@@ -15,6 +15,9 @@
 #include <linux/limits.h>
 #include <linux/string.h>
 
+#include "edac_module.h"
+#include "apple_soc_edac-internal.h"
+
 #define EDAC_TEST_WORDS		64
 /* Not a valid interrupt: the IRQ core ignores masks and unmasks of it. */
 #define EDAC_TEST_IRQ		INT_MAX
@@ -126,7 +129,7 @@ static struct edac_test_ctx *edac_test_line(struct kunit *test,
 	/* T6041 line 45 + n reads its status word at fake word n. */
 	for (i = 0; i < T6041_NI_REGS; i++)
 		ctx->status_regs[i] = (void __iomem __force *)
-			((u8 *)&ctx->fake.regs[i] - T6041_NI_STATUS);
+			((uintptr_t)&ctx->fake.regs[i] - T6041_NI_STATUS);
 	if (hw->num_status_regs)
 		ctx->edac.status_regs = ctx->status_regs;
 
@@ -148,7 +151,7 @@ static struct edac_test_ctx *edac_test_line(struct kunit *test,
 			continue;
 		irq_data->ni = &hw->ni[i];
 		irq_data->ni_base = (void __iomem __force *)
-			((u8 *)ctx->fake.regs - hw->ni[i].status);
+			((uintptr_t)ctx->fake.regs - hw->ni[i].status);
 	}
 
 	return ctx;
@@ -182,8 +185,8 @@ static unsigned long edac_test_fire(struct kunit *test,
 	cancel_delayed_work_sync(&irq_data->rearm);
 	delay = msecs_to_jiffies(expect_backoff_ms);
 	KUNIT_EXPECT_NE(test, 0U, expect_backoff_ms);
-	KUNIT_EXPECT_GE(test, expires - before, delay);
-	KUNIT_EXPECT_LE(test, expires - after, delay);
+	KUNIT_EXPECT_TRUE(test, time_after_eq(expires, before + delay));
+	KUNIT_EXPECT_TRUE(test, time_before_eq(expires, after + delay));
 
 	return expires - before;
 }
@@ -205,13 +208,32 @@ static int edac_test_init(struct kunit *test)
 	return 0;
 }
 
-static const struct apple_soc_edac_hw *const edac_test_error_hws[] = {
-	&t6000_error_hw, &t6041_error_hw, &t8112_error_hw, &t8140_error_hw,
+static const char *const edac_test_error_compatibles[] = {
+	"apple,t6000-error-handler",
+	"apple,t6041-error-handler", "apple,t8112-error-handler",
+	"apple,t8140-error-handler",
 };
 
-static const struct apple_soc_edac_hw *const edac_test_event_hws[] = {
-	&t6000_event_hw, &t6041_event_hw, &t8112_event_hw, &t8140_event_hw,
+static const char *const edac_test_event_compatibles[] = {
+	"apple,t6000-event-log",
+	"apple,t6041-event-log", "apple,t8112-event-log",
+	"apple,t8140-event-log",
 };
+
+static const struct apple_soc_edac_hw *edac_test_hw(struct kunit *test,
+						     const char *compatible)
+{
+	const struct of_device_id *id;
+
+	for (id = apple_soc_edac_of_match; id->compatible[0]; id++)
+		if (!strcmp(id->compatible, compatible)) {
+			KUNIT_ASSERT_NOT_NULL(test, id->data);
+			return id->data;
+		}
+
+	KUNIT_FAIL_AND_ABORT(test, "no match data for %s", compatible);
+	return NULL;
+}
 
 static void edac_test_expect_source(struct kunit *test,
 				    const struct apple_soc_edac_hw *hw,
@@ -243,11 +265,12 @@ static void edac_test_source_t6041(struct kunit *test)
 		{ 70, NULL }, { 88, NULL }, { 89, NULL }, { 255, NULL },
 		{ UINT_MAX, NULL },
 	};
+	const struct apple_soc_edac_hw *hw =
+		edac_test_hw(test, "apple,t6041-error-handler");
 	unsigned int i;
 
 	for (i = 0; i < ARRAY_SIZE(cases); i++)
-		edac_test_expect_source(test, &t6041_error_hw, cases[i].index,
-					cases[i].name);
+		edac_test_expect_source(test, hw, cases[i].index, cases[i].name);
 }
 
 /* Range edges of every SoC: first and last line in, neighbours per table. */
@@ -255,8 +278,9 @@ static void edac_test_source_edges(struct kunit *test)
 {
 	unsigned int h, r, i, claimed;
 
-	for (h = 0; h < ARRAY_SIZE(edac_test_error_hws); h++) {
-		const struct apple_soc_edac_hw *hw = edac_test_error_hws[h];
+	for (h = 0; h < ARRAY_SIZE(edac_test_error_compatibles); h++) {
+		const struct apple_soc_edac_hw *hw =
+			edac_test_hw(test, edac_test_error_compatibles[h]);
 
 		claimed = 0;
 		for (i = 0; i < hw->num_irqs; i++)
@@ -282,8 +306,9 @@ static void edac_test_tables(struct kunit *test)
 {
 	unsigned int h, r, end;
 
-	for (h = 0; h < ARRAY_SIZE(edac_test_error_hws); h++) {
-		const struct apple_soc_edac_hw *hw = edac_test_error_hws[h];
+	for (h = 0; h < ARRAY_SIZE(edac_test_error_compatibles); h++) {
+		const struct apple_soc_edac_hw *hw =
+			edac_test_hw(test, edac_test_error_compatibles[h]);
 
 		KUNIT_EXPECT_FALSE(test, hw->event_log);
 		KUNIT_EXPECT_GT(test, hw->nranges, (size_t)0);
@@ -301,17 +326,21 @@ static void edac_test_tables(struct kunit *test)
 		}
 	}
 
-	for (h = 0; h < ARRAY_SIZE(edac_test_event_hws); h++) {
-		KUNIT_EXPECT_TRUE(test, edac_test_event_hws[h]->event_log);
-		KUNIT_EXPECT_EQ(test, edac_test_event_hws[h]->nranges, (size_t)0);
-		KUNIT_EXPECT_EQ(test, edac_test_event_hws[h]->nni, (size_t)0);
+	for (h = 0; h < ARRAY_SIZE(edac_test_event_compatibles); h++) {
+		const struct apple_soc_edac_hw *hw =
+			edac_test_hw(test, edac_test_event_compatibles[h]);
+
+		KUNIT_EXPECT_TRUE(test, hw->event_log);
+		KUNIT_EXPECT_EQ(test, hw->nranges, (size_t)0);
+		KUNIT_EXPECT_EQ(test, hw->nni, (size_t)0);
 	}
 }
 
 /* T6041: exactly the NI lines 45-69 own one status aperture each. */
 static void edac_test_t6041_status_lines(struct kunit *test)
 {
-	const struct apple_soc_edac_hw *hw = &t6041_error_hw;
+	const struct apple_soc_edac_hw *hw =
+		edac_test_hw(test, "apple,t6041-error-handler");
 	unsigned int i;
 
 	KUNIT_EXPECT_EQ(test, hw->num_status_regs, T6041_NI_REGS);
@@ -328,7 +357,8 @@ static void edac_test_t6041_status_lines(struct kunit *test)
 /* T8140 NI blocks sit on claimed NI lines with a valid aperture and words. */
 static void edac_test_t8140_ni_table(struct kunit *test)
 {
-	const struct apple_soc_edac_hw *hw = &t8140_error_hw;
+	const struct apple_soc_edac_hw *hw =
+		edac_test_hw(test, "apple,t8140-error-handler");
 	unsigned int i, j;
 
 	KUNIT_EXPECT_EQ(test, hw->nni, (size_t)6);
@@ -357,8 +387,9 @@ static void edac_test_event_log_source(struct kunit *test)
 {
 	unsigned int h;
 
-	for (h = 0; h < ARRAY_SIZE(edac_test_event_hws); h++) {
-		const struct apple_soc_edac_hw *hw = edac_test_event_hws[h];
+	for (h = 0; h < ARRAY_SIZE(edac_test_event_compatibles); h++) {
+		const struct apple_soc_edac_hw *hw =
+			edac_test_hw(test, edac_test_event_compatibles[h]);
 
 		edac_test_expect_source(test, hw, 0, "event-log");
 		edac_test_expect_source(test, hw, hw->num_irqs - 1, "event-log");
@@ -393,7 +424,9 @@ static bool edac_test_t6041(struct edac_test_ctx *ctx, bool *error,
 /* A T6041 NI word that reads zero is left alone. */
 static void edac_test_t6041_status_zero(struct kunit *test)
 {
-	struct edac_test_ctx *ctx = edac_test_line(test, &t6041_error_hw, 50);
+	const struct apple_soc_edac_hw *hw =
+		edac_test_hw(test, "apple,t6041-error-handler");
+	struct edac_test_ctx *ctx = edac_test_line(test, hw, 50);
 	bool error = true, cleared = false;
 
 	KUNIT_EXPECT_FALSE(test, edac_test_t6041(ctx, &error, &cleared));
@@ -407,7 +440,9 @@ static void edac_test_t6041_status_zero(struct kunit *test)
 /* Each bit is acknowledged; only bits 0-2 and 4-7 are platform errors. */
 static void edac_test_t6041_status_mask(struct kunit *test)
 {
-	struct edac_test_ctx *ctx = edac_test_line(test, &t6041_error_hw, 45);
+	const struct apple_soc_edac_hw *hw =
+		edac_test_hw(test, "apple,t6041-error-handler");
+	struct edac_test_ctx *ctx = edac_test_line(test, hw, 45);
 	unsigned int bit;
 	bool error, cleared;
 
@@ -433,7 +468,9 @@ static void edac_test_t6041_status_mask(struct kunit *test)
 /* A word that reads back set after the acknowledge is reported. */
 static void edac_test_t6041_status_sticky(struct kunit *test)
 {
-	struct edac_test_ctx *ctx = edac_test_line(test, &t6041_error_hw, 60);
+	const struct apple_soc_edac_hw *hw =
+		edac_test_hw(test, "apple,t6041-error-handler");
+	struct edac_test_ctx *ctx = edac_test_line(test, hw, 60);
 	bool error, cleared;
 
 	ctx->fake.regs[15] = 0x11;
@@ -449,7 +486,9 @@ static void edac_test_t6041_status_sticky(struct kunit *test)
 /* Line 45 + n uses aperture n, and lines outside 45-69 touch none. */
 static void edac_test_t6041_status_index(struct kunit *test)
 {
-	struct edac_test_ctx *ctx = edac_test_line(test, &t6041_error_hw, 45);
+	const struct apple_soc_edac_hw *hw =
+		edac_test_hw(test, "apple,t6041-error-handler");
+	struct edac_test_ctx *ctx = edac_test_line(test, hw, 45);
 	static const unsigned int outside[] = { 0, 9, 26, 44, 70, 88 };
 	bool error, cleared;
 	unsigned int i;
@@ -481,7 +520,9 @@ static void edac_test_t6041_status_index(struct kunit *test)
 static void edac_test_ni_status_words(struct kunit *test)
 {
 	/* SoC NI 0: 0x1ffd7ff */
-	struct edac_test_ctx *ctx = edac_test_line(test, &t8140_error_hw, 18);
+	const struct apple_soc_edac_hw *hw =
+		edac_test_hw(test, "apple,t8140-error-handler");
+	struct edac_test_ctx *ctx = edac_test_line(test, hw, 18);
 	unsigned int bit;
 	bool cleared = false;
 
@@ -507,7 +548,9 @@ static void edac_test_ni_status_words(struct kunit *test)
 /* No word set: nothing found and nothing written. */
 static void edac_test_ni_status_none(struct kunit *test)
 {
-	struct edac_test_ctx *ctx = edac_test_line(test, &t8140_error_hw, 22);
+	const struct apple_soc_edac_hw *hw =
+		edac_test_hw(test, "apple,t8140-error-handler");
+	struct edac_test_ctx *ctx = edac_test_line(test, hw, 22);
 	bool cleared = false;
 
 	KUNIT_ASSERT_NOT_NULL(test, ctx->irq.ni);
@@ -521,7 +564,9 @@ static void edac_test_ni_status_none(struct kunit *test)
 /* One word of several staying set makes the NI not cleared. */
 static void edac_test_ni_status_sticky(struct kunit *test)
 {
-	struct edac_test_ctx *ctx = edac_test_line(test, &t8140_error_hw, 23);
+	const struct apple_soc_edac_hw *hw =
+		edac_test_hw(test, "apple,t8140-error-handler");
+	struct edac_test_ctx *ctx = edac_test_line(test, hw, 23);
 	bool cleared = true;
 
 	/* GFX NI: 0x3ff7ff, so words 0 and 21 are both in the mask. */
@@ -540,12 +585,14 @@ static void edac_test_ni_status_sticky(struct kunit *test)
 static void edac_test_ni_status_top_word(struct kunit *test)
 {
 	static const struct apple_soc_edac_ni ni = { 18, 9, 0x100, BIT(31) };
-	struct edac_test_ctx *ctx = edac_test_line(test, &t8140_error_hw, 18);
+	const struct apple_soc_edac_hw *hw =
+		edac_test_hw(test, "apple,t8140-error-handler");
+	struct edac_test_ctx *ctx = edac_test_line(test, hw, 18);
 	bool cleared;
 
 	ctx->irq.ni = &ni;
 	ctx->irq.ni_base = (void __iomem __force *)
-		((u8 *)ctx->fake.regs - ni.status);
+		((uintptr_t)ctx->fake.regs - ni.status);
 	ctx->fake.regs[31] = 0xffffffff;
 	ctx->fake.regs[30] = 0x1;
 	KUNIT_EXPECT_TRUE(test, apple_soc_edac_ni_status(&ctx->irq, &cleared));
@@ -555,9 +602,9 @@ static void edac_test_ni_status_top_word(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ctx->fake.reads, 2U);
 
 	/* Word 11 is outside SoC NI 0's mask. */
-	ctx->irq.ni = &t8140_ni[0];
+	ctx->irq.ni = &ctx->edac.hw->ni[0];
 	ctx->irq.ni_base = (void __iomem __force *)
-		((u8 *)ctx->fake.regs - t8140_ni[0].status);
+		((uintptr_t)ctx->fake.regs - ctx->edac.hw->ni[0].status);
 	ctx->fake.regs[30] = 0;
 	ctx->fake.regs[11] = 0x1;
 	KUNIT_EXPECT_FALSE(test, apple_soc_edac_ni_status(&ctx->irq, &cleared));
@@ -568,7 +615,9 @@ static void edac_test_ni_status_top_word(struct kunit *test)
 /* T6041 NI error acknowledged: one UE, the line stays unmasked. */
 static void edac_test_irq_t6041_error(struct kunit *test)
 {
-	struct edac_test_ctx *ctx = edac_test_line(test, &t6041_error_hw, 47);
+	const struct apple_soc_edac_hw *hw =
+		edac_test_hw(test, "apple,t6041-error-handler");
+	struct edac_test_ctx *ctx = edac_test_line(test, hw, 47);
 
 	ctx->fake.regs[2] = 0x4;
 	KUNIT_EXPECT_EQ(test, edac_test_fire(test, ctx, 0), 0UL);
@@ -580,7 +629,9 @@ static void edac_test_irq_t6041_error(struct kunit *test)
 /* Bit 3 alone is acknowledged without an error count. */
 static void edac_test_irq_t6041_bit3(struct kunit *test)
 {
-	struct edac_test_ctx *ctx = edac_test_line(test, &t6041_error_hw, 69);
+	const struct apple_soc_edac_hw *hw =
+		edac_test_hw(test, "apple,t6041-error-handler");
+	struct edac_test_ctx *ctx = edac_test_line(test, hw, 69);
 
 	ctx->fake.regs[24] = BIT(3);
 	KUNIT_EXPECT_EQ(test, edac_test_fire(test, ctx, 0), 0UL);
@@ -591,7 +642,9 @@ static void edac_test_irq_t6041_bit3(struct kunit *test)
 /* An NI line with no status set is masked and backed off, not counted. */
 static void edac_test_irq_t6041_empty(struct kunit *test)
 {
-	struct edac_test_ctx *ctx = edac_test_line(test, &t6041_error_hw, 56);
+	const struct apple_soc_edac_hw *hw =
+		edac_test_hw(test, "apple,t6041-error-handler");
+	struct edac_test_ctx *ctx = edac_test_line(test, hw, 56);
 
 	edac_test_fire(test, ctx, APPLE_SOC_EDAC_BACKOFF_MS);
 	KUNIT_EXPECT_EQ(test, edac_test_ue(ctx), 0U);
@@ -602,7 +655,9 @@ static void edac_test_irq_t6041_empty(struct kunit *test)
 /* An acknowledge that does not take counts once and backs off. */
 static void edac_test_irq_t6041_sticky(struct kunit *test)
 {
-	struct edac_test_ctx *ctx = edac_test_line(test, &t6041_error_hw, 64);
+	const struct apple_soc_edac_hw *hw =
+		edac_test_hw(test, "apple,t6041-error-handler");
+	struct edac_test_ctx *ctx = edac_test_line(test, hw, 64);
 
 	ctx->fake.regs[19] = 0x1;
 	ctx->fake.sticky[19] = 0x1;
@@ -615,36 +670,39 @@ static void edac_test_irq_t6041_sticky(struct kunit *test)
 static void edac_test_irq_no_status(struct kunit *test)
 {
 	static const struct {
-		const struct apple_soc_edac_hw *hw;
+		const char *compatible;
 		unsigned int index;
 	} lines[] = {
-		{ &t6041_error_hw, 3 },		/* sep */
-		{ &t6041_error_hw, 27 },	/* sram */
-		{ &t6000_error_hw, 33 },	/* ni0, no status on T6000 */
-		{ &t8112_error_hw, 2 },		/* sep */
-		{ &t8140_error_hw, 24 },	/* nsi */
-		{ &t6000_event_hw, 0 },
-		{ &t8140_event_hw, 8 },
+		{ "apple,t6041-error-handler", 3 },		/* sep */
+		{ "apple,t6041-error-handler", 27 },	/* sram */
+		{ "apple,t6000-error-handler", 33 },	/* ni0, no status on T6000 */
+		{ "apple,t8112-error-handler", 2 },		/* sep */
+		{ "apple,t8140-error-handler", 24 },	/* nsi */
+		{ "apple,t6000-event-log", 0 },
+		{ "apple,t8140-event-log", 8 },
 	};
 	unsigned int i;
 
 	for (i = 0; i < ARRAY_SIZE(lines); i++) {
+		const struct apple_soc_edac_hw *hw;
 		struct edac_test_ctx *ctx;
 
-		ctx = edac_test_line(test, lines[i].hw, lines[i].index);
+		hw = edac_test_hw(test, lines[i].compatible);
+		ctx = edac_test_line(test, hw, lines[i].index);
 		KUNIT_EXPECT_NULL(test, ctx->irq.ni);
 		edac_test_fire(test, ctx, APPLE_SOC_EDAC_BACKOFF_MS);
 		KUNIT_EXPECT_EQ_MSG(test, edac_test_ue(ctx), 1U, "line %u", i);
 		KUNIT_EXPECT_EQ(test, ctx->fake.reads, 0U);
 		KUNIT_EXPECT_EQ(test, ctx->fake.writes, 0U);
-		cancel_delayed_work_sync(&ctx->irq.rearm);
 	}
 }
 
 /* T8140 NI: acknowledged status is one UE without a mask. */
 static void edac_test_irq_ni_error(struct kunit *test)
 {
-	struct edac_test_ctx *ctx = edac_test_line(test, &t8140_error_hw, 21);
+	const struct apple_soc_edac_hw *hw =
+		edac_test_hw(test, "apple,t8140-error-handler");
+	struct edac_test_ctx *ctx = edac_test_line(test, hw, 21);
 
 	ctx->fake.regs[24] = 0x100;
 	KUNIT_EXPECT_EQ(test, edac_test_fire(test, ctx, 0), 0UL);
@@ -656,7 +714,9 @@ static void edac_test_irq_ni_error(struct kunit *test)
 /* T8140 NI asserted with no status: masked, no UE. Sticky: UE once + mask. */
 static void edac_test_irq_ni_empty_sticky(struct kunit *test)
 {
-	struct edac_test_ctx *ctx = edac_test_line(test, &t8140_error_hw, 19);
+	const struct apple_soc_edac_hw *hw =
+		edac_test_hw(test, "apple,t8140-error-handler");
+	struct edac_test_ctx *ctx = edac_test_line(test, hw, 19);
 
 	edac_test_fire(test, ctx, APPLE_SOC_EDAC_BACKOFF_MS);
 	KUNIT_EXPECT_EQ(test, edac_test_ue(ctx), 0U);
@@ -672,7 +732,9 @@ static void edac_test_irq_ni_empty_sticky(struct kunit *test)
 /* The backoff doubles to its cap; after the retry limit the line stays off. */
 static void edac_test_irq_backoff_limit(struct kunit *test)
 {
-	struct edac_test_ctx *ctx = edac_test_line(test, &t6000_error_hw, 0);
+	const struct apple_soc_edac_hw *hw =
+		edac_test_hw(test, "apple,t6000-error-handler");
+	struct edac_test_ctx *ctx = edac_test_line(test, hw, 0);
 	unsigned int i, expect = APPLE_SOC_EDAC_BACKOFF_MS;
 
 	for (i = 0; i < APPLE_SOC_EDAC_MAX_RETRIES; i++) {
@@ -693,7 +755,9 @@ static void edac_test_irq_backoff_limit(struct kunit *test)
 /* A line that stayed quiet for a minute after its unmask starts over. */
 static void edac_test_irq_backoff_reset(struct kunit *test)
 {
-	struct edac_test_ctx *ctx = edac_test_line(test, &t8112_error_hw, 1);
+	const struct apple_soc_edac_hw *hw =
+		edac_test_hw(test, "apple,t8112-error-handler");
+	struct edac_test_ctx *ctx = edac_test_line(test, hw, 1);
 
 	ctx->irq.retries = APPLE_SOC_EDAC_MAX_RETRIES + 1;
 	ctx->irq.backoff_ms = APPLE_SOC_EDAC_BACKOFF_MAX_MS;
@@ -713,7 +777,9 @@ static void edac_test_irq_backoff_reset(struct kunit *test)
 /* The rearm work unmasks and restarts the quiet-period clock. */
 static void edac_test_rearm(struct kunit *test)
 {
-	struct edac_test_ctx *ctx = edac_test_line(test, &t6000_error_hw, 12);
+	const struct apple_soc_edac_hw *hw =
+		edac_test_hw(test, "apple,t6000-error-handler");
+	struct edac_test_ctx *ctx = edac_test_line(test, hw, 12);
 	unsigned long before;
 
 	ctx->irq.armed_jiffies = jiffies - 10 * HZ;
@@ -759,3 +825,6 @@ static struct kunit_suite apple_soc_edac_test_suite = {
 };
 
 kunit_test_suite(apple_soc_edac_test_suite);
+
+MODULE_IMPORT_NS("EXPORTED_FOR_KUNIT_TESTING");
+MODULE_LICENSE("GPL");

@@ -583,8 +583,8 @@ config EDAC_APPLE_SOC
 	  without status is masked.
 
 config EDAC_APPLE_SOC_KUNIT_TEST
-	bool "KUnit tests for Apple SoC error reporting" if !KUNIT_ALL_TESTS
-	depends on EDAC_APPLE_SOC=y && KUNIT=y
+	tristate "KUnit tests for Apple SoC error reporting" if !KUNIT_ALL_TESTS
+	depends on EDAC_APPLE_SOC && KUNIT
 	default KUNIT_ALL_TESTS
 	help
 	  Build KUnit tests for the Apple SoC error reporting driver: the
