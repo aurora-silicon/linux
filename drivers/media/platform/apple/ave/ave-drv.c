@@ -74,10 +74,16 @@ const struct ave_variant ave_t6000 = {
  * M4's 27.2 loaders, it sets the word at TEXT 0x4224 on every boot; with that
  * word zeroed the TEXT CRC is 077a3444. It is the M2 encoder's build of the
  * firmware version the M3 runs on 27.2, and it starts the same way: the boot
- * configuration handshake as device 12 with handshake type 12, the 26B123
- * command layout, codec clocks ungated by clearing the mailbox idle word,
- * the bootloader's code base (marked valid) left as it is, and DATA restored
- * from the boot snapshot before every start.
+ * configuration handshake, the 26B123 command layout, codec clocks ungated
+ * by clearing the mailbox idle word, the bootloader's code base (marked
+ * valid) left as it is, and DATA restored from the boot snapshot before
+ * every start.
+ *
+ * The chip identity comes from the ADT (ave soc-id "t8112"). This build's
+ * device table gives that chip device 12 and handshake type 12, so the
+ * handshake names 12 for both (the 13.5 build, ave_t8112, uses 18/15).
+ * On the J473 the start handshake with 12/12 completes and the encodes
+ * decode bit-exact.
  */
 static const struct ave_variant ave_t8112_26b123 = {
 	.regs = &ave_coproc_6070,

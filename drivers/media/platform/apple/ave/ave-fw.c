@@ -236,8 +236,11 @@ static const struct ave_fw_build *ave_fw_find_build(const struct ave_variant *v,
 }
 
 /* Whether these are the segment sizes of one of v's builds */
-static bool ave_fw_sizes_match(const struct ave_variant *v, size_t text,
-			       size_t data)
+/*
+ * Whether TEXT/DATA segments of these sizes are a build the variant pins.
+ * ave_fw_probe() refuses the firmware when they are not.
+ */
+bool ave_fw_sizes_match(const struct ave_variant *v, size_t text, size_t data)
 {
 	if (v->build_count)
 		return ave_fw_find_build(v, text, data, 0);
@@ -297,12 +300,11 @@ int ave_fw_probe(struct ave_dev *ave)
 		want_crc = build->text_crc;
 	} else if (!ave->variant->boot_qualified && !ave->variant->fw_text_size) {
 		/* A probe-only variant that pins no build takes any segment sizes. */
-	} else if (ave->text.size != ave->variant->fw_text_size ||
-		   (ave->data.size != ave->variant->fw_data_size &&
-		    (!ave->variant->fw_data_size_alt ||
-		     ave->data.size != ave->variant->fw_data_size_alt))) {
+	} else if (!ave_fw_sizes_match(ave->variant, ave->text.size,
+				       ave->data.size)) {
 		return dev_err_probe(dev, -EINVAL,
-				     "unexpected firmware segment sizes\n");
+				     "unexpected firmware segment sizes (TEXT %#zx DATA %#zx)\n",
+				     ave->text.size, ave->data.size);
 	}
 	if ((ave->text.phys < ave->data.phys + ave->data.size &&
 	     ave->data.phys < ave->text.phys + ave->text.size) ||
