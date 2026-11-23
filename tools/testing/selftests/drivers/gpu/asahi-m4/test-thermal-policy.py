@@ -255,3 +255,46 @@ lease_unit=OUT/'gpu-lease.c';lease_unit.write_text(lease_source)
 run(['cc','-std=gnu11','-Wall','-Wextra','-Werror','-fsanitize=undefined','-fno-sanitize-recover=all',str(lease_unit),'-o',str(OUT/'gpu-lease')])
 run([str(OUT/'gpu-lease')])
 print('GPU attach epochs reject stale worker publications and stale detach, begin restricted, expire budgets and never wrap')
+
+# Validate shared -ENODATA hold logic and its call sites in G16 glue and PMP thermal.
+nodata_source = r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <linux/soc/apple/pmp-cooling.h>
+int main(void) {
+    const unsigned long long t0 = 10000000000ULL;
+    /* Never hold without a prior valid timestamp or if time went backwards. */
+    assert(!apple_pmp_hold_nodata(0, 50000, t0, true));
+    assert(!apple_pmp_hold_nodata(0, 50000, t0, false));
+    assert(!apple_pmp_hold_nodata(t0 + 1, 50000, t0, true));
+    assert(!apple_pmp_hold_nodata(t0 + 1, 50000, t0, false));
+
+    /* Idle cool (<100 C) holds indefinitely; hot idle (>=100 C) uses transient window only. */
+    assert(apple_pmp_hold_nodata(t0, 99999, t0 + 10000000000ULL, true));
+    assert(apple_pmp_hold_nodata(t0, 100000, t0 + 100000000ULL, true));
+    assert(!apple_pmp_hold_nodata(t0, 100000, t0 + 100000001ULL, true));
+
+    /* Active <100 C holds across the 2 s gated window, then fails closed. */
+    assert(apple_pmp_hold_nodata(t0, 94000, t0 + APPLE_PMP_GATED_HOLD_NS - 1, false));
+    assert(apple_pmp_hold_nodata(t0, 99999, t0 + APPLE_PMP_GATED_HOLD_NS - 1, false));
+    assert(!apple_pmp_hold_nodata(t0, 99999, t0 + APPLE_PMP_GATED_HOLD_NS, false));
+
+    /* Active 100..105.999 C holds only a brief <=100 ms PMP SRAM refresh glitch. */
+    assert(apple_pmp_hold_nodata(t0, 100000, t0 + APPLE_PMP_TRANSIENT_HOLD_NS, false));
+    assert(apple_pmp_hold_nodata(t0, 105999, t0 + APPLE_PMP_TRANSIENT_HOLD_NS, false));
+    assert(!apple_pmp_hold_nodata(t0, 100000, t0 + APPLE_PMP_TRANSIENT_HOLD_NS + 1, false));
+    assert(!apple_pmp_hold_nodata(t0, 105999, t0 + APPLE_PMP_TRANSIENT_HOLD_NS + 1, false));
+
+    /* At or above passive throttling (106 C), -ENODATA always fails closed immediately. */
+    assert(!apple_pmp_hold_nodata(t0, APPLE_PMP_PASSIVE_MC, t0, false));
+    assert(!apple_pmp_hold_nodata(t0, APPLE_PMP_PASSIVE_MC, t0, true));
+    assert(!apple_pmp_hold_nodata(t0, 110000, t0 + 1000000ULL, false));
+    return 0;
+}
+'''
+nodata_unit = OUT/'nodata-hold.c'; nodata_unit.write_text(nodata_source)
+nodata_bin = build(ROOT, OUT, nodata_unit)
+run([str(nodata_bin)])
+assert 'apple_pmp_hold_nodata(' in (G16/'glue.c').read_text()
+assert 'apple_pmp_hold_nodata(' in (ROOT/'drivers/thermal/apple-pmp-thermal.c').read_text()
+print('Shared -ENODATA hold masks brief PMP refresh glitches below passive trip and fails closed above')

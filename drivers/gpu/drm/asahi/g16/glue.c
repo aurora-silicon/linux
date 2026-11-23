@@ -152,12 +152,12 @@ int asahi_g16_cooling_sample(struct asahi_g16_cooling *cooling, u64 now, bool id
 	if (!ret) {
 		cooling->valid_ns = now;
 		cooling->valid_mc = *temperature;
-	} else if (ret == -ENODATA && cooling->valid_ns &&
-		   (idle || now - cooling->valid_ns < APPLE_PMP_GATED_HOLD_NS) &&
-		   cooling->valid_mc < APPLE_PMP_GATED_HOLD_MC) {
+	} else if (ret == -ENODATA &&
+		   apple_pmp_hold_nodata(cooling->valid_ns, cooling->valid_mc,
+					 now, idle)) {
 		*temperature = cooling->valid_mc;
 		/* Idle makes no heat: the 2 s with work in flight start with the work. */
-		if (idle)
+		if (idle && cooling->valid_mc < APPLE_PMP_GATED_HOLD_MC)
 			cooling->valid_ns = now;
 		ret = 0;
 	}
