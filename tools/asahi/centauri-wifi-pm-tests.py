@@ -17,7 +17,7 @@ import tempfile
 
 
 def block(source, name):
-    match = re.search(r"^(?:static )?(?:int|void) " + re.escape(name) + r"\(", source, re.M)
+    match = re.search(r"^(?:static )?(?:int|void|bool) " + re.escape(name) + r"\(", source, re.M)
     if not match:
         raise RuntimeError(f"Production function {name} missing")
     brace = source.index("{", match.start())
@@ -39,22 +39,26 @@ typedef uint8_t u8;
 typedef uint16_t u16;
 typedef uint32_t u32;
 #define BIT(n) (1U << (n))
+#define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x, v) ((x) = (v))
 #define GFP_KERNEL 0
-#define BUFFER_SIZE 128
+#define BUFFER_SIZE 256
+#define DATA_TX_SLOTS 8
 #define TX_BUFFER 2048
 #define TR_BASE 0
 #define dma_rmb() ((void)0)
 #define dma_wmb() ((void)0)
 #define dev_err(...) ((void)0)
 #define dev_dbg(...) ((void)0)
+#define lockdep_assert_held(l) assert(*(l))
 #define msecs_to_jiffies(x) (x)
 #define time_before(a, b) ((long)((a) - (b)) < 0)
 #define time_after_eq(a, b) (!time_before(a, b))
 static unsigned long jiffies;
 struct centauri_t6050_wifi;
-struct centauri_t6050 { struct centauri_t6050_wifi *wifi; bool removing; };
+struct pci_dev { int dev; };
+struct centauri_t6050 { struct pci_dev *pdev; struct centauri_t6050_wifi *wifi; bool removing; };
 struct wiphy { struct centauri_t6050_wifi *wifi; };
 struct net_device { int unused; };
 struct cfg80211_wowlan { bool any; };
@@ -66,7 +70,8 @@ struct centauri_t6050_wifi {
     struct { u8 *window, *bar; uint64_t window_dma; } a;
     int lock, connect_work, link_work, data_tx_queue;
     bool command_failed, stopping, connect_abort, disconnect_pending, connecting, connected;
-    bool reply_valid, pm_prepared;
+    bool reply_valid, pm_prepared, pm_wowlan_armed;
+    bool data_tx_busy[DATA_TX_SLOTS];
     u16 command_head, sequence, reply_capture, reply_sequence, reply_status;
     u32 reply_command;
     u8 *reply_buffer;
@@ -74,7 +79,7 @@ struct centauri_t6050_wifi {
     struct centauri_wifi_disconnect_receipt pm_disconnect;
 };
 static const u16 ring_size[5] = {0, 64};
-static unsigned int doorbells, drains, notifications, consumer;
+static unsigned int doorbells, drains, notifications, consumer, tx_drain_rounds;
 static u16 firmware_status;
 static bool async_reply, async_event, wrong_reply;
 static bool *submission_probe;
@@ -101,6 +106,11 @@ static void drain(struct centauri_t6050_wifi *wifi)
 {
     assert(wifi->lock);
     drains++;
+    if (tx_drain_rounds) {
+        tx_drain_rounds--;
+        if (!tx_drain_rounds)
+            memset(wifi->data_tx_busy, 0, sizeof(wifi->data_tx_busy));
+    }
     if (transport_mode != REPLY)
         return;
     if (!wifi->reply_valid) {
@@ -124,22 +134,23 @@ static void cfg80211_disconnected(struct net_device *netdev, u16 reason, void *i
 '''
 
 TESTS = r'''
+static struct pci_dev pdev;
 static struct centauri_t6050 control;
 static struct centauri_t6050_wifi wifi;
 static struct wiphy wiphy;
 static struct net_device netdev;
-static u8 window[16384], bar[8192];
+static u8 window[32768], bar[8192];
 static void reset(void)
 {
     memset(&wifi, 0, sizeof(wifi));
     memset(window, 0, sizeof(window));
-    control = (struct centauri_t6050) { .wifi = &wifi };
+    control = (struct centauri_t6050) { .pdev = &pdev, .wifi = &wifi };
     wifi.control = &control;
     wifi.a.window = window;
     wifi.a.bar = bar;
     wifi.connected = true;
     wiphy.wifi = &wifi;
-    doorbells = drains = notifications = consumer = 0;
+    doorbells = drains = notifications = consumer = tx_drain_rounds = 0;
     firmware_status = 0;
     async_reply = async_event = wrong_reply = false;
     transport_mode = REPLY;
@@ -188,12 +199,16 @@ int main(void)
     assert(!wifi.pm_disconnect.seen);
     expect_error(0); /* Missing transaction remains missing. */
     struct cfg80211_wowlan wowlan = {};
+    assert(!centauri_t6050_wifi_wowlan_armed(&control));
     assert(call_registered_suspend(&wiphy, &wowlan) == 1);
+    assert(!centauri_t6050_wifi_wowlan_armed(&control));
     wowlan.any = true;
     assert(call_registered_suspend(&wiphy, &wowlan) == 0);
-    assert(!doorbells && !wifi.pm_disconnect.seen);
+    assert(centauri_t6050_wifi_wowlan_armed(&control));
+    assert(!doorbells && !wifi.pm_disconnect.seen && !centauri_t6050_wifi_pm_disconnected(&control));
     wifi.connected = false;
     assert(call_registered_suspend(&wiphy, &wowlan) == 1);
+    assert(!centauri_t6050_wifi_wowlan_armed(&control));
     wifi.connected = true;
     wifi.connecting = true;
     assert(call_registered_suspend(&wiphy, &wowlan) == 1);
@@ -204,8 +219,12 @@ int main(void)
     assert(!doorbells && !wifi.pm_disconnect.seen);
 
     firmware_status = 326;
+    wifi.data_tx_busy[0] = true;
+    tx_drain_rounds = 2;
     assert(disconnect() == 0);
+    assert(!data_tx_in_flight(&wifi));
     assert(wifi.pm_disconnect.seen && wifi.pm_disconnect.submitted);
+    assert(centauri_t6050_wifi_pm_disconnected(&control));
     assert(wifi.pm_disconnect.replied && wifi.pm_disconnect.status == 326);
     assert(wifi.pm_disconnect.command_error == -EREMOTEIO);
     expect_error(0); /* Keep the existing helper normalization. */
@@ -303,6 +322,15 @@ int main(void)
     mutex_unlock(&wifi.lock);
     assert(published);
     submission_probe = NULL;
+
+    /* Failed keep-alive unwind marks Wi-Fi failed so teardown skips ACIPC. */
+    prepare();
+    wifi.data_tx_busy[0] = true;
+    centauri_t6050_wifi_mark_failed(&control);
+    assert(wifi.stopping && wifi.command_failed);
+    assert(disconnect() == 0);
+    assert(wifi.pm_disconnect.stopping_skip && !doorbells && !drains);
+
     puts("PASS: production disconnect/transport/PM callbacks and first-error retention");
     return 0;
 }
@@ -322,9 +350,12 @@ def main():
     receipt = re.search(r"struct centauri_wifi_disconnect_receipt \{.*?\n\};", source, re.S)
     if not receipt:
         raise RuntimeError("Production receipt structure missing")
-    names = ["command_reply", "wait_disconnect", "wifi_disconnect",
+    names = ["command_reply", "wait_disconnect", "data_tx_in_flight",
+             "drain_tx_in_flight", "wifi_disconnect",
              "centauri_t6050_wifi_pm_prepare", "centauri_t6050_wifi_pm_error",
-             "centauri_t6050_wifi_pm_complete", "wifi_suspend"]
+             "centauri_t6050_wifi_pm_disconnected", "centauri_t6050_wifi_wowlan_armed",
+             "centauri_t6050_wifi_mark_failed", "centauri_t6050_wifi_pm_complete",
+             "wifi_suspend"]
     has_resume = bool(re.search(r"^static int wifi_resume\(", source, re.M))
     if has_resume:
         names.append("wifi_resume")
