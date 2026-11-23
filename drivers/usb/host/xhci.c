@@ -3412,6 +3412,7 @@ static void xhci_endpoint_reset(struct usb_hcd *hcd,
 	struct xhci_virt_device *vdev;
 	struct xhci_virt_ep *ep;
 	struct xhci_input_control_ctx *ctrl_ctx;
+	struct xhci_slot_ctx *slot_ctx;
 	struct xhci_command *stop_cmd, *cfg_cmd;
 	unsigned int ep_index;
 	unsigned long flags;
@@ -3434,6 +3435,17 @@ static void xhci_endpoint_reset(struct usb_hcd *hcd,
 
 		vdev = xhci->devs[udev->slot_id];
 		if (!vdev || vdev->udev != udev)
+			return;
+
+		/*
+		 * A slot that is only enabled, as after the xHC lost its state and
+		 * a reset-resume allocated the slot again, has no ep0 context yet:
+		 * an Evaluate Context fails with a Context State Error. Address
+		 * Device sets ep0 up and the core resets ep0 again if needed.
+		 */
+		slot_ctx = xhci_get_slot_ctx(xhci, vdev->out_ctx);
+		if (GET_SLOT_STATE(le32_to_cpu(slot_ctx->dev_state)) ==
+		    SLOT_STATE_DISABLED)
 			return;
 
 		xhci_check_ep0_maxpacket(xhci, vdev);
