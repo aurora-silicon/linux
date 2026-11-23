@@ -99,10 +99,10 @@ static const struct file_operations dbgview_regs_fops = {
 	.llseek = default_llseek,
 };
 
-static int dbgview_snapshot_show(struct seq_file *s, void *unused)
+static int dbgview_snapshot(struct seq_file *s, unsigned int bytes)
 {
 	struct dbgview *dv = s->private;
-	size_t words = min_t(size_t, snap_bytes, dv->size) / 4;
+	size_t words = min_t(size_t, bytes, dv->size) / 4;
 	unsigned long flags;
 	u64 before, after;
 	u32 *val;
@@ -137,6 +137,10 @@ static int dbgview_snapshot_show(struct seq_file *s, void *unused)
 
 	kfree(val);
 	return 0;
+}
+static int dbgview_snapshot_show(struct seq_file *s, void *unused)
+{
+	return dbgview_snapshot(s, snap_bytes);
 }
 DEFINE_SHOW_ATTRIBUTE(dbgview_snapshot);
 
@@ -221,3 +225,7 @@ module_exit(dbgview_exit);
 MODULE_AUTHOR("Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>");
 MODULE_DESCRIPTION("Apple SoC read-only debug register views");
 MODULE_LICENSE("Dual MIT/GPL");
+
+#if IS_ENABLED(CONFIG_APPLE_DBGVIEW_KUNIT_TEST)
+#include "dbgview-test.c"
+#endif

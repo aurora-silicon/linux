@@ -25,6 +25,20 @@ config APPLE_DBGVIEW
 
 	  Say m here if you debug an Apple SoC.
 
+config APPLE_DBGVIEW_KUNIT_TEST
+	bool "KUnit tests for the Apple SoC debug register views" if !KUNIT_ALL_TESTS
+	depends on APPLE_DBGVIEW=y && KUNIT=y && PM
+	default KUNIT_ALL_TESTS
+	help
+	  Read the regs and snapshot views of a register block that the
+	  test backs with kernel memory: whole, partial, unaligned, short
+	  and page-sized reads, end of block, runtime PM references and
+	  failures, bad user buffers, the snapshot format and its size
+	  parameter, and that no view writes the block. The tests touch no
+	  hardware.
+
+	  If unsure, say N.
+
 config APPLE_DOCKCHANNEL
 	tristate "Apple DockChannel FIFO"
 	depends on ARCH_APPLE || COMPILE_TEST
