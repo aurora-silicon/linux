@@ -86,6 +86,36 @@ static inline bool ane_fw_cold_engine_restartable(const struct ane_fw_cold_state
 	return true;
 }
 
+/* ANE_SYS's actual power state (PMGR bits 7:4) reads off. */
+static inline bool ane_fw_sys_off(u32 sys)
+{
+	return !(sys & 0xf0);
+}
+
+/*
+ * A session quarantined by a hung request, powered off under its firmware
+ * without a stop. down: our power-down of the quarantined engine began
+ * (ANE_SYS was still held by us then, so no earlier OFF counts); sys_off:
+ * genpd then reported ANE_SYS off with its PMGR actual state off; held: we
+ * hold ANE_SYS or the child power states again.
+ */
+struct ane_fw_hung_proof {
+	bool down, sys_off, held;
+};
+
+/*
+ * The old firmware is gone, and the memory it could reach (pool, IPC, heap,
+ * heap tail, DATA, programs closed while quarantined) may be reused, only
+ * when ANE_SYS really went off after our power-down and the ANE CPU and
+ * sub-block power states read off now (@pmgr, read from PMGR, which is
+ * readable in any power state). Anything less keeps the quarantine.
+ */
+static inline bool ane_fw_hung_gone(const struct ane_fw_hung_proof *p,
+				    const struct ane_fw_cold_state *pmgr)
+{
+	return p->down && p->sys_off && !p->held && ane_fw_cold_pmgr_valid(pmgr, true);
+}
+
 /*
  * RVBAR (engine +0x1050000) and the TEXT entry: latched at TEXT (bit 0 set)
  * is ready; with bit 0 clear the entry may be written; latched at any other

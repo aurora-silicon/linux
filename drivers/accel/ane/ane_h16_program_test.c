@@ -2142,6 +2142,66 @@ static void program_sleep_gate_test(struct kunit *test)
 	mutex_unlock(lock);
 }
 
+/*
+ * Closing the session for a park or a sleep releases a held gate. When that
+ * fails, the session is quarantined there and the backend told once, so a
+ * backend checks for the quarantine after closing (the H17 park and sleep
+ * do) and recovers it with a verified power cycle: the open program is
+ * replayed and runs again behind its handle.
+ */
+static void program_sleep_gate_quarantine_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test);
+	struct ane_h16_program *p = NULL;
+	struct mutex *lock = kunit_kzalloc(test, sizeof(*lock), GFP_KERNEL);
+	unsigned int replayed;
+	u64 first;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, lock);
+	mutex_init(lock);
+	f->s.ops = &fw_session_ops_hung;
+	f->s.gate_hold_ns = 1000;
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+	KUNIT_ASSERT_TRUE(test, f->s.gate_held);
+
+	/*
+	 * The firmware takes nothing any more: the closing gate fails. The
+	 * session lock is set only around the sleep gate, so no idle gate work
+	 * outlives the test (as in program_gate_hold_test).
+	 */
+	f->t.armed = false;
+	f->s.lock = lock;
+	ane_h16_session_sleep(&f->s, true);
+	KUNIT_EXPECT_TRUE(test, f->s.asleep);
+	KUNIT_EXPECT_FALSE(test, f->s.gate_held);
+	KUNIT_EXPECT_TRUE(test, f->s.quarantined);
+	KUNIT_EXPECT_EQ(test, f->hung, 1U);
+	/* Closed again while quarantined: no second report. */
+	ane_h16_session_sleep(&f->s, false);
+	ane_h16_session_sleep(&f->s, true);
+	KUNIT_EXPECT_EQ(test, f->hung, 1U);
+
+	/* Powered off, proven off, booted again from the preload. */
+	f->t.armed = true;
+	fw_cold_boot(f);
+	ane_h16_session_restart(&f->s);
+	ane_h16_session_recovered(&f->s);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_replay(&f->s, &replayed, &first), 0);
+	KUNIT_EXPECT_EQ(test, replayed, 1U);
+	ane_h16_session_sleep(&f->s, false);
+	f->s.lock = NULL;
+	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+	KUNIT_EXPECT_EQ(test, f->hung, 1U);
+	f->now += 1000;
+	KUNIT_EXPECT_EQ(test, ane_h16_session_gate_expire(&f->s), 0);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), 0);
+	ane_h16_session_put(&f->s, p);
+	cancel_delayed_work_sync(&f->s.gate_work);
+}
+
 /* A program survives a sleep: the same handle executes afterwards. */
 static void program_sleep_keeps_program_test(struct kunit *test)
 {
@@ -3383,6 +3443,7 @@ static struct kunit_case program_cases[] = {
 	KUNIT_CASE(program_sleep_replay_failure_test),
 	KUNIT_CASE(program_sleep_replay_deferred_test),
 	KUNIT_CASE(program_sleep_gate_test),
+	KUNIT_CASE(program_sleep_gate_quarantine_test),
 	KUNIT_CASE(program_sleep_keeps_program_test),
 	KUNIT_CASE(program_sleep_restart_test),
 	KUNIT_CASE(program_sleep_restart_deferred_test),

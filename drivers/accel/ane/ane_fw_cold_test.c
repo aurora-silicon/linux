@@ -365,7 +365,53 @@ static void ane_cold_no_clpc_test(struct kunit *test)
 #endif
 }
 
+/*
+ * Recovery of a hung engine reuses its memory only with the whole proof: our
+ * power-down began, ANE_SYS then went off as PMGR reads it, nothing is held
+ * again, and the ANE CPU and sub-block read off now.
+ */
+static void ane_cold_hung_gone_test(struct kunit *test)
+{
+	const struct ane_fw_hung_proof proven = { .down = true, .sys_off = true };
+	struct ane_fw_cold_state off = ane_cold_fixture(), s;
+	struct ane_fw_hung_proof p;
+
+	KUNIT_EXPECT_TRUE(test, ane_fw_sys_off(0x200));
+	KUNIT_EXPECT_TRUE(test, ane_fw_sys_off(0x20f));
+	KUNIT_EXPECT_FALSE(test, ane_fw_sys_off(0x23ff));
+	KUNIT_EXPECT_FALSE(test, ane_fw_sys_off(0x10));
+
+	KUNIT_EXPECT_TRUE(test, ane_fw_hung_gone(&proven, &off));
+	/* No power-down of ours, so an OFF proves nothing about the hung firmware. */
+	p = proven;
+	p.down = false;
+	KUNIT_EXPECT_FALSE(test, ane_fw_hung_gone(&p, &off));
+	/* ANE_SYS never reported off (runtime DARTs held it, or no genpd notifier). */
+	p = proven;
+	p.sys_off = false;
+	KUNIT_EXPECT_FALSE(test, ane_fw_hung_gone(&p, &off));
+	/* Powered again, or a reference still held. */
+	p = proven;
+	p.held = true;
+	KUNIT_EXPECT_FALSE(test, ane_fw_hung_gone(&p, &off));
+	/* The ANE CPU power state targets or reads on. */
+	s = off;
+	s.cpu |= 0xf;
+	KUNIT_EXPECT_FALSE(test, ane_fw_hung_gone(&proven, &s));
+	s = off;
+	s.cpu |= 0xf0;
+	KUNIT_EXPECT_FALSE(test, ane_fw_hung_gone(&proven, &s));
+	/* A sub-block word left on, or BUSY latched as a stuck power-down leaves it. */
+	s = off;
+	s.subblock = 0x3ff;
+	KUNIT_EXPECT_FALSE(test, ane_fw_hung_gone(&proven, &s));
+	s = off;
+	s.subblock = 0x300 | BIT(11);
+	KUNIT_EXPECT_FALSE(test, ane_fw_hung_gone(&proven, &s));
+}
+
 static struct kunit_case ane_cold_cases[] = {
+	KUNIT_CASE(ane_cold_hung_gone_test),
 	KUNIT_CASE(ane_cold_no_clpc_test),
 	KUNIT_CASE(ane_cold_restartable_test),
 	KUNIT_CASE(ane_cold_rvbar_test),
