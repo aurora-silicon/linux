@@ -1806,6 +1806,8 @@
 		operating-points-v2 = <&gpu_opp>;
 		apple,cs-opp = <&gpu_cs_opp>;
 		apple,afr-opp = <&gpu_afr_opp>;
+		/* Avoid a core power cycle between interactive submissions, then release. */
+		apple,idle-off-delay-ms = <16>;
 		apple,firmware-version = <26 5 2>;
 };
 
