@@ -7376,8 +7376,8 @@ static int apple_dart_reimport_locked(struct apple_dart *dart)
 		}
 		done++;
 	}
-	dev_info(dart->dev, "hibernation restore: %d locked streams re-imported (%d)\n",
-		 done, ret);
+	dev_dbg(dart->dev, "hibernation restore: %d locked streams re-imported (%d)\n",
+		done, ret);
 	return ret;
 }
 
@@ -7389,7 +7389,7 @@ static int apple_dart_restore(struct device *dev)
 	/* No register of a block its display consumer took down can be read before it is up. */
 	if (READ_ONCE(dart->display_unpowered)) {
 		dart->restore_pending = true;
-		dev_info(dev, "hibernation restore deferred to its display's power-up\n");
+		dev_dbg(dev, "hibernation restore deferred to its display's power-up\n");
 		return 0;
 	}
 	ret = apple_dart_system_resume(dev);
@@ -7433,7 +7433,8 @@ int apple_dart_display_restore(struct device *dev)
 	dart->restore_pending = false;
 	ret = apple_dart_system_resume(dev);
 	if (ret || !dart->locked) {
-		dev_info(dev, "deferred hibernation restore at its display's power-up: %d\n", ret);
+		if (ret)
+			dev_err(dev, "deferred hibernation restore failed: %d\n", ret);
 		return ret;
 	}
 	ret = pm_runtime_resume_and_get(dev);
@@ -7441,7 +7442,7 @@ int apple_dart_display_restore(struct device *dev)
 		return ret;
 	ret = apple_dart_reimport_locked(dart);
 	pm_runtime_put(dev);
-	dev_info(dev, "deferred hibernation restore at its display's power-up: %d\n", ret);
+	dev_dbg(dev, "deferred hibernation restore at its display's power-up: %d\n", ret);
 #endif
 	return ret;
 }
