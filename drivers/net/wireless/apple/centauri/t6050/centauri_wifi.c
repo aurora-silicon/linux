@@ -12,6 +12,7 @@
 #include <linux/workqueue.h>
 #include <net/cfg80211.h>
 #include <net/regulatory.h>
+#include <net/sock.h>
 #include "centauri_t6050.h"
 
 #define CR_BASE 0x100000
@@ -36,6 +37,13 @@
  */
 #define DATA_TX_QUEUE_LIMIT 128
 #define DATA_TX_INFLIGHT_MAX 512
+/*
+ * TCP sizes its bursts, its small-queue budget and (BBR) the extra
+ * congestion window it allows for them at 1 ms of its pacing rate (shift
+ * 10). Aggregation on a shared Wi-Fi channel wants more: mac80211 sets 8 ms
+ * (shift 7) on every socket it transmits for, and so does this driver.
+ */
+#define DATA_TX_PACING_SHIFT 7
 
 static_assert(DATA_TX_BUFFER >=
 	      CEN_ALPHA_SCRATCH_OFFSET + CEN_ALPHA_SCRATCH_SIZE);
@@ -2503,6 +2511,7 @@ static netdev_tx_t net_transmit(struct sk_buff *skb, struct net_device *netdev)
 		netif_stop_queue(netdev);
 		return NETDEV_TX_BUSY;
 	}
+	sk_pacing_shift_update(skb->sk, DATA_TX_PACING_SHIFT);
 	skb_queue_tail(&wifi->data_tx_queue, skb);
 	if (skb_queue_len(&wifi->data_tx_queue) >= DATA_TX_QUEUE_LIMIT)
 		netif_stop_queue(netdev);
