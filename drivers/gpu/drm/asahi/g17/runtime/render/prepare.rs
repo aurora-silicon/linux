@@ -993,7 +993,7 @@ impl super::super::Backend {
             let _scope = (*held)
                 .as_mut()
                 .filter(|claim| claim.remaining() != 0)
-                .map(|claim| firmware.init.outer_scope(claim))
+                .map(|claim| firmware.port.outer_scope(&firmware.init, claim))
                 .transpose()?;
             firmware.publish_render(self.owner, slot, packet, deferred)
         })();

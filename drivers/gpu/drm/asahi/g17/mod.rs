@@ -1265,8 +1265,12 @@ struct Shared {
     /// Preallocated completion collector owned exclusively by `run_runtime_events`.
     #[pin]
     worker_deferred: Mutex<Option<runtime::DeferredBatch>>,
-    /// M5: the event work and the scheduler workers follow the submitting CPU.
+    /// M5: the event work follows the submitting CPU.
     follows_submitter: bool,
+    /// Multi-die M5: restrict each scheduler's ordered submit queue to the creating CPU's
+    /// cluster to avoid cross-die migration. Single-die M5 parts leave schedulers unpinned so
+    /// queues created on one thread do not contend on a single cluster under multi-queue load.
+    pin_scheduler_cluster: bool,
     /// M5: the CPU of the last publication, `u32::MAX` before the first.
     submitter: AtomicU32,
     #[pin]
@@ -1457,9 +1461,10 @@ impl Shared {
         self.events.clone()
     }
 
-    /// Whether the event work and the scheduler workers follow the submitting CPU (M5).
-    pub(super) fn follows_submitter(&self) -> bool {
-        self.follows_submitter
+    /// Whether each scheduler's submit queue should be restricted to the creating CPU's cluster
+    /// (multi-die M5 only).
+    pub(super) fn pin_scheduler_cluster(&self) -> bool {
+        self.pin_scheduler_cluster
     }
 
     /// Records the publishing CPU for the event work's placement (M5).
@@ -1802,6 +1807,7 @@ impl Gpu {
                     "g17::Shared::worker_deferred"
                 ),
                 follows_submitter: m5,
+                pin_scheduler_cluster: m5 && id.num_dies > 1,
                 submitter: AtomicU32::new(u32::MAX),
                 grow <- new_work!("g17::Shared::grow"),
                 reclaim_work <- new_work!("g17::Shared::reclaim_work"),

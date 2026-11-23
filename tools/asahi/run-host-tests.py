@@ -257,6 +257,10 @@ ASAHI_TESTS = {
     'g17-m5-direct-compute-tests.py': [([], PASS)]
         + mutations('--mutation', ('no-pre-recovery-drain', 'direct-debits-published',
                                    'scope-allows-reserve'), []),
+    'g17-m5-multiqueue-contention-tests.py': [([], PASS)]
+        + mutations('--mutation', ('unlocked-claim-outer', 'raw-compute-scope',
+                                   'raw-render-scope', 'unlocked-scope-drop',
+                                   'drop-direct-claim-on-fallback', 'pin-single-die'), []),
     'g17-firmware-selection-tests.py': [([], PASS)],
     'g17-growth-gate-tests.py': [([], PASS)],
     'g17-growth-tests.py': [([], PASS)],

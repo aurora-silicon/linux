@@ -7,9 +7,9 @@
 //! through a preparation lease ([`super::Shared::port`]): shutdown and device loss join every
 //! lease before they detach the session. Each piece below is atomic or has its own lock.
 //!
-//! Lock order: device mutex -> compute queue cell -> the locks of this port. Among the port's
-//! locks: render publication lock -> M5 outer-ring lock -> admission pool, QoS, mailbox. None
-//! of their holders ever takes the device mutex.
+//! Lock order: device mutex -> outer_{compute,render} -> compute queue cell -> the locks of
+//! this port. Among the port's locks: render publication lock -> M5 outer-ring lock ->
+//! admission pool, QoS, mailbox. None of their holders ever takes the device mutex.
 
 use super::{
     fw::{
@@ -170,6 +170,22 @@ pub(super) struct M5RenderRoom {
 impl M5RenderRoom {
     pub(super) fn priority(&self) -> u8 {
         self.priority
+    }
+}
+
+/// Serializes entry and Drop of an M5 [`super::initdata::OuterScope`] under `Port::m5_outer`
+/// so `Credits::scoped` and `reserved[]` cannot race with direct M5 reservations or publications.
+pub(super) struct PortOuterScope<'a> {
+    scope: Option<super::initdata::OuterScope<'a>>,
+    port: Arc<Port>,
+}
+
+impl Drop for PortOuterScope<'_> {
+    fn drop(&mut self) {
+        if let Some(scope) = self.scope.take() {
+            let _m5_outer = self.port.m5_outer_lock();
+            drop(scope);
+        }
     }
 }
 
@@ -340,6 +356,21 @@ impl Port {
     /// Serializes M5 shared outer-ring and host-port updates with direct M5 compute publishers.
     pub(super) fn m5_outer_lock(&self) -> MutexGuard<'_, Option<(u32, u64, u64)>> {
         self.m5_outer.lock()
+    }
+
+    /// Enters an M5 `OuterScope` under `m5_outer` and returns a guard that re-acquires
+    /// `m5_outer` around the inner scope's Drop, preventing races with direct M5 reservations.
+    pub(super) fn outer_scope<'a>(
+        self: &Arc<Self>,
+        init: &super::initdata::InitData,
+        claim: &'a mut super::initdata::OuterClaim,
+    ) -> Result<PortOuterScope<'a>> {
+        let _m5_outer = self.m5_outer.lock();
+        let scope = init.outer_scope(claim)?;
+        Ok(PortOuterScope {
+            scope: Some(scope),
+            port: self.clone(),
+        })
     }
 
     /// Clears the cached M5 submission-history geometry after firmware recovery restarts.

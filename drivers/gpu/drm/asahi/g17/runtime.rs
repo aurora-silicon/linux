@@ -2194,14 +2194,28 @@ impl Backend {
         }
         let m5 = self.context.is_m5();
         let priority = packet.context.policy().priority();
-        // Reserve M5 outer room before locking the compute cell so an unspent claim drops
-        // outside the cell lock (dropping an unspent claim can notify availability fences).
-        let mut m5_outer = if m5 {
-            Some(port.reserve_m5_compute(priority).ok()?)
+        // Reuse the M5 outer claim already reserved during prepare_compute() when present and
+        // matching priority, avoiding a redundant Port::m5_outer lock trip and unused-claim drop
+        // notification; otherwise reserve before locking the compute cell.
+        let (mut m5_outer, from_held) = if m5 {
+            let claimed = {
+                let mut held = self.outer_compute.lock();
+                if held.as_ref().is_some_and(|claim| {
+                    claim.remaining() != 0 && claim.priority() == usize::from(priority)
+                }) {
+                    held.take()
+                } else {
+                    None
+                }
+            };
+            match claimed {
+                Some(claim) => (Some(claim), true),
+                None => (Some(port.reserve_m5_compute(priority).ok()?), false),
+            }
         } else {
-            None
+            (None, false)
         };
-        let result = {
+        let result = (|| {
             let mut queue = cell.lock()?;
             if !queue.installed()
                 || queue.spared_pending()
@@ -2225,13 +2239,29 @@ impl Backend {
                 m5,
                 generation: port.generation(),
             };
-            queue.publish(packet.clone(), &[], &mut host, &mut |event| deferred.push(event))
+            Some(queue.publish(packet.clone(), &[], &mut host, &mut |event| deferred.push(event)))
+        })();
+        let outcome = match result {
+            None => None,
+            Some(Err(error)) if (error == EAGAIN || error == EBUSY) && !packet.is_published() => {
+                None
+            }
+            Some(result) => Some(result),
         };
-        drop(m5_outer);
-        match result {
-            Err(error) if (error == EAGAIN || error == EBUSY) && !packet.is_published() => None,
-            result => Some(result),
+        if outcome.is_none() && from_held {
+            if let Some(claim) = m5_outer.take().filter(|claim| claim.remaining() != 0) {
+                let mut held = self.outer_compute.lock();
+                if !held.as_ref().is_some_and(|existing| existing.remaining() != 0) {
+                    // Replace None or an already-spent claim (whose drop notifies nobody).
+                    *held = Some(claim);
+                } else {
+                    drop(held);
+                    drop(claim);
+                }
+            }
         }
+        drop(m5_outer);
+        outcome
     }
 
     /// Scheduler admission of a compute packet. Shared capacity the packet lacks (a channel, a
@@ -2323,6 +2353,7 @@ impl Backend {
         if held.as_ref().is_some_and(|claim| claim.remaining() != 0) {
             return Ok(true);
         }
+        let _m5_outer = firmware.port.m5_outer_lock();
         match firmware.init.reserve_outer(self.context.policy().priority(), count) {
             Ok(claim) => {
                 // Replaces only a spent claim, whose drop notifies nobody.
@@ -2346,7 +2377,7 @@ impl Backend {
         let _scope = (*held)
             .as_mut()
             .filter(|claim| claim.remaining() != 0)
-            .map(|claim| firmware.init.outer_scope(claim))
+            .map(|claim| firmware.port.outer_scope(&firmware.init, claim))
             .transpose()?;
         firmware.publish_compute(self.owner, packet.clone(), dependencies, deferred)
     }
