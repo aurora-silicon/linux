@@ -842,16 +842,22 @@ static void dcp_peer_queue_completion(struct apple_dcp *owner, u32 id, ktime_t t
 }
 #endif
 
+/* Only the swap id of a swap_complete record is used. */
+static void dcp_swap_complete_id(struct apple_dcp *dcp, u32 swap_id)
+{
+	ktime_t now = dcp_is_ext26(dcp) ? ns_to_ktime(dcp->ext26_rx_ns) : ktime_get();
+	trace_iomfb_swap_complete(dcp, swap_id);
+#if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
+	if (dcp_peer_swap_complete_v27(dcp, swap_id, now, dcp_peer_queue_completion))
+		return;
+#endif
+	dcp_report_swap_complete(dcp, swap_id, now);
+}
+
 static void dcpep_cb_swap_complete(struct apple_dcp *dcp,
 				   struct DCP_FW_NAME(dc_swap_complete_resp) *resp)
 {
-	ktime_t now = dcp_is_ext26(dcp) ? ns_to_ktime(dcp->ext26_rx_ns) : ktime_get();
-	trace_iomfb_swap_complete(dcp, resp->swap_id);
-#if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
-	if (dcp_peer_swap_complete_v27(dcp, resp->swap_id, now, dcp_peer_queue_completion))
-		return;
-#endif
-	dcp_report_swap_complete(dcp, resp->swap_id, now);
+	dcp_swap_complete_id(dcp, resp->swap_id);
 }
 
 /* special */
@@ -3471,13 +3477,11 @@ static void dcp_swapped(struct apple_dcp *dcp, void *data, void *cookie)
 		return;
 	}
 	if (dcp_is_ext26(dcp) && dcp->ext26_early_complete && dcp->ext26_early_id == swap_id) {
-		struct DCP_FW_NAME(dc_swap_complete_resp) completed = { .swap_id = swap_id };
-
 		u64 received = dcp->ext26_rx_ns;
 
 		dcp->ext26_early_complete = false;
 		dcp->ext26_rx_ns = dcp->ext26_early_ns;
-		dcpep_cb_swap_complete(dcp, &completed);
+		dcp_swap_complete_id(dcp, swap_id);
 		dcp->ext26_rx_ns = received;
 		return;
 	}
