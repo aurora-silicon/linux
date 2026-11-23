@@ -2160,6 +2160,9 @@ static bool iomfb_uses_queue(struct apple_dcp *d) { (void)d; return false; }
 static bool test_and_set_bit(int t, unsigned long *b) { (void)t; (void)b; return false; }
 static void complete(int *p) { *p = 1; }
 static u8 dcp_push_depth(unsigned *d) { return (*d)++; }
+/* As in iomfb.c: a frame starts after the end of the one below it. */
+static u16 dcp_packet_start(struct dcp_channel *ch, u8 depth)
+{ return depth ? ch->end[depth - 1] : 0; }
 /* As dcp_ack(): pop the callback frame and write its reply back once. */
 static void dcp_ack(struct apple_dcp *d, enum dcp_context_id c)
 {

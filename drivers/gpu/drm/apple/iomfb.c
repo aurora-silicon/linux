@@ -2205,9 +2205,15 @@ static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
 	u8 depth;
 	bool handled, zero_reply;
 
-	/* The record must lie in the channel window before anything reads it. */
+	/*
+	 * The record must lie in the channel window before anything reads it,
+	 * above the frames still pending on this channel: copying it, and
+	 * zeroing its tail, must not touch an outer callback that is waiting
+	 * for its reply.
+	 */
 	if (length < sizeof(*hdr) || !ch || !ch->cb_shadow ||
 	    ch->depth >= DCP_MAX_CALL_DEPTH ||
+	    offset < dcp_packet_start(ch, ch->depth) ||
 	    offset >= DCP_CB_AREA || length > DCP_CB_AREA - offset) {
 		dev_err(dev, "invalid IOMFB callback envelope\n");
 		dcp->crashed = true;
