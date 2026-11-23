@@ -1480,7 +1480,7 @@ static bool tas2764_writeable_register(struct device *dev, unsigned int reg)
 	case TAS2764_REG(0x1, 0x33):
 	case TAS2764_REG(0x1, 0x37):
 	case TAS2764_SDOUT_HIZ_1 ... TAS2764_SDOUT_HIZ_9:
-	case TAS2764_REG(0x1, 0x47):
+	case TAS2764_TG_EN:
 	case TAS2764_REG(0x6, 0x14) ... TAS2764_REG(0x6, 0x1f):
 	case TAS2764_REG(0xf0, 0x0) ... TAS2764_REG(0xff, 0x7f):
 		return true;

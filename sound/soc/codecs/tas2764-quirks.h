@@ -169,11 +169,6 @@ static int tas2764_do_quirky_pwr_ctrl_change(struct tas2764_priv *tas2764,
  *  - set BOP settings (the BOP config bits *and* BOP_SRC)
  */
 
-/*
- * Other setup TODOs:
- *  - DVC ramp rate
- */
-
 static const struct tas2764_quirk_init_sequence {
 	const struct reg_sequence *seq;
 	int len;
