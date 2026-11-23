@@ -110,15 +110,6 @@
 
 #include "isp-imx558-cfg0.dtsi"
 
-/*
- * The Wi-Fi/Bluetooth module's CLKREQ# is wired to the SoC (the ADT gives the
- * Wi-Fi bridge a CLKREQ function), so the link may use Clock PM and the L1 PM
- * Substates.
- */
-&port00 {
-	supports-clkreq;
-};
-
 &isp {
 	apple,platform-id = <18>;
 	apple,temporal-filter = <1>;

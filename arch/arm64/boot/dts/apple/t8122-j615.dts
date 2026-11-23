@@ -161,3 +161,12 @@
 	/* Per-device factory data from this Mac's own iBoot system container. */
 	firmware-name = "apple/mesacal-j615.bin";
 };
+
+/*
+ * The Wi-Fi/Bluetooth module's CLKREQ# is wired to the SoC (the J615 ADT gives
+ * the Wi-Fi bridge a CLKREQ function), so the link may use Clock PM and the L1
+ * PM Substates.
+ */
+&port00 {
+	supports-clkreq;
+};
