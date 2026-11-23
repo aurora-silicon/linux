@@ -48,12 +48,13 @@ pub(crate) fn explicit_dependency(board: &Board) -> u8 {
 /// Dependency class of a compute kick's implicit parent (the previous kick of its queue) on
 /// `board`. With the counted forms ([`counted_forms`]) it is class 1, which holds the kick until
 /// its parent has completed. On boards whose explicit waits take the completion class
-/// ([`Board::completion_inputs`]) a parent the host has already retired (`parent_retired`) takes
-/// the pipelined class instead, as macOS's late-published M5 Pro kicks do: there is nothing left
-/// to hold for. Otherwise it is the pipelined class, with which a kick may start while its parent
-/// still runs.
-pub(crate) fn parent_dependency(board: &Board, parent_retired: bool) -> u8 {
-    if !counted_forms(board) || (parent_retired && board.completion_inputs()) {
+/// ([`Board::completion_inputs`]), a kick whose parent may overlap (`pipeline_parent` — because
+/// every earlier kick of the queue has retired, or the kick declares no compute barrier against
+/// any active kick of the same context and carries no explicit dependencies or visible-completion
+/// requirement) takes the pipelined class instead. Otherwise it is the pipelined class, with which
+/// a kick may start while its parent still runs.
+pub(crate) fn parent_dependency(board: &Board, pipeline_parent: bool) -> u8 {
+    if !counted_forms(board) || (pipeline_parent && board.completion_inputs()) {
         COMPUTE_PIPELINED_DEPENDENCY
     } else {
         COMPLETION_DEPENDENCY

@@ -2628,6 +2628,7 @@ impl Queue {
         let (epoch, addresses) = self.publication_preflight(&packet, host)?;
         let crate::g17::command::Validated::Compute {
             matrix_ops: requested_matrix_ops,
+            visible_completion,
             cdm_auxiliary_allocation,
             plan,
             m5_intersection,
@@ -2777,13 +2778,33 @@ impl Queue {
         let predecessor = KickPredecessor::new(qid, kick_parent)?;
         let matrix_ops = self.graph.m5 && *requested_matrix_ops;
         let m5_board = if self.graph.m5 { Some(self.graph.board.ok_or(EINVAL)?) } else { None };
-        // Every earlier kick of this queue has retired, so the parent has completed.
+        // Every earlier kick of this queue has retired, so the parent has completed;
+        // or the kick declares no compute barrier against any active kick of this queue,
+        // has no explicit dependencies or visible-completion requirement, and shares the
+        // same context with no replay/quarantine/witness pending, so pipelined overlap is valid.
         let parent_retired = self.active.len == 0
             && self.replays.len == 0
             && !self.quarantined
             && !self.awaiting_witness;
-        let parent_class = m5_board
-            .map(|board| crate::g17::fw::m5::compute::parent_dependency(board, parent_retired));
+        let same_context_independent = !parent_retired
+            && dependencies.is_empty()
+            && !*visible_completion
+            && self.replays.len == 0
+            && !self.quarantined
+            && !self.awaiting_witness
+            && self.active.iter().all(|active| {
+                active.packet.context.id() == packet.context.id()
+                    && !crate::g17::job::Order::contains(
+                        packet.order.wait_through[crate::g17::job::Engine::Compute.index()],
+                        active.packet.order.sequence,
+                    )
+            });
+        let parent_class = m5_board.map(|board| {
+            crate::g17::fw::m5::compute::parent_dependency(
+                board,
+                parent_retired || same_context_independent,
+            )
+        });
         let m5_args = m5_board.zip(parent_class).map(|(board, parent_class)| {
             let tuple = crate::g17::fw::m5::compute::kick_tuple(board, parent_class);
             crate::g17::fw::m5::compute::DescriptorArgs {
