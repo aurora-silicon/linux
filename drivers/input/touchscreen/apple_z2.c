@@ -153,6 +153,11 @@ static int apple_z2_read_packet(struct apple_z2 *z2)
 		return 0;
 
 	pkt_len = (get_unaligned_le16(z2->rx_buf + 1) + 8) & 0xfffffffc;
+	/*
+	 * No valid packet is this long. Drop it unread rather than read it in
+	 * pieces: a controller that sends one is misbehaving, and touch input
+	 * stopping is the safe outcome.
+	 */
 	if (pkt_len > APPLE_Z2_RX_BUF_SIZE) {
 		dev_warn_ratelimited(&z2->spidev->dev,
 				     "dropping oversized packet (%zu bytes)\n",

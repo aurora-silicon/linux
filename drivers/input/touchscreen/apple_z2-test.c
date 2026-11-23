@@ -17,7 +17,7 @@
 #include <linux/sizes.h>
 
 /* Size of the receive buffer that apple_z2_probe() allocates */
-#define Z2_TEST_RX_SIZE		4000
+#define Z2_TEST_RX_SIZE		APPLE_Z2_RX_BUF_SIZE
 /*
  * The test's receive buffer is much larger than the driver's, so that a read
  * with a hostile length stays inside the allocation and can be checked.
@@ -714,7 +714,8 @@ static void z2_parse_count_beyond_report(struct kunit *test)
 		if (z2_test_slot_of(ctx, i) >= 0)
 			beyond++;
 	KUNIT_EXPECT_EQ(test, beyond, 0);
-	KUNIT_EXPECT_LE(test, z2_test_active_slots(ctx), 3);
+	/* ...while the three records the report holds are all reported */
+	KUNIT_EXPECT_EQ(test, z2_test_active_slots(ctx), 3);
 }
 
 /* The report ends before the first finger record */
@@ -744,7 +745,8 @@ static void z2_parse_partial_record(struct kunit *test)
 	z2_test_parse(ctx, 2, z2_test_msg_len(2) - 1);
 
 	KUNIT_EXPECT_EQ(test, z2_test_slot_of(ctx, 2), -1);
-	KUNIT_EXPECT_LE(test, z2_test_active_slots(ctx), 1);
+	KUNIT_EXPECT_GE(test, z2_test_slot_of(ctx, 1), 0);
+	KUNIT_EXPECT_EQ(test, z2_test_active_slots(ctx), 1);
 }
 
 /*
@@ -887,12 +889,22 @@ static void z2_read_oversize_length(struct kunit *test)
 	unsigned int i;
 
 	for (i = 0; i < ARRAY_SIZE(wire_lens); i++) {
+		/* The length the driver reads, as apple_z2_read_packet() rounds it */
+		size_t pkt_len = (wire_lens[i] + 8) & ~3;
+		bool fits = pkt_len <= Z2_TEST_RX_SIZE;
+
 		z2_test_clear_log(ctx);
 		z2_test_queue_packet(ctx, 0, wire_lens[i]);
-		apple_z2_read_packet(&ctx->z2);
+		KUNIT_EXPECT_EQ_MSG(test, apple_z2_read_packet(&ctx->z2),
+				    fits ? 0 : -EMSGSIZE,
+				    "length field %u", wire_lens[i]);
 		KUNIT_EXPECT_LE_MSG(test, ctx->max_rx_len,
 				    (size_t)Z2_TEST_RX_SIZE,
 				    "length field %u", wire_lens[i]);
+		/* A dropped packet is not parsed */
+		if (!fits)
+			KUNIT_EXPECT_EQ_MSG(test, ctx->nevents, 0,
+					    "length field %u", wire_lens[i]);
 	}
 }
 
