@@ -27,6 +27,12 @@ enum ane_fw_irq_role {
 	ANE_FW_IRQ_CHANNELS,
 };
 
+struct ane_fw_bridge_op {
+	u32 offset;
+	u32 clear;
+	u32 set;
+};
+
 /* Later firmware generations must never enter the H14 staging path. */
 struct ane_fw_platform {
 	const struct ane_h16_profile *h16_profiles;
@@ -34,6 +40,9 @@ struct ane_fw_platform {
 	/* DART/DAPF register tables, one per supported DART revision. */
 	const struct ane_h16_mmio *h16_mmio;
 	unsigned int h16_mmio_count;
+	/* Engine AXI2AF bridge register updates applied after CE bring-up at every power-up. */
+	const struct ane_fw_bridge_op *bridge_ops;
+	unsigned int bridge_op_count;
 	/* DART PARAMS3, the one DART register read before a table is chosen. */
 	u32 dart_params;
 	/* The DAPF bank: iommus entry that owns it, offset from its reg, size. */
@@ -124,6 +133,12 @@ struct ane_fw_platform {
 	const struct ane_fw_platform *next_build;
 	const char *build_name;
 };
+
+static inline u32 ane_fw_bridge_op_apply(u32 current_val,
+					 const struct ane_fw_bridge_op *op)
+{
+	return (current_val & ~op->clear) | op->set;
+}
 
 /* Pure range check: the boot loader supplies the physical addresses. */
 static inline bool

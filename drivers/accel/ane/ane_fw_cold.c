@@ -1576,10 +1576,22 @@ static int ane_fw_power(struct ane_fw_backend *b, bool raw_boot)
 	return ret;
 }
 
+static void ane_fw_apply_bridge_ops(struct ane_fw_backend *b)
+{
+	unsigned int i;
+
+	for (i = 0; i < b->soc->bridge_op_count; i++) {
+		const struct ane_fw_bridge_op *op = &b->soc->bridge_ops[i];
+		void __iomem *reg = b->engine + op->offset;
+
+		ane_wr32(b, ane_fw_bridge_op_apply(ane_rd32(b, reg), op), reg);
+	}
+}
+
 /*
  * ANE_SYS on, then the child power steps from the cold state, then (for a
- * cold boot) the engine's reset values, and CE. At boot and again after a
- * power-down for sleep.
+ * cold boot) the engine's reset values, CE, and any per-SoC engine bridge
+ * register updates. At boot and again after a power-down for sleep.
  */
 static int ane_fw_power_up(struct ane_fw_backend *b, bool raw_boot, bool cold_engine)
 {
@@ -1635,6 +1647,7 @@ static int ane_fw_power_up(struct ane_fw_backend *b, bool raw_boot, bool cold_en
 	if ((ane_rd64(b, b->engine + 0x18a4010) & 3) != 3 ||
 	    ane_rd64(b, b->engine + 0x18a4018))
 		return -EIO;
+	ane_fw_apply_bridge_ops(b);
 	dev_dbg(dev, "ANE power: ANE_SYS on, child/PWGATE/CE ready\n");
 	return 0;
 }
