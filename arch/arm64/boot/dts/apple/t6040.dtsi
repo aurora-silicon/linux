@@ -308,7 +308,7 @@
 			    "keep-alive-soc", "keep-alive-east", "smc-wdt",
 			    "agx-gate", "s2r-count", "gfx-ps", "cpu-debug";
 		/*
-		 * ADT pmgr device-check-ps-b4-sleep (check-ps-b4-sleep = 0x1f): per
+		 * The power states that must be off before a sleep: per
 		 * display pipe its CPU and its last sub-block, 8 bytes apart.
 		 */
 		apple,check-ps-b4-sleep = <&pmgr_disp 0x0 0x58>, <&pmgr_aux 0x350 0x388>,
@@ -318,8 +318,8 @@
 						"dispext3";
 		/*
 		 * apple,apcie, for the sleep of ANS's storage PCIe link (two ST lanes
-		 * and a shared PHY), comes from the boot loader. From the ADT's
-		 * /arm-io/apcie0 it adds it here and puts the axi2af, cio3pll, clkgen,
+		 * and a shared PHY), comes from the boot loader. It adds
+		 * the node here and puts the axi2af, cio3pll, clkgen,
 		 * phy-block and phy-ip windows and the apple,tunable-* arrays on the
 		 * internal PCIe host (apple,t6020-pcie, the one with an "rc"
 		 * reg-name), in the single-lane T8140 shape. It leaves a node that
