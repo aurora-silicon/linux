@@ -118,7 +118,7 @@ u64 arm64_hibernate_layout_mix(u64 h, const void *p, size_t len)
 
 /*
  * Mix one memory span less the parts in @ex, ranges that this boot keeps out of
- * the image. iBoot's no-map allocations inside aura's fixed layout (the DCP
+ * the image. The boot loader's no-map allocations inside aura's fixed layout (the DCP
  * oslogs, ANS firmware) move with the boot object and split memblock's regions
  * differently on every boot; what lies there never holds an image page.
  */
