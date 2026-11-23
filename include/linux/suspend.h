@@ -438,13 +438,12 @@ int arch_hibernation_header_restore(void *addr);
  * @pfn: Valid page frame of the image.
  *
  * Provided by an architecture that sets ARCH_HIBERNATION_CLEAN_IMAGE.
- * Called once for every valid page frame of the image after the whole image
- * has been loaded, while the list of those frames is still intact, so that
- * the architecture can clean the caches for devices that do not snoop them.
+ * Called for every image page loaded straight into its original frame, once
+ * its contents are complete and before it is protected, so that the
+ * architecture can clean the caches for devices that do not snoop them.
  *
  * Return: 1 when the page was cleaned, 0 when it was left alone because
- * nothing was loaded into it through the linear map (the frame is restored
- * from restore_pblist).
+ * nothing was loaded into it through the linear map.
  */
 int arch_hibernate_clean_image_page(unsigned long pfn);
 #endif

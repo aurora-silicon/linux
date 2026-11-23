@@ -2754,32 +2754,31 @@ static void *get_buffer(struct memory_bitmap *bm, struct chain_allocator *ca)
 #ifdef CONFIG_ARCH_HIBERNATION_CLEAN_IMAGE
 /*
  * Most image pages are loaded straight into their original frames through
- * the cacheable linear map (only conflicting pages go through restore_pblist).
- * Where devices read memory without snooping the CPU caches, a later eviction
- * of a dirty line would overwrite what a device wrote since: let the
- * architecture clean every image page before the jump.
+ * the cacheable linear map (only conflicting pages go through restore_pblist,
+ * whose copy cleans them). Where devices read memory without snooping the CPU
+ * caches, a later eviction of a dirty line would overwrite what a device wrote
+ * since: let the architecture clean each such page once it is complete, while
+ * the loader still waits for the next one, rather than all of them in a pass
+ * after the load.
  */
-static void swsusp_clean_restored_image(void)
-{
-	unsigned long pfn, n = 0, skipped = 0;
+static unsigned long nr_cleaned_pages;
 
-	memory_bm_position_reset(&orig_bm);
-	for (pfn = memory_bm_next_pfn(&orig_bm); pfn != BM_END_OF_MAP;
-	     pfn = memory_bm_next_pfn(&orig_bm)) {
-		if (!pfn_valid(pfn))
-			continue;
-		if (!arch_hibernate_clean_image_page(pfn)) {
-			skipped++;
-			continue;
-		}
-		if (!(++n & 0xffff))
-			cond_resched();
-	}
-	pr_debug("%lu image pages cleaned, %lu left to the restore_pblist copy\n",
-		 n, skipped);
+static void swsusp_clean_loaded_page(void *addr)
+{
+	unsigned long pfn = memory_bm_get_current(&orig_bm);
+
+	if (addr == page_address(pfn_to_page(pfn)))
+		nr_cleaned_pages += arch_hibernate_clean_image_page(pfn);
+}
+
+static void swsusp_clean_report(void)
+{
+	pr_debug("%lu image pages cleaned as they were loaded\n", nr_cleaned_pages);
+	nr_cleaned_pages = 0;
 }
 #else
-static inline void swsusp_clean_restored_image(void) {}
+static inline void swsusp_clean_loaded_page(void *addr) {}
+static inline void swsusp_clean_report(void) {}
 #endif
 
 /**
@@ -2856,6 +2855,7 @@ next:
 		}
 	} else {
 		copy_last_highmem_page();
+		swsusp_clean_loaded_page(handle->buffer);
 		error = hibernate_restore_protect_page(handle->buffer);
 		if (error)
 			return error;
@@ -2886,6 +2886,7 @@ next:
  */
 int snapshot_write_finalize(struct snapshot_handle *handle)
 {
+	bool loaded;
 	int error;
 
 	/*
@@ -2899,12 +2900,15 @@ int snapshot_write_finalize(struct snapshot_handle *handle)
 		if (error)
 			return error > 0 ? -ENODATA : error;
 	}
+	loaded = handle->cur > 1 && handle->cur > nr_meta_pages + nr_copy_pages + nr_zero_pages;
 	copy_last_highmem_page();
+	/* while orig_bm still points at the last page: recycling overwrites it */
+	if (loaded)
+		swsusp_clean_loaded_page(handle->buffer);
 	error = hibernate_restore_protect_page(handle->buffer);
 	/* Do that only if we have loaded the image entirely */
-	if (handle->cur > 1 && handle->cur > nr_meta_pages + nr_copy_pages + nr_zero_pages) {
-		/* while orig_bm still lists the image: recycling overwrites it */
-		swsusp_clean_restored_image();
+	if (loaded) {
+		swsusp_clean_report();
 		memory_bm_recycle(&orig_bm);
 		free_highmem_data();
 	}
