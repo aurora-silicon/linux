@@ -177,6 +177,11 @@ ASAHI_TESTS = {
                                    'missing-control-firmware', 'missing-control-descriptor',
                                    'missing-owner-ipc', 'missing-owner-firmware',
                                    'missing-owner-descriptor', 'missing-owner-arena'), out()),
+    # a7638d51880c, the parent of the fix, ran pm_runtime_force_suspend in the late
+    # slot, so the dp-audio domain dropped under a running DCP.
+    'dcpaud-sleep-hold-tests.py': [(out(), PASS)]
+        + mutations('--mutation', ('bound-only', 'leak-device', 'leak-node', 'invert-wakeup'), out())
+        + [(out() + ['--ref', 'a7638d51880ce077cfb3edfa7ff638de2be74c85'], KILL)],
     'dcp-bw-scratch-window-tests.py': [([], PASS)] + mutations('--mutation', ('old-check', 'start-only'), []),
     'clpc-gpu-demand-tests.py': [([], PASS)],
     'clpc-high-power-cleanup-tests.py': [(out(), PASS),
