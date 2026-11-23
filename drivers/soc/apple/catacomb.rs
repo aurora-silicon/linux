@@ -28,16 +28,33 @@ pub(crate) fn is_kind(kind: u8) -> bool {
     path_for(kind).is_some()
 }
 
+/// Whether write() can replace this catacomb: an existing file the kernel can
+/// open for writing, which rename can also replace.
 pub(crate) fn writable(kind: u8) -> bool {
-    path_for(kind)
-        .and_then(|path| shim::StoreFile::open_writable_existing(path).ok())
-        .is_some()
+    path_for(kind).is_some_and(|path| {
+        shim::replaceable(path).is_ok() && shim::StoreFile::open_writable_existing(path).is_ok()
+    })
+}
+
+/// Whether write() can publish this catacomb when it may not exist yet: checks
+/// the parent, reserved temporary name, and any existing file. The file's
+/// contents are not read: it must open for writing or be provably missing.
+pub(crate) fn publishable(kind: u8) -> bool {
+    path_for(kind).is_some_and(|path| {
+        shim::publishable(path).is_ok()
+            && (shim::StoreFile::open_writable_existing(path).is_ok()
+                || matches!(shim::StoreFile::open_readonly(path), Err(e) if e == ENOENT))
+    })
 }
 
 /// Reserve a missing Linux owner file before SELECT_CONTEXT changes SEP state.
-/// A corrupt existing file is never truncated here: it is failure evidence.
+/// Publication prerequisites are checked first so a refused probe does not
+/// strand an empty owner file; a later sync error can still leave the empty
+/// placeholder without selecting a context. A corrupt existing file is never
+/// truncated here: it is failure evidence.
 pub(crate) fn prepare_missing_owner() -> Result<()> {
     let path = path_for(crate::PRIVATE_TYPE_CATACOMB_OWNER).ok_or(EINVAL)?;
+    shim::publishable(path)?;
     let (file, created) = shim::StoreFile::open_host(path)?;
     if !created {
         return Err(ENODATA);
@@ -56,12 +73,7 @@ pub(crate) fn write(kind: u8, blob: &[u8]) -> Result<()> {
     head[8..12].copy_from_slice(&(blob.len() as u32).to_le_bytes());
     head[12..14].copy_from_slice(&crc16_ccitt_false(blob).to_le_bytes());
 
-    let file = shim::StoreFile::open_trunc(path)?;
-    file.write_all(0, &head)?;
-    if !blob.is_empty() {
-        file.write_all(HEADER as u64, blob)?;
-    }
-    file.sync()
+    shim::replace_file(path, &head, blob)
 }
 
 /// `Ok(None)` only when the file is missing. A file that exists but cannot be

@@ -69,6 +69,10 @@ class SelinuxModuleTests(unittest.TestCase):
         self.assertRegex(self.te, r'allow kernel_t aurora_sep_state_t:file \{[^}]*'
                          r'setattr_file_perms rename_file_perms delete_file_perms \};')
 
+    def test_temporary_names_match_the_driver(self):
+        shim = (PKG.parents[1] / 'drivers/soc/apple/store_shim.c').read_text()
+        self.assertIn('".%s.new", base + 1', shim)
+
     def test_no_access_to_generic_var_lib(self):
         self.assertNotRegex(self.te, r'allow\s+\S+\s+var_lib_t')
 
