@@ -1,0 +1,6 @@
+# ./tools/testing/kunit/kunit.py run --arch=arm64 --kunitconfig=drivers/nvmem/apple-efuses.kunitconfig
+CONFIG_KUNIT=y
+CONFIG_ARCH_APPLE=y
+CONFIG_NVMEM=y
+CONFIG_NVMEM_APPLE_EFUSES=y
+CONFIG_NVMEM_APPLE_EFUSES_KUNIT_TEST=y
