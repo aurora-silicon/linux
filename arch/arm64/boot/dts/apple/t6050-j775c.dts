@@ -5312,19 +5312,26 @@
 		};
 
 		video-encoder@2283100000 {
-			compatible = "apple,t6050-ave", "apple,ave";
-			reg = <0x22 0x83100000 0x00 0x45c000 0x22 0x83800000 0x00 0x800000 0x22
-				0x83050000 0x00 0x4000 0x23 0x806001c0 0x00 0x7e64 0x22 0x82000000
-				0x00 0x8000>;
-			interrupts = <0x00 0x00 0x983 0x04 0x00 0x00 0xae6 0x04 0x00 0x00 0xae5 0x04
-				0x00 0x00 0xae8 0x04 0x00 0x00 0xae7 0x04>;
-			iommus = <&{/soc/iommu@22830a0000} 0x00 &{/soc/iommu@2283080000} 0x00>;
-			power-domains = <&{/soc/power-management@2380600000/power-controller@1c0}
-				&{/soc/power-management@2380600000/power-controller@8008}
-				&{/soc/power-management@2380600000/power-controller@8010}
-				&{/soc/power-management@2380600000/power-controller@8018}
-				&{/soc/power-management@2380600000/power-controller@8020}
-				&{/soc/power-management@2380600000/power-controller@8000}>;
+			compatible = "apple,t6050-ave";
+			reg = <0x22 0x83100000 0x00 0x45c000>,
+			      <0x22 0x83050000 0x00 0x4000>,
+			      <0x22 0x83800000 0x00 0x800000>;
+			reg-names = "codec", "mailbox", "coproc";
+			interrupts = <0x00 0x00 0x983 0x04>,
+			             <0x00 0x00 0xae6 0x04>,
+			             <0x00 0x00 0xae5 0x04>,
+			             <0x00 0x00 0xae8 0x04>,
+			             <0x00 0x00 0xae7 0x04>;
+			iommus = <&{/soc/iommu@22830a0000} 0x00>,
+			         <&{/soc/iommu@22830a0000} 0x0c>,
+			         <&{/soc/iommu@2283080000} 0x00>,
+			         <&{/soc/iommu@2283080000} 0x0c>;
+			power-domains = <&{/soc/power-management@2380600000/power-controller@8000}>,
+			                <&{/soc/power-management@2380600000/power-controller@8008}>,
+			                <&{/soc/power-management@2380600000/power-controller@8010}>,
+			                <&{/soc/power-management@2380600000/power-controller@8018}>,
+			                <&{/soc/power-management@2380600000/power-controller@8020}>;
+			power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1";
 			clocks = <&{/soc/clock-controller@280600000} 0x1f7>;
 			status = "disabled";
 		};
@@ -5348,19 +5355,24 @@
 		};
 
 		video-encoder@23a3100000 {
-			compatible = "apple,t6050-ave", "apple,ave";
-			reg = <0x23 0xa3100000 0x00 0x45c000 0x23 0xa3800000 0x00 0x800000 0x23
-				0xa3050000 0x00 0x4000 0x23 0x806001f0 0x00 0x7e5c 0x23 0xa2000000
-				0x00 0x8000>;
-			interrupts = <0x00 0x00 0x98b 0x04 0x00 0x00 0xaea 0x04 0x00 0x00 0xae9 0x04
-				0x00 0x00 0xaec 0x04 0x00 0x00 0xaeb 0x04>;
-			iommus = <&{/soc/iommu@23a30a0000} 0x00 &{/soc/iommu@23a3080000} 0x00>;
-			power-domains = <&{/soc/power-management@2380600000/power-controller@1f0}
-				&{/soc/power-management@2380600000/power-controller@8030}
-				&{/soc/power-management@2380600000/power-controller@8038}
-				&{/soc/power-management@2380600000/power-controller@8040}
-				&{/soc/power-management@2380600000/power-controller@8048}
-				&{/soc/power-management@2380600000/power-controller@8028}>;
+			compatible = "apple,t6050-ave";
+			reg = <0x23 0xa3100000 0x00 0x45c000>,
+			      <0x23 0xa3050000 0x00 0x4000>,
+			      <0x23 0xa3800000 0x00 0x800000>;
+			reg-names = "codec", "mailbox", "coproc";
+			interrupts = <0x00 0x00 0x98b 0x04>,
+			             <0x00 0x00 0xaea 0x04>,
+			             <0x00 0x00 0xae9 0x04>,
+			             <0x00 0x00 0xaec 0x04>,
+			             <0x00 0x00 0xaeb 0x04>;
+			iommus = <&{/soc/iommu@23a30a0000} 0x00>,
+			         <&{/soc/iommu@23a3080000} 0x00>;
+			power-domains = <&{/soc/power-management@2380600000/power-controller@8028}>,
+			                <&{/soc/power-management@2380600000/power-controller@8030}>,
+			                <&{/soc/power-management@2380600000/power-controller@8038}>,
+			                <&{/soc/power-management@2380600000/power-controller@8040}>,
+			                <&{/soc/power-management@2380600000/power-controller@8048}>;
+			power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1";
 			clocks = <&{/soc/clock-controller@280600000} 0x1f8>;
 			status = "disabled";
 		};
