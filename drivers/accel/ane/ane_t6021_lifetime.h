@@ -226,7 +226,8 @@ struct ane_t6021_prog {
  * Each is a kernel copy no client can map and the engine maps read-only:
  * the cache key, the TD check and every LOAD of the program read the copy,
  * never the caller's buffer, so what was keyed and checked is what the
- * firmware reads.
+ * firmware reads. PROG_LOAD also keys a view of the caller's buffers (mem
+ * the BOs) to find a program already loaded; that view is never loaded.
  */
 struct ane_t6021_secs {
 	void *mem[ANE_T6021_PROG_SECS];	/* driver allocation, NULL: no section */

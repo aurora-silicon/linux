@@ -1878,17 +1878,42 @@ static int ane_rtclient_load_program(struct ane_rtclient *ane,
 	 * checked here are the bytes every LOAD of the program names. Each
 	 * copy is made with one read of the buffer, under bo_lock.
 	 */
-	/* Every section must name a BO of this file that holds it. */
-	for (i = 0; i < user->section_count; i++) {
-		bool ok;
+	/* Every section must name a BO of this file that holds it. A program
+	 * already in the table has its own checked copies, so look it up from
+	 * the caller's bytes first: loading it again takes no copies and no
+	 * part of bo_total_max_mb. Bytes changed meanwhile only change the
+	 * key; they are never what the firmware reads.
+	 */
+	{
+		struct ane_t6021_secs view = {};
 
 		mutex_lock(&ane_t6021_bo_lock);
-		ok = ane_t6021_sec_bo_locked(fd, &sections[i]);
+		for (i = 0; i < user->section_count; i++) {
+			struct ane_t6021_bo *bo;
+			unsigned int slot = sections[i].id - 1;
+
+			bo = ane_t6021_sec_bo_locked(fd, &sections[i]);
+			if (!bo)
+				break;
+			view.mem[slot] = bo;
+			view.cpu[slot] = (u8 *)bo->cpu + sections[i].offset;
+			view.size[slot] = sections[i].size;
+		}
+		if (i == user->section_count)
+			ane_t6021_secs_key(&view, digest);
 		mutex_unlock(&ane_t6021_bo_lock);
-		if (!ok) {
+		if (i < user->section_count) {
 			ret = -EINVAL;
 			goto out;
 		}
+	}
+	cached = ane_t6021_prog_find(digest);
+	if (cached) {
+		ret = ane_t6021_fdprogs_ref(&ane_t6021_progtab, &fd->progs,
+					    cached);
+		if (!ret)
+			*prog_id = cached->prog_id;
+		goto out;
 	}
 	for (i = 0; i < user->section_count; i++) {
 		struct ane_t6021_sec_copy *c;
