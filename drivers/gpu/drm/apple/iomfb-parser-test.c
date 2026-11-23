@@ -341,6 +341,7 @@ static void iomfb_command_depth_test(struct kunit *test)
 	dcp->shmem = kunit_kzalloc(test, 0x10000, GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, dcp->shmem);
 	dcp->quiescing = true;
+	dcp->iomfb.owner = current;
 	for (i = 0; i < ARRAY_SIZE(fws); i++) {
 		dcp->fw_compat = fws[i];
 		dcp->crashed = false;
@@ -351,15 +352,14 @@ static void iomfb_command_depth_test(struct kunit *test)
 				 iomfb_refused_complete, &done);
 		KUNIT_EXPECT_TRUE(test, dcp->crashed);
 		KUNIT_EXPECT_EQ(test, dcp->ch_cmd.depth, DCP_MAX_CALL_DEPTH);
-		/* A refused command is still completed, without an output. */
-		KUNIT_EXPECT_EQ(test, done.calls, 1U);
-		KUNIT_EXPECT_TRUE(test, done.out_null);
+		/* The caller retains ownership when the frame is refused. */
+		KUNIT_EXPECT_EQ(test, done.calls, 0U);
 		/* A frame that does not fit the transmit window is refused too. */
 		dcp->crashed = false;
 		dcp->ch_cmd.depth = 0;
 		done = (struct iomfb_refused_cookie){};
-		dcp_push_context(dcp, DCP_CONTEXT_CMD, &call, 0x8000, 0, dcp->shmem,
-				 iomfb_refused_complete, &done);
+		dcp_push(dcp, false, &call, 0x8000, 0, dcp->shmem,
+			 iomfb_refused_complete, &done);
 		KUNIT_EXPECT_TRUE(test, dcp->crashed);
 		KUNIT_EXPECT_EQ(test, dcp->ch_cmd.depth, 0);
 		KUNIT_EXPECT_EQ(test, done.calls, 1U);

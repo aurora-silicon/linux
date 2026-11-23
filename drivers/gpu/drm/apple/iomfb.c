@@ -1337,8 +1337,8 @@ static int iomfb_queue_command(struct apple_dcp *dcp, bool oob,
 	return ret;
 }
 
-/* Call a DCP function given by a tag */
-static void dcp_push_context(struct apple_dcp *dcp, enum dcp_context_id context,
+/* A rejected command leaves callback ownership with the caller. */
+static int dcp_push_context(struct apple_dcp *dcp, enum dcp_context_id context,
 			     const struct dcp_method_entry *call, u32 in_len,
 			     u32 out_len, void *data, dcp_callback_t cb, void *cookie)
 {
@@ -1348,12 +1348,12 @@ static void dcp_push_context(struct apple_dcp *dcp, enum dcp_context_id context,
 	/* A KUnit test answers for the firmware. */
 	if (dcp->test_push) {
 		dcp->test_push(dcp, call, cb, cookie);
-		return;
+		return 0;
 	}
 #endif
 
 	if (dcp_fail_stop(dcp) && READ_ONCE(dcp->crashed))
-		return;
+		return -ESHUTDOWN;
 
 	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G &&
 	    call->tag_h17g[0])
@@ -1390,14 +1390,7 @@ static void dcp_push_context(struct apple_dcp *dcp, enum dcp_context_id context,
 			       DCP_PACKET_ALIGNMENT)) {
 		dev_err(dcp->dev, "invalid IOMFB command envelope\n");
 		WRITE_ONCE(dcp->crashed, true);
-		/*
-		 * Complete the command without an output, as a corrupt ack
-		 * does, so that its callback drops the cookie reference and
-		 * wakes the waiter instead of leaving it to time out.
-		 */
-		if (cb)
-			cb(dcp, NULL, cookie);
-		return;
+		return -EPROTO;
 	}
 	depth = dcp_push_depth(&ch->depth);
 	offset = dcp_packet_start(ch, depth);
@@ -1440,6 +1433,7 @@ static void dcp_push_context(struct apple_dcp *dcp, enum dcp_context_id context,
 		WRITE_ONCE(dcp->ext26_power_ns, sent ? ktime_get_ns() : 0);
 		WRITE_ONCE(dcp->ext26_power_sent, sent);
 	}
+	return 0;
 }
 
 void dcp_push(struct apple_dcp *dcp, bool oob,
@@ -1454,8 +1448,11 @@ void dcp_push(struct apple_dcp *dcp, bool oob,
 		return;
 	}
 
-	dcp_push_context(dcp, dcp_call_context(dcp, oob), call,
-			 in_len, out_len, data, cb, cookie);
+	if (!dcp_push_context(dcp, dcp_call_context(dcp, oob), call,
+			      in_len, out_len, data, cb, cookie))
+		return;
+	if (cb)
+		cb(dcp, NULL, cookie);
 }
 
 /*
@@ -1478,7 +1475,7 @@ int dcp_push_oob_concurrent(struct apple_dcp *dcp, const struct dcp_method_entry
 		ret = -EBUSY;
 	} else {
 		WRITE_ONCE(dcp->iomfb.owner, current);
-		dcp_push_context(dcp, dcp_call_context(dcp, true), call,
+		ret = dcp_push_context(dcp, dcp_call_context(dcp, true), call,
 				 in_len, out_len, data, cb, cookie);
 		WRITE_ONCE(dcp->iomfb.owner, NULL);
 	}
@@ -1514,8 +1511,7 @@ int dcp_push_nested(struct apple_dcp *dcp, enum dcp_context_id origin,
 	if (!ch || !ch->depth || ch->depth >= DCP_MAX_CALL_DEPTH ||
 	    (u64)sizeof(struct dcp_packet_header) + in_len + out_len > 0x8000)
 		return -EINVAL;
-	dcp_push_context(dcp, context, call, in_len, out_len, data, cb, cookie);
-	return READ_ONCE(dcp->crashed) ? -EPROTO : 0;
+	return dcp_push_context(dcp, context, call, in_len, out_len, data, cb, cookie);
 }
 
 /* Parse a callback tag "D123" into the ID 123. Returns -EINVAL on failure. */
