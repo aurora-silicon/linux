@@ -395,6 +395,7 @@ impl Runtime {
         }
         let mut guard = self.state.lock();
         let state = Option::as_mut(&mut *guard).ok_or(ENODEV)?;
+        if !self.healthy() { return Err(EIO); }
         state.pending.push((packet, 0), GFP_KERNEL)?;
         self.pump(state);
         Ok(())
@@ -417,7 +418,9 @@ impl Runtime {
         self.healthy.store(false, Ordering::Release);
         self.idle.notify_all();
         for (packet, _) in state.pending.drain(..) {
-            packet.release_guard();
+            if !state.inflight.iter().any(|flight| Arc::ptr_eq(&flight.packet, &packet)) {
+                packet.release_guard();
+            }
             packet.finish(Err(error));
         }
         // Published work stays owned: the firmware may still read it.
@@ -447,7 +450,7 @@ impl Runtime {
     /// Publishes pending commands while pool slots are free.
     fn pump(&self, state: &mut State) {
         self.acknowledge(state);
-        if self.asleep.load(Ordering::Acquire) { return; }
+        if !self.healthy() || self.asleep.load(Ordering::Acquire) { return; }
         while state.inflight.len() < POOL_SLOTS - 1 && !state.pending.is_empty() {
             // A slot is reused only once the firmware has unlinked it from its tracking list
             // (+0x94), which its retirement scan does after the slot's cursor is advanced.
@@ -485,10 +488,13 @@ impl Runtime {
                 packet.finish(Err(EINVAL));
                 continue;
             };
-            let result = (|| -> Result<(mmu::VmBind, event::EventValue)> {
+            let slot = state.next_slot;
+            let stamp = state.last.next();
+            let ordinal = state.published + 1;
+            let last = index + 1 == packet.commands.len();
+            let result = (|| -> Result {
                 let bind = self.graph.kernel_uat().bind(&packet.vm)?;
                 let preempt = packet.preempt.as_ref().ok_or(EINVAL)?.gpu_va().get();
-                let stamp = state.last.next();
                 let job = ComputeJob {
                     context: bind.slot(),
                     sequence: state.sequence,
@@ -497,35 +503,33 @@ impl Runtime {
                     usc_base: control.usc_base,
                     preempt,
                 };
-                let command = state.pool.encode(state.next_slot, &state.queue, stamp.raw(), &job)?;
+                let command = state.pool.encode(slot, &state.queue, stamp.raw(), &job)?;
+                let publication = state.root.stage_compute(command)?;
+                state.inflight.push(Inflight { packet: packet.clone(), last, stamp, slot, ordinal,
+                    started: Instant::now(), _bind: bind }, GFP_KERNEL)?;
                 packet.mark_published();
-                state.root.publish(command)?;
-                state.peer.as_mut().send_message(EP_DOORBELL, gpu::COMPUTE_KICK)?;
-                Ok((bind, stamp))
+                publication.commit();
+                Ok(())
             })();
             match result {
-                Ok((bind, stamp)) => {
+                Ok(()) => {
                     state.last = stamp;
                     state.sequence += 1;
-                    let slot = state.next_slot;
                     state.busy |= 1 << slot;
-                    state.published += 1;
-                    let ordinal = state.published;
-                    state.next_slot = (state.next_slot + 1) % POOL_SLOTS;
+                    state.published = ordinal;
+                    state.next_slot = (slot + 1) % POOL_SLOTS;
                     state.submitted += 1;
-                    let last = index + 1 == packet.commands.len();
-                    if state.inflight.push(Inflight { packet: packet.clone(), last, stamp, slot, ordinal,
-                        started: Instant::now(), _bind: bind }, GFP_KERNEL).is_err() {
-                        self.fail_all(state, ENOMEM);
+                    if last { let _ = state.pending.remove(0); } else { state.pending[0].1 += 1; }
+                    if let Err(err) = state.peer.as_mut().send_message(EP_DOORBELL, gpu::COMPUTE_KICK) {
+                        self.fail_all(state, err);
                         return;
                     }
-                    if last { let _ = state.pending.remove(0); } else { state.pending[0].1 += 1; }
                 }
+                Err(EBUSY) if !state.inflight.is_empty() => return,
                 Err(e) => {
                     dev_err!(self.dev, "GPU: compute publication failed {:?}\n", e);
                     let _ = state.pending.remove(0);
-                    // Earlier commands of a published packet fail it when they retire.
-                    if !(packet.may_be_published() && index != 0) {
+                    if !state.inflight.iter().any(|flight| Arc::ptr_eq(&flight.packet, &packet)) {
                         packet.release_guard();
                     }
                     packet.finish(Err(e));
@@ -594,6 +598,10 @@ impl Runtime {
                     state.retired += 1;
                     if done.last {
                         done.packet.retired();
+                    } else if !state.inflight.iter().any(|flight| Arc::ptr_eq(&flight.packet, &done.packet))
+                        && !state.pending.iter().any(|(packet, _)| Arc::ptr_eq(packet, &done.packet))
+                    {
+                        done.packet.release_guard();
                     }
                 }
                 continue;

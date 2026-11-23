@@ -358,6 +358,27 @@ impl CommandPool {
     }
 }
 
+/// Ring contents prepared while the firmware still owns the old producer.
+pub(crate) struct ComputePublication<'a> {
+    positions: &'a fw::types::GpuArray<u8>,
+    indices: &'a fw::types::GpuArray<u8>,
+    head: &'a core::sync::atomic::AtomicU32,
+    producer: &'a core::sync::atomic::AtomicU32,
+    next_head: u32,
+    next_producer: u32,
+}
+
+impl ComputePublication<'_> {
+    pub(crate) fn commit(self) {
+        self.head.store(self.next_head, Ordering::Release);
+        crate::pgtable::clean_poc(self.positions.as_slice().as_ptr(), 0x60);
+        crate::pgtable::poc_barrier();
+        self.producer.store(self.next_producer, Ordering::Release);
+        crate::pgtable::clean_poc(self.indices.as_slice().as_ptr(), 0x30);
+        crate::pgtable::poc_barrier();
+    }
+}
+
 /// The firmware 27.2 root and every record it names.
 pub(crate) struct RootV27_2 {
     graph: Arc<GpuManagerG14V13_5>,
@@ -410,42 +431,50 @@ impl RootV27_2 {
         Ok((Self::word(&self.boot.positions, 0x40)?, Self::word(&self.boot.positions, 0)?))
     }
 
-    /// Publishes `command` as the queue's next command: pointer, queue head, then the compute
-    /// submission entry and its producer.
-    pub(crate) fn publish(&self, command: u64) -> Result {
+    /// Prepares a work pointer and channel entry without advancing either producer.
+    pub(crate) fn stage_compute(&self, command: u64) -> Result<ComputePublication<'_>> {
         let job = &self.boot;
+        let indices = &self.channels[2 * SUBMISSION_RING];
+        let ring = &self.channels[2 * SUBMISSION_RING + 1];
+        crate::pgtable::clean_invalidate_poc(job.positions.as_slice().as_ptr(), 0x60);
+        crate::pgtable::clean_invalidate_poc(indices.as_slice().as_ptr(), 0x30);
+        crate::pgtable::poc_barrier();
         let head = job.positions.shared_index(0x40)?;
         let old = head.load(Ordering::Acquire);
         let capacity = Self::word(&job.positions, 0x50)?;
-        if capacity == 0 || (old % capacity) as usize * 8 + 8 > job.pointers.as_slice().len() {
-            return Err(EINVAL);
+        let retired = Self::word(&job.positions, 0)?;
+        if capacity <= 1 || old >= capacity || retired >= capacity
+            || capacity as usize > job.pointers.len() / 8
+        {
+            return Err(EIO);
         }
-        let at = (old % capacity) as usize * 8;
+        let next_head = (old + 1) % capacity;
+        if next_head == retired { return Err(EBUSY); }
+
+        let producer = indices.shared_index(0x20)?;
+        let write = producer.load(Ordering::Acquire);
+        let read = Self::word(indices, 0)?;
+        let entries = crate::m3::m3_channel_format::SLOTS;
+        if write >= entries || read >= entries { return Err(EIO); }
+        let next_producer = (write + 1) % entries;
+        if next_producer == read { return Err(EBUSY); }
+        let slot = u8::try_from(job.event.slot()).map_err(|_| EINVAL)?;
+        let entry = crate::m3::submission_entry(COMPUTE as u32, job.queue.gpu_va().get(),
+            u16::try_from(next_head).map_err(|_| EINVAL)?, slot, false).map_err(|_| EINVAL)?;
+
+        let at = old as usize * 8;
         job.pointers.shared_index(at)?.store(command as u32, Ordering::Relaxed);
         job.pointers.shared_index(at + 4)?.store((command >> 32) as u32, Ordering::Relaxed);
         crate::pgtable::clean_poc(job.pointers.as_slice()[at..].as_ptr(), 8);
-        crate::pgtable::poc_barrier();
-        let new = (old + 1) % capacity;
-        head.store(new, Ordering::Release);
-        crate::pgtable::clean_poc(job.positions.as_slice().as_ptr(), 0x60);
-        crate::pgtable::poc_barrier();
-        let state = &self.channels[2 * SUBMISSION_RING];
-        let ring = &self.channels[2 * SUBMISSION_RING + 1];
-        let w = Self::word(state, 0x20)?;
-        if w >= crate::m3::m3_channel_format::SLOTS { return Err(EIO); }
-        let slot = u8::try_from(job.event.slot()).map_err(|_| EINVAL)?;
-        let entry = crate::m3::submission_entry(COMPUTE as u32, job.queue.gpu_va().get(),
-            u16::try_from(new).map_err(|_| EINVAL)?, slot, false).map_err(|_| EINVAL)?;
-        let base = w as usize * entry.len();
-        for (k, word) in entry.chunks(4).enumerate() {
-            ring.shared_index(base + 4 * k)?.store(u32::from_le_bytes([word[0], word[1], word[2], word[3]]), Ordering::Relaxed);
+        let base = write as usize * entry.len();
+        for (index, word) in entry.chunks_exact(4).enumerate() {
+            ring.shared_index(base + 4 * index)?.store(
+                u32::from_le_bytes([word[0], word[1], word[2], word[3]]), Ordering::Relaxed);
         }
         crate::pgtable::clean_poc(ring.as_slice()[base..].as_ptr(), entry.len());
         crate::pgtable::poc_barrier();
-        state.shared_index(0x20)?.store((w + 1) % crate::m3::m3_channel_format::SLOTS, Ordering::Release);
-        crate::pgtable::clean_poc(state.as_slice().as_ptr(), 0x30);
-        crate::pgtable::poc_barrier();
-        Ok(())
+        Ok(ComputePublication { positions: &job.positions, indices, head, producer,
+            next_head, next_producer })
     }
 
     /// Publishes the boot job, whose command and ring entry the root already holds. The GPU
