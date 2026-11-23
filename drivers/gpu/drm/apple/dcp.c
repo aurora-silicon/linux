@@ -9744,8 +9744,9 @@ static void dcp_t8132_sleep_stopped(struct apple_dcp *dcp)
  * dcp_sleep_keeps_firmware - whether a DCP's firmware runs through this sleep
  * @dev: the DCP device
  *
- * For blocks the DCP's firmware drives (DP audio), from their late or noirq
- * suspend, after every device's .suspend: true when the DCP's suspend left
+ * For blocks the DCP's firmware drives (DP audio), from their late suspend,
+ * after every device's .suspend. It takes the DCP's device lock, which can
+ * sleep, so it is not for the noirq phase. True when the DCP's suspend left
  * its coprocessor running with its domains on, or when no driver is bound
  * (a boot stage or an earlier bind may have left the firmware running).
  * False when the suspend stopped the firmware (S2R, the 27.x sleep, an M4
