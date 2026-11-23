@@ -1001,3 +1001,7 @@ int ave_ipc_settle(struct ave_dev *ave, unsigned int wait_ms)
 	ave->reply_err = 0;
 	return ret;
 }
+
+#if IS_ENABLED(CONFIG_VIDEO_APPLE_AVE_IPC_KUNIT_TEST)
+#include "ave-ipc-test.c"
+#endif
