@@ -896,6 +896,12 @@ pub(crate) mod sizes {
     );
     /// Maximum jobs folded into one barrier-free compute horizon prefix.
     pub(crate) const HORIZON_JOBS: u32 = COMPUTE_UNITS as u32;
+    /// Maximum commands accumulated in a busy-state horizon micro-coalescing batch before
+    /// immediate publication, and maximum hold window (18 us) while a queue already has >= 2
+    /// active commands in flight.
+    pub(crate) const COALESCE_MAX_CMDS: usize = 6;
+    pub(crate) const COALESCE_WINDOW_US: u32 = 18;
+    pub(crate) const COALESCE_WINDOW_NS: u64 = (COALESCE_WINDOW_US as u64) * 1000;
     /// Jobs admitted to the engine per logical queue: enough to keep a queue's commands
     /// in flight back to back without scheduler backpressure stalls; exact prior-command
     /// dependencies still gate each one.

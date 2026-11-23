@@ -290,6 +290,7 @@ impl Firmware {
             self.floor_power(error);
         }
         self.engine.frozen = true;
+        self.engine.coalesce_deadline_ns = 0;
         self.events.grow.clear();
         self.fail_flights(error, done);
         self.fail_all_vms(EIO);

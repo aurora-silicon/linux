@@ -68,6 +68,7 @@ mod hw {
         pub const TA_WAVE_PASSES: usize = 4;
         pub const TA_WAVE_REFILL: usize = TA_WAVE_PASSES / 2;
         pub const COMPUTE_PIPES: usize = 2;
+        pub const COALESCE_WINDOW_US: u32 = 18;
     }
 }
 
@@ -161,6 +162,7 @@ struct Engine {
     slot_wait: bool,
     ta_wave_wait: bool,
     short_repoll: bool,
+    coalesce_deadline_ns: u64,
     frozen: bool,
     stats: Stats,
     prof: Prof,
@@ -217,6 +219,8 @@ struct Shared {
     rearmed: Cell<u32>,
     idle_power_polls: Cell<u32>,
     rearm_soon: Cell<u32>,
+    rearm_after_calls: Cell<u32>,
+    last_rearm_us: Cell<u32>,
     poll_now_calls: Cell<u32>,
 }
 impl Shared {
@@ -229,8 +233,17 @@ impl Shared {
             rearmed: Cell::new(0),
             idle_power_polls: Cell::new(0),
             rearm_soon: Cell::new(0),
+            rearm_after_calls: Cell::new(0),
+            last_rearm_us: Cell::new(0),
             poll_now_calls: Cell::new(0),
         })
+    }
+    fn rearm_us(&self, soon: bool) -> u32 {
+        if soon { 25 } else { 100 }
+    }
+    fn rearm_after(&self, us: u32) {
+        self.rearm_after_calls.set(self.rearm_after_calls.get() + 1);
+        self.last_rearm_us.set(us);
     }
     fn rearm(&self, soon: bool) {
         self.rearmed.set(self.rearmed.get() + 1);
@@ -311,6 +324,7 @@ struct Firmware {
     drain_fs_delta: u32,
     drain_compute_delta: u32,
     ta_pending: usize,
+    coalesce_us: Option<u32>,
     retire_calls: u32,
     publish_full_calls: u32,
     publish_checked_calls: u32,
@@ -347,6 +361,7 @@ impl Firmware {
                 slot_wait: false,
                 ta_wave_wait: false,
                 short_repoll: false,
+                coalesce_deadline_ns: 0,
                 frozen: false,
                 stats: Stats::default(),
                 prof: Prof::default(),
@@ -364,6 +379,7 @@ impl Firmware {
             drain_fs_delta: 0,
             drain_compute_delta: 0,
             ta_pending: 0,
+            coalesce_us: None,
             retire_calls: 0,
             publish_full_calls: 0,
             publish_checked_calls: 0,
@@ -425,8 +441,12 @@ impl Firmware {
         Ok(())
     }
     fn publish_checked(&mut self, _done: &mut Completions) -> Result {
+        self.engine.coalesce_deadline_ns = 0;
         self.publish_checked_calls += 1;
         Ok(())
+    }
+    fn defer_busy_coalesce(&mut self, _now: u64) -> Option<u32> {
+        self.coalesce_us
     }
     fn ta_pending_passes(&self) -> usize {
         self.ta_pending
@@ -1017,6 +1037,58 @@ fn ta_only_irq_wakes_ta_wave_wait_with_hysteresis_and_short_repoll() {
     assert!(!fw.engine.short_repoll);
 }
 
+#[test]
+fn submit_locked_and_poll_step_micro_coalesce_busy_horizons() {
+    CLOCK.with(|c| c.set(100_000));
+    let shared = Shared::new();
+    let mut fw = Firmware::new();
+    fw.engine.flights.push(Flight {
+        computes: 2,
+        compute_pipe: 0,
+        renders: 0,
+        target: 0x200,
+        fs_target: 0,
+    });
+    fw.engine.target[0] = 0x200;
+    fw.coalesce_us = Some(18);
+    fw.engine.coalesce_deadline_ns = 118_000;
+
+    // submit_locked skips publish_checked and arms rearm_after(18) when defer_busy_coalesce fires.
+    let mut done = vec![];
+    shared
+        .submit_locked(&mut fw, Arc::new(Job { id: 3 }), &mut done)
+        .unwrap();
+    assert_eq!(fw.publish_checked_calls, 0);
+    assert_eq!(shared.rearm_after_calls.get(), 1);
+    assert_eq!(shared.last_rearm_us.get(), 18);
+    assert_eq!(shared.rearmed.get(), 0);
+
+    // An early non-retiring event poll before the deadline does not flush prematurely.
+    CLOCK.with(|c| c.set(105_000));
+    let (mut retry_tail, mut deferred) = (false, false);
+    assert!(fw
+        .poll_step(true, EVENT_RETIRE_POLLS, &mut retry_tail, &mut deferred, &mut done)
+        .unwrap());
+    assert_eq!(fw.publish_checked_calls, 0);
+
+    // Reaching the deadline on an event poll flushes immediately.
+    CLOCK.with(|c| c.set(118_000));
+    assert!(fw
+        .poll_step(true, EVENT_RETIRE_POLLS, &mut retry_tail, &mut deferred, &mut done)
+        .unwrap());
+    assert_eq!(fw.publish_checked_calls, 1);
+    assert_eq!(fw.engine.coalesce_deadline_ns, 0);
+
+    // A timer poll (!evented) with an active coalesce deadline also flushes immediately.
+    fw.engine.coalesce_deadline_ns = 136_000;
+    CLOCK.with(|c| c.set(125_000));
+    assert!(fw
+        .poll_step(false, 0, &mut retry_tail, &mut deferred, &mut done)
+        .unwrap());
+    assert_eq!(fw.publish_checked_calls, 2);
+    assert_eq!(fw.engine.coalesce_deadline_ns, 0);
+}
+
 mod boot {
     pub fn eproto() -> super::Error {
         super::Error(-71)
@@ -1328,6 +1400,7 @@ mod resnap_sync_test {
         __IDLE_RESNAP__
         __REARM_US__
         __REARM__
+        __REARM_AFTER__
         __NOTE_FLIGHT_US__
     }
 
@@ -1415,11 +1488,21 @@ mod resnap_sync_test {
         assert_eq!(shared.drops.load(Ordering::Acquire), 1);
         assert_eq!(shared.resnap_deadline_ns.load(Ordering::Acquire), 127_000);
 
+        // Coalesce rearm_after(18) pulls in a 25 us timer (>5 us earlier) and coalesces within 5 us.
+        shared.rearm_after(18);
+        assert_eq!(shared.starts.load(Ordering::Acquire), 3);
+        assert_eq!(shared.drops.load(Ordering::Acquire), 2);
+        assert_eq!(shared.resnap_deadline_ns.load(Ordering::Acquire), 120_000);
+        CLOCK.store(106_000, Ordering::Release);
+        shared.rearm_after(14);
+        assert_eq!(shared.starts.load(Ordering::Acquire), 3);
+        assert_eq!(shared.drops.load(Ordering::Acquire), 2);
+
         // cancel_resnap unconditionally clears deadline and drops handle.
         shared.cancel_resnap();
         assert_eq!(shared.resnap_deadline_ns.load(Ordering::Acquire), 0);
         assert!(shared.resnap_handle.lock().is_none());
-        assert_eq!(shared.drops.load(Ordering::Acquire), 2);
+        assert_eq!(shared.drops.load(Ordering::Acquire), 3);
     }
 
     #[test]
@@ -1578,6 +1661,7 @@ for token, decl in {
     '__IDLE_RESNAP__': 'pub(crate) fn idle_resnap(',
     '__REARM_US__': 'pub(crate) fn rearm_us(',
     '__REARM__': 'pub(crate) fn rearm(',
+    '__REARM_AFTER__': 'pub(crate) fn rearm_after(',
     '__POLL_NOW__': 'pub(crate) fn poll_now(',
 }.items():
     harness = harness.replace(token, item(decl).replace('super::hw::', 'hw::'))

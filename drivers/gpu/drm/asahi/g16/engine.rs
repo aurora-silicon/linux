@@ -607,6 +607,9 @@ pub(crate) struct Engine {
     pub(crate) ta_wave_wait: bool,
     /// An EP 0x20 event arrived with a flight still settling its final receipt: repoll sooner.
     pub(crate) short_repoll: bool,
+    /// Absolute deadline (`ktime_get_ns`) for busy-state same-queue horizon micro-coalescing
+    /// (0 when no batch is held).
+    pub(crate) coalesce_deadline_ns: u64,
     /// Progress tracking of the oldest compute pipe 0/1 and render flights.
     pub(crate) progress_flight: [u64; 3],
     pub(crate) progress: [Option<u32>; 4],
@@ -651,6 +654,7 @@ impl Engine {
             slot_wait: false,
             ta_wave_wait: false,
             short_repoll: false,
+            coalesce_deadline_ns: 0,
             progress_flight: [0; 3],
             progress: [None; 4],
             stats: KBox::zeroed(GFP_KERNEL)?,
@@ -999,6 +1003,7 @@ impl Firmware {
         self.engine.chan_wait = false;
         self.engine.slot_wait = false;
         self.engine.ta_wave_wait = false;
+        self.engine.coalesce_deadline_ns = 0;
         while self.recovery.failed().is_none()
             && !self.engine.frozen
             && !self.engine.pending.is_empty()
@@ -1540,6 +1545,193 @@ impl Firmware {
         }
     }
 
+    /// Whether `self.engine.pending` is an eligible single-queue, single-VM busy horizon
+    /// batch that can accumulate more same-queue commands before publishing.
+    fn can_defer_busy_coalesce(&self) -> bool {
+        if self.recovery.failed().is_some()
+            || self.engine.frozen
+            || self.engine.flights.is_empty()
+            || self.engine.pending.is_empty()
+            || self.engine.flights.len() >= super::hw::sizes::FLIGHTS
+            || self.engine.chan_wait
+            || self.engine.slot_wait
+            || self.engine.ta_wave_wait
+            || self
+                .engine
+                .flights
+                .iter()
+                .any(|f| f.doomed || f.recovery_suspect || f.initbm)
+        {
+            return false;
+        }
+        let head = &self.engine.pending[0];
+        let head_sent = head.progress.sent();
+        if head.vm.status.get() != 0
+            || head.long()
+            || !self.can_queue_behind(head)
+            || self
+                .engine
+                .pending
+                .iter()
+                .any(|j| !Arc::ptr_eq(&j.queue, &head.queue) || !Arc::ptr_eq(&j.vm, &head.vm))
+        {
+            return false;
+        }
+        let Some(head_order) = head.command_order(head_sent) else {
+            return false;
+        };
+        match command(head, head_sent) {
+            Some(Command::Compute(c)) => {
+                if head.resources.compute_scs()
+                    || c.is_rt()
+                    || head_order.wait_through != [None, None]
+                    || !head.fw_waits.is_empty()
+                {
+                    return false;
+                }
+                let queue_active: usize = self
+                    .engine
+                    .flights
+                    .iter()
+                    .filter(|fl| fl.computes != 0 && Arc::ptr_eq(&fl.job.queue, &head.queue))
+                    .map(|fl| fl.computes as usize)
+                    .sum();
+                if queue_active < 2 {
+                    return false;
+                }
+                let Some(mut next_seq) = head_order.sequence.checked_add(1) else {
+                    return false;
+                };
+                let mut pending_cmds = 1usize;
+                for k in (head_sent + 1)..head.progress.count() {
+                    let Some(Command::Compute(c2)) = command(head, k) else {
+                        return false;
+                    };
+                    if c2.is_rt() || !head.can_fold_horizon_cmd(k, next_seq) {
+                        return false;
+                    }
+                    let Some(s) = next_seq.checked_add(1) else {
+                        return false;
+                    };
+                    next_seq = s;
+                    pending_cmds += 1;
+                }
+                for j in &self.engine.pending[1..] {
+                    let n = j.progress.count();
+                    if j.long()
+                        || j.resources.compute_scs()
+                        || !j.can_fold_horizon_job(next_seq)
+                        || (0..n).any(|k| {
+                            matches!(command(j, k), Some(Command::Compute(c2)) if c2.is_rt())
+                        })
+                    {
+                        return false;
+                    }
+                    let Some(s) = next_seq.checked_add(u64::from(n)) else {
+                        return false;
+                    };
+                    next_seq = s;
+                    pending_cmds += n as usize;
+                }
+                let active_computes: usize = self
+                    .engine
+                    .flights
+                    .iter()
+                    .map(|fl| fl.computes as usize)
+                    .sum();
+                let Ok(slot_mask) = head.resources.compute_slot_mask() else {
+                    return false;
+                };
+                let pipe = self.choose_compute_pipe(&head.queue, [None, None], slot_mask, false);
+                let free_c = self.slots.free_compute_in_mask_for_pipe(slot_mask, pipe) as usize;
+                let cap = super::hw::sizes::COALESCE_MAX_CMDS
+                    .min(free_c)
+                    .min(params::compute_flights().saturating_sub(active_computes))
+                    .min(super::hw::sizes::COMPUTE_SLOTS);
+                cap > 1 && pending_cmds < cap
+            }
+            Some(Command::Render(_)) => {
+                if head.resources.render_scs() || !head.fw_waits.is_empty() {
+                    return false;
+                }
+                let queue_active: usize = self
+                    .engine
+                    .flights
+                    .iter()
+                    .filter(|fl| fl.renders != 0 && Arc::ptr_eq(&fl.job.queue, &head.queue))
+                    .map(|fl| fl.renders as usize)
+                    .sum();
+                if queue_active < 2 {
+                    return false;
+                }
+                let Some(mut next_seq) = head_order.sequence.checked_add(1) else {
+                    return false;
+                };
+                let mut pending_cmds = 1usize;
+                for k in (head_sent + 1)..head.progress.count() {
+                    if !head.can_fold_render_cmd(k, next_seq) {
+                        return false;
+                    }
+                    let Some(s) = next_seq.checked_add(1) else {
+                        return false;
+                    };
+                    next_seq = s;
+                    pending_cmds += 1;
+                }
+                for j in &self.engine.pending[1..] {
+                    let n = j.progress.count();
+                    if j.long()
+                        || j.resources.render_scs()
+                        || !j.can_fold_render_horizon_job(next_seq)
+                    {
+                        return false;
+                    }
+                    let Some(s) = next_seq.checked_add(u64::from(n)) else {
+                        return false;
+                    };
+                    next_seq = s;
+                    pending_cmds += n as usize;
+                }
+                let active_renders: usize = self
+                    .engine
+                    .flights
+                    .iter()
+                    .map(|fl| fl.renders as usize)
+                    .sum();
+                let ta_room = super::hw::sizes::TA_WAVE_PASSES
+                    .saturating_sub(self.ta_pending_passes());
+                let cap = super::hw::sizes::COALESCE_MAX_CMDS
+                    .min(params::render_flights().saturating_sub(active_renders))
+                    .min(ta_room)
+                    .min(super::hw::sizes::RENDER_SLOTS);
+                cap > 1 && pending_cmds < cap
+            }
+            None => false,
+        }
+    }
+
+    /// Defers immediate publication for up to `COALESCE_WINDOW_US` while a single queue already
+    /// has `>= 2` active commands in flight so consecutive same-queue `SUBMIT` ioctls accumulate
+    /// into one multi-command flight (up to `COALESCE_MAX_CMDS`), cutting `SubmitRecord`s, WC
+    /// producer updates, and doorbells without delaying `d=1`/`d=2`, barriered streams, RT/SCS
+    /// work, or multi-queue/cross-VM handoffs.
+    pub(crate) fn defer_busy_coalesce(&mut self, now: u64) -> Option<u32> {
+        if !self.can_defer_busy_coalesce() {
+            self.engine.coalesce_deadline_ns = 0;
+            return None;
+        }
+        if self.engine.coalesce_deadline_ns == 0 {
+            self.engine.coalesce_deadline_ns =
+                now.saturating_add(super::hw::sizes::COALESCE_WINDOW_NS);
+        }
+        if now >= self.engine.coalesce_deadline_ns {
+            self.engine.coalesce_deadline_ns = 0;
+            return None;
+        }
+        let rem_ns = self.engine.coalesce_deadline_ns.saturating_sub(now);
+        Some((rem_ns.div_ceil(1000) as u32).clamp(1, super::hw::sizes::COALESCE_WINDOW_US))
+    }
+
     /// Resolves the newest in-flight target stamp and producer `InitBM` state for `class`
     /// (`RENDER` -> `r_fs_stamp`, `COMPUTE` -> `cstamp`) across `job`'s same-queue `target_seq`
     /// and any cross-queue `job.fw_waits` (plus an earlier member of an in-progress render batch
@@ -1814,10 +2006,14 @@ impl Firmware {
     ///   split across two pipes.
     /// - If the command waits only on one pipe, reuse that pipe (in-order ring, zero `c2c`
     ///   barrier).
-    /// - If barrier-free (`[None, None]`) or waiting on both pipes (`[Some, Some]`), pick the
-    ///   pipe with fewer active compute commands, breaking ties by `next_compute_pipe`.
+    /// - If barrier-free (`[None, None]`) and `queue` already has an active compute flight on a
+    ///   single pipe with free units, keep that queue pipe-affine so consecutive horizon submits
+    ///   fold onto one workqueue without splitting across pipes.
+    /// - Otherwise (other queues, cross-VM compute, or waiting on both pipes `[Some, Some]`),
+    ///   pick the pipe with fewer active compute commands, breaking ties by `next_compute_pipe`.
     fn choose_compute_pipe(
         &self,
+        queue: &Arc<super::queue::QueueState>,
         waits: [Option<WaitTarget>; sizes::COMPUTE_PIPES],
         slot_mask: u32,
         rt_compute: bool,
@@ -1833,27 +2029,47 @@ impl Firmware {
             return 0;
         }
         match waits {
-            [Some(_), None] => 0,
-            [None, Some(_)] => 1,
-            _ => {
-                if !self.slots.compute_available_in_mask_for_pipe(slot_mask, 0) {
-                    return 1;
-                }
-                let mut active = [0usize; sizes::COMPUTE_PIPES];
+            [Some(_), None] => return 0,
+            [None, Some(_)] => return 1,
+            [None, None] => {
+                let mut q_pipe: Option<usize> = None;
                 for fl in &self.engine.flights {
-                    if fl.computes != 0 {
+                    if fl.computes != 0 && Arc::ptr_eq(&fl.job.queue, queue) {
                         let p = (fl.compute_pipe as usize).min(sizes::COMPUTE_PIPES - 1);
-                        active[p] += fl.computes as usize;
+                        match q_pipe {
+                            None => q_pipe = Some(p),
+                            Some(prev) if prev == p => {}
+                            Some(_) => {
+                                q_pipe = None;
+                                break;
+                            }
+                        }
                     }
                 }
-                if active[0] < active[1] {
-                    0
-                } else if active[1] < active[0] {
-                    1
-                } else {
-                    (self.engine.next_compute_pipe as usize) % sizes::COMPUTE_PIPES
+                if let Some(p) = q_pipe {
+                    if self.slots.compute_available_in_mask_for_pipe(slot_mask, p) {
+                        return p;
+                    }
                 }
             }
+            [Some(_), Some(_)] => {}
+        }
+        if !self.slots.compute_available_in_mask_for_pipe(slot_mask, 0) {
+            return 1;
+        }
+        let mut active = [0usize; sizes::COMPUTE_PIPES];
+        for fl in &self.engine.flights {
+            if fl.computes != 0 {
+                let p = (fl.compute_pipe as usize).min(sizes::COMPUTE_PIPES - 1);
+                active[p] += fl.computes as usize;
+            }
+        }
+        if active[0] < active[1] {
+            0
+        } else if active[1] < active[0] {
+            1
+        } else {
+            (self.engine.next_compute_pipe as usize) % sizes::COMPUTE_PIPES
         }
     }
 
@@ -2080,7 +2296,10 @@ impl Firmware {
                 job.command_order(index)
                     .and_then(|o| o.wait_through[super::command::COMPUTE]),
             )?;
-            (self.choose_compute_pipe(waits, slot_mask, rt_compute), waits)
+            (
+                self.choose_compute_pipe(&job.queue, waits, slot_mask, rt_compute),
+                waits,
+            )
         };
         let pipe_behind = !render
             && self
@@ -2190,26 +2409,18 @@ impl Firmware {
                     .slots
                     .free_compute_in_mask_for_pipe(slot_mask, compute_pipe)
                     as usize;
-                let mut active_pipe = [0usize; sizes::COMPUTE_PIPES];
-                for fl in &self.engine.flights {
-                    if fl.computes != 0 {
-                        let p = (fl.compute_pipe as usize).min(sizes::COMPUTE_PIPES - 1);
-                        active_pipe[p] += fl.computes as usize;
-                    }
-                }
-                let active_computes = active_pipe[0] + active_pipe[1];
-                // Keep barrier-free work balanced across both compute pipes: fold extra commands
-                // into this pipe only when the alternate pipe already has deeper queued work, so
-                // independent submits distribute across pipes 0 and 1 in the same doorbell batch.
-                let pipe_fold_cap =
-                    active_pipe[1 - compute_pipe].saturating_sub(active_pipe[compute_pipe] + 1);
+                let active_computes: usize = self
+                    .engine
+                    .flights
+                    .iter()
+                    .map(|fl| fl.computes as usize)
+                    .sum();
                 let used = prefix.c_head.wrapping_sub(c_read) % sizes::QUEUE_CAP;
                 let ring_more = (sizes::QUEUE_CAP.saturating_sub(4)).saturating_sub(used) as usize;
                 let mut more_slots = free_c
                     .min(params::compute_flights().saturating_sub(active_computes + 1))
                     .min(sizes::COMPUTE_SLOTS.saturating_sub(1))
-                    .min(ring_more)
-                    .min(pipe_fold_cap);
+                    .min(ring_more);
                 let rt_head = job.resources.compute_scs() || c.is_rt();
                 // Fold trailing barrier-free compute commands of the base job first.
                 while !rt_head && more_slots > 0 && end < job.progress.count() {
