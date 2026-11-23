@@ -1043,10 +1043,12 @@ unsafe extern "C" fn pm_event(
     // SAFETY: By the callback contract above.
     let hook = unsafe { &*nb.cast::<PmHook>() };
     let ret = match action as u32 {
-        bindings::PM_SUSPEND_PREPARE | bindings::PM_HIBERNATION_PREPARE => {
-            hook.state.set_parked(true)
+        bindings::PM_SUSPEND_PREPARE
+        | bindings::PM_HIBERNATION_PREPARE
+        | bindings::PM_RESTORE_PREPARE => hook.state.set_parked(true),
+        bindings::PM_POST_SUSPEND | bindings::PM_POST_HIBERNATION | bindings::PM_POST_RESTORE => {
+            hook.state.set_parked(false)
         }
-        bindings::PM_POST_SUSPEND | bindings::PM_POST_HIBERNATION => hook.state.set_parked(false),
         _ => return bindings::NOTIFY_DONE as c_int,
     };
     if let Err(e) = ret {

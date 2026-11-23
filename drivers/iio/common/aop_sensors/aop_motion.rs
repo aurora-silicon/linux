@@ -340,22 +340,14 @@ impl Control {
 
     /// Returns whether the service reports a calibration state set by an
     /// earlier calibration in this AOP boot, as after a rebind of the driver.
-    fn holds_calibration(&self) -> bool {
-        let mut msg = KVec::new();
-        if msg
-            .extend_from_slice(&[0; 4], GFP_KERNEL)
-            .and_then(|()| msg.extend_from_slice(&PROP_CALIBRATION_STATE.to_le_bytes(), GFP_KERNEL))
-            .is_err()
-        {
-            return false;
-        }
-        match self
-            .aop
-            .epic_call_ret(&self.service, SUBTYPE_GET_PROPERTY, &msg, 4)
-        {
-            Ok((status, value)) => calibration_state_set(status, &value),
-            Err(_) => false,
-        }
+    fn holds_calibration(&self) -> Result<bool> {
+        let mut msg = KVec::with_capacity(8, GFP_KERNEL)?;
+        msg.extend_from_slice(&[0; 4], GFP_KERNEL)?;
+        msg.extend_from_slice(&PROP_CALIBRATION_STATE.to_le_bytes(), GFP_KERNEL)?;
+        let (status, value) =
+            self.aop
+                .epic_call_ret(&self.service, SUBTYPE_GET_PROPERTY, &msg, 4)?;
+        Ok(calibration_state_set(status, &value))
     }
 
     /// Sends the three calibration packets. The firmware keeps calibration for
@@ -368,7 +360,7 @@ impl Control {
     /// The packets are therefore sent only while the service's calibration
     /// state is still unset, and the state is set after them.
     fn calibrate(&self) -> Result {
-        if self.holds_calibration() {
+        if self.holds_calibration()? {
             dev_dbg!(self.dev, "calibration kept from an earlier bind\n");
             return Ok(());
         }
@@ -389,12 +381,18 @@ impl Control {
                 CALIBRATION.len()
             );
         }
-        // Firmware without the state property answers unsupported; it is
-        // then left to the packets' own status, as before.
-        match self.write(PROP_CALIBRATION_STATE, &CALIBRATION_LOADED.to_le_bytes())? {
-            0 | STATUS_UNSUPPORTED => Ok(()),
-            status => Err(self.refused(PROP_CALIBRATION_STATE, status)),
+        // The packets are already applied. Keep this bind calibrated even
+        // if updating the firmware's state marker fails.
+        match self.write(PROP_CALIBRATION_STATE, &CALIBRATION_LOADED.to_le_bytes()) {
+            Ok(0 | STATUS_UNSUPPORTED) => {}
+            Ok(status) => dev_warn!(
+                self.dev,
+                "calibration state update refused: status {:#x}\n",
+                status
+            ),
+            Err(e) => dev_warn!(self.dev, "calibration state update failed: {:?}\n", e),
         }
+        Ok(())
     }
 
     fn start_reports(&self) -> Result {
