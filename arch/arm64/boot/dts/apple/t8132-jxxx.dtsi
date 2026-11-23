@@ -362,7 +362,6 @@
 };
 
 &dwc3_0 {
-	dr_mode = "host";
 	maximum-speed = "super-speed";
 	phys = <&atcphy0 PHY_TYPE_USB2>, <&atcphy0 PHY_TYPE_USB3>;
 	phy-names = "usb2-phy", "usb3-phy";
@@ -416,7 +415,6 @@
 };
 
 &dwc3_1 {
-	dr_mode = "host";
 	maximum-speed = "super-speed";
 	phys = <&atcphy1 PHY_TYPE_USB2>, <&atcphy1 PHY_TYPE_USB3>;
 	phy-names = "usb2-phy", "usb3-phy";
@@ -470,5 +468,6 @@
 		reg = <0x10000 0x0 0x0 0x0 0x0>;
 		local-mac-address = [00 00 00 00 00 00];
 		apple,antenna-sku = "XX";
+		brcm,ccode-map-trivial;
 	};
 };

@@ -163,9 +163,38 @@ config APPLE_SART
 
 	  Say 'y' here if you have an Apple SoC.
 
+config APPLE_SART_KUNIT_TEST
+	bool "KUnit tests for the Apple SART DMA address filter" if !KUNIT_ALL_TESTS
+	depends on APPLE_SART=y && KUNIT=y
+	depends on ARM64 && OF
+	default KUNIT_ALL_TESTS
+	help
+	  Add and remove allowed regions on a SART whose registers are a
+	  buffer of kernel memory, and check the register encoding of each
+	  SART generation, the handling of a full table, of regions that are
+	  not whole pages and of the bootloader's entries, and what a
+	  firmware-driven sleep saves, restores and refuses. The tests touch
+	  no hardware.
+
+	  If unsure, say N.
+
 config APPLE_TUNABLE
 	tristate
 	depends on ARCH_APPLE || COMPILE_TEST
+
+config APPLE_TUNABLE_KUNIT_TEST
+	tristate "KUnit tests for Apple Silicon hardware tunables" if !KUNIT_ALL_TESTS
+	depends on KUNIT && ARM64 && OF
+	depends on ARCH_APPLE || COMPILE_TEST
+	select APPLE_TUNABLE
+	default KUNIT_ALL_TESTS
+	help
+	  Parse tunable properties from a device node built by the test and
+	  apply them to a buffer of kernel memory: the triplet decoding, the
+	  length, alignment and bounds checks, and the mask and value
+	  arithmetic. The tests touch no hardware.
+
+	  If unsure, say N.
 
 config RUST_APPLE_MAILBOX
 	bool
@@ -228,13 +257,13 @@ config APPLE_SEP
 	  the iBoot system container, locating its .gl extent through read-only,
 	  checksum-validated APFS metadata. It validates the complete store and
 	  both root records before registering with SEP.
-	  xART writes are enabled by default, but accepted only when the driver
+	  xART writes are always on, and accepted only when the driver
 	  validates the physical extent ownership invariants. Unsupported APFS
 	  layouts fail closed. A Linux identity keybag is created automatically
 	  when none exists; existing identities and reference keys are retained.
-	  Set xart_writes=0 provision_keybag=0 for read-only operation.
-	  With writes off the driver still attaches, but refuses Touch ID enrol
-	  and verify: the enclave saves anti-replay state after every match.
+	  There is no read-only mode: the xart_writes and provision_keybag
+	  module parameters were removed, and a stale value on the kernel
+	  command line or in modprobe.d is ignored.
 
 	  Say Y here if you have an Apple silicon Mac.
 

@@ -34,6 +34,8 @@ properties:
               - apple,t8112-dcpext
               - apple,t6000-dcpext
               - apple,t6020-dcpext
+              - apple,t6030-dcpext
+              - apple,t6031-dcpext
               - apple,t6041-dcpext
               - apple,t8122-dcpext
               - apple,t6050-dcpext
@@ -191,6 +193,16 @@ properties:
     description: |
       Per-slot enable flags, in slot order. The legacy J700 bootloader
       supplies a single zero to select surface zero instead.
+
+  apple,camera-indicator-surface:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    maximum: 3
+    description: |
+      Swap slot the kernel reserves for the software camera indicator, a
+      kernel-owned overlay on the internal panel that the camera driver shows
+      while it streams, on a best-effort basis: the camera does not depend on
+      it. The slot must not be enabled in apple,iomfb-surfaces. Userspace cannot
+      use the slot. This is a software indicator, not a privacy guarantee.
 
   apple,power-lut-data-x:
     $ref: /schemas/types.yaml#/definitions/uint8-array
@@ -526,6 +538,18 @@ properties:
             description:
               The route carries USB4 DP tunnels only, never a DP Alt Mode
               display. It is not a Type-C mode-switch.
+          apple,connector-group:
+            $ref: /schemas/types.yaml#/definitions/uint32
+            minimum: 0
+            maximum: 3
+            default: 0
+            description:
+              The order group of the route's display connector.
+              Connectors are created group by group, and in a group the
+              tunnel-only routes' after the others on SoCs that give every
+              port/pipeline pair a connector of its own (T6050), so a port
+              added to a board in a new group keeps the existing
+              connectors' names.
           port:
             $ref: /schemas/graph.yaml#/properties/port
         required:
@@ -571,23 +595,6 @@ allOf:
           maxItems: 10
           items:
             pattern: '^(dp-xbar|typec[0-9]+(-dpin[01])?)$'
-  - if:
-      not:
-        properties:
-          compatible:
-            contains:
-              enum: ['apple,t6030-dcpext', 'apple,t8132-dcpext',
-                     'apple,t6050-dcp', 'apple,t6050-dcpext']
-        required:
-          - compatible
-    then:
-      properties:
-        mux-controls:
-          maxItems: 8
-        mux-control-names:
-          maxItems: 8
-          items:
-            pattern: '^(dp-xbar|typec[0-9]+)$'
   - if:
       allOf:
         - not:

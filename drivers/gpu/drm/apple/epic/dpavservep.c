@@ -581,6 +581,17 @@ static const struct drm_edid *dcpavserv_read_edid_inline(struct apple_epic_servi
 	return drm_edid_alloc(resp->data + EDID_LEADING_DATA_SIZE, edid_size);
 }
 
+/*
+ * The sink's EDID through @service, a dcpav-service-epic its caller keeps
+ * pinned, for a driver that tracks the service itself (the M4 external DCP,
+ * iomfb_m4_ext_edid()): only the read, no instance bookkeeping.
+ */
+const struct drm_edid *dcpavserv_read_edid(struct apple_epic_service *service)
+{
+	return service->ep->wire_v2 ? dcpavserv_read_edid_inline(service) :
+		dcpavserv_read_edid_legacy(service);
+}
+
 bool dcpavserv_edid_current(struct apple_dcp *dcp, u64 generation)
 {
 	lockdep_assert_held(&dcp->hpd_mutex);
@@ -598,9 +609,6 @@ bool dcpavserv_edid_service_current(struct apple_dcp *dcp, u64 epoch)
 		((!dcp_is_ext26(dcp) && dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17P_EXTERNAL) ||
 		 !READ_ONCE(dcp->external_physically_absent));
 }
-
-#define DCPAVSERV_EDID_RETRIES 5
-#define DCPAVSERV_EDID_RETRY_MS 500
 
 static void dcpavserv_edid_retry_work(struct work_struct *work)
 {
@@ -812,4 +820,5 @@ int dpavservep_init(struct apple_dcp *dcp)
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST)
 #include "dpavservep-v14-test.c"
+#include "dpavservep-identity-test.c"
 #endif

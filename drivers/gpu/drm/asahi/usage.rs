@@ -11,6 +11,16 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
+/// Number of GPU engines tracked in [`Engine`]: vertex, fragment and compute.
+pub(crate) const NUM_ENGINES: usize = 3;
+
+/// Engine time charged across all clients per [`Engine`], in ns, for the GPU busy share.
+///
+/// Overlapping work from multiple clients on the same engine adds up here; consumers clamp
+/// the resulting busy share to 1000 permille, which safely errs toward the higher floor.
+pub(crate) static ENGINE_NS: [AtomicU64; NUM_ENGINES] =
+    [const { AtomicU64::new(0) }; NUM_ENGINES];
+
 #[derive(Clone, Copy)]
 pub(crate) enum Engine {
     Vertex,
@@ -20,13 +30,13 @@ pub(crate) enum Engine {
 
 /// One ledger per DRM file, shared by all of its queues and VMs.
 pub(crate) struct Client {
-    ns: [AtomicU64; 3],
+    ns: [AtomicU64; NUM_ENGINES],
 }
 
 impl Client {
     pub(crate) const fn new() -> Self {
         Self {
-            ns: [const { AtomicU64::new(0) }; 3],
+            ns: [const { AtomicU64::new(0) }; NUM_ENGINES],
         }
     }
 
@@ -38,6 +48,9 @@ impl Client {
             return;
         }
         let ns = ticks_to_ns(end - start, frequency_hz);
+        // Release orders retirement's earlier qos_complete() before any reader
+        // that Acquire-loads ENGINE_NS and then reads qos.oldest_in_flight().
+        ENGINE_NS[engine as usize].fetch_add(ns, Ordering::Release);
         let counter = &self.ns[engine as usize];
         let mut old = counter.load(Ordering::Relaxed);
         loop {
@@ -54,7 +67,7 @@ impl Client {
     }
 
     /// Vertex, fragment and compute, in ns. No cross-engine atomic snapshot is promised.
-    pub(crate) fn snapshot(&self) -> [u64; 3] {
+    pub(crate) fn snapshot(&self) -> [u64; NUM_ENGINES] {
         self.ns.each_ref().map(|ns| ns.load(Ordering::Relaxed))
     }
 }
@@ -75,14 +88,14 @@ const DISCONTINUITY_S: u64 = 60;
 /// still add up, one union each.
 pub(crate) struct Lane<P> {
     client: P,
-    covered: [AtomicU64; 3],
+    covered: [AtomicU64; NUM_ENGINES],
 }
 
 impl<P: core::ops::Deref<Target = Client>> Lane<P> {
     pub(crate) fn new(client: P) -> Self {
         Self {
             client,
-            covered: [const { AtomicU64::new(0) }; 3],
+            covered: [const { AtomicU64::new(0) }; NUM_ENGINES],
         }
     }
 
