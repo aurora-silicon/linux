@@ -177,6 +177,9 @@ struct Stream<T> {
     buffer_on: bool,
     /// The client is held open for recent direct reads until this deadline.
     direct_until: Option<T>,
+    /// Opening the client for a direct read failed with this error; direct
+    /// reads return it without another try until this deadline.
+    failed_until: Option<(T, Error)>,
     /// Set across system sleep and after unbind: no client may be open.
     parked: bool,
     /// The client was opened and the reports started.
@@ -188,6 +191,7 @@ impl<T> Stream<T> {
         Self {
             buffer_on: false,
             direct_until: None,
+            failed_until: None,
             parked: false,
             active: false,
         }
@@ -221,6 +225,16 @@ impl<T> Stream<T> {
             self.direct_until = None;
             IdleStep::Expire
         }
+    }
+
+    /// Returns the error of a failed open for as long as direct reads back
+    /// off from it, given the milliseconds left until they may try again
+    /// (`<= 0` once they may).
+    fn check_backoff(&mut self, remaining_ms: i64) -> Option<Error> {
+        if remaining_ms <= 0 {
+            self.failed_until = None;
+        }
+        self.failed_until.as_ref().map(|(_, e)| *e)
     }
 }
 
@@ -499,6 +513,7 @@ impl State {
         if on {
             // The buffer takes over a client that direct reads opened.
             s.direct_until = None;
+            s.failed_until = None;
         }
         let ret = self.sync_locked(&mut s);
         if on && ret.is_err() {
@@ -512,6 +527,7 @@ impl State {
         let ret = {
             let mut s = self.stream.lock();
             s.parked = parked;
+            s.failed_until = None;
             if parked {
                 s.direct_until = None;
             }
@@ -538,11 +554,19 @@ impl State {
     /// Returns the current orientation. Without a buffer consumer the client
     /// is opened on demand and kept open until direct reads go quiet for
     /// `DIRECT_IDLE_MS`. The stream lock is held across the wait for the first
-    /// sample, so the idle work cannot close the client under a reader.
+    /// sample, so the idle work cannot close the client under a reader. A
+    /// failed open is not tried again for as long as the idle window; reads in
+    /// between return its error.
     fn read_now(self: &Arc<Self>) -> Result<[i32; 4]> {
         let mut s = self.stream.lock();
         if s.parked {
             return Err(EBUSY);
+        }
+        if let Some((until, _)) = s.failed_until {
+            let remaining_ms = (until - Instant::<Monotonic>::now()).as_millis_ceil();
+            if let Some(e) = s.check_backoff(remaining_ms) {
+                return Err(e);
+            }
         }
         let started = !s.active;
         if !s.buffer_on {
@@ -550,6 +574,9 @@ impl State {
         }
         if let Err(e) = self.sync_locked(&mut s) {
             s.direct_until = None;
+            // Polling readers must not repeat a failing open at their rate.
+            let until = Instant::<Monotonic>::now() + Delta::from_millis(DIRECT_IDLE_MS);
+            s.failed_until = Some((until, e));
             return Err(e);
         }
         if started {

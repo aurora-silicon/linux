@@ -27,7 +27,8 @@ def const(source, name):
 def main():
     root = Path(__file__).resolve().parents[5]
     devmotion = (root / "drivers/iio/common/aop_sensors/aop_devmotion.rs").read_text()
-    parts = [const(devmotion, "DIRECT_IDLE_MS"),
+    parts = ["#[derive(Clone, Copy, Debug, PartialEq, Eq)]\nstruct Error(i32);",
+             const(devmotion, "DIRECT_IDLE_MS"),
              block(devmotion, "#[derive(Clone, Copy, Debug, PartialEq, Eq)]\nenum SyncAction"),
              block(devmotion, "#[derive(Clone, Copy, Debug, PartialEq, Eq)]\nenum IdleStep"),
              block(devmotion, "struct Stream<T>"),
@@ -52,16 +53,41 @@ fn sync(s: &mut Stream<i64>, svc: &mut Service) {
     }
 }
 
-/// One direct read at `now` ms, as `State::read_now()` does it.
-fn read(s: &mut Stream<i64>, svc: &mut Service, now: i64) -> bool {
+const EBUSY: Error = Error(16);
+const EIO: Error = Error(5);
+const ETIMEDOUT: Error = Error(110);
+
+/// One direct read at `now` ms, as `State::read_now()` does it, on a service
+/// that fails every open with `fail`. A failed open counts as an open.
+fn try_read(
+    s: &mut Stream<i64>,
+    svc: &mut Service,
+    now: i64,
+    fail: Option<Error>,
+) -> Result<(), Error> {
     if s.parked {
-        return false;
+        return Err(EBUSY);
+    }
+    if let Some((until, _)) = s.failed_until {
+        if let Some(e) = s.check_backoff(until - now) {
+            return Err(e);
+        }
     }
     if !s.buffer_on {
         s.direct_until = Some(now + DIRECT_IDLE_MS);
     }
+    if let (SyncAction::Start, Some(e)) = (s.next_action(), fail) {
+        svc.opens += 1;
+        s.direct_until = None;
+        s.failed_until = Some((now + DIRECT_IDLE_MS, e));
+        return Err(e);
+    }
     sync(s, svc);
-    true
+    Ok(())
+}
+
+fn read(s: &mut Stream<i64>, svc: &mut Service, now: i64) -> bool {
+    try_read(s, svc, now, None).is_ok()
 }
 
 /// The idle work running at `now` ms; returns the re-arm delay, if any.
@@ -189,6 +215,79 @@ fn sleep_and_unbind_park_the_client() {
     assert!(s.direct_until.is_none());
     sync(&mut s, &mut svc);
     assert_eq!((svc.opens, svc.closes), (3, 3));
+}
+#[test]
+fn failed_open_backs_off_direct_reads() {
+    let mut s = Stream::<i64>::new();
+    let mut svc = Service { opens: 0, closes: 0 };
+
+    // A 25 Hz poller on a failing service tries one open per idle window
+    // and gets the error of that open in between.
+    let mut now = 0;
+    while now < 10_000 {
+        assert_eq!(try_read(&mut s, &mut svc, now, Some(EIO)), Err(EIO));
+        assert!(!s.want());
+        assert_eq!(idle(&mut s, &mut svc, now), None);
+        now += 40;
+    }
+    assert_eq!((svc.opens, svc.closes), ((10_000 / DIRECT_IDLE_MS) as u32, 0));
+
+    // The cached error is the one of the latest try.
+    assert_eq!(try_read(&mut s, &mut svc, 10_000, Some(ETIMEDOUT)), Err(ETIMEDOUT));
+    let last = 10_000 + DIRECT_IDLE_MS;
+    assert_eq!(try_read(&mut s, &mut svc, last - 1, Some(EIO)), Err(ETIMEDOUT));
+    assert_eq!(svc.opens, 6);
+
+    // The first read after the window tries again; success ends the backoff.
+    assert!(read(&mut s, &mut svc, last));
+    assert_eq!((svc.opens, svc.closes), (7, 0));
+    assert!(s.failed_until.is_none());
+    assert!(s.active);
+    assert!(read(&mut s, &mut svc, last + 40));
+    assert_eq!((svc.opens, svc.closes), (7, 0));
+
+    // The deadline itself is the first moment of the next try.
+    assert_eq!(s.check_backoff(-1), None);
+    s.failed_until = Some((500, EIO));
+    assert_eq!(s.check_backoff(1), Some(EIO));
+    assert!(s.failed_until.is_some());
+    assert_eq!(s.check_backoff(0), None);
+    assert!(s.failed_until.is_none());
+}
+#[test]
+fn buffer_and_sleep_end_the_backoff() {
+    let mut s = Stream::<i64>::new();
+    let mut svc = Service { opens: 0, closes: 0 };
+    assert_eq!(try_read(&mut s, &mut svc, 0, Some(EIO)), Err(EIO));
+    assert_eq!(try_read(&mut s, &mut svc, 40, Some(EIO)), Err(EIO));
+    assert_eq!(svc.opens, 1);
+
+    // Enabling a buffer is a new request: it tries an open of its own, and
+    // a read under the running buffer is served, as `set_buffer()` does it.
+    s.buffer_on = true;
+    s.direct_until = None;
+    s.failed_until = None;
+    sync(&mut s, &mut svc);
+    assert_eq!((svc.opens, svc.closes), (2, 0));
+    assert_eq!(try_read(&mut s, &mut svc, 80, Some(EIO)), Ok(()));
+    s.buffer_on = false;
+    sync(&mut s, &mut svc);
+    assert_eq!((svc.opens, svc.closes), (2, 1));
+
+    // Sleep drops a backoff, as `set_parked()` does it, so the first read
+    // after resume tries at once. A read during the sleep is refused as
+    // before and leaves no backoff behind.
+    assert_eq!(try_read(&mut s, &mut svc, 1_000, Some(EIO)), Err(EIO));
+    assert_eq!(svc.opens, 3);
+    s.parked = true;
+    s.failed_until = None;
+    sync(&mut s, &mut svc);
+    assert_eq!(try_read(&mut s, &mut svc, 1_020, Some(EIO)), Err(EBUSY));
+    s.parked = false;
+    s.failed_until = None;
+    sync(&mut s, &mut svc);
+    assert!(read(&mut s, &mut svc, 1_040));
+    assert_eq!((svc.opens, svc.closes), (4, 1));
 }
 ''']
     with tempfile.TemporaryDirectory(prefix="aop-devmotion-") as tmp:
