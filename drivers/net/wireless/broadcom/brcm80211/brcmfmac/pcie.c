@@ -429,6 +429,7 @@ struct brcmf_pciedev_info {
 	const struct brcmf_pcie_reginfo *reginfo;
 	void __iomem *regs;
 	void __iomem *tcm;
+	size_t tcm_size;
 	u32 fw_size;
 	bool skip_reset_vector;
 	struct brcmf_chip *ci;
@@ -1133,11 +1134,25 @@ static void brcmf_pcie_bus_console_init(struct brcmf_pciedev_info *devinfo)
 	console = &shared->console;
 	addr = shared->tcm_base_address + BRCMF_SHARED_CONSOLE_ADDR_OFFSET;
 	console->base_addr = brcmf_pcie_read_tcm32(devinfo, addr);
+	console->bufsize = 0;
+	console->read_idx = 0;
+	if (!brcmf_pcie_tcm_range_valid(devinfo->tcm_size, console->base_addr,
+					BRCMF_CONSOLE_WRITEIDX_OFFSET + 4)) {
+		console->base_addr = 0;
+		return;
+	}
 
 	addr = console->base_addr + BRCMF_CONSOLE_BUFADDR_OFFSET;
 	console->buf_addr = brcmf_pcie_read_tcm32(devinfo, addr);
 	addr = console->base_addr + BRCMF_CONSOLE_BUFSIZE_OFFSET;
 	console->bufsize = brcmf_pcie_read_tcm32(devinfo, addr);
+	if (!console->bufsize ||
+	    !brcmf_pcie_tcm_range_valid(devinfo->tcm_size, console->buf_addr,
+					console->bufsize)) {
+		console->base_addr = 0;
+		console->bufsize = 0;
+		return;
+	}
 	addr = console->base_addr + BRCMF_CONSOLE_WRITEIDX_OFFSET;
 	console->scan_idx = brcmf_pcie_read_tcm32(devinfo, addr);
 	console->scan_len = 0;
@@ -1170,6 +1185,8 @@ static void brcmf_pcie_bus_console_read(struct brcmf_pciedev_info *devinfo,
 		return;
 	addr = console->base_addr + BRCMF_CONSOLE_WRITEIDX_OFFSET;
 	newidx = brcmf_pcie_read_tcm32(devinfo, addr);
+	if (newidx >= console->bufsize || console->read_idx >= console->bufsize)
+		return;
 	while (newidx != console->read_idx) {
 		addr = console->buf_addr + console->read_idx;
 		ch = brcmf_pcie_read_tcm8(devinfo, addr);
@@ -2392,6 +2409,7 @@ static int brcmf_pcie_get_resource(struct brcmf_pciedev_info *devinfo)
 
 	devinfo->regs = ioremap(bar0_addr, BRCMF_PCIE_REG_MAP_SIZE);
 	devinfo->tcm = ioremap(bar1_addr, bar1_size);
+	devinfo->tcm_size = bar1_size;
 
 	if (!devinfo->regs || !devinfo->tcm) {
 		brcmf_err(bus, "ioremap() failed (%p,%p)\n", devinfo->regs,
