@@ -68,6 +68,7 @@
 #include <linux/panic.h>
 #include <linux/pm_domain.h>
 #include <linux/smp.h>
+#include <linux/soc/apple/aura-hibernate.h>
 #include <linux/soc/apple/dart.h>
 #include <linux/soc/apple/sleep.h>
 #include <linux/soc/apple/dcp-v27-sleep.h>
@@ -903,6 +904,9 @@ struct apple_sleep {
 	bool matched;
 	void __iomem *dvfm[SLEEP_CLUSTERS];
 	struct aura_s2r_mailbox *mbox;
+	u64 mbox_pa;
+	/* After a resume from disk: no mailbox of this boot, so no deep sleep */
+	bool mbox_lost;
 
 	u32 wake_enable[WAKE_SOURCES_MAX];
 	int wake_enable_count;
@@ -6465,6 +6469,9 @@ static int apple_sleep_begin(suspend_state_t state)
 	if (state != PM_SUSPEND_MEM)
 		return 0;
 
+	if (apple_sleep->mbox_lost)
+		return -ENODEV;
+
 	ret = apple_sleep_profile_check(apple_sleep);
 	if (ret)
 		return ret;
@@ -7208,6 +7215,7 @@ static int apple_sleep_map_mailbox(struct apple_sleep *s)
 	s->mbox = devm_memremap(s->dev, pa, sizeof(*s->mbox), MEMREMAP_WB);
 	if (IS_ERR(s->mbox))
 		return PTR_ERR(s->mbox);
+	s->mbox_pa = pa;
 
 	/* aura wrote it with the MMU off, so nothing of it can be in a cache. */
 	if (s->mbox->magic != AURA_S2R_MAGIC)
@@ -7221,6 +7229,61 @@ static int apple_sleep_map_mailbox(struct apple_sleep *s)
 
 	return 0;
 }
+
+/*
+ * aura's mailbox moves with the boot object, so after a resume from disk the
+ * one mapped at probe is the one of the boot that wrote the image, which no
+ * aura reads any more. Take this boot's from aura's tree. Without a valid one
+ * deep sleep stays off until the next boot: a wake through a mailbox aura does
+ * not read would run its boot flow again.
+ */
+static int apple_sleep_restore(struct device *dev)
+{
+	struct apple_sleep *s = dev_get_drvdata(dev);
+	struct aura_s2r_mailbox *mbox;
+	u64 pa;
+	int ret;
+
+	if (!IS_ENABLED(CONFIG_APPLE_AURA_HIBERNATE))
+		return 0;
+
+	ret = aura_hibernate_boot_chosen_u64("aurora,s2r-mailbox", &pa);
+	if (ret) {
+		dev_err(dev, "no S2R mailbox of this boot (%d): deep sleep off\n", ret);
+		goto lost;
+	}
+	if (pa == s->mbox_pa)
+		return 0;
+
+	mbox = devm_memremap(dev, pa, sizeof(*mbox), MEMREMAP_WB);
+	if (IS_ERR(mbox)) {
+		ret = PTR_ERR(mbox);
+		dev_err(dev, "S2R mailbox of this boot not mapped (%d): deep sleep off\n", ret);
+		goto lost;
+	}
+	/* The boot kernel may have read it through a cacheable mapping. */
+	dcache_inval_poc((unsigned long)mbox, (unsigned long)(mbox + 1));
+	if (mbox->magic != AURA_S2R_MAGIC || mbox->boot_mpidr != cpu_logical_map(0)) {
+		dev_err(dev, "S2R mailbox of this boot not valid (magic %llx, CPU %llx): deep sleep off\n",
+			mbox->magic, mbox->boot_mpidr);
+		devm_memunmap(dev, mbox);
+		goto lost;
+	}
+
+	devm_memunmap(dev, s->mbox);
+	s->mbox = mbox;
+	s->mbox_pa = pa;
+	dev_dbg(dev, "S2R mailbox of this boot at %llx\n", pa);
+	return 0;
+
+lost:
+	s->mbox_lost = true;
+	return 0;
+}
+
+static const struct dev_pm_ops apple_sleep_pm_ops = {
+	.restore = apple_sleep_restore,
+};
 
 static struct apple_tunable *apple_sleep_apcie_tunable(struct apple_sleep *s,
 						       struct device_node *np,
@@ -9662,6 +9725,7 @@ static struct platform_driver apple_sleep_driver = {
 		.name = "apple-sleep",
 		.of_match_table = apple_sleep_of_match,
 		.suppress_bind_attrs = true,
+		.pm = pm_sleep_ptr(&apple_sleep_pm_ops),
 	},
 	.probe = apple_sleep_probe,
 };
