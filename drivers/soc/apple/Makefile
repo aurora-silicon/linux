@@ -71,3 +71,6 @@ obj-$(CONFIG_APPLE_REGVIEW) += apple-regview.o
 apple-regview-y := regview.o
 
 obj-$(CONFIG_APPLE_AURORA_BOOT_SECURITY) += aurora-boot-security.o
+ifeq ($(CONFIG_APPLE_AURORA_BOOT_SECURITY_KUNIT_TEST),m)
+obj-m += aurora-boot-security-test.o
+endif

@@ -434,8 +434,8 @@ config APPLE_AURORA_BOOT_SECURITY_LOCKDOWN
 	  applies.
 
 config APPLE_AURORA_BOOT_SECURITY_KUNIT_TEST
-	bool "KUnit tests for the Aurora boot security record" if !KUNIT_ALL_TESTS
-	depends on APPLE_AURORA_BOOT_SECURITY=y && KUNIT=y && OF_DYNAMIC
+	tristate "KUnit tests for the Aurora boot security record" if !KUNIT_ALL_TESTS
+	depends on APPLE_AURORA_BOOT_SECURITY && KUNIT && OF_DYNAMIC
 	default KUNIT_ALL_TESTS
 	help
 	  Build boot records in the live device tree and check what the
@@ -443,11 +443,11 @@ config APPLE_AURORA_BOOT_SECURITY_KUNIT_TEST
 	  chain enforced, when a claimed "verified" state is demoted, which
 	  records are ignored, and what every file in
 	  /sys/firmware/aurora/boot_security/ shows for absent, empty,
-	  unterminated, short, long and oversized properties. The init
-	  cases add and remove a test /chosen/aurora,boot-security and are
-	  skipped when APPLE_AURORA_BOOT_SECURITY_LOCKDOWN is set. Both
+	  unterminated, short, long and oversized properties. The built-in
+	  init suite adds and removes a test /chosen/aurora,boot-security
+	  and skips when APPLE_AURORA_BOOT_SECURITY_LOCKDOWN is set. Both
 	  suites skip while the boot-security state is in use. The IMA
-	  formatting case skips when IMA is enabled. No hardware is touched.
+	  submission case skips when IMA is enabled. No hardware is touched.
 
 	  If unsure, say N.
 

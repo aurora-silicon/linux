@@ -10,11 +10,17 @@
  * sysfs file prints for absent, empty, unterminated, short, long and
  * oversized properties. No hardware is touched.
  *
- * Included from aurora-boot-security.c.
+ * The init suite is built into the driver while .init.text is live.
  */
 
 #include <kunit/test.h>
 #include <linux/kernfs.h>
+#include <linux/kobject.h>
+#include <linux/mm.h>
+#include <linux/of.h>
+#include <linux/vmalloc.h>
+
+#include "aurora-boot-security-test.h"
 
 #define BS_GUARD 0xa5
 
@@ -38,10 +44,10 @@ struct bs_meas_spec {
 
 static void bs_reset_globals(void)
 {
-	rec = NULL;
-	chain_state = "none";
-	stage1_enforced = false;
-	lockdown_reason = "no";
+	*aurora_bs_test.rec = NULL;
+	*aurora_bs_test.chain_state = "none";
+	*aurora_bs_test.stage1_enforced = false;
+	*aurora_bs_test.lockdown_reason = "no";
 }
 
 /* A property with exactly @len bytes of @val, no terminator added. */
@@ -72,6 +78,10 @@ static void bs_raw(struct kunit *test, struct device_node *np,
 		kfree(p);
 		KUNIT_FAIL_AND_ABORT(test, "could not add property %s: %d", name, ret);
 	}
+
+	/* The detached fixture node owns this even if apply is never called. */
+	p->next = np->deadprops;
+	np->deadprops = p;
 }
 
 static void bs_str(struct kunit *test, struct device_node *np,
@@ -148,22 +158,30 @@ static void bs_apply(struct kunit *test)
 
 	KUNIT_ASSERT_EQ(test, of_changeset_apply(&ctx->cs), 0);
 	ctx->applied = true;
-	rec = ctx->np;
+	*aurora_bs_test.rec = ctx->np;
 }
 
 /* What aurora_boot_security_init() derives from the record. */
 static void bs_decide(void)
 {
-	stage1_enforced = stage1_enforced_verified();
-	chain_state = effective_state();
+	*aurora_bs_test.stage1_enforced = aurora_bs_test.stage1_enforced_verified();
+	*aurora_bs_test.chain_state = aurora_bs_test.effective_state();
 }
 
-/* A page for a show function, with a guard page behind it. */
+static ssize_t bs_show(struct kobj_attribute *attr, char *buf)
+{
+	return attr->show(NULL, attr, buf);
+}
+
+KUNIT_DEFINE_ACTION_WRAPPER(bs_vfree, vfree, const void *);
+
+/* A page for a show function, with a second page for the canary. */
 static char *bs_page(struct kunit *test)
 {
-	char *buf = kunit_kzalloc(test, 2 * PAGE_SIZE, GFP_KERNEL);
+	char *buf = vzalloc(2 * PAGE_SIZE);
 
 	KUNIT_ASSERT_NOT_NULL(test, buf);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, bs_vfree, buf), 0);
 	KUNIT_ASSERT_TRUE(test, PAGE_ALIGNED(buf));
 	memset(buf + PAGE_SIZE, BS_GUARD, PAGE_SIZE);
 	return buf;
@@ -184,16 +202,16 @@ static int bs_init(struct kunit *test)
 {
 	struct bs_ctx *ctx;
 
-	if (rec || aurora_kobj || bs_kobj)
+	if (*aurora_bs_test.rec || *aurora_bs_test.aurora_kobj || *aurora_bs_test.bs_kobj)
 		kunit_skip(test, "boot-security state is in use");
 	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
 	if (!ctx)
 		return -ENOMEM;
 	of_changeset_init(&ctx->cs);
 	test->priv = ctx;
-	ctx->old_chain_state = chain_state;
-	ctx->old_lockdown_reason = lockdown_reason;
-	ctx->old_stage1_enforced = stage1_enforced;
+	ctx->old_chain_state = *aurora_bs_test.chain_state;
+	ctx->old_lockdown_reason = *aurora_bs_test.lockdown_reason;
+	ctx->old_stage1_enforced = *aurora_bs_test.stage1_enforced;
 	bs_reset_globals();
 	return 0;
 }
@@ -205,10 +223,10 @@ static void bs_exit(struct kunit *test)
 	if (!ctx)
 		return;
 	test->priv = NULL;
-	rec = NULL;
-	chain_state = ctx->old_chain_state;
-	lockdown_reason = ctx->old_lockdown_reason;
-	stage1_enforced = ctx->old_stage1_enforced;
+	*aurora_bs_test.rec = NULL;
+	*aurora_bs_test.chain_state = ctx->old_chain_state;
+	*aurora_bs_test.lockdown_reason = ctx->old_lockdown_reason;
+	*aurora_bs_test.stage1_enforced = ctx->old_stage1_enforced;
 	if (ctx->applied)
 		of_changeset_revert(&ctx->cs);
 	of_changeset_destroy(&ctx->cs);
@@ -234,8 +252,8 @@ static void bs_stage1_no_measurements(struct kunit *test)
 	bs_str(test, np, "state", "verified");
 	bs_apply(test);
 	bs_decide();
-	KUNIT_EXPECT_FALSE(test, stage1_enforced);
-	KUNIT_EXPECT_STREQ(test, chain_state, "partial");
+	KUNIT_EXPECT_FALSE(test, *aurora_bs_test.stage1_enforced);
+	KUNIT_EXPECT_STREQ(test, *aurora_bs_test.chain_state, "partial");
 }
 
 /* One measurement without a hash. */
@@ -251,6 +269,7 @@ static const struct bs_one_case bs_one_cases[] = {
 	{ "stage1 enforce verified", BS_M("stage1", "enforce", "verified"), true },
 	{ "stage1 audit verified", BS_M("stage1", "audit", "verified"), false },
 	{ "stage1 off verified", BS_M("stage1", "off", "verified"), false },
+	{ "stage1 enforce test key", BS_M("stage1", "enforce", "test-key"), false },
 	{ "stage1 enforce failed", BS_M("stage1", "enforce", "failed"), false },
 	{ "stage1 enforce unverified", BS_M("stage1", "enforce", "unverified"), false },
 	{ "stage1 enforce no verdict", BS_M("stage1", "enforce", BS_ABSENT), false },
@@ -275,7 +294,26 @@ static void bs_stage1_one_measurement(struct kunit *test)
 	bs_test_record(test);
 	bs_meas(test, &p->m, 1);
 	bs_apply(test);
-	KUNIT_EXPECT_EQ(test, stage1_enforced_verified(), p->enforced);
+	KUNIT_EXPECT_EQ(test, aurora_bs_test.stage1_enforced_verified(), p->enforced);
+}
+
+/* Report the build flavour separately from the recorded verdict. */
+static void bs_stage1_dev_enforce(struct kunit *test)
+{
+	const struct bs_meas_spec m = BS_M("stage1", "enforce", "verified");
+	struct device_node *np = bs_test_record(test);
+	char *buf = bs_page(test);
+
+	bs_str(test, np, "state", "verified");
+	bs_str(test, np, "stage1-flavour", "dev");
+	bs_meas(test, &m, 1);
+	bs_apply(test);
+	bs_decide();
+
+	KUNIT_EXPECT_TRUE(test, *aurora_bs_test.stage1_enforced);
+	KUNIT_EXPECT_STREQ(test, *aurora_bs_test.chain_state, "verified");
+	bs_show(aurora_bs_test.stage1_flavour, buf);
+	KUNIT_EXPECT_STREQ(test, buf, "dev\n");
 }
 
 /* Any one enforcing, verified Stage 1 entry counts, wherever it is. */
@@ -291,7 +329,7 @@ static void bs_stage1_among_others(struct kunit *test)
 	bs_test_record(test);
 	bs_meas(test, m, ARRAY_SIZE(m));
 	bs_apply(test);
-	KUNIT_EXPECT_TRUE(test, stage1_enforced_verified());
+	KUNIT_EXPECT_TRUE(test, aurora_bs_test.stage1_enforced_verified());
 }
 
 static void bs_stage1_none_among_many(struct kunit *test)
@@ -306,7 +344,7 @@ static void bs_stage1_none_among_many(struct kunit *test)
 	bs_test_record(test);
 	bs_meas(test, m, ARRAY_SIZE(m));
 	bs_apply(test);
-	KUNIT_EXPECT_FALSE(test, stage1_enforced_verified());
+	KUNIT_EXPECT_FALSE(test, aurora_bs_test.stage1_enforced_verified());
 }
 
 /* A string property without its terminator is not that string. */
@@ -329,7 +367,7 @@ static void bs_stage1_unterminated(struct kunit *test)
 			bs_raw(test, c, names[i], vals[i],
 			       strlen(vals[i]) + (i != bad));
 		bs_apply(test);
-		KUNIT_EXPECT_EQ_MSG(test, stage1_enforced_verified(), bad < 0,
+		KUNIT_EXPECT_EQ_MSG(test, aurora_bs_test.stage1_enforced_verified(), bad < 0,
 				    "unterminated %s", bad < 0 ? "none" : names[bad]);
 		bs_exit(test);
 	}
@@ -348,7 +386,7 @@ static void bs_stage1_string_list(struct kunit *test)
 	bs_raw(test, c, "policy", lists, sizeof(lists));
 	bs_str(test, c, "verdict", "verified");
 	bs_apply(test);
-	KUNIT_EXPECT_FALSE(test, stage1_enforced_verified());
+	KUNIT_EXPECT_FALSE(test, aurora_bs_test.stage1_enforced_verified());
 }
 
 /* --- The chain state ---------------------------------------------------- */
@@ -392,11 +430,11 @@ static void bs_state_demotion(struct kunit *test)
 		       p->len > 0 ? p->len :
 		       p->len < 0 ? 0 : strlen(p->state) + 1);
 	bs_apply(test);
-	stage1_enforced = p->enforced;
+	*aurora_bs_test.stage1_enforced = p->enforced;
 	if (p->expect)
-		KUNIT_EXPECT_STREQ(test, effective_state(), p->expect);
+		KUNIT_EXPECT_STREQ(test, aurora_bs_test.effective_state(), p->expect);
 	else
-		KUNIT_EXPECT_STRNEQ(test, effective_state(), "verified");
+		KUNIT_EXPECT_STRNEQ(test, aurora_bs_test.effective_state(), "verified");
 }
 
 /* A record that names the second string of a list is not verified. */
@@ -407,8 +445,8 @@ static void bs_state_string_list(struct kunit *test)
 
 	bs_raw(test, np, "state", list, sizeof(list));
 	bs_apply(test);
-	stage1_enforced = true;
-	KUNIT_EXPECT_STREQ(test, effective_state(), "partial");
+	*aurora_bs_test.stage1_enforced = true;
+	KUNIT_EXPECT_STREQ(test, aurora_bs_test.effective_state(), "partial");
 }
 
 static void bs_state_and_advisory_show(struct kunit *test)
@@ -425,9 +463,9 @@ static void bs_state_and_advisory_show(struct kunit *test)
 	bs_apply(test);
 	bs_decide();
 
-	KUNIT_EXPECT_EQ(test, state_show(NULL, &state_attr, buf), 9);
+	KUNIT_EXPECT_EQ(test, bs_show(aurora_bs_test.state, buf), 9);
 	KUNIT_EXPECT_STREQ(test, buf, "verified\n");
-	KUNIT_EXPECT_EQ(test, advisory_show(NULL, &advisory_attr, buf), 2);
+	KUNIT_EXPECT_EQ(test, bs_show(aurora_bs_test.advisory, buf), 2);
 	KUNIT_EXPECT_STREQ(test, buf, "0\n");
 }
 
@@ -445,9 +483,9 @@ static void bs_state_and_advisory_show_audit(struct kunit *test)
 	bs_apply(test);
 	bs_decide();
 
-	state_show(NULL, &state_attr, buf);
+	bs_show(aurora_bs_test.state, buf);
 	KUNIT_EXPECT_STREQ(test, buf, "partial\n");
-	advisory_show(NULL, &advisory_attr, buf);
+	bs_show(aurora_bs_test.advisory, buf);
 	KUNIT_EXPECT_STREQ(test, buf, "1\n");
 }
 
@@ -456,11 +494,11 @@ static void bs_state_show_defaults(struct kunit *test)
 {
 	char *buf = bs_page(test);
 
-	state_show(NULL, &state_attr, buf);
+	bs_show(aurora_bs_test.state, buf);
 	KUNIT_EXPECT_STREQ(test, buf, "none\n");
-	advisory_show(NULL, &advisory_attr, buf);
+	bs_show(aurora_bs_test.advisory, buf);
 	KUNIT_EXPECT_STREQ(test, buf, "1\n");
-	KUNIT_EXPECT_EQ(test, lockdown_show(NULL, &lockdown_attr, buf), 3);
+	KUNIT_EXPECT_EQ(test, bs_show(aurora_bs_test.lockdown, buf), 3);
 	KUNIT_EXPECT_STREQ(test, buf, "no\n");
 }
 
@@ -475,7 +513,7 @@ static void bs_policy_show_case(struct kunit *test,
 	bs_test_record(test);
 	bs_meas(test, m, n);
 	bs_apply(test);
-	KUNIT_EXPECT_EQ(test, policy_show(NULL, &policy_attr, buf),
+	KUNIT_EXPECT_EQ(test, bs_show(aurora_bs_test.policy, buf),
 			(ssize_t)strlen(expect));
 	KUNIT_EXPECT_STREQ(test, buf, expect);
 }
@@ -557,7 +595,7 @@ static void bs_policy_show_bounded(struct kunit *test)
 	bs_test_record(test);
 	bs_meas(test, m, n);
 	bs_apply(test);
-	ret = policy_show(NULL, &policy_attr, buf);
+	ret = bs_show(aurora_bs_test.policy, buf);
 	KUNIT_EXPECT_EQ(test, ret, (ssize_t)PAGE_SIZE - 1);
 	KUNIT_EXPECT_EQ(test, strlen(buf), (size_t)ret);
 	bs_expect_guard(test, buf, PAGE_SIZE, 2 * PAGE_SIZE);
@@ -605,9 +643,9 @@ static void bs_string_show(struct kunit *test)
 		       p->len < 0 ? 0 : strlen(p->val) + 1);
 	bs_apply(test);
 	if (p->uefi)
-		ret = uefi_secure_boot_show(NULL, &uefi_secure_boot_attr, buf);
+		ret = bs_show(aurora_bs_test.uefi_secure_boot, buf);
 	else
-		ret = stage1_flavour_show(NULL, &stage1_flavour_attr, buf);
+		ret = bs_show(aurora_bs_test.stage1_flavour, buf);
 	KUNIT_EXPECT_EQ(test, ret, (ssize_t)strlen(p->expect));
 	KUNIT_EXPECT_STREQ(test, buf, p->expect);
 }
@@ -617,13 +655,13 @@ static void bs_string_show_long(struct kunit *test)
 {
 	struct device_node *np = bs_test_record(test);
 	char *buf = bs_page(test);
-	char *val = kunit_kzalloc(test, 2 * PAGE_SIZE, GFP_KERNEL);
+	char *val = vzalloc(2 * PAGE_SIZE);
 
 	KUNIT_ASSERT_NOT_NULL(test, val);
 	memset(val, 'x', 2 * PAGE_SIZE - 1);
 	bs_raw(test, np, "stage1-flavour", val, 2 * PAGE_SIZE);
 	bs_apply(test);
-	KUNIT_EXPECT_EQ(test, stage1_flavour_show(NULL, &stage1_flavour_attr, buf),
+	KUNIT_EXPECT_EQ(test, bs_show(aurora_bs_test.stage1_flavour, buf),
 			(ssize_t)PAGE_SIZE - 1);
 	bs_expect_guard(test, buf, PAGE_SIZE, 2 * PAGE_SIZE);
 }
@@ -675,7 +713,7 @@ static void bs_lp_coih_show(struct kunit *test)
 	} else {
 		strscpy(expect, "unknown\n", 2 * 64 + 2);
 	}
-	KUNIT_EXPECT_EQ(test, lp_coih_show(NULL, &lp_coih_attr, buf),
+	KUNIT_EXPECT_EQ(test, bs_show(aurora_bs_test.lp_coih, buf),
 			(ssize_t)strlen(expect));
 	KUNIT_EXPECT_STREQ(test, buf, expect);
 }
@@ -691,7 +729,7 @@ static void bs_measurements_show_case(struct kunit *test,
 	bs_test_record(test);
 	bs_meas(test, m, n);
 	bs_apply(test);
-	KUNIT_EXPECT_EQ(test, measurements_show(NULL, &measurements_attr, buf),
+	KUNIT_EXPECT_EQ(test, bs_show(aurora_bs_test.measurements, buf),
 			(ssize_t)strlen(expect));
 	KUNIT_EXPECT_STREQ(test, buf, expect);
 }
@@ -775,7 +813,7 @@ static void bs_format_measurements_bounded(struct kunit *test)
 		size_t sz = sizes[i], want = min(sz - 1, strlen(full));
 
 		memset(buf, BS_GUARD, 512);
-		ret = format_measurements(buf, sz);
+		ret = aurora_bs_test.format_measurements(buf, sz);
 		KUNIT_EXPECT_EQ_MSG(test, ret, (ssize_t)want, "size %zu", sz);
 		KUNIT_EXPECT_EQ_MSG(test, buf[want], 0, "size %zu", sz);
 		/* A cut first line leaves no room for the second. */
@@ -804,7 +842,7 @@ static void bs_measurements_show_bounded(struct kunit *test)
 	bs_test_record(test);
 	bs_meas(test, m, n);
 	bs_apply(test);
-	ret = measurements_show(NULL, &measurements_attr, buf);
+	ret = bs_show(aurora_bs_test.measurements, buf);
 	KUNIT_EXPECT_EQ(test, ret, (ssize_t)PAGE_SIZE - 1);
 	KUNIT_EXPECT_EQ(test, strlen(buf), (size_t)ret);
 	bs_expect_guard(test, buf, PAGE_SIZE, 2 * PAGE_SIZE);
@@ -829,12 +867,13 @@ static void bs_measure_record_full_page(struct kunit *test)
 	bs_meas(test, m, n);
 	bs_apply(test);
 	bs_decide();
-	measure_record();
+	aurora_bs_test.measure_record();
 }
 
 static struct kunit_case bs_cases[] = {
 	KUNIT_CASE(bs_stage1_no_measurements),
 	KUNIT_CASE_PARAM(bs_stage1_one_measurement, bs_one_gen_params),
+	KUNIT_CASE(bs_stage1_dev_enforce),
 	KUNIT_CASE(bs_stage1_among_others),
 	KUNIT_CASE(bs_stage1_none_among_many),
 	KUNIT_CASE(bs_stage1_unterminated),
@@ -870,6 +909,9 @@ static struct kunit_suite bs_suite = {
 	.test_cases = bs_cases,
 };
 
+kunit_test_suite(bs_suite);
+
+#if IS_BUILTIN(CONFIG_APPLE_AURORA_BOOT_SECURITY_KUNIT_TEST)
 /* --- The init path, on the real /chosen/aurora,boot-security ----------- */
 
 static int bs_init_init(struct kunit *test)
@@ -1087,5 +1129,8 @@ static struct kunit_suite bs_init_suite = {
 	.test_cases = bs_init_cases,
 };
 
-kunit_test_suites(&bs_suite);
 kunit_test_init_section_suites(&bs_init_suite);
+#else
+MODULE_IMPORT_NS("EXPORTED_FOR_KUNIT_TESTING");
+MODULE_LICENSE("Dual MIT/GPL");
+#endif
