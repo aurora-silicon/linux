@@ -1176,6 +1176,9 @@ const GROW_WORK: u64 = 3;
 const RECLAIM_WORK: u64 = 4;
 const FEED_WORK: u64 = 5;
 const GOVERNOR_WORK: u64 = 6;
+/// Deferred housekeeping deadline when a completion drained the last in-flight work within
+/// `HOUSEKEEPING_NS`.
+const HOUSEKEEPING_WORK: u64 = 7;
 
 /// Device state shared with the coprocessor callbacks and the event worker.
 #[pin_data]
@@ -1249,6 +1252,8 @@ struct Shared {
     poll: DelayedWork<Shared, POLL_WORK>,
     #[pin]
     idle: DelayedWork<Shared, IDLE_WORK>,
+    #[pin]
+    housekeeping_timer: DelayedWork<Shared, HOUSEKEEPING_WORK>,
     /// M5: the thermal governor runs (the firmware has the host power budget word).
     governs: bool,
     #[pin]
@@ -1306,6 +1311,9 @@ impl_has_delayed_work! {
 }
 impl_has_delayed_work! {
     impl HasDelayedWork<Shared, IDLE_WORK> for Shared { self.idle }
+}
+impl_has_delayed_work! {
+    impl HasDelayedWork<Shared, HOUSEKEEPING_WORK> for Shared { self.housekeeping_timer }
 }
 impl_has_delayed_work! {
     impl HasDelayedWork<Shared, GOVERNOR_WORK> for Shared { self.governor }
@@ -1391,6 +1399,15 @@ impl WorkItem<POLL_WORK> for Shared {
 impl WorkItem<IDLE_WORK> for Shared {
     type Pointer = Arc<Shared>;
     fn run(this: Arc<Shared>) {
+        this.queue_events();
+    }
+}
+impl WorkItem<HOUSEKEEPING_WORK> for Shared {
+    type Pointer = Arc<Shared>;
+    fn run(this: Arc<Shared>) {
+        if this.sleeping() {
+            return;
+        }
         this.queue_events();
     }
 }
@@ -1548,6 +1565,16 @@ impl Shared {
         let delay_ms = delay_ns.div_ceil(1_000_000).min(u64::from(u32::MAX)) as u32;
         let _ = workqueue::system_highpri()
             .enqueue_delayed::<Arc<Self>, IDLE_WORK>(self.clone(), msecs_to_jiffies(delay_ms));
+    }
+
+    fn queue_housekeeping(self: &Arc<Self>, delay_ns: u64) {
+        let delay_ms = delay_ns
+            .div_ceil(1_000_000)
+            .clamp(1, u64::from(u32::MAX)) as u32;
+        let _ = workqueue::system_highpri().enqueue_delayed::<Arc<Self>, HOUSEKEEPING_WORK>(
+            self.clone(),
+            msecs_to_jiffies(delay_ms),
+        );
     }
 
     fn disable_timer<const ID: u64>(self: &Arc<Self>, timer: &DelayedWork<Self, ID>) {
@@ -1797,6 +1824,7 @@ impl Gpu {
                 housekeeping_ns: AtomicU64::new(0),
                 poll <- new_delayed_work!("g17::Shared::poll"),
                 idle <- new_delayed_work!("g17::Shared::idle"),
+                housekeeping_timer <- new_delayed_work!("g17::Shared::housekeeping_timer"),
                 governs: m5,
                 governor <- new_delayed_work!("g17::Shared::governor"),
                 governor_armed: AtomicBool::new(false),
@@ -2472,6 +2500,7 @@ impl Gpu {
         self.shared.stop_queues();
         self.shared.disable_timer(&self.shared.poll);
         self.shared.disable_timer(&self.shared.idle);
+        self.shared.disable_timer(&self.shared.housekeeping_timer);
         self.shared.disable_timer(&self.shared.governor);
         if let Some(firmware) = (*self.shared.state.lock()).as_deref_mut() {
             firmware.governor_restore();
