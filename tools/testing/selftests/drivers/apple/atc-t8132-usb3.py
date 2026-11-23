@@ -64,7 +64,7 @@ def main():
         print("# SKIP: requires the matching kernel source tree")
         return 4
     source = source.read_text()
-    print("TAP version 13\n1..13", flush=True)
+    print("TAP version 13\n1..15", flush=True)
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     preamble = r'''
 #include <assert.h>
@@ -106,6 +106,8 @@ struct apple_atcphy {
     bool t8132_ss, t8132_common_owned, t8132_suspended, t8132_failed, host_active;
     bool ss_tunables, mode_dirty, pipe_pending, swap_lanes;
     bool cio_tunables, t8132_dp_alt, fixed_usb2, hibernated, pd_was_off, idle_rpm;
+    bool fixed_ss;
+    int typec_mode;
     bool t8103_dummy_pending, t8103_usb3_workaround;
     unsigned tunnel_users;
     struct { bool prepared, changed, restored; } cio_sleep;
@@ -126,6 +128,9 @@ static u32 core[0x24000/4], usb2[0x4000/4], pipe_regs[0x4000/4];
 static unsigned tunes[16], tune_count, reset_releases, bist_phase, writes, core_reads;
 static unsigned stall_power, stall_bist, expected_tunes, stall_sleep;
 static bool stop_response, stall_shim, stall_rcal, trace;
+/* The J773g front ports' STATUS2 transitions and PIPE handler writes (fixed SuperSpeed lanes). */
+static bool slow_status2, trace_pipe;
+static unsigned status2_hold;
 struct event { char type; u32 off, value, interval, bound; };
 static struct event events[512];
 static unsigned nevents, release_event;
@@ -148,6 +153,9 @@ static u32 readl(const void *p)
 {
     if ((uintptr_t)p >= (uintptr_t)core && (uintptr_t)p < (uintptr_t)core + sizeof(core))
         core_reads++;
+    /* STATUS2 bit 7 reads set twice before it clears, as macOS saw it on the J773g front ports. */
+    if (slow_status2 && p == core + ACIOPHY_BIST_MAC_USBPHY_STATUS2/4 && status2_hold && !--status2_hold)
+        core[ACIOPHY_BIST_MAC_USBPHY_STATUS2/4] &= ~BIT(7);
     return *(const u32 *)p;
 }
 static void writel(u32 value, void *p)
@@ -156,6 +164,8 @@ static void writel(u32 value, void *p)
     writes++;
     if ((uintptr_t)p>=(uintptr_t)core && (uintptr_t)p<(uintptr_t)core+sizeof(core))
         event('w',(uintptr_t)p-(uintptr_t)core,value,0,0);
+    if (trace_pipe && (uintptr_t)p>=(uintptr_t)pipe_regs && (uintptr_t)p<(uintptr_t)pipe_regs+sizeof(pipe_regs))
+        event('q',(uintptr_t)p-(uintptr_t)pipe_regs,value,0,0);
     if (p == core + AUS_COMMON_SHIM_BLK_BIAS_REG/4 && (value&BIT(1)) && !stall_rcal)
         core[AUS_COMMON_DIG_RCAL1/4]=BIT(0);
     if (p == core + ATCPHY_POWER_CTRL/4) {
@@ -176,6 +186,10 @@ static void writel(u32 value, void *p)
             core[ACIOPHY_BIST_MAC_USBPHY_STATUS2/4] = stall_bist == 1 ? BIT(7) : 0;
         if (!stop_response && bist_phase == 2)
             core[ACIOPHY_BIST_MAC_USBPHY_STATUS2/4] = stall_bist == 2 ? 0 : BIT(6);
+        if (slow_status2 && !stop_response && bist_phase <= 2) {
+            core[ACIOPHY_BIST_MAC_USBPHY_STATUS2/4] = bist_phase == 1 ? 0x84 : 0xc4;
+            status2_hold = stall_bist == bist_phase ? 0 : 2;
+        }
     }
     *(u32 *)p = value;
 }
@@ -940,6 +954,136 @@ int main(void)
         downgraded=loader.replace('if (ret != -ENOENT)', 'if (false)',1)
         assert downgraded!=loader
         run(Path(directory),"loader-negative-invalid-downgrade",downgraded,expect_failure=True)
+        fixed_stubs = r'''
+static unsigned pipe_checks, configures;
+static int check_ret;
+static int atcphy_pipehandler_check(struct apple_atcphy *a) { (void)a; pipe_checks++; return check_ret; }
+/* Recorded as one step; the mux sequence itself is covered by tools/asahi/atc-usb3-tests.py. */
+static void atcphy_pipehandler_set_mux(struct apple_atcphy *a, u32 data, u32 clk)
+{
+    (void)a; event('m',data,clk,0,0);
+    pipe_regs[PIPEHANDLER_MUX_CTRL/4]=(data&7)|((clk&7)<<3);
+}
+static int atcphy_configure_t8132(struct apple_atcphy *, enum atcphy_mode);
+static int atcphy_configure(struct apple_atcphy *a, enum atcphy_mode m)
+{ configures++; return atcphy_configure_t8132(a,m); }
+'''
+        fixed_tests = mode4_tests[:mode4_tests.index("int main(void)")] + r'''
+#define Q(o,v) {'q',o,v,0,0}
+#define M(d,c) {'m',d,c,0,0}
+static void fixed_init(struct apple_atcphy *a)
+{
+    mode4_init(a,false); a->fixed_ss=a->fixed_usb2=true; a->typec_mode=APPLE_ATCPHY_MODE_USB3_DP;
+    slow_status2=trace_pipe=true; status2_hold=pipe_checks=configures=0; check_ret=0;
+    /* What macOS 27.2 read on the J773g front ports before its PIPE handover. */
+    core[ACIOPHY_BIST_CFG1/4]=0x180;
+    pipe_regs[PIPEHANDLER_OVERRIDE_VALUES/4]=0x16;
+    pipe_regs[PIPEHANDLER_NONSELECTED_OVERRIDE/4]=0x1332;
+    pipe_regs[PIPEHANDLER_MUX_CTRL/4]=0x22;
+}
+static unsigned find(unsigned from,char type,u32 off)
+{
+    for(unsigned i=from;i<nevents;i++) if(events[i].type==type && events[i].off==off) return i;
+    assert(!"event not found"); return 0;
+}
+int main(void)
+{
+    struct apple_atcphy a;
+    /* The handover of the J773g trace, write for write: no PIPE lock, receiver-valid alone. */
+    fixed_init(&a); a.mode=APPLE_ATCPHY_MODE_USB3_DP; a.t8132_common_owned=true; trace=true;
+    assert(!atcphy_route_fixed_ss(&a));
+    const struct event route[]={Q(PIPEHANDLER_OVERRIDE_VALUES,0x10),Q(PIPEHANDLER_OVERRIDE,1),
+        W(0x17000,0x181),W(0x17088,0x4100000),W(0x1708c,0x220),
+        W(0x17000,0x185),P(0x17000,10,10000),W(0x17000,0x181),P(0x17080,10,130000),
+        W(0x17004,4),U(10),W(0x17004,0),
+        W(0x17088,0x6100000),W(0x1708c,0x220),U(10),
+        W(0x17000,0x185),P(0x17000,10,10000),W(0x17000,0x181),P(0x17080,10,130000),
+        W(0x17004,4),U(10),W(0x17004,0),
+        Q(PIPEHANDLER_NONSELECTED_OVERRIDE,0x333),W(0x1708c,0),
+        W(0x17000,0x185),P(0x17000,10,10000),W(0x17000,0x181),W(0x17000,0x180),
+        M(PIPEHANDLER_MUX_CTRL_DATA_USB3,PIPEHANDLER_MUX_CTRL_CLK_USB3),
+        Q(PIPEHANDLER_OVERRIDE,0),Q(PIPEHANDLER_OVERRIDE,0)};
+    unsigned count=sizeof(route)/sizeof(route[0]);
+    expect_trace(0,route,count); assert(nevents==count);
+    /* Phase 2 ends on STATUS2 0x44, not on its first 0xc4. */
+    assert(core[ACIOPHY_BIST_MAC_USBPHY_STATUS2/4]==0x44);
+    assert(pipe_checks==1 && !pipe_regs[PIPEHANDLER_LOCK_REQ/4]);
+    assert(!(pipe_regs[PIPEHANDLER_NONSELECTED_OVERRIDE/4]&PIPEHANDLER_DUMMY_PHY_EN));
+    assert(a.pipe_state==ATCPHY_PIPEHANDLER_STATE_USB3 && !a.pipe_pending && !a.t8132_failed);
+    /* A transition that never completes fails the epoch and leaves the handover pending. */
+    for(unsigned phase=1;phase<=2;phase++) {
+        fixed_init(&a); a.mode=APPLE_ATCPHY_MODE_USB3_DP; a.t8132_common_owned=true; stall_bist=phase;
+        assert(atcphy_route_fixed_ss(&a)==-ETIMEDOUT && bist_phase==phase);
+        assert(a.t8132_failed && a.pipe_pending && a.pipe_state==ATCPHY_PIPEHANDLER_STATE_DUMMY);
+        assert(!pipe_regs[PIPEHANDLER_OVERRIDE/4] && pipe_regs[PIPEHANDLER_MUX_CTRL/4]==0x22);
+        assert(pipe_regs[PIPEHANDLER_NONSELECTED_OVERRIDE/4]==0x1332);
+        unsigned before=writes; atcphy_fixed_ss_start(&a);
+        assert(writes==before && !configures);
+    }
+    /* From off: the mode4 epoch with its common start, then the handover, once. */
+    fixed_init(&a); trace=true;
+    atcphy_fixed_ss_start(&a);
+    assert(configures==1 && a.mode==APPLE_ATCPHY_MODE_USB3_DP && a.t8132_common_owned && !a.mode_dirty);
+    unsigned expected[]={0,1,2,3,4,6,8,5};
+    assert(tune_count==8 && !memcmp(expected,tunes,sizeof(expected)) && reset_releases==1);
+    assert((core[0x60/4]&0xfff)==0x489 && (core[0x64/4]&0x1ffff)==0x110 && !(core[ATCPHY_MISC/4]&BIT(2)));
+    unsigned rcal=find(release_event,'p',AUS_COMMON_DIG_RCAL1);
+    assert(find(0,'q',PIPEHANDLER_OVERRIDE_VALUES)>rcal && a.pipe_state==ATCPHY_PIPEHANDLER_STATE_USB3);
+    /* Started and routed: nothing to do; in mode but parked: the handover alone. */
+    unsigned before=writes; atcphy_fixed_ss_start(&a); assert(writes==before && configures==1);
+    a.pipe_state=ATCPHY_PIPEHANDLER_STATE_DUMMY; bist_phase=0;
+    atcphy_fixed_ss_start(&a);
+    assert(configures==1 && bist_phase==3 && a.pipe_state==ATCPHY_PIPEHANDLER_STATE_USB3);
+    puts("ok 14 - fixed SuperSpeed lanes: the J773g handover before the reset release, latched failures");
+    /* Sleep lifecycle: s2idle keeps the running host; deep sleep stops then cold-restarts steps 2-7. */
+    struct device dev = { &a };
+    fixed_init(&a);
+    atcphy_fixed_ss_start(&a);
+    a.host_active = true;
+    pm_suspend_target_state = PM_SUSPEND_TO_IDLE;
+    assert(!atcphy_suspend(&dev) && a.t8132_suspended && a.t8132_common_owned);
+    assert(!atcphy_resume(&dev) && !a.t8132_suspended && a.pipe_state == ATCPHY_PIPEHANDLER_STATE_USB3);
+    /* Deep sleep refuses an active common epoch until the host parks PIPE and powers OFF. */
+    pm_suspend_target_state = PM_SUSPEND_MEM;
+    assert(atcphy_suspend(&dev) == -EBUSY && !a.t8132_suspended);
+    a.host_active = false;
+    a.pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
+    stop_response = true;
+    assert(!atcphy_configure_t8132(&a, APPLE_ATCPHY_MODE_OFF));
+    assert(!a.t8132_common_owned && a.mode == APPLE_ATCPHY_MODE_OFF);
+    assert(!atcphy_suspend(&dev) && a.t8132_suspended);
+    assert(!atcphy_resume(&dev) && !a.t8132_suspended);
+    /* After deep sleep power-off, registers read 0 (clamp cleared); fixed_ss_start restores everything. */
+    stop_response = false;
+    core[ATCPHY_POWER_CTRL/4] = 0;
+    core[ATCPHY_POWER_STAT/4] = 0;
+    core[ATCPHY_MISC/4] = 0;
+    tune_count = reset_releases = bist_phase = 0;
+    atcphy_fixed_ss_start(&a);
+    assert(configures == 2 && a.mode == APPLE_ATCPHY_MODE_USB3_DP && a.t8132_common_owned);
+    assert(!a.mode_dirty && !a.t8132_failed && tune_count == 8 && reset_releases == 1);
+    assert(bist_phase == 3 && a.pipe_state == ATCPHY_PIPEHANDLER_STATE_USB3);
+    puts("ok 15 - fixed SuperSpeed lanes: s2idle retention and deep-sleep stop/cold-restart lifecycle");
+    return 0;
+}
+'''
+        fixed_names = names + ["atcphy_route_fixed_ss", "atcphy_fixed_ss_start"]
+        fixed_program = preamble + defines(source)
+        for name in ["atcphy_generation", "atcphy_mode", "atcphy_pipehandler_state", "atcphy_t8132_bank"]:
+            fixed_program += enum(source, name)
+        fixed_program += declarations + fixed_stubs
+        fixed_program += "\n".join(function(source, name) for name in fixed_names) + fixed_tests
+        run(Path(directory), "atc-fixed-ss", fixed_program)
+        # The first T8132 condition, bit 6 alone.
+        old_phase2 = fixed_program.replace("(reg & status2_done) == BIT(6)",
+                                           "(reg & (status2_done & BIT(6))) == BIT(6)", 1)
+        assert old_phase2 != fixed_program
+        run(Path(directory), "fixed-ss-negative-phase2-bit6", old_phase2, expect_failure=True)
+        locked = fixed_program.replace("\tatcphy->pipe_pending = true;\n\n\tclear32(pipe + PIPEHANDLER_OVERRIDE_VALUES,",
+                                       "\tatcphy->pipe_pending = true;\n\tset32(pipe + PIPEHANDLER_LOCK_REQ, PIPEHANDLER_LOCK_EN);\n\n"
+                                       "\tclear32(pipe + PIPEHANDLER_OVERRIDE_VALUES,", 1)
+        assert locked != fixed_program
+        run(Path(directory), "fixed-ss-negative-lock", locked, expect_failure=True)
     return 0
 
 

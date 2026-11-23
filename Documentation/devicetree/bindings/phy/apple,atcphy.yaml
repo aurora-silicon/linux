@@ -208,6 +208,8 @@ allOf:
     then:
       properties:
         apple,dp-alt-mode: false
+        apple,lane-config: false
+        apple,plug-orientation: false
         apple,tunable-usb3-axi2af: false
         apple,tunable-usb3-lioa: false
         apple,tunable-usb3-fabric: false
@@ -330,6 +332,30 @@ properties:
       DisplayPort alternate mode, so 4-lane DP and USB3+DP run the PHY's own
       DP transmitter instead of falling back to USB. Without it, DP on T8132
       is only carried in USB4/Thunderbolt tunnels.
+
+  apple,lane-config:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    items:
+      - const: 2
+      - const: 0
+    description: >
+      T8132 only. The lane configuration of a PHY whose SuperSpeed lanes are
+      wired to a hub on the board rather than to a Type-C connector, with no
+      port controller to select a mode: the value of the PHY's
+      atc-lane-config in Apple's device tree. The PHY then runs the lanes
+      from probe on, and routes the USB3 PIPE to them before the USB
+      controller leaves reset. <2 0> carries USB3 on one lane, with the other
+      lane idle in DisplayPort mode. Only a USB controller with a fixed hub
+      child uses it; anything else keeps the port on USB2.
+
+  apple,plug-orientation:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    enum: [1]
+    description: >
+      T8132 only. The orientation of the lanes of apple,lane-config: the
+      value of the PHY's atc-plug-orientation in Apple's device tree. 1 is
+      the normal (unswapped) orientation in Apple's device tree, USB3 on
+      lane 0.
 
   apple,tunable-usb3-axi2af:
     $ref: "#/$defs/apple,tunable"
@@ -522,6 +548,10 @@ required:
   - reg-names
   - "#phy-cells"
   - "#reset-cells"
+
+dependencies:
+  apple,lane-config: [ "apple,plug-orientation" ]
+  apple,plug-orientation: [ "apple,lane-config" ]
 
 additionalProperties: false
 

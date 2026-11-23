@@ -25,7 +25,7 @@ struct apple_atcphy {
 		bool aux, pll;
 		unsigned int pairs, rate;
 	} dp_t8122;
-	bool fixed_usb2, host_active, mode_dirty, ss_tunables, dp_tunables,
+	bool fixed_usb2, fixed_ss, host_active, mode_dirty, ss_tunables, dp_tunables,
 		aux_power_requested;
 	unsigned int dp_owned_pmas, dp_idle_pmas;
 	unsigned int dp_usb_context_valid, dp_usb_context_dirty;
@@ -250,6 +250,12 @@ static void _atcphy_dwc3_reset_assert(struct apple_atcphy *p);
 static void atcphy_usb2_power_off(struct apple_atcphy *p);
 static void atcphy_restore_after_pd_off(struct apple_atcphy *p);
 static int atcphy_power_off(struct apple_atcphy *p);
+/* Fixed SuperSpeed lanes are T8132's (drivers/apple/atc-t8132-usb3.py): none here. */
+static void __attribute__((unused)) atcphy_fixed_ss_start(struct apple_atcphy *p)
+{
+	(void)p;
+	assert(!"fixed SuperSpeed lanes started");
+}
 static int atcphy_configure(struct apple_atcphy *p, enum atcphy_mode mode);
 
 /* These units exercise older PHY generations. Never accept a T8132 dispatch. */

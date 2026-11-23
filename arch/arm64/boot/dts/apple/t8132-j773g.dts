@@ -174,18 +174,22 @@
 };
 
 /*
- * The two front USB-C ports: an on-board USB2 hub (Apple 05ac:800b, firmware
- * on spi3) on raw USB2 root port 1 of ATC2's controller (ADT usb-drd2), with
- * no port controller. The PHY only enters USB3 mode from a Type-C mode
- * switch, so the hub runs at high speed. The hub child tells dwc3-apple the
- * controller is a host from probe on; the graph link from the PHY's USB3 port
- * to the controller's SuperSpeed port is how the PHY finds that fixed hub
- * and keeps its USB2 path up without a cable event (no SuperSpeed data path
- * is described). The hub's reset and SPI-flash output-enable lines (ADT
- * usb3hub_rst, usb3hub_flash_oe) are AP GPIOs; the boot loader leaves both
- * high, as does macOS, and the hub runs with them high.
+ * The two front USB-C ports: an on-board hub (firmware on spi3) on ATC2's
+ * controller (ADT usb-drd2), with no port controller. Its USB2 half (Apple
+ * 05ac:800b) is on raw xHCI port 1, its SuperSpeed half (05ac:800c) on raw
+ * port 2, which ATC2's PHY carries on its lanes. The hub children tell
+ * dwc3-apple the controller is a host from probe on; the graph link from the
+ * PHY's USB3 port to the controller's SuperSpeed port is how the PHY finds
+ * that fixed hub and keeps its USB2 path up without a cable event. The lane
+ * configuration and plug orientation are the ADT atc-phy2's atc-lane-config
+ * and atc-plug-orientation: with them the PHY runs USB3 on lane 0, unswapped,
+ * from probe on, as macOS does. The hub's reset and SPI-flash output-enable
+ * lines (ADT usb3hub_rst, usb3hub_flash_oe) are AP GPIOs; the boot loader
+ * leaves both high, as does macOS, and the hub runs with them high.
  */
 &atcphy2 {
+	apple,lane-config = <2 0>;
+	apple,plug-orientation = <1>;
 	status = "okay";
 
 	ports {
@@ -211,6 +215,10 @@
 
 &dwc3_2 {
 	dr_mode = "host";
+	/* The hub's SuperSpeed half links at 10 Gb/s on macOS. */
+	maximum-speed = "super-speed-plus";
+	phys = <&atcphy2 PHY_TYPE_USB2>, <&atcphy2 PHY_TYPE_USB3>;
+	phy-names = "usb2-phy", "usb3-phy";
 	#address-cells = <1>;
 	#size-cells = <0>;
 	status = "okay";
@@ -218,6 +226,11 @@
 	hub@1 {
 		compatible = "usb5ac,800b";
 		reg = <1>;
+	};
+
+	hub@2 {
+		compatible = "usb5ac,800c";
+		reg = <2>;
 	};
 
 	ports {
