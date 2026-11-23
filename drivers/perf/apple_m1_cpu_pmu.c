@@ -15,6 +15,7 @@
 #include <linux/perf/arm_pmuv3.h>
 #include <linux/platform_device.h>
 
+#include <asm/apple-idle.h>
 #include <asm/apple_m1_pmu.h>
 #include <asm/irq_regs.h>
 #include <asm/perf_event.h>
@@ -770,14 +771,26 @@ static void __m1_pmu_set_mode(u8 mode)
 	isb();
 }
 
+#ifdef CONFIG_ARCH_APPLE
+static void apple_pmu_wfi_freeze_set(bool active)
+{
+	this_cpu_write(apple_pmu_wfi_freeze, active);
+}
+#else
+static void apple_pmu_wfi_freeze_set(bool active) { }
+#endif
+
 static void m1_pmu_start(struct arm_pmu *cpu_pmu)
 {
+	/* arm_pmu only starts the PMU with at least one event on it. */
+	apple_pmu_wfi_freeze_set(true);
 	__m1_pmu_set_mode(PMCR0_IMODE_FIQ);
 }
 
 static void m1_pmu_stop(struct arm_pmu *cpu_pmu)
 {
 	__m1_pmu_set_mode(PMCR0_IMODE_OFF);
+	apple_pmu_wfi_freeze_set(false);
 }
 
 static int m1_pmu_map_event(struct perf_event *event)
@@ -856,6 +869,7 @@ static void m1_pmu_reset(void *info)
 	int i;
 
 	__m1_pmu_set_mode(PMCR0_IMODE_OFF);
+	apple_pmu_wfi_freeze_set(false);
 
 	for (i = 0; i < M1_PMU_NR_COUNTERS; i++) {
 		m1_pmu_disable_counter(i);
@@ -1040,3 +1054,7 @@ static struct platform_driver m1_pmu_driver = {
 };
 
 module_platform_driver(m1_pmu_driver);
+
+#if IS_ENABLED(CONFIG_APPLE_M1_CPU_PMU_KUNIT_TEST)
+#include "apple_m1_cpu_pmu-test.c"
+#endif

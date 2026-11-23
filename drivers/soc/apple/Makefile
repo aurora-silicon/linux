@@ -47,6 +47,7 @@ DTC_FLAGS_t6041-gate-test := -Wno-unit_address_vs_reg -Wno-avoid_unnecessary_add
 
 obj-$(CONFIG_APPLE_TUNABLE) += apple-tunable.o
 apple-tunable-y = tunable.o
+obj-$(CONFIG_APPLE_TUNABLE_KUNIT_TEST) += tunable-test.o
 
 obj-$(CONFIG_APPLE_AOP) += aop.o
 

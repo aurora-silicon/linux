@@ -59,7 +59,7 @@ pre += r'''
 enum vb2_buffer_state { STATE_DUMMY };
 #define dev_err(d,...) ((void)(d))
 #define kzalloc(n,f) calloc(1,n)
-#define kfree free
+#define kfree(p) free((void *)(p))
 static bool vp_feature = true;
 static bool avd_qfw_has_vp_done(const struct avd_dev *d) { return d->queued && vp_feature; }
 static bool avd_backend_is_open(const struct avd_dev *d) { return !d->queued; }
@@ -72,6 +72,32 @@ struct v4l2_ctrl { union { void *p; } p_cur; };
 static struct v4l2_ctrl_vp9_frame params;
 static struct v4l2_ctrl_vp9_compressed_hdr updates;
 static struct v4l2_ctrl frame_ctrl,update_ctrl;
+static struct v4l2_ctrl *locked_ctrl;
+
+static void v4l2_ctrl_lock(struct v4l2_ctrl *ctrl)
+{
+ assert(!locked_ctrl);
+ locked_ctrl = ctrl;
+}
+
+static void v4l2_ctrl_unlock(struct v4l2_ctrl *ctrl)
+{
+ assert(locked_ctrl == ctrl);
+ locked_ctrl = NULL;
+}
+
+static void *kmemdup(const void *source, size_t size, int flags)
+{
+ void *copy;
+
+ (void)flags;
+ assert(locked_ctrl);
+ copy = malloc(size);
+ if (copy)
+  memcpy(copy, source, size);
+ return copy;
+}
+
 static struct v4l2_ctrl *v4l2_ctrl_find(void *h,u32 id) {
  (void)h;frame_ctrl.p_cur.p=&params;update_ctrl.p_cur.p=&updates;
  return id==V4L2_CID_STATELESS_VP9_FRAME?&frame_ctrl:&update_ctrl;
@@ -84,7 +110,7 @@ static void avd_run_preamble(struct avd_ctx *ctx,struct avd_run *run) {
 static void avd_run_postamble(struct avd_ctx *ctx,struct avd_run *run) { (void)ctx;(void)run; }
 static int avd_init_job(struct avd_ctx *ctx,int codec,size_t segments) {
  free(ctx->job.segments);ctx->job.codec=codec;ctx->job.num=0;
- ctx->job.segments=calloc(segments,sizeof(*ctx->job.segments));return ctx->job.segments?0:-ENOMEM;
+ ctx->job.segments=calloc(segments,sizeof(*ctx->job.segments));ctx->job.overflow=false;ctx->job.max=ctx->job.segments?segments:0;return ctx->job.segments?0:-ENOMEM;
 }
 static int avd_submit_job(struct avd_ctx *ctx);
 '''
@@ -184,8 +210,7 @@ int main(int argc,char **argv) {
  assert(!memcmp(&adapted,&p->bank[1].probability_tables,sizeof(adapted)));
  write_program(argv[1],"vp9-adaptive-1",&frame);
  assert(!avd_vp9_ready(&ctx));
- struct avd_vp9_run attempt;
- current_dst=&dst[2].base.vb;assert(avd_vp9_run_preamble(&ctx,&attempt)==-EBUSY);assert(!dst[2].bank);
+ current_dst=&dst[2].base.vb;assert(avd_vp9_run(&ctx)==-EBUSY);assert(!dst[2].bank);
  /* PP(0) retires while b points to bank 1: only bank 0 may be released. */
  avd_vp9_done(&ctx,&src,&dst[0].base.vb,VB2_BUF_STATE_DONE);
  assert(!p->bank[0].busy&&p->bank[1].busy&&!dst[0].bank);

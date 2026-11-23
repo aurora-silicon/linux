@@ -543,6 +543,15 @@ enum drm_asahi_feature {
  */
 #define DRM_ASAHI_FEATURE_ASYNC_SUBMIT ((1ULL) << 39)
 
+/*
+ * DRM_ASAHI_FEATURE_VDM_USC_INVALIDATE: the render-start VDM barrier at the
+ * root of a render's VDM stream may set the USC cache invalidate (bit 3).
+ * Reported on every GPU: the kernel's stream checks admit the barrier word
+ * with or without it. A feature bit like those of enum drm_asahi_feature,
+ * defined here like bit 32.
+ */
+#define DRM_ASAHI_FEATURE_VDM_USC_INVALIDATE ((1ULL) << 40)
+
 #define DRM_ASAHI_PARAM_GROUP_VM_STATUS 1
 #define DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS 2
 

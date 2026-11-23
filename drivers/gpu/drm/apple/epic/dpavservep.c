@@ -44,25 +44,23 @@ static bool dcpavserv_identity(struct apple_epic_service *service, const char *n
 			class && !strcmp(class, "DCPDPService") && service->channel;
 	if (!service->ep->wire_v2)
 		return unit == 0;
-	/*
-	 * A DP-to-HDMI converter's AV service: the generic ones, and the
-	 * MCDP29xx converters that firmware 27 names after their part (the
-	 * M2 Mac mini's HDMI port, and USB-C to HDMI adapters).
-	 */
-	if (!class || (strcmp(class, "AppleDCPDP2HDMI") &&
-		       strcmp(class, "DCPDP13Service") &&
-		       strcmp(class, "AppleDCPMCDP29XX") &&
-		       strcmp(class, "AppleDCPMCDP2900")) ||
-	    !service->channel || service->channel > U16_MAX)
+	if (!class || !service->channel || service->channel > U16_MAX)
 		return false;
 	/* H17P's lower-case interface-id is dynamic, not a physical-port unit. */
 	if (service->ep->endpoint == DPAVSERV_ENDPOINT_V2)
-		return unit == service->channel;
+		return (!strcmp(class, "AppleDCPDP2HDMI") ||
+			!strcmp(class, "DCPDP13Service")) && unit == service->channel;
 	/*
-	 * An AFKV2 AV service on the classic DPAV endpoint carries EPICUnit 0;
-	 * its interface-id (the channel) is dynamic across reconnects.
+	 * Firmware 27 names an MCDP29xx DP-to-HDMI converter's AV service after
+	 * its part (the M2 Mac mini's HDMI port, USB-C to HDMI adapters) and
+	 * announces it on the classic DPAV endpoint with EPICUnit 0; its
+	 * interface-id (the channel) is dynamic across reconnects. The generic
+	 * services stay refused there: using them resets the M4 Air when the
+	 * external processor releases its link.
 	 */
-	return service->ep->endpoint == DPAVSERV_ENDPOINT && unit == 0;
+	return service->ep->endpoint == DPAVSERV_ENDPOINT && unit == 0 &&
+		(!strcmp(class, "AppleDCPMCDP29XX") ||
+		 !strcmp(class, "AppleDCPMCDP2900"));
 }
 
 static bool dcpavserv_admission_current(struct apple_dcp *dcp, u64 generation)

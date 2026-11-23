@@ -11,6 +11,7 @@
 
 #include "t8122.dtsi"
 #include "t8122-j613-j615.dtsi"
+#include "t8122-j613-qspi.dtsi"
 
 / {
 	compatible = "apple,j615", "apple,t8122", "apple,arm-platform";
@@ -170,4 +171,12 @@
 &mesa {
 	/* Per-device factory data from this Mac's own iBoot system container. */
 	firmware-name = "apple/mesacal-j615.bin";
+};
+
+/*
+ * The J615 ADT puts the boot NOR and its nvram on QSPIMC, as on the J613.
+ * No NVRAM write entry exists for this board yet: keep it read-only.
+ */
+&nvram_qspi {
+	read-only;
 };

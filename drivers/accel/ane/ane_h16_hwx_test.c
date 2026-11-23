@@ -275,6 +275,31 @@ static void hwx_program_test(struct kunit *test)
 	}
 }
 
+/* The fp32 trailer word: 10000.0f or 1000.0f, in every form; nothing else. */
+static void hwx_trailer_test(struct kunit *test)
+{
+	static const u32 refused[] = { 0, 0x3f800000, 0x42c80000, 0x461c4001, 0x447a0001 };
+	unsigned int variant, i;
+
+	for (variant = 0; variant < 4; variant++) {
+		struct hwx_fixture *f = fixture_create(test, variant & 1, variant & 2);
+		struct ane_h16_hwx info;
+		u8 *word;
+
+		KUNIT_ASSERT_NOT_NULL(test, f);
+		word = f->bytes + f->program + ((variant & 1) ? 0x8a0 : 0x880);
+		KUNIT_ASSERT_EQ(test, get_unaligned_le32(word), 0x461c4000U);
+		put_unaligned_le32(0x447a0000, word);
+		KUNIT_EXPECT_EQ_MSG(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0,
+				    "form %u, 1000.0f", variant);
+		for (i = 0; i < ARRAY_SIZE(refused); i++) {
+			put_unaligned_le32(refused[i], word);
+			KUNIT_EXPECT_EQ_MSG(test, ane_h16_hwx_validate(f->bytes, f->size, &info),
+					    -ENOEXEC, "form %u, word %#x", variant, refused[i]);
+		}
+	}
+}
+
 /* Build only structural tasks: no model bytes or hardware fixtures needed. */
 static void fixture_tasks(struct hwx_fixture *f, u32 tasks, u32 records)
 {
@@ -812,6 +837,7 @@ static struct kunit_case hwx_cases[] = {
 	KUNIT_CASE(hwx_element_format_test),
 	KUNIT_CASE(hwx_surface_order_test),
 	KUNIT_CASE(hwx_program_test),
+	KUNIT_CASE(hwx_trailer_test),
 	KUNIT_CASE(hwx_staged_counts_test),
 	KUNIT_CASE(hwx_final_task_end_test),
 	KUNIT_CASE(hwx_geometry_test),
@@ -832,4 +858,5 @@ static struct kunit_suite hwx_suite = {
 };
 
 kunit_test_suite(hwx_suite);
+MODULE_DESCRIPTION("KUnit tests for Apple ANE HWX loading");
 MODULE_LICENSE("Dual MIT/GPL");

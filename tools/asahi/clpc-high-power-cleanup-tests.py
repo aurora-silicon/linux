@@ -41,6 +41,9 @@ typedef uint8_t u8;
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x, v) ((x) = (v))
 #define SMC_KEY(x) 0x7a45544d
+/* Model a kernel built with the SMC driver, so the SMC path runs. */
+#define CONFIG_MFD_MACSMC 1
+#define IS_ENABLED(option) (option)
 #define dev_warn(...) (warnings++)
 enum platform_profile_option { PLATFORM_PROFILE_BALANCED, PLATFORM_PROFILE_LOW_POWER,
                                PLATFORM_PROFILE_PERFORMANCE };

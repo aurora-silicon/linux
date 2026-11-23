@@ -3103,22 +3103,6 @@ brcmf_pcie_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	brcmf_dbg(PCIE, "Enter %x:%x\n", pdev->vendor, pdev->device);
 
-	/*
-	 * T8132's BCM4388 IOVA aperture starts above 1 TiB and the message-buffer
-	 * ABI carries full 64-bit host addresses, so do not retain PCI's
-	 * conservative 32-bit default DMA mask on this platform.
-	 */
-	if (pdev->device == BRCM_PCIE_4388_DEVICE_ID &&
-	    of_machine_is_compatible("apple,t8132")) {
-		ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(42));
-		if (ret) {
-			pci_err(pdev, "failed to enable 42-bit DMA: %d\n", ret);
-			return ret;
-		}
-		pci_info(pdev, "using 42-bit DMA addresses\n");
-	}
-
-
 	ret = -ENOMEM;
 	devinfo = kzalloc_obj(*devinfo);
 	if (devinfo == NULL)

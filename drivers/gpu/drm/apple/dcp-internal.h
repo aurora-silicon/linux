@@ -345,6 +345,29 @@ struct apple_dcp_hw_data {
 	 * firmware 27.0 and 27.2.1), so there is no secure port to idle before the IOP.
 	 */
 	bool s2r_no_secure_port;
+	/*
+	 * Every AFK endpoint speaks AFKv2 (see afk_init()), whatever the
+	 * firmware interface: for a firmware that does so on all of them
+	 * without an IOMFB interface version that implies it.
+	 */
+	bool afk_v2;
+	/*
+	 * The RTKit session is taken over without its endpoint map (see
+	 * apple_rtkit_init_adopted()): afk_start() registers each endpoint
+	 * with RTKit before starting it.
+	 */
+	bool afk_adopt_endpoints;
+	/*
+	 * AFK services are matched by the name in their announcement; the
+	 * properties after it are not parsed (afk_recv_handle_init()).
+	 */
+	bool afk_announced_names;
+	/*
+	 * How long AFK waits for the firmware to start or stop an endpoint
+	 * and to answer a command or service call (afk_timeout_ms()); zero
+	 * for one second.
+	 */
+	unsigned int afk_timeout_ms;
 };
 
 enum dcp_test_point {
@@ -439,6 +462,8 @@ struct dcp_desktop_state {
 
 /* TODO: move IOMFB members to its own struct */
 struct dcpext_scanout;
+struct t8152_display;
+struct dcp_iboot;
 struct dcp_hdmi;
 struct dcp_cec;
 
@@ -563,8 +588,18 @@ struct apple_dcp {
 
 	/* firmware version and compatible firmware version */
 	enum dcp_firmware_version fw_compat;
+	/* T8152: the DisplayPort hardware behind the DPTX port (t8152_display.h) */
+	struct t8152_display *t8152;
+	/* DCP_FIRMWARE_IBOOT: the display driven through it (iomfb_iboot.h) */
+	struct dcp_iboot *iboot;
 	/* Bumped by every iomfb poweron; see afk_compact_slot(). */
 	u32 afk_power_gen;
+	/*
+	 * AFK endpoints the bootloader left running, bit N for endpoint
+	 * 0x20 + N, from its hand-off: afk_start() stops each before its
+	 * INIT. Zero for a processor without such a hand-off.
+	 */
+	u32 afk_live_endpoints;
 	/* Firmware 27.x: the method IDs of this build (iomfb_v27_methods()). */
 	const struct dcp_method_entry *v27_methods;
 	bool external;
@@ -1183,6 +1218,19 @@ struct apple_dcp {
 	struct dcp_panel_identity *panel_identity;
 	struct dcp_cec *cec;
 };
+
+/* A DCP driven through the firmware's iBoot interface alone. */
+static inline bool dcp_is_iboot(const struct apple_dcp *dcp)
+{
+	return dcp->fw_compat == DCP_FIRMWARE_IBOOT;
+}
+
+struct apple_rtkit_shmem;
+/* The common RTKit shared memory hooks, for a processor with its own RTKit ops. */
+int dcp_rtk_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr);
+void dcp_rtk_shmem_destroy(void *cookie, struct apple_rtkit_shmem *bfr);
+/* Keep a session that cannot be stopped, its DMA and this driver until reboot. */
+int dcp_retain_live_session(struct apple_dcp *dcp);
 
 /* T8132 firmware uses its own wire codec, with the common DRM/KMS owner. */
 static inline bool iomfb_is_m4(const struct apple_dcp *dcp)
