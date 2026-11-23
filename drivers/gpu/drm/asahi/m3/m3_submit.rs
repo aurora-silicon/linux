@@ -244,6 +244,10 @@ pub(crate) struct Queue {
     render_queue: Option<Arc<crate::g14_v27_2_render::QueueRender>>,
     early_tiling:bool,
     wide_visibility:bool,
+    /// Whether this queue's render command builder encodes depth and stencil compression
+    /// for every sample count and layer count. Otherwise only the single-sample,
+    /// single-layer compressed depth layout is admitted.
+    zls_compression_all_layouts:bool,
     urgency:u8,
 }
 impl Queue {
@@ -257,7 +261,7 @@ impl Queue {
             1=>sched::Priority::High,0=>sched::Priority::Kernel,_=>return Err(EINVAL)};
         Ok(Self {entity:sched::Entity::new(&scheduler,priority)?,_scheduler:scheduler,
             shared:Sink::M3(shared),vm,usc,fences:FenceContexts::new(1,c_str!("asahi_m3_queue"),kernel::static_lock_class!())?,
-            early_tiling,wide_visibility,urgency,preempt_alloc:None,
+            early_tiling,wide_visibility,zls_compression_all_layouts:false,urgency,preempt_alloc:None,
             #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
             render_queue: None})
     }
@@ -272,7 +276,11 @@ impl Queue {
             1=>sched::Priority::High,0=>sched::Priority::Kernel,_=>return Err(EINVAL)};
         Ok(Self {entity:sched::Entity::new(&scheduler,priority)?,_scheduler:scheduler,
             shared:Sink::G14V27_2(runtime),vm,usc,fences:FenceContexts::new(1,c_str!("asahi_g14_queue"),kernel::static_lock_class!())?,
-            early_tiling:false,wide_visibility:false,urgency,preempt_alloc:Some((ualloc_priv,preempt_bytes)),
+            early_tiling:false,wide_visibility:false,
+            // The G14 render command carries the depth and stencil load, store and partial
+            // compression words in every layout (g14_v27_2_render.rs).
+            zls_compression_all_layouts:true,
+            urgency,preempt_alloc:Some((ualloc_priv,preempt_bytes)),
             render_queue: Some(render_queue)})
     }
 }
@@ -283,7 +291,8 @@ impl queue::Queue for Queue {
         let mut parser=agx_uapi::UapiCommandParser::new(raw);let mut commands=KVec::new();let mut timestamps=KVec::new();let mut flushes=KVec::new();let mut visibility=KVec::new();let mut render_attachments=KVec::new();
         while let Some(command)=parser.next_hardware().map_err(|_|EINVAL)? {
             if let agx_uapi::ParsedHardwareCommand::Render{payload,vertex_attachments,fragment_attachments,..}=command {
-                if let Err(e)=validate_render(payload,self.usc,&AddressSpace(&self.vm),self.early_tiling) {
+                if let Err(e)=validate_render(payload,self.usc,&AddressSpace(&self.vm),self.early_tiling,
+                    self.zls_compression_all_layouts) {
                     pr_err!("M3 render rejected {:?}: flags={:#x} size={}x{} layers={} samples={} utile={}x{} sample_size={} depth={:#x} stencil={:#x} zls={:#x} samplers={} heap={:#x}\n",e,payload.flags,payload.width,payload.height,payload.layers,payload.samples,payload.utile_width,payload.utile_height,payload.sample_size,payload.depth.base,payload.stencil.base,payload.zls_control,payload.sampler_count,payload.sampler_heap);
                     return Err(e);
                 }
@@ -370,7 +379,7 @@ fn encode_attachments(vm: &mmu::Vm, list: &agx_uapi::UapiAttachmentList)
 }
 
 fn validate_render(r: agx_uapi::UapiRenderCommand, usc: u64, space: &AddressSpace<'_>,
-    early_tiling: bool) -> Result {
+    early_tiling: bool, zls_compression_all_layouts: bool) -> Result {
     use agx_uapi::{GpuAddressSpace, GpuAccess};
     if r.sample_size % 8 != 0 {return Err(ENOTSUPP);}
     let empty = agx_uapi::UapiHelperProgram { binary:0, config:0, data:0 };
@@ -382,11 +391,12 @@ fn validate_render(r: agx_uapi::UapiRenderCommand, usc: u64, space: &AddressSpac
     if r.flags & !(2|16|(1<<18)|stage_scope) != 0 || !matches!(r.samples, 1 | 2 | 4)
         || r.sampler_count != 0 || r.sampler_heap != 0
         || r.vertex_helper != empty || r.fragment_helper != empty
-        || r.stencil.compression_base != 0 || r.stencil.compression_stride != 0
+        || (!zls_compression_all_layouts
+            && (r.stencil.compression_base != 0 || r.stencil.compression_stride != 0))
         || r.ppp_control & !0x203 != 0 { return Err(ENOTSUPP); }
     // Native 26A428 descriptors witness the ZLS metadata registers and mirrors
     // for single-sample, single-layer depth. Keep other layouts unqualified.
-    if (r.depth.compression_base != 0 || r.stencil.compression_base != 0)
+    if !zls_compression_all_layouts && (r.depth.compression_base != 0 || r.stencil.compression_base != 0)
         && (r.samples != 1 || r.layers != 1) {return Err(ENOTSUPP);}
     // sample_size describes color tilebuffer storage. Depth/stencil-only
     // passes legitimately require zero bytes of color storage.
