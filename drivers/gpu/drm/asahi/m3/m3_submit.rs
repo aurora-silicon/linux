@@ -89,6 +89,14 @@ impl Packet {
     pub(crate) fn may_be_published(&self)->bool {self.published.load(Ordering::Relaxed)}
     pub(crate) fn retired(&self) {self.release_guard();self.finish(Ok(()));}
     pub(crate) fn finish(&self,result:Result) {
+        self.complete(result, true);
+    }
+    /// Fail the fence without making a packet rejection or cancellation a VM error.
+    /// A published prefix still owns its mappings until the runtime retires it.
+    pub(crate) fn fail_packet(&self,error:Error) {
+        self.complete(Err(error), false);
+    }
+    fn complete(&self,result:Result,fail_vm:bool) {
         // Retirement, cancellation and a queued scheduler timeout can race.
         // Claim error/signal ownership once; this flag is NOT proof that the
         // fence is signaled or that hardware DMA has stopped.
@@ -99,7 +107,9 @@ impl Packet {
             // can't unmap memory under it. It stays with the packet until the runtime drops
             // the packet, after the firmware has provably stopped.
             if let Some(guard)=self.vm_job.lock().as_ref() {guard.quarantine();}
-            if let Some(status) = self.vm.status() { status.record(e); }
+            if fail_vm {
+                if let Some(status) = self.vm.status() { status.record(e); }
+            }
             self.completion.set_error(e);
         }
         // A scheduler job/fence and the runtime's last packet can outlive
@@ -132,7 +142,7 @@ impl sched::JobImpl for Job {
         if let Err(e)=crate::m3::m3_runtime::Runtime::submit(&job.shared,job.packet.clone()) {
             pr_err!("M3 scheduler: submission failed {:?}\n",e);
             // submit() failed before this packet could be published.
-            job.packet.release_guard();job.packet.finish(Err(e));
+            job.packet.release_guard();job.packet.fail_packet(e);
         }
         Ok(Some(Fence::from_fence(&job.packet.completion)))
     }
@@ -160,7 +170,7 @@ impl sched::JobImpl for Job {
     }
     fn cancel(job:&mut Self) {
         crate::m3::m3_runtime::Runtime::withdraw(&job.shared,&job.packet);
-        job.packet.finish(Err(ECANCELED));
+        job.packet.fail_packet(ECANCELED);
     }
 }
 struct AddressSpace<'a>(&'a mmu::Vm);

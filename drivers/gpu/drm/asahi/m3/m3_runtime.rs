@@ -223,7 +223,7 @@ impl Inner {
     fn fail_front(&mut self,error:Error) {
         if let Ok((packet,_))=self.pending.remove(0) {
             if !self.packet_active(&packet) && !self.fault_captured {packet.release_guard();}
-            packet.finish(Err(error));
+            packet.fail_packet(error);
         }
     }
     /// Signal every packet of `entries` (packets that continue past the batch included).
