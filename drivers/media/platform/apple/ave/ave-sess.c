@@ -788,9 +788,9 @@ int ave_sess_input(struct ave_ctx *ctx, unsigned int slot, struct vb2_v4l2_buffe
 	*input = vb2_dma_contig_plane_dma_addr(vb, 0) + off;
 	if (!used || used >= p->stride * rows || used % rows || used / rows < width) {
 		if ((size_t)off + frame > vb2_plane_size(vb, 0)) {
-			dev_err(ctx->ave->dev,
-				"OUTPUT plane has no %zu byte frame after offset %u\n",
-				frame, off);
+			dev_err_ratelimited(ctx->ave->dev,
+					    "OUTPUT plane has no %zu byte frame after offset %u\n",
+					    frame, off);
 			return -EINVAL;
 		}
 		if (IS_ALIGNED(*input, 64))
