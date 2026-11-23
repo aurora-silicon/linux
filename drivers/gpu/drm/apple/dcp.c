@@ -6362,12 +6362,17 @@ static bool dcp_external_is_idle(struct apple_dcp *dcp)
  * drive the full panel (aura: chosen.asahi,show-notch=1). Follow it, so the
  * mode covers the same rows as the boot framebuffer did.
  */
-static bool boot_show_notch(void)
+static bool dcp_boot_show_notch(const struct device_node *chosen)
 {
 	const char *val;
 
-	return !of_property_read_string(of_chosen, "asahi,show-notch", &val) &&
+	return !of_property_read_string(chosen, "asahi,show-notch", &val) &&
 	       !strcmp(val, "1");
+}
+
+static bool boot_show_notch(void)
+{
+	return dcp_boot_show_notch(of_chosen);
 }
 
 /*
@@ -10276,4 +10281,5 @@ void dcp_unregister(void)
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST)
 #include "dcp_external_audio_test.c"
+#include "dcp_handoff_test.c"
 #endif
