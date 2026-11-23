@@ -29,6 +29,8 @@ pub(crate) const fn ring_passed(c: u32, b: u32, h: u32, t: u32, m: u32) -> bool 
 // `fw::initdata::FirmwareData`.
 pub(crate) const RECOVERY_BUDGET_NS: u64 = 1_000_000_000;
 pub(crate) const EVENT_WAIT_NS: u64 = 50_000_000;
+/// Bounded wait before dismissing a trailing phase-0 recovery notification on an idle GPU.
+pub(crate) const PHANTOM_PHASE0_WAIT_NS: u64 = 50_000_000;
 pub(crate) const WINDOW_NS: u64 = 10_000_000_000;
 pub(crate) const WINDOW_LIMIT: u32 = 32;
 #[allow(dead_code)]
@@ -75,6 +77,17 @@ pub(crate) enum RecoveryAction {
     MarkAndAcknowledge,
     Resume,
     ProtocolError,
+}
+
+/// A type-4 or 0x16 notification drained after a completed recovery leaves phase at 0 with
+/// no flights in flight. Consume it after a short bounded wait instead of spinning to fail-stop.
+pub(crate) const fn phantom_phase0(
+    phase: u32,
+    answered: bool,
+    flights_empty: bool,
+    elapsed_ns: u64,
+) -> bool {
+    phase == 0 && !answered && flights_empty && elapsed_ns >= PHANTOM_PHASE0_WAIT_NS
 }
 
 /// Only the host writes phases 2 and 0; the firmware publishes phases 1 and 3.
@@ -246,6 +259,7 @@ mod tests {
         assert!(!expired(deadline, deadline));
         assert!(expired(deadline + 1, deadline));
         assert!(EVENT_WAIT_NS < RECOVERY_BUDGET_NS);
+        assert!(PHANTOM_PHASE0_WAIT_NS < RECOVERY_BUDGET_NS);
         assert!(ABORT_GRACE_NS < RECOVERY_BUDGET_NS);
         assert!(expired(1, EXPIRED));
         assert_eq!(renew(7, 5000, 1000), (5_000_000_007, 1_000_000_007));
@@ -283,6 +297,16 @@ mod tests {
             assert!(!stamp_reached(start, end, end));
             assert!(stamp_reached(end, end, end));
         }
+    }
+
+    #[test]
+    fn phantom_phase0_clears_only_idle_unanswered_phase0_after_wait() {
+        assert!(!phantom_phase0(0, false, true, PHANTOM_PHASE0_WAIT_NS - 1));
+        assert!(phantom_phase0(0, false, true, PHANTOM_PHASE0_WAIT_NS));
+        assert!(!phantom_phase0(0, false, false, PHANTOM_PHASE0_WAIT_NS));
+        assert!(!phantom_phase0(0, true, true, PHANTOM_PHASE0_WAIT_NS));
+        assert!(!phantom_phase0(1, false, true, PHANTOM_PHASE0_WAIT_NS));
+        assert!(!phantom_phase0(2, true, true, PHANTOM_PHASE0_WAIT_NS));
     }
 
     #[test]

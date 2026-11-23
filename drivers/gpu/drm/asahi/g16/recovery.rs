@@ -374,29 +374,8 @@ impl Firmware {
 
     fn recover(&mut self) -> Result {
         let start = self.events.recovery_started_ns.unwrap_or_else(now_ns);
-        if !logic::admit(
-            start,
-            &mut self.recovery.window_ns,
-            &mut self.recovery.window_count,
-        ) {
-            dev_err!(self.dev(), "M4 GPU recovery storm: fail-stop\n");
-            return Err(EIO);
-        }
         self.recovery.running = true;
         self.engine.frozen = true;
-        // A recovery may reset what the firmware keeps for a bound PB epoch, also one whose
-        // render was not affected: start the next render on each pass slot fresh.
-        self.pools.invalidate();
-        self.events.grow.clear();
-        // These frontiers must be captured before the host answers 2: the
-        // firmware can force the stage target while aborting a work item.
-        let stage = self.recovery_snapshot()?;
-        // Powered down, the GPU holds no fault to read.
-        let fault = self.session.fault_scan()?.unwrap_or_default();
-        let asid = Some(fault.status)
-            .filter(|status| status & 1 != 0)
-            .map(|status| ((status >> 17) & 0x3f) as u32)
-            .filter(|asid| *asid >= 1);
         let deadline = start.saturating_add(logic::RECOVERY_BUDGET_NS);
         let mut answered = false;
         let mut generation = 0;
@@ -425,6 +404,14 @@ impl Firmware {
                         poll_sleep();
                         continue;
                     }
+                    if !logic::admit(
+                        now,
+                        &mut self.recovery.window_ns,
+                        &mut self.recovery.window_count,
+                    ) {
+                        dev_err!(self.dev(), "M4 GPU recovery storm: fail-stop\n");
+                        return Err(EIO);
+                    }
                     generation = current_generation;
                     let event = if have_event {
                         let event = self.events.last_error.ok_or(super::boot::eproto())?;
@@ -436,6 +423,19 @@ impl Firmware {
                     } else {
                         u32::MAX
                     };
+                    // Firmware is now halted in phase 1: invalidate bound PB state and
+                    // capture stage frontiers and fault-bank state before answering 2
+                    // (firmware may force stage targets while aborting work, and fault_scan
+                    // writes the fault-bank selector so it must not run against active FW).
+                    self.pools.invalidate();
+                    self.events.grow.clear();
+                    let stage = self.recovery_snapshot()?;
+                    // Powered down, the GPU holds no fault to read.
+                    let fault = self.session.fault_scan()?.unwrap_or_default();
+                    let asid = Some(fault.status)
+                        .filter(|status| status & 1 != 0)
+                        .map(|status| ((status >> 17) & 0x3f) as u32)
+                        .filter(|asid| *asid >= 1);
                     self.mark_recovery(stage, event, asid)?;
                     // Snapshot reads and all TPC repairs precede acknowledgement.
                     barrier();
@@ -470,7 +470,25 @@ impl Firmware {
                     );
                     return Err(super::boot::eproto());
                 }
-                RecoveryAction::Wait => {}
+                RecoveryAction::Wait => {
+                    if logic::phantom_phase0(
+                        phase,
+                        answered,
+                        self.engine.flights.is_empty(),
+                        now.saturating_sub(start),
+                    ) {
+                        self.recovery.errors_seen = self.events.errors;
+                        self.recovery.statistics_seen = self.events.recovery_statistics;
+                        self.events.recovery_started_ns = None;
+                        self.recovery.running = false;
+                        self.engine.frozen = false;
+                        dev_warn!(
+                            self.dev(),
+                            "M4 GPU idle recovery notification cleared without phase 1\n"
+                        );
+                        return Ok(());
+                    }
+                }
             }
             self.drain_rings()?;
             poll_sleep();
