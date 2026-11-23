@@ -26,7 +26,7 @@ use kernel::{
     platform,
     prelude::*,
     soc::apple::rtkit,
-    sync::{aref::ARef, Arc, ArcBorrow, CondVar, Mutex, SpinLock},
+    sync::{aref::ARef, Arc, ArcBorrow, CondVar, CondVarTimeoutResult, Mutex, SpinLock},
     time::{delay::fsleep, msecs_to_jiffies, Delta, Instant, Monotonic},
     uapi,
     workqueue::{impl_has_delayed_work, impl_has_work, DelayedWork, OwnedQueue, Work, WorkItem},
@@ -252,14 +252,14 @@ pub(crate) struct Started<'a> {
 }
 
 /// Starts the firmware and retires the boot job.
-pub(crate) fn start<'a>(pdev: &'a platform::Device<device::Core<'_>>, cfg: &'static hw::HwConfig)
-    -> Result<Started<'a>> {
+pub(crate) fn start<'a>(
+    pdev: &'a platform::Device<device::Core<'_>>,
+    cfg: &'static hw::HwConfig,
+    registers: &'static [hw::RegisterV27_2],
+    writable: u64,
+) -> Result<Started<'a>> {
     use kernel::dma::{Device as _, DmaMask};
     let dev: &device::Device = pdev.as_ref();
-    let (registers, writable) = match cfg.chip_id {
-        0x8112 => (hw::t8112::REGISTERS_V27_2, hw::t8112::WRITABLE_V27_2),
-        _ => return Err(ENODEV),
-    };
     let geometry = mmu::UatGeometry { ias: cfg.uat_ias, oas: cfg.uat_oas };
     let mut window = mmu::FirmwareWindow::reserve(dev, geometry)?;
     let asc = AscControl::new(pdev.resource_by_name(c"asc").ok_or(EINVAL)?.start())?;
@@ -795,7 +795,9 @@ impl Runtime {
         let mut guard = self.state.lock();
         let Some(state) = Option::as_mut(&mut *guard) else { return; };
         self.service_locked(state);
-        if !state.running() && state.pending.is_empty() { self.idle.notify_all(); }
+        if !state.running() && (state.pending.is_empty() || self.asleep.load(Ordering::Acquire)) {
+            self.idle.notify_all();
+        }
     }
 
     fn process_events(&self, state: &mut State) -> Result {
@@ -908,7 +910,7 @@ impl Runtime {
         // Hold publications first, then let what is published retire. User space is frozen by
         // now; only the scheduler's queued jobs can still arrive, and they wait in `pending`.
         self.asleep.store(true, Ordering::Release);
-        let start = Instant::<Monotonic>::now();
+        let mut remaining = msecs_to_jiffies(STOP_DRAIN_MS);
         loop {
             let Some(state) = Option::as_mut(&mut *guard) else { return Ok(()); };
             if !self.healthy() { return Ok(()); }
@@ -917,15 +919,16 @@ impl Runtime {
                           state.submitted, state.retired, state.pending.len());
                 return Ok(());
             }
-            if start.elapsed() >= Delta::from_millis(STOP_DRAIN_MS.into()) {
+            if remaining == 0 {
                 dev_err!(self.dev, "GPU: sleep refused, {} commands still running\n", state.inflight.len());
                 self.asleep.store(false, Ordering::Release);
                 self.pump(state);
                 return Err(EBUSY);
             }
-            // The service retires on notifications; `idle` is signalled only when nothing at all
-            // is left, so look again every 50 ms.
-            let _ = self.idle.wait_timeout(&mut guard, msecs_to_jiffies(50));
+            remaining = match self.idle.wait_timeout(&mut guard, remaining) {
+                CondVarTimeoutResult::Woken { jiffies } => jiffies,
+                _ => 0,
+            };
         }
     }
 

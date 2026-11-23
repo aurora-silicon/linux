@@ -153,6 +153,7 @@ impl drm::driver::Driver for AsahiDrmDriver {
 /// Firmware interface selected by the hardware compatible.
 pub(crate) enum ProbeConfig {
     Legacy(&'static hw::HwConfig),
+    LegacyWithG14Handoff(&'static hw::HwConfig),
     G17(&'static g17::Config),
     /// M5 Pro, Max and Ultra: the ID registers select the configuration.
     G17M5,
@@ -200,7 +201,7 @@ macro_rules! asahi_of_device_table {
                 ),
                 (
                     of::DeviceId::new(c"apple,agx-t8112"),
-                    ProbeConfig::Legacy(&hw::t8112::HWCONFIG)
+                    ProbeConfig::LegacyWithG14Handoff(&hw::t8112::HWCONFIG)
                 ),
                 (
                     of::DeviceId::new(c"apple,agx-t6000"),
@@ -376,8 +377,9 @@ impl platform::Driver for AsahiPlatformDriver {
 
         dev_info!(pdev.as_ref(), "Probing...\n");
 
-        let cfg = match info.ok_or(ENODEV)? {
-            ProbeConfig::Legacy(cfg) => *cfg,
+        let (cfg, has_g14_handoff) = match info.ok_or(ENODEV)? {
+            ProbeConfig::Legacy(cfg) => (*cfg, false),
+            ProbeConfig::LegacyWithG14Handoff(cfg) => (*cfg, true),
             ProbeConfig::G17(cfg) => {
                 return AsahiPlatformDriver::probe_g17(pdev, regs::G17Resources::new(pdev)?, cfg)
             }
@@ -391,16 +393,19 @@ impl platform::Driver for AsahiPlatformDriver {
             ProbeConfig::M5 => return Err(ENODEV),
         };
 
-        // G14 with firmware 27.2 has its own root and start sequence (g14_v27_2.rs).
-        if (cfg.gpu_gen, cfg.gpu_variant) == (hw::GpuGen::G14, hw::GpuVariant::G) {
-            let version: Option<KVec<u32>> = pdev.as_ref().fwnode().ok_or(EIO)?
-                .property_read_array_vec(c"apple,firmware-version", 3)?.optional();
-            if version.as_deref() == Some(&[27, 2, 0]) {
-                #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
-                return AsahiPlatformDriver::probe_g14_v27_2(pdev, cfg);
-                #[cfg(not(CONFIG_DRM_ASAHI_G14_V27_2))]
-                return Err(ENODEV);
-            }
+        let fwnode = pdev.as_ref().fwnode().ok_or(EIO)?;
+        let compat: KVec<u32> = fwnode
+            .property_read_array_vec(c"apple,firmware-compat", 3)?
+            .required_by(pdev.as_ref())?;
+
+        // The loader advertises the supported wire layout independently of the image version.
+        if has_g14_handoff && compat.as_slice() == [27, 2, 0] {
+            #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+            return AsahiPlatformDriver::probe_g14_v27_2(
+                pdev, cfg, hw::t8112::REGISTERS_V27_2, hw::t8112::WRITABLE_V27_2,
+            );
+            #[cfg(not(CONFIG_DRM_ASAHI_G14_V27_2))]
+            return Err(ENODEV);
         }
 
         // SAFETY: The selected SoC's UAT output width bounds all device DMA.
@@ -413,11 +418,6 @@ impl platform::Driver for AsahiPlatformDriver {
 
         // Start the coprocessor CPU, so UAT can initialize the handoff
         regs::Resources::start_cpu(pdev)?;
-
-        let fwnode = pdev.as_ref().fwnode().ok_or(EIO)?;
-        let compat: KVec<u32> = fwnode
-            .property_read_array_vec(c"apple,firmware-compat", 3)?
-            .required_by(pdev.as_ref())?;
 
         let drm = drm::UnregisteredDevice::<AsahiDrmDriver>::new(pdev, Ok(()))?;
         // SAFETY: Every adapter calls close_binding in unbind before devres;
@@ -503,9 +503,11 @@ impl AsahiPlatformDriver {
     fn probe_g14_v27_2<'bound>(
         pdev: &'bound platform::Device<Core<'_>>,
         cfg: &'static hw::HwConfig,
+        registers: &'static [hw::RegisterV27_2],
+        writable: u64,
     ) -> Result<AsahiPlatformDriverData<'bound>> {
         let crate::g14_v27_2::Started { backend, drm, binding, resources } =
-            crate::g14_v27_2::start(pdev, cfg)?;
+            crate::g14_v27_2::start(pdev, cfg, registers, writable)?;
         let gpu = backend.clone() as Arc<dyn gpu::Gpu>;
         let data = try_pin_init!(AsahiDrmRegistrationData { gpu, resources });
         // SAFETY: The registration is stored in the platform data and unregistered when it is
