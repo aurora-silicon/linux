@@ -187,10 +187,17 @@ struct macaudio_platform_cfg {
 	 * No voltage or current sense reaches the AP, so no protection daemon
 	 * can govern the speakers, and there is no sense PCM. "Speaker Volume
 	 * Unlock" does not apply: the SN012776 volumes stay at the floor until
-	 * a "Speaker Protection" lease is granted, which runs them at
-	 * safe_vol, its operating gain and their ceiling.
+	 * the interface is on the "Speaker Protection" lease, and playback
+	 * starts only after a grant, which runs them at safe_vol, its
+	 * operating gain and their ceiling.
 	 */
 	bool spk_fixed_ceiling;
+	/*
+	 * With spk_fixed_ceiling: the amp level safe_vol was computed for. At
+	 * any other level the same volume drives the speaker differently, so
+	 * the speakers stay off.
+	 */
+	int spk_ceiling_level;
 };
 
 static const char *volume_control_names[] = {
@@ -2426,10 +2433,21 @@ static int macaudio_sn012776_level(struct device_node *amp)
 }
 
 /*
+ * A fixed ceiling holds only at the amp level it was computed for.
+ */
+static bool macaudio_sn012776_level_allowed(const struct macaudio_platform_cfg *cfg,
+					    int level)
+{
+	return level >= 0 && (!cfg->spk_fixed_ceiling || level == cfg->spk_ceiling_level);
+}
+
+/*
  * Speakers on SN012776 amps run only when every amp has its level from the
- * Mac; a boot loader that does not pass it leaves them off.
+ * Mac, and under a fixed ceiling only at the level that ceiling was computed
+ * for; otherwise they stay off.
  */
 static bool macaudio_sn012776_levels_present(struct device *dev,
+					     const struct macaudio_platform_cfg *cfg,
 					     struct device_node *codec)
 {
 	struct of_phandle_args args;
@@ -2444,8 +2462,13 @@ static bool macaudio_sn012776_levels_present(struct device *dev,
 		if (level < 0)
 			dev_err(dev, "%pOF: %s amp level from the boot loader\n", args.np,
 				level == -ENOENT ? "no" : "out-of-range");
+		else if (!macaudio_sn012776_level_allowed(cfg, level))
+			dev_err(dev, "%pOF: amp level %d, the fixed ceiling holds only at %d\n",
+				args.np, level, cfg->spk_ceiling_level);
+		else if (cfg->spk_fixed_ceiling)
+			dev_info(dev, "%pOF: amp level %d from the boot loader\n", args.np, level);
 		of_node_put(args.np);
-		if (level < 0)
+		if (!macaudio_sn012776_level_allowed(cfg, level))
 			return false;
 	}
 	return n > 0;
@@ -2685,11 +2708,12 @@ static int macaudio_parse_of(struct macaudio_snd_data *ma)
 			if (ma->cfg->amp == AMP_SN012776) {
 				struct device_node *spk_codec = of_get_child_by_name(np, "codec");
 				bool levels = spk_codec &&
-					macaudio_sn012776_levels_present(card->dev, spk_codec);
+					macaudio_sn012776_levels_present(card->dev, ma->cfg,
+									 spk_codec);
 
 				of_node_put(spk_codec);
 				if (!levels) {
-					dev_err(card->dev, "the boot loader passed no amp levels, disabling speakers\n");
+					dev_err(card->dev, "no usable amp levels from the boot loader, disabling speakers\n");
 					continue;
 				}
 			}
