@@ -44,6 +44,7 @@
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
+#include <linux/suspend.h>
 #include <linux/reset-controller.h>
 #include <linux/soc/apple/dp-tunnel.h>
 #include <linux/soc/apple/rtkit.h>
@@ -2128,6 +2129,65 @@ static void t6040_rtkit_cleanup(void *data)
 	t6040_rtkit_stop_transport(data);
 }
 
+/*
+ * Suspend-to-idle leaves the Type-C link up: the USB4/Thunderbolt router keeps
+ * its own domains out of the system transition while a cable is set up, and a
+ * running PHY coprocessor is not stopped either. genpd would still power off
+ * common_dp (and with it phymxwrap) in its noirq phase under the running
+ * coprocessor: the link then dies after resume and the next detach finds a
+ * coprocessor that no longer answers (AP idle -62). Put this device on the
+ * awake path while its coprocessor runs, so genpd keeps the domains on
+ * (common_dp carries apple,sleep-wakeup-path). The decision is taken again in
+ * every suspend pass, dark wakes included, and once more in noirq for a
+ * coprocessor started after .suspend. A sleep the platform takes part in
+ * (firmware suspend) is left as it was.
+ */
+static void t6040_keep_running_cpu_awake(struct t6040_usb2_phy *tphy, bool noirq)
+{
+	bool running;
+
+	if (!pm_suspend_no_platform())
+		return;
+
+	if (noirq) {
+		/*
+		 * An attach or detach holding the lock may wait for a coprocessor
+		 * reply that cannot arrive now. Its outcome is unknown: keep the
+		 * domains on for this sleep.
+		 */
+		if (!mutex_trylock(&tphy->lock)) {
+			device_set_awake_path(tphy->dev);
+			return;
+		}
+	} else {
+		mutex_lock(&tphy->lock);
+	}
+	running = tphy->rtk && apple_rtkit_is_running(tphy->rtk);
+	mutex_unlock(&tphy->lock);
+
+	if (running) {
+		device_set_awake_path(tphy->dev);
+		dev_dbg(tphy->dev, "PHY coprocessor running: domains kept on for s2idle\n");
+	}
+}
+
+static int t6040_usb2_suspend(struct device *dev)
+{
+	t6040_keep_running_cpu_awake(dev_get_drvdata(dev), false);
+	return 0;
+}
+
+static int t6040_usb2_suspend_noirq(struct device *dev)
+{
+	t6040_keep_running_cpu_awake(dev_get_drvdata(dev), true);
+	return 0;
+}
+
+static const struct dev_pm_ops t6040_usb2_pm_ops = {
+	.suspend = t6040_usb2_suspend,
+	.suspend_noirq = t6040_usb2_suspend_noirq,
+};
+
 static void t6040_mbox_dev_put(void *data)
 {
 	put_device(data);
@@ -2505,6 +2565,7 @@ static struct platform_driver t6040_usb2_driver = {
 	.driver = {
 		.name = "phy-apple-t6040-usb2",
 		.of_match_table = t6040_usb2_of_match,
+		.pm = pm_sleep_ptr(&t6040_usb2_pm_ops),
 	},
 };
 module_platform_driver(t6040_usb2_driver);
