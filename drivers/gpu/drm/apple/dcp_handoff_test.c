@@ -2,8 +2,9 @@
 /*
  * Included by dcp.c: the boot loader handoff state the driver reads before
  * it starts a display coprocessor. dcp_external_is_idle() runs on a fake
- * coprocessor register window; boot_show_notch() on /chosen, with the
- * property applied and reverted through an OF changeset.
+ * coprocessor register window; dcp_boot_show_notch(), which boot_show_notch()
+ * applies to /chosen, on nodes of the test's own. Nothing here reads or
+ * writes the device tree, so the suite is safe next to a probing display.
  */
 #include <kunit/test.h>
 #include <linux/of.h>
@@ -53,66 +54,50 @@ static void dcp_handoff_external_idle(struct kunit *test)
 									   ~stopped)));
 }
 
-/* boot_show_notch() with /chosen/asahi,show-notch set by @add, or absent. */
-static bool dcp_handoff_notch(struct kunit *test,
-			      int (*add)(struct of_changeset *cs, struct device_node *np))
+/*
+ * dcp_boot_show_notch() on a node of the test's own, never part of the
+ * device tree, with asahi,show-notch holding @length bytes at @value.
+ */
+static bool dcp_handoff_notch(const void *value, int length)
 {
-	struct of_changeset cs;
-	bool ret;
+	struct property prop = {
+		.name = "asahi,show-notch",
+		.length = length,
+		.value = (void *)value,
+	};
+	struct device_node chosen = { .properties = &prop };
 
-	if (!add)
-		return boot_show_notch();
-	of_changeset_init(&cs);
-	KUNIT_ASSERT_EQ(test, add(&cs, of_chosen), 0);
-	KUNIT_ASSERT_EQ(test, of_changeset_apply(&cs), 0);
-	ret = boot_show_notch();
-	KUNIT_EXPECT_EQ(test, of_changeset_revert(&cs), 0);
-	of_changeset_destroy(&cs);
-	return ret;
+	return dcp_boot_show_notch(&chosen);
 }
 
-#define DCP_HANDOFF_NOTCH_STRING(tag, value)						\
-static int dcp_handoff_notch_##tag(struct of_changeset *cs, struct device_node *np)	\
-{											\
-	return of_changeset_add_prop_string(cs, np, "asahi,show-notch", value);		\
-}
-
-DCP_HANDOFF_NOTCH_STRING(one, "1")
-DCP_HANDOFF_NOTCH_STRING(zero, "0")
-DCP_HANDOFF_NOTCH_STRING(empty, "")
-DCP_HANDOFF_NOTCH_STRING(ten, "10")
-DCP_HANDOFF_NOTCH_STRING(yes, "yes")
-
-static int dcp_handoff_notch_u32(struct of_changeset *cs, struct device_node *np)
-{
-	return of_changeset_add_prop_u32(cs, np, "asahi,show-notch", 1);
-}
-
-static int dcp_handoff_notch_bool(struct of_changeset *cs, struct device_node *np)
-{
-	return of_changeset_add_prop_bool(cs, np, "asahi,show-notch");
-}
+#define dcp_handoff_notch_string(s)	dcp_handoff_notch(s, sizeof(s))
 
 static void dcp_handoff_boot_notch(struct kunit *test)
 {
-	if (!of_chosen)
-		kunit_skip(test, "no /chosen node");
-	if (of_property_present(of_chosen, "asahi,show-notch"))
-		kunit_skip(test, "/chosen already has asahi,show-notch");
+	static const char unterminated[] = { '1' };
+	static const __be32 cell = cpu_to_be32(1);
+	struct property other = {
+		.name = "bootargs",
+		.length = sizeof("1"),
+		.value = "1",
+	};
+	struct device_node chosen = {};
 
-	/* Absent: the driver keeps the notch rows out of the mode. */
-	KUNIT_EXPECT_FALSE(test, dcp_handoff_notch(test, NULL));
+	/* Absent, or no /chosen at all: the notch rows stay out of the mode. */
+	KUNIT_EXPECT_FALSE(test, dcp_boot_show_notch(NULL));
+	KUNIT_EXPECT_FALSE(test, dcp_boot_show_notch(&chosen));
+	chosen.properties = &other;
+	KUNIT_EXPECT_FALSE(test, dcp_boot_show_notch(&chosen));
 	/* Only the string "1" the boot loader writes shows the notch. */
-	KUNIT_EXPECT_TRUE(test, dcp_handoff_notch(test, dcp_handoff_notch_one));
-	KUNIT_EXPECT_FALSE(test, dcp_handoff_notch(test, dcp_handoff_notch_zero));
-	KUNIT_EXPECT_FALSE(test, dcp_handoff_notch(test, dcp_handoff_notch_empty));
-	KUNIT_EXPECT_FALSE(test, dcp_handoff_notch(test, dcp_handoff_notch_ten));
-	KUNIT_EXPECT_FALSE(test, dcp_handoff_notch(test, dcp_handoff_notch_yes));
-	/* A cell or an empty property is not the string "1". */
-	KUNIT_EXPECT_FALSE(test, dcp_handoff_notch(test, dcp_handoff_notch_u32));
-	KUNIT_EXPECT_FALSE(test, dcp_handoff_notch(test, dcp_handoff_notch_bool));
-	/* Reverted: absent again. */
-	KUNIT_EXPECT_FALSE(test, dcp_handoff_notch(test, NULL));
+	KUNIT_EXPECT_TRUE(test, dcp_handoff_notch_string("1"));
+	KUNIT_EXPECT_FALSE(test, dcp_handoff_notch_string("0"));
+	KUNIT_EXPECT_FALSE(test, dcp_handoff_notch_string(""));
+	KUNIT_EXPECT_FALSE(test, dcp_handoff_notch_string("10"));
+	KUNIT_EXPECT_FALSE(test, dcp_handoff_notch_string("yes"));
+	/* A cell, an empty property or an unterminated "1" is not that string. */
+	KUNIT_EXPECT_FALSE(test, dcp_handoff_notch(&cell, sizeof(cell)));
+	KUNIT_EXPECT_FALSE(test, dcp_handoff_notch(NULL, 0));
+	KUNIT_EXPECT_FALSE(test, dcp_handoff_notch(unterminated, sizeof(unterminated)));
 }
 
 static struct kunit_case dcp_handoff_cases[] = {
