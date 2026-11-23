@@ -8,7 +8,7 @@ mod exit;
 mod dependencies;
 mod direct;
 mod grow;
-mod observe;
+pub(super) mod observe;
 mod pools;
 mod prepare;
 mod recovery;
