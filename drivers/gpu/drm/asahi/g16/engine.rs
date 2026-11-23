@@ -407,7 +407,7 @@ enum PublicationError {
 }
 
 /// Engine statistics, printed by `aurora-g16/stats`.
-#[derive(Default)]
+#[derive(Default, Zeroable)]
 pub(crate) struct Stats {
     pub(crate) pub_ns: u64,
     pub(crate) idle_from_ns: u64,
@@ -465,7 +465,7 @@ pub(crate) struct Stats {
 /// Host-side phase timers of publication and polling, on with `debug_flags` bit 49
 /// (`Debug1`); printed as the `prof:` line of `aurora-g16/stats`. A measurement aid: nothing is
 /// timed while the flag is off.
-#[derive(Default)]
+#[derive(Default, Zeroable)]
 pub(crate) struct Prof {
     /// Published prefixes timed.
     pub(crate) prefixes: u64,
@@ -520,17 +520,21 @@ struct Scratch {
 }
 
 impl Scratch {
-    fn new() -> Result<Self> {
+    #[inline(never)]
+    fn new_boxed() -> Result<KBox<Self>> {
         let z = |n| KVec::from_elem(0u8, n, GFP_KERNEL);
-        Ok(Self {
-            cw: z(work::compute::WORK_SIZE)?,
-            cq: z(work::compute::SEQ_SIZE)?,
-            ta: z(work::ta::WORK_SIZE)?,
-            tas: z(work::ta::SEQ_SIZE)?,
-            fs: z(work::fs::WORK_SIZE)?,
-            fss: z(work::fs::SEQ_SIZE)?,
-            scene: z(work::scene::ACTIVE_SIZE)?,
-        })
+        KBox::try_init(
+            try_init!(Self {
+                cw: z(work::compute::WORK_SIZE)?,
+                cq: z(work::compute::SEQ_SIZE)?,
+                ta: z(work::ta::WORK_SIZE)?,
+                tas: z(work::ta::SEQ_SIZE)?,
+                fs: z(work::fs::WORK_SIZE)?,
+                fss: z(work::fs::SEQ_SIZE)?,
+                scene: z(work::scene::ACTIVE_SIZE)?,
+            }),
+            GFP_KERNEL,
+        )
     }
 }
 
@@ -601,6 +605,7 @@ pub(crate) struct Engine {
 }
 
 impl Engine {
+    #[inline(never)]
     pub(crate) fn new() -> Result<Self> {
         // Wrapped native stamps are safe only while pending references fit within the
         // signed half-window: at most FLIGHTS commands are published at once, far inside it.
@@ -633,12 +638,12 @@ impl Engine {
             short_repoll: false,
             progress_flight: [0; 3],
             progress: [None; 4],
-            stats: KBox::new(Stats::default(), GFP_KERNEL)?,
-            prof: KBox::new(Prof::default(), GFP_KERNEL)?,
+            stats: KBox::zeroed(GFP_KERNEL)?,
+            prof: KBox::zeroed(GFP_KERNEL)?,
             debugfs: None,
             // Allocate host encoder buffers before any submitted fence can depend on
             // the device mutex. Publication must never enter direct reclaim here.
-            scratch: Some(KBox::new(Scratch::new()?, GFP_KERNEL)?),
+            scratch: Some(Scratch::new_boxed()?),
         })
     }
 
@@ -1844,6 +1849,7 @@ impl Firmware {
     /// producer writes and queue kicks. EAGAIN defers while storage/channel state is held;
     /// The error records whether firmware may see a counter/producer update, independently
     /// of errno; unpublished EIO is still an ordinary job failure.
+    #[inline(never)]
     fn publish_prefix(
         &mut self,
         job: &Arc<Job>,

@@ -198,7 +198,7 @@ impl Queue {
             },
             GFP_KERNEL,
         )?;
-        let proof = KBox::new(command::SpanProof::new(), GFP_KERNEL)?;
+        let proof = command::SpanProof::new_boxed()?;
         Ok(Self {
             scheduler,
             state,

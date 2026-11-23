@@ -93,6 +93,7 @@ fn pair(graph: &[Arc<FwObject>], state: usize, ring: usize) -> Ring {
 
 /// Builds the complete unpublished M4 graph. The return shape is shared with
 /// the other backend, while all object layouts and policy are M4-specific.
+#[inline(never)]
 pub(crate) fn build(
     dev: &device::Device,
     adt: &GpuAdt,

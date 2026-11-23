@@ -44,9 +44,10 @@ pub const EBUSY:Error=Error(16); pub const EOVERFLOW:Error=Error(75); pub const 
 pub const ETIMEDOUT:Error=Error(110);pub const ERESTARTSYS:Error=Error(512);
 pub const GFP_KERNEL:u32=0;
 pub type Result<T=()> = std::result::Result<T,Error>;
+macro_rules! init { ($($tt:tt)*) => { $($tt)* }; }
 pub mod prelude {pub use crate::{Result,KVec,KBox,GFP_KERNEL,EINVAL,EAGAIN,E2BIG,EBUSY,EOVERFLOW,EIO,ETIMEDOUT,ERESTARTSYS};}
 pub struct KBox<T>(Box<T>);
-impl<T>KBox<T>{pub fn new(x:T,_:u32)->Result<Self>{Ok(Self(Box::new(x)))}}
+impl<T>KBox<T>{pub fn new(x:T,_:u32)->Result<Self>{Ok(Self(Box::new(x)))} pub fn init(x:T,_:u32)->Result<Self>{Ok(Self(Box::new(x)))}}
 impl<T>std::ops::Deref for KBox<T>{type Target=T;fn deref(&self)->&T{&self.0}}
 impl<T>std::ops::DerefMut for KBox<T>{fn deref_mut(&mut self)->&mut T{&mut self.0}}
 pub struct KVec<T>(Vec<T>);

@@ -380,6 +380,7 @@ pub(crate) struct Pools {
     quarantined_epochs: [Option<Arc<PbEpoch>>; sizes::PB_SLOTS],
 }
 impl Pools {
+    #[allow(dead_code)]
     pub(crate) fn new(dev: &AsahiDrmDevice) -> Self {
         Self {
             dev: dev.as_ref().as_ref().into(),
@@ -397,6 +398,31 @@ impl Pools {
             quarantined: [false; sizes::PB_SLOTS],
             quarantined_epochs: [const { None }; sizes::PB_SLOTS],
         }
+    }
+    /// Allocates [`Pools`] directly on the heap so probe/backend bring-up does not stage the
+    /// per-slot lease arrays on the kernel stack.
+    #[allow(dead_code)]
+    #[inline(never)]
+    pub(crate) fn new_boxed(dev: &AsahiDrmDevice) -> Result<KBox<Self>> {
+        Ok(KBox::init(
+            init!(Self {
+                dev: dev.as_ref().as_ref().into(),
+                stats: PbStats::default(),
+                owners: [const { None }; sizes::PB_SLOTS],
+                owner_vms: [const { None }; sizes::PB_SLOTS],
+                owner_arenas: [const { None }; sizes::PB_SLOTS],
+                pending_vms: [const { None }; sizes::PB_SLOTS],
+                pending_arenas: [const { None }; sizes::PB_SLOTS],
+                binds: [0; sizes::PB_SLOTS],
+                keep: [false; sizes::PB_SLOTS],
+                active: None,
+                last_clean_retired: None,
+                inflight: [0; sizes::PB_SLOTS],
+                quarantined: [false; sizes::PB_SLOTS],
+                quarantined_epochs: [const { None }; sizes::PB_SLOTS],
+            }),
+            GFP_KERNEL,
+        )?)
     }
     /// Number of contiguous PB/UMA allocator slots (`0..n`) each rendering VM should prepare
     /// so at least [`sizes::BASE_PB_SLOTS`] healthy slots remain available across quarantines.

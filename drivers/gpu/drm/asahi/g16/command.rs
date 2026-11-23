@@ -637,18 +637,16 @@ fn align_span(start: u64, end: u64) -> Result<(u64, u64)> {
 /// Maximum page-aligned GPUVM spans retained in one logical queue's validation cache.
 const MAX_PROOF_RANGES: usize = 128;
 
-/// One logical queue's bounded cache of validated page-aligned GPUVM spans and permissions.
-/// Mapping mutations invalidate or hide the VM's validation epoch so stale proofs are never
-/// reused across unmaps or remaps.
-pub(crate) struct SpanProof {
+/// Bounded cache of validated page-aligned GPUVM spans and permissions.
+struct ProofCache {
     epoch: Option<u64>,
     ranges: [(u64, u64, u8); MAX_PROOF_RANGES],
     count: usize,
     overflow: bool,
 }
 
-impl SpanProof {
-    pub(crate) const fn new() -> Self {
+impl ProofCache {
+    const fn new() -> Self {
         Self {
             epoch: None,
             ranges: [(0, 0, 0); MAX_PROOF_RANGES],
@@ -668,7 +666,7 @@ impl SpanProof {
             })
     }
 
-    pub(crate) fn invalidate(&mut self) {
+    fn invalidate(&mut self) {
         self.epoch = None;
         self.count = 0;
         self.overflow = false;
@@ -680,13 +678,7 @@ impl SpanProof {
             .any(|&range| Self::contains(range, req))
     }
 
-    pub(crate) fn covers_aligned(
-        &self,
-        epoch: Option<u64>,
-        first: u64,
-        size: u64,
-        access: u8,
-    ) -> bool {
+    fn covers_aligned(&self, epoch: Option<u64>, first: u64, size: u64, access: u8) -> bool {
         self.epoch.is_some() && self.epoch == epoch && self.covers_entry((first, size, access))
     }
 
@@ -726,7 +718,7 @@ impl SpanProof {
         self.count += 1;
     }
 
-    pub(crate) fn record_one(&mut self, epoch: Option<u64>, first: u64, size: u64, access: u8) {
+    fn record_one(&mut self, epoch: Option<u64>, first: u64, size: u64, access: u8) {
         if epoch.is_none() {
             self.invalidate();
             return;
@@ -758,6 +750,63 @@ impl SpanProof {
         for &req in ranges {
             self.insert_entry(req);
         }
+    }
+}
+
+/// Heap-resident validation scratch paired with [`ProofCache`] so `Prepared::validate` never
+/// stages kilobytes of span/command arrays on the kernel stack.
+struct ValidateScratch {
+    batch: SpanBatch,
+    missing: [(u64, u64, u8); 48],
+    vdm_vas: [u64; MAX_COMMANDS as usize],
+    cdm_ranges: [(u64, u64); MAX_COMMANDS as usize],
+}
+
+impl ValidateScratch {
+    const fn new() -> Self {
+        Self {
+            batch: SpanBatch::new(),
+            missing: [(0, 0, 0); 48],
+            vdm_vas: [0; MAX_COMMANDS as usize],
+            cdm_ranges: [(0, 0); MAX_COMMANDS as usize],
+        }
+    }
+}
+
+/// One logical queue's bounded cache of validated page-aligned GPUVM spans and permissions,
+/// together with reusable scratch buffers for `Prepared::validate`.
+/// Mapping mutations invalidate or hide the VM's validation epoch so stale proofs are never
+/// reused across unmaps or remaps.
+pub(crate) struct SpanProof {
+    cache: ProofCache,
+    scratch: ValidateScratch,
+}
+
+impl SpanProof {
+    #[allow(dead_code)]
+    pub(crate) const fn new() -> Self {
+        Self {
+            cache: ProofCache::new(),
+            scratch: ValidateScratch::new(),
+        }
+    }
+
+    pub(crate) fn invalidate(&mut self) {
+        self.cache.invalidate();
+    }
+
+    pub(crate) fn covers_aligned(
+        &self,
+        epoch: Option<u64>,
+        first: u64,
+        size: u64,
+        access: u8,
+    ) -> bool {
+        self.cache.covers_aligned(epoch, first, size, access)
+    }
+
+    pub(crate) fn record_one(&mut self, epoch: Option<u64>, first: u64, size: u64, access: u8) {
+        self.cache.record_one(epoch, first, size, access);
     }
 }
 
@@ -820,18 +869,26 @@ impl SpanBatch {
         Self::report_failure(vm, &self.ranges[..n])
     }
 
-    fn flush_with_proof(&mut self, vm: &mmu::Vm, proof: &mut SpanProof) -> Result {
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    fn flush_with_proof_parts(
+        &mut self,
+        vm: &mmu::Vm,
+        cache: &mut ProofCache,
+        missing: &mut [(u64, u64, u8); 48],
+    ) -> Result {
         let n = self.len;
         if n == 0 {
             return Ok(());
         }
         self.len = 0;
         let epoch = vm.mapping_validation_epoch();
-        if proof.epoch.is_some() && proof.epoch == epoch {
-            let mut missing = [(0u64, 0u64, 0u8); 48];
+        if cache.epoch.is_some() && cache.epoch == epoch {
             let mut missing_len = 0usize;
             for &req in &self.ranges[..n] {
-                if !proof.covers_entry(req) {
+                if !cache.covers_entry(req) {
                     missing[missing_len] = req;
                     missing_len += 1;
                 }
@@ -840,30 +897,35 @@ impl SpanBatch {
                 return Ok(());
             }
             let (mut covered, mut walked) = vm.covers_ranges_batch(&missing[..missing_len]);
-            if covered && walked != proof.epoch {
+            if covered && walked != cache.epoch {
                 (covered, walked) = vm.covers_ranges_batch(&self.ranges[..n]);
             }
             if covered {
-                proof.record_slice(walked, &self.ranges[..n]);
+                cache.record_slice(walked, &self.ranges[..n]);
                 return Ok(());
             }
-            proof.invalidate();
+            cache.invalidate();
             return Self::report_failure(vm, &self.ranges[..n]);
         }
         let (covered, walked) = vm.covers_ranges_batch(&self.ranges[..n]);
         if covered {
-            proof.record_slice(walked, &self.ranges[..n]);
+            cache.record_slice(walked, &self.ranges[..n]);
             return Ok(());
         }
-        proof.invalidate();
+        cache.invalidate();
         Self::report_failure(vm, &self.ranges[..n])
     }
 
-    fn flush_locked_with_proof(
+    #[allow(dead_code)]
+    fn flush_with_proof(&mut self, vm: &mmu::Vm, proof: &mut SpanProof) -> Result {
+        self.flush_with_proof_parts(vm, &mut proof.cache, &mut proof.scratch.missing)
+    }
+
+    fn flush_locked_with_cache(
         &mut self,
         guard: &mut mmu::VmReadGuard<'_>,
         epoch: Option<u64>,
-        proof: &mut SpanProof,
+        cache: &mut ProofCache,
     ) -> Result {
         let n = self.len;
         if n == 0 {
@@ -872,14 +934,14 @@ impl SpanBatch {
         self.len = 0;
         let mut had_miss = false;
         for &(first, size, access) in &self.ranges[..n] {
-            if proof.covers_aligned(epoch, first, size, access) {
+            if cache.covers_aligned(epoch, first, size, access) {
                 continue;
             }
             had_miss = true;
             let read = access & 1 != 0;
             let write = access & 2 != 0;
             if !guard.covers_range(first, size, read, write) {
-                proof.invalidate();
+                cache.invalidate();
                 return if guard.covers_range(first, size, false, false) {
                     Err(EACCES)
                 } else {
@@ -888,9 +950,19 @@ impl SpanBatch {
             }
         }
         if had_miss {
-            proof.record_slice(epoch, &self.ranges[..n]);
+            cache.record_slice(epoch, &self.ranges[..n]);
         }
         Ok(())
+    }
+
+    #[allow(dead_code)]
+    fn flush_locked_with_proof(
+        &mut self,
+        guard: &mut mmu::VmReadGuard<'_>,
+        epoch: Option<u64>,
+        proof: &mut SpanProof,
+    ) -> Result {
+        self.flush_locked_with_cache(guard, epoch, &mut proof.cache)
     }
 }
 
@@ -1434,6 +1506,34 @@ impl ParsedStream {
     }
 }
 
+impl SpanProof {
+    /// Allocates a [`SpanProof`] directly on the heap without staging its range or scratch arrays
+    /// on the kernel stack.
+    #[inline(never)]
+    pub(crate) fn new_boxed() -> Result<KBox<Self>> {
+        Ok(KBox::init(
+            init!(Self {
+                cache <- init!(ProofCache {
+                    epoch: None,
+                    ranges <- ::pin_init::init_array_from_fn(|_| (0, 0, 0)),
+                    count: 0,
+                    overflow: false,
+                }),
+                scratch <- init!(ValidateScratch {
+                    batch <- init!(SpanBatch {
+                        ranges <- ::pin_init::init_array_from_fn(|_| (0, 0, 0)),
+                        len: 0,
+                    }),
+                    missing <- ::pin_init::init_array_from_fn(|_| (0, 0, 0)),
+                    vdm_vas <- ::pin_init::init_array_from_fn(|_| 0),
+                    cdm_ranges <- ::pin_init::init_array_from_fn(|_| (0, 0)),
+                }),
+            }),
+            GFP_KERNEL,
+        )?)
+    }
+}
+
 impl Prepared {
     /// Checks each command's spans, programs and stream gates, with a job reference on the VM
     /// already held so that the checked mappings are retained until the job retires.
@@ -1450,35 +1550,40 @@ impl Prepared {
         if commands.is_empty() {
             return Err(EINVAL);
         }
-        let mut batch = SpanBatch::new();
-        let mut vdm_vas = [0u64; MAX_COMMANDS as usize];
         let mut vdm_count = 0usize;
-        let mut cdm_ranges = [(0u64, 0u64); MAX_COMMANDS as usize];
         let mut cdm_count = 0usize;
-        for command in commands.iter() {
-            match command {
-                Command::Render(render) => {
-                    check_render(
-                        &mut batch,
-                        context,
-                        &render.cmd,
-                        &render.vertex_attachments,
-                        &render.fragment_attachments,
-                    )?;
-                    if vdm_count >= vdm_vas.len() {
-                        return Err(EINVAL);
+        {
+            let scratch = &mut proof.scratch;
+            scratch.batch.clear();
+            for command in commands.iter() {
+                match command {
+                    Command::Render(render) => {
+                        check_render(
+                            &mut scratch.batch,
+                            context,
+                            &render.cmd,
+                            &render.vertex_attachments,
+                            &render.fragment_attachments,
+                        )?;
+                        if vdm_count >= scratch.vdm_vas.len() {
+                            return Err(EINVAL);
+                        }
+                        scratch.vdm_vas[vdm_count] = render.cmd.vdm_ctrl_stream_base;
+                        vdm_count += 1;
                     }
-                    vdm_vas[vdm_count] = render.cmd.vdm_ctrl_stream_base;
-                    vdm_count += 1;
-                }
-                Command::Compute(compute) => {
-                    let range =
-                        check_compute(&mut batch, context, &compute.cmd, &compute.attachments)?;
-                    if cdm_count >= cdm_ranges.len() {
-                        return Err(EINVAL);
+                    Command::Compute(compute) => {
+                        let range = check_compute(
+                            &mut scratch.batch,
+                            context,
+                            &compute.cmd,
+                            &compute.attachments,
+                        )?;
+                        if cdm_count >= scratch.cdm_ranges.len() {
+                            return Err(EINVAL);
+                        }
+                        scratch.cdm_ranges[cdm_count] = range;
+                        cdm_count += 1;
                     }
-                    cdm_ranges[cdm_count] = range;
-                    cdm_count += 1;
                 }
             }
         }
@@ -1495,12 +1600,14 @@ impl Prepared {
             let mut guard = Some(context.vm.read_lock().map_err(|_| EFAULT)?);
             let mut epoch = guard.as_ref().and_then(|g| g.epoch());
             if let Some(g) = guard.as_mut() {
-                batch.flush_locked_with_proof(g, epoch, proof)?;
+                let SpanProof { cache, scratch } = proof;
+                scratch.batch.flush_locked_with_cache(g, epoch, cache)?;
                 if need_vdm {
-                    gate::vdm_batch_locked(g, &vdm_vas[..vdm_count])?;
+                    gate::vdm_batch_locked(g, &scratch.vdm_vas[..vdm_count])?;
                 }
             }
-            for &(base, end) in &cdm_ranges[..cdm_count] {
+            for i in 0..cdm_count {
+                let (base, end) = proof.scratch.cdm_ranges[i];
                 gate::cdm_locked(
                     context.vm,
                     &mut guard,
@@ -1512,7 +1619,10 @@ impl Prepared {
                 )?;
             }
         } else {
-            batch.flush_with_proof(context.vm, proof)?;
+            let SpanProof { cache, scratch } = proof;
+            scratch
+                .batch
+                .flush_with_proof_parts(context.vm, cache, &mut scratch.missing)?;
         }
         Ok(Submission {
             counts,

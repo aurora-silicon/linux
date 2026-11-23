@@ -1358,6 +1358,7 @@ impl Firmware {
     /// Retire the flight at `index` (the oldest of its engine class). Only a full normal receipt
     /// retires its storage; a passed abort quarantines it. Job failure independently drops
     /// remaining unpublished commands even when the storage fully retired.
+    #[inline(never)]
     pub(crate) fn retire_oldest(
         &mut self,
         index: usize,

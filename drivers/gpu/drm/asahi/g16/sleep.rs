@@ -115,14 +115,16 @@ impl Shared {
         }
         self.events.drain();
         self.events_unbound.drain();
-        // `sleeping` is already set, so taking the queued scrubs under `scrub_queue`
+        // `sleeping` is already set, so draining queued scrubs under `scrub_queue`
         // guarantees no concurrent `enqueue_scrubs()` can still queue onto `scrub_wq`
-        // while `scrub_wq.drain()` runs. Drop the drained batch outside the spinlock.
-        let pending_scrubs = {
-            let mut queue = self.scrub_queue.lock();
-            core::mem::replace(&mut *queue, super::slots::ScrubQueue::new())
-        };
-        drop(pending_scrubs);
+        // while `scrub_wq.drain()` runs. Drop each drained item outside the spinlock.
+        loop {
+            let item = self.scrub_queue.lock().pop();
+            let Some(item) = item else {
+                break;
+            };
+            drop(item);
+        }
         self.scrub_wq.drain();
         self.feed.pause();
         self.feed_wq.drain();

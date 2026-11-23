@@ -594,16 +594,21 @@ impl Drop for PendingScrub {
     }
 }
 
+/// Maximum displaced render pass slots staged in one stack-resident [`ScrubBatch`].
+/// Keeping the batch bounded avoids multi-kilobyte stack frames in poll/submit paths while
+/// any additional displaced slots remain flagged for the next pass.
+const MAX_SCRUB_BATCH: usize = 8;
+
 /// Zero-allocation batch of displaced render pass slots to scrub after dropping `Shared::state`.
 pub(crate) struct ScrubBatch {
-    items: [Option<PendingScrub>; sizes::RENDER_SLOTS],
+    items: [Option<PendingScrub>; MAX_SCRUB_BATCH],
     len: usize,
 }
 
 impl ScrubBatch {
     pub(crate) const fn new() -> Self {
         Self {
-            items: [const { None }; sizes::RENDER_SLOTS],
+            items: [const { None }; MAX_SCRUB_BATCH],
             len: 0,
         }
     }
@@ -612,8 +617,12 @@ impl ScrubBatch {
         self.len == 0
     }
 
+    fn is_full(&self) -> bool {
+        self.len >= MAX_SCRUB_BATCH
+    }
+
     fn push(&mut self, item: PendingScrub) -> bool {
-        if self.len >= sizes::RENDER_SLOTS {
+        if self.len >= MAX_SCRUB_BATCH {
             return false;
         }
         self.items[self.len] = Some(item);
@@ -635,6 +644,19 @@ impl ScrubQueue {
         Self {
             slots: [const { None }; sizes::RENDER_SLOTS],
         }
+    }
+
+    /// Allocates an empty [`ScrubQueue`] directly on the heap to keep `Shared` setup off the
+    /// probe stack.
+    #[allow(dead_code)]
+    #[inline(never)]
+    pub(crate) fn new_boxed() -> Result<KBox<Self>> {
+        Ok(KBox::init(
+            init!(Self {
+                slots: [const { None }; sizes::RENDER_SLOTS],
+            }),
+            GFP_KERNEL,
+        )?)
     }
 
     /// Moves every staged scrub from `batch` into the queue. Returns `true` if any was queued.
@@ -698,6 +720,7 @@ pub(crate) struct Slots {
     render: KBox<RenderOwners>,
 }
 impl Slots {
+    #[inline(never)]
     pub(crate) fn new() -> Result<Self> {
         Ok(Self {
             cursor: 0,
@@ -706,8 +729,8 @@ impl Slots {
             scrub_gen: 0,
             stats: SlotStats::default(),
             scrub: Arc::new(ScrubState::new(), GFP_KERNEL)?,
-            compute: KBox::new(
-                ComputeOwners {
+            compute: KBox::init(
+                init!(ComputeOwners {
                     lifetime: Lifetime::new(true),
                     owner: [const { None }; sizes::COMPUTE_UNITS],
                     pending_retarget: [None; sizes::COMPUTE_UNITS],
@@ -716,11 +739,11 @@ impl Slots {
                     pending_arena: [const { None }; sizes::COMPUTE_UNITS],
                     scrub_full: [true; sizes::COMPUTE_UNITS],
                     last_full: [true; sizes::COMPUTE_UNITS],
-                },
+                }),
                 GFP_KERNEL,
             )?,
-            render: KBox::new(
-                RenderOwners {
+            render: KBox::init(
+                init!(RenderOwners {
                     lifetime: Lifetime::new(true),
                     owner: [const { None }; sizes::RENDER_SLOTS],
                     pending_retarget: [None; sizes::RENDER_SLOTS],
@@ -731,7 +754,7 @@ impl Slots {
                     last_full: [true; sizes::RENDER_SLOTS],
                     staged: ScrubBatch::new(),
                     scrub_pending: false,
-                },
+                }),
                 GFP_KERNEL,
             )?,
         })
@@ -876,6 +899,10 @@ impl Slots {
             let Some(arena) = self.render.arena[k].clone() else {
                 continue;
             };
+            if self.render.staged.is_full() {
+                self.render.scrub_pending = true;
+                break;
+            }
             self.scrub.scrubbing.fetch_or(bit, Ordering::SeqCst);
             let generation = self.scrub.generation.load(Ordering::Acquire);
             let item = PendingScrub {
@@ -886,6 +913,7 @@ impl Slots {
                 done: false,
             };
             if !self.render.staged.push(item) {
+                self.render.scrub_pending = true;
                 break;
             }
         }

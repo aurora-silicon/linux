@@ -278,6 +278,7 @@ pub(crate) struct Graphs {
     pub(crate) render: RenderGraph,
 }
 impl Graphs {
+    #[inline(never)]
     pub(crate) fn new(dev: &AsahiDrmDevice, o: &mut Objects) -> Result<Self> {
         // Host polls sched_ctx from WC during register_context(); keep uncached and share one
         // scheduling context across all compute pipes and the render graph.
@@ -295,6 +296,7 @@ impl Graphs {
     }
 }
 impl Firmware {
+    #[inline(never)]
     pub(crate) fn init_graphs(&mut self) -> Result {
         for ch in [Channel::Ta, Channel::Fs, Channel::Compute] {
             if self.channels.read(ch)? != 0 || self.channels.write_cell(ch)? != 0 {
