@@ -1502,7 +1502,8 @@ static void ave_26b123_layout(struct kunit *test)
 /*
  * The M2 with the 27.2 stub: the reserved segment sizes select the 27.2
  * build's own start (device 12, handshake type 12) and the 26B123 layout;
- * the 13.5 build keeps the M2's 6070 start, and other sizes stay refused.
+ * the 13.5 build keeps the M2's 6070 start. Other sizes fall back to
+ * ave_t8112, whose size check in ave_fw_probe() then refuses them.
  */
 static void ave_t8112_26b123_build(struct kunit *test)
 {
@@ -1516,6 +1517,12 @@ static void ave_t8112_26b123_build(struct kunit *test)
 			    &ave_t8112);
 	KUNIT_EXPECT_PTR_EQ(test, ave_fw_select_build(&ave_t8112, 0x134000, 0x128000),
 			    &ave_t8112);
+	/* The near misses are refused: no variant of the chain pins them. */
+	KUNIT_EXPECT_FALSE(test, ave_fw_sizes_match(&ave_t8112, 0x11c000, 0x12c000));
+	KUNIT_EXPECT_FALSE(test, ave_fw_sizes_match(&ave_t8112, 0x134000, 0x128000));
+	KUNIT_EXPECT_FALSE(test, ave_fw_sizes_match(n, 0x11c000, 0x12c000));
+	KUNIT_EXPECT_TRUE(test, ave_fw_sizes_match(&ave_t8112, 0xd0000, 0x128000));
+	KUNIT_EXPECT_TRUE(test, ave_fw_sizes_match(n, 0x11c000, 0x128000));
 	KUNIT_EXPECT_NULL(test, n->next_build);
 	KUNIT_EXPECT_TRUE(test, n->boot_qualified);
 	KUNIT_EXPECT_PTR_EQ(test, n->regs, ave_t8112.regs);
