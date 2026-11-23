@@ -37,9 +37,10 @@
 	/*
 	 * Pin 112 takes an SError when read, so only the pins a node names are
 	 * exposed: 80/81 (PCIe ports 0 and 1's PERST#), 106/107 (amp fault, amp
-	 * shutdown), 134/139 (jack codec interrupt, reset) and 136/137 (speaker ID).
+	 * shutdown), 134/139 (jack codec interrupt, reset), 136/137 (speaker ID)
+	 * and 138 (Touch ID data ready).
 	 */
-	gpio-reserved-ranges = <0 80>, <82 24>, <108 26>, <135 1>, <138 1>, <140 81>;
+	gpio-reserved-ranges = <0 80>, <82 24>, <108 26>, <135 1>, <140 81>;
 };
 
 /*
@@ -912,4 +913,40 @@
 
 &avd {
 	status = "okay";
+};
+
+/*
+ * Touch ID (ADT spi2/mesa): the Mesa sensor on spi2 at 8 MHz, chip select 0,
+ * powered by NUB GPIO 21 (function-mesa_pwr), data ready on AP GPIO 138, as
+ * on the J714s. spi2 runs from the 24 MHz reference (ADT clock-ids 451).
+ */
+&ps_nub_gpio {
+	status = "okay";
+};
+
+&nub_gpio0 {
+	status = "okay";
+};
+
+&ps_spi2 {
+	status = "okay";
+};
+
+&spi2 {
+	clocks = <&clkref>;
+	status = "okay";
+
+	mesa: fingerprint@0 {
+		compatible = "apple,mesa-fingerprint";
+		reg = <0>;
+		spi-max-frequency = <8000000>;
+		spi-cpol;
+		spi-cs-setup-delay-ns = <20>;
+		spi-cs-hold-delay-ns = <20>;
+		enable-gpios = <&nub_gpio0 21 GPIO_ACTIVE_HIGH>;
+		interrupt-parent = <&pinctrl_ap>;
+		interrupts = <138 IRQ_TYPE_EDGE_RISING>;
+		/* Per-device factory data from this Mac's own iBoot system container */
+		firmware-name = "apple/mesacal-k116s.bin", "apple/msrk-k116s.bin";
+	};
 };
