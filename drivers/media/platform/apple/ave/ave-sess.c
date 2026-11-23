@@ -812,9 +812,10 @@ int ave_sess_input(struct ave_ctx *ctx, unsigned int slot, struct vb2_v4l2_buffe
 	 * Buffers the driver allocated (MMAP) are large enough for the
 	 * encoder's layout: spread the lines out in place, last line first,
 	 * so no extra DMA space is needed. Imported buffers may be shared
-	 * with other users and get a copy instead.
+	 * with other users and get a copy instead, and so does a buffer whose
+	 * data_offset leaves the picture off the encoder's 64-byte alignment.
 	 */
-	if (vb->memory == VB2_MEMORY_MMAP &&
+	if (vb->memory == VB2_MEMORY_MMAP && IS_ALIGNED(*input, 64) &&
 	    vb2_plane_size(vb, 0) >= (size_t)off + frame) {
 		to = (u8 *)from;
 		for (u32 y = rows; y-- > 0;)

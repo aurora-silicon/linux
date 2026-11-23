@@ -109,6 +109,13 @@ static int submit(struct vb2_v4l2_buffer *b, unsigned int off, unsigned int used
 			pl->length, (unsigned long long)input, encoder_extent());
 		exit(1);
 	}
+	if (!IS_ALIGNED(input, 64)) {
+		fprintf(stderr,
+			"FAIL: data_offset %u payload %u (%s, %u byte buffer): encoder input %#llx is not 64-byte aligned\n",
+			off, used, b->vb2_buf.memory == VB2_MEMORY_MMAP ? "MMAP" : "DMABUF",
+			pl->length, (unsigned long long)input);
+		exit(1);
+	}
 	encoder_read(input);
 	return 0;
 }
@@ -173,6 +180,34 @@ static void packed(enum vb2_memory memory, unsigned int off, bool in_place)
 	put(b);
 }
 
+/*
+ * Packed lines at every byte data_offset of a buffer with room to spare:
+ * each picture is accepted at an aligned address (submit() checks) and
+ * its lines arrive there unchanged, in place or in the copy.
+ */
+static void packed_any_offset(enum vb2_memory memory)
+{
+	const struct ave_params *p = &sess.p;
+	u32 rows = p->height + DIV_ROUND_UP(p->height, 2), line = p->width;
+	struct vb2_v4l2_buffer *b = buffer(memory, sizeimage() + 2 * 64);
+
+	for (unsigned int off = 0; off < 2 * 64; off++) {
+		u8 *from = (u8 *)b->vb2_buf.planes[0].mem + off;
+		const u8 *to;
+
+		for (u32 y = 0; y < rows; y++)
+			for (u32 x = 0; x < line; x++)
+				from[y * line + x] = (u8)(y * 7 + x + off);
+		assert(!submit(b, off, off + rows * line));
+		to = sess.slot[0].bounce.cpu ? sess.slot[0].bounce.cpu : from;
+		for (u32 y = 0; y < rows; y++)
+			for (u32 x = 0; x < line; x++)
+				assert(to[(size_t)y * p->stride + x] == (u8)(y * 7 + x + off));
+		release_bounce();
+	}
+	put(b);
+}
+
 int main(void)
 {
 	static const u32 sizes[][2] = { { 128, 64 }, { 100, 60 }, { 320, 180 } };
@@ -190,7 +225,9 @@ int main(void)
 	packed(VB2_MEMORY_MMAP, 64, false);
 	packed(VB2_MEMORY_DMABUF, 0, false);
 	packed(VB2_MEMORY_DMABUF, 128, false);
+	packed_any_offset(VB2_MEMORY_MMAP);
+	packed_any_offset(VB2_MEMORY_DMABUF);
 	assert(!dma_allocs && jiffies);
-	puts("ok: OUTPUT data_offset sweep (MMAP, DMABUF), offset with room, packed-stride repack");
+	puts("ok: OUTPUT data_offset sweep (MMAP, DMABUF), offset with room, packed repack at any offset");
 	return 0;
 }
