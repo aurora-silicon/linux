@@ -1681,22 +1681,22 @@ impl InitData {
     /// (16.16); without one, its own controller raises the state for work that queues up behind
     /// the running command and otherwise lets it fall to the base state.
     ///
-    /// M5 publishes none while work streams, except while a host thread waits for it (`waited`):
-    /// then the full effort, so a submit-and-wait loop runs at the top state.
-    ///
-    /// The other G17 SoCs publish the full effort while a client has kept the GPU running
+    /// M5 publishes none while paced work streams, and publishes the full effort while either a
+    /// host thread waits for submitted work (`waited`) or a client has kept the GPU running
     /// without going idle for longer than the effort hold (`bound`, [`super::power::BusyRuns`]):
-    /// a submit-and-wait loop queues nothing behind its command, so the firmware alone keeps it
-    /// at the bottom state however busy the GPU is. Other work streams with the lowest effort
-    /// that keeps it above the base performance state ([`active_effort`]), and leaves the rest
-    /// to the firmware: work that the firmware let fall to the base state stalled the GPU under
-    /// concurrent load (a firmware recovery with no fault), and a full effort on every
+    /// pipelined compute and render loops that keep the GPU continuously busy without blocking on
+    /// an unsignalled fence would otherwise fall to the base performance state.
+    ///
+    /// The other G17 SoCs publish the full effort while `bound`, and stream other work with the
+    /// lowest effort that keeps it above the base performance state ([`active_effort`]), leaving
+    /// the rest to the firmware: work that the firmware let fall to the base state stalled the GPU
+    /// under concurrent load (a firmware recovery with no fault), and a full effort on every
     /// submission held the top state whatever the load. A waiter doesn't tell paced work from a
     /// submit-and-wait loop, because paced work has one too (the compositor, or the next frame's
     /// fence).
     pub(super) fn submission_effort(&self, effort: u32, waited: bool, bound: bool) -> u32 {
         if self.m5 {
-            return if waited { effort } else { 0 };
+            return if waited || bound { effort } else { 0 };
         }
         if bound { effort } else { effort.min(self.active_effort) }
     }
