@@ -784,6 +784,7 @@ static void macaudio_vlimit_update(struct macaudio_snd_data *ma)
 {
 	int i;
 	bool unlock = true;
+	bool quiesced;
 	struct snd_kcontrol *kctl;
 	const char *reason;
 
@@ -801,6 +802,13 @@ static void macaudio_vlimit_update(struct macaudio_snd_data *ma)
 	/* No protection daemon can hold these speakers: nothing to unlock */
 	if (macaudio_spk_lease_only(ma->cfg))
 		return;
+
+	/*
+	 * macaudio_pm_notify() writes pm_quiesced without volume_lock_mutex:
+	 * read it once, so the lock reason, the lost-lease flag and the kept
+	 * volumes below all see the same value.
+	 */
+	quiesced = READ_ONCE(ma->pm_quiesced);
 
 	/* Check that someone is holding the main lock */
 	if (!ma->speaker_lock_owner) {
@@ -821,7 +829,7 @@ static void macaudio_vlimit_update(struct macaudio_snd_data *ma)
 	 * Lock the volumes before the freeze instead of when the frozen daemon's
 	 * lease runs out.
 	 */
-	if (ma->pm_quiesced) {
+	if (quiesced) {
 		reason = "System suspend";
 		unlock = false;
 	}
@@ -846,7 +854,7 @@ static void macaudio_vlimit_update(struct macaudio_snd_data *ma)
 		} else  {
 			dev_info(ma->card.dev, "Speaker volumes locked: %s\n", reason);
 			/* The system-sleep lock is the kernel's own, not a lease the daemon lost */
-			if (!ma->pm_quiesced)
+			if (!quiesced)
 				ma->speaker_volume_was_locked = true;
 		}
 
@@ -858,7 +866,7 @@ static void macaudio_vlimit_update(struct macaudio_snd_data *ma)
 		 * them only there left nothing to set again at the unlock, and
 		 * the volumes stayed at the lock's ceiling for the whole boot.
 		 */
-		if (!unlock && ma->pm_quiesced) {
+		if (!unlock && quiesced) {
 			macaudio_pm_volumes_save(ma);
 			ma->pm_lock_taken = true;
 		}
@@ -3935,7 +3943,7 @@ static int macaudio_slk_put(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_v
 	}
 
 	/* Between suspend-prepare and the freeze: the lease starts again after the resume */
-	if (ma->pm_quiesced) {
+	if (READ_ONCE(ma->pm_quiesced)) {
 		mutex_unlock(&ma->volume_lock_mutex);
 		return 0;
 	}
