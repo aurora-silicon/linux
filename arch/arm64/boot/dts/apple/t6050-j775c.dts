@@ -34,3 +34,8 @@
 
 #define T6050_J775C
 #include "t6050-peripherals.dtsi"
+
+/* The CPU cluster held up while ANE requests run */
+&ane0 {
+	performance-domains = <&cpufreq_pc>;
+};
