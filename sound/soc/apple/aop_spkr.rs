@@ -1679,7 +1679,13 @@ pub(crate) struct SpeakerComponent {
 
 impl SpeakerComponent {
     pub(crate) fn register(aop: Arc<SndSocAopData>) -> Result<Self> {
-        let spkr = Service::new(aop.clone(), AUDIO_DEV_SPKR, "spkr", PWRD_OUTPUT, true)?;
+        // A Mac whose speaker stream has no sense channel (the Mac mini: its ADT
+        // audio-speaker stream lists no RX channel) runs the speakers without the ring.
+        let has_sense = aop
+            .fwnode
+            .property_match_string(c_str!("dma-names"), c_str!("sense"))
+            .is_ok();
+        let spkr = Service::new(aop.clone(), AUDIO_DEV_SPKR, "spkr", PWRD_OUTPUT, has_sense)?;
         let cout = Service::new(aop.clone(), AUDIO_DEV_COUT, "cout", PWRD_OUTPUT, false)?;
         let cin = Service::new(aop.clone(), AUDIO_DEV_CIN, "cin", PWRD_INPUT, false)?;
         let services = [&spkr, &cout, &cin];
