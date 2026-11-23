@@ -790,10 +790,15 @@ static int avd_probe(struct platform_device *pdev)
 	 * size their contexts before the first decode would power it up.
 	 */
 	ret = pm_runtime_resume_and_get(avd->dev);
-	if (ret < 0)
+	if (ret < 0) {
+		if (avd->variant->quirks & AVD_QUIRK_KOPSIA) {
+			dev_err_probe(avd->dev, ret, "Kopsia probe boot failed\n");
+			goto err_disable_runtime_pm;
+		}
 		dev_warn(avd->dev, "firmware probe boot failed: %d\n", ret);
-	else
+	} else {
 		pm_runtime_put_autosuspend(avd->dev);
+	}
 
 	ret = avd_v4l2_init(avd);
 	if (ret)
