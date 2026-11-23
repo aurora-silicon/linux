@@ -645,6 +645,7 @@ static void apple_smc_init_state(struct apple_smc *smc)
 	spin_lock_init(&smc->lock);
 	init_completion(&smc->init_done);
 	init_completion(&smc->cmd_done);
+	BLOCKING_INIT_NOTIFIER_HEAD(&smc->event_handlers);
 	smc->boot_stage = APPLE_SMC_BOOTING;
 }
 
@@ -712,7 +713,6 @@ static int apple_smc_probe(struct platform_device *pdev)
 	}
 
 	dev_set_drvdata(&pdev->dev, smc);
-	BLOCKING_INIT_NOTIFIER_HEAD(&smc->event_handlers);
 
 	ret = apple_smc_read(smc, SMC_KEY(#KEY), &count, sizeof(count));
 	if (ret >= 0 && ret != sizeof(count)) {
