@@ -45,6 +45,8 @@ typedef uint32_t u32;
 #define GFP_KERNEL 0
 #define BUFFER_SIZE 256
 #define DATA_TX_SLOTS 8
+#define CEN_HOST_EVENTS_LEGACY 85
+#define CEN_HOST_EVENTS_FULL 91
 #define TX_BUFFER 2048
 #define TR_BASE 0
 #define dma_rmb() ((void)0)
@@ -72,6 +74,7 @@ struct centauri_t6050_wifi {
     bool command_failed, stopping, connect_abort, disconnect_pending, connecting, connected;
     bool reply_valid, pm_prepared, pm_wowlan_armed;
     bool data_tx_busy[DATA_TX_SLOTS];
+    bool host_events_fallback_logged;
     u16 command_head, sequence, reply_capture, reply_sequence, reply_status;
     u32 reply_command;
     u8 *reply_buffer;
@@ -79,8 +82,12 @@ struct centauri_t6050_wifi {
     struct centauri_wifi_disconnect_receipt pm_disconnect;
 };
 static const u16 ring_size[5] = {0, 64};
-static unsigned int doorbells, drains, notifications, consumer, tx_drain_rounds;
-static u16 firmware_status;
+static unsigned int doorbells, drains, notifications, consumer, tx_drain_rounds, info_logs;
+static void dev_info(const void *dev, const char *fmt, ...)
+{ (void)dev; (void)fmt; info_logs++; }
+static u16 firmware_status, last_cmd6_tlv280_len, mock_fw_transient_status;
+static u32 mock_reply_command = 131073;
+static u8 mock_fw_max_events, last_cmd6_tlv280_count;
 static bool async_reply, async_event, wrong_reply;
 static bool *submission_probe;
 static bool private_access_forbidden;
@@ -101,6 +108,25 @@ static void index_write(struct centauri_t6050_wifi *wifi, int array, int index, 
 static void put_unaligned_le16(u16 value, void *p) { memcpy(p, &value, 2); }
 static void put_unaligned_le32(u32 value, void *p) { memcpy(p, &value, 4); }
 static void put_unaligned_le64(uint64_t value, void *p) { memcpy(p, &value, 8); }
+static void append_tlv(u8 *buffer, size_t *size, u16 tag, const void *value, size_t len)
+{
+    put_unaligned_le16(tag, buffer + *size);
+    put_unaligned_le16(len, buffer + *size + 2);
+    memcpy(buffer + *size + 4, value, len);
+    *size += 4 + len;
+    if (tag == 280) {
+        last_cmd6_tlv280_len = len;
+        last_cmd6_tlv280_count = len ? ((const u8 *)value)[0] : 0;
+    }
+}
+static int command_reply(struct centauri_t6050_wifi *wifi, u32 id,
+                         const void *payload, size_t size, void *reply,
+                         size_t *reply_size, bool *submitted);
+static int command(struct centauri_t6050_wifi *wifi, u32 id, const void *payload,
+                   size_t size)
+{
+    return command_reply(wifi, id, payload, size, NULL, NULL, NULL);
+}
 static void command_fault(struct centauri_t6050_wifi *wifi) { wifi->command_failed = true; }
 static void drain(struct centauri_t6050_wifi *wifi)
 {
@@ -116,8 +142,17 @@ static void drain(struct centauri_t6050_wifi *wifi)
     if (!wifi->reply_valid) {
         wifi->reply_valid = true;
         wifi->reply_sequence = wifi->reply_capture + wrong_reply;
-        wifi->reply_command = 131073 | (async_reply ? BIT(30) : 0);
-        wifi->reply_status = firmware_status;
+        wifi->reply_command = mock_reply_command | (async_reply ? BIT(30) : 0);
+        if (mock_reply_command == 6 && mock_fw_transient_status) {
+            wifi->reply_status = mock_fw_transient_status;
+            mock_fw_transient_status = 0;
+        } else if (mock_reply_command == 6 && mock_fw_max_events &&
+                   (last_cmd6_tlv280_len > 1 + mock_fw_max_events ||
+                    last_cmd6_tlv280_count > mock_fw_max_events)) {
+            wifi->reply_status = 1;
+        } else {
+            wifi->reply_status = firmware_status;
+        }
     } else if (async_event) {
         wifi->disconnect_pending = false;
     }
@@ -150,8 +185,10 @@ static void reset(void)
     wifi.a.bar = bar;
     wifi.connected = true;
     wiphy.wifi = &wifi;
-    doorbells = drains = notifications = consumer = tx_drain_rounds = 0;
-    firmware_status = 0;
+    doorbells = drains = notifications = consumer = tx_drain_rounds = info_logs = 0;
+    firmware_status = last_cmd6_tlv280_len = mock_fw_transient_status = 0;
+    mock_reply_command = 131073;
+    mock_fw_max_events = last_cmd6_tlv280_count = 0;
     async_reply = async_event = wrong_reply = false;
     transport_mode = REPLY;
     jiffies = 0;
@@ -331,6 +368,57 @@ int main(void)
     assert(disconnect() == 0);
     assert(wifi.pm_disconnect.stopping_skip && !doorbells && !drains);
 
+    /*
+     * Sleep sends legacy 86-byte TLV 280 without touching fallback state;
+     * legacy firmware refuses 91 events on wake (-EREMOTEIO), falls back to 85,
+     * and logs the fallback once via dev_info.
+     */
+    prepare();
+    mock_reply_command = 6;
+    mock_fw_max_events = 85;
+    mutex_lock(&wifi.lock);
+    assert(alpha_host_power(&wifi, true) == 0);
+    assert(!info_logs && last_cmd6_tlv280_len == 86 &&
+           last_cmd6_tlv280_count == 9 && doorbells == 1);
+    assert(alpha_host_power(&wifi, false) == 0);
+    assert(info_logs == 1 && wifi.host_events_fallback_logged &&
+           last_cmd6_tlv280_len == 86 && last_cmd6_tlv280_count == 85 &&
+           doorbells == 3);
+    /* Subsequent wakes fall back without repeating the one-shot dev_info. */
+    assert(alpha_host_power(&wifi, true) == 0);
+    assert(last_cmd6_tlv280_len == 86 && last_cmd6_tlv280_count == 9 && doorbells == 4);
+    assert(alpha_host_power(&wifi, false) == 0);
+    assert(info_logs == 1 && last_cmd6_tlv280_len == 86 &&
+           last_cmd6_tlv280_count == 85 && doorbells == 6);
+    mutex_unlock(&wifi.lock);
+
+    /* Transient unrelated -EREMOTEIO on wake does not permanently pin 85 events. */
+    prepare();
+    mock_reply_command = 6;
+    mock_fw_max_events = 91;
+    mock_fw_transient_status = 777;
+    mutex_lock(&wifi.lock);
+    assert(alpha_host_power(&wifi, false) == 0);
+    assert(info_logs == 1 && last_cmd6_tlv280_len == 86 &&
+           last_cmd6_tlv280_count == 85 && doorbells == 2);
+    assert(alpha_host_power(&wifi, false) == 0);
+    assert(info_logs == 1 && last_cmd6_tlv280_len == 92 &&
+           last_cmd6_tlv280_count == 91 && doorbells == 3);
+    mutex_unlock(&wifi.lock);
+
+    /* Full-mask firmware keeps 86-byte sleep TLV and accepts 91 events on wake. */
+    prepare();
+    mock_reply_command = 6;
+    mock_fw_max_events = 91;
+    mutex_lock(&wifi.lock);
+    assert(alpha_host_power(&wifi, true) == 0);
+    assert(!info_logs && last_cmd6_tlv280_len == 86 &&
+           last_cmd6_tlv280_count == 9 && doorbells == 1);
+    assert(alpha_host_power(&wifi, false) == 0);
+    assert(!info_logs && last_cmd6_tlv280_len == 92 &&
+           last_cmd6_tlv280_count == 91 && doorbells == 2);
+    mutex_unlock(&wifi.lock);
+
     puts("PASS: production disconnect/transport/PM callbacks and first-error retention");
     return 0;
 }
@@ -355,7 +443,7 @@ def main():
              "centauri_t6050_wifi_pm_prepare", "centauri_t6050_wifi_pm_error",
              "centauri_t6050_wifi_pm_disconnected", "centauri_t6050_wifi_wowlan_armed",
              "centauri_t6050_wifi_mark_failed", "centauri_t6050_wifi_pm_complete",
-             "wifi_suspend"]
+             "alpha_host_power_send", "alpha_host_power", "wifi_suspend"]
     has_resume = bool(re.search(r"^static int wifi_resume\(", source, re.M))
     if has_resume:
         names.append("wifi_resume")
@@ -409,12 +497,20 @@ static int call_registered_resume(struct wiphy *wiphy)
         ("stale-reply", "receipt.replied = receipt.submitted && (!ret || ret == -EREMOTEIO);",
          "receipt.replied = true;"),
         ("wowlan-ignores-trigger", "wowlan->any && ", ""),
+        ("sleep-uses-full-len",
+         "return alpha_host_power_send(wifi, true, CEN_HOST_EVENTS_LEGACY);",
+         "return alpha_host_power_send(wifi, true, CEN_HOST_EVENTS_FULL);"),
+        ("silent-fallback-log",
+         "if (!ret && !wifi->host_events_fallback_logged)",
+         "if (false && !ret && !wifi->host_events_fallback_logged)"),
     ]
     failures = {
         'lost-suspend-error': 'centauri_t6050_wifi_pm_error(&control) == expected',
         'overwritten-first-error': 'wifi.pm_disconnect.status == 777',
         'stale-reply': '!wifi.pm_disconnect.submitted && !wifi.pm_disconnect.replied',
         'wowlan-ignores-trigger': 'call_registered_suspend(&wiphy, &wowlan) == 1',
+        'sleep-uses-full-len': 'alpha_host_power(&wifi, true) == 0',
+        'silent-fallback-log': 'info_logs == 1',
     }
     for name, before, after in negative_controls if args.negative_controls else []:
         if before not in production:
