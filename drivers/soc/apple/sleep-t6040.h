@@ -42,7 +42,7 @@
 #define PS_APCIE_GP_CLKGATED	0x00000244
 
 /*
- * cluster-ctl (ADT pmgr reg[0] + cluster-ctl-offset 0x20000 = 0x502820000), one word per
+ * cluster-ctl (PMGR + 0x20000 = 0x502820000), one word per
  * complex, measured on the J616s: the CPU complexes E +0x0, P0 +0x4 and P1 +0x8, then the
  * internal and the external display's complexes +0xc and +0x10. The low nibble 0 powers a
  * complex down and 0xf powers it up; BIT4 reads set until a power-down has finished.
@@ -56,7 +56,7 @@
 #define T6040_CLUSTER_TIMEOUT_US	50000
 
 /*
- * SOC-PwrGate (ADT pmgr reg[0x26] = 0x50282c000): the retention bits at +0x0/+0x40 and
+ * SOC-PwrGate (0x50282c000): the retention bits at +0x0/+0x40 and
  * the three CPM voters at +0x100/+0x108/+0x110, each BIT31. The wake restore re-asserts
  * them. The entry leaves them alone: the voters already read 0x80000000 there.
  */
@@ -68,7 +68,7 @@
 #define PWRGATE_CPM_2		0x110
 
 /*
- * SOC-East (ADT pmgr reg[2] = 0x502280000). The SEP/retention word at +0xc00: the wake
+ * SOC-East (0x502280000). The SEP/retention word at +0xc00: the wake
  * clears PS_DEV_DISABLE and then polls PS_BUSY clear before going on. Also holds several
  * of the axi2af domains' power words.
  */
@@ -103,7 +103,7 @@
 /*
  * The AGX residency gate at the top of the PMGR quiesce: unless
  * MiniPMGR +0x75010 has both [19:18] set (it read 0 on the J616s), the GPU's AFR power
- * word (pmgr_gfx 0x288e80000 + 0x100, ADT power-device AFR) is lowered when its
+ * word (pmgr_gfx 0x288e80000 + 0x100, power device AFR) is lowered when its
  * target is not 0: [19:16] := 4 and polled, [7:4] polled to 4, then the word := 0
  * and [7:4] polled to 0.
  */
@@ -163,7 +163,7 @@ static const struct {
 #define SPMI_NOTIFY_ENABLE_SLEEP	0x2000001
 
 /*
- * MasterMini, the block of the always-on PMGR (ADT pmgr reg[0x37] = 0x508900000).
+ * MasterMini, the block of the always-on PMGR (0x508900000).
  * The S2R timer at +0x4000 (physical 0x508904000) is the commit: writing 1 arms
  * the SoC sleep engine. Measured on the J616s: exactly this write.
  */
@@ -220,7 +220,7 @@ enum {
 };
 
 /*
- * The AON watchdog's WD2, the sleep safety net: ADT wdt reg[0] = 0x50836c000, with the
+ * The AON watchdog's WD2, the sleep safety net: 0x50836c000, with the
  * T8140's registers. Linux's own watchdog driver runs WD1 (+0x10..+0x1c), not this one.
  * ALARM is 32 bits at 24 MHz.
  */
@@ -383,7 +383,7 @@ static bool t6040_sleep_ps_on(u32 val, bool cpu)
 
 /*
  * CPU parking power ops. MPIDR Aff1 is the cluster (E=0, P0=1,
- * P1=2), Aff0 the core. The start and stop bit is the core's bit in the ADT
+ * P1=2), Aff0 the core. The start and stop bit is the core's bit in the
  * function-enable_core masks, which is its cpu-id: the E cluster has four
  * slots (bits 0-3), each P cluster six (P0 bits 4-9, P1 bits 10-15; one slot
  * of each is harvested on J616s). Four-core banks (4 * cluster + core) would
@@ -413,7 +413,7 @@ static u32 t6040_cpu_start_bit(u64 mpidr)
 }
 
 /*
- * Each core's CoreSight external debug block (ADT cpuN coresight-reg: 0x210010000 +
+ * Each core's CoreSight external debug block (0x210010000 +
  * cluster * 0x1000000 + core * 0x100000). Every CPU, boot and secondary,
  * unlocks it (EDLAR) and writes EDPRCR := 0 right before its deep WFI, so that
  * the debug logic does not prevent power gating. With
@@ -598,7 +598,7 @@ static void t6040_sio_ps_restore(struct t6040_sleep *s)
 
 /*
  * The 9 AOP-global wake-source masks armed before an S2R
- * (the values are decoded from the ADT's ap-wake-sources).
+ * (the platform's AP wake sources).
  * valid & ~enabled per word.
  */
 static const u32 t6040_wake_mask[AOP_WAKE_WORDS] = {
@@ -701,7 +701,7 @@ static void t6040_clk_quiesce(struct t6040_sleep *s)
 
 /*
  * Wait for every other core's power word (SOC + 8 * its cpu-start bit index,
- * ECPU_0.. PCPU1_5 in the ADT) to read ACTUAL 0, each for at most 10 ms.
+ * ECPU_0.. PCPU1_5) to read ACTUAL 0, each for at most 10 ms.
  */
 static void t6040_secondaries_off(struct t6040_sleep *s)
 {
@@ -1377,11 +1377,11 @@ void t6040_resume_stub(void);
 
 /*
  * The four ATC complexes' power words in SOC (soc_ps, 0x502800000), deepest first: cio_usb,
- * cio_pcie, cio, pcie, common (ADT: ATCn_CIO_USB .. ATCn_COMMON). The quiesce gate wants
+ * cio_pcie, cio, pcie, common (ATCn_CIO_USB .. ATCn_COMMON). The quiesce gate wants
  * them off; their drivers don't lower atcN_common.
  *
  * Their common_dp, usb, phymxwrap and usb_aon words are MiniPMGR words (0x508300000 + 0xa0..,
- * ADT ATCn_COMMON_DP/USB/PHYMXWRAP/USB_AON) and not in this table: the same offsets in SOC
+ * ATCn_COMMON_DP/USB/PHYMXWRAP/USB_AON) and not in this table: the same offsets in SOC
  * are AIC, PMC, PMS_FPWM0-4 and FAB0_SOC.
  */
 static const u16 t6040_atc_words[4][5] = {
@@ -1834,7 +1834,7 @@ static void t6040_disp_back(struct t6040_sleep *s)
 }
 
 /*
- * The display power words the ADT wants off before a sleep (apple,check-ps-b4-sleep), lowered
+ * The display power words that must be off before a sleep (apple,check-ps-b4-sleep), lowered
  * here: after the device suspend, interrupts off, one CPU up, so no driver, interrupt handler
  * or DART touches the pipes any more. The DCPs only stop their firmware: lowering the domains
  * from their suspend makes the SoC panic. Each group from its last sub-block up to, and not
@@ -1947,7 +1947,7 @@ static void __iomem *t6040_sleep_map(struct device *dev, const char *name)
 
 /*
  * ANS's storage-apcie windows + PLL/lane tunables, from the apple,apcie node
- * the boot object publishes from the ADT. Our static tree has none
+ * the boot object publishes. Our static tree has none
  * of these, so until aura fills the node @valid stays false and a real sleep
  * with ANS stopped refuses (t6040_sleep_refuse). The reg-names and tunable
  * property names match the T8140's apple,apcie shape exactly, so the same
