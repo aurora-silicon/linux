@@ -166,11 +166,29 @@ static void avd_hevc_no_tiles_test(struct kunit *test)
 			0);
 }
 
+/* The 4x4-CTB test picture has CTB addresses 0 to 15. */
+static void avd_hevc_slices_test(struct kunit *test)
+{
+	struct v4l2_ctrl_hevc_sps sps;
+	struct v4l2_ctrl_hevc_slice_params sl[2] = {};
+
+	avd_hevc_test_sps(&sps);
+	KUNIT_EXPECT_EQ(test, avd_hevc_check_slices(&sps, sl, 2), 0);
+	sl[1].slice_segment_addr = 15;
+	KUNIT_EXPECT_EQ(test, avd_hevc_check_slices(&sps, sl, 2), 0);
+	sl[1].slice_segment_addr = 16;
+	KUNIT_EXPECT_EQ(test, avd_hevc_check_slices(&sps, sl, 2), -EINVAL);
+	sl[1].slice_segment_addr = U32_MAX;
+	KUNIT_EXPECT_EQ(test, avd_hevc_check_slices(&sps, sl, 2), -EINVAL);
+	KUNIT_EXPECT_EQ(test, avd_hevc_check_slices(&sps, sl, 1), 0);
+}
+
 static struct kunit_case avd_hevc_test_cases[] = {
 	KUNIT_CASE_PARAM(avd_hevc_geometry_test, avd_hevc_geometry_gen_params),
 	KUNIT_CASE_PARAM(avd_hevc_tiles_test, avd_hevc_tiles_gen_params),
 	KUNIT_CASE(avd_hevc_tiles_array_test),
 	KUNIT_CASE(avd_hevc_no_tiles_test),
+	KUNIT_CASE(avd_hevc_slices_test),
 	{}
 };
 

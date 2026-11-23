@@ -958,6 +958,12 @@ static int stream_slices(struct avd_ctx *ctx, struct avd_hevc_run *run)
 
 			row = pos / num_cols;
 			col = pos % num_cols;
+			/* Each segment starts a tile: no more than the PPS has. */
+			if (tiles_enabled && row > pps->num_tile_rows_minus1) {
+				dev_err_ratelimited(ctx->dev->dev,
+						    "HEVC: more tile segments than tiles\n");
+				return -EINVAL;
+			}
 
 			/*
 			 * not a fan of this, in JCT-VC-HEVC_V1 only TILES_B_Cisco_1
@@ -1120,6 +1126,29 @@ VISIBLE_IF_KUNIT int avd_hevc_check_tiles(const struct v4l2_ctrl_hevc_sps *sps,
 	return 0;
 }
 EXPORT_SYMBOL_IF_KUNIT(avd_hevc_check_tiles);
+
+/*
+ * stream_slices() indexes the per-CTB tables with each slice's
+ * slice_segment_addr, which the V4L2 core cannot check against the picture.
+ * It must name a CTB of the picture (H.265 7.4.7.1).
+ * avd_hevc_check_sps_geometry() must have accepted the SPS.
+ */
+VISIBLE_IF_KUNIT int
+avd_hevc_check_slices(const struct v4l2_ctrl_hevc_sps *sps,
+		      const struct v4l2_ctrl_hevc_slice_params *sl,
+		      int num_slices)
+{
+	u32 width, height;
+	int i;
+
+	avd_hevc_pic_in_ctbs(sps, &width, &height);
+	for (i = 0; i < num_slices; i++)
+		if (sl[i].slice_segment_addr >= width * height)
+			return -EINVAL;
+
+	return 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(avd_hevc_check_slices);
 
 static int avd_hevc_validate_sps(struct avd_ctx *ctx,
 				 const struct v4l2_ctrl_hevc_sps *sps)
@@ -1369,7 +1398,8 @@ static int avd_hevc_compute_tiles(struct avd_ctx *ctx, struct avd_hevc_run *run)
 
 	tiles_enabled = !!(pps->flags & V4L2_HEVC_PPS_FLAG_TILES_ENABLED);
 
-	if (avd_hevc_check_tiles(sps, pps))
+	if (avd_hevc_check_tiles(sps, pps) ||
+	    avd_hevc_check_slices(sps, run->sl, run->num_slices))
 		return -EINVAL;
 
 	tile_info->ctb_addr_rs_to_ts = kzalloc(

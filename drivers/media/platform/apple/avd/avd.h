@@ -380,6 +380,9 @@ bool avd_h264_scaling_is_flat(const struct v4l2_ctrl_h264_pps *pps,
 int avd_hevc_check_sps_geometry(const struct v4l2_ctrl_hevc_sps *sps);
 int avd_hevc_check_tiles(const struct v4l2_ctrl_hevc_sps *sps,
 			 const struct v4l2_ctrl_hevc_pps *pps);
+int avd_hevc_check_slices(const struct v4l2_ctrl_hevc_sps *sps,
+			  const struct v4l2_ctrl_hevc_slice_params *sl,
+			  int num_slices);
 int avd_hevc_kunit_compute_tiles(const struct v4l2_ctrl_hevc_sps *sps,
 				 const struct v4l2_ctrl_hevc_pps *pps,
 				 u32 *tile_ids, size_t n);
