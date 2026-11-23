@@ -5002,9 +5002,13 @@ static int hci_set_event_mask_page_2_sync(struct hci_dev *hdev)
 				     sizeof(events), events, HCI_CMD_TIMEOUT);
 }
 
-/* Read local codec list if the HCI command is supported */
+/* Populate the local codec list for SCO offload. */
 static int hci_read_local_codecs_sync(struct hci_dev *hdev)
 {
+	/* The SCO codec socket option requires an offload data path. */
+	if (!hdev->get_data_path_id)
+		return 0;
+
 	if (hdev->commands[45] & 0x04)
 		hci_read_supported_codecs_v2(hdev);
 	else if (hdev->commands[29] & 0x20)
