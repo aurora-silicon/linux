@@ -175,12 +175,11 @@ fn f32_to_micro(f: u32) -> Option<u64> {
 }
 
 // FireFish2 / CT720 report, 55 bytes, lux float at +0x1d. The four counts are
-// red, green, blue, clear. Clear is the wideband count (largest in room light;
-// the calibration gains are 8, 8, 8, 4). Under the ~5460 K light captured on
-// a J313 the first three ranked green, red, blue. Byte +0x2a is non-zero
-// when the color temperature at +0x2b is valid. The integration time is stored
-// twice at +0x2f (the AOP logs 197380 µs when it arms this sensor); disagreeing
-// copies mean this is not that layout, and color is left unpublished.
+// red, green, blue and clear; clear is the wideband channel. Byte +0x2a is
+// non-zero when the color temperature at +0x2b is valid. The integration time
+// is stored twice at +0x2f (the AOP logs 197380 µs when it arms this sensor);
+// disagreeing copies mean this is not that layout, and color is left
+// unpublished.
 const CT720_LEN: usize = 55;
 const CT720_COUNT_OFF: [usize; 4] = [0x0d, 0x11, 0x15, 0x19];
 const CT720_CCT_FLAG: usize = 0x2a;
