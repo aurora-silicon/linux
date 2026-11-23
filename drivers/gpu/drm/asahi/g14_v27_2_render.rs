@@ -179,7 +179,7 @@ impl QueueRender {
         if let Some(binding) = Option::as_mut(&mut *self.binding.lock()) {
             binding.initialized = true;
             binding.blocks = self.buffer.block_count();
-            self.buffer.increment();
+            self.buffer.increment_parameter_counter();
         }
     }
 
@@ -445,7 +445,7 @@ pub(crate) fn encode_vertex(
     put32(s, 0x3c, c.context);
     put32(s, 0x40, 1);
     put32(s, 0x48, scene.slot());
-    put32(s, 0x54, q.slot);
+    // Match the command metadata: the default event-control index is zero.
     put64(s, 0x5c, unk_pointee);
     put64(s, 0x64, unk_buf_0);
     s[0x80..0x180].copy_from_slice(&attachments.0[..0x100]);

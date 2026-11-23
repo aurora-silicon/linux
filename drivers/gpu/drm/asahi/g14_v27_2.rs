@@ -694,6 +694,7 @@ impl Runtime {
             }
         } else if flight.started.elapsed() > Delta::from_millis(COMMAND_TIMEOUT_MS) {
             dev_err!(self.dev, "GPU: render timed out: TA retired={} fragment retired={}\n", ta_done, fs_done);
+            state.root.log_timeout(&self.dev);
             return Err(ETIMEDOUT);
         }
         Ok(())
@@ -785,6 +786,7 @@ impl Runtime {
             if front.started.elapsed() > Delta::from_millis(COMMAND_TIMEOUT_MS) {
                 dev_err!(self.dev, "GPU: compute command timed out: stamp={:#x} expected={:#x} submitted={} completed={}\n",
                          state.queue_stamp(), front.stamp.raw(), state.submitted, state.retired);
+                state.root.log_timeout(&self.dev);
                 self.fail_all(state, ETIMEDOUT);
                 return;
             }

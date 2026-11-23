@@ -9,6 +9,7 @@
 //! that manager's own root.
 
 use super::*;
+use kernel::device;
 use crate::g14_v27_2_abi::{self, GrowRequest, QueueError};
 use crate::g17::fw::m5::initdata as abi;
 use crate::hw::{RegisterBaseV27_2, RegisterV27_2};
@@ -335,7 +336,7 @@ impl BootJob {
         for owner in [queue_stamps, scheduler, cursor] {
             owners.push(owner, GFP_KERNEL)?;
         }
-        let expected_stamp = event.current().next().raw();
+        let expected_stamp = event.current_noncoherent().next().raw();
         Ok(Self { queue, positions, pointers, command, stream, tracking, timestamps, event,
                   expected_stamp, _owners: owners, _client: (mapping, object),
                   client_va, preempt1: preempt1 as u64 })
@@ -537,7 +538,7 @@ impl RootV27_2 {
 
     /// The queue's identity for client commands, and the stamp value it last reached.
     pub(crate) fn queue(&self) -> (QueueInfo, event::EventValue) {
-        (self.boot.info(self.compute_state), self.boot.event.current())
+        (self.boot.info(self.compute_state), self.boot.event.current_noncoherent())
     }
 
     /// The queue's capacity (position block +0x50).
@@ -555,14 +556,33 @@ impl RootV27_2 {
 
     pub(crate) fn render_queue(&self, dm: usize) -> (QueueInfo, event::EventValue) {
         let queue = &self.render_queues[dm];
-        (queue.info(self.render_states[dm]), queue.event.current())
+        (queue.info(self.render_states[dm]), queue.event.current_noncoherent())
     }
 
     pub(crate) fn render_done(&self, dm: usize, target: u32, stamp: event::EventValue) -> Result<bool> {
         let queue = &self.render_queues[dm];
         crate::pgtable::clean_invalidate_poc(queue.positions.as_slice().as_ptr(), 0x60);
         crate::pgtable::poc_barrier();
-        Ok(Self::word(&queue.positions, 0)? == target && queue.event.current() >= stamp)
+        Ok(Self::word(&queue.positions, 0)? == target && queue.event.current_noncoherent() >= stamp)
+    }
+
+    fn log_queue(
+        dev: &device::Device, name: &str, positions: &fw::types::GpuArray<u8>,
+        queue: &fw::types::GpuArray<u8>, stamp: &event::Event,
+    ) {
+        crate::pgtable::clean_invalidate_poc(positions.as_slice().as_ptr(), 0x60);
+        crate::pgtable::clean_invalidate_poc(queue.as_slice().as_ptr(), 0x90);
+        crate::pgtable::poc_barrier();
+        dev_err!(dev, "GPU: {} queue head={:?} fetched={:?} retired={:?} scheduler={:?} stamp={:#x}\n",
+            name, Self::word(positions, 0x40), Self::word(positions, 0x30),
+            Self::word(positions, 0), Self::word(queue, 0x74), stamp.current_noncoherent().raw());
+    }
+
+    pub(crate) fn log_timeout(&self, dev: &device::Device) {
+        Self::log_queue(dev, "compute", &self.boot.positions, &self.boot.queue, &self.boot.event);
+        for (name, queue) in ["tiler", "fragment"].into_iter().zip(&self.render_queues) {
+            Self::log_queue(dev, name, &queue.positions, &queue.queue, &queue.event);
+        }
     }
 
     pub(crate) fn render_kick(dm: usize) -> u64 {
@@ -668,7 +688,7 @@ impl RootV27_2 {
         Ok(Self::word(&self.channels[2 * SUBMISSION_RING], 0)? == 1
             && Self::word(&job.positions, 0x30)? == 1
             && Self::word(&job.positions, 0)? == 1
-            && job.event.current().raw() == job.expected_stamp)
+            && job.event.current_noncoherent().raw() == job.expected_stamp)
     }
 
     pub(crate) fn peek_event(&self) -> Result<Option<(u32, FirmwareEvent)>> {
@@ -829,6 +849,7 @@ impl RootV27_2 {
         let sram_table = Self::sram_table(states.len())?;
 
         let mut alloc = graph.alloc();
+        graph.event_manager.sync_initial_stamps();
         let mut boot = BootJob::new(&mut alloc, graph.event_manager.try_get_polled()?,
                                     graph.kernel_uat(), &graph.dev, cfg)?;
         // The 0x60-byte root child and the eight-byte temperature generation occupy

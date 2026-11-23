@@ -326,6 +326,15 @@ impl BufferG14V13_5 {
         })
     }
 
+    pub(crate) fn increment_parameter_counter(&self) {
+        self.increment();
+        let inner = self.inner.lock();
+        inner.info.counter.with(|raw, _| {
+            crate::pgtable::clean_poc(core::ptr::from_ref(raw).cast(), core::mem::size_of_val(raw));
+        });
+        crate::pgtable::poc_barrier();
+    }
+
     /// The 27.2 firmware owns the page list once bound. Publish only new block descriptors
     /// and the block-control producer, using the legacy manager for backing allocation.
     pub(crate) fn ensure_parameter_blocks(&self, count: usize) -> Result<bool> {
