@@ -32,36 +32,139 @@ pub(crate) struct ComputeSlot {
     pub(crate) counter: Arc<FwObject>,
     pub(crate) context_store: Arc<FwObject>,
     pub(crate) aux: Arc<FwObject>,
+    /// Freelist entries of the unit's UMA pool, seeded once ([`init_uma_pool`]).
+    pub(crate) seeds: u32,
     /// VM-free firmware lease keeping `work` (containing the compute UMA manager at `+0xe00`)
     /// and `counter` mapped in context-0 UAT until a later compute retirement overwrites
     /// firmware `uma_mgr_table[1 + k]`.
     uma_lease: Arc<FwLease>,
 }
 
+/// Where a compute unit lives and how large its UMA pool is.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Placement {
+    /// The VM's base units: a 32 MiB pool at the unit's original client addresses.
+    Base,
+    /// SCS-capable units (ray-query scratch): a pool of `seeds` 4-KiB entries
+    /// ([`super::rt::required_seeds`]) and its freelist in the unit's SCS pool window, the
+    /// other records at their own client addresses, sharing ledger index and UMA slot `1 + k`
+    /// with base unit k.
+    Scs { seeds: u32 },
+}
+
+impl Placement {
+    fn pool(self, k: u64) -> u64 {
+        match self {
+            Placement::Base => client::compute_pool(k),
+            Placement::Scs { .. } => client::scs_compute_pool(k),
+        }
+    }
+    /// The base of the unit's list, preempt, auxiliary and context records.
+    fn state(self, k: u64) -> u64 {
+        match self {
+            Placement::Base => client::compute_state(k),
+            Placement::Scs { .. } => client::scs_compute_records(k),
+        }
+    }
+    /// The unit's freelist: a base unit's at its state, an SCS unit's right after its pool.
+    fn freelist(self, k: u64) -> u64 {
+        match self {
+            Placement::Base => client::compute_state(k),
+            Placement::Scs { .. } => self.pool(k) + self.pool_bytes() as u64,
+        }
+    }
+    fn work(self, k: u64) -> u64 {
+        let index = match self {
+            Placement::Base => k,
+            Placement::Scs { .. } => sizes::COMPUTE_UNITS as u64 + k,
+        };
+        client::WORK_PAGE + index * client::CWORK_STRIDE
+    }
+    /// Freelist entries of the unit's pool.
+    pub(crate) fn seeds(self) -> u32 {
+        match self {
+            Placement::Base => super::rt::BASE_SEEDS,
+            Placement::Scs { seeds } => seeds,
+        }
+    }
+    /// Bytes of the unit's pool: its seeds of 4 KiB.
+    pub(crate) fn pool_bytes(self) -> usize {
+        (u64::from(self.seeds()) * super::rt::SEED_BYTES) as usize
+    }
+    /// Bytes of the unit's freelist ([`super::rt::freelist_bytes`]).
+    pub(crate) fn freelist_bytes(self) -> usize {
+        super::rt::freelist_bytes(self.seeds()) as usize
+    }
+    /// An SCS unit's pool fits [`super::rt::MAX_SCS_SEEDS`] in whole rows, so it and its
+    /// freelist fit its window.
+    pub(crate) fn check(self) -> Result {
+        match self {
+            Placement::Base => Ok(()),
+            Placement::Scs { seeds } => {
+                if seeds == 0
+                    || seeds % super::rt::SEEDS_PER_ROW != 0
+                    || seeds > super::rt::MAX_SCS_SEEDS
+                {
+                    Err(E2BIG)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+const _: () = assert!(
+    sizes::POOL_BYTES == super::rt::BASE_SEEDS as u64 * super::rt::SEED_BYTES
+        && super::rt::window_bytes(super::rt::MAX_SCS_SEEDS) <= client::SCS_POOL_WINDOW
+);
+
 /// Initializes the private pool exactly once, before it is exposed. Never called on reuse.
-pub(crate) fn init_uma_pool(state: &FwObject, list: &FwObject, pool: u64) -> Result {
-    if pool & 0x3fff != 0 {
+/// `seeds` 4-KiB freelist entries and their 2-MiB pool-table rows; 8192 is the 32 MiB pool
+/// every unit had before SCS. The freelist `state` holds every seed, the pool table `list`
+/// every row.
+pub(crate) fn init_uma_pool(state: &FwObject, list: &FwObject, pool: u64, seeds: u32) -> Result {
+    let seeds = seeds as usize;
+    let rows = seeds / super::rt::SEEDS_PER_ROW as usize;
+    if pool & 0x3fff != 0
+        || seeds == 0
+        || seeds % super::rt::SEEDS_PER_ROW as usize != 0
+        || seeds * super::rt::RECORD_BYTES as usize > state.size
+        || rows * super::fw::buffer::uma_pools::POOL_TABLE_STRIDE > list.size
+    {
         return Err(EINVAL);
     }
     let mut chunk = [0u8; 512];
-    for first in (0..8192).step_by(64) {
+    for first in (0..seeds).step_by(64) {
         for j in 0..64 {
             chunk[j * 8..j * 8 + 8]
                 .copy_from_slice(&(pool + ((first + j) as u64) * 0x1000).to_le_bytes());
         }
         state.write(first * 8, &chunk)?;
     }
-    for i in 0..16 {
+    for i in 0..rows {
         list.w64(i * 64, (1u64 << 61) | (pool + i as u64 * 0x200000))?;
     }
     Ok(())
 }
 
 impl ComputeSlot {
+    #[allow(dead_code)]
     pub(crate) fn new(o: &mut Objects, fw_factory: &Factory, k: u64) -> Result<Self> {
+        Self::new_in(o, fw_factory, k, Placement::Base)
+    }
+
+    /// Unit `k` at `placement`.
+    pub(crate) fn new_in(
+        o: &mut Objects,
+        fw_factory: &Factory,
+        k: u64,
+        placement: Placement,
+    ) -> Result<Self> {
+        placement.check()?;
         let sh = Class::Shared;
+        let state = placement.state(k);
         let mut fw = fw_factory.fw_objects();
-        let work = alloc_work(&mut fw, 0x2000, client::WORK_PAGE + k * client::CWORK_STRIDE, 0)?;
+        let work = alloc_work(&mut fw, 0x2000, placement.work(k), 0)?;
         let counter = alloc(&mut fw, 0x80, sh, None, 0, false)?;
         let uma_lease = FwLease::new(fw)?;
         let unit = Self {
@@ -70,7 +173,7 @@ impl ComputeSlot {
                 o,
                 0x4000,
                 sh,
-                Client::nc(client::compute_preempt(k)),
+                Client::nc(state + client::COMPUTE_PREEMPT_OFF),
                 0,
                 false,
             )?,
@@ -86,42 +189,59 @@ impl ComputeSlot {
                 false,
             )?,
             pool: o.alloc(super::object::Request {
-                size: 0x2000000,
+                size: placement.pool_bytes(),
                 class: sh,
                 placement: super::object::Placement::Anywhere,
                 offset: 0,
-                client: Some((client::compute_pool(k), super::hw::pte::LEAF_NC)),
+                client: Some((placement.pool(k), super::hw::pte::LEAF_NC)),
                 lower: None,
                 cpu: false,
             })?,
             pool_state: alloc(
                 o,
-                0x20000,
+                placement.freelist_bytes(),
                 sh,
-                Client::nc(client::compute_state(k)),
+                Client::nc(placement.freelist(k)),
                 0,
                 false,
             )?,
-            page_list: alloc(o, 0x4000, sh, Client::nc(client::compute_list(k)), 0, false)?,
+            page_list: alloc(
+                o,
+                0x4000,
+                sh,
+                Client::nc(state + client::COMPUTE_LIST_OFF),
+                0,
+                false,
+            )?,
             counter,
             context_store: alloc(
                 o,
                 0x40000,
                 sh,
-                Client::nc(client::compute_context(k)),
+                Client::nc(state + client::COMPUTE_CONTEXT_OFF),
                 0,
                 false,
             )?,
-            aux: alloc(o, 0x4000, sh, Client::nc(client::compute_aux(k)), 0, false)?,
+            aux: alloc(
+                o,
+                0x4000,
+                sh,
+                Client::nc(state + client::COMPUTE_AUX_OFF),
+                0,
+                false,
+            )?,
+            seeds: placement.seeds(),
             uma_lease,
         };
         init_uma_pool(
             &unit.pool_state,
             &unit.page_list,
             unit.pool.gva.ok_or(EINVAL)?,
+            unit.seeds,
         )?;
         Ok(unit)
     }
+
     /// VM-free firmware lease keeping this unit's `work` and `counter` mapped in context-0 UAT.
     pub(crate) fn uma_lease(&self) -> Arc<FwLease> {
         self.uma_lease.clone()
@@ -1171,7 +1291,12 @@ impl Slots {
         let Some(k) = chosen else {
             return Ok(None);
         };
+        let arena_changed = self.compute.arena[k]
+            .as_ref()
+            .zip(units.compute_arena(k).as_ref())
+            .is_some_and(|(a, b)| !Arc::ptr_eq(a, b));
         let full = self.compute.scrub_full[k]
+            || arena_changed
             || vm_id.is_none_or(|id| {
                 self.compute.owner[k]
                     .as_ref()

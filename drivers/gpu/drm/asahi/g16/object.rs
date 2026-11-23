@@ -444,7 +444,7 @@ impl Objects {
                 lower: None,
                 cpu: true,
             },
-            Some(0x7040000000..0x7080000000),
+            Some(hw::client::DYNAMIC),
         )
     }
 

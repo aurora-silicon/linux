@@ -67,7 +67,7 @@ assert 'fn check_stream(' not in command
 assert 'fn cover(' not in command
 assert 'enum Resolved' not in command
 hardware = (SOURCE.parent / 'hw.rs').read_text()
-capacities = '\n'.join(re.findall(r'pub\(crate\) const (?:TPC_SIZE|TILEMAP_SIZE): u64 = .*?;', hardware))
+capacities = '\n'.join(re.findall(r'pub\(crate\) const (?:TPC_SIZE|TILEMAP_SIZE|SCS_POOL_WINDOW): u64 = .*?;', hardware))
 names = ['drm_asahi_cmd_header', 'drm_asahi_attachment', 'drm_asahi_cmd_render',
          'drm_asahi_cmd_compute', 'drm_asahi_bg_eot', 'drm_asahi_zls_buffer',
          'drm_asahi_timestamp', 'drm_asahi_timestamps', 'drm_asahi_helper_program',
@@ -103,7 +103,7 @@ extern crate self as kernel;
 // The parser logs why it refuses a command; check the format arguments, print nothing.
 macro_rules! pr_warn { ($($arg:tt)*) => {{ let _ = format_args!($($arg)*); }}; }
 pub mod bindings { pub const EOPNOTSUPP:i32=95; }
-pub mod prelude { pub type Result<T=()> = core::result::Result<T,i32>; pub const E2BIG:i32=-7; }
+pub mod prelude { pub type Result<T=()> = core::result::Result<T,i32>; pub const EINVAL:i32=-22; pub const E2BIG:i32=-7; pub const EOVERFLOW:i32=-75; }
 pub(crate) mod timestamp {
     pub(crate) struct Destinations;
     impl Destinations { pub(crate) const fn empty() -> Self { Self } }
@@ -132,6 +132,7 @@ mod fw {
     #[path="FW_WORK"] pub mod work;
 }
 #[path="FULL_ENCODER"] mod encode;
+#[path="RT_MOD"] mod rt;
 READER
 IMPLS
 PRODUCTION_CONSTANTS
@@ -237,7 +238,7 @@ fn render_high_resource_words_are_preserved() {
 }
 #[test]
 fn ray_query_and_unknown_extension_bytes_are_refused() {
-    let mut r=render(); r.ray_query[0].scs_layout=1;
+    let mut r=render(); r.ray_query[0].scs_layout=0xffff_0000_ff00_ffff;
     assert!(check_stream(&entry(CMD_RENDER,&data(&r),[NONE;2]),false).is_err());
     let mut raw=data(&compute()); raw.extend([0u8;8]);
     assert!(check_stream(&entry(CMD_COMPUTE,&raw,[NONE;2]),false).is_ok());
@@ -386,7 +387,7 @@ fn g16_stage_prefixes_v2_framing_and_tiling_narrowing() {
     both.legacy.flags |= FRAGMENT_BARRIERS;
     assert!(check_stream(&entry(CMD_RENDER, &data(&both), [NONE; 2]), true).is_err());
     let mut rq = m5;
-    rq.legacy.ray_query[0].scs_layout = 1;
+    rq.legacy.ray_query[0].scs_layout = 0xffff_0000_ff00_ffff;
     assert!(check_stream(&entry(CMD_RENDER, &data(&rq), [NONE; 2]), true).is_err());
 
     // Without STAGE_PREFIXES, nonzero trailing bytes past 448 are rejected; zero tail is accepted.
@@ -444,7 +445,7 @@ fn unsupported_flags_and_compute_fields() {
         assert!(check_stream(&entry(CMD_COMPUTE,&data(&c),[NONE;2]),false).is_err());
     }
     let mut c=compute();
-    c.scs_layout=1;
+    c.scs_layout=0xffff_0000_ff00_ffff;
     assert!(check_stream(&entry(CMD_COMPUTE,&data(&c),[NONE;2]),false).is_err());
     c.scs_layout=0; c.cdm_auxiliary_allocation=8;
     assert!(check_stream(&entry(CMD_COMPUTE,&data(&c),[NONE;2]),false).is_err());
@@ -696,6 +697,8 @@ mod render_admission_tests {
     pub(crate) struct Context<'a> {
         pub(crate) vm: &'a mmu::Vm,
         pub(crate) usc_base: u64,
+        pub(crate) active_cores: u32,
+        pub(crate) render_scs: [u16; 2],
     }
     use super::MAX_COMMANDS;
     RENDER_ADMISSION
@@ -745,7 +748,7 @@ mod render_admission_tests {
     #[test]
     fn compressed_zls_1x_layered_and_2x_accepted() {
         let vm = base_vm();
-        let ctx = Context { vm: &vm, usc_base: 1 << 40 };
+        let ctx = Context { vm: &vm, usc_base: 1 << 40, active_cores: 10, render_scs: [0, 0] };
         // 1x compressed D32F depth + stencil.
         let mut cmd = base_cmd();
         cmd.zls_ctrl = Z_COMP | S_COMP;
@@ -778,7 +781,7 @@ mod render_admission_tests {
     #[test]
     fn compressed_zls_invalid_ctrl_alignment_and_vm_spans_rejected() {
         let vm = base_vm();
-        let ctx = Context { vm: &vm, usc_base: 1 << 40 };
+        let ctx = Context { vm: &vm, usc_base: 1 << 40, active_cores: 10, render_scs: [0, 0] };
         let valid = || {
             let mut cmd = base_cmd();
             cmd.zls_ctrl = Z_COMP | S_COMP;
@@ -835,7 +838,7 @@ mod render_admission_tests {
     #[test]
     fn submit_wide_span_batch_dedups_and_flushes_once_across_passes() {
         let vm = base_vm();
-        let ctx = Context { vm: &vm, usc_base: 1 << 40 };
+        let ctx = Context { vm: &vm, usc_base: 1 << 40, active_cores: 10, render_scs: [0, 0] };
         let mut batch = SpanBatch::new();
         for pass in 0..4u64 {
             let mut cmd = base_cmd();
@@ -875,7 +878,7 @@ mod render_admission_tests {
     #[test]
     fn few_primitives_flag_admitted_in_parse_and_render_check() {
         let vm = base_vm();
-        let ctx = Context { vm: &vm, usc_base: 1 << 40 };
+        let ctx = Context { vm: &vm, usc_base: 1 << 40, active_cores: 10, render_scs: [0, 0] };
         let mut r = super::render();
         r.flags = FEW_PRIMITIVES;
         assert!(super::check_stream(
@@ -912,7 +915,7 @@ mod render_admission_tests {
 
         // First flush populates the proof for epoch 1.
         let mut batch = SpanBatch::new();
-        let ctx = Context { vm: &vm, usc_base: 1 << 40 };
+        let ctx = Context { vm: &vm, usc_base: 1 << 40, active_cores: 10, render_scs: [0, 0] };
         check_render(&mut batch, &ctx, &cmd, &[], &[]).unwrap();
         assert_eq!(batch.flush_with_proof(&vm, &mut proof), Ok(()));
         assert_eq!(vm.batch_calls.get(), 1);
@@ -958,7 +961,7 @@ mod render_admission_tests {
         vm.maps.remove(1);
         vm.epoch.set(Some(2));
         let mut batch = SpanBatch::new();
-        let ctx = Context { vm: &vm, usc_base: 1 << 40 };
+        let ctx = Context { vm: &vm, usc_base: 1 << 40, active_cores: 10, render_scs: [0, 0] };
         check_render(&mut batch, &ctx, &cmd, &[att], &[]).unwrap();
         assert_eq!(batch.flush_with_proof(&vm, &mut proof), Err(ENOENT));
 
@@ -975,9 +978,11 @@ mod render_admission_tests {
 replacements = {'FULL_UAPI': str(BINDINGS), 'READER': reader,
                 'CAPACITIES': capacities, 'FW_GRAPH': str(SOURCE.parent/'fw/graph.rs'),
                 'FW_WORK': str(SOURCE.parent/'fw/work.rs'), 'FULL_ENCODER': str(SOURCE.parent/'encode.rs'),
+                'RT_MOD': str(SOURCE.parent/'rt.rs'),
                 'IMPLS': '\n'.join('unsafe impl AnyBitPattern for uapi::' + name + ' {}' for name in names),
-                'PRODUCTION_CONSTANTS': constants, 'PARSE_TYPES': parse_types,
-                'PRODUCTION_PARSER': parser.replace('super::encode::', 'encode::'),
+                'PRODUCTION_CONSTANTS': constants,
+                'PARSE_TYPES': parse_types.replace('super::rt::', 'rt::'),
+                'PRODUCTION_PARSER': parser.replace('super::encode::', 'encode::').replace('super::rt::', 'rt::'),
                 'INLINE_CONTAINERS': inline_containers.replace('crate::timestamp::', 'timestamp::'),
                 'RENDER_ADMISSION': render_admission.replace('super::vm::', 'vm::').replace('super::params::', 'params::'),
                 'G17_CONSTANTS': g17_constants, 'G17_PARSER': g17_parser}

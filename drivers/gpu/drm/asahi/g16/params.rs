@@ -6,8 +6,8 @@
 //! SOFT_FAULTS suppressed by `soft_faults`, VDM_USC_INVALIDATE, and `INDEPENDENT_QUEUES` from
 //! `queue_limits`), G16 advertises per-command input readiness/errors, exact queue-local historical
 //! prefixes, fragment-only and staged render barriers (`RENDER_STAGE_PREFIXES_V2`), independent
-//! logical queues, `FEW_PRIMITIVES`, and `COMPUTE_NO_QUERY_ACCESS`. Ray queries are not
-//! advertised.
+//! logical queues, `FEW_PRIMITIVES`, `COMPUTE_NO_QUERY_ACCESS`, render ray queries
+//! (`RENDER_RAY_QUERY`) and bounded AS builds (`BOUNDED_AS_BUILD`).
 
 use kernel::{prelude::*, uapi};
 
@@ -100,6 +100,8 @@ pub(crate) fn fill(gpu: &Gpu, params: &mut uapi::drm_asahi_params_global) -> Res
         | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS)
         | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS)
         | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FEW_PRIMITIVES)
+        | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_RENDER_RAY_QUERY)
+        | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_BOUNDED_AS_BUILD)
         | crate::g17::sync_output::FEATURE_CUMULATIVE_SIGNALS
         | crate::file::DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2;
     params.gpu_generation = GPU_GENERATION;

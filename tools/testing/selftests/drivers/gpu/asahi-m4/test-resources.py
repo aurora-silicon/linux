@@ -232,6 +232,7 @@ pub mod g16 {
     pub struct Events{pub grow:crate::KVec<[u32;18]>}
     pub struct Firmware{pub pools:pools::Pools,pub events:Events}
     pub mod budget{__BUDGET__}
+    #[path="__ROOT__/rt.rs"]pub mod rt;
     #[path="__ROOT__/slots.rs"]pub mod slots;
     #[path="__ROOT__/pools.rs"]pub mod pools;
 }
@@ -653,7 +654,7 @@ pub mod g16 {
         for idx in 0..g16::hw::sizes::EXT_PB_SLOTS {
             let local=(g16::hw::sizes::BASE_PB_SLOTS+idx) as u64;
             let hw_slot=(g16::hw::sizes::WARM_PB_SLOTS+idx) as u32;
-            let ext=g16::pools::Allocator::new_at(&mut o,&g16::object::Factory,local,hw_slot,pools.heap()).unwrap();
+            let ext=g16::pools::Allocator::new_at(&mut o,&g16::object::Factory,local,hw_slot,pools.heap(),g16::slots::Placement::Base).unwrap();
             assert_eq!(ext.refs().unwrap().parameter_id,hw_slot);
         }
         for k in 0..g16::hw::sizes::COMPUTE_UNITS as u64 {
@@ -753,13 +754,17 @@ pub mod g16 {
         let pools=PoolSet::new_with_slots(&mut o,&f,[7,8]).unwrap();
         assert_eq!(pools.unit(0).unwrap().id(),7);
         assert_eq!(pools.unit(1).unwrap().id(),8);
+        let scs=pools.scs(&mut o,&f,g16::hw::sizes::FREELIST_SEED + 512).unwrap();
+        assert_eq!(scs.unit(0).unwrap().id(),7);
+        assert_eq!(scs.unit(1).unwrap().id(),8);
         assert_eq!(
             g16::pools::Allocator::new_at(
                 &mut o,
                 &f,
                 g16::hw::sizes::MAX_VM_PB_SLOTS as u64,
                 0,
-                pools.heap()
+                pools.heap(),
+                g16::slots::Placement::Base
             ).err(),
             Some(EINVAL)
         );
@@ -769,14 +774,15 @@ pub mod g16 {
                 &f,
                 0,
                 g16::hw::sizes::PB_SLOTS as u32,
-                pools.heap()
+                pools.heap(),
+                g16::slots::Placement::Base
             ).err(),
             Some(EINVAL)
         );
         let mut uma_slots=Vec::new();
         for k in 0..g16::hw::sizes::PB_SLOTS {
             let local=(k % g16::hw::sizes::MAX_VM_PB_SLOTS) as u64;
-            let alloc=g16::pools::Allocator::new_at(&mut o,&f,local,k as u32,pools.heap()).unwrap();
+            let alloc=g16::pools::Allocator::new_at(&mut o,&f,local,k as u32,pools.heap(),g16::slots::Placement::Base).unwrap();
             let refs=alloc.prepare_in_flight(1,false).unwrap();
             assert_eq!(refs.parameter_id,k as u32);
             let desc=find_va(refs.uma_mgr[0]);
@@ -906,33 +912,33 @@ pub mod g16 {
         // and keeps 2 healthy slots (18, 19) for cross-VM switching.
         let vm_mask:u32=(1u32<<0)|(1u32<<1)|(((1u32<<ext)-1)<<warm);
         for (i,expected) in [0usize,1,warm,warm+1].iter().enumerate() {
-            let slot=p.pick_slot_in_mask_blocks(&vm1,false,vm_mask,0,0).unwrap();
+            let slot=p.pick_slot_in_mask_blocks_mode(&vm1,false,vm_mask,0,0,false).unwrap();
             assert_eq!(slot,*expected);
             p.publish_flight(slot);
             p.invalidate();
             p.quarantine_flight(slot,None);
             assert_ne!(p.quarantined_mask() & (1u32<<slot), 0);
-            assert!(!p.exhausted_for_mask(&vm1,vm_mask,0));
+            assert!(!p.exhausted_for_mask_mode(&vm1,vm_mask,0,false));
             assert_eq!(p.needed_slots(),(2+i+1).min(total));
         }
         // Cross-VM switching still works cleanly across surviving spares 18 and 19.
         let s_a=warm+2;let s_b=warm+3;
-        assert_eq!(p.pick_slot_in_mask_blocks(&vm1,false,vm_mask,0,0),Some(s_a));
+        assert_eq!(p.pick_slot_in_mask_blocks_mode(&vm1,false,vm_mask,0,0,false),Some(s_a));
         let ea=mk_epoch(&vm1,s_a);
         let b=p.bind(s_a,false);p.publish_flight(s_a);p.retire_flight(s_a,&ea,b,true).unwrap();
-        assert_eq!(p.pick_slot_in_mask_blocks(&vm2,false,vm_mask,0,0),Some(s_b));
+        assert_eq!(p.pick_slot_in_mask_blocks_mode(&vm2,false,vm_mask,0,0,false),Some(s_b));
         let eb=mk_epoch(&vm2,s_b);
         let b=p.bind(s_b,false);p.publish_flight(s_b);p.retire_flight(s_b,&eb,b,true).unwrap();
-        assert_eq!(p.pick_slot_in_mask_blocks(&vm1,false,vm_mask,0,0),Some(s_a));
+        assert_eq!(p.pick_slot_in_mask_blocks_mode(&vm1,false,vm_mask,0,0,false),Some(s_a));
         // 5th hang quarantines s_a: only s_b survives (reuse-only for VM2; VM1/VM3 exhausted).
         p.publish_flight(s_a);
         p.quarantine_flight(s_a,None);
-        assert!(!p.exhausted_for_mask(&vm2,vm_mask,0));
-        assert_eq!(p.pick_slot_in_mask_blocks(&vm2,false,vm_mask,0,0),Some(s_b));
-        assert!(p.exhausted_for_mask(&vm1,vm_mask,0));
-        assert!(p.exhausted_for_mask(&vm3,vm_mask,0));
+        assert!(!p.exhausted_for_mask_mode(&vm2,vm_mask,0,false));
+        assert_eq!(p.pick_slot_in_mask_blocks_mode(&vm2,false,vm_mask,0,0,false),Some(s_b));
+        assert!(p.exhausted_for_mask_mode(&vm1,vm_mask,0,false));
+        assert!(p.exhausted_for_mask_mode(&vm3,vm_mask,0,false));
         p.invalidate();
-        assert!(p.exhausted_for_mask(&vm2,vm_mask,0));
+        assert!(p.exhausted_for_mask_mode(&vm2,vm_mask,0,false));
 
         // Quarantine all but the last global slot leaving slot (PB_SLOTS - 1) fresh:
         // VM2 claims and reuses it while other VMs report exhaustion until recovery.
@@ -1926,7 +1932,7 @@ pub mod g16 {
         let mut epochs = Vec::new();
         for i in (0..warm).rev() {
             let (mask, home) = mask_for(i);
-            let slot = p.pick_slot_in_mask_blocks(&vms[i], false, mask, home, 512).unwrap();
+            let slot = p.pick_slot_in_mask_blocks_mode(&vms[i], false, mask, home, 512, false).unwrap();
             assert_eq!(slot, home, "VM {i} must claim its home slot {home} despite reverse arrival");
             let e = mk_epoch(&vms[i], slot);
             let b = p.bind(slot, false);
@@ -1938,10 +1944,10 @@ pub mod g16 {
         let mut binds = Vec::new();
         for &(i, ref _e) in &epochs {
             let (mask, home) = mask_for(i);
-            assert!(p.can_pipeline_in_mask_blocks(&vms[i], mask, home, 512));
-            let slot = p.pick_slot_in_mask_blocks(&vms[i], true, mask, home, 512).unwrap();
+            assert!(p.can_pipeline_in_mask_blocks_mode(&vms[i], mask, home, 512, false));
+            let slot = p.pick_slot_in_mask_blocks_mode(&vms[i], true, mask, home, 512, false).unwrap();
             assert_eq!(slot, home);
-            assert!(p.reusable_for_mask(slot, &vms[i], mask, 512).is_some());
+            assert!(p.reusable_for_mask_mode(slot, &vms[i], mask, 512, false).is_some());
             let b = p.bind(slot, true);
             p.publish_flight(slot);
             binds.push((i, slot, b));
@@ -1955,8 +1961,8 @@ pub mod g16 {
         // Overflow d=20: VMs 16..20 share warm slots [0..4] cleanly on drained displaced rotation.
         for i in warm..20 {
             let (mask, home) = mask_for(i);
-            assert!(!p.can_pipeline_in_mask_blocks(&vms[i], mask, home, 512));
-            let slot = p.pick_slot_in_mask_blocks(&vms[i], false, mask, home, 512).unwrap();
+            assert!(!p.can_pipeline_in_mask_blocks_mode(&vms[i], mask, home, 512, false));
+            let slot = p.pick_slot_in_mask_blocks_mode(&vms[i], false, mask, home, 512, false).unwrap();
             assert_ne!(mask & (1u32 << slot), 0);
             let e = mk_epoch(&vms[i], slot);
             let b = p.bind(slot, false);
@@ -2099,7 +2105,7 @@ pub mod g16 {
         let mut pass_arenas = Vec::new();
         let mut comp_arenas = Vec::new();
 
-        // Bind and retire 16 VMs across warm PB slots, render passes, and compute units.
+        // Bind and retire 16 concurrent VMs across 16 PB slots, 16 render passes, and 16 compute units.
         for i in 0..WARM_PB_SLOTS {
             let v = vm(400 + i as u64);
             let pb_arena = sync::Arc::new(render_arena(KVec::new()), 0).unwrap();
@@ -2113,8 +2119,12 @@ pub mod g16 {
                 ComputeArena { compute: KVec::new(), render: None }, 0,
             ).unwrap();
 
-            // 1) PB slot i
-            let pb_slot = i;
+            // 1) PB warm slot i
+            let mask = (1u32 << i) | (1u32 << ((i + 1) % WARM_PB_SLOTS));
+            let pb_slot = p
+                .pick_slot_in_mask_blocks_mode(&v, false, mask, i, 512, false)
+                .unwrap();
+            assert_eq!(pb_slot, i);
             let e = g16::pools::PbEpoch::new(
                 &factory,
                 &v,
@@ -2167,35 +2177,38 @@ pub mod g16 {
             assert!(p.reusable(i, &vms[i]).is_some());
         }
 
-        // Close all VMs: displaced slots 0..15 reclaim immediately; last (15) stays undisplaced.
+        // Close all 16 VMs: displaced slots 0..15 reclaim immediately; undisplaced slot 15 stays.
         for v in &vms {
             v.vm.close();
         }
-        assert!(p.reclaim_closed(), "undisplaced last PB slot remains");
-        assert!(s.reclaim_closed(), "undisplaced last render/compute slot remain");
+        assert!(p.reclaim_closed(), "undisplaced PB slot 15 remains");
+        assert!(s.reclaim_closed(), "undisplaced render/compute slot 15 remain");
         // Displaced pass scrubs must skip closed VMs.
         s.stage_displaced_pass_scrubs();
         assert!(!s.scrubbing_active());
 
-        let last = WARM_PB_SLOTS - 1;
-        for i in 0..last {
+        for i in 0..(WARM_PB_SLOTS - 1) {
             assert_eq!(sync::Arc::strong_count(&pb_arenas[i]), 1, "PB arena {i} reclaimed");
             // pb_mgr_table[i] still names this epoch's manager: it stays until replaced.
             assert_eq!(sync::Arc::strong_count(&epochs[i]), 2, "PB epoch {i} still bound");
             assert_eq!(sync::Arc::strong_count(&pass_arenas[i]), 1, "pass arena {i} reclaimed");
             assert_eq!(sync::Arc::strong_count(&comp_arenas[i]), 1, "compute arena {i} reclaimed");
+            // Drop our local epoch ref to confirm VmState itself has only our Vec ref left.
             assert_eq!(sync::Arc::strong_count(&vms[i]), 2);
         }
-        // Final undisplaced slot stays protected until displaced.
+        // Final undisplaced slot 15 stays protected until displaced.
+        let last = WARM_PB_SLOTS - 1;
         assert_eq!(sync::Arc::strong_count(&pb_arenas[last]), 2);
         assert_eq!(sync::Arc::strong_count(&pass_arenas[last]), 2);
         assert_eq!(sync::Arc::strong_count(&comp_arenas[last]), 2);
 
-        // Live VM runs 1 render + 1 compute, displacing slot 15 everywhere.
+        // Live VM 17 runs 1 render + 1 compute, displacing slot 15 everywhere.
         let live = vm(500);
         let live_r_arena = sync::Arc::new(render_arena(passes), 0).unwrap();
         let live_r_prep = ComputeArena { compute: KVec::new(), render: Some(live_r_arena.clone()) };
-        let live_slot = p.pick_slot_in_mask_blocks(&live, false, 0b11, 0, 512).unwrap();
+        let live_slot = p
+            .pick_slot_in_mask_blocks_mode(&live, false, 0b11, 0, 512, false)
+            .unwrap();
         assert_eq!(live_slot, 0);
         let live_e = g16::pools::PbEpoch::new(
             &factory,
@@ -2316,6 +2329,92 @@ pub mod g16 {
         assert!(!s2.reclaim_closed(), "quarantined compute slot must not spin reclaim");
         assert!(sync::Arc::strong_count(&vq) > 1, "quarantined leases stay retained");
     }
+
+    #[test]fn dual_pipe_closed_compute_vms_pin_only_one_unit_per_pipe(){
+        use g16::hw::sizes::COMPUTE_UNITS;
+        use g16::resources::{COMPUTE_OWNER_ARENAS, ComputeArena};
+        use g16::slots::ComputeSlot;
+
+        let mut o = Objects::new();
+        let mut s = Slots::new().unwrap();
+        let mut compute_slots = KVec::new();
+        for k in 0..COMPUTE_UNITS {
+            compute_slots.push(ComputeSlot::new(&mut o, &g16::object::Factory, k as u64).unwrap(), 0).unwrap();
+        }
+        let prep = ComputeArena { compute: compute_slots, render: None };
+
+        // Simulate 8 compute VMs, each owning 24 independent per-unit ComputeArenas
+        // (matching production ComputeUnitSet), running across BOTH CDM pipes (0 and 1).
+        let mut vms = Vec::new();
+        let mut vm_unit_arenas: Vec<Vec<sync::Arc<ComputeArena>>> = Vec::new();
+        for i in 0..8usize {
+            let v = vm(800 + i as u64);
+            let mut per_unit = Vec::with_capacity(COMPUTE_UNITS);
+            for _ in 0..COMPUTE_UNITS {
+                per_unit.push(
+                    sync::Arc::new(ComputeArena { compute: KVec::new(), render: None }, 0).unwrap(),
+                );
+            }
+            COMPUTE_OWNER_ARENAS.with(|a| *a.borrow_mut() = Some(per_unit.clone()));
+            for pipe in [0usize, 1usize] {
+                let mut c = Claims::new();
+                let k = s.claim_compute_for_pipe(&prep, &mut c, Some(v.id), pipe).unwrap().unwrap();
+                s.hold_compute_slot(k, &v, &prep).unwrap();
+                s.publish(&mut c).unwrap();
+                s.retire(&mut c).unwrap();
+            }
+            COMPUTE_OWNER_ARENAS.with(|a| *a.borrow_mut() = None);
+            vms.push(v);
+            vm_unit_arenas.push(per_unit);
+        }
+
+        // Close all 8 VMs and reclaim displaced leases:
+        // - Pipe 0 and pipe 1 each retain 1 undisplaced last-retired unit -> reusable == 22.
+        // - Out of 8 * 24 = 192 per-unit arenas, ONLY those 2 undisplaced units remain pinned
+        //   (strong_count == 2); all 190 other units (including the other 23 units of each
+        //   last-retired VM) drop immediately (strong_count == 1).
+        for v in &vms {
+            v.vm.close();
+        }
+        assert!(s.reclaim_closed(), "two undisplaced dual-pipe units remain");
+        assert_eq!(s.lifetime_counts()[0].reusable, (COMPUTE_UNITS - 2) as u32);
+        let pinned_units: usize = vm_unit_arenas
+            .iter()
+            .flat_map(|units| units.iter())
+            .filter(|arena| sync::Arc::strong_count(arena) > 1)
+            .count();
+        assert_eq!(pinned_units, 2, "must pin exactly 1 unit per CDM pipe, never a whole VM set");
+        for (i, units) in vm_unit_arenas.iter().enumerate() {
+            let vm_pinned = units.iter().filter(|a| sync::Arc::strong_count(a) > 1).count();
+            if i == 7 {
+                assert_eq!(vm_pinned, 2, "last VM holds only its 2 undisplaced units");
+            } else {
+                assert_eq!(vm_pinned, 0, "displaced closed VM {i} holds 0 units");
+                assert_eq!(sync::Arc::strong_count(&vms[i]), 1, "closed VM {i} fully released");
+            }
+        }
+
+        // Displace pipe 0 and pipe 1 with a live VM -> all 8 closed VMs and 192 units release.
+        let live = vm(900);
+        for pipe in [0usize, 1usize] {
+            let mut c = Claims::new();
+            let k = s.claim_compute_for_pipe(&prep, &mut c, Some(live.id), pipe).unwrap().unwrap();
+            s.hold_compute_slot(k, &live, &prep).unwrap();
+            s.publish(&mut c).unwrap();
+            s.retire(&mut c).unwrap();
+        }
+        assert!(!s.reclaim_closed(), "both dual-pipe closed leases displaced and reclaimed");
+        let pinned_after: usize = vm_unit_arenas
+            .iter()
+            .flat_map(|units| units.iter())
+            .filter(|arena| sync::Arc::strong_count(arena) > 1)
+            .count();
+        assert_eq!(pinned_after, 0);
+        for (i, v) in vms.iter().enumerate() {
+            assert_eq!(sync::Arc::strong_count(v), 1, "closed VM {i} fully released after displacement");
+        }
+    }
+
     #[test]fn closed_vm_reclaim_retains_firmware_pb_and_uma_leases_until_overwritten(){
         use g16::hw::sizes::{COMPUTE_UNITS, WARM_PB_SLOTS};
         use g16::resources::{COMPUTE_OWNER_ARENA, ComputeArena, PbOwnerArena};
@@ -2459,90 +2558,6 @@ pub mod g16 {
         let _ = WARM_PB_SLOTS;
     }
 
-    #[test]fn dual_pipe_closed_compute_vms_pin_only_one_unit_per_pipe(){
-        use g16::hw::sizes::COMPUTE_UNITS;
-        use g16::resources::{COMPUTE_OWNER_ARENAS, ComputeArena};
-        use g16::slots::ComputeSlot;
-
-        let mut o = Objects::new();
-        let mut s = Slots::new().unwrap();
-        let mut compute_slots = KVec::new();
-        for k in 0..COMPUTE_UNITS {
-            compute_slots.push(ComputeSlot::new(&mut o, &g16::object::Factory, k as u64).unwrap(), 0).unwrap();
-        }
-        let prep = ComputeArena { compute: compute_slots, render: None };
-
-        // Simulate 8 compute VMs, each owning 24 independent per-unit ComputeArenas
-        // (matching production ComputeUnitSet), running across BOTH CDM pipes (0 and 1).
-        let mut vms = Vec::new();
-        let mut vm_unit_arenas: Vec<Vec<sync::Arc<ComputeArena>>> = Vec::new();
-        for i in 0..8usize {
-            let v = vm(800 + i as u64);
-            let mut per_unit = Vec::with_capacity(COMPUTE_UNITS);
-            for _ in 0..COMPUTE_UNITS {
-                per_unit.push(
-                    sync::Arc::new(ComputeArena { compute: KVec::new(), render: None }, 0).unwrap(),
-                );
-            }
-            COMPUTE_OWNER_ARENAS.with(|a| *a.borrow_mut() = Some(per_unit.clone()));
-            for pipe in [0usize, 1usize] {
-                let mut c = Claims::new();
-                let k = s.claim_compute_for_pipe(&prep, &mut c, Some(v.id), pipe).unwrap().unwrap();
-                s.hold_compute_slot(k, &v, &prep).unwrap();
-                s.publish(&mut c).unwrap();
-                s.retire(&mut c).unwrap();
-            }
-            COMPUTE_OWNER_ARENAS.with(|a| *a.borrow_mut() = None);
-            vms.push(v);
-            vm_unit_arenas.push(per_unit);
-        }
-
-        // Close all 8 VMs and reclaim displaced leases:
-        // - Pipe 0 and pipe 1 each retain 1 undisplaced last-retired unit -> reusable == 22.
-        // - Out of 8 * 24 = 192 per-unit arenas, ONLY those 2 undisplaced units remain pinned
-        //   (strong_count == 2); all 190 other units (including the other 23 units of each
-        //   last-retired VM) drop immediately (strong_count == 1).
-        for v in &vms {
-            v.vm.close();
-        }
-        assert!(s.reclaim_closed(), "two undisplaced dual-pipe units remain");
-        assert_eq!(s.lifetime_counts()[0].reusable, (COMPUTE_UNITS - 2) as u32);
-        let pinned_units: usize = vm_unit_arenas
-            .iter()
-            .flat_map(|units| units.iter())
-            .filter(|arena| sync::Arc::strong_count(arena) > 1)
-            .count();
-        assert_eq!(pinned_units, 2, "must pin exactly 1 unit per CDM pipe, never a whole VM set");
-        for (i, units) in vm_unit_arenas.iter().enumerate() {
-            let vm_pinned = units.iter().filter(|a| sync::Arc::strong_count(a) > 1).count();
-            if i == 7 {
-                assert_eq!(vm_pinned, 2, "last VM holds only its 2 undisplaced units");
-            } else {
-                assert_eq!(vm_pinned, 0, "displaced closed VM {i} holds 0 units");
-                assert_eq!(sync::Arc::strong_count(&vms[i]), 1, "closed VM {i} fully released");
-            }
-        }
-
-        // Displace pipe 0 and pipe 1 with a live VM -> all 8 closed VMs and 192 units release.
-        let live = vm(900);
-        for pipe in [0usize, 1usize] {
-            let mut c = Claims::new();
-            let k = s.claim_compute_for_pipe(&prep, &mut c, Some(live.id), pipe).unwrap().unwrap();
-            s.hold_compute_slot(k, &live, &prep).unwrap();
-            s.publish(&mut c).unwrap();
-            s.retire(&mut c).unwrap();
-        }
-        assert!(!s.reclaim_closed(), "both dual-pipe closed leases displaced and reclaimed");
-        let pinned_after: usize = vm_unit_arenas
-            .iter()
-            .flat_map(|units| units.iter())
-            .filter(|arena| sync::Arc::strong_count(arena) > 1)
-            .count();
-        assert_eq!(pinned_after, 0);
-        for (i, v) in vms.iter().enumerate() {
-            assert_eq!(sync::Arc::strong_count(v), 1, "closed VM {i} fully released after displacement");
-        }
-    }
 
     // A closed VM's PB slot 3 is displaced by slot 4 and reclaimed. pb_mgr_table[3] still names
     // its epoch's manager; gPM_SP(0) wrote that manager's page list (DYNAMIC, 0x704000cb40)
@@ -2593,7 +2608,7 @@ pub mod g16 {
         // A new VM's InitBM epoch rebinds slot 3. The old binding stays intact while that
         // render is in flight and goes only with its full retirement.
         let z = vm(48);
-        assert_eq!(p.pick_slot_in_mask_blocks(&z, false, 0b11000, 3, 512), Some(3));
+        assert_eq!(p.pick_slot_in_mask_blocks_mode(&z, false, 0b11000, 3, 512, false), Some(3));
         let ez = epoch(&z, 3);
         let bz = p.bind(3, false);
         p.hold_alloc(3, &z, None, None).unwrap();
@@ -2655,7 +2670,7 @@ source=source.replace('__BUDGET__',budget.replace('//!','//'))
 source = source.replace('__LIVE_TOKEN__' ,item((production/'vm.rs').read_text(),'pub(crate) struct LiveToken')).replace('__LIVE_DROP__',item((production/'vm.rs').read_text(),'impl Drop for LiveToken'))
 resources_source = (production/'resources.rs').read_text()
 assert 'pub(crate) struct ComputeUnitSet {' in resources_source, 'resources.rs must split compute units into per-unit ComputeArenas'
-assert 'ComputeArena::new(factory, bind, vm, live, k)?' in resources_source, 'ComputeUnitSet::new must allocate one ComputeArena per unit'
+assert 'ComputeArena::new(factory, bind, vm, live, k, placement)?' in resources_source, 'ComputeUnitSet::new must allocate one ComputeArena per unit'
 assert 'compute_ext: Option<Arc<ComputeUnitSet>>' in resources_source, 'compute_ext must use ComputeUnitSet so undisplaced slots pin only one unit'
 assert 'base.arena(k)' in resources_source and 'ext.arena(k - base.len())' in resources_source, 'Prepared::compute_arena must return the per-unit ComputeArena'
 ext_tiers_start = resources_source.index('pub(crate) const EXT_RENDER_TIERS:')

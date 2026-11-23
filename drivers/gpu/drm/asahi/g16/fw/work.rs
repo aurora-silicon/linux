@@ -66,9 +66,9 @@ pub(crate) mod compute;
 pub(crate) mod ta {
     pub(crate) const WORK_SIZE: usize = 0x940;
     /// Active non-zero head (`0..HEAD_ACTIVE_SIZE`) and tail (`TAIL_ACTIVE_START..WORK_SIZE`)
-    /// spans of a TA work image. The intervening zero gap is cleared on full scrubs and skipped
-    /// on clean same-VM reuse.
-    pub(crate) const HEAD_ACTIVE_SIZE: usize = 0x360;
+    /// spans of a TA work image (including two optional SCS register records). The intervening
+    /// zero gap is cleared on full scrubs and skipped on clean same-VM reuse.
+    pub(crate) const HEAD_ACTIVE_SIZE: usize = 0x370;
     pub(crate) const TAIL_ACTIVE_START: usize = 0x740;
     pub(crate) const SEQ_SIZE: usize = 0x300;
     pub(crate) const SEQ_OBJECT: usize = 0x1000;
@@ -112,7 +112,7 @@ pub(crate) mod ta {
             && l.auxiliary + 8 <= WORK_SIZE
     }
     const _: () = assert!(valid(&V25G83) && valid(&V26B123));
-    const _: () = assert!(REGS + SEL.len() * super::REG_RECORD <= HEAD_ACTIVE_SIZE);
+    const _: () = assert!(REGS + (SEL.len() + 2) * super::REG_RECORD <= HEAD_ACTIVE_SIZE);
     const _: () = assert!(HEAD_ACTIVE_SIZE <= TAIL_ACTIVE_START);
     const _: () = assert!(TAIL_ACTIVE_START <= WORK_SIZE);
     pub(crate) const SEL: [u32; 66] = [
@@ -130,9 +130,9 @@ pub(crate) mod ta {
 pub(crate) mod fs {
     pub(crate) const WORK_SIZE: usize = 0xca0;
     /// Active non-zero head (`0..HEAD_ACTIVE_SIZE`) and tail (`TAIL_ACTIVE_START..WORK_SIZE`)
-    /// spans of an FS work image. The intervening zero gap is cleared on full scrubs and skipped
-    /// on clean same-VM reuse.
-    pub(crate) const HEAD_ACTIVE_SIZE: usize = 0x460;
+    /// spans of an FS work image (including two optional SCS register records). The intervening
+    /// zero gap is cleared on full scrubs and skipped on clean same-VM reuse.
+    pub(crate) const HEAD_ACTIVE_SIZE: usize = 0x470;
     pub(crate) const TAIL_ACTIVE_START: usize = 0x780;
     pub(crate) const SEQ_SIZE: usize = 0x380;
     pub(crate) const SEQ_OBJECT: usize = 0x1000;
@@ -179,7 +179,7 @@ pub(crate) mod fs {
             && l.flag < WORK_SIZE
     }
     const _: () = assert!(valid(&V25G83) && valid(&V26B123));
-    const _: () = assert!(REGS + SEL.len() * super::REG_RECORD <= HEAD_ACTIVE_SIZE);
+    const _: () = assert!(REGS + (SEL.len() + 2) * super::REG_RECORD <= HEAD_ACTIVE_SIZE);
     const _: () = assert!(HEAD_ACTIVE_SIZE <= TAIL_ACTIVE_START);
     const _: () = assert!(TAIL_ACTIVE_START <= WORK_SIZE);
     pub(crate) const SEL: [u32; 82] = [

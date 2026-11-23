@@ -69,6 +69,7 @@ mod queue;
 mod recovery;
 mod regs;
 mod resources;
+mod rt;
 mod sleep;
 mod slots;
 mod timestamp;
@@ -635,8 +636,8 @@ impl Gpu {
         let scrub_wq = OwnedQueue::new_unbound_reclaim(c_str!("aurora_g16_scrub"), false)?;
         let feed = feed::Feed::new()?;
         let feed_wq = OwnedQueue::new_unbound_reclaim(c_str!("aurora_g16_feed"), false)?;
-        let scrub_queue = slots::ScrubQueue::new_boxed()?;
         let active_render_vms = Arc::new(AtomicU32::new(0), GFP_KERNEL)?;
+        let scrub_queue = slots::ScrubQueue::new_boxed()?;
         let shared = Arc::pin_init(
             pin_init!(Shared {
                 dev: dev.as_ref().as_ref().into(),

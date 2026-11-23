@@ -9,7 +9,7 @@ use super::{
     command::Command,
     object::{Factory, Objects},
     pools::{PbEpoch, PoolSet},
-    slots::{ComputeSlot, PassSlot},
+    slots::{ComputeSlot, PassSlot, Placement},
     vm::VmState,
 };
 use crate::mmu;
@@ -17,7 +17,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use kernel::{
     new_condvar, new_mutex, new_spinlock_irq,
     prelude::*,
-    sync::{Arc, CondVar, CondVarTimeoutResult, Mutex, SpinLockIrq},
+    sync::{Arc, CondVar, CondVarTimeoutResult, Mutex, SetOnce, SpinLockIrq},
 };
 
 /// Never-exposed PB epochs an open VM keeps on standby after bursts drain.
@@ -55,17 +55,22 @@ const BURST_GAP_NS: u64 = 2_000_000;
 const BURST_COMMANDS: usize = 3;
 
 impl ComputeArena {
-    /// Allocates one self-contained compute unit `k` (its index fixes its client addresses and
-    /// hardware UMA slot).
+    /// Freelist entries of the unit's UMA pool.
+    pub(crate) fn seeds(&self) -> u32 {
+        self.unit.seeds
+    }
+    /// Allocates one self-contained compute unit `k` (its index and `placement` fix its client
+    /// addresses; the index fixes its hardware UMA slot).
     fn new(
         factory: &Factory,
         bind: &mmu::VmBind,
         vm: &mmu::Vm,
         live: &Arc<super::vm::LiveToken>,
         k: usize,
+        placement: Placement,
     ) -> Result<Arc<Self>> {
         let mut objects = factory.objects(vm);
-        let unit = ComputeSlot::new(&mut objects, factory, k as u64)?;
+        let unit = ComputeSlot::new_in(&mut objects, factory, k as u64, placement)?;
         objects.finish_private()?;
         Ok(Arc::new(
             Self(crate::cleanup::Deferred::new(ComputeInner {
@@ -88,18 +93,20 @@ pub(crate) struct ComputeUnitSet {
     units: KVec<Arc<ComputeArena>>,
 }
 impl ComputeUnitSet {
-    /// Units `range` (each index fixes its client addresses and hardware UMA slot).
+    /// Units `range` (each index and `placement` fix its client addresses; the index fixes its
+    /// hardware UMA slot).
     fn new(
         factory: &Factory,
         bind: &mmu::VmBind,
         vm: &mmu::Vm,
         live: &Arc<super::vm::LiveToken>,
         range: core::ops::Range<usize>,
+        placement: Placement,
     ) -> Result<Arc<Self>> {
         let mut units = KVec::with_capacity(range.len(), GFP_KERNEL)?;
         for k in range {
             units.push(
-                ComputeArena::new(factory, bind, vm, live, k)?,
+                ComputeArena::new(factory, bind, vm, live, k, placement)?,
                 GFP_KERNEL,
             )?;
         }
@@ -107,6 +114,10 @@ impl ComputeUnitSet {
     }
     fn len(&self) -> usize {
         self.units.len()
+    }
+    /// Freelist entries of the set's UMA pools (all its units share a placement).
+    pub(crate) fn seeds(&self) -> u32 {
+        self.units.first().map_or(0, |arena| arena.seeds())
     }
     fn unit(&self, idx: usize) -> Option<&ComputeSlot> {
         self.units.get(idx).map(|arena| &arena.unit)
@@ -302,11 +313,20 @@ impl core::ops::Deref for RenderArena {
         &self.0
     }
 }
+/// The SCS-capable render allocators of a render arena and the mappings they own.
+pub(crate) struct ScsPools {
+    pub(crate) pools: PoolSet,
+    _objects: Objects,
+}
+
 pub(crate) struct RenderInner {
     pub(crate) passes: KVec<PassSlot>,
     pub(crate) pools: PoolSet,
     /// Device-wide physical PB/UMA allocator slots `[home, alt]` bound to `pools.unit(0..2)`.
     pub(crate) base_pb_slots: [usize; BASE_PB_SLOTS],
+    /// [`PoolSet::scs`], with the VM's first render that has scratch. Held with the arena, so
+    /// a pass slot's owner lease keeps it too. Dropped before the arena's own mappings.
+    pub(crate) scs: SetOnce<ScsPools>,
     pub(crate) tpc_dirty: [AtomicU64; BASE_RENDER_SLOTS],
     pub(crate) tilemap_dirty: [AtomicU64; BASE_RENDER_SLOTS],
     pub(crate) tilemap_last: [AtomicU64; BASE_RENDER_SLOTS],
@@ -345,6 +365,7 @@ impl RenderArena {
                 passes,
                 pools,
                 base_pb_slots,
+                scs: SetOnce::new(),
                 tpc_dirty: [const { AtomicU64::new(0) }; BASE_RENDER_SLOTS],
                 tilemap_dirty: [const { AtomicU64::new(0) }; BASE_RENDER_SLOTS],
                 tilemap_last: [const { AtomicU64::new(0) }; BASE_RENDER_SLOTS],
@@ -356,6 +377,30 @@ impl RenderArena {
             })?),
             GFP_KERNEL,
         )?)
+    }
+    /// Creates the SCS-capable render allocators with pools of `seeds.pool` entries unless
+    /// they exist. Existing ones must hold `seeds.needed`: once the hardware may hold them they
+    /// cannot grow (E2BIG). Called under the VM cache's construction mutex, before any job uses
+    /// them.
+    fn ensure_scs(&self, factory: &Factory, vm: &mmu::Vm, seeds: super::rt::ScsSeeds) -> Result {
+        if let Some(scs) = self.scs.as_ref() {
+            return if scs.pools.seeds() >= seeds.needed {
+                Ok(())
+            } else {
+                Err(E2BIG)
+            };
+        }
+        let mut objects = factory.objects(vm);
+        let pools = self.pools.scs(&mut objects, factory, seeds.pool)?;
+        objects.finish_private()?;
+        // The construction mutex excludes a second populate.
+        if !self.scs.populate(ScsPools {
+            pools,
+            _objects: objects,
+        }) {
+            return Err(EBUSY);
+        }
+        Ok(())
     }
     pub(crate) fn set_dirty(&self, k: usize, tpc: u64, tilemap: u64) -> Result {
         let pass = self.passes.get(k).ok_or(EINVAL)?;
@@ -468,6 +513,7 @@ impl PoolExtArena {
             local_idx as u64,
             hw_slot as u32,
             heap,
+            Placement::Base,
         )?;
         objects.finish_private()?;
         Ok(Arc::new(
@@ -583,6 +629,8 @@ struct Ready {
     compute: Option<Arc<ComputeUnitSet>>,
     /// Units from [`BASE_COMPUTE_UNITS`] on, for a VM that keeps compute queued.
     compute_ext: Option<Arc<ComputeUnitSet>>,
+    /// SCS-capable units, for jobs with compute scratch.
+    compute_scs: Option<Arc<ComputeUnitSet>>,
     render: Option<Arc<RenderArena>>,
     /// Demand-grown extension render pass tiers (`EXT_RENDER_TIERS`).
     render_ext: [Option<Arc<RenderExtArena>>; EXT_RENDER_TIERS.len()],
@@ -778,6 +826,7 @@ impl Cache {
             (
                 ready.compute.take(),
                 ready.compute_ext.take(),
+                ready.compute_scs.take(),
                 ready.render.take(),
                 core::mem::take(&mut ready.render_ext),
                 core::mem::take(&mut ready.pb_heap_ext),
@@ -804,6 +853,22 @@ impl Cache {
             .count()
             .try_into()?;
         let render = render_count != 0;
+        // Scratch is sized on top of a pool's base pages: such a job runs on SCS-capable
+        // storage, for all its commands of that engine, whose pools hold the largest of them.
+        let scs = |engine: fn(&Command) -> bool| {
+            commands
+                .iter()
+                .filter(|&c| engine(c))
+                .map(Command::scs)
+                .fold(super::rt::ScsSeeds::NONE, |a, b| super::rt::ScsSeeds {
+                    needed: a.needed.max(b.needed),
+                    pool: a.pool.max(b.pool).max(b.needed),
+                })
+        };
+        let compute_seeds = scs(|c| matches!(c, Command::Compute(_)));
+        let render_seeds = scs(|c| matches!(c, Command::Render(_)));
+        let compute_scs = compute_seeds.needed != 0;
+        let render_scs = render_seeds.needed != 0;
         let (compute, compute_ext, render_arena, render_ext, pb_heap_ext, pb_ext) = {
             // Never held by publication, completion, recovery, fence signalling or
             // standby waits, so Cache::close() and same-VM compute SUBMITs never block.
@@ -811,16 +876,36 @@ impl Cache {
             if vm.status.get() != 0 || vm.vm.is_closed() || self.closed.load(Ordering::Acquire) {
                 return Err(EIO);
             }
-            if compute && ready.compute.is_none() {
+            if compute && !compute_scs && ready.compute.is_none() {
                 ready.compute = Some(ComputeUnitSet::new(
                     &self.factory,
                     &self.bind,
                     &vm.vm,
                     &self.live,
                     0..BASE_COMPUTE_UNITS,
+                    Placement::Base,
                 )?);
             }
-            if compute && ready.compute_ext.is_none() {
+            if compute_scs {
+                match ready.compute_scs.as_ref().map(|set| set.seeds()) {
+                    None => {
+                        ready.compute_scs = Some(ComputeUnitSet::new(
+                            &self.factory,
+                            &self.bind,
+                            &vm.vm,
+                            &self.live,
+                            0..super::hw::sizes::SCS_COMPUTE_UNITS,
+                            Placement::Scs {
+                                seeds: compute_seeds.pool,
+                            },
+                        )?);
+                    }
+                    // The units cannot grow once the hardware may hold them.
+                    Some(seeds) if seeds < compute_seeds.needed => return Err(E2BIG),
+                    Some(_) => {}
+                }
+            }
+            if compute && !compute_scs && ready.compute_ext.is_none() {
                 let units = super::params::compute_units();
                 if units > BASE_COMPUTE_UNITS {
                     // SAFETY: ktime_get has no preconditions.
@@ -840,6 +925,7 @@ impl Cache {
                             &vm.vm,
                             &self.live,
                             BASE_COMPUTE_UNITS..units,
+                            Placement::Base,
                         )
                         .ok();
                     }
@@ -860,6 +946,13 @@ impl Cache {
                     hints.active_render_vms.fetch_add(1, Ordering::AcqRel);
                     ready.render_vm_counter = Some(hints.active_render_vms.clone());
                 }
+            }
+            if render_scs {
+                ready.render.as_ref().ok_or(EINVAL)?.ensure_scs(
+                    &self.factory,
+                    &vm.vm,
+                    render_seeds,
+                )?;
             }
             if render {
                 if let Some(base) = ready.render.as_ref() {
@@ -1000,8 +1093,16 @@ impl Cache {
                 [const { None }; EXT_PB_SLOTS]
             };
             (
-                if compute { ready.compute.clone() } else { None },
-                if compute { ready.compute_ext.clone() } else { None },
+                match (compute, compute_scs) {
+                    (true, true) => ready.compute_scs.clone(),
+                    (true, false) => ready.compute.clone(),
+                    (false, _) => None,
+                },
+                if compute && !compute_scs {
+                    ready.compute_ext.clone()
+                } else {
+                    None
+                },
                 if render { ready.render.clone() } else { None },
                 render_ext,
                 pb_heap_ext,
@@ -1102,7 +1203,9 @@ impl Cache {
         Ok(Prepared {
             compute,
             compute_ext,
+            compute_scs,
             render: render_arena,
+            render_scs,
             render_ext,
             pb_heap_ext,
             pb_ext,
@@ -1118,7 +1221,11 @@ pub(crate) struct Prepared {
     pub(crate) compute: Option<Arc<ComputeUnitSet>>,
     /// The VM's extension compute units when the job was prepared.
     pub(crate) compute_ext: Option<Arc<ComputeUnitSet>>,
+    /// The job's computes use the VM's SCS-capable compute arena (`0..SCS_COMPUTE_UNITS`).
+    compute_scs: bool,
     pub(crate) render: Option<Arc<RenderArena>>,
+    /// The job's renders use the arena's SCS-capable allocators (`render.scs`).
+    render_scs: bool,
     /// The VM's demand-grown extension render pass tiers when the job was prepared.
     pub(crate) render_ext: [Option<Arc<RenderExtArena>>; EXT_RENDER_TIERS.len()],
     /// The VM's demand-grown contiguous PB heap extension tiers when the job was prepared.
@@ -1165,6 +1272,14 @@ impl Prepared {
                 .and_then(|ext| ext.arena(k - base.len()))
         }
     }
+    /// Whether this job's computes use SCS-capable compute units.
+    pub(crate) fn compute_scs(&self) -> bool {
+        self.compute_scs
+    }
+    /// Whether this job's renders use SCS-capable render allocators.
+    pub(crate) fn render_scs(&self) -> bool {
+        self.render_scs
+    }
     /// Physical PB/UMA allocator slot bitmask and preferred home slot this job can use.
     pub(crate) fn pb_slot_mask(&self) -> Result<(u32, usize)> {
         let base = self.render()?;
@@ -1172,9 +1287,11 @@ impl Prepared {
         for &slot in &base.base_pb_slots {
             mask |= 1u32 << slot;
         }
-        for (idx, ext) in self.pb_ext.iter().enumerate() {
-            if ext.is_some() {
-                mask |= 1u32 << (super::hw::sizes::WARM_PB_SLOTS + idx);
+        if !self.render_scs {
+            for (idx, ext) in self.pb_ext.iter().enumerate() {
+                if ext.is_some() {
+                    mask |= 1u32 << (super::hw::sizes::WARM_PB_SLOTS + idx);
+                }
             }
         }
         Ok((mask, base.base_pb_slots[0]))
@@ -1182,7 +1299,17 @@ impl Prepared {
     fn pb_allocator(&self, k: usize) -> Result<&super::pools::Allocator> {
         let base = self.render()?;
         if let Some(local) = base.base_pb_slots.iter().position(|&slot| slot == k) {
-            return base.pools.unit(local).ok_or(EINVAL);
+            return if self.render_scs {
+                base.scs
+                    .as_ref()
+                    .and_then(|scs| scs.pools.unit(local))
+                    .ok_or(EINVAL)
+            } else {
+                base.pools.unit(local).ok_or(EINVAL)
+            };
+        }
+        if self.render_scs {
+            return Err(EINVAL);
         }
         let idx = k.checked_sub(super::hw::sizes::WARM_PB_SLOTS).ok_or(EINVAL)?;
         self.pb_ext

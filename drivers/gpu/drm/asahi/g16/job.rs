@@ -98,6 +98,8 @@ pub(crate) struct Job {
     pub(crate) vm: Arc<VmState>,
     /// Validated commands, in submission order (at most 64).
     pub(crate) commands: Commands,
+    /// Any command traces rays or builds acceleration structures (`Command::long`).
+    long: bool,
     pub(crate) resources: super::resources::Prepared,
     /// Immutable dependency/order ledger, one entry for every accepted command.
     orders: Orders,
@@ -151,6 +153,7 @@ impl Job {
         if commands.len() != orders.len() {
             return Err(EINVAL);
         }
+        let long = commands.iter().any(Command::long);
         let progress = super::engine::Progress::new(commands.len());
         let guard = MappingGuard {
             guard,
@@ -162,6 +165,7 @@ impl Job {
                 queue,
                 vm,
                 commands,
+                long,
                 orders,
                 resources,
                 fence,
@@ -181,6 +185,12 @@ impl Job {
             }),
             GFP_KERNEL,
         )
+    }
+
+    /// The job gets the long execution allowance (ray traversal or acceleration-structure
+    /// builds, `recovery::logic::LONG_DEADLINE_MS`).
+    pub(crate) fn long(&self) -> bool {
+        self.long
     }
 
     /// Latches a hardware/publication failure before any later work can be published.

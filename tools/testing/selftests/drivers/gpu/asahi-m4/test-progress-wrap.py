@@ -32,10 +32,12 @@ macro_rules! dev_warn{($($tt:tt)*)=>{};}
 macro_rules! dev_err{($($tt:tt)*)=>{};}
 struct Object(Cell<u32>);impl Object{fn r32(&self,_off:usize)->core::result::Result<u32,()>{Ok(self.0.get())}}
 struct Compute{fw_stamp:Object}struct Render{fw_stamp:[Object;2]}struct Graph{compute:[Compute;2],render:Render}
-struct Flight{computes:u32,compute_pipe:u8,renders:u32,target:u32,ta_target:u32,fs_target:u32,published_ns:u64}
+struct Job{long:bool}
+impl Job{fn long(&self)->bool{self.long}}
+struct Flight{job:Job,computes:u32,compute_pipe:u8,renders:u32,target:u32,ta_target:u32,fs_target:u32,published_ns:u64}
 struct Engine{flights:Vec<Flight>,target:[u32;2],ta_target:u32,fs_target:u32,progress_flight:[u64;3],progress:[__TYPE__;4]}
 impl Engine{fn oldest(&self)->Option<&Flight>{self.flights.first()}}
-struct Recovery{deadline_ns:u64,compute_deadline_ns:u64,warning_deadline_ns:[u64;2],long_commands:u64,receipt_fault:bool,failed:Option<Error>}
+struct Recovery{deadlines:logic::Deadlines,warning_deadline_ns:[u64;2],long_commands:u64,receipt_fault:bool,failed:Option<Error>}
 struct Firmware{graph:Graph,engine:Engine,recovery:Recovery,render_renewed:u32,compute_renewed:u32,fail_stops:Vec<Error>}
 impl Firmware{
     fn dev(&self){}
@@ -45,13 +47,17 @@ impl Firmware{
     fn fail_stop(&mut self,error:Error,_done:&mut ()){self.recovery.failed=Some(error);self.fail_stops.push(error);}
     fn renew_render_deadline(&mut self){
         let now=now_ns();
-        self.recovery.deadline_ns=logic::renew(now,params::deadline_ms(),0).0;
+        let renewed=logic::Deadlines::renew(now,params::deadline_ms(),0);
+        self.recovery.deadlines.any=renewed.any;
+        self.recovery.deadlines.long_any=renewed.long_any;
         self.recovery.warning_deadline_ns[command::RENDER]=now.saturating_add(5_000_000_000);
         self.render_renewed+=1;
     }
     fn renew_compute_deadline(&mut self){
         let now=now_ns();
-        self.recovery.compute_deadline_ns=logic::renew(now,0,params::compute_deadline_ms()).1;
+        let renewed=logic::Deadlines::renew(now,0,params::compute_deadline_ms());
+        self.recovery.deadlines.compute=renewed.compute;
+        self.recovery.deadlines.long_compute=renewed.long_compute;
         self.recovery.warning_deadline_ns[command::COMPUTE]=now.saturating_add(5_000_000_000);
         self.compute_renewed+=1;
     }
@@ -62,8 +68,8 @@ type Completions=();
 fn firmware(render:bool,target:u32,previous:u32)->Firmware{
     set_now_ns(1_000_000_000);
     let mut f=Firmware{graph:Graph{compute:[Compute{fw_stamp:Object(Cell::new(previous))},Compute{fw_stamp:Object(Cell::new(previous))}],render:Render{fw_stamp:[Object(Cell::new(previous)),Object(Cell::new(previous))]}},
-        engine:Engine{flights:vec![Flight{computes:u32::from(!render),compute_pipe:0,renders:u32::from(render),target,ta_target:target,fs_target:target,published_ns:1}],target:[target,0],ta_target:target,fs_target:target,progress_flight:[0;3],progress:[__ZERO__;4]},
-        recovery:Recovery{deadline_ns:u64::MAX,compute_deadline_ns:u64::MAX,warning_deadline_ns:[u64::MAX;2],long_commands:0,receipt_fault:false,failed:None},
+        engine:Engine{flights:vec![Flight{job:Job{long:false},computes:u32::from(!render),compute_pipe:0,renders:u32::from(render),target,ta_target:target,fs_target:target,published_ns:1}],target:[target,0],ta_target:target,fs_target:target,progress_flight:[0;3],progress:[__ZERO__;4]},
+        recovery:Recovery{deadlines:logic::Deadlines::EXPIRED,warning_deadline_ns:[u64::MAX;2],long_commands:0,receipt_fault:false,failed:None},
         render_renewed:0,compute_renewed:0,fail_stops:vec![]};
     f.renew_render_deadline();f.renew_compute_deadline();f.render_renewed=0;f.compute_renewed=0;f
 }
@@ -89,7 +95,7 @@ fn firmware(render:bool,target:u32,previous:u32)->Firmware{
 }
 #[test]fn concurrent_compute_and_render_renew_deadlines_independently(){
     let mut f=firmware(true,0x200,0x100);
-    f.engine.flights.push(Flight{computes:1,compute_pipe:0,renders:0,target:0x300,ta_target:0,fs_target:0,published_ns:2});
+    f.engine.flights.push(Flight{job:Job{long:false},computes:1,compute_pipe:0,renders:0,target:0x300,ta_target:0,fs_target:0,published_ns:2});
     f.engine.target[0]=0x300;
     f.progress();assert_eq!((f.render_renewed,f.compute_renewed),(0,0));
     f.graph.compute[0].fw_stamp.0.set(0x300);f.progress();assert_eq!((f.render_renewed,f.compute_renewed),(0,1));
@@ -97,7 +103,7 @@ fn firmware(render:bool,target:u32,previous:u32)->Firmware{
 }
 #[test]fn two_concurrent_compute_pipes_sample_progress_independently(){
     let mut f=firmware(false,0x200,0x100);
-    f.engine.flights.push(Flight{computes:1,compute_pipe:1,renders:0,target:0x200,ta_target:0,fs_target:0,published_ns:2});
+    f.engine.flights.push(Flight{job:Job{long:false},computes:1,compute_pipe:1,renders:0,target:0x200,ta_target:0,fs_target:0,published_ns:2});
     f.engine.target=[0x200,0x200];
     f.progress();assert_eq!(f.compute_renewed,0);
     // Pipe 1 advances while pipe 0 stays pending -> renews compute deadline once.
@@ -110,7 +116,7 @@ fn firmware(render:bool,target:u32,previous:u32)->Firmware{
 }
 #[test]fn stuck_render_times_out_while_compute_keeps_advancing_and_retiring(){
     let mut f=firmware(true,0x200,0x100);
-    f.engine.flights.push(Flight{computes:1,compute_pipe:0,renders:0,target:0x300,ta_target:0,fs_target:0,published_ns:2});
+    f.engine.flights.push(Flight{job:Job{long:false},computes:1,compute_pipe:0,renders:0,target:0x300,ta_target:0,fs_target:0,published_ns:2});
     f.engine.target[0]=0x300;
     let mut done=();
     assert_eq!(f.check_hangs(&mut done),Ok(()));
@@ -135,7 +141,7 @@ fn firmware(render:bool,target:u32,previous:u32)->Firmware{
 }
 #[test]fn stuck_compute_times_out_while_render_keeps_advancing_and_retiring(){
     let mut f=firmware(false,0x200,0x100);
-    f.engine.flights.push(Flight{computes:0,compute_pipe:0,renders:1,target:0,ta_target:0x300,fs_target:0x300,published_ns:2});
+    f.engine.flights.push(Flight{job:Job{long:false},computes:0,compute_pipe:0,renders:1,target:0,ta_target:0x300,fs_target:0x300,published_ns:2});
     f.engine.ta_target=0x300;f.engine.fs_target=0x300;
     let mut done=();
     assert_eq!(f.check_hangs(&mut done),Ok(()));
