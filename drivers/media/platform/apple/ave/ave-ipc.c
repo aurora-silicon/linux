@@ -389,7 +389,8 @@ static int ave_smalloc_get(struct ave_dev *ave, u32 bytes, u64 *addr)
 	const struct ave_fw_transport *t = ave->layout->abi->transport;
 	u32 total = min_t(u32, t->smalloc_bytes / AVE_SMALLOC_GRANULE,
 			  AVE_SMALLOC_UNITS);
-	u32 units = DIV_ROUND_UP(bytes, AVE_SMALLOC_GRANULE);
+	/* In 64 bits: a request near 4 GiB must not round up to 0 units */
+	u32 units = DIV_ROUND_UP_ULL(bytes, AVE_SMALLOC_GRANULE);
 	unsigned long first;
 	unsigned int i;
 
