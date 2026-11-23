@@ -544,8 +544,6 @@ static void bs_policy_show_bounded(struct kunit *test)
 	ssize_t ret;
 	int i, n = PAGE_SIZE / 64 + 8;
 
-	if (IS_ENABLED(CONFIG_IMA))
-		kunit_skip(test, "IMA is enabled");
 	m = kunit_kcalloc(test, n, sizeof(*m), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, m);
 	for (i = 0; i < n; i++) {
