@@ -94,6 +94,9 @@ int avd_open_submit(struct avd_dev *avd, struct avd_frame *f)
 	if (codec > AVD_CODEC_AV1 || !words || !f->prog_words ||
 	    f->prog_words > f->prog->size / sizeof(u32))
 		return -EINVAL;
+	/* The context FIFO only exists while the OUTPUT queue streams. */
+	if (!ctx->inst.cpu)
+		return -EINVAL;
 	if (!(avd->capabilities & BIT(codec)))
 		return -EOPNOTSUPP;
 	for (i = 0; i < codec; i++)
