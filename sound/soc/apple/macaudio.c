@@ -572,6 +572,7 @@ static void macaudio_vlimit_unlock(struct macaudio_snd_data *ma, bool unlock)
 			failed = true;
 		}
 	}
+	/* None kept (not taken yet, or dropped with the card): fail closed. */
 	if (!hits)
 		dev_err(ma->card.dev, "Failed to %slock volume %s: %d\n",
 			unlock ? "un" : "", name, -EINVAL);
@@ -2180,6 +2181,52 @@ static int macaudio_spk_owned_write_check(struct snd_kcontrol *kctl,
 }
 
 /*
+ * Forget the speaker controls the take helpers below keep. They belong to
+ * one binding of the card: its controls go with it, and a later late_probe
+ * takes the new ones afresh.
+ */
+static void macaudio_spk_drop_volumes(struct macaudio_snd_data *ma)
+{
+	struct device *dev = ma->card.dev;
+
+	if (ma->spk_vols)
+		devm_kfree(dev, ma->spk_vols);
+	if (ma->spk_uval)
+		devm_kfree(dev, ma->spk_uval);
+	ma->spk_vols = NULL;
+	ma->spk_uval = NULL;
+	ma->spk_nr_vols = 0;
+}
+
+static void macaudio_spk_drop_amp_gains(struct macaudio_snd_data *ma)
+{
+	if (ma->spk_amp_gains)
+		devm_kfree(ma->card.dev, ma->spk_amp_gains);
+	ma->spk_amp_gains = NULL;
+	ma->spk_nr_amp_gains = 0;
+}
+
+static void macaudio_spk_drop_hpfs(struct macaudio_snd_data *ma)
+{
+	struct device *dev = ma->card.dev;
+
+	if (ma->spk_hpfs)
+		devm_kfree(dev, ma->spk_hpfs);
+	if (ma->spk_hpf_granted)
+		devm_kfree(dev, ma->spk_hpf_granted);
+	ma->spk_hpfs = NULL;
+	ma->spk_hpf_granted = NULL;
+	ma->spk_nr_hpfs = 0;
+}
+
+static void macaudio_spk_drop_controls(struct macaudio_snd_data *ma)
+{
+	macaudio_spk_drop_volumes(ma);
+	macaudio_spk_drop_amp_gains(ma);
+	macaudio_spk_drop_hpfs(ma);
+}
+
+/*
  * Keep the speaker volumes, which the lease sets, and refuse userspace
  * writes to them while leased (macaudio_spk_owned_write_check()).
  *
@@ -2201,6 +2248,7 @@ static int macaudio_spk_take_volumes(struct macaudio_snd_data *ma)
 	if (!nr)
 		return -ENOENT;
 
+	macaudio_spk_drop_volumes(ma);
 	ma->spk_vols = devm_kcalloc(dev, nr, sizeof(*ma->spk_vols), GFP_KERNEL);
 	ma->spk_uval = devm_kzalloc(dev, sizeof(*ma->spk_uval), GFP_KERNEL);
 	if (!ma->spk_vols || !ma->spk_uval)
@@ -2239,6 +2287,7 @@ static int macaudio_spk_take_amp_gains(struct macaudio_snd_data *ma)
 	list_for_each_entry(kctl, &ma->card.snd_card->controls, list)
 		if (macaudio_is_amp_gain(ma, kctl))
 			nr++;
+	macaudio_spk_drop_amp_gains(ma);
 	if (!nr)
 		return 0;
 
@@ -2306,6 +2355,7 @@ static int macaudio_spk_take_hpfs(struct macaudio_snd_data *ma)
 	if (!nr)
 		return -ENOENT;
 
+	macaudio_spk_drop_hpfs(ma);
 	ma->spk_hpfs = devm_kcalloc(dev, nr, sizeof(*ma->spk_hpfs), GFP_KERNEL);
 	ma->spk_hpf_granted = devm_kcalloc(dev, nr, sizeof(*ma->spk_hpf_granted), GFP_KERNEL);
 	if (!ma->spk_hpfs || !ma->spk_hpf_granted)
@@ -3563,6 +3613,8 @@ static int macaudio_card_remove(struct snd_soc_card *card)
 	cancel_delayed_work_sync(&ma->lock_timeout_work);
 	mutex_lock(&ma->volume_lock_mutex);
 	macaudio_pm_volumes_drop(ma);
+	/* The controls they point to go with this binding of the card. */
+	macaudio_spk_drop_controls(ma);
 	mutex_unlock(&ma->volume_lock_mutex);
 	return 0;
 }

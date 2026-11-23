@@ -327,11 +327,45 @@ static void macaudio_pm_volumes_ignore_user_elements(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, value, 33);
 }
 
+/*
+ * A card bound again (a codec unbound and bound) takes its volumes afresh:
+ * the kept set is the new binding's, never the old one's plus the new.
+ */
+static void macaudio_pm_volumes_taken_again(struct kunit *test)
+{
+	struct macaudio_pmt_pm t;
+	unsigned int i;
+
+	macaudio_pmt_pm_card(test, &t);
+	KUNIT_ASSERT_EQ(test, macaudio_spk_take_volumes(t.ma), 0);
+	KUNIT_ASSERT_EQ(test, t.ma->spk_nr_vols, MACAUDIO_PMT_NR_VOLS - 1);
+	for (i = 0; i < MACAUDIO_PMT_NR_VOLS - 1; i++)
+		KUNIT_EXPECT_PTR_EQ(test, t.ma->spk_vols[i], t.vols[i]);
+
+	/* As macaudio_card_remove() leaves them for the next late_probe */
+	macaudio_spk_drop_controls(t.ma);
+	KUNIT_EXPECT_EQ(test, t.ma->spk_nr_vols, 0);
+	KUNIT_EXPECT_NULL(test, t.ma->spk_vols);
+	KUNIT_ASSERT_EQ(test, macaudio_spk_take_volumes(t.ma), 0);
+	KUNIT_ASSERT_EQ(test, t.ma->spk_nr_vols, MACAUDIO_PMT_NR_VOLS - 1);
+
+	/* The lock still covers exactly the speaker volumes */
+	macaudio_pmt_take(test, &t);
+	KUNIT_EXPECT_EQ(test, macaudio_pmt_ping(test, &t), 0);
+	macaudio_pmt_notify(&t, PM_SUSPEND_PREPARE);
+	macaudio_pmt_expect_vols(test, &t, true);
+	KUNIT_EXPECT_EQ(test, t.ma->pm_nr_volumes, MACAUDIO_PMT_NR_VOLS - 1);
+	macaudio_pmt_notify(&t, PM_POST_SUSPEND);
+	KUNIT_EXPECT_EQ(test, macaudio_pmt_ping(test, &t), 0);
+	macaudio_pmt_expect_vols(test, &t, false);
+}
+
 static struct kunit_case macaudio_pm_volumes_cases[] = {
 	KUNIT_CASE(macaudio_pm_volumes_ignore_user_elements),
 	KUNIT_CASE(macaudio_pm_volumes_restored_after_sleep),
 	KUNIT_CASE(macaudio_pm_volumes_second_sleep_before_ping),
 	KUNIT_CASE(macaudio_pm_volumes_new_owner),
+	KUNIT_CASE(macaudio_pm_volumes_taken_again),
 	{}
 };
 

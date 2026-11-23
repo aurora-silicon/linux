@@ -410,8 +410,9 @@ bool snd_soc_control_matches(struct snd_kcontrol *kctl,
 
 	/*
 	 * A user-defined element (SNDRV_CTL_IOCTL_ELEM_ADD) is not one of the
-	 * card's controls: its name says nothing about it and it has no
-	 * private_value, so it never matches a driver's pattern.
+	 * card's controls: its name says nothing about it and its
+	 * private_value is not a struct soc_mixer_control, so it never
+	 * matches a driver's pattern.
 	 */
 	if (kctl->vd[0].access & SNDRV_CTL_ELEM_ACCESS_USER)
 		return false;
