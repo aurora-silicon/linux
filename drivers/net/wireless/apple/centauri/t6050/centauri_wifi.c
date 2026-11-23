@@ -111,6 +111,9 @@ struct centauri_t6050_wifi {
 	u8 avoid_ssid[IEEE80211_MAX_SSID_LEN];
 	size_t avoid_ssid_len;
 	unsigned long avoid_until;
+	/* Received frames wait here for rx_napi, whose poll hands them to GRO. */
+	struct napi_struct rx_napi;
+	struct sk_buff_head rx_gro_queue;
 };
 
 static int query_link_status(struct centauri_t6050_wifi *wifi);
@@ -353,10 +356,30 @@ static bool data_rx_frame(const u8 *packet, unsigned int capacity,
 	return *offset <= capacity && *frame_length <= capacity - *offset;
 }
 
+static int rx_poll(struct napi_struct *napi, int budget)
+{
+	struct centauri_t6050_wifi *wifi =
+		container_of(napi, struct centauri_t6050_wifi, rx_napi);
+	struct sk_buff *skb;
+	int done = 0;
+
+	while (done < budget && (skb = skb_dequeue(&wifi->rx_gro_queue))) {
+		napi_gro_receive(napi, skb);
+		done++;
+	}
+	if (done < budget && napi_complete_done(napi, done) &&
+	    !skb_queue_empty(&wifi->rx_gro_queue))
+		napi_schedule(napi);
+	return done;
+}
+
 static void drain_data_rx(struct centauri_t6050_wifi *wifi)
 {
 	u16 head, tail, post;
 	unsigned int processed = 0;
+	struct sk_buff_head frames;
+
+	__skb_queue_head_init(&frames);
 
 	if (!(wifi->data_rings_open & BIT(4)) || readl(wifi->a.bar + 8) != 2)
 		return;
@@ -408,7 +431,7 @@ static void drain_data_rx(struct centauri_t6050_wifi *wifi)
 				skb->ip_summed = CHECKSUM_NONE;
 				wifi->netdev->stats.rx_packets++;
 				wifi->netdev->stats.rx_bytes += frame_length;
-				netif_rx(skb);
+				__skb_queue_tail(&frames, skb);
 			} else {
 				wifi->netdev->stats.rx_dropped++;
 			}
@@ -430,6 +453,19 @@ static void drain_data_rx(struct centauri_t6050_wifi *wifi)
 		index_write(wifi, 3, 12, post);
 		dma_wmb();
 		writel(1, wifi->a.bar + 0x1050);
+	}
+	/*
+	 * Hand the batch to the NAPI context, so that GRO coalesces a flow's
+	 * segments (and TCP acknowledges each coalesced run once, not every
+	 * other segment) before they reach the stack.
+	 */
+	if (!skb_queue_empty(&frames)) {
+		spin_lock_bh(&wifi->rx_gro_queue.lock);
+		skb_queue_splice_tail_init(&frames, &wifi->rx_gro_queue);
+		spin_unlock_bh(&wifi->rx_gro_queue.lock);
+		local_bh_disable();
+		napi_schedule(&wifi->rx_napi);
+		local_bh_enable();
 	}
 }
 
@@ -2392,9 +2428,13 @@ static int net_open(struct net_device *netdev)
 
 	netif_carrier_off(netdev);
 	netif_stop_queue(netdev);
+	skb_queue_purge(&wifi->rx_gro_queue);
+	napi_enable(&wifi->rx_napi);
 	mutex_lock(&wifi->lock);
 	ret = wifi->configured ? data_start(wifi) : -ENETDOWN;
 	mutex_unlock(&wifi->lock);
+	if (ret)
+		napi_disable(&wifi->rx_napi);
 	return ret;
 }
 
@@ -2406,6 +2446,8 @@ static int net_stop(struct net_device *netdev)
 	cancel_scan(wifi);
 	netif_stop_queue(netdev);
 	skb_queue_purge(&wifi->data_tx_queue);
+	napi_disable(&wifi->rx_napi);
+	skb_queue_purge(&wifi->rx_gro_queue);
 	return 0;
 }
 
@@ -2647,6 +2689,7 @@ int centauri_t6050_wifi_register(struct centauri_t6050 *c)
 	wifi->control = c;
 	mutex_init(&wifi->lock);
 	skb_queue_head_init(&wifi->data_tx_queue);
+	skb_queue_head_init(&wifi->rx_gro_queue);
 	INIT_WORK(&wifi->scan_work, scan_worker);
 	INIT_WORK(&wifi->connect_work, connect_worker);
 	INIT_WORK(&wifi->link_work, link_worker);
@@ -2662,6 +2705,7 @@ int centauri_t6050_wifi_register(struct centauri_t6050 *c)
 	}
 	*(struct centauri_t6050_wifi **)wiphy_priv(wifi->wiphy) = wifi;
 	*(struct centauri_t6050_wifi **)netdev_priv(wifi->netdev) = wifi;
+	netif_napi_add(wifi->netdev, &wifi->rx_napi, rx_poll);
 	set_wiphy_dev(wifi->wiphy, &c->pdev->dev);
 	wifi->wiphy->interface_modes = BIT(NL80211_IFTYPE_STATION);
 	wifi->wiphy->max_scan_ssids = 1;
@@ -2776,6 +2820,7 @@ void centauri_t6050_wifi_unregister(struct centauri_t6050 *c)
 	skb_queue_purge(&wifi->data_tx_queue);
 	if (wifi->netdev && wifi->netdev->reg_state == NETREG_REGISTERED)
 		unregister_netdev(wifi->netdev);
+	skb_queue_purge(&wifi->rx_gro_queue);
 	if (wifi->registered)
 		wiphy_unregister(wifi->wiphy);
 	if (wifi->wiphy)
