@@ -13,7 +13,7 @@ DRIVER = ROOT / 'drivers/net/wireless/broadcom/brcm80211/brcmfmac'
 
 
 def function(source, name):
-    match = re.search(r'^(?:static\s+)?(?:void|int|bool|s32)\s+' + name +
+    match = re.search(r'^(?:static\s+)?(?:inline\s+)?(?:void|int|bool|s32)\s+' + name +
                       r'\([^;]*?\)\s*\{', source, re.M)
     if not match:
         raise ValueError('Missing function ' + name)
@@ -66,7 +66,7 @@ struct brcmf_pcie_console { u32 base_addr, buf_addr, bufsize, read_idx;
  u32 scan_idx; u8 scan_line[8]; u8 scan_len; };
 struct brcmf_pcie_shared_info { u32 tcm_base_address; struct brcmf_pcie_console console; };
 struct brcmf_pciedev_info { enum brcmf_pcie_state state; struct pci_dev *pdev;
- struct brcmf_pcie_shared_info shared; bool fw_dead, reset_wanted; u32 recoveries; unsigned long recovery_window; };
+ size_t tcm_size; struct brcmf_pcie_shared_info shared; bool fw_dead, reset_wanted; u32 recoveries; unsigned long recovery_window; };
 struct pcie_priv { struct brcmf_pciedev_info *devinfo; };
 struct brcmf_bus { enum brcmf_bus_state state; struct device *dev; struct { struct pcie_priv *pcie; } bus_priv; };
 struct brcmf_proto { void *pd; };
@@ -116,6 +116,7 @@ static void reset(void)
 {
  memset(tcm, 0, sizeof(tcm)); link_down = false;
  memset(&devinfo, 0, sizeof(devinfo)); devinfo.pdev = &pdev; devinfo.state = BRCMFMAC_PCIE_STATE_UP;
+ devinfo.tcm_size = sizeof(tcm);
  devinfo.shared.tcm_base_address = SHARED; put32(SHARED + BRCMF_SHARED_FLAGS_OFFSET, 0x10007);
  devinfo.shared.console.base_addr = CONS; devinfo.shared.console.buf_addr = BUF;
  devinfo.shared.console.bufsize = BUFSZ; put32(CONS + BRCMF_CONSOLE_WRITEIDX_OFFSET, 0);
@@ -145,6 +146,9 @@ int main(void)
  /* Trap flag in shared RAM: dead at the first stall. */
  reset(); put32(SHARED, 0x10007 | BRCMF_PCIE_SHARED_TRAP); put32(SHARED + BRCMF_SHARED_TRAP_ADDR_OFFSET, 0x800);
  put32(0x800, 4); put32(0x804, 0x1234); stall(1); assert(died("trap in shared RAM")); cases++;
+ /* A trap record outside the TCM is not read; the firmware is still dead. */
+ reset(); put32(SHARED, 0x10007 | BRCMF_PCIE_SHARED_TRAP);
+ put32(SHARED + BRCMF_SHARED_TRAP_ADDR_OFFSET, sizeof(tcm) - 4); stall(1); assert(died("trap in shared RAM")); cases++;
  /* Assert only counts when the firmware was built with asserts. */
  reset(); put32(SHARED, 0x10007 | BRCMF_PCIE_SHARED_ASSERT); stall(1); assert(!crashes); cases++;
  reset(); put32(SHARED, 0x10007 | BRCMF_PCIE_SHARED_ASSERT | BRCMF_PCIE_SHARED_ASSERT_BUILT);
@@ -165,6 +169,9 @@ int main(void)
  stall(1); assert(!crashes); cases++;
  /* A garbage write index does not run the scan off the ring. */
  reset(); put32(CONS + BRCMF_CONSOLE_WRITEIDX_OFFSET, BUFSZ + 5); stall(1); assert(!crashes); cases++;
+ /* A console buffer outside the TCM is not scanned. */
+ reset(); put32(CONS + BRCMF_CONSOLE_WRITEIDX_OFFSET, 8); devinfo.shared.console.buf_addr = sizeof(tcm) - 4;
+ stall(1); assert(!crashes); cases++;
  /* Nothing happens while the bus is down. */
  reset(); devinfo.state = BRCMFMAC_PCIE_STATE_DOWN; put32(SHARED, 0x10007 | BRCMF_PCIE_SHARED_TRAP);
  tcm_reads = 0; stall(BRCMF_PCIE_CTL_STALL_MAX); assert(!crashes && !tcm_reads); cases++;
@@ -209,6 +216,9 @@ MUTATIONS = {
     'wanted-over-limit': ('pcie', '\tif (xchg(&devinfo->fw_dead, true))\n\t\treturn;\n',
                           '\tif (xchg(&devinfo->fw_dead, true))\n\t\treturn;\n'
                           '\tWRITE_ONCE(devinfo->reset_wanted, true);\n'),
+    'trap-bound': ('pcie', '\t\tif (brcmf_pcie_tcm_range_valid(devinfo->tcm_size, addr, 8))', '\t\tif (true)'),
+    'console-bound': ('pcie', '\t    !brcmf_pcie_tcm_range_valid(devinfo->tcm_size, console->buf_addr,\n'
+                      '\t\t\t\t\tconsole->bufsize))\n', '\t    false)\n'),
     'stall-reset': ('msgbuf', '\tmsgbuf->ctl_stalls = 0;\n', ''),
     'ring-full': ('msgbuf', '\t\tif (err == -ENOMEM)\n', '\t\tif (false)\n'),
 }
@@ -220,12 +230,13 @@ def main():
     parser.add_argument('--mutation', choices=sorted(MUTATIONS))
     args = parser.parse_args()
     sources = {name: (DRIVER / (name + '.c')).read_text() for name in ('pcie', 'msgbuf')}
+    sources['pcie.h'] = (DRIVER / 'pcie.h').read_text()
     defines = ''.join(define(sources['pcie'], n) for n in (
         'BRCMF_PCIE_SHARED_ASSERT_BUILT', 'BRCMF_PCIE_SHARED_ASSERT', 'BRCMF_PCIE_SHARED_TRAP',
         'BRCMF_SHARED_FLAGS_OFFSET', 'BRCMF_SHARED_TRAP_ADDR_OFFSET', 'BRCMF_CONSOLE_WRITEIDX_OFFSET',
         'BRCMF_PCIE_CTL_STALL_MAX', 'BRCMF_PCIE_RECOVERY_MAX', 'BRCMF_PCIE_RECOVERY_WINDOW_S'))
     bodies = {
-        'pcie': ''.join(function(sources['pcie'], n) for n in (
+        'pcie': function(sources['pcie.h'], 'brcmf_pcie_tcm_range_valid') + ''.join(function(sources['pcie'], n) for n in (
             'brcmf_pcie_fw_died', 'brcmf_pcie_console_trapped', 'brcmf_pcie_ctl_stall')),
         'msgbuf': function(sources['msgbuf'], 'brcmf_msgbuf_query_dcmd_len'),
     }
