@@ -35,6 +35,8 @@
 #include <drm/drm_gem_framebuffer_helper.h>
 #include <drm/drm_modeset_helper_vtables.h>
 #include <drm/drm_probe_helper.h>
+#include <drm/drm_vblank.h>
+#include <drm/drm_vblank_helper.h>
 
 #include "dcp-internal.h"
 #include "ibootep.h"
@@ -689,8 +691,15 @@ static int iboot_crtc_atomic_check(struct drm_crtc *crtc,
 	struct drm_crtc_state *new = drm_atomic_get_new_crtc_state(state, crtc);
 	struct dcp_iboot *ib = to_dcp_iboot(crtc->dev);
 
-	/* No vblank interrupt: the helpers complete events after the flush. */
-	new->no_vblank = true;
+	/*
+	 * No vblank interrupt: page-flip events come from a timer at the
+	 * mode's refresh rate (drm_vblank_helper), so a compositor and its
+	 * clients render once per refresh instead of as fast as commits
+	 * complete. A commit that leaves the CRTC off gets no flush
+	 * (commit_tail_rpm flushes active CRTCs only), so its event goes out
+	 * at once, as before.
+	 */
+	new->no_vblank = !new->active;
 	if (new->enable && !iboot_find_mode(ib, &new->mode))
 		return -EINVAL;
 	return 0;
@@ -871,6 +880,7 @@ static void iboot_crtc_atomic_enable(struct drm_crtc *crtc,
 	iboot_set_mode_locked(ib, t, c);
 out:
 	mutex_unlock(&ib->lock);
+	drm_crtc_vblank_on(crtc);
 }
 
 static void iboot_crtc_atomic_disable(struct drm_crtc *crtc,
@@ -880,6 +890,7 @@ static void iboot_crtc_atomic_disable(struct drm_crtc *crtc,
 	struct dcp_iboot *ib = to_dcp_iboot(crtc->dev);
 	int ret, idx;
 
+	drm_crtc_vblank_off(crtc);
 	/* A mode change: SET_MODE alone switches, as before. */
 	if (new->active)
 		return;
@@ -915,6 +926,7 @@ static void iboot_crtc_atomic_disable(struct drm_crtc *crtc,
 
 static const struct drm_crtc_helper_funcs iboot_crtc_helper = {
 	.atomic_check = iboot_crtc_atomic_check,
+	.atomic_flush = drm_crtc_vblank_atomic_flush,
 	.atomic_enable = iboot_crtc_atomic_enable,
 	.atomic_disable = iboot_crtc_atomic_disable,
 };
@@ -926,6 +938,7 @@ static const struct drm_crtc_funcs iboot_crtc_funcs = {
 	.page_flip = drm_atomic_helper_page_flip,
 	.atomic_duplicate_state = drm_atomic_helper_crtc_duplicate_state,
 	.atomic_destroy_state = drm_atomic_helper_crtc_destroy_state,
+	DRM_CRTC_VBLANK_TIMER_FUNCS,
 };
 
 static const struct drm_encoder_funcs iboot_encoder_funcs = {
@@ -1054,6 +1067,10 @@ int dcp_iboot_kms_init(struct dcp_iboot *ib)
 	if (ret)
 		return ret;
 	drm_crtc_helper_add(&ib->crtc, &iboot_crtc_helper);
+
+	ret = drm_vblank_init(drm, 1);
+	if (ret)
+		return ret;
 
 	ret = drm_encoder_init(drm, &ib->encoder, &iboot_encoder_funcs,
 			       DRM_MODE_ENCODER_TMDS, NULL);
