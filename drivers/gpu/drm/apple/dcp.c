@@ -11516,7 +11516,13 @@ static void dcp_t6040_ext_link_down(struct apple_dcp *dcp)
 	 * S2R writes, which its power-up after the wake does not undo, and then every link
 	 * rate failed clock recovery into the converter. The +5 V rail stays on: without it
 	 * HPD stays low.
+	 *
+	 * A Type-C route's PHY goes the same way, for the same reason: left on, the link
+	 * after the wake failed at four lanes, fell back to fewer lanes with DSC, and the
+	 * sink dropped HPD. The connect after the wake powers it again (dcp_typec_phy_on()).
 	 */
+	if (dcp_is_typec_output(dcp) && dcp_typec_phy_release(dcp))
+		dev_dbg(dcp->dev, "Type-C DP PHY off for the sleep\n");
 	if (dcp_t6040_fixed_hdmi(dcp) && !dcp->t6040_fixed_phy_off) {
 		phy_power_off(dcp->fixed_phy);
 		phy_exit(dcp->fixed_phy);
