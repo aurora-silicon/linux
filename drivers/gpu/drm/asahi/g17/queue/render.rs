@@ -969,6 +969,8 @@ impl Pair {
         // The J813's (common 26A428) items carry configuration, descriptor and announcement in
         // one publication; macOS 27.0 never publishes a configuration alone there.
         let j813 = crate::g17::J813_FORMS.load(Ordering::Relaxed);
+        let host_only_render_kicks =
+            m5 && !j813 && self.board.is_some_and(|board| board.host_only_render_kicks);
         if m5 && !j813 && self.registered.is_none() {
             if self.installed == [true; 2] {
                 // The cold-install configuration pair must be consumed first.
@@ -1096,9 +1098,8 @@ impl Pair {
                 },
             },
             mcache,
-            // M5 tiling kicks also retain the last event of the mask, except on the J813, whose
-            // macOS 27.0 TA and 3D kicks name no event at all.
-            event_mask: if m5 && stage == 0 && !j813 {
+            // Common 26A428 and the host-only form use an empty tiling event mask.
+            event_mask: if m5 && stage == 0 && !j813 && !host_only_render_kicks {
                 [0, 0, 0, 1u64 << 62]
             } else {
                 abi::RENDER_KICK_EVENT_MASK
@@ -1155,6 +1156,16 @@ impl Pair {
         let tiling_kick = tiling_kick.prepare_entry(&ta_args)?;
         let fragment_kick = fragment_kick.prepare_entry(&fragment_args)?;
         let memory = &mut *self.memory;
+        // For a firmware that supports host-only kicks, an installed render
+        // pair with work in flight can use the host-port kick alone:
+        // another item-ring notification has no new configuration or lead
+        // command to publish. Keep the ordinary inner publication for the
+        // first command, a drained restart, a rebind, and a class change.
+        let sparse_inner = host_only_render_kicks
+            && self.active.front().is_some() && self.previous.is_none()
+            && self.registered == Some(policy.priority()) && !self.context_update
+            && !self.identity_update && !present.into_iter().any(|value| value)
+            && !leads.into_iter().any(|value| value);
         let lanes = [
             publication::Lane::new(
                 &memory.graph,
@@ -1165,6 +1176,7 @@ impl Pair {
                 present[0],
                 kicks[0],
                 leads[0],
+                sparse_inner,
             )?,
             publication::Lane::new(
                 &memory.graph,
@@ -1175,6 +1187,7 @@ impl Pair {
                 present[1],
                 kicks[1],
                 leads[1],
+                sparse_inner,
             )?,
         ];
         let windows = [lanes[0].window, lanes[1].window];
@@ -1398,6 +1411,7 @@ impl Pair {
                 true,
                 kicks[0],
                 false,
+                false,
             )?,
             publication::Lane::new(
                 &self.memory.graph,
@@ -1407,6 +1421,7 @@ impl Pair {
                 configs[1],
                 true,
                 kicks[1],
+                false,
                 false,
             )?,
         ];
