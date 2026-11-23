@@ -57,8 +57,8 @@ pub(crate) struct Recovery {
     warning_deadline_ns: [u64; 2],
     pub(crate) long_commands: u64,
     pub(crate) publication_wait_deadline: Option<u64>,
-    /// Last fully retired compute/TA/FS identity, for late recovery snapshots.
-    pub(crate) last_retired: [Option<u32>; 3],
+    /// Recently retired compute/TA/FS stamps, for late recovery snapshots.
+    pub(crate) last_retired: logic::RetiredStamps,
     /// Queue engine order: render, compute. A quarantined/exhausted class stays offline.
     pub(crate) unavailable: [Option<Error>; 2],
     pub(crate) errors_seen: u32,
@@ -84,7 +84,7 @@ impl Recovery {
             warning_deadline_ns: [u64::MAX; 2],
             long_commands: 0,
             publication_wait_deadline: None,
-            last_retired: [None; 3],
+            last_retired: logic::RetiredStamps::new(),
             unavailable: [None; 2],
             errors_seen: 0,
             statistics_seen: 0,

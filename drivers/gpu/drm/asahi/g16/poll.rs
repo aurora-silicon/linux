@@ -76,6 +76,22 @@ fn stats_show(shared: &Arc<Shared>, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 }
 
 impl Shared {
+    /// Schedules a delayed poll while idle so DVFS utilization decays to S1 and a held CLPC
+    /// memory/fabric floor expires cleanly after all flights drain.
+    fn arm_idle_power_poll(self: &Arc<Self>, firmware: &Firmware) {
+        if firmware.recovery.failed().is_some() {
+            return;
+        }
+        let delay_ns = if firmware.power.clpc_holding() {
+            super::power::policy::CLPC_IDLE_HOLD_NS
+        } else if firmware.power.utilization.decaying() {
+            super::power::policy::WINDOW_NS
+        } else {
+            return;
+        };
+        self.mod_poll(kernel::time::msecs_to_jiffies((delay_ns / 1_000_000) as u32).max(1));
+    }
+
     /// One poll pass (the poll work item).
     pub(crate) fn run_poll(self: Arc<Self>) {
         // The domain may be off. The sleep's end queues a pass.
@@ -117,31 +133,12 @@ impl Shared {
                     Ok(true) => {
                         self.rearm(firmware.engine.chan_wait || firmware.engine.short_repoll)
                     }
-                    // Idle: one more pass after a window gives the state back. A failed
-                    // engine's poll no longer services power, so it has nothing to give back.
-                    Ok(false)
-                        if firmware.recovery.failed().is_none()
-                            && firmware.power.utilization.decaying() =>
-                    {
-                        self.mod_poll(kernel::time::msecs_to_jiffies(
-                            (if firmware.power.clpc_holding() {
-                                super::power::policy::CLPC_IDLE_HOLD_NS
-                            } else {
-                                super::power::policy::WINDOW_NS
-                            } / 1_000_000) as u32,
-                        ));
+                    // Idle: arm a delayed poll while DVFS utilization is decaying or a CLPC
+                    // floor hold is still pending so both expire cleanly to idle power.
+                    Ok(false) => {
+                        self.arm_idle_power_poll(firmware);
                         self.cancel_resnap();
                     }
-                    Ok(false)
-                        if firmware.recovery.failed().is_none()
-                            && firmware.power.clpc_holding() =>
-                    {
-                        self.mod_poll(kernel::time::msecs_to_jiffies(
-                            (super::power::policy::CLPC_IDLE_HOLD_NS / 1_000_000) as u32,
-                        ));
-                        self.cancel_resnap();
-                    }
-                    Ok(false) => self.cancel_resnap(),
                     Err(error) => {
                         self.cancel_resnap();
                         firmware.fail_stop(error, &mut done);
@@ -178,6 +175,8 @@ impl Shared {
                         self.fail_stop(error);
                     } else if firmware.recovery.needs_repoll() || firmware.engine.frozen {
                         self.rearm(false);
+                    } else if firmware.engine.flights.is_empty() {
+                        self.arm_idle_power_poll(firmware);
                     }
                 }
             }
@@ -256,6 +255,9 @@ impl Shared {
             }
             if !firmware.engine.flights.is_empty() || firmware.engine.chan_wait {
                 self.rearm(firmware.engine.chan_wait);
+            } else {
+                firmware.power.report_work(false);
+                self.arm_idle_power_poll(firmware);
             }
         }
         accepted
@@ -296,7 +298,7 @@ impl Shared {
         let mut scrubs = super::slots::ScrubBatch::new();
         let accepted = {
             let mut state = self.state.lock();
-            if self.sleeping.load(Ordering::Acquire) || self.recovering.load(Ordering::Acquire) {
+            if self.sleeping.load(Ordering::Acquire) {
                 return None;
             }
             match state.as_deref_mut() {
@@ -1101,12 +1103,14 @@ impl Firmware {
                 core::mem::forget(f);
                 return;
             }
-            if f.computes != 0 {
-                self.recovery.last_retired[0] = Some(f.target);
+            for &stamp in &f.cstamp[..(f.computes as usize).min(f.cstamp.len())] {
+                self.recovery.last_retired.push(0, stamp);
             }
             if f.renders != 0 {
-                self.recovery.last_retired[1] = Some(f.ta_target);
-                self.recovery.last_retired[2] = Some(f.fs_target);
+                for m in 0..(f.renders as usize).min(f.r_ta_stamp.len()) {
+                    self.recovery.last_retired.push(1, f.r_ta_stamp[m]);
+                    self.recovery.last_retired.push(2, f.r_fs_stamp[m]);
+                }
                 let committed = f.pb.as_ref().ok_or(EINVAL).and_then(|epoch| {
                     self.pools.retire_flight(
                         f.pb_slot as usize,
@@ -1205,6 +1209,7 @@ impl Firmware {
                             complete(done, j3, Err(error));
                         }
                         self.fail_stop(error, done);
+                        core::mem::forget(f);
                         return;
                     }
                 }
@@ -1217,6 +1222,7 @@ impl Firmware {
             // Drained: a gap until the next publication.
             self.engine.stats.idle_from_ns = now_ns();
             self.power.utilization.idle(self.engine.stats.idle_from_ns);
+            self.power.report_work(false);
         }
         // The next prefix on the retired flight's class(es) starts executing about now.
         if f.renders != 0 {
@@ -1294,6 +1300,7 @@ impl Firmware {
                             self.retain(j2);
                             complete(done, j2, Err(proof_error));
                             self.fail_stop(proof_error, done);
+                            core::mem::forget(f);
                             return;
                         }
                     }
@@ -1380,7 +1387,8 @@ impl Firmware {
                     let index = *slots.get(compute).ok_or(EINVAL)? as usize;
                     if !command.timestamp_outputs.is_empty() {
                         let unit = flight.job.resources.compute_unit(index)?;
-                        let ticks = [unit.its.r64(0)?, unit.its.r64(8)?, 0, 0];
+                        let (start, end) = self.compute_ticks(unit)?;
+                        let ticks = [start, end, 0, 0];
                         command
                             .timestamp_outputs
                             .publish(ticks, super::hw::COMMAND_TIMESTAMP_HZ);
@@ -1412,7 +1420,8 @@ impl Firmware {
                         let index = *slots.get(compute).ok_or(EINVAL)? as usize;
                         if !command.timestamp_outputs.is_empty() {
                             let unit = flight.job.resources.compute_unit(index)?;
-                            let ticks = [unit.its.r64(0)?, unit.its.r64(8)?, 0, 0];
+                            let (start, end) = self.compute_ticks(unit)?;
+                            let ticks = [start, end, 0, 0];
                             command
                                 .timestamp_outputs
                                 .publish(ticks, super::hw::COMMAND_TIMESTAMP_HZ);

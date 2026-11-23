@@ -120,32 +120,58 @@ impl Shared {
 impl Job {
     METHODS
 }
-struct SchedJob { job:Arc<Job>, shared:Arc<Shared> }
-struct ArmedJob { job:SchedJob, pushed:Arc<Mutex<Vec<u64>>> }
-impl ArmedJob {
-    fn push(self) { self.pushed.lock().unwrap().push(self.job.job.id); }
+struct SchedJob { job:Arc<Job>, shared:Arc<Shared>, pending_sched:Arc<AtomicUsize>, counted:bool }
+impl SchedJob {
+    fn finish_pending(&mut self) {
+        if self.counted {
+            self.counted = false;
+            self.pending_sched.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+    fn run(&mut self) {
+        self.job.start(&self.shared);
+        self.finish_pending();
+    }
 }
-struct PendingJob { job:SchedJob, deps:Vec<InputFence>, pushed:Arc<Mutex<Vec<u64>>>, fail_dep:bool }
+impl Drop for SchedJob {
+    fn drop(&mut self) {
+        self.finish_pending();
+    }
+}
+struct ArmedJob { job:SchedJob, pushed:Arc<Mutex<Vec<u64>>>, queue:Arc<Mutex<Vec<SchedJob>>> }
+impl ArmedJob {
+    fn push(self) {
+        self.pushed.lock().unwrap().push(self.job.job.id);
+        self.queue.lock().unwrap().push(self.job);
+    }
+}
+struct PendingJob { job:SchedJob, deps:Vec<InputFence>, pushed:Arc<Mutex<Vec<u64>>>, queue:Arc<Mutex<Vec<SchedJob>>>, fail_dep:bool }
 impl PendingJob {
     fn add_dependency(&mut self, fence:InputFence)->Result {
         if self.fail_dep { return Err(ENOMEM); }
         self.deps.push(fence);
         Ok(())
     }
-    fn arm(self)->ArmedJob { ArmedJob { job:self.job, pushed:self.pushed } }
+    fn arm(self)->ArmedJob { ArmedJob { job:self.job, pushed:self.pushed, queue:self.queue } }
 }
-struct Entity { new_jobs:AtomicUsize, pushed:Arc<Mutex<Vec<u64>>>, fail_new:bool, fail_dep:bool }
+struct Entity { new_jobs:AtomicUsize, pushed:Arc<Mutex<Vec<u64>>>, queue:Arc<Mutex<Vec<SchedJob>>>, fail_new:bool, fail_dep:bool }
 impl Entity {
-    fn new()->Self { Self { new_jobs:AtomicUsize::new(0), pushed:Arc::new(Mutex::new(vec![])), fail_new:false, fail_dep:false } }
+    fn new()->Self { Self { new_jobs:AtomicUsize::new(0), pushed:Arc::new(Mutex::new(vec![])), queue:Arc::new(Mutex::new(vec![])), fail_new:false, fail_dep:false } }
     fn new_job(&mut self, _credits:u32, job:SchedJob)->Result<PendingJob> {
         self.new_jobs.fetch_add(1, Ordering::AcqRel);
         if self.fail_new { return Err(ENOMEM); }
-        Ok(PendingJob { job, deps:vec![], pushed:self.pushed.clone(), fail_dep:self.fail_dep })
+        Ok(PendingJob { job, deps:vec![], pushed:self.pushed.clone(), queue:self.queue.clone(), fail_dep:self.fail_dep })
+    }
+    fn drain_run(&self) {
+        let mut jobs = core::mem::take(&mut *self.queue.lock().unwrap());
+        for mut job in jobs.drain(..) {
+            job.run();
+        }
     }
 }
-struct Scheduler { entity:Entity, last_job:Option<Arc<Job>> }
+struct Scheduler { entity:Entity, pending_sched:Arc<AtomicUsize> }
 impl Scheduler {
-    fn new()->Self { Self { entity:Entity::new(), last_job:None } }
+    fn new()->Self { Self { entity:Entity::new(), pending_sched:Arc::new(AtomicUsize::new(0)) } }
     PUSH_METHOD
 }
 fn job(id:u64,status:Arc<Status>)->Arc<Job> {
@@ -486,7 +512,8 @@ fn scheduler_push_bypasses_drm_sched_on_inline_start_and_rolls_back_on_fallback_
     assert_eq!(sched.entity.new_jobs.load(Ordering::Acquire),0);
     assert_eq!(*shared.submitted.lock().unwrap(),vec![1,2]);
     // Unsignalled input falls back to drm_sched; subsequent job waits for predecessor start.
-    let j3=job_with_inputs(3,status.clone(),vec![InputFence::new(0)]);
+    let f3=InputFence::new(0);
+    let j3=job_with_inputs(3,status.clone(),vec![f3.clone()]);
     sched.push(j3.clone(),shared.clone()).unwrap();
     assert!(!j3.is_started());
     assert_eq!(sched.entity.new_jobs.load(Ordering::Acquire),1);
@@ -496,15 +523,25 @@ fn scheduler_push_bypasses_drm_sched_on_inline_start_and_rolls_back_on_fallback_
     assert!(!j4.is_started());
     assert_eq!(sched.entity.new_jobs.load(Ordering::Acquire),2);
     assert_eq!(*sched.entity.pushed.lock().unwrap(),vec![3,4]);
-    // Fallback ENOMEM rolls back accepted so the failed push never poisons queue ordinals.
-    j3.started.store(true,Ordering::Release);
-    j4.started.store(true,Ordering::Release);
+    // Fallback ENOMEM rolls back accepted and pending_sched without poisoning queue ordering.
+    f3.signal(1);
+    sched.entity.drain_run();
+    assert_eq!(sched.pending_sched.load(Ordering::Acquire),0);
     sched.entity.fail_new=true;
     let j5=job_with_inputs(5,status.clone(),vec![InputFence::new(0)]);
     j5.accepted.store(false,Ordering::Release);
     assert_eq!(sched.push(j5.clone(),shared.clone()),Err(ENOMEM));
     assert!(!j5.accepted.load(Ordering::Acquire));
     assert!(!j5.is_started());
+    assert_eq!(sched.pending_sched.load(Ordering::Acquire),0);
+    // Scheduler retains zero Arc<Job> references after inline or drm_sched completion.
+    let w1=Arc::downgrade(&j1);
+    let w3=Arc::downgrade(&j3);
+    let w4=Arc::downgrade(&j4);
+    drop((j1,j2,j3,j4,j5));
+    assert!(w1.upgrade().is_none(), "inline job must not be retained by Scheduler");
+    assert!(w3.upgrade().is_none(), "drm_sched job must not be retained by Scheduler after run");
+    assert!(w4.upgrade().is_none(), "queued job must not be retained by Scheduler after run");
 }
 '''.replace('QUEUE_METHODS', queue_methods).replace('ORDER_SOURCE', order_source).replace('FENCE_METHODS', fence_methods).replace('METHODS', methods.replace('super::fence::','fence::')).replace('PUSH_METHOD', push_method)
 

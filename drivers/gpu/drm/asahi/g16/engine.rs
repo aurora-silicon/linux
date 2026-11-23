@@ -706,13 +706,7 @@ impl Firmware {
         target: u32,
         stage: [u32; 3],
     ) -> Result {
-        if flags & 1 != 0
-            && super::recovery::logic::last_retired_target(
-                &self.recovery.last_retired,
-                event,
-                target,
-            )
-        {
+        if flags & 1 != 0 && self.recovery.last_retired.contains(event, target) {
             // A notification may follow the full receipt. It names the retained old
             // owner, not the next command that happens to occupy the flight list.
             return Ok(());

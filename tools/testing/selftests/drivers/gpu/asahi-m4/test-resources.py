@@ -153,7 +153,7 @@ pub mod g16 {
         pub enum PassOwnerArena{Base(crate::sync::Arc<RenderArena>)}
         pub struct PoolExtArena;
         #[derive(Clone)]
-        pub enum PbOwnerArena{Base(crate::sync::Arc<RenderArena>),Ext(crate::sync::Arc<PoolExtArena>)}
+        pub enum PbOwnerArena{Base(crate::sync::Arc<RenderArena>),Ext(crate::sync::Arc<RenderArena>,crate::sync::Arc<PoolExtArena>)}
         impl PassOwnerArena{
             pub fn pass_and_tilemap_dirty(&self,k:usize)->Option<(&super::slots::PassSlot,&AtomicU64)>{
                 match self{Self::Base(a)=>Some((a.passes.get(k)?,a.tilemap_dirty.get(k)?))}
@@ -857,7 +857,7 @@ pub mod g16 {
         // Publish and retire slot 0: not displaced yet, so nothing is staged.
         let mut c0=Claims::new();c0.pass[0]=0;c0.pass_mask=1;
         s.claim_pass_in(&prep,0,Some(a.id),0x4000).unwrap();
-        s.hold_vm(&c0,&a).unwrap();s.hold_arenas(&c0,&prep);s.publish(&c0).unwrap();
+        s.hold_vm(&c0,&a).unwrap();s.hold_arenas(&c0,&prep);s.publish(&mut c0).unwrap();
         render.set_dirty(0,0x2000,0x4000).unwrap();
         render.passes[0].tilemap.fill(0,0xab,0x4000).unwrap();
         render.passes[0].its.fill(0,0xcd,32).unwrap();
@@ -868,7 +868,7 @@ pub mod g16 {
         // Publish and retire slot 1: displaces slot 0, staging slot 0 for off-lock scrub.
         let mut c1=Claims::new();c1.pass[0]=1;c1.pass_mask=2;
         s.claim_pass_in(&prep,1,Some(a.id),0x1000).unwrap();
-        s.hold_vm(&c1,&a).unwrap();s.hold_arenas(&c1,&prep);s.publish(&c1).unwrap();
+        s.hold_vm(&c1,&a).unwrap();s.hold_arenas(&c1,&prep);s.publish(&mut c1).unwrap();
         s.retire(&mut c1).unwrap();
         s.stage_displaced_pass_scrubs();
         assert!(s.scrubbing_active());
@@ -900,13 +900,13 @@ pub mod g16 {
         // Prime and displace slot 0.
         let mut c0=Claims::new();c0.pass[0]=0;c0.pass_mask=1;
         s.claim_pass_in(&prep,0,Some(a.id),0x2000).unwrap();
-        s.hold_vm(&c0,&a).unwrap();s.hold_arenas(&c0,&prep);s.publish(&c0).unwrap();
+        s.hold_vm(&c0,&a).unwrap();s.hold_arenas(&c0,&prep);s.publish(&mut c0).unwrap();
         render.set_dirty(0,0x1000,0x2000).unwrap();
         render.passes[0].tilemap.fill(0,0x55,0x2000).unwrap();
         s.retire(&mut c0).unwrap();
         let mut c1=Claims::new();c1.pass[0]=1;c1.pass_mask=2;
         s.claim_pass_in(&prep,1,Some(a.id),0x1000).unwrap();
-        s.hold_vm(&c1,&a).unwrap();s.hold_arenas(&c1,&prep);s.publish(&c1).unwrap();
+        s.hold_vm(&c1,&a).unwrap();s.hold_arenas(&c1,&prep);s.publish(&mut c1).unwrap();
         s.retire(&mut c1).unwrap();
         // Dropped batch clears scrubbing bit without marking clean.
         s.stage_displaced_pass_scrubs();
@@ -924,20 +924,20 @@ pub mod g16 {
         assert!(render.passes[0].tilemap.snapshot()[..0x2000].iter().all(|&b|b==0));
         // Cancel, re-displace, pre-scrub clean, then invalidate_scrub() or cross-VM forces full scrub.
         let mut c0=Claims::new();c0.pass[0]=0;c0.pass_mask=1;
-        s.hold_vm(&c0,&a).unwrap();s.hold_arenas(&c0,&prep);s.publish(&c0).unwrap();s.retire(&mut c0).unwrap();
+        s.hold_vm(&c0,&a).unwrap();s.hold_arenas(&c0,&prep);s.publish(&mut c0).unwrap();s.retire(&mut c0).unwrap();
         let mut c1=Claims::new();c1.pass[0]=1;c1.pass_mask=2;
         s.claim_pass_in(&prep,1,Some(a.id),0x1000).unwrap();
-        s.hold_vm(&c1,&a).unwrap();s.hold_arenas(&c1,&prep);s.publish(&c1).unwrap();s.retire(&mut c1).unwrap();
+        s.hold_vm(&c1,&a).unwrap();s.hold_arenas(&c1,&prep);s.publish(&mut c1).unwrap();s.retire(&mut c1).unwrap();
         s.stage_displaced_pass_scrubs();
         let _=s.take_staged_scrubs().run();
         s.invalidate_scrub();
         s.claim_pass_in(&prep,0,Some(a.id),0x2000).unwrap();
         assert!(s.render_needs_full_work(0));
         let mut c0=Claims::new();c0.pass[0]=0;c0.pass_mask=1;
-        s.hold_vm(&c0,&a).unwrap();s.hold_arenas(&c0,&prep);s.publish(&c0).unwrap();s.retire(&mut c0).unwrap();
+        s.hold_vm(&c0,&a).unwrap();s.hold_arenas(&c0,&prep);s.publish(&mut c0).unwrap();s.retire(&mut c0).unwrap();
         let mut c1=Claims::new();c1.pass[0]=1;c1.pass_mask=2;
         s.claim_pass_in(&prep,1,Some(a.id),0x1000).unwrap();
-        s.hold_vm(&c1,&a).unwrap();s.hold_arenas(&c1,&prep);s.publish(&c1).unwrap();s.retire(&mut c1).unwrap();
+        s.hold_vm(&c1,&a).unwrap();s.hold_arenas(&c1,&prep);s.publish(&mut c1).unwrap();s.retire(&mut c1).unwrap();
         s.stage_displaced_pass_scrubs();
         let _=s.take_staged_scrubs().run();
         s.claim_pass_in(&prep,0,Some(b.id),0x2000).unwrap();
@@ -952,14 +952,14 @@ pub mod g16 {
         // Prime slot 0, then displace it by retiring slot 1; record retirement without staging yet.
         let mut c0=Claims::new();c0.pass[0]=0;c0.pass_mask=1;
         s.claim_pass_in(&prep,0,Some(a.id),0x2000).unwrap();
-        s.hold_vm(&c0,&a).unwrap();s.hold_arenas(&c0,&prep);s.publish(&c0).unwrap();
+        s.hold_vm(&c0,&a).unwrap();s.hold_arenas(&c0,&prep);s.publish(&mut c0).unwrap();
         render.set_dirty(0,0x1000,0x2000).unwrap();
         render.passes[0].tilemap.fill(0,0x77,0x2000).unwrap();
         s.retire(&mut c0).unwrap();
         s.note_render_retired();
         let mut c1=Claims::new();c1.pass[0]=1;c1.pass_mask=2;
         s.claim_pass_in(&prep,1,Some(a.id),0x1000).unwrap();
-        s.hold_vm(&c1,&a).unwrap();s.hold_arenas(&c1,&prep);s.publish(&c1).unwrap();
+        s.hold_vm(&c1,&a).unwrap();s.hold_arenas(&c1,&prep);s.publish(&mut c1).unwrap();
         s.retire(&mut c1).unwrap();
         s.note_render_retired();
         // Immediate publication in the same lock hold sees slot 0 available and NOT scrubbing.
@@ -1003,7 +1003,7 @@ pub mod g16 {
         assert_eq!(s.free_compute_in(hw::sizes::COMPUTE_UNITS),(hw::sizes::COMPUTE_UNITS-4) as u32);
         s.hold_vm(&claims,&a).unwrap();
         s.hold_arenas(&claims,&prep);
-        s.publish(&claims).unwrap();
+        s.publish(&mut claims).unwrap();
         assert_eq!(s.compute_published(),4);
         s.retire(&mut claims).unwrap();
         assert_eq!(s.compute_published(),0);
@@ -1053,7 +1053,7 @@ pub mod g16 {
 
         s.hold_vm(&c,&a).unwrap();
         s.hold_arenas(&c,&prep);
-        s.publish(&c).unwrap();
+        s.publish(&mut c).unwrap();
         assert_eq!(s.render_published(),3);
         s.retire(&mut c).unwrap();
         assert_eq!(s.render_published(),0);
@@ -1135,9 +1135,9 @@ pub mod g16 {
         // unit 0 is now retired-undisplaced and unit 1 is quarantined -> base [0..2] exhausted.
         let mut c=Claims::new();
         assert_eq!(s.claim_compute_for(&prep_full,&mut c,Some(a.id)).unwrap(),Some(0));
-        s.hold_vm(&c,&a).unwrap();s.publish(&c).unwrap();s.retire(&mut c).unwrap();
+        s.hold_vm(&c,&a).unwrap();s.publish(&mut c).unwrap();s.retire(&mut c).unwrap();
         assert_eq!(s.claim_compute_for(&prep_full,&mut c,Some(a.id)).unwrap(),Some(1));
-        s.hold_vm(&c,&a).unwrap();s.publish(&c).unwrap();s.quarantine(&mut c);
+        s.hold_vm(&c,&a).unwrap();s.publish(&mut c).unwrap();s.quarantine(&mut c);
         assert!(s.base_compute_quarantined());
         assert!(s.compute_exhausted_within(2));
         assert!(!s.compute_exhausted_within(4));
@@ -1148,7 +1148,7 @@ pub mod g16 {
         assert!(should_expand_compute_ext(&mut last,&mut burst,10_000_000,1,s.base_compute_quarantined()));
         // Expanded fresh VM claims unit 2, retires cleanly, and displaces base unit 0 back to reusable.
         assert_eq!(s.claim_compute_for(&prep_full,&mut c,Some(b.id)).unwrap(),Some(2));
-        s.hold_vm(&c,&b).unwrap();s.publish(&c).unwrap();s.retire(&mut c).unwrap();
+        s.hold_vm(&c,&b).unwrap();s.publish(&mut c).unwrap();s.retire(&mut c).unwrap();
         assert!(!s.compute_exhausted_within(2));
         assert!(s.compute_available(2));
         // A base-only (2-unit) VM can now claim displaced base unit 0 again.
@@ -1179,10 +1179,10 @@ pub mod g16 {
         // Retire base pass slot 0, then hang and quarantine base pass slot 1 -> base [0..2] exhausted.
         let mut c0=Claims::new();c0.pass[0]=0;c0.pass_count=1;c0.pass_mask=1<<0;
         s.claim_pass_in(&prep,0,Some(a.id),0x1000).unwrap();
-        s.hold_vm(&c0,&a).unwrap();s.publish(&c0).unwrap();s.retire(&mut c0).unwrap();
+        s.hold_vm(&c0,&a).unwrap();s.publish(&mut c0).unwrap();s.retire(&mut c0).unwrap();
         let mut c1=Claims::new();c1.pass[0]=1;c1.pass_count=1;c1.pass_mask=1<<1;
         s.claim_pass_in(&prep,1,Some(a.id),0x1000).unwrap();
-        s.hold_vm(&c1,&a).unwrap();s.publish(&c1).unwrap();s.quarantine(&mut c1);
+        s.hold_vm(&c1,&a).unwrap();s.publish(&mut c1).unwrap();s.quarantine(&mut c1);
         assert!(s.base_render_quarantined());
         assert!(s.render_exhausted_within(2));
         assert!(!s.render_exhausted_within(4));
@@ -1194,7 +1194,7 @@ pub mod g16 {
         assert_eq!(k,2);
         let mut c2=Claims::new();c2.pass[0]=k as u32;c2.pass_count=1;c2.pass_mask=1<<k;
         s.claim_pass_in(&prep,k,Some(b.id),0x1000).unwrap();
-        s.hold_vm(&c2,&b).unwrap();s.publish(&c2).unwrap();s.retire(&mut c2).unwrap();
+        s.hold_vm(&c2,&b).unwrap();s.publish(&mut c2).unwrap();s.retire(&mut c2).unwrap();
         assert!(!s.render_exhausted_within(2));
     }
 

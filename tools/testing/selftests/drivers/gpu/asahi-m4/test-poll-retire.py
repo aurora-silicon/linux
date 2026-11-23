@@ -183,6 +183,7 @@ impl Shared {
     fn rearm(&self, _soon: bool) {
         self.rearmed.set(self.rearmed.get() + 1);
     }
+    fn arm_idle_power_poll(&self, _firmware: &Firmware) {}
     fn fail_stop(&self, _e: Error) {}
     __SUBMIT_LOCKED__
 }
@@ -195,6 +196,7 @@ impl Power {
     fn needs_ramp(&self, _now: u64) -> bool {
         self.ramp
     }
+    fn report_work(&mut self, _in_flight: bool) {}
 }
 
 struct Firmware {

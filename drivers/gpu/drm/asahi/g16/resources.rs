@@ -296,7 +296,7 @@ impl PoolExtArena {
 #[allow(dead_code)]
 pub(crate) enum PbOwnerArena {
     Base(Arc<RenderArena>),
-    Ext(Arc<PoolExtArena>),
+    Ext(Arc<RenderArena>, Arc<PoolExtArena>),
 }
 
 /// Keeps the arena owning a retained pass slot alive through displacement.
@@ -826,13 +826,14 @@ impl Prepared {
     }
     /// The arena owning PB/UMA allocator slot `k`.
     pub(crate) fn pb_owner_arena(&self, k: usize) -> Option<PbOwnerArena> {
+        let base = self.render.as_ref()?;
         if k < BASE_PB_SLOTS {
-            self.render.as_ref().map(|r| PbOwnerArena::Base(r.clone()))
+            Some(PbOwnerArena::Base(base.clone()))
         } else {
             self.pb_ext
                 .get(k - BASE_PB_SLOTS)
                 .and_then(|slot| slot.as_ref())
-                .map(|ext| PbOwnerArena::Ext(ext.clone()))
+                .map(|ext| PbOwnerArena::Ext(base.clone(), ext.clone()))
         }
     }
     /// Render pass slots this job can use.

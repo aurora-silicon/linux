@@ -1181,11 +1181,8 @@ mod compute_horizon_scope {
     }
 
     mod recovery {
-        pub mod logic {
-            pub fn last_retired_target(last: &[Option<u32>; 3], event: u32, target: u32) -> bool {
-                let idx = match event { 15 => 0, 0x70 => 1, 0x71 => 2, _ => return false };
-                last[idx] == Some(target)
-            }
+        pub(crate) mod logic {
+            pub(crate) use crate::recovery::logic::RetiredStamps;
         }
     }
     mod poll {
@@ -1230,7 +1227,7 @@ mod compute_horizon_scope {
         recovery_started_ns: u64,
     }
     struct RecEngine { flights: Vec<RecFlight>, ta_target: u32 }
-    struct RecState { last_retired: [Option<u32>; 3] }
+    struct RecState { last_retired: recovery::logic::RetiredStamps }
     struct RecFirmware { engine: RecEngine, recovery: RecState }
     impl RecFirmware {
         __RECOVERY_PREPARE__
@@ -1260,7 +1257,7 @@ mod compute_horizon_scope {
                 }],
                 ta_target: 0,
             },
-            recovery: RecState { last_retired: [None; 3] },
+            recovery: RecState { last_retired: recovery::logic::RetiredStamps::new() },
         };
         assert_eq!(fw.recovery_prepare(1, 15, 0x200, [0, 0, 0x100]), Ok(()));
         assert!(fw.engine.flights[0].doomed);
@@ -1302,7 +1299,7 @@ mod compute_horizon_scope {
                 }],
                 ta_target: 0x300,
             },
-            recovery: RecState { last_retired: [None; 3] },
+            recovery: RecState { last_retired: recovery::logic::RetiredStamps::new() },
         };
         // Pass 0 TA finished (stage[0] == 0x100); interior TA target 0x200 matches and cleans
         // TPC only for unfinished passes 1 and 2.
