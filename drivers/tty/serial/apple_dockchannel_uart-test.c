@@ -61,15 +61,18 @@ static u32 *dcut_reg(u8 *base, unsigned int off)
 	return (u32 *)(base + off);
 }
 
+/*
+ * The stubs are active for the test task, so an interrupt that runs a real
+ * DockChannel port on top of it lands here too: give that port its own
+ * registers, as the driver would.
+ */
 static u32 dcut_rx_readl(struct dcuart_port *dcuart, u32 reg)
 {
 	struct dcut_ctx *ctx = kunit_get_current_test()->priv;
 	u8 c;
 
-	if (dcuart != &ctx->dcuart) {
-		ctx->violations++;
-		return 0;
-	}
+	if (dcuart != &ctx->dcuart)
+		return readl_relaxed(dcuart->port.membase + reg);
 
 	switch (reg) {
 	case DATA_RX_COUNT:
@@ -99,6 +102,9 @@ static u32 dcut_tx_free(struct dcuart_port *dcuart)
 {
 	struct dcut_ctx *ctx = kunit_get_current_test()->priv;
 
+	if (dcuart != &ctx->dcuart)
+		return readl(dcuart->port.membase + DATA_TX_FREE);
+
 	ctx->tx_free_reads++;
 	return ctx->tx_room;
 }
@@ -106,6 +112,11 @@ static u32 dcut_tx_free(struct dcuart_port *dcuart)
 static void dcut_tx_put(struct dcuart_port *dcuart, u8 ch)
 {
 	struct dcut_ctx *ctx = kunit_get_current_test()->priv;
+
+	if (dcuart != &ctx->dcuart) {
+		writel(ch, dcuart->port.membase + DATA_TX8);
+		return;
+	}
 
 	if (!ctx->tx_room || ctx->tx_len >= DCUT_LOG) {
 		ctx->violations++;
