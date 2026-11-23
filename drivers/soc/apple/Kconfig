@@ -90,6 +90,18 @@ config APPLE_PMGR_DCS_KUNIT_TEST
 	  Also verify that boot constraints and concurrent endpoints retain
 	  their votes, and that suspend restores the last confirmed request.
 
+config APPLE_PMGR_FABRIC_KUNIT_TEST
+	bool "KUnit tests for the Apple PMGR fabric controls" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y && APPLE_PMGR_MISC=y && OF_DYNAMIC && MFD_SYSCON
+	default KUNIT_ALL_TESTS
+	help
+	  Test the fabric and DCS suspend and resume p-states with and
+	  without PMP, the confirmed fabric raise and its timeout, fabric
+	  holds, the idle fabric governor and its parameter, and the device
+	  tree lookup of the governor's bandwidth voters, on simulated
+	  registers and a test device tree fragment. No hardware is accessed;
+	  only useful for kernel developers.
+
 config APPLE_CLUSTER_PWRGATE
 	bool "Apple SoC CPU cluster power gates"
 	depends on OF

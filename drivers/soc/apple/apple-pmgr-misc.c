@@ -22,7 +22,7 @@
 #include <linux/soc/apple/pmgr-misc.h>
 #include <linux/sort.h>
 #include <linux/workqueue.h>
-#if IS_ENABLED(CONFIG_APPLE_PMGR_DCS_KUNIT_TEST)
+#if IS_ENABLED(CONFIG_APPLE_PMGR_DCS_KUNIT_TEST) || IS_ENABLED(CONFIG_APPLE_PMGR_FABRIC_KUNIT_TEST)
 #include <kunit/static_stub.h>
 #endif
 
@@ -499,6 +499,9 @@ static bool apple_pmgr_cpus_at_min(void)
 	unsigned int cpu;
 	bool at_min = true;
 
+#if IS_ENABLED(CONFIG_APPLE_PMGR_FABRIC_KUNIT_TEST)
+	KUNIT_STATIC_STUB_REDIRECT(apple_pmgr_cpus_at_min);
+#endif
 	for_each_online_cpu(cpu) {
 		policy = cpufreq_cpu_get(cpu);
 		if (!policy)
@@ -848,4 +851,8 @@ module_platform_driver(apple_pmgr_misc_driver);
 
 #if IS_ENABLED(CONFIG_APPLE_PMGR_DCS_KUNIT_TEST)
 #include "apple-pmgr-dcs-test.c"
+#endif
+
+#if IS_ENABLED(CONFIG_APPLE_PMGR_FABRIC_KUNIT_TEST)
+#include "apple-pmgr-fabric-test.c"
 #endif
