@@ -91,7 +91,7 @@ struct avd_frame { unsigned int idx; struct avd_buf *prog; size_t prog_words;
                    dma_addr_t fifo_iova; u32 cmd[24], tag; unsigned long deadline; int state,status;
                    struct avd_ctx *ctx; };
 struct avd_segment { u32 instructions[AVD_MAX_INST]; size_t num; };
-struct avd_job { struct avd_segment *segments; unsigned int num, codec; };
+struct avd_job { struct avd_segment *segments; unsigned int num, codec; size_t max; bool overflow; };
 struct avd_dev;
 struct avd_variant { unsigned int quirks, revision, fifo_slots, vp_slots[4], vp_slot_base[4];
  void (*configure_stream)(struct avd_dev *,dma_addr_t,u8,u32); };
@@ -265,7 +265,7 @@ int main(int argc, char **argv)
    decode.flags=idx%3?0:V4L2_H264_DECODE_PARAM_FLAG_IDR_PIC;
    decode.dpb[0].flags=idx%3?V4L2_H264_DPB_ENTRY_FLAG_VALID:0;
    sl.slice_type=idx%3==0?V4L2_H264_SLICE_TYPE_I:idx%3==1?V4L2_H264_SLICE_TYPE_P:V4L2_H264_SLICE_TYPE_B;
-   ctx.job.segments=calloc(3,sizeof(*ctx.job.segments)); assert(ctx.job.segments);
+   ctx.job.segments=calloc(3,sizeof(*ctx.job.segments)); assert(ctx.job.segments); ctx.job.max=3;
    stream_hdr(&ctx,&run); ctx.job.num=1;sl.first_mb_in_slice=0;slice.addr=0x200800000ULL;
    stream_slice(&ctx,&run);
    size_t continuation=1+ctx.job.segments[0].num+ctx.job.segments[1].num;
@@ -425,8 +425,9 @@ static bool avd_h264_slice_fits(const struct v4l2_ctrl_h264_sps *s,size_t n,size
 static size_t avd_h264_max_slices(const struct v4l2_ctrl_h264_sps *s) { (void)s;return 20; }
 static int avd_h264_realloc_slices(struct avd_ctx *c,size_t n) { (void)c;(void)n;abort(); }
 static int avd_init_job(struct avd_ctx *c,unsigned int codec,size_t n) {
- free(c->job.segments);c->job.codec=codec;c->job.num=0;
- c->job.segments=calloc(n,sizeof(*c->job.segments));return c->job.segments?0:-ENOMEM;
+ free(c->job.segments);c->job.codec=codec;c->job.num=0;c->job.overflow=false;
+ c->job.segments=calloc(n,sizeof(*c->job.segments));c->job.max=c->job.segments?n:0;
+ return c->job.segments?0:-ENOMEM;
 }
 static void avd_job_finish(struct avd_ctx *c,enum vb2_buffer_state s) { (void)c;assert(s==VB2_BUF_STATE_DONE);held_finishes++; }
 static int avd_submit_job(struct avd_ctx *c) { submissions++;return avd_open_build_program(c); }
@@ -457,6 +458,7 @@ int main(void) {
  }
  /* Applied SPS controls reject unequal depths for both codecs. */
  struct v4l2_ctrl_hevc_sps hevc={.chroma_format_idc=1,
+  .log2_min_luma_coding_block_size_minus3=1,.log2_diff_max_min_luma_coding_block_size=2,
   .pic_width_in_luma_samples=1920,.pic_height_in_luma_samples=1088};
  ctx.coded_fmt.fmt.pix_mp.width=1920;ctx.coded_fmt.fmt.pix_mp.height=1088;
  for(unsigned int luma=0;luma<5;luma++) for(unsigned int chroma=0;chroma<5;chroma++) {
@@ -475,7 +477,7 @@ int main(void) {
  assert(!avd_h264_run(&ctx));assert(submissions==1&&hc.bank[0].submitted&&dst[0].bank==1);
  /* Compare the complete header to one built with the emitted VALID count. */
  struct avd_segment expected={0};struct avd_job saved=ctx.job;
- ctx.job=(struct avd_job){.segments=&expected};fixture_run.num_valid=2;fixture_run.cur_poc=40;
+ ctx.job=(struct avd_job){.segments=&expected,.max=1};fixture_run.num_valid=2;fixture_run.cur_poc=40;
  stream_hdr(&ctx,&fixture_run);
  assert(!memcmp((u32 *)programs[0].cpu+1,expected.instructions,expected.num*sizeof(u32)));
  ctx.job=saved;
@@ -546,6 +548,7 @@ def prepare_regressions(out):
                  'avd_h264_abort_picture', 'avd_h264_refs_valid', 'avd_h264_done'):
         code += function(source, name)
     code += function((ROOT / 'avd-backend-open.c').read_text(), 'avd_open_build_program')
+    code += function((ROOT / 'avd-hevc.c').read_text(), 'avd_hevc_check_sps_geometry')
     code += function((ROOT / 'avd-hevc.c').read_text(), 'avd_hevc_validate_sps')
     code += RUN_FIXTURE + function(source, 'avd_h264_run') + RUN_MAIN
     dest = out / 'prepare.c'
@@ -568,7 +571,7 @@ int main(void)
  struct avd_decoded_buffer destination = {0};
  struct avd_segment segments[2];
  struct avd_ctx ctx_storage = { .priv = &hc, .dev = &dev,
-  .fh.m2m_ctx = &m2m, .job.segments = segments, .decomp = true };
+  .fh.m2m_ctx = &m2m, .job.segments = segments, .job.max = 2, .decomp = true };
  struct avd_ctx *ctx = &ctx_storage;
  struct v4l2_ctrl_h264_decode_params dec = {0};
  struct v4l2_ctrl_h264_sps sps = { .chroma_format_idc = 1,

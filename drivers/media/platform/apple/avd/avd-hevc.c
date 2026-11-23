@@ -1110,6 +1110,10 @@ VISIBLE_IF_KUNIT int avd_hevc_check_tiles(const struct v4l2_ctrl_hevc_sps *sps,
 	if (!(pps->flags & V4L2_HEVC_PPS_FLAG_TILES_ENABLED))
 		return 0;
 
+	if (pps->num_tile_columns_minus1 >= ARRAY_SIZE(pps->column_width_minus1) ||
+	    pps->num_tile_rows_minus1 >= ARRAY_SIZE(pps->row_height_minus1))
+		return -EINVAL;
+
 	avd_hevc_pic_in_ctbs(sps, &width, &height);
 	if (pps->num_tile_columns_minus1 >= width ||
 	    pps->num_tile_rows_minus1 >= height)
