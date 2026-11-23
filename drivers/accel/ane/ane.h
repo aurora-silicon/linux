@@ -260,7 +260,7 @@ static inline bool ane_tm_failure_recoverable(bool tm_retention,
 u64 ane_bo_iova_size(u32 npages, unsigned int shift);
 int ane_bo_check_size(u64 size, u64 iova_span);
 struct page *ane_dart_alloc_scratch_page(void);
-int ane_dart_scratch_slot(struct drm_mm *mm, u64 iova, u64 size,
+int ane_dart_scratch_slot(struct ane_device *ane, u64 iova, u64 size,
 			  struct drm_mm_node **host);
 int ane_submit_check_sizes(const struct drm_ane_submit *args, size_t cmd_size,
 			   size_t btsp_size);
@@ -288,8 +288,7 @@ int ane_dart_init(struct ane_device *ane);
 void ane_dart_mask(struct ane_device *ane);
 void ane_dart_unmask(struct ane_device *ane);
 bool ane_dart_faulted(struct ane_device *ane, u64 *iova, u32 *status);
-int ane_dart_drain_fault(struct ane_device *ane, u64 fault_iova,
-			 struct ane_dart_scratch *scratch, int *pages);
+int ane_dart_drain_fault(struct ane_device *ane, u64 fault_iova);
 void ane_dart_release_scratch(struct ane_device *ane,
 			      struct ane_dart_scratch *scratch, int pages);
 bool ane_dart_scratch_in(struct ane_device *ane, struct drm_mm_node *host);

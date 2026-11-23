@@ -198,14 +198,19 @@ EXPORT_SYMBOL_IF_KUNIT(ane_dart_alloc_scratch_page);
  *
  * Callers hold iommu_lock.
  */
-VISIBLE_IF_KUNIT int ane_dart_scratch_slot(struct drm_mm *mm, u64 iova,
+VISIBLE_IF_KUNIT int ane_dart_scratch_slot(struct ane_device *ane, u64 iova,
 					   u64 size, struct drm_mm_node **host)
 {
+	struct drm_mm *mm = &ane->mm;
 	struct drm_mm_node *node;
 
 	*host = NULL;
 	if (iova + size < iova)
 		return -EINVAL;
+	/* A drain in an unmapped BO has no separate drm_mm node. */
+	for (int i = 0; i < ane->scratch_pages; i++)
+		if (ane->scratch[i].iova == iova)
+			return -EBUSY;
 	drm_mm_for_each_node_in_range(node, mm, iova, iova + size) {
 		/* Past the end of the range that the allocator manages. */
 		if (node == &mm->head_node)
@@ -250,9 +255,9 @@ EXPORT_SYMBOL_IF_KUNIT(ane_dart_scratch_in);
  *
  * Callers hold engine_lock, which keeps the BOs' DART state still.
  */
-int ane_dart_drain_fault(struct ane_device *ane, u64 fault_iova,
-			 struct ane_dart_scratch *scratch, int *pages)
+int ane_dart_drain_fault(struct ane_device *ane, u64 fault_iova)
 {
+	struct ane_dart_scratch *scratch;
 	struct drm_mm_node *node = NULL, *host;
 	struct page *page;
 	u64 iova;
@@ -265,7 +270,7 @@ int ane_dart_drain_fault(struct ane_device *ane, u64 fault_iova,
 	iova = fault_iova & ~((1ULL << ane->shift) - 1);
 
 	mutex_lock(&ane->iommu_lock);
-	ret = ane_dart_scratch_slot(&ane->mm, iova, BIT(ane->shift), &host);
+	ret = ane_dart_scratch_slot(ane, iova, BIT(ane->shift), &host);
 	if (ret)
 		goto refuse;
 	if (!host) {
@@ -296,11 +301,11 @@ int ane_dart_drain_fault(struct ane_device *ane, u64 fault_iova,
 	mutex_unlock(&ane->iommu_lock);
 	dev_dbg(ane->dev, "fault drain: page at %#llx in %s\n", iova,
 		host ? "an unmapped buffer's range" : "a hole");
-	scratch[*pages].iova = iova;
-	scratch[*pages].page = page;
-	scratch[*pages].node = node;
-	scratch[*pages].host = host;
-	(*pages)++;
+	scratch = &ane->scratch[ane->scratch_pages++];
+	scratch->iova = iova;
+	scratch->page = page;
+	scratch->node = node;
+	scratch->host = host;
 	for (i = 0; i < ane->dart_count; i++)
 		ane_dart_invalidate(ane, &ane->darts[i]);
 	return 0;

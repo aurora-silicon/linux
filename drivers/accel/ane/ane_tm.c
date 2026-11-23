@@ -465,8 +465,7 @@ int ane_tm_execute(struct ane_device *ane, struct ane_request *req)
 				err = -EIO;
 				break;
 			}
-			err = ane_dart_drain_fault(ane, fault_iova, scratch,
-						   &ane->scratch_pages);
+			err = ane_dart_drain_fault(ane, fault_iova);
 			if (err)
 				break;
 			/* The retried transaction now completes; poll on. */

@@ -158,10 +158,11 @@ struct drm_ane_bo_free {
  *
  * A successful SUBMIT returns after the engine completed the work, with the
  * output buffers visible to the CPU. While it runs, the engine reaches only
- * the buffers in @handles and @btsp_handle: an access outside them faults
- * and fails the SUBMIT. The buffers are put into the device address space
- * by the SUBMIT that names them, not by BO_INIT, so a SUBMIT can also fail
- * with -ENOMEM when there is no memory to map them.
+ * the buffers in @handles and @btsp_handle. The driver reports an error
+ * if it handles an address fault. On devices where the IOMMU handles the
+ * fault separately, SUBMIT may still return success. The buffers are put
+ * into the device address space by the SUBMIT that names them. A SUBMIT
+ * can also fail with -ENOMEM when there is no memory to map them.
  */
 struct drm_ane_submit {
 	__u64 tsk_size;

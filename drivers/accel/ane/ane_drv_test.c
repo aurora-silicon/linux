@@ -265,47 +265,61 @@ static struct drm_mm_node *ane_test_node(struct kunit *test, struct drm_mm *mm,
 
 static void ane_dart_scratch_slot_test(struct kunit *test)
 {
+	struct ane_device *ane = kunit_kzalloc(test, sizeof(*ane), GFP_KERNEL);
 	struct drm_mm_node *job, *next, *other, *scratch, *kept, *host;
-	struct drm_mm mm;
+	struct drm_mm *mm;
+
+	KUNIT_ASSERT_NOT_NULL(test, ane);
+	mm = &ane->mm;
 
 	/* One page above zero up to 64 pages. */
-	drm_mm_init(&mm, ANE_TEST_PG, 63 * ANE_TEST_PG);
-	job = ane_test_node(test, &mm, 1, 4, ANE_MM_BO_MAPPED);
-	next = ane_test_node(test, &mm, 5, 3, ANE_MM_BO_UNMAPPED);
-	other = ane_test_node(test, &mm, 8, 2, ANE_MM_BO_UNMAPPED);
-	scratch = ane_test_node(test, &mm, 12, 1, ANE_MM_SCRATCH);
-	kept = ane_test_node(test, &mm, 13, 2, ANE_MM_PRESERVED);
+	drm_mm_init(mm, ANE_TEST_PG, 63 * ANE_TEST_PG);
+	job = ane_test_node(test, mm, 1, 4, ANE_MM_BO_MAPPED);
+	next = ane_test_node(test, mm, 5, 3, ANE_MM_BO_UNMAPPED);
+	other = ane_test_node(test, mm, 8, 2, ANE_MM_BO_UNMAPPED);
+	scratch = ane_test_node(test, mm, 12, 1, ANE_MM_SCRATCH);
+	kept = ane_test_node(test, mm, 13, 2, ANE_MM_PRESERVED);
 
 	/* Past the end of the job's buffer: the packed neighbour. */
-	KUNIT_EXPECT_EQ(test, ane_dart_scratch_slot(&mm, 5 * ANE_TEST_PG,
+	KUNIT_EXPECT_EQ(test, ane_dart_scratch_slot(ane, 5 * ANE_TEST_PG,
 						    ANE_TEST_PG, &host), 0);
 	KUNIT_EXPECT_PTR_EQ(test, host, next);
 	/* Inside and at the last page of a buffer the job does not name. */
-	KUNIT_EXPECT_EQ(test, ane_dart_scratch_slot(&mm, 6 * ANE_TEST_PG,
+	KUNIT_EXPECT_EQ(test, ane_dart_scratch_slot(ane, 6 * ANE_TEST_PG,
 						    ANE_TEST_PG, &host), 0);
 	KUNIT_EXPECT_PTR_EQ(test, host, next);
-	KUNIT_EXPECT_EQ(test, ane_dart_scratch_slot(&mm, 9 * ANE_TEST_PG,
+	KUNIT_EXPECT_EQ(test, ane_dart_scratch_slot(ane, 9 * ANE_TEST_PG,
 						    ANE_TEST_PG, &host), 0);
 	KUNIT_EXPECT_PTR_EQ(test, host, other);
+	/* An unmapped BO can host multiple drains at distinct IOVAs. */
+	ane->scratch[0].iova = 5 * ANE_TEST_PG;
+	ane->scratch[0].host = next;
+	ane->scratch_pages = 1;
+	KUNIT_EXPECT_EQ(test, ane_dart_scratch_slot(ane, 5 * ANE_TEST_PG,
+						    ANE_TEST_PG, &host), -EBUSY);
+	KUNIT_EXPECT_NULL(test, host);
+	KUNIT_EXPECT_EQ(test, ane_dart_scratch_slot(ane, 6 * ANE_TEST_PG,
+						    ANE_TEST_PG, &host), 0);
+	KUNIT_EXPECT_PTR_EQ(test, host, next);
 	/* A hole: the drain reserves its own node. */
-	KUNIT_EXPECT_EQ(test, ane_dart_scratch_slot(&mm, 10 * ANE_TEST_PG,
+	KUNIT_EXPECT_EQ(test, ane_dart_scratch_slot(ane, 10 * ANE_TEST_PG,
 						    ANE_TEST_PG, &host), 0);
 	KUNIT_EXPECT_NULL(test, host);
-	KUNIT_EXPECT_EQ(test, ane_dart_scratch_slot(&mm, 40 * ANE_TEST_PG,
+	KUNIT_EXPECT_EQ(test, ane_dart_scratch_slot(ane, 40 * ANE_TEST_PG,
 						    ANE_TEST_PG, &host), 0);
 	KUNIT_EXPECT_NULL(test, host);
 	/* Ranges with PTEs cannot take a drain page. */
-	KUNIT_EXPECT_EQ(test, ane_dart_scratch_slot(&mm, 4 * ANE_TEST_PG,
+	KUNIT_EXPECT_EQ(test, ane_dart_scratch_slot(ane, 4 * ANE_TEST_PG,
 						    ANE_TEST_PG, &host), -EBUSY);
-	KUNIT_EXPECT_EQ(test, ane_dart_scratch_slot(&mm, 12 * ANE_TEST_PG,
+	KUNIT_EXPECT_EQ(test, ane_dart_scratch_slot(ane, 12 * ANE_TEST_PG,
 						    ANE_TEST_PG, &host), -EBUSY);
-	KUNIT_EXPECT_EQ(test, ane_dart_scratch_slot(&mm, 14 * ANE_TEST_PG,
+	KUNIT_EXPECT_EQ(test, ane_dart_scratch_slot(ane, 14 * ANE_TEST_PG,
 						    ANE_TEST_PG, &host), -EBUSY);
 	KUNIT_EXPECT_NULL(test, host);
 	/* Past the end of the allocator range. */
-	KUNIT_EXPECT_NE(test, ane_dart_scratch_slot(&mm, 64 * ANE_TEST_PG,
+	KUNIT_EXPECT_NE(test, ane_dart_scratch_slot(ane, 64 * ANE_TEST_PG,
 						    ANE_TEST_PG, &host), 0);
-	KUNIT_EXPECT_NE(test, ane_dart_scratch_slot(&mm, U64_MAX & ~(u64)(ANE_TEST_PG - 1),
+	KUNIT_EXPECT_NE(test, ane_dart_scratch_slot(ane, U64_MAX & ~(u64)(ANE_TEST_PG - 1),
 						    ANE_TEST_PG, &host), 0);
 
 	drm_mm_remove_node(job);
@@ -313,7 +327,7 @@ static void ane_dart_scratch_slot_test(struct kunit *test)
 	drm_mm_remove_node(other);
 	drm_mm_remove_node(scratch);
 	drm_mm_remove_node(kept);
-	drm_mm_takedown(&mm);
+	drm_mm_takedown(mm);
 }
 
 /*
