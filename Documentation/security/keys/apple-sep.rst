@@ -16,6 +16,9 @@ The trusted-key core accepts ``new <bytes>``, ``import <hex-key>``, and
 ``load <hex-blob>``. Key sizes are 32 through 128 bytes. ``new`` obtains random
 key material through the SEP source by default; ``trusted.rng=kernel`` selects
 the kernel RNG instead. ``import`` accepts plaintext already held by the caller.
+It needs a kernel built with ``CONFIG_TRUSTED_KEYS_IMPORT`` (off by default;
+without it ``import`` fails with ``EINVAL``) and fails with ``EPERM`` while
+the kernel is locked down for integrity.
 For example, in a session keyring with the source active::
 
     umask 077

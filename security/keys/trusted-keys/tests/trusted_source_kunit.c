@@ -337,6 +337,38 @@ static void trusted_source_migratable(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, fake->seals, 3 + 2);
 }
 
+/*
+ * Only a source that opts in may seal plaintext the caller holds, and only
+ * in a kernel built with CONFIG_TRUSTED_KEYS_IMPORT.
+ */
+static void trusted_source_import(struct kunit *test)
+{
+	char cmd[sizeof("import ") + 2 * 32];
+	bool allowed = IS_ENABLED(CONFIG_TRUSTED_KEYS_IMPORT);
+
+	memcpy(cmd, "import ", 7);
+	memset(cmd + 7, 'a', 2 * 32);
+	cmd[7 + 2 * 32] = '\0';
+
+	fake_register(test);
+	KUNIT_EXPECT_EQ(test, PTR_ERR(fake_key(test, cmd)), -EINVAL);
+	KUNIT_EXPECT_EQ(test, fake->seals, 0);
+	unregister_trusted_key_source(&fake->src);
+
+	fake->ops.importable = 1;
+	fake_register(test);
+	if (allowed)
+		KUNIT_EXPECT_FALSE(test, IS_ERR(fake_key(test, cmd)));
+	else
+		KUNIT_EXPECT_EQ(test, PTR_ERR(fake_key(test, cmd)), -EINVAL);
+	KUNIT_EXPECT_EQ(test, fake->seals, allowed ? 1 : 0);
+	unregister_trusted_key_source(&fake->src);
+
+	/* A withdrawn source leaves no permission to import behind. */
+	KUNIT_EXPECT_EQ(test, PTR_ERR(fake_key(test, cmd)), -EINVAL);
+	KUNIT_EXPECT_EQ(test, fake->seals, allowed ? 1 : 0);
+}
+
 /* A second source is refused, and cannot withdraw the first. */
 static void trusted_source_exclusive(struct kunit *test)
 {
@@ -442,6 +474,7 @@ static struct kunit_case trusted_source_cases[] = {
 	KUNIT_CASE(trusted_source_after_core_init),
 	KUNIT_CASE(trusted_source_dispatch),
 	KUNIT_CASE(trusted_source_migratable),
+	KUNIT_CASE(trusted_source_import),
 	KUNIT_CASE(trusted_source_exclusive),
 	KUNIT_CASE(trusted_source_init_failure),
 	KUNIT_CASE(trusted_source_invalid),
