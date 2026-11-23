@@ -124,6 +124,34 @@ static void avd_hevc_tiles_test(struct kunit *test)
 		KUNIT_EXPECT_MEMEQ(test, ids, c->ids, sizeof(ids));
 }
 
+/*
+ * More tile columns or rows than the PPS control has size entries for are
+ * refused by the check itself, even for a picture wide or tall enough.
+ */
+static void avd_hevc_tiles_array_test(struct kunit *test)
+{
+	struct v4l2_ctrl_hevc_sps sps;
+	struct v4l2_ctrl_hevc_pps pps = {
+		.flags = V4L2_HEVC_PPS_FLAG_TILES_ENABLED |
+			 V4L2_HEVC_PPS_FLAG_UNIFORM_SPACING,
+	};
+
+	avd_hevc_test_sps(&sps);
+	sps.pic_width_in_luma_samples = 8192;
+	sps.pic_height_in_luma_samples = 4320;
+
+	pps.num_tile_columns_minus1 = ARRAY_SIZE(pps.column_width_minus1) - 1;
+	pps.num_tile_rows_minus1 = ARRAY_SIZE(pps.row_height_minus1) - 1;
+	KUNIT_EXPECT_EQ(test, avd_hevc_check_tiles(&sps, &pps), 0);
+
+	pps.num_tile_columns_minus1 = ARRAY_SIZE(pps.column_width_minus1);
+	KUNIT_EXPECT_EQ(test, avd_hevc_check_tiles(&sps, &pps), -EINVAL);
+
+	pps.num_tile_columns_minus1 = ARRAY_SIZE(pps.column_width_minus1) - 1;
+	pps.num_tile_rows_minus1 = ARRAY_SIZE(pps.row_height_minus1);
+	KUNIT_EXPECT_EQ(test, avd_hevc_check_tiles(&sps, &pps), -EINVAL);
+}
+
 static void avd_hevc_no_tiles_test(struct kunit *test)
 {
 	struct v4l2_ctrl_hevc_sps sps;
@@ -141,6 +169,7 @@ static void avd_hevc_no_tiles_test(struct kunit *test)
 static struct kunit_case avd_hevc_test_cases[] = {
 	KUNIT_CASE_PARAM(avd_hevc_geometry_test, avd_hevc_geometry_gen_params),
 	KUNIT_CASE_PARAM(avd_hevc_tiles_test, avd_hevc_tiles_gen_params),
+	KUNIT_CASE(avd_hevc_tiles_array_test),
 	KUNIT_CASE(avd_hevc_no_tiles_test),
 	{}
 };
