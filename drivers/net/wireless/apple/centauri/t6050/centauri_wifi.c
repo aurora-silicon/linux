@@ -419,7 +419,7 @@ static void report_beacon(struct centauri_t6050_wifi *wifi, const u8 *payload,
 		return;
 	frequency = ieee80211_channel_to_frequency(number, band);
 	channel = ieee80211_get_channel(wifi->wiphy, frequency);
-	if (!channel)
+	if (!channel || channel->flags & IEEE80211_CHAN_DISABLED)
 		return;
 	signal = max_t(s8, payload[0x16], payload[0x17]);
 	if (signal >= 0 || signal < -127)
