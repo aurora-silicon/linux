@@ -1084,6 +1084,14 @@ int hibernate(void)
 		error = swsusp_check(false);
 		if (!error) {
 			/*
+			 * The tasks are still frozen from the snapshot, so
+			 * nothing has cleared a wakeup that a wake IRQ latched
+			 * while the image was created and written.  Clear it as
+			 * freeze_processes() does on the resume path, or the
+			 * QUIESCE of the devices fails with -EBUSY.
+			 */
+			pm_wakeup_clear(0);
+			/*
 			 * This kernel loads the image now, as the resume path's
 			 * PM_RESTORE_PREPARE would mark it, so drivers quiesce
 			 * for the jump into it as they do there.
