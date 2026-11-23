@@ -3,7 +3,7 @@
 //! M4 receive records. Events and statistics use complete 0x48-byte records.
 //!
 //! Type 1 carries 128 completion bits. The native runtime holds events 0x70
-//! (TA), 0x71 (fragment) and 15 (compute). Type 4 and statistics type 0x16
+//! (TA), 0x71 (fragment) and 15/16 (compute pipes 0/1). Type 4 and statistics type 0x16
 //! announce the firmware's generation-based recovery; neither is a job receipt.
 
 use kernel::{bindings, device, prelude::*};
@@ -14,7 +14,7 @@ use super::hw::rings;
 use super::regs::{mb, rmb, wmb};
 
 pub(crate) const RECORD_WORDS: usize = 18;
-pub(crate) const STAGE_EVENTS: [u32; 3] = [0x70, 0x71, 15];
+pub(crate) const STAGE_EVENTS: [u32; 4] = [0x70, 0x71, 15, 16];
 /// Retained only for the allocator's pending-growth container. M4 does not
 /// interpret a G15 type-7 record as an allocator request.
 pub(crate) const GROW_QUEUE: usize = 8;
@@ -45,7 +45,7 @@ pub(crate) struct Events {
     /// First notification of the pending recovery, for its absolute deadline.
     pub(crate) recovery_started_ns: Option<u64>,
     pub(crate) channel_errors: u32,
-    pub(crate) event_ns: [u64; 3],
+    pub(crate) event_ns: [u64; 4],
     pub(crate) grow: KVec<[u32; 14]>,
     #[allow(dead_code)]
     pub(crate) grow_lost: u32,
@@ -63,7 +63,7 @@ impl Events {
             last_statistics: None,
             recovery_started_ns: None,
             channel_errors: 0,
-            event_ns: [0; 3],
+            event_ns: [0; 4],
             grow: KVec::new(),
             grow_lost: 0,
         }
@@ -125,7 +125,7 @@ impl Events {
             match kind {
                 1 => {
                     // Type 1 carries 128 completion bits across words 1..=4; STAGE_EVENTS
-                    // ([0x70, 0x71, 15]) only inspects word 1 (compute 15) and word 4 (TA/FS).
+                    // ([0x70, 0x71, 15, 16]) inspects word 1 (compute 15/16) and word 4 (TA/FS).
                     let (w1, w4) = match ring.ring.r32(base + 4).and_then(|w1| {
                         Ok((w1, ring.ring.r32(base + 16)?))
                     }) {
@@ -150,7 +150,7 @@ impl Events {
                         self.stage_events = self.stage_events.wrapping_add(1);
                         if stage == 1 {
                             self.fs_events = self.fs_events.wrapping_add(1);
-                        } else if stage == 2 {
+                        } else if stage >= 2 {
                             self.compute_events = self.compute_events.wrapping_add(1);
                         }
                     }

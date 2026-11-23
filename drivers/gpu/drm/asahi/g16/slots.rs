@@ -68,7 +68,15 @@ impl ComputeSlot {
             )?,
             work: alloc_work(o, 0x2000, client::WORK_PAGE + k * client::CWORK_STRIDE, 0)?,
             seq: alloc(o, 0x300, cmd_fw(), None, 0, false)?,
-            barrier: alloc(o, barrier::SIZE, cmd_fw(), None, 0, false)?,
+            // Holds fs2c (+0x00) and cross-pipe c2c (+0x40) barriers within one page.
+            barrier: alloc(
+                o,
+                barrier::SIZE * sizes::COMPUTE_PIPES,
+                cmd_fw(),
+                None,
+                0,
+                false,
+            )?,
             pool: o.alloc(super::object::Request {
                 size: 0x2000000,
                 class: sh,
@@ -263,8 +271,22 @@ impl PassSlot {
             prev_barrier: alloc(o, barrier::SIZE, cmd_fw(), None, 0, false)?,
             ta_fs_barrier: alloc(o, barrier::SIZE, cmd_fw(), None, 0, false)?,
             fs_dep: alloc(o, barrier::SIZE, cmd_fw(), None, 0, false)?,
-            compute_barrier: alloc(o, barrier::SIZE, cmd_fw(), None, 0, false)?,
-            fs_compute_barrier: alloc(o, barrier::SIZE, cmd_fw(), None, 0, false)?,
+            compute_barrier: alloc(
+                o,
+                barrier::SIZE * sizes::COMPUTE_PIPES,
+                cmd_fw(),
+                None,
+                0,
+                false,
+            )?,
+            fs_compute_barrier: alloc(
+                o,
+                barrier::SIZE * sizes::COMPUTE_PIPES,
+                cmd_fw(),
+                None,
+                0,
+                false,
+            )?,
         })
     }
 
@@ -371,6 +393,7 @@ impl PassSlot {
 pub(crate) struct Claims {
     pub(crate) slot: [u32; sizes::COMPUTE_SLOTS],
     pub(crate) slot_count: u32,
+    pub(crate) compute_pipe: u8,
     pub(crate) pass: [u32; sizes::RENDER_SLOTS],
     pub(crate) pass_count: u32,
     pub(crate) pass_mask: u64,
@@ -388,6 +411,7 @@ impl Claims {
         Self {
             slot: [0; sizes::COMPUTE_SLOTS],
             slot_count: 0,
+            compute_pipe: 0,
             pass: [0; sizes::RENDER_SLOTS],
             pass_count: 0,
             pass_mask: 0,
@@ -765,6 +789,18 @@ impl Slots {
     pub(crate) fn compute_available(&self, n: usize) -> bool {
         (0..n.min(sizes::COMPUTE_UNITS)).any(|k| self.compute.lifetime.available(k))
     }
+    /// Whether one of the first `n` compute units eligible for `pipe` can be claimed now.
+    /// Pipe 0 may claim `0..n`; secondary pipes stay in `BASE_COMPUTE_UNITS..n` so a 2-unit
+    /// base-only VM can never see both base units undisplaced across two pipes.
+    pub(crate) fn compute_available_for_pipe(&self, n: usize, pipe: usize) -> bool {
+        let limit = n.min(sizes::COMPUTE_UNITS);
+        let start = if pipe == 0 {
+            0
+        } else {
+            super::resources::BASE_COMPUTE_UNITS.min(limit)
+        };
+        (start..limit).any(|k| self.compute.lifetime.available(k))
+    }
     /// Whether one of the first `n` render pass slots can be claimed now.
     #[allow(dead_code)]
     pub(crate) fn pass_available(&self, n: usize) -> bool {
@@ -883,7 +919,17 @@ impl Slots {
     }
     /// Available compute units within the first `n` units (a VM's prepared count).
     pub(crate) fn free_compute_in(&self, n: usize) -> u32 {
-        (0..n.min(sizes::COMPUTE_UNITS))
+        self.free_compute_in_for_pipe(n, 0)
+    }
+    /// Available compute units within the first `n` units eligible for `pipe`.
+    pub(crate) fn free_compute_in_for_pipe(&self, n: usize, pipe: usize) -> u32 {
+        let limit = n.min(sizes::COMPUTE_UNITS);
+        let start = if pipe == 0 {
+            0
+        } else {
+            super::resources::BASE_COMPUTE_UNITS.min(limit)
+        };
+        (start..limit)
             .filter(|&k| self.compute.lifetime.available(k))
             .count() as u32
     }
@@ -931,20 +977,42 @@ impl Slots {
         self.compute.last_full.get(k).copied().unwrap_or(true)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn claim_compute_for(
         &mut self,
         units: &super::resources::Prepared,
         f: &mut Claims,
         vm_id: Option<u64>,
     ) -> Result<Option<usize>> {
+        self.claim_compute_for_pipe(units, f, vm_id, 0)
+    }
+
+    pub(crate) fn claim_compute_for_pipe(
+        &mut self,
+        units: &super::resources::Prepared,
+        f: &mut Claims,
+        vm_id: Option<u64>,
+        pipe: usize,
+    ) -> Result<Option<usize>> {
         if f.slot_count as usize >= f.slot.len() {
             return Ok(None);
         }
-        // Round robin over this VM's units: the next one in publication order is the
-        // oldest, the first to be displaced by a later retired publication.
+        // Round robin over this VM's units eligible for `pipe`: pipe 0 spans `0..n`, while
+        // secondary pipes stay in `BASE_COMPUTE_UNITS..n` so base units `0..2` only ever hold
+        // pipe-0 leases and a 2-unit VM can never hit `compute_exhausted_within(2)`.
         let n = units.compute_units()?.min(sizes::COMPUTE_UNITS);
-        for i in 0..n {
-            let k = (self.cursor as usize + i) % n;
+        let start = if pipe == 0 {
+            0
+        } else {
+            super::resources::BASE_COMPUTE_UNITS
+        };
+        if start >= n {
+            return Ok(None);
+        }
+        let span = n - start;
+        let base_cursor = (self.cursor as usize).saturating_sub(start) % span;
+        for i in 0..span {
+            let k = start + (base_cursor + i) % span;
             if self.compute.lifetime.claim(k) {
                 let full = self.compute.scrub_full[k]
                     || vm_id.is_none_or(|id| {
@@ -959,6 +1027,7 @@ impl Slots {
                 self.compute.last_full[k] = full;
                 f.slot[f.slot_count as usize] = k as u32;
                 f.slot_count += 1;
+                f.compute_pipe = pipe as u8;
                 self.cursor = ((k + 1) % n) as u32;
                 return Ok(Some(k));
             }
@@ -1394,7 +1463,7 @@ impl Slots {
         let mut c = self.compute.lifetime.clone();
         let mut p = self.render.lifetime.clone();
         for &k in &f.slot[..f.slot_count as usize] {
-            if !c.publish(k as usize) {
+            if !c.publish_on(k as usize, f.compute_pipe) {
                 return Err(EBUSY);
             }
         }
@@ -1473,6 +1542,7 @@ impl Slots {
         }
         self.pass_busy &= !f.pass_mask;
         f.slot_count = 0;
+        f.compute_pipe = 0;
         f.pass_count = 0;
         f.pass_mask = 0;
         f.ct_count = 0;
@@ -1495,6 +1565,7 @@ impl Slots {
         }
         self.pass_busy &= !f.pass_mask;
         f.slot_count = 0;
+        f.compute_pipe = 0;
         f.pass_count = 0;
         f.pass_mask = 0;
         f.ct_count = 0;
@@ -1521,6 +1592,7 @@ impl Slots {
         }
         self.pass_busy &= !f.pass_mask;
         f.slot_count = 0;
+        f.compute_pipe = 0;
         f.pass_count = 0;
         f.pass_mask = 0;
         f.ct_count = 0;

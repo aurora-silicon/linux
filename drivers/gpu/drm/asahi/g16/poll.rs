@@ -785,23 +785,25 @@ impl Firmware {
         self.engine.ta_wave_wait && self.ta_pending_passes() < super::hw::sizes::TA_WAVE_PASSES
     }
 
-    /// Cheap single-stage stamp check for the oldest compute and oldest render flights' terminal
-    /// stages so `submit_locked()` can eagerly retire finished work without scanning all rings
-    /// when nothing has completed.
+    /// Cheap single-stage stamp check for the oldest compute pipe 0/1 and oldest render flights'
+    /// terminal stages so `submit_locked()` can eagerly retire finished work without scanning
+    /// all rings when nothing has completed.
     fn oldest_stamp_reached(&self) -> bool {
         if self.engine.flights.is_empty() {
             return false;
         }
-        let mut oldest_compute: Option<&Flight> = None;
-        let mut compute_behind = false;
+        let mut oldest_compute: [Option<&Flight>; super::hw::sizes::COMPUTE_PIPES] =
+            [None; super::hw::sizes::COMPUTE_PIPES];
+        let mut compute_behind = [false; super::hw::sizes::COMPUTE_PIPES];
         let mut oldest_render: Option<&Flight> = None;
         let mut render_behind = false;
         for f in self.engine.flights.iter() {
             if f.computes != 0 {
-                if oldest_compute.is_none() {
-                    oldest_compute = Some(f);
+                let p = (f.compute_pipe as usize).min(super::hw::sizes::COMPUTE_PIPES - 1);
+                if oldest_compute[p].is_none() {
+                    oldest_compute[p] = Some(f);
                 } else {
-                    compute_behind = true;
+                    compute_behind[p] = true;
                 }
             }
             if f.renders != 0 {
@@ -811,20 +813,22 @@ impl Firmware {
                     render_behind = true;
                 }
             }
-            if compute_behind && render_behind {
+            if compute_behind[0] && compute_behind[1] && render_behind {
                 break;
             }
         }
         rmb();
-        if let Some(f) = oldest_compute {
-            if let Ok(obs) = self.graph.compute.fw_stamp.r32(0) {
-                let reached = if compute_behind {
-                    stamp_reached(obs, f.target, self.engine.target)
-                } else {
-                    obs == f.target
-                };
-                if reached {
-                    return true;
+        for p in 0..super::hw::sizes::COMPUTE_PIPES {
+            if let Some(f) = oldest_compute[p] {
+                if let Ok(obs) = self.graph.compute[p].fw_stamp.r32(0) {
+                    let reached = if compute_behind[p] {
+                        stamp_reached(obs, f.target, self.engine.target[p])
+                    } else {
+                        obs == f.target
+                    };
+                    if reached {
+                        return true;
+                    }
                 }
             }
         }
@@ -858,7 +862,7 @@ impl Firmware {
             return Ok(false);
         }
         let mut retired_any = false;
-        let (mut check_compute, mut check_render) = (true, true);
+        let (mut check_compute, mut check_render) = ([true; super::hw::sizes::COMPUTE_PIPES], true);
         let mut ret = self.retired_flight_classes(&mut check_compute, &mut check_render);
         while let Ok(Some((index, receipt))) = ret {
             let outcome = self.retire_outcome_at(index, receipt);
@@ -909,17 +913,14 @@ impl Firmware {
         Ok((at(start_off)?, at(end_off)?))
     }
 
-    /// Exact M4 queue and submit-pipe proof for one serialized publication. Event
-    /// notifications are wakeups; neither an event nor elapsed time releases an owner.
-    pub(crate) fn queue_receipt(
+    /// Exact queue-ring proof for one serialized publication on its workqueue pipe.
+    fn queue_ring_receipt(
         &self,
-        channel: Channel,
         state: &super::object::FwObject,
         info: &super::object::FwObject,
         head: u32,
-        record: u32,
     ) -> Result<bool> {
-        if head >= 256 || record >= 256 {
+        if head >= 256 {
             return Err(EINVAL);
         }
         // M4's qualified NC cursors are READ and WRITE. Offset zero is not an M4
@@ -941,17 +942,11 @@ impl Firmware {
         }
         // With ASC-cached QI, its three consumers and busy flag can remain stale until
         // terminal CIVAC. The working M4 protocol substitutes the NC READ cursor above.
-        let pipe = self.channels.channel(channel);
-        if pipe.read()? != record || pipe.completion()? != record || pipe.write()? != record {
-            return Ok(false);
-        }
         Ok(true)
     }
 
-    /// In-order receipt of flight `f` with later flights queued behind it: the NC READ cursor
-    /// (and with uncached queue info its consumers) passed its ring entries, and the submit
-    /// pipe's read and completion cursors passed its record.
-    fn queue_passed(
+    /// Passed queue-ring proof when later flights are queued behind `f` on the same pipe.
+    fn queue_ring_passed(
         &self,
         channel: Channel,
         state: &super::object::FwObject,
@@ -959,10 +954,13 @@ impl Firmware {
         f: &Flight,
     ) -> Result<bool> {
         let cap = super::hw::sizes::QUEUE_CAP;
-        let (start, head, tail, record) = match channel {
-            Channel::Compute => (f.c_start, f.head, self.engine.head, f.rec[2]),
-            Channel::Ta => (f.ta_start, f.ta_head, self.engine.ta_head, f.rec[0]),
-            Channel::Fs => (f.fs_start, f.fs_head, self.engine.fs_head, f.rec[1]),
+        let (start, head, tail) = match channel {
+            Channel::Compute => {
+                let p = (f.compute_pipe as usize).min(super::hw::sizes::COMPUTE_PIPES - 1);
+                (f.c_start, f.head, self.engine.head[p])
+            }
+            Channel::Ta => (f.ta_start, f.ta_head, self.engine.ta_head),
+            Channel::Fs => (f.fs_start, f.fs_head, self.engine.fs_head),
         };
         if head >= cap || start >= cap || tail >= cap {
             return Err(EINVAL);
@@ -977,12 +975,58 @@ impl Firmware {
                 }
             }
         }
+        Ok(true)
+    }
+
+    /// Submit-channel proof for `record`: exact when no later record exists on `channel`,
+    /// otherwise passed within the current channel producer frontier.
+    fn channel_receipt(&self, channel: Channel, record: u32, passed: bool) -> Result<bool> {
         let slots = super::fw::channels::RING_SLOTS;
-        let first = (record + slots - 1) % slots;
-        let producer = self.channels.producer(channel);
+        if record >= slots {
+            return Err(EINVAL);
+        }
         let pipe = self.channels.channel(channel);
-        Ok(ring_passed(pipe.read()?, first, record, producer, slots)
-            && ring_passed(pipe.completion()?, first, record, producer, slots))
+        if passed {
+            let first = (record + slots - 1) % slots;
+            let producer = self.channels.producer(channel);
+            Ok(ring_passed(pipe.read()?, first, record, producer, slots)
+                && ring_passed(pipe.completion()?, first, record, producer, slots))
+        } else {
+            Ok(pipe.read()? == record && pipe.completion()? == record && pipe.write()? == record)
+        }
+    }
+
+    /// Exact M4 queue and submit-pipe proof for one serialized publication. Event
+    /// notifications are wakeups; neither an event nor elapsed time releases an owner.
+    pub(crate) fn queue_receipt(
+        &self,
+        channel: Channel,
+        state: &super::object::FwObject,
+        info: &super::object::FwObject,
+        head: u32,
+        record: u32,
+    ) -> Result<bool> {
+        Ok(self.queue_ring_receipt(state, info, head)?
+            && self.channel_receipt(channel, record, false)?)
+    }
+
+    /// In-order receipt of flight `f` with later flights queued behind it: the NC READ cursor
+    /// (and with uncached queue info its consumers) passed its ring entries, and the submit
+    /// pipe's read and completion cursors passed its record.
+    fn queue_passed(
+        &self,
+        channel: Channel,
+        state: &super::object::FwObject,
+        info: &super::object::FwObject,
+        f: &Flight,
+    ) -> Result<bool> {
+        let record = match channel {
+            Channel::Compute => f.rec[2],
+            Channel::Ta => f.rec[0],
+            Channel::Fs => f.rec[1],
+        };
+        Ok(self.queue_ring_passed(channel, state, info, f)?
+            && self.channel_receipt(channel, record, true)?)
     }
 
     /// A full receipt includes stage and notifier stamps, every physical consumer,
@@ -1001,51 +1045,60 @@ impl Firmware {
         }
     }
 
-    /// Inspects the oldest compute flight and oldest render flight independently so either
-    /// class can retire as soon as its hardware receipt settles without waiting on the other.
+    /// Inspects the oldest compute flight per pipe and oldest render flight independently so any
+    /// pipe/class can retire as soon as its hardware receipt settles without waiting on another.
     pub(crate) fn retired_flight(&mut self) -> Result<Option<(usize, Retirement)>> {
-        let (mut check_compute, mut check_render) = (true, true);
+        let (mut check_compute, mut check_render) = ([true; super::hw::sizes::COMPUTE_PIPES], true);
         self.retired_flight_classes(&mut check_compute, &mut check_render)
     }
 
-    /// Like [`Self::retired_flight`], skipping classes that are inactive or already known
+    /// Like [`Self::retired_flight`], skipping pipes/classes that are inactive or already known
     /// pending in the current [`Self::retire_once`] pass and never polling a mixed flight twice.
     fn retired_flight_classes(
         &mut self,
-        check_compute: &mut bool,
+        check_compute: &mut [bool; super::hw::sizes::COMPUTE_PIPES],
         check_render: &mut bool,
     ) -> Result<Option<(usize, Retirement)>> {
-        let (mut compute_idx, mut render_idx) = (None, None);
-        if *check_compute || *check_render {
+        let mut compute_idx = [None; super::hw::sizes::COMPUTE_PIPES];
+        let mut render_idx = None;
+        if check_compute[0] || check_compute[1] || *check_render {
             for (i, f) in self.engine.flights.iter().enumerate() {
-                if *check_compute && compute_idx.is_none() && f.computes != 0 {
-                    compute_idx = Some(i);
+                if f.computes != 0 {
+                    let p = (f.compute_pipe as usize).min(super::hw::sizes::COMPUTE_PIPES - 1);
+                    if check_compute[p] && compute_idx[p].is_none() {
+                        compute_idx[p] = Some(i);
+                    }
                 }
                 if *check_render && render_idx.is_none() && f.renders != 0 {
                     render_idx = Some(i);
                 }
-                if (!*check_compute || compute_idx.is_some())
+                if (!check_compute[0] || compute_idx[0].is_some())
+                    && (!check_compute[1] || compute_idx[1].is_some())
                     && (!*check_render || render_idx.is_some())
                 {
                     break;
                 }
             }
         }
-        if compute_idx.is_none() {
-            *check_compute = false;
+        for p in 0..super::hw::sizes::COMPUTE_PIPES {
+            if compute_idx[p].is_none() {
+                check_compute[p] = false;
+            }
         }
         if render_idx.is_none() {
             *check_render = false;
         }
-        if let Some(index) = compute_idx {
-            let receipt = self.retired_at(index)?;
-            if receipt.complete() {
-                return Ok(Some((index, receipt)));
-            }
-            *check_compute = false;
-            if render_idx == Some(index) {
-                *check_render = false;
-                render_idx = None;
+        for p in 0..super::hw::sizes::COMPUTE_PIPES {
+            if let Some(index) = compute_idx[p] {
+                let receipt = self.retired_at(index)?;
+                if receipt.complete() {
+                    return Ok(Some((index, receipt)));
+                }
+                check_compute[p] = false;
+                if render_idx == Some(index) {
+                    *check_render = false;
+                    render_idx = None;
+                }
             }
         }
         if let Some(index) = render_idx {
@@ -1069,33 +1122,45 @@ impl Firmware {
         rmb();
         let mut full = true;
         let mut ticks = [0u64; 4];
-        // Later flights of the same engine class queued behind this one: that class's queue,
-        // pipe and stamp cells already moved on, so its receipt is "passed", in order; the
-        // newest flight of a class keeps the exact receipt.
+        // Later flights of the same pipe/class queued behind this one: that pipe's queue and
+        // stamp cells already moved on, so its receipt is "passed", in order; the newest flight
+        // of a pipe keeps its exact queue receipt while Channel::Compute is checked independently
+        // against the shared submit-channel producer frontier.
         if f.computes != 0 {
-            let compute_behind = self
+            let pipe = (f.compute_pipe as usize).min(super::hw::sizes::COMPUTE_PIPES - 1);
+            let pipe_behind = self
+                .engine
+                .flights
+                .iter()
+                .filter(|o| o.computes != 0 && o.compute_pipe == f.compute_pipe)
+                .nth(1)
+                .is_some();
+            let chan_behind = self
                 .engine
                 .flights
                 .iter()
                 .filter(|o| o.computes != 0)
                 .nth(1)
-                .is_some();
-            let g = &self.graph.compute;
-            if compute_behind {
-                let e = &self.engine;
-                if !stamp_reached(g.fw_stamp.r32(0)?, f.target, e.target)
-                    || !self.queue_passed(Channel::Compute, &g.qstate, &g.qinfo, f)?
+                .is_some()
+                || f.rec[2] != self.channels.producer(Channel::Compute);
+            let g = &self.graph.compute[pipe];
+            if pipe_behind {
+                let tail = self.engine.target[pipe];
+                if !stamp_reached(g.fw_stamp.r32(0)?, f.target, tail)
+                    || !self.queue_ring_passed(Channel::Compute, &g.qstate, &g.qinfo, f)?
+                    || !self.channel_receipt(Channel::Compute, f.rec[2], chan_behind)?
                 {
                     return Ok(Retirement::Pending);
                 }
                 rmb();
                 let stamp = g.notifier.r32(notifier_page::COMPUTE_STAMP)?;
-                full &= stamp_reached(stamp, f.target, e.target)
+                full &= stamp_reached(stamp, f.target, tail)
                     && (stamp != f.target
                         || g.notifier.r32(notifier_page::COMPUTE_CONTEXT)? == f.job.vm.slot);
             } else {
                 if g.fw_stamp.r32(0)? != f.target
-                    || !self.queue_receipt(Channel::Compute, &g.qstate, &g.qinfo, f.head, f.rec[2])?
+                    || !self.queue_ring_receipt(&g.qstate, &g.qinfo, f.head)?
+                    || !self.channel_receipt(Channel::Compute, f.rec[2], chan_behind)?
                 {
                     return Ok(Retirement::Pending);
                 }
@@ -1330,13 +1395,16 @@ impl Firmware {
                 core::mem::forget(f);
                 return;
             }
-            for &stamp in &f.cstamp[..(f.computes as usize).min(f.cstamp.len())] {
-                self.recovery.last_retired.push(0, stamp);
+            if f.computes != 0 {
+                let p = (f.compute_pipe as usize).min(super::hw::sizes::COMPUTE_PIPES - 1);
+                for &stamp in &f.cstamp[..(f.computes as usize).min(f.cstamp.len())] {
+                    self.recovery.last_retired.push(p, stamp);
+                }
             }
             if f.renders != 0 {
                 for m in 0..(f.renders as usize).min(f.r_ta_stamp.len()) {
-                    self.recovery.last_retired.push(1, f.r_ta_stamp[m]);
-                    self.recovery.last_retired.push(2, f.r_fs_stamp[m]);
+                    self.recovery.last_retired.push(2, f.r_ta_stamp[m]);
+                    self.recovery.last_retired.push(3, f.r_fs_stamp[m]);
                 }
                 let committed = f.pb.as_ref().ok_or(EINVAL).and_then(|epoch| {
                     self.pools.retire_flight(
@@ -1548,24 +1616,29 @@ impl Firmware {
         }
     }
 
-    /// Progress of the oldest compute and oldest render flights: a FW stamp of an engine on
+    /// Progress of the oldest compute pipe 0/1 and oldest render flights: a FW stamp of a pipe on
     /// which its oldest flight still has unreached work moved since the last poll. Renews the
-    /// deadline; the first call for a flight pair only records its position.
+    /// deadline; the first call for a flight only records its position.
     /// [`Self::check_hangs`] calls it while no firmware recovery notification is pending.
     pub(crate) fn progress(&mut self) {
         if self.engine.flights.is_empty() {
             return;
         }
         let (g, r, e) = (&self.graph.compute, &self.graph.render, &self.engine);
-        let (mut fc, mut fr) = (None, None);
+        let mut fc: [Option<&Flight>; super::hw::sizes::COMPUTE_PIPES] =
+            [None; super::hw::sizes::COMPUTE_PIPES];
+        let mut fr = None;
         for f in e.flights.iter() {
-            if fc.is_none() && f.computes != 0 {
-                fc = Some(f);
+            if f.computes != 0 {
+                let p = (f.compute_pipe as usize).min(super::hw::sizes::COMPUTE_PIPES - 1);
+                if fc[p].is_none() {
+                    fc[p] = Some(f);
+                }
             }
             if fr.is_none() && f.renders != 0 {
                 fr = Some(f);
             }
-            if fc.is_some() && fr.is_some() {
+            if fc[0].is_some() && fc[1].is_some() && fr.is_some() {
                 break;
             }
         }
@@ -1573,22 +1646,26 @@ impl Firmware {
         // immediately after native wrap and must remain distinguishable from completion.
         let pending =
             |observed, own, tail| (!stamp_reached(observed, own, tail)).then_some(observed);
-        let (mut c, mut ta, mut fs) = (None, None, None);
-        let mut published = [0u64; 2];
-        if let Some(fc) = fc {
-            c = pending(g.fw_stamp.r32(0).unwrap_or(0), fc.target, e.target);
-            published[0] = fc.published_ns;
+        let mut c = [None; super::hw::sizes::COMPUTE_PIPES];
+        let (mut ta, mut fs) = (None, None);
+        let mut published = [0u64; 3];
+        for p in 0..super::hw::sizes::COMPUTE_PIPES {
+            if let Some(f) = fc[p] {
+                c[p] = pending(g[p].fw_stamp.r32(0).unwrap_or(0), f.target, e.target[p]);
+                published[p] = f.published_ns;
+            }
         }
         if let Some(fr) = fr {
             ta = pending(r.fw_stamp[0].r32(0).unwrap_or(0), fr.ta_target, e.ta_target);
             fs = pending(r.fw_stamp[1].r32(0).unwrap_or(0), fr.fs_target, e.fs_target);
-            published[1] = fr.published_ns;
+            published[2] = fr.published_ns;
         }
-        let compute_moved =
-            fc.is_some() && e.progress_flight[0] == published[0] && c != e.progress[0];
+        let compute_moved = (0..super::hw::sizes::COMPUTE_PIPES).any(|p| {
+            fc[p].is_some() && e.progress_flight[p] == published[p] && c[p] != e.progress[p]
+        });
         let render_moved = fr.is_some()
-            && e.progress_flight[1] == published[1]
-            && [ta, fs] != [e.progress[1], e.progress[2]];
+            && e.progress_flight[2] == published[2]
+            && [ta, fs] != [e.progress[2], e.progress[3]];
         if compute_moved {
             self.renew_compute_deadline();
         }
@@ -1596,7 +1673,7 @@ impl Firmware {
             self.renew_render_deadline();
         }
         self.engine.progress_flight = published;
-        self.engine.progress = [c, ta, fs];
+        self.engine.progress = [c[0], c[1], ta, fs];
     }
 
     /// The device mutex still excludes slot reuse after owner-ledger retirement. Read the
@@ -1775,12 +1852,12 @@ impl Firmware {
         if hi > lo {
             s.span_ticks = s.span_ticks.saturating_add(hi - lo);
         }
-        for b in 0..3 {
+        for b in 0..4 {
             let t = self.events.event_ns[b];
-            let skip = if b == 2 {
-                f.computes == 0
-            } else {
-                f.renders == 0
+            let skip = match b {
+                2 => f.computes == 0 || f.compute_pipe != 0,
+                3 => f.computes == 0 || f.compute_pipe != 1,
+                _ => f.renders == 0,
             };
             if skip {
                 continue;
@@ -1806,7 +1883,7 @@ impl Firmware {
     /// readiness and Flags words).
     #[allow(dead_code)]
     pub(crate) fn report(&self, what: &str) {
-        let (g, r, e) = (&self.graph.compute, &self.graph.render, &self.engine);
+        let (r, e) = (&self.graph.render, &self.engine);
         let ch = &self.channels;
         let rd = |o: &super::object::FwObject, off| o.r32(off).unwrap_or(0xdeadbeef);
         let state = self
@@ -1816,22 +1893,33 @@ impl Firmware {
             .flatten()
             .unwrap_or_default();
         let f = e.oldest();
+        let pipe = f
+            .map_or(0, |f| {
+                if f.computes != 0 {
+                    f.compute_pipe as usize
+                } else {
+                    0
+                }
+            })
+            .min(super::hw::sizes::COMPUTE_PIPES - 1);
+        let g = &self.graph.compute[pipe];
         let ms = f.map_or(0, |f| now_ns().wrapping_sub(f.published_ns) / 1_000_000);
 
         dev_info!(
             self.graph.dev.as_ref(),
-            "G16: {}: ctx={} prefixes={} n={} target={:#x} user={:#x} fw={:#x} done={} read={} write={} head={} ch={}/{} events={}/{} errors={} busy={} fault={:#x} {}ms\n",
+            "G16: {}: ctx={} prefixes={} n={} pipe={} target={:#x} user={:#x} fw={:#x} done={} read={} write={} head={} ch={}/{} events={}/{} errors={} busy={} fault={:#x} {}ms\n",
             what,
             f.map_or(0, |f| f.job.vm.slot),
             e.flights.len(),
             e.ordinal,
-            e.target,
+            pipe,
+            e.target[pipe],
             rd(&g.user_stamp, 0),
             rd(&g.fw_stamp, 0),
             rd(&g.qstate, qstate::DONE),
             rd(&g.qstate, qstate::READ),
             rd(&g.qstate, qstate::WRITE),
-            e.head,
+            e.head[pipe],
             ch.read(Channel::Compute).unwrap_or(0xdeadbeef),
             ch.write_cell(Channel::Compute).unwrap_or(0xdeadbeef),
             self.events.compute_events,

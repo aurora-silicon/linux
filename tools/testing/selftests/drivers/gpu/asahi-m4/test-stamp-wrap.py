@@ -28,6 +28,7 @@ const EINVAL:Error=Error(-22);const EAGAIN:Error=Error(-11);type Result<T=()> = 
 #[path="__LOGIC__"]mod logic;
 use logic::{Retirement, ABORT_GRACE_NS};
 mod encode { __STAMP_SEED__ __STAMP__ }
+mod hw { pub mod sizes { pub const COMPUTE_PIPES: usize = 2; } }
 struct Object{cells:BTreeMap<usize,u64>,va:u64,unstable:bool,reads:Cell<u32>}
 impl Default for Object{fn default()->Self{Self{cells:BTreeMap::new(),va:0x1234,unstable:false,reads:Cell::new(0)}}}
 impl Object {
@@ -40,15 +41,15 @@ impl Object {
 mod notifier_page {pub const COMPUTE_STAMP:usize=0;pub const COMPUTE_CONTEXT:usize=4;pub const TA_STAMP:usize=8;pub const FS_STAMP:usize=12;pub const FS_RECORD:usize=32;}
 mod notifier {pub const CONTEXT:usize=16;}
 mod compute {pub const DESCRIPTOR_COMPLETED:usize=0;pub const DESCRIPTOR_COUNTER:usize=8;}
-struct CGraph{fw_stamp:Object,qstate:Object,qinfo:Object,notifier:Object}
+#[derive(Default)]struct CGraph{fw_stamp:Object,qstate:Object,qinfo:Object,notifier:Object}
 struct RGraph{fw_stamp:[Object;2],qstate:[Object;2],qinfo:[Object;2],notifier:Object}
-struct Graph{compute:CGraph,render:RGraph}
+struct Graph{compute:[CGraph;2],render:RGraph}
 struct Vm{slot:u32}struct Job{vm:Vm,resources:Resources}
 struct Resources{compute:Vec<CUnit>,passes:Vec<RUnit>,pools:Pools}
 impl Resources{fn compute(&self)->Result<&Self>{Ok(self)}fn render(&self)->Result<&Self>{Ok(self)}fn compute_unit(&self,k:usize)->Result<&CUnit>{self.compute.get(k).ok_or(EINVAL)}fn render_pass(&self,k:usize)->Result<&RUnit>{self.passes.get(k).ok_or(EINVAL)}fn pb_retired(&self,k:usize)->Result<bool>{self.pools.retired(k)}fn pb_retired_at(&self,k:usize,target:u64)->Result<bool>{self.pools.retired_at(k,target)}}
-struct Claims{slot:[u32;16],slot_count:u32,pass:[u32;1]}
-struct Flight{computes:u32,renders:u32,target:u32,ta_target:u32,fs_target:u32,job:Job,claims:Claims,head:u32,ta_head:u32,fs_head:u32,rec:[u32;3],pb_slot:u32,uma_submitted:u64,csubmitted:[u64;16],recovery_suspect:bool,recovery_started_ns:u64,gate_passed_ns:Option<u64>,unsettled_polls:u32,doomed:bool}
-struct Engine{flights:Vec<Flight>,target:u32,ta_target:u32,fs_target:u32,retired_ticks:[u64;4]}
+struct Claims{slot:[u32;16],slot_count:u32,pass:[u32;4]}
+struct Flight{computes:u32,renders:u32,compute_pipe:u8,target:u32,ta_target:u32,fs_target:u32,job:Job,claims:Claims,head:u32,ta_head:u32,fs_head:u32,rec:[u32;3],pb_slot:u32,uma_submitted:u64,csubmitted:[u64;16],recovery_suspect:bool,recovery_started_ns:u64,gate_passed_ns:Option<u64>,unsettled_polls:u32,doomed:bool}
+struct Engine{flights:Vec<Flight>,target:[u32;2],ta_target:u32,fs_target:u32,retired_ticks:[u64;4]}
 fn stamp_reached(observed:u32,own:u32,tail:u32)->bool{logic::stamp_reached(observed,own,tail)}
 impl Engine{fn oldest(&self)->Option<&Flight>{self.flights.first()}}
 struct CUnit{counter:Object,its:Object,work:Object}
@@ -57,10 +58,15 @@ struct Scrub{compute:Vec<CUnit>,passes:Vec<RUnit>}
 struct Slots{scrub:Scrub}
 struct Pools{full:bool,completed:u64}
 impl Pools{fn retired(&self,_k:usize)->Result<bool>{Ok(self.full)}fn retired_at(&self,_k:usize,target:u64)->Result<bool>{Ok(self.full && target!=0 && self.completed>=target)}}
-struct Firmware{graph:Graph,engine:Engine,slots:Slots,pools:Pools,queue_passed:bool}
-thread_local!{static CLOCK:Cell<u64> = const { Cell::new(100_000_000) };}
-fn rmb(){}fn now_ns()->u64{CLOCK.with(|c| c.get())}
+struct TopChannels{compute_producer:u32}
+impl TopChannels{fn producer(&self,ch:Channel)->u32{match ch{Channel::Compute=>self.compute_producer,_=>1}}}
+struct Firmware{graph:Graph,engine:Engine,slots:Slots,pools:Pools,channels:TopChannels,queue_passed:bool,last_chan_passed:Cell<Option<bool>>}
+thread_local! { static CLOCK: Cell<u64> = const { Cell::new(100_000_000) }; }
+fn rmb(){}fn now_ns()->u64{CLOCK.with(|c|c.get())}
 impl Firmware{
+    fn queue_ring_receipt(&self,_state:&Object,_info:&Object,_head:u32)->Result<bool>{Ok(self.queue_passed)}
+    fn queue_ring_passed(&self,_ch:Channel,_state:&Object,_info:&Object,_f:&Flight)->Result<bool>{Ok(self.queue_passed)}
+    fn channel_receipt(&self,_ch:Channel,_rec:u32,passed:bool)->Result<bool>{self.last_chan_passed.set(Some(passed));Ok(self.queue_passed)}
     fn queue_receipt(&self,_ch:Channel,_state:&Object,_info:&Object,_head:u32,_rec:u32)->Result<bool>{Ok(self.queue_passed)}
     fn queue_passed(&self,_ch:Channel,_state:&Object,_info:&Object,_f:&Flight)->Result<bool>{Ok(self.queue_passed)}
     // The ITS-pair ticks (25G83, and the first choice on 26B123): the receipt tests set them.
@@ -75,15 +81,15 @@ impl Firmware{
 fn firmware(render:bool,ordinal:u64)->Firmware{
     let target=encode::stamp(ordinal);
     let mut f=Firmware{
-        graph:Graph{compute:CGraph{fw_stamp:Object::default(),qstate:Object::default(),qinfo:Object::default(),notifier:Object::default()},
+        graph:Graph{compute:[CGraph::default(),CGraph::default()],
             render:RGraph{fw_stamp:Default::default(),qstate:Default::default(),qinfo:Default::default(),notifier:Object::default()}},
-        engine:Engine{flights:vec![Flight{computes:u32::from(!render),renders:u32::from(render),target,ta_target:target,fs_target:target,job:Job{vm:Vm{slot:2},resources:Resources{compute:vec![CUnit{counter:Object::default(),its:Object::default(),work:Object::default()}],passes:vec![RUnit{scene:Object::default()}],pools:Pools{full:true,completed:2}}},claims:Claims{slot:[0;16],slot_count:u32::from(!render),pass:[0]},head:1,ta_head:1,fs_head:1,rec:[1;3],pb_slot:0,uma_submitted:2,csubmitted:{let mut a=[0u64;16];if !render{a[0]=ordinal;}a},recovery_suspect:false,recovery_started_ns:0,gate_passed_ns:None,unsettled_polls:0,doomed:false}],target,ta_target:target,fs_target:target,retired_ticks:[0;4]},
+        engine:Engine{flights:vec![Flight{computes:u32::from(!render),renders:u32::from(render),compute_pipe:0,target,ta_target:target,fs_target:target,job:Job{vm:Vm{slot:2},resources:Resources{compute:vec![CUnit{counter:Object::default(),its:Object::default(),work:Object::default()}],passes:vec![RUnit{scene:Object::default()}],pools:Pools{full:true,completed:2}}},claims:Claims{slot:[0;16],slot_count:u32::from(!render),pass:[0;4]},head:1,ta_head:1,fs_head:1,rec:[1;3],pb_slot:0,uma_submitted:2,csubmitted:{let mut a=[0u64;16];if !render{a[0]=ordinal;}a},recovery_suspect:false,recovery_started_ns:0,gate_passed_ns:None,unsettled_polls:0,doomed:false}],target:[target,0],ta_target:target,fs_target:target,retired_ticks:[0;4]},
         slots:Slots{scrub:Scrub{compute:vec![CUnit{counter:Object::default(),its:Object::default(),work:Object::default()}],passes:vec![RUnit{scene:Object::default()}]}},
-        pools:Pools{full:true,completed:2},queue_passed:true,
+        pools:Pools{full:true,completed:2},channels:TopChannels{compute_producer:1},queue_passed:true,last_chan_passed:Cell::new(None),
     };
-    f.graph.compute.fw_stamp.set(0,u64::from(target));
-    f.graph.compute.notifier.set(notifier_page::COMPUTE_STAMP,u64::from(target));
-    f.graph.compute.notifier.set(notifier_page::COMPUTE_CONTEXT,2);
+    f.graph.compute[0].fw_stamp.set(0,u64::from(target));
+    f.graph.compute[0].notifier.set(notifier_page::COMPUTE_STAMP,u64::from(target));
+    f.graph.compute[0].notifier.set(notifier_page::COMPUTE_CONTEXT,2);
     f.engine.flights[0].job.resources.compute[0].counter.set(0,ordinal);
     f.engine.flights[0].job.resources.compute[0].its.set(0,100);f.engine.flights[0].job.resources.compute[0].its.set(8,101);
     f.engine.flights[0].job.resources.compute[0].work.set(compute::DESCRIPTOR_COMPLETED,ordinal);
@@ -128,15 +134,15 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     for n in [0x7fffff,0x800000,0xffffff,0x1000000,0x1000001]{
         let mut f=firmware(false,n);
         let later=firmware(false,n+1).engine.flights.remove(0);
-        f.engine.flights.push(later);f.engine.target=encode::stamp(n+1);
+        f.engine.flights.push(later);f.engine.target[0]=encode::stamp(n+1);
         // The command behind it finished too: the shared stamp and notifier cells name it.
-        f.graph.compute.fw_stamp.set(0,u64::from(encode::stamp(n+1)));
-        f.graph.compute.notifier.set(notifier_page::COMPUTE_STAMP,u64::from(encode::stamp(n+1)));
-        f.graph.compute.notifier.set(notifier_page::COMPUTE_CONTEXT,9);
+        f.graph.compute[0].fw_stamp.set(0,u64::from(encode::stamp(n+1)));
+        f.graph.compute[0].notifier.set(notifier_page::COMPUTE_STAMP,u64::from(encode::stamp(n+1)));
+        f.graph.compute[0].notifier.set(notifier_page::COMPUTE_CONTEXT,9);
         assert_eq!(f.retired(),Ok(Retirement::Full));
-        f.graph.compute.fw_stamp.set(0,u64::from(encode::stamp(n-1)));
+        f.graph.compute[0].fw_stamp.set(0,u64::from(encode::stamp(n-1)));
         assert_eq!(f.retired(),Ok(Retirement::Pending));
-        f.graph.compute.fw_stamp.set(0,u64::from(encode::stamp(n)));
+        f.graph.compute[0].fw_stamp.set(0,u64::from(encode::stamp(n)));
         assert_eq!(f.retired(),Ok(Retirement::Full));
         f.queue_passed=false;assert_eq!(f.retired(),Ok(Retirement::Pending));
         f.queue_passed=true;f.engine.flights[0].job.resources.compute[0].work.set(compute::DESCRIPTOR_COMPLETED,n-1);
@@ -190,10 +196,10 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     let mut f=firmware(true,10);
     let c=firmware(false,20).engine.flights.remove(0);
     f.engine.flights.push(c);
-    f.engine.target=encode::stamp(20);
-    f.graph.compute.fw_stamp.set(0,u64::from(encode::stamp(20)));
-    f.graph.compute.notifier.set(notifier_page::COMPUTE_STAMP,u64::from(encode::stamp(20)));
-    f.graph.compute.notifier.set(notifier_page::COMPUTE_CONTEXT,2);
+    f.engine.target[0]=encode::stamp(20);
+    f.graph.compute[0].fw_stamp.set(0,u64::from(encode::stamp(20)));
+    f.graph.compute[0].notifier.set(notifier_page::COMPUTE_STAMP,u64::from(encode::stamp(20)));
+    f.graph.compute[0].notifier.set(notifier_page::COMPUTE_CONTEXT,2);
     // Keep render FS stamp unreached so render at index 0 stays pending.
     f.graph.render.fw_stamp[1].set(0,u64::from(encode::stamp(9)));
     assert_eq!(f.retired_flight(),Ok(Some((1,Retirement::Full))));
@@ -211,7 +217,7 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     for stage in 0..2 { f2.graph.render.fw_stamp[stage].set(0,u64::from(encode::stamp(40))); }
     f2.graph.render.notifier.set(notifier_page::TA_STAMP,u64::from(encode::stamp(40)));
     f2.graph.render.notifier.set(notifier_page::FS_STAMP,u64::from(encode::stamp(40)));
-    f2.graph.compute.fw_stamp.set(0,u64::from(encode::stamp(29)));
+    f2.graph.compute[0].fw_stamp.set(0,u64::from(encode::stamp(29)));
     assert_eq!(f2.retired_flight(),Ok(Some((1,Retirement::Full))));
 }
 #[test]fn multi_compute_horizon_requires_every_claimed_unit_receipt(){
@@ -251,8 +257,10 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     // Render-only retirement performs zero compute WC reads.
     let mut fr=firmware(true,5);
     assert_eq!(fr.retired_flight(),Ok(Some((0,Retirement::Full))));
-    assert_eq!(fr.graph.compute.fw_stamp.reads.get(),0);
-    assert_eq!(fr.graph.compute.notifier.reads.get(),0);
+    assert_eq!(fr.graph.compute[0].fw_stamp.reads.get(),0);
+    assert_eq!(fr.graph.compute[0].notifier.reads.get(),0);
+    assert_eq!(fr.graph.compute[1].fw_stamp.reads.get(),0);
+    assert_eq!(fr.graph.compute[1].notifier.reads.get(),0);
     // In-progress render (TA done, FS still running) fails fast on FS stamp without reading TA or scene.
     let mut fp=firmware(true,7);
     fp.graph.render.fw_stamp[1].set(0,u64::from(encode::stamp(6)));
@@ -268,9 +276,9 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     // Mixed flight pending is polled once, not twice.
     let mut fm=firmware(false,9);
     fm.engine.flights[0].renders=1;
-    fm.graph.compute.fw_stamp.set(0,u64::from(encode::stamp(8)));
+    fm.graph.compute[0].fw_stamp.set(0,u64::from(encode::stamp(8)));
     assert_eq!(fm.retired_flight(),Ok(None));
-    assert_eq!(fm.graph.compute.fw_stamp.reads.get(),1);
+    assert_eq!(fm.graph.compute[0].fw_stamp.reads.get(),1);
     assert_eq!(fm.graph.render.fw_stamp[1].reads.get(),0);
     // Pending compute class is not re-polled while retiring a burst of render flights.
     let mut fmix=firmware(false,30);
@@ -283,15 +291,15 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     for stage in 0..2 { fmix.graph.render.fw_stamp[stage].set(0,u64::from(encode::stamp(41))); }
     fmix.graph.render.notifier.set(notifier_page::TA_STAMP,u64::from(encode::stamp(41)));
     fmix.graph.render.notifier.set(notifier_page::FS_STAMP,u64::from(encode::stamp(41)));
-    fmix.graph.compute.fw_stamp.set(0,u64::from(encode::stamp(29)));
-    let (mut check_c,mut check_r)=(true,true);
+    fmix.graph.compute[0].fw_stamp.set(0,u64::from(encode::stamp(29)));
+    let (mut check_c,mut check_r)=([true;2],true);
     assert_eq!(fmix.retired_flight_classes(&mut check_c,&mut check_r),Ok(Some((1,Retirement::Full))));
-    assert!(!check_c && check_r);
+    assert!(!check_c[0] && !check_c[1] && check_r);
     fmix.engine.flights.remove(1);
     assert_eq!(fmix.retired_flight_classes(&mut check_c,&mut check_r),Ok(Some((1,Retirement::Full))));
     fmix.engine.flights.remove(1);
     assert_eq!(fmix.retired_flight_classes(&mut check_c,&mut check_r),Ok(None));
-    assert_eq!(fmix.graph.compute.fw_stamp.reads.get(),1);
+    assert_eq!(fmix.graph.compute[0].fw_stamp.reads.get(),1);
 }
 #[test]fn innocent_suspect_flight_does_not_false_abort_after_recovery_grace(){
     let mut f=firmware(true,15);
@@ -358,31 +366,14 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     c.engine.flights[0].job.resources.compute[0].its.set(8,299);
     assert_eq!(c.retired(),Ok(Retirement::Pending));
 }
-#[test]fn recovery_suspect_compact_compute_retires_full_with_hw_ticks(){
-    // An innocent cross-VM compact compute (compute_ts_mask == 0) marked recovery_suspect
-    // during another VM's hang still proves stage execution via cold-path ITS ticks and
-    // retires Full without false Aborted or VM blame.
-    CLOCK.with(|c|c.set(100_000_000));
-    let mut f=firmware(false,29);
-    f.engine.flights[0].compute_ts_mask=0;
-    f.engine.flights[0].recovery_suspect=true;
-    f.engine.flights[0].recovery_started_ns=90_000_000;
-    f.engine.flights[0].job.resources.compute[0].its.set(0,500);
-    f.engine.flights[0].job.resources.compute[0].its.set(8,525);
-    assert_eq!(f.retired_flight(),Ok(Some((0,Retirement::Full))));
-    assert!(!f.engine.flights[0].doomed);
-    assert_eq!(f.engine.flights[0].job.resources.compute[0].its.reads.get(),2);
-    assert_eq!(f.engine.retired_ticks,[0;4]);
-}
 #[test]fn cross_vm_render_hang_recovery_isolates_innocent_client_flight(){
-    // VM A (slot 0, ASID 1) hangs/aborts on render n=30 while innocent VM B (slot 1, ASID 2,
-    // compact stage_ts_mask=0) has a co-resident render n=31 with real FS ticks and independent
-    // allocator slot completion. VM A aborts; VM B retires Full without blame or error.
+    // VM A (slot 0, ASID 1) hangs/aborts on render n=30 while innocent VM B (slot 1, ASID 2)
+    // has a co-resident render n=31 with real TA/FS ticks and independent allocator slot
+    // completion. VM A aborts; VM B retires Full without blame or error.
     CLOCK.with(|c|c.set(100_000_000));
     let mut f=firmware(true,30);
     f.engine.flights[0].job.vm.slot=1;
     f.engine.flights[0].pb_slot=0;
-    f.engine.flights[0].stage_ts_mask=0;
     f.engine.flights[0].doomed=true;
     f.engine.flights[0].recovery_suspect=true;
     f.engine.flights[0].recovery_started_ns=90_000_000;
@@ -392,12 +383,13 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     innocent.job.vm.slot=2;
     innocent.pb_slot=1;
     innocent.uma_submitted=2;
-    innocent.stage_ts_mask=0;
     innocent.doomed=false;
     innocent.recovery_suspect=true;
     innocent.recovery_started_ns=90_000_000;
     innocent.job.resources.pools=Pools{full:true,completed:2};
     innocent.job.resources.passes[0].scene=Object::default();
+    innocent.job.resources.passes[0].scene.set(0x600,300);
+    innocent.job.resources.passes[0].scene.set(0x608,320);
     innocent.job.resources.passes[0].scene.set(0x620,400);
     innocent.job.resources.passes[0].scene.set(0x628,430);
     f.engine.flights.push(innocent);
@@ -411,18 +403,93 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     f.graph.render.notifier.set(notifier::CONTEXT,2);
     f.graph.render.notifier.set(notifier_page::FS_RECORD+notifier::CONTEXT,2);
 
-    // After 20 ms recovery grace, hanging VM A aborts on slot 0.
-    CLOCK.with(|c|c.set(110_000_000));
+    // First unsettled poll records gate_passed_ns on hanging VM A; after ABORT_GRACE_NS, VM A aborts.
+    assert_eq!(f.retired_flight(),Ok(None));
+    CLOCK.with(|c|c.set(100_000_000 + ABORT_GRACE_NS));
     let (idx_a,ret_a)=f.retired_flight().unwrap().unwrap();
     assert_eq!((idx_a,ret_a),(0,Retirement::Aborted));
     assert!(ret_a.job_failed(f.engine.flights[0].doomed));
     f.engine.flights.remove(0);
 
-    // Innocent VM B on slot 1 proves FS execution via cold-path FS ticks and retires Full.
+    // Innocent VM B on slot 1 proves TA/FS execution via hardware ticks and retires Full.
     let (idx_b,ret_b)=f.retired_flight().unwrap().unwrap();
     assert_eq!((idx_b,ret_b),(0,Retirement::Full));
     assert!(!f.engine.flights[0].doomed);
     assert!(!ret_b.job_failed(f.engine.flights[0].doomed));
+}
+#[test]fn two_compute_pipes_retire_out_of_order_independently(){
+    // Pipe 0 flight at idx 0 (pending, rec=1) + Pipe 1 flight at idx 1 (complete, rec=2,
+    // shared Channel::Compute producer=2): pipe 1 retires Full ahead of pipe 0, and once
+    // pipe 0 settles afterwards it still uses passed channel_receipt because rec (1) != producer (2).
+    let mut f=firmware(false,10);
+    f.engine.flights[0].compute_pipe=0;
+    f.engine.flights[0].rec[2]=1;
+    let mut c1=firmware(false,11).engine.flights.remove(0);
+    c1.compute_pipe=1;
+    c1.rec[2]=2;
+    f.engine.flights.push(c1);
+    f.engine.target=[encode::stamp(10),encode::stamp(11)];
+    f.channels.compute_producer=2;
+    f.graph.compute[0].fw_stamp.set(0,u64::from(encode::stamp(9)));
+    f.graph.compute[1].fw_stamp.set(0,u64::from(encode::stamp(11)));
+    f.graph.compute[1].notifier.set(notifier_page::COMPUTE_STAMP,u64::from(encode::stamp(11)));
+    f.graph.compute[1].notifier.set(notifier_page::COMPUTE_CONTEXT,2);
+    assert_eq!(f.retired_flight(),Ok(Some((1,Retirement::Full))));
+    assert_eq!(f.last_chan_passed.get(),Some(true));
+    f.engine.flights.remove(1);
+    assert_eq!(f.retired_flight(),Ok(None));
+    // Now finish pipe 0: rec[2]=1 != producer=2 still sets chan_behind=true.
+    f.last_chan_passed.set(None);
+    f.graph.compute[0].fw_stamp.set(0,u64::from(encode::stamp(10)));
+    assert_eq!(f.retired_flight(),Ok(Some((0,Retirement::Full))));
+    assert_eq!(f.last_chan_passed.get(),Some(true));
+}
+#[test]fn two_pipe_cross_vm_compute_hang_recovery_isolates_innocent_pipe(){
+    // Pipe 0 VM A (ASID 1) hangs/aborts while co-resident Pipe 1 VM B (ASID 2) proves CDM
+    // execution via hardware ITS ticks and retires Full immediately without blame or false abort.
+    CLOCK.with(|c|c.set(100_000_000));
+    let mut f=firmware(false,40);
+    f.engine.flights[0].compute_pipe=0;
+    f.engine.flights[0].job.vm.slot=1;
+    f.engine.flights[0].rec[2]=1;
+    f.engine.flights[0].doomed=true;
+    f.engine.flights[0].recovery_suspect=true;
+    f.engine.flights[0].recovery_started_ns=90_000_000;
+    f.engine.flights[0].job.resources.compute[0].its=Object::default();
+
+    let mut innocent=firmware(false,41).engine.flights.remove(0);
+    innocent.compute_pipe=1;
+    innocent.job.vm.slot=2;
+    innocent.rec[2]=2;
+    innocent.doomed=false;
+    innocent.recovery_suspect=true;
+    innocent.recovery_started_ns=90_000_000;
+    innocent.job.resources.compute[0].its.set(0,500);
+    innocent.job.resources.compute[0].its.set(8,530);
+    f.engine.flights.push(innocent);
+
+    f.engine.target=[encode::stamp(40),encode::stamp(41)];
+    f.channels.compute_producer=2;
+    f.graph.compute[0].fw_stamp.set(0,u64::from(encode::stamp(40)));
+    f.graph.compute[0].notifier.set(notifier_page::COMPUTE_STAMP,u64::from(encode::stamp(40)));
+    f.graph.compute[0].notifier.set(notifier_page::COMPUTE_CONTEXT,1);
+    f.graph.compute[1].fw_stamp.set(0,u64::from(encode::stamp(41)));
+    f.graph.compute[1].notifier.set(notifier_page::COMPUTE_STAMP,u64::from(encode::stamp(41)));
+    f.graph.compute[1].notifier.set(notifier_page::COMPUTE_CONTEXT,2);
+
+    // Within grace: pipe 0 records gate_passed_ns while innocent pipe 1 retires Full immediately.
+    let (idx_b,ret_b)=f.retired_flight().unwrap().unwrap();
+    assert_eq!((idx_b,ret_b),(1,Retirement::Full));
+    assert!(!f.engine.flights[1].doomed);
+    assert!(!ret_b.job_failed(f.engine.flights[1].doomed));
+    f.engine.flights.remove(1);
+    assert_eq!(f.retired_flight(),Ok(None));
+
+    // Past ABORT_GRACE_NS from gate_passed_ns: hanging pipe 0 aborts cleanly.
+    CLOCK.with(|c|c.set(100_000_000 + ABORT_GRACE_NS));
+    let (idx_a,ret_a)=f.retired_flight().unwrap().unwrap();
+    assert_eq!((idx_a,ret_a),(0,Retirement::Aborted));
+    assert!(ret_a.job_failed(f.engine.flights[0].doomed));
 }
 
 mod queue_proof {
@@ -469,12 +536,15 @@ mod queue_proof {
         }
         fn producer(&self, ch: Channel) -> u32 { self.channel(ch).write }
     }
-    struct Engine { head: u32, ta_head: u32, fs_head: u32 }
-    struct Flight { c_start: u32, head: u32, ta_start: u32, ta_head: u32, fs_start: u32, fs_head: u32, rec: [u32; 3] }
+    struct Engine { head: [u32; 2], ta_head: u32, fs_head: u32 }
+    struct Flight { compute_pipe: u8, c_start: u32, head: u32, ta_start: u32, ta_head: u32, fs_start: u32, fs_head: u32, rec: [u32; 3] }
     struct Firmware { init: Init, channels: Channels, engine: Engine }
     mod inner {
         use super::*;
         impl Firmware {
+            __QUEUE_RING_RECEIPT__
+            __QUEUE_RING_PASSED__
+            __CHANNEL_RECEIPT__
             __QUEUE_RECEIPT__
             __QUEUE_PASSED__
         }
@@ -489,7 +559,7 @@ mod queue_proof {
                     ta: Pipe { read: 7, completion: 7, write: 7 },
                     fs: Pipe { read: 9, completion: 9, write: 9 },
                 },
-                engine: Engine { head: 10, ta_head: 20, fs_head: 30 },
+                engine: Engine { head: [10, 12], ta_head: 20, fs_head: 30 },
             };
             let mut state = Object::default();
             let mut info = Object::default();
@@ -516,10 +586,24 @@ mod queue_proof {
             assert_eq!(fw.queue_receipt(Channel::Compute, &state, &info, 256, 5), Err(EINVAL));
             assert_eq!(info.reads.get(), 0);
 
+            // Split ring + channel receipts for 2-pipe OOO compute: pipe 1's own ring is exact
+            // (head=12) while shared Channel::Compute producer moved on to 6 (rec=5 -> passed=true).
+            fw.channels.compute = Pipe { read: 6, completion: 6, write: 6 };
+            state.set(qstate::READ, 12);
+            state.set(qstate::WRITE, 12);
+            assert_eq!(fw.queue_ring_receipt(&state, &info, 12), Ok(true));
+            assert_eq!(fw.channel_receipt(Channel::Compute, 5, false), Ok(false));
+            assert_eq!(fw.channel_receipt(Channel::Compute, 5, true), Ok(true));
+            let f_p1 = Flight { compute_pipe: 1, c_start: 10, head: 11, ta_start: 0, ta_head: 1, fs_start: 0, fs_head: 1, rec: [1, 1, 5] };
+            assert_eq!(fw.queue_ring_passed(Channel::Compute, &state, &info, &f_p1), Ok(true));
+            state.set(qstate::READ, 10);
+            assert_eq!(fw.queue_ring_passed(Channel::Compute, &state, &info, &f_p1), Ok(false));
+            assert_eq!(info.reads.get(), 0);
+
             // queue_passed with queued work behind flight (including wrap-around) never reads qinfo.
             fw.engine.ta_head = 2;
             fw.channels.ta = Pipe { read: 2, completion: 2, write: 3 };
-            let f = Flight { c_start: 0, head: 10, ta_start: 254, ta_head: 0, fs_start: 0, fs_head: 1, rec: [1, 1, 5] };
+            let f = Flight { compute_pipe: 0, c_start: 0, head: 10, ta_start: 254, ta_head: 0, fs_start: 0, fs_head: 1, rec: [1, 1, 5] };
             state.set(qstate::READ, 1);
             assert_eq!(fw.queue_passed(Channel::Ta, &state, &info, &f), Ok(true));
             assert_eq!(info.reads.get(), 0);
@@ -536,8 +620,11 @@ mod queue_proof {
 }
 
 '''.replace('__LOGIC__', str(backend/'recovery/logic.rs'))
-for token, path, name in [('__STAMP_SEED__','encode.rs','stamp_seed'),('__STAMP__','encode.rs','stamp'),('__RETIRED__','poll.rs','retired'),('__RETIRED_AT__','poll.rs','retired_at'),('__RETIRED_FLIGHT__','poll.rs','retired_flight'),('__RETIRED_FLIGHT_CLASSES__','poll.rs','retired_flight_classes'),('__RETIRED_SNAPSHOT__','poll.rs','retired_snapshot'),('__RETIRED_SNAPSHOT_AT__','poll.rs','retired_snapshot_at'),('__QUEUE_RECEIPT__','poll.rs','queue_receipt'),('__QUEUE_PASSED__','poll.rs','queue_passed'),('__GRAPH_FW__','graph.rs','graph_fw'),('__QINFO_CACHED__','graph.rs','qinfo_cached')]:
-    harness=harness.replace(token,function((backend/path).read_text(),name))
+for token, path, name in [('__STAMP_SEED__','encode.rs','stamp_seed'),('__STAMP__','encode.rs','stamp'),('__RETIRED__','poll.rs','retired'),('__RETIRED_AT__','poll.rs','retired_at'),('__RETIRED_FLIGHT__','poll.rs','retired_flight'),('__RETIRED_FLIGHT_CLASSES__','poll.rs','retired_flight_classes'),('__RETIRED_SNAPSHOT__','poll.rs','retired_snapshot'),('__RETIRED_SNAPSHOT_AT__','poll.rs','retired_snapshot_at'),('__QUEUE_RING_RECEIPT__','poll.rs','queue_ring_receipt'),('__QUEUE_RING_PASSED__','poll.rs','queue_ring_passed'),('__CHANNEL_RECEIPT__','poll.rs','channel_receipt'),('__QUEUE_RECEIPT__','poll.rs','queue_receipt'),('__QUEUE_PASSED__','poll.rs','queue_passed'),('__GRAPH_FW__','graph.rs','graph_fw'),('__QINFO_CACHED__','graph.rs','qinfo_cached')]:
+    body = function((backend/path).read_text(),name)
+    if token in ('__RETIRED_FLIGHT__', '__RETIRED_FLIGHT_CLASSES__', '__RETIRED_SNAPSHOT_AT__'):
+        body = body.replace('super::hw::', 'hw::')
+    harness=harness.replace(token, body)
 hw_text=(backend/'hw.rs').read_text()
 def mod_block(text, name):
     start=text.index('pub(crate) mod '+name+' {')

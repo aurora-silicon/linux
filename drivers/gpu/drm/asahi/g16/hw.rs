@@ -708,6 +708,8 @@ pub(crate) mod sizes {
     pub(crate) const POOL_SIZE: u64 = 0x200000;
     pub(crate) const FREELIST_SEED: u32 = 8192;
     pub(crate) const QUEUE_CAP: u32 = 256;
+    /// Independent firmware compute workqueue pipes sharing `Channel::Compute` and `sched_ctx`.
+    pub(crate) const COMPUTE_PIPES: usize = 2;
     /// Compute units claimable in one batched compute prefix (matches `COMPUTE_UNITS`).
     pub(crate) const COMPUTE_SLOTS: usize = COMPUTE_UNITS;
     /// Base physical PB/UMA allocator slots allocated per VM on first render.
@@ -724,12 +726,14 @@ pub(crate) mod sizes {
     const _: () =
         assert!(super::client::render_descriptor(5) + 0x4000 <= super::client::render_base(0));
     /// Worst-case firmware work-ring entries consumed per pipelined render pass on TA
-    /// (`prev_barrier`, `ta_fs_barrier`, `compute_barrier`, `ta_work`) and FS (`fs_dep`,
-    /// `fs_compute_barrier`, `own_barrier`, `fs_work`). `InitBM` runs only on an idle engine
-    /// (`initbm` + `ta_work` = 2 entries).
-    pub(crate) const MAX_RENDER_RING_ENTRIES: usize = 4;
-    /// Worst-case firmware work-ring entries per compute command (`fs2c` barrier + `work`).
-    pub(crate) const MAX_COMPUTE_RING_ENTRIES: usize = 2;
+    /// (`prev_barrier`, `ta_fs_barrier`, up to `COMPUTE_PIPES` `compute_barrier` entries,
+    /// `ta_work`) and FS (`fs_dep`, up to `COMPUTE_PIPES` `fs_compute_barrier` entries,
+    /// `own_barrier`, `fs_work`). `InitBM` runs only on an idle engine (`initbm` + `ta_work` = 2
+    /// entries).
+    pub(crate) const MAX_RENDER_RING_ENTRIES: usize = 5;
+    /// Worst-case firmware work-ring entries per compute command (`fs2c` barrier + cross-pipe
+    /// `c2c` barrier + `work`).
+    pub(crate) const MAX_COMPUTE_RING_ENTRIES: usize = 3;
     /// Maximum unfinished TA passes kept in flight at once so multi-pass render bursts pace
     /// TA in `<= 8`-pass waves without throttling single-pass pipelining (where TA finishes
     /// well ahead of FS).

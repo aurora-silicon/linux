@@ -37,6 +37,8 @@ pub(crate) const POOL_SIZE: usize = 0x2000000;
 pub(crate) const POOL_STATE_SIZE: usize = 0x20000;
 pub(crate) const PAGE_LIST_SIZE: usize = 0x4000;
 pub(crate) const EVENT: u32 = 15;
+/// Firmware completion events for concurrent compute pipes `0..COMPUTE_PIPES`.
+pub(crate) const EVENTS: [u32; 2] = [EVENT, 16];
 /// The binding generation.
 pub(crate) const GENERATION: usize = 0x88b;
 

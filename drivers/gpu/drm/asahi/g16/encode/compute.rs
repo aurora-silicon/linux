@@ -52,6 +52,8 @@ pub(crate) struct ComputeRefs {
     pub(crate) record_fw: u64,
     pub(crate) binding_generation: u8,
     pub(crate) uma_slot: u32,
+    /// Firmware completion event assigned to this compute pipe (e.g. 15 or 16).
+    pub(crate) event: u32,
     /// Native command descriptor identifier (work+0x820), independent of compute index.
     pub(crate) command_id: u64,
     /// Native u32 compute sequence/index (StartCompute+0x38).
@@ -202,6 +204,8 @@ pub(crate) fn encode_compute_for(
     if r.binding_generation == 0
         || r.uma_slot == 0
         || r.uma_slot > 32
+        || r.event == 0
+        || r.event >= 128
         || r.target_stamp & 0xff != 0
         || r.submitted == 0
     {
@@ -328,7 +332,7 @@ pub(crate) fn encode_compute_for(
     put64(w, 0x800, r.user_stamp);
     put64(w, 0x808, r.fw_stamp);
     put32(w, 0x810, r.target_stamp);
-    put32(w, 0x814, compute::EVENT);
+    put32(w, 0x814, r.event);
     put32(w, 0x81c, 1);
     put32(w, 0x818, r.work_818);
     put64(w, 0x820, r.command_id);
@@ -375,7 +379,7 @@ pub(crate) fn encode_compute_for(
     put64(q, 0x198, r.context_store_gva + 0x1e800);
     put64(q, 0x1a0, r.context_store_gva + 0x1f000);
     put64(q, 0x1a8, r.work + layout.target as u64);
-    put32(q, 0x1b8, compute::EVENT);
+    put32(q, 0x1b8, r.event);
     let requested = ts_va[0] != 0 || ts_va[1] != 0;
     timestamp(q, compute::TS_START, false, r, requested, layout.auxiliary);
     put32(q, 0x208, 1);

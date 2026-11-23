@@ -60,9 +60,13 @@ pub(crate) struct QueueState {
     /// Exact successful firmware receipts, independently for render and compute. These
     /// survive aggregate-fence publication and never advance on aborted/failed commands.
     pub(crate) completed: [AtomicU64; 2],
-    /// Published command frontier per engine. The firmware runs the compute queue in
+    /// Out-of-order full compute receipts strictly above `completed[COMPUTE] + 1` (bit `k`
+    /// records ordinal `completed[COMPUTE] + 2 + k`), enabling concurrent 2-pipe completion.
+    pub(crate) compute_ooo: AtomicU64,
+    /// Published command frontier per engine. The firmware runs each queue pipe in
     /// publication order, each command to its Finalize, so a compute command may follow its
-    /// published (not yet retired) compute predecessors.
+    /// published (not yet retired) compute predecessors (on the same pipe or via a cross-pipe
+    /// barrier).
     pub(crate) published: [AtomicU64; 2],
     /// Owned-job counts at the queue's last 32 arrivals (compute horizon ahead), recorded by the
     /// engine when a job arrives.
@@ -95,6 +99,17 @@ impl QueueState {
             }
         }
         Ok(())
+    }
+
+    /// Whether compute ordinal `seq` already has a full successful firmware receipt, either
+    /// at or below the contiguous `completed[COMPUTE]` frontier or recorded in `compute_ooo`.
+    pub(crate) fn is_compute_retired(&self, seq: u64) -> bool {
+        let completed = self.completed[command::COMPUTE].load(Ordering::Acquire);
+        if seq <= completed {
+            return true;
+        }
+        let shift = seq.wrapping_sub(completed).wrapping_sub(2);
+        shift < 64 && (self.compute_ooo.load(Ordering::Acquire) & (1u64 << shift)) != 0
     }
 }
 
@@ -176,6 +191,7 @@ impl Queue {
                 cancelled_at: [const { AtomicU64::new(0) }; 2],
                 turn: AtomicU64::new(0),
                 completed: [const { AtomicU64::new(0) }; 2],
+                compute_ooo: AtomicU64::new(0),
                 published: [const { AtomicU64::new(0) }; 2],
                 owned: [const { AtomicU32::new(0) }; 32],
                 owned_index: AtomicU32::new(0),

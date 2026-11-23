@@ -249,7 +249,7 @@ fn compute_work(out: &std::path::Path) {
         context_store_gva: g + 0x500000, counter_fw: f + 0x500000,
         pool_state_gva: g + 0x600000, page_list_gva: g + 0x700000, usc_base: 1 << 40,
         record_fw: f + 0x700000, binding_generation: 200, uma_slot: 3, command_id: 9,
-        compute_index: 8, work_818: 0, target_stamp: 0x900, submitted: 5,
+        compute_index: 8, work_818: 0, target_stamp: 0x900, submitted: 5, event: compute::EVENT,
     };
     let c = uapi::drm_asahi_cmd_compute {
         cdm_ctrl_stream_base: g + 0x300000, cdm_ctrl_stream_end: g + 0x300200,

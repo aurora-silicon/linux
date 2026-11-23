@@ -51,7 +51,7 @@ pub(crate) fn compute_flights() -> usize {
 
 /// Render commands in flight at most: bounded by both retained pass slots
 /// (`RENDER_SLOTS - 1`, leaving one slot for displacement) and firmware TA/FS work-ring
-/// capacity (`(QUEUE_CAP - 1) / MAX_RENDER_RING_ENTRIES`, worst case 4 ring entries per pass).
+/// capacity (`(QUEUE_CAP - 1) / MAX_RENDER_RING_ENTRIES`, worst case 5 ring entries per pass).
 /// Decoupled from `hw::sizes::FLIGHTS` because multi-pass render batches pack multiple passes
 /// into one `Flight`.
 pub(crate) fn render_flights() -> usize {

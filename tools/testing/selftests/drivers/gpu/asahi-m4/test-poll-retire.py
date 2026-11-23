@@ -66,6 +66,7 @@ const EVENT_RETIRE_POLLS: u32 = 11;
 mod hw {
     pub mod sizes {
         pub const TA_WAVE_PASSES: usize = 8;
+        pub const COMPUTE_PIPES: usize = 2;
     }
 }
 
@@ -125,7 +126,7 @@ struct RenderGraph {
     fw_stamp: [Cell32; 2],
 }
 struct Graph {
-    compute: ComputeGraph,
+    compute: [ComputeGraph; 2],
     render: RenderGraph,
 }
 
@@ -143,6 +144,7 @@ struct Prof {
 
 struct Flight {
     computes: u32,
+    compute_pipe: u8,
     renders: u32,
     target: u32,
     fs_target: u32,
@@ -152,7 +154,7 @@ struct Engine {
     shared: Option<Arc<Shared>>,
     flights: Vec<Flight>,
     pending: Vec<Arc<Job>>,
-    target: u32,
+    target: [u32; 2],
     fs_target: u32,
     chan_wait: bool,
     slot_wait: bool,
@@ -301,9 +303,14 @@ impl Firmware {
             session: Session,
             objects: Objects,
             graph: Graph {
-                compute: ComputeGraph {
-                    fw_stamp: Cell32::new(0),
-                },
+                compute: [
+                    ComputeGraph {
+                        fw_stamp: Cell32::new(0),
+                    },
+                    ComputeGraph {
+                        fw_stamp: Cell32::new(0),
+                    },
+                ],
                 render: RenderGraph {
                     fw_stamp: [Cell32::new(0), Cell32::new(0)],
                 },
@@ -312,7 +319,7 @@ impl Firmware {
                 shared: None,
                 flights: vec![],
                 pending: vec![],
-                target: 0,
+                target: [0; 2],
                 fs_target: 0,
                 chan_wait: false,
                 slot_wait: false,
@@ -416,12 +423,13 @@ fn submit_locked_retires_inline_on_reached_stamp_without_full_housekeeping() {
     let mut fw = Firmware::new();
     fw.engine.flights.push(Flight {
         computes: 1,
+        compute_pipe: 0,
         renders: 0,
         target: 0x100,
         fs_target: 0,
     });
-    fw.engine.target = 0x100;
-    fw.graph.compute.fw_stamp.set(0x100);
+    fw.engine.target[0] = 0x100;
+    fw.graph.compute[0].fw_stamp.set(0x100);
     fw.retire_on_call = true;
 
     let mut done = vec![];
@@ -443,6 +451,7 @@ fn submit_locked_preserves_evented_when_irq_precedes_receipt() {
     let mut fw = Firmware::new();
     fw.engine.flights.push(Flight {
         computes: 0,
+        compute_pipe: 0,
         renders: 1,
         target: 0,
         fs_target: 0x100,
@@ -464,6 +473,7 @@ fn submit_locked_preserves_evented_when_irq_precedes_receipt() {
     let mut fw_ta = Firmware::new();
     fw_ta.engine.flights.push(Flight {
         computes: 0,
+        compute_pipe: 0,
         renders: 1,
         target: 0,
         fs_target: 0x100,
@@ -490,17 +500,19 @@ fn submit_locked_defers_housekeeping_and_arms_short_repoll_on_coalesced_event() 
     fw.last_housekeeping_ns = 1_000_000;
     fw.engine.flights.push(Flight {
         computes: 1,
+        compute_pipe: 0,
         renders: 0,
         target: 0x100,
         fs_target: 0,
     });
     fw.engine.flights.push(Flight {
         computes: 1,
+        compute_pipe: 0,
         renders: 0,
         target: 0x200,
         fs_target: 0,
     });
-    fw.engine.target = 0x200;
+    fw.engine.target[0] = 0x200;
 
     let mut done = vec![];
     shared
@@ -539,11 +551,12 @@ fn poll_step_defers_active_housekeeping_until_five_ms_and_off_hot_lock() {
     fw.last_housekeeping_ns = 1_000_000;
     fw.engine.flights.push(Flight {
         computes: 1,
+        compute_pipe: 0,
         renders: 0,
         target: 0x100,
         fs_target: 0,
     });
-    fw.engine.target = 0x100;
+    fw.engine.target[0] = 0x100;
     let mut retry_tail = false;
     let mut deferred = false;
     let mut done = vec![];
@@ -572,6 +585,7 @@ fn run_housekeeping_throttles_auxiliary_ring_drain_while_flights_active() {
     fw.last_aux_drain_ns = 1_000_000;
     fw.engine.flights.push(Flight {
         computes: 1,
+        compute_pipe: 0,
         renders: 0,
         target: 0x100,
         fs_target: 0,
@@ -608,6 +622,7 @@ fn ta_only_event_does_not_spin_or_arm_short_repoll() {
     let mut fw = Firmware::new();
     fw.engine.flights.push(Flight {
         computes: 0,
+        compute_pipe: 0,
         renders: 1,
         target: 0,
         fs_target: 0x100,
@@ -634,6 +649,7 @@ fn fs_event_without_settled_receipt_still_polls_tail_and_sets_short_repoll() {
     let mut fw = Firmware::new();
     fw.engine.flights.push(Flight {
         computes: 0,
+        compute_pipe: 0,
         renders: 1,
         target: 0,
         fs_target: 0x100,
@@ -666,41 +682,69 @@ fn concurrent_compute_completion_behind_pending_render_wakes_submit_retire() {
     let mut fw = Firmware::new();
     fw.engine.flights.push(Flight {
         computes: 0,
+        compute_pipe: 0,
         renders: 1,
         target: 0,
         fs_target: 0x200,
     });
     fw.engine.flights.push(Flight {
         computes: 1,
+        compute_pipe: 0,
         renders: 0,
         target: 0x100,
         fs_target: 0,
     });
     fw.engine.fs_target = 0x200;
-    fw.engine.target = 0x100;
+    fw.engine.target[0] = 0x100;
     // Render still running, compute reached its stamp.
     fw.graph.render.fw_stamp[1].set(0x100);
-    fw.graph.compute.fw_stamp.set(0x100);
+    fw.graph.compute[0].fw_stamp.set(0x100);
     assert!(fw.oldest_stamp_reached());
-    assert_eq!(fw.graph.compute.fw_stamp.reads.get(), 1);
+    assert_eq!(fw.graph.compute[0].fw_stamp.reads.get(), 1);
     assert_eq!(fw.graph.render.fw_stamp[1].reads.get(), 0);
     assert_eq!(fw.oldest_terminal_events(), Some((Some(0), Some(0))));
-}
 
-#[test]
-fn oldest_stamp_reached_skips_inactive_class_wc_reads() {
-    // Compute-only workload never reads render fw_stamp.
-    let mut fc = Firmware::new();
-    fc.engine.flights.push(Flight {
+    // Pipe 1 reaching its stamp behind a pending pipe 0 flight also wakes inline retirement.
+    let mut fw2 = Firmware::new();
+    fw2.engine.flights.push(Flight {
         computes: 1,
+        compute_pipe: 0,
         renders: 0,
         target: 0x200,
         fs_target: 0,
     });
-    fc.engine.target = 0x200;
-    fc.graph.compute.fw_stamp.set(0x100);
+    fw2.engine.flights.push(Flight {
+        computes: 1,
+        compute_pipe: 1,
+        renders: 0,
+        target: 0x100,
+        fs_target: 0,
+    });
+    fw2.engine.target = [0x200, 0x100];
+    fw2.graph.compute[0].fw_stamp.set(0x100);
+    fw2.graph.compute[1].fw_stamp.set(0x100);
+    assert!(fw2.oldest_stamp_reached());
+    assert_eq!(fw2.graph.compute[0].fw_stamp.reads.get(), 1);
+    assert_eq!(fw2.graph.compute[1].fw_stamp.reads.get(), 1);
+    assert_eq!(fw2.graph.render.fw_stamp[1].reads.get(), 0);
+}
+
+#[test]
+fn oldest_stamp_reached_skips_inactive_class_wc_reads() {
+    // Compute-only workload never reads render fw_stamp or idle compute pipe 1.
+    let mut fc = Firmware::new();
+    fc.engine.flights.push(Flight {
+        computes: 1,
+        compute_pipe: 0,
+        renders: 0,
+        target: 0x200,
+        fs_target: 0,
+    });
+    fc.engine.target[0] = 0x200;
+    fc.graph.compute[0].fw_stamp.set(0x100);
     assert!(!fc.oldest_stamp_reached());
-    assert_eq!(fc.graph.compute.fw_stamp.reads.get(), 1);
+    assert_eq!(fc.graph.compute[0].fw_stamp.reads.get(), 1);
+    assert_eq!(fc.graph.compute[1].fw_stamp.reads.get(), 0);
     assert_eq!(fc.graph.render.fw_stamp[0].reads.get(), 0);
     assert_eq!(fc.graph.render.fw_stamp[1].reads.get(), 0);
 
@@ -708,6 +752,7 @@ fn oldest_stamp_reached_skips_inactive_class_wc_reads() {
     let mut fr = Firmware::new();
     fr.engine.flights.push(Flight {
         computes: 0,
+        compute_pipe: 0,
         renders: 1,
         target: 0,
         fs_target: 0x200,
@@ -715,7 +760,8 @@ fn oldest_stamp_reached_skips_inactive_class_wc_reads() {
     fr.engine.fs_target = 0x200;
     fr.graph.render.fw_stamp[1].set(0x100);
     assert!(!fr.oldest_stamp_reached());
-    assert_eq!(fr.graph.compute.fw_stamp.reads.get(), 0);
+    assert_eq!(fr.graph.compute[0].fw_stamp.reads.get(), 0);
+    assert_eq!(fr.graph.compute[1].fw_stamp.reads.get(), 0);
     assert_eq!(fr.graph.render.fw_stamp[0].reads.get(), 0);
     assert_eq!(fr.graph.render.fw_stamp[1].reads.get(), 1);
 }
@@ -726,6 +772,7 @@ fn poll_step_skips_publish_when_pending_blocked_and_nothing_retired() {
     let mut fw = Firmware::new();
     fw.engine.flights.push(Flight {
         computes: 0,
+        compute_pipe: 0,
         renders: 1,
         target: 0,
         fs_target: 0x100,
@@ -794,6 +841,7 @@ fn pending_slot_wait_arms_short_repoll_without_breaking_ta_only_or_frozen() {
     let mut fw = Firmware::new();
     fw.engine.flights.push(Flight {
         computes: 0,
+        compute_pipe: 0,
         renders: 11,
         target: 0,
         fs_target: 0x100,
@@ -848,6 +896,7 @@ fn ta_only_irq_wakes_ta_wave_wait_without_spinning_retry_tail() {
     let mut fw = Firmware::new();
     fw.engine.flights.push(Flight {
         computes: 0,
+        compute_pipe: 0,
         renders: 8,
         target: 0,
         fs_target: 0x800,
@@ -896,7 +945,7 @@ mod event_drain_test {
     const STATE_WRITE: usize = 0x40;
     const RING_SLOTS: u32 = 128;
     const RECORD_WORDS: usize = 18;
-    const STAGE_EVENTS: [u32; 3] = [0x70, 0x71, 15];
+    const STAGE_EVENTS: [u32; 4] = [0x70, 0x71, 15, 16];
     mod rings {
         pub const EVENT_RECORD: usize = 0x48;
     }
@@ -984,7 +1033,7 @@ mod event_drain_test {
         ta_events: u32,
         fs_events: u32,
         compute_events: u32,
-        event_ns: [u64; 3],
+        event_ns: [u64; 4],
         errors: u32,
         channel_errors: u32,
         recovery_started_ns: Option<u64>,
@@ -1018,7 +1067,8 @@ mod event_drain_test {
     #[test]
     fn event_drain_batches_state_read_and_minimizes_wc_reads() {
         let ring = Ring::new();
-        // 3 consecutive type-1 stage events: TA (0x70 -> word 4 bit 16), FS (0x71 -> word 4 bit 17), Compute (15 -> word 1 bit 15).
+        // 4 consecutive type-1 stage events: TA (0x70 -> word 4 bit 16), FS (0x71 -> word 4 bit 17),
+        // Compute pipe 0 (15 -> word 1 bit 15), Compute pipe 1 (16 -> word 1 bit 16).
         let mut r0 = [0u32; RECORD_WORDS];
         r0[0] = 1;
         r0[4] = 1 << 16;
@@ -1028,22 +1078,28 @@ mod event_drain_test {
         let mut r2 = [0u32; RECORD_WORDS];
         r2[0] = 1;
         r2[1] = 1 << 15;
+        let mut r3 = [0u32; RECORD_WORDS];
+        r3[0] = 1;
+        r3[1] = 1 << 16;
         ring.put_record(0, &r0);
         ring.put_record(1, &r1);
         ring.put_record(2, &r2);
-        ring.set_indices(0, 3);
+        ring.put_record(3, &r3);
+        ring.set_indices(0, 4);
 
         let mut ev = Events::default();
         ev.drain(&device::Device, &ring).unwrap();
         assert_eq!(ev.event_ns[0], 12345);
+        assert_eq!(ev.event_ns[2], 12345);
+        assert_eq!(ev.event_ns[3], 12345);
         assert_eq!(ev.fs_events, 1);
-        assert_eq!(ev.compute_events, 1);
-        assert_eq!(ev.stage_events, 3);
-        assert_eq!(ring.read_idx(), 3);
-        // Exactly ONE STATE_READ write for all 3 records!
+        assert_eq!(ev.compute_events, 2);
+        assert_eq!(ev.stage_events, 4);
+        assert_eq!(ring.read_idx(), 4);
+        // Exactly ONE STATE_READ write for all 4 records!
         assert_eq!(ring.state.writes.get(), 1);
-        // Exactly 3 WC reads per type-1 record (kind, word 1, word 4) = 9 reads (not 54)!
-        assert_eq!(ring.ring.reads.get(), 9);
+        // Exactly 3 WC reads per type-1 record (kind, word 1, word 4) = 12 reads (not 72)!
+        assert_eq!(ring.ring.reads.get(), 12);
     }
 
     #[test]

@@ -501,14 +501,51 @@ impl Job {
     pub(crate) fn command_retired(&self, index: u32) -> Result {
         let order = self.orders.get(index as usize).ok_or(EINVAL)?;
         let previous = order.sequence.checked_sub(1).ok_or(EINVAL)?;
-        self.queue.completed[order.engine]
-            .compare_exchange(
-                previous,
-                order.sequence,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .map_err(|_| EIO)?;
+        if order.engine != super::command::COMPUTE {
+            self.queue.completed[order.engine]
+                .compare_exchange(
+                    previous,
+                    order.sequence,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .map_err(|_| EIO)?;
+            return Ok(());
+        }
+        // Concurrent 2-pipe compute commands on the same logical queue may retire out of
+        // sequence order. Record published out-of-order full receipts above `completed + 1`
+        // in `compute_ooo` and advance `completed[COMPUTE]` across contiguous retired runs.
+        let completed = self.queue.completed[super::command::COMPUTE].load(Ordering::Acquire);
+        if order.sequence <= completed {
+            return Err(EIO);
+        }
+        if order.sequence == completed + 1 {
+            let mut next = order.sequence;
+            let mut ooo = self.queue.compute_ooo.load(Ordering::Acquire);
+            while ooo & 1 != 0 {
+                next += 1;
+                ooo >>= 1;
+            }
+            // Re-anchor remaining OOO bits above `next + 1` (since `next` advanced by at least 1
+            // and bit 0 of `ooo` is now `next + 1`, which is 0).
+            ooo >>= 1;
+            self.queue.compute_ooo.store(ooo, Ordering::Release);
+            self.queue.completed[super::command::COMPUTE]
+                .compare_exchange(completed, next, Ordering::AcqRel, Ordering::Acquire)
+                .map_err(|_| EIO)?;
+            return Ok(());
+        }
+        let published = self.queue.published[super::command::COMPUTE].load(Ordering::Acquire);
+        let shift = order.sequence - completed - 2;
+        if order.sequence > published || shift >= 64 {
+            return Err(EIO);
+        }
+        let bit = 1u64 << shift;
+        let ooo = self.queue.compute_ooo.load(Ordering::Acquire);
+        if ooo & bit != 0 {
+            return Err(EIO);
+        }
+        self.queue.compute_ooo.store(ooo | bit, Ordering::Release);
         Ok(())
     }
 

@@ -1234,7 +1234,7 @@ pub mod g16 {
         assert_eq!(s.hold_compute_slot(g16::hw::sizes::COMPUTE_UNITS,&a,&prep),Err(EINVAL));
         s.hold_compute_slot(k0,&a,&prep).unwrap();
         s.verify_held(&cc).unwrap();
-        s.publish(&cc).unwrap();
+        s.publish(&mut cc).unwrap();
         s.note_published(&cc);
         s.retire(&mut cc).unwrap();
 
@@ -1257,7 +1257,7 @@ pub mod g16 {
         let mut dup=cr;
         dup.pass[1]=46;
         assert_eq!(s.verify_held(&dup),Err(EINVAL));
-        s.publish(&cr).unwrap();
+        s.publish(&mut cr).unwrap();
         s.note_published(&cr);
         s.retire(&mut cr).unwrap();
 
@@ -1267,7 +1267,7 @@ pub mod g16 {
         cr2.pass[0]=46;cr2.pass_count=1;cr2.pass_mask=1u64<<46;s.pass_busy|=1u64<<46;
         s.hold_render_pass(46,&b,&prep).unwrap();
         s.verify_held(&cr2).unwrap();
-        s.publish(&cr2).unwrap();
+        s.publish(&mut cr2).unwrap();
         s.note_published(&cr2);
         assert_eq!(s.stats.cross_vm_retargets[1],1);
         assert_eq!(s.stats.last_retarget[1].unit,46);
@@ -1422,6 +1422,58 @@ pub mod g16 {
         s.release(&mut c);
     }
 
+    #[test]fn two_pipe_compute_out_of_order_retire_and_base_unit_isolation(){
+        let mut o=Objects::new();let mut s=Slots::new().unwrap();
+        let mut units=KVec::new();
+        for k in 0..4u64 {
+            units.push(g16::slots::ComputeSlot::new(&mut o,k).unwrap(),0).unwrap();
+        }
+        let prep=g16::resources::ComputeArena{compute:units,render:None};
+        let a=vm(1);let b=vm(2);
+        // Pipe 0 claims unit 0; pipe 1 stays out of base units 0..2 and claims unit 2.
+        let mut c0=Claims::new();
+        let mut c1=Claims::new();
+        assert_eq!(s.claim_compute_for_pipe(&prep,&mut c0,Some(a.id),0).unwrap(),Some(0));
+        assert_eq!(c0.compute_pipe,0);
+        s.hold_vm(&c0,&a).unwrap();s.publish(&mut c0).unwrap();
+        assert_eq!(s.claim_compute_for_pipe(&prep,&mut c1,Some(a.id),1).unwrap(),Some(2));
+        assert_eq!(c1.compute_pipe,1);
+        s.hold_vm(&c1,&a).unwrap();s.publish(&mut c1).unwrap();
+        // Pipe 1 finishes ahead of still-running pipe 0: retire must succeed (no EINVAL).
+        assert_eq!(s.retire(&mut c1),Ok(()));
+        // Second pipe-1 flight claims unit 3 and retires, displacing unit 2 on pipe 1.
+        let mut c1b=Claims::new();
+        assert_eq!(s.claim_compute_for_pipe(&prep,&mut c1b,Some(a.id),1).unwrap(),Some(3));
+        s.hold_vm(&c1b,&a).unwrap();s.publish(&mut c1b).unwrap();
+        assert_eq!(s.retire(&mut c1b),Ok(()));
+        assert!(s.compute_available_for_pipe(4,1));
+        // Now pipe 0's unit 0 retires: pipe 1's newer unit 3 must NOT mark unit 0 reusable,
+        // while base unit 1 remains fresh so a 2-unit base-only VM is never exhausted!
+        assert_eq!(s.retire(&mut c0),Ok(()));
+        assert!(!s.compute_exhausted_within(2));
+        assert!(s.compute_available(2));
+        // Pipe 0 claims base unit 1 (not undisplaced unit 0), publishes, and retires -> unit 0 displaced!
+        let mut c0b=Claims::new();
+        assert_eq!(s.claim_compute_for_pipe(&prep,&mut c0b,Some(b.id),0).unwrap(),Some(1));
+        s.hold_vm(&c0b,&b).unwrap();s.publish(&mut c0b).unwrap();
+        assert_eq!(s.retire(&mut c0b),Ok(()));
+        assert!(!s.compute_exhausted_within(2));
+        assert!(s.compute_available(2));
+        // A 2-unit base-only VM can claim displaced base unit 0 on pipe 0, while pipe 1
+        // reclaims displaced extension unit 2 on the 4-unit VM without touching base units 0..2.
+        let mut base_units=KVec::new();
+        for k in 0..2u64 {
+            base_units.push(g16::slots::ComputeSlot::new(&mut o,k).unwrap(),0).unwrap();
+        }
+        let prep_base=g16::resources::ComputeArena{compute:base_units,render:None};
+        let mut c0c=Claims::new();
+        assert_eq!(s.claim_compute_for_pipe(&prep_base,&mut c0c,Some(b.id),0).unwrap(),Some(0));
+        let mut c1c=Claims::new();
+        assert_eq!(s.claim_compute_for_pipe(&prep,&mut c1c,Some(b.id),1).unwrap(),Some(2));
+        s.release(&mut c0c);
+        s.release(&mut c1c);
+    }
+
     #[test]fn base_render_quarantine_expands_fresh_vm_and_recovers_displacement(){
         use crate::g16::resources::{BASE_RENDER_SLOTS, EXT_RENDER_TIERS, target_render_slots};
         let mut o=Objects::new();let mut s=Slots::new().unwrap();
@@ -1527,7 +1579,7 @@ pub mod g16 {
         let a=vm(1);let b=vm(2);
         let pub_retire=|s:&mut Slots,k:usize,vm:&sync::Arc<g16::vm::VmState>|{
             let mut c=Claims::new();c.pass[0]=k as u32;c.pass_mask=1u64<<k;
-            s.hold_vm(&c,vm).unwrap();s.hold_arenas(&c,&prep);s.publish(&c).unwrap();s.retire(&mut c).unwrap();
+            s.hold_vm(&c,vm).unwrap();s.hold_arenas(&c,&prep);s.publish(&mut c).unwrap();s.retire(&mut c).unwrap();
         };
         // Slot 0 runs a large pass (0x10000), then a small pass (0x2000) -> dirty=0x10000, last=0x2000.
         s.claim_pass_in(&prep,0,Some(a.id),0x10000).unwrap();
@@ -1592,10 +1644,27 @@ pub mod g16 {
         assert_eq!(cmd_fw(), Class::Fw);
         assert_eq!(cmd_shared(), Class::Shared);
         let mut o = Objects::new();
-        let c = ComputeGraph::new(&mut o).unwrap();
-        let r = RenderGraph::new(&mut o, c.sched_ctx.clone()).unwrap();
-        c.init(FwAbi).unwrap();
+        let ctx = o.alloc(g16::object::Request {
+            size: 0x40,
+            class: Class::Fw,
+            placement: g16::object::Placement::Anywhere,
+            offset: 0,
+            client: None,
+            lower: None,
+            cpu: true,
+        }).unwrap();
+        let c = ComputeGraph::new(&mut o, ctx.clone()).unwrap();
+        let c1 = ComputeGraph::new(&mut o, ctx.clone()).unwrap();
+        let r = RenderGraph::new(&mut o, ctx).unwrap();
+        c.init(FwAbi, true).unwrap();
+        c1.init(FwAbi, false).unwrap();
         r.init(FwAbi).unwrap();
+        assert_eq!(c.sched_ctx.va, c1.sched_ctx.va);
+        assert_ne!(c.qinfo.va, c1.qinfo.va);
+        assert_ne!(c.fw_stamp.va, c1.fw_stamp.va);
+        assert_eq!(c1.qinfo.class, Class::FwCached);
+        assert_eq!(c1.qstate.class, Class::Fw);
+        assert_eq!(c1.fw_stamp.class, Class::Shared);
         assert_eq!(c.qinfo.class, Class::FwCached);
         assert_eq!(c.qscratch.class, Class::FwCached);
         assert_eq!(c.job_list.class, Class::FwCached);

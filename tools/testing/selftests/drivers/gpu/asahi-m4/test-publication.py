@@ -55,8 +55,8 @@ assert prefix_render_fn.count('render_bar,') == 5, prefix_render_fn
 assert 'p.prev_barrier.write(0, &prev)?;' in prefix_render_fn
 assert 'p.ta_fs_barrier.write(0, &ta_fs)?;' in prefix_render_fn
 assert 'p.fs_dep.write(0, &dep)?;' in prefix_render_fn
-assert 'p.compute_barrier.write(0, &cbar)?;' in prefix_render_fn
-assert 'p.fs_compute_barrier.write(0, &fcbar)?;' in prefix_render_fn
+assert 'p.compute_barrier.write(off, &cbar)?;' in prefix_render_fn
+assert 'p.fs_compute_barrier.write(off, &fcbar)?;' in prefix_render_fn
 c2ta_slice = prefix_render_fn[
     prefix_render_fn.index('plan.ta_compute_wait'):prefix_render_fn.index('p.compute_barrier.write')
 ]
@@ -66,6 +66,9 @@ c2fs_slice = prefix_render_fn[
 fs2c_slice = prefix_compute_fn[
     prefix_compute_fn.index('wait_render'):prefix_compute_fn.index('s.barrier.write')
 ]
+assert 'work::compute::EVENTS[pipe]' in prefix_compute_fn
+assert 'work::compute::EVENTS[p_idx]' in c2ta_slice
+assert 'work::compute::EVENTS[p_idx]' in c2fs_slice
 assert 'render_bar,' in c2ta_slice and 'BarrierType::Hold' not in c2ta_slice
 assert 'render_bar,' in c2fs_slice and 'BarrierType::Hold' not in c2fs_slice
 assert 'BarrierType::Stamp,' in prefix_render_fn[prefix_render_fn.index('let own = encode::barrier'):prefix_render_fn.index('p.own_barrier.write')]
@@ -91,7 +94,19 @@ __PUBLICATION_ERROR__
 #[derive(Copy,Clone)]enum Command { Compute(ComputeCommand), Render(()) }
 struct Status(AtomicU32);impl Status{fn get(&self)->u32{self.0.load(Ordering::Relaxed)}}
 struct Vm { status:Status, slot:u32 }
-struct Queue { turn:AtomicU64, priority:u32, completed:[AtomicU64;2] }
+struct Queue { turn:AtomicU64, priority:u32, completed:[AtomicU64;2], compute_ooo:AtomicU64 }
+impl Queue {
+    fn new(turn:u64, priority:u32)->Arc<Self>{
+        Arc::new(Self{turn:AtomicU64::new(turn),priority,completed:[AtomicU64::new(0),AtomicU64::new(0)],compute_ooo:AtomicU64::new(0)})
+    }
+    fn is_compute_retired(&self, seq:u64)->bool{
+        let c=self.completed[command::COMPUTE].load(Ordering::Acquire);
+        if seq<=c { return true; }
+        let off=seq-c-1;
+        if off==0 || off>64 { return false; }
+        (self.compute_ooo.load(Ordering::Acquire) & (1u64 << (off-1))) != 0
+    }
+}
 struct Progress { sent:AtomicU32,count:u32,pending:AtomicBool }
 impl Progress {
     fn sent(&self)->u32{self.sent.load(Ordering::Relaxed)}
@@ -152,7 +167,7 @@ mod encode {
     // containment branch below decides whether the unit becomes claimable again.
     pub fn preserve_compute_descriptor(refs:&ComputeRefs,_old:&[u8;160],_before:u64,_work:&mut[u8;8192])->Result<(),()>{if refs.invalid{Err(())}else{Ok(())}}
 }
-mod hw { pub mod sizes { pub const FLIGHTS:usize=32; pub const TA_WAVE_PASSES:usize=8; } }
+mod hw { pub mod sizes { pub const FLIGHTS:usize=32; pub const TA_WAVE_PASSES:usize=8; pub const COMPUTE_PIPES:usize=2; } }
 mod command {pub const RENDER:usize=0;pub const COMPUTE:usize=1;}
 thread_local!{static CLOCK:std::cell::Cell<u64>=const{std::cell::Cell::new(0)};}
 fn now_ns()->u64{CLOCK.with(|clock|clock.get())}
@@ -256,7 +271,7 @@ impl Firmware {
 fn mk_vm(slot:u32)->Arc<Vm>{Arc::new(Vm{status:Status(AtomicU32::new(0)),slot})}
 fn job_on_vm(id:u32,vm:Arc<Vm>,render:bool,sent:u32,dependency:Result)->Arc<Job>{
     Arc::new(Job{id,vm,
-        queue:Arc::new(Queue{turn:AtomicU64::new(0),priority:0,completed:[AtomicU64::new(0),AtomicU64::new(0)]}),
+        queue:Queue::new(0,0),
         progress:Progress{sent:AtomicU32::new(sent),count:sent+1,pending:AtomicBool::new(true)},
         commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access:true})};sent as usize+1],dependency,terminal_marked:AtomicBool::new(false),resources:Resources})
 }
@@ -410,7 +425,7 @@ fn firmware(jobs:Vec<Arc<Job>>,stages:Vec<(Result,bool)>)->Firmware{
         let vm1=mk_vm(1);
         let mk_prio=|id:u32,render:bool,priority:u32|Arc::new(Job{
             id,vm:vm1.clone(),
-            queue:Arc::new(Queue{turn:AtomicU64::new(0),priority,completed:[AtomicU64::new(0),AtomicU64::new(0)]}),
+            queue:Queue::new(0,priority),
             progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
             commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access:false})}],
             dependency:Ok(()),terminal_marked:AtomicBool::new(false),resources:Resources,
@@ -526,8 +541,8 @@ fn firmware(jobs:Vec<Arc<Job>>,stages:Vec<(Result,bool)>)->Firmware{
     }
     #[test]fn alt_bypass_preserves_per_queue_fifo_order(){
         let vm1=mk_vm(1);
-        let q1=Arc::new(Queue{turn:AtomicU64::new(0),priority:0,completed:[AtomicU64::new(0),AtomicU64::new(0)]});
-        let q2=Arc::new(Queue{turn:AtomicU64::new(1),priority:0,completed:[AtomicU64::new(0),AtomicU64::new(0)]});
+        let q1=Queue::new(0,0);
+        let q2=Queue::new(1,0);
         let mk_q=|id:u32,q:Arc<Queue>,render:bool|Arc::new(Job{
             id,vm:vm1.clone(),queue:q,
             progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
@@ -612,7 +627,7 @@ fn firmware(jobs:Vec<Arc<Job>>,stages:Vec<(Result,bool)>)->Firmware{
     }
     #[test]fn same_queue_independent_compute_bypasses_ta_wave_paused_render_only(){
         let vm1=mk_vm(1);
-        let q1=Arc::new(Queue{turn:AtomicU64::new(0),priority:0,completed:[AtomicU64::new(0),AtomicU64::new(0)]});
+        let q1=Queue::new(0,0);
         let mk=|id:u32,render:bool,query_access:bool,dep:Result|Arc::new(Job{
             id,vm:vm1.clone(),queue:q1.clone(),
             progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
@@ -698,15 +713,19 @@ impl QueueBehindStamp{
 struct QueueBehindRenderGraph{fw_stamp:[QueueBehindStamp;2]}
 struct QueueBehindGraph{render:QueueBehindRenderGraph}
 impl QueueBehindGraph{fn new()->Self{Self{render:QueueBehindRenderGraph{fw_stamp:[QueueBehindStamp::new(0),QueueBehindStamp::new(0)]}}}}
-struct QueueBehindFlight{job:Arc<QueueBehindJob>,group:Vec<Arc<QueueBehindJob>>,first:usize,count:usize,computes:u32,renders:u32,target:u32,cstamp:[u32;16],r_ta_stamp:[u32;16],r_fs_stamp:[u32;16],fs_target:u32,initbm:bool,has_timestamps:bool,doomed:bool,recovery_suspect:bool}
-struct QueueBehindEngine{ordinal:u64,draw:u64,ta_target:u32,flights:Vec<QueueBehindFlight>}
+struct QueueBehindFlight{job:Arc<QueueBehindJob>,group:Vec<Arc<QueueBehindJob>>,first:usize,count:usize,computes:u32,renders:u32,compute_pipe:u8,target:u32,cstamp:[u32;16],r_ta_stamp:[u32;16],r_fs_stamp:[u32;16],fs_target:u32,initbm:bool,has_timestamps:bool,doomed:bool,recovery_suspect:bool}
+struct QueueBehindEngine{ordinal:u64,draw:u64,ta_target:u32,next_compute_pipe:u8,flights:Vec<QueueBehindFlight>}
 struct QueueBehindSlots{compute_exhausted:bool,render_exhausted:bool,compute_available:bool,pass_available:bool}
 impl QueueBehindSlots{
     fn compute_exhausted(&self)->bool{self.compute_exhausted}
     fn render_exhausted(&self)->bool{self.render_exhausted}
     fn compute_available(&self,_n:usize)->bool{self.compute_available}
+    fn compute_available_for_pipe(&self,n:usize,pipe:usize)->bool{
+        self.compute_available && (pipe == 0 || n > resources::BASE_COMPUTE_UNITS)
+    }
     fn pass_available(&self,_n:usize)->bool{self.pass_available}
 }
+mod resources { pub const BASE_COMPUTE_UNITS: usize = 2; }
 struct QueueBehindPools{exhausted:bool,can_pipeline:bool,block_pipeline_vm:Option<u32>}
 impl QueueBehindPools{
     fn exhausted(&self)->bool{self.exhausted}
@@ -716,6 +735,7 @@ impl QueueBehindPools{
 struct QueueBehindHost{graph:QueueBehindGraph,engine:QueueBehindEngine,slots:QueueBehindSlots,pools:QueueBehindPools}
 mod queue_behind_scope {
     use super::*;
+    use crate::hw::sizes;
     type Job = QueueBehindJob;
     type Flight = QueueBehindFlight;
     fn command(job:&Job,k:u32)->Option<&Command>{job.commands.get(k as usize)}
@@ -751,11 +771,13 @@ mod queue_behind_scope {
         __WAIT_STAMP_FOR_WITH__
         __WAIT_STAMP_FOR__
         __CROSS_ENGINE_WAIT__
+        __WAIT_COMPUTE_STAMPS_FOR__
+        __CHOOSE_COMPUTE_PIPE__
     }
     #[test]fn timed_compute_queues_behind_same_vm_and_coexists_with_render(){
         let vm1=Arc::new(Vm{status:Status(AtomicU32::new(0)),slot:1});
         let vm2=Arc::new(Vm{status:Status(AtomicU32::new(0)),slot:2});
-        let q1=Arc::new(Queue{turn:AtomicU64::new(0),priority:0,completed:[AtomicU64::new(0),AtomicU64::new(0)]});
+        let q1=Queue::new(0,0);
         let mk=|id:u32,vm:Arc<Vm>,queue:Arc<Queue>,render:bool|Arc::new(QueueBehindJob{
             id,vm,queue,progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
             commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access:true})}],
@@ -768,7 +790,7 @@ mod queue_behind_scope {
         let j_render=mk(4,vm1.clone(),q1.clone(),true);
         let mut p=QueueBehindHost{
             graph:QueueBehindGraph::new(),
-            engine:QueueBehindEngine{ordinal:1,draw:1,ta_target:0,flights:vec![QueueBehindFlight{job:j1,group:vec![],first:0,count:1,computes:1,renders:0,target:0x100,cstamp:[0x100;16],r_ta_stamp:[0;16],r_fs_stamp:[0;16],fs_target:0,initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false}]},
+            engine:QueueBehindEngine{ordinal:1,draw:1,ta_target:0,next_compute_pipe:0,flights:vec![QueueBehindFlight{job:j1,group:vec![],first:0,count:1,computes:1,renders:0,compute_pipe:0,target:0x100,cstamp:[0x100;16],r_ta_stamp:[0;16],r_fs_stamp:[0;16],fs_target:0,initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false}]},
             slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
             pools:QueueBehindPools{exhausted:false,can_pipeline:true,block_pipeline_vm:None},
         };
@@ -798,8 +820,8 @@ mod queue_behind_scope {
     }
     #[test]fn compute_query_access_waits_for_timed_predecessor_unless_no_query_access(){
         let vm1=Arc::new(Vm{status:Status(AtomicU32::new(0)),slot:1});
-        let q1=Arc::new(Queue{turn:AtomicU64::new(0),priority:0,completed:[AtomicU64::new(0),AtomicU64::new(0)]});
-        let q2=Arc::new(Queue{turn:AtomicU64::new(0),priority:0,completed:[AtomicU64::new(0),AtomicU64::new(0)]});
+        let q1=Queue::new(0,0);
+        let q2=Queue::new(0,0);
         let mk=|id:u32,queue:Arc<Queue>,query_access:bool,wait_vdm:Option<u64>,wait_cdm:Option<u64>|Arc::new(QueueBehindJob{
             id,vm:vm1.clone(),queue,
             progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
@@ -814,7 +836,7 @@ mod queue_behind_scope {
         let other_queue=mk(2,q2.clone(),true,None,Some(1));
         let p=QueueBehindHost{
             graph:QueueBehindGraph::new(),
-            engine:QueueBehindEngine{ordinal:1,draw:1,ta_target:0,flights:vec![QueueBehindFlight{job:timed,group:vec![],first:0,count:1,computes:1,renders:0,target:0x100,cstamp:[0x100;16],r_ta_stamp:[0;16],r_fs_stamp:[0;16],fs_target:0,initbm:false,has_timestamps:true,doomed:false,recovery_suspect:false}]},
+            engine:QueueBehindEngine{ordinal:1,draw:1,ta_target:0,next_compute_pipe:0,flights:vec![QueueBehindFlight{job:timed,group:vec![],first:0,count:1,computes:1,renders:0,compute_pipe:0,target:0x100,cstamp:[0x100;16],r_ta_stamp:[0;16],r_fs_stamp:[0;16],fs_target:0,initbm:false,has_timestamps:true,doomed:false,recovery_suspect:false}]},
             slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
             pools:QueueBehindPools{exhausted:false,can_pipeline:true,block_pipeline_vm:None},
         };
@@ -832,7 +854,7 @@ mod queue_behind_scope {
         });
         let pr=QueueBehindHost{
             graph:QueueBehindGraph::new(),
-            engine:QueueBehindEngine{ordinal:1,draw:1,ta_target:0,flights:vec![QueueBehindFlight{job:timed_render,group:vec![],first:0,count:1,computes:0,renders:1,target:0,cstamp:[0;16],r_ta_stamp:[0;16],r_fs_stamp:{let mut a=[0;16];a[0]=0x200;a},fs_target:0x200,initbm:false,has_timestamps:true,doomed:false,recovery_suspect:false}]},
+            engine:QueueBehindEngine{ordinal:1,draw:1,ta_target:0,next_compute_pipe:0,flights:vec![QueueBehindFlight{job:timed_render,group:vec![],first:0,count:1,computes:0,renders:1,compute_pipe:0,target:0,cstamp:[0;16],r_ta_stamp:[0;16],r_fs_stamp:{let mut a=[0;16];a[0]=0x200;a},fs_target:0x200,initbm:false,has_timestamps:true,doomed:false,recovery_suspect:false}]},
             slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
             pools:QueueBehindPools{exhausted:false,can_pipeline:true,block_pipeline_vm:None},
         };
@@ -843,7 +865,7 @@ mod queue_behind_scope {
     #[test]fn render_queues_behind_same_vm_and_coexists_with_compute_while_blocking_initbm(){
         let vm1=Arc::new(Vm{status:Status(AtomicU32::new(0)),slot:1});
         let vm2=Arc::new(Vm{status:Status(AtomicU32::new(0)),slot:2});
-        let q1=Arc::new(Queue{turn:AtomicU64::new(0),priority:0,completed:[AtomicU64::new(0),AtomicU64::new(0)]});
+        let q1=Queue::new(0,0);
         let mk=|id:u32,vm:Arc<Vm>,render:bool|Arc::new(QueueBehindJob{
             id,vm,queue:q1.clone(),progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
             commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access:true})}],
@@ -856,7 +878,7 @@ mod queue_behind_scope {
         let c1=mk(4,vm1.clone(),false);
         let mut p=QueueBehindHost{
             graph:QueueBehindGraph::new(),
-            engine:QueueBehindEngine{ordinal:1,draw:1,ta_target:0,flights:vec![QueueBehindFlight{job:r1,group:vec![],first:0,count:1,computes:0,renders:1,target:0,cstamp:[0;16],r_ta_stamp:[0;16],r_fs_stamp:{let mut a=[0;16];a[0]=0x200;a},fs_target:0x200,initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false}]},
+            engine:QueueBehindEngine{ordinal:1,draw:1,ta_target:0,next_compute_pipe:0,flights:vec![QueueBehindFlight{job:r1,group:vec![],first:0,count:1,computes:0,renders:1,compute_pipe:0,target:0,cstamp:[0;16],r_ta_stamp:[0;16],r_fs_stamp:{let mut a=[0;16];a[0]=0x200;a},fs_target:0x200,initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false}]},
             slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
             pools:QueueBehindPools{exhausted:false,can_pipeline:true,block_pipeline_vm:None},
         };
@@ -887,8 +909,8 @@ mod queue_behind_scope {
     #[test]fn cross_vm_render_compute_overlap_matrix(){
         let vm1=Arc::new(Vm{status:Status(AtomicU32::new(0)),slot:1});
         let vm2=Arc::new(Vm{status:Status(AtomicU32::new(0)),slot:2});
-        let q1=Arc::new(Queue{turn:AtomicU64::new(0),priority:0,completed:[AtomicU64::new(0),AtomicU64::new(0)]});
-        let q2=Arc::new(Queue{turn:AtomicU64::new(0),priority:0,completed:[AtomicU64::new(0),AtomicU64::new(0)]});
+        let q1=Queue::new(0,0);
+        let q2=Queue::new(0,0);
         let mk=|id:u32,vm:Arc<Vm>,queue:Arc<Queue>,render:bool|Arc::new(QueueBehindJob{
             id,vm,queue,progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
             commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access:false})}],
@@ -900,13 +922,13 @@ mod queue_behind_scope {
         let vm2_r=mk(3,vm2.clone(),q2.clone(),true);
         let vm2_c=mk(4,vm2.clone(),q2.clone(),false);
         let mk_flight=|job:Arc<QueueBehindJob>,c:u32,r:u32|QueueBehindFlight{
-            job,group:vec![],first:0,count:1,computes:c,renders:r,
+            job,group:vec![],first:0,count:1,computes:c,renders:r,compute_pipe:0,
             target:if c!=0{0x100}else{0},cstamp:[0x100;16],r_ta_stamp:[0;16],r_fs_stamp:{let mut a=[0;16];a[0]=0x200;a},
             fs_target:if r!=0{0x200}else{0},initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false,
         };
         let mut p=QueueBehindHost{
             graph:QueueBehindGraph::new(),
-            engine:QueueBehindEngine{ordinal:1,draw:1,ta_target:0,flights:vec![mk_flight(vm1_r.clone(),0,1)]},
+            engine:QueueBehindEngine{ordinal:1,draw:1,ta_target:0,next_compute_pipe:0,flights:vec![mk_flight(vm1_r.clone(),0,1)]},
             slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
             pools:QueueBehindPools{exhausted:false,can_pipeline:true,block_pipeline_vm:None},
         };
@@ -928,8 +950,8 @@ mod queue_behind_scope {
     }
     #[test]fn cross_engine_wait_resolves_barriers_and_skips_no_barrier_or_retired(){
         let vm1=Arc::new(Vm{status:Status(AtomicU32::new(0)),slot:1});
-        let q1=Arc::new(Queue{turn:AtomicU64::new(0),priority:0,completed:[AtomicU64::new(0),AtomicU64::new(0)]});
-        let q2=Arc::new(Queue{turn:AtomicU64::new(0),priority:0,completed:[AtomicU64::new(0),AtomicU64::new(0)]});
+        let q1=Queue::new(0,0);
+        let q2=Queue::new(0,0);
         let mk=|id:u32,queue:Arc<Queue>,render:bool,seq:u64,wait:[Option<u64>;2]|Arc::new(QueueBehindJob{
             id,vm:vm1.clone(),queue,
             progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
@@ -944,9 +966,9 @@ mod queue_behind_scope {
         let c_other_q=mk(5,q2.clone(),false,1,[None,None]);
         let p=QueueBehindHost{
             graph:QueueBehindGraph::new(),
-            engine:QueueBehindEngine{ordinal:1,draw:1,ta_target:0,flights:vec![
-                QueueBehindFlight{job:r1,group:vec![],first:0,count:1,computes:0,renders:1,target:0,cstamp:[0;16],r_ta_stamp:[0;16],r_fs_stamp:{let mut a=[0;16];a[0]=0x500;a},fs_target:0x500,initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false},
-                QueueBehindFlight{job:c1.clone(),group:vec![],first:0,count:1,computes:1,renders:0,target:0x700,cstamp:{let mut a=[0;16];a[0]=0x700;a},r_ta_stamp:[0;16],r_fs_stamp:[0;16],fs_target:0,initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false},
+            engine:QueueBehindEngine{ordinal:1,draw:1,ta_target:0,next_compute_pipe:0,flights:vec![
+                QueueBehindFlight{job:r1,group:vec![],first:0,count:1,computes:0,renders:1,compute_pipe:0,target:0,cstamp:[0;16],r_ta_stamp:[0;16],r_fs_stamp:{let mut a=[0;16];a[0]=0x500;a},fs_target:0x500,initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false},
+                QueueBehindFlight{job:c1.clone(),group:vec![],first:0,count:1,computes:1,renders:0,compute_pipe:0,target:0x700,cstamp:{let mut a=[0;16];a[0]=0x700;a},r_ta_stamp:[0;16],r_fs_stamp:[0;16],fs_target:0,initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false},
             ]},
             slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
             pools:QueueBehindPools{exhausted:false,can_pipeline:true,block_pipeline_vm:None},
@@ -981,8 +1003,8 @@ mod queue_behind_scope {
         cstamp[0]=0x100;cstamp[1]=0x200;cstamp[2]=0x300;
         let pm=QueueBehindHost{
             graph:QueueBehindGraph::new(),
-            engine:QueueBehindEngine{ordinal:3,draw:1,ta_target:0,flights:vec![
-                QueueBehindFlight{job:multi_c,group:vec![],first:0,count:3,computes:3,renders:0,target:0x300,cstamp,r_ta_stamp:[0;16],r_fs_stamp:[0;16],fs_target:0,initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false},
+            engine:QueueBehindEngine{ordinal:3,draw:1,ta_target:0,next_compute_pipe:0,flights:vec![
+                QueueBehindFlight{job:multi_c,group:vec![],first:0,count:3,computes:3,renders:0,compute_pipe:0,target:0x300,cstamp,r_ta_stamp:[0;16],r_fs_stamp:[0;16],fs_target:0,initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false},
             ]},
             slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
             pools:QueueBehindPools{exhausted:false,can_pipeline:true,block_pipeline_vm:None},
@@ -1001,7 +1023,7 @@ mod queue_behind_scope {
 
         // Verify wait_stamp_for_with / cross_engine_wait propagate producer flight.initbm.
         let vm1=Arc::new(Vm{status:Status(AtomicU32::new(0)),slot:1});
-        let q1=Arc::new(Queue{turn:AtomicU64::new(0),priority:0,completed:[AtomicU64::new(0),AtomicU64::new(0)]});
+        let q1=Queue::new(0,0);
         let mk=|id:u32,render:bool,seq:u64,wait:[Option<u64>;2]|Arc::new(QueueBehindJob{
             id,vm:vm1.clone(),queue:q1.clone(),
             progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
@@ -1014,8 +1036,8 @@ mod queue_behind_scope {
         let r_after_r=mk(3,true,2,[Some(1),None]);
         let host=QueueBehindHost{
             graph:QueueBehindGraph::new(),
-            engine:QueueBehindEngine{ordinal:1,draw:1,ta_target:0,flights:vec![QueueBehindFlight{
-                job:r_initbm,group:vec![],first:0,count:1,computes:0,renders:1,target:0,
+            engine:QueueBehindEngine{ordinal:1,draw:1,ta_target:0,next_compute_pipe:0,flights:vec![QueueBehindFlight{
+                job:r_initbm,group:vec![],first:0,count:1,computes:0,renders:1,compute_pipe:0,target:0,
                 cstamp:[0;16],r_ta_stamp:[0;16],r_fs_stamp:{let mut a=[0;16];a[0]=0x900;a},fs_target:0x900,
                 initbm:true,has_timestamps:false,doomed:false,recovery_suspect:false,
             }]},
@@ -1042,8 +1064,8 @@ mod queue_behind_scope {
     }
     #[test]fn multi_queue_concurrent_compute_and_render_on_same_vm(){
         let vm1=Arc::new(Vm{status:Status(AtomicU32::new(0)),slot:1});
-        let q_comp=Arc::new(Queue{turn:AtomicU64::new(0),priority:2,completed:[AtomicU64::new(0),AtomicU64::new(0)]});
-        let q_rend=Arc::new(Queue{turn:AtomicU64::new(0),priority:2,completed:[AtomicU64::new(0),AtomicU64::new(0)]});
+        let q_comp=Queue::new(0,2);
+        let q_rend=Queue::new(0,2);
         let c_job=Arc::new(QueueBehindJob{
             id:1,vm:vm1.clone(),queue:q_comp.clone(),
             progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
@@ -1060,8 +1082,8 @@ mod queue_behind_scope {
         });
         let mut p=QueueBehindHost{
             graph:QueueBehindGraph::new(),
-            engine:QueueBehindEngine{ordinal:1,draw:0,ta_target:0,flights:vec![QueueBehindFlight{
-                job:c_job.clone(),group:vec![],first:0,count:1,computes:1,renders:0,target:0x100,cstamp:[0x100;16],r_ta_stamp:[0;16],r_fs_stamp:[0;16],fs_target:0,
+            engine:QueueBehindEngine{ordinal:1,draw:0,ta_target:0,next_compute_pipe:0,flights:vec![QueueBehindFlight{
+                job:c_job.clone(),group:vec![],first:0,count:1,computes:1,renders:0,compute_pipe:0,target:0x100,cstamp:[0x100;16],r_ta_stamp:[0;16],r_fs_stamp:[0;16],fs_target:0,
                 initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false,
             }]},
             slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
@@ -1072,7 +1094,7 @@ mod queue_behind_scope {
         assert_eq!(p.cross_engine_wait(&r_job,0,command::COMPUTE),Ok(None));
         // Symmetrically, Queue 0 compute queues directly behind Queue 1 render on the same VM.
         p.engine.flights[0]=QueueBehindFlight{
-            job:r_job,group:vec![],first:0,count:1,computes:0,renders:1,target:0,cstamp:[0;16],r_ta_stamp:[0;16],r_fs_stamp:{let mut a=[0;16];a[0]=0x200;a},fs_target:0x200,
+            job:r_job,group:vec![],first:0,count:1,computes:0,renders:1,compute_pipe:0,target:0,cstamp:[0;16],r_ta_stamp:[0;16],r_fs_stamp:{let mut a=[0;16];a[0]=0x200;a},fs_target:0x200,
             initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false,
         };
         assert!(p.can_queue_behind(&c_job));
@@ -1080,7 +1102,7 @@ mod queue_behind_scope {
     }
     #[test]fn cross_engine_wait_and_compute_flight_cap_account_for_batched_horizon_members(){
         let vm1=Arc::new(Vm{status:Status(AtomicU32::new(0)),slot:1});
-        let q1=Arc::new(Queue{turn:AtomicU64::new(0),priority:2,completed:[AtomicU64::new(0),AtomicU64::new(0)]});
+        let q1=Queue::new(0,2);
         let mk=|id:u32,render:bool,seq:u64,wait:[Option<u64>;2]|Arc::new(QueueBehindJob{
             id,vm:vm1.clone(),queue:q1.clone(),
             progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
@@ -1098,8 +1120,8 @@ mod queue_behind_scope {
         cstamp[0]=0x100;cstamp[1]=0x200;cstamp[2]=0x300;
         let mut p=QueueBehindHost{
             graph:QueueBehindGraph::new(),
-            engine:QueueBehindEngine{ordinal:3,draw:0,ta_target:0,flights:vec![QueueBehindFlight{
-                job:c1,group:vec![c2,c3],first:0,count:1,computes:3,renders:0,target:0x300,cstamp,r_ta_stamp:[0;16],r_fs_stamp:[0;16],fs_target:0,
+            engine:QueueBehindEngine{ordinal:3,draw:0,ta_target:0,next_compute_pipe:0,flights:vec![QueueBehindFlight{
+                job:c1,group:vec![c2,c3],first:0,count:1,computes:3,renders:0,compute_pipe:0,target:0x300,cstamp,r_ta_stamp:[0;16],r_fs_stamp:[0;16],fs_target:0,
                 initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false,
             }]},
             slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
@@ -1114,7 +1136,7 @@ mod queue_behind_scope {
     }
     #[test]fn multi_pass_render_flight_wait_stamp_and_render_cap(){
         let vm1=Arc::new(Vm{status:Status(AtomicU32::new(0)),slot:1});
-        let q1=Arc::new(Queue{turn:AtomicU64::new(0),priority:2,completed:[AtomicU64::new(0),AtomicU64::new(0)]});
+        let q1=Queue::new(0,2);
         let multi=Arc::new(QueueBehindJob{
             id:1,vm:vm1.clone(),queue:q1.clone(),
             progress:Progress{sent:AtomicU32::new(0),count:3,pending:AtomicBool::new(true)},
@@ -1138,8 +1160,8 @@ mod queue_behind_scope {
         r_fs[0]=0x100;r_fs[1]=0x200;r_fs[2]=0x300;
         let mut p=QueueBehindHost{
             graph:QueueBehindGraph::new(),
-            engine:QueueBehindEngine{ordinal:0,draw:3,ta_target:0,flights:vec![QueueBehindFlight{
-                job:multi.clone(),group:vec![],first:0,count:3,computes:0,renders:3,target:0,cstamp:[0;16],r_ta_stamp:[0;16],r_fs_stamp:r_fs,fs_target:0x300,
+            engine:QueueBehindEngine{ordinal:0,draw:3,ta_target:0,next_compute_pipe:0,flights:vec![QueueBehindFlight{
+                job:multi.clone(),group:vec![],first:0,count:3,computes:0,renders:3,compute_pipe:0,target:0,cstamp:[0;16],r_ta_stamp:[0;16],r_fs_stamp:r_fs,fs_target:0x300,
                 initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false,
             }]},
             slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
@@ -1154,7 +1176,7 @@ mod queue_behind_scope {
         let mut cur_fs=[0u32;16];
         cur_fs[0]=0x400;
         let cur=QueueBehindFlight{
-            job:next_r.clone(),group:vec![],first:0,count:1,computes:0,renders:1,target:0,cstamp:[0;16],r_ta_stamp:[0;16],r_fs_stamp:cur_fs,fs_target:0x400,
+            job:next_r.clone(),group:vec![],first:0,count:1,computes:0,renders:1,compute_pipe:0,target:0,cstamp:[0;16],r_ta_stamp:[0;16],r_fs_stamp:cur_fs,fs_target:0x400,
             initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false,
         };
         assert_eq!(p.wait_stamp_for_with(&next_r,command::RENDER,Some(4),Some(&cur)),Ok(Some(WaitTarget{stamp:0x400,initbm:false})));
@@ -1176,7 +1198,7 @@ mod queue_behind_scope {
         let mut grp_fs=[0u32;16];
         grp_fs[0]=0x400;grp_fs[1]=0x500;grp_fs[2]=0x600;
         let cur_grp=QueueBehindFlight{
-            job:next_r.clone(),group:vec![r_fold_a.clone(),r_fold_b.clone()],first:0,count:1,computes:0,renders:3,target:0,cstamp:[0;16],r_ta_stamp:[0;16],r_fs_stamp:grp_fs,fs_target:0x600,
+            job:next_r.clone(),group:vec![r_fold_a.clone(),r_fold_b.clone()],first:0,count:1,computes:0,renders:3,compute_pipe:0,target:0,cstamp:[0;16],r_ta_stamp:[0;16],r_fs_stamp:grp_fs,fs_target:0x600,
             initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false,
         };
         assert_eq!(p.wait_stamp_for_with(&r_fold_b,command::RENDER,Some(4),Some(&cur_grp)),Ok(Some(WaitTarget{stamp:0x400,initbm:false})));
@@ -1192,7 +1214,7 @@ mod queue_behind_scope {
     }
     #[test]fn ta_pending_passes_paces_unfinished_ta_waves_without_throttling_finished_ta(){
         let vm1=Arc::new(Vm{status:Status(AtomicU32::new(0)),slot:1});
-        let q1=Arc::new(Queue{turn:AtomicU64::new(0),priority:2,completed:[AtomicU64::new(0),AtomicU64::new(0)]});
+        let q1=Queue::new(0,2);
         let mk=|id:u32|Arc::new(QueueBehindJob{
             id,vm:vm1.clone(),queue:q1.clone(),
             progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
@@ -1208,8 +1230,8 @@ mod queue_behind_scope {
         }
         let mut p=QueueBehindHost{
             graph:QueueBehindGraph::new(),
-            engine:QueueBehindEngine{ordinal:0,draw:8,ta_target:0x800,flights:vec![QueueBehindFlight{
-                job:r_live,group:vec![],first:0,count:8,computes:0,renders:7,target:0,cstamp:[0;16],
+            engine:QueueBehindEngine{ordinal:0,draw:8,ta_target:0x800,next_compute_pipe:0,flights:vec![QueueBehindFlight{
+                job:r_live,group:vec![],first:0,count:8,computes:0,renders:7,compute_pipe:0,target:0,cstamp:[0;16],
                 r_ta_stamp:r_ta,r_fs_stamp:r_ta,fs_target:0x800,
                 initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false,
             }]},
@@ -1238,7 +1260,7 @@ mod queue_behind_scope {
     #[test]fn slot_wait_arms_only_for_same_vm_slot_or_flight_headroom_blocks(){
         let vm1=Arc::new(Vm{status:Status(AtomicU32::new(0)),slot:1});
         let vm2=Arc::new(Vm{status:Status(AtomicU32::new(0)),slot:2});
-        let q1=Arc::new(Queue{turn:AtomicU64::new(0),priority:0,completed:[AtomicU64::new(0),AtomicU64::new(0)]});
+        let q1=Queue::new(0,0);
         let mk=|id:u32,vm:Arc<Vm>,render:bool,dep:Result,query_access:bool,wait:[Option<u64>;2]|Arc::new(QueueBehindJob{
             id,vm,queue:q1.clone(),
             progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
@@ -1253,8 +1275,8 @@ mod queue_behind_scope {
         let c_ts_wait=mk(5,vm1.clone(),false,Ok(()),true,[Some(1),None]);
         let mut p=QueueBehindHost{
             graph:QueueBehindGraph::new(),
-            engine:QueueBehindEngine{ordinal:1,draw:1,ta_target:0,flights:vec![QueueBehindFlight{
-                job:r_live,group:vec![],first:0,count:1,computes:0,renders:1,target:0,cstamp:[0;16],
+            engine:QueueBehindEngine{ordinal:1,draw:1,ta_target:0,next_compute_pipe:0,flights:vec![QueueBehindFlight{
+                job:r_live,group:vec![],first:0,count:1,computes:0,renders:1,compute_pipe:0,target:0,cstamp:[0;16],
                 r_ta_stamp:[0;16],r_fs_stamp:{let mut a=[0;16];a[0]=0x100;a},fs_target:0x100,
                 initbm:false,has_timestamps:true,doomed:false,recovery_suspect:false,
             }]},
@@ -1308,17 +1330,18 @@ mod queue_behind_scope {
     #[test]fn staged_render_barriers_split_ta_and_fs_compute_and_render_waits(){
         const FRAG: u32 = kernel::uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_FRAGMENT_BARRIERS;
         const STAGED: u32 = kernel::uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_STAGE_PREFIXES;
+        const NO_C: [[Option<u32>; 2]; 2] = [[None; 2]; 2];
         // 1. Cold InitBM / empty render pipe (`class_behind = false`): zero render barriers,
         //    compute->FS-only wait routes directly to fs_compute_barrier.
         assert_eq!(
-            plan_render_barriers(STAGED, false, true, 0, None, None, [None, Some(0x700)], false),
+            plan_render_barriers(STAGED, false, true, 0, None, None, [[None, None], [Some(0x700), None]], false),
             RenderBarrierPlan {
                 early: false,
                 ta_prev_wait: false,
                 ta_fs_wait: None,
                 fs_render_wait: None,
-                ta_compute_wait: None,
-                fs_compute_wait: Some(0x700),
+                ta_compute_wait: [None, None],
+                fs_compute_wait: [Some(0x700), None],
             }
         );
         // 2. Independent multi-pass render (`fs_wait_render = None`, e.g. compress.bw array /
@@ -1327,14 +1350,14 @@ mod queue_behind_scope {
         //    ZERO FS->FS barriers (only own_barrier on FS).
         for flags in [0u32, FRAG, STAGED] {
             assert_eq!(
-                plan_render_barriers(flags, true, true, 0x200, None, None, [None, None], false),
+                plan_render_barriers(flags, true, true, 0x200, None, None, NO_C, false),
                 RenderBarrierPlan {
                     early: true,
                     ta_prev_wait: true,
                     ta_fs_wait: None,
                     fs_render_wait: None,
-                    ta_compute_wait: None,
-                    fs_compute_wait: None,
+                    ta_compute_wait: [None, None],
+                    fs_compute_wait: [None, None],
                 }
             );
         }
@@ -1348,7 +1371,7 @@ mod queue_behind_scope {
                 0x200,
                 Some(0x200),
                 None,
-                [Some(0x700), Some(0x700)],
+                [[Some(0x700), None], [Some(0x700), None]],
                 false,
             ),
             RenderBarrierPlan {
@@ -1356,8 +1379,8 @@ mod queue_behind_scope {
                 ta_prev_wait: true,
                 ta_fs_wait: None,
                 fs_render_wait: Some(0x200),
-                ta_compute_wait: Some(0x700),
-                fs_compute_wait: None,
+                ta_compute_wait: [Some(0x700), None],
+                fs_compute_wait: [None, None],
             }
         );
         // 4. Different compute targets on TA (0x600) vs FS (0x700) with no FS render dep:
@@ -1370,7 +1393,7 @@ mod queue_behind_scope {
                 0x200,
                 None,
                 None,
-                [Some(0x600), Some(0x700)],
+                [[Some(0x600), None], [Some(0x700), None]],
                 false,
             ),
             RenderBarrierPlan {
@@ -1378,8 +1401,30 @@ mod queue_behind_scope {
                 ta_prev_wait: true,
                 ta_fs_wait: None,
                 fs_render_wait: None,
-                ta_compute_wait: Some(0x600),
-                fs_compute_wait: Some(0x700),
+                ta_compute_wait: [Some(0x600), None],
+                fs_compute_wait: [Some(0x700), None],
+            }
+        );
+        // 4b. Two-pipe compute waits deduplicate per pipe independently: pipe 0 shared by TA+FS
+        //     (0x600) stays on TA only, while pipe 1 FS-only wait (0x700) routes to FS pipe 1.
+        assert_eq!(
+            plan_render_barriers(
+                STAGED,
+                true,
+                true,
+                0x200,
+                None,
+                None,
+                [[Some(0x600), None], [Some(0x600), Some(0x700)]],
+                false,
+            ),
+            RenderBarrierPlan {
+                early: true,
+                ta_prev_wait: true,
+                ta_fs_wait: None,
+                fs_render_wait: None,
+                ta_compute_wait: [Some(0x600), None],
+                fs_compute_wait: [None, Some(0x700)],
             }
         );
         // 5. Staged render whose TA waits on an older in-flight FS (0x100 != prev_fs 0x200)
@@ -1392,7 +1437,7 @@ mod queue_behind_scope {
                 0x200,
                 Some(0x200),
                 Some(0x100),
-                [None, None],
+                NO_C,
                 false,
             ),
             RenderBarrierPlan {
@@ -1400,8 +1445,8 @@ mod queue_behind_scope {
                 ta_prev_wait: true,
                 ta_fs_wait: Some(0x100),
                 fs_render_wait: Some(0x200),
-                ta_compute_wait: None,
-                fs_compute_wait: None,
+                ta_compute_wait: [None, None],
+                fs_compute_wait: [None, None],
             }
         );
         // 6. Staged render where TA and FS wait on the same older in-flight FS (0x100):
@@ -1415,7 +1460,7 @@ mod queue_behind_scope {
                 0x200,
                 Some(0x100),
                 Some(0x100),
-                [None, None],
+                NO_C,
                 false,
             ),
             RenderBarrierPlan {
@@ -1423,8 +1468,8 @@ mod queue_behind_scope {
                 ta_prev_wait: true,
                 ta_fs_wait: Some(0x100),
                 fs_render_wait: None,
-                ta_compute_wait: None,
-                fs_compute_wait: None,
+                ta_compute_wait: [None, None],
+                fs_compute_wait: [None, None],
             }
         );
         // 7. Staged render whose TA explicitly waits on the newest in-flight FS (0x200 == prev_fs):
@@ -1438,7 +1483,7 @@ mod queue_behind_scope {
                 0x200,
                 Some(0x200),
                 Some(0x200),
-                [None, None],
+                NO_C,
                 false,
             ),
             RenderBarrierPlan {
@@ -1446,8 +1491,8 @@ mod queue_behind_scope {
                 ta_prev_wait: false,
                 ta_fs_wait: Some(0x200),
                 fs_render_wait: None,
-                ta_compute_wait: None,
-                fs_compute_wait: None,
+                ta_compute_wait: [None, None],
+                fs_compute_wait: [None, None],
             }
         );
         // 8. Dependent FRAGMENT_BARRIERS render (e.g. render.postfx): TA runs early with
@@ -1460,7 +1505,7 @@ mod queue_behind_scope {
                 0x200,
                 Some(0x200),
                 None,
-                [Some(0x700), Some(0x700)],
+                [[Some(0x700), None], [Some(0x700), None]],
                 false,
             ),
             RenderBarrierPlan {
@@ -1468,47 +1513,47 @@ mod queue_behind_scope {
                 ta_prev_wait: true,
                 ta_fs_wait: None,
                 fs_render_wait: Some(0x200),
-                ta_compute_wait: Some(0x700),
-                fs_compute_wait: None,
+                ta_compute_wait: [Some(0x700), None],
+                fs_compute_wait: [None, None],
             }
         );
         // 9. Legacy dependent render (flags = 0, fs_wait_render = Some(0x200)):
         //    TA waits on 0x200 (FS->TA, dominating prev_ta); prev_barrier and fs_dep omitted.
         assert_eq!(
-            plan_render_barriers(0, true, true, 0x200, Some(0x200), None, [None, None], false),
+            plan_render_barriers(0, true, true, 0x200, Some(0x200), None, NO_C, false),
             RenderBarrierPlan {
                 early: false,
                 ta_prev_wait: false,
                 ta_fs_wait: Some(0x200),
                 fs_render_wait: None,
-                ta_compute_wait: None,
-                fs_compute_wait: None,
+                ta_compute_wait: [None, None],
+                fs_compute_wait: [None, None],
             }
         );
         // 10. Legacy dependent render waiting on an older FS (0x100 != prev_fs 0x200):
         //     TA still needs prev_barrier on the shared PB in addition to ta_fs_wait(0x100).
         assert_eq!(
-            plan_render_barriers(0, true, true, 0x200, Some(0x100), None, [None, None], false),
+            plan_render_barriers(0, true, true, 0x200, Some(0x100), None, NO_C, false),
             RenderBarrierPlan {
                 early: false,
                 ta_prev_wait: true,
                 ta_fs_wait: Some(0x100),
                 fs_render_wait: None,
-                ta_compute_wait: None,
-                fs_compute_wait: None,
+                ta_compute_wait: [None, None],
+                fs_compute_wait: [None, None],
             }
         );
         // 11. Conservative `early_tiling = false` serializes TA behind prev_fs even when
         //     fs_wait_render is None, dominating prev_ta and omitting fs_dep.
         assert_eq!(
-            plan_render_barriers(FRAG, true, false, 0x200, None, None, [None, None], false),
+            plan_render_barriers(FRAG, true, false, 0x200, None, None, NO_C, false),
             RenderBarrierPlan {
                 early: false,
                 ta_prev_wait: false,
                 ta_fs_wait: Some(0x200),
                 fs_render_wait: None,
-                ta_compute_wait: None,
-                fs_compute_wait: None,
+                ta_compute_wait: [None, None],
+                fs_compute_wait: [None, None],
             }
         );
         // 12. Cross-VM warm render behind another VM's render (`cross_vm_prev = true`, no
@@ -1516,14 +1561,14 @@ mod queue_behind_scope {
         //     for all flag styles (legacy/FRAG/STAGED) while FS ALWAYS waits on prev_fs (0x200).
         for flags in [0u32, FRAG, STAGED] {
             assert_eq!(
-                plan_render_barriers(flags, true, true, 0x200, None, None, [None, None], true),
+                plan_render_barriers(flags, true, true, 0x200, None, None, NO_C, true),
                 RenderBarrierPlan {
                     early: true,
                     ta_prev_wait: true,
                     ta_fs_wait: None,
                     fs_render_wait: Some(0x200),
-                    ta_compute_wait: None,
-                    fs_compute_wait: None,
+                    ta_compute_wait: [None, None],
+                    fs_compute_wait: [None, None],
                 }
             );
         }
@@ -1531,29 +1576,135 @@ mod queue_behind_scope {
         //     TA waits on own older FS (0x100) and prev_ta, while FS still waits on cross-VM
         //     prev_fs (0x200) so two VMs' FS/PB teardowns never overlap.
         assert_eq!(
-            plan_render_barriers(0, true, true, 0x200, Some(0x100), None, [None, None], true),
+            plan_render_barriers(0, true, true, 0x200, Some(0x100), None, NO_C, true),
             RenderBarrierPlan {
                 early: false,
                 ta_prev_wait: true,
                 ta_fs_wait: Some(0x100),
                 fs_render_wait: Some(0x200),
-                ta_compute_wait: None,
-                fs_compute_wait: None,
+                ta_compute_wait: [None, None],
+                fs_compute_wait: [None, None],
             }
         );
         // 14. Cross-VM with `early_tiling = false`: TA already waits on prev_fs, so fs_dep
         //     is dominated and omitted.
         assert_eq!(
-            plan_render_barriers(STAGED, true, false, 0x200, None, None, [None, None], true),
+            plan_render_barriers(STAGED, true, false, 0x200, None, None, NO_C, true),
             RenderBarrierPlan {
                 early: false,
                 ta_prev_wait: false,
                 ta_fs_wait: Some(0x200),
                 fs_render_wait: None,
-                ta_compute_wait: None,
-                fs_compute_wait: None,
+                ta_compute_wait: [None, None],
+                fs_compute_wait: [None, None],
             }
         );
+    }
+    #[test]fn two_pipe_concurrent_compute_dispatch_and_fw_timestamp_safety(){
+        let vm1=Arc::new(Vm{status:Status(AtomicU32::new(0)),slot:1});
+        let vm2=Arc::new(Vm{status:Status(AtomicU32::new(0)),slot:2});
+        let q1=Queue::new(0,2);
+        let q2=Queue::new(0,2);
+        let mk=|id:u32,vm:Arc<Vm>,queue:Arc<Queue>,seq:u64|Arc::new(QueueBehindJob{
+            id,vm,queue,
+            progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
+            commands:vec![Command::Compute(ComputeCommand{query_access:false})],
+            order:Order{engine:command::COMPUTE,sequence:seq,wait_through:[None,None]},
+            extra_orders:vec![],dependency:Ok(()),resources:Resources,
+        });
+        let c1=mk(1,vm1.clone(),q1.clone(),1);
+        let c2=mk(2,vm1.clone(),q1.clone(),2);
+        let c_vm2=mk(3,vm2.clone(),q2.clone(),1);
+        let mut host=QueueBehindHost{
+            graph:QueueBehindGraph::new(),
+            engine:QueueBehindEngine{ordinal:0,draw:0,ta_target:0,next_compute_pipe:0,flights:vec![]},
+            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
+            pools:QueueBehindPools{exhausted:false,can_pipeline:true,block_pipeline_vm:None},
+        };
+        // Empty engine uses next_compute_pipe (0), then balances onto pipe 1 while pipe 0 is active.
+        assert_eq!(host.choose_compute_pipe([None, None], 24), 0);
+        host.engine.flights.push(QueueBehindFlight{
+            job:c1.clone(),group:vec![],first:0,count:1,computes:1,renders:0,compute_pipe:0,target:0x100,
+            cstamp:[0x100;16],r_ta_stamp:[0;16],r_fs_stamp:[0;16],fs_target:0,initbm:false,
+            has_timestamps:false,doomed:false,recovery_suspect:false,
+        });
+        assert_eq!(host.choose_compute_pipe([None, None], 24), 1);
+        // A 2-unit base-only VM stays pinned to pipe 0 even while pipe 0 is active.
+        assert_eq!(host.choose_compute_pipe([None, None], 2), 0);
+        assert!(host.can_queue_behind(&c2));
+        // Add second concurrent flight on pipe 1: both pipes active,
+        // tie-break uses next_compute_pipe, and cross-VM compute overlaps cleanly.
+        host.engine.flights.push(QueueBehindFlight{
+            job:c2.clone(),group:vec![],first:0,count:1,computes:1,renders:0,compute_pipe:1,target:0x100,
+            cstamp:[0x100;16],r_ta_stamp:[0;16],r_fs_stamp:[0;16],fs_target:0,initbm:false,
+            has_timestamps:false,doomed:false,recovery_suspect:false,
+        });
+        host.engine.next_compute_pipe=1;
+        assert_eq!(host.choose_compute_pipe([None, None], 24), 1);
+        host.engine.next_compute_pipe=0;
+        assert_eq!(host.choose_compute_pipe([None, None], 24), 0);
+        assert!(host.can_queue_behind(&c_vm2));
+        // Same-VM compute still pipelines without draining.
+        assert!(host.can_queue_behind(&c2));
+    }
+    #[test]fn two_pipe_compute_barriers_reuse_single_pipe_and_serialize_across_both_pipes(){
+        let vm1=Arc::new(Vm{status:Status(AtomicU32::new(0)),slot:1});
+        let q1=Queue::new(0,2);
+        let mk=|id:u32,seq:u64,wait_c:Option<u64>|Arc::new(QueueBehindJob{
+            id,vm:vm1.clone(),queue:q1.clone(),
+            progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
+            commands:vec![Command::Compute(ComputeCommand{query_access:false})],
+            order:Order{engine:command::COMPUTE,sequence:seq,wait_through:[None,wait_c]},
+            extra_orders:vec![],dependency:Ok(()),resources:Resources,
+        });
+        let c1=mk(1,1,None);
+        let c2=mk(2,2,None);
+        let c3=mk(3,3,Some(1));
+        let c4=mk(4,4,Some(2));
+        let mut host=QueueBehindHost{
+            graph:QueueBehindGraph::new(),
+            engine:QueueBehindEngine{ordinal:2,draw:0,ta_target:0,next_compute_pipe:0,flights:vec![
+                QueueBehindFlight{
+                    job:c1,group:vec![],first:0,count:1,computes:1,renders:0,compute_pipe:0,target:0x100,
+                    cstamp:{let mut a=[0;16];a[0]=0x100;a},r_ta_stamp:[0;16],r_fs_stamp:[0;16],fs_target:0,
+                    initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false,
+                },
+                QueueBehindFlight{
+                    job:c2,group:vec![],first:0,count:1,computes:2,renders:0,compute_pipe:1,target:0x200,
+                    cstamp:{let mut a=[0;16];a[0]=0x200;a},r_ta_stamp:[0;16],r_fs_stamp:[0;16],fs_target:0,
+                    initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false,
+                },
+            ]},
+            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
+            pools:QueueBehindPools{exhausted:false,can_pipeline:true,block_pipeline_vm:None},
+        };
+        // Barrier-free compute resolves [None, None].
+        assert_eq!(host.wait_compute_stamps_for(&c3, None), Ok([None, None]));
+        // Waiting on seq 1 (pipe 0 only) returns [Some(0x100), None] and reuses pipe 0 (zero c2c barrier).
+        let w1 = host.wait_compute_stamps_for(&c3, Some(1)).unwrap();
+        assert_eq!(w1, [Some(WaitTarget{stamp:0x100,initbm:false}), None]);
+        assert_eq!(host.choose_compute_pipe(w1, 24), 0);
+        // Waiting on seq 2 (both pipe 0 seq 1 and pipe 1 seq 2 <= 2) returns both stamps and
+        // selects the least-loaded pipe (pipe 0 has 1 active vs pipe 1 has 2 -> picks pipe 0,
+        // so prefix_compute emits one cross-pipe c2c barrier on pipe 1's 0x200).
+        let w2 = host.wait_compute_stamps_for(&c4, Some(2)).unwrap();
+        assert_eq!(w2, [Some(WaitTarget{stamp:0x100,initbm:false}), Some(WaitTarget{stamp:0x200,initbm:false})]);
+        assert_eq!(host.choose_compute_pipe(w2, 24), 0);
+        // Unpublished seq 3 returns Err(EAGAIN).
+        assert_eq!(host.wait_compute_stamps_for(&c4, Some(3)), Err(EAGAIN));
+        // If seq 2 retired out-of-order on pipe 1 while seq 1 is still active on pipe 0,
+        // compute_ooo bit 0 marks seq 2 retired so wait_compute_stamps_for(Some(2)) succeeds
+        // and still waits on pipe 0's active seq 1 (0x100)!
+        host.engine.flights.remove(1);
+        q1.compute_ooo.store(1u64 << 0, Ordering::Release);
+        assert!(q1.is_compute_retired(2));
+        let w2_ooo = host.wait_compute_stamps_for(&c4, Some(2)).unwrap();
+        assert_eq!(w2_ooo, [Some(WaitTarget{stamp:0x100,initbm:false}), None]);
+        assert_eq!(host.choose_compute_pipe(w2_ooo, 24), 0);
+        // Once contiguous completed[COMPUTE] reaches 2, wait_compute_stamps_for returns [None, None].
+        q1.completed[command::COMPUTE].store(2, Ordering::Release);
+        q1.compute_ooo.store(0, Ordering::Release);
+        assert_eq!(host.wait_compute_stamps_for(&c4, Some(2)), Ok([None, None]));
     }
 }
 #[allow(non_camel_case_types, deprecated)]
@@ -1868,6 +2019,7 @@ mod compute_horizon_scope {
         assert!(!unready.can_fold_render_horizon_job(2));
     }
 
+    use crate::hw::sizes;
     mod recovery {
         pub(crate) mod logic {
             pub(crate) use crate::recovery::logic::{stamp_reached, RetiredStamps};
@@ -1905,6 +2057,7 @@ mod compute_horizon_scope {
         claims: RecClaims,
         computes: u32,
         renders: u32,
+        compute_pipe: u8,
         target: u32,
         ta_target: u32,
         fs_target: u32,
@@ -1917,7 +2070,7 @@ mod compute_horizon_scope {
         gate_passed_ns: Option<u64>,
         unsettled_polls: u32,
     }
-    struct RecEngine { flights: Vec<RecFlight>, target: u32, ta_target: u32, fs_target: u32 }
+    struct RecEngine { flights: Vec<RecFlight>, target: [u32; 2], ta_target: u32, fs_target: u32 }
     struct RecState { last_retired: recovery::logic::RetiredStamps }
     struct RecFirmware { engine: RecEngine, recovery: RecState }
     impl RecFirmware {
@@ -1937,6 +2090,7 @@ mod compute_horizon_scope {
                     claims: RecClaims { pass: [0; 16] },
                     computes: 3,
                     renders: 0,
+                    compute_pipe: 0,
                     target: 0x300,
                     ta_target: 0,
                     fs_target: 0,
@@ -1949,16 +2103,16 @@ mod compute_horizon_scope {
                     gate_passed_ns: None,
                     unsettled_polls: 0,
                 }],
-                target: 0x300,
+                target: [0x300, 0],
                 ta_target: 0,
                 fs_target: 0,
             },
             recovery: RecState { last_retired: recovery::logic::RetiredStamps::new() },
         };
-        assert_eq!(fw.recovery_prepare(1, 15, 0x200, [0, 0, 0x100]), Ok(()));
+        assert_eq!(fw.recovery_prepare(1, 15, 0x200, [0, 0, 0x100, 0]), Ok(()));
         assert!(fw.engine.flights[0].doomed);
         assert!(fw.engine.flights[0].recovery_suspect);
-        assert_eq!(fw.recovery_prepare(1, 15, 0x400, [0, 0, 0x100]), Err(ENOENT));
+        assert_eq!(fw.recovery_prepare(1, 15, 0x400, [0, 0, 0x100, 0]), Err(ENOENT));
     }
     #[test]
     fn recovery_prepare_matches_interior_render_stamps_and_cleans_only_unfinished_tpc() {
@@ -1984,6 +2138,7 @@ mod compute_horizon_scope {
                     claims: RecClaims { pass },
                     computes: 0,
                     renders: 3,
+                    compute_pipe: 0,
                     target: 0,
                     ta_target: 0x300,
                     fs_target: 0x300,
@@ -1996,7 +2151,7 @@ mod compute_horizon_scope {
                     gate_passed_ns: None,
                     unsettled_polls: 0,
                 }],
-                target: 0,
+                target: [0, 0],
                 ta_target: 0x300,
                 fs_target: 0x300,
             },
@@ -2004,14 +2159,14 @@ mod compute_horizon_scope {
         };
         // Pass 0 TA finished (stage[0] == 0x100); interior TA target 0x200 matches and cleans
         // TPC only for unfinished passes 1 and 2.
-        assert_eq!(fw.recovery_prepare(9, 0x70, 0x200, [0x100, 0, 0]), Ok(()));
+        assert_eq!(fw.recovery_prepare(9, 0x70, 0x200, [0x100, 0, 0, 0]), Ok(()));
         assert!(fw.engine.flights[0].doomed);
         assert_eq!(fw.engine.flights[0].job.resources.passes[0].tpc.cleared.get(), 0);
         assert_eq!(fw.engine.flights[0].job.resources.passes[1].tpc.cleared.get(), 0x2000);
         assert_eq!(fw.engine.flights[0].job.resources.passes[2].tpc.cleared.get(), 0x3000);
         // Interior FS target 0x200 also matches; unrelated target 0x400 returns ENOENT.
-        assert_eq!(fw.recovery_prepare(1, 0x71, 0x200, [0x300, 0x100, 0]), Ok(()));
-        assert_eq!(fw.recovery_prepare(1, 0x71, 0x400, [0x300, 0x100, 0]), Err(ENOENT));
+        assert_eq!(fw.recovery_prepare(1, 0x71, 0x200, [0x300, 0x100, 0, 0]), Ok(()));
+        assert_eq!(fw.recovery_prepare(1, 0x71, 0x400, [0x300, 0x100, 0, 0]), Err(ENOENT));
     }
     #[test]
     fn cross_vm_recovery_prepare_isolates_blame_to_faulting_vm() {
@@ -2028,6 +2183,7 @@ mod compute_horizon_scope {
                         claims: RecClaims { pass: [0; 16] },
                         computes: 0,
                         renders: 1,
+                        compute_pipe: 0,
                         target: 0,
                         ta_target: 0x100,
                         fs_target: 0x100,
@@ -2045,6 +2201,7 @@ mod compute_horizon_scope {
                         claims: RecClaims { pass: [0; 16] },
                         computes: 1,
                         renders: 0,
+                        compute_pipe: 0,
                         target: 0x500,
                         ta_target: 0,
                         fs_target: 0,
@@ -2058,15 +2215,15 @@ mod compute_horizon_scope {
                         unsettled_polls: 0,
                     },
                 ],
-                target: 0x500,
+                target: [0x500, 0],
                 ta_target: 0x100,
                 fs_target: 0x100,
             },
             recovery: RecState { last_retired: recovery::logic::RetiredStamps::new() },
         };
         // VM 1 (ASID 1) faults on FS 0x100 while VM 2 (ASID 2) has co-resident compute 0x500.
-        assert_eq!(fw.recovery_prepare(1, 0x71, 0x100, [0x100, 0, 0]), Ok(()));
-        assert_eq!(fw.recovery_prepare_suspects([0x100, 0, 0], 0x71, Some(1)), Ok(()));
+        assert_eq!(fw.recovery_prepare(1, 0x71, 0x100, [0x100, 0, 0, 0]), Ok(()));
+        assert_eq!(fw.recovery_prepare_suspects([0x100, 0, 0, 0], 0x71, Some(1)), Ok(()));
         assert!(fw.engine.flights[0].doomed);
         assert!(fw.engine.flights[0].recovery_suspect);
         // VM 2's co-resident compute is suspect-only (checked via hardware ITS ticks), NEVER doomed!
@@ -2084,6 +2241,7 @@ mod compute_horizon_scope {
             claims: RecClaims { pass: [0; 16] },
             computes: 0,
             renders: 1,
+            compute_pipe: 0,
             target: 0,
             ta_target: 0x200,
             fs_target: 0x200,
@@ -2098,11 +2256,90 @@ mod compute_horizon_scope {
         };
         fw.engine.ta_target = 0x200;
         fw.engine.fs_target = 0x200;
-        assert_eq!(fw.recovery_prepare(1, 0x71, 0x100, [0x200, 0, 0]), Ok(()));
-        assert_eq!(fw.recovery_prepare_suspects([0x200, 0, 0], 0x71, Some(1)), Ok(()));
+        assert_eq!(fw.recovery_prepare(1, 0x71, 0x100, [0x200, 0, 0, 0]), Ok(()));
+        assert_eq!(fw.recovery_prepare_suspects([0x200, 0, 0, 0], 0x71, Some(1)), Ok(()));
         assert!(fw.engine.flights[0].doomed);
         assert!(!fw.engine.flights[1].doomed);
         assert!(fw.engine.flights[1].recovery_suspect);
+    }
+    #[test]
+    fn two_pipe_compute_recovery_isolates_faulting_pipe_and_event_targets() {
+        // Pipe 0 (VM 1, event 15) and Pipe 1 (VM 2, event 16) both hold identical per-pipe
+        // stamp 0x100. Faulting event 16 dooms ONLY pipe 1 (VM 2) while pipe 0 (VM 1) stays
+        // un-doomed suspect-only.
+        let mut cs = [0u32; 16];
+        cs[0] = 0x100;
+        let mut last_retired = recovery::logic::RetiredStamps::new();
+        last_retired.push(0, 0x300);
+        last_retired.push(1, 0x400);
+        let mut fw = RecFirmware {
+            engine: RecEngine {
+                flights: vec![
+                    RecFlight {
+                        job: RecJob { vm: RecVm { slot: 1 }, resources: Resources { passes: vec![] } },
+                        claims: RecClaims { pass: [0; 16] },
+                        computes: 1,
+                        renders: 0,
+                        compute_pipe: 0,
+                        target: 0x100,
+                        ta_target: 0,
+                        fs_target: 0,
+                        cstamp: cs,
+                        r_ta_stamp: [0; 16],
+                        r_fs_stamp: [0; 16],
+                        doomed: false,
+                        recovery_suspect: false,
+                        recovery_started_ns: 0,
+                        gate_passed_ns: None,
+                        unsettled_polls: 0,
+                    },
+                    RecFlight {
+                        job: RecJob { vm: RecVm { slot: 2 }, resources: Resources { passes: vec![] } },
+                        claims: RecClaims { pass: [0; 16] },
+                        computes: 1,
+                        renders: 0,
+                        compute_pipe: 1,
+                        target: 0x100,
+                        ta_target: 0,
+                        fs_target: 0,
+                        cstamp: cs,
+                        r_ta_stamp: [0; 16],
+                        r_fs_stamp: [0; 16],
+                        doomed: false,
+                        recovery_suspect: false,
+                        recovery_started_ns: 0,
+                        gate_passed_ns: None,
+                        unsettled_polls: 0,
+                    },
+                ],
+                target: [0x100, 0x100],
+                ta_target: 0,
+                fs_target: 0,
+            },
+            recovery: RecState { last_retired },
+        };
+        assert_eq!(fw.recovery_prepare(1, 16, 0x100, [0, 0, 0, 0]), Ok(()));
+        assert_eq!(fw.recovery_prepare_suspects([0, 0, 0, 0], 16, Some(2)), Ok(()));
+        assert!(!fw.engine.flights[0].doomed);
+        assert!(fw.engine.flights[0].recovery_suspect);
+        assert!(fw.engine.flights[1].doomed);
+        assert!(fw.engine.flights[1].recovery_suspect);
+
+        // If pipe 0 already finished (stage[2] == 0x100) before recovery snapshot, pipe 0 is not
+        // even marked recovery_suspect while pipe 1 is.
+        fw.engine.flights[0].recovery_suspect = false;
+        fw.engine.flights[1].recovery_suspect = false;
+        fw.engine.flights[1].doomed = false;
+        assert_eq!(fw.recovery_prepare_suspects([0, 0, 0x100, 0], 16, Some(2)), Ok(()));
+        assert!(!fw.engine.flights[0].recovery_suspect);
+        assert!(fw.engine.flights[1].recovery_suspect);
+        assert!(fw.engine.flights[1].doomed);
+
+        // last_retired_target distinguishes event 15 (slot 0) from event 16 (slot 1).
+        assert_eq!(fw.recovery_prepare(1, 15, 0x300, [0, 0, 0, 0]), Ok(()));
+        assert_eq!(fw.recovery_prepare(1, 16, 0x400, [0, 0, 0, 0]), Ok(()));
+        assert_eq!(fw.recovery_prepare(1, 15, 0x400, [0, 0, 0, 0]), Err(ENOENT));
+        assert_eq!(fw.recovery_prepare(1, 16, 0x300, [0, 0, 0, 0]), Err(ENOENT));
     }
 }
 '''
@@ -2167,12 +2404,14 @@ for token, declaration in {
     '__WAIT_STAMP_FOR_WITH__': 'fn wait_stamp_for_with(',
     '__WAIT_STAMP_FOR__': 'fn wait_stamp_for(',
     '__CROSS_ENGINE_WAIT__': 'fn cross_engine_wait(',
+    '__WAIT_COMPUTE_STAMPS_FOR__': 'fn wait_compute_stamps_for(',
+    '__CHOOSE_COMPUTE_PIPE__': 'fn choose_compute_pipe(',
     '__WAIT_TARGET__': 'struct WaitTarget {',
     '__CROSS_ENGINE_BARRIER_TYPE__': 'const fn cross_engine_barrier_type(',
     '__RENDER_BARRIER_PLAN__': 'struct RenderBarrierPlan {',
     '__PLAN_RENDER_BARRIERS__': 'fn plan_render_barriers(',
 }.items():
-    harness = harness.replace(token, item(declaration).replace("super::command::", "crate::command::").replace("super::recovery::", "crate::recovery::").replace("super::hw::", "crate::hw::"))
+    harness = harness.replace(token, item(declaration).replace("super::command::", "crate::command::").replace("super::recovery::", "crate::recovery::").replace("super::hw::", "crate::hw::").replace("super::resources::", "crate::resources::"))
 unit = output / 'publication.rs'
 unit.write_text(harness)
 log = ''
