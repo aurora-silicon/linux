@@ -289,6 +289,50 @@ impl Drop for Scene::ver {
     }
 }
 
+#[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+impl SceneG14V13_5 {
+    pub(crate) fn render_addresses(&self) -> (u64, u64) {
+        self.object.with(|raw, _| (raw.user_buffer.or(0).into(), raw.stats.into()))
+    }
+}
+
+/// Host-owned parameter-buffer inputs that persist across firmware submissions.
+#[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+pub(crate) struct ParameterBufferInfo {
+    pub(crate) page_list: u64,
+    pub(crate) page_list_size: u32,
+    pub(crate) max_blocks: u32,
+    pub(crate) block_list: u64,
+    pub(crate) block_control: u64,
+    pub(crate) block_size: u32,
+    pub(crate) counter: u64,
+    pub(crate) max_pages: u32,
+    pub(crate) max_linear_pages: u32,
+}
+
+#[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+impl BufferG14V13_5 {
+    pub(crate) fn parameter_info(&self) -> ParameterBufferInfo {
+        self.inner.lock().info.with(|raw, inner| ParameterBufferInfo {
+            page_list: inner.page_list.gpu_va().get(),
+            page_list_size: raw.page_list_size,
+            max_blocks: raw.max_blocks,
+            block_list: inner.block_list.gpu_va().get(),
+            block_control: inner.block_ctl.gpu_va().get(),
+            block_size: raw.block_size,
+            counter: inner.counter.gpu_va().get(),
+            max_pages: raw.max_pages,
+            max_linear_pages: raw.max_pages_nomemless,
+        })
+    }
+
+    /// The 27.2 firmware owns the page list once bound. Publish only new block descriptors
+    /// and the block-control producer, using the legacy manager for backing allocation.
+    pub(crate) fn ensure_parameter_blocks(&self, count: usize) -> Result<bool> {
+        self.ensure_blocks_inner(count, false, true)
+    }
+}
+
 /// Inner data for a single TVB buffer object.
 #[versions(AGX)]
 struct BufferInner {
@@ -486,16 +530,18 @@ impl Buffer::ver {
     /// The buffer manager owns the buffer while scenes on it are in flight, so the new size is only
     /// published if no scene is active.
     pub(crate) fn ensure_blocks(&self, min_blocks: usize) -> Result<bool> {
-        self.ensure_blocks_inner(min_blocks, false)
+        self.ensure_blocks_inner(min_blocks, false, false)
     }
 
     /// [`Self::ensure_blocks`] for a caller that guarantees all work that used this buffer has
     /// completed: the new size is published although scenes of completed jobs may still be held.
     pub(crate) fn ensure_blocks_idle(&self, min_blocks: usize) -> Result<bool> {
-        self.ensure_blocks_inner(min_blocks, true)
+        self.ensure_blocks_inner(min_blocks, true, false)
     }
 
-    fn ensure_blocks_inner(&self, min_blocks: usize, fw_idle: bool) -> Result<bool> {
+    fn ensure_blocks_inner(
+        &self, min_blocks: usize, fw_idle: bool, firmware_pages: bool,
+    ) -> Result<bool> {
         let mut inner = self.inner.lock();
 
         let cur_count = inner.blocks.len();
@@ -529,18 +575,29 @@ impl Buffer::ver {
                 .push(block, GFP_KERNEL)
                 .expect("push() failed after reserve()");
             inner.info.block_list[2 * (cur_count + i)] = page_num;
-            for j in 0..PAGES_PER_BLOCK {
-                inner.info.page_list[(cur_count + i) * PAGES_PER_BLOCK + j] = page_num + j as u32;
+            if !firmware_pages {
+                for j in 0..PAGES_PER_BLOCK {
+                    inner.info.page_list[(cur_count + i) * PAGES_PER_BLOCK + j] = page_num + j as u32;
+                }
             }
         }
 
+        if firmware_pages {
+            let added = &inner.info.block_list.as_slice()[2 * cur_count..2 * new_count];
+            crate::pgtable::clean_poc(added.as_ptr().cast(), core::mem::size_of_val(added));
+            crate::pgtable::poc_barrier();
+        }
         inner.info.block_ctl.with(|raw, _inner| {
             raw.total.store(new_count as u32, Ordering::SeqCst);
             raw.wptr.store(new_count as u32, Ordering::SeqCst);
+            if firmware_pages {
+                crate::pgtable::clean_poc(core::ptr::from_ref(raw).cast(), core::mem::size_of_val(raw));
+                crate::pgtable::poc_barrier();
+            }
         });
 
         /* Only do this update if the buffer manager is idle (which means we own it) */
-        if inner.active_scenes == 0 || fw_idle {
+        if !firmware_pages && (inner.active_scenes == 0 || fw_idle) {
             let page_count = (new_count * PAGES_PER_BLOCK) as u32;
             inner.info.with(|raw, _inner| {
                 raw.page_count.store(page_count, Ordering::Relaxed);

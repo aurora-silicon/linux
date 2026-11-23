@@ -58,6 +58,8 @@ pub(crate) struct Packet {
     vm_job:Pin<KBox<Mutex<Option<mmu::VmJobGuard>>>>,
     /// G14 firmware 27.2: the compute preemption buffer in the packet's VM, kept until retirement.
     pub(crate) preempt:Option<crate::fw::types::GpuArray<u8>>,
+    #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+    pub(crate) render_queue: Option<Arc<crate::g14_v27_2_render::QueueRender>>,
 }
 /// The runtime a queue's packets go to: the M3 runtime or the G14 firmware-27.2 compute runtime.
 #[derive(Clone)]
@@ -238,6 +240,8 @@ pub(crate) struct Queue {
     /// preemption buffer it provides.
     preempt_alloc:Option<(Arc<Mutex<crate::alloc::DefaultAllocator>>,usize)>,
     /// Whether the SoC advertises early tiling (`m3_soc::Features::fragment_dependency`).
+    #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+    render_queue: Option<Arc<crate::g14_v27_2_render::QueueRender>>,
     early_tiling:bool,
     wide_visibility:bool,
     urgency:u8,
@@ -253,19 +257,23 @@ impl Queue {
             1=>sched::Priority::High,0=>sched::Priority::Kernel,_=>return Err(EINVAL)};
         Ok(Self {entity:sched::Entity::new(&scheduler,priority)?,_scheduler:scheduler,
             shared:Sink::M3(shared),vm,usc,fences:FenceContexts::new(1,c_str!("asahi_m3_queue"),kernel::static_lock_class!())?,
-            early_tiling,wide_visibility,urgency,preempt_alloc:None})
+            early_tiling,wide_visibility,urgency,preempt_alloc:None,
+            #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+            render_queue: None})
     }
     /// A G14 firmware-27.2 compute queue: the same front end, published by that runtime.
     #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
     pub(crate) fn new_g14_v27_2(runtime:Arc<crate::g14_v27_2::Runtime>,scheduler:Arc<sched::Scheduler<Job>>,vm:mmu::Vm,priority:u32,usc:u64,
-        ualloc_priv:Arc<Mutex<crate::alloc::DefaultAllocator>>,preempt_bytes:usize)->Result<Self> {
+        ualloc_priv:Arc<Mutex<crate::alloc::DefaultAllocator>>,preempt_bytes:usize,
+        render_queue: Arc<crate::g14_v27_2_render::QueueRender>)->Result<Self> {
         agx_uapi::QueueUscWindow{base:usc,user_start:0x4000,user_end:(1u64<<42)-0x8000}.validate().map_err(|_|EINVAL)?;
         let urgency=3u8.saturating_sub(priority.min(3) as u8);
         let priority=match priority {3=>sched::Priority::Low,2=>sched::Priority::Normal,
             1=>sched::Priority::High,0=>sched::Priority::Kernel,_=>return Err(EINVAL)};
         Ok(Self {entity:sched::Entity::new(&scheduler,priority)?,_scheduler:scheduler,
             shared:Sink::G14V27_2(runtime),vm,usc,fences:FenceContexts::new(1,c_str!("asahi_g14_queue"),kernel::static_lock_class!())?,
-            early_tiling:false,wide_visibility:false,urgency,preempt_alloc:Some((ualloc_priv,preempt_bytes))})
+            early_tiling:false,wide_visibility:false,urgency,preempt_alloc:Some((ualloc_priv,preempt_bytes)),
+            render_queue: Some(render_queue)})
     }
 }
 impl queue::Queue for Queue {
@@ -274,12 +282,7 @@ impl queue::Queue for Queue {
         let vm_job=self.vm.retain_job()?;
         let mut parser=agx_uapi::UapiCommandParser::new(raw);let mut commands=KVec::new();let mut timestamps=KVec::new();let mut flushes=KVec::new();let mut visibility=KVec::new();let mut render_attachments=KVec::new();
         while let Some(command)=parser.next_hardware().map_err(|_|EINVAL)? {
-            // Only the M3 runtime renders; the G14 firmware-27.2 runtime is compute-only.
-            #[cfg(not(CONFIG_DRM_ASAHI_M3_T8122))]
-            if let agx_uapi::ParsedHardwareCommand::Render{..}=command {return Err(EINVAL);}
-            #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
             if let agx_uapi::ParsedHardwareCommand::Render{payload,vertex_attachments,fragment_attachments,..}=command {
-                if self.preempt_alloc.is_some() {return Err(EINVAL);}
                 if let Err(e)=validate_render(payload,self.usc,&AddressSpace(&self.vm),self.early_tiling) {
                     pr_err!("M3 render rejected {:?}: flags={:#x} size={}x{} layers={} samples={} utile={}x{} sample_size={} depth={:#x} stencil={:#x} zls={:#x} samplers={} heap={:#x}\n",e,payload.flags,payload.width,payload.height,payload.layers,payload.samples,payload.utile_width,payload.utile_height,payload.sample_size,payload.depth.base,payload.stencil.base,payload.zls_control,payload.sampler_count,payload.sampler_heap);
                     return Err(e);
@@ -331,7 +334,9 @@ impl queue::Queue for Queue {
                 Some(alloc.lock().array_empty::<u8>(*bytes)?),
             _ => None,
         };
-        let packet=Arc::new(Packet{preempt,vm:self.vm.clone(),commands,timestamps,attachments:flushes,wide_visibility:visibility,render_attachments,
+        let packet=Arc::new(Packet{preempt,
+            #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+            render_queue: self.render_queue.clone(),vm:self.vm.clone(),commands,timestamps,attachments:flushes,wide_visibility:visibility,render_attachments,
             completion:self.fences.new_fence(0,Completion)?.into(),
             finish_claimed:AtomicBool::new(false),published:AtomicBool::new(false),urgency:self.urgency,owner:Owner::current(),
             vm_job:KBox::pin_init(new_mutex!(Some(vm_job)),GFP_KERNEL)?},GFP_KERNEL)?;
@@ -364,14 +369,16 @@ fn encode_attachments(vm: &mmu::Vm, list: &agx_uapi::UapiAttachmentList)
     Ok(out)
 }
 
-#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
 fn validate_render(r: agx_uapi::UapiRenderCommand, usc: u64, space: &AddressSpace<'_>,
     early_tiling: bool) -> Result {
     use agx_uapi::{GpuAddressSpace, GpuAccess};
     if r.sample_size % 8 != 0 {return Err(ENOTSUPP);}
     let empty = agx_uapi::UapiHelperProgram { binary:0, config:0, data:0 };
     // Early tiling (render flag bit 5) only where it is advertised.
+    #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
     let stage_scope=if early_tiling && crate::m3::m3_params::early_tiling() {1<<5} else {0};
+    #[cfg(not(CONFIG_DRM_ASAHI_M3_T8122))]
+    let stage_scope = { let _ = early_tiling; 0 };
     if r.flags & !(2|16|(1<<18)|stage_scope) != 0 || !matches!(r.samples, 1 | 2 | 4)
         || r.sampler_count != 0 || r.sampler_heap != 0
         || r.vertex_helper != empty || r.fragment_helper != empty

@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! G14 GPUs on GPU firmware 27.2: start the firmware and run compute work on it.
+//! G14 GPU firmware boot, submission and retirement.
 //!
 //! [`start`] builds the 27.2 root (`gpu/v27_2.rs`) on the records of a 13.5 G14 manager,
 //! installs the driver's kernel window in the loader's UAT regions, starts the ASC, holds the
 //! GPU powered and retires one kernel-owned compute job. [`Backend`] then serves clients
-//! through the 26.x submission front end (`m3_submit`): each compute command is encoded in the
-//! 27.2 layout and published, in order, on the root's queue. Render commands are refused, and the device
-//! reports `DRM_ASAHI_FEATURE_COMPUTE_ONLY`.
+//! through the common submission front end (`m3_submit`). Compute uses the bootstrap
+//! queue. A render owns a separate tiler and fragment submission and their parameter buffer
+//! until both data masters have retired.
 //!
 //! The runtime is driven by the firmware's endpoint-0x20 notifications, which it sends after
 //! publishing records on its event, statistics and log rings: each one runs the service, which
@@ -32,8 +32,9 @@ use kernel::{
 };
 
 use crate::{
-    alloc, event, gem,
+    alloc, event, g14_v27_2_render as render, gem,
     gpu::{self, CommandPool, ComputeJob, GpuManagerG14V13_5, QueueInfo, RootV27_2, POOL_SLOTS},
+    gpu::{FirmwareEvent, FRAGMENT, TILER},
     hw, mmu, queue,
     m3::m3_submit::{Command, Packet},
 };
@@ -308,6 +309,17 @@ struct Inflight {
     _bind: mmu::VmBind,
 }
 
+struct RenderFlight {
+    packet: Arc<Packet>,
+    last: bool,
+    bind: mmu::VmBind,
+    scene: render::Prep,
+    slots: [usize; 2],
+    stamps: [event::EventValue; 2],
+    targets: [u32; 2],
+    started: Instant<Monotonic>,
+}
+
 struct State {
     peer: Peer,
     root: crate::fw::types::GpuObject<RootV27_2>,
@@ -335,9 +347,33 @@ struct State {
     retired_raw: u32,
     capacity: u32,
     inflight: KVec<Inflight>,
+    rendering: Option<RenderFlight>,
     pending: KVec<(Arc<Packet>, usize)>,
     submitted: u64,
     retired: u64,
+}
+
+impl State {
+    fn running(&self) -> bool {
+        !self.inflight.is_empty() || self.rendering.is_some()
+    }
+
+    fn owns(&self, packet: &Arc<Packet>) -> bool {
+        self.inflight.iter().any(|flight| Arc::ptr_eq(&flight.packet, packet))
+            || self.rendering.as_ref().is_some_and(|flight| Arc::ptr_eq(&flight.packet, packet))
+    }
+
+    fn pending(&self, packet: &Arc<Packet>) -> bool {
+        self.pending.iter().any(|(current, _)| Arc::ptr_eq(current, packet))
+    }
+
+    fn advance_packet(&mut self, last: bool) {
+        if last {
+            let _ = self.pending.remove(0);
+        } else {
+            self.pending[0].1 += 1;
+        }
+    }
 }
 
 #[pin_data(PinnedDrop)]
@@ -396,6 +432,7 @@ impl Runtime {
         }
         let mut guard = self.state.lock();
         let state = Option::as_mut(&mut *guard).ok_or(ENODEV)?;
+        if !self.healthy() { return Err(EIO); }
         state.pending.push((packet, 0), GFP_KERNEL)?;
         self.pump(state);
         Ok(())
@@ -408,7 +445,7 @@ impl Runtime {
             if let Some(i) = state.pending.iter().position(|(p, _)| Arc::ptr_eq(p, packet)) {
                 let _ = state.pending.remove(i);
             }
-            if !state.inflight.iter().any(|f| Arc::ptr_eq(&f.packet, packet)) {
+            if !state.owns(packet) {
                 packet.release_guard();
             }
         }
@@ -417,9 +454,14 @@ impl Runtime {
     fn fail_all(&self, state: &mut State, error: Error) {
         self.healthy.store(false, Ordering::Release);
         self.idle.notify_all();
-        for (packet, _) in state.pending.drain(..) {
-            packet.release_guard();
+        while let Some((packet, _)) = state.pending.pop() {
+            if !state.owns(&packet) {
+                packet.release_guard();
+            }
             packet.finish(Err(error));
+        }
+        if let Some(flight) = &state.rendering {
+            flight.packet.finish(Err(error));
         }
         // Published work stays owned: the firmware may still read it.
         for f in state.inflight.iter() {
@@ -445,94 +487,216 @@ impl Runtime {
         }
     }
 
-    /// Publishes pending commands while pool slots are free.
+    /// Finds unlinked slots without moving any publication cursor.
+    fn free_slots(&self, state: &mut State, count: usize) -> Result<Option<[usize; 2]>> {
+        let mut slots = [0; 2];
+        let mut found = 0;
+        for k in 0..POOL_SLOTS {
+            let slot = (state.next_slot + k) % POOL_SLOTS;
+            if state.busy & (1 << slot) != 0 { continue; }
+            if state.pool.registered(slot)? {
+                state.skipped += 1;
+                continue;
+            }
+            slots[found] = slot;
+            found += 1;
+            if found == count {
+                state.waiting_unlink = false;
+                return Ok(Some(slots));
+            }
+        }
+        if !state.waiting_unlink {
+            state.waiting_unlink = true;
+            state.peer.as_mut().send_message(EP_DOORBELL, gpu::COMPUTE_KICK)?;
+        }
+        Ok(None)
+    }
+
+    /// Compute commands may pipeline. A render pair is a scheduling boundary so its buffer,
+    /// timestamps and dependencies remain owned until both data masters retire.
     fn pump(&self, state: &mut State) {
         self.acknowledge(state);
-        if self.asleep.load(Ordering::Acquire) { return; }
+        if !self.healthy() || self.asleep.load(Ordering::Acquire) || state.rendering.is_some() {
+            return;
+        }
         while state.inflight.len() < POOL_SLOTS - 1 && !state.pending.is_empty() {
-            // A slot is reused only once the firmware has unlinked it from its tracking list
-            // (+0x94), which its retirement scan does after the slot's cursor is advanced.
-            // Slots retire in order but are unlinked whenever the scan runs; take the next
-            // free slot that is unlinked.
-            let mut chosen = None;
-            for k in 0..POOL_SLOTS {
-                let slot = (state.next_slot + k) % POOL_SLOTS;
-                if state.busy & (1 << slot) != 0 { continue; }
-                match state.pool.registered(slot) {
-                    Ok(false) => { chosen = Some(slot); break; }
-                    Ok(true) => state.skipped += 1,
-                    Err(e) => { self.fail_all(state, e); return; }
-                }
-            }
-            let Some(slot) = chosen else {
-                if !state.waiting_unlink {
-                    // Every free slot is held: wake the firmware's service once so its
-                    // retirement scan runs. The scan sends nothing; the next notification,
-                    // submission or scheduler timeout retries.
-                    state.waiting_unlink = true;
-                    let _ = state.peer.as_mut().send_message(EP_DOORBELL, gpu::COMPUTE_KICK);
-                }
-                return;
-            };
-            state.next_slot = slot;
-            state.waiting_unlink = false;
-            // Unlinked already: its cursor needs no further advance.
-            state.unacked &= !(1 << slot);
             let (packet, index) = (state.pending[0].0.clone(), state.pending[0].1);
-            let Command::Compute(control) = packet.commands[index] else {
-                // Queues of this backend accept only compute commands (Queue::submit).
-                let _ = state.pending.remove(0);
-                if !(packet.may_be_published() && index != 0) { packet.release_guard(); }
-                packet.finish(Err(EINVAL));
-                continue;
+            let command = packet.commands[index];
+            let paired = matches!(command, Command::Render { .. });
+            if paired && state.running() { return; }
+            let count = if paired { 2 } else { 1 };
+            let slots = match self.free_slots(state, count) {
+                Ok(Some(slots)) => slots,
+                Ok(None) => return,
+                Err(err) => { self.fail_all(state, err); return; }
             };
-            let result = (|| -> Result<(mmu::VmBind, event::EventValue)> {
-                let bind = self.graph.kernel_uat().bind(&packet.vm)?;
-                let preempt = packet.preempt.as_ref().ok_or(EINVAL)?.gpu_va().get();
-                let stamp = state.last.next();
-                let job = ComputeJob {
-                    context: bind.slot(),
-                    sequence: state.sequence,
-                    cdm_base: control.base,
-                    cdm_end: control.end,
-                    usc_base: control.usc_base,
-                    preempt,
-                };
-                let command = state.pool.encode(state.next_slot, &state.queue, stamp.raw(), &job)?;
-                packet.mark_published();
-                state.root.publish(command)?;
-                state.peer.as_mut().send_message(EP_DOORBELL, gpu::COMPUTE_KICK)?;
-                Ok((bind, stamp))
-            })();
+            let last = index + 1 == packet.commands.len();
+            let result = match command {
+                Command::Compute(control) => self.publish_compute(state, &packet, control, last, slots[0]),
+                Command::Render { command, usc } =>
+                    self.publish_render(state, &packet, index, &command, usc, last, slots),
+            };
             match result {
-                Ok((bind, stamp)) => {
-                    state.last = stamp;
-                    state.sequence += 1;
-                    let slot = state.next_slot;
-                    state.busy |= 1 << slot;
-                    state.published += 1;
-                    let ordinal = state.published;
-                    state.next_slot = (state.next_slot + 1) % POOL_SLOTS;
-                    state.submitted += 1;
-                    let last = index + 1 == packet.commands.len();
-                    if state.inflight.push(Inflight { packet: packet.clone(), last, stamp, slot, ordinal,
-                        started: Instant::now(), _bind: bind }, GFP_KERNEL).is_err() {
-                        self.fail_all(state, ENOMEM);
-                        return;
-                    }
-                    if last { let _ = state.pending.remove(0); } else { state.pending[0].1 += 1; }
-                }
-                Err(e) => {
-                    dev_err!(self.dev, "GPU: compute publication failed {:?}\n", e);
+                Ok(()) if paired || !self.healthy() => return,
+                Ok(()) => {}
+                Err(EBUSY) if state.running() => return,
+                Err(err) => {
+                    dev_err!(self.dev, "GPU: command publication failed {:?}\n", err);
                     let _ = state.pending.remove(0);
-                    // Earlier commands of a published packet fail it when they retire.
-                    if !(packet.may_be_published() && index != 0) {
+                    if !state.owns(&packet) {
                         packet.release_guard();
                     }
-                    packet.finish(Err(e));
+                    packet.finish(Err(err));
                 }
             }
         }
+    }
+
+    fn publish_compute(
+        &self, state: &mut State, packet: &Arc<Packet>,
+        control: crate::m3::agx_compute::Control, last: bool, slot: usize,
+    ) -> Result {
+        let bind = self.graph.kernel_uat().bind(&packet.vm)?;
+        let preempt = packet.preempt.as_ref().ok_or(EINVAL)?.gpu_va().get();
+        let stamp = state.last.next();
+        let job = ComputeJob {
+            context: bind.slot(),
+            sequence: state.sequence,
+            cdm_base: control.base,
+            cdm_end: control.end,
+            usc_base: control.usc_base,
+            preempt,
+        };
+        let command = state.pool.encode(slot, &state.queue, stamp.raw(), &job)?;
+        let submission = state.root.stage_compute(command)?;
+        let ordinal = state.published + 1;
+        // Commit ownership before the firmware can see the new work.
+        state.inflight.push(Inflight { packet: packet.clone(), last, stamp, slot, ordinal,
+            started: Instant::now(), _bind: bind }, GFP_KERNEL)?;
+        packet.mark_published();
+        submission.publish();
+        state.last = stamp;
+        state.sequence += 1;
+        state.unacked &= !(1 << slot);
+        state.busy |= 1 << slot;
+        state.published = ordinal;
+        state.next_slot = (slot + 1) % POOL_SLOTS;
+        state.submitted += 1;
+        state.advance_packet(last);
+        if let Err(err) = state.peer.as_mut().send_message(EP_DOORBELL, gpu::COMPUTE_KICK) {
+            self.fail_all(state, err);
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn publish_render(
+        &self, state: &mut State, packet: &Arc<Packet>, index: usize,
+        command: &crate::m3::agx_uapi::UapiRenderCommand, usc: u64, last: bool, slots: [usize; 2],
+    ) -> Result {
+        let queue = packet.render_queue.as_ref().ok_or(EINVAL)?;
+        let scene = queue.prepare(command, usc)?;
+        let bind = self.graph.kernel_uat().bind(&packet.vm)?;
+        let context = bind.slot();
+        let (tiler, tiler_stamp) = state.root.render_queue(TILER);
+        let (fragment, fragment_stamp) = state.root.render_queue(FRAGMENT);
+        let stamps = [tiler_stamp.next(), fragment_stamp.next()];
+        let with_buffer = scene.buffer_op.is_some();
+        let timestamps = packet.render_timestamp_addresses(index);
+        let attachments = &packet.render_attachments[index];
+        let ta = state.pool.encode_with(slots[TILER], context, state.sequence, stamps[TILER].raw(),
+            |cmd, stream, common| {
+                render::encode_vertex(cmd, stream, &common, &tiler, tiler.compute_state,
+                    command, &scene, stamps[FRAGMENT].raw(), fragment.slot,
+                    timestamps[TILER], &attachments[TILER])?;
+                if let Some(op) = scene.buffer_op {
+                    render::encode_buffer_op(&mut cmd[render::INITBUF_AT..][..0x20], &common, &scene, op);
+                }
+                Ok(())
+            })?;
+        let fs = state.pool.encode_with(slots[FRAGMENT], context, state.sequence + 1, stamps[FRAGMENT].raw(),
+            |cmd, stream, common| {
+                render::encode_fragment(cmd, stream, &common, &fragment, fragment.compute_state,
+                    command, &scene, timestamps[FRAGMENT], &attachments[FRAGMENT])?;
+                render::encode_own_barrier(&mut cmd[render::OWN_BARRIER_AT..][..render::OWN_BARRIER_SIZE],
+                    &tiler, stamps[TILER].raw(), stamps[FRAGMENT].raw());
+                Ok(())
+            })?;
+        let ta_work = [ta + render::INITBUF_AT as u64, ta];
+        let fs_work = [fs + render::OWN_BARRIER_AT as u64, fs];
+        let ta_post = state.root.stage_render(TILER, &ta_work[usize::from(!with_buffer)..])?;
+        let fs_post = state.root.stage_render(FRAGMENT, &fs_work)?;
+        state.rendering = Some(RenderFlight {
+            packet: packet.clone(), last, bind, scene, slots, stamps,
+            targets: [ta_post.target(), fs_post.target()], started: Instant::now(),
+        });
+        queue.published();
+        packet.mark_published();
+        // Queue the fragment dependency before kicking the tiler that satisfies it.
+        fs_post.publish();
+        ta_post.publish();
+        for slot in slots {
+            state.busy |= 1 << slot;
+            state.unacked &= !(1 << slot);
+        }
+        state.next_slot = (slots[FRAGMENT] + 1) % POOL_SLOTS;
+        state.sequence += 2;
+        state.submitted += 2;
+        state.advance_packet(last);
+        for dm in [FRAGMENT, TILER] {
+            if let Err(err) = state.peer.as_mut().send_message(EP_DOORBELL, RootV27_2::render_kick(dm)) {
+                self.fail_all(state, err);
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn retire_slot(&self, state: &mut State, slot: usize) {
+        match state.pool.retire(slot) {
+            Ok(true) => {}
+            Ok(false) => {
+                state.unacked |= 1 << slot;
+                state.deferred += 1;
+            }
+            Err(err) => dev_err!(self.dev, "GPU: tracking retirement failed {:?}\n", err),
+        }
+        state.busy &= !(1 << slot);
+        state.retired += 1;
+    }
+
+    fn retire_render(&self, state: &mut State) -> Result {
+        let Some(flight) = state.rendering.as_ref() else { return Ok(()); };
+        let mut ta_done = state.root.render_done(TILER, flight.targets[TILER], flight.stamps[TILER])?;
+        let mut fs_done = state.root.render_done(FRAGMENT, flight.targets[FRAGMENT], flight.stamps[FRAGMENT])?;
+        if !(ta_done && fs_done)
+            && state.root.render_queue(TILER).1 >= flight.stamps[TILER]
+            && state.root.render_queue(FRAGMENT).1 >= flight.stamps[FRAGMENT]
+        {
+            // As on the compute queue, the final stamp precedes the retired cursor and
+            // there may be no separate notification when the cursor changes.
+            let start = Instant::<Monotonic>::now();
+            while !(ta_done && fs_done) && start.elapsed() < Delta::from_micros(RETIRE_WAIT_US) {
+                fsleep(Delta::from_micros(20));
+                ta_done = state.root.render_done(TILER, flight.targets[TILER], flight.stamps[TILER])?;
+                fs_done = state.root.render_done(FRAGMENT, flight.targets[FRAGMENT], flight.stamps[FRAGMENT])?;
+            }
+        }
+        if ta_done && fs_done {
+            let flight = state.rendering.take().ok_or(EIO)?;
+            for slot in flight.slots {
+                self.retire_slot(state, slot);
+            }
+            if flight.last {
+                flight.packet.retired();
+            } else if !state.pending(&flight.packet) {
+                flight.packet.release_guard();
+            }
+        } else if flight.started.elapsed() > Delta::from_millis(COMMAND_TIMEOUT_MS) {
+            dev_err!(self.dev, "GPU: render timed out: TA retired={} fragment retired={}\n", ta_done, fs_done);
+            return Err(ETIMEDOUT);
+        }
+        Ok(())
     }
 
     /// Reads the queue's retired position into `retired_total`.
@@ -551,7 +715,33 @@ impl Runtime {
         let mut guard = self.state.lock();
         let Some(state) = Option::as_mut(&mut *guard) else { return; };
         self.service_locked(state);
-        if state.inflight.is_empty() && state.pending.is_empty() { self.idle.notify_all(); }
+        if !state.running() && state.pending.is_empty() { self.idle.notify_all(); }
+    }
+
+    fn process_events(&self, state: &mut State) -> Result {
+        // Limit one pass to the ring capacity. Further arrivals notify the worker again.
+        for _ in 0..256 {
+            let Some((cursor, event)) = state.root.peek_event()? else { break; };
+            match event {
+                FirmwareEvent::Grow(request) if request.halt_count == state.root.halt_count()? => {
+                    let Some(reply) = state.root.reserve_control_reply()? else { break; };
+                    let granted = state.rendering.as_ref()
+                        .filter(|flight| flight.bind.slot() == request.vm && flight.scene.slot() == request.buffer)
+                        .and_then(|flight| flight.packet.render_queue.as_ref())
+                        .is_some_and(|queue| queue.grow().unwrap_or(false));
+                    reply.grow(request, granted)?;
+                    state.peer.as_mut().send_message(EP_DOORBELL, gpu::DEVICE_CONTROL_KICK)?;
+                }
+                FirmwareEvent::ChannelError => {
+                    dev_err!(self.dev, "GPU firmware rejected a channel record\n");
+                    state.root.consume_event(cursor)?;
+                    return Err(EIO);
+                }
+                FirmwareEvent::Grow(_) | FirmwareEvent::Notification => {}
+            }
+            state.root.consume_event(cursor)?;
+        }
+        Ok(())
     }
 
     fn service_locked(&self, state: &mut State) {
@@ -562,6 +752,8 @@ impl Runtime {
             self.fail_all(state, EIO);
             return;
         }
+        if let Err(err) = self.process_events(state) { self.fail_all(state, err); return; }
+        if let Err(err) = self.retire_render(state) { self.fail_all(state, err); return; }
         if let Err(e) = self.advance(state) { self.fail_all(state, e); return; }
         // The completion stamp is written before the firmware's post-processing advances the
         // retired position, and that advance sends no message. If the front command's stamp
@@ -581,20 +773,11 @@ impl Runtime {
             let front = &state.inflight[0];
             if state.retired_total >= front.ordinal {
                 if let Ok(done) = state.inflight.remove(0) {
-                    match state.pool.retire(done.slot) {
-                        Ok(true) => {}
-                        // The firmware has not recorded the cursor value yet; `acknowledge`
-                        // retries on its next notification.
-                        Ok(false) => {
-                            state.unacked |= 1 << done.slot;
-                            state.deferred += 1;
-                        }
-                        Err(e) => dev_err!(self.dev, "GPU: tracking retirement failed {:?}\n", e),
-                    }
-                    state.busy &= !(1 << done.slot);
-                    state.retired += 1;
+                    self.retire_slot(state, done.slot);
                     if done.last {
                         done.packet.retired();
+                    } else if !state.owns(&done.packet) && !state.pending(&done.packet) {
+                        done.packet.release_guard();
                     }
                 }
                 continue;
@@ -629,7 +812,7 @@ impl Runtime {
         loop {
             let Some(state) = Option::as_mut(&mut *guard) else { return Ok(()); };
             if !self.healthy() { return Ok(()); }
-            if state.inflight.is_empty() {
+            if !state.running() {
                 dev_info!(self.dev, "GPU held for sleep: submitted={} completed={} pending={}\n",
                           state.submitted, state.retired, state.pending.len());
                 return Ok(());
@@ -665,7 +848,7 @@ impl Runtime {
             let start = Instant::<Monotonic>::now();
             while self.healthy() && start.elapsed() < Delta::from_millis(STOP_DRAIN_MS.into()) {
                 let Some(state) = guard.as_ref() else { break; };
-                if state.inflight.is_empty() && state.pending.is_empty() { break; }
+                if !state.running() && state.pending.is_empty() { break; }
                 let _ = self.idle.wait_timeout(&mut guard, msecs_to_jiffies(STOP_DRAIN_MS));
             }
         }
@@ -782,6 +965,7 @@ impl Backend {
             retired_raw: head,
             capacity,
             inflight: KVec::new(),
+            rendering: None,
             pending: KVec::new(),
             submitted: 0,
             retired: 0,
@@ -831,12 +1015,9 @@ impl gpu::Gpu for Backend {
         Ok(())
     }
     fn supports_vm_status(&self) -> bool { true }
-    /// Render commands are refused (`m3_submit`), so the device also reports itself
-    /// compute-only: graphics userspace then leaves it alone instead of failing its first render.
     fn feature_flags(&self) -> u64 {
         uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_VM_STATUS as u64
             | uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_SCHEDULED_QUEUES as u64
-            | uapi::DRM_ASAHI_FEATURE_COMPUTE_ONLY as u64
     }
     fn tracked_submission(&self) -> bool { true }
     fn base_clock_hz(&self) -> u32 { <GpuManagerG14V13_5 as gpu::Gpu>::base_clock_hz(&self.graph) }
@@ -844,11 +1025,13 @@ impl gpu::Gpu for Backend {
     fn new_vm(&self, range: Range<u64>) -> Result<mmu::Vm> {
         self.graph.kernel_uat().new_vm(self.ids.vm.next(), range)?.with_tracked_status()
     }
-    fn new_queue(&self, vm: mmu::Vm, _ualloc: Arc<Mutex<alloc::DefaultAllocator>>,
+    fn new_queue(&self, vm: mmu::Vm, ualloc: Arc<Mutex<alloc::DefaultAllocator>>,
         ualloc_priv: Arc<Mutex<alloc::DefaultAllocator>>, priority: u32,
         usc_exec_base: u64, _usage: Arc<crate::usage::Client>) -> Result<KBox<dyn queue::Queue>> {
+        let render = Arc::new(render::QueueRender::new(self.graph.clone(), ualloc, ualloc_priv.clone())?,
+                              GFP_KERNEL)?;
         Ok(KBox::new(crate::m3::m3_submit::Queue::new_g14_v27_2(self.runtime.clone(), self.scheduler.clone(),
-            vm, priority, usc_exec_base, ualloc_priv, self.preempt_bytes)?, GFP_KERNEL)?)
+            vm, priority, usc_exec_base, ualloc_priv, self.preempt_bytes, render)?, GFP_KERNEL)?)
     }
     fn map_timestamp_buffer(&self, _bo: gem::ObjectRef, _range: Range<usize>) -> Result<crate::timestamp::Buffer> {
         // Timestamp buffers would need new tables in the firmware window after boot.
