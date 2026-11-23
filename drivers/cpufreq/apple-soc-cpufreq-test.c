@@ -1215,33 +1215,33 @@ static void cft_test_fast_die_init_required(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, cft_qos_max(ctx), FREQ_QOS_MAX_DEFAULT_VALUE);
 }
 
+KUNIT_DEFINE_ACTION_WRAPPER(cft_put_report, of_node_put, struct device_node *);
+
 /* The property names the PMP report node and the lane of the cluster. */
 static void cft_test_fast_die_init_described(struct kunit *test)
 {
 	struct cft_ctx *ctx = cft_fast_die_setup(test, &soc_t8140_info);
-	struct device_node *np, *report = NULL;
+	struct device_node *np, *report;
 	struct apple_fast_die *fd;
 	__be32 *value;
+	int ret;
 
-	/*
-	 * Any node with a phandle can stand in for the report node. The walk
-	 * takes no reference: take one for the time the test uses the node.
-	 */
-	for_each_of_allnodes(np) {
-		if (np->phandle) {
-			report = np;
+	/* Hold a reference to the first node that can stand in for the report. */
+	for (report = of_find_all_nodes(NULL); report;
+	     report = of_find_all_nodes(report)) {
+		if (report->phandle)
 			break;
-		}
 	}
 	if (!report)
 		kunit_skip(test, "no devicetree node with a phandle");
+	ret = kunit_add_action_or_reset(test, cft_put_report, report);
+	KUNIT_ASSERT_EQ(test, ret, 0);
 
 	value = kunit_kzalloc(test, 2 * sizeof(*value), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, value);
 	value[0] = cpu_to_be32(report->phandle);
 	value[1] = cpu_to_be32(3);
 	np = cft_cluster_node(test, value, 2);
-	of_node_put(report);
 
 	KUNIT_ASSERT_EQ(test, apple_fast_die_init(ctx->policy, np), 0);
 	fd = ctx->priv->fast_die;

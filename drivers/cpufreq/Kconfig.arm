@@ -44,7 +44,8 @@ config ARM_APPLE_SOC_CPUFREQ_KUNIT_TEST
 	  die-temperature limit and its devicetree parsing, and the board
 	  thermal ownership cap. The cluster registers are ordinary memory,
 	  which the MMIO accessors of arm64 can read and write; no hardware
-	  is accessed.
+	  is accessed. The policy suite skips when a CPUFreq driver is already
+	  registered.
 
 	  If unsure, say N.
 
