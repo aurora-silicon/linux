@@ -14,6 +14,7 @@
  *	Alpha Lin <Alpha.Lin@rock-chips.com>
  */
 
+#include <kunit/visibility.h>
 #include <linux/unaligned.h>
 
 #include <media/v4l2-vp9.h>
@@ -781,6 +782,40 @@ static int avd_vp9_alloc_bufs(struct avd_ctx *ctx, struct avd_vp9_bank *bank)
 }
 
 /*
+ * VP9 6.2.13 tile_info(): tile_rows_log2 is 0, 1 or 2, and tile_cols_log2
+ * lies between calc_min_log2_tile_cols() and calc_max_log2_tile_cols() of
+ * 6.2.14, which follow from the frame width. The job has one segment per
+ * tile and the per-column scratch is sized for the column count this allows.
+ */
+#define VP9_MIN_TILE_WIDTH_B64	4
+#define VP9_MAX_TILE_WIDTH_B64	64
+#define VP9_MAX_TILE_ROWS_LOG2	2
+
+VISIBLE_IF_KUNIT int
+avd_vp9_check_tiling(const struct v4l2_ctrl_vp9_frame *frame)
+{
+	/* 6.2.6 Compute image size syntax */
+	u32 sb_64_cols = (((frame->frame_width_minus_1 + 8) >> 3) + 7) >> 3;
+	u32 min_log2 = 0, max_log2 = 1;
+
+	if (frame->tile_rows_log2 > VP9_MAX_TILE_ROWS_LOG2)
+		return -EINVAL;
+
+	while ((VP9_MAX_TILE_WIDTH_B64 << min_log2) < sb_64_cols)
+		min_log2++;
+	while ((sb_64_cols >> max_log2) >= VP9_MIN_TILE_WIDTH_B64)
+		max_log2++;
+	max_log2--;
+
+	if (frame->tile_cols_log2 < min_log2 ||
+	    frame->tile_cols_log2 > max_log2)
+		return -EINVAL;
+
+	return 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(avd_vp9_check_tiling);
+
+/*
  * Only VP9 profiles 0 and 2 (4:2:0, 8 and 10 bits) decode. A profile 1
  * frame (4:2:2 or 4:4:4) is never completed: it times out and the whole
  * decoder is reset, failing every other stream's frames too. Refuse
@@ -796,12 +831,12 @@ static int avd_vp9_validate_frame(struct avd_ctx *ctx,
 	if (frame->bit_depth != (frame->profile == 2 ? 10 : 8))
 		return -EINVAL;
 
-	return 0;
+	return avd_vp9_check_tiling(frame);
 }
 
 static int avd_vp9_run_preamble(struct avd_ctx *ctx, struct avd_vp9_run *run)
 {
-	struct v4l2_ctrl *ctrl;
+	struct v4l2_ctrl *ctrl, *hdr;
 	const struct v4l2_ctrl_vp9_frame *dec_params;
 	struct avd_vp9_ctx *vp9_ctx = ctx->priv;
 	unsigned int fctx_idx;
@@ -811,16 +846,25 @@ static int avd_vp9_run_preamble(struct avd_ctx *ctx, struct avd_vp9_run *run)
 	if (run->base.setup_err)
 		return run->base.setup_err;
 
-	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
-			      V4L2_CID_STATELESS_VP9_COMPRESSED_HDR);
-	if (WARN_ON(!ctrl))
-		return -EINVAL;
-	run->prob_updates = ctrl->p_cur.p;
-
+	hdr = v4l2_ctrl_find(&ctx->ctrl_hdl,
+			     V4L2_CID_STATELESS_VP9_COMPRESSED_HDR);
 	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl, V4L2_CID_STATELESS_VP9_FRAME);
-	if (WARN_ON(!ctrl))
+	if (WARN_ON(!hdr || !ctrl))
 		return -EINVAL;
-	dec_params = ctrl->p_cur.p;
+
+	/*
+	 * A plain VIDIOC_S_EXT_CTRLS can change the controls while the job is
+	 * built; check and build from copies taken under the control lock.
+	 */
+	v4l2_ctrl_lock(ctrl);
+	run->prob_updates = kmemdup(hdr->p_cur.p, sizeof(*run->prob_updates),
+				    GFP_KERNEL);
+	run->decode_params = kmemdup(ctrl->p_cur.p,
+				     sizeof(*run->decode_params), GFP_KERNEL);
+	v4l2_ctrl_unlock(ctrl);
+	if (!run->prob_updates || !run->decode_params)
+		return -ENOMEM;
+	dec_params = run->decode_params;
 
 	ret = validate_dec_params(ctx, dec_params);
 	if (ret)
@@ -830,8 +874,6 @@ static int avd_vp9_run_preamble(struct avd_ctx *ctx, struct avd_vp9_run *run)
 	ret = avd_vp9_validate_frame(ctx, dec_params);
 	if (ret)
 		return ret;
-
-	run->decode_params = dec_params;
 
 	if (avd_backend_is_qfw(ctx->dev)) {
 		struct avd_vp9_bank *bank = NULL;
@@ -869,7 +911,7 @@ static void avd_vp9_update_probs(struct avd_ctx *ctx,
 
 static int avd_vp9_run(struct avd_ctx *ctx)
 {
-	struct avd_vp9_run run;
+	struct avd_vp9_run run = {};
 	struct avd_vp9_ctx *vp9_ctx;
 	struct avd_decoded_buffer *dst;
 	int ret;
@@ -877,17 +919,16 @@ static int avd_vp9_run(struct avd_ctx *ctx)
 	ret = avd_vp9_run_preamble(ctx, &run);
 	if (ret) {
 		avd_run_postamble(ctx, &run.base);
-		return ret;
+		goto out;
 	}
 
-	ret = avd_init_job(
-		ctx, AVD_CODEC_VP9,
-		(1 << run.decode_params->tile_rows_log2) *
-				(1 << run.decode_params->tile_cols_log2) +
-			1);
+	/* One segment per tile, bounded by avd_vp9_check_tiling(), and the header. */
+	ret = avd_init_job(ctx, AVD_CODEC_VP9,
+			   ((size_t)1 << (run.decode_params->tile_rows_log2 +
+					  run.decode_params->tile_cols_log2)) + 1);
 	if (ret) {
 		avd_run_postamble(ctx, &run.base);
-		return ret;
+		goto out;
 	}
 
 	init_probs(ctx, &run);
@@ -909,7 +950,11 @@ static int avd_vp9_run(struct avd_ctx *ctx)
 		update_ctx_last_info(vp9_ctx);
 		ctx->job_fifo = vp9_ctx->b->bufs.inst.addr;
 	}
-	return avd_submit_job(ctx);
+	ret = avd_submit_job(ctx);
+out:
+	kfree(run.decode_params);
+	kfree(run.prob_updates);
+	return ret;
 }
 
 #define copy_tx_and_skip(p1, p2)                                    \

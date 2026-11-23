@@ -634,6 +634,10 @@ validate_vp9_frame(struct v4l2_ctrl_vp9_frame *frame)
 	if (frame->tile_cols_log2 > 6)
 		return -EINVAL;
 
+	/* tile_rows_log2 is coded as up to two one-bit increments. */
+	if (frame->tile_rows_log2 > 2)
+		return -EINVAL;
+
 	if (frame->reference_mode > V4L2_VP9_REFERENCE_MODE_SELECT)
 		return -EINVAL;
 

@@ -29,6 +29,9 @@ int avd_open_build_program(struct avd_ctx *ctx)
 
 	if (!f || !job->segments)
 		return -EINVAL;
+	/* The builder ran past the table or a segment; nothing fits. */
+	if (job->overflow || job->num >= job->max)
+		return -EOVERFLOW;
 	for (i = 0; i <= job->num; i++) {
 		if (job->segments[i].num > AVD_MAX_INST ||
 		    check_add_overflow(count, job->segments[i].num + !!i, &count))

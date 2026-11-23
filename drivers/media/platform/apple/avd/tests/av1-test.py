@@ -106,7 +106,7 @@ static void avd_run_preamble(struct avd_ctx *ctx,struct avd_run *run){
 static void avd_run_postamble(struct avd_ctx *ctx,struct avd_run *run){(void)ctx;(void)run;}
 static int avd_init_job(struct avd_ctx *ctx,int codec,size_t segments){
  free(ctx->job.segments);ctx->job.codec=codec;ctx->job.num=0;
- ctx->job.segments=calloc(segments,sizeof(*ctx->job.segments));return ctx->job.segments?0:-ENOMEM;
+ ctx->job.segments=calloc(segments,sizeof(*ctx->job.segments));ctx->job.overflow=false;ctx->job.max=ctx->job.segments?segments:0;return ctx->job.segments?0:-ENOMEM;
 }
 static int avd_submit_job(struct avd_ctx *ctx);
 '''
