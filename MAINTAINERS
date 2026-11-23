@@ -2136,9 +2136,12 @@ F:	drivers/pci/controller/pcie-apple-t8140-bootstrap*
 F:	drivers/phy/apple/atc-j700-dp.h
 F:	drivers/rtc/rtc-apple-pmu.c
 F:	drivers/soc/apple/aop.rs
+F:	drivers/soc/apple/aura-hibernate.c
 F:	drivers/soc/apple/mcc.c
+F:	drivers/soc/apple/rtkit-hib-handoff.c
 F:	drivers/soc/apple/sleep*.c
 F:	drivers/tty/serial/apple_dockchannel*
+F:	include/linux/soc/apple/aura-hibernate.h
 F:	include/linux/soc/apple/pci-apple-piodma.h
 F:	include/linux/soc/apple/sleep.h
 F:	rust/kernel/iio/common/aop_sensors.rs
