@@ -4,6 +4,7 @@
 #include <drm/drm_mm.h>
 #include <linux/crash_dump.h>
 #include <linux/debugfs.h>
+#include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/io.h>
 #include <linux/iommu.h>
@@ -158,6 +159,8 @@ struct ane_fw_backend {
 	 */
 	struct delayed_work recover;
 	bool hung_down, hung_off;
+	/* Boot time of the OFF that set hung_off. */
+	u64 hung_off_at;
 	/* Runtime recoveries, limited (ane_fw_recover_admit()); under lock. */
 	struct ane_fw_recover_limit recover_limit;
 	/* A power-down outside a sleep: a stuck power word cannot wait for one. */
@@ -1204,6 +1207,28 @@ static bool ane_fw_hung_wait_off(struct ane_fw_backend *b)
 	return READ_ONCE(b->hung_off);
 }
 
+#define ANE_FW_RECOVER_OFF_MS 100U
+
+/*
+ * A recovery used to power ANE_SYS on again within about a millisecond of
+ * genpd turning it off: the cold boot's power-up followed the proof at once.
+ * Every other power cycle of the engine (idle park, system sleep) keeps it
+ * off for seconds. Keep it off for ANE_FW_RECOVER_OFF_MS; returns the ms
+ * waited.
+ */
+static unsigned int ane_fw_hung_stay_off(struct ane_fw_backend *b)
+{
+	u64 min_ns = (u64)ANE_FW_RECOVER_OFF_MS * NSEC_PER_MSEC;
+	/* Acquire: pairs with the release in ane_fw_genpd_event(), after hung_off_at. */
+	u64 off_at = smp_load_acquire(&b->hung_off) ? READ_ONCE(b->hung_off_at) : 0;
+	u64 wait = ane_fw_recover_off_wait(off_at, ktime_get_boottime_ns(), min_ns);
+	unsigned int ms = DIV_ROUND_UP_ULL(wait, NSEC_PER_MSEC);
+
+	if (ms)
+		msleep(ms);
+	return ms;
+}
+
 /* The new firmware is up: the next hang starts its proof afresh. */
 static void ane_fw_hung_recovered(struct ane_fw_backend *b)
 {
@@ -1266,6 +1291,7 @@ static void ane_fw_recover_work(struct work_struct *work)
 						recover);
 	struct device *dev = &b->pdev->dev;
 	bool rpm = ane_fw_rpm(b), held = false, reschedule = false;
+	unsigned int off = 0;
 	u64 start, last;
 	int ret;
 
@@ -1316,6 +1342,8 @@ static void ane_fw_recover_work(struct work_struct *work)
 		ret = ane_fw_hung_down(b, true);
 		if (!ret && !ane_fw_hung_wait_off(b))
 			ret = -ETIMEDOUT;
+		if (!ret)
+			off = ane_fw_hung_stay_off(b);
 		if (!ret && !ane_fw_hung_proven(b))
 			ret = -EIO;
 		if (ret) {
@@ -1342,9 +1370,9 @@ static void ane_fw_recover_work(struct work_struct *work)
 		}
 		ane_h16_session_sleep(&b->session, false);
 		dev_info(dev,
-			 "H17 ANE: %s after a hung request in %llu ms, %u programs replayed; recovery %u of %u within %u s\n",
+			 "H17 ANE: %s after a hung request in %llu ms (off %u ms), %u programs replayed; recovery %u of %u within %u s\n",
 			 ret ? "recovery FAILED" : "firmware recovered",
-			 div_u64(ktime_get_ns() - start, NSEC_PER_MSEC), b->resume_replayed,
+			 div_u64(ktime_get_ns() - start, NSEC_PER_MSEC), off, b->resume_replayed,
 			 ane_fw_recover_recent(&b->recover_limit, ktime_get_boottime_ns(),
 					       ane_fw_recover_default.window_ns, &last),
 			 ANE_FW_RECOVER_BURST, ANE_FW_RECOVER_WINDOW_S);
@@ -1628,9 +1656,15 @@ static int ane_fw_genpd_event(struct notifier_block *nb, unsigned long action, v
 		b->sys_offs++;
 		b->sys_off_pmgr = ane_rd32(b, b->pmgr + b->soc->pmgr_sys);
 		b->sys_off_at = now;
-		/* After a hung engine's power-down: the proof it is gone. */
-		if (smp_load_acquire(&b->hung_down) && ane_fw_sys_off(b->sys_off_pmgr))
-			WRITE_ONCE(b->hung_off, true);
+		/*
+		 * After a hung engine's power-down (acquire: pairs with the release in
+		 * ane_fw_hung_down()): the proof it is gone.
+		 */
+		if (smp_load_acquire(&b->hung_down) && ane_fw_sys_off(b->sys_off_pmgr)) {
+			WRITE_ONCE(b->hung_off_at, now);
+			/* hung_off_at is read after hung_off (ane_fw_hung_stay_off()). */
+			smp_store_release(&b->hung_off, true);
+		}
 	} else if (action == GENPD_NOTIFY_ON) {
 		b->sys_ons++;
 		b->sys_on_pmgr = ane_rd32(b, b->pmgr + b->soc->pmgr_sys);

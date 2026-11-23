@@ -536,7 +536,27 @@ static void ane_cold_recover_backoff_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rec_try(&l, &p, now, &wait), ANE_FW_RECOVER_NOW);
 }
 
+/* A recovery keeps ANE_SYS off for its minimum, counted from genpd's OFF. */
+static void ane_cold_recover_off_test(struct kunit *test)
+{
+	const u64 min = 100 * NSEC_PER_MSEC, off = 5 * NSEC_PER_SEC;
+
+	/* The storm's recoveries powered up again within about a millisecond. */
+	KUNIT_EXPECT_EQ(test, ane_fw_recover_off_wait(off, off + NSEC_PER_MSEC, min),
+			99 * NSEC_PER_MSEC);
+	KUNIT_EXPECT_EQ(test, ane_fw_recover_off_wait(off, off, min), min);
+	KUNIT_EXPECT_EQ(test, ane_fw_recover_off_wait(off, off + min, min), 0ULL);
+	KUNIT_EXPECT_EQ(test, ane_fw_recover_off_wait(off, off + NSEC_PER_SEC, min), 0ULL);
+	/* No OFF recorded, or one in the future: wait the whole minimum. */
+	KUNIT_EXPECT_EQ(test, ane_fw_recover_off_wait(0, off, min), min);
+	KUNIT_EXPECT_EQ(test, ane_fw_recover_off_wait(off, off - 1, min), min);
+	/* No minimum: never wait. */
+	KUNIT_EXPECT_EQ(test, ane_fw_recover_off_wait(off, off, 0), 0ULL);
+	KUNIT_EXPECT_EQ(test, ane_fw_recover_off_wait(0, off, 0), 0ULL);
+}
+
 static struct kunit_case ane_cold_cases[] = {
+	KUNIT_CASE(ane_cold_recover_off_test),
 	KUNIT_CASE(ane_cold_recover_storm_test),
 	KUNIT_CASE(ane_cold_recover_backoff_test),
 	KUNIT_CASE(ane_cold_hung_gone_test),

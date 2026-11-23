@@ -117,6 +117,18 @@ static inline bool ane_fw_hung_gone(const struct ane_fw_hung_proof *p,
 }
 
 /*
+ * How long a recovery still keeps ANE_SYS off, @min_ns from the OFF at
+ * @off_at (boot time) given @now: the whole of it when the OFF time is
+ * unknown or lies ahead.
+ */
+static inline u64 ane_fw_recover_off_wait(u64 off_at, u64 now, u64 min_ns)
+{
+	if (!off_at || now < off_at)
+		return min_ns;
+	return now - off_at >= min_ns ? 0 : min_ns - (now - off_at);
+}
+
+/*
  * Runtime recoveries of a hung engine are limited. Each one powers the
  * engine off under its firmware and boots it again; a client that hangs it
  * again right away turns that into a storm of power cycles, and eight of them
