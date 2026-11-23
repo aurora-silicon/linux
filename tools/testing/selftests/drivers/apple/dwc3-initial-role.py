@@ -26,6 +26,16 @@ def function(source, name):
     return source[match.start():end] + "\n"
 
 
+def hw_defs(source):
+    """The driver's struct dwc3_apple_hw and its per-SoC tables."""
+    struct = re.search(r"^struct dwc3_apple_hw \{.*?^\};\n", source, re.M | re.S)
+    assert struct, "struct dwc3_apple_hw"
+    tables = re.findall(r"^static const struct dwc3_apple_hw \w+ = \{.*?\};\n", source, re.M | re.S)
+    assert tables, "dwc3_apple_hw tables"
+    unused = "static const struct dwc3_apple_hw __attribute__((unused)) "
+    return struct[0] + "".join(t.replace("static const struct dwc3_apple_hw ", unused, 1) for t in tables)
+
+
 def main():
     root = Path(__file__).resolve().parents[5]
     path = root / "drivers/usb/dwc3/core.c"
@@ -106,6 +116,7 @@ struct dwc3_probe_data {
 struct dwc3_apple {
     struct dwc3 dwc;
     struct device *dev;
+    const struct dwc3_apple_hw *hw;
     void *mmio_resource;
     unsigned lock;
     int state;
@@ -126,7 +137,6 @@ static int stop_error;
 static int fake_dev_err_probe(int error) { return error; }
 static void fake_guard(void *p) { (void)p; }
 static bool of_machine_is_compatible(const char *s) { return j713 && !strcmp(s,"apple,j713"); }
-static bool of_device_is_compatible(const char *node,const char *s) { return !strcmp(node,s); }
 static void msleep(unsigned n) { (void)n; }
 static void udelay(unsigned n) { (void)n; }
 static u32 dwc3_readl(struct dwc3 *d,u32 off)
@@ -170,7 +180,8 @@ static int dwc3_apple_core_stop(struct dwc3_apple *a) { (void)a; return stop_err
     cio_defines = "\n".join(line for line in apple.splitlines()
                             if line.startswith(("#define APPLE_DWC3_",
                                                 "#define DWC3_APPLE_T8140_PWRDNSCALE"))) + "\n"
-    program = preamble.replace("struct dwc3_apple {", sleep_phase + "\nstruct dwc3_apple {", 1)
+    program = preamble.replace("struct dwc3_apple {",
+                               sleep_phase + "\n" + hw_defs(apple) + "struct dwc3_apple {", 1)
     program += enum + "\n" + cio_defines + function(core,"dwc3_set_prtcap")
     program += function(core,"dwc3_core_soft_reset") + function(core,"dwc3_core_set_initial_role")
     program += r'''
@@ -208,7 +219,7 @@ static struct dwc3_apple a;
 static void clean(void)
 {
     dev=(struct device){ .of_node="apple,t8132-dwc3", .host_only=true };
-    a=(struct dwc3_apple){ .dev=&dev, .state=DWC3_APPLE_PROBE_PENDING, .apple_regs=cio };
+    a=(struct dwc3_apple){ .dev=&dev, .hw=&dwc3_apple_t8132_hw, .state=DWC3_APPLE_PROBE_PENDING, .apple_regs=cio };
     a.dwc.gctl=0xa5a50000;
     j713=stall_reset=true; io_ready=false;
     role_writes=dctl_writes=core_calls=releases=mode_at_init=dr_mode_at_init=0;
@@ -228,7 +239,7 @@ int main(void)
     assert(role_writes==2 && !dctl_writes && core_calls==2 && mode_at_init==DWC3_GCTL_PRTCAP_HOST);
     assert(dr_mode_at_init==USB_DR_MODE_HOST);
     puts("ok 2 - subsequent physical-reset session restores HOST before core init");
-    clean(); dev.of_node="apple,t8103-dwc3"; stall_reset=false;
+    clean(); dev.of_node="apple,t8103-dwc3"; a.hw=&dwc3_apple_t8103_hw; stall_reset=false;
     assert(!dwc3_apple_core_init(&a,DWC3_APPLE_HOST) && !role_writes && dctl_writes==1);
     clean(); j713=false; stall_reset=false;
     assert(!dwc3_apple_core_init(&a,DWC3_APPLE_HOST) && !role_writes && dctl_writes==1);
@@ -268,7 +279,7 @@ int main(void)
     assert(!dwc3_apple_core_start(&a,DWC3_APPLE_DEVICE) && !cio_writes);
     clean(); j713=false; stall_reset=false;
     assert(!dwc3_apple_core_start(&a,DWC3_APPLE_HOST) && !cio_writes);
-    clean(); dev.of_node="apple,t8103-dwc3"; stall_reset=false;
+    clean(); dev.of_node="apple,t8103-dwc3"; a.hw=&dwc3_apple_t8103_hw; stall_reset=false;
     assert(!dwc3_apple_core_start(&a,DWC3_APPLE_HOST) && cio_writes==5);
     puts("ok 6 - J713 native CIO values after core admission, old and device paths preserved");
     return 0;
@@ -282,7 +293,7 @@ int main(void)
                             "\t\t\t(void)0;",1)
     assert retry != program
     no_cio = program.replace(
-        ' ||\n\t    dwc3_apple_host_before_core_init(appledwc, state)', '', 1)
+        ' || dwc3_apple_host_before_core_init(appledwc, state)', '', 1)
     assert no_cio != program
     print("TAP version 13\n1..7",flush=True)
     resource.setrlimit(resource.RLIMIT_CORE,(0,0))

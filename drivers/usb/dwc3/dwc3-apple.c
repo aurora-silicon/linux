@@ -13,6 +13,7 @@
 #include <linux/devm-helpers.h>
 #include <linux/iopoll.h>
 #include <linux/of.h>
+#include <linux/of_device.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/phy/apple-atc.h>
@@ -126,6 +127,39 @@ int tipd_port_replug(struct usb_role_switch *sw, u8 seconds);
 #define DWC3_APPLE_NR_DRD_REGS 3
 
 /**
+ * struct dwc3_apple_hw - What sets each SoC's controller apart
+ * @hibernation: The core's power management saves and restores only with GCTL's hibernation
+ *		 enable, see dwc3_apple_setup_hibernation()
+ * @host_first: A host role may be brought up before the core, and only that path sets up
+ *		the CIO registers
+ * @usb2_host_latch: The host role is latched while the USB2 PHY is stopped, and a failure to
+ *		     set its mode is fatal
+ * @usb3_setup_strict: A failed USB3 PHY setup must not start xHCI
+ * @usb3_no_u3: The USB3 PHY does not bring a SuperSpeed link back from U3 in a host
+ * @usb3_pipe_reset: The USB3 PIPE is reset after the role is set
+ * @host_only: The controller must never enter DWC3_APPLE_DEVICE
+ * @ss_port: The SuperSpeed device of a Type-C host is looked for after a sleep
+ * @idle_rpm: The PHY driver and the DARTs follow runtime PM
+ * @usb3_phy_optional: Ports without a USB3 PHY exist
+ * @pre_core_rpm: The controller runtime-suspends before its first cable
+ * @shutdown_exit: A shutdown tears the core down
+ */
+struct dwc3_apple_hw {
+	bool hibernation;
+	bool host_first;
+	bool usb2_host_latch;
+	bool usb3_setup_strict;
+	bool usb3_no_u3;
+	bool usb3_pipe_reset;
+	bool host_only;
+	bool ss_port;
+	bool idle_rpm;
+	bool usb3_phy_optional;
+	bool pre_core_rpm;
+	bool shutdown_exit;
+};
+
+/**
  * struct dwc3_apple - Apple-specific DWC3 USB controller
  * @dwc: Core DWC3 structure
  * @dev: Pointer to the device structure
@@ -137,6 +171,7 @@ int tipd_port_replug(struct usb_role_switch *sw, u8 seconds);
  * @usb3_phy: USB3 PHY, configured after the core is brought up
  * @role_sw: USB role switch
  * @fixed_hub: A fixed hub sits on the controller's USB2 port, the controller stays in host mode
+ * @hw: What sets this SoC's controller apart, from its match entry
  * @host_only: The controller must never enter DWC3_APPLE_DEVICE, see dwc3_apple_host_only()
  * @lock: Mutex for synchronizing access
  * @state: Current state of the controller, see enum dwc3_apple_state and the comment above
@@ -167,6 +202,7 @@ struct dwc3_apple {
 	struct dwc3 dwc;
 
 	struct device *dev;
+	const struct dwc3_apple_hw *hw;
 	struct resource *mmio_resource;
 	void __iomem *apple_regs;
 
@@ -328,7 +364,7 @@ static void dwc3_apple_setup_hibernation(struct dwc3_apple *appledwc)
 	struct dwc3 *dwc = &appledwc->dwc;
 	u32 reg;
 
-	if (!of_device_is_compatible(appledwc->dev->of_node, "apple,t8140-dwc3"))
+	if (!appledwc->hw->hibernation)
 		return;
 	reg = dwc3_readl(dwc, DWC3_GCTL);
 	reg &= ~DWC3_GCTL_PWRDNSCALE_MASK;
@@ -704,7 +740,7 @@ static bool dwc3_apple_host_before_core_init(struct dwc3_apple *appledwc,
 					     enum dwc3_apple_state state)
 {
 	return state == DWC3_APPLE_HOST && apple_t8132_usb_host_first() &&
-		of_device_is_compatible(appledwc->dev->of_node, "apple,t8132-dwc3");
+		appledwc->hw->host_first;
 }
 
 static int dwc3_apple_core_probe(struct dwc3_apple *appledwc, enum dwc3_apple_state state)
@@ -896,13 +932,12 @@ static int dwc3_apple_core_start(struct dwc3_apple *appledwc, enum dwc3_apple_st
 		return ret;
 	}
 	/* T8132 latches the host role while its USB2 PHY is stopped. */
-	if (of_device_is_compatible(appledwc->dev->of_node, "apple,t8132-dwc3") &&
-	    state == DWC3_APPLE_HOST)
+	if (appledwc->hw->usb2_host_latch && state == DWC3_APPLE_HOST)
 		mode = PHY_MODE_USB_HOST;
 	if (mode != PHY_MODE_INVALID) {
 		ret = phy_set_mode(appledwc->usb2_phy, mode);
 		if (ret) {
-			if (of_device_is_compatible(appledwc->dev->of_node, "apple,t8132-dwc3"))
+			if (appledwc->hw->usb2_host_latch)
 				return ret;
 			dev_warn(appledwc->dev, "Failed to set the USB2 PHY mode, err=%d\n", ret);
 		}
@@ -961,8 +996,7 @@ static int dwc3_apple_core_start(struct dwc3_apple *appledwc, enum dwc3_apple_st
 	 * configure some unknown Apple-specific settings and then bring up xhci or gadget mode.
 	 */
 	/* Native J713 host reset uses the same CIO setup before xHCI starts. */
-	if (!of_device_is_compatible(appledwc->dev->of_node, "apple,t8132-dwc3") ||
-	    dwc3_apple_host_before_core_init(appledwc, state))
+	if (!appledwc->hw->host_first || dwc3_apple_host_before_core_init(appledwc, state))
 		dwc3_apple_setup_cio(appledwc);
 	dwc3_apple_apply_tunables(appledwc);
 	dwc3_apple_setup_hibernation(appledwc);
@@ -1014,23 +1048,19 @@ static int dwc3_apple_set_role(struct dwc3_apple *appledwc, enum dwc3_apple_stat
 		 * T6050 one: that PHY reports a port left on USB2 (four DisplayPort lanes) as
 		 * success, and its errors leave the PIPE without a known producer.
 		 */
-		if (of_device_is_compatible(appledwc->dev->of_node, "apple,t8132-dwc3") ||
-		    of_device_is_compatible(appledwc->dev->of_node, "apple,t6050-dwc3")) {
+		if (appledwc->hw->usb3_setup_strict) {
 			dev_err(appledwc->dev, "USB3 PHY setup failed, err=%d\n", ret);
 			return ret;
 		}
 		dev_warn(appledwc->dev, "USB3 PHY setup failed, USB2 only, err=%d\n", ret);
-	} else if (host && appledwc->usb3_phy &&
-		   (of_device_is_compatible(appledwc->dev->of_node, "apple,t8132-dwc3") ||
-		    of_device_is_compatible(appledwc->dev->of_node, "apple,t8142-dwc3"))) {
+	} else if (host && appledwc->usb3_phy && appledwc->hw->usb3_no_u3) {
 		/*
 		 * These PHYs do not bring a SuperSpeed link back from U3 once
 		 * the core has suspended them: keep them out of P3 from here on.
 		 */
 		appledwc->dwc.dis_u3_susphy_quirk = true;
 		dwc3_enable_susphy(&appledwc->dwc, true);
-	} else if (appledwc->usb3_phy &&
-		   of_device_is_compatible(appledwc->dev->of_node, "apple,t6040-dwc3")) {
+	} else if (appledwc->usb3_phy && appledwc->hw->usb3_pipe_reset) {
 		dwc3_apple_usb3_pipe_reset(appledwc);
 	}
 	return 0;
@@ -1043,13 +1073,12 @@ static int dwc3_apple_set_role(struct dwc3_apple *appledwc, enum dwc3_apple_stat
  * controller (a charger or a host on the other end), or the core would end up in device mode on
  * top of a PHY powered in host mode.
  */
-static bool dwc3_apple_host_only(struct device *dev)
+static bool dwc3_apple_host_only(const struct dwc3_apple_hw *hw)
 {
 	if (!IS_ENABLED(CONFIG_USB_DWC3_GADGET) && !IS_ENABLED(CONFIG_USB_DWC3_DUAL_ROLE))
 		return true;
 
-	return of_device_is_compatible(dev->of_node, "apple,t6040-dwc3") ||
-	       of_device_is_compatible(dev->of_node, "apple,t6050-dwc3");
+	return hw->host_only;
 }
 
 static int dwc3_apple_init(struct dwc3_apple *appledwc, enum dwc3_apple_state state)
@@ -1345,7 +1374,7 @@ static int dwc3_apple_ss_ports(struct dwc3_apple *appledwc, struct usb_device **
 static bool dwc3_apple_ss_port(struct dwc3_apple *appledwc)
 {
 	return !appledwc->fixed_hub && appledwc->role_sw && dwc3_apple_sleep_board() &&
-	       of_device_is_compatible(appledwc->dev->of_node, "apple,t6050-dwc3");
+	       appledwc->hw->ss_port;
 }
 
 /* TEST (J714s): as a sleep stops such a host, whether a SuperSpeed device is on it. */
@@ -1707,8 +1736,7 @@ static bool dwc3_apple_tunnel_keep(struct dwc3_apple *appledwc)
 	lockdep_assert_held(&appledwc->lock);
 	if (appledwc->fixed_hub || !(of_machine_is_compatible("apple,j714s") ||
 				     of_machine_is_compatible("apple,j716c")) ||
-	    !of_device_is_compatible(appledwc->dev->of_node, "apple,t6050-dwc3") ||
-	    dwc3_apple_tunnel_phy(appledwc, APPLE_T6050_CIO_USB_KEEP))
+	    !appledwc->hw->ss_port || dwc3_apple_tunnel_phy(appledwc, APPLE_T6050_CIO_USB_KEEP))
 		return false;
 	appledwc->sleep_tunnel = true;
 	appledwc->sleep_tunnel_taken = false;
@@ -2175,12 +2203,11 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 
 	appledwc->dev = &pdev->dev;
 	appledwc->fixed_hub = dwc3_apple_has_fixed_hub(dev, &appledwc->hub_port);
-	appledwc->host_only = dwc3_apple_host_only(dev);
+	appledwc->hw = of_device_get_match_data(dev);
+	appledwc->host_only = dwc3_apple_host_only(appledwc->hw);
 	appledwc->dt_dis_u3_susphy = device_property_read_bool(dev, "snps,dis_u3_susphy_quirk");
 	appledwc->sleep_ddr = device_property_read_bool(dev, "apple,sleep-ddr");
-	/* The PHY driver and the DARTs follow runtime PM on these SoCs. */
-	appledwc->idle_rpm = of_device_is_compatible(dev->of_node, "apple,t6040-dwc3") ||
-			     of_device_is_compatible(dev->of_node, "apple,t8132-dwc3");
+	appledwc->idle_rpm = appledwc->hw->idle_rpm;
 	mutex_init(&appledwc->lock);
 	/*
 	 * Its xHCI child is asynchronous, but can't start to resume before the PM core has
@@ -2206,8 +2233,7 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 	 * Older T8132 device trees and the T6040 ports without a USB3 PHY
 	 * expose only USB2; a NULL PHY is a no-op.
 	 */
-	if (of_device_is_compatible(dev->of_node, "apple,t8132-dwc3") ||
-	    of_device_is_compatible(dev->of_node, "apple,t6040-dwc3"))
+	if (appledwc->hw->usb3_phy_optional)
 		appledwc->usb3_phy = devm_phy_optional_get(dev, "usb3-phy");
 	else
 		appledwc->usb3_phy = devm_phy_get(dev, "usb3-phy");
@@ -2279,8 +2305,7 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 	 * Tested on T8132; on the T6041 (M4 Max) the never-plugged ports are the usual case.
 	 */
 	if (appledwc->idle_rpm && !appledwc->fixed_hub &&
-	    (of_device_is_compatible(dev->of_node, "apple,t8132-dwc3") ||
-	     of_machine_is_compatible("apple,t6041"))) {
+	    (appledwc->hw->pre_core_rpm || of_machine_is_compatible("apple,t6041"))) {
 		pm_runtime_set_active(dev);
 		pm_runtime_enable(dev);
 		appledwc->pre_core_rpm = true;
@@ -2348,7 +2373,7 @@ static void dwc3_apple_shutdown(struct platform_device *pdev)
 	int ret;
 
 	dwc3_apple_pm_quiesce(appledwc);
-	if (!of_device_is_compatible(appledwc->dev->of_node, "apple,t8132-dwc3"))
+	if (!appledwc->hw->shutdown_exit)
 		return;
 	guard(mutex)(&appledwc->lock);
 	ret = dwc3_apple_exit(appledwc);
@@ -2357,9 +2382,47 @@ static void dwc3_apple_shutdown(struct platform_device *pdev)
 			"Shutdown retains incomplete PHY/reset ownership: %d\n", ret);
 }
 
+static const struct dwc3_apple_hw dwc3_apple_t8103_hw = { };
+
+static const struct dwc3_apple_hw dwc3_apple_t8132_hw = {
+	.host_first = true,
+	.usb2_host_latch = true,
+	.usb3_setup_strict = true,
+	.usb3_no_u3 = true,
+	.idle_rpm = true,
+	.usb3_phy_optional = true,
+	.pre_core_rpm = true,
+	.shutdown_exit = true,
+};
+
+static const struct dwc3_apple_hw dwc3_apple_t8140_hw = {
+	.hibernation = true,
+};
+
+static const struct dwc3_apple_hw dwc3_apple_t8142_hw = {
+	.usb3_no_u3 = true,
+};
+
+static const struct dwc3_apple_hw dwc3_apple_t6040_hw = {
+	.usb3_pipe_reset = true,
+	.host_only = true,
+	.idle_rpm = true,
+	.usb3_phy_optional = true,
+};
+
+static const struct dwc3_apple_hw dwc3_apple_t6050_hw = {
+	.usb3_setup_strict = true,
+	.host_only = true,
+	.ss_port = true,
+};
+
 static const struct of_device_id dwc3_apple_of_match[] = {
-	{ .compatible = "apple,t8132-dwc3" },
-	{ .compatible = "apple,t8103-dwc3" },
+	{ .compatible = "apple,t8132-dwc3", .data = &dwc3_apple_t8132_hw },
+	{ .compatible = "apple,t8140-dwc3", .data = &dwc3_apple_t8140_hw },
+	{ .compatible = "apple,t8142-dwc3", .data = &dwc3_apple_t8142_hw },
+	{ .compatible = "apple,t6040-dwc3", .data = &dwc3_apple_t6040_hw },
+	{ .compatible = "apple,t6050-dwc3", .data = &dwc3_apple_t6050_hw },
+	{ .compatible = "apple,t8103-dwc3", .data = &dwc3_apple_t8103_hw },
 	{}
 };
 MODULE_DEVICE_TABLE(of, dwc3_apple_of_match);

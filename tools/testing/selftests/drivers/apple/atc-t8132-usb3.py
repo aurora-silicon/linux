@@ -26,6 +26,16 @@ def function(source, name):
     return source[match.start():end] + "\n"
 
 
+def hw_defs(source):
+    """The driver's struct dwc3_apple_hw and its per-SoC tables."""
+    struct = re.search(r"^struct dwc3_apple_hw \{.*?^\};\n", source, re.M | re.S)
+    assert struct, "struct dwc3_apple_hw"
+    tables = re.findall(r"^static const struct dwc3_apple_hw \w+ = \{.*?\};\n", source, re.M | re.S)
+    assert tables, "dwc3_apple_hw tables"
+    unused = "static const struct dwc3_apple_hw __attribute__((unused)) "
+    return struct[0] + "".join(t.replace("static const struct dwc3_apple_hw ", unused, 1) for t in tables)
+
+
 def enum(source, name):
     start = source.index("enum " + name + " {")
     return source[start:source.index("};", start) + 2] + "\n"
@@ -378,7 +388,8 @@ int main(void)
 enum phy_mode { PHY_MODE_USB_HOST, PHY_MODE_USB_DEVICE };
 struct device { const char *of_node; };
 struct dwc3 { int dr_mode, current_dr_role; bool dis_u3_susphy_quirk; };
-struct dwc3_apple { struct dwc3 dwc; struct device *dev; void *usb2_phy, *usb3_phy; int lock, state;
+''' + hw_defs(dwc) + r'''struct dwc3_apple { struct dwc3 dwc; struct device *dev;
+    const struct dwc3_apple_hw *hw; void *usb2_phy, *usb3_phy; int lock, state;
     bool dt_dis_u3_susphy, host_only, sleep_ddr; };
 static int phy_error, host_calls, gadget_calls, stops, syscore;
 static bool of_device_is_compatible(const char *node, const char *name) { return !strcmp(node,name); }
@@ -399,7 +410,7 @@ static void dwc3_apple_syscore(struct dwc3_apple *a, bool on) { (void)a; assert(
 int main(void)
 {
     struct device dev = { "apple,t8132-dwc3" };
-    struct dwc3_apple a = { .dev=&dev, .usb3_phy=&dev, .state=DWC3_APPLE_NO_CABLE };
+    struct dwc3_apple a = { .dev=&dev, .hw=&dwc3_apple_t8132_hw, .usb3_phy=&dev, .state=DWC3_APPLE_NO_CABLE };
     phy_error=-ETIMEDOUT;
     assert(dwc3_apple_init(&a,DWC3_APPLE_HOST)==-ETIMEDOUT);
     assert(!host_calls && !gadget_calls && stops==1 && a.state==DWC3_APPLE_NO_CABLE);
@@ -411,7 +422,7 @@ int main(void)
     assert(host_calls==1 && a.state==DWC3_APPLE_HOST && syscore==1);
     /* A T8132 host keeps its USB3 PHY out of P3. */
     assert(a.dwc.dis_u3_susphy_quirk);
-    dev.of_node="apple,t8103-dwc3"; phy_error=-ETIMEDOUT;
+    dev.of_node="apple,t8103-dwc3"; a.hw=&dwc3_apple_t8103_hw; phy_error=-ETIMEDOUT;
     assert(!dwc3_apple_init(&a,DWC3_APPLE_HOST) && host_calls==2 && syscore==2);
     assert(!a.dwc.dis_u3_susphy_quirk);
     puts("ok 7 - T8132 PHY failures stop before xHCI, older fallback preserved");
@@ -659,8 +670,9 @@ struct dwc3 {
     struct phy *usb3_generic_phy[1],*usb2_generic_phy[1];void *usb3_phy,*usb2_phy;
     const void *glue_ops;bool dis_u3_susphy_quirk;
 };
-struct dwc3_apple {
-    struct dwc3 dwc; struct device *dev; void *mmio_resource,*reset,*usb2_phy;
+''' + hw_defs(dwc) + r'''struct dwc3_apple {
+    struct dwc3 dwc; struct device *dev; const struct dwc3_apple_hw *hw;
+    void *mmio_resource,*reset,*usb2_phy;
     int lock,state; bool core_active,core_exit_pending,reset_pending,shutting_down,fixed_hub;
     unsigned usb2_power_off_pending,usb3_power_off_pending,hub_port;
     bool host_only,idle_rpm,rpm_held,dt_dis_u3_susphy,sleep_ddr,sleep_in_place;
@@ -734,7 +746,9 @@ static int dwc3_core_probe(struct dwc3_probe_data *d) {
         shutdown += r'''
 static void mutex_init(int *p) { *p=0; }
 static bool dwc3_apple_has_fixed_hub(struct device *d,unsigned *port) { (void)d;(void)port;return false; }
-static bool dwc3_apple_host_only(struct device *d) { (void)d;return false; }
+static bool dwc3_apple_host_only(const struct dwc3_apple_hw *hw) { (void)hw;return false; }
+static const void *of_device_get_match_data(struct device *d)
+{ return !strcmp(d->of_node,"apple,t8132-dwc3") ? &dwc3_apple_t8132_hw : &dwc3_apple_t8103_hw; }
 static bool device_property_read_bool(struct device *d,const char *name) { (void)d;(void)name;return false; }
 static void spin_lock_init(int *p) { *p=0; }
 static void device_enable_async_suspend(struct device *d) { (void)d; }
@@ -795,7 +809,7 @@ int main(void)
         atcphy_shutdown(&supplier);assert(!provider_stops && atc.t8132_common_owned);
     }
     /* Other controllers are quiesced (a6671210b88c), never torn down. */
-    init(&p,&a);p.dev.of_node="apple,t8103-dwc3";
+    init(&p,&a);p.dev.of_node="apple,t8103-dwc3";a.hw=&dwc3_apple_t8103_hw;
     dwc3_apple_shutdown(&p);assert(a.shutting_down && !count && !reset_calls);
     puts("ok 11 - consumer/provider shutdown ordering, probe-pending lifetime and retained failures");
     return 0;
