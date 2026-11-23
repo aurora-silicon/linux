@@ -671,9 +671,8 @@ impl gpuvm::DriverGpuVm for VmInner {
         ).map_err(|_| EOVERFLOW)? + 1;
         let _mutation = self.mapping_addition();
         let (map_addr, map_length) = (op.addr(), op.length() as usize);
-        let mut iova = op.addr();
         let mut left = op.length() as usize;
-        let mut offset = op.gem_offset() as usize;
+        let offset = op.gem_offset() as usize;
 
         let one_page = op.flags().contains(gpuvm::GpuVaFlag::REPEAT);
 
@@ -696,7 +695,7 @@ impl gpuvm::DriverGpuVm for VmInner {
         if is_sparse_tile(op.flags()) {
             // Kernel tile fill: the GEM only anchors the GPUVA.
             let result = if one_page {
-                self.map_sparse_tile(iova..iova + left as u64, ctx.prot)
+                self.map_sparse_tile(map_addr..map_addr + left as u64, ctx.prot)
             } else {
                 Err(EINVAL)
             };
@@ -710,53 +709,25 @@ impl gpuvm::DriverGpuVm for VmInner {
         // Never acquire the object reservation from inside the GPUVM map callback.
         let segments = op.vm_bo().data().segments.lock();
         let sgt = segments.as_ref().ok_or(EFAULT)?;
-        for &(dma_address, dma_len) in sgt.iter() {
-            let mut addr = dma_address as usize;
-            let mut len = dma_len as usize;
-
-            if left == 0 {
-                break;
-            }
-
-            if offset > 0 {
-                let skip = len.min(offset);
-                addr += skip;
-                len -= skip;
-                offset -= skip;
-            }
-            if len == 0 {
-                continue;
-            }
-
-            assert!(offset == 0);
-
-            if one_page {
-                len = left;
-            } else {
-                len = len.min(left);
-            }
-
+        if left > 0 {
             mod_dev_dbg!(
                 self.dev,
-                "MMU: map: {:#x}:{:#x} -> {:#x} [OP={}]\n",
-                addr,
-                len,
-                iova,
+                "MMU: map_segments: {:#x}+{:#x} [OP={}]\n",
+                map_addr,
+                left,
                 one_page
             );
-
-            if let Err(error) = self.page_table.map_pages(
-                iova..(iova + len as u64),
-                addr as PhysicalAddr,
+            if let Err(error) = self.page_table.map_segments(
+                map_addr..(map_addr + left as u64),
+                sgt.iter()
+                    .map(|&(dma_address, dma_len)| (dma_address as PhysicalAddr, dma_len as usize)),
+                offset,
                 ctx.prot,
                 one_page,
             ) {
                 self.rollback_failed_map(map_addr, map_length as u64);
                 return Err(error);
             }
-
-            left -= len;
-            iova += len as u64;
         }
 
         drop(segments);
@@ -1140,7 +1111,7 @@ impl VmInner {
 
     /// Install only into the empty range reserved by `map_node`.
     fn map_node_prepared(&mut self, node: &mm::Node<(), KernelMappingInner>, prot: Prot) -> Result {
-        let mut iova = node.start();
+        let iova = node.start();
         let segments = node
             .bo
             .as_ref()
@@ -1149,60 +1120,24 @@ impl VmInner {
             .data()
             .segments
             .lock();
-        let mut offset = node.offset;
-        let mut left = node.mapped_size;
 
         if let Some(segments) = &*segments {
-            for (dma_address, dma_len) in segments.iter() {
-                if left == 0 {
-                    break;
-                }
-
-                // TODO: proper DMA address/length handling
-                let mut addr = *dma_address as usize;
-                let mut len: usize = *dma_len as usize;
-
-                if (offset | addr | len | iova as usize) & UAT_PGMSK != 0 {
-                    dev_err!(
-                        self.dev.as_ref(),
-                        "MMU: KernelMapping {:#x}:{:#x} -> {:#x} is not page-aligned\n",
-                        addr,
-                        len,
-                        iova
-                    );
-                    return Err(EINVAL);
-                }
-
-                if offset > 0 {
-                    let skip = len.min(offset);
-                    addr += skip;
-                    len -= skip;
-                    offset -= skip;
-                }
-
-                len = len.min(left);
-
-                if len == 0 {
-                    continue;
-                }
-
+            if node.mapped_size > 0 {
                 mod_dev_dbg!(
                     self.dev,
-                    "MMU: map: {:#x}:{:#x} -> {:#x}\n",
-                    addr,
-                    len,
-                    iova
+                    "MMU: map_node_prepared: {:#x}+{:#x}\n",
+                    iova,
+                    node.mapped_size
                 );
-
-                self.page_table.map_pages(
-                    iova..(iova + len as u64),
-                    addr as PhysicalAddr,
+                self.page_table.map_segments(
+                    iova..(iova + node.mapped_size as u64),
+                    segments
+                        .iter()
+                        .map(|&(dma_address, dma_len)| (dma_address as PhysicalAddr, dma_len as usize)),
+                    node.offset,
                     prot,
                     false,
                 )?;
-
-                iova += len as u64;
-                left -= len;
             }
         }
 
