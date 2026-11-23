@@ -327,5 +327,195 @@ echo ok
         self.assertIn('ok', r.stdout)
 
 
+class RootConfiguration(unittest.TestCase):
+    """What root installs as update-m1n1's or m1n1's configuration is passed to it by the shell
+    that made it, and does not sit in a temporary file of the invoking user's on the way."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.bin = self.root / 'bin'
+        self.bin.mkdir()
+        self.log = self.root / 'log'
+        (self.bin / 'fakesudo').write_text(f'#!/bin/sh\necho "sudo $*" >>"{self.log}"\nexec "$@"\n')
+        # An install that finds its source changed since the shell wrote it: any file under the
+        # temporary directory that root is asked to install by name has other content by then.
+        (self.bin / 'install').write_text(
+            '#!/bin/bash\nfor a in "$@"; do\n'
+            f'  if [[ -f $a && $a == "{self.root}/tmp/"* ]]; then echo CHANGED=1 >"$a"; fi\n'
+            'done\nexec /usr/bin/install "$@"\n')
+        for f in self.bin.iterdir():
+            f.chmod(0o755)
+        (self.root / 'tmp').mkdir()
+        self.etc = self.root / 'etc'
+        self.etc.mkdir()
+        self.state = self.root / 'state'
+        self.state.mkdir()
+        self.conf = self.etc / 'update-m1n1'
+        self.m1n1 = self.etc / 'm1n1.conf'
+
+    def sh(self, body):
+        script = f"""
+set -euo pipefail
+AURORA_SEP_SOURCE_ONLY=1 source '{INSTALLER}'
+export TMPDIR='{self.root}/tmp'
+die() {{ echo "DIED: $*"; exit 9; }}
+umask 077
+sudo=fakesudo
+UPDATE_M1N1_CONF='{self.conf}' M1N1_CONF='{self.m1n1}' STATE='{self.state}'
+{body}
+"""
+        env = {**os.environ, 'PATH': f'{self.bin}:{os.environ["PATH"]}'}
+        r = subprocess.run(['bash', '-c', script], capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        # Nothing of the user's is left in the temporary directory, and none in /etc.
+        self.assertEqual(list((self.root / 'tmp').iterdir()), [])
+        self.assertEqual(sorted(p.name for p in self.etc.iterdir() if '.' in p.name and p.name != 'm1n1.conf'), [])
+        return r
+
+    def mode(self, path):
+        return stat.S_IMODE(path.stat().st_mode)
+
+    def test_no_user_temporary_file_is_installed_as_root(self):
+        text = INSTALLER.read_text()
+        self.assertEqual(re.findall(r'^[^#\n]*\$sudo install\b[^\n]*"\$tmp"[^\n]*', text, re.M), [])
+        for dest in ('"$UPDATE_M1N1_CONF"', '"$M1N1_CONF"', '"$conf"', '"$STATE/update-m1n1.default.saved"'):
+            self.assertIn(f'| root_put {dest}', text)
+
+    def test_freeze_and_unfreeze(self):
+        self.conf.write_text('KEEP=1\n\n')
+        self.sh('m3_freeze; echo "by=$M3_FROZEN_BY"')
+        text = self.conf.read_text()
+        self.assertTrue(text.startswith('KEEP=1\n\n# >>> aurora-sep: keep this M3'), text)
+        self.assertTrue(text.endswith('\nM1N1_UPDATE_DISABLED=1\n# <<< aurora-sep: keep this M3\'s boot.bin as it is\n'), text)
+        self.assertNotIn('CHANGED', text)
+        self.assertEqual(self.mode(self.conf), 0o644)
+        self.sh('m3_unfreeze')
+        self.assertEqual(self.conf.read_text(), 'KEEP=1\n\n')
+        self.assertEqual(self.mode(self.conf), 0o644)
+
+    def test_unfreeze_removes_a_file_that_held_only_the_freeze(self):
+        self.sh('m3_freeze')
+        self.assertIn('M1N1_UPDATE_DISABLED=1', self.conf.read_text())
+        self.sh('m3_unfreeze')
+        self.assertFalse(self.conf.exists())
+
+    def test_switches_write_and_remove(self):
+        self.m1n1.write_text('other=1\n')
+        stubs = 'is_m3_air() { false; }; is_m3_max() { false; }; m3_switches() { echo chosen.a=1 chosen.b=0; }\n'
+        self.sh(stubs + 'm3_switches_write')
+        lines = self.m1n1.read_text().splitlines()
+        self.assertEqual(lines[0], 'other=1')
+        self.assertEqual(lines[2:4], ['chosen.a=1', 'chosen.b=0'])
+        self.assertEqual(len(lines), 5)
+        self.assertEqual(self.mode(self.m1n1), 0o644)
+        self.sh(stubs + 'm3_switches_remove')
+        self.assertEqual(self.m1n1.read_text(), 'other=1\n')
+
+    def test_boot_state_snapshot_and_neo_block(self):
+        self.conf.write_text('M1N1=/x/m1n1.bin\n')
+        self.sh('m3_freeze; snapshot_boot_state || true')
+        self.assertEqual((self.state / 'update-m1n1.default.saved').read_text(), 'M1N1=/x/m1n1.bin\n')
+        self.assertEqual(self.mode(self.state / 'update-m1n1.default.saved'), 0o644)
+        self.sh('m3_unfreeze; neo_gpu_boot_config; neo_gpu_boot_config')
+        text = self.conf.read_text()
+        self.assertTrue(text.startswith('M1N1=/x/m1n1.bin\n# >>> aurora-sep: Neo stage2\n'), text)
+        self.assertEqual(text.count('# >>> aurora-sep: Neo stage2'), 1)
+        self.assertTrue(text.endswith('# <<< aurora-sep: Neo stage2\n'), text)
+        self.assertNotIn('CHANGED', text)
+
+    def test_a_failed_write_keeps_the_old_file(self):
+        self.conf.write_text('KEEP=1\n')
+        (self.bin / 'mv').write_text('#!/bin/sh\nexit 1\n')
+        (self.bin / 'mv').chmod(0o755)
+        script = f"""
+AURORA_SEP_SOURCE_ONLY=1 source '{INSTALLER}'
+sudo=''
+echo new | root_put '{self.conf}' && echo put-ok
+"""
+        env = {**os.environ, 'PATH': f'{self.bin}:{os.environ["PATH"]}'}
+        r = subprocess.run(['bash', '-c', script], capture_output=True, text=True, env=env)
+        self.assertNotIn('put-ok', r.stdout)
+        self.assertEqual(self.conf.read_text(), 'KEEP=1\n')
+        self.assertEqual([p.name for p in self.etc.iterdir()], ['update-m1n1'])
+
+
+class AdtReaderRootCopy(unittest.TestCase):
+    """The report's ADT reader: under sudo root runs its own copy, checked as root."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.bin = self.root / 'bin'
+        self.bin.mkdir()
+        (self.bin / 'fakesudo').write_text('#!/bin/sh\nexec "$@"\n')
+        (self.bin / 'fakesudo').chmod(0o755)
+        (self.root / 'tmp').mkdir()
+        self.work = self.root / 'work'
+        self.work.mkdir()
+        self.reader = self.work / 'aurora-adt-extract.py'
+        self.reader.write_bytes(b'print("reader")\n')
+
+    def sh(self, body, sudo='fakesudo', pin=None):
+        pin = sha(b'print("reader")\n') if pin is None else pin
+        script = f"""
+set -euo pipefail
+AURORA_SEP_SOURCE_ONLY=1 source '{INSTALLER}'
+export TMPDIR='{self.root}/tmp'
+umask 077
+sudo={sudo!r}
+M3_ADT_READER={('aurora-adt-extract.py ' + pin) if pin else ''!r}
+M3_WORK='{self.work}'
+{body}
+"""
+        env = {**os.environ, 'PATH': f'{self.bin}:{os.environ["PATH"]}'}
+        return subprocess.run(['bash', '-c', script], capture_output=True, text=True, env=env)
+
+    def test_root_runs_its_own_checked_copy(self):
+        r = self.sh(f"""
+m3_adt_reader_root '{self.reader}'
+echo "run=$M3_ADT_RUN"
+echo CHANGED >'{self.reader}'
+python3 -I "$M3_ADT_RUN"
+stat -c 'mode %a' "$M3_ADT_RUN"
+m3_adt_reader_root_done
+echo "root=[$M3_ADT_ROOT]"
+""")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        run = Path(re.search(r'^run=(.*)$', r.stdout, re.M).group(1))
+        self.assertEqual(run.name, 'aurora-adt-extract.py')
+        self.assertNotEqual(run.parent, self.work)
+        self.assertIn('\nreader\nmode 644\nroot=[]\n', r.stdout)
+        self.assertFalse(run.parent.exists())
+
+    def test_a_copy_that_differs_from_the_pinned_reader_is_refused(self):
+        r = self.sh(f"""
+echo 'print("other")' >'{self.reader}'
+if m3_adt_reader_root '{self.reader}'; then echo accepted; else echo "why=$M3_ADT_WHY"; fi
+m3_report_cleanup
+""")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn('accepted', r.stdout)
+        self.assertIn('why=aurora-adt-extract.py changed after its checksum was checked, so the ADT was not read', r.stdout)
+        self.assertEqual(list((self.root / 'tmp').iterdir()), [])
+
+    def test_without_sudo_the_reader_runs_where_it_is(self):
+        r = self.sh(f"m3_adt_reader_root '{self.reader}'; echo \"run=$M3_ADT_RUN root=[$M3_ADT_ROOT]\"", sudo='')
+        self.assertIn(f'run={self.reader} root=[]', r.stdout)
+
+    def test_the_report_runs_only_roots_copy(self):
+        text = INSTALLER.read_text()
+        for name in ('m3_report_adt', 'm3_report_stage2_log'):
+            body = text.split(f'\n{name}() {{', 1)[1].split('\n}\n', 1)[0]
+            runs = re.findall(r'\$sudo python3 -I "\$(\w+)"', body)
+            self.assertGreaterEqual(len(runs), 2, name)
+        adt = text.split('\nm3_report_adt() {', 1)[1].split('\n}\n', 1)[0]
+        self.assertEqual(set(re.findall(r'\$sudo python3 -I "\$(\w+)"', adt)), {'M3_ADT_RUN'})
+        self.assertIn('m3_report_stage2_log "$1" "$M3_ADT_RUN" "$log"', adt)
+        self.assertLess(adt.index('m3_adt_reader_root "$reader"'), adt.index('$sudo python3 -I'))
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -110,6 +110,10 @@ WORK_TO_ROOT = re.compile(r'sudo (mktemp -d|sh -c umask 022 && cat >"\$1" _ <tmp
 WORK_WRITE = re.compile(r'^sudo sh -c umask 022 && cat >"\$1" _ (<tmp>/(?:migrate-pro-session\.py|'
                         r'frozen-dependencies\.py|dependency-result\.json|dependency-files|aurora-m3-gpu-check))$')
 
+# root_put: what 12.2 installed from a temporary file is now passed to root's shell.
+ROOT_PUT = re.compile(r'^sudo sh -c umask 022 && mkdir -p "\$\(dirname "\$1"\)" && t=\$\(mktemp "\$1\.XXXXXX"\) && '
+                      r'\{ cat >"\$t" && chmod 0644 "\$t" && mv -f "\$t" "\$1" \|\| \{ rm -f "\$t"; exit 1; \}; \} _ (\S+)$')
+
 
 def package_check_log(tc, text):
     lines = text.splitlines()
@@ -125,6 +129,7 @@ def package_check_log(tc, text):
     for line in lines:
         if line in ('pacman -Qu --color never', 'pacman -Sy --noconfirm', 'sudo pacman -Sy --noconfirm'): continue
         line = WORK_WRITE.sub(r'sudo tee \1', line)
+        line = ROOT_PUT.sub(r'sudo install -m 644 <tmp> \1', line)
         # work_to_root: root's own checked copy of the downloads (not in 12.2).
         if WORK_TO_ROOT.match(line): continue
         # Root's Python runs isolated (-I) since 12.2.
