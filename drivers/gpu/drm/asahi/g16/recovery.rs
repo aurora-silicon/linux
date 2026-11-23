@@ -425,16 +425,30 @@ impl Firmware {
         let deadline = start.saturating_add(logic::RECOVERY_BUDGET_NS);
         let mut answered = false;
         let mut generation = 0;
+        let mut last_phase = 0;
         loop {
             if let Some(error) = self.transport_error() {
                 return Err(error);
             }
             let now = now_ns();
             if logic::expired(now, deadline) {
-                dev_err!(self.dev(), "M4 GPU recovery exceeded 1000 ms\n");
+                // Which side stalled, and whether tiling or fragment work was left behind.
+                let stage = self.recovery_snapshot().unwrap_or_default();
+                dev_err!(
+                    self.dev(),
+                    "M4 GPU recovery exceeded 1000 ms: {} (phase {}, TA {:#x}/{:#x}, FS {:#x}/{:#x}, {} flights)\n",
+                    logic::Stall::of(last_phase, answered).describe(),
+                    last_phase,
+                    stage[0],
+                    self.engine.ta_target,
+                    stage[1],
+                    self.engine.fs_target,
+                    self.engine.flights.len()
+                );
                 return Err(ETIMEDOUT);
             }
             let phase = self.firmware_r32(self.init.firmware_data().phase)?;
+            last_phase = phase;
             let current_generation = if phase == 1 || phase == 3 {
                 self.firmware_generation()?
             } else {

@@ -102,6 +102,36 @@ pub(crate) fn action(phase: u32, answered: bool, generation_matches: bool) -> Re
     }
 }
 
+/// Where a recovery that ran past [`RECOVERY_BUDGET_NS`] stopped, from the last phase the host
+/// read and whether the host had acknowledged phase 1 ([`action`]'s inputs).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Stall {
+    /// The firmware announced a recovery but never published phase 1.
+    NotHalted,
+    /// The firmware published phase 1 and the host had not acknowledged it.
+    NotAcknowledged,
+    /// The host acknowledged phase 1 and the firmware never published phase 3.
+    NotResumed,
+}
+
+impl Stall {
+    pub(crate) const fn of(phase: u32, answered: bool) -> Self {
+        match (phase, answered) {
+            (_, true) => Self::NotResumed,
+            (1, false) => Self::NotAcknowledged,
+            _ => Self::NotHalted,
+        }
+    }
+
+    pub(crate) const fn describe(self) -> &'static str {
+        match self {
+            Self::NotHalted => "firmware never halted in phase 1",
+            Self::NotAcknowledged => "phase 1 not acknowledged",
+            Self::NotResumed => "firmware never published phase 3",
+        }
+    }
+}
+
 /// One valid-prefix entry of the firmware's snapshot. Invalid entries terminate it.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SnapshotEntry {
@@ -247,6 +277,24 @@ mod tests {
             assert_eq!(action(phase, false, true), RecoveryAction::ProtocolError);
         }
         assert_eq!(action(3, true, false), RecoveryAction::ProtocolError);
+    }
+
+    #[test]
+    fn budget_overrun_names_the_phase_that_never_arrived() {
+        // dcp103b: a type-4 event and its statistics arrived, then 1000 ms passed. Which side
+        // stalled follows from the last phase read and whether the host had answered.
+        assert_eq!(Stall::of(0, false), Stall::NotHalted);
+        assert_eq!(Stall::of(1, false), Stall::NotAcknowledged);
+        assert_eq!(Stall::of(2, true), Stall::NotResumed);
+        for phase in [3, 4, u32::MAX] {
+            assert_eq!(Stall::of(phase, false), Stall::NotHalted);
+        }
+        let all = [Stall::NotHalted, Stall::NotAcknowledged, Stall::NotResumed];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a.describe(), b.describe());
+            }
+        }
     }
 
     #[test]
