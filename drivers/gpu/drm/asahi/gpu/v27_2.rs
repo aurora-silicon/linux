@@ -1082,6 +1082,10 @@ impl RootV27_2 {
             put32(control.as_mut_slice(), 0x4c24, 1);
             owners.push(flush, GFP_KERNEL)?;
         }
+        // The firmware window mirrors only the kernel page tables that exist when it is
+        // installed. Keep one allocation of the GPU read-write range alive from here, so the
+        // tables that later hold the parameter-buffer lists are already visible to the firmware.
+        owners.push(alloc.gpu.array_empty::<u8>(0x4000)?, GFP_KERNEL)?;
         let mut power = alloc.shared.array_empty::<u8>(0x6a0)?;
         {
             // Cold mirrors of the controller's power and temperature-loop values.
@@ -1284,6 +1288,9 @@ impl GpuManagerG14V13_5 {
     pub(crate) fn new_render_buffer(&self, ualloc: Arc<Mutex<alloc::DefaultAllocator>>,
         ualloc_priv: Arc<Mutex<alloc::DefaultAllocator>>) -> Result<buffer::BufferG14V13_5> {
         let mut alloc = self.alloc();
-        buffer::BufferG14V13_5::new(self, &mut alloc, ualloc, ualloc_priv, &self.buffer_mgr)
+        buffer::BufferG14V13_5::new(
+            self, &mut alloc, ualloc, ualloc_priv, &self.buffer_mgr,
+            buffer::ParameterListPlacement::KernelGpu,
+        )
     }
 }

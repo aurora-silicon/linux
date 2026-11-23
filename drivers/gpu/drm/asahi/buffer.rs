@@ -371,6 +371,13 @@ pub(crate) struct Buffer {
     inner: Arc<Mutex<BufferInner::ver>>,
 }
 
+/// Address space in which the parameter-buffer lists are visible to their consumers.
+pub(crate) enum ParameterListPlacement {
+    VmPrivate,
+    #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+    KernelGpu,
+}
+
 #[versions(AGX)]
 impl Buffer::ver {
     /// Create a new Buffer for a given VM, given the per-VM allocators.
@@ -380,6 +387,7 @@ impl Buffer::ver {
         ualloc: Arc<Mutex<alloc::DefaultAllocator>>,
         ualloc_priv: Arc<Mutex<alloc::DefaultAllocator>>,
         mgr: &BufferManager::ver,
+        list_placement: ParameterListPlacement,
     ) -> Result<Buffer::ver> {
         // These are the typical max numbers on macOS.
         // 8GB machines have this halved.
@@ -402,19 +410,33 @@ impl Buffer::ver {
         let preempt2_size = num_clusters_adj * gpu.get_cfg().preempt2_size;
         let preempt3_size = num_clusters_adj * gpu.get_cfg().preempt3_size;
 
+        let (page_list, block_list) = {
+            let mut vm_private;
+            let lists = match list_placement {
+                ParameterListPlacement::VmPrivate => {
+                    vm_private = ualloc_priv.lock();
+                    &mut *vm_private
+                }
+                // The lists live in the kernel half of the UAT so the firmware can rebuild them.
+                // The parameter manager writes them while the render engines run, so the GPU
+                // mapping must be writable: a read-only mapping leaves a stalled write fault
+                // that blocks the context flush after the render and every later completion.
+                #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+                ParameterListPlacement::KernelGpu => &mut alloc.gpu,
+            };
+            (
+                lists.array_empty_tagged(max_pages, b"PLST")?,
+                lists.array_empty_tagged(max_blocks * 2, b"BLST")?,
+            )
+        };
         let shared = &mut alloc.shared;
         let info = alloc.private.new_init(
-            {
-                let ualloc_priv = &ualloc_priv;
-                try_init!(buffer::Info::ver {
-                    block_ctl: shared.new_default::<buffer::BlockControl>()?,
-                    counter: shared.new_default::<buffer::Counter>()?,
-                    page_list: ualloc_priv.lock().array_empty_tagged(max_pages, b"PLST")?,
-                    block_list: ualloc_priv
-                        .lock()
-                        .array_empty_tagged(max_blocks * 2, b"BLST")?,
-                })
-            },
+            try_init!(buffer::Info::ver {
+                block_ctl: shared.new_default::<buffer::BlockControl>()?,
+                counter: shared.new_default::<buffer::Counter>()?,
+                page_list,
+                block_list,
+            }),
             |inner, _p| {
                 try_init!(buffer::raw::Info::ver {
                     gpu_counter: 0x0,
