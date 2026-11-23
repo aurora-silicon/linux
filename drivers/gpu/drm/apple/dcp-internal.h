@@ -186,8 +186,8 @@ struct dcp_channel {
 	bool command[DCP_MAX_CALL_DEPTH];
 	/*
 	 * Callback records are copied out of the shared buffer once, into
-	 * @cb_shadow at the same offset, and handled only from that copy: the
-	 * firmware can rewrite shared memory at any time. A callback's reply
+	 * separate slots in @cb_shadow at each depth. Firmware can rewrite
+	 * shared memory at any time. A callback's reply
 	 * is built in the copy and written back once, to @cb_reply (in the
 	 * shared record), when the callback is acked. NULL for command frames.
 	 */

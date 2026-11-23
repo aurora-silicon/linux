@@ -362,16 +362,8 @@ static u8 dcp_pop_depth(u8 *depth)
 	return --(*depth);
 }
 
-/*
- * Callback records arrive in a DCP_CB_AREA window of each receive channel.
- * Each callback channel keeps a private copy of its window, with the same
- * layout, so that records keep their offsets and nesting. The copy has
- * DCP_CB_AREA of slack after the window: a handler reads and writes its fixed
- * request and reply structures, which may be longer than the lengths the
- * record declares, and those accesses must stay inside the copy.
- */
+/* Each receive channel has a bounded wire window independent of its TX window. */
 #define DCP_CB_AREA 0x8000
-#define DCP_CB_SHADOW_SIZE (2 * DCP_CB_AREA)
 
 /*
  * Bytes after a record that are zeroed in the copy before its handler runs,
@@ -386,7 +378,7 @@ static_assert(sizeof(struct dcp_packet_header) +
 	      sizeof(struct dcp_dict_passthrough_req) <= DCP_CB_TAIL);
 static_assert(sizeof(struct dcp_packet_header) +
 	      sizeof(struct dcp_dict_passthrough_resp) <= DCP_CB_TAIL);
-static_assert(DCP_CB_TAIL <= DCP_CB_SHADOW_SIZE - DCP_CB_AREA);
+#define DCP_CB_SHADOW_SIZE (DCP_CB_AREA + DCP_CB_TAIL)
 
 static void dcp_cb_shadow_free(void *buf)
 {
@@ -403,14 +395,15 @@ static int dcp_cb_shadow_alloc(struct apple_dcp *dcp)
 
 	if (dcp->ch_cb.cb_shadow)
 		return 0;
-	buf = kvzalloc(ARRAY_SIZE(channels) * DCP_CB_SHADOW_SIZE, GFP_KERNEL);
+	buf = kvzalloc(ARRAY_SIZE(channels) * DCP_MAX_CALL_DEPTH * DCP_CB_SHADOW_SIZE,
+		       GFP_KERNEL);
 	if (!buf)
 		return -ENOMEM;
 	ret = devm_add_action_or_reset(dcp->dev, dcp_cb_shadow_free, buf);
 	if (ret)
 		return ret;
 	for (unsigned int i = 0; i < ARRAY_SIZE(channels); i++)
-		channels[i]->cb_shadow = buf + i * DCP_CB_SHADOW_SIZE;
+		channels[i]->cb_shadow = buf + i * DCP_MAX_CALL_DEPTH * DCP_CB_SHADOW_SIZE;
 	return 0;
 }
 
@@ -2208,22 +2201,17 @@ static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
 	u8 depth;
 	bool handled, zero_reply;
 
-	/*
-	 * The record must lie in the channel window before anything reads it,
-	 * above the frames still pending on this channel: copying it, and
-	 * zeroing its tail, must not touch an outer callback that is waiting
-	 * for its reply.
-	 */
+	/* Validate the wire range before reading the shared record. */
 	if (length < sizeof(*hdr) || !ch || !ch->cb_shadow ||
 	    ch->depth >= DCP_MAX_CALL_DEPTH ||
-	    offset < dcp_packet_start(ch, ch->depth) ||
 	    offset >= DCP_CB_AREA || length > DCP_CB_AREA - offset) {
 		dev_err(dev, "invalid IOMFB callback envelope\n");
 		dcp->crashed = true;
 		return;
 	}
 
-	record = ch->cb_shadow + offset;
+	/* Pending frames own disjoint private storage regardless of wire offsets. */
+	record = ch->cb_shadow + ch->depth * DCP_CB_SHADOW_SIZE;
 	memcpy(record, data, length);
 	memset(record + length, 0, DCP_CB_TAIL);
 	hdr = record;

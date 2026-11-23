@@ -2129,9 +2129,10 @@ struct dcp_packet_header { char tag[4]; u32 in_len, out_len; };
 struct dcp_channel { unsigned depth; void *output[8]; unsigned end[8]; u8 *cb_shadow; void *cb_reply[8]; u32 cb_reply_len[8]; bool command[8]; };
 #define DCP_CB_AREA 0x8000
 #define DCP_CB_TAIL 0x2000
+#define DCP_CB_SHADOW_SIZE (DCP_CB_AREA + DCP_CB_TAIL)
 /* The private callback copy: the window plus its slack. */
 static struct dcp_channel *dcp_shadowed(struct dcp_channel *ch)
-{ static u8 buf[2 * DCP_CB_AREA]; if (!ch->cb_shadow) ch->cb_shadow = buf; return ch; }
+{ static u8 buf[DCP_MAX_CALL_DEPTH * DCP_CB_SHADOW_SIZE]; if (!ch->cb_shadow) ch->cb_shadow = buf; return ch; }
 struct apple_dcp {
     struct { int iomfb_method_profile; } hw;
     struct device *dev;
@@ -2160,9 +2161,6 @@ static bool iomfb_uses_queue(struct apple_dcp *d) { (void)d; return false; }
 static bool test_and_set_bit(int t, unsigned long *b) { (void)t; (void)b; return false; }
 static void complete(int *p) { *p = 1; }
 static u8 dcp_push_depth(unsigned *d) { return (*d)++; }
-/* As in iomfb.c: a frame starts after the end of the one below it. */
-static u16 dcp_packet_start(struct dcp_channel *ch, u8 depth)
-{ return depth ? ch->end[depth - 1] : 0; }
 /* As dcp_ack(): pop the callback frame and write its reply back once. */
 static void dcp_ack(struct apple_dcp *d, enum dcp_context_id c)
 {

@@ -373,39 +373,25 @@ static void iomfb_command_depth_test(struct kunit *test)
 	}
 }
 
-/* A nested callback must start above the callback that waits for its reply. */
-static void iomfb_nested_callback_offset_test(struct kunit *test)
+static void iomfb_nested_callback_shadow_test(struct kunit *test)
 {
 	struct apple_dcp *dcp = test->priv;
 	struct dcp_packet_header *record;
-	u16 above;
-	u8 *reply;
+	void *outer_reply;
 
 	record = kunit_kzalloc(test, sizeof(*record) + 4, GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, record);
 	dcp->fw_compat = DCP_FIRMWARE_V_12_3;
 	iomfb_push_deferred_callback(test, dcp, record);
-	reply = dcp->ch_cb.output[0];
-	put_unaligned_le32(0x600dcafe, reply);
-	above = dcp_packet_start(&dcp->ch_cb, dcp->ch_cb.depth);
+	outer_reply = dcp->ch_cb.output[0];
+	put_unaligned_le32(123, outer_reply);
 
-	/* Over the pending frame: refused, and the pending reply is intact. */
+	/* Each frame has a distinct reply even when the wire offset is reused. */
 	dcpep_handle_cb(dcp, DCP_CONTEXT_CB, record, sizeof(*record) + 4, 0);
-	KUNIT_EXPECT_TRUE(test, dcp->crashed);
-	KUNIT_EXPECT_EQ(test, dcp->ch_cb.depth, 1);
-	KUNIT_EXPECT_EQ(test, get_unaligned_le32(reply), 0x600dcafeU);
-	dcp->crashed = false;
-	dcpep_handle_cb(dcp, DCP_CONTEXT_CB, record, sizeof(*record) + 4, above - 4);
-	KUNIT_EXPECT_TRUE(test, dcp->crashed);
-	KUNIT_EXPECT_EQ(test, dcp->ch_cb.depth, 1);
-	KUNIT_EXPECT_EQ(test, get_unaligned_le32(reply), 0x600dcafeU);
-
-	/* Right after it: accepted as the next frame. */
-	dcp->crashed = false;
-	dcpep_handle_cb(dcp, DCP_CONTEXT_CB, record, sizeof(*record) + 4, above);
-	KUNIT_EXPECT_FALSE(test, dcp->crashed);
-	KUNIT_EXPECT_EQ(test, dcp->ch_cb.depth, 2);
-	KUNIT_EXPECT_EQ(test, get_unaligned_le32(reply), 0x600dcafeU);
+	KUNIT_ASSERT_FALSE(test, dcp->crashed);
+	KUNIT_ASSERT_EQ(test, dcp->ch_cb.depth, 2);
+	KUNIT_EXPECT_PTR_NE(test, dcp->ch_cb.output[1], outer_reply);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(outer_reply), 123U);
 }
 
 /* Bytes past a record read as zero, not as what an earlier record left there. */
@@ -436,7 +422,7 @@ static struct kunit_case iomfb_parser_cases[] = {
 	KUNIT_CASE(iomfb_ack_status_test),
 	KUNIT_CASE(iomfb_command_depth_test),
 	KUNIT_CASE(iomfb_callback_tail_test),
-	KUNIT_CASE(iomfb_nested_callback_offset_test),
+	KUNIT_CASE(iomfb_nested_callback_shadow_test),
 	{}
 };
 
