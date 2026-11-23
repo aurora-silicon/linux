@@ -80,6 +80,8 @@ struct ComputeEntry {
 pub(super) struct ComputeCell {
     #[pin]
     queue: kernel::sync::Mutex<Option<KBox<compute::Queue>>>,
+    /// Lock-free mirror of the installed queue's QID (`u8::MAX` when empty).
+    qid: core::sync::atomic::AtomicU8,
 }
 
 impl ComputeCell {
@@ -87,9 +89,15 @@ impl ComputeCell {
         Arc::pin_init(
             pin_init!(Self {
                 queue <- kernel::new_mutex!(None, "g17::ComputeCell::queue"),
+                qid: core::sync::atomic::AtomicU8::new(u8::MAX),
             }),
             GFP_KERNEL,
         )
+    }
+
+    pub(super) fn qid(&self) -> Option<u8> {
+        let qid = self.qid.load(Ordering::Acquire);
+        (qid != u8::MAX).then_some(qid)
     }
 
     /// The installed queue, locked; None once the registry gave it up.
@@ -148,10 +156,18 @@ impl ComputeSlot {
     }
     /// Gives the queue up to the caller, which drops it outside the cell lock.
     fn take(&mut self) -> Option<KBox<compute::Queue>> {
-        self.0.queue.lock().take()
+        let mut guard = self.0.queue.lock();
+        let taken = guard.take();
+        self.0.qid.store(u8::MAX, Ordering::Release);
+        taken
     }
     fn put(&mut self, queue: Option<KBox<compute::Queue>>) {
-        let old = core::mem::replace(&mut *self.0.queue.lock(), queue);
+        let qid = queue.as_ref().map_or(u8::MAX, |queue| queue.qid());
+        let old = {
+            let mut guard = self.0.queue.lock();
+            self.0.qid.store(qid, Ordering::Release);
+            core::mem::replace(&mut *guard, queue)
+        };
         drop(old);
     }
 }
@@ -1534,6 +1550,7 @@ struct ComputeHost<'a> {
     regs: &'a crate::regs::G17Resources,
     port: &'a super::port::Port,
     outer: Option<super::port::OuterClaim<'a>>,
+    m5_outer: Option<kernel::sync::MutexGuard<'a, Option<(u32, u64, u64)>>>,
     /// M5: the shared compute ring's room check of this publication, by priority.
     outer_cursors: Option<(u8, [u32; 3])>,
     effort: &'a mut super::power::Effort,
@@ -1588,7 +1605,14 @@ impl compute::Host for ComputeHost<'_> {
         // Every M5 pipe-2 doorbell (0x83) is noted in the firmware's submission history first,
         // as the render doorbell notes its pair.
         if self.init.is_m5() && message >> super::MSG_TYPE_SHIFT == 0x83 && message & 3 == 2 {
-            if let Err(error) = self.init.note_m5_submission_history(1) {
+            if let Some(guard) = self.m5_outer.as_mut() {
+                if let Err(error) = self.port.note_m5_submission_history_locked(guard, 1) {
+                    pr_warn!("asahi: M5 submission history skipped: {:?}\n", error);
+                }
+                // Drop `m5_outer` before ringing the mailbox doorbell so competing M5 submitters
+                // do not wait behind mailbox I/O.
+                self.m5_outer = None;
+            } else if let Err(error) = self.init.note_m5_submission_history(1) {
                 pr_warn!("asahi: M5 submission history skipped: {:?}\n", error);
             }
         }
@@ -1719,6 +1743,7 @@ impl super::Firmware {
         // the source's kick, and the firmware orders it. So is a G17P source of the consumer's
         // own execution context: one context needs no write-back between the two kicks.
         let m5 = self.init.is_m5();
+        let consumer_qid = self.queues.compute(owner).map(|queue| queue.qid());
         let mut waited: u128 = 0;
         for source in &sources.sources {
             if source.submission.source_status()? { continue; }
@@ -1732,6 +1757,13 @@ impl super::Firmware {
             let Some((sequence, dependency, stamp_va, event_slot, hold, same_execution)) = found else {
                 return Err(EAGAIN);
             };
+            if m5 && consumer_qid == Some(dependency.qid()) {
+                // Same physical QID in this epoch: the queue's implicit parent already strictly
+                // orders earlier kicks on this QID; drop the self-reader hold and skip adding a
+                // duplicate explicit barrier.
+                drop(hold);
+                continue;
+            }
             waited |= 1u128 << dependency.qid();
             if m5 || same_execution {
                 merged.insert(sequence, dependency)?;
@@ -1798,7 +1830,7 @@ impl super::Firmware {
         // reservation; dropping it unused returns the work-ring slot. M5 compute
         // serializes the shared outer ring and host-port updates under `m5_outer`
         // (after the compute cell lock, matching direct M5 publishers).
-        let _m5_outer = self.init.is_m5().then(|| self.port.m5_outer_lock());
+        let m5_outer = self.init.is_m5().then(|| self.port.m5_outer_lock());
         let mut outer_cursors = None;
         let outer = if self.init.is_m5() {
             let priority = packet.context.policy().priority();
@@ -1816,6 +1848,7 @@ impl super::Firmware {
             regs: &self.bridge.regs,
             port: &self.port,
             outer,
+            m5_outer,
             outer_cursors,
             effort: &mut self.effort,
             qids: &mut queues.qids,
@@ -2157,17 +2190,76 @@ impl Backend {
         }
     }
 
+    /// Resolves same-VM cross-QID M5 compute sources lock-free from each producer's
+    /// `PublishedSource` snapshot under a live preparation lease. Sources already published on
+    /// `target_qid` in `generation` are ordered by this queue's implicit parent, so they skip the
+    /// duplicate explicit barrier, `Hold`, and `firmware_consumer` mark while still checking
+    /// `source_status()` (error propagation) and epoch validity. Any unpublished, errored,
+    /// cancelled, or epoch-mismatched source returns `None` so the device-mutex path handles it.
+    fn resolve_direct_sources(
+        &self,
+        port: &super::port::Port,
+        generation: u64,
+        target_qid: u8,
+        sources: &super::sync_input::Sources,
+    ) -> Option<(super::dependency::Frontier, KVec<super::sync_input::Hold>, u64)> {
+        sources.check().ok()?;
+        let mut frontier = super::dependency::Frontier::new();
+        let mut holds = KVec::new();
+        let mut cross_qid_mask = 0u64;
+        for (idx, source) in sources.sources.iter().enumerate() {
+            if source.submission.source_status().ok()? {
+                continue;
+            }
+            let published = source.submission.published_source(generation)?;
+            if published.dependency.qid() == target_qid {
+                if port.recovery_state().ok()? != 0 || port.generation() != generation {
+                    return None;
+                }
+                if source.submission.source_status().ok()? {
+                    continue;
+                }
+                if !source.submission.has_published_epoch(generation) {
+                    return None;
+                }
+                continue;
+            }
+            let hold = super::sync_input::Hold::new(&published.readers).ok()?;
+            // Re-validate after taking the binding loan so the producer cannot have retired,
+            // faulted, cancelled, or crossed an epoch before `readers` became non-zero.
+            if port.recovery_state().ok()? != 0 || port.generation() != generation {
+                return None;
+            }
+            if source.submission.source_status().ok()? {
+                continue;
+            }
+            if !source.submission.has_published_epoch(generation) {
+                return None;
+            }
+            frontier
+                .insert(published.published, published.dependency)
+                .ok()?;
+            holds.push(hold, GFP_KERNEL).ok()?;
+            cross_qid_mask |= 1u64 << idx;
+        }
+        Some((frontier, holds, cross_qid_mask))
+    }
+
     /// Steady-state publication into this owner's bound channel without the device mutex: only
     /// the channel's own lock and the port's small locks are taken, and nothing device-wide is
-    /// scanned. None leaves the packet untouched for the device-mutex path, which owns binding,
-    /// first installation, input sources, render prefixes, replay and recovery.
+    /// scanned. On M5, same-VM cross-QID compute sources whose producers have published their kick
+    /// metadata also resolve directly without the device mutex. None leaves the packet untouched
+    /// for the device-mutex path, which owns binding, first installation, non-M5 native-wait
+    /// sources, render prefixes, replay and recovery.
     fn compute_direct(
         &self,
         packet: &Arc<super::job::Packet>,
         required: super::freelist::ComputeCapacity,
         deferred: &mut DeferredBatch,
     ) -> Option<Result> {
-        if packet.completion.sources().is_some()
+        let m5 = self.context.is_m5();
+        let has_sources = packet.completion.sources().is_some();
+        if (has_sources && !m5)
             || self.context.render_seen()
             || packet.cancel_requested()
             || packet.completion.status().get() != 0
@@ -2176,11 +2268,19 @@ impl Backend {
             return None;
         }
         let cell = self.direct.lock().clone()?;
+        let target_qid = cell.qid()?;
         let lease = self.shared.preparations.try_enter().ok()?;
         let port = self.shared.port(&lease)?;
         if self.shared.crashed.load(Ordering::Acquire) || port.recovery_state().ok()? != 0 {
             return None;
         }
+        let generation = port.generation();
+        let (direct_frontier, direct_holds, cross_qid_mask) =
+            if let Some(sources) = packet.completion.sources() {
+                self.resolve_direct_sources(port, generation, target_qid, sources)?
+            } else {
+                (super::dependency::Frontier::new(), KVec::new(), 0)
+            };
         // Full effort is applied by the device-mutex path when it is not already.
         if !port.note_submission() {
             return None;
@@ -2192,7 +2292,6 @@ impl Backend {
             Err(error) if error == EBUSY => return None,
             Err(error) => return Some(Err(error)),
         }
-        let m5 = self.context.is_m5();
         let priority = packet.context.policy().priority();
         // Reuse the M5 outer claim already reserved during prepare_compute() when present and
         // matching priority, avoiding a redundant Port::m5_outer lock trip and unused-claim drop
@@ -2221,6 +2320,7 @@ impl Backend {
                 || queue.spared_pending()
                 || !queue.pool_fits(required)
                 || queue.pending_switch_from().is_some()
+                || queue.qid() != target_qid
                 || !matches!(queue.matches(self.owner, queue.qid(), &self.context), Ok(true))
                 || !lease.is_current()
             {
@@ -2237,10 +2337,33 @@ impl Backend {
                 m5_outer: m5_outer.as_mut(),
                 m5_outer_guard: None,
                 m5,
-                generation: port.generation(),
+                generation,
             };
-            Some(queue.publish(packet.clone(), &[], &mut host, &mut |event| deferred.push(event)))
+            Some(queue.publish(
+                packet.clone(),
+                direct_frontier.as_slice(),
+                &mut host,
+                &mut |event| deferred.push(event),
+            ))
         })();
+        if packet.is_published() {
+            if let Some(sources) = packet.completion.sources() {
+                if cross_qid_mask != 0 {
+                    for (idx, source) in sources.sources.iter().enumerate() {
+                        if cross_qid_mask & (1u64 << idx) != 0 {
+                            source.submission.note_firmware_consumer();
+                        }
+                    }
+                    sources.set_holds(direct_holds);
+                } else {
+                    drop(direct_holds);
+                }
+                super::sync_input::note_published();
+                super::sync_input::note_native(0);
+            }
+        } else {
+            drop(direct_holds);
+        }
         let outcome = match result {
             None => None,
             Some(Err(error)) if (error == EAGAIN || error == EBUSY) && !packet.is_published() => {
@@ -2399,8 +2522,17 @@ impl Backend {
             Err(_) => return Readiness::Ready,
             Ok(_) => {}
         }
+        let sources_checked = if packet.completion.sources().is_some() {
+            match self.sources_published(packet) {
+                Ok(false) => return Readiness::Progress,
+                Err(_) => return Readiness::Ready,
+                Ok(true) => true,
+            }
+        } else {
+            false
+        };
         // The steady state: this owner's channel is bound and installed.
-        if packet.completion.sources().is_none() {
+        if !sources_checked || self.context.is_m5() {
             if let Some(cell) = self.direct.lock().clone() {
                 let bound = cell.lock().and_then(|mut queue| {
                     let bound = queue.installed()
@@ -2426,10 +2558,12 @@ impl Backend {
                 }
             }
         }
-        match self.sources_published(packet) {
-            Ok(false) => return Readiness::Progress,
-            Err(_) => return Readiness::Ready,
-            Ok(true) => {}
+        if !sources_checked {
+            match self.sources_published(packet) {
+                Ok(false) => return Readiness::Progress,
+                Err(_) => return Readiness::Ready,
+                Ok(true) => {}
+            }
         }
         let lease = match self.shared.preparations.try_enter() {
             Ok(lease) => lease,
@@ -2602,6 +2736,28 @@ impl Backend {
     fn sources_published(&self, packet: &super::job::Packet) -> Result<bool> {
         let Some(sources) = packet.completion.sources() else { return Ok(true); };
         sources.check()?;
+        if let Ok(lease) = self.shared.preparations.try_enter() {
+            if let Some(port) = self.shared.port(&lease) {
+                if !self.shared.crashed.load(Ordering::Acquire)
+                    && port.recovery_state().ok() == Some(0)
+                {
+                    let generation = port.generation();
+                    let mut all_fast = true;
+                    for source in &sources.sources {
+                        if source.submission.source_status()? {
+                            continue;
+                        }
+                        if !source.submission.has_published_epoch(generation) {
+                            all_fast = false;
+                            break;
+                        }
+                    }
+                    if all_fast {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
         let state = self.shared.state.lock();
         let firmware = state.as_deref().ok_or(ENODEV)?;
         if firmware.recovery.pending()

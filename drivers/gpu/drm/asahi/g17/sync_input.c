@@ -10,10 +10,31 @@ static int collect_leaf(struct dma_fence *leaf,
 			struct asahi_g17_fence_leaf *out, size_t capacity,
 			size_t *count)
 {
+	int status = dma_fence_get_status(leaf);
+
+	/*
+	 * Coalesce healthy unsignaled leaves sharing a fence context (such as
+	 * multiple points of one timeline chain), keeping only the latest seqno.
+	 * Failed leaves (status < 0) are never coalesced so errors are preserved.
+	 */
+	if (status == 0 && leaf->context != 0) {
+		size_t i;
+
+		for (i = 0; i < *count; ++i) {
+			if (out[i].status != 0 ||
+			    out[i].fence->context != leaf->context)
+				continue;
+			if (dma_fence_is_later(leaf, out[i].fence)) {
+				dma_fence_put(out[i].fence);
+				out[i].fence = dma_fence_get(leaf);
+			}
+			return 0;
+		}
+	}
 	if (*count == capacity)
 		return -ENOSPC;
 	out[*count].fence = dma_fence_get(leaf);
-	out[*count].status = dma_fence_get_status(leaf);
+	out[*count].status = status;
 	++*count;
 	return 0;
 }

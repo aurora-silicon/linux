@@ -76,7 +76,7 @@ pub(super) struct Source {
 /// processor stop until the last consumer releases its binding loan.
 pub(super) struct Hold(Arc<AtomicU32>);
 impl Hold {
-    fn new(readers: &Arc<AtomicU32>) -> Result<Self> {
+    pub(super) fn new(readers: &Arc<AtomicU32>) -> Result<Self> {
         readers.fetch_update(Ordering::AcqRel, Ordering::Acquire,
             |count| count.checked_add(1)).map_err(|_| EOVERFLOW)?;
         Ok(Self(readers.clone()))
@@ -86,9 +86,8 @@ impl Drop for Hold {
     fn drop(&mut self) { self.0.fetch_sub(1, Ordering::AcqRel); }
 }
 
-/// A new owner starts with no loans. Acquiring a loan requires exclusive access
-/// and arms the hint; eligibility queries stay read-only. A validated owner
-/// transition can clear the hint after all independent loans have been released.
+/// Checks a physical queue's independent source-reader counter directly so lock-free
+/// direct-path loans (`Hold::new`) are always observed by ownership, rearm, and share checks.
 #[repr(transparent)]
 pub(super) struct ReaderHint {
     possible: bool,
@@ -103,7 +102,7 @@ impl ReaderHint {
         Ok(hold)
     }
     pub(super) fn has_readers(&self, count: &AtomicU32) -> bool {
-        self.possible && count.load(Ordering::Acquire) != 0
+        count.load(Ordering::Acquire) != 0
     }
     pub(super) fn reset_for_owner(&mut self, count: &AtomicU32) -> Result {
         if self.has_readers(count) { return Err(EBUSY); }

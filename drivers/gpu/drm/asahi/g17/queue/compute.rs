@@ -3137,6 +3137,23 @@ impl Queue {
                     first || notify_activation)?)?;
             }
             host.notify((0x83 << 48) | 0x02 | u64::from(policy.priority()) << 2)?;
+            if !packet.cancel_requested() {
+                if let Some(dependency) =
+                    crate::g17::fw::kick::KickDependency::new(qid, kick_timestamp)
+                {
+                    packet.completion.note_source_published(
+                        crate::g17::fence::PublishedSource {
+                            epoch,
+                            published,
+                            dependency,
+                            readers: self.source_readers.clone(),
+                        },
+                    );
+                    if packet.cancel_requested() {
+                        packet.completion.clear_source_published();
+                    }
+                }
+            }
             crate::g17::trace::publish(crate::g17::trace::COMPUTE, qid, ordinal, &packet);
             host.note_submission()
         })();

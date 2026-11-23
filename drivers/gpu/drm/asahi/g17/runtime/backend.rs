@@ -144,6 +144,15 @@ impl job::Backend for Backend {
         let mut heads = KVec::new();
         let mut sources: KVec<sync_input::Source> = KVec::new();
         let mut publication_waits = KVec::new();
+        let mut unchecked: KVec<usize> = KVec::new();
+        let lease = self.shared.preparations.try_enter().ok();
+        let port_epoch = lease.as_ref().and_then(|lease| {
+            let port = self.shared.port(lease)?;
+            if self.shared.crashed.load(Ordering::Acquire) || port.recovery_state().ok()? != 0 {
+                return None;
+            }
+            Some(port.generation())
+        });
         for input in inputs.iter().filter_map(|input| input.fence.as_ref()) {
             let status = job::fence_status(input);
             if status > 0 { continue; }
@@ -160,29 +169,52 @@ impl job::Backend for Backend {
                     continue;
                 }
                 if sources.len() == crate::g17::fw::kick::KICK_BARRIERS_MAX { return None; }
-                let published = {
-                    let state = self.shared.state.lock();
-                    let firmware = state.as_deref()?;
-                    if self.shared.crashed.load(Ordering::Acquire) || firmware.recovery.pending()
-                        || crate::g17::recovery::Memory::recovery_state(&firmware.init).ok()? != 0
-                    { return None; }
-                    firmware.queues.compute.iter().flatten()
-                        .filter_map(|entry| entry.queue.as_deref())
-                        .any(|queue| queue.has_input_source(&submission, self.context.status(),
-                            firmware.recovery.generation()))
-                };
+                let published_fast =
+                    port_epoch.is_some_and(|epoch| submission.has_published_epoch(epoch));
+                let idx = sources.len();
+                sources.push(sync_input::Source { submission }, GFP_KERNEL).ok()?;
+                if !published_fast {
+                    unchecked.push(idx, GFP_KERNEL).ok()?;
+                }
+            }
+            heads.push(input.clone(), GFP_KERNEL).ok()?;
+        }
+        drop(lease);
+        if sources.is_empty() { return None; }
+        if !unchecked.is_empty() {
+            // Hoist the device mutex outside the leaf loop when any source was not already
+            // confirmed via the lock-free `PublishedSource` snapshot.
+            let state = self.shared.state.lock();
+            let firmware = state.as_deref()?;
+            if self.shared.crashed.load(Ordering::Acquire)
+                || firmware.recovery.pending()
+                || crate::g17::recovery::Memory::recovery_state(&firmware.init).ok()? != 0
+            {
+                return None;
+            }
+            let generation = firmware.recovery.generation();
+            for idx in unchecked {
+                let submission = &sources[idx].submission;
+                let published = firmware
+                    .queues
+                    .compute
+                    .iter()
+                    .flatten()
+                    .filter_map(|entry| entry.queue.as_deref())
+                    .any(|queue| {
+                        queue.has_input_source(submission, self.context.status(), generation)
+                    });
                 if !published {
-                    if submission.source_status().ok()? { continue; }
+                    if submission.source_status().ok()? {
+                        continue;
+                    }
                     // The existing scheduler fence becomes ready after actual
                     // publication, not GPU completion. No binding loan or
                     // consumer hardware capacity is acquired while waiting.
                     publication_waits.push(submission.ready()?, GFP_KERNEL).ok()?;
                 }
-                sources.push(sync_input::Source { submission }, GFP_KERNEL).ok()?;
             }
-            heads.push(input.clone(), GFP_KERNEL).ok()?;
         }
-        if sources.is_empty() { return None; }
         sync_input::Sources::new(heads, sources, publication_waits).ok()
     }
 
