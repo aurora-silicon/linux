@@ -21,6 +21,7 @@ struct pf_test {
 	u32 *votes;
 	bool cpus_min;
 	bool published;
+	unsigned int saved_idle_pstate;
 };
 
 static const struct regmap_config pf_vote_regmap_config = {
@@ -44,10 +45,19 @@ static int pf_test_init(struct kunit *test)
 	struct pf_test *f;
 	unsigned int i;
 
+	/*
+	 * The cases drive the driver's single instance and its parameter.
+	 * Where the driver runs on real hardware they would take both over.
+	 */
+	if (smp_load_acquire(&apple_pmgr_misc_inst))
+		kunit_skip(test, "apple-pmgr-misc is bound on this system");
+
 	f = kunit_kzalloc(test, sizeof(*f), GFP_KERNEL);
 	if (!f)
 		return -ENOMEM;
 	misc = &f->misc;
+	f->saved_idle_pstate = READ_ONCE(idle_fabric_pstate);
+	WRITE_ONCE(idle_fabric_pstate, 0);
 	f->fabric = kunit_kzalloc(test, sizeof(u32), GFP_KERNEL);
 	f->dcs = kunit_kzalloc(test, sizeof(u32), GFP_KERNEL);
 	f->votes = kunit_kzalloc(test, 8 * sizeof(u32), GFP_KERNEL);
@@ -95,7 +105,7 @@ static void pf_test_exit(struct kunit *test)
 		return;
 	cancel_delayed_work_sync(&f->misc.idle_work);
 	cancel_delayed_work_sync(&f->misc.idle_work_prompt);
-	WRITE_ONCE(idle_fabric_pstate, 0);
+	WRITE_ONCE(idle_fabric_pstate, f->saved_idle_pstate);
 	if (f->published) {
 		/* Pairs with the acquire in the driver's readers. */
 		smp_store_release(&apple_pmgr_misc_inst, NULL);
@@ -468,6 +478,39 @@ static void pf_match_data_test(struct kunit *test)
  * never freed; each case adds and removes its own power-state children.
  */
 static struct device_node *pf_dt_pmgr;
+
+/*
+ * The driver looks its voters and the PMP up in the whole tree. Nodes of
+ * the system's own devicetree would join the fixture's, so the devicetree
+ * cases only run where the fixture's are the only ones.
+ */
+static bool pf_dt_foreign(const char *compatible)
+{
+	struct device_node *np, *box = pf_dt_pmgr ? pf_dt_pmgr->parent : NULL;
+
+	for_each_compatible_node(np, NULL, compatible) {
+		struct device_node *p;
+		bool ours = false;
+
+		for (p = np->parent; p && box; p = p->parent)
+			if (p == box) {
+				ours = true;
+				break;
+			}
+		if (!ours) {
+			of_node_put(np);
+			return true;
+		}
+	}
+	return false;
+}
+
+static void pf_dt_require_fixture_only(struct kunit *test)
+{
+	if (pf_dt_foreign("apple,pmgr-pwrstate") ||
+	    pf_dt_foreign("apple,t6000-pmp-v2"))
+		kunit_skip(test, "the system devicetree describes PMGR or PMP nodes");
+}
 static u32 pf_dt_regs[0x50];
 
 static const struct regmap_config pf_dt_regmap_config = {
@@ -543,6 +586,8 @@ static void pf_dt_voters_test(struct kunit *test)
 	struct apple_pmgr_misc *misc = &f->misc;
 	struct regmap *map = syscon_node_to_regmap(pf_dt_pmgr);
 
+	pf_dt_require_fixture_only(test);
+
 	KUNIT_ASSERT_FALSE(test, IS_ERR(map));
 	KUNIT_EXPECT_TRUE(test, pf_dt_find(test, misc, c, ARRAY_SIZE(c)));
 	/* Matched by label, in the order of apple_pmgr_fabric_voters. */
@@ -571,6 +616,8 @@ static void pf_dt_voters_missing_test(struct kunit *test)
 	};
 	struct pf_test *f = test->priv;
 	struct apple_pmgr_misc *misc = &f->misc;
+
+	pf_dt_require_fixture_only(test);
 
 	/* Desktop without ISP: the governor must never lower. */
 	KUNIT_EXPECT_FALSE(test, pf_dt_find(test, misc, c, 2));
@@ -609,6 +656,8 @@ static void pf_dt_voters_duplicate_test(struct kunit *test)
 	struct pf_test *f = test->priv;
 	struct apple_pmgr_misc *misc = &f->misc;
 
+	pf_dt_require_fixture_only(test);
+
 	/* A second gfx node must not stand in for the missing isp_sys. */
 	KUNIT_EXPECT_FALSE(test, pf_dt_find(test, misc, c, ARRAY_SIZE(c)));
 	KUNIT_EXPECT_NOT_NULL(test, misc->votes[0].regmap);
@@ -623,6 +672,8 @@ static void pf_dt_pmp_unbound_test(struct kunit *test)
 	struct pf_test *f = test->priv;
 	struct apple_pmgr_misc *misc = &f->misc;
 	struct of_changeset cs;
+
+	pf_dt_require_fixture_only(test);
 
 	/* PMP described but no driver bound: sleep takes the path without it. */
 	misc->pmp_owned = true;
