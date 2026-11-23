@@ -119,6 +119,8 @@ fn encode_compute(
     put64(cmd, 0x334, timestamps + 0x20);
 
     put32(stream, 0, 11);
+    // 13.5 StartCompute.unk_28, at the same place in this layout (the 13.5 G14 path writes 1).
+    put32(stream, 0x28, 1);
     put64(stream, 0x160, job.sequence);
     put64(stream, 0x04, cmd_va + 0x18);
     put64(stream, 0x0c, cmd_va + 0x68);
