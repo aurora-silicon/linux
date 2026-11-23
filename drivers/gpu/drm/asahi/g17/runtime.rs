@@ -2131,6 +2131,9 @@ impl Backend {
 
     /// M5: the domain outer-ring claims wait on. None off M5 or without firmware.
     fn outer_domain(&self) -> Option<Arc<super::availability::Availability>> {
+        if !self.context.is_m5() {
+            return None;
+        }
         self.shared.state.lock().as_deref().and_then(|firmware| firmware.init.outer_available().ok())
     }
 
@@ -2173,6 +2176,9 @@ impl Backend {
         dependencies: &[super::fw::kick::KickDependency],
         deferred: &mut DeferredBatch,
     ) -> Result {
+        if !firmware.init.is_m5() {
+            return firmware.publish_compute(self.owner, packet.clone(), dependencies, deferred);
+        }
         let mut held = self.outer_compute.lock();
         let _scope = (*held)
             .as_mut()
@@ -2185,6 +2191,9 @@ impl Backend {
     /// Returns an engine's unspent outer claim after its publication, cancellation or close.
     /// Outside the device mutex: returned credits notify waiters.
     pub(super) fn release_outer(&self, engine: crate::g17::job::Engine) {
+        if !self.context.is_m5() {
+            return;
+        }
         let held = match engine {
             crate::g17::job::Engine::Compute => &self.outer_compute,
             crate::g17::job::Engine::Render => &self.outer_render,
