@@ -1401,6 +1401,18 @@ impl RenderState {
 }
 
 impl Registry {
+    /// The kick-ring views of one parked pair whose VM's client has closed it
+    /// (`ParkedPair::take_closed_views`), for the caller to drop off the device lock; `None`
+    /// once no parked pair holds any.
+    pub(in crate::g17) fn take_closed_parked_views(
+        &mut self,
+    ) -> Option<[Option<crate::mmu::KernelMapping>; 2]> {
+        self.render.entries.iter_mut().flatten().find_map(|entry| {
+            let views = entry.parked.as_mut()?.take_closed_views();
+            views.iter().any(Option::is_some).then_some(views)
+        })
+    }
+
     /// Give idle private backing to another ready client under capacity pressure.
     /// Keep graph/QID/context ownership; the next use rearms the same pool after
     /// its consumed release, exactly as eviction-driven reclaim does.
