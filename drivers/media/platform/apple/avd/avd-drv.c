@@ -590,8 +590,35 @@ static const struct avd_variant avd_t8142_variant = {
 	.quirks = AVD_QUIRK_HEVC_V5_HEADER | AVD_QUIRK_H264_MV_128,
 };
 
+static const struct avd_variant avd_t8152_variant = {
+	.vp_slots = {
+		[AVD_CODEC_HEVC] = 2,
+		[AVD_CODEC_H264] = 1,
+		[AVD_CODEC_VP9] = 1,
+		[AVD_CODEC_AV1] = 1,
+	},
+	.vp_slot_base = {
+		[AVD_CODEC_HEVC] = 0,
+		[AVD_CODEC_H264] = 4,
+		[AVD_CODEC_VP9] = 8,
+		[AVD_CODEC_AV1] = 9,
+	},
+	.fifo_slots = 7,
+	.configure_stream = t8122_configure_stream,
+	.capabilities = AVD_CAPABILITY_H264 | AVD_CAPABILITY_HEVC |
+			AVD_CAPABILITY_VP9 | AVD_CAPABILITY_AV1,
+	.revision = 4,
+	.vp_slot_offset = 0xc,
+	.submit_offset = 0x40,
+	.submit_queue_max_offset = 0x44,
+	.submit_queue_status_offset = 0x7c,
+	.quirks = AVD_QUIRK_HEVC_V5_HEADER | AVD_QUIRK_H264_MV_128 |
+		  AVD_QUIRK_NO_RECOVERY_RESET | AVD_QUIRK_KOPSIA,
+};
+
 /* can also be derived from a version register */
 static const struct of_device_id avd_of_match[] = {
+	{ .compatible = "apple,t8152-avd", .data = &avd_t8152_variant },
 	{
 		.compatible = "apple,t8103-avd",
 		.data = &avd_t8103_variant
@@ -667,7 +694,8 @@ static int avd_probe(struct platform_device *pdev)
 	match = of_match_node(avd_of_match, pdev->dev.of_node);
 	avd->variant = match->data;
 
-	avd->rstc = devm_reset_control_get_exclusive(avd->dev, NULL);
+	avd->rstc = avd->variant->quirks & AVD_QUIRK_KOPSIA ? NULL :
+		devm_reset_control_get_exclusive(avd->dev, NULL);
 	if (IS_ERR(avd->rstc))
 		return PTR_ERR(avd->rstc);
 
@@ -705,13 +733,6 @@ static int avd_probe(struct platform_device *pdev)
 		return ret;
 
 	avd->domain = iommu_get_domain_for_dev(avd->dev);
-	if (avd->domain) {
-		avd->empty_domain = iommu_paging_domain_alloc(avd->dev);
-		if (IS_ERR(avd->empty_domain)) {
-			avd->empty_domain = NULL;
-			dev_warn(avd->dev, "cannot alloc new empty domain");
-		}
-	}
 
 	ret = avd_backend_select(avd);
 	if (ret)
@@ -729,16 +750,19 @@ static int avd_probe(struct platform_device *pdev)
 		return ret;
 	}
 
-	irq = platform_get_irq(pdev, 1);
-	if (irq < 0)
-		return irq;
-	avd->pm.irq = irq;
-	ret = devm_request_threaded_irq(&pdev->dev, irq, NULL,
-			avd_irq_handler, IRQF_ONESHOT | IRQF_NO_AUTOEN,
-			dev_name(&pdev->dev), avd);
-	if (ret) {
-		dev_err(avd->dev, "Could not request IRQ 1");
-		return ret;
+	/* Kopsia has no described completion interrupt; its backend polls. */
+	if (!(avd->variant->quirks & AVD_QUIRK_KOPSIA)) {
+		irq = platform_get_irq(pdev, 1);
+		if (irq < 0)
+			return irq;
+		avd->pm.irq = irq;
+		ret = devm_request_threaded_irq(&pdev->dev, irq, NULL,
+				avd_irq_handler, IRQF_ONESHOT | IRQF_NO_AUTOEN,
+				dev_name(&pdev->dev), avd);
+		if (ret) {
+			dev_err(avd->dev, "Could not request IRQ 1");
+			return ret;
+		}
 	}
 
 	/*
@@ -751,6 +775,13 @@ static int avd_probe(struct platform_device *pdev)
 		if (ret)
 			return ret;
 	}
+	if (avd->domain) {
+		avd->empty_domain = iommu_paging_domain_alloc(avd->dev);
+		if (IS_ERR(avd->empty_domain)) {
+			avd->empty_domain = NULL;
+			dev_warn(avd->dev, "cannot alloc new empty domain");
+		}
+	}
 	avd_pm_enable(avd);
 
 	/*
@@ -759,10 +790,15 @@ static int avd_probe(struct platform_device *pdev)
 	 * size their contexts before the first decode would power it up.
 	 */
 	ret = pm_runtime_resume_and_get(avd->dev);
-	if (ret < 0)
+	if (ret < 0) {
+		if (avd->variant->quirks & AVD_QUIRK_KOPSIA) {
+			dev_err_probe(avd->dev, ret, "Kopsia probe boot failed\n");
+			goto err_disable_runtime_pm;
+		}
 		dev_warn(avd->dev, "firmware probe boot failed: %d\n", ret);
-	else
+	} else {
 		pm_runtime_put_autosuspend(avd->dev);
+	}
 
 	ret = avd_v4l2_init(avd);
 	if (ret)
@@ -773,6 +809,9 @@ static int avd_probe(struct platform_device *pdev)
 err_disable_runtime_pm:
 	pm_runtime_dont_use_autosuspend(&pdev->dev);
 	pm_runtime_disable(&pdev->dev);
+	cancel_delayed_work_sync(&avd->queue_work);
+	if (avd->empty_domain)
+		iommu_domain_free(avd->empty_domain);
 	return ret;
 }
 
