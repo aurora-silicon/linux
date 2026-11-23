@@ -133,7 +133,8 @@ static void dcpavserv_init(struct apple_epic_service *service, const char *name,
 			service->cookie = &dcp->dcpavserv;
 			if (!v2 && !dcp->desktop && class &&
 			    (!strcmp(class, "DCPDP13Service") ||
-			     !strcmp(class, "DCPDPService")))
+			     !strcmp(class, "DCPDPService") ||
+			     !strcmp(class, "AppleDCPDP2HDMI")))
 				dcp_hdr_service_bind(service);
 			complete(&dcp->dcpavserv.enable_completion);
 			published = true;

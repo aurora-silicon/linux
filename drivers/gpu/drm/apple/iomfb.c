@@ -3279,7 +3279,7 @@ void dcp_hdr_service_bind(struct apple_epic_service *service)
 		return;
 	scoped_guard(spinlock_irqsave, &dcp->hdr.lock) {
 		old = dcp->hdr.service;
-		dcp->hdr.service = service;
+		WRITE_ONCE(dcp->hdr.service, service);
 		dcp_hdr_reset_locked(dcp);
 	}
 	if (old)
@@ -3294,7 +3294,7 @@ void dcp_hdr_service_unbind(struct apple_epic_service *service)
 	scoped_guard(spinlock_irqsave, &dcp->hdr.lock) {
 		owned = dcp->hdr.service == service;
 		if (owned) {
-			dcp->hdr.service = NULL;
+			WRITE_ONCE(dcp->hdr.service, NULL);
 			dcp_hdr_reset_locked(dcp);
 		}
 	}
@@ -3354,7 +3354,8 @@ bool dcp_hdr_metadata_live(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
-	return !dcp_has_panel(dcp) && (dcp->desktop || READ_ONCE(dcp->hdr.service));
+	return READ_ONCE(dcp->iomfb_template_pq) && !dcp_has_panel(dcp) &&
+	       (dcp->desktop || READ_ONCE(dcp->hdr.service));
 }
 
 /*
@@ -3403,7 +3404,7 @@ static void dcp_hdr_metadata_sync(struct apple_dcp *dcp, struct drm_crtc *crtc,
 	u64 generation;
 	u32 retcode = 0;
 	bool same;
-	int ret;
+	int transport, ret;
 
 	if (!dcp->output_pq || READ_ONCE(dcp->crashed) ||
 	    !dcp_hdr_metadata_live(to_apple_crtc(crtc)->dcp))
@@ -3427,15 +3428,10 @@ static void dcp_hdr_metadata_sync(struct apple_dcp *dcp, struct drm_crtc *crtc,
 		return;
 
 	dcp_hdr_message(msg, data);
-	ret = afk_send_command_with_reply_len(service, EPIC_SUBTYPE_STD_SERVICE,
-					      msg, sizeof(msg), reply, sizeof(reply),
-					      &retcode, &received);
-	ret = dcp_hdr_reply(ret, retcode, reply, received);
-	/*
-	 * A block the firmware refused is not sent again on every frame (the
-	 * command is synchronous): only a new block, a new mode set or a new
-	 * service instance retries.
-	 */
+	transport = afk_send_command_with_reply_len(service, EPIC_SUBTYPE_STD_SERVICE,
+						    msg, sizeof(msg), reply, sizeof(reply),
+						    &retcode, &received);
+	ret = dcp_hdr_reply(transport, retcode, reply, received);
 	if (ret)
 		dev_warn_ratelimited(dcp->dev, "HDR static metadata not taken: %d\n", ret);
 	else
@@ -3444,8 +3440,10 @@ static void dcp_hdr_metadata_sync(struct apple_dcp *dcp, struct drm_crtc *crtc,
 			get_unaligned_le16(data + 16), get_unaligned_le16(data + 18));
 	scoped_guard(spinlock_irqsave, &dcp->hdr.lock) {
 		if (dcp->hdr.service == service && dcp->hdr.generation == generation) {
-			memcpy(dcp->hdr.sent, data, sizeof(data));
-			dcp->hdr.sent_valid = true;
+			/* Without a valid reply, the previous block may no longer be active. */
+			dcp->hdr.sent_valid = !transport && ret != -EPROTO;
+			if (dcp->hdr.sent_valid)
+				memcpy(dcp->hdr.sent, data, sizeof(data));
 			if (!ret)
 				dcp->hdr.infoframe = true;
 		}
@@ -4349,6 +4347,7 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit)
 {
 	struct platform_device *pdev = to_apple_crtc(crtc)->dcp;
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+	bool route_ready;
 
 	if (iomfb_is_m4(dcp)) {
 		struct drm_plane_state *plane = drm_atomic_get_new_plane_state(commit,
@@ -4401,12 +4400,14 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit)
 		return;
 	}
 
+	route_ready = dcp_crtc_route_ready(crtc, commit, true);
 	if (READ_ONCE(dcp->mode_state.valid) && dcp->connector &&
 	    READ_ONCE(dcp->connector->connected) &&
 	    !(to_apple_atomic_state(commit)->failed_routes & drm_crtc_mask(crtc))) {
 		/* A panel's EDR switches without a mode set (dcp_edr_live()). */
 		dcp_edr_sync(dcp, crtc, commit);
-		dcp_hdr_metadata_sync(dcp, crtc, commit);
+		if (route_ready)
+			dcp_hdr_metadata_sync(dcp, crtc, commit);
 	}
 
 	if (iomfb_uses_queue(dcp)) {
@@ -4424,7 +4425,7 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit)
 	 * firmware has reported the display back.
 	 */
 	if ((to_apple_atomic_state(commit)->failed_routes & drm_crtc_mask(crtc)) ||
-	    !dcp_crtc_route_ready(crtc, commit, true) ||
+	    !route_ready ||
 	    !READ_ONCE(dcp->mode_state.valid) || !dcp->connector || !dcp->connector->connected) {
 		schedule_work(&dcp->vblank_wq);
 		return;

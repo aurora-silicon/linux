@@ -4872,8 +4872,6 @@ static void _dcp_poweroff(struct apple_dcp *dcp)
 		iomfb_poweroff_v26_6_desktop(dcp);
 		if (dcp->edr_hm)
 			dcp->edr_restart = true;
-		/* The link set up again starts without HDR10 metadata. */
-		dcp_hdr_metadata_forget(dcp);
 		break;
 	case DCP_FIRMWARE_V_26_6:
 		iomfb_v26_6_poweroff(dcp);
@@ -4895,6 +4893,8 @@ static void _dcp_poweroff(struct apple_dcp *dcp)
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
 		break;
 	}
+	/* The link set up again starts without HDR10 metadata. */
+	dcp_hdr_metadata_forget(dcp);
 }
 
 static void dcp_resume_enable_irq(void *ctx)
