@@ -140,6 +140,21 @@ config APPLE_RTKIT
 
 	  Say 'y' here if you have an Apple SoC.
 
+config APPLE_RTKIT_KUNIT_TEST
+	bool "KUnit tests for the Apple RTKit IPC library" if !KUNIT_ALL_TESTS
+	depends on APPLE_RTKIT=y && KUNIT=y
+	default KUNIT_ALL_TESTS
+	help
+	  Feed the RTKit receive handlers the messages a co-processor sends
+	  (HELLO version negotiation, the endpoint map, power state ACKs,
+	  buffer requests, syslog, ioreport, kdebug, CoreAnalytics and crash
+	  reports) and check the replies, with the mailbox send replaced by a
+	  static stub. Check that the crashlog parser follows containers to
+	  the right log and never reads past a truncated or malformed
+	  crashlog. The tests touch no hardware.
+
+	  If unsure, say N.
+
 config APPLE_RTKIT_HELPER
 	tristate "Apple Generic RTKit helper co-processor"
 	depends on APPLE_RTKIT
