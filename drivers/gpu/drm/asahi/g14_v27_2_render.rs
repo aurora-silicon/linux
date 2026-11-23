@@ -415,6 +415,9 @@ pub(crate) fn encode_vertex(
     put64(cmd, 0x58c, q.fw_stamp);
     put32(cmd, 0x594, c.stamp_value);
     put32(cmd, 0x598, q.slot);
+    // flush_stamps: the firmware's per-queue completion walk stops at a command whose meta
+    // leaves this clear, so the host stamp is never written and later commands never retire.
+    put32(cmd, 0x5a0, 1);
     // The event-control index is independent of the completion stamp slot.
     put64(cmd, 0x5a4, 0); // uuid (compute leaves it 0)
     let command_time = c.cmd_va + 0x5cc;
@@ -908,7 +911,9 @@ pub(crate) fn encode_fragment(
     w64(cmd, meta + offset_of!(Meta, fw_stamp), q.fw_stamp);
     w32(cmd, meta + offset_of!(Meta, stamp_value), c.stamp_value);
     w32(cmd, meta + offset_of!(Meta, stamp_slot), q.slot);
-    // evctl_index 0 (13.5 fixed), flush_stamps 0, uuid (u64 at 0x908) 0, event_seq 0.
+    // evctl_index 0 (13.5 fixed), uuid (u64 at 0x908) 0, event_seq 0. flush_stamps (0x904) is
+    // set, as for the tiler: without it the completion walk stops at this command.
+    put32(cmd, 0x904, 1);
     w64(cmd, offset_of!(Rf, unk_buf_10), 1);
     w64(
         cmd,
