@@ -69,7 +69,7 @@
 # decides. The state file says which (fallback=software|none).
 #
 # A file opt-out (/etc/mesa-m3/disable or the user's mesa-m3/disable) on a
-# J613 (T8122) or a J516S (T6030) is the exception: when the same node,
+# single-board T8122 or T6030 is the exception: when the same node,
 # display, kernel-log, user-setup and same-boot attempt checks pass and
 # mesa-m3-system-check admits /usr, the session keeps system Mesa
 # (fallback=none, no new attempt). The whole check runs in its own sh and is
@@ -385,7 +385,7 @@ _mm3_legacy_attempt_clear() {
 	return 0
 }
 
-# File opt-out on J613/T8122 or J516S/T6030 may keep the system Mesa. Prints
+# File opt-out on a single-board T8122 or T6030 may keep the system Mesa. Prints
 # one detail line and returns 0 only when every check below passes. A helper
 # exit of 0 is not enough on its own. Does not write an attempt or touch a
 # marker. mesa_m3=off is not a file opt-out.
@@ -404,11 +404,13 @@ _mm3_system_admit() {
 	_mm3_chip=
 	_mm3_identity=$(printf '%s\n' "$_mm3_dt" | grep -E '^apple,j')
 	_mm3_socs=$(printf '%s\n' "$_mm3_dt" | grep -E '^apple,t')
-	case "$_mm3_soc:$_mm3_identity:$_mm3_socs" in
-	t8122:apple,j613:apple,t8122) _mm3_chip=t8122 ;;
-	t6030:apple,j516s:apple,t6030) _mm3_chip=t6030 ;;
-	*) return 1 ;;
-	esac
+	# Any board of this SoC: exactly one board compatible, and exactly one SoC
+	# compatible, which is the SoC the GPU checks below are keyed on.
+	case "$_mm3_soc" in t8122|t6030) ;; *) return 1 ;; esac
+	[ "$_mm3_socs" = "apple,$_mm3_soc" ] || return 1
+	[ -n "$_mm3_identity" ] &&
+		[ "$(printf '%s\n' "$_mm3_identity" | wc -l)" -eq 1 ] || return 1
+	_mm3_chip=$_mm3_soc
 	# Exactly one render node, and it is this SoC's asahi GPU, and this user
 	# can open it. An any-node match is not enough.
 	_mm3_nodes=0

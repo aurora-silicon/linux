@@ -775,9 +775,21 @@ for journal in noperm error match bank dcp g15g verdict; do
 	HR=$(system_root "journal-$journal" pro)
 	handoff "$HR" software no FAKE_JOURNAL="$journal"
 done
-for dt in 'apple,j615 apple,t8122' 'apple,j514s apple,t6030' \
-	'apple,j614s apple,t6030' 'apple,j613 apple,j615 apple,t8122' \
-	'apple,j613 apple,t6030' 'apple,j516s apple,t6030 apple,t8122'; do
+# Any single board of the SoC reaches the helper, which decides on the GPU.
+HR=$(system_root board-j615 air)
+nul apple,j615 apple,t8122 > "$HR/proc/device-tree/compatible"
+handoff "$HR" none yes
+HR=$(system_root board-j504 air)
+nul apple,j504 apple,t8122 > "$HR/proc/device-tree/compatible"
+handoff "$HR" none yes
+HR=$(system_root board-j514s pro)
+nul apple,j514s apple,t6030 > "$HR/proc/device-tree/compatible"
+handoff "$HR" none yes
+# Two boards, two SoCs or no board stay refused. Without a board table the
+# hook cannot tell which SoC a board belongs to; the GPU and display checks
+# are keyed on the SoC compatible instead.
+for dt in 'apple,j613 apple,j615 apple,t8122' 'apple,t6030' \
+	'apple,j516s apple,t6030 apple,t8122'; do
 	HR=$(system_root "board-$(printf '%s' "$dt" | tr ' ,' '--')" pro)
 	nul $dt > "$HR/proc/device-tree/compatible"
 	# Match the GPU to the ambiguous board's first SoC so the old fallback

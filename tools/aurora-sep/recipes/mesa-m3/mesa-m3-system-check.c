@@ -18,9 +18,10 @@
 static bool
 board_compat_matches(const char *bytes, size_t length, const char *soc)
 {
-   const char *board = !strcmp(soc, "t8122") ? "apple,j613" :
-                       !strcmp(soc, "t6030") ? "apple,j516s" : NULL;
-   if (!board || !length || bytes[length - 1] != '\0')
+   /* Any board of this SoC: one board compatible and one SoC compatible. */
+   if (strcmp(soc, "t8122") && strcmp(soc, "t6030"))
+      return false;
+   if (!length || bytes[length - 1] != '\0')
       return false;
    unsigned boards = 0, socs = 0;
    size_t offset = 0;
@@ -31,8 +32,6 @@ board_compat_matches(const char *bytes, size_t length, const char *soc)
          return false;
       const char *value = bytes + offset;
       if (!strncmp(value, "apple,j", 7)) {
-         if (strcmp(value, board))
-            return false;
          boards++;
       } else if (!strncmp(value, "apple,t", 7)) {
          if (strncmp(value + 6, soc, strlen(soc) + 1))
@@ -42,6 +41,32 @@ board_compat_matches(const char *bytes, size_t length, const char *soc)
       offset += size + 1;
    }
    return boards == 1 && socs == 1;
+}
+
+/* The asahi driver names its renderer "Apple <chip> (<GPU> <stepping>)".
+ * Accept the chip and GPU of the admitted SoC with any stepping. The prefix
+ * already excludes software and layered renderers; refuse them by name too.
+ */
+static bool
+native_renderer(const char *renderer, const char *soc)
+{
+   static const char *const refused[] = {
+      "llvmpipe", "softpipe", "swrast", "lavapipe", "zink",
+   };
+   const char *prefix;
+   if (!strcmp(soc, "t8122"))
+      prefix = "Apple M3 (G15G ";
+   else if (!strcmp(soc, "t6030"))
+      prefix = "Apple M3 Pro (G15S ";
+   else
+      return false;
+   if (!renderer || strncmp(renderer, prefix, strlen(prefix)))
+      return false;
+   for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); i++) {
+      if (strcasestr(renderer, refused[i]))
+         return false;
+   }
+   return true;
 }
 
 static bool
@@ -104,9 +129,7 @@ main(int argc, char **argv)
       fprintf(stderr, "usage: mesa-m3-system-check /dev/dri/renderD<N> t8122|t6030\n");
       return 2;
    }
-   const char *expected = !strcmp(argv[2], "t8122") ? "Apple M3 (G15G C0)" :
-                          !strcmp(argv[2], "t6030") ? "Apple M3 Pro (G15S B1)" : NULL;
-   if (!expected)
+   if (strcmp(argv[2], "t8122") && strcmp(argv[2], "t6030"))
       return 2;
    const char *node_prefix = "/dev/dri/renderD";
    size_t prefix_length = strlen(node_prefix);
@@ -206,8 +229,7 @@ main(int argc, char **argv)
        !make_current(display, EGL_NO_SURFACE, EGL_NO_SURFACE, context))
       goto done;
    const char *renderer = (const char *)get_string(GL_RENDERER);
-   accepted = renderer && !strcmp(renderer, expected) &&
-              system_implementation();
+   accepted = native_renderer(renderer, argv[2]) && system_implementation();
    if (accepted)
       printf("system-mesa=available renderer=%s\n", renderer);
 done:

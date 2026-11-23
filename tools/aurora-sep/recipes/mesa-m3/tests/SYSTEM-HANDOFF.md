@@ -5,12 +5,15 @@ With native Mesa installed in `/usr`, the legacy file opt-out still forced
 system driver worked. The legacy package owns this hook, so the native Mesa
 package must not overwrite it or add an unconditional late unset.
 
-This change allows a file opt-out on J613/T8122 and J516S/T6030 to leave system
-Mesa selected. It requires one accessible Asahi render node, the matching
+This change allows a file opt-out on any T8122 or T6030 board to leave system
+Mesa selected. The device tree must name exactly one board and one SoC. It requires one accessible Asahi render node, the matching
 native display, a readable healthy kernel journal, no unmatched same-boot
 legacy login attempt, and no conflicting environment or later user settings.
 A bounded helper then opens the exact EGL device using only `/usr` libraries
-and verifies its native renderer and loaded implementation paths. It creates
+and verifies that its renderer string starts with the admitted SoC's chip
+and GPU (`Apple M3 (G15G ` on T8122, `Apple M3 Pro (G15S ` on T6030, any
+stepping; this also rules out llvmpipe, softpipe, swrast, lavapipe and
+zink) and its loaded implementation paths. It creates
 a context but makes no draw, swap or compute calls.
 
 With `--system-provider`, the user-setup check also refuses settings the
@@ -26,8 +29,8 @@ scanner refuses instead of holding the login. The helper keeps its own
 5-second timeout.
 
 A failed check keeps the existing software fallback. `mesa_m3=off` and
-`nomodeset` remain recovery choices. Other boards, including J615, remain
-outside this system handoff. Explicit legacy profile selection is unchanged.
+`nomodeset` remain recovery choices. Other SoCs remain outside this system
+handoff. Explicit legacy profile selection is unchanged.
 No opt-in flags, attempt records or success markers are added or removed.
 Only the exact software-fallback pair previously exported by this hook can
 be cleared. The state remains `inactive`, `reason=opt-out`, `fallback=none`
