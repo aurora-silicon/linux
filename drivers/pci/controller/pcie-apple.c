@@ -478,6 +478,7 @@ static const struct hw_info t6050_pciec_hw = {
 	.no_port_reset		= true,
 	.msimap_by_vector	= true,
 	.mps_timers		= true,
+	.s2idle_hold_domain	= true,
 };
 
 static const struct of_device_id apple_pcie_of_match[];
@@ -3697,6 +3698,25 @@ static int apple_pcie_adopted_no_clkpm_walk(struct pci_dev *pdev, void *data)
 	return 0;
 }
 
+/*
+ * An adopted port with an endpoint power GPIO (pwren-gpios) is trained by
+ * Linux. Match the root port itself as well as functions below it.
+ * If no port matches, neither kind of training can be established.
+ */
+static bool apple_pcie_adopted_link_trained_by(struct apple_pcie *pcie,
+					      struct pci_dev *pdev, bool bootloader)
+{
+	struct pci_dev *rp = pcie_find_root_port(pdev);
+	struct apple_pcie_port *port;
+
+	if (!pcie->hw->adopt_link || !rp)
+		return false;
+	list_for_each_entry(port, &pcie->ports, entry)
+		if (port->idx == PCI_SLOT(rp->devfn))
+			return bootloader == !port->pwren;
+	return false;
+}
+
 static int apple_pcie_enable_device(struct pci_host_bridge *bridge, struct pci_dev *pdev)
 {
 	struct apple_pcie *pcie = pci_host_bridge_priv(bridge);
@@ -3715,6 +3735,14 @@ static int apple_pcie_enable_device(struct pci_host_bridge *bridge, struct pci_d
 
 	/* Also cover functions discovered by a later hotplug or rescan. */
 	if (pcie->hw->tunneled)
+		pdev->dev_flags |= PCI_DEV_FLAGS_NO_D3;
+
+	/*
+	 * Firmware owns the power of a boot-trained adopted link, and s2idle
+	 * requires the port and everything below it to stay accessible in D0.
+	 * Keep the PCI core's suspend paths from putting them in D3hot.
+	 */
+	if (apple_pcie_adopted_link_trained_by(pcie, pdev, true))
 		pdev->dev_flags |= PCI_DEV_FLAGS_NO_D3;
 
 	/*
@@ -6710,6 +6738,23 @@ err_release:
 }
 
 /*
+ * Pre-suspend policy shared with apple_pcie_prepare(): everything known before
+ * endpoints suspend, leaving only the domain hold and live link check to noirq.
+ */
+static bool apple_pcie_can_keep_link(const struct apple_pcie *pcie)
+{
+	if (!READ_ONCE(s2idle_keep_link) || !pm_suspend_no_platform())
+		return false;
+	if (!(pcie->kernel_init || pcie->tunnel_cold_init))
+		return false;
+	if (pcie->bus_stopped || pcie->resume_failed)
+		return false;
+	if (!pcie->power_retained && !pcie->hw->s2idle_hold_domain)
+		return false;
+	return true;
+}
+
+/*
  * In suspend-to-idle ACIO and the router links stay powered, so an up
  * tunnel can simply be left running. The functions below keep their state
  * and resume like any other PCIe device; nothing has to be re-trained.
@@ -6721,15 +6766,9 @@ static bool apple_pcie_keep_link(struct apple_pcie *pcie)
 {
 	int ret;
 
-	if (!READ_ONCE(s2idle_keep_link) || !pm_suspend_no_platform())
-		return false;
-	if (!(pcie->kernel_init || pcie->tunnel_cold_init))
-		return false;
-	if (pcie->bus_stopped || pcie->resume_failed)
+	if (!apple_pcie_can_keep_link(pcie))
 		return false;
 	if (!pcie->power_retained) {
-		if (!pcie->hw->s2idle_hold_domain)
-			return false;
 		ret = apple_pcie_hold_domains(pcie);
 		if (ret) {
 			dev_dbg(pcie->dev, "PCIe-C power domain not held (%d): link not kept\n",
@@ -6785,22 +6824,6 @@ static void apple_pcie_stop_for_sleep(struct device *dev)
 
 static void apple_pcie_neo_save_functions(struct apple_pcie *pcie);
 
-/* Whether Linux trained the port above pdev itself (cold train), rather than adopting it */
-static bool apple_pcie_below_kernel_trained_port(struct pci_dev *pdev)
-{
-	struct pci_config_window *cfg = pdev->sysdata;
-	struct apple_pcie *pcie = apple_pcie_lookup(cfg->parent);
-	struct pci_dev *rp = pcie_find_root_port(pdev);
-	struct apple_pcie_port *port;
-
-	if (!rp)
-		return false;
-	list_for_each_entry(port, &pcie->ports, entry)
-		if (port->idx == PCI_SLOT(rp->devfn))
-			return !!port->pwren;
-	return false;
-}
-
 /*
  * The J716c radio drivers save PCI state without entering D3. The PCI core
  * keeps the root port in D0 as well. Its host and DART have no switchable
@@ -6812,6 +6835,8 @@ static bool apple_pcie_below_kernel_trained_port(struct pci_dev *pdev)
  */
 static int apple_pcie_check_d0(struct pci_dev *pdev, void *data)
 {
+	struct pci_config_window *cfg = pdev->sysdata;
+	struct apple_pcie *pcie = apple_pcie_lookup(cfg->parent);
 	int *error = data;
 	u16 value;
 
@@ -6822,7 +6847,7 @@ static int apple_pcie_check_d0(struct pci_dev *pdev, void *data)
 	 * asked to stay awake need to remain in D0.
 	 */
 	if (!device_awake_path(&pdev->dev) &&
-	    apple_pcie_below_kernel_trained_port(pdev))
+	    apple_pcie_adopted_link_trained_by(pcie, pdev, false))
 		return 0;
 
 	if (pci_read_config_word(pdev, PCI_VENDOR_ID, &value) ||
@@ -6879,7 +6904,7 @@ static int apple_pcie_suspend_noirq(struct device *dev)
 	if (pcie->cio_prepared)
 		return apple_pcie_cio_suspend(pcie);
 	/* The reversed DART link is safe only with retained clocks or native PM. */
-	if (pcie->cio_dart && (!pm_suspend_no_platform() || !s2idle_keep_link))
+	if (pcie->cio_dart && !apple_pcie_can_keep_link(pcie))
 		return -EBUSY;
 	if (pcie->neo_sleep_armed) {
 		struct apple_pcie_port *port;
@@ -7545,7 +7570,7 @@ static int apple_pcie_prepare(struct device *dev)
 	 */
 	if (pcie && pcie->cio_dart && !pcie->cio_prepared &&
 	    pm_suspend_target_state != PM_SUSPEND_ON &&
-	    (!pm_suspend_no_platform() || !s2idle_keep_link)) {
+	    !apple_pcie_can_keep_link(pcie)) {
 		dev_warn(dev, "no CIO sleep transaction from the NHI; refusing sleep\n");
 		return -EBUSY;
 	}

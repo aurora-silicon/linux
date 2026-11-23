@@ -761,25 +761,6 @@ static void send_vblank_event(struct drm_device *dev,
 	drm_send_event_timestamp_locked(dev, &e->base, now);
 }
 
-/**
- * dcp_crtc_send_page_flip_event - helper to send vblank event after pageflip
- * @crtc: CRTC whose flip completed
- * @e: pending vblank event
- * @now: swap completion timestamp
- * @start: swap submission timestamp
- *
- * Compensate for unknown slack between page flip and arrival of the
- * swap_complete callback. Minimal observed duration on DCP with HDMI output
- * was around 2.3 ms. If the fb swap was submitted closer to the expected
- * swap_complete it gets a penalty of one frame duration. This is on the border
- * of unreasonable considering that Apple advertises support for 240 Hz (frame
- * duration of 4.167 ms).
- * It is unreasonable considering kwin's kms commit scheduling. Kwin commits
- * 1.5 ms + the mode's vblank time before the expected next page flip
- * completion. This results in presenting at half the display's rate for HDMI
- * outputs.
- * This might be a difference between dcp and dcpext.
- */
 /*
  * Advance the CRTC's flip sequence by the number of refresh periods since the
  * previous flip (at least one), so that userspace sees a non-zero, increasing
@@ -804,6 +785,25 @@ static u64 dcp_crtc_next_flip_seq(struct apple_crtc *crtc, ktime_t flip)
 	return crtc->flip_seq;
 }
 
+/**
+ * dcp_crtc_send_page_flip_event - helper to send vblank event after pageflip
+ * @crtc: CRTC whose flip completed
+ * @e: pending vblank event
+ * @now: swap completion timestamp
+ * @start: swap submission timestamp
+ *
+ * Compensate for unknown slack between page flip and arrival of the
+ * swap_complete callback. Minimal observed duration on DCP with HDMI output
+ * was around 2.3 ms. If the fb swap was submitted closer to the expected
+ * swap_complete it gets a penalty of one frame duration. This is on the border
+ * of unreasonable considering that Apple advertises support for 240 Hz (frame
+ * duration of 4.167 ms).
+ * It is unreasonable considering kwin's kms commit scheduling. Kwin commits
+ * 1.5 ms + the mode's vblank time before the expected next page flip
+ * completion. This results in presenting at half the display's rate for HDMI
+ * outputs.
+ * This might be a difference between dcp and dcpext.
+ */
 static void dcp_crtc_send_page_flip_event(struct apple_crtc *crtc,
 					  struct drm_pending_vblank_event *e,
 					  ktime_t now, ktime_t start)
@@ -6090,14 +6090,18 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 
 	/*
 	 * The T8122 external processor: Linux starts it and drives 14.7
-	 * firmware through the classic IOMFB template, as on M1/M2.
+	 * firmware through the classic IOMFB template, as on M1/M2. On the
+	 * 27.2 image it runs the firmware-27 backend with the 27.2 table, as
+	 * the internal processor does.
 	 */
 	if (of_device_is_compatible(dev->of_node, "apple,t8122-dcpext")) {
 		if (dcp_ext26_admitted(dev->of_node))
 			return DCP_FIRMWARE_H17P;
+		if (apple_t8122_dcpext_v27_2(dev->of_node))
+			return dcp_v27_method_table(dev, compat_str);
 		if (!strcmp(compat_str, "14.7.0"))
 			return DCP_FIRMWARE_V_14_7_TEMPLATE;
-		dev_err(dev, "T8122 external display not started: DCP firmware-compat %s is not 14.7.0\n",
+		dev_err(dev, "T8122 external display not started: DCP firmware-compat %s is neither 14.7.0 nor the 27.2 image\n",
 			compat_str);
 		return DCP_FIRMWARE_UNKNOWN;
 	}
@@ -6298,8 +6302,10 @@ clocks:
 		dcp->num_firmware_clocks = 2;
 		return 0;
 	}
+	/* External processors without a provider clock table (T6041, T8122). */
 	if (!of_property_present(dev->of_node, "apple,clock-ids") &&
-	    of_device_is_compatible(dev->of_node, "apple,t6041-dcpext"))
+	    (of_device_is_compatible(dev->of_node, "apple,t6041-dcpext") ||
+	     of_device_is_compatible(dev->of_node, "apple,t8122-dcpext")))
 		return 0;
 	clocks = of_property_count_u32_elems(dev->of_node, "apple,clock-ids");
 	if (clocks == -ENODATA &&
@@ -6356,12 +6362,17 @@ static bool dcp_external_is_idle(struct apple_dcp *dcp)
  * drive the full panel (aura: chosen.asahi,show-notch=1). Follow it, so the
  * mode covers the same rows as the boot framebuffer did.
  */
-static bool boot_show_notch(void)
+static bool dcp_boot_show_notch(const struct device_node *chosen)
 {
 	const char *val;
 
-	return !of_property_read_string(of_chosen, "asahi,show-notch", &val) &&
+	return !of_property_read_string(chosen, "asahi,show-notch", &val) &&
 	       !strcmp(val, "1");
+}
+
+static bool boot_show_notch(void)
+{
+	return dcp_boot_show_notch(of_chosen);
 }
 
 /*
@@ -7011,10 +7022,12 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 		cancel_work_sync(&dcp->bl_register_wq);
 		cancel_work_sync(&dcp->bl_update_wq);
 	}
-	if (dcp->clk)
-		devm_clk_put(dev, dcp->clk);
+	/*
+	 * Both clocks are released with the bind's devres group. An explicit
+	 * devm_clk_put() would also match the NULL devres entry of an absent
+	 * optional clock and warn.
+	 */
 	dcp->clk = NULL;
-	/* optional and possibly NULL, released with the bind's devres group */
 	dcp->clk_194 = NULL;
 	dcp->firmware_clocks = NULL;
 	dcp->num_firmware_clocks = 0;
@@ -7352,6 +7365,21 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 		dcp->hw.firmware_dma_bits = 41;
 		dcp->hw.num_dptx_ports = 0;
 		dcp->hw.adopt_live_session = true;
+	}
+	/*
+	 * The T8122 external processor on firmware 27: the boot loader leaves
+	 * it unpowered (its DISPEXT domains are off at handoff), so Linux
+	 * starts it as on 14.7, with the firmware-27 endpoints and both DPTX
+	 * port services. Its DART window is the internal panel's, which the
+	 * display gate copied onto its DARTs (gate_t8122_dcpext_alias()):
+	 * 0x100_0000_0000 + 64 GiB, so 41-bit firmware DMA addressing as there.
+	 */
+	if (fw_compat == DCP_FIRMWARE_V_27_0 &&
+	    of_device_is_compatible(dev->of_node, "apple,t8122-dcpext")) {
+		dcp->hw.firmware_dma_bits = 41;
+		dcp->hw.num_dptx_ports = 2;
+		dcp->hw.fw_14_7_endpoints = false;
+		dcp->hw.adopt_live_session = false;
 	}
 	if (fw_compat == DCP_FIRMWARE_V_27_0 &&
 	    of_device_is_compatible(dev->of_node, "apple,t6041-dcpext")) {
@@ -8936,6 +8964,15 @@ static int dcp_s2r_domains_off(struct apple_dcp *dcp)
 	if (ret)
 		goto out;
 
+	/*
+	 * The display DART goes off with these domains, and every framebuffer is mapped
+	 * into it: an unmap while they are off, a client freeing a buffer after DPMS off,
+	 * would reach its registers and reset the SoC. The firmware's D572 does not say
+	 * so on every firmware (27.2 reports 1 at the stop). Dark until the domains are
+	 * back, as for an external DCP.
+	 */
+	if (dcp->s2r_disp_dart)
+		apple_dart_power_dark(dcp->s2r_disp_dart, true);
 	if (pmc)
 		dcp_pmc_set(dcp, pmc, false);
 	val = readl(ps + l->disp_cpu);
@@ -9245,6 +9282,9 @@ static int dcp_s2r_warm_restart(struct apple_dcp *dcp)
 	ret = dcp_s2r_domains_on(dcp);
 	if (ret)
 		return ret;
+	/* Powered again: the invalidations held while it was dark run now. */
+	if (dcp->s2r_disp_dart)
+		apple_dart_power_dark(dcp->s2r_disp_dart, false);
 
 	/* After the domains, whose writes it would reject, the DART protects them again. */
 	if (dcp->s2r_dcp_dart)
@@ -10257,4 +10297,6 @@ void dcp_unregister(void)
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST)
 #include "dcp_external_audio_test.c"
+#include "dcp_handoff_test.c"
+#include "dcp-firmware-test.c"
 #endif

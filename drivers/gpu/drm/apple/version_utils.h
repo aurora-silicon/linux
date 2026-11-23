@@ -10,7 +10,7 @@
 #define DCP_FW_UNION(u) (u).DCP_FW
 #define DCP_FW_SUFFIX CONCATENATE(_, DCP_FW)
 #define DCP_FW_NAME(name) CONCATENATE(name, DCP_FW_SUFFIX)
-#define DCP_FW_VERSION(x, y, z) ( ((x) << 16) | ((y) << 8) | (z) )
+#define DCP_FW_VERSION(x, y, z) (((x) << 16) | ((y) << 8) | (z))
 
 /*
  * 26.x firmware exists in two unrelated wire lineages.  The H17-generation

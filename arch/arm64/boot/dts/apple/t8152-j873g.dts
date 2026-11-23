@@ -503,3 +503,4 @@
 #include "t8152-j873-ethernet.dtsi"
 #include "t8152-j873-audio.dtsi"
 #include "t8152-j873-dcp.dtsi"
+#include "t8152-j873-avd.dtsi"

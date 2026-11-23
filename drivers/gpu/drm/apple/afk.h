@@ -83,8 +83,8 @@ struct apple_epic_service {
 	bool started;
 
     struct {
-        struct dentry *entry;
-        u8 *scratch;
+	struct dentry *entry;
+	u8 *scratch;
     } debugfs;
 };
 

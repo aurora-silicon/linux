@@ -3867,8 +3867,19 @@ static int __maybe_unused ane_rtclient_sleep_pm_resume(struct device *dev)
 	return ane_t6021_pm_resume(ane_rtclient_get_sleep_pm(dev));
 }
 
+static int __maybe_unused ane_rtclient_runtime_suspend(struct device *dev)
+{
+	return ane_rtclient_is_platform(dev) ? ane_fw_platform_runtime_suspend(dev) : 0;
+}
+
+static int __maybe_unused ane_rtclient_runtime_resume(struct device *dev)
+{
+	return ane_rtclient_is_platform(dev) ? ane_fw_platform_runtime_resume(dev) : 0;
+}
+
 static const struct dev_pm_ops __maybe_unused ane_rtclient_sleep_pm = {
 	SYSTEM_SLEEP_PM_OPS(ane_rtclient_sleep_pm_suspend, ane_rtclient_sleep_pm_resume)
+	RUNTIME_PM_OPS(ane_rtclient_runtime_suspend, ane_rtclient_runtime_resume, NULL)
 };
 
 static int ane_rtclient_probe_inner(struct platform_device *pdev,
@@ -4526,7 +4537,7 @@ static struct platform_driver ane_rtclient_driver = {
 		.name = "ane_t6021",
 		.of_match_table = ane_rtclient_of_match,
 		.dev_groups = ane_t6021_stats_groups,
-		.pm = pm_sleep_ptr(&ane_rtclient_sleep_pm),
+		.pm = pm_ptr(&ane_rtclient_sleep_pm),
 		.suppress_bind_attrs = true,
 	},
 	.probe = ane_rtclient_probe,
