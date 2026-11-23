@@ -178,6 +178,12 @@
 						<&cpu_p14 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
 						<&cpu_p15 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
 				};
+
+				map-dcs {
+					trip = <&cpu_die_passive>;
+					cooling-device =
+						<&pmc THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
 			};
 		};
 
@@ -991,6 +997,18 @@
 
 &mcc {
 	status = "okay";
+};
+
+&pmc {
+	/*
+	 * System power above DCS state 0 at each DCS state, measured on a
+	 * J575c with all 32 DCS channels enabled (ADT mcc: 8 AMCCs, 4 DCS
+	 * each, dcs-channel-enable-mask 0xffffffff) under 256 MiB GPU copies:
+	 * 233 GB/s at state 5, 85 GB/s at states 0 and 1. States 1 and 2 draw
+	 * no more than state 0, so the power allocator never asks for a limit
+	 * below DCS state 2 (cooling state 3).
+	 */
+	apple,dcs-power-microwatt = <0 0 0 5508000 8559000 10966000>;
 };
 
 /* The J616c's CPU keys and two fans, all read back on a J575c */
