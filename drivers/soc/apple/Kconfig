@@ -163,6 +163,21 @@ config APPLE_SART
 
 	  Say 'y' here if you have an Apple SoC.
 
+config APPLE_SART_KUNIT_TEST
+	bool "KUnit tests for the Apple SART DMA address filter" if !KUNIT_ALL_TESTS
+	depends on APPLE_SART=y && KUNIT=y
+	depends on ARM64 && OF
+	default KUNIT_ALL_TESTS
+	help
+	  Add and remove allowed regions on a SART whose registers are a
+	  buffer of kernel memory, and check the register encoding of each
+	  SART generation, the handling of a full table, of regions that are
+	  not whole pages and of the bootloader's entries, and what a
+	  firmware-driven sleep saves, restores and refuses. The tests touch
+	  no hardware.
+
+	  If unsure, say N.
+
 config APPLE_TUNABLE
 	tristate
 	depends on ARCH_APPLE || COMPILE_TEST
