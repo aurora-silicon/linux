@@ -105,7 +105,8 @@ ASAHI_TESTS = {
     'aop-bootargs-tests.py': [([], PASS)],
     # 24dc422773c9 registers another child device for each repeated service announcement.
     'aop-service-tests.py': [([], PASS),
-                             (['--old-ref', '24dc422773c9beb9e99ee9e1ab713e9d6abb1e7b'], PASS)],
+                             (['--old-ref', '24dc422773c9beb9e99ee9e1ab713e9d6abb1e7b'], PASS)]
+        + mutations('--mutation', ('no-work-release', 'no-slot-release', 'no-register-release'), [], PASS),
     'mtp-pm-tests.py': [(out(), PASS),
                          (out() + ['--old-transport', '4db3a5a22c43'], PASS),
                          (out() + ['--old-mouse', '62d2045d8928'], PASS)],
