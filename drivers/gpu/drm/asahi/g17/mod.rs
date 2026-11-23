@@ -1291,14 +1291,14 @@ struct Shared {
     /// step). Publishers without the device mutex set it too.
     governor_activity_ns: AtomicU64,
     /// The queue of all work that signals job fences: the event work, and every scheduler's
-    /// timeout work. Memory reclaim may wait on those fences, so it is reclaim-safe and per-CPU
-    /// high priority, as `system_highpri_wq`. On M5, `enqueue_on(submitter)` places completion
-    /// processing directly on the submitting CPU (keeping it in the submitter's L2 and die).
+    /// timeout work. Memory reclaim may wait on those fences, so it is reclaim-safe, and it is
+    /// high priority, as `system_highpri_wq`. [`Self::new_events_queue`] says where the event
+    /// work runs.
     events: Arc<workqueue::OwnedQueue>,
     /// Preallocated completion collector owned exclusively by `run_runtime_events`.
     #[pin]
     worker_deferred: Mutex<Option<runtime::DeferredBatch>>,
-    /// M5: the event work follows the submitting CPU.
+    /// M5: the event work runs beside the CPU that last published work, in its affinity pod.
     follows_submitter: bool,
     /// Multi-die M5: restrict each scheduler's ordered submit queue to the creating CPU's
     /// cluster to avoid cross-die migration. Single-die M5 parts leave schedulers unpinned so
@@ -1492,6 +1492,28 @@ impl Shared {
     /// The queue for the schedulers' timeout work, which signals the fences of timed-out jobs.
     pub(super) fn fence_queue(&self) -> Arc<workqueue::OwnedQueue> {
         self.events.clone()
+    }
+
+    /// The queue of [`Self::events`].
+    ///
+    /// Event work that follows the submitter is aimed at the publishing CPU by
+    /// [`Self::queue_event_records`]. Its queue is unbound, so that CPU only selects the affinity
+    /// pod, the CPUs sharing its L2, and the scheduler wakes the worker on an idle CPU of the pod:
+    /// beside the submitter and on its die, wherever the completion interrupt was taken. On a
+    /// per-CPU queue the worker would run on the submitting CPU itself and, with the higher
+    /// priority, preempt the submitter for every completion, often in the middle of a publication
+    /// holding the locks the event work takes next. As their owner would not be running, the
+    /// worker could not spin on them: it would sleep until the submitter unlocks and then preempt
+    /// it again, two context switches of the submitter per completion.
+    ///
+    /// Otherwise the queue is per-CPU and the event work runs on the CPU that queues it, as on
+    /// `system_highpri_wq`.
+    fn new_events_queue(follows_submitter: bool) -> Result<workqueue::OwnedQueue> {
+        if follows_submitter {
+            workqueue::OwnedQueue::new_unbound_reclaim(c"aurora_g17_events", true)
+        } else {
+            workqueue::OwnedQueue::new_percpu_reclaim(c"aurora_g17_events", true)
+        }
     }
 
     /// Whether each scheduler's submit queue should be restricted to the creating CPU's cluster
@@ -1785,10 +1807,9 @@ impl Gpu {
         let render_policy = if m5 { Some(render_resources::M5Policy::new(&id)?) } else { None };
         // The bare-metal M5 boot runs both engines; other M5 profiles take no submission.
         let submits = !m5 || cfg.profile == FirmwareProfile::M5PublishedRoots;
-        let events = Arc::new(
-            workqueue::OwnedQueue::new_percpu_reclaim(c"aurora_g17_events", true)?,
-            GFP_KERNEL,
-        )?;
+        // The event work follows the submitter on M5, which decides its queue's kind.
+        let follows_submitter = m5;
+        let events = Arc::new(Shared::new_events_queue(follows_submitter)?, GFP_KERNEL)?;
         let frequencies = Self::state_frequencies(dev, cfg, variant, id.num_clusters)?;
         let max_pstate = frequencies
             .as_ref()
@@ -1839,7 +1860,7 @@ impl Gpu {
                     Some(worker_deferred),
                     "g17::Shared::worker_deferred"
                 ),
-                follows_submitter: m5,
+                follows_submitter,
                 pin_scheduler_cluster: m5 && id.num_dies > 1,
                 submitter: AtomicU32::new(u32::MAX),
                 grow <- new_work!("g17::Shared::grow"),
