@@ -205,6 +205,9 @@ pub(super) const BUILD_25G83: fw::variant::Build = fw::variant::Build {
     ],
     // Four clusters: the tiler segment values of 25F84 on this machine.
     variant: &fw::variant::Variant {
+        // Tiling and fragment kicks wait on their own prefixes (host path, !m5_commands);
+        // unmeasured on the M4 Pro, which keeps false.
+        render_stage_prefixes: true,
         ta_mode_1: true,
         ..fw::variant::V25G83
     },
