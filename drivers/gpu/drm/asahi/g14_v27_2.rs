@@ -299,6 +299,7 @@ pub(crate) fn start<'a>(pdev: &'a platform::Device<device::Core<'_>>, cfg: &'sta
 struct Inflight {
     packet: Arc<Packet>,
     last: bool,
+    publication_error: Option<Error>,
     stamp: event::EventValue,
     slot: usize,
     /// Queue publications up to and including this command, counted from take-over.
@@ -335,8 +336,24 @@ struct State {
     capacity: u32,
     inflight: KVec<Inflight>,
     pending: KVec<(Arc<Packet>, usize)>,
+    accepting: bool,
     submitted: u64,
     retired: u64,
+}
+
+impl State {
+    /// Stop publishing this packet. Report failure only once any published prefix retires.
+    fn fail_publication(&mut self, packet: &Arc<Packet>, err: Error) {
+        let _ = self.pending.remove(0);
+        if let Some(last) = self.inflight.iter_mut().rev()
+            .find(|flight| Arc::ptr_eq(&flight.packet, packet))
+        {
+            last.publication_error = Some(err);
+        } else {
+            packet.release_guard();
+            packet.finish(Err(err));
+        }
+    }
 }
 
 #[pin_data(PinnedDrop)]
@@ -396,6 +413,7 @@ impl Runtime {
         let mut guard = self.state.lock();
         let state = Option::as_mut(&mut *guard).ok_or(ENODEV)?;
         if !self.healthy() { return Err(EIO); }
+        if !state.accepting { return Err(ENODEV); }
         state.pending.push((packet, 0), GFP_KERNEL)?;
         self.pump(state);
         Ok(())
@@ -483,9 +501,7 @@ impl Runtime {
             let (packet, index) = (state.pending[0].0.clone(), state.pending[0].1);
             let Command::Compute(control) = packet.commands[index] else {
                 // Queues of this backend accept only compute commands (Queue::submit).
-                let _ = state.pending.remove(0);
-                if !(packet.may_be_published() && index != 0) { packet.release_guard(); }
-                packet.finish(Err(EINVAL));
+                state.fail_publication(&packet, EINVAL);
                 continue;
             };
             let slot = state.next_slot;
@@ -506,7 +522,7 @@ impl Runtime {
                 let command = state.pool.encode(slot, &state.queue, stamp.raw(), &job)?;
                 let publication = state.root.stage_compute(command)?;
                 state.inflight.push(Inflight { packet: packet.clone(), last, stamp, slot, ordinal,
-                    started: Instant::now(), _bind: bind }, GFP_KERNEL)?;
+                    publication_error: None, started: Instant::now(), _bind: bind }, GFP_KERNEL)?;
                 packet.mark_published();
                 publication.commit();
                 Ok(())
@@ -528,11 +544,7 @@ impl Runtime {
                 Err(EBUSY) if !state.inflight.is_empty() => return,
                 Err(e) => {
                     dev_err!(self.dev, "GPU: compute publication failed {:?}\n", e);
-                    let _ = state.pending.remove(0);
-                    if !state.inflight.iter().any(|flight| Arc::ptr_eq(&flight.packet, &packet)) {
-                        packet.release_guard();
-                    }
-                    packet.finish(Err(e));
+                    state.fail_publication(&packet, e);
                 }
             }
         }
@@ -596,7 +608,10 @@ impl Runtime {
                     }
                     state.busy &= !(1 << done.slot);
                     state.retired += 1;
-                    if done.last {
+                    if let Some(err) = done.publication_error {
+                        done.packet.release_guard();
+                        done.packet.finish(Err(err));
+                    } else if done.last {
                         done.packet.retired();
                     } else if !state.inflight.iter().any(|flight| Arc::ptr_eq(&flight.packet, &done.packet))
                         && !state.pending.iter().any(|(packet, _)| Arc::ptr_eq(packet, &done.packet))
@@ -666,17 +681,20 @@ impl Runtime {
     /// Stops the firmware: retire or fail outstanding work, allow power-off, then halt the ASC
     /// with every mapping still in place (RTKit power-off if the firmware does not stop).
     pub(crate) fn stop(&self) {
-        // Let published work retire; the service signals `idle` when nothing is left.
+        // Close admission while the service retires work already accepted.
         {
             let mut guard = self.state.lock();
+            let Some(state) = Option::as_mut(&mut *guard) else { return; };
+            state.accepting = false;
             let start = Instant::<Monotonic>::now();
             while self.healthy() && start.elapsed() < Delta::from_millis(STOP_DRAIN_MS.into()) {
                 let Some(state) = guard.as_ref() else { break; };
                 if state.inflight.is_empty() && state.pending.is_empty() { break; }
                 let _ = self.idle.wait_timeout(&mut guard, msecs_to_jiffies(STOP_DRAIN_MS));
             }
+            // Serialize the last permitted publication with the transition to shutdown.
+            self.healthy.store(false, Ordering::Release);
         }
-        self.healthy.store(false, Ordering::Release);
         // Nothing queues service work after the detach, and none is queued or running once the
         // drain returns, so no work outlives the module.
         drop(self.notify.detach());
@@ -790,6 +808,7 @@ impl Backend {
             capacity,
             inflight: KVec::new(),
             pending: KVec::new(),
+            accepting: true,
             submitted: 0,
             retired: 0,
         });
