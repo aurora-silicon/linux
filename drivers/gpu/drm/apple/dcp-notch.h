@@ -114,6 +114,17 @@ static inline bool dcp_notch_offer(bool notch_free, enum dcp_notch_policy effect
 }
 
 /*
+ * Whether a probe offers only the notch-free geometry, which then sets the
+ * physical height it reports.  A bounded probe (the console) gets the
+ * notch-free size whatever the policy, so that the size it keeps in its
+ * screen info does not change with the compositor's geometry.
+ */
+static inline bool dcp_notch_free_only(enum dcp_notch_policy effective, bool full_fits)
+{
+	return effective == DCP_NOTCH_HIDDEN || !full_fits;
+}
+
+/*
  * The physical height of the notch-free geometry: the panel's adj-height-mm
  * if it gives one, else the full height scaled by the rows.
  */

@@ -595,6 +595,21 @@ int main(void)
     pref = true; assert(dcp_notch_offer(true, DCP_NOTCH_HIDDEN, false, &pref) && pref);
     assert(dcp_notch_full_fits(0, 1864) && dcp_notch_full_fits(1864, 1864));
     assert(!dcp_notch_full_fits(1800, 1864) && dcp_notch_full_fits(1800, 0));
+    /*
+     * The reported physical height is the notch-free one exactly when the
+     * probe offers only the notch-free geometry, so the console's bounded
+     * re-probe keeps the size of its first probe whatever the policy.
+     */
+    for (int e = DCP_NOTCH_HIDDEN; e <= DCP_NOTCH_SHOWN; e++)
+        for (int ff = 0; ff <= 1; ff++) {
+            bool pf = true, pu = true;
+            bool f_off = dcp_notch_offer(true, e, ff, &pf);
+            bool u_off = dcp_notch_offer(false, e, ff, &pu);
+
+            assert(dcp_notch_free_only(e, ff) == (f_off && !u_off));
+        }
+    assert(dcp_notch_free_only(DCP_NOTCH_SHOWN, false));
+    assert(!dcp_notch_free_only(DCP_NOTCH_SHOWN, true));
     /* No notch rows: no twins. */
     {
         unsigned k = 1;

@@ -2840,9 +2840,9 @@ int dcp_get_modes(struct drm_connector *connector)
 				     &connector->display_info.width_mm);
 		of_property_read_u32(dcp->dev->of_node, "apple,panel-height-mm",
 				     &connector->display_info.height_mm);
-		/* The physical size follows the geometry offered to a compositor. */
-		if (free.vdisplay < fixed.vdisplay && full_fits &&
-		    effective == DCP_NOTCH_HIDDEN)
+		/* The physical size follows the geometry this probe offers. */
+		if (free.vdisplay < fixed.vdisplay &&
+		    dcp_notch_free_only(effective, full_fits))
 			connector->display_info.height_mm =
 				dcp_notch_free_mm(connector->display_info.height_mm,
 						  dcp->panel.adj_height_mm, fixed.vdisplay,
@@ -3040,9 +3040,10 @@ edid_done:
 					READ_ONCE(dcp->notch_owned));
 	full_fits = dcp_notch_full_fits(apple_connector->probe_max_y,
 					READ_ONCE(dcp->notch_panel_rows));
-	/* What a compositor is offered sets the reported physical size. */
-	if (full_fits && dcp->notch_rows && dcp_notch_dynamic(dcp))
-		WRITE_ONCE(dcp->notch_free_offered, effective == DCP_NOTCH_HIDDEN);
+	/* What this probe offers sets the reported physical size. */
+	if (dcp->notch_rows && dcp_notch_dynamic(dcp))
+		WRITE_ONCE(dcp->notch_free_offered,
+			   dcp_notch_free_only(effective, full_fits));
 	for (i = 0; i < nr_modes; ++i) {
 		bool preferred = modes[i].mode.type & DRM_MODE_TYPE_PREFERRED;
 
