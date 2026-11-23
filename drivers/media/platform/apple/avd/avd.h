@@ -46,6 +46,8 @@
 /* A reset after a timeout hangs the machine: stay parked and retire the decoder */
 #define AVD_QUIRK_NO_RECOVERY_RESET BIT(5)
 
+#define AVD_QUIRK_KOPSIA BIT(6)
+
 #define VP_SLOT_NONE		255
 #define INST_FIFO_SLOT_NONE	255
 
@@ -300,7 +302,12 @@ struct avd_segment {
 
 struct avd_job {
 	enum avd_codec codec;
+	/* index of the segment being written */
 	size_t num;
+	/* segments allocated */
+	size_t max;
+	/* an instruction did not fit; the job must not be submitted */
+	bool overflow;
 	struct avd_segment *segments;
 };
 
@@ -370,6 +377,13 @@ bool avd_h264_slice_fits(const struct v4l2_ctrl_h264_sps *sps, size_t held,
 			 size_t held_bytes, u32 len, size_t decoded_size);
 bool avd_h264_scaling_is_flat(const struct v4l2_ctrl_h264_pps *pps,
 			      const struct v4l2_ctrl_h264_scaling_matrix *scaling);
+int avd_hevc_check_sps_geometry(const struct v4l2_ctrl_hevc_sps *sps);
+int avd_hevc_check_tiles(const struct v4l2_ctrl_hevc_sps *sps,
+			 const struct v4l2_ctrl_hevc_pps *pps);
+int avd_hevc_kunit_compute_tiles(const struct v4l2_ctrl_hevc_sps *sps,
+				 const struct v4l2_ctrl_hevc_pps *pps,
+				 u32 *tile_ids, size_t n);
+int avd_vp9_check_tiling(const struct v4l2_ctrl_vp9_frame *frame);
 #endif
 
 extern const struct avd_coded_fmt_ops avd_h264_fmt_ops;
@@ -410,6 +424,9 @@ void avd_queue_add_ctx(struct avd_ctx *ctx);
 void avd_queue_del_ctx(struct avd_ctx *ctx);
 int avd_open_build_program(struct avd_ctx *ctx);
 extern const struct avd_backend_ops avd_open_backend;
+extern const struct avd_backend_ops avd_kopsia_backend;
+int avd_open_submit(struct avd_dev *avd, struct avd_frame *f);
+irqreturn_t avd_open_complete(struct avd_dev *avd, u32 status);
 extern const struct avd_backend_ops avd_apple_backend;
 extern const struct avd_backend_ops avd_qfw_backend;
 struct avd_qfw;

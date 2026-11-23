@@ -121,3 +121,7 @@ void DCP_FW_NAME(iomfb_start)(struct apple_dcp *dcp)
 
 #undef DCP_FW_VER
 #undef DCP_FW
+
+#if IS_ENABLED(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST)
+#include "iomfb-legacy-methods-test.c"
+#endif

@@ -832,4 +832,5 @@ static struct kunit_suite hwx_suite = {
 };
 
 kunit_test_suite(hwx_suite);
+MODULE_DESCRIPTION("KUnit tests for Apple ANE HWX loading");
 MODULE_LICENSE("Dual MIT/GPL");

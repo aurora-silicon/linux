@@ -3,9 +3,11 @@
 //! Qualified V25G83/V26A428 statistics, decoded from complete copied records.
 //! No record of these firmwares measures power or temperature.
 //!
-//! The 26A428 firmware (the A18 Pro's, and the M5's) reports the performance state the
-//! GPU runs at (tags 0x19 and 0x1b), and its utilisation records carry their own
-//! timestamps, from which busy time is integrated ([`Protocol`]). 25G83 sends neither.
+//! The 26A428 firmware (the A18 Pro's, and the M5's) and T6041's 25G83
+//! firmware report the performance state the GPU runs at (tags 0x19 and 0x1b),
+//! and their utilisation records carry their own timestamps, from which busy
+//! time is integrated ([`Protocol`]). T6040's 25G83 is left on `Protocol::NONE`
+//! because it has not been measured yet.
 //! All state is protected by the device mutex.
 
 pub(super) const UNAVAILABLE: u32 = 0;
@@ -50,34 +52,34 @@ const TIMER_HZ: u64 = 24_000_000;
 /// What a firmware reports beyond utilisation.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Protocol {
-    /// Highest performance state its state records (tags 0x19 and 0x1b) name; zero where it
-    /// sends none. State 0 is off.
-    pub(crate) max_pstate: u32,
+    /// Emits performance state reports in tags 0x19 (interval) and 0x1b (state).
+    pub(crate) reports_pstate: bool,
     /// Interval of its utilisation record (tag 0x13), in timer ticks, whose timestamps busy
     /// time is integrated from; zero where it is not integrated.
     pub(crate) util_period_ticks: u64,
 }
 
 impl Protocol {
-    /// 25G83: utilisation only.
+    /// Utilisation only: no 0x19/0x1b performance state reports and no busy-time integration.
     pub(crate) const NONE: Self = Self {
-        max_pstate: 0,
+        reports_pstate: false,
         util_period_ticks: 0,
     };
-    /// M5: the device tree's operating points 1 to 13, utilisation every 8 ms.
-    pub(crate) const M5: Self = Self {
-        max_pstate: 13,
+    /// Performance state reports (tags 0x19/0x1b) and 8 ms timestamped utilisation records
+    /// (192000 ticks at 24 MHz), as emitted by V26A428 M5 and T6041 25G83.
+    pub(crate) const PSTATE_8MS: Self = Self {
+        reports_pstate: true,
         util_period_ticks: 192_000,
     };
-    /// A18 Pro: states 1 to 10 of its eleven-state performance tables, utilisation every
-    /// 16 ms.
-    pub(crate) const A18_PRO: Self = Self {
-        max_pstate: 10,
+    /// Performance state reports (tags 0x19/0x1b) and 16 ms timestamped utilisation records
+    /// (384000 ticks at 24 MHz), as emitted by V26A428 on A18 Pro.
+    pub(crate) const PSTATE_16MS: Self = Self {
+        reports_pstate: true,
         util_period_ticks: 384_000,
     };
 
     pub(crate) const fn reports_pstate(self) -> bool {
-        self.max_pstate != 0
+        self.reports_pstate
     }
 
     fn integrates_busy(self) -> bool {
@@ -109,6 +111,9 @@ pub(super) struct Telemetry {
     gated: bool,
     /// The records decoded beyond utilisation.
     protocol: Protocol,
+    /// Highest valid performance state index for tags 0x19/0x1b, derived from the device's
+    /// state-frequency table; zero fails closed and rejects all 0x1b states.
+    max_pstate: u32,
     /// Timestamp of the latest utilisation record in this epoch: the start of the window the
     /// next one closes.
     busy_ts: Option<u64>,
@@ -118,10 +123,12 @@ pub(super) struct Telemetry {
 }
 
 impl Telemetry {
-    /// Decoder for a firmware that also sends `protocol`'s records.
-    pub(super) fn new(protocol: Protocol) -> Self {
+    /// Decoder for a firmware that also sends `protocol`'s records, bounding 0x1b performance
+    /// state indices to `1..=max_pstate`.
+    pub(super) fn new(protocol: Protocol, max_pstate: u32) -> Self {
         Self {
             protocol,
+            max_pstate,
             ..Self::default()
         }
     }
@@ -235,16 +242,16 @@ impl Telemetry {
                 self.view.pstate_status = if words[6] <= 10 { VALID } else { UNAVAILABLE };
                 self.view.pstate = words[6];
             }
-            // 26A428: the interval [words 3-4, words 1-2] that just ended. Its end
-            // timestamps the state report that follows it.
+            // The interval [words 3-4, words 1-2] that just ended. Its end timestamps the
+            // state report that follows it.
             0x19 if self.protocol.reports_pstate() => {
                 self.pstate_interval_end = Some(u64::from(words[1]) | (u64::from(words[2]) << 32));
             }
-            // 26A428: the performance state now in effect, in words 1 and 3. A report whose
-            // two words differ is not used.
+            // The performance state now in effect, in words 1 and 3. A report whose two
+            // words differ is not used.
             0x1b if self.protocol.reports_pstate() => {
                 let pstate = words[1];
-                if pstate != words[3] || pstate == 0 || pstate > self.protocol.max_pstate {
+                if pstate != words[3] || pstate == 0 || pstate > self.max_pstate {
                     self.view.pstate_status = UNAVAILABLE;
                     return;
                 }
@@ -533,7 +540,7 @@ mod tests {
 
     #[test]
     fn m5_state_reports_give_the_pstate() {
-        let mut stats = Telemetry::new(Protocol::M5);
+        let mut stats = Telemetry::new(Protocol::PSTATE_8MS, 13);
         stats.record(&M5_INTERVAL, 100, AGE);
         assert_eq!(stats.read(100, AGE).pstate_status, UNAVAILABLE);
         stats.record(&M5_STATE, 101, AGE);
@@ -564,7 +571,7 @@ mod tests {
 
     #[test]
     fn m5_busy_time_integrates_utilisation_windows() {
-        let mut stats = Telemetry::new(Protocol::M5);
+        let mut stats = Telemetry::new(Protocol::PSTATE_8MS, 13);
         assert_eq!(
             (stats.read(0, AGE).busy_status, stats.read(0, AGE).busy_ns),
             (VALID, 0)
@@ -604,7 +611,7 @@ mod tests {
 
     #[test]
     fn a18_pro_state_reports_give_the_pstate() {
-        let mut stats = Telemetry::new(Protocol::A18_PRO);
+        let mut stats = Telemetry::new(Protocol::PSTATE_16MS, 10);
         let mut interval = M5_INTERVAL;
         let mut state = M5_STATE;
         (state[1], state[3]) = (10, 10);
@@ -633,7 +640,7 @@ mod tests {
 
     #[test]
     fn a18_pro_busy_time_integrates_16_ms_windows() {
-        let mut stats = Telemetry::new(Protocol::A18_PRO);
+        let mut stats = Telemetry::new(Protocol::PSTATE_16MS, 10);
         let mut words = M5_U[0];
         stats.record(&words, 100, AGE);
         // One full 16 ms window at 100%, then one at 25%.
@@ -651,6 +658,79 @@ mod tests {
         words[1] += 768_001;
         stats.record(&words, 104, AGE);
         assert_eq!(stats.read(104, AGE).busy_ns, 28_000_000);
+    }
+
+    #[test]
+    fn t6041_state_reports_give_the_pstate() {
+        let mut stats = Telemetry::new(Protocol::PSTATE_8MS, 10);
+        let mut interval = M5_INTERVAL;
+        let mut state = M5_STATE;
+        (state[1], state[3]) = (10, 10);
+        stats.record(&interval, 100, AGE);
+        stats.record(&state, 101, AGE);
+        let view = stats.read(101, AGE);
+        assert_eq!((view.pstate_status, view.pstate), (VALID, 10));
+        assert_eq!(view.pstate_timestamp, 0x59_3c04_2f8f);
+        // Mismatched words, off, or beyond state 10 (even though M5 shares PSTATE_8MS with
+        // max_pstate 13): not a state.
+        for (a, b) in [(1, 10), (0, 0), (11, 11), (13, 13)] {
+            (state[1], state[3]) = (a, b);
+            stats.record(&state, 102, AGE);
+            assert_eq!(stats.read(102, AGE).pstate_status, UNAVAILABLE);
+        }
+        // Tag 0x10 is not this firmware's state report.
+        interval[1] += 1;
+        stats.record(&interval, 103, AGE);
+        stats.record(&P1, 103, AGE);
+        assert_eq!(stats.read(103, AGE).pstate_status, UNAVAILABLE);
+        (state[1], state[3]) = (1, 1);
+        stats.record(&state, 104, AGE);
+        assert_eq!(stats.read(104, AGE).pstate, 1);
+        // Gated cores are off.
+        stats.gate();
+        let view = stats.read(105, AGE);
+        assert_eq!((view.pstate_status, view.pstate), (VALID, 0));
+        stats.invalidate();
+        assert_eq!(stats.read(106, AGE).pstate_status, STALE);
+    }
+
+    #[test]
+    fn t6041_busy_time_integrates_8_ms_windows() {
+        let mut stats = Telemetry::new(Protocol::PSTATE_8MS, 10);
+        let mut words = M5_U[0];
+        stats.record(&words, 100, AGE);
+        // One full 8 ms window at 100%, then one at 50%.
+        words[1] += 192_000;
+        stats.record(&words, 101, AGE);
+        assert_eq!(stats.read(101, AGE).busy_ns, 8_000_000);
+        words[1] += 192_000;
+        words[6] = 50;
+        stats.record(&words, 102, AGE);
+        assert_eq!(stats.read(102, AGE).busy_ns, 12_000_000);
+        // Up to two periods (16 ms) is one window; longer is a gap.
+        words[1] += 384_000;
+        stats.record(&words, 103, AGE);
+        assert_eq!(stats.read(103, AGE).busy_ns, 20_000_000);
+        words[1] += 384_001;
+        stats.record(&words, 104, AGE);
+        assert_eq!(stats.read(104, AGE).busy_ns, 20_000_000);
+    }
+
+    #[test]
+    fn zero_max_pstate_fails_closed() {
+        for protocol in [Protocol::PSTATE_8MS, Protocol::PSTATE_16MS] {
+            let mut stats = Telemetry::new(protocol, 0);
+            stats.record(&M5_INTERVAL, 100, AGE);
+            for pstate in [0, 1, 10, 13] {
+                let mut words = M5_STATE;
+                (words[1], words[3]) = (pstate, pstate);
+                stats.record(&words, 101, AGE);
+                assert_eq!(stats.read(101, AGE).pstate_status, UNAVAILABLE);
+            }
+            // Tag 0x10 is still ignored when the protocol reports 0x19/0x1b.
+            stats.record(&P1, 102, AGE);
+            assert_eq!(stats.read(102, AGE).pstate_status, UNAVAILABLE);
+        }
     }
 
     #[test]
