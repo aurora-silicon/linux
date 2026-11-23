@@ -145,7 +145,8 @@ VISIBLE_IF_KUNIT int ane_bo_check_size(u64 size, u64 iova_span)
 {
 	if (!size)
 		return -EINVAL;
-	if (size > iova_span || round_up(size, PAGE_SIZE) > iova_span)
+	if (size > iova_span || size > U64_MAX - (PAGE_SIZE - 1) ||
+	    round_up(size, PAGE_SIZE) > iova_span)
 		return -E2BIG;
 	return 0;
 }

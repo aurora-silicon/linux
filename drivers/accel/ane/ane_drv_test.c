@@ -182,6 +182,12 @@ static const struct ane_bo_size_case ane_bo_size_cases[] = {
 	{ "page count past u32", (u64)PAGE_SIZE << 32, ANE_TEST_SPAN, -E2BIG },
 	{ "largest u64", U64_MAX, ANE_TEST_SPAN, -E2BIG },
 	{ "rounds up past a smaller range", SZ_16K + 1, SZ_16K + 1, -E2BIG },
+	/* round_up() would wrap to 0 below these, for any range. */
+	{ "largest u64, whole u64 range", U64_MAX, U64_MAX, -E2BIG },
+	{ "one byte past the last whole page, whole u64 range",
+	  U64_MAX - (PAGE_SIZE - 1) + 1, U64_MAX, -E2BIG },
+	{ "last whole page, whole u64 range", U64_MAX - (PAGE_SIZE - 1),
+	  U64_MAX, 0 },
 };
 
 KUNIT_ARRAY_PARAM_DESC(ane_bo_size, ane_bo_size_cases, desc);
