@@ -1680,6 +1680,18 @@ int swsusp_invalidate_sig(void)
 }
 
 /**
+ * swsusp_free_image_swap - Free the swap pages of an image that was not restored.
+ *
+ * The pages that hold an image written by this kernel are allocated in its own
+ * swap map. If this kernel goes on instead of the image (a test_resume restore
+ * that failed), nothing frees them, and swapoff then waits for them forever.
+ */
+void swsusp_free_image_swap(void)
+{
+	free_all_swap_pages(root_swap);
+}
+
+/**
  * swsusp_unmark - Unmark swsusp signature in the resume device
  *
  * Return: 0 on success, negative error code on failure.

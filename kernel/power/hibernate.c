@@ -1102,6 +1102,11 @@ int hibernate(void)
 			hibernate_set_loading(false);
 			hibernate_loading_own_image = false;
 		}
+		/*
+		 * Still here, so the image was not restored, and the swap
+		 * pages that hold it are allocated in this kernel's swap map.
+		 */
+		swsusp_free_image_swap();
 	}
 	thaw_processes();
 

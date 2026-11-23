@@ -204,6 +204,7 @@ extern int swsusp_read(unsigned int *flags_p);
 extern int swsusp_write(unsigned int flags);
 void swsusp_close(void);
 int swsusp_invalidate_sig(void);
+void swsusp_free_image_swap(void);
 #ifdef CONFIG_SUSPEND
 extern int swsusp_unmark(void);
 #else
