@@ -288,7 +288,6 @@
 };
 
 #include "hwmon-laptop.dtsi"
-#include "t8112-hwmon.dtsi"
 /*
  * Mesa fingerprint sensor on spi2 (J415 ADT /arm-io/spi2/mesa): power on AP
  * GPIO 178, active high, and data-ready on AP GPIO 177. The data-ready edge
