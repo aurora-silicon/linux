@@ -191,6 +191,14 @@ properties:
       Linux ownership provider to acquire a quiesced device and isolate
       the exclave DART contexts. Absence does not prove a handoff on T8140.
 
+  performance-domains:
+    maxItems: 1
+    description:
+      The CPU cluster performance domain (a cluster cpufreq controller) to
+      hold up while requests run. The driver raises that cluster's minimum
+      frequency to its maximum and keeps its CPUs out of deep idle from the
+      first request until shortly after the last one ends.
+
 required:
   - compatible
   - reg
