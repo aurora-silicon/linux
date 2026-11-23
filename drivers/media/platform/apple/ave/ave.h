@@ -259,7 +259,10 @@ struct ave_variant {
 	 * The same encoder running another firmware build that a newer
 	 * bootloader preloads, with a start and command protocol of its own.
 	 * The firmware segment sizes the bootloader reserved select it.
-	 * NULL when there is none.
+	 * NULL when there is none. Use builds[] when the builds differ only
+	 * in TEXT CRC (and command layout) but start the same way; use
+	 * next_build when a build needs other start fields (boot device,
+	 * handshake type, boot word, DATA handling) and has sizes of its own.
 	 */
 	const struct ave_variant *next_build;
 
@@ -580,6 +583,7 @@ extern const struct ave_variant ave_t6000, ave_t6041, ave_t8112, ave_t8132,
 /* ave-fw.c */
 u64 ave_fw_vcbar(const struct ave_variant *variant, u64 text_iova);
 int ave_fw_probe(struct ave_dev *ave);
+bool ave_fw_sizes_match(const struct ave_variant *v, size_t text, size_t data);
 const struct ave_variant *ave_fw_select_build(const struct ave_variant *v,
 					      size_t text, size_t data);
 int ave_fw_text_id_crc(const void *text, size_t size, u32 cell_off,
