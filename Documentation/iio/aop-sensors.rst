@@ -58,8 +58,12 @@ sysfs reads start them on demand and stop them again once reads go quiet. A
 failed direct-read start backs off for the same idle window so polling clients
 cannot hammer a failing service. The calibration packets are sent once at probe
 and conservatively again after firmware suspend, hibernation or restore, rather
-than on every start or s2idle resume. Around system sleep any active stream is
-stopped and restored on wake only if a buffer is still enabled.
+than on every start or s2idle resume. Some firmware, such as the M1 Pro's,
+applies every packet it receives on top of the calibration it already holds, so
+the driver first reads the service's calibration state (property 61) and skips
+the packets when it is set, as after a rebind; after sending them it sets the
+state to 2. Around system sleep any active stream is stopped and restored on
+wake only if a buffer is still enabled.
 
 If both devices bind but every raw read returns ``ENODATA``, check the AOP
 core's ``nCal`` boot argument for the SoC. The T6040 firmware accepts the
