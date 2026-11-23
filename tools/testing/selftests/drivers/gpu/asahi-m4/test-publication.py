@@ -117,7 +117,7 @@ impl Progress {
     fn count(&self)->u32{self.count}
     fn set_pending(&self,v:bool){self.pending.store(v,Ordering::Relaxed)}
 }
-struct Resources;impl Resources{fn compute_units(&self)->Result<usize>{Ok(2)}fn render_passes(&self)->Result<usize>{Ok(8)}fn pb_slots(&self)->Result<usize>{Ok(2)}fn pb_heap_blocks(&self)->Result<u32>{Ok(512)}}
+struct Resources;impl Resources{fn compute_units(&self)->Result<usize>{Ok(2)}fn render_passes(&self)->Result<usize>{Ok(8)}fn pb_slots(&self)->Result<usize>{Ok(2)}fn pb_slot_mask(&self)->Result<(u32,usize)>{Ok((0b11,0))}fn pb_heap_blocks(&self)->Result<u32>{Ok(512)}}
 struct Job { id:u32,vm:Arc<Vm>,queue:Arc<Queue>,progress:Progress,commands:Vec<Command>,dependency:Result,terminal_marked:AtomicBool,resources:Resources }
 impl Job {
     fn check_command_dependencies(&self,_index:u32)->Result{self.dependency}
@@ -162,9 +162,11 @@ impl Pools{
     fn exhausted(&self)->bool{self.exhausted}
     fn exhausted_for(&self,vm:&Vm)->bool{self.exhausted_vm==Some(vm.slot)}
     fn exhausted_for_within(&self,vm:&Vm,_limit:usize)->bool{self.exhausted_for(vm)}
+    fn exhausted_for_mask(&self,vm:&Vm,_mask:u32,_home:usize)->bool{self.exhausted_for(vm)}
     fn can_pipeline(&self,vm:&Arc<Vm>)->bool{self.block_pipeline_vm!=Some(vm.slot)}
     fn can_pipeline_within(&self,vm:&Arc<Vm>,_limit:usize)->bool{self.can_pipeline(vm)}
     fn can_pipeline_within_blocks(&self,vm:&Arc<Vm>,limit:usize,_min_blocks:u32)->bool{self.can_pipeline_within(vm,limit)}
+    fn can_pipeline_in_mask_blocks(&self,vm:&Arc<Vm>,_mask:u32,_home:usize,_min_blocks:u32)->bool{self.can_pipeline(vm)}
 }
 mod encode {
     pub struct ComputeRefs{pub invalid:bool}
@@ -744,6 +746,7 @@ impl QueueBehindPools{
     fn can_pipeline(&self,vm:&Arc<Vm>)->bool{self.can_pipeline&&self.block_pipeline_vm!=Some(vm.slot)}
     fn can_pipeline_within(&self,vm:&Arc<Vm>,_limit:usize)->bool{self.can_pipeline(vm)}
     fn can_pipeline_within_blocks(&self,vm:&Arc<Vm>,limit:usize,_min_blocks:u32)->bool{self.can_pipeline_within(vm,limit)}
+    fn can_pipeline_in_mask_blocks(&self,vm:&Arc<Vm>,_mask:u32,_home:usize,_min_blocks:u32)->bool{self.can_pipeline(vm)}
 }
 struct QueueBehindHost{graph:QueueBehindGraph,engine:QueueBehindEngine,slots:QueueBehindSlots,pools:QueueBehindPools}
 mod queue_behind_scope {

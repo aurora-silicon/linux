@@ -1148,9 +1148,26 @@ impl Slots {
         geo: &Geometry,
         picked: u64,
     ) -> Option<usize> {
+        self.pick_pass_in_for(resources, geo, picked, None)
+    }
+    /// Selects a render pass slot in `resources` with capacity for `geo`, preferring slots
+    /// already owned by `vm_id` (clean before dirty) and unowned slots before retargeting
+    /// another VM's warm pass slot.
+    pub(crate) fn pick_pass_in_for(
+        &self,
+        resources: &super::resources::Prepared,
+        geo: &Geometry,
+        picked: u64,
+        vm_id: Option<u64>,
+    ) -> Option<usize> {
         let n = resources.render_passes().ok()?.min(sizes::RENDER_SLOTS);
-        let mut clean_partial = None;
-        let mut fallback = None;
+        let mut same_clean_partial = None;
+        let mut same_dirty = None;
+        let mut unowned_clean = None;
+        let mut unowned_dirty = None;
+        let mut other_full_clean = None;
+        let mut other_clean_partial = None;
+        let mut other_dirty = None;
         let mut saw_scrubbing = false;
         for i in 0..n {
             let k = (self.pass_cursor as usize + i) % n;
@@ -1166,22 +1183,55 @@ impl Slots {
                     saw_scrubbing = true;
                     continue;
                 }
-                if self.scrub.is_clean(k) {
-                    if let Ok(d) = resources.render_pass_dirty(k) {
+                let clean = self.scrub.is_clean(k);
+                let full_clean = clean
+                    && resources.render_pass_dirty(k).is_ok_and(|d| {
                         let need = d.tilemap.load(Ordering::Acquire).min(geo.tilemap_bytes);
-                        if need <= d.tilemap_clean.load(Ordering::Acquire)
+                        need <= d.tilemap_clean.load(Ordering::Acquire)
                             && d.heap.load(Ordering::Acquire) == 0
-                        {
+                    });
+                if let Some(id) = vm_id {
+                    let same_vm = !self.render.scrub_full[k]
+                        && self.render.owner[k].as_ref().is_some_and(|o| o.id == id);
+                    if same_vm {
+                        if full_clean {
                             return Some(k);
                         }
+                        if clean {
+                            same_clean_partial.get_or_insert(k);
+                        } else {
+                            same_dirty.get_or_insert(k);
+                        }
+                    } else if self.render.owner[k].is_none() {
+                        if full_clean {
+                            unowned_clean.get_or_insert(k);
+                        } else {
+                            unowned_dirty.get_or_insert(k);
+                        }
+                    } else if full_clean {
+                        other_full_clean.get_or_insert(k);
+                    } else if clean {
+                        other_clean_partial.get_or_insert(k);
+                    } else {
+                        other_dirty.get_or_insert(k);
                     }
-                    clean_partial.get_or_insert(k);
-                    continue;
+                } else if full_clean {
+                    return Some(k);
+                } else if clean {
+                    other_clean_partial.get_or_insert(k);
+                } else {
+                    other_dirty.get_or_insert(k);
                 }
-                fallback.get_or_insert(k);
             }
         }
-        if let Some(k) = clean_partial.or(fallback) {
+        if let Some(k) = same_clean_partial
+            .or(same_dirty)
+            .or(unowned_clean)
+            .or(unowned_dirty)
+            .or(other_full_clean)
+            .or(other_clean_partial)
+            .or(other_dirty)
+        {
             return Some(k);
         }
         if saw_scrubbing {

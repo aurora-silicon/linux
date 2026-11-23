@@ -1350,8 +1350,8 @@ impl Firmware {
                 .base_render_quarantined
                 .store(self.slots.base_render_quarantined(), Ordering::Release);
             shared
-                .needed_pb_slots
-                .store(self.pools.needed_slots() as u32, Ordering::Release);
+                .quarantined_pb_mask
+                .store(self.pools.quarantined_mask(), Ordering::Release);
         }
     }
 

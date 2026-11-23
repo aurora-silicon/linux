@@ -106,7 +106,7 @@ const _: () = assert!(EXT_RENDER_TIERS[1].1 == EXT_RENDER_TIERS[2].0);
 const _: () = assert!(EXT_RENDER_TIERS[2].1 == EXT_RENDER_TIERS[3].0);
 const _: () = assert!(EXT_RENDER_TIERS[3].1 == super::hw::sizes::RENDER_SLOTS);
 const BASE_PB_SLOTS: usize = super::hw::sizes::BASE_PB_SLOTS;
-const EXT_PB_SLOTS: usize = super::hw::sizes::PB_SLOTS - BASE_PB_SLOTS;
+const EXT_PB_SLOTS: usize = super::hw::sizes::EXT_PB_SLOTS;
 /// Demand-grown contiguous PB heap extensions within the 256 MiB
 /// [`super::hw::client::PB_HEAP_SIZE`] window so steady 60/120 Hz single-pass clients stay on
 /// the 64 MiB base heap while multi-pass and heavy 3D workloads expand to 128 MiB (Tier 0) and
@@ -124,14 +124,18 @@ const _: () = assert!(
 const RENDER_BURST_COMMANDS: usize = BASE_RENDER_SLOTS;
 
 /// Device-wide hints read locklessly in `SUBMIT` to size per-VM extension backing.
-#[derive(Copy, Clone, Default)]
-pub(crate) struct PrepareHints {
+#[derive(Copy, Clone)]
+pub(crate) struct PrepareHints<'a> {
     /// A base compute unit (`0..BASE_COMPUTE_UNITS`) is quarantined: allocate extension units.
     pub(crate) expand_compute_ext: bool,
     /// A base render pass slot (`0..BASE_RENDER_SLOTS`) is quarantined: allocate extension slots.
     pub(crate) expand_render_ext: bool,
-    /// Contiguous PB/UMA allocator slots (`BASE_PB_SLOTS..=PB_SLOTS`) needed across quarantines.
-    pub(crate) pb_slots: usize,
+    /// Bitmask of permanently quarantined device-wide PB/UMA allocator slots (`0..PB_SLOTS`).
+    pub(crate) quarantined_pb_mask: u32,
+    /// Round-robin cursor assigning a VM's `[home, alt]` base PB/UMA slots in `0..WARM_PB_SLOTS`.
+    pub(crate) next_pb_slot: &'a AtomicU32,
+    /// Live open VMs owning a `RenderArena`, used for multi-VM pass-slot headroom.
+    pub(crate) active_render_vms: &'a Arc<AtomicU32>,
 }
 
 /// Updates the consecutive-compute burst counter and reports whether this submission
@@ -209,6 +213,51 @@ fn target_render_slots(
     target.min(super::hw::sizes::RENDER_SLOTS)
 }
 
+/// Like [`target_render_slots`], returning `(effective_target, single_vm_target)`.
+///
+/// When `active_render_vms` reaches Tier 0's pass-slot ceiling (`EXT_RENDER_TIERS[0].1 == 8`)
+/// and this VM is already bursting (`single_vm_target > BASE_RENDER_SLOTS`), `effective_target`
+/// expands up to Tier 1 (`EXT_RENDER_TIERS[1].1 == 18`) so up to 16 concurrent render VMs each
+/// keep a warm pass slot without cross-VM full-scrub thrashing. Steady 60/120 Hz single-pass
+/// clients stay at `BASE_RENDER_SLOTS`, and `single_vm_target` keeps `PB_HEAP_EXT_TIERS` gated
+/// on actual single-VM pass demand so multi-VM light renders do not expand to 256 MiB PB heaps.
+fn target_render_slots_for(
+    last_render_ns: &mut u64,
+    render_burst: &mut u32,
+    now: u64,
+    render_count: usize,
+    active_passes: u32,
+    base_quarantined: bool,
+    current_slots: usize,
+    single_vm_slots: usize,
+    active_render_vms: u32,
+) -> (usize, usize) {
+    let single = target_render_slots(
+        last_render_ns,
+        render_burst,
+        now,
+        render_count,
+        active_passes,
+        base_quarantined,
+        single_vm_slots.max(BASE_RENDER_SLOTS),
+    );
+    let mut target = current_slots.max(single);
+    if single > BASE_RENDER_SLOTS && (active_render_vms as usize) >= EXT_RENDER_TIERS[0].1 {
+        let multi_need = (active_render_vms as usize)
+            .saturating_add(1)
+            .min(EXT_RENDER_TIERS[1].1);
+        for &(start, end) in &EXT_RENDER_TIERS[..2] {
+            if target >= multi_need {
+                break;
+            }
+            if target < end && multi_need > start {
+                target = end;
+            }
+        }
+    }
+    (target.min(super::hw::sizes::RENDER_SLOTS), single)
+}
+
 pub(crate) struct RenderArena(crate::cleanup::Deferred<RenderInner>);
 impl core::ops::Deref for RenderArena {
     type Target = RenderInner;
@@ -219,6 +268,8 @@ impl core::ops::Deref for RenderArena {
 pub(crate) struct RenderInner {
     pub(crate) passes: KVec<PassSlot>,
     pub(crate) pools: PoolSet,
+    /// Device-wide physical PB/UMA allocator slots `[home, alt]` bound to `pools.unit(0..2)`.
+    pub(crate) base_pb_slots: [usize; BASE_PB_SLOTS],
     pub(crate) tpc_dirty: [AtomicU64; BASE_RENDER_SLOTS],
     pub(crate) tilemap_dirty: [AtomicU64; BASE_RENDER_SLOTS],
     pub(crate) tilemap_last: [AtomicU64; BASE_RENDER_SLOTS],
@@ -243,18 +294,20 @@ impl RenderArena {
         bind: &mmu::VmBind,
         vm: &mmu::Vm,
         live: &Arc<super::vm::LiveToken>,
+        base_pb_slots: [usize; BASE_PB_SLOTS],
     ) -> Result<Arc<Self>> {
         let mut objects = factory.objects(vm);
         let mut passes = KVec::with_capacity(BASE_RENDER_SLOTS, GFP_KERNEL)?;
         for k in 0..BASE_RENDER_SLOTS {
             passes.push(PassSlot::new(&mut objects, k as u64, 1)?, GFP_KERNEL)?;
         }
-        let pools = PoolSet::new(&mut objects)?;
+        let pools = PoolSet::new_with_slots(&mut objects, base_pb_slots)?;
         objects.finish_private()?;
         Ok(Arc::new(
             Self(crate::cleanup::Deferred::new(RenderInner {
                 passes,
                 pools,
+                base_pb_slots,
                 tpc_dirty: [const { AtomicU64::new(0) }; BASE_RENDER_SLOTS],
                 tilemap_dirty: [const { AtomicU64::new(0) }; BASE_RENDER_SLOTS],
                 tilemap_last: [const { AtomicU64::new(0) }; BASE_RENDER_SLOTS],
@@ -345,8 +398,9 @@ impl RenderExtArena {
     }
 }
 
-/// One lazily allocated recovery PB/UMA allocator slot (`BASE_PB_SLOTS..PB_SLOTS`),
-/// sharing the VM's base PB heap so non-fault VMs pay zero extra allocator memory.
+/// One lazily allocated recovery PB/UMA allocator slot (`WARM_PB_SLOTS..PB_SLOTS`),
+/// mapped at per-VM local VA index `BASE_PB_SLOTS..MAX_VM_PB_SLOTS` and sharing the VM's base PB
+/// heap so non-fault VMs pay zero extra allocator memory.
 pub(crate) struct PoolExtArena(crate::cleanup::Deferred<PoolExtInner>);
 impl core::ops::Deref for PoolExtArena {
     type Target = PoolExtInner;
@@ -366,11 +420,13 @@ impl PoolExtArena {
         bind: &mmu::VmBind,
         vm: &mmu::Vm,
         live: &Arc<super::vm::LiveToken>,
-        slot: usize,
+        local_idx: usize,
+        hw_slot: usize,
         heap: &Arc<super::object::FwObject>,
     ) -> Result<Arc<Self>> {
         let mut objects = factory.objects(vm);
-        let allocator = super::pools::Allocator::new(&mut objects, slot as u64, heap)?;
+        let allocator =
+            super::pools::Allocator::new_at(&mut objects, local_idx as u64, hw_slot as u32, heap)?;
         objects.finish_private()?;
         Ok(Arc::new(
             Self(crate::cleanup::Deferred::new(PoolExtInner {
@@ -490,14 +546,26 @@ struct Ready {
     render_ext: [Option<Arc<RenderExtArena>>; EXT_RENDER_TIERS.len()],
     /// Demand-grown contiguous PB heap extension tiers (`PB_HEAP_EXT_TIERS`).
     pb_heap_ext: [Option<Arc<PbHeapExtArena>>; PB_HEAP_EXT_TIERS.len()],
-    /// Recovery PB/UMA allocator slots (`BASE_PB_SLOTS..PB_SLOTS`), allocated lazily after hangs.
+    /// Recovery PB/UMA allocator slots (`WARM_PB_SLOTS..PB_SLOTS`), allocated lazily after hangs.
     pb_ext: [Option<Arc<PoolExtArena>>; EXT_PB_SLOTS],
+    /// Single-VM render pass slot target (excluding multi-VM Tier 1 expansion), gating
+    /// `PB_HEAP_EXT_TIERS` so concurrent light-render VMs do not allocate 256 MiB PB heaps.
+    single_vm_render_slots: usize,
+    /// Device-wide count of open rendering VMs; decremented once on `Cache::close()` or drop.
+    render_vm_counter: Option<Arc<AtomicU32>>,
     /// Last compute submission and the back-to-back run it continues.
     last_compute_ns: u64,
     burst: u32,
     /// Last render submission and the back-to-back run it continues.
     last_render_ns: u64,
     render_burst: u32,
+}
+impl Drop for Ready {
+    fn drop(&mut self) {
+        if let Some(counter) = self.render_vm_counter.take() {
+            counter.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
 }
 struct Standby {
     /// Never-exposed epochs kept on standby for this VM's queued renders.
@@ -662,6 +730,9 @@ impl Cache {
         self.standby_available.notify_all();
         let ready = {
             let mut ready = self.ready.lock();
+            if let Some(counter) = ready.render_vm_counter.take() {
+                counter.fetch_sub(1, Ordering::AcqRel);
+            }
             (
                 ready.compute.take(),
                 ready.compute_ext.take(),
@@ -678,7 +749,7 @@ impl Cache {
         self: &Arc<Self>,
         vm: &Arc<VmState>,
         commands: &[Command],
-        hints: PrepareHints,
+        hints: PrepareHints<'_>,
     ) -> Result<Prepared> {
         let computes = commands
             .iter()
@@ -733,34 +804,63 @@ impl Cache {
                 }
             }
             if render && ready.render.is_none() {
+                let home = (hints.next_pb_slot.fetch_add(1, Ordering::Relaxed) as usize)
+                    % super::hw::sizes::WARM_PB_SLOTS;
+                let alt = (home + 1) % super::hw::sizes::WARM_PB_SLOTS;
                 ready.render = Some(RenderArena::new(
                     &self.factory,
                     &self.bind,
                     &vm.vm,
                     &self.live,
+                    [home, alt],
                 )?);
+                if ready.render_vm_counter.is_none() {
+                    hints.active_render_vms.fetch_add(1, Ordering::AcqRel);
+                    ready.render_vm_counter = Some(hints.active_render_vms.clone());
+                }
             }
             if render {
-                let target_pb = hints.pb_slots.clamp(BASE_PB_SLOTS, super::hw::sizes::PB_SLOTS);
-                if target_pb > BASE_PB_SLOTS {
-                    if let Some(base) = ready.render.as_ref() {
+                if let Some(base) = ready.render.as_ref() {
+                    let quarantined = hints.quarantined_pb_mask;
+                    let mut healthy = base
+                        .base_pb_slots
+                        .iter()
+                        .filter(|&&slot| (quarantined & (1u32 << slot)) == 0)
+                        .count();
+                    for (idx, ext) in ready.pb_ext.iter().enumerate() {
+                        let hw_slot = super::hw::sizes::WARM_PB_SLOTS + idx;
+                        if ext.is_some() && (quarantined & (1u32 << hw_slot)) == 0 {
+                            healthy += 1;
+                        }
+                    }
+                    if healthy < BASE_PB_SLOTS {
                         let heap = base.pools.heap().clone();
-                        for k in BASE_PB_SLOTS..target_pb {
-                            let idx = k - BASE_PB_SLOTS;
-                            if ready.pb_ext[idx].is_none() {
-                                // Best effort: without recovery slots, keep prior PB slots.
-                                ready.pb_ext[idx] = PoolExtArena::new(
-                                    &self.factory,
-                                    &self.bind,
-                                    &vm.vm,
-                                    &self.live,
-                                    k,
-                                    &heap,
-                                )
-                                .ok();
-                                if ready.pb_ext[idx].is_none() {
-                                    break;
-                                }
+                        for idx in 0..EXT_PB_SLOTS {
+                            if healthy >= BASE_PB_SLOTS {
+                                break;
+                            }
+                            let hw_slot = super::hw::sizes::WARM_PB_SLOTS + idx;
+                            if ready.pb_ext[idx].is_some()
+                                || (quarantined & (1u32 << hw_slot)) != 0
+                            {
+                                continue;
+                            }
+                            let local_idx = BASE_PB_SLOTS + idx;
+                            // Best effort: without recovery slots, keep prior PB slots.
+                            ready.pb_ext[idx] = PoolExtArena::new(
+                                &self.factory,
+                                &self.bind,
+                                &vm.vm,
+                                &self.live,
+                                local_idx,
+                                hw_slot,
+                                &heap,
+                            )
+                            .ok();
+                            if ready.pb_ext[idx].is_some() {
+                                healthy += 1;
+                            } else {
+                                break;
                             }
                         }
                     }
@@ -778,7 +878,8 @@ impl Cache {
                     let now = unsafe { kernel::bindings::ktime_get() } as u64;
                     let state = &mut *ready;
                     let active_passes = self.active_render_passes.load(Ordering::Acquire);
-                    let target = target_render_slots(
+                    let active_vms = hints.active_render_vms.load(Ordering::Acquire);
+                    let (target, single_target) = target_render_slots_for(
                         &mut state.last_render_ns,
                         &mut state.render_burst,
                         now,
@@ -786,7 +887,10 @@ impl Cache {
                         active_passes,
                         hints.expand_render_ext,
                         current_slots,
+                        state.single_vm_render_slots,
+                        active_vms,
                     );
+                    state.single_vm_render_slots = state.single_vm_render_slots.max(single_target);
                     for (idx, &(start, end)) in EXT_RENDER_TIERS.iter().enumerate() {
                         if start >= target {
                             break;
@@ -809,8 +913,11 @@ impl Cache {
                 }
                 if let Some(base) = ready.render.as_ref() {
                     let base_blocks = base.pools.heap_blocks();
+                    let single_slots = ready.single_vm_render_slots;
                     for (idx, &(start, end)) in PB_HEAP_EXT_TIERS.iter().enumerate() {
-                        if ready.render_ext[idx].is_none() {
+                        if single_slots < EXT_RENDER_TIERS[idx].1
+                            || ready.render_ext[idx].is_none()
+                        {
                             break;
                         }
                         if base_blocks >= end {
@@ -1015,23 +1122,31 @@ impl Prepared {
             self.compute_ext.clone()
         }
     }
-    /// Contiguous PB/UMA allocator slots (`0..n`) this job can use.
-    pub(crate) fn pb_slots(&self) -> Result<usize> {
-        let _ = self.render()?;
-        let ext = self.pb_ext.iter().take_while(|slot| slot.is_some()).count();
-        Ok(BASE_PB_SLOTS + ext)
+    /// Physical PB/UMA allocator slot bitmask and preferred home slot this job can use.
+    pub(crate) fn pb_slot_mask(&self) -> Result<(u32, usize)> {
+        let base = self.render()?;
+        let mut mask = 0u32;
+        for &slot in &base.base_pb_slots {
+            mask |= 1u32 << slot;
+        }
+        for (idx, ext) in self.pb_ext.iter().enumerate() {
+            if ext.is_some() {
+                mask |= 1u32 << (super::hw::sizes::WARM_PB_SLOTS + idx);
+            }
+        }
+        Ok((mask, base.base_pb_slots[0]))
     }
     fn pb_allocator(&self, k: usize) -> Result<&super::pools::Allocator> {
         let base = self.render()?;
-        if k < BASE_PB_SLOTS {
-            base.pools.unit(k).ok_or(EINVAL)
-        } else {
-            self.pb_ext
-                .get(k - BASE_PB_SLOTS)
-                .and_then(|slot| slot.as_deref())
-                .map(|arena| &arena.allocator)
-                .ok_or(EINVAL)
+        if let Some(local) = base.base_pb_slots.iter().position(|&slot| slot == k) {
+            return base.pools.unit(local).ok_or(EINVAL);
         }
+        let idx = k.checked_sub(super::hw::sizes::WARM_PB_SLOTS).ok_or(EINVAL)?;
+        self.pb_ext
+            .get(idx)
+            .and_then(|slot| slot.as_deref())
+            .map(|arena| &arena.allocator)
+            .ok_or(EINVAL)
     }
     pub(crate) fn prepare_pb_in_flight(
         &self,
@@ -1071,11 +1186,12 @@ impl Prepared {
     pub(crate) fn pb_owner_arena(&self, k: usize) -> Option<PbOwnerArena> {
         let base = self.render.as_ref()?;
         let heap_ext = core::array::from_fn(|idx| self.pb_heap_ext[idx].clone());
-        if k < BASE_PB_SLOTS {
+        if base.base_pb_slots.contains(&k) {
             Some(PbOwnerArena::Base(base.clone(), heap_ext))
         } else {
+            let idx = k.checked_sub(super::hw::sizes::WARM_PB_SLOTS)?;
             self.pb_ext
-                .get(k - BASE_PB_SLOTS)
+                .get(idx)
                 .and_then(|slot| slot.as_ref())
                 .map(|ext| PbOwnerArena::Ext(base.clone(), ext.clone(), heap_ext))
         }

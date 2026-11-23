@@ -1127,8 +1127,8 @@ impl Firmware {
                 && matches!(command(&job, job.progress.sent()), Some(Command::Render(_)))
                 && (job
                     .resources
-                    .pb_slots()
-                    .is_ok_and(|n| self.pools.exhausted_for_within(&job.vm, n))
+                    .pb_slot_mask()
+                    .is_ok_and(|(mask, home)| self.pools.exhausted_for_mask(&job.vm, mask, home))
                     || job
                         .resources
                         .render_passes()
@@ -1305,10 +1305,11 @@ impl Firmware {
             || (is_render
                 && !job
                     .resources
-                    .pb_slots()
-                    .and_then(|n| Ok((n, job.resources.pb_heap_blocks()?)))
-                    .is_ok_and(|(n, blocks)| {
-                        self.pools.can_pipeline_within_blocks(&job.vm, n, blocks)
+                    .pb_slot_mask()
+                    .and_then(|(mask, home)| Ok((mask, home, job.resources.pb_heap_blocks()?)))
+                    .is_ok_and(|(mask, home, blocks)| {
+                        self.pools
+                            .can_pipeline_in_mask_blocks(&job.vm, mask, home, blocks)
                     }))
     }
 
@@ -1486,10 +1487,11 @@ impl Firmware {
                     && super::recovery::logic::next_ordinal(e.draw).is_some()
                     && job
                         .resources
-                        .pb_slots()
-                        .and_then(|n| Ok((n, job.resources.pb_heap_blocks()?)))
-                        .is_ok_and(|(n, blocks)| {
-                            self.pools.can_pipeline_within_blocks(&job.vm, n, blocks)
+                        .pb_slot_mask()
+                        .and_then(|(mask, home)| Ok((mask, home, job.resources.pb_heap_blocks()?)))
+                        .is_ok_and(|(mask, home, blocks)| {
+                            self.pools
+                                .can_pipeline_in_mask_blocks(&job.vm, mask, home, blocks)
                         })
                     && job
                         .resources
@@ -1829,13 +1831,13 @@ impl Firmware {
         let mut a = job
             .resources
             .prepare_pb_in_flight(alloc_slot, draw, render_pipelined)?;
-        let pb_slots = job.resources.pb_slots()?;
+        let (pb_mask, _) = job.resources.pb_slot_mask()?;
         let heap_blocks = job.resources.pb_heap_blocks()?;
         // Reuse this VM's retired epoch of the allocator slot when still bound and sized for the
         // VM's current PB heap (no reseed/InitBM); if the PB heap grew, rotate onto a fresh epoch.
         let (epoch, reused) = match self
             .pools
-            .reusable_for_within(alloc_slot, &job.vm, pb_slots, heap_blocks)
+            .reusable_for_mask(alloc_slot, &job.vm, pb_mask, heap_blocks)
         {
             Some(e) => {
                 self.pools.stats.reused += 1;
@@ -2271,7 +2273,10 @@ impl Firmware {
                 }) {
                     return Err(E2BIG);
                 }
-                let Some(k) = self.slots.pick_pass_in(&job.resources, &geometry, 0) else {
+                let Some(k) =
+                    self.slots
+                        .pick_pass_in_for(&job.resources, &geometry, 0, Some(job.vm.id))
+                else {
                     self.engine.slot_wait = true;
                     return Err(EAGAIN);
                 };
@@ -2328,10 +2333,11 @@ impl Firmware {
                             break;
                         }
                         let geo2 = Geometry::new(&r2.cmd, 0);
-                        let Some(k2) = self.slots.pick_pass_in(
+                        let Some(k2) = self.slots.pick_pass_in_for(
                             &job.resources,
                             &geo2,
                             f.claims.pass_mask,
+                            Some(job.vm.id),
                         ) else {
                             break;
                         };
@@ -2457,10 +2463,11 @@ impl Firmware {
                                     break;
                                 };
                                 let geo2 = Geometry::new(&r2.cmd, 0);
-                                let Some(slot) = self.slots.pick_pass_in(
+                                let Some(slot) = self.slots.pick_pass_in_for(
                                     &job.resources,
                                     &geo2,
                                     picked_mask,
+                                    Some(job.vm.id),
                                 ) else {
                                     precheck_ok = false;
                                     break;
@@ -3039,11 +3046,11 @@ impl Firmware {
             .claim_pass_in(resources, k, Some(job.vm.id), geometry.tilemap_bytes)?;
         self.slots.hold_render_pass(k, &job.vm, resources)?;
         let (refs, init_buffer) = if member == 0 {
-            let pb_slots = resources.pb_slots()?;
+            let (pb_mask, pb_home) = resources.pb_slot_mask()?;
             let heap_blocks = resources.pb_heap_blocks()?;
             let alloc_slot = self
                 .pools
-                .pick_slot_within_blocks(&job.vm, behind, pb_slots, heap_blocks)
+                .pick_slot_in_mask_blocks(&job.vm, behind, pb_mask, pb_home, heap_blocks)
                 .ok_or(EAGAIN)?;
             let slot_pipelined = self.pools.slot_inflight(alloc_slot) > 0;
             let (refs, init_buffer, epoch, binding) =
