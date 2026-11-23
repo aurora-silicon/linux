@@ -783,6 +783,42 @@ static int ane_fw_reload_segment(struct ane_fw_backend *b, unsigned int i)
 	       -EKEYREJECTED : 0;
 }
 
+#define ANE_FW_RECOVER_QUIET_MS 100U
+
+/*
+ * A recovered engine takes requests only once it has settled: the new
+ * firmware has posted nothing for ANE_FW_RECOVER_QUIET_MS (what it posts
+ * meanwhile, such as its own SHAREDMALLOCs, is served), and its power, DARTs
+ * and transport read healthy (ane_fw_recover_settled()). Until then the
+ * session stays closed: the replay waits, and requests wait in
+ * ane_h16_session_enter().
+ */
+static int ane_fw_recover_settle(struct ane_fw_backend *b)
+{
+	struct ane_fw_settled st = {};
+	u64 start = ktime_get_ns();
+	int served;
+
+	served = ane_fw_transport_settle(&b->transport,
+					 (u64)ANE_FW_RECOVER_QUIET_MS * NSEC_PER_MSEC,
+					 ((u64)ANE_FW_RECOVER_QUIET_MS + 1000) * NSEC_PER_MSEC);
+	st.transport_error = served < 0 ? served : b->transport.error;
+	st.sys = ane_rd32(b, b->pmgr + b->soc->pmgr_sys);
+	st.cpu = ane_rd32(b, b->pmgr + b->soc->pmgr_cpu);
+	for (unsigned int i = 0; i < ANE_FW_DARTS; i++)
+		st.dart_error[i] = ane_rd32(b, b->dart[i] + 0x100);
+	if (!ane_fw_recover_settled(&st)) {
+		dev_err(&b->pdev->dev,
+			"H17 ANE: recovered engine not settled: transport %d, ANE_SYS %#x CPU %#x, DART errors %#x %#x %#x\n",
+			st.transport_error, st.sys, st.cpu, st.dart_error[0], st.dart_error[1],
+			st.dart_error[2]);
+		return st.transport_error ?: -EIO;
+	}
+	dev_dbg(&b->pdev->dev, "H17 ANE: recovered engine settled in %llu ms, %d posts served\n",
+		div_u64(ktime_get_ns() - start, NSEC_PER_MSEC), served);
+	return 0;
+}
+
 /*
  * After resume, the cold way: power up from the cold state with the same
  * checks as at boot (the engine and DARTs must read their reset values),
@@ -855,6 +891,12 @@ static int ane_fw_cold_cycle_boot(struct ane_fw_backend *b, bool recover)
 	if (ret)
 		return ret;
 	b->transport.allow_free = true;
+	/* Nothing reaches a recovered engine before it settled, the replay included. */
+	if (recover) {
+		ret = ane_fw_recover_settle(b);
+		if (ret)
+			return ret;
+	}
 	b->resume_ready_ns = ktime_get_ns();
 	dev_dbg(dev, "H17 ANE: booted again from the preload after system sleep in %llu ms\n",
 		div_u64(b->resume_ready_ns - start, NSEC_PER_MSEC));

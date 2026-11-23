@@ -555,7 +555,40 @@ static void ane_cold_recover_off_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ane_fw_recover_off_wait(0, off, 0), 0ULL);
 }
 
+/* A recovered engine takes requests only with everything reading healthy. */
+static void ane_cold_recover_settled_test(struct kunit *test)
+{
+	const struct ane_fw_settled up = { .sys = 0x23ff, .cpu = 0x0f0003ff };
+	struct ane_fw_settled s;
+
+	KUNIT_EXPECT_TRUE(test, ane_fw_recover_settled(&up));
+	/* ANE_SYS or the CPU not (yet) on, in target or actual state. */
+	s = up;
+	s.sys = 0x230f;
+	KUNIT_EXPECT_FALSE(test, ane_fw_recover_settled(&s));
+	s = up;
+	s.sys = 0x23f0;
+	KUNIT_EXPECT_FALSE(test, ane_fw_recover_settled(&s));
+	s = up;
+	s.cpu = 0x0f0003f0;
+	KUNIT_EXPECT_FALSE(test, ane_fw_recover_settled(&s));
+	s = up;
+	s.cpu = 0x0f000300;
+	KUNIT_EXPECT_FALSE(test, ane_fw_recover_settled(&s));
+	/* A DART fault on any of the three. */
+	for (unsigned int i = 0; i < ANE_FW_DARTS; i++) {
+		s = up;
+		s.dart_error[i] = 0x80000001;
+		KUNIT_EXPECT_FALSE(test, ane_fw_recover_settled(&s));
+	}
+	/* The transport failed while serving the new firmware's posts. */
+	s = up;
+	s.transport_error = -ENOSPC;
+	KUNIT_EXPECT_FALSE(test, ane_fw_recover_settled(&s));
+}
+
 static struct kunit_case ane_cold_cases[] = {
+	KUNIT_CASE(ane_cold_recover_settled_test),
 	KUNIT_CASE(ane_cold_recover_off_test),
 	KUNIT_CASE(ane_cold_recover_storm_test),
 	KUNIT_CASE(ane_cold_recover_backoff_test),

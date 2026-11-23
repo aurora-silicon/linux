@@ -129,6 +129,33 @@ static inline u64 ane_fw_recover_off_wait(u64 off_at, u64 now, u64 min_ns)
 }
 
 /*
+ * After a recovery's cold boot, before any request (the replay of open
+ * programs included) reaches the new firmware: ANE_SYS and the ANE CPU power
+ * state still target and read on, no DART reports a fault, and the
+ * transport, after serving what the firmware posted while it went quiet, has
+ * not failed. Anything less fails the recovery. The sub-block power state and
+ * CE are left to the firmware once it runs (it gates the engine itself), so
+ * they are not judged.
+ */
+struct ane_fw_settled {
+	u32 sys, cpu;
+	u32 dart_error[ANE_FW_DARTS];
+	int transport_error;
+};
+
+static inline bool ane_fw_recover_settled(const struct ane_fw_settled *s)
+{
+	unsigned int i;
+
+	if ((s->sys & 0xff) != 0xff || (s->cpu & 0xff) != 0xff || s->transport_error)
+		return false;
+	for (i = 0; i < ANE_FW_DARTS; i++)
+		if (s->dart_error[i])
+			return false;
+	return true;
+}
+
+/*
  * Runtime recoveries of a hung engine are limited. Each one powers the
  * engine off under its firmware and boots it again; a client that hangs it
  * again right away turns that into a storm of power cycles, and eight of them
