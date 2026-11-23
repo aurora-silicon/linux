@@ -3522,8 +3522,8 @@ static int ane_rtclient_rs_prepare(struct ane_rtclient_restart *rs)
 	lockdep_assert_held(&ane_t6021_fw_lock);
 	if (!ane->registered)
 		return -EOPNOTSUPP;
-	/* Only the qualified, Linux-owned legacy boot profile can restart.
-	 * Borrowed firmware, RTKit and later-generation ownership stay fenced.
+	/* The legacy transport can restart only with a pristine firmware
+	 * source. RTKit and later-generation ownership stay fenced.
 	 */
 	if (ane->soc->platform || !a || ane->rtk ||
 	    !legacy_only || !scratch3_ack || !legacy_query || fw_start_rtb_mode ||
@@ -3875,6 +3875,7 @@ static int ane_rtclient_probe_inner(struct platform_device *pdev,
 				    bool *hardware_touched)
 {
 	struct device *dev = &pdev->dev;
+	struct ane_t6021_preload preload = {};
 	struct resource *res;
 	struct ane_rtclient *ane;
 	struct ane_t6021 *a;
@@ -3908,7 +3909,7 @@ static int ane_rtclient_probe_inner(struct platform_device *pdev,
 		return -EINVAL;
 	}
 	if (fw_start && ane_t6021_fwload_requested()) {
-		ret = ane_t6021_fwload_check(dev);
+		ret = ane_t6021_fwload_check(dev, &preload);
 		if (ret)
 			return dev_err_probe(dev, ret, "firmware preflight failed\n");
 	}
@@ -4057,7 +4058,7 @@ static int ane_rtclient_probe_inner(struct platform_device *pdev,
 		ane->fw = a;
 
 		dev_dbg(dev, "BOOT-PHASE fwload stage+alias begin\n");
-		ret = ane_t6021_fwload_probe(a);
+		ret = ane_t6021_fwload_probe(a, &preload);
 		if (ret) {
 			dev_err_probe(dev, ret, "fw_start: staging failed\n");
 			ane_t6021_fwload_remove(a);

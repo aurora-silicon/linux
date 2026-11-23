@@ -322,6 +322,8 @@ static int ane_t6021_boot_prepare(void *ctx, u32 *lo, u32 *hi)
 	request = readl(eng + ANE_MBI_SCRATCH0 + 4 * 3);
 
 	src.fw_dva = ane->fw_iova;
+	if (ane->fw_preloaded)
+		src.cfg_size = ane->fw_size;
 	err = ane_t6021_boot_prepare_publish(&src, request, scratch0,
 					     scratch1, 0x4000,
 					     ANE_T6021_BOOT_IPC_CEILING,

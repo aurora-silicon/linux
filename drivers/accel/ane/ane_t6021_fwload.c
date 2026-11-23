@@ -69,8 +69,11 @@
 #include <linux/platform_device.h>
 #include <linux/random.h>
 #include <linux/sizes.h>
+#include <linux/slab.h>
 #include <linux/unaligned.h>
 
+#include "ane_fw_cold.h"
+#include "ane_fw_platform.h"
 #include "ane_t6021.h"
 #include "ane_t6021_boot.h"
 #include "ane_fw_validate.h"
@@ -229,8 +232,10 @@ static int ane_t6021_pmu_map(struct ane_t6021 *ane, struct iommu_domain *dom)
 		prot |= IOMMU_CACHE;
 	ret = iommu_map(dom, soc->pmu_pa, soc->pmu_pa, ANE_T6021_FW_ALIAS_PAGE,
 			prot, GFP_KERNEL);
-	if (!ret && iommu_iova_to_phys(dom, soc->pmu_pa) != soc->pmu_pa)
+	if (!ret && iommu_iova_to_phys(dom, soc->pmu_pa) != soc->pmu_pa) {
+		iommu_unmap(dom, soc->pmu_pa, ANE_T6021_FW_ALIAS_PAGE);
 		ret = -EIO;
+	}
 	dev_dbg(ane->dev, "pmu: DART map %#llx (IOVA == PA, %#x bytes): %d\n",
 		soc->pmu_pa, ANE_T6021_FW_ALIAS_PAGE, ret);
 	return ret;
@@ -520,7 +525,161 @@ static int ane_t6021_fw_patch(struct ane_t6021 *ane, u8 *img)
 	return 0;
 }
 
-int ane_t6021_fwload_check(struct device *dev)
+/*
+ * The native H14 firmware has a different TEXT/DATA layout from the
+ * disk-loaded image. Use the layout reported by the loader to match the
+ * boot ABI, and take the physical and device addresses from the handoff.
+ */
+static int ane_t6021_fw_preload_check(struct device *dev,
+				     const struct ane_fw_image *legacy,
+				     struct ane_t6021_preload *preload)
+{
+	struct ane_t6021_preload p;
+	struct ane_fw_platform layout = {
+		/* H14 native layout, from the ADT's segment-ranges. */
+		.preload_size = { 0xd8000, 0x614000 },
+	};
+	struct device_node *np = dev->of_node;
+	u64 text_end, data_end;
+	unsigned int i;
+	int ret;
+
+	if (of_property_count_u32_elems(np, "memory-region") != 2 ||
+	    of_property_count_strings(np, "memory-region-names") != 2 ||
+	    of_property_match_string(np, "memory-region-names", "firmware-text") != 0 ||
+	    of_property_match_string(np, "memory-region-names", "firmware-data") != 1 ||
+	    of_property_count_u64_elems(np, "apple,firmware-iovas") != 2 ||
+	    of_property_read_u64_array(np, "apple,firmware-iovas", p.dva, 2))
+		return -EINVAL;
+
+	for (i = 0; i < ARRAY_SIZE(p.phys); i++) {
+		ret = ane_fw_preload_range(np, i, &p.phys[i], &p.size[i]);
+		if (ret)
+			return ret;
+	}
+
+	if (check_add_overflow(p.dva[0], p.size[0], &text_end) ||
+	    check_add_overflow(p.dva[1], p.size[1], &data_end) ||
+	    !IS_ALIGNED(p.dva[0], SZ_16K) || text_end != p.dva[1])
+		return -EINVAL;
+
+	if (p.size[0] == legacy->segs[0].vmsize &&
+	    p.size[1] == legacy->segs[1].vmsize)
+		return 0;
+
+	memcpy(layout.preload_dva, p.dva, sizeof(p.dva));
+	if (!ane_fw_preload_ranges_valid(&layout, p.phys, p.size, p.dva) ||
+	    !ane_t6021_rvbar_entry_ok(p.dva[0]) || !p.dva[0])
+		return -EINVAL;
+	if (!ane_fw_raw_boot())
+		return -EPERM;
+
+	*preload = p;
+	return 0;
+}
+
+static int ane_t6021_fw_preload_map(struct ane_t6021 *ane,
+				   const struct ane_t6021_preload *p)
+{
+	const struct ane_t602x_soc *soc = of_device_get_match_data(ane->dev);
+	struct iommu_domain *dom = iommu_get_domain_for_dev(ane->dev);
+	u64 rvbar = readq(ane->base[ANE_T6021_REG_ENGINE] + ANE_ASC_RVBAR);
+	int prot = IOMMU_READ, ret;
+	void *data;
+	unsigned int i;
+	u64 off;
+
+	if (!dom)
+		return -ENODEV;
+	if (!ane_t6021_rvbar_latched(rvbar) ||
+	    ane_t6021_rvbar_entry_bits(rvbar) != p->dva[0])
+		return -EINVAL;
+	/* These fixed IOVAs must be outside the DMA allocator's range. */
+	if (p->dva[0] <= dma_get_mask(ane->dev) ||
+	    p->dva[0] < dom->geometry.aperture_start ||
+	    p->dva[1] + p->size[1] - 1 > dom->geometry.aperture_end)
+		return -ERANGE;
+	for (i = 0; i < ARRAY_SIZE(p->dva); i++)
+		for (off = 0; off < p->size[i]; off += SZ_16K)
+			if (iommu_iova_to_phys(dom, p->dva[i] + off))
+				return -EEXIST;
+	if (iommu_iova_to_phys(dom, soc->pmu_pa))
+		return -EEXIST;
+
+	/*
+	 * Keep the loader's DATA intact. Give the ASC a coherent working copy
+	 * so cold restart can replay the original bytes on noncoherent devices.
+	 */
+	data = memremap(p->phys[1], p->size[1], MEMREMAP_WB);
+	if (!data)
+		return -ENOMEM;
+	ane->fw_pristine_data = kvmemdup(data, p->size[1], GFP_KERNEL);
+	memunmap(data);
+	if (!ane->fw_pristine_data)
+		return -ENOMEM;
+	ane->fw_data_size = p->size[1];
+	ane->fw_data_buf = dma_alloc_coherent(ane->dev, ane->fw_data_size,
+					     &ane->fw_data_dma, GFP_KERNEL);
+	if (!ane->fw_data_buf) {
+		ret = -ENOMEM;
+		goto unwind;
+	}
+	memcpy(ane->fw_data_buf, ane->fw_pristine_data, ane->fw_data_size);
+	dma_wmb();
+
+	if (dev_is_dma_coherent(ane->dev))
+		prot |= IOMMU_CACHE;
+
+	ret = iommu_map(dom, p->dva[0], p->phys[0], p->size[0], prot, GFP_KERNEL);
+	if (ret)
+		goto unwind;
+	ane->fw_alias_ext_iova[0] = p->dva[0];
+	ane->fw_alias_ext_len[0] = p->size[0];
+	ane->fw_alias_extn = 1;
+	for (off = 0; off < p->size[0]; off += SZ_16K) {
+		if (iommu_iova_to_phys(dom, p->dva[0] + off) != p->phys[0] + off) {
+			ret = -EIO;
+			goto unwind;
+		}
+	}
+
+	/* The DMA-API allocation can be physically discontiguous. */
+	ane->fw_alias_ext_iova[1] = p->dva[1];
+	for (off = 0; off < p->size[1]; off += SZ_16K) {
+		phys_addr_t phys = iommu_iova_to_phys(dom, ane->fw_data_dma + off);
+
+		if (!phys || !IS_ALIGNED(phys, SZ_16K)) {
+			ret = -EFAULT;
+			goto unwind;
+		}
+		ret = iommu_map(dom, p->dva[1] + off, phys, SZ_16K,
+				prot | IOMMU_WRITE, GFP_KERNEL);
+		if (ret)
+			goto unwind;
+		ane->fw_alias_ext_len[1] = off + SZ_16K;
+		ane->fw_alias_extn = 2;
+		if (iommu_iova_to_phys(dom, p->dva[1] + off) != phys) {
+			ret = -EIO;
+			goto unwind;
+		}
+	}
+	ret = ane_t6021_pmu_map(ane, dom);
+	if (ret)
+		goto unwind;
+
+	ane->fw_preloaded = true;
+	ane->fw_iova = p->dva[0];
+	ane->fw_alias_iova = p->dva[0];
+	ane->fw_size = p->size[0] + p->size[1];
+	dev_info(ane->dev, "using iBoot ANE preload at %pad\n", &ane->fw_iova);
+	return 0;
+
+unwind:
+	ane_t6021_fwload_remove(ane);
+	return ret;
+}
+
+int ane_t6021_fwload_check(struct device *dev, struct ane_t6021_preload *preload)
 {
 	const struct ane_t602x_soc *soc = of_device_get_match_data(dev);
 	const struct ane_fw_image *img = soc->fw;
@@ -533,6 +692,11 @@ int ane_t6021_fwload_check(struct device *dev)
 
 	if (!fw_load)
 		return 0;
+	if (of_property_read_bool(dev->of_node, "apple,firmware-preloaded")) {
+		ret = ane_t6021_fw_preload_check(dev, img, preload);
+		if (ret || preload->dva[0])
+			return ret;
+	}
 	/*
 	 * The image is installed on the machine itself from Apple's files, so
 	 * a missing file is the normal state of a system that has not fetched
@@ -541,7 +705,7 @@ int ane_t6021_fwload_check(struct device *dev)
 	ret = firmware_request_nowarn(&fw, img->name, dev);
 	if (ret == -ENOENT) {
 		dev_info(dev,
-			 "firmware %s is not installed, so the ANE stays off; install it with omarchy-ane-firmware-fetch\n",
+		 "firmware %s is not installed, so the ANE stays off\n",
 			 img->name);
 		return -ENODEV;
 	}
@@ -560,7 +724,8 @@ int ane_t6021_fwload_check(struct device *dev)
 	return ret;
 }
 
-int ane_t6021_fwload_probe(struct ane_t6021 *ane)
+int ane_t6021_fwload_probe(struct ane_t6021 *ane,
+			 const struct ane_t6021_preload *preload)
 {
 	const struct ane_t602x_soc *soc = of_device_get_match_data(ane->dev);
 	const struct ane_fw_image *img = soc->fw;
@@ -578,6 +743,8 @@ int ane_t6021_fwload_probe(struct ane_t6021 *ane)
 
 	if (!fw_load)
 		return 0;
+	if (preload->dva[0])
+		return ane_t6021_fw_preload_map(ane, preload);
 	if (fw_extra_ram > SZ_16M || !IS_ALIGNED(fw_extra_ram, ANE_T6021_FW_ALIAS_PAGE))
 		return -EINVAL;
 	/* The 64-bit coherent mask is set once in ane_t6021_probe,
@@ -587,7 +754,7 @@ int ane_t6021_fwload_probe(struct ane_t6021 *ane)
 	ret = request_firmware(&fw, img->name, ane->dev);
 	if (ret) {
 		dev_err(ane->dev,
-			"cannot load firmware %s: %d; install it with omarchy-ane-firmware-fetch (or equivalent for your distribution)\n",
+			"cannot load firmware %s: %d\n",
 			img->name, ret);
 		return ret;
 	}
@@ -639,9 +806,25 @@ int ane_t6021_fwload_probe(struct ane_t6021 *ane)
 
 bool ane_t6021_fwload_recoverable(struct ane_t6021 *ane)
 {
+	if (ane->fw_preloaded)
+		return ane->fw_pristine_data && ane->fw_data_buf;
+
 	return fw_load && ane->fw_buf && ane->fw_image &&
 	       ane->fw_size >= ANE_FW_BUF_SIZE &&
 	       !ane_t6021_fw_alias_is_reserved(ane->dev);
+}
+
+static int ane_t6021_fw_preload_reload(struct ane_t6021 *ane)
+{
+	u64 rvbar = readq(ane->base[ANE_T6021_REG_ENGINE] + ANE_ASC_RVBAR);
+
+	if (ane_t6021_rvbar_latched(rvbar) &&
+	    ane_t6021_rvbar_entry_bits(rvbar) != ane->fw_iova)
+		return -EINVAL;
+
+	memcpy(ane->fw_data_buf, ane->fw_pristine_data, ane->fw_data_size);
+	dma_wmb();
+	return 0;
 }
 
 /* Restore the validated image in its existing owned mappings. The caller
@@ -660,6 +843,8 @@ int ane_t6021_fwload_reload(struct ane_t6021 *ane)
 
 	if (!ane_t6021_fwload_recoverable(ane))
 		return -EOPNOTSUPP;
+	if (ane->fw_preloaded)
+		return ane_t6021_fw_preload_reload(ane);
 	sha256(fw->data, fw->size, actual_sha);
 	ret = ane_fw_validate_blob(fw->data, fw->size, img, actual_sha,
 				   segs, &entry, &reason);
@@ -684,8 +869,15 @@ out:
 
 void ane_t6021_fwload_remove(struct ane_t6021 *ane)
 {
+	struct iommu_domain *dom = iommu_get_domain_for_dev(ane->dev);
+
+	if (dom && ane->fw_preloaded) {
+		const struct ane_t602x_soc *soc = of_device_get_match_data(ane->dev);
+
+		iommu_unmap(dom, soc->pmu_pa, ANE_T6021_FW_ALIAS_PAGE);
+	}
+	ane->fw_preloaded = false;
 	if (ane->fw_alias_extn) {
-		struct iommu_domain *dom = iommu_get_domain_for_dev(ane->dev);
 		int i;
 
 		/* Unmap exactly the per-window recorded extents: the
@@ -702,6 +894,13 @@ void ane_t6021_fwload_remove(struct ane_t6021 *ane)
 	}
 	release_firmware(ane->fw_image);
 	ane->fw_image = NULL;
+	kvfree(ane->fw_pristine_data);
+	ane->fw_pristine_data = NULL;
+	if (ane->fw_data_buf) {
+		dma_free_coherent(ane->dev, ane->fw_data_size, ane->fw_data_buf,
+				  ane->fw_data_dma);
+		ane->fw_data_buf = NULL;
+	}
 	if (!ane->fw_buf)
 		return;
 	dma_free_coherent(ane->dev, ane->fw_size, ane->fw_buf, ane->fw_iova);

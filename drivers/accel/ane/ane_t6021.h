@@ -426,6 +426,11 @@ struct ane_t6021 {
 	void *fw_buf;
 	dma_addr_t fw_iova;
 	u32 fw_size;
+	bool fw_preloaded;
+	void *fw_pristine_data;
+	void *fw_data_buf;
+	dma_addr_t fw_data_dma;
+	size_t fw_data_size;
 	/* Validated pristine image retained for bounded, source-stable recovery. */
 	const struct firmware *fw_image;
 	/* Entry alias: IOVA the fw pages are aliased at (the latched
@@ -741,8 +746,15 @@ void ane_t6021_csne_ping_attempt(struct ane_t6021 *ane);
  * the staging half of the boot sequence: it provides the fw DVA that
  * the RVBAR fold uses; ane_t6021_boot.c consumes the staged surface.
  */
-int ane_t6021_fwload_check(struct device *dev);
-int ane_t6021_fwload_probe(struct ane_t6021 *ane);
+struct ane_t6021_preload {
+	u64 phys[2];
+	u64 size[2];
+	u64 dva[2];
+};
+
+int ane_t6021_fwload_check(struct device *dev, struct ane_t6021_preload *preload);
+int ane_t6021_fwload_probe(struct ane_t6021 *ane,
+			 const struct ane_t6021_preload *preload);
 int ane_t6021_fwload_reload(struct ane_t6021 *ane);
 bool ane_t6021_fwload_recoverable(struct ane_t6021 *ane);
 void ane_t6021_boot_release_pin(struct ane_t6021 *ane);

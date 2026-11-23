@@ -218,7 +218,7 @@ static int ane_fw_quarantine(struct ane_fw_backend *b, int error)
 	return error;
 }
 
-static bool ane_fw_raw_boot(void)
+bool ane_fw_raw_boot(void)
 {
 	struct device_node *chosen __free(device_node) = of_find_node_by_path("/chosen");
 	const char *evidence;
