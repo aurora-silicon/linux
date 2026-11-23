@@ -341,6 +341,15 @@ impl Registry {
             .ok_or(ENOENT)
     }
 
+    /// The VM id of a live VM currently bound to TTBAT `slot`, if any.
+    pub(crate) fn find_by_slot(&self, slot: u32) -> Option<u64> {
+        self.vms
+            .lock()
+            .iter()
+            .find(|state| state.slot == slot)
+            .map(|state| state.id)
+    }
+
     /// Latches `error` on every VM whose client handle is open. The fail-stop path calls it under
     /// the device lock.
     pub(crate) fn fail_all(&self, error: Error) {

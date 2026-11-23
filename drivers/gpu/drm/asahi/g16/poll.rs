@@ -1347,7 +1347,6 @@ impl Firmware {
     }
 
     /// Logs the fault bank of `state` when it holds a fault.
-    #[allow(dead_code)]
     pub(crate) fn log_fault(&self, state: &EngineState) {
         let (bank, f, va) = (state.bank, state.status, state.address);
         if f != 0 {
@@ -1357,7 +1356,7 @@ impl Firmware {
             } else {
                 "unmapped"
             };
-            dev_info!(
+            dev_warn!(
                 self.graph.dev.as_ref(),
                 "G16: fault bank {}: status {:#x} va {:#x} ({} {} level {} unit {:#x} ctx {})\n",
                 bank,

@@ -533,9 +533,9 @@ impl Session {
         self.while_powered(regs::Regs::engine_state)
     }
 
-    /// The first engine fault bank holding a fault, for a firmware halted for recovery, or
-    /// `None` while the GPU is powered down.
-    pub(crate) fn fault_scan(&self) -> Result<Option<regs::EngineState>> {
+    /// All eight engine fault banks, for a firmware halted for recovery, or `None` while the GPU
+    /// is powered down.
+    pub(crate) fn fault_scan(&self) -> Result<Option<regs::FaultScan>> {
         self.while_powered(regs::Regs::fault_scan)
     }
 
