@@ -18,6 +18,7 @@
  * Author: Marc Zyngier <maz@kernel.org>
  */
 
+#include <linux/async.h>
 #include <linux/bitfield.h>
 #include <linux/gpio/consumer.h>
 #include <linux/gpio/driver.h>
@@ -7659,28 +7660,39 @@ static int apple_pcie_s2r_port_up(struct apple_pcie *pcie, struct apple_pcie_por
 	return 0;
 }
 
-/* The noirq resume, before the PCI core's of the functions behind the ports. */
-static void apple_pcie_s2r_ports_up(struct apple_pcie *pcie)
+static void apple_pcie_s2r_port_resume(void *data, async_cookie_t cookie)
 {
-	struct apple_pcie_port *port;
+	struct apple_pcie_port *port = data;
+	struct apple_pcie *pcie = port->pcie;
 	int ret;
 
-	list_for_each_entry(port, &pcie->ports, entry) {
-		if (!port->s2r_link_up)
-			continue;
-		if (apple_pcie_port_readl(port, PORT_LINKSTS) & PORT_LINKSTS_UP) {
-			apple_pcie_s2r_rid2sid(pcie, port);
-			continue;
-		}
-		ret = apple_pcie_s2r_port_up(pcie, port);
-		if (ret) {
-			dev_err(pcie->dev, "S2R: %pOF link not back (%d), its functions stay unreachable\n",
-				port->np, ret);
-			continue;
-		}
-		dev_dbg(pcie->dev, "S2R: %pOF link back, PWREN and PERST# cycled as at probe\n",
-			port->np);
+	if (apple_pcie_port_readl(port, PORT_LINKSTS) & PORT_LINKSTS_UP) {
+		apple_pcie_s2r_rid2sid(pcie, port);
+		return;
 	}
+	ret = apple_pcie_s2r_port_up(pcie, port);
+	if (ret) {
+		dev_err(pcie->dev, "S2R: %pOF link not back (%d), its functions stay unreachable\n",
+			port->np, ret);
+		return;
+	}
+	dev_dbg(pcie->dev, "S2R: %pOF link back, PWREN and PERST# cycled as at probe\n", port->np);
+}
+
+/*
+ * The noirq resume, before the PCI core's of the functions behind the ports. The ports share
+ * no register and wait out their PCIe timings on their own, so they come up side by side
+ * rather than one after another.
+ */
+static void apple_pcie_s2r_ports_up(struct apple_pcie *pcie)
+{
+	ASYNC_DOMAIN_EXCLUSIVE(domain);
+	struct apple_pcie_port *port;
+
+	list_for_each_entry(port, &pcie->ports, entry)
+		if (port->s2r_link_up)
+			async_schedule_domain(apple_pcie_s2r_port_resume, port, &domain);
+	async_synchronize_full_domain(&domain);
 }
 
 static int apple_pcie_prepare(struct device *dev)
