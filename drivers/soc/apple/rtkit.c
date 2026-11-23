@@ -2349,6 +2349,7 @@ static int apple_rtkit_inherit_endpoints(
 }
 
 static struct apple_rtkit *__apple_rtkit_init(struct device *dev, void *cookie,
+					      const char *mbox_prop,
 					      const char *mbox_name, int mbox_idx,
 					      const struct apple_rtkit_ops *ops,
 					      bool adopted,
@@ -2414,7 +2415,9 @@ static struct apple_rtkit *__apple_rtkit_init(struct device *dev, void *cookie,
 	set_bit(APPLE_RTKIT_EP_MGMT, rtk->endpoints);
 	set_bit(APPLE_RTKIT_EP_MGMT, rtk->started);
 
-	if (mbox_name)
+	if (mbox_prop)
+		rtk->mbox = apple_mbox_get_prop(dev, mbox_prop, 0);
+	else if (mbox_name)
 		rtk->mbox = apple_mbox_get_byname(dev, mbox_name);
 	else
 		rtk->mbox = apple_mbox_get(dev, mbox_idx);
@@ -2468,16 +2471,25 @@ struct apple_rtkit *apple_rtkit_init(struct device *dev, void *cookie,
 					    const char *mbox_name, int mbox_idx,
 					    const struct apple_rtkit_ops *ops)
 {
-	return __apple_rtkit_init(dev, cookie, mbox_name, mbox_idx, ops, false,
+	return __apple_rtkit_init(dev, cookie, NULL, mbox_name, mbox_idx, ops, false,
 				  NULL, 0, false, NULL);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_init);
+
+struct apple_rtkit *apple_rtkit_init_mbox_prop(struct device *dev, void *cookie,
+					       const char *mbox_prop,
+					       const struct apple_rtkit_ops *ops)
+{
+	return __apple_rtkit_init(dev, cookie, mbox_prop, NULL, 0, ops, false,
+				  NULL, 0, false, NULL);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_init_mbox_prop);
 
 struct apple_rtkit *apple_rtkit_init_adopted(struct device *dev, void *cookie,
 					     const char *mbox_name, int mbox_idx,
 					     const struct apple_rtkit_ops *ops)
 {
-	return __apple_rtkit_init(dev, cookie, mbox_name, mbox_idx, ops, true,
+	return __apple_rtkit_init(dev, cookie, NULL, mbox_name, mbox_idx, ops, true,
 				  NULL, 0, false, NULL);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_init_adopted);
@@ -2536,7 +2548,7 @@ struct apple_rtkit *apple_rtkit_init_adopted_with_buffers(
 	const struct apple_rtkit_ops *ops,
 	const struct apple_rtkit_inherited_buffer *buffers, unsigned int count)
 {
-	return __apple_rtkit_init(dev, cookie, mbox_name, mbox_idx, ops, true,
+	return __apple_rtkit_init(dev, cookie, NULL, mbox_name, mbox_idx, ops, true,
 				  buffers, count, false, NULL);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_init_adopted_with_buffers);
@@ -2549,7 +2561,7 @@ struct apple_rtkit *apple_rtkit_init_adopted_with_session(
 	if (!session)
 		return ERR_PTR(-EINVAL);
 
-	return __apple_rtkit_init(dev, cookie, mbox_name, mbox_idx, ops, true,
+	return __apple_rtkit_init(dev, cookie, NULL, mbox_name, mbox_idx, ops, true,
 				  session->buffers, session->num_buffers, false,
 				  session);
 }
@@ -3607,7 +3619,7 @@ struct apple_rtkit *devm_apple_rtkit_init_m5_saved(struct device *dev, void *coo
 	struct apple_rtkit *rtk;
 	int ret;
 
-	rtk = __apple_rtkit_init(dev, cookie, mbox_name, mbox_idx, ops, false,
+	rtk = __apple_rtkit_init(dev, cookie, NULL, mbox_name, mbox_idx, ops, false,
 				NULL, 0, true, NULL);
 	if (IS_ERR(rtk))
 		return rtk;

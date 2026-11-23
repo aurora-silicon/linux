@@ -1339,14 +1339,14 @@ static void apple_mbox_quiesce(void *data)
 	pm_runtime_barrier(mbox->dev);
 }
 
-struct apple_mbox *apple_mbox_get(struct device *dev, int index)
+struct apple_mbox *apple_mbox_get_prop(struct device *dev, const char *prop, int index)
 {
 	struct of_phandle_args args;
 	struct platform_device *pdev;
 	struct apple_mbox *mbox;
 	int ret;
 
-	ret = of_parse_phandle_with_args(dev->of_node, "mboxes", "#mbox-cells",
+	ret = of_parse_phandle_with_args(dev->of_node, prop, "#mbox-cells",
 					 index, &args);
 	if (ret || !args.np)
 		return ERR_PTR(ret);
@@ -1372,6 +1372,12 @@ out_put_pdev:
 	put_device(&pdev->dev);
 
 	return mbox;
+}
+EXPORT_SYMBOL(apple_mbox_get_prop);
+
+struct apple_mbox *apple_mbox_get(struct device *dev, int index)
+{
+	return apple_mbox_get_prop(dev, "mboxes", index);
 }
 EXPORT_SYMBOL(apple_mbox_get);
 

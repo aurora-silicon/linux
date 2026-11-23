@@ -164,6 +164,11 @@ struct apple_rtkit *apple_rtkit_init(struct device *dev, void *cookie,
 					  const char *mbox_name, int mbox_idx,
 					  const struct apple_rtkit_ops *ops);
 
+/* As apple_rtkit_init(), with the mailbox named by @mbox_prop instead of mboxes. */
+struct apple_rtkit *apple_rtkit_init_mbox_prop(struct device *dev, void *cookie,
+					       const char *mbox_prop,
+					       const struct apple_rtkit_ops *ops);
+
 /*
  * Initialize an instance for a co-processor that the bootloader left running
  * and that cannot be reset. No HELLO/EPMAP handshake takes place: the system
