@@ -315,3 +315,7 @@ module_init(aurora_boot_security_init);
 module_exit(aurora_boot_security_exit);
 MODULE_DESCRIPTION("Report the boot chain record left by aura and U-Boot");
 MODULE_LICENSE("Dual MIT/GPL");
+
+#if IS_ENABLED(CONFIG_APPLE_AURORA_BOOT_SECURITY_KUNIT_TEST)
+#include "aurora-boot-security-test.c"
+#endif
