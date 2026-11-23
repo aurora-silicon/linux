@@ -589,6 +589,10 @@ impl RootV27_2 {
         MSG_TX_DOORBELL | (4 * RENDER_GROUP + dm) as u64
     }
 
+    pub(crate) fn render_queue_announced(&self, dm: usize) -> bool {
+        self.render_queues[dm].announced.load(Ordering::Acquire)
+    }
+
     pub(crate) fn stage_render(&self, dm: usize, commands: &[u64]) -> Result<Submission<'_>> {
         let queue = self.render_queues.get(dm).ok_or(EINVAL)?;
         self.stage_work(&queue.positions, &queue.pointers, queue.info(0),

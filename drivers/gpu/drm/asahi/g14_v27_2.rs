@@ -13,7 +13,8 @@
 //! publishing records on its event, statistics and log rings: each one runs the service, which
 //! consumes those rings (the firmware waits for space in them) and retires completed commands.
 //! Completion follows the queue's retired position, which the firmware advances in order. There
-//! is no timer: the DRM scheduler's job timeout runs the service as the backstop for a hang.
+//! is a delayed service run while waiting for firmware to free a pool slot or make room on
+//! the device-control ring. These changes need not generate a notification.
 
 use core::ops::Range;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -21,14 +22,14 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use kernel::{
     device,
     drm::sched,
-    new_condvar, new_mutex, new_spinlock, new_work,
+    new_condvar, new_delayed_work, new_mutex, new_spinlock, new_work,
     platform,
     prelude::*,
     soc::apple::rtkit,
     sync::{aref::ARef, Arc, ArcBorrow, CondVar, Mutex, SpinLock},
     time::{delay::fsleep, msecs_to_jiffies, Delta, Instant, Monotonic},
     uapi,
-    workqueue::{impl_has_work, OwnedQueue, Work, WorkItem},
+    workqueue::{impl_has_delayed_work, impl_has_work, DelayedWork, OwnedQueue, Work, WorkItem},
 };
 
 use crate::{
@@ -53,6 +54,33 @@ const COMMAND_TIMEOUT_MS: i64 = 5000;
 const STOP_DRAIN_MS: u32 = 2000;
 /// Bound on the wait between a command's completion stamp and its retired position.
 const RETIRE_WAIT_US: i64 = 2000;
+/// Poll interval when firmware can release a resource without an interrupt.
+const RESOURCE_RETRY_MS: u32 = 10;
+/// Work item for the poll. Ordinary firmware notifications can still queue immediate work.
+const RETRY_WORK: u64 = 1;
+
+struct FirmwareWait {
+    since: Instant<Monotonic>,
+    last_kick: Option<Instant<Monotonic>>,
+}
+
+impl FirmwareWait {
+    /// Bound the wait even if the blocked command has not been published yet.
+    fn kick_due(wait: &mut Option<Self>) -> Result<bool> {
+        let now = Instant::now();
+        let wait = wait.get_or_insert(Self { since: now, last_kick: None });
+        if now - wait.since >= Delta::from_millis(COMMAND_TIMEOUT_MS) {
+            return Err(ETIMEDOUT);
+        }
+        if wait.last_kick.is_some_and(|last| {
+            now - last < Delta::from_millis(RESOURCE_RETRY_MS.into())
+        }) {
+            return Ok(false);
+        }
+        wait.last_kick = Some(now);
+        Ok(true)
+    }
+}
 
 /// The ASC control page, kept mapped until the firmware is stopped.
 pub(crate) struct AscControl(*mut u8);
@@ -112,6 +140,17 @@ impl Notify {
     fn wake(&self) {
         if let Some(runtime) = self.runtime.lock().as_ref() {
             let _ = runtime.queue.enqueue::<Arc<Runtime>, 0>(runtime.clone());
+        }
+    }
+
+    /// Queues a poll while attached. Detaching also fences off poll requests before teardown.
+    fn retry(&self) {
+        if let Some(runtime) = self.runtime.lock().as_ref() {
+            if runtime.healthy() {
+                let _ = runtime.queue.enqueue_delayed::<Arc<Runtime>, RETRY_WORK>(
+                    runtime.clone(), msecs_to_jiffies(RESOURCE_RETRY_MS),
+                );
+            }
         }
     }
 
@@ -330,7 +369,8 @@ struct State {
     last: event::EventValue,
     sequence: u64,
     next_slot: usize,
-    waiting_unlink: bool,
+    waiting_unlink: Option<FirmwareWait>,
+    waiting_control: Option<FirmwareWait>,
     /// Publications and retirements counted on the queue's position block.
     published: u64,
     /// Completion stamps seen before the retired position they precede.
@@ -400,7 +440,7 @@ pub(crate) struct Runtime {
     /// published across a system sleep.
     asleep: AtomicBool,
     notify: Arc<Notify>,
-    /// Runs the service; only `Notify::wake` queues on it, and `stop` drains it.
+    /// Runs the service. Only `Notify` queues on it, and `stop` drains it.
     queue: OwnedQueue,
     #[pin]
     state: Mutex<Option<State>>,
@@ -409,6 +449,8 @@ pub(crate) struct Runtime {
     idle: CondVar,
     #[pin]
     work: Work<Runtime>,
+    #[pin]
+    retry: DelayedWork<Runtime, RETRY_WORK>,
 }
 
 impl_has_work! {
@@ -419,6 +461,19 @@ impl WorkItem for Runtime {
     type Pointer = Arc<Runtime>;
     fn run(this: Arc<Runtime>) {
         this.service();
+    }
+}
+
+impl_has_delayed_work! {
+    impl HasDelayedWork<Runtime, RETRY_WORK> for Runtime { self.retry }
+}
+
+impl WorkItem<RETRY_WORK> for Runtime {
+    type Pointer = Arc<Runtime>;
+    fn run(this: Arc<Runtime>) {
+        if this.healthy() {
+            this.service();
+        }
     }
 }
 
@@ -463,6 +518,9 @@ impl Runtime {
             }
             if !state.owns(packet) {
                 packet.release_guard();
+            }
+            if state.pending.is_empty() {
+                state.waiting_unlink = None;
             }
         }
     }
@@ -517,14 +575,19 @@ impl Runtime {
             slots[found] = slot;
             found += 1;
             if found == count {
-                state.waiting_unlink = false;
+                state.waiting_unlink = None;
                 return Ok(Some(slots));
             }
         }
-        if !state.waiting_unlink {
-            state.waiting_unlink = true;
+        if FirmwareWait::kick_due(&mut state.waiting_unlink)? {
             state.peer.as_mut().send_message(EP_DOORBELL, gpu::COMPUTE_KICK)?;
+            for dm in [TILER, FRAGMENT] {
+                if state.root.render_queue_announced(dm) {
+                    state.peer.as_mut().send_message(EP_DOORBELL, RootV27_2::render_kick(dm))?;
+                }
+            }
         }
+        self.notify.retry();
         Ok(None)
     }
 
@@ -544,7 +607,11 @@ impl Runtime {
             let slots = match self.free_slots(state, count) {
                 Ok(Some(slots)) => slots,
                 Ok(None) => return,
-                Err(err) => { self.fail_all(state, err); return; }
+                Err(err) => {
+                    dev_err!(self.dev, "GPU: command pool stalled: {:?}\n", err);
+                    self.fail_all(state, err);
+                    return;
+                }
             };
             let last = index + 1 == packet.commands.len();
             let result = match command {
@@ -737,7 +804,17 @@ impl Runtime {
             let Some((cursor, event)) = state.root.peek_event()? else { break; };
             match event {
                 FirmwareEvent::Grow(request) if request.halt_count == state.root.halt_count()? => {
-                    let Some(reply) = state.root.reserve_control_reply()? else { break; };
+                    let Some(reply) = state.root.reserve_control_reply()? else {
+                        // Leave the GrowTVB request at the head of the event ring until
+                        // there is space for its reply.
+                        if FirmwareWait::kick_due(&mut state.waiting_control)? {
+                            state.peer.as_mut().send_message(
+                                EP_DOORBELL, gpu::DEVICE_CONTROL_KICK,
+                            )?;
+                        }
+                        self.notify.retry();
+                        return Ok(());
+                    };
                     let granted = state.rendering.as_ref()
                         .filter(|flight| flight.bind.slot() == request.vm && flight.scene.slot() == request.buffer)
                         .and_then(|flight| flight.packet.render_queue.as_ref())
@@ -752,6 +829,7 @@ impl Runtime {
                 }
                 FirmwareEvent::Grow(_) | FirmwareEvent::Notification => {}
             }
+            state.waiting_control = None;
             state.root.consume_event(cursor)?;
         }
         Ok(())
@@ -759,13 +837,18 @@ impl Runtime {
 
     fn service_locked(&self, state: &mut State) {
         let _ = state.root.drain();
+        if !self.healthy() { return; }
         if state.peer.is_crashed() {
             dev_err!(self.dev, "GPU firmware crashed; failing {} pending and {} published commands\n",
                      state.pending.len(), state.inflight.len());
             self.fail_all(state, EIO);
             return;
         }
-        if let Err(err) = self.process_events(state) { self.fail_all(state, err); return; }
+        if let Err(err) = self.process_events(state) {
+            dev_err!(self.dev, "GPU: event service failed: {:?}\n", err);
+            self.fail_all(state, err);
+            return;
+        }
         if let Err(err) = self.retire_render(state) { self.fail_all(state, err); return; }
         if let Err(e) = self.advance(state) { self.fail_all(state, e); return; }
         // The completion stamp is written before the firmware's post-processing advances the
@@ -853,6 +936,7 @@ impl Runtime {
         let Some(state) = Option::as_mut(&mut *guard) else { return; };
         dev_info!(self.dev, "GPU released after sleep: running={:?} pending={}\n",
                   state.root.firmware_running(), state.pending.len());
+        state.waiting_unlink = None;
         if self.healthy() { self.pump(state); }
     }
 
@@ -873,9 +957,15 @@ impl Runtime {
             // Serialize the last permitted publication with the transition to shutdown.
             self.healthy.store(false, Ordering::Release);
         }
-        // Nothing queues service work after the detach, and none is queued or running once the
-        // drain returns, so no work outlives the module.
+        // Detach prevents new enqueues. Flush the delayed item before draining the queue,
+        // since a pending timer may not have queued its work yet.
         drop(self.notify.detach());
+        // SAFETY: This is the initialized, pinned retry item. It cannot rearm after detach.
+        unsafe {
+            let work = Work::raw_get(DelayedWork::raw_as_work(&self.retry));
+            let delayed = kernel::container_of!(work, kernel::bindings::delayed_work, work);
+            kernel::bindings::flush_delayed_work(delayed);
+        }
         self.queue.drain();
         let mut guard = self.state.lock();
         let Some(mut state) = guard.take() else { return; };
@@ -946,6 +1036,7 @@ impl Backend {
                 state <- new_mutex!(None, "g14_v27_2::Runtime::state"),
                 idle <- new_condvar!("g14_v27_2::Runtime::idle"),
                 work <- new_work!("g14_v27_2::Runtime::work"),
+                retry <- new_delayed_work!("g14_v27_2::Runtime::retry"),
             }), GFP_KERNEL)) {
             Ok(runtime) => runtime,
             Err(e) => {
@@ -974,7 +1065,8 @@ impl Backend {
             peer, root, pool, asc, queue, last,
             sequence: u64::from(head),
             next_slot: 0,
-            waiting_unlink: false,
+            waiting_unlink: None,
+            waiting_control: None,
             published: 0,
             late: 0,
             busy: 0,
