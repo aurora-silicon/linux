@@ -307,6 +307,8 @@ static const struct brcmf_firmware_mapping brcmf_pcie_fwnames[] = {
 #define BRCMF_SHARED_FLAGS3_OFFSET		108
 #define BRCMF_SHARED_HOST_CAP2_OFFSET		112
 #define BRCMF_SHARED_HOST_CAP3_OFFSET		116
+/* The end of the last shared RAM field the driver reads or writes */
+#define BRCMF_SHARED_SIZE			(BRCMF_SHARED_HOST_CAP2_OFFSET + 4)
 
 #define BRCMF_RING_H2D_RING_COUNT_OFFSET	0
 #define BRCMF_RING_D2H_RING_COUNT_OFFSET	1
@@ -1599,6 +1601,8 @@ static int brcmf_pcie_init_ringbuffers(struct brcmf_pciedev_info *devinfo)
 	u32 h2d_w_idx_ptr;
 	u32 h2d_r_idx_ptr;
 	u32 ring_mem_ptr;
+	u32 h2d_idx_len;
+	u32 d2h_idx_len;
 	u32 i;
 	u64 address;
 	u32 bufsz;
@@ -1624,6 +1628,13 @@ static int brcmf_pcie_init_ringbuffers(struct brcmf_pciedev_info *devinfo)
 		brcmf_err(bus, "invalid max_flowrings(%d)\n", max_flowrings);
 		return -EIO;
 	}
+	if (!brcmf_pcie_tcm_range_valid(devinfo->tcm_size,
+					le32_to_cpu(ringinfo.ringmem),
+					BRCMF_NROF_COMMON_MSGRINGS *
+					BRCMF_RING_MEM_SZ)) {
+		brcmf_err(bus, "ring memory outside the TCM\n");
+		return -EINVAL;
+	}
 
 	if (devinfo->dma_idx_sz != 0) {
 		bufsz = (max_submissionrings + max_completionrings) *
@@ -1641,6 +1652,21 @@ static int brcmf_pcie_init_ringbuffers(struct brcmf_pciedev_info *devinfo)
 		h2d_w_idx_ptr = le32_to_cpu(ringinfo.h2d_w_idx_ptr);
 		h2d_r_idx_ptr = le32_to_cpu(ringinfo.h2d_r_idx_ptr);
 		idx_offset = sizeof(u32);
+		/* One index per common ring and flowring, each way */
+		h2d_idx_len = (BRCMF_NROF_H2D_COMMON_MSGRINGS + max_flowrings) *
+			      idx_offset;
+		d2h_idx_len = BRCMF_NROF_D2H_COMMON_MSGRINGS * idx_offset;
+		if (!brcmf_pcie_tcm_range_valid(devinfo->tcm_size,
+						h2d_w_idx_ptr, h2d_idx_len) ||
+		    !brcmf_pcie_tcm_range_valid(devinfo->tcm_size,
+						h2d_r_idx_ptr, h2d_idx_len) ||
+		    !brcmf_pcie_tcm_range_valid(devinfo->tcm_size,
+						d2h_w_idx_ptr, d2h_idx_len) ||
+		    !brcmf_pcie_tcm_range_valid(devinfo->tcm_size,
+						d2h_r_idx_ptr, d2h_idx_len)) {
+			brcmf_err(bus, "ring indices outside the TCM\n");
+			return -EINVAL;
+		}
 		devinfo->write_ptr = brcmf_pcie_write_tcm16;
 		devinfo->read_ptr = brcmf_pcie_read_tcm16;
 		brcmf_dbg(PCIE, "Using TCM indices\n");
@@ -2031,6 +2057,12 @@ brcmf_pcie_init_share_ram_info(struct brcmf_pciedev_info *devinfo,
 	u32 addr;
 
 	shared = &devinfo->shared;
+	if (!brcmf_pcie_tcm_range_valid(devinfo->tcm_size, sharedram_addr,
+					BRCMF_SHARED_SIZE)) {
+		brcmf_err(bus, "shared RAM at 0x%08x is outside the TCM\n",
+			  sharedram_addr);
+		return -EINVAL;
+	}
 	shared->tcm_base_address = sharedram_addr;
 
 	shared->flags = brcmf_pcie_read_tcm32(devinfo, sharedram_addr +
@@ -2069,6 +2101,17 @@ brcmf_pcie_init_share_ram_info(struct brcmf_pciedev_info *devinfo,
 
 	addr = sharedram_addr + BRCMF_SHARED_RING_INFO_ADDR_OFFSET;
 	shared->ring_info_addr = brcmf_pcie_read_tcm32(devinfo, addr);
+
+	if (!brcmf_pcie_tcm_range_valid(devinfo->tcm_size,
+					shared->htod_mb_data_addr, 4) ||
+	    !brcmf_pcie_tcm_range_valid(devinfo->tcm_size,
+					shared->dtoh_mb_data_addr, 4) ||
+	    !brcmf_pcie_tcm_range_valid(devinfo->tcm_size,
+					shared->ring_info_addr,
+					sizeof(struct brcmf_pcie_dhi_ringinfo))) {
+		brcmf_err(bus, "shared RAM addresses outside the TCM\n");
+		return -EINVAL;
+	}
 
 	brcmf_dbg(PCIE, "max rx buf post %d, rx dataoffset %d\n",
 		  shared->max_rxbufpost, shared->rx_dataoffset);
