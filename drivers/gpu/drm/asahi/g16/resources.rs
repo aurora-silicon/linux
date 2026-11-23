@@ -27,6 +27,8 @@ use kernel::{
 /// avoids allocating and mapping fresh epochs whenever submission depth rises.
 const SPARE_EPOCHS: usize = 32;
 
+/// Backing for one physical compute unit (`k`) of a VM, deferred-dropped independently so an
+/// undisplaced last-retired owner lease on one CDM pipe never pins the VM's other compute units.
 pub(crate) struct ComputeArena(crate::cleanup::Deferred<ComputeInner>);
 impl core::ops::Deref for ComputeArena {
     type Target = ComputeInner;
@@ -35,7 +37,7 @@ impl core::ops::Deref for ComputeArena {
     }
 }
 pub(crate) struct ComputeInner {
-    pub(crate) compute: KVec<ComputeSlot>,
+    pub(crate) unit: ComputeSlot,
     _objects: Objects,
     // Mappings must disappear while their root still owns its ASID.
     _bind: mmu::VmBind,
@@ -53,32 +55,64 @@ const BURST_GAP_NS: u64 = 2_000_000;
 const BURST_COMMANDS: usize = 3;
 
 impl ComputeArena {
-    /// Units `units` (their index fixes their client addresses and hardware UMA slot).
+    /// Allocates one self-contained compute unit `k` (its index fixes its client addresses and
+    /// hardware UMA slot).
     fn new(
         factory: &Factory,
         bind: &mmu::VmBind,
         vm: &mmu::Vm,
         live: &Arc<super::vm::LiveToken>,
-        units: core::ops::Range<usize>,
+        k: usize,
     ) -> Result<Arc<Self>> {
         let mut objects = factory.objects(vm);
-        let mut compute = KVec::with_capacity(units.len(), GFP_KERNEL)?;
-        for k in units {
-            compute.push(
-                ComputeSlot::new(&mut objects, factory, k as u64)?,
-                GFP_KERNEL,
-            )?;
-        }
+        let unit = ComputeSlot::new(&mut objects, factory, k as u64)?;
         objects.finish_private()?;
         Ok(Arc::new(
             Self(crate::cleanup::Deferred::new(ComputeInner {
-                compute,
+                unit,
                 _objects: objects,
                 _bind: bind.clone(),
                 _live: live.clone(),
             })?),
             GFP_KERNEL,
         )?)
+    }
+}
+
+/// Contiguous range of independently reference-counted [`ComputeArena`] units owned by a VM.
+///
+/// Each unit `k` owns its own `Arc<ComputeArena>` so `Cache::close()` and
+/// `Slots::reclaim_closed()` release all unused or displaced units immediately even while a
+/// CDM pipe retains one undisplaced last-retired unit until displacement.
+pub(crate) struct ComputeUnitSet {
+    units: KVec<Arc<ComputeArena>>,
+}
+impl ComputeUnitSet {
+    /// Units `range` (each index fixes its client addresses and hardware UMA slot).
+    fn new(
+        factory: &Factory,
+        bind: &mmu::VmBind,
+        vm: &mmu::Vm,
+        live: &Arc<super::vm::LiveToken>,
+        range: core::ops::Range<usize>,
+    ) -> Result<Arc<Self>> {
+        let mut units = KVec::with_capacity(range.len(), GFP_KERNEL)?;
+        for k in range {
+            units.push(
+                ComputeArena::new(factory, bind, vm, live, k)?,
+                GFP_KERNEL,
+            )?;
+        }
+        Ok(Arc::new(Self { units }, GFP_KERNEL)?)
+    }
+    fn len(&self) -> usize {
+        self.units.len()
+    }
+    fn unit(&self, idx: usize) -> Option<&ComputeSlot> {
+        self.units.get(idx).map(|arena| &arena.unit)
+    }
+    fn arena(&self, idx: usize) -> Option<Arc<ComputeArena>> {
+        self.units.get(idx).cloned()
     }
 }
 
@@ -546,9 +580,9 @@ impl PassOwnerArena {
 
 #[derive(Default)]
 struct Ready {
-    compute: Option<Arc<ComputeArena>>,
+    compute: Option<Arc<ComputeUnitSet>>,
     /// Units from [`BASE_COMPUTE_UNITS`] on, for a VM that keeps compute queued.
-    compute_ext: Option<Arc<ComputeArena>>,
+    compute_ext: Option<Arc<ComputeUnitSet>>,
     render: Option<Arc<RenderArena>>,
     /// Demand-grown extension render pass tiers (`EXT_RENDER_TIERS`).
     render_ext: [Option<Arc<RenderExtArena>>; EXT_RENDER_TIERS.len()],
@@ -778,7 +812,7 @@ impl Cache {
                 return Err(EIO);
             }
             if compute && ready.compute.is_none() {
-                ready.compute = Some(ComputeArena::new(
+                ready.compute = Some(ComputeUnitSet::new(
                     &self.factory,
                     &self.bind,
                     &vm.vm,
@@ -800,7 +834,7 @@ impl Cache {
                         hints.expand_compute_ext,
                     ) {
                         // Best effort: without them the VM keeps the base compute units.
-                        state.compute_ext = ComputeArena::new(
+                        state.compute_ext = ComputeUnitSet::new(
                             &self.factory,
                             &self.bind,
                             &vm.vm,
@@ -1081,9 +1115,9 @@ impl Cache {
 
 /// Immutable references carried by an accepted job. No fallible lazy work in the engine.
 pub(crate) struct Prepared {
-    pub(crate) compute: Option<Arc<ComputeArena>>,
+    pub(crate) compute: Option<Arc<ComputeUnitSet>>,
     /// The VM's extension compute units when the job was prepared.
-    pub(crate) compute_ext: Option<Arc<ComputeArena>>,
+    pub(crate) compute_ext: Option<Arc<ComputeUnitSet>>,
     pub(crate) render: Option<Arc<RenderArena>>,
     /// The VM's demand-grown extension render pass tiers when the job was prepared.
     pub(crate) render_ext: [Option<Arc<RenderExtArena>>; EXT_RENDER_TIERS.len()],
@@ -1113,21 +1147,22 @@ impl Drop for Prepared {
     }
 }
 impl Prepared {
-    pub(crate) fn compute(&self) -> Result<&ComputeArena> {
+    pub(crate) fn compute(&self) -> Result<&ComputeUnitSet> {
         self.compute.as_deref().ok_or(EINVAL)
     }
     /// Compute units this job can use.
     pub(crate) fn compute_units(&self) -> Result<usize> {
-        Ok(self.compute()?.compute.len()
-            + self.compute_ext.as_deref().map_or(0, |e| e.compute.len()))
+        Ok(self.compute()?.len() + self.compute_ext.as_deref().map_or(0, ComputeUnitSet::len))
     }
-    /// The arena holding compute unit `k`.
+    /// The per-unit arena holding compute unit `k`.
     pub(crate) fn compute_arena(&self, k: usize) -> Option<Arc<ComputeArena>> {
         let base = self.compute.as_ref()?;
-        if k < base.compute.len() {
-            Some(base.clone())
+        if k < base.len() {
+            base.arena(k)
         } else {
-            self.compute_ext.clone()
+            self.compute_ext
+                .as_ref()
+                .and_then(|ext| ext.arena(k - base.len()))
         }
     }
     /// Physical PB/UMA allocator slot bitmask and preferred home slot this job can use.
@@ -1294,13 +1329,13 @@ impl Prepared {
     }
     /// Compute unit `k`: the VM's base units, then its extension units.
     pub(crate) fn compute_unit(&self, k: usize) -> Result<&ComputeSlot> {
-        let base = &self.compute()?.compute;
-        match base.get(k) {
+        let base = self.compute()?;
+        match base.unit(k) {
             Some(unit) => Ok(unit),
             None => self
                 .compute_ext
                 .as_deref()
-                .and_then(|e| e.compute.get(k - base.len()))
+                .and_then(|e| e.unit(k - base.len()))
                 .ok_or(EINVAL),
         }
     }

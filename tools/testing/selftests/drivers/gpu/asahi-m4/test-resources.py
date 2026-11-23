@@ -193,12 +193,17 @@ pub mod g16 {
             pub static COMPUTE_OWNER_ARENA:std::cell::RefCell<
                 Option<crate::sync::Arc<ComputeArena>>,
             >=const{std::cell::RefCell::new(None)};
+            pub static COMPUTE_OWNER_ARENAS:std::cell::RefCell<
+                Option<Vec<crate::sync::Arc<ComputeArena>>>,
+            >=const{std::cell::RefCell::new(None)};
         }
         impl ComputeArena{
             pub fn compute_units(&self)->Result<usize>{Ok(self.compute.len())}
             pub fn compute_unit(&self,k:usize)->Result<&super::slots::ComputeSlot>{self.compute.get(k).ok_or(EINVAL)}
-            pub fn compute_arena(&self,_k:usize)->Option<crate::sync::Arc<ComputeArena>>{
-                COMPUTE_OWNER_ARENA.with(|a|a.borrow().clone())
+            pub fn compute_arena(&self,k:usize)->Option<crate::sync::Arc<ComputeArena>>{
+                COMPUTE_OWNER_ARENAS
+                    .with(|a|a.borrow().as_ref().and_then(|v|v.get(k).cloned()))
+                    .or_else(||COMPUTE_OWNER_ARENA.with(|a|a.borrow().clone()))
             }
             pub fn render_arena(&self)->Option<crate::sync::Arc<RenderArena>>{self.render.clone()}
             pub fn render_passes(&self)->Result<usize>{self.render.as_deref().map(|r|r.passes.len()).ok_or(EINVAL)}
@@ -2429,6 +2434,90 @@ pub mod g16 {
         let _ = WARM_PB_SLOTS;
     }
 
+    #[test]fn dual_pipe_closed_compute_vms_pin_only_one_unit_per_pipe(){
+        use g16::hw::sizes::COMPUTE_UNITS;
+        use g16::resources::{COMPUTE_OWNER_ARENAS, ComputeArena};
+        use g16::slots::ComputeSlot;
+
+        let mut o = Objects::new();
+        let mut s = Slots::new().unwrap();
+        let mut compute_slots = KVec::new();
+        for k in 0..COMPUTE_UNITS {
+            compute_slots.push(ComputeSlot::new(&mut o, &g16::object::Factory, k as u64).unwrap(), 0).unwrap();
+        }
+        let prep = ComputeArena { compute: compute_slots, render: None };
+
+        // Simulate 8 compute VMs, each owning 24 independent per-unit ComputeArenas
+        // (matching production ComputeUnitSet), running across BOTH CDM pipes (0 and 1).
+        let mut vms = Vec::new();
+        let mut vm_unit_arenas: Vec<Vec<sync::Arc<ComputeArena>>> = Vec::new();
+        for i in 0..8usize {
+            let v = vm(800 + i as u64);
+            let mut per_unit = Vec::with_capacity(COMPUTE_UNITS);
+            for _ in 0..COMPUTE_UNITS {
+                per_unit.push(
+                    sync::Arc::new(ComputeArena { compute: KVec::new(), render: None }, 0).unwrap(),
+                );
+            }
+            COMPUTE_OWNER_ARENAS.with(|a| *a.borrow_mut() = Some(per_unit.clone()));
+            for pipe in [0usize, 1usize] {
+                let mut c = Claims::new();
+                let k = s.claim_compute_for_pipe(&prep, &mut c, Some(v.id), pipe).unwrap().unwrap();
+                s.hold_compute_slot(k, &v, &prep).unwrap();
+                s.publish(&mut c).unwrap();
+                s.retire(&mut c).unwrap();
+            }
+            COMPUTE_OWNER_ARENAS.with(|a| *a.borrow_mut() = None);
+            vms.push(v);
+            vm_unit_arenas.push(per_unit);
+        }
+
+        // Close all 8 VMs and reclaim displaced leases:
+        // - Pipe 0 and pipe 1 each retain 1 undisplaced last-retired unit -> reusable == 22.
+        // - Out of 8 * 24 = 192 per-unit arenas, ONLY those 2 undisplaced units remain pinned
+        //   (strong_count == 2); all 190 other units (including the other 23 units of each
+        //   last-retired VM) drop immediately (strong_count == 1).
+        for v in &vms {
+            v.vm.close();
+        }
+        assert!(s.reclaim_closed(), "two undisplaced dual-pipe units remain");
+        assert_eq!(s.lifetime_counts()[0].reusable, (COMPUTE_UNITS - 2) as u32);
+        let pinned_units: usize = vm_unit_arenas
+            .iter()
+            .flat_map(|units| units.iter())
+            .filter(|arena| sync::Arc::strong_count(arena) > 1)
+            .count();
+        assert_eq!(pinned_units, 2, "must pin exactly 1 unit per CDM pipe, never a whole VM set");
+        for (i, units) in vm_unit_arenas.iter().enumerate() {
+            let vm_pinned = units.iter().filter(|a| sync::Arc::strong_count(a) > 1).count();
+            if i == 7 {
+                assert_eq!(vm_pinned, 2, "last VM holds only its 2 undisplaced units");
+            } else {
+                assert_eq!(vm_pinned, 0, "displaced closed VM {i} holds 0 units");
+                assert_eq!(sync::Arc::strong_count(&vms[i]), 1, "closed VM {i} fully released");
+            }
+        }
+
+        // Displace pipe 0 and pipe 1 with a live VM -> all 8 closed VMs and 192 units release.
+        let live = vm(900);
+        for pipe in [0usize, 1usize] {
+            let mut c = Claims::new();
+            let k = s.claim_compute_for_pipe(&prep, &mut c, Some(live.id), pipe).unwrap().unwrap();
+            s.hold_compute_slot(k, &live, &prep).unwrap();
+            s.publish(&mut c).unwrap();
+            s.retire(&mut c).unwrap();
+        }
+        assert!(!s.reclaim_closed(), "both dual-pipe closed leases displaced and reclaimed");
+        let pinned_after: usize = vm_unit_arenas
+            .iter()
+            .flat_map(|units| units.iter())
+            .filter(|arena| sync::Arc::strong_count(arena) > 1)
+            .count();
+        assert_eq!(pinned_after, 0);
+        for (i, v) in vms.iter().enumerate() {
+            assert_eq!(sync::Arc::strong_count(v), 1, "closed VM {i} fully released after displacement");
+        }
+    }
 }
 '''
 poll_source = (production/'poll.rs').read_text()
@@ -2474,6 +2563,10 @@ budget += r'''
 source=source.replace('__BUDGET__',budget.replace('//!','//'))
 source = source.replace('__LIVE_TOKEN__' ,item((production/'vm.rs').read_text(),'pub(crate) struct LiveToken')).replace('__LIVE_DROP__',item((production/'vm.rs').read_text(),'impl Drop for LiveToken'))
 resources_source = (production/'resources.rs').read_text()
+assert 'pub(crate) struct ComputeUnitSet {' in resources_source, 'resources.rs must split compute units into per-unit ComputeArenas'
+assert 'ComputeArena::new(factory, bind, vm, live, k)?' in resources_source, 'ComputeUnitSet::new must allocate one ComputeArena per unit'
+assert 'compute_ext: Option<Arc<ComputeUnitSet>>' in resources_source, 'compute_ext must use ComputeUnitSet so undisplaced slots pin only one unit'
+assert 'base.arena(k)' in resources_source and 'ext.arena(k - base.len())' in resources_source, 'Prepared::compute_arena must return the per-unit ComputeArena'
 ext_tiers_start = resources_source.index('pub(crate) const EXT_RENDER_TIERS:')
 ext_tiers_end = resources_source.index('];\n', ext_tiers_start) + 3
 render_burst_lines = (
@@ -2518,7 +2611,7 @@ for command in [
         raise SystemExit(result.returncode)
 files = ['graph.rs', 'slots.rs', 'pools.rs', 'pools/lifetime.rs', 'fw/buffer.rs', 'fw/graph.rs', 'fw/work.rs', 'hw.rs', 'resources.rs', 'budget.rs']
 (out/'resource-host.json').write_text(json.dumps({
-    'result': 'pass', 'tests': 40,
+    'result': 'pass', 'tests': 41,
     'scope': 'Actual production allocation, initialization and lifetime code against a CPU-only backing recorder; no hardware qualification.',
     'private_rw_pte': hex(private_rw),
     'private_rw_reference': 'Qualified J713 NC read/write leaf attributes',
