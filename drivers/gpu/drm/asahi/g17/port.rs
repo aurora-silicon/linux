@@ -158,6 +158,21 @@ impl RenderRoom {
     }
 }
 
+/// Room for two slots on M5's shared outer work ring of one priority, reserved under
+/// both the render publication lock and `m5_outer`.
+#[derive(Clone, Copy)]
+pub(super) struct M5RenderRoom {
+    priority: u8,
+    start: u32,
+    next: [u32; 2],
+}
+
+impl M5RenderRoom {
+    pub(super) fn priority(&self) -> u8 {
+        self.priority
+    }
+}
+
 /// A compute work-ring slot reserved before any command becomes visible. Dropping an unused
 /// claim returns the slot.
 pub(super) struct OuterClaim<'a> {
@@ -397,10 +412,19 @@ impl Port {
 
     /// Counts `submissions` in the M5 submission-history table without taking the device mutex.
     pub(super) fn note_m5_submission_history(&self, submissions: u8) -> Result {
+        let mut geometry = self.m5_outer.lock();
+        self.note_m5_submission_history_locked(&mut geometry, submissions)
+    }
+
+    /// [`Self::note_m5_submission_history`] while the caller already holds `m5_outer`.
+    pub(super) fn note_m5_submission_history_locked(
+        &self,
+        geometry: &mut MutexGuard<'_, Option<(u32, u64, u64)>>,
+        submissions: u8,
+    ) -> Result {
         let Some(history) = self.views()?.m5_history else {
             return Ok(());
         };
-        let mut geometry = self.m5_outer.lock();
         for _ in 0..64 {
             // SAFETY: Pointers name retained, bounds-checked firmware-shared words.
             let generation = unsafe { (*history.generation).load(Ordering::Acquire) };
@@ -408,7 +432,7 @@ impl Port {
                 core::hint::spin_loop();
                 continue;
             }
-            let (period, count) = match *geometry {
+            let (period, count) = match **geometry {
                 Some((seen, period, count)) if seen == generation => (period, count),
                 _ => {
                     // SAFETY: As above; seqlock generation recheck validates consistency.
@@ -428,7 +452,7 @@ impl Port {
                     }
                     let period = u64::from(c[0]) | (u64::from(c[1]) << 32);
                     let count = u64::from(c[2]) | (u64::from(c[3]) << 32);
-                    *geometry = Some((generation, period, count));
+                    **geometry = Some((generation, period, count));
                     (period, count)
                 }
             };
@@ -451,6 +475,130 @@ impl Port {
             return Ok(());
         }
         Err(EBUSY)
+    }
+
+    /// Reserves two slots on M5's shared outer ring for a direct render pair while
+    /// `m5_outer` is already held. Returns EBUSY if a device-mutex OuterScope is active
+    /// or fewer than two slots are free.
+    pub(super) fn reserve_m5_render_locked(
+        &self,
+        _guard: &MutexGuard<'_, Option<(u32, u64, u64)>>,
+        priority: u8,
+    ) -> Result<(M5RenderRoom, super::initdata::OuterClaim)> {
+        let views = self.views()?;
+        let credits = views.m5_credits.as_ref().ok_or(EINVAL)?;
+        let (_, ring) = self.ring(priority)?;
+        if credits.is_scoped() {
+            return Err(EBUSY);
+        }
+        let cursors = ring.cursors()?;
+        let start = cursors[2];
+        let next = [(start + 1) % WORK_RING_SLOTS, (start + 2) % WORK_RING_SLOTS];
+        if next.iter().any(|&p| p == cursors[0] || p == cursors[1]) {
+            return Err(EBUSY);
+        }
+        let claim = credits.reserve(priority, 2, cursors)?;
+        Ok((
+            M5RenderRoom {
+                priority,
+                start,
+                next,
+            },
+            claim,
+        ))
+    }
+
+    /// Copies an M5 render pair's fragment, then tiling record into the two reserved slots
+    /// of M5's shared outer ring without exposing them, commits accounting, issues the
+    /// host-port advance, and publishes inner producers (as `Firmware::submit_m5_render_pair`).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Mirrors write_render_pair with the held M5 outer lock."
+    )]
+    pub(super) fn write_m5_render_pair(
+        &self,
+        _render: &MutexGuard<'_, ()>,
+        _m5_outer: &MutexGuard<'_, Option<(u32, u64, u64)>>,
+        room: &M5RenderRoom,
+        fragment: &WorkSlot,
+        tiling: &WorkSlot,
+        commit_accounting: impl FnOnce() -> Result,
+        publish_inner: impl FnOnce(),
+    ) -> Result<[u32; 2]> {
+        if !matches!(fragment.data_master, 1 | 2) || !matches!(tiling.data_master, 0 | 2) {
+            return Err(EINVAL);
+        }
+        let regs = self.regs.as_ref().ok_or(ENODEV)?;
+        let (_, ring) = self.ring(room.priority)?;
+        let records = [
+            WorkSlot::new(
+                DataMaster::Compute,
+                fragment.queue_va,
+                fragment.qid,
+                fragment.items_end,
+                fragment.first != 0,
+            )?,
+            WorkSlot::new(
+                DataMaster::Compute,
+                tiling.queue_va,
+                tiling.qid,
+                tiling.items_end,
+                tiling.first != 0,
+            )?,
+        ];
+        let submission = super::fw::m5::queue::HardwareSubmission::advance_pair(
+            fragment.qid,
+            tiling.qid,
+        )?;
+        let destinations = [room.start, room.next[0]].map(|index| {
+            // SAFETY: The ring view spans WORK_RING_SLOTS records; `reserve_m5_render_locked`
+            // validated both indices are in range and host-owned while `m5_outer` stays held.
+            unsafe {
+                ring.slots
+                    .add(index as usize * core::mem::size_of::<WorkSlot>())
+            }
+        });
+        for (record, destination) in records.iter().zip(destinations) {
+            // SAFETY: Both slots are distinct, reserved, and protected by `m5_outer`.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    core::ptr::from_ref(record).cast::<u8>(),
+                    destination,
+                    core::mem::size_of::<WorkSlot>(),
+                );
+            }
+        }
+        commit_accounting()?;
+        regs.submit_m5_work(&submission)?;
+        publish_inner();
+        Ok(room.next)
+    }
+
+    /// Exposes a retained M5 render pair written by `write_m5_render_pair` with one
+    /// producer update and consumes its two direct outer-ring credits.
+    pub(super) fn expose_m5_render_pair(
+        &self,
+        _render: &MutexGuard<'_, ()>,
+        _m5_outer: &MutexGuard<'_, Option<(u32, u64, u64)>>,
+        room: &M5RenderRoom,
+        claim: &mut super::initdata::OuterClaim,
+        next: [u32; 2],
+    ) -> Result {
+        if next != room.next {
+            return Err(EBUSY);
+        }
+        let views = self.views()?;
+        let credits = views.m5_credits.as_ref().ok_or(EINVAL)?;
+        let (_, ring) = self.ring(room.priority)?;
+        if ring.cursors()?[2] != room.start {
+            return Err(EBUSY);
+        }
+        fence(Ordering::SeqCst);
+        // SAFETY: As for `RingView::cursors`; `m5_outer` has been held continuously
+        // since `reserve_m5_render_locked` and `write_m5_render_pair`.
+        unsafe { (*ring.producer).store(room.next[1], Ordering::Relaxed) };
+        fence(Ordering::SeqCst);
+        credits.consume_direct_count(claim, 2)
     }
 
     fn render_rings(&self, priority: u8) -> Result<(RingView, RingView)> {

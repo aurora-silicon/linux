@@ -629,6 +629,23 @@ impl Host<'_> {
         }
     }
 }
+/// Encodes the G17 render mailbox doorbell (0x83, priority in bits 3:2, pipe in bits 1:0).
+///
+/// Firmware queue contract across both locked and direct render publishers:
+/// - Non-M5 G17 submits render pairs to the dedicated tiling/fragment rings and rings pipe 0.
+/// - M5 Pro/Max/Ultra (!J813_FORMS) submits render pairs into the shared compute work ring paired
+///   with host-port gating writes and submission-history accounting, and rings pipe 2.
+/// - J813 (J813_FORMS, common 26A428 firmware) uses the mailbox-only G17P queue forms (no
+///   host-port or KSM register writes) and rings pipe 0.
+fn render_doorbell_message(m5: bool, priority: u8) -> u64 {
+    let pipe = if m5 && !crate::g17::J813_FORMS.load(core::sync::atomic::Ordering::Relaxed) {
+        2
+    } else {
+        0
+    };
+    (0x83 << crate::g17::MSG_TYPE_SHIFT) | u64::from(priority) << 2 | pipe
+}
+
 impl crate::g17::queue::render::Host for Host<'_> {
     fn generation(&self) -> u64 {
         self.firmware.recovery.generation()
@@ -792,11 +809,10 @@ impl crate::g17::queue::render::Host for Host<'_> {
                 self.firmware.bridge.regs.g17_core_power()
             });
         }
-        let result = self.firmware.primary.notify(
-            (0x83 << crate::g17::MSG_TYPE_SHIFT)
-                | u64::from(priority) << 2
-                | if m5 && !crate::g17::J813_FORMS.load(core::sync::atomic::Ordering::Relaxed) { 2 } else { 0 },
-        );
+        let result = self
+            .firmware
+            .primary
+            .notify(render_doorbell_message(m5, priority));
         if result.is_err() {
             self.firmware.primary.state.shared.lose_device_quietly();
         }

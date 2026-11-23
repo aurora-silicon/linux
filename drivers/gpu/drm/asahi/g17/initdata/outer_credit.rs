@@ -79,17 +79,23 @@ impl Credits {
         Ok(OuterClaim { domain: self.clone(), priority: index, remaining: count })
     }
 
-    /// Consumes one reserved slot for a direct M5 compute publication without touching
+    /// Consumes one reserved slot for a direct M5 publication without touching
     /// `published[]`, so an enclosing device-mutex `OuterScope` never debits a direct slot.
     pub(crate) fn consume_direct(&self, claim: &mut OuterClaim) -> Result {
-        if !core::ptr::eq(self, &*claim.domain) {
+        self.consume_direct_count(claim, 1)
+    }
+
+    /// Consumes `count` reserved slots for a direct M5 publication without touching
+    /// `published[]`, so an enclosing device-mutex `OuterScope` never debits direct slots.
+    pub(crate) fn consume_direct_count(&self, claim: &mut OuterClaim, count: u32) -> Result {
+        if count == 0 || !core::ptr::eq(self, &*claim.domain) {
             return Err(EINVAL);
         }
-        if claim.remaining == 0 {
+        if claim.remaining < count {
             return Err(EIO);
         }
-        claim.remaining -= 1;
-        self.reserved[claim.priority].fetch_sub(1, Ordering::AcqRel);
+        claim.remaining -= count;
+        self.reserved[claim.priority].fetch_sub(count, Ordering::AcqRel);
         Ok(())
     }
 
@@ -158,12 +164,15 @@ mod tests {
         let full = free(cursors).unwrap();
         let mut scoped_claim = credits.reserve(1, 2, cursors).unwrap();
         let mut direct_claim = credits.reserve(1, 1, cursors).unwrap();
-        assert_eq!(credits.capacity(1, cursors).unwrap(), full - 3);
+        let mut direct_pair = credits.reserve(1, 2, cursors).unwrap();
+        assert_eq!(credits.capacity(1, cursors).unwrap(), full - 5);
 
-        // Direct publish consumes only its own reserved slot and leaves published[] untouched.
+        // Direct publish consumes only its own reserved slots and leaves published[] untouched.
         assert!(!credits.is_scoped());
         credits.consume_direct(&mut direct_claim).unwrap();
         assert_eq!(direct_claim.remaining(), 0);
+        credits.consume_direct_count(&mut direct_pair, 2).unwrap();
+        assert_eq!(direct_pair.remaining(), 0);
         assert_eq!(credits.capacity(1, cursors).unwrap(), full - 2);
         assert_eq!(credits.counter(1).unwrap().load(Ordering::Acquire), 0);
 
@@ -176,6 +185,7 @@ mod tests {
         assert!(!credits.is_scoped());
         assert_eq!(scoped_claim.remaining(), 2);
         drop(direct_claim);
+        drop(direct_pair);
         drop(scoped_claim);
         assert_eq!(credits.capacity(1, cursors).unwrap(), full);
     }
