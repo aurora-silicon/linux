@@ -1390,6 +1390,13 @@ static void dcp_push_context(struct apple_dcp *dcp, enum dcp_context_id context,
 			       DCP_PACKET_ALIGNMENT)) {
 		dev_err(dcp->dev, "invalid IOMFB command envelope\n");
 		WRITE_ONCE(dcp->crashed, true);
+		/*
+		 * Complete the command without an output, as a corrupt ack
+		 * does, so that its callback drops the cookie reference and
+		 * wakes the waiter instead of leaving it to time out.
+		 */
+		if (cb)
+			cb(dcp, NULL, cookie);
 		return;
 	}
 	depth = dcp_push_depth(&ch->depth);

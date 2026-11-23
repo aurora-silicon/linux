@@ -312,6 +312,19 @@ static void iomfb_ack_status_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, *((u8 *)(record + 1)), 1);
 }
 
+struct iomfb_refused_cookie {
+	unsigned int calls;
+	bool out_null;
+};
+
+static void iomfb_refused_complete(struct apple_dcp *dcp, void *out, void *cookie)
+{
+	struct iomfb_refused_cookie *c = cookie;
+
+	c->calls++;
+	c->out_null = !out;
+}
+
 /* Every firmware bounds the command stack before it writes a frame. */
 static void iomfb_command_depth_test(struct kunit *test)
 {
@@ -322,6 +335,7 @@ static void iomfb_command_depth_test(struct kunit *test)
 		DCP_FIRMWARE_V_12_3, DCP_FIRMWARE_V_13_5, DCP_FIRMWARE_V_26_6_DESKTOP,
 	};
 	struct apple_dcp *dcp = test->priv;
+	struct iomfb_refused_cookie done;
 	unsigned int i;
 
 	dcp->shmem = kunit_kzalloc(test, 0x10000, GFP_KERNEL);
@@ -332,15 +346,24 @@ static void iomfb_command_depth_test(struct kunit *test)
 		dcp->crashed = false;
 		memset(&dcp->ch_cmd, 0, sizeof(dcp->ch_cmd));
 		dcp->ch_cmd.depth = DCP_MAX_CALL_DEPTH;
-		dcp_push_context(dcp, DCP_CONTEXT_CMD, &call, 4, 4, &i, NULL, NULL);
+		done = (struct iomfb_refused_cookie){};
+		dcp_push_context(dcp, DCP_CONTEXT_CMD, &call, 4, 4, &i,
+				 iomfb_refused_complete, &done);
 		KUNIT_EXPECT_TRUE(test, dcp->crashed);
 		KUNIT_EXPECT_EQ(test, dcp->ch_cmd.depth, DCP_MAX_CALL_DEPTH);
+		/* A refused command is still completed, without an output. */
+		KUNIT_EXPECT_EQ(test, done.calls, 1U);
+		KUNIT_EXPECT_TRUE(test, done.out_null);
 		/* A frame that does not fit the transmit window is refused too. */
 		dcp->crashed = false;
 		dcp->ch_cmd.depth = 0;
-		dcp_push_context(dcp, DCP_CONTEXT_CMD, &call, 0x8000, 0, dcp->shmem, NULL, NULL);
+		done = (struct iomfb_refused_cookie){};
+		dcp_push_context(dcp, DCP_CONTEXT_CMD, &call, 0x8000, 0, dcp->shmem,
+				 iomfb_refused_complete, &done);
 		KUNIT_EXPECT_TRUE(test, dcp->crashed);
 		KUNIT_EXPECT_EQ(test, dcp->ch_cmd.depth, 0);
+		KUNIT_EXPECT_EQ(test, done.calls, 1U);
+		KUNIT_EXPECT_TRUE(test, done.out_null);
 		/* A command that fits is pushed and marked as a command frame. */
 		dcp->crashed = false;
 		dcp_push_context(dcp, DCP_CONTEXT_CMD, &call, 4, 4, &i, NULL, NULL);
