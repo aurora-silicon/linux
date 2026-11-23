@@ -842,7 +842,7 @@ static void apple_smc_write_mbse(struct apple_smc *smc, smc_key value)
 
 /*
  * SMC key pmVC, the request for the VDD_CIO rail: the enable mask | 0x100 (0x101 on the T6040's
- * J616s). Linux never asks for the rail, which is power-gated otherwise (ADT vdd-cio-rail-pg), and
+ * J616s). Linux never asks for the rail, which is power-gated otherwise, and
  * a rail the SMC drops during the sleep transition races the sleep engine's hand-over of the ATC
  * ports.
  */
