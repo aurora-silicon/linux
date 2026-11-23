@@ -1729,8 +1729,9 @@ impl SepData {
         }
         let (status, out) = self.scrd_command(&crate::scrd::scrd_context_create_tracked(uid)).ok_or(EIO)?;
         let ctx = crate::scrd::tracked_create_reference(&out).filter(|_| status == 0).ok_or(EIO)?;
-        let (status, _) = self.scrd_command(&crate::scrd::scrd_context_externalize(&ctx)).ok_or(EIO)?;
-        if status != 0 {
+        // The context exists once created: an externalize that is refused or
+        // gets no reply still deletes it.
+        if !matches!(self.scrd_command(&crate::scrd::scrd_context_externalize(&ctx)), Some((0, _))) {
             let _ = self.delete_context(&ctx);
             return Err(EIO);
         }
