@@ -185,6 +185,12 @@ struct dchid_iface {
 	bool gpio_announced;
 
 	struct mutex out_mutex;
+	/*
+	 * Protects the pending command (out_flags, out_report, retcode,
+	 * resp_buf, resp_size, tx_seq) against the receive path, which
+	 * completes it without out_mutex.
+	 */
+	spinlock_t resp_lock;
 	u32 out_flags;
 	int out_report;
 	u32 retcode;
@@ -318,6 +324,7 @@ dchid_get_interface(struct dockchannel_hid *dchid, int index, const char *name)
 	init_completion(&iface->out_complete);
 	init_completion(&iface->ready);
 	mutex_init(&iface->out_mutex);
+	spin_lock_init(&iface->resp_lock);
 	iface->wq = alloc_ordered_workqueue("dchid-%s", WQ_MEM_RECLAIM, iface->name);
 	if (!iface->wq)
 		goto err_put_node;
@@ -432,12 +439,14 @@ static int dchid_cmd(struct dchid_iface *iface, u32 type, u32 req,
 
 	mutex_lock(&iface->out_mutex);
 
+	spin_lock(&iface->resp_lock);
 	WARN_ON(iface->out_report != -1);
 	iface->out_report = report_id;
 	iface->out_flags = FIELD_PREP(FLAGS_GROUP, type) | FIELD_PREP(FLAGS_REQ, req);
 	iface->resp_buf = resp_buf;
 	iface->resp_size = resp_size;
 	reinit_completion(&iface->out_complete);
+	spin_unlock(&iface->resp_lock);
 
 	ret = dchid_send(iface, iface->out_flags, data, size);
 	if (ret < 0)
@@ -459,11 +468,17 @@ static int dchid_cmd(struct dchid_iface *iface, u32 type, u32 req,
 	}
 
 done:
+	/*
+	 * Retire the command before the caller's buffer goes away: an
+	 * acknowledgment that arrives from now on no longer matches it.
+	 */
+	spin_lock(&iface->resp_lock);
 	iface->tx_seq++;
 	iface->out_report = -1;
 	iface->out_flags = 0;
 	iface->resp_buf = NULL;
 	iface->resp_size = 0;
+	spin_unlock(&iface->resp_lock);
 	mutex_unlock(&iface->out_mutex);
 	return ret;
 }
@@ -1051,16 +1066,26 @@ static int dchid_create_interface(struct dchid_iface *iface)
 
 static void dchid_handle_descriptor(struct dchid_iface *iface, void *hid_desc, size_t desc_len)
 {
-	if (iface->hid) {
+	void *desc;
+
+	/*
+	 * Once the interface is queued for creation the HID core may be
+	 * parsing its descriptor, which must then stay as it is.
+	 */
+	if (iface->hid || iface->creating) {
 		dev_warn(iface->dchid->dev, "Tried to initialize already started interface %s!\n",
 			 iface->name);
 		return;
 	}
 
-	iface->hid_desc = devm_kmemdup(iface->dchid->dev, hid_desc, desc_len, GFP_KERNEL);
-	if (!iface->hid_desc)
+	desc = devm_kmemdup(iface->dchid->dev, hid_desc, desc_len, GFP_KERNEL);
+	if (!desc)
 		return;
 
+	/* An interface has one descriptor: a repeated one replaces it. */
+	if (iface->hid_desc)
+		devm_kfree(iface->dchid->dev, iface->hid_desc);
+	iface->hid_desc = desc;
 	iface->hid_desc_len = desc_len;
 }
 
@@ -1362,26 +1387,29 @@ static void dchid_handle_ack(struct dchid_iface *iface, struct dchid_hdr *hdr, v
 			shdr->length, hdr->length - sizeof(*shdr));
 		return;
 	}
+
+	/* The command must not be retired between the checks and the copy. */
+	spin_lock(&iface->resp_lock);
 	if (shdr->flags != iface->out_flags) {
 		dev_err(iface->dchid->dev,
 			"Received unexpected flags 0x%x on ACK channel (expected 0x%x)\n",
 			shdr->flags, iface->out_flags);
-		return;
+		goto out;
 	}
 
 	if (shdr->length < 1) {
 		dev_err(iface->dchid->dev, "Received length 0 output report ack\n");
-		return;
+		goto out;
 	}
 	if (iface->tx_seq != hdr->seq) {
 		dev_err(iface->dchid->dev, "Received ACK with bad seq (expected %d, got %d)\n",
 			iface->tx_seq, hdr->seq);
-		return;
+		goto out;
 	}
 	if (iface->out_report != payload[0]) {
 		dev_err(iface->dchid->dev, "Received ACK with bad report (expected %d, got %d\n",
 			iface->out_report, payload[0]);
-		return;
+		goto out;
 	}
 
 	/*
@@ -1402,6 +1430,8 @@ static void dchid_handle_ack(struct dchid_iface *iface, struct dchid_hdr *hdr, v
 	iface->out_report = -1;
 	iface->retcode = shdr->retcode;
 	complete(&iface->out_complete);
+out:
+	spin_unlock(&iface->resp_lock);
 }
 
 /*
