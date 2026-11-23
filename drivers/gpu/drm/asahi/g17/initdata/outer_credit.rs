@@ -49,7 +49,7 @@ impl Credits {
         }, GFP_KERNEL)?)
     }
 
-    pub(super) fn available(&self) -> Arc<Availability> { self.available.clone() }
+    pub(crate) fn available(&self) -> Arc<Availability> { self.available.clone() }
 
     pub(super) fn waiting(&self) -> bool { self.available.has_waiters() }
 

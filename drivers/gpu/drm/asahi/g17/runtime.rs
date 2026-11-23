@@ -182,7 +182,6 @@ pub(super) struct Registry {
     completion_cursor: usize,
     /// Control word of each completion-ring slot as of the last scan that read it.
     completion_seen: KVVec<u64>,
-    worker_deferred: Option<DeferredBatch>,
     teardown: super::teardown::Pending,
 }
 
@@ -240,7 +239,6 @@ impl Registry {
                 }
                 seen
             },
-            worker_deferred: Some(DeferredBatch::worker()?),
             teardown: super::teardown::Pending::new()?,
         })
     }
@@ -1383,7 +1381,7 @@ impl DeferredBatch {
     };
 
     /// Reused by the sole event work item; no allocation on a completion pass.
-    fn worker() -> Result<Self> {
+    pub(super) fn worker() -> Result<Self> {
         Self::with_capacity(2 * QIDS * Self::DEPTH, QIDS)
     }
     /// One publication can quarantine only its selected physical queue/pair.
@@ -1618,6 +1616,7 @@ struct DirectHost<'a> {
     port: &'a super::port::Port,
     outer: Option<super::port::OuterClaim<'a>>,
     m5_outer: Option<&'a mut super::initdata::OuterClaim>,
+    m5_outer_guard: Option<kernel::sync::MutexGuard<'a, Option<(u32, u64, u64)>>>,
     m5: bool,
     generation: u64,
 }
@@ -1652,15 +1651,27 @@ impl compute::Host for DirectHost<'_> {
     fn publish_outer(&mut self, priority: u8, slot: &super::fw::channels::WorkSlot) -> Result {
         if self.m5 {
             let claim = self.m5_outer.as_deref_mut().ok_or(EIO)?;
-            return self.port.publish_m5_compute(priority, claim, slot).map(|_| ());
+            let guard = self
+                .m5_outer_guard
+                .get_or_insert_with(|| self.port.m5_outer_lock());
+            return self
+                .port
+                .publish_m5_compute_locked(guard, priority, claim, slot)
+                .map(|_| ());
         }
         self.port.publish_compute(self.outer.take().ok_or(EIO)?, slot).map(|_| ())
     }
     fn notify(&mut self, message: u64) -> Result {
         if self.m5 && message >> super::MSG_TYPE_SHIFT == 0x83 && message & 3 == 2 {
-            if let Err(error) = self.port.note_m5_submission_history(1) {
+            let guard = self
+                .m5_outer_guard
+                .get_or_insert_with(|| self.port.m5_outer_lock());
+            if let Err(error) = self.port.note_m5_submission_history_locked(guard, 1) {
                 pr_warn!("asahi: M5 submission history skipped: {:?}\n", error);
             }
+            // Drop `m5_outer` before ringing the mailbox doorbell so competing M5 submitters
+            // do not wait behind mailbox I/O.
+            self.m5_outer_guard = None;
         }
         self.port.notify(message)
     }
@@ -1671,7 +1682,10 @@ impl compute::Host for DirectHost<'_> {
         if !self.m5 {
             return Err(EINVAL);
         }
-        self.port.submit_m5_work_held(submission)
+        let guard = self
+            .m5_outer_guard
+            .get_or_insert_with(|| self.port.m5_outer_lock());
+        self.port.submit_m5_work_held_locked(guard, submission)
     }
 }
 
@@ -1903,25 +1917,66 @@ impl Registry {
     }
 }
 
+/// Post-scan compute state collected while `scan_compute_summary` already holds each cell lock,
+/// allowing the event worker to avoid redundant full-registry cell scans.
+#[derive(Clone, Copy, Default)]
+pub(super) struct ComputeScan {
+    pub(super) in_flight: bool,
+    pub(super) replay: bool,
+    pub(super) polling: bool,
+}
+
 impl super::Firmware {
+    fn scan_compute(&mut self, masks: Option<[u64; 2]>, deferred: &mut DeferredBatch) -> Result {
+        self.scan_compute_summary(masks, deferred).map(|_| ())
+    }
+
     /// Latch one shared snapshot for all selected queues before settling any VM.
     /// A later queue's exact success in this batch wins over a peer's failure.
-    fn scan_compute(&mut self, masks: Option<[u64; 2]>, deferred: &mut DeferredBatch) -> Result {
+    fn scan_compute_summary(
+        &mut self,
+        masks: Option<[u64; 2]>,
+        deferred: &mut DeferredBatch,
+    ) -> Result<ComputeScan> {
         let state = super::recovery::Memory::recovery_state(&self.init)?;
         let generation = self.recovery.generation();
         let registry = &mut self.queues;
         registry.observations.clear();
         let mut requested = false;
+        let mut retire_mask = 0u128;
+        let mut terminal_mask = 0u128;
+        let mut witness_mask = 0u128;
+        let mut in_flight_mask = 0u128;
+        let mut replay_mask = 0u128;
+        let mut polling_mask = 0u128;
         // Every queue's pending identities are staged, not only the ones this batch
         // retires: the scan passes each new record once, and a queue retired by a later
         // batch finds its observation already latched.
-        for queue in registry
-            .compute
-            .iter()
-            .flatten()
-            .filter_map(|entry| entry.queue.as_deref())
-        {
-            requested |= queue.request_observations(&mut registry.observations)?;
+        for (index, entry) in registry.compute.iter().enumerate() {
+            let Some(queue) = entry.as_ref().and_then(|entry| entry.queue.as_deref()) else {
+                continue;
+            };
+            let bit = 1u128.checked_shl(index as u32).unwrap_or(0);
+            let slot_requested = queue.request_observations(&mut registry.observations)?;
+            requested |= slot_requested;
+            if slot_requested || queue.needs_scan_retire(masks) {
+                retire_mask |= bit;
+            }
+            if queue.has_terminal() {
+                terminal_mask |= bit;
+            }
+            if queue.awaiting_witness() {
+                witness_mask |= bit;
+            }
+            if queue.in_flight() {
+                in_flight_mask |= bit;
+            }
+            if queue.replay_commands() != 0 {
+                replay_mask |= bit;
+            }
+            if queue.retirement_polling() || queue.pool_release_pending() {
+                polling_mask |= bit;
+            }
         }
         // Completion records are appended in order: fold only the records written since
         // the previous scan. A request whose stamp already covers it has its record in the
@@ -1943,14 +1998,21 @@ impl super::Firmware {
         let port = &self.port;
         let retired = deferred.pending();
         let mut freed = false;
-        for mut queue in registry
-            .compute
-            .iter_mut()
-            .flatten()
-            .filter_map(|entry| entry.queue.as_deref_mut())
-        {
+        let mut pending = retire_mask;
+        while pending != 0 {
+            let index = pending.trailing_zeros() as usize;
+            let bit = 1u128 << index;
+            pending &= !bit;
+            let Some(mut queue) = registry.compute[index]
+                .as_mut()
+                .and_then(|entry| entry.queue.as_deref_mut())
+            else {
+                continue;
+            };
             let busy = !queue.channel_free();
-            queue.latch_observations(&mut registry.observations)?;
+            if requested {
+                queue.latch_observations(&mut registry.observations)?;
+            }
             queue.retire(
                 masks,
                 generation,
@@ -1959,35 +2021,79 @@ impl super::Firmware {
                 &mut |event| deferred.push(event),
             )?;
             freed |= busy && queue.channel_free();
+            if queue.has_terminal() {
+                terminal_mask |= bit;
+            }
+            if queue.awaiting_witness() {
+                witness_mask |= bit;
+            }
+            if queue.in_flight() {
+                in_flight_mask |= bit;
+            } else {
+                in_flight_mask &= !bit;
+            }
+            if queue.replay_commands() != 0 {
+                replay_mask |= bit;
+            } else {
+                replay_mask &= !bit;
+            }
+            if queue.retirement_polling() || queue.pool_release_pending() {
+                polling_mask |= bit;
+            } else {
+                polling_mask &= !bit;
+            }
         }
         // All compute observations in this batch are latched before a VM
         // failure can settle its render peers. Exact successes win first.
-        for index in 0..self.queues.compute.len() {
-            let terminal = self.queues.compute[index]
-                .as_mut()
-                .and_then(|entry| entry.queue.as_deref_mut())
-                .and_then(|mut queue| queue.take_terminal());
-            if let Some((status, error)) = terminal {
-                status.record(error);
-                self.settle_render_vm(&status, error, deferred)?;
-                self.queues.fail_compute_vm(&status, error, deferred)?;
+        let had_terminal = terminal_mask != 0;
+        if had_terminal {
+            for index in 0..self.queues.compute.len() {
+                let terminal = self.queues.compute[index]
+                    .as_mut()
+                    .and_then(|entry| entry.queue.as_deref_mut())
+                    .and_then(|mut queue| queue.take_terminal());
+                if let Some((status, error)) = terminal {
+                    status.record(error);
+                    self.settle_render_vm(&status, error, deferred)?;
+                    self.queues.fail_compute_vm(&status, error, deferred)?;
+                }
             }
         }
-        let port = &self.port;
-        let registry = &mut self.queues;
-        for mut queue in registry
-            .compute
-            .iter_mut()
-            .flatten()
-            .filter_map(|entry| entry.queue.as_deref_mut())
-        {
-            let busy = !queue.channel_free();
-            queue.release_witnessed(
-                state,
-                |owner| port.qos_complete(&[owner]),
-                &mut |event| deferred.push(event),
-            )?;
-            freed |= busy && queue.channel_free();
+        if witness_mask != 0 || had_terminal {
+            let port = &self.port;
+            let registry = &mut self.queues;
+            for (index, entry) in registry.compute.iter_mut().enumerate() {
+                let bit = 1u128.checked_shl(index as u32).unwrap_or(0);
+                if !had_terminal && (witness_mask & bit) == 0 {
+                    continue;
+                }
+                let Some(mut queue) = entry.as_mut().and_then(|entry| entry.queue.as_deref_mut())
+                else {
+                    continue;
+                };
+                let busy = !queue.channel_free();
+                queue.release_witnessed(
+                    state,
+                    |owner| port.qos_complete(&[owner]),
+                    &mut |event| deferred.push(event),
+                )?;
+                freed |= busy && queue.channel_free();
+                if queue.in_flight() {
+                    in_flight_mask |= bit;
+                } else {
+                    in_flight_mask &= !bit;
+                }
+                if queue.replay_commands() != 0 {
+                    replay_mask |= bit;
+                } else {
+                    replay_mask &= !bit;
+                }
+                if queue.retirement_polling() || queue.pool_release_pending() {
+                    polling_mask |= bit;
+                } else {
+                    polling_mask &= !bit;
+                }
+            }
         }
         // Wake only the admission waits this batch can end. The fences gate
         // scheduler entities alone; their callbacks never take the device mutex.
@@ -1998,7 +2104,11 @@ impl super::Firmware {
         if deferred.pending() != retired {
             shared.progress.notify();
         }
-        Ok(())
+        Ok(ComputeScan {
+            in_flight: in_flight_mask != 0,
+            replay: replay_mask != 0,
+            polling: polling_mask != 0,
+        })
     }
 }
 
@@ -2111,6 +2221,7 @@ impl Backend {
                 port,
                 outer,
                 m5_outer: m5_outer.as_mut(),
+                m5_outer_guard: None,
                 m5,
                 generation: port.generation(),
             };
@@ -2162,7 +2273,34 @@ impl Backend {
 
     /// M5: the domain outer-ring claims wait on. None off M5 or without firmware.
     fn outer_domain(&self) -> Option<Arc<super::availability::Availability>> {
-        self.shared.state.lock().as_deref().and_then(|firmware| firmware.init.outer_available().ok())
+        if !self.context.is_m5() {
+            return None;
+        }
+        let lease = self.shared.preparations.try_enter().ok()?;
+        self.shared.port(&lease)?.outer_domain()
+    }
+
+    /// M5: holds this owner's compute outer-ring claim through `Port` without taking the device
+    /// mutex, for a channel already bound and installed.
+    fn claim_compute_outer_direct(&self, count: u32) -> Result<bool> {
+        let mut held = self.outer_compute.lock();
+        if held.as_ref().is_some_and(|claim| claim.remaining() != 0) {
+            return Ok(true);
+        }
+        let Ok(lease) = self.shared.preparations.try_enter() else {
+            return Ok(true);
+        };
+        let Some(port) = self.shared.port(&lease) else {
+            return Ok(true);
+        };
+        match port.reserve_m5_outer(self.context.policy().priority(), count) {
+            Ok(claim) => {
+                *held = Some(claim);
+                Ok(true)
+            }
+            Err(error) if error == EBUSY => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     /// M5: holds this owner's claim on the shared work ring for the next compute or render
@@ -2233,24 +2371,24 @@ impl Backend {
         // The steady state: this owner's channel is bound and installed.
         if packet.completion.sources().is_none() {
             if let Some(cell) = self.direct.lock().clone() {
-                let bound = cell.lock().is_some_and(|mut queue| {
+                let bound = cell.lock().and_then(|mut queue| {
                     let bound = queue.installed()
                         && !queue.spared_pending()
                         && queue.pool_fits(required)
                         && matches!(queue.matches(self.owner, queue.qid(), &self.context), Ok(true));
                     if bound {
                         queue.claim();
+                        Some(queue.outer_slots())
+                    } else {
+                        None
                     }
-                    bound
                 });
-                if bound {
+                if let Some(outer_slots) = bound {
                     self.hold_claim(Some(cell));
                     if !self.context.is_m5() {
                         return Readiness::Ready;
                     }
-                    let state = self.shared.state.lock();
-                    let Some(firmware) = state.as_deref() else { return Readiness::Ready; };
-                    return match self.claim_outer(firmware, crate::g17::job::Engine::Compute) {
+                    return match self.claim_compute_outer_direct(outer_slots) {
                         Ok(false) => Readiness::Outer,
                         _ => Readiness::Ready,
                     };

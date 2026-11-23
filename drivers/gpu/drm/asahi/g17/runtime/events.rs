@@ -23,6 +23,7 @@ struct Service<'a> {
     firmware: &'a mut Firmware,
     deferred: &'a mut DeferredBatch,
     render_masks: [u64; 2],
+    compute_scan: Option<super::ComputeScan>,
     settlement_error: Option<Error>,
 }
 
@@ -117,15 +118,16 @@ impl event::Queues for Service<'_> {
     fn retain_render_completions(&mut self, masks: [u64; 2]) {
         // Inline timeout and drain callers may discard the worker hints. The
         // queue owner retains stamps until its borrowed pair returns to scan.
-        self.firmware.queues.retain_render_completions(masks);
-        self.render_masks[0] |= masks[0];
-        self.render_masks[1] |= masks[1];
+        let matched = self.firmware.queues.retain_render_completions(masks);
+        self.render_masks[0] |= matched[0];
+        self.render_masks[1] |= matched[1];
     }
     fn complete_compute(&mut self, masks: [u64; 2]) -> Result {
         // A batch without a queue identity still observes completions whose
         // notification was coalesced; identified batches retain QID filtering.
         let selected = (masks != [0; 2]).then_some(masks);
-        self.firmware.scan_compute(selected, self.deferred)
+        self.compute_scan = Some(self.firmware.scan_compute_summary(selected, self.deferred)?);
+        Ok(())
     }
 }
 
@@ -362,8 +364,8 @@ impl Firmware {
         }
     }
 
-    /// A step of the event pass is waiting on the firmware with no event to wake it.
-    fn runtime_polling(&self, now: u64) -> bool {
+    /// Non-compute checks of [`Self::runtime_polling`], reused on the single-lock fast path.
+    fn non_compute_runtime_polling(&self, now: u64) -> bool {
         self.render_control_backpressured()
             || self.init.outer_waiting()
             || self.queues.replay_outer_wait.is_some()
@@ -371,6 +373,11 @@ impl Firmware {
             || self.queues.render.replay_polling()
             || self.queues.teardown.polling(now)
             || self.compute_exit_polling(now)
+    }
+
+    /// A step of the event pass is waiting on the firmware with no event to wake it.
+    fn runtime_polling(&self, now: u64) -> bool {
+        self.non_compute_runtime_polling(now)
             || self
                 .queues
                 .compute
@@ -420,10 +427,19 @@ impl Firmware {
         &mut self,
         deferred: &mut DeferredBatch,
     ) -> Result<(event::Pending, [u64; 2])> {
+        let (pending, masks, _) = self.service_runtime_events_scan(deferred)?;
+        Ok((pending, masks))
+    }
+
+    fn service_runtime_events_scan(
+        &mut self,
+        deferred: &mut DeferredBatch,
+    ) -> Result<(event::Pending, [u64; 2], Option<super::ComputeScan>)> {
         let mut service = Service {
             firmware: self,
             deferred,
             render_masks: [0; 2],
+            compute_scan: None,
             settlement_error: None,
         };
         let pending = event::service(&mut service)?;
@@ -435,7 +451,7 @@ impl Firmware {
             shared.preparations.close();
             shared.queue_events();
         }
-        Ok((pending, service.render_masks))
+        Ok((pending, service.render_masks, service.compute_scan))
     }
 
     /// Preparation admission is already closed and all builders have joined.
@@ -446,6 +462,7 @@ impl Firmware {
             firmware: self,
             deferred,
             render_masks: [0; 2],
+            compute_scan: None,
             settlement_error: None,
         };
         let result = recovery::service(&mut service, || {
@@ -508,10 +525,16 @@ impl crate::g17::Shared {
             self.stop_runtime();
             return;
         }
+        let Some(mut deferred) = self.worker_deferred.lock().take() else {
+            self.lose_device_quietly();
+            return;
+        };
         crate::g17::trace::event(0);
-        let result = self.runtime_event_turn();
+        let result = self.runtime_event_turn(&mut deferred);
+        deferred.finish();
         crate::g17::trace::event(2);
         self.queue_feed();
+        *self.worker_deferred.lock() = Some(deferred);
         if let Err(error) = result {
             dev_err!(self.dev.as_ref(), "GPU event service failed: {:?}\n", error);
             self.lose_device_quietly();
@@ -519,221 +542,235 @@ impl crate::g17::Shared {
         }
     }
 
-    fn runtime_event_turn(self: &Arc<Self>) -> Result {
+    fn runtime_event_turn(self: &Arc<Self>, deferred: &mut DeferredBatch) -> Result {
         // Taken before consuming records: a request made during this pass gets the next one.
         let requested = self
             .housekeeping
             .swap(false, core::sync::atomic::Ordering::AcqRel);
-        let (deferred, recover, masks) = {
+        let (recover, masks, fast_done) = {
             let mut state = self.state.lock();
             let Some(firmware) = (*state).as_deref_mut() else {
                 return Ok(());
             };
-            let Some(mut deferred) = firmware.queues.worker_deferred.take() else {
-                drop(state);
-                self.lose_device_quietly();
-                return Ok(());
-            };
-            let (pending, masks) = match firmware.service_runtime_events(&mut deferred) {
-                Ok(out) => out,
-                Err(error) => {
-                    drop(state);
-                    deferred.finish();
-                    if let Some(firmware) = (*self.state.lock()).as_deref_mut() {
-                        firmware.queues.worker_deferred = Some(deferred);
-                    }
-                    return Err(error);
-                }
-            };
+            let (pending, masks, compute_scan) = firmware.service_runtime_events_scan(deferred)?;
             let recover = pending.recovery || firmware.recovery.pending();
             if recover {
                 // Epoch closure and event consumption are serialized with every
                 // publisher. Joining builders must happen after unlocking.
                 self.preparations.close();
             }
-            (deferred, recover, masks)
-        };
-        let mut deferred = Some(deferred);
-        if let Some(batch) = deferred.as_mut() {
-            batch.finish();
-        }
-        crate::g17::trace::event(1);
-        let result = (|| -> Result {
-            let batch = deferred.as_mut().ok_or(EIO)?;
-            if recover {
-                self.preparations
-                    .wait_drained_until(super::now_ns().saturating_add(super::WORK_RING_WAIT_NS))?;
+            // Steady-state pure-compute completions with work still in flight, no render work
+            // to observe, no replays, no waiters and housekeeping not yet due finish in this
+            // single device-mutex hold; fences are signalled right after unlocking.
+            let mut fast_done = false;
+            if !recover
+                && !requested
+                && !self.crashed.load(core::sync::atomic::Ordering::Acquire)
+                && masks == [0; 2]
+                && !firmware.render_observation_needed()
+            {
+                if let Some(scan) = compute_scan {
+                    let now = super::now_ns();
+                    let in_flight = scan.in_flight || firmware.queues.render_in_flight();
+                    let no_replay = !scan.replay && !firmware.queues.render.replay_parked();
+                    let no_housekeeping = in_flight
+                        && firmware.queues.teardown.is_empty()
+                        && !self.channels.has_waiters()
+                        && !self.progress.has_waiters()
+                        && !self.queues.has_waiters()
+                        && !self.renders.has_waiters()
+                        && now.saturating_sub(
+                            self.housekeeping_ns
+                                .load(core::sync::atomic::Ordering::Relaxed),
+                        ) < HOUSEKEEPING_NS;
+                    let no_outer_or_grow =
+                        !firmware.init.outer_waiting() && !firmware.render_grow_ready();
+                    if no_replay && no_housekeeping && no_outer_or_grow {
+                        if let Some(delay) = firmware.idle_check(now, true)? {
+                            self.queue_idle(delay);
+                        }
+                        let polling = scan.polling || firmware.non_compute_runtime_polling(now);
+                        if polling {
+                            self.queue_poll();
+                        } else if channel::Events::pending(&firmware.init, Role::Primary)?
+                            || (firmware.secondary.is_some()
+                                && channel::Events::pending(&firmware.init, Role::Secondary)?)
+                        {
+                            self.queue_event_records();
+                        }
+                        fast_done = true;
+                    }
+                }
             }
-            let mut state = self.state.lock();
-            let Some(firmware) = (*state).as_deref_mut() else {
-                return Ok(());
-            };
+            (recover, masks, fast_done)
+        };
+        deferred.finish();
+        crate::g17::trace::event(1);
+        if fast_done {
+            return Ok(());
+        }
+        if recover {
+            self.preparations
+                .wait_drained_until(super::now_ns().saturating_add(super::WORK_RING_WAIT_NS))?;
+        }
+        let mut state = self.state.lock();
+        let Some(firmware) = (*state).as_deref_mut() else {
+            return Ok(());
+        };
+        if self.crashed.load(core::sync::atomic::Ordering::Acquire) {
+            return Err(EIO);
+        }
+        // Capture pre-recovery trace/statistics reports before firmware restart resets the
+        // report rings, matching the non-throttled post-signal ordering.
+        let mut reports_drained = false;
+        if recover {
+            firmware.drain_post_signal_reports();
+            reports_drained = true;
+            firmware.service_runtime_recovery(deferred)?;
+            if !firmware.recovery.pending()
+                && !self.sleep_gate.load(core::sync::atomic::Ordering::Acquire)
+            {
+                if !self.preparations.reopen() {
+                    return Ok(());
+                }
+                // Restart stopped consumption before its following record.
+                // Resume builders before observing pairs outside this lock.
+                self.queue_events();
+            }
+        }
+        // Replay only at this outer boundary, after recovery has settled.
+        // Publication may service events but must never recurse into replay.
+        firmware.replay_compute(deferred)?;
+        firmware.replay_render(deferred)?;
+        // Skip dropping and re-acquiring the device mutex around a no-op render observation.
+        if masks != [0; 2] || firmware.render_observation_needed() {
+            drop(state);
+            self.observe_renders(masks, deferred)?;
+            state = self.state.lock();
             if self.crashed.load(core::sync::atomic::Ordering::Acquire) {
                 return Err(EIO);
             }
-            // Capture pre-recovery trace/statistics reports before firmware restart resets the
-            // report rings, matching the non-throttled post-signal ordering.
-            let mut reports_drained = false;
-            if recover {
-                firmware.drain_post_signal_reports();
-                reports_drained = true;
-                firmware.service_runtime_recovery(batch)?;
-                if !firmware.recovery.pending()
-                    && !self.sleep_gate.load(core::sync::atomic::Ordering::Acquire)
-                {
-                    if !self.preparations.reopen() {
-                        return Ok(());
-                    }
-                    // Restart stopped consumption before its following record.
-                    // Resume builders before observing pairs outside this lock.
-                    self.queue_events();
-                }
-            }
-            // Replay only at this outer boundary, after recovery has settled.
-            // Publication may service events but must never recurse into replay.
-            firmware.replay_compute(batch)?;
-            firmware.replay_render(batch)?;
-            // Pure compute completions have empty render masks: keep the same device-mutex
-            // hold instead of dropping and immediately re-acquiring around a no-op observe.
-            if masks != [0; 2] {
-                drop(state);
-                self.observe_renders(masks, batch)?;
-                state = self.state.lock();
-                if self.crashed.load(core::sync::atomic::Ordering::Acquire) {
-                    return Err(EIO);
-                }
-            }
-            let Some(firmware) = (*state).as_deref_mut() else {
-                return Ok(());
-            };
-            let now = super::now_ns();
-            let compute = firmware
-                .queues
-                .compute
-                .iter()
-                .flatten()
-                .filter_map(|entry| entry.queue.as_deref())
-                .any(|queue| queue.in_flight());
-            let in_flight = compute || firmware.queues.render_in_flight();
-            let idle = firmware.idle_check(now, in_flight)?;
-            // Expiries, drained pairs, exits, pool and heap trimming, teardown and M5 report
-            // drains give back what retirement freed; a completion needs none of them to retire
-            // or to signal. While work is in flight and nothing waits for capacity, a pass for
-            // firmware records alone skips them. Any requested pass, recovery, teardown, a waiter,
-            // the last retirement and, at the latest, the first pass after HOUSEKEEPING_NS run
-            // them all.
-            let housekeeping = requested
-                || recover
-                || !in_flight
-                || firmware.recovery.pending()
-                || !firmware.queues.teardown.is_empty()
-                || self.channels.has_waiters()
-                || self.progress.has_waiters()
-                || self.queues.has_waiters()
-                || self.renders.has_waiters()
-                || now.saturating_sub(
-                    self.housekeeping_ns
-                        .load(core::sync::atomic::Ordering::Relaxed),
-                ) >= HOUSEKEEPING_NS;
-            let mut lingers = None;
-            let mut drains = None;
-            let mut kills = None;
-            let mut pools = None;
-            let mut shrinking = false;
-            if housekeeping {
+        }
+        let Some(firmware) = (*state).as_deref_mut() else {
+            return Ok(());
+        };
+        let now = super::now_ns();
+        let compute = firmware
+            .queues
+            .compute
+            .iter()
+            .flatten()
+            .filter_map(|entry| entry.queue.as_deref())
+            .any(|queue| queue.in_flight());
+        let in_flight = compute || firmware.queues.render_in_flight();
+        let idle = firmware.idle_check(now, in_flight)?;
+        // Expiries, drained pairs, exits, pool and heap trimming, teardown and M5 report
+        // drains give back what retirement freed; a completion needs none of them to retire
+        // or to signal. While work is in flight and nothing waits for capacity, a pass for
+        // firmware records alone skips them. Any requested pass, recovery, teardown, a waiter,
+        // the last retirement and, at the latest, the first pass after HOUSEKEEPING_NS run
+        // them all.
+        let housekeeping = requested
+            || recover
+            || !in_flight
+            || firmware.recovery.pending()
+            || !firmware.queues.teardown.is_empty()
+            || self.channels.has_waiters()
+            || self.progress.has_waiters()
+            || self.queues.has_waiters()
+            || self.renders.has_waiters()
+            || now.saturating_sub(
                 self.housekeeping_ns
-                    .store(now, core::sync::atomic::Ordering::Relaxed);
-                if !reports_drained {
-                    // The completions above are signalled; reports are throttled to the
-                    // housekeeping cadence while work stays in flight.
-                    firmware.drain_post_signal_reports();
-                }
-                if !firmware.recovery.pending() {
-                    lingers = firmware.expire_render_lingers(now)?;
-                }
-                drains = firmware.reclaim_drained_renders(batch)?;
-                firmware.service_compute_exit(batch)?;
-                kills = firmware.kill_retry_delay();
-                pools = firmware.service_compute_pools(batch, now)?;
-                if !firmware.recovery.pending() {
-                    firmware
-                        .queues
-                        .vacate_evicted_render_pools(&firmware.init, batch)?;
-                    shrinking = firmware
-                        .queues
-                        .shrink_render_heaps(&firmware.init, now, batch);
-                }
-                let mut reclaim = self.reclaim.lock();
-                firmware.service_teardown(&mut reclaim)?;
-                if !reclaim.is_empty() {
-                    self.queue_reclaims();
-                }
+                    .load(core::sync::atomic::Ordering::Relaxed),
+            ) >= HOUSEKEEPING_NS;
+        let mut lingers = None;
+        let mut drains = None;
+        let mut kills = None;
+        let mut pools = None;
+        let mut shrinking = false;
+        if housekeeping {
+            self.housekeeping_ns
+                .store(now, core::sync::atomic::Ordering::Relaxed);
+            if !reports_drained {
+                // The completions above are signalled; reports are throttled to the
+                // housekeeping cadence while work stays in flight.
+                firmware.drain_post_signal_reports();
             }
-            // The firmware may consume M5 work-ring slots without a completion interrupt: while
-            // a preparation waits for unclaimed room, every pass polls the consumers.
-            let outer = firmware.init.poll_outer_progress()?;
-            let polling = firmware.runtime_polling(now);
-            if polling {
-                self.queue_poll();
+            if !firmware.recovery.pending() {
+                lingers = firmware.expire_render_lingers(now)?;
             }
-            // A heap with growth to give back is re-evaluated at least once per
-            // shrink period, also while the device is otherwise idle.
-            let idle = if shrinking {
-                Some(idle.map_or(SHRINK_WAKE_NS, |delay| delay.min(SHRINK_WAKE_NS)))
-            } else {
-                idle
-            };
-            // A retained compute pool gives its backing back when it expires, and
-            // so does an idle render free-list registration. A drained render pair
-            // whose settlement failed is retried when its backoff ends, and a closed
-            // context's kill that waited for other work is looked at again.
-            let idle = [pools, lingers, drains, kills]
-                .into_iter()
-                .fold(idle, |idle, expiry| match (idle, expiry) {
-                    (Some(delay), Some(expiry)) => Some(delay.min(expiry)),
-                    (delay, expiry) => delay.or(expiry),
-                });
-            if let Some(delay) = idle {
-                self.queue_idle(delay);
+            drains = firmware.reclaim_drained_renders(deferred)?;
+            firmware.service_compute_exit(deferred)?;
+            kills = firmware.kill_retry_delay();
+            pools = firmware.service_compute_pools(deferred, now)?;
+            if !firmware.recovery.pending() {
+                firmware
+                    .queues
+                    .vacate_evicted_render_pools(&firmware.init, deferred)?;
+                shrinking = firmware
+                    .queues
+                    .shrink_render_heaps(&firmware.init, now, deferred);
             }
-            if firmware.recovery.pending() {
-                self.preparations.close();
-                self.queue_events();
-            } else if !recover
-                && !polling
-                && (channel::Events::pending(&firmware.init, Role::Primary)?
-                    || (firmware.secondary.is_some()
-                        && channel::Events::pending(&firmware.init, Role::Secondary)?))
-            {
-                // A full bounded pass must not depend on a fresh notification for
-                // records that arrived while it was consuming the same ring.
-                self.queue_event_records();
-            }
-            let grow_ready = firmware.render_grow_ready();
-            if batch.pending() == 0 {
-                firmware.queues.worker_deferred = deferred.take();
-            }
-            drop(state);
-            if grow_ready {
-                self.queue_grow();
-            }
-            // Outside the device mutex: the notification can run DMA-fence callbacks.
-            if let Some(domain) = outer {
-                domain.notify();
-            }
-            // Firmware ring room, consumed releases and teardown steps have no
-            // event of their own: recheck render publishers' conditions every pass.
-            if self.renders.has_waiters() {
-                self.renders.notify();
-            }
-            Ok(())
-        })();
-        if let Some(mut batch) = deferred.take() {
-            batch.finish();
-            if let Some(firmware) = (*self.state.lock()).as_deref_mut() {
-                firmware.queues.worker_deferred = Some(batch);
+            let mut reclaim = self.reclaim.lock();
+            firmware.service_teardown(&mut reclaim)?;
+            if !reclaim.is_empty() {
+                self.queue_reclaims();
             }
         }
-        result
+        // The firmware may consume M5 work-ring slots without a completion interrupt: while
+        // a preparation waits for unclaimed room, every pass polls the consumers.
+        let outer = firmware.init.poll_outer_progress()?;
+        let polling = firmware.runtime_polling(now);
+        if polling {
+            self.queue_poll();
+        }
+        // A heap with growth to give back is re-evaluated at least once per
+        // shrink period, also while the device is otherwise idle.
+        let idle = if shrinking {
+            Some(idle.map_or(SHRINK_WAKE_NS, |delay| delay.min(SHRINK_WAKE_NS)))
+        } else {
+            idle
+        };
+        // A retained compute pool gives its backing back when it expires, and
+        // so does an idle render free-list registration. A drained render pair
+        // whose settlement failed is retried when its backoff ends, and a closed
+        // context's kill that waited for other work is looked at again.
+        let idle = [pools, lingers, drains, kills]
+            .into_iter()
+            .fold(idle, |idle, expiry| match (idle, expiry) {
+                (Some(delay), Some(expiry)) => Some(delay.min(expiry)),
+                (delay, expiry) => delay.or(expiry),
+            });
+        if let Some(delay) = idle {
+            self.queue_idle(delay);
+        }
+        if firmware.recovery.pending() {
+            self.preparations.close();
+            self.queue_events();
+        } else if !recover
+            && !polling
+            && (channel::Events::pending(&firmware.init, Role::Primary)?
+                || (firmware.secondary.is_some()
+                    && channel::Events::pending(&firmware.init, Role::Secondary)?))
+        {
+            // A full bounded pass must not depend on a fresh notification for
+            // records that arrived while it was consuming the same ring.
+            self.queue_event_records();
+        }
+        let grow_ready = firmware.render_grow_ready();
+        drop(state);
+        if grow_ready {
+            self.queue_grow();
+        }
+        // Outside the device mutex: the notification can run DMA-fence callbacks.
+        if let Some(domain) = outer {
+            domain.notify();
+        }
+        // Firmware ring room, consumed releases and teardown steps have no
+        // event of their own: recheck render publishers' conditions every pass.
+        if self.renders.has_waiters() {
+            self.renders.notify();
+        }
+        Ok(())
     }
 }

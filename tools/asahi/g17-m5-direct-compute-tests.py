@@ -58,19 +58,19 @@ def build_harness(mutation=None):
     turn = item(events_src, 'fn runtime_event_turn(')
     if mutation == 'no-pre-recovery-drain':
         turn = turn.replace(
-            'firmware.drain_post_signal_reports();\n                reports_drained = true;\n'
-            '                firmware.service_runtime_recovery(batch)?;',
-            'firmware.service_runtime_recovery(batch)?;',
+            'firmware.drain_post_signal_reports();\n            reports_drained = true;\n'
+            '            firmware.service_runtime_recovery(deferred)?;',
+            'firmware.service_runtime_recovery(deferred)?;',
             1,
         )
 
     # Verify report-drain ordering contract in production runtime_event_turn().
     ordering_ok = ordered_ok(
         turn,
-        'if let Some(batch) = deferred.as_mut() {\n            batch.finish();\n        }',
+        'deferred.finish();',
         'let mut reports_drained = false;',
-        'firmware.drain_post_signal_reports();\n                reports_drained = true;',
-        'firmware.service_runtime_recovery(batch)?;',
+        'firmware.drain_post_signal_reports();\n            reports_drained = true;',
+        'firmware.service_runtime_recovery(deferred)?;',
         'if housekeeping {',
         'if !reports_drained {',
     )
@@ -89,9 +89,9 @@ def build_harness(mutation=None):
 
     if mutation == 'direct-debits-published':
         prod = prod.replace(
-            'self.reserved[claim.priority].fetch_sub(1, Ordering::AcqRel);',
-            'self.reserved[claim.priority].fetch_sub(1, Ordering::AcqRel);\n'
-            '        self.published[claim.priority].fetch_add(1, Ordering::AcqRel);',
+            'self.reserved[claim.priority].fetch_sub(count, Ordering::AcqRel);',
+            'self.reserved[claim.priority].fetch_sub(count, Ordering::AcqRel);\n'
+            '        self.published[claim.priority].fetch_add(u64::from(count), Ordering::AcqRel);',
             1,
         )
     elif mutation == 'scope-allows-reserve':

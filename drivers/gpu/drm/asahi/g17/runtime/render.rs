@@ -1275,13 +1275,15 @@ impl Registry {
             )
         })
     }
-    pub(in crate::g17) fn retain_render_completions(&mut self, masks: [u64; 2]) {
+    pub(in crate::g17) fn retain_render_completions(&mut self, masks: [u64; 2]) -> [u64; 2] {
+        let mut matched = [0u64; 2];
         for entry in self.render.entries.iter_mut().flatten() {
             let mut hit = false;
             for id in entry.reservation.ids {
                 let qid = usize::from(id.qid());
                 let bit = masks[qid / 64] & (1u64 << (qid % 64));
                 entry.event_masks[qid / 64] |= bit;
+                matched[qid / 64] |= bit;
                 hit |= bit != 0;
             }
             // Event passes skip a pair while preparation, growth or an
@@ -1292,6 +1294,7 @@ impl Registry {
                 entry.missed_event = true;
             }
         }
+        matched
     }
     pub(in crate::g17) fn render_needs_rescan(&self) -> bool {
         self.render.entries.iter().flatten().any(|entry| {

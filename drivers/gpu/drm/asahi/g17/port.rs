@@ -347,9 +347,22 @@ impl Port {
         *self.m5_outer.lock() = None;
     }
 
-    /// Reserves one slot on M5's shared outer ring for a direct compute publisher without
-    /// taking the device mutex. Returns EBUSY if a device-mutex OuterScope is active or full.
-    pub(super) fn reserve_m5_compute(&self, priority: u8) -> Result<super::initdata::OuterClaim> {
+    /// M5: the availability domain outer-ring claims wait on. None off M5 or before attach.
+    pub(super) fn outer_domain(&self) -> Option<Arc<super::availability::Availability>> {
+        self.views()
+            .ok()?
+            .m5_credits
+            .as_ref()
+            .map(|credits| credits.available())
+    }
+
+    /// Reserves `count` slots on M5's shared outer ring without taking the device mutex.
+    /// Returns EBUSY if a device-mutex OuterScope is active or fewer than `count` slots are free.
+    pub(super) fn reserve_m5_outer(
+        &self,
+        priority: u8,
+        count: u32,
+    ) -> Result<super::initdata::OuterClaim> {
         let views = self.views()?;
         let credits = views.m5_credits.as_ref().ok_or(EINVAL)?;
         let (_, ring) = self.ring(priority)?;
@@ -358,13 +371,20 @@ impl Port {
             return Err(EBUSY);
         }
         let cursors = ring.cursors()?;
-        credits.reserve(priority, 1, cursors)
+        credits.reserve(priority, count, cursors)
     }
 
-    /// Publishes one compute slot on M5's shared outer ring under the port's M5 outer lock
-    /// and consumes the caller's direct reservation.
-    pub(super) fn publish_m5_compute(
+    /// Reserves one slot on M5's shared outer ring for a direct compute publisher without
+    /// taking the device mutex. Returns EBUSY if a device-mutex OuterScope is active or full.
+    pub(super) fn reserve_m5_compute(&self, priority: u8) -> Result<super::initdata::OuterClaim> {
+        self.reserve_m5_outer(priority, 1)
+    }
+
+    /// Publishes one compute slot on M5's shared outer ring while the caller holds `m5_outer`,
+    /// consuming the caller's direct reservation.
+    pub(super) fn publish_m5_compute_locked(
         &self,
+        _guard: &MutexGuard<'_, Option<(u32, u64, u64)>>,
         priority: u8,
         claim: &mut super::initdata::OuterClaim,
         record: &WorkSlot,
@@ -375,7 +395,6 @@ impl Port {
         let views = self.views()?;
         let credits = views.m5_credits.as_ref().ok_or(EINVAL)?;
         let (_, ring) = self.ring(priority)?;
-        let _guard = self.m5_outer.lock();
         let [first, second, producer] = ring.cursors()?;
         let next = (producer + 1) % WORK_RING_SLOTS;
         if next == first || next == second {
@@ -400,14 +419,13 @@ impl Port {
         Ok(next)
     }
 
-    /// Issues an M5 host-port compute submission with gating held off, serialized by `m5_outer`.
-    pub(super) fn submit_m5_work_held(
+    /// Issues an M5 host-port compute submission with gating held off while `m5_outer` is held.
+    pub(super) fn submit_m5_work_held_locked(
         &self,
+        _guard: &MutexGuard<'_, Option<(u32, u64, u64)>>,
         submission: &super::fw::m5::queue::HardwareSubmission,
     ) -> Result {
-        let regs = self.regs.as_ref().ok_or(ENODEV)?;
-        let _guard = self.m5_outer.lock();
-        regs.submit_m5_work_held(submission)
+        self.regs.as_ref().ok_or(ENODEV)?.submit_m5_work_held(submission)
     }
 
     /// Counts `submissions` in the M5 submission-history table without taking the device mutex.
@@ -935,17 +953,23 @@ impl Port {
     }
 
     pub(super) fn note_gpu_activity(&self) {
-        // Observe gating before activity can wake the cores. A lockless
+        let now_ns = super::now_ns();
+        // Firmware gates the cores only after its idle-off delay, so back-to-back submissions
+        // within that window cannot follow a core gating; skip the uncached power register read.
+        let idle_off_ns = u64::from(super::power::FIRMWARE_IDLE_OFF_MS) * 1_000_000;
+        let previous = self.last_submission_ns.load(Ordering::Relaxed);
+        let recent = previous != 0 && now_ns.saturating_sub(previous) < idle_off_ns;
+        // Otherwise observe gating before activity can wake the cores. A lockless
         // publisher cannot clear the decoder under the device mutex; this
         // epoch makes both the next drain and the next reader discard it.
-        if self
-            .regs
-            .as_ref()
-            .is_some_and(|regs| regs.g17_core_power() & 0xf == 0)
+        if !recent
+            && self
+                .regs
+                .as_ref()
+                .is_some_and(|regs| regs.g17_core_power() & 0xf == 0)
         {
             self.statistics_epoch.fetch_add(1, Ordering::Release);
         }
-        let now_ns = super::now_ns();
         self.last_submission_ns.store(now_ns, Ordering::Relaxed);
         self.demand.set_active(true);
         self.report_busy(now_ns);

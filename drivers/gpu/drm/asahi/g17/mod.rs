@@ -1258,12 +1258,13 @@ struct Shared {
     /// step). Publishers without the device mutex set it too.
     governor_activity_ns: AtomicU64,
     /// The queue of all work that signals job fences: the event work, and every scheduler's
-    /// timeout work. Memory reclaim may wait on those fences, so it is reclaim-safe. On M5 it is
-    /// unbound, so the event work runs in the affinity pod (the L2) of the CPU that last
-    /// published work, not on whichever CPU the completion IRQ thread first ran on; on a two-die
-    /// part that keeps completion processing on the submitter's die. Elsewhere it is per-CPU and
-    /// high priority, as `system_highpri_wq`.
+    /// timeout work. Memory reclaim may wait on those fences, so it is reclaim-safe and per-CPU
+    /// high priority, as `system_highpri_wq`. On M5, `enqueue_on(submitter)` places completion
+    /// processing directly on the submitting CPU (keeping it in the submitter's L2 and die).
     events: Arc<workqueue::OwnedQueue>,
+    /// Preallocated completion collector owned exclusively by `run_runtime_events`.
+    #[pin]
+    worker_deferred: Mutex<Option<runtime::DeferredBatch>>,
     /// M5: the event work and the scheduler workers follow the submitting CPU.
     follows_submitter: bool,
     /// M5: the CPU of the last publication, `u32::MAX` before the first.
@@ -1747,17 +1748,14 @@ impl Gpu {
         // The bare-metal M5 boot runs both engines; other M5 profiles take no submission.
         let submits = !m5 || cfg.profile == FirmwareProfile::M5PublishedRoots;
         let events = Arc::new(
-            if m5 {
-                workqueue::OwnedQueue::new_unbound_reclaim(c"aurora_g17_events", true)?
-            } else {
-                workqueue::OwnedQueue::new_percpu_reclaim(c"aurora_g17_events", true)?
-            },
+            workqueue::OwnedQueue::new_percpu_reclaim(c"aurora_g17_events", true)?,
             GFP_KERNEL,
         )?;
         let frequencies = Self::state_frequencies(dev, cfg, variant, id.num_clusters)?;
         let max_pstate = frequencies
             .as_ref()
             .map_or(0, stats::StateFrequencies::max_pstate);
+        let worker_deferred = runtime::DeferredBatch::worker()?;
         let shared = Arc::pin_init(
             pin_init!(Shared {
                 drm <- new_mutex!(Some(dev.into()), "g17::Shared::drm"),
@@ -1799,6 +1797,10 @@ impl Gpu {
                 governor_armed: AtomicBool::new(false),
                 governor_activity_ns: AtomicU64::new(0),
                 events,
+                worker_deferred <- new_mutex!(
+                    Some(worker_deferred),
+                    "g17::Shared::worker_deferred"
+                ),
                 follows_submitter: m5,
                 submitter: AtomicU32::new(u32::MAX),
                 grow <- new_work!("g17::Shared::grow"),
