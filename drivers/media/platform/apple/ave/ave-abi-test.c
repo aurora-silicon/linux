@@ -2,7 +2,6 @@
 /* Byte equality against the pre-ABI-refactor 9003 command builders. */
 #include <kunit/device.h>
 #include <kunit/test.h>
-#include <linux/module.h>
 #include <linux/crc32.h>
 #include <linux/errno.h>
 #include <linux/string.h>
@@ -1644,5 +1643,3 @@ static struct kunit_suite ave_abi_suite = {
 	.test_cases = ave_abi_cases,
 };
 kunit_test_suite(ave_abi_suite);
-
-MODULE_LICENSE("GPL");
