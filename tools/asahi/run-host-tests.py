@@ -157,7 +157,7 @@ ASAHI_TESTS = {
         + mutations('--mutation', ('narrow-stream', 'ignore-aperture', 'revision-wide'), out('--output')),
     'brcmf-recovery-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('stall-limit', 'trap-flag', 'console', 'line-start', 'once',
-                                   'rate-limit', 'stall-reset', 'ring-full'), out()),
+                                   'rate-limit', 'stall-reset', 'ring-full', 'trap-bound'), out()),
     'brcmf-roam-tests.py': [(out(), PASS)],
     'brcmf-shared-tcm-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('shared', 'htod-mb', 'dtoh-mb', 'ring-info', 'ring-mem', 'ring-idx',

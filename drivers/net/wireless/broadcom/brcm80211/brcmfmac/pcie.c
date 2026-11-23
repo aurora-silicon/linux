@@ -1059,9 +1059,13 @@ static void brcmf_pcie_ctl_stall(struct device *dev, u32 stalls)
 		addr = brcmf_pcie_read_tcm32(devinfo, shared->tcm_base_address +
 					     BRCMF_SHARED_TRAP_ADDR_OFFSET);
 		/* trap type, then the exception pc */
-		brcmf_err(bus, "firmware trap 0x%x at 0x%08x\n",
-			  brcmf_pcie_read_tcm32(devinfo, addr),
-			  brcmf_pcie_read_tcm32(devinfo, addr + 4));
+		if (brcmf_pcie_tcm_range_valid(devinfo->tcm_size, addr, 8))
+			brcmf_err(bus, "firmware trap 0x%x at 0x%08x\n",
+				  brcmf_pcie_read_tcm32(devinfo, addr),
+				  brcmf_pcie_read_tcm32(devinfo, addr + 4));
+		else
+			brcmf_err(bus, "firmware trap record at 0x%08x is outside the TCM\n",
+				  addr);
 		reason = "trap in shared RAM";
 	} else if ((flags & BRCMF_PCIE_SHARED_ASSERT_BUILT) &&
 		   (flags & BRCMF_PCIE_SHARED_ASSERT)) {
@@ -1138,6 +1142,8 @@ static void brcmf_pcie_bus_console_init(struct brcmf_pciedev_info *devinfo)
 	console->base_addr = brcmf_pcie_read_tcm32(devinfo, addr);
 	console->bufsize = 0;
 	console->read_idx = 0;
+	console->scan_idx = 0;
+	console->scan_len = 0;
 	if (!brcmf_pcie_tcm_range_valid(devinfo->tcm_size, console->base_addr,
 					BRCMF_CONSOLE_WRITEIDX_OFFSET + 4)) {
 		console->base_addr = 0;
@@ -1157,7 +1163,8 @@ static void brcmf_pcie_bus_console_init(struct brcmf_pciedev_info *devinfo)
 	}
 	addr = console->base_addr + BRCMF_CONSOLE_WRITEIDX_OFFSET;
 	console->scan_idx = brcmf_pcie_read_tcm32(devinfo, addr);
-	console->scan_len = 0;
+	if (console->scan_idx >= console->bufsize)
+		console->scan_idx = 0;
 
 	brcmf_dbg(FWCON, "Console: base %x, buf %x, size %d\n",
 		  console->base_addr, console->buf_addr, console->bufsize);
