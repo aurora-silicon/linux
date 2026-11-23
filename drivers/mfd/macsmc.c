@@ -1968,7 +1968,7 @@ static int apple_smc_freeze(struct device *dev)
 		return 0;
 	}
 	apple_smc_handed_over = true;
-	dev_info(dev, "SMC quiesced for the restored kernel\n");
+	dev_dbg(dev, "SMC quiesced for the restored kernel\n");
 	return 0;
 }
 
