@@ -615,7 +615,7 @@ static void drain_data_tx(struct centauri_t6050_wifi *wifi)
 		wifi->data_tx_length[post] = skb->len;
 		wifi->data_tx_busy[post] = true;
 		wifi->data_tx_submitted++;
-		dev_kfree_skb_any(skb);
+		dev_consume_skb_any(skb);
 		post = next;
 		posted = true;
 	}
