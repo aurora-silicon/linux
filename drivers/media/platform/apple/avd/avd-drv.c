@@ -845,6 +845,9 @@ static struct platform_driver avd_driver = {
 	},
 };
 module_platform_driver(avd_driver);
+#if IS_REACHABLE(CONFIG_VIDEO_APPLE_AVD_KUNIT_TEST)
+#include "avd-variant-test.c"
+#endif
 
 MODULE_LICENSE("GPL v2");
 MODULE_DESCRIPTION("Apple avd v4l2 sl m2m");
