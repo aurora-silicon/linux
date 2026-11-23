@@ -1298,11 +1298,16 @@ impl Registry {
     }
     pub(in crate::g17) fn render_needs_rescan(&self) -> bool {
         self.render.entries.iter().flatten().any(|entry| {
+            // A completion that arrived while the pair was borrowed (`missed_event`) is owed to
+            // its borrower, whose return observes the pair or requests an event pass: no
+            // rescan waits for it.
             let active = entry
                 .pair
                 .as_ref()
                 .map_or(
-                    (entry.preparing.is_some() || entry.growing) && entry.borrowed_active,
+                    (entry.preparing.is_some() || entry.growing)
+                        && entry.borrowed_active
+                        && !entry.missed_event,
                     |pair| pair.published_in_flight(),
                 );
             active

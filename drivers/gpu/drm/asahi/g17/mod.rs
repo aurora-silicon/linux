@@ -1298,6 +1298,11 @@ struct Shared {
     /// Preallocated completion collector owned exclusively by `run_runtime_events`.
     #[pin]
     worker_deferred: Mutex<Option<runtime::DeferredBatch>>,
+    /// Collector, as large as the event worker's, for the observation a render borrower owes the
+    /// pair it puts back (`Backend::render_direct`). Taken only with `try_lock`, so no borrower
+    /// waits for another, and finished after the device mutex is released.
+    #[pin]
+    render_collector: Mutex<runtime::DeferredBatch>,
     /// M5: the event work runs beside the CPU that last published work, in its affinity pod.
     follows_submitter: bool,
     /// Multi-die M5: restrict each scheduler's ordered submit queue to the creating CPU's
@@ -1815,6 +1820,7 @@ impl Gpu {
             .as_ref()
             .map_or(0, stats::StateFrequencies::max_pstate);
         let worker_deferred = runtime::DeferredBatch::worker()?;
+        let render_collector = runtime::DeferredBatch::worker()?;
         let shared = Arc::pin_init(
             pin_init!(Shared {
                 drm <- new_mutex!(Some(dev.into()), "g17::Shared::drm"),
@@ -1860,6 +1866,7 @@ impl Gpu {
                     Some(worker_deferred),
                     "g17::Shared::worker_deferred"
                 ),
+                render_collector <- new_mutex!(render_collector, "g17::Shared::render_collector"),
                 follows_submitter,
                 pin_scheduler_cluster: m5 && id.num_dies > 1,
                 submitter: AtomicU32::new(u32::MAX),

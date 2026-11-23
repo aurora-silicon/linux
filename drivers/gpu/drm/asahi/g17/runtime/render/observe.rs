@@ -16,6 +16,11 @@ pub(in crate::g17::runtime) enum FastRenderOutcome {
     Idle,
     /// Retired the single ready render observation cleanly with no further render work pending.
     Done,
+    /// Retired every ready observation in steady state, while published work whose completion
+    /// was noted stays in flight (`render_needs_rescan`): its later completions are observed by
+    /// their own events or by the rescan poll, which is all the full `observe_renders()` pass
+    /// would add.
+    Rescan,
 }
 
 impl crate::g17::Firmware {
@@ -48,11 +53,17 @@ impl crate::g17::Firmware {
     /// The first slot from `start` whose pair has news to observe: published work in flight, the
     /// fragment queue's notification seen (`completion_noted`), and an observation the pair accepts.
     fn next_render_observation(&mut self, start: usize) -> Result<Option<usize>> {
+        let end = self.queues.render.entries.len();
+        self.next_render_observation_in(start, end)
+    }
+
+    /// [`Self::next_render_observation`] among the slots `start..end`.
+    fn next_render_observation_in(&mut self, start: usize, end: usize) -> Result<Option<usize>> {
         if self.recovery.pending() {
             return Ok(None);
         }
         let state = crate::g17::recovery::Memory::recovery_state(&self.init)?;
-        for slot in start..self.queues.render.entries.len() {
+        for slot in start..end.min(self.queues.render.entries.len()) {
             let Some(entry) = self.queues.render.entries[slot].as_ref() else {
                 continue;
             };
@@ -144,6 +155,37 @@ impl crate::g17::Firmware {
         &mut self,
         deferred: &mut DeferredBatch,
     ) -> Result<FastRenderOutcome> {
+        let end = self.queues.render.entries.len();
+        self.fast_observe_renders(1, end, deferred)
+    }
+
+    /// The observation a borrower owes the pair it has just put back into `slot`, in the hold
+    /// that put it back, with a live preparation lease and a collector of the event worker's size
+    /// (`deferred`): the event worker's single-lock retirement ([`Self::try_fast_observe_render`])
+    /// of that slot alone. `Fallback` leaves the slot to the worker's full pass; otherwise its
+    /// ready completions are retired (`Rescan`: and the rescan poll covers what stays in flight).
+    ///
+    /// The event pass a completion of a lent pair would otherwise request runs on another CPU and
+    /// takes the device mutex after the borrower's next lend of the same pair, so it finds the
+    /// pair lent again; observing here retires every completion by the return of the loan it
+    /// arrived during.
+    pub(in crate::g17::runtime) fn observe_returned_render(
+        &mut self,
+        slot: u8,
+        deferred: &mut DeferredBatch,
+    ) -> Result<FastRenderOutcome> {
+        let slot = usize::from(slot);
+        self.fast_observe_renders(slot, slot + 1, deferred)
+    }
+
+    /// [`Self::try_fast_observe_render`] for the observations of the slots `start..end`; the
+    /// steady-state checks still cover every slot.
+    fn fast_observe_renders(
+        &mut self,
+        start: usize,
+        end: usize,
+        deferred: &mut DeferredBatch,
+    ) -> Result<FastRenderOutcome> {
         if self.recovery.pending()
             || self.queues.render.replay_parked()
             || self.render_grow_pending()
@@ -165,9 +207,9 @@ impl crate::g17::Firmware {
         }
         let mut retired_any = false;
         for _ in 0..crate::hw::t8140::queues::RENDER_SLOTS {
-            let Some(slot) = self.next_render_observation(1)? else {
+            let Some(slot) = self.next_render_observation_in(start, end)? else {
                 return Ok(if self.queues.render_needs_rescan() {
-                    FastRenderOutcome::Fallback
+                    FastRenderOutcome::Rescan
                 } else if retired_any {
                     FastRenderOutcome::Done
                 } else {
@@ -220,14 +262,18 @@ impl crate::g17::Firmware {
                 || self.recovery.pending()
                 || self.render_grow_pending()
                 || self.render_grow_ready()
-                || self.queues.render_needs_rescan()
             {
                 return Ok(FastRenderOutcome::Fallback);
             }
+            // Work still in flight behind this front keeps its noted completion: retire whatever
+            // else is ready in this hold before deciding.
             retired_any = true;
         }
-        if self.next_render_observation(1)?.is_some() || self.queues.render_needs_rescan() {
+        if self.next_render_observation_in(start, end)?.is_some() {
             return Ok(FastRenderOutcome::Fallback);
+        }
+        if self.queues.render_needs_rescan() {
+            return Ok(FastRenderOutcome::Rescan);
         }
         Ok(if retired_any {
             FastRenderOutcome::Done
