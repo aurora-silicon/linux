@@ -10284,6 +10284,12 @@ static bool dcp_t6041_ext_restarts(void)
 	return soc && soc->ext_restart;
 }
 
+/* A T604x display power complex: its sleep takes the external links down and back. */
+bool dcp_t604x_relinks(void)
+{
+	return dcp_t6041_power();
+}
+
 /* The fixed HDMI output of a T6040 external DCP, not lent to a Type-C display. */
 static bool dcp_t6040_fixed_hdmi(struct apple_dcp *dcp)
 {

@@ -1534,7 +1534,7 @@ static int dcp_retrain_active_crtc(struct apple_connector *connector,
 		   (READ_ONCE(dcp->mode_state.valid) ||
 		    !dcp_has_mode(dcp, &crtc->state->mode))) {
 		ret = 0;
-	} else if (crtc && crtc->state && crtc->state->active &&
+	} else if (dcp_t604x_relinks() && crtc && crtc->state && crtc->state->active &&
 		   !dcp_mode_settable(dcp, &crtc->state->mode) &&
 		   !dcp_typec_follows_crtc(dcp)) {
 		/*
@@ -1968,11 +1968,11 @@ void dcp_hotplug(struct work_struct *work)
 	if (READ_ONCE(dcp->mode_state.valid))
 		dcp->tunnel_power_cycles = 0;
 	/*
-	 * HPD went low, as when a sink just woken asserts it again with its full
+	 * T604x: HPD went low, as when a sink just woken asserts it again with its full
 	 * mode list: the plug that follows reads that list, so a link recovery
 	 * pending for the old one would only take the new link down.
 	 */
-	if (!READ_ONCE(connector->connected))
+	if (!READ_ONCE(connector->connected) && dcp_t604x_relinks())
 		cancel_delayed_work(&dcp->link_recovery_wq);
 
 	scoped_guard(mutex, &connector->base.dev->mode_config.mutex) {
