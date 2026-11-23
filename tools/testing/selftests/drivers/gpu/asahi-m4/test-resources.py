@@ -1691,6 +1691,69 @@ pub mod g16 {
         assert_eq!(r.registration_barrier.class, Class::Fw);
     }
 
+    #[test]fn pb_heap_growth_rotates_to_expanded_epoch_and_falls_back_under_quarantine(){
+        use g16::fw::buffer;
+        use g16::hw::client;
+        use g16::pools::{PbEpoch, Pools, alloc_pb_heap_chunk};
+
+        // Demand-grown PB heap chunks map contiguously right after the 64 MiB base heap
+        // inside PB_HEAP_SIZE (256 MiB) and reject out-of-range or zero-sized chunks.
+        let mut o = Objects::new();
+        let tier0 = alloc_pb_heap_chunk(&mut o, 512, 512).unwrap();
+        let tier1 = alloc_pb_heap_chunk(&mut o, 1024, 1024).unwrap();
+        assert_eq!(tier0.gva, Some(client::pb_heap(0) + 512 * buffer::BLOCK_BYTES));
+        assert_eq!(tier0.size, 512 * buffer::BLOCK_BYTES as usize);
+        assert_eq!(tier1.gva, Some(client::pb_heap(0) + 1024 * buffer::BLOCK_BYTES));
+        assert_eq!(tier1.size, 1024 * buffer::BLOCK_BYTES as usize);
+        assert!(alloc_pb_heap_chunk(&mut o, 512, 0).is_err());
+        assert!(alloc_pb_heap_chunk(&mut o, 1024, 1025).is_err());
+
+        // Start VM1 with a 512-block (64 MiB) warm epoch on slot 0.
+        let factory = g16::object::Factory;
+        let budget = g16::budget::Budget::new().unwrap();
+        let vm1 = vm(1);
+        let mut p = g16::pools::Pools::new(&driver::AsahiDrmDevice(device::Device));
+        let e512 = PbEpoch::new(&factory, &vm1, g16::budget::Budget::reserve(&budget, 1).unwrap().take().unwrap()).unwrap();
+        e512.prepare(0, client::pb_heap(0), 512).unwrap();
+        assert_eq!(e512.heap_blocks(), 512);
+        e512.expose();
+        let b0 = p.bind(0, false);
+        p.publish_flight(0);
+        p.retire_flight(0, &e512, b0, true).unwrap();
+
+        // At 512 blocks VM1 pipelines cleanly on slot 0.
+        assert!(p.can_pipeline_within_blocks(&vm1, 2, 512));
+        assert_eq!(p.pick_slot_within_blocks(&vm1, true, 2, 512), Some(0));
+
+        // Once VM1 expands its PB heap to 1024 blocks (128 MiB), slot 0's 512-block epoch
+        // refuses pipelining so the engine drains once and rotates onto displaced slot 1.
+        assert!(!p.can_pipeline_within_blocks(&vm1, 2, 1024));
+        assert_eq!(p.pick_slot_within_blocks(&vm1, true, 2, 1024), None);
+        assert_eq!(p.pick_slot_within_blocks(&vm1, false, 2, 1024), Some(1));
+        assert!(p.reusable_for_within(0, &vm1, 2, 1024).is_none());
+
+        let e1024 = PbEpoch::new(&factory, &vm1, g16::budget::Budget::reserve(&budget, 1).unwrap().take().unwrap()).unwrap();
+        e1024.prepare(1, client::pb_heap(0), 1024).unwrap();
+        assert_eq!(e1024.heap_blocks(), 1024);
+        e1024.expose();
+        let b1 = p.bind(1, false);
+        p.publish_flight(1);
+        p.retire_flight(1, &e1024, b1, true).unwrap();
+
+        // Slot 1 now pipelines at 1024 blocks; expanding to 2048 rotates cleanly back to displaced slot 0.
+        assert!(p.can_pipeline_within_blocks(&vm1, 2, 1024));
+        assert_eq!(p.pick_slot_within_blocks(&vm1, true, 2, 1024), Some(1));
+        assert!(!p.can_pipeline_within_blocks(&vm1, 2, 2048));
+        assert_eq!(p.pick_slot_within_blocks(&vm1, false, 2, 2048), Some(0));
+
+        // Quarantine edge case: if slot 0 is quarantined so no displaced slot remains in 0..2,
+        // VM1 safely falls back to reusing its warm 1024-block slot 1 instead of deadlocking.
+        p.quarantine_flight(0, None);
+        assert!(p.can_pipeline_within_blocks(&vm1, 2, 2048));
+        assert_eq!(p.pick_slot_within_blocks(&vm1, true, 2, 2048), Some(1));
+        assert!(p.reusable_for_within(1, &vm1, 2, 2048).is_some());
+    }
+
 }
 '''
 poll_source = (production/'poll.rs').read_text()

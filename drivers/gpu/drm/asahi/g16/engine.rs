@@ -1300,7 +1300,10 @@ impl Firmware {
                 && !job
                     .resources
                     .pb_slots()
-                    .is_ok_and(|n| self.pools.can_pipeline_within(&job.vm, n)))
+                    .and_then(|n| Ok((n, job.resources.pb_heap_blocks()?)))
+                    .is_ok_and(|(n, blocks)| {
+                        self.pools.can_pipeline_within_blocks(&job.vm, n, blocks)
+                    }))
     }
 
     /// Whether `job` is ready to run without an engine drain but currently blocked solely on
@@ -1460,7 +1463,10 @@ impl Firmware {
                     && job
                         .resources
                         .pb_slots()
-                        .is_ok_and(|n| self.pools.can_pipeline_within(&job.vm, n))
+                        .and_then(|n| Ok((n, job.resources.pb_heap_blocks()?)))
+                        .is_ok_and(|(n, blocks)| {
+                            self.pools.can_pipeline_within_blocks(&job.vm, n, blocks)
+                        })
                     && job
                         .resources
                         .render_passes()
@@ -1728,8 +1734,14 @@ impl Firmware {
         let mut a = job
             .resources
             .prepare_pb_in_flight(alloc_slot, draw, render_pipelined)?;
-        // Reuse this VM's retired epoch of the allocator slot when still bound (no reseed/InitBM).
-        let (epoch, reused) = match self.pools.reusable(alloc_slot, &job.vm) {
+        let pb_slots = job.resources.pb_slots()?;
+        let heap_blocks = job.resources.pb_heap_blocks()?;
+        // Reuse this VM's retired epoch of the allocator slot when still bound and sized for the
+        // VM's current PB heap (no reseed/InitBM); if the PB heap grew, rotate onto a fresh epoch.
+        let (epoch, reused) = match self
+            .pools
+            .reusable_for_within(alloc_slot, &job.vm, pb_slots, heap_blocks)
+        {
             Some(e) => {
                 self.pools.stats.reused += 1;
                 a.init_buffer = false;
@@ -1743,7 +1755,7 @@ impl Firmware {
                 if let Err(err) = e.prepare(
                     alloc_slot,
                     job.resources.pb_heap_gva(alloc_slot)?,
-                    job.resources.pb_heap_blocks()?,
+                    heap_blocks,
                 ) {
                     job.resources.return_pb(e);
                     return Err(err);
@@ -2920,9 +2932,10 @@ impl Firmware {
         self.slots.hold_render_pass(k, &job.vm, resources)?;
         let (refs, init_buffer) = if member == 0 {
             let pb_slots = resources.pb_slots()?;
+            let heap_blocks = resources.pb_heap_blocks()?;
             let alloc_slot = self
                 .pools
-                .pick_slot_within(&job.vm, behind, pb_slots)
+                .pick_slot_within_blocks(&job.vm, behind, pb_slots, heap_blocks)
                 .ok_or(EAGAIN)?;
             let slot_pipelined = self.pools.slot_inflight(alloc_slot) > 0;
             let (refs, init_buffer, epoch, binding) =
