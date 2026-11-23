@@ -766,7 +766,7 @@ impl Firmware {
         unit: &super::slots::ComputeSlot,
     ) -> Result<(u64, u64)> {
         let (start, end) = (unit.its.r64(0)?, unit.its.r64(8)?);
-        if start != 0 && end > start {
+        if start != 0 && end >= start {
             return Ok((start, end));
         }
         let Some((start_off, end_off)) = work_ticks else {
@@ -998,7 +998,7 @@ impl Firmware {
                         break;
                     }
                     let (start, end) = self.compute_ticks(unit)?;
-                    if start == 0 || end <= start {
+                    if start == 0 || end < start {
                         full = false;
                         break;
                     }
@@ -1085,9 +1085,9 @@ impl Firmware {
                         ticks = [ta_start, ta_end, fs_start, fs_end];
                     }
                     full &= ta_start != 0
-                        && ta_end > ta_start
+                        && ta_end >= ta_start
                         && fs_start != 0
-                        && fs_end > fs_start;
+                        && fs_end >= fs_start;
                     if !full {
                         break;
                     }
@@ -1558,7 +1558,7 @@ impl Firmware {
                 f.job
                     .queue
                     .usage
-                    .add(engine, start, end, super::hw::COMMAND_TIMESTAMP_HZ as u32);
+                    .add_union(engine, start, end, super::hw::COMMAND_TIMESTAMP_HZ as u32);
                 *sum = sum.saturating_add(end - start);
                 lo = lo.min(start);
                 hi = hi.max(end);

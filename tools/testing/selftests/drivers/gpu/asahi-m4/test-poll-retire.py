@@ -17,11 +17,11 @@ assert (
     'OwnedQueue::new_percpu_reclaim(c_str!("aurora_g16_events"), true)' in mod_source
 ), 'aurora_g16_events must use new_percpu_reclaim(..., true)'
 assert (
-    'pub(crate) usage: Arc<crate::usage::Lane<Arc<crate::usage::Client>>>' in queue_source
-), 'QueueState::usage must deduplicate per-queue pipelined stages via usage::Lane'
+    'pub(crate) usage: Arc<crate::usage::Client>' in queue_source
+), 'QueueState::usage must reference the per-file usage::Client'
 assert (
-    'crate::usage::Lane::new(usage)' in queue_source
-), 'Queue::new must wrap client usage in usage::Lane'
+    '.add_union(engine, start, end, super::hw::COMMAND_TIMESTAMP_HZ as u32)' in source
+), 'G16 poll retirement must deduplicate per-file intervals via Client::add_union'
 
 
 def item(declaration, text=source):
@@ -1015,24 +1015,25 @@ mod resnap_sync_test {
 mod usage;
 
 #[test]
-fn per_queue_usage_lane_charges_distinct_stages_and_deduplicates_overlap() {
+fn per_file_usage_union_deduplicates_pipelined_and_dual_pipe_siblings() {
     let client = Arc::new(usage::Client::new());
-    let lane = usage::Lane::new(client.clone());
     const HZ: u32 = 24_000_000;
     // Two pipelined renders whose TA and FS intervals overlap across flights.
-    lane.add(usage::Engine::Vertex, 24_000, 48_000, HZ);
-    lane.add(usage::Engine::Fragment, 40_000, 88_000, HZ);
-    lane.add(usage::Engine::Vertex, 36_000, 72_000, HZ);
-    lane.add(usage::Engine::Fragment, 64_000, 120_000, HZ);
-    lane.add(usage::Engine::Compute, 100_000, 124_000, HZ);
+    client.add_union(usage::Engine::Vertex, 24_000, 48_000, HZ);
+    client.add_union(usage::Engine::Fragment, 40_000, 88_000, HZ);
+    client.add_union(usage::Engine::Vertex, 36_000, 72_000, HZ);
+    client.add_union(usage::Engine::Fragment, 64_000, 120_000, HZ);
+    // Two sibling queues on the same DRM file overlapping across dual CDM pipes.
+    client.add_union(usage::Engine::Compute, 100_000, 124_000, HZ);
+    client.add_union(usage::Engine::Compute, 106_000, 130_000, HZ);
     let [v_ns, f_ns, c_ns] = client.snapshot();
     // Vertex union: [24k, 72k] = 48k ticks = 2_000_000 ns (not 60k ticks = 2.5 ms).
     assert_eq!(v_ns, 2_000_000);
     // Fragment union: [40k, 120k] = 80k ticks = 3_333_333 ns (distinct from Vertex).
     assert_eq!(f_ns, 3_333_333);
     assert_ne!(v_ns, f_ns);
-    // Compute: [100k, 124k] = 24k ticks = 1_000_000 ns.
-    assert_eq!(c_ns, 1_000_000);
+    // Compute union: [100k, 130k] = 30k ticks = 1_250_000 ns (not 48k ticks = 2.0 ms).
+    assert_eq!(c_ns, 1_250_000);
 }
 '''
 

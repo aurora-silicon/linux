@@ -328,6 +328,36 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     assert_eq!(f.retired(),Ok(Retirement::Aborted));
     assert!(f.engine.flights[0].doomed);
 }
+#[test]fn same_tick_stage_timestamps_retire_full_while_zero_or_reversed_stay_pending(){
+    // 24 MHz (41.67 ns) stage timestamps can legitimately record end == start on tiny draws
+    // or dispatches; accept end >= start while still rejecting 0 or reversed intervals.
+    let mut r=firmware(true,50);
+    r.engine.flights[0].job.resources.passes[0].scene.set(0x600,100);
+    r.engine.flights[0].job.resources.passes[0].scene.set(0x608,100);
+    r.engine.flights[0].job.resources.passes[0].scene.set(0x620,200);
+    r.engine.flights[0].job.resources.passes[0].scene.set(0x628,200);
+    assert_eq!(r.retired(),Ok(Retirement::Full));
+    assert_eq!(r.engine.retired_ticks,[100,100,200,200]);
+
+    r.engine.flights[0].job.resources.passes[0].scene.set(0x608,0);
+    assert_eq!(r.retired(),Ok(Retirement::Pending));
+    r.engine.flights[0].job.resources.passes[0].scene.set(0x608,99);
+    assert_eq!(r.retired(),Ok(Retirement::Pending));
+    r.engine.flights[0].job.resources.passes[0].scene.set(0x608,100);
+    r.engine.flights[0].job.resources.passes[0].scene.set(0x628,199);
+    assert_eq!(r.retired(),Ok(Retirement::Pending));
+
+    let mut c=firmware(false,51);
+    c.engine.flights[0].job.resources.compute[0].its.set(0,300);
+    c.engine.flights[0].job.resources.compute[0].its.set(8,300);
+    assert_eq!(c.retired(),Ok(Retirement::Full));
+    assert_eq!(c.engine.retired_ticks,[300,300,0,0]);
+
+    c.engine.flights[0].job.resources.compute[0].its.set(8,0);
+    assert_eq!(c.retired(),Ok(Retirement::Pending));
+    c.engine.flights[0].job.resources.compute[0].its.set(8,299);
+    assert_eq!(c.retired(),Ok(Retirement::Pending));
+}
 
 '''.replace('__LOGIC__', str(backend/'recovery/logic.rs'))
 for token, path, name in [('__STAMP_SEED__','encode.rs','stamp_seed'),('__STAMP__','encode.rs','stamp'),('__RETIRED__','poll.rs','retired'),('__RETIRED_AT__','poll.rs','retired_at'),('__RETIRED_FLIGHT__','poll.rs','retired_flight'),('__RETIRED_FLIGHT_CLASSES__','poll.rs','retired_flight_classes'),('__RETIRED_SNAPSHOT__','poll.rs','retired_snapshot'),('__RETIRED_SNAPSHOT_AT__','poll.rs','retired_snapshot_at')]:

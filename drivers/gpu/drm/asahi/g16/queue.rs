@@ -48,8 +48,8 @@ pub(crate) struct QueueState {
     /// Host priority: `DRM_ASAHI_PRIORITY_REALTIME - priority` as `file.rs` passes it (MEDIUM 2,
     /// LOW 3; `file.rs` refuses HIGH and REALTIME). Smaller is served first.
     pub(crate) priority: u32,
-    /// Completed stage time of the DRM file that created this queue (deduplicated per lane).
-    pub(crate) usage: Arc<crate::usage::Lane<Arc<crate::usage::Client>>>,
+    /// Completed stage time of the DRM file that created this queue (deduplicated per file).
+    pub(crate) usage: Arc<crate::usage::Client>,
     /// USC executable window base.
     pub(crate) usc_base: u64,
     /// First cancelled accepted ordinal per engine; zero means none. Later scheduler
@@ -164,7 +164,6 @@ impl Queue {
             return Err(EIO);
         }
         let credit = QueueCredit::acquire(&usage)?;
-        let usage = Arc::new(crate::usage::Lane::new(usage), GFP_KERNEL)?;
         let timeline = Timeline::new()?;
         let scheduler = Scheduler::new(&gpu.shared.dev)?;
         let state = Arc::new(
