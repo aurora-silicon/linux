@@ -167,6 +167,20 @@ config APPLE_TUNABLE
 	tristate
 	depends on ARCH_APPLE || COMPILE_TEST
 
+config APPLE_TUNABLE_KUNIT_TEST
+	tristate "KUnit tests for Apple Silicon hardware tunables" if !KUNIT_ALL_TESTS
+	depends on KUNIT && ARM64 && OF
+	depends on ARCH_APPLE || COMPILE_TEST
+	select APPLE_TUNABLE
+	default KUNIT_ALL_TESTS
+	help
+	  Parse tunable properties from a device node built by the test and
+	  apply them to a buffer of kernel memory: the triplet decoding, the
+	  length, alignment and bounds checks, and the mask and value
+	  arithmetic. The tests touch no hardware.
+
+	  If unsure, say N.
+
 config RUST_APPLE_MAILBOX
 	bool
 	depends on PM
