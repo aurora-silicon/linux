@@ -440,6 +440,7 @@ struct bcm4377_transfer_ring {
 	size_t mapped_payload_size;
 	u8 completion_ring;
 	u16 n_entries;
+	u16 head;
 	u8 generation;
 
 	bool sync;
@@ -671,6 +672,19 @@ static void bcm4377_ring_doorbell(struct bcm4377_data *bcm4377, u8 doorbell,
 	iowrite32(db, bcm4377->bar0 + BCM4377_BAR0_DOORBELL);
 }
 
+/*
+ * The producer index of a transfer ring is kept by the host. The copy in
+ * ring_state is shared with the device and only ever written here, never
+ * read back, so what the device writes there cannot move the slot the host
+ * fills next.
+ */
+static void bcm4377_set_xfer_head(struct bcm4377_data *bcm4377,
+				  struct bcm4377_transfer_ring *ring, u16 head)
+{
+	ring->head = head;
+	bcm4377->ring_state->xfer_ring_head[ring->ring_id] = cpu_to_le16(head);
+}
+
 static int bcm4377_extract_msgid(struct bcm4377_data *bcm4377,
 				 struct bcm4377_transfer_ring *ring,
 				 u16 raw_msgid, u8 *msgid)
@@ -739,9 +753,8 @@ static void bcm4377_handle_event(struct bcm4377_data *bcm4377,
 	hci_recv_frame(bcm4377->hdev, skb);
 
 out:
-	head = le16_to_cpu(bcm4377->ring_state->xfer_ring_head[ring->ring_id]);
-	head = (head + 1) % ring->n_entries;
-	bcm4377->ring_state->xfer_ring_head[ring->ring_id] = cpu_to_le16(head);
+	head = (ring->head + 1) % ring->n_entries;
+	bcm4377_set_xfer_head(bcm4377, ring, head);
 
 	bcm4377_ring_doorbell(bcm4377, ring->doorbell, head);
 
@@ -984,7 +997,7 @@ static int bcm4377_enqueue(struct bcm4377_data *bcm4377,
 
 	spin_lock_irqsave(&ring->lock, flags);
 
-	head = le16_to_cpu(bcm4377->ring_state->xfer_ring_head[ring->ring_id]);
+	head = ring->head;
 	tail = le16_to_cpu(bcm4377->ring_state->xfer_ring_tail[ring->ring_id]);
 
 	new_head = (head + 1) % ring->n_entries;
@@ -1041,8 +1054,7 @@ static int bcm4377_enqueue(struct bcm4377_data *bcm4377,
 	dev_dbg(&bcm4377->pdev->dev,
 		"updating head for transfer queue #%d to %d\n", ring->ring_id,
 		new_head);
-	bcm4377->ring_state->xfer_ring_head[ring->ring_id] =
-		cpu_to_le16(new_head);
+	bcm4377_set_xfer_head(bcm4377, ring, new_head);
 
 	if (!ring->sync)
 		bcm4377_ring_doorbell(bcm4377, ring->doorbell, new_head);
@@ -1147,7 +1159,7 @@ static int bcm4377_create_transfer_ring(struct bcm4377_data *bcm4377,
 	msg.flags = cpu_to_le16(flags);
 	msg.footer_size = ring->payload_size / 4;
 
-	bcm4377->ring_state->xfer_ring_head[ring->ring_id] = 0;
+	bcm4377_set_xfer_head(bcm4377, ring, 0);
 	bcm4377->ring_state->xfer_ring_tail[ring->ring_id] = 0;
 	ring->generation++;
 	spin_unlock_irqrestore(&ring->lock, spinlock_flags);
@@ -1180,8 +1192,7 @@ static int bcm4377_create_transfer_ring(struct bcm4377_data *bcm4377,
 	 * to reply by acknowledging them in the completion ring
 	 */
 	if (ring->virtual || ring->d2h_buffers_only) {
-		bcm4377->ring_state->xfer_ring_head[ring->ring_id] =
-			cpu_to_le16(0xf);
+		bcm4377_set_xfer_head(bcm4377, ring, 0xf);
 		bcm4377_ring_doorbell(bcm4377, ring->doorbell, 0xf);
 	}
 
@@ -1450,6 +1461,7 @@ static int bcm4377_pci_reset(struct bcm4377_data *bcm4377)
 	WRITE_ONCE(bcm4377->rti_status, 0);
 
 	memset(bcm4377->ring_state, 0, sizeof(*bcm4377->ring_state));
+	bcm4377->control_h2d_ring.head = 0;
 	bcm4377->control_h2d_ring.generation = 0;
 	bcm4377->control_ack_ring.enabled = false;
 	bitmap_zero(bcm4377->control_h2d_ring.msgids,
@@ -3397,3 +3409,7 @@ MODULE_FIRMWARE("brcm/brcmbt4387*.bin");
 MODULE_FIRMWARE("brcm/brcmbt4387*.ptb");
 MODULE_FIRMWARE("brcm/brcmbt4388*.bin");
 MODULE_FIRMWARE("brcm/brcmbt4388*.ptb");
+
+#if IS_ENABLED(CONFIG_BT_HCIBCM4377_KUNIT_TEST)
+#include "hci_bcm4377_test.c"
+#endif
