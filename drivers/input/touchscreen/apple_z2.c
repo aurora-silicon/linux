@@ -500,3 +500,7 @@ module_spi_driver(apple_z2_driver);
 MODULE_LICENSE("GPL");
 MODULE_FIRMWARE("apple/dfrmtfw-*.bin");
 MODULE_DESCRIPTION("Apple Z2 touchscreens driver");
+
+#if IS_ENABLED(CONFIG_TOUCHSCREEN_APPLE_Z2_KUNIT_TEST)
+#include "apple_z2-test.c"
+#endif
