@@ -82,8 +82,49 @@ static void bcm4377_enqueue_uses_host_head_test(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, buf[ring->n_entries * slot + i], 0);
 }
 
+/*
+ * An event whose payload sits in the completion entry's footer can be no
+ * longer than that footer; a longer one is dropped and the ring moves on.
+ */
+static void bcm4377_footer_event_len_test(struct kunit *test)
+{
+	static const u32 lens[] = { 9, 0xfffffff8, 0xffffffff, 8 };
+	struct bcm4377_test_ctx *ctx = test->priv;
+	struct bcm4377_data *bcm4377 = ctx->bcm4377;
+	struct bcm4377_transfer_ring *ring = &bcm4377->hci_d2h_ring;
+	struct bcm4377_completion_ring_entry *entry;
+	struct bcm4377_completion_ring cring = {
+		.ring_id = BCM4377_EVENT_RING_HCI_ACL,
+		.payload_size = 8,
+		.n_entries = 2,
+		.transfer_rings = BIT(BCM4377_XFER_RING_HCI_D2H),
+	};
+	size_t i;
+
+	ring->ring_id = BCM4377_XFER_RING_HCI_D2H;
+	ring->n_entries = 8;
+	ring->virtual = true;
+	ring->enabled = true;
+	spin_lock_init(&ring->lock);
+	/* Room past the footer, so a missing check reads this, not a neighbour. */
+	cring.ring = kunit_kzalloc(test, 2 * (sizeof(*entry) + cring.payload_size) + 64,
+				   GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, cring.ring);
+	entry = cring.ring;
+	entry->ring_id = cpu_to_le16(BCM4377_XFER_RING_HCI_D2H);
+	entry->flags = BCM4377_XFER_RING_FLAG_PAYLOAD_IN_FOOTER;
+
+	/* No HCI device: an accepted frame is freed by hci_recv_frame(). */
+	for (i = 0; i < ARRAY_SIZE(lens); i++) {
+		entry->len = cpu_to_le32(lens[i]);
+		bcm4377_handle_completion(bcm4377, &cring, 0);
+		KUNIT_EXPECT_EQ(test, ring->head, i + 1);
+	}
+}
+
 static struct kunit_case bcm4377_test_cases[] = {
 	KUNIT_CASE(bcm4377_enqueue_uses_host_head_test),
+	KUNIT_CASE(bcm4377_footer_event_len_test),
 	{}
 };
 

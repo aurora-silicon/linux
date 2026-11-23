@@ -713,7 +713,7 @@ static int bcm4377_extract_msgid(struct bcm4377_data *bcm4377,
 static void bcm4377_handle_event(struct bcm4377_data *bcm4377,
 				 struct bcm4377_transfer_ring *ring,
 				 u16 raw_msgid, u8 entry_flags, u8 type,
-				 void *payload, size_t len)
+				 void *payload, size_t len, size_t footer_size)
 {
 	struct sk_buff *skb;
 	u16 head;
@@ -742,6 +742,12 @@ static void bcm4377_handle_event(struct bcm4377_data *bcm4377,
 		}
 
 		payload = ring->payloads + msgid * ring->mapped_payload_size;
+	} else if (len > footer_size) {
+		/* The payload is in the completion entry's footer. */
+		dev_warn(&bcm4377->pdev->dev,
+			 "invalid footer payload len in event for ring %d: %zu > %zu\n",
+			 ring->ring_id, len, footer_size);
+		goto out;
 	}
 
 	skb = bt_skb_alloc(len, GFP_ATOMIC);
@@ -844,17 +850,17 @@ static void bcm4377_handle_completion(struct bcm4377_data *bcm4377,
 	case BCM4377_XFER_RING_HCI_D2H:
 		bcm4377_handle_event(bcm4377, &bcm4377->hci_d2h_ring, msg_id,
 				     entry->flags, HCI_EVENT_PKT, data,
-				     data_len);
+				     data_len, ring->payload_size);
 		break;
 	case BCM4377_XFER_RING_SCO_D2H:
 		bcm4377_handle_event(bcm4377, &bcm4377->sco_d2h_ring, msg_id,
 				     entry->flags, HCI_SCODATA_PKT, data,
-				     data_len);
+				     data_len, ring->payload_size);
 		break;
 	case BCM4377_XFER_RING_ACL_D2H:
 		bcm4377_handle_event(bcm4377, &bcm4377->acl_d2h_ring, msg_id,
 				     entry->flags, HCI_ACLDATA_PKT, data,
-				     data_len);
+				     data_len, ring->payload_size);
 		break;
 
 	default:
