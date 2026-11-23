@@ -1116,6 +1116,31 @@ struct afk_compact_reply {
 	u8 data[];
 };
 
+/*
+ * Replies wait on the transmit queue for ring space that only the firmware
+ * frees, while the receive worker keeps taking calls, so what is queued
+ * needs a limit of its own. One message is at most AFK_COMPACT_MESSAGE_MAX
+ * bytes and the receive side assembles one at a time; the queued replies
+ * together get the same room. A reply is never larger than its call, so
+ * any single call fits when nothing else is queued, and the calls the
+ * firmware makes are a small fraction of that even in a burst.
+ */
+static bool afk_compact_reply_reserve(struct apple_dcp_afkep *ep, size_t size)
+{
+	guard(spinlock_irqsave)(&ep->lock);
+	if (size > AFK_COMPACT_MESSAGE_MAX ||
+	    ep->compact_reply_bytes > AFK_COMPACT_MESSAGE_MAX - size)
+		return false;
+	ep->compact_reply_bytes += size;
+	return true;
+}
+
+static void afk_compact_reply_release(struct apple_dcp_afkep *ep, size_t size)
+{
+	guard(spinlock_irqsave)(&ep->lock);
+	ep->compact_reply_bytes -= size;
+}
+
 static void afk_compact_reply_worker(struct work_struct *work)
 {
 	struct afk_compact_reply *r = container_of(work, struct afk_compact_reply, work);
@@ -1131,6 +1156,7 @@ static void afk_compact_reply_worker(struct work_struct *work)
 		guard(spinlock_irqsave)(&r->ep->lock);
 		r->ep->sleep_poisoned = true;
 	}
+	afk_compact_reply_release(r->ep, r->size);
 	atomic_dec_return_release(&r->ep->sleep_jobs);
 	kvfree(r);
 }
@@ -1167,9 +1193,17 @@ static void afk_recv_handle_compact_call(struct apple_dcp_afkep *ep,
 	group = le16_to_cpu(call->group);
 	command = le32_to_cpu(call->command);
 
-	r = kvzalloc(struct_size(r, data, payload_size), GFP_KERNEL);
-	if (!r)
+	if (!afk_compact_reply_reserve(ep, payload_size)) {
+		dev_warn_ratelimited(ep->dcp->dev,
+				     "AFK[ep:%02x]: too many replies queued, dropping compact service %u call %u:%u\n",
+				     ep->endpoint, channel, group, command);
 		return;
+	}
+	r = kvzalloc(struct_size(r, data, payload_size), GFP_KERNEL);
+	if (!r) {
+		afk_compact_reply_release(ep, payload_size);
+		return;
+	}
 	INIT_WORK(&r->work, afk_compact_reply_worker);
 	r->ep = ep;
 	r->channel = channel;
