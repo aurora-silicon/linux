@@ -733,13 +733,6 @@ static int avd_probe(struct platform_device *pdev)
 		return ret;
 
 	avd->domain = iommu_get_domain_for_dev(avd->dev);
-	if (avd->domain) {
-		avd->empty_domain = iommu_paging_domain_alloc(avd->dev);
-		if (IS_ERR(avd->empty_domain)) {
-			avd->empty_domain = NULL;
-			dev_warn(avd->dev, "cannot alloc new empty domain");
-		}
-	}
 
 	ret = avd_backend_select(avd);
 	if (ret)
@@ -782,6 +775,13 @@ static int avd_probe(struct platform_device *pdev)
 		if (ret)
 			return ret;
 	}
+	if (avd->domain) {
+		avd->empty_domain = iommu_paging_domain_alloc(avd->dev);
+		if (IS_ERR(avd->empty_domain)) {
+			avd->empty_domain = NULL;
+			dev_warn(avd->dev, "cannot alloc new empty domain");
+		}
+	}
 	avd_pm_enable(avd);
 
 	/*
@@ -809,6 +809,9 @@ static int avd_probe(struct platform_device *pdev)
 err_disable_runtime_pm:
 	pm_runtime_dont_use_autosuspend(&pdev->dev);
 	pm_runtime_disable(&pdev->dev);
+	cancel_delayed_work_sync(&avd->queue_work);
+	if (avd->empty_domain)
+		iommu_domain_free(avd->empty_domain);
 	return ret;
 }
 
