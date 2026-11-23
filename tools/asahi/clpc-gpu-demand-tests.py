@@ -441,6 +441,24 @@ static void check_t8140_ane(void) {
  jiffies=1040; apple_clpc_sample(&c); assert(published==0 && queued_idle);
 }
 
+// T6050 ANE work holds DCS 6 and fabric 2 while it runs (and keeps on-time
+// idle sampling), sees a sub-sample request once, and releases after HOLD_MS.
+static void check_t6050_ane(void) {
+ struct apple_clpc_ane ane={0};
+ struct apple_clpc c={.hw=&apple_clpc_hw_t6050,.agent=1,.mask=3,.ane=&ane};
+ c.ane_states[APPLE_CLPC_DCS]=c.hw->ane[APPLE_CLPC_DCS];
+ c.ane_states[APPLE_CLPC_SOC]=c.hw->ane[APPLE_CLPC_SOC];
+ assert(c.hw->ane[APPLE_CLPC_DCS]==6 && c.hw->ane[APPLE_CLPC_SOC]==2 && c.hw->idle_on_time);
+ read_error=vote_error=0; pmgr_status=0; pmp_floor=0; jiffies=3000; published=~0u;
+ apple_clpc_sample(&c); assert(published==0 && c.last_reason==0);
+ ane.active=true; jiffies=3004; apple_clpc_sample(&c);
+ assert(published==0x26 && c.last_reason==32);
+ ane.active=false; ane.pending=true; jiffies=3008; apple_clpc_sample(&c);
+ assert(published==0x26 && c.last_reason==32 && !ane.pending);
+ jiffies=3012; apple_clpc_sample(&c); assert(published==0x26 && c.last_reason==16);
+ jiffies=3040; apple_clpc_sample(&c); assert(published==0 && c.last_reason==0 && queued_idle);
+}
+
 // T6040 ANE work also holds the second P cluster at its qualified frequency,
 // added on first use, for the vote hold after the last request, then drops it.
 static void check_t6040_ane(void) {
@@ -752,6 +770,7 @@ int main(void) {
  check_t8140();
  check_t8140_dense();
  check_t8140_ane();
+ check_t6050_ane();
  check_low_power();
  check_t6040_ane();
  puts("PASS: T6040, T6041 and T8132 host demand; DT GPU busy share and down-step hold; T8140/T604x ANE, streaming, dense work, read errors and PMP backoff; idle release");
