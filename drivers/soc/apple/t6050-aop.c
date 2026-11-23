@@ -220,15 +220,17 @@ static void t6050_aop_recv(void *cookie, u8 ep, u64 msg)
 	case AFK_INIT_TX:
 		r->tx_off = FIELD_GET(AFK_RING_OFFSET, msg) << AFK_BLOCK_SHIFT;
 		r->tx_size = FIELD_GET(AFK_RING_SIZE, msg) << AFK_BLOCK_SHIFT;
-		r->tx_ready = true;
+		WRITE_ONCE(r->tx_ready, true);
 		break;
 	case AFK_INIT_RX:
 		r->rx_off = FIELD_GET(AFK_RING_OFFSET, msg) << AFK_BLOCK_SHIFT;
 		r->rx_size = FIELD_GET(AFK_RING_SIZE, msg) << AFK_BLOCK_SHIFT;
-		r->rx_ready = true;
+		WRITE_ONCE(r->rx_ready, true);
 		t6050_aop_send(aop, ep, FIELD_PREP(AFK_TYPE, AFK_START));
 		break;
 	case AFK_START_ACK:
+		/* Started again from a GETBUF: no sleep element of the last setup is pending. */
+		r->closed = false;
 		set_bit(ep - AOP_EP_FIRST, &aop->opened);
 		break;
 	case AFK_RING:
@@ -304,7 +306,7 @@ static int t6050_aop2_put(struct t6050_aop *aop, u8 ep, const u32 *msg, unsigned
 	__le32 *qe;
 	int ret;
 
-	ret = t6050_aop2_view(r, r->tx_off, r->tx_size, r->tx_ready, &v);
+	ret = t6050_aop2_view(r, r->tx_off, r->tx_size, READ_ONCE(r->tx_ready), &v);
 	if (ret)
 		return ret;
 	dma_rmb();
@@ -361,7 +363,7 @@ static int t6050_aop2_rx_wptr(struct t6050_aop *aop, u8 ep)
 	struct t6050_aop_view v;
 	u32 wptr;
 
-	if (t6050_aop2_view(r, r->rx_off, r->rx_size, r->rx_ready, &v))
+	if (t6050_aop2_view(r, r->rx_off, r->rx_size, READ_ONCE(r->rx_ready), &v))
 		return -EINVAL;
 	dma_rmb();
 	wptr = t6050_aop2_ptr(&v, AFK_PTR_WRITE);
@@ -396,8 +398,8 @@ static int t6050_aop2_take(struct t6050_aop *aop, u8 ep, u32 old, u32 new)
 	struct t6050_aop_view v;
 	int code;
 
-	if (t6050_aop2_view(r, r->rx_off, r->rx_size, r->rx_ready, &v) || old >= v.bufsz ||
-	    new >= v.bufsz)
+	if (t6050_aop2_view(r, r->rx_off, r->rx_size, READ_ONCE(r->rx_ready), &v) ||
+	    old >= v.bufsz || new >= v.bufsz)
 		return -EINVAL;
 	if (old == new)
 		return -ENOMSG;
