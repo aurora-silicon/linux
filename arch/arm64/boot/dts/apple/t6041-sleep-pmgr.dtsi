@@ -471,7 +471,8 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "apcie_phy_sw";
-		power-domains = <&ps_apcie_sys_st0>, <&ps_apcie_sys_st1>;
+		power-domains = <&ps_apcie_sys_st0>, <&ps_apcie_sys_st1>,
+				<&ps_apcie_sys_gp>;
 		status = "disabled";
 	};
 

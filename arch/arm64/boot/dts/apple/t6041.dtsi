@@ -581,9 +581,9 @@
 					  <&ps_i2c3>, <&ps_i2c2>, <&ps_i2c1>, <&ps_i2c0>,
 					  <&ps_fpwm2>, <&ps_fpwm1>, <&ps_fpwm0>, <&ps_dpa4>,
 					  <&ps_dpa3>, <&ps_dpa2>, <&ps_dpa1>, <&ps_dpa0>,
-					  <&ps_avd_sys>, <&ps_apcie_st1>, <&ps_apcie_st0>,
-					  <&ps_apcie_gp>, <&ps_ap_tmm>, <&ps_ans>, <&ps_ane_sys>,
-					  <&ps_afr>;
+					  <&ps_avd_sys>, <&ps_ans>, <&ps_apcie_st1>,
+					  <&ps_apcie_st0>, <&ps_apcie_gp>, <&ps_ap_tmm>,
+					  <&ps_ane_sys>, <&ps_afr>;
 		apple,atc-off-domains = <&ps_atc0_phymxwrap>, <&ps_atc1_phymxwrap>,
 					<&ps_atc2_phymxwrap>, <&ps_atc3_phymxwrap>,
 					<&ps_atc0_usb>, <&ps_atc1_usb>,

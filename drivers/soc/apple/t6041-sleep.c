@@ -31,6 +31,7 @@
 #include <linux/smp.h>
 #include <linux/soc/apple/sleep.h>
 #include <linux/soc/apple/tunable.h>
+#include <linux/string.h>
 #include <linux/suspend.h>
 #include <linux/time64.h>
 #include <asm/arch_timer.h>
@@ -139,8 +140,10 @@ struct t6041_sleep {
 	void __iomem **ps_atc_off;
 	unsigned int n_atc_off;
 	void __iomem **ps_auto;
+	unsigned long *ps_auto_mem;
 	unsigned int n_auto;
 	void __iomem **ps_auto_clkgate;
+	unsigned long *ps_auto_clkgate_mem;
 	unsigned int n_auto_clkgate;
 	void __iomem **ps_auto_active;
 	unsigned int n_auto_active;
@@ -359,15 +362,17 @@ static void cpm_gates(struct t6041_sleep *s)
 	writel(0x80000000, s->pwrgate + 0x110);
 }
 
-static void t6041_ps_match_list(void __iomem *const *regs, unsigned int count,
-				u32 mask, u32 want, bool skip_fused)
+static void t6041_ps_match_list(void __iomem *const *regs,
+				const unsigned long *may_be_fused,
+				unsigned int count, u32 mask, u32 want)
 {
 	unsigned int i;
 
 	for (i = 0; i < count; i++) {
 		u32 now = readl(regs[i]);
 
-		if (skip_fused && !(now & (PS_TARGET | PS_ACTUAL)))
+		if (may_be_fused && test_bit(i, may_be_fused) &&
+		    !(now & (PS_TARGET | PS_ACTUAL)))
 			continue;
 		if ((now & mask) != want)
 			writel((now & ~mask) | want, regs[i]);
@@ -376,24 +381,24 @@ static void t6041_ps_match_list(void __iomem *const *regs, unsigned int count,
 
 /*
  * Put every matched PS word into its macOS commit mode: hardware AUTO (off,
- * clock-gated, or active) or manual active. Fused-off channel words read 0
- * for both target and actual on binned parts and are skipped uniformly.
+ * clock-gated, or active) or manual active. Only fused-off AMCC/DCS channel
+ * slices on 24-channel binned parts (reading 0 for both target and actual)
+ * are skipped; idle non-channel domains such as fab6_soc must still enter
+ * hardware AUTO.
  */
 static void t6041_ps_match_all(struct t6041_sleep *s)
 {
 	const u32 auto_mask = PS_TARGET | PS_AUTO_ENABLE | PS_AUTO_STATE;
 
-	t6041_ps_match_list(s->ps_auto, s->n_auto, auto_mask,
-			    PS_TARGET | PS_AUTO_ENABLE | FIELD_PREP(PS_AUTO_STATE, 0),
-			    true);
-	t6041_ps_match_list(s->ps_auto_clkgate, s->n_auto_clkgate, auto_mask,
-			    PS_TARGET | PS_AUTO_ENABLE | FIELD_PREP(PS_AUTO_STATE, 4),
-			    true);
-	t6041_ps_match_list(s->ps_auto_active, s->n_auto_active, auto_mask,
-			    PS_TARGET | PS_AUTO_ENABLE | FIELD_PREP(PS_AUTO_STATE, 0xf),
-			    false);
-	t6041_ps_match_list(s->ps_keep_on, s->n_keep_on,
-			    PS_TARGET | PS_AUTO_ENABLE, PS_TARGET, false);
+	t6041_ps_match_list(s->ps_auto, s->ps_auto_mem, s->n_auto, auto_mask,
+			    PS_TARGET | PS_AUTO_ENABLE | FIELD_PREP(PS_AUTO_STATE, 0));
+	t6041_ps_match_list(s->ps_auto_clkgate, s->ps_auto_clkgate_mem,
+			    s->n_auto_clkgate, auto_mask,
+			    PS_TARGET | PS_AUTO_ENABLE | FIELD_PREP(PS_AUTO_STATE, 4));
+	t6041_ps_match_list(s->ps_auto_active, NULL, s->n_auto_active, auto_mask,
+			    PS_TARGET | PS_AUTO_ENABLE | FIELD_PREP(PS_AUTO_STATE, 0xf));
+	t6041_ps_match_list(s->ps_keep_on, NULL, s->n_keep_on,
+			    PS_TARGET | PS_AUTO_ENABLE, PS_TARGET);
 }
 
 static void t6041_cpu_off(u64 mpidr)
@@ -424,34 +429,47 @@ static void __noreturn t6041_boot_wfi(struct t6041_sleep *s)
 }
 
 /*
- * Raise each present core and CPM PS word to on, then drop its target to 0
- * so the hardware drops PS_ACTUAL when the core enters deep WFI.
+ * Raise each present core and all three CPM PS words to on, then drop their
+ * targets to 0 so the hardware drops PS_ACTUAL when each core and cluster
+ * enters deep WFI. Clear any stray target/auto bits on absent/fused-off cores
+ * (e.g. pcpu0_5 / pcpu1_5 on 14-core binned parts) without raising them.
  */
 static void t6041_cpu_ps_match(struct t6041_sleep *s)
 {
+	const u32 cpu_clear = PS_TARGET | PS_AUTO_ENABLE | PS_AUTO_STATE;
+	DECLARE_BITMAP(present, T6041_CPU_COUNT);
 	unsigned int cpu, i;
 	u32 v;
 
+	bitmap_zero(present, T6041_CPU_COUNT);
 	for_each_present_cpu(cpu) {
-		void __iomem *reg = s->ps_cpu[t6041_cpu_id(cpu_logical_map(cpu))];
+		unsigned int id = t6041_cpu_id(cpu_logical_map(cpu));
+		void __iomem *reg = s->ps_cpu[id];
 
+		__set_bit(id, present);
 		v = readl(reg);
-		writel((v & ~(PS_TARGET | PS_AUTO_ENABLE)) | PS_TARGET, reg);
+		writel((v & ~cpu_clear) | PS_TARGET, reg);
 		t6041_poll_until_us(reg, v, FIELD_GET(PS_ACTUAL, v) == 0xf, 2000);
 	}
-	for (i = 0; i < 2; i++) {
+	for (i = 0; i < T6041_CPM_COUNT; i++) {
 		void __iomem *reg = s->ps_cpm[i];
 
 		v = readl(reg);
-		writel((v & ~(PS_TARGET | PS_AUTO_ENABLE)) | PS_TARGET, reg);
+		writel((v & ~cpu_clear) | PS_TARGET, reg);
 		t6041_poll_until_us(reg, v, FIELD_GET(PS_ACTUAL, v) == 0xf, 2000);
 	}
-	for_each_present_cpu(cpu) {
-		void __iomem *reg = s->ps_cpu[t6041_cpu_id(cpu_logical_map(cpu))];
+	for (i = 0; i < T6041_CPU_COUNT; i++) {
+		void __iomem *reg = s->ps_cpu[i];
 
-		writel(readl(reg) & ~PS_TARGET, reg);
+		if (test_bit(i, present)) {
+			writel(readl(reg) & ~PS_TARGET, reg);
+		} else {
+			v = readl(reg);
+			if (v & cpu_clear)
+				writel(v & ~cpu_clear, reg);
+		}
 	}
-	for (i = 0; i < 2; i++) {
+	for (i = 0; i < T6041_CPM_COUNT; i++) {
 		void __iomem *reg = s->ps_cpm[i];
 
 		writel(readl(reg) & ~PS_TARGET, reg);
@@ -799,6 +817,11 @@ static int t6041_sleep_commit(unsigned long unused)
 	if (t6041_poll_until_us(s->spmi + SPMI_STATUS, v,
 				(v & SPMI_IDLE) == SPMI_IDLE, 5000))
 		s->spmi_late++;
+	/*
+	 * Keep SPMI quiet before clearing keep-alive tables and committing
+	 * sleep, matching macOS and the sleep engine's bus handoff window.
+	 */
+	t6041_spin_us(20000);
 	/* Keep-alive tables off right before commit. */
 	for (i = 0; i < KA_WORDS; i++) {
 		writel(0, s->ka[0] + i * KA_STRIDE);
@@ -1483,9 +1506,9 @@ struct t6041_topo_ctx {
 	struct device *dev;
 	struct device_node *const *nodes;
 	unsigned int n;
-	u8 *state;
-	unsigned int *order;
-	unsigned int out;
+	unsigned int stride;
+	unsigned long *adj;
+	unsigned int *indeg;
 };
 
 static int t6041_topo_find(const struct t6041_topo_ctx *ctx,
@@ -1515,46 +1538,55 @@ static int t6041_ps_parent(struct device_node *np, int index,
 	return 0;
 }
 
-static int t6041_topo_visit(struct t6041_topo_ctx *ctx, struct device_node *np,
-			    unsigned int depth)
+static int t6041_topo_add_ancestors(struct t6041_topo_ctx *ctx, unsigned int src,
+				    struct device_node *np, unsigned int depth)
 {
-	int idx = t6041_topo_find(ctx, np);
 	struct device_node *parent;
 	int k, ret;
 
-	if (idx >= 0) {
-		if (ctx->state[idx] == 2)
-			return 0;
-		if (ctx->state[idx] == 1) {
-			dev_err(ctx->dev, "PMGR power-domain cycle involving %pOF\n", np);
-			return -EINVAL;
-		}
-		ctx->state[idx] = 1;
-	}
 	if (depth >= T6041_PS_MAX_DEPTH) {
 		dev_err(ctx->dev, "PMGR power-domain hierarchy too deep or cyclic at %pOF\n", np);
 		return -EINVAL;
 	}
 
 	for (k = 0; ; k++) {
+		int idx;
+
 		ret = t6041_ps_parent(np, k, &parent);
 		if (ret == -ENOENT)
 			break;
 		if (ret)
 			return ret;
-		ret = t6041_topo_visit(ctx, parent, depth + 1);
-		of_node_put(parent);
-		if (ret)
-			return ret;
-	}
 
-	if (idx >= 0) {
-		ctx->state[idx] = 2;
-		ctx->order[ctx->out++] = idx;
+		idx = t6041_topo_find(ctx, parent);
+		if (idx == (int)src) {
+			dev_err(ctx->dev, "PMGR power-domain cycle involving %pOF\n", parent);
+			of_node_put(parent);
+			return -EINVAL;
+		}
+		if (idx >= 0) {
+			if (!__test_and_set_bit(idx, ctx->adj + (size_t)src * ctx->stride))
+				ctx->indeg[idx]++;
+		} else {
+			ret = t6041_topo_add_ancestors(ctx, src, parent, depth + 1);
+			if (ret) {
+				of_node_put(parent);
+				return ret;
+			}
+		}
+		of_node_put(parent);
 	}
 	return 0;
 }
 
+/*
+ * Stable (input-order-preserving) Kahn's topological sort on DT power-domains
+ * edges (child -> parent). For child-first (shutdown), pick the lowest-index
+ * ready node forward; for parent-first (restore), run the same child-first
+ * pass in reverse index order and reverse the output so edge-free nodes later
+ * in the list (such as auto-managed DCS domains after AMCCs) stay after
+ * earlier nodes whose ancestors are resolved later.
+ */
 static int t6041_topo_sort(struct device *dev, struct device_node *const *nodes,
 			   unsigned int n, unsigned int *order, bool child_first)
 {
@@ -1562,35 +1594,64 @@ static int t6041_topo_sort(struct device *dev, struct device_node *const *nodes,
 		.dev = dev,
 		.nodes = nodes,
 		.n = n,
-		.order = order,
+		.stride = BITS_TO_LONGS(n),
 	};
-	unsigned int i;
+	unsigned long *emitted = NULL;
+	unsigned int i, step;
 	int ret = 0;
 
 	if (!n)
 		return 0;
 
-	ctx.state = kcalloc(n, sizeof(*ctx.state), GFP_KERNEL);
-	if (!ctx.state)
-		return -ENOMEM;
+	ctx.adj = kcalloc((size_t)n * ctx.stride, sizeof(*ctx.adj), GFP_KERNEL);
+	ctx.indeg = kcalloc(n, sizeof(*ctx.indeg), GFP_KERNEL);
+	emitted = bitmap_zalloc(n, GFP_KERNEL);
+	if (!ctx.adj || !ctx.indeg || !emitted) {
+		ret = -ENOMEM;
+		goto out;
+	}
 
 	for (i = 0; i < n; i++) {
-		if (ctx.state[i])
-			continue;
-		ret = t6041_topo_visit(&ctx, nodes[i], 0);
+		ret = t6041_topo_add_ancestors(&ctx, i, nodes[i], 0);
 		if (ret)
-			break;
+			goto out;
 	}
 
-	kfree(ctx.state);
-	if (ret)
-		return ret;
+	for (step = 0; step < n; step++) {
+		unsigned int pick, next;
+		bool found = false;
 
-	if (child_first) {
-		for (i = 0; i < n / 2; i++)
-			swap(order[i], order[n - 1 - i]);
+		if (child_first) {
+			for (pick = 0; pick < n; pick++) {
+				if (!test_bit(pick, emitted) && !ctx.indeg[pick]) {
+					found = true;
+					break;
+				}
+			}
+		} else {
+			for (pick = n; pick-- > 0; ) {
+				if (!test_bit(pick, emitted) && !ctx.indeg[pick]) {
+					found = true;
+					break;
+				}
+			}
+		}
+		if (!found) {
+			dev_err(dev, "PMGR power-domain cycle detected\n");
+			ret = -EINVAL;
+			goto out;
+		}
+		__set_bit(pick, emitted);
+		order[child_first ? step : n - 1 - step] = pick;
+		for_each_set_bit(next, ctx.adj + (size_t)pick * ctx.stride, n)
+			ctx.indeg[next]--;
 	}
-	return 0;
+
+out:
+	bitmap_free(emitted);
+	kfree(ctx.indeg);
+	kfree(ctx.adj);
+	return ret;
 }
 
 static bool t6041_node_in_list(struct device_node *const *list, unsigned int n,
@@ -1612,10 +1673,20 @@ struct t6041_restore_acc {
 	unsigned int n_exclude;
 };
 
+static bool t6041_ps_is_mem_channel(const struct device_node *np)
+{
+	const char *label;
+
+	if (of_property_read_string(np, "label", &label))
+		return false;
+	return str_has_prefix(label, "amcc") || str_has_prefix(label, "dcs_");
+}
+
 static int t6041_parse_ps_list(struct t6041_ps_resolver *r, const char *prop,
 			       bool topo_child_first,
 			       void __iomem ***out_regs,
 			       unsigned int *out_count,
+			       unsigned long **out_mem_mask,
 			       struct t6041_restore_acc *acc)
 {
 	struct device *dev = r->dev;
@@ -1623,6 +1694,7 @@ static int t6041_parse_ps_list(struct t6041_ps_resolver *r, const char *prop,
 	struct device_node **nodes;
 	void __iomem **regs;
 	void __iomem **dst;
+	unsigned long *mem_mask = NULL;
 	unsigned int *order = NULL;
 	unsigned int i, uniq = 0;
 	int count, ret = 0;
@@ -1685,6 +1757,20 @@ static int t6041_parse_ps_list(struct t6041_ps_resolver *r, const char *prop,
 		memcpy(dst, regs, uniq * sizeof(*dst));
 	}
 
+	if (out_mem_mask) {
+		mem_mask = devm_bitmap_zalloc(dev, uniq, GFP_KERNEL);
+		if (!mem_mask) {
+			ret = -ENOMEM;
+			goto out_put;
+		}
+		for (i = 0; i < uniq; i++) {
+			struct device_node *entry = topo_child_first ? nodes[order[i]] : nodes[i];
+
+			if (t6041_ps_is_mem_channel(entry))
+				__set_bit(i, mem_mask);
+		}
+	}
+
 	for (i = 0; i < uniq; i++) {
 		if (t6041_node_in_list(acc->exclude, acc->n_exclude, nodes[i]))
 			continue;
@@ -1697,6 +1783,8 @@ static int t6041_parse_ps_list(struct t6041_ps_resolver *r, const char *prop,
 
 	*out_regs = dst;
 	*out_count = uniq;
+	if (out_mem_mask)
+		*out_mem_mask = mem_mask;
 
 out_put:
 	kfree(order);
@@ -1811,27 +1899,28 @@ static int t6041_map_ps_domains(struct t6041_sleep *s)
 	 * ps_restore.
 	 */
 	ret = t6041_parse_ps_list(&r, "apple,sleep-auto-domains", false,
-				  &s->ps_auto, &s->n_auto, &acc);
+				  &s->ps_auto, &s->n_auto, &s->ps_auto_mem, &acc);
 	if (ret)
 		goto out;
 	ret = t6041_parse_ps_list(&r, "apple,sleep-auto-active-domains", false,
-				  &s->ps_auto_active, &s->n_auto_active, &acc);
+				  &s->ps_auto_active, &s->n_auto_active, NULL, &acc);
 	if (ret)
 		goto out;
 	ret = t6041_parse_ps_list(&r, "apple,sleep-auto-clkgate-domains", false,
-				  &s->ps_auto_clkgate, &s->n_auto_clkgate, &acc);
+				  &s->ps_auto_clkgate, &s->n_auto_clkgate,
+				  &s->ps_auto_clkgate_mem, &acc);
 	if (ret)
 		goto out;
 	ret = t6041_parse_ps_list(&r, "apple,sleep-keep-on-domains", false,
-				  &s->ps_keep_on, &s->n_keep_on, &acc);
+				  &s->ps_keep_on, &s->n_keep_on, NULL, &acc);
 	if (ret)
 		goto out;
 	ret = t6041_parse_ps_list(&r, "apple,atc-off-domains", false,
-				  &s->ps_atc_off, &s->n_atc_off, &acc);
+				  &s->ps_atc_off, &s->n_atc_off, NULL, &acc);
 	if (ret)
 		goto out;
 	ret = t6041_parse_ps_list(&r, "apple,sleep-off-domains", true,
-				  &s->ps_off, &s->n_off, &acc);
+				  &s->ps_off, &s->n_off, NULL, &acc);
 	if (ret)
 		goto out;
 
