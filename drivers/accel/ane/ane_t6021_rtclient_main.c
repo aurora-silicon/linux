@@ -95,6 +95,7 @@
 
 #include "ane_fw_platform.h"
 #include "ane_fw_cold.h"
+#include "ane_h16_accel.h"
 #include "ane_h16_protocol.h"
 #include "ane_h16_pending.h"
 #include "ane_h16_resources.h"
@@ -314,6 +315,11 @@ struct ane_rtclient {
 	struct ane_fw_transport *transport;
 	struct ane_legacy_buffer *transport_pool;
 	struct ane_fw_platform transport_regs;
+	/*
+	 * For a published table: the shared program session (H16/H17) on that
+	 * transport, behind the ABI 3 node, in place of the ABI 2 node.
+	 */
+	struct ane_h16_session *session;
 	struct ane_fw_channel channels[ANE_FW_CHANNELS];
 	u8 channel_snapshot[ANE_FW_TABLE_SIZE];
 	u64 channel_table_offset;
@@ -1013,7 +1019,11 @@ static int ane_rtclient_transport_init(struct ane_rtclient *ane)
 		if (!ane->transport)
 			return -ENOMEM;
 	}
-	slot = ane_rtclient_legacy_alloc(ane, SZ_16K);
+	/*
+	 * The command arena: startup, then the program session's LOAD and
+	 * CREATE records and EXECUTE batches, as on the H16/H17 cold boots.
+	 */
+	slot = ane_rtclient_legacy_alloc(ane, SZ_256K);
 	if (slot < 0)
 		return slot;
 	ane->transport_pool = &ane->legacy_buffers[slot];
@@ -1021,8 +1031,14 @@ static int ane_rtclient_transport_init(struct ane_rtclient *ane)
 		.cpu = ane->transport_pool->cpu, .dva = ane->transport_pool->dma,
 		.size = ane->transport_pool->size,
 	};
-	/* The mailbox the 13.5 rings use: doorbell, pending, acknowledge. */
+	/*
+	 * The mailbox the 13.5 rings use: doorbell, pending, acknowledge. Every
+	 * engine this driver binds is an H14 one; the program session takes
+	 * only H14 HWX objects on it.
+	 */
 	ane->transport_regs = (struct ane_fw_platform) {
+		.chip_family = 14,
+		.hwx_subtype = ANE_HWX_SUBTYPE_H14,
 		.doorbell = ANE_IPI_OFF,
 		.irq_status = ANE_IPI_OFF + 0x8000,
 		.irq_ack = ANE_IPI_OFF + 0xc000,
@@ -1038,6 +1054,92 @@ static int ane_rtclient_transport_init(struct ane_rtclient *ane)
 		dev_err(ane->dev, "27.x transport: %d (raised at ane_fw_transport.h:%u)\n",
 			ret, ane->transport->error_line);
 	return ret;
+}
+
+/*
+ * The program session's private mappings: coherent memory in the engine's
+ * DMA domain, like every other firmware-visible buffer of this device, out
+ * of the firmware's own alias range. Coherent, so no sync op is needed.
+ */
+static int ane_rtclient_session_map(void *ctx, size_t size, bool device_write,
+				    struct ane_fw_surface *surface)
+{
+	struct ane_rtclient *ane = ctx;
+	dma_addr_t dma;
+	void *cpu;
+
+	if (!size || !IS_ALIGNED(size, SZ_16K))
+		return -ENOSPC;
+	cpu = dma_alloc_coherent(ane->dev, size, &dma, GFP_KERNEL);
+	if (!cpu)
+		return -ENOMEM;
+	if (!IS_ALIGNED(dma, SZ_16K) ||
+	    (ane->fw && !ane_t6021_fw_alias_iova_ok(ane->fw, dma, size))) {
+		dma_free_coherent(ane->dev, size, cpu, dma);
+		return -ERANGE;
+	}
+	*surface = (struct ane_fw_surface) { .cpu = cpu, .dva = dma, .size = size };
+	return 0;
+}
+
+/* The session gives back only memory the firmware no longer uses. */
+static void ane_rtclient_session_unmap(void *ctx, const struct ane_fw_surface *surface)
+{
+	struct ane_rtclient *ane = ctx;
+
+	dma_free_coherent(ane->dev, surface->size, surface->cpu, surface->dva);
+}
+
+static void ane_rtclient_session_log(void *ctx, const char *item, u64 a, u64 b)
+{
+	struct ane_rtclient *ane = ctx;
+
+	dev_info(ane->dev, "27.x program: %s %#llx %#llx\n", item, a, b);
+}
+
+static const struct ane_h16_session_ops ane_rtclient_session_ops = {
+	.map = ane_rtclient_session_map,
+	.unmap = ane_rtclient_session_unmap,
+	.log = ane_rtclient_session_log,
+};
+
+/*
+ * After the 27.x startup: the shared program session on the transport the
+ * startup used, and its ABI 3 node. From here on the node serializes all
+ * firmware traffic; FREE stays admitted as during startup.
+ */
+static int ane_rtclient_session_register(struct ane_rtclient *ane)
+{
+	int ret;
+
+	ane->session = devm_kzalloc(ane->dev, sizeof(*ane->session), GFP_KERNEL);
+	if (!ane->session)
+		return -ENOMEM;
+	ret = ane_h16_session_init(ane->session, ane->transport, &ane_rtclient_session_ops,
+				   ane, 3 * NSEC_PER_SEC);
+	if (!ret)
+		ret = ane_h16_accel_register(ane->dev, ane->session);
+	if (ret)
+		dev_err(ane->dev, "27.x program session: %d\n", ret);
+	return ret;
+}
+
+/*
+ * System sleep parks a 27.x engine until reboot: from then on every request
+ * of the session fails instead of waiting on a stopped CPU.
+ */
+static void ane_rtclient_session_park(struct ane_rtclient *ane)
+{
+	struct ane_h16_session *s = ane->session;
+
+	if (!s || !s->lock)
+		return;
+	mutex_lock(s->lock);
+	if (!s->quarantined) {
+		s->error = -ESHUTDOWN;
+		s->quarantined = true;
+	}
+	mutex_unlock(s->lock);
 }
 
 /* Give every host-to-firmware slot to the host before the boot ACK. */
@@ -1994,8 +2096,8 @@ static int ane_rtclient_load_program(struct ane_rtclient *ane,
 
 	BUILD_BUG_ON(DRM_ANE_MAX_SECTIONS != ANE_T6021_LOAD_SEC_COUNT);
 	/*
-	 * 27.x LOAD takes the original HWX (the ABI 3 path), not the ABI 2
-	 * sections, and the H16 HWX path accepts no H14 program yet.
+	 * 27.x LOAD takes the original HWX through the ABI 3 node, not the
+	 * ABI 2 sections; that firmware gets no ABI 2 node.
 	 */
 	if (ane->fw_table) {
 		dev_info_once(ane->dev,
@@ -3959,6 +4061,7 @@ static int ane_rtclient_sleep_stop(void *ctx)
 	if (ane->fw_table) {
 		dev_info(ane->dev,
 			 "suspend: no restart for 27.x firmware yet; parked until reboot\n");
+		ane_rtclient_session_park(ane);
 		return ane_rtclient_sleep_park(ane);
 	}
 	rs = kzalloc_obj(*rs);
@@ -4595,6 +4698,18 @@ static int ane_rtclient_probe_inner(struct platform_device *pdev,
 		}
 	}
 
+	if (ane->fw_table) {
+		ret = ane_rtclient_session_register(ane);
+		if (ret)
+			goto err_pm_or_hold;
+		ane->registered = true;
+		dev_info(dev,
+			 "loaded ane_t6021 (27.x firmware; ABI 3 node; legacy_only=%u chman_ok=%u booted=%u; state %s)\n",
+			 legacy_only, ane->chman_ok, ane->fw ? ane->fw->booted : 0,
+			 ane->held ? "HELD" : "ready");
+		return 0;
+	}
+
 	{
 		struct ane_t6021_drm *adrm;
 		int drmret;
@@ -4627,9 +4742,6 @@ static int ane_rtclient_probe_inner(struct platform_device *pdev,
 			goto err_pm_or_hold;
 		}
 		WRITE_ONCE(ane_t6021_perf_ane, ane);
-		if (ane->fw_table)
-			dev_info(dev,
-				 "27.x firmware up; program load, create and execute are refused on it\n");
 		dev_info(dev,
 			 "loaded ane_t6021 (DRM major %d minor %d; ABI 2; legacy_only=%u chman_ok=%u booted=%u; state %s; BO cap %u MiB)\n",
 			 DRM_ANE_ABI_V2, 0,
