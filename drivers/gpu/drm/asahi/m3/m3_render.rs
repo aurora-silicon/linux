@@ -792,18 +792,19 @@ impl Render {
     }
     pub(crate) fn complete(&mut self)->Result<bool> {
         let recovered = self.recovery_aborted_draw == Some(self.draw);
-        for (stamp,fw,pointers,value,head) in [(s::TA_STAMP,s::TA_FW_STAMP,s::TA_POINTERS,self.stamp_epoch.value(s::STAMP_TA - 256,self.draw),self.heads[0]),
-            (s::FRAGMENT_STAMP,s::FRAGMENT_FW_STAMP,s::FRAGMENT_POINTERS,self.stamp_epoch.value(s::STAMP_FRAGMENT - 256,self.draw),self.heads[1])] {
+        for (stage,stamp,fw,pointers,value,head) in [(0usize,s::TA_STAMP,s::TA_FW_STAMP,s::TA_POINTERS,self.stamp_epoch.value(s::STAMP_TA - 256,self.draw),self.heads[0]),
+            (1usize,s::FRAGMENT_STAMP,s::FRAGMENT_FW_STAMP,s::FRAGMENT_POINTERS,self.stamp_epoch.value(s::STAMP_FRAGMENT - 256,self.draw),self.heads[1])] {
+            let allow_lagging_done = recovered && stage == 1;
             if self.objects[stamp].read_u32(0)?!=value || self.objects[fw].read_u32(0)?!=value
-                || (!recovered && self.objects[pointers].read_u32(queue::DONE)?!=u32::from(head))
+                || (!allow_lagging_done && self.objects[pointers].read_u32(queue::DONE)?!=u32::from(head))
                 || self.objects[pointers].read_u32(queue::READ)?!=u32::from(head) {return Ok(false);}
         }
         if self.profile==super::m3_profile::Profile::Extended && self.draw!=0 {
             for (idx, pool) in UMA_POOLS.iter().enumerate() {
                 let actual = self.objects[pool.manager].read_u64(0x54)?;
                 let expected = self.draw.saturating_sub(self.pool_delta[idx]);
-                if actual < expected {return Ok(false);}
-                if actual > expected && actual <= self.draw {
+                if actual < expected || actual > self.draw {return Ok(false);}
+                if actual > expected {
                     self.pool_delta[idx] = self.draw - actual;
                 }
             }

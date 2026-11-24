@@ -19,7 +19,7 @@ def method(source, signature):
 
 MOCKS = r"""
 use std::cell::Cell;
-use std::sync::{Mutex, atomic::{AtomicU8, Ordering}};
+use std::sync::{Mutex, atomic::{AtomicBool, AtomicU8, Ordering}};
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Error(i32);
 impl Error {
@@ -74,6 +74,7 @@ struct Packet<'a> {
     vm: &'a Vm,
     vm_job: JobGuard,
     finish_state: AtomicU8,
+    guard_pinned: AtomicBool,
     completion: Fence,
     commands: [(); 1],
 }
@@ -97,6 +98,7 @@ impl<'a> Packet<'a> {
             vm,
             vm_job: JobGuard(Mutex::new(guard.then(Guard::default))),
             finish_state: AtomicU8::new(0),
+            guard_pinned: AtomicBool::new(false),
             completion: Fence::default(),
             commands: [()],
         }
@@ -180,6 +182,29 @@ fn fail_packet_records_device_loss_errors() {
         assert_eq!(packet.completion.error.get(), err.0);
         assert_eq!(packet.completion.signals.get(), 1);
     }
+}
+
+#[test]
+fn terminal_fault_pins_guard_against_release_guard() {
+    let vm = Vm::default();
+    let packet = Packet::new(&vm, true);
+    packet.finish(Err(EIO));
+    assert!(packet.vm_job.lock().as_ref().unwrap().0.get());
+    // Subsequent fail_front() / withdraw() calls must not release a quarantined guard.
+    packet.release_guard();
+    assert!(packet.vm_job.lock().is_some());
+    assert!(packet.vm_job.lock().as_ref().unwrap().0.get());
+}
+
+#[test]
+fn cancel_then_terminal_fault_pins_guard_against_release_guard() {
+    let vm = Vm::default();
+    let packet = Packet::new(&vm, true);
+    packet.fail_packet(ECANCELED);
+    packet.finish(Err(EIO));
+    packet.release_guard();
+    assert!(packet.vm_job.lock().is_some());
+    assert!(packet.vm_job.lock().as_ref().unwrap().0.get());
 }
 """
 

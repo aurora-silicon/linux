@@ -245,8 +245,7 @@ impl Inner {
         }
         self.log_owners(trigger);
         let vm = self.active[0].entries[0].0.vm.clone();
-        let mmu_fault = self.device.log_extended_fault_banks(&vm).unwrap_or(false);
-        let blame_err = if mmu_fault { EIO } else { trigger };
+        let mut blame_err = trigger;
         let overall = Instant::<Monotonic>::now();
         let mut rounds = 0u32;
         let mut prev_gen: Option<u64> = None;
@@ -269,7 +268,7 @@ impl Inner {
                             dev_err!(self.drm.as_ref(), "M3 GPU recovery phase 1 did not arrive\n");
                             return Err(ETIMEDOUT);
                         }
-                        let _ = self.config.drain(&self.drm);
+                        self.config.drain(&self.drm)?;
                         fsleep(Delta::from_millis(1));
                     }
                     _ => {
@@ -284,6 +283,14 @@ impl Inner {
                 return Err(EPROTO);
             }
             prev_gen = Some(generation);
+            // Read MMU fault banks only once firmware has reached phase 1 (engines stopped
+            // and firmware waiting for host phase 2) so SGX+0xd800 cannot race with firmware.
+            if !blamed {
+                let mmu_fault = self.device.log_extended_fault_banks(&vm).unwrap_or(false);
+                if mmu_fault {
+                    blame_err = EIO;
+                }
+            }
             let mut entries = 0usize;
             let mut clear_tpc = false;
             for idx in 0..offsets.snapshot_entries {
@@ -310,7 +317,8 @@ impl Inner {
             if clear_tpc {
                 for batch in self.active.iter() {
                     if let NativeJob::Render(j) = &mut self.jobs[batch.index] {
-                        j.clear_active_tpc(batch.base, batch.entries.len())?;
+                        let renders = batch.mixed.as_ref().map_or(batch.entries.len(), |m| m.renders);
+                        j.clear_active_tpc(batch.base, renders)?;
                     }
                 }
             }
@@ -346,7 +354,7 @@ impl Inner {
                             dev_err!(self.drm.as_ref(), "M3 GPU recovery phase 3 timed out (gen {})\n", generation);
                             return Err(ETIMEDOUT);
                         }
-                        let _ = self.config.drain(&self.drm);
+                        self.config.drain(&self.drm)?;
                         fsleep(Delta::from_millis(1));
                     }
                     _ => {
@@ -365,15 +373,23 @@ impl Inner {
                 entries,
                 clear_tpc
             );
+            let check_busy = crate::m3::m3_params::retire_mmio(self.device.soc())
+                & crate::m3::m3_params::RETIRE_MMIO_BUSY
+                != 0;
             let drain_start = Instant::<Monotonic>::now();
             let mut another_round = false;
             loop {
-                let _ = self.config.drain(&self.drm);
+                self.config.drain(&self.drm)?;
                 let pipes_idle = self.config.pipes_idle()?;
+                let phase = self.config.recovery_phase()?;
                 let mut all_drained = pipes_idle;
                 if all_drained {
-                    let engines_idle = (self.device.pstate_register().unwrap_or(1) & 0xf) == 0
-                        || self.device.check_idle_parts(true, false).is_ok();
+                    // Honor the SoC's retire_mmio mask: do not probe core-clock-gated busy
+                    // registers (0xc020/0xc120) when RETIRE_MMIO_BUSY is omitted (e.g. G15G).
+                    let engines_idle = phase == 0
+                        && (!check_busy
+                            || (self.device.pstate_register().unwrap_or(1) & 0xf) == 0
+                            || self.device.check_idle_parts(true, false).is_ok());
                     for batch in self.active.iter() {
                         let batch_drained = match &mut self.jobs[batch.index] {
                             NativeJob::Render(j) => {
@@ -395,12 +411,12 @@ impl Inner {
                     }
                 }
                 if all_drained {
+                    self.config.note_recovered(generation);
                     break;
                 }
                 if self.state.health.crashed() {
                     return Err(EIO);
                 }
-                let phase = self.config.recovery_phase()?;
                 match logic::action(phase, false, true) {
                     RecoveryAction::Wait => {}
                     RecoveryAction::MarkAndAcknowledge => {
@@ -434,7 +450,9 @@ impl Inner {
                 self.jobs[mixed.compute_index].finish_recovery(&self.drm)?;
             }
         }
-        // Fail and quarantine all packets from the stopped batch(es).
+        // Reserve capacity before draining active batches; fail and pin every stopped packet.
+        let active_packets: usize = self.active.iter().map(|b| b.entries.len()).sum();
+        let _ = self.quarantined_packets.reserve(active_packets, GFP_KERNEL);
         self.quarantine_budget.charge(flights);
         for batch in self.active.drain_all() {
             for (packet, _) in batch.entries {
@@ -1015,6 +1033,12 @@ impl Inner {
                     let (expired,previous)=self.active.first().map(|b|(b.start.elapsed()>=Delta::from_secs(2),b.previous_events)).ok_or(EIO)?;
                     if expired {
                         dev_err!(self.drm.as_ref(),"M3 pipelined completion events={} previous={}\n",self.config.completed_events,previous);
+                        if self.config.recovery_phase() == Ok(1) {
+                            if let Err(e) = self.recover_extended(ETIMEDOUT) {
+                                self.fail_active(e);return Err(e);
+                            }
+                            return Ok(true);
+                        }
                         self.fail_active(ETIMEDOUT);return Err(ETIMEDOUT);
                     }
                     return Ok(false);
@@ -1586,6 +1610,7 @@ impl Runtime {
         while !self.inner.config.ready()? {
             let inner: &mut Inner = &mut *self.inner;
             inner.config.drain(&inner.drm)?;
+            if let Some(error) = inner.config.take_recovery_trigger()? { return Err(error); }
             if !inner.state.healthy() { return Err(EIO); }
             if deadline.elapsed() >= Delta::from_secs(2) { return Err(ETIMEDOUT); }
             fsleep(Delta::from_millis(1));
@@ -1618,6 +1643,7 @@ impl Runtime {
         loop {
             let inner: &mut Inner = &mut *self.inner;
             inner.config.drain(&inner.drm)?;
+            if let Some(error) = inner.config.take_recovery_trigger()? { return Err(error); }
             if !inner.state.healthy() { return Err(EIO); }
             if inner.config.control_done(expected)? { return Ok(()); }
             if deadline.elapsed() >= Delta::from_secs(2) { return Err(ETIMEDOUT); }

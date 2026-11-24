@@ -27,29 +27,35 @@ pub(crate) const RECOVERY_DRAIN_MS: i64 = 1000;
 pub(crate) const RECOVERY_BUDGET_MS: i64 = 5000;
 
 /// Recovery control-object offsets derived from the `m3_init_26` layout shift
-/// rather than hardcoded size checks.
+/// and validated against the exact expected `CONTROL_REGION` byte size.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RecoveryOffsets {
     pub(crate) snapshot: usize,
     pub(crate) snapshot_entries: usize,
     pub(crate) generation: usize,
     pub(crate) phase: usize,
+    pub(crate) control_bytes: usize,
 }
 
 impl RecoveryOffsets {
     /// Extended control region offsets shifted by the profile's `m3_init_26`
     /// control-table delta (`0` on 26.6.2 / `0xeaf0`, `0x1e0` on 27.2 / `0xedd0`).
-    pub(crate) const fn extended(shift: usize) -> Self {
+    pub(crate) const fn extended(shift: usize, control_bytes: usize) -> Self {
         Self {
             snapshot: logic::SNAPSHOT + shift,
             snapshot_entries: logic::SNAPSHOT_ENTRIES,
             generation: logic::GENERATION + shift,
             phase: logic::PHASE + shift,
+            control_bytes,
         }
     }
 
-    /// Verify every recovery word and snapshot entry fits inside `control_bytes`.
+    /// Verify `control_bytes` matches the expected layout size and every recovery
+    /// word and snapshot entry fits inside it (failing closed on mismatched layouts).
     pub(crate) const fn valid_for(self, control_bytes: usize) -> bool {
+        if control_bytes != self.control_bytes {
+            return false;
+        }
         let Some(snap_bytes) = self.snapshot_entries.checked_mul(8) else {
             return false;
         };
@@ -128,18 +134,25 @@ mod tests {
 
     #[test]
     fn extended_offsets_match_shared_g16_and_272_layouts() {
-        let base = RecoveryOffsets::extended(0);
+        assert!(FURTHER_RECOVERIES > 0);
+        assert!(RECOVERY_DRAIN_MS > 0);
+        assert!(RECOVERY_BUDGET_MS >= RECOVERY_DRAIN_MS);
+
+        let base = RecoveryOffsets::extended(0, 0xeaf0);
         assert_eq!(base.snapshot, 0x40b8);
         assert_eq!(base.generation, 0x4fa0);
         assert_eq!(base.phase, 0x4fb0);
         assert!(base.valid_for(0xeaf0));
         assert!(!base.valid_for(0x4fb0));
+        // Must fail closed if CONTROL_REGION grows to 27.2 without updating the shift.
+        assert!(!base.valid_for(0xedd0));
 
-        let v272 = RecoveryOffsets::extended(0x1e0);
+        let v272 = RecoveryOffsets::extended(0x1e0, 0xedd0);
         assert_eq!(v272.snapshot, 0x4298);
         assert_eq!(v272.generation, 0x5180);
         assert_eq!(v272.phase, 0x5190);
         assert!(v272.valid_for(0xedd0));
+        assert!(!v272.valid_for(0xeaf0));
         assert!(!v272.valid_for(0x5190));
     }
 

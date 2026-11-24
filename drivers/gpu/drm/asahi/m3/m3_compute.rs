@@ -451,10 +451,10 @@ impl Compute {
         if self.profile == super::m3_profile::Profile::Extended {
             let actual = self.objects[storage::POOL].read_u64(0x54)?;
             let expected = self.sequence.saturating_sub(self.pool_delta);
-            if actual < expected {
+            if actual < expected || actual > self.sequence {
                 return Ok(false);
             }
-            if actual > expected && actual <= self.sequence {
+            if actual > expected {
                 self.pool_delta = self.sequence - actual;
             }
         }

@@ -48,6 +48,10 @@ pub(crate) struct Packet {
     pub(crate) render_attachments:KVec<[crate::m3::agx_attachments::Attachments;2]>,
     completion:UserFence<Completion>,
     finish_state: AtomicU8,
+    /// Set once a terminal fault (`fail_vm == true`) quarantines `vm_job`;
+    /// thereafter `release_guard()` is a no-op so neither `fail_front()` nor
+    /// `withdraw()` can unmap a quarantined VM's pages.
+    guard_pinned: AtomicBool,
     /// Set before a batch with any of this packet's commands can change firmware-visible state,
     /// and never cleared.
     published: AtomicBool,
@@ -109,7 +113,14 @@ impl Packet {
             self.timestamps[index][stage*2+i].as_ref().map_or(0,Destination::firmware_address)))
     }
     /// Called only after all published commands retired or before any publication.
-    pub(crate) fn release_guard(&self) {drop(self.vm_job.lock().take());}
+    /// Never drops a guard that was pinned by a terminal fault quarantine.
+    pub(crate) fn release_guard(&self) {
+        let mut guard_slot = self.vm_job.lock();
+        if self.guard_pinned.load(Ordering::Acquire) {
+            return;
+        }
+        drop(guard_slot.take());
+    }
     /// Called before the first firmware-visible change of a batch that includes this packet.
     pub(crate) fn mark_published(&self) {self.published.store(true,Ordering::Relaxed);}
     /// Whether the firmware may have seen any of this packet's commands.
@@ -150,6 +161,12 @@ impl Packet {
             Err(e) if fail_vm => match self.finish_state.swap(TERMINAL, Ordering::AcqRel) {
                 PENDING => {}
                 PACKET_FAILED => {
+                    let guard_slot = self.vm_job.lock();
+                    if let Some(guard) = guard_slot.as_ref() {
+                        self.guard_pinned.store(true, Ordering::Release);
+                        guard.quarantine();
+                    }
+                    drop(guard_slot);
                     record_vm(e);
                     return;
                 }
@@ -168,9 +185,17 @@ impl Packet {
         if let Err(e)=result {
             // A guard still held here belongs to work the firmware may still run: block
             // mapping changes before the error fence is visible (as G15 does), so userspace
-            // can't unmap memory under it. It stays with the packet until the runtime drops
-            // the packet, after the firmware has provably stopped.
-            if let Some(guard)=self.vm_job.lock().as_ref() {guard.quarantine();}
+            // can't unmap memory under it. Terminal faults (`fail_vm`) also pin the guard
+            // against later `release_guard()` calls so it stays with the packet until the
+            // runtime drops it after the firmware has provably stopped.
+            let guard_slot = self.vm_job.lock();
+            if let Some(guard) = guard_slot.as_ref() {
+                if fail_vm {
+                    self.guard_pinned.store(true, Ordering::Release);
+                }
+                guard.quarantine();
+            }
+            drop(guard_slot);
             record_vm(e);
             self.completion.set_error(e);
         }
@@ -392,7 +417,7 @@ impl queue::Queue for Queue {
             #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
             render_queue: self.render_queue.clone(),vm:self.vm.clone(),commands,timestamps,attachments:flushes,wide_visibility:visibility,render_attachments,
             completion:self.fences.new_fence(0,Completion)?.into(),
-            finish_state:AtomicU8::new(0),published:AtomicBool::new(false),urgency:self.urgency,owner:Owner::current(),
+            finish_state:AtomicU8::new(0),guard_pinned:AtomicBool::new(false),published:AtomicBool::new(false),urgency:self.urgency,owner:Owner::current(),
             vm_job:KBox::pin_init(new_mutex!(Some(vm_job)),GFP_KERNEL)?},GFP_KERNEL)?;
         let mut job=self.entity.new_job(1,Job{shared:self.shared.clone(),packet})?;
         for sync in syncs.drain(0..in_sync_count) {if let Some(f)=sync.fence {job.add_dependency(f)?;}}

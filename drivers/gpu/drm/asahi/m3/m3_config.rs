@@ -375,8 +375,13 @@ impl Config {
     /// Nothing is acknowledged, cleared or resumed here.
     pub(crate) fn log_recovery_state(&mut self, dev: &driver::AsahiDrmDevice, events: u64) -> Result {
         if self.profile == super::m3_profile::Profile::Extended {
+            let control_start = 0x4ebc + super::m3_init_26::control_shift();
+            let control_size = self.objects[CONTROL_REGION].size();
             for (owner, start, length) in [(super::m3_init_26::RECOVERY_ACTIVITY, 0, 0x60),
-                (CONTROL_REGION, 0x4ebc, 0x100)] {
+                (CONTROL_REGION, control_start, 0x100)] {
+                if owner == CONTROL_REGION && start.saturating_add(length) > control_size {
+                    continue;
+                }
                 for offset in (start..start + length).step_by(32) {
                     let mut bytes = [0; 32];
                     self.objects[owner].read(offset, &mut bytes)?;
@@ -573,6 +578,7 @@ impl Config {
         }
         let offsets = super::m3_recovery::RecoveryOffsets::extended(
             super::m3_init_26::control_shift(),
+            super::m3_init_26::control_region_bytes(),
         );
         offsets
             .valid_for(self.objects[CONTROL_REGION].size())
@@ -617,8 +623,8 @@ impl Config {
     }
 
     /// Returns a recovery trigger error if the firmware reported a fault/timeout
-    /// or entered recovery phase != 0, ignoring trailing `STATS 0x16` from the
-    /// already-completed recovery generation.
+    /// or entered recovery phase != 0, ignoring trailing `EVENT 0`/`4` or
+    /// `STATS 0x16` notifications from the already-completed recovery generation.
     pub(crate) fn take_recovery_trigger(&mut self) -> Result<Option<Error>> {
         if self.recovery_offsets().is_none() {
             return Ok(None);
@@ -626,7 +632,10 @@ impl Config {
         let phase = self.recovery_phase()?;
         if let Some((kind, _word3)) = self.pending_recovery_event.take() {
             self.pending_recovery_stats = false;
-            return Ok(Some(if kind == 4 { ETIMEDOUT } else { EIO }));
+            let gen = self.recovery_generation()?;
+            if !super::m3_recovery::is_trailing_stats(phase, gen, self.last_recovery_gen) {
+                return Ok(Some(if kind == 4 { ETIMEDOUT } else { EIO }));
+            }
         }
         if core::mem::take(&mut self.pending_recovery_stats) {
             let gen = self.recovery_generation()?;

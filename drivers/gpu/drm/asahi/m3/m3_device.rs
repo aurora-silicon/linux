@@ -175,7 +175,8 @@ impl Device {
 
     /// Read-only MMU fault bank & engine busy snapshot for Extended (26.x/27.2)
     /// profiles. Returns `Ok(true)` if any cluster fault bank has its valid bit set.
-    /// Does not acknowledge or clear hardware fault banks.
+    /// Does not acknowledge or clear hardware fault banks, and always restores
+    /// the bank selector register (`0xd800`) on exit.
     pub(crate) fn log_extended_fault_banks(&self, vm: &crate::mmu::Vm) -> Result<bool> {
         let sgx_guard = self.sgx.try_access().ok_or(ENODEV)?;
         let sgx = sgx_guard.as_view();
@@ -188,38 +189,47 @@ impl Device {
             );
             return Ok(false);
         }
-        let c020 = sgx.try_read64(0xc020)?;
-        let c120 = sgx.try_read64(0xc120)?;
+        let check_busy = crate::m3::m3_params::retire_mmio(self.soc)
+            & crate::m3::m3_params::RETIRE_MMIO_BUSY
+            != 0;
+        let (c020, c120) = if check_busy {
+            (sgx.try_read64(0xc020)?, sgx.try_read64(0xc120)?)
+        } else {
+            (0, 0)
+        };
         let selector = sgx.try_read64(0xd800)?;
-        let mut any_fault = false;
-        for bank in 0..u64::from(self.soc.clusters) {
-            sgx.try_write64(bank, 0xd800)?;
-            let address = sgx.try_read64(0xd8c8)?;
-            let fault = sgx.try_read64(0xd8c0)?;
-            dev_info!(
-                self.dev.as_ref(),
-                "M3 {}: pstate={} busy={:#x}/{:#x} bank {} fault={:#x} address={:#x}\n",
-                self.soc.gpu_name,
-                pstate,
-                c020,
-                c120,
-                bank,
-                fault,
-                address << 6
-            );
-            if fault & 1 != 0 {
-                any_fault = true;
+        let result = (|| -> Result<bool> {
+            let mut any_fault = false;
+            for bank in 0..u64::from(self.soc.clusters) {
+                sgx.try_write64(bank, 0xd800)?;
+                let address = sgx.try_read64(0xd8c8)?;
+                let fault = sgx.try_read64(0xd8c0)?;
                 dev_info!(
                     self.dev.as_ref(),
-                    "M3 fault mapping bank={} address={:#x} translation={:?}\n",
+                    "M3 {}: pstate={} busy={:#x}/{:#x} bank {} fault={:#x} address={:#x}\n",
+                    self.soc.gpu_name,
+                    pstate,
+                    c020,
+                    c120,
                     bank,
-                    address << 6,
-                    vm.translate_iova(address << 6)
+                    fault,
+                    address << 6
                 );
+                if fault & 1 != 0 {
+                    any_fault = true;
+                    dev_info!(
+                        self.dev.as_ref(),
+                        "M3 fault mapping bank={} address={:#x} translation={:?}\n",
+                        bank,
+                        address << 6,
+                        vm.translate_iova(address << 6)
+                    );
+                }
             }
-        }
-        sgx.try_write64(selector, 0xd800)?;
-        Ok(any_fault)
+            Ok(any_fault)
+        })();
+        let _ = sgx.try_write64(selector, 0xd800);
+        result
     }
 
     /// Read-only snapshot. Do not select or acknowledge fault banks here;
