@@ -273,7 +273,7 @@ static void sio_t6030_device_tree_test(struct kunit *test)
 		int ret;
 
 		KUNIT_ASSERT_NOT_NULL_MSG(test, np, "%s", nodes[i][0]);
-		ret = sio_t6030_check_node(np);
+		ret = sio_t6030_check_node(np, "apple,sio-firmware-params");
 		if (!strcmp(nodes[i][1], "admitted"))
 			KUNIT_EXPECT_EQ_MSG(test, ret, 0, "%s", nodes[i][0]);
 		else
@@ -309,6 +309,53 @@ static void sio_t6030_probe_test(struct kunit *test)
 	}
 }
 
+/*
+ * A low-window SIO's parameter list follows the protocol its firmware reports: the earlier
+ * tables for protocol 9, the second list for protocol 10; a protocol-10 firmware without a valid
+ * second list gets no DMA (the earlier shim records crash it at the first channel configuration).
+ */
+static void sio_low_window_params_test(struct kunit *test)
+{
+	static const struct {
+		const char *path;
+		u32 protocol;
+		const char *prop;
+		bool mismatch;
+	} cases[] = {
+		{ "/sio-t6030-test/sio-low-window-test-both", 9, "apple,sio-firmware-params", false },
+		{ "/sio-t6030-test/sio-low-window-test-both", 10, "apple,sio-firmware-params-v10",
+		  false },
+		{ "/sio-t6030-test/sio-low-window-test-bad-v10", 10, "apple,sio-firmware-params",
+		  true },
+		{ "/sio-t6030-test/sio-low-window-test-bad-v10", 9, "apple,sio-firmware-params",
+		  false },
+		/* An older loader: the earlier tables only */
+		{ "/sio-t6030-test/sio-t6030-test-earlier", 10, "apple,sio-firmware-params", true },
+		{ "/sio-t6030-test/sio-t6030-test-earlier", 9, "apple,sio-firmware-params", false },
+		/* T6030: its protocol-10 tables are the first list */
+		{ "/sio-t6030-test/sio-t6030-test-v10", 10, "apple,sio-firmware-params", false },
+	};
+	struct device *dev = kunit_kzalloc(test, sizeof(*dev), GFP_KERNEL);
+	unsigned int i;
+
+	KUNIT_ASSERT_EQ(test, 0, of_overlay_apply_kunit(test, apple_sio_t6030_test));
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		struct device_node *np __free(device_node) = of_find_node_by_path(cases[i].path);
+		struct sio_data *sio = kunit_kzalloc(test, sizeof(*sio), GFP_KERNEL);
+
+		KUNIT_ASSERT_NOT_NULL_MSG(test, np, "%s", cases[i].path);
+		KUNIT_ASSERT_NOT_NULL(test, dev);
+		KUNIT_ASSERT_NOT_NULL(test, sio);
+		dev->of_node = np;
+		sio->dev = dev;
+		sio->protocol = cases[i].protocol;
+		KUNIT_EXPECT_STREQ_MSG(test, sio_dt_params_name(sio), cases[i].prop, "%s v%u",
+				       cases[i].path, cases[i].protocol);
+		KUNIT_EXPECT_EQ_MSG(test, sio->tables_mismatch, cases[i].mismatch, "%s v%u",
+				    cases[i].path, cases[i].protocol);
+	}
+}
+
 static struct kunit_case sio_t6030_test_cases[] = {
 	KUNIT_CASE(sio_t6030_protocol10_test),
 	KUNIT_CASE(sio_t6030_earlier_loader_test),
@@ -318,6 +365,7 @@ static struct kunit_case sio_t6030_test_cases[] = {
 	KUNIT_CASE(sio_t6030_spans_test),
 	KUNIT_CASE(sio_t6030_device_tree_test),
 	KUNIT_CASE(sio_t6030_probe_test),
+	KUNIT_CASE(sio_low_window_params_test),
 	{}
 };
 
