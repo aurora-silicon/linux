@@ -94,7 +94,7 @@ pub mod g16 {
     }
     pub mod object {
         use crate::*;use crate::sync::Arc;
-        #[derive(Copy,Clone,Debug,Eq,PartialEq)]pub enum Class{Shared,Fw,FwCached,SharedCached,Mmio}
+        #[derive(Copy,Clone,Debug,Eq,PartialEq)]pub enum Class{Shared,Fw,FwCached,SharedCached,FwCoherent,Mmio}
         pub enum Placement{Anywhere}
         pub struct Request{pub size:usize,pub class:Class,pub placement:Placement,pub offset:usize,pub client:Option<(u64,u64)>,pub lower:Option<u64>,pub cpu:bool}
         pub struct FwObject{pub class:Class,pub client_leaf:Option<u64>,pub va:u64,pub gva:Option<u64>,pub lower_gva:Option<u64>,pub lower_leaf:Option<u64>,pub size:usize,pub mapped:usize,pub offset:usize,pub data:std::sync::Arc<std::sync::Mutex<Vec<u8>>>,pub fills:std::sync::Mutex<Vec<(usize,usize)>>,pub fail_fill:std::sync::atomic::AtomicBool,pub write_bytes:std::sync::atomic::AtomicUsize}
@@ -118,15 +118,28 @@ pub mod g16 {
         impl Factory{
             pub fn objects(&self,_:&super::vm::MockVm)->Objects{Objects::new()}
             pub fn fw_objects(&self)->Objects{Objects::new()}
+            pub fn persistent_objects(&self)->Objects{Objects::persistent()}
         }
         pub static NEXT_VA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0xfffffc2001000000);
         std::thread_local!{pub static ALL_OBJECTS:std::cell::RefCell<Vec<Arc<FwObject>>>=const{std::cell::RefCell::new(Vec::new())};}
-        pub struct Objects{pub objects:Vec<Arc<FwObject>>}
+        pub struct Objects{pub objects:Vec<Arc<FwObject>>,pub persistent:bool}
+        // Device-lifetime render records of each pass slot index, per test thread (the
+        // production table is resources::RenderCmds): one never-dropped allocator owns them.
+        std::thread_local!{
+            pub static PERSISTENT:std::cell::RefCell<Option<Objects>>=const{std::cell::RefCell::new(None)};
+            pub static PASS_CMDS:std::cell::RefCell<Vec<(u64,crate::g16::slots::PassCmds)>>=const{std::cell::RefCell::new(Vec::new())};
+        }
+        pub fn test_cmds(k:u64)->crate::g16::slots::PassCmds{
+            if let Some(c)=PASS_CMDS.with(|p|p.borrow().iter().find(|e|e.0==k).map(|e|e.1.clone())){return c;}
+            let c=PERSISTENT.with(|p|{let mut p=p.borrow_mut();crate::g16::slots::PassCmds::new(p.get_or_insert_with(Objects::persistent)).unwrap()});
+            PASS_CMDS.with(|p|p.borrow_mut().push((k,c.clone())));c
+        }
         impl Objects{
-            pub fn new()->Self{Self{objects:vec![]}}
+            pub fn new()->Self{Self{objects:vec![],persistent:false}}
+            pub fn persistent()->Self{Self{objects:vec![],persistent:true}}
             pub fn finish_private(&mut self)->Result{Ok(())}
             pub fn alloc_dynamic_client(&mut self,size:usize)->Result<Arc<FwObject>>{self.alloc(Request{size,class:Class::Shared,placement:Placement::Anywhere,offset:0,client:Some((0x7040000000,super::hw::pte::LEAF_NC)),lower:None,cpu:true})}
-            pub fn alloc(&mut self,r:Request)->Result<Arc<FwObject>>{let bytes=(r.size+r.offset+0x3fff)&!0x3fff;let va=NEXT_VA.fetch_add(bytes as u64+0x4000,std::sync::atomic::Ordering::Relaxed);let x=Arc::new(FwObject{class:r.class,client_leaf:r.client.map(|c|c.1),va:va+r.offset as u64,gva:r.client.map(|c|c.0+r.offset as u64),lower_gva:r.lower.map(|g|g+r.offset as u64),lower_leaf:r.lower.map(|_|super::hw::pte::LOWER),size:r.size,mapped:bytes,offset:r.offset,data:std::sync::Arc::new(std::sync::Mutex::new(if r.cpu{vec![0;bytes]}else{vec![]})),fills:std::sync::Mutex::new(Vec::new()),fail_fill:std::sync::atomic::AtomicBool::new(false),write_bytes:std::sync::atomic::AtomicUsize::new(0)},0)?;self.objects.push(x.clone());ALL_OBJECTS.with(|a|a.borrow_mut().push(x.clone()));Ok(x)}
+            pub fn alloc(&mut self,r:Request)->Result<Arc<FwObject>>{if r.class==Class::FwCoherent&&(!self.persistent||r.client.is_some()||r.lower.is_some()){return Err(EINVAL);}let bytes=(r.size+r.offset+0x3fff)&!0x3fff;let va=NEXT_VA.fetch_add(bytes as u64+0x4000,std::sync::atomic::Ordering::Relaxed);let x=Arc::new(FwObject{class:r.class,client_leaf:r.client.map(|c|c.1),va:va+r.offset as u64,gva:r.client.map(|c|c.0+r.offset as u64),lower_gva:r.lower.map(|g|g+r.offset as u64),lower_leaf:r.lower.map(|_|super::hw::pte::LOWER),size:r.size,mapped:bytes,offset:r.offset,data:std::sync::Arc::new(std::sync::Mutex::new(if r.cpu{vec![0;bytes]}else{vec![]})),fills:std::sync::Mutex::new(Vec::new()),fail_fill:std::sync::atomic::AtomicBool::new(false),write_bytes:std::sync::atomic::AtomicUsize::new(0)},0)?;self.objects.push(x.clone());ALL_OBJECTS.with(|a|a.borrow_mut().push(x.clone()));Ok(x)}
         }
     }
     pub mod graph {
@@ -274,7 +287,7 @@ pub mod g16 {
     fn arenas(o:&mut Objects)->Arenas{
         let mut compute=KVec::new();let mut passes=KVec::new();
         let f=g16::object::Factory;
-        for k in 0..2{compute.push(g16::slots::ComputeSlot::new(o,&f,k).unwrap(),0).unwrap();passes.push(g16::slots::PassSlot::new(o,k,1).unwrap(),0).unwrap();}
+        for k in 0..2{compute.push(g16::slots::ComputeSlot::new(o,&f,k).unwrap(),0).unwrap();passes.push(g16::slots::PassSlot::new(o, k, 1, &crate::g16::object::test_cmds((k) as u64)).unwrap(),0).unwrap();}
         Arenas{compute:g16::resources::ComputeArena{compute,render:None,hw_slots:None},render:render_arena(passes)}
     }
     fn retire_render(s:&mut Slots,k:usize){let mut c=Claims::new();c.pass[0]=k as u32;c.pass_mask=1<<k;s.publish(&mut c).unwrap();s.retire(&mut c).unwrap();}
@@ -331,6 +344,54 @@ pub mod g16 {
         for (k,s) in arena.compute.compute.iter().enumerate(){assert_eq!(s.work.lower_gva.unwrap()&0x3fff,0);assert_eq!(s.work.size,0x2000);assert_eq!(s.pool.size,0x2000000);assert_eq!(s.pool_state.size,0x20000);assert_eq!(s.page_list.size,0x4000);assert_eq!(s.context_store.size,0x40000);assert_eq!(s.pool_state.r32(0).unwrap()as u64 |((s.pool_state.r32(4).unwrap()as u64)<<32),s.pool.gva.unwrap());assert_eq!(pools.allocator_refs_for(k).unwrap().parameter_id,k as u32);}
         // One PB heap per VM, shared by both render allocators.
         assert_eq!(aliases.len(),42);
+    }
+    #[test]fn firmware_cached_render_records_are_device_lifetime_and_never_owned_by_vm_arenas(){
+        use g16::object::{Class,Placement,Request};
+        let req=|class,client:Option<(u64,u64)>,lower:Option<u64>|Request{size:0x40,class,placement:Placement::Anywhere,offset:0,client,lower,cpu:true};
+        // A per-VM arena cannot map a firmware-cached record (its teardown would unmap it), and
+        // a device-lifetime allocator cannot give one a client or lower alias.
+        let mut vm=Objects::new();
+        assert!(matches!(vm.alloc(req(Class::FwCoherent,None,None)),Err(EINVAL)));
+        let mut dev=Objects::persistent();
+        assert!(matches!(dev.alloc(req(Class::FwCoherent,Some((0x7040000000,g16::hw::pte::LEAF_NC)),None)),Err(EINVAL)));
+        assert!(matches!(dev.alloc(req(Class::FwCoherent,None,Some(0x70f1000000))),Err(EINVAL)));
+        // Two VMs' pass slot 3 share index 3's records; neither VM arena owns any of them.
+        let (mut a,mut b)=(Objects::new(),Objects::new());
+        let pa=g16::slots::PassSlot::new(&mut a,3,1,&crate::g16::object::test_cmds(3)).unwrap();
+        let pb=g16::slots::PassSlot::new(&mut b,3,1,&crate::g16::object::test_cmds(3)).unwrap();
+        let records=|p:&g16::slots::PassSlot|[p.ta_seq.clone(),p.fs_seq.clone(),p.own_barrier.clone(),p.prev_barrier.clone(),p.ta_fs_barrier.clone(),p.fs_dep.clone(),p.compute_barrier.clone(),p.fs_compute_barrier.clone()];
+        let (ra,rb)=(records(&pa),records(&pb));
+        for (x,y) in ra.iter().zip(rb.iter()){
+            assert!(crate::sync::Arc::ptr_eq(x,y));
+            assert_eq!(x.class,Class::FwCoherent);
+            assert_eq!((x.gva,x.lower_gva,x.client_leaf),(None,None,None));
+        }
+        assert!(a.objects.iter().chain(b.objects.iter()).all(|o|o.class!=Class::FwCoherent));
+        assert!(a.objects.iter().chain(b.objects.iter()).all(|o|ra.iter().all(|r|!crate::sync::Arc::ptr_eq(o,r))));
+        let pc=g16::slots::PassSlot::new(&mut b,4,1,&crate::g16::object::test_cmds(4)).unwrap();
+        assert!(!crate::sync::Arc::ptr_eq(&pc.ta_seq,&pa.ta_seq)&&!crate::sync::Arc::ptr_eq(&pc.own_barrier,&pa.own_barrier));
+        // Microsequences keep whole pages; the barrier records are disjoint 0x40-aligned
+        // records of one page; the encoders name the shared records.
+        assert_eq!((pa.ta_seq.va&0x3fff,pa.fs_seq.va&0x3fff),(0,0));
+        let page=ra[2].va&!0x3fff;
+        let mut spans:Vec<(u64,u64)>=ra[2..].iter().map(|o|(o.va,o.va+o.size as u64)).collect();
+        spans.sort();
+        assert!(spans.windows(2).all(|w|w[0].1<=w[1].0));
+        assert!(ra[2..].iter().all(|o|o.va&!0x3fff==page&&o.va%0x40==0&&o.va+o.size as u64<=page+0x4000));
+        assert_eq!((pa.refs().ta_seq,pa.refs().fs_seq),(pb.refs().ta_seq,pb.refs().fs_seq));
+        assert_eq!((pa.refs().ta_seq,pa.refs().fs_seq),(pa.ta_seq.va,pa.fs_seq.va));
+        // Closing VM a drops its arena and pass slot: the device table still owns and hands
+        // out the same records, mapped by its never-dropped allocator.
+        drop(pa);drop(a);
+        let again=crate::g16::object::test_cmds(3);
+        assert!(crate::sync::Arc::ptr_eq(&again.ta_seq,&rb[0])&&crate::sync::Arc::ptr_eq(&again.fs_dep,&rb[5]));
+        crate::g16::object::PERSISTENT.with(|p|{
+            let p=p.borrow();let owned=&p.as_ref().unwrap().objects;
+            assert!(owned.iter().any(|o|crate::sync::Arc::ptr_eq(o,&rb[0])));
+            assert!(owned.iter().any(|o|crate::sync::Arc::ptr_eq(o,&rb[1])));
+            assert!(owned.iter().all(|o|o.class==Class::FwCoherent));
+        });
+        drop(pb);drop(pc);drop(b);
     }
     #[test]fn work_has_kernel_lower_alias_without_application_alias(){
         let mut o=Objects::new();let slots=Slots::new().unwrap();let arena=arenas(&mut o);
@@ -682,7 +743,7 @@ pub mod g16 {
         let mut scene_lists=Vec::new();
         let count_client=|objs:&Objects|objs.objects.iter().filter(|a|a.gva.is_some()).count();
         for k in 0..g16::hw::sizes::RENDER_SLOTS as u64 {
-            let pass=g16::slots::PassSlot::new(&mut o,k,1).unwrap();
+            let pass=g16::slots::PassSlot::new(&mut o, k, 1, &crate::g16::object::test_cmds((k) as u64)).unwrap();
             let va=pass.refs().scene_list;
             assert_ne!(va,0);
             assert!(!scene_lists.contains(&va),"each pass slot must own a distinct scene_list");
@@ -692,7 +753,7 @@ pub mod g16 {
         for &(start, end) in &g16::resources::EXT_RENDER_TIERS {
             let mut ot = Objects::new();
             for k in start..end {
-                g16::slots::PassSlot::new(&mut ot, k as u64, 1).unwrap();
+                g16::slots::PassSlot::new(&mut ot, k as u64, 1, &crate::g16::object::test_cmds((k as u64) as u64)).unwrap();
             }
             let tier_maps = count_client(&ot);
             assert!(
@@ -1023,7 +1084,7 @@ pub mod g16 {
         let mut o=Objects::new();let mut s=Slots::new().unwrap();
         let mut passes=KVec::new();
         for k in 0..g16::hw::sizes::RENDER_SLOTS as u64 {
-            let pass=g16::slots::PassSlot::new(&mut o,k,1).unwrap();
+            let pass=g16::slots::PassSlot::new(&mut o, k, 1, &crate::g16::object::test_cmds((k) as u64)).unwrap();
             if k < g16::hw::sizes::BASE_RENDER_SLOTS as u64 {
                 assert_eq!(pass.tpc.size as u64, g16::hw::client::TPC_SIZE);
                 assert_eq!(pass.tilemap.size as u64, g16::hw::client::TILEMAP_SIZE);
@@ -1128,6 +1189,7 @@ pub mod g16 {
         assert_eq!(render.passes[0].its.fills.lock().unwrap().len(),its_before);
         assert_eq!(render.passes[0].pre[0].fills.lock().unwrap().len(),pre0_before);
     }
+
 
     #[test]fn offlock_scrub_falls_back_on_error_drop_recovery_and_cross_vm(){
         let mut o=Objects::new();let mut s=Slots::new().unwrap();let arena=arenas(&mut o);
@@ -1262,7 +1324,7 @@ pub mod g16 {
         let mut o=Objects::new();let mut s=Slots::new().unwrap();let arena=arenas(&mut o);
         let mut passes=KVec::new();
         for k in 0..g16::hw::sizes::RENDER_SLOTS as u64 {
-            passes.push(g16::slots::PassSlot::new(&mut o,k,1).unwrap(),0).unwrap();
+            passes.push(g16::slots::PassSlot::new(&mut o, k, 1, &crate::g16::object::test_cmds((k) as u64)).unwrap(),0).unwrap();
         }
         let render=sync::Arc::new(render_arena(passes),0).unwrap();
         let prep=g16::resources::Prepared{compute:arena.compute.compute,render:Some(render),hw_slots:None};
@@ -1324,7 +1386,7 @@ pub mod g16 {
         let mut o=Objects::new();let mut s=Slots::new().unwrap();let arena=arenas(&mut o);
         let mut passes=KVec::new();
         for k in 0..g16::hw::sizes::RENDER_SLOTS as u64 {
-            passes.push(g16::slots::PassSlot::new(&mut o,k,1).unwrap(),0).unwrap();
+            passes.push(g16::slots::PassSlot::new(&mut o, k, 1, &crate::g16::object::test_cmds((k) as u64)).unwrap(),0).unwrap();
         }
         let render=sync::Arc::new(render_arena(passes),0).unwrap();
         let prep=g16::resources::Prepared{compute:arena.compute.compute,render:Some(render),hw_slots:None};
@@ -1470,20 +1532,26 @@ pub mod g16 {
 
         // Verify exact per-slot mapped backing bytes for Base vs Ext slots.
         let mut o_base = Objects::new();
-        g16::slots::PassSlot::new(&mut o_base, 0, 1).unwrap();
+        g16::slots::PassSlot::new(&mut o_base, 0, 1, &crate::g16::object::test_cmds((0) as u64)).unwrap();
         let base_slot_bytes: usize = o_base.objects.iter().map(|obj| obj.mapped).sum();
-        assert_eq!(base_slot_bytes, (16 * 1024 + 8 * 1024 + 608) * 1024);
+        // Microsequences and barrier records are the device-lifetime records of the index.
+        assert_eq!(base_slot_bytes, (16 * 1024 + 8 * 1024 + 480) * 1024);
         let mut o_ext = Objects::new();
-        g16::slots::PassSlot::new(&mut o_ext, 2, 1).unwrap();
+        g16::slots::PassSlot::new(&mut o_ext, 2, 1, &crate::g16::object::test_cmds((2) as u64)).unwrap();
         let ext_slot_bytes: usize = o_ext.objects.iter().map(|obj| obj.mapped).sum();
-        assert_eq!(ext_slot_bytes, (2 * 1024 + 1024 + 608) * 1024);
+        assert_eq!(ext_slot_bytes, (2 * 1024 + 1024 + 480) * 1024);
+        // Each index's device-lifetime records: two microsequence pages and one barrier page.
+        let indices = crate::g16::object::PASS_CMDS.with(|p| p.borrow().len());
+        let device_bytes: usize = crate::g16::object::PERSISTENT
+            .with(|p| p.borrow().as_ref().unwrap().objects.iter().map(|obj| obj.mapped).sum());
+        assert_eq!((indices, device_bytes), (2, 2 * 3 * 16 * 1024));
         // Cumulative extension backing across the 4 demand-grown tiers:
-        // Tier 0 (6 ext): 21.5625 MiB, Tier 1 (16 ext): 57.50 MiB,
-        // Tier 2 (30 ext): 107.8125 MiB, Tier 3 (46 ext): 165.3125 MiB.
-        assert_eq!((tier0_end - BASE_RENDER_SLOTS) * ext_slot_bytes, 22_080 * 1024);
-        assert_eq!((tier1_end - BASE_RENDER_SLOTS) * ext_slot_bytes, 58_880 * 1024);
-        assert_eq!((tier2_end - BASE_RENDER_SLOTS) * ext_slot_bytes, 110_400 * 1024);
-        assert_eq!((full_end - BASE_RENDER_SLOTS) * ext_slot_bytes, 169_280 * 1024);
+        // Tier 0 (6 ext): 20.8125 MiB, Tier 1 (16 ext): 55.50 MiB,
+        // Tier 2 (30 ext): 104.0625 MiB, Tier 3 (46 ext): 159.5625 MiB.
+        assert_eq!((tier0_end - BASE_RENDER_SLOTS) * ext_slot_bytes, 21_312 * 1024);
+        assert_eq!((tier1_end - BASE_RENDER_SLOTS) * ext_slot_bytes, 56_832 * 1024);
+        assert_eq!((tier2_end - BASE_RENDER_SLOTS) * ext_slot_bytes, 106_560 * 1024);
+        assert_eq!((full_end - BASE_RENDER_SLOTS) * ext_slot_bytes, 163_392 * 1024);
     }
 
     #[test]fn base_compute_quarantine_expands_fresh_vm_and_recovers_displacement(){
@@ -1678,7 +1746,7 @@ pub mod g16 {
         let mut o=Objects::new();let mut s=Slots::new().unwrap();
         let mut passes=KVec::new();
         for k in 0..4u64 {
-            passes.push(g16::slots::PassSlot::new(&mut o,k,1).unwrap(),0).unwrap();
+            passes.push(g16::slots::PassSlot::new(&mut o, k, 1, &crate::g16::object::test_cmds((k) as u64)).unwrap(),0).unwrap();
         }
         let render=sync::Arc::new(render_arena(passes),0).unwrap();
         let prep=g16::resources::Prepared{compute:KVec::new(),render:Some(render),hw_slots:None};
@@ -1771,7 +1839,7 @@ pub mod g16 {
         let mut o=Objects::new();let mut s=Slots::new().unwrap();
         let mut passes=KVec::new();
         for k in 0..3u64 {
-            passes.push(g16::slots::PassSlot::new(&mut o,k,1).unwrap(),0).unwrap();
+            passes.push(g16::slots::PassSlot::new(&mut o, k, 1, &crate::g16::object::test_cmds((k) as u64)).unwrap(),0).unwrap();
         }
         let render=sync::Arc::new(render_arena(passes),0).unwrap();
         let prep=g16::resources::Prepared{compute:KVec::new(),render:Some(render.clone()),hw_slots:None};
@@ -2116,7 +2184,7 @@ pub mod g16 {
         let mut s = Slots::new().unwrap();
         let mut passes = KVec::new();
         for k in 0..EXT_RENDER_TIERS[1].1 {
-            passes.push(g16::slots::PassSlot::new(&mut o, k as u64, 1).unwrap(), 0).unwrap();
+            passes.push(g16::slots::PassSlot::new(&mut o, k as u64, 1, &crate::g16::object::test_cmds((k as u64) as u64)).unwrap(), 0).unwrap();
         }
         let render = sync::Arc::new(render_arena(passes), 0).unwrap();
         let prep = g16::resources::ComputeArena {
@@ -2210,7 +2278,7 @@ pub mod g16 {
         }
         let mut passes = KVec::new();
         for k in 0..18 {
-            passes.push(PassSlot::new(&mut o, k as u64, 1).unwrap(), 0).unwrap();
+            passes.push(PassSlot::new(&mut o, k as u64, 1, &crate::g16::object::test_cmds((k as u64) as u64)).unwrap(), 0).unwrap();
         }
         let shared_prep_compute = ComputeArena { compute: compute_slots, render: None, hw_slots: None };
         let geo = g16::encode::Geometry { tpc_bytes: 0x1000, tilemap_bytes: 0x2000 };
@@ -2227,7 +2295,7 @@ pub mod g16 {
             let pb_arena = sync::Arc::new(render_arena(KVec::new()), 0).unwrap();
             let mut r_passes = KVec::new();
             for k in 0..18 {
-                r_passes.push(PassSlot::new(&mut o, k as u64, 1).unwrap(), 0).unwrap();
+                r_passes.push(PassSlot::new(&mut o, k as u64, 1, &crate::g16::object::test_cmds((k as u64) as u64)).unwrap(), 0).unwrap();
             }
             let r_arena = sync::Arc::new(render_arena(r_passes), 0).unwrap();
             let r_prep = ComputeArena { compute: KVec::new(), render: Some(r_arena.clone()), hw_slots: None };
@@ -2394,7 +2462,7 @@ pub mod g16 {
         let mut s2 = Slots::new().unwrap();
         let mut sc_passes = KVec::new();
         for k in 0..2 {
-            sc_passes.push(PassSlot::new(&mut o, k as u64, 1).unwrap(), 0).unwrap();
+            sc_passes.push(PassSlot::new(&mut o, k as u64, 1, &crate::g16::object::test_cmds((k as u64) as u64)).unwrap(), 0).unwrap();
         }
         let sc_arena = sync::Arc::new(render_arena(sc_passes), 0).unwrap();
         let sc_prep = ComputeArena { compute: KVec::new(), render: Some(sc_arena.clone()), hw_slots: None };
@@ -2828,7 +2896,7 @@ graph_types = '\n'.join(
 ).replace('fn new(', 'pub(crate) fn new(').replace('fn init(', 'pub(crate) fn init(')
 source = source.replace('__GRAPH_TYPES__', graph_types)
 source = source.replace('__ALLOC__',item(graph_source,'pub(crate) fn alloc(')).replace('__ALLOC_WORK__',item(graph_source,'pub(crate) fn alloc_work('))
-source = source.replace('__HW__','\n'.join(module(hw,n) for n in ('client','sizes','engine','tuning','pte'))).replace('__ROOT__',str(production)).replace('__PRIVATE_RW__',hex(private_rw)+'u64').replace('__CLIENT__', '#[derive(Copy,Clone)]\n'+item(graph_source, 'pub(crate) struct Client {')+'\n'+item(graph_source, 'impl Client {'))
+source = source.replace('__HW__','\n'.join([module(hw,n) for n in ('client','sizes','engine','tuning','pte')] + [l for l in hw.splitlines() if l.startswith('pub(crate) const PAGE: u64')])).replace('__ROOT__',str(production)).replace('__PRIVATE_RW__',hex(private_rw)+'u64').replace('__CLIENT__', '#[derive(Copy,Clone)]\n'+item(graph_source, 'pub(crate) struct Client {')+'\n'+item(graph_source, 'impl Client {'))
 (out/'check-resources.rs').write_text(source)
 log = ''
 for command in [

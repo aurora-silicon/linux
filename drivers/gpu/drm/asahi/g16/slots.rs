@@ -264,6 +264,56 @@ impl ComputeSlot {
     }
 }
 
+/// The render microsequences and barrier records of one pass slot index, shared by every VM's
+/// [`PassSlot`] of that index: the index is device-global and claimed by one flight at a time.
+/// They are written by the host before publication and only read by the firmware, so they take
+/// the firmware-cached [`Class::FwCoherent`] view macOS 26B123 gives its per-queue command
+/// objects. Each microsequence keeps its own page; the barrier records share one page, as the
+/// compute unit's barriers do.
+#[derive(Clone)]
+pub(crate) struct PassCmds {
+    pub(crate) ta_seq: Arc<FwObject>,
+    pub(crate) fs_seq: Arc<FwObject>,
+    pub(crate) own_barrier: Arc<FwObject>,
+    pub(crate) prev_barrier: Arc<FwObject>,
+    pub(crate) ta_fs_barrier: Arc<FwObject>,
+    pub(crate) fs_dep: Arc<FwObject>,
+    pub(crate) compute_barrier: Arc<FwObject>,
+    pub(crate) fs_compute_barrier: Arc<FwObject>,
+}
+
+impl PassCmds {
+    /// Barrier records in the shared page: own, prev, TA->FS, FS dependency (one record each),
+    /// then the per-pipe compute and FS-compute barriers.
+    const OWN: usize = 0;
+    const PREV: usize = barrier::SIZE;
+    const TA_FS: usize = 2 * barrier::SIZE;
+    const FS_DEP: usize = 3 * barrier::SIZE;
+    const COMPUTE: usize = 4 * barrier::SIZE;
+    const FS_COMPUTE: usize = Self::COMPUTE + barrier::SIZE * sizes::COMPUTE_PIPES;
+    const BARRIERS: usize = Self::FS_COMPUTE + barrier::SIZE * sizes::COMPUTE_PIPES;
+
+    /// Allocates one pass slot index's set from a device-lifetime allocator
+    /// ([`Factory::persistent_objects`]), which the caller never drops.
+    pub(crate) fn new(o: &mut Objects) -> Result<Self> {
+        let coherent = Class::FwCoherent;
+        let barriers = alloc(o, Self::BARRIERS, coherent, None, 0, false)?;
+        let record = |offset, size| FwObject::view(&barriers, offset, size);
+        Ok(Self {
+            ta_seq: alloc(o, ta::SEQ_OBJECT, coherent, None, 0, false)?,
+            fs_seq: alloc(o, fs::SEQ_OBJECT, coherent, None, 0, false)?,
+            own_barrier: record(Self::OWN, barrier::SIZE)?,
+            prev_barrier: record(Self::PREV, barrier::SIZE)?,
+            ta_fs_barrier: record(Self::TA_FS, barrier::SIZE)?,
+            fs_dep: record(Self::FS_DEP, barrier::SIZE)?,
+            compute_barrier: record(Self::COMPUTE, barrier::SIZE * sizes::COMPUTE_PIPES)?,
+            fs_compute_barrier: record(Self::FS_COMPUTE, barrier::SIZE * sizes::COMPUTE_PIPES)?,
+        })
+    }
+}
+
+const _: () = assert!(PassCmds::BARRIERS <= super::hw::PAGE as usize);
+
 /// One render pass slot.
 pub(crate) struct PassSlot {
     pub(crate) aux: Arc<FwObject>,
@@ -292,8 +342,9 @@ pub(crate) struct PassSlot {
 }
 
 impl PassSlot {
-    /// Allocates pass slot `i`'s objects, with their client leaf classes.
-    pub(crate) fn new(o: &mut Objects, i: u64, pre_records: u32) -> Result<Self> {
+    /// Allocates pass slot `i`'s objects, with their client leaf classes, around the
+    /// device-lifetime microsequences and barrier records `cmds` of index `i`.
+    pub(crate) fn new(o: &mut Objects, i: u64, pre_records: u32, cmds: &PassCmds) -> Result<Self> {
         let sh = Class::Shared;
         let off = client::pass_off(i);
         let tpc = if i >= sizes::BASE_RENDER_SLOTS as u64 {
@@ -393,33 +444,19 @@ impl PassSlot {
             fs_scratch,
             fs_work,
             ta_work,
-            ta_seq: alloc(o, ta::SEQ_OBJECT, cmd_fw(), None, 0, false)?,
-            fs_seq: alloc(o, fs::SEQ_OBJECT, cmd_fw(), None, 0, false)?,
+            ta_seq: cmds.ta_seq.clone(),
+            fs_seq: cmds.fs_seq.clone(),
             ta_scratch: alloc(o, 0x10000, sh, None, 0, false)?,
             scene: alloc(o, super::fw::work::scene::SIZE, sh, None, 0, false)?,
             // Internal TA start/end, FS start/end; legacy user cells likewise.
             its: alloc(o, 32, sh, None, 0, false)?,
             _uts: alloc(o, 32, Class::Fw, None, 0, false)?,
-            own_barrier: alloc(o, barrier::SIZE, cmd_fw(), None, 0, false)?,
-            prev_barrier: alloc(o, barrier::SIZE, cmd_fw(), None, 0, false)?,
-            ta_fs_barrier: alloc(o, barrier::SIZE, cmd_fw(), None, 0, false)?,
-            fs_dep: alloc(o, barrier::SIZE, cmd_fw(), None, 0, false)?,
-            compute_barrier: alloc(
-                o,
-                barrier::SIZE * sizes::COMPUTE_PIPES,
-                cmd_fw(),
-                None,
-                0,
-                false,
-            )?,
-            fs_compute_barrier: alloc(
-                o,
-                barrier::SIZE * sizes::COMPUTE_PIPES,
-                cmd_fw(),
-                None,
-                0,
-                false,
-            )?,
+            own_barrier: cmds.own_barrier.clone(),
+            prev_barrier: cmds.prev_barrier.clone(),
+            ta_fs_barrier: cmds.ta_fs_barrier.clone(),
+            fs_dep: cmds.fs_dep.clone(),
+            compute_barrier: cmds.compute_barrier.clone(),
+            fs_compute_barrier: cmds.fs_compute_barrier.clone(),
         })
     }
 

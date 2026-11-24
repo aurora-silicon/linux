@@ -9,7 +9,7 @@ use super::{
     command::Command,
     object::{Factory, Objects},
     pools::{PbEpoch, PoolSet},
-    slots::{ComputeSlot, PassSlot, Placement},
+    slots::{ComputeSlot, PassCmds, PassSlot, Placement},
     vm::VmState,
 };
 use crate::mmu;
@@ -19,6 +19,60 @@ use kernel::{
     prelude::*,
     sync::{Arc, CondVar, CondVarTimeoutResult, Mutex, SetOnce, SpinLockIrq},
 };
+
+/// One pass slot index's device-lifetime render command records and the allocator that maps
+/// them. The allocator is never dropped: an ASC-cached M4 mapping has no qualified teardown
+/// (`mmu::KernelMapping::drop` refuses it), so even a failed construction keeps its mappings.
+struct PersistentPassCmds {
+    objects: core::mem::ManuallyDrop<Objects>,
+    cmds: Option<PassCmds>,
+}
+
+/// The firmware-cached render microsequences and barrier records of every pass slot index
+/// (`0..RENDER_SLOTS`), created on first use and kept until reboot. A pass slot index is
+/// device-global and claimed by one flight at a time, so every VM's [`PassSlot`] of an index
+/// shares its records, and closing a VM drops no firmware-cached mapping.
+#[pin_data]
+pub(crate) struct RenderCmds {
+    #[pin]
+    sets: Mutex<[Option<KBox<PersistentPassCmds>>; super::hw::sizes::RENDER_SLOTS]>,
+}
+
+impl RenderCmds {
+    pub(crate) fn new() -> Result<Arc<Self>> {
+        Arc::pin_init(
+            pin_init!(Self {
+                sets <- new_mutex!(
+                    [const { None }; super::hw::sizes::RENDER_SLOTS],
+                    "g16::render_cmds"
+                ),
+            }),
+            GFP_KERNEL,
+        )
+    }
+
+    /// The records of pass slot index `k`, allocated from `factory` on first use.
+    pub(crate) fn get(&self, factory: &Factory, k: usize) -> Result<PassCmds> {
+        let mut sets = self.sets.lock();
+        let entry = sets.get_mut(k).ok_or(EINVAL)?;
+        if let Some(cmds) = entry.as_ref().and_then(|set| set.cmds.as_ref()) {
+            return Ok(cmds.clone());
+        }
+        let mut set = KBox::new(
+            PersistentPassCmds {
+                objects: core::mem::ManuallyDrop::new(factory.persistent_objects()),
+                cmds: None,
+            },
+            GFP_KERNEL,
+        )?;
+        // From here on a failure leaks the allocator with whatever it mapped.
+        let cmds = PassCmds::new(&mut set.objects)?;
+        set.objects.finish_private()?;
+        set.cmds = Some(cmds.clone());
+        *entry = Some(set);
+        Ok(cmds)
+    }
+}
 
 /// Never-exposed PB epochs an open VM keeps on standby after bursts drain.
 ///
@@ -167,14 +221,15 @@ impl ComputeUnitSet {
 pub(crate) const BASE_RENDER_SLOTS: usize = super::hw::sizes::BASE_RENDER_SLOTS;
 /// Demand-grown extension render pass slot tiers (`BASE_RENDER_SLOTS..hw::sizes::RENDER_SLOTS`).
 ///
-/// Each extension `PassSlot` backs 3.59 MiB (2 MiB TPC + 1 MiB tilemap + 608 KiB metadata,
-/// scratch, and barriers). Growing in four bounded chunks keeps compositor and shallow desktop
-/// VMs on Tier 0 (~21.6 MiB), keeps 20-31 pass workloads on Tier 2 without paying for 48 slots,
-/// and keeps every tier's client-object batch well below `MAX_CLIENT` (512):
-/// - Tier 0 (`2..8`, 6 slots, +21.56 MiB / 21.56 MiB cum): compositors, 2-6 pass frames.
-/// - Tier 1 (`8..18`, 10 slots, +35.94 MiB / 57.50 MiB cum): moderate multi-pass bursts.
-/// - Tier 2 (`18..32`, 14 slots, +50.31 MiB / 107.81 MiB cum): 20-31 pass pipelined frames.
-/// - Tier 3 (`32..RENDER_SLOTS`, 16 slots, +57.50 MiB / 165.31 MiB cum at 48 slots): deep
+/// Each extension `PassSlot` backs 3.47 MiB (2 MiB TPC + 1 MiB tilemap + 480 KiB metadata and
+/// scratch; its microsequences and barriers are the device-lifetime [`RenderCmds`] of its index).
+/// Growing in four bounded chunks keeps compositor and shallow desktop VMs on Tier 0
+/// (~20.8 MiB), keeps 20-31 pass workloads on Tier 2 without paying for 48 slots, and keeps
+/// every tier's client-object batch well below `MAX_CLIENT` (512):
+/// - Tier 0 (`2..8`, 6 slots, +20.81 MiB / 20.81 MiB cum): compositors, 2-6 pass frames.
+/// - Tier 1 (`8..18`, 10 slots, +34.69 MiB / 55.50 MiB cum): moderate multi-pass bursts.
+/// - Tier 2 (`18..32`, 14 slots, +48.56 MiB / 104.06 MiB cum): 20-31 pass pipelined frames.
+/// - Tier 3 (`32..RENDER_SLOTS`, 16 slots, +55.50 MiB / 159.56 MiB cum at 48 slots): deep
 ///   multi-pass bursts (160 client mappings <= `MAX_CLIENT`).
 pub(crate) const EXT_RENDER_TIERS: [(usize, usize); 4] = [
     (BASE_RENDER_SLOTS, 8),
@@ -324,8 +379,8 @@ fn should_expand_compute_ext(
 ///
 /// Steady 60/120 Hz single-pass depth-1 clients finish each frame before the next arrives
 /// (`active_passes == 0`, `render_count == 1`, inter-frame gap >= `BURST_GAP_NS`) and stay
-/// on the two base pass slots (~49.2 MiB). Extension tiers grow on demand: Tier 0 (`2..8`,
-/// +21.6 MiB) allocates when a base pass slot is quarantined, a VM overlaps an in-flight render,
+/// on the two base pass slots (~48.9 MiB). Extension tiers grow on demand: Tier 0 (`2..8`,
+/// +20.8 MiB) allocates when a base pass slot is quarantined, a VM overlaps an in-flight render,
 /// submits a multi-pass command stream (`render_count >= BASE_RENDER_SLOTS`), or sustains a
 /// sub-2 ms back-to-back burst; higher tiers allocate only when live passes plus this submission
 /// and one displacement slot exceed the currently backed capacity.
@@ -467,7 +522,8 @@ impl RenderArena {
         let mut objects = factory.objects(vm);
         let mut passes = KVec::with_capacity(BASE_RENDER_SLOTS, GFP_KERNEL)?;
         for k in 0..BASE_RENDER_SLOTS {
-            passes.push(PassSlot::new(&mut objects, k as u64, 1)?, GFP_KERNEL)?;
+            let cmds = factory.pass_cmds(k)?;
+            passes.push(PassSlot::new(&mut objects, k as u64, 1, &cmds)?, GFP_KERNEL)?;
         }
         let pools = PoolSet::new_with_slots(&mut objects, factory, base_pb_slots)?;
         objects.finish_private()?;
@@ -565,7 +621,8 @@ impl RenderExtArena {
         let mut tilemap_clean = KVec::with_capacity(count, GFP_KERNEL)?;
         let mut heap_dirty = KVec::with_capacity(count, GFP_KERNEL)?;
         for k in slots.clone() {
-            passes.push(PassSlot::new(&mut objects, k as u64, 1)?, GFP_KERNEL)?;
+            let cmds = factory.pass_cmds(k)?;
+            passes.push(PassSlot::new(&mut objects, k as u64, 1, &cmds)?, GFP_KERNEL)?;
             tpc_dirty.push(AtomicU64::new(0), GFP_KERNEL)?;
             tilemap_dirty.push(AtomicU64::new(0), GFP_KERNEL)?;
             tilemap_last.push(AtomicU64::new(0), GFP_KERNEL)?;

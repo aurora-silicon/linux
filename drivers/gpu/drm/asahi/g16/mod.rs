@@ -754,10 +754,11 @@ impl Firmware {
             let pools = pools::Pools::new_boxed(dev)?;
             let vms = vm::Registry::new()?;
             let engine = engine::Engine::new()?;
+            let render_cmds = resources::RenderCmds::new()?;
             let slot = KBox::<Firmware>::new_uninit(GFP_KERNEL)?;
-            Ok((graph, slots, pools, vms, engine, slot))
+            Ok((graph, slots, pools, vms, engine, render_cmds, slot))
         })();
-        let (graph, slots, pools, vms, engine, slot) = match backend {
+        let (graph, slots, pools, vms, engine, render_cmds, slot) = match backend {
             Ok(backend) => backend,
             Err(error) => {
                 dev_err!(
@@ -777,7 +778,7 @@ impl Firmware {
             events,
             ..
         } = KBox::into_inner(booted);
-        let private_factory = objects.private_factory();
+        let private_factory = objects.private_factory(render_cmds);
         let mut firmware = slot
             .write_init(init!(Firmware {
                 session,

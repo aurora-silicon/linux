@@ -46,6 +46,13 @@ pub(crate) enum Class {
     Shared,
     /// Firmware and GPU, ASC-cached.
     SharedCached,
+    /// Firmware-only, ASC-cached (AttrIndex 0) behind a cacheable host mapping: the leaf macOS
+    /// 26B123 gives its per-queue command objects and the G13-G15 private-allocator contract
+    /// (`PROT_FW_PRIV_RW` behind `gem::new_kernel_object`). Only for records the host writes
+    /// before publication and the firmware only reads, with no client or lower alias, and only
+    /// from device-lifetime allocators ([`Factory::persistent_objects`]): an ASC-cached M4
+    /// mapping has no qualified teardown, so its owner is never dropped.
+    FwCoherent,
     /// Firmware device mapping.
     #[allow(dead_code)]
     Mmio,
@@ -59,6 +66,7 @@ impl Class {
             Class::FwCached => pte::FW_CACHED,
             Class::Shared => pte::SHARED,
             Class::SharedCached => pte::SHARED_CACHED,
+            Class::FwCoherent => pte::FW_CACHED,
             Class::Mmio => pte::MMIO,
         }
     }
@@ -325,6 +333,7 @@ pub(crate) struct Factory {
     uat: Arc<mmu::Uat>,
     window: Arc<Mutex<uat::Window>>,
     firmware: core::ops::Range<u64>,
+    render_cmds: Arc<super::resources::RenderCmds>,
 }
 
 impl Factory {
@@ -339,6 +348,7 @@ impl Factory {
                 pending: None,
             }),
             sealed: false,
+            persistent: false,
             fw_next: self.firmware.start,
             retained: KVec::new(),
             clients: KVec::new(),
@@ -360,6 +370,7 @@ impl Factory {
                 pending: None,
             }),
             sealed: false,
+            persistent: false,
             fw_next: self.firmware.start,
             retained: KVec::new(),
             clients: KVec::new(),
@@ -367,6 +378,36 @@ impl Factory {
             error: None,
             pages: 0,
         }
+    }
+
+    /// Allocates the only objects that may hold [`Class::FwCoherent`] records: firmware-only,
+    /// with no client VM binding. The caller owns them for the device lifetime and never drops
+    /// them ([`super::resources::RenderCmds`]).
+    pub(crate) fn persistent_objects(&self) -> Objects {
+        Objects {
+            dev: self.dev.clone(),
+            uat: self.uat.clone(),
+            window: self.window.clone(),
+            private: Some(Private {
+                vm: None,
+                firmware: self.firmware.clone(),
+                pending: None,
+            }),
+            sealed: false,
+            persistent: true,
+            fw_next: self.firmware.start,
+            retained: KVec::new(),
+            clients: KVec::new(),
+            mappings: KVec::new(),
+            error: None,
+            pages: 0,
+        }
+    }
+
+    /// The device-lifetime render microsequences and barrier records of pass slot `k`, shared by
+    /// every VM's [`super::slots::PassSlot`] `k`.
+    pub(crate) fn pass_cmds(&self, k: usize) -> Result<super::slots::PassCmds> {
+        self.render_cmds.get(self, k)
     }
 }
 
@@ -378,6 +419,8 @@ pub(crate) struct Objects {
     pub(crate) window: Arc<Mutex<uat::Window>>,
     private: Option<Private>,
     sealed: bool,
+    /// A device-lifetime allocator that may map [`Class::FwCoherent`] records.
+    persistent: bool,
     /// Next free VA of the firmware allocator window.
     fw_next: u64,
     /// Every object owned by this session or private arena.
@@ -406,6 +449,7 @@ impl Objects {
             window: Arc::pin_init(new_mutex!(window, "g16::Objects::window"), GFP_KERNEL)?,
             private: None,
             sealed: false,
+            persistent: false,
             fw_next: hw::va::FW_ALLOC.start,
             retained: KVec::new(),
             clients: KVec::new(),
@@ -416,19 +460,24 @@ impl Objects {
     }
 
     /// Freeze the session allocation boundary before making any private arenas.
-    pub(crate) fn private_factory(&mut self) -> Factory {
+    pub(crate) fn private_factory(
+        &mut self,
+        render_cmds: Arc<super::resources::RenderCmds>,
+    ) -> Factory {
         self.sealed = true;
         Factory {
             dev: self.dev.clone(),
             uat: self.uat.clone(),
             window: self.window.clone(),
             firmware: self.fw_next..hw::va::FW_ALLOC.end,
+            render_cmds,
         }
     }
 
     /// Maps private backing into one client and unique kernel/firmware apertures. Mapping
     /// owners retain the GEM independently, including every partial construction failure.
-    /// All reclaimable objects are NC from creation; there is no ASC cache transition.
+    /// All reclaimable objects are NC from creation; there is no ASC cache transition. Only a
+    /// device-lifetime allocator maps [`Class::FwCoherent`] records, never reclaimed.
     fn alloc_private(&mut self, req: Request) -> Result<Arc<FwObject>> {
         self.alloc_private_in(req, None)
     }
@@ -454,7 +503,12 @@ impl Objects {
         client_range: Option<core::ops::Range<u64>>,
     ) -> Result<Arc<FwObject>> {
         if !matches!(req.placement, Placement::Anywhere)
-            || !matches!(req.class, Class::Fw | Class::Shared)
+            || !matches!(req.class, Class::Fw | Class::Shared | Class::FwCoherent)
+            || (req.class == Class::FwCoherent
+                && (!self.persistent
+                    || req.client.is_some()
+                    || req.lower.is_some()
+                    || client_range.is_some()))
             || req.size == 0
             || req.offset >= hw::PAGE as usize
         {
@@ -469,14 +523,21 @@ impl Objects {
             & !(hw::PAGE as usize - 1);
         self.retained.reserve(1, GFP_KERNEL)?;
         self.mappings.reserve(3, GFP_KERNEL)?;
-        let mut backing = gem::new_kernel_object_wc(&self.dev, bytes)?;
+        // A firmware-cached record needs a cacheable host view of the same pages (the host and
+        // firmware caches are coherent, as for G13-G15 private objects); every other private
+        // class keeps its write-combined view.
+        let mut backing = if req.class == Class::FwCoherent {
+            gem::new_kernel_object(&self.dev, bytes)?
+        } else {
+            gem::new_kernel_object_wc(&self.dev, bytes)?
+        };
         let registered = self.dev.registration_guard().ok_or(ENODEV)?;
         let parent: &kernel::platform::Device<kernel::device::Bound> = registered.as_ref();
         gem::prepare_new_object(&backing.gem, parent.as_ref())?;
         let cpu = if req.cpu {
             let vmap = backing.vmap()?;
             let pointer = NonNull::new(vmap.addr.cast::<u8>()).ok_or(ENOMEM)?;
-            // SAFETY: Fresh private WC mapping spans bytes and has not been exposed.
+            // SAFETY: Fresh private mapping spans bytes and has not been exposed.
             unsafe { core::ptr::write_bytes(pointer.as_ptr(), 0, bytes) };
             Some(pointer)
         } else {
@@ -618,6 +679,10 @@ impl Objects {
                 return Err(EINVAL);
             }
             return self.alloc_private(req);
+        }
+        // Session objects are write-combined: they never give the firmware a cached record.
+        if req.class == Class::FwCoherent {
+            return Err(EINVAL);
         }
         if self.sealed {
             return Err(EBUSY);
