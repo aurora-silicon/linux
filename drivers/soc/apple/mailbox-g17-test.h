@@ -33,6 +33,30 @@ static void apple_g17_rx_flood_bounded_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, count, 64U * APPLE_G17_MBOX_RX_BUDGET);
 }
 
+/* A flooding FIFO: the hard interrupt drains one budget and hands the rest
+ * to the oneshot thread.
+ */
+static void apple_g17_rx_hardirq_budget_test(struct kunit *test)
+{
+	const struct apple_mbox_hw hw = {
+		.i2a_control = 0, .i2a_recv0 = 8, .i2a_recv1 = 16,
+		.control_empty = BIT(17),
+	};
+	struct apple_mbox mbox = { .hw = &hw, .rx = apple_g17_test_rx };
+	unsigned int count = 0;
+	void *regs = kunit_kzalloc(test, 32, GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, regs);
+	mbox.regs = (void __iomem *)regs;
+	mbox.ascwrap_v6.role = APPLE_MBOX_ASCWRAP_V6_ROLE_GFX;
+	mbox.cookie = &count;
+	spin_lock_init(&mbox.rx_lock);
+
+	KUNIT_EXPECT_EQ(test, apple_mbox_g17_recv_hardirq(0, &mbox), IRQ_WAKE_THREAD);
+	KUNIT_EXPECT_EQ(test, count, APPLE_G17_MBOX_RX_BUDGET);
+
+}
+
 static void apple_g17_tx_stall_bounded_test(struct kunit *test)
 {
 	const struct apple_mbox_hw hw = { .control_full = BIT(16) };
@@ -95,6 +119,7 @@ static void apple_g17_rx_util_min_test(struct kunit *test)
 
 static struct kunit_case apple_g17_stall_cases[] = {
 	KUNIT_CASE(apple_g17_rx_flood_bounded_test),
+	KUNIT_CASE(apple_g17_rx_hardirq_budget_test),
 	KUNIT_CASE(apple_g17_tx_stall_bounded_test),
 	KUNIT_CASE(apple_g17_rx_util_min_test),
 	{ }
