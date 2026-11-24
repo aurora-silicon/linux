@@ -1,12 +1,88 @@
 # Code owners for aurora-silicon/linux.
 #
-# Only files whose change affects every user or the release process are
-# listed. Changes to them need a review from an Owner; everything else
-# follows the normal merge policy:
-# https://github.com/aurora-silicon/agent-guidelines/blob/main/policy/merge-policy.md
-# Roles: https://github.com/aurora-silicon/agent-guidelines/blob/main/policy/governance-and-roles.md
+# Every PR is reviewed by Core or Omarchy Mac; an approval from either team
+# counts everywhere. The '# area:' sections only route: they add the area's
+# specialists to the review request and give the readiness bot its area:
+# labels. Omarchy Mac is listed first where it reviews first (M1 to M3
+# platform). Later lines win, as in every CODEOWNERS file, so keep the team
+# pair on every area line.
+# Routing and labels: https://github.com/aurora-silicon/agent-guidelines/blob/main/docs/MAINTAINER-HANDBOOK.md
+# Merge rules:        https://github.com/aurora-silicon/agent-guidelines/blob/main/policy/merge-policy.md
 
-/.github/                               @RyanTheTide @DjDeveloperr
-/arch/arm64/configs/aurora_defconfig    @RyanTheTide @DjDeveloperr
-/RELEASES.md                            @RyanTheTide @DjDeveloperr
-/CONTRIBUTING.md                        @RyanTheTide @DjDeveloperr
+*                                               @aurora-silicon/core @aurora-silicon/omarchy-m
+
+# area: platform
+/arch/arm64/boot/dts/apple/t8103*               @aurora-silicon/omarchy-m @aurora-silicon/core
+/arch/arm64/boot/dts/apple/t600*                @aurora-silicon/omarchy-m @aurora-silicon/core
+/arch/arm64/boot/dts/apple/t8112*               @aurora-silicon/omarchy-m @aurora-silicon/core
+/arch/arm64/boot/dts/apple/t602*                @aurora-silicon/omarchy-m @aurora-silicon/core
+/arch/arm64/boot/dts/apple/t8122*               @aurora-silicon/omarchy-m @aurora-silicon/core
+/arch/arm64/boot/dts/apple/t603*                @aurora-silicon/omarchy-m @aurora-silicon/core
+/drivers/soc/apple/                             @aurora-silicon/omarchy-m @aurora-silicon/core
+/drivers/iommu/apple-dart.c                     @aurora-silicon/omarchy-m @aurora-silicon/core
+/drivers/nvme/host/apple.c                      @aurora-silicon/omarchy-m @aurora-silicon/core
+/drivers/spmi/                                  @aurora-silicon/omarchy-m @aurora-silicon/core
+/drivers/watchdog/apple_wdt.c                   @aurora-silicon/omarchy-m @aurora-silicon/core
+/drivers/gpio/gpio-macsmc.c                     @aurora-silicon/omarchy-m @aurora-silicon/core
+
+# area: bringup
+/arch/arm64/boot/dts/apple/t8132*               @aurora-silicon/core @aurora-silicon/omarchy-m
+/arch/arm64/boot/dts/apple/t604*                @aurora-silicon/core @aurora-silicon/omarchy-m
+/arch/arm64/boot/dts/apple/t8140*               @aurora-silicon/core @aurora-silicon/omarchy-m
+/arch/arm64/boot/dts/apple/t8142*               @aurora-silicon/core @aurora-silicon/omarchy-m
+/arch/arm64/boot/dts/apple/t8152*               @aurora-silicon/core @aurora-silicon/omarchy-m
+/arch/arm64/boot/dts/apple/t6050*               @aurora-silicon/core @aurora-silicon/omarchy-m
+
+# area: gpu
+/drivers/gpu/drm/asahi/                         @aurora-silicon/core @aurora-silicon/omarchy-m @DjDeveloperr
+/include/uapi/drm/asahi_drm.h                   @aurora-silicon/core @aurora-silicon/omarchy-m @DjDeveloperr
+/tools/asahi/                                   @aurora-silicon/core @aurora-silicon/omarchy-m @DjDeveloperr
+
+# area: display
+/drivers/gpu/drm/apple/                         @aurora-silicon/core @aurora-silicon/omarchy-m
+/drivers/gpu/drm/tiny/appletbdrm.c              @aurora-silicon/core @aurora-silicon/omarchy-m
+
+# area: audio
+/sound/soc/apple/                               @aurora-silicon/core @aurora-silicon/omarchy-m
+/sound/soc/codecs/tas2764*                      @aurora-silicon/core @aurora-silicon/omarchy-m
+/sound/soc/codecs/tas2770*                      @aurora-silicon/core @aurora-silicon/omarchy-m
+/sound/soc/codecs/cs42l83*                      @aurora-silicon/core @aurora-silicon/omarchy-m
+/sound/soc/codecs/cs42l84*                      @aurora-silicon/core @aurora-silicon/omarchy-m
+
+# area: power
+/drivers/pmdomain/apple/                        @aurora-silicon/core @aurora-silicon/omarchy-m
+/drivers/cpufreq/apple-soc-cpufreq.c            @aurora-silicon/core @aurora-silicon/omarchy-m
+/drivers/mfd/macsmc.c                           @aurora-silicon/core @aurora-silicon/omarchy-m
+/drivers/power/supply/macsmc-power*             @aurora-silicon/core @aurora-silicon/omarchy-m
+/drivers/rtc/rtc-macsmc.c                       @aurora-silicon/core @aurora-silicon/omarchy-m
+/drivers/hwmon/macsmc-hwmon.c                   @aurora-silicon/core @aurora-silicon/omarchy-m
+
+# area: usb
+/drivers/usb/typec/tipd/                        @aurora-silicon/core @aurora-silicon/omarchy-m
+/drivers/phy/apple/                             @aurora-silicon/core @aurora-silicon/omarchy-m
+/drivers/thunderbolt/apple*                     @aurora-silicon/core @aurora-silicon/omarchy-m
+
+# area: media
+/drivers/media/platform/apple/                  @aurora-silicon/core @aurora-silicon/omarchy-m
+/drivers/accel/ane/                             @aurora-silicon/core @aurora-silicon/omarchy-m
+
+# area: wireless
+/drivers/net/wireless/broadcom/brcm80211/       @aurora-silicon/core @aurora-silicon/omarchy-m
+/drivers/bluetooth/hci_bcm4377.c                @aurora-silicon/core @aurora-silicon/omarchy-m
+
+# area: input
+/drivers/input/touchscreen/apple_z2.c           @aurora-silicon/core @aurora-silicon/omarchy-m
+/drivers/input/misc/macsmc-input.c              @aurora-silicon/core @aurora-silicon/omarchy-m
+/drivers/hid/hid-apple.c                        @aurora-silicon/core @aurora-silicon/omarchy-m
+
+# area: rust
+/rust/                                          @aurora-silicon/core @aurora-silicon/omarchy-m
+
+# Files whose change affects every user or the release process: an Owner
+# reviews them. Keep these last so they win.
+# area: release
+/.github/                                       @RyanTheTide @DjDeveloperr
+/arch/arm64/configs/aurora_defconfig            @RyanTheTide @DjDeveloperr
+/RELEASES.md                                    @RyanTheTide @DjDeveloperr
+/CONTRIBUTING.md                                @RyanTheTide @DjDeveloperr
+# end-area
