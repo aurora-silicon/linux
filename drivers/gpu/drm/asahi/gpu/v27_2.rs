@@ -9,6 +9,8 @@
 //! that manager's own root.
 
 use super::*;
+use kernel::device;
+use crate::g14_v27_2_abi::{self, GrowRequest, QueueError};
 use crate::g17::fw::m5::initdata as abi;
 use crate::hw::{RegisterBaseV27_2, RegisterV27_2};
 use crate::m3::m3_init_26 as directory26;
@@ -26,6 +28,9 @@ const COMPUTE: usize = 2;
 const PRIORITY_GROUP: usize = 2;
 const PRIORITY_ROW: usize = 2;
 /// The submission descriptor the queue publishes on (three per group).
+const RENDER_GROUP: usize = 0;
+pub(crate) const TILER: usize = 0;
+pub(crate) const FRAGMENT: usize = 1;
 const SUBMISSION_RING: usize = 3 * PRIORITY_GROUP + COMPUTE;
 /// Firmware event, log, trace and statistics rings in the 34-entry channel list.
 const EVENT_RING: usize = 13;
@@ -119,6 +124,8 @@ fn encode_compute(
     put64(cmd, 0x334, timestamps + 0x20);
 
     put32(stream, 0, 11);
+    // 13.5 StartCompute.unk_28, at the same place in this layout (the 13.5 G14 path writes 1).
+    put32(stream, 0x28, 1);
     put64(stream, 0x160, job.sequence);
     put64(stream, 0x04, cmd_va + 0x18);
     put64(stream, 0x0c, cmd_va + 0x68);
@@ -152,8 +159,99 @@ fn encode_compute(
     put32(stream, finish + 0x84, 0x4000_0002);
 }
 
-/// The root's queue and the kernel-owned boot job published on it: one compute dispatch of an
-/// empty control stream in context 0, which the firmware must retire before clients run.
+/// A persistent firmware queue with a separate scheduler context and stamp slot per data master.
+struct DmQueue {
+    queue: fw::types::GpuArray<u8>,
+    positions: fw::types::GpuArray<u8>,
+    pointers: fw::types::GpuArray<u8>,
+    event: event::Event,
+    announced: core::sync::atomic::AtomicBool,
+    _scheduler: fw::types::GpuArray<u8>,
+    _stamps: fw::types::GpuArray<u8>,
+}
+
+impl DmQueue {
+    fn new(alloc: &mut KernelAllocators, event: event::Event, priority: usize) -> Result<Self> {
+        let mut queue = alloc.private.array_empty::<u8>(0x2cc0)?;
+        let mut positions = alloc.shared.array_empty::<u8>(0x2860)?;
+        let pointers = alloc.private.array_empty::<u8>(0x2860)?;
+        let mut scheduler = alloc.private.array_empty::<u8>(0x40)?;
+        let mut queue_stamps = alloc.shared.array_empty::<u8>(0x18)?;
+        let queue_stamps_va = queue_stamps.gpu_va().get();
+        put64(queue_stamps.as_mut_slice(), 8, queue_stamps_va);
+        let ctx = scheduler.as_mut_slice();
+        ctx[..2].copy_from_slice(&u16::MAX.to_le_bytes());
+        ctx[5] = 1;
+        ctx[0x27] = 0xff;
+        let queue_va = queue.gpu_va().get();
+        let q = queue.as_mut_slice();
+        for (offset, value) in [(0, positions.gpu_va().get()), (8, pointers.gpu_va().get()),
+                                (0x10, queue_stamps_va), (0x18, queue_va + 0x90),
+                                (0x7c, scheduler.gpu_va().get())] {
+            put64(q, offset, value);
+        }
+        // The kernel-owned queue has no owning process.
+        for offset in [0x2c, 0x4c, 0x50] {
+            put32(q, offset, u32::MAX);
+        }
+        let row = crate::fw::workqueue::raw::PRIORITY[priority];
+        put32(q, 0x30, row.0);
+        put32(q, 0x34, row.1);
+        put64(q, 0x38, row.2.0);
+        put32(q, 0x40, row.3);
+        put32(q, 0x44, row.4);
+        // The current lane stays at the all-ones sentinel; the firmware assigns it.
+        put32(q, 0x48, u32::MAX);
+        crate::pgtable::clean_poc(q.as_ptr(), q.len());
+        put32(positions.as_mut_slice(), 0x50, QUEUE_CAPACITY);
+        for mapping in [&positions, &pointers, &scheduler, &queue_stamps] {
+            crate::pgtable::clean_poc(mapping.as_slice().as_ptr(), mapping.as_slice().len());
+        }
+        Ok(Self { queue, positions, pointers, event,
+            announced: core::sync::atomic::AtomicBool::new(false),
+            _scheduler: scheduler, _stamps: queue_stamps })
+    }
+
+    fn info(&self, engine_state: u64) -> QueueInfo {
+        QueueInfo {
+            queue: self.queue.gpu_va().get(),
+            slot: self.event.slot(),
+            stamp: u64::from(self.event.stamp_pointer()),
+            fw_stamp: u64::from(self.event.fw_stamp_pointer()),
+            compute_state: engine_state,
+        }
+    }
+}
+
+/// A prepared submission has written only unowned ring entries. Publishing its cursors is
+/// infallible, so a pair can be staged before either of its queues becomes firmware-visible.
+pub(crate) struct Submission<'a> {
+    head: &'a core::sync::atomic::AtomicU32,
+    positions: &'a [u8],
+    target: u32,
+    producer: &'a core::sync::atomic::AtomicU32,
+    indices: &'a [u8],
+    next: u32,
+    announced: Option<&'a core::sync::atomic::AtomicBool>,
+}
+
+impl Submission<'_> {
+    pub(crate) fn target(&self) -> u32 { self.target }
+
+    pub(crate) fn publish(self) {
+        self.head.store(self.target, Ordering::Release);
+        crate::pgtable::clean_poc(self.positions.as_ptr(), 0x60);
+        crate::pgtable::poc_barrier();
+        self.producer.store(self.next, Ordering::Release);
+        crate::pgtable::clean_poc(self.indices.as_ptr(), 0x30);
+        crate::pgtable::poc_barrier();
+        if let Some(announced) = self.announced {
+            announced.store(true, Ordering::Release);
+        }
+    }
+}
+
+/// The kernel-owned boot dispatch must retire before clients use the compute queue.
 struct BootJob {
     queue: fw::types::GpuArray<u8>,
     positions: fw::types::GpuArray<u8>,
@@ -238,7 +336,7 @@ impl BootJob {
         for owner in [queue_stamps, scheduler, cursor] {
             owners.push(owner, GFP_KERNEL)?;
         }
-        let expected_stamp = event.current().next().raw();
+        let expected_stamp = event.current_noncoherent().next().raw();
         Ok(Self { queue, positions, pointers, command, stream, tracking, timestamps, event,
                   expected_stamp, _owners: owners, _client: (mapping, object),
                   client_va, preempt1: preempt1 as u64 })
@@ -278,6 +376,9 @@ impl BootJob {
 /// translates. Slots are reused in order.
 pub(crate) const POOL_SLOTS: usize = 48;
 
+const COMMAND_STRIDE: usize = 0x1000;
+const STREAM_STRIDE: usize = 0x400;
+
 pub(crate) struct CommandPool {
     commands: fw::types::GpuArray<u8>,
     streams: fw::types::GpuArray<u8>,
@@ -289,8 +390,8 @@ pub(crate) struct CommandPool {
 
 impl CommandPool {
     pub(crate) fn new(alloc: &mut KernelAllocators, cfg: &'static hw::HwConfig) -> Result<Self> {
-        let commands = alloc.private.array_empty::<u8>(POOL_SLOTS * 0x400)?;
-        let streams = alloc.private.array_empty::<u8>(POOL_SLOTS * 0x400)?;
+        let commands = alloc.private.array_empty::<u8>(POOL_SLOTS * COMMAND_STRIDE)?;
+        let streams = alloc.private.array_empty::<u8>(POOL_SLOTS * STREAM_STRIDE)?;
         let mut tracking = alloc.private.array_empty::<u8>(POOL_SLOTS * 0x100)?;
         // One 64-byte line per retirement cursor, so no firmware write can reach a neighbour.
         let cursors = alloc.shared.array_empty::<u8>(POOL_SLOTS * 0x40)?;
@@ -305,24 +406,37 @@ impl CommandPool {
 
     /// Builds slot `i` for `job` and returns the command's firmware VA.
     pub(crate) fn encode(&mut self, i: usize, q: &QueueInfo, stamp_value: u32, job: &ComputeJob) -> Result<u64> {
+        let preempt1 = self.preempt1;
+        self.encode_with(i, job.context, job.sequence, stamp_value, |cmd, stream, common| {
+            encode_compute(cmd, common.cmd_va, stream, common.stream_va, common.tracking,
+                           common.timestamps, preempt1, q, stamp_value, job);
+            Ok(())
+        })
+    }
+
+    pub(crate) fn encode_with(
+        &mut self, i: usize, context: u32, sequence: u64, stamp_value: u32,
+        encode: impl FnOnce(&mut [u8], &mut [u8], crate::g14_v27_2_render::Common) -> Result,
+    ) -> Result<u64> {
         if i >= POOL_SLOTS { return Err(EINVAL); }
-        let cmd_va = self.commands.gpu_va().get() + (i * 0x400) as u64;
-        let stream_va = self.streams.gpu_va().get() + (i * 0x400) as u64;
+        let cmd_va = self.commands.gpu_va().get() + (i * COMMAND_STRIDE) as u64;
+        let stream_va = self.streams.gpu_va().get() + (i * STREAM_STRIDE) as u64;
         let tracking_va = self.tracking.gpu_va().get() + (i * 0x100) as u64;
         let timestamps_va = self.stamps.gpu_va().get() + (i * 0x80) as u64;
-        // The firmware keeps 0xc8 bytes of the tracking slot; start each use cleared.
         let tracking = &mut self.tracking.as_mut_slice()[i * 0x100..(i + 1) * 0x100];
         tracking[8..].fill(0);
         crate::pgtable::clean_poc(tracking.as_ptr(), tracking.len());
         let stamps = &mut self.stamps.as_mut_slice()[i * 0x80..(i + 1) * 0x80];
         stamps.fill(0);
-        crate::pgtable::clean_poc(stamps.as_ptr(), 0x80);
-        let cmd = &mut self.commands.as_mut_slice()[i * 0x400..(i + 1) * 0x400];
+        crate::pgtable::clean_poc(stamps.as_ptr(), stamps.len());
+        let cmd = &mut self.commands.as_mut_slice()[i * COMMAND_STRIDE..(i + 1) * COMMAND_STRIDE];
         cmd.fill(0);
-        let stream = &mut self.streams.as_mut_slice()[i * 0x400..(i + 1) * 0x400];
+        let stream = &mut self.streams.as_mut_slice()[i * STREAM_STRIDE..(i + 1) * STREAM_STRIDE];
         stream.fill(0);
-        encode_compute(cmd, cmd_va, stream, stream_va, tracking_va, timestamps_va, self.preempt1,
-                       q, stamp_value, job);
+        encode(cmd, stream, crate::g14_v27_2_render::Common {
+            cmd_va, stream_va, tracking: tracking_va, timestamps: timestamps_va,
+            context, sequence, stamp_value,
+        })?;
         crate::pgtable::clean_poc(stream.as_ptr(), stream.len());
         crate::pgtable::clean_poc(cmd.as_ptr(), cmd.len());
         crate::pgtable::poc_barrier();
@@ -358,24 +472,31 @@ impl CommandPool {
     }
 }
 
-/// Ring contents prepared while the firmware still owns the old producer.
-pub(crate) struct ComputePublication<'a> {
-    positions: &'a fw::types::GpuArray<u8>,
-    indices: &'a fw::types::GpuArray<u8>,
-    head: &'a core::sync::atomic::AtomicU32,
-    producer: &'a core::sync::atomic::AtomicU32,
-    next_head: u32,
-    next_producer: u32,
+pub(crate) enum FirmwareEvent {
+    Grow(GrowRequest),
+    ChannelError,
+    Notification,
 }
 
-impl ComputePublication<'_> {
-    pub(crate) fn commit(self) {
-        self.head.store(self.next_head, Ordering::Release);
-        crate::pgtable::clean_poc(self.positions.as_slice().as_ptr(), 0x60);
+pub(crate) struct ControlReply<'a> {
+    state: &'a fw::types::GpuArray<u8>,
+    ring: &'a fw::types::GpuArray<u8>,
+    cursor: u32,
+}
+
+impl ControlReply<'_> {
+    pub(crate) fn grow(self, request: GrowRequest, granted: bool) -> Result {
+        let record = request.reply(granted);
+        let at = self.cursor as usize * core::mem::size_of_val(&record);
+        for (index, word) in record.into_iter().enumerate() {
+            self.ring.shared_index(at + index * 4)?.store(word, Ordering::Relaxed);
+        }
+        crate::pgtable::clean_poc(self.ring.as_slice()[at..].as_ptr(), core::mem::size_of_val(&record));
         crate::pgtable::poc_barrier();
-        self.producer.store(self.next_producer, Ordering::Release);
-        crate::pgtable::clean_poc(self.indices.as_slice().as_ptr(), 0x30);
+        self.state.shared_index(0x20)?.store((self.cursor + 1) % RING_RECORDS, Ordering::Release);
+        crate::pgtable::clean_poc(self.state.as_slice().as_ptr(), 0x30);
         crate::pgtable::poc_barrier();
+        Ok(())
     }
 }
 
@@ -384,6 +505,8 @@ pub(crate) struct RootV27_2 {
     graph: Arc<GpuManagerG14V13_5>,
     boot: BootJob,
     compute_state: u64,
+    render_states: [u64; 2],
+    render_queues: [DmQueue; 2],
     channels: KVec<fw::types::GpuArray<u8>>,
     _owners: KVec<fw::types::GpuArray<u8>>,
     _register_mappings: KVec<mmu::KernelMapping>,
@@ -415,7 +538,7 @@ impl RootV27_2 {
 
     /// The queue's identity for client commands, and the stamp value it last reached.
     pub(crate) fn queue(&self) -> (QueueInfo, event::EventValue) {
-        (self.boot.info(self.compute_state), self.boot.event.current())
+        (self.boot.info(self.compute_state), self.boot.event.current_noncoherent())
     }
 
     /// The queue's capacity (position block +0x50).
@@ -431,50 +554,109 @@ impl RootV27_2 {
         Ok((Self::word(&self.boot.positions, 0x40)?, Self::word(&self.boot.positions, 0)?))
     }
 
-    /// Prepares a work pointer and channel entry without advancing either producer.
-    pub(crate) fn stage_compute(&self, command: u64) -> Result<ComputePublication<'_>> {
-        let job = &self.boot;
-        let indices = &self.channels[2 * SUBMISSION_RING];
-        let ring = &self.channels[2 * SUBMISSION_RING + 1];
-        crate::pgtable::clean_invalidate_poc(job.positions.as_slice().as_ptr(), 0x60);
+    pub(crate) fn render_queue(&self, dm: usize) -> (QueueInfo, event::EventValue) {
+        let queue = &self.render_queues[dm];
+        (queue.info(self.render_states[dm]), queue.event.current_noncoherent())
+    }
+
+    pub(crate) fn render_done(&self, dm: usize, target: u32, stamp: event::EventValue) -> Result<bool> {
+        let queue = &self.render_queues[dm];
+        crate::pgtable::clean_invalidate_poc(queue.positions.as_slice().as_ptr(), 0x60);
+        crate::pgtable::poc_barrier();
+        Ok(Self::word(&queue.positions, 0)? == target && queue.event.current_noncoherent() >= stamp)
+    }
+
+    fn log_queue(
+        dev: &device::Device, name: &str, positions: &fw::types::GpuArray<u8>,
+        queue: &fw::types::GpuArray<u8>, stamp: &event::Event,
+    ) {
+        crate::pgtable::clean_invalidate_poc(positions.as_slice().as_ptr(), 0x60);
+        crate::pgtable::clean_invalidate_poc(queue.as_slice().as_ptr(), 0x90);
+        crate::pgtable::poc_barrier();
+        dev_err!(dev, "GPU: {} queue head={:?} fetched={:?} retired={:?} scheduler={:?} stamp={:#x}\n",
+            name, Self::word(positions, 0x40), Self::word(positions, 0x30),
+            Self::word(positions, 0), Self::word(queue, 0x74), stamp.current_noncoherent().raw());
+    }
+
+    pub(crate) fn log_timeout(&self, dev: &device::Device) {
+        Self::log_queue(dev, "compute", &self.boot.positions, &self.boot.queue, &self.boot.event);
+        for (name, queue) in ["tiler", "fragment"].into_iter().zip(&self.render_queues) {
+            Self::log_queue(dev, name, &queue.positions, &queue.queue, &queue.event);
+        }
+    }
+
+    pub(crate) fn render_kick(dm: usize) -> u64 {
+        MSG_TX_DOORBELL | (4 * RENDER_GROUP + dm) as u64
+    }
+
+    pub(crate) fn render_queue_announced(&self, dm: usize) -> bool {
+        self.render_queues[dm].announced.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn stage_render(&self, dm: usize, commands: &[u64]) -> Result<Submission<'_>> {
+        let queue = self.render_queues.get(dm).ok_or(EINVAL)?;
+        self.stage_work(&queue.positions, &queue.pointers, queue.info(0),
+                        Some(&queue.announced), RENDER_GROUP, dm, commands)
+    }
+
+    pub(crate) fn stage_compute(&self, command: u64) -> Result<Submission<'_>> {
+        self.stage_work(&self.boot.positions, &self.boot.pointers, self.boot.info(self.compute_state),
+                        None, PRIORITY_GROUP, COMPUTE, &[command])
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn stage_work<'a>(
+        &'a self, positions: &'a fw::types::GpuArray<u8>, pointers: &fw::types::GpuArray<u8>,
+        queue: QueueInfo, announced: Option<&'a core::sync::atomic::AtomicBool>,
+        group: usize, dm: usize, commands: &[u64],
+    ) -> Result<Submission<'a>> {
+        let ring_index = 3 * group + dm;
+        let indices = &self.channels[2 * ring_index];
+        let ring = &self.channels[2 * ring_index + 1];
+        crate::pgtable::clean_invalidate_poc(positions.as_slice().as_ptr(), 0x60);
         crate::pgtable::clean_invalidate_poc(indices.as_slice().as_ptr(), 0x30);
         crate::pgtable::poc_barrier();
-        let head = job.positions.shared_index(0x40)?;
+
+        let head = positions.shared_index(0x40)?;
         let old = head.load(Ordering::Acquire);
-        let capacity = Self::word(&job.positions, 0x50)?;
-        let retired = Self::word(&job.positions, 0)?;
-        if capacity <= 1 || old >= capacity || retired >= capacity
-            || capacity as usize > job.pointers.len() / 8
-        {
+        let capacity = Self::word(positions, 0x50)?;
+        let retired = Self::word(positions, 0)?;
+        let first = announced.is_some_and(|first| !first.load(Ordering::Acquire));
+        if capacity as usize > pointers.len() / 8 || (first && old != retired) {
             return Err(EIO);
         }
-        let next_head = (old + 1) % capacity;
-        if next_head == retired { return Err(EBUSY); }
+        let count = u32::try_from(commands.len()).map_err(|_| EINVAL)?;
+        let target = g14_v27_2_abi::queue_head(capacity, old, retired, count).map_err(|error| {
+            match error {
+                QueueError::Geometry => EIO,
+                QueueError::Full => EBUSY,
+            }
+        })?;
 
         let producer = indices.shared_index(0x20)?;
-        let write = producer.load(Ordering::Acquire);
-        let read = Self::word(indices, 0)?;
-        let entries = crate::m3::m3_channel_format::SLOTS;
-        if write >= entries || read >= entries { return Err(EIO); }
-        let next_producer = (write + 1) % entries;
-        if next_producer == read { return Err(EBUSY); }
-        let slot = u8::try_from(job.event.slot()).map_err(|_| EINVAL)?;
-        let entry = crate::m3::submission_entry(COMPUTE as u32, job.queue.gpu_va().get(),
-            u16::try_from(next_head).map_err(|_| EINVAL)?, slot, false).map_err(|_| EINVAL)?;
-
-        let at = old as usize * 8;
-        job.pointers.shared_index(at)?.store(command as u32, Ordering::Relaxed);
-        job.pointers.shared_index(at + 4)?.store((command >> 32) as u32, Ordering::Relaxed);
-        crate::pgtable::clean_poc(job.pointers.as_slice()[at..].as_ptr(), 8);
-        let base = write as usize * entry.len();
+        let w = producer.load(Ordering::Acquire);
+        let r = Self::word(indices, 0)?;
+        if w >= RING_RECORDS || r >= RING_RECORDS { return Err(EIO); }
+        let next = (w + 1) % RING_RECORDS;
+        if next == r { return Err(EBUSY); }
+        let slot = u8::try_from(queue.slot).map_err(|_| EINVAL)?;
+        let entry = crate::m3::submission_entry(dm as u32, queue.queue,
+            u16::try_from(target).map_err(|_| EINVAL)?, slot, first).map_err(|_| EINVAL)?;
+        let base = w as usize * entry.len();
+        for (index, &command) in commands.iter().enumerate() {
+            let at = ((old as usize + index) % capacity as usize) * 8;
+            pointers.shared_index(at)?.store(command as u32, Ordering::Relaxed);
+            pointers.shared_index(at + 4)?.store((command >> 32) as u32, Ordering::Relaxed);
+            crate::pgtable::clean_poc(pointers.as_slice()[at..].as_ptr(), 8);
+        }
         for (index, word) in entry.chunks_exact(4).enumerate() {
             ring.shared_index(base + 4 * index)?.store(
                 u32::from_le_bytes([word[0], word[1], word[2], word[3]]), Ordering::Relaxed);
         }
         crate::pgtable::clean_poc(ring.as_slice()[base..].as_ptr(), entry.len());
         crate::pgtable::poc_barrier();
-        Ok(ComputePublication { positions: &job.positions, indices, head, producer,
-            next_head, next_producer })
+        Ok(Submission { head, positions: positions.as_slice(), target, producer,
+            indices: indices.as_slice(), next, announced })
     }
 
     /// Publishes the boot job, whose command and ring entry the root already holds. The GPU
@@ -510,13 +692,64 @@ impl RootV27_2 {
         Ok(Self::word(&self.channels[2 * SUBMISSION_RING], 0)? == 1
             && Self::word(&job.positions, 0x30)? == 1
             && Self::word(&job.positions, 0)? == 1
-            && job.event.current().raw() == job.expected_stamp)
+            && job.event.current_noncoherent().raw() == job.expected_stamp)
     }
 
-    /// Consumes everything the firmware published on its statistics, event, log and trace
-    /// rings. The firmware waits for space when one is full, and host consumer advancement is
-    /// the acknowledgement; completion is followed through the queue's position block, so the
-    /// records are not kept.
+    pub(crate) fn peek_event(&self) -> Result<Option<(u32, FirmwareEvent)>> {
+        use crate::m3::m3_channel_format::RECEIVE_BYTES;
+        let state = &self.channels[2 * EVENT_RING];
+        let ring = &self.channels[2 * EVENT_RING + 1];
+        crate::pgtable::clean_invalidate_poc(state.as_slice().as_ptr(), 0x30);
+        crate::pgtable::poc_barrier();
+        let (read, write) = (Self::word(state, 0)?, Self::word(state, 0x20)?);
+        if read >= RING_RECORDS || write >= RING_RECORDS { return Err(EIO); }
+        if read == write { return Ok(None); }
+        let at = read as usize * RECEIVE_BYTES;
+        crate::pgtable::clean_invalidate_poc(ring.as_slice()[at..].as_ptr(), RECEIVE_BYTES);
+        crate::pgtable::poc_barrier();
+        let word = |offset| Self::word(ring, at + offset);
+        let event = match word(0)? {
+            6 => FirmwareEvent::Grow(GrowRequest::decode([
+                word(4)?, word(8)?, word(0x0c)?, word(0x10)?, word(0x14)?, word(0x18)?,
+            ])),
+            7 => FirmwareEvent::ChannelError,
+            _ => FirmwareEvent::Notification,
+        };
+        Ok(Some((read, event)))
+    }
+
+    pub(crate) fn consume_event(&self, cursor: u32) -> Result {
+        let state = &self.channels[2 * EVENT_RING];
+        state.shared_index(0)?.store((cursor + 1) % RING_RECORDS, Ordering::Release);
+        crate::pgtable::clean_poc(state.as_slice().as_ptr(), 0x30);
+        crate::pgtable::poc_barrier();
+        Ok(())
+    }
+
+    pub(crate) fn halt_count(&self) -> Result<u64> {
+        const OFFSET: usize = 0x4bf0;
+        crate::pgtable::clean_invalidate_poc(self.control.as_slice()[OFFSET..].as_ptr(), 8);
+        crate::pgtable::poc_barrier();
+        Ok(u64::from(Self::word(&self.control, OFFSET)?)
+            | (u64::from(Self::word(&self.control, OFFSET + 4)?) << 32))
+    }
+
+    pub(crate) fn reserve_control_reply(&self) -> Result<Option<ControlReply<'_>>> {
+        let state = &self.channels[2 * crate::m3::DEVICE_CONTROL];
+        crate::pgtable::clean_invalidate_poc(state.as_slice().as_ptr(), 0x30);
+        crate::pgtable::poc_barrier();
+        let write = Self::word(state, 0x20)?;
+        let consumers = [Self::word(state, 0)?, Self::word(state, 0x10)?];
+        if write >= RING_RECORDS || consumers.iter().any(|&cursor| cursor >= RING_RECORDS) {
+            return Err(EIO);
+        }
+        let next = (write + 1) % RING_RECORDS;
+        if consumers.contains(&next) { return Ok(None); }
+        Ok(Some(ControlReply { state, ring: &self.channels[2 * crate::m3::DEVICE_CONTROL + 1],
+            cursor: write }))
+    }
+
+    /// Drain the telemetry rings. The event ring is consumed separately after servicing each event.
     pub(crate) fn drain(&self) -> Result {
         let consume = |state: &fw::types::GpuArray<u8>, base: usize, records: u32| -> Result {
             let write = Self::word(state, base + 0x20)?;
@@ -528,7 +761,6 @@ impl RootV27_2 {
             Ok(())
         };
         consume(&self.channels[2 * STATISTICS_RING], 0, RING_RECORDS)?;
-        consume(&self.channels[2 * EVENT_RING], 0, RING_RECORDS)?;
         // One log ring per log thread, state blocks 0x30 apart.
         for thread in 0..directory26::LOG_THREADS {
             consume(&self.channels[2 * LOG_RINGS], thread * 0x30, RING_RECORDS)?;
@@ -564,26 +796,30 @@ impl RootV27_2 {
         Ok([Self::word(ring, 0)?, Self::word(ring, 0x10)?, Self::word(ring, 0x20)?])
     }
 
-    /// Publishes one of the two pre-encoded idle-policy records on the device-control ring:
-    /// keep powered first, then allow off. Returns the ring cursor and the counted generation
-    /// the firmware acknowledges, which follows the larger of the host's last publication and
-    /// the firmware's consumed count.
+    /// Publishes an idle action and its acknowledged generation on an idle control channel.
     pub(crate) fn publish_idle_policy(&self, allow_off: bool) -> Result<(u32, u32)> {
-        let cursor = u32::from(allow_off);
         let host = self.globals.shared_index(0xe40)?;
         let firmware = self.idle_acknowledgement()?;
         let producer = self.channels[2 * crate::m3::DEVICE_CONTROL].shared_index(0x20)?;
-        if Self::word(&self.status, 0x14)? != 1 ||
-            crate::m3::idle_cursor(self.idle_progress()?).map_err(|_| EBUSY)? != cursor {
-            return Err(EAGAIN);
-        }
+        if Self::word(&self.status, 0x14)? != 1 { return Err(EAGAIN); }
+        let cursor = crate::m3::idle_cursor(self.idle_progress()?).map_err(|_| EBUSY)?;
         let action = crate::m3::Action::Idle { enabled: allow_off };
         let generation = action.generation(host.load(Ordering::Acquire), firmware).map_err(|_| EOVERFLOW)?;
+        let mut record = [0; crate::m3::CONTROL_BYTES];
+        action.encode(&mut record).map_err(|_| EINVAL)?;
+        let ring = &self.channels[2 * crate::m3::DEVICE_CONTROL + 1];
+        let at = cursor as usize * record.len();
+        for (i, word) in record.chunks_exact(4).enumerate() {
+            ring.shared_index(at + i * 4)?.store(
+                u32::from_le_bytes([word[0], word[1], word[2], word[3]]), Ordering::Relaxed);
+        }
+        crate::pgtable::clean_poc(ring.as_slice()[at..].as_ptr(), record.len());
         host.store(generation, Ordering::Release);
         crate::pgtable::poc_barrier();
-        producer.store(cursor + 1, Ordering::Release);
+        let next = (cursor + 1) % RING_RECORDS;
+        producer.store(next, Ordering::Release);
         crate::pgtable::poc_barrier();
-        Ok((cursor + 1, generation))
+        Ok((next, generation))
     }
 
     /// Builds the root, the boot job and every record they name.
@@ -617,6 +853,7 @@ impl RootV27_2 {
         let sram_table = Self::sram_table(states.len())?;
 
         let mut alloc = graph.alloc();
+        graph.event_manager.sync_initial_stamps();
         let mut boot = BootJob::new(&mut alloc, graph.event_manager.try_get_polled()?,
                                     graph.kernel_uat(), &graph.dev, cfg)?;
         // The 0x60-byte root child and the eight-byte temperature generation occupy
@@ -645,15 +882,7 @@ impl RootV27_2 {
             ring[..entry.len()].copy_from_slice(&entry);
             crate::pgtable::clean_poc(ring.as_ptr(), ring.len());
         }
-        {
-            // The two idle-policy records: keep powered, then allow off.
-            let records = &mut channels[2 * crate::m3::DEVICE_CONTROL + 1].as_mut_slice()
-                [..2 * crate::m3::CONTROL_BYTES];
-            for (index, record) in records.chunks_exact_mut(crate::m3::CONTROL_BYTES).enumerate() {
-                crate::m3::Action::Idle { enabled: index == 1 }.encode(record).map_err(|_| EINVAL)?;
-            }
-            crate::pgtable::clean_poc(records.as_ptr(), records.len());
-        }
+
 
         let mut directory = alloc.private.array_empty::<u8>(0x4c8)?;
         let bytes = directory.as_mut_slice();
@@ -729,10 +958,14 @@ impl RootV27_2 {
                                 (0x109c, 0), (0x1064, 0), (0x2728, 0)] {
             put32(hw, offset as usize, value);
         }
-        // Compute resource mask, one low bit per configured core; the firmware seeds the
-        // compute engine's population from it.
-        let cores = id.total_active_cores;
-        put32(hw, 0x2670, if cores < 32 { (1u32 << cores) - 1 } else { u32::MAX });
+        // Per-engine kick masks. The firmware gives an engine a kick slot only for bits set
+        // here, so an engine whose mask is left zero is never scheduled. The tiler takes one
+        // bit per cluster; the fragment and compute engines take one bit per configured core.
+        let low_bits = |n: u32| if n < 32 { (1u32 << n) - 1 } else { u32::MAX };
+        put32(hw, 0x2668, low_bits(id.num_clusters));
+        for offset in [0x266c, 0x2670] {
+            put32(hw, offset, low_bits(id.total_active_cores));
+        }
         // Firmware-managed operating points, CRE and event-assisted operating-point completion.
         for offset in [0xfc0, 0x26b8, 0x1054] {
             put32(hw, offset, 1);
@@ -781,6 +1014,7 @@ impl RootV27_2 {
         let mut owners = KVec::new();
         let mut controller = None;
         let mut compute_state = 0;
+        let mut render_states = [0; 2];
         for (offset, size) in [(0x10, 0x88), (0x254, 0x678), (0x25c, 0x760),
                                (0x264, 0x6d0), (0x26c, 0x60), (0x485, 0x6c48)] {
             let mut owner = alloc.private.array_empty::<u8>(size)?;
@@ -792,6 +1026,8 @@ impl RootV27_2 {
             if offset == 0x10 {
                 put64(bytes, 8, address);
             }
+            if offset == 0x254 { render_states[TILER] = address; }
+            if offset == 0x25c { render_states[FRAGMENT] = address; }
             if offset == 0x264 {
                 // The compute engine state the start and finish records name.
                 compute_state = address;
@@ -850,6 +1086,10 @@ impl RootV27_2 {
             put32(control.as_mut_slice(), 0x4c24, 1);
             owners.push(flush, GFP_KERNEL)?;
         }
+        // The firmware window mirrors only the kernel page tables that exist when it is
+        // installed. Keep one allocation of the GPU read-write range alive from here, so the
+        // tables that later hold the parameter-buffer lists are already visible to the firmware.
+        owners.push(alloc.gpu.array_empty::<u8>(0x4000)?, GFP_KERNEL)?;
         let mut power = alloc.shared.array_empty::<u8>(0x6a0)?;
         {
             // Cold mirrors of the controller's power and temperature-loop values.
@@ -866,6 +1106,10 @@ impl RootV27_2 {
             crate::pgtable::clean_poc(data.as_ptr(), data.len());
         }
 
+        let render_queues = [
+            DmQueue::new(&mut alloc, graph.event_manager.try_get_polled()?, RENDER_GROUP)?,
+            DmQueue::new(&mut alloc, graph.event_manager.try_get_polled()?, RENDER_GROUP)?,
+        ];
         boot.encode(&boot.info(compute_state));
         let (page_size, page_bits, levels, descriptors) = graph.initdata.with(|r, _|
             (r.uat_page_size, r.uat_page_bits, r.uat_num_levels, r.uat_level_info));
@@ -873,7 +1117,7 @@ impl RootV27_2 {
         core::mem::drop(alloc);
         let root = fw::types::GpuObject::<Self>::new_init_prealloc(root,
             |_| try_init!(Self {
-                graph: graph.clone(), boot, compute_state, channels, _owners: owners,
+                graph: graph.clone(), boot, compute_state, render_states, render_queues, channels, _owners: owners,
                 _register_mappings: register_mappings, _controller: controller, _directory: directory,
                 boot_page, globals, status, control, power, extra,
             }),
@@ -1057,4 +1301,15 @@ impl RootV27_2 {
 /// The 13.5 hardware data's highest operating-point index.
 fn old_max_pstate(base: &fw::initdata::RuntimePointersG14V13_5) -> Result<u32> {
     Ok(base.hwdata_b.with(|old, _| old.max_pstate))
+}
+
+impl GpuManagerG14V13_5 {
+    pub(crate) fn new_render_buffer(&self, ualloc: Arc<Mutex<alloc::DefaultAllocator>>,
+        ualloc_priv: Arc<Mutex<alloc::DefaultAllocator>>) -> Result<buffer::BufferG14V13_5> {
+        let mut alloc = self.alloc();
+        buffer::BufferG14V13_5::new(
+            self, &mut alloc, ualloc, ualloc_priv, &self.buffer_mgr,
+            buffer::ParameterListPlacement::KernelGpu,
+        )
+    }
 }

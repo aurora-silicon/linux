@@ -500,7 +500,7 @@ impl platform::Driver for AsahiPlatformDriver {
 }
 
 impl AsahiPlatformDriver {
-    /// G14 with firmware 27.2: start the firmware and register a compute-only DRM device.
+    /// G14 with firmware 27.2: start the firmware and register its DRM device.
     #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
     fn probe_g14_v27_2<'bound>(
         pdev: &'bound platform::Device<Core<'_>>,
@@ -521,7 +521,7 @@ impl AsahiPlatformDriver {
                 return Err(error);
             }
         };
-        dev_info!(pdev.as_ref(), "G14 firmware 27.2 running; compute-only DRM device registered\n");
+        dev_info!(pdev.as_ref(), "G14 firmware 27.2 running; DRM device registered\n");
         Ok(AsahiPlatformDriverData {
             binding,
             _device: reg.device().into(),

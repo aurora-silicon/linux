@@ -124,6 +124,14 @@ impl EventInner {
         // keeps the GpuObject the stamp is contained within alive.
         EventValue(unsafe { &*self.stamp }.load(Ordering::Acquire))
     }
+
+    /// Read a completion stamp written by an agent outside the CPU coherency domain.
+    #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+    pub(crate) fn current_noncoherent(&self) -> EventValue {
+        crate::pgtable::clean_invalidate_poc(self.stamp.cast(), core::mem::size_of::<u32>());
+        crate::pgtable::poc_barrier();
+        self.current()
+    }
 }
 
 impl slotalloc::SlotItem for EventInner {
@@ -202,6 +210,18 @@ impl EventManager {
             Ok(())
         })?;
         Ok(ev)
+    }
+
+    /// Make freshly initialized stamps visible before a non-coherent firmware starts.
+    #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+    pub(crate) fn sync_initial_stamps(&self) {
+        self.alloc.with_inner(|inner| {
+            let stamps = inner.stamps.as_slice();
+            let fw_stamps = inner.fw_stamps.as_slice();
+            crate::pgtable::clean_poc(stamps.as_ptr().cast(), core::mem::size_of_val(stamps));
+            crate::pgtable::clean_poc(fw_stamps.as_ptr().cast(), core::mem::size_of_val(fw_stamps));
+        });
+        crate::pgtable::poc_barrier();
     }
 
     /// Reserve the normal stamp pair for a kernel queue that polls its own completion.

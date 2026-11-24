@@ -183,6 +183,36 @@ const MAX_FW_ALLOC_GARBAGE_BYTES: usize = 16 * 1024 * 1024;
 /// within the safe range for kmalloc (on 16K page systems).
 const MAX_FW_ALLOC_GARBAGE_OBJECTS: usize = 2048;
 
+/// What [`GpuManager::alloc`] does with the freed firmware-private objects it holds.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum GarbageAction {
+    /// Under the collection limits: keep holding them.
+    Keep,
+    /// Over a limit: flush the firmware cache, then make them reusable.
+    Collect,
+    /// Over a limit, but this manager has no device-control channel to flush the firmware
+    /// cache with. Reusing the memory could hand the firmware stale cached lines, so it stays
+    /// held.
+    Hold,
+}
+
+/// Decide the garbage action from the (count, bytes) held by the private and GPU read-only
+/// allocators and whether this manager owns a device-control channel.
+fn garbage_action(
+    private: (usize, usize),
+    gpu_ro: (usize, usize),
+    device_control: bool,
+) -> GarbageAction {
+    let over = |(count, bytes): (usize, usize)| {
+        count > MAX_FW_ALLOC_GARBAGE_OBJECTS || bytes > MAX_FW_ALLOC_GARBAGE_BYTES
+    };
+    match (over(private) || over(gpu_ro), device_control) {
+        (false, _) => GarbageAction::Keep,
+        (true, true) => GarbageAction::Collect,
+        (true, false) => GarbageAction::Hold,
+    }
+}
+
 /// Global allocators used for kernel-half structures.
 pub(crate) struct KernelAllocators {
     pub(crate) private: alloc::DefaultAllocator,
@@ -297,6 +327,8 @@ pub(crate) struct GpuManager {
     pub(crate) initdata: fw::types::GpuObject<fw::initdata::InitData::ver>,
     uat: mmu::Uat,
     crashed: AtomicBool,
+    /// Set once the over-limit firmware-private garbage was reported as held.
+    garbage_held: AtomicBool,
     #[pin]
     alloc: Mutex<KernelAllocators>,
     io_mappings: KVec<mmu::KernelMapping>,
@@ -1085,6 +1117,7 @@ impl GpuManager::ver {
                 next_mmio_iova: IOVA_KERN_MMIO_RANGE.start,
                 rtkit <- new_mutex!(None, "rtkit"),
                 crashed: AtomicBool::new(false),
+                garbage_held: AtomicBool::new(false),
                 event_manager,
                 stats: stats_snap.clone(),
                 raw_stats: raw_stats_snap.clone(),
@@ -1487,12 +1520,7 @@ impl GpuManager::ver {
         job.run(&mut pipe);
         mod_dev_dbg!(self.dev, "GPU: run_job: ring doorbell\n");
 
-        let mut guard = self.rtkit.lock();
-        let rtk = guard.as_mut().as_pin_mut().unwrap();
-        rtk.send_message(
-            EP_DOORBELL,
-            MSG_TX_DOORBELL | pipe_type as u64 | ((index as u64) << 2),
-        )?;
+        self.ring_doorbell(MSG_TX_DOORBELL | pipe_type as u64 | ((index as u64) << 2))?;
         mod_dev_dbg!(self.dev, "GPU: run_job: done\n");
 
         Ok(())
@@ -1558,15 +1586,7 @@ impl GpuManager::ver {
         mod_dev_dbg!(self.dev, "Context invalidation command: {:?}\n", &dc);
 
         let mut txch = self.tx_channels.lock();
-
-        let token = txch.device_control.send(&dc);
-
-        {
-            let mut guard = self.rtkit.lock();
-            let rtk = guard.as_mut().as_pin_mut().unwrap();
-            rtk.send_message(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_DEVCTRL)?;
-        }
-
+        let token = self.send_device_control(&mut txch, &dc)?;
         txch.device_control.wait_for(token)?;
 
         mod_dev_dbg!(
@@ -1580,6 +1600,34 @@ impl GpuManager::ver {
         guard.gpu_ro.collect_garbage(garbage_count_gpuro);
 
         Ok(())
+    }
+
+    /// Whether this manager drives its firmware over its own RTKit transport and device-control
+    /// channel. A manager whose records serve another runtime (the G14 firmware 27.2 graph) has
+    /// none: that firmware never reads the legacy channels.
+    fn has_device_control(&self) -> bool {
+        self.rtkit.lock().is_some()
+    }
+
+    /// Ring a doorbell on this manager's RTKit transport, or fail with ENODEV without one.
+    fn ring_doorbell(&self, message: u64) -> Result {
+        let mut guard = self.rtkit.lock();
+        let rtk = guard.as_mut().as_pin_mut().ok_or(ENODEV)?;
+        rtk.send_message(EP_DOORBELL, message)
+    }
+
+    /// Queue a device-control message and ring its doorbell. Without a transport nothing is
+    /// queued, so no caller waits for a firmware that will never answer.
+    fn send_device_control(
+        &self,
+        txch: &mut TxChannels::ver,
+        msg: &fw::channels::DeviceControlMsg::ver,
+    ) -> Result<u32> {
+        let mut guard = self.rtkit.lock();
+        let rtk = guard.as_mut().as_pin_mut().ok_or(ENODEV)?;
+        let token = txch.device_control.send(msg);
+        rtk.send_message(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_DEVCTRL)?;
+        Ok(token)
     }
 }
 
@@ -1644,7 +1692,7 @@ impl Gpu for GpuManager::ver {
 
         let initdata = self.initdata.gpu_va().get();
         let mut guard = self.rtkit.lock();
-        let mut rtk = guard.as_mut().as_pin_mut().unwrap();
+        let mut rtk = guard.as_mut().as_pin_mut().ok_or(ENODEV)?;
 
         rtk.as_mut().boot()?;
         rtk.as_mut().start_endpoint(EP_FIRMWARE)?;
@@ -1814,24 +1862,39 @@ impl GpuManager for GpuManager::ver {
         let (garbage_count, garbage_bytes) = guard.private.garbage();
         let (ro_garbage_count, ro_garbage_bytes) = guard.gpu_ro.garbage();
 
-        if garbage_bytes > MAX_FW_ALLOC_GARBAGE_BYTES
-            || ro_garbage_bytes > MAX_FW_ALLOC_GARBAGE_BYTES
-            || garbage_count > MAX_FW_ALLOC_GARBAGE_OBJECTS
-            || ro_garbage_count > MAX_FW_ALLOC_GARBAGE_OBJECTS
-        {
-            mod_dev_dbg!(
-                self.dev,
-                "Collecting kalloc garbage (private: {} objects, {} bytes, gpuro: {} objects, {} bytes)\n",
-                garbage_count,
-                garbage_bytes,
-                ro_garbage_count,
-                ro_garbage_bytes
-            );
-            if self.flush_fw_cache().is_err() {
-                dev_err!(self.dev.as_ref(), "Failed to flush FW cache\n");
-            } else {
-                guard.private.collect_garbage(garbage_count);
-                guard.gpu_ro.collect_garbage(ro_garbage_count);
+        match garbage_action(
+            (garbage_count, garbage_bytes),
+            (ro_garbage_count, ro_garbage_bytes),
+            self.has_device_control(),
+        ) {
+            GarbageAction::Keep => {}
+            GarbageAction::Hold => {
+                if !self.garbage_held.swap(true, Ordering::Relaxed) {
+                    dev_warn!(
+                        self.dev.as_ref(),
+                        "No firmware cache flush on this firmware: holding freed firmware memory (private: {} objects, {} bytes, gpuro: {} objects, {} bytes)\n",
+                        garbage_count,
+                        garbage_bytes,
+                        ro_garbage_count,
+                        ro_garbage_bytes
+                    );
+                }
+            }
+            GarbageAction::Collect => {
+                mod_dev_dbg!(
+                    self.dev,
+                    "Collecting kalloc garbage (private: {} objects, {} bytes, gpuro: {} objects, {} bytes)\n",
+                    garbage_count,
+                    garbage_bytes,
+                    ro_garbage_count,
+                    ro_garbage_bytes
+                );
+                if self.flush_fw_cache().is_err() {
+                    dev_err!(self.dev.as_ref(), "Failed to flush FW cache\n");
+                } else {
+                    guard.private.collect_garbage(garbage_count);
+                    guard.gpu_ro.collect_garbage(ro_garbage_count);
+                }
             }
         }
 
@@ -1847,11 +1910,7 @@ impl GpuManager for GpuManager::ver {
             return Err(ENODEV);
         }
 
-        let mut guard = self.rtkit.lock();
-        let rtk = guard.as_mut().as_pin_mut().unwrap();
-        rtk.send_message(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_KICKFW)?;
-
-        Ok(())
+        self.ring_doorbell(MSG_TX_DOORBELL | DOORBELL_KICKFW)
     }
 
     fn flush_fw_cache(&self) -> Result {
@@ -1885,14 +1944,7 @@ impl GpuManager for GpuManager::ver {
         };
 
         let mut txch = self.tx_channels.lock();
-
-        let token = txch.device_control.send(&dc);
-        {
-            let mut guard = self.rtkit.lock();
-            let rtk = guard.as_mut().as_pin_mut().unwrap();
-            rtk.send_message(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_DEVCTRL)?;
-        }
-
+        let token = self.send_device_control(&mut txch, &dc)?;
         txch.device_control.wait_for(token)?;
         Ok(())
     }
@@ -2022,26 +2074,16 @@ impl GpuManager for GpuManager::ver {
         mod_dev_dbg!(self.dev, "Recover Channel command: {:?}\n", &dc);
         let mut txch = self.tx_channels.lock();
 
-        let token = txch.device_control.send(&dc);
-        {
-            let mut guard = self.rtkit.lock();
-            let rtk = guard.as_mut().as_pin_mut().unwrap();
-            if rtk
-                .send_message(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_DEVCTRL)
-                .is_err()
-            {
-                dev_err!(
-                    self.dev.as_ref(),
-                    "Failed to send Recover Channel command\n"
-                );
-            }
-        }
-
-        if txch.device_control.wait_for(token).is_err() {
-            dev_err!(
+        match self.send_device_control(&mut txch, &dc) {
+            Err(_) => dev_err!(
+                self.dev.as_ref(),
+                "Failed to send Recover Channel command\n"
+            ),
+            Ok(token) if txch.device_control.wait_for(token).is_err() => dev_err!(
                 self.dev.as_ref(),
                 "Timed out waiting for Recover Channel command\n"
-            );
+            ),
+            Ok(_) => {}
         }
 
         if debug_enabled(DebugFlags::VerboseFaults) {
@@ -2069,16 +2111,8 @@ impl GpuManager for GpuManager::ver {
 
         let mut txch = self.tx_channels.lock();
 
-        txch.device_control.send(&dc);
-        {
-            let mut guard = self.rtkit.lock();
-            let rtk = guard.as_mut().as_pin_mut().unwrap();
-            if rtk
-                .send_message(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_DEVCTRL)
-                .is_err()
-            {
-                dev_err!(self.dev.as_ref(), "Failed to send TVB Grow Ack command\n");
-            }
+        if self.send_device_control(&mut txch, &dc).is_err() {
+            dev_err!(self.dev.as_ref(), "Failed to send TVB Grow Ack command\n");
         }
     }
 
@@ -2088,12 +2122,13 @@ impl GpuManager for GpuManager::ver {
         }
 
         let mut fwctl = self.fwctl_channel.lock();
-        let token = fwctl.send(&msg);
-        {
+        let token = {
             let mut guard = self.rtkit.lock();
-            let rtk = guard.as_mut().as_pin_mut().unwrap();
+            let rtk = guard.as_mut().as_pin_mut().ok_or(ENODEV)?;
+            let token = fwctl.send(&msg);
             rtk.send_message(EP_DOORBELL, MSG_FWCTL)?;
-        }
+            token
+        };
         fwctl.wait_for(token)?;
         Ok(())
     }
@@ -2145,5 +2180,50 @@ impl GpuManagerPriv for GpuManager::ver {
         mod_dev_dbg!(self.dev, "OP end (pending: {})\n", val - 1);
         // SAFETY: Pairs with the begin call in start_op(); callable from any context.
         unsafe { kernel::bindings::apple_pmp_agx_activity_end() };
+    }
+}
+
+#[kunit_tests(asahi_gpu_garbage)]
+mod tests {
+    use super::*;
+
+    const UNDER: (usize, usize) = (MAX_FW_ALLOC_GARBAGE_OBJECTS, MAX_FW_ALLOC_GARBAGE_BYTES);
+    const OVER_COUNT: (usize, usize) = (MAX_FW_ALLOC_GARBAGE_OBJECTS + 1, 0);
+    const OVER_BYTES: (usize, usize) = (1, MAX_FW_ALLOC_GARBAGE_BYTES + 1);
+
+    #[test]
+    fn under_the_limits_keeps_holding() {
+        assert_eq!(garbage_action(UNDER, UNDER, true), GarbageAction::Keep);
+        assert_eq!(garbage_action(UNDER, UNDER, false), GarbageAction::Keep);
+    }
+
+    #[test]
+    fn over_a_limit_collects_with_device_control() {
+        assert_eq!(
+            garbage_action(OVER_COUNT, UNDER, true),
+            GarbageAction::Collect
+        );
+        assert_eq!(
+            garbage_action(UNDER, OVER_BYTES, true),
+            GarbageAction::Collect
+        );
+    }
+
+    /// The G14 firmware 27.2 graph has no device-control channel. Its scene allocations used
+    /// to reach the legacy cache flush here and panic on the missing RTKit transport.
+    #[test]
+    fn over_a_limit_holds_without_device_control() {
+        assert_eq!(
+            garbage_action(OVER_COUNT, UNDER, false),
+            GarbageAction::Hold
+        );
+        assert_eq!(
+            garbage_action(UNDER, OVER_BYTES, false),
+            GarbageAction::Hold
+        );
+        assert_eq!(
+            garbage_action(OVER_BYTES, OVER_COUNT, false),
+            GarbageAction::Hold
+        );
     }
 }
