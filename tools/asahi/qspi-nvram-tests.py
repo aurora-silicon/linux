@@ -31,6 +31,7 @@ PREFIX = r'''
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
+#include <stddef.h>
 typedef uint8_t u8; typedef uint32_t u32; typedef uint64_t u64;
 typedef uint64_t resource_size_t;
 struct device_node { const char *compatible; };
@@ -64,6 +65,14 @@ static unsigned long jiffies;
 static bool runtime_ready, write_fault_latched, read_only=true;
 static int apple_qspi_policy_lock;
 struct kernel_param { void *arg; };
+struct list_head { struct list_head *next, *prev; };
+#define LIST_HEAD(n) struct list_head n = { &(n), &(n) }
+static void INIT_LIST_HEAD(struct list_head *l){l->next=l->prev=l;}
+static void list_add(struct list_head *n,struct list_head *h){n->next=h->next;n->prev=h;h->next->prev=n;h->next=n;}
+#define container_of(p,t,m) ((t*)((char*)(p)-offsetof(t,m)))
+#define list_for_each_entry(pos,head,member) for(pos=container_of((head)->next,typeof(*pos),member);&pos->member!=(head);pos=container_of(pos->member.next,typeof(*pos),member))
+static LIST_HEAD(apple_qspi_writers);
+static int apple_qspi_hold_writers(bool hold);
 static int kstrtobool(const char*s,bool*v){if(!strcmp(s,"Y"))*v=true;else if(!strcmp(s,"N"))*v=false;else return -EINVAL;return 0;}
 static int param_get_bool(char*b,const struct kernel_param*p){b[0]=*(bool*)p->arg?'Y':'N';return 1;}
 struct apple_qspi {
@@ -71,6 +80,7 @@ struct apple_qspi {
  u64 window_start, window_end;
  u8 jedec[3]; u8 jedec_alt[3]; u8 bp_ok;
  int irq;
+ struct list_head writer; struct device *dev; bool runtime_pm, power_held;
 };
 struct spi_controller;
 struct device { struct device *parent; struct spi_controller *controller; };
@@ -96,11 +106,18 @@ static u8 flash[0x800000], sr[3], jedec[3]={0xef,0x65,0x17};
 static unsigned int wire[4096],wire_count,fail_opcode;
 static bool corrupt_readback,stuck_busy,programmed;
 static unsigned int pm_refs,busy_calls,busy_wire;
+/* Genpd model: the block gates when idle with no reference held. */
+static unsigned int hold_refs,gates,resumes;static bool gated;static struct device *deny_resume;
+static int pm_runtime_resume_and_get(struct device*d){
+ assert(d);if(d==deny_resume)return -EIO;if(gated){gated=false;resumes++;}hold_refs++;return 0;
+}
+static int pm_runtime_put_autosuspend(struct device*d){assert(d&&hold_refs);hold_refs--;return 0;}
 static void pm_runtime_mark_last_busy(struct device*d){
  assert(d&&pm_refs);busy_calls++;busy_wire=wire_count;
 }
 static int apple_qspi_transfer_op(struct spi_mem*m,const struct spi_mem_op*o){
  if(m->spi->controller->auto_runtime_pm)assert(pm_refs);
+ assert(!gated);
  assert(wire_count<ARRAY_SIZE(wire));wire[wire_count++]=o->cmd.opcode;
  if(o->cmd.opcode==fail_opcode)return -EIO;
  switch(o->cmd.opcode){
@@ -140,6 +157,16 @@ static void reset(void){
  jedec[0]=0xef;jedec[1]=0x65;jedec[2]=0x17;
  ctl.auto_runtime_pm=false;ctl.dev.parent=&parent;
  pm_refs=busy_calls=busy_wire=0;
+ INIT_LIST_HEAD(&apple_qspi_writers);hold_refs=gates=resumes=0;gated=false;deny_resume=NULL;
+}
+/* spi-mem: one runtime reference per operation, then an idle gap past the
+ * autosuspend delay, in which the block gates unless something holds it. */
+static int spimem(struct spi_mem_op*o){
+ int r;if(gated){gated=false;resumes++;}pm_refs++;r=apple_qspi_mem_exec_op(&mem,o);pm_refs--;
+ if(!hold_refs){gated=true;gates++;}return r;
+}
+static void writer(struct apple_qspi*w,struct device*d){
+ w->dev=d;w->runtime_pm=true;list_add(&w->writer,&apple_qspi_writers);
 }
 static struct spi_mem_op program(u64 addr,unsigned int n,const u8*b){
  struct spi_mem_op o=SPI_MEM_OP(SPI_MEM_OP_CMD(0x02,1),SPI_MEM_OP_ADDR(3,addr,1),SPI_MEM_OP_NO_DUMMY,SPI_MEM_OP_NO_DATA);
@@ -312,6 +339,35 @@ int main(void){
  pm_refs=0;
  reset();assert(!apple_qspi_mem_exec_op(&mem,&t8140_read));assert(!busy_calls);
  puts("PASS runtime-PM idle stamp after read, denied write, full verified program and transfer error; other SoCs unchanged");
+ /* Armed writes hold the controller: an erase, an idle gap and the programs
+  * that refill the sector all run in one power session. */
+ reset();ctl.auto_runtime_pm=true;writer(&q,&parent);gated=true;
+ assert(!spimem(&t8140_read)&&gates==1&&resumes==1&&!hold_refs);
+ arm();memset(flash+0x701000,0,4096);memset(data,0x55,sizeof(data));erase.addr.val=0x701000;
+ assert(!spimem(&erase)&&sent(0x20));
+ for(unsigned int i=0;i<16;i++){o=program(0x701000+i*256,256,data);assert(!spimem(&o));}
+ assert(gates==1&&resumes==2&&!gated);
+ assert(hold_refs==1&&q.power_held);
+ for(unsigned int i=0;i<4096;i++)assert(flash[0x701000+i]==0x55);
+ assert(!apple_qspi_set_read_only("Y",&parameter)&&read_only&&!hold_refs&&!q.power_held);
+ assert(!spimem(&t8140_read)&&gates==2);
+ /* Disarming twice or arming again keeps one reference. */
+ assert(!apple_qspi_set_read_only("Y",&parameter)&&!hold_refs);
+ arm();arm();assert(hold_refs==1);
+ /* A latched fault releases it, and the block gates again. */
+ fail_opcode=0x02;o=program(0x702000,1,data);
+ assert(spimem(&o)==-EIO&&q.write_fault&&read_only&&!hold_refs&&!q.power_held&&gated);
+ assert(apple_qspi_set_read_only("N",&parameter)==-EPERM&&!hold_refs);
+ /* Arm all or none: one controller that cannot resume keeps both read-only. */
+ static struct apple_qspi q2;static struct device parent2;
+ reset();q2=(struct apple_qspi){0};ctl.auto_runtime_pm=true;writer(&q,&parent);writer(&q2,&parent2);
+ runtime_ready=true;deny_resume=&parent;
+ assert(apple_qspi_set_read_only("N",&parameter)==-EIO&&read_only&&!hold_refs&&!q.power_held&&!q2.power_held);
+ deny_resume=NULL;arm();assert(hold_refs==2);
+ assert(!apple_qspi_set_read_only("Y",&parameter)&&!hold_refs);
+ /* A controller without runtime PM takes no reference. */
+ reset();writer(&q,&parent);q.runtime_pm=false;arm();assert(!hold_refs&&!q.power_held);
+ puts("PASS armed writes hold controller power across erase, idle gaps and programs; disarm, fault and failed resume release it");
  return 0;
 }
 '''
@@ -349,7 +405,8 @@ def main():
                   'static bool apple_qspi_opcode_is_read(', 'static int apple_qspi_width_mode(',
                   'static int apple_qspi_shape_op(', 'static bool apple_qspi_supports_op(',
                   'static int apple_qspi_read_register(', 'static int apple_qspi_command(',
-                  'static int apple_qspi_read_array(', 'static int apple_qspi_status(',
+                  'static int apple_qspi_read_array(',
+                  'static int apple_qspi_hold_power(', 'static int apple_qspi_hold_writers(bool hold)\n{', 'static int apple_qspi_status(',
                   'static int apple_qspi_nvram_modify(', 'static int apple_qspi_exec_op(',
                   'static int apple_qspi_mem_exec_op(']
     code = PREFIX + policy + boards + '\n'.join(function(source, s) for s in signatures) + CONTROLS
@@ -382,6 +439,9 @@ def main():
             ('read-only', 'read_only || !qspi->nvram_write_candidate || qspi->write_fault',
              '!qspi->nvram_write_candidate || qspi->write_fault'),
             ('fault-latch', 'write_fault_latched = true;', 'write_fault_latched = false;'),
+            ('write-hold', 'ret = apple_qspi_hold_writers(!value);', 'ret = 0;'),
+            ('fault-release', 'read_only = true;\n\tapple_qspi_hold_writers(false);', 'read_only = true;'),
+            ('arm-all-or-none', '\tif (ret)\n\t\tlist_for_each_entry', '\tif (0)\n\t\tlist_for_each_entry'),
             ('pm-last-busy', 'pm_runtime_mark_last_busy(ctlr->dev.parent);', '(void)ctlr;')]:
             assert old in code
             mutant = run(code.replace(old, new), Path(directory) / (name + '.c'))
