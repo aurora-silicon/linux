@@ -141,6 +141,12 @@ impl job::Backend for Backend {
         -> Option<Arc<crate::g17::sync_input::Sources>>
     {
         use crate::g17::{fence, sync_input};
+        // Where explicit waits take the completion class (M5), every command of this logical
+        // queue goes to its one bound queue in submission order: a source of its own is either
+        // published there ahead of the consumer or still queued ahead of it here. So its own
+        // sources need no publication check (or wait) under the device mutex; publication finds
+        // them on that queue and orders the consumer behind them as behind any other source.
+        let own_first = self.shared.m5_board.is_some_and(|board| board.completion_inputs());
         let mut heads = KVec::new();
         let mut sources: KVec<sync_input::Source> = KVec::new();
         let mut publication_waits = KVec::new();
@@ -155,11 +161,17 @@ impl job::Backend for Backend {
                 // SAFETY: Collection owns each leaf until this lookup finishes.
                 let submission = unsafe { fence::exported_source_raw(leaf.fence) }?;
                 if submission.source_status().ok()? { continue; }
-                if !submission.same_vm(self.context.status()) { return None; }
+                // This queue's own submissions are of its VM.
+                let local = own_first && submission.origin() == self.owner;
+                if !local && !submission.same_vm(self.context.status()) { return None; }
                 if sources.iter().any(|known| Arc::ptr_eq(&known.submission, &submission)) {
                     continue;
                 }
                 if sources.len() == crate::g17::fw::kick::KICK_BARRIERS_MAX { return None; }
+                if local {
+                    sources.push(sync_input::Source { submission, local }, GFP_KERNEL).ok()?;
+                    continue;
+                }
                 let published = {
                     let state = self.shared.state.lock();
                     let firmware = state.as_deref()?;
@@ -178,12 +190,17 @@ impl job::Backend for Backend {
                     // consumer hardware capacity is acquired while waiting.
                     publication_waits.push(submission.ready()?, GFP_KERNEL).ok()?;
                 }
-                sources.push(sync_input::Source { submission }, GFP_KERNEL).ok()?;
+                sources.push(sync_input::Source { submission, local }, GFP_KERNEL).ok()?;
             }
             heads.push(input.clone(), GFP_KERNEL).ok()?;
         }
         if sources.is_empty() { return None; }
         sync_input::Sources::new(heads, sources, publication_waits).ok()
+    }
+
+    fn source_origin(&self) -> u64 {
+        // Queue identities start at 2 and are never reused on the device.
+        self.owner
     }
 
     fn feed(&self) -> Option<Arc<crate::g17::feed::Feed>> {

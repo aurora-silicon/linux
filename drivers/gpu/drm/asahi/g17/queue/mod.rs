@@ -604,7 +604,8 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
                 && matches!(&pending[0].0, Validated::Compute { visible_completion, .. }
                     if *visible_completion || !visible_required)
                 && !pending[0].2.has_outputs();
-            let aggregate = outputs.publish(self.context.clone(), firmware_source)?;
+            let origin = self.backend.source_origin();
+            let aggregate = outputs.publish(self.context.clone(), firmware_source, origin)?;
             let output_fence = aggregate.fence();
             super::trace::submit(
                 1,
