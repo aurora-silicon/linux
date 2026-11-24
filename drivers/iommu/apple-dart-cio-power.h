@@ -27,8 +27,9 @@ static bool dart_cio_fault(void __iomem *regs, const struct dart_cio_power *s)
 
 static int dart_cio_idle(void __iomem *regs, const struct dart_cio_power *s)
 {
-	unsigned int ports = max(FIELD_GET(GENMASK(18, 16), s->params[1]),
-				 FIELD_GET(GENMASK(22, 20), s->params[1]));
+	unsigned int rports = FIELD_GET(GENMASK(18, 16), s->params[1]);
+	unsigned int wports = FIELD_GET(GENMASK(22, 20), s->params[1]);
+	unsigned int ports = max(rports, wports);
 	u32 value;
 	int ret;
 

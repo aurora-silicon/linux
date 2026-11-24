@@ -5,7 +5,7 @@
 #include <kunit/test.h>
 
 static void apple_g17_test_rx(struct apple_mbox *mbox,
-                              struct apple_mbox_msg msg, void *cookie)
+			      struct apple_mbox_msg msg, void *cookie)
 {
 	unsigned int *count = cookie;
 

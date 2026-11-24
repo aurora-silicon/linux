@@ -3,9 +3,9 @@
 //! Module parameters and the GET_PARAMS identity.
 //!
 //! With the shared `file.rs` additions (VM_STATUS and VM_STATUS_MIRROR from `supports_vm_status`,
-//! SOFT_FAULTS suppressed by `soft_faults`), G16 advertises per-command input readiness/errors,
-//! exact queue-local historical prefixes, fragment-only render barriers, and
-//! `COMPUTE_NO_QUERY_ACCESS`. No independent hardware queue reservation or ray queries are
+//! SOFT_FAULTS suppressed by `soft_faults`, VDM_USC_INVALIDATE), G16 advertises per-command
+//! input readiness/errors, exact queue-local historical prefixes, fragment-only render barriers,
+//! and `COMPUTE_NO_QUERY_ACCESS`. No independent hardware queue reservation or ray queries are
 //! advertised.
 
 use kernel::{prelude::*, uapi};

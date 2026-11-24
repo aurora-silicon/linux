@@ -398,7 +398,13 @@ static int iomfb_enqueue_opaque_x(struct apple_dcp *dcp)
 	struct iomfb_opaque_x_transaction *opaque;
 
 	lockdep_assert_held(&dcp->iomfb.lock);
-	/* DCPEXT rejects enableGPAlphaDiv; retain the panel-only workaround. */
+	/*
+	 * H17P blends the X byte of an XRGB surface as alpha; this property
+	 * makes the panel pipe take it as opaque. It is sent to panels only:
+	 * the H17P external controller answers it with status 4, which
+	 * iomfb_opaque_x_complete() treats as fatal, and native26 external
+	 * pipes keep their own presentation path.
+	 */
 	if (dcp->hw.iomfb_method_profile ==
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL || dcp_is_ext26(dcp))
 		return 0;
@@ -4551,9 +4557,20 @@ int iomfb_start_rtkit(struct apple_dcp *dcp)
 	     dcp->fw_compat == DCP_FIRMWARE_V_27_0) &&
 	    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17P_EXTERNAL &&
 	    !dcp_is_ext26(dcp)) {
-		ret = apple_rtkit_start_ep(dcp->rtk, REMOTE_ALLOC_ENDPOINT);
-		if (ret)
-			return ret;
+		/*
+		 * Firmware 27 lists the endpoints its application uses. Some
+		 * builds (T8112's 27.2 DCP) have no remote allocator there, and
+		 * starting an endpoint the firmware does not advertise fails.
+		 */
+		if (dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+		    !apple_rtkit_has_endpoint(dcp->rtk, REMOTE_ALLOC_ENDPOINT)) {
+			dev_info(dcp->dev, "remote allocator not advertised; IOMFB endpoint %sadvertised\n",
+				 apple_rtkit_has_endpoint(dcp->rtk, IOMFB_ENDPOINT) ? "" : "not ");
+		} else {
+			ret = apple_rtkit_start_ep(dcp->rtk, REMOTE_ALLOC_ENDPOINT);
+			if (ret)
+				return ret;
+		}
 	}
 	/* Desktop 26.x started the transport with its auxiliary endpoints. */
 	if (dcp->fw_compat != DCP_FIRMWARE_V_26_6_DESKTOP) {
