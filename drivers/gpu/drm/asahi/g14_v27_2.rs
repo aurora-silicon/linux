@@ -670,7 +670,8 @@ impl Runtime {
             };
             let last = index + 1 == packet.commands.len();
             let result = match command {
-                Command::Compute(control) => self.publish_compute(state, &packet, control, last, slots[0]),
+                Command::Compute(control) =>
+                    self.publish_compute(state, &packet, index, control, last, slots[0]),
                 Command::Render { command, usc } =>
                     self.publish_render(state, &packet, index, &command, usc, last, slots),
             };
@@ -687,7 +688,7 @@ impl Runtime {
     }
 
     fn publish_compute(
-        &self, state: &mut State, packet: &Arc<Packet>,
+        &self, state: &mut State, packet: &Arc<Packet>, index: usize,
         control: crate::m3::agx_compute::Control, last: bool, slot: usize,
     ) -> Result {
         let bind = self.graph.kernel_uat().bind(&packet.vm)?;
@@ -700,6 +701,7 @@ impl Runtime {
             cdm_end: control.end,
             usc_base: control.usc_base,
             preempt,
+            timestamps: packet.timestamp_addresses(index),
         };
         let command = state.pool.encode(slot, &state.queue, stamp.raw(), &job)?;
         let submission = state.root.stage_compute(command)?;

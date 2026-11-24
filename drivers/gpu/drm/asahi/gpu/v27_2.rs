@@ -76,6 +76,8 @@ pub(crate) struct ComputeJob {
     /// VA of the preemption buffer in the same context (13.5 layout: buffer 1 at +0,
     /// buffers 2 to 5 at +compute_preempt1_size + 8n).
     pub(crate) preempt: u64,
+    /// Firmware VAs of the user start and end timestamps, or 0.
+    pub(crate) timestamps: [u64; 2],
 }
 
 fn put32(b: &mut [u8], at: usize, v: u32) {
@@ -119,6 +121,7 @@ fn encode_compute(
     // through the pointer at +0x334.
     put32(cmd, 0x33c, 1);
     put64(cmd, 0x334, timestamps + 0x20);
+    let user = g14_v27_2_abi::encode_compute_timestamps(cmd, cmd_va, job.timestamps);
 
     put32(stream, 0, 11);
     // 13.5 StartCompute.unk_28, at the same place in this layout (the 13.5 G14 path writes 1).
@@ -138,6 +141,7 @@ fn encode_compute(
         put64(stream, at + 0x0c, cmd_va + 0x2cc);
         put64(stream, at + 0x14, cmd_va + selected);
         put64(stream, at + 0x1c, q.queue);
+        put64(stream, at + 0x24, user);
         put64(stream, at + 0x2c, cmd_va + 0x314);
         put64(stream, at + 0x34, cmd_va + 0x264);
     }
@@ -354,7 +358,7 @@ impl BootJob {
         let cdm = self.client_va + self.preempt1 + 0x2000;
         let job = ComputeJob {
             context: 0, sequence: 0, cdm_base: cdm, cdm_end: cdm + 8,
-            usc_base: 0x11_0000_0000, preempt: self.client_va,
+            usc_base: 0x11_0000_0000, preempt: self.client_va, timestamps: [0; 2],
         };
         let (cmd_va, stream_va) = (self.command.gpu_va().get(), self.stream.gpu_va().get());
         encode_compute(self.command.as_mut_slice(), cmd_va, self.stream.as_mut_slice(), stream_va,
