@@ -9,6 +9,7 @@
 #include <linux/cpu.h>
 #include <linux/cpu_cooling.h>
 #include <linux/cpufreq.h>
+#include <linux/cpumask.h>
 #include <linux/hwmon.h>
 #include <linux/hrtimer.h>
 #include <linux/jiffies.h>
@@ -27,7 +28,6 @@
 #include <linux/soc/apple/pmp-telemetry.h>
 #include <linux/soc/apple/pmp-cooling.h>
 #include <linux/soc/apple/pmp-power-policy.h>
-#include <linux/soc/apple/t8132.h>
 #include <linux/suspend.h>
 #include <linux/thermal.h>
 #include <linux/workqueue.h>
@@ -184,7 +184,9 @@ static void apple_pmp_power_work(struct work_struct *work)
 	u64 epoch = apple_pmp_gpu_epoch(pmp_thermal.sensors);
 	bool dark = false;
 	u64 now;
-	int ret = apple_pmp_power_read_rails(mw);
+	int ret;
+
+	ret = apple_pmp_power_read_rails(mw);
 	/* The running reader cannot read zero on both CPU rails. A firmware
 	 * reset/all-zero image must not refill the energy bucket; an idle
 	 * system may still draw well under 0.1 W on all three rails.
@@ -266,7 +268,8 @@ static int apple_pmp_power_read(struct device *dev, enum hwmon_sensor_types type
 	if (pmp_thermal.power.fault || pmp_thermal.power_error ||
 	    ktime_get_ns() - pmp_thermal.power.last_ns > APPLE_PMP_POWER_STALE_NS)
 		return -EAGAIN;
-	*value = 1000L * (channel == 3 ? pmp_thermal.power.total_mw : pmp_thermal.rail_mw[channel]);
+	*value = 1000L * (channel == 3 ? pmp_thermal.power.total_mw :
+			  pmp_thermal.rail_mw[channel]);
 	return 0;
 }
 
@@ -681,21 +684,138 @@ static void apple_pmp_thermal_cleanup(void)
 	pmp_thermal.ready = false;
 }
 
-static int apple_pmp_add_cluster(unsigned int index, unsigned int cpu,
-				 unsigned long members)
+static int apple_pmp_policy_info(struct cpufreq_policy *policy,
+				 u32 *capacity, unsigned int *max_freq)
 {
-	struct apple_pmp_cluster *c = &pmp_thermal.clusters[index];
 	unsigned int n;
+	bool have_cap = false;
+	u32 cap = 0;
+
+	guard(cpufreq_policy_read)(policy);
+	if (!policy->freq_table)
+		return -EPROBE_DEFER;
+	if (cpumask_empty(policy->related_cpus))
+		return -EINVAL;
+	for_each_cpu(n, policy->related_cpus) {
+		struct device_node *np = of_cpu_device_node_get(n);
+		u32 cpu_cap;
+		int ret;
+
+		if (!np)
+			return -ENODEV;
+		ret = of_property_read_u32(np, "capacity-dmips-mhz", &cpu_cap);
+		of_node_put(np);
+		if (ret || !cpu_cap)
+			return -EINVAL;
+		if (!have_cap) {
+			cap = cpu_cap;
+			have_cap = true;
+		} else if (cpu_cap != cap) {
+			return -EINVAL;
+		}
+	}
+	*capacity = cap;
+	*max_freq = policy->cpuinfo.max_freq;
+	return 0;
+}
+
+/*
+ * Logical CPU numbering follows the boot CPU and device-tree order, so
+ * cluster masks vary across boards and boot paths. Discover the two
+ * cpufreq policies from the live topology, verify they partition every
+ * possible CPU with uniform DT capacity per cluster, and order P before E
+ * so cluster indices match the PP0b (P) and PPbb (E) power rails.
+ */
+static int apple_pmp_discover_clusters(struct cpufreq_policy *ordered[2])
+{
+	struct cpufreq_policy *found[2] = {};
+	unsigned int max_freq[2] = {};
+	u32 cap[2] = {};
+	unsigned int cpu, count = 0, i;
+	bool cap_gt, freq_gt;
 	int ret;
 
-	c->policy = cpufreq_cpu_get(cpu);
-	if (!c->policy)
-		return -EPROBE_DEFER;
+	for_each_online_cpu(cpu) {
+		struct cpufreq_policy *policy;
+		bool seen = false;
+
+		for (i = 0; i < count; i++) {
+			guard(cpufreq_policy_read)(found[i]);
+			if (cpumask_test_cpu(cpu, found[i]->related_cpus)) {
+				seen = true;
+				break;
+			}
+		}
+		if (seen)
+			continue;
+
+		policy = cpufreq_cpu_get(cpu);
+		if (!policy) {
+			ret = -EPROBE_DEFER;
+			goto err;
+		}
+		for (i = 0; i < count; i++) {
+			if (found[i] == policy) {
+				cpufreq_cpu_put(policy);
+				seen = true;
+				break;
+			}
+		}
+		if (seen)
+			continue;
+		if (count >= ARRAY_SIZE(found)) {
+			cpufreq_cpu_put(policy);
+			ret = -EINVAL;
+			goto err;
+		}
+		ret = apple_pmp_policy_info(policy, &cap[count], &max_freq[count]);
+		if (ret) {
+			cpufreq_cpu_put(policy);
+			goto err;
+		}
+		found[count++] = policy;
+	}
+
+	for_each_possible_cpu(cpu) {
+		unsigned int matches = 0;
+
+		for (i = 0; i < count; i++) {
+			guard(cpufreq_policy_read)(found[i]);
+			if (cpumask_test_cpu(cpu, found[i]->related_cpus))
+				matches++;
+		}
+		if (matches == 0) {
+			ret = -EPROBE_DEFER;
+			goto err;
+		}
+		if (matches != 1) {
+			ret = -EINVAL;
+			goto err;
+		}
+	}
+	cap_gt = cap[0] > cap[1];
+	freq_gt = max_freq[0] > max_freq[1];
+	if (count != ARRAY_SIZE(found) || cap[0] == cap[1] ||
+	    max_freq[0] == max_freq[1] || cap_gt != freq_gt) {
+		ret = -EINVAL;
+		goto err;
+	}
+	ordered[0] = cap_gt ? found[0] : found[1];
+	ordered[1] = cap_gt ? found[1] : found[0];
+	return 0;
+
+err:
+	for (i = 0; i < count; i++)
+		cpufreq_cpu_put(found[i]);
+	return ret;
+}
+
+static int apple_pmp_add_cluster(unsigned int index)
+{
+	struct apple_pmp_cluster *c = &pmp_thermal.clusters[index];
+	int ret;
+
 	guard(cpufreq_policy_read)(c->policy);
-	for_each_possible_cpu(n)
-		if (cpumask_test_cpu(n, c->policy->related_cpus) !=
-		    (n < BITS_PER_LONG && !!(members & BIT(n))))
-			return -EINVAL;
 	if (!c->policy->freq_table)
 		return -EPROBE_DEFER;
 
@@ -732,29 +852,27 @@ static bool apple_pmp_unbudgeted(void)
 
 static int apple_pmp_thermal_setup(void)
 {
+	struct cpufreq_policy *policies[2];
 	struct thermal_zone_device *zone;
-	unsigned long p_members = BIT(0) | GENMASK(9, 7);
-	unsigned long e_members = GENMASK(6, 1);
 	unsigned int i;
 	int ret;
 
-	/* J773g numbers the four P cores 0,3-5 and the six E cores 1-2,6-9. */
-	if (of_machine_is_compatible("apple,j773g")) {
-		p_members = BIT(0) | GENMASK(5, 3);
-		e_members = GENMASK(2, 1) | GENMASK(9, 6);
-	}
+	ret = apple_pmp_discover_clusters(policies);
+	if (ret)
+		return ret;
+	for (i = 0; i < ARRAY_SIZE(pmp_thermal.clusters); i++)
+		pmp_thermal.clusters[i].policy = policies[i];
 	if (apple_pmp_unbudgeted())
 		apple_pmp_power_init_unbudgeted(&pmp_thermal.power);
 	else
 		apple_pmp_power_init(&pmp_thermal.power);
 	apple_pmp_cooling_init(&pmp_thermal.cooling);
 	pmp_thermal.guard_level = 8;
-	ret = apple_pmp_add_cluster(0, 0, p_members);
-	if (ret)
-		goto fail;
-	ret = apple_pmp_add_cluster(1, 1, e_members);
-	if (ret)
-		goto fail;
+	for (i = 0; i < ARRAY_SIZE(pmp_thermal.clusters); i++) {
+		ret = apple_pmp_add_cluster(i);
+		if (ret)
+			goto fail;
+	}
 	zone = thermal_zone_device_register_with_trips("apple-pmp-die", apple_pmp_trips,
 						       ARRAY_SIZE(apple_pmp_trips), NULL,
 						       &apple_pmp_thermal_ops, &apple_pmp_params,
@@ -824,11 +942,11 @@ static int apple_pmp_thermal_probe(struct platform_device *pdev)
 {
 	const struct apple_pmp_sensor_data *sensors = dev_get_platdata(&pdev->dev);
 
-	/* The M4 PMP sensor records and the Airs' fanless policy are qualified. */
-	if (!apple_t8132_firmware_path())
-		return -ENODEV;
 	if (!sensors || !sensors->read || !sensors->dev)
 		return -EINVAL;
+	/* The M4 PMP's sensor records, found by name in its own image. */
+	if (!of_device_is_compatible(sensors->dev->of_node, "apple,t8132-pmp-v2"))
+		return -ENODEV;
 	pmp_thermal.sensors = sensors;
 	pmp_thermal.cached_error = -EAGAIN;
 	pmp_thermal.power_error = -EAGAIN;
@@ -873,9 +991,11 @@ static void apple_pmp_thermal_complete(struct device *dev)
 		return;
 	pmp_thermal.sleep_paused = false;
 	scoped_guard(mutex, &pmp_thermal.lock) {
+		u64 now = ktime_get_ns();
+
 		/* The sleep is no telemetry gap, nor cool time to refill the bucket. */
 		if (p->last_ns)
-			p->last_ns = ktime_get_ns();
+			p->last_ns = now;
 		if (p->active & BIT(2))
 			apple_pmp_gpu_publish(pmp_thermal.sensors, pmp_thermal.gpu_epoch,
 					      p->level[2], p->last_ns);
