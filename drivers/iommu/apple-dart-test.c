@@ -1347,6 +1347,29 @@ static u64 *apple_dart_test_reserved_table(struct kunit *test)
 }
 
 /*
+ * fw_mirror from the DART's own state: a T8132 DART its handed-over internal
+ * DCP names mirrors when locked without reserved tables and not borrowed; any
+ * other locked T8132 DART (the PMP's) keeps the retained-root path.
+ */
+static void apple_dart_test_t8132_fw_mirror_selection(struct kunit *test)
+{
+	struct apple_dart dart = { .locked = true };
+
+	KUNIT_EXPECT_TRUE(test, apple_dart_selects_fw_mirror(&dart, NULL, true));
+	/* A locked T8132 DART no display processor names: the PMP's. */
+	KUNIT_EXPECT_FALSE(test, apple_dart_selects_fw_mirror(&dart, NULL, false));
+
+	dart.locked = false;
+	KUNIT_EXPECT_FALSE(test, apple_dart_selects_fw_mirror(&dart, NULL, true));
+	dart.locked = true;
+	dart.fw_handoff = true;
+	KUNIT_EXPECT_FALSE(test, apple_dart_selects_fw_mirror(&dart, NULL, true));
+	dart.fw_handoff = false;
+	dart.preserve_display = true;
+	KUNIT_EXPECT_FALSE(test, apple_dart_selects_fw_mirror(&dart, NULL, true));
+}
+
+/*
  * A 27.2 T8132 internal display DART: re-exported firmware segments take the
  * protection of the live leaves that map them (read-only text, cacheable
  * data); a region whose leaf maps another page keeps what it asked for.
@@ -1454,6 +1477,7 @@ static struct kunit_case apple_dart_test_cases[] = {
 	KUNIT_CASE(apple_dart_test_locked_handoff),
 	KUNIT_CASE(apple_dart_test_sync_unknown_roots),
 	KUNIT_CASE(apple_dart_test_firmware_roots),
+	KUNIT_CASE(apple_dart_test_t8132_fw_mirror_selection),
 	KUNIT_CASE(apple_dart_test_t8132_dcp_v27_fw_prot),
 	KUNIT_CASE(apple_dart_test_unmap_flush_after_publish_failure),
 	KUNIT_CASE(apple_dart_test_gated_commands),
