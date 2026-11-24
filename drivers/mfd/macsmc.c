@@ -658,8 +658,12 @@ static int apple_smc_probe(struct platform_device *pdev)
 		of_device_is_compatible(dev->of_node, "apple,t6050-smc");
 	if (smc->saved_enabled && of_machine_is_compatible("apple,j714s"))
 		smc->wake_reasons = apple_smc_j714s_wake_reasons;
-	/* J813's late notice needs the bounded, IRQ-independent transport too. */
-	if (of_machine_is_compatible("apple,j813"))
+	/*
+	 * J813's late notice needs the bounded, IRQ-independent transport too, as does T8103's:
+	 * its SMC hears last, after SEP and the other coprocessors stopped.
+	 */
+	if (of_machine_is_compatible("apple,j813") ||
+	    of_device_is_compatible(dev->of_node, "apple,t8103-smc"))
 		smc->saved_enabled = true;
 	smc->sram_base = devm_platform_get_and_ioremap_resource(pdev, 1, &smc->sram);
 	if (IS_ERR(smc->sram_base))
@@ -1528,9 +1532,11 @@ static const struct apple_sleep_smc_saved_ops apple_smc_saved_ops = {
 };
 
 /*
- * J813 retains its existing MBSE/AP sequence and delay floors. The transport
- * is the saved lane: no scheduler, jiffies, IRQ worker or SRAM reuse is needed
- * after the peer stops. Unrelated notifications are retained until resume.
+ * J813 and T8103 retain their existing MBSE/AP sequence and delay floors. The
+ * transport is the saved lane: no scheduler, jiffies, IRQ worker or SRAM reuse
+ * is needed after the peer stops. Unrelated notifications are retained until
+ * resume, except on gen 1, whose are drained once the AP's power-down is
+ * answered.
  */
 static int apple_smc_sleep_after_peers(void *data, u64 *sent, u64 *ack)
 {
@@ -1544,14 +1550,26 @@ static int apple_smc_sleep_after_peers(void *data, u64 *sent, u64 *ack)
 		return -EINVAL;
 
 	smc->saved_committed = true;
+	/* Gen 1 (T8103): WKTP between slpw and slpa; this SMC has no pmVC. */
+	if (apple_sleep_smc_gen1_keys()) {
+		u8 wktp = 2;
+
+		ret = apple_smc_saved_write(smc, SMC_KEY(WKTP), &wktp, sizeof(wktp));
+		if (ret)
+			goto out;
+	}
 	ret = apple_smc_saved_write_u32(smc, SMC_KEY(MBSE), SMC_KEY(slpa));
 	if (ret)
 		goto out;
 	mdelay(SMC_SLEEP_ARM_MS);
 	smc->ap_notified = true;
 	ret = apple_rtkit_m5_saved_ap_power(smc->rtk, false, sent, ack);
-	if (!ret)
+	if (!ret) {
+		/* Gen 1: what the SMC posted with its answer, out of the mailbox first */
+		if (apple_sleep_smc_gen1_keys())
+			apple_smc_saved_drain(smc);
 		mdelay(SMC_SLEEP_IDLE_MS);
+	}
 out:
 	smc->saved_notice_error = ret;
 	return ret;
