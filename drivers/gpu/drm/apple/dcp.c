@@ -11517,13 +11517,12 @@ static void dcp_t6040_fixed_phy_up(struct apple_dcp *dcp)
 	if (ret) {
 		/*
 		 * The PHY stays off (the unbind action must not power off a PHY that is not on),
-		 * and so do the converter's rails.
+		 * and so does the converter's rail. The +5 V rail stays on as the sleep left it
+		 * (dcp_t6040_ext_link_down()): without it HPD stays low.
 		 */
 		dev_err(dcp->dev, "HDMI: DP PHY not powered again after the sleep: %d\n", ret);
 		if (dcp->dp2hdmi_pwren)
 			gpiod_set_value_cansleep(dcp->dp2hdmi_pwren, 0);
-		if (dcp->hdmi_pwren)
-			gpiod_set_value_cansleep(dcp->hdmi_pwren, 0);
 		return;
 	}
 	dcp->t6040_fixed_phy_off = false;
