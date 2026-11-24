@@ -227,6 +227,7 @@ enum {
  */
 #define WDT_MAX_SECS		178U
 #define T6040_WDT_PA		0x50836c000ULL	/* the address t6040_resume_stub writes */
+#define T6040_GP_PORTS		4	/* the GP PCIe host's port0 .. port3 */
 
 struct t6040_sleep_group {
 	const char *name;
@@ -292,12 +293,15 @@ struct t6040_sleep {
 	u32 pmc_dcp_saved[2];
 	u32 pmc_if_saved[2];		/* BWR and boost interface enables at the commit */
 	bool pmc_if_valid;
-	/* The GP PCIe host's two ports (Wi-Fi/BT, SD) for the commit's port stop (T8140's). */
-	void __iomem *gp_port[2];
-	void __iomem *gp_phy[2];
+	/*
+	 * The GP PCIe host's ports with an endpoint in the DT (J616s: Wi-Fi/BT and SD on 0
+	 * and 1; J773s: Wi-Fi and Ethernet on 0 and 2), for the commit's port stop (T8140's).
+	 */
+	void __iomem *gp_port[T6040_GP_PORTS];
+	void __iomem *gp_phy[T6040_GP_PORTS];
 	void __iomem *gp_pins;
-	int gp_perst[2];
-	bool gp_perst_low[2];
+	int gp_perst[T6040_GP_PORTS];
+	bool gp_perst_low[T6040_GP_PORTS];
 	void __iomem *spmi0;
 	void __iomem *spmi_a0;
 	void __iomem *mastermini;
@@ -339,8 +343,9 @@ struct t6040_sleep {
 	struct t6040_apcie_st apcie_st;
 	int pcie_ans_on_ret;
 	u32 apcie_wake_step;
-	u32 gp_phy_saved[2], gp_appclk_saved[2], gp_perst_saved[2];
-	bool gp_saved[2];
+	u32 gp_phy_saved[T6040_GP_PORTS], gp_appclk_saved[T6040_GP_PORTS];
+	u32 gp_perst_saved[T6040_GP_PORTS];
+	bool gp_saved[T6040_GP_PORTS];
 	unsigned int gp_clk_timeouts;
 	unsigned int aop_ps_timeouts;
 	unsigned int poll_timeouts;
@@ -1476,7 +1481,7 @@ static __always_inline bool t6040_apcie_sys_gp_on(struct t6040_sleep *s)
 	return FIELD_GET(PS_ACTUAL, readl(s->soc_east + PS_APCIE_SYS_GP));
 }
 
-/* The GP host's two ports, while the block's domains are all still on. */
+/* The GP host's ports, while the block's domains are all still on. */
 static void t6040_gp_ports_stop(struct t6040_sleep *s)
 {
 	int p;
@@ -1523,7 +1528,7 @@ static void t6040_apcie_gp_lower(struct t6040_sleep *s)
 }
 
 /*
- * The GP PCIe host's two ports (Wi-Fi/BT, SD): the boot loader set their clocks up, and
+ * The GP PCIe host's ports (J616s: Wi-Fi/BT, SD): the boot loader set their clocks up, and
  * nobody does after a sleep. Without them the DART in port 0's block faults in its noirq
  * resume. t6040_gp_port_stop() backwards, short of the link: the lane reference clocks
  * requested and acknowledged, the PHY's enables and the port's application clock as saved,
@@ -1991,42 +1996,59 @@ static void t6040_sleep_map_apcie(struct t6040_sleep *s)
 			 "no storage-apcie windows/tunables (apple,apcie): a real sleep with ANS stopped refuses\n");
 }
 
-/* The GP PCIe host's port and PHY windows and its ports' PERST# pins, for the commit. */
+/* The device number of a host's pci@N,0 child, or -1. */
+static int t6040_gp_child_port(struct device_node *child)
+{
+	u32 reg;
+
+	if (of_property_read_u32_index(child, "reg", 0, &reg))
+		return -1;
+	return (reg >> 11) & 0x1f;
+}
+
+/*
+ * The GP PCIe host's port and PHY windows and its ports' PERST# pins, for the commit: the
+ * ports with a pci@N,0 child, and each port's "portN" and "phyN" windows by name.
+ */
 static void t6040_sleep_map_gp(struct t6040_sleep *s)
 {
-	static const char *const ports[] = { "port0", "port1" };
-	static const char *const phys[] = { "phy0", "phy1" };
 	struct device_node *host, *child;
 	struct device_node *pins = NULL;
+	unsigned long mapped = 0;
 	struct resource res;
+	char name[8];
 	int p, idx;
 
-	s->gp_perst[0] = -1;
-	s->gp_perst[1] = -1;
+	for (p = 0; p < T6040_GP_PORTS; p++)
+		s->gp_perst[p] = -1;
 	host = of_parse_phandle(s->dev->of_node, "apple,gp-pcie", 0);
 	if (!host)
 		return;
 	/* Also with the host disabled: its port blocks hold DARTs that stay bound. */
-	for (p = 0; p < ARRAY_SIZE(s->gp_port); p++) {
-		idx = of_property_match_string(host, "reg-names", ports[p]);
+	for_each_child_of_node(host, child) {
+		p = t6040_gp_child_port(child);
+		if (p < 0 || p >= T6040_GP_PORTS || s->gp_port[p])
+			continue;
+		snprintf(name, sizeof(name), "port%d", p);
+		idx = of_property_match_string(host, "reg-names", name);
 		if (idx >= 0 && !of_address_to_resource(host, idx, &res))
 			s->gp_port[p] = t6040_ioremap_np(s->dev, res.start, resource_size(&res));
-		idx = of_property_match_string(host, "reg-names", phys[p]);
+		snprintf(name, sizeof(name), "phy%d", p);
+		idx = of_property_match_string(host, "reg-names", name);
 		if (idx >= 0 && !of_address_to_resource(host, idx, &res))
 			s->gp_phy[p] = t6040_ioremap_np(s->dev, res.start, resource_size(&res));
+		if (s->gp_port[p] && s->gp_phy[p])
+			__set_bit(p, &mapped);
 	}
 	/* Its endpoints' PERST# pins only for a host Linux runs. */
 	if (!of_device_is_available(host))
 		goto out;
 	for_each_available_child_of_node(host, child) {
 		struct of_phandle_args args;
-		u32 reg[1];
 
-		if (of_property_read_u32_array(child, "reg", reg, 1))
-			continue;
-		p = (reg[0] >> 11) & 0x1f;	/* the device number of pci@N,0 */
-		if (p > 1 || of_parse_phandle_with_args(child, "reset-gpios", "#gpio-cells", 0,
-							&args))
+		p = t6040_gp_child_port(child);
+		if (p < 0 || p >= T6040_GP_PORTS ||
+		    of_parse_phandle_with_args(child, "reset-gpios", "#gpio-cells", 0, &args))
 			continue;
 		if (args.args_count >= 2 && (!pins || pins == args.np)) {
 			if (!pins)
@@ -2041,10 +2063,10 @@ static void t6040_sleep_map_gp(struct t6040_sleep *s)
 			s->gp_pins = t6040_ioremap_np(s->dev, res.start, resource_size(&res));
 		of_node_put(pins);
 	}
-	dev_dbg(s->dev, "GP PCIe: ports %d/%d phys %d/%d, PERST# pins %d/%d\n",
-		!!s->gp_port[0], !!s->gp_port[1], !!s->gp_phy[0], !!s->gp_phy[1],
-		s->gp_perst[0], s->gp_perst[1]);
 out:
+	dev_dbg(s->dev, "GP PCIe: ports %*pbl mapped, PERST# pins %d/%d/%d/%d\n",
+		T6040_GP_PORTS, &mapped, s->gp_perst[0], s->gp_perst[1], s->gp_perst[2],
+		s->gp_perst[3]);
 	of_node_put(host);
 }
 
@@ -2182,8 +2204,7 @@ static int t6040_sleep_begin(struct apple_sleep *c)
 	u32 timeouts;
 
 	s->returned = false;
-	s->gp_saved[0] = false;
-	s->gp_saved[1] = false;
+	memset(s->gp_saved, 0, sizeof(s->gp_saved));
 	t6040_aop_ps_save(s);
 	t6040_sleep_pmvc(s);
 	t6040_dcs_dyn_pg(s);
