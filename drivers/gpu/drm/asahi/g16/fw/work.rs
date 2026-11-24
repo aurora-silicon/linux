@@ -80,6 +80,9 @@ pub(crate) mod ta {
     pub(crate) const TS_END: usize = 0x21c;
     pub(crate) const FINALIZE: usize = 0x268;
     pub(crate) const END: usize = 0x2fc;
+    /// u32 of the StartTA command: nonzero when the stage's register list enables SCS
+    /// (`compute::START_SCS`).
+    pub(crate) const START_SCS: usize = 0x60;
     /// The binding generation.
     pub(crate) const GENERATION: usize = 0x917;
 
@@ -142,6 +145,9 @@ pub(crate) mod fs {
     pub(crate) const TS_END: usize = 0x23c;
     pub(crate) const FINALIZE: usize = 0x288;
     pub(crate) const END: usize = 0x344;
+    /// u32 of the StartFS command: nonzero when the stage's register list enables SCS
+    /// (`compute::START_SCS`).
+    pub(crate) const START_SCS: usize = 0x78;
     /// The binding generation.
     pub(crate) const GENERATION: usize = 0xc5f;
 

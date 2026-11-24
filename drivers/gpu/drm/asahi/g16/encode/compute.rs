@@ -476,6 +476,7 @@ pub(crate) fn encode_compute_rt(
     put32(q, 0x30, u32::from(fault_mask != 0));
     put32(q, 0x38, r.compute_index);
     put32(q, 0x3c, r.work_818);
+    put32(q, compute::START_SCS, u32::from(rt.scs));
     put64(q, 0x44, r.work + 0x76c);
     put32(q, 0x50, 1);
     for (i, a) in att.iter().enumerate() {

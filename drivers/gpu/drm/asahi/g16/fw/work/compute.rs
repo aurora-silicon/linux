@@ -36,6 +36,11 @@ pub(crate) const CONTEXT_STORE_SIZE: usize = 0x40000;
 pub(crate) const POOL_SIZE: usize = 0x2000000;
 pub(crate) const POOL_STATE_SIZE: usize = 0x20000;
 pub(crate) const PAGE_LIST_SIZE: usize = 0x4000;
+/// u32 of the StartCompute command: nonzero when the work's register list enables shader-context
+/// scratch (SCS). The firmware then records the work's slot as an SCS user, appends
+/// `0x017d9 = 1` to the kick's register list, and keeps the SCS state (`0x017e0`, the compute
+/// and TA windows) through its idle teardown while the slot is busy.
+pub(crate) const START_SCS: usize = 0x40;
 pub(crate) const EVENT: u32 = 15;
 /// Firmware completion events for concurrent compute pipes `0..COMPUTE_PIPES`.
 pub(crate) const EVENTS: [u32; 2] = [EVENT, 16];

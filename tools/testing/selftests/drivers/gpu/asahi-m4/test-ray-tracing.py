@@ -14,7 +14,9 @@ Failure modes this guards against (written before the code):
  2. RT words land in the wrong register record, the register counts change, a gated register
     (0x1a141, render 0x017d9) is written while its gate is off, or a ray-query compute item is
     not bracketed by 0x017e1 = 1 first and 0x017d9 = 1 last, or its tail is not 0x2c, as macOS
-    27.2 writes them on the J773g.
+    27.2 writes them on the J773g; or a start command's SCS flag (StartCompute +0x40, StartTA
+    +0x60, StartFS +0x78) differs from whether the item's register list enables SCS, which
+    leaves a running ray-query dispatch exposed to the firmware's idle SCS teardown.
  3. The fragment window word loses bit 9; a render stage's tail word takes the auxiliary
     intersection word (the M4 Pro's render programs use the scratch tail).
  4. SCS sizing differs from the M4 Pro's formula ((pages + pages/256 + 8) x cores pages), is not
@@ -237,12 +239,17 @@ fn compute_rt_words_land_in_the_25f84_register_slots_only() {
                 assert_eq!(sel, plain_sel);
                 assert!(value == plain_value || rt_sels.contains(&sel), "{sel:#x}");
             }
-            // Nothing else moves: the register list, its count and the pool's descriptor words.
+            // The embedded StartCompute marks the slot as an SCS user, as macOS 27.2 does on
+            // every J773g compute item that opens with 0x017e1 (and on no other).
+            let flag = compute::SEQ_EMBEDDED + compute::START_SCS;
+            assert_eq!((u32_at(&plain, flag), u32_at(&w, flag)), (0, 1));
+            // Nothing else moves: the register list, its count, the pool's descriptor words and
+            // the start command's SCS flag.
             let regs = compute::REGS..compute::REGS + 27 * 12;
             let pool_words = [0x1c, 0x24, 0x2c, 0x48];
             for (i, (a, b)) in plain.iter().zip(w.iter()).enumerate() {
                 if a != b {
-                    assert!(regs.contains(&i) || (0x728..0x72c).contains(&i)
+                    assert!(regs.contains(&i) || (0x728..0x72c).contains(&i) || (flag..flag + 4).contains(&i)
                         || pool_words.iter().any(|&o| (d + o..d + o + 4).contains(&i)), "byte {i:#x}");
                 }
             }
@@ -315,7 +322,11 @@ fn render_stage_words_land_in_the_ta_and_fs_register_slots_only() {
             let window = 1 << 24 | 0x60 << 16;
             let ift = [POOL + 128, 0xc0003800, 0x6f00000000, 0x3feff, 0x10010020000, 0x16000000000];
             let (w, q) = ta_rt(&words, tl);
-            assert_eq!(q, taq_plain);
+            // StartTA marks the slot as an SCS user; nothing else in the sequence moves.
+            assert_eq!((u32_at(&taq_plain, ta::START_SCS), u32_at(&q, ta::START_SCS)), (0, 1));
+            for (i, (a, b)) in taq_plain.iter().zip(q.iter()).enumerate() {
+                assert!(a == b || (ta::START_SCS..ta::START_SCS + 4).contains(&i), "TA seq byte {i:#x}");
+            }
             assert_eq!((u16_at(&w, 0x748), u16_at(&w, 0x74a)), (68, 68 * 12));
             let ta_plain_regs = records(&ta_plain, ta::REGS, 66);
             let got = records(&w, ta::REGS, 68);
@@ -334,7 +345,11 @@ fn render_stage_words_land_in_the_ta_and_fs_register_slots_only() {
                 }
             }
             let (w, q) = fs_rt(&words, fl);
-            assert_eq!(q, fsq_plain);
+            // StartFS marks the slot as an SCS user; nothing else in the sequence moves.
+            assert_eq!((u32_at(&fsq_plain, fs::START_SCS), u32_at(&q, fs::START_SCS)), (0, 1));
+            for (i, (a, b)) in fsq_plain.iter().zip(q.iter()).enumerate() {
+                assert!(a == b || (fs::START_SCS..fs::START_SCS + 4).contains(&i), "FS seq byte {i:#x}");
+            }
             assert_eq!((u16_at(&w, 0x788), u16_at(&w, 0x78a)), (84, 84 * 12));
             let fs_plain_regs = records(&fs_plain, fs::REGS, 82);
             let got = records(&w, fs::REGS, 84);

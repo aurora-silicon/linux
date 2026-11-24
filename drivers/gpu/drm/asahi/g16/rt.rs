@@ -19,8 +19,11 @@
 //!   ray queries has been traced.
 //! - 0x1a141 (SCS driver word), `COMPUTE_SCS_DRIVER_WORD` (T1): macOS's ray-query compute
 //!   items on the J773g do not write it.
-//! - An SCS-enable bit in the work or microsequence, as g17's kick header has (T6): none is
-//!   known, so nothing is written.
+//! - The SCS-enable bit (T6, g17's kick header bit 61) is a u32 of each start command:
+//!   StartCompute +0x40, StartTA +0x60, StartFS +0x78 (`fw::work`'s `START_SCS`). macOS 27.2 on
+//!   the J773g sets it on every compute item whose list opens with 0x017e1 and on no other. A
+//!   slot without it is not protected from the firmware's idle SCS teardown (0x017e0 = 0,
+//!   compute and TA windows 0xff0000), which runs while its dispatch is still executing.
 //! - A traversal exclusion between clients (T8): the A18 Pro needs one (`g17::traversal`), the
 //!   M4 Pro's variants do not set it; G16G adds none.
 //! - How macOS sizes the SCS pool for a given request (T3): it grows its compute pool beyond

@@ -378,6 +378,7 @@ pub(crate) fn encode_ta_rt(
     put64(q, 0x64, work + 0x784);
     put64(q, 0x6c, work + 0x8a8);
     put32(q, 0x7c, r.uuid);
+    put32(q, ta::START_SCS, u32::from(RENDER_SCS_ENABLE && rt.scs));
     // TA attachments are filled by render_attachments before publication.
     inline_uma(q, 0x190, r, 0);
     timestamps(
@@ -657,6 +658,7 @@ pub(crate) fn encode_fs_rt(
     put64(q, 0x7c, work + 0xa58);
     put64(q, 0x84, work + 0xbf0);
     put32(q, 0xa0, r.uuid);
+    put32(q, fs::START_SCS, u32::from(RENDER_SCS_ENABLE && rt.scs));
     inline_uma(q, 0x1b0, r, 1);
     timestamps(
         q,
