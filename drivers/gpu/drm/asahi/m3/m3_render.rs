@@ -832,24 +832,30 @@ impl Render {
         }
         Ok(true)
     }
-    /// Whether the tiler queue has not yet retired its current head.
-    pub(crate) fn ta_done_pending(&mut self) -> Result<bool> {
-        Ok(self.objects[s::TA_POINTERS].read_u32(queue::DONE)? != u32::from(self.heads[0]))
-    }
-    /// Whether TA fully drained while fragment has READ == head but DONE < head.
+    /// Whether TA aborted and retired its ring while fragment has `READ == head`
+    /// with `DONE != head` and neither the TA host stamp nor the fragment FW
+    /// stamp reached the expected draw value.
     ///
-    /// On a TA fault, 27.2 firmware aborts the paired fragment command without
-    /// advancing `FRAGMENT_POINTERS.DONE` (while advancing `READ == head` and
-    /// idling the engines); the next draw catches `DONE` back up to `head`.
+    /// On a tiler-only fault, 27.2 firmware advances `TA.DONE` (already before
+    /// phase 3) while leaving `TA_STAMP` behind and discarding the paired
+    /// fragment command without advancing `FRAGMENT_POINTERS.DONE` or
+    /// `FRAGMENT_FW_STAMP` (`READ` still reaches `head`); the next draw catches
+    /// `DONE` back up to `head`.
     pub(crate) fn fragment_read_only_pending(&mut self) -> Result<bool> {
+        let ta_expected = self.stamp_epoch.value(s::STAMP_TA - 256, self.draw);
+        let fs_expected = self.stamp_epoch.value(s::STAMP_FRAGMENT - 256, self.draw);
+        let ta_host = self.objects[s::TA_STAMP].read_u32(0)?;
+        let fs_fw = self.objects[s::FRAGMENT_FW_STAMP].read_u32(0)?;
         let ta_done = self.objects[s::TA_POINTERS].read_u32(queue::DONE)?;
         let ta_read = self.objects[s::TA_POINTERS].read_u32(queue::READ)?;
         let fs_done = self.objects[s::FRAGMENT_POINTERS].read_u32(queue::DONE)?;
         let fs_read = self.objects[s::FRAGMENT_POINTERS].read_u32(queue::READ)?;
         Ok(ta_done == u32::from(self.heads[0])
             && ta_read == u32::from(self.heads[0])
+            && ta_host != ta_expected
             && fs_read == u32::from(self.heads[1])
-            && fs_done != u32::from(self.heads[1]))
+            && fs_done != u32::from(self.heads[1])
+            && fs_fw != fs_expected)
     }
     /// Re-synchronize render stamps and pool expectations after firmware recovery
     /// drained the stopped batch, and mark the faulting VM's binding for quarantine.
