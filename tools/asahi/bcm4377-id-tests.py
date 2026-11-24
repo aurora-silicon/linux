@@ -60,7 +60,8 @@ int main(void) {
         assert(id->driver_data==chip);
         for(unsigned b=0;b<sizeof(boards)/sizeof(boards[0]);b++) {
             board=boards[b];struct bcm4377_data data={};struct hci_dev hdev={};
-            bool expected=id->device==BCM4378_DEVICE_ID && !strcmp(board,"apple,j493");
+            /* Selected by the chip on every board that carries it. */
+            bool expected=id->device==BCM4378_DEVICE_ID;
             assert(probe_registration(&data,id,&hdev)==expected);
             assert(data.hw==&bcm4377_hw_variants[id->driver_data]);
             assert(bcm4377_resume_recovery_supported(&data)==expected);
@@ -68,9 +69,10 @@ int main(void) {
             cases++;
         }
     }
-    board="apple,j493";
-    struct bcm4377_hw wrong=bcm4377_hw_variants[BCM4378];wrong.id=4378;
-    struct bcm4377_data decimal={.hw=&wrong};assert(!bcm4377_resume_recovery_supported(&decimal));cases++;
+    for(unsigned chip=0;chip<4;chip++) {
+        assert(bcm4377_hw_variants[chip].recover_resume_timeout==(chip==BCM4378));
+        cases++;
+    }
     printf("%u table-backed identity and callback cases PASS\n",cases);return 0;
 }
 '''
@@ -121,10 +123,11 @@ def main():
     source_prefix = PREFIX + defs + '\n' + hw_defs + '\n' + pci_defs + '\n' + any_id + '\n' + '\n'.join(pieces[n] for n in ('enum', 'hw_struct', 'variants', 'pci_macro_table'))
     suffix = SUFFIX.replace('@SELECTION@', pieces['selection']).replace('@REGISTRATION@', pieces['registration'])
     gates = {'positive': pieces['gate'], 'published-original': old_pieces['gate']}
-    assert pieces['gate'].count('0x4378') == 1
-    gates['decimal-id'] = pieces['gate'].replace('0x4378', '4378')
-    gates['other-chip'] = pieces['gate'].replace('0x4378', '0x4387')
-    gates['board-bypass'] = pieces['gate'].replace('of_machine_is_compatible("apple,j493")', 'true')
+    flag = 'bcm4377->hw->recover_resume_timeout'
+    assert pieces['gate'].count(flag) == 1
+    gates['every-chip'] = pieces['gate'].replace(flag, 'true')
+    gates['other-chip'] = pieces['gate'].replace(flag, 'bcm4377->hw->id == 0x4387')
+    gates['board-gate'] = pieces['gate'].replace(flag, flag + ' && of_machine_is_compatible("apple,j493")')
     results = {}
     def no_core():
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
