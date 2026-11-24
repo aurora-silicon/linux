@@ -1,0 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* J493 with macOS 27 system firmware (27.2 stub). */
+#include "t8112-j493.dts"
+#include "t8112-mtp-fw27.dtsi"

@@ -1,0 +1,20 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * The MTP (keyboard and trackpad) of a T8112 laptop with macOS 27 system
+ * firmware. Every one of these laptops gets the same 27.x MTP firmware train.
+ */
+
+/*
+ * The 27.x MTP firmware cannot be restarted once quiesced: a boot stage that
+ * starts it hands it over running (apple,rtkit-handoff).
+ */
+&mtp {
+	apple,rtkit-keep-running;
+};
+
+/* The 27.x trackpad firmware answers only the two-stage power command. */
+&mtp_hid {
+	multi-touch {
+		apple,power-method = <2>;
+	};
+};
