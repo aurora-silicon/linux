@@ -399,4 +399,5 @@
 
 &t6040_sleep {
 	status = "okay";
+	apple,vdd-cio-request = <0x101>;
 };
