@@ -62,7 +62,7 @@ fn property_offset(data: &[u8], name: &[u8]) -> usize {
 fn set_cell(data: &mut [u8], name: &[u8], value: u32) {
     let at = property_offset(data, name) + 36; put32(data, at, value);
 }
-fn source() -> perf::Source { perf::parse(MEASURED).unwrap() }
+fn source() -> perf::Source { perf::parse(MEASURED, b"gpu,t8132").unwrap() }
 fn tables() -> wire::Performance { data::select(&source()).unwrap() }
 fn input(performance: wire::Performance) -> wire::Input {
     const HOST: u64 = wire::HOST_START;
@@ -166,7 +166,7 @@ fn j773g(core: [u32; 16], sram: [u32; 16]) -> perf::Source {
             put32(&mut raw,at+i*8+4,mv+5);
         }
     }
-    let p=data::select(&perf::parse(&raw).unwrap()).unwrap();
+    let p=data::select(&perf::parse(&raw, b"gpu,t8132").unwrap()).unwrap();
     let encoded=encode(p.clone()).unwrap();let main=&encoded[wire::id::MAIN];
     for i in 0..10 {
         assert_eq!(get32(main,0xfc8+i*4),p.frequency[i]);
@@ -179,35 +179,35 @@ fn j773g(core: [u32; 16], sram: [u32; 16]) -> perf::Source {
     assert_eq!(p.frequency[9],1471);assert_eq!(p.voltage[9],975);
 }
 #[test] fn truncations_and_overflowing_tree_headers_reject_without_panic() {
-    for end in 0..MEASURED.len() {assert!(perf::parse(&MEASURED[..end]).is_err());}
+    for end in 0..MEASURED.len() {assert!(perf::parse(&MEASURED[..end], b"gpu,t8132").is_err());}
     for at in [0,4,40,property_offset(MEASURED,b"perf-states")+32,property_offset(MEASURED,b"compatible")+32] {
         let mut bad=MEASURED.to_vec();put32(&mut bad,at,u32::MAX);
-        assert!(perf::parse(&bad).is_err());
+        assert!(perf::parse(&bad, b"gpu,t8132").is_err());
     }
-    assert!(perf::parse(&vec![0;0x20_0001]).is_err());
+    assert!(perf::parse(&vec![0;0x20_0001], b"gpu,t8132").is_err());
     let mut deep=Vec::new();
     for _ in 0..34 {deep.extend_from_slice(&0u32.to_le_bytes());deep.extend_from_slice(&1u32.to_le_bytes());}
-    deep.extend_from_slice(&[0;8]);assert!(perf::parse(&deep).is_err());
-    let mut padded=MEASURED.to_vec();padded.extend_from_slice(&[0;4096]);assert_eq!(perf::parse(&padded),Ok(source()));
+    deep.extend_from_slice(&[0;8]);assert!(perf::parse(&deep, b"gpu,t8132").is_err());
+    let mut padded=MEASURED.to_vec();padded.extend_from_slice(&[0;4096]);assert_eq!(perf::parse(&padded, b"gpu,t8132"),Ok(source()));
 }
 #[test] fn missing_wrong_identity_and_duplicate_required_properties_reject() {
     for name in [b"compatible".as_slice(),b"perf-state-count",b"perf-states",b"perf-states-sram"] {
         let mut bad=MEASURED.to_vec();let at=property_offset(&bad,name);bad[at]=b'X';
-        assert!(perf::parse(&bad).is_err());
+        assert!(perf::parse(&bad, b"gpu,t8132").is_err());
     }
     let mut bad=MEASURED.to_vec();let at=property_offset(&bad,b"compatible")+36;bad[at]=b'X';
-    assert_eq!(perf::parse(&bad),Err(perf::Error::Identity));
+    assert_eq!(perf::parse(&bad, b"gpu,t8132"),Err(perf::Error::Identity));
     let mut bad=MEASURED.to_vec();let at=property_offset(&bad,b"perf-states-sram");
     bad[at..at+32].fill(0);bad[at..at+11].copy_from_slice(b"perf-states");
-    assert_eq!(perf::parse(&bad),Err(perf::Error::Duplicate));
+    assert_eq!(perf::parse(&bad, b"gpu,t8132"),Err(perf::Error::Duplicate));
 }
 #[test] fn metadata_shape_frequency_units_off_state_and_voltage_ranges_reject() {
     for (name,value) in [(b"perf-state-count".as_slice(),0),(b"perf-state-count",33),(b"perf-state-count",15),(b"perf-state-table-count",2),(b"gpu-num-perf-states",14)] {
-        let mut bad=MEASURED.to_vec();set_cell(&mut bad,name,value);assert!(perf::parse(&bad).is_err());
+        let mut bad=MEASURED.to_vec();set_cell(&mut bad,name,value);assert!(perf::parse(&bad, b"gpu,t8132").is_err());
     }
     let at=property_offset(MEASURED,b"perf-states")+36;
     for (offset,value) in [(0,1),(8,0),(8,338_000_001),(8,3_001_000_000),(12,99),(12,1101)] {
-        let mut bad=MEASURED.to_vec();put32(&mut bad,at+offset,value);assert!(perf::parse(&bad).is_err());
+        let mut bad=MEASURED.to_vec();put32(&mut bad,at+offset,value);assert!(perf::parse(&bad, b"gpu,t8132").is_err());
     }
 }
 #[test] fn unsupported_shape_pairs_and_ordering_reject_before_encoding() {
@@ -256,7 +256,7 @@ fn j773g(core: [u32; 16], sram: [u32; 16]) -> perf::Source {
     let minimal = source();
     assert_eq!(minimal.avg_power_filter_tc_ms, None);
     assert_eq!(minimal.lowpeak_limiter_tc_ms, None);
-    let full = perf::parse(MEASURED_CLPC).unwrap();
+    let full = perf::parse(MEASURED_CLPC, b"gpu,t8132").unwrap();
     assert_eq!(full.power_sample_clks, Some(200_000));
     assert_eq!(full.power_sample_period_ms, Some(8));
     assert_eq!(full.avg_power_filter_tc_ms, Some(248));
@@ -275,11 +275,11 @@ fn j773g(core: [u32; 16], sram: [u32; 16]) -> perf::Source {
     ] {
         let mut bad = MEASURED_CLPC.to_vec();
         set_cell(&mut bad, name, 0);
-        assert_eq!(perf::parse(&bad), Err(perf::Error::Range));
+        assert_eq!(perf::parse(&bad, b"gpu,t8132"), Err(perf::Error::Range));
     }
     let mut unaligned = MEASURED_CLPC.to_vec();
     set_cell(&mut unaligned, b"coredump-copy-buffer", 0x8001);
-    assert_eq!(perf::parse(&unaligned), Err(perf::Error::Range));
+    assert_eq!(perf::parse(&unaligned, b"gpu,t8132"), Err(perf::Error::Range));
 }
 '''
 for marker, value in {'PARSER': backend / 'adt/perf.rs', 'ENCODER': backend / 'fw/initdata.rs',

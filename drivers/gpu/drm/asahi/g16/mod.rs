@@ -98,29 +98,7 @@ use crate::{alloc, gem, gpu, mmu, regs as shared_regs};
 /// Name of the G16 platform driver.
 pub(crate) const DRIVER_NAME: &CStr = c_str!("aurora-g16");
 
-/// GPU generation reported to userspace.
-pub(crate) const GPU_GENERATION: u32 = 16;
-
-/// Static configuration of a SoC with a G16 GPU.
-pub(crate) struct Config {
-    /// SoC identifier reported to userspace.
-    pub(crate) chip_id: u32,
-    /// GPU variant reported to userspace.
-    pub(crate) gpu_variant: crate::hw::GpuVariant,
-    /// GPU revision reported to userspace.
-    pub(crate) gpu_revision: u32,
-    /// Input address bits translated by each UAT root.
-    pub(crate) uat_ias: u32,
-    /// Output (physical) address bits of the UAT.
-    pub(crate) uat_oas: u32,
-    /// Clusters and cores per cluster.
-    pub(crate) num_clusters: u32,
-    pub(crate) num_cores_per_cluster: u32,
-    /// Qualified identification register values.
-    pub(crate) hw_ids: &'static [hw::HwId],
-    /// Qualified firmware builds.
-    pub(crate) firmware: &'static [hw::FirmwareBuild],
-}
+pub(crate) use hw::Config;
 
 /// OF match table of the G16 platform driver.
 const OF_TABLE: kernel::device_id::IdArray<of::DeviceId, &'static Config, 1> =

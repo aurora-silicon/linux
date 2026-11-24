@@ -13,7 +13,7 @@ pub(crate) mod perf;
 use core::ops::Range;
 use kernel::{bindings, c_str, device, of, prelude::*};
 
-use super::{boot::glue, hw};
+use super::{boot::glue, hw, Config};
 
 /// Independently owned reservations; none may intersect System RAM or another reservation.
 pub(crate) struct GpuAdt {
@@ -130,9 +130,9 @@ fn handoff(dev: &device::Device) -> Result<(u32, KVec<u64>, KVec<u32>)> {
 }
 
 /// The firmware layout the boot loader's handoff describes, if it describes a known one.
-pub(crate) fn layout(dev: &device::Device) -> Option<&'static hw::FwLayout> {
+pub(crate) fn layout(dev: &device::Device, cfg: &Config) -> Option<&'static hw::FwLayout> {
     let (version, vas, flags) = handoff(dev).ok()?;
-    hw::FW_LAYOUTS
+    cfg.layouts
         .iter()
         .copied()
         .find(|layout| layout.matches(version, &vas, &flags))
@@ -140,12 +140,12 @@ pub(crate) fn layout(dev: &device::Device) -> Option<&'static hw::FwLayout> {
 
 /// Validates the FDT contract and returns the reserved physical regions, read-only.
 #[inline(never)]
-pub(crate) fn read(dev: &device::Device) -> Result<KBox<GpuAdt>> {
+pub(crate) fn read(dev: &device::Device, cfg: &Config) -> Result<KBox<GpuAdt>> {
     let node = dev.of_node().ok_or(EINVAL)?;
     let (version, vas, flags) = handoff(dev)?;
     let names: KVec<u8> = node.get_property(c_str!("memory-region-names"))?;
     let phandles: KVec<u32> = node.get_property(c_str!("memory-region"))?;
-    let layout = hw::FW_LAYOUTS
+    let layout = cfg.layouts
         .iter()
         .copied()
         .find(|layout| layout.matches(version, &vas, &flags));
@@ -207,7 +207,7 @@ pub(crate) fn read(dev: &device::Device) -> Result<KBox<GpuAdt>> {
         regions[index] = start..end;
     }
     let (copy, source_pa) = performance_source(&regions)?;
-    let performance = perf::parse(&copy).map_err(|error| {
+    let performance = perf::parse(&copy, cfg.adt_compatible).map_err(|error| {
         dev_err!(
             dev,
             "M4 original ADT performance data rejected: {:?}\n",

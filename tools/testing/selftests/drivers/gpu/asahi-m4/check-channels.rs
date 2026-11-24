@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 #![allow(dead_code)]
+mod fw {
+    #[path = "@KERNEL@/drivers/gpu/drm/asahi/g16/fw/initdata.rs"]
+    pub mod initdata;
+}
 #[path = "@KERNEL@/drivers/gpu/drm/asahi/g16/fw/channels.rs"]
 mod channels;
 #[path = "@KERNEL@/drivers/gpu/drm/asahi/g16/fw/graph.rs"]
@@ -8,11 +12,6 @@ mod fwid {
 @FWID_BUILD@
 }
 mod hw {pub enum GpuVariant {G}}
-struct Config {
-    chip_id:u32,gpu_variant:hw::GpuVariant,gpu_revision:u32,uat_ias:u32,uat_oas:u32,
-    num_clusters:u32,num_cores_per_cluster:u32,
-    hw_ids:&'static[backend_hw::HwId],firmware:&'static[backend_hw::FirmwareBuild],
-}
 #[path = "@KERNEL@/drivers/gpu/drm/asahi/g16/hw.rs"]
 mod backend_hw;
 fn main() {

@@ -206,7 +206,7 @@ pub(crate) struct Regs {
     /// Host-owned generation register page (SGX +0xd60000).
     generation: Mapping,
     /// GFXCAXI2AF registers (SGX +0x1000000), written only by the 27.2 start.
-    axi2af: Mapping,
+    axi2af: Option<Mapping>,
     /// Highest firmware performance state the board's table holds: S9 until the table is
     /// known (the ten-row J713/J604 tables), S10 on the eleven-row J773g table.
     top: AtomicU32,
@@ -214,7 +214,11 @@ pub(crate) struct Regs {
 
 impl Regs {
     /// Maps the ASC control page and the SGX status window.
-    pub(crate) fn new(pdev: &platform::Device<Core<'_>>, res: G16Resources) -> Result<Self> {
+    pub(crate) fn new(
+        pdev: &platform::Device<Core<'_>>,
+        res: G16Resources,
+        cfg: &super::Config,
+    ) -> Result<Self> {
         let window = |name: &CStr, offset: u64| -> Result<Mapping> {
             let r = pdev.resource_by_name(name).ok_or(EINVAL)?;
             let nonposted = r
@@ -228,11 +232,19 @@ impl Regs {
         Ok(Self {
             asc: window(c_str!("asc"), 0)?,
             status: window(c_str!("sgx"), SGX_STATUS as u64)?,
-            generation: window(c_str!("sgx"), 0xd60000)?,
-            axi2af: window(c_str!("sgx"), super::hw::start_27_2::AXI2AF as u64)?,
+            generation: window(c_str!("sgx"), super::hw::HOST_BLOCK)?,
+            axi2af: cfg
+                .axi2af
+                .then(|| window(c_str!("sgx"), super::hw::start_27_2::AXI2AF as u64))
+                .transpose()?,
             top: AtomicU32::new(9),
             res,
         })
+    }
+
+    /// Physical base of the scratch alias in InitData.
+    pub(crate) fn host_block_pa(&self) -> u64 {
+        self.generation.phys
     }
 
     /// Reads the identification words and the enabled-core mask (after the AGX vote on 25G83).
@@ -283,7 +295,10 @@ impl Regs {
 
     /// 26B123 before RUN: sets bit 0 of the two GFXCAXI2AF enables, each read first.
     pub(crate) fn enable_axi2af(&self) -> Result {
-        let r = self.axi2af.io();
+        let Some(axi2af) = &self.axi2af else {
+            return Ok(());
+        };
+        let r = axi2af.io();
         for offset in super::hw::start_27_2::AXI2AF_ENABLES {
             let value = r.try_read32(offset)?;
             r.try_write32(value | 1, offset)?;

@@ -607,27 +607,32 @@ pub(crate) fn admit(
     // The board check guards the PMP AGX vote, which only the 25G83 start sends. A firmware
     // whose handoff names the start without the vote (26B123) rests on the firmware identity
     // checks below instead.
-    let votes = !matches!(adt::layout(dev), Some(layout) if layout.start == hw::Start::MacOs27_2);
+    let votes = !matches!(
+        adt::layout(dev, cfg),
+        Some(layout) if layout.start == hw::Start::MacOs27_2
+    );
     if votes && !glue::board() {
         return Err(ENODEV);
     }
-    // Retain the PMP supplier (and its AGX bridge) before any vote.
-    // SAFETY: `dev` is the bound GPU device.
-    let ret = unsafe { bindings::apple_pmp_j713_gpu_prepare(dev.as_raw()) };
-    if ret != 0 {
-        let err = Error::from_errno(ret);
-        if err != EPROBE_DEFER {
-            dev_err!(dev, "PMP supplier not ready: {:?}\n", err);
+    if cfg.prepare_pmp {
+        // Retain the PMP supplier (and its AGX bridge) before any vote.
+        // SAFETY: `dev` is the bound GPU device.
+        let ret = unsafe { bindings::apple_pmp_j713_gpu_prepare(dev.as_raw()) };
+        if ret != 0 {
+            let err = Error::from_errno(ret);
+            if err != EPROBE_DEFER {
+                dev_err!(dev, "PMP supplier not ready: {:?}\n", err);
+            }
+            return Err(err);
         }
-        return Err(err);
     }
     glue::display_prepare(dev).inspect_err(|e| {
         if *e != EPROBE_DEFER {
             dev_err!(dev, "native display not admitted: {:?}\n", e);
         }
     })?;
-    let adt =
-        adt::read(dev).inspect_err(|e| dev_err!(dev, "ADT GPU regions not admitted: {:?}\n", e))?;
+    let adt = adt::read(dev, cfg)
+        .inspect_err(|e| dev_err!(dev, "ADT GPU regions not admitted: {:?}\n", e))?;
     crate::fwid::identify(
         dev,
         adt.text.clone(),
@@ -660,14 +665,14 @@ pub(crate) fn admit(
         dev_err!(dev, "G16: unsupported coherent, IOMMU or custom DMA path\n");
         return Err(EINVAL);
     }
-    let regs = regs::Regs::new(pdev, res)?;
+    let regs = regs::Regs::new(pdev, res, cfg)?;
     // Once power admission starts, even a rejected cold check must not detach the GFX
     // domain under an inherited firmware owner. Keep the module and platform binding; once
     // the module's removal has begun nothing is held.
     glue::retain_module()?;
     glue::hold_power(dev)?;
     let (power_offset, power_state) = glue::power_domain_state(dev)?;
-    if power_offset != 0x250 || (power_state >> 4) & 0xf != 0xf {
+    if power_offset != cfg.power_offset || (power_state >> 4) & 0xf != 0xf {
         dev_err!(
             dev,
             "M4 GFX domain not admitted: register{:#x} state{:#x}\n",
@@ -989,15 +994,16 @@ pub(crate) fn start(
         );
         return Err(eproto());
     }
-    // M4 has one cluster with up to ten enabled cores.
-    if id.core_masks[0] == 0 || id.cores >> hw::CLUSTER_BITS != 0 {
+    if id.cores >> cfg.core_slots() != 0
+        || id.core_masks[..cfg.num_clusters as usize].contains(&0)
+    {
         dev_err!(d, "implausible G16G core mask {:#x}\n", id.cores);
         return Err(eproto());
     }
     dev_info!(
         d,
         "M4 G16G: {} cores enabled\n",
-        id.core_masks[0].count_ones()
+        id.cores.count_ones()
     );
     if regs.pstate()? > regs.top() {
         return Err(eproto());
@@ -1067,7 +1073,7 @@ pub(crate) fn start(
     let result = (|| {
         events.reserve()?;
         // Every host object and every context-0 alias is prepared before RUN is set.
-        built = Some(initdata::build(&d, &session.adt, &mut objects)?);
+        built = Some(initdata::build(&d, &session.adt, &session.regs, &mut objects)?);
         if let Some((init, _, _)) = built.as_ref() {
             // The running firmware may report any state of the board's table, up to S10 on J773g.
             session.regs.set_table(init.rows);

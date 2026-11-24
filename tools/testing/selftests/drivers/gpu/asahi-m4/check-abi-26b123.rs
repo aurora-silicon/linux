@@ -15,11 +15,6 @@ mod hw {
 mod fwid {
 @FWID_BUILD@
 }
-struct Config {
-    chip_id:u32,gpu_variant:hw::GpuVariant,gpu_revision:u32,uat_ias:u32,uat_oas:u32,
-    num_clusters:u32,num_cores_per_cluster:u32,
-    hw_ids:&'static[backend_hw::HwId],firmware:&'static[backend_hw::FirmwareBuild],
-}
 #[path = "@KERNEL@/drivers/gpu/drm/asahi/g16/hw.rs"]
 mod backend_hw;
 #[path = "@KERNEL@/drivers/gpu/drm/asahi/g16/fw/mod.rs"]

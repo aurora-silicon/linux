@@ -11,7 +11,7 @@
 
 use kernel::{prelude::*, uapi};
 
-use super::{hw, Gpu, GPU_GENERATION};
+use super::{hw, Gpu};
 use crate::module_parameters;
 
 /// Operations per VM_BIND batch at most: batches are atomic and may be large (sparse residency
@@ -90,11 +90,6 @@ pub(crate) fn early_tiling() -> bool {
 
 /// Fills the generation part of GET_PARAMS group 0.
 pub(crate) fn fill(gpu: &Gpu, params: &mut uapi::drm_asahi_params_global) -> Result {
-    // Match the working J713 C backend identity; SGX register revision fields are
-    // not the userspace BCD revision.
-    if gpu.cfg.chip_id != 0x8132 || gpu.cfg.gpu_revision != 0x10 {
-        return Err(ENODEV);
-    }
     params.features |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS)
         | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS)
         | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS)
@@ -104,7 +99,7 @@ pub(crate) fn fill(gpu: &Gpu, params: &mut uapi::drm_asahi_params_global) -> Res
         | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_BOUNDED_AS_BUILD)
         | crate::g17::sync_output::FEATURE_CUMULATIVE_SIGNALS
         | crate::file::DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2;
-    params.gpu_generation = GPU_GENERATION;
+    params.gpu_generation = gpu.cfg.gpu_generation;
     params.gpu_variant = gpu.cfg.gpu_variant as u32;
     params.gpu_revision = gpu.cfg.gpu_revision;
     params.chip_id = gpu.cfg.chip_id;

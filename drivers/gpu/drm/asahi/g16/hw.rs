@@ -20,13 +20,52 @@ pub(crate) struct HwId {
 
 pub(crate) use crate::fwid::FirmwareBuild;
 
+/// Static configuration of a SoC supported by this backend.
+pub(crate) struct Config {
+    /// SoC identifier reported to userspace.
+    pub(crate) chip_id: u32,
+    /// GPU generation reported to userspace.
+    pub(crate) gpu_generation: u32,
+    /// GPU variant reported to userspace.
+    pub(crate) gpu_variant: crate::hw::GpuVariant,
+    /// GPU revision reported to userspace.
+    pub(crate) gpu_revision: u32,
+    /// Input address bits translated by each UAT root.
+    pub(crate) uat_ias: u32,
+    /// Output (physical) address bits of the UAT.
+    pub(crate) uat_oas: u32,
+    /// Clusters and cores per cluster.
+    pub(crate) num_clusters: u32,
+    pub(crate) num_cores_per_cluster: u32,
+    /// Qualified identification register values.
+    pub(crate) hw_ids: &'static [HwId],
+    /// Compatible of the original ADT SGX node.
+    pub(crate) adt_compatible: &'static [u8],
+    /// Qualified boot-loader handoffs.
+    pub(crate) layouts: &'static [&'static FwLayout],
+    /// Qualified firmware builds.
+    pub(crate) firmware: &'static [FirmwareBuild],
+    /// T8132 retains the PMP bridge even on firmware that does not send an AGX vote.
+    pub(crate) prepare_pmp: bool,
+    /// PMGR register offset of the GFX domain.
+    pub(crate) power_offset: u32,
+    /// GFXCAXI2AF needs host enable writes before the 27.2 firmware starts.
+    pub(crate) axi2af: bool,
+}
+
+impl Config {
+    pub(crate) const fn core_slots(&self) -> u32 {
+        self.num_clusters * self.num_cores_per_cluster
+    }
+}
+
 /// The J713/J773g T8132 configuration. Hardware admission also checks the exact TEXT image.
 pub(crate) mod t8132 {
-    use super::super::Config;
-    use super::{FirmwareBuild, HwId};
+    use super::{Config, FirmwareBuild, HwId, FW_25G83, FW_26B123};
 
     pub(crate) const CONFIG: Config = Config {
         chip_id: 0x8132,
+        gpu_generation: 16,
         gpu_variant: crate::hw::GpuVariant::G,
         gpu_revision: 0x10,
         uat_ias: 42,
@@ -37,6 +76,8 @@ pub(crate) mod t8132 {
             version: 0x0a021100,
             counts: 0x0011010a,
         }],
+        adt_compatible: b"gpu,t8132",
+        layouts: &[&FW_25G83, &FW_26B123],
         firmware: &[
             FirmwareBuild {
                 name: "Apple GFX 25G83 (normalized loaded image)",
@@ -126,6 +167,9 @@ pub(crate) mod t8132 {
                 ],
             },
         ],
+        prepare_pmp: true,
+        power_offset: 0x250,
+        axi2af: true,
     };
 
     /// What iBoot writes into the 25G83 build b000 TEXT it loads, in TEXT order:
@@ -282,6 +326,9 @@ pub(crate) enum Start {
     MacOs27_2,
 }
 
+/// Host-owned SGX register block.
+pub(crate) const HOST_BLOCK: u64 = 0xd60000;
+
 /// The 26B123 start sequence up to the InitData doorbell:
 /// 1. before RUN, bit 0 of GFXCAXI2AF `+0x104` and `+0x108` is set (read, then written);
 /// 2. RTKit boots without an IOP power request: HELLO 12, the crash-log endpoint starts while
@@ -339,6 +386,8 @@ pub(crate) struct FwLayout {
     pub(crate) data_size: u64,
     /// The firmware ABI of the builds this layout holds.
     pub(crate) abi: FwAbi,
+    /// InitData wire layout, including the version word of this firmware image.
+    pub(crate) initdata: &'static super::fw::initdata::Layout,
     /// Every leaf the boot loader builds in the firmware's own page tables, in VA order, and
     /// the only leaves cold admission accepts (none: the firmware builds its own tree at
     /// start); `None` until known, which refuses the firmware.
@@ -391,6 +440,7 @@ pub(crate) const FW_25G83: FwLayout = FwLayout {
     text_size: 0x60000,
     data_size: 0x13c000,
     abi: FwAbi::V25G83,
+    initdata: &super::fw::initdata::V25G83,
     leaves: Some(&[
         Leaves {
             range: 0..0x50000,
@@ -452,6 +502,7 @@ pub(crate) const FW_26B123: FwLayout = FwLayout {
     text_size: 0x64000,
     data_size: 0xd8000,
     abi: FwAbi::V26B123,
+    initdata: &super::fw::initdata::V26B123,
     // The firmware builds its own tree at start; admit only an empty tree.
     leaves: Some(&[]),
     ppl_magic: Some(PplMagic {
@@ -466,9 +517,6 @@ pub(crate) const FW_26B123: FwLayout = FwLayout {
     // and to 0 after each power-down.
     powered: Some(0x648),
 };
-
-/// The firmware layouts this backend knows, newest last.
-pub(crate) const FW_LAYOUTS: &[&FwLayout] = &[&FW_25G83, &FW_26B123];
 
 /// User VA range reported as `vm_start..vm_end`: 42 bits with the final two pages excluded.
 pub(crate) const USER_RANGE: Range<u64> = 0x4000..0x3ffffff8000;

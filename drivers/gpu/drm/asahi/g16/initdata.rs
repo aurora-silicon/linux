@@ -97,10 +97,11 @@ fn pair(graph: &[Arc<FwObject>], state: usize, ring: usize) -> Ring {
 pub(crate) fn build(
     dev: &device::Device,
     adt: &GpuAdt,
+    regs: &super::regs::Regs,
     objects: &mut Objects,
 ) -> Result<(InitData, Channels, u32)> {
     let abi = adt.layout.abi;
-    let layout = abi.initdata();
+    let layout = adt.layout.initdata;
     let performance = board::qualify(dev, adt)?;
     // The top row: S9 on J713, S10 on J773g.
     let ceiling = performance.count as u32 - 1;
@@ -260,7 +261,7 @@ pub(crate) fn build(
     input.scratch = objects.reserve_io(0x8000)?;
     // This scratch alias deliberately has firmware RAM attrs, matching the
     // qualified owner, even though the target is an SGX register window.
-    objects.map_mmio_class(input.scratch, 0x300d60000, 0x8000, hw::pte::FW)?;
+    objects.map_mmio_class(input.scratch, regs.host_block_pa(), 0x8000, hw::pte::FW)?;
 
     // Private CPU-side staging keeps the pure encoder independent of raw GEM
     // pointers. No staging references survive publication.
