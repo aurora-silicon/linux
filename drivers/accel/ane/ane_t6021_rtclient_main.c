@@ -307,6 +307,13 @@ struct ane_rtclient {
 	 * 27.x contract. Decided from the booted firmware at every boot.
 	 */
 	bool fw_table;
+	/*
+	 * For a published table: the shared 27.x transport (the H16/H17 one)
+	 * with its command pool, and the mailbox registers it rings.
+	 */
+	struct ane_fw_transport *transport;
+	struct ane_legacy_buffer *transport_pool;
+	struct ane_fw_platform transport_regs;
 	struct ane_fw_channel channels[ANE_FW_CHANNELS];
 	u8 channel_snapshot[ANE_FW_TABLE_SIZE];
 	u64 channel_table_offset;
@@ -863,7 +870,8 @@ static void ane_rtclient_dump_rings(struct ane_rtclient *ane)
 
 	for (i = 0; i < ARRAY_SIZE(chans); i++) {
 		const struct ane_fw_channel *c = &ane->channels[chans[i]];
-		unsigned int cur = chans[i] == 5 ? ane->legacy_malloc_cursor :
+		unsigned int cur = ane->transport ? ane->transport->head[chans[i]] :
+				   chans[i] == 5 ? ane->legacy_malloc_cursor :
 				   ane->legacy_cmd_cursor[chans[i]];
 		unsigned int n = min_t(unsigned int, c->slots, 8);
 
@@ -885,18 +893,160 @@ static void ane_rtclient_dump_rings(struct ane_rtclient *ane)
 		 ane->legacy_live, ane->legacy_allocated, ane->legacy_bytes);
 }
 
+/*
+ * The shared 27.x transport's view of this device: coherent rings and
+ * buffers, the engine's mailbox registers, and firmware allocations from the
+ * same table the 13.5 allocation ring uses.
+ */
+static u64 ane_rtclient_tr_load64(void *ctx, const void *p)
+{
+	return le64_to_cpu(READ_ONCE(*(const __le64 *)p));
+}
+
+static void ane_rtclient_tr_store64(void *ctx, void *p, u64 value)
+{
+	WRITE_ONCE(*(__le64 *)p, cpu_to_le64(value));
+}
+
+static void ane_rtclient_tr_rmb(void *ctx)
+{
+	dma_rmb();
+}
+
+static void ane_rtclient_tr_wmb(void *ctx)
+{
+	dma_wmb();
+}
+
+static u32 ane_rtclient_tr_read32(void *ctx, u32 reg)
+{
+	struct ane_rtclient *ane = ctx;
+
+	return readl(ane->engine + reg);
+}
+
+static void ane_rtclient_tr_write32(void *ctx, u32 reg, u32 value)
+{
+	struct ane_rtclient *ane = ctx;
+
+	writel(value, ane->engine + reg);
+	if (reg == ane->transport_regs.irq_ack) {
+		/* Complete an acknowledgment before the next coherent ring reads. */
+		mb();
+	}
+}
+
+static u64 ane_rtclient_tr_now(void *ctx)
+{
+	return ktime_get_ns();
+}
+
+static void ane_rtclient_tr_relax(void *ctx, u64 waited_ns)
+{
+	ane_fw_poll_pause(waited_ns);
+}
+
+/* The transport bounds size and count (ane_fw_shared_size()). */
+static int ane_rtclient_tr_alloc(void *ctx, size_t size, u32 tag,
+				 struct ane_fw_surface *surface)
+{
+	struct ane_rtclient *ane = ctx;
+	struct ane_legacy_buffer *buf;
+	int slot = ane_rtclient_legacy_alloc(ane, size);
+
+	if (slot < 0) {
+		dev_info(ane->dev, "27.x SHAREDMALLOC tag %#x %zu bytes: allocation failed %d\n",
+			 tag, size, slot);
+		return slot;
+	}
+	buf = &ane->legacy_buffers[slot];
+	*surface = (struct ane_fw_surface) {
+		.cpu = buf->cpu, .dva = buf->dma, .size = buf->size,
+	};
+	dev_info(ane->dev, "27.x SHAREDMALLOC tag %#x %zu bytes -> %pad\n",
+		 tag, size, &buf->dma);
+	return 0;
+}
+
+static void ane_rtclient_tr_refused(void *ctx, u64 word0, u64 word1, u64 word2,
+				    int error)
+{
+	struct ane_rtclient *ane = ctx;
+
+	dev_info(ane->dev, "27.x SHAREDMALLOC refused %016llx %016llx %016llx: %d\n",
+		 word0, word1, word2, error);
+}
+
+static void ane_rtclient_tr_note(void *ctx, const char *event, u64 dva, u64 size,
+				 u32 tag)
+{
+	struct ane_rtclient *ane = ctx;
+
+	dev_info(ane->dev, "27.x SHAREDMALLOC %s tag %#x %llu bytes at %#llx\n",
+		 event, tag, size, dva);
+}
+
+static const struct ane_fw_transport_ops ane_rtclient_transport_ops = {
+	.load64 = ane_rtclient_tr_load64, .store64 = ane_rtclient_tr_store64,
+	.read_barrier = ane_rtclient_tr_rmb, .write_barrier = ane_rtclient_tr_wmb,
+	.read32 = ane_rtclient_tr_read32, .write32 = ane_rtclient_tr_write32,
+	.now_ns = ane_rtclient_tr_now, .relax = ane_rtclient_tr_relax,
+	.alloc = ane_rtclient_tr_alloc, .refused = ane_rtclient_tr_refused,
+	.shared_note = ane_rtclient_tr_note,
+};
+
+/*
+ * Attach the shared transport to the table the firmware published and give
+ * its host-to-firmware slots to the host (ane_fw_transport_arm()).
+ */
+static int ane_rtclient_transport_init(struct ane_rtclient *ane)
+{
+	struct ane_t6021 *a = ane->fw;
+	struct ane_fw_surface ipc = {
+		.cpu = a->boot_ipc, .dva = a->boot_ipc_iova, .size = a->boot_ipc_size,
+	}, pool;
+	int slot, ret;
+
+	if (!ane->transport) {
+		ane->transport = devm_kzalloc(ane->dev, sizeof(*ane->transport),
+					      GFP_KERNEL);
+		if (!ane->transport)
+			return -ENOMEM;
+	}
+	slot = ane_rtclient_legacy_alloc(ane, SZ_16K);
+	if (slot < 0)
+		return slot;
+	ane->transport_pool = &ane->legacy_buffers[slot];
+	pool = (struct ane_fw_surface) {
+		.cpu = ane->transport_pool->cpu, .dva = ane->transport_pool->dma,
+		.size = ane->transport_pool->size,
+	};
+	/* The mailbox the 13.5 rings use: doorbell, pending, acknowledge. */
+	ane->transport_regs = (struct ane_fw_platform) {
+		.doorbell = ANE_IPI_OFF,
+		.irq_status = ANE_IPI_OFF + 0x8000,
+		.irq_ack = ANE_IPI_OFF + 0xc000,
+	};
+	ret = ane_fw_transport_init(ane->transport, &ane->transport_regs,
+				    &ane_rtclient_transport_ops, ane, ipc, pool, 0,
+				    a->boot_scratch_result, ANE_FW_TABLE_SIZE);
+	/* FREE takes the DVA|1 reply, as on the H16/H17 cold boots. */
+	ane->transport->allow_free = true;
+	if (!ret)
+		ret = ane_fw_transport_arm(ane->transport);
+	if (ret)
+		dev_err(ane->dev, "27.x transport: %d (raised at ane_fw_transport.h:%u)\n",
+			ret, ane->transport->error_line);
+	return ret;
+}
+
 /* Give every host-to-firmware slot to the host before the boot ACK. */
 static bool ane_rtclient_host_init(struct ane_rtclient *ane)
 {
 	struct ane_t6021 *a = ane->fw;
 
-	if (ane->fw_table) {
-		/* Only a validated table: validate_chman() set chman_ok. */
-		if (!ane->chman_ok)
-			return false;
-		ane_fw_channels_host_init(a->boot_ipc, ane->channels);
-		return true;
-	}
+	if (ane->fw_table)
+		return ane->chman_ok && !ane_rtclient_transport_init(ane);
 	return ane_t6021_chman_host_init(a->boot_ipc, a->boot_ipc_size,
 					 a->boot_ipc_iova);
 }
@@ -918,32 +1068,49 @@ static int ane_rtclient_ack_wait(struct ane_rtclient *ane)
 }
 
 /*
- * The 27.x startup exchange (ane_fw_startup_command()), in place of the 13.5
- * CONFIG_GET. Every reply is logged once per boot.
+ * The 27.x startup exchange (ane_fw_startup_command()) on the shared
+ * transport, in place of the 13.5 CONFIG_GET. The transport answers the
+ * firmware's SHAREDMALLOC requests and drains its TERMINAL ring while it
+ * waits. Every reply is logged once per boot.
  */
 static int ane_rtclient_fw_startup(struct ane_rtclient *ane)
 {
-	struct ane_legacy_buffer *command = ane->cmd_buf;
-	u8 *p = command->cpu;
+	struct ane_fw_transport *t = ane->transport;
+	u8 command[100], *p;
 	unsigned int i, off;
 	u16 id, size;
 	int ret;
 
+	if (!t)
+		return -ENODEV;
 	for (i = 0; ane_fw_startup_command(i, &id, &size); i++) {
-		memset(p, 0, SZ_16K);
-		ret = ane_rtclient_legacy_exchange(ane, command, size, id, 1,
-						   jiffies + msecs_to_jiffies(3000));
+		memset(command, 0, sizeof(command));
+		ane_fw_command_header(command, id, true);
+		ret = ane_fw_transport_publish(t, ANE_FW_IO, command, size,
+					       ktime_get_ns() + 3 * NSEC_PER_SEC);
+		if (!ret)
+			ret = ane_fw_transport_wait(t, ANE_FW_IO);
+		p = t->pool.cpu + (t->pending[ANE_FW_IO].dva - t->pool.dva);
 		dev_info(ane->dev, "27.x startup %#x (%u bytes): %d ack %#x\n",
-			 id, size, ret, get_unaligned_le16(p + 6));
-		for (off = 0; off < size; off += 32)
-			dev_info(ane->dev, "27.x reply %#x +%#04x: %*ph\n", id, off,
-				 (int)min_t(unsigned int, 32, size - off), p + off);
-		if (ret)
+			 id, size, ret, t->pending[ANE_FW_IO].dva ?
+			 get_unaligned_le16(p + 6) : 0);
+		if (t->pending[ANE_FW_IO].dva)
+			for (off = 0; off < size; off += 32)
+				dev_info(ane->dev, "27.x reply %#x +%#04x: %*ph\n", id, off,
+					 (int)min_t(unsigned int, 32, size - off), p + off);
+		if (ret) {
+			dev_info(ane->dev,
+				 "27.x transport error %d (ane_fw_transport.h:%u); IO head %u\n",
+				 t->error, t->error_line, t->head[ANE_FW_IO]);
+			ane_rtclient_dump_rings(ane);
 			return ret;
+		}
 		if ((id == 0x4 && get_unaligned_le32(p + 8)) ||
 		    (id == 0x3 && ane_fw_config_status(p, size)))
 			return -EPROTO;
 	}
+	dev_info(ane->dev, "27.x startup done: %u firmware allocations (%zu bytes)\n",
+		 t->shared_count, t->shared_bytes);
 	return 0;
 }
 
@@ -1826,9 +1993,15 @@ static int ane_rtclient_load_program(struct ane_rtclient *ane,
 	int ret, i, j;
 
 	BUILD_BUG_ON(DRM_ANE_MAX_SECTIONS != ANE_T6021_LOAD_SEC_COUNT);
-	/* H16 requires the original HWX, not caller-asserted section identity. */
-	if (ane->fw_table)
+	/*
+	 * 27.x LOAD takes the original HWX (the ABI 3 path), not the ABI 2
+	 * sections, and the H16 HWX path accepts no H14 program yet.
+	 */
+	if (ane->fw_table) {
+		dev_info_once(ane->dev,
+			      "27.x firmware: ABI 2 program load not supported; refused\n");
 		return -EOPNOTSUPP;
+	}
 	if (user->pad || user->section_count < 1 ||
 	    user->section_count > ANE_T6021_LOAD_SEC_COUNT ||
 	    user->generic_count > DRM_ANE_MAX_BINDS || !fd)
@@ -4454,6 +4627,9 @@ static int ane_rtclient_probe_inner(struct platform_device *pdev,
 			goto err_pm_or_hold;
 		}
 		WRITE_ONCE(ane_t6021_perf_ane, ane);
+		if (ane->fw_table)
+			dev_info(dev,
+				 "27.x firmware up; program load, create and execute are refused on it\n");
 		dev_info(dev,
 			 "loaded ane_t6021 (DRM major %d minor %d; ABI 2; legacy_only=%u chman_ok=%u booted=%u; state %s; BO cap %u MiB)\n",
 			 DRM_ANE_ABI_V2, 0,

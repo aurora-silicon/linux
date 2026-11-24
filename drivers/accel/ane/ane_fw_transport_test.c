@@ -737,6 +737,84 @@ static void ane_transport_shared_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->t.shared_count, 2U);
 }
 
+/*
+ * The native 27.2 H14 layout (J473 row, 2026-11-24): a 0xc441-byte IPC with
+ * the table at its base, the 13.5 mailbox registers, and the 64 KiB "LOG"
+ * request the firmware posts right after the boot ACK, while the first
+ * startup command waits.
+ */
+static void ane_transport_h14_log_request_test(struct kunit *test)
+{
+	static const struct { u32 type, slots, offset; } rings[ANE_FW_CHANNELS] = {
+		{ 2, 512, 0x800 }, { 0, 16, 0x8800 }, { 0, 8, 0x8c00 },
+		{ 0, 64, 0x8e00 }, { 1, 64, 0x9e00 }, { 1, 8, 0xae00 },
+		{ 1, 64, 0xb000 }, { 0, 16, 0xc000 },
+	};
+	struct ane_transport_test *f = test->priv;
+	u8 command[12] = {};
+	unsigned int i;
+	u8 *p;
+
+	f->soc.doorbell = 0x1844000;
+	f->soc.irq_status = 0x184c000;
+	f->soc.irq_ack = 0x1850000;
+	f->ipc = (struct ane_fw_surface) {
+		.cpu = kunit_kzalloc(test, 0xc441, GFP_KERNEL),
+		.dva = 0xff7b0000,
+		.size = 0xc441,
+	};
+	KUNIT_ASSERT_NOT_NULL(test, f->ipc.cpu);
+	for (i = 0; i < ANE_FW_CHANNELS; i++) {
+		u8 *d = (u8 *)f->ipc.cpu + i * ANE_FW_DESCRIPTOR_SIZE;
+
+		strscpy((char *)d, ane_fw_channel_name(i), 64);
+		put_unaligned_le32(rings[i].type, d + 0x40);
+		put_unaligned_le32(i, d + 0x44);
+		put_unaligned_le64(rings[i].slots, d + 0x48);
+		put_unaligned_le64(f->ipc.dva + rings[i].offset, d + 0x50);
+	}
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_init(&f->t, &f->soc, &ane_test_ops, f,
+						    f->ipc, f->pool, 0, f->ipc.dva,
+						    ANE_FW_TABLE_SIZE), 0);
+	f->t.allow_free = true;
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
+	ane_fw_command_header(command, 0x4, true);
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_publish(&f->t, ANE_FW_IO, command,
+						       sizeof(command), TEST_DEADLINE), 0);
+	KUNIT_EXPECT_EQ(test, f->last_reg, 0x1844000U);
+	KUNIT_EXPECT_EQ(test, f->last_value, (u32)BIT(1));
+
+	ane_test_shared_request(f, 0, SZ_64K, ANE_FW_SHARED_LOG);
+	p = ane_test_slot(f, ANE_FW_SHAREDMALLOC);
+	KUNIT_EXPECT_PTR_EQ(test, p, (u8 *)f->ipc.cpu + 0xae00);
+	put_unaligned_le64(0x31da9850, p + 24);
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_poll(&f->t, ANE_FW_IO), -EAGAIN);
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_shared(&f->t), 0);
+	/* Allocated, answered DVA|1, zero, ordinal 1; the fourth word stays. */
+	KUNIT_EXPECT_EQ(test, f->allocs, 1U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(p), TEST_SHARED_DVA | 1);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(p + 8), 0ULL);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(p + 16), 1ULL);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(p + 24), 0x31da9850ULL);
+	KUNIT_EXPECT_EQ(test, f->t.shared_bytes, (size_t)SZ_64K);
+	KUNIT_EXPECT_EQ(test, f->t.shared_tags[0], ANE_FW_SHARED_LOG);
+	KUNIT_EXPECT_EQ(test, f->last_reg, 0x1844000U);
+	KUNIT_EXPECT_EQ(test, f->last_value, (u32)BIT(5));
+	KUNIT_EXPECT_EQ(test, f->irq, 0U);
+	KUNIT_EXPECT_PTR_EQ(test, ane_fw_transport_shared_tagged(&f->t, ANE_FW_SHARED_LOG),
+			    &f->t.shared[0]);
+
+	/* The startup command then completes. */
+	ane_test_reply(f, ANE_FW_IO);
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_poll(&f->t, ANE_FW_IO), 0);
+
+	/* A 2 MiB request under any other tag is refused, not served. */
+	ane_test_shared_request(f, 0, SZ_2M, ANE_FW_SHARED_LOG);
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_shared(&f->t), -E2BIG);
+	KUNIT_EXPECT_EQ(test, f->refusals, 1U);
+	KUNIT_EXPECT_EQ(test, f->allocs, 1U);
+}
+
 /* The body of a fresh zero-header request is not its publication boundary. */
 static void ane_transport_shared_notification_test(struct kunit *test)
 {
@@ -1573,6 +1651,7 @@ static struct kunit_case ane_transport_cases[] = {
 	KUNIT_CASE(ane_transport_report_word2_test),
 	KUNIT_CASE(ane_transport_presence_test),
 	KUNIT_CASE(ane_transport_shared_test),
+	KUNIT_CASE(ane_transport_h14_log_request_test),
 	KUNIT_CASE(ane_transport_shared_notification_test),
 	KUNIT_CASE(ane_transport_shared_batch_test),
 	KUNIT_CASE(ane_transport_shared_rejections_test),
