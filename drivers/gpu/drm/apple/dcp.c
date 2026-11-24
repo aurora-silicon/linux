@@ -9093,6 +9093,13 @@ static int dcp_s2r_suspend(struct apple_dcp *dcp)
 	bool was_off;
 	int ret;
 
+	/*
+	 * Not bound into the display subsystem (a component unbind released the RTKit
+	 * session): nothing of the firmware is this driver's to stop.
+	 */
+	if (IS_ERR_OR_NULL(dcp->rtk))
+		return 0;
+
 	/* Still stopped from a suspend that never reached the commit. */
 	if (READ_ONCE(dcp->s2r_fw_down)) {
 		dcp_s2r_stop_failed_start(dcp);
@@ -9498,6 +9505,8 @@ static int dcp_s2r_warm_restart(struct apple_dcp *dcp)
 {
 	int ret;
 
+	if (IS_ERR_OR_NULL(dcp->rtk))
+		return -ENODEV;
 	dcp_s2r_forget_crash(dcp);
 	ret = dcp_s2r_domains_on(dcp);
 	if (ret)
@@ -9663,6 +9672,9 @@ static int dcp_s2r_resume(struct apple_dcp *dcp)
 	bool real = pm_resume_via_firmware();
 
 	dcp->s2r_stopped = false;
+	/* No RTKit session since the suspend stopped it: nothing to start. */
+	if (IS_ERR_OR_NULL(dcp->rtk))
+		return 0;
 	/* A real sleep took the domains' power. */
 	if (real)
 		dcp->s2r_domains_up = false;
@@ -9896,7 +9908,8 @@ static void dcp_s2r_prewarm_work(struct work_struct *work)
 	guard(mutex)(&dcp->s2r_prewarm_lock);
 	light = dcp->s2r_wake_light;
 	dcp->s2r_wake_light = false;
-	if (!dcp->dpms_powered_off || !READ_ONCE(dcp->s2r_fw_down) || READ_ONCE(dcp->crashed))
+	if (!dcp->dpms_powered_off || !READ_ONCE(dcp->s2r_fw_down) || READ_ONCE(dcp->crashed) ||
+	    IS_ERR_OR_NULL(dcp->rtk))
 		return;
 	dcp_s2r_find_darts(dcp);
 	ret = dcp_s2r_warm_restart(dcp);
