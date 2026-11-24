@@ -8961,6 +8961,15 @@ static int dcp_s2r_domains_off(struct apple_dcp *dcp)
 	if (ret)
 		goto out;
 
+	/*
+	 * The display DART goes off with these domains, and every framebuffer is mapped
+	 * into it: an unmap while they are off, a client freeing a buffer after DPMS off,
+	 * would reach its registers and reset the SoC. The firmware's D572 does not say
+	 * so on every firmware (27.2 reports 1 at the stop). Dark until the domains are
+	 * back, as for an external DCP.
+	 */
+	if (dcp->s2r_disp_dart)
+		apple_dart_power_dark(dcp->s2r_disp_dart, true);
 	if (pmc)
 		dcp_pmc_set(dcp, pmc, false);
 	val = readl(ps + l->disp_cpu);
@@ -9270,6 +9279,9 @@ static int dcp_s2r_warm_restart(struct apple_dcp *dcp)
 	ret = dcp_s2r_domains_on(dcp);
 	if (ret)
 		return ret;
+	/* Powered again: the invalidations held while it was dark run now. */
+	if (dcp->s2r_disp_dart)
+		apple_dart_power_dark(dcp->s2r_disp_dart, false);
 
 	/* After the domains, whose writes it would reject, the DART protects them again. */
 	if (dcp->s2r_dcp_dart)
@@ -10282,4 +10294,5 @@ void dcp_unregister(void)
 #if IS_ENABLED(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST)
 #include "dcp_external_audio_test.c"
 #include "dcp_handoff_test.c"
+#include "dcp-firmware-test.c"
 #endif

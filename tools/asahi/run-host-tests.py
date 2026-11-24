@@ -163,7 +163,8 @@ ASAHI_TESTS = {
         + [(out() + ['--ref', '9260e1f021e075713931f3c23c0a5fa1da936b0b'], KILL)],
     'brcmf-suspend-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('country-gate', 'queue-reasons', 'worker-gate',
-                                   'resume-order', 'tx-drain', 'lpas-resume'), out()),
+                                   'resume-order', 'tx-drain', 'lpas-resume',
+                                   'wowl-s2idle-only'), out()),
     'brcmf-wowl-filter-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('base-order', 'mask-last', 'totsize', 'no-track'), out()),
     'brcmfmac-scan-timeout-tests.py': [(out('--output'), PASS)],

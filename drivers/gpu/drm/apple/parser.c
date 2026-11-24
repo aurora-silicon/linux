@@ -639,6 +639,7 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 	out->best.score = -1;
 	out->pq.score = -1;
 	out->sdr_usable = false;
+	out->sdr_unsafe = false;
 	out->has_bootstrap = false;
 
 	ret = iterator_begin(handle, &outer_it, false);
@@ -730,6 +731,9 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 		     (!timing_color_contains(&limits->unsafe, cmode.id) &&
 		      !timing_color_contains(&limits->dsc_required, cmode.id))))
 			out->sdr_usable = true;
+		else if (!external_sdr && cmode.eotf == DCP_EOTF_SDR_GAMMA &&
+			 !timing_color_contains(&limits->dsc_required, cmode.id))
+			out->sdr_unsafe = true;
 
 		if (external_sdr) {
 			unsigned int rank;
@@ -1186,9 +1190,9 @@ static bool dcp_180hz_ids_current(struct dcp_parse_ctx handle,
 /*
  * An external display defaults to its native resolution at the highest
  * refresh rate it can take, as other systems pick it, rather than to the
- * timing its EDID lists first.  Among the timings of that resolution with a
- * usable SDR element, the higher refresh rate ranks first, then IsPreferred,
- * then the firmware score.
+ * timing its EDID lists first.  Among the default candidates of that
+ * resolution, the higher refresh rate ranks first, then IsPreferred, then the
+ * firmware score.
  */
 VISIBLE_IF_KUNIT bool dcp_mode_default_above(const struct dcp_display_mode *mode,
 					     s64 score,
@@ -1207,20 +1211,53 @@ VISIBLE_IF_KUNIT bool dcp_mode_default_above(const struct dcp_display_mode *mode
 }
 
 /*
+ * A timing the default may be.  Firmware lists a color element as unsafe
+ * when the timing needs a faster link than it can vouch for: behind a USB-C
+ * to HDMI cable (a Parade PS176) a Dell S2725QS gets every 3840x2160 60 Hz
+ * element listed, the timings above the 340 MHz of its EDID's HDMI 1.4 block
+ * being unsafe though its HDMI 2.x block takes 600 MHz.  The firmware still
+ * marks that timing IsPreferred and scores it highest, and macOS drives it
+ * at 60 Hz (DPTimingModeId 50, an HBR2 x4 link) from the same list.  So a
+ * timing the firmware prefers stays a candidate when its SDR elements are
+ * unsafe; one only DSC can carry does not, and neither does an unsafe timing
+ * the firmware does not prefer.  dcp_external_default() still passes it over
+ * when the firmware also prefers a usable timing of the same resolution.
+ */
+VISIBLE_IF_KUNIT bool dcp_mode_default_candidate(const struct dcp_display_mode *m)
+{
+	if (m->automatic_rgb8_quirk)
+		return false;
+	return m->sdr_usable || (m->sdr_unsafe && m->firmware_preferred);
+}
+
+static bool dcp_mode_same_size(const struct dcp_display_mode *a,
+			       const struct dcp_display_mode *b)
+{
+	return a->mode.hdisplay == b->mode.hdisplay &&
+	       a->mode.vdisplay == b->mode.vdisplay;
+}
+
+/*
  * The native resolution: the largest the firmware marks IsPreferred, or the
  * largest of all when it marks none.
+ *
+ * Nothing falls back to another timing when the default fails to light up,
+ * so a timing with only unsafe SDR elements is the default only when the
+ * firmware prefers no usable timing of the native resolution.  With one, the
+ * unsafe timings are left out and the usable ones rank among themselves.
  */
 static struct dcp_display_mode *dcp_external_default(struct dcp_display_mode *modes,
 						     unsigned int count)
 {
 	struct dcp_display_mode *native = NULL, *best = NULL;
+	bool usable_preferred = false;
 	unsigned int i;
 
 	for (i = 0; i < count; i++) {
 		const struct dcp_display_mode *m = &modes[i];
 		u64 area = (u64)m->mode.hdisplay * m->mode.vdisplay;
 
-		if (m->automatic_rgb8_quirk || !m->sdr_usable)
+		if (!dcp_mode_default_candidate(m))
 			continue;
 		if (!native ||
 		    (m->firmware_preferred && !native->firmware_preferred) ||
@@ -1231,11 +1268,17 @@ static struct dcp_display_mode *dcp_external_default(struct dcp_display_mode *mo
 	if (!native)
 		return NULL;
 	for (i = 0; i < count; i++) {
+		const struct dcp_display_mode *m = &modes[i];
+
+		if (dcp_mode_default_candidate(m) && dcp_mode_same_size(m, native) &&
+		    m->sdr_usable && m->firmware_preferred)
+			usable_preferred = true;
+	}
+	for (i = 0; i < count; i++) {
 		struct dcp_display_mode *m = &modes[i];
 
-		if (m->automatic_rgb8_quirk || !m->sdr_usable ||
-		    m->mode.hdisplay != native->mode.hdisplay ||
-		    m->mode.vdisplay != native->mode.vdisplay)
+		if (!dcp_mode_default_candidate(m) || !dcp_mode_same_size(m, native) ||
+		    (usable_preferred && !m->sdr_usable))
 			continue;
 		if (!best || dcp_mode_default_above(m, m->score, best, best->score))
 			best = m;

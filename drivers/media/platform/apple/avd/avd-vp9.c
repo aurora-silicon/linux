@@ -493,19 +493,53 @@ static void set_header(struct avd_ctx *ctx, struct avd_vp9_run *run)
 		set_refs(ctx, run);
 }
 
-static void set_tiles(struct avd_ctx *ctx, struct avd_vp9_run *run)
+/*
+ * Find the next tile in the frame (VP9 6.4 decode_tiles()): at @offset each
+ * tile but the last starts with its size as a 32-bit big-endian word, the
+ * last one takes the rest of the payload. Returns the tile's data offset in
+ * @offset and its size in @size, both within @payload. A tile holds at least
+ * one byte (9.2.1: sz is at least 1).
+ */
+VISIBLE_IF_KUNIT int avd_vp9_next_tile(const u8 *data, u32 payload, bool last,
+				       u32 *offset, u32 *size)
+{
+	u32 off = *offset, tile_size;
+
+	if (!data || off > payload)
+		return -EINVAL;
+
+	if (last) {
+		tile_size = payload - off;
+	} else {
+		if (payload - off < 4)
+			return -EINVAL;
+		tile_size = get_unaligned_be32(&data[off]);
+		off += 4;
+		if (tile_size > payload - off)
+			return -EINVAL;
+	}
+	if (!tile_size)
+		return -EINVAL;
+
+	*offset = off;
+	*size = tile_size;
+	return 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(avd_vp9_next_tile);
+
+static int set_tiles(struct avd_ctx *ctx, struct avd_vp9_run *run)
 {
 	const struct v4l2_ctrl_vp9_frame *frame = run->decode_params;
 	struct avd_vp9_ctx *vp9_ctx = ctx->priv;
 	struct vb2_v4l2_buffer *src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
 	const u8 *data = vb2_plane_vaddr(&src->vb2_buf, 0);
-
+	u32 payload = vb2_get_plane_payload(&src->vb2_buf, 0);
 	u32 offset =
 		frame->uncompressed_header_size + frame->compressed_header_size;
-	u32 size = vb2_get_plane_payload(&src->vb2_buf, 0) - offset;
 	u32 num_tile_rows = 1 << frame->tile_rows_log2;
 	u32 num_tile_cols = 1 << frame->tile_cols_log2;
 	u32 tile_size;
+	int ret;
 
 	/* 6.2.6 Compute image size syntax */
 	u32 sb_64_cols = (((frame->frame_width_minus_1 + 8) >> 3) + 7) >> 3;
@@ -513,18 +547,15 @@ static void set_tiles(struct avd_ctx *ctx, struct avd_vp9_run *run)
 
 	for (int row = 0; row < num_tile_rows; row++)
 		for (int col = 0; col < num_tile_cols; col++) {
+			/* Every tile lies within the payload. */
+			ret = avd_vp9_next_tile(data, payload,
+						row == num_tile_rows - 1 &&
+						col == num_tile_cols - 1,
+						&offset, &tile_size);
+			if (ret)
+				return ret;
+
 			ctx->job.num++;
-			if (row == num_tile_rows - 1 &&
-			    col == num_tile_cols - 1) {
-				tile_size = size;
-			} else {
-				tile_size = get_unaligned_be32(&data[offset]);
-				/* i have crashed my computer because of this */
-				if (tile_size > size - 4)
-					return;
-				offset += 4;
-				size -= 4;
-			}
 			push(AVD_OP_CODED_DATA |
 				     AVD_OP_CODED_DATA_ADDR(
 					     run->base.coded_in >> 32),
@@ -547,9 +578,10 @@ static void set_tiles(struct avd_ctx *ctx, struct avd_vp9_run *run)
 			     "til_ac0_tile_dims");
 
 			offset += tile_size;
-			size -= tile_size;
 			vp9_ctx->b->submit_num++;
 		}
+
+	return 0;
 }
 
 static void update_dec_buf_info(struct avd_decoded_buffer *buf,
@@ -666,6 +698,28 @@ static void init_probs(struct avd_ctx *ctx, const struct avd_vp9_run *run)
 	       sizeof(avd_probs->seg.tree_probs));
 }
 
+static enum avd_image_fmt
+avd_vp9_frame_image_fmt(const struct v4l2_ctrl_vp9_frame *frame)
+{
+	/* avd_vp9_try_ctrl() admits only 4:2:0 (profiles 0 and 2). */
+	return frame->bit_depth == 8 ? AVD_IMG_FMT_420_8BIT :
+				       AVD_IMG_FMT_420_10BIT;
+}
+
+/*
+ * The row and column scratch is sized at STREAMON from the OUTPUT (coded)
+ * format, which cannot change while it streams. The CAPTURE format can be
+ * larger and can change meanwhile, so the frame must fit the coded size.
+ */
+VISIBLE_IF_KUNIT bool
+avd_vp9_frame_fits(const struct v4l2_ctrl_vp9_frame *frame, u32 width,
+		   u32 height)
+{
+	return frame->frame_width_minus_1 + 1 <= width &&
+	       frame->frame_height_minus_1 + 1 <= height;
+}
+EXPORT_SYMBOL_IF_KUNIT(avd_vp9_frame_fits);
+
 static int validate_dec_params(struct avd_ctx *ctx,
 			       const struct v4l2_ctrl_vp9_frame *dec_params)
 {
@@ -682,6 +736,9 @@ static int validate_dec_params(struct avd_ctx *ctx,
 	if (!avd_backend_is_open(ctx->dev) &&
 	    (dec_params->frame_width_minus_1 + 1 < 64 ||
 	     dec_params->frame_height_minus_1 + 1 < 64))
+		return -EINVAL;
+
+	if (!avd_vp9_frame_fits(dec_params, fmt_width(ctx), fmt_height(ctx)))
 		return -EINVAL;
 
 	aligned_width = max_t(unsigned int,
@@ -872,6 +929,9 @@ static int avd_vp9_run_preamble(struct avd_ctx *ctx, struct avd_vp9_run *run)
 
 	/* The frame may have been set, unchecked, while another codec was selected. */
 	ret = avd_vp9_validate_frame(ctx, dec_params);
+	if (!ret)
+		ret = avd_check_run_image_fmt(ctx,
+					      avd_vp9_frame_image_fmt(dec_params));
 	if (ret)
 		return ret;
 
@@ -940,8 +1000,10 @@ static int avd_vp9_run(struct avd_ctx *ctx)
 
 	set_header(ctx, &run);
 	vp9_ctx->b->submit_num = 0;
-	set_tiles(ctx, &run);
+	ret = set_tiles(ctx, &run);
 	avd_run_postamble(ctx, &run.base);
+	if (ret)
+		goto out;
 
 	if (avd_backend_is_qfw(ctx->dev)) {
 		/* Forward updates need no hardware result; publish before next prepare. */
@@ -1202,6 +1264,7 @@ static void avd_vp9_stop(struct avd_ctx *ctx)
 	/* drain() excludes readiness callbacks before private storage is freed. */
 	avd_vp9_free(ctx, ctx->priv);
 	ctx->priv = NULL;
+	ctx->scratch_sized = false;
 }
 
 static int avd_vp9_start(struct avd_ctx *ctx)
@@ -1222,6 +1285,9 @@ static int avd_vp9_start(struct avd_ctx *ctx)
 		avd_init_v4l2_vp9_count_tbl(&vp9_ctx->bank[i]);
 	}
 	ctx->max_frames = vp9_ctx->nbanks;
+	/* avd_vp9_alloc_bufs() sized the scratch for this depth */
+	ctx->scratch_fmt = ctx->image_fmt;
+	ctx->scratch_sized = true;
 	/* job_ready can run while STREAMON is still initializing this codec. */
 	smp_store_release(&ctx->priv, vp9_ctx);
 
@@ -1235,25 +1301,31 @@ err_free_ctx:
 static enum avd_image_fmt avd_vp9_get_image_fmt(struct avd_ctx *ctx,
 						struct v4l2_ctrl *ctrl)
 {
-#define BIT_DEPTH(chroma)                                      \
-	(frame->bit_depth == 8 ? AVD_IMG_FMT_##chroma##_8BIT : \
-				 AVD_IMG_FMT_##chroma##_10BIT)
-	const struct v4l2_ctrl_vp9_frame *frame = ctrl->p_new.p_vp9_frame;
-
 	if (ctrl->id != V4L2_CID_STATELESS_VP9_FRAME)
 		return AVD_IMG_FMT_ANY;
 
-	/* avd_vp9_try_ctrl() admits only 4:2:0 (profiles 0 and 2). */
-	return BIT_DEPTH(420);
-#undef BIT_DEPTH
+	return avd_vp9_frame_image_fmt(ctrl->p_new.p_vp9_frame);
 }
 
 static int avd_vp9_try_ctrl(struct avd_ctx *ctx, struct v4l2_ctrl *ctrl)
 {
-	if (ctrl->id == V4L2_CID_STATELESS_VP9_FRAME)
-		return avd_vp9_validate_frame(ctx, ctrl->p_new.p_vp9_frame);
+	const struct v4l2_ctrl_vp9_frame *frame = ctrl->p_new.p_vp9_frame;
+	struct vb2_queue *vq;
 
-	return 0;
+	if (ctrl->id != V4L2_CID_STATELESS_VP9_FRAME)
+		return 0;
+
+	/*
+	 * The OUTPUT format is fixed while its queue streams and the scratch
+	 * is sized from it: a larger frame cannot be decoded, as the run
+	 * finds too. Before that the format may still be set to the stream's.
+	 */
+	vq = v4l2_m2m_get_vq(ctx->fh.m2m_ctx, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE);
+	if (vb2_is_streaming(vq) &&
+	    !avd_vp9_frame_fits(frame, fmt_width(ctx), fmt_height(ctx)))
+		return -EINVAL;
+
+	return avd_vp9_validate_frame(ctx, frame);
 }
 
 static unsigned int avd_vp9_pp_kicks(struct avd_ctx *ctx)

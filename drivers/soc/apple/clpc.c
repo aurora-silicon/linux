@@ -483,6 +483,7 @@ EXPORT_SYMBOL_GPL(apple_clpc_ane_put);
 
 /* SoCs whose CLPC takes ANE input; each SoC has exactly one CLPC. */
 static const struct of_device_id apple_clpc_ane_providers[] = {
+	{ .compatible = "apple,t6050-clpc" },
 	{ .compatible = "apple,t6041-max-clpc" },
 	{ .compatible = "apple,t6041-clpc" },
 	{ .compatible = "apple,t8140-clpc" },
@@ -1991,6 +1992,17 @@ static const struct apple_clpc_hw apple_clpc_hw_t8142 = {
 	 * mm-512x2048).
 	 */
 	.ane = { [APPLE_CLPC_DCS] = 7, [APPLE_CLPC_SOC] = 3 },
+	/*
+	 * With the engine AXI2AF bridge tunables applied, pure ANE execution
+	 * time on J813 also tracks the P-cluster frequency (cpu-map cluster1),
+	 * independent of which cluster hosts the submitting thread (pinned to
+	 * an E-core with DCS 7 / SOC 3, unet-320 firmware report_done drops
+	 * from 660.5 us with no P-cluster floor to 350.7 us at 4176 MHz,
+	 * 4.49 W, with no further gain at 4464 MHz, 5.31 W).
+	 */
+	.ane_cluster = 1,
+	.ane_cluster_khz = 4176000,
+	.ane_cluster_machine = "apple,t8142",
 };
 
 #if IS_BUILTIN(CONFIG_KUNIT) && !defined(MODULE)
@@ -2189,6 +2201,8 @@ static void apple_clpc_t6041_policy_test(struct kunit *test)
 	apple_clpc_gpu_put(gpu);
 }
 
+static const struct apple_clpc_hw apple_clpc_hw_t6050;
+
 static void apple_clpc_ane_demand_hold_test(struct kunit *test)
 {
 	struct apple_clpc_ane ane = {};
@@ -2243,6 +2257,20 @@ static void apple_clpc_ane_demand_hold_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, demand[APPLE_CLPC_DCS], 7u);
 	KUNIT_EXPECT_EQ(test, demand[APPLE_CLPC_SOC], 3u);
 	apple_clpc_ane_set_active(&ane, false);
+	/* T6050 holds DCS 6 and fabric 2 while ANE work is in flight. */
+	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t6050.ane[APPLE_CLPC_DCS], 6);
+	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t6050.ane[APPLE_CLPC_SOC], 2);
+	clpc->hw = &apple_clpc_hw_t6050;
+	clpc->ane_states[APPLE_CLPC_DCS] = clpc->hw->ane[APPLE_CLPC_DCS];
+	clpc->ane_states[APPLE_CLPC_SOC] = clpc->hw->ane[APPLE_CLPC_SOC];
+	memset(demand, 0, sizeof(demand));
+	apple_clpc_ane_set_active(&ane, true);
+	KUNIT_EXPECT_TRUE(test, apple_clpc_ane_input_demand(clpc, demand));
+	KUNIT_EXPECT_EQ(test, demand[APPLE_CLPC_DCS], 6u);
+	KUNIT_EXPECT_EQ(test, demand[APPLE_CLPC_SOC], 2u);
+	apple_clpc_ane_set_active(&ane, false);
+	memset(demand, 0, sizeof(demand));
+	KUNIT_EXPECT_FALSE(test, apple_clpc_ane_input_demand(clpc, demand));
 }
 
 static void apple_clpc_ane_cluster_test(struct kunit *test)
@@ -2262,6 +2290,8 @@ static void apple_clpc_ane_cluster_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, time_before(now + msecs_to_jiffies(APPLE_CLPC_HOLD_MS),
 					     clpc->ane_until));
 	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t6040.ane_cluster, 2u);
+	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t8142.ane_cluster, 1u);
+	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t8142.ane_cluster_khz, 4176000u);
 	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t8140.ane_cluster_khz, 0u);
 }
 
@@ -2405,6 +2435,14 @@ static const struct apple_clpc_hw apple_clpc_hw_t6050 = {
 		[APPLE_CLPC_SOC] = { 1, 2, 2, 2 },
 	},
 	.gpu = { [APPLE_CLPC_DCS] = 6, [APPLE_CLPC_SOC] = 2 },
+	/*
+	 * ANE demand, measured on J775c (M5 Max, H17): DCS 6 and fabric 2, the
+	 * top states this table already uses. unet-320 (8 tasks, 200 runs)
+	 * host p50 is 5504 us with no ANE floor and 2551 us at (6, 2); (6, 3)
+	 * measured 2536 us, the same within run-to-run spread, so fabric stays
+	 * at 2.
+	 */
+	.ane = { [APPLE_CLPC_DCS] = 6, [APPLE_CLPC_SOC] = 2 },
 	.sustain = 3,
 	.gpu_input = true,
 	.idle_on_time = true,

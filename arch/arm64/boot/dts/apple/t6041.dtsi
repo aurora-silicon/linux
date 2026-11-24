@@ -714,6 +714,71 @@
 };
 
 /*
+ * First ProRes engine (ADT /arm-io/apr0) and its DART, from the J616c ADT.
+ * apr0 sits in the SCODEC block (PMGR bank 0 / pmgr_aux: FAB1_SOC 0x2d0,
+ * SCODEC 0x328, SCODEC_STREAMING 0x330) with core, wrapper and aux windows.
+ */
+&pmgr_aux {
+	ps_fab1_soc: power-controller@2d0 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2d0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "fab1_soc";
+		power-domains = <&ps_afi>;
+		apple,always-on;
+		status = "disabled";
+	};
+
+	ps_scodec: power-controller@328 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x328 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "scodec";
+		power-domains = <&ps_fab1_soc>;
+		status = "disabled";
+	};
+
+	ps_scodec_streaming: power-controller@330 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x330 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "scodec_streaming";
+		power-domains = <&ps_scodec>;
+		status = "disabled";
+	};
+};
+
+/ {
+	apr0: video-codec@301000000 {
+		compatible = "apple,t6041-prores", "apple,prores";
+		reg = <0x3 0x01000000 0x0 0x4000>,
+		      <0x3 0x00000000 0x0 0x1000000>,
+		      <0x3 0x010c0000 0x0 0x4000>;
+		reg-names = "core", "wrapper", "aux";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1960 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_scodec_streaming>;
+		iommus = <&apr0_dart 1>;
+		resets = <&ps_scodec>;
+		status = "disabled";
+	};
+
+	apr0_dart: iommu@301020000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x3 0x01020000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x0 0x300 0x0>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1959 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_scodec>;
+		status = "disabled";
+	};
+};
+
+/*
  * The first video encoder (ADT ave0, soc-id t6040), its DARTs and its power
  * domains. It has no board wiring, so it is enabled on every M4 Max board.
  * iBoot preloads its firmware; the driver refuses a firmware layout it does

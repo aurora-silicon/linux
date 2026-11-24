@@ -190,10 +190,6 @@ static int avd_open(struct file *filp)
 
 	ctx->dev = avd;
 
-	ret = avd_buf_alloc(avd, &ctx->inst, fifo_size());
-	if (ret)
-		goto err_free_ctx;
-
 	INIT_LIST_HEAD(&ctx->queue_node);
 	ctx->next_dep = AVD_DEP_PREV_DONE;
 
@@ -221,7 +217,6 @@ err_cleanup_m2m_ctx:
 	v4l2_m2m_ctx_release(ctx->fh.m2m_ctx);
 
 err_free_ctx:
-	avd_buf_free(avd, &ctx->inst);
 	kfree(ctx);
 	return ret;
 }
@@ -845,6 +840,9 @@ static struct platform_driver avd_driver = {
 	},
 };
 module_platform_driver(avd_driver);
+#if IS_REACHABLE(CONFIG_VIDEO_APPLE_AVD_KUNIT_TEST)
+#include "avd-variant-test.c"
+#endif
 
 MODULE_LICENSE("GPL v2");
 MODULE_DESCRIPTION("Apple avd v4l2 sl m2m");
