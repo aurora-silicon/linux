@@ -424,6 +424,45 @@ enum PublicationError {
     Uncertain(Error),
 }
 
+/// Why a publication pass stopped at a ready job without publishing it (`Stats::hold_causes`).
+///
+/// A drain cause means the job waits for an empty engine; the others wait behind in-flight
+/// work for headroom or ordering.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum HoldCause {
+    /// The job's VM failed, or a flight is doomed or suspect in a recovery.
+    DrainFailed,
+    /// A cold `InitBM` render is in flight.
+    DrainInitbm,
+    /// Compute and render of different VMs, or an SCS compute conflict.
+    DrainCross,
+    /// No warm PB/UMA allocator slot of the VM can take the render behind active flights.
+    DrainPb,
+    /// The TA wave window is full.
+    TaWave,
+    /// Flight, render pass or compute unit headroom.
+    Slot,
+    /// The job's dependency check failed: it fails once it reaches publication.
+    /// (`Engine::pick()` skips jobs still waiting for a dependency.)
+    Dependency,
+    /// Any other admission refusal behind in-flight work.
+    Other,
+}
+
+impl HoldCause {
+    pub(crate) const COUNT: usize = 8;
+    pub(crate) const NAMES: [&'static str; Self::COUNT] = [
+        "drain_failed",
+        "drain_initbm",
+        "drain_cross",
+        "drain_pb",
+        "ta_wave",
+        "slot",
+        "dependency",
+        "other",
+    ];
+}
+
 /// Engine statistics, printed by `aurora-g16/stats`.
 #[derive(Default, Zeroable)]
 pub(crate) struct Stats {
@@ -474,6 +513,8 @@ pub(crate) struct Stats {
     /// Why ready jobs stayed unpublished: both flights published, a channel record unconsumed,
     /// no free slot.
     pub(crate) hold: [u64; 3],
+    /// `hold[0]` split by [`HoldCause`].
+    pub(crate) hold_causes: [u64; HoldCause::COUNT],
     /// Compute commands published behind in-flight ones.
     pub(crate) behind: u64,
     /// Most flights in flight at once.
@@ -1032,7 +1073,7 @@ impl Firmware {
                 && !self.can_queue_behind_with_ta(&job, &mut ta_pending)
             {
                 if self.needs_engine_drain(&job) {
-                    self.engine.stats.hold[0] += 1;
+                    self.note_hold(&job, true, 0);
                     break;
                 }
                 let ta_val = *ta_pending.get_or_insert_with(|| self.ta_pending_passes());
@@ -1119,7 +1160,7 @@ impl Firmware {
                                     .check_command_dependencies(cand.progress.sent())
                                     .is_ok()
                         });
-                        self.engine.stats.hold[0] += 1;
+                        self.note_hold(&job, false, ta_val);
                         break;
                     }
                 }
@@ -1357,20 +1398,68 @@ impl Firmware {
                     || (((is_compute && f.renders != 0) || (is_render && f.computes != 0))
                         && !Arc::ptr_eq(&f.job.vm, &job.vm))
             })
-            || (is_render
-                && !job
-                    .resources
-                    .pb_slot_mask()
-                    .and_then(|(mask, home)| Ok((mask, home, job.resources.pb_heap_blocks()?)))
-                    .is_ok_and(|(mask, home, blocks)| {
-                        self.pools.can_pipeline_in_mask_blocks_mode(
-                            &job.vm,
-                            mask,
-                            home,
-                            blocks,
-                            job.resources.render_scs(),
-                        )
-                    }))
+            || (is_render && !self.render_can_pipeline(job))
+    }
+
+    /// Whether `job`'s render can reuse a warm PB/UMA allocator slot of its VM behind active
+    /// flights, without the drain that a fresh `InitBM` epoch needs.
+    fn render_can_pipeline(&self, job: &Arc<Job>) -> bool {
+        job.resources
+            .pb_slot_mask()
+            .and_then(|(mask, home)| Ok((mask, home, job.resources.pb_heap_blocks()?)))
+            .is_ok_and(|(mask, home, blocks)| {
+                self.pools.can_pipeline_in_mask_blocks_mode(
+                    &job.vm,
+                    mask,
+                    home,
+                    blocks,
+                    job.resources.render_scs(),
+                )
+            })
+    }
+
+    /// Why a publication pass stopped at `job`: `drain` when [`Self::needs_engine_drain`]
+    /// held it, otherwise the first refusal of [`Self::can_queue_behind_with_ta`] that
+    /// applies, with `ta_pending` from that check. Of the drain causes, a failure, an `InitBM`
+    /// flight and the PB check are tested directly; what remains of `needs_engine_drain()` is a
+    /// cross-VM or SCS overlap.
+    fn hold_cause(&self, job: &Arc<Job>, drain: bool, ta_pending: usize) -> HoldCause {
+        let render = command(job, job.progress.sent());
+        if drain {
+            if job.vm.status.get() != 0
+                || self
+                    .engine
+                    .flights
+                    .iter()
+                    .any(|f| f.doomed || f.recovery_suspect)
+            {
+                HoldCause::DrainFailed
+            } else if self.engine.flights.iter().any(|f| f.initbm) {
+                HoldCause::DrainInitbm
+            } else if matches!(render, Some(Command::Render(_))) && !self.render_can_pipeline(job) {
+                HoldCause::DrainPb
+            } else {
+                HoldCause::DrainCross
+            }
+        } else if job.check_command_dependencies(job.progress.sent()).is_err() {
+            HoldCause::Dependency
+        } else if matches!(render, Some(Command::Render(r))
+            if ta_pending >= self.ta_wave_cap_for(r.is_heavy_ta()))
+        {
+            HoldCause::TaWave
+        } else if self.blocked_on_slot_headroom(job) {
+            HoldCause::Slot
+        } else {
+            HoldCause::Other
+        }
+    }
+
+    /// Counts a publication pass that stopped at the ready `job` behind in-flight work.
+    fn note_hold(&mut self, job: &Arc<Job>, drain: bool, ta_pending: usize) {
+        let cause = self.hold_cause(job, drain, ta_pending);
+        let s = &mut self.engine.stats;
+        s.hold[0] += 1;
+        s.hold_causes[cause as usize] += 1;
     }
 
     /// Whether `job` is ready to run without an engine drain but currently blocked solely on
@@ -1599,19 +1688,7 @@ impl Firmware {
                     && !self.slots.render_exhausted()
                     && !self.pools.exhausted()
                     && super::recovery::logic::next_ordinal(e.draw).is_some()
-                    && job
-                        .resources
-                        .pb_slot_mask()
-                        .and_then(|(mask, home)| Ok((mask, home, job.resources.pb_heap_blocks()?)))
-                        .is_ok_and(|(mask, home, blocks)| {
-                            self.pools.can_pipeline_in_mask_blocks_mode(
-                                &job.vm,
-                                mask,
-                                home,
-                                blocks,
-                                job.resources.render_scs(),
-                            )
-                        })
+                    && self.render_can_pipeline(job)
                     && job
                         .resources
                         .render_passes()

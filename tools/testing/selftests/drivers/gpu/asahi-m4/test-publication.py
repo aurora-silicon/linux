@@ -133,7 +133,10 @@ impl Job {
 fn command(job:&Job,k:u32)->Option<&Command>{job.commands.get(k as usize)}
 type Completions=Vec<(u32,Result)>;
 fn complete(done:&mut Completions,job:&Arc<Job>,result:Result){done.push((job.id,result));}
-#[derive(Default)]struct Stats{hold:[u64;3],grouped:u64}
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+__HOLD_CAUSE__
+__HOLD_CAUSE_IMPL__
+#[derive(Default)]struct Stats{hold:[u64;3],hold_causes:[u64;HoldCause::COUNT],grouped:u64}
 struct Claims;
 struct Flight{job:Arc<Job>,claims:Claims,group:Vec<Arc<Job>>,computes:u32,renders:u32,compute_pipe:u8,rt_compute:bool,doomed:bool,recovery_suspect:bool,initbm:bool,heavy_render:bool}
 impl Flight{fn new(job:Arc<Job>)->Self{Self{job,claims:Claims,group:vec![],computes:0,renders:0,compute_pipe:0,rt_compute:false,doomed:false,recovery_suspect:false,initbm:false,heavy_render:false}}}
@@ -230,6 +233,9 @@ impl Firmware {
     fn mark_class_unavailable(&mut self,class:usize,error:Error){self.unavailable.push((class,error));}
     fn sync_quarantine_hints(&self){}
     __NEEDS_ENGINE_DRAIN__
+    __RENDER_CAN_PIPELINE__
+    __HOLD_CAUSE_FN__
+    __NOTE_HOLD__
     __TA_WAVE_CAP_FOR__
     __ACTIVE_TA_WAVE_CAP__
     fn blocked_on_slot_headroom(&self,job:&Arc<Job>)->bool{
@@ -498,6 +504,50 @@ fn firmware(jobs:Vec<Arc<Job>>,stages:Vec<(Result,bool)>)->Firmware{
         f.pools.block_pipeline_vm=None;
         assert_eq!(f.publish_checked(&mut done),Ok(()));
         assert_eq!(f.attempted,[2,3]);
+    }
+    #[test]fn hold_causes_split_hold0_by_the_gate_that_stopped_publication(){
+        let vm1=mk_vm(1);
+        let vm2=mk_vm(2);
+        // One held publication pass per case: (in-flight job and kind, its flags, held job,
+        // host knobs) -> exactly one hold[0] of the expected cause.
+        let run=|flight:Arc<Job>,renders:u32,initbm:bool,doomed:bool,held:Arc<Job>,
+                 allow_behind:bool,block_pipeline:Option<u32>,block_render:bool,expect:HoldCause|{
+            let mut f=firmware(vec![held],vec![]);
+            let mut fl=Flight::new(flight);
+            if renders==0{fl.computes=1;}else{fl.renders=renders;}
+            fl.initbm=initbm;
+            fl.doomed=doomed;
+            f.engine.flights.push(fl);
+            f.allow_behind=allow_behind;
+            f.pools.block_pipeline_vm=block_pipeline;
+            f.block_render_behind=block_render;
+            let mut done=vec![];
+            assert_eq!(f.publish_checked(&mut done),Ok(()));
+            assert!(f.attempted.is_empty(),"{:?}",expect);
+            assert_eq!(f.engine.stats.hold[0],1,"{:?}",expect);
+            let mut want=[0u64;HoldCause::COUNT];
+            want[expect as usize]=1;
+            assert_eq!(f.engine.stats.hold_causes,want,"{:?}",expect);
+        };
+        let r=|id:u32,vm:&Arc<Vm>,dep:Result|job_on_vm(id,vm.clone(),true,0,dep);
+        // A warm same-VM render whose allocator cannot pipeline waits for an empty engine.
+        run(r(1,&vm1,Ok(())),1,false,false,r(2,&vm1,Ok(())),true,Some(vm1.slot),false,HoldCause::DrainPb);
+        // A cold InitBM flight drains first.
+        run(r(1,&vm1,Ok(())),1,true,false,r(2,&vm1,Ok(())),true,None,false,HoldCause::DrainInitbm);
+        // Another VM's compute in flight: no cross-VM render/compute overlap.
+        run(job_on_vm(1,vm2.clone(),false,0,Ok(())),0,false,false,r(2,&vm1,Ok(())),true,None,false,HoldCause::DrainCross);
+        // A doomed flight drains first.
+        run(r(1,&vm1,Ok(())),1,false,true,r(2,&vm1,Ok(())),true,None,false,HoldCause::DrainFailed);
+        // A full light TA wave (8 renders) pauses the next light render.
+        run(r(1,&vm1,Ok(())),8,false,false,r(2,&vm1,Ok(())),true,None,false,HoldCause::TaWave);
+        // Pass, flight or unit headroom.
+        run(r(1,&vm1,Ok(())),1,false,false,r(2,&vm1,Ok(())),true,None,true,HoldCause::Slot);
+        // A failed dependency (pick() skips jobs still waiting for one).
+        run(r(1,&vm1,Ok(())),1,false,false,r(2,&vm1,Err(ECANCELED)),false,None,false,HoldCause::Dependency);
+        // Any other refusal.
+        run(r(1,&vm1,Ok(())),1,false,false,r(2,&vm1,Ok(())),false,None,false,HoldCause::Other);
+        assert_eq!(HoldCause::NAMES.len(),HoldCause::COUNT);
+        assert_eq!(HoldCause::Other as usize,HoldCause::COUNT-1);
     }
     #[test]fn alt_bypass_does_not_starve_cold_cross_vm_initbm_while_warm_overlaps(){
         let vm1=mk_vm(1);
@@ -849,6 +899,7 @@ mod queue_behind_scope {
     __SCS_COMPUTE_CONFLICT__
     impl QueueBehindHost {
         __NEEDS_ENGINE_DRAIN__
+        __RENDER_CAN_PIPELINE__
         __BLOCKED_ON_SLOT_HEADROOM__
         __TA_PENDING_PASSES__
         __TA_WAVE_CAP_FOR__
@@ -2848,6 +2899,11 @@ for token, declaration in {
     '__PUBLISH__': 'pub(crate) fn publish(&mut self',
     '__PUBLISH_CHECKED__': 'pub(crate) fn publish_checked(&mut self',
     '__NEEDS_ENGINE_DRAIN__': 'fn needs_engine_drain(',
+    '__RENDER_CAN_PIPELINE__': 'fn render_can_pipeline(',
+    '__HOLD_CAUSE__': 'enum HoldCause {',
+    '__HOLD_CAUSE_IMPL__': 'impl HoldCause {',
+    '__HOLD_CAUSE_FN__': 'fn hold_cause(',
+    '__NOTE_HOLD__': 'fn note_hold(',
     '__BLOCKED_ON_SLOT_HEADROOM__': 'fn blocked_on_slot_headroom(',
     '__DESCRIPTOR_CONTAINMENT__': 'if encode::preserve_compute_descriptor(',
     '__PUBLISH_PRODUCER__': 'fn publish_producer(',

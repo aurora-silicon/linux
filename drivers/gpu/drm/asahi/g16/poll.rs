@@ -2261,6 +2261,11 @@ impl Firmware {
                 s.hold[1],
                 s.hold[2]
             )?;
+            write!(f, "hold_causes:")?;
+            for (name, n) in super::engine::HoldCause::NAMES.iter().zip(s.hold_causes) {
+                write!(f, " {} {}", name, n)?;
+            }
+            writeln!(f)?;
         }
         let p = &self.engine.prof;
         writeln!(
