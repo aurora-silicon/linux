@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Hold the GPU's attached power domain across suspend-to-idle.
  *

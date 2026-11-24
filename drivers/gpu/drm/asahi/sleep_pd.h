@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 
 #ifndef _ASAHI_SLEEP_PD_H
 #define _ASAHI_SLEEP_PD_H
