@@ -5,6 +5,10 @@
 #   aurora-nightly  prerelease, daily from main when main moved since the last nightly
 #   v*              immutable stable release, built from a tag on main
 #
+# A running edge or nightly build always finishes and publishes; a newer one
+# waits, and only the newest waiting build is kept. Publishing never runs twice
+# at once for a channel and never moves a channel tag backwards.
+#
 # workflow_dispatch builds without publishing (publish: none) or publishes
 # one rolling channel by hand (publish: edge | nightly). Pull requests that
 # change the release machinery itself get a build without publishing.
@@ -15,6 +19,7 @@
 # The aurora-* channel tags are protected by a ruleset; the publish job moves
 # them over SSH with the release deploy key (secret RELEASE_DEPLOY_KEY), only
 # forward and with a lease. Stable releases attach to the v* tag an Owner pushed.
+# Every published asset gets a build provenance attestation.
 #
 # The configuration is the fleet configuration (aurora_defconfig + asahi.config)
 # built with the fleet toolchain versions pinned below. Modules are signed with
@@ -32,6 +37,8 @@ on:
     paths:
       - '.github/workflows/kernel-release.yml'
       - '.github/scripts/kernel-release-build.sh'
+      - '.github/scripts/kernel-smoke-qemu.sh'
+      - '.github/scripts/kernel-smoke-expected.txt'
       - 'arch/arm64/configs/aurora_defconfig'
   schedule:
     - cron: '30 15 * * *'
@@ -46,19 +53,15 @@ on:
 permissions:
   contents: read
 
+# Pull requests: a new push replaces the running check. Channel builds and
+# publishing are serialised per channel in the jobs below.
 concurrency:
-  group: >-
-    kernel-release-${{
-      github.event_name == 'schedule' && 'nightly' ||
-      github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) ||
-      startsWith(github.ref, 'refs/tags/v') && github.ref_name ||
-      github.event_name == 'workflow_dispatch' && inputs.publish != 'none' && inputs.publish ||
-      github.event_name == 'workflow_dispatch' && format('dispatch-{0}', github.ref_name) ||
-      'edge' }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+  group: kernel-release-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   LLVM_VERSION: '22.1.6'
+  LLVM_SHA256: 'b67817634e8e1c2632dfc056af14d61b94f8e6502f4e557560eea227aa22ce37'
   RUST_VERSION: '1.97.1'
   BINDGEN_VERSION: '0.73.2'
   PAHOLE_VERSION: 'v1.31'
@@ -134,6 +137,9 @@ jobs:
     if: needs.plan.outputs.build == 'true'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 345
+    concurrency:
+      group: kernel-release-build-${{ (needs.plan.outputs.channel == 'edge' || needs.plan.outputs.channel == 'nightly') && needs.plan.outputs.channel || github.run_id }}
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
         with:
@@ -184,6 +190,7 @@ jobs:
           mkdir -p ~/tc
           curl -fsSL -o /tmp/llvm.tar.xz \
             "https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/LLVM-$LLVM_VERSION-Linux-ARM64.tar.xz"
+          echo "$LLVM_SHA256  /tmp/llvm.tar.xz" | sha256sum -c -
           mkdir -p ~/tc/llvm
           tar -xJf /tmp/llvm.tar.xz -C ~/tc/llvm --strip-components=1
           rm /tmp/llvm.tar.xz
@@ -257,8 +264,13 @@ jobs:
     needs: [plan, build, smoke]
     if: needs.plan.outputs.channel != 'none' && needs.plan.outputs.build == 'true'
     runs-on: ubuntu-24.04-arm
+    concurrency:
+      group: kernel-release-publish-${{ needs.plan.outputs.channel }}
+      cancel-in-progress: false
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
@@ -272,12 +284,17 @@ jobs:
           name: kernel-${{ needs.plan.outputs.channel }}-${{ needs.plan.outputs.sha }}
           path: dist
 
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: 'dist/*'
+
       - name: Write release notes
         run: |
           set -euo pipefail
           krel=$(cat dist/kernel.release)
           cat > notes.md <<EOF
-          Kernel \`$krel\` built from \`$SHA\` on main.
+          Kernel \`$krel\` built from \`$SHA\` ($([ "$CHANNEL" = stable ] && echo "tag $TAG_NAME" || echo "head of main")).
 
           Channel: **$CHANNEL**. Configuration: the fleet configuration (\`arch/arm64/configs/aurora_defconfig\` + \`asahi.config\`), toolchain LLVM $LLVM_VERSION, Rust $RUST_VERSION, bindgen $BINDGEN_VERSION, pahole $PAHOLE_VERSION.
 
@@ -290,6 +307,7 @@ jobs:
           cat notes.md
 
       - name: Move the channel tag
+        id: tag
         if: needs.plan.outputs.channel == 'edge' || needs.plan.outputs.channel == 'nightly'
         env:
           DEPLOY_KEY: ${{ secrets.RELEASE_DEPLOY_KEY }}
@@ -303,10 +321,17 @@ jobs:
             status=$(gh api "repos/$GH_REPO/compare/$old...$SHA" -q .status)
             case "$status" in
             ahead|identical) ;;
+            behind)
+              echo "$tag is already at a newer commit ($old); not publishing $SHA"
+              echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0 ;;
             *) echo "::error::$tag is at $old, which $SHA does not contain ($status)"; exit 1 ;;
             esac
           fi
           [ "$old" = "$SHA" ] && { echo "$tag already at $SHA"; exit 0; }
+          if gh api "repos/$GH_REPO/git/ref/heads/$tag" >/dev/null 2>&1; then
+            echo "::error::a branch named $tag exists; rename it to archive/$tag so the tag name is unambiguous"
+            exit 1
+          fi
           # The aurora-* tags are protected by a ruleset that only the release
           # deploy key may bypass; GITHUB_TOKEN cannot move them.
           if [ -z "$DEPLOY_KEY" ]; then
@@ -314,9 +339,10 @@ jobs:
             exit 1
           fi
           install -m 0700 -d ~/.ssh
-          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/release_key
-          chmod 0600 ~/.ssh/release_key
-          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+          trap 'rm -f ~/.ssh/release_key' EXIT
+          (umask 077; printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/release_key)
+          # GitHub's published SSH host key.
+          echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' >> ~/.ssh/known_hosts
           git init -q tagger
           cd tagger
           git remote add origin "git@github.com:$GH_REPO.git"
@@ -324,10 +350,9 @@ jobs:
           git fetch -q --depth 1 origin "$SHA"
           # The lease makes the push fail if the tag moved since it was read.
           git push --force-with-lease="refs/tags/$tag:$old" origin "$SHA:refs/tags/$tag"
-          rm -f ~/.ssh/release_key
 
       - name: Publish rolling prerelease
-        if: needs.plan.outputs.channel == 'edge' || needs.plan.outputs.channel == 'nightly'
+        if: (needs.plan.outputs.channel == 'edge' || needs.plan.outputs.channel == 'nightly') && steps.tag.outputs.skip != 'true'
         run: |
           set -euo pipefail
           tag="aurora-$CHANNEL"
@@ -349,10 +374,15 @@ jobs:
         if: needs.plan.outputs.channel == 'stable'
         run: |
           set -euo pipefail
-          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
-            echo "::error::release $TAG_NAME already exists; stable releases are never rebuilt"
-            exit 1
-          fi
-          gh release create "$TAG_NAME" dist/* --verify-tag --latest \
+          # Built as a draft and published once every asset is uploaded, so a
+          # failed upload leaves only a draft, which the next attempt replaces.
+          draft=$(gh release view "$TAG_NAME" --json isDraft -q .isDraft 2>/dev/null || echo none)
+          case "$draft" in
+          none) ;;
+          true) gh release delete "$TAG_NAME" -y ;;
+          *) echo "::error::release $TAG_NAME is already published; stable releases are never rebuilt"; exit 1 ;;
+          esac
+          gh release create "$TAG_NAME" dist/* --verify-tag --draft \
             --title "Aurora kernel $TAG_NAME" --notes-file notes.md --generate-notes
+          gh release edit "$TAG_NAME" --draft=false --latest
           gh release view "$TAG_NAME" --json tagName,isPrerelease,assets -q '{tag: .tagName, prerelease: .isPrerelease, assets: [.assets[].name]}'

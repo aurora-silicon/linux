@@ -113,7 +113,10 @@ echo "::endgroup::"
 # The private signing key stays on the builder for this run only.
 rm -f "$O/certs/signing_key.pem"
 for f in "$D"/*.tar.* ; do
-	if tar -tf "$f" | grep -q 'signing_key\.pem$'; then
+	# List first: grep -q in a pipeline would end it early and, under
+	# pipefail, turn a match into a pass.
+	list=$(tar -tf "$f") || { echo "::error::cannot list $f"; exit 1; }
+	if grep -q 'signing_key\.pem$' <<<"$list"; then
 		echo "::error::$f contains the private signing key"
 		exit 1
 	fi
