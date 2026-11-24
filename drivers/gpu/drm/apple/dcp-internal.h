@@ -375,6 +375,11 @@ struct apple_dcp_hw_data {
 	 * them there (T8103: its power-down faults on an unmapped window otherwise).
 	 */
 	bool map_reg_dart;
+	/*
+	 * The display DART goes off and on with the coprocessor's own stop and start: no
+	 * D572 turns it off first, and the stop's power-down resets it (T8103).
+	 */
+	bool s2r_disp_dart_with_dcp;
 };
 
 enum dcp_test_point {

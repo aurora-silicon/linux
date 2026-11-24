@@ -8873,8 +8873,16 @@ err:
 /* Its power state can only be lowered once this has finished. */
 static int dcp_s2r_stop_streams(struct apple_dcp *dcp)
 {
+	int ret;
+
 	if (!dcp->s2r_dcp_dart)
 		return -ENODEV;
+	if (dcp->hw.s2r_disp_dart_with_dcp && dcp->s2r_disp_dart) {
+		ret = apple_dart_display_streams(dcp->s2r_disp_dart,
+						 dcp_s2r_layout(dcp)->disp_streams, false, true);
+		if (ret)
+			return ret;
+	}
 
 	return apple_dart_display_streams(dcp->s2r_dcp_dart, dcp_s2r_layout(dcp)->dcp_streams,
 					  false, true);
@@ -9526,6 +9534,13 @@ static int dcp_s2r_warm_restart(struct apple_dcp *dcp)
 	if (dcp->s2r_dcp_dart)
 		apple_dart_display_streams(dcp->s2r_dcp_dart, dcp_s2r_layout(dcp)->dcp_streams,
 					   true, false);
+	/* Set up again before the firmware runs, which uses it right away. */
+	if (dcp->hw.s2r_disp_dart_with_dcp && dcp->s2r_disp_dart) {
+		ret = apple_dart_display_streams(dcp->s2r_disp_dart,
+						 dcp_s2r_layout(dcp)->disp_streams, true, false);
+		if (ret)
+			return ret;
+	}
 
 	if (dcp->secure_rtk) {
 		dcp_secure_poll_stop(dcp);
