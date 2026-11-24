@@ -101,6 +101,7 @@
 
 #define AIC_TARGET_CPU		0x3000
 
+#define AIC_CPU_BLOCK(cpu)	(0x5000 + ((cpu) << 7))
 #define AIC_CPU_IPI_SET(cpu)	(0x5008 + ((cpu) << 7))
 #define AIC_CPU_IPI_CLR(cpu)	(0x500c + ((cpu) << 7))
 #define AIC_CPU_IPI_MASK_SET(cpu) (0x5024 + ((cpu) << 7))
@@ -421,6 +422,12 @@ struct aic_irq_chip {
 	int max_die;
 
 	u32 *sleep_masks;
+	/* AIC1: each line's target CPUs, which a firmware sleep's power cycle may take */
+	u32 *sleep_targets;
+	/* AIC1: the global registers the boot loader set (0x10..0x3c), lost the same way */
+	u32 sleep_globals[12];
+	/* AIC1: each CPU block's first word, the CPU number WHOAMI reports there */
+	u32 sleep_cpu_ids[32];
 
 	struct aic_info info;
 };
@@ -456,6 +463,7 @@ void aic_sleep_mask_all(void)
 	struct aic_irq_chip *ic = aic_irqc;
 	u32 words = ic->max_irq >> 5, off = 0, reg, i;
 	u32 *saved = ic->sleep_masks;
+	u32 *targets = ic->sleep_targets;
 	int die;
 
 	for (die = 0; die < ic->nr_die; die++, off += ic->info.die_stride) {
@@ -464,7 +472,13 @@ void aic_sleep_mask_all(void)
 			*saved++ = aic_ic_read(ic, reg);
 			aic_ic_write(ic, reg, U32_MAX);
 		}
+		for (i = 0; targets && i < ic->nr_irq; i++)
+			*targets++ = aic_ic_read(ic, ic->info.target_cpu + off + i * 4);
 	}
+	for (i = 0; ic->sleep_targets && i < ARRAY_SIZE(ic->sleep_globals); i++)
+		ic->sleep_globals[i] = aic_ic_read(ic, AIC_CONFIG + i * 4);
+	for (i = 0; ic->sleep_targets && i < min(num_possible_cpus(), 32U); i++)
+		ic->sleep_cpu_ids[i] = aic_ic_read(ic, AIC_CPU_BLOCK(i));
 }
 
 void aic_sleep_restore(void)
@@ -472,9 +486,29 @@ void aic_sleep_restore(void)
 	struct aic_irq_chip *ic = aic_irqc;
 	u32 words = ic->max_irq >> 5, off = 0, i;
 	u32 *saved = ic->sleep_masks;
+	u32 *targets = ic->sleep_targets;
 	int die;
 
+	/* Delivery as a whole first: with the configuration gone, no line reaches a CPU. */
+	for (i = 0; targets && i < ARRAY_SIZE(ic->sleep_globals); i++) {
+		if (aic_ic_read(ic, AIC_CONFIG + i * 4) != ic->sleep_globals[i])
+			aic_ic_write(ic, AIC_CONFIG + i * 4, ic->sleep_globals[i]);
+	}
+
+	/* The CPU numbers, before any CPU comes back up and reads its own */
+	for (i = 0; targets && i < min(num_possible_cpus(), 32U); i++) {
+		if (aic_ic_read(ic, AIC_CPU_BLOCK(i)) != ic->sleep_cpu_ids[i])
+			aic_ic_write(ic, AIC_CPU_BLOCK(i), ic->sleep_cpu_ids[i]);
+	}
+
 	for (die = 0; die < ic->nr_die; die++, off += ic->info.die_stride) {
+		/* Targets first: an unmasked line with none goes nowhere. */
+		for (i = 0; targets && i < ic->nr_irq; i++, targets++) {
+			u32 reg = ic->info.target_cpu + off + i * 4;
+
+			if (aic_ic_read(ic, reg) != *targets)
+				aic_ic_write(ic, reg, *targets);
+		}
 		for (i = 0; i < words; i++, saved++) {
 			aic_ic_write(ic, ic->info.mask_set + off + i * 4, *saved);
 			aic_ic_write(ic, ic->info.mask_clr + off + i * 4, ~*saved);
@@ -1429,6 +1463,12 @@ static int __init aic_of_ic_init(struct device_node *node, struct device_node *p
 				    sizeof(*irqc->sleep_masks), GFP_KERNEL);
 	if (WARN_ON(!irqc->sleep_masks))
 		goto err_unmap;
+	if (irqc->info.target_cpu) {
+		irqc->sleep_targets = kcalloc(irqc->nr_die * irqc->nr_irq,
+					      sizeof(*irqc->sleep_targets), GFP_KERNEL);
+		if (WARN_ON(!irqc->sleep_targets))
+			goto err_unmap;
+	}
 
 	irqc->hw_domain = irq_domain_create_tree(of_fwnode_handle(node),
 						 &aic_irq_domain_ops, irqc);
