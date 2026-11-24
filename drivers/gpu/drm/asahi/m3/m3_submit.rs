@@ -5,7 +5,7 @@ use crate::{file,m3::agx_uapi,mmu,queue};
 #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
 use crate::m3::m3_drm::Shared;
 use crate::alloc::Allocator as _;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 #[derive(Default)]
 pub(crate) struct Completion;
 #[vtable]
@@ -47,7 +47,7 @@ pub(crate) struct Packet {
     pub(crate) wide_visibility:KVec<bool>,
     pub(crate) render_attachments:KVec<[crate::m3::agx_attachments::Attachments;2]>,
     completion:UserFence<Completion>,
-    finish_claimed: AtomicBool,
+    finish_state: AtomicU8,
     /// Set before a batch with any of this packet's commands can change firmware-visible state,
     /// and never cleared.
     published: AtomicBool,
@@ -116,17 +116,62 @@ impl Packet {
     pub(crate) fn may_be_published(&self)->bool {self.published.load(Ordering::Relaxed)}
     pub(crate) fn retired(&self) {self.release_guard();self.finish(Ok(()));}
     pub(crate) fn finish(&self,result:Result) {
+        self.complete(result, true);
+    }
+    /// Fail the fence without making a packet rejection or cancellation a VM error.
+    /// Terminal device-loss errors still record on `VmStatus`.
+    /// A published prefix still owns its mappings until the runtime retires it.
+    pub(crate) fn fail_packet(&self,error:Error) {
+        self.complete(Err(error), false);
+    }
+    fn complete(&self,result:Result,fail_vm:bool) {
+        const PENDING: u8 = 0;
+        const PACKET_FAILED: u8 = 1;
+        const TERMINAL: u8 = 2;
         // Retirement, cancellation and a queued scheduler timeout can race.
-        // Claim error/signal ownership once; this flag is NOT proof that the
-        // fence is signaled or that hardware DMA has stopped.
-        if self.finish_claimed.swap(true, Ordering::Relaxed) { return; }
+        // Claim fence error/signal ownership once while still allowing a later
+        // terminal GPU fault (`fail_vm == true`) on a published prefix to record
+        // on `VmStatus` after an earlier `fail_packet()`.
+        let record_vm = |e: Error| {
+            if let Some(status) = self.vm.status() {
+                if fail_vm {
+                    status.record(e);
+                } else {
+                    status.record_if_device_loss(e);
+                }
+            }
+        };
+        match result {
+            Ok(()) => {
+                if self.finish_state.swap(TERMINAL, Ordering::AcqRel) != PENDING {
+                    return;
+                }
+            }
+            Err(e) if fail_vm => match self.finish_state.swap(TERMINAL, Ordering::AcqRel) {
+                PENDING => {}
+                PACKET_FAILED => {
+                    record_vm(e);
+                    return;
+                }
+                _ => return,
+            },
+            Err(_) => {
+                if self
+                    .finish_state
+                    .compare_exchange(PENDING, PACKET_FAILED, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
         if let Err(e)=result {
             // A guard still held here belongs to work the firmware may still run: block
             // mapping changes before the error fence is visible (as G15 does), so userspace
             // can't unmap memory under it. It stays with the packet until the runtime drops
             // the packet, after the firmware has provably stopped.
             if let Some(guard)=self.vm_job.lock().as_ref() {guard.quarantine();}
-            if let Some(status) = self.vm.status() { status.record(e); }
+            record_vm(e);
             self.completion.set_error(e);
         }
         // A scheduler job/fence and the runtime's last packet can outlive
@@ -168,7 +213,7 @@ impl sched::JobImpl for Job {
         if let Err(e)=submitted {
             pr_err!("M3 scheduler: submission failed {:?}\n",e);
             // submit() failed before this packet could be published.
-            job.packet.release_guard();job.packet.finish(Err(e));
+            job.packet.release_guard();job.packet.fail_packet(e);
         }
         Ok(Some(Fence::from_fence(&job.packet.completion)))
     }
@@ -195,7 +240,7 @@ impl sched::JobImpl for Job {
             #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
             Sink::G14V27_2(runtime)=>runtime.withdraw(&job.packet),
         }
-        job.packet.finish(Err(ECANCELED));
+        job.packet.fail_packet(ECANCELED);
     }
 }
 #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
@@ -347,7 +392,7 @@ impl queue::Queue for Queue {
             #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
             render_queue: self.render_queue.clone(),vm:self.vm.clone(),commands,timestamps,attachments:flushes,wide_visibility:visibility,render_attachments,
             completion:self.fences.new_fence(0,Completion)?.into(),
-            finish_claimed:AtomicBool::new(false),published:AtomicBool::new(false),urgency:self.urgency,owner:Owner::current(),
+            finish_state:AtomicU8::new(0),published:AtomicBool::new(false),urgency:self.urgency,owner:Owner::current(),
             vm_job:KBox::pin_init(new_mutex!(Some(vm_job)),GFP_KERNEL)?},GFP_KERNEL)?;
         let mut job=self.entity.new_job(1,Job{shared:self.shared.clone(),packet})?;
         for sync in syncs.drain(0..in_sync_count) {if let Some(f)=sync.fence {job.add_dependency(f)?;}}

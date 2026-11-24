@@ -88,6 +88,7 @@ ASAHI_TESTS = {
     'pmp-native26-tests.py': [([], PASS)],
 
 
+    'm3-packet-completion-tests.py': [(out(), PASS), (out() + ['--mutate'], KILL)],
     'm3-stamp-admission-tests.py': [(out(), PASS),
                                      (out() + ['--mutation', 'live-reseed'], KILL)],
     'hardware-defaults-tests.py': [([], PASS)],
