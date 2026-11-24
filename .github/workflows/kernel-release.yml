@@ -9,6 +9,9 @@
 # one rolling channel by hand (publish: edge | nightly). Pull requests that
 # change the release machinery itself get a build without publishing.
 #
+# Every build boots under QEMU and loads every module it ships (which also runs
+# the KUnit suites built as modules) before anything is published.
+#
 # The configuration is the fleet configuration (aurora_defconfig + asahi.config)
 # built with the fleet toolchain versions pinned below. Modules are signed with
 # a key generated for each run and thrown away afterwards; lab fleet kits are
@@ -207,8 +210,47 @@ jobs:
           retention-days: 7
           compression-level: 0
 
-  publish:
+  smoke:
     needs: [plan, build]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+          sparse-checkout: .github
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: kernel-${{ needs.plan.outputs.channel }}-${{ needs.plan.outputs.sha }}
+          path: dist
+
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-arm busybox-static zstd cpio
+
+      - name: Boot under QEMU and load every module
+        run: |
+          krel=$(cat dist/kernel.release)
+          gzip -dc "dist/Image-$krel.gz" > Image
+          .github/scripts/kernel-smoke-qemu.sh Image "dist/modules-$krel.tar.zst" /bin/busybox smoke
+
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-${{ needs.plan.outputs.channel }}-${{ needs.plan.outputs.sha }}
+          path: |
+            smoke/console.log
+            smoke/dmesg.txt
+            smoke/smoke-summary.json
+            smoke/smoke-results.tsv
+          retention-days: 14
+
+  publish:
+    needs: [plan, build, smoke]
     if: needs.plan.outputs.channel != 'none' && needs.plan.outputs.build == 'true'
     runs-on: ubuntu-24.04-arm
     permissions:
