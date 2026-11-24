@@ -140,6 +140,10 @@ fn cancellation_preserves_live_guard_and_signals_once() {
     assert!(packet.vm_job.lock().is_none());
     assert_eq!(packet.completion.signals.get(), 1);
     assert_eq!(packet.completion.error.get(), -125);
+    // Clean retirement closes the state to TERMINAL: a racing post-retirement fault must not poison VmStatus.
+    packet.finish(Err(EIO));
+    assert_eq!(vm.error.get(), 0);
+    assert_eq!(packet.completion.signals.get(), 1);
 }
 
 #[test]

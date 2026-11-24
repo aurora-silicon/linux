@@ -143,11 +143,7 @@ impl Packet {
         };
         match result {
             Ok(()) => {
-                if self
-                    .finish_state
-                    .compare_exchange(PENDING, TERMINAL, Ordering::AcqRel, Ordering::Acquire)
-                    .is_err()
-                {
+                if self.finish_state.swap(TERMINAL, Ordering::AcqRel) != PENDING {
                     return;
                 }
             }
