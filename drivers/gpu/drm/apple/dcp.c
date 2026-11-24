@@ -9159,7 +9159,7 @@ static void dcp_s2r_ps_lower(void __iomem *reg)
 	writel((val & ~GENMASK(3, 0)) | GENMASK(9, 8), reg);
 }
 
-/* Its display-power words, pmc-dcp only where the layout has one. */
+/* Its display-power words, pwrgate and pmc-dcp only where the layout has them. */
 static int dcp_s2r_map_power(struct apple_dcp *dcp, void __iomem **ps, void __iomem **pwrgate,
 			     void __iomem **pmc)
 {
@@ -9170,12 +9170,14 @@ static int dcp_s2r_map_power(struct apple_dcp *dcp, void __iomem **ps, void __io
 	if (!np)
 		return -ENODEV;
 	*ps = of_iomap(np, of_property_match_string(np, "reg-names", "ps"));
-	*pwrgate = of_iomap(np, of_property_match_string(np, "reg-names", "pwrgate"));
+	if (dcp_s2r_layout(dcp)->ret_ff)
+		*pwrgate = of_iomap(np, of_property_match_string(np, "reg-names", "pwrgate"));
 	if (dcp_s2r_layout(dcp)->pmc_dcp)
 		*pmc = of_iomap(np, of_property_match_string(np, "reg-names", "pmc-dcp"));
 	of_node_put(np);
 
-	return *ps && *pwrgate && (*pmc || !dcp_s2r_layout(dcp)->pmc_dcp) ? 0 : -ENODEV;
+	return *ps && (*pwrgate || !dcp_s2r_layout(dcp)->ret_ff) &&
+	       (*pmc || !dcp_s2r_layout(dcp)->pmc_dcp) ? 0 : -ENODEV;
 }
 
 /* macOS's power-off, measured 3 of 3 on T8140. The firmware is stopped and its DARTs are off. */
@@ -9211,14 +9213,17 @@ static int dcp_s2r_domains_off(struct apple_dcp *dcp)
 	}
 	dcp_s2r_ps_lower(ps + l->disp_cpu);
 	dcp_s2r_ps_lower(ps + l->disp_fe);
-	dcp_s2r_ps_lower(ps + l->disp_sys);
+	/* A layout without a system word has 0 there, a different domain's word. */
+	if (l->disp_sys)
+		dcp_s2r_ps_lower(ps + l->disp_sys);
 
 	ret = readl_poll_timeout(ps + l->disp_cpu, val, !FIELD_GET(GENMASK(7, 4), val), 100,
 				 50000);
 	if (ret)
 		dev_err(dcp->dev, "DISP_CPU did not power off: %#x\n", val);
 	dev_dbg(dcp->dev, "display domains off: CPU %#x FE %#x SYS %#x\n",
-		readl(ps + l->disp_cpu), readl(ps + l->disp_fe), readl(ps + l->disp_sys));
+		readl(ps + l->disp_cpu), readl(ps + l->disp_fe),
+		l->disp_sys ? readl(ps + l->disp_sys) : 0);
 out:
 	if (ps)
 		iounmap(ps);
@@ -9245,9 +9250,11 @@ static int dcp_s2r_domains_on(struct apple_dcp *dcp)
 	if (ret)
 		goto out;
 
-	val = readl(ps + l->disp_sys) & ~(GENMASK(9, 8) | GENMASK(3, 0) | BIT(28));
-	writel(val | 0xf, ps + l->disp_sys);
-	writel(val | 0xf | BIT(28), ps + l->disp_sys);
+	if (l->disp_sys) {
+		val = readl(ps + l->disp_sys) & ~(GENMASK(9, 8) | GENMASK(3, 0) | BIT(28));
+		writel(val | 0xf, ps + l->disp_sys);
+		writel(val | 0xf | BIT(28), ps + l->disp_sys);
+	}
 	val = readl(ps + l->disp_fe) & ~(GENMASK(9, 8) | GENMASK(3, 0));
 	writel(val | 0xf, ps + l->disp_fe);
 	val = readl(ps + l->disp_cpu) & ~(GENMASK(9, 8) | GENMASK(3, 0) | BIT(28));
