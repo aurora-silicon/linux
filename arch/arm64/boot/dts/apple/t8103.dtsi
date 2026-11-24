@@ -660,6 +660,7 @@
 
 		dcp: dcp@231c00000 {
 			compatible = "apple,t8103-dcp", "apple,dcp";
+			apple,display-power = <&dcp_power>;
 			mboxes = <&dcp_mbox>;
 			mbox-names = "mbox";
 			iommus = <&dcp_dart 0 0x0 0x0 0x0 0xfc000000>;
@@ -1111,6 +1112,17 @@
 			#address-cells = <1>;
 			#size-cells = <1>;
 			reg = <0x2 0x3b700000 0 0x14000>;
+		};
+
+		/*
+		 * The power words the DCP's driver lowers and raises around a stop of its
+		 * firmware: DISP0's CPU and front end, in the PMGR's power state block.
+		 * No driver binds this.
+		 */
+		dcp_power: display-power@23b700000 {
+			compatible = "apple,t8103-display-power";
+			reg = <0x2 0x3b700000 0x0 0x14000>;
+			reg-names = "ps";
 		};
 
 		pmgr_dcp: power-management@23b738000 {
