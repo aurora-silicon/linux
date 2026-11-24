@@ -147,11 +147,10 @@ struct lock {int held;};
 static unsigned takes;
 static struct lock *lock_take(struct lock *l) {assert(!l->held); l->held = 1; takes++; return l;}
 static void lock_drop(struct lock **l) {if (*l) (*l)->held = 0;}
+#define guard(type) struct lock *_g __attribute__((cleanup(lock_drop))) = lock_take
 #define scoped_guard(type, l) \
     for (struct lock *_guard __attribute__((cleanup(lock_drop))) = lock_take(l), *_once = _guard; \
          _once; _once = NULL)
-static void mutex_lock(struct lock *l) {lock_take(l);}
-static void mutex_unlock(struct lock *l) {l->held = 0;}
 struct apple_epic_service {bool torndown; unsigned pins;};
 struct apple_dcp_afkep {int endpoint;};
 struct audiosrv_data {
@@ -166,7 +165,9 @@ struct audiosrv_data {
 };
 struct apple_dcp {struct device *dev; struct apple_dcp_afkep *avep; struct audiosrv_data *audiosrv;};
 static bool native, v27;
-static int call_ret;
+static int call_ret, hook;
+static struct audiosrv_data *hook_asrv;
+static struct apple_epic_service *hook_next;
 static unsigned calls, last_cmd, connects, disconnects, releases, closes, v27_starts;
 static bool dcp_audiosrv_native_link(struct device *dev) {(void)dev; return native;}
 static bool dcp_is_v14_7_external(const struct apple_dcp *dcp) {(void)dcp; return false;}
@@ -185,10 +186,18 @@ static int afk_service_call(struct apple_epic_service *s, int group, u32 cmd, co
                             size_t pad, void *out, size_t room, size_t out_pad)
 {
     (void)group; (void)data; (void)len; (void)pad; (void)out; (void)room; (void)out_pad;
-    assert(s && s->pins); calls++; last_cmd = cmd; return call_ret;
+    assert(s && s->pins); calls++; last_cmd = cmd;
+    /* A successor published while the RPC runs (and, at a Close, opened) */
+    if (hook) {
+        hook_asrv->srv = hook_next;
+        hook_asrv->is_open = hook == 2;
+        hook = 0;
+    }
+    return call_ret;
 }
 '''
-    return prefix + block(source, 'void av_service_connect(') + '\n' + block(
+    return prefix + block(source, 'static bool av_audiosrv_published(') + '\n' + block(
+        source, 'void av_service_connect(') + '\n' + block(
         source, 'static void __av_service_disconnect(') + '\n' + block(
         source, 'void av_service_disconnect(') + r'''
 int main(void)
@@ -243,13 +252,31 @@ int main(void)
     call_ret = -EINVAL;
     av_service_connect(&dcp);
     assert(calls == 3 && !asrv.is_open && armed == 1 && !errs && asrv.open_refused == -EINVAL &&
-           asrv.open_check_dev == &dev && connects == 3);
+           connects == 3);
     call_ret = -ETIMEDOUT;
     av_service_connect(&dcp);
     assert(calls == 4 && !asrv.is_open && armed == 1 && errs == 1);
     call_ret = 0;
     av_service_connect(&dcp);
     assert(calls == 5 && asrv.is_open && connects == 4);
+
+    /* A Close whose instance is replaced meanwhile leaves the successor's Open. */
+    struct apple_epic_service next = {0};
+    hook_asrv = &asrv;
+    hook_next = &next;
+    hook = 2;
+    av_service_disconnect(&dcp);
+    assert(calls == 6 && last_cmd == 5 && asrv.srv == &next && asrv.is_open);
+
+    /* An Open whose instance is replaced meanwhile is not the successor's. */
+    asrv.srv = &srv;
+    asrv.is_open = false;
+    hook_next = &next;
+    hook = 1;
+    av_service_connect(&dcp);
+    assert(calls == 7 && last_cmd == 4 && asrv.srv == &next && !asrv.is_open && connects == 4);
+    assert(!next.pins);
+    asrv.srv = &srv;
     assert(!srv.pins && !asrv.srv_rwsem.held && !asrv.plug_lock.held);
     return 0;
 }

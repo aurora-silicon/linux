@@ -208,9 +208,8 @@ static void av_audiosrv_init(struct apple_epic_service *service, const char *nam
 		afk_service_put(old);
 
 	asrv->plugged = true;
-	/* The classic Open was the old instance's: the successor is opened afresh. */
-	if (old)
-		asrv->is_open = false;
+	/* A classic Open is its instance's: the one published now is opened afresh. */
+	asrv->is_open = false;
 	/* A new instance, maybe a new sink: its catalog is asked for afresh. */
 	WRITE_ONCE(asrv->elements_empty, false);
 	mutex_unlock(&asrv->plug_lock);
@@ -1082,10 +1081,19 @@ static const struct apple_epic_service_ops avep_ops[] = {
 	{}
 };
 
+/* Whether @service is the published instance; plug_lock held, then srv_rwsem */
+static bool av_audiosrv_published(struct audiosrv_data *asrv,
+				  struct apple_epic_service *service)
+{
+	guard(rwsem_read)(&asrv->srv_rwsem);
+	return asrv->srv == service;
+}
+
 void av_service_connect(struct apple_dcp *dcp)
 {
 	struct apple_epic_service *service;
 	struct audiosrv_data *asrv = dcp->audiosrv;
+	bool opened;
 	int ret;
 
 	/*
@@ -1104,7 +1112,9 @@ void av_service_connect(struct apple_dcp *dcp)
 
 	/* open AV audio service */
 	dev_info(dcp->dev, "%s: starting audio service, plugged:%d\n", __func__,  asrv->plugged);
-	if (asrv->is_open)
+	scoped_guard(mutex, &asrv->plug_lock)
+		opened = asrv->is_open;
+	if (opened)
 		goto out;
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
@@ -1147,7 +1157,6 @@ void av_service_connect(struct apple_dcp *dcp)
 		 * refusal then, so a lasting one is still reported.
 		 */
 		WRITE_ONCE(asrv->open_refused, ret);
-		asrv->open_check_dev = dcp->dev;
 		mod_delayed_work(system_wq, &asrv->open_check_wq,
 				 msecs_to_jiffies(AV_AUDIOSRV_REPLACE_MS));
 		goto out;
@@ -1156,12 +1165,18 @@ void av_service_connect(struct apple_dcp *dcp)
 		dev_err(dcp->dev, "error opening audio service: %d\n", ret);
 		goto out;
 	}
-	mutex_lock(&asrv->plug_lock);
-	asrv->is_open = true;
-
-	if (asrv->audio_dev)
-		dcpaud_connect(asrv->audio_dev, asrv->plugged);
-	mutex_unlock(&asrv->plug_lock);
+	/*
+	 * The Open ran without locks: it is this instance's only if the
+	 * instance is still the published one. A successor published meanwhile
+	 * is opened by its own connect.
+	 */
+	scoped_guard(mutex, &asrv->plug_lock) {
+		if (av_audiosrv_published(asrv, service)) {
+			asrv->is_open = true;
+			if (asrv->audio_dev)
+				dcpaud_connect(asrv->audio_dev, asrv->plugged);
+		}
+	}
 out:
 	afk_service_put(service);
 }
@@ -1193,6 +1208,7 @@ static void __av_service_disconnect(struct apple_dcp *dcp, const u64 *gen)
 {
 	struct apple_epic_service *service;
 	struct audiosrv_data *asrv = dcp->audiosrv;
+	bool opened;
 	int ret;
 
 	/* A CEC-only endpoint has no audio owner (av_service_connect()). */
@@ -1244,15 +1260,14 @@ static void __av_service_disconnect(struct apple_dcp *dcp, const u64 *gen)
 		goto out;
 	}
 #endif
-	if (!asrv->is_open)
+	/* Only the published instance's Open is closed, and only once. */
+	scoped_guard(mutex, &asrv->plug_lock) {
+		opened = asrv->is_open && av_audiosrv_published(asrv, service);
+		if (opened && asrv->audio_dev)
+			dcpaud_disconnect(asrv->audio_dev);
+	}
+	if (!opened)
 		goto out;
-
-	mutex_lock(&asrv->plug_lock);
-
-	if (asrv->audio_dev)
-		dcpaud_disconnect(asrv->audio_dev);
-
-	mutex_unlock(&asrv->plug_lock);
 
 	ret = afk_service_call(service, 0, asrv->cmds.close, NULL, 0, 16,
 			       NULL, 0, 16);
@@ -1261,7 +1276,11 @@ static void __av_service_disconnect(struct apple_dcp *dcp, const u64 *gen)
 	}
 	if (service->torndown)
 		afk_service_disable(service);
-	asrv->is_open = false;
+	/* A successor published meanwhile keeps its own state. */
+	scoped_guard(mutex, &asrv->plug_lock) {
+		if (av_audiosrv_published(asrv, service))
+			asrv->is_open = false;
+	}
 out:
 	afk_service_put(service);
 }
@@ -1553,6 +1572,7 @@ unsupported:
 
 	INIT_WORK(&audiosrv_data->start_av_service_wq, av_work_service_start);
 	INIT_DELAYED_WORK(&audiosrv_data->open_check_wq, av_work_open_check);
+	audiosrv_data->open_check_dev = dcp->dev;
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
 	INIT_WORK(&audiosrv_data->terminate_wq, av_work_service_terminate);
 	mutex_init(&audiosrv_data->open_lock);
