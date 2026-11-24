@@ -72,21 +72,27 @@ additionalProperties: false
 
 examples:
   - |
-    audio-controller {
-        compatible = "apple,t8112-dpaudio", "apple,dpaudio";
-        dmas = <&sio 0x66>;
-        dma-names = "tx";
-        power-domains = <&ps_dpa1>;
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
 
-        ports {
-            #address-cells = <1>;
-            #size-cells = <0>;
+        audio-controller@238334000 {
+            compatible = "apple,t8112-dpaudio", "apple,dpaudio";
+            reg = <0x2 0x38334000 0x0 0x4000>;
+            dmas = <&sio 0x66>;
+            dma-names = "tx";
+            power-domains = <&ps_dpa1>;
 
-            port@0 {
-                reg = <0>;
+            ports {
+                #address-cells = <1>;
+                #size-cells = <0>;
 
-                endpoint {
-                    remote-endpoint = <&dcpext_audio>;
+                port@0 {
+                    reg = <0>;
+
+                    endpoint {
+                        remote-endpoint = <&dcpext_audio>;
+                    };
                 };
             };
         };

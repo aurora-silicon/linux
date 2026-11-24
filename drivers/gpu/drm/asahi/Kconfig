@@ -50,6 +50,7 @@ config DRM_ASAHI_G16
 config DRM_ASAHI_G18
 	bool "Apple M6 (G18G, T8152) support (experimental)"
 	depends on DRM_ASAHI && ARM64
+	depends on APPLE_CLPC=y || APPLE_CLPC=DRM_ASAHI || APPLE_CLPC=n
 	select WANT_DEV_COREDUMP
 	help
 	  Backend for the Mac mini M6 (J873) GPU and its 26A428 firmware.
@@ -94,6 +95,18 @@ config DRM_ASAHI_M3_T8122
 	  asahi.t8122_start=0 keeps startup disabled for recovery. Unknown
 	  boards and firmware do not gain automatic admission. Other GPUs
 	  are not affected.
+
+config DRM_ASAHI_G14_V27_2
+	bool "Apple G14G on GPU firmware 27.2"
+	depends on DRM_ASAHI
+	# The firmware's UAT is adopted through the G15 backend's handoff helpers.
+	depends on DRM_ASAHI_G15
+	default y
+	help
+	  Start an M2 GPU (G14G) whose boot loader reports GPU firmware
+	  27.2, and register a DRM device on it. Clients use
+	  the shared submission interface for compute and rendering.
+	  Other GPUs and firmware versions are not affected.
 
 config DRM_ASAHI_G15
 	bool "Apple M3 Pro/Max (G15) support"

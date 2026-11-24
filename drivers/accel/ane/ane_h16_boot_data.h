@@ -131,9 +131,13 @@ static const struct ane_h16_tunables ane_h16_tunables_26a428[] = {
 /*
  * T8132 (M4): the engine AXI2AF set at +0x0, then its write-disable and lock
  * bits. The lock holds until ANE_SYS power is cycled, so a group that finds
- * it set only checks its values. M4 has no XL or C1PPT writes.
+ * it set only checks its values. Bit 31 of each AXI2AF word (+0x0..+0x38)
+ * loads its fields: it reads back set after the write and clears when a
+ * sub-block power cycles under a held ANE_SYS (an aborted system suspend);
+ * the fields stay. The bit-31 words further up keep it. M4 has no XL or
+ * C1PPT writes.
  */
-static const struct ane_h16_tunable ane_t8132_axi[] = {
+static const struct ane_h16_tunable ane_t8132_axi2af[] = {
 	{ 0x0000, 0x800000ff, 0x8000001b },
 	{ 0x0004, 0x80ff00ff, 0x800d000d },
 	{ 0x0008, 0x80ff00ff, 0x800d000d },
@@ -149,6 +153,9 @@ static const struct ane_h16_tunable ane_t8132_axi[] = {
 	{ 0x0030, 0x800000ff, 0x80000016 },
 	{ 0x0034, 0x800000ff, 0x80000012 },
 	{ 0x0038, 0x800000ff, 0x80000012 },
+};
+
+static const struct ane_h16_tunable ane_t8132_axi[] = {
 	{ 0x0100, 0x000000ff, 0x000000ff },
 	{ 0x0104, 0x00ff0000, 0x00010000 },
 	{ 0x0108, 0xffff0006, 0x00040000 },
@@ -194,6 +201,9 @@ static const struct ane_h16_tunable ane_t8132_axi_lock[] = {
 };
 
 static const struct ane_h16_tunables ane_t8132_tunables[] = {
+	{ .window = ANE_H16_ENGINE, .values = ane_t8132_axi2af,
+	  .count = ARRAY_SIZE(ane_t8132_axi2af), .lock_offset = 0xdfc, .lock_mask = 1,
+	  .strobe = BIT(31) },
 	{ .window = ANE_H16_ENGINE, .values = ane_t8132_axi,
 	  .count = ARRAY_SIZE(ane_t8132_axi), .lock_offset = 0xdfc, .lock_mask = 1 },
 	{ .window = ANE_H16_ENGINE, .values = ane_t8132_axi_wd,

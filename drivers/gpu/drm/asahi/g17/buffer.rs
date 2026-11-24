@@ -704,6 +704,8 @@ pub(crate) struct ManagerArgs {
     pub(crate) buffer_id: u8,
     pub(crate) generation: u64,
     pub(crate) first_ordinal: u64,
+    /// The heap's normal maximum in blocks (`Variant::tvb_normal_blocks`); NEO heaps only.
+    pub(crate) normal_blocks: usize,
 }
 
 /// A retained parameter-buffer graph and all of its sparse backing. Client
@@ -793,7 +795,13 @@ impl Manager {
     ) -> Result<Self> {
         let geometry = tvb.geometry;
         let neo = geometry == BlockGeometry::NEO;
-        let layout = if neo { layout::Layout::NEO } else { layout::Layout::m5(geometry)? };
+        let mut layout = if neo { layout::Layout::NEO } else { layout::Layout::m5(geometry)? };
+        if neo {
+            if args.normal_blocks == 0 || args.normal_blocks > geometry.max_blocks() {
+                return Err(EINVAL);
+            }
+            layout.normal_blocks = args.normal_blocks;
+        }
         if metrics.scene_stride != layout.metric_stride {
             return Err(EINVAL);
         }
@@ -827,6 +835,7 @@ impl Manager {
             discard: args.discard,
             buffer_id: args.buffer_id.into(),
             generation: args.generation,
+            normal_blocks: layout.normal_blocks,
         };
         if neo {
             graph.initialize::<fw::Graph>(0, |view| view.init(&graph_args))?;

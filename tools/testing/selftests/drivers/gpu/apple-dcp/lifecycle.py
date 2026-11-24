@@ -595,7 +595,7 @@ def bounce(root):
          ' struct { bool connected, closed, tile_hint; void *service, *atcphy; int linkcfg_completion; } dptxport[1];\n'
          ' void *phy, *dev, *active_typec_route;\n'
          ' int dptx_die, dptx_phy, dptx_dfp_port, connector_type;\n'
-         ' bool external, external_link_ready, crashed;\n'
+         ' bool external, external_link_ready, crashed, rtkit_adopted;\n'
          ' bool typec_work_enabled;' + ('' if '\n int fw_compat;' in unit else ' int fw_compat;') +
          ' struct { bool fw_14_7_endpoints; } hw;\n'
          ' struct { bool active; } split;\n'

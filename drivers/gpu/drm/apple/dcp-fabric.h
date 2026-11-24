@@ -78,6 +78,12 @@ bool dcp_has_typec_routes(struct platform_device *pdev);
 unsigned int dcp_typec_nr_ports(void);
 struct device_node *dcp_typec_port_of_node(unsigned int idx);
 bool dcp_typec_port_has_candidate(unsigned int idx, struct platform_device *pdev);
+#if IS_ENABLED(CONFIG_KUNIT)
+/* apple_drv.c: whether a native26 pipeline can drive Type-C port @port_idx */
+bool apple_typec_port_rgb8_only(struct platform_device **dcp, int num_dcp,
+				struct platform_device *pipeline,
+				unsigned int port_idx);
+#endif
 /* Connectors by apple,connector-group; T6050's tunnel-only pairs after the others in each */
 #define DCP_TYPEC_CONNECTOR_GROUPS 4
 unsigned int dcp_typec_nr_passes(void);
@@ -130,6 +136,7 @@ bool dcp_is_t8132_ext(const struct apple_dcp *dcp);
 
 /* DCP probe, resume and endpoint teardown hooks. */
 int dcp_register_typec_routes(struct apple_dcp *dcp);
+void dcp_sleep_hold_phys(struct apple_dcp *dcp);
 void dcp_typec_route_park(struct apple_dcp *dcp);
 void dcp_typec_route_unpark(struct apple_dcp *dcp);
 int dcp_fabric_sleep_release(struct apple_dcp *dcp, s64 ms[2]);
