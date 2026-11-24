@@ -22,6 +22,8 @@
 
 	aliases {
 		gpu = &gpu;
+		rtc0 = &smc_rtc;
+		rtc1 = &pmu_rtc;
 		/* m1n1 copies this machine's Thunderbolt calibration onto the
 		 * node these names point at. Current m1n1 looks up usb4-N-acio
 		 * and usb4-N-nhi; the packaged 1.6.1 bootloader looks up
@@ -1209,10 +1211,25 @@
 			reg = <0x2 0x3d0d9300 0x0 0x100>;
 			#address-cells = <2>;
 			#size-cells = <0>;
+			#interrupt-cells = <2>;
+			interrupt-controller;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 343 IRQ_TYPE_LEVEL_HIGH>;
+			apple,response-vector = <192>;
 
 			pmic1: pmic@f {
 				compatible = "apple,sera-pmic", "apple,spmi-nvmem";
 				reg = <0xf SPMI_USID>;
+
+				pmu_rtc: rtc {
+					compatible = "apple,t8103-pmu-rtc", "apple,t8112-pmu-rtc";
+					apple,rtc-base = <0xd000>;
+					interrupt-parent = <&nub_spmi>;
+					interrupts = <2 IRQ_TYPE_EDGE_RISING>;
+					nvmem-cells = <&rtc_offset>;
+					nvmem-cell-names = "rtc_offset";
+					wakeup-source;
+				};
 
 				nvmem-layout {
 					compatible = "fixed-layout";
@@ -1242,8 +1259,8 @@
 						bits = <3 1>;
 					};
 
-					fault_shadow: fault-shadow@a67b {
-						reg = <0xa67b 0x10>;
+					fault_shadow: fault-shadow@a47b {
+						reg = <0xa47b 0x10>;
 					};
 
 					socd: socd@ab00 {
@@ -1323,7 +1340,7 @@
 				compatible = "apple,smc-hwmon";
 			};
 
-			rtc {
+			smc_rtc: rtc {
 				compatible = "apple,smc-rtc";
 				nvmem-cells = <&rtc_offset>;
 				nvmem-cell-names = "rtc_offset";

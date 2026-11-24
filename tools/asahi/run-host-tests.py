@@ -66,6 +66,11 @@ ASAHI_TESTS = {
     'display-sleep-merge-tests.py': [(out(), PASS)],
     'dcpext26-slot-unregister-tests.py': [(out(), PASS)],
     'dcpext26-budget-tests.py': [([], PASS)],
+    'mcc-boot-dma-tests.py': [([], PASS), (['--accept-unresolved'], KILL), (['--ignore-detached-supplier'], KILL),
+                              (['--final-skips-unresolved'], KILL),
+                              (['--detach-retired-only'], KILL),
+                              (['--resume-after-detach'], KILL)],
+    'dcp-peer-shown-tests.py': [([], PASS), (['--always-shown'], KILL), (['--owner-only'], KILL)],
     'dcpext26-queue-tests.py': [([], PASS), (['--drop-v27-close'], KILL)],
     'dcpext26-retrain-tests.py': [([], PASS), (['--negative-control'], KILL)],
     'dcpext26-lifecycle-tests.py': [([], PASS)],
@@ -183,6 +188,8 @@ ASAHI_TESTS = {
                                    'missing-control-firmware', 'missing-control-descriptor',
                                    'missing-owner-ipc', 'missing-owner-firmware',
                                    'missing-owner-descriptor', 'missing-owner-arena'), out()),
+    # A DP audio PCM open reads a replaced service's successor; a gone service opens unplugged.
+    'dcpaud-open-fallback-tests.py': [([], PASS)] + mutations('--mutation', ('no-retry', 'wait-any', 'gone-fails', 'keep-cookie', 'mask-all'), []),
     # a7638d51880c, the parent of the fix, ran pm_runtime_force_suspend in the late
     # slot, so the dp-audio domain dropped under a running DCP.
     'dcpaud-sleep-hold-tests.py': [(out(), PASS)]
@@ -240,7 +247,7 @@ ASAHI_TESTS = {
                                    'held-blocks-owner', 'hold-ignores-release', 'hold-ignores-work',
                                    'close-unheld', 'hold-after-release', 'put-back-own-work',
                                    'sync-skips-lent', 'lent-close-unheld', 'parked-stays-held',
-                                   'sync-clobbers', 'sync-no-wake'), []),
+                                   'sync-clobbers', 'sync-no-wake', 'spare-detach-reassigns'), []),
     'g17-capacity-backoff-tests.py': [([], PASS)],
     'g17-capacity-fault-tests.py': [([], PASS)],
     'g17-compute-constructor-tests.py': [([], PASS)],
@@ -272,6 +279,8 @@ ASAHI_TESTS = {
                                    'skip-epoch-check',
                                    'unconditional-changed-notify',
                                    'skip-generation-bump'), []),
+    'g17-m5-effort-tests.py': [([], PASS)]
+        + mutations('--mutation', ('m5-ignores-bound',), []),
     'g17-firmware-selection-tests.py': [([], PASS)],
     'g17-growth-gate-tests.py': [([], PASS)],
     'g17-growth-tests.py': [([], PASS)],
@@ -301,6 +310,14 @@ ASAHI_TESTS = {
     'isp-preview-flow-tests.py': [([], PASS)],
     'isp-preview-tests.py': [([], PASS)],
     'isp-tests.py': [(['--suite', suite] + out(), PASS) for suite in ['session', 'buffers', 'receive', 'returns', 'queue']] + [(['--suite', suite, '--control', control] + out(), KILL) for suite, controls in [('session', ['send', 'overwrite', 'stop', 'reset']), ('buffers', ['rollback']), ('receive', ['drain']), ('returns', ['address', 'pool', 'duplicate', 'snapshot']), ('queue', ['queue-error'])] for control in controls],
+    'm5-hotspot-fans-dt-tests.py': [(out('--output') + ['--dtc', '{dtc}'], PASS),
+                                    (out('--output') + ['--dtc', '{dtc}', '--mutation', 'drop-fans'], KILL),
+                                    (out('--output') + ['--dtc', '{dtc}', '--mutation', 'drop-siblings'], KILL),
+                                    (out('--output') + ['--dtc', '{dtc}', '--mutation', 'drop-hotspot'], KILL),
+                                    (out('--output') + ['--dtc', '{dtc}', '--mutation', 'drop-trip'], KILL),
+                                    (out('--output') + ['--dtc', '{dtc}', '--mutation', 'drop-settable'], KILL),
+                                    (out('--output') + ['--dtc', '{dtc}', '--mutation', 'drop-provider-check'], KILL),
+                                    (out('--output') + ['--dtc', '{dtc}', '--mutation', 'drop-budget-release-pending'], KILL)],
     'mt7932-association-events-tests.py': [(out(), PASS)],
     'mt7932-connect-result-tests.py': [(out('--output'), PASS)],
     'mt7932-owe-retry-tests.py': [(out(), PASS)],
@@ -329,7 +346,7 @@ ASAHI_TESTS = {
     'pmu-rtc-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('ack-clobber', 'arm-ack', 'offset-seconds',
                                    'offset-sign', 'event-bit', 'wrong-control',
-                                   'maverick-event', 'stowe-offset', 'baku-limit',
+                                   'maverick-event', 'stowe-offset', 'reg-base', 'baku-limit',
                                    'set-no-round', 'set-negative'), out()),
     'perf-mmap-alias-lifecycle-tests.py': [([], PASS)],
     'qspi-nvram-tests.py': [(out('--output'), PASS)],
