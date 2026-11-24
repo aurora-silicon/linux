@@ -198,20 +198,6 @@ impl Scene::ver {
         self.object.tpc.gpu_pointer()
     }
 
-    /// Zeroes the first `bytes` of the Tail Pointer Cache, so that a fragment pass run after
-    /// a firmware recovery stopped its tiler finds no tiles.
-    #[allow(dead_code)]
-    pub(crate) fn clear_tpc(&self, bytes: usize) -> Result {
-        let tpc = self.object.tpc.as_slice();
-        if bytes > tpc.len() { return Err(ERANGE); }
-        // SAFETY: the TPC belongs to this scene, whose tiler was stopped by the firmware and is
-        // halted; nothing else writes it until the scene's fragment pass runs or is dropped.
-        unsafe { core::ptr::write_bytes(tpc.as_ptr().cast_mut(), 0, bytes) };
-        crate::pgtable::clean_poc(tpc.as_ptr(), bytes);
-        crate::pgtable::poc_barrier();
-        Ok(())
-    }
-
     /// Returns the GPU pointer to the first preemption scratch buffer.
     pub(crate) fn preempt_buf_1_pointer(&self) -> GpuPointer<'_, &'_ [u8]> {
         self.object.preempt_buf.gpu_pointer()
@@ -307,6 +293,18 @@ impl Drop for Scene::ver {
 impl SceneG14V13_5 {
     pub(crate) fn render_addresses(&self) -> (u64, u64) {
         self.object.with(|raw, _| (raw.user_buffer.or(0).into(), raw.stats.into()))
+    }
+
+    /// Zeroes the first `bytes` of the Tail Pointer Cache, so that a fragment pass run after
+    /// a firmware recovery stopped its tiler finds no tiles.
+    ///
+    /// # Safety
+    ///
+    /// The GPU must not access the TPC during the call (its tiler is stopped and no other
+    /// render using this buffer is in flight), and no CPU reference into it may be live.
+    pub(crate) unsafe fn clear_tpc(&self, bytes: usize) -> Result {
+        // SAFETY: forwarded from the caller.
+        unsafe { self.object.tpc.zero_prefix(bytes) }
     }
 }
 

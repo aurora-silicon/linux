@@ -78,8 +78,14 @@ impl Prep {
     }
 
     /// Clears the tiler's TPC storage after a firmware recovery stopped the tiler.
-    pub(crate) fn clear_tpc(&self) -> Result {
-        self.scene.clear_tpc(self.tile.tpc_size)
+    /// Zeroes the scene's TPC after a firmware recovery stopped its tiler.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::buffer::Scene::clear_tpc`].
+    pub(crate) unsafe fn clear_tpc(&self) -> Result {
+        // SAFETY: forwarded from the caller.
+        unsafe { self.scene.clear_tpc(self.tile.tpc_size) }
     }
 }
 

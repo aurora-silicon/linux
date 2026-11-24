@@ -741,8 +741,17 @@ impl RootV27_2 {
         Ok(Some((read, event)))
     }
 
+    /// Validates a byte range of the control object before it is sliced or cache-maintained.
+    fn control_range(control: &fw::types::GpuArray<u8>, from: usize, bytes: usize) -> Result {
+        match from.checked_add(bytes) {
+            Some(end) if end <= control.as_slice().len() && from % 4 == 0 => Ok(()),
+            _ => Err(EINVAL),
+        }
+    }
+
     /// Reads control words from `from` into `out`.
     pub(crate) fn control_snapshot(&self, from: usize, out: &mut [u32]) -> Result {
+        Self::control_range(&self.control, from, out.len() * 4)?;
         let at = self.control.as_slice()[from..].as_ptr();
         crate::pgtable::clean_invalidate_poc(at, out.len() * 4);
         crate::pgtable::poc_barrier();
@@ -754,6 +763,7 @@ impl RootV27_2 {
 
     /// Writes one control word and makes it visible to the firmware.
     pub(crate) fn control_store(&self, at: usize, value: u32) -> Result {
+        Self::control_range(&self.control, at, 4)?;
         self.control.shared_index(at)?.store(value, Ordering::Release);
         crate::pgtable::clean_poc(self.control.as_slice()[at..].as_ptr(), 4);
         crate::pgtable::poc_barrier();

@@ -75,6 +75,10 @@ const RECOVERY_DRAIN_MS: i64 = 1000;
 /// Further recoveries answered while the stopped work drains (work behind it can time out in
 /// turn) before the runtime gives up.
 const FURTHER_RECOVERIES: u32 = 4;
+/// Rounds start only within this budget; one round takes at most PHASE1_WAIT_MS +
+/// HANDSHAKE_MS + RECOVERY_DRAIN_MS, so the lock is released well within the 10 s scheduler
+/// job timeout.
+const RECOVERY_BUDGET_MS: i64 = 5000;
 
 struct FirmwareWait {
     since: Instant<Monotonic>,
@@ -407,6 +411,27 @@ pub(crate) fn start<'a>(
     Ok(Started { backend, drm, binding, resources })
 }
 
+/// Whether the packet's VM has failed (`VmStatus` latched): its work is no longer admitted.
+fn vm_failed(packet: &Packet) -> bool {
+    packet.vm.status().is_some_and(|status| status.get() != 0)
+}
+
+/// Latches the VM of work a recovery stopped as guilty, before the work drains: from here on
+/// `submit` refuses it and `pump` publishes none of its queued packets.
+fn latch_guilty(packet: &Packet, error: Error) {
+    if let Some(status) = packet.vm.status() {
+        status.note_recovery_guilty();
+        status.record(error);
+    }
+}
+
+/// Keeps a command the firmware stopped, and everything it owns (packet and VM job guard, VM
+/// binding, scene), for the rest of the boot: see `Runtime::fail_doomed`. Bounded by the
+/// recovery-storm window; the same as `stop` does for everything at shutdown.
+fn quarantine<T>(flight: T) {
+    core::mem::forget(flight);
+}
+
 struct Inflight {
     packet: Arc<Packet>,
     last: bool,
@@ -580,6 +605,9 @@ impl Runtime {
         if packet.commands.is_empty() {
             return Err(ENOTSUPP);
         }
+        // A VM that lost its context (a recovery found it guilty, or its work failed) runs
+        // nothing more on the GPU.
+        if vm_failed(&packet) { return Err(EIO); }
         let mut guard = self.state.lock();
         let state = Option::as_mut(&mut *guard).ok_or(ENODEV)?;
         if !self.healthy() { return Err(EIO); }
@@ -681,6 +709,11 @@ impl Runtime {
         }
         while state.inflight.len() < POOL_SLOTS - 1 && !state.pending.is_empty() {
             let (packet, index) = (state.pending[0].0.clone(), state.pending[0].1);
+            if vm_failed(&packet) {
+                // Queued before its VM failed: none of it is published from now on.
+                state.fail_publication(&packet, EIO);
+                continue;
+            }
             let command = packet.commands[index];
             let paired = matches!(command, Command::Render { .. });
             if paired && state.running() { return; }
@@ -857,6 +890,7 @@ impl Runtime {
             }
             if let Some(err) = flight.doomed {
                 self.fail_doomed(state, &flight.packet, err);
+                quarantine(flight);
             } else if flight.last {
                 flight.packet.retired();
             } else if !state.pending(&flight.packet) {
@@ -865,8 +899,11 @@ impl Runtime {
         } else if started.elapsed() > Delta::from_millis(COMMAND_TIMEOUT_MS) {
             dev_err!(self.dev, "GPU: render timed out: TA retired={} fragment retired={}\n", ta_done, fs_done);
             if state.root.recovery_phase()? == 1 && doomed.is_none() {
-                // The firmware stopped it and halted, but its event was not seen.
-                return self.recover(state, ETIMEDOUT, -1);
+                // The firmware stopped it and halted, but its event was not seen. Recovery
+                // marks it and waits until it left both queues: retire it now, so its fence
+                // is signalled and the queue behind it runs without waiting for another message.
+                self.recover(state, ETIMEDOUT, -1)?;
+                return self.retire_render(state);
             }
             state.root.log_timeout(&self.dev);
             state.fault.log(&self.dev);
@@ -878,12 +915,18 @@ impl Runtime {
     /// Fails a packet the firmware stopped, once none of its commands is in a queue: its
     /// unpublished commands are withdrawn, and its VM records the error (the client sees a
     /// lost context). Other clients' work is not touched.
+    ///
+    /// A stopped command left its queue without a completion stamp: that proves queue progress,
+    /// not that the GPU no longer reaches its memory (the G16 rule, `Retirement::Aborted`). So
+    /// its VM job guard is not released: the error completion quarantines it (no mapping
+    /// changes), and the caller keeps the flight that owns the packet, its VM binding and
+    /// scene for the rest of the boot (`quarantine`). Pool slots are reused only after the
+    /// firmware unregisters them (`free_slots`).
     fn fail_doomed(&self, state: &mut State, packet: &Arc<Packet>, err: Error) {
         if state.owns(packet) { return; }
         if let Some(i) = state.pending.iter().position(|(p, _)| Arc::ptr_eq(p, packet)) {
             let _ = state.pending.remove(i);
         }
-        packet.release_guard();
         // Record it even if a racing scheduler timeout already claimed the fence (as fail_all).
         if let Some(status) = packet.vm.status() { status.record(err); }
         packet.finish(Err(err));
@@ -897,6 +940,7 @@ impl Runtime {
             Stopped::Render => {
                 let Some(flight) = state.rendering.as_mut() else { return Err(EIO); };
                 flight.doomed = Some(error);
+                latch_guilty(&flight.packet, error);
                 let owner = &flight.packet.owner;
                 dev_err!(self.dev, "GPU: stopped render of {}[{}] (slot {}, {:?})\n",
                          owner.process(), owner.pid, slot, error);
@@ -908,6 +952,7 @@ impl Runtime {
                 for flight in state.inflight.iter_mut().filter(owned) {
                     flight.doomed.get_or_insert(error);
                 }
+                latch_guilty(&packet, error);
                 dev_err!(self.dev, "GPU: stopped compute {:#x} of {}[{}] (slot {}, {:?})\n",
                          stamp, packet.owner.process(), packet.owner.pid, slot, error);
             }
@@ -966,7 +1011,14 @@ impl Runtime {
         state.root.log_timeout(&self.dev);
         let mut rounds = 0;
         let mut previous = None;
+        let began = Instant::<Monotonic>::now();
         loop {
+            // The state lock is held throughout: keep the whole recovery, including a last round
+            // started at the budget, inside the DRM scheduler's job timeout.
+            if began.elapsed() > Delta::from_millis(RECOVERY_BUDGET_MS) {
+                dev_err!(self.dev, "GPU: recovery took more than {} ms\n", RECOVERY_BUDGET_MS);
+                return Err(ETIMEDOUT);
+            }
             if self.wait_recovery(state, false, 0, PHASE1_WAIT_MS)?.is_none() {
                 dev_err!(self.dev, "GPU: firmware reported {:?} (slot {}) but did not enter recovery\n",
                          error, slot);
@@ -1019,7 +1071,10 @@ impl Runtime {
                 if let Some(flight) = state.rendering.as_ref() {
                     let ta_left = state.root.render_retired(TILER, flight.targets[TILER])?;
                     if !ta_left {
-                        flight.scene.clear_tpc()?;
+                        // SAFETY: the firmware is in recovery phase 1 with every queue stopped,
+                        // so the GPU does not access the stopped tiler's TPC; the CPU reads it
+                        // nowhere, and the state lock (held) serializes every render flight.
+                        unsafe { flight.scene.clear_tpc()? };
                         dev_err!(self.dev, "GPU: cleared the stopped tiler's TPC storage\n");
                     }
                 }
@@ -1052,7 +1107,18 @@ impl Runtime {
                              state.recoveries, start.elapsed().as_millis());
                     return Ok(());
                 }
-                if state.root.recovery_phase()? == 1 { break; }
+                if state.peer.is_crashed() { return Err(EIO); }
+                // Phase 0 = still draining; 1 = a new recovery (a new generation is checked
+                // at the next round); the host's own phases mean the handshake was misread.
+                match recovery_logic::action(state.root.recovery_phase()?, false, true) {
+                    RecoveryAction::Wait => {}
+                    RecoveryAction::MarkAndAcknowledge => break,
+                    _ => {
+                        dev_err!(self.dev, "GPU: recovery phase {} while the stopped work drained\n",
+                                 state.root.recovery_phase()?);
+                        return Err(EPROTO);
+                    }
+                }
                 if start.elapsed() > Delta::from_millis(RECOVERY_DRAIN_MS) {
                     dev_err!(self.dev, "GPU: stopped work did not leave the queue\n");
                     state.root.log_timeout(&self.dev);
@@ -1180,6 +1246,7 @@ impl Runtime {
                     self.retire_slot(state, done.slot);
                     if let Some(err) = done.doomed {
                         self.fail_doomed(state, &done.packet, err);
+                        quarantine(done);
                     } else if let Some(err) = done.publication_error {
                         done.packet.release_guard();
                         done.packet.finish(Err(err));
