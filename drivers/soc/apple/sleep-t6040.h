@@ -1588,8 +1588,7 @@ static void t6040_gp_pcie_clk(struct t6040_sleep *s)
 }
 
 /*
- * The VDD_CIO rail request (SMC key pmVC) is written in each .begin; its key and value
- * belong to the SMC driver (apple_smc_request_pmvc()).
+ * The VDD_CIO rail request (SMC key pmVC) is written in each .begin (t6040_sleep_pmvc()).
  */
 
 /* The SMC node is apple,t6041-smc + apple,t8103-smc here (macsmc's match list). */
@@ -2172,16 +2171,23 @@ static int t6040_sleep_map_regs(struct apple_sleep *c)
 }
 
 /*
- * The VDD_CIO rail request (SMC key pmVC), written in each .begin. A kernel
- * whose SMC driver this built-in code cannot call (not built, or a module)
- * links without the call and says so.
+ * The VDD_CIO rail request (SMC key pmVC), written in each .begin: the rail's enable mask
+ * | 0x100. The mask is the board's; only the J616s's (bit 0) is known, so another board
+ * gets no request rather than a guessed one. A kernel whose SMC driver this built-in code
+ * cannot call (not built, or a module) links without the call and says so.
  */
+#define T6040_J616S_PMVC	0x101
+
 static void t6040_sleep_pmvc(struct t6040_sleep *s)
 {
 	struct platform_device *pdev;
 	struct device_node *np;
 	struct apple_smc *smc;
 
+	if (!of_machine_is_compatible("apple,j616s")) {
+		dev_warn_once(s->dev, "pmVC: no VDD_CIO mask known for this board\n");
+		return;
+	}
 	if (!IS_REACHABLE(CONFIG_MFD_MACSMC)) {
 		dev_warn_once(s->dev, "pmVC: the SMC driver is not built in\n");
 		return;
@@ -2191,7 +2197,7 @@ static void t6040_sleep_pmvc(struct t6040_sleep *s)
 	of_node_put(np);
 	smc = pdev ? platform_get_drvdata(pdev) : NULL;
 	if (smc)
-		apple_smc_request_pmvc(smc);
+		apple_smc_request_pmvc(smc, T6040_J616S_PMVC);
 	else
 		dev_warn(s->dev, "pmVC: no SMC to write to\n");
 	if (pdev)

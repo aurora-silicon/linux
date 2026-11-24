@@ -858,30 +858,25 @@ static void apple_smc_write_mbse(struct apple_smc *smc, smc_key value)
 		dev_err(smc->dev, "Failed to issue MBSE = %p4ch: %d\n", &value, ret);
 }
 
-/*
- * SMC key pmVC, the request for the VDD_CIO rail: the enable mask | 0x100 (0x101 on the T6040's
- * J616s). Linux never asks for the rail, which is power-gated otherwise, and
- * a rail the SMC drops during the sleep transition races the sleep engine's hand-over of the ATC
- * ports.
- */
-#define SMC_PMVC_REQUEST	0x101
-
 /**
  * apple_smc_request_pmvc() - ask the SMC to keep the VDD_CIO rail up
  * @smc: the SMC
+ * @request: the value of SMC key pmVC: the board's rail enable mask | 0x100
  *
- * Writes pmVC at the moment the caller picks, for a sleep controller that issues it ahead of
- * the device suspend phase.
+ * Linux never asks for the rail, which is power-gated otherwise, and a rail the SMC drops
+ * during the sleep transition races the sleep engine's hand-over of the ATC ports. Writes
+ * pmVC at the moment the caller picks, for a sleep controller that issues it ahead of the
+ * device suspend phase; the mask is the board's, so the caller passes it.
  *
  * Return: 0 on success, a negative errno otherwise.
  */
-int apple_smc_request_pmvc(struct apple_smc *smc)
+int apple_smc_request_pmvc(struct apple_smc *smc, u32 request)
 {
 	int ret;
 
-	ret = apple_smc_write_u32(smc, SMC_KEY(pmVC), SMC_PMVC_REQUEST);
+	ret = apple_smc_write_u32(smc, SMC_KEY(pmVC), request);
 	if (ret < 0)
-		dev_warn(smc->dev, "pmVC: write %#x failed: %d\n", SMC_PMVC_REQUEST, ret);
+		dev_warn(smc->dev, "pmVC: write %#x failed: %d\n", request, ret);
 	return ret;
 }
 EXPORT_SYMBOL(apple_smc_request_pmvc);

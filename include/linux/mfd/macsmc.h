@@ -370,6 +370,6 @@ static inline int apple_smc_write_flag_atomic(struct apple_smc *smc, smc_key key
 	return apple_smc_write_u8_atomic(smc, key, state ? 1 : 0);
 }
 
-int apple_smc_request_pmvc(struct apple_smc *smc);
+int apple_smc_request_pmvc(struct apple_smc *smc, u32 request);
 
 #endif
