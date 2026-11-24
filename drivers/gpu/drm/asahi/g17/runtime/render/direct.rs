@@ -31,6 +31,8 @@ pub(in crate::g17::runtime) struct Loan {
     lease: PublicationLease,
     addresses: RenderAddresses,
     uat: Arc<crate::mmu::Uat>,
+    compute: Option<crate::g17::fw::kick::KickDependency>,
+    fragment_compute: Option<crate::g17::fw::kick::KickDependency>,
 }
 
 /// Publication host of a lent pair. Registration, first-publication and
@@ -151,6 +153,44 @@ impl crate::g17::Firmware {
         if self.recovery.pending() || self.recovery.generation() != generation {
             return Ok(None);
         }
+        let recovery_state = crate::g17::recovery::Memory::recovery_state(&self.init)?;
+        if recovery_state != 0 {
+            return Ok(None);
+        }
+        let mut compute = None;
+        let mut fragment_compute = None;
+        if packet.order.wait_through[1].unwrap_or(0) != 0
+            || packet.order.tiling_wait_through[1].unwrap_or(0) != 0
+        {
+            let Some(queue) = self.queues.compute(owner) else {
+                return Ok(None);
+            };
+            compute = match queue.dependency(
+                owner,
+                packet.completion.status(),
+                packet.order.tiling_wait_through[1],
+                recovery_state,
+            ) {
+                Ok(dep) => dep,
+                Err(error) if error == EAGAIN => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            if packet.order.tiling_wait_through[1] != packet.order.wait_through[1] {
+                let whole = match queue.dependency(
+                    owner,
+                    packet.completion.status(),
+                    packet.order.wait_through[1],
+                    recovery_state,
+                ) {
+                    Ok(dep) => dep,
+                    Err(error) if error == EAGAIN => return Ok(None),
+                    Err(error) => return Err(error),
+                };
+                if whole != compute {
+                    fragment_compute = whole;
+                }
+            }
+        }
         let Ok(entry) = self.queues.render.entry_mut(slot) else {
             return Ok(None);
         };
@@ -219,6 +259,8 @@ impl crate::g17::Firmware {
             lease,
             addresses,
             uat: self.uat.clone(),
+            compute,
+            fragment_compute,
         }))
     }
 
@@ -279,17 +321,12 @@ impl Backend {
         slot: u8,
         deferred: &mut DeferredBatch,
     ) -> Option<Result> {
-        // A compute prefix needs the compute queue's state; leave it to the
-        // device-mutex path. M5 renders publish through the device mutex
-        // only: their host-port transaction is part of the publication.
+        // M5 renders publish through the device mutex only: their host-port
+        // transaction is part of the publication.
         if packet.context.is_m5()
             || packet.is_published()
             || packet.cancel_requested()
             || packet.completion.status().get() != 0
-            || packet.order.wait_through[1].unwrap_or(0) != 0
-            // Only the device-mutex path resolves a staged render's tiling prefixes.
-            || matches!(&packet.command, crate::g17::command::Validated::Render { pass, .. }
-                if pass.stage_prefixes)
             || self.admission_open().is_err()
         {
             return None;
@@ -338,6 +375,8 @@ impl Backend {
             }
             let room = port.observe_render_room(&render, priority)?.ok_or(EBUSY)?;
             let mut dependencies = pair.own_dependencies(self.owner, packet)?;
+            dependencies.compute = loan.compute;
+            dependencies.fragment_compute = loan.fragment_compute;
             if let Some(footprint) = packet.footprint.as_ref() {
                 dependencies.hazard_count = self.admission.publication_barriers(
                     self.owner,
