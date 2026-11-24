@@ -58,10 +58,12 @@
 };
 
 &dcp_dart {
+	power-domains = <&ps_disp_cpu>;
 	status = "okay";
 };
 
 &disp0_dart {
+	power-domains = <&ps_disp_cpu>;
 	status = "okay";
 };
 
@@ -101,6 +103,16 @@
 		iommus = <&disp0_dart 0>;
 		dma-noncoherent;
 	};
+};
+
+/*
+ * Both retained display DARTs sit in DISP_CPU. iBoot leaves this
+ * state under firmware control and Linux must not touch its register.
+ * Give the DARTs a logical, always-on domain without a consumer switch.
+ */
+&ps_disp_cpu {
+	apple,firmware-owned;
+	status = "okay";
 };
 
 /*
