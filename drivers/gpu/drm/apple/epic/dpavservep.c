@@ -18,6 +18,7 @@
 #include "../dcp.h"
 #include "../dcp-internal.h"
 #include "../connector.h"
+#include "../iomfb_internal.h"
 #include "../trace.h"
 
 static void dcpavserv_notify_edid(struct apple_epic_service *service)
@@ -130,6 +131,11 @@ static void dcpavserv_init(struct apple_epic_service *service, const char *name,
 			dcp->dcpavserv.opened = NULL;
 			dcp->dcpavserv.opened_epoch = 0;
 			service->cookie = &dcp->dcpavserv;
+			if (!v2 && !dcp->desktop && class &&
+			    (!strcmp(class, "DCPDP13Service") ||
+			     !strcmp(class, "DCPDPService") ||
+			     !strcmp(class, "AppleDCPDP2HDMI")))
+				dcp_hdr_service_bind(service);
 			complete(&dcp->dcpavserv.enable_completion);
 			published = true;
 		}
@@ -175,6 +181,7 @@ static void dcpavserv_teardown(struct apple_epic_service *service)
 
 	mutex_lock(&dcp->dcpavserv.lock);
 	if (dcp->dcpavserv.service == service) {
+		dcp_hdr_service_unbind(service);
 		dcp->dcpavserv.enabled = false;
 		dcp->dcpavserv.service = NULL;
 		dcp->dcpavserv.epoch++;
@@ -204,6 +211,7 @@ void dpavservep_detach(struct apple_dcp *dcp)
 	dcp->dcpavserv.opened_epoch = 0;
 	reinit_completion(&dcp->dcpavserv.enable_completion);
 	if (service) {
+		dcp_hdr_service_unbind(service);
 		afk_service_retire(service);
 		dcpavserv_invalidate_edid(dcp);
 	}

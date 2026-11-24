@@ -595,25 +595,22 @@ static unsigned int pq_mode_rank(const struct color_mode *cmode)
 	return rank + (cmode->depth == 10);
 }
 
-/* A PQ element that needs DSC ranks below every one that does not. */
-#define PQ_RANK_NO_DSC 4
-
 /*
- * @dsc: firmware 27, whose processor compresses an element the timing lists
- * as needing DSC itself, as for SDR: such a PQ element is usable too.
+ * @dsc: the modeset delegates compression of DSC-required elements to DCP.
  */
 static void collect_pq_mode(struct dcp_color_mode *pq, unsigned int *best_rank,
 			    struct color_mode *cmode,
 			    const struct timing_color_restrictions *limits, bool dsc)
 {
 	unsigned int rank = pq_mode_rank(cmode);
+	bool needs_dsc = timing_color_contains(&limits->dsc_required, cmode->id);
 
-	if (!rank || timing_color_contains(&limits->unsafe, cmode->id))
+	if (!rank || (needs_dsc && !dsc) ||
+	    timing_color_contains(&limits->unsafe, cmode->id))
 		return;
-	if (!timing_color_contains(&limits->dsc_required, cmode->id))
-		rank += PQ_RANK_NO_DSC;
-	else if (!dsc)
-		return;
+
+	/* Break equal format and depth ranks in favour of no compression. */
+	rank = 2 * rank + !needs_dsc;
 	if (rank < *best_rank)
 		return;
 	if (rank > *best_rank)

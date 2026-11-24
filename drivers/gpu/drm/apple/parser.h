@@ -42,8 +42,7 @@ struct dcp_parse_ctx {
 	 */
 	bool sdr_default_rgb;
 	/*
-	 * A firmware 27 processor: it compresses a PQ element the timing lists
-	 * as needing DSC itself, so such an element is usable for PQ.
+	 * The modeset delegates compression of DSC-required elements to DCP.
 	 */
 	bool pq_dsc;
 	/*

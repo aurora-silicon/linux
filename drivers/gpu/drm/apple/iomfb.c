@@ -2463,7 +2463,13 @@ int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *ctx,
 		ctx->metadata_timing = dcp_firmware_metadata_enabled(dcp);
 		ctx->sdr_default_rgb = dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
 				       !dcp_has_panel(dcp);
-		ctx->pq_dsc = dcp->fw_compat == DCP_FIRMWARE_V_27_0;
+		/*
+		 * The template sends a timing and colour ID to DCP. It can
+		 * select an entry the timing lists as needing DSC, just as
+		 * for SDR. The parser still rejects unsafe PQ entries.
+		 */
+		ctx->pq_dsc = READ_ONCE(dcp->iomfb_template_pq) &&
+			      !dcp_has_panel(dcp);
 	}
 	ctx->zero_vrr_range_fallback = dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP;
 	ctx->internal_present_deadline = dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP;
@@ -3185,18 +3191,14 @@ out:
 }
 
 /*
- * PQ output goes through the IOMFB template's mode set, which picks the
- * timing's PQ element (see dcp_display_mode.pq): the desktop 26.x firmware,
- * the external H17P processor and the firmware 27 external processors.  The
- * other processors, and the firmware 27 panel, keep SDR.
+ * The template chooses a PQ colour ID and tags the surfaces. The caller
+ * checks for that ID in the current timing catalogue. Panels keep their
+ * existing SDR/EDR path, with the desktop template retaining PQ support.
  */
 static bool dcp_hdr_output_supported(struct apple_dcp *dcp)
 {
-	if (iomfb_is_m4(dcp))
-		return false;
-	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
-	       dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL ||
-	       (dcp->fw_compat == DCP_FIRMWARE_V_27_0 && !dcp_has_panel(dcp));
+	return READ_ONCE(dcp->iomfb_template_pq) &&
+	       (!dcp_has_panel(dcp) || dcp->desktop);
 }
 
 /*
@@ -3259,20 +3261,52 @@ static bool dcp_crtc_bt2020(struct apple_dcp *dcp, struct drm_crtc *crtc,
 	return conn_state && conn_state->colorspace == DRM_MODE_COLORIMETRY_BT2020_RGB;
 }
 
-/*
- * HDR10 static metadata is link state on the external processors: a link
- * set up again (mode set, power off) starts without it.
- */
+static void dcp_hdr_reset_locked(struct apple_dcp *dcp)
+{
+	lockdep_assert_held(&dcp->hdr.lock);
+	dcp->hdr.generation++;
+	dcp->hdr.sent_valid = false;
+	dcp->hdr.infoframe = false;
+}
+
+void dcp_hdr_service_bind(struct apple_epic_service *service)
+{
+	struct apple_dcp *dcp = service->ep->dcp;
+	struct apple_epic_service *old;
+
+	service = afk_service_get(service);
+	if (!service)
+		return;
+	scoped_guard(spinlock_irqsave, &dcp->hdr.lock) {
+		old = dcp->hdr.service;
+		WRITE_ONCE(dcp->hdr.service, service);
+		dcp_hdr_reset_locked(dcp);
+	}
+	if (old)
+		afk_service_put(old);
+}
+
+void dcp_hdr_service_unbind(struct apple_epic_service *service)
+{
+	struct apple_dcp *dcp = service->ep->dcp;
+	bool owned;
+
+	scoped_guard(spinlock_irqsave, &dcp->hdr.lock) {
+		owned = dcp->hdr.service == service;
+		if (owned) {
+			WRITE_ONCE(dcp->hdr.service, NULL);
+			dcp_hdr_reset_locked(dcp);
+		}
+	}
+	if (owned)
+		afk_service_put(service);
+}
+
+/* A link set up again starts without the previous HDR10 metadata. */
 void dcp_hdr_metadata_forget(struct apple_dcp *dcp)
 {
-	struct dcp_desktop_state *d = dcp->desktop;
-
-	if (!d)
-		return;
-	scoped_guard(spinlock_irqsave, &d->hdr_lock) {
-		d->hdr_sent_valid = false;
-		d->hdr_infoframe = false;
-	}
+	guard(spinlock_irqsave)(&dcp->hdr.lock);
+	dcp_hdr_reset_locked(dcp);
 }
 
 /*
@@ -3283,18 +3317,20 @@ void dcp_hdr_metadata_forget(struct apple_dcp *dcp)
  */
 static void dcp_hdr_infoframe_stop(struct apple_dcp *dcp)
 {
-	struct dcp_desktop_state *d = dcp->desktop;
 	struct apple_epic_service *service = NULL;
 	u8 msg[DCP_HDR_STOP_SIZE], reply[DCP_HDR_STOP_SIZE] = {};
 	size_t received = 0;
+	u64 generation;
 	u32 retcode = 0;
 	int ret;
 
-	if (!d || READ_ONCE(dcp->crashed))
+	if (READ_ONCE(dcp->crashed))
 		return;
-	scoped_guard(spinlock_irqsave, &d->hdr_lock)
-		if (d->hdr_infoframe)
-			service = afk_service_get(d->av_service);
+	scoped_guard(spinlock_irqsave, &dcp->hdr.lock) {
+		generation = dcp->hdr.generation;
+		if (dcp->hdr.infoframe)
+			service = afk_service_get(dcp->hdr.service);
+	}
 	if (!service)
 		return;
 
@@ -3307,9 +3343,9 @@ static void dcp_hdr_infoframe_stop(struct apple_dcp *dcp)
 		dev_warn(dcp->dev, "HDR InfoFrame not stopped: %d\n", ret);
 	else
 		dev_dbg(dcp->dev, "HDR InfoFrame stopped\n");
-	scoped_guard(spinlock_irqsave, &d->hdr_lock)
-		if (d->av_service == service)
-			d->hdr_infoframe = false;
+	scoped_guard(spinlock_irqsave, &dcp->hdr.lock)
+		if (dcp->hdr.service == service && dcp->hdr.generation == generation)
+			dcp->hdr.infoframe = false;
 	afk_service_put(service);
 }
 
@@ -3318,8 +3354,8 @@ bool dcp_hdr_metadata_live(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
-	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
-	       !dcp_has_panel(dcp);
+	return READ_ONCE(dcp->iomfb_template_pq) && !dcp_has_panel(dcp) &&
+	       (dcp->desktop || READ_ONCE(dcp->hdr.service));
 }
 
 /*
@@ -3360,27 +3396,20 @@ static void dcp_edr_sync(struct apple_dcp *dcp, struct drm_crtc *crtc,
 static void dcp_hdr_metadata_sync(struct apple_dcp *dcp, struct drm_crtc *crtc,
 				  struct drm_atomic_commit *commit)
 {
-	struct dcp_desktop_state *d = dcp->desktop;
-	const struct drm_connector_state *conn_state = NULL;
-	struct drm_connector_state *state;
-	struct drm_connector *connector;
+	const struct drm_connector_state *conn_state;
 	struct apple_epic_service *service;
 	u8 data[DCP_HDR_DATA_SIZE], msg[DCP_HDR_MSG_SIZE];
 	u8 reply[DCP_HDR_MSG_SIZE] = {};
 	size_t received = 0;
+	u64 generation;
 	u32 retcode = 0;
 	bool same;
-	int i, ret;
+	int transport, ret;
 
-	if (!d || !dcp->output_pq || READ_ONCE(dcp->crashed) ||
+	if (!dcp->output_pq || READ_ONCE(dcp->crashed) ||
 	    !dcp_hdr_metadata_live(to_apple_crtc(crtc)->dcp))
 		return;
-	for_each_new_connector_in_state(commit, connector, state, i)
-		if (state->crtc == crtc)
-			conn_state = state;
-	if (!conn_state && dcp->connector && dcp->connector->base.state &&
-	    dcp->connector->base.state->crtc == crtc)
-		conn_state = dcp->connector->base.state;
+	conn_state = dcp_crtc_connector_state(dcp, crtc, commit);
 	if (!conn_state || !conn_state->hdr_output_metadata ||
 	    conn_state->hdr_output_metadata->length != sizeof(struct hdr_output_metadata))
 		return;
@@ -3390,35 +3419,33 @@ static void dcp_hdr_metadata_sync(struct apple_dcp *dcp, struct drm_crtc *crtc,
 		return;
 
 	/* Most frames change nothing: compare before pinning the service. */
-	scoped_guard(spinlock_irqsave, &d->hdr_lock) {
-		same = d->hdr_sent_valid && !memcmp(d->hdr_sent, data, sizeof(data));
-		service = same ? NULL : afk_service_get(d->av_service);
+	scoped_guard(spinlock_irqsave, &dcp->hdr.lock) {
+		generation = dcp->hdr.generation;
+		same = dcp->hdr.sent_valid && !memcmp(dcp->hdr.sent, data, sizeof(data));
+		service = same ? NULL : afk_service_get(dcp->hdr.service);
 	}
 	if (!service)
 		return;
 
 	dcp_hdr_message(msg, data);
-	ret = afk_send_command_with_reply_len(service, EPIC_SUBTYPE_STD_SERVICE,
-					      msg, sizeof(msg), reply, sizeof(reply),
-					      &retcode, &received);
-	ret = dcp_hdr_reply(ret, retcode, reply, received);
-	/*
-	 * A block the firmware refused is not sent again on every frame (the
-	 * command is synchronous): only a new block, a new mode set or a new
-	 * service instance retries.
-	 */
+	transport = afk_send_command_with_reply_len(service, EPIC_SUBTYPE_STD_SERVICE,
+						    msg, sizeof(msg), reply, sizeof(reply),
+						    &retcode, &received);
+	ret = dcp_hdr_reply(transport, retcode, reply, received);
 	if (ret)
 		dev_warn_ratelimited(dcp->dev, "HDR static metadata not taken: %d\n", ret);
 	else
 		dev_dbg(dcp->dev, "HDR static metadata: MaxCLL %u MaxFALL %u mastering %u/%u\n",
 			get_unaligned_le16(data + 20), get_unaligned_le16(data + 22),
 			get_unaligned_le16(data + 16), get_unaligned_le16(data + 18));
-	scoped_guard(spinlock_irqsave, &d->hdr_lock) {
-		if (d->av_service == service) {
-			memcpy(d->hdr_sent, data, sizeof(data));
-			d->hdr_sent_valid = true;
+	scoped_guard(spinlock_irqsave, &dcp->hdr.lock) {
+		if (dcp->hdr.service == service && dcp->hdr.generation == generation) {
+			/* Without a valid reply, the previous block may no longer be active. */
+			dcp->hdr.sent_valid = !transport && ret != -EPROTO;
+			if (dcp->hdr.sent_valid)
+				memcpy(dcp->hdr.sent, data, sizeof(data));
 			if (!ret)
-				d->hdr_infoframe = true;
+				dcp->hdr.infoframe = true;
 		}
 	}
 	afk_service_put(service);
@@ -4320,6 +4347,7 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit)
 {
 	struct platform_device *pdev = to_apple_crtc(crtc)->dcp;
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+	bool route_ready;
 
 	if (iomfb_is_m4(dcp)) {
 		struct drm_plane_state *plane = drm_atomic_get_new_plane_state(commit,
@@ -4372,13 +4400,13 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit)
 		return;
 	}
 
-	if ((dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
-	     dcp->fw_compat == DCP_FIRMWARE_V_27_0) &&
-	    READ_ONCE(dcp->mode_state.valid) && dcp->connector &&
-	    READ_ONCE(dcp->connector->connected)) {
+	route_ready = dcp_crtc_route_ready(crtc, commit, true);
+	if (READ_ONCE(dcp->mode_state.valid) && dcp->connector &&
+	    READ_ONCE(dcp->connector->connected) &&
+	    !(to_apple_atomic_state(commit)->failed_routes & drm_crtc_mask(crtc))) {
 		/* A panel's EDR switches without a mode set (dcp_edr_live()). */
 		dcp_edr_sync(dcp, crtc, commit);
-		if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
+		if (route_ready)
 			dcp_hdr_metadata_sync(dcp, crtc, commit);
 	}
 
@@ -4397,7 +4425,7 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit)
 	 * firmware has reported the display back.
 	 */
 	if ((to_apple_atomic_state(commit)->failed_routes & drm_crtc_mask(crtc)) ||
-	    !dcp_crtc_route_ready(crtc, commit, true) ||
+	    !route_ready ||
 	    !READ_ONCE(dcp->mode_state.valid) || !dcp->connector || !dcp->connector->connected) {
 		schedule_work(&dcp->vblank_wq);
 		return;
