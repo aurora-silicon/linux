@@ -441,9 +441,11 @@ static int dcp_pcm_open(struct snd_pcm_substream *substream)
 	 * link is set up again (a modeset, at boot), and refuses calls to the
 	 * instance it is replacing meanwhile. Userspace probes the PCM once
 	 * and drops an output whose open fails, so read from the successor.
-	 * The sink is taken as the successor reports it.
+	 * The sink is taken as the successor reports it. A refusal is -EINVAL
+	 * (a non-zero retcode); a missing service, a timeout or no memory is
+	 * not waited out.
 	 */
-	if (ret < 0 && dcp_audiosrv_replaced(dcpaud->dcp_dev, gen)) {
+	if (ret == -EINVAL && dcp_audiosrv_replaced(dcpaud->dcp_dev, gen)) {
 		dev_dbg(dcpaud->dev, "sink info read failed on a replaced instance (%d), retrying\n",
 			ret);
 		mutex_lock(&dcpaud->data_lock);

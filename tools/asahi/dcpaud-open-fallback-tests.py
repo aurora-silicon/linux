@@ -27,8 +27,11 @@ AUDIO = 'drivers/gpu/drm/apple/audio.c'
 
 MUTATIONS = {
     # Fail the open when the instance is being replaced.
-    'no-retry': ('\tif (ret < 0 && dcp_audiosrv_replaced(dcpaud->dcp_dev, gen)) {',
+    'no-retry': ('\tif (ret == -EINVAL && dcp_audiosrv_replaced(dcpaud->dcp_dev, gen)) {',
                  '\tif (0 && gen) {'),
+    # Wait for a successor on any failure, not only a refusal.
+    'wait-any': ('\tif (ret == -EINVAL && dcp_audiosrv_replaced(dcpaud->dcp_dev, gen)) {',
+                 '\tif (ret < 0 && dcp_audiosrv_replaced(dcpaud->dcp_dev, gen)) {'),
     # Fail the open when the service is gone.
     'gone-fails': ('\tif (ret == -ENODEV) {\n\t\t/*\n\t\t * No instance answers',
                    '\tif (0) {\n\t\t/*\n\t\t * No instance answers'),
@@ -172,6 +175,10 @@ int main(void)
 	name = "persistent error";
 	CHECK(run(true, 0, -ENOMEM, 0, false, false, &d, &rt) == -ENOMEM);
 	CHECK(!dma_opens);
+
+	name = "no memory, a successor published: not waited for";
+	CHECK(run(true, 0, -ENOMEM, 0, true, true, &d, &rt) == -ENOMEM);
+	CHECK(!dma_opens && reads == 1);
 
 	name = "service gone";
 	CHECK(run(true, 0, -ENODEV, 0, false, false, &d, &rt) == 0);
