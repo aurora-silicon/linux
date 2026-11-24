@@ -1216,7 +1216,8 @@ static int apple_smc_saved_drain(struct apple_smc *smc)
 	return -ENOBUFS;
 }
 
-static int apple_smc_saved_write_u32(struct apple_smc *smc, smc_key key, u32 value)
+static int apple_smc_saved_write(struct apple_smc *smc, smc_key key, const void *buf,
+				 size_t size)
 {
 	u64 msg;
 	int ret;
@@ -1232,10 +1233,10 @@ static int apple_smc_saved_write_u32(struct apple_smc *smc, smc_key key, u32 val
 	if (ret)
 		return ret;
 	/* Guard precedes the copy. Timeout keeps both this ID and this SRAM. */
-	memcpy_toio(smc->shmem.iomem, &value, sizeof(value));
+	memcpy_toio(smc->shmem.iomem, buf, size);
 	smc->msg_id = (smc->msg_id + 1) & 0xf;
 	msg = FIELD_PREP(SMC_MSG, SMC_MSG_WRITE_KEY) |
-		FIELD_PREP(SMC_SIZE, sizeof(value)) |
+		FIELD_PREP(SMC_SIZE, size) |
 		FIELD_PREP(SMC_ID, smc->msg_id) | FIELD_PREP(SMC_DATA, key);
 	smp_store_release(&smc->saved_pending, true);
 	ret = apple_rtkit_m5_saved_send(smc->rtk, msg);
@@ -1250,6 +1251,11 @@ static int apple_smc_saved_write_u32(struct apple_smc *smc, smc_key key, u32 val
 		return -EIO;
 	/* The existing write_u32 callers require a zero-length write ACK. */
 	return FIELD_GET(SMC_SIZE, smc->cmd_ret) ? -EPROTO : 0;
+}
+
+static int apple_smc_saved_write_u32(struct apple_smc *smc, smc_key key, u32 value)
+{
+	return apple_smc_saved_write(smc, key, &value, sizeof(value));
 }
 
 static u64 apple_smc_saved_stamp(void)
