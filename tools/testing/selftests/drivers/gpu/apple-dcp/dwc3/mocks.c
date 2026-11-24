@@ -84,8 +84,17 @@ struct dwc3 {
 	bool dis_u3_susphy_quirk;
 	struct { void *notifier_call; } psy_nb;
 };
+
+/* What the match data sets apart; not a T8132 controller, so none of it is set. */
+struct dwc3_apple_hw {
+	bool host_first, usb2_host_latch;
+};
+
+static const struct dwc3_apple_hw dwc3_apple_fixture_hw;
+
 struct dwc3_apple {
 	struct dwc3 dwc;
+	const struct dwc3_apple_hw *hw;
 	enum dwc3_apple_state state;
 	struct reset_controller_dev *reset;
 	int lock;

@@ -111,6 +111,7 @@ static void initial(struct fixture *f, unsigned int gen, bool fixed, bool pm)
 				 .pm_enabled = pm,
 				 .pm_refs = pm ? 1 : 0 };
 	f->apple = (struct dwc3_apple){
+		.hw = &dwc3_apple_fixture_hw,
 		.state = DWC3_APPLE_HOST,
 		.reset = &f->atc.rcdev,
 		.usb2_phy = &f->p2,
