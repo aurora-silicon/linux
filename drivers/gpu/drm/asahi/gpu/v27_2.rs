@@ -950,14 +950,29 @@ impl RootV27_2 {
             let at = abi::relocate_by_bands(abi::COMMON26_POLICY_BANDS, source).ok_or(EINVAL)?;
             policy.get_mut(at..at + width).ok_or(EINVAL)?.copy_from_slice(&value.to_le_bytes()[..width]);
         }
-        // Thermal thresholds and corrections, then the SoC-hot alarm selection.
-        for (at, value) in [(0x22d4, 11000), (0x2284, 900), (0x2288, 4),
-                            (0x229c, crate::f32!(1.0).to_bits()), (0x2f30, 125), (0x2f34, 1)] {
+        // Thermal thresholds, then the SoC-hot alarm selection: the chip's values, as the 13.5
+        // InitData writes them (HwDataA unk_8cc, unk_87c and unk_e24).
+        for (at, value) in [(0x22d4, cfg.da.unk_8cc), (0x2284, cfg.da.unk_87c as u32),
+                            (0x2f30, cfg.da.unk_e24)] {
             put32(policy, at, value);
         }
-        for at in [0x2320, 0x2420, 0x2f38, 0x3038] {
-            for sid in (0..64).filter(|sid| sensors & (1u64 << sid) != 0) {
-                put32(policy, at + 4 * sid, crate::f32!(5.3).to_bits());
+        // Controller constants the 13.5 InitData also sets (unk_880, unk_894 = 1.0, unk_e28).
+        const FILTER_STAGES: u32 = 4;
+        const ALARM_ENABLE: u32 = 1;
+        for (at, value) in [(0x2288, FILTER_STAGES), (0x229c, crate::f32!(1.0).to_bits()),
+                            (0x2f34, ALARM_ENABLE)] {
+            put32(policy, at, value);
+        }
+        // Per-sensor corrections from the chip's coefficient tables (13.5 unk_coef_a/unk_coef_b),
+        // indexed from the first fast-die sensor id. A sensor without a coefficient refuses.
+        const FIRST_SENSOR: usize = 7;
+        let coef_a = cfg.unk_coef_a.first().ok_or(EINVAL)?;
+        let coef_b = cfg.unk_coef_b.first().ok_or(EINVAL)?;
+        for (at, coef) in [(0x2320, coef_a), (0x2420, coef_a), (0x2f38, coef_b), (0x3038, coef_b)] {
+            for sid in (0..64usize).filter(|sid| sensors & (1u64 << sid) != 0) {
+                let value = sid.checked_sub(FIRST_SENSOR).and_then(|index| coef.get(index))
+                    .ok_or(EINVAL)?;
+                put32(policy, at + 4 * sid, value.to_bits());
             }
         }
         put64(policy, 0x2f28, sensors);
