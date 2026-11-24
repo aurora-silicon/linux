@@ -27,6 +27,14 @@ allOf:
     then:
       required:
         - interrupts
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8103-pmu-rtc
+    then:
+      required:
+        - apple,rtc-base
 
 properties:
   compatible:
@@ -41,6 +49,20 @@ properties:
               - apple,t6050-pmu-rtc
               - apple,t8132-pmu-rtc
           - const: apple,t6041-pmu-rtc
+      - items:
+          - enum:
+              - apple,t8103-pmu-rtc
+              - apple,t8122-pmu-rtc
+          - const: apple,t8112-pmu-rtc
+
+  apple,rtc-base:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    maximum: 0xffff
+    description:
+      Base address of the RTC register block in the parent PMIC's 16-bit
+      SPMI register space. Required when a PMU places a shared layout at a
+      different base (such as Sera on T8103); when omitted, the driver falls
+      back to the compatible's historical base.
 
   interrupts:
     maxItems: 1

@@ -165,6 +165,14 @@ static const char gate_pmp_uuid[] __initconst = "2F4EB4C4-001B-3ACF-A9A0-68D8E42
 static const char gate_t8122_pmp_uuid[] __initconst = "3B18C886-4C70-349B-B1C4-70F35DE2C5CD";
 
 /*
+ * The T8122 PMP image of the 27.2 (26B123) system firmware. The PMP report
+ * driver checks the running image against the values the boot loader passes
+ * and reads the soc-device records from them, so the same PMP support takes
+ * either image.
+ */
+static const char gate_t8122_pmp_uuid_27_2[] __initconst = "C6CCB960-AC83-34A2-9493-C3131BD5AE4B";
+
+/*
  * The T6031 PMP image, as the J516C ADT names it (iop-pmp-nub, passed on by
  * the boot loader in /chosen/asahi,t6031-pmp). It is not the T6030 image.
  */
@@ -203,6 +211,7 @@ struct gate_soc {
 	const char *dcp_full_name;	/* the DCP node the PMP overlay expects, under /soc */
 	const char *pmp_values;		/* the boot loader's PMP values for this Mac */
 	const char *pmp_uuid;		/* the PMP image the PMP support is written for */
+	const char *pmp_uuid_alt;	/* another PMP image it takes, or NULL */
 	const char *report_compat;	/* the PMP report the overlay adds, or the reused one */
 	const char *disp_entry;		/* its display request entry, which the DCP waits for */
 	const u8 *pmp_dtbo, *pmp_dtbo_end;	/* NULL: no PMP description built in */
@@ -274,6 +283,7 @@ static const struct gate_soc gate_t8122 __initconst = {
 	.dcp_full_name = "dcp@28ec00000",
 	.pmp_values = "/chosen/asahi,t8122-pmp",
 	.pmp_uuid = gate_t8122_pmp_uuid,
+	.pmp_uuid_alt = gate_t8122_pmp_uuid_27_2,
 	.report_compat = "apple,t8122-pmp-v2-report",
 	.disp_entry = "report@7",
 	.reuse_pmp = true,
@@ -766,9 +776,12 @@ static int __init gate_pmp_resolve(struct device_node **np, struct device_node *
 			gate_pmp_values = NULL;
 			return -EINVAL;
 		}
-		if (strcmp(uuid, gate_soc->pmp_uuid)) {
-			gate_warn("PMP not added: this Mac's PMP firmware image is %s, not %s\n",
-				uuid, gate_soc->pmp_uuid);
+		if (strcmp(uuid, gate_soc->pmp_uuid) &&
+		    (!gate_soc->pmp_uuid_alt || strcmp(uuid, gate_soc->pmp_uuid_alt))) {
+			gate_warn("PMP not added: this Mac's PMP firmware image is %s, not %s%s%s\n",
+				uuid, gate_soc->pmp_uuid,
+				gate_soc->pmp_uuid_alt ? " or " : "",
+				gate_soc->pmp_uuid_alt ?: "");
 			of_node_put(gate_pmp_values);
 			gate_pmp_values = NULL;
 			return -EINVAL;
@@ -1815,6 +1828,8 @@ static void __init gate_describe(void)
  * alone. apple_t8122_display.dcpext=0 keeps them disabled too.
  */
 static bool gate_t8122_dcpext_requested __initdata = true;
+/* The changeset that enabled the dcpext; only the KUnit test reverts it. */
+static struct of_changeset *gate_t8122_dcpext_cs __initdata;
 
 static int __init gate_t8122_dcpext_setup(char *arg)
 {
@@ -1870,6 +1885,56 @@ static bool __init gate_node_in(struct device_node *const *nodes, int n,
 	return false;
 }
 
+/*
+ * On the 27.2 image the T8122 external processor and its scanout use the
+ * panel's DMA window (the 1 TiB alias): the display subsystem takes the
+ * window all its display DARTs share, and the device tree's 14.7 windows for
+ * the external DARTs (from 0) share none with the panel's. Give @dart and
+ * @disp_dart the window of the internal processor's DART.
+ */
+static int __init gate_t8122_dcpext_alias(struct of_changeset *cs,
+					  struct device_node *dart,
+					  struct device_node *disp_dart)
+{
+	struct device_node *dcp, *panel_dart;
+	struct device_node *targets[] = { dart, disp_dart };
+	const struct property *window;
+	int i, ret = 0;
+
+	dcp = of_find_compatible_node(NULL, NULL, "apple,t8122-dcp");
+	panel_dart = dcp ? of_parse_phandle(dcp, "iommus", 0) : NULL;
+	of_node_put(dcp);
+	window = panel_dart ? of_find_property(panel_dart, "apple,dma-range", NULL) : NULL;
+	/* One window: its start and its size, as the DART driver reads it. */
+	if (!window || window->length != 2 * sizeof(u64)) {
+		of_node_put(panel_dart);
+		return -ENODEV;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(targets) && !ret; i++) {
+		/* Kept for good: the live tree refers to it once applied. */
+		struct property *prop = kzalloc_obj(*prop);
+		void *value = kmemdup(window->value, window->length, GFP_KERNEL);
+
+		if (!prop || !value) {
+			kfree(prop);
+			kfree(value);
+			ret = -ENOMEM;
+			break;
+		}
+		prop->name = "apple,dma-range";
+		prop->length = window->length;
+		prop->value = value;
+		ret = of_changeset_update_property(cs, targets[i], prop);
+		if (ret) {
+			kfree(prop);
+			kfree(value);
+		}
+	}
+	of_node_put(panel_dart);
+	return ret;
+}
+
 static void __init gate_t8122_dcpext_one(struct device_node *np)
 {
 	struct device_node *dart = NULL, *mbox = NULL, *piodma = NULL;
@@ -1891,8 +1956,8 @@ static void __init gate_t8122_dcpext_one(struct device_node *np)
 		gate_ext_refuse(np, "the boot loader did not reserve its firmware");
 		return;
 	}
-	if (!gate_ext_firmware_ok(np)) {
-		gate_ext_refuse(np, "its firmware-compat is not 14.7.0");
+	if (!gate_ext_firmware_ok(np) && !apple_t8122_dcpext_v27_2(np)) {
+		gate_ext_refuse(np, "its firmware is neither 14.7.0 nor the 27.2 image");
 		return;
 	}
 	if (!of_property_present(np, "memory-region")) {
@@ -1974,6 +2039,8 @@ static void __init gate_t8122_dcpext_one(struct device_node *np)
 		ret = gate_add_bool(cs, entry, "apple,soc-device-record");
 	if (!ret)
 		ret = gate_add_bool(cs, entry, "apple,defer-startup-ack");
+	if (!ret && apple_t8122_dcpext_v27_2(np))
+		ret = gate_t8122_dcpext_alias(cs, dart, disp_dart);
 	if (!ret)
 		ret = of_changeset_update_prop_string(cs, dart, "status", "okay");
 	if (!ret)
@@ -2002,6 +2069,7 @@ static void __init gate_t8122_dcpext_one(struct device_node *np)
 		gate_ext_refuse(np, "the gate could not enable it");
 		goto put;
 	}
+	gate_t8122_dcpext_cs = cs;
 	gate_info("enabled %pOF with its Type-C routes, DARTs, mailbox, %d display crossbar(s) with ATC common power kept on, display DART %pOF in the display subsystem, CPU power floor and PMP DISPEXT request; started by the display driver\n",
 		  np, nxbar, disp_dart);
 put:
@@ -3137,10 +3205,22 @@ static const char *const t6041_max_usbc2_nodes[] = {
 	"/dcp@606e00000",
 };
 
+/* The third USB-C processor of the J614c/J616c, dcpext3, as dcpext2's chain. */
+static const char *const t6041_max_usbc3_nodes[] = {
+	"/iommu@306340000",
+	"/iommu@306300000",
+	"/mailbox@306e08000",
+	"/dcp@306e00000/typec-routes/route@0",
+	"/dcp@306e00000/typec-routes/route@1",
+	"/dcp@306e00000/typec-routes/route@2",
+	"/dcp@306e00000",
+};
+
 static const struct gate_staged t6041_max_stages[] = {
 	{ "/iommu@3a2300000", t6041_max_hdmi_nodes, ARRAY_SIZE(t6041_max_hdmi_nodes) },
 	{ "/iommu@602300000", t6041_max_usbc_nodes, ARRAY_SIZE(t6041_max_usbc_nodes) },
 	{ "/iommu@606300000", t6041_max_usbc2_nodes, ARRAY_SIZE(t6041_max_usbc2_nodes) },
+	{ "/iommu@306300000", t6041_max_usbc3_nodes, ARRAY_SIZE(t6041_max_usbc3_nodes) },
 };
 
 /*
@@ -3301,7 +3381,7 @@ static void __init gate_t6041_max_run(void)
 	if (!internal)
 		internal = of_find_compatible_node(NULL, NULL, gate_soc->dcp_compat);
 	if (gate_t6041_v27_unapproved(internal, false)) {
-		staged_info("firmware 27 internal display only, external displays left off\n");
+		staged_info("unapproved firmware 27 on internal dcp, external displays left off\n");
 		of_node_put(internal);
 		of_node_put(display);
 		return;
@@ -3336,16 +3416,29 @@ static void __init gate_t6041_max_run(void)
  * every available route. Enable them only for a dcpext the boot loader handed
  * over (apple,t8132-dcpext-firmware-ready = 1). A handed-over dcpext that is
  * not adopted then disables them again, see dcp_platform_probe_t8132_ext().
- * Only the device tree changes here; no register is touched.
+ * Only the T8132 display driver binds a dcpext and can do that, so without it,
+ * or with nomodeset, the routes stay disabled: the ports would wait for mode
+ * switches that never register. Only the device tree changes here; no
+ * register is touched.
  */
 static void __init gate_j713_dcpext_routes(void)
 {
-	struct of_changeset *cs = gate_cs_alloc();
+	struct of_changeset *cs;
 	struct device_node *np;
 	unsigned int n = 0;
 	u32 ready;
 	int ret = 0;
 
+	if (!IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8132)) {
+		pr_info("apple-j713-display: dcpext Type-C routes left disabled: the T8132 display driver is not built\n");
+		return;
+	}
+	if (IS_ENABLED(CONFIG_VIDEO) && video_firmware_drivers_only()) {
+		pr_info("apple-j713-display: dcpext Type-C routes left disabled: nomodeset is on the command line\n");
+		return;
+	}
+
+	cs = gate_cs_alloc();
 	if (!cs)
 		return;
 	for_each_compatible_node(np, NULL, "apple,t8132-dcpext") {
