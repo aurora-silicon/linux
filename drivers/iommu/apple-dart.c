@@ -49,6 +49,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/pm_wakeup.h>
+#include <linux/semaphore.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/tunable.h>
 #include <linux/string.h>
@@ -387,7 +388,11 @@ struct apple_dart {
 	u32 m5_disp_streams;	/* the display pipe's streams before its domain went off */
 	bool m5_released, m5_changed, m5_display, m5_failed;
 	/* Optional cached evidence; never a sleep-ownership grant. */
-	struct mutex v27_lifecycle;
+	/*
+	 * Held for as long as a sleep lease lasts: taken by the suspend that claims the lease and
+	 * released by the resume that finishes it, in another task. So a semaphore, not a mutex.
+	 */
+	struct semaphore v27_lifecycle;
 	struct list_head v27_clients;
 	atomic_t v27_ops;
 	bool v27_provider, v27_lost, v27_noirq_skip, v27_restoring;
@@ -5836,7 +5841,7 @@ static int apple_dart_probe(struct platform_device *pdev)
 		}
 	}
 	spin_lock_init(&dart->lock);
-	mutex_init(&dart->v27_lifecycle);
+	sema_init(&dart->v27_lifecycle, 1);
 	INIT_LIST_HEAD(&dart->v27_clients);
 	atomic_set(&dart->v27_ops, 0);
 	dart->v27_provider = res && apple_dart_v27_provider(dev, res->start);
@@ -6598,10 +6603,12 @@ int apple_dart_restore_tunnel_state(struct device *dev)
 }
 EXPORT_SYMBOL_GPL(apple_dart_restore_tunnel_state);
 
+DEFINE_GUARD(apple_dart_v27_lifecycle, struct semaphore *, down(_T), up(_T))
+
 static void apple_dart_remove(struct platform_device *pdev)
 {
 	struct apple_dart *dart = platform_get_drvdata(pdev);
-	guard(mutex)(&dart->v27_lifecycle);
+	guard(apple_dart_v27_lifecycle)(&dart->v27_lifecycle);
 
 	if (dart->cold_ane) {
 		dev_warn(&pdev->dev, "cold ANE DART retained until reset\n");
@@ -6656,11 +6663,11 @@ static void apple_dart_shutdown(struct platform_device *pdev)
 	struct apple_dart *dart = platform_get_drvdata(pdev);
 
 	/*
-	 * A sleep lease that lost its retained state keeps this mutex for good, so that nothing
+	 * A sleep lease that lost its retained state keeps this semaphore for good, so that nothing
 	 * reuses the DART before the platform reset. The reset is what follows here: waiting for
-	 * the mutex would hang the shutdown.
+	 * it would hang the shutdown.
 	 */
-	if (!mutex_trylock(&dart->v27_lifecycle)) {
+	if (down_trylock(&dart->v27_lifecycle)) {
 		dev_info(&pdev->dev, "shutdown: left as its sleep lease pinned it\n");
 		return;
 	}
@@ -6672,7 +6679,7 @@ static void apple_dart_shutdown(struct platform_device *pdev)
 	 */
 	if (apple_dart_has_borrowed(dart))
 		apple_dart_fail_borrowed(dart, "shutdown");
-	mutex_unlock(&dart->v27_lifecycle);
+	up(&dart->v27_lifecycle);
 }
 
 static const struct apple_dart_hw apple_dart_hw_t8103 = {
