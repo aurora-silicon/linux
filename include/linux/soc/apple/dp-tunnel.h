@@ -122,6 +122,12 @@ int apple_atc_dp_tunnel_rate_source(struct phy *phy, unsigned int source,
 int apple_t6050_dp_tunnel_clock(struct phy *phy, unsigned int clock, u8 rate);
 
 /*
+ * T6040 Type-C PHY: start the pixel clock for DP IN @dpin's tunnel at DP link
+ * rate code @rate, or stop it (@rate == 0). -ENODEV for another driver's PHY.
+ */
+int apple_t6040_dp_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate);
+
+/*
  * ATC PHY: wake the DP clock path of a PHY in Thunderbolt/USB4 mode ahead of
  * apple_atc_dp_tunnel_rate(), before DCP is told about the display.
  * -EOPNOTSUPP where the rate call does all of it (everything but t600x).

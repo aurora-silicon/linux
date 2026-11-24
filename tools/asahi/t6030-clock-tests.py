@@ -21,7 +21,7 @@ FUNCTIONS = {
         'atc_t8122_tunnel_stop', 'atc_t8122_tunnel_pclk', 'atc_t8122_tunnel_start',
         'apple_atc_dp_tunnel_rate_source'],
     'drivers/gpu/drm/apple/dcp-fabric.c': [
-        'dcp_route_clock_rate', 'dcp_tunnel_set_rate'],
+        'dcp_phy_tunnel_rate', 'dcp_route_clock_rate', 'dcp_tunnel_set_rate'],
 }
 CASES = ['dual-start', 'reverse-start', 'stop-second', 'same-rate',
          'stale-owner', 'same-source', 'retune-one', 'busy-mode', 'busy-pll',

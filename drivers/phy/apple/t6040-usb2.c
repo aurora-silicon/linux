@@ -2363,33 +2363,24 @@ switch_failed:
 }
 
 /*
- * The dp-tunnel.h provider for appledrm, which looks it up with symbol_get().
- * phy-apple-atc exports the same names for the older SoCs; a kernel that
- * builds both gets them from there (and T6040 tunnels then need appledrm to
- * pick a T6040 provider instead).
+ * The dp-tunnel.h provider for appledrm, which looks it up with symbol_get()
+ * and asks it before the ATC PHY's apple_atc_dp_tunnel_rate(): the names are
+ * this driver's own, so a kernel can build both PHY drivers. There is no
+ * open: the rate call does all of it, as on every SoC but t600x.
  */
-#if !IS_ENABLED(CONFIG_PHY_APPLE_ATC)
-int apple_atc_dp_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate)
+int apple_t6040_dp_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate)
 {
 	struct t6040_usb2_phy *tphy;
 
-	if (!phy || phy->ops != &t6040_dp_phy_ops || dpin > 1)
+	if (!phy || phy->ops != &t6040_dp_phy_ops)
+		return -ENODEV;
+	if (dpin > 1)
 		return -EINVAL;
 	tphy = phy_get_drvdata(phy);
 	guard(mutex)(&tphy->lock);
 	return t6040_tun_rate_locked(tphy, dpin, rate);
 }
-EXPORT_SYMBOL_GPL(apple_atc_dp_tunnel_rate);
-
-/* The rate call does all of it, as on every SoC but t600x. */
-int apple_atc_dp_tunnel_open(struct phy *phy)
-{
-	if (!phy || phy->ops != &t6040_dp_phy_ops)
-		return -EINVAL;
-	return -EOPNOTSUPP;
-}
-EXPORT_SYMBOL_GPL(apple_atc_dp_tunnel_open);
-#endif
+EXPORT_SYMBOL_GPL(apple_t6040_dp_tunnel_rate);
 
 /* ---- CIO: USB4/Thunderbolt (PHY mode 2) ----
  *

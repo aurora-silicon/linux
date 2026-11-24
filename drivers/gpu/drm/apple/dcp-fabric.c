@@ -458,6 +458,31 @@ bool dcp_is_typec_only(struct platform_device *pdev)
 	return !dcp->fixed_phy;
 }
 
+/*
+ * The DP tunnel clock of @phy: T6040's Type-C PHY's, or else the ATC PHY's.
+ * Each provider turns away the other's PHY, so a kernel can build both.
+ */
+static int dcp_phy_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate)
+{
+	typeof(apple_t6040_dp_tunnel_rate) *t6040;
+	typeof(apple_atc_dp_tunnel_rate) *atc;
+	int ret;
+
+	t6040 = symbol_get(apple_t6040_dp_tunnel_rate);
+	if (t6040) {
+		ret = t6040(phy, dpin, rate);
+		symbol_put(apple_t6040_dp_tunnel_rate);
+		if (ret != -ENODEV)
+			return ret;
+	}
+	atc = symbol_get(apple_atc_dp_tunnel_rate);
+	if (!atc)
+		return -ENOENT;
+	ret = atc(phy, dpin, rate);
+	symbol_put(apple_atc_dp_tunnel_rate);
+	return ret;
+}
+
 static int dcp_route_clock_rate(struct apple_dcp_typec_route *route,
 				struct phy *phy, unsigned int dpin, u8 rate)
 {
@@ -498,16 +523,7 @@ static int dcp_route_clock_rate(struct apple_dcp_typec_route *route,
 		if (route->mux_index != 0)
 			return -ENOENT;
 	}
-	{
-		typeof(apple_atc_dp_tunnel_rate) *fn;
-
-		fn = symbol_get(apple_atc_dp_tunnel_rate);
-		if (!fn)
-			return -ENOENT;
-		ret = fn(phy, dpin, rate);
-		symbol_put(apple_atc_dp_tunnel_rate);
-	}
-	return ret;
+	return dcp_phy_tunnel_rate(phy, dpin, rate);
 }
 
 /*
@@ -3172,15 +3188,8 @@ static int dcp_tb_split_teardown_locked(struct apple_dcp_typec_port *port,
 	scoped_guard(mutex, &dcp->tb_lock) {
 		/* Retire the callback before dropping its clock reference. */
 		dcp->split.active = false;
-		if (dcp->phy) {
-			typeof(apple_atc_dp_tunnel_rate) *stop =
-				symbol_get(apple_atc_dp_tunnel_rate);
-
-			if (stop) {
-				stop(dcp->phy, 1, 0);
-				symbol_put(apple_atc_dp_tunnel_rate);
-			}
-		}
+		if (dcp->phy)
+			dcp_phy_tunnel_rate(dcp->phy, 1, 0);
 		if (dcp->split.xbar) {
 			if (dcp->split.xbar_up)
 				mux_control_deselect(dcp->split.xbar);

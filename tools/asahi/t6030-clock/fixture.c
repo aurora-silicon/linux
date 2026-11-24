@@ -126,6 +126,10 @@ static int apple_atc_dp_tunnel_rate(struct phy *p, unsigned dpin, u8 rate)
 {
 	abort();
 }
+static int apple_t6040_dp_tunnel_rate(struct phy *p, unsigned dpin, u8 rate)
+{
+	abort();
+}
 /* T6050 ATC PHY (atc-t6050-dp.c): one tunnel clock per DP IN, recorded. */
 static unsigned t6050_calls, t6050_clock;
 static u8 t6050_rate;
