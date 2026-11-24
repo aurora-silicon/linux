@@ -5761,11 +5761,25 @@ int apple_pcie_t6050_port_recycle(struct pci_dev *bridge)
 }
 EXPORT_SYMBOL_GPL(apple_pcie_t6050_port_recycle);
 
+/*
+ * An adopting host must keep the bootloader's bus numbers: the handed-over
+ * device tree's iommu-map names each adopted endpoint by the RID the
+ * bootloader gave it, and the RID-to-SID routes are programmed for that RID.
+ * Reassigning bus numbers over only the adopted root ports changes the
+ * secondary bus whenever the bootloader numbered a port that Linux does not
+ * adopt (for example after a reset where only a subset of links trained),
+ * leaving the endpoint unreachable because config cycles go only to the
+ * adopted bus.
+ */
 static int apple_pcie_host_init(struct platform_device *pdev, struct pci_host_bridge *bridge)
 {
 	struct apple_pcie *pcie = pci_host_bridge_priv(bridge);
-	int ret = pci_host_common_init(pdev, bridge, &apple_pcie_cfg_ecam_ops);
+	int ret;
 
+	if (pcie->hw->adopt_link)
+		bridge->no_reassign_bus = true;
+
+	ret = pci_host_common_init(pdev, bridge, &apple_pcie_cfg_ecam_ops);
 	if (!ret && pcie->hw->adopt_link)
 		pci_walk_bus(bridge->bus, apple_pcie_adopted_no_clkpm_walk, NULL);
 	return ret;
