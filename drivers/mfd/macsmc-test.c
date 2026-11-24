@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* Included by macsmc.c; the command and SRAM transports are stubbed. */
+#include <kunit/device.h>
 #include <kunit/test.h>
 
 struct macsmc_test_context {
@@ -14,6 +15,9 @@ struct macsmc_test_context {
 	unsigned int seen_count;
 	int ap_power_result;
 	u64 record;
+	smc_key last_write_key;
+	size_t last_write_size;
+	u8 last_write_byte;
 };
 
 #define MACSMC_TEST_AP_IDLE	0
@@ -26,6 +30,11 @@ static int macsmc_test_command(struct apple_smc *smc, u64 cmd, u64 arg,
 
 	KUNIT_EXPECT_TRUE(kunit_get_current_test(), mutex_is_locked(&smc->mutex));
 	ctx->calls++;
+	if (cmd == SMC_MSG_WRITE_KEY) {
+		ctx->last_write_key = arg;
+		ctx->last_write_size = size;
+		ctx->last_write_byte = ctx->shmem[0];
+	}
 	if (ctx->seen_count < ARRAY_SIZE(ctx->seen))
 		ctx->seen[ctx->seen_count++] = cmd == SMC_MSG_WRITE_KEY ?
 			get_unaligned((u32 *)ctx->shmem) : arg;
@@ -395,6 +404,117 @@ static void macsmc_port_reasons_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, apple_smc_port_reasons_only(&ctx->smc, BIT_ULL(43)));
 }
 
+static struct device *macsmc_test_attach_dev(struct kunit *test,
+					     struct macsmc_test_context *ctx)
+{
+	struct device *dev = kunit_device_register(test, "macsmc-test");
+
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, dev);
+	dev_set_drvdata(dev, &ctx->smc);
+	ctx->smc.dev = dev;
+	return dev;
+}
+
+static void macsmc_wktp_probe_test(struct kunit *test)
+{
+	struct macsmc_test_context *ctx = test->priv;
+	const u8 ro_wire[] = { 1, 'u', 'i', '8', ' ', APPLE_SMC_READABLE };
+	const u8 wide_wire[] = { 2, 'u', 'i', '1', '6',
+				 APPLE_SMC_READABLE | APPLE_SMC_WRITABLE };
+	const u8 valid_wire[] = { 1, 'u', 'i', '8', ' ',
+				  APPLE_SMC_READABLE | APPLE_SMC_WRITABLE |
+				  APPLE_SMC_FUNCTION };
+
+	macsmc_test_attach_dev(test, ctx);
+
+	/* Absent WKTP leaves has_wktp clear and issues no write. */
+	ctx->result = -EIO;
+	apple_smc_probe_wktp(&ctx->smc);
+	KUNIT_EXPECT_FALSE(test, ctx->smc.has_wktp);
+	KUNIT_EXPECT_EQ(test, ctx->calls, 1U);
+
+	/* Read-only or wrong-sized WKTP is ignored. */
+	ctx->result = 0;
+	ctx->calls = 0;
+	memcpy(ctx->shmem, ro_wire, sizeof(ro_wire));
+	apple_smc_probe_wktp(&ctx->smc);
+	KUNIT_EXPECT_FALSE(test, ctx->smc.has_wktp);
+	KUNIT_EXPECT_EQ(test, ctx->calls, 1U);
+
+	ctx->calls = 0;
+	memcpy(ctx->shmem, wide_wire, sizeof(wide_wire));
+	apple_smc_probe_wktp(&ctx->smc);
+	KUNIT_EXPECT_FALSE(test, ctx->smc.has_wktp);
+	KUNIT_EXPECT_EQ(test, ctx->calls, 1U);
+
+	/* Valid 1-byte writable WKTP enables tracking and writes full wake (0). */
+	ctx->calls = 0;
+	memcpy(ctx->shmem, valid_wire, sizeof(valid_wire));
+	apple_smc_probe_wktp(&ctx->smc);
+	KUNIT_EXPECT_TRUE(test, ctx->smc.has_wktp);
+	KUNIT_EXPECT_EQ(test, ctx->calls, 2U);
+	KUNIT_EXPECT_EQ(test, ctx->last_write_key, SMC_KEY(WKTP));
+	KUNIT_EXPECT_EQ(test, ctx->last_write_size, sizeof(u8));
+	KUNIT_EXPECT_EQ(test, ctx->last_write_byte, (u8)SMC_WAKE_TYPE_FULL);
+}
+
+static void macsmc_wktp_full_wake_test(struct kunit *test)
+{
+	struct macsmc_test_context *ctx = test->priv;
+	struct device *dev = macsmc_test_attach_dev(test, ctx);
+
+	pm_suspend_clear_flags();
+
+	/* Without WKTP capability, complete() issues no write. */
+	apple_smc_complete(dev);
+	KUNIT_EXPECT_EQ(test, ctx->calls, 0U);
+
+	/* Full wake writes WKTP = 0 to exit Silent Running / Power Nap. */
+	ctx->smc.has_wktp = true;
+	ctx->shmem[0] = 0xa5;
+	apple_smc_complete(dev);
+	KUNIT_EXPECT_EQ(test, ctx->calls, 1U);
+	KUNIT_EXPECT_EQ(test, ctx->last_write_key, SMC_KEY(WKTP));
+	KUNIT_EXPECT_EQ(test, ctx->last_write_size, sizeof(u8));
+	KUNIT_EXPECT_EQ(test, ctx->last_write_byte, (u8)SMC_WAKE_TYPE_FULL);
+}
+
+static void macsmc_wktp_dark_wake_test(struct kunit *test)
+{
+	struct macsmc_test_context *ctx = test->priv;
+	struct device *dev = macsmc_test_attach_dev(test, ctx);
+
+	if (!IS_ENABLED(CONFIG_PM_SLEEP))
+		kunit_skip(test, "CONFIG_PM_SLEEP disabled");
+
+	ctx->smc.has_wktp = true;
+	pm_suspend_clear_flags();
+	pm_set_dark_wake();
+	apple_smc_complete(dev);
+	pm_suspend_clear_flags();
+
+	KUNIT_EXPECT_EQ(test, ctx->calls, 0U);
+}
+
+static void macsmc_wktp_quarantined_test(struct kunit *test)
+{
+	struct macsmc_test_context *ctx = test->priv;
+	struct device *dev = macsmc_test_attach_dev(test, ctx);
+
+	pm_suspend_clear_flags();
+	ctx->smc.has_wktp = true;
+	ctx->smc.saved_enabled = true;
+	ctx->smc.saved_recovery = true;
+
+	apple_smc_complete(dev);
+	KUNIT_EXPECT_EQ(test, ctx->calls, 0U);
+
+	ctx->smc.saved_recovery = false;
+	ctx->smc.saved_fault = -EIO;
+	apple_smc_complete(dev);
+	KUNIT_EXPECT_EQ(test, ctx->calls, 0U);
+}
+
 static struct kunit_case macsmc_parser_cases[] = {
 	KUNIT_CASE(macsmc_key_info_lock_test),
 	KUNIT_CASE(macsmc_key_index_test),
@@ -412,6 +532,10 @@ static struct kunit_case macsmc_parser_cases[] = {
 	KUNIT_CASE(macsmc_lid_wake_test),
 	KUNIT_CASE(macsmc_wake_reason_test),
 	KUNIT_CASE(macsmc_port_reasons_test),
+	KUNIT_CASE(macsmc_wktp_probe_test),
+	KUNIT_CASE(macsmc_wktp_full_wake_test),
+	KUNIT_CASE(macsmc_wktp_dark_wake_test),
+	KUNIT_CASE(macsmc_wktp_quarantined_test),
 	{}
 };
 

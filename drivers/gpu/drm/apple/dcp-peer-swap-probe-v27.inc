@@ -6,6 +6,7 @@ struct dcp_peer_background {
 	struct iomfb_transaction transaction;
 	struct dcp_peer_video_wait *wait;
 	struct dcp_swap_submit_req_v27 wire;
+	char tag[4];
 	bool sent;
 };
 
@@ -26,9 +27,10 @@ static void dcp_peer_background_start(struct apple_dcp *dcp,
 {
 	struct dcp_peer_background *background =
 		container_of(transaction, struct dcp_peer_background, transaction);
-	struct dcp_method_entry method = { .name = "peer_background_test",
-		.tag = {'A', '4', '0', '8'} };
+	struct dcp_method_entry method = { .name = "peer_background_test" };
 	struct dcp_swap_submit_resp_v27 failed = { .ret = ~0U };
+
+	memcpy(method.tag, background->tag, sizeof(method.tag));
 
 	background->sent = true;
 	if (!dcp_present_begin_h17p(&dcp->present_state_h17p,
@@ -55,13 +57,18 @@ static int dcp_peer_queue_background(struct apple_dcp *dcp,
 				     struct dcp_peer_video_wait *wait)
 {
 	struct dcp_peer_background *background;
+	char tag[4];
 	int ret;
 
+	ret = iomfb_v27_tag(dcp->v27_methods, "A408", tag);
+	if (ret)
+		return ret;
 	background = kzalloc_obj(*background);
 	if (!background)
 		return -ENOMEM;
 	background->wire = *wire;
 	background->wait = wait;
+	memcpy(background->tag, tag, sizeof(background->tag));
 	kref_get(&wait->refs);
 	background->transaction.start = dcp_peer_background_start;
 	background->transaction.release = dcp_peer_background_release;
@@ -185,6 +192,7 @@ static void dcp_peer_a407_background_start(struct apple_dcp *dcp,
 {
 	struct dcp_peer_a407_background *background =
 		container_of(transaction, struct dcp_peer_a407_background, transaction);
+	/* The J714s's 27.0 swap form, whose table names A407 (iomfb_v27_methods_j714s()). */
 	struct dcp_method_entry method = { .name = "peer_background_test",
 		.tag = {'A', '4', '0', '7'} };
 	struct dcp_swap_submit_resp_v27 failed = { .ret = ~0U };
@@ -345,6 +353,8 @@ static ssize_t peer_swap_test_store(struct device *dev,
 		    dcp->crtc->base.state->active || peer->crtc->base.state->active ||
 		    dcp->fw_compat != DCP_FIRMWARE_V_27_0 ||
 		    peer->fw_compat != DCP_FIRMWARE_V_27_0 ||
+		    /* Both engines must take the swap form the owner sends. */
+		    dcp->v27_a407 != peer->v27_a407 ||
 		    !device_trylock(peer->dev)) {
 			ret = -EBUSY;
 			goto out;
