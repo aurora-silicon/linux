@@ -13,6 +13,7 @@
 #include "iomfb_v12_3.h"
 #include "iomfb_v13_3.h"
 #include "iomfb_v14_7_tpl.h"
+#include "dcp-internal.h"
 #include "version_utils.h"
 
 struct dcp_callback_size {

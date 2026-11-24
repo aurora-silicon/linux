@@ -1045,6 +1045,22 @@ static const struct apr_variant apr_t6041 = {
 	.apri = &apri_t6041,
 };
 
+/* T6041's engine and windows, with T8132's own wrapper table; no built-in rows. */
+static const struct apr_variant apr_t8132 = {
+	.build_desc = apr_build_desc,
+	.stats = {
+		{ APR_REG_STATS0_LO, APR_REG_STATS0_HI, APR_REG_STATS0_SIZE },
+		{ APR_REG_STATS1_LO, APR_REG_STATS1_HI, APR_REG_STATS1_SIZE },
+	},
+	.reg_names = { "core", "wrapper", "aux" },
+	.num_regs = 3,
+	.num_irqs = 1,
+	.ring_bytes = APR_RING_BYTES,
+	.desc_bytes = APR_DESC_BYTES,
+	.firmware_name = APRI_T8132_FIRMWARE_NAME,
+	.apri = &apri_t8132,
+};
+
 /* T6041's engine plus the SCODEC control window. */
 static const struct apr_variant apr_t6050 = {
 	.build_desc = apr_build_desc,
@@ -2162,6 +2178,7 @@ static const struct of_device_id apr_of_match[] = {
 	{ .compatible = "apple,t6000-prores", .data = &apr_t6000 },
 	{ .compatible = "apple,t6041-prores", .data = &apr_t6041 },
 	{ .compatible = "apple,t6050-prores", .data = &apr_t6050 },
+	{ .compatible = "apple,t8132-prores", .data = &apr_t8132 },
 	{ .compatible = "apple,t8140-prores", .data = &apr_t8140 },
 	{ .compatible = "apple,t8142-prores", .data = &apr_t8142 },
 	{ }
@@ -2183,4 +2200,5 @@ MODULE_DESCRIPTION("Apple ProRes encoder");
 MODULE_LICENSE("GPL");
 MODULE_FIRMWARE(APRI_T6041_FIRMWARE_NAME);
 MODULE_FIRMWARE(APRI_T6050_FIRMWARE_NAME);
+MODULE_FIRMWARE(APRI_T8132_FIRMWARE_NAME);
 MODULE_FIRMWARE(APRI_T8142_FIRMWARE_NAME);

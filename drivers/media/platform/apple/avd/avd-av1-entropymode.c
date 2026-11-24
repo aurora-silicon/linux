@@ -75,7 +75,7 @@ static_assert(offsetof(struct avd_av1_cdfs, dc_sign_cdf) == 5214);
 static_assert(offsetof(struct avd_av1_cdfs, coeff_base_cdf) == 6646);
 static_assert(sizeof(struct avd_av1_cdfs) == 9166);
 
-static const u16 default_palette_uv_mode_cdf[ PALETTE_UV_MODE_CONTEXTS ] = {
+static const u16 default_palette_uv_mode_cdf[PALETTE_UV_MODE_CONTEXTS] = {
 	AOM_CDF(32461, 21488)
 };
 
@@ -94,15 +94,15 @@ static const u16 default_angle_delta_cdf[DIRECTIONAL_MODES]
 static const u16 default_if_y_mode_cdf[BLOCK_SIZE_GROUPS][CDF_SIZE(AV1_INTRA_MODES)] = {
 	{
 		AOM_CDF(22801, 23489, 24293, 24756, 25601, 26123,
-		        26606, 27418, 27945, 29228, 29685, 30349)
+			26606, 27418, 27945, 29228, 29685, 30349)
 	},
 	{
 		AOM_CDF(18673, 19845, 22631, 23318, 23950, 24649,
-		        25527, 27364, 28152, 29701, 29984, 30852)
+			25527, 27364, 28152, 29701, 29984, 30852)
 	},
 	{
 		AOM_CDF(19770, 20979, 23396, 23939, 24241, 24654,
-		        25136, 27073, 27830, 29360, 29730, 30659)
+			25136, 27073, 27830, 29360, 29730, 30659)
 	},
 	{
 		AOM_CDF(20155, 21301, 22838, 23178, 23261, 23533,
@@ -717,7 +717,7 @@ static const u16 default_palette_y_mode_cdf[PALETTE_BLOCK_SIZES]
 	{ { AOM_CDF(32450) }, { AOM_CDF(7946) }, { AOM_CDF(129) } }
 };
 
-static const u16 default_palette_size_2_y_color_cdf[ PALETTE_COLOR_CONTEXTS ] = {
+static const u16 default_palette_size_2_y_color_cdf[PALETTE_COLOR_CONTEXTS] = {
 	AOM_CDF(28710),
 	AOM_CDF(16384),
 	AOM_CDF(10553),
@@ -725,7 +725,7 @@ static const u16 default_palette_size_2_y_color_cdf[ PALETTE_COLOR_CONTEXTS ] = 
 	AOM_CDF(31603)
 };
 
-static const u16 default_palette_size_3_y_color_cdf[ PALETTE_COLOR_CONTEXTS ][ 2 ] = {
+static const u16 default_palette_size_3_y_color_cdf[PALETTE_COLOR_CONTEXTS][2] = {
 	{ AOM_CDF(27877, 30490) },
 	{ AOM_CDF(11532, 25697) },
 	{ AOM_CDF(6544,  30234) },
@@ -733,7 +733,7 @@ static const u16 default_palette_size_3_y_color_cdf[ PALETTE_COLOR_CONTEXTS ][ 2
 	{ AOM_CDF(31915, 32385) }
 };
 
-static const u16 default_palette_size_4_y_color_cdf[ PALETTE_COLOR_CONTEXTS ][ 3 ] = {
+static const u16 default_palette_size_4_y_color_cdf[PALETTE_COLOR_CONTEXTS][3] = {
 	{ AOM_CDF(25572, 28046, 30045) },
 	{ AOM_CDF(9478,  21590, 27256) },
 	{ AOM_CDF(7248,  26837, 29824) },
@@ -741,7 +741,7 @@ static const u16 default_palette_size_4_y_color_cdf[ PALETTE_COLOR_CONTEXTS ][ 3
 	{ AOM_CDF(31400, 31825, 32250) }
 };
 
-static const u16 default_palette_size_5_y_color_cdf[ PALETTE_COLOR_CONTEXTS ][ 4 ] = {
+static const u16 default_palette_size_5_y_color_cdf[PALETTE_COLOR_CONTEXTS][4] = {
 	{ AOM_CDF(24779, 26955, 28576, 30282) },
 	{ AOM_CDF(8669,  20364, 24073, 28093) },
 	{ AOM_CDF(4255,  27565, 29377, 31067) },
@@ -749,7 +749,7 @@ static const u16 default_palette_size_5_y_color_cdf[ PALETTE_COLOR_CONTEXTS ][ 4
 	{ AOM_CDF(31646, 31893, 32147, 32426) }
 };
 
-static const u16 default_palette_size_6_y_color_cdf[ PALETTE_COLOR_CONTEXTS ][ 5 ] = {
+static const u16 default_palette_size_6_y_color_cdf[PALETTE_COLOR_CONTEXTS][5] = {
 	{ AOM_CDF(23132, 25407, 26970, 28435, 30073) },
 	{ AOM_CDF(7443,  17242, 20717, 24762, 27982) },
 	{ AOM_CDF(6300,  24862, 26944, 28784, 30671) },
@@ -757,7 +757,7 @@ static const u16 default_palette_size_6_y_color_cdf[ PALETTE_COLOR_CONTEXTS ][ 5
 	{ AOM_CDF(31270, 31550, 31808, 32059, 32353) }
 };
 
-static const u16 default_palette_size_7_y_color_cdf[ PALETTE_COLOR_CONTEXTS ][ 6 ] = {
+static const u16 default_palette_size_7_y_color_cdf[PALETTE_COLOR_CONTEXTS][6] = {
 	{ AOM_CDF(23105, 25199, 26464, 27684, 28931, 30318) },
 	{ AOM_CDF(6950,  15447, 18952, 22681, 25567, 28563) },
 	{ AOM_CDF(7560,  23474, 25490, 27203, 28921, 30708) },
@@ -765,7 +765,7 @@ static const u16 default_palette_size_7_y_color_cdf[ PALETTE_COLOR_CONTEXTS ][ 6
 	{ AOM_CDF(31198, 31451, 31670, 31882, 32123, 32391) }
 };
 
-static const u16 default_palette_size_8_y_color_cdf[ PALETTE_COLOR_CONTEXTS ][ 7 ] = {
+static const u16 default_palette_size_8_y_color_cdf[PALETTE_COLOR_CONTEXTS][7] = {
 	{ AOM_CDF(21689, 23883, 25163, 26352, 27506, 28827, 30195) },
 	{ AOM_CDF(6892,  15385, 17840, 21606, 24287, 26753, 29204) },
 	{ AOM_CDF(5651,  23182, 25042, 26518, 27982, 29392, 30900) },
@@ -773,7 +773,7 @@ static const u16 default_palette_size_8_y_color_cdf[ PALETTE_COLOR_CONTEXTS ][ 7
 	{ AOM_CDF(31028, 31270, 31504, 31705, 31927, 32153, 32392) }
 };
 
-static const u16 default_palette_size_2_uv_color_cdf[ PALETTE_COLOR_CONTEXTS ][ 1 ] = {
+static const u16 default_palette_size_2_uv_color_cdf[PALETTE_COLOR_CONTEXTS][1] = {
   { AOM_CDF(29089) },
   { AOM_CDF(16384) },
   { AOM_CDF(8713) },
@@ -781,7 +781,7 @@ static const u16 default_palette_size_2_uv_color_cdf[ PALETTE_COLOR_CONTEXTS ][ 
   { AOM_CDF(31610) }
 };
 
-static const u16 default_palette_size_3_uv_color_cdf[ PALETTE_COLOR_CONTEXTS ][ 2 ] = {
+static const u16 default_palette_size_3_uv_color_cdf[PALETTE_COLOR_CONTEXTS][2] = {
   { AOM_CDF(25257, 29145) },
   { AOM_CDF(12287, 27293) },
   { AOM_CDF(7033,  27960) },
@@ -789,7 +789,7 @@ static const u16 default_palette_size_3_uv_color_cdf[ PALETTE_COLOR_CONTEXTS ][ 
   { AOM_CDF(30608, 31639) }
 };
 
-static const u16 default_palette_size_4_uv_color_cdf[ PALETTE_COLOR_CONTEXTS ][ 3 ] = {
+static const u16 default_palette_size_4_uv_color_cdf[PALETTE_COLOR_CONTEXTS][3] = {
   { AOM_CDF(24210, 27175, 29903) },
   { AOM_CDF(9888,  22386, 27214) },
   { AOM_CDF(5901,  26053, 29293) },
@@ -797,7 +797,7 @@ static const u16 default_palette_size_4_uv_color_cdf[ PALETTE_COLOR_CONTEXTS ][ 
   { AOM_CDF(30459, 31136, 31926) }
 };
 
-static const u16 default_palette_size_5_uv_color_cdf[ PALETTE_COLOR_CONTEXTS ][ 4 ] = {
+static const u16 default_palette_size_5_uv_color_cdf[PALETTE_COLOR_CONTEXTS][4] = {
   { AOM_CDF(22980, 25479, 27781, 29986) },
   { AOM_CDF(8413,  21408, 24859, 28874) },
   { AOM_CDF(2257,  29449, 30594, 31598) },
@@ -805,7 +805,7 @@ static const u16 default_palette_size_5_uv_color_cdf[ PALETTE_COLOR_CONTEXTS ][ 
   { AOM_CDF(31844, 32044, 32281, 32518) }
 };
 
-static const u16 default_palette_size_6_uv_color_cdf[ PALETTE_COLOR_CONTEXTS ][ 5 ] = {
+static const u16 default_palette_size_6_uv_color_cdf[PALETTE_COLOR_CONTEXTS][5] = {
   { AOM_CDF(22217, 24567, 26637, 28683, 30548) },
   { AOM_CDF(7307,  16406, 19636, 24632, 28424) },
   { AOM_CDF(4441,  25064, 26879, 28942, 30919) },
@@ -813,7 +813,7 @@ static const u16 default_palette_size_6_uv_color_cdf[ PALETTE_COLOR_CONTEXTS ][ 
   { AOM_CDF(30674, 30953, 31396, 31735, 32207) }
 };
 
-static const u16 default_palette_size_7_uv_color_cdf[ PALETTE_COLOR_CONTEXTS ][ 6 ] = {
+static const u16 default_palette_size_7_uv_color_cdf[PALETTE_COLOR_CONTEXTS][6] = {
   { AOM_CDF(21239, 23168, 25044, 26962, 28705, 30506) },
   { AOM_CDF(6545,  15012, 18004, 21817, 25503, 28701) },
   { AOM_CDF(3448,  26295, 27437, 28704, 30126, 31442) },
@@ -821,7 +821,7 @@ static const u16 default_palette_size_7_uv_color_cdf[ PALETTE_COLOR_CONTEXTS ][ 
   { AOM_CDF(30988, 31204, 31479, 31734, 31983, 32325) }
 };
 
-static const u16 default_palette_size_8_uv_color_cdf[ PALETTE_COLOR_CONTEXTS ][ 7 ] = {
+static const u16 default_palette_size_8_uv_color_cdf[PALETTE_COLOR_CONTEXTS][7] = {
   { AOM_CDF(21442, 23288, 24758, 26246, 27649, 28980, 30563) },
   { AOM_CDF(5863,  14933, 17552, 20668, 23683, 26411, 29273) },
   { AOM_CDF(3415,  25810, 26877, 27990, 29223, 30394, 31618) },
@@ -4023,7 +4023,7 @@ void avd_av1_default_coeff_probs(u32 base_qindex, void *ptr)
 
 void avd_av1_set_default_cdfs(void *ptr) //,
 {
-	struct avd_av1_cdfs *cdfs = ((struct avd_av1_cdfs*)ptr);
+	struct avd_av1_cdfs *cdfs = ((struct avd_av1_cdfs *)ptr);
 
 	memcpy(cdfs->partition_cdf_0, default_partition_cdf_0,
 	       sizeof(cdfs->partition_cdf_0));

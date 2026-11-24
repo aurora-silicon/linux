@@ -350,6 +350,8 @@ impl platform::Driver for AsahiPlatformDriver {
         // parameter set it; a no-op everywhere else.
         unsafe { bindings::apple_pmp_agx_activity_release() };
         if let Some(gpu) = this.g17.as_ref() {
+            #[cfg(CONFIG_DRM_ASAHI_G18)]
+            crate::g18::compat::g17p::g17p_unpublish_gfx_data();
             // Driver data is dropped after devres, so CPU control must happen in unbind.
             gpu.shutdown();
         }
@@ -677,6 +679,11 @@ impl AsahiPlatformDriver {
                 error
             );
         }
+        // The G17P firmware DATA diagnostics read only the bound GPU's own data segment.
+        #[cfg(CONFIG_DRM_ASAHI_G18)]
+        if cfg.identity.gpu_variant == hw::GpuVariant::P {
+            crate::g18::compat::g17p::g17p_publish_gfx_data(pdev.as_ref());
+        }
         Ok(AsahiPlatformDriverData {
             binding,
             _device: reg.device().into(),
@@ -859,6 +866,8 @@ impl Drop for AsahiPlatformDriverData<'_> {
         }
         drop(self.stats.take());
         if let Some(gpu) = self.g17.as_ref() {
+            #[cfg(CONFIG_DRM_ASAHI_G18)]
+            crate::g18::compat::g17p::g17p_unpublish_gfx_data();
             // Also covers failure to allocate platform driver data after the probe body returned.
             gpu.shutdown();
         }
