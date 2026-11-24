@@ -431,6 +431,10 @@ struct ane_t6021 {
 	void *fw_data_buf;
 	dma_addr_t fw_data_dma;
 	size_t fw_data_size;
+	/* Owned, zeroed runtime RAM mapped right after a preload's DATA. */
+	void *fw_tail_buf;
+	dma_addr_t fw_tail_dma;
+	size_t fw_tail_size;
 	/* Validated pristine image retained for bounded, source-stable recovery. */
 	const struct firmware *fw_image;
 	/* Entry alias: IOVA the fw pages are aliased at (the latched

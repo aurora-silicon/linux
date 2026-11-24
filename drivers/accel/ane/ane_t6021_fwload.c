@@ -581,6 +581,50 @@ static int ane_t6021_fw_preload_check(struct device *dev,
 	return 0;
 }
 
+/*
+ * The firmware's runtime memory past its image. The disk path gives the
+ * firmware fw_extra_ram bytes of owned RAM after its 5 MiB allocation; a
+ * preload gets the same, zeroed and device-writable, mapped right after
+ * DATA. The 27.2 H14 firmware keeps per-process state there, at its
+ * sharedMemoryBase (TEXT + DATA): without it CREATE faults in the DART and
+ * the engine's command loop later reads zeros.
+ */
+static int ane_t6021_fw_preload_tail(struct ane_t6021 *ane, struct iommu_domain *dom,
+				     u64 tail, int prot)
+{
+	u64 off;
+	int ret;
+
+	if (!fw_extra_ram)
+		return 0;
+	if (!IS_ALIGNED(tail, SZ_16K) || tail + fw_extra_ram - 1 > dom->geometry.aperture_end ||
+	    ane->fw_alias_extn != 2)
+		return -ERANGE;
+	for (off = 0; off < fw_extra_ram; off += SZ_16K)
+		if (iommu_iova_to_phys(dom, tail + off))
+			return -EEXIST;
+	ane->fw_tail_buf = dma_alloc_coherent(ane->dev, fw_extra_ram, &ane->fw_tail_dma,
+					      GFP_KERNEL);
+	if (!ane->fw_tail_buf)
+		return -ENOMEM;
+	ane->fw_tail_size = fw_extra_ram;
+	ane->fw_alias_ext_iova[2] = tail;
+	for (off = 0; off < fw_extra_ram; off += SZ_16K) {
+		phys_addr_t phys = iommu_iova_to_phys(dom, ane->fw_tail_dma + off);
+
+		if (!phys || !IS_ALIGNED(phys, SZ_16K))
+			return -EFAULT;
+		ret = iommu_map(dom, tail + off, phys, SZ_16K, prot | IOMMU_WRITE, GFP_KERNEL);
+		if (ret)
+			return ret;
+		ane->fw_alias_ext_len[2] = off + SZ_16K;
+		ane->fw_alias_extn = 3;
+		if (iommu_iova_to_phys(dom, tail + off) != phys)
+			return -EIO;
+	}
+	return 0;
+}
+
 static int ane_t6021_fw_preload_map(struct ane_t6021 *ane,
 				   const struct ane_t6021_preload *p)
 {
@@ -666,6 +710,9 @@ static int ane_t6021_fw_preload_map(struct ane_t6021 *ane,
 			goto unwind;
 		}
 	}
+	ret = ane_t6021_fw_preload_tail(ane, dom, p->dva[1] + p->size[1], prot);
+	if (ret)
+		goto unwind;
 	ret = ane_t6021_pmu_map(ane, dom);
 	if (ret)
 		goto unwind;
@@ -826,6 +873,8 @@ static int ane_t6021_fw_preload_reload(struct ane_t6021 *ane)
 		return -EINVAL;
 
 	memcpy(ane->fw_data_buf, ane->fw_pristine_data, ane->fw_data_size);
+	if (ane->fw_tail_buf)
+		memset(ane->fw_tail_buf, 0, ane->fw_tail_size);
 	dma_wmb();
 	return 0;
 }
@@ -903,6 +952,12 @@ void ane_t6021_fwload_remove(struct ane_t6021 *ane)
 		dma_free_coherent(ane->dev, ane->fw_data_size, ane->fw_data_buf,
 				  ane->fw_data_dma);
 		ane->fw_data_buf = NULL;
+	}
+	if (ane->fw_tail_buf) {
+		dma_free_coherent(ane->dev, ane->fw_tail_size, ane->fw_tail_buf,
+				  ane->fw_tail_dma);
+		ane->fw_tail_buf = NULL;
+		ane->fw_tail_size = 0;
 	}
 	if (!ane->fw_buf)
 		return;
