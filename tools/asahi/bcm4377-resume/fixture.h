@@ -72,10 +72,10 @@ struct bcm4377_data {
 };
 static int cal_count,ptb_count,reset_count,open_count,queued_count,addr_count,cal_failures,ptb_error,addr_error,reset_error,rings_error,close_error;
 static int rebind_count;
-/* A real sleep that took the function's power, and the rebind it queues. */
-static bool resume_via_firmware;
+/* The PCIe host's word that a firmware sleep took the function's power, and the rebind. */
+static bool host_power_lost;
 static int power_rebinds;
-static bool pm_resume_via_firmware(void) { return resume_via_firmware; }
+static bool apple_pcie_s2r_power_lost(struct pci_dev *p) { (void)p; return host_power_lost; }
 static void __bcm4377_queue_rebind(struct bcm4377_data *b, const char *why, bool expected)
 {
 	(void)why;

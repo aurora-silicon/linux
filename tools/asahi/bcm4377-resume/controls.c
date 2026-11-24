@@ -111,7 +111,7 @@ int main(int argc,char **argv) {
 	case 46:
 		/* Power lost in a real sleep: no resume command, a quiet rebind instead. */
 		assert(!bcm4377_suspend(&dev));
-		resume_via_firmware = true;
+		host_power_lost = true;
 		assert(!bcm4377_resume(&dev));
 		assert(power_rebinds == 1 && b.needs_reset && !b.quiesced && !b.resume_powered);
 		/* The close before the rebind owes no reset; without a rebind it does. */
@@ -120,10 +120,8 @@ int main(int argc,char **argv) {
 		b.reset_pending = 0;
 		bcm4377_hci_close(&h);
 		assert(dev_warnings == 1);
-		/* not for a function behind the high DMA window, which keeps its power */
-		resume_via_firmware = false;
-		b.dma_window_base = 1;
-		resume_via_firmware = true;
+		/* not below a host whose ports kept their power */
+		host_power_lost = false;
 		assert(!bcm4377_suspend(&dev));
 		assert(!bcm4377_resume(&dev));
 		assert(power_rebinds == 1);
