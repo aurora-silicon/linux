@@ -120,6 +120,10 @@ static void spin_lock_bh(spinlock_t *m){mutex_lock(m);}static void spin_unlock_b
 static struct tbnet *netdev_priv(struct net_device *d){return d->priv;}
 static void netif_carrier_off(struct net_device *d){d->carrier=false;}static void netif_carrier_on(struct net_device *d){d->carrier=true;}static bool netif_carrier_ok(struct net_device *d){return d->carrier;}
 static void netif_stop_queue(struct net_device *d){d->queue_on=false;}static void netif_start_queue(struct net_device *d){d->queue_on=true;}
+static void netif_tx_disable(struct net_device *d)
+{
+	d->queue_on = false;
+}
 static void stop_login(struct tbnet *n){assert(heldmutex==0);pthread_mutex_lock(&gate);if(setup_active){teardown_entered=1;pthread_cond_broadcast(&cv);}while(setup_active)pthread_cond_wait(&cv,&gate);pthread_mutex_unlock(&gate);}
 static void start_login(struct tbnet *n){}static void cancel_work_sync(struct work_struct *w){}
 static bool netif_running(struct net_device *d){return d->running;}static void netif_device_detach(struct net_device *d){d->attached=false;}static void netif_device_attach(struct net_device *d){d->attached=true;}
