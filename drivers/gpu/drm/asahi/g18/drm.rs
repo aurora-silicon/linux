@@ -197,7 +197,7 @@ impl gpu::Gpu for G18DrmGpu {
         params.max_frequency_khz = 0;
         params.usc_generation = G18_USC_GENERATION;
         params.gpu_hal_generation = G18_UAPI_HAL_GENERATION;
-        params.max_commands_per_submission = 1;
+        params.max_commands_per_submission = crate::file::MAX_COMMANDS_PER_SUBMISSION;
         if self.config.admit_graphics_scratch {
             params.features |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_G18_GRAPHICS_SCRATCH as u64;
         }
