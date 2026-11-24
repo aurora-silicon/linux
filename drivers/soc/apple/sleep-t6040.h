@@ -276,6 +276,8 @@ struct t6040_apcie_st {
 struct t6040_sleep {
 	struct device *dev;
 	struct apple_sleep *core;
+	/* The SMC pmVC (VDD_CIO) request from the DT; 0 when the board gives none. */
+	u32 pmvc;
 	struct t6040_sleep_group *groups;
 	unsigned int ngroups;
 	/* The dry run level of the suspend in progress, from .begin to .end; 0 otherwise. */
@@ -2160,6 +2162,8 @@ static int t6040_sleep_map_regs(struct apple_sleep *c)
 	t6040_sleep_map_gp(s);
 	t6040_ed_map(dev);
 
+	of_property_read_u32(dev->of_node, "apple,vdd-cio-request", &s->pmvc);
+
 	s->mbox = c->mbox;
 	c->ps = s->soc_east;
 	c->wdt = s->wdt;
@@ -2172,20 +2176,19 @@ static int t6040_sleep_map_regs(struct apple_sleep *c)
 
 /*
  * The VDD_CIO rail request (SMC key pmVC), written in each .begin: the rail's enable mask
- * | 0x100. The mask is the board's; only the J616s's (bit 0) is known, so another board
- * gets no request rather than a guessed one. A kernel whose SMC driver this built-in code
- * cannot call (not built, or a module) links without the call and says so.
+ * | 0x100, from the DT (apple,vdd-cio-request). The mask is the board's, so a board whose
+ * value the DT does not give gets no request rather than a guessed one. A kernel whose SMC
+ * driver this built-in code cannot call (not built, or a module) links without the call and
+ * says so.
  */
-#define T6040_J616S_PMVC	0x101
-
 static void t6040_sleep_pmvc(struct t6040_sleep *s)
 {
 	struct platform_device *pdev;
 	struct device_node *np;
 	struct apple_smc *smc;
 
-	if (!of_machine_is_compatible("apple,j616s")) {
-		dev_warn_once(s->dev, "pmVC: no VDD_CIO mask known for this board\n");
+	if (!s->pmvc) {
+		dev_warn_once(s->dev, "pmVC: no VDD_CIO request in the device tree\n");
 		return;
 	}
 	if (!IS_REACHABLE(CONFIG_MFD_MACSMC)) {
@@ -2197,7 +2200,7 @@ static void t6040_sleep_pmvc(struct t6040_sleep *s)
 	of_node_put(np);
 	smc = pdev ? platform_get_drvdata(pdev) : NULL;
 	if (smc)
-		apple_smc_request_pmvc(smc, T6040_J616S_PMVC);
+		apple_smc_request_pmvc(smc, s->pmvc);
 	else
 		dev_warn(s->dev, "pmVC: no SMC to write to\n");
 	if (pdev)
