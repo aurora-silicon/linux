@@ -3199,6 +3199,12 @@ static bool dcp_hdr_output_supported(struct apple_dcp *dcp)
 	       (dcp->fw_compat == DCP_FIRMWARE_V_27_0 && !dcp_has_panel(dcp));
 }
 
+/* Whether an external output of @pdev can be given a PQ signal at all. */
+bool dcp_pq_output_supported(struct platform_device *pdev)
+{
+	return dcp_hdr_output_supported(platform_get_drvdata(pdev));
+}
+
 /*
  * A desktop 26.x or firmware 27 panel keeps its SDR link and shows PQ
  * content as EDR, given the panel's peak (see res_max_panel_brightness()).

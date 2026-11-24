@@ -1024,11 +1024,15 @@ static int apple_connector_attach_pq_reference(struct drm_connector *connector)
 
 /*
  * External displays can take a PQ BT.2020 signal where the firmware
- * offers one, and a desktop 26.x panel PQ content it shows as EDR;
- * dcp_crtc_atomic_check() refuses it elsewhere.
+ * offers one (@pq_output), and a desktop 26.x panel PQ content it shows as
+ * EDR (@panel_edr); dcp_crtc_atomic_check() refuses it elsewhere.  An
+ * external output that cannot carry PQ gets neither property: the mode set
+ * would keep the SDR transfer function and send no HDR metadata while still
+ * honouring a BT.2020 colorspace, so a compositor that enabled HDR there
+ * would show SDR content as BT.2020 on an SDR sink, washed out.
  */
 static int apple_connector_attach_hdr(struct drm_connector *connector,
-				      bool panel_edr)
+				      bool panel_edr, bool pq_output)
 {
 	const u32 colorspaces = BIT(DRM_MODE_COLORIMETRY_BT2020_RGB);
 	int ret;
@@ -1041,9 +1045,13 @@ static int apple_connector_attach_hdr(struct drm_connector *connector,
 	/* A desktop 26.x Type-C route is a pipeline output carrying DisplayPort. */
 	case DRM_MODE_CONNECTOR_USB:
 	case DRM_MODE_CONNECTOR_DisplayPort:
+		if (!pq_output && !panel_edr)
+			return 0;
 		ret = drm_mode_create_dp_colorspace_property(connector, colorspaces);
 		break;
 	case DRM_MODE_CONNECTOR_HDMIA:
+		if (!pq_output)
+			return 0;
 		ret = drm_mode_create_hdmi_colorspace_property(connector, colorspaces);
 		break;
 	default:
@@ -1100,7 +1108,8 @@ static int apple_connector_create(struct drm_device *drm,
 	if (ret)
 		goto err_cleanup;
 	ret = apple_connector_attach_hdr(&connector->base,
-					 dcp_fw_compat_panel_edr(dcp));
+					 dcp_fw_compat_panel_edr(dcp),
+					 dcp_pq_output_supported(dcp));
 	if (ret)
 		goto err_cleanup;
 
@@ -1332,6 +1341,32 @@ VISIBLE_IF_KUNIT bool apple_typec_port_rgb8_only(struct platform_device **dcp,
 }
 
 /*
+ * Whether every pipeline that can drive @port_idx (or @pipeline alone) can
+ * give it a PQ signal: the connector cannot know which one a commit lands
+ * on, so one that cannot would show a BT.2020 desktop on an SDR link.
+ */
+static bool apple_typec_port_pq_output(struct platform_device **dcp,
+				       int num_dcp,
+				       struct platform_device *pipeline,
+				       unsigned int port_idx)
+{
+	bool any = false;
+	int i;
+
+	for (i = 0; i < num_dcp; i++) {
+		if (pipeline && dcp[i] != pipeline)
+			continue;
+		if (!dcp_typec_port_has_candidate(port_idx, dcp[i]))
+			continue;
+		if (!platform_get_drvdata(dcp[i]) ||
+		    !dcp_pq_output_supported(dcp[i]))
+			return false;
+		any = true;
+	}
+	return any;
+}
+
+/*
  * Create a connector per physical Type-C port and attach it to every
  * pipeline that can drive it. The M2 Pro/Max laptops append a second
  * connector per port for a dock's second DP tunnel, preserving primary
@@ -1433,7 +1468,10 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 		 * intact; its capabilities are not the pipeline's.
 		 */
 		if (!apple_typec_port_rgb8_only(dcp, num_dcp, pipeline, port_idx)) {
-			ret = apple_connector_attach_hdr(&connector->base, false);
+			bool pq = apple_typec_port_pq_output(dcp, num_dcp,
+							     pipeline, port_idx);
+
+			ret = apple_connector_attach_hdr(&connector->base, false, pq);
 			if (ret)
 				return ret;
 		}

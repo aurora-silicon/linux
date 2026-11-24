@@ -106,6 +106,7 @@ int dcp_ext26_layout_stop(struct apple_dcp *dcp);
 int dcp_wait_ready(struct platform_device *pdev, u64 timeout);
 void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit);
 bool dcp_hdr_metadata_live(struct platform_device *pdev);
+bool dcp_pq_output_supported(struct platform_device *pdev);
 bool dcp_edr_live(struct platform_device *pdev);
 void dcp_retain_framebuffer(struct platform_device *pdev,
 			    struct dcp_fb_reference *entry);
