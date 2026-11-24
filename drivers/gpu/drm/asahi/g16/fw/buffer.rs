@@ -82,7 +82,8 @@ fn put64(x: &mut [u8], off: usize, v: u64) {
     x[off..off + 8].copy_from_slice(&v.to_le_bytes());
 }
 
-/// Literal fresh M4 PB manager. The firmware and GPU page-list aliases share backing.
+/// Literal fresh M4 PB manager sized to `heap_blocks` (1..=[`MAX_BLOCKS`]).
+/// The firmware and GPU page-list aliases share backing.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn pb_manager_image(
     id: u32,
@@ -91,23 +92,26 @@ pub(crate) fn pb_manager_image(
     blocks_fw: u64,
     ring_fw: u64,
     count_fw: u64,
+    heap_blocks: u32,
 ) -> [u8; pb_manager::SIZE] {
+    let blocks = heap_blocks.clamp(1, MAX_BLOCKS);
+    let pages = blocks * PAGES_PER_BLOCK;
     let mut m = [0; pb_manager::SIZE];
     put32(&mut m, 0xc, id);
     put32(&mut m, 0x10, id);
     put64(&mut m, 0x20, pages_fw);
     put64(&mut m, 0x28, pages_gpu);
     put32(&mut m, 0x30, PAGE_LIST_SIZE as u32);
-    put32(&mut m, 0x34, MAX_PAGES);
+    put32(&mut m, 0x34, pages);
     put32(&mut m, 0x38, BLOCK_LIST_RECORDS);
-    put32(&mut m, 0x3c, MAX_BLOCKS);
+    put32(&mut m, 0x3c, blocks);
     put64(&mut m, 0x44, blocks_fw);
     put64(&mut m, 0x4c, ring_fw);
-    put32(&mut m, 0x54, MAX_PAGES - 1);
+    put32(&mut m, 0x54, pages - 1);
     put32(&mut m, 0x58, BLOCK_BYTES as u32);
     put64(&mut m, 0x64, count_fw);
-    put32(&mut m, 0x7c, MAX_PAGES);
-    put32(&mut m, 0x80, MAX_PAGES);
+    put32(&mut m, 0x7c, pages);
+    put32(&mut m, 0x80, pages);
     m
 }
 
@@ -156,6 +160,7 @@ mod tests {
             0xfffffc2000500000,
             0xfffffc2000600000,
             0xfffffc2000700000,
+            MAX_BLOCKS,
         );
         assert_eq!(m.len(), 0xc0);
         assert_eq!((r32(&m, 0xc), r32(&m, 0x10)), (1, 1));
@@ -169,6 +174,26 @@ mod tests {
         assert_eq!(r32(&m, 0x54), 8191);
         assert_eq!(r32(&m, 0x7c), 8192);
         assert_eq!(r32(&m, 0x80), 8192);
+        // A 64 MiB heap (512 blocks / 2048 pages) describes only its backed blocks and pages.
+        let small = pb_manager_image(
+            0,
+            0xfffffc2000400000,
+            0x701a040000,
+            0xfffffc2000500000,
+            0xfffffc2000600000,
+            0xfffffc2000700000,
+            512,
+        );
+        assert_eq!(
+            (
+                r32(&small, 0x34),
+                r32(&small, 0x3c),
+                r32(&small, 0x54),
+                r32(&small, 0x7c),
+                r32(&small, 0x80),
+            ),
+            (2048, 512, 2047, 2048, 2048)
+        );
         let written = [
             (0xc, 8),
             (0x20, 16),

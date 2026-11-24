@@ -101,10 +101,11 @@ static void expect(struct device_node *host, bool cold, bool admitted)
 int main(void)
 {
     struct device_node dart = { .tunables = true };
-    const char *intr2axi[] = { "apple,t8112-pciec", "apple,t6000-pciec" };
-    for (unsigned int i = 0; i < 2; i++) {
+    const char *intr2axi[] = { "apple,t8112-pciec", "apple,t6000-pciec",
+                              "apple,t8142-pciec" };
+    for (unsigned int i = 0; i < 3; i++) {
         /* M2 must win over its T8103 fallback, without a board allowlist. */
-        struct device_node host = { .compat = { intr2axi[i], "apple,t8103-pciec" },
+        struct device_node host = { .compat = { intr2axi[i], i < 2 ? "apple,t8103-pciec" : NULL },
                                    .status = -1, .dart = &dart };
         const struct of_device_id *id = of_match_node(apple_pcie_of_match, &host);
         assert(id && ((const struct hw_info *)id->data)->tunnel_intr2axi);
@@ -133,7 +134,7 @@ int main(void)
     expect(&regular, false, false);
     regular.compat[0] = "apple,unknown-pciec";
     expect(&regular, false, false);
-    puts("PASS: M1, M1 Pro, M2, firmware handoff, missing DART and DT opt-in");
+    puts("PASS: M1, M1 Pro, M2, native T8142, firmware handoff, missing DART and DT opt-in");
     return 0;
 }
 '''
@@ -569,6 +570,106 @@ def run_cases(out, cases, extra_flags=()):
             print('PASS negative control:', name)
 
 
+def pm_registration(source, start, end):
+    first = source.index(start)
+    return source[first:source.index(end, first) + len(end)]
+
+
+PM_FIXTURE = r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stdio.h>
+struct notifier_block { int (*notifier_call)(void); int priority; };
+struct apple_cio_hw { bool phy_shared_with_dwc3; };
+struct apple_cio { const struct apple_cio_hw *hw; struct notifier_block pm_notifier; };
+struct dwc3_apple { struct notifier_block pm_nb; };
+static const struct apple_cio_hw apple_cio_t8142_hw = { .phy_shared_with_dwc3 = true };
+static struct notifier_block *chain[2];
+static int count;
+static bool busy, phy_off, pci_off;
+static int register_pm_notifier(struct notifier_block *nb)
+{
+    int i = count++;
+    assert(count <= 2);
+    while (i && chain[i - 1]->priority < nb->priority) {
+        chain[i] = chain[i - 1];
+        i--;
+    }
+    chain[i] = nb;
+    return 0;
+}
+static int apple_cio_pm_notify(void)
+{
+    /* An open disk must be rejected while its PCIe link still works. */
+    assert(!phy_off);
+    if (busy)
+        return 1;
+    pci_off = true;
+    return 0;
+}
+static int dwc3_apple_pm_notify(void)
+{
+    assert(pci_off);
+    phy_off = true;
+    return 0;
+}
+static void add_cio(struct apple_cio *acio)
+{
+    /* ACIO_REGISTRATION */
+}
+static void add_dwc(struct dwc3_apple *appledwc)
+{
+    int ret;
+    /* DWC_REGISTRATION */
+    assert(!ret);
+}
+int main(void)
+{
+    struct apple_cio acio = { .hw = &apple_cio_t8142_hw };
+    struct dwc3_apple dwc = { 0 };
+    /* DWC3 probes first on J813. Equal priority reproduces the failure. */
+    add_dwc(&dwc);
+    add_cio(&acio);
+    for (int open = 0; open < 2; open++) {
+        busy = open;
+        phy_off = pci_off = false;
+        for (int i = 0; i < count; i++)
+            if (chain[i]->notifier_call())
+                break;
+        assert(phy_off == !busy && pci_off == !busy);
+    }
+    puts("PASS: T8142 refuses an open disk before PHY shutdown; idle PCIe stops first");
+    return 0;
+}
+'''
+
+
+def test_pm_order(out, acio):
+    dwc = (ROOT / 'drivers/usb/dwc3/dwc3-apple.c').read_text()
+    code = PM_FIXTURE.replace('/* ACIO_REGISTRATION */', pm_registration(
+        acio, 'acio->pm_notifier.notifier_call = apple_cio_pm_notify;',
+        'register_pm_notifier(&acio->pm_notifier);'))
+    code = code.replace('/* DWC_REGISTRATION */', pm_registration(
+        dwc, 'appledwc->pm_nb.notifier_call = dwc3_apple_pm_notify;',
+        'ret = register_pm_notifier(&appledwc->pm_nb);'))
+    mutation = code.replace('acio->pm_notifier.priority = 40;',
+                            'acio->pm_notifier.priority = 0;')
+    assert mutation != code
+    for name, body in [('pm-order', code), ('phy-before-pcie', mutation)]:
+        source, binary = out / (name + '.c'), out / name
+        source.write_text(body)
+        subprocess.run(['cc', '-std=gnu11', '-Wall', '-Werror', str(source),
+                        '-o', str(binary)], check=True)
+        run = subprocess.run([str(binary)], capture_output=True, text=True)
+        (out / (name + '.log')).write_text(run.stdout + run.stderr)
+        if name == 'pm-order':
+            assert run.returncode == 0, run.stderr
+            print(run.stdout, end='')
+        else:
+            assert run.returncode < 0 and 'Assertion' in run.stderr
+            print('PASS negative control:', name)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--out', type=Path)
@@ -641,10 +742,13 @@ def main():
     with tempfile.TemporaryDirectory(prefix='pciec-policy-') as tmp:
         out = args.out or Path(tmp)
         out.mkdir(parents=True, exist_ok=True)
+        test_pm_order(out, acio)
         cases = {
             'production': code,
             'm2-fallback': code.replace(
                 '{ .compatible = "apple,t8112-pciec",\t.data = &t8112_pciec_hw },', ''),
+            't8142-admission': code.replace(
+                'of_device_is_compatible(np, "apple,t8142-pciec")', 'false'),
             'dart-bypass': code.replace(
                 'tunables = of_property_present(iommu_spec.np, "apple,tunable");',
                 'tunables = true;'),

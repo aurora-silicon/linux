@@ -68,10 +68,18 @@
 	T6050_CPU(label, mpidr, "apple,everest", pcluster_opp, cluster, 1024, l2, 0x30000, 0x20000)
 
 /*
- * Caches. Every cluster has its own unified L2, shared by its six cores: the ADT's /cpus/cpuN
- * l2-cache-size is 8 MiB on the M-tier (apple,sawtooth) cores and 16 MiB on the P-tier
- * (apple,everest) cores in the J714c/s, J716c/s, J775c/d and J873s ADTs, and macOS reports
- * hw.perflevelN.cpusperl2 = 6 on both tiers. The L1 sizes are macOS's
+ * Caches. Every M-tier (apple,sawtooth) cluster has a unified L2 shared by its cores: the ADT's
+ * /cpus/cpuN l2-cache-size is 8 MiB on those cores in the J714c/s, J716c/s, J775c/d and J873s
+ * ADTs, and macOS reports hw.perflevelN.cpusperl2 = 6. A P-tier (apple,everest) core has one
+ * more level: CLIDR_EL1 reports three cache levels there and two on an M-tier core. Each P core
+ * has a private unified L2 (its size is not established) in front of a 16 MiB unified L3 shared
+ * by the cluster, which is the cluster cache the ADT lists as the P cores' l2-cache-size. On
+ * J775c, a dependent-load sweep on one P core is not slowed by a second P core of the same
+ * cluster running the same sweep up to 512 KiB (private), but is from 8 MiB on (shared, half
+ * of 16 MiB); a core of an M-tier cluster slows neither. Describing all three levels matches the
+ * hardware and CLIDR_EL1 (and avoids a CLIDR level-count mismatch if init_cache_level() runs
+ * without early OF levels).
+ * The L1 sizes are macOS's
  * hw.perflevelN.l1icachesize/l1dcachesize: 128 KiB I and 64 KiB D on the M tier, 192 KiB I and
  * 128 KiB D on the P tier. The system level cache sits behind the memory controllers and is
  * shared with every agent; it is not part of the CPUs' cache hierarchy and is not described here.
@@ -84,7 +92,21 @@
 		cache-size = <bytes>;	\
 	}
 #define T6050_M_L2(label, name)	T6050_L2(label, name, 0x800000)
-#define T6050_P_L2(label, name)	T6050_L2(label, name, 0x1000000)
+/* A P core's private L2, in front of its cluster's L3. */
+#define T6050_P_L2(label, name, l3)	\
+	label: name {			\
+		compatible = "cache";	\
+		cache-level = <2>;	\
+		cache-unified;		\
+		next-level-cache = <&l3>; \
+	}
+#define T6050_P_L3(label, name)	\
+	label: name {			\
+		compatible = "cache";	\
+		cache-level = <3>;	\
+		cache-unified;		\
+		cache-size = <0x1000000>; \
+	}
 
 / {
 	compatible = "apple,t6050", "apple,arm-platform";

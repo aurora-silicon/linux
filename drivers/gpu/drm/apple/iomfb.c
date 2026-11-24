@@ -3227,14 +3227,14 @@ static bool dcp_hdr_output_supported(struct apple_dcp *dcp)
 }
 
 /*
- * A desktop 26.x or firmware 27 panel keeps its SDR link and shows PQ
- * content as EDR, given the panel's peak (see res_max_panel_brightness()).
+ * A desktop 26.x or firmware 27 panel with EDR headroom (dcp_panel_edr())
+ * keeps its SDR link and shows PQ content as EDR, given the panel's peak
+ * (see res_max_panel_brightness()).
  */
 static bool dcp_panel_edr_supported(struct apple_dcp *dcp)
 {
-	return (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
-		dcp->fw_compat == DCP_FIRMWARE_V_27_0) &&
-	       dcp_has_panel(dcp) && READ_ONCE(dcp->panel.peak_nits);
+	return dcp_fw_swap_has_edr(dcp) && dcp_has_panel(dcp) &&
+	       dcp->panel.edr_ceiling && READ_ONCE(dcp->panel.peak_nits);
 }
 
 /* The state of the connector on @crtc that @commit sets up. */
@@ -3708,6 +3708,22 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 	if (crtc_state->mode.hdisplay == 0 && crtc_state->mode.vdisplay == 0)
 		return 0;
 
+	/*
+	 * The DCP of an HDMI output plugs the display in only some time after
+	 * its link came up (dcp_poweron() connects it): a second or more after
+	 * a system resume, as the converter and the display wake up. A mode set
+	 * before that fails in the firmware ("setmode failed", the pipe not
+	 * enabled) after a 200 ms wait. Leave the mode unset instead: the
+	 * hotplug that connects the display finds the mode invalid with the
+	 * CRTC active, and sets it again (dcp_hotplug()).
+	 */
+	if (dcp->hdmi_hpd && !dcp_is_typec_output(dcp) && dcp->connector &&
+	    !READ_ONCE(dcp->connector->connected)) {
+		dev_dbg(dcp->dev, "HDMI display not plugged in yet: mode set deferred to its hotplug\n");
+		dcp_mode_set_valid(&dcp->mode_state, false);
+		return -EAGAIN;
+	}
+
 	dcp_crtc_color_request(dcp, crtc, commit, &dcp->color_req);
 	dcp->pq_requested = dcp->color_req.eotf == HDMI_EOTF_SMPTE_ST2084;
 	dcp->output_edr = dcp->pq_requested && dcp_panel_edr_supported(dcp) &&
@@ -3914,6 +3930,20 @@ iomfb_scanout_prepare_h17p(struct apple_dcp *dcp, struct drm_crtc *crtc,
 		if (new_state->crtc == crtc && new_state->visible && new_state->fb) {
 			scanout->fb[slot] = new_state->fb;
 			drm_framebuffer_get(new_state->fb);
+		}
+	}
+	if (dcp->boot_surface_pending && scanout->fb[0]) {
+		struct drm_plane_state *primary = crtc->primary ?
+			drm_atomic_get_new_plane_state(state, crtc->primary) : NULL;
+
+		/*
+		 * Match the explicit slot-zero clear in iomfb_flush() when the
+		 * primary plane is disabled; dcp->iomfb.scanout keeps its own
+		 * reference pinned until completion replaces it.
+		 */
+		if (!primary || primary->crtc != crtc || !primary->visible || !primary->fb) {
+			drm_framebuffer_put(scanout->fb[0]);
+			scanout->fb[0] = NULL;
 		}
 	}
 	if (dcp_is_ext26(dcp)) {
@@ -4580,6 +4610,13 @@ static void iomfb_start(struct apple_dcp *dcp)
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
 		break;
 	}
+}
+
+bool dcp_boot_surface_pending(struct platform_device *pdev)
+{
+	struct apple_dcp *dcp = pdev ? platform_get_drvdata(pdev) : NULL;
+
+	return dcp && READ_ONCE(dcp->boot_surface_pending);
 }
 
 bool dcp_is_initialized(struct platform_device *pdev)

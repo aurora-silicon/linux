@@ -1105,8 +1105,8 @@ static int aic_init_cpu(unsigned int cpu)
  */
 static void aic_irq_cpus_update(unsigned int cpu, bool accepts)
 {
-	static struct cpumask aff;	/* CPU hotplug is serialized */
 	struct aic_irq_chip *ic = aic_irqc;
+	const struct cpumask *aff;
 	unsigned int die, i, virq;
 
 	if (accepts == cpumask_test_cpu(cpu, &aic_irq_cpus))
@@ -1118,8 +1118,11 @@ static void aic_irq_cpus_update(unsigned int cpu, bool accepts)
 			virq = irq_find_mapping(ic->hw_domain, AIC_IRQ_HWIRQ(die, i));
 			if (!virq || !irq_has_action(virq))
 				continue;
-			cpumask_copy(&aff, irq_get_affinity_mask(virq));
-			irq_set_affinity(virq, &aff);
+			aff = irq_get_affinity_mask(virq);
+			if (!aff)
+				continue;
+			/* Read under the desc lock, so a concurrent smp_affinity write is kept */
+			irq_set_affinity(virq, aff);
 		}
 	}
 }

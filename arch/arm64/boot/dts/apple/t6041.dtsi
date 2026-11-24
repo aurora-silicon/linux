@@ -20,6 +20,12 @@
 	power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1", "perf";
 };
 
+&ane {
+	power-domains = <&ps_ane_sys>, <&ps_ane_cpu>, <&ps_ane_mpm>,
+			<&ps_ane_td>, <&ps_ane_base>, <&pmc_soc_max>;
+	power-domain-names = "sys", "cpu", "mpm", "td", "base", "perf";
+};
+
 /*
  * The main PMIC is a Chapel at 0xb (ADT nub-spmi0 spmi-chapelL1-b), not the
  * J616s's Abbey at 0xe. Its nvmem cells and RTC alarm registers are at the

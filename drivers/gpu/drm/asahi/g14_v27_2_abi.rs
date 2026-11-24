@@ -71,6 +71,28 @@ impl GrowRequest {
     }
 }
 
+/// Globals words of the firmware's per-pipe progress checks and compute watchdog, which the
+/// shared 0xe48-byte 27.2 Globals hold at the same offsets as the M3 and M4 27.2 runtimes write
+/// them (`m3_power_26`, `g16/fw/initdata`), with the 13.5 names: 0x24 relaxed compute kill
+/// timeout (ms), 0x78 command submission enabled, 0x998/0x99c/0x9a0 progress-check intervals
+/// of 3D/TA/compute (firmware polls), 0x9c8 compute context-switch timeout (ms), 0x9cc compute
+/// kill timeout (ms), 0xe28. Left zero, the firmware's progress recovery (armed in HwDataB)
+/// times out TA and compute work that runs past a poll within a second or two. The TA interval
+/// is the 100 polls the M3 runtime uses for long vertex loops (`m3_config`), not 10.
+pub(crate) const GLOBALS_PROGRESS: [(usize, u32); 8] = [
+    (0x24, 3000),
+    (0x78, 1),
+    (0x998, 40),
+    (0x99c, 100),
+    (0x9a0, 250),
+    (0x9c8, 40),
+    (0x9cc, 50),
+    (0xe28, 3),
+];
+
+/// Size of the 27.2 Globals object.
+pub(crate) const GLOBALS_BYTES: usize = 0xe48;
+
 #[cfg_attr(not(test), kunit_tests(asahi_g14_fw_queues))]
 #[cfg_attr(test, allow(dead_code))]
 mod tests {
@@ -147,5 +169,21 @@ mod tests {
                 0
             ]
         );
+    }
+
+    #[test]
+    fn progress_words_fit_the_globals_and_leave_power_words_alone() {
+        let power = [0x58usize, 0x5a, 0x5c, 0x6e, 0x84, 0x88, 0x8c, 0x98];
+        for (i, &(at, value)) in GLOBALS_PROGRESS.iter().enumerate() {
+            assert_eq!(at % 4, 0);
+            assert!(at + 4 <= GLOBALS_BYTES);
+            assert_ne!(value, 0);
+            assert!(power.iter().all(|&p| p + 4 <= at || at + 4 <= p));
+            assert!(GLOBALS_PROGRESS[i + 1..].iter().all(|&(other, _)| other != at));
+        }
+        // Every progress interval is set: a zero interval is what stopped work in a poll.
+        for at in [0x998, 0x99c, 0x9a0] {
+            assert!(GLOBALS_PROGRESS.iter().any(|&(o, v)| o == at && v != 0));
+        }
     }
 }

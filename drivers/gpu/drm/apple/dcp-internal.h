@@ -227,9 +227,9 @@ struct dcp_panel {
 	int height_mm;
 	/// panel has a mini-LED backlight
 	bool has_mini_led;
-	/// peak panel luminance in nits, for EDR (desktop 26.x; 0 if unknown)
+	/// peak panel luminance in nits, for EDR (0 if unknown or no EDR headroom)
 	u32 peak_nits;
-	/// EDR headroom ceiling x1000 from the ADT (desktop 26.x; 0 if none)
+	/// EDR headroom ceiling x1000 from the ADT (0: the panel has no EDR headroom)
 	u32 edr_ceiling;
 	/// calibrated colour target from the raw ADT; NULL if not given
 	const struct dcp_color_space *color_target;
@@ -939,6 +939,8 @@ struct apple_dcp {
 
 	/* clear all surfaces on init */
 	bool surfaces_cleared;
+	bool boot_surface_pending;
+	bool boot_scanout_reserved;
 
 	/* enable CRC calculation */
 	bool crc_enabled;
@@ -1376,6 +1378,18 @@ static inline void dcp_takeover_adopt_proven(struct apple_dcp *dcp)
 		WRITE_ONCE(dcp->desktop->takeover_adopted, false);
 }
 
+/*
+ * Firmware interfaces whose swaps carry EDR, i.e. that the driver's EDR path
+ * implements (dcp_edr_prepare()): desktop 26.x and firmware 27.  This is the
+ * interface ABI, not the panel: whether a panel has EDR headroom comes from
+ * its ADT (dcp_panel_edr()).
+ */
+static inline bool dcp_fw_swap_has_edr(struct apple_dcp *dcp)
+{
+	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
+	       dcp->fw_compat == DCP_FIRMWARE_V_27_0;
+}
+
 static inline bool dcp_vrr_live(struct apple_dcp *dcp)
 {
 	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && dcp->main_display &&
@@ -1414,12 +1428,20 @@ static inline bool dcp_is_v14_7_external(const struct apple_dcp *dcp)
 }
 
 /*
- * Firmware 27's external processors (the T6050 DCPEXTs): their DP/HDMI
- * audio service is the desktop one, on endpoint 0x2b (see av.c).
+ * Firmware 27's external processors with its own DPTX endpoint layout (the
+ * T6050 and firmware-27 T6041 DCPEXTs, ports on DPTX_ENDPOINT_V2): their
+ * DP/HDMI audio service is the desktop one, on endpoint 0x2b (see av.c).
+ *
+ * A firmware-27 DCP on the classic layout (the T8112 DCPs, whose 27.2
+ * firmware advertises its ports on DPTX_ENDPOINT, dcp_v27_dptx_layout())
+ * has the classic audio service on AV_ENDPOINT: there 0x2b is HDCP only.
+ * The layout is read as set at probe, so that the DP audio driver, which
+ * binds before the DCP starts, sees the same role as the DCP.
  */
 static inline bool dcp_is_v27_external(const struct apple_dcp *dcp)
 {
-	return dcp->fw_compat == DCP_FIRMWARE_V_27_0 && dcp->hw.num_dptx_ports;
+	return dcp->fw_compat == DCP_FIRMWARE_V_27_0 && dcp->hw.num_dptx_ports &&
+	       dcp->hw.dptx_endpoint == DPTX_ENDPOINT_V2;
 }
 
 /* The 14.7 internal panel (J514S/J516S), presented through DCPLink. */
