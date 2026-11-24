@@ -3,10 +3,10 @@
 //! Module parameters and the GET_PARAMS identity.
 //!
 //! With the shared `file.rs` additions (VM_STATUS and VM_STATUS_MIRROR from `supports_vm_status`,
-//! SOFT_FAULTS suppressed by `soft_faults`), the feature word is 0x1c02: per-command input
-//! readiness/errors and exact queue-local historical prefixes use explicit retained inputs
-//! and successful command receipt frontiers. No independent hardware queue reservation,
-//! fragment barriers or ray queries are advertised.
+//! SOFT_FAULTS suppressed by `soft_faults`, VDM_USC_INVALIDATE), the feature word is 0x1c02 plus
+//! bit 40: per-command input readiness/errors and exact queue-local historical prefixes use
+//! explicit retained inputs and successful command receipt frontiers. No independent hardware
+//! queue reservation, fragment barriers or ray queries are advertised.
 
 use kernel::{prelude::*, uapi};
 
@@ -26,6 +26,26 @@ pub(crate) fn deadline_ms() -> u32 {
 /// timeout; it does not disable authenticated firmware fault/recovery handling.
 pub(crate) fn compute_deadline_ms() -> u32 {
     module_parameters::g16_compute_deadline_ms.value()
+}
+
+/// PB heap blocks of a new render arena (64 MiB in 128 KiB blocks).
+pub(crate) fn pb_heap_blocks() -> u32 {
+    64 * 8
+}
+
+/// PB blocks posted to a fresh epoch of a heap of `heap_blocks`.
+pub(crate) fn pb_posted_blocks(heap_blocks: u32) -> u32 {
+    2048u32.min(heap_blocks)
+}
+
+/// Compute units of a VM that submits compute back to back.
+pub(crate) fn compute_units() -> usize {
+    6usize.clamp(2, hw::sizes::COMPUTE_UNITS)
+}
+
+/// Compute commands in flight at most.
+pub(crate) fn compute_flights() -> usize {
+    16usize.clamp(1, hw::sizes::FLIGHTS)
 }
 
 /// Repoll while a ready prefix waits for record consumption, us.
