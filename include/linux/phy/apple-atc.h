@@ -18,7 +18,7 @@ struct phy;
  * The PHY held the controller in reset through the sleep, with its own USB2 and USB3 sides
  * down, and has released the reset: the core's registers are gone whether or not the SoC
  * lost power, and so is xHCI's saved state. The PHY's own sides come back with
- * apple_typec_phy_sleep_power_up(), once the core is set up again.
+ * apple_t6040_atcphy_sleep_power_up(), once the core is set up again.
  */
 #define APPLE_ATCPHY_SLEEP_RESET	2
 
@@ -227,63 +227,5 @@ static inline void apple_t6040_atcphy_sleep_finish(struct phy *usb2_phy, bool ke
 {
 }
 #endif
-
-/*
- * What the controller's glue calls: the driver that @usb2_phy belongs to answers, and the
- * other one doesn't know the PHY. A step that only one of them has is nothing to do for the
- * other's PHYs.
- */
-static inline int apple_typec_phy_sleep_prepare(struct phy *usb2_phy)
-{
-	int ret = apple_atcphy_sleep_prepare(usb2_phy);
-
-	return ret == -EOPNOTSUPP ? apple_t6040_atcphy_sleep_prepare(usb2_phy) : ret;
-}
-
-static inline int apple_typec_phy_sleep_enter(struct phy *usb2_phy)
-{
-	int ret = apple_t6040_atcphy_sleep_enter(usb2_phy);
-
-	return ret == -EOPNOTSUPP ? 0 : ret;
-}
-
-static inline int apple_typec_phy_sleep_result(struct phy *usb2_phy)
-{
-	int ret = apple_atcphy_sleep_result(usb2_phy);
-
-	return ret == -EOPNOTSUPP ? apple_t6040_atcphy_sleep_result(usb2_phy) : ret;
-}
-
-static inline int apple_typec_phy_sleep_power_up(struct phy *usb2_phy)
-{
-	int ret = apple_t6040_atcphy_sleep_power_up(usb2_phy);
-
-	return ret == -EOPNOTSUPP ? 0 : ret;
-}
-
-static inline int apple_typec_phy_sleep_recover(struct phy *usb2_phy)
-{
-	int ret = apple_atcphy_sleep_recover(usb2_phy);
-
-	return ret == -EOPNOTSUPP ? apple_t6040_atcphy_sleep_recover(usb2_phy) : ret;
-}
-
-static inline void apple_typec_phy_sleep_finish(struct phy *usb2_phy, bool kept)
-{
-	apple_atcphy_sleep_finish(usb2_phy, kept);
-	apple_t6040_atcphy_sleep_finish(usb2_phy, kept);
-}
-
-/* The T6040 PHY's finish has nothing to wait for, so it ends at once. */
-static inline void apple_typec_phy_sleep_finish_async(struct phy *usb2_phy, bool kept)
-{
-	apple_atcphy_sleep_finish_async(usb2_phy, kept);
-	apple_t6040_atcphy_sleep_finish(usb2_phy, kept);
-}
-
-static inline void apple_typec_phy_sleep_finish_flush(struct phy *usb2_phy)
-{
-	apple_atcphy_sleep_finish_flush(usb2_phy);
-}
 
 #endif
