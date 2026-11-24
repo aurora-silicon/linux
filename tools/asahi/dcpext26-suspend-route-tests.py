@@ -70,6 +70,8 @@ static void dcp_disable_typec_work(struct apple_dcp *d,bool sync) { disabled++; 
 static void dcp_enable_typec_work(struct apple_dcp *d) { enabled++; }
 static int dcp_external_disconnect(struct apple_dcp *d,bool wait) { return disconnect_error; }
 static void device_set_wakeup_path(struct device *d) { wake_paths++; }
+/* The DP PHY hold has its own test (dcp-sleep-phy-hold-tests.py). */
+static void dcp_sleep_hold_phys(struct apple_dcp *d) { (void)d; }
 static void reset_counts(void) { parks=unparks=wake_paths=disabled=enabled=0; }
 '''
 code = pre + function(header, 'dcp_is_ext26') + '\n' + function(source, 'dcp_is_external_h17p') + '\n' + function(source, 'dcp_is_retained_external')
