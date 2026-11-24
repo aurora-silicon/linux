@@ -269,6 +269,11 @@ MODULE_PARM_DESC(t6050_sd_port_wake,
 #define DOORBELL_ADDR		CONFIG_PCIE_APPLE_MSI_DOORBELL_ADDR
 
 struct hw_info {
+	/*
+	 * A firmware sleep takes the complex's power, and the boot loader brings it and its
+	 * links up again at the wake, as at boot: what Linux set up on top is put back.
+	 */
+	bool sleep_loader_reinit;
 	u32 phy_lane_ctl;
 	u32 port_msiaddr;
 	u32 port_msiaddr_hi;
@@ -311,6 +316,7 @@ struct hw_info {
 };
 
 static const struct hw_info t8103_hw = {
+	.sleep_loader_reinit	= true,
 	.phy_lane_ctl		= PHY_LANE_CTL,
 	.port_msiaddr		= PORT_MSIADDR,
 	.port_msiaddr_hi	= 0,
@@ -605,6 +611,8 @@ struct apple_pcie {
 	struct apple_pcie_neo_cold *neo_cold;
 	struct notifier_block	neo_pm_nb;
 	bool			neo_sleep_armed;
+	/* Ports saved for a firmware sleep that takes the complex's power */
+	bool			fw_slept;
 	struct work_struct	neo_recover_work;
 	bool			neo_recover;
 	/* The link and the functions back after a sleep, while the rest resumes */
@@ -6923,6 +6931,80 @@ static int apple_pcie_check_adopted_s2idle(struct apple_pcie *pcie)
 	return error;
 }
 
+static bool apple_pcie_loader_sleep(struct apple_pcie *pcie)
+{
+	return pcie->hw->sleep_loader_reinit && !pcie->managed_sids && !pcie->neo_sleep_armed &&
+	       pm_suspend_target_state == PM_SUSPEND_MEM && pm_suspend_via_firmware();
+}
+
+/*
+ * hw.sleep_loader_reinit: a firmware sleep takes the whole PCIe complex's power, and the
+ * boot loader brings the complex and its links up again at the wake, as at boot. What
+ * Linux set up on top of that is lost: the ports' clocks, their interrupts and MSI setup,
+ * the RID to SID map.
+ * The root ports and functions are suspended above, and the PCI core restores them.
+ */
+static void apple_pcie_loader_sleep_save(struct apple_pcie *pcie)
+{
+	struct apple_pcie_port *port;
+	int i;
+
+	list_for_each_entry(port, &pcie->ports, entry) {
+		apple_pcie_port_disable_irq(port);
+		port->saved_intmask = apple_pcie_port_readl(port, PORT_INTMSK);
+		for_each_set_bit(i, port->sid_map, port->sid_map_sz)
+			port->saved_rid2sid[i] =
+				apple_pcie_port_readl(port, port_rid2sid_offset(port, i));
+	}
+	pcie->fw_slept = true;
+}
+
+static int apple_pcie_loader_sleep_restore(struct apple_pcie *pcie)
+{
+	struct apple_pcie_port *port;
+	u8 up = 0;
+	int i, ret = 0;
+
+	pcie->fw_slept = false;
+	list_for_each_entry(port, &pcie->ports, entry) {
+		u32 stat;
+
+		if (!(apple_pcie_port_readl(port, PORT_STATUS) & PORT_STATUS_READY)) {
+			dev_err(pcie->dev, "%pOF not set up again after the sleep\n", port->np);
+			ret = -ENODEV;
+			continue;
+		}
+		if (pcie->hw->port_refclk)
+			rmw_clear(PORT_REFCLK_CGDIS, port->base + pcie->hw->port_refclk);
+		else if (port->phy)
+			rmw_set(PHY_LANE_CFG_REFCLKCGEN, port->phy + PHY_LANE_CFG);
+		rmw_clear(PORT_APPCLK_CGDIS, port->base + PORT_APPCLK);
+
+		apple_pcie_tunnel_restore_irq_hw(port);
+		for_each_set_bit(i, port->sid_map, port->sid_map_sz)
+			apple_pcie_rid2sid_write(port, i, port->saved_rid2sid[i]);
+
+		if (!(apple_pcie_port_readl(port, PORT_LINKSTS) & PORT_LINKSTS_UP)) {
+			ret = apple_pcie_setup_link(pcie, port, port->np);
+			if (!ret) {
+				apple_pcie_port_writel(port, PORT_LTSSMCTL_START, PORT_LTSSMCTL);
+				ret = readl_poll_timeout(port->base + PORT_LINKSTS, stat,
+							 stat & PORT_LINKSTS_UP, 1000,
+							 link_up_timeout * USEC_PER_MSEC);
+			}
+			if (ret)
+				dev_err(pcie->dev, "%pOF link not up after the sleep: %d\n",
+					port->np, ret);
+		}
+		if (apple_pcie_port_readl(port, PORT_LINKSTS) & PORT_LINKSTS_UP)
+			up |= BIT(port->idx);
+		apple_pcie_port_writel(port, port->saved_intmask, PORT_INTMSK);
+		apple_pcie_port_enable_irq(port);
+	}
+	dev_info(pcie->dev, "ports set up again after the sleep, links up %#x\n", up);
+	return ret;
+}
+
 static int apple_pcie_suspend_noirq(struct device *dev)
 {
 	struct apple_pcie *pcie = apple_pcie_lookup(dev);
@@ -6988,6 +7070,10 @@ static int apple_pcie_suspend_noirq(struct device *dev)
 		return ret;
 	}
 	if (!pcie->hw->tunneled) {
+		if (apple_pcie_loader_sleep(pcie)) {
+			apple_pcie_loader_sleep_save(pcie);
+			return 0;
+		}
 		if (pm_suspend_no_platform() && pcie->num_pds)
 			return apple_pcie_hold_domains(pcie);
 		return 0;
@@ -7519,8 +7605,17 @@ static int apple_pcie_resume_noirq(struct device *dev)
 		}
 		return ret;
 	}
-	if (!pcie->hw->tunneled)
+	if (!pcie->hw->tunneled) {
+		if (pcie->fw_slept) {
+			if (pm_resume_via_firmware())
+				return apple_pcie_loader_sleep_restore(pcie);
+			/* Refused: nothing lost */
+			pcie->fw_slept = false;
+			list_for_each_entry(port, &pcie->ports, entry)
+				apple_pcie_port_enable_irq(port);
+		}
 		return 0;
+	}
 	if (pcie->resume_failed)
 		return -EIO;
 	/*
