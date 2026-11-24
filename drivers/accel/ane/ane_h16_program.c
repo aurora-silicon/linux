@@ -359,8 +359,10 @@ EXPORT_SYMBOL_GPL(ane_h16_process_bindings);
  * The operation section binds BAR slots to resources: per record, a count at
  * +8 and (slot, tag) pairs from +0xc. A tag is a generic-section ID, or the
  * kernel resource index for a __KERN_0 program. BAR slot s takes its base
- * from the program descriptor qword at +0x10 * (s + 1), so every pair must
- * name the resource whose HWX address is that base. Kernel programs must bind
+ * from the program descriptor qword at +0x10 * (s + 1), or on H14, whose
+ * descriptor has no slot table, from the fixed H14 slots
+ * (ane_h16_hwx_slot_base()), so every pair must name the resource whose HWX
+ * address is that base. Kernel programs must bind
  * the kernel: the legacy tag 2 instead makes the H17 firmware assert and stop
  * answering (H17 harness facts, kernel-table programs).
  */
@@ -408,7 +410,7 @@ int ane_h16_operation_validate(const struct ane_h16_hwx_snapshot *snapshot,
 			if (slot >= 64 || (seen & BIT_ULL(slot)))
 				return -ENOEXEC;
 			seen |= BIT_ULL(slot);
-			base = get_unaligned_le64(c + 0x10 * (slot + 1));
+			base = ane_h16_hwx_slot_base(hwx, c, slot);
 			if (tag == ANE_H16_RESOURCE_KERNEL && hwx->kernel.size) {
 				want = hwx->kernel.vm;
 				kernel_bound = true;
@@ -434,6 +436,8 @@ EXPORT_SYMBOL_GPL(ane_h16_operation_validate);
  * The scratch-backed 0x8c0 form has that tuple plus one intermediate-spill
  * tuple in the kind-3 payload at +0x890.  The two records use independent
  * mcache value types even though both name BAR 4 and their bit ranges overlap.
+ * The H14 0x890 form carries a tuple of its own whose meaning to the firmware
+ * is not known: it sends no record, and the firmware keeps its default DSID.
  */
 int ane_h16_custom_bars(const struct ane_h16_hwx_snapshot *snapshot,
 			const struct ane_h16_hwx *hwx, u32 dsid,
@@ -448,12 +452,16 @@ int ane_h16_custom_bars(const struct ane_h16_hwx_snapshot *snapshot,
 	ret = ane_h16_hwx_snapshot_check(snapshot);
 	if (ret)
 		return ret;
-	if (!hwx->program_offset || snapshot->size < 0x8a0 ||
-	    hwx->program_offset > snapshot->size - 0x8a0)
+	if (!hwx->program_offset || snapshot->size < 0x890 ||
+	    hwx->program_offset > snapshot->size - 0x890)
 		return -ENOEXEC;
 	c = (const u8 *)snapshot->bytes + hwx->program_offset;
 	*count = 0;
 	length = get_unaligned_le32(c + 4);
+	if (length == 0x890 && hwx->subtype == ANE_HWX_SUBTYPE_H14)
+		return 0;
+	if (snapshot->size < 0x8a0 || hwx->program_offset > snapshot->size - 0x8a0)
+		return -ENOEXEC;
 	bar = get_unaligned_le32(c + 0x868);
 	offset = get_unaligned_le32(c + 0x878);
 	width = get_unaligned_le32(c + 0x87c);

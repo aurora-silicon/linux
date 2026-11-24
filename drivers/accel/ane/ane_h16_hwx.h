@@ -10,9 +10,12 @@
 #define ANE_H16_SECTIONS 8
 #define ANE_H16_REGIONS 7
 #define ANE_H16_HWX_MAX (SZ_256M + SZ_1M)
-/* Mach-O CPU subtypes of the two targets that share this container form. */
+/* Mach-O CPU subtypes of the targets that share this container form. */
+#define ANE_HWX_SUBTYPE_H14 5
 #define ANE_HWX_SUBTYPE_H16 7
 #define ANE_HWX_SUBTYPE_H17 9
+/* BAR slots a task record can name (bits 28:23 of a dense record). */
+#define ANE_HWX_BAR_SLOTS 64
 
 struct ane_h16_hwx_section {
 	u64 vm;
@@ -63,6 +66,13 @@ struct ane_h16_hwx {
 
 /* Input must be one immutable kernel-owned snapshot of the original file. */
 int ane_h16_hwx_validate(const void *bytes, size_t size, struct ane_h16_hwx *info);
+
+/*
+ * The HWX address BAR slot @slot of a validated program takes its base from,
+ * or 0 for a slot that names no surface, scratch or kernel. @descriptor is
+ * the program descriptor command in the same snapshot.
+ */
+u64 ane_h16_hwx_slot_base(const struct ane_h16_hwx *info, const void *descriptor, u32 slot);
 
 struct ane_h16_hwx_snapshot {
 	void *bytes;
