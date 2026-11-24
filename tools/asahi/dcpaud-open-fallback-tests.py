@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
-"""Run the real dcp_pcm_open() over plugged, unplugged and unreadable sinks.
+"""Run the real dcp_pcm_open() over plugged, unplugged, replaced and gone sinks.
 
 PipeWire and PulseAudio probe a PCM once when its card appears and drop the
 output for good if the open fails. dcp_pcm_open() opens an unplugged sink
-with a fixed hardware description for that reason. A sink whose DCP audio
-service is between a stop and its next start (the firmware announces it again
-while the display link is set up again) cannot have its elements read; the
-open then takes the same unplugged path instead of failing.
+with a fixed hardware description for that reason. The firmware refuses
+calls to an audio service instance it is replacing (it announces the service
+again while the display link is set up again): the open then reads from the
+successor. A service that is gone opens as unplugged with a cookie no
+connection has, so no later stream op (hw_free, native start) takes the sink as
+connected. Any other failure still fails the open.
 
 The fixture compiles dcp_pcm_open() from drivers/gpu/drm/apple/audio.c against
 mocks of the ALSA and DMA calls. --mutation names a change to the production
@@ -24,11 +26,17 @@ ROOT = Path(__file__).resolve().parents[2]
 AUDIO = 'drivers/gpu/drm/apple/audio.c'
 
 MUTATIONS = {
-    # Fail the open when the sink info cannot be read (the old behaviour).
-    'fail-open': ('\tif (ret < 0) {\n\t\t/*\n\t\t * The service is between',
-                  '\tif (ret < 0) {\n\t\treturn ret;\n\t\t/*\n\t\t * The service is between'),
-    # Open with the unplugged description but treat the stream as plugged.
-    'no-flag': ('\t\tdcpaud->open_unplugged = true;\n', ''),
+    # Fail the open when the instance is being replaced.
+    'no-retry': ('\tif (ret < 0 && dcp_audiosrv_replaced(dcpaud->dcp_dev, gen)) {',
+                 '\tif (0 && gen) {'),
+    # Fail the open when the service is gone.
+    'gone-fails': ('\tif (ret == -ENODEV) {\n\t\t/*\n\t\t * No instance answers',
+                   '\tif (0) {\n\t\t/*\n\t\t * No instance answers'),
+    # Keep the live cookie on a gone service: later ops take it as connected.
+    'keep-cookie': ('\t\tdcpaud->open_cookie = dcpaud->connection_cookie - 1;\n', ''),
+    # Turn every failure into an unplugged open.
+    'mask-all': ('\tif (ret == -ENODEV) {\n\t\t/*\n\t\t * No instance answers',
+                 '\tif (ret < 0) {\n\t\t/*\n\t\t * No instance answers'),
 }
 
 def block(text, start):
@@ -53,6 +61,8 @@ HARNESS = r'''
 #include <stdio.h>
 #include <errno.h>
 #define dev_dbg(...) ((void)0)
+#define IS_ENABLED(x) 1
+typedef unsigned long long u64;
 #define SNDRV_PCM_INFO_MMAP 1u
 #define SNDRV_PCM_INFO_MMAP_VALID 2u
 #define SNDRV_PCM_INFO_INTERLEAVED 4u
@@ -75,13 +85,27 @@ struct snd_pcm { void *private_data; };
 struct snd_pcm_substream { struct snd_pcm *pcm; struct snd_pcm_runtime *runtime; };
 struct snd_dmaengine_dai_dma_data { unsigned int flags; };
 struct dma_chan { int unused; };
-struct dcp_audio { struct device *dev; struct mutex data_lock; bool connected, open_unplugged;
-	unsigned long open_cookie, connection_cookie; struct dma_chan *chan; };
+struct dcp_audio { struct device *dev, *dcp_dev; struct mutex data_lock; bool connected, open_unplugged;
+	unsigned int open_cookie, connection_cookie; struct dma_chan *chan; };
 static const struct snd_pcm_hardware dcp_pcm_hw = { .formats = PLUGGED_FORMATS };
 static const struct snd_pcm_hardware dcp_pcm_hw_unplugged = { .formats = UNPLUGGED_FORMATS };
-static int init_error, info_error, rules, dma_opens;
+static int init_error, info_errors[2], reads, rules, dma_opens;
+static bool replaced, successor_connected;
+static struct dcp_audio *cur;
 static int dcpaud_init_dma(struct dcp_audio *d) { return init_error; }
-static int dcpaud_read_remote_info(struct dcp_audio *d) { return info_error; }
+static int dcpaud_read_remote_info(struct dcp_audio *d) { return info_errors[reads++ ? 1 : 0]; }
+static u64 dcp_audiosrv_instance(struct device *d) { return 4; }
+static bool dcp_audiosrv_replaced(struct device *d, u64 gen)
+{
+	if (gen != 4)
+		return false;
+	if (replaced) {
+		/* the teardown reported the unplug, the successor its sink (or not yet) */
+		cur->connected = successor_connected;
+		cur->connection_cookie += successor_connected ? 1 : 0;
+	}
+	return replaced;
+}
 static int dcpaud_rule_format(void *p, void *r) { return 0; }
 static int dcpaud_rule_channels(void *p, void *r) { return 0; }
 static int dcpaud_rule_rate(void *p, void *r) { return 0; }
@@ -96,17 +120,19 @@ CHECKS = r'''
 static int failures;
 #define CHECK(c) do { if (!(c)) { printf("FAIL line %d (%s: %s)\n", __LINE__, name, #c); failures++; } } while (0)
 
-static int run(const char *name, bool connected, int ierr, int info, struct dcp_audio *d,
-	       struct snd_pcm_runtime *rt)
+static int run(bool connected, int ierr, int e0, int e1, bool repl, bool succ,
+	       struct dcp_audio *d, struct snd_pcm_runtime *rt)
 {
 	static struct snd_pcm pcm;
 	struct snd_pcm_substream s = { .pcm = &pcm, .runtime = rt };
 
-	(void)name;
 	*d = (struct dcp_audio){ .connected = connected, .connection_cookie = 7 };
 	*rt = (struct snd_pcm_runtime){ 0 };
 	pcm.private_data = d;
-	init_error = ierr; info_error = info; rules = dma_opens = 0;
+	cur = d;
+	init_error = ierr; info_errors[0] = e0; info_errors[1] = e1;
+	replaced = repl; successor_connected = succ;
+	reads = rules = dma_opens = 0;
 	return dcp_pcm_open(&s);
 }
 
@@ -117,31 +143,51 @@ int main(void)
 	const char *name;
 
 	name = "plugged";
-	CHECK(run(name, true, 0, 0, &d, &rt) == 0);
-	CHECK(!d.open_unplugged && rules == 3 && dma_opens == 1);
-	CHECK(rt.hw.formats == PLUGGED_FORMATS && d.open_cookie == 7 && !d.data_lock.held);
+	CHECK(run(true, 0, 0, 0, false, false, &d, &rt) == 0);
+	CHECK(!d.open_unplugged && rules == 3 && dma_opens == 1 && reads == 1);
+	CHECK(rt.hw.formats == PLUGGED_FORMATS && dcpaud_connection_up(&d) && !d.data_lock.held);
 
 	name = "unplugged";
-	CHECK(run(name, false, 0, 0, &d, &rt) == 0);
+	CHECK(run(false, 0, 0, 0, false, false, &d, &rt) == 0);
+	CHECK(d.open_unplugged && !rules && !reads && rt.hw.formats == UNPLUGGED_FORMATS);
+	CHECK(!dcpaud_connection_up(&d));
+
+	name = "replaced, successor plugged";
+	CHECK(run(true, 0, -EINVAL, 0, true, true, &d, &rt) == 0);
+	CHECK(!d.open_unplugged && reads == 2 && rules == 3 && dma_opens == 1);
+	CHECK(rt.hw.formats == PLUGGED_FORMATS && dcpaud_connection_up(&d) && d.open_cookie == 8);
+
+	name = "replaced, successor not yet plugged";
+	CHECK(run(true, 0, -EINVAL, 0, true, false, &d, &rt) == 0);
+	CHECK(d.open_unplugged && reads == 1 && !rules && !dcpaud_connection_up(&d));
+
+	name = "replaced, successor refuses too";
+	CHECK(run(true, 0, -EINVAL, -EINVAL, true, true, &d, &rt) == -EINVAL);
+	CHECK(!dma_opens);
+
+	name = "stable service refuses";
+	CHECK(run(true, 0, -EINVAL, 0, false, false, &d, &rt) == -EINVAL);
+	CHECK(!dma_opens && reads == 1);
+
+	name = "persistent error";
+	CHECK(run(true, 0, -ENOMEM, 0, false, false, &d, &rt) == -ENOMEM);
+	CHECK(!dma_opens);
+
+	name = "service gone";
+	CHECK(run(true, 0, -ENODEV, 0, false, false, &d, &rt) == 0);
 	CHECK(d.open_unplugged && !rules && dma_opens == 1 && rt.hw.formats == UNPLUGGED_FORMATS);
-
-	name = "service-restarting";
-	CHECK(run(name, true, 0, -ENODEV, &d, &rt) == 0);
-	CHECK(d.open_unplugged && !rules && dma_opens == 1);
-	CHECK(rt.hw.formats == UNPLUGGED_FORMATS && !d.data_lock.held);
-
-	name = "firmware-refused";
-	CHECK(run(name, true, 0, -EIO, &d, &rt) == 0);
-	CHECK(d.open_unplugged && dma_opens == 1);
+	/* hw_free and native start test only this: the sink is not this open's */
+	CHECK(!dcpaud_connection_up(&d) && !d.data_lock.held);
 
 	name = "no-dma";
-	CHECK(run(name, true, -EPROBE_DEFER_, 0, &d, &rt) == -EPROBE_DEFER_);
+	CHECK(run(true, -EPROBE_DEFER_, 0, 0, false, false, &d, &rt) == -EPROBE_DEFER_);
 	CHECK(!dma_opens && !d.data_lock.held);
 
 	if (failures)
 		return 1;
-	puts("PASS dcp_pcm_open: plugged, unplugged, service restarting and refused element read "
-	     "open (the last two as unplugged), DMA failure still fails");
+	puts("PASS dcp_pcm_open: plugged, unplugged, replaced instance (successor plugged, not yet, "
+	     "refusing), stable refusal and persistent error fail, gone service opens unplugged "
+	     "and never connected, DMA failure fails");
 	return 0;
 }
 '''
@@ -157,7 +203,8 @@ def main():
         assert source.count(old) == 1, args.mutation
         source = source.replace(old, new)
 
-    code = HARNESS + '#define EPROBE_DEFER_ 517\n' + function(source, 'dcp_pcm_open') + CHECKS
+    code = (HARNESS + '#define EPROBE_DEFER_ 517\n' + function(source, 'dcpaud_connection_up') +
+            function(source, 'dcp_pcm_open') + CHECKS)
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / 'check.c'
         path.write_text(code)

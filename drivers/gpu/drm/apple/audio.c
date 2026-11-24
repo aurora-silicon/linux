@@ -410,6 +410,9 @@ static int dcp_pcm_open(struct snd_pcm_substream *substream)
 		.flags = SND_DMAENGINE_PCM_DAI_FLAG_PACK,
 	};
 	struct snd_pcm_hardware hw;
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+	u64 gen;
+#endif
 	int ret;
 
 	mutex_lock(&dcpaud->data_lock);
@@ -428,23 +431,48 @@ static int dcp_pcm_open(struct snd_pcm_substream *substream)
 		goto refine;
 	}
 
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+	gen = dcp_audiosrv_instance(dcpaud->dcp_dev);
+#endif
 	ret = dcpaud_read_remote_info(dcpaud);
-	if (ret < 0) {
-		/*
-		 * The service is between a stop and its next start: the firmware
-		 * announces it again while the display link is set up again (a
-		 * modeset), and it refuses the element read meanwhile. Open as for
-		 * an unplugged sink rather than fail, which would drop the output
-		 * for good (see dcp_pcm_hw_unplugged).
-		 */
-		dev_dbg(dcpaud->dev, "sink info not readable (%d), opening as unplugged\n",
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+	/*
+	 * The firmware announces the audio service again while the display
+	 * link is set up again (a modeset, at boot), and refuses calls to the
+	 * instance it is replacing meanwhile. Userspace probes the PCM once
+	 * and drops an output whose open fails, so read from the successor.
+	 * The sink is taken as the successor reports it.
+	 */
+	if (ret < 0 && dcp_audiosrv_replaced(dcpaud->dcp_dev, gen)) {
+		dev_dbg(dcpaud->dev, "sink info read failed on a replaced instance (%d), retrying\n",
 			ret);
 		mutex_lock(&dcpaud->data_lock);
+		dcpaud->open_unplugged = !dcpaud->connected;
+		dcpaud->open_cookie = dcpaud->connection_cookie;
+		mutex_unlock(&dcpaud->data_lock);
+		if (dcpaud->open_unplugged) {
+			hw = dcp_pcm_hw_unplugged;
+			goto refine;
+		}
+		ret = dcpaud_read_remote_info(dcpaud);
+	}
+#endif
+	if (ret == -ENODEV) {
+		/*
+		 * No instance answers: the service went and its unplug is on the
+		 * way. Open as unplugged, as before the plug, and with a cookie
+		 * no connection has, so that no stream op of this open takes the
+		 * sink as connected.
+		 */
+		mutex_lock(&dcpaud->data_lock);
 		dcpaud->open_unplugged = true;
+		dcpaud->open_cookie = dcpaud->connection_cookie - 1;
 		mutex_unlock(&dcpaud->data_lock);
 		hw = dcp_pcm_hw_unplugged;
 		goto refine;
 	}
+	if (ret < 0)
+		return ret;
 
 	snd_pcm_hw_rule_add(substream->runtime, 0, SNDRV_PCM_HW_PARAM_FORMAT,
 			    dcpaud_rule_format, dcpaud,

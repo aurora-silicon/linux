@@ -342,6 +342,37 @@ static int av_audiosrv_call(struct apple_epic_service *srv, u32 command, const v
 /* How long an Open refused by an instance being replaced waits for the next one */
 #define AV_AUDIOSRV_REPLACE_MS	1000
 
+/* The audio service instance now published, as dcp_audiosrv_replaced() takes it. */
+u64 dcp_audiosrv_instance(struct device *dev)
+{
+	struct apple_dcp *dcp = dev_get_drvdata(dev);
+	struct audiosrv_data *asrv = dcp->audiosrv;
+
+	if (!asrv)
+		return 0;
+	guard(rwsem_read)(&asrv->srv_rwsem);
+	return asrv->gen;
+}
+
+/*
+ * Whether instance @gen has a published successor, waiting for one as
+ * dcp_audiosrv_open() does: the firmware refuses calls to an instance it is
+ * replacing, and publishes the successor within some hundred milliseconds.
+ */
+bool dcp_audiosrv_replaced(struct device *dev, u64 gen)
+{
+	struct apple_dcp *dcp = dev_get_drvdata(dev);
+	struct audiosrv_data *asrv = dcp->audiosrv;
+
+	if (!asrv)
+		return false;
+	wait_event_timeout(asrv->gen_wq,
+			   READ_ONCE(asrv->srv) && READ_ONCE(asrv->gen) != gen,
+			   msecs_to_jiffies(AV_AUDIOSRV_REPLACE_MS));
+	guard(rwsem_read)(&asrv->srv_rwsem);
+	return asrv->srv && asrv->gen != gen;
+}
+
 /*
  * The 14.7 external role: the service is open while a PCM is (see
  * av_service_connect()). The instance the PCM opened is kept under open_lock,
