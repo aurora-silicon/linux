@@ -762,6 +762,17 @@ ane_t6021_chman_entry_ok(const struct ane_t6021_chman_desc *d,
 	       d->ring == ipc_dva + s->off;
 }
 
+/*
+ * The firmware sizes the 'IPC ' surface itself (SCRATCH1 + 1 after READY).
+ * The 13.5 firmware asks for room for the fixed layout above. A smaller
+ * request cannot hold that layout: such firmware publishes its own 27.x
+ * descriptor table and returns its DVA at DONE (ane_fw_channels_parse()).
+ */
+static inline bool ane_t6021_chman_published(u64 ipc_size)
+{
+	return ipc_size < ANE_T6021_CHMAN_TOTAL;
+}
+
 /* Bitmask of mismatching entries (0 = the whole table validated). */
 static inline unsigned int
 ane_t6021_chman_check(const struct ane_t6021_chman_desc *t, u64 ipc_dva)

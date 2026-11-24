@@ -359,8 +359,9 @@ EXPORT_SYMBOL_GPL(ane_h16_process_bindings);
  * The operation section binds BAR slots to resources: per record, a count at
  * +8 and (slot, tag) pairs from +0xc. A tag is a generic-section ID, or the
  * kernel resource index for a __KERN_0 program. BAR slot s takes its base
- * from the program descriptor qword at +0x10 * (s + 1), so every pair must
- * name the resource whose HWX address is that base. Kernel programs must bind
+ * from the program descriptor qword at +0x10 * (s + 1) (ane_h16_hwx_slot_base()),
+ * so every pair must name the resource whose HWX address is that base; the
+ * kernel resource is the __KERN_0 section, or __TEXT/__const without one. Kernel programs must bind
  * the kernel: the legacy tag 2 instead makes the H17 firmware assert and stop
  * answering (H17 harness facts, kernel-table programs).
  */
@@ -408,10 +409,13 @@ int ane_h16_operation_validate(const struct ane_h16_hwx_snapshot *snapshot,
 			if (slot >= 64 || (seen & BIT_ULL(slot)))
 				return -ENOEXEC;
 			seen |= BIT_ULL(slot);
-			base = get_unaligned_le64(c + 0x10 * (slot + 1));
+			base = ane_h16_hwx_slot_base(hwx, c, slot);
 			if (tag == ANE_H16_RESOURCE_KERNEL && hwx->kernel.size) {
 				want = hwx->kernel.vm;
 				kernel_bound = true;
+			} else if (tag == ANE_H16_RESOURCE_KERNEL) {
+				/* LOAD slot 1 carries __TEXT/__const without a kernel. */
+				want = hwx->constants.vm;
 			} else if (scratch && hwx->scratch.size && tag == scratch->index) {
 				want = scratch->hwx_vm;
 			} else {
@@ -434,6 +438,8 @@ EXPORT_SYMBOL_GPL(ane_h16_operation_validate);
  * The scratch-backed 0x8c0 form has that tuple plus one intermediate-spill
  * tuple in the kind-3 payload at +0x890.  The two records use independent
  * mcache value types even though both name BAR 4 and their bit ranges overlap.
+ * The H14 0x890 form carries a tuple of its own whose meaning to the firmware
+ * is not known: it sends no record, and the firmware keeps its default DSID.
  */
 int ane_h16_custom_bars(const struct ane_h16_hwx_snapshot *snapshot,
 			const struct ane_h16_hwx *hwx, u32 dsid,
@@ -448,12 +454,16 @@ int ane_h16_custom_bars(const struct ane_h16_hwx_snapshot *snapshot,
 	ret = ane_h16_hwx_snapshot_check(snapshot);
 	if (ret)
 		return ret;
-	if (!hwx->program_offset || snapshot->size < 0x8a0 ||
-	    hwx->program_offset > snapshot->size - 0x8a0)
+	if (!hwx->program_offset || snapshot->size < 0x890 ||
+	    hwx->program_offset > snapshot->size - 0x890)
 		return -ENOEXEC;
 	c = (const u8 *)snapshot->bytes + hwx->program_offset;
 	*count = 0;
 	length = get_unaligned_le32(c + 4);
+	if (length == 0x890 && hwx->subtype == ANE_HWX_SUBTYPE_H14)
+		return 0;
+	if (snapshot->size < 0x8a0 || hwx->program_offset > snapshot->size - 0x8a0)
+		return -ENOEXEC;
 	bar = get_unaligned_le32(c + 0x868);
 	offset = get_unaligned_le32(c + 0x878);
 	width = get_unaligned_le32(c + 0x87c);
@@ -1061,6 +1071,36 @@ static int h16_failed_load(struct ane_h16_session *s, struct ane_h16_program *p,
 	return h16_fail(s, error);
 }
 
+static unsigned int h16_dump_fwlog(struct ane_h16_session *s);
+
+/*
+ * A LOAD or CREATE the firmware refused or answered with something else:
+ * log what it sent back, so a refusal says why. The header (status in its
+ * top 16 bits), the ID words, then the first reply qword that differs from
+ * the request and its offset; then the firmware's own log.
+ */
+static void h16_log_reply(struct ane_h16_session *s, const char *what, const u8 *request,
+			  const u8 *reply, size_t length, size_t id_offset)
+{
+	size_t off;
+
+	if (!reply) {
+		s->ops->log(s->ctx, what, 0, 0);
+		return;
+	}
+	s->transport->ops->read_barrier(s->transport->ctx);
+	s->ops->log(s->ctx, what, get_unaligned_le64(reply),
+		    get_unaligned_le64(reply + id_offset));
+	for (off = 8; off + 8 <= length; off += 8)
+		if (off != id_offset &&
+		    get_unaligned_le64(reply + off) != get_unaligned_le64(request + off))
+			break;
+	if (off + 8 <= length)
+		s->ops->log(s->ctx, "reply differs from the request at", off,
+			    get_unaligned_le64(reply + off));
+	h16_dump_fwlog(s);
+}
+
 /*
  * On this firmware family a direct EXECUTE reuses the BAR context of the
  * program the engine ran last, so the first EXECUTE of a program writes into
@@ -1082,7 +1122,7 @@ int ane_h16_session_load(struct ane_h16_session *s,
 	struct h16_program_binds binds = {};
 	struct ane_h16_program *p;
 	u8 *command;
-	const u8 *reply;
+	const u8 *reply = NULL;
 	unsigned int i;
 	int ret;
 
@@ -1158,11 +1198,14 @@ int ane_h16_session_load(struct ane_h16_session *s,
 		ret = ane_h16_load_reply(reply, ANE_H16_LOAD_SIZE, command, &p->key.program);
 	if (ret) {
 		s->ops->log(s->ctx, "LOAD refused", (u64)-ret, 0);
+		h16_log_reply(s, "LOAD reply header, ID", command, reply, ANE_H16_LOAD_SIZE,
+			      ANE_H16_LOAD_ID_OFFSET);
 		ret = h16_failed_load(s, p, ret);
 		goto out;
 	}
 	s->ops->log(s->ctx, "LOAD program", p->key.program, p->bar_count);
 	ret = ane_h16_create_encode(command, ANE_H16_CREATE_SIZE, p->key.program);
+	reply = NULL;
 	if (!ret)
 		ret = h16_send_at(s, ANE_FW_IO, command, ANE_H16_CREATE_SIZE,
 				  h16_record_at(s, p, true), &reply);
@@ -1171,6 +1214,8 @@ int ane_h16_session_load(struct ane_h16_session *s,
 					   &p->key.process);
 	if (ret) {
 		s->ops->log(s->ctx, "CREATE refused", (u64)-ret, 0);
+		h16_log_reply(s, "CREATE reply header, program", command, reply,
+			      ANE_H16_CREATE_SIZE, 8);
 		ret = h16_failed_load(s, p, ret);
 		goto out;
 	}

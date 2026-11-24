@@ -138,6 +138,8 @@ static inline int ane_fw_heap_tail(const u64 dva[2], const u64 size[2], u64 limi
 /* The exact /chosen/apple,ane-cold-boot value a raw loader boot publishes. */
 #define ANE_FW_COLD_BOOT_EVIDENCE "raw-no-xnu-ane-untouched-v1"
 
+bool ane_fw_raw_boot(void);
+
 /*
  * What the loader handed off, as read from the DT and the TEXT segment, and
  * the live state of the engine. marker is /chosen/apple,ane-cold-boot or

@@ -5,6 +5,7 @@
 
 #include "ane_fw_protocol.h"
 #include "ane_h16_protocol.h"
+#include "ane_t6021_boot.h"
 
 static void ane_h16_id_table_test(struct kunit *test)
 {
@@ -233,6 +234,180 @@ static void ane_channel_rejections_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, ane_fw_contains(16, 64, 16, 65));
 }
 
+/* The H14 IPC size the native 27.2 firmware asks for, and its table DVA. */
+#define TEST_H14_IPC_SIZE 0xc441
+#define TEST_H14_IPC_DVA 0xff7b0000ULL
+
+/* A 27.x table at the base of an H14-sized IPC surface. */
+static u8 *ane_test_h14_table(struct kunit *test)
+{
+	static const u32 types[ANE_FW_CHANNELS] = { 2, 0, 0, 0, 1, 1, 1, 0 };
+	u8 *ipc = kunit_kzalloc(test, TEST_H14_IPC_SIZE, GFP_KERNEL);
+	unsigned int i;
+
+	if (!ipc)
+		return NULL;
+	for (i = 0; i < ANE_FW_CHANNELS; i++) {
+		u8 *d = ipc + i * ANE_FW_DESCRIPTOR_SIZE;
+
+		strscpy((char *)d, ane_fw_channel_name(i), 64);
+		put_unaligned_le32(types[i], d + 0x40);
+		put_unaligned_le32(i, d + 0x44);
+		put_unaligned_le64(0x10, d + 0x48);
+		put_unaligned_le64(TEST_H14_IPC_DVA + ANE_FW_TABLE_SIZE + i * 0x400,
+				   d + 0x50);
+	}
+	return ipc;
+}
+
+/* The 13.5 layout, as the 13.5 firmware writes it at the IPC base. */
+static u8 *ane_test_static_table(struct kunit *test, u64 dva)
+{
+	u8 *ipc = kunit_kzalloc(test, ANE_T6021_CHMAN_TOTAL, GFP_KERNEL);
+	unsigned int i;
+
+	if (!ipc)
+		return NULL;
+	for (i = 0; i < ANE_T6021_CHMAN_COUNT; i++) {
+		const struct ane_t6021_chman_static *s = &ane_t6021_chman_layout[i];
+		struct ane_t6021_chman_desc *d = (void *)ipc + i * ANE_FW_DESCRIPTOR_SIZE;
+
+		strscpy(d->name, s->name, sizeof(d->name));
+		d->type = s->type;
+		d->bit = s->bit;
+		d->size = s->size;
+		d->ring = dva + s->off;
+	}
+	return ipc;
+}
+
+static void ane_h14_layout_select_test(struct kunit *test)
+{
+	struct ane_fw_channel channels[ANE_FW_CHANNELS];
+	u8 *snapshot = kunit_kzalloc(test, ANE_FW_TABLE_SIZE, GFP_KERNEL);
+	u8 *ipc = ane_test_h14_table(test);
+	u8 *legacy = ane_test_static_table(test, TEST_H14_IPC_DVA);
+	u64 offset = U64_MAX;
+
+	KUNIT_ASSERT_NOT_NULL(test, snapshot);
+	KUNIT_ASSERT_NOT_NULL(test, ipc);
+	KUNIT_ASSERT_NOT_NULL(test, legacy);
+	/* The firmware's own IPC request selects the layout. */
+	KUNIT_EXPECT_TRUE(test, ane_t6021_chman_published(TEST_H14_IPC_SIZE));
+	KUNIT_EXPECT_TRUE(test, ane_t6021_chman_published(0x4000));
+	KUNIT_EXPECT_FALSE(test, ane_t6021_chman_published(ANE_T6021_CHMAN_TOTAL));
+	KUNIT_EXPECT_FALSE(test, ane_t6021_chman_published(ANE_T6021_CHMAN_TOTAL + 1));
+
+	/* 27.x: the table at the DONE address inside the requested surface. */
+	KUNIT_ASSERT_EQ(test, ane_fw_channels_snapshot(ipc, TEST_H14_IPC_DVA,
+						       TEST_H14_IPC_SIZE,
+						       TEST_H14_IPC_DVA, snapshot,
+						       &offset, channels), 0);
+	KUNIT_EXPECT_EQ(test, offset, 0ULL);
+	KUNIT_EXPECT_EQ(test, memcmp(snapshot, ipc, ANE_FW_TABLE_SIZE), 0);
+	KUNIT_EXPECT_EQ(test, channels[1].offset, (u64)ANE_FW_TABLE_SIZE + 0x400);
+	KUNIT_EXPECT_EQ(test, channels[1].bit, 1U);
+	KUNIT_EXPECT_EQ(test, channels[5].type, 1U);
+	KUNIT_EXPECT_EQ(test, channels[7].slots, 0x10U);
+	/* The same table is not the 13.5 layout. */
+	KUNIT_EXPECT_NE(test, ane_t6021_chman_check((const void *)ipc,
+						    TEST_H14_IPC_DVA), 0U);
+
+	/* 13.5: a full-size request keeps the static layout. */
+	KUNIT_EXPECT_EQ(test, ane_t6021_chman_check((const void *)legacy,
+						    TEST_H14_IPC_DVA), 0U);
+	KUNIT_EXPECT_TRUE(test, ane_t6021_chman_host_init(legacy, ANE_T6021_CHMAN_TOTAL,
+							  TEST_H14_IPC_DVA));
+	/* The static layout never fits a 27.x-sized request. */
+	KUNIT_EXPECT_FALSE(test, ane_t6021_chman_host_init(legacy, TEST_H14_IPC_SIZE,
+							   TEST_H14_IPC_DVA));
+}
+
+static void ane_h14_table_rejections_test(struct kunit *test)
+{
+	struct ane_fw_channel channels[ANE_FW_CHANNELS] = {};
+	u8 *snapshot = kunit_kzalloc(test, ANE_FW_TABLE_SIZE, GFP_KERNEL);
+	u8 *ipc = ane_test_h14_table(test);
+	u8 *d;
+	u64 offset = 0;
+
+	KUNIT_ASSERT_NOT_NULL(test, snapshot);
+	KUNIT_ASSERT_NOT_NULL(test, ipc);
+	/* DONE address outside the surface, or a table crossing its end. */
+	KUNIT_EXPECT_EQ(test, ane_fw_channels_snapshot(ipc, TEST_H14_IPC_DVA,
+						       TEST_H14_IPC_SIZE, 0, snapshot,
+						       &offset, channels), -EPROTO);
+	KUNIT_EXPECT_EQ(test, ane_fw_channels_snapshot(ipc, TEST_H14_IPC_DVA,
+						       TEST_H14_IPC_SIZE,
+						       TEST_H14_IPC_DVA + TEST_H14_IPC_SIZE -
+						       ANE_FW_TABLE_SIZE + 1,
+						       snapshot, &offset, channels),
+			-EPROTO);
+	KUNIT_EXPECT_EQ(test, ane_fw_channels_snapshot(NULL, TEST_H14_IPC_DVA,
+						       TEST_H14_IPC_SIZE,
+						       TEST_H14_IPC_DVA, snapshot,
+						       &offset, channels), -EPROTO);
+	/* A ring past the requested size. */
+	d = ipc + 7 * ANE_FW_DESCRIPTOR_SIZE;
+	put_unaligned_le64(TEST_H14_IPC_DVA + 0xc400, d + 0x50);
+	KUNIT_EXPECT_EQ(test, ane_fw_channels_snapshot(ipc, TEST_H14_IPC_DVA,
+						       TEST_H14_IPC_SIZE,
+						       TEST_H14_IPC_DVA, snapshot,
+						       &offset, channels), -EPROTO);
+	put_unaligned_le64(TEST_H14_IPC_DVA + ANE_FW_TABLE_SIZE + 7 * 0x400, d + 0x50);
+	/* A duplicate name, then an unknown one. */
+	strscpy((char *)d, "IO", 64);
+	KUNIT_EXPECT_EQ(test, ane_fw_channels_snapshot(ipc, TEST_H14_IPC_DVA,
+						       TEST_H14_IPC_SIZE,
+						       TEST_H14_IPC_DVA, snapshot,
+						       &offset, channels), -EPROTO);
+	strscpy((char *)d, "IPC", 64);
+	KUNIT_EXPECT_EQ(test, ane_fw_channels_snapshot(ipc, TEST_H14_IPC_DVA,
+						       TEST_H14_IPC_SIZE,
+						       TEST_H14_IPC_DVA, snapshot,
+						       &offset, channels), -EPROTO);
+	/* A rejected table leaves the caller's channels untouched. */
+	KUNIT_EXPECT_EQ(test, channels[1].slots, 0U);
+}
+
+static void ane_fw_host_command_test(struct kunit *test)
+{
+	static const struct { u16 id, size; } startup[] = {
+		{ 0x4, 12 }, { 0x0, 12 }, { 0x3, 16 }, { 0x22, 100 },
+	};
+	u8 *command = kunit_kzalloc(test, 0x1c0, GFP_KERNEL);
+	unsigned int i;
+	u16 id, size;
+
+	KUNIT_ASSERT_NOT_NULL(test, command);
+	for (i = 0; ane_fw_startup_command(i, &id, &size); i++) {
+		KUNIT_ASSERT_LT(test, i, (unsigned int)ARRAY_SIZE(startup));
+		KUNIT_EXPECT_EQ(test, id, startup[i].id);
+		KUNIT_EXPECT_EQ(test, size, startup[i].size);
+		memset(command, 0xff, 0x1c0);
+		KUNIT_EXPECT_EQ(test, ane_fw_host_command_prepare(command, size, id,
+								  true, 9), 0);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(command), 0U);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le16(command + 4), id);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le16(command + 6), 0);
+		KUNIT_EXPECT_EQ(test, ane_fw_host_command_prepare(command, size + 1, id,
+								  true, 1), -EINVAL);
+		KUNIT_EXPECT_EQ(test, ane_fw_host_command_prepare(command, size, id,
+								  false, 1), -EINVAL);
+	}
+	KUNIT_EXPECT_EQ(test, i, (unsigned int)ARRAY_SIZE(startup));
+	/* 13.5-only and mode commands never go out in the 27.x format. */
+	KUNIT_EXPECT_EQ(test, ane_fw_host_command_prepare(command, 0x18, 0x1f,
+							  true, 1), -EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, ane_fw_host_command_prepare(command, 0x18, 0x27,
+							  true, 1), -EOPNOTSUPP);
+	/* Program commands keep the H16 shape and ring checks. */
+	KUNIT_EXPECT_EQ(test, ane_fw_host_command_prepare(command, 0x1c0, 0x200,
+							  true, 1), 0);
+	KUNIT_EXPECT_EQ(test, ane_fw_host_command_prepare(command, 0x1c0, 0x200,
+							  true, 7), -EINVAL);
+}
+
 static void ane_reply_status_test(struct kunit *test)
 {
 	u8 command[16] = {};
@@ -356,6 +531,9 @@ static struct kunit_case ane_protocol_cases[] = {
 	KUNIT_CASE(ane_dynamic_channels_test),
 	KUNIT_CASE(ane_channel_snapshot_test),
 	KUNIT_CASE(ane_channel_rejections_test),
+	KUNIT_CASE(ane_h14_layout_select_test),
+	KUNIT_CASE(ane_h14_table_rejections_test),
+	KUNIT_CASE(ane_fw_host_command_test),
 	KUNIT_CASE(ane_reply_status_test),
 	KUNIT_CASE(ane_finished_event_test),
 	KUNIT_CASE(ane_rtk_order_test),

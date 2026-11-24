@@ -11,6 +11,8 @@
 
 #include "ane_h16_hwx_test_fixture.h"
 #include "ane_h16_add128_fixture.h"
+#include "ane_h14_add_fixture.h"
+#include "ane_h14_chain_fixture.h"
 #include "ane_h17_mobilenet_fixture.h"
 
 #define FW_IPC_DVA 0x100003d0000ULL
@@ -74,6 +76,8 @@ struct prog_fw {
 	u64 last_sync_dva;
 	/* The EXECUTE failure trace lines, by step. */
 	u64 fail_step, fail_flags, fail_reports, fail_state, fail_other;
+	/* The reply header and ID words logged for a refused LOAD. */
+	u64 load_reply, load_reply_id;
 	/* EXECUTE of a program or process this firmware never created fails. */
 	bool strict;
 	unsigned int replay_failed;
@@ -381,6 +385,9 @@ static void fw_log(void *ctx, const char *item, u64 a, u64 b)
 		f->fail_other = a;
 	} else if (!strcmp(item, "PROGRAM REPLAY FAILED")) {
 		f->replay_failed++;
+	} else if (!strcmp(item, "LOAD reply header, ID")) {
+		f->load_reply = a;
+		f->load_reply_id = b;
 	}
 }
 
@@ -457,7 +464,8 @@ static struct prog_fw *fw_create_family(struct kunit *test, unsigned int family)
 	f->test = test;
 	init_waitqueue_head(&f->pipeline_wake);
 	f->soc.chip_family = family;
-	f->soc.hwx_subtype = family == 17 ? ANE_HWX_SUBTYPE_H17 : ANE_HWX_SUBTYPE_H16;
+	f->soc.hwx_subtype = family == 17 ? ANE_HWX_SUBTYPE_H17 :
+			     family == 14 ? ANE_HWX_SUBTYPE_H14 : ANE_HWX_SUBTYPE_H16;
 	f->soc.doorbell = 0x1884000;
 	f->soc.irq_status = 0x188c000;
 	f->soc.irq_ack = 0x1890000;
@@ -860,6 +868,240 @@ static void program_add128_hwx_test(struct kunit *test)
 	}
 	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
 	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), 0);
+}
+
+/* The H14 add program and the sections h16-sections.py builds for it. */
+static struct ane_h16_hwx_snapshot *h14_add(struct kunit *test, const void *aux[],
+					    size_t aux_size[])
+{
+	struct ane_h16_hwx_snapshot *snapshot;
+	u8 *hwx;
+
+	hwx = sparse_bytes(test, h14_add_hwx_runs, ARRAY_SIZE(h14_add_hwx_runs),
+			   H14_ADD_HWX_SIZE);
+	aux[0] = sparse_bytes(test, h14_add_generic_runs, ARRAY_SIZE(h14_add_generic_runs),
+			      H14_ADD_GENERIC_SIZE);
+	aux[1] = sparse_bytes(test, h14_add_operation_runs,
+			      ARRAY_SIZE(h14_add_operation_runs), H14_ADD_OPERATION_SIZE);
+	aux[2] = sparse_bytes(test, h14_add_procedure_runs,
+			      ARRAY_SIZE(h14_add_procedure_runs), H14_ADD_PROCEDURE_SIZE);
+	aux[3] = sparse_bytes(test, h14_add_properties_runs,
+			      ARRAY_SIZE(h14_add_properties_runs), H14_ADD_PROPERTIES_SIZE);
+	aux_size[0] = H14_ADD_GENERIC_SIZE;
+	aux_size[1] = H14_ADD_OPERATION_SIZE;
+	aux_size[2] = H14_ADD_PROCEDURE_SIZE;
+	aux_size[3] = H14_ADD_PROPERTIES_SIZE;
+	snapshot = kunit_kzalloc(test, sizeof(*snapshot), GFP_KERNEL);
+	if (!hwx || !aux[0] || !aux[1] || !aux[2] || !aux[3] || !snapshot ||
+	    ane_h16_hwx_snapshot_create(hwx, H14_ADD_HWX_SIZE, snapshot) ||
+	    kunit_add_action_or_reset(test, snapshot_free, snapshot))
+		return NULL;
+	return snapshot;
+}
+
+/*
+ * The H14 container: a 0x890-byte descriptor whose BAR slot table starts at
+ * slot 1, eight-word task headers, segments a, b (inputs) then y (output).
+ * Slot 1 binds the __TEXT/__const coefficients, slot 4 the first input, slot
+ * 5 the output and slot 6 the second input; the program loads and runs on an
+ * H14 session with no custom BAR record. A descriptor whose output slot is
+ * empty is refused.
+ */
+static void program_h14_add_hwx_test(struct kunit *test)
+{
+	static const u32 ids[3] = { 5, 6, 4 }, classes[3] = { 0, 0, 1 };
+	struct prog_fw *f = fw_create_family(test, 14);
+	struct ane_h16_hwx_snapshot *snapshot, bad = {};
+	struct ane_h16_program *p = NULL;
+	const void *aux[ANE_H16_AUX_COUNT];
+	size_t aux_size[ANE_H16_AUX_COUNT];
+	const u8 *descriptor;
+	unsigned int i;
+	u8 *copy;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	snapshot = h14_add(test, aux, aux_size);
+	KUNIT_ASSERT_NOT_NULL(test, snapshot);
+	KUNIT_ASSERT_MEMEQ(test, snapshot->digest, h14_add_hwx_sha256, SHA256_DIGEST_SIZE);
+	KUNIT_EXPECT_EQ(test, snapshot->info.subtype, ANE_HWX_SUBTYPE_H14);
+	KUNIT_EXPECT_EQ(test, snapshot->info.tasks, 1);
+	KUNIT_EXPECT_EQ(test, snapshot->info.kernel.size, 0);
+	descriptor = (const u8 *)snapshot->bytes + snapshot->info.program_offset;
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_slot_base(&snapshot->info, descriptor, 1),
+			snapshot->info.constants.vm);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_slot_base(&snapshot->info, descriptor, 4),
+			snapshot->info.surfaces[0].section.vm);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_slot_base(&snapshot->info, descriptor, 5),
+			snapshot->info.surfaces[2].section.vm);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_slot_base(&snapshot->info, descriptor, 6),
+			snapshot->info.surfaces[1].section.vm);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_slot_base(&snapshot->info, descriptor, 3), 0);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_slot_base(&snapshot->info, descriptor, 7), 0);
+
+	copy = kunit_kmalloc(test, H14_ADD_HWX_SIZE, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, copy);
+	memcpy(copy, snapshot->bytes, H14_ADD_HWX_SIZE);
+	memset(copy + snapshot->info.program_offset + 0x60, 0, 8);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_snapshot_create(copy, H14_ADD_HWX_SIZE, &bad), -ENOEXEC);
+
+	KUNIT_ASSERT_EQ(test, ane_h16_session_load(&f->s, snapshot, aux, aux_size, &p), 0);
+	KUNIT_ASSERT_NOT_NULL(test, p);
+	KUNIT_EXPECT_EQ(test, p->hwx.surface_count, 3);
+	KUNIT_EXPECT_EQ(test, p->hwx.surfaces[2].direction, 2);
+	KUNIT_EXPECT_EQ(test, p->bar_count, 0);
+	expect_slot(test, f->load, 0, 1002, 4, p->aux[0].dva, H14_ADD_GENERIC_SIZE);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(f->load + ANE_H16_LOAD_SLOT_OFFSET +
+						 2 * ANE_H16_LOAD_SLOT_SIZE + 0x20),
+			p->hwx.text.size);
+	expect_slot(test, f->load, 3, 1003, 4, p->aux[1].dva, H14_ADD_OPERATION_SIZE);
+	expect_slot(test, f->load, 4, 1004, 4, p->aux[2].dva, H14_ADD_PROCEDURE_SIZE);
+	expect_slot(test, f->load, 6, 1005, 4, p->aux[3].dva, H14_ADD_PROPERTIES_SIZE);
+	KUNIT_EXPECT_EQ(test, f->writable_maps, 1);
+
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x28), 3);
+	for (i = 0; i < 3; i++) {
+		const u8 *d = f->exec + 0x60 + i * 0x30;
+
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(d + 4), ids[i]);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(d + 8), classes[i]);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le64(d + 0x18), p->surfaces[i]->dva);
+	}
+	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), 0);
+}
+
+/*
+ * A two-layer H14 linked convolution: its kernel-DMA records name slot 1
+ * (the __TEXT/__const coefficients) and the layers meet in the __DATA
+ * scratch (slot 3). The validator takes both slots from the descriptor's
+ * table, and the operation section binds slot 1 to the kernel resource:
+ * the program has no __KERN_0, and LOAD slot 1 carries those constants.
+ */
+static void program_h14_chain_hwx_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create_family(test, 14);
+	struct ane_h16_hwx_snapshot *snapshot;
+	struct ane_h16_program *p = NULL;
+	const void *aux[ANE_H16_AUX_COUNT];
+	size_t aux_size[ANE_H16_AUX_COUNT];
+	const u8 *descriptor;
+	u8 *hwx;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	hwx = sparse_bytes(test, h14_chain_hwx_runs, ARRAY_SIZE(h14_chain_hwx_runs),
+			   H14_CHAIN_HWX_SIZE);
+	aux[0] = sparse_bytes(test, h14_chain_generic_runs,
+			      ARRAY_SIZE(h14_chain_generic_runs), H14_CHAIN_GENERIC_SIZE);
+	aux[1] = sparse_bytes(test, h14_chain_operation_runs,
+			      ARRAY_SIZE(h14_chain_operation_runs), H14_CHAIN_OPERATION_SIZE);
+	aux[2] = sparse_bytes(test, h14_chain_procedure_runs,
+			      ARRAY_SIZE(h14_chain_procedure_runs), H14_CHAIN_PROCEDURE_SIZE);
+	aux[3] = sparse_bytes(test, h14_chain_properties_runs,
+			      ARRAY_SIZE(h14_chain_properties_runs), H14_CHAIN_PROPERTIES_SIZE);
+	aux_size[0] = H14_CHAIN_GENERIC_SIZE;
+	aux_size[1] = H14_CHAIN_OPERATION_SIZE;
+	aux_size[2] = H14_CHAIN_PROCEDURE_SIZE;
+	aux_size[3] = H14_CHAIN_PROPERTIES_SIZE;
+	snapshot = kunit_kzalloc(test, sizeof(*snapshot), GFP_KERNEL);
+	KUNIT_ASSERT_TRUE(test, hwx && aux[0] && aux[1] && aux[2] && aux[3] && snapshot);
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_snapshot_create(hwx, H14_CHAIN_HWX_SIZE, snapshot), 0);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, snapshot_free, snapshot), 0);
+	KUNIT_ASSERT_MEMEQ(test, snapshot->digest, h14_chain_hwx_sha256, SHA256_DIGEST_SIZE);
+	KUNIT_EXPECT_EQ(test, snapshot->info.tasks, 2);
+	KUNIT_EXPECT_EQ(test, snapshot->info.kernel.size, 0);
+	KUNIT_ASSERT_NE(test, snapshot->info.scratch.size, 0);
+	KUNIT_ASSERT_EQ(test, snapshot->info.surface_count, 2);
+	descriptor = (const u8 *)snapshot->bytes + snapshot->info.program_offset;
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_slot_base(&snapshot->info, descriptor, 1),
+			snapshot->info.constants.vm);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_slot_base(&snapshot->info, descriptor, 3),
+			snapshot->info.scratch.vm);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_slot_base(&snapshot->info, descriptor, 4),
+			snapshot->info.surfaces[0].section.vm);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_slot_base(&snapshot->info, descriptor, 5),
+			snapshot->info.surfaces[1].section.vm);
+	KUNIT_EXPECT_EQ(test, snapshot->info.surfaces[1].direction, 2);
+
+	KUNIT_ASSERT_EQ(test, ane_h16_session_load(&f->s, snapshot, aux, aux_size, &p), 0);
+	KUNIT_ASSERT_NOT_NULL(test, p);
+	KUNIT_EXPECT_EQ(test, p->bar_count, 0);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), 0);
+}
+
+/*
+ * The H14 program is refused where it does not fit: on an H16 session, with
+ * an operation section that binds slot 4 to the second input, with a BAR
+ * record that names a slot no region binds, and with a descriptor whose
+ * memory base names no region of the program.
+ */
+static void program_h14_add_refused_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test), *g = fw_create_family(test, 14);
+	struct ane_h16_hwx_snapshot *snapshot;
+	struct ane_h16_program *p = NULL;
+	struct ane_h16_hwx *info = kunit_kzalloc(test, sizeof(*info), GFP_KERNEL);
+	const void *aux[ANE_H16_AUX_COUNT];
+	size_t aux_size[ANE_H16_AUX_COUNT];
+	u8 *op, *hwx;
+	size_t text, desc;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, g);
+	KUNIT_ASSERT_NOT_NULL(test, info);
+	snapshot = h14_add(test, aux, aux_size);
+	KUNIT_ASSERT_NOT_NULL(test, snapshot);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_load(&f->s, snapshot, aux, aux_size, &p),
+			-ENOEXEC);
+	KUNIT_EXPECT_NULL(test, p);
+
+	/* The operation record pairs from +0x10: slot 4 -> ID 5, swapped to 6. */
+	op = kunit_kmalloc(test, aux_size[1], GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, op);
+	memcpy(op, aux[1], aux_size[1]);
+	KUNIT_ASSERT_EQ(test, get_unaligned_le32(op + 4 + 0xc), 4);
+	put_unaligned_le32(6, op + 4 + 0x10);
+	aux[1] = op;
+	KUNIT_EXPECT_NE(test, ane_h16_session_load(&g->s, snapshot, aux, aux_size, &p), 0);
+	KUNIT_EXPECT_NULL(test, p);
+
+	hwx = kunit_kmalloc(test, snapshot->size, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, hwx);
+	memcpy(hwx, snapshot->bytes, snapshot->size);
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(hwx, snapshot->size, info), 0);
+	text = info->text.offset;
+	desc = info->program_offset;
+	/* The task's last record is the slot 5 BAR record; name slot 7 instead. */
+	KUNIT_ASSERT_EQ(test, get_unaligned_le32(hwx + text + info->text.size - 12),
+			0x22808542);
+	put_unaligned_le32(0x23808542, hwx + text + info->text.size - 12);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(hwx, snapshot->size, info), -ENOEXEC);
+	put_unaligned_le32(0x22808542, hwx + text + info->text.size - 12);
+	put_unaligned_le64(0x30018000, hwx + desc + 0x50);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(hwx, snapshot->size, info), -ENOEXEC);
+	put_unaligned_le64(0x30000000, hwx + desc + 0x50);
+	put_unaligned_le32(4, hwx + desc + 0x868);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(hwx, snapshot->size, info), -ENOEXEC);
+	put_unaligned_le32(3, hwx + desc + 0x868);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(hwx, snapshot->size, info), 0);
+	/* An H16 task header (nine words) is not an H14 one. */
+	put_unaligned_le32(ANE_HWX_SUBTYPE_H16, hwx + 8);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(hwx, snapshot->size, info), -ENOEXEC);
+}
+
+/* A refused LOAD logs the firmware's reply header and ID words. */
+static void program_load_reply_logged_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test);
+	struct ane_h16_program *p = NULL;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	f->mode = FW_LOAD_NAK;
+	KUNIT_EXPECT_EQ(test, fw_load_program(f, &p), -EREMOTEIO);
+	KUNIT_EXPECT_EQ(test, f->load_reply >> 32, 0x10000 | ANE_H16_LOAD_PROGRAM);
+	KUNIT_EXPECT_EQ(test, f->load_reply_id & U32_MAX, ANE_H16_LOAD_ID_REQUEST);
 }
 
 /* Synthetic HWX with a kernel section: slot 1 is class 3 with index 1007. */
@@ -3395,6 +3637,10 @@ static struct kunit_case program_cases[] = {
 	KUNIT_CASE(program_add128_slots_test),
 	KUNIT_CASE(program_kernel_slots_test),
 	KUNIT_CASE(program_add128_hwx_test),
+	KUNIT_CASE(program_h14_add_hwx_test),
+	KUNIT_CASE(program_h14_chain_hwx_test),
+	KUNIT_CASE(program_h14_add_refused_test),
+	KUNIT_CASE(program_load_reply_logged_test),
 	KUNIT_CASE(program_replies_test),
 	KUNIT_CASE(program_deny_list_test),
 	KUNIT_CASE(program_custom_bar_test),

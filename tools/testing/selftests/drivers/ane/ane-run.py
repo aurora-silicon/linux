@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
-"""Load one H16G or H17 HWX through the ABI 3 accel node and run cases.
+"""Load one H14, H16G or H17 HWX through the ABI 3 accel node and run cases.
 
 The program is loaded once. Each --case names the input files, one per
 input surface in the order H16_LOAD reports, and optionally the expected
@@ -30,7 +30,7 @@ KSFT_PASS, KSFT_FAIL, KSFT_SKIP = 0, 1, 4
 
 DRM_COMMAND_BASE = 0x40
 DRM_ANE_ABI_V3 = 3
-CHIPS = (16, 17)
+CHIPS = (14, 16, 17)
 SECTIONS = (
     (1, "generic.bin"),
     (2, "operation.bin"),

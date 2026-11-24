@@ -34,26 +34,107 @@ static inline bool ane_h16_register_valid(u32 word)
 }
 
 /*
- * A stream opens with a 16-byte frame: little-endian u32 @prologue, then
- * twelve reserved zero bytes. H16 programs open with 1; measured H17 programs
- * open with 0 or 1. The last task may end at the end of the section;
- * every other task is padded with zeros to 16 bytes. This structural gate
- * does not replace container/tensor/aperture validation.
+ * Byte addresses in the H14 register image, exclusive ends: common, L2, PE,
+ * NE, source tile DMA, destination tile DMA and kernel DMA. H14 objects
+ * keep every block below 0x4000.
+ */
+static inline bool ane_h14_register_valid(u32 word)
+{
+	static const struct {
+		u32 start;
+		u32 end;
+	} blocks[] = {
+		{ 0x0000, 0x004c }, { 0x0500, 0x0564 }, { 0x0900, 0x0914 },
+		{ 0x0d00, 0x0d14 }, { 0x1100, 0x11d4 }, { 0x1500, 0x1528 },
+		{ 0x1900, 0x1a18 },
+	};
+	u32 addr = word * 4;
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(blocks); i++)
+		if (addr >= blocks[i].start && addr < blocks[i].end)
+			return true;
+	return false;
+}
+
+/*
+ * The task framing of one HWX target: the fixed header words before the
+ * first register record (eight on H14, nine on H16 and H17; one more when
+ * the last of them has both low bits set) and the register image the
+ * records may name.
+ */
+struct ane_hx_task_format {
+	unsigned int header_words;
+	bool (*register_valid)(u32 word);
+};
+
+#define ANE_H16_TASK_FORMAT \
+	((const struct ane_hx_task_format) { 9, ane_h16_register_valid })
+
+/*
+ * Call @fn(@ctx, header) for every register record of every task, after the
+ * walk proved each record lies in its task. Stops at the first nonzero
+ * return and returns it.
  */
 static inline int
-ane_hx_task_stream_validate_limit(const void *text, size_t size, u32 expected_tasks,
-				  u32 prologue, u32 *record_limit, size_t *final_end)
+ane_hx_task_records(const void *text, size_t size, const struct ane_hx_task_format *f,
+		    int (*fn)(void *ctx, u32 header), void *ctx)
+{
+	const u8 *p = text;
+	size_t pos = 16;
+	int ret;
+
+	while (pos + 16 <= size) {
+		u32 words = (get_unaligned_le32(p + pos) >> 16) & 0x7ff;
+		size_t end, rec;
+
+		if (!words) {
+			pos += 16;
+			continue;
+		}
+		end = pos + words * 4;
+		if (end > size)
+			return -ENOEXEC;
+		rec = pos + f->header_words * 4;
+		if ((get_unaligned_le32(p + pos + (f->header_words - 1) * 4) & 3) == 3)
+			rec += 4;
+		while (rec < end) {
+			u32 h = get_unaligned_le32(p + rec);
+
+			ret = fn(ctx, h);
+			if (ret)
+				return ret;
+			rec += 4 + 4 * (h & BIT(31) ? 1 + hweight32((h >> 15) & 0xffff) :
+					((h >> 15) & 0x3f) + 1);
+		}
+		pos = ALIGN(end, 16);
+	}
+	return 0;
+}
+
+/*
+ * A stream opens with a 16-byte frame: little-endian u32 @prologue, then
+ * twelve reserved zero bytes. H16 programs open with 1; measured H17 programs
+ * open with 0 or 1; H14 programs open with 0. The last task may end at the
+ * end of the section; every other task is padded with zeros to 16 bytes.
+ * This structural gate does not replace container/tensor/aperture
+ * validation.
+ */
+static inline int
+ane_hx_task_stream_check(const void *text, size_t size, u32 expected_tasks,
+			 u32 prologue, const struct ane_hx_task_format *f,
+			 u32 *record_limit, size_t *final_end)
 {
 	const u8 *p = text;
 	size_t pos = 16, last = 0;
 	u32 tasks = 0, limit = 0;
 
-	if (!p || !expected_tasks || size < 16 || size > ANE_H16_TASK_MAX ||
-	    (size & 3) || get_unaligned_le32(p) != prologue ||
+	if (!p || !f || !f->header_words || !expected_tasks || size < 16 ||
+	    size > ANE_H16_TASK_MAX || (size & 3) || get_unaligned_le32(p) != prologue ||
 	    memchr_inv(p + 4, 0, 12))
 		return -ENOEXEC;
 	while (pos < size) {
-		u32 words, header_words = 9;
+		u32 words, header_words = f->header_words;
 		size_t end, padded, rec;
 
 		if (size - pos < 16)
@@ -65,10 +146,10 @@ ane_hx_task_stream_validate_limit(const void *text, size_t size, u32 expected_ta
 			pos += 16;
 			continue;
 		}
-		if (words < 9 || words > (size - pos) / 4)
+		if (words < header_words || words > (size - pos) / 4)
 			return -ENOEXEC;
 		end = pos + words * 4;
-		if ((get_unaligned_le32(p + pos + 8 * 4) & 3) == 3)
+		if ((get_unaligned_le32(p + pos + (header_words - 1) * 4) & 3) == 3)
 			header_words++;
 		if (words < header_words)
 			return -ENOEXEC;
@@ -86,16 +167,16 @@ ane_hx_task_stream_validate_limit(const void *text, size_t size, u32 expected_ta
 				count = 1 + hweight32(mask);
 			else
 				count = ((h >> 15) & 0x3f) + 1;
-			if (count > (end - rec) / 4 || !ane_h16_register_valid(base))
+			if (count > (end - rec) / 4 || !f->register_valid(base))
 				return -ENOEXEC;
 			if (h & BIT(31)) {
 				for (i = 0; i < 16; i++)
 					if ((mask & BIT(i)) &&
-					    !ane_h16_register_valid(base + i + 1))
+					    !f->register_valid(base + i + 1))
 						return -ENOEXEC;
 			} else {
 				for (i = 1; i < count; i++)
-					if (!ane_h16_register_valid(base + i))
+					if (!f->register_valid(base + i))
 						return -ENOEXEC;
 			}
 			rec += count * 4;
@@ -115,6 +196,14 @@ ane_hx_task_stream_validate_limit(const void *text, size_t size, u32 expected_ta
 	if (final_end)
 		*final_end = last;
 	return 0;
+}
+
+static inline int
+ane_hx_task_stream_validate_limit(const void *text, size_t size, u32 expected_tasks,
+				  u32 prologue, u32 *record_limit, size_t *final_end)
+{
+	return ane_hx_task_stream_check(text, size, expected_tasks, prologue,
+					&ANE_H16_TASK_FORMAT, record_limit, final_end);
 }
 
 static inline int

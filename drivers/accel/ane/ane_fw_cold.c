@@ -245,7 +245,7 @@ static int ane_fw_quarantine(struct ane_fw_backend *b, int error)
 	return error;
 }
 
-static bool ane_fw_raw_boot(void)
+bool ane_fw_raw_boot(void)
 {
 	struct device_node *chosen __free(device_node) = of_find_node_by_path("/chosen");
 	const char *evidence;
@@ -2388,12 +2388,6 @@ static void ane_fw_debugfs(struct ane_fw_backend *b)
 		dput(root);
 }
 
-/*
- * How long dynamic power gating stays off after the last EXECUTE, as on
- * H16: toggling it around every request costs the H17 engine about 70 us
- * (gate open plus gate close) of each back-to-back EXECUTE.
- */
-#define ANE_FW_GATE_HOLD_NS (2 * NSEC_PER_MSEC)
 
 static int ane_fw_program_stage(struct ane_fw_backend *b)
 {
@@ -2407,7 +2401,7 @@ static int ane_fw_program_stage(struct ane_fw_backend *b)
 	ret = apple_clpc_ane_get(&b->pdev->dev, &b->clpc);
 	if (ret)
 		return ret;
-	b->session.gate_hold_ns = ANE_FW_GATE_HOLD_NS;
+	b->session.gate_hold_ns = ANE_H16_GATE_HOLD_NS;
 	ret = ane_h16_accel_register(&b->pdev->dev, &b->session);
 	if (ret) {
 		apple_clpc_ane_put(b->clpc);
@@ -2439,7 +2433,7 @@ static int ane_fw_register_parked(struct ane_fw_backend *b)
 	ret = apple_clpc_ane_get(&b->pdev->dev, &b->clpc);
 	if (ret)
 		return ret;
-	b->session.gate_hold_ns = ANE_FW_GATE_HOLD_NS;
+	b->session.gate_hold_ns = ANE_H16_GATE_HOLD_NS;
 	ret = ane_h16_accel_register(&b->pdev->dev, &b->session);
 	if (ret) {
 		apple_clpc_ane_put(b->clpc);

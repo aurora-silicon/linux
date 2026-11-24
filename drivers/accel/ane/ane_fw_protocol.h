@@ -105,6 +105,46 @@ ane_fw_channels_parse(const void *table, u64 ipc_dva, size_t ipc_size,
 	return 0;
 }
 
+/*
+ * Copy the table the firmware published at table_dva inside the IPC surface
+ * (CPU address ipc) to snapshot and parse the copy. The caller orders the
+ * copy after the firmware's DONE and compares the live table with the
+ * snapshot again afterwards.
+ */
+static inline int
+ane_fw_channels_snapshot(const void *ipc, u64 ipc_dva, size_t ipc_size,
+			 u64 table_dva, void *snapshot, u64 *table_offset,
+			 struct ane_fw_channel channels[ANE_FW_CHANNELS])
+{
+	if (!ipc || !snapshot || !table_offset ||
+	    !ane_fw_contains(ipc_dva, ipc_size, table_dva, ANE_FW_TABLE_SIZE))
+		return -EPROTO;
+	*table_offset = table_dva - ipc_dva;
+	memcpy(snapshot, (const u8 *)ipc + *table_offset, ANE_FW_TABLE_SIZE);
+	return ane_fw_channels_parse(snapshot, ipc_dva, ipc_size, table_dva,
+				     channels);
+}
+
+/*
+ * The 27.x startup exchange on the IO ring, in macOS order: 0x4, START (0x0),
+ * CONFIG_GET (0x3) and RESOURCE_INFO (0x22), each with a zero body of the
+ * given size. The H16 and H17 cold boots send the same list.
+ */
+#define ANE_FW_STARTUP_COMMANDS 4
+
+static inline bool ane_fw_startup_command(unsigned int i, u16 *id, u16 *size)
+{
+	static const struct { u16 id, size; } commands[ANE_FW_STARTUP_COMMANDS] = {
+		{ 0x4, 12 }, { 0x0, 12 }, { 0x3, 16 }, { 0x22, 100 },
+	};
+
+	if (i >= ANE_FW_STARTUP_COMMANDS)
+		return false;
+	*id = commands[i].id;
+	*size = commands[i].size;
+	return true;
+}
+
 /* Call only after parsing the table and checking its immutable snapshot. */
 static inline void
 ane_fw_channels_host_init(void *ipc, const struct ane_fw_channel *channels)

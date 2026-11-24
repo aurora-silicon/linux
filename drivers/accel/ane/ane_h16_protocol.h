@@ -61,6 +61,31 @@ ane_h16_command_prepare(void *command, size_t length, u16 id, unsigned int chann
 	return 0;
 }
 
+/*
+ * A host command for 27.x firmware: a program command of the table above on
+ * its ring (table position table_index), or a startup command of its exact
+ * size on the IO ring. Nothing else goes out in the 27.x format.
+ */
+static inline int
+ane_fw_host_command_prepare(void *command, size_t length, u16 id, bool io_ring,
+			    unsigned int table_index)
+{
+	unsigned int i;
+	u16 startup, size;
+
+	if (ane_h16_command_info(id))
+		return ane_h16_command_prepare(command, length, id, table_index);
+	for (i = 0; ane_fw_startup_command(i, &startup, &size); i++) {
+		if (startup != id)
+			continue;
+		if (!command || !io_ring || length != size)
+			return -EINVAL;
+		ane_fw_command_header(command, id, true);
+		return 0;
+	}
+	return -EOPNOTSUPP;
+}
+
 /* The first word selects report slots; rolling words are also valid. */
 static inline int
 ane_h16_event_report_status(const void *event, size_t length, unsigned int channel)
