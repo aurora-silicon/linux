@@ -2051,6 +2051,7 @@ struct UatShared {
     map_kernel_to_user: bool,
     handoff_rgn: UatRegion,
     ttbs_rgn: UatRegion,
+    clean_poc: bool,
     quirks: UatQuirks,
 }
 
@@ -2080,9 +2081,11 @@ impl UatShared {
         }
     }
 
-    /// Writes back context-table slot `idx` after it changed, where this SoC needs it.
+    /// Writes back context-table slot `idx` after it changed, where the UAT
+    /// walker does not snoop the CPU caches (either an adopted UAT or a SoC
+    /// with `quirks.clean_tables`).
     fn publish_slot(&self, idx: usize) {
-        if self.quirks.clean_tables {
+        if self.clean_poc || self.quirks.clean_tables {
             let slot = core::ptr::from_ref(&self.ttbs()[idx]).cast::<u8>();
             pgtable::clean_poc(slot, size_of::<SlotTTBS>());
             pgtable::poc_barrier();
@@ -3631,6 +3634,7 @@ impl Uat {
                         map_kernel_to_user,
                         handoff_rgn,
                         ttbs_rgn,
+                        clean_poc: true,
                         quirks: UatQuirks::DEFAULT,
                     },
                     "uat_shared"
@@ -3867,13 +3871,6 @@ impl Uat {
                 uat_inner.owned_user_roots[idx] = ttb;
                 binding.generation = binding_wire_generation(incarnation);
                 uat_inner.publish_slot(idx);
-                if self.inner.clean_poc && !uat_inner.quirks.clean_tables {
-                    // A table walker that does not snoop the CPU caches must also see the new
-                    // TTBAT words, not only the new tables.
-                    let slot = core::ptr::from_ref(&uat_inner.ttbs()[idx]).cast::<u8>();
-                    pgtable::clean_poc(slot, size_of::<SlotTTBS>());
-                    pgtable::poc_barrier();
-                }
                 drop(transaction);
 
                 // Make sure all TLB entries from the previous owner of this ASID are gone
@@ -4247,6 +4244,7 @@ impl Uat {
                         map_kernel_to_user: false,
                         handoff_rgn,
                         ttbs_rgn,
+                        clean_poc: shared_quirks.clean_tables,
                         quirks: shared_quirks,
                     },
                     "uat_shared"

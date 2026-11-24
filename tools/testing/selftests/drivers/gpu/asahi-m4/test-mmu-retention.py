@@ -40,7 +40,7 @@ handoff='\n'.join(body(mm,m) for m in ['fn lock(&self) {\n        self.lock_ap',
 mid=r'''
 }
 struct Quirks{handoff_lock:bool,clean_tables:bool}
-struct SlotTTBS{ttb0:AtomicU64,ttb1:AtomicU64}struct UatShared{handoff:Handoff,ttbs:[SlotTTBS;64],map_kernel_to_user:bool,kernel_ttb1:u64,binding_generations:[u64;64],binding_published:[bool;64],owned_user_roots:[u64;64],quirks:Quirks}
+struct SlotTTBS{ttb0:AtomicU64,ttb1:AtomicU64}struct UatShared{handoff:Handoff,ttbs:[SlotTTBS;64],map_kernel_to_user:bool,kernel_ttb1:u64,binding_generations:[u64;64],binding_published:[bool;64],owned_user_roots:[u64;64],clean_poc:bool,quirks:Quirks}
 impl UatShared{fn handoff(&self)->&Handoff{&self.handoff}fn ttbs(&self)->&[SlotTTBS;64]{&self.ttbs}}
 struct UatInner{firmware:UatFirmware,m4_adopted:bool,clean_poc:bool,failed:AtomicBool,shared:Mutex<UatShared>}
 '''
@@ -52,7 +52,7 @@ raii='#[path="'+str(ROOT/'drivers/gpu/drm/asahi/mmu/ppl.rs')+'"]mod ppl;\n'+'\n'
 inner='impl UatInner{\n'+'\n'.join(body(mm,m) for m in ['fn lock(&self) -> Guard', 'fn check_m4(', 'fn lock_handoff(', 'fn lock_m4_upper('])+'\n}\n'
 models=r'''
 fn uat(m4:bool,firmware:UatFirmware)->Rc<UatInner>{uat_with(m4,firmware,false,false)}
-fn uat_with(m4:bool,firmware:UatFirmware,clean_poc:bool,clean_tables:bool)->Rc<UatInner>{Rc::new(UatInner{firmware,m4_adopted:m4,clean_poc,failed:AtomicBool::new(false),shared:Mutex::new(UatShared{handoff:Handoff::new(),ttbs:std::array::from_fn(|_|SlotTTBS{ttb0:AtomicU64::new(0),ttb1:AtomicU64::new(0)}),map_kernel_to_user:!m4,kernel_ttb1:0x800000000,binding_generations:[0;64],binding_published:[false;64],owned_user_roots:[0;64],quirks:Quirks{handoff_lock:true,clean_tables}})})}
+fn uat_with(m4:bool,firmware:UatFirmware,clean_poc:bool,clean_tables:bool)->Rc<UatInner>{Rc::new(UatInner{firmware,m4_adopted:m4,clean_poc,failed:AtomicBool::new(false),shared:Mutex::new(UatShared{handoff:Handoff::new(),ttbs:std::array::from_fn(|_|SlotTTBS{ttb0:AtomicU64::new(0),ttb1:AtomicU64::new(0)}),map_kernel_to_user:!m4,kernel_ttb1:0x800000000,binding_generations:[0;64],binding_published:[false;64],owned_user_roots:[0;64],clean_poc,quirks:Quirks{handoff_lock:true,clean_tables}})})}
 #[derive(Clone,Copy)]struct Prot{cached:bool}impl Prot{fn is_cached_noncoherent(&self)->bool{self.cached}}
 struct Mutation;impl Drop for Mutation{fn drop(&mut self){MUTATIONS.fetch_sub(1,Ordering::Relaxed);}}
 struct MapTable{fail:bool}impl MapTable{fn unmap_pages(&mut self,_r:Range<u64>)->Result{LEAF_CLEARS.fetch_add(1,Ordering::Relaxed);if self.fail{Err(EIO)}else{Ok(())}}}
@@ -108,10 +108,35 @@ fn bind_tests(){for m4 in [false,true]{for blocked in [false,true]{if blocked&&!
  // A previously faulted M4 is refused before any new lock or TTBAT generation mutation.
  let u=uat(true,UatFirmware::Handoff);u.failed.store(true,Ordering::Release);let backend=Uat{inner:u.clone(),slots:Allocator};assert!(backend.bind(&Vm{id:9,binding:new_binding()}).is_err());assert_eq!(u.shared.lock().binding_generations[4],0);
 }
-// A non-snooping walker sees the TTBAT slot bind fills written back exactly once: by bind for an
-// adopted UAT without the clean_tables quirk (clean_poc only), by publish_slot with the quirk.
-// A coherent walker (neither) gets no clean.
-fn ttbat_clean_tests(){for (clean_poc,clean_tables,cleaned) in [(false,false,false),(true,false,true),(true,true,true)]{reset();let u=uat_with(false,UatFirmware::Handoff,clean_poc,clean_tables);let backend=Uat{inner:u.clone(),slots:Allocator};let bound=backend.bind(&Vm{id:9,binding:new_binding()}).unwrap();assert_eq!(bound.1,4);let s=u.shared.lock();let slot=(core::ptr::from_ref(&s.ttbs[4]) as usize,size_of::<SlotTTBS>());let cleans=CLEANS.lock().unwrap();assert_eq!(cleans.iter().filter(|c|**c==slot).count(),usize::from(cleaned));assert_eq!(s.ttbs[4].ttb0.load(Ordering::Relaxed),0x804000001|(4<<48));}}
+// A non-snooping walker sees the TTBAT slot written back exactly once on both bind and
+// VmInner::drop through UatShared::publish_slot: for an adopted UAT without the clean_tables
+// quirk (clean_poc only) and with the quirk. A coherent walker (neither) gets no clean.
+fn ttbat_clean_tests(){
+ for (clean_poc,clean_tables,cleaned) in [(false,false,false),(true,false,true),(false,true,true),(true,true,true)]{
+  reset();
+  let u=uat_with(false,UatFirmware::Handoff,clean_poc,clean_tables);
+  let backend=Uat{inner:u.clone(),slots:Allocator};
+  let binding=new_binding();
+  let bound=backend.bind(&Vm{id:9,binding:binding.clone()}).unwrap();
+  assert_eq!(bound.1,4);
+  let slot={
+   let s=u.shared.lock();
+   let slot=(core::ptr::from_ref(&s.ttbs[4]) as usize,size_of::<SlotTTBS>());
+   assert_eq!(CLEANS.lock().unwrap().iter().filter(|c|**c==slot).count(),usize::from(cleaned));
+   assert_eq!(s.ttbs[4].ttb0.load(Ordering::Relaxed),0x804000001|(4<<48));
+   slot
+  };
+  CLEANS.lock().unwrap().clear();
+  binding.lock().active_users=0;
+  drop(bound);
+  drop(VmInner{id:9,binding,uat_inner:u.clone(),page_table:UatPageTable::new()});
+  let s=u.shared.lock();
+  assert_eq!(CLEANS.lock().unwrap().iter().filter(|c|**c==slot).count(),usize::from(cleaned));
+  assert_eq!(s.ttbs[4].ttb0.load(Ordering::Relaxed),0);
+  assert_eq!(s.ttbs[4].ttb1.load(Ordering::Relaxed),0);
+  assert_eq!(s.owned_user_roots[4],0);
+ }
+}
 fn generation_churn_test(){
  let u=uat(true,UatFirmware::Handoff);let backend=Uat{inner:u.clone(),slots:Allocator};
  let published=backend.bind(&Vm{id:1,binding:new_binding()}).unwrap();assert_eq!(published.0.binding.lock().generation,1);
@@ -121,7 +146,7 @@ fn generation_churn_test(){
  let next=backend.bind(&Vm{id:999,binding:new_binding()}).unwrap();assert_eq!(next.0.binding.lock().generation,3);
 }
 fn vm_drop_tests(){for (m4,blocked,pre_failed) in [(false,false,false),(true,false,false),(true,true,false),(true,false,true)]{reset();let u=uat(m4,UatFirmware::Handoff);let binding=new_binding();binding.lock().bind_token=Some(Token(3));let low=0x804000001|(4<<48);{let mut s=u.shared.lock();s.ttbs[4].ttb0.store(low,Ordering::Release);s.owned_user_roots[4]=low;s.handoff.lock_fw.store(u8::from(blocked),Ordering::Release);}u.failed.store(pre_failed,Ordering::Release);drop(VmInner{id:9,binding,uat_inner:u.clone(),page_table:UatPageTable::new()});let uncertain=blocked||pre_failed;assert_eq!(ROOT_FREES.load(Ordering::Relaxed),usize::from(!uncertain));assert_eq!(TREE_FREES.load(Ordering::Relaxed),usize::from(!uncertain));let s=u.shared.lock();assert_eq!(s.ttbs[4].ttb0.load(Ordering::Relaxed),if uncertain{low}else{0});assert_eq!(s.owned_user_roots[4],if uncertain{low}else{0});assert_eq!(s.handoff.lock_ap.load(Ordering::Relaxed),0);assert_eq!(u.failed.load(Ordering::Acquire),uncertain);}}
-fn main(){ttbat_clean_tests();generation_churn_test();mapping_tests();page_tests();bind_tests();vm_drop_tests();fail_stop_race_tests();println!("Shared Rust fault injection passed: G15/Neo normal and cached frees exactly once; M4 cached/timeout/partial-unmap retains node+backing+VA; guards released before free; M4 bind timeout changes no TTBAT/generation; VM-drop timeout retains physical tables/root; faulted M4 admission rejects before and after lock acquisition; a non-snooping adopted UAT writes back the bound TTBAT slot once (mock hardware)");}
+fn main(){ttbat_clean_tests();generation_churn_test();mapping_tests();page_tests();bind_tests();vm_drop_tests();fail_stop_race_tests();println!("Shared Rust fault injection passed: G15/Neo normal and cached frees exactly once; M4 cached/timeout/partial-unmap retains node+backing+VA; guards released before free; M4 bind timeout changes no TTBAT/generation; VM-drop timeout retains physical tables/root; faulted M4 admission rejects before and after lock acquisition; a non-snooping adopted UAT writes back the TTBAT slot once on bind and once on VM teardown (mock hardware)");}
 '''
 source=pre+handoff+mid+raii+inner+models+map_drop+pages+bindings+helpers+bind+vm+main
 (OUT/'check-mmu-retention.rs').write_text(source)
