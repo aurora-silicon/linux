@@ -429,6 +429,9 @@ static DEFINE_PER_CPU(uint32_t, aic_fiq_unmasked);
 
 static struct aic_irq_chip *aic_irqc;
 
+/* AIC1: each CPU's number as AIC knows it (WHOAMI), for line targets; the logical id until read */
+static DEFINE_PER_CPU(u32, aic_cpu_hwid);
+
 /* CPUs that accept hardware IRQs, read from SIQ_CFG on AICv2+ at EL2 */
 static struct cpumask aic_irq_cpus;
 
@@ -579,7 +582,8 @@ static int aic_irq_set_affinity(struct irq_data *d,
 	else
 		cpu = cpumask_any_and(mask_val, cpu_online_mask);
 
-	aic_ic_write(ic, ic->info.target_cpu + AIC_HWIRQ_IRQ(hwirq) * 4, BIT(cpu));
+	aic_ic_write(ic, ic->info.target_cpu + AIC_HWIRQ_IRQ(hwirq) * 4,
+		     BIT(per_cpu(aic_cpu_hwid, cpu)));
 	irq_data_update_effective_affinity(d, cpumask_of(cpu));
 
 	return IRQ_SET_MASK_OK;
@@ -1078,7 +1082,17 @@ static int aic_init_cpu(unsigned int cpu)
 		 * If we ever end up with a mismatch here, we will have to introduce
 		 * a mapping table similar to what other irqchip drivers do.
 		 */
-		WARN_ON(aic_ic_read(aic_irqc, AIC_WHOAMI) != smp_processor_id());
+		u32 whoami = aic_ic_read(aic_irqc, AIC_WHOAMI);
+
+		/*
+		 * The device tree's CPU order need not be AIC's (the E- and P-cores can
+		 * interleave): a line's target is AIC's number for the CPU, so keep it.
+		 */
+		if (whoami < 32)
+			per_cpu(aic_cpu_hwid, smp_processor_id()) = whoami;
+		if (whoami != smp_processor_id())
+			pr_info_once("AIC: CPU numbers differ from the device tree's order (CPU%d is AIC CPU %u)\n",
+				     smp_processor_id(), whoami);
 
 		/*
 		 * Always keep IPIs unmasked at the hardware level (except auto-masking
@@ -1316,7 +1330,7 @@ static void __init aic_sleep_init(struct aic_irq_chip *irqc)
 
 static int __init aic_of_ic_init(struct device_node *node, struct device_node *parent)
 {
-	int i, die;
+	int i, die, cpu;
 	u32 off, start_off;
 	void __iomem *regs;
 	struct aic_irq_chip *irqc;
@@ -1434,6 +1448,9 @@ static int __init aic_of_ic_init(struct device_node *node, struct device_node *p
 			build_fiq_affinity(irqc, chld);
 	}
 	of_node_put(affs);
+
+	for_each_possible_cpu(cpu)
+		per_cpu(aic_cpu_hwid, cpu) = cpu;
 
 	set_handle_irq(aic_handle_irq);
 	set_handle_fiq(aic_handle_fiq);
