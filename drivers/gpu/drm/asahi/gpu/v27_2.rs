@@ -530,6 +530,11 @@ impl GpuManagerG14V13_5 {
     pub(crate) fn kernel_uat(&self) -> &mmu::Uat {
         &self.uat
     }
+
+    /// The firmware timestamp aperture that timestamp buffers are bound in.
+    pub(crate) fn timestamp_range(&self) -> Range<u64> {
+        self.timestamp_range.clone()
+    }
 }
 
 impl RootV27_2 {

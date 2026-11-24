@@ -340,6 +340,9 @@ pub(crate) fn start<'a>(
                                                 gpu::GraphProfile::G14V27_2)?;
     let root = RootV27_2::build(&graph, &board)?;
     let pool = CommandPool::new(&mut gpu::GpuManager::alloc(&*graph), cfg)?;
+    // Timestamp buffers are bound in the timestamp aperture while the firmware runs, and the
+    // window only carries the tables that exist now: link the aperture's tables first.
+    graph.kernel_uat().prepare_kernel_tables(&[graph.timestamp_range()])?;
     window.mirror(graph.kernel_uat())?;
     window.install()?;
     window.announce();
@@ -1212,8 +1215,8 @@ impl gpu::Gpu for Backend {
         Ok(KBox::new(crate::m3::m3_submit::Queue::new_g14_v27_2(self.runtime.clone(), self.scheduler.clone(),
             vm, priority, usc_exec_base, ualloc_priv, self.preempt_bytes, render)?, GFP_KERNEL)?)
     }
-    fn map_timestamp_buffer(&self, _bo: gem::ObjectRef, _range: Range<usize>) -> Result<crate::timestamp::Buffer> {
-        // Timestamp buffers would need new tables in the firmware window after boot.
-        Err(ENOTSUPP)
+    fn map_timestamp_buffer(&self, bo: gem::ObjectRef, range: Range<usize>) -> Result<crate::timestamp::Buffer> {
+        // The aperture's tables were linked before the firmware window was mirrored (start()).
+        <GpuManagerG14V13_5 as gpu::Gpu>::map_timestamp_buffer(&self.graph, bo, range)
     }
 }

@@ -3748,7 +3748,20 @@ impl Uat {
     /// Links the kernel lower root's tables for each range, with no mappings. A published-roots
     /// firmware samples that root's top-level entries only when it starts.
     pub(crate) fn prepare_lower_tables(&self, ranges: &[Range<u64>]) -> Result {
-        let mut inner = lock_vm(&self.kernel_lower_vm.gpuvm, None, false)?;
+        Self::prepare_tables(&self.kernel_lower_vm, ranges)
+    }
+
+    /// Links the kernel window's tables for each range, with no mappings, for a firmware that
+    /// copies the window's second-level entries only when it starts
+    /// ([`FirmwareWindow::mirror`]). Page tables are only freed with their VM, so the leaf
+    /// tables stay where that copy names them.
+    #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+    pub(crate) fn prepare_kernel_tables(&self, ranges: &[Range<u64>]) -> Result {
+        Self::prepare_tables(&self.kernel_vm, ranges)
+    }
+
+    fn prepare_tables(vm: &Vm, ranges: &[Range<u64>]) -> Result {
+        let mut inner = lock_vm(&vm.gpuvm, None, false)?;
         for range in ranges {
             inner.page_table.alloc_pages(range.clone())?;
         }
