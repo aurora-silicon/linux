@@ -195,6 +195,7 @@
 
 &ane {
 	status = "okay";
+};
 
 /*
  * The Wi-Fi/Bluetooth module's CLKREQ# is wired to the SoC (the J615 ADT gives
