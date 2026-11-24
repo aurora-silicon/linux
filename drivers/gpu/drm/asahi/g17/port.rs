@@ -18,7 +18,7 @@ use super::{
     },
     qos,
 };
-use core::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use kernel::{
     new_mutex, new_spinlock,
     prelude::*,
@@ -35,6 +35,9 @@ const PRIORITIES: usize = Policy::PRIORITIES as usize;
 /// work bound by host refills. While the GPU is the bottleneck the burst gains nothing, and at the
 /// SoC's thermal limit the power it takes comes out of the GPU's clock.
 const RX_UTIL_MIN_GPU_BOUND: u32 = 256;
+const RX_STATE_UNSET: u8 = 0;
+const RX_STATE_DEFAULT: u8 = 1;
+const RX_STATE_GPU_BOUND: u8 = 2;
 
 /// One priority class's compute work ring: its slot array and the cursors of its two firmware
 /// consumers and of the host producer.
@@ -114,6 +117,8 @@ pub(super) struct Port {
     /// The request last made, `None` before the first.
     #[pin]
     rx_applied: SpinLock<Option<Option<u32>>>,
+    /// Lock-free mirror of `rx_applied` (`RX_STATE_*`) so steady-state updates avoid locking.
+    rx_state: AtomicU8,
     /// Serializes every render publication, with or without the device mutex: the tiling
     /// and fragment work rings have one host producer at a time, and same-VM attachment
     /// overlaps are ordered by publication order (see hazard.rs).
@@ -205,6 +210,7 @@ impl Port {
                 rx: SetOnce::new(),
                 feed,
                 rx_applied <- new_spinlock!(None, "g17::Port::rx_applied"),
+                rx_state: AtomicU8::new(RX_STATE_UNSET),
                 render <- new_mutex!((), "g17::Port::render"),
                 m5_outer <- new_mutex!(None, "g17::Port::m5_outer"),
                 generation: AtomicU64::new(0),
@@ -827,10 +833,33 @@ impl Port {
         let Some(rx) = self.rx.as_ref() else {
             return;
         };
-        let want = self.feed.gpu_bound().then_some(RX_UTIL_MIN_GPU_BOUND);
+        let want_state = if self.feed.gpu_bound() {
+            RX_STATE_GPU_BOUND
+        } else {
+            RX_STATE_DEFAULT
+        };
+        if self.rx_state.load(Ordering::SeqCst) == want_state {
+            return;
+        }
         let mut applied = self.rx_applied.lock();
-        if *applied != Some(want) && rx.set(want).is_ok() {
-            *applied = Some(want);
+        // Publish the transitioning state before re-reading `feed.gpu_bound()`,
+        // so a concurrent caller observing a newer feed state cannot return
+        // early against the stale mirrored value while this update is in flight.
+        self.rx_state.store(RX_STATE_UNSET, Ordering::SeqCst);
+        let gpu_bound = self.feed.gpu_bound();
+        let want = gpu_bound.then_some(RX_UTIL_MIN_GPU_BOUND);
+        let want_state = if gpu_bound {
+            RX_STATE_GPU_BOUND
+        } else {
+            RX_STATE_DEFAULT
+        };
+        if *applied != Some(want) {
+            if rx.set(want).is_ok() {
+                *applied = Some(want);
+                self.rx_state.store(want_state, Ordering::Release);
+            }
+        } else {
+            self.rx_state.store(want_state, Ordering::Release);
         }
     }
 
@@ -934,6 +963,28 @@ impl Port {
         let now_ns = super::now_ns().max(now_ns);
         let mut busy = self.busy.lock();
         if let Some(permille) = busy.sample(now_ns, retired, oldest) {
+            self.demand.set_busy(permille);
+        }
+        self.busy_window_start
+            .store(busy.window_start().map_or(0, |s| s.max(1)), Ordering::Relaxed);
+        self.busy_below_top
+            .store(busy.below_top(), Ordering::Relaxed);
+    }
+
+    /// Lifts CLPC to the top memory/fabric column immediately when a sustained busy run
+    /// ([`super::power::BusyRuns::bound`]) begins while the last reported share is below
+    /// the top column. Lock-free once at the top column.
+    pub(super) fn lift_busy_if_below_top(&self, now_ns: u64) {
+        if !self.demand.has_provider() || !self.busy_below_top.load(Ordering::Relaxed) {
+            return;
+        }
+        let retired = crate::usage::ENGINE_NS
+            .each_ref()
+            .map(|ns| ns.load(Ordering::Acquire));
+        let oldest = self.qos.lock().oldest_in_flight();
+        let now_ns = super::now_ns().max(now_ns);
+        let mut busy = self.busy.lock();
+        if let Some(permille) = busy.lift_saturated(now_ns, retired, oldest) {
             self.demand.set_busy(permille);
         }
         self.busy_window_start
