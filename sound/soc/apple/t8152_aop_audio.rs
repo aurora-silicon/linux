@@ -303,6 +303,10 @@ struct SenseRing {
     done: AtomicUsize,
     /// When `done` was last moved (or the ring started), CLOCK_MONOTONIC ns.
     done_at: AtomicI64,
+    /// True while a cyclic transfer is active; cleared before terminating the
+    /// channel so `sense_ring_done` never consumes a terminated channel's
+    /// zero-residue status.
+    active: AtomicBool,
     /// The attached sense front-end, or null; cleared under that front-end's
     /// stream lock, which the callback holds while it uses the front-end.
     sub: AtomicPtr<bindings::snd_pcm_substream>,
@@ -323,6 +327,7 @@ impl SenseRing {
             cookie: AtomicI32::new(0),
             done: AtomicUsize::new(0),
             done_at: AtomicI64::new(0),
+            active: AtomicBool::new(false),
             sub: AtomicPtr::new(ptr::null_mut()),
             fe_pos: AtomicUsize::new(0),
             fe_running: AtomicBool::new(false),
@@ -409,6 +414,7 @@ impl SenseRing {
             }
             self.cookie.store(cookie, Ordering::Release);
             if let Some(f) = (*dma).device_issue_pending {
+                self.active.store(true, Ordering::Release);
                 f(chan);
             }
         }
@@ -417,6 +423,7 @@ impl SenseRing {
 
     /// Stops the transfer and waits for its callback; a no-op without a channel.
     fn stop(&self) {
+        self.active.store(false, Ordering::Release);
         let chan = self.chan.load(Ordering::Acquire);
         if chan.is_null() {
             return;
@@ -620,6 +627,9 @@ impl SenseRing {
 unsafe extern "C" fn sense_ring_done(param: *mut c_void) {
     // SAFETY: by the function's contract.
     let ring = unsafe { &*param.cast::<SenseRing>() };
+    if !ring.active.load(Ordering::Acquire) {
+        return;
+    }
     let chan = ring.chan.load(Ordering::Acquire);
     if chan.is_null() {
         return;
@@ -637,6 +647,9 @@ unsafe extern "C" fn sense_ring_done(param: *mut c_void) {
             None => return,
         }
     };
+    if !ring.active.load(Ordering::Acquire) {
+        return;
+    }
     // SAFETY: no preconditions.
     let now_ns = unsafe { bindings::ktime_get() };
     let ring_bytes = ring.ring_bytes();
