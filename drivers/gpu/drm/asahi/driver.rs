@@ -54,7 +54,7 @@ pub(crate) struct AsahiPlatformDriverData<'bound> {
     pub(crate) g16: Option<Arc<crate::g16::Gpu>>,
     m3: Option<M3Backend>,
     /// The G14 firmware-27.2 backend, whose firmware must be stopped on unbind.
-    #[cfg(all(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_M3_T8122))]
+    #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
     g14_v27_2: Option<Arc<crate::g14_v27_2::Backend>>,
     /// Raw `struct device *` of the platform device. Stored once at probe
     /// time so the `Drop` impl can find the sysfs file on unregister.
@@ -276,7 +276,7 @@ unsafe extern "C" fn sleep_prepare(dev: *mut bindings::device) -> core::ffi::c_i
     // G14 on firmware 27.2: the firmware keeps running through suspend-to-idle, with nothing in
     // flight; a sleep that powers the SoC down would lose it, and it has no cold restart, so that
     // is refused.
-    #[cfg(all(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_M3_T8122))]
+    #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
     if let Some(backend) = data.g14_v27_2.as_ref() {
         // SAFETY: Reads a global flag word.
         if unsafe { bindings::pm_suspend_via_firmware() } {
@@ -298,7 +298,7 @@ unsafe extern "C" fn sleep_prepare(dev: *mut bindings::device) -> core::ffi::c_i
 unsafe extern "C" fn sleep_complete(dev: *mut bindings::device) {
     // SAFETY: Called by the PM core.
     let data = unsafe { sleep_data(dev) };
-    #[cfg(all(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_M3_T8122))]
+    #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
     if let Some(backend) = data.g14_v27_2.as_ref() {
         backend.sleep_complete();
     }
@@ -359,7 +359,7 @@ impl platform::Driver for AsahiPlatformDriver {
         if let Some(m3) = this.m3.as_ref() {
             m3.stop();
         }
-        #[cfg(all(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_M3_T8122))]
+        #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
         if let Some(backend) = this.g14_v27_2.as_ref() {
             backend.stop();
         }
@@ -402,11 +402,11 @@ impl platform::Driver for AsahiPlatformDriver {
 
         // The loader advertises the supported wire layout independently of the image version.
         if has_g14_handoff && compat.as_slice() == [27, 2, 0] {
-            #[cfg(all(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_M3_T8122))]
+            #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
             return AsahiPlatformDriver::probe_g14_v27_2(
                 pdev, cfg, hw::t8112::REGISTERS_V27_2, hw::t8112::WRITABLE_V27_2,
             );
-            #[cfg(not(all(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_M3_T8122)))]
+            #[cfg(not(CONFIG_DRM_ASAHI_G14_V27_2))]
             return Err(ENODEV);
         }
 
@@ -486,7 +486,7 @@ impl platform::Driver for AsahiPlatformDriver {
             _reg: reg,
             g17: None,
             m3: None,
-            #[cfg(all(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_M3_T8122))]
+            #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
             g14_v27_2: None,
             #[cfg(CONFIG_DRM_ASAHI_G16)]
             g16: None,
@@ -501,7 +501,7 @@ impl platform::Driver for AsahiPlatformDriver {
 
 impl AsahiPlatformDriver {
     /// G14 with firmware 27.2: start the firmware and register a compute-only DRM device.
-    #[cfg(all(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_M3_T8122))]
+    #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
     fn probe_g14_v27_2<'bound>(
         pdev: &'bound platform::Device<Core<'_>>,
         cfg: &'static hw::HwConfig,
@@ -563,7 +563,7 @@ impl AsahiPlatformDriver {
             _reg: reg,
             g17: None,
             m3: None,
-            #[cfg(all(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_M3_T8122))]
+            #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
             g14_v27_2: None,
             #[cfg(CONFIG_DRM_ASAHI_G16)]
             g16: None,
@@ -607,7 +607,7 @@ impl AsahiPlatformDriver {
             _reg: reg,
             g17: None,
             m3: Some(backend),
-            #[cfg(all(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_M3_T8122))]
+            #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
             g14_v27_2: None,
             raw_dev: core::ptr::null_mut(),
             raw_stats: core::ptr::null_mut(),
@@ -690,7 +690,7 @@ impl AsahiPlatformDriver {
             _reg: reg,
             g17: Some(gpu),
             m3: None,
-            #[cfg(all(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_M3_T8122))]
+            #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
             g14_v27_2: None,
             #[cfg(CONFIG_DRM_ASAHI_G16)]
             g16: None,
@@ -739,7 +739,7 @@ impl AsahiPlatformDriver {
             _reg: reg,
             g17: None,
             m3: None,
-            #[cfg(all(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_M3_T8122))]
+            #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
             g14_v27_2: None,
             #[cfg(CONFIG_DRM_ASAHI_G16)]
             g16: None,
@@ -780,7 +780,7 @@ impl AsahiPlatformDriver {
             _reg: reg,
             g17: None,
             m3: None,
-            #[cfg(all(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_M3_T8122))]
+            #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
             g14_v27_2: None,
             g16: Some(gpu),
             raw_dev,
@@ -838,7 +838,7 @@ impl AsahiPlatformDriver {
                 _reg: reg,
                 g17: None,
                 m3: None,
-                #[cfg(all(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_M3_T8122))]
+                #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
                 g14_v27_2: None,
                 #[cfg(CONFIG_DRM_ASAHI_G16)]
                 g16: None,
@@ -875,7 +875,7 @@ impl Drop for AsahiPlatformDriverData<'_> {
         if let Some(m3) = self.m3.as_ref() {
             m3.stop();
         }
-        #[cfg(all(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_M3_T8122))]
+        #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
         if let Some(backend) = self.g14_v27_2.as_ref() {
             backend.stop();
         }

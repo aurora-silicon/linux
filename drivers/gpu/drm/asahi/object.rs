@@ -697,7 +697,7 @@ impl<T, U: Allocation<T>> GpuArray<T, U> {
     }
 }
 
-#[cfg(all(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_M3_T8122))]
+#[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
 impl<U: Allocation<u8>> GpuArray<u8, U> {
     /// Aligned index in a shared firmware ring, accessed without borrowing its payload.
     pub(crate) fn shared_index(&self, offset: usize) -> Result<&core::sync::atomic::AtomicU32> {
