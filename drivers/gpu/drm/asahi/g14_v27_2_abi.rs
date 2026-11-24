@@ -100,9 +100,8 @@ pub(crate) const COMPUTE_USER_TIMESTAMPS: usize = 0x2dc;
 
 /// The 27.2 compute command's JobMeta flush_stamps word, after the completion stamp, firmware
 /// stamp, stamp value and slot (+0x298..+0x2b4); the render commands keep it at the same place
-/// of their JobMeta (vertex +0x5a0, fragment +0x904). Set, the firmware flushes the command's
-/// stamps when it completes; left clear, a compute queue whose commands write user timestamps
-/// stalls with commands fetched but never retired.
+/// of their JobMeta (vertex +0x5a0, fragment +0x904), and the M3 27.2 compute command sets it
+/// when it does not coalesce. Set, the firmware flushes the command's stamps when it completes.
 pub(crate) const COMPUTE_FLUSH_STAMPS: usize = 0x2b4;
 /// The 13.5 compute JobParameters1 inside the 27.2 compute command.
 pub(crate) const COMPUTE_JOB_PARAMETERS1: usize = 0x68;
