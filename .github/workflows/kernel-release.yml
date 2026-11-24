@@ -17,7 +17,8 @@
 # the KUnit suites built as modules) before anything is published.
 #
 # The aurora-* channel tags are protected by a ruleset; the publish job moves
-# them over SSH with the release deploy key (secret RELEASE_DEPLOY_KEY), only
+# them over SSH with the release deploy key (RELEASE_DEPLOY_KEY, a secret of the
+# release environment, which deploys only from main and v* tags), only
 # forward and with a lease. Stable releases attach to the v* tag an Owner pushed.
 # Every published asset gets a build provenance attestation.
 #
@@ -264,6 +265,9 @@ jobs:
     needs: [plan, build, smoke]
     if: needs.plan.outputs.channel != 'none' && needs.plan.outputs.build == 'true'
     runs-on: ubuntu-24.04-arm
+    # The release environment only deploys from main and v* tags and holds
+    # RELEASE_DEPLOY_KEY, so no other branch's run can read the key.
+    environment: release
     concurrency:
       group: kernel-release-publish-${{ needs.plan.outputs.channel }}
       cancel-in-progress: false
