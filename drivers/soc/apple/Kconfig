@@ -390,6 +390,19 @@ config APPLE_REGVIEW
 
 	  This is a development aid. If unsure, say 'n'.
 
+config APPLE_REGVIEW_KUNIT_TEST
+	tristate "KUnit tests for the Apple SoC read-only register views" if !KUNIT_ALL_TESTS
+	depends on APPLE_REGVIEW && KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  Check every built-in register list against the apertures it
+	  needs, the bounds check for short, misnumbered, empty and
+	  wrapping ranges, and the exact text of the views, on register
+	  windows that the test backs with kernel memory. The tests touch
+	  no hardware.
+
+	  If unsure, say N.
+
 config APPLE_CLPC
 	tristate "Apple host performance controller floors"
 	depends on ARCH_APPLE || COMPILE_TEST
