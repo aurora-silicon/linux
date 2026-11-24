@@ -281,8 +281,6 @@ struct t6040_sleep {
 	unsigned int dry;
 	void __iomem *cpu_start;
 	void __iomem *wdt;
-	/* The DT's wdt block is the one t6040_resume_stub hardcodes. */
-	bool wdt_stub_ok;
 	/* The commit's and the wake's SoC blocks (see the #defines). Optional. */
 	void __iomem *cluster_ctl;
 	void __iomem *pwrgate;
@@ -1354,7 +1352,7 @@ static int t6040_apcie_st_raise(struct t6040_sleep *s)
  * The first thing Linux runs after a wake, MMU off and no stack (as the T8132 stub does). The
  * last wake program leaves the AON WD2 running for 5 s, less than the device resume takes:
  * restart it for 60 s, in t6040_sleep_set_wd2()'s order, then take cpu_resume. The PA is
- * the T6040 AON WDT (T6040_WDT_PA), used only when the DT's wdt block is that one.
+ * the T6040 AON WDT (T6040_WDT_PA): probe refuses a DT whose wdt block is another one.
  */
 asm("	.pushsection .text, \"ax\"\n"
 "	.type	t6040_resume_stub, %function\n"
@@ -2087,10 +2085,14 @@ static int t6040_sleep_map_regs(struct apple_sleep *c)
 		return dev_err_probe(dev, -ENODEV, "a register block is missing or not mapped\n");
 
 	widx = of_property_match_string(dev->of_node, "reg-names", "wdt");
-	s->wdt_stub_ok = widx >= 0 && !of_address_to_resource(dev->of_node, widx, &wres) &&
-			 wres.start == T6040_WDT_PA;
-	if (!s->wdt_stub_ok)
-		dev_warn(dev, "the wdt block is not the AON watchdog: no WD2 restart at the wake\n");
+	/*
+	 * The wake stub restarts the WD2 at T6040_WDT_PA before anything else runs; on another
+	 * watchdog the one the wake program leaves running would reset the Mac mid-resume.
+	 */
+	if (widx < 0 || of_address_to_resource(dev->of_node, widx, &wres) ||
+	    wres.start != T6040_WDT_PA)
+		return dev_err_probe(dev, -ENODEV,
+				     "the wdt block is not the AON watchdog the wake stub restarts\n");
 
 	s->aop_ps = t6040_sleep_map_min(dev, "aop-ps", AOP_PS_SIZE);
 	for (i = 0; i < ARRAY_SIZE(s->dcs); i++) {
