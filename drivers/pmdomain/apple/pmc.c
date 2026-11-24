@@ -275,9 +275,13 @@ static int apple_pmc_agent_enable(struct apple_pmc *pmc, unsigned int agent,
 	return ret;
 }
 
+static struct platform_driver apple_pmc_driver;
+
 static struct apple_pmc *apple_pmc_from_dev(struct device *dev)
 {
-	return dev ? dev_get_drvdata(dev) : NULL;
+	if (!dev || dev->driver != &apple_pmc_driver.driver)
+		return NULL;
+	return dev_get_drvdata(dev);
 }
 
 /**
