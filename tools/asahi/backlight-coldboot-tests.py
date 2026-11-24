@@ -72,7 +72,8 @@ struct apple_dcp {
  struct { struct dcp_backlight_state state; int lock; } backlight;
  struct { bool update; u32 maximum; } brightness;
  bool panel,m4,v14,external,typec,pipe_enabled_h17p,crashed,quiescing;
- bool typec_crtc_off,typec_cable_connected,typec_follow_start,typec_poweron_hpd,hdmi_yielded;
+ bool typec_crtc_off,typec_cable_connected,typec_follow_start,typec_poweron_hpd,hdmi_yielded,hdmi_crtc_off;
+ void *connector;
  unsigned crtc_unplugs,typec_unplugs,typec_generation,typec_reconnect_tries,external_generation,external_crtc_generation;
  int external_lock,hpd_mutex,relink_lock,relink,typec_iomfb_hpd_ready;
  struct delayed_work typec_reconnect_wq,placeholder_edid_wq,external_stop_retry_wq,bl_fallback_wq;
@@ -125,6 +126,7 @@ static void dcp_queue_typec_reconnect(struct apple_dcp *p,int n) { (void)p;(void
 static unsigned long wait_for_completion_timeout(int *p,unsigned long n) { (void)p;return n; }
 static unsigned long msecs_to_jiffies(unsigned long n) { return n; }
 static bool gpiod_get_value_cansleep(void *p) { return p!=NULL; }
+static void disconnected_hpd_event(void *p) { (void)p; }
 static void queue_delayed_work(unsigned long q,struct delayed_work *w,unsigned delay)
 { (void)q;(void)w;assert(delay==DCP_BL_FALLBACK_DELAY);fallbacks++; }
 '''

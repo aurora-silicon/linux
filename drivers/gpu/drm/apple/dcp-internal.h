@@ -1109,6 +1109,8 @@ struct apple_dcp {
 #endif
 
 	struct gpio_desc *hdmi_hpd;
+	/* CRTC off released the fixed HDMI link while its sink stays attached. */
+	bool hdmi_crtc_off;
 	struct gpio_desc *hdmi_pwren;
 	struct gpio_desc *dp2hdmi_pwren;
 
