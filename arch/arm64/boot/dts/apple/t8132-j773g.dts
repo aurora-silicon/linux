@@ -272,6 +272,15 @@
 	/delete-property/ apple,dma-range;
 };
 
+&ps_apcie_gp {
+	status = "okay";
+};
+
+&ps_apcie_sys_gp {
+	apple,always-on;
+	status = "okay";
+};
+
 &pcie0 {
 	/delete-property/ apple,managed-sids;
 	/* ADT mapper-apcie2 maps the Ethernet requester to DART2 stream 1. */
