@@ -4638,14 +4638,16 @@ static int atcphy_usb3_power_off(struct phy *phy)
 		return ret;
 	atcphy->t8103_usb3_retry = false;
 	/*
-	 * T8132 keeps DWC3 on the dummy PIPE while USB4/Thunderbolt owns the
-	 * lanes. Stopping that USB host must not take the dock's PCIe and DP
-	 * tunnels down before their drivers suspend. The Type-C mux owns the
-	 * CIO mode and releases it when the connection ends. A CIO mode whose
-	 * last transition failed is still taken down, as before.
+	 * In USB4/Thunderbolt the router owns the lanes: dwc3 only had its PIPE
+	 * on the router's USB3 adapter (or on the dummy backend), and that is
+	 * parked above. Stopping the USB host, for a cable change or only for a
+	 * data role swap, must not take the router's link down with it: that
+	 * drops a host-to-host link, and a dock's PCIe and DP tunnels, before
+	 * their drivers know. The Type-C mux owns the CIO mode and releases it
+	 * when the connection ends. A CIO mode whose last transition failed is
+	 * still taken down, as before.
 	 */
-	if (atcphy->hw->gen == ATCPHY_GENERATION_T8132 && atcphy_mode_is_cio(atcphy->mode) &&
-	    !atcphy->mode_dirty)
+	if (atcphy_mode_is_cio(atcphy->mode) && !atcphy->mode_dirty)
 		return 0;
 	/*
 	 * dwc3 can tear its host down while a DisplayPort alt mode link is up,

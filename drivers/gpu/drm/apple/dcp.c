@@ -7197,8 +7197,16 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	}
 
 	fw_compat = dcp_check_firmware_version(dev);
-	if (fw_compat == DCP_FIRMWARE_UNKNOWN)
+	if (fw_compat == DCP_FIRMWARE_UNKNOWN) {
+		/*
+		 * The firmware does not change until the next boot, so this
+		 * processor never registers its Type-C display routes: disable
+		 * them, so that the port controllers that name them as their
+		 * mode switch do not wait for them, and USB on the ports goes on.
+		 */
+		dcp_typec_routes_disable_dev(dev);
 		return -ENODEV;
+	}
 	if (fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
 	    (fw_compat == DCP_FIRMWARE_V_27_0 &&
 	     of_device_is_compatible(dev->of_node, "apple,t6041-dcp"))) {
