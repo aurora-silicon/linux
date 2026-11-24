@@ -101,10 +101,6 @@ static int t6050_sd_port_wake = 2;
 module_param(t6050_sd_port_wake, int, 0644);
 MODULE_PARM_DESC(t6050_sd_port_wake,
 		 "T6050: the SD card reader's port after a firmware sleep: back once the resume is over (2, default), back in the early resume (1), or parked until a restart (0)");
-/* A real sleep takes a conventional host's power: its ports are set up again as at probe. */
-static bool s2r_conventional = true;
-module_param(s2r_conventional, bool, 0644);
-MODULE_PARM_DESC(s2r_conventional, "Set a conventional host's ports up again after a real S2R");
 
 /* T8103 (original M1) and related SoCs */
 #define CORE_RC_PHYIF_CTL		0x00024
@@ -7658,8 +7654,7 @@ failed:
  */
 static bool apple_pcie_s2r_conventional(struct apple_pcie *pcie)
 {
-	return READ_ONCE(s2r_conventional) && pcie->hw->s2r_ports_lost &&
-	       !pcie->hw->tunneled && !pcie->managed_sids &&
+	return pcie->hw->s2r_ports_lost && !pcie->hw->tunneled && !pcie->managed_sids &&
 	       !pcie->piodma_supplier && !pcie->hw->root_bus_only;
 }
 
