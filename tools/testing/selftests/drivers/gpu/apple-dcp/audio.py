@@ -124,6 +124,7 @@ def cec_only_endpoint(root):
     source = (root / 'drivers/gpu/drm/apple/av.c').read_text()
     prefix = r'''
 #include <assert.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -134,7 +135,12 @@ typedef uint64_t u64;
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x, v) ((x) = (v))
 #define dev_info(d, ...) ((void)(d))
-#define dev_err(d, ...) ((void)(d))
+static unsigned errs, armed;
+#define dev_err(d, ...) ((void)(d), errs++)
+#define AV_AUDIOSRV_REPLACE_MS 1000
+static int system_wq;
+static unsigned long msecs_to_jiffies(unsigned m) {return m;}
+#define mod_delayed_work(wq, w, j) ((void)(wq), (void)(w), (void)(j), armed++)
 struct device {int unused;};
 struct platform_device {int unused;};
 struct lock {int held;};
@@ -155,9 +161,12 @@ struct audiosrv_data {
     u64 gen, v27_boot_gen;
     struct platform_device *audio_dev;
     struct {u32 open, close;} cmds;
+    int open_check_wq, open_refused;
+    struct device *open_check_dev;
 };
 struct apple_dcp {struct device *dev; struct apple_dcp_afkep *avep; struct audiosrv_data *audiosrv;};
 static bool native, v27;
+static int call_ret;
 static unsigned calls, last_cmd, connects, disconnects, releases, closes, v27_starts;
 static bool dcp_audiosrv_native_link(struct device *dev) {(void)dev; return native;}
 static bool dcp_is_v14_7_external(const struct apple_dcp *dcp) {(void)dcp; return false;}
@@ -176,7 +185,7 @@ static int afk_service_call(struct apple_epic_service *s, int group, u32 cmd, co
                             size_t pad, void *out, size_t room, size_t out_pad)
 {
     (void)group; (void)data; (void)len; (void)pad; (void)out; (void)room; (void)out_pad;
-    assert(s && s->pins); calls++; last_cmd = cmd; return 0;
+    assert(s && s->pins); calls++; last_cmd = cmd; return call_ret;
 }
 '''
     return prefix + block(source, 'void av_service_connect(') + '\n' + block(
@@ -224,6 +233,23 @@ int main(void)
     av_service_connect(&dcp);
     av_service_disconnect(&dcp);
     assert(connects == 3 && disconnects == 2 && calls == 2);
+
+    /*
+     * Classic link, the firmware refuses the Open (an instance being
+     * replaced): judged later, not reported now; any other error is.
+     */
+    native = v27 = false;
+    asrv.srv = &srv;
+    call_ret = -EINVAL;
+    av_service_connect(&dcp);
+    assert(calls == 3 && !asrv.is_open && armed == 1 && !errs && asrv.open_refused == -EINVAL &&
+           asrv.open_check_dev == &dev && connects == 3);
+    call_ret = -ETIMEDOUT;
+    av_service_connect(&dcp);
+    assert(calls == 4 && !asrv.is_open && armed == 1 && errs == 1);
+    call_ret = 0;
+    av_service_connect(&dcp);
+    assert(calls == 5 && asrv.is_open && connects == 4);
     assert(!srv.pins && !asrv.srv_rwsem.held && !asrv.plug_lock.held);
     return 0;
 }
