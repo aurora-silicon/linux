@@ -291,9 +291,9 @@ static void avd_pm_open_boot_replay_test(struct kunit *test)
 	avd->code = (__force void __iomem *)kunit_kzalloc(test, 0x100, GFP_KERNEL);
 	avd->mbox = (__force void __iomem *)kunit_kzalloc(test, 0x100, GFP_KERNEL);
 	avd->pm.piodma = (__force void __iomem *)kunit_kzalloc(test, 0x28, GFP_KERNEL);
-	KUNIT_ASSERT_NOT_NULL(test, avd->code);
-	KUNIT_ASSERT_NOT_NULL(test, avd->mbox);
-	KUNIT_ASSERT_NOT_NULL(test, avd->pm.piodma);
+	KUNIT_ASSERT_NOT_NULL(test, (__force void *)avd->code);
+	KUNIT_ASSERT_NOT_NULL(test, (__force void *)avd->mbox);
+	KUNIT_ASSERT_NOT_NULL(test, (__force void *)avd->pm.piodma);
 	avd->pm.sram_phys = 0x123456780ULL;
 	for (i = 0; i < 2; i++) {
 		/* Model loss of both ITCM and PIODMA configuration between boots. */
