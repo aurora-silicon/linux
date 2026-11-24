@@ -3090,6 +3090,9 @@ impl Pair {
             }
         }
     }
+    pub(crate) fn graph_started(&self) -> bool {
+        self.graph_started
+    }
     pub(crate) fn forget_registration(&mut self) {
         self.registered = None;
     }
@@ -3203,16 +3206,20 @@ impl Pair {
             .into_iter()
             .all(|c| c.done == c.read && c.read == c.write))
     }
-    pub(crate) fn reusable(&self) -> Result<bool> {
+    /// Idle, drained, and free of pending retirement or channel errors so a
+    /// live owner's sibling can be detached or a closed owner's pair reused.
+    pub(crate) fn detachable(&self) -> Result<bool> {
         let previous_ready = self
             .previous
             .as_ref()
             .is_none_or(|p| p.memory.is_none() && self.context_update && !p.ready);
         Ok(!self.channel_error
-            && self.owner.is_none()
             && self.displaced.is_none()
             && previous_ready
             && self.idle_for_context(self.context())?)
+    }
+    pub(crate) fn reusable(&self) -> Result<bool> {
+        Ok(self.owner.is_none() && self.detachable()?)
     }
     /// An M5 pool may be replaced without changing the pair's live logical
     /// owner. Commands already using the pair must drain, and an earlier

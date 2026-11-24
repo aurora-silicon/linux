@@ -114,7 +114,7 @@ def build(mutation=None):
 
     pairs_code = '\n'.join([
         re.search(r'pub\(crate\) const COMPUTE_CHANNELS_MAX: usize = \d+;', pairs).group(0),
-        re.search(r'const G17D_PAIRS: u8 = [^;]+;', pairs).group(0),
+        re.search(r'const MULTI_PAIRS: u8 = [^;]+;', pairs).group(0),
         re.search(r'static PAIRS: AtomicU8 = AtomicU8::new\(\d+\);', pairs).group(0),
         re.search(r'static COMPUTE_CHANNELS: AtomicU8 = AtomicU8::new\(\d+\);', pairs).group(0),
         item(pairs, 'pub(crate) fn select_board('),
@@ -156,7 +156,7 @@ mod file {
     @@FILE@@
 }
 
-pub struct Board { g17d: bool, compute_channels: u8 }
+pub struct Board { g17d: bool, clusters: u32, compute_channels: u8 }
 impl Board {
     fn g17d_forms(&self) -> bool { self.g17d }
     @@CHANNELS@@
@@ -199,8 +199,8 @@ fn main() {
     for &(name, channels) in BOARDS {
         let multi = name == "J714";
         assert!(channels >= 1 && usize::from(channels) <= pairs::COMPUTE_CHANNELS_MAX, "{}", name);
-        for g17d in [false, true] {
-            let board = Board { g17d, compute_channels: channels };
+        for (g17d, clusters) in [(false, 1), (false, 2), (true, 4), (true, 8)] {
+            let board = Board { g17d, clusters, compute_channels: channels };
             assert_eq!(multi_channel(&board), multi, "{}: multi_channel()", name);
             pairs::select_board(&board);
             assert_eq!(pairs::compute_channels_per_owner(), channels, "{}: channels per owner", name);
