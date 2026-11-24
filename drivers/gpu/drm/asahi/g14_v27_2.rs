@@ -977,7 +977,8 @@ impl Runtime {
                 return Ok(());
             }
             if remaining == 0 {
-                dev_err!(self.dev, "GPU: sleep refused, {} commands still running\n", state.inflight.len());
+                dev_err!(self.dev, "GPU: sleep refused, {} compute commands and {} render pairs still running\n",
+                         state.inflight.len(), usize::from(state.rendering.is_some()));
                 self.asleep.store(false, Ordering::Release);
                 self.pump(state);
                 return Err(EBUSY);

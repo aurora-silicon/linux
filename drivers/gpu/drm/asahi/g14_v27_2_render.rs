@@ -113,7 +113,11 @@ impl QueueRender {
     /// Called with the render data masters idle, so making a fresh binding cannot free memory
     /// which a previous flight still owns.
     pub(crate) fn prepare(&self, r: &UapiRenderCommand, usc: u64) -> Result<Prep> {
-        let tile = crate::queue::QueueInnerG14V13_5::get_tiling_params(&to_cmdbuf(r), 1)?;
+        let clusters =
+            <crate::gpu::GpuManagerG14V13_5 as crate::gpu::GpuManager>::get_dyncfg(&self.graph)
+                .id
+                .num_clusters;
+        let tile = crate::queue::QueueInnerG14V13_5::get_tiling_params(&to_cmdbuf(r), clusters)?;
         self.buffer.ensure_parameter_blocks(tile.min_tvb_blocks)?;
         let mut alloc =
             <crate::gpu::GpuManagerG14V13_5 as crate::gpu::GpuManager>::alloc(&self.graph);
