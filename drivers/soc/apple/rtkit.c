@@ -3536,6 +3536,21 @@ out:
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_wake_retained);
 
+/*
+ * After a sleep that took the co-processor's power, its mailbox's enables are gone with
+ * it: set them again before the co-processor is started, or its messages never arrive.
+ * The receive enable is one the boot loader sets on M1, which Linux doesn't set otherwise.
+ */
+int apple_rtkit_mbox_restore(struct apple_rtkit *rtk)
+{
+	int ret = apple_mbox_restore(rtk->mbox);
+
+	if (!ret)
+		apple_mbox_set_recv_enabled(rtk->mbox, true);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_mbox_restore);
+
 void apple_rtkit_free(struct apple_rtkit *rtk)
 {
 	apple_rtkit_stop_rx(rtk);
