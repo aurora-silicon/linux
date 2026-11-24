@@ -936,12 +936,16 @@ impl Firmware {
 
     /// Called at actual submission publication, not while a queued job is merely being built.
     fn note_submission(&mut self) -> Result {
+        let now = now_ns();
         self.primary.state.shared.note_submitter();
         self.port.note_gpu_activity();
         self.primary.state.shared.note_gpu_activity();
         self.effort.submit();
-        self.effort.note_waiters(now_ns(), fence::waiters());
+        self.effort.note_waiters(now, fence::waiters());
         self.effort.note_bound(self.primary.state.shared.feed.busy_run());
+        if self.effort.bound() {
+            self.port.lift_busy_if_below_top(now);
+        }
         self.apply_effort(power::FULL_EFFORT)
     }
 
@@ -1049,6 +1053,9 @@ impl Firmware {
         if self.effort.streaming() {
             let waiters = self.effort.note_waiters(now_ns, fence::waiters());
             let bound = self.effort.note_bound(self.primary.state.shared.feed.busy_run());
+            if self.effort.bound() {
+                self.port.lift_busy_if_below_top(now_ns);
+            }
             if waiters || bound {
                 self.apply_effort(power::FULL_EFFORT)?;
             }

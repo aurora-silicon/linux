@@ -1687,12 +1687,16 @@ impl compute::Host for ComputeHost<'_> {
         self.port.notify(message)
     }
     fn note_submission(&mut self) -> Result {
+        let now = super::now_ns();
         self.shared.note_submitter();
         self.port.note_gpu_activity();
         self.shared.note_gpu_activity();
         self.effort.submit();
-        self.effort.note_waiters(super::now_ns(), super::fence::waiters());
+        self.effort.note_waiters(now, super::fence::waiters());
         self.effort.note_bound(self.shared.feed.busy_run());
+        if self.effort.bound() {
+            self.port.lift_busy_if_below_top(now);
+        }
         super::Firmware::apply_shared_effort(self.init, self.effort, self.port, super::power::FULL_EFFORT)
     }
     fn submit_m5(&mut self, submission: &super::fw::m5::queue::HardwareSubmission) -> Result {

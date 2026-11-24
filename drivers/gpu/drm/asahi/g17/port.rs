@@ -659,6 +659,28 @@ impl Port {
             .store(busy.below_top(), Ordering::Relaxed);
     }
 
+    /// Lifts CLPC to the top memory/fabric column immediately when a sustained busy run
+    /// ([`super::power::BusyRuns::bound`]) begins while the last reported share is below
+    /// the top column. Lock-free once at the top column.
+    pub(super) fn lift_busy_if_below_top(&self, now_ns: u64) {
+        if !self.demand.has_provider() || !self.busy_below_top.load(Ordering::Relaxed) {
+            return;
+        }
+        let retired = crate::usage::ENGINE_NS
+            .each_ref()
+            .map(|ns| ns.load(Ordering::Acquire));
+        let oldest = self.qos.lock().oldest_in_flight();
+        let now_ns = super::now_ns().max(now_ns);
+        let mut busy = self.busy.lock();
+        if let Some(permille) = busy.lift_saturated(now_ns, retired, oldest) {
+            self.demand.set_busy(permille);
+        }
+        self.busy_window_start
+            .store(busy.window_start().map_or(0, |s| s.max(1)), Ordering::Relaxed);
+        self.busy_below_top
+            .store(busy.below_top(), Ordering::Relaxed);
+    }
+
     /// Wake delay (ns) for `idle_check` while a solo long command is running below
     /// the top CLPC busy column, or `None` when already at top or idle.
     pub(super) fn busy_recheck_delay(&self, now_ns: u64) -> Option<u64> {
