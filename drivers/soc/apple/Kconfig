@@ -345,7 +345,7 @@ config APPLE_REGVIEW
 config APPLE_CLPC
 	tristate "Apple host performance controller floors"
 	depends on ARCH_APPLE || COMPILE_TEST
-	depends on APPLE_PMC && CPU_FREQ
+	depends on (APPLE_PMC || !APPLE_PMC) && CPU_FREQ
 	depends on MFD_MACSMC || !MFD_MACSMC
 	select ACPI_PLATFORM_PROFILE if ACPI
 	default ARCH_APPLE
@@ -353,9 +353,9 @@ config APPLE_CLPC
 	  Raises the DRAM controller and SoC fabric performance floors of the
 	  host's PMC voter agent while CPU clusters are busy, and releases
 	  them at idle. On SoCs with power modes it also offers them as
-	  platform profiles.
+	  platform profiles (with or without a PMC parent).
 
-	  Say 'y' or 'm' here if you have an Apple SoC with a PMC.
+	  Say 'y' or 'm' here if you have an Apple SoC.
 
 config APPLE_DISPLAY_GATE
 	bool "Apple internal display enable gate"
