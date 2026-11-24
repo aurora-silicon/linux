@@ -366,3 +366,7 @@ module_platform_driver(apple_cio_reset_driver);
 MODULE_AUTHOR("Sven Peter <sven@kernel.org>");
 MODULE_DESCRIPTION("Apple SoC CIO block reset driver");
 MODULE_LICENSE("Dual MIT/GPL");
+
+#if IS_ENABLED(CONFIG_RESET_APPLE_CIO_KUNIT_TEST)
+#include "reset-apple-cio-test.c"
+#endif
