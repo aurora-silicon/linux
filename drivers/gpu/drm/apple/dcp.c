@@ -2309,6 +2309,37 @@ static unsigned long dcp_dptx_wait_linkcfg(struct apple_dcp *dcp, u32 port,
 }
 
 /*
+ * A fixed HDMI port can come up from the boot loader with a default surface
+ * already active, in which case the firmware does not start fresh link
+ * training while AP HPD is withheld. Assert AP HPD from the converter's real
+ * HPD GPIO before waiting for link configuration, except on paths where HPD
+ * has another owner (such as 13.5 DP2HDMI, where the converter holds HPD on
+ * its own and linkcfg timeout is non-fatal, or an adopted session whose
+ * post-wait path drives HPD).
+ */
+static int dcp_assert_hpd_before_link_wait(struct apple_dcp *dcp, u32 port,
+					   bool late_hpd, bool skip_fixed_hdmi)
+{
+	bool typec = dcp_is_typec_output(dcp);
+	bool fixed_hdmi = !typec && !skip_fixed_hdmi &&
+			  dcp->fixed_connector_type == DRM_MODE_CONNECTOR_HDMIA &&
+			  dcp->hdmi_hpd;
+	int level;
+
+	if (late_hpd || (!typec && !fixed_hdmi))
+		return 0;
+	if (fixed_hdmi) {
+		level = gpiod_get_value_cansleep(dcp->hdmi_hpd);
+		if (level <= 0)
+			return level < 0 ? level : -ENOLINK;
+	}
+	if (dcp_uses_t6020_tunnel_flow(dcp))
+		return dptxport_set_hpd_timeout(dcp->dptxport[port].service,
+						true, 8000);
+	return dptxport_set_hpd(dcp->dptxport[port].service, true);
+}
+
+/*
  * Connect DPTX port @port. On failure, @retryable (if given) tells whether
  * the attempt left nothing outstanding in the firmware, so that a later
  * connection may simply try again: the service was not published yet, or a
@@ -2460,19 +2491,17 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 		goto out_release;
 	}
 	dcp->dptxport[port].connected = true;
-	if (dcp_is_typec_output(dcp) && !late_hpd) {
-		if (dcp_uses_t6020_tunnel_flow(dcp))
-			ret = dptxport_set_hpd_timeout(dcp->dptxport[port].service,
-						       true, 8000);
+	ret = dcp_assert_hpd_before_link_wait(dcp, port, late_hpd, dp2hdmi);
+	if (ret) {
+		if (ret == -ENOLINK)
+			dev_dbg(dcp->dev,
+				"dcp_dptx_connect: HDMI HPD dropped before assert\n");
 		else
-			ret = dptxport_set_hpd(dcp->dptxport[port].service, true);
-		if (ret) {
 			dev_err(dcp->dev,
-				"dcp_dptx_connect: failed to assert Type-C HPD: %d\n",
+				"dcp_dptx_connect: failed to assert AP HPD: %d\n",
 				ret);
-			dcp->dptxport[port].connected = false;
-			goto out_release;
-		}
+		dcp->dptxport[port].connected = false;
+		goto out_release;
 	}
 
 	mutex_unlock(&dcp->hpd_mutex);
