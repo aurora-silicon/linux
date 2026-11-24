@@ -284,11 +284,15 @@ impl Power {
 struct Pools {
     reclaim_calls: u32,
     reclaim_remaining: bool,
+    closed_vm_last: bool,
 }
 impl Pools {
     fn reclaim_closed(&mut self) -> bool {
         self.reclaim_calls += 1;
         self.reclaim_remaining
+    }
+    fn take_closed_vm_last(&mut self) -> bool {
+        core::mem::take(&mut self.closed_vm_last)
     }
 }
 
@@ -570,6 +574,19 @@ fn idle_poll_step_reclaims_closed_vm_slots_and_rearms_while_remaining() {
         .unwrap();
     assert_eq!((fw.pools.reclaim_calls, fw.slots.reclaim_calls), (3, 3));
     assert!(!shared.closed_vm_reclaim.load(Ordering::Acquire));
+
+    // A closed VM's render retired after the flag cleared and recorded its last PB epoch:
+    // the next pass reclaims once without the flag, then scans stop again.
+    fw.pools.closed_vm_last = true;
+    let _ = fw
+        .poll_step(false, 0, &mut retry_tail, &mut hk_deferred, &mut done)
+        .unwrap();
+    assert_eq!((fw.pools.reclaim_calls, fw.slots.reclaim_calls), (4, 4));
+    assert!(!shared.closed_vm_reclaim.load(Ordering::Acquire));
+    let _ = fw
+        .poll_step(false, 0, &mut retry_tail, &mut hk_deferred, &mut done)
+        .unwrap();
+    assert_eq!((fw.pools.reclaim_calls, fw.slots.reclaim_calls), (4, 4));
 }
 
 #[test]

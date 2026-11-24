@@ -174,13 +174,16 @@ pub mod g16 {
     pub mod vm {
         use crate::{mmu,sync::Arc};
         use core::sync::atomic::{AtomicBool,Ordering};
-        pub struct MockVm(AtomicBool);
+        pub struct MockVm(AtomicBool,AtomicBool);
         impl MockVm{
-            pub fn new()->Self{Self(AtomicBool::new(false))}
+            pub fn new()->Self{Self(AtomicBool::new(false),AtomicBool::new(false))}
             pub fn is_closed(&self)->bool{self.0.load(Ordering::Acquire)}
             pub fn close(&self){self.0.store(true,Ordering::Release);}
+            // Accepted renders still unpublished (the VM cache's standby reservations).
+            pub fn set_unpublished(&self,v:bool){self.1.store(v,Ordering::Release);}
         }
         pub struct VmState{pub id:u64,pub slot:u32,pub generation:u8,pub vm:MockVm}
+        impl VmState{pub fn renders_unpublished(&self)->bool{self.vm.1.load(Ordering::Acquire)}}
         struct Registry{live:std::sync::Arc<std::sync::atomic::AtomicU32>}impl Registry{fn release(&self,_file:u64){self.live.fetch_sub(1,Ordering::AcqRel);}}
         __LIVE_TOKEN__
         __LIVE_DROP__
@@ -1060,7 +1063,8 @@ pub mod g16 {
         let _=p.bind(1,false);p.publish_flight(1);
         p.invalidate();
         p.quarantine_flight(1,Some(e3.clone()));
-        assert_eq!(sync::Arc::strong_count(&e2),2,"prior slot owner epoch must stay mapped");
+        // e2 is slot 1's prior owner and VM2's last retired epoch.
+        assert_eq!(sync::Arc::strong_count(&e2),3,"prior slot owner epoch must stay mapped");
         assert_eq!(sync::Arc::strong_count(&e3),2,"aborted fresh epoch must stay mapped");
         // Render class must NOT wedge: slot 2 is fresh and needed_slots advances to 3.
         assert!(!p.exhausted());
@@ -2966,6 +2970,130 @@ pub mod g16 {
         drop(ex);
         assert_eq!(sync::Arc::strong_count(&x), 1, "closed VM released after replacement");
         assert_eq!(sync::Arc::strong_count(&x_records), 1);
+        assert!(!p.reclaim_closed());
+    }
+
+    // Live cross-VM steal of a warm PB slot (display manager active: kwin, its helpers and 16
+    // clients over 16 warm slots). VM A's epoch owns slot 3. VM B's fresh epoch rebinds slot 3
+    // and retires, replacing owners[3] while A is still open. A's next render is a cold InitBM
+    // on slot 4, the only flight; gPM_SP(0) then writes the old epoch's page list through A's
+    // context: "write unmapped level 0 unit 0xe0 ctx 62 ... flights=1 live_vm=Some(108)".
+    #[test]fn live_vm_displaced_pb_epoch_keeps_page_list_until_its_next_render_retires(){
+        let factory = g16::object::Factory;
+        let budget = g16::budget::Budget::new().unwrap();
+        let mut p = g16::pools::Pools::new(&driver::AsahiDrmDevice(device::Device));
+        let epoch = |v: &sync::Arc<g16::vm::VmState>, k: usize| {
+            let e = g16::pools::PbEpoch::new(
+                &factory,
+                v,
+                g16::budget::Budget::reserve(&budget, 1).unwrap().take().unwrap(),
+            ).unwrap();
+            e.prepare(k, g16::hw::client::pb_heap(0), 512).unwrap();
+            e.expose();
+            e
+        };
+        let run = |p: &mut g16::pools::Pools, v: &sync::Arc<g16::vm::VmState>, k: usize,
+                   e: &sync::Arc<g16::pools::PbEpoch>, completed: bool| {
+            let b = p.bind(k, false);
+            p.hold_alloc(k, v, None, None).unwrap();
+            p.publish_flight(k);
+            p.retire_flight(k, e, b, completed).unwrap();
+        };
+
+        let a = vm(62);
+        let b = vm(5);
+        let ea1 = epoch(&a, 3);
+        run(&mut p, &a, 3, &ea1, true);
+        let eb = epoch(&b, 3);
+        run(&mut p, &b, 3, &eb, true);
+        assert!(p.reusable(3, &a).is_none(), "slot 3 is bound to B's epoch");
+        assert_eq!(sync::Arc::strong_count(&ea1), 2, "A's page list unmapped while A is open");
+        assert_eq!(p.stats.kept, 1);
+
+        // A's next render binds slot 4 with InitBM. The old list stays while it is in flight
+        // and after a failed retirement, which need not have run the InitBM.
+        let ea2 = epoch(&a, 4);
+        let b2 = p.bind(4, false);
+        p.hold_alloc(4, &a, None, None).unwrap();
+        p.publish_flight(4);
+        assert_eq!(sync::Arc::strong_count(&ea1), 2);
+        p.retire_flight(4, &ea2, b2, false).unwrap();
+        assert_eq!(sync::Arc::strong_count(&ea1), 2, "a failed render released the old list");
+        let ea3 = epoch(&a, 4);
+        run(&mut p, &a, 4, &ea3, true);
+        assert_eq!(sync::Arc::strong_count(&ea1), 1, "released after A's newer render retired");
+        assert_eq!(sync::Arc::strong_count(&ea3), 3, "slot 4 owner and A's last epoch");
+        assert_eq!(sync::Arc::strong_count(&eb), 3, "slot 3 owner and B's last epoch");
+        // Warm reuse of the same epoch changes nothing.
+        run(&mut p, &b, 3, &eb, true);
+        assert_eq!(sync::Arc::strong_count(&eb), 3);
+        assert_eq!(p.stats.kept, 1);
+        // Open VMs never keep reclaim armed.
+        assert!(!p.take_closed_vm_last());
+        assert!(!p.reclaim_closed());
+    }
+
+    // A closed VM keeps its last epoch while a render it accepted waits for publication or
+    // retirement, and loses it once none does, so its context and lists are not pinned.
+    #[test]fn closed_vm_last_pb_epoch_waits_for_its_accepted_renders(){
+        let factory = g16::object::Factory;
+        let budget = g16::budget::Budget::new().unwrap();
+        let mut p = g16::pools::Pools::new(&driver::AsahiDrmDevice(device::Device));
+        let epoch = |v: &sync::Arc<g16::vm::VmState>, k: usize| {
+            let e = g16::pools::PbEpoch::new(
+                &factory,
+                v,
+                g16::budget::Budget::reserve(&budget, 1).unwrap().take().unwrap(),
+            ).unwrap();
+            e.prepare(k, g16::hw::client::pb_heap(0), 512).unwrap();
+            e.expose();
+            e
+        };
+        let run = |p: &mut g16::pools::Pools, v: &sync::Arc<g16::vm::VmState>, k: usize,
+                   e: &sync::Arc<g16::pools::PbEpoch>| {
+            let b = p.bind(k, false);
+            p.hold_alloc(k, v, None, None).unwrap();
+            p.publish_flight(k);
+            p.retire_flight(k, e, b, true).unwrap();
+        };
+
+        let a = vm(20);
+        let b = vm(21);
+        let ea1 = epoch(&a, 3);
+        run(&mut p, &a, 3, &ea1);
+        let eb = epoch(&b, 3);
+        run(&mut p, &b, 3, &eb);
+        assert_eq!(sync::Arc::strong_count(&ea1), 2);
+
+        // A closes with an accepted render not yet published.
+        a.vm.set_unpublished(true);
+        a.vm.close();
+        assert!(p.reclaim_closed(), "accepted render of the closed VM still unpublished");
+        assert_eq!(sync::Arc::strong_count(&ea1), 2);
+        // It publishes a fresh InitBM epoch on slot 4.
+        a.vm.set_unpublished(false);
+        let ea2 = epoch(&a, 4);
+        let b2 = p.bind(4, false);
+        p.hold_alloc(4, &a, None, None).unwrap();
+        p.publish_flight(4);
+        assert!(p.reclaim_closed(), "render of the closed VM in flight");
+        assert_eq!(sync::Arc::strong_count(&ea1), 2);
+        p.retire_flight(4, &ea2, b2, true).unwrap();
+        assert_eq!(sync::Arc::strong_count(&ea1), 1, "older epoch released after the InitBM");
+        assert!(p.take_closed_vm_last(), "a closed VM's entry asks for another reclaim pass");
+        assert!(!p.take_closed_vm_last());
+        // B retires on slot 5, so slot 4 is displaced; nothing of A is pending any more.
+        let eb5 = epoch(&b, 5);
+        run(&mut p, &b, 5, &eb5);
+        assert!(!p.reclaim_closed());
+        assert_eq!(sync::Arc::strong_count(&ea2), 2, "only slot 4's owner keeps A's last epoch");
+        drop(ea1);
+        drop(ea2);
+        // Slot 4's owner holds A until a newer epoch retires there.
+        assert_eq!(sync::Arc::strong_count(&a), 2);
+        let eb4 = epoch(&b, 4);
+        run(&mut p, &b, 4, &eb4);
+        assert_eq!(sync::Arc::strong_count(&a), 1, "closed VM fully released");
         assert!(!p.reclaim_closed());
     }
 

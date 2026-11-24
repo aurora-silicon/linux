@@ -1031,6 +1031,12 @@ impl Cache {
         }
     }
 
+    /// Whether accepted renders still hold standby reservations, that is, are not yet
+    /// published ([`Prepared::commit_render`]) or dropped.
+    pub(crate) fn renders_unpublished(&self) -> bool {
+        self.standby.lock().reserved != 0
+    }
+
     /// The VM's client closed. Lets go of the arenas and surplus standby epochs: accepted
     /// renders keep only the exact standby count they reserved until they finish, and hardware
     /// slots hold their own last-owner leases.

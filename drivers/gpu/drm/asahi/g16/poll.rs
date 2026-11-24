@@ -639,9 +639,10 @@ impl Firmware {
         let Some(shared) = self.engine.shared.as_ref() else {
             return;
         };
-        if !shared.closed_vm_reclaim.load(Ordering::Acquire)
-            || !shared.closed_vm_reclaim.swap(false, Ordering::AcqRel)
-        {
+        let armed = shared.closed_vm_reclaim.load(Ordering::Acquire)
+            && shared.closed_vm_reclaim.swap(false, Ordering::AcqRel);
+        // A closed VM's render retired and recorded its last epoch after the VM was closed.
+        if !self.pools.take_closed_vm_last() && !armed {
             return;
         }
         let remaining = self.pools.reclaim_closed() | self.slots.reclaim_closed();
