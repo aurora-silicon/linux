@@ -850,7 +850,7 @@ pub mod g16 {
         c31.pass[0]=31;c31.pass_count=1;c31.pass_mask=1u32<<31;
         s.claim_pass_for(&arena,31,Some(a.id)).unwrap();
         s.hold_vm(&c31,&a).unwrap();
-        s.publish(&c31).unwrap();
+        s.publish(&mut c31).unwrap();
         // Clean same-VM reuse of displaced slot 0 does not need full work write.
         s.claim_pass_for(&arena,0,Some(a.id)).unwrap();
         assert!(!s.render_needs_full_work(0));
@@ -1278,13 +1278,13 @@ pub mod g16 {
         // Prime and displace slot 0.
         let mut c0=Claims::new();c0.pass[0]=0;c0.pass_mask=1;
         s.claim_pass_in(&prep,0,Some(a.id),0x2000).unwrap();
-        s.hold_vm(&c0,&a).unwrap();s.hold_arenas(&c0,&prep);s.publish(&c0).unwrap();
+        s.hold_vm(&c0,&a).unwrap();s.hold_arenas(&c0,&prep);s.publish(&mut c0).unwrap();
         render.set_dirty(0,0x1000,0x2000).unwrap();
         render.passes[0].tilemap.fill(0,0x66,0x2000).unwrap();
         s.retire(&mut c0).unwrap();
         let mut c1=Claims::new();c1.pass[0]=1;c1.pass_mask=2;
         s.claim_pass_in(&prep,1,Some(a.id),0x1000).unwrap();
-        s.hold_vm(&c1,&a).unwrap();s.hold_arenas(&c1,&prep);s.publish(&c1).unwrap();
+        s.hold_vm(&c1,&a).unwrap();s.hold_arenas(&c1,&prep);s.publish(&mut c1).unwrap();
         s.retire(&mut c1).unwrap();
 
         // Hand staged scrub off via ScrubQueue; waiter is woken on completion and woke flag is set.
@@ -1311,10 +1311,10 @@ pub mod g16 {
         // the async scrub runs: it must clear scrubbing without marking clean, so next claim
         // performs a full scrub.
         let mut c0=Claims::new();c0.pass[0]=0;c0.pass_mask=1;
-        s.hold_vm(&c0,&a).unwrap();s.hold_arenas(&c0,&prep);s.publish(&c0).unwrap();s.retire(&mut c0).unwrap();
+        s.hold_vm(&c0,&a).unwrap();s.hold_arenas(&c0,&prep);s.publish(&mut c0).unwrap();s.retire(&mut c0).unwrap();
         let mut c1=Claims::new();c1.pass[0]=1;c1.pass_mask=2;
         s.claim_pass_in(&prep,1,Some(a.id),0x1000).unwrap();
-        s.hold_vm(&c1,&a).unwrap();s.hold_arenas(&c1,&prep);s.publish(&c1).unwrap();s.retire(&mut c1).unwrap();
+        s.hold_vm(&c1,&a).unwrap();s.hold_arenas(&c1,&prep);s.publish(&mut c1).unwrap();s.retire(&mut c1).unwrap();
         s.stage_displaced_pass_scrubs();
         assert!(q.push_batch(s.take_staged_scrubs()));
         assert!(s.scrubbing_active());
