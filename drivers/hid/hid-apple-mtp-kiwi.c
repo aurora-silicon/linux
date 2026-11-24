@@ -34,6 +34,7 @@
 
 #include <linux/debugfs.h>
 #include <linux/hid.h>
+#include <linux/spinlock.h>
 #include <linux/input/mt.h>
 #include <linux/module.h>
 #include <linux/property.h>
@@ -94,6 +95,7 @@ struct kiwi {
 	struct input_dev *input;
 	int size_x, size_y;
 	int res_x, res_y;
+	spinlock_t lock;	/* serialises kiwi_raw_event() against kiwi_input_open() */
 	bool have_base;
 	int rowmean[KIWI_ROWS];	/* per-row mean of the last frame, pre-removal */
 	u8 cand_hot[(KIWI_CELLS + 7) / 8];	/* hot-cell map of the first baseline candidate */
@@ -743,26 +745,81 @@ static void kiwi_frame(struct kiwi *k, const u8 *data)
 	kiwi_report(k);
 }
 
+/*
+ * The descriptor declares the whole frame as one item of 0x80000 bits.
+ * hid-core refuses a Report Size above 16384, so clamp it: the driver reads
+ * the raw frames and never looks at the field layout.
+ */
+#define KIWI_MAX_REPORT_SIZE	16384
+
+static const __u8 *kiwi_report_fixup(struct hid_device *hdev, __u8 *rdesc,
+				     unsigned int *rsize)
+{
+	unsigned int i = 0;
+
+	while (i < *rsize) {
+		u8 prefix = rdesc[i];
+		unsigned int n = prefix & 3, j;
+		u32 val = 0;
+
+		if (prefix == 0xfe) {		/* long item */
+			if (i + 1 >= *rsize)
+				break;
+			i += 3 + rdesc[i + 1];
+			continue;
+		}
+		if (n == 3)
+			n = 4;
+		if (i + 1 + n > *rsize)
+			break;
+		if ((prefix & 0xfc) == 0x74 && n >= 2) {	/* Global: Report Size */
+			for (j = 0; j < n; j++)
+				val |= (u32)rdesc[i + 1 + j] << (8 * j);
+			if (val > KIWI_MAX_REPORT_SIZE) {
+				hid_info(hdev, "clamping Report Size %u to %u\n",
+					 val, KIWI_MAX_REPORT_SIZE);
+				for (j = 0; j < n; j++)
+					rdesc[i + 1 + j] = (KIWI_MAX_REPORT_SIZE >> (8 * j)) & 0xff;
+			}
+		}
+		i += 1 + n;
+	}
+	return rdesc;
+}
+
 static int kiwi_raw_event(struct hid_device *hdev, struct hid_report *report,
 			  u8 *data, int size)
 {
 	struct kiwi *k = hid_get_drvdata(hdev);
+	unsigned long flags;
 
-	if (size == KIWI_FRAME_SIZE && data[0] == KIWI_MAGIC)
+	if (size == KIWI_FRAME_SIZE && data[0] == KIWI_MAGIC) {
+		spin_lock_irqsave(&k->lock, flags);
 		kiwi_frame(k, data);
+		spin_unlock_irqrestore(&k->lock, flags);
+	}
 	return 0;
 }
 
 static int kiwi_input_open(struct input_dev *input)
 {
 	struct kiwi *k = input_get_drvdata(input);
+	unsigned long flags;
 
+	/* the lock serialises this reset against kiwi_raw_event() -> kiwi_frame() */
+	spin_lock_irqsave(&k->lock, flags);
 	k->have_base = false;
 	k->cand_age = 0;
 	k->agree = 0;
 	k->now = 0;
 	k->sup = false;
 	k->had = false;
+	k->have_hot = false;
+	k->sup_map_on = false;
+	k->sup_map_clear = 0;
+	memset(k->sup_map, 0, sizeof(k->sup_map));
+	memset(k->cont, 0, sizeof(k->cont));
+	spin_unlock_irqrestore(&k->lock, flags);
 	return hid_hw_open(to_hid_device(input->dev.parent));
 }
 
@@ -818,6 +875,7 @@ static int kiwi_probe(struct hid_device *hdev, const struct hid_device_id *id)
 	kiwi->size_y = size_y;
 	kiwi->res_x = DIV_ROUND_CLOSEST(size_x, mm_x);
 	kiwi->res_y = DIV_ROUND_CLOSEST(size_y, mm_y);
+	spin_lock_init(&kiwi->lock);
 	hid_set_drvdata(hdev, kiwi);
 
 	ret = hid_parse(hdev);
@@ -844,8 +902,11 @@ static void kiwi_remove(struct hid_device *hdev)
 	struct kiwi *k = hid_get_drvdata(hdev);
 
 	debugfs_remove_recursive(k->dbg);
-	input_unregister_device(k->input);
+	/* stop the transport first: a frame still in flight would otherwise
+	 * reach kiwi_report() on an already unregistered input device
+	 */
 	hid_hw_stop(hdev);
+	input_unregister_device(k->input);
 }
 
 static const struct hid_device_id kiwi_devices[] = {
@@ -860,6 +921,7 @@ static struct hid_driver kiwi_driver = {
 	.match = kiwi_match,
 	.probe = kiwi_probe,
 	.remove = kiwi_remove,
+	.report_fixup = kiwi_report_fixup,
 	.raw_event = kiwi_raw_event,
 };
 module_hid_driver(kiwi_driver);
