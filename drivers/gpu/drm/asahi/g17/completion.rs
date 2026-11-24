@@ -570,6 +570,12 @@ impl Completion {
     pub(super) fn is_input_source(&self, source: &Arc<super::fence::Submission>) -> bool {
         self.output.output().member.is_source(source)
     }
+    pub(crate) fn note_source_published(&self, published: super::fence::PublishedSource) {
+        self.output.output().member.note_published(published);
+    }
+    pub(crate) fn clear_source_published(&self) {
+        self.output.output().member.clear_published();
+    }
     pub(super) fn set_source_ready(&self, ready: Fence) {
         self.output.output().member.set_source_ready(ready);
     }
@@ -667,6 +673,7 @@ impl Completion {
             })
             .is_ok();
         if accepted {
+            self.clear_source_published();
             self.replay_timeout.store(true, Ordering::Release);
             // Callers replay only work proven not to have started; the new
             // publication runs from the beginning and reports its own result.
@@ -685,6 +692,7 @@ impl Completion {
 
     pub(crate) fn has_firmware_consumer(&self) -> bool {
         self.firmware_consumer.load(Ordering::Acquire)
+            || self.output.output().member.has_firmware_consumer()
     }
 
     pub(crate) fn take_replay_timeout(&self) -> bool {

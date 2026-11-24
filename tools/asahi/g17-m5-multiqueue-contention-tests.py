@@ -141,7 +141,7 @@ def build_harness(mutation=None):
             compute_direct,
             'held.take()',
             'let result = (|| {',
-            'let mut queue = cell.lock()?;',
+            '.lock()?;',
             '})();',
             'if outcome.is_none() && from_held {',
             '*held = Some(claim);',
