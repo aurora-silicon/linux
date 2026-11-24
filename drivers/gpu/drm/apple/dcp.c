@@ -9930,7 +9930,18 @@ static int dcp_platform_suspend(struct device *dev)
 
 	if (dcp->hdmi_hpd_irq) {
 		disable_irq(dcp->hdmi_hpd_irq);
-		if (!dcp->active_typec_route) {
+		/*
+		 * The firmware runs through this sleep, so the HDMI output
+		 * keeps its link as through DPMS off (see dcp_poweroff()), and
+		 * resume lights it again through dcp_poweron(). Only a display
+		 * that is gone is reported and released here. Releasing one
+		 * that stays attached reports it unplugged, and nothing
+		 * connects it again after the wake: its HPD stays high, so no
+		 * edge comes, and a CRTC userspace turned off for the unplug
+		 * never runs dcp_poweron().
+		 */
+		if (!dcp->active_typec_route &&
+		    gpiod_get_value_cansleep(dcp->hdmi_hpd) <= 0) {
 			disconnected_hpd_event(dcp->connector);
 			dcp_dptx_disconnect(dcp, 0);
 		}
