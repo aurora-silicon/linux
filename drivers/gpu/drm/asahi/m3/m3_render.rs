@@ -832,6 +832,10 @@ impl Render {
         }
         Ok(true)
     }
+    /// Whether the tiler queue has not yet retired its current head.
+    pub(crate) fn ta_done_pending(&mut self) -> Result<bool> {
+        Ok(self.objects[s::TA_POINTERS].read_u32(queue::DONE)? != u32::from(self.heads[0]))
+    }
     /// Whether TA fully drained while fragment has READ == head but DONE < head.
     ///
     /// On a TA fault, 27.2 firmware aborts the paired fragment command without
@@ -851,7 +855,11 @@ impl Render {
     /// drained the stopped batch, and mark the faulting VM's binding for quarantine.
     pub(crate) fn finish_recovery(&mut self, dev: &driver::AsahiDrmDevice) -> Result {
         self.quarantine_active_vm = true;
-        self.recovery_aborted_draw = Some(self.draw);
+        self.recovery_aborted_draw = if self.fragment_read_only_pending()? {
+            Some(self.draw)
+        } else {
+            None
+        };
         let ta_expected = self.stamp_epoch.value(s::STAMP_TA - 256, self.draw);
         let fs_expected = self.stamp_epoch.value(s::STAMP_FRAGMENT - 256, self.draw);
         let ta_host = self.objects[s::TA_STAMP].read_u32(0)?;

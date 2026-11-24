@@ -551,6 +551,9 @@ impl Config {
                         } else if kind == 0 || kind == 4 {
                             let word3 = u32::from_le_bytes(record[12..16].try_into().map_err(|_| EIO)?);
                             dev_err!(dev.as_ref(), "M3 firmware event {}: {:02x?}\n", kind, record);
+                            if self.recovery_offsets().is_none() {
+                                return Err(EIO);
+                            }
                             self.pending_recovery_event.get_or_insert((kind, word3));
                         } else {
                             dev_err!(dev.as_ref(), "M3 firmware event {}: {:02x?}\n", kind, record);
@@ -558,6 +561,9 @@ impl Config {
                         }
                     } else if channel == storage::STATS && kind == 0x16 {
                         dev_err!(dev.as_ref(), "M3 firmware channel {} record {}: {:02x?}\n", channel, kind, record);
+                        if self.recovery_offsets().is_none() {
+                            return Err(EIO);
+                        }
                         self.pending_recovery_stats = true;
                     } else if channel == storage::TRACE && kind != 5 {
                         dev_err!(dev.as_ref(), "M3 firmware channel {} record {}: {:02x?}\n", channel, kind, record);
@@ -627,6 +633,13 @@ impl Config {
     /// `STATS 0x16` notifications from the already-completed recovery generation.
     pub(crate) fn take_recovery_trigger(&mut self) -> Result<Option<Error>> {
         if self.recovery_offsets().is_none() {
+            if let Some((kind, _word3)) = self.pending_recovery_event.take() {
+                self.pending_recovery_stats = false;
+                return Ok(Some(if kind == 4 { ETIMEDOUT } else { EIO }));
+            }
+            if core::mem::take(&mut self.pending_recovery_stats) {
+                return Ok(Some(EIO));
+            }
             return Ok(None);
         }
         let phase = self.recovery_phase()?;

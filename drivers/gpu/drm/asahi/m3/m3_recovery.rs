@@ -80,6 +80,13 @@ pub(crate) const fn stopped_tiler(flags: u32) -> bool {
     flags & 9 == 9
 }
 
+/// Whether the recovery snapshot proves a tiler-only stop (at least one stopped
+/// tiler entry and no non-tiler/fragment entry). Only in this case does 27.2
+/// firmware discard the paired fragment command without advancing `FS.DONE`.
+pub(crate) const fn tiler_only_stop(stopped_tiler_seen: bool, non_tiler_seen: bool) -> bool {
+    stopped_tiler_seen && !non_tiler_seen
+}
+
 /// Trailing `STATS 0x16` notifications can arrive after the host already wrote
 /// phase 0 for that recovery generation; do not treat them as a new fault.
 pub(crate) const fn is_trailing_stats(
@@ -160,9 +167,16 @@ mod tests {
     fn stopped_tiler_matches_observed_g15g_and_g14_flags() {
         assert!(stopped_tiler(0xd));
         assert!(stopped_tiler(0x1f));
+        assert!(!stopped_tiler(0x15));
+        assert!(!stopped_tiler(0x27));
         assert!(!stopped_tiler(0x7));
         assert!(!stopped_tiler(0x8));
         assert!(!stopped_tiler(0x0));
+
+        assert!(tiler_only_stop(true, false));
+        assert!(!tiler_only_stop(true, true));
+        assert!(!tiler_only_stop(false, true));
+        assert!(!tiler_only_stop(false, false));
     }
 
     #[test]

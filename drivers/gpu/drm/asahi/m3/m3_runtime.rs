@@ -293,6 +293,7 @@ impl Inner {
             }
             let mut entries = 0usize;
             let mut clear_tpc = false;
+            let mut non_tiler_stop = false;
             for idx in 0..offsets.snapshot_entries {
                 let (flags, target) = self.config.read_recovery_snapshot(idx)?;
                 let Some(entry) = SnapshotEntry::decode(flags, target) else {
@@ -300,6 +301,8 @@ impl Inner {
                 };
                 if rec::stopped_tiler(entry.flags) {
                     clear_tpc = true;
+                } else {
+                    non_tiler_stop = true;
                 }
                 if entries < 4 {
                     dev_info!(
@@ -314,6 +317,7 @@ impl Inner {
                 }
                 entries += 1;
             }
+            let tiler_only = rec::tiler_only_stop(clear_tpc, non_tiler_stop);
             if clear_tpc {
                 for batch in self.active.iter() {
                     if let NativeJob::Render(j) = &mut self.jobs[batch.index] {
@@ -363,6 +367,17 @@ impl Inner {
                     }
                 }
             }
+            // Snapshot whether TA was still pending before phase 0 so the discarded-FS
+            // fallback only applies when TA actually drains after phase 0 on a
+            // snapshot-proven tiler-only stop (never on a pure-fragment or TA+FS stop).
+            let mut ta_pending_before_p0 = false;
+            for batch in self.active.iter() {
+                if let NativeJob::Render(j) = &mut self.jobs[batch.index] {
+                    if j.ta_done_pending()? {
+                        ta_pending_before_p0 = true;
+                    }
+                }
+            }
             self.config.write_recovery_phase(0)?;
             self.config.note_recovered(generation);
             dev_err!(
@@ -376,6 +391,7 @@ impl Inner {
             let check_busy = crate::m3::m3_params::retire_mmio(self.device.soc())
                 & crate::m3::m3_params::RETIRE_MMIO_BUSY
                 != 0;
+            let allow_discarded_fs = tiler_only && ta_pending_before_p0;
             let drain_start = Instant::<Monotonic>::now();
             let mut another_round = false;
             loop {
@@ -386,7 +402,10 @@ impl Inner {
                 if all_drained {
                     // Honor the SoC's retire_mmio mask: do not probe core-clock-gated busy
                     // registers (0xc020/0xc120) when RETIRE_MMIO_BUSY is omitted (e.g. G15G).
-                    let engines_idle = phase == 0
+                    // Only allow the discarded-FS fallback when the snapshot proved a
+                    // tiler-only stop and TA actually drained after phase 0.
+                    let engines_idle = allow_discarded_fs
+                        && phase == 0
                         && (!check_busy
                             || (self.device.pstate_register().unwrap_or(1) & 0xf) == 0
                             || self.device.check_idle_parts(true, false).is_ok());
