@@ -12,6 +12,7 @@
 #include "ane_h16_hwx_test_fixture.h"
 #include "ane_h16_add128_fixture.h"
 #include "ane_h14_add_fixture.h"
+#include "ane_h14_chain_fixture.h"
 #include "ane_h17_mobilenet_fixture.h"
 
 #define FW_IPC_DVA 0x100003d0000ULL
@@ -966,6 +967,66 @@ static void program_h14_add_hwx_test(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, get_unaligned_le32(d + 8), classes[i]);
 		KUNIT_EXPECT_EQ(test, get_unaligned_le64(d + 0x18), p->surfaces[i]->dva);
 	}
+	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), 0);
+}
+
+/*
+ * A two-layer H14 linked convolution: its kernel-DMA records name slot 1
+ * (the __TEXT/__const coefficients) and the layers meet in the __DATA
+ * scratch (slot 3). The validator takes both slots from the descriptor's
+ * table, and the operation section binds slot 1 to the kernel resource:
+ * the program has no __KERN_0, and LOAD slot 1 carries those constants.
+ */
+static void program_h14_chain_hwx_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create_family(test, 14);
+	struct ane_h16_hwx_snapshot *snapshot;
+	struct ane_h16_program *p = NULL;
+	const void *aux[ANE_H16_AUX_COUNT];
+	size_t aux_size[ANE_H16_AUX_COUNT];
+	const u8 *descriptor;
+	u8 *hwx;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	hwx = sparse_bytes(test, h14_chain_hwx_runs, ARRAY_SIZE(h14_chain_hwx_runs),
+			   H14_CHAIN_HWX_SIZE);
+	aux[0] = sparse_bytes(test, h14_chain_generic_runs,
+			      ARRAY_SIZE(h14_chain_generic_runs), H14_CHAIN_GENERIC_SIZE);
+	aux[1] = sparse_bytes(test, h14_chain_operation_runs,
+			      ARRAY_SIZE(h14_chain_operation_runs), H14_CHAIN_OPERATION_SIZE);
+	aux[2] = sparse_bytes(test, h14_chain_procedure_runs,
+			      ARRAY_SIZE(h14_chain_procedure_runs), H14_CHAIN_PROCEDURE_SIZE);
+	aux[3] = sparse_bytes(test, h14_chain_properties_runs,
+			      ARRAY_SIZE(h14_chain_properties_runs), H14_CHAIN_PROPERTIES_SIZE);
+	aux_size[0] = H14_CHAIN_GENERIC_SIZE;
+	aux_size[1] = H14_CHAIN_OPERATION_SIZE;
+	aux_size[2] = H14_CHAIN_PROCEDURE_SIZE;
+	aux_size[3] = H14_CHAIN_PROPERTIES_SIZE;
+	snapshot = kunit_kzalloc(test, sizeof(*snapshot), GFP_KERNEL);
+	KUNIT_ASSERT_TRUE(test, hwx && aux[0] && aux[1] && aux[2] && aux[3] && snapshot);
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_snapshot_create(hwx, H14_CHAIN_HWX_SIZE, snapshot), 0);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, snapshot_free, snapshot), 0);
+	KUNIT_ASSERT_MEMEQ(test, snapshot->digest, h14_chain_hwx_sha256, SHA256_DIGEST_SIZE);
+	KUNIT_EXPECT_EQ(test, snapshot->info.tasks, 2);
+	KUNIT_EXPECT_EQ(test, snapshot->info.kernel.size, 0);
+	KUNIT_ASSERT_NE(test, snapshot->info.scratch.size, 0);
+	KUNIT_ASSERT_EQ(test, snapshot->info.surface_count, 2);
+	descriptor = (const u8 *)snapshot->bytes + snapshot->info.program_offset;
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_slot_base(&snapshot->info, descriptor, 1),
+			snapshot->info.constants.vm);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_slot_base(&snapshot->info, descriptor, 3),
+			snapshot->info.scratch.vm);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_slot_base(&snapshot->info, descriptor, 4),
+			snapshot->info.surfaces[0].section.vm);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_slot_base(&snapshot->info, descriptor, 5),
+			snapshot->info.surfaces[1].section.vm);
+	KUNIT_EXPECT_EQ(test, snapshot->info.surfaces[1].direction, 2);
+
+	KUNIT_ASSERT_EQ(test, ane_h16_session_load(&f->s, snapshot, aux, aux_size, &p), 0);
+	KUNIT_ASSERT_NOT_NULL(test, p);
+	KUNIT_EXPECT_EQ(test, p->bar_count, 0);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
 	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
 	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), 0);
 }
@@ -3577,6 +3638,7 @@ static struct kunit_case program_cases[] = {
 	KUNIT_CASE(program_kernel_slots_test),
 	KUNIT_CASE(program_add128_hwx_test),
 	KUNIT_CASE(program_h14_add_hwx_test),
+	KUNIT_CASE(program_h14_chain_hwx_test),
 	KUNIT_CASE(program_h14_add_refused_test),
 	KUNIT_CASE(program_load_reply_logged_test),
 	KUNIT_CASE(program_replies_test),
