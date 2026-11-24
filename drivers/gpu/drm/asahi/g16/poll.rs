@@ -316,13 +316,19 @@ impl Shared {
             if !firmware.engine.flights.is_empty() || firmware.engine.chan_wait {
                 // If an EP 0x20 event retired an older flight while later flights remain active,
                 // or arrived before the oldest receipt became visible, arm a short repoll so
-                // trailing completions never fall back to `resnap_us`.
+                // trailing completions never fall back to `resnap_us`. A ready job this
+                // publication left waiting on TA wave or slot headroom repolls as soon as
+                // `poll_step()` would rearm it, not a full `resnap_us` later.
                 if let Some(us) = coalesce_us {
                     self.rearm_after(us.min(self.rearm_us(false)));
                 } else {
+                    let paced = !firmware.engine.frozen
+                        && !firmware.engine.pending.is_empty()
+                        && (firmware.engine.slot_wait || firmware.engine.ta_wave_wait);
                     self.rearm(
                         firmware.engine.chan_wait
                             || restored_event
+                            || paced
                             || (was_evented && retired_any && !firmware.engine.flights.is_empty()),
                     );
                 }
