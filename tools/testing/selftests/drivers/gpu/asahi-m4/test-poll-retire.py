@@ -164,6 +164,7 @@ struct Engine {
     ta_wave_wait: bool,
     short_repoll: bool,
     housekeeping_owed: bool,
+    held_wait: bool,
     coalesce_deadline_ns: u64,
     frozen: bool,
     stats: Stats,
@@ -328,7 +329,7 @@ struct Firmware {
     ta_pending: usize,
     ta_wave_cap: usize,
     coalesce_us: Option<u32>,
-    publish_waits: Option<(bool, bool)>,
+    publish_waits: Option<(bool, bool, bool)>,
     retire_calls: u32,
     publish_full_calls: u32,
     publish_checked_calls: u32,
@@ -367,6 +368,7 @@ impl Firmware {
                 ta_wave_wait: false,
                 short_repoll: false,
                 housekeeping_owed: false,
+                held_wait: false,
                 coalesce_deadline_ns: 0,
                 frozen: false,
                 stats: Stats::default(),
@@ -455,9 +457,10 @@ impl Firmware {
     }
     fn publish_checked(&mut self, _done: &mut Completions) -> Result {
         self.engine.coalesce_deadline_ns = 0;
-        if let Some((slot_wait, ta_wave_wait)) = self.publish_waits {
+        if let Some((slot_wait, ta_wave_wait, held_wait)) = self.publish_waits {
             self.engine.slot_wait = slot_wait;
             self.engine.ta_wave_wait = ta_wave_wait;
+            self.engine.held_wait = held_wait;
         }
         self.publish_checked_calls += 1;
         Ok(())
@@ -1045,6 +1048,49 @@ fn pending_slot_wait_arms_short_repoll_without_breaking_ta_only_or_frozen() {
 }
 
 #[test]
+fn held_wait_spins_stage_events_and_repolls_soon_until_a_retirement() {
+    CLOCK.with(|c| c.set(100_000));
+    let mut fw = Firmware::new();
+    fw.engine.flights.push(Flight {
+        computes: 0,
+        compute_pipe: 0,
+        renders: 2,
+        target: 0,
+        fs_target: 0x200,
+    });
+    fw.engine.fs_target = 0x200;
+    fw.engine.pending.push(Arc::new(Job { id: 2 }));
+    fw.drain_stage_delta = 1;
+    let (mut retry_tail, mut deferred, mut done) = (false, false, vec![]);
+    // Nothing held: a stage-only event is non-terminal, with no tail spin and no short repoll.
+    assert!(fw
+        .poll_step(true, EVENT_RETIRE_POLLS, &mut retry_tail, &mut deferred, &mut done)
+        .unwrap());
+    assert!(!retry_tail);
+    assert!(!fw.engine.short_repoll);
+    // A ready job held behind its own VM's flights spins the receipt tail on the same event...
+    fw.engine.held_wait = true;
+    assert!(fw
+        .poll_step(true, EVENT_RETIRE_POLLS, &mut retry_tail, &mut deferred, &mut done)
+        .unwrap());
+    assert!(retry_tail);
+    // ...and a timer pass repolls at repoll_us while the hold lasts, without publishing.
+    retry_tail = false;
+    fw.drain_stage_delta = 0;
+    assert!(fw
+        .poll_step(false, 0, &mut retry_tail, &mut deferred, &mut done)
+        .unwrap());
+    assert!(fw.engine.short_repoll);
+    assert_eq!(fw.publish_checked_calls, 0);
+    // The retirement that can release it reaches publish_checked().
+    fw.retire_on_call = true;
+    let _ = fw
+        .poll_step(false, 0, &mut retry_tail, &mut deferred, &mut done)
+        .unwrap();
+    assert_eq!(fw.publish_checked_calls, 1);
+}
+
+#[test]
 fn ta_only_irq_wakes_ta_wave_wait_with_hysteresis_and_short_repoll() {
     CLOCK.with(|c| c.set(100_000));
     let mut fw = Firmware::new();
@@ -1120,11 +1166,12 @@ fn submit_locked_repolls_soon_when_its_publication_leaves_a_paced_job() {
     // publish_checked() leaves a ready job on TA wave or slot headroom: SUBMIT arms the same
     // short repoll poll_step() arms for it, unless the engine is frozen.
     CLOCK.with(|c| c.set(100_000));
-    for (slot_wait, ta_wave_wait, frozen, soon) in [
-        (false, false, false, 0),
-        (true, false, false, 1),
-        (false, true, false, 1),
-        (false, true, true, 0),
+    for (slot_wait, ta_wave_wait, held_wait, frozen, soon) in [
+        (false, false, false, false, 0),
+        (true, false, false, false, 1),
+        (false, true, false, false, 1),
+        (false, false, true, false, 1),
+        (false, true, false, true, 0),
     ] {
         let shared = Shared::new();
         let mut fw = Firmware::new();
@@ -1138,7 +1185,7 @@ fn submit_locked_repolls_soon_when_its_publication_leaves_a_paced_job() {
         });
         fw.engine.fs_target = 0x100;
         fw.engine.frozen = frozen;
-        fw.publish_waits = Some((slot_wait, ta_wave_wait));
+        fw.publish_waits = Some((slot_wait, ta_wave_wait, held_wait));
         let mut done = vec![];
         shared
             .submit_locked(&mut fw, Arc::new(Job { id: 2 }), &mut done)
@@ -1803,7 +1850,7 @@ for command in [
     json.dumps(
         {
             'passed': True,
-            'tests': 24,
+            'tests': 25,
             'cpu_only': True,
             'hardware_execution': False,
             'scope': 'Verbatim production submit_locked inline retirement and poll_step TA-only non-spin logic.',

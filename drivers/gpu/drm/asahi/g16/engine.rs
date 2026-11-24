@@ -654,6 +654,10 @@ pub(crate) struct Engine {
     /// An idle poll pass inside the housekeeping cadence skipped housekeeping: queue a backup
     /// poll so it runs once the cadence elapses.
     pub(crate) housekeeping_owed: bool,
+    /// A ready job is held behind flights that all belong to its own VM, for any cause but a
+    /// failure, a cross-VM overlap or a failed dependency: one of those flights retiring is
+    /// what releases it, so repoll soon instead of after `resnap_us`.
+    pub(crate) held_wait: bool,
     /// Absolute deadline (`ktime_get_ns`) for busy-state same-queue horizon micro-coalescing
     /// (0 when no batch is held).
     pub(crate) coalesce_deadline_ns: u64,
@@ -702,6 +706,7 @@ impl Engine {
             ta_wave_wait: false,
             short_repoll: false,
             housekeeping_owed: false,
+            held_wait: false,
             coalesce_deadline_ns: 0,
             progress_flight: [0; 3],
             progress: [None; 4],
@@ -1051,6 +1056,7 @@ impl Firmware {
         self.engine.chan_wait = false;
         self.engine.slot_wait = false;
         self.engine.ta_wave_wait = false;
+        self.engine.held_wait = false;
         self.engine.coalesce_deadline_ns = 0;
         while self.recovery.failed().is_none()
             && !self.engine.frozen
@@ -1454,12 +1460,24 @@ impl Firmware {
         }
     }
 
-    /// Counts a publication pass that stopped at the ready `job` behind in-flight work.
+    /// Counts a publication pass that stopped at the ready `job` behind in-flight work, and
+    /// marks it [`Engine::held_wait`] when only its own VM's flights hold it.
     fn note_hold(&mut self, job: &Arc<Job>, drain: bool, ta_pending: usize) {
         let cause = self.hold_cause(job, drain, ta_pending);
         let s = &mut self.engine.stats;
         s.hold[0] += 1;
         s.hold_causes[cause as usize] += 1;
+        if !matches!(
+            cause,
+            HoldCause::DrainFailed | HoldCause::DrainCross | HoldCause::Dependency
+        ) && self
+            .engine
+            .flights
+            .iter()
+            .all(|f| Arc::ptr_eq(&f.job.vm, &job.vm))
+        {
+            self.engine.held_wait = true;
+        }
     }
 
     /// Whether `job` is ready to run without an engine drain but currently blocked solely on
@@ -1709,6 +1727,7 @@ impl Firmware {
             || self.engine.chan_wait
             || self.engine.slot_wait
             || self.engine.ta_wave_wait
+            || self.engine.held_wait
             || self
                 .engine
                 .flights

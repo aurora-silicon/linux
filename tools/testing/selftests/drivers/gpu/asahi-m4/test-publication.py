@@ -141,7 +141,7 @@ struct Claims;
 struct Flight{job:Arc<Job>,claims:Claims,group:Vec<Arc<Job>>,computes:u32,renders:u32,compute_pipe:u8,rt_compute:bool,doomed:bool,recovery_suspect:bool,initbm:bool,heavy_render:bool}
 impl Flight{fn new(job:Arc<Job>)->Self{Self{job,claims:Claims,group:vec![],computes:0,renders:0,compute_pipe:0,rt_compute:false,doomed:false,recovery_suspect:false,initbm:false,heavy_render:false}}}
 __SCS_COMPUTE_CONFLICT__
-struct Engine{ordinal:u64,draw:u64,pending:Vec<Arc<Job>>,flights:Vec<Flight>,frozen:bool,turn:u64,stats:Stats,chan_wait:bool,slot_wait:bool,ta_wave_wait:bool,coalesce_deadline_ns:u64}
+struct Engine{ordinal:u64,draw:u64,pending:Vec<Arc<Job>>,flights:Vec<Flight>,frozen:bool,turn:u64,stats:Stats,chan_wait:bool,slot_wait:bool,ta_wave_wait:bool,held_wait:bool,coalesce_deadline_ns:u64}
 impl Engine {
     __PICK__
     __UNPEND__
@@ -316,7 +316,7 @@ fn job(id:u32,render:bool,sent:u32,dependency:Result)->Arc<Job>{
 }
 fn firmware(jobs:Vec<Arc<Job>>,stages:Vec<(Result,bool)>)->Firmware{
     Firmware{session:Session{shared:Shared{sleeping:AtomicBool::new(false)},rings:vec![],ring_fail:false,checks:AtomicU32::new(0),transports:AtomicU32::new(0)},objects:Checks,recovery:Recovery{error:None,publication_wait_deadline:None},
-        engine:Engine{ordinal:0,draw:0,pending:jobs,flights:vec![],frozen:false,turn:0,stats:Stats::default(),chan_wait:false,slot_wait:false,ta_wave_wait:false,coalesce_deadline_ns:0},
+        engine:Engine{ordinal:0,draw:0,pending:jobs,flights:vec![],frozen:false,turn:0,stats:Stats::default(),chan_wait:false,slot_wait:false,ta_wave_wait:false,held_wait:false,coalesce_deadline_ns:0},
         slots:Slots{compute_exhausted:false,render_exhausted:false,releases:0,quarantines:0},pools:Pools{exhausted:false,exhausted_vm:None,block_pipeline_vm:None},power:Power::default(),
         unavailable:vec![],stages:stages.into_iter().map(|(result,visible)|Stage{result,visible}).collect(),
         retained:vec![],attempted:vec![],fail_stops:0,allow_behind:false,block_render_behind:false,block_compute_behind:false,
@@ -511,7 +511,8 @@ fn firmware(jobs:Vec<Arc<Job>>,stages:Vec<(Result,bool)>)->Firmware{
         // One held publication pass per case: (in-flight job and kind, its flags, held job,
         // host knobs) -> exactly one hold[0] of the expected cause.
         let run=|flight:Arc<Job>,renders:u32,initbm:bool,doomed:bool,held:Arc<Job>,
-                 allow_behind:bool,block_pipeline:Option<u32>,block_render:bool,expect:HoldCause|{
+                 allow_behind:bool,block_pipeline:Option<u32>,block_render:bool,expect:HoldCause,
+                 held_wait:bool|{
             let mut f=firmware(vec![held],vec![]);
             let mut fl=Flight::new(flight);
             if renders==0{fl.computes=1;}else{fl.renders=renders;}
@@ -528,24 +529,28 @@ fn firmware(jobs:Vec<Arc<Job>>,stages:Vec<(Result,bool)>)->Firmware{
             let mut want=[0u64;HoldCause::COUNT];
             want[expect as usize]=1;
             assert_eq!(f.engine.stats.hold_causes,want,"{:?}",expect);
+            // Only a hold behind the job's own VM's flights asks for the short repoll.
+            assert_eq!(f.engine.held_wait,held_wait,"{:?}",expect);
         };
         let r=|id:u32,vm:&Arc<Vm>,dep:Result|job_on_vm(id,vm.clone(),true,0,dep);
         // A warm same-VM render whose allocator cannot pipeline waits for an empty engine.
-        run(r(1,&vm1,Ok(())),1,false,false,r(2,&vm1,Ok(())),true,Some(vm1.slot),false,HoldCause::DrainPb);
+        run(r(1,&vm1,Ok(())),1,false,false,r(2,&vm1,Ok(())),true,Some(vm1.slot),false,HoldCause::DrainPb,true);
         // A cold InitBM flight drains first.
-        run(r(1,&vm1,Ok(())),1,true,false,r(2,&vm1,Ok(())),true,None,false,HoldCause::DrainInitbm);
+        run(r(1,&vm1,Ok(())),1,true,false,r(2,&vm1,Ok(())),true,None,false,HoldCause::DrainInitbm,true);
         // Another VM's compute in flight: no cross-VM render/compute overlap.
-        run(job_on_vm(1,vm2.clone(),false,0,Ok(())),0,false,false,r(2,&vm1,Ok(())),true,None,false,HoldCause::DrainCross);
+        run(job_on_vm(1,vm2.clone(),false,0,Ok(())),0,false,false,r(2,&vm1,Ok(())),true,None,false,HoldCause::DrainCross,false);
         // A doomed flight drains first.
-        run(r(1,&vm1,Ok(())),1,false,true,r(2,&vm1,Ok(())),true,None,false,HoldCause::DrainFailed);
+        run(r(1,&vm1,Ok(())),1,false,true,r(2,&vm1,Ok(())),true,None,false,HoldCause::DrainFailed,false);
         // A full light TA wave (8 renders) pauses the next light render.
-        run(r(1,&vm1,Ok(())),8,false,false,r(2,&vm1,Ok(())),true,None,false,HoldCause::TaWave);
+        run(r(1,&vm1,Ok(())),8,false,false,r(2,&vm1,Ok(())),true,None,false,HoldCause::TaWave,true);
         // Pass, flight or unit headroom.
-        run(r(1,&vm1,Ok(())),1,false,false,r(2,&vm1,Ok(())),true,None,true,HoldCause::Slot);
+        run(r(1,&vm1,Ok(())),1,false,false,r(2,&vm1,Ok(())),true,None,true,HoldCause::Slot,true);
         // A failed dependency (pick() skips jobs still waiting for one).
-        run(r(1,&vm1,Ok(())),1,false,false,r(2,&vm1,Err(ECANCELED)),false,None,false,HoldCause::Dependency);
+        run(r(1,&vm1,Ok(())),1,false,false,r(2,&vm1,Err(ECANCELED)),false,None,false,HoldCause::Dependency,false);
         // Any other refusal.
-        run(r(1,&vm1,Ok(())),1,false,false,r(2,&vm1,Ok(())),false,None,false,HoldCause::Other);
+        run(r(1,&vm1,Ok(())),1,false,false,r(2,&vm1,Ok(())),false,None,false,HoldCause::Other,true);
+        // Behind another VM's render (warm cross-VM renders overlap): counted, but no short repoll.
+        run(r(1,&vm2,Ok(())),1,false,false,r(2,&vm1,Ok(())),false,None,false,HoldCause::Other,false);
         assert_eq!(HoldCause::NAMES.len(),HoldCause::COUNT);
         assert_eq!(HoldCause::Other as usize,HoldCause::COUNT-1);
     }
@@ -2718,6 +2723,7 @@ mod busy_coalesce_scope {
         chan_wait: bool,
         slot_wait: bool,
         ta_wave_wait: bool,
+        held_wait: bool,
         coalesce_deadline_ns: u64,
     }
     struct Slots { free_c: u32 }
@@ -2771,6 +2777,7 @@ mod busy_coalesce_scope {
                 chan_wait: false,
                 slot_wait: false,
                 ta_wave_wait: false,
+                held_wait: false,
                 coalesce_deadline_ns: 0,
             },
             slots: Slots { free_c: 20 },
@@ -2794,6 +2801,12 @@ mod busy_coalesce_scope {
         }
         assert_eq!(h.defer_busy_coalesce(110_000), None);
         assert_eq!(h.engine.coalesce_deadline_ns, 0);
+
+        // A job held behind the VM's own flights is never coalesced behind them.
+        h.engine.pending = vec![mk_job(&vm1, &q1, false, 3, [None, None])];
+        h.engine.held_wait = true;
+        assert_eq!(h.defer_busy_coalesce(150_000), None);
+        h.engine.held_wait = false;
 
         // Deadline expiry flushes even with 1 pending command.
         h.engine.pending = vec![mk_job(&vm1, &q1, false, 3, [None, None])];
