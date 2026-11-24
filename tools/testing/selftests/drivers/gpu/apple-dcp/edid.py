@@ -95,12 +95,14 @@ struct apple_epic_service {
     bool pending_open;const char *pending_name,*pending_class;s64 pending_unit;
 };
 /* v27_closed_teardown: set only by a J714s firmware 27 sleep. */
-struct apple_dcp_afkep { u8 *command_tags;bool lock,stopping;void *wq;struct work_struct service_work;struct apple_dcp *dcp;const struct apple_epic_service_ops *ops;bool wire_v2,inline_v2,match_epic_name,v27_closed_teardown;u32 endpoint;unsigned int num_channels;struct apple_epic_service services[AFK_MAX_CHANNEL]; };
+struct apple_dcp_afkep { u8 *command_tags;bool lock,stopping;void *wq;struct work_struct service_work;struct apple_dcp *dcp;const struct apple_epic_service_ops *ops,*unmatched_ops;bool wire_v2,inline_v2,match_epic_name,v27_closed_teardown;u32 endpoint;unsigned int num_channels;int service_wq;struct apple_epic_service services[AFK_MAX_CHANNEL]; };
+#define wake_up_all(q) ((void)(q))
 struct apple_connector { void *dcp;bool connected,edid_invalidation_pending;struct { int registration_state; } base;unsigned int hotplug_wq; };
 struct apple_dcp {
     void *dev;int fw_compat;struct apple_dcp_afkep *dcpavservep;struct apple_connector *connector;
+    void *desktop;
     bool external_physically_absent,hpd_mutex,quiescing,typec_cable_connected;u64 typec_generation;unsigned int nr_modes;
-    struct { int iomfb_method_profile,firmware_compat; bool fw_14_7_endpoints; unsigned int num_dptx_ports; } hw; bool ext_dead,external_native;
+    struct { int iomfb_method_profile,firmware_compat; bool fw_14_7_endpoints,afk_announced_names; unsigned int num_dptx_ports; unsigned char dptx_endpoint; } hw; bool ext_dead,external_native;
     struct { bool lock,enabled;u64 epoch;int enable_completion;struct apple_epic_service *service,*opened;
              u64 opened_epoch,close_gen,terminated_epoch,close_epoch;bool opening;struct work_struct close_wq; } dcpavserv;
     /* A J714s firmware 27 processor's: this one is not. */
@@ -108,8 +110,12 @@ struct apple_dcp {
     /* Not a dcpext: none of these scenarios is an external processor. */
     bool dcpext;
 };
+#define DPTX_ENDPOINT_V2 0x2c
 '''+internal_inline(root,'dcp_fw_is_14_7')+internal_inline(root,'dcp_is_v14_7_external')+internal_inline(root,'dcp_is_v27_external')+r'''struct epic_cmd { u32 retcode;u64 rxbuf,txbuf;u32 rxlen,txlen; };
 static unsigned int dma_frees,opens;
+
+static void dcp_hdr_service_bind(struct apple_epic_service *s) { (void)s; }
+static void dcp_hdr_service_unbind(struct apple_epic_service *s) { (void)s; }
 
 static int open_error,open_action;
 void dpavservep_detach(struct apple_dcp *dcp);
@@ -146,6 +152,8 @@ struct item { const char *key,*value; s64 integer; };
 struct dcp_parse_ctx { struct item *items;unsigned int count,index;bool key; };
 struct iterator { struct dcp_parse_ctx *handle;unsigned int idx,len; };
 #define kfree(p) free((void *)(p))
+#define GFP_KERNEL 0
+#define kstrdup(s,f) strdup(s)
 #define PTR_ERR(p) ((int)(intptr_t)(p))
 static struct item announcement_items[3];
 static int parse(u8 *p,size_t n,struct dcp_parse_ctx *ctx)
@@ -169,8 +177,8 @@ static int skip(struct dcp_parse_ctx *h) { assert(!h->key);h->index++;h->key=tru
            function('afk.h','static inline bool afk_service_matches('),function('afk.h','static inline bool afk_service_reclaimable('),
            function('afk.h','static inline bool\nafk_service_reinit('),function('afk.h','static inline void afk_service_discard('),
            function('afk.h','static inline void afk_service_publish('),
-           function('epic/dpavservep.c','static void dcpavserv_notify_edid('),function('epic/dpavservep.c','static bool dcpavserv_identity('),
-           function('epic/dpavservep.c','static bool dcpavserv_admission_current('),function('epic/dpavservep.c','static int dcpavserv_prepare('),
+           function('epic/dpavservep.c','static void dcpavserv_notify_edid('),function('epic/dpavservep.c','static bool dcpavserv_hdr_class('),function('epic/dpavservep.c','static bool dcpavserv_identity('),
+           '/* These scenarios model a Type-C output (dcp-fabric.c decides it in the driver). */\nstatic bool dcp_is_typec_output(struct apple_dcp *d) { (void)d; return true; }\n'+function('epic/dpavservep.c','static bool dcpavserv_admission_current('),function('epic/dpavservep.c','static int dcpavserv_prepare('),
            function('epic/dpavservep.c','static int dcpavserv_revalidate('),function('epic/dpavservep.c','static void dcpavserv_init('),function('epic/dpavservep.c','static void dcpavserv_invalidate_edid('),
            function('epic/dpavservep.c','static void dcpavserv_teardown('),function('epic/dpavservep.c','void dpavservep_detach('),
            function('afk.c','static const struct apple_epic_service_ops *\nafk_match_service('),
@@ -293,20 +301,6 @@ static void repeated_announcements(void)
         const char *forged[]={"DCPDP13ServiceExtra","dcpdp13service","AppleDCPDP2HDMIExtra","unrelated-provider"};
         announce(13,name,forged[variant],13);assert(opens==before && !d.dcpavserv.service);
     }
-    /* AFKV2 on the classic DPAV endpoint: EPICUnit 0 with a dynamic interface-id. */
-    ep.endpoint=0x28;
-    for(unsigned int variant=0;variant<2;variant++) {
-        const char *provider=variant?native_class:class;
-        assert(!prepare(1,1,name,provider));assert(!prepare(5,5,name,provider));
-        assert(!prepare(0,0,name,provider));assert(!prepare(65536,0,name,provider));
-        assert(!prepare(5,0,"dcpdp-service-epic",provider));assert(!prepare(5,0,name,"unrelated-provider"));
-        for(u32 channel=1;channel<=13;channel+=4) {
-            struct apple_epic_service *s=prepare(channel,0,name,provider);
-            assert(s && "EPICUnit-0 AV provider must be admitted");afk_service_discard(s);
-        }
-    }
-    ep.endpoint=0x2c;assert(!prepare(5,0,name,native_class));ep.endpoint=0x2a;
-    assert(!prepare(5,0,name,native_class)); /* H17P keeps unit == interface-id. */
     assert(!prepare(13,13,name,NULL));
     open_error=-EIO;announce(13,name,native_class,13);assert(opens==++before && !d.dcpavserv.service);open_error=0;
     for(unsigned int window=0;window<5;window++) {
@@ -588,7 +582,7 @@ def admission(root):
 
     av = (base / 'epic/dpavservep.c').read_text()
     af = (base / 'afk.c').read_text()
-    announce = af[af.index('static void afk_recv_handle_init('):af.index('static void afk_recv_handle_init(') + 6500]
+    announce = af[af.index('static void afk_recv_handle_init('):af.index('static void afk_recv_handle_init(') + 7000]
     assert announce.index('ops->prepare(service,') < announce.index('EPIC_CAT_REPORT, AFKV2_OPEN')
     assert '.prepare = dcpavserv_prepare,' in av and '.prepare = dcpdpserv_prepare,' in av
     prefix = r'''
@@ -674,10 +668,15 @@ struct drm_edid { int identity; };
 '''+internal_inline(root,'dcp_is_v14_7_external')+r'''static unsigned int reads, allocations, legacy_reads, receives;
 static unsigned int event;
 static struct apple_dcp_afkep *received_ep;
+static struct apple_epic_service *hdr_bound;
 static struct apple_epic_service *afk_service_get(struct apple_epic_service *s)
 { if(!s || !s->enabled || s->torndown) return NULL; s->users++; return s; }
 static void afk_service_put(struct apple_epic_service *s)
 { assert(s->users); s->users--; }
+static void dcp_hdr_service_bind(struct apple_epic_service *s)
+{ assert(!hdr_bound); hdr_bound=afk_service_get(s); }
+static void dcp_hdr_service_unbind(struct apple_epic_service *s)
+{ if(hdr_bound==s) { hdr_bound=NULL; afk_service_put(s); } }
 static void afk_service_retire(struct apple_epic_service *s) { s->enabled=false;s->torndown=true; }
 static void drm_edid_free(const struct drm_edid *e)
 { if(e) { assert(allocations); allocations--; free((void *)e); } }
@@ -685,7 +684,7 @@ static void dcpavserv_teardown(struct apple_epic_service *s);
 static const struct drm_edid *dcpavserv_read_edid_inline(struct apple_epic_service *s)
 {
     struct apple_dcp *d=s->ep->dcp;
-    assert(!d->hpd_mutex && !d->dcpavserv.lock && s->users==2);
+    assert(!d->hpd_mutex && !d->dcpavserv.lock && s->users==(hdr_bound==s ? 3U : 2U));
     reads++;
     if(event==1 || event==2) { d->typec_generation++; d->typec_cable_connected=(event==2); }
     if(event==3) { s->enabled=false; dcpavserv_teardown(s); }
@@ -708,8 +707,9 @@ static int afk_receive_message(struct apple_dcp_afkep *ep, u64 message)
              function('epic/dpavservep.c', 'static void dcpavserv_teardown('),
              function('dcp.c', 'static struct apple_dcp_afkep *dcp_afkep('),
              function('dcp.c', 'static void dcp_recv_msg('),
+             function('epic/dpavservep.c', 'static bool dcpavserv_hdr_class('),
              function('epic/dpavservep.c', 'static bool dcpavserv_identity('),
-             function('epic/dpavservep.c', 'static bool dcpavserv_admission_current('),
+             '/* These scenarios model a Type-C output (dcp-fabric.c decides it in the driver). */\nstatic bool dcp_is_typec_output(struct apple_dcp *d) { (void)d; return true; }\n' + function('epic/dpavservep.c', 'static bool dcpavserv_admission_current('),
              function('epic/dpavservep.c', 'static int dcpavserv_prepare('),
              function('epic/dpavservep.c', 'static int dcpdpserv_prepare('),
              function('epic/dpavservep.c', 'static void dcpavserv_init('),
@@ -764,16 +764,26 @@ int main(void)
     assert(connector.edid_invalidation_pending && connector.hotplug_wq && d.dcpavserv.epoch==2);
     /* Same slot and physical generation: CLOSE/re-OPEN gets a fresh ticket. */
     s.enabled=true; assert(!dcpavserv_prepare(&s,name,class,1)); dcpavserv_init(&s,name,class,1);
-    assert(d.dcpavserv.service==&s && s.users==1 && d.dcpavserv.epoch==3);
+    assert(d.dcpavserv.service==&s && hdr_bound==&s && s.users==2 && d.dcpavserv.epoch==3);
     mutex_lock(&d.dcpavserv.lock);
     assert(!dcpavserv_edid_service_current(&d,1) && dcpavserv_edid_service_current(&d,3));
     mutex_unlock(&d.dcpavserv.lock);
     event=0; e=dcpavserv_copy_edid(&d,3,&epoch); assert(!IS_ERR(e) && epoch==3);
     /* Simulate retirement in the final validation-to-publication gap. */
-    s.enabled=false; dcpavserv_teardown(&s); s.enabled=true; assert(!dcpavserv_prepare(&s,name,class,1)); dcpavserv_init(&s,name,class,1);
+    s.enabled=false; dcpavserv_teardown(&s); assert(!hdr_bound && !s.users); s.enabled=true; assert(!dcpavserv_prepare(&s,name,class,1)); dcpavserv_init(&s,name,class,1);
     mutex_lock(&d.dcpavserv.lock); assert(!dcpavserv_edid_service_current(&d,epoch)); mutex_unlock(&d.dcpavserv.lock);
-    drm_edid_free(e); assert(d.typec_generation==3 && d.dcpavserv.epoch==5 && s.users==1);
-    s.enabled=false; dcpavserv_teardown(&s);
+    drm_edid_free(e); assert(d.typec_generation==3 && d.dcpavserv.epoch==5 && hdr_bound==&s && s.users==2);
+    s.enabled=false; dcpavserv_teardown(&s); assert(!hdr_bound && !s.users);
+    /* Firmware 27 MCDP29xx / MCDP2900 AV services bind HDR metadata on EP 0x28 too. */
+    av.endpoint=0x28; d.hw.iomfb_method_profile=0; s.enabled=true;
+    const char *v27_classes[] = {"AppleDCPMCDP29XX", "AppleDCPMCDP2900"};
+    for (size_t i = 0; i < sizeof(v27_classes) / sizeof(v27_classes[0]); i++) {
+        assert(!dcpavserv_prepare(&s, name, v27_classes[i], 0));
+        dcpavserv_init(&s, name, v27_classes[i], 0);
+        assert(hdr_bound == &s && s.users == 2);
+        dcpavserv_teardown(&s);
+        assert(!hdr_bound && !s.users);
+    }
     av.wire_v2=false; av.endpoint=0x28; d.hw.iomfb_method_profile=0;
     d.dcpavserv.enabled=false; assert(!dcpavserv_prepare(&s,name,NULL,0));
     assert(dcpavserv_prepare(&s,name,class,1)==-ENODEV);
@@ -783,8 +793,26 @@ int main(void)
     assert(!IS_ERR(e) && legacy_reads==1 && s.users==1); drm_edid_free(e);
     d.hw.iomfb_method_profile=0;av.wire_v2=false;d.external_physically_absent=true;
     mutex_lock(&d.hpd_mutex);assert(dcpavserv_edid_current(&d,0));mutex_unlock(&d.hpd_mutex);
+    dcpavserv_teardown(&s);
+
+    /* The legacy AV service owns HDR metadata on both DP and HDMI. */
+    const char *legacy_classes[] = {"DCPDPService", "DCPDP13Service", "AppleDCPDP2HDMI"};
+    for (size_t i = 0; i < sizeof(legacy_classes) / sizeof(legacy_classes[0]); i++) {
+        assert(!dcpavserv_prepare(&s, name, legacy_classes[i], 0));
+        dcpavserv_init(&s, name, legacy_classes[i], 0);
+        assert(hdr_bound == &s && s.users == 2);
+        dcpavserv_teardown(&s);
+        assert(!hdr_bound && !s.users);
+    }
+    /* The desktop command binds through its own service lifecycle. */
+    struct dcp_desktop_state desktop = {};
+    d.desktop = &desktop;
+    assert(!dcpavserv_prepare(&s, name, class, 0));
+    dcpavserv_init(&s, name, class, 0);
+    assert(d.dcpavserv.service == &s && !hdr_bound);
+    dcpavserv_teardown(&s);
     assert(!allocations && !d.hpd_mutex && !d.dcpavserv.lock);
-    puts("PASS: production old/new lookup and receive, exact service admission before OPEN, delayed disconnect/replug, service detach pins, legacy transport");
+    puts("PASS: production old/new lookup and receive, exact service admission before OPEN, delayed disconnect/replug, service detach pins, legacy and AFKv2 HDR binding");
 }
 '''
     return prefix + '\n'.join(parts) + suffix

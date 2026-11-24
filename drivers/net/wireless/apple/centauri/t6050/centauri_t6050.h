@@ -72,7 +72,8 @@ int centauri_t6050_request_irqs(struct centauri_t6050_irqs *irqs, struct pci_dev
 			 unsigned int count, irq_handler_t handler, void *data);
 void centauri_t6050_free_irqs(struct centauri_t6050_irqs *irqs);
 
-int centauri_t6050_start_ipc(struct centauri_t6050 *c);
+int centauri_t6050_start_ipc(struct centauri_t6050 *c, struct pci_dev **beta);
+void centauri_t6050_attach_beta(struct centauri_t6050 *c, struct pci_dev *beta);
 void centauri_t6050_free_ipc(struct centauri_t6050 *c);
 void centauri_t6050_release_ipc(struct centauri_t6050_ipc *ipc);
 bool centauri_t6050_ipc_fenced(struct centauri_t6050_ipc *ipc);

@@ -110,6 +110,7 @@ struct apple_spmi {
 	void __iomem *faults;
 	unsigned int nfaults;
 	const struct apple_spmi_hw *hw;
+	u32 num_irqs;
 	struct mutex fifo_lock;
 	struct completion fifo_rx;
 	struct irq_domain *irqd;
@@ -235,23 +236,13 @@ static int apple_spmi_wait_rx_not_empty(struct spmi_controller *ctrl)
  * late, or the stray one that was read in a reply's place, is read out instead: the bus gets a
  * command's whole timeout to finish, then the reply FIFO is read until it is empty. Nothing of
  * an old exchange can then answer a new command. A FIFO that does not empty keeps the failure.
- * On the J714s, J716c, J813 and J815, whose deep sleep writes the PMU on this queue.
- * Other generation 4 machines keep refusing later commands after a failed exchange.
+ * This is the controller's own reply FIFO, so it applies to every generation 4 controller
+ * (apple,t8142-spmi: T8142 and T6050), on every board.
  */
-static bool apple_spmi_gen4_recovers(void)
-{
-	return of_machine_is_compatible("apple,j714s") ||
-	       of_machine_is_compatible("apple,j716c") ||
-	       of_machine_is_compatible("apple,j813") ||
-	       of_machine_is_compatible("apple,j815");
-}
-
 static int apple_spmi_gen4_recover(struct spmi_controller *ctrl, struct apple_spmi *spmi)
 {
 	unsigned int i;
 
-	if (!apple_spmi_gen4_recovers())
-		return -EIO;
 	usleep_range(REG_POLL_TIMEOUT_US, 2 * REG_POLL_TIMEOUT_US);
 	for (i = 0; i < SPMI_GEN4_REPLY_DRAIN_MAX; i++) {
 		if (readl(spmi->regs + spmi->hw->status) & spmi->hw->rx_empty) {
@@ -282,7 +273,7 @@ static int __spmi_raw_cmd(struct spmi_controller *ctrl, u8 opc, u8 sid, u16 para
 				return ret;
 		} else {
 			writel(SPMI_ACT_FIFO_FLUSH, spmi->regs + SPMI_ACT_REG);
-			apple_spmi_irq_ack_raw(spmi, spmi->hw->num_irqs);
+			apple_spmi_irq_ack_raw(spmi, spmi->num_irqs);
 		}
 		spmi->prev_fail = false;
 	}
@@ -451,7 +442,7 @@ static int apple_spmi_irq_domain_translate(struct irq_domain *irqd,
 	if (fwspec->param_count != 2)
 		return -EINVAL;
 
-	if (args[0] >= spmi->hw->num_irqs)
+	if (args[0] >= spmi->num_irqs)
 		return -EINVAL;
 	*hwirq = args[0];
 	*type = args[1] & IRQ_TYPE_SENSE_MASK;
@@ -471,7 +462,7 @@ static int apple_spmi_irq_domain_alloc(struct irq_domain *irqd, unsigned int vir
 	if (ret)
 		return ret;
 
-	if (hwirq + nr_irqs > spmi->hw->num_irqs)
+	if (hwirq + nr_irqs > spmi->num_irqs)
 		return -EINVAL;
 
 	for (i = 0; i < nr_irqs; i++) {
@@ -508,7 +499,7 @@ static void apple_spmi_irq_handler(struct irq_desc *desc)
 {
 	struct apple_spmi *spmi = irq_desc_get_handler_data(desc);
 	struct irq_chip *chip = irq_desc_get_chip(desc);
-	u32 notify = spmi->hw->num_irqs;
+	u32 notify = spmi->num_irqs;
 	bool handled = false, held = false, raw_pending = false;
 	unsigned long val, offset, bit;
 
@@ -579,7 +570,7 @@ static void apple_spmi_teardown_irq(void *data)
 {
 	struct apple_spmi *spmi = data;
 
-	for (size_t offset = 0; offset < (spmi->hw->num_irqs + 32) / 8; offset += 4)
+	for (size_t offset = 0; offset < (spmi->num_irqs + 32) / 8; offset += 4)
 		writel(0, spmi->regs + SPMI_IRQ_MASK_BASE + offset);
 
 	synchronize_irq(spmi->irq);
@@ -599,7 +590,7 @@ static int apple_spmi_init_irq(struct platform_device *pdev,
 
 	raw_spin_lock_init(&spmi->irq_mask_lock);
 
-	for (size_t offset = 0; offset < (spmi->hw->num_irqs + 32) / 8; offset += 4) {
+	for (size_t offset = 0; offset < (spmi->num_irqs + 32) / 8; offset += 4) {
 		writel(0, spmi->regs + SPMI_IRQ_MASK_BASE + offset);
 		writel(U32_MAX, spmi->regs + SPMI_IRQ_ACK_BASE + offset);
 	}
@@ -613,7 +604,7 @@ static int apple_spmi_init_irq(struct platform_device *pdev,
 		return ret;
 
 	irq_set_chained_handler_and_data(spmi->irq, apple_spmi_irq_handler, spmi);
-	apple_spmi_irq_unmask_raw(spmi, spmi->hw->num_irqs);
+	apple_spmi_irq_unmask_raw(spmi, spmi->num_irqs);
 	spmi->notify_irq = true;
 
 	return 0;
@@ -639,8 +630,8 @@ static int apple_spmi_suspend_noirq(struct device *dev)
 	spmi->notify_irq = false;
 	spmi->notify_parked = true;
 	raw_spin_lock_irqsave(&spmi->irq_mask_lock, flags);
-	apple_spmi_irq_mask_raw(spmi, spmi->hw->num_irqs);
-	apple_spmi_irq_ack_raw(spmi, spmi->hw->num_irqs);
+	apple_spmi_irq_mask_raw(spmi, spmi->num_irqs);
+	apple_spmi_irq_ack_raw(spmi, spmi->num_irqs);
 	raw_spin_unlock_irqrestore(&spmi->irq_mask_lock, flags);
 
 	return 0;
@@ -660,12 +651,12 @@ static int apple_spmi_resume_noirq(struct device *dev)
 	raw_spin_lock_irqsave(&spmi->irq_mask_lock, flags);
 	/* Whether the enables survive a real sleep has not been measured. */
 	if (pm_resume_via_firmware()) {
-		bitmap_to_arr32(words, spmi->irq_mask_cache, spmi->hw->num_irqs);
-		for (i = 0; i < spmi->hw->num_irqs / 32; i++)
+		bitmap_to_arr32(words, spmi->irq_mask_cache, spmi->num_irqs);
+		for (i = 0; i < spmi->num_irqs / 32; i++)
 			writel(words[i], spmi->regs + SPMI_IRQ_MASK_BASE + i * 4);
 	}
-	apple_spmi_irq_ack_raw(spmi, spmi->hw->num_irqs);
-	apple_spmi_irq_unmask_raw(spmi, spmi->hw->num_irqs);
+	apple_spmi_irq_ack_raw(spmi, spmi->num_irqs);
+	apple_spmi_irq_unmask_raw(spmi, spmi->num_irqs);
 	raw_spin_unlock_irqrestore(&spmi->irq_mask_lock, flags);
 	spmi->notify_parked = false;
 	spmi->notify_irq = true;
@@ -690,6 +681,30 @@ static int apple_spmi_probe(struct platform_device *pdev)
 	spmi->hw = device_get_match_data(&pdev->dev);
 	if (!spmi->hw)
 		return -EINVAL;
+	spmi->num_irqs = spmi->hw->num_irqs;
+	if (spmi->hw->legacy_irqs) {
+		u32 response_vector;
+
+		ret = of_property_read_u32(pdev->dev.of_node,
+					   "apple,response-vector",
+					   &response_vector);
+		if (!ret) {
+			if (!response_vector ||
+			    response_vector > SPMI_MAX_PERIPHERAL_IRQS ||
+			    response_vector % 64)
+				return dev_err_probe(&pdev->dev, -EINVAL,
+						     "invalid apple,response-vector %u\n",
+						     response_vector);
+			spmi->num_irqs = response_vector;
+		} else if (ret != -EINVAL) {
+			return dev_err_probe(&pdev->dev, ret,
+					     "failed to read apple,response-vector\n");
+		}
+	} else if (of_property_present(pdev->dev.of_node,
+				       "apple,response-vector")) {
+		dev_warn(&pdev->dev,
+			 "ignoring apple,response-vector on generation 4 controller\n");
+	}
 	mutex_init(&spmi->fifo_lock);
 	init_completion(&spmi->fifo_rx);
 	platform_set_drvdata(pdev, spmi);
