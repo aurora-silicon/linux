@@ -1,0 +1,1045 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
+
+//! The G14 root for GPU firmware 27.2, the boot compute job that starts the firmware's command
+//! service, and the command pool the 27.2 compute runtime (`crate::g14_v27_2`) publishes from.
+//!
+//! The root is built on the records of a 13.5 G14 manager, made with
+//! [`GraphProfile::G14V27_2`]: its hardware data supplies the calibrated values, and its
+//! kernel UAT, allocators and buffer-manager control pages are shared. The firmware never sees
+//! that manager's own root.
+
+use super::*;
+use crate::g17::fw::m5::initdata as abi;
+use crate::hw::{RegisterBaseV27_2, RegisterV27_2};
+use crate::m3::m3_init_26 as directory26;
+
+/// The firmware build word this root carries in its version field.
+const FIRMWARE_WORD: u64 = 0x0c8a_8342_8392_04c8;
+
+/// Kick message for the compute submission ring the root uses (group 2, compute).
+pub(crate) const COMPUTE_KICK: u64 = MSG_TX_DOORBELL | (4 * PRIORITY_GROUP + COMPUTE) as u64;
+/// Kick message for the device-control ring.
+pub(crate) const DEVICE_CONTROL_KICK: u64 = MSG_FWCTL | DOORBELL_DEVCTRL;
+
+/// Data master of the root's queue, and its priority group: the legacy G14 priority row 2.
+const COMPUTE: usize = 2;
+const PRIORITY_GROUP: usize = 2;
+const PRIORITY_ROW: usize = 2;
+/// The submission descriptor the queue publishes on (three per group).
+const SUBMISSION_RING: usize = 3 * PRIORITY_GROUP + COMPUTE;
+/// Firmware event, log, trace and statistics rings in the 34-entry channel list.
+const EVENT_RING: usize = 13;
+const LOG_RINGS: usize = 14;
+const TRACE_RING: usize = 15;
+const STATISTICS_RING: usize = 16;
+/// Ring geometries: the trace ring has 512 records of 0x48 bytes, the others 256.
+const TRACE_RECORDS: u32 = 512;
+const RING_RECORDS: u32 = 256;
+/// Queue capacity at position block +0x50 (16 x the 0x50 channels).
+const QUEUE_CAPACITY: u32 = 0x500;
+/// Upper performance-state cap, in hundredths, at globals +0x98: the first state above idle.
+/// Only this cap has run on hardware.
+const STATE_CAP: u32 = 100;
+
+/// Board facts the root needs, read from the device tree at probe.
+pub(crate) struct BoardV27_2 {
+    /// The SGX register window (`reg` "sgx").
+    pub(crate) sgx: u64,
+    pub(crate) sgx_size: u64,
+    /// Bytes of the firmware's crash copy buffer (`apple,coredump-copy-buffer`).
+    pub(crate) copy_bytes: u32,
+    /// The chip's 27.2 register table.
+    pub(crate) registers: &'static [RegisterV27_2],
+    /// Slots whose stock mode is read-write (bit per slot).
+    pub(crate) writable: u64,
+}
+
+/// Firmware-visible facts of the root's queue that every compute command names.
+#[derive(Copy, Clone)]
+pub(crate) struct QueueInfo {
+    pub(crate) queue: u64,
+    pub(crate) slot: u32,
+    pub(crate) stamp: u64,
+    pub(crate) fw_stamp: u64,
+    pub(crate) compute_state: u64,
+}
+
+/// One compute command, as the 26.x submission front end hands it over.
+pub(crate) struct ComputeJob {
+    pub(crate) context: u32,
+    pub(crate) sequence: u64,
+    pub(crate) cdm_base: u64,
+    pub(crate) cdm_end: u64,
+    pub(crate) usc_base: u64,
+    /// VA of the preemption buffer in the same context (13.5 layout: buffer 1 at +0,
+    /// buffers 2 to 5 at +compute_preempt1_size + 8n).
+    pub(crate) preempt: u64,
+}
+
+fn put32(b: &mut [u8], at: usize, v: u32) {
+    b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+}
+
+fn put64(b: &mut [u8], at: usize, v: u64) {
+    b[at..at + 8].copy_from_slice(&v.to_le_bytes());
+}
+
+/// Encodes a type-3 compute command (0x358 bytes, the 13.5 G14 job parameters inside the
+/// 27.2 wrapper) and its start/finish stream. Both buffers must be zeroed.
+#[allow(clippy::too_many_arguments)]
+fn encode_compute(
+    cmd: &mut [u8], cmd_va: u64, stream: &mut [u8], stream_va: u64, tracking: u64,
+    timestamps: u64, preempt1: u64, q: &QueueInfo, stamp_value: u32, job: &ComputeJob,
+) {
+    put32(cmd, 0, 3);
+    put64(cmd, 4, job.sequence);
+    put32(cmd, 0xc, job.context);
+    put64(cmd, 0x10, tracking);
+    // 13.5 JobParameters1 at +0x68.
+    let p2 = job.preempt + preempt1;
+    for (at, v) in [(0x00, job.preempt), (0x08, job.cdm_base), (0x10, p2), (0x18, p2 + 8),
+                    (0x20, p2 + 16), (0x28, p2 + 24), (0x30, job.usc_base), (0x38, 0x8c60), (0x58, 1)] {
+        put64(cmd, 0x68 + at, v);
+    }
+    put64(cmd, 0x1e8, stream_va);
+    put32(cmd, 0x1f0, 0x2c0);
+    // 13.5 JobParameters2: preemption buffer and CDM end; EncoderParams mask.
+    put64(cmd, 0x220, job.preempt);
+    put64(cmd, 0x228, job.cdm_end);
+    put32(cmd, 0x270, u32::MAX);
+    put64(cmd, 0x298, q.stamp);
+    put64(cmd, 0x2a0, q.fw_stamp);
+    put32(cmd, 0x2a8, stamp_value);
+    put32(cmd, 0x2b0, q.slot);
+    put64(cmd, 0x2cc, timestamps);
+    put64(cmd, 0x2d4, timestamps + 8);
+    // Command-local dependency latch, enabled with seed 0; the firmware clears 0x10 bytes
+    // through the pointer at +0x334.
+    put32(cmd, 0x33c, 1);
+    put64(cmd, 0x334, timestamps + 0x20);
+
+    put32(stream, 0, 11);
+    put64(stream, 0x160, job.sequence);
+    put64(stream, 0x04, cmd_va + 0x18);
+    put64(stream, 0x0c, cmd_va + 0x68);
+    put64(stream, 0x14, q.compute_state);
+    put64(stream, 0x1c, q.queue);
+    put32(stream, 0x24, job.context);
+    put32(stream, 0x34, q.slot);
+    put64(stream, 0x3c, cmd_va + 0x1f4);
+    put64(stream, 0x158, cmd_va + 0x340);
+    for (at, op, selected) in [(0x16c, 0x8000_0003u32, 0x2ccu64), (0x1bc, 3, 0x2d4)] {
+        put32(stream, at, op);
+        put64(stream, at + 0x04, cmd_va + 0x2c4);
+        put64(stream, at + 0x0c, cmd_va + 0x2cc);
+        put64(stream, at + 0x14, cmd_va + selected);
+        put64(stream, at + 0x1c, q.queue);
+        put64(stream, at + 0x2c, cmd_va + 0x314);
+        put64(stream, at + 0x34, cmd_va + 0x264);
+    }
+    put32(stream, 0x1b8, 0x0080_0000);
+    let finish = 0x208;
+    put32(stream, finish, 12);
+    put64(stream, finish + 4, q.compute_state);
+    put64(stream, finish + 0x0c, q.queue);
+    put32(stream, finish + 0x14, job.context);
+    put64(stream, finish + 0x18, cmd_va + 0x1f4);
+    put64(stream, finish + 0x2c, q.fw_stamp);
+    put32(stream, finish + 0x34, stamp_value);
+    put32(stream, finish + 0x5c, (-(finish as i32)) as u32);
+    put64(stream, finish + 0x71, cmd_va + 0x340);
+    put64(stream, finish + 0x79, cmd_va + 0x304);
+    put32(stream, finish + 0x84, 0x4000_0002);
+}
+
+/// The root's queue and the kernel-owned boot job published on it: one compute dispatch of an
+/// empty control stream in context 0, which the firmware must retire before clients run.
+struct BootJob {
+    queue: fw::types::GpuArray<u8>,
+    positions: fw::types::GpuArray<u8>,
+    pointers: fw::types::GpuArray<u8>,
+    command: fw::types::GpuArray<u8>,
+    stream: fw::types::GpuArray<u8>,
+    tracking: fw::types::GpuArray<u8>,
+    timestamps: fw::types::GpuArray<u8>,
+    event: event::Event,
+    expected_stamp: u32,
+    _owners: KVec<fw::types::GpuArray<u8>>,
+    /// The job's buffers in context 0: mapping before backing.
+    _client: (mmu::KernelMapping, gem::ObjectRef),
+    client_va: u64,
+    preempt1: u64,
+}
+
+impl BootJob {
+    fn new(alloc: &mut KernelAllocators, event: event::Event, uat: &mmu::Uat, dev: &AsahiDevice,
+           cfg: &'static hw::HwConfig) -> Result<Self> {
+        let mut queue = alloc.private.array_empty::<u8>(0x2cc0)?;
+        let mut positions = alloc.shared.array_empty::<u8>(0x2860)?;
+        let pointers = alloc.private.array_empty::<u8>(0x2860)?;
+        let mut scheduler = alloc.private.array_empty::<u8>(0x40)?;
+        let mut queue_stamps = alloc.shared.array_empty::<u8>(0x18)?;
+        let command = alloc.private.array_empty::<u8>(0x400)?;
+        let stream = alloc.private.array_empty::<u8>(0x400)?;
+        // A command-buffer tracking slot (0x100 stride, 0xc8 bytes kept by the firmware)
+        // whose first word names its own cleared retirement cursor.
+        let mut tracking = alloc.private.array_empty::<u8>(0x100)?;
+        let cursor = alloc.shared.array_empty::<u8>(0x90)?;
+        put64(tracking.as_mut_slice(), 0, cursor.gpu_va().get());
+        crate::pgtable::clean_poc(tracking.as_slice().as_ptr(), 0x100);
+
+        let queue_stamps_va = queue_stamps.gpu_va().get();
+        put64(queue_stamps.as_mut_slice(), 8, queue_stamps_va);
+        let ctx = scheduler.as_mut_slice();
+        ctx[..2].copy_from_slice(&u16::MAX.to_le_bytes());
+        ctx[5] = 1;
+        ctx[0x27] = 0xff;
+        let queue_va = queue.gpu_va().get();
+        let q = queue.as_mut_slice();
+        for (offset, value) in [(0, positions.gpu_va().get()), (8, pointers.gpu_va().get()),
+                                (0x10, queue_stamps_va), (0x18, queue_va + 0x90),
+                                (0x7c, scheduler.gpu_va().get())] {
+            put64(q, offset, value);
+        }
+        // The kernel-owned queue has no owning process.
+        for offset in [0x2c, 0x4c, 0x50] {
+            put32(q, offset, u32::MAX);
+        }
+        let row = crate::fw::workqueue::raw::PRIORITY[PRIORITY_ROW];
+        put32(q, 0x30, row.0);
+        put32(q, 0x34, row.1);
+        put64(q, 0x38, row.2.0);
+        put32(q, 0x40, row.3);
+        put32(q, 0x44, row.4);
+        // The current lane stays at the all-ones sentinel; the firmware assigns it.
+        put32(q, 0x48, u32::MAX);
+        crate::pgtable::clean_poc(q.as_ptr(), q.len());
+        put32(positions.as_mut_slice(), 0x50, QUEUE_CAPACITY);
+
+        // The job's preemption buffer and control stream live in context 0 at a client VA.
+        let preempt1 = cfg.compute_preempt1_size;
+        let client_va = IOVA_KERN_GPU_BUFMGR_LOW + 0x10_0000;
+        let mut object = gem::new_kernel_object(dev, preempt1 + 0x4000)?;
+        let size = object.size();
+        {
+            use kernel::io::Io;
+            let map = object.vmap()?;
+            for off in (0..size).step_by(8) { map.try_write64(0, off)?; }
+            // CDM control stream: one Stream Terminate block (block type 2 in bits 31:29).
+            map.try_write32(0x4000_0000, preempt1 + 0x2000)?;
+        }
+        let mapping = object.map_at(uat.kernel_lower_vm(), client_va, mmu::PROT_GPU_SHARED_RW, false)?;
+        let timestamps = alloc.shared.array_empty::<u8>(0x80)?;
+
+        let mut owners = KVec::new();
+        for owner in [&queue_stamps, &pointers, &scheduler] {
+            crate::pgtable::clean_poc(owner.as_slice().as_ptr(), owner.as_slice().len());
+        }
+        for owner in [queue_stamps, scheduler, cursor] {
+            owners.push(owner, GFP_KERNEL)?;
+        }
+        let expected_stamp = event.current().next().raw();
+        Ok(Self { queue, positions, pointers, command, stream, tracking, timestamps, event,
+                  expected_stamp, _owners: owners, _client: (mapping, object),
+                  client_va, preempt1: preempt1 as u64 })
+    }
+
+    fn info(&self, compute_state: u64) -> QueueInfo {
+        QueueInfo {
+            queue: self.queue.gpu_va().get(),
+            slot: self.event.slot(),
+            stamp: u64::from(self.event.stamp_pointer()),
+            fw_stamp: u64::from(self.event.fw_stamp_pointer()),
+            compute_state,
+        }
+    }
+
+    /// Encodes the boot command and names it at queue position 0.
+    fn encode(&mut self, q: &QueueInfo) {
+        let cdm = self.client_va + self.preempt1 + 0x2000;
+        let job = ComputeJob {
+            context: 0, sequence: 0, cdm_base: cdm, cdm_end: cdm + 8,
+            usc_base: 0x11_0000_0000, preempt: self.client_va,
+        };
+        let (cmd_va, stream_va) = (self.command.gpu_va().get(), self.stream.gpu_va().get());
+        encode_compute(self.command.as_mut_slice(), cmd_va, self.stream.as_mut_slice(), stream_va,
+                       self.tracking.gpu_va().get(), self.timestamps.gpu_va().get(), self.preempt1,
+                       q, self.expected_stamp, &job);
+        crate::pgtable::clean_poc(self.stream.as_slice().as_ptr(), self.stream.as_slice().len());
+        crate::pgtable::clean_poc(self.command.as_slice().as_ptr(), self.command.as_slice().len());
+        put64(self.pointers.as_mut_slice(), 0, cmd_va);
+        crate::pgtable::clean_poc(self.pointers.as_slice().as_ptr(), 8);
+        crate::pgtable::poc_barrier();
+    }
+}
+
+/// Command slots for client compute work. They are allocated with the root, before the
+/// firmware window's tables are mirrored, so every slot lies in a table the firmware already
+/// translates. Slots are reused in order.
+pub(crate) const POOL_SLOTS: usize = 48;
+
+pub(crate) struct CommandPool {
+    commands: fw::types::GpuArray<u8>,
+    streams: fw::types::GpuArray<u8>,
+    tracking: fw::types::GpuArray<u8>,
+    cursors: fw::types::GpuArray<u8>,
+    stamps: fw::types::GpuArray<u8>,
+    preempt1: u64,
+}
+
+impl CommandPool {
+    pub(crate) fn new(alloc: &mut KernelAllocators, cfg: &'static hw::HwConfig) -> Result<Self> {
+        let commands = alloc.private.array_empty::<u8>(POOL_SLOTS * 0x400)?;
+        let streams = alloc.private.array_empty::<u8>(POOL_SLOTS * 0x400)?;
+        let mut tracking = alloc.private.array_empty::<u8>(POOL_SLOTS * 0x100)?;
+        // One 64-byte line per retirement cursor, so no firmware write can reach a neighbour.
+        let cursors = alloc.shared.array_empty::<u8>(POOL_SLOTS * 0x40)?;
+        let stamps = alloc.shared.array_empty::<u8>(POOL_SLOTS * 0x80)?;
+        let base = cursors.gpu_va().get();
+        for (i, chunk) in tracking.as_mut_slice().chunks_mut(0x100).enumerate() {
+            put64(chunk, 0, base + 0x40 * i as u64);
+        }
+        crate::pgtable::clean_poc(tracking.as_slice().as_ptr(), tracking.as_slice().len());
+        Ok(Self { commands, streams, tracking, cursors, stamps, preempt1: cfg.compute_preempt1_size as u64 })
+    }
+
+    /// Builds slot `i` for `job` and returns the command's firmware VA.
+    pub(crate) fn encode(&mut self, i: usize, q: &QueueInfo, stamp_value: u32, job: &ComputeJob) -> Result<u64> {
+        if i >= POOL_SLOTS { return Err(EINVAL); }
+        let cmd_va = self.commands.gpu_va().get() + (i * 0x400) as u64;
+        let stream_va = self.streams.gpu_va().get() + (i * 0x400) as u64;
+        let tracking_va = self.tracking.gpu_va().get() + (i * 0x100) as u64;
+        let timestamps_va = self.stamps.gpu_va().get() + (i * 0x80) as u64;
+        // The firmware keeps 0xc8 bytes of the tracking slot; start each use cleared.
+        let tracking = &mut self.tracking.as_mut_slice()[i * 0x100..(i + 1) * 0x100];
+        tracking[8..].fill(0);
+        crate::pgtable::clean_poc(tracking.as_ptr(), tracking.len());
+        let stamps = &mut self.stamps.as_mut_slice()[i * 0x80..(i + 1) * 0x80];
+        stamps.fill(0);
+        crate::pgtable::clean_poc(stamps.as_ptr(), 0x80);
+        let cmd = &mut self.commands.as_mut_slice()[i * 0x400..(i + 1) * 0x400];
+        cmd.fill(0);
+        let stream = &mut self.streams.as_mut_slice()[i * 0x400..(i + 1) * 0x400];
+        stream.fill(0);
+        encode_compute(cmd, cmd_va, stream, stream_va, tracking_va, timestamps_va, self.preempt1,
+                       q, stamp_value, job);
+        crate::pgtable::clean_poc(stream.as_ptr(), stream.len());
+        crate::pgtable::clean_poc(cmd.as_ptr(), cmd.len());
+        crate::pgtable::poc_barrier();
+        Ok(cmd_va)
+    }
+
+    /// Retirement: advance slot `i`'s cursor to the value the firmware recorded at
+    /// tracking +0xc, so its retirement scan unlinks the slot from the queue's list.
+    ///
+    /// The firmware records +0xc in its post-processing, which can run after the queue's
+    /// retired position has advanced. Until then +0xc reads 0 (the slot is cleared for each
+    /// use) and nothing is written: the cursor would stay behind and the firmware would keep
+    /// the slot linked for good. Returns whether the cursor was advanced; the caller retries a
+    /// slot that returned `false` on the firmware's next notification.
+    pub(crate) fn retire(&self, i: usize) -> Result<bool> {
+        if i >= POOL_SLOTS { return Err(EINVAL); }
+        crate::pgtable::clean_invalidate_poc(self.tracking.as_slice()[i * 0x100..].as_ptr(), 0x100);
+        crate::pgtable::poc_barrier();
+        let expected = self.tracking.shared_index(i * 0x100 + 0xc)?.load(Ordering::Acquire);
+        if expected == 0 { return Ok(false); }
+        self.cursors.shared_index(i * 0x40)?.store(expected, Ordering::Release);
+        crate::pgtable::clean_poc(self.cursors.as_slice()[i * 0x40..].as_ptr(), 0x40);
+        crate::pgtable::poc_barrier();
+        Ok(true)
+    }
+
+    /// Whether the firmware still holds slot `i` in the queue's tracking list (+0x94).
+    pub(crate) fn registered(&self, i: usize) -> Result<bool> {
+        if i >= POOL_SLOTS { return Err(EINVAL); }
+        crate::pgtable::clean_invalidate_poc(self.tracking.as_slice()[i * 0x100..].as_ptr(), 0x100);
+        crate::pgtable::poc_barrier();
+        Ok(self.tracking.shared_index(i * 0x100 + 0x94)?.load(Ordering::Acquire) != 0)
+    }
+}
+
+/// Ring contents prepared while the firmware still owns the old producer.
+pub(crate) struct ComputePublication<'a> {
+    positions: &'a fw::types::GpuArray<u8>,
+    indices: &'a fw::types::GpuArray<u8>,
+    head: &'a core::sync::atomic::AtomicU32,
+    producer: &'a core::sync::atomic::AtomicU32,
+    next_head: u32,
+    next_producer: u32,
+}
+
+impl ComputePublication<'_> {
+    pub(crate) fn commit(self) {
+        self.head.store(self.next_head, Ordering::Release);
+        crate::pgtable::clean_poc(self.positions.as_slice().as_ptr(), 0x60);
+        crate::pgtable::poc_barrier();
+        self.producer.store(self.next_producer, Ordering::Release);
+        crate::pgtable::clean_poc(self.indices.as_slice().as_ptr(), 0x30);
+        crate::pgtable::poc_barrier();
+    }
+}
+
+/// The firmware 27.2 root and every record it names.
+pub(crate) struct RootV27_2 {
+    graph: Arc<GpuManagerG14V13_5>,
+    boot: BootJob,
+    compute_state: u64,
+    channels: KVec<fw::types::GpuArray<u8>>,
+    _owners: KVec<fw::types::GpuArray<u8>>,
+    _register_mappings: KVec<mmu::KernelMapping>,
+    _controller: fw::types::GpuArray<u8>,
+    _directory: fw::types::GpuArray<u8>,
+    boot_page: fw::types::GpuArray<u8>,
+    globals: fw::types::GpuArray<u8>,
+    status: fw::types::GpuArray<u8>,
+    control: fw::types::GpuArray<u8>,
+    power: fw::types::GpuArray<u8>,
+    extra: fw::types::GpuArray<u8>,
+}
+
+impl fw::types::GpuStruct for RootV27_2 {
+    type Raw<'a> = fw::initdata::raw::InitDataG14V27_2<'a>;
+}
+
+impl GpuManagerG14V13_5 {
+    /// The kernel UAT these records live in.
+    pub(crate) fn kernel_uat(&self) -> &mmu::Uat {
+        &self.uat
+    }
+}
+
+impl RootV27_2 {
+    fn word(a: &fw::types::GpuArray<u8>, at: usize) -> Result<u32> {
+        Ok(a.shared_index(at)?.load(Ordering::Acquire))
+    }
+
+    /// The queue's identity for client commands, and the stamp value it last reached.
+    pub(crate) fn queue(&self) -> (QueueInfo, event::EventValue) {
+        (self.boot.info(self.compute_state), self.boot.event.current())
+    }
+
+    /// The queue's capacity (position block +0x50).
+    pub(crate) fn capacity(&self) -> Result<u32> {
+        Self::word(&self.boot.positions, 0x50)
+    }
+
+    /// The queue head and the firmware's retired position, which it advances in order.
+    pub(crate) fn progress(&self) -> Result<(u32, u32)> {
+        let positions = self.boot.positions.as_slice();
+        crate::pgtable::clean_invalidate_poc(positions.as_ptr(), 0x60);
+        crate::pgtable::poc_barrier();
+        Ok((Self::word(&self.boot.positions, 0x40)?, Self::word(&self.boot.positions, 0)?))
+    }
+
+    /// Prepares a work pointer and channel entry without advancing either producer.
+    pub(crate) fn stage_compute(&self, command: u64) -> Result<ComputePublication<'_>> {
+        let job = &self.boot;
+        let indices = &self.channels[2 * SUBMISSION_RING];
+        let ring = &self.channels[2 * SUBMISSION_RING + 1];
+        crate::pgtable::clean_invalidate_poc(job.positions.as_slice().as_ptr(), 0x60);
+        crate::pgtable::clean_invalidate_poc(indices.as_slice().as_ptr(), 0x30);
+        crate::pgtable::poc_barrier();
+        let head = job.positions.shared_index(0x40)?;
+        let old = head.load(Ordering::Acquire);
+        let capacity = Self::word(&job.positions, 0x50)?;
+        let retired = Self::word(&job.positions, 0)?;
+        if capacity <= 1 || old >= capacity || retired >= capacity
+            || capacity as usize > job.pointers.len() / 8
+        {
+            return Err(EIO);
+        }
+        let next_head = (old + 1) % capacity;
+        if next_head == retired { return Err(EBUSY); }
+
+        let producer = indices.shared_index(0x20)?;
+        let write = producer.load(Ordering::Acquire);
+        let read = Self::word(indices, 0)?;
+        let entries = crate::m3::m3_channel_format::SLOTS;
+        if write >= entries || read >= entries { return Err(EIO); }
+        let next_producer = (write + 1) % entries;
+        if next_producer == read { return Err(EBUSY); }
+        let slot = u8::try_from(job.event.slot()).map_err(|_| EINVAL)?;
+        let entry = crate::m3::submission_entry(COMPUTE as u32, job.queue.gpu_va().get(),
+            u16::try_from(next_head).map_err(|_| EINVAL)?, slot, false).map_err(|_| EINVAL)?;
+
+        let at = old as usize * 8;
+        job.pointers.shared_index(at)?.store(command as u32, Ordering::Relaxed);
+        job.pointers.shared_index(at + 4)?.store((command >> 32) as u32, Ordering::Relaxed);
+        crate::pgtable::clean_poc(job.pointers.as_slice()[at..].as_ptr(), 8);
+        let base = write as usize * entry.len();
+        for (index, word) in entry.chunks_exact(4).enumerate() {
+            ring.shared_index(base + 4 * index)?.store(
+                u32::from_le_bytes([word[0], word[1], word[2], word[3]]), Ordering::Relaxed);
+        }
+        crate::pgtable::clean_poc(ring.as_slice()[base..].as_ptr(), entry.len());
+        crate::pgtable::poc_barrier();
+        Ok(ComputePublication { positions: &job.positions, indices, head, producer,
+            next_head, next_producer })
+    }
+
+    /// Publishes the boot job, whose command and ring entry the root already holds. The GPU
+    /// must be held powered (`operating_point`: the Fender state, nonzero index, no request
+    /// pending) and the command service installed.
+    pub(crate) fn publish_boot_job(&self, operating_point: u32) -> Result {
+        let job = &self.boot;
+        let index = operating_point & 0xf;
+        if operating_point & 0x10 != 0 || index == 0 || index > self.graph.dyncfg.pwr.perf_max_pstate
+            || self.idle_progress()? != [1; 3]
+            || self.idle_acknowledgement()? != Self::word(&self.globals, 0xe40)?
+            || !self.commands_installed()? {
+            return Err(EAGAIN);
+        }
+        let producer = self.channels[2 * SUBMISSION_RING].shared_index(0x20)?;
+        let head = job.positions.shared_index(0x40)?;
+        if Self::word(&self.status, 0x14)? != 1 || producer.load(Ordering::Acquire) != 0
+            || head.load(Ordering::Acquire) != 0 {
+            return Err(EAGAIN);
+        }
+        crate::pgtable::poc_barrier();
+        head.store(1, Ordering::Release);
+        crate::pgtable::poc_barrier();
+        producer.store(1, Ordering::Release);
+        crate::pgtable::poc_barrier();
+        Ok(())
+    }
+
+    /// Whether the boot job has retired: ring consumed, queue read and retired, stamp reached.
+    pub(crate) fn boot_job_complete(&self) -> Result<bool> {
+        self.drain()?;
+        let job = &self.boot;
+        Ok(Self::word(&self.channels[2 * SUBMISSION_RING], 0)? == 1
+            && Self::word(&job.positions, 0x30)? == 1
+            && Self::word(&job.positions, 0)? == 1
+            && job.event.current().raw() == job.expected_stamp)
+    }
+
+    /// Consumes everything the firmware published on its statistics, event, log and trace
+    /// rings. The firmware waits for space when one is full, and host consumer advancement is
+    /// the acknowledgement; completion is followed through the queue's position block, so the
+    /// records are not kept.
+    pub(crate) fn drain(&self) -> Result {
+        let consume = |state: &fw::types::GpuArray<u8>, base: usize, records: u32| -> Result {
+            let write = Self::word(state, base + 0x20)?;
+            let read = state.shared_index(base)?;
+            if write < records && read.load(Ordering::Acquire) != write {
+                read.store(write, Ordering::Release);
+                crate::pgtable::poc_barrier();
+            }
+            Ok(())
+        };
+        consume(&self.channels[2 * STATISTICS_RING], 0, RING_RECORDS)?;
+        consume(&self.channels[2 * EVENT_RING], 0, RING_RECORDS)?;
+        // One log ring per log thread, state blocks 0x30 apart.
+        for thread in 0..directory26::LOG_THREADS {
+            consume(&self.channels[2 * LOG_RINGS], thread * 0x30, RING_RECORDS)?;
+        }
+        consume(&self.channels[2 * TRACE_RING], 0, TRACE_RECORDS)
+    }
+
+    /// Shared status +0x14: the firmware sets it to 1 once it has initialized.
+    pub(crate) fn initialized(&self) -> Result<bool> {
+        Ok(Self::word(&self.status, 0x14)? == 1)
+    }
+
+    /// Shared status +0x10: nonzero while the firmware reports itself running.
+    pub(crate) fn firmware_running(&self) -> Result<u32> {
+        Self::word(&self.status, 0x10)
+    }
+
+    /// Whether the firmware has installed its command handlers: it clears the installation
+    /// request (+0x4c24), which the root sets, once powered initialization has copied them.
+    /// Engine entries may be published only after that.
+    pub(crate) fn commands_installed(&self) -> Result<bool> {
+        Ok(Self::word(&self.control, 0x4c24)? == 0)
+    }
+
+    pub(crate) fn idle_acknowledgement(&self) -> Result<u32> {
+        Self::word(&self.control, 0xe838)
+    }
+
+    /// Device-control ring consumer, target and producer.
+    pub(crate) fn idle_progress(&self) -> Result<[u32; 3]> {
+        self.drain()?;
+        let ring = &self.channels[2 * crate::m3::DEVICE_CONTROL];
+        Ok([Self::word(ring, 0)?, Self::word(ring, 0x10)?, Self::word(ring, 0x20)?])
+    }
+
+    /// Publishes one of the two pre-encoded idle-policy records on the device-control ring:
+    /// keep powered first, then allow off. Returns the ring cursor and the counted generation
+    /// the firmware acknowledges, which follows the larger of the host's last publication and
+    /// the firmware's consumed count.
+    pub(crate) fn publish_idle_policy(&self, allow_off: bool) -> Result<(u32, u32)> {
+        let cursor = u32::from(allow_off);
+        let host = self.globals.shared_index(0xe40)?;
+        let firmware = self.idle_acknowledgement()?;
+        let producer = self.channels[2 * crate::m3::DEVICE_CONTROL].shared_index(0x20)?;
+        if Self::word(&self.status, 0x14)? != 1 ||
+            crate::m3::idle_cursor(self.idle_progress()?).map_err(|_| EBUSY)? != cursor {
+            return Err(EAGAIN);
+        }
+        let action = crate::m3::Action::Idle { enabled: allow_off };
+        let generation = action.generation(host.load(Ordering::Acquire), firmware).map_err(|_| EOVERFLOW)?;
+        host.store(generation, Ordering::Release);
+        crate::pgtable::poc_barrier();
+        producer.store(cursor + 1, Ordering::Release);
+        crate::pgtable::poc_barrier();
+        Ok((cursor + 1, generation))
+    }
+
+    /// Builds the root, the boot job and every record they name.
+    pub(crate) fn build(graph: &Arc<GpuManagerG14V13_5>, board: &BoardV27_2) -> Result<fw::types::GpuObject<Self>> {
+        let cfg = graph.cfg;
+        let pwr = &graph.dyncfg.pwr;
+        let states = &pwr.perf_states;
+        let id = &graph.dyncfg.id;
+        // Inputs the controller below is built from, all from the DT and the ID registers.
+        let [core_mask] = id.core_masks.as_slice() else { return Err(EINVAL); };
+        if !pwr.power_zones.is_empty() || pwr.max_power_mw == 0 || pwr.max_power_mw > i32::MAX as u32
+            || states.last().map(|s| s.pwr_mw) != Some(pwr.max_power_mw)
+            || pwr.power_sample_period == 0
+            || pwr.ppm_filter_time_constant_ms < pwr.power_sample_period
+            || pwr.avg_power_filter_tc_ms < pwr.power_sample_period
+            || pwr.avg_power_target_filter_tc == 0
+            || !(2..=abi::COMMON26_HW_PERF_ROWS).contains(&states.len())
+            || states.windows(2).any(|s| s[1].pwr_mw <= s[0].pwr_mw || s[1].freq_hz <= s[0].freq_hz)
+            || pwr.perf_base_pstate == 0 || pwr.perf_base_pstate as usize >= states.len()
+            || core_mask.count_ones() != id.total_active_cores || id.total_active_cores == 0
+            || cfg.shared3_tab.len() != 16
+            || board.copy_bytes == 0 || board.sgx_size < 0xe14000 {
+            return Err(EINVAL);
+        }
+        // Alarm sensors: the chip's fast-die selection, also its sensor inventory.
+        let sensors = cfg.fast_sensor_mask[0];
+        if sensors == 0 || sensors >> 32 != 0 || cfg.fast_sensor_mask_alt[0] != sensors {
+            return Err(EINVAL);
+        }
+        // The SRAM voltage of each operating point, published by the loader from the ADT.
+        let sram_table = Self::sram_table(states.len())?;
+
+        let mut alloc = graph.alloc();
+        let mut boot = BootJob::new(&mut alloc, graph.event_manager.try_get_polled()?,
+                                    graph.kernel_uat(), &graph.dev, cfg)?;
+        // The 0x60-byte root child and the eight-byte temperature generation occupy
+        // consecutive, 64-byte-aligned shared suballocations.
+        let extra = alloc.shared.array_empty::<u8>(0x80 + 8)?;
+
+        // The thirteen TX descriptors and four RX rings.
+        let mut channels = KVec::new();
+        let mut addresses = [0; 34];
+        for (index, address) in addresses.iter_mut().enumerate() {
+            let size = directory26::allocation(index).map_err(|_| EINVAL)?.size;
+            let owner = if index < 26 && index % 2 == 1 {
+                alloc.private.array_empty::<u8>(size)?
+            } else {
+                alloc.shared.array_empty::<u8>(size)?
+            };
+            *address = owner.gpu_va().get();
+            channels.push(owner, GFP_KERNEL)?;
+        }
+        {
+            // The boot job's entry is pending at index 0 of its empty ring.
+            let slot = u8::try_from(boot.event.slot()).map_err(|_| EINVAL)?;
+            let entry = crate::m3::submission_entry(COMPUTE as u32, boot.queue.gpu_va().get(), 1, slot, true)
+                .map_err(|_| EINVAL)?;
+            let ring = channels[2 * SUBMISSION_RING + 1].as_mut_slice();
+            ring[..entry.len()].copy_from_slice(&entry);
+            crate::pgtable::clean_poc(ring.as_ptr(), ring.len());
+        }
+        {
+            // The two idle-policy records: keep powered, then allow off.
+            let records = &mut channels[2 * crate::m3::DEVICE_CONTROL + 1].as_mut_slice()
+                [..2 * crate::m3::CONTROL_BYTES];
+            for (index, record) in records.chunks_exact_mut(crate::m3::CONTROL_BYTES).enumerate() {
+                crate::m3::Action::Idle { enabled: index == 1 }.encode(record).map_err(|_| EINVAL)?;
+            }
+            crate::pgtable::clean_poc(records.as_ptr(), records.len());
+        }
+
+        let mut directory = alloc.private.array_empty::<u8>(0x4c8)?;
+        let bytes = directory.as_mut_slice();
+        directory26::write_channels(bytes, &addresses).map_err(|_| EINVAL)?;
+        let base = &graph.initdata.runtime_pointers;
+
+        // Hardware data: the 27.2 inline block.
+        use fw::initdata::raw::HwDataBG14V27_2 as Hw;
+        use crate::m3::m3_mmio_26::{write_record, RECORD_BYTES, TABLE_OFFSET};
+        let mut hardware = alloc.private.array_empty::<u8>(0x2788)?;
+        let hw = hardware.as_mut_slice();
+        let mode = |slot: usize| if board.writable & (1 << slot) != 0 { 2 } else { 0 };
+        for slot in 0..60 {
+            write_record(&mut hw[TABLE_OFFSET + RECORD_BYTES * slot..], 0, 0, 0, 0, 0, mode(slot))
+                .map_err(|_| EINVAL)?;
+        }
+        let mut register_mappings = KVec::new();
+        let mut io_va = IOVA_KERN_MMIO_RANGE.start;
+        for reg in board.registers {
+            let physical = match reg.base {
+                RegisterBaseV27_2::Physical(pa) => pa,
+                RegisterBaseV27_2::Sgx(offset) => board.sgx + offset,
+            };
+            let Some(va_offset) = reg.install else { continue; };
+            let subpage = physical as usize & mmu::UAT_PGMSK;
+            let span = (subpage + reg.size as usize + mmu::UAT_PGMSK) & !mmu::UAT_PGMSK;
+            let writable = mode(reg.slot) == 2;
+            let page_start = physical - subpage as u64;
+            let va = match va_offset {
+                0 => io_va,
+                offset => IOVA_KERN_MMIO_RANGE.start + offset,
+            };
+            let page = graph.uat.kernel_vm().map_io(
+                graph.dev.as_ref().as_ref(), va, page_start as usize, span,
+                if writable { mmu::PROT_FW_MMIO_RW } else { mmu::PROT_FW_MMIO_RO },
+            )?;
+            if page.translate_offset(subpage)? != physical
+                || page.translate_offset(subpage + reg.size as usize - 1)? != physical + u64::from(reg.size) - 1 {
+                return Err(EINVAL);
+            }
+            write_record(&mut hw[TABLE_OFFSET + RECORD_BYTES * reg.slot..], physical,
+                page.iova() + subpage as u64, reg.size, reg.size, reg.relative, mode(reg.slot))
+                .map_err(|_| EINVAL)?;
+            if va_offset == 0 {
+                io_va = io_va.checked_add(span as u64).ok_or(EOVERFLOW)?;
+            }
+            register_mappings.push(page, GFP_KERNEL)?;
+        }
+        let dump = core::mem::offset_of!(Hw, coredump_copy_buffer_size);
+        put64(hw, dump, u64::from(board.copy_bytes));
+        base.hwdata_b.with(|old, _| {
+            for (offset, value) in [
+                (0x00, old.unk_8.0), (0x08, old.unk_18.0),
+                (0x10, 0x11_00000000), (0x18, 0x11_00000000),
+                (0x20, 0x6f_ffff8000), (0x28, IOVA_G14_V27_2_TIMESTAMP_RANGE.start),
+                (0x10cc, old.uat_ttb_base.0),
+            ] {
+                put64(hw, offset, value);
+            }
+            for (offset, value) in [(0x10d4, old.gpu_core_id), (0x10d8, old.gpu_rev_id),
+                                    (0x10dc, id.total_active_cores), (0x10e0, old.max_pstate)] {
+                put32(hw, offset, value);
+            }
+            let chip = core::mem::offset_of!(Hw, chip_id);
+            for (i, word) in [old.chip_id, old.unk_454, old.unk_458, old.unk_45c].into_iter().enumerate() {
+                put32(hw, chip + 4 * i, word);
+            }
+        });
+        // Inline words the stock host producer fixes for a gpu,t8112 node without model-slow.
+        for (offset, value) in [(0xfc8u32, 0u32), (0xfd8, 1), (0xfec, 24000), (0xff0, 1),
+                                (0xffc, 1), (0x2724, 1), (0x2754, 1),
+                                (0xfc4, 1), (0xfdc, 1), (0xfe0, 0), (0x1028, 0),
+                                (0x109c, 0), (0x1064, 0), (0x2728, 0)] {
+            put32(hw, offset as usize, value);
+        }
+        // Compute resource mask, one low bit per configured core; the firmware seeds the
+        // compute engine's population from it.
+        let cores = id.total_active_cores;
+        put32(hw, 0x2670, if cores < 32 { (1u32 << cores) - 1 } else { u32::MAX });
+        // Firmware-managed operating points, CRE and event-assisted operating-point completion.
+        for offset in [0xfc0, 0x26b8, 0x1054] {
+            put32(hw, offset, 1);
+        }
+        put64(hw, 0x267c, u64::from(*core_mask));
+        put32(hw, 0x2684, id.total_active_cores);
+        // Operating points: power above the lowest state, and frequency above the base state,
+        // as percentages; MHz and the per-lane core and SRAM voltages.
+        let top = states.len() - 1;
+        if old_max_pstate(base)? as usize != top { return Err(EINVAL); }
+        let baseline = states[0].pwr_mw;
+        let span = crate::float::F32::from(states[top].pwr_mw - baseline);
+        for (i, state) in states.iter().enumerate() {
+            let percentage = crate::float::F32::from(state.pwr_mw - baseline) * crate::f32!(100.0) / span;
+            put32(hw, abi::COMMON26_HW_PERF_RELATIVE_A + i * 4, percentage.to_bits());
+        }
+        let base_idx = pwr.perf_base_pstate as usize;
+        let base_hz = states[base_idx].freq_hz;
+        let span = crate::float::F32::from(states[top].freq_hz - base_hz);
+        for (i, state) in states.iter().enumerate().skip(base_idx + 1) {
+            let relative = crate::float::F32::from(state.freq_hz - base_hz) * crate::f32!(100.0) / span;
+            put32(hw, abi::COMMON26_HW_PERF_RELATIVE_B + 4 * i, relative.to_bits());
+        }
+        for (i, state) in states.iter().enumerate() {
+            let [mv] = state.volt_mv.as_slice() else { return Err(EINVAL); };
+            let (freq, voltage) = sram_table[i * 8..i * 8 + 8].split_at(4);
+            let sram_mv = u32::from_le_bytes(voltage.try_into().map_err(|_| EINVAL)?);
+            if u32::from_le_bytes(freq.try_into().map_err(|_| EINVAL)?) != state.freq_hz || sram_mv < *mv || sram_mv == 0 {
+                return Err(EINVAL);
+            }
+            let mhz = state.freq_hz / 1_000_000;
+            for series in [abi::COMMON26_HW_PERF_FREQUENCY, 0x1924] {
+                put32(hw, series + i * 4, mhz);
+            }
+            for lane in 0..abi::COMMON26_HW_PERF_LANES {
+                let row = i * abi::COMMON26_HW_PERF_ROW_STRIDE + lane * 4;
+                put32(hw, abi::COMMON26_HW_PERF_CORE_VOLTAGE + row, *mv);
+                put32(hw, abi::COMMON26_HW_PERF_SRAM_VOLTAGE + row, sram_mv);
+            }
+        }
+        crate::pgtable::clean_poc(hw.as_ptr(), hw.len());
+        put64(bytes, 0, hardware.gpu_va().get());
+        channels.push(hardware, GFP_KERNEL)?;
+
+        // The directory's other records; +0x485 is the power controller.
+        let mut owners = KVec::new();
+        let mut controller = None;
+        let mut compute_state = 0;
+        for (offset, size) in [(0x10, 0x88), (0x254, 0x678), (0x25c, 0x760),
+                               (0x264, 0x6d0), (0x26c, 0x60), (0x485, 0x6c48)] {
+            let mut owner = alloc.private.array_empty::<u8>(size)?;
+            if offset == 0x485 {
+                Self::controller(owner.as_mut_slice(), graph, &extra, sensors)?;
+            }
+            let address = owner.gpu_va().get();
+            put64(bytes, offset, address);
+            if offset == 0x10 {
+                put64(bytes, 8, address);
+            }
+            if offset == 0x264 {
+                // The compute engine state the start and finish records name.
+                compute_state = address;
+            }
+            if offset == 0x485 {
+                controller = Some(owner);
+            } else {
+                owners.push(owner, GFP_KERNEL)?;
+            }
+        }
+        let controller = controller.ok_or(EINVAL)?;
+        let ids = alloc.private.array_empty::<u8>(0x134c)?;
+        for (slot, offset) in [(0x2c8, 0), (0x2d0, 0x1000), (0x2d8, 0x1300)] {
+            put64(bytes, slot, ids.gpu_va().get() + offset);
+        }
+        owners.push(ids, GFP_KERNEL)?;
+        let low = base.buffer_mgr_ctl_low_mapping.as_ref().ok_or(EINVAL)?;
+        let high = base.buffer_mgr_ctl_high_mapping.as_ref().ok_or(EINVAL)?;
+        if low.translate_offset(0)? != high.translate_offset(0)? { return Err(EINVAL); }
+        put64(bytes, 0x2e0, low.iova());
+        put64(bytes, 0x2e8, high.iova());
+        bytes[0x3e4] = 0xff;
+        let payload = alloc.shared.array_empty::<u8>(
+            directory26::LOG_THREADS * RING_RECORDS as usize * directory26::LOG_PAYLOAD_BYTES)?;
+        put64(bytes, 0x200, payload.gpu_va().get());
+        owners.push(payload, GFP_KERNEL)?;
+        crate::pgtable::clean_poc(bytes.as_ptr(), bytes.len());
+
+        let status = alloc.shared.array_empty::<u8>(0x20)?;
+        let boot_page = {
+            let page = alloc.shared_ro.alloc_generic::<u8>(mmu::UAT_PGSZ, mmu::UAT_PGSZ, None)?;
+            fw::types::GpuArray::empty(page, mmu::UAT_PGSZ)?
+        };
+        let mut globals = alloc.shared_ro.array_empty::<u8>(0xe48)?;
+        {
+            let data = globals.as_mut_slice();
+            for (offset, value) in [(0x58, 0xffffu16), (0x5a, 0x28), (0x5c, 0xffff)] {
+                data[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+            }
+            let ceiling = pwr.perf_max_pstate * 100;
+            for (at, value) in [(0x84, pwr.max_power_mw), (0x88, ceiling), (0x8c, ceiling), (0x98, STATE_CAP)] {
+                put32(data, at, value);
+            }
+            put32(data, 0x6e, 1);
+            crate::pgtable::clean_poc(data.as_ptr(), data.len());
+        }
+        let mut control = alloc.shared.array_empty::<u8>(0xe850)?;
+        {
+            // One shared backing: 0x20 bytes of indices, followed at +0x40 by 256 cache-flush
+            // requests. An empty ring still needs both VAs.
+            let flush = alloc.shared.array_empty::<u8>(0x40 + 256 * 0x18)?;
+            let state = flush.gpu_va().get();
+            directory26::write_flush_ring(control.as_mut_slice(), 0x4be0, state, state + 0x40)
+                .map_err(|_| EINVAL)?;
+            // Request command-handler installation during powered initialization.
+            put32(control.as_mut_slice(), 0x4c24, 1);
+            owners.push(flush, GFP_KERNEL)?;
+        }
+        let mut power = alloc.shared.array_empty::<u8>(0x6a0)?;
+        {
+            // Cold mirrors of the controller's power and temperature-loop values.
+            let gains = base.hwdata_a.with(|a, _| (a.ppm_kp.to_bits(), a.ppm_ki_dt.to_bits()));
+            let data = power.as_mut_slice();
+            for (at, value) in [(0x12c, pwr.max_power_mw), (0x130, gains.0), (0x134, gains.1)] {
+                put32(data, at, value);
+            }
+            let initial = controller.as_slice();
+            for (dst, src) in [(0xc8, 0x22d4), (0xcc, 0x2280), (0xd0, 0x2284),
+                               (0xd4, 0x22cc), (0xd8, 0x22b4), (0xdc, 0x22a4)] {
+                data[dst..dst + 4].copy_from_slice(&initial[src..src + 4]);
+            }
+            crate::pgtable::clean_poc(data.as_ptr(), data.len());
+        }
+
+        boot.encode(&boot.info(compute_state));
+        let (page_size, page_bits, levels, descriptors) = graph.initdata.with(|r, _|
+            (r.uat_page_size, r.uat_page_bits, r.uat_num_levels, r.uat_level_info));
+        let root = alloc.shared_ro.alloc_generic::<Self>(mmu::UAT_PGSZ, mmu::UAT_PGSZ, None)?;
+        core::mem::drop(alloc);
+        let root = fw::types::GpuObject::<Self>::new_init_prealloc(root,
+            |_| try_init!(Self {
+                graph: graph.clone(), boot, compute_state, channels, _owners: owners,
+                _register_mappings: register_mappings, _controller: controller, _directory: directory,
+                boot_page, globals, status, control, power, extra,
+            }),
+            |owners, _| {
+                try_init!(fw::initdata::raw::InitDataG14V27_2 {
+                    ver_info: fw::types::Array::new(core::array::from_fn(|i| (FIRMWARE_WORD >> (16 * i)) as u16)),
+                    unk_buf: owners.boot_page.gpu_pointer(),
+                    unk_8: 0,
+                    unk_c: 0,
+                    runtime_pointers: owners._directory.gpu_pointer(),
+                    globals: owners.globals.gpu_pointer(),
+                    role: 0,
+                    host_mapped_fw_allocations: 1,
+                    uat_page_size: page_size,
+                    uat_page_bits: page_bits,
+                    uat_num_levels: levels,
+                    uat_level_info: descriptors,
+                    __pad0: Default::default(),
+                    status_record: owners.status.gpu_pointer(),
+                    control: owners.control.gpu_pointer(),
+                    power: owners.power.gpu_pointer(),
+                    extra: owners.extra.gpu_pointer(),
+                })
+            },
+        )?;
+        root.with(|r, _| crate::pgtable::clean_poc(core::ptr::from_ref(r).cast(), core::mem::size_of_val(r)));
+        Ok(root)
+    }
+
+    /// The loader's `adt-perf-states-sram` table under `/chosen/aurora-gpu-resources/sgx`
+    /// (frequency and SRAM millivolts per state).
+    fn sram_table(states: usize) -> Result<KVec<u8>> {
+        let chosen = kernel::of::chosen().ok_or(ENODEV)?;
+        let is = |name: Option<KVec<u8>>, want: &[u8]| {
+            name.as_deref().is_some_and(|n| n.strip_suffix(b"\0").unwrap_or(n) == want)
+        };
+        for parent in chosen.children() {
+            if !is(parent.get_opt_property::<KVec<u8>>(c"name")?, b"aurora-gpu-resources") { continue; }
+            for child in parent.children() {
+                if is(child.get_opt_property::<KVec<u8>>(c"name")?, b"sgx") {
+                    let table = child.get_opt_property::<KVec<u8>>(c"adt-perf-states-sram")?
+                        .ok_or(ENODEV)?;
+                    if table.len() != states * 8 { return Err(EINVAL); }
+                    return Ok(table);
+                }
+            }
+        }
+        Err(EINVAL)
+    }
+
+    /// The power and thermal controller (directory +0x485): the 13.5 calibrated values of the
+    /// hardware data A, moved to the 27.2 layout.
+    fn controller(policy: &mut [u8], graph: &GpuManagerG14V13_5, extra: &fw::types::GpuArray<u8>,
+                  sensors: u64) -> Result {
+        let pwr = &graph.dyncfg.pwr;
+        let cfg = graph.cfg;
+        let base = &graph.initdata.runtime_pointers;
+        let max_state = (pwr.perf_states.len() as u32 - 1) * 100;
+        for offset in [0x222c, 0x2880] {
+            put32(policy, offset, max_state);
+        }
+        let generation = extra.gpu_va().get() + 0x80;
+        if generation & 0x3f != 0 || extra.as_slice()[0x80..] != [0; 8] {
+            return Err(EINVAL);
+        }
+        put64(policy, 0x3b98, generation);
+        // Secure metrology sensor set, and the fast-die release temperature, mask and gains.
+        put64(policy, 0x3ba0, sensors);
+        let (release, mask, integral, proportional) = base.hwdata_a.with(|old, _|
+            (old.fast_die0_release_temp_cc, old.fast_die0_sensor_mask.0,
+             old.fast_die0_ki_dt.to_bits(), old.fast_die0_kp.to_bits()));
+        for (source, value, width) in [(0x2270, u64::from(release), 4), (0x2268, mask, 8),
+                                       (0x2294, u64::from(integral), 4), (0x22a4, u64::from(proportional), 4)] {
+            let at = abi::relocate_by_bands(abi::COMMON26_POLICY_BANDS, source).ok_or(EINVAL)?;
+            policy.get_mut(at..at + width).ok_or(EINVAL)?.copy_from_slice(&value.to_le_bytes()[..width]);
+        }
+        // Thermal thresholds and corrections, then the SoC-hot alarm selection.
+        for (at, value) in [(0x22d4, 11000), (0x2284, 900), (0x2288, 4),
+                            (0x229c, crate::f32!(1.0).to_bits()), (0x2f30, 125), (0x2f34, 1)] {
+            put32(policy, at, value);
+        }
+        for at in [0x2320, 0x2420, 0x2f38, 0x3038] {
+            for sid in (0..64).filter(|sid| sensors & (1u64 << sid) != 0) {
+                put32(policy, at + 4 * sid, crate::f32!(5.3).to_bits());
+            }
+        }
+        put64(policy, 0x2f28, sensors);
+        put32(policy, 0x3ba8, 1);
+        for (word, value) in policy[0x62b8..0x62f8].chunks_exact_mut(4).zip(cfg.shared3_tab) {
+            word.copy_from_slice(&value.to_le_bytes());
+        }
+        // Cold-wake operand: the board's base operating point.
+        put32(policy, 0xa4, pwr.perf_base_pstate);
+        for (source, bits) in [
+            (4, pwr.pwr_sample_period_aic_clks),
+            (8, pwr.pwr_sample_period_aic_clks),
+            // Two initial state sources; the current state at +0x38 belongs to the firmware.
+            (0x2c, pwr.perf_base_pstate),
+            (0x30, pwr.perf_base_pstate),
+            (0x9f0, pwr.pwr_min_duty_cycle),
+            (0xb5c, pwr.perf_integral_gain.to_bits()),
+            (0xb60, pwr.perf_integral_gain2.to_bits()),
+            (0xb6c, pwr.perf_proportional_gain.to_bits()),
+            (0xb70, pwr.perf_proportional_gain2.to_bits()),
+        ] {
+            let target = abi::relocate_by_bands(abi::COMMON26_POLICY_BANDS, source).ok_or(EINVAL)?;
+            policy.get_mut(target..target + 4).ok_or(EINVAL)?.copy_from_slice(&bits.to_le_bytes());
+        }
+        // The calibrated values of the 13.5 producer; only the layout and the peak length unit
+        // differ. No power zones.
+        let samples = pwr.ppm_filter_time_constant_ms / pwr.power_sample_period;
+        let fields = base.hwdata_a.with(|a, _| [
+            (0x50, 100), (0xa80, a.ppm_filter_tc_periods_x4),
+            (0xa8c, a.ppm_filter_a_neg.to_bits()), (0xa94, a.ppm_filter_a.to_bits()),
+            (0xa9c, a.ppm_ki_dt.to_bits()), (0xaa8, a.unk_6fc.to_bits()),
+            (0xaac, a.ppm_kp.to_bits()), (0xab8, a.pwr_min_duty_cycle),
+            (0xabc, a.max_pstate_scaled_4), (0xacc, a.max_power_3),
+            (0xad8, samples), (0x2200, a.unk_6fc.to_bits()),
+            (0xa48, max_state),
+            (0xb38, a.perf_tgt_utilization), (0xb40, a.perf_boost_min_util),
+            (0xb44, a.perf_boost_ce_step), (0xb58, a.perf_filter_drop_threshold),
+            (0xb5c, a.perf_filter_a_neg.to_bits()), (0xb60, a.perf_filter_a2_neg.to_bits()),
+            (0xb64, a.perf_filter_a.to_bits()), (0xb68, a.perf_filter_a2.to_bits()),
+            (0xb74, a.perf_integral_min_clamp.to_bits()), (0xb78, a.unk_79c.to_bits()),
+            (0xb84, a.boost_state_unk_k.to_bits()), (0xb88, a.base_pstate_scaled_2),
+            (0xb8c, a.max_pstate_scaled_5), (0xb90, a.base_pstate_scaled_3),
+            (0xb9c, a.perf_tgt_utilization_2), (0xbd0, a.base_pstate_scaled_4),
+            (0x2204, a.pwr_min_duty_cycle_2.to_bits()), (0x2208, a.max_pstate_scaled_6.to_bits()),
+            (0x220c, pwr.max_freq_mhz),
+            (0x22b0, a.unk_8a8.to_bits()), (0x22c0, a.pwr_min_duty_cycle_4),
+            (0x22c4, a.max_pstate_scaled_8), (0x22c8, a.max_pstate_scaled_9),
+            (0x2308, a.max_pstate_scaled_10),
+            (0x28e8, 0), (0x28f0, a.max_power_4),
+            (0x28f4, a.max_power_5), (0x28f8, a.max_power_6),
+            (0x2904, a.avg_power_target_filter_a_neg.to_bits()),
+            (0x2908, a.avg_power_target_filter_a.to_bits()),
+            (0x29f0, a.avg_power_filter_a_neg.to_bits()),
+            (0x29f8, a.avg_power_filter_a.to_bits()),
+            (0x2a00, a.avg_power_ki_dt.to_bits()), (0x2a10, a.avg_power_kp.to_bits()),
+            (0x2a0c, a.unk_d20.to_bits()), (0x2a1c, a.avg_power_min_duty_cycle),
+            (0x2a20, a.max_pstate_scaled_12), (0x2a2c, a.max_power_7.to_bits()),
+            (0x2a30, a.max_power_8),
+            (0x2b80, a.unk_e10_0.gpu_se_filter_a_neg.to_bits()),
+            (0x2b84, a.unk_e10_0.gpu_se_filter_1_a_neg.to_bits()),
+            (0x2b88, a.unk_e10_0.gpu_se_filter_a.to_bits()),
+            (0x2b8c, a.unk_e10_0.gpu_se_filter_1_a.to_bits()),
+            (0x2b90, a.unk_e10_0.gpu_se_ki_dt.to_bits()),
+            (0x2b94, a.unk_e10_0.gpu_se_ki_1_dt.to_bits()),
+            (0x2b9c, a.unk_e10_0.unk_7c.to_bits()),
+            (0x2ba0, a.unk_e10_0.gpu_se_kp.to_bits()),
+            (0x2ba4, a.unk_e10_0.gpu_se_kp_1.to_bits()),
+            (0x2bac, a.unk_e10_0.unk_8c), (0x2bb0, a.unk_e10_0.max_pstate_scaled_1),
+            (0x2c10, a.unk_e10_0.unk_3c), (0x2c14, a.unk_e10_0.unk_38),
+            (0x2c28, a.unk_e10_0.gpu_se_reset_criteria),
+            (0x6ac8, 1),
+        ]);
+        for (at, value) in fields {
+            put32(policy, at, value);
+        }
+        put64(policy, 0xae0, u64::from(samples) * u64::from(pwr.pwr_sample_period_aic_clks));
+        crate::pgtable::clean_poc(policy.as_ptr(), policy.len());
+        Ok(())
+    }
+}
+
+/// The 13.5 hardware data's highest operating-point index.
+fn old_max_pstate(base: &fw::initdata::RuntimePointersG14V13_5) -> Result<u32> {
+    Ok(base.hwdata_b.with(|old, _| old.max_pstate))
+}

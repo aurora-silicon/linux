@@ -4519,3 +4519,142 @@ mod execution_context_tests {
         assert!(pick_returned(core::iter::empty(), &returns, &fences, 0).is_none());
     }
 }
+
+/// The word GPU firmware 27.2 on G14 exchanges through the handoff region's magic fields.
+#[cfg(CONFIG_DRM_ASAHI_G15)]
+const MAGIC_G14_V27_2: u64 = 0x4b1d000000000003;
+
+/// The loader's UAT regions as GPU firmware 27.2 on G14 uses them. The driver mirrors its
+/// kernel window into the firmware's shared second-level table and names its own trees in
+/// TTBAT context 0 before the ASC starts.
+#[cfg(CONFIG_DRM_ASAHI_G15)]
+pub(crate) struct FirmwareWindow {
+    handoff: UatRegion,
+    ttbs: UatRegion,
+    tables: UatRegion,
+    shared_l2: UatRegion,
+    entries: KVec<u64>,
+    lower_root: u64,
+    pa_mask: u64,
+}
+
+#[cfg(CONFIG_DRM_ASAHI_G15)]
+impl FirmwareWindow {
+    /// Maps the four regions. Fails with `EBUSY` unless the handoff is idle and the shared
+    /// table and context 0 are empty.
+    pub(crate) fn reserve(dev: &device::Device, geometry: UatGeometry) -> Result<Self> {
+        let handoff = Uat::map_region(dev, c"handoff", HANDOFF_SIZE, true)?;
+        let ttbs = Uat::map_region(dev, c"ttbs", UAT_PGSZ, true)?;
+        let tables = Uat::map_region(dev, c"pagetables", UAT_PGSZ, true)?;
+        let shared_l2 = Uat::map_region(dev, c"shared-l2", UAT_PGSZ, true)?;
+        let this = Self {
+            handoff, ttbs, tables, shared_l2,
+            entries: KVec::from_elem(0u64, UAT_PGSZ / 8, GFP_KERNEL)?,
+            lower_root: 0,
+            pa_mask: ((1u64 << geometry.oas) - 1) & !(UAT_PGMSK as u64),
+        };
+        let h = this.handoff();
+        if h.magic_ap.load(Ordering::Acquire) != 0 || h.magic_fw.load(Ordering::Acquire) != 0
+            || h.lock_ap.load(Ordering::Acquire) != 0 || h.lock_fw.load(Ordering::Acquire) != 0
+            || !this.empty() {
+            return Err(EBUSY);
+        }
+        Ok(this)
+    }
+
+    fn handoff(&self) -> &Handoff {
+        // SAFETY: map_region checked the size of the handoff reservation; only its aligned
+        // atomic fields are used.
+        unsafe { &*self.handoff.map.ptr().cast::<Handoff>() }
+    }
+
+    fn shared(&self) -> &[AtomicU64; UAT_PGSZ / 8] {
+        // SAFETY: the shared-l2 reservation is one mapped 16 KiB table.
+        unsafe { &*self.shared_l2.map.ptr().cast::<[AtomicU64; UAT_PGSZ / 8]>() }
+    }
+
+    fn context(&self) -> &SlotTTBS {
+        // SAFETY: the TTBAT reservation holds at least one aligned slot.
+        unsafe { &*self.ttbs.map.ptr().cast::<SlotTTBS>() }
+    }
+
+    fn empty(&self) -> bool {
+        let context = self.context();
+        self.shared().iter().all(|w| w.load(Ordering::Acquire) == 0)
+            && context.ttb0.load(Ordering::Acquire) == 0 && context.ttb1.load(Ordering::Acquire) == 0
+    }
+
+    /// The regions to adopt the UAT from.
+    pub(crate) fn regions(&self) -> AdoptedRegions {
+        AdoptedRegions {
+            handoff: self.handoff.base..self.handoff.base + UAT_PGSZ as PhysicalAddr,
+            ttbs: self.ttbs.base..self.ttbs.base + UAT_PGSZ as PhysicalAddr,
+            kernel_root: self.tables.base,
+        }
+    }
+
+    /// Copies the kernel window's second-level entries from `uat` and writes all of its tables
+    /// back. Call after the last allocation the firmware is to reach.
+    pub(crate) fn mirror(&mut self, uat: &Uat) -> Result {
+        let mask = self.pa_mask;
+        let root = uat.kernel_window_root();
+        let entries = &mut self.entries;
+        // SAFETY: the adopted UAT's driver-owned window root and its second level are live
+        // RAM tables.
+        unsafe {
+            let upper = pgtable::with_root_entries(None, root, 3, |w| w[2].load(Ordering::Acquire))?;
+            if upper & 3 != 3 { return Err(EINVAL); }
+            pgtable::with_root_entries(None, upper & mask, entries.len(), |w| {
+                for (entry, word) in entries.iter_mut().zip(w) {
+                    *entry = word.load(Ordering::Acquire);
+                }
+            })?;
+        }
+        // The window's last 4 GiB is the MMIO range: its register mappings use one table.
+        let first_io = (0xf_0000_0000u64 >> 25) as usize;
+        if entries[first_io..].iter().filter(|w| **w != 0).count() != 1 { return Err(EINVAL); }
+        for &w in entries.iter().filter(|w| **w != 0) {
+            if w & 3 != 3 { return Err(EINVAL); }
+            crate::g15::uat::clean_page(w & mask)?;
+        }
+        crate::g15::uat::clean_lower(uat)?;
+        self.lower_root = uat.kernel_lower_root();
+        Ok(())
+    }
+
+    /// Installs the mirrored window and names the driver's trees in context 0.
+    pub(crate) fn install(&self) -> Result {
+        if !self.empty() || self.lower_root == 0 { return Err(EBUSY); }
+        for (word, value) in self.shared().iter().zip(self.entries.iter()) {
+            if *value != 0 { word.store(*value, Ordering::Release); }
+        }
+        let context = self.context();
+        context.ttb0.store(self.lower_root | TTBR_VALID, Ordering::Release);
+        context.ttb1.store(self.tables.base | TTBR_VALID, Ordering::Release);
+        pgtable::clean_poc(self.ttbs.map.ptr(), size_of::<SlotTTBS>());
+        pgtable::clean_poc(self.shared_l2.map.ptr(), UAT_PGSZ);
+        pgtable::poc_barrier();
+        Ok(())
+    }
+
+    /// Announces the host to the firmware; call just before starting the ASC.
+    pub(crate) fn announce(&self) {
+        self.handoff().magic_ap.store(MAGIC_G14_V27_2, Ordering::Release);
+        fence(Ordering::SeqCst);
+    }
+
+    /// Whether the firmware has answered the announcement.
+    pub(crate) fn answered(&self) -> bool {
+        self.handoff().magic_fw.load(Ordering::Acquire) == MAGIC_G14_V27_2
+    }
+
+    /// Whether the firmware still names the shared table and context 0 as installed.
+    pub(crate) fn intact(&self) -> bool {
+        // SAFETY: the firmware's kernel root is one mapped 16 KiB table.
+        let root = unsafe { &*self.tables.map.ptr().cast::<[AtomicU64; 4]>() };
+        let context = self.context();
+        root[2].load(Ordering::Acquire) & self.pa_mask == self.shared_l2.base
+            && context.ttb0.load(Ordering::Acquire) == self.lower_root | TTBR_VALID
+            && context.ttb1.load(Ordering::Acquire) == self.tables.base | TTBR_VALID
+    }
+}
