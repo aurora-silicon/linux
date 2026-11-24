@@ -8,6 +8,7 @@
  */
 
 #include <linux/soc/apple/j613-display.h>
+#include <kunit/visibility.h>
 #include <linux/aperture.h>
 #include <linux/component.h>
 #include <linux/completion.h>
@@ -73,10 +74,51 @@ struct apple_drm_private {
 	bool s2r_skipped;
 	/* A dark wake left the outputs as the suspend did, for the next resume. */
 	bool dark_held;
-	struct notifier_block pm_nb;
+	/* On apple_drm_pm_list while bound, for the system-sleep notifier. */
+	struct list_head pm_node;
+	/* The notifier's output restore, run outside apple_drm_pm_lock. */
+	struct work_struct pm_resume_work;
 };
 
 static int apple_drm_pm_notify(struct notifier_block *nb, unsigned long action, void *data);
+#ifdef CONFIG_PM_SLEEP
+static void apple_drm_pm_resume_work(struct work_struct *work);
+#endif
+
+/*
+ * One system-sleep notifier for every bound display subsystem (and for the
+ * T8132 external outputs), registered at module init. Registering it from the
+ * component bind would take the PM notifier chain's rwsem under
+ * component_mutex, while a PM notifier that takes a lock held around a
+ * component_add() (as the Apple CIO driver's does with its device lock, which
+ * it holds while populating the NHI) closes a cycle: component_mutex ->
+ * pm_chain_head.rwsem -> acio->lock -> component_mutex.
+ *
+ * apple_drm_pm_lock is a leaf: it guards apple_drm_pm_list only, and nothing
+ * else is taken under it. At PM_POST_SUSPEND the notifier queues each
+ * device's restore (pm_resume_work) on apple_drm_pm_wq under it; the restore
+ * itself, which takes the hotplug, modeset and DCP locks, runs from the work.
+ * PM_POST_SUSPEND comes after user space is thawed, as before. The next
+ * PM_SUSPEND_PREPARE flushes the queue, outside the lock, so a restore never
+ * overlaps the next suspend, and apple_drm_uninit() cancels its device's
+ * after taking it off the list.
+ */
+static DEFINE_MUTEX(apple_drm_pm_lock);
+static LIST_HEAD(apple_drm_pm_list);
+/* Ordered, so the next suspend's PM_SUSPEND_PREPARE can wait for every restore. */
+static struct workqueue_struct *apple_drm_pm_wq;
+/*
+ * Below the DCPs' own notifiers (dcp_s2r_pm_register(), priority 0), whatever
+ * the probe order: the chain runs higher priorities first and appends equal
+ * ones, and a DCP that defers past module init would otherwise come after
+ * this one. At PM_POST_SUSPEND a DCPEXT's dark-wake firmware restart then
+ * still finishes before the restore here is queued, and a DCP that refuses
+ * PM_SUSPEND_PREPARE rolls back only the notifiers before it, as at bind.
+ */
+static struct notifier_block apple_drm_pm_nb = {
+	.notifier_call = apple_drm_pm_notify,
+	.priority = -1,
+};
 
 /* Component readiness is later than platform probe/bind. */
 static DEFINE_MUTEX(apple_g15_display_lock);
@@ -1153,17 +1195,22 @@ static int apple_probe_per_dcp(struct device *dev,
 				      (zpos <= 1 || surf != top_surf);
 
 			/*
-			 * The T8142 runs macOS 27.0's DCP firmware as firmware
-			 * 27, outside the H17G profile, and blends XRGB's X
-			 * byte as alpha all the same (GPU-rendered alacritty
-			 * showed wrong colours on the panel).
+			 * T8142 and T6041 run firmware 27 outside the H17G
+			 * profile and blend XRGB's fourth byte as straight
+			 * alpha all the same (on AGX, B8G8R8X8 leaves PBE
+			 * Swizzle A at channel 0, storing X = R and turning
+			 * R = 0 blues and cyans black on the panel).
 			 */
 			bool xrgb_is_alpha =
 				dcp_data->hw.iomfb_method_profile ==
 					DCP_IOMFB_METHODS_H17G ||
 				(dcp_data->fw_compat == DCP_FIRMWARE_V_27_0 &&
-				 of_device_is_compatible(dcp_data->dev->of_node,
-							 "apple,t8142-dcp"));
+				 (of_device_is_compatible(dcp_data->dev->of_node,
+							  "apple,t8142-dcp") ||
+				  of_device_is_compatible(dcp_data->dev->of_node,
+							  "apple,t6041-dcp") ||
+				  of_device_is_compatible(dcp_data->dev->of_node,
+							  "apple,t6041-dcpext")));
 
 			planes[zpos] = apple_plane_init(drm, 1U << num, surf,
 							supports_l10r,
@@ -1180,6 +1227,27 @@ static int apple_probe_per_dcp(struct device *dev,
 			return ret;
 
 		zpos++;
+	}
+
+	if (dcp_data->camera_ind.has_surf) {
+		struct drm_plane *ind_plane;
+
+		ind_plane = apple_plane_init(drm, 1U << num, dcp_data->camera_ind.surf,
+					     supports_l10r, supports_xrgb2101010,
+					     dcp_data->hw.iomfb_method_profile ==
+						     DCP_IOMFB_METHODS_H17G,
+					     DRM_PLANE_TYPE_OVERLAY, false,
+					     supports_premultiplied,
+					     dcp_is_ext26(dcp_data));
+		if (IS_ERR(ind_plane))
+			return PTR_ERR(ind_plane);
+		ret = drm_plane_create_zpos_immutable_property(ind_plane, zpos++);
+		if (ret)
+			return ret;
+		/* Without its buffer the plane stays reserved and no indicator is shown. */
+		ret = dcp_indicator_attach_plane(dcp_data, drm, ind_plane);
+		if (ret)
+			dev_err(dev, "camera indicator unavailable: %d\n", ret);
 	}
 
 	/*
@@ -1238,6 +1306,32 @@ static int apple_probe_per_dcp(struct device *dev,
 }
 
 /*
+ * A native26 pipeline scans out XRGB8888 only (see apple_plane_init()), so a
+ * Type-C connector any of whose pipelines is native26 offers no BT.2020/PQ
+ * output contract. Every other pipeline has a 10-bit primary.
+ */
+VISIBLE_IF_KUNIT bool apple_typec_port_rgb8_only(struct platform_device **dcp,
+						 int num_dcp,
+						 struct platform_device *pipeline,
+						 unsigned int port_idx)
+{
+	int i;
+
+	for (i = 0; i < num_dcp; i++) {
+		struct apple_dcp *d;
+
+		if (pipeline && dcp[i] != pipeline)
+			continue;
+		if (!dcp_typec_port_has_candidate(port_idx, dcp[i]))
+			continue;
+		d = platform_get_drvdata(dcp[i]);
+		if (d && dcp_is_ext26(d))
+			return true;
+	}
+	return false;
+}
+
+/*
  * Create a connector per physical Type-C port and attach it to every
  * pipeline that can drive it. The M2 Pro/Max laptops append a second
  * connector per port for a dock's second DP tunnel, preserving primary
@@ -1254,8 +1348,11 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 	unsigned int n, nr_ports = dcp_typec_nr_ports();
 	bool fixed = dcp_typec_fixed_crtcs();
 	unsigned int slots = fixed ? num_dcp : (dcp_typec_dual_stream() ? 2 : 1);
-	/* T6050 creates its tunnel-only port/pipeline pairs in a second pass. */
-	unsigned int passes = fixed ? 2 : 1;
+	/*
+	 * Connectors are created in passes, by connector group; on T6050, in a
+	 * group, the tunnel-only port/pipeline pairs after the others.
+	 */
+	unsigned int passes = dcp_typec_nr_passes();
 	int i, ret;
 
 	/* Keep the existing physical-port connector numbers stable. On the
@@ -1283,13 +1380,14 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 		if (fixed) {
 			if (!dcp_typec_port_has_candidate(port_idx, pipeline))
 				continue;
-			/* T6050: tunnel-only pairs in the second pass */
-			if (dcp_typec_port_tunnel_only(port_idx, pipeline) != pass)
+			if (dcp_typec_port_pass(port_idx, pipeline) != pass)
 				continue;
 			mask = crtc_mask[idx / nr_ports];
 			if (!mask)
 				continue;
 		} else {
+			if (dcp_typec_port_pass(port_idx, NULL) != pass)
+				continue;
 			for (i = 0; i < num_dcp; i++) {
 				if (!dcp_typec_port_has_candidate(port_idx, dcp[i]))
 					continue;
@@ -1330,12 +1428,11 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 		if (ret)
 			return ret;
 		/*
-		 * T8122's retained external scanout accepts only 8-bit RGB.
-		 * Do not advertise the BT.2020/PQ output contract until this
-		 * route has a qualified 10-bit primary-plane format. The sink
-		 * EDID remains intact; its capabilities are not the pipeline's.
+		 * A native26 route scans out 8-bit RGB only: do not advertise
+		 * the BT.2020/PQ output contract on it. The sink EDID remains
+		 * intact; its capabilities are not the pipeline's.
 		 */
-		if (!of_machine_is_compatible("apple,t8122")) {
+		if (!apple_typec_port_rgb8_only(dcp, num_dcp, pipeline, port_idx)) {
 			ret = apple_connector_attach_hdr(&connector->base, false);
 			if (ret)
 				return ret;
@@ -1683,6 +1780,10 @@ static int apple_drm_init(struct device *dev)
 	if (IS_ERR(apple))
 		return PTR_ERR(apple);
 
+	INIT_LIST_HEAD(&apple->pm_node);
+#ifdef CONFIG_PM_SLEEP
+	INIT_WORK(&apple->pm_resume_work, apple_drm_pm_resume_work);
+#endif
 	dev_set_drvdata(dev, apple);
 
 	ret = drmm_mode_config_init(&apple->drm);
@@ -1708,6 +1809,13 @@ static int apple_drm_init(struct device *dev)
 
 	apple->drm.mode_config.funcs = &apple_mode_config_funcs;
 	apple->drm.mode_config.helper_private = &apple_mode_config_helpers;
+
+	/*
+	 * Dumb buffers are DMA memory, write-combined in the CPU's mapping:
+	 * a client that renders into them in software (a compositor without
+	 * a GPU driver) should draw into a cached shadow buffer and copy.
+	 */
+	apple->drm.mode_config.prefer_shadow = true;
 
 	ret = component_bind_all(dev, apple);
 	if (ret)
@@ -1818,8 +1926,9 @@ static int apple_drm_init(struct device *dev)
 		goto err_unbind;
 	}
 
-	apple->pm_nb.notifier_call = apple_drm_pm_notify;
-	register_pm_notifier(&apple->pm_nb);
+	mutex_lock(&apple_drm_pm_lock);
+	list_add_tail(&apple->pm_node, &apple_drm_pm_list);
+	mutex_unlock(&apple_drm_pm_lock);
 
 	return 0;
 
@@ -1844,7 +1953,12 @@ static void apple_drm_uninit(struct device *dev)
 	if (apple->aborted)
 		return;
 
-	unregister_pm_notifier(&apple->pm_nb);
+	mutex_lock(&apple_drm_pm_lock);
+	list_del_init(&apple->pm_node);
+	mutex_unlock(&apple_drm_pm_lock);
+#ifdef CONFIG_PM_SLEEP
+	cancel_work_sync(&apple->pm_resume_work);
+#endif
 
 	/* Before anything of the DRM device is torn down. */
 	t8132_ext_drm_fini(&apple->drm);
@@ -1868,7 +1982,7 @@ static void apple_drm_unbind(struct device *dev)
 	apple_drm_uninit(dev);
 }
 
-const struct component_master_ops apple_drm_ops = {
+static const struct component_master_ops apple_drm_ops = {
 	.bind	= apple_drm_bind,
 	.unbind	= apple_drm_unbind,
 };
@@ -2019,6 +2133,7 @@ static bool apple_drm_hold_resume_events(struct apple_drm_private *apple, u32 cr
 
 static void apple_drm_resume_outputs(struct apple_drm_private *apple)
 {
+	struct drm_crtc *crtc;
 	u32 dropped = 0;
 
 	apple->dark_held = false;
@@ -2028,6 +2143,11 @@ static void apple_drm_resume_outputs(struct apple_drm_private *apple)
 	if (dropped && apple_drm_hold_resume_events(apple, dropped))
 		dropped = 0;
 	drm_mode_config_helper_resume(&apple->drm);
+	drm_for_each_crtc(crtc, &apple->drm) {
+		if (t8132_ext_crtc(crtc))
+			continue;
+		dcp_indicator_display_resumed(platform_get_drvdata(to_apple_crtc(crtc)->dcp));
+	}
 	if (dropped)
 		drm_kms_helper_hotplug_event(&apple->drm);
 }
@@ -2059,17 +2179,43 @@ static void apple_platform_complete(struct device *dev)
 		apple_drm_resume_outputs(apple);
 }
 
-/* It failed before ->prepare() reached this device, so ->complete() didn't run either. */
-static int apple_drm_pm_notify(struct notifier_block *nb, unsigned long action, void *data)
+/*
+ * Queued at PM_POST_SUSPEND: the sleep failed before ->prepare() reached this
+ * device, so ->complete() didn't run either.
+ */
+static void apple_drm_pm_resume_work(struct work_struct *work)
 {
-	struct apple_drm_private *apple = container_of(nb, struct apple_drm_private, pm_nb);
+	struct apple_drm_private *apple =
+		container_of(work, struct apple_drm_private, pm_resume_work);
 
-	if (action == PM_POST_SUSPEND && apple->dark_held) {
+	if (apple->dark_held) {
 		dev_warn(apple->drm.dev, "dark wake over without a resume: outputs back now\n");
 		apple_drm_resume_outputs(apple);
 	}
+}
 
-	return NOTIFY_DONE;
+static int apple_drm_pm_notify(struct notifier_block *nb, unsigned long action, void *data)
+{
+	struct apple_drm_private *apple;
+	int ret;
+
+	/* No restore queued by the last PM_POST_SUSPEND overlaps the next transition. */
+	if (action == PM_SUSPEND_PREPARE || action == PM_HIBERNATION_PREPARE ||
+	    action == PM_RESTORE_PREPARE)
+		flush_workqueue(apple_drm_pm_wq);
+
+	/* The T8132 external outputs' sleep handling (a no-op without them). */
+	ret = t8132_ext_drm_pm_event(action);
+	if (action != PM_POST_SUSPEND)
+		return ret;
+
+	mutex_lock(&apple_drm_pm_lock);
+	list_for_each_entry(apple, &apple_drm_pm_list, pm_node)
+		if (apple->dark_held)
+			queue_work(apple_drm_pm_wq, &apple->pm_resume_work);
+	mutex_unlock(&apple_drm_pm_lock);
+
+	return ret;
 }
 
 static const struct dev_pm_ops apple_platform_pm_ops = {
@@ -2120,9 +2266,21 @@ static int __init appledrm_register(void)
 	ret = dcp_register();
 	if (ret)
 		goto unregister_audio;
+	apple_drm_pm_wq = alloc_ordered_workqueue("appledrm-pm", 0);
+	if (!apple_drm_pm_wq) {
+		ret = -ENOMEM;
+		goto unregister_dcp;
+	}
+	ret = register_pm_notifier(&apple_drm_pm_nb);
+	if (ret)
+		goto destroy_wq;
 	ret = platform_driver_register(&apple_platform_driver);
 	if (!ret)
 		return 0;
+	unregister_pm_notifier(&apple_drm_pm_nb);
+destroy_wq:
+	destroy_workqueue(apple_drm_pm_wq);
+unregister_dcp:
 	dcp_unregister();
 unregister_audio:
 	apple_j613_display_fail();
@@ -2140,6 +2298,8 @@ static void __exit appledrm_unregister(void)
 #endif
 	dcp_unregister();
 	platform_driver_unregister(&apple_platform_driver);
+	unregister_pm_notifier(&apple_drm_pm_nb);
+	destroy_workqueue(apple_drm_pm_wq);
 }
 
 module_init(appledrm_register);

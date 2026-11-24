@@ -188,12 +188,6 @@ impl Config {
     }
 
     pub(crate) fn root(&self) -> u64 { self.objects[storage::ROOT].va() }
-    pub(crate) fn log_globals_debug(&mut self,dev:&driver::AsahiDrmDevice)->Result {
-        let value=self.objects[GLOBALS].read_u32(crate::m3::m3_globals_debug::OFFSET)?;
-        dev_info!(dev.as_ref(),"M3_GLOBALS_DEBUG off={} value={} request_level={}\n",
-            u8::from(crate::m3::m3_params::globals_debug_off()),value,crate::m3::m3_params::consistent_perf());
-        Ok(())
-    }
     pub(crate) fn performance_request(&mut self,chip:u32,busy:bool)->Result {
         // Native controller inputs supersede the legacy fixed-request interface.
         if self.profile == super::m3_profile::Profile::Extended { return Ok(()); }
@@ -305,12 +299,9 @@ impl Config {
         let state=kind*2;let ring=state+1;
         let w=self.objects[state].read_u32(0x20)?;
         if w>=256 || self.objects[state].read_u32(0)?!=w { return Err(EBUSY); }
-        let mut message=[0u8;0x18];
-        message[8..16].copy_from_slice(&queue.to_le_bytes());
-        message[16..20].copy_from_slice(&(kind as u32).to_le_bytes());
-        message[20..22].copy_from_slice(&head.to_le_bytes());
-        message[22]=event;message[23]=u8::from(new); // New queue; caller selected the event slot.
-        self.objects[ring].write(w as usize*0x18,&message)?;
+        let message = super::m3_channel_format::submission_entry(kind as u32, queue, head, event, new)
+            .map_err(|_| EINVAL)?;
+        self.objects[ring].write(w as usize * message.len(), &message)?;
         agx_memory::publish();
         self.objects[state].u32(0x20,(w+1)%256)?;
         agx_memory::publish();

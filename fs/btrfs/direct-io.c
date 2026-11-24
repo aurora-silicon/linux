@@ -366,6 +366,59 @@ out:
 	return ret;
 }
 
+/*
+ * Return true if a direct write to the range of @em allocates a new extent
+ * (COW): it is not a NOCOW write into an existing or preallocated extent and it
+ * does not fall back to buffered IO.
+ */
+static bool btrfs_dio_write_is_cow(const struct btrfs_inode *inode,
+				   const struct extent_map *em)
+{
+	if (inode->flags & BTRFS_INODE_NODATACOW)
+		return false;
+	if (em->flags & EXTENT_FLAG_PREALLOC)
+		return false;
+	if (btrfs_extent_map_is_compressed(em) ||
+	    em->disk_bytenr == EXTENT_MAP_INLINE)
+		return false;
+	return true;
+}
+
+/*
+ * A COW write replaces everything mapped in its range with one newly allocated
+ * extent, so the boundaries of the extents it overwrites do not matter. Extend
+ * the mapping [@start, @start + @len) over the following extent maps that a
+ * direct write would COW as well, within @length and the maximum extent size.
+ * Without this, a sequential rewrite of a fragmented range allocates one new
+ * extent (and ordered extent, file extent item and bio) per old extent. The
+ * file stays fragmented and the rewrite runs at small-write speed.
+ */
+static u64 btrfs_dio_cow_write_len(struct btrfs_inode *inode, u64 start,
+				   u64 len, u64 length)
+{
+	const u64 limit = start + min(length, inode->root->fs_info->max_extent_size);
+	u64 end = start + len;
+
+	while (end < limit) {
+		struct extent_map *em;
+		u64 em_end;
+		bool cow;
+
+		em = btrfs_get_extent(inode, NULL, end, limit - end);
+		if (IS_ERR(em))
+			break;
+		cow = btrfs_dio_write_is_cow(inode, em);
+		em_end = btrfs_extent_map_end(em);
+		btrfs_free_extent_map(em);
+		if (!cow)
+			break;
+		end = min(em_end, limit);
+		cond_resched();
+	}
+
+	return end - start;
+}
+
 static int btrfs_dio_iomap_begin(struct inode *inode, loff_t start,
 		loff_t length, unsigned int flags, struct iomap *iomap,
 		struct iomap *srcmap)
@@ -508,6 +561,9 @@ static int btrfs_dio_iomap_begin(struct inode *inode, loff_t start,
 	}
 
 	len = min(len, em->len - (start - em->start));
+	if (write && !(flags & IOMAP_NOWAIT) &&
+	    btrfs_dio_write_is_cow(BTRFS_I(inode), em))
+		len = btrfs_dio_cow_write_len(BTRFS_I(inode), start, len, length);
 
 	/*
 	 * If we have a NOWAIT request and the range contains multiple extents
@@ -1035,7 +1091,13 @@ buffered:
 	pos = iocb->ki_pos;
 	written_buffered = btrfs_buffered_write(iocb, from);
 	if (written_buffered < 0) {
-		ret = written_buffered;
+		/*
+		 * Direct IO may already have written a part, and the file
+		 * position has moved past it.  Report that part, like
+		 * direct_write_fallback() does, the caller sees the error on
+		 * the next write.
+		 */
+		ret = written ? 0 : written_buffered;
 		goto out;
 	}
 	/*

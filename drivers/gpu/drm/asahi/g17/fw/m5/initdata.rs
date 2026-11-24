@@ -1789,6 +1789,23 @@ pub(crate) const M5_HOST_RECOVERY: usize = 0x4af0;
 pub(crate) const M5_RECOVERY_INFO: usize = 0x4298;
 pub(crate) const M5_RECOVERY_SLOT_MASK: usize = 0x4ab8;
 
+/// The rest of the M5 firmware's recovery record in the primary status B, beside the slot mask,
+/// read while the firmware waits in recovery state 1:
+///
+/// - +0x4aa0: the number of busy slots the firmware walked;
+/// - +0x4aa8: a word describing the slot the record names, or 0 without one;
+/// - +0x4aac: the recovery reason (`recovery::cause`); 5 was read here from every recovery of a
+///   ten-minute mixed client load on a J716s with the 27.3 beta 1 firmware;
+/// - +0x4ab0: a u64 the reason's raiser leaves (for a page fault, its latched MMU fault status).
+///
+/// A record that reads all zero, slot mask included, is logged as none recorded. Only the reason
+/// has been read from a running firmware; the other words and their meanings are
+/// not yet confirmed from captured InitData.
+pub(crate) const M5_RECOVERY_SLOTS_WALKED: usize = 0x4aa0;
+pub(crate) const M5_RECOVERY_SLOT_WORD: usize = 0x4aa8;
+pub(crate) const M5_RECOVERY_REASON: usize = 0x4aac;
+pub(crate) const M5_RECOVERY_DETAIL: usize = 0x4ab0;
+
 pub(crate) const M5_STATUS_CONFIG_LINK_WORD: usize = 0x774;
 
 pub(crate) const M5_STATUS_CONFIG_LINK_PTR: usize = 0x778;
@@ -1796,6 +1813,19 @@ pub(crate) const M5_STATUS_CONFIG_LINK_PTR: usize = 0x778;
 pub(crate) const M5_HW_DATA_INSERT: usize = 0x267c;
 
 pub(crate) const M5_HW_DATA_INSERT_LEN: usize = 8;
+
+/// The HW data word that bounds how long the GPU may take to pause scheduling, us. The M5
+/// encoding holds the inherited fixed word (150) there: [`COMMON26_HW_FIXED_WORD_OFFSET`] moved
+/// by the M5 insert. Measured on a J716s under a ten-minute mixed client load: with 150 here, three
+/// GPU recoveries occurred, all with firmware reason 5 (a scheduling pause that timed out); with
+/// 2000 here, the same load produced none. One run each. This is the M5 Pro's offset; a board
+/// without the insert has the word eight bytes lower ([`hw_offset`]).
+pub(crate) const M5_HW_PAUSE_TIMEOUT_US: usize = 0x271c;
+
+const _: () = assert!(
+    M5_HW_DATA_INSERT < COMMON26_HW_FIXED_WORD_OFFSET
+        && COMMON26_HW_FIXED_WORD_OFFSET + M5_HW_DATA_INSERT_LEN == M5_HW_PAUSE_TIMEOUT_US
+);
 
 /// The common 26A428 private cluster (J873, J813): status config 0x6d0 bytes, the secondary
 /// root's second extra 0x60.
@@ -1827,7 +1857,7 @@ const COMMON26_POLICY_BOOT_TIMESTAMP: usize = 0x6c14;
 /// initPowerAndPerformanceData stores (the G18 backend's G18G_26A428_POLICY_BANDS). 26A428
 /// inserts 0x680 bytes between the AON PTD pointer and the boot timestamp; the 25G76 words
 /// there have no place.
-const COMMON26_POLICY_BANDS: &[LayoutBand] = &[
+pub(crate) const COMMON26_POLICY_BANDS: &[LayoutBand] = &[
     band(0x0000, 0x009c, 0, Evidence::ProducerChecked),
     band(0x00a0, 0x0200, 0x10, Evidence::ProducerChecked),
     band(0x09b8, 0x295c, 0x10, Evidence::ProducerChecked),
@@ -2408,6 +2438,9 @@ pub(crate) struct Board {
     /// Whether explicit waits on other kicks take the completion class
     /// ([`Board::completion_inputs`]).
     completion_inputs: bool,
+    /// Whether firmware accepts tiling kicks without an entry signal and retained
+    /// render pairs kicked through the host port alone.
+    pub(crate) host_only_render_kicks: bool,
 }
 
 /// M5 Pro: two clusters of ten cores.
@@ -2437,6 +2470,7 @@ pub(crate) const J714: Board = Board {
     fan_curve_start_mc: 84_000,
     g17d_forms: false,
     completion_inputs: true,
+    host_only_render_kicks: false,
 };
 
 /// M5 Max: four clusters of ten cores.
@@ -2468,6 +2502,10 @@ pub(crate) const J716C: Board = Board {
     fan_curve_start_mc: 84_000,
     g17d_forms: false,
     completion_inputs: false,
+    // Qualified on G17C's 26A428 image. G17S uses completion-class inputs,
+    // G17D has distinct kick encodings, and common 26A428 publishes descriptors
+    // on the item ring. Qualify those interfaces separately.
+    host_only_render_kicks: true,
 };
 
 /// J775D's performance controllers run from P3.
@@ -2509,6 +2547,7 @@ pub(crate) const J775D: Board = Board {
     fan_curve_start_mc: 97_000,
     g17d_forms: true,
     completion_inputs: false,
+    host_only_render_kicks: false,
 };
 
 /// M5 (T8142, MacBook Air J813): one cluster of ten core slots, eight enabled. Values from the
@@ -2548,6 +2587,7 @@ pub(crate) const J813: Board = Board {
     fan_curve_start_mc: 84_000,
     g17d_forms: false,
     completion_inputs: false,
+    host_only_render_kicks: false,
 };
 
 /// The J813 on its macOS 27.2 (26B123) firmware: the same board on the common 26B123 graph.

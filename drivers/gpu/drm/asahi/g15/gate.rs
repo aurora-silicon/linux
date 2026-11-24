@@ -2,7 +2,9 @@
 
 //! Stream admission gates (safety nets for userspace encoders).
 //!
-//! VDM: the root stream's first word is 0x21000960. CDM walk from `cdm_ctrl_stream_base` through
+//! VDM: the root stream's first word is 0x21000960, or 0x21000968 with the USC cache invalidate.
+//!
+//! CDM walk from `cdm_ctrl_stream_base` through
 //! links until TERMINATE (0x40000000), at most 64 links and [`CDM_MAX_BYTES`] of records (a
 //! longer or cyclic stream is rejected): barriers 0x60000160, 0x60001560, 0x600215fe, 0x600201fe;
 //! link 0x2000XXXX; direct launch (40 B, the G15 layout), indirect launches 36 B
@@ -20,6 +22,8 @@ use super::{command::cover, command::USC_WINDOW, params};
 use crate::mmu;
 
 const VDM_ROOT: u32 = 0x21000960;
+/// USC cache invalidate bit of the VDM root barrier (DRM_ASAHI_FEATURE_VDM_USC_INVALIDATE).
+const VDM_ROOT_USC_INVAL: u32 = 0x8;
 const CDM_TERMINATE: u32 = 0x40000000;
 const CDM_BARRIERS: [u32; 4] = [0x60000160, 0x600215fe, 0x60001560, 0x600201fe];
 const CDM_LINK: u32 = 0x20000000;
@@ -148,7 +152,8 @@ fn arguments(vm: &mut mmu::VmReadGuard, address: u64, checked: &mut Checked) -> 
     Ok(())
 }
 
-/// VDM admission: a normal root stream opens with exactly the G15 barrier.
+/// VDM admission: a normal root stream opens with the G15 barrier, with or
+/// without the USC cache invalidate.
 pub(crate) fn vdm(vm: &mut mmu::VmReadGuard, va: u64) -> Result {
     if !params::stream_gate() {
         return Ok(());
@@ -156,7 +161,7 @@ pub(crate) fn vdm(vm: &mut mmu::VmReadGuard, va: u64) -> Result {
     let mut bytes = [0u8; 4];
     vm.read_user(va, &mut bytes).map_err(|_| EFAULT)?;
     let word = u32::from_le_bytes(bytes);
-    if word != VDM_ROOT {
+    if word & !VDM_ROOT_USC_INVAL != VDM_ROOT {
         return Err(reject("VDM root", va, &[word]));
     }
     Ok(())
