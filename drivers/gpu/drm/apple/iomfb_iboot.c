@@ -135,6 +135,27 @@ static const struct apple_rtkit_ops dcp_iboot_rtkit_ops = {
 	.syslog_is_debug = dcp_iboot_rtk_syslog_debug,
 };
 
+/*
+ * Nothing scans out the bootloader's framebuffers while the main DCP stays
+ * off: drop the simpledrm devices on them, outputs that would show nothing.
+ * This detaches a simpledrm that is bound already, as the built-in one is
+ * long before this probe; one loaded later would bind again.
+ */
+static void dcp_iboot_drop_boot_fbs(void)
+{
+	struct device_node *chosen __free(device_node) = of_find_node_by_path("/chosen");
+
+	for_each_child_of_node_scoped(chosen, np) {
+		struct resource res;
+
+		if (!of_device_is_compatible(np, "simple-framebuffer") ||
+		    of_address_to_resource(np, 0, &res))
+			continue;
+		aperture_remove_conflicting_devices(res.start, resource_size(&res),
+						    dcp_iboot_driver_name());
+	}
+}
+
 static bool dcp_iboot_handoff_quiesced(struct dcp_iboot *ib)
 {
 	struct device_node *chosen __free(device_node) = of_find_node_by_path("/chosen");
@@ -708,17 +729,23 @@ register_kms:
 }
 
 /*
- * Without a USB-C display the bootloader drives HDMI from the main DCP
- * (source 0) and never starts DCPEXT0. hdmi_np: DCPEXT0's node, which
- * describes the HDMI PHY.
+ * hdmi_np: DCPEXT0's node, which describes the HDMI PHY; its source select
+ * names the DCP driving HDMI (0 the main DCP, 1 DCPEXT0). On the J873g,
+ * iBoot lights only a monitor on the back-right port, through the main DCP,
+ * and leaves HDMI to the kernel even when HDMI is the only display. A
+ * source a bootloader did set is still adopted.
  */
 int dcp_iboot_probe(struct apple_dcp *dcp)
 {
 	struct device *dev = dcp->dev;
+	/* Read by whichever DCP probes first, before any DCP drives a port. */
+	int boot_link = t8152_atc_boot_link(dev);
 	struct device_node *hdmi_np __free(device_node) = t8152_hdmi_node();
 	int source = hdmi_np ? t8152_hdmi_source(hdmi_np) : -ENODEV;
 	struct t8152_display *disp;
 	struct dcp_iboot *ib;
+	u32 dp_source = 0;
+	bool main_dcp;
 	u32 live;
 	int ret;
 
@@ -726,6 +753,22 @@ int dcp_iboot_probe(struct apple_dcp *dcp)
 	    !of_property_present(dev->of_node, "apple,usb-c-ports")) {
 		dev_info(dev, "%s\n", source == 0 ? "HDMI is on the main DCP" :
 			 "no bootloader HDMI link to adopt");
+		return -ENODEV;
+	}
+
+	/*
+	 * A main DCP that the bootloader left without a display cannot power
+	 * one: its SET_POWER never completes, on HDMI or USB-C. It has one
+	 * when it drives HDMI or the bootloader's link on a USB-C port; none
+	 * when iBoot found no monitor on back-right, with HDMI alone too. Then
+	 * leave its outputs to the DCPEXTs, which start cold, and the shared
+	 * HDMI port with them. If the ports could not be read, bind as before.
+	 */
+	of_property_read_u32(dev->of_node, "apple,dp-source", &dp_source);
+	main_dcp = dev->of_node != hdmi_np && !dp_source;
+	if (main_dcp && source != 0 && boot_link == 0) {
+		dcp_iboot_drop_boot_fbs();
+		dev_info(dev, "no display from the bootloader: main DCP off, the DCPEXTs drive the outputs\n");
 		return -ENODEV;
 	}
 

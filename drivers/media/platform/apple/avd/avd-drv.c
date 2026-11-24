@@ -190,10 +190,6 @@ static int avd_open(struct file *filp)
 
 	ctx->dev = avd;
 
-	ret = avd_buf_alloc(avd, &ctx->inst, fifo_size());
-	if (ret)
-		goto err_free_ctx;
-
 	INIT_LIST_HEAD(&ctx->queue_node);
 	ctx->next_dep = AVD_DEP_PREV_DONE;
 
@@ -221,7 +217,6 @@ err_cleanup_m2m_ctx:
 	v4l2_m2m_ctx_release(ctx->fh.m2m_ctx);
 
 err_free_ctx:
-	avd_buf_free(avd, &ctx->inst);
 	kfree(ctx);
 	return ret;
 }
