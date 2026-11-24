@@ -1069,6 +1069,36 @@ static int h16_failed_load(struct ane_h16_session *s, struct ane_h16_program *p,
 	return h16_fail(s, error);
 }
 
+static unsigned int h16_dump_fwlog(struct ane_h16_session *s);
+
+/*
+ * A LOAD or CREATE the firmware refused or answered with something else:
+ * log what it sent back, so a refusal says why. The header (status in its
+ * top 16 bits), the ID words, then the first reply qword that differs from
+ * the request and its offset; then the firmware's own log.
+ */
+static void h16_log_reply(struct ane_h16_session *s, const char *what, const u8 *request,
+			  const u8 *reply, size_t length, size_t id_offset)
+{
+	size_t off;
+
+	if (!reply) {
+		s->ops->log(s->ctx, what, 0, 0);
+		return;
+	}
+	s->transport->ops->read_barrier(s->transport->ctx);
+	s->ops->log(s->ctx, what, get_unaligned_le64(reply),
+		    get_unaligned_le64(reply + id_offset));
+	for (off = 8; off + 8 <= length; off += 8)
+		if (off != id_offset &&
+		    get_unaligned_le64(reply + off) != get_unaligned_le64(request + off))
+			break;
+	if (off + 8 <= length)
+		s->ops->log(s->ctx, "reply differs from the request at", off,
+			    get_unaligned_le64(reply + off));
+	h16_dump_fwlog(s);
+}
+
 /*
  * On this firmware family a direct EXECUTE reuses the BAR context of the
  * program the engine ran last, so the first EXECUTE of a program writes into
@@ -1090,7 +1120,7 @@ int ane_h16_session_load(struct ane_h16_session *s,
 	struct h16_program_binds binds = {};
 	struct ane_h16_program *p;
 	u8 *command;
-	const u8 *reply;
+	const u8 *reply = NULL;
 	unsigned int i;
 	int ret;
 
@@ -1166,11 +1196,14 @@ int ane_h16_session_load(struct ane_h16_session *s,
 		ret = ane_h16_load_reply(reply, ANE_H16_LOAD_SIZE, command, &p->key.program);
 	if (ret) {
 		s->ops->log(s->ctx, "LOAD refused", (u64)-ret, 0);
+		h16_log_reply(s, "LOAD reply header, ID", command, reply, ANE_H16_LOAD_SIZE,
+			      ANE_H16_LOAD_ID_OFFSET);
 		ret = h16_failed_load(s, p, ret);
 		goto out;
 	}
 	s->ops->log(s->ctx, "LOAD program", p->key.program, p->bar_count);
 	ret = ane_h16_create_encode(command, ANE_H16_CREATE_SIZE, p->key.program);
+	reply = NULL;
 	if (!ret)
 		ret = h16_send_at(s, ANE_FW_IO, command, ANE_H16_CREATE_SIZE,
 				  h16_record_at(s, p, true), &reply);
@@ -1179,6 +1212,8 @@ int ane_h16_session_load(struct ane_h16_session *s,
 					   &p->key.process);
 	if (ret) {
 		s->ops->log(s->ctx, "CREATE refused", (u64)-ret, 0);
+		h16_log_reply(s, "CREATE reply header, program", command, reply,
+			      ANE_H16_CREATE_SIZE, 8);
 		ret = h16_failed_load(s, p, ret);
 		goto out;
 	}

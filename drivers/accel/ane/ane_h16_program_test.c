@@ -75,6 +75,8 @@ struct prog_fw {
 	u64 last_sync_dva;
 	/* The EXECUTE failure trace lines, by step. */
 	u64 fail_step, fail_flags, fail_reports, fail_state, fail_other;
+	/* The reply header and ID words logged for a refused LOAD. */
+	u64 load_reply, load_reply_id;
 	/* EXECUTE of a program or process this firmware never created fails. */
 	bool strict;
 	unsigned int replay_failed;
@@ -382,6 +384,9 @@ static void fw_log(void *ctx, const char *item, u64 a, u64 b)
 		f->fail_other = a;
 	} else if (!strcmp(item, "PROGRAM REPLAY FAILED")) {
 		f->replay_failed++;
+	} else if (!strcmp(item, "LOAD reply header, ID")) {
+		f->load_reply = a;
+		f->load_reply_id = b;
 	}
 }
 
@@ -1010,6 +1015,19 @@ static void program_h14_add_refused_test(struct kunit *test)
 	/* An H16 task header (nine words) is not an H14 one. */
 	put_unaligned_le32(ANE_HWX_SUBTYPE_H16, hwx + 8);
 	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(hwx, snapshot->size, info), -ENOEXEC);
+}
+
+/* A refused LOAD logs the firmware's reply header and ID words. */
+static void program_load_reply_logged_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test);
+	struct ane_h16_program *p = NULL;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	f->mode = FW_LOAD_NAK;
+	KUNIT_EXPECT_EQ(test, fw_load_program(f, &p), -EREMOTEIO);
+	KUNIT_EXPECT_EQ(test, f->load_reply >> 32, 0x10000 | ANE_H16_LOAD_PROGRAM);
+	KUNIT_EXPECT_EQ(test, f->load_reply_id & U32_MAX, ANE_H16_LOAD_ID_REQUEST);
 }
 
 /* Synthetic HWX with a kernel section: slot 1 is class 3 with index 1007. */
@@ -3547,6 +3565,7 @@ static struct kunit_case program_cases[] = {
 	KUNIT_CASE(program_add128_hwx_test),
 	KUNIT_CASE(program_h14_add_hwx_test),
 	KUNIT_CASE(program_h14_add_refused_test),
+	KUNIT_CASE(program_load_reply_logged_test),
 	KUNIT_CASE(program_replies_test),
 	KUNIT_CASE(program_deny_list_test),
 	KUNIT_CASE(program_custom_bar_test),
