@@ -37,6 +37,10 @@ static int dcp_peer_video_call_stream(struct apple_dcp *dcp, bool independent,
 
 	if (out_size > sizeof(wait->reply))
 		return -EINVAL;
+	/* The calls name 27.0 IDs: this engine's build may number them differently. */
+	ret = iomfb_v27_tag(dcp->v27_methods, tag, method.tag);
+	if (ret)
+		return ret;
 	/* An unrelated AP thread gets its own firmware stream. A369/A367/etc.
 	 * must not be mistaken for nested callbacks of the pending A413.
 	 * Stream1 (the driver's OOB context) is independent of stream0.
@@ -46,7 +50,6 @@ static int dcp_peer_video_call_stream(struct apple_dcp *dcp, bool independent,
 	wait = kzalloc(sizeof(*wait), GFP_KERNEL);
 	if (!wait)
 		return -ENOMEM;
-	memcpy(method.tag, tag, sizeof(method.tag));
 	wait->size = out_size;
 	init_completion(&wait->done);
 	kref_init(&wait->refs);

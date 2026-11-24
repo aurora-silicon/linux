@@ -828,11 +828,82 @@ err:
 	return ret;
 }
 
+static int apple_atomic_check(struct drm_device *dev,
+			      struct drm_atomic_commit *state)
+{
+	struct drm_plane *plane;
+	struct drm_plane_state *old_plane_state, *new_plane_state;
+	struct drm_crtc *crtc;
+	struct drm_crtc_state *crtc_state;
+	int i, ret;
+
+	ret = drm_atomic_helper_check_modeset(dev, state);
+	if (ret)
+		return ret;
+
+	/*
+	 * Until a displayed KMS swap retires the boot scanout, pull the CRTC
+	 * and its primary plane into every commit touching that CRTC so a
+	 * cursor- or overlay-only commit replays the intended slot-zero state
+	 * and framebuffer reference inside the atomic transaction.
+	 */
+	for_each_oldnew_plane_in_state(state, plane, old_plane_state,
+				       new_plane_state, i) {
+		struct drm_crtc *targets[2] = {
+			old_plane_state->crtc,
+			new_plane_state->crtc,
+		};
+
+		for (int t = 0; t < ARRAY_SIZE(targets); t++) {
+			struct drm_crtc *target = targets[t];
+
+			if (!target || t8132_ext_crtc(target))
+				continue;
+			if (!dcp_boot_surface_pending(to_apple_crtc(target)->dcp))
+				continue;
+			crtc_state = drm_atomic_get_crtc_state(state, target);
+			if (IS_ERR(crtc_state))
+				return PTR_ERR(crtc_state);
+		}
+	}
+
+	for_each_new_crtc_in_state(state, crtc, crtc_state, i) {
+		struct drm_plane_state *plane_state;
+
+		if (t8132_ext_crtc(crtc) || !crtc->primary)
+			continue;
+		if (!crtc_state->enable || !crtc_state->active)
+			continue;
+		if (!dcp_boot_surface_pending(to_apple_crtc(crtc)->dcp))
+			continue;
+
+		plane_state = drm_atomic_get_plane_state(state, crtc->primary);
+		if (IS_ERR(plane_state))
+			return PTR_ERR(plane_state);
+		crtc_state->planes_changed = true;
+	}
+
+	if (dev->mode_config.normalize_zpos) {
+		ret = drm_atomic_normalize_zpos(dev, state);
+		if (ret)
+			return ret;
+	}
+
+	ret = drm_atomic_helper_check_planes(dev, state);
+	if (ret)
+		return ret;
+
+	if (state->legacy_cursor_update)
+		state->async_update = !drm_atomic_helper_async_check(dev, state);
+
+	return 0;
+}
+
 static const struct drm_mode_config_funcs apple_mode_config_funcs = {
 	.atomic_state_alloc	= apple_atomic_state_alloc,
 	.atomic_state_clear	= apple_atomic_state_clear,
 	.atomic_state_free	= apple_atomic_state_free,
-	.atomic_check		= drm_atomic_helper_check,
+	.atomic_check		= apple_atomic_check,
 	.atomic_commit		= apple_atomic_commit,
 	.fb_create		= drm_gem_fb_create,
 };
@@ -1059,8 +1130,10 @@ static int apple_connector_attach_pq_reference(struct drm_connector *connector)
  * External displays expose the colour properties backed by DCP's per-timing
  * ColorModes catalogue (Colorspace, HDR_OUTPUT_METADATA, Broadcast RGB,
  * color format, max bpc); dcp_crtc_atomic_check() validates each request
- * against the active timing's catalogue.  Internal panels with EDR expose
- * Colorspace (BT2020_RGB), HDR_OUTPUT_METADATA and PQ_REFERENCE_LUMINANCE.
+ * against the active timing's catalogue.  An internal panel with EDR
+ * headroom (dcp_panel_edr()) exposes Colorspace (BT2020_RGB),
+ * HDR_OUTPUT_METADATA and PQ_REFERENCE_LUMINANCE; an SDR panel offers no
+ * HDR at all.
  */
 static int apple_connector_attach_hdr(struct drm_connector *connector,
 				      bool panel_edr, bool ext_color_props)
@@ -1180,8 +1253,7 @@ static int apple_connector_create(struct drm_device *drm,
 	ret = drm_connector_attach_vrr_capable_property(&connector->base);
 	if (ret)
 		goto err_cleanup;
-	ret = apple_connector_attach_hdr(&connector->base,
-					 dcp_fw_compat_panel_edr(dcp),
+	ret = apple_connector_attach_hdr(&connector->base, dcp_panel_edr(dcp),
 					 dcp_ext_color_props_supported(dcp));
 	if (ret)
 		goto err_cleanup;

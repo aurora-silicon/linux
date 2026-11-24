@@ -22,8 +22,9 @@ impl<T>std::ops::DerefMut for KVec<T>{fn deref_mut(&mut self)->&mut Vec<T>{&mut 
 mod hw{pub mod sizes{pub const MAX_VMS:u32=63;}}
 mod module_parameters{pub struct Param;impl Param{pub fn value(&self)->u32{0}}pub static robust_isolation:Param=Param;}
 mod types{pub struct ScopeGuard<F:FnOnce()>(Option<F>);impl<F:FnOnce()>ScopeGuard<F>{pub fn new(f:F)->Self{Self(Some(f))}pub fn dismiss(mut self){self.0.take();}}impl<F:FnOnce()>Drop for ScopeGuard<F>{fn drop(&mut self){if let Some(f)=self.0.take(){f()}}}}
-struct Handle;impl Handle{fn is_closed(&self)->bool{false}}
-struct VmState{id:u64,vm:Handle,drops:Arc<AtomicU32>}impl Drop for VmState{fn drop(&mut self){self.drops.fetch_add(1,Ordering::AcqRel);}}
+struct Handle(std::sync::atomic::AtomicBool);impl Handle{fn open()->Self{Self(std::sync::atomic::AtomicBool::new(false))}fn mark_closed(&self){self.0.store(true,Ordering::Release);}fn is_closed(&self)->bool{self.0.load(Ordering::Acquire)}}
+struct Cache{closes:AtomicU32,spares:StdMutex<Vec<Arc<VmState>>>}impl Cache{fn new()->Self{Self{closes:AtomicU32::new(0),spares:StdMutex::new(Vec::new())}}fn close(&self){self.closes.fetch_add(1,Ordering::AcqRel);let spares=std::mem::take(&mut *self.spares.lock().unwrap());drop(spares);}}
+struct VmState{id:u64,vm:Handle,drops:Arc<AtomicU32>,resources:Option<Arc<Cache>>}impl Drop for VmState{fn drop(&mut self){self.drops.fetch_add(1,Ordering::AcqRel);}}
 __REGISTRY__
 struct Reservation<'a>(Option<&'a Registry>,u64);
 __RESERVATION_DROP__
@@ -46,11 +47,27 @@ impl Registry{
 }
 #[test]fn close_releases_registry_owner_without_another_vm_create(){
  let r=Registry::new_test();let drops=Arc::new(AtomicU32::new(0));
- let state=Arc::new(VmState{id:1,vm:Handle,drops:drops.clone()});r.vms.lock().push(state.clone(),0).unwrap();
+ let cache=Arc::new(Cache::new());
+ let state=Arc::new(VmState{id:1,vm:Handle::open(),drops:drops.clone(),resources:Some(cache.clone())});r.vms.lock().push(state.clone(),0).unwrap();
  r.close(1);assert!(r.vms.lock().is_empty());assert_eq!(drops.load(Ordering::Acquire),0);
+ // The client's close lets the VM's cache drop its arenas while other owners hold the VM.
+ assert_eq!(cache.closes.load(Ordering::Acquire),1);
  drop(state);assert_eq!(drops.load(Ordering::Acquire),1);
- r.vms.lock().push(Arc::new(VmState{id:2,vm:Handle,drops:drops.clone()}),0).unwrap();
+ r.vms.lock().push(Arc::new(VmState{id:2,vm:Handle::open(),drops:drops.clone(),resources:None}),0).unwrap();
  r.close(2);assert_eq!(drops.load(Ordering::Acquire),2);
+}
+#[test]fn prune_closes_cache_and_breaks_spare_epoch_cycle(){
+ let r=Registry::new_test();let drops=Arc::new(AtomicU32::new(0));
+ let cache=Arc::new(Cache::new());
+ let state=Arc::new(VmState{id:1,vm:Handle::open(),drops:drops.clone(),resources:Some(cache.clone())});
+ // Simulate a spare PB epoch inside Cache holding a strong reference back to VmState.
+ cache.spares.lock().unwrap().push(state.clone());
+ state.vm.mark_closed();
+ r.vms.lock().push(state,0).unwrap();
+ r.prune();
+ assert!(r.vms.lock().is_empty());
+ assert_eq!(cache.closes.load(Ordering::Acquire),1);
+ assert_eq!(drops.load(Ordering::Acquire),1);
 }
 '''
 for tag,marker in [('REGISTRY','pub(crate) struct Registry'),('RESERVATION_DROP',"impl Drop for Reservation<'_>"),('RESERVE','fn reserve(&self, file_id:'),('RELEASE','fn release(&self, file_id:'),('CLOSE','pub(crate) fn close(&self, id:'),('PRUNE','fn prune(&self)')]:

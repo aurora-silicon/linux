@@ -254,6 +254,11 @@ impl Registry {
             let index = vms.iter().position(|state| state.id == id);
             index.and_then(|index| vms.remove(index).ok())
         };
+        // Arenas still reachable by firmware stay with the slot leases and jobs that hold
+        // them; the rest (and the spare epochs, which hold the VM) go now.
+        if let Some(cache) = state.as_ref().and_then(|state| state.resources.as_ref()) {
+            cache.close();
+        }
         drop(state);
     }
 
@@ -268,8 +273,12 @@ impl Registry {
             let Some(closed) = closed else {
                 break;
             };
-            // No allocation while holding the registry lock, which fail_all() also needs.
-            // Final VM destruction is deferred independently of this caller's locks.
+            // Break the spare-epoch cycle before releasing the registry reference, matching
+            // close(). No allocation while holding the registry lock, which fail_all() also
+            // needs. Final VM destruction is deferred independently of this caller's locks.
+            if let Some(cache) = closed.resources.as_ref() {
+                cache.close();
+            }
             drop(closed);
         }
     }

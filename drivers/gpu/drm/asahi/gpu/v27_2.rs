@@ -42,6 +42,9 @@ const TRACE_RECORDS: u32 = 512;
 const RING_RECORDS: u32 = 256;
 /// Queue capacity at position block +0x50 (16 x the 0x50 channels).
 const QUEUE_CAPACITY: u32 = 0x500;
+/// Upper performance-state cap, in hundredths, at globals +0x98: the first state above idle.
+/// Only this cap has run on hardware.
+const STATE_CAP: u32 = 100;
 
 /// Board facts the root needs, read from the device tree at probe.
 pub(crate) struct BoardV27_2 {
@@ -1080,11 +1083,9 @@ impl RootV27_2 {
             for (offset, value) in [(0x58, 0xffffu16), (0x5a, 0x28), (0x5c, 0xffff)] {
                 data[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
             }
-            put32(data, 0x84, pwr.max_power_mw);
-            // The performance-state ceiling the board's table describes; the power and thermal
-            // controller below decides how much of it the GPU may use.
-            for at in g14_v27_2_abi::GLOBALS_PSTATE_SELECTORS {
-                put32(data, at, pwr.perf_max_pstate * 100);
+            let ceiling = pwr.perf_max_pstate * 100;
+            for (at, value) in [(0x84, pwr.max_power_mw), (0x88, ceiling), (0x8c, ceiling), (0x98, STATE_CAP)] {
+                put32(data, at, value);
             }
             put32(data, 0x6e, 1);
             // The firmware's progress checks and compute watchdog, as M3 and M4 27.2 set them.

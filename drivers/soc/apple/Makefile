@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: GPL-2.0-only
 
+obj-$(CONFIG_APPLE_MCC_BOOT_DMA) += mcc-boot-dma.o
+
 obj-$(CONFIG_APPLE_J613_DISPLAY_SYNC) += j613-display.o
 
 obj-$(CONFIG_APPLE_DBGVIEW) += apple-dbgview.o
 apple-dbgview-y = dbgview.o
+obj-$(CONFIG_APPLE_DBGVIEW_KUNIT_TEST) += dbgview-test.o
 
 obj-$(CONFIG_APPLE_DOCKCHANNEL) += apple-dockchannel.o
 apple-dockchannel-y = dockchannel.o
@@ -70,5 +73,6 @@ obj-$(CONFIG_APPLE_CLPC) += clpc.o
 
 obj-$(CONFIG_APPLE_REGVIEW) += apple-regview.o
 apple-regview-y := regview.o
+obj-$(CONFIG_APPLE_REGVIEW_KUNIT_TEST) += regview-test.o
 
 obj-$(CONFIG_APPLE_AURORA_BOOT_SECURITY) += aurora-boot-security.o

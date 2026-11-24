@@ -1500,7 +1500,11 @@ impl AopData {
         order.extend_from_slice(default, GFP_KERNEL)?;
         Ok(order)
     }
-    fn new(dev: &platform::Device<Core<'_>>, cfg: &AopHwConfig) -> Result<Arc<AopData>> {
+    fn new(
+        dev: &platform::Device<Core<'_>>,
+        cfg: &AopHwConfig,
+        setup_port: bool,
+    ) -> Result<Arc<AopData>> {
         let sleep_endpoints = Self::endpoint_order(
             dev.as_ref(),
             c_str!("apple,sleep-endpoints"),
@@ -1512,7 +1516,7 @@ impl AopData {
             cfg.wake_endpoints,
         )?;
         let registration_queue = OwnedQueue::new_ordered(c_str!("apple-aop"))?;
-        let setup_queue = if cfg.setup_port {
+        let setup_queue = if setup_port {
             Some(OwnedQueue::new_ordered(c_str!("apple-aop-setup"))?)
         } else {
             None
@@ -1591,9 +1595,14 @@ impl AopData {
                     let mut init = ep_guard.start(rtk.as_mut());
                     if init == Err(ETIMEDOUT) {
                         // The mailbox stayed full for the whole send timeout,
-                        // so the request was never written. The firmware can
-                        // still be busy finishing its own boot: send it once
-                        // more, which checks the mailbox again first.
+                        // so the request was never written and a resend is
+                        // safe. The send already waits on the mailbox's
+                        // send-empty interrupt, and the firmware sends no
+                        // other event when it reads its inbound FIFO again.
+                        // Seen on a J616s warm boot with a slow firmware
+                        // start (#547); why the FIFO stays full after the
+                        // power handshake is open (#2344). Resend once,
+                        // logged, then fail the endpoint.
                         dev_warn!(
                             self.dev,
                             "Endpoint {:#04x}: AFK init not sent (mailbox full); retrying",
@@ -3351,7 +3360,14 @@ impl platform::Driver for AopDriver {
         } else {
             None
         };
-        let data = AopData::new(pdev, cfg)?;
+        // The setup-port boot opens the mailbox named "setup"; a device tree
+        // that gives the AOP no such mailbox gets the boot without it.
+        let setup_port = cfg.setup_port
+            && pdev.as_ref().fwnode().is_some_and(|node| {
+                node.property_match_string(c_str!("mbox-names"), c_str!("setup"))
+                    .is_ok()
+            });
+        let data = AopData::new(pdev, cfg, setup_port)?;
         // Whatever fails below leaves the AOP running and its children
         // registering; the same teardown as unbind's cleans that up.
         let probe_guard = ScopeGuard::new_with_data(data.clone(), |data| data.remove());
@@ -3377,12 +3393,12 @@ impl platform::Driver for AopDriver {
             rtkit::RtKit::<AopData>::new(pdev.as_ref(), None, 0, data.clone())?
         };
         data.rtkit.lock().as_mut().set(Some(rtkit));
-        if cfg.setup_port {
+        if setup_port {
             AopData::setup_open(&data, pdev.as_ref())?;
         }
         asc_mmio.update(ASC_CPU_CONTROL, |r| r.with_const_cpu_run::<1>());
         data.cpu_started.store(true, Release);
-        let started = if cfg.setup_port {
+        let started = if setup_port {
             // The RTKit handshake up to AP power on comes first, then the
             // setup port's own power state and endpoint buffers, and only
             // then the AFK endpoints.

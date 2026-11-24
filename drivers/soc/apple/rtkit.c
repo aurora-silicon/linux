@@ -481,7 +481,7 @@ static void apple_rtkit_management_rx_iop_pwr_ack(struct apple_rtkit *rtk,
 
 	dev_dbg(rtk->dev, "RTKit: IOP power state transition: 0x%x -> 0x%x\n",
 		rtk->iop_power_state, new_state);
-	rtk->iop_power_state = new_state;
+	WRITE_ONCE(rtk->iop_power_state, new_state);
 
 	/*
 	 * A retained wake: a co-processor may report QUIESCED when it starts
@@ -3054,7 +3054,8 @@ int apple_rtkit_quiesce(struct apple_rtkit *rtk)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_quiesce);
 
-static int apple_rtkit_wake_common(struct apple_rtkit *rtk, bool early_ap_power)
+static int apple_rtkit_wake_common(struct apple_rtkit *rtk, bool early_ap_power,
+				   bool reinit_iop_ack)
 {
 	u64 msg;
 	int ret;
@@ -3062,7 +3063,8 @@ static int apple_rtkit_wake_common(struct apple_rtkit *rtk, bool early_ap_power)
 	if (apple_rtkit_is_running(rtk))
 		return -EINVAL;
 
-	reinit_completion(&rtk->iop_pwr_ack_completion);
+	if (reinit_iop_ack)
+		reinit_completion(&rtk->iop_pwr_ack_completion);
 
 	/*
 	 * Use open-coded apple_rtkit_set_iop_power_state since apple_rtkit_boot
@@ -3079,13 +3081,79 @@ static int apple_rtkit_wake_common(struct apple_rtkit *rtk, bool early_ap_power)
 
 int apple_rtkit_wake(struct apple_rtkit *rtk)
 {
-	return apple_rtkit_wake_common(rtk, false);
+	return apple_rtkit_wake_common(rtk, false, true);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_wake);
 
+/* Wait up to @ms for @c, polling the mailbox where waits poll it: true once it is done. */
+static int apple_rtkit_done_within(struct apple_rtkit *rtk, struct completion *c,
+				   unsigned int ms)
+{
+	unsigned long deadline = jiffies + msecs_to_jiffies(ms);
+	long t;
+
+	do {
+		if ((rtk->sync_syslog_ack || rtk->poll_waits) && apple_rtkit_poll(rtk) < 0)
+			break;
+		t = apple_rtkit_wait_timeout(rtk, c, msecs_to_jiffies(1));
+		if (t < 0)
+			return t;
+		if (t > 0)
+			return 1;
+	} while (time_before(jiffies, deadline));
+
+	return try_wait_for_completion(c);
+}
+
+/*
+ * Some firmware reports in by itself once its CPU runs and then acknowledges
+ * IOP power on by itself, answering no request for it after that; other
+ * firmware waits to be asked. Give the firmware up to @self_ack_ms to report in
+ * (its endpoint map, and CoreAnalytics where the ops need it) and again to
+ * acknowledge IOP power on; ask for IOP power as apple_rtkit_wake() does if it
+ * does neither.
+ */
+int apple_rtkit_boot_or_wake(struct apple_rtkit *rtk, unsigned int self_ack_ms)
+{
+	int ret;
+
+	if (apple_rtkit_is_running(rtk))
+		return -EINVAL;
+	if (rtk->crashed)
+		return -EINVAL;
+
+	ret = apple_rtkit_done_within(rtk, &rtk->epmap_completion, self_ack_ms);
+	if (ret < 0)
+		return ret;
+	if (!ret || rtk->boot_result)
+		return apple_rtkit_wake(rtk);
+	if (apple_rtkit_needs_coreanalytics(rtk) &&
+	    test_bit(APPLE_RTKIT_EP_COREANALYTICS, rtk->endpoints)) {
+		ret = apple_rtkit_wait_for_completion(rtk, &rtk->coreanalytics_completion);
+		if (ret) {
+			dev_err(rtk->dev, "RTKit: CoreAnalytics readiness failed: %d\n", ret);
+			return ret;
+		}
+	}
+
+	ret = apple_rtkit_done_within(rtk, &rtk->iop_pwr_ack_completion, self_ack_ms);
+	if (ret < 0)
+		return ret;
+	if (READ_ONCE(rtk->iop_power_state) == APPLE_RTKIT_PWR_STATE_ON) {
+		dev_dbg(rtk->dev, "RTKit: the IOP acknowledged power on by itself\n");
+		return apple_rtkit_boot(rtk);
+	}
+	/*
+	 * When !ret, iop_pwr_ack_completion was not signaled; keep it intact so
+	 * a late self-ACK arriving before SET_IOP_PWR_STATE is not lost.
+	 */
+	return apple_rtkit_wake_common(rtk, false, ret != 0);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_boot_or_wake);
+
 int apple_rtkit_wake_early_ap(struct apple_rtkit *rtk)
 {
-	return apple_rtkit_wake_common(rtk, true);
+	return apple_rtkit_wake_common(rtk, true, true);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_wake_early_ap);
 

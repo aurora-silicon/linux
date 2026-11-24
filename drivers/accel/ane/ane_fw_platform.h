@@ -186,6 +186,7 @@ ane_fw_sleep_path(const struct ane_fw_platform *platform)
 
 extern const struct ane_fw_platform ane_h16_platform, ane_h17_platform, ane_t6050_platform,
 				    ane_t8142_platform;
+extern const struct ane_fw_platform ane_t8122_platform;
 extern const struct ane_fw_platform ane_t8132_platform;
 int ane_fw_platform_preflight(struct platform_device *pdev,
 			      const struct ane_fw_platform *soc);
