@@ -704,9 +704,7 @@ impl Drop for VmJobGuard {
         // Healthy last-job release need not close mapping/job admission when
         // there is no accepted cleanup to drain. Keep every recovery, close,
         // in-progress commit and failed-cleanup path on the existing drain.
-        // M5 only: other G17 GPUs keep the drain on every last release.
-        if self.vm.m5
-            && !state.blocked
+        if !state.blocked
             && !state.quarantined
             && !state.draining
             && !state.closed
