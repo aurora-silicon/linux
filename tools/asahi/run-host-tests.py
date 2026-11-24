@@ -271,6 +271,17 @@ ASAHI_TESTS = {
     'g17-m5-idle-housekeeping-tests.py': [([], PASS)]
         + mutations('--mutation', ('idle-forces-housekeeping', 'no-deferred-timer',
                                    'hardcode-in-flight-true', 'skip-cadence-expiry'), []),
+    'g17-m5-event-placement-tests.py': [([], PASS)]
+        + mutations('--mutation', ('percpu-always', 'unbound-always', 'aim-local',
+                                   'record-always', 'not-reclaim', 'split-flag'), []),
+    'g17-m5-render-fast-done-tests.py': [([], PASS)]
+        + mutations('--mutation', ('hold-m5-outer-across-doorbell',
+                                   'hold-render-lock-across-doorbell',
+                                   'skip-pending-error-fallback',
+                                   'single-slot-bailout',
+                                   'skip-epoch-check',
+                                   'unconditional-changed-notify',
+                                   'skip-generation-bump'), []),
     'g17-m5-effort-tests.py': [([], PASS)]
         + mutations('--mutation', ('m5-ignores-bound',), []),
     'g17-firmware-selection-tests.py': [([], PASS)],
@@ -285,6 +296,12 @@ ASAHI_TESTS = {
     'g17-quarantine-drain-tests.py': [([], PASS)]
         + mutations('--mutation', ('no-drain-release', 'without-witness', 'ignore-leases', 'no-last-lease',
                                    'witness-covers-later-failure', 'unquarantined-drain'), []),
+    'g17-render-return-observe-tests.py': [([], PASS)]
+        + mutations('--mutation', ('rescan-owed', 'observe-all-slots', 'observe-ignores-gate',
+                                   'rescan-in-loop-bail', 'rescan-is-fallback', 'missed-dropped',
+                                   'observe-in-recovery', 'collector-blocks', 'finish-under-mutex',
+                                   'no-pass-requested', 'rescan-no-poll', 'worker-rescan-slow-path',
+                                   'owed-slow-path'), []),
     'g17-render-direct-recovery-tests.py': [([], PASS)]
         + mutations('--mutation', ('recovery-state-eio', 'drop-generation-check',
                                    'wrong-j813-pipe'), []),

@@ -586,7 +586,10 @@ impl crate::g17::Shared {
         let requested = self
             .housekeeping
             .swap(false, core::sync::atomic::Ordering::AcqRel);
-        let (recover, masks, fast_done) = {
+        let (recover, masks, fast_done, render_changed) = {
+            // Taken before `state` so single-lock render retirement observes a live preparation
+            // epoch and drops it before `wait_drained_until()` if recovery opens.
+            let fast_epoch = self.preparations.try_enter().ok();
             let mut state = self.state.lock();
             let Some(firmware) = (*state).as_deref_mut() else {
                 return Ok(());
@@ -598,18 +601,64 @@ impl crate::g17::Shared {
                 // publisher. Joining builders must happen after unlocking.
                 self.preparations.close();
             }
-            // Steady-state pure-compute completions with no render work to observe, no replays,
-            // no waiters and housekeeping not yet due finish in this single device-mutex hold;
-            // fences are signalled right after unlocking. Transient idle intervals defer
-            // housekeeping to the cadence timer rather than draining reports on every completion.
+            // Steady-state compute or render completions with no replays, no waiters and
+            // housekeeping not yet due finish in this single device-mutex hold; fences are
+            // signalled right after unlocking. Transient idle intervals defer housekeeping to the
+            // cadence timer rather than draining reports on every completion.
             let mut fast_done = false;
+            let mut render_changed = false;
+            let mut rescan = false;
             if !recover
                 && !requested
                 && !self.crashed.load(core::sync::atomic::Ordering::Acquire)
-                && masks == [0; 2]
-                && !firmware.render_observation_needed()
             {
-                if let Some(scan) = compute_scan {
+                let needs_render = masks != [0; 2] || firmware.render_observation_needed();
+                let render_clean = if !needs_render {
+                    true
+                } else if fast_epoch.as_ref().is_some_and(|epoch| epoch.is_current()) {
+                    let before = deferred.pending();
+                    match firmware.try_fast_observe_render(deferred)? {
+                        super::render::observe::FastRenderOutcome::Done => {
+                            render_changed = true;
+                            true
+                        }
+                        super::render::observe::FastRenderOutcome::Idle => true,
+                        // The full pass would find nothing more and arm the rescan poll.
+                        super::render::observe::FastRenderOutcome::Rescan => {
+                            render_changed = deferred.pending() != before;
+                            rescan = true;
+                            true
+                        }
+                        super::render::observe::FastRenderOutcome::Fallback => {
+                            render_changed = deferred.pending() != before;
+                            false
+                        }
+                    }
+                } else {
+                    false
+                };
+                // Render completions that found nothing to retire here (Idle) are owed to the
+                // borrowers of their pairs, which observe them on return.
+                if render_clean && (compute_scan.is_some() || render_changed || masks != [0; 2]) {
+                    let scan = match compute_scan {
+                        Some(scan) => scan,
+                        None => {
+                            let mut scan = super::ComputeScan::default();
+                            for queue in firmware
+                                .queues
+                                .compute
+                                .iter()
+                                .flatten()
+                                .filter_map(|entry| entry.queue.as_deref())
+                            {
+                                scan.in_flight |= queue.in_flight();
+                                scan.replay |= queue.replay_commands() != 0;
+                                scan.polling |=
+                                    queue.retirement_polling() || queue.pool_release_pending();
+                            }
+                            scan
+                        }
+                    };
                     let now = super::now_ns();
                     let in_flight = scan.in_flight || firmware.queues.render_in_flight();
                     let no_replay = !scan.replay && !firmware.queues.render.replay_parked();
@@ -640,7 +689,8 @@ impl crate::g17::Shared {
                         {
                             self.queue_housekeeping(delay);
                         }
-                        let polling = scan.polling || firmware.non_compute_runtime_polling(now);
+                        let polling =
+                            rescan || scan.polling || firmware.non_compute_runtime_polling(now);
                         if polling {
                             self.queue_poll();
                         } else if channel::Events::pending(&firmware.init, Role::Primary)?
@@ -653,8 +703,11 @@ impl crate::g17::Shared {
                     }
                 }
             }
-            (recover, masks, fast_done)
+            (recover, masks, fast_done, render_changed)
         };
+        if render_changed {
+            self.note_changed();
+        }
         deferred.finish();
         crate::g17::trace::event(1);
         if fast_done {
@@ -695,11 +748,17 @@ impl crate::g17::Shared {
         firmware.replay_render(deferred)?;
         // Skip dropping and re-acquiring the device mutex around a no-op render observation.
         if masks != [0; 2] || firmware.render_observation_needed() {
+            firmware.drain_render_deferred(masks, deferred)?;
             drop(state);
-            self.observe_renders(masks, deferred)?;
+            self.observe_renders(deferred)?;
             state = self.state.lock();
             if self.crashed.load(core::sync::atomic::Ordering::Acquire) {
                 return Err(EIO);
+            }
+            if let Some(firmware) = (*state).as_deref() {
+                if !firmware.recovery.pending() && firmware.queues.render_needs_rescan() {
+                    self.queue_poll();
+                }
             }
         }
         let Some(firmware) = (*state).as_deref_mut() else {

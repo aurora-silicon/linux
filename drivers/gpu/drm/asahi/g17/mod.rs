@@ -1192,6 +1192,39 @@ const GOVERNOR_WORK: u64 = 6;
 /// `HOUSEKEEPING_NS`.
 const HOUSEKEEPING_WORK: u64 = 7;
 
+/// `CondVar` wrapper that tracks active waiters so `notify_all()` skips the waitqueue lock
+/// in the common zero-waiter steady state.
+#[pin_data]
+struct TrackedCondVar {
+    #[pin]
+    condvar: CondVar,
+    waiters: AtomicU32,
+}
+
+impl TrackedCondVar {
+    fn wait_timeout<T: ?Sized>(
+        &self,
+        guard: &mut kernel::sync::MutexGuard<'_, T>,
+        timeout: kernel::time::Jiffies,
+    ) -> kernel::sync::CondVarTimeoutResult {
+        struct Waiter<'a>(&'a AtomicU32);
+        impl Drop for Waiter<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::Release);
+            }
+        }
+        self.waiters.fetch_add(1, Ordering::SeqCst);
+        let _waiter = Waiter(&self.waiters);
+        self.condvar.wait_timeout(guard, timeout)
+    }
+
+    fn notify_all(&self) {
+        if self.waiters.load(Ordering::SeqCst) != 0 {
+            self.condvar.notify_all();
+        }
+    }
+}
+
 /// Device state shared with the coprocessor callbacks and the event worker.
 #[pin_data]
 struct Shared {
@@ -1275,14 +1308,19 @@ struct Shared {
     /// step). Publishers without the device mutex set it too.
     governor_activity_ns: AtomicU64,
     /// The queue of all work that signals job fences: the event work, and every scheduler's
-    /// timeout work. Memory reclaim may wait on those fences, so it is reclaim-safe and per-CPU
-    /// high priority, as `system_highpri_wq`. On M5, `enqueue_on(submitter)` places completion
-    /// processing directly on the submitting CPU (keeping it in the submitter's L2 and die).
+    /// timeout work. Memory reclaim may wait on those fences, so it is reclaim-safe, and it is
+    /// high priority, as `system_highpri_wq`. [`Self::new_events_queue`] says where the event
+    /// work runs.
     events: Arc<workqueue::OwnedQueue>,
     /// Preallocated completion collector owned exclusively by `run_runtime_events`.
     #[pin]
     worker_deferred: Mutex<Option<runtime::DeferredBatch>>,
-    /// M5: the event work follows the submitting CPU.
+    /// Collector, as large as the event worker's, for the observation a render borrower owes the
+    /// pair it puts back (`Backend::render_direct`). Taken only with `try_lock`, so no borrower
+    /// waits for another, and finished after the device mutex is released.
+    #[pin]
+    render_collector: Mutex<runtime::DeferredBatch>,
+    /// M5: the event work runs beside the CPU that last published work, in its affinity pod.
     follows_submitter: bool,
     /// Multi-die M5: restrict each scheduler's ordered submit queue to the creating CPU's
     /// cluster to avoid cross-die migration. Single-die M5 parts leave schedulers unpinned so
@@ -1309,7 +1347,7 @@ struct Shared {
     #[pin]
     actuators: Mutex<thermal::Actuators>,
     #[pin]
-    changed: CondVar,
+    changed: TrackedCondVar,
     /// The port of the session in `state`; null before boot and once detachment begins.
     port: core::sync::atomic::AtomicPtr<port::Port>,
 }
@@ -1488,6 +1526,28 @@ impl Shared {
     /// The queue for the schedulers' timeout work, which signals the fences of timed-out jobs.
     pub(super) fn fence_queue(&self) -> Arc<workqueue::OwnedQueue> {
         self.events.clone()
+    }
+
+    /// The queue of [`Self::events`].
+    ///
+    /// Event work that follows the submitter is aimed at the publishing CPU by
+    /// [`Self::queue_event_records`]. Its queue is unbound, so that CPU only selects the affinity
+    /// pod, the CPUs sharing its L2, and the scheduler wakes the worker on an idle CPU of the pod:
+    /// beside the submitter and on its die, wherever the completion interrupt was taken. On a
+    /// per-CPU queue the worker would run on the submitting CPU itself and, with the higher
+    /// priority, preempt the submitter for every completion, often in the middle of a publication
+    /// holding the locks the event work takes next. As their owner would not be running, the
+    /// worker could not spin on them: it would sleep until the submitter unlocks and then preempt
+    /// it again, two context switches of the submitter per completion.
+    ///
+    /// Otherwise the queue is per-CPU and the event work runs on the CPU that queues it, as on
+    /// `system_highpri_wq`.
+    fn new_events_queue(follows_submitter: bool) -> Result<workqueue::OwnedQueue> {
+        if follows_submitter {
+            workqueue::OwnedQueue::new_unbound_reclaim(c"aurora_g17_events", true)
+        } else {
+            workqueue::OwnedQueue::new_percpu_reclaim(c"aurora_g17_events", true)
+        }
     }
 
     /// Whether each scheduler's submit queue should be restricted to the creating CPU's cluster
@@ -1801,15 +1861,15 @@ impl Gpu {
         let render_policy = if m5 { Some(render_resources::M5Policy::new(&id)?) } else { None };
         // The bare-metal M5 boot runs both engines; other M5 profiles take no submission.
         let submits = !m5 || cfg.profile == FirmwareProfile::M5PublishedRoots;
-        let events = Arc::new(
-            workqueue::OwnedQueue::new_percpu_reclaim(c"aurora_g17_events", true)?,
-            GFP_KERNEL,
-        )?;
+        // The event work follows the submitter on M5, which decides its queue's kind.
+        let follows_submitter = m5;
+        let events = Arc::new(Shared::new_events_queue(follows_submitter)?, GFP_KERNEL)?;
         let frequencies = Self::state_frequencies(dev, cfg, variant, id.num_clusters)?;
         let max_pstate = frequencies
             .as_ref()
             .map_or(0, stats::StateFrequencies::max_pstate);
         let worker_deferred = runtime::DeferredBatch::worker()?;
+        let render_collector = runtime::DeferredBatch::worker()?;
         let shared = Arc::pin_init(
             pin_init!(Shared {
                 drm <- new_mutex!(Some(dev.into()), "g17::Shared::drm"),
@@ -1856,7 +1916,8 @@ impl Gpu {
                     Some(worker_deferred),
                     "g17::Shared::worker_deferred"
                 ),
-                follows_submitter: m5,
+                render_collector <- new_mutex!(render_collector, "g17::Shared::render_collector"),
+                follows_submitter,
                 pin_scheduler_cluster: m5 && id.num_dies > 1,
                 submitter: AtomicU32::new(u32::MAX),
                 grow <- new_work!("g17::Shared::grow"),
@@ -1865,7 +1926,10 @@ impl Gpu {
                 stop <- new_mutex!((), "g17::Shared::stop"),
                 state <- new_mutex!(None, "g17::Shared::state"),
                 actuators <- new_mutex!(thermal::Actuators::new(), "g17::Shared::actuators"),
-                changed <- new_condvar!("g17::Shared::changed"),
+                changed <- pin_init!(TrackedCondVar {
+                    condvar <- new_condvar!("g17::Shared::changed"),
+                    waiters: AtomicU32::new(0),
+                }),
                 port: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
             }),
             GFP_KERNEL,
