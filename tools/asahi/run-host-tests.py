@@ -79,8 +79,11 @@ ASAHI_TESTS = {
 
     'dcpext26-startup-tests.py': [([], PASS)],
     'iomfb-startup-tests.py': [([], PASS)],
+    'atc-dp-drive-tests.py': [([], PASS)] + mutations(
+        '--mutation', ['eopnotsupp', 'accept-with-rate', 'refuse-drive'], []),
     'dcp-v27-dptx-layout-tests.py': [([], PASS)] + mutations(
-        '--mutation', ['ignore-advertisement', 'ignore-pinned', 'ignore-dcpext'], []),
+        '--mutation', ['ignore-advertisement', 'ignore-pinned', 'ignore-dcpext',
+                       'ignore-typec-routes'], []),
     'dcpext26-wire-tests.py': [([], PASS)],
     'pmp-native26-tests.py': [([], PASS)],
 

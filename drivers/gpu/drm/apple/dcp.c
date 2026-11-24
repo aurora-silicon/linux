@@ -4835,6 +4835,9 @@ static int dcp_ext26_start_services(struct apple_dcp *dcp)
  * whose firmware advertises both of those gets the controller and its ports
  * there.
  *
+ * A primary DCP can also serve external ports when the device tree connects
+ * Type-C display routes to it.
+ *
  * Decided here, not at probe: RTKit is woken at bind, and its endpoint map is
  * known only from then on. Hardware data that names an endpoint keeps it:
  * T8142's dcpext (the same layout), and the T6050 and firmware-27 T6041
@@ -4842,8 +4845,8 @@ static int dcp_ext26_start_services(struct apple_dcp *dcp)
  */
 static void dcp_v27_dptx_layout(struct apple_dcp *dcp)
 {
-	if (dcp->fw_compat != DCP_FIRMWARE_V_27_0 || !dcp->dcpext ||
-	    dcp->hw.dptx_endpoint)
+	if (dcp->fw_compat != DCP_FIRMWARE_V_27_0 ||
+	    (!dcp->dcpext && !dcp->nr_typec_routes) || dcp->hw.dptx_endpoint)
 		return;
 	if (!apple_rtkit_has_endpoint(dcp->rtk, DPTX_CONTROLLER_ENDPOINT) ||
 	    !apple_rtkit_has_endpoint(dcp->rtk, DPTX_ENDPOINT))
