@@ -103,6 +103,8 @@ pub(crate) const GLOBALS_PSTATE_SELECTORS: [usize; 3] = [0x88, 0x8c, 0x98];
 /// after the command time (+0x2c4) and the internal start/end pointers (+0x2cc), the order of
 /// the 13.5 compute command and of the 27.2 render commands (vertex +0x5e4, fragment +0x948).
 pub(crate) const COMPUTE_USER_TIMESTAMPS: usize = 0x2dc;
+/// The 13.5 compute JobParameters1 inside the 27.2 compute command.
+pub(crate) const COMPUTE_JOB_PARAMETERS1: usize = 0x68;
 
 /// The value of a 27.2 Timestamp operation's user word: like the 13.5 and the M3 27.2
 /// operations it names the command's start/end pair of user destinations, not a destination.
@@ -117,6 +119,19 @@ pub(crate) fn user_timestamp_pointer(pair_va: u64, pair: [u64; 2]) -> u64 {
 
 fn put64(b: &mut [u8], at: usize, v: u64) {
     b[at..at + 8].copy_from_slice(&v.to_le_bytes());
+}
+
+fn put32(b: &mut [u8], at: usize, v: u32) {
+    b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+}
+
+/// Writes a compute helper program (binary: USC offset | 1, data, configuration) into the
+/// 13.5 JobParameters1 of a 27.2 compute command, at the places the 13.5 G14 compute path
+/// fills: program +0x40, argument +0x48, configuration +0x50.
+pub(crate) fn encode_compute_helper(cmd: &mut [u8], binary: u32, data: u64, config: u32) {
+    put32(cmd, COMPUTE_JOB_PARAMETERS1 + 0x40, binary);
+    put64(cmd, COMPUTE_JOB_PARAMETERS1 + 0x48, data);
+    put32(cmd, COMPUTE_JOB_PARAMETERS1 + 0x50, config);
 }
 
 /// Writes the user timestamp pair of a zeroed 27.2 compute command at `cmd_va` and returns the
@@ -248,6 +263,18 @@ mod tests {
     fn free(at: usize, len: usize) -> bool {
         at + len <= COMPUTE_COMMAND_BYTES
             && COMPUTE_WRITES.iter().all(|&(o, l)| o + l <= at || at + len <= o)
+    }
+
+    #[test]
+    fn the_compute_helper_lands_in_free_job_parameters() {
+        let mut cmd = [0u8; COMPUTE_COMMAND_BYTES];
+        encode_compute_helper(&mut cmd, 0x1235, 0x11_2233_4400, 0x7_0000);
+        let read64 = |at: usize| u64::from_le_bytes(cmd[at..at + 8].try_into().unwrap());
+        let read32 = |at: usize| u32::from_le_bytes(cmd[at..at + 4].try_into().unwrap());
+        assert_eq!((read32(0xa8), read64(0xb0), read32(0xb8)), (0x1235, 0x11_2233_4400, 0x7_0000));
+        for (at, len) in [(0xa8, 4), (0xb0, 8), (0xb8, 4)] {
+            assert!(free(at, len));
+        }
     }
 
     #[test]

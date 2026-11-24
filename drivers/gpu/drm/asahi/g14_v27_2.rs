@@ -705,6 +705,7 @@ impl Runtime {
             usc_base: control.usc_base,
             preempt,
             timestamps: packet.timestamp_addresses(index),
+            helper: control.helper,
         };
         let command = state.pool.encode(slot, &state.queue, stamp.raw(), &job)?;
         let submission = state.root.stage_compute(command)?;

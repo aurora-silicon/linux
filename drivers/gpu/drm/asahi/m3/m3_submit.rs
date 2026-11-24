@@ -318,6 +318,10 @@ pub(crate) struct Queue {
     /// for every sample count and layer count. Otherwise only the single-sample,
     /// single-layer compressed depth layout is admitted.
     zls_compression_all_layouts:bool,
+    /// Whether this queue's command builders encode the render sampler heap and the render and
+    /// compute helper programs, in the 13.5 places. Otherwise they are refused: the M3 26.x
+    /// commands stream their sampler state and carry no helper.
+    samplers_and_helpers:bool,
     urgency:u8,
 }
 impl Queue {
@@ -331,7 +335,7 @@ impl Queue {
             1=>sched::Priority::High,0=>sched::Priority::Kernel,_=>return Err(EINVAL)};
         Ok(Self {entity:sched::Entity::new(&scheduler,priority)?,_scheduler:scheduler,
             shared:Sink::M3(shared),vm,usc,fences:FenceContexts::new(1,c_str!("asahi_m3_queue"),kernel::static_lock_class!())?,
-            early_tiling,wide_visibility,zls_compression_all_layouts:false,urgency,preempt_alloc:None,
+            early_tiling,wide_visibility,zls_compression_all_layouts:false,samplers_and_helpers:false,urgency,preempt_alloc:None,
             #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
             render_queue: None})
     }
@@ -350,6 +354,10 @@ impl Queue {
             // The G14 render command carries the depth and stencil load, store and partial
             // compression words in every layout (g14_v27_2_render.rs).
             zls_compression_all_layouts:true,
+            // Its render commands carry the sampler heap and both helper programs, and its
+            // compute command the 13.5 compute JobParameters1 with the helper
+            // (g14_v27_2_render.rs, gpu/v27_2.rs).
+            samplers_and_helpers:true,
             urgency,preempt_alloc:Some((ualloc_priv,preempt_bytes)),
             render_queue: Some(render_queue)})
     }
@@ -362,7 +370,7 @@ impl queue::Queue for Queue {
         while let Some(command)=parser.next_hardware().map_err(|_|EINVAL)? {
             if let agx_uapi::ParsedHardwareCommand::Render{payload,vertex_attachments,fragment_attachments,..}=command {
                 if let Err(e)=validate_render(payload,self.usc,&AddressSpace(&self.vm),self.early_tiling,
-                    self.zls_compression_all_layouts) {
+                    self.zls_compression_all_layouts,self.samplers_and_helpers) {
                     pr_err!("M3 render rejected {:?}: flags={:#x} size={}x{} layers={} samples={} utile={}x{} sample_size={} depth={:#x} stencil={:#x} zls={:#x} samplers={} heap={:#x}\n",e,payload.flags,payload.width,payload.height,payload.layers,payload.samples,payload.utile_width,payload.utile_height,payload.sample_size,payload.depth.base,payload.stencil.base,payload.zls_control,payload.sampler_count,payload.sampler_heap);
                     return Err(e);
                 }
@@ -390,6 +398,9 @@ impl queue::Queue for Queue {
             // The common translator validates the original command/attachment
             // addresses; this M3 scheduling hint changes none of them.
             payload.flags &= !wide;
+            // The common translator refuses helpers; a queue that encodes one takes it here.
+            let empty=agx_uapi::UapiHelperProgram{binary:0,config:0,data:0};
+            let helper=if self.samplers_and_helpers {core::mem::replace(&mut payload.helper,empty)} else {empty};
             render_attachments.push([crate::m3::agx_attachments::Attachments::EMPTY;2],GFP_KERNEL)?;
             flushes.push(encode_attachments(&self.vm,&attachments)?,GFP_KERNEL)?;
             let c=agx_uapi::translate_compute_command(payload,attachments,
@@ -405,7 +416,7 @@ impl queue::Queue for Queue {
             }
             timestamps.push([Destination::resolve(objects,payload.timestamps.start)?,
                 Destination::resolve(objects,payload.timestamps.end)?,None,None],GFP_KERNEL)?;
-            commands.push(Command::Compute(crate::m3::agx_compute::Control{base:c.control_stream_base,end:c.control_stream_end,usc_base:self.usc}),GFP_KERNEL)?;
+            commands.push(Command::Compute(crate::m3::agx_compute::Control{base:c.control_stream_base,end:c.control_stream_end,usc_base:self.usc,helper}),GFP_KERNEL)?;
         }
         parser.finish().map_err(|_|EINVAL)?;
         let preempt=match &self.preempt_alloc {
@@ -449,7 +460,7 @@ fn encode_attachments(vm: &mmu::Vm, list: &agx_uapi::UapiAttachmentList)
 }
 
 fn validate_render(r: agx_uapi::UapiRenderCommand, usc: u64, space: &AddressSpace<'_>,
-    early_tiling: bool, zls_compression_all_layouts: bool) -> Result {
+    early_tiling: bool, zls_compression_all_layouts: bool, samplers_and_helpers: bool) -> Result {
     use agx_uapi::{GpuAddressSpace, GpuAccess};
     if r.sample_size % 8 != 0 {return Err(ENOTSUPP);}
     let empty = agx_uapi::UapiHelperProgram { binary:0, config:0, data:0 };
@@ -459,8 +470,8 @@ fn validate_render(r: agx_uapi::UapiRenderCommand, usc: u64, space: &AddressSpac
     #[cfg(not(CONFIG_DRM_ASAHI_M3_T8122))]
     let stage_scope = { let _ = early_tiling; 0 };
     if r.flags & !(2|16|(1<<18)|stage_scope) != 0 || !matches!(r.samples, 1 | 2 | 4)
-        || r.sampler_count != 0 || r.sampler_heap != 0
-        || r.vertex_helper != empty || r.fragment_helper != empty
+        || (!samplers_and_helpers && (r.sampler_count != 0 || r.sampler_heap != 0
+            || r.vertex_helper != empty || r.fragment_helper != empty))
         || (!zls_compression_all_layouts
             && (r.stencil.compression_base != 0 || r.stencil.compression_stride != 0))
         || r.ppp_control & !0x203 != 0 { return Err(ENOTSUPP); }
@@ -475,6 +486,7 @@ fn validate_render(r: agx_uapi::UapiRenderCommand, usc: u64, space: &AddressSpac
         || u32::from(r.sample_size)*u32::from(r.utile_width)*u32::from(r.utile_height)*u32::from(r.samples)>32768 {
         return Err(EINVAL);
     }
+    agx_uapi::validate_sampler(space, r.sampler_heap, r.sampler_count.into()).map_err(|_| EINVAL)?;
     crate::m3::agx_render_state::compact(r.vdm_base).map_err(|_| EINVAL)?;
     if r.vdm_base & 3 != 0 || !space.covers(r.vdm_base,4,GpuAccess::Read)
         || r.scissor_base == 0 || r.scissor_base & 7 != 0 || !space.covers(r.scissor_base,8,GpuAccess::Read) {

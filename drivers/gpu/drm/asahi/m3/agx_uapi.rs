@@ -574,7 +574,7 @@ impl QueueUscWindow {
     }
 }
 
-fn validate_sampler<A: GpuAddressSpace>(
+pub(crate) fn validate_sampler<A: GpuAddressSpace>(
     address_space: &A,
     heap: u64,
     count: u32,

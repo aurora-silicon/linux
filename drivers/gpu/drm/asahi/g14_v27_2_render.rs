@@ -92,6 +92,8 @@ fn to_cmdbuf(r: &UapiRenderCommand) -> kernel::uapi::drm_asahi_cmd_render {
     c.sample_size_B = r.sample_size;
     c.ppp_ctrl = r.ppp_control;
     c.ppp_multisamplectl = r.multisample_control;
+    // The tiling parameters carry the vertex helper's configuration, as in the 13.5 command.
+    c.vertex_helper.cfg = r.vertex_helper.config;
     c
 }
 
