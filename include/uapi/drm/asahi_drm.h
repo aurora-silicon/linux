@@ -561,6 +561,18 @@ enum drm_asahi_feature {
  */
 #define DRM_ASAHI_FEATURE_COMPUTE_ONLY ((1ULL) << 41)
 
+/*
+ * DRM_ASAHI_FEATURE_USERPTR_NO_MEMLOCK: DRM_IOCTL_ASAHI_GEM_USERPTR does not
+ * charge its pins to the caller's RLIMIT_MEMLOCK; only the GPU memory limits
+ * bound them (see struct drm_asahi_gem_userptr). Kernels that report
+ * DRM_ASAHI_FEATURE_USERPTR without it refuse with ENOMEM a range that
+ * exceeds that limit, unless the caller has CAP_IPC_LOCK, so userspace can
+ * check the limit before it offers imports of arbitrary size. Bit 42 is
+ * reserved for DRM_ASAHI_FEATURE_COMPUTE_MULTI_CHANNEL. A feature bit like
+ * those of enum drm_asahi_feature, defined here like bit 32.
+ */
+#define DRM_ASAHI_FEATURE_USERPTR_NO_MEMLOCK ((1ULL) << 43)
+
 #define DRM_ASAHI_PARAM_GROUP_VM_STATUS 1
 #define DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS 2
 
@@ -2301,10 +2313,12 @@ enum drm_asahi_compute_flags {
 	DRM_ASAHI_COMPUTE_USES_MATRIX = (1L << 16),
 
 	/**
-	 * @DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS: The command neither copies nor
-	 * resets queries, so it cannot observe timestamps the kernel publishes
-	 * for earlier commands and need not wait for that publication. Requires
-	 * DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS.
+	 * @DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS: The command reads and writes no
+	 * timestamp or availability word whose host publication by the kernel
+	 * is still pending for an earlier command, so it need not wait for that
+	 * publication. The command may copy or reset queries whose words are
+	 * all already published, or were never bound for host timestamps.
+	 * Requires DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS.
 	 */
 	DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS = (1L << 17),
 

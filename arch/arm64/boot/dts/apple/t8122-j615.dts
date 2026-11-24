@@ -196,3 +196,12 @@
 &ane {
 	status = "okay";
 };
+
+/*
+ * The Wi-Fi/Bluetooth module's CLKREQ# is wired to the SoC (the J615 ADT gives
+ * the Wi-Fi bridge a CLKREQ function), so the link may use Clock PM and the L1
+ * PM Substates.
+ */
+&port00 {
+	supports-clkreq;
+};
