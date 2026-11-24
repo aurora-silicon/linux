@@ -402,16 +402,29 @@ static int apple_dart_dcp_arena(struct apple_dart_dcp *dcp)
 	return slots >= DCP_DART_SCANOUT_SLOTS ? 0 : -ENOSPC;
 }
 
+/* Legacy firmware trees use an underscore in the SID16 alias. */
+static struct device_node *apple_dart_frontend_node(bool piodma)
+{
+	struct device_node *node;
+
+	if (!piodma)
+		return of_find_node_by_path("disp0");
+
+	node = of_find_node_by_path("disp0-piodma");
+	return node ? node : of_find_node_by_path("disp0_piodma");
+}
+
 /* Snapshot only this consumer's real no-map reservations, before table admission. */
 static int apple_dart_dcp_leaf_regions(struct apple_dart_dcp *dcp)
 {
 	struct device_node *consumer, *node;
-	/* An external display DART's SID16 serves its dcpext's memory. */
-	const char *alias = dcp->sid == 23 || dcp->dart->dispext ?
-		dcp->dart->dcp_instance->dcp : dcp->sid == 0 ? "disp0" : "disp0_piodma";
 	int count, ret = 0;
 
-	consumer = of_find_node_by_path(alias);
+	/* An external display DART's SID16 serves its dcpext's memory. */
+	if (dcp->sid == 23 || dcp->dart->dispext)
+		consumer = of_find_node_by_path(dcp->dart->dcp_instance->dcp);
+	else
+		consumer = apple_dart_frontend_node(dcp->sid != 0);
 	if (!consumer)
 		return -ENODEV;
 	count = of_property_count_u32_elems(consumer, "memory-region");
@@ -769,7 +782,7 @@ snapshot_done:
 	if (ret)
 		return ret;
 
-	alias = of_find_node_by_path(dcp->sid == 0 ? "disp0" : "disp0_piodma");
+	alias = apple_dart_frontend_node(dcp->sid != 0);
 	ret = alias && consumer == alias && of_device_is_available(alias) &&
 		(main_external ||
 		 of_property_read_bool(alias, "apple,j713-inherited-mappings")) ?
@@ -1006,7 +1019,7 @@ static int apple_dart_frontend_prepare(struct apple_dart *dart)
 		ret = apple_dart_dcp_import(dart, i ? 16 : 0, bounds, &borrowed[i]);
 		if (ret)
 			return ret;
-		node = of_find_node_by_path(i ? "disp0_piodma" : "disp0");
+		node = apple_dart_frontend_node(i);
 		ret = node ? apple_dart_frontend_validate(borrowed[i], node) : -ENODEV;
 		of_node_put(node);
 		if (ret)
@@ -1032,7 +1045,7 @@ static ssize_t j713_display_state_show(struct device *dev,
 	if (!dart->frontend[0] || !dart->frontend[1] || !READ_ONCE(dart->iommu.ready))
 		return -ENODEV;
 	for (unsigned int i = 0; i < 2; i++) {
-		struct device_node *node = of_find_node_by_path(i ? "disp0_piodma" : "disp0");
+		struct device_node *node = apple_dart_frontend_node(i);
 
 		status[i] = node ? apple_dart_frontend_validate(dart->frontend[i], node) : -ENODEV;
 		of_node_put(node);

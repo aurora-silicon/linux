@@ -24,7 +24,7 @@
 
 	aliases {
 		/* The loader and the display DART find the PIODMA stream by it. */
-		disp0_piodma = &disp0_piodma;
+		disp0-piodma = &disp0_piodma;
 	};
 
 	/*
