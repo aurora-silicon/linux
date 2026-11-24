@@ -11,6 +11,7 @@
 
 #include "t8122.dtsi"
 #include "t8122-j613-j615.dtsi"
+#include "t8122-j613-qspi.dtsi"
 
 / {
 	compatible = "apple,j615", "apple,t8122", "apple,arm-platform";
@@ -18,6 +19,12 @@
 };
 
 &dcp {
+	/*
+	 * DRM owns swap slots 0 and 1 here. On this panel the indicator
+	 * shows in slot 3; in slot 2 it does not show under the desktop.
+	 */
+	apple,camera-indicator-surface = <3>;
+
 	panel: panel {
 		compatible = "apple,panel-j615", "apple,panel";
 		/* 2880x1864 at 224 ppi; 64 notch rows above the desktop. */
@@ -26,6 +33,10 @@
 		adj-height-mm = <204>;
 		apple,max-brightness = <500>;
 	};
+};
+
+&isp {
+	apple,camera-indicator = <&dcp>;
 };
 
 &wifi0 {
@@ -160,4 +171,12 @@
 &mesa {
 	/* Per-device factory data from this Mac's own iBoot system container. */
 	firmware-name = "apple/mesacal-j615.bin";
+};
+
+/*
+ * The J615 ADT puts the boot NOR and its nvram on QSPIMC, as on the J613.
+ * No NVRAM write entry exists for this board yet: keep it read-only.
+ */
+&nvram_qspi {
+	read-only;
 };

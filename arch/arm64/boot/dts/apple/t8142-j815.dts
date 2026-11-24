@@ -299,6 +299,7 @@
  */
 &smc {
 	hwmon {
+		apple,discover-temperatures;
 		apple,soc-die-keys = "Te04", "Te08", "Te0C", "Te0R",
 				     "Tp00", "Tp04", "Tp0C", "Tp0G", "Tp0O",
 				     "Tp0R", "Tp0X", "Tp0a", "Tp0p", "Tp0u",
@@ -438,88 +439,6 @@
 	status = "okay";
 };
 
-/*
- * Video encoder: ADT ave behind dart-ave (DART + CPUDART). aura hands over the
- * preloaded 26A428 firmware (memory regions, CRCs in /chosen) or disables the
- * node when the ADT has no preload.
- */
-&ps_venc_sys {
-	status = "okay";
-};
-
-&ps_venc_dma {
-	status = "okay";
-};
-
-&ps_venc_pipe4 {
-	status = "okay";
-};
-
-&ps_venc_pipe5 {
-	status = "okay";
-};
-
-&ps_venc_me0 {
-	status = "okay";
-};
-
-&ps_venc_me1 {
-	status = "okay";
-};
-
-&ave_dart0 {
-	status = "okay";
-};
-
-&ave_dart1 {
-	status = "okay";
-};
-
-&ave {
-	status = "okay";
-};
-
-/*
- * The Neural Engine. It stays off until the first request: the firmware is
- * started then, from the preload, and system sleep cycles it cold.
- */
-&ps_ane_sys {
-	status = "okay";
-};
-
-&ane_dart0 {
-	status = "okay";
-};
-
-&ane_dart1 {
-	status = "okay";
-};
-
-&ane_dart2 {
-	status = "okay";
-};
-
-&ane {
-	status = "okay";
-};
-
-/* Both JPEG engines and their DART. */
-&ps_jpg {
-	status = "okay";
-};
-
-&jpeg_dart {
-	status = "okay";
-};
-
-&jpeg0 {
-	status = "okay";
-};
-
-&jpeg1 {
-	status = "okay";
-};
-
 /* The port controllers follow the sleep's command rules (tipd: woken first, read at intervals) */
 &hpm0 {
 	apple,sleep-ssps-rules;
@@ -528,3 +447,30 @@
 &hpm1 {
 	apple,sleep-ssps-rules;
 };
+
+/*
+ * The MagSafe 3 port's PD controller: ADT hpm5 on nub-spmi-a0, SID 8, port-type
+ * 0x11. It has no USB data path, so it gets no connector node; tipd registers a
+ * Type-C port and a power supply for it, as on J714s. The bus is polled on
+ * T8142, so like hpm0 and hpm1 it has no interrupts. Its ADT features-supported
+ * is <3>, "Power In" only: no liquid detection.
+ */
+&nub_spmi_a0 {
+	hpm5: usb-pd@8 {
+		compatible = "apple,sn201202x";
+		reg = <0x8 SPMI_USID>;
+		apple,no-liquid-detection;
+		/* The same sleep rules as hpm0 and hpm1, as the J714s's hpm5 has them. */
+		apple,sleep-ssps-rules;
+	};
+};
+
+#include "t8142-j813-j815-sleep.dtsi"
+
+/*
+ * The external display processors (dispext0/1), their DARTs, the display
+ * crossbars and the USB-C ports' DisplayPort routes: the same two ports and
+ * blocks as the J813. The loader hands both processors over and enables
+ * them; without its hand-off they stay disabled.
+ */
+#include "t8142-j813-dcpext.dtsi"

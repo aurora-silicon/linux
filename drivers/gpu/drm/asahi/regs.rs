@@ -349,6 +349,13 @@ impl Resources<'_> {
             .expect("64-bit read failed!")
     }
 
+    /// The G14 Fender operating-point word: requested index in bits 3:0, request pending in
+    /// bit 4. Sampled while the firmware holds the GPU powered.
+    #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+    pub(crate) fn operating_point(&self) -> u32 {
+        self.sgx_read32::<0xd01000>()
+    }
+
     /// Initialize the MMIO registers for the GPU.
     pub(crate) fn init_mmio(&self) -> Result {
         // Nothing to do for now...
@@ -479,6 +486,16 @@ impl Resources<'_> {
             core_masks,
             core_masks_packed,
         })
+    }
+
+    /// The MMU fault status registers of this GPU core: the status word, the address register
+    /// (`None` where the address is part of the status word) and whether it uses the G14X layout.
+    pub(crate) fn fault_registers(cfg: &'static hw::HwConfig) -> (usize, Option<usize>, bool) {
+        if cfg.gpu_core as u32 >= hw::GpuCore::G14S as u32 {
+            (FAULT_INFO_G14X, Some(FAULT_ADDR_G14X), true)
+        } else {
+            (FAULT_INFO, None, false)
+        }
     }
 
     /// Get the fault information from the MMU status register, if one occurred.
