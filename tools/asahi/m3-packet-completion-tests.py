@@ -108,20 +108,20 @@ TESTS = r"""
 }
 
 #[test]
-fn rejected_bystander_remains_admissible_after_another_vm_faults() {
+fn direct_packet_rejection_leaves_vm_admissible() {
     let guilty = Vm::default();
-    let bystander = Vm::default();
+    let other = Vm::default();
     let faulty = Packet::new(&guilty, true);
-    let rejected = Packet::new(&bystander, false);
+    let rejected = Packet::new(&other, false);
     faulty.finish(Err(EIO));
     rejected.fail_packet(EBUSY);
     assert_eq!(guilty.error.get(), -5);
     assert!(faulty.vm_job.lock().as_ref().unwrap().0.get());
     assert_eq!(rejected.completion.error.get(), -16);
-    assert_eq!(bystander.error.get(), 0);
-    assert!(bystander.submit().is_ok());
+    assert_eq!(other.error.get(), 0);
+    assert!(other.submit().is_ok());
 
-    let later = Packet::new(&bystander, true);
+    let later = Packet::new(&other, true);
     later.retired();
     assert_eq!(later.completion.error.get(), 0);
     assert_eq!(later.completion.signals.get(), 1);
@@ -198,7 +198,7 @@ def main():
             "self.complete(Err(error), false);", "self.complete(Err(error), true);"
         )
     methods = ("release_guard", "retired", "finish", "fail_packet", "complete")
-    extracted = [method(source, f"fn {name}(") for name in methods]
+    extracted = [method(source, f"fn {name}(&self") for name in methods]
     args.out.mkdir(parents=True, exist_ok=True)
     program = args.out / "packet-completion.rs"
     program.write_text(MOCKS + "\n".join(extracted) + TESTS)
