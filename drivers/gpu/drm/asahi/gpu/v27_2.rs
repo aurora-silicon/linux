@@ -117,6 +117,9 @@ fn encode_compute(
     put64(cmd, 0x2a0, q.fw_stamp);
     put32(cmd, 0x2a8, stamp_value);
     put32(cmd, 0x2b0, q.slot);
+    // flush_stamps, as the render commands set it: without it a queue of compute commands
+    // with user timestamps stops retiring.
+    put32(cmd, g14_v27_2_abi::COMPUTE_FLUSH_STAMPS, 1);
     put64(cmd, 0x2cc, timestamps);
     put64(cmd, 0x2d4, timestamps + 8);
     // Command-local dependency latch, enabled with seed 0; the firmware clears 0x10 bytes

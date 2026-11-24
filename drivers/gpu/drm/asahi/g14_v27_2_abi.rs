@@ -103,6 +103,13 @@ pub(crate) const GLOBALS_PSTATE_SELECTORS: [usize; 3] = [0x88, 0x8c, 0x98];
 /// after the command time (+0x2c4) and the internal start/end pointers (+0x2cc), the order of
 /// the 13.5 compute command and of the 27.2 render commands (vertex +0x5e4, fragment +0x948).
 pub(crate) const COMPUTE_USER_TIMESTAMPS: usize = 0x2dc;
+
+/// The 27.2 compute command's JobMeta flush_stamps word, after the completion stamp, firmware
+/// stamp, stamp value and slot (+0x298..+0x2b4); the render commands keep it at the same place
+/// of their JobMeta (vertex +0x5a0, fragment +0x904). Set, the firmware flushes the command's
+/// stamps when it completes; left clear, a compute queue whose commands write user timestamps
+/// stalls with commands fetched but never retired.
+pub(crate) const COMPUTE_FLUSH_STAMPS: usize = 0x2b4;
 /// The 13.5 compute JobParameters1 inside the 27.2 compute command.
 pub(crate) const COMPUTE_JOB_PARAMETERS1: usize = 0x68;
 
@@ -256,7 +263,7 @@ mod tests {
         (0x68, 8), (0x70, 8), (0x78, 8), (0x80, 8), (0x88, 8), (0x90, 8), (0x98, 8), (0xa0, 8),
         (0xc0, 8),
         (0x1e8, 8), (0x1f0, 4), (0x220, 8), (0x228, 8), (0x264, 8), (0x270, 4),
-        (0x298, 0x1c), (0x2c4, 0x18), (0x304, 8), (0x314, 8), (0x334, 0x14),
+        (0x298, 0x20), (0x2c4, 0x18), (0x304, 8), (0x314, 8), (0x334, 0x14),
     ];
 
     /// Whether `len` bytes at `at` fit the command and are none the compute encoder uses.
@@ -275,6 +282,14 @@ mod tests {
         for (at, len) in [(0xa8, 4), (0xb0, 8), (0xb8, 4)] {
             assert!(free(at, len));
         }
+    }
+
+    #[test]
+    fn flush_stamps_follows_the_compute_job_meta_and_misses_the_user_pair() {
+        // The JobMeta words the encoder writes end right before it: slot at +0x2b0.
+        assert_eq!(COMPUTE_FLUSH_STAMPS, 0x2b0 + 4);
+        assert!(COMPUTE_FLUSH_STAMPS + 4 <= COMPUTE_USER_TIMESTAMPS);
+        assert_eq!(COMPUTE_FLUSH_STAMPS % 4, 0);
     }
 
     #[test]
