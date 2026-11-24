@@ -177,6 +177,10 @@ ASAHI_TESTS = {
                                    'missing-control-firmware', 'missing-control-descriptor',
                                    'missing-owner-ipc', 'missing-owner-firmware',
                                    'missing-owner-descriptor', 'missing-owner-arena'), out()),
+    # A fixed (non-Type-C) output takes its DP AV service again after a sleep.
+    'dpavserv-admission-tests.py': [([], PASS)]
+        + mutations('--mutation', ('old-cable-wait', 'ignore-generation', 'ignore-cable',
+                                     'ignore-quiescing'), []),
     'dcp-bw-scratch-window-tests.py': [([], PASS)] + mutations('--mutation', ('old-check', 'start-only'), []),
     'clpc-gpu-demand-tests.py': [([], PASS)],
     'clpc-high-power-cleanup-tests.py': [(out(), PASS),
