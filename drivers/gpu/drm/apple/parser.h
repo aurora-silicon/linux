@@ -163,6 +163,11 @@ struct dcp_display_mode {
 	bool firmware_preferred;
 	/* An SDR color element that is neither unsafe nor DSC only */
 	bool sdr_usable;
+	/*
+	 * An SDR color element the firmware lists as unsafe, but not DSC
+	 * only, outside the external SDR path
+	 */
+	bool sdr_unsafe;
 	/* The firmware score of the timing */
 	s64 score;
 	/* The sync polarity flags of the timing, if it reports them */
@@ -202,6 +207,7 @@ bool dcp_property_complete(const void *blob, size_t received, size_t advertised)
 #if IS_ENABLED(CONFIG_KUNIT)
 bool dcp_mode_default_above(const struct dcp_display_mode *mode, s64 score,
 			    const struct dcp_display_mode *best, s64 best_score);
+bool dcp_mode_default_candidate(const struct dcp_display_mode *m);
 bool dcp_mode_ranks_above(bool preferred, s64 score, bool best_preferred,
 			  s64 best_score);
 #endif
