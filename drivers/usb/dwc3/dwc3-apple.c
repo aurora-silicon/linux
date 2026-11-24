@@ -2204,6 +2204,8 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 	appledwc->dev = &pdev->dev;
 	appledwc->fixed_hub = dwc3_apple_has_fixed_hub(dev, &appledwc->hub_port);
 	appledwc->hw = of_device_get_match_data(dev);
+	if (!appledwc->hw)
+		return -ENODEV;
 	appledwc->host_only = dwc3_apple_host_only(appledwc->hw);
 	appledwc->dt_dis_u3_susphy = device_property_read_bool(dev, "snps,dis_u3_susphy_quirk");
 	appledwc->sleep_ddr = device_property_read_bool(dev, "apple,sleep-ddr");

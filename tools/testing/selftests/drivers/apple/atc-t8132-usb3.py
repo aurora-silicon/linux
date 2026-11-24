@@ -752,17 +752,18 @@ static const void *of_device_get_match_data(struct device *d)
 static bool device_property_read_bool(struct device *d,const char *name) { (void)d;(void)name;return false; }
 static void spin_lock_init(int *p) { *p=0; }
 static void device_enable_async_suspend(struct device *d) { (void)d; }
-static void publish_owner(struct platform_device *pdev,struct dwc3_apple *appledwc)
+static int publish_owner(struct platform_device *pdev,struct dwc3_apple *appledwc)
 {
     struct device *dev=&pdev->dev;
 ''' + prefix + r'''
+    return 0;
 }
 static struct atcphy_hw hw={ATCPHY_GENERATION_T8132};
 static struct phy ss={0},hs={1};
 static void init(struct platform_device *p,struct dwc3_apple *a)
 {
     memset(p,0,sizeof(*p));memset(a,0,sizeof(*a));
-    p->dev.of_node="apple,t8132-dwc3";publish_owner(p,a);
+    p->dev.of_node="apple,t8132-dwc3";assert(!publish_owner(p,a));
     a->state=DWC3_APPLE_PROBE_PENDING;a->dwc.num_usb3_ports=a->dwc.num_usb2_ports=1;
     a->dwc.usb3_generic_phy[0]=&ss;a->dwc.usb2_generic_phy[0]=&hs;
     atc=(struct apple_atcphy){.hw=&hw,.t8132_ss=true,.pipe_state=ATCPHY_PIPEHANDLER_STATE_DUMMY};
