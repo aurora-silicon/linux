@@ -552,6 +552,15 @@ enum drm_asahi_feature {
  */
 #define DRM_ASAHI_FEATURE_VDM_USC_INVALIDATE ((1ULL) << 40)
 
+/*
+ * DRM_ASAHI_FEATURE_COMPUTE_ONLY: the device runs compute commands only.
+ * DRM_ASAHI_CMD_RENDER is refused, so the device cannot serve graphics APIs;
+ * userspace should not offer it for them. Compute commands, the VM and GEM
+ * interfaces are unaffected. A feature bit like those of enum
+ * drm_asahi_feature, defined here like bit 32.
+ */
+#define DRM_ASAHI_FEATURE_COMPUTE_ONLY ((1ULL) << 41)
+
 #define DRM_ASAHI_PARAM_GROUP_VM_STATUS 1
 #define DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS 2
 
