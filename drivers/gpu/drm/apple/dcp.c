@@ -11726,6 +11726,9 @@ void dcp_unregister(void)
 {
 	platform_driver_unregister(&apple_platform_driver);
 	dcp_t6041_unmap_power();
+	/* The phandle dcp_t6041_note_power() took and kept, now that no DCP is left. */
+	of_node_put(dcp_t6041_power_np);
+	dcp_t6041_power_np = NULL;
 }
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST)
