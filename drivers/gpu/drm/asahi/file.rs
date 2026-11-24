@@ -585,8 +585,13 @@ impl File {
         gpu.get_params(&mut params)?;
 
         params.features |= gpu.feature_flags();
+        // Every backend admits the USC cache invalidate in the VDM root barrier.
+        params.features |= uapi::DRM_ASAHI_FEATURE_VDM_USC_INVALIDATE as u64;
         if Self::supports_user_memory(reg_data) {
-            params.features |= uapi::DRM_ASAHI_FEATURE_USERPTR as u64;
+            // GEM_USERPTR pins are bounded by the GPU memory ledger only, not by
+            // RLIMIT_MEMLOCK (UserPages::pin()).
+            params.features |= uapi::DRM_ASAHI_FEATURE_USERPTR as u64
+                | uapi::DRM_ASAHI_FEATURE_USERPTR_NO_MEMLOCK as u64;
         }
         if Self::supports_residency_control(reg_data) {
             params.features |= uapi::DRM_ASAHI_FEATURE_GEM_RESIDENCY as u64;
@@ -1665,7 +1670,9 @@ impl File {
             cls_pr_debug!(Errors, "queue_create: Invalid arguments\n");
             return Err(EINVAL);
         }
-        if data.flags != 0 || data.priority > uapi::drm_asahi_priority_DRM_ASAHI_PRIORITY_REALTIME {
+        if data.flags & !uapi::drm_asahi_queue_create_flags_DRM_ASAHI_QUEUE_CREATE_ASYNC_SUBMIT != 0
+            || data.priority > uapi::drm_asahi_priority_DRM_ASAHI_PRIORITY_REALTIME
+        {
             cls_pr_debug!(Errors, "queue_create: Invalid arguments\n");
             return Err(EINVAL);
         }
@@ -1738,6 +1745,9 @@ impl File {
         queue.reserve_render_scs(data.render_scs_layout)?;
         if data.compute_timeout_ms != 0 {
             data.compute_timeout_ms = queue.set_compute_timeout(data.compute_timeout_ms)?;
+        }
+        if data.flags & uapi::drm_asahi_queue_create_flags_DRM_ASAHI_QUEUE_CREATE_ASYNC_SUBMIT != 0 {
+            queue.set_async_submit()?;
         }
 
         data.queue_id = resv.index().try_into()?;

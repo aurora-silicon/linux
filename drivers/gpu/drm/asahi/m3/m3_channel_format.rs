@@ -7,6 +7,30 @@ use super::m3_init_layout::Error;
 pub(crate) const CONTROL_BYTES: usize = 64;
 pub(crate) const RECEIVE_BYTES: usize = 72;
 pub(crate) const SLOTS: u32 = 256;
+pub(crate) const SUBMISSION_BYTES: usize = 0x18;
+/// Two firmware engine classes for each of the three data masters.
+pub(crate) const ENGINE_CLASSES: u32 = 6;
+
+/// Submission-channel wire entry. The M3 runtime writes it for both of its
+/// profiles (14.8.3 Legacy and 26.6.2 Extended) through `m3_config::submit_queue`,
+/// which has no per-profile layout; the G14G firmware-27.2 path (26B123) writes the
+/// same entry. The caller owns the queue and publishes its contents before
+/// advancing the channel's shared write index.
+pub(crate) fn submission_entry(
+    selector: u32, queue: u64, position: u16, stamp: u8, first: bool,
+) -> Result<[u8; SUBMISSION_BYTES], Error> {
+    if selector > 2 {
+        return Err(Error::Bounds);
+    }
+    let mut entry = [0; SUBMISSION_BYTES];
+    entry[8..16].copy_from_slice(&queue.to_le_bytes());
+    entry[16..20].copy_from_slice(&selector.to_le_bytes());
+    entry[20..22].copy_from_slice(&position.to_le_bytes());
+    entry[22] = stamp;
+    entry[23] = u8::from(first);
+    Ok(entry)
+}
+
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Action {
@@ -161,6 +185,18 @@ mod tests {
         }
         assert_eq!(payload_offset(8, 0x101), Ok((8 * 256 + 1) * 0xd8));
         assert!(payload_offset(9, 0).is_err());
+    }
+
+    #[test]
+    fn first_and_reused_compute_entries_match_the_26b123_wire_format() {
+        let expected = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0x40, 0x12, 0x34, 0xa0, 0xff, 0xff,
+                        0xff, 2, 0, 0, 0, 0x23, 1, 7, 1];
+        let queue = 0xffff_ffa0_3412_4000;
+        assert_eq!(submission_entry(2, queue, 0x123, 7, true).unwrap(), expected);
+        let reused = submission_entry(2, queue, 0x123, 7, false).unwrap();
+        assert_eq!(&reused[..23], &expected[..23]);
+        assert_eq!(reused[23], 0);
+        assert!(submission_entry(3, queue, 0, 0, true).is_err());
     }
 
     #[test]

@@ -398,7 +398,13 @@ static int iomfb_enqueue_opaque_x(struct apple_dcp *dcp)
 	struct iomfb_opaque_x_transaction *opaque;
 
 	lockdep_assert_held(&dcp->iomfb.lock);
-	/* DCPEXT rejects enableGPAlphaDiv; retain the panel-only workaround. */
+	/*
+	 * H17P blends the X byte of an XRGB surface as alpha; this property
+	 * makes the panel pipe take it as opaque. It is sent to panels only:
+	 * the H17P external controller answers it with status 4, which
+	 * iomfb_opaque_x_complete() treats as fatal, and native26 external
+	 * pipes keep their own presentation path.
+	 */
 	if (dcp->hw.iomfb_method_profile ==
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL || dcp_is_ext26(dcp))
 		return 0;
@@ -2423,6 +2429,14 @@ u64 dcp_modes_transfer_begin(struct apple_dcp *dcp)
  * catalog, except on H17P external, which publishes an empty one. A
  * transfer started before the current attachment is never published.
  */
+static bool dcp_sdr_default_rgb(struct apple_dcp *dcp)
+{
+	return dcp->fw_compat == DCP_FIRMWARE_V_27_0 && !dcp_has_panel(dcp);
+}
+
+static const struct dcp_display_mode *
+dcp_find_mode(struct apple_dcp *dcp, const struct drm_display_mode *mode);
+
 int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *ctx,
 		      u64 generation)
 {
@@ -2455,9 +2469,14 @@ int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *ctx,
 		if (ret)
 			return ret;
 		ctx->metadata_timing = dcp_firmware_metadata_enabled(dcp);
-		ctx->sdr_default_rgb = dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
-				       !dcp_has_panel(dcp);
-		ctx->pq_dsc = dcp->fw_compat == DCP_FIRMWARE_V_27_0;
+		ctx->sdr_default_rgb = dcp_sdr_default_rgb(dcp);
+		/*
+		 * The template sends a timing and colour ID to DCP. It can
+		 * select an entry the timing lists as needing DSC, just as
+		 * for SDR. The parser still rejects unsafe PQ entries.
+		 */
+		ctx->pq_dsc = READ_ONCE(dcp->iomfb_template_pq) &&
+			      !dcp_has_panel(dcp);
 	}
 	ctx->zero_vrr_range_fallback = dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP;
 	ctx->internal_present_deadline = dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP;
@@ -2997,15 +3016,15 @@ static int dcp_desktop_modeset(struct apple_dcp *dcp,
 			       struct drm_crtc_state *crtc_state)
 {
 	struct dcp_desktop_state *d = dcp->desktop;
-	struct dcp_display_mode matched;
+	const struct dcp_display_mode *matched;
 
 	if (d->trial_modeset_ok) {
 		d->trial_modeset_ok = false;
 		/* The trial installed a VRR timing variable too (see the mode set). */
 		if (d->mode_live &&
-		    lookup_mode(dcp, &crtc_state->mode, &matched) &&
-		    matched.timing_mode_id == d->trial_timing_mode_id &&
-		    matched.color_mode_id == d->trial_color_mode_id) {
+		    (matched = dcp_find_mode(dcp, &crtc_state->mode)) &&
+		    matched->timing_mode_id == d->trial_timing_mode_id &&
+		    matched->color_mode_id == d->trial_color_mode_id) {
 			dev_dbg(dcp->dev, "keeping the takeover mode " DRM_MODE_FMT "\n",
 				DRM_MODE_ARG(&crtc_state->mode));
 			return 0;
@@ -3030,20 +3049,26 @@ MODULE_PARM_DESC(takeover_adopt,
 static int dcp_takeover_adopt(struct apple_dcp *dcp, const struct drm_display_mode *m)
 {
 	struct dcp_desktop_state *d = dcp->desktop;
-	struct dcp_display_mode sel;
+	const struct dcp_display_mode *sel = dcp_find_mode(dcp, m);
 
-	if (!lookup_mode(dcp, m, &sel))
+	if (!sel)
 		return -ENOENT;
-	dcp->mode = (struct dcp_set_digital_out_mode_req) {
-		.color_mode_id = sel.color_mode_id,
-		.timing_mode_id = sel.timing_mode_id,
-	};
-	dcp->use_timestamps = sel.needs_timestamps;
-	dcp->vrr_enabled = false;
+	scoped_guard(spinlock_irqsave, &dcp->hdr.lock) {
+		dcp->mode = (struct dcp_set_digital_out_mode_req) {
+			.color_mode_id = sel->color_mode_id,
+			.timing_mode_id = sel->timing_mode_id,
+		};
+		if (dcp_default_sdr_color(sel, &dcp->active_color))
+			dcp->active_color.score = -1;
+		dcp->output_pq = false;
+		dcp->output_hdr = false;
+		dcp->vrr_enabled = false;
+	}
+	dcp->use_timestamps = sel->needs_timestamps;
 	d->mode_live = true;
 	d->takeover_adopted = true;
 	dev_info(dcp->dev, "takeover: adopting the live mode (color:%u timing:%u) " DRM_MODE_FMT "\n",
-		 sel.color_mode_id, sel.timing_mode_id, DRM_MODE_ARG(m));
+		 sel->color_mode_id, sel->timing_mode_id, DRM_MODE_ARG(m));
 	return 0;
 }
 
@@ -3179,18 +3204,14 @@ out:
 }
 
 /*
- * PQ output goes through the IOMFB template's mode set, which picks the
- * timing's PQ element (see dcp_display_mode.pq): the desktop 26.x firmware,
- * the external H17P processor and the firmware 27 external processors.  The
- * other processors, and the firmware 27 panel, keep SDR.
+ * The template chooses a PQ colour ID and tags the surfaces. The caller
+ * checks for that ID in the current timing catalogue. Panels keep their
+ * existing SDR/EDR path, with the desktop template retaining PQ support.
  */
 static bool dcp_hdr_output_supported(struct apple_dcp *dcp)
 {
-	if (iomfb_is_m4(dcp))
-		return false;
-	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
-	       dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL ||
-	       (dcp->fw_compat == DCP_FIRMWARE_V_27_0 && !dcp_has_panel(dcp));
+	return READ_ONCE(dcp->iomfb_template_pq) &&
+	       (!dcp_has_panel(dcp) || dcp->desktop);
 }
 
 /*
@@ -3253,20 +3274,66 @@ static bool dcp_crtc_bt2020(struct apple_dcp *dcp, struct drm_crtc *crtc,
 	return conn_state && conn_state->colorspace == DRM_MODE_COLORIMETRY_BT2020_RGB;
 }
 
-/*
- * HDR10 static metadata is link state on the external processors: a link
- * set up again (mode set, power off) starts without it.
- */
+static void dcp_hdr_reset_locked(struct apple_dcp *dcp)
+{
+	lockdep_assert_held(&dcp->hdr.lock);
+	dcp->hdr.generation++;
+	dcp->hdr.sent_valid = false;
+	dcp->hdr.infoframe = false;
+}
+
+void dcp_hdr_service_bind(struct apple_epic_service *service)
+{
+	struct apple_dcp *dcp = service->ep->dcp;
+	struct apple_epic_service *old;
+
+	service = afk_service_get(service);
+	if (!service)
+		return;
+	scoped_guard(spinlock_irqsave, &dcp->hdr.lock) {
+		old = dcp->hdr.service;
+		WRITE_ONCE(dcp->hdr.service, service);
+		dcp_hdr_reset_locked(dcp);
+	}
+	if (old)
+		afk_service_put(old);
+}
+
+void dcp_hdr_service_unbind(struct apple_epic_service *service)
+{
+	struct apple_dcp *dcp = service->ep->dcp;
+	bool owned;
+
+	scoped_guard(spinlock_irqsave, &dcp->hdr.lock) {
+		owned = dcp->hdr.service == service;
+		if (owned) {
+			WRITE_ONCE(dcp->hdr.service, NULL);
+			dcp_hdr_reset_locked(dcp);
+		}
+	}
+	if (owned)
+		afk_service_put(service);
+}
+
+/* A link set up again starts without the previous HDR10 metadata. */
 void dcp_hdr_metadata_forget(struct apple_dcp *dcp)
 {
-	struct dcp_desktop_state *d = dcp->desktop;
+	guard(spinlock_irqsave)(&dcp->hdr.lock);
+	dcp_hdr_reset_locked(dcp);
+}
 
-	if (!d)
-		return;
-	scoped_guard(spinlock_irqsave, &d->hdr_lock) {
-		d->hdr_sent_valid = false;
-		d->hdr_infoframe = false;
-	}
+static int dcp_hdr_send(struct apple_epic_service *service,
+			const void *msg, size_t msg_len,
+			void *reply, size_t reply_len,
+			u32 *retcode, size_t *received)
+{
+	if (service->ep->wire_v2)
+		return afk_send_command_len(service, EPIC_SUBTYPE_STD_SERVICE,
+					    msg, msg_len, reply, reply_len,
+					    retcode, received);
+	return afk_send_command_with_reply_len(service, EPIC_SUBTYPE_STD_SERVICE,
+					       msg, msg_len, reply, reply_len,
+					       retcode, received);
 }
 
 /*
@@ -3277,33 +3344,34 @@ void dcp_hdr_metadata_forget(struct apple_dcp *dcp)
  */
 static void dcp_hdr_infoframe_stop(struct apple_dcp *dcp)
 {
-	struct dcp_desktop_state *d = dcp->desktop;
 	struct apple_epic_service *service = NULL;
 	u8 msg[DCP_HDR_STOP_SIZE], reply[DCP_HDR_STOP_SIZE] = {};
 	size_t received = 0;
+	u64 generation;
 	u32 retcode = 0;
 	int ret;
 
-	if (!d || READ_ONCE(dcp->crashed))
+	if (READ_ONCE(dcp->crashed))
 		return;
-	scoped_guard(spinlock_irqsave, &d->hdr_lock)
-		if (d->hdr_infoframe)
-			service = afk_service_get(d->av_service);
+	scoped_guard(spinlock_irqsave, &dcp->hdr.lock) {
+		generation = dcp->hdr.generation;
+		if (dcp->hdr.infoframe)
+			service = afk_service_get(dcp->hdr.service);
+	}
 	if (!service)
 		return;
 
 	dcp_hdr_stop_message(msg);
-	ret = afk_send_command_with_reply_len(service, EPIC_SUBTYPE_STD_SERVICE,
-					      msg, sizeof(msg), reply, sizeof(reply),
-					      &retcode, &received);
+	ret = dcp_hdr_send(service, msg, sizeof(msg), reply, sizeof(reply),
+			   &retcode, &received);
 	ret = dcp_hdr_stop_reply(ret, retcode, reply, received);
 	if (ret)
 		dev_warn(dcp->dev, "HDR InfoFrame not stopped: %d\n", ret);
 	else
 		dev_dbg(dcp->dev, "HDR InfoFrame stopped\n");
-	scoped_guard(spinlock_irqsave, &d->hdr_lock)
-		if (d->av_service == service)
-			d->hdr_infoframe = false;
+	scoped_guard(spinlock_irqsave, &dcp->hdr.lock)
+		if (dcp->hdr.service == service && dcp->hdr.generation == generation)
+			dcp->hdr.infoframe = false;
 	afk_service_put(service);
 }
 
@@ -3312,8 +3380,8 @@ bool dcp_hdr_metadata_live(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
-	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
-	       !dcp_has_panel(dcp);
+	return READ_ONCE(dcp->iomfb_template_pq) && !dcp_has_panel(dcp) &&
+	       (dcp->desktop || READ_ONCE(dcp->hdr.service));
 }
 
 /*
@@ -3354,98 +3422,125 @@ static void dcp_edr_sync(struct apple_dcp *dcp, struct drm_crtc *crtc,
 static void dcp_hdr_metadata_sync(struct apple_dcp *dcp, struct drm_crtc *crtc,
 				  struct drm_atomic_commit *commit)
 {
-	struct dcp_desktop_state *d = dcp->desktop;
-	const struct drm_connector_state *conn_state = NULL;
-	struct drm_connector_state *state;
-	struct drm_connector *connector;
+	const struct drm_connector_state *conn_state;
 	struct apple_epic_service *service;
 	u8 data[DCP_HDR_DATA_SIZE], msg[DCP_HDR_MSG_SIZE];
 	u8 reply[DCP_HDR_MSG_SIZE] = {};
 	size_t received = 0;
+	u64 generation;
 	u32 retcode = 0;
 	bool same;
-	int i, ret;
+	int transport, ret;
 
-	if (!d || !dcp->output_pq || READ_ONCE(dcp->crashed) ||
+	if (!dcp->output_hdr || READ_ONCE(dcp->crashed) ||
 	    !dcp_hdr_metadata_live(to_apple_crtc(crtc)->dcp))
 		return;
-	for_each_new_connector_in_state(commit, connector, state, i)
-		if (state->crtc == crtc)
-			conn_state = state;
-	if (!conn_state && dcp->connector && dcp->connector->base.state &&
-	    dcp->connector->base.state->crtc == crtc)
-		conn_state = dcp->connector->base.state;
+	conn_state = dcp_crtc_connector_state(dcp, crtc, commit);
 	if (!conn_state || !conn_state->hdr_output_metadata ||
 	    conn_state->hdr_output_metadata->length != sizeof(struct hdr_output_metadata))
 		return;
 	if (((const struct hdr_output_metadata *)conn_state->hdr_output_metadata->data)
-		    ->hdmi_metadata_type1.eotf != HDMI_EOTF_SMPTE_ST2084 ||
+		    ->hdmi_metadata_type1.eotf == HDMI_EOTF_TRADITIONAL_GAMMA_SDR ||
 	    dcp_hdr_data(data, conn_state->hdr_output_metadata->data))
 		return;
 
 	/* Most frames change nothing: compare before pinning the service. */
-	scoped_guard(spinlock_irqsave, &d->hdr_lock) {
-		same = d->hdr_sent_valid && !memcmp(d->hdr_sent, data, sizeof(data));
-		service = same ? NULL : afk_service_get(d->av_service);
+	scoped_guard(spinlock_irqsave, &dcp->hdr.lock) {
+		generation = dcp->hdr.generation;
+		same = dcp->hdr.sent_valid && !memcmp(dcp->hdr.sent, data, sizeof(data));
+		service = same ? NULL : afk_service_get(dcp->hdr.service);
 	}
 	if (!service)
 		return;
 
 	dcp_hdr_message(msg, data);
-	ret = afk_send_command_with_reply_len(service, EPIC_SUBTYPE_STD_SERVICE,
-					      msg, sizeof(msg), reply, sizeof(reply),
-					      &retcode, &received);
-	ret = dcp_hdr_reply(ret, retcode, reply, received);
-	/*
-	 * A block the firmware refused is not sent again on every frame (the
-	 * command is synchronous): only a new block, a new mode set or a new
-	 * service instance retries.
-	 */
+	transport = dcp_hdr_send(service, msg, sizeof(msg), reply, sizeof(reply),
+				 &retcode, &received);
+	ret = dcp_hdr_reply(transport, retcode, reply, received);
 	if (ret)
 		dev_warn_ratelimited(dcp->dev, "HDR static metadata not taken: %d\n", ret);
 	else
 		dev_dbg(dcp->dev, "HDR static metadata: MaxCLL %u MaxFALL %u mastering %u/%u\n",
 			get_unaligned_le16(data + 20), get_unaligned_le16(data + 22),
 			get_unaligned_le16(data + 16), get_unaligned_le16(data + 18));
-	scoped_guard(spinlock_irqsave, &d->hdr_lock) {
-		if (d->av_service == service) {
-			memcpy(d->hdr_sent, data, sizeof(data));
-			d->hdr_sent_valid = true;
+	scoped_guard(spinlock_irqsave, &dcp->hdr.lock) {
+		if (dcp->hdr.service == service && dcp->hdr.generation == generation) {
+			/* Without a valid reply, the previous block may no longer be active. */
+			dcp->hdr.sent_valid = !transport && ret != -EPROTO;
+			if (dcp->hdr.sent_valid)
+				memcpy(dcp->hdr.sent, data, sizeof(data));
 			if (!ret)
-				d->hdr_infoframe = true;
+				dcp->hdr.infoframe = true;
 		}
 	}
 	afk_service_put(service);
 }
 
-/* Only an SDR or a PQ signal, and PQ only where the timing has an element. */
+static void dcp_crtc_color_request(struct apple_dcp *dcp, struct drm_crtc *crtc,
+				   struct drm_atomic_commit *commit,
+				   struct dcp_color_request *req)
+{
+	const struct drm_connector_state *conn_state =
+		dcp_crtc_connector_state(dcp, crtc, commit);
+
+	*req = (struct dcp_color_request) {
+		.eotf = dcp_crtc_eotf(dcp, crtc, commit),
+		.colorspace = conn_state ? conn_state->colorspace :
+					   DRM_MODE_COLORIMETRY_DEFAULT,
+		.color_format = conn_state ? conn_state->color_format :
+					     DRM_CONNECTOR_COLOR_FORMAT_AUTO,
+		.broadcast_rgb = conn_state ? conn_state->hdmi.broadcast_rgb :
+					      DRM_HDMI_BROADCAST_RGB_AUTO,
+		.max_bpc = conn_state ? conn_state->max_requested_bpc : 0,
+		.allow_hdr = dcp_hdr_output_supported(dcp),
+		.allow_dsc = READ_ONCE(dcp->iomfb_template_pq) && !dcp_has_panel(dcp),
+		.allow_unsafe_sdr = dcp->hw.iomfb_method_profile !=
+				    DCP_IOMFB_METHODS_H17P_EXTERNAL,
+		.default_rgb = dcp_sdr_default_rgb(dcp),
+	};
+}
+
+/* Validate requested EOTF, colorspace, format, range and bpc against the timing. */
 int dcp_crtc_check_hdr(struct apple_dcp *dcp, struct drm_crtc *crtc,
 		       struct drm_atomic_commit *commit)
 {
 	struct drm_crtc_state *crtc_state = drm_atomic_get_new_crtc_state(commit, crtc);
-	struct dcp_display_mode mode;
+	struct dcp_color_request req;
+	struct dcp_color_mode selected;
+	const struct dcp_display_mode *mode;
 
 	if (!crtc_state || !crtc_state->enable ||
 	    !drm_atomic_crtc_needs_modeset(crtc_state))
 		return 0;
-	switch (dcp_crtc_eotf(dcp, crtc, commit)) {
-	case HDMI_EOTF_TRADITIONAL_GAMMA_SDR:
-		return 0;
-	case HDMI_EOTF_SMPTE_ST2084:
-		if (dcp_panel_edr_supported(dcp))
+	dcp_crtc_color_request(dcp, crtc, commit, &req);
+	if (dcp_panel_edr_supported(dcp)) {
+		if (req.eotf == HDMI_EOTF_TRADITIONAL_GAMMA_SDR ||
+		    req.eotf == HDMI_EOTF_SMPTE_ST2084)
 			return 0;
-		if (dcp_hdr_output_supported(dcp) &&
-		    lookup_mode(dcp, &crtc_state->mode, &mode) && mode.pq.score >= 0)
-			return 0;
-		fallthrough;
-	default:
 		return -EINVAL;
 	}
+	if (dcp_color_request_is_default(&req) &&
+	    req.eotf == HDMI_EOTF_TRADITIONAL_GAMMA_SDR &&
+	    req.colorspace == DRM_MODE_COLORIMETRY_DEFAULT)
+		return 0;
+	if (!READ_ONCE(dcp->iomfb_template_pq) || dcp_is_ext26(dcp)) {
+		/* Fixed 8-bit SDR pipes satisfy any default SDR request with max_bpc >= 8. */
+		if (req.eotf == HDMI_EOTF_TRADITIONAL_GAMMA_SDR &&
+		    req.colorspace == DRM_MODE_COLORIMETRY_DEFAULT &&
+		    req.color_format == DRM_CONNECTOR_COLOR_FORMAT_AUTO &&
+		    req.broadcast_rgb == DRM_HDMI_BROADCAST_RGB_AUTO &&
+		    (!req.max_bpc || req.max_bpc >= 8))
+			return 0;
+		return -EINVAL;
+	}
+	mode = dcp_find_mode(dcp, &crtc_state->mode);
+	if (!mode)
+		return -EINVAL;
+	return dcp_select_color_mode(mode, &req, &selected);
 }
 
-/* The user may own drm_display_mode, so we need to search for our copy */
-bool lookup_mode(struct apple_dcp *dcp, const struct drm_display_mode *mode,
-		 struct dcp_display_mode *out)
+static const struct dcp_display_mode *
+dcp_find_mode(struct apple_dcp *dcp, const struct drm_display_mode *mode)
 {
 	struct dcp_display_mode *modes;
 	unsigned int count, i;
@@ -3458,7 +3553,7 @@ bool lookup_mode(struct apple_dcp *dcp, const struct drm_display_mode *mode,
 				   DRM_MODE_MATCH_TIMINGS |
 					   DRM_MODE_MATCH_CLOCK)) {
 			if (!modes[i].automatic_rgb8_quirk)
-				goto found;
+				return &modes[i];
 			mutex_lock(&dcp->hpd_mutex);
 			mutex_lock(&dcp->dcpavserv.lock);
 			spin_lock_irqsave(&dcp->metadata.lock, flags);
@@ -3467,16 +3562,24 @@ bool lookup_mode(struct apple_dcp *dcp, const struct drm_display_mode *mode,
 			mutex_unlock(&dcp->dcpavserv.lock);
 			mutex_unlock(&dcp->hpd_mutex);
 			if (eligible)
-				goto found;
+				return &modes[i];
 		}
 	}
 
-	return false;
+	return NULL;
+}
 
-found:
+/* The user may own drm_display_mode, so we need to search for our copy */
+bool lookup_mode(struct apple_dcp *dcp, const struct drm_display_mode *mode,
+		 struct dcp_display_mode *out)
+{
+	const struct dcp_display_mode *found = dcp_find_mode(dcp, mode);
+
+	if (!found)
+		return false;
 	/* Callers keep a copy, never a pointer into the catalog. */
 	if (out)
-		*out = modes[i];
+		*out = *found;
 	return true;
 }
 
@@ -3490,15 +3593,15 @@ found:
 static bool dcp_mode_settable(struct apple_dcp *dcp,
 			      const struct drm_display_mode *mode)
 {
-	struct dcp_display_mode dcp_mode;
+	const struct dcp_display_mode *dcp_mode = dcp_find_mode(dcp, mode);
 
-	if (!lookup_mode(dcp, mode, &dcp_mode))
+	if (!dcp_mode)
 		return false;
 
 	if (dcp->fw_compat == DCP_FIRMWARE_H17P && !dcp_is_ext26(dcp) &&
 	    dcp->hw.iomfb_method_profile !=
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL)
-		return dcp_mode.mode.type & DRM_MODE_TYPE_PREFERRED;
+		return dcp_mode->mode.type & DRM_MODE_TYPE_PREFERRED;
 
 	/*
 	 * The T6050 internal DCP (M5 Max) crashes on 3024x1986@60 and the
@@ -3593,11 +3696,13 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 	if (crtc_state->mode.hdisplay == 0 && crtc_state->mode.vdisplay == 0)
 		return 0;
 
-	dcp->pq_requested = dcp_crtc_eotf(dcp, crtc, commit) == HDMI_EOTF_SMPTE_ST2084;
+	dcp_crtc_color_request(dcp, crtc, commit, &dcp->color_req);
+	dcp->pq_requested = dcp->color_req.eotf == HDMI_EOTF_SMPTE_ST2084;
 	dcp->output_edr = dcp->pq_requested && dcp_panel_edr_supported(dcp) &&
 			  dcp_crtc_bt2020(dcp, crtc, commit);
 	dcp->pq_requested &= dcp_hdr_output_supported(dcp);
-	if (!dcp->pq_requested)
+	if (dcp->color_req.eotf == HDMI_EOTF_TRADITIONAL_GAMMA_SDR ||
+	    !dcp_hdr_output_supported(dcp))
 		dcp_hdr_infoframe_stop(dcp);
 	dcp_hdr_metadata_forget(dcp);
 	dcp_mode_begin(&dcp->mode_state);
@@ -4314,6 +4419,7 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit)
 {
 	struct platform_device *pdev = to_apple_crtc(crtc)->dcp;
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+	bool route_ready;
 
 	if (iomfb_is_m4(dcp)) {
 		struct drm_plane_state *plane = drm_atomic_get_new_plane_state(commit,
@@ -4366,13 +4472,13 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit)
 		return;
 	}
 
-	if ((dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
-	     dcp->fw_compat == DCP_FIRMWARE_V_27_0) &&
-	    READ_ONCE(dcp->mode_state.valid) && dcp->connector &&
-	    READ_ONCE(dcp->connector->connected)) {
+	route_ready = dcp_crtc_route_ready(crtc, commit, true);
+	if (READ_ONCE(dcp->mode_state.valid) && dcp->connector &&
+	    READ_ONCE(dcp->connector->connected) &&
+	    !(to_apple_atomic_state(commit)->failed_routes & drm_crtc_mask(crtc))) {
 		/* A panel's EDR switches without a mode set (dcp_edr_live()). */
 		dcp_edr_sync(dcp, crtc, commit);
-		if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
+		if (route_ready)
 			dcp_hdr_metadata_sync(dcp, crtc, commit);
 	}
 
@@ -4391,7 +4497,7 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit)
 	 * firmware has reported the display back.
 	 */
 	if ((to_apple_atomic_state(commit)->failed_routes & drm_crtc_mask(crtc)) ||
-	    !dcp_crtc_route_ready(crtc, commit, true) ||
+	    !route_ready ||
 	    !READ_ONCE(dcp->mode_state.valid) || !dcp->connector || !dcp->connector->connected) {
 		schedule_work(&dcp->vblank_wq);
 		return;

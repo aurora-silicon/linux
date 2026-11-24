@@ -478,6 +478,7 @@ static const struct hw_info t6050_pciec_hw = {
 	.no_port_reset		= true,
 	.msimap_by_vector	= true,
 	.mps_timers		= true,
+	.s2idle_hold_domain	= true,
 };
 
 static const struct of_device_id apple_pcie_of_match[];
@@ -3697,6 +3698,25 @@ static int apple_pcie_adopted_no_clkpm_walk(struct pci_dev *pdev, void *data)
 	return 0;
 }
 
+/*
+ * An adopted port with an endpoint power GPIO (pwren-gpios) is trained by
+ * Linux. Match the root port itself as well as functions below it.
+ * If no port matches, neither kind of training can be established.
+ */
+static bool apple_pcie_adopted_link_trained_by(struct apple_pcie *pcie,
+					      struct pci_dev *pdev, bool bootloader)
+{
+	struct pci_dev *rp = pcie_find_root_port(pdev);
+	struct apple_pcie_port *port;
+
+	if (!pcie->hw->adopt_link || !rp)
+		return false;
+	list_for_each_entry(port, &pcie->ports, entry)
+		if (port->idx == PCI_SLOT(rp->devfn))
+			return bootloader == !port->pwren;
+	return false;
+}
+
 static int apple_pcie_enable_device(struct pci_host_bridge *bridge, struct pci_dev *pdev)
 {
 	struct apple_pcie *pcie = pci_host_bridge_priv(bridge);
@@ -3715,6 +3735,14 @@ static int apple_pcie_enable_device(struct pci_host_bridge *bridge, struct pci_d
 
 	/* Also cover functions discovered by a later hotplug or rescan. */
 	if (pcie->hw->tunneled)
+		pdev->dev_flags |= PCI_DEV_FLAGS_NO_D3;
+
+	/*
+	 * Firmware owns the power of a boot-trained adopted link, and s2idle
+	 * requires the port and everything below it to stay accessible in D0.
+	 * Keep the PCI core's suspend paths from putting them in D3hot.
+	 */
+	if (apple_pcie_adopted_link_trained_by(pcie, pdev, true))
 		pdev->dev_flags |= PCI_DEV_FLAGS_NO_D3;
 
 	/*
@@ -6710,6 +6738,23 @@ err_release:
 }
 
 /*
+ * Pre-suspend policy shared with apple_pcie_prepare(): everything known before
+ * endpoints suspend, leaving only the domain hold and live link check to noirq.
+ */
+static bool apple_pcie_can_keep_link(const struct apple_pcie *pcie)
+{
+	if (!READ_ONCE(s2idle_keep_link) || !pm_suspend_no_platform())
+		return false;
+	if (!(pcie->kernel_init || pcie->tunnel_cold_init))
+		return false;
+	if (pcie->bus_stopped || pcie->resume_failed)
+		return false;
+	if (!pcie->power_retained && !pcie->hw->s2idle_hold_domain)
+		return false;
+	return true;
+}
+
+/*
  * In suspend-to-idle ACIO and the router links stay powered, so an up
  * tunnel can simply be left running. The functions below keep their state
  * and resume like any other PCIe device; nothing has to be re-trained.
@@ -6721,15 +6766,9 @@ static bool apple_pcie_keep_link(struct apple_pcie *pcie)
 {
 	int ret;
 
-	if (!READ_ONCE(s2idle_keep_link) || !pm_suspend_no_platform())
-		return false;
-	if (!(pcie->kernel_init || pcie->tunnel_cold_init))
-		return false;
-	if (pcie->bus_stopped || pcie->resume_failed)
+	if (!apple_pcie_can_keep_link(pcie))
 		return false;
 	if (!pcie->power_retained) {
-		if (!pcie->hw->s2idle_hold_domain)
-			return false;
 		ret = apple_pcie_hold_domains(pcie);
 		if (ret) {
 			dev_dbg(pcie->dev, "PCIe-C power domain not held (%d): link not kept\n",
@@ -6785,22 +6824,6 @@ static void apple_pcie_stop_for_sleep(struct device *dev)
 
 static void apple_pcie_neo_save_functions(struct apple_pcie *pcie);
 
-/* Whether Linux trained the port above pdev itself (cold train), rather than adopting it */
-static bool apple_pcie_below_kernel_trained_port(struct pci_dev *pdev)
-{
-	struct pci_config_window *cfg = pdev->sysdata;
-	struct apple_pcie *pcie = apple_pcie_lookup(cfg->parent);
-	struct pci_dev *rp = pcie_find_root_port(pdev);
-	struct apple_pcie_port *port;
-
-	if (!rp)
-		return false;
-	list_for_each_entry(port, &pcie->ports, entry)
-		if (port->idx == PCI_SLOT(rp->devfn))
-			return !!port->pwren;
-	return false;
-}
-
 /*
  * The J716c radio drivers save PCI state without entering D3. The PCI core
  * keeps the root port in D0 as well. Its host and DART have no switchable
@@ -6812,6 +6835,8 @@ static bool apple_pcie_below_kernel_trained_port(struct pci_dev *pdev)
  */
 static int apple_pcie_check_d0(struct pci_dev *pdev, void *data)
 {
+	struct pci_config_window *cfg = pdev->sysdata;
+	struct apple_pcie *pcie = apple_pcie_lookup(cfg->parent);
 	int *error = data;
 	u16 value;
 
@@ -6822,7 +6847,7 @@ static int apple_pcie_check_d0(struct pci_dev *pdev, void *data)
 	 * asked to stay awake need to remain in D0.
 	 */
 	if (!device_awake_path(&pdev->dev) &&
-	    apple_pcie_below_kernel_trained_port(pdev))
+	    apple_pcie_adopted_link_trained_by(pcie, pdev, false))
 		return 0;
 
 	if (pci_read_config_word(pdev, PCI_VENDOR_ID, &value) ||
@@ -6838,22 +6863,16 @@ static int apple_pcie_check_d0(struct pci_dev *pdev, void *data)
 	return *error;
 }
 
-static int apple_pcie_check_adopted_s2idle(struct apple_pcie *pcie)
+/*
+ * Every host whose links the boot loader trained (hw->adopt_link) keeps them
+ * across suspend-to-idle: the root complex and every port's link must still
+ * be up, read from the hardware. Deeper sleep remains unqualified.
+ */
+static int apple_pcie_adopted_links_ready(struct apple_pcie *pcie)
 {
-	struct pci_host_bridge *bridge = pci_host_bridge_from_priv(pcie);
 	struct apple_pcie_port *port;
-	int error = 0;
 
-	/*
-	 * Qualified on the J716c, the K114c, the K116s and the J714s: the same
-	 * T6050 host with the N1 adopted on port 0. The K116s and the J714s
-	 * (16- and 14-inch M5 Pro) also have a kernel-trained SD reader port.
-	 * Other adopted platforms and deeper sleep remain unqualified.
-	 */
-	if (!(of_machine_is_compatible("apple,j716c") ||
-	      of_machine_is_compatible("apple,k114c") ||
-	      of_machine_is_compatible("apple,k116s") ||
-	      of_machine_is_compatible("apple,j714s")) || !pm_suspend_no_platform())
+	if (!pm_suspend_no_platform())
 		return -EBUSY;
 
 	if (!(readl(pcie->base + CORE_RC_CTL) & CORE_RC_CTL_RUN) ||
@@ -6861,6 +6880,9 @@ static int apple_pcie_check_adopted_s2idle(struct apple_pcie *pcie)
 		return -ENOLINK;
 
 	list_for_each_entry(port, &pcie->ports, entry) {
+		/* Parked for this sleep: held down on purpose, and may not answer */
+		if (pcie->t6050_parked & BIT(port->idx))
+			continue;
 		if (READ_ONCE(port->link_failed) ||
 		    !(apple_pcie_port_readl(port, PORT_STATUS) & PORT_STATUS_READY) ||
 		    (apple_pcie_port_readl(port, PORT_LINKSTS) &
@@ -6868,6 +6890,35 @@ static int apple_pcie_check_adopted_s2idle(struct apple_pcie *pcie)
 		    (apple_pcie_port_readl(port, PORT_INTSTAT) & BIT(PORT_INT_LINK_DOWN)))
 			return -ENOLINK;
 	}
+	return 0;
+}
+
+/*
+ * An adopted host that apple_pcie_suspend_noirq() puts to sleep itself, given
+ * that it passed the CIO-DART refusal: not in a CIO or NEO sleep transaction,
+ * not a managed radio, and up. For suspend-to-idle it ends in
+ * apple_pcie_check_adopted_s2idle(); for a firmware suspend in
+ * apple_pcie_t6050_sleep_down(). apple_pcie_prepare() refuses on the same terms.
+ */
+static bool apple_pcie_adopted_sleep_host(struct apple_pcie *pcie)
+{
+	return !pcie->cio_prepared && !pcie->neo_sleep_armed && !pcie->managed_sids &&
+	       pcie->hw->adopt_link && !READ_ONCE(pcie->t6050_down);
+}
+
+static bool apple_pcie_adopted_s2idle_checked(struct apple_pcie *pcie)
+{
+	return apple_pcie_adopted_sleep_host(pcie) && !pm_suspend_via_firmware();
+}
+
+/* ... and the devices below must still be in D0, before and after the sleep. */
+static int apple_pcie_check_adopted_s2idle(struct apple_pcie *pcie)
+{
+	struct pci_host_bridge *bridge = pci_host_bridge_from_priv(pcie);
+	int error = apple_pcie_adopted_links_ready(pcie);
+
+	if (error)
+		return error;
 	pci_walk_bus(bridge->bus, apple_pcie_check_d0, &error);
 	return error;
 }
@@ -6879,7 +6930,7 @@ static int apple_pcie_suspend_noirq(struct device *dev)
 	if (pcie->cio_prepared)
 		return apple_pcie_cio_suspend(pcie);
 	/* The reversed DART link is safe only with retained clocks or native PM. */
-	if (pcie->cio_dart && (!pm_suspend_no_platform() || !s2idle_keep_link))
+	if (pcie->cio_dart && !apple_pcie_can_keep_link(pcie))
 		return -EBUSY;
 	if (pcie->neo_sleep_armed) {
 		struct apple_pcie_port *port;
@@ -6918,20 +6969,22 @@ static int apple_pcie_suspend_noirq(struct device *dev)
 	if (!pcie->managed_sids && pcie->hw->adopt_link) {
 		int ret;
 
+		if (apple_pcie_adopted_s2idle_checked(pcie)) {
+			ret = apple_pcie_check_adopted_s2idle(pcie);
+			pcie->link_kept = !ret;
+			return ret;
+		}
 		/* Down since a wake that failed: nothing to keep or shut down, nothing read */
 		if (READ_ONCE(pcie->t6050_down))
 			return 0;
-		if (pm_suspend_via_firmware()) {
-			/* The root ports below are suspended: from here a parked port's is not read */
-			WRITE_ONCE(pcie->t6050_cold_lost, pcie->t6050_parked);
-			ret = apple_pcie_t6050_sleep_down(pcie);
-			if (!ret && pcie->t6050_reset_before_sleep)
-				ret = apple_pcie_t6050_reset_for_sleep(pcie);
-			return ret;
-		}
-		ret = apple_pcie_check_adopted_s2idle(pcie);
-
-		pcie->link_kept = !ret;
+		/*
+		 * A firmware suspend. The root ports below are suspended: from here a
+		 * parked port's is not read.
+		 */
+		WRITE_ONCE(pcie->t6050_cold_lost, pcie->t6050_parked);
+		ret = apple_pcie_t6050_sleep_down(pcie);
+		if (!ret && pcie->t6050_reset_before_sleep)
+			ret = apple_pcie_t6050_reset_for_sleep(pcie);
 		return ret;
 	}
 	if (!pcie->hw->tunneled) {
@@ -7545,9 +7598,32 @@ static int apple_pcie_prepare(struct device *dev)
 	 */
 	if (pcie && pcie->cio_dart && !pcie->cio_prepared &&
 	    pm_suspend_target_state != PM_SUSPEND_ON &&
-	    (!pm_suspend_no_platform() || !s2idle_keep_link)) {
+	    !apple_pcie_can_keep_link(pcie)) {
 		dev_warn(dev, "no CIO sleep transaction from the NHI; refusing sleep\n");
 		return -EBUSY;
+	}
+	/*
+	 * An adopted link that apple_pcie_suspend_noirq() would already refuse to
+	 * keep: refuse now. Refused there, the root ports and endpoints below have
+	 * already suspended to D3hot, this host gets no noirq resume, and nothing
+	 * retrains their links before their drivers resume. A link that drops
+	 * after this is still refused only there.
+	 */
+	if (pcie && pm_suspend_target_state != PM_SUSPEND_ON &&
+	    apple_pcie_adopted_sleep_host(pcie)) {
+		int ret;
+
+		/* A firmware suspend: the port and DART apple_pcie_t6050_sleep_down() takes down */
+		if (pm_suspend_via_firmware())
+			ret = pcie->t6050_port && pcie->t6050_dart ? 0 : -EBUSY;
+		else
+			ret = apple_pcie_adopted_links_ready(pcie);
+
+		if (ret) {
+			dev_warn(dev, "adopted link not kept for this sleep (%d); refusing\n",
+				 ret);
+			return ret;
+		}
 	}
 	return apple_radio_prepare(dev);
 }

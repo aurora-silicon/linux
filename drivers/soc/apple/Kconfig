@@ -163,9 +163,38 @@ config APPLE_SART
 
 	  Say 'y' here if you have an Apple SoC.
 
+config APPLE_SART_KUNIT_TEST
+	bool "KUnit tests for the Apple SART DMA address filter" if !KUNIT_ALL_TESTS
+	depends on APPLE_SART=y && KUNIT=y
+	depends on ARM64 && OF
+	default KUNIT_ALL_TESTS
+	help
+	  Add and remove allowed regions on a SART whose registers are a
+	  buffer of kernel memory, and check the register encoding of each
+	  SART generation, the handling of a full table, of regions that are
+	  not whole pages and of the bootloader's entries, and what a
+	  firmware-driven sleep saves, restores and refuses. The tests touch
+	  no hardware.
+
+	  If unsure, say N.
+
 config APPLE_TUNABLE
 	tristate
 	depends on ARCH_APPLE || COMPILE_TEST
+
+config APPLE_TUNABLE_KUNIT_TEST
+	tristate "KUnit tests for Apple Silicon hardware tunables" if !KUNIT_ALL_TESTS
+	depends on KUNIT && ARM64 && OF
+	depends on ARCH_APPLE || COMPILE_TEST
+	select APPLE_TUNABLE
+	default KUNIT_ALL_TESTS
+	help
+	  Parse tunable properties from a device node built by the test and
+	  apply them to a buffer of kernel memory: the triplet decoding, the
+	  length, alignment and bounds checks, and the mask and value
+	  arithmetic. The tests touch no hardware.
+
+	  If unsure, say N.
 
 config RUST_APPLE_MAILBOX
 	bool
@@ -316,7 +345,7 @@ config APPLE_REGVIEW
 config APPLE_CLPC
 	tristate "Apple host performance controller floors"
 	depends on ARCH_APPLE || COMPILE_TEST
-	depends on APPLE_PMC && CPU_FREQ
+	depends on (APPLE_PMC || !APPLE_PMC) && CPU_FREQ
 	depends on MFD_MACSMC || !MFD_MACSMC
 	select ACPI_PLATFORM_PROFILE if ACPI
 	default ARCH_APPLE
@@ -324,9 +353,9 @@ config APPLE_CLPC
 	  Raises the DRAM controller and SoC fabric performance floors of the
 	  host's PMC voter agent while CPU clusters are busy, and releases
 	  them at idle. On SoCs with power modes it also offers them as
-	  platform profiles.
+	  platform profiles (with or without a PMC parent).
 
-	  Say 'y' or 'm' here if you have an Apple SoC with a PMC.
+	  Say 'y' or 'm' here if you have an Apple SoC.
 
 config APPLE_DISPLAY_GATE
 	bool "Apple internal display enable gate"

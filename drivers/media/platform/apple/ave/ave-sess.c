@@ -764,6 +764,10 @@ static void ave_note_copy(struct ave_ctx *ctx, u32 stride, const char *how)
  * buffer with their own, smaller line size instead, which shows in the
  * payload size; such frames are copied to a per-slot buffer in the
  * encoder's layout.
+ *
+ * The encoder reads a whole coded frame (p->ch lines, the size S_FMT
+ * reports) from the address it is given, so every address handed out here
+ * has that much memory behind it.
  */
 int ave_sess_input(struct ave_ctx *ctx, unsigned int slot, struct vb2_v4l2_buffer *src,
 		   dma_addr_t *input)
@@ -775,6 +779,7 @@ int ave_sess_input(struct ave_ctx *ctx, unsigned int slot, struct vb2_v4l2_buffe
 	u32 used = vb2_get_plane_payload(vb, 0) - min(off, vb2_get_plane_payload(vb, 0));
 	u32 crows = DIV_ROUND_UP(p->height, 2), rows = p->height + crows;
 	u32 width = ALIGN(p->width, 2) * p->sample_bytes, stride;
+	size_t frame = (size_t)p->stride * p->ch * 3 / 2;
 	struct ave_buf *b = &sess->slot[slot].bounce;
 	const u8 *from;
 	u8 *to;
@@ -782,6 +787,12 @@ int ave_sess_input(struct ave_ctx *ctx, unsigned int slot, struct vb2_v4l2_buffe
 
 	*input = vb2_dma_contig_plane_dma_addr(vb, 0) + off;
 	if (!used || used >= p->stride * rows || used % rows || used / rows < width) {
+		if ((size_t)off + frame > vb2_plane_size(vb, 0)) {
+			dev_err_ratelimited(ctx->ave->dev,
+					    "OUTPUT plane has no %zu byte frame after offset %u\n",
+					    frame, off);
+			return -EINVAL;
+		}
 		if (IS_ALIGNED(*input, 64))
 			return 0;
 		dev_err(ctx->ave->dev, "OUTPUT plane at %pad is not 64-byte aligned\n", input);
@@ -801,10 +812,11 @@ int ave_sess_input(struct ave_ctx *ctx, unsigned int slot, struct vb2_v4l2_buffe
 	 * Buffers the driver allocated (MMAP) are large enough for the
 	 * encoder's layout: spread the lines out in place, last line first,
 	 * so no extra DMA space is needed. Imported buffers may be shared
-	 * with other users and get a copy instead.
+	 * with other users and get a copy instead, and so does a buffer whose
+	 * data_offset leaves the picture off the encoder's 64-byte alignment.
 	 */
-	if (vb->memory == VB2_MEMORY_MMAP &&
-	    vb2_plane_size(vb, 0) >= off + (size_t)p->stride * rows) {
+	if (vb->memory == VB2_MEMORY_MMAP && IS_ALIGNED(*input, 64) &&
+	    vb2_plane_size(vb, 0) >= (size_t)off + frame) {
 		to = (u8 *)from;
 		for (u32 y = rows; y-- > 0;)
 			memmove(to + y * p->stride, from + y * stride, width);
@@ -812,7 +824,7 @@ int ave_sess_input(struct ave_ctx *ctx, unsigned int slot, struct vb2_v4l2_buffe
 		return 0;
 	}
 
-	ret = ave_alloc(ctx->ave, b, p->stride * rows, 0);
+	ret = ave_alloc(ctx->ave, b, frame, 0);
 	if (ret) {
 		dev_err(ctx->ave->dev, "no room to copy %u byte stride input\n", stride);
 		return ret;

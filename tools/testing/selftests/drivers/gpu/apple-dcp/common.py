@@ -194,6 +194,18 @@ def atc_cio_helpers(source):
     return result
 
 
+def atc_cfg_helpers(source):
+    """Where the power and reset block sits and which bit swaps the lanes, both of
+    which T8152 moves; the power-up, power-down and lane functions call these.
+
+    Marked unused, as a unit may extract only some of their callers. Older
+    sources have neither: ''.
+    """
+    return ''.join(atc_function(source, name).replace(
+                       'static inline ', 'static inline __attribute__((unused)) ', 1)
+                   for name in ('atcphy_cfg', 'atcphy_lane_swap'))
+
+
 def atc_restore_helpers(source):
     """What atcphy_restore_after_pd_off() needs beyond the parking helpers.
 
