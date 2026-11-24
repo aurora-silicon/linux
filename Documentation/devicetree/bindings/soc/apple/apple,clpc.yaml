@@ -21,6 +21,7 @@ properties:
     oneOf:
       - items:
           - enum:
+              - apple,t6020-clpc
               - apple,t8112-clpc
           - const: apple,clpc
       - const: apple,clpc
