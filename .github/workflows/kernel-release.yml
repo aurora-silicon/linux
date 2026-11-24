@@ -1,0 +1,278 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Kernel release channels (see RELEASES.md):
+#   aurora-edge     prerelease, rebuilt on every push to main
+#   aurora-nightly  prerelease, daily from main when main moved since the last nightly
+#   v*              immutable stable release, built from a tag on main
+#
+# workflow_dispatch builds without publishing (publish: none) or publishes
+# one rolling channel by hand (publish: edge | nightly). Pull requests that
+# change the release machinery itself get a build without publishing.
+#
+# The configuration is the fleet configuration (aurora_defconfig + asahi.config)
+# built with the fleet toolchain versions pinned below. Modules are signed with
+# a key generated for each run and thrown away afterwards; lab fleet kits are
+# signed separately and are not produced here.
+
+name: kernel-release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/kernel-release.yml'
+      - '.github/scripts/kernel-release-build.sh'
+      - 'arch/arm64/configs/aurora_defconfig'
+  schedule:
+    - cron: '30 15 * * *'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Channel to publish (none = build only)'
+        type: choice
+        options: [none, edge, nightly]
+        default: none
+
+permissions:
+  contents: read
+
+concurrency:
+  group: >-
+    kernel-release-${{
+      github.event_name == 'schedule' && 'nightly' ||
+      github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) ||
+      startsWith(github.ref, 'refs/tags/v') && github.ref_name ||
+      github.event_name == 'workflow_dispatch' && inputs.publish != 'none' && inputs.publish ||
+      github.event_name == 'workflow_dispatch' && format('dispatch-{0}', github.ref_name) ||
+      'edge' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+env:
+  LLVM_VERSION: '22.1.6'
+  RUST_VERSION: '1.97.1'
+  BINDGEN_VERSION: '0.73.2'
+  PAHOLE_VERSION: 'v1.31'
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04-arm
+    outputs:
+      channel: ${{ steps.plan.outputs.channel }}
+      sha: ${{ steps.plan.outputs.sha }}
+      build: ${{ steps.plan.outputs.build }}
+      localversion: ${{ steps.plan.outputs.localversion }}
+      pkgbase: ${{ steps.plan.outputs.pkgbase }}
+    steps:
+      - id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          PUBLISH: ${{ inputs.publish }}
+        run: |
+          set -euo pipefail
+          build=true
+          case "$EVENT:$REF" in
+          push:refs/heads/main) channel=edge ;;
+          push:refs/tags/v*) channel=stable ;;
+          schedule:*) channel=nightly ;;
+          pull_request:*) channel=none ;;
+          workflow_dispatch:*)
+            channel=$PUBLISH
+            if [ "$channel" != none ] && [ "$REF" != refs/heads/main ]; then
+              echo "::error::publishing $channel needs a dispatch on main"; exit 1
+            fi ;;
+          *) echo "::error::unexpected trigger $EVENT $REF"; exit 1 ;;
+          esac
+          if [ "$channel" = nightly ]; then
+            sha=$(gh api "repos/$REPO/commits/main" -q .sha)
+            last=$(gh api "repos/$REPO/commits/aurora-nightly" -q .sha 2>/dev/null || true)
+            if [ "$EVENT" = schedule ] && [ "$last" = "$sha" ]; then
+              echo "main is still at the last nightly ($sha); nothing to build"
+              build=false
+            fi
+          else
+            sha=$SHA
+          fi
+          if [ "$channel" = stable ]; then
+            # A stable tag must be on main, or on a hotfix/ branch (RELEASES.md).
+            on=
+            for b in main $(gh api --paginate "repos/$REPO/branches" -q '.[].name | select(startswith("hotfix/"))'); do
+              status=$(gh api "repos/$REPO/compare/$(jq -rn --arg b "$b" '$b|@uri')...$sha" -q .status)
+              case "$status" in behind|identical) on=$b; break ;; esac
+            done
+            if [ -z "$on" ]; then
+              echo "::error::$REF_NAME ($sha) is not on main or a hotfix/ branch"; exit 1
+            fi
+            echo "$REF_NAME is on $on"
+          fi
+          case "$channel" in
+          stable) lv="-aurora-${REF_NAME#v}"; pkg=linux-aurora-bin ;;
+          edge|nightly) lv="-aurora-$channel"; pkg="linux-aurora-$channel-bin" ;;
+          *) lv=-aurora-ci; pkg=linux-aurora-ci-bin ;;
+          esac
+          {
+            echo "channel=$channel"; echo "sha=$sha"; echo "build=$build"
+            echo "localversion=$lv"; echo "pkgbase=$pkg"
+          } | tee -a "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 345
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /usr/local/share/boost /opt/hostedtoolcache/CodeQL || true
+          df -h / "$GITHUB_WORKSPACE"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libelf-dev libssl-dev libdw-dev zlib1g-dev cmake \
+            cpio kmod rsync zstd xz-utils python3 \
+            fakeroot libarchive-tools
+
+      - name: Install makepkg (for make pacman-pkg)
+        continue-on-error: true
+        run: sudo apt-get install -y --no-install-recommends makepkg
+
+      - name: Install Rust
+        run: |
+          if ! command -v rustup >/dev/null; then
+            curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup toolchain install "$RUST_VERSION" --profile minimal -c rust-src
+          rustup default "$RUST_VERSION"
+          rustc --version
+
+      - name: Restore toolchain cache
+        id: tc-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/tc
+          key: tc-${{ runner.arch }}-llvm${{ env.LLVM_VERSION }}-bindgen${{ env.BINDGEN_VERSION }}-pahole${{ env.PAHOLE_VERSION }}-1
+
+      - name: Install LLVM, bindgen and pahole
+        if: steps.tc-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p ~/tc
+          curl -fsSL -o /tmp/llvm.tar.xz \
+            "https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/LLVM-$LLVM_VERSION-Linux-ARM64.tar.xz"
+          mkdir -p ~/tc/llvm
+          tar -xJf /tmp/llvm.tar.xz -C ~/tc/llvm --strip-components=1
+          rm /tmp/llvm.tar.xz
+          git clone -q --depth 1 -b "$PAHOLE_VERSION" --recurse-submodules --shallow-submodules \
+            https://git.kernel.org/pub/scm/devel/pahole/pahole.git /tmp/pahole
+          cmake -S /tmp/pahole -B /tmp/pahole/build -DCMAKE_INSTALL_PREFIX="$HOME/tc/pahole" \
+            -D__LIB=lib -DCMAKE_BUILD_TYPE=Release
+          make -C /tmp/pahole/build -j"$(nproc)" install
+          LIBCLANG_PATH=~/tc/llvm/lib cargo install --locked --root ~/tc/bindgen \
+            bindgen-cli --version "$BINDGEN_VERSION"
+
+      - name: Build
+        env:
+          LOCALVERSION: ${{ needs.plan.outputs.localversion }}
+          PKGBASE: ${{ needs.plan.outputs.pkgbase }}
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/tc/llvm/bin:$HOME/tc/pahole/bin:$HOME/tc/bindgen/bin:$PATH"
+          export LD_LIBRARY_PATH="$HOME/tc/pahole/lib:$HOME/tc/llvm/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          export LIBCLANG_PATH="$HOME/tc/llvm/lib"
+          .github/scripts/kernel-release-build.sh "$RUNNER_TEMP/out" "$RUNNER_TEMP/dist" "$LOCALVERSION" "$PKGBASE"
+          df -h /
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kernel-${{ needs.plan.outputs.channel }}-${{ needs.plan.outputs.sha }}
+          path: ${{ runner.temp }}/dist/
+          retention-days: 7
+          compression-level: 0
+
+  publish:
+    needs: [plan, build]
+    if: needs.plan.outputs.channel != 'none' && needs.plan.outputs.build == 'true'
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      CHANNEL: ${{ needs.plan.outputs.channel }}
+      SHA: ${{ needs.plan.outputs.sha }}
+      TAG_NAME: ${{ github.ref_name }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: kernel-${{ needs.plan.outputs.channel }}-${{ needs.plan.outputs.sha }}
+          path: dist
+
+      - name: Write release notes
+        run: |
+          set -euo pipefail
+          krel=$(cat dist/kernel.release)
+          cat > notes.md <<EOF
+          Kernel \`$krel\` built from \`$SHA\` on main.
+
+          Channel: **$CHANNEL**. Configuration: the fleet configuration (\`arch/arm64/configs/aurora_defconfig\` + \`asahi.config\`), toolchain LLVM $LLVM_VERSION, Rust $RUST_VERSION, bindgen $BINDGEN_VERSION, pahole $PAHOLE_VERSION.
+
+          Modules are signed with a key generated for this build only and discarded after it (certificate: \`module-signing-cert-$krel.der\`). These are not the lab-signed fleet kits.
+
+          Assets: \`Image-$krel.gz\`, \`modules-$krel.tar.zst\` (/lib/modules tree), \`dtbs-$krel.tar.zst\`, \`config-$krel\`, \`System.map-$krel\`, Arch packages (\`make pacman-pkg\`, when they built) and \`SHA256SUMS\`.
+
+          Build: $RUN_URL
+          EOF
+          cat notes.md
+
+      - name: Publish rolling prerelease
+        if: needs.plan.outputs.channel == 'edge' || needs.plan.outputs.channel == 'nightly'
+        run: |
+          set -euo pipefail
+          tag="aurora-$CHANNEL"
+          title="Aurora kernel $CHANNEL ($(cut -c1-12 <<<"$SHA"))"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            # Move the channel tag to the new commit. main only moves forward,
+            # so this is a fast-forward of the tag; a rewritten main fails here.
+            gh api -X PATCH "repos/$GH_REPO/git/refs/tags/$tag" -f sha="$SHA" -F force=false >/dev/null
+            gh release edit "$tag" --prerelease --title "$title" --notes-file notes.md
+            gh release upload "$tag" dist/* --clobber
+            keep=$(cd dist && ls)
+            gh release view "$tag" --json assets -q '.assets[].name' | while read -r a; do
+              grep -qxF "$a" <<<"$keep" || gh release delete-asset "$tag" "$a" -y
+            done
+          else
+            gh release create "$tag" dist/* --target "$SHA" --prerelease --latest=false \
+              --title "$title" --notes-file notes.md
+          fi
+          gh release view "$tag" --json tagName,isPrerelease,assets -q '{tag: .tagName, prerelease: .isPrerelease, assets: [.assets[].name]}'
+
+      - name: Publish stable release
+        if: needs.plan.outputs.channel == 'stable'
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            echo "::error::release $TAG_NAME already exists; stable releases are never rebuilt"
+            exit 1
+          fi
+          gh release create "$TAG_NAME" dist/* --verify-tag --latest \
+            --title "Aurora kernel $TAG_NAME" --notes-file notes.md --generate-notes
+          gh release view "$TAG_NAME" --json tagName,isPrerelease,assets -q '{tag: .tagName, prerelease: .isPrerelease, assets: [.assets[].name]}'
