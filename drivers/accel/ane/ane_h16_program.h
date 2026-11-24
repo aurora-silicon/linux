@@ -30,6 +30,15 @@
 #define ANE_H16_TERMINATE_SIZE 0x10
 #define ANE_H16_UNLOAD_SIZE 0xc
 #define ANE_H16_GATE_SIZE 0xc
+/*
+ * How long dynamic power gating stays off after the last EXECUTE. macOS keeps
+ * it off across a run of back-to-back requests and turns it back on about
+ * 1 ms after the last one (two 0x002d per run, not per request; J616s 27.0,
+ * same on H17). Toggling it around every request costs 50-70 us of each
+ * EXECUTE, and on the 27.2 H14 firmware a close right after a request's
+ * report can take the firmware down. Every backend's session uses this.
+ */
+#define ANE_H16_GATE_HOLD_NS (2 * NSEC_PER_MSEC)
 #define ANE_H16_REPORT_MAX 0x100
 /*
  * One program's LOAD and CREATE, which stay in the command arena while the

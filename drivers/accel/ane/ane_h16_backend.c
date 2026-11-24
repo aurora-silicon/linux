@@ -1903,13 +1903,6 @@ out:
 	return ret;
 }
 
-/*
- * How long dynamic power gating stays off after the last EXECUTE. macOS 27.0
- * on the J616s keeps it off across a run of back-to-back requests and turns
- * it back on about 1 ms after the last one (two 0x002d per run, not per
- * request); toggling it per request costs about 50 us of each EXECUTE ack.
- */
-#define ANE_H16_GATE_HOLD_NS (2 * NSEC_PER_MSEC)
 
 /* After startup: one program session and the ABI 3 accel node. */
 static int ane_h16_program_stage(struct ane_h16_device *h)

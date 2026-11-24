@@ -1117,8 +1117,10 @@ static int ane_rtclient_session_register(struct ane_rtclient *ane)
 		return -ENOMEM;
 	ret = ane_h16_session_init(ane->session, ane->transport, &ane_rtclient_session_ops,
 				   ane, 3 * NSEC_PER_SEC);
-	if (!ret)
+	if (!ret) {
+		ane->session->gate_hold_ns = ANE_H16_GATE_HOLD_NS;
 		ret = ane_h16_accel_register(ane->dev, ane->session);
+	}
 	if (ret)
 		dev_err(ane->dev, "27.x program session: %d\n", ret);
 	return ret;
