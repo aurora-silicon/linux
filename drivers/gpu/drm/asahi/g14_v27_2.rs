@@ -1030,8 +1030,6 @@ impl Runtime {
         self.queue.drain();
         let mut guard = self.state.lock();
         let Some(mut state) = guard.take() else { return; };
-        // Nothing published is outstanding: the drain retired every command it accepted.
-        let drained = !state.running();
         self.fail_all(&mut state, ENODEV);
         let allowed = set_idle_policy(&state.root, &mut state.peer, true);
         let root = &state.root;
@@ -1048,16 +1046,10 @@ impl Runtime {
         if running != Ok(0) && forced != Some(Ok(())) {
             dev_err!(self.dev, "GPU firmware did not stop; a reset is required\n");
         }
-        // A confirmed stop (no work outstanding, the firmware reports itself stopped without an
-        // RTKit power-off) leaves nothing that can reach this memory, so it is released and a
-        // later probe starts over. Otherwise keep everything the firmware could reach for the
-        // rest of the boot, halted or not: its page tables still name these pages.
-        if drained && running == Ok(0) && forced.is_none() {
-            dev_info!(self.dev, "GPU firmware stopped with no work outstanding; memory released\n");
-            drop(guard);
-            drop(state);
-            return;
-        }
+        // Keep everything the firmware could reach for the rest of the boot, halted or not:
+        // its page tables still name these pages, and the boot handoff window that start()
+        // keeps for the life of the boot still references the graph's tables. Releasing them
+        // needs that window torn down first, which this runtime does not do.
         core::mem::forget(state);
         core::mem::forget(self.graph.clone());
     }
