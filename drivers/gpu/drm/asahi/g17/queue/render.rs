@@ -2028,10 +2028,10 @@ impl Pair {
         Some(observation::snapshot(&self.memory, front.ticket.ordinal).ok()?.untouched())
     }
 
-    /// The owner of a published group whose tiler started and whose fragment end is unwritten.
-    /// Groups an earlier recovery listed or blamed are skipped: a restart drops started groups,
-    /// so their records stay half-written without anything running.
-    pub(crate) fn running_owner(&self) -> Option<&Arc<VmStatus>> {
+    /// A published group whose tiler started and whose fragment end is unwritten, with its pass
+    /// record. Groups an earlier recovery listed or blamed are skipped: a restart drops started
+    /// groups, so their records stay half-written without anything running.
+    fn running(&self) -> Option<(&Active, [u64; 2])> {
         self.active
             .iter()
             .filter(|active| {
@@ -2039,11 +2039,15 @@ impl Pair {
                     && !active.packet.completion.interrupted()
                     && !active.packet.completion.blamed()
             })
-            .find(|active| {
-                observation::snapshot(&self.memory, active.ticket.ordinal)
-                    .is_ok_and(|snapshot| snapshot.pass[0] != 0 && snapshot.pass[1] == 0)
+            .find_map(|active| {
+                let pass = observation::snapshot(&self.memory, active.ticket.ordinal).ok()?.pass;
+                (pass[0] != 0 && pass[1] == 0).then_some((active, pass))
             })
-            .map(|active| active.packet.completion.status())
+    }
+
+    /// The owner of the `running` group and its tiler start, read while firmware is halted.
+    pub(crate) fn running_start(&self) -> Option<(&Arc<VmStatus>, u64)> {
+        self.running().map(|(active, pass)| (active.packet.completion.status(), pass[0]))
     }
 
     /// Firmware is halted and all graph borrowers have joined before this copy.

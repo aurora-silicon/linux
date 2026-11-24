@@ -12,7 +12,7 @@ mod slot;
 mod safety;
 pub(crate) use safety::{note_retired, since_retired};
 pub(crate) use attribution::{Record, Sources, PAGE_FAULT};
-use attribution::Attribution;
+pub(crate) use attribution::Attribution;
 
 pub(super) fn slot_key(slot: usize, slot_keys: Option<u64>) -> Option<u64> {
     slot::key(slot, slot_keys?).ok()
@@ -141,10 +141,11 @@ pub(super) trait Queues {
     fn render_pass_started(&self, qid: u8, stamp: u64) -> Option<bool>;
     /// Read while firmware is halted, like `render_pass_started`. The QIDs of every pair of a VM
     /// an earlier recovery found guilty with a render that started and did not finish. Without
-    /// one, and only when the oldest published render of the pair holding `blamed` had not
-    /// started, those of the one VM with such a render. None if no such VM, several, or any
-    /// other VM holds compute work, which these records cannot see.
-    fn render_culprit(&self, _blamed: u8) -> Option<u128> { None }
+    /// one, `Suspects` the VM whose such render started first, unless another VM holds compute
+    /// work, which these records cannot see. `NoCulprit` when the oldest published render of the
+    /// pair holding `blamed` had not started and no VM can be named; None keeps the firmware's
+    /// blame.
+    fn render_culprit(&self, _blamed: u8) -> Option<Attribution> { None }
     /// Copy every retained queue's live producer to its recovery target, then
     /// issue a full barrier. A failed graph must not skip subsequent queues.
     fn publish_recovery_targets(&self) -> Option<Error>;
@@ -345,6 +346,9 @@ pub(super) fn service<H: Host>(
         |qid, stamp| host.render_pass_started(qid, stamp));
     let attribution = sources.host_fallback(attribution,
         || host.render_culprit(request.blamed?));
+    if let Attribution::Suspects(qids) = attribution {
+        pr_warn!("G17: recovery gen {} suspects queues {:#x}\n", request.generation, qids);
+    }
     if let Attribution::Queues(qids) = attribution {
         pr_warn!("G17: recovery gen {} blames queues {:#x}\n", request.generation, qids);
     }
@@ -525,14 +529,15 @@ fn classify<Q: Queues>(
     let cancelled = entries.cancelled;
     match attribution {
         Attribution::Firmware => {}
-        Attribution::Queues(qids) => guilty_qids = qids,
+        Attribution::Queues(qids) | Attribution::Suspects(qids) => guilty_qids = qids,
         Attribution::NoCulprit => guilty_qids = 0,
     }
     let no_culprit = attribution == Attribution::NoCulprit;
-    // Only the firmware names these queues. A reason-0 restart can land on a bystander whose
-    // render started and waits behind the culprit's (2026-11-23 01:46 UTC, m4.179: t3code, then
-    // Hyprland), so the first such blame is collateral and only a repeat makes the VM guilty.
-    let unconfirmed = attribution == Attribution::Firmware;
+    // Only the firmware, or the pass records' suspicion, names these queues. A reason-0 restart
+    // can land on a bystander whose render started and waits behind the culprit's (2026-11-23
+    // 01:46 UTC, m4.179: t3code, then Hyprland), and a slow innocent render can be the oldest
+    // running one, so the first such blame is collateral and only a repeat makes the VM guilty.
+    let unconfirmed = matches!(attribution, Attribution::Firmware | Attribution::Suspects(_));
     let blame = blamed.is_some_and(|qid| guilty_qids & (1u128 << qid) != 0);
     if guilty_qids == 0 && !no_culprit {
         return (0, blame, false, false);
@@ -1214,6 +1219,23 @@ mod tests {
         assert!(deqp.recovery_guilty() && deqp.get() != 0);
         assert!(queues.restart(59, 1 << 59));
         assert!(!b.recovery_guilty() && b.get() == 0);
+    }
+
+    #[test]
+    fn the_oldest_running_render_is_only_suspected_at_first() {
+        // An innocent slow render that started its tiler just before the hung one is the oldest
+        // running render. The pass records only suspect it: collateral once, its VM kept.
+        let (slow, deqp, x) = (vm(), vm(), vm());
+        let mut queues = Cascade::new([([58, 59], &slow), ([60, 61], &deqp), ([62, 63], &x), ([64, 65], &x)]);
+        assert!(!queues.restart_as(59, 1 << 59, Attribution::Suspects(3 << 58)));
+        assert!(!slow.recovery_guilty() && slow.get() == 0);
+        // It retires; deqp's render is the oldest running one now and is suspected twice.
+        queues.retire(58);
+        queues.restart_as(59, 1 << 61, Attribution::Suspects(3 << 60));
+        assert!(!deqp.recovery_guilty());
+        queues.restart_as(59, 1 << 61, Attribution::Suspects(3 << 60));
+        assert!(deqp.recovery_guilty() && deqp.get() != 0);
+        assert!(!slow.recovery_guilty() && slow.get() == 0);
     }
 
     #[test]
