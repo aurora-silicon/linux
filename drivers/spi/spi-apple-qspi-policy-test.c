@@ -152,6 +152,8 @@ static void qspi_policy_status(struct kunit *test)
 	/* Block protect only where the board allows it. */
 	KUNIT_EXPECT_FALSE(test, apple_qspi_status_allows_write(0x04, 0, 0, 0));
 	KUNIT_EXPECT_TRUE(test, apple_qspi_status_allows_write(0x04, 0x02, 0, 0x1c));
+	/* The J813 W25Q64: QE and the SR3 drive strength, no block protection. */
+	KUNIT_EXPECT_TRUE(test, apple_qspi_status_allows_write(0x00, 0x02, 0x60, 0));
 	/* CMP, SUS and WPS are refused everywhere. */
 	KUNIT_EXPECT_FALSE(test, apple_qspi_status_allows_write(0, 0x40, 0, 0x1c));
 	KUNIT_EXPECT_FALSE(test, apple_qspi_status_allows_write(0, 0x80, 0, 0x1c));
