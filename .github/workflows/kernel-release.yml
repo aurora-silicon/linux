@@ -102,8 +102,8 @@ jobs:
           *) echo "::error::unexpected trigger $EVENT $REF"; exit 1 ;;
           esac
           if [ "$channel" = nightly ]; then
-            sha=$(gh api "repos/$REPO/commits/main" -q .sha)
-            last=$(gh api "repos/$REPO/commits/aurora-nightly" -q .sha 2>/dev/null || true)
+            sha=$(gh api "repos/$REPO/git/ref/heads/main" -q .object.sha)
+            last=$(gh api "repos/$REPO/git/ref/tags/aurora-nightly" -q .object.sha 2>/dev/null || true)
             if [ "$EVENT" = schedule ] && [ "$last" = "$sha" ]; then
               echo "main is still at the last nightly ($sha); nothing to build"
               build=false
@@ -318,8 +318,9 @@ jobs:
         run: |
           set -euo pipefail
           tag="aurora-$CHANNEL"
-          # Rolling channel tags only move forward: the new commit must contain
-          # the one the tag points at now (a rewritten main stops here).
+          # Channel tags are always addressed as refs/tags/<name>, never by the
+          # bare name, which may also be a branch. They only move forward: the
+          # new commit must contain the tagged one (a rewritten main stops here).
           old=$(gh api "repos/$GH_REPO/git/ref/tags/$tag" -q .object.sha 2>/dev/null || true)
           if [ -n "$old" ]; then
             status=$(gh api "repos/$GH_REPO/compare/$old...$SHA" -q .status)
@@ -332,10 +333,6 @@ jobs:
             esac
           fi
           [ "$old" = "$SHA" ] && { echo "$tag already at $SHA"; exit 0; }
-          if gh api "repos/$GH_REPO/git/ref/heads/$tag" >/dev/null 2>&1; then
-            echo "::error::a branch named $tag exists; rename it to archive/$tag so the tag name is unambiguous"
-            exit 1
-          fi
           # The aurora-* tags are protected by a ruleset that only the release
           # deploy key may bypass; GITHUB_TOKEN cannot move them.
           if [ -z "$DEPLOY_KEY" ]; then
