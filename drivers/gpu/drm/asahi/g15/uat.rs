@@ -118,7 +118,7 @@ fn clean_entries(pa: u64, first: usize, count: usize) -> Result {
 }
 
 /// Cleans a whole RAM table page to the point of coherency.
-fn clean_page(pa: u64) -> Result {
+pub(crate) fn clean_page(pa: u64) -> Result {
     clean_entries(pa, 0, ENTRIES)
 }
 

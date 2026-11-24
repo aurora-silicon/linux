@@ -315,7 +315,8 @@ struct apple_dcp_hw_data {
 	 * The endpoint the DPTX port services are announced on, where it is not
 	 * the firmware's default (DPTX_ENDPOINT_V2 on firmware 27): the T8142
 	 * dcpext announces them on DPTX_ENDPOINT. 0: the default, or on a
-	 * firmware-27 dcpext what its firmware advertises (dcp_v27_dptx_layout()).
+	 * firmware-27 dcpext or DCP with Type-C routes what its firmware
+	 * advertises (dcp_v27_dptx_layout()).
 	 */
 	u8 dptx_endpoint;
 	/*
@@ -498,6 +499,8 @@ struct apple_dcp {
 	struct iomfb_m4 *v26_6;
 	/* An adopted session has no confirmed firmware DMA stop boundary. */
 	bool retain_dma;
+	/* RTKit session handed over running by a boot stage (apple,rtkit-handoff) */
+	bool rtkit_adopted;
 	/*
 	 * Allocates AFK rings where the DMA API cannot, on an adopted
 	 * J713 external DCP whose DART only takes the retained allocator.
@@ -893,6 +896,12 @@ struct apple_dcp {
 	struct delayed_work secure_poll_wq;
 	/* Stopped and not restarted, which outlives a suspend that gets refused. */
 	bool s2r_fw_down;
+	/*
+	 * Its last system suspend left the firmware running and its domains on
+	 * (wakeup path), see dcp_sleep_keeps_firmware(). Cleared by the next
+	 * suspend and resume.
+	 */
+	bool sleep_fw_runs;
 	/* DCPEXT kept down through a dark wake, see dcp_s2r_dark_finish(). */
 	bool s2r_dark_held;
 	struct notifier_block s2r_pm_nb;

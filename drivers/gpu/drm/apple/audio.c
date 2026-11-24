@@ -2086,6 +2086,39 @@ static __maybe_unused int dcpaud_system_suspend(struct device *dev)
 }
 
 /*
+ * The DCP's firmware drives this block. A DCP that keeps its coprocessor
+ * running through a sleep keeps its own power domains for it, and this
+ * block's domain must stay with them: cutting it at noirq under running DCP
+ * firmware resets the machine. A DCP that stops its firmware for the sleep
+ * needs nothing held here, so the domain goes down as before. A DCP device
+ * without a driver may still run firmware that a boot stage or an earlier
+ * bind left running, so its block is kept too. Every device's .suspend has
+ * run before this late phase, so the DCP's choice is known
+ * (dcp_sleep_keeps_firmware()).
+ */
+static __maybe_unused int dcpaud_suspend_late(struct device *dev)
+{
+	struct device_node *endpoint, *dcp_node = NULL;
+	struct platform_device *dcp_pdev = NULL;
+
+	endpoint = of_graph_get_endpoint_by_regs(dev->of_node, 0, 0);
+	if (endpoint) {
+		dcp_node = of_graph_get_remote_port_parent(endpoint);
+		of_node_put(endpoint);
+	}
+	if (dcp_node && of_device_is_available(dcp_node))
+		dcp_pdev = of_find_device_by_node(dcp_node);
+	of_node_put(dcp_node);
+	if (dcp_pdev) {
+		if (dcp_sleep_keeps_firmware(&dcp_pdev->dev))
+			device_set_wakeup_path(dev);
+		put_device(&dcp_pdev->dev);
+	}
+
+	return pm_runtime_force_suspend(dev);
+}
+
+/*
  * Runtime PM stops in the late phase and comes back in the early one, so it
  * works through every device's .suspend and .resume. The display resumes
  * before this device and holds its link again in its own resume, before
@@ -2097,7 +2130,7 @@ static __maybe_unused int dcpaud_system_suspend(struct device *dev)
 static const struct dev_pm_ops dcpaud_pm_ops = {
 	.prepare = pm_sleep_ptr(dcpaud_pm_prepare),
 	SYSTEM_SLEEP_PM_OPS(dcpaud_system_suspend, NULL)
-	LATE_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
+	LATE_SYSTEM_SLEEP_PM_OPS(dcpaud_suspend_late, pm_runtime_force_resume)
 	RUNTIME_PM_OPS(dcpaud_suspend, dcpaud_resume, NULL)
 };
 

@@ -17,6 +17,7 @@
 #include "../afk.h"
 #include "../dcp.h"
 #include "../dcp-internal.h"
+#include "../dcp-fabric.h"
 #include "../connector.h"
 #include "../trace.h"
 
@@ -44,20 +45,37 @@ static bool dcpavserv_identity(struct apple_epic_service *service, const char *n
 			class && !strcmp(class, "DCPDPService") && service->channel;
 	if (!service->ep->wire_v2)
 		return unit == 0;
+	if (!class || !service->channel || service->channel > U16_MAX)
+		return false;
 	/* H17P's lower-case interface-id is dynamic, not a physical-port unit. */
-	return service->ep->endpoint == DPAVSERV_ENDPOINT_V2 && class &&
-		(!strcmp(class, "AppleDCPDP2HDMI") ||
-		 !strcmp(class, "DCPDP13Service")) && service->channel &&
-		service->channel <= U16_MAX && unit == service->channel;
+	if (service->ep->endpoint == DPAVSERV_ENDPOINT_V2)
+		return (!strcmp(class, "AppleDCPDP2HDMI") ||
+			!strcmp(class, "DCPDP13Service")) && unit == service->channel;
+	/*
+	 * Firmware 27 names an MCDP29xx DP-to-HDMI converter's AV service after
+	 * its part (the M2 Mac mini's HDMI port, USB-C to HDMI adapters) and
+	 * announces it on the classic DPAV endpoint with EPICUnit 0; its
+	 * interface-id (the channel) is dynamic across reconnects. The generic
+	 * services stay refused there: using them resets the M4 Air when the
+	 * external processor releases its link.
+	 */
+	return service->ep->endpoint == DPAVSERV_ENDPOINT && unit == 0 &&
+		(!strcmp(class, "AppleDCPMCDP29XX") ||
+		 !strcmp(class, "AppleDCPMCDP2900"));
 }
 
 static bool dcpavserv_admission_current(struct apple_dcp *dcp, u64 generation)
 {
 	lockdep_assert_held(&dcp->hpd_mutex);
-	/* Initial service discovery may precede the first Type-C attachment. */
+	/*
+	 * Initial service discovery may precede the first Type-C attachment. A
+	 * fixed output that no Type-C display has borrowed (the HDMI port) has no
+	 * Type-C cable to wait for: every sleep and DPMS cycle still moves the
+	 * generation on, so a service announced before it is not taken after it.
+	 */
 	return !READ_ONCE(dcp->quiescing) && !READ_ONCE(dcp->external_physically_absent) &&
 		generation == dcp->typec_generation &&
-		(!generation || dcp->typec_cable_connected);
+		(!generation || dcp->typec_cable_connected || !dcp_is_typec_output(dcp));
 }
 
 /* Admission runs before AFKV2 OPEN and before readers can pin the service. */
