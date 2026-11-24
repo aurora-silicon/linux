@@ -34,6 +34,22 @@ config APPLE_DOCKCHANNEL
 
 	  Say 'y' here if you have an Apple SoC.
 
+config APPLE_DOCKCHANNEL_KUNIT_TEST
+	bool "KUnit tests for the Apple DockChannel FIFO" if !KUNIT_ALL_TESTS
+	depends on APPLE_DOCKCHANNEL=y && KUNIT=y
+	select IRQ_SIM
+	default KUNIT_ALL_TESTS
+	help
+	  Send and receive through a DockChannel FIFO that the test models
+	  behind static stubs: whole words and tail bytes, a FIFO with
+	  partial, exact or no room, the TX and RX thresholds and waits,
+	  timeouts, a count register that reports more than the caller's
+	  buffer, and the receive callback. The FIFO interrupts are
+	  simulated interrupts and the interrupt controller registers are
+	  kernel memory. The tests touch no hardware.
+
+	  If unsure, say N.
+
 config APPLE_MAILBOX
 	tristate "Apple SoC mailboxes"
 	depends on PM
