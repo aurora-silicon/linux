@@ -93,12 +93,6 @@ pub(crate) const GLOBALS_PROGRESS: [(usize, u32); 8] = [
 /// Size of the 27.2 Globals object.
 pub(crate) const GLOBALS_BYTES: usize = 0xe48;
 
-/// Globals words of the three performance-state selectors, in hundredths of a state. All three
-/// take the ceiling of the board's performance-state table, as G14 13.5 (`initdata`), M3 27.2
-/// (`m3_power_26`) and M4 27.2 (`g16/fw/initdata`) write them; a lower value here caps the GPU
-/// clock below what the firmware's power and thermal controller would allow.
-pub(crate) const GLOBALS_PSTATE_SELECTORS: [usize; 3] = [0x88, 0x8c, 0x98];
-
 #[cfg_attr(not(test), kunit_tests(asahi_g14_fw_queues))]
 #[cfg_attr(test, allow(dead_code))]
 mod tests {
@@ -179,26 +173,17 @@ mod tests {
 
     #[test]
     fn progress_words_fit_the_globals_and_leave_power_words_alone() {
-        let power = [0x58usize, 0x5a, 0x5c, 0x6e, 0x84];
+        let power = [0x58usize, 0x5a, 0x5c, 0x6e, 0x84, 0x88, 0x8c, 0x98];
         for (i, &(at, value)) in GLOBALS_PROGRESS.iter().enumerate() {
             assert_eq!(at % 4, 0);
             assert!(at + 4 <= GLOBALS_BYTES);
             assert_ne!(value, 0);
-            assert!(power.iter().chain(&GLOBALS_PSTATE_SELECTORS).all(|&p| p + 4 <= at || at + 4 <= p));
+            assert!(power.iter().all(|&p| p + 4 <= at || at + 4 <= p));
             assert!(GLOBALS_PROGRESS[i + 1..].iter().all(|&(other, _)| other != at));
         }
         // Every progress interval is set: a zero interval is what stopped work in a poll.
         for at in [0x998, 0x99c, 0x9a0] {
             assert!(GLOBALS_PROGRESS.iter().any(|&(o, v)| o == at && v != 0));
-        }
-    }
-
-    #[test]
-    fn pstate_selectors_are_aligned_distinct_words_of_the_globals() {
-        for (i, &at) in GLOBALS_PSTATE_SELECTORS.iter().enumerate() {
-            assert_eq!(at % 4, 0);
-            assert!(at + 4 <= GLOBALS_BYTES);
-            assert!(GLOBALS_PSTATE_SELECTORS[i + 1..].iter().all(|&o| o + 4 <= at || at + 4 <= o));
         }
     }
 }
