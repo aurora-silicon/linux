@@ -1647,6 +1647,32 @@ pub mod g16 {
         assert!(!pools.exhausted_for_mask_mode(&good_vm, pb_mask, picked[0], true));
     }
 
+    #[test]fn render_only_pb_routing_without_quarantine_matches_v29_for_any_boot_history(){
+        use crate::g16::resources::pick_base_pb_slots;
+        let warm = g16::hw::sizes::WARM_PB_SLOTS;
+        // v29 (4310e041) gave a new render arena [start % WARM_PB_SLOTS, home + 1]. With nothing
+        // quarantined the quarantine-aware picker must be that exact pair for every start.
+        for start in 0..(4 * warm) {
+            assert_eq!(pick_base_pb_slots(start, 0), [start % warm, (start + 1) % warm]);
+        }
+        // render.light [procs] d=16 (dcp103a, dcp103b) makes WARM_PB_SLOTS render-only VMs. Earlier
+        // work in the same boot only moves `next_pb_slot`: whatever the start, every warm slot is
+        // the home of exactly one of them and the alternate of exactly one other.
+        for start in [0usize, 1, 7, 15, 16, 39, 1000] {
+            let mut home = [0u32; 32];
+            let mut alt = [0u32; 32];
+            for vm in 0..warm {
+                let [h, a] = pick_base_pb_slots(start + vm, 0);
+                assert_ne!(h, a);
+                home[h] += 1;
+                alt[a] += 1;
+            }
+            assert!(home[..warm].iter().all(|&n| n == 1), "start {start}: {home:?}");
+            assert!(alt[..warm].iter().all(|&n| n == 1), "start {start}: {alt:?}");
+            assert!(home[warm..].iter().chain(&alt[warm..]).all(|&n| n == 0));
+        }
+    }
+
     #[test]fn base_render_quarantine_expands_fresh_vm_and_recovers_displacement(){
         use crate::g16::resources::{BASE_RENDER_SLOTS, EXT_RENDER_TIERS, target_render_slots};
         let mut o=Objects::new();let mut s=Slots::new().unwrap();
