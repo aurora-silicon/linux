@@ -130,9 +130,9 @@ const AUDIO_RET_BUSY: u32 = 0xe00002d5;
 const SPKR_POWER_STATE_PW0: u32 = from_fourcc(b"pw0 ");
 const SPKR_POWER_STATE_PWRD: u32 = from_fourcc(b"pwrd");
 
-/// Leaf power-up retries while the firmware raises the fabric (see `PowerDomain::get`).
-/// Blind attempts before the fabric is raised, and attempts while it rises.
-const PD_GET_ATTEMPTS: u32 = 3;
+/// Leaf power-up attempts with the fabric raised (see `PowerDomain::get`): a
+/// fallback, since the low-power microphone's first report already proves
+/// the fabric up.  Any retry is logged with the attempts it took.
 const PD_GET_RAISED_ATTEMPTS: u32 = 60;
 const PD_GET_RETRY_MS: i64 = 10;
 /// The fabric comes up some tens to hundreds of milliseconds after the
@@ -359,14 +359,15 @@ impl PowerDomain {
     /// the PMGR driver's poll window with the parent still coming up. A
     /// failed resume leaves the virtual domain device in the runtime-PM error
     /// state, where every later request fails with EINVAL; clear that state
-    /// and retry a bounded number of times before giving up.
-    fn get(&self, attempts: u32) -> Result<()> {
+    /// and retry a bounded number of times before giving up.  Returns the
+    /// attempts the domain took.
+    fn get(&self, attempts: u32) -> Result<u32> {
         let mut rc = 0;
         for attempt in 0..attempts {
             // SAFETY: the domain device stays attached for the lifetime of `self`.
             rc = unsafe { bindings::pm_runtime_get_sync(self.dev.as_ptr()) };
             if rc >= 0 {
-                return Ok(());
+                return Ok(attempt + 1);
             }
             // SAFETY: as above; a failed resume still took the usage count.
             unsafe { bindings::pm_runtime_put_noidle(self.dev.as_ptr()) };
@@ -803,8 +804,20 @@ impl SndSocT8140AopData {
                 self.power_down(&pds[..i]);
                 return Err(ENODEV);
             };
-            if let Err(e) = pd.get(attempts) {
-                if e != ETIMEDOUT || attempts > PD_GET_ATTEMPTS {
+            match pd.get(attempts) {
+                Ok(1) => {}
+                Ok(n) => {
+                    // The fabric was not up after the low-power
+                    // microphone's report: the retry hid a slow fabric.
+                    dev_warn!(
+                        self.dev,
+                        "{}: power domain {} up after {} attempts\n",
+                        name,
+                        pd.name,
+                        n
+                    );
+                }
+                Err(e) => {
                     dev_err!(
                         self.dev,
                         "{}: power domain {} did not power up: {:?}\n",
@@ -812,9 +825,9 @@ impl SndSocT8140AopData {
                         pd.name,
                         e
                     );
+                    self.power_down(&pds[..i]);
+                    return Err(e);
                 }
-                self.power_down(&pds[..i]);
-                return Err(e);
             }
         }
         Ok(())

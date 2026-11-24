@@ -1740,9 +1740,11 @@ int iomfb_v26_6_atomic_check(struct apple_dcp *dcp, struct drm_crtc *crtc,
 
 int iomfb_v26_6_modeset(struct apple_dcp *dcp, struct drm_crtc_state *crtc_state)
 {
-	struct dcp_display_mode mode;
+	struct dcp_display_mode *mode __free(kfree) = kzalloc_obj(*mode);
 
-	if (!lookup_mode(dcp, &crtc_state->mode, &mode))
+	if (!mode)
+		return -ENOMEM;
+	if (!lookup_mode(dcp, &crtc_state->mode, mode))
 		return -EINVAL;
 	/*
 	 * The firmware keeps the timing it booted with, which every mode
@@ -1751,8 +1753,8 @@ int iomfb_v26_6_modeset(struct apple_dcp *dcp, struct drm_crtc_state *crtc_state
 	 * (locked 60 Hz).
 	 */
 	if (dcp->v26) {
-		WRITE_ONCE(dcp->v26->timed, mode.vrr);
-		WRITE_ONCE(dcp->v26->refresh, drm_mode_vrefresh(&mode.mode));
+		WRITE_ONCE(dcp->v26->timed, mode->vrr);
+		WRITE_ONCE(dcp->v26->refresh, drm_mode_vrefresh(&mode->mode));
 	}
 	dcp_mode_set_valid(&dcp->mode_state, true);
 	return 0;

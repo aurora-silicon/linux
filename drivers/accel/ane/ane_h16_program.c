@@ -448,12 +448,35 @@ int ane_h16_custom_bars(const struct ane_h16_hwx_snapshot *snapshot,
 	ret = ane_h16_hwx_snapshot_check(snapshot);
 	if (ret)
 		return ret;
-	if (!hwx->program_offset || snapshot->size < 0x8a0 ||
-	    hwx->program_offset > snapshot->size - 0x8a0)
+	if (!hwx->program_offset || snapshot->size < 0x890 ||
+	    hwx->program_offset > snapshot->size - 0x890)
 		return -ENOEXEC;
 	c = (const u8 *)snapshot->bytes + hwx->program_offset;
 	*count = 0;
 	length = get_unaligned_le32(c + 4);
+	if (length == 0x890)
+		return 0;
+	if (length == 0x8b0) {
+		if (snapshot->size < 0x8b0 || hwx->program_offset > snapshot->size - 0x8b0)
+			return -ENOEXEC;
+		bar = get_unaligned_le16(c + 0x890);
+		offset = c[0x893];
+		width = c[0x894];
+		if (!width || width > 16 || offset > 64 - width || dsid >= BIT(width))
+			return -ENOEXEC;
+		bars[0] = (struct ane_h16_custom_bar) {
+			.configuration = 1,
+			.value_type = 1,
+			.bar = bar,
+			.bit_offset = offset,
+			.bit_width = width,
+			.value = dsid,
+		};
+		*count = 1;
+		return 0;
+	}
+	if (snapshot->size < 0x8a0 || hwx->program_offset > snapshot->size - 0x8a0)
+		return -ENOEXEC;
 	bar = get_unaligned_le32(c + 0x868);
 	offset = get_unaligned_le32(c + 0x878);
 	width = get_unaligned_le32(c + 0x87c);
