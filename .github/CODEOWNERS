@@ -1,0 +1,12 @@
+# Code owners for aurora-silicon/linux.
+#
+# Only files whose change affects every user or the release process are
+# listed. Changes to them need a review from an Owner; everything else
+# follows the normal merge policy:
+# https://github.com/aurora-silicon/agent-guidelines/blob/main/policy/merge-policy.md
+# Roles: https://github.com/aurora-silicon/agent-guidelines/blob/main/policy/governance-and-roles.md
+
+/.github/                               @RyanTheTide @DjDeveloperr
+/arch/arm64/configs/aurora_defconfig    @RyanTheTide @DjDeveloperr
+/RELEASES.md                            @RyanTheTide @DjDeveloperr
+/CONTRIBUTING.md                        @RyanTheTide @DjDeveloperr
