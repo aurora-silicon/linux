@@ -567,18 +567,24 @@ impl State {
         true
     }
     /// Takes back one idle live sibling in `eligible`, preferring unpublished
-    /// siblings before published ones. Slots in `installed` or `published` keep
-    /// `released` set so their installed QIDs are reused first.
+    /// siblings before published ones and non-wide siblings before wide-marked
+    /// ones. Slots in `installed` or `published` keep `released` set so their
+    /// installed QIDs are reused first.
     fn reclaim_sibling(&mut self, eligible: u64, installed: u64) -> Option<u8> {
         for allow_published in [false, true] {
-            for slot in 1..cfg::RENDER_SLOTS {
-                let bit = 1u64 << slot;
-                if eligible & bit == 0 || (!allow_published && self.published & bit != 0) {
-                    continue;
-                }
-                let keep_installed = (installed | self.published) & bit != 0;
-                if self.release_unused_sibling(slot as u8, None, keep_installed) {
-                    return Some(slot as u8);
+            for allow_wide in [false, true] {
+                for slot in 1..cfg::RENDER_SLOTS {
+                    let bit = 1u64 << slot;
+                    if eligible & bit == 0
+                        || (!allow_published && self.published & bit != 0)
+                        || (!allow_wide && self.wide & bit != 0)
+                    {
+                        continue;
+                    }
+                    let keep_installed = (installed | self.published) & bit != 0;
+                    if self.release_unused_sibling(slot as u8, None, keep_installed) {
+                        return Some(slot as u8);
+                    }
                 }
             }
         }
@@ -1280,6 +1286,10 @@ impl Pool {
     }
     pub(crate) fn owns_live_slot(&self, owner: u64) -> bool {
         self.state.lock().has_live_owner(owner)
+    }
+    pub(crate) fn is_wide(&self, slot: u8) -> bool {
+        let index = usize::from(slot);
+        index < cfg::RENDER_SLOTS && self.state.lock().wide & (1u64 << index) != 0
     }
     pub(crate) fn note_published(&self, slot: u8) {
         self.state.lock().mark_published(slot);
@@ -2171,6 +2181,83 @@ mod two_pair_tests {
         state.release(2);
         assert_eq!(state.pick(1, 1, Plan::Any), Some(2));
         assert!(!state.can_pick_render(1, 1, Plan::Pair(1)));
+    }
+
+    #[test]
+    fn reclaim_prefers_non_wide_sibling_and_clears_wide_on_detach() {
+        let mut state = State::new();
+        // Owner 1 holds two published pairs; slot 1 holds its one-pair wide mark.
+        state.set_owner(1, 1);
+        state.set_owner(2, 1);
+        state.published = (1u64 << 1) | (1u64 << 2);
+        assert_eq!(state.pick(1, 1, Plan::Pair(1)), Some(1));
+        state.release(1);
+        assert_ne!(state.wide & (1u64 << 1), 0);
+        // Reclaiming a sibling takes the non-wide slot (slot 2) instead of slot 1.
+        assert_eq!(state.reclaim_sibling(State::MASK, State::MASK), Some(2));
+        assert_ne!(state.released & (1u64 << 2), 0);
+        assert_ne!(state.wide & (1u64 << 1), 0);
+        // Reattach slot 2 and explicitly detach the wide slot with keep_installed=true:
+        // the wide mark clears so reclaiming/re-acquiring slot 1 does not leave a stale mark.
+        state.released &= !(1u64 << 2);
+        assert!(state.release_unused_sibling(1, Some(1), true));
+        assert_eq!(state.wide & (1u64 << 1), 0);
+        assert_ne!(state.released & (1u64 << 1), 0);
+        assert_eq!(state.owners[1], 1);
+        // With only slot 2 live, the next one-pair render moves to slot 2.
+        assert_eq!(state.pick(1, 1, Plan::Any), Some(2));
+        state.release(2);
+        // Detach with keep_installed=false also clears the wide mark and owner.
+        state.set_owner(1, 1);
+        state.released &= !(1u64 << 1);
+        assert!(state.release_unused_sibling(2, Some(1), false));
+        assert_eq!(state.owners[2], 0);
+        assert_eq!(state.wide & (1u64 << 2), 0);
+    }
+
+    #[test]
+    fn wide_render_respects_open_queue_capacity_gate_and_release_owner() {
+        let pool = Pool::new(MAX_EXECUTION_CONTEXTS).unwrap();
+        pool.note_build_room(true, 4);
+        let q1 = pool.try_reserve_queue(4).unwrap();
+        let q2 = pool.try_reserve_queue(4).unwrap();
+        let q3 = pool.try_reserve_queue(4).unwrap();
+        // Owner 1 gets two pairs; mark `wide_slot` for one-pair renders, then leave it idle
+        // while the other pair stays busy and capacity shrinks to 3 (= open queues).
+        let a = pool.acquire_render(1, 2, None, u64::MAX, || Ok(())).unwrap();
+        let b = pool.acquire_render(1, 1, None, u64::MAX, || Ok(())).unwrap();
+        let wide_slot = b.slot();
+        assert!(pool.is_wide(wide_slot));
+        drop(b);
+        drop(a);
+        let other = {
+            let mut state = pool.state.lock();
+            let other = (1..cfg::RENDER_SLOTS)
+                .find(|s| *s != usize::from(wide_slot) && state.owns_live(1, *s))
+                .unwrap();
+            state.refs[other] = 1;
+            state.active |= 1u64 << other;
+            other as u8
+        };
+        pool.note_build_room(false, 3);
+        {
+            let mut state = pool.state.lock();
+            // Promoting idle `wide_slot` would push pair_demand from 3 to 4 > cap 3.
+            assert!(!state.can_pick_render_for(1, 1, 3, Plan::Any));
+            assert_eq!(state.pick_for(1, 1, 3, Plan::Any), None);
+            // With capacity 4, the marked slot is picked again.
+            state.render_capacity = 4;
+            assert!(state.can_pick_render_for(1, 1, 3, Plan::Any));
+            assert_eq!(state.pick_for(1, 1, 3, Plan::Any), Some(wide_slot));
+            state.release(wide_slot);
+            state.release(other);
+        }
+        // release_owner clears the wide mark.
+        pool.release_owner(1);
+        assert!(!pool.is_wide(wide_slot));
+        drop(q3);
+        drop(q2);
+        drop(q1);
     }
 
     #[test]

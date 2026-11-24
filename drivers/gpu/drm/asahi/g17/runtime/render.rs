@@ -291,13 +291,16 @@ impl Registry {
         }
         // Prefer an empty reservation or an already parked channel, then a
         // reusable or warmed unpublished pair, then an idle drained published
-        // sibling (render only).
-        for pass in 0..3u8 {
-            if pass == 2 && owner.is_none() {
+        // sibling (render only), preferring non-wide siblings before wide ones.
+        for pass in 0..4u8 {
+            if pass >= 2 && owner.is_none() {
                 break;
             }
             let with_backing = pass != 0;
             for slot in 1..RENDER_SLOTS {
+                if pass == 2 && self.admission.is_wide(slot as u8) {
+                    continue;
+                }
                 if with_backing
                     && self.render.entries[slot].as_ref().is_some_and(|entry| {
                         entry.pair.is_some()
@@ -454,9 +457,12 @@ impl Registry {
     /// only that slot's owner so the next queue reuses them via `bind_owner()`.
     /// The caller destroys any returned backing after dropping the device lock.
     pub(super) fn reclaim_unused_render_sibling(&mut self) -> Result<Option<UnusedRenderSpare>> {
-        for pass in 0..3u8 {
+        for pass in 0..4u8 {
             let with_backing = pass != 0;
             for slot in 1..RENDER_SLOTS {
+                if pass == 2 && self.admission.is_wide(slot as u8) {
+                    continue;
+                }
                 if with_backing
                     && self.render.entries[slot].as_ref().is_some_and(|entry| {
                         entry.pair.is_some()

@@ -379,7 +379,7 @@ def release_fixture():
     pool = '\n'.join(item(source, name) for name in [
         'pub(crate) fn can_reassign_unused_spare(', 'pub(crate) fn reassign_unused_spare(',
         'pub(crate) fn release_unused_sibling(', 'pub(crate) fn owns_live_slot(',
-        'pub(crate) fn hold_render_slots_for_exit_kill(',
+        'pub(crate) fn is_wide(', 'pub(crate) fn hold_render_slots_for_exit_kill(',
         'pub(crate) fn set_held(', 'pub(crate) fn sync_held(', 'pub(crate) fn release_owner('])
     pending = '\n'.join(item(teardown, name) for name in [
         'pub(crate) fn new(', 'pub(crate) fn releasing(', 'fn find(', 'fn insert(',
