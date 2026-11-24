@@ -8,6 +8,7 @@
 # pair on every area line.
 # Routing and labels: https://github.com/aurora-silicon/agent-guidelines/blob/main/docs/MAINTAINER-HANDBOOK.md
 # Merge rules:        https://github.com/aurora-silicon/agent-guidelines/blob/main/policy/merge-policy.md
+# Access tiers:       https://github.com/aurora-silicon/agent-guidelines/blob/main/policy/access-tiers.md
 
 *                                               @aurora-silicon/core @aurora-silicon/omarchy-m
 
