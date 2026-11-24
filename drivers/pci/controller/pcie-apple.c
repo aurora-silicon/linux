@@ -1987,6 +1987,7 @@ static int apple_pcie_adopt_link(struct apple_pcie_port *port)
 	void __iomem *rp, *ep;
 	char name[16];
 	u32 value, bus;
+	u16 tls;
 	u8 cap;
 	bool msi = false;
 	int ret, i;
@@ -2053,7 +2054,7 @@ static int apple_pcie_adopt_link(struct apple_pcie_port *port)
 		port->perst = NULL;
 	}
 
-	/* The currently qualified handoff is Gen3 x1, with no retrain in progress. */
+	/* The qualified handoff is x1, with no retrain in progress. */
 	cap = readb(rp + PCI_CAPABILITY_LIST);
 	for (i = 0; cap && i < 48; i++) {
 		if (cap < 0x40 || (cap & 3))
@@ -2065,13 +2066,17 @@ static int apple_pcie_adopt_link(struct apple_pcie_port *port)
 	if (!cap || i == 48)
 		return -EINVAL;
 	/*
-	 * x1 at up to the Gen3 target the bootloader set. The endpoint picks the speed: the N1's
-	 * ROM personality links at Gen1 and comes back at Gen3 after its root-port reset.
+	 * x1 at up to the target link speed the bootloader set in the root port, which
+	 * it takes from the port's ADT bridge: 8 GT/s where that sets 3 (the N1, the
+	 * USB-A controller), the root port's fastest where it sets none (the J775D's
+	 * 10 Gb Ethernet). The endpoint picks the speed within it: the N1's ROM
+	 * personality links at Gen1 and comes back at Gen3 after its root-port reset.
 	 */
 	value = readw(rp + cap + PCI_EXP_LNKSTA);
+	tls = readw(rp + cap + PCI_EXP_LNKCTL2) & PCI_EXP_LNKCTL2_TLS;
 	if ((value & (PCI_EXP_LNKSTA_NLW | PCI_EXP_LNKSTA_LT)) != (1 << PCI_EXP_LNKSTA_NLW_SHIFT) ||
 	    (value & PCI_EXP_LNKSTA_CLS) < PCI_EXP_LNKSTA_CLS_2_5GB ||
-	    (value & PCI_EXP_LNKSTA_CLS) > PCI_EXP_LNKSTA_CLS_8_0GB)
+	    (value & PCI_EXP_LNKSTA_CLS) > tls)
 		return -ENOLINK;
 
 	/* Refuse an active endpoint or malformed capability chain. */
@@ -2112,10 +2117,10 @@ static int apple_pcie_adopt_link(struct apple_pcie_port *port)
 /*
  * T6050 port bring-up, for an adopted port whose endpoint must come back on a
  * retrained link: port disable, the port reset table, port enable, root complex
- * configuration for Gen3 x1, then the lane PHY, PERST# and the LTSSM. The port's
- * registers are its port<n>, phy<n> and intr2axi<n> blocks; the root complex's
- * are the root port's config space. The boot loader copies the port's tunables
- * onto its node.
+ * configuration (an x1 link at the port's max-link-speed), then the lane PHY,
+ * PERST# and the LTSSM. The port's registers are its port<n>, phy<n> and
+ * intr2axi<n> blocks; the root complex's are the root port's config space. The
+ * boot loader copies the port's tunables onto its node.
  */
 static const struct apple_pcie_reset_reg apple_pcie_t6050_reset_regs[] = {
 	{ 0x088, 0x00000110 },
@@ -2327,7 +2332,12 @@ static int apple_pcie_t6050_port_enable(struct apple_pcie_port *port)
 				     250000);
 }
 
-/* Root complex tunables and a Gen3 x1 link, with the read-only registers opened for it */
+/*
+ * Root complex tunables and an x1 link at the port's DT "max-link-speed" (which the
+ * boot loader fills in from the ADT), 8 GT/s without one, with the read-only
+ * registers opened for it. A speed above the root port's fastest is lowered to it,
+ * as the boot loader does.
+ */
 static int apple_pcie_t6050_port_configure(struct apple_pcie_port *port)
 {
 	static const char * const shadow[] = {
@@ -2338,11 +2348,16 @@ static int apple_pcie_t6050_port_configure(struct apple_pcie_port *port)
 	static const u32 shadow_sel[] = { 0, BIT(24), 0 };
 	void __iomem *dbi = apple_pcie_t6050_dbi(port);
 	int cap = apple_pcie_t6050_exp_cap(dbi);
+	int speed = of_pci_get_max_link_speed(port->np);
+	int top;
+	u32 sls;
 	u16 ctl2;
 	int ret, i;
 
 	if (!cap)
 		return -EIO;
+	if (speed <= 0)
+		speed = PCI_EXP_LNKCTL2_TLS_8_0GT;
 	apple_pcie_t6050_dbi_rmw(dbi, RC_T6050_MISC_CONTROL_1, 0, RC_T6050_DBI_RO_WR_EN);
 	ret = apple_pcie_t6050_tune(port, dbi, "apple,pcie-rc-tunables");
 	for (i = 0; !ret && i < ARRAY_SIZE(shadow); i++) {
@@ -2352,13 +2367,19 @@ static int apple_pcie_t6050_port_configure(struct apple_pcie_port *port)
 	}
 	if (!ret) {
 		apple_pcie_t6050_dbi_rmw(dbi, 0x194, 0, BIT(0));
-		if (!(readl(dbi + cap + PCI_EXP_LNKCAP2) & PCI_EXP_LNKCAP2_SLS_8_0GB))
+		sls = readl(dbi + cap + PCI_EXP_LNKCAP2) & PCI_EXP_LNKCAP2_SLS;
+		top = sls ? __fls(sls) : 0;
+		if (top && speed > top) {
+			dev_info(port->pcie->dev, "port %d: max-link-speed %d above the root port's %d\n",
+				 port->idx, speed, top);
+			speed = top;
+		}
+		if (!top || !(sls & BIT(speed)))
 			ret = -EIO;
 	}
 	if (!ret) {
 		ctl2 = readw(dbi + cap + PCI_EXP_LNKCTL2);
-		writew((ctl2 & ~PCI_EXP_LNKCTL2_TLS) | PCI_EXP_LNKCTL2_TLS_8_0GT,
-		       dbi + cap + PCI_EXP_LNKCTL2);
+		writew((ctl2 & ~PCI_EXP_LNKCTL2_TLS) | speed, dbi + cap + PCI_EXP_LNKCTL2);
 		apple_pcie_t6050_dbi_rmw(dbi, RC_T6050_PORT_LINK_CTRL, RC_T6050_LINK_MODE,
 					 FIELD_PREP(RC_T6050_LINK_MODE, 1));
 		apple_pcie_t6050_dbi_rmw(dbi, RC_T6050_LINK_WIDTH_SPEED_CTRL, RC_T6050_LINK_WIDTH,
@@ -2784,8 +2805,9 @@ static int apple_pcie_t6050_port_routes(struct apple_pcie_port *port, const u32 
  * Root-port reset of an adopted T6050 port, for an endpoint that must come back on a
  * retrained link (the N1 after its ROM boot): PME_Turn_Off to L2, PERST# asserted, the
  * port disabled, reset, enabled and configured, its routes and MSI map rewritten, then the
- * lane PHY, PERST# release and LTSSM to a Gen3 x1 link. The caller has quiesced the
- * endpoint and saved the root port's state; the PCI core restores it.
+ * lane PHY, PERST# release and LTSSM to an x1 link at the port's max-link-speed. The
+ * caller has quiesced the endpoint and saved the root port's state; the PCI core
+ * restores it.
  */
 static int apple_pcie_t6050_reset_root_port(struct pci_host_bridge *bridge,
 					    struct pci_dev *rp)
