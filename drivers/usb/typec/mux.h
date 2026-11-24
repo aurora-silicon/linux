@@ -22,6 +22,7 @@ struct typec_mux_dev {
 	typec_mux_notify_fn_t abort;
 	bool removed;
 	bool safe_after_role;
+	bool usb2_tunnel_fallback;
 	bool transient_timeouts;
 	bool dp_joins_usb;
 };

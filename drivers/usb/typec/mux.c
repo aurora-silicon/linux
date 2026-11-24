@@ -338,6 +338,31 @@ bool typec_mux_safe_after_role(struct typec_mux *mux)
 EXPORT_SYMBOL_GPL(typec_mux_safe_after_role);
 
 /**
+ * typec_mux_usb2_tunnel_fallback - Check for USB2 instead of a tunnel
+ * @mux: Mux handle
+ *
+ * The provider that owns the port's lanes advertises this when it falls
+ * back to USB2 on D+/D- on a request for USB4 or Thunderbolt.
+ *
+ * Return: true if a provider of @mux declared this capability.
+ */
+bool typec_mux_usb2_tunnel_fallback(struct typec_mux *mux)
+{
+	unsigned int i;
+
+	if (IS_ERR_OR_NULL(mux))
+		return false;
+
+	for (i = 0; i < mux->num_mux_devs; i++) {
+		if (mux->mux_devs[i]->usb2_tunnel_fallback)
+			return true;
+	}
+
+	return false;
+}
+EXPORT_SYMBOL_GPL(typec_mux_usb2_tunnel_fallback);
+
+/**
  * typec_mux_dp_joins_usb - Check whether DisplayPort pin D can join a running USB 3 link
  * @mux: Mux handle
  *
@@ -752,6 +777,7 @@ typec_mux_register(struct device *parent, const struct typec_mux_desc *desc)
 	mux_dev->commit = desc->commit;
 	mux_dev->abort = desc->abort;
 	mux_dev->safe_after_role = desc->safe_after_role;
+	mux_dev->usb2_tunnel_fallback = desc->usb2_tunnel_fallback;
 	mux_dev->transient_timeouts = desc->transient_timeouts;
 	mux_dev->dp_joins_usb = desc->dp_joins_usb;
 

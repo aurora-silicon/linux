@@ -105,6 +105,8 @@ struct typec_mux_desc {
 	typec_mux_notify_fn_t abort;
 	/* SAFE needs the USB role consumer to stop the shared PHY first. */
 	bool safe_after_role;
+	/* Serves USB2 on D+/D- in place of a requested USB4/TBT link. */
+	bool usb2_tunnel_fallback;
 	/*
 	 * -ETIMEDOUT from @set only means that the hardware held the change up
 	 * for now: the same state can be applied again later, and is worth
@@ -132,6 +134,7 @@ int typec_mux_begin(struct typec_mux *mux, struct typec_mux_state *state);
 /* Apply the providers while retaining the transaction and ownership. */
 int typec_mux_apply(struct typec_mux *mux);
 bool typec_mux_safe_after_role(struct typec_mux *mux);
+bool typec_mux_usb2_tunnel_fallback(struct typec_mux *mux);
 bool typec_mux_timeout_transient(struct typec_mux *mux);
 bool typec_mux_dp_joins_usb(struct typec_mux *mux);
 int typec_mux_end(struct typec_mux *mux);
@@ -163,6 +166,11 @@ static inline int typec_mux_begin(struct typec_mux *mux, struct typec_mux_state 
 static inline int typec_mux_apply(struct typec_mux *mux) { return 0; }
 
 static inline bool typec_mux_safe_after_role(struct typec_mux *mux)
+{
+	return false;
+}
+
+static inline bool typec_mux_usb2_tunnel_fallback(struct typec_mux *mux)
 {
 	return false;
 }
