@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
- * The 14.x IOMFB board records: which record a DCP gets on which machine,
- * and which DCP firmware image a record admits. The J516C (T6031) record
+ * The 14.x IOMFB board records: which record a DCP gets with which panel
+ * (the compatible of its panel node), and which DCP firmware image a record
+ * admits. The J516C (T6031) record
  * admits only the T6030 image, whose IOMFB layouts were validated, and
  * refuses every other; the existing records are unchanged. Which DCPs stamp
  * their swaps: the internal panel of a T6031 record; the T6030 and T8122
@@ -20,7 +21,7 @@
 
 struct board_ctx {
 	const char *dcp;
-	const char *const *machine;	/* NULL-terminated root compatibles */
+	const char *panel;	/* the panel node's compatible; NULL: none */
 };
 
 static bool board_ctx_dcp_is(const void *ctx, const char *compat)
@@ -30,30 +31,27 @@ static bool board_ctx_dcp_is(const void *ctx, const char *compat)
 	return !strcmp(c->dcp, compat);
 }
 
-static bool board_ctx_machine_is(const void *ctx, const char *compat)
+static bool board_ctx_panel_is(const void *ctx, const char *compat)
 {
 	const struct board_ctx *c = ctx;
-	const char *const *m;
 
-	for (m = c->machine; *m; m++)
-		if (!strcmp(*m, compat))
-			return true;
-	return false;
+	return c->panel && !strcmp(c->panel, compat);
 }
 
-static const struct dcp_v14_board *board_for(const char *dcp, const char *const *machine,
+static const struct dcp_v14_board *board_for(const char *dcp, const char *panel,
 					     bool *known)
 {
-	const struct board_ctx ctx = { .dcp = dcp, .machine = machine };
+	const struct board_ctx ctx = { .dcp = dcp, .panel = panel };
 
-	return dcp_v14_board_select(board_ctx_dcp_is, board_ctx_machine_is, &ctx, known);
+	return dcp_v14_board_select(board_ctx_dcp_is, board_ctx_panel_is, &ctx, known);
 }
 
-static const char *const j516c[] = { "apple,j516c", "apple,t6031", "apple,arm-platform", NULL };
-static const char *const j514c[] = { "apple,j514c", "apple,t6031", "apple,arm-platform", NULL };
-static const char *const j516m[] = { "apple,j516m", "apple,t6034", "apple,arm-platform", NULL };
-static const char *const j516s[] = { "apple,j516s", "apple,t6030", "apple,arm-platform", NULL };
-static const char *const j613[] = { "apple,j613", "apple,t8122", "apple,arm-platform", NULL };
+/* The panel compatibles the board device trees give (t6031-j516c.dts etc). */
+static const char *const j516c = "apple,panel-j516";
+static const char *const j514c = "apple,panel-j514";
+static const char *const j516m = "apple,panel-j516";	/* T6034, t6031-dcp */
+static const char *const j516s = "apple,panel-j516";
+static const char *const j613 = "apple,panel-j613";
 
 static void v14_board_j516c(struct kunit *test)
 {
@@ -65,7 +63,7 @@ static void v14_board_j516c(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, known);
 	KUNIT_EXPECT_STREQ(test, b->name, "J516C");
 	KUNIT_EXPECT_STREQ(test, b->debugfs, "dcp-j516c");
-	KUNIT_EXPECT_STREQ(test, b->machine, "apple,j516c");
+	KUNIT_EXPECT_STREQ(test, b->panel, "apple,panel-j516");
 	KUNIT_EXPECT_STREQ(test, b->handoff, "apple,t6031-handoff");
 	KUNIT_EXPECT_STREQ(test, b->firmware_uuid, J516C_DCP_IMAGE);
 	KUNIT_EXPECT_EQ(test, b->panel_width, 3456);
@@ -91,7 +89,7 @@ static void v14_board_j514c(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, known);
 	KUNIT_EXPECT_STREQ(test, b->name, "J514C");
 	KUNIT_EXPECT_STREQ(test, b->debugfs, "dcp-j514c");
-	KUNIT_EXPECT_STREQ(test, b->machine, "apple,j514c");
+	KUNIT_EXPECT_STREQ(test, b->panel, "apple,panel-j514");
 	KUNIT_EXPECT_STREQ(test, b->handoff, "apple,t6031-handoff");
 	KUNIT_EXPECT_STREQ(test, b->firmware_uuid, J516C_DCP_IMAGE);
 	KUNIT_EXPECT_EQ(test, b->panel_width, 0);
@@ -105,12 +103,20 @@ static void v14_board_j514c(struct kunit *test)
 	KUNIT_EXPECT_PTR_NE(test, b, board_for("apple,t6031-dcp", j516c, &known));
 }
 
-/* A T6031 DCP on a T6034 has no record: refused. */
+/*
+ * A T6031 DCP with the J516 panel gets the J516 record on any machine (the
+ * T6034 J516M uses the T6031 DCP); its firmware image is still checked. A
+ * panel no record names, or no panel node, is refused.
+ */
 static void v14_board_t6031_other_boards(struct kunit *test)
 {
 	bool known;
 
-	KUNIT_EXPECT_NULL(test, board_for("apple,t6031-dcp", j516m, &known));
+	KUNIT_EXPECT_PTR_EQ(test, board_for("apple,t6031-dcp", j516m, &known),
+			    board_for("apple,t6031-dcp", j516c, &known));
+	KUNIT_EXPECT_NULL(test, board_for("apple,t6031-dcp", "apple,panel-other", &known));
+	KUNIT_EXPECT_TRUE(test, known);
+	KUNIT_EXPECT_NULL(test, board_for("apple,t6031-dcp", NULL, &known));
 	KUNIT_EXPECT_TRUE(test, known);
 	/* Not a 14.x internal DCP at all. */
 	KUNIT_EXPECT_NULL(test, board_for("apple,t8112-dcp", j516c, &known));
@@ -149,7 +155,7 @@ static void v14_board_unchanged(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, b);
 	KUNIT_EXPECT_STREQ(test, b->name, "T6030");
 	KUNIT_EXPECT_STREQ(test, b->debugfs, "dcp-t6030");
-	KUNIT_EXPECT_NULL(test, b->machine);
+	KUNIT_EXPECT_NULL(test, b->panel);
 	KUNIT_EXPECT_STREQ(test, b->handoff, "apple,t6030-handoff");
 	KUNIT_EXPECT_STREQ(test, b->firmware_uuid, T6030_DCP_IMAGE);
 	KUNIT_EXPECT_EQ(test, b->panel_width, 0);
@@ -159,8 +165,9 @@ static void v14_board_unchanged(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, b->ctm_set, 0);
 	KUNIT_EXPECT_TRUE(test, dcp_v14_board_admits(b, T6030_DCP_IMAGE));
 	KUNIT_EXPECT_FALSE(test, dcp_v14_board_admits(b, J613_DCP_IMAGE));
-	/* The T6030 record serves a T6030 DCP on any machine, as before. */
-	KUNIT_EXPECT_PTR_EQ(test, board_for("apple,t6030-dcp", j516c, &known), b);
+	/* The T6030 record serves a T6030 DCP with any panel, as before. */
+	KUNIT_EXPECT_PTR_EQ(test, board_for("apple,t6030-dcp", j514c, &known), b);
+	KUNIT_EXPECT_PTR_EQ(test, board_for("apple,t6030-dcp", NULL, &known), b);
 
 	b = board_for("apple,t8122-dcp", j613, &known);
 	KUNIT_ASSERT_NOT_NULL(test, b);
@@ -173,7 +180,7 @@ static void v14_board_unchanged(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, b->log_bringup);
 	KUNIT_EXPECT_FALSE(test, dcp_v14_board_admits(b, T6030_DCP_IMAGE));
 
-	/* A T8122 DCP on a T6031 machine has no record. */
+	/* A T8122 DCP with a panel no T8122 record names has no record. */
 	KUNIT_EXPECT_NULL(test, board_for("apple,t8122-dcp", j516c, &known));
 	KUNIT_EXPECT_TRUE(test, known);
 }
