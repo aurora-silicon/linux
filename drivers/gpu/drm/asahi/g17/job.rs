@@ -541,6 +541,7 @@ pub(crate) struct Scheduler<B: Backend> {
 #[derive(Clone)]
 pub(crate) struct Fences {
     pub(crate) ready: Fence,
+    pub(crate) scheduled: Fence,
     pub(crate) completed: Fence,
     pub(crate) publication: Option<Arc<super::completion::Publication>>,
     pub(crate) owner: Arc<Completion>,
@@ -611,14 +612,9 @@ impl<B: Backend> Scheduler<B> {
         super::trace::schedule(&packet, 0, dependency_count as i32);
         let completed = packet.completion.fence();
         let host_timestamps = packet.completion.has_timestamps();
-        // Only commands which actually write timestamps become host-prefix
-        // producers. Ordinary consumers retain the scheduled ready fence and
-        // their existing firmware dependency path for cross-engine overlap.
-        let host_publication = if host_timestamps {
-            packet.completion.publication()
-        } else {
-            None
-        };
+        // Expose any ordered publication so later commands that overlap execution
+        // with this command still order their completion and error propagation.
+        let host_publication = packet.completion.publication();
         if self.allowance_ms > super::timeout::DEFAULT_ALLOWANCE_MS {
             packet.allowance_end.store(u64::MAX, Ordering::Relaxed);
         }
@@ -642,10 +638,11 @@ impl<B: Backend> Scheduler<B> {
         if let Some(publication) = publication {
             publication.activate();
         }
+        let scheduled = job.fences().scheduled();
         let ready = if host_timestamps {
             completed.clone()
         } else {
-            job.fences().scheduled()
+            scheduled.clone()
         };
         // All fallible scheduler setup precedes early hardware publication. The
         // scheduler still owns watchdog, credits and cancellation after push.
@@ -666,7 +663,7 @@ impl<B: Backend> Scheduler<B> {
             self.backend.count_backlog(&packet);
         }
         job.push();
-        Ok(Fences { ready, completed, publication: host_publication, owner: packet.completion.clone() })
+        Ok(Fences { ready, scheduled, completed, publication: host_publication, owner: packet.completion.clone() })
     }
 }
 

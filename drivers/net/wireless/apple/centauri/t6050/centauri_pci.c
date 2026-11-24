@@ -455,6 +455,7 @@ static int centauri_t6050_cycle(struct centauri_t6050 *c)
 static void centauri_t6050_boot_worker(struct work_struct *work)
 {
 	struct centauri_t6050 *c = container_of(to_delayed_work(work), struct centauri_t6050, boot_work);
+	struct pci_dev *beta = NULL;
 	bool retry = false;
 	int ret;
 
@@ -473,7 +474,7 @@ static void centauri_t6050_boot_worker(struct work_struct *work)
 				c->boot_phase = CEN_BOOT_IPC;
 			break;
 		case CEN_BOOT_IPC:
-			ret = centauri_t6050_start_ipc(c);
+			ret = centauri_t6050_start_ipc(c, &beta);
 			if (!ret)
 				c->boot_phase = CEN_BOOT_READY;
 			break;
@@ -496,6 +497,8 @@ out:
 	if (READ_ONCE(c->removing))
 		c->boot_phase = CEN_BOOT_STOPPED;
 	mutex_unlock(&c->boot_lock);
+	if (beta)
+		centauri_t6050_attach_beta(c, beta);
 	if (retry && !READ_ONCE(c->removing))
 		queue_delayed_work(system_long_wq, &c->boot_work, msecs_to_jiffies(20));
 }
