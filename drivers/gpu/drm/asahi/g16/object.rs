@@ -272,6 +272,30 @@ impl FwObject {
             // SAFETY: ptr() bounds this naturally aligned 64-bit volatile receipt.
             return Ok(u64::from_le(unsafe { (p as *const u64).read_volatile() }));
         }
+        if p as usize % 4 == 0 {
+            // Packed 64-bit firmware fields such as compute::DESCRIPTOR_COUNTER (0xe4c) and
+            // DESCRIPTOR_COMPLETED (0xe54) are 4-byte aligned. Read aligned 32-bit word pairs
+            // rather than falling through to 16 single-byte WC loads in self.read().
+            let pair = |words: *const u32| -> (u32, u32) {
+                rmb();
+                // SAFETY: ptr() bounds 8 bytes and `words` is 4-byte aligned.
+                let lo = u32::from_le(unsafe { words.read_volatile() });
+                // SAFETY: `words.add(1)` stays within the 8-byte range and is 4-byte aligned.
+                let hi = u32::from_le(unsafe { words.add(1).read_volatile() });
+                (lo, hi)
+            };
+            let words = p.cast::<u32>();
+            let mut first = pair(words);
+            for _ in 0..3 {
+                let next = pair(words);
+                if first == next {
+                    rmb();
+                    return Ok(u64::from(next.0) | (u64::from(next.1) << 32));
+                }
+                first = next;
+            }
+            return Err(EAGAIN);
+        }
         let mut first = [0u8; 8];
         let mut next = [0u8; 8];
         self.read(offset, &mut first)?;
