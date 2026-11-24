@@ -108,9 +108,17 @@ int main(int argc,char **argv) {
 		recover(&b);
 		assert(rebind_count == 1);
 		break;
+	case 46:
+		/* A firmware sleep took the controller's state: no unquiesce, a rebind after. */
+		assert(!bcm4377_suspend(&dev));
+		b.sleep_lost = true;
+		assert(!bcm4377_resume(&dev));
+		assert(!b.sleep_lost && !b.quiesced && !b.resume_powered);
+		break;
  default:abort();
  }
-	if (atoi(argv[1]) == 6 || atoi(argv[1]) == 44 || atoi(argv[1]) == 45)
+	if (atoi(argv[1]) == 6 || atoi(argv[1]) == 44 || atoi(argv[1]) == 45 ||
+	    atoi(argv[1]) == 46)
 		assert(rebind_count == 1);
 	else
 		assert(!rebind_count);

@@ -56,7 +56,7 @@ struct bcm4377_hw { unsigned int id; int (*send_calibration)(struct bcm4377_data
 struct bcm4377_data {
  struct hci_dev *hdev; struct pci_dev *pdev; struct bcm4377_hw *hw;
 	bool wake_armed, quiesced, needs_reset, cal_needed, cal_loaded;
-	bool setup_retry_used, setup_retry_pending, setup_retry_blocked;
+	bool setup_retry_used, sleep_lost, setup_retry_pending, setup_retry_blocked;
 	struct delayed_work setup_retry_work;
 	bdaddr_t bdaddr;
 	char *bar0;
@@ -72,6 +72,11 @@ static int rebind_count;
 
 /* Controlled boundary for the existing driver's asynchronous rebind work. */
 static void bcm4377_hci_reset(struct hci_dev *hdev)
+{
+	rebind_count++;
+}
+
+static void bcm4377_queue_rebind(struct bcm4377_data *bcm4377, const char *why)
 {
 	rebind_count++;
 }

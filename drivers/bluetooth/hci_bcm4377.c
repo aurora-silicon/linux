@@ -608,6 +608,8 @@ struct bcm4377_data {
 	bool cal_needed;
 	bool cal_loaded;
 	bool setup_retry_used;
+	/* A firmware-driven sleep took the controller's state: rebind after the resume */
+	bool sleep_lost;
 	bool setup_retry_pending;
 	bool setup_retry_blocked;
 	struct delayed_work setup_retry_work;
@@ -3200,6 +3202,11 @@ static int bcm4377_resume(struct device *dev)
 		bcm4377->wake_armed = false;
 	}
 
+	if (bcm4377->sleep_lost) {
+		/* Its firmware is gone: nothing to unquiesce. */
+		bcm4377->quiesced = false;
+		bcm4377->resume_powered = false;
+	}
 	if (bcm4377->quiesced) {
 		iowrite32(BCM4377_BAR0_SLEEP_CONTROL_UNQUIESCE,
 			  bcm4377->bar0 + BCM4377_BAR0_SLEEP_CONTROL);
@@ -3218,6 +3225,10 @@ static int bcm4377_resume(struct device *dev)
 	bcm4377->resume_powered = false;
 
 	ret = hci_resume_dev(bcm4377->hdev);
+	if (bcm4377->sleep_lost) {
+		bcm4377->sleep_lost = false;
+		bcm4377_queue_rebind(bcm4377, "state lost in a firmware sleep");
+	}
 	apple_radio_sleep_endpoint_resumed(dev, ret);
 	if (!apple_radio_sleep_owned(dev)) {
 		WRITE_ONCE(bcm4377->setup_retry_blocked, false);
@@ -3233,8 +3244,24 @@ static int bcm4377_resume_noirq(struct device *dev)
 	u32 before, after;
 	int ret;
 
-	if (!apple_radio_sleep_owned(dev) || !pm_resume_via_firmware())
+	if (!pm_resume_via_firmware())
 		return 0;
+	/*
+	 * Not under the radio sleep transaction: a firmware-driven sleep that took the
+	 * function's power (PERST at the wake) leaves the private BAR windows at their reset
+	 * values, and the firmware gone. Set the windows up again so that nothing here faults,
+	 * and rebind once the resume is over.
+	 */
+	if (!apple_radio_sleep_owned(dev)) {
+		ret = pci_read_config_dword(bcm4377->pdev, BCM4377_PCIECFG_BAR0_WINDOW1, &before);
+		if (!ret && before == bcm4377->hw->bar0_window1)
+			return 0;
+		bcm4377->sleep_lost = true;
+		ret = bcm4377_init_cfg(bcm4377);
+		dev_info(dev, "lost its state in the sleep (window %#x): windows set up again (%d), rebinding after the resume\n",
+			 before, ret);
+		return 0;
+	}
 
 	/*
 	 * PERST resets the private BAR windows, which PCI's standard saved state

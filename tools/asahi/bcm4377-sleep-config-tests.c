@@ -21,10 +21,11 @@ struct hardware {
 struct bcm4377_data {
 	struct pci_dev *pdev;
 	struct hardware *hw;
+	bool sleep_lost;
 };
 static struct pci_dev pci;
 static struct hardware hw = { 0x18002000, 0x18109000, 0x18106000, true, false };
-static struct bcm4377_data data = { &pci, &hw };
+static struct bcm4377_data data = { .pdev = &pci, .hw = &hw };
 static bool owned, physical, ignore_window;
 static unsigned int ops, writes, fail;
 static u32 cfg[64];
@@ -93,9 +94,20 @@ int main(void)
 
 	fresh();
 
+	/* Outside the radio sleep transaction, the windows intact: one read, nothing else. */
+	owned = false;
+	cfg[0x80 / 4] = hw.bar0_window1;
+	assert(!bcm4377_resume_noirq(&dev));
+	assert(ops == 1 && !writes && !data.sleep_lost);
+	/* ... and lost to a sleep that took the function's power: set up again, then a rebind. */
+	fresh();
 	owned = false;
 	assert(!bcm4377_resume_noirq(&dev));
-	assert(!ops);
+	assert(data.sleep_lost);
+	assert(cfg[0x80 / 4] == hw.bar0_window1);
+	assert(cfg[0x70 / 4] == hw.bar0_window2);
+	assert(cfg[0x78 / 4] == hw.bar0_core2_window2);
+	data.sleep_lost = false;
 	fresh();
 	physical = false;
 	assert(!bcm4377_resume_noirq(&dev));
@@ -115,6 +127,6 @@ int main(void)
 		bcm4377_resume_noirq(&dev);
 		assert(0);
 	}
-	puts("PASS: private PCI windows, retained-path skip and restore failures");
+	puts("PASS: private PCI windows, retained-path skip, lost state and restore failures");
 	return 0;
 }
