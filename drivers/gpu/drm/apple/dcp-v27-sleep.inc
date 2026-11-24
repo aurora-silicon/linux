@@ -1540,6 +1540,9 @@ static int dcp_v27_sleep_prepare(struct apple_dcp *dcp)
 	ret = dcp_v27_step(s, "settle", dcp_v27_sleep_settle(dcp));
 	if (ret)
 		goto undo;
+	/* The presentation is gone and the queue settled: a present that re-armed the tick
+	 * has done so by now. Stop it before the sleep RPCs talk to a mailbox going down. */
+	dcp_edr_tick_stop(dcp);
 	/*
 	 * The display DART stops once the pipe has stopped fetching. With the display's sleep first
 	 * that is after its plain A484(0), answered when the display is off, and before A500: stopped
