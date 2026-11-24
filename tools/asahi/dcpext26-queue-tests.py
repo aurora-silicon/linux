@@ -12,6 +12,8 @@ def function(name):
     a = s.index(name + '(')
     if name == 'ext26_scanout_bytes':
         a = s.rindex('static u64 ext26_scanout_bytes(')
+    elif name == 'iomfb_ext26_release_retained':
+        a = s.rindex('static void iomfb_ext26_release_retained(')
     else:
         a = s.rfind('\n', 0, a) + 1
     b = s.index('\n}', s.index('{', a)) + 2
@@ -71,14 +73,14 @@ static void schedule_work(struct work_struct *w){w->scheduled++;}
 #define current NULL
 static unsigned long jiffies;
 struct apple_dcp;
-struct iomfb_transaction {struct list_head link;void (*start)(struct apple_dcp *,struct iomfb_transaction *);void (*release)(struct iomfb_transaction *);bool brightness_only,presentation,completed,backlight_failed;};
-struct iomfb_scanout_h17p {int request;struct drm_framebuffer *fb[4];struct list_head link;};
+struct iomfb_transaction {struct list_head link;void (*start)(struct apple_dcp *,struct iomfb_transaction *);void (*release)(struct iomfb_transaction *);bool brightness_only,presentation,completed,backlight_failed,backlight_reserved;struct {u64 sequence;} backlight;};
+struct iomfb_scanout_h17p {int request;struct drm_framebuffer *fb[4];struct list_head link;unsigned ext26_epoch;};
 struct apple_dcp {
  void *dev;bool s2r_scanout_stale,s2r_scanout_hold,sleep_v27_closed;
- struct {int lock,timeout,backlight_retry,callback_count;void *owner;unsigned long deadline;unsigned queued;bool presentation_paused,backlight_queued,stopped;struct work_struct work;struct list_head pending,dropped;struct iomfb_transaction *active;struct iomfb_scanout_h17p *scanout,*next_scanout;} iomfb;
+ struct {int lock,timeout,backlight_retry,callback_count,opaque_x_state;void *owner;unsigned long deadline;unsigned queued;bool presentation_paused,backlight_queued,stopped;struct work_struct work;struct list_head pending,dropped;struct iomfb_transaction *active;struct iomfb_scanout_h17p *scanout,*next_scanout;} iomfb;
  struct {bool pending;} present_state_h17p;struct {bool valid;} mode_state;struct {bool connected;} *connector;
  struct {void *data;} chunks;bool native,crashed,ext26_control_pending,ext26_blanked,ext26_normal,ext26_early_complete;
- unsigned ext26_epochs;u64 ext26_retained_bytes;struct list_head ext26_retained;
+ unsigned ext26_epochs,ext26_stops;u64 ext26_retained_bytes;struct list_head ext26_retained;
  int fw_compat;struct work_struct vblank_wq,bl_update_wq;
 };
 static void iomfb_v27_sleep_start(struct apple_dcp *d, struct iomfb_transaction *t) { }
@@ -91,11 +93,25 @@ static int iomfb_enqueue_opaque_x(struct apple_dcp *d){return 0;}
 static unsigned flushed;
 static void iomfb_flush_h17p(struct apple_dcp *d,struct drm_crtc *c,struct drm_atomic_commit *s){assert(d->iomfb.next_scanout);flushed++;d->present_state_h17p.pending=true;}
 #define iomfb_flush_v27 iomfb_flush_h17p
+#define IOMFB_OPAQUE_X_WAITING 1
+#define IOMFB_OPAQUE_X_NEEDED 2
+#define atomic_cmpxchg(p,o,n) ((void)(p))
+static void dcp_backlight_complete(struct apple_dcp *d,u64 seq,bool ok){(void)d;(void)seq;(void)ok;}
+static void iomfb_retire_indicator_h17p(struct apple_dcp *d,struct iomfb_scanout_h17p *s){(void)d;(void)s;}
+static void iomfb_scanout_release_h17p(struct iomfb_scanout_h17p *scanout);
+/* Mock publication of the completed snapshot (request copy omitted). */
+static void iomfb_scanout_complete_h17p(struct apple_dcp *d){
+ struct iomfb_scanout_h17p *previous=d->iomfb.scanout;
+ if(!d->iomfb.next_scanout)return;
+ d->iomfb.scanout=d->iomfb.next_scanout;d->iomfb.next_scanout=NULL;
+ iomfb_scanout_release_h17p(previous);
+}
 '''
 names = ['ext26_scanout_bytes', 'iomfb_scanout_release_h17p',
          'iomfb_scanout_prepare_h17p', 'iomfb_scanout_put_h17p',
          'iomfb_ext26_retain_epoch', 'iomfb_discard_pending',
-         'iomfb_queue_advance', 'iomfb_queue_work', 'iomfb_queue']
+         'iomfb_queue_advance', 'iomfb_queue_work', 'iomfb_queue',
+         'iomfb_ext26_release_retained', 'iomfb_present_complete_h17p']
 code = pre + h + '\n' + '\n'.join(function(n) for n in names)
 a = s.index('struct iomfb_atomic_transaction {')
 b = s.index('\nvoid dcp_flush(', a)
@@ -152,11 +168,63 @@ int main(void){
  iomfb_queue_atomic(&x,&c,&s);iomfb_queue_work(&x.iomfb.work);
  x.present_state_h17p.pending=false;iomfb_queue_advance(&x);
  assert(x.ext26_retained_bytes==(32ULL<<20)&&fb.refs==32&&!x.iomfb.next_scanout);
+ /*
+  * A present of a later epoch completing on a fresh surface releases what
+  * earlier epochs retained: 40 stop/start cycles stay admitted and bounded.
+  * An exposed present that failed in the completing epoch stays retained.
+  */
+ struct apple_dcp y={0};setup(&y);
+ struct obj o2={32ULL<<20};struct drm_framebuffer fb2[2]={{.obj={&o2},.refs=1},{.obj={&o2},.refs=1}};
+ for(unsigned i=0;i<40;i++){
+  struct drm_framebuffer *cur=&fb2[i&1];
+  struct drm_atomic_commit t={.refs=1,.count=1,.new={{.crtc=&c,.visible=true,.fb=cur}}};
+  unsigned before=flushed;
+  iomfb_queue_atomic(&y,&c,&t);iomfb_queue_work(&y.iomfb.work);
+  assert(!y.crashed&&flushed==before+1&&y.iomfb.next_scanout); /* admitted */
+  assert(y.iomfb.next_scanout->ext26_epoch==i);
+  assert(iomfb_present_complete_h17p(&y));
+  y.present_state_h17p.pending=false;iomfb_queue_advance(&y);
+  assert(!y.iomfb.active&&t.refs==1&&y.iomfb.scanout&&y.iomfb.scanout->fb[0]==cur);
+  /* Only the previous epoch's surface was retained; this completion freed it. */
+  assert(list_empty(&y.ext26_retained)&&!y.ext26_retained_bytes);
+  assert(fb2[0].refs+fb2[1].refs==3);
+  assert(!iomfb_ext26_retain_epoch(&y));
+  assert(y.ext26_retained_bytes==(32ULL<<20)&&y.ext26_stops==i+1);
+ }
+ /* Failed exposed present of the current epoch, then a completion in it. */
+ {
+  struct drm_atomic_commit t={.refs=1,.count=1,.new={{.crtc=&c,.visible=true,.fb=&fb2[0]}}};
+  iomfb_queue_atomic(&y,&c,&t);iomfb_queue_work(&y.iomfb.work);
+  y.present_state_h17p.pending=false;iomfb_queue_advance(&y); /* no completion: put */
+  assert(y.ext26_retained_bytes==(64ULL<<20));
+  iomfb_queue_atomic(&y,&c,&t);iomfb_queue_work(&y.iomfb.work);
+  assert(iomfb_present_complete_h17p(&y));
+  y.present_state_h17p.pending=false;iomfb_queue_advance(&y);
+  assert(y.ext26_retained_bytes==(32ULL<<20)); /* same-epoch failure kept */
+  assert(!iomfb_ext26_retain_epoch(&y));
+  /* A completed present with no surface is no witness. */
+  struct drm_atomic_commit off={.refs=1,.count=1,.new={{.crtc=&c,.visible=false,.fb=NULL}}};
+  iomfb_queue_atomic(&y,&c,&off);iomfb_queue_work(&y.iomfb.work);
+  assert(iomfb_present_complete_h17p(&y));
+  y.present_state_h17p.pending=false;iomfb_queue_advance(&y);
+  assert(y.ext26_retained_bytes==(64ULL<<20));
+  /* A layer the completed present left out may still show the old surface. */
+  struct iomfb_scanout_h17p *layer=calloc(1,sizeof(*layer)),done={0};INIT_LIST_HEAD(&layer->link);
+  layer->ext26_epoch=0;layer->fb[1]=&fb2[1];fb2[1].refs++;unsigned held=fb2[1].refs;
+  list_add_tail(&layer->link,&y.ext26_retained);
+  done.ext26_epoch=y.ext26_stops+1;done.fb[0]=&fb2[0];
+  iomfb_ext26_release_retained(&y,&done);
+  assert(fb2[1].refs==held&&y.ext26_retained_bytes==(32ULL<<20)&&y.ext26_retained.next==&layer->link);
+  done.fb[1]=&fb2[1];iomfb_ext26_release_retained(&y,&done);
+  assert(fb2[1].refs==held-1&&list_empty(&y.ext26_retained)&&!y.ext26_retained_bytes);
+ }
  /* Fixture-only teardown; this is not a production DMA-retirement claim. */
  struct iomfb_scanout_h17p *f,*n;
  list_for_each_entry_safe(f,n,&x.ext26_retained,link){list_del(&f->link);iomfb_scanout_release_h17p(f);}
  list_for_each_entry_safe(f,n,&d.ext26_retained,link){list_del(&f->link);iomfb_scanout_release_h17p(f);}
- assert(fb.refs==1&&s.refs==1);
+ list_for_each_entry_safe(f,n,&y.ext26_retained,link){list_del(&f->link);iomfb_scanout_release_h17p(f);}
+ iomfb_scanout_release_h17p(y.iomfb.scanout);
+ assert(fb.refs==1&&s.refs==1&&fb2[0].refs==1&&fb2[1].refs==1);
 }
 '''
 if '--drop-v27-close' in sys.argv:
@@ -171,4 +239,4 @@ with tempfile.TemporaryDirectory() as t:
     result = subprocess.run([str(p.with_suffix(''))])
     if result.returncode:
         sys.exit(1)
-print('PASS production queue/start/prepare/advance/release: 30 epochs, budget refusal, inherited refs, native/classic allocation failure, exposed failed present')
+print('PASS production queue/start/prepare/advance/release: 30 epochs, budget refusal, inherited refs, native/classic allocation failure, exposed failed present, 40 epochs released by later-epoch completion, layers left out stay retained')

@@ -21,6 +21,8 @@
 #include <linux/slab.h>
 #include <linux/unaligned.h>
 
+#include <kunit/static_stub.h>
+
 #include <drm/drm_color_mgmt.h>
 #include <drm/drm_fb_dma_helper.h>
 #include <drm/drm_fourcc.h>
@@ -896,11 +898,7 @@ DCP_THUNK_INOUT(dcp_register_dfb_surface, dcpep_register_dfb_surface,
 
 static void __maybe_unused dcp_ack_dfb_surface(struct apple_dcp *dcp)
 {
-	struct dcp_channel *ch = &dcp->ch_cb;
-	u8 *succ = ch->output[ch->depth - 1];
-
-	*succ = true;
-	dcp_ack(dcp, DCP_CONTEXT_CB);
+	dcp_ack_status(dcp, DCP_CONTEXT_CB, true);
 }
 
 /*
@@ -938,10 +936,7 @@ static void __maybe_unused dcp_fill_dfb_surface(struct apple_dcp *dcp, u8 *s)
 static void complete_dfb_surface(struct apple_dcp *dcp, void *out, void *cookie)
 {
 #if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
-	struct dcp_channel *ch = &dcp->ch_cb;
-
-	*(u8 *)ch->output[ch->depth - 1] = out && !get_unaligned_le32(out);
-	dcp_ack(dcp, DCP_CONTEXT_CB);
+	dcp_ack_status(dcp, DCP_CONTEXT_CB, out && !get_unaligned_le32(out));
 #else
 	dcp_ack_dfb_surface(dcp);
 #endif
@@ -1012,13 +1007,8 @@ static bool iomfbep_cb_create_dfb_surface(struct apple_dcp *dcp, int tag,
 
 static void complete_pmu_service_matched(struct apple_dcp *dcp, void *out, void *cookie)
 {
-	struct dcp_channel *ch = &dcp->ch_cb;
-	u8 *succ = ch->output[ch->depth - 1];
-
-	*succ = true;
-
 	// ack D206 cb_match_pmu_service_2
-	dcp_ack(dcp, DCP_CONTEXT_CB);
+	dcp_ack_status(dcp, DCP_CONTEXT_CB, true);
 }
 
 static bool iomfbep_cb_match_pmu_service_2(struct apple_dcp *dcp, int tag, void *out, void *in)
@@ -1034,13 +1024,8 @@ static bool iomfbep_cb_match_pmu_service_2(struct apple_dcp *dcp, int tag, void 
 
 static void complete_backlight_service_matched(struct apple_dcp *dcp, void *out, void *cookie)
 {
-	struct dcp_channel *ch = &dcp->ch_cb;
-	u8 *succ = ch->output[ch->depth - 1];
-
-	*succ = true;
-
 	// ack D206 cb_match_backlight_service
-	dcp_ack(dcp, DCP_CONTEXT_CB);
+	dcp_ack_status(dcp, DCP_CONTEXT_CB, true);
 }
 
 static bool iomfbep_cb_match_backlight_service(struct apple_dcp *dcp, int tag, void *out, void *in)
@@ -1179,9 +1164,9 @@ static bool dcpep_map_piodma(struct apple_dcp *dcp,
 		goto reject;
 	}
 
-#if DCP_FW_H17(DCP_FW_VER)
 	memdesc->piodma_mapped = true;
 
+#if DCP_FW_H17(DCP_FW_VER)
 	/* the H17P reply echoes the buffer index */
 	*resp = (struct DCP_FW_NAME(dcp_map_buf_resp)) {
 		.buffer = req->buffer,
@@ -1238,12 +1223,8 @@ static bool dcpep_unmap_piodma(struct apple_dcp *dcp,
 	memdesc = &dcp->memdesc[request->buffer];
 
 	if (!test_bit(request->buffer, dcp->memdesc_map) || !memdesc->buf ||
-	    !dcp->iommu_dom)
+	    !memdesc->piodma_mapped || !dcp->iommu_dom)
 		goto not_mapped;
-#if DCP_FW_H17(DCP_FW_VER)
-	if (!memdesc->piodma_mapped)
-		goto not_mapped;
-#endif
 
 	if (memdesc->dva != request->dva) {
 		dev_warn(dcp->dev,
@@ -1278,6 +1259,28 @@ static void dcpep_cb_unmap_piodma(struct apple_dcp *dcp,
 }
 
 /*
+ * Whether one more buffer of @size bytes keeps the live allocate_buffer
+ * buffers within the budget the link backends use as well.
+ */
+static bool dcp_fw_buffer_fits(struct apple_dcp *dcp, size_t size)
+{
+	unsigned int count = 0;
+	size_t bytes = 0;
+	u32 id;
+
+	for_each_set_bit(id, dcp->memdesc_map, DCP_MAX_MAPPINGS) {
+		/* map_physical descriptors have no buffer */
+		if (!dcp->memdesc[id].buf)
+			continue;
+		count++;
+		bytes += ALIGN(dcp->memdesc[id].size, SZ_16K);
+	}
+
+	return count < DCP_FW_MAX_BUFFERS && bytes <= DCP_FW_MAX_BUFFER_BYTES &&
+	       size <= DCP_FW_MAX_BUFFER_BYTES - bytes;
+}
+
+/*
  * Allocate an IOVA contiguous buffer mapped to the DCP. The buffer need not be
  * physically contiguous, however we should save the sgtable in case the
  * buffer needs to be later mapped for PIODMA.
@@ -1293,7 +1296,13 @@ dcpep_cb_allocate_buffer(struct apple_dcp *dcp,
 	int ret;
 
 	/* Validate both wire-size and IOMMU-page rounding before allocating. */
+	/*
+	 * Native26 is bounded by ext26_allocate()'s own session budget: its
+	 * release callback keeps every buffer until rebind, so the live-buffer
+	 * budget below would count the whole session.
+	 */
 	if (!req->size || req->size > SIZE_MAX ||
+	    (!dcp_is_ext26(dcp) && req->size > DCP_FW_MAX_BUFFER) ||
 	    check_add_overflow((size_t)req->size, (size_t)4095, &rounded))
 		return resp;
 	allocated.size = round_down(rounded, 4096);
@@ -1305,6 +1314,13 @@ dcpep_cb_allocate_buffer(struct apple_dcp *dcp,
 
 	if (id >= DCP_MAX_MAPPINGS) {
 		dev_warn(dcp->dev, "DCP overflowed mapping table, ignoring\n");
+		return resp;
+	}
+
+	if (!dcp_is_ext26(dcp) && !dcp_fw_buffer_fits(dcp, size)) {
+		dev_warn_ratelimited(dcp->dev,
+				     "refusing a %zu byte buffer over the DCP buffer budget\n",
+				     size);
 		return resp;
 	}
 
@@ -1377,8 +1393,9 @@ static u8 dcpep_cb_release_mem_desc(struct apple_dcp *dcp, u32 *mem_desc_id)
 	 * the allocator.  The firmware is expected to unmap piodma first, but
 	 * if it releases a descriptor without doing so we would hand the pages
 	 * back while the DART still resolves them -- the display engine would
-	 * then read whoever owns them next.  Only the H17P map_piodma handler
-	 * sets piodma_mapped, so older firmware is unaffected.
+	 * then read whoever owns them next.  If that unmap fails, keep the
+	 * descriptor and its pages rather than free memory the DART still
+	 * resolves.
 	 */
 	if (memdesc->piodma_mapped) {
 		dev_warn(dcp->dev,
@@ -1489,6 +1506,8 @@ static u64 dcpep_cb_get_frequency(struct apple_dcp *dcp)
 static dma_addr_t dcpep_map_reg_dva(struct apple_dcp *dcp, u32 index,
 				    struct resource *rsrc)
 {
+	KUNIT_STATIC_STUB_REDIRECT(dcpep_map_reg_dva, dcp, index, rsrc);
+
 #if DCP_FW_LAYOUT_14_7(DCP_FW_VER)
 	/*
 	 * T8122 dcpext: with the PMGR bandwidth page mapped, the DART faults
@@ -1509,6 +1528,26 @@ static dma_addr_t dcpep_map_reg_dva(struct apple_dcp *dcp, u32 index,
 #endif
 	return dma_map_resource(dcp->dev, rsrc->start, resource_size(rsrc),
 				DMA_BIDIRECTIONAL, 0);
+}
+
+/*
+ * map_reg may come again for a window: hand out the first mapping rather
+ * than map the window (or allocate its scratch page) once more.
+ */
+static dma_addr_t dcpep_map_reg_once(struct apple_dcp *dcp, u32 index,
+				     struct resource *rsrc)
+{
+	dma_addr_t dva;
+
+	if (test_bit(index, dcp->disp_reg_mapped))
+		return dcp->disp_reg_dva[index];
+
+	dva = dcpep_map_reg_dva(dcp, index, rsrc);
+	if (dva == DMA_MAPPING_ERROR)
+		return dva;
+	dcp->disp_reg_dva[index] = dva;
+	set_bit(index, dcp->disp_reg_mapped);
+	return dva;
 }
 #endif
 
@@ -1540,7 +1579,7 @@ static struct DCP_FW_NAME(dcp_map_reg_resp) dcpep_cb_map_reg(struct apple_dcp *d
 		 */
 		dma_addr_t dva = rsrc->start;
 #elif DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
-		dma_addr_t dva = dcpep_map_reg_dva(dcp, req->index, rsrc);
+		dma_addr_t dva = dcpep_map_reg_once(dcp, req->index, rsrc);
 		WARN_ON(dva == DMA_MAPPING_ERROR);
 #endif
 
@@ -1833,12 +1872,9 @@ static u8 dcpep_cb_prop_end(struct apple_dcp *dcp,
 /* Boot sequence */
 static void boot_done(struct apple_dcp *dcp, void *out, void *cookie)
 {
-	struct dcp_channel *ch = &dcp->ch_cb;
-	u8 *succ = ch->output[ch->depth - 1];
 	dev_dbg(dcp->dev, "boot done\n");
 
-	*succ = true;
-	dcp_ack(dcp, DCP_CONTEXT_CB);
+	dcp_ack_status(dcp, DCP_CONTEXT_CB, true);
 }
 
 static void boot_5b(struct apple_dcp *dcp, void *out, void *cookie)
@@ -1927,12 +1963,9 @@ static void boot_1_10(struct apple_dcp *dcp, void *out, void *cookie)
 
 	if (dim.width > 16384 || dim.height > 16384
 	   ) {
-		struct dcp_channel *ch = &dcp->ch_cb;
-
 		dev_err(dcp->dev, "invalid default framebuffer dimensions %ux%u\n",
 			dim.width, dim.height);
-		*(u8 *)ch->output[ch->depth - 1] = false;
-		dcp_ack(dcp, DCP_CONTEXT_CB);
+		dcp_ack_status(dcp, DCP_CONTEXT_CB, false);
 		return;
 	}
 
@@ -1947,12 +1980,9 @@ static void boot_1_10(struct apple_dcp *dcp, void *out, void *cookie)
 	 */
 	memcpy(&dim, out, sizeof(dim));
 	if (!dim.width || !dim.height || dim.width > 16384 || dim.height > 16384) {
-		struct dcp_channel *ch = &dcp->ch_cb;
-
 		dev_err(dcp->dev, "invalid default framebuffer dimensions %ux%u\n",
 			dim.width, dim.height);
-		*(u8 *)ch->output[ch->depth - 1] = false;
-		dcp_ack(dcp, DCP_CONTEXT_CB);
+		dcp_ack_status(dcp, DCP_CONTEXT_CB, false);
 		return;
 	}
 	dev_dbg(dcp->dev, "default framebuffer dimensions %ux%u\n",
@@ -2037,11 +2067,7 @@ static void boot_1_5(struct apple_dcp *dcp, void *out, void *cookie)
 #if DCP_FW_H17(DCP_FW_VER)
 static void d000_done(struct apple_dcp *dcp, void *out, void *cookie)
 {
-	struct dcp_channel *ch = &dcp->ch_cb;
-	u8 *succ = ch->output[ch->depth - 1];
-
-	*succ = true;
-	dcp_ack(dcp, DCP_CONTEXT_CB);
+	dcp_ack_status(dcp, DCP_CONTEXT_CB, true);
 }
 
 /*
@@ -4954,3 +4980,7 @@ void DCP_FW_NAME(iomfb_shutdown)(struct apple_dcp *dcp)
 		dev_warn(dcp->dev, "shutdown scanout stop was not confirmed\n");
 	kref_put(&cookie->refcount, release_wait_cookie);
 }
+
+#if IS_ENABLED(CONFIG_DRM_APPLE_PARSER_KUNIT_TEST)
+#include "iomfb-template-mem-test.c"
+#endif

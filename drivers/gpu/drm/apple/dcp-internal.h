@@ -19,6 +19,7 @@
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
 #include <linux/scatterlist.h>
+#include <linux/sizes.h>
 #include <linux/usb/typec_mux.h>
 
 #include "dcp-fabric.h"
@@ -61,6 +62,8 @@ struct iomfb_scanout_h17p {
 	struct drm_framebuffer *fb[SWAP_SURFACES];
 	/* On iomfb.dropped while the firmware may still read a dropped present. */
 	struct list_head link;
+	/* Native26: the value of ext26_stops when this snapshot was prepared. */
+	unsigned int ext26_epoch;
 };
 
 /* One operation, including all of its nested replies and present completion. */
@@ -143,6 +146,14 @@ struct dcp_chunks {
 };
 
 #define DCP_MAX_MAPPINGS (128) /* should be enough */
+/*
+ * Budget for the buffers the firmware has the driver allocate (D451 and the
+ * link backends' allocate callbacks): the size of one buffer, the number of
+ * live buffers and their bytes in all.
+ */
+#define DCP_FW_MAX_BUFFERS	64
+#define DCP_FW_MAX_BUFFER	SZ_16M
+#define DCP_FW_MAX_BUFFER_BYTES	SZ_64M
 #define MAX_DISP_REGISTERS (7)
 
 struct dcp_mem_descriptor {
@@ -167,6 +178,22 @@ struct dcp_channel {
 	/* Header of each pending AP command record, as dcp_push() wrote it */
 	struct dcp_packet_header header[DCP_MAX_CALL_DEPTH];
 	u16 end[DCP_MAX_CALL_DEPTH];
+	/*
+	 * True for a frame that holds an AP command waiting for its ack, false
+	 * for a firmware callback waiting for ours. An ack from the firmware
+	 * only completes the former, dcp_ack() only answers the latter.
+	 */
+	bool command[DCP_MAX_CALL_DEPTH];
+	/*
+	 * Callback records are copied out of the shared buffer once, into
+	 * separate slots in @cb_shadow at each depth. Firmware can rewrite
+	 * shared memory at any time. A callback's reply
+	 * is built in the copy and written back once, to @cb_reply (in the
+	 * shared record), when the callback is acked. NULL for command frames.
+	 */
+	u8 *cb_shadow;
+	void *cb_reply[DCP_MAX_CALL_DEPTH];
+	u32 cb_reply_len[DCP_MAX_CALL_DEPTH];
 
 	/* Current depth of the call stack. Less than DCP_MAX_CALL_DEPTH */
 	u8 depth;
@@ -692,6 +719,8 @@ struct apple_dcp {
 	struct list_head ext26_retained;
 	u64 ext26_retained_bytes;
 	unsigned int ext26_epochs;
+	/* Successful retaining stops; tags the epoch of each prepared scanout. */
+	unsigned int ext26_stops;
 	struct drm_display_mode ext26_mode;
 	DECLARE_BITMAP(ext26_released, DCP_MAX_MAPPINGS);
 	bool ext26_power_sent;
@@ -740,6 +769,12 @@ struct apple_dcp {
 	/* Display registers mappable to the DCP */
 	struct resource *disp_registers[MAX_DISP_REGISTERS];
 	unsigned int nr_disp_registers;
+	/*
+	 * The DVA map_reg (D411) handed out for each window, mapped on the
+	 * first request and kept for the device's lifetime.
+	 */
+	dma_addr_t disp_reg_dva[MAX_DISP_REGISTERS];
+	DECLARE_BITMAP(disp_reg_mapped, MAX_DISP_REGISTERS);
 
 	struct resource disp_bw_scratch_res;
 	struct resource disp_bw_doorbell_res;

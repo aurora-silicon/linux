@@ -204,6 +204,7 @@ int main(void){struct apple_dcp d={0};assert(!ext26_prop_start(&d,0));assert(!ex
 # native branch, plus the native wire admission, rather than a model allocator.
 s=(R/'drivers/gpu/drm/apple/iomfb_template.c').read_text();pos=s.index('dcpep_cb_allocate_buffer(struct');a=s.rfind('static struct ',0,pos);i=s.index('\n}',pos)+2
 alloc=s[a:i]
+b=s.index('static bool dcp_fw_buffer_fits(');alloc=s[b:s.index('\n}',b)+2]+'\n'+alloc
 h=(R/'drivers/gpu/drm/apple/iomfb_h17p.c').read_text()
 pre4=pre[:pre.index('struct device {')]+r'''
 #define SZ_16K 16384UL
@@ -217,6 +218,14 @@ pre4=pre[:pre.index('struct device {')]+r'''
 #define round_down(x,a) ((x)&~((__typeof__(x))(a)-1))
 #define check_add_overflow(a,b,p) __builtin_add_overflow((a),(b),(p))
 #define dev_warn(...) ((void)0)
+#define dev_warn_ratelimited(...) ((void)0)
+#define SZ_16M (16UL<<20)
+#define SZ_64M (64UL<<20)
+#define DCP_FW_MAX_BUFFERS 64
+#define DCP_FW_MAX_BUFFER SZ_16M
+#define DCP_FW_MAX_BUFFER_BYTES SZ_64M
+#define ALIGN(x,a) (((x)+(a)-1)&~((__typeof__(x))(a)-1))
+#define for_each_set_bit(b,map,n) for((b)=0;(b)<(n);(b)++) if(test_bit((b),(map)))
 struct scatterlist {u64 phys;};
 struct sg_table {struct scatterlist *sgl;unsigned orig_nents;};
 struct dcp_mem_descriptor {size_t size;void *buf;u64 dva;struct sg_table map;bool piodma_mapped;};
@@ -248,5 +257,8 @@ int main(void){struct apple_dcp d={.native=true};set_bit(0,d.memdesc_map);struct
  put_unaligned_le32(1,in+8);ext26_map_piodma(&d,201,out,in);assert(maps==1&&get_unaligned_le32(out)==1&&get_unaligned_le64(out+4)==r.dva&&!get_unaligned_le32(out+12));
  ext26_map_piodma(&d,201,out,in);assert(maps==1&&get_unaligned_le64(out+4)==r.dva);set_bit(1,d.ext26_released);ext26_map_piodma(&d,201,out,in);assert(maps==1&&!get_unaligned_le32(out)&&d.memdesc[1].buf);
  fragmented=true;r=dcpep_cb_allocate_buffer(&d,&q);assert(!r.mem_desc_id&&frees==1&&!test_bit(2,d.memdesc_map));
+ /* Native26 keeps released buffers until rebind and has its own session budget: the live-buffer budget must not apply. */
+ fragmented=false;struct apple_dcp n={.native=true};static char held;for(unsigned k=0;k<100;k++){set_bit(k,n.memdesc_map);n.memdesc[k].buf=&held;n.memdesc[k].size=1<<20;}
+ struct dcp_allocate_buffer_req big={32u<<20};r=dcpep_cb_allocate_buffer(&n,&big);assert(r.mem_desc_id==100);free(n.memdesc[100].buf);
  free(d.memdesc[1].buf);puts("native D451 physically contiguous16K reply and D201 word1, packed16-byte reply, repeat mapping and logical retention");}
 ''')

@@ -89,9 +89,9 @@ static int dcp_v14_pmp_wait_ready(struct device_node *entry,
 #define DCP_V14_MAX_RAW_BYTES	SZ_8M
 #define DCP_V14_EXT_MAX_RAW_SIZE	SZ_8M
 #define DCP_V14_EXT_MAX_RAW_BYTES	(24 * SZ_1M)
-#define DCP_V14_MAX_BUFFERS	64
-#define DCP_V14_MAX_BUFFER	SZ_16M
-#define DCP_V14_MAX_BUFFER_BYTES SZ_64M
+#define DCP_V14_MAX_BUFFERS	DCP_FW_MAX_BUFFERS
+#define DCP_V14_MAX_BUFFER	DCP_FW_MAX_BUFFER
+#define DCP_V14_MAX_BUFFER_BYTES DCP_FW_MAX_BUFFER_BYTES
 /* IOMFB layer of the primary plane. */
 #define DCP_V14_LAYER		0
 #define DCP_V14_BLACK		0xff000000

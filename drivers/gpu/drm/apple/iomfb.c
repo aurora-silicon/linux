@@ -362,8 +362,101 @@ static u8 dcp_pop_depth(u8 *depth)
 	return --(*depth);
 }
 
+/* Each receive channel has a bounded wire window independent of its TX window. */
+#define DCP_CB_AREA 0x8000
+
+/*
+ * Bytes after a record that are zeroed in the copy before its handler runs,
+ * so that a handler whose fixed structures reach past the declared lengths
+ * reads zeros rather than what earlier records left there. The largest
+ * structures a callback handler reads or writes are the dictionary
+ * passthrough request and reply; the tail covers either, starting at the
+ * header, which is where a record with zero declared lengths puts them.
+ */
+#define DCP_CB_TAIL 0x2000
+static_assert(sizeof(struct dcp_packet_header) +
+	      sizeof(struct dcp_dict_passthrough_req) <= DCP_CB_TAIL);
+static_assert(sizeof(struct dcp_packet_header) +
+	      sizeof(struct dcp_dict_passthrough_resp) <= DCP_CB_TAIL);
+#define DCP_CB_SHADOW_SIZE (DCP_CB_AREA + DCP_CB_TAIL)
+
+static void dcp_cb_shadow_free(void *buf)
+{
+	kvfree(buf);
+}
+
+static int dcp_cb_shadow_alloc(struct apple_dcp *dcp)
+{
+	struct dcp_channel *channels[] = {
+		&dcp->ch_cb, &dcp->ch_oobcb, &dcp->ch_async, &dcp->ch_oobasync,
+	};
+	u8 *buf;
+	int ret;
+
+	if (dcp->ch_cb.cb_shadow)
+		return 0;
+	buf = kvzalloc(ARRAY_SIZE(channels) * DCP_MAX_CALL_DEPTH * DCP_CB_SHADOW_SIZE,
+		       GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+	ret = devm_add_action_or_reset(dcp->dev, dcp_cb_shadow_free, buf);
+	if (ret)
+		return ret;
+	for (unsigned int i = 0; i < ARRAY_SIZE(channels); i++)
+		channels[i]->cb_shadow = buf + i * DCP_MAX_CALL_DEPTH * DCP_CB_SHADOW_SIZE;
+	return 0;
+}
+
+/* Whether the innermost frame of @ch is a firmware callback awaiting our ack. */
+static bool dcp_cb_pending(const struct dcp_channel *ch)
+{
+	return ch && ch->depth && ch->depth <= DCP_MAX_CALL_DEPTH &&
+	       !ch->command[ch->depth - 1];
+}
+
+/*
+ * Answer the innermost pending callback on @context with a one-byte status,
+ * for handlers that deferred their ack until a nested command completed.
+ * If that frame is not a callback (the firmware acked out of order, or sent
+ * the callback on another context), refuse instead of writing through a
+ * stale or missing output pointer.
+ */
+void dcp_ack_status(struct apple_dcp *dcp, enum dcp_context_id context,
+		    bool status)
+{
+	struct dcp_channel *ch = dcp_get_channel(dcp, context);
+
+	if (!dcp_cb_pending(ch) || !ch->output[ch->depth - 1]) {
+		dev_err(dcp->dev, "no pending callback to answer on context %X\n",
+			context);
+		WRITE_ONCE(dcp->crashed, true);
+		return;
+	}
+	*(u8 *)ch->output[ch->depth - 1] = status;
+	dcp_ack(dcp, context);
+}
+
+/* Write the reply of the callback at @depth back to its shared record, once. */
+static void dcp_cb_reply_commit(struct dcp_channel *ch, u8 depth)
+{
+	void *reply;
+
+	/* An ack on an empty stack (after a reset) has no frame to commit. */
+	if (depth >= DCP_MAX_CALL_DEPTH)
+		return;
+	reply = ch->cb_reply[depth];
+	if (!reply)
+		return;
+	if (ch->cb_reply_len[depth])
+		memcpy(reply, ch->output[depth], ch->cb_reply_len[depth]);
+	ch->cb_reply[depth] = NULL;
+	ch->cb_reply_len[depth] = 0;
+}
+
 /* Older firmware and the H17G method profile retain their existing transport. */
 static u64 ext26_scanout_bytes(struct iomfb_scanout_h17p *scanout);
+static void iomfb_ext26_release_retained(struct apple_dcp *dcp,
+					 struct iomfb_scanout_h17p *completed);
 
 static bool iomfb_uses_queue(struct apple_dcp *dcp)
 {
@@ -716,6 +809,11 @@ void iomfb_reset_transport(struct apple_dcp *dcp)
 	dcp->ch_oobcb.depth = 0;
 	dcp->ch_async.depth = 0;
 	dcp->ch_oobasync.depth = 0;
+	/* Frames discarded here never send their callback replies. */
+	memset(dcp->ch_cb.cb_reply, 0, sizeof(dcp->ch_cb.cb_reply));
+	memset(dcp->ch_oobcb.cb_reply, 0, sizeof(dcp->ch_oobcb.cb_reply));
+	memset(dcp->ch_async.cb_reply, 0, sizeof(dcp->ch_async.cb_reply));
+	memset(dcp->ch_oobasync.cb_reply, 0, sizeof(dcp->ch_oobasync.cb_reply));
 	dcp->present_state_h17p.pending = false;
 	dcp->present_state_h17p.accepted = false;
 	mutex_unlock(&dcp->iomfb.lock);
@@ -1238,8 +1336,8 @@ static int iomfb_queue_command(struct apple_dcp *dcp, bool oob,
 	return ret;
 }
 
-/* Call a DCP function given by a tag */
-static void dcp_push_context(struct apple_dcp *dcp, enum dcp_context_id context,
+/* A rejected command leaves callback ownership with the caller. */
+static int dcp_push_context(struct apple_dcp *dcp, enum dcp_context_id context,
 			     const struct dcp_method_entry *call, u32 in_len,
 			     u32 out_len, void *data, dcp_callback_t cb, void *cookie)
 {
@@ -1249,12 +1347,12 @@ static void dcp_push_context(struct apple_dcp *dcp, enum dcp_context_id context,
 	/* A KUnit test answers for the firmware. */
 	if (dcp->test_push) {
 		dcp->test_push(dcp, call, cb, cookie);
-		return;
+		return 0;
 	}
 #endif
 
 	if (dcp_fail_stop(dcp) && READ_ONCE(dcp->crashed))
-		return;
+		return -ESHUTDOWN;
 
 	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G &&
 	    call->tag_h17g[0])
@@ -1279,15 +1377,19 @@ static void dcp_push_context(struct apple_dcp *dcp, enum dcp_context_id context,
 	u8 depth;
 	u16 offset;
 
-	if (iomfb_uses_queue(dcp) &&
-	    (!ch || ch->depth >= DCP_MAX_CALL_DEPTH ||
-	     (u64)sizeof(header) + in_len + out_len > 0x8000 ||
-	     dcp_packet_start(ch, ch->depth) >
+	/*
+	 * Every firmware: the frame must fit the channel's call stack and its
+	 * 0x8000-byte transmit window. A firmware that stops acking (or that
+	 * nests too deeply) must not grow the stack past its arrays.
+	 */
+	if (!ch || ch->depth >= DCP_MAX_CALL_DEPTH ||
+	    (u64)sizeof(header) + in_len + out_len > 0x8000 ||
+	    dcp_packet_start(ch, ch->depth) >
 		0x8000 - ALIGN(sizeof(header) + in_len + out_len,
-			       DCP_PACKET_ALIGNMENT))) {
+			       DCP_PACKET_ALIGNMENT)) {
 		dev_err(dcp->dev, "invalid IOMFB command envelope\n");
 		WRITE_ONCE(dcp->crashed, true);
-		return;
+		return -EPROTO;
 	}
 	depth = dcp_push_depth(&ch->depth);
 	offset = dcp_packet_start(ch, depth);
@@ -1311,8 +1413,11 @@ static void dcp_push_context(struct apple_dcp *dcp, enum dcp_context_id context,
 	ch->callbacks[depth] = cb;
 	ch->cookies[depth] = cookie;
 	ch->output[depth] = out + sizeof(header) + in_len;
+	ch->cb_reply[depth] = NULL;
+	ch->cb_reply_len[depth] = 0;
 	ch->header[depth] = header;
 	ch->end[depth] = offset + ALIGN(data_len, DCP_PACKET_ALIGNMENT);
+	ch->command[depth] = true;
 
 	if (dcp_is_ext26(dcp))
 		dma_wmb();
@@ -1327,6 +1432,7 @@ static void dcp_push_context(struct apple_dcp *dcp, enum dcp_context_id context,
 		WRITE_ONCE(dcp->ext26_power_ns, sent ? ktime_get_ns() : 0);
 		WRITE_ONCE(dcp->ext26_power_sent, sent);
 	}
+	return 0;
 }
 
 void dcp_push(struct apple_dcp *dcp, bool oob,
@@ -1341,8 +1447,11 @@ void dcp_push(struct apple_dcp *dcp, bool oob,
 		return;
 	}
 
-	dcp_push_context(dcp, dcp_call_context(dcp, oob), call,
-			 in_len, out_len, data, cb, cookie);
+	if (!dcp_push_context(dcp, dcp_call_context(dcp, oob), call,
+			      in_len, out_len, data, cb, cookie))
+		return;
+	if (cb)
+		cb(dcp, NULL, cookie);
 }
 
 /*
@@ -1365,7 +1474,7 @@ int dcp_push_oob_concurrent(struct apple_dcp *dcp, const struct dcp_method_entry
 		ret = -EBUSY;
 	} else {
 		WRITE_ONCE(dcp->iomfb.owner, current);
-		dcp_push_context(dcp, dcp_call_context(dcp, true), call,
+		ret = dcp_push_context(dcp, dcp_call_context(dcp, true), call,
 				 in_len, out_len, data, cb, cookie);
 		WRITE_ONCE(dcp->iomfb.owner, NULL);
 	}
@@ -1401,8 +1510,7 @@ int dcp_push_nested(struct apple_dcp *dcp, enum dcp_context_id origin,
 	if (!ch || !ch->depth || ch->depth >= DCP_MAX_CALL_DEPTH ||
 	    (u64)sizeof(struct dcp_packet_header) + in_len + out_len > 0x8000)
 		return -EINVAL;
-	dcp_push_context(dcp, context, call, in_len, out_len, data, cb, cookie);
-	return READ_ONCE(dcp->crashed) ? -EPROTO : 0;
+	return dcp_push_context(dcp, context, call, in_len, out_len, data, cb, cookie);
 }
 
 /* Parse a callback tag "D123" into the ID 123. Returns -EINVAL on failure. */
@@ -1429,7 +1537,14 @@ void dcp_ack(struct apple_dcp *dcp, enum dcp_context_id context)
 {
 	struct dcp_channel *ch = dcp_get_channel(dcp, context);
 
-	dcp_pop_depth(&ch->depth);
+	/* Only a pending firmware callback can be answered. */
+	if (!dcp_cb_pending(ch)) {
+		dev_err(dcp->dev, "no pending callback to ack on context %X\n",
+			context);
+		WRITE_ONCE(dcp->crashed, true);
+		return;
+	}
+	dcp_cb_reply_commit(ch, dcp_pop_depth(&ch->depth));
 	if (dcp_is_ext26(dcp))
 		dma_wmb();
 	dcp_send_message(dcp, IOMFB_ENDPOINT,
@@ -2073,31 +2188,45 @@ static bool dcp_external_zero_reply(struct apple_dcp *dcp, int tag,
 	       of_device_is_compatible(dcp->dev->of_node, "apple,t8140-dcpext");
 }
 
+/*
+ * @data points at the record in the shared buffer, which the firmware can
+ * rewrite at any time. It is read exactly once, by the copy into the channel's
+ * private window; everything below, including every handler, sees only that
+ * copy. Handlers build their reply in the copy, and dcp_ack() writes the
+ * validated number of reply bytes back to the shared record.
+ */
 static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
-			    void *data, u32 length, u16 offset)
+			    const void *data, u32 length, u16 offset)
 {
 	struct device *dev = dcp->dev;
-	struct dcp_packet_header *hdr = data;
-	void *in, *out;
+	struct dcp_packet_header *hdr;
+	void *record, *in, *out, *shared_out;
+	u32 in_len, out_len;
 	int tag;
 	struct dcp_channel *ch = dcp_get_channel(dcp, context);
 	u8 depth;
 	bool handled, zero_reply;
 
-	if ((dcp->fw_compat == DCP_FIRMWARE_H17P ||
-	     dcp->fw_compat == DCP_FIRMWARE_V_27_0 ||
-	     dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) &&
-	    (length < sizeof(*hdr) || !ch || ch->depth >= DCP_MAX_CALL_DEPTH ||
-	     offset >= 0x8000 || length > 0x8000 - offset)) {
+	/* Validate the wire range before reading the shared record. */
+	if (length < sizeof(*hdr) || !ch || !ch->cb_shadow ||
+	    ch->depth >= DCP_MAX_CALL_DEPTH ||
+	    offset >= DCP_CB_AREA || length > DCP_CB_AREA - offset) {
 		dev_err(dev, "invalid IOMFB callback envelope\n");
 		dcp->crashed = true;
 		return;
 	}
 
-	/* The header is read below: check the record lies in the shared buffer first. */
-	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
-	    (length < sizeof(*hdr) || offset >= 0x8000 || length > 0x8000 - offset)) {
-		dev_err(dev, "invalid IOMFB callback envelope\n");
+	/* Pending frames own disjoint private storage regardless of wire offsets. */
+	record = ch->cb_shadow + ch->depth * DCP_CB_SHADOW_SIZE;
+	memcpy(record, data, length);
+	memset(record + length, 0, DCP_CB_TAIL);
+	hdr = record;
+	in_len = hdr->in_len;
+	out_len = hdr->out_len;
+
+	if ((u64)sizeof(*hdr) + in_len + out_len > length) {
+		dev_err(dev, "short IOMFB callback (%u, %u, length %u)\n",
+			in_len, out_len, length);
 		dcp->crashed = true;
 		return;
 	}
@@ -2105,59 +2234,52 @@ static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
 	tag = dcp_parse_tag(hdr->tag);
 
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
-	    (!iomfb_check_callback_v26_6_desktop(tag, hdr->in_len, hdr->out_len) ||
-	     (u64)sizeof(*hdr) + hdr->in_len + hdr->out_len != length)) {
+	    (!iomfb_check_callback_v26_6_desktop(tag, in_len, out_len) ||
+	     (u64)sizeof(*hdr) + in_len + out_len != length)) {
 		dev_err(dev, "invalid desktop IOMFB callback %d (%u, %u)\n",
-			tag, hdr->in_len, hdr->out_len);
+			tag, in_len, out_len);
 		dcp->crashed = true;
 		return;
 	}
 
 	handled = tag >= 0 && tag < IOMFB_MAX_CB && dcp->cb_handlers &&
 		  dcp->cb_handlers[tag];
-	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && handled &&
-	    ((u64)sizeof(*hdr) + hdr->in_len + hdr->out_len > length ||
-	     !iomfb_check_callback_v26_6_desktop(tag, hdr->in_len, hdr->out_len))) {
-		dev_err(dev, "short IOMFB callback %d (%u, %u, length %u)\n",
-			tag, hdr->in_len, hdr->out_len, length);
-		dcp->crashed = true;
-		return;
-	}
 	if ((dcp->fw_compat == DCP_FIRMWARE_H17P || dcp->fw_compat == DCP_FIRMWARE_V_27_0) &&
 	    (tag < 0 || tag >= IOMFB_MAX_CB ||
-	     (u64)sizeof(*hdr) + hdr->in_len + hdr->out_len != length ||
+	     (u64)sizeof(*hdr) + in_len + out_len != length ||
 	     (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
 	      handled &&
 	      !(dcp->fw_compat == DCP_FIRMWARE_V_27_0 ?
-		iomfb_v27_callback_size_valid(tag, hdr->in_len, hdr->out_len) :
-		iomfb_check_callback_h17p(dcp, tag, hdr->in_len, hdr->out_len))))) {
+		iomfb_v27_callback_size_valid(tag, in_len, out_len) :
+		iomfb_check_callback_h17p(dcp, tag, in_len, out_len))))) {
 		dev_err(dev, "unqualified IOMFB callback %d (%u, %u)\n",
-			tag, hdr->in_len, hdr->out_len);
+			tag, in_len, out_len);
 		dcp->crashed = true;
 		return;
 	}
 
-	in = data + sizeof(*hdr);
-	out = in + hdr->in_len;
+	in = record + sizeof(*hdr);
+	out = in + in_len;
+	shared_out = (void *)data + sizeof(*hdr) + in_len;
 
-	dcp_trace_panel_setter(dcp, tag, in, hdr->in_len);
+	dcp_trace_panel_setter(dcp, tag, in, in_len);
 
 	if (!handled) {
 		if (dcp_is_ext26(dcp)) {
 			dev_err(dev, "native26 unsupported callback D%03d (%u/%u); session retained\n",
-				tag, hdr->in_len, hdr->out_len);
+				tag, in_len, out_len);
 			WRITE_ONCE(dcp->crashed, true);
 			complete(&dcp->start_done);
 			return;
 		}
 		zero_reply = dcp_external_zero_reply(dcp, tag, context,
-						     hdr->in_len, hdr->out_len);
+						     in_len, out_len);
 		if (!zero_reply &&
 		    (!iomfb_uses_queue(dcp) ||
 		     !test_and_set_bit(tag, dcp->unknown_callbacks)))
 			dev_warn(dev, "received unknown callback %c%c%c%c (%u, %u) context=%u\n",
 				 hdr->tag[3], hdr->tag[2], hdr->tag[1], hdr->tag[0],
-				 hdr->in_len, hdr->out_len, context);
+				 in_len, out_len, context);
 		if (dcp->hw.iomfb_method_profile ==
 		    DCP_IOMFB_METHODS_H17P_EXTERNAL && !zero_reply) {
 			/* Retain the failed session without inventing a successful reply. */
@@ -2176,25 +2298,28 @@ static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
 		if (dcp->fw_compat == DCP_FIRMWARE_H17P ||
 		    dcp->fw_compat == DCP_FIRMWARE_V_27_0 ||
 		    dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) {
-			if (hdr->out_len)
-				memset(out, 0, hdr->out_len);
+			memset(out, 0, out_len);
 			depth = dcp_push_depth(&ch->depth);
 			ch->output[depth] = out;
+			ch->cb_reply[depth] = shared_out;
+			ch->cb_reply_len[depth] = out_len;
 			ch->end[depth] = offset +
 					 ALIGN(length, DCP_PACKET_ALIGNMENT);
+			ch->command[depth] = false;
 			dcp_ack(dcp, context);
 		}
 		return;
 	}
 
-	// TODO: verify that in_len and out_len match our prototypes
-	// for now just clear the out data to have at least consistent results
-	if (hdr->out_len)
-		memset(out, 0, hdr->out_len);
+	/* The reply starts zeroed; only out_len bytes of it go back. */
+	memset(out, 0, out_len);
 
 	depth = dcp_push_depth(&ch->depth);
 	ch->output[depth] = out;
+	ch->cb_reply[depth] = shared_out;
+	ch->cb_reply_len[depth] = out_len;
 	ch->end[depth] = offset + ALIGN(length, DCP_PACKET_ALIGNMENT);
+	ch->command[depth] = false;
 
 	if (dcp->cb_handlers[tag](dcp, tag, out, in))
 		dcp_ack(dcp, context);
@@ -2214,6 +2339,18 @@ static void dcpep_handle_ack(struct apple_dcp *dcp, enum dcp_context_id context)
 
 	if (!ch->depth) {
 		dev_warn(dcp->dev, "ignoring ack on idle context %X\n", context);
+		return;
+	}
+
+	/*
+	 * Only a command this driver sent can be acked. The innermost frame
+	 * may instead be a callback that is still waiting for our reply; its
+	 * output points into the private copy, not into a command record.
+	 */
+	if (!ch->command[ch->depth - 1]) {
+		dev_err(dcp->dev, "ack for a pending callback on context %X\n",
+			context);
+		WRITE_ONCE(dcp->crashed, true);
 		return;
 	}
 
@@ -3780,6 +3917,7 @@ iomfb_scanout_prepare_h17p(struct apple_dcp *dcp, struct drm_crtc *crtc,
 	if (!scanout)
 		return NULL;
 	INIT_LIST_HEAD(&scanout->link);
+	scanout->ext26_epoch = dcp->ext26_stops;
 	if (dcp->iomfb.scanout) {
 		scanout->request = dcp->iomfb.scanout->request;
 		for (i = 0; i < SWAP_SURFACES; i++) {
@@ -4011,6 +4149,7 @@ void iomfb_present_failed_h17p(struct apple_dcp *dcp)
 bool iomfb_present_complete_h17p(struct apple_dcp *dcp)
 {
 	struct iomfb_transaction *transaction = dcp->iomfb.active;
+	struct iomfb_scanout_h17p *completed = dcp->iomfb.next_scanout;
 	struct iomfb_scanout_h17p *dropped, *next;
 
 	lockdep_assert_held(&dcp->iomfb.lock);
@@ -4034,6 +4173,8 @@ bool iomfb_present_complete_h17p(struct apple_dcp *dcp)
 		atomic_cmpxchg(&dcp->iomfb.opaque_x_state, IOMFB_OPAQUE_X_WAITING,
 			       IOMFB_OPAQUE_X_NEEDED);
 	iomfb_scanout_complete_h17p(dcp);
+	if (completed && dcp_is_ext26(dcp))
+		iomfb_ext26_release_retained(dcp, completed);
 	return true;
 }
 
@@ -4579,6 +4720,10 @@ int iomfb_start_rtkit(struct apple_dcp *dcp)
 			return ret;
 	}
 
+	ret = dcp_cb_shadow_alloc(dcp);
+	if (ret)
+		return ret;
+
 	dcp->shmem = dma_alloc_coherent(dcp->dev, DCP_SHMEM_SIZE, &shmem_iova,
 					GFP_KERNEL);
 	if (!dcp->shmem)
@@ -4676,12 +4821,63 @@ int iomfb_ext26_retain_epoch(struct apple_dcp *dcp)
 	dcp->ext26_retained_bytes = dcpext26_backing_add(dcp->ext26_retained_bytes, bytes);
 	if (bytes)
 		dcp->ext26_epochs++;
+	/* Scanouts prepared from here on belong to the next epoch. */
+	dcp->ext26_stops++;
 	dcp->ext26_blanked = false;
 	dcp->ext26_normal = false;
 	dcp->ext26_early_complete = false;
 	dev_dbg(dcp->dev, "native26 retained epoch %u: %llu backing bytes; remote/DMA fence unproved\n",
 		 dcp->ext26_epochs, dcp->ext26_retained_bytes);
 	return 0;
+}
+
+/*
+ * Release the backing retained from earlier epochs once a present of a later
+ * epoch has completed with a surface of its own.  That completion is the
+ * witness iomfb_present_complete_h17p() already relies on within an epoch:
+ * the firmware has latched the new surface and is past every earlier
+ * present.  Every scanout of an earlier epoch was exposed before the stop that
+ * ended it, and that stop found no present pending or prepared, so the
+ * completed present was submitted after all of them.  The new surface cannot
+ * share a GEM object with them (iomfb_ext26_backing_fresh()).  A retained
+ * scanout is released only if the completed present wrote every layer it
+ * used.  Scanouts retained in the completed present's own epoch (an exposed
+ * present that failed) stay until a present of a later epoch completes.
+ */
+static void iomfb_ext26_release_retained(struct apple_dcp *dcp,
+					 struct iomfb_scanout_h17p *completed)
+{
+	struct iomfb_scanout_h17p *scanout, *next;
+	u64 bytes = 0;
+	unsigned int i;
+	bool surface = false;
+
+	lockdep_assert_held(&dcp->iomfb.lock);
+	for (i = 0; i < SWAP_SURFACES; i++)
+		surface |= !!completed->fb[i];
+	if (!surface)
+		return;
+	list_for_each_entry_safe(scanout, next, &dcp->ext26_retained, link) {
+		bool replaced = scanout->ext26_epoch != completed->ext26_epoch;
+
+		/*
+		 * Only a layer the completed present wrote is known to have
+		 * moved on: a layer it left out may still hold the old surface.
+		 */
+		for (i = 0; replaced && i < SWAP_SURFACES; i++)
+			if (scanout->fb[i] && !completed->fb[i])
+				replaced = false;
+		if (!replaced) {
+			bytes = dcpext26_backing_add(bytes, ext26_scanout_bytes(scanout));
+			continue;
+		}
+		list_del(&scanout->link);
+		iomfb_scanout_release_h17p(scanout);
+	}
+	if (bytes != dcp->ext26_retained_bytes)
+		dev_dbg(dcp->dev, "native26 epoch %u present completed; %llu retained backing bytes left\n",
+			completed->ext26_epoch, bytes);
+	dcp->ext26_retained_bytes = bytes;
 }
 
 /* A retained old attachment may still address this GEM object. */

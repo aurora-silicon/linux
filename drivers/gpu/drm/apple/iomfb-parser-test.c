@@ -15,7 +15,7 @@ static int iomfb_parser_test_init(struct kunit *test)
 		return PTR_ERR(dcp->dev);
 	dcp->fw_compat = DCP_FIRMWARE_H17P;
 	test->priv = dcp;
-	return 0;
+	return dcp_cb_shadow_alloc(dcp);
 }
 
 static void iomfb_tag_test(struct kunit *test)
@@ -133,7 +133,280 @@ static void iomfb_callback_size_test(struct kunit *test)
 	dcpep_handle_cb(dcp, DCP_CONTEXT_CB, record, size, 0);
 	KUNIT_EXPECT_FALSE(test, dcp->crashed);
 	KUNIT_EXPECT_EQ(test, dcp->ch_cb.depth, 1);
+	/* A deferred reply is built in the private copy ... */
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(dcp->ch_cb.output[0]), 0x12345678U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32((u8 *)(record + 1) + 0x1044), 0U);
+	/* ... and reaches the shared record when the callback is acked. */
+	dcp_cb_reply_commit(&dcp->ch_cb, dcp_pop_depth(&dcp->ch_cb.depth));
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32((u8 *)(record + 1) + 0x1044), 0x12345678U);
+}
+
+static struct dcp_packet_header *iomfb_race_record;
+
+/* Firmware rewrites the shared record while the handler runs. */
+static bool iomfb_race_callback(struct apple_dcp *dcp, int tag, void *out, void *in)
+{
+	struct dcp_packet_header *hdr = in - sizeof(*hdr);
+
+	iomfb_race_record->in_len = 0x7ffffff0;
+	iomfb_race_record->out_len = 0x7ffffff0;
+	put_unaligned_le32(0xffffffff, iomfb_race_record + 1);
+	/* The handler sees only the copy, which still holds the checked values. */
+	if (hdr->in_len != 8 || hdr->out_len != 4 || get_unaligned_le32(in) != 0x11111111)
+		return false;
+	put_unaligned_le32(0x12345678, out);
+	return false;
+}
+
+static void iomfb_callback_copy_once_test(struct kunit *test)
+{
+	struct apple_dcp *dcp = test->priv;
+	iomfb_cb_handler *handlers;
+	struct dcp_packet_header *record;
+	size_t size = sizeof(*record) + 8 + 4;
+	u8 *canary;
+
+	handlers = kunit_kcalloc(test, IOMFB_MAX_CB, sizeof(*handlers), GFP_KERNEL);
+	record = kunit_kzalloc(test, size + 64, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, handlers);
+	KUNIT_ASSERT_NOT_NULL(test, record);
+	handlers[114] = iomfb_race_callback;
+	dcp->cb_handlers = handlers;
+	dcp->fw_compat = DCP_FIRMWARE_V_12_3;
+	memcpy(record->tag, "411D", 4);
+	record->in_len = 8;
+	record->out_len = 4;
+	put_unaligned_le32(0x11111111, record + 1);
+	put_unaligned_le32(0xdeadbeef, (u8 *)(record + 1) + 8);
+	canary = (u8 *)record + size;
+	memset(canary, 0xa5, 64);
+	iomfb_race_record = record;
+
+	dcpep_handle_cb(dcp, DCP_CONTEXT_CB, record, size, 0x100);
+	KUNIT_ASSERT_FALSE(test, dcp->crashed);
+	KUNIT_ASSERT_EQ(test, dcp->ch_cb.depth, 1);
+	dcp_cb_reply_commit(&dcp->ch_cb, dcp_pop_depth(&dcp->ch_cb.depth));
+	/* The reply lands where the checked lengths put it, and nowhere else. */
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32((u8 *)(record + 1) + 8), 0x12345678U);
+	KUNIT_EXPECT_NULL(test, memchr_inv(canary, 0xa5, 64));
+}
+
+static void iomfb_legacy_callback_lengths_test(struct kunit *test)
+{
+	struct apple_dcp *dcp = test->priv;
+	struct dcp_packet_header record = { .tag = { '4', '1', '1', 'D' } };
+	static const u32 lengths[][2] = {
+		{ U32_MAX, 1 }, { 1, U32_MAX }, { 1, 0 }, { 0, 1 }, { 0x7ffffff0, 0 },
+	};
+	unsigned int i;
+
+	/* Firmware without a size table still gets the envelope and length checks. */
+	dcp->fw_compat = DCP_FIRMWARE_V_12_3;
+	for (i = 0; i < ARRAY_SIZE(lengths); i++) {
+		record.in_len = lengths[i][0];
+		record.out_len = lengths[i][1];
+		dcp->crashed = false;
+		dcpep_handle_cb(dcp, DCP_CONTEXT_CB, &record, sizeof(record), 0);
+		KUNIT_EXPECT_TRUE(test, dcp->crashed);
+		KUNIT_EXPECT_EQ(test, dcp->ch_cb.depth, 0);
+	}
+	/* Command contexts carry no callbacks and have no private window. */
+	record.in_len = 0;
+	record.out_len = 0;
+	dcp->crashed = false;
+	dcpep_handle_cb(dcp, DCP_CONTEXT_CMD, &record, sizeof(record), 0);
+	KUNIT_EXPECT_TRUE(test, dcp->crashed);
+}
+
+static bool iomfb_deferred_callback(struct apple_dcp *dcp, int tag, void *out, void *in)
+{
+	return false;
+}
+
+static void iomfb_push_deferred_callback(struct kunit *test, struct apple_dcp *dcp,
+					 struct dcp_packet_header *record)
+{
+	iomfb_cb_handler *handlers;
+
+	handlers = kunit_kcalloc(test, IOMFB_MAX_CB, sizeof(*handlers), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, handlers);
+	handlers[114] = iomfb_deferred_callback;
+	dcp->cb_handlers = handlers;
+	memcpy(record->tag, "411D", 4);
+	record->in_len = 0;
+	record->out_len = 4;
+	dcpep_handle_cb(dcp, DCP_CONTEXT_CB, record, sizeof(*record) + 4, 0);
+	KUNIT_ASSERT_FALSE(test, dcp->crashed);
+	KUNIT_ASSERT_EQ(test, dcp->ch_cb.depth, 1);
+}
+
+/* An ack from the firmware must complete a command, never a pending callback. */
+static void iomfb_ack_pending_callback_test(struct kunit *test)
+{
+	struct apple_dcp *dcp = test->priv;
+	struct dcp_packet_header *record;
+
+	record = kunit_kzalloc(test, sizeof(*record) + 4, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, record);
+	dcp->fw_compat = DCP_FIRMWARE_V_12_3;
+	iomfb_push_deferred_callback(test, dcp, record);
+	/* A command that once ran at this depth left its header behind. */
+	dcp->ch_cb.header[0].in_len = 0x100;
+	dcpep_handle_ack(dcp, DCP_CONTEXT_CB);
+	KUNIT_EXPECT_TRUE(test, dcp->crashed);
+	KUNIT_EXPECT_EQ(test, dcp->ch_cb.depth, 1);
+}
+
+/* dcp_ack() answers only a pending firmware callback. */
+static void iomfb_ack_without_callback_test(struct kunit *test)
+{
+	struct apple_dcp *dcp = test->priv;
+	static const struct dcp_method_entry call = {
+		.name = "test", .tag = { 'A', '0', '0', '0' },
+	};
+
+	dcp->quiescing = true;	/* nothing is sent to a mailbox */
+	dcp->fw_compat = DCP_FIRMWARE_V_12_3;
+	dcp->shmem = kunit_kzalloc(test, 0x10000, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, dcp->shmem);
+
+	/* An empty stack must not wrap. */
+	dcp_ack(dcp, DCP_CONTEXT_CB);
+	KUNIT_EXPECT_TRUE(test, dcp->crashed);
+	KUNIT_EXPECT_EQ(test, dcp->ch_cb.depth, 0);
+
+	/* Nor may our own command be popped as if it were a callback. */
+	dcp->crashed = false;
+	dcp_push_context(dcp, DCP_CONTEXT_CB, &call, 4, 4, dcp->shmem, NULL, NULL);
+	KUNIT_ASSERT_FALSE(test, dcp->crashed);
+	dcp_ack(dcp, DCP_CONTEXT_CB);
+	KUNIT_EXPECT_TRUE(test, dcp->crashed);
+	KUNIT_EXPECT_EQ(test, dcp->ch_cb.depth, 1);
+}
+
+/*
+ * A deferred handler answers its callback with dcp_ack_status() once its
+ * nested command completes; only a pending callback can be answered.
+ */
+static void iomfb_ack_status_test(struct kunit *test)
+{
+	struct apple_dcp *dcp = test->priv;
+	struct dcp_packet_header *record;
+
+	record = kunit_kzalloc(test, sizeof(*record) + 4, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, record);
+	dcp->quiescing = true;
+	dcp->fw_compat = DCP_FIRMWARE_V_12_3;
+
+	/* The firmware already took the callback off the stack. */
+	dcp_ack_status(dcp, DCP_CONTEXT_CB, true);
+	KUNIT_EXPECT_TRUE(test, dcp->crashed);
+	KUNIT_EXPECT_EQ(test, dcp->ch_cb.depth, 0);
+
+	/* The status reaches the pending callback's reply, then the shared record. */
+	dcp->crashed = false;
+	iomfb_push_deferred_callback(test, dcp, record);
+	dcp_ack_status(dcp, DCP_CONTEXT_CB, true);
+	KUNIT_EXPECT_FALSE(test, dcp->crashed);
+	KUNIT_EXPECT_EQ(test, dcp->ch_cb.depth, 0);
+	KUNIT_EXPECT_EQ(test, *((u8 *)(record + 1)), 1);
+}
+
+struct iomfb_refused_cookie {
+	unsigned int calls;
+	bool out_null;
+};
+
+static void iomfb_refused_complete(struct apple_dcp *dcp, void *out, void *cookie)
+{
+	struct iomfb_refused_cookie *c = cookie;
+
+	c->calls++;
+	c->out_null = !out;
+}
+
+/* Every firmware bounds the command stack before it writes a frame. */
+static void iomfb_command_depth_test(struct kunit *test)
+{
+	static const struct dcp_method_entry call = {
+		.name = "test", .tag = { 'A', '0', '0', '0' },
+	};
+	static const enum dcp_firmware_version fws[] = {
+		DCP_FIRMWARE_V_12_3, DCP_FIRMWARE_V_13_5, DCP_FIRMWARE_V_26_6_DESKTOP,
+	};
+	struct apple_dcp *dcp = test->priv;
+	struct iomfb_refused_cookie done;
+	unsigned int i;
+
+	dcp->shmem = kunit_kzalloc(test, 0x10000, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, dcp->shmem);
+	dcp->quiescing = true;
+	dcp->iomfb.owner = current;
+	for (i = 0; i < ARRAY_SIZE(fws); i++) {
+		dcp->fw_compat = fws[i];
+		dcp->crashed = false;
+		memset(&dcp->ch_cmd, 0, sizeof(dcp->ch_cmd));
+		dcp->ch_cmd.depth = DCP_MAX_CALL_DEPTH;
+		done = (struct iomfb_refused_cookie){};
+		dcp_push_context(dcp, DCP_CONTEXT_CMD, &call, 4, 4, &i,
+				 iomfb_refused_complete, &done);
+		KUNIT_EXPECT_TRUE(test, dcp->crashed);
+		KUNIT_EXPECT_EQ(test, dcp->ch_cmd.depth, DCP_MAX_CALL_DEPTH);
+		/* The caller retains ownership when the frame is refused. */
+		KUNIT_EXPECT_EQ(test, done.calls, 0U);
+		/* A frame that does not fit the transmit window is refused too. */
+		dcp->crashed = false;
+		dcp->ch_cmd.depth = 0;
+		done = (struct iomfb_refused_cookie){};
+		dcp_push(dcp, false, &call, 0x8000, 0, dcp->shmem,
+			 iomfb_refused_complete, &done);
+		KUNIT_EXPECT_TRUE(test, dcp->crashed);
+		KUNIT_EXPECT_EQ(test, dcp->ch_cmd.depth, 0);
+		KUNIT_EXPECT_EQ(test, done.calls, 1U);
+		KUNIT_EXPECT_TRUE(test, done.out_null);
+		/* A command that fits is pushed and marked as a command frame. */
+		dcp->crashed = false;
+		dcp_push_context(dcp, DCP_CONTEXT_CMD, &call, 4, 4, &i, NULL, NULL);
+		KUNIT_EXPECT_FALSE(test, dcp->crashed);
+		KUNIT_EXPECT_EQ(test, dcp->ch_cmd.depth, 1);
+		KUNIT_EXPECT_TRUE(test, dcp->ch_cmd.command[0]);
+	}
+}
+
+static void iomfb_nested_callback_shadow_test(struct kunit *test)
+{
+	struct apple_dcp *dcp = test->priv;
+	struct dcp_packet_header *record;
+	void *outer_reply;
+
+	record = kunit_kzalloc(test, sizeof(*record) + 4, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, record);
+	dcp->fw_compat = DCP_FIRMWARE_V_12_3;
+	iomfb_push_deferred_callback(test, dcp, record);
+	outer_reply = dcp->ch_cb.output[0];
+	put_unaligned_le32(123, outer_reply);
+
+	/* Each frame has a distinct reply even when the wire offset is reused. */
+	dcpep_handle_cb(dcp, DCP_CONTEXT_CB, record, sizeof(*record) + 4, 0);
+	KUNIT_ASSERT_FALSE(test, dcp->crashed);
+	KUNIT_ASSERT_EQ(test, dcp->ch_cb.depth, 2);
+	KUNIT_EXPECT_PTR_NE(test, dcp->ch_cb.output[1], outer_reply);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(outer_reply), 123U);
+}
+
+/* Bytes past a record read as zero, not as what an earlier record left there. */
+static void iomfb_callback_tail_test(struct kunit *test)
+{
+	struct apple_dcp *dcp = test->priv;
+	struct dcp_packet_header *record;
+
+	record = kunit_kzalloc(test, sizeof(*record) + 4, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, record);
+	dcp->fw_compat = DCP_FIRMWARE_V_12_3;
+	memset(dcp->ch_cb.cb_shadow, 0x5a, DCP_CB_SHADOW_SIZE);
+	iomfb_push_deferred_callback(test, dcp, record);
+	KUNIT_EXPECT_NULL(test, memchr_inv(dcp->ch_cb.cb_shadow + sizeof(*record) + 4, 0,
+					   DCP_CB_TAIL));
 }
 
 static struct kunit_case iomfb_parser_cases[] = {
@@ -142,6 +415,14 @@ static struct kunit_case iomfb_parser_cases[] = {
 	KUNIT_CASE(iomfb_callback_envelope_test),
 	KUNIT_CASE(iomfb_callback_lengths_test),
 	KUNIT_CASE(iomfb_callback_size_test),
+	KUNIT_CASE(iomfb_callback_copy_once_test),
+	KUNIT_CASE(iomfb_legacy_callback_lengths_test),
+	KUNIT_CASE(iomfb_ack_pending_callback_test),
+	KUNIT_CASE(iomfb_ack_without_callback_test),
+	KUNIT_CASE(iomfb_ack_status_test),
+	KUNIT_CASE(iomfb_command_depth_test),
+	KUNIT_CASE(iomfb_callback_tail_test),
+	KUNIT_CASE(iomfb_nested_callback_shadow_test),
 	{}
 };
 

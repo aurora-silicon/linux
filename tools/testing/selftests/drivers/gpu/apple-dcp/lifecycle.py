@@ -2126,7 +2126,13 @@ enum dcp_context_id { DCP_CONTEXT_CB = 0, DCP_CONTEXT_ASYNC = 3 };
 struct device_node { bool external; };
 struct device { struct device_node *of_node; };
 struct dcp_packet_header { char tag[4]; u32 in_len, out_len; };
-struct dcp_channel { unsigned depth; void *output[8]; unsigned end[8]; };
+struct dcp_channel { unsigned depth; void *output[8]; unsigned end[8]; u8 *cb_shadow; void *cb_reply[8]; u32 cb_reply_len[8]; bool command[8]; };
+#define DCP_CB_AREA 0x8000
+#define DCP_CB_TAIL 0x2000
+#define DCP_CB_SHADOW_SIZE (DCP_CB_AREA + DCP_CB_TAIL)
+/* The private callback copy: the window plus its slack. */
+static struct dcp_channel *dcp_shadowed(struct dcp_channel *ch)
+{ static u8 buf[DCP_MAX_CALL_DEPTH * DCP_CB_SHADOW_SIZE]; if (!ch->cb_shadow) ch->cb_shadow = buf; return ch; }
 struct apple_dcp {
     struct { int iomfb_method_profile; } hw;
     struct device *dev;
@@ -2141,7 +2147,7 @@ struct apple_dcp {
 static bool machine;
 static unsigned acks, case_tag;
 static struct dcp_channel *dcp_get_channel(struct apple_dcp *d, enum dcp_context_id c)
-{ (void)c; return &d->channel; }
+{ (void)c; return dcp_shadowed(&d->channel); }
 static int dcp_parse_tag(char *p) { (void)p; return case_tag; }
 static bool of_machine_is_compatible(const char *n) { (void)n; return machine; }
 static bool of_device_is_compatible(struct device_node *n, const char *s)
@@ -2155,8 +2161,14 @@ static bool iomfb_uses_queue(struct apple_dcp *d) { (void)d; return false; }
 static bool test_and_set_bit(int t, unsigned long *b) { (void)t; (void)b; return false; }
 static void complete(int *p) { *p = 1; }
 static u8 dcp_push_depth(unsigned *d) { return (*d)++; }
+/* As dcp_ack(): pop the callback frame and write its reply back once. */
 static void dcp_ack(struct apple_dcp *d, enum dcp_context_id c)
-{ (void)c; acks++; d->channel.depth--; }
+{
+    struct dcp_channel *ch = &d->channel; unsigned k;
+    (void)c; acks++; k = --ch->depth;
+    if (ch->cb_reply[k]) memcpy(ch->cb_reply[k], ch->output[k], ch->cb_reply_len[k]);
+    ch->cb_reply[k] = 0;
+}
 """
     suffix = r"""
 int main(void)

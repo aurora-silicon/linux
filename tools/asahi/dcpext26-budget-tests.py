@@ -28,12 +28,12 @@ static void list_splice_tail_init(struct list_head *n,struct list_head *h){while
 #define list_for_each_entry(p,h,m) for(struct list_head *it=(h)->next;it!=(h)&&((p)=entry(it),1);it=it->next)
 struct obj {u64 size;};
 struct fb {struct obj *obj[1];};
-struct iomfb_scanout_h17p {struct fb *fb[4];struct list_head link;};
+struct iomfb_scanout_h17p {struct fb *fb[4];struct list_head link;unsigned ext26_epoch;};
 struct apple_dcp {
  struct {int lock;void *active;struct iomfb_scanout_h17p *scanout,*next_scanout;struct list_head dropped;} iomfb;
  struct {bool pending;} present_state_h17p;struct {void *data;} chunks;
  bool ext26_control_pending,ext26_blanked,ext26_normal,ext26_early_complete;
- unsigned ext26_epochs;u64 ext26_retained_bytes;struct list_head ext26_retained;
+ unsigned ext26_epochs,ext26_stops;u64 ext26_retained_bytes;struct list_head ext26_retained;
 };
 static bool idle=true;
 static bool iomfb_channels_idle(struct apple_dcp *d){(void)d;return idle;}
