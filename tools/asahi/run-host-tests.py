@@ -183,6 +183,9 @@ ASAHI_TESTS = {
         + mutations('--mutation', ('bound-only', 'stopped-holds', 'invert-runs', 'no-lock',
                                      'leak-device', 'leak-node', 'ignore-dcp'), out())
         + [(out() + ['--ref', 'a7638d51880ce077cfb3edfa7ff638de2be74c85'], KILL)],
+    # A DCP whose firmware runs through the sleep holds its DP PHYs' domains.
+    'dcp-sleep-phy-hold-tests.py': [([], PASS)]
+        + mutations('--mutation', ('no-route', 'no-own-phy', 'class-device', 'no-err-check'), []),
     'dcp-bw-scratch-window-tests.py': [([], PASS)] + mutations('--mutation', ('old-check', 'start-only'), []),
     'clpc-gpu-demand-tests.py': [([], PASS)],
     'clpc-high-power-cleanup-tests.py': [(out(), PASS),
