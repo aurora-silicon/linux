@@ -225,7 +225,12 @@ impl job::Backend for Backend {
     }
 
     fn render_scs_blocks(&self, pages: [u16; 2]) -> Result<usize> {
-        crate::g17::fw::render_rt::required_blocks(self.shared.active_cores, pages, self.pairs)
+        crate::g17::fw::render_rt::required_blocks(
+            self.shared.active_cores,
+            self.shared.clusters,
+            pages,
+            self.pairs,
+        )
     }
 
     fn ensure_compute(&self, command: &crate::g17::command::Validated) -> Result {

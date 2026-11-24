@@ -146,6 +146,7 @@ S2IDLE_FIXTURE = r'''
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+typedef uint8_t u8;
 typedef uint32_t u32;
 #define BIT(n) (1U << (n))
 #define GENMASK(h, l) ((~0U << (l)) & (~0U >> (31 - (h))))
@@ -187,23 +188,71 @@ struct apple_pcie_pd {
 };
 struct apple_dart_cio { int dummy; };
 struct hw_info;
+struct list_head {
+    struct list_head *next, *prev;
+};
+#define list_for_each_entry(pos, head, member)     for (pos = container_of((head)->next, typeof(*pos), member);          &pos->member != (head);          pos = container_of(pos->member.next, typeof(*pos), member))
+static void list_init(struct list_head *head)
+{
+    head->next = head;
+    head->prev = head;
+}
+static void list_add_tail(struct list_head *entry, struct list_head *head)
+{
+    entry->next = head;
+    entry->prev = head->prev;
+    head->prev->next = entry;
+    head->prev = entry;
+}
+struct apple_pcie_port {
+    struct list_head entry;
+    unsigned int idx;
+    bool link_failed;
+    u8 regs[0x900];
+};
 struct apple_pcie {
     struct device *dev;
     const struct hw_info *hw;
+    u8 *base;
+    struct list_head ports;
     bool power_retained, kernel_init, tunnel_cold_init;
     bool bus_stopped, resume_failed, link_kept;
     struct apple_pcie_pd *pds;
     unsigned int num_pds, pd_held;
     struct apple_dart_cio *cio_dart;
-    bool cio_prepared;
+    bool cio_prepared, neo_sleep_armed, t6050_down;
+    unsigned int managed_sids;
+    void *t6050_port, *t6050_dart;
+    u32 t6050_parked;
 };
 static bool s2idle_keep_link = true;
 static int pm_suspend_target_state = PM_SUSPEND_TO_IDLE;
+static bool suspend_via_firmware;
 static bool link_healthy = true;
 static unsigned int radio_prepare_calls, warn_calls;
+static u32 readl(const void *addr)
+{
+    u32 v;
+
+    memcpy(&v, addr, sizeof(v));
+    return v;
+}
+static void writel(u32 v, void *addr)
+{
+    memcpy(addr, &v, sizeof(v));
+}
+static u32 apple_pcie_port_readl(struct apple_pcie_port *port, u32 reg)
+{
+    assert(reg + sizeof(u32) <= sizeof(port->regs));
+    return readl(port->regs + reg);
+}
 static bool pm_suspend_no_platform(void)
 {
     return pm_suspend_target_state == PM_SUSPEND_TO_IDLE;
+}
+static bool pm_suspend_via_firmware(void)
+{
+    return suspend_via_firmware;
 }
 static struct apple_pcie *apple_pcie_lookup(struct device *dev)
 {
@@ -274,8 +323,10 @@ static void reset_host(struct device *dev, struct apple_pcie *pcie,
     pcie->pds = pd;
     pcie->num_pds = 1;
     pcie->cio_dart = cio_dart;
+    list_init(&pcie->ports);
     s2idle_keep_link = true;
     pm_suspend_target_state = PM_SUSPEND_TO_IDLE;
+    suspend_via_firmware = false;
     link_healthy = true;
     radio_prepare_calls = 0;
     warn_calls = 0;
@@ -401,6 +452,98 @@ int main(void)
     assert(apple_pcie_prepare(&dev) == 0 && radio_prepare_calls == 1 && warn_calls == 0);
     assert(apple_pcie_keep_link(&pcie) && pcie.pd_held == 0 && dev.add_calls == 0);
 
+    /* Adopted T6050 host: s2idle and firmware-suspend refusals in prepare. */
+    const struct hw_info *t6050_adopt = match_compat("apple,t6050-pcie");
+    assert(t6050_adopt && t6050_adopt->adopt_link);
+
+    u8 rc_regs[0x100];
+    struct apple_pcie_port p0, p1;
+    int dummy_port = 1, dummy_dart = 1;
+
+    #define RESET_ADOPTED() do {         reset_host(&dev, &pcie, &pd, t6050_adopt, NULL);         memset(rc_regs, 0, sizeof(rc_regs));         pcie.base = rc_regs;         writel(CORE_RC_CTL_RUN, rc_regs + CORE_RC_CTL);         writel(CORE_RC_STAT_READY, rc_regs + CORE_RC_STAT);         memset(&p0, 0, sizeof(p0));         p0.idx = 0;         writel(PORT_STATUS_READY, p0.regs + PORT_STATUS);         writel(PORT_LINKSTS_UP, p0.regs + PORT_LINKSTS);         list_add_tail(&p0.entry, &pcie.ports);         memset(&p1, 0, sizeof(p1));         p1.idx = 1;         writel(PORT_STATUS_READY, p1.regs + PORT_STATUS);         writel(PORT_LINKSTS_UP, p1.regs + PORT_LINKSTS);         list_add_tail(&p1.entry, &pcie.ports);     } while (0)
+
+    /* Healthy adopted host passes s2idle prepare. */
+    RESET_ADOPTED();
+    assert(apple_pcie_prepare(&dev) == 0 && radio_prepare_calls == 1 && warn_calls == 0);
+
+    /* Non-s2idle without firmware suspend refuses with -EBUSY in prepare. */
+    RESET_ADOPTED();
+    pm_suspend_target_state = PM_SUSPEND_MEM;
+    assert(apple_pcie_prepare(&dev) == -EBUSY && radio_prepare_calls == 0 && warn_calls == 1);
+
+    /* Root complex not running or not ready refuses with -ENOLINK. */
+    RESET_ADOPTED();
+    writel(0, rc_regs + CORE_RC_CTL);
+    assert(apple_pcie_prepare(&dev) == -ENOLINK && radio_prepare_calls == 0 && warn_calls == 1);
+
+    RESET_ADOPTED();
+    writel(0, rc_regs + CORE_RC_STAT);
+    assert(apple_pcie_prepare(&dev) == -ENOLINK && radio_prepare_calls == 0 && warn_calls == 1);
+
+    /* Unparked port link_failed / not ready / link down / interrupt refuses with -ENOLINK. */
+    RESET_ADOPTED();
+    p1.link_failed = true;
+    assert(apple_pcie_prepare(&dev) == -ENOLINK && radio_prepare_calls == 0 && warn_calls == 1);
+
+    RESET_ADOPTED();
+    writel(0, p1.regs + PORT_STATUS);
+    assert(apple_pcie_prepare(&dev) == -ENOLINK && radio_prepare_calls == 0 && warn_calls == 1);
+
+    RESET_ADOPTED();
+    writel(PORT_LINKSTS_UP | PORT_LINKSTS_BUSY, p1.regs + PORT_LINKSTS);
+    assert(apple_pcie_prepare(&dev) == -ENOLINK && radio_prepare_calls == 0 && warn_calls == 1);
+
+    RESET_ADOPTED();
+    writel(BIT(PORT_INT_LINK_DOWN), p1.regs + PORT_INTSTAT);
+    assert(apple_pcie_prepare(&dev) == -ENOLINK && radio_prepare_calls == 0 && warn_calls == 1);
+
+    /* Parked port with dead link registers is skipped and passes prepare. */
+    RESET_ADOPTED();
+    p1.link_failed = true;
+    writel(0, p1.regs + PORT_STATUS);
+    writel(0, p1.regs + PORT_LINKSTS);
+    writel(BIT(PORT_INT_LINK_DOWN), p1.regs + PORT_INTSTAT);
+    pcie.t6050_parked = BIT(p1.idx);
+    assert(apple_pcie_prepare(&dev) == 0 && radio_prepare_calls == 1 && warn_calls == 0);
+
+    /* Firmware suspend refuses without both t6050_port and t6050_dart, passes with both. */
+    RESET_ADOPTED();
+    pm_suspend_target_state = PM_SUSPEND_MEM;
+    suspend_via_firmware = true;
+    assert(apple_pcie_prepare(&dev) == -EBUSY && radio_prepare_calls == 0 && warn_calls == 1);
+
+    RESET_ADOPTED();
+    pm_suspend_target_state = PM_SUSPEND_MEM;
+    suspend_via_firmware = true;
+    pcie.t6050_port = &dummy_port;
+    assert(apple_pcie_prepare(&dev) == -EBUSY && radio_prepare_calls == 0 && warn_calls == 1);
+
+    RESET_ADOPTED();
+    pm_suspend_target_state = PM_SUSPEND_MEM;
+    suspend_via_firmware = true;
+    pcie.t6050_dart = &dummy_dart;
+    assert(apple_pcie_prepare(&dev) == -EBUSY && radio_prepare_calls == 0 && warn_calls == 1);
+
+    RESET_ADOPTED();
+    pm_suspend_target_state = PM_SUSPEND_MEM;
+    suspend_via_firmware = true;
+    pcie.t6050_port = &dummy_port;
+    pcie.t6050_dart = &dummy_dart;
+    assert(apple_pcie_prepare(&dev) == 0 && radio_prepare_calls == 1 && warn_calls == 0);
+
+    /* Already-down, managed-radio, or NEO/CIO-prepared adopted host bypasses adopted check. */
+    RESET_ADOPTED();
+    writel(0, rc_regs + CORE_RC_CTL);
+    pcie.t6050_down = true;
+    assert(apple_pcie_prepare(&dev) == 0 && radio_prepare_calls == 1 && warn_calls == 0);
+
+    RESET_ADOPTED();
+    writel(0, rc_regs + CORE_RC_CTL);
+    pcie.managed_sids = 1;
+    assert(apple_pcie_prepare(&dev) == 0 && radio_prepare_calls == 1 && warn_calls == 0);
+
+    #undef RESET_ADOPTED
+
     puts("PASS: T6050 PCIe-C s2idle domain hold, release, deep sleep and prepare refusal");
     return 0;
 }
@@ -447,6 +590,8 @@ def main():
                                  'apple_pcie_hold_domains',
                                  'apple_pcie_can_keep_link',
                                  'apple_pcie_keep_link',
+                                 'apple_pcie_adopted_links_ready',
+                                 'apple_pcie_adopted_sleep_host',
                                  'apple_pcie_prepare'))))
     s2idle_code = S2IDLE_FIXTURE.replace('/* PRODUCTION */', s2idle_prod)
     t6050_old = '\t.mps_timers\t\t= true,\n\t.s2idle_hold_domain\t= true,\n'
@@ -478,6 +623,16 @@ def main():
             'dev_pm_genpd_remove_notifier(pd->dev);', '(void)pd;'),
         'ignore-domain-off': (
             'if (!dev_pm_genpd_is_on(pd->dev)) {', 'if (false) {'),
+        'drop-adopted-prepare-guard': (
+            'if (pcie && pm_suspend_target_state != PM_SUSPEND_ON &&\n'
+            '\t    apple_pcie_adopted_sleep_host(pcie)) {',
+            'if (false) {'),
+        'drop-adopted-fw-sleep-guard': (
+            'ret = pcie->t6050_port && pcie->t6050_dart ? 0 : -EBUSY;',
+            'ret = 0;'),
+        'drop-adopted-parked-skip': (
+            'if (pcie->t6050_parked & BIT(port->idx))\n\t\t\tcontinue;',
+            'if (false)\n\t\t\tcontinue;'),
     }
     s2idle_cases = {'s2idle-production': s2idle_code}
     for name, (old, new) in s2idle_muts.items():

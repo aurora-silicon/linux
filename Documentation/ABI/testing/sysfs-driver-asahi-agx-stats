@@ -108,11 +108,11 @@ Description:
 		           older than the age limit below or its epoch ended.
 		           unsupported is a fixed property of the firmware,
 		           taken from the driver's per-firmware match data, and
-		           never changes at runtime: the V25G83 firmware accepts
-		           tag 0x10 but never emits it, and no other record of
-		           it carries the current pstate, so pstate_status
-		           always reads unsupported on G16S. V26A428 reports
-		           its state in other records (see below).
+		           never changes at runtime: T6040 V25G83 (M4 Pro) is
+		           left on Protocol::NONE because it has not been
+		           measured yet, so pstate_status reads unsupported on
+		           T6040. V26A428 and T6041 (25G83) report their state
+		           in other records (see below).
 		           utilisation_status is never unsupported on these
 		           firmwares. Numeric metrics are printed only while
 		           their capability is valid; otherwise their value is
@@ -132,7 +132,8 @@ Description:
 		           firmware whose match data says it emits tag 0x10
 		           (none of the current G16S/G17P firmwares do). A
 		           firmware that reports its state in tags 0x19 and
-		           0x1b (V26A428) never has tag 0x10 decoded. Words 1
+		           0x1b (V26A428 and T6041 25G83) never has tag 0x10
+		           decoded. Words 1
 		           and 2 form a little-endian u64 firmware timestamp.
 		           The first timestamp establishes a baseline. Invalid
 		           selectors and backwards timestamps remove pstate
@@ -141,21 +142,23 @@ Description:
 
 		requested_frequency_hz, achieved_frequency_hz, busy_ns,
 		power_mw, temperature_raw
-		           Always unsupported on V25G83 (G16S). No record of it
-		           carries a state, a qualified busy-time duration, a
-		           power unit or a temperature.
+		           Unsupported on T6040 V25G83 (M4 Pro), which is left
+		           on Protocol::NONE because it has not been measured
+		           yet; power_mw and temperature_raw are unsupported on
+		           all G16S/G17P firmwares.
 
-		The V26A428 firmware, which the A18 Pro (T8140, G17P) and M5
-		run, uses the same snapshot and keys, with these differences:
+		The V26A428 firmware (A18 Pro T8140 and M5) and T6041 (M4 Max,
+		25G83) use the same snapshot and keys, with these
+		differences:
 
 		pstate_status, pstate
 		           Supported. The firmware reports the performance state
 		           in effect in tag 0x1b, words 1 and 3, which must
 		           agree: an index into the performance state table,
-		           1..10 on the A18 Pro, 1..13 on M5. The end of the
-		           interval record before it (tag 0x19, words 1 and 2)
-		           is its firmware timestamp. A report that names state
-		           0 or a state beyond the table removes pstate
+		           1..10 on the A18 Pro and T6041, 1..13 on M5. The end
+		           of the interval record before it (tag 0x19, words 1
+		           and 2) is its firmware timestamp. A report that names
+		           state 0 or a state beyond the table removes pstate
 		           validity. While the GPU cores are gated, pstate reads
 		           valid 0: the GPU is off. Power-up starts a new epoch,
 		           stale until the next report. The driver asks for full
@@ -167,16 +170,23 @@ Description:
 		achieved_frequency_hz
 		           The frequency of pstate in Hz, while pstate_status is
 		           valid, and 0 for state 0. M5: the board's performance
-		           state table. A18 Pro: the device tree operating point
-		           that the state's entry of performance table A names.
-		           Its records do not name the table; at its top state a
-		           sustained FP32 FMA load completes faster than table
-		           B's frequency there allows, so it runs table A.
+		           state table. A18 Pro and T6041: the device tree
+		           operating point that the state's entry of performance
+		           table A names. Their records do not name the table:
+		           on the A18 Pro, at the top state a sustained FP32 FMA
+		           load completes faster than table B's frequency there
+		           allows, so it runs table A; on T6041 both tables map
+		           state 10 to OPP 15 (1578 MHz) and only differ on
+		           mid-states (states 5..9 on 32-core J616C, 6..9 on
+		           40-core), so those mid-state frequencies are nominal
+		           (taken from table A) until measured by a mid-state
+		           ALU benchmark.
 
 		busy_ns    Cumulative u64 since the driver was bound. The tag
-		           0x13 records of this firmware carry a timestamp in
+		           0x13 records of these firmwares carry a timestamp in
 		           24 MHz ticks (words 1 and 2), one every 8 ms on M5
-		           and every 16 ms on the A18 Pro. Each record credits
+		           and T6041 (192000 ticks) and every 16 ms on the A18
+		           Pro (384000 ticks). Each record credits
 		           the window since the previous record of its epoch at
 		           its device utilisation. A record more than two
 		           periods after the previous one, or with an earlier

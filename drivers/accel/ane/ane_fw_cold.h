@@ -184,6 +184,8 @@ int ane_fw_staged_bind(struct platform_device *pdev);
 bool ane_fw_staged_bound(struct device *dev);
 void ane_fw_staged_unbind(struct platform_device *pdev);
 int ane_fw_staged_suspend(struct device *dev);
+int ane_fw_staged_runtime_suspend(struct device *dev);
+int ane_fw_staged_runtime_resume(struct device *dev);
 void ane_fw_staged_start(void);
 bool ane_fw_staged_exit(void);
 
