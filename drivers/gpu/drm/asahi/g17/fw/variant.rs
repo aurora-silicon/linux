@@ -247,6 +247,12 @@ pub(crate) const V26A428_M5: Variant = Variant {
     ..V26A428
 };
 
+/// The 27.2 M5 firmware (26B123): the 26A428 M5 protocol with the 26B123 InitData layouts.
+pub(crate) const V26B123_M5: Variant = Variant {
+    m5_layouts: Some(M5Layouts::V26B123),
+    ..V26A428_M5
+};
+
 pub(crate) const V25F84: Variant = Variant {
     qid_floor: 0,
     registration: QueueRegistration::Mailbox,
