@@ -4340,11 +4340,12 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 		complete_set_digital_out_mode(dcp, NULL, cookie);
 	} else
 #endif
-	if (mode->vrr &&
-		   dcp->hw.iomfb_method_profile !=
-		   DCP_IOMFB_METHODS_H17P_EXTERNAL)
+	if ((mode->vrr || dcp->vrr_enabled) &&
+	    dcp->hw.iomfb_method_profile !=
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL)
 		dcp_set_adaptive_sync(dcp,
-				      crtc_state->vrr_enabled ? mode->min_vrr : 0,
+				      mode->vrr && crtc_state->vrr_enabled ?
+				      mode->min_vrr : 0,
 				      cookie);
 	else
 		dcp_set_digital_out_mode(dcp, false, &dcp->mode,

@@ -2228,7 +2228,10 @@ int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_commit *commi
 	 * macOS switches between a timing's fixed and variable modes with a
 	 * full mode set.
 	 */
-	if ((dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
+	if ((dcp->fw_compat == DCP_FIRMWARE_V_12_3 ||
+	     dcp->fw_compat == DCP_FIRMWARE_V_13_5 ||
+	     dcp->fw_compat == DCP_FIRMWARE_V_14_7_TEMPLATE ||
+	     dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
 	     (dcp->fw_compat == DCP_FIRMWARE_V_27_0 && !dcp->main_display &&
 	      !dcp_has_panel(dcp))) &&
 	    crtc_state->enable && !dcp_vrr_live(dcp)) {

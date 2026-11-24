@@ -2018,6 +2018,24 @@ FW27_VRR    dcp.crashed = true;
     dcp.panel = false;
     dcp.peer_check = 0;
     dcp.fw_compat = DCP_FIRMWARE_UNKNOWN;
+    /* Legacy 12.3/13.5/14.7_tpl DCPs program VRR inside iomfb_modeset(). */
+    const enum dcp_firmware_version tpl_fws[] = {
+        DCP_FIRMWARE_V_12_3, DCP_FIRMWARE_V_13_5, DCP_FIRMWARE_V_14_7_TEMPLATE
+    };
+    for (unsigned int i = 0; i < 3; i++) {
+        dcp.fw_compat = tpl_fws[i];
+        state.crtc.enable = true;
+        state.crtc.vrr_enabled = true;
+        state.crtc.mode_changed = false;
+        state.no_old_crtc = false;
+        state.old_crtc.vrr_enabled = false;
+        assert(dcp_crtc_atomic_check(&crtc, &state) == 0 && state.crtc.mode_changed);
+        state.crtc.mode_changed = false;
+        state.old_crtc.vrr_enabled = true;
+        assert(dcp_crtc_atomic_check(&crtc, &state) == 0 && !state.crtc.mode_changed);
+        cases += 2;
+    }
+    dcp.fw_compat = DCP_FIRMWARE_UNKNOWN;
 """
     return prefix + check + suffix.replace('DESKTOP_VRR', desktop, 1).replace('FW27_VRR', fw27, 1)
 
