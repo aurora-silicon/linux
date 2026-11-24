@@ -12,11 +12,43 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use kernel::{prelude::*, sync::Arc};
 
 use super::encode::{Geometry, PassRefs};
-use super::fw::work::{barrier, fs, ta};
-use super::graph::{alloc, alloc_work, cmd_fw, Client};
+use super::fw::work::{barrier, compute, fs, ta};
+use super::graph::{alloc, alloc_work, Client};
 use super::hw::{client, sizes};
 use super::object::{Class, Factory, FwLease, FwObject, Objects};
 use super::pools::lifetime::Lifetime;
+
+/// The compute command records of one hardware compute unit index (microsequence and barrier
+/// records), shared by every VM's [`ComputeSlot`] bound to that hardware unit: the unit index
+/// is device-global and claimed by one flight at a time. The host writes them before
+/// publication and never reads back what the firmware writes, so they take the firmware-cached
+/// [`Class::FwCoherent`] view macOS 26B123 gives its per-queue command objects, with no client
+/// or lower alias.
+#[derive(Clone)]
+pub(crate) struct UnitCmds {
+    pub(crate) seq: Arc<FwObject>,
+    pub(crate) barrier: Arc<FwObject>,
+}
+
+impl UnitCmds {
+    /// Allocates one compute unit index's command records from a device-lifetime allocator
+    /// ([`Factory::persistent_objects`]), which the caller never drops.
+    pub(crate) fn new(o: &mut Objects) -> Result<Self> {
+        let coherent = Class::FwCoherent;
+        Ok(Self {
+            seq: alloc(o, compute::SEQ_SIZE, coherent, None, 0, false)?,
+            // Holds fs2c (+0x00) and cross-pipe c2c (+0x40) barriers within one page.
+            barrier: alloc(
+                o,
+                barrier::SIZE * sizes::COMPUTE_PIPES,
+                coherent,
+                None,
+                0,
+                false,
+            )?,
+        })
+    }
+}
 
 /// One immutable allocation set. Mutable firmware pool cursors survive successful reuse.
 pub(crate) struct ComputeSlot {
@@ -149,16 +181,23 @@ pub(crate) fn init_uma_pool(state: &FwObject, list: &FwObject, pool: u64, seeds:
 
 impl ComputeSlot {
     #[allow(dead_code)]
-    pub(crate) fn new(o: &mut Objects, fw_factory: &Factory, k: u64) -> Result<Self> {
-        Self::new_in(o, fw_factory, k, Placement::Base)
+    pub(crate) fn new(
+        o: &mut Objects,
+        fw_factory: &Factory,
+        k: u64,
+        cmds: &UnitCmds,
+    ) -> Result<Self> {
+        Self::new_in(o, fw_factory, k, Placement::Base, cmds)
     }
 
-    /// Unit `k` at `placement`.
+    /// Unit `k` at `placement`, around the device-lifetime command records `cmds` of its
+    /// hardware ledger slot.
     pub(crate) fn new_in(
         o: &mut Objects,
         fw_factory: &Factory,
         k: u64,
         placement: Placement,
+        cmds: &UnitCmds,
     ) -> Result<Self> {
         placement.check()?;
         let sh = Class::Shared;
@@ -178,16 +217,8 @@ impl ComputeSlot {
                 false,
             )?,
             work,
-            seq: alloc(o, 0x300, cmd_fw(), None, 0, false)?,
-            // Holds fs2c (+0x00) and cross-pipe c2c (+0x40) barriers within one page.
-            barrier: alloc(
-                o,
-                barrier::SIZE * sizes::COMPUTE_PIPES,
-                cmd_fw(),
-                None,
-                0,
-                false,
-            )?,
+            seq: cmds.seq.clone(),
+            barrier: cmds.barrier.clone(),
             pool: o.alloc(super::object::Request {
                 size: placement.pool_bytes(),
                 class: sh,
@@ -249,9 +280,9 @@ impl ComputeSlot {
     /// Resets command-local state before reuse. Pool/list/counter/descriptor state is preserved.
     ///
     /// Clean same-VM reuse only zeroes the 16-byte internal timestamp pair so retirement
-    /// checks cannot observe stale ticks; `work` (including its embedded sequence) is
-    /// overwritten completely by `prefix_compute`. First use, cross-VM retarget, cancelled
-    /// preparation, or post-recovery/error reuse runs the full scrub of all scratch areas.
+    /// checks cannot observe stale ticks; `work` and `seq` are overwritten by `prefix_compute`.
+    /// First use, cross-VM retarget, cancelled preparation, or post-recovery/error reuse runs
+    /// the full scrub of all scratch areas.
     fn scrub(&self, full: bool) -> Result {
         self.its.fill(0, 0, 16)?;
         if !full {

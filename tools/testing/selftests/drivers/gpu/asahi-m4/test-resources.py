@@ -119,20 +119,28 @@ pub mod g16 {
             pub fn objects(&self,_:&super::vm::MockVm)->Objects{Objects::new()}
             pub fn fw_objects(&self)->Objects{Objects::new()}
             pub fn persistent_objects(&self)->Objects{Objects::persistent()}
+            pub fn persistent_objects_probe(&self)->Objects{Objects::persistent()}
         }
         pub static NEXT_VA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0xfffffc2001000000);
         std::thread_local!{pub static ALL_OBJECTS:std::cell::RefCell<Vec<Arc<FwObject>>>=const{std::cell::RefCell::new(Vec::new())};}
         pub struct Objects{pub objects:Vec<Arc<FwObject>>,pub persistent:bool}
-        // Device-lifetime render records of each pass slot index, per test thread (the
-        // production table is resources::RenderCmds): one never-dropped allocator owns them.
+        // Device-lifetime render and compute command records, per test thread (the production
+        // tables are resources::RenderCmds and resources::ComputeCmds): one never-dropped
+        // allocator owns them.
         std::thread_local!{
             pub static PERSISTENT:std::cell::RefCell<Option<Objects>>=const{std::cell::RefCell::new(None)};
             pub static PASS_CMDS:std::cell::RefCell<Vec<(u64,crate::g16::slots::PassCmds)>>=const{std::cell::RefCell::new(Vec::new())};
+            pub static UNIT_CMDS:std::cell::RefCell<Vec<(u64,crate::g16::slots::UnitCmds)>>=const{std::cell::RefCell::new(Vec::new())};
         }
         pub fn test_cmds(k:u64)->crate::g16::slots::PassCmds{
             if let Some(c)=PASS_CMDS.with(|p|p.borrow().iter().find(|e|e.0==k).map(|e|e.1.clone())){return c;}
             let c=PERSISTENT.with(|p|{let mut p=p.borrow_mut();crate::g16::slots::PassCmds::new(p.get_or_insert_with(Objects::persistent),k).unwrap()});
             PASS_CMDS.with(|p|p.borrow_mut().push((k,c.clone())));c
+        }
+        pub fn test_unit_cmds(k:u64)->crate::g16::slots::UnitCmds{
+            if let Some(c)=UNIT_CMDS.with(|p|p.borrow().iter().find(|e|e.0==k).map(|e|e.1.clone())){return c;}
+            let c=PERSISTENT.with(|p|{let mut p=p.borrow_mut();crate::g16::slots::UnitCmds::new(p.get_or_insert_with(Objects::persistent)).unwrap()});
+            UNIT_CMDS.with(|p|p.borrow_mut().push((k,c.clone())));c
         }
         impl Objects{
             pub fn new()->Self{Self{objects:vec![],persistent:false}}
@@ -287,7 +295,7 @@ pub mod g16 {
     fn arenas(o:&mut Objects)->Arenas{
         let mut compute=KVec::new();let mut passes=KVec::new();
         let f=g16::object::Factory;
-        for k in 0..2{compute.push(g16::slots::ComputeSlot::new(o,&f,k).unwrap(),0).unwrap();passes.push(g16::slots::PassSlot::new(o, k, 1, &crate::g16::object::test_cmds((k) as u64)).unwrap(),0).unwrap();}
+        for k in 0..2{compute.push(g16::slots::ComputeSlot::new(o,&f,k,&crate::g16::object::test_unit_cmds(k)).unwrap(),0).unwrap();passes.push(g16::slots::PassSlot::new(o, k, 1, &crate::g16::object::test_cmds((k) as u64)).unwrap(),0).unwrap();}
         Arenas{compute:g16::resources::ComputeArena{compute,render:None,hw_slots:None},render:render_arena(passes)}
     }
     fn retire_render(s:&mut Slots,k:usize){let mut c=Claims::new();c.pass[0]=k as u32;c.pass_mask=1<<k;s.publish(&mut c).unwrap();s.retire(&mut c).unwrap();}
@@ -399,6 +407,98 @@ pub mod g16 {
             assert!(owned.iter().all(|o|o.class==Class::FwCoherent));
         });
         drop(pb);drop(pc);drop(b);
+    }
+    #[test]fn firmware_cached_compute_records_and_work_rings_are_device_lifetime_and_never_owned_by_vm_arenas(){
+        use g16::graph::{ComputeGraph, RenderGraph};
+        use g16::object::{Class, Placement, Request};
+        use g16::slots::{ComputeSlot, Placement as SlotPlacement, UnitCmds};
+        let mut vm_a = Objects::new();
+        let mut vm_b = Objects::new();
+        let f = g16::object::Factory;
+        // Per-VM non-persistent allocator refuses UnitCmds (Class::FwCoherent).
+        assert!(matches!(UnitCmds::new(&mut vm_a), Err(EINVAL)));
+        // Normal VM unit 3 and an SCS VM local unit 0 bound to hardware slot 3 share slot 3's
+        // device-lifetime seq + barrier records; neither VM arena owns any FwCoherent object.
+        let ca = ComputeSlot::new(&mut vm_a, &f, 3, &g16::object::test_unit_cmds(3)).unwrap();
+        let cb = ComputeSlot::new_in(
+            &mut vm_b,
+            &f,
+            0,
+            SlotPlacement::Scs { seeds: 8192 },
+            &g16::object::test_unit_cmds(3),
+        )
+        .unwrap();
+        let ra = [ca.seq.clone(), ca.barrier.clone()];
+        let rb = [cb.seq.clone(), cb.barrier.clone()];
+        for (x, y) in ra.iter().zip(rb.iter()) {
+            assert!(crate::sync::Arc::ptr_eq(x, y));
+            assert_eq!(x.class, Class::FwCoherent);
+            assert_eq!((x.gva, x.client_leaf, x.lower_gva), (None, None, None));
+            assert_eq!(x.va & 0x3fff, 0);
+        }
+        assert_ne!(ca.seq.va, ca.barrier.va);
+        assert_eq!(ca.work.class, Class::Shared);
+        assert!(ca.work.lower_gva.is_some());
+        assert!(vm_a.objects.iter().chain(vm_b.objects.iter()).all(|o| o.class != Class::FwCoherent));
+        assert!(vm_a
+            .objects
+            .iter()
+            .chain(vm_b.objects.iter())
+            .all(|o| ra.iter().all(|r| !crate::sync::Arc::ptr_eq(o, r))));
+        // Distinct hardware slot gets distinct UnitCmds.
+        let cc = ComputeSlot::new(&mut vm_b, &f, 4, &g16::object::test_unit_cmds(4)).unwrap();
+        assert!(!crate::sync::Arc::ptr_eq(&cc.seq, &ca.seq));
+        assert!(!crate::sync::Arc::ptr_eq(&cc.barrier, &ca.barrier));
+        // Closing VM a leaves slot 3's UnitCmds owned by the device-lifetime allocator.
+        drop(ca);
+        drop(vm_a);
+        let again = g16::object::test_unit_cmds(3);
+        assert!(crate::sync::Arc::ptr_eq(&again.seq, &rb[0]));
+        assert!(crate::sync::Arc::ptr_eq(&again.barrier, &rb[1]));
+        g16::object::PERSISTENT.with(|p| {
+            let p = p.borrow();
+            let owned = &p.as_ref().unwrap().objects;
+            assert!(owned.iter().any(|o| crate::sync::Arc::ptr_eq(o, &rb[0])));
+            assert!(owned.iter().any(|o| crate::sync::Arc::ptr_eq(o, &rb[1])));
+            assert!(owned.iter().all(|o| o.class == Class::FwCoherent));
+        });
+        // Work rings require a device-lifetime persistent allocator and never live in session o.
+        let mut session = Objects::new();
+        let mut non_persistent = Objects::new();
+        let mut rings = Objects::persistent();
+        let ctx = session
+            .alloc(Request {
+                size: 0x40,
+                class: Class::Fw,
+                placement: Placement::Anywhere,
+                offset: 0,
+                client: None,
+                lower: None,
+                cpu: true,
+            })
+            .unwrap();
+        assert!(matches!(
+            ComputeGraph::new(&mut session, &mut non_persistent, ctx.clone()),
+            Err(EINVAL)
+        ));
+        assert!(matches!(
+            RenderGraph::new(&mut session, &mut non_persistent, ctx.clone()),
+            Err(EINVAL)
+        ));
+        let cg0 = ComputeGraph::new(&mut session, &mut rings, ctx.clone()).unwrap();
+        let cg1 = ComputeGraph::new(&mut session, &mut rings, ctx.clone()).unwrap();
+        let rg = RenderGraph::new(&mut session, &mut rings, ctx).unwrap();
+        let all_rings = [&cg0.ring, &cg1.ring, &rg.ring[0], &rg.ring[1]];
+        assert_eq!(rings.objects.len(), 4);
+        for ring in all_rings {
+            assert_eq!(ring.class, Class::FwCoherent);
+            assert_eq!((ring.gva, ring.client_leaf, ring.lower_gva), (None, None, None));
+            assert!(rings.objects.iter().any(|o| crate::sync::Arc::ptr_eq(o, ring)));
+            assert!(session.objects.iter().all(|o| !crate::sync::Arc::ptr_eq(o, ring)));
+        }
+        drop(cb);
+        drop(cc);
+        drop(vm_b);
     }
     #[test]fn work_has_kernel_lower_alias_without_application_alias(){
         let mut o=Objects::new();let slots=Slots::new().unwrap();let arena=arenas(&mut o);
@@ -747,7 +847,7 @@ pub mod g16 {
             assert_eq!(ext.refs().unwrap().parameter_id,hw_slot);
         }
         for k in 0..g16::hw::sizes::COMPUTE_UNITS as u64 {
-            g16::slots::ComputeSlot::new(&mut o,&g16::object::Factory,k).unwrap();
+            g16::slots::ComputeSlot::new(&mut o,&g16::object::Factory,k,&crate::g16::object::test_unit_cmds(k)).unwrap();
         }
         let mut scene_lists=Vec::new();
         let count_client=|objs:&Objects|objs.objects.iter().filter(|a|a.gva.is_some()).count();
@@ -1294,7 +1394,7 @@ pub mod g16 {
         let mut o=Objects::new();
         let mut units=KVec::new();
         for k in 0..hw::sizes::COMPUTE_UNITS {
-            units.push(ComputeSlot::new(&mut o,&g16::object::Factory,k as u64).unwrap(),0).unwrap();
+            units.push(ComputeSlot::new(&mut o,&g16::object::Factory,k as u64,&crate::g16::object::test_unit_cmds(k as u64)).unwrap(),0).unwrap();
         }
         let prep=ComputeArena{compute:units,render:None,hw_slots:None};
         let a=Arc::new(
@@ -1569,7 +1669,7 @@ pub mod g16 {
         let mut o=Objects::new();let mut s=Slots::new().unwrap();
         let mut units=KVec::new();
         for k in 0..4u64 {
-            units.push(g16::slots::ComputeSlot::new(&mut o,&g16::object::Factory,k).unwrap(),0).unwrap();
+            units.push(g16::slots::ComputeSlot::new(&mut o,&g16::object::Factory,k,&crate::g16::object::test_unit_cmds(k)).unwrap(),0).unwrap();
         }
         let prep_full=g16::resources::ComputeArena{compute:units,render:None,hw_slots:None};
         let a=vm(1);let b=vm(2);
@@ -1596,7 +1696,7 @@ pub mod g16 {
         // A base-only (2-unit) VM can now claim displaced base unit 0 again.
         let mut base_units=KVec::new();
         for k in 0..2u64 {
-            base_units.push(g16::slots::ComputeSlot::new(&mut o,&g16::object::Factory,k).unwrap(),0).unwrap();
+            base_units.push(g16::slots::ComputeSlot::new(&mut o,&g16::object::Factory,k,&crate::g16::object::test_unit_cmds(k)).unwrap(),0).unwrap();
         }
         let prep_base=g16::resources::ComputeArena{compute:base_units,render:None,hw_slots:None};
         assert_eq!(s.claim_compute_for(&prep_base,&mut c,Some(b.id)).unwrap(),Some(0));
@@ -1608,7 +1708,7 @@ pub mod g16 {
         let p1_start = g16::hw::sizes::PIPE1_COMPUTE_START;
         let mut units=KVec::new();
         for k in 0..(p1_start + 2) as u64 {
-            units.push(g16::slots::ComputeSlot::new(&mut o,&g16::object::Factory,k).unwrap(),0).unwrap();
+            units.push(g16::slots::ComputeSlot::new(&mut o,&g16::object::Factory,k,&crate::g16::object::test_unit_cmds(k)).unwrap(),0).unwrap();
         }
         let prep=g16::resources::ComputeArena{compute:units,render:None,hw_slots:None};
         let a=vm(1);let b=vm(2);
@@ -1645,7 +1745,7 @@ pub mod g16 {
         // reclaims displaced extension unit PIPE1_COMPUTE_START without touching 0..PIPE1_COMPUTE_START.
         let mut base_units=KVec::new();
         for k in 0..2u64 {
-            base_units.push(g16::slots::ComputeSlot::new(&mut o,&g16::object::Factory,k).unwrap(),0).unwrap();
+            base_units.push(g16::slots::ComputeSlot::new(&mut o,&g16::object::Factory,k,&crate::g16::object::test_unit_cmds(k)).unwrap(),0).unwrap();
         }
         let prep_base=g16::resources::ComputeArena{compute:base_units,render:None,hw_slots:None};
         let mut c0c=Claims::new();
@@ -1662,7 +1762,7 @@ pub mod g16 {
         let p1_start = g16::hw::sizes::PIPE1_COMPUTE_START;
         let mut full_units=KVec::new();
         for k in 0..g16::hw::sizes::COMPUTE_UNITS as u64 {
-            full_units.push(g16::slots::ComputeSlot::new(&mut o,&g16::object::Factory,k).unwrap(),0).unwrap();
+            full_units.push(g16::slots::ComputeSlot::new(&mut o,&g16::object::Factory,k,&crate::g16::object::test_unit_cmds(k)).unwrap(),0).unwrap();
         }
         let prep_full=g16::resources::ComputeArena{compute:full_units,render:None,hw_slots:None};
         let bad=vm(1);let fresh=vm(2);let other=vm(3);
@@ -1679,8 +1779,8 @@ pub mod g16 {
         let scs_slots = pick_scs_compute_slots(s.quarantined_compute_mask(), g16::hw::sizes::COMPUTE_UNITS);
         assert_eq!(scs_slots, [1, 2]);
         let mut scs_units=KVec::new();
-        for local in 0..g16::hw::sizes::SCS_COMPUTE_UNITS as u64 {
-            scs_units.push(g16::slots::ComputeSlot::new(&mut o,&g16::object::Factory,local).unwrap(),0).unwrap();
+        for (local, &hw_slot) in scs_slots.iter().enumerate() {
+            scs_units.push(g16::slots::ComputeSlot::new(&mut o,&g16::object::Factory,local as u64,&crate::g16::object::test_unit_cmds(hw_slot as u64)).unwrap(),0).unwrap();
         }
         let prep_scs=g16::resources::ComputeArena{compute:scs_units,render:None,hw_slots:Some(scs_slots)};
         let scs_mask = prep_scs.compute_slot_mask().unwrap();
@@ -1921,6 +2021,7 @@ pub mod g16 {
         assert_eq!(cmd_fw(), Class::Fw);
         assert_eq!(cmd_shared(), Class::Shared);
         let mut o = Objects::new();
+        let mut rings = Objects::persistent();
         let ctx = o.alloc(g16::object::Request {
             size: 0x40,
             class: Class::Fw,
@@ -1930,9 +2031,9 @@ pub mod g16 {
             lower: None,
             cpu: true,
         }).unwrap();
-        let c = ComputeGraph::new(&mut o, ctx.clone()).unwrap();
-        let c1 = ComputeGraph::new(&mut o, ctx.clone()).unwrap();
-        let r = RenderGraph::new(&mut o, ctx).unwrap();
+        let c = ComputeGraph::new(&mut o, &mut rings, ctx.clone()).unwrap();
+        let c1 = ComputeGraph::new(&mut o, &mut rings, ctx.clone()).unwrap();
+        let r = RenderGraph::new(&mut o, &mut rings, ctx).unwrap();
         c.init(FwAbi, true).unwrap();
         c1.init(FwAbi, false).unwrap();
         r.init(FwAbi).unwrap();
@@ -1941,6 +2042,7 @@ pub mod g16 {
         assert_ne!(c.fw_stamp.va, c1.fw_stamp.va);
         assert_eq!(c1.qinfo.class, Class::FwCached);
         assert_eq!(c1.qstate.class, Class::Fw);
+        assert_eq!(c1.ring.class, Class::FwCoherent);
         assert_eq!(c1.fw_stamp.class, Class::Shared);
         assert_eq!(c.qinfo.class, Class::FwCached);
         assert_eq!(c.qscratch.class, Class::FwCached);
@@ -1949,7 +2051,7 @@ pub mod g16 {
         assert_eq!(c.qstate.class, Class::Fw);
         assert_eq!(c.notifier.class, Class::Fw);
         assert_eq!(c.threshold.class, Class::Fw);
-        assert_eq!(c.ring.class, Class::Fw);
+        assert_eq!(c.ring.class, Class::FwCoherent);
         assert_eq!(c.user_stamp.class, Class::Shared);
         assert_eq!(c.fw_stamp.class, Class::Shared);
         for stage in 0..2 {
@@ -1957,7 +2059,7 @@ pub mod g16 {
             assert_eq!(r.qscratch[stage].class, Class::FwCached);
             assert_eq!(r.job_list[stage].class, Class::FwCached);
             assert_eq!(r.qstate[stage].class, Class::Fw);
-            assert_eq!(r.ring[stage].class, Class::Fw);
+            assert_eq!(r.ring[stage].class, Class::FwCoherent);
             assert_eq!(r.user_stamp[stage].class, Class::Shared);
             assert_eq!(r.fw_stamp[stage].class, Class::Shared);
         }
@@ -2036,7 +2138,7 @@ pub mod g16 {
         let mut s = Slots::new().unwrap();
         let mut units = KVec::new();
         for k in 0..g16::hw::sizes::COMPUTE_UNITS as u64 {
-            units.push(g16::slots::ComputeSlot::new(&mut o, &g16::object::Factory, k).unwrap(), 0).unwrap();
+            units.push(g16::slots::ComputeSlot::new(&mut o, &g16::object::Factory, k, &crate::g16::object::test_unit_cmds(k)).unwrap(), 0).unwrap();
         }
         let prep = g16::resources::ComputeArena { compute: units, render: None, hw_slots: None };
         let vms = [vm(1), vm(2), vm(3), vm(4)];
@@ -2284,7 +2386,7 @@ pub mod g16 {
 
         let mut compute_slots = KVec::new();
         for k in 0..COMPUTE_UNITS {
-            compute_slots.push(ComputeSlot::new(&mut o, &g16::object::Factory, k as u64).unwrap(), 0).unwrap();
+            compute_slots.push(ComputeSlot::new(&mut o, &g16::object::Factory, k as u64, &crate::g16::object::test_unit_cmds(k as u64)).unwrap(), 0).unwrap();
         }
         let mut passes = KVec::new();
         for k in 0..18 {
@@ -2533,7 +2635,7 @@ pub mod g16 {
         let mut s = Slots::new().unwrap();
         let mut compute_slots = KVec::new();
         for k in 0..COMPUTE_UNITS {
-            compute_slots.push(ComputeSlot::new(&mut o, &g16::object::Factory, k as u64).unwrap(), 0).unwrap();
+            compute_slots.push(ComputeSlot::new(&mut o, &g16::object::Factory, k as u64, &crate::g16::object::test_unit_cmds(k as u64)).unwrap(), 0).unwrap();
         }
         let prep = ComputeArena { compute: compute_slots, render: None, hw_slots: None };
 
@@ -2663,7 +2765,7 @@ pub mod g16 {
         // Compute unit 0 owned by VM1, displaced by VM2 on unit 1.
         let mut units1 = KVec::new();
         for k in 0..COMPUTE_UNITS {
-            units1.push(ComputeSlot::new(&mut o, &factory, k as u64).unwrap(), 0).unwrap();
+            units1.push(ComputeSlot::new(&mut o, &factory, k as u64, &crate::g16::object::test_unit_cmds(k as u64)).unwrap(), 0).unwrap();
         }
         let c_uma1 = units1[0].uma_lease();
         let prep1 = ComputeArena { compute: units1, render: None, hw_slots: None };
@@ -2682,7 +2784,7 @@ pub mod g16 {
 
         let mut units2 = KVec::new();
         for k in 0..COMPUTE_UNITS {
-            units2.push(ComputeSlot::new(&mut o, &factory, k as u64).unwrap(), 0).unwrap();
+            units2.push(ComputeSlot::new(&mut o, &factory, k as u64, &crate::g16::object::test_unit_cmds(k as u64)).unwrap(), 0).unwrap();
         }
         let prep2 = ComputeArena { compute: units2, render: None, hw_slots: None };
         let mut cc2 = Claims::new();
@@ -2692,7 +2794,7 @@ pub mod g16 {
         s.retire(&mut cc2).unwrap();
 
         let mut units3 = KVec::new();
-        units3.push(ComputeSlot::new(&mut o, &factory, 0).unwrap(), 0).unwrap();
+        units3.push(ComputeSlot::new(&mut o, &factory, 0, &crate::g16::object::test_unit_cmds(0)).unwrap(), 0).unwrap();
         let c_uma3 = units3[0].uma_lease();
         let prep3 = ComputeArena { compute: units3, render: None, hw_slots: None };
 
@@ -2880,9 +2982,23 @@ for store in ('pub(crate) fn write(', 'pub(crate) fn fill(', 'pub(crate) fn w32(
     assert 'self.stored(' in item(object_source, store), store + ' must clean firmware-cached GPU-aliased stores'
 assert object_source.count('let clean = req.class == Class::FwCoherent && req.lower.is_some();') == 1, 'only FwCoherent work with a lower alias cleans its stores'
 assert 'pub(crate) struct ComputeUnitSet {' in resources_source, 'resources.rs must split compute units into per-unit ComputeArenas'
-assert 'ComputeArena::new(factory, bind, vm, live, k, placement)?' in resources_source, 'ComputeUnitSet::new must allocate one ComputeArena per unit'
+assert 'pub(crate) struct ComputeCmds {' in resources_source, 'resources.rs must retain device-lifetime ComputeCmds'
+assert 'let cmds = factory.compute_cmds(hw_slot)?;' in resources_source, 'ComputeArena::new must fetch hardware-slot UnitCmds'
+assert 'ComputeArena::new(factory, bind, vm, live, k, k, placement)?' in resources_source, 'ComputeUnitSet::new must allocate one ComputeArena per unit'
+assert 'for (local, &hw_slot) in hw_slots.iter().enumerate()' in resources_source, 'ComputeUnitSet::new_scs must bind UnitCmds by hw_slot'
 assert 'compute_ext: Option<Arc<ComputeUnitSet>>' in resources_source, 'compute_ext must use ComputeUnitSet so undisplaced slots pin only one unit'
 assert 'base.arena(k)' in resources_source and 'ext.arena(k - base.len())' in resources_source, 'Prepared::compute_arena must return the per-unit ComputeArena'
+engine_source = (production/'engine.rs').read_text()
+prefix_compute_fn = item(engine_source, 'fn prefix_compute(')
+assert 'seq: s.seq.va,' in prefix_compute_fn, 'prefix_compute must point ComputeRefs::seq at firmware-cached s.seq'
+assert 's.seq.write(0, q)?;' in prefix_compute_fn, 'prefix_compute must write encoded sequence into s.seq'
+assert '&w[work::compute::BODY_ACTIVE_START..work::compute::SEQ_EMBEDDED]' in prefix_compute_fn, 'clean compute reuse must skip embedded sequence copy into WC work'
+graphs_finish_fn = item(graph_source, 'pub(crate) fn finish(')
+assert 'core::mem::ManuallyDrop::new(factory.persistent_objects_probe())' in graphs_finish_fn, 'Graphs::finish must keep probe-time FwCoherent ring allocator in ManuallyDrop'
+assert 'ring_objects.finish_private()?;' in graphs_finish_fn, 'Graphs::finish must publish persistent ring mappings'
+alloc_private_in_fn = item(object_source, 'fn alloc_private_in(')
+assert 'pub(crate) fn persistent_objects_probe(&self) -> Objects' in object_source, 'Factory must expose persistent_objects_probe for probe-time work rings'
+assert 'if self.probe {' in alloc_private_in_fn and 'self.dev.registration_guard().ok_or(ENODEV)?' in alloc_private_in_fn, 'alloc_private_in must gate as_bound() on self.probe and keep registration_guard() otherwise'
 ext_tiers_start = resources_source.index('pub(crate) const EXT_RENDER_TIERS:')
 ext_tiers_end = resources_source.index('];\n', ext_tiers_start) + 3
 render_burst_lines = (
@@ -2903,12 +3019,18 @@ graph_types = '\n'.join(
     item(graph_source, decl)
     for decl in (
         'pub(crate) struct ComputeGraph {',
+        'struct QueueSession {',
+        'impl QueueSession {',
         'struct QueueObjects {',
         'impl QueueObjects {',
         'fn init_queue(',
         'fn init_notifier(',
+        'struct ComputeGraphSession {',
+        'impl ComputeGraphSession {',
         'impl ComputeGraph {',
         'pub(crate) struct RenderGraph {',
+        'struct RenderGraphSession {',
+        'impl RenderGraphSession {',
         'impl RenderGraph {',
     )
 ).replace('fn new(', 'pub(crate) fn new(').replace('fn init(', 'pub(crate) fn init(')
