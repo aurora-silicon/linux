@@ -114,6 +114,16 @@ def parser_fixture(root):
     dsc_raw = bytearray(struct.pack('<I', 0xd3))
     wire(dsc_fixture, dsc_raw)
     timing_source += 'static const unsigned char dsc_blob[] = {' + ','.join(map(str,dsc_raw)) + '};\n'
+    # An unsafe-only HDMI 2.0 >340 MHz timing (e.g. 1080p180 / 1440p144): every
+    # element is in UnsafeColorElementIDs, so SDR already uses an unsafe element
+    # and PQ falls back to the best non-DSC unsafe PQ element.
+    unsafe_only_fixture = [dict(timing_fixture[0], ColorModes=[
+        color(80, 1, 8, 0, 10), color(105, 5, 12, 2, 7, encoding=2),
+        color(113, 9, 10, 2, 9)],
+        UnsafeColorElementIDs=[80, 105, 113], DSCRequiredColorElementIDs=[113])]
+    unsafe_only_raw = bytearray(struct.pack('<I', 0xd3))
+    wire(unsafe_only_fixture, unsafe_only_raw)
+    timing_source += 'static const unsigned char unsafe_only_blob[] = {' + ','.join(map(str,unsafe_only_raw)) + '};\n'
     # Default mode: an external display's native resolution at its highest
     # usable refresh rate; a panel keeps the timing its firmware prefers.
     def timing(i, w, h, hz, pref, score, unsafe=False):
@@ -346,6 +356,13 @@ int main(int argc, char **argv)
             assert(m[0].pq.id == (dsc ? 122 : 127) && m[0].pq.depth == 10);
             free(m);
         }
+        /* Unsafe-only >340 MHz timing falls back to non-DSC unsafe PQ (105),
+         * still skipping DSC-required unsafe PQ (113) when pq_dsc is false. */
+        assert(!parse(unsafe_only_blob, sizeof(unsafe_only_blob), &c));
+        m = enumerate_modes(&c, &n, 600, 330, 0, false, false);
+        assert(!IS_ERR(m) && n == 1 && !m[0].sdr_usable && m[0].sdr_unsafe);
+        assert(m[0].pq.id == 105 && m[0].pq.depth == 12);
+        free(m);
         /* The default modes; the timing ID that carries DRM_MODE_TYPE_PREFERRED. */
         static const struct { const unsigned char *blob; size_t size; bool internal; u32 id; } d[] = {
             { default_acer, sizeof(default_acer), false, 2 },

@@ -655,13 +655,14 @@ static void record_color_entry(struct dcp_display_mode *out,
  */
 static void collect_pq_mode(struct dcp_color_mode *pq, unsigned int *best_rank,
 			    struct color_mode *cmode,
-			    const struct timing_color_restrictions *limits, bool dsc)
+			    const struct timing_color_restrictions *limits,
+			    bool dsc, bool allow_unsafe)
 {
 	unsigned int rank = pq_mode_rank(cmode);
 	bool needs_dsc = timing_color_contains(&limits->dsc_required, cmode->id);
 
 	if (!rank || (needs_dsc && !dsc) ||
-	    timing_color_contains(&limits->unsafe, cmode->id))
+	    (!allow_unsafe && timing_color_contains(&limits->unsafe, cmode->id)))
 		return;
 
 	/* Break equal format and depth ranks in favour of no compression. */
@@ -682,9 +683,10 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 {
 	struct iterator outer_it;
 	struct dcp_color_mode bootstrap = { .score = -1 };
+	struct dcp_color_mode unsafe_pq = { .score = -1 };
 	s64 color_scores[DCP_MAX_COLOR_ENTRIES];
 	unsigned int best_sdr_rank = 0, best_unsafe_rank = 0, best_pq_rank = 0;
-	unsigned int best_rgb_rank = 0;
+	unsigned int best_unsafe_pq_rank = 0, best_rgb_rank = 0;
 	int ret = 0;
 	out->sdr_444.score = -1;
 	out->sdr_rgb.score = -1;
@@ -778,9 +780,14 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 				       cmode.pixel_encoding);
 		record_color_entry(out, color_scores, &cmode, limits, limits_known);
 
-		if (limits_known)
+		if (limits_known) {
 			collect_pq_mode(&out->pq, &best_pq_rank, &cmode, limits,
-					handle->pq_dsc);
+					handle->pq_dsc, false);
+			if (!external_sdr)
+				collect_pq_mode(&unsafe_pq, &best_unsafe_pq_rank,
+						&cmode, limits, handle->pq_dsc,
+						true);
+		}
 		if (cmode.eotf == DCP_EOTF_SDR_GAMMA &&
 		    (!limits_known ||
 		     (!timing_color_contains(&limits->unsafe, cmode.id) &&
@@ -844,6 +851,17 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 		}
 		fill_color_mode(&out->best, &cmode);
 	}
+
+	/*
+	 * Timings above HDMI 1.4's 340 MHz clock behind DP-to-HDMI 2.0 bridges
+	 * list every element in UnsafeColorElementIDs even though SDR already
+	 * drives them through those unsafe elements.  Fall back to the best
+	 * non-DSC unsafe PQ element only on such unsafe-only timings, keeping
+	 * UnsafeColorElementIDs strict whenever any safe SDR element exists.
+	 */
+	if (!external_sdr && out->pq.score < 0 && !out->sdr_usable &&
+	    out->sdr_unsafe && unsafe_pq.score >= 0)
+		out->pq = unsafe_pq;
 
 	return 0;
 }

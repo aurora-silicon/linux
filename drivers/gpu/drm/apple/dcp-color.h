@@ -286,7 +286,8 @@ static inline int dcp_select_color_mode(const struct dcp_display_mode *mode,
 	if (hdr && !req->allow_hdr)
 		return -EINVAL;
 
-	max_pass = (!hdr && req->allow_unsafe_sdr) ? 2 : 1;
+	max_pass = (req->allow_unsafe_sdr &&
+		    (!hdr || (!mode->sdr_usable && mode->sdr_unsafe))) ? 2 : 1;
 	for (pass = 0; pass < max_pass && !best; pass++) {
 		bool allow_unsafe = pass > 0;
 
