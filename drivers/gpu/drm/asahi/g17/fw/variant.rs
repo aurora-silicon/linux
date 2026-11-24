@@ -36,6 +36,17 @@ pub(crate) enum InitGraph {
     V25G83,
 }
 
+/// The InitData layouts of an M5 firmware build ([`super::m5::initdata`]). A build names its
+/// layouts; the M5 graph builds them, and a build that names none is refused.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum M5Layouts {
+    /// The 26A428 graph: version word 0x0c8e_0339_8728_04c0 and its allocation sizes.
+    V26A428,
+    /// The 27.2 (26B123) graph: version word 0x0c8e_4339_8728_04c0, a larger power policy
+    /// (0x12728) and status config (0x790), the 26A428 HW data.
+    V26B123,
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum QueueRegistration {
     Firmware,
@@ -99,6 +110,8 @@ pub(crate) struct Variant {
     /// work. The bare-metal M5 firmware powers the cores for work by its own policy: under a
     /// hold, the M5 Ultra's core-power witness reads unpowered until the hold is released.
     pub(crate) registration_power_hold: bool,
+    /// The InitData layouts the M5 graph must build for this firmware; `None` off M5.
+    pub(crate) m5_layouts: Option<M5Layouts>,
     /// A context takes its render pool identity when it is created, not at its first render,
     /// so that identities held by render graphs kept until the firmware stops refuse new
     /// contexts with an error instead of failing a context's first render. Set for the A18
@@ -169,6 +182,7 @@ pub(crate) const V26A428: Variant = Variant {
     v26b123: false,
     m5_commands: false,
     registration_power_hold: true,
+    m5_layouts: None,
     render_id_at_create: true,
     objects_after_release: true,
     telemetry_protocol: crate::g17::telemetry::Protocol::PSTATE_16MS,
@@ -212,6 +226,7 @@ pub(crate) const V25G83: Variant = Variant {
     v26b123: false,
     m5_commands: false,
     registration_power_hold: true,
+    m5_layouts: None,
     render_id_at_create: false,
     objects_after_release: false,
     telemetry_protocol: crate::g17::telemetry::Protocol::NONE,
@@ -225,6 +240,7 @@ pub(crate) const V26A428_M5: Variant = Variant {
     traversal_exclusion: false,
     render_ray_query: false,
     registration_power_hold: false,
+    m5_layouts: Some(M5Layouts::V26A428),
     render_id_at_create: false,
     objects_after_release: false,
     telemetry_protocol: crate::g17::telemetry::Protocol::PSTATE_8MS,
