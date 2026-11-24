@@ -429,8 +429,22 @@ static int dcp_pcm_open(struct snd_pcm_substream *substream)
 	}
 
 	ret = dcpaud_read_remote_info(dcpaud);
-	if (ret < 0)
-		return ret;
+	if (ret < 0) {
+		/*
+		 * The service is between a stop and its next start: the firmware
+		 * announces it again while the display link is set up again (a
+		 * modeset), and it refuses the element read meanwhile. Open as for
+		 * an unplugged sink rather than fail, which would drop the output
+		 * for good (see dcp_pcm_hw_unplugged).
+		 */
+		dev_dbg(dcpaud->dev, "sink info not readable (%d), opening as unplugged\n",
+			ret);
+		mutex_lock(&dcpaud->data_lock);
+		dcpaud->open_unplugged = true;
+		mutex_unlock(&dcpaud->data_lock);
+		hw = dcp_pcm_hw_unplugged;
+		goto refine;
+	}
 
 	snd_pcm_hw_rule_add(substream->runtime, 0, SNDRV_PCM_HW_PARAM_FORMAT,
 			    dcpaud_rule_format, dcpaud,

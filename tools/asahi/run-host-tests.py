@@ -178,6 +178,8 @@ ASAHI_TESTS = {
                                    'missing-control-firmware', 'missing-control-descriptor',
                                    'missing-owner-ipc', 'missing-owner-firmware',
                                    'missing-owner-descriptor', 'missing-owner-arena'), out()),
+    # A DP audio PCM whose sink info cannot be read yet opens as unplugged.
+    'dcpaud-open-fallback-tests.py': [([], PASS)] + mutations('--mutation', ('fail-open', 'no-flag'), []),
     'dcp-bw-scratch-window-tests.py': [([], PASS)] + mutations('--mutation', ('old-check', 'start-only'), []),
     'clpc-gpu-demand-tests.py': [([], PASS)],
     'clpc-high-power-cleanup-tests.py': [(out(), PASS),
