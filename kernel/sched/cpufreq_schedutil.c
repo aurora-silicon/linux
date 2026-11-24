@@ -13,6 +13,9 @@
 struct sugov_tunables {
 	struct gov_attr_set	attr_set;
 	unsigned int		rate_limit_us;
+#ifdef CONFIG_NO_HZ_COMMON
+	unsigned int		busy_boost_us;
+#endif
 };
 
 struct sugov_policy {
@@ -24,6 +27,9 @@ struct sugov_policy {
 	raw_spinlock_t		update_lock;
 	u64			last_freq_update_time;
 	s64			freq_update_delay_ns;
+#ifdef CONFIG_NO_HZ_COMMON
+	s64			busy_boost_ns;
+#endif
 	unsigned int		next_freq;
 	unsigned int		cached_raw_freq;
 
@@ -53,8 +59,12 @@ struct sugov_cpu {
 	unsigned long		bw_min;
 	unsigned long		bw_max;
 
-	/* The field below is for single-CPU policies only: */
 #ifdef CONFIG_NO_HZ_COMMON
+	/* Idle entry count seen last, and since when the CPU has not idled */
+	unsigned long		busy_idle_entries;
+	u64			busy_since;
+
+	/* The field below is for single-CPU policies only: */
 	unsigned long		saved_idle_calls;
 #endif
 };
@@ -406,8 +416,57 @@ static bool sugov_hold_freq(struct sugov_cpu *sg_cpu)
 	sg_cpu->saved_idle_calls = idle_calls;
 	return ret;
 }
+
+/**
+ * sugov_busy_boost() - Boost a CPU that has stayed busy.
+ * @sg_cpu: the sugov data for the CPU
+ * @max_cap: the max CPU capacity
+ *
+ * Frequency-invariant utilization grows in proportion to the frequency the
+ * CPU runs at, so a task that starts running flat out on a CPU clocked down
+ * by idle takes long to raise the frequency. A CPU that has not entered its
+ * idle loop for busy_boost_us has more work than its utilization shows yet:
+ * request its maximum capacity for it until it idles again. Work that idles
+ * in between, however briefly, is not affected. 0 turns this off.
+ *
+ * Return: @max_cap for a CPU busy for at least busy_boost_us, 0 otherwise
+ */
+static unsigned long sugov_busy_boost(struct sugov_cpu *sg_cpu,
+				      unsigned long max_cap)
+{
+	s64 boost_ns = READ_ONCE(sg_cpu->sg_policy->busy_boost_ns);
+	unsigned long entries;
+	u64 now;
+
+	if (!boost_ns || scx_switched_all()) {
+		sg_cpu->busy_since = 0;
+		return 0;
+	}
+
+	entries = tick_nohz_get_idle_entries_cpu(sg_cpu->cpu);
+	if (idle_cpu(sg_cpu->cpu)) {
+		sg_cpu->busy_idle_entries = entries;
+		sg_cpu->busy_since = 0;
+		return 0;
+	}
+
+	now = ktime_get_mono_fast_ns();
+	if (!sg_cpu->busy_since || entries != sg_cpu->busy_idle_entries) {
+		sg_cpu->busy_idle_entries = entries;
+		sg_cpu->busy_since = now;
+		return 0;
+	}
+
+	return (s64)(now - sg_cpu->busy_since) >= boost_ns ? max_cap : 0;
+}
 #else /* !CONFIG_NO_HZ_COMMON: */
 static inline bool sugov_hold_freq(struct sugov_cpu *sg_cpu) { return false; }
+
+static inline unsigned long sugov_busy_boost(struct sugov_cpu *sg_cpu,
+					     unsigned long max_cap)
+{
+	return 0;
+}
 #endif /* !CONFIG_NO_HZ_COMMON */
 
 /*
@@ -435,6 +494,7 @@ static inline bool sugov_update_single_common(struct sugov_cpu *sg_cpu,
 		return false;
 
 	boost = sugov_iowait_apply(sg_cpu, time, max_cap);
+	boost = max(boost, sugov_busy_boost(sg_cpu, max_cap));
 	sugov_get_util(sg_cpu, boost);
 
 	return true;
@@ -528,6 +588,7 @@ static unsigned int sugov_next_freq_shared(struct sugov_cpu *sg_cpu, u64 time)
 		unsigned long boost;
 
 		boost = sugov_iowait_apply(j_sg_cpu, time, max_cap);
+		boost = max(boost, sugov_busy_boost(j_sg_cpu, max_cap));
 		sugov_get_util(j_sg_cpu, boost);
 
 		util = max(j_sg_cpu->util, util);
@@ -637,8 +698,48 @@ rate_limit_us_store(struct gov_attr_set *attr_set, const char *buf, size_t count
 
 static struct governor_attr rate_limit_us = __ATTR_RW(rate_limit_us);
 
+#ifdef CONFIG_NO_HZ_COMMON
+static void sugov_update_busy_boost(struct sugov_policy *sg_policy)
+{
+	WRITE_ONCE(sg_policy->busy_boost_ns,
+		   (s64)sg_policy->tunables->busy_boost_us * NSEC_PER_USEC);
+}
+
+static ssize_t busy_boost_us_show(struct gov_attr_set *attr_set, char *buf)
+{
+	struct sugov_tunables *tunables = to_sugov_tunables(attr_set);
+
+	return sysfs_emit(buf, "%u\n", tunables->busy_boost_us);
+}
+
+static ssize_t
+busy_boost_us_store(struct gov_attr_set *attr_set, const char *buf, size_t count)
+{
+	struct sugov_tunables *tunables = to_sugov_tunables(attr_set);
+	struct sugov_policy *sg_policy;
+	unsigned int busy_boost_us;
+
+	if (kstrtouint(buf, 10, &busy_boost_us))
+		return -EINVAL;
+
+	tunables->busy_boost_us = busy_boost_us;
+
+	list_for_each_entry(sg_policy, &attr_set->policy_list, tunables_hook)
+		sugov_update_busy_boost(sg_policy);
+
+	return count;
+}
+
+static struct governor_attr busy_boost_us = __ATTR_RW(busy_boost_us);
+#else
+static inline void sugov_update_busy_boost(struct sugov_policy *sg_policy) { }
+#endif
+
 static struct attribute *sugov_attrs[] = {
 	&rate_limit_us.attr,
+#ifdef CONFIG_NO_HZ_COMMON
+	&busy_boost_us.attr,
+#endif
 	NULL
 };
 ATTRIBUTE_GROUPS(sugov);
@@ -873,6 +974,7 @@ static int sugov_start(struct cpufreq_policy *policy)
 	unsigned int cpu;
 
 	sugov_update_rate_limit_us(sg_policy);
+	sugov_update_busy_boost(sg_policy);
 	sg_policy->last_freq_update_time	= 0;
 	sg_policy->next_freq			= 0;
 	sg_policy->work_in_progress		= false;

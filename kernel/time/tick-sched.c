@@ -1201,6 +1201,7 @@ void tick_nohz_idle_enter(void)
 	WARN_ON_ONCE(ts->timer_expires_base);
 	tick_sched_flag_set(ts, TS_FLAG_INIDLE);
 	ts->idle_entrytime = ktime_get();
+	WRITE_ONCE(ts->idle_entries, ts->idle_entries + 1);
 	tick_nohz_clock_sleep(ts);
 
 	local_irq_enable();
@@ -1327,6 +1328,25 @@ unsigned long tick_nohz_get_idle_calls_cpu(int cpu)
 	struct tick_sched *ts = tick_get_tick_sched(cpu);
 
 	return ts->idle_calls;
+}
+
+/**
+ * tick_nohz_get_idle_entries_cpu - return the idle entry counter for a CPU
+ * @cpu: target CPU number
+ *
+ * Every pass of @cpu's idle loop increments this counter with WRITE_ONCE(),
+ * whether or not the tick is stopped, so a value that has not changed since
+ * an earlier read means @cpu has not entered idle in between unless it is
+ * idle now. Called from the schedutil frequency scaling governor in
+ * scheduler context.
+ *
+ * Return: the idle loop entry count for @cpu
+ */
+unsigned long tick_nohz_get_idle_entries_cpu(int cpu)
+{
+	struct tick_sched *ts = tick_get_tick_sched(cpu);
+
+	return READ_ONCE(ts->idle_entries);
 }
 
 void tick_nohz_idle_restart_tick(void)

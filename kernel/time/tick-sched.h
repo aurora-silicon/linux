@@ -46,6 +46,7 @@ struct tick_device {
  * @next_tick:		Next tick to be fired when in dynticks mode.
  * @idle_waketime:	Time when the idle was interrupted
  * @idle_entrytime:	Time when the idle call was entered
+ * @idle_entries:	Total number of idle loop entries
  * @last_jiffies:	Base jiffies snapshot when next event was last computed
  * @timer_expires_base:	Base time clock monotonic for @timer_expires
  * @timer_expires:	Anticipated timer expiration time (in case sched tick is stopped)
@@ -73,6 +74,7 @@ struct tick_sched {
 
 	/* Idle entry */
 	ktime_t				idle_entrytime;
+	unsigned long			idle_entries;
 
 	/* Tick stop */
 	unsigned long			last_jiffies;
