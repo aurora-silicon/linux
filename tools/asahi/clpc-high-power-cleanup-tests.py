@@ -76,13 +76,13 @@ struct apple_clpc {
     void *pmc, *debugfs, *covered;
     int policy_nb;
 };
-static void *cpu_possible_mask;
-static bool cpumask_equal(void *a, void *b) { return a == b; }
-static bool apple_clpc_has_profile_ceiling(const struct apple_clpc *c) {
+static void __attribute__((unused)) *cpu_possible_mask;
+static bool __attribute__((unused)) cpumask_equal(void *a, void *b) { return a == b; }
+static bool __attribute__((unused)) apple_clpc_has_profile_ceiling(const struct apple_clpc *c) {
     return c->low_power_khz || c->auto_low_power;
 }
-static void apple_clpc_find_clusters(struct apple_clpc *c) { (void)c; }
-static void apple_clpc_profile_limit(struct apple_clpc *c) { (void)c; }
+static void __attribute__((unused)) apple_clpc_find_clusters(struct apple_clpc *c) { (void)c; }
+static void __attribute__((unused)) apple_clpc_profile_limit(struct apple_clpc *c) { (void)c; }
 static struct mutex apple_clpc_clients_lock;
 static unsigned long jiffies = 123;
 static int system_freezable_power_efficient_wq;
