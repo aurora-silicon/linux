@@ -3328,12 +3328,58 @@ static const struct msi_parent_ops apple_msi_parent_ops = {
 	.init_dev_msi_info	= apple_msi_init_dev_msi_info,
 };
 
-/* T6030 has one shared AIC MSI window, partitioned by its ADT bridges. */
-static bool apple_t6030_msi_slice_valid(u32 base, u32 count, u32 aic_irq,
+/*
+ * A PCIe-C bridge's slice of the shared AIC MSI window: 32 vectors, aligned,
+ * above the internal host's first slice, inside the 8-bit map target, and
+ * consistent with the shared window's first AIC interrupt.
+ */
+static bool apple_pciec_msi_slice_valid(u32 base, u32 count, u32 aic_irq,
 					u32 aic_base)
 {
 	return base >= 0x20 && !(base & 0x1f) && base + count <= 256 &&
-	       count == 32 && aic_irq == aic_base + base;
+	       count == 32 && aic_irq >= aic_base &&
+	       aic_irq - aic_base == base;
+}
+
+/*
+ * The internal PCIe host owns vector 0 of the shared AIC MSI window, so its
+ * msi-ranges start is the window's first AIC interrupt. Require one consistent
+ * base across all internal hosts sharing the same interrupt controller.
+ */
+static int apple_pciec_msi_window_base(const struct of_phandle_args *slice,
+				       u32 *base)
+{
+	const struct of_device_id *match;
+	struct device_node *np;
+	bool found = false;
+
+	for_each_matching_node_and_match(np, apple_pcie_of_match, &match) {
+		const struct hw_info *hw = match->data;
+		struct of_phandle_args host = {};
+
+		if (hw->tunneled ||
+		    of_property_present(np, "apple,msi-vector-base"))
+			continue;
+		if (of_parse_phandle_with_args(np, "msi-ranges",
+					       "#interrupt-cells", 0, &host))
+			continue;
+		if (host.np != slice->np ||
+		    host.args_count != slice->args_count ||
+		    host.args[0] != slice->args[0] ||
+		    host.args[2] != slice->args[2]) {
+			of_node_put(host.np);
+			continue;
+		}
+		of_node_put(host.np);
+		if (found && *base != host.args[1]) {
+			of_node_put(np);
+			return -EINVAL;
+		}
+		*base = host.args[1];
+		found = true;
+	}
+
+	return found ? 0 : -ENOENT;
 }
 
 static int apple_msi_init(struct apple_pcie *pcie)
@@ -3390,20 +3436,36 @@ static int apple_msi_init(struct apple_pcie *pcie)
 
 	/*
 	 * The controller-wide ADT count (512) is not a per-host allocation.
-	 * Internal PCIe owns vectors 0..31. Each PCIe-C bridge owns a distinct
-	 * 32-vector slice. Keep endpoint MSI data local, and route its table
-	 * entry to the corresponding shared-window vector.
+	 * Internal PCIe owns the low vectors and each PCIe-C bridge a distinct
+	 * 32-vector slice of the shared window, which the device tree gives as
+	 * apple,msi-vector-base (the ADT bridge's msi-vector-offset) and as
+	 * the slice's first AIC interrupt in msi-ranges. Keep endpoint MSI
+	 * data local, and route its table entry to the corresponding
+	 * shared-window vector.
 	 */
 	if (pcie->hw == &t8122_pciec_hw || pcie->hw == &t8132_pciec_hw ||
 	    pcie->hw == &t6040_pciec_hw) {
-		struct resource ecam;
-		u32 expected_base, aic_base;
+		u32 aic_base;
 
-		if (of_address_to_resource(to_of_node(fwnode), 0, &ecam))
+		if (args.args_count != 3 || args.args[0] != 0 ||
+		    args.args[2] != IRQ_TYPE_EDGE_RISING)
 			goto invalid_slice;
-		/* These ECAM apertures identify the ADT bridges of each SoC. */
-		if (of_machine_is_compatible("apple,t6030")) {
-			aic_base = 1342;
+		ret = of_property_read_u32(to_of_node(fwnode),
+					   "apple,msi-vector-base",
+					   &pcie->msi_vector_base);
+		if (ret && of_machine_is_compatible("apple,t6030") &&
+		    args.args[1] == 1342 && pcie->nvecs == 512) {
+			struct resource ecam;
+			u32 expected_base;
+
+			/*
+			 * Old experimental T6030 boot DTs exposed the global
+			 * window to each host. Correct it here so old recovery
+			 * kernels can continue using the unchanged shared
+			 * bootloader DT; their ECAM apertures name the bridge.
+			 */
+			if (of_address_to_resource(to_of_node(fwnode), 0, &ecam))
+				goto invalid_slice;
 			switch (ecam.start) {
 			case 0x730000000ULL:
 				expected_base = 0x20;
@@ -3417,51 +3479,6 @@ static int apple_msi_init(struct apple_pcie *pcie)
 			default:
 				goto invalid_slice;
 			}
-		} else if (of_machine_is_compatible("apple,t6040")) {
-			aic_base = 2071;
-			switch (ecam.start) {
-			case 0x1c50000000ULL:
-				expected_base = 0x20;
-				break;
-			case 0x1c60000000ULL:
-				expected_base = 0x40;
-				break;
-			case 0x1c70000000ULL:
-				expected_base = 0x60;
-				break;
-			default:
-				goto invalid_slice;
-			}
-		} else if (of_machine_is_compatible("apple,t8132")) {
-			aic_base = 1506;
-			switch (ecam.start) {
-			/* The internal port's bridges own vectors 0..95. */
-			case 0x1c50000000ULL:
-				expected_base = 0x60;
-				break;
-			case 0x1c60000000ULL:
-				expected_base = 0x80;
-				break;
-			default:
-				goto invalid_slice;
-			}
-		} else {
-			goto invalid_slice;
-		}
-		if (args.args_count != 3 || args.args[0] != 0 ||
-		    args.args[2] != IRQ_TYPE_EDGE_RISING)
-			goto invalid_slice;
-		ret = of_property_read_u32(to_of_node(fwnode),
-					   "apple,msi-vector-base",
-					   &pcie->msi_vector_base);
-		if (!of_find_property(to_of_node(fwnode),
-				      "apple,msi-vector-base", NULL) &&
-		    aic_base == 1342 && args.args[1] == 1342 && pcie->nvecs == 512) {
-			/*
-			 * Old experimental boot DTs exposed the global window to
-			 * each host. Correct it here so old recovery kernels can
-			 * continue using the unchanged shared bootloader DT.
-			 */
 			pcie->msi_vector_base = expected_base;
 			pcie->nvecs = 32;
 			args.args[1] += expected_base;
@@ -3470,9 +3487,10 @@ static int apple_msi_init(struct apple_pcie *pcie)
 		} else if (ret) {
 			goto invalid_slice;
 		}
-		if (pcie->msi_vector_base != expected_base ||
-		    !apple_t6030_msi_slice_valid(pcie->msi_vector_base,
-					pcie->nvecs, args.args[1], aic_base))
+		if (apple_pciec_msi_window_base(&args, &aic_base) ||
+		    !apple_pciec_msi_slice_valid(pcie->msi_vector_base,
+						 pcie->nvecs, args.args[1],
+						 aic_base))
 			goto invalid_slice;
 	}
 
