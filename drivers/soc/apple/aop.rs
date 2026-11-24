@@ -1351,6 +1351,8 @@ struct AopData {
     /// endpoint order.
     sleep_endpoints: KVec<u8>,
     wake_endpoints: KVec<u8>,
+    /// [`AopHwConfig::s2r_notice`]
+    s2r_notice: u8,
     /// No call starts until the system has resumed.
     sleeping: Atomic<bool>,
     /// RTKit reported the firmware crashed. Nothing restarts it short of a reboot.
@@ -1544,6 +1546,7 @@ impl AopData {
                     ep_shutdown <- pin_init::pin_init_array_from_fn(|_| FutureValue::pin_init()),
                     ep_sleep <- pin_init::pin_init_array_from_fn(|_| FutureValue::pin_init()),
                     sleep_endpoints,
+                    s2r_notice: cfg.s2r_notice,
                     wake_endpoints,
                     sleeping: Atomic::new(false),
                     crashed: Atomic::new(false),
@@ -1848,7 +1851,11 @@ impl AopData {
         }
 
         let mut result = Ok(());
-        for endpoint in AfkOrder::new(&self.sleep_endpoints) {
+        let notice = self.s2r_notice;
+        // An empty order is every endpoint: without the stops, the loop doesn't run.
+        let stops = AfkOrder::new(&self.sleep_endpoints)
+            .take_while(|_| notice & AOP_S2R_ENDPOINTS != 0);
+        for endpoint in stops {
             let Some(index) = afk_endpoint_index(endpoint) else {
                 continue;
             };
@@ -1864,7 +1871,7 @@ impl AopData {
             self.sleep_stopped
                 .store(self.sleep_stopped.load(Relaxed) | (1 << index), Relaxed);
         }
-        if result.is_ok() {
+        if result.is_ok() && notice & AOP_S2R_AP_IDLE != 0 {
             // Set first: a notice without an answer may still have been taken.
             self.ap_idle.store(true, Relaxed);
             result = self.ap_power(false).inspect_err(|e| {
@@ -3038,7 +3045,16 @@ struct AopHwConfig {
     /// left in DRAM are then neither reserved nor mapped, so it runs as its
     /// fallback compatible's block did (T8122: `apple,t6020-aop`).
     without_fw_regions: Option<&'static AopHwConfig>,
+    /// What it hears for a firmware-driven sleep: bit 0 its endpoints stop
+    /// ([`AOP_S2R_ENDPOINTS`]), bit 1 the AP's idle notice
+    /// ([`AOP_S2R_AP_IDLE`]).
+    s2r_notice: u8,
 }
+
+/// [`AopHwConfig::s2r_notice`]: the endpoints stop and start around a sleep.
+const AOP_S2R_ENDPOINTS: u8 = 1 << 0;
+/// [`AopHwConfig::s2r_notice`]: the AP's idle and on notices around a sleep.
+const AOP_S2R_AP_IDLE: u8 = 1 << 1;
 
 impl AopHwConfig {
     /// The configuration to start the block with, given whether the
@@ -3070,6 +3086,8 @@ const HW_CFG_T8103_DIRECT: AopHwConfig = AopHwConfig {
     bootargs_word_access: false,
     halt_on_failed_start: false,
     without_fw_regions: None,
+    // Measured across real sleeps with its endpoints stopped only.
+    s2r_notice: AOP_S2R_ENDPOINTS,
 };
 /// T8103 (M1): from firmware 27 on, the AOP runs its external code and data
 /// from DRAM, which the bootloader reserves in `memory-region`, and stops
@@ -3100,6 +3118,7 @@ const HW_CFG_T8112: AopHwConfig = AopHwConfig {
     bootargs_word_access: false,
     halt_on_failed_start: false,
     without_fw_regions: None,
+    s2r_notice: AOP_S2R_ENDPOINTS | AOP_S2R_AP_IDLE,
 };
 /// `nCal` keeps the firmware's own value, as on T8112.
 const HW_CFG_T6000: AopHwConfig = AopHwConfig {
@@ -3120,6 +3139,7 @@ const HW_CFG_T6000: AopHwConfig = AopHwConfig {
     bootargs_word_access: false,
     halt_on_failed_start: false,
     without_fw_regions: None,
+    s2r_notice: AOP_S2R_ENDPOINTS | AOP_S2R_AP_IDLE,
 };
 const HW_CFG_T6020: AopHwConfig = AopHwConfig {
     ec0p: 0x0100_00000000,
@@ -3139,6 +3159,7 @@ const HW_CFG_T6020: AopHwConfig = AopHwConfig {
     bootargs_word_access: false,
     halt_on_failed_start: false,
     without_fw_regions: None,
+    s2r_notice: AOP_S2R_ENDPOINTS | AOP_S2R_AP_IDLE,
 };
 /// T6040 (J616s): the firmware's external code and log live in DRAM, mapped
 /// through the reserved regions the bootloader describes; the RTKit firmware
@@ -3163,6 +3184,7 @@ const HW_CFG_T6040: AopHwConfig = AopHwConfig {
     bootargs_word_access: true,
     halt_on_failed_start: true,
     without_fw_regions: None,
+    s2r_notice: AOP_S2R_ENDPOINTS | AOP_S2R_AP_IDLE,
 };
 /// T8132 (J713): as T6040. The bootloader hands the AOP over the same way, with
 /// the DART's DAPF programmed and its windows reserved alongside the firmware
@@ -3199,6 +3221,7 @@ const HW_CFG_T8140: AopHwConfig = AopHwConfig {
     bootargs_word_access: false,
     halt_on_failed_start: false,
     without_fw_regions: None,
+    s2r_notice: AOP_S2R_ENDPOINTS | AOP_S2R_AP_IDLE,
 };
 /// T8152: like T8140, but the setup port (mailbox 1 of the AOP bank, and the
 /// ADT aop-exclave-mailbox) is not reachable from the AP: both bus-error.
@@ -3220,6 +3243,7 @@ const HW_CFG_T8152: AopHwConfig = AopHwConfig {
     bootargs_word_access: false,
     halt_on_failed_start: false,
     without_fw_regions: None,
+    s2r_notice: AOP_S2R_ENDPOINTS | AOP_S2R_AP_IDLE,
 };
 
 /// T8142 (M5): booted through a setup port as on T8140, at the ADT's
@@ -3245,6 +3269,7 @@ const HW_CFG_T8142: AopHwConfig = AopHwConfig {
     bootargs_word_access: false,
     halt_on_failed_start: false,
     without_fw_regions: None,
+    s2r_notice: AOP_S2R_ENDPOINTS | AOP_S2R_AP_IDLE,
 };
 /// T6050 (M5 Pro and Max): booted as T8142, through the setup port at
 /// AOP ASC + 0x4007c000. Its EPMAP also names system endpoint 4, which never

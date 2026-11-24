@@ -148,7 +148,8 @@ def method(source):
 
 
 def configs(source):
-    """struct AopHwConfig and the HW_CFG_* constants, each with its doc comment.
+    """struct AopHwConfig, the HW_CFG_* constants and the AOP_S2R_* flags they use, each with its
+    doc comment.
 
     Other items between them (the sleep's PM callbacks) use kernel bindings the harness
     doesn't have.
@@ -161,7 +162,8 @@ def configs(source):
             if not line.strip() or line.startswith(('//', '#[')):
                 pending.append(line)
                 continue
-            keep = line.startswith(('struct AopHwConfig', 'impl AopHwConfig', 'const HW_CFG_'))
+            keep = line.startswith(('struct AopHwConfig', 'impl AopHwConfig', 'const HW_CFG_',
+                                    'const AOP_S2R_'))
             item, pending, depth = pending + [line], [], 0
         else:
             item.append(line)
