@@ -2222,16 +2222,20 @@ int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_commit *commi
 
 	/*
 	 * On desktop 26.6 firmware the panel takes VRR_ENABLED with the next
-	 * frame, without a mode set (see dcp_vrr_update()).  The external
-	 * processors ignore a new minimum rate on a live mode, so they still
-	 * change adaptive sync with a mode set, as firmware 27's externals do:
-	 * macOS switches between a timing's fixed and variable modes with a
-	 * full mode set.
+	 * frame, without a mode set (see dcp_vrr_update()), once a mode set
+	 * has armed adaptive sync.  An adopted boot mode starts fixed
+	 * (!dcp->vrr_enabled), so enabling VRR_ENABLED the first time still
+	 * needs one mode set; other template pipes change adaptive sync inside
+	 * iomfb_modeset() via a full mode set, except firmware 27 panels which
+	 * do not re-modeset on VRR.
 	 */
-	if ((dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
-	     (dcp->fw_compat == DCP_FIRMWARE_V_27_0 && !dcp->main_display &&
-	      !dcp_has_panel(dcp))) &&
-	    crtc_state->enable && !dcp_vrr_live(dcp)) {
+	if (READ_ONCE(dcp->iomfb_template_pq) &&
+	    !(dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+	      (dcp->main_display || dcp_has_panel(dcp))) &&
+	    crtc_state->enable &&
+	    !(dcp_vrr_live(dcp) &&
+	      (READ_ONCE(dcp->vrr_enabled) || !crtc_state->vrr_enabled ||
+	       (dcp->desktop && READ_ONCE(dcp->desktop->vrr_failed))))) {
 		struct drm_crtc_state *old =
 			drm_atomic_get_old_crtc_state(commit, crtc);
 
@@ -4329,6 +4333,14 @@ bool dcp_fw_compat_panel_edr(struct platform_device *pdev)
 	       dcp->fw_compat == DCP_FIRMWARE_V_27_0;
 }
 
+/* External connectors driven by iomfb_template support full colour selection. */
+bool dcp_ext_color_props_supported(struct platform_device *pdev)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	return !dcp_is_ext26(dcp) && !dcp_fw_compat_is_14_7(pdev);
+}
+
 bool dcp_fw_compat_is_14_7(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
@@ -4402,37 +4414,7 @@ static const struct apple_epic_service_ops dcp_compact_aux_ops[] = {
 static void dcp_av_service_init(struct apple_epic_service *service,
 				const char *name, const char *class, s64 unit)
 {
-	struct dcp_desktop_state *d = service->ep->dcp->desktop;
-	struct apple_epic_service *old;
-
-	service = afk_service_get(service);
-	if (!service)
-		return;
-	scoped_guard(spinlock_irqsave, &d->hdr_lock) {
-		old = d->av_service;
-		d->av_service = service;
-		d->hdr_sent_valid = false;
-		d->hdr_infoframe = false;
-	}
-	if (old)
-		afk_service_put(old);
-}
-
-static void dcp_av_service_teardown(struct apple_epic_service *service)
-{
-	struct dcp_desktop_state *d = service->ep->dcp->desktop;
-	bool owned;
-
-	scoped_guard(spinlock_irqsave, &d->hdr_lock) {
-		owned = d->av_service == service;
-		if (owned) {
-			d->av_service = NULL;
-			d->hdr_sent_valid = false;
-			d->hdr_infoframe = false;
-		}
-	}
-	if (owned)
-		afk_service_put(service);
+	dcp_hdr_service_bind(service);
 }
 
 static const struct apple_epic_service_ops dcp_ext_av_service_ops[] = {
@@ -4440,7 +4422,7 @@ static const struct apple_epic_service_ops dcp_ext_av_service_ops[] = {
 		.name = "dcpav-service-epic",
 		.reusable = true,
 		.init = dcp_av_service_init,
-		.teardown = dcp_av_service_teardown,
+		.teardown = dcp_hdr_service_unbind,
 	},
 	{
 		.name = "*",
@@ -5089,8 +5071,6 @@ static void _dcp_poweroff(struct apple_dcp *dcp)
 		iomfb_poweroff_v26_6_desktop(dcp);
 		if (dcp->edr_hm)
 			dcp->edr_restart = true;
-		/* The link set up again starts without HDR10 metadata. */
-		dcp_hdr_metadata_forget(dcp);
 		break;
 	case DCP_FIRMWARE_V_26_6:
 		iomfb_v26_6_poweroff(dcp);
@@ -5112,6 +5092,13 @@ static void _dcp_poweroff(struct apple_dcp *dcp)
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
 		break;
 	}
+	/* The link set up again starts without HDR10 metadata. */
+	scoped_guard(spinlock_irqsave, &dcp->hdr.lock) {
+		dcp->active_color.score = -1;
+		dcp->output_pq = false;
+		dcp->output_hdr = false;
+	}
+	dcp_hdr_metadata_forget(dcp);
 }
 
 static void dcp_resume_enable_irq(void *ctx)
@@ -7516,7 +7503,6 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 		dcp->desktop = devm_kzalloc(dev, sizeof(*dcp->desktop), GFP_KERNEL);
 		if (!dcp->desktop)
 			return -ENOMEM;
-		spin_lock_init(&dcp->desktop->hdr_lock);
 		/*
 		 * The opaque client identity of the IOMFB calls.  The firmware's
 		 * own client passes a kernel pointer there; pass a random value
@@ -7560,6 +7546,8 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	dcp_fabric_init(dcp);
 	spin_lock_init(&dcp->mode_state.lock);
 	spin_lock_init(&dcp->metadata.lock);
+	spin_lock_init(&dcp->hdr.lock);
+	dcp->active_color.score = -1;
 	mutex_init(&dcp->dcpavserv.lock);
 	INIT_WORK(&dcp->dcpavserv.close_wq, dcpavserv_close_work);
 	ret = dcpavserv_edid_retry_init(dcp);
