@@ -148,6 +148,17 @@ def main():
             assert code.count(old) == 1, (name, code.count(old))
             variants.append((name, code.replace(old, new)))
         variants.append(("control-after", code))
+    # The T8122 14.x wait finds no T8122 report node here and returns -ENODEV; it is added to
+    # every variant after the T6030 mutations are placed, so they target the T6030 path only.
+    dispatch = "int apple_pmp_report_wait_supplier_ready("
+    t8122 = function(report, "static int apple_pmp_report_wait_t8122_14(") + "\n"
+    def with_t8122(source):
+        if dispatch not in source:
+            return source
+        return source.replace(dispatch, t8122 + dispatch, 1)
+    variants = [(name, with_t8122(source)) for name, source in variants]
+    if baseline_code and "apple_pmp_report_wait_t8122_14(" in baseline_code:
+        baseline_code = with_t8122(baseline_code)
     results = [run(args.output, name, source, compiler) for name, source in variants]
     if baseline_code:
         results.append(run(args.output, "control-prior-config-off", baseline_code, compiler, (0,)))
