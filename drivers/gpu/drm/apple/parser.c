@@ -675,6 +675,34 @@ static void collect_pq_mode(struct dcp_color_mode *pq, unsigned int *best_rank,
 	*best_rank = rank;
 }
 
+static int parse_downstream_pixel_encoding(struct dcp_parse_ctx *handle,
+					   s64 *encoding)
+{
+	struct iterator it;
+	int ret;
+
+	*encoding = -1;
+	ret = iterator_begin(handle, &it, true);
+	if (ret)
+		return ret;
+
+	for (; it.idx < it.len; ++it.idx) {
+		char *key = parse_string(it.handle);
+
+		if (IS_ERR(key))
+			return PTR_ERR(key);
+		if (!strcmp(key, "PixelEncoding"))
+			ret = parse_int(it.handle, encoding);
+		else
+			ret = skip(it.handle);
+		kfree(key);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
 static int parse_color_modes(struct dcp_parse_ctx *handle,
 			     struct dcp_display_mode *out, bool external_sdr,
 			     const struct timing_color_restrictions *limits,
@@ -707,6 +735,7 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 		static const char * const fields[] = { "Colorimetry", "Depth", "DynamicRange", "EOTF", "ID", "PixelEncoding", "Score", "IsVirtual" };
 		unsigned int seen = 0;
 		bool is_virtual = true;
+		s64 downstream_encoding = -1;
 		struct color_mode cmode = {
 			.colorimetry = -1,
 			.depth = -1,
@@ -738,6 +767,9 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 				ret = parse_int(it.handle, &cmode.colorimetry);
 			else if (!strcmp(key, "Depth"))
 				ret = parse_int(it.handle, &cmode.depth);
+			else if (!strcmp(key, "DownstreamFormat"))
+				ret = parse_downstream_pixel_encoding(it.handle,
+								      &downstream_encoding);
 			else if (!strcmp(key, "DynamicRange"))
 				ret = parse_int(it.handle, &cmode.dynamic_range);
 			else if (!strcmp(key, "EOTF"))
@@ -773,6 +805,13 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 		if (is_virtual || cmode.score < 0 || cmode.id < 0 ||
 		    cmode.id > U32_MAX)
 			continue;
+
+		/*
+		 * DP-to-HDMI bridges downsample 4K60 YCbCr 4:4:4/4:2:2 to
+		 * YCbCr 4:2:0 on the downstream link; expose the wire format.
+		 */
+		if (downstream_encoding == DCP_COLOR_FORMAT_YCBCR420)
+			cmode.pixel_encoding = DCP_COLOR_FORMAT_YCBCR420;
 
 		trace_iomfb_color_mode(handle->dcp, cmode.id, cmode.score,
 				       cmode.depth, cmode.colorimetry,

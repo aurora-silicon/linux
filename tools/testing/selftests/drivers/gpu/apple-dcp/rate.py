@@ -98,18 +98,18 @@ def parser_fixture(root):
     pq_raw = bytearray(struct.pack('<I', 0xd3))
     wire(pq_fixture, pq_raw)
     timing_source += 'static const unsigned char pq_blob[] = {' + ','.join(map(str,pq_raw)) + '};\n'
-    # Without link bandwidth for PQ RGB: YCbCr 4:4:4 BT.2020, never 4:2:2.
+    # Without link bandwidth for PQ RGB: YCbCr 4:4:4 (encoding=3) BT.2020 outranks 4:2:2 (encoding=2).
     ycc_fixture = [dict(timing_fixture[0], ColorModes=[
-        color(85, 1, 10, 0, 10), color(95, 5, 12, 2, 7, encoding=2), color(96, 9, 10, 2, 7, encoding=2),
-        color(97, 20, 12, 2, 7, encoding=3), color(98, 30, 10, 2, 9)],
+        color(85, 1, 10, 0, 10), color(95, 5, 12, 2, 7, encoding=3), color(96, 9, 10, 2, 7, encoding=3),
+        color(97, 20, 12, 2, 7, encoding=2), color(98, 30, 10, 2, 9)],
         UnsafeColorElementIDs=[96, 98])]
     ycc_raw = bytearray(struct.pack('<I', 0xd3))
     wire(ycc_fixture, ycc_raw)
     timing_source += 'static const unsigned char ycc_blob[] = {' + ','.join(map(str,ycc_raw)) + '};\n'
-    # A fast external timing offers DSC RGB and uncompressed YCbCr 4:4:4.
+    # A fast external timing offers DSC RGB and uncompressed YCbCr 4:4:4 (encoding=3).
     dsc_fixture = [dict(timing_fixture[0], ColorModes=[
         color(85, 1, 10, 0, 10), color(122, 5, 10, 2, 9),
-        color(127, 9, 10, 2, 7, encoding=2), color(130, 20, 10, 2, 9)],
+        color(127, 9, 10, 2, 7, encoding=3), color(130, 20, 10, 2, 9)],
         UnsafeColorElementIDs=[130], DSCRequiredColorElementIDs=[122, 130])]
     dsc_raw = bytearray(struct.pack('<I', 0xd3))
     wire(dsc_fixture, dsc_raw)
@@ -124,6 +124,19 @@ def parser_fixture(root):
     unsafe_only_raw = bytearray(struct.pack('<I', 0xd3))
     wire(unsafe_only_fixture, unsafe_only_raw)
     timing_source += 'static const unsigned char unsafe_only_blob[] = {' + ','.join(map(str,unsafe_only_raw)) + '};\n'
+    # DP-to-HDMI bridge 4K60 YCbCr 4:2:0 via DownstreamFormat (MCDP2900 CE 119/162).
+    ds420_fixture = [dict(timing_fixture[0], ColorModes=[
+        color(80, 242999, 8, 0, 10, encoding=0),
+        color(83, 232999, 8, 0, 1, encoding=3, dynamic=1),
+        dict(color(119, 202232, 8, 0, 1, encoding=3, dynamic=1),
+             DownstreamFormat=color(118, 202999, 8, 0, 1, encoding=1, dynamic=1)),
+        color(105, 627999, 12, 2, 7, encoding=2, dynamic=1),
+        dict(color(162, 607627, 12, 2, 7, encoding=2, dynamic=1),
+             DownstreamFormat=color(161, 607999, 12, 2, 7, encoding=1, dynamic=1))],
+        UnsafeColorElementIDs=[80, 83, 105, 162])]
+    ds420_raw = bytearray(struct.pack('<I', 0xd3))
+    wire(ds420_fixture, ds420_raw)
+    timing_source += 'static const unsigned char ds420_blob[] = {' + ','.join(map(str,ds420_raw)) + '};\n'
     # Default mode: an external display's native resolution at its highest
     # usable refresh rate; a panel keeps the timing its firmware prefers.
     def timing(i, w, h, hz, pref, score, unsafe=False):
@@ -363,9 +376,37 @@ int main(int argc, char **argv)
             c.pq_dsc = dsc;
             m = enumerate_modes(&c, &n, 600, 330, 0, false, false);
             assert(!IS_ERR(m) && n == 1 && !m[0].sdr_usable && m[0].sdr_unsafe);
-            assert(m[0].pq.id == 105 && m[0].pq.depth == 12);
+            assert(m[0].pq.id == 105 && m[0].pq.depth == 12 &&
+                   m[0].pq.format == DCP_COLOR_FORMAT_YCBCR422);
             free(m);
         }
+        /* DP-to-HDMI bridge 4K60 DownstreamFormat exposes true wire YCbCr 4:2:0
+         * (CE 119 SDR, CE 162 PQ) without aliasing 4:4:4 (83) or 4:2:2 (105). */
+        assert(!parse(ds420_blob, sizeof(ds420_blob), &c));
+        m = enumerate_modes(&c, &n, 600, 330, 0, false, false);
+        assert(!IS_ERR(m) && n == 1 && m[0].sdr_usable && m[0].sdr_444.id == 83);
+        {
+            unsigned int found_420_sdr = 0, found_420_pq = 0, found_444 = 0, found_422 = 0;
+            for (unsigned int j = 0; j < m[0].nr_colors; j++) {
+                if (m[0].colors[j].id == 119) {
+                    assert(m[0].colors[j].format == DCP_COLOR_FORMAT_YCBCR420 &&
+                           !(m[0].colors[j].flags & DCP_COLOR_FLAG_UNSAFE));
+                    found_420_sdr++;
+                } else if (m[0].colors[j].id == 162) {
+                    assert(m[0].colors[j].format == DCP_COLOR_FORMAT_YCBCR420 &&
+                           (m[0].colors[j].flags & DCP_COLOR_FLAG_UNSAFE));
+                    found_420_pq++;
+                } else if (m[0].colors[j].id == 83) {
+                    assert(m[0].colors[j].format == DCP_COLOR_FORMAT_YCBCR444);
+                    found_444++;
+                } else if (m[0].colors[j].id == 105) {
+                    assert(m[0].colors[j].format == DCP_COLOR_FORMAT_YCBCR422);
+                    found_422++;
+                }
+            }
+            assert(found_420_sdr == 1 && found_420_pq == 1 && found_444 == 1 && found_422 == 1);
+        }
+        free(m);
         /* The default modes; the timing ID that carries DRM_MODE_TYPE_PREFERRED. */
         static const struct { const unsigned char *blob; size_t size; bool internal; u32 id; } d[] = {
             { default_acer, sizeof(default_acer), false, 2 },

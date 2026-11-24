@@ -952,20 +952,21 @@ int main(void)
     struct dcp_color_request req;
     struct dcp_color_mode out;
 
-    /* Populate Acer 1080p60-shaped catalog */
+    /* Populate Acer 1080p60-shaped catalog (enc 3 = YCbCr444, enc 2 = YCbCr422) */
     add_entry(&acer, 81, DCP_EOTF_SDR_GAMMA, DCP_COLOR_FORMAT_RGB, DCP_COLORIMETRY_SRGB, DCP_COLOR_YCBCR_RANGE_FULL, 8, 0);
     add_entry(&acer, 82, DCP_EOTF_SDR_GAMMA, DCP_COLOR_FORMAT_RGB, DCP_COLORIMETRY_SRGB, DCP_COLOR_YCBCR_RANGE_LIMITED, 8, 0);
-    add_entry(&acer, 91, DCP_EOTF_SDR_GAMMA, DCP_COLOR_FORMAT_RGB, DCP_COLORIMETRY_SRGB, DCP_COLOR_YCBCR_RANGE_FULL, 10, 0);
-    add_entry(&acer, 95, DCP_EOTF_SDR_GAMMA, DCP_COLOR_FORMAT_RGB, DCP_COLORIMETRY_BT2020_RGB, DCP_COLOR_YCBCR_RANGE_FULL, 10, 0);
-    add_entry(&acer, 83, DCP_EOTF_SDR_GAMMA, DCP_COLOR_FORMAT_YCBCR422, DCP_COLORIMETRY_BT709, DCP_COLOR_YCBCR_RANGE_LIMITED, 8, 0);
-    add_entry(&acer, 84, DCP_EOTF_SDR_GAMMA, DCP_COLOR_FORMAT_YCBCR422, DCP_COLORIMETRY_BT601, DCP_COLOR_YCBCR_RANGE_LIMITED, 8, 0);
-    add_entry(&acer, 93, DCP_EOTF_SDR_GAMMA, DCP_COLOR_FORMAT_YCBCR422, DCP_COLORIMETRY_BT709, DCP_COLOR_YCBCR_RANGE_LIMITED, 10, 0);
-    add_entry(&acer, 107, DCP_EOTF_ST_2084, DCP_COLOR_FORMAT_YCBCR444, DCP_COLORIMETRY_BT2020_YCC, DCP_COLOR_YCBCR_RANGE_LIMITED, 12, 0);
-    add_entry(&acer, 109, DCP_EOTF_ST_2084, DCP_COLOR_FORMAT_YCBCR422_DP, DCP_COLORIMETRY_BT2020_YCC, DCP_COLOR_YCBCR_RANGE_LIMITED, 12, 0);
+    add_entry(&acer, 86, DCP_EOTF_SDR_GAMMA, DCP_COLOR_FORMAT_RGB, DCP_COLORIMETRY_SRGB, DCP_COLOR_YCBCR_RANGE_FULL, 10, 0);
+    add_entry(&acer, 85, DCP_EOTF_SDR_GAMMA, DCP_COLOR_FORMAT_RGB, DCP_COLORIMETRY_BT2020_RGB, DCP_COLOR_YCBCR_RANGE_FULL, 10, 0);
+    add_entry(&acer, 84, DCP_EOTF_SDR_GAMMA, DCP_COLOR_FORMAT_YCBCR444, DCP_COLORIMETRY_BT709, DCP_COLOR_YCBCR_RANGE_LIMITED, 8, 0);
+    add_entry(&acer, 83, DCP_EOTF_SDR_GAMMA, DCP_COLOR_FORMAT_YCBCR444, DCP_COLORIMETRY_BT601, DCP_COLOR_YCBCR_RANGE_LIMITED, 8, 0);
+    add_entry(&acer, 90, DCP_EOTF_SDR_GAMMA, DCP_COLOR_FORMAT_YCBCR444, DCP_COLORIMETRY_BT709, DCP_COLOR_YCBCR_RANGE_LIMITED, 10, 0);
+    add_entry(&acer, 108, DCP_EOTF_ST_2084, DCP_COLOR_FORMAT_YCBCR422, DCP_COLORIMETRY_BT2020_YCC, DCP_COLOR_YCBCR_RANGE_LIMITED, 12, 0);
+    add_entry(&acer, 110, DCP_EOTF_ST_2084, DCP_COLOR_FORMAT_YCBCR422_DP, DCP_COLORIMETRY_BT2020_YCC, DCP_COLOR_YCBCR_RANGE_LIMITED, 12, 0);
     add_entry(&acer, 113, DCP_EOTF_ST_2084, DCP_COLOR_FORMAT_RGB, DCP_COLORIMETRY_BT2020_RGB, DCP_COLOR_YCBCR_RANGE_FULL, 10, 0);
     add_entry(&acer, 114, DCP_EOTF_ST_2084, DCP_COLOR_FORMAT_RGB, DCP_COLORIMETRY_BT2020_RGB, DCP_COLOR_YCBCR_RANGE_LIMITED, 10, 0);
-    add_entry(&acer, 115, DCP_EOTF_ST_2084, DCP_COLOR_FORMAT_YCBCR422, DCP_COLORIMETRY_BT2020_YCC, DCP_COLOR_YCBCR_RANGE_LIMITED, 10, 0);
+    add_entry(&acer, 116, DCP_EOTF_ST_2084, DCP_COLOR_FORMAT_YCBCR444, DCP_COLORIMETRY_BT2020_YCC, DCP_COLOR_YCBCR_RANGE_LIMITED, 10, 0);
     add_entry(&acer, 117, DCP_EOTF_ST_2084, DCP_COLOR_FORMAT_RGB, DCP_COLORIMETRY_BT2020_RGB, DCP_COLOR_YCBCR_RANGE_FULL, 12, 0);
+    add_entry(&acer, 120, DCP_EOTF_ST_2084, DCP_COLOR_FORMAT_YCBCR444, DCP_COLORIMETRY_BT2020_YCC, DCP_COLOR_YCBCR_RANGE_LIMITED, 12, 0);
     add_entry(&acer, 121, DCP_EOTF_BT_2100, DCP_COLOR_FORMAT_YCBCR444, DCP_COLORIMETRY_BT2020_YCC, DCP_COLOR_YCBCR_RANGE_LIMITED, 10, 0);
     add_entry(&acer, 122, DCP_EOTF_SDR_GAMMA, DCP_COLOR_FORMAT_YCBCR420, DCP_COLORIMETRY_BT709, DCP_COLOR_YCBCR_RANGE_LIMITED, 8, 0);
 
@@ -985,51 +986,51 @@ int main(void)
     req.broadcast_rgb = DRM_HDMI_BROADCAST_RGB_LIMITED;
     assert(!dcp_select_color_mode(&acer, &req, &out) && out.id == 114 && out.range == DCP_COLOR_YCBCR_RANGE_LIMITED);
 
-    /* Explicit YCbCr 4:4:4 / 4:2:2 PQ (including 10b vs 12b DP tunnel) */
+    /* Explicit YCbCr 4:4:4 (10b/12b) and 4:2:2 (plain outranks DP tunnel) PQ */
     req = (struct dcp_color_request){ .eotf = HDMI_EOTF_SMPTE_ST2084, .colorspace = DRM_MODE_COLORIMETRY_BT2020_YCC,
-        .color_format = DRM_CONNECTOR_COLOR_FORMAT_YCBCR444, .max_bpc = 12, .allow_hdr = true };
-    assert(!dcp_select_color_mode(&acer, &req, &out) && out.id == 107);
-    req.color_format = DRM_CONNECTOR_COLOR_FORMAT_YCBCR422; req.max_bpc = 10;
-    assert(!dcp_select_color_mode(&acer, &req, &out) && out.id == 115 && out.depth == 10);
+        .color_format = DRM_CONNECTOR_COLOR_FORMAT_YCBCR444, .max_bpc = 10, .allow_hdr = true };
+    assert(!dcp_select_color_mode(&acer, &req, &out) && out.id == 116 && out.depth == 10);
     req.max_bpc = 12;
-    assert(!dcp_select_color_mode(&acer, &req, &out) && out.id == 115); /* plain 422 outranks 422_DP */
+    assert(!dcp_select_color_mode(&acer, &req, &out) && out.id == 120 && out.depth == 12);
+    req.color_format = DRM_CONNECTOR_COLOR_FORMAT_YCBCR422; req.max_bpc = 12;
+    assert(!dcp_select_color_mode(&acer, &req, &out) && out.id == 108); /* plain 422 outranks 422_DP (110) */
 
     /* HLG support */
     req = (struct dcp_color_request){ .eotf = HDMI_EOTF_BT_2100_HLG, .colorspace = DRM_MODE_COLORIMETRY_BT2020_YCC,
         .max_bpc = 12, .allow_hdr = true };
     assert(!dcp_select_color_mode(&acer, &req, &out) && out.id == 121);
 
-    /* SDR: RGB 8b Limited, RGB 10b wide-gamut BT.2020, YCbCr 4:2:2 BT.709/BT.601, YCbCr 4:2:0 */
+    /* SDR: RGB 8b Limited, RGB 10b wide-gamut BT.2020, YCbCr 4:4:4 BT.709/BT.601, YCbCr 4:2:0 */
     req = (struct dcp_color_request){ .broadcast_rgb = DRM_HDMI_BROADCAST_RGB_LIMITED, .max_bpc = 8 };
     assert(!dcp_select_color_mode(&acer, &req, &out) && out.id == 82);
     req = (struct dcp_color_request){ .colorspace = DRM_MODE_COLORIMETRY_BT2020_RGB, .max_bpc = 10 };
-    assert(!dcp_select_color_mode(&acer, &req, &out) && out.id == 95);
-    req = (struct dcp_color_request){ .color_format = DRM_CONNECTOR_COLOR_FORMAT_YCBCR422,
+    assert(!dcp_select_color_mode(&acer, &req, &out) && out.id == 85);
+    req = (struct dcp_color_request){ .color_format = DRM_CONNECTOR_COLOR_FORMAT_YCBCR444,
         .colorspace = DRM_MODE_COLORIMETRY_BT709_YCC, .max_bpc = 10 };
-    assert(!dcp_select_color_mode(&acer, &req, &out) && out.id == 93);
+    assert(!dcp_select_color_mode(&acer, &req, &out) && out.id == 90);
     req.colorspace = DRM_MODE_COLORIMETRY_SMPTE_170M_YCC; req.max_bpc = 8;
-    assert(!dcp_select_color_mode(&acer, &req, &out) && out.id == 84);
+    assert(!dcp_select_color_mode(&acer, &req, &out) && out.id == 83);
     req = (struct dcp_color_request){ .color_format = DRM_CONNECTOR_COLOR_FORMAT_YCBCR420, .max_bpc = 8 };
     assert(!dcp_select_color_mode(&acer, &req, &out) && out.id == 122);
 
-    /* MSI 1440p60-shaped timing: PQ RGB unsafe, PQ 444/422 safe -> Mutter AUTO BT2020_RGB succeeds via 444 */
+    /* MSI 1440p60-shaped timing: PQ RGB/444 unsafe, PQ 422 safe -> Mutter AUTO BT2020_RGB succeeds via 422 (105) */
     struct dcp_display_mode msi = { .sdr_rgb = acer.sdr_rgb,
-        .pq = { .score = 10, .id = 104, .eotf = DCP_EOTF_ST_2084,
-        .format = DCP_COLOR_FORMAT_YCBCR444, .colorimetry = DCP_COLORIMETRY_BT2020_YCC,
+        .pq = { .score = 10, .id = 105, .eotf = DCP_EOTF_ST_2084,
+        .format = DCP_COLOR_FORMAT_YCBCR422, .colorimetry = DCP_COLORIMETRY_BT2020_YCC,
         .range = DCP_COLOR_YCBCR_RANGE_LIMITED, .depth = 12 },
         .color_mode_id = 81 };
-    add_entry(&msi, 104, DCP_EOTF_ST_2084, DCP_COLOR_FORMAT_YCBCR444, DCP_COLORIMETRY_BT2020_YCC, DCP_COLOR_YCBCR_RANGE_LIMITED, 12, 0);
-    add_entry(&msi, 106, DCP_EOTF_ST_2084, DCP_COLOR_FORMAT_YCBCR422_DP, DCP_COLORIMETRY_BT2020_YCC, DCP_COLOR_YCBCR_RANGE_LIMITED, 12, 0);
+    add_entry(&msi, 105, DCP_EOTF_ST_2084, DCP_COLOR_FORMAT_YCBCR422, DCP_COLORIMETRY_BT2020_YCC, DCP_COLOR_YCBCR_RANGE_LIMITED, 12, 0);
+    add_entry(&msi, 107, DCP_EOTF_ST_2084, DCP_COLOR_FORMAT_YCBCR422_DP, DCP_COLORIMETRY_BT2020_YCC, DCP_COLOR_YCBCR_RANGE_LIMITED, 12, 0);
     add_entry(&msi, 113, DCP_EOTF_ST_2084, DCP_COLOR_FORMAT_RGB, DCP_COLORIMETRY_BT2020_RGB, DCP_COLOR_YCBCR_RANGE_FULL, 10, DCP_COLOR_FLAG_UNSAFE);
     req = (struct dcp_color_request){ .eotf = HDMI_EOTF_SMPTE_ST2084, .colorspace = DRM_MODE_COLORIMETRY_BT2020_RGB,
         .max_bpc = 12, .allow_hdr = true };
-    assert(!dcp_select_color_mode(&msi, &req, &out) && out.id == 104);
+    assert(!dcp_select_color_mode(&msi, &req, &out) && out.id == 105);
     /* Explicit PQ RGB on MSI 1440p60 MUST be rejected (only unsafe RGB exists) */
     req.color_format = DRM_CONNECTOR_COLOR_FORMAT_RGB444;
     assert(dcp_select_color_mode(&msi, &req, &out) == -EINVAL);
-    /* Explicit PQ 4:2:2 on MSI 1440p60 picks DP tunnel entry 106 */
+    /* Explicit PQ 4:2:2 on MSI 1440p60 picks plain 4:2:2 (105) over DP tunnel (107) */
     req.color_format = DRM_CONNECTOR_COLOR_FORMAT_YCBCR422; req.colorspace = DRM_MODE_COLORIMETRY_BT2020_YCC;
-    assert(!dcp_select_color_mode(&msi, &req, &out) && out.id == 106);
+    assert(!dcp_select_color_mode(&msi, &req, &out) && out.id == 105);
 
     /* Unsafe-only >340 MHz HDMI 2.0 timing (e.g. 1080p180 / 1440p144): SDR already uses unsafe
      * elements (sdr_usable=false, sdr_unsafe=true), so non-DSC unsafe PQ is permitted, whereas

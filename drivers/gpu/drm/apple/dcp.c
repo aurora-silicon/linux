@@ -5084,9 +5084,11 @@ static void _dcp_poweroff(struct apple_dcp *dcp)
 		break;
 	}
 	/* The link set up again starts without HDR10 metadata. */
-	dcp->active_color.score = -1;
-	dcp->output_pq = false;
-	dcp->output_hdr = false;
+	scoped_guard(spinlock_irqsave, &dcp->hdr.lock) {
+		dcp->active_color.score = -1;
+		dcp->output_pq = false;
+		dcp->output_hdr = false;
+	}
 	dcp_hdr_metadata_forget(dcp);
 }
 

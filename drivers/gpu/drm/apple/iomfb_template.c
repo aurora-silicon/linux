@@ -3959,16 +3959,18 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 			cmode->depth, cmode->format, cmode->colorimetry,
 			cmode->eotf, cmode->range, mode->vrr);
 
-	dcp->mode = (struct dcp_set_digital_out_mode_req) {
-		.color_mode_id = mode->color_mode_id,
-		.timing_mode_id = mode->timing_mode_id
-	};
-	if (cmode)
-		dcp->active_color = *cmode;
-	else
-		dcp->active_color.score = -1;
-	dcp->output_pq = cmode && cmode->eotf == DCP_EOTF_ST_2084;
-	dcp->output_hdr = cmode && cmode->eotf != DCP_EOTF_SDR_GAMMA;
+	scoped_guard(spinlock_irqsave, &dcp->hdr.lock) {
+		dcp->mode = (struct dcp_set_digital_out_mode_req) {
+			.color_mode_id = mode->color_mode_id,
+			.timing_mode_id = mode->timing_mode_id
+		};
+		if (cmode)
+			dcp->active_color = *cmode;
+		else
+			dcp->active_color.score = -1;
+		dcp->output_pq = cmode && cmode->eotf == DCP_EOTF_ST_2084;
+		dcp->output_hdr = cmode && cmode->eotf != DCP_EOTF_SDR_GAMMA;
+	}
 
 	/* VRR modes need swap timestamps, see iomfb_flush(); so do fixed internal timings. */
 	dcp->use_timestamps = mode->needs_timestamps;
