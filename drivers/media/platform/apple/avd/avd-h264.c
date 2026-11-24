@@ -754,6 +754,24 @@ VISIBLE_IF_KUNIT int avd_h264_validate_sps(struct avd_ctx *ctx,
 }
 EXPORT_SYMBOL_IF_KUNIT(avd_h264_validate_sps);
 
+static bool avd_h264_sps_is_fmt_init(const struct v4l2_ctrl_h264_sps *sps)
+{
+	return !sps->flags && !sps->pic_width_in_mbs_minus1 &&
+	       !sps->pic_height_in_map_units_minus1;
+}
+
+VISIBLE_IF_KUNIT int
+avd_h264_validate_sps_ctrl(struct avd_ctx *ctx,
+			   const struct v4l2_ctrl_h264_sps *sps,
+			   bool streaming)
+{
+	if (!streaming && avd_h264_sps_is_fmt_init(sps))
+		return avd_h264_validate_sps_fmt(ctx, sps);
+
+	return avd_h264_validate_sps(ctx, sps);
+}
+EXPORT_SYMBOL_IF_KUNIT(avd_h264_validate_sps_ctrl);
+
 /* Free the slices held for one bank's picture. */
 static void avd_h264_drop_bank_slices(struct avd_ctx *ctx, struct avd_bank *bank)
 {
@@ -809,11 +827,12 @@ static int avd_h264_start(struct avd_ctx *ctx)
 	/*
 	 * Pre-streaming format-negotiation controls (for example Chromium's
 	 * V4L2VideoDecoder::SetExtCtrlsInit) populate chroma format and bit
-	 * depth with flags == 0 before the first frame request supplies the
-	 * parsed SPS. Validate the picture format here; avd_h264_run() enforces
-	 * full avd_h264_validate_sps() (including FRAME_MBS_ONLY) per frame.
+	 * depth with flags and dimensions zeroed before the first frame
+	 * request supplies the parsed SPS. Allow that minimal init control
+	 * here while rejecting populated interlaced SPS structs upfront;
+	 * avd_h264_run() enforces full avd_h264_validate_sps() per frame.
 	 */
-	ret = avd_h264_validate_sps_fmt(ctx, ctrl->p_cur.p_h264_sps);
+	ret = avd_h264_validate_sps_ctrl(ctx, ctrl->p_cur.p_h264_sps, false);
 	if (ret)
 		return ret;
 
@@ -1283,10 +1302,8 @@ static int avd_h264_try_ctrl(struct avd_ctx *ctx, struct v4l2_ctrl *ctrl)
 						V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) :
 				NULL;
 
-		if (vq && vb2_is_streaming(vq))
-			return avd_h264_validate_sps(ctx,
-						     ctrl->p_new.p_h264_sps);
-		return avd_h264_validate_sps_fmt(ctx, ctrl->p_new.p_h264_sps);
+		return avd_h264_validate_sps_ctrl(ctx, ctrl->p_new.p_h264_sps,
+						  vq && vb2_is_streaming(vq));
 	}
 	if (ctrl->id == V4L2_CID_STATELESS_H264_PPS)
 		return avd_h264_validate_pps(ctx, ctrl->p_new.p_h264_pps);

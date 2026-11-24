@@ -425,6 +425,9 @@ int avd_h264_validate_sps_fmt(struct avd_ctx *ctx,
 			      const struct v4l2_ctrl_h264_sps *sps);
 int avd_h264_validate_sps(struct avd_ctx *ctx,
 			  const struct v4l2_ctrl_h264_sps *sps);
+int avd_h264_validate_sps_ctrl(struct avd_ctx *ctx,
+			       const struct v4l2_ctrl_h264_sps *sps,
+			       bool streaming);
 int avd_hevc_validate_sps_fmt(struct avd_ctx *ctx,
 			      const struct v4l2_ctrl_hevc_sps *sps);
 size_t avd_h264_start_slices(const struct v4l2_ctrl_h264_sps *sps);

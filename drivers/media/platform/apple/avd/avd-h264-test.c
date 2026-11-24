@@ -184,16 +184,37 @@ static void avd_sps_fmt_init_test(struct kunit *test)
 
 	/* 8-bit and 10-bit 4:2:0 pre-streaming init controls */
 	KUNIT_EXPECT_EQ(test, avd_h264_validate_sps_fmt(ctx, &sps), 0);
+	KUNIT_EXPECT_EQ(test, avd_h264_validate_sps_ctrl(ctx, &sps, false), 0);
+	KUNIT_EXPECT_EQ(test, avd_h264_validate_sps_ctrl(ctx, &sps, true), -EINVAL);
 	KUNIT_EXPECT_EQ(test, avd_h264_validate_sps(ctx, &sps), -EINVAL);
 
 	sps.bit_depth_luma_minus8 = 2;
 	sps.bit_depth_chroma_minus8 = 2;
 	KUNIT_EXPECT_EQ(test, avd_h264_validate_sps_fmt(ctx, &sps), 0);
+	KUNIT_EXPECT_EQ(test, avd_h264_validate_sps_ctrl(ctx, &sps, false), 0);
+	KUNIT_EXPECT_EQ(test, avd_h264_validate_sps_ctrl(ctx, &sps, true), -EINVAL);
 	KUNIT_EXPECT_EQ(test, avd_h264_validate_sps(ctx, &sps), -EINVAL);
 
+	/* Populated interlaced SPS must still be rejected pre-streaming */
+	sps = (struct v4l2_ctrl_h264_sps) {
+		.chroma_format_idc = 1,
+		.pic_width_in_mbs_minus1 = 79,
+		.pic_height_in_map_units_minus1 = 22,
+	};
+	KUNIT_EXPECT_EQ(test, avd_h264_validate_sps_ctrl(ctx, &sps, false), -EINVAL);
+	sps.pic_width_in_mbs_minus1 = 0;
+	sps.pic_height_in_map_units_minus1 = 0;
+	sps.flags = V4L2_H264_SPS_FLAG_MB_ADAPTIVE_FRAME_FIELD;
+	KUNIT_EXPECT_EQ(test, avd_h264_validate_sps_ctrl(ctx, &sps, false), -EINVAL);
+
 	/* Unsupported formats remain rejected pre-streaming */
-	sps.chroma_format_idc = 3;
+	sps = (struct v4l2_ctrl_h264_sps) {
+		.chroma_format_idc = 3,
+		.bit_depth_luma_minus8 = 2,
+		.bit_depth_chroma_minus8 = 2,
+	};
 	KUNIT_EXPECT_EQ(test, avd_h264_validate_sps_fmt(ctx, &sps), -EINVAL);
+	KUNIT_EXPECT_EQ(test, avd_h264_validate_sps_ctrl(ctx, &sps, false), -EINVAL);
 	sps.chroma_format_idc = 2;
 	KUNIT_EXPECT_EQ(test, avd_h264_validate_sps_fmt(ctx, &sps), -EINVAL);
 	sps.chroma_format_idc = 1;
