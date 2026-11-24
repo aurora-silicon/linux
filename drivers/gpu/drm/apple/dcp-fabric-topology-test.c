@@ -410,6 +410,122 @@ static void topology_route_skip_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, of_device_is_available(route_np));
 }
 
+/*
+ * apple_typec_port_rgb8_only(): a Type-C port is 8-bit RGB only if one of
+ * the pipelines in scope (all of them, or only @pipeline) is a candidate for
+ * the port and runs the native26 (ext26) IOMFB method set.
+ */
+enum { RGB8_PLAIN, RGB8_EXT26, RGB8_NODATA, RGB8_PIPES };
+enum { RGB8_BOTH, RGB8_PLAIN_ONLY, RGB8_NODATA_EXT26, RGB8_NONE, RGB8_PORTS };
+
+struct topology_rgb8 {
+	struct apple_dcp_typec_port port[RGB8_PORTS];
+	struct apple_dcp_typec_route route[RGB8_PORTS][2];
+	struct apple_dcp dcp[RGB8_PIPES];
+	struct platform_device *pdev[RGB8_PIPES];
+	unsigned int first;
+};
+
+static void topology_rgb8_unlist(void *data)
+{
+	struct topology_rgb8 *t = data;
+	unsigned int p;
+
+	guard(mutex)(&dcp_typec_fabric_lock);
+	for (p = 0; p < RGB8_PORTS; p++)
+		list_del(&t->port[p].link);
+}
+
+static void topology_rgb8_route(struct topology_rgb8 *t, unsigned int p,
+				unsigned int slot, unsigned int pipe)
+{
+	struct apple_dcp_typec_route *route = &t->route[p][slot];
+
+	route->dcp = &t->dcp[pipe];
+	route->port = &t->port[p];
+	list_add_tail(&route->port_link, &t->port[p].routes);
+}
+
+static struct topology_rgb8 *topology_rgb8_init(struct kunit *test)
+{
+	struct topology_rgb8 *t;
+	unsigned int p, i;
+
+	t = kunit_kzalloc(test, sizeof(*t), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, t);
+	for (i = 0; i < RGB8_PIPES; i++) {
+		t->pdev[i] = kunit_platform_device_alloc(test, "dcp-rgb8",
+							 PLATFORM_DEVID_AUTO);
+		KUNIT_ASSERT_NOT_ERR_OR_NULL(test, t->pdev[i]);
+		KUNIT_ASSERT_EQ(test, kunit_platform_device_add(test, t->pdev[i]), 0);
+		t->dcp[i].dev = &t->pdev[i]->dev;
+		if (i != RGB8_NODATA)
+			platform_set_drvdata(t->pdev[i], &t->dcp[i]);
+	}
+	t->dcp[RGB8_EXT26].hw.iomfb_method_profile = DCP_IOMFB_METHODS_J613_EXT26;
+	/* An ext26 method set that cannot be reached: no drvdata */
+	t->dcp[RGB8_NODATA].hw.iomfb_method_profile = DCP_IOMFB_METHODS_J613_EXT26;
+
+	t->first = dcp_typec_nr_ports();
+	scoped_guard(mutex, &dcp_typec_fabric_lock) {
+		for (p = 0; p < RGB8_PORTS; p++)
+			INIT_LIST_HEAD(&t->port[p].routes);
+		topology_rgb8_route(t, RGB8_BOTH, 0, RGB8_PLAIN);
+		topology_rgb8_route(t, RGB8_BOTH, 1, RGB8_EXT26);
+		topology_rgb8_route(t, RGB8_PLAIN_ONLY, 0, RGB8_PLAIN);
+		topology_rgb8_route(t, RGB8_NODATA_EXT26, 0, RGB8_NODATA);
+		topology_rgb8_route(t, RGB8_NODATA_EXT26, 1, RGB8_EXT26);
+		for (p = 0; p < RGB8_PORTS; p++)
+			list_add_tail(&t->port[p].link, &dcp_typec_ports);
+	}
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, topology_rgb8_unlist, t), 0);
+	return t;
+}
+
+static void topology_rgb8_only_test(struct kunit *test)
+{
+	struct topology_rgb8 *t = topology_rgb8_init(test);
+	struct platform_device *all[] = {
+		t->pdev[RGB8_PLAIN], t->pdev[RGB8_EXT26], t->pdev[RGB8_NODATA],
+	};
+	struct platform_device *nodata_first[] = {
+		t->pdev[RGB8_NODATA], t->pdev[RGB8_PLAIN], t->pdev[RGB8_EXT26],
+	};
+	struct platform_device *plain = t->pdev[RGB8_PLAIN];
+	struct platform_device *ext26 = t->pdev[RGB8_EXT26];
+	struct platform_device *nodata = t->pdev[RGB8_NODATA];
+	unsigned int both = t->first + RGB8_BOTH;
+	unsigned int plain_only = t->first + RGB8_PLAIN_ONLY;
+	unsigned int nodata_ext26 = t->first + RGB8_NODATA_EXT26;
+	unsigned int none = t->first + RGB8_NONE;
+
+	/* No pipelines at all */
+	KUNIT_EXPECT_FALSE(test, apple_typec_port_rgb8_only(all, 0, NULL, both));
+
+	/* Any pipeline: an ext26 candidate after a 10-bit one */
+	KUNIT_EXPECT_TRUE(test, apple_typec_port_rgb8_only(all, 3, NULL, both));
+	KUNIT_EXPECT_TRUE(test, apple_typec_port_rgb8_only(nodata_first, 3, NULL, both));
+
+	/* One pipeline: only its own method set counts */
+	KUNIT_EXPECT_FALSE(test, apple_typec_port_rgb8_only(all, 3, plain, both));
+	KUNIT_EXPECT_TRUE(test, apple_typec_port_rgb8_only(all, 3, ext26, both));
+	/* A pipeline that is not a candidate for the port */
+	KUNIT_EXPECT_FALSE(test, apple_typec_port_rgb8_only(all, 3, ext26, plain_only));
+
+	/* The ext26 pipeline is not a candidate for this port */
+	KUNIT_EXPECT_FALSE(test, apple_typec_port_rgb8_only(all, 3, NULL, plain_only));
+
+	/* A candidate without drvdata is skipped, not dereferenced */
+	KUNIT_EXPECT_FALSE(test, apple_typec_port_rgb8_only(all, 3, nodata, nodata_ext26));
+	KUNIT_EXPECT_TRUE(test, apple_typec_port_rgb8_only(nodata_first, 3, NULL,
+							   nodata_ext26));
+
+	/* A port without routes, and one past the last port */
+	KUNIT_EXPECT_FALSE(test, apple_typec_port_rgb8_only(all, 3, NULL, none));
+	KUNIT_EXPECT_FALSE(test, apple_typec_port_rgb8_only(all, 3, NULL,
+							    t->first + RGB8_PORTS));
+}
+
 static struct kunit_case dcp_topology_cases[] = {
 	KUNIT_CASE(topology_pipeline_identity_test),
 	KUNIT_CASE(topology_adopt_release_test),
@@ -417,6 +533,7 @@ static struct kunit_case dcp_topology_cases[] = {
 	KUNIT_CASE(topology_connector_group_test),
 	KUNIT_CASE(topology_route_supplier_test),
 	KUNIT_CASE(topology_route_skip_test),
+	KUNIT_CASE(topology_rgb8_only_test),
 	{}
 };
 

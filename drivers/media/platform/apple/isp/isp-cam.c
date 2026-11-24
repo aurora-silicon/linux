@@ -68,7 +68,8 @@ static const struct isp_setfile isp_setfiles[] = {
 	[ISP_IMX514_2820_02] = {0x514, "imx514", 0x28200205, "apple/isp_2820_02XX.dat", 0xa198},
 	[ISP_IMX514_2820_03] = {0x514, "imx514", 0x28200305, "apple/isp_2820_03XX.dat", 0xa198},
 	[ISP_IMX514_2820_04] = {0x514, "imx514", 0x28200405, "apple/isp_2820_04XX.dat", 0xa198},
-	[ISP_IMX558_1921_01] = {0x558, "imx558", 0x19210106, "apple/isp_1921_01XX.dat", 0xad40},
+	[ISP_IMX558_1921_01] = {0x558, "imx558", 0x19210106, "apple/isp_1921_01XX.dat", 0xad40,
+				0, ISP_TEMPORAL_FILTER_OFF},
 	[ISP_IMX558_1922_02] = {0x558, "imx558", 0x19220201, "apple/isp_1922_02XX.dat", 0xad40},
 	[ISP_IMX558_1925_03] = {0x558, "imx558", 0x19250306, "apple/isp_1925_03XX.dat", 0xcbc0,
 				0xcba6, ISP_TEMPORAL_FILTER_OFF},
@@ -1088,9 +1089,7 @@ select_config:
 	if (err)
 		return err;
 
-	err = isp_cmd_ch_mbnr_enable(isp, ch, 0,
-				     isp->preview_26 ? ISP_MBNR_MODE_DISABLE :
-				     ISP_MBNR_MODE_ENABLE, 1);
+	err = isp_cmd_ch_mbnr_enable(isp, ch, 0, ISP_MBNR_MODE_ENABLE, 1);
 	if (err)
 		return err;
 
@@ -1124,11 +1123,7 @@ select_config:
 			return err;
 	}
 
-	/* Preview has no consumer for temporal history on this firmware. */
-	if (isp->preview_26)
-		err = isp_cmd_apple_ch_temporal_filter_disable(isp, ch);
-	else
-		err = isp_ch_configure_temporal_filter(isp, ch);
+	err = isp_ch_configure_temporal_filter(isp, ch);
 	if (err)
 		return err;
 

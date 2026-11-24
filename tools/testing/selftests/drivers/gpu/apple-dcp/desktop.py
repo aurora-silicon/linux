@@ -203,7 +203,7 @@ def brightness_takeover(root):
     prefix = prefix.replace('static inline ', 'static inline __attribute__((unused)) ')
     functions = '\n'.join(block(source, marker) for marker in (
         'static bool dcp_backlight_desktop(', 'static int dcp_get_brightness(',
-        'static void dcp_backlight_sync_hint(',
+        'void dcp_backlight_presented(', 'static void dcp_backlight_sync_hint(',
         'int dcp_backlight_register(', 'static int dcp_set_brightness(',
         'static bool dcp_backlight_controls_device('))
     # The 14.7 panel's nits policy and class operations (an M3 internal
@@ -245,7 +245,8 @@ struct apple_dcp {
     int fw_compat;bool quiescing;
     struct {int iomfb_method_profile;} hw;
     struct {u32 maximum,nits,dac;bool update;struct backlight_device *bl_dev;
-        u32 level,fade_from,fade_to;bool fading;unsigned long fade_start;int fade_work;} brightness;
+        u32 level,fade_from,fade_to;bool fading;unsigned long fade_start;int fade_work;
+        struct dcp_bl_presented presented;} brightness;
     struct {bool lock;struct dcp_backlight_state state;unsigned long fade_start;
         int fade_work;void (*kick)(struct apple_dcp *);} backlight;
     struct {bool inherited_brightness_valid;u32 inherited_brightness;} *desktop;
@@ -336,6 +337,20 @@ int main(void)
     inject_user=true;dcp_backlight_sync_hint(&d);
     assert(d.backlight.state.controlled && d.backlight.state.target==450);
     assert(registered.props.brightness==450 && !registered.ops_lock);
+    /*
+     * DAC firmware (J414s, 13.5): the report of the loader's level until a
+     * present, then the presented level, through a display power cycle whose
+     * power-off report of 0 is not followed by one for the lit panel.
+     */
+    struct apple_dcp dac={.fw_compat=0,.brightness={.maximum=500,.nits=140}};
+    struct backlight_device dac_bl={.data=&dac};
+    assert(dcp_get_brightness(&dac_bl)==140);
+    dcp_backlight_presented(&dac,500);
+    assert(dcp_get_brightness(&dac_bl)==500);
+    dcp_backlight_presented(&dac,0);dac.brightness.nits=0;
+    assert(dcp_get_brightness(&dac_bl)==0);
+    dcp_backlight_presented(&dac,500);
+    assert(dcp_get_brightness(&dac_bl)==500 && !dac.backlight.lock);
     return 0;
 }
 '''

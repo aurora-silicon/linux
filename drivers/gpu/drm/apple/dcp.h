@@ -63,6 +63,7 @@ struct apple_encoder {
 #define to_apple_encoder(x) container_of(x, struct apple_encoder, base)
 
 void dcp_poweroff(struct platform_device *pdev);
+bool dcp_sleep_keeps_firmware(struct device *dev);
 int dcp_typec_prepare_route(struct apple_dcp *dcp);
 void dcp_poweron(struct platform_device *pdev);
 void dcp_external_recover(struct platform_device *pdev);
@@ -183,6 +184,8 @@ bool apple_t8122_25g83_board(void);
 
 void dcp_typec_hybrid_first_dt(void);
 void dcp_fabric_hdmi_unplugged(struct apple_dcp *dcp);
+void dcp_hdmi_unplugged_in_sleep(struct apple_dcp *dcp);
+void dcp_hdmi_disconnect(struct apple_dcp *dcp);
 void dcp_fabric_hybrid_kick(struct apple_dcp *dcp, unsigned int delay_ms);
 void dcp_hdmi_yield_link(struct apple_dcp *dcp);
 void dcp_link_recovery_schedule(struct apple_dcp *dcp);
