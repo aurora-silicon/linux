@@ -129,7 +129,11 @@ static int apple_pwm_test_apply(struct apple_pwm_test *ctx, u64 period,
 
 static int apple_pwm_test_usage(struct apple_pwm_test *ctx)
 {
+#ifdef CONFIG_PM
 	return atomic_read(&ctx->dev->power.usage_count);
+#else
+	return 0;
+#endif
 }
 
 struct apple_pwm_test_conv {
