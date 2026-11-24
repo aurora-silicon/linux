@@ -5630,6 +5630,14 @@ static int atcphy_cio_start(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 	int ret;
 
 	lockdep_assert_held(&atcphy->lock);
+	/*
+	 * Without its tunables (an older loader) atcphy_configure() refuses CIO:
+	 * leave the power domains alone instead of cycling them for nothing.
+	 */
+	if (atcphy->hw->gen == ATCPHY_GENERATION_T8152 && !atcphy->ss_tunables) {
+		dev_info(atcphy->dev, "USB4 needs the bootloader's PHY tunables; the port stays USB2\n");
+		return -EOPNOTSUPP;
+	}
 	/* The router's Thunderbolt mode is not qualified on these ports. */
 	if (mode != APPLE_ATCPHY_MODE_USB4) {
 		dev_info(atcphy->dev, "Thunderbolt alt mode is not supported on this port\n");

@@ -1569,6 +1569,9 @@ static void atcphy_test_t8152_no_tunables(struct kunit *test)
 	guard(mutex)(&atcphy->lock);
 	for (size_t i = 0; i < ARRAY_SIZE(refused); i++)
 		KUNIT_EXPECT_EQ(test, atcphy_configure(atcphy, refused[i]), -EOPNOTSUPP);
+	/* USB4 from the Type-C mux: refused before the power domains come up */
+	KUNIT_EXPECT_EQ(test, atcphy_cio_start(atcphy, APPLE_ATCPHY_MODE_USB4), -EOPNOTSUPP);
+	KUNIT_EXPECT_FALSE(test, atcphy->cio_powered);
 	KUNIT_EXPECT_EQ(test, readl(core + ACIOPHY_T8152_AON_LANE0),
 			ACIOPHY_T8152_AON_LANE_CLAMP_EN);
 	KUNIT_EXPECT_EQ(test, readl(core + ACIOPHY_CROSSBAR_T8103), 0U);
