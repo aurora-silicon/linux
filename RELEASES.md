@@ -14,9 +14,11 @@ this file adds the kernel build details.
 | --- | --- | --- | --- |
 | stable | the GitHub Release for a `v*` tag, e.g. [`releases/latest`](https://github.com/aurora-silicon/linux/releases/latest) | a `v*` tag is pushed on a `main` commit | never: a stable release is not rebuilt or edited |
 | nightly | prerelease tag [`aurora-nightly`](https://github.com/aurora-silicon/linux/releases/tag/aurora-nightly) | once a day, if `main` moved since the last nightly | tag and assets replaced each night |
-| edge | prerelease tag [`aurora-edge`](https://github.com/aurora-silicon/linux/releases/tag/aurora-edge) | every push to `main` (a newer push cancels the running build) | tag and assets replaced on every push |
+| edge | prerelease tag [`aurora-edge`](https://github.com/aurora-silicon/linux/releases/tag/aurora-edge) | every push to `main`; a running build always finishes and only the newest waiting push is built next | tag and assets replaced on every build |
 
-Each release body names the exact `main` commit it was built from. `edge` is
+Each release body names the exact commit it was built from, and every asset
+carries a build provenance attestation from `kernel-release.yml`
+(`gh attestation verify <file> --repo aurora-silicon/linux`). `edge` is
 for testing what just merged; `nightly` is the candidate pool for the next
 stable tag; `stable` is what distributions ship by default.
 
@@ -45,10 +47,11 @@ not published here.
 Stable releases are time-boxed. On the release cadence:
 
 1. Take the commit the current `aurora-nightly` was built from (it is in the
-   release body), once it has passed the lab regression gate: every lab Mac
-   (M1 Pro, M2 Air, M2 mini, M3 Air, M4 Air, M4 Pro, Neo) boots it with no new
-   failures compared with the previous stable release. The gate looks for
-   regressions only; missing features do not block a tag.
+   release body), once it has passed the
+   [lab regression gate](https://github.com/aurora-silicon/agent-guidelines/blob/main/policy/branching-and-releases.md#4-cutting-a-stable-release):
+   it boots and passes on every gate Mac with no new failures compared with the
+   previous stable release. The gate looks for regressions only; missing
+   features do not block a tag.
 2. An Owner tags it and pushes the tag (only Owners create `v*` tags, and
    nobody moves or deletes one):
 
