@@ -420,6 +420,141 @@ pub(super) fn release<C: Control>(control: &mut C) -> kernel::error::Result {
     result
 }
 
+/// Busy-share window: long enough to span frames, short enough to follow a burst.
+pub(super) const BUSY_WINDOW_NS: u64 = 200_000_000;
+/// A longer gap between reports with no long command in flight was idle: start over
+/// rather than average it in.
+pub(super) const BUSY_WINDOW_MAX_NS: u64 = 2_000_000_000;
+/// An unretired command that has been running continuously for this long saturates
+/// its engine and immediately lifts the busy share to 1000 permille, without waiting
+/// for it to retire or for the current window to end.
+pub(super) const BUSY_LONG_COMMAND_NS: u64 = 50_000_000;
+
+/// Per-window busiest GPU engine share (0..=1000 permille), combining retired stage
+/// execution time with unretired in-flight command time.
+///
+/// The vertex, fragment and compute engines run in parallel, so their summed time is
+/// not a share of the window: taking the busiest engine's share avoids double-counting
+/// across engines. For each engine, `retired_ns + in_flight_age` is differenced across
+/// window boundaries so a command spanning a boundary counts in the window it runs in
+/// and is never double-counted when it later retires. Any engine with an unretired
+/// command older than [`BUSY_LONG_COMMAND_NS`] lifts immediately to 1000 permille so
+/// long compute or render work running beside a light compositor never sits at a low
+/// memory floor waiting for retirement. In-flight age counts from publication, so time
+/// a command waits in its queue or on dependencies, and a render's vertex and fragment
+/// stages retiring together, err toward a higher share, which is the safe direction.
+pub(super) struct BusyShare {
+    start_ns: Option<u64>,
+    retired_ns: [u64; crate::usage::NUM_ENGINES],
+    in_flight_ns: [u64; crate::usage::NUM_ENGINES],
+    below_top: bool,
+}
+
+impl BusyShare {
+    pub(super) const fn new() -> Self {
+        Self {
+            start_ns: None,
+            retired_ns: [0; crate::usage::NUM_ENGINES],
+            in_flight_ns: [0; crate::usage::NUM_ENGINES],
+            below_top: false,
+        }
+    }
+
+    /// CLPC cleared GPU activity (forgetting its last share so a new burst starts
+    /// at the top column). Only called once the GPU is idle: restart the window so
+    /// the first report of the next burst re-baselines instead of closing a window
+    /// diluted by the idle gap, which would drop the burst off the top column.
+    pub(super) fn clear_active(&mut self) {
+        self.start_ns = None;
+        self.in_flight_ns = [0; crate::usage::NUM_ENGINES];
+        self.below_top = false;
+    }
+
+    pub(super) fn below_top(&self) -> bool {
+        self.below_top
+    }
+
+    pub(super) fn window_start(&self) -> Option<u64> {
+        self.start_ns
+    }
+
+    pub(super) fn is_long_in_flight(
+        now_ns: u64,
+        oldest_in_flight: [u64; crate::usage::NUM_ENGINES],
+    ) -> bool {
+        oldest_in_flight
+            .iter()
+            .any(|&since| since != 0 && now_ns.saturating_sub(since) >= BUSY_LONG_COMMAND_NS)
+    }
+
+    /// Delay (ns) until an in-flight command reaches [`BUSY_LONG_COMMAND_NS`], at
+    /// least 1 ms. Retirement runs its own event pass, so this never delays idle
+    /// teardown.
+    pub(super) fn recheck_delay_for(now_ns: u64, oldest: u64) -> Option<u64> {
+        if oldest == 0 {
+            return None;
+        }
+        let age = now_ns.saturating_sub(oldest);
+        Some(BUSY_LONG_COMMAND_NS.saturating_sub(age).max(1_000_000))
+    }
+
+    pub(super) fn sample(
+        &mut self,
+        now_ns: u64,
+        retired_ns: [u64; crate::usage::NUM_ENGINES],
+        oldest_in_flight: [u64; crate::usage::NUM_ENGINES],
+    ) -> Option<u32> {
+        let long_in_flight = Self::is_long_in_flight(now_ns, oldest_in_flight);
+        let Some(start) = self.start_ns else {
+            self.start_ns = Some(now_ns);
+            self.retired_ns = retired_ns;
+            for (slot, &since) in self.in_flight_ns.iter_mut().zip(oldest_in_flight.iter()) {
+                *slot = if since != 0 {
+                    now_ns.saturating_sub(since)
+                } else {
+                    0
+                };
+            }
+            return None;
+        };
+        let elapsed = now_ns.saturating_sub(start);
+        if elapsed < BUSY_WINDOW_NS {
+            if self.below_top && long_in_flight {
+                self.below_top = false;
+                return Some(1000);
+            }
+            return None;
+        }
+        let mut busiest = 0u64;
+        for i in 0..crate::usage::NUM_ENGINES {
+            let now = retired_ns[i];
+            let delta = now.saturating_sub(self.retired_ns[i]);
+            self.retired_ns[i] = now;
+            let since = oldest_in_flight[i];
+            let age = if since != 0 {
+                now_ns.saturating_sub(since)
+            } else {
+                0
+            };
+            let prev_age = self.in_flight_ns[i];
+            self.in_flight_ns[i] = age;
+            let busy = delta.saturating_add(age).saturating_sub(prev_age);
+            busiest = busiest.max(busy);
+        }
+        self.start_ns = Some(now_ns);
+        if elapsed > BUSY_WINDOW_MAX_NS && !long_in_flight {
+            return None;
+        }
+        let permille = if long_in_flight {
+            1000
+        } else {
+            (busiest.saturating_mul(1000) / elapsed).min(1000) as u32
+        };
+        self.below_top = permille < 1000;
+        Some(permille)
+    }
+}
+
 #[cfg_attr(not(test), kernel::macros::kunit_tests(asahi_g17_idle_hold))]
 mod tests {
     use super::*;
@@ -576,12 +711,150 @@ mod tests {
         hold.asserted();
         assert_eq!(hold.step(1, false, 2, FIRMWARE_IDLE_OFF_MS), HoldAction::Release);
     }
+
+    #[test]
+    fn long_in_flight_command_lifts_beside_light_submitter() {
+        const NS_MS: u64 = 1_000_000;
+        let mut share = BusyShare::new();
+        // Establish light compositor baseline: ~50 permille (10 ms in 200 ms).
+        assert_eq!(share.sample(1000 * NS_MS, [0, 0, 0], [0, 0, 0]), None);
+        assert_eq!(
+            share.sample(1200 * NS_MS, [2 * NS_MS, 10 * NS_MS, 0], [0, 0, 0]),
+            Some(50)
+        );
+        assert!(share.below_top());
+        // A 500 ms compute job starts at t=1250 ms; compositor submits at t=1410 ms.
+        assert_eq!(
+            share.sample(
+                1410 * NS_MS,
+                [4 * NS_MS, 20 * NS_MS, 0],
+                [0, 0, 1250 * NS_MS],
+            ),
+            Some(1000)
+        );
+        assert!(!share.below_top());
+        // Still running across the next window at t=1610 ms: stays at 1000.
+        assert_eq!(
+            share.sample(
+                1610 * NS_MS,
+                [6 * NS_MS, 30 * NS_MS, 0],
+                [0, 0, 1250 * NS_MS],
+            ),
+            Some(1000)
+        );
+        // Retires at t=1750 ms (+500 ms retired); only the 140 ms in [1610, 1750] counts.
+        assert_eq!(
+            share.sample(1810 * NS_MS, [8 * NS_MS, 40 * NS_MS, 500 * NS_MS], [0, 0, 0]),
+            Some(700)
+        );
+        // Next window returns cleanly to the light compositor share.
+        assert_eq!(
+            share.sample(2010 * NS_MS, [10 * NS_MS, 50 * NS_MS, 500 * NS_MS], [0, 0, 0]),
+            Some(50)
+        );
+    }
+
+    #[test]
+    fn late_long_command_lifts_mid_window_without_double_counting() {
+        const NS_MS: u64 = 1_000_000;
+        let mut share = BusyShare::new();
+        assert_eq!(share.sample(1000 * NS_MS, [0, 0, 0], [0, 0, 0]), None);
+        assert_eq!(share.sample(1200 * NS_MS, [0, 10 * NS_MS, 0], [0, 0, 0]), Some(50));
+        // Long compute starts at t=1390 ms; window closes at t=1410 ms (only 20 ms old).
+        assert_eq!(
+            share.sample(1410 * NS_MS, [0, 20 * NS_MS, 0], [0, 0, 1390 * NS_MS]),
+            Some(95)
+        );
+        assert!(share.below_top());
+        // At t=1440 ms (50 ms old, mid-window), early lift reports 1000 immediately.
+        assert_eq!(
+            share.sample(1440 * NS_MS, [0, 22 * NS_MS, 0], [0, 0, 1390 * NS_MS]),
+            Some(1000)
+        );
+        assert!(!share.below_top());
+        // Second mid-window submit does not spam CLPC.
+        assert_eq!(
+            share.sample(1460 * NS_MS, [0, 23 * NS_MS, 0], [0, 0, 1390 * NS_MS]),
+            None
+        );
+        // Retires at t=1490 ms (+100 ms retired); window [1410, 1610] credits exact 80 ms.
+        assert_eq!(
+            share.sample(1610 * NS_MS, [0, 30 * NS_MS, 100 * NS_MS], [0, 0, 0]),
+            Some(400)
+        );
+    }
+
+    #[test]
+    fn straddling_short_command_and_long_gaps_behave_cleanly() {
+        const NS_MS: u64 = 1_000_000;
+        let mut share = BusyShare::new();
+        assert_eq!(share.sample(1000 * NS_MS, [0, 0, 0], [0, 0, 0]), None);
+        // 40 ms command [1170, 1210] straddles boundary 1200: 30 ms in first, 10 ms in second.
+        assert_eq!(
+            share.sample(1200 * NS_MS, [0, 0, 0], [0, 0, 1170 * NS_MS]),
+            Some(150)
+        );
+        assert_eq!(
+            share.sample(1400 * NS_MS, [0, 0, 40 * NS_MS], [0, 0, 0]),
+            Some(50)
+        );
+        // Multi-engine takes busiest engine rather than summing parallel engines.
+        assert_eq!(
+            share.sample(1600 * NS_MS, [0, 120 * NS_MS, 150 * NS_MS], [0, 0, 0]),
+            Some(600)
+        );
+        // >2 s idle gap with a freshly-started command (age 0) restarts without reporting.
+        assert_eq!(
+            share.sample(5000 * NS_MS, [0, 120 * NS_MS, 150 * NS_MS], [0, 0, 5000 * NS_MS]),
+            None
+        );
+        // >2 s active command still reports 1000.
+        assert_eq!(
+            share.sample(8000 * NS_MS, [0, 120 * NS_MS, 150 * NS_MS], [0, 0, 5000 * NS_MS]),
+            Some(1000)
+        );
+        // Recheck delay wakes once at the long-command age (at least 1 ms), None when idle.
+        assert_eq!(BusyShare::recheck_delay_for(1010 * NS_MS, 0), None);
+        assert_eq!(
+            BusyShare::recheck_delay_for(1010 * NS_MS, 1000 * NS_MS),
+            Some(40 * NS_MS)
+        );
+        assert_eq!(
+            BusyShare::recheck_delay_for(1045 * NS_MS, 1000 * NS_MS),
+            Some(5 * NS_MS)
+        );
+        assert_eq!(
+            BusyShare::recheck_delay_for(1100 * NS_MS, 1000 * NS_MS),
+            Some(NS_MS)
+        );
+    }
+
+    #[test]
+    fn new_burst_after_idle_restarts_the_window() {
+        const NS_MS: u64 = 1_000_000;
+        let mut share = BusyShare::new();
+        // Steady 600 permille fragment work.
+        assert_eq!(share.sample(900 * NS_MS, [0, 0, 0], [0, 0, 0]), None);
+        assert_eq!(share.sample(1100 * NS_MS, [0, 120 * NS_MS, 0], [0, 0, 0]), Some(600));
+        assert_eq!(share.sample(1300 * NS_MS, [0, 240 * NS_MS, 0], [0, 0, 0]), Some(600));
+        // Work continues to 1400 ms, then the GPU idles and CLPC clears its share.
+        share.clear_active();
+        assert!(!share.below_top());
+        // First submission after a 600 ms idle gap: closing [1300, 2000] would report
+        // a diluted 85 permille (60 ms in 700 ms); it re-baselines instead.
+        assert_eq!(share.sample(2000 * NS_MS, [0, 300 * NS_MS, 0], [0, 0, 0]), None);
+        assert!(!share.below_top());
+        // No report until a fresh 200 ms window of the new burst completes.
+        assert_eq!(share.sample(2190 * NS_MS, [0, 414 * NS_MS, 0], [0, 0, 0]), None);
+        assert_eq!(share.sample(2200 * NS_MS, [0, 420 * NS_MS, 0], [0, 0, 0]), Some(600));
+    }
 }
 
 unsafe extern "C" {
     fn asahi_clpc_gpu_get(dev: *mut core::ffi::c_void, out: *mut *mut core::ffi::c_void) -> core::ffi::c_int;
     fn asahi_clpc_gpu_set_active(gpu: *mut core::ffi::c_void, active: bool);
     fn asahi_clpc_gpu_put(gpu: *mut core::ffi::c_void);
+    fn asahi_clpc_gpu_set_busy(gpu: *mut core::ffi::c_void, permille: core::ffi::c_uint);
 }
 
 /// DT-selected memory-demand provider. Its independent allocation outlives a
@@ -605,9 +878,18 @@ impl Demand {
         }
     }
 
+    pub(super) fn has_provider(&self) -> bool {
+        !self.0.is_null()
+    }
+
     pub(super) fn set_active(&self, active: bool) {
         // SAFETY: the retained reference is live; NULL denotes no DT provider.
         unsafe { asahi_clpc_gpu_set_active(self.0, active) };
+    }
+
+    pub(super) fn set_busy(&self, permille: u32) {
+        // SAFETY: the retained reference is live; NULL denotes no DT provider.
+        unsafe { asahi_clpc_gpu_set_busy(self.0, permille.min(1000) as core::ffi::c_uint) };
     }
 }
 

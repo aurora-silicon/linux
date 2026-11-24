@@ -1017,9 +1017,6 @@ static int apple_qspi_probe(struct platform_device *pdev)
 	qspi->nvram_policy = true;
 	qspi->nvram_window = soc->multi_io_reads;
 	apple_qspi_nvram_window(dev, qspi);
-	if (of_device_is_compatible(dev->of_node, "apple,t8122-qspi") &&
-	    !of_machine_is_compatible("apple,j613"))
-		return -ENODEV;
 	init_completion(&qspi->done);
 	spin_lock_init(&qspi->lock);
 
