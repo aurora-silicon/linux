@@ -792,12 +792,12 @@ struct drm_asahi_gem_create {
  * object stays the parent's memory. The CPU and GPU views are coherent
  * without cache maintenance.
  *
- * The pinned pages count against the caller's RLIMIT_MEMLOCK, together with
- * its other long-term pins, unless it has CAP_IPC_LOCK (ENOMEM otherwise),
- * and their size against the client and device limits of
+ * The size of the object counts against the client and device limits of
  * drm_asahi_params_global::client_memory_limit and
- * drm_asahi_params_global::memory_limit (ENOMEM). They are never released by
- * memory-pressure reclaim.
+ * drm_asahi_params_global::memory_limit (ENOMEM), as that of a
+ * DRM_IOCTL_ASAHI_GEM_CREATE object does. The pinned pages are shown in the
+ * caller's VmPin (mm->pinned_vm) but are not limited by its RLIMIT_MEMLOCK.
+ * They are never released by memory-pressure reclaim.
  *
  * Without DRM_ASAHI_GEM_USERPTR_READ_ONLY, the whole range must be mapped
  * writable, and not be a shared mapping of a file whose filesystem tracks
