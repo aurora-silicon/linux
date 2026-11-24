@@ -4402,37 +4402,7 @@ static const struct apple_epic_service_ops dcp_compact_aux_ops[] = {
 static void dcp_av_service_init(struct apple_epic_service *service,
 				const char *name, const char *class, s64 unit)
 {
-	struct dcp_desktop_state *d = service->ep->dcp->desktop;
-	struct apple_epic_service *old;
-
-	service = afk_service_get(service);
-	if (!service)
-		return;
-	scoped_guard(spinlock_irqsave, &d->hdr_lock) {
-		old = d->av_service;
-		d->av_service = service;
-		d->hdr_sent_valid = false;
-		d->hdr_infoframe = false;
-	}
-	if (old)
-		afk_service_put(old);
-}
-
-static void dcp_av_service_teardown(struct apple_epic_service *service)
-{
-	struct dcp_desktop_state *d = service->ep->dcp->desktop;
-	bool owned;
-
-	scoped_guard(spinlock_irqsave, &d->hdr_lock) {
-		owned = d->av_service == service;
-		if (owned) {
-			d->av_service = NULL;
-			d->hdr_sent_valid = false;
-			d->hdr_infoframe = false;
-		}
-	}
-	if (owned)
-		afk_service_put(service);
+	dcp_hdr_service_bind(service);
 }
 
 static const struct apple_epic_service_ops dcp_ext_av_service_ops[] = {
@@ -4440,7 +4410,7 @@ static const struct apple_epic_service_ops dcp_ext_av_service_ops[] = {
 		.name = "dcpav-service-epic",
 		.reusable = true,
 		.init = dcp_av_service_init,
-		.teardown = dcp_av_service_teardown,
+		.teardown = dcp_hdr_service_unbind,
 	},
 	{
 		.name = "*",
@@ -5089,8 +5059,6 @@ static void _dcp_poweroff(struct apple_dcp *dcp)
 		iomfb_poweroff_v26_6_desktop(dcp);
 		if (dcp->edr_hm)
 			dcp->edr_restart = true;
-		/* The link set up again starts without HDR10 metadata. */
-		dcp_hdr_metadata_forget(dcp);
 		break;
 	case DCP_FIRMWARE_V_26_6:
 		iomfb_v26_6_poweroff(dcp);
@@ -5112,6 +5080,8 @@ static void _dcp_poweroff(struct apple_dcp *dcp)
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
 		break;
 	}
+	/* The link set up again starts without HDR10 metadata. */
+	dcp_hdr_metadata_forget(dcp);
 }
 
 static void dcp_resume_enable_irq(void *ctx)
@@ -7516,7 +7486,6 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 		dcp->desktop = devm_kzalloc(dev, sizeof(*dcp->desktop), GFP_KERNEL);
 		if (!dcp->desktop)
 			return -ENOMEM;
-		spin_lock_init(&dcp->desktop->hdr_lock);
 		/*
 		 * The opaque client identity of the IOMFB calls.  The firmware's
 		 * own client passes a kernel pointer there; pass a random value
@@ -7560,6 +7529,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	dcp_fabric_init(dcp);
 	spin_lock_init(&dcp->mode_state.lock);
 	spin_lock_init(&dcp->metadata.lock);
+	spin_lock_init(&dcp->hdr.lock);
 	mutex_init(&dcp->dcpavserv.lock);
 	INIT_WORK(&dcp->dcpavserv.close_wq, dcpavserv_close_work);
 	ret = dcpavserv_edid_retry_init(dcp);

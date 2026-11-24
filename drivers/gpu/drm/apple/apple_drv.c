@@ -53,6 +53,7 @@
 
 #include "apple_boot_display.h"
 #include "apple_resume.h"
+#include "dcp-hdr-metadata.h"
 #include "dcp.h"
 #include "plane.h"
 #include "iomfb_m4.h"
@@ -959,7 +960,12 @@ static int apple_connector_atomic_check(struct drm_connector *conn,
 {
 	struct drm_connector_state *old = drm_atomic_get_old_connector_state(state, conn);
 	struct drm_connector_state *new = drm_atomic_get_new_connector_state(state, conn);
+	const struct drm_property_blob *blob = new->hdr_output_metadata;
 	struct drm_crtc_state *crtc_state;
+
+	if (blob && (blob->length != sizeof(struct hdr_output_metadata) ||
+		     !dcp_hdr_is_type1(blob->data)))
+		return -EINVAL;
 
 	if (!new->crtc || (old->colorspace == new->colorspace &&
 			   drm_connector_atomic_hdr_metadata_equal(old, new)))

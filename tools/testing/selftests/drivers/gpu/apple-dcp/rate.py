@@ -106,6 +106,14 @@ def parser_fixture(root):
     ycc_raw = bytearray(struct.pack('<I', 0xd3))
     wire(ycc_fixture, ycc_raw)
     timing_source += 'static const unsigned char ycc_blob[] = {' + ','.join(map(str,ycc_raw)) + '};\n'
+    # A fast external timing offers DSC RGB and uncompressed YCbCr 4:4:4.
+    dsc_fixture = [dict(timing_fixture[0], ColorModes=[
+        color(85, 1, 10, 0, 10), color(122, 5, 10, 2, 9),
+        color(127, 9, 10, 2, 7, encoding=2), color(130, 20, 10, 2, 9)],
+        UnsafeColorElementIDs=[130], DSCRequiredColorElementIDs=[122, 130])]
+    dsc_raw = bytearray(struct.pack('<I', 0xd3))
+    wire(dsc_fixture, dsc_raw)
+    timing_source += 'static const unsigned char dsc_blob[] = {' + ','.join(map(str,dsc_raw)) + '};\n'
     # Default mode: an external display's native resolution at its highest
     # usable refresh rate; a panel keeps the timing its firmware prefers.
     def timing(i, w, h, hz, pref, score, unsafe=False):
@@ -330,6 +338,14 @@ int main(int argc, char **argv)
         assert(!IS_ERR(m) && n == 1 && m[0].pq.id == 95 && m[0].pq.depth == 12);
         assert(m[0].color_mode_id == 85);
         free(m);
+        for (unsigned int dsc = 0; dsc < 2; dsc++) {
+            assert(!parse(dsc_blob, sizeof(dsc_blob), &c));
+            c.pq_dsc = dsc;
+            m = enumerate_modes(&c, &n, 600, 330, 0, false, false);
+            assert(!IS_ERR(m) && n == 1 && m[0].color_mode_id == 85);
+            assert(m[0].pq.id == (dsc ? 122 : 127) && m[0].pq.depth == 10);
+            free(m);
+        }
         /* The default modes; the timing ID that carries DRM_MODE_TYPE_PREFERRED. */
         static const struct { const unsigned char *blob; size_t size; bool internal; u32 id; } d[] = {
             { default_acer, sizeof(default_acer), false, 2 },
@@ -601,7 +617,7 @@ struct apple_dcp {
     u64 typec_generation; unsigned int nr_modes;
     struct dcp_display_mode *modes;
     struct { bool holding, stopped; } announce;
-    bool ext_backlight, has_panel;
+    bool ext_backlight, has_panel, iomfb_template_pq;
     /* External pipes carry no internal panel identity. */
     void *panel_identity;
 };
@@ -769,6 +785,7 @@ struct apple_connector {''')
     state = state.replace('    struct work_struct hotplug_wq, bl_sync_wq;\n};', '    struct work_struct hotplug_wq, bl_sync_wq;\n    bool edid_live; unsigned hotplug_reasons;\n};', 1)
     state = state.replace('u64 typec_generation; unsigned int nr_modes;', '''u64 typec_generation; unsigned int nr_modes;
     struct apple_epic *dcpavservep;
+    void *desktop;
     int fw_compat,width_mm,height_mm,fixed_connector_type; unsigned notch_height;
     bool modes_lock,modes_admitted,modes_provisional,placeholder_retried,external_native; int external_held;
     u64 modes_generation,dimensions_generation; struct work_struct dimensions_wq;
@@ -826,6 +843,8 @@ static void complete(int *p) { (*p)++; }
 static void reinit_completion(int *p) { *p=0; }
 static struct apple_epic_service *afk_service_get(struct apple_epic_service *s) { if(!s->enabled) return NULL; s->users++; return s; }
 static void afk_service_put(struct apple_epic_service *s) { assert(s->users); s->users--; }
+static void dcp_hdr_service_bind(struct apple_epic_service *s) { (void)s; }
+static void dcp_hdr_service_unbind(struct apple_epic_service *s) { (void)s; }
 static void afk_service_retire(struct apple_epic_service *s) { assert(!*hpd_lock); s->enabled=false; s->torndown=true; }
 /* These H17P scenarios never queue the native 14.7 Close worker. */
 static bool cancel_work_sync(struct work_struct *w) { assert(!w->scheduled); return false; }
@@ -914,7 +933,8 @@ static void dcp_update_connector_dimensions(struct apple_dcp *d,struct drm_conne
 static int __attribute__((unused)) dcp_direct_crossbar_link(struct apple_dcp *d,bool up) { (void)d;(void)up;return 0; }
 '''
     transport = '\n'.join(block(av,marker) for marker in [
-        'static void dcpavserv_notify_edid(', 'static bool dcpavserv_identity(',
+        'static void dcpavserv_notify_edid(', 'static bool dcpavserv_hdr_class(',
+        'static bool dcpavserv_identity(',
         'static bool dcpavserv_admission_current(', 'static int dcpavserv_prepare(',
         'static void dcpavserv_init(', 'static void dcpavserv_invalidate_edid(',
         'static void dcpavserv_teardown(', 'void dpavservep_detach(',

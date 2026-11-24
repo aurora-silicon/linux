@@ -411,18 +411,6 @@ struct dcp_desktop_state {
 	u32 vrr_min_on, vrr_min_off, vrr_min_sent;
 	/* The frame's colour matrix, sent after an adaptive sync update. */
 	struct iomfb_set_matrix_req matrix;
-	/*
-	 * HDR10 static metadata (external processors): the pinned
-	 * dcpav-service-epic service, the Type 1 body last sent on this link
-	 * (taken or refused), if any, and whether the firmware took one, so
-	 * that the link carries a Dynamic Range and Mastering InfoFrame.
-	 * hdr_lock protects all of them.
-	 */
-	spinlock_t hdr_lock;
-	struct apple_epic_service *av_service;
-	u8 hdr_sent[24];
-	bool hdr_sent_valid;
-	bool hdr_infoframe;
 	u32 present_id;
 	bool present_pending;
 	/*
@@ -825,6 +813,17 @@ struct apple_dcp {
 	bool typec_hpd_held;
 	bool use_timestamps;
 	bool vrr_enabled;
+	struct {
+		/* Pins the AV service and tracks HDR10 metadata for its link. */
+		spinlock_t lock;
+		struct apple_epic_service *service;
+		u64 generation;
+		u8 sent[24];
+		bool sent_valid;
+		bool infoframe;
+	} hdr;
+	/* The selected IOMFB backend programs catalogue colour IDs and PQ surfaces. */
+	bool iomfb_template_pq;
 	/*
 	 * The mode set asks for a PQ signal; output_pq: the one set carries it;
 	 * output_edr: a panel shows the PQ content as EDR, edr_sent: swaps

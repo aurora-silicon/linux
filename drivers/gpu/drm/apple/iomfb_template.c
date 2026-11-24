@@ -4919,6 +4919,13 @@ static void dcp_started(struct apple_dcp *dcp, void *data, void *cookie)
 	iomfb_get_color_remap_mode(dcp, false, &color_remap, init_1, cookie);
 }
 
+/* These sessions program the catalogue's colour ID and tag PQ surfaces. */
+static void iomfb_template_start(struct apple_dcp *dcp)
+{
+	WRITE_ONCE(dcp->iomfb_template_pq, true);
+	dcp_start_signal(dcp, false, dcp_started, NULL);
+}
+
 void DCP_FW_NAME(iomfb_shutdown)(struct apple_dcp *dcp)
 {
 #if DCP_FW_DESKTOP_26(DCP_FW_VER)

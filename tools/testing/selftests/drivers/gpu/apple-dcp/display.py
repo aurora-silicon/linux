@@ -598,8 +598,10 @@ int main(void) {
 
 
 def hdr_metadata(root):
-    """HDR10 static metadata message for DCPAV selector 0x15, byte for byte."""
-    header = (root / 'drivers/gpu/drm/apple/dcp-hdr-metadata.h').read_text()
+    """HDR10 metadata wire encoding and caching over the AV service (legacy and AFKv2)."""
+    apple = root / 'drivers/gpu/drm/apple'
+    header = (apple / 'dcp-hdr-metadata.h').read_text()
+    iomfb = (apple / 'iomfb.c').read_text()
     header = '\n'.join(line for line in header.splitlines()
                        if not line.startswith('#include'))
     header = header.replace('static inline ', 'static inline __attribute__((unused)) ')
@@ -655,6 +657,159 @@ struct hdr_output_metadata {
     union { struct hdr_metadata_infoframe hdmi_metadata_type1; };
 };
 """ + header + r"""
+typedef uint64_t u64;
+#define HDMI_EOTF_SMPTE_ST2084 2
+#define EPIC_SUBTYPE_STD_SERVICE 0xc0
+#define READ_ONCE(x) (x)
+#define scoped_guard(kind, lock) for (bool held = true; held; held = false)
+#define lockdep_assert_held(lock) ((void)0)
+#define dev_warn_ratelimited(...) ((void)0)
+#define dev_warn(...) ((void)0)
+#define dev_dbg(...) ((void)0)
+struct apple_dcp_afkep { bool wire_v2; };
+struct apple_epic_service { struct apple_dcp_afkep *ep; unsigned int refs; };
+struct drm_crtc { int dcp; };
+struct drm_atomic_commit { int unused; };
+struct drm_connector_state {
+    struct { size_t length; const void *data; } *hdr_output_metadata;
+};
+struct apple_dcp {
+    bool output_pq, crashed;
+    struct {
+        struct apple_epic_service *service;
+        u64 generation;
+        u8 sent[DCP_HDR_DATA_SIZE];
+        bool sent_valid, infoframe;
+    } hdr;
+};
+#define to_apple_crtc(crtc) (crtc)
+#define dcp_hdr_metadata_live(pdev) true
+static const struct drm_connector_state *test_connector;
+static int transport_result;
+static u32 dcp_status;
+static size_t reply_length;
+static unsigned int sends, v2_sends, legacy_sends, stop_sends;
+static bool reset_during_send;
+static struct apple_dcp test_dcp;
+static const struct drm_connector_state *dcp_crtc_connector_state(
+    struct apple_dcp *dcp, struct drm_crtc *crtc, struct drm_atomic_commit *commit)
+{
+    (void)dcp; (void)crtc; (void)commit;
+    return test_connector;
+}
+static struct apple_epic_service *afk_service_get(struct apple_epic_service *service)
+{
+    if (service)
+        service->refs++;
+    return service;
+}
+static void afk_service_put(struct apple_epic_service *service)
+{
+    assert(service->refs == 1);
+    service->refs--;
+}
+""" + block(iomfb, 'static void dcp_hdr_reset_locked(') + r"""
+static int mock_hdr_command(struct apple_epic_service *service, u8 type,
+    const void *msg, size_t msg_len, void *reply, size_t capacity, u32 *retcode, size_t *received)
+{
+    u32 selector = get_unaligned_le32((const u8 *)msg + 0x04);
+
+    assert(service->refs == 1 && type == EPIC_SUBTYPE_STD_SERVICE);
+    if (selector == DCP_HDR_SELECTOR_SET_STATIC) {
+        assert(msg_len == DCP_HDR_MSG_SIZE && capacity == DCP_HDR_MSG_SIZE);
+        sends++;
+    } else {
+        assert(selector == DCP_HDR_SELECTOR_STOP_INFOFRAME);
+        assert(msg_len == DCP_HDR_STOP_SIZE && capacity == DCP_HDR_STOP_SIZE);
+        stop_sends++;
+    }
+    if (reset_during_send)
+        dcp_hdr_reset_locked(&test_dcp);
+    if (transport_result)
+        return transport_result;
+    *retcode = 0;
+    *received = reply_length;
+    if (selector == DCP_HDR_SELECTOR_SET_STATIC)
+        put_unaligned_le32(dcp_status, (u8 *)reply + DCP_HDR_MSG_STATUS);
+    else
+        put_unaligned_le32(dcp_status, (u8 *)reply + DCP_HDR_STOP_STATUS);
+    return 0;
+}
+static int afk_send_command_len(struct apple_epic_service *service, u8 type,
+    const void *msg, size_t msg_len, void *reply, size_t capacity, u32 *retcode, size_t *received)
+{
+    assert(service->ep->wire_v2);
+    v2_sends++;
+    return mock_hdr_command(service, type, msg, msg_len, reply, capacity, retcode, received);
+}
+static int afk_send_command_with_reply_len(struct apple_epic_service *service, u8 type,
+    const void *msg, size_t msg_len, void *reply, size_t capacity, u32 *retcode, size_t *received)
+{
+    assert(!service->ep->wire_v2);
+    legacy_sends++;
+    return mock_hdr_command(service, type, msg, msg_len, reply, capacity, retcode, received);
+}
+""" + block(iomfb, 'static int dcp_hdr_send(') + block(iomfb, 'static void dcp_hdr_infoframe_stop(') + block(iomfb, 'static void dcp_hdr_metadata_sync(') + r"""
+static void test_metadata_cache(struct hdr_output_metadata hdr)
+{
+    struct apple_dcp_afkep ep = { .wire_v2 = false };
+    struct apple_epic_service service = { .ep = &ep };
+    struct drm_crtc crtc = {};
+    struct drm_atomic_commit commit = {};
+    struct drm_connector_state conn;
+    __typeof__(*conn.hdr_output_metadata) blob = { sizeof(hdr), &hdr };
+
+    conn.hdr_output_metadata = &blob;
+    test_connector = &conn;
+    test_dcp.output_pq = true;
+    test_dcp.hdr.service = &service;
+    reply_length = DCP_HDR_MSG_SIZE;
+    transport_result = -EIO;
+    dcp_hdr_metadata_sync(&test_dcp, &crtc, &commit);
+    assert(sends == 1 && legacy_sends == 1 && !v2_sends && !test_dcp.hdr.sent_valid && !test_dcp.hdr.infoframe);
+    transport_result = 0;
+    reply_length = DCP_HDR_MSG_STATUS;
+    dcp_hdr_metadata_sync(&test_dcp, &crtc, &commit);
+    assert(sends == 2 && !test_dcp.hdr.sent_valid);
+
+    reply_length = DCP_HDR_MSG_SIZE;
+    reset_during_send = true;
+    dcp_hdr_metadata_sync(&test_dcp, &crtc, &commit);
+    assert(sends == 3 && !test_dcp.hdr.sent_valid && !test_dcp.hdr.infoframe);
+    reset_during_send = false;
+    dcp_hdr_metadata_sync(&test_dcp, &crtc, &commit);
+    dcp_hdr_metadata_sync(&test_dcp, &crtc, &commit);
+    assert(sends == 4 && test_dcp.hdr.sent_valid && test_dcp.hdr.infoframe);
+
+    dcp_hdr_reset_locked(&test_dcp);
+    dcp_status = 1;
+    dcp_hdr_metadata_sync(&test_dcp, &crtc, &commit);
+    dcp_hdr_metadata_sync(&test_dcp, &crtc, &commit);
+    assert(sends == 5 && test_dcp.hdr.sent_valid && !test_dcp.hdr.infoframe);
+    hdr.hdmi_metadata_type1.max_cll--;
+    dcp_status = 0;
+    dcp_hdr_metadata_sync(&test_dcp, &crtc, &commit);
+    assert(sends == 6 && test_dcp.hdr.infoframe && !service.refs);
+    hdr.hdmi_metadata_type1.max_cll++;
+    transport_result = -ETIMEDOUT;
+    dcp_hdr_metadata_sync(&test_dcp, &crtc, &commit);
+    assert(sends == 7 && !test_dcp.hdr.sent_valid && test_dcp.hdr.infoframe);
+    hdr.hdmi_metadata_type1.max_cll--;
+    transport_result = 0;
+    dcp_hdr_metadata_sync(&test_dcp, &crtc, &commit);
+    assert(sends == 8 && test_dcp.hdr.sent_valid && !service.refs);
+
+    /* AFKv2 transport (fw 27 / H17P) uses afk_send_command_len for 0x15 and 0x14. */
+    ep.wire_v2 = true;
+    dcp_hdr_reset_locked(&test_dcp);
+    dcp_hdr_metadata_sync(&test_dcp, &crtc, &commit);
+    assert(sends == 9 && v2_sends == 1 && test_dcp.hdr.sent_valid && test_dcp.hdr.infoframe);
+    reply_length = DCP_HDR_STOP_SIZE;
+    dcp_hdr_infoframe_stop(&test_dcp);
+    assert(stop_sends == 1 && v2_sends == 2 && !test_dcp.hdr.infoframe && !service.refs);
+    puts("PASS: retry transport and short replies, discard stale replies, deduplicate completed commands, AFKv2 0x15/0x14");
+}
+
 static const u8 expected[] = {""" + expected + r"""};
 static const u8 expected_stop[] = {""" + expected_stop + r"""};
 int main(void)
@@ -675,6 +830,7 @@ int main(void)
             fprintf(stderr, "byte %#zx: %#x, expected %#x\n", i, msg[i], expected[i]);
             return 1;
         }
+    test_metadata_cache(hdr);
     /* Only static metadata Type 1 is sent. */
     hdr.metadata_type = 1;
     assert(dcp_hdr_data(data, &hdr) == -EINVAL);
