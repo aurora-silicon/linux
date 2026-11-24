@@ -83,8 +83,8 @@ struct apple_epic_service {
 	bool started;
 
     struct {
-        struct dentry *entry;
-        u8 *scratch;
+	struct dentry *entry;
+	u8 *scratch;
     } debugfs;
 };
 
@@ -238,6 +238,23 @@ static inline void afk_service_retire(struct apple_epic_service *service)
 	spin_lock_irqsave(&service->lock, flags);
 	service->enabled = false;
 	service->torndown = true;
+	spin_unlock_irqrestore(&service->lock, flags);
+}
+
+/*
+ * Retire @service only if it still serves @channel; a singleton slot reused
+ * in place for a later announcement keeps its new channel enabled.
+ */
+static inline void afk_service_retire_channel(struct apple_epic_service *service,
+					      u32 channel)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&service->lock, flags);
+	if (service->channel == channel) {
+		service->enabled = false;
+		service->torndown = true;
+	}
 	spin_unlock_irqrestore(&service->lock, flags);
 }
 
@@ -563,8 +580,15 @@ struct apple_dcp_afkep {
 	void *compact_rx_data;
 
 	const struct apple_epic_service_ops *ops;
+	/*
+	 * Bound to an announced service no entry of @ops names, which is then
+	 * opened like a matched one. NULL leaves such a service unopened.
+	 */
+	const struct apple_epic_service_ops *unmatched_ops;
 	struct apple_epic_service services[AFK_MAX_CHANNEL];
 	u32 num_channels;
+	/* Woken once a service has opened and its init callback has run. */
+	wait_queue_head_t service_wq;
 
 	struct dentry *debugfs_entry;
 
@@ -584,6 +608,7 @@ static inline void afk_ep_init_state(struct apple_dcp_afkep *ep)
 	spin_lock_init(&ep->lock);
 	INIT_LIST_HEAD(&ep->compact_cmds);
 	init_waitqueue_head(&ep->compact_orphan_wq);
+	init_waitqueue_head(&ep->service_wq);
 	mutex_init(&ep->compact_tx_lock);
 	init_completion(&ep->started);
 	init_completion(&ep->stopped);
@@ -595,6 +620,7 @@ static inline void afk_ep_init_state(struct apple_dcp_afkep *ep)
 
 struct apple_dcp_afkep *afk_init(struct apple_dcp *dcp, u32 endpoint,
 				 const struct apple_epic_service_ops *ops);
+bool afk_compact_av_capable(struct apple_dcp *dcp);
 int afk_v2_copy_owned(struct apple_epic_service *service, u64 dva,
 		      void *buffer, size_t size, bool to_peer);
 int afk_start(struct apple_dcp_afkep *ep);
@@ -623,6 +649,13 @@ int afk_send_command_timeout(struct apple_epic_service *service, u8 type,
 			     const void *payload, size_t payload_len,
 			     void *output, size_t output_len, u32 *retcode,
 			     unsigned int timeout_ms);
+/*
+ * As afk_send_command(), and @received is set to the number of bytes of
+ * @output the reply filled: an AFKv2 reply may be shorter than @output_len.
+ */
+int afk_send_command_len(struct apple_epic_service *service, u8 type,
+			 const void *payload, size_t payload_len, void *output,
+			 size_t output_len, u32 *retcode, size_t *received);
 int afk_service_call(struct apple_epic_service *service, u16 group, u32 command,
 		     const void *data, size_t data_len, size_t data_pad,
 		     void *output, size_t output_len, size_t output_pad);
