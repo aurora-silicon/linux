@@ -8,7 +8,7 @@ device is on the wakeup path, and cutting it under the running firmware
 resets the J473 (firmware 27.2) on s2idle. dcp_sleep_hold_phys() puts the
 provider device of the DCP's own dp-phy and of its active Type-C route's PHY
 on the wakeup path. The fixture builds the real dcp_phy_set_wakeup_path() and
-dcp_sleep_hold_phys() from drivers/gpu/drm/apple/dcp.c against a small
+dcp_sleep_hold_phys() from drivers/gpu/drm/apple/dcp-fabric.c against a small
 driver-core model and checks which devices end up on the wakeup path.
 
 --mutation names a change to the production functions that the matrix must
@@ -23,7 +23,7 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-DCP = "drivers/gpu/drm/apple/dcp.c"
+DCP = "drivers/gpu/drm/apple/dcp-fabric.c"
 
 MUTATIONS = {
     # Forget the Type-C route's PHY (the USB-C output of a primary DCP).
@@ -44,14 +44,27 @@ HARNESS = r'''
 #include <stdlib.h>
 #include <unistd.h>
 static volatile int cur_line;
+static bool dcp_typec_fabric_lock;
+static bool *lock_acquire(bool *held)
+{
+	if (*held)
+		abort();
+	*held = true;
+	return held;
+}
+static void lock_release(bool **held) { **held = false; }
+#define guard(kind) bool *__attribute__((cleanup(lock_release))) held = lock_acquire
 static void on_segv(int sig) { char b[64]; int n = snprintf(b, sizeof(b), "FAIL line %d (signal %d)\n", cur_line, sig); write(1, b, n); _exit(1); }
-#define READ_ONCE(x) (x)
 #define MAX_ERRNO 4095
 #define IS_ERR_VALUE(x) ((unsigned long)(void *)(x) >= (unsigned long)-MAX_ERRNO)
 static inline bool IS_ERR_OR_NULL(const void *p) { return !p || IS_ERR_VALUE((unsigned long)p); }
 struct device { struct device *parent; bool wakeup_path; };
 static void device_set_wakeup_path(struct device *dev)
 {
+	if (!dcp_typec_fabric_lock) {
+		printf("FAIL line %d wakeup mark without fabric lock\n", cur_line);
+		exit(1);
+	}
 	if (IS_ERR_VALUE((unsigned long)dev)) { printf("FAIL line %d error pointer\n", cur_line); exit(1); }
 	dev->wakeup_path = true;
 }
@@ -98,7 +111,7 @@ int main(void)
 '''
 
 def extract(src, name):
-    m = re.search(r'^static void %s\(.*?^}\n' % re.escape(name), src, re.S | re.M)
+    m = re.search(r'^(?:static )?void %s\(.*?^}\n' % re.escape(name), src, re.S | re.M)
     if not m:
         sys.exit(f"{name} not found in {DCP}")
     return m.group(0)

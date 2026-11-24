@@ -4996,6 +4996,29 @@ int dcp_register_typec_routes(struct apple_dcp *dcp)
 }
 
 /*
+ * A DCP whose firmware runs through a sleep keeps driving the DP PHY of its
+ * output, so the PHY's power domain has to stay up with the DCP's own: cut at
+ * noirq under the running firmware, it resets the SoC (J473, firmware 27.2).
+ * Put the PHY devices in use on the wakeup path, as the DCP itself is.
+ */
+static void dcp_phy_set_wakeup_path(struct phy *phy)
+{
+	if (!IS_ERR_OR_NULL(phy) && phy->dev.parent)
+		device_set_wakeup_path(phy->dev.parent);
+}
+
+void dcp_sleep_hold_phys(struct apple_dcp *dcp)
+{
+	struct apple_dcp_typec_route *route;
+
+	guard(mutex)(&dcp_typec_fabric_lock);
+	route = dcp->active_typec_route;
+	dcp_phy_set_wakeup_path(dcp->phy);
+	if (route)
+		dcp_phy_set_wakeup_path(route->phy);
+}
+
+/*
  * A sleep that reaches its commit powers the crossbar off. Take the output of a direct
  * route down while it still has power, as a released display's is, and select it again
  * after the wake. The route stays, and with it the display on the port.

@@ -9766,27 +9766,6 @@ bool dcp_sleep_keeps_firmware(struct device *dev)
 }
 EXPORT_SYMBOL_GPL(dcp_sleep_keeps_firmware);
 
-/*
- * A DCP whose firmware runs through a sleep keeps driving the DP PHY of its
- * output, so the PHY's power domain has to stay up with the DCP's own: cut at
- * noirq under the running firmware, it resets the SoC (J473, firmware 27.2).
- * Put the PHY devices in use on the wakeup path, as the DCP itself is.
- */
-static void dcp_phy_set_wakeup_path(struct phy *phy)
-{
-	if (!IS_ERR_OR_NULL(phy) && phy->dev.parent)
-		device_set_wakeup_path(phy->dev.parent);
-}
-
-static void dcp_sleep_hold_phys(struct apple_dcp *dcp)
-{
-	struct apple_dcp_typec_route *route = READ_ONCE(dcp->active_typec_route);
-
-	dcp_phy_set_wakeup_path(dcp->phy);
-	if (route)
-		dcp_phy_set_wakeup_path(route->phy);
-}
-
 static int dcp_platform_suspend(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
