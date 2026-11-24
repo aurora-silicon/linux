@@ -11,6 +11,7 @@
 #include <linux/module.h>
 #include <linux/pm_runtime.h>
 #include <linux/slab.h>
+#include <linux/suspend.h>
 #include <linux/random.h>
 #include <crypto/sha2.h>
 #include <crypto/utils.h>
@@ -338,6 +339,10 @@ static bool tb_domain_event_cb(void *data, enum tb_cfg_pkg_type type,
 {
 	struct tb *tb = data;
 
+	/* During noirq only XDomain discovery requests can receive a reply. */
+	if (READ_ONCE(tb->noirq_ctl_retained) && type != TB_CFG_PKG_XDOMAIN_REQ)
+		return true;
+
 	if (!tb->cm_ops->handle_event) {
 		tb_warn(tb, "domain does not have event handler\n");
 		return true;
@@ -528,11 +533,34 @@ void tb_domain_remove(struct tb *tb)
 }
 EXPORT_SYMBOL_FOR_MODULES(tb_domain_remove, "thunderbolt_apple");
 
+static bool tb_domain_retain_noirq_control(struct tb *tb)
+{
+	struct tb_port *port;
+	bool xdomain = false;
+
+	lockdep_assert_held(&tb->lock);
+
+	if (!pm_suspend_no_platform() ||
+	    !(tb->nhi->quirks & QUIRK_NO_SYSTEM_SLEEP) ||
+	    !tb->root_switch)
+		return false;
+
+	tb_switch_for_each_port(tb->root_switch, port) {
+		if (tb_port_has_remote(port))
+			return false;
+		if (port->xdomain)
+			xdomain = true;
+	}
+
+	return xdomain;
+}
+
 /**
  * tb_domain_suspend_noirq() - Suspend a domain
  * @tb: Domain to suspend
  *
- * Suspends all devices in the domain and stops the control channel.
+ * Suspends all devices in the domain. Stops the control channel unless
+ * an awake host router needs it for direct XDomain discovery.
  *
  * Return: %0 on success, negative errno otherwise.
  */
@@ -548,8 +576,14 @@ int tb_domain_suspend_noirq(struct tb *tb)
 	mutex_lock(&tb->lock);
 	if (tb->cm_ops->suspend_noirq)
 		ret = tb->cm_ops->suspend_noirq(tb);
-	if (!ret)
-		tb_ctl_stop(tb->ctl);
+	if (!ret) {
+		if (tb_domain_retain_noirq_control(tb)) {
+			WRITE_ONCE(tb->noirq_ctl_retained, true);
+			tb_dbg(tb, "XDomain control channel retained for s2idle\n");
+		} else {
+			tb_ctl_stop(tb->ctl);
+		}
+	}
 	mutex_unlock(&tb->lock);
 
 	return ret;
@@ -570,9 +604,14 @@ int tb_domain_resume_noirq(struct tb *tb)
 	int ret = 0;
 
 	mutex_lock(&tb->lock);
-	tb_ctl_start(tb->ctl);
+	if (!tb->noirq_ctl_retained)
+		tb_ctl_start(tb->ctl);
 	if (tb->cm_ops->resume_noirq)
 		ret = tb->cm_ops->resume_noirq(tb);
+	if (tb->noirq_ctl_retained) {
+		WRITE_ONCE(tb->noirq_ctl_retained, false);
+		tb_dbg(tb, "XDomain control channel remained active\n");
+	}
 	mutex_unlock(&tb->lock);
 
 	return ret;

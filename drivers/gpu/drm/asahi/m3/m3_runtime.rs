@@ -223,7 +223,7 @@ impl Inner {
     fn fail_front(&mut self,error:Error) {
         if let Ok((packet,_))=self.pending.remove(0) {
             if !self.packet_active(&packet) && !self.fault_captured {packet.release_guard();}
-            packet.finish(Err(error));
+            packet.fail_packet(error);
         }
     }
     /// Signal every packet of `entries` (packets that continue past the batch included).
@@ -1300,7 +1300,7 @@ impl Runtime {
         self.retire_extended_control(first)?;
         self.inner.boot_step = BootStep::DeviceControl;
         // Each data master registers its two firmware engine classes.
-        for ordinal in 0..6 {
+        for ordinal in 0..super::m3_channel_format::ENGINE_CLASSES {
             let action = Action::Register { pipe: ordinal / 2, engine: ordinal % 2 + 1 };
             self.send_extended_control(action)?;
         }

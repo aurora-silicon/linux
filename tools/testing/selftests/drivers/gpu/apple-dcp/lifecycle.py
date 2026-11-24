@@ -529,6 +529,38 @@ static void __attribute__((unused)) dcp_relink_link_up(int *s, u64 generation, u
     if 'cd321x_macos_usbw(cd321x);' in funcs:
         shim += ('\nstruct cd321x;\n'
                  'static void cd321x_macos_usbw(struct cd321x *cd321x) { (void)cd321x; }\n')
+    # Whether DisplayPort pin D joins the running USB 3 link (typec_mux_dp_joins_usb()) is the
+    # scenario's choice: off in the display scenarios above, on in the ones added here.
+    if 'cd321x_dp_joins_usb(cd321x, &st)' in funcs:
+        shim += ('\nstruct cd321x; struct cd321x_status;\n'
+                 'static bool joins;\n'
+                 'static bool cd321x_dp_joins_usb(struct cd321x *cd321x,\n'
+                 '                                const struct cd321x_status *st)\n'
+                 '{ (void)cd321x; (void)st; return joins; }\n')
+        end = ' printf("%d assertions, %d failures\\n", checks, failures); return !!failures;\n}\n'
+        assert tests.count(end) == 1
+        tests = tests.replace(end, r''' /*
+  * Pin D comes to a connection that runs USB 3. Joined, the role is set only once, to the
+  * host it already is; a provider that still fails the change gets the role stopped and the
+  * update retried; without the mux's word the role stops first, as for any mode change.
+  */
+ for (int t = 0; t < 3; t++) {
+  init(); port.display_route_active = false; joins = t < 2;
+  port.tps.data_status = TPS_DATA_STATUS_USB2_CONNECTION | TPS_DATA_STATUS_USB3_CONNECTION;
+  port.update_status.status = TPS_STATUS_PLUG_PRESENT;
+  port.update_status.data_status = port.tps.data_status | TPS_DATA_STATUS_DP_CONNECTION;
+  port.update_status.data_status_changed = TPS_DATA_STATUS_DP_CONNECTION;
+  mode_error = t == 1 ? -EIO : 0;
+  cd321x_update_work(&port.update_work.work);
+  if (t == 0)
+   CHECK(roles == 1 && role == USB_ROLE_HOST && port.pm.phase == CD321X_PM_RUNNING);
+  else if (t == 1)
+   CHECK(roles == 1 && role == USB_ROLE_NONE && port.pm.phase == CD321X_PM_REVALIDATE);
+  else
+   CHECK(roles == 2 && role == USB_ROLE_HOST && port.pm.phase == CD321X_PM_RUNNING);
+ }
+ joins = false;
+''' + end)
     # How long a held mux has been retried is measured on the driver's clock.
     if 'jiffies_to_msecs(jiffies)' in funcs:
         shim += ('\nstatic unsigned long jiffies;\n'
@@ -563,10 +595,11 @@ def bounce(root):
          ' struct { bool connected, closed, tile_hint; void *service, *atcphy; int linkcfg_completion; } dptxport[1];\n'
          ' void *phy, *dev, *active_typec_route;\n'
          ' int dptx_die, dptx_phy, dptx_dfp_port, connector_type;\n'
-         ' bool external, external_link_ready, crashed;\n'
+         ' bool external, external_link_ready, crashed, rtkit_adopted;\n'
          ' bool typec_work_enabled;' + ('' if '\n int fw_compat;' in unit else ' int fw_compat;') +
          ' struct { bool fw_14_7_endpoints; } hw;\n'
-         ' struct { bool active; } split;')
+         ' struct { bool active; } split;\n'
+         ' bool hdmi_hpd;')
     old_raw = unit[unit.index('static int dcp_dptx_connect_raw('):]
     old_raw = old_raw[:old_raw.index('return raw_error; }') + len('return raw_error; }')]
     sessions = bool(SESSION_RAW.search(dcp))
@@ -593,6 +626,7 @@ typedef uint8_t u8;
 #define dev_info(...) ((void)0)
 #define DRM_MODE_CONNECTOR_DisplayPort 10
 #define DCP_FIRMWARE_H17P 17
+#define DCP_FIRMWARE_V_13_5 2
 #define DPTX_CONNECT_TIMEOUT 2000
 #define DPTX_TUNNEL_CONNECT_TIMEOUT 8000
 static void mutex_lock(int *m) { (void)m; }
@@ -1810,12 +1844,13 @@ enum dcp_firmware_version { DCP_FIRMWARE_UNKNOWN, DCP_FIRMWARE_V_12_3, DCP_FIRMW
     DCP_FIRMWARE_V_14_7, DCP_FIRMWARE_V_14_7_TEMPLATE, DCP_FIRMWARE_V_26_6,
     DCP_FIRMWARE_V_26_6_DESKTOP, DCP_FIRMWARE_V_27_0 };
 struct apple_dcp {
-    bool crashed, external, external_native, quiescing, main_display, panel;
+    bool crashed, external, external_native, quiescing, main_display, panel, iomfb_template_pq, vrr_enabled;
     int peer_check; /* what the firmware 27 paired-timing check answers */
     unsigned int nr_typec_routes;
     enum dcp_firmware_version fw_compat;
     struct { int iomfb_method_profile; } hw;
     struct { bool valid; } mode_state;
+    struct { bool vrr_failed; } *desktop;
     struct apple_connector *connector;
     void *dev;
 };
@@ -1920,6 +1955,8 @@ FW27_VRR    dcp.crashed = true;
     # VRR_ENABLED change must never become a mode set.  The external
     # processors ignore a live minimum rate and still apply it with a mode set.
     desktop = r"""    dcp.fw_compat = DCP_FIRMWARE_V_26_6_DESKTOP;
+    dcp.iomfb_template_pq = true;
+    dcp.vrr_enabled = true;
     dcp.hw.iomfb_method_profile = 0;
     dcp.mode_state.valid = true;
     dcp.connector = &connector;
@@ -1944,13 +1981,35 @@ FW27_VRR    dcp.crashed = true;
         }
         cases++;
     }
+    /* Adopted desktop 26.6 panel boot mode starts fixed (!dcp.vrr_enabled):
+     * enabling VRR_ENABLED triggers one modeset to arm adaptive sync unless vrr_failed. */
+    {
+        __typeof__(*dcp.desktop) ds = { .vrr_failed = false };
+        dcp.desktop = &ds;
+        dcp.main_display = true;
+        dcp.vrr_enabled = false;
+        state.crtc.enable = true;
+        state.no_old_crtc = false;
+        state.old_crtc.vrr_enabled = false;
+        state.crtc.vrr_enabled = true;
+        state.crtc.mode_changed = false;
+        assert(dcp_crtc_atomic_check(&crtc, &state) == 0 && state.crtc.mode_changed);
+        ds.vrr_failed = true;
+        state.crtc.mode_changed = false;
+        assert(dcp_crtc_atomic_check(&crtc, &state) == 0 && !state.crtc.mode_changed);
+        dcp.desktop = NULL;
+        cases += 2;
+    }
     dcp.main_display = false;
+    dcp.vrr_enabled = false;
+    dcp.iomfb_template_pq = false;
     dcp.fw_compat = DCP_FIRMWARE_UNKNOWN;
 """
     # Firmware 27: its externals change adaptive sync with a full mode set, as
     # macOS switches between a timing's fixed and variable modes; the panel
     # does not. A paired timing the pair cannot take fails the check.
     fw27 = r"""    dcp.fw_compat = DCP_FIRMWARE_V_27_0;
+    dcp.iomfb_template_pq = true;
     dcp.hw.iomfb_method_profile = 0;
     dcp.mode_state.valid = true;
     dcp.connector = &connector;
@@ -1983,6 +2042,26 @@ FW27_VRR    dcp.crashed = true;
     dcp.main_display = false;
     dcp.panel = false;
     dcp.peer_check = 0;
+    dcp.fw_compat = DCP_FIRMWARE_UNKNOWN;
+    /* Template-driven 12.3/13.5/14.7_tpl DCPs program VRR inside iomfb_modeset(). */
+    const enum dcp_firmware_version tpl_fws[] = {
+        DCP_FIRMWARE_V_12_3, DCP_FIRMWARE_V_13_5, DCP_FIRMWARE_V_14_7_TEMPLATE
+    };
+    dcp.iomfb_template_pq = true;
+    for (unsigned int i = 0; i < 3; i++) {
+        dcp.fw_compat = tpl_fws[i];
+        state.crtc.enable = true;
+        state.crtc.vrr_enabled = true;
+        state.crtc.mode_changed = false;
+        state.no_old_crtc = false;
+        state.old_crtc.vrr_enabled = false;
+        assert(dcp_crtc_atomic_check(&crtc, &state) == 0 && state.crtc.mode_changed);
+        state.crtc.mode_changed = false;
+        state.old_crtc.vrr_enabled = true;
+        assert(dcp_crtc_atomic_check(&crtc, &state) == 0 && !state.crtc.mode_changed);
+        cases += 2;
+    }
+    dcp.iomfb_template_pq = false;
     dcp.fw_compat = DCP_FIRMWARE_UNKNOWN;
 """
     return prefix + check + suffix.replace('DESKTOP_VRR', desktop, 1).replace('FW27_VRR', fw27, 1)
