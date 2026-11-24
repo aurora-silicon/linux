@@ -2723,9 +2723,6 @@ pub(crate) struct Board {
     /// Whether the host encodings are the G17D ones measured on the M5 Ultra
     /// ([`Board::g17d_forms`]).
     g17d_forms: bool,
-    /// Whether explicit waits on other kicks take the completion class
-    /// ([`Board::completion_inputs`]).
-    completion_inputs: bool,
     /// Whether firmware accepts tiling kicks without an entry signal and retained
     /// render pairs kicked through the host port alone.
     pub(crate) host_only_render_kicks: bool,
@@ -2757,7 +2754,6 @@ pub(crate) const J714: Board = Board {
     hw_words: &[],
     fan_curve_start_mc: 84_000,
     g17d_forms: false,
-    completion_inputs: true,
     host_only_render_kicks: false,
 };
 
@@ -2789,7 +2785,6 @@ pub(crate) const J716C: Board = Board {
     hw_words: &[],
     fan_curve_start_mc: 84_000,
     g17d_forms: false,
-    completion_inputs: false,
     // Qualified on G17C's 26A428 image. G17S uses completion-class inputs,
     // G17D has distinct kick encodings, and common 26A428 publishes descriptors
     // on the item ring. Qualify those interfaces separately.
@@ -2834,7 +2829,6 @@ pub(crate) const J775D: Board = Board {
     // above the SMC's own start rather than below it.
     fan_curve_start_mc: 97_000,
     g17d_forms: true,
-    completion_inputs: false,
     host_only_render_kicks: false,
 };
 
@@ -2874,7 +2868,6 @@ pub(crate) const J813: Board = Board {
                 (0x10d4, 0x17), (0x1118, 0), (0x2660, 4), (0x2720, 1), (0x2724, 0)],
     fan_curve_start_mc: 84_000,
     g17d_forms: false,
-    completion_inputs: false,
     host_only_render_kicks: false,
 };
 
@@ -2889,6 +2882,14 @@ const _: () = {
     assert!(J714.min_parameter_buffer as u64 == min_parameter_buffer_pages(J714.clusters) << 15);
     assert!(J716C.min_parameter_buffer as u64 == min_parameter_buffer_pages(J716C.clusters) << 15);
     assert!(J775D.min_parameter_buffer as u64 == min_parameter_buffer_pages(J775D.clusters) << 15);
+};
+
+// Completion inputs follow the firmware interface and host encodings: the M5 graph's G17S and
+// G17C boards take them, the G17D and the common-interface boards keep their own forms.
+const _: () = {
+    assert!(J714.completion_inputs() && J716C.completion_inputs());
+    assert!(!J775D.completion_inputs() && !J813.completion_inputs());
+    assert!(!J813_26B123.completion_inputs());
 };
 
 /// Populate the enabled-USC count from the device's sampled core masks.
@@ -3465,8 +3466,22 @@ impl Board {
     /// producers) take the completion class, which holds them in firmware until those kicks
     /// complete. A wait on another queue's compute stays in firmware only for work that declares
     /// a visible completion (DRM_ASAHI_COMPUTE_VISIBLE_COMPLETION); others wait on the host.
+    ///
+    /// This keys on the board's static graph family and host encodings: every board on [`M5_GRAPH`]
+    /// (whose static profile is [`RootProfile::J714G17S26A428`]) without the G17D host encodings
+    /// (`!self.g17d_forms`) takes these waits, with the counted descriptor forms
+    /// [`super::compute::kick_tuple`] gives them. Any other graph family keeps them off until its
+    /// kicks are known to take that form.
+    /// - The common interface (the J813) encodes its kicks in its own forms
+    ///   ([`Board::j813_forms`]): it already gives explicit dependencies the completion class,
+    ///   but its kicks carry no submission sequence and no retired-parent relaxation, which the
+    ///   M5 graph's form adds, so its waits stay on the host.
+    /// - The G17D host encodings ([`Board::g17d_forms`]) run compute only with the qualified
+    ///   tuple and the entry-signal gate, and take their firmware waits in the pipelined class
+    ///   ([`super::compute::explicit_dependency`]); the counted G17S form's tuple does not apply
+    ///   there and has not been run on a G17D, where a wrong kick form never completes.
     pub(crate) const fn completion_inputs(&self) -> bool {
-        self.completion_inputs
+        matches!(self.graph.profile, RootProfile::J714G17S26A428) && !self.g17d_forms
     }
 
     /// Whether this is the J813, whose register programs macOS 27.0 writes in the common 26A428
