@@ -183,8 +183,9 @@ impl Channels {
         Ok(producer)
     }
 
-    /// Stage the boot NOP before the initdata root is handed to the firmware.
-    pub(crate) fn stage_boot_nop(&mut self, session: &Session) -> Result {
+    /// Stage the boot NOP (the firmware ABI's consume-only `nop` opcode) before the initdata
+    /// root is handed to the firmware.
+    pub(crate) fn stage_boot_nop(&mut self, session: &Session, nop: u32) -> Result {
         if self.devctl_producer != 0
             || self.devctl.read()? != 0
             || self.devctl.completion()? != 0
@@ -192,15 +193,33 @@ impl Channels {
         {
             return Err(super::boot::eproto());
         }
-        self.devctl
-            .ring
-            .write(0, &DevCtl::op(super::fw::channels::devctl::NOP).to_bytes())?;
+        self.devctl.ring.write(0, &DevCtl::op(nop).to_bytes())?;
         wmb();
-        session.regs.set_generation(1)?;
+        session.set_generation(1)?;
         self.devctl.state.w32(STATE_WRITE, 1)?;
         wmb();
         self.devctl_producer = 1;
         Ok(())
+    }
+
+    /// The one error line for a stop during the boot sequence: why, the device-control indices
+    /// and the FirmwareData recovery words. Reads host RAM only, never a GPU register.
+    pub(crate) fn log_stop(&self, session: &Session, init: &InitData, why: &str) {
+        let ix = |r: Result<u32>| r.unwrap_or(u32::MAX);
+        let fd = init.firmware_data();
+        let word = |o: usize| init.control.as_ref().map_or(u32::MAX, |c| ix(c.r32(o)));
+        dev_err!(
+            session.dev,
+            "G16 boot stopped: {}: devctl read {} completion {} write {} producer {}; phase {:#x} scheduler {:#x} ready {:#x}\n",
+            why,
+            ix(self.devctl.read()),
+            ix(self.devctl.completion()),
+            ix(self.devctl.write()),
+            self.devctl_producer,
+            word(fd.phase),
+            word(fd.scheduler),
+            ix(init.readiness())
+        );
     }
 
     /// Consumes a receive ring to its firmware producer.
@@ -218,28 +237,50 @@ impl Channels {
     }
 
     /// Drains every receive ring: events (decoded into `events`), the nine log sub-rings, trace
-    /// and stats.
+    /// and stats, on every pass, whatever another ring reported. The firmware waits while its
+    /// event ring is full, so one bad record must never leave a ring undrained. The first error
+    /// is returned once all are done.
     pub(crate) fn drain_rings(&self, dev: &kernel::device::Device, events: &mut Events) -> Result {
-        events.drain(dev, &self.event)?;
+        let mut result = events.drain(dev, &self.event);
+        let mut keep = |r: Result| {
+            if result.is_ok() {
+                result = r;
+            }
+        };
         for i in 0..rings::LOG_RINGS {
-            Self::drain_one(&self.log, i * 0x30, 256)?;
+            keep(Self::drain_one(&self.log, i * 0x30, 256));
         }
-        // Ktrace has twice the capacity of the other receive rings.
+        keep(self.drain_trace(dev));
+        keep(events.drain_statistics(dev, &self.stats));
+        result
+    }
+
+    /// Ktrace has twice the capacity of the other receive rings. A record of another type than
+    /// the qualified one (5) is logged and consumed, then reported.
+    fn drain_trace(&self, dev: &kernel::device::Device) -> Result {
         let producer = self.trace.write()?;
         let mut consumer = self.trace.read()?;
         if producer >= 512 || consumer >= 512 {
             return Err(super::boot::eproto());
         }
         rmb();
+        let mut result = Ok(());
         while consumer != producer {
-            if self.trace.ring.r32(consumer as usize * 0x48)? != 5 {
-                return Err(super::boot::eproto());
+            let kind = self.trace.ring.r32(consumer as usize * 0x48)?;
+            if kind != 5 && result.is_ok() {
+                dev_err!(
+                    dev,
+                    "unexpected M4 firmware trace record type {} at {}\n",
+                    kind,
+                    consumer
+                );
+                result = Err(super::boot::eproto());
             }
             consumer = (consumer + 1) % 512;
             self.trace.state.w32(STATE_READ, consumer)?;
             wmb();
         }
-        events.drain_statistics(dev, &self.stats)
+        result
     }
 }
 
@@ -266,6 +307,7 @@ pub(crate) fn devctl_submit(
         channels.drain_rings(&dev, events)?;
         session.check()?;
         if init.halted()? {
+            channels.log_stop(session, init, "firmware halted before a control was posted");
             return Err(EBUSY);
         }
         if expired() {
@@ -285,7 +327,7 @@ pub(crate) fn devctl_submit(
         .ring
         .write(producer as usize * rings::DEVCTL_RECORD, &record.to_bytes())?;
     wmb();
-    session.regs.set_generation(next)?;
+    session.set_generation(next)?;
     channels.devctl.state.w32(STATE_WRITE, next)?;
     wmb();
     channels.devctl_producer = next;
@@ -300,6 +342,7 @@ pub(crate) fn devctl_submit(
             return Ok(());
         }
         if init.halted()? {
+            channels.log_stop(session, init, "firmware halted awaiting a control");
             return Err(EBUSY);
         }
         if expired() {
@@ -333,9 +376,10 @@ impl Firmware {
         )
     }
 
-    /// The latched transport error: an RTKit crash or a refused RTKit buffer.
+    /// The latched transport error: an RTKit crash or a refused RTKit buffer. The register
+    /// and UAT checks of [`Session::check`] run once per pass, in its callers.
     pub(crate) fn transport_error(&self) -> Option<Error> {
-        self.session.check().err()
+        self.session.transport().err()
     }
 
     /// Drains the receive rings and decodes events. Called first in every poll pass.

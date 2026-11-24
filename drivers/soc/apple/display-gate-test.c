@@ -14,7 +14,9 @@
  *    changed when a check fails.
  *  - T8122 (t8122-gate-test.dtso): on by default, with the full handoff,
  *    and nothing changed when a check of the handoff or of the reused PMP
- *    topology fails.
+ *    topology fails. Its external processor (dcpext) starts on 14.7.0, and
+ *    on the 27.2 image beside an internal DCP handed over on it, with the
+ *    panel's DMA window on both of its DARTs; otherwise it stays disabled.
  *  - T6041: no test tree; a PMP that binds after the deadline still
  *    starts the external display power-up, and only a failed PMP or power-up
  *    leaves the internal panel alone.
@@ -158,6 +160,7 @@ struct gate_test {
 	bool requested, t6031_requested;
 	int t6031_switch;
 	const char *t6031_board;
+	const char *pmp_uuid;	/* the PMP image the values name: the fixture's unless set */
 };
 
 static struct device_node *__init gt_node(struct kunit *test, const char *path)
@@ -333,7 +336,7 @@ static void __init gt_expect_enabled(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, of_device_is_compatible(pmp, s->pmp_compat));
 	KUNIT_EXPECT_FALSE(test, of_device_is_available(pmp));
 	KUNIT_ASSERT_EQ(test, of_property_read_string(pmp, "apple,tunable-uuid", &uuid), 0);
-	KUNIT_EXPECT_STREQ(test, uuid, s->pmp_uuid);
+	KUNIT_EXPECT_STREQ(test, uuid, t->pmp_uuid);
 	KUNIT_EXPECT_TRUE(test, of_property_present(pmp, "apple,tunable-test"));
 	KUNIT_EXPECT_TRUE(test, of_property_present(pmp, "apple,board-id"));
 	KUNIT_EXPECT_TRUE(test, of_property_present(pmp, "apple,dram-vendor-id"));
@@ -404,6 +407,7 @@ static int __init gt_init(struct kunit *test, const struct gt_soc *s)
 		return -ENOMEM;
 	test->priv = t;
 	t->s = s;
+	t->pmp_uuid = s->pmp_uuid;
 	/* As the boot left them: the test kernel's command line sets neither. */
 	t->requested = gate_requested;
 	t->t6031_requested = gate_t6031_requested;
@@ -417,6 +421,7 @@ static int __init gt_init(struct kunit *test, const struct gt_soc *s)
 	gate_requested = true;
 	gate_t6031_requested = false;
 	gate_t6031_switch = -1;
+	gate_t8122_dcpext_cs = NULL;
 	if (gt_live_soc)
 		kunit_skip(test, "the booted device tree has its own /soc");
 	return 0;
@@ -441,6 +446,12 @@ static void __init gt_exit(struct kunit *test)
 {
 	struct gate_test *t = test->priv;
 
+	/* The T8122 dcpext's changes build on the display's: reverted first. */
+	if (gate_t8122_dcpext_cs) {
+		of_changeset_revert(gate_t8122_dcpext_cs);
+		gate_cs_free(gate_t8122_dcpext_cs);
+		gate_t8122_dcpext_cs = NULL;
+	}
 	/* The gate leaves its changes applied only when it enabled the display. */
 	if (gate_pmp_ovcs) {
 		of_changeset_revert(&gate_pmp_cs);
@@ -830,6 +841,17 @@ static void __init gate_t8122_t6031_pmp_image(struct kunit *test)
 	gt_expect_untouched(test);
 }
 
+/* The 27.2 (26B123) T8122 PMP image is taken as well. */
+static void __init gate_t8122_pmp_image_27_2(struct kunit *test)
+{
+	struct gate_test *t = test->priv;
+
+	t->pmp_uuid = "C6CCB960-AC83-34A2-9493-C3131BD5AE4B";
+	gt_set_string(test, gt_t8122.values, "apple,tunable-uuid", t->pmp_uuid);
+	gt_run(test);
+	gt_expect_enabled(test);
+}
+
 static void __init gate_t8122_no_report_pmp_link(struct kunit *test)
 {
 	gt_remove(test, gt_t8122.report, "apple,pmp");
@@ -894,6 +916,227 @@ static void __init gate_t8122_enabled_again(struct kunit *test)
 {
 	gt_run(test);
 	gt_expect_enabled(test);
+}
+
+/* T8122 external display processor (dcpext) */
+
+#define GT_T8122_DCPEXT		"/t8122-soc/dcp@31ac00000"
+#define GT_T8122_DCPEXT_DART	"/t8122-soc/iommu@31930c000"
+#define GT_T8122_DISPEXT_DART	"/t8122-soc/iommu@319304000"
+#define GT_T8122_DCPEXT_MBOX	"/t8122-soc/mailbox@31ac08000"
+#define GT_T8122_DCPEXT_PS	"/t8122-soc/power-management@2d0700000/power-controller@488"
+#define GT_T8122_DCPEXT_ENTRY	"/t8122-soc/pmp_report@2d03c0000/report@8"
+
+/* The device tree's 14.7 windows of the dcpext DARTs, and the panel's. */
+static const u64 gt_t8122_dcpext_window[2] __initconst = { 0x800000000, 0x7ffff0000 };
+static const u64 gt_t8122_dispext_window[2] __initconst = { 0x0, 0xfffff0000 };
+static const u64 gt_t8122_panel_window[2] __initconst = { 0x10000000000, 0x1000000000 };
+
+static const u32 gt_v14_7[3] __initconst = { 14, 7, 0 };
+static const u32 gt_v27_0[3] __initconst = { 27, 0, 0 };
+static const u32 gt_v27_2[3] __initconst = { 27, 2, 0 };
+
+/* Sets, or adds, the u32 array @name of @path. */
+static void __init gt_set_u32_array(struct kunit *test, const char *path, const char *name,
+				    const u32 *val, size_t n)
+{
+	struct gate_test *t = test->priv;
+	struct device_node *np = gt_node(test, path);
+
+	if (of_property_present(np, name))
+		gt_remove(test, path, name);
+	KUNIT_ASSERT_EQ(test, of_changeset_add_prop_u32_array(&t->cs, np, name, val, n), 0);
+}
+
+/* The dcpext as the boot loader marks it, with these firmware versions. */
+static void __init gt_t8122_dcpext_firmware(struct kunit *test, const u32 version[3],
+					    const u32 compat[3])
+{
+	gt_add_u32(test, GT_T8122_DCPEXT, "apple,t8122-dcpext-firmware-ready", 1);
+	if (version)
+		gt_set_u32_array(test, GT_T8122_DCPEXT, "apple,firmware-version", version, 3);
+	gt_set_u32_array(test, GT_T8122_DCPEXT, "apple,firmware-compat", compat, 3);
+}
+
+/* The internal DCP handed over on the 27.2 (26B123) image. */
+static void __init gt_t8122_dcp_v27_2(struct kunit *test)
+{
+	gt_set_string(test, gt_t8122.dcp, "apple,firmware-uuid", APPLE_T8122_DCP_26B123_UUID);
+	gt_set_u32_array(test, gt_t8122.dcp, "apple,firmware-version", gt_v27_2, 3);
+	gt_set_u32_array(test, gt_t8122.dcp, "apple,firmware-compat", gt_v27_2, 3);
+}
+
+static void __init gt_expect_window(struct kunit *test, const char *path, const u64 want[2])
+{
+	u64 window[2] = {};
+
+	KUNIT_ASSERT_EQ_MSG(test, of_property_read_u64_array(gt_node(test, path),
+							     "apple,dma-range", window, 2), 0,
+			    "%s", path);
+	KUNIT_EXPECT_EQ_MSG(test, window[0], want[0], "%s start", path);
+	KUNIT_EXPECT_EQ_MSG(test, window[1], want[1], "%s size", path);
+}
+
+/*
+ * The panel as gt_expect_enabled() checks it, and the dcpext enabled or not
+ * with all it needs. @window: the window both dcpext DARTs must have, NULL
+ * for the device tree's own.
+ */
+static void __init gt_expect_dcpext(struct kunit *test, bool enabled, const u64 *window)
+{
+	struct device_node *display = gt_node(test, gt_t8122.display);
+	struct device_node *entry = gt_node(test, GT_T8122_DCPEXT_ENTRY);
+	struct of_phandle_args args;
+
+	gt_expect_enabled(test);
+	KUNIT_EXPECT_EQ(test, gt_okay(test, GT_T8122_DCPEXT), enabled);
+	KUNIT_EXPECT_EQ(test, gt_okay(test, GT_T8122_DCPEXT_DART), enabled);
+	KUNIT_EXPECT_EQ(test, gt_okay(test, GT_T8122_DISPEXT_DART), enabled);
+	KUNIT_EXPECT_EQ(test, gt_okay(test, GT_T8122_DCPEXT_MBOX), enabled);
+	KUNIT_EXPECT_EQ(test, of_property_read_bool(entry, "apple,always-on"), enabled);
+	KUNIT_EXPECT_EQ(test, of_property_read_bool(entry, "apple,soc-device-record"), enabled);
+	KUNIT_EXPECT_EQ(test, of_property_read_bool(entry, "apple,defer-startup-ack"), enabled);
+	KUNIT_EXPECT_EQ(test, gt_u32(test, GT_T8122_DCPEXT_PS, "apple,min-state"),
+			enabled ? PMGR_PS_ACTIVE : 4);
+	/* Its scanout DART joins the display subsystem's, after the panel's. */
+	KUNIT_EXPECT_EQ(test, of_count_phandle_with_args(display, "iommus", "#iommu-cells"),
+			enabled ? 2 : 1);
+	if (enabled) {
+		KUNIT_ASSERT_EQ(test, of_parse_phandle_with_args(display, "iommus",
+								 "#iommu-cells", 1, &args), 0);
+		KUNIT_EXPECT_PTR_EQ(test, args.np, gt_node(test, GT_T8122_DISPEXT_DART));
+		of_node_put(args.np);
+	}
+	gt_expect_window(test, GT_T8122_DCPEXT_DART, window ?: gt_t8122_dcpext_window);
+	gt_expect_window(test, GT_T8122_DISPEXT_DART, window ?: gt_t8122_dispext_window);
+	/* The panel's own window stays as it is. */
+	gt_expect_window(test, "/t8122-soc/iommu@28d30c000", gt_t8122_panel_window);
+}
+
+static void __init gt_require_display_driver(struct kunit *test)
+{
+	if (!IS_ENABLED(CONFIG_DRM_APPLE))
+		kunit_skip(test, "the gate keeps the dcpext off without the display driver");
+}
+
+/* Without the boot loader's firmware-ready mark the dcpext stays disabled. */
+static void __init gate_t8122_dcpext_not_ready(struct kunit *test)
+{
+	gt_set_u32_array(test, GT_T8122_DCPEXT, "apple,firmware-compat", gt_v14_7, 3);
+	gt_run(test);
+	gt_expect_dcpext(test, false, NULL);
+}
+
+/* On 14.7.0 it starts with the device tree's windows. */
+static void __init gate_t8122_dcpext_v14_7(struct kunit *test)
+{
+	gt_require_display_driver(test);
+	gt_t8122_dcpext_firmware(test, gt_v14_7, gt_v14_7);
+	gt_run(test);
+	gt_expect_dcpext(test, true, NULL);
+	KUNIT_EXPECT_FALSE(test, apple_t8122_dcpext_v27_2(gt_node(test, GT_T8122_DCPEXT)));
+}
+
+/*
+ * On the 27.2 image, beside an internal DCP handed over on it, it starts
+ * with the panel's window on both of its DARTs.
+ */
+static void __init gate_t8122_dcpext_v27_2(struct kunit *test)
+{
+	gt_require_display_driver(test);
+	gt_t8122_dcp_v27_2(test);
+	gt_t8122_dcpext_firmware(test, gt_v27_2, gt_v27_2);
+	gt_run(test);
+	gt_expect_dcpext(test, true, gt_t8122_panel_window);
+	KUNIT_EXPECT_TRUE(test, apple_t8122_dcpext_v27_2(gt_node(test, GT_T8122_DCPEXT)));
+	/* The internal DCP itself is not the external processor. */
+	KUNIT_EXPECT_FALSE(test, apple_t8122_dcpext_v27_2(gt_node(test, gt_t8122.dcp)));
+	KUNIT_EXPECT_FALSE(test, apple_t8122_dcpext_v27_2(NULL));
+}
+
+/* 27.2.0 next to an internal DCP on its 14.x image is not the 27.2 image. */
+static void __init gate_t8122_dcpext_v27_2_internal_v14(struct kunit *test)
+{
+	gt_t8122_dcpext_firmware(test, gt_v27_2, gt_v27_2);
+	gt_run(test);
+	gt_expect_dcpext(test, false, NULL);
+	KUNIT_EXPECT_FALSE(test, apple_t8122_dcpext_v27_2(gt_node(test, GT_T8122_DCPEXT)));
+}
+
+/* Both its version and its compatibility must be 27.2.0. */
+static void __init gate_t8122_dcpext_v27_2_other_version(struct kunit *test)
+{
+	gt_t8122_dcp_v27_2(test);
+	gt_t8122_dcpext_firmware(test, gt_v27_0, gt_v27_2);
+	gt_run(test);
+	gt_expect_dcpext(test, false, NULL);
+	KUNIT_EXPECT_FALSE(test, apple_t8122_dcpext_v27_2(gt_node(test, GT_T8122_DCPEXT)));
+}
+
+static void __init gate_t8122_dcpext_v27_2_no_version(struct kunit *test)
+{
+	gt_t8122_dcp_v27_2(test);
+	gt_t8122_dcpext_firmware(test, NULL, gt_v27_2);
+	gt_run(test);
+	gt_expect_dcpext(test, false, NULL);
+}
+
+static void __init gate_t8122_dcpext_other_firmware(struct kunit *test)
+{
+	gt_t8122_dcp_v27_2(test);
+	gt_t8122_dcpext_firmware(test, gt_v27_0, gt_v27_0);
+	gt_run(test);
+	gt_expect_dcpext(test, false, NULL);
+}
+
+/* Without the panel's window there is none to give it: nothing changes. */
+static void __init gate_t8122_dcpext_v27_2_no_panel_window(struct kunit *test)
+{
+	gt_require_display_driver(test);
+	gt_t8122_dcp_v27_2(test);
+	gt_t8122_dcpext_firmware(test, gt_v27_2, gt_v27_2);
+	gt_remove(test, "/t8122-soc/iommu@28d30c000", "apple,dma-range");
+	gt_run(test);
+	gt_expect_enabled(test);
+	KUNIT_EXPECT_FALSE(test, gt_okay(test, GT_T8122_DCPEXT));
+	KUNIT_EXPECT_FALSE(test, gt_okay(test, GT_T8122_DCPEXT_DART));
+	KUNIT_EXPECT_FALSE(test, gt_okay(test, GT_T8122_DISPEXT_DART));
+	KUNIT_EXPECT_FALSE(test, of_property_read_bool(gt_node(test, GT_T8122_DCPEXT_ENTRY),
+						       "apple,always-on"));
+	gt_expect_window(test, GT_T8122_DCPEXT_DART, gt_t8122_dcpext_window);
+	gt_expect_window(test, GT_T8122_DISPEXT_DART, gt_t8122_dispext_window);
+}
+
+/*
+ * gate_t8122_dcpext_alias() alone: it copies one window (start and size)
+ * onto both DARTs, and takes nothing else.
+ */
+static void __init gate_t8122_dcpext_alias_window(struct kunit *test)
+{
+	struct device_node *dart = gt_node(test, GT_T8122_DCPEXT_DART);
+	struct device_node *disp_dart = gt_node(test, GT_T8122_DISPEXT_DART);
+	static const u32 short_window[2] __initconst = { 0x100, 0x0 };
+	struct gate_test *t = test->priv;
+	struct of_changeset cs;
+
+	of_changeset_init(&cs);
+	KUNIT_ASSERT_EQ(test, gate_t8122_dcpext_alias(&cs, dart, disp_dart), 0);
+	KUNIT_ASSERT_EQ(test, of_changeset_apply(&cs), 0);
+	gt_expect_window(test, GT_T8122_DCPEXT_DART, gt_t8122_panel_window);
+	gt_expect_window(test, GT_T8122_DISPEXT_DART, gt_t8122_panel_window);
+	KUNIT_EXPECT_EQ(test, of_changeset_revert(&cs), 0);
+	of_changeset_destroy(&cs);
+	gt_expect_window(test, GT_T8122_DCPEXT_DART, gt_t8122_dcpext_window);
+	gt_expect_window(test, GT_T8122_DISPEXT_DART, gt_t8122_dispext_window);
+
+	/* A window that is not one start and one size is refused. */
+	gt_set_u32_array(test, "/t8122-soc/iommu@28d30c000", "apple,dma-range",
+			 short_window, ARRAY_SIZE(short_window));
+	KUNIT_ASSERT_EQ(test, of_changeset_apply(&t->cs), 0);
+	of_changeset_init(&cs);
+	KUNIT_EXPECT_EQ(test, gate_t8122_dcpext_alias(&cs, dart, disp_dart), -ENODEV);
+	KUNIT_EXPECT_TRUE(test, list_empty(&cs.entries));
+	of_changeset_destroy(&cs);
 }
 
 /* The case and suite structs outlive init: only the functions are init code. */
@@ -962,6 +1205,7 @@ static struct kunit_case gate_t8122_cases[] __refdata = {
 	KUNIT_CASE(gate_t8122_no_pmp_values),
 	KUNIT_CASE(gate_t8122_t6031_pmp_image),
 	KUNIT_CASE(gate_t8122_no_report_pmp_link),
+	KUNIT_CASE(gate_t8122_pmp_image_27_2),
 	KUNIT_CASE(gate_t8122_pmp_enabled),
 	KUNIT_CASE(gate_t8122_pmp_has_values),
 	KUNIT_CASE(gate_t8122_no_pmp_dart),
@@ -969,6 +1213,15 @@ static struct kunit_case gate_t8122_cases[] __refdata = {
 	KUNIT_CASE(gate_t8122_disp_no_ack),
 	KUNIT_CASE(gate_t8122_no_storage_request),
 	KUNIT_CASE(gate_t8122_not_inherited_on),
+	KUNIT_CASE(gate_t8122_dcpext_not_ready),
+	KUNIT_CASE(gate_t8122_dcpext_v14_7),
+	KUNIT_CASE(gate_t8122_dcpext_v27_2),
+	KUNIT_CASE(gate_t8122_dcpext_v27_2_internal_v14),
+	KUNIT_CASE(gate_t8122_dcpext_v27_2_other_version),
+	KUNIT_CASE(gate_t8122_dcpext_v27_2_no_version),
+	KUNIT_CASE(gate_t8122_dcpext_other_firmware),
+	KUNIT_CASE(gate_t8122_dcpext_v27_2_no_panel_window),
+	KUNIT_CASE(gate_t8122_dcpext_alias_window),
 	KUNIT_CASE(gate_t8122_enabled_again),
 	{}
 };
@@ -1252,8 +1505,8 @@ static void __init gt_max_set_dcp_fw(struct kunit *test, const char *path,
 			0);
 }
 
-/* Unapproved firmware 27 adopts only the internal panel: external chains stay off. */
-static void __init gate_t6041_max_firmware27_internal_only(struct kunit *test)
+/* Unapproved firmware 27 on the internal DCP leaves external chains off. */
+static void __init gate_t6041_max_unapproved_firmware27(struct kunit *test)
 {
 	static const u32 compat[3] = { 27, 2, 0 };
 
@@ -1295,7 +1548,7 @@ static struct kunit_case gate_t6041_max_cases[] __refdata = {
 	KUNIT_CASE(gate_t6041_max_enabled_by_loader),
 	KUNIT_CASE(gate_t6041_max_missing_node),
 	KUNIT_CASE(gate_t6041_max_no_display),
-	KUNIT_CASE(gate_t6041_max_firmware27_internal_only),
+	KUNIT_CASE(gate_t6041_max_unapproved_firmware27),
 	KUNIT_CASE(gate_t6041_max_v27_2),
 	{}
 };

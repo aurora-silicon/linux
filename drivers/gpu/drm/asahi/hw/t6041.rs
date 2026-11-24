@@ -43,7 +43,7 @@ pub(super) const BASE: Config = Config {
         handoff_slot: 0xffff_ffff,
         handoff_unk2: 0,
         native_gpu_permissions: true,
-        narrow_pool_window: true,
+        narrow_pool_window: false,
     },
     region_c: Some(&REGION_C),
     chip: Some(&CHIP),
@@ -79,9 +79,8 @@ const BUILDS: [fw::variant::Build; 5] = [
         ..BUILD_25G83
     },
     fw::variant::Build {
-        name: "macOS 26.6.2 (25G83, iBoot mBoot-18000.161.10), 32 cores",
         config: Some(&super::t6041_25g83::CONFIG),
-        ..BUILD_25G83
+        ..BUILD_25G83_32CORE
     },
     fw::variant::Build {
         config: Some(&BASE),
@@ -111,6 +110,7 @@ pub(super) const BUILD_26B123: fw::variant::Build = fw::variant::Build {
     }],
     variant: &fw::variant::Variant {
         ta_mode_1: true,
+        render_id_at_create: true,
         ..fw::variant::V26B123
     },
     config: None,
@@ -141,9 +141,10 @@ const BUILD_25F84: fw::variant::Build = fw::variant::Build {
 
 /// The macOS 26.6.2 boot firmware (iBoot mBoot-18000.161.10) loads the 25G83 build the M4 Pro
 /// runs. iBoot fills part of the loaded TEXT for each Mac, so each admitted image is a
-/// measurement. Three are listed: the 32-core J616C's, which runs with
-/// [`super::t6041_25g83::CONFIG`], and the 40-core J614C's and J575C's, which run with
-/// [`CONFIG_25G83`]. The J575C's is measured with its boot-filled ranges zeroed.
+/// measurement. Four are listed: the 32-core J616C's, which runs via [`BUILD_25G83_32CORE`]
+/// with [`super::t6041_25g83::CONFIG`], and the 40-core J614C's and J575C's, which run with
+/// [`CONFIG_25G83`]. The J575C's is measured with its boot-filled ranges zeroed, as is the
+/// J614C's under system firmware 27.2, whose iBoot fills the same ranges.
 pub(super) const BUILD_25G83: fw::variant::Build = fw::variant::Build {
     os_version: [26, 6, 2],
     name: "macOS 26.6.2 (25G83, iBoot mBoot-18000.161.10)",
@@ -187,13 +188,50 @@ pub(super) const BUILD_25G83: fw::variant::Build = fw::variant::Build {
                 0x74, 0x0a, 0x3c, 0xcd,
             ],
         },
+        crate::fwid::FirmwareBuild {
+            name: "Apple GFX 25G83 for T6041 (normalized loaded image, 40-core J614C, iBoot 27.2)",
+            text_size: 0x60000,
+            data_size: 0x138000,
+            entropy: &[[0x59839, 0x5991c]],
+            // Under system firmware 27.2 (mBoot-20457.41.3) iBoot fills the J614C's header load
+            // field and SLID record block as it does on the J575C, so they are zeroed the same way.
+            boot_filled: &[(0x224, 4), (0x59839, 0x231)],
+            text_sha256: [
+                0x1b, 0x54, 0x21, 0x51, 0x66, 0x75, 0x20, 0x5e, 0x0d, 0x90, 0x25, 0xd5, 0x5a, 0xf8,
+                0x91, 0x10, 0xe1, 0xaf, 0xdf, 0x89, 0xda, 0xdb, 0x09, 0xf4, 0x81, 0xc6, 0x3d, 0x36,
+                0x15, 0xa5, 0x2c, 0x7d,
+            ],
+        },
     ],
-    // Four clusters: the tiler segment values of 25F84 on this machine.
+    // 40-core T6041 parts (J614C, J575C) stay on TA mode 1 until clustered tiling is tested on
+    // 40-core hardware; 32-core parts run [`BUILD_25G83_32CORE`] below.
+    // T6041's 25G83 firmware emits pstate reports (tags 0x19/0x1b) and 8 ms
+    // timestamped utilisation records (tag 0x13).
     variant: &fw::variant::Variant {
+        // Tiling and fragment kicks wait on their own prefixes (host path, !m5_commands);
+        // unmeasured on the M4 Pro, which keeps false.
+        render_stage_prefixes: true,
         ta_mode_1: true,
+        telemetry_protocol: crate::g17::telemetry::Protocol::PSTATE_8MS,
+        render_id_at_create: true,
         ..fw::variant::V25G83
     },
     config: None,
+};
+
+/// 32-core T6041 (J616C) on 25G83: inherits the 25G83 image list (the 32- vs 40-core config
+/// is chosen by probed core count) and tiles clustered with the four-cluster segment words
+/// (`fw::m5::target::cluster_control`). A clustered RD32 Minecraft frame needs ~1600-2200 heap
+/// blocks, past the 0x45e normal maximum, and at that maximum a four-cluster pass never starts
+/// (reason 0 recoveries), so the heap may use every slot of the block table.
+pub(super) const BUILD_25G83_32CORE: fw::variant::Build = fw::variant::Build {
+    name: "macOS 26.6.2 (25G83, iBoot mBoot-18000.161.10), 32 cores",
+    variant: &fw::variant::Variant {
+        ta_mode_1: false,
+        tvb_normal_blocks: crate::g17::fw::buffer::NORMAL_MAX_BLOCKS_FOUR_CLUSTERS,
+        ..*BUILD_25G83.variant
+    },
+    ..BUILD_25G83
 };
 
 /// The 40-core M4 Max on 25G83: the 25F84 configuration with the 25G83 register map and

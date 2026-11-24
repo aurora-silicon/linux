@@ -79,3 +79,11 @@ or sensitive, say so rather than substituting data from another Mac.
 
 For kernel patches, also follow the existing
 [kernel submission guidance](Documentation/process/submitting-patches.rst).
+
+## Pull request rules
+
+Aurora Silicon's rules for pull requests, including how to disclose an LLM's
+help and what commits carry, are in
+[aurora-silicon/agent-guidelines](https://github.com/aurora-silicon/agent-guidelines).
+Run its [pre-PR checklist](https://github.com/aurora-silicon/agent-guidelines/blob/main/pre-pr-checklist.md)
+before opening one.

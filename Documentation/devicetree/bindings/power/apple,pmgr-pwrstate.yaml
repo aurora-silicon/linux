@@ -90,6 +90,7 @@ properties:
               - apple,t8132-pmgr-pwrstate
               - apple,t8140-pmgr-pwrstate
               - apple,t8142-pmgr-pwrstate
+              - apple,t8152-pmgr-pwrstate
           - const: apple,t8103-pmgr-pwrstate
 
   reg:
@@ -147,6 +148,16 @@ properties:
       The driver behind this domain lowers it before a system sleep and brings
       it back afterwards, in an order its hardware needs. The power controller
       leaves it alone after a wake.
+    type: boolean
+
+  apple,sleep-wakeup-path:
+    description:
+      A consumer of this domain can keep running into system sleep, until the
+      sleep's final commit after the noirq phase or through the whole sleep,
+      and is then on the wakeup path. The OS keeps the domain on through
+      system sleep while a device under it is on the wakeup path, also when
+      the domain was off when the power controller probed. Other domains are
+      unaffected.
     type: boolean
 
   apple,firmware-owned:

@@ -37,6 +37,34 @@
 	wake-gpios = <&pinctrl 40 GPIO_ACTIVE_HIGH>;
 };
 
+&smc_gpio_low {
+	apple,output-templates = <0xe 0x00800000>;
+};
+
+/* The 16-inch M4 Max chassis has High Power mode, as on the J616s */
+&clpc {
+	apple,high-power-mode;
+};
+
+/*
+ * ADT aop-spmi0/stockholm-spmi: the Stockholm NFC controller at SPMI 9, its
+ * interrupts in 224-230 and its enable on SMC gp0e, as on the J616s.
+ */
+&aop_spmi0 {
+	status = "okay";
+
+	stockholm: nfc@9 {
+		compatible = "apple,stockholm-nci";
+		reg = <9 SPMI_USID>;
+		interrupt-parent = <&aop_spmi0>;
+		interrupts = <229 IRQ_TYPE_EDGE_RISING>,
+			     <230 IRQ_TYPE_EDGE_RISING>,
+			     <227 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "host-wake", "data-ready", "error";
+		enable-gpios = <&smc_gpio_low 0xe GPIO_ACTIVE_HIGH>;
+	};
+};
+
 &panel {
 	compatible = "apple,panel-j616", "apple,panel-mini-led", "apple,panel";
 	width-mm = <346>;
@@ -60,4 +88,84 @@
 
 &mesa {
 	firmware-name = "apple/mesacal-j616c.bin", "apple/msrk-j616c.bin";
+};
+
+/*
+ * ADT /arm-io/aon-ptd ptd_data_table: the battery record ("IFtb", layout 1,
+ * slots 0x12-0x15). Only its peek aperture is read.
+ */
+&aon_ptd {
+	apple,battery-record = <0x49467462 1 0x12 4>;
+	status = "okay";
+};
+
+/* SIO AES engine, software keys only. */
+&ps_aes {
+	status = "okay";
+};
+
+&aes {
+	status = "okay";
+};
+
+/*
+ * First ProRes encoder (apr0) and its DART. Runs with SCODEC_STREAMING (and
+ * SCODEC) powered; uses the driver's built-in T6041 power-up rows, optionally
+ * overridden by apple/prores-t6041-init.bin.
+ */
+&ps_fab1_soc {
+	status = "okay";
+};
+
+&ps_scodec {
+	status = "okay";
+};
+
+&ps_scodec_streaming {
+	status = "okay";
+};
+
+&apr0_dart {
+	status = "okay";
+};
+
+&apr0 {
+	status = "okay";
+};
+
+/* Both MSR scalers/CSCs (scaler0, scaler1) and their DARTs. */
+&ps_fab5_soc {
+	status = "okay";
+};
+
+&ps_msr0 {
+	status = "okay";
+};
+
+&ps_msr0_ase_core {
+	status = "okay";
+};
+
+&scaler0_dart {
+	status = "okay";
+};
+
+&scaler0 {
+	status = "okay";
+};
+
+&ps_msr1 {
+	status = "okay";
+};
+
+&ps_msr1_ase_core {
+	status = "okay";
+};
+
+&scaler1_dart {
+	status = "okay";
+};
+
+&scaler1 {
+	status = "okay";
 };

@@ -536,13 +536,14 @@ impl Objects {
         self.pages
     }
 
-    /// Bounded live UAT ownership checks; no user leaf walk and no firmware memory repair.
+    /// Bounded live checks of the host window; no user leaf walk and no firmware memory repair.
+    /// The UAT's context bindings are checked by [`super::boot::Session::check`], which every
+    /// caller runs just before this.
     pub(crate) fn health(&mut self) -> Result {
         if let Some(error) = self.error {
             return Err(error);
         }
-        self.window.lock().check()?;
-        self.uat.check_adopted_bindings()
+        self.window.lock().check()
     }
 
     /// Allocates and maps a zeroed firmware object.
