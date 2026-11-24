@@ -83,7 +83,7 @@ CPU=max; [ $ACCEL = kvm ] && CPU=host
 echo "qemu: accel=$ACCEL kernel=$KREL"
 set +e
 timeout "$QEMU_TIMEOUT" qemu-system-aarch64 -M virt -accel $ACCEL -cpu $CPU -smp 4 -m 6G \
-	-nographic -no-reboot -kernel "$IMG" -initrd "$OUT/initramfs.cpio.zst" \
+	-nographic -no-reboot -nic none -kernel "$IMG" -initrd "$OUT/initramfs.cpio.zst" \
 	-append "console=ttyAMA0 rdinit=/init panic=-1 loglevel=1 log_buf_len=128M kunit.enable=1" \
 	> "$OUT/console.log" 2>&1
 QRC=$?
