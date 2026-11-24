@@ -112,7 +112,8 @@ T6041_ITEMS = SOC_ITEMS + [
     "const CHIP_25G83: ",
     "const HW_DATA_WORDS: ",
     "const HW_DATA_WORDS_25G83: ",
-    "const POWER_CONFIG_WORDS",
+    "const POWER_CONFIG_WORDS: ",
+    "const POWER_CONFIG_WORDS_25G83: ",
 ]
 
 J616C_ITEMS = [
@@ -226,7 +227,15 @@ fn main() {
     let (hw_g83, power_g83, region_g83) = build(t6041::CHIP_ID, &t6041::REGISTER_WINDOWS_25G83,
         &[], &t6041::PERF, &T6041_OPPS, &T6041_AUX, &t6041::CHIP_25G83, &t6041::REGION_C, 40);
     println!("T6041 25G83 initialization objects built");
-    assert_eq!(power_g83, power, "the register map changes only the hardware data");
+    // The power configuration keeps the 25G83 starting values of the performance limiter.
+    let word = |b: &[u8], at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+    let changed = (0..power.len() / 4).map(|i| 4 * i)
+        .filter(|&at| word(&power, at) != word(&power_g83, at)).collect::<Vec<_>>();
+    assert_eq!(changed, [0x0, 0x44, 0x9c], "25G83 power configuration: only the limiter start");
+    assert_eq!([word(&power, 0x0), word(&power, 0x44), word(&power, 0x9c)], [1, 0xc, 0x43a9_0000],
+               "25F84 limiter state");
+    assert_eq!([word(&power_g83, 0x0), word(&power_g83, 0x44), word(&power_g83, 0x9c)], [0, 1, 0],
+               "25G83 limiter start");
     assert_eq!(region_g83, region, "the register map changes only the hardware data");
     let map = 0x640..0x640 + REGISTER_MAP_SLOTS * core::mem::size_of::<RegisterMapEntry>();
     let outside = |a: &[u8], b: &[u8]| a.iter().zip(b).enumerate()
