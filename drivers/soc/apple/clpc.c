@@ -2684,6 +2684,151 @@ static struct kunit_suite apple_clpc_suite = {
 	.test_cases = apple_clpc_cases,
 };
 kunit_test_suite(apple_clpc_suite);
+
+/* A cpufreq table out of order, with an invalid entry, as a driver may give it. */
+static struct cpufreq_policy *apple_clpc_test_policy(struct kunit *test)
+{
+	static const unsigned int khz[] = {
+		600000, CPUFREQ_ENTRY_INVALID, 1200000, 2000000, 1500000,
+	};
+	struct cpufreq_frequency_table *table;
+	struct cpufreq_policy *policy;
+	unsigned int i;
+
+	policy = kunit_kzalloc(test, sizeof(*policy), GFP_KERNEL);
+	table = kunit_kcalloc(test, ARRAY_SIZE(khz) + 1, sizeof(*table), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, policy);
+	KUNIT_ASSERT_NOT_NULL(test, table);
+	for (i = 0; i < ARRAY_SIZE(khz); i++)
+		table[i].frequency = khz[i];
+	table[i].frequency = CPUFREQ_TABLE_END;
+	policy->freq_table = table;
+	policy->cpuinfo.max_freq = 2000000;
+	return policy;
+}
+
+static void apple_clpc_step_khz_test(struct kunit *test)
+{
+	struct cpufreq_policy *policy = apple_clpc_test_policy(test);
+
+	/* One table step either way, whatever the table order. */
+	KUNIT_EXPECT_EQ(test, apple_clpc_step_khz(policy, 1200000, true), 1500000u);
+	KUNIT_EXPECT_EQ(test, apple_clpc_step_khz(policy, 1500000, true), 2000000u);
+	KUNIT_EXPECT_EQ(test, apple_clpc_step_khz(policy, 1500000, false), 1200000u);
+	KUNIT_EXPECT_EQ(test, apple_clpc_step_khz(policy, 1200000, false), 600000u);
+	/* Off the table: the nearest entry in that direction. */
+	KUNIT_EXPECT_EQ(test, apple_clpc_step_khz(policy, 1300000, true), 1500000u);
+	KUNIT_EXPECT_EQ(test, apple_clpc_step_khz(policy, 1300000, false), 1200000u);
+	/*
+	 * No step past either end: @khz back. The invalid entry sits above
+	 * every real one, so these up steps are the ones that would pick it.
+	 */
+	KUNIT_EXPECT_EQ(test, apple_clpc_step_khz(policy, 2000000, true), 2000000u);
+	KUNIT_EXPECT_EQ(test, apple_clpc_step_khz(policy, 600000, false), 600000u);
+	KUNIT_EXPECT_EQ(test, apple_clpc_step_khz(policy, 2100000, true), 2100000u);
+	KUNIT_EXPECT_EQ(test, apple_clpc_step_khz(policy, 0, false), 0u);
+
+	/*
+	 * The lookup apple_clpc_profile_limit() makes for the low-power top: the
+	 * first entry at or above low_power_khz, so a value between two entries
+	 * rounds up and an exact entry is kept. Its max_freq fallback is not
+	 * covered here.
+	 */
+	KUNIT_EXPECT_EQ(test, apple_clpc_step_khz(policy, 1400000 - 1, true), 1500000u);
+	KUNIT_EXPECT_EQ(test, apple_clpc_step_khz(policy, 1500000 - 1, true), 1500000u);
+	KUNIT_EXPECT_EQ(test, apple_clpc_step_khz(policy, 600000 - 1, true), 600000u);
+	/* Above the table nothing is found and @khz comes back. */
+	KUNIT_EXPECT_EQ(test, apple_clpc_step_khz(policy, 2100000 - 1, true), 2100000u - 1);
+}
+
+static void apple_clpc_steps_first_test(struct kunit *test)
+{
+	/* Down: the higher ceiling first; on a tie, the faster cluster. */
+	KUNIT_EXPECT_TRUE(test, apple_clpc_steps_first(2000000, 2000000, 1500000, 3000000, false));
+	KUNIT_EXPECT_FALSE(test, apple_clpc_steps_first(1500000, 3000000, 2000000, 2000000, false));
+	KUNIT_EXPECT_TRUE(test, apple_clpc_steps_first(1500000, 3000000, 1500000, 2000000, false));
+	KUNIT_EXPECT_FALSE(test, apple_clpc_steps_first(1500000, 2000000, 1500000, 3000000, false));
+
+	/* Up: the lower ceiling first; on a tie, the slower cluster. */
+	KUNIT_EXPECT_TRUE(test, apple_clpc_steps_first(1500000, 3000000, 2000000, 2000000, true));
+	KUNIT_EXPECT_FALSE(test, apple_clpc_steps_first(2000000, 2000000, 1500000, 3000000, true));
+	KUNIT_EXPECT_TRUE(test, apple_clpc_steps_first(1500000, 2000000, 1500000, 3000000, true));
+	KUNIT_EXPECT_FALSE(test, apple_clpc_steps_first(1500000, 3000000, 1500000, 2000000, true));
+
+	/* Identical clusters: the one already picked keeps the step. */
+	KUNIT_EXPECT_FALSE(test, apple_clpc_steps_first(1500000, 2000000, 1500000, 2000000, true));
+	KUNIT_EXPECT_FALSE(test, apple_clpc_steps_first(1500000, 2000000, 1500000, 2000000, false));
+}
+
+static void apple_clpc_vote_test(struct kunit *test)
+{
+	unsigned long hold = msecs_to_jiffies(APPLE_CLPC_HOLD_MS);
+	/*
+	 * Start so that the hold deadline wraps to 0 while its last held
+	 * sample is still ULONG_MAX: a compare that is not wrap-safe drops
+	 * the vote early there.
+	 */
+	unsigned long t0 = ULONG_MAX - (hold - 1);
+	struct apple_clpc_vote vote = {};
+
+	KUNIT_ASSERT_GT(test, hold, 1ul);
+	KUNIT_ASSERT_EQ(test, t0 + hold - 1, ULONG_MAX);
+	KUNIT_EXPECT_EQ(test, apple_clpc_vote(&vote, 0, t0), 0u);
+	KUNIT_EXPECT_EQ(test, apple_clpc_vote(&vote, 5, t0), 5u);
+	/* No demand: the state holds for APPLE_CLPC_HOLD_MS, then drops. */
+	KUNIT_EXPECT_EQ(test, apple_clpc_vote(&vote, 0, t0 + hold - 1), 5u);
+	KUNIT_EXPECT_EQ(test, apple_clpc_vote(&vote, 0, t0 + hold), 0u);
+	KUNIT_EXPECT_EQ(test, apple_clpc_vote(&vote, 0, t0 + 2 * hold), 0u);
+
+	/* A new demand replaces the state at once, down as well as up. */
+	KUNIT_EXPECT_EQ(test, apple_clpc_vote(&vote, 7, t0 + 2 * hold), 7u);
+	KUNIT_EXPECT_EQ(test, apple_clpc_vote(&vote, 2, t0 + 2 * hold + 1), 2u);
+	/* and restarts the hold. */
+	KUNIT_EXPECT_EQ(test, apple_clpc_vote(&vote, 0, t0 + 3 * hold), 2u);
+	KUNIT_EXPECT_EQ(test, apple_clpc_vote(&vote, 0, t0 + 3 * hold + 1), 0u);
+}
+
+static void apple_clpc_floor_test(struct kunit *test)
+{
+	struct apple_clpc *clpc = kunit_kzalloc(test, sizeof(*clpc), GFP_KERNEL);
+	struct apple_clpc_hw *hw = kunit_kzalloc(test, sizeof(*hw), GFP_KERNEL);
+	unsigned int state[APPLE_CLPC_RAILS] = {};
+
+	KUNIT_ASSERT_NOT_NULL(test, clpc);
+	KUNIT_ASSERT_NOT_NULL(test, hw);
+	clpc->hw = hw;
+
+	/* Each rail's state in its own nibble of the PMC floor word. */
+	hw->rail[APPLE_CLPC_DCS] = 0;
+	hw->rail[APPLE_CLPC_SOC] = 1;
+	KUNIT_EXPECT_EQ(test, apple_clpc_floor(clpc, state), 0u);
+	state[APPLE_CLPC_DCS] = 5;
+	state[APPLE_CLPC_SOC] = 3;
+	KUNIT_EXPECT_EQ(test, apple_clpc_floor(clpc, state), 0x35u);
+
+	/* The rail numbers come from the table, not the rail order. */
+	hw->rail[APPLE_CLPC_DCS] = 2;
+	hw->rail[APPLE_CLPC_SOC] = 0;
+	KUNIT_EXPECT_EQ(test, apple_clpc_floor(clpc, state), 0x503u);
+
+	/* A state wider than a nibble cannot spill into another rail. */
+	state[APPLE_CLPC_DCS] = 0x1f;
+	state[APPLE_CLPC_SOC] = 0x10;
+	KUNIT_EXPECT_EQ(test, apple_clpc_floor(clpc, state), 0xf00u);
+}
+
+static struct kunit_case apple_clpc_policy_cases[] = {
+	KUNIT_CASE(apple_clpc_step_khz_test),
+	KUNIT_CASE(apple_clpc_steps_first_test),
+	KUNIT_CASE(apple_clpc_vote_test),
+	KUNIT_CASE(apple_clpc_floor_test),
+	{}
+};
+static struct kunit_suite apple_clpc_policy_suite = {
+	.name = "apple-clpc-policy",
+	.test_cases = apple_clpc_policy_cases,
+};
+kunit_test_suite(apple_clpc_policy_suite);
 #endif
 
 /*
