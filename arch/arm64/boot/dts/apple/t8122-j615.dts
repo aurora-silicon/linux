@@ -181,6 +181,21 @@
 	read-only;
 };
 
+&ane_dart0 {
+	status = "okay";
+};
+
+&ane_dart1 {
+	status = "okay";
+};
+
+&ane_dart2 {
+	status = "okay";
+};
+
+&ane {
+	status = "okay";
+
 /*
  * The Wi-Fi/Bluetooth module's CLKREQ# is wired to the SoC (the J615 ADT gives
  * the Wi-Fi bridge a CLKREQ function), so the link may use Clock PM and the L1

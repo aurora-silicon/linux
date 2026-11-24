@@ -68,6 +68,13 @@ enum apple_clpc_rail {
 #define APPLE_CLPC_GPU_BACKOFF_MS	100
 /* Package power readings in the low-power profile: every 100 ms */
 #define APPLE_CLPC_POWER_MS	100
+/*
+ * Policy fraction of the fastest CPU cluster's maximum frequency used as the
+ * low-power platform-profile ceiling when neither the DT nor the SoC table
+ * supplies an explicit frequency (matches macOS Low Power Mode's ~64% P-core
+ * ceiling).
+ */
+#define APPLE_CLPC_LOW_POWER_PCT	64
 
 /* Why the last vote was cast, for debugfs */
 #define APPLE_CLPC_REASON_CPU		BIT(0)
@@ -122,7 +129,10 @@ enum apple_clpc_rail {
  *	from a deferrable timer
  * @low_power_khz: CPU frequency ceiling of the low-power platform profile,
  *	taken up to the next table frequency, for a node without
- *	apple,low-power-frequency-max-mhz; 0 for no platform profile
+ *	apple,low-power-frequency-max-mhz; 0 for none
+ * @auto_low_power: derive the low-power ceiling from the fastest CPU
+ *	cluster's operating points (APPLE_CLPC_LOW_POWER_PCT) when neither DT
+ *	nor @low_power_khz sets one
  * @low_power_mw: package power (the SMC's PHPC key) the low-power profile
  *	holds the CPU clusters to; 0 for none
  * @high_power_machine: the machine compatible that had High Power mode from
@@ -149,6 +159,7 @@ struct apple_clpc_hw {
 	unsigned int ane_cluster_khz;
 	const char *ane_cluster_machine;
 	bool idle_on_time;
+	bool auto_low_power;
 	unsigned int low_power_khz;
 	unsigned int low_power_mw;
 	const char *high_power_machine;
@@ -258,10 +269,13 @@ struct apple_clpc {
 	unsigned long gpu_streaming_samples;
 	unsigned long gpu_dense_samples;
 	/* The platform profile and, for its power target, the SMC */
+	bool has_pmc;
 	enum platform_profile_option profile;
 	bool low_power;
 	/* the DT ceiling, else hw->low_power_khz, else 0 */
 	unsigned int low_power_khz;
+	bool auto_low_power;
+	unsigned int low_power_mw;
 	struct device_node *smc_np;
 	struct apple_smc *smc;
 	/* The performance profile is sent to the SMC as High Power mode */
@@ -594,7 +608,8 @@ static void apple_clpc_find_clusters(struct apple_clpc *clpc)
 			cl = &clpc->clusters[i];
 			cpumask_set_cpu(cpu, cl->cpus);
 			cpumask_set_cpu(cpu, clpc->covered);
-			clpc->idle[cpu] = get_cpu_idle_time(cpu, &clpc->wall[cpu], 0);
+			if (clpc->idle && clpc->wall)
+				clpc->idle[cpu] = get_cpu_idle_time(cpu, &clpc->wall[cpu], 0);
 		}
 		cpufreq_cpu_put(policy);
 	}
@@ -678,10 +693,29 @@ static u32 apple_clpc_floor(struct apple_clpc *clpc, const unsigned int *state)
 	return floor;
 }
 
+static inline bool apple_clpc_has_profile_ceiling(const struct apple_clpc *clpc)
+{
+	return clpc->low_power_khz || clpc->auto_low_power;
+}
+
 static void apple_clpc_queue(struct apple_clpc *clpc, bool idle)
 {
 	if (READ_ONCE(clpc->stopped))
 		return;
+
+	if (!clpc->has_pmc) {
+		unsigned long delay;
+
+		cancel_delayed_work(&clpc->idle_work);
+		if (apple_clpc_has_profile_ceiling(clpc) && READ_ONCE(clpc->low_power))
+			delay = msecs_to_jiffies(APPLE_CLPC_POWER_MS);
+		else if (!cpumask_equal(clpc->covered, cpu_possible_mask))
+			delay = HZ;
+		else
+			return;
+		mod_delayed_work(system_freezable_power_efficient_wq, &clpc->work, delay);
+		return;
+	}
 
 	/*
 	 * A held vote has to be sampled on time so that it drops once demand
@@ -881,12 +915,49 @@ static unsigned int apple_clpc_step_khz(struct cpufreq_policy *policy,
 	struct cpufreq_frequency_table *pos;
 	unsigned int best = khz;
 
+	if (!policy->freq_table)
+		return khz;
 	cpufreq_for_each_valid_entry(pos, policy->freq_table) {
 		if (up ? pos->frequency > khz && (best == khz || pos->frequency < best) :
 			 pos->frequency < khz && (best == khz || pos->frequency > best))
 			best = pos->frequency;
 	}
 	return best;
+}
+
+/*
+ * The low-power platform-profile frequency ceiling for @policy:
+ *  - when @low_power_khz is given (ADT/DT or SoC table), the first table
+ *    frequency at or above @low_power_khz (matching macOS Low Power Mode's
+ *    round-up on M4/M5), or policy max if the cluster is slower;
+ *  - otherwise, when @auto_low_power is set, APPLE_CLPC_LOW_POWER_PCT of
+ *    @max_cluster_khz rounded down to a table frequency on the fastest
+ *    cluster(s), leaving slower clusters uncapped.
+ */
+static unsigned int apple_clpc_low_power_top_khz(struct cpufreq_policy *policy,
+						 unsigned int low_power_khz,
+						 bool auto_low_power,
+						 unsigned int max_cluster_khz)
+{
+	unsigned int top;
+
+	if (low_power_khz) {
+		top = apple_clpc_step_khz(policy, low_power_khz - 1, true);
+		if (top < low_power_khz)
+			top = policy->cpuinfo.max_freq;
+		return top;
+	}
+	if (auto_low_power && max_cluster_khz &&
+	    policy->cpuinfo.max_freq >= max_cluster_khz) {
+		unsigned int target = div_u64((u64)max_cluster_khz *
+					      APPLE_CLPC_LOW_POWER_PCT, 100);
+
+		top = apple_clpc_step_khz(policy, target + 1, false);
+		if (top > target)
+			top = policy->cpuinfo.min_freq ?: policy->cpuinfo.max_freq;
+		return top;
+	}
+	return policy->cpuinfo.max_freq;
 }
 
 /*
@@ -946,52 +1017,60 @@ static bool apple_clpc_steps_first(unsigned int a_khz, unsigned int a_max,
 
 /*
  * The platform profile's ceilings. In the low-power profile every cluster
- * stays at or below the first frequency at or above clpc->low_power_khz. Each
- * new package power reading above hw->low_power_mw takes one table step off
- * one cluster, and each one below 90% of it puts one back, in the order of
+ * stays at or below apple_clpc_low_power_top_khz(). When @low_power_mw is set,
+ * each new package power reading above it takes one table step off one
+ * cluster, and each one below 90% of it puts one back, in the order of
  * apple_clpc_steps_first(). Elsewhere there is no ceiling.
  */
 static void apple_clpc_profile_limit(struct apple_clpc *clpc)
 {
 	bool low = READ_ONCE(clpc->low_power);
 	struct cpufreq_policy *policy[APPLE_CLPC_MAX_CLUSTERS] = {};
-	unsigned int i, khz, pick_khz = 0;
+	unsigned int i, khz, pick_khz = 0, max_cluster_khz = 0;
 	int mw, step = 0, pick = -1;
 
-	if (!clpc->low_power_khz || time_before(jiffies, clpc->power_next))
+	if (!apple_clpc_has_profile_ceiling(clpc) ||
+	    time_before(jiffies, clpc->power_next))
 		return;
 	clpc->power_next = jiffies + msecs_to_jiffies(APPLE_CLPC_POWER_MS);
-	if (low && clpc->hw->low_power_mw) {
+	if (low && clpc->smc_np) {
 		mw = apple_clpc_read_power(clpc);
 		clpc->power_reads++;
 		/* The SMC updates the reading less often: act on a new one only. */
 		if (mw >= 0 && mw != clpc->power_mw) {
 			clpc->power_updates++;
-			if (mw > (int)clpc->hw->low_power_mw)
-				step = -1;
-			else if (mw < (int)clpc->hw->low_power_mw * 9 / 10)
-				step = 1;
+			if (clpc->low_power_mw) {
+				if (mw > (int)clpc->low_power_mw)
+					step = -1;
+				else if (mw < (int)clpc->low_power_mw * 9 / 10)
+					step = 1;
+			}
 		}
 		clpc->power_mw = mw;
 	}
 	for (i = 0; i < clpc->nr_clusters; i++) {
+		policy[i] = cpufreq_cpu_get(clpc->clusters[i].policy_cpu);
+		if (policy[i])
+			max_cluster_khz = max(max_cluster_khz,
+					      policy[i]->cpuinfo.max_freq);
+	}
+	for (i = 0; i < clpc->nr_clusters; i++) {
 		struct apple_clpc_cluster *cl = &clpc->clusters[i];
 
-		policy[i] = cpufreq_cpu_get(cl->policy_cpu);
 		if (!policy[i])
 			continue;
 		if (!freq_qos_request_active(&cl->max_qos) &&
 		    freq_qos_add_request(&policy[i]->constraints, &cl->max_qos, FREQ_QOS_MAX,
 					 FREQ_QOS_MAX_DEFAULT_VALUE) < 0)
 			clpc->update_errors++;
-		/* The top: the first table frequency at or above clpc->low_power_khz */
-		cl->top_khz = apple_clpc_step_khz(policy[i],
-						  clpc->low_power_khz - 1, true);
-		if (cl->top_khz < clpc->low_power_khz)
-			cl->top_khz = policy[i]->cpuinfo.max_freq;
+		cl->top_khz = apple_clpc_low_power_top_khz(policy[i],
+							   clpc->low_power_khz,
+							   clpc->auto_low_power,
+							   max_cluster_khz);
 		if (!low)
 			cl->max_khz = 0;
-		else if (!cl->max_khz)
+		else if (!cl->max_khz || !clpc->low_power_mw ||
+			 cl->max_khz > cl->top_khz)
 			cl->max_khz = cl->top_khz;
 		if (!step)
 			continue;
@@ -1023,71 +1102,73 @@ static void apple_clpc_profile_limit(struct apple_clpc *clpc)
 static void apple_clpc_sample(struct apple_clpc *clpc)
 {
 	unsigned int demand[APPLE_CLPC_RAILS] = {};
-	unsigned int state[APPLE_CLPC_RAILS];
+	unsigned int state[APPLE_CLPC_RAILS] = {};
 	unsigned long now = jiffies;
 	unsigned int i, rail;
-	u32 reason = 0, floor;
+	u32 reason = 0, floor = 0;
 
 	clpc->samples++;
 	if (!cpumask_equal(clpc->covered, cpu_possible_mask) &&
-	    time_after_eq(now, clpc->next_scan)) {
+	    (!clpc->has_pmc || time_after_eq(now, clpc->next_scan))) {
 		apple_clpc_find_clusters(clpc);
 		clpc->next_scan = now + HZ;
 	}
 
-	for (i = 0; i < clpc->nr_clusters; i++) {
-		struct apple_clpc_cluster *cl = &clpc->clusters[i];
+	if (clpc->has_pmc) {
+		for (i = 0; i < clpc->nr_clusters; i++) {
+			struct apple_clpc_cluster *cl = &clpc->clusters[i];
 
-		apple_clpc_sample_cluster(clpc, cl);
+			apple_clpc_sample_cluster(clpc, cl);
+			for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
+				demand[rail] = max(demand[rail], cl->request[rail]);
+		}
 		for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
-			demand[rail] = max(demand[rail], cl->request[rail]);
-	}
-	for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
-		if (demand[rail])
-			reason |= APPLE_CLPC_REASON_CPU;
-	if (apple_clpc_gpu_input_demand(clpc->hw, clpc->gpu, demand))
-		reason |= APPLE_CLPC_REASON_HOST_GPU;
-	if (apple_clpc_ane_input_demand(clpc, demand))
-		reason |= APPLE_CLPC_REASON_ANE;
-	apple_clpc_ane_cluster(clpc, reason & APPLE_CLPC_REASON_ANE, now);
-	if (clpc->gpu_pmgr) {
-		/* Both run every sample: each tracks state across samples. */
-		bool late = time_after(now, clpc->gpu_sampled +
-					    msecs_to_jiffies(2 * APPLE_CLPC_SAMPLE_MS));
-		bool dense = apple_clpc_gpu_dense(clpc, late);
-		bool streaming = apple_clpc_gpu_streaming(clpc, now);
+			if (demand[rail])
+				reason |= APPLE_CLPC_REASON_CPU;
+		if (apple_clpc_gpu_input_demand(clpc->hw, clpc->gpu, demand))
+			reason |= APPLE_CLPC_REASON_HOST_GPU;
+		if (apple_clpc_ane_input_demand(clpc, demand))
+			reason |= APPLE_CLPC_REASON_ANE;
+		apple_clpc_ane_cluster(clpc, reason & APPLE_CLPC_REASON_ANE, now);
+		if (clpc->gpu_pmgr) {
+			/* Both run every sample: each tracks state across samples. */
+			bool late = time_after(now, clpc->gpu_sampled +
+						    msecs_to_jiffies(2 * APPLE_CLPC_SAMPLE_MS));
+			bool dense = apple_clpc_gpu_dense(clpc, late);
+			bool streaming = apple_clpc_gpu_streaming(clpc, now);
 
-		if (streaming || dense) {
-			bool released = apple_clpc_gpu_limited(clpc, now);
+			if (streaming || dense) {
+				bool released = apple_clpc_gpu_limited(clpc, now);
 
-			apple_clpc_gpu_floor_count(clpc, released);
-			if (!released) {
-				reason |= streaming ? APPLE_CLPC_REASON_STREAMING_GPU :
-						      APPLE_CLPC_REASON_DENSE_GPU;
-				if (streaming)
-					clpc->gpu_streaming_samples++;
-				else
-					clpc->gpu_dense_samples++;
-				for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
-					demand[rail] = max(demand[rail],
-							   clpc->hw->gpu[rail]);
+				apple_clpc_gpu_floor_count(clpc, released);
+				if (!released) {
+					reason |= streaming ? APPLE_CLPC_REASON_STREAMING_GPU :
+							      APPLE_CLPC_REASON_DENSE_GPU;
+					if (streaming)
+						clpc->gpu_streaming_samples++;
+					else
+						clpc->gpu_dense_samples++;
+					for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
+						demand[rail] = max(demand[rail],
+								   clpc->hw->gpu[rail]);
+				}
 			}
 		}
+
+		for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
+			state[rail] = apple_clpc_vote(&clpc->vote[rail], demand[rail],
+						      now);
+
+		floor = apple_clpc_floor(clpc, state);
+		for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
+			if (state[rail] > demand[rail])
+				reason |= APPLE_CLPC_REASON_HOLD;
+		clpc->last_floor = floor;
+		clpc->last_reason = reason;
+		clpc->last_vote_ns = ktime_get_mono_fast_ns();
+		if (apple_pmc_floor_update(clpc->pmc, clpc->agent, clpc->mask, floor))
+			clpc->update_errors++;
 	}
-
-	for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
-		state[rail] = apple_clpc_vote(&clpc->vote[rail], demand[rail],
-					      now);
-
-	floor = apple_clpc_floor(clpc, state);
-	for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
-		if (state[rail] > demand[rail])
-			reason |= APPLE_CLPC_REASON_HOLD;
-	clpc->last_floor = floor;
-	clpc->last_reason = reason;
-	clpc->last_vote_ns = ktime_get_mono_fast_ns();
-	if (apple_pmc_floor_update(clpc->pmc, clpc->agent, clpc->mask, floor))
-		clpc->update_errors++;
 
 	apple_clpc_profile_limit(clpc);
 
@@ -1097,9 +1178,10 @@ static void apple_clpc_sample(struct apple_clpc *clpc)
 	 * ceiling (High Power only) has nothing to do there, so it stays
 	 * deferrable.
 	 */
-	apple_clpc_queue(clpc, !apple_clpc_floor(clpc, state) && !clpc->gpu_on &&
+	apple_clpc_queue(clpc, !floor && !clpc->gpu_on &&
 			 !clpc->ane_qos_khz &&
-			 !(clpc->low_power_khz && READ_ONCE(clpc->low_power)));
+			 !(apple_clpc_has_profile_ceiling(clpc) &&
+			   READ_ONCE(clpc->low_power)));
 }
 
 static void apple_clpc_run(struct apple_clpc *clpc)
@@ -1125,20 +1207,22 @@ static int apple_clpc_status_show(struct seq_file *s, void *unused)
 	struct apple_clpc *clpc = s->private;
 	unsigned int i, rail;
 
-	seq_printf(s, "agent: %u floor: %#010x (saved %#010x)\n", clpc->agent,
-		   apple_pmc_floor_read(clpc->pmc, clpc->agent),
-		   clpc->saved_floor);
-	for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
-		seq_printf(s, "%s: rail %u state %u enabled %u map %u,%u,%u,%u\n",
-			   rail == APPLE_CLPC_DCS ? "dcs" : "soc",
-			   clpc->hw->rail[rail], clpc->vote[rail].state,
-			   apple_pmc_voter_enabled(clpc->pmc, clpc->agent,
-						   clpc->hw->rail[rail]),
-			   clpc->hw->map[rail][0], clpc->hw->map[rail][1],
-			   clpc->hw->map[rail][2], clpc->hw->map[rail][3]);
-	seq_printf(s, "last_vote: %#x reason_bits %#x sampled_ns %llu (cpu=1 host_gpu=2 streaming_gpu=4 dense_gpu=8 hold=16 ane=32)\n",
-		   READ_ONCE(clpc->last_floor), READ_ONCE(clpc->last_reason),
-		   READ_ONCE(clpc->last_vote_ns));
+	if (clpc->has_pmc) {
+		seq_printf(s, "agent: %u floor: %#010x (saved %#010x)\n", clpc->agent,
+			   apple_pmc_floor_read(clpc->pmc, clpc->agent),
+			   clpc->saved_floor);
+		for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
+			seq_printf(s, "%s: rail %u state %u enabled %u map %u,%u,%u,%u\n",
+				   rail == APPLE_CLPC_DCS ? "dcs" : "soc",
+				   clpc->hw->rail[rail], clpc->vote[rail].state,
+				   apple_pmc_voter_enabled(clpc->pmc, clpc->agent,
+							   clpc->hw->rail[rail]),
+				   clpc->hw->map[rail][0], clpc->hw->map[rail][1],
+				   clpc->hw->map[rail][2], clpc->hw->map[rail][3]);
+		seq_printf(s, "last_vote: %#x reason_bits %#x sampled_ns %llu (cpu=1 host_gpu=2 streaming_gpu=4 dense_gpu=8 hold=16 ane=32)\n",
+			   READ_ONCE(clpc->last_floor), READ_ONCE(clpc->last_reason),
+			   READ_ONCE(clpc->last_vote_ns));
+	}
 	if (clpc->gpu) {
 		struct apple_clpc_gpu *gpu = clpc->gpu;
 		unsigned int busy, level;
@@ -1178,7 +1262,7 @@ static int apple_clpc_status_show(struct seq_file *s, void *unused)
 	}
 	seq_printf(s, "samples: %lu update errors: %lu\n", clpc->samples,
 		   clpc->update_errors);
-	if (clpc->low_power_khz) {
+	if (apple_clpc_has_profile_ceiling(clpc)) {
 		seq_printf(s, "profile: %s power %d mW (%lu new of %lu readings) ceilings (kHz):",
 			   clpc->profile == PLATFORM_PROFILE_LOW_POWER ? "low-power" :
 			   clpc->profile == PLATFORM_PROFILE_PERFORMANCE ? "performance" :
@@ -1205,12 +1289,14 @@ static int apple_clpc_status_show(struct seq_file *s, void *unused)
 			   clpc->gpu_streaming_samples, clpc->gpu_dense_samples);
 		seq_printf(s, "gpu read errors: %lu\n", clpc->gpu_read_errors);
 	}
-	for (i = 0; i < clpc->nr_clusters; i++)
-		seq_printf(s, "cluster cpu%u: busy %u%% level %u%% -> dcs %u soc %u\n",
-			   clpc->clusters[i].policy_cpu, clpc->clusters[i].busy,
-			   clpc->clusters[i].level,
-			   clpc->clusters[i].request[APPLE_CLPC_DCS],
-			   clpc->clusters[i].request[APPLE_CLPC_SOC]);
+	if (clpc->has_pmc) {
+		for (i = 0; i < clpc->nr_clusters; i++)
+			seq_printf(s, "cluster cpu%u: busy %u%% level %u%% -> dcs %u soc %u\n",
+				   clpc->clusters[i].policy_cpu, clpc->clusters[i].busy,
+				   clpc->clusters[i].level,
+				   clpc->clusters[i].request[APPLE_CLPC_DCS],
+				   clpc->clusters[i].request[APPLE_CLPC_SOC]);
+	}
 
 	return 0;
 }
@@ -1297,8 +1383,9 @@ static void apple_clpc_halt(struct apple_clpc *clpc)
 		cancel_delayed_work_sync(&clpc->work);
 		cancel_delayed_work_sync(&clpc->idle_work);
 	}
-	apple_pmc_floor_update(clpc->pmc, clpc->agent, clpc->mask,
-			       clpc->saved_floor);
+	if (clpc->has_pmc)
+		apple_pmc_floor_update(clpc->pmc, clpc->agent, clpc->mask,
+				       clpc->saved_floor);
 	for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
 		clpc->vote[rail].state = 0;
 	if (clpc->ane_qos_khz &&
@@ -1339,7 +1426,6 @@ static void apple_clpc_stop(void *data)
 	for (i = 0; i < clpc->nr_clusters; i++)
 		if (freq_qos_request_active(&clpc->clusters[i].max_qos))
 			freq_qos_remove_request(&clpc->clusters[i].max_qos);
-	of_node_put(clpc->smc_np);
 	apple_clpc_free_clusters(clpc);
 }
 
@@ -1355,13 +1441,20 @@ static int apple_clpc_policy_notify(struct notifier_block *nb, unsigned long eve
 	struct cpufreq_policy *policy = data;
 	unsigned int i;
 
+	if (event == CPUFREQ_CREATE_POLICY) {
+		if (!READ_ONCE(clpc->stopped))
+			mod_delayed_work(system_freezable_power_efficient_wq, &clpc->work, 0);
+		return NOTIFY_OK;
+	}
 	if (event != CPUFREQ_REMOVE_POLICY)
 		return NOTIFY_DONE;
 	guard(mutex)(&clpc->sample_lock);
 	for (i = 0; i < clpc->nr_clusters; i++)
-		if (cpumask_test_cpu(clpc->clusters[i].policy_cpu, policy->related_cpus) &&
-		    freq_qos_request_active(&clpc->clusters[i].max_qos))
-			freq_qos_remove_request(&clpc->clusters[i].max_qos);
+		if (cpumask_test_cpu(clpc->clusters[i].policy_cpu, policy->related_cpus)) {
+			if (freq_qos_request_active(&clpc->clusters[i].max_qos))
+				freq_qos_remove_request(&clpc->clusters[i].max_qos);
+			clpc->clusters[i].max_khz = 0;
+		}
 	if (clpc->ane_cpu < 0 || !cpumask_test_cpu(clpc->ane_cpu, policy->related_cpus))
 		return NOTIFY_OK;
 	if (freq_qos_request_active(&clpc->ane_qos))
@@ -1463,8 +1556,13 @@ static int apple_clpc_profile_set(struct device *dev, enum platform_profile_opti
 	}
 	WRITE_ONCE(clpc->profile, profile);
 	WRITE_ONCE(clpc->low_power, profile == PLATFORM_PROFILE_LOW_POWER);
-	/* The next sample applies it. */
+	/* Apply profile ceilings right away so userspace sees the change immediately. */
 	clpc->power_next = jiffies;
+	if (!READ_ONCE(clpc->stopped) && apple_clpc_has_profile_ceiling(clpc)) {
+		if (!cpumask_equal(clpc->covered, cpu_possible_mask))
+			apple_clpc_find_clusters(clpc);
+		apple_clpc_profile_limit(clpc);
+	}
 	mutex_unlock(&clpc->sample_lock);
 	if (!READ_ONCE(clpc->stopped))
 		mod_delayed_work(system_freezable_power_efficient_wq, &clpc->work, 0);
@@ -1586,14 +1684,21 @@ static const struct apple_clpc_hw *apple_clpc_dt_hw(struct device *dev,
 	return hw;
 }
 
+static void apple_clpc_put_smc_np(void *data)
+{
+	struct apple_clpc *clpc = data;
+
+	of_node_put(clpc->smc_np);
+}
+
 static int apple_clpc_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct device_node *gpu = NULL;
 	struct apple_clpc *clpc;
 	unsigned int rail, i;
-	bool high_power;
-	u32 mhz;
+	bool high_power, has_profile;
+	u32 mhz, mw;
 	int ret;
 
 	clpc = devm_kzalloc(dev, sizeof(*clpc), GFP_KERNEL);
@@ -1605,82 +1710,148 @@ static int apple_clpc_probe(struct platform_device *pdev)
 	clpc->hw = apple_clpc_dt_hw(dev, of_device_get_match_data(dev));
 	if (IS_ERR(clpc->hw))
 		return PTR_ERR(clpc->hw);
-	/* T6040 firmware keeps GFX powered for its whole lifetime. A separate
-	 * host publication/idle input, not that supplier state, drives demand;
-	 * the T8132 and M5 (T8142) GPU drivers report through the same input.
-	 * On T8140 the same input counts submissions for dense light work.
-	 */
-	if (clpc->hw->gpu_input || clpc->hw->gpu_dense) {
-		clpc->gpu = kzalloc_obj(*clpc->gpu);
-		if (!clpc->gpu)
-			return -ENOMEM;
-		kref_init(&clpc->gpu->ref);
-		spin_lock_init(&clpc->gpu->lock);
-		ret = devm_add_action_or_reset(dev, apple_clpc_gpu_owner_put, clpc->gpu);
-		if (ret)
-			return ret;
-	}
-	if (clpc->hw->ane[APPLE_CLPC_DCS] || clpc->hw->ane[APPLE_CLPC_SOC]) {
-		clpc->ane = kzalloc_obj(*clpc->ane);
-		if (!clpc->ane)
-			return -ENOMEM;
-		kref_init(&clpc->ane->ref);
-		spin_lock_init(&clpc->ane->lock);
-		ret = devm_add_action_or_reset(dev, apple_clpc_ane_owner_put, clpc->ane);
-		if (ret)
-			return ret;
-		for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
-			clpc->ane_states[rail] = clpc->hw->ane[rail];
-	}
+
+	clpc->has_pmc = clpc->pmc && apple_pmc_rail_count(clpc->pmc) > 0;
 	clpc->ane_cpu = -ENODEV;
 	clpc->ane_until = jiffies;
-	if (clpc->ane && clpc->hw->ane_cluster_khz &&
-	    of_machine_is_compatible(clpc->hw->ane_cluster_machine)) {
-		clpc->ane_cpu = apple_clpc_cluster_cpu(clpc->hw->ane_cluster);
-		if (clpc->ane_cpu >= 0) {
-			clpc->policy_nb.notifier_call = apple_clpc_policy_notify;
-			if (!cpufreq_register_notifier(&clpc->policy_nb,
-						       CPUFREQ_POLICY_NOTIFIER)) {
-				clpc->policy_nb_added = true;
-				clpc->ane_cluster_khz = clpc->hw->ane_cluster_khz;
+
+	/*
+	 * The boot loader copies the ADT's Low Power mode CPU ceiling
+	 * (pmgr/clpc cpu-low-power-frequency-max) into the node. Without it,
+	 * a SoC's own value applies where it has one, or the generic
+	 * operating-point ceiling when auto_low_power is enabled.
+	 */
+	if (!of_property_read_u32(dev->of_node, "apple,low-power-frequency-max-mhz", &mhz))
+		clpc->low_power_khz = mhz * 1000;
+	else
+		clpc->low_power_khz = clpc->hw->low_power_khz;
+	if (!clpc->low_power_khz && clpc->hw->auto_low_power)
+		clpc->auto_low_power = true;
+	if (!of_property_read_u32(dev->of_node, "apple,low-power-mw", &mw))
+		clpc->low_power_mw = mw;
+	else
+		clpc->low_power_mw = clpc->hw->low_power_mw;
+	/*
+	 * The board DT says whether the machine has High Power mode: then the
+	 * performance profile tells the SMC that it is on (the zETM record).
+	 * A machine with High Power mode and no low-power ceiling still gets
+	 * the platform profile, named "apple-smc" so that userspace keeps its
+	 * own low-power CPU budget.
+	 */
+	high_power = of_property_read_bool(dev->of_node, "apple,high-power-mode");
+	/*
+	 * A DTB from before the property (the ESP copy can lag the kernel)
+	 * keeps High Power mode where this table already gave it.
+	 */
+	if (!high_power && clpc->hw->high_power_machine)
+		high_power = of_machine_is_compatible(clpc->hw->high_power_machine);
+	if ((apple_clpc_has_profile_ceiling(clpc) || high_power) &&
+	    IS_REACHABLE(CONFIG_ACPI_PLATFORM_PROFILE)) {
+		/*
+		 * The SMC is optional: without it (no apple,smc phandle, or a
+		 * kernel without the SMC driver) the low-power profile has only
+		 * its ceiling and there is no High Power mode.
+		 */
+		if (IS_ENABLED(CONFIG_MFD_MACSMC)) {
+			clpc->smc_np = of_parse_phandle(dev->of_node, "apple,smc", 0);
+			if (clpc->smc_np) {
+				ret = devm_add_action_or_reset(dev, apple_clpc_put_smc_np, clpc);
+				if (ret)
+					return ret;
 			}
 		}
-		if (!clpc->ane_cluster_khz)
-			dev_dbg(dev, "no ANE cluster floor (cpu-map cluster%u)\n",
-				clpc->hw->ane_cluster);
+		clpc->high_power = clpc->smc_np && high_power;
 	}
-	/* The property is optional: without it, CPU demand alone sets the floors. */
-	if (clpc->hw->gpu_demand)
-		gpu = of_parse_phandle(dev->of_node, "apple,gpu-power-state", 0);
-	if (gpu) {
-		ret = of_property_read_u32(gpu, "reg", &clpc->gpu_offset);
-		clpc->gpu_pmgr = syscon_node_to_regmap(gpu->parent);
-		of_node_put(gpu);
+	/* High Power mode alone needs the SMC; without it there is no profile. */
+	has_profile = (apple_clpc_has_profile_ceiling(clpc) || clpc->high_power) &&
+		      IS_REACHABLE(CONFIG_ACPI_PLATFORM_PROFILE);
+	if (!clpc->has_pmc && !has_profile)
+		return dev_err_probe(dev, -ENODEV,
+				     "parent is not a PMC and no platform profile is available\n");
+
+	if (clpc->has_pmc) {
+		/* T6040 firmware keeps GFX powered for its whole lifetime. A separate
+		 * host publication/idle input, not that supplier state, drives demand;
+		 * the T8132 and M5 (T8142) GPU drivers report through the same input.
+		 * On T8140 the same input counts submissions for dense light work.
+		 */
+		if (clpc->hw->gpu_input || clpc->hw->gpu_dense) {
+			clpc->gpu = kzalloc_obj(*clpc->gpu);
+			if (!clpc->gpu)
+				return -ENOMEM;
+			kref_init(&clpc->gpu->ref);
+			spin_lock_init(&clpc->gpu->lock);
+			ret = devm_add_action_or_reset(dev, apple_clpc_gpu_owner_put, clpc->gpu);
+			if (ret)
+				return ret;
+		}
+		if (clpc->hw->ane[APPLE_CLPC_DCS] || clpc->hw->ane[APPLE_CLPC_SOC]) {
+			clpc->ane = kzalloc_obj(*clpc->ane);
+			if (!clpc->ane)
+				return -ENOMEM;
+			kref_init(&clpc->ane->ref);
+			spin_lock_init(&clpc->ane->lock);
+			ret = devm_add_action_or_reset(dev, apple_clpc_ane_owner_put, clpc->ane);
+			if (ret)
+				return ret;
+			for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
+				clpc->ane_states[rail] = clpc->hw->ane[rail];
+		}
+		if (clpc->ane && clpc->hw->ane_cluster_khz &&
+		    of_machine_is_compatible(clpc->hw->ane_cluster_machine)) {
+			clpc->ane_cpu = apple_clpc_cluster_cpu(clpc->hw->ane_cluster);
+			if (clpc->ane_cpu >= 0) {
+				clpc->policy_nb.notifier_call = apple_clpc_policy_notify;
+				if (!cpufreq_register_notifier(&clpc->policy_nb,
+							       CPUFREQ_POLICY_NOTIFIER)) {
+					clpc->policy_nb_added = true;
+					clpc->ane_cluster_khz = clpc->hw->ane_cluster_khz;
+				}
+			}
+			if (!clpc->ane_cluster_khz)
+				dev_dbg(dev, "no ANE cluster floor (cpu-map cluster%u)\n",
+					clpc->hw->ane_cluster);
+		}
+		/* The property is optional: without it, CPU demand alone sets the floors. */
+		if (clpc->hw->gpu_demand)
+			gpu = of_parse_phandle(dev->of_node, "apple,gpu-power-state", 0);
+		if (gpu) {
+			ret = of_property_read_u32(gpu, "reg", &clpc->gpu_offset);
+			clpc->gpu_pmgr = syscon_node_to_regmap(gpu->parent);
+			of_node_put(gpu);
+			if (ret)
+				return dev_err_probe(dev, ret, "graphics power state has no reg\n");
+			if (IS_ERR(clpc->gpu_pmgr))
+				return dev_err_probe(dev, PTR_ERR(clpc->gpu_pmgr),
+						     "no regmap for the graphics power state\n");
+		}
+
+		ret = of_property_read_u32(dev->of_node, "reg", &clpc->agent);
 		if (ret)
-			return dev_err_probe(dev, ret, "graphics power state has no reg\n");
-		if (IS_ERR(clpc->gpu_pmgr))
-			return dev_err_probe(dev, PTR_ERR(clpc->gpu_pmgr),
-					     "no regmap for the graphics power state\n");
+			return dev_err_probe(dev, ret, "missing voter agent\n");
+
+		for (rail = 0; rail < APPLE_CLPC_RAILS; rail++) {
+			if (clpc->hw->rail[rail] >= apple_pmc_rail_count(clpc->pmc))
+				return -EINVAL;
+			clpc->mask |= APPLE_PMC_RAIL_MASK(clpc->hw->rail[rail]);
+		}
+
+		clpc->idle = devm_kcalloc(dev, nr_cpu_ids, sizeof(*clpc->idle),
+					  GFP_KERNEL);
+		clpc->wall = devm_kcalloc(dev, nr_cpu_ids, sizeof(*clpc->wall),
+					  GFP_KERNEL);
+		if (!clpc->idle || !clpc->wall)
+			return -ENOMEM;
+
+		for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
+			if (!apple_pmc_voter_enabled(clpc->pmc, clpc->agent,
+						     clpc->hw->rail[rail]))
+				dev_warn(dev, "voter agent %u is not enabled on rail %u\n",
+					 clpc->agent, clpc->hw->rail[rail]);
+
+		clpc->saved_floor = apple_pmc_floor_read(clpc->pmc, clpc->agent) &
+				    clpc->mask;
 	}
-	if (!apple_pmc_rail_count(clpc->pmc))
-		return dev_err_probe(dev, -ENODEV, "parent is not a PMC\n");
-
-	ret = of_property_read_u32(dev->of_node, "reg", &clpc->agent);
-	if (ret)
-		return dev_err_probe(dev, ret, "missing voter agent\n");
-
-	for (rail = 0; rail < APPLE_CLPC_RAILS; rail++) {
-		if (clpc->hw->rail[rail] >= apple_pmc_rail_count(clpc->pmc))
-			return -EINVAL;
-		clpc->mask |= APPLE_PMC_RAIL_MASK(clpc->hw->rail[rail]);
-	}
-
-	clpc->idle = devm_kcalloc(dev, nr_cpu_ids, sizeof(*clpc->idle),
-				  GFP_KERNEL);
-	clpc->wall = devm_kcalloc(dev, nr_cpu_ids, sizeof(*clpc->wall),
-				  GFP_KERNEL);
-	if (!clpc->idle || !clpc->wall)
-		return -ENOMEM;
 
 	for (i = 0; i < APPLE_CLPC_MAX_CLUSTERS; i++) {
 		if (!zalloc_cpumask_var(&clpc->clusters[i].cpus, GFP_KERNEL)) {
@@ -1693,14 +1864,6 @@ static int apple_clpc_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	}
 
-	for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
-		if (!apple_pmc_voter_enabled(clpc->pmc, clpc->agent,
-					     clpc->hw->rail[rail]))
-			dev_warn(dev, "voter agent %u is not enabled on rail %u\n",
-				 clpc->agent, clpc->hw->rail[rail]);
-
-	clpc->saved_floor = apple_pmc_floor_read(clpc->pmc, clpc->agent) &
-			    clpc->mask;
 	apple_clpc_find_clusters(clpc);
 	clpc->next_scan = jiffies + HZ;
 	mutex_init(&clpc->sample_lock);
@@ -1733,45 +1896,10 @@ static int apple_clpc_probe(struct platform_device *pdev)
 
 	clpc->profile = PLATFORM_PROFILE_BALANCED;
 	clpc->power_next = jiffies;
-	/*
-	 * The boot loader copies the ADT's Low Power mode CPU ceiling
-	 * (pmgr/clpc cpu-low-power-frequency-max) into the node. Without it,
-	 * a SoC's own value applies where it has one.
-	 */
-	if (!of_property_read_u32(dev->of_node, "apple,low-power-frequency-max-mhz", &mhz))
-		clpc->low_power_khz = mhz * 1000;
-	else
-		clpc->low_power_khz = clpc->hw->low_power_khz;
-	/*
-	 * The board DT says whether the machine has High Power mode: then the
-	 * performance profile tells the SMC that it is on (the zETM record).
-	 * A machine with High Power mode and no low-power ceiling still gets
-	 * the platform profile, named "apple-smc" so that userspace keeps its
-	 * own low-power CPU budget.
-	 */
-	high_power = of_property_read_bool(dev->of_node, "apple,high-power-mode");
-	/*
-	 * A DTB from before the property (the ESP copy can lag the kernel)
-	 * keeps High Power mode where this table already gave it.
-	 */
-	if (!high_power && clpc->hw->high_power_machine)
-		high_power = of_machine_is_compatible(clpc->hw->high_power_machine);
-	if ((clpc->low_power_khz || high_power) && IS_REACHABLE(CONFIG_ACPI_PLATFORM_PROFILE)) {
-		/*
-		 * The SMC is optional: without it (no apple,smc phandle, or a
-		 * kernel without the SMC driver) the low-power profile has only
-		 * its ceiling and there is no High Power mode.
-		 */
-		if (IS_ENABLED(CONFIG_MFD_MACSMC))
-			clpc->smc_np = of_parse_phandle(dev->of_node, "apple,smc", 0);
-		clpc->high_power = clpc->smc_np && high_power;
-	}
-	/* High Power mode alone needs the SMC; without it there is no profile. */
-	if ((clpc->low_power_khz || clpc->high_power) &&
-	    IS_REACHABLE(CONFIG_ACPI_PLATFORM_PROFILE)) {
+	if (has_profile) {
 		struct device *ppdev;
 
-		if (clpc->low_power_khz && !clpc->policy_nb_added) {
+		if (apple_clpc_has_profile_ceiling(clpc) && !clpc->policy_nb_added) {
 			clpc->policy_nb.notifier_call = apple_clpc_policy_notify;
 			clpc->policy_nb_added = !cpufreq_register_notifier(&clpc->policy_nb,
 									   CPUFREQ_POLICY_NOTIFIER);
@@ -1780,10 +1908,15 @@ static int apple_clpc_probe(struct platform_device *pdev)
 		 * "apple-clpc" budgets the low-power profile itself; "apple-smc"
 		 * only carries High Power mode, and userspace keeps the CPU budget.
 		 */
-		ppdev = devm_platform_profile_register(dev, clpc->low_power_khz ? "apple-clpc" :
-						       "apple-smc", clpc, &apple_clpc_profile_ops);
-		if (IS_ERR(ppdev))
+		ppdev = devm_platform_profile_register(dev,
+						       apple_clpc_has_profile_ceiling(clpc) ?
+						       "apple-clpc" : "apple-smc",
+						       clpc, &apple_clpc_profile_ops);
+		if (IS_ERR(ppdev)) {
+			if (!clpc->has_pmc)
+				return PTR_ERR(ppdev);
 			dev_warn(dev, "no platform profile: %pe\n", ppdev);
+		}
 	}
 
 	mutex_lock(&apple_clpc_clients_lock);
@@ -1809,8 +1942,10 @@ static int apple_clpc_resume(struct device *dev)
 	struct apple_clpc *clpc = dev_get_drvdata(dev);
 	unsigned int cpu;
 
-	for_each_possible_cpu(cpu)
-		clpc->wall[cpu] = 0;
+	if (clpc->wall)
+		for_each_possible_cpu(cpu)
+			clpc->wall[cpu] = 0;
+	clpc->power_next = jiffies;
 	WRITE_ONCE(clpc->stopped, false);
 	apple_clpc_queue(clpc, true);
 	return 0;
@@ -2003,6 +2138,16 @@ static const struct apple_clpc_hw apple_clpc_hw_t8142 = {
 	.ane_cluster = 1,
 	.ane_cluster_khz = 4176000,
 	.ane_cluster_machine = "apple,t8142",
+};
+
+/*
+ * Standalone CLPC node without a PMC voter parent (for example T8112): no
+ * memory/fabric floor votes, and when the DT carries no explicit
+ * apple,low-power-frequency-max-mhz the low-power platform profile derives its
+ * ceiling from the fastest CPU cluster's operating points.
+ */
+static const struct apple_clpc_hw apple_clpc_hw_generic = {
+	.auto_low_power = true,
 };
 
 #if IS_BUILTIN(CONFIG_KUNIT) && !defined(MODULE)
@@ -2364,6 +2509,159 @@ static void apple_clpc_ane_wake_removal_test(struct kunit *test)
 	apple_clpc_ane_put(ane);
 }
 
+static void apple_clpc_low_power_roundup_test(struct kunit *test)
+{
+	/* M4 Pro P-cluster OPPs around the 2808 MHz ADT ceiling (J616s). */
+	struct cpufreq_frequency_table p_table[] = {
+		{ .frequency = 2592000 },
+		{ .frequency = 2868000 },
+		{ .frequency = 3132000 },
+		{ .frequency = 4512000 },
+		{ .frequency = CPUFREQ_TABLE_END },
+	};
+	struct cpufreq_frequency_table e_table[] = {
+		{ .frequency = 1020000 },
+		{ .frequency = 2592000 },
+		{ .frequency = CPUFREQ_TABLE_END },
+	};
+	struct cpufreq_policy p_pol = {
+		.freq_table = p_table,
+		.cpuinfo = { .min_freq = 2592000, .max_freq = 4512000 },
+	};
+	struct cpufreq_policy e_pol = {
+		.freq_table = e_table,
+		.cpuinfo = { .min_freq = 1020000, .max_freq = 2592000 },
+	};
+
+	/* Explicit ceiling rounds UP to the first OPP >= 2808 MHz (2868 MHz). */
+	KUNIT_EXPECT_EQ(test,
+			apple_clpc_low_power_top_khz(&p_pol, 2808000, false, 4512000),
+			2868000u);
+	/* Slower cluster below 2808 MHz stays at its max (2592 MHz). */
+	KUNIT_EXPECT_EQ(test,
+			apple_clpc_low_power_top_khz(&e_pol, 2808000, false, 4512000),
+			2592000u);
+	/* Explicit DT ceiling also overrides auto_low_power. */
+	KUNIT_EXPECT_EQ(test,
+			apple_clpc_low_power_top_khz(&p_pol, 2808000, true, 4512000),
+			2868000u);
+}
+
+static void apple_clpc_low_power_auto_test(struct kunit *test)
+{
+	/* T8112 (J473/J413) live E and P cluster operating points. */
+	struct cpufreq_frequency_table e_table[] = {
+		{ .frequency = 600000 },
+		{ .frequency = 912000 },
+		{ .frequency = 1284000 },
+		{ .frequency = 1752000 },
+		{ .frequency = 2004000 },
+		{ .frequency = 2256000 },
+		{ .frequency = 2424000 },
+		{ .frequency = CPUFREQ_TABLE_END },
+	};
+	struct cpufreq_frequency_table p_table[] = {
+		{ .frequency = 660000 },
+		{ .frequency = 924000 },
+		{ .frequency = 1188000 },
+		{ .frequency = 1452000 },
+		{ .frequency = 1704000 },
+		{ .frequency = 1968000 },
+		{ .frequency = 2208000 },
+		{ .frequency = 2400000 },
+		{ .frequency = 2568000 },
+		{ .frequency = 2724000 },
+		{ .frequency = 2868000 },
+		{ .frequency = 2988000 },
+		{ .frequency = 3096000 },
+		{ .frequency = 3204000 },
+		{ .frequency = CPUFREQ_TABLE_END },
+	};
+	struct cpufreq_frequency_table single_table[] = {
+		{ .frequency = 3000000 },
+		{ .frequency = CPUFREQ_TABLE_END },
+	};
+	struct cpufreq_policy e_pol = {
+		.freq_table = e_table,
+		.cpuinfo = { .min_freq = 600000, .max_freq = 2424000 },
+	};
+	struct cpufreq_policy p_pol = {
+		.freq_table = p_table,
+		.cpuinfo = { .min_freq = 660000, .max_freq = 3204000 },
+	};
+	struct cpufreq_policy single_pol = {
+		.freq_table = single_table,
+		.cpuinfo = { .min_freq = 3000000, .max_freq = 3000000 },
+	};
+	struct cpufreq_policy no_table_pol = {
+		.freq_table = NULL,
+		.cpuinfo = { .min_freq = 660000, .max_freq = 3204000 },
+	};
+
+	/* 64% of 3204 MHz = 2050.56 MHz -> highest OPP <= target is 1968 MHz. */
+	KUNIT_EXPECT_EQ(test,
+			apple_clpc_low_power_top_khz(&p_pol, 0, true, 3204000),
+			1968000u);
+	/* Slower E-cluster (2424 < 3204 MHz) stays uncapped. */
+	KUNIT_EXPECT_EQ(test,
+			apple_clpc_low_power_top_khz(&e_pol, 0, true, 3204000),
+			2424000u);
+	/* Without auto_low_power or low_power_khz, no cap applies. */
+	KUNIT_EXPECT_EQ(test,
+			apple_clpc_low_power_top_khz(&p_pol, 0, false, 3204000),
+			3204000u);
+	/* All OPPs above 64% target: fall back safely to policy min_freq. */
+	KUNIT_EXPECT_EQ(test,
+			apple_clpc_low_power_top_khz(&single_pol, 0, true, 3000000),
+			3000000u);
+	/* NULL freq_table must not dereference NULL; falls back to min_freq. */
+	KUNIT_EXPECT_EQ(test,
+			apple_clpc_low_power_top_khz(&no_table_pol, 0, true, 3204000),
+			660000u);
+}
+
+static void apple_clpc_profile_ops_test(struct kunit *test)
+{
+	struct apple_clpc *clpc = kunit_kzalloc(test, sizeof(*clpc), GFP_KERNEL);
+	struct device dev = {};
+	unsigned long choices = 0;
+	enum platform_profile_option prof = PLATFORM_PROFILE_BALANCED;
+
+	KUNIT_ASSERT_NOT_NULL(test, clpc);
+	mutex_init(&clpc->sample_lock);
+	clpc->hw = &apple_clpc_hw_generic;
+	clpc->auto_low_power = true;
+	clpc->has_pmc = false;
+	clpc->stopped = true;
+	clpc->profile = PLATFORM_PROFILE_BALANCED;
+	dev_set_drvdata(&dev, clpc);
+
+	KUNIT_EXPECT_TRUE(test, apple_clpc_hw_generic.auto_low_power);
+	KUNIT_EXPECT_FALSE(test, apple_clpc_hw_t6040.auto_low_power);
+	KUNIT_EXPECT_FALSE(test, apple_clpc_hw_t8132.auto_low_power);
+	KUNIT_EXPECT_TRUE(test, apple_clpc_has_profile_ceiling(clpc));
+
+	KUNIT_EXPECT_EQ(test, apple_clpc_profile_probe(clpc, &choices), 0);
+	KUNIT_EXPECT_TRUE(test, test_bit(PLATFORM_PROFILE_LOW_POWER, &choices));
+	KUNIT_EXPECT_TRUE(test, test_bit(PLATFORM_PROFILE_BALANCED, &choices));
+	KUNIT_EXPECT_TRUE(test, test_bit(PLATFORM_PROFILE_PERFORMANCE, &choices));
+
+	KUNIT_EXPECT_EQ(test, apple_clpc_profile_set(&dev, PLATFORM_PROFILE_LOW_POWER), 0);
+	KUNIT_EXPECT_EQ(test, apple_clpc_profile_get(&dev, &prof), 0);
+	KUNIT_EXPECT_EQ(test, prof, PLATFORM_PROFILE_LOW_POWER);
+	KUNIT_EXPECT_TRUE(test, clpc->low_power);
+
+	KUNIT_EXPECT_EQ(test, apple_clpc_profile_set(&dev, PLATFORM_PROFILE_PERFORMANCE), 0);
+	KUNIT_EXPECT_EQ(test, apple_clpc_profile_get(&dev, &prof), 0);
+	KUNIT_EXPECT_EQ(test, prof, PLATFORM_PROFILE_PERFORMANCE);
+	KUNIT_EXPECT_FALSE(test, clpc->low_power);
+
+	KUNIT_EXPECT_EQ(test, apple_clpc_profile_set(&dev, PLATFORM_PROFILE_BALANCED), 0);
+	KUNIT_EXPECT_EQ(test, apple_clpc_profile_get(&dev, &prof), 0);
+	KUNIT_EXPECT_EQ(test, prof, PLATFORM_PROFILE_BALANCED);
+	KUNIT_EXPECT_FALSE(test, clpc->low_power);
+}
+
 static struct kunit_case apple_clpc_cases[] = {
 	KUNIT_CASE(apple_clpc_ane_demand_hold_test),
 	KUNIT_CASE(apple_clpc_ane_states_test),
@@ -2376,6 +2674,9 @@ static struct kunit_case apple_clpc_cases[] = {
 	KUNIT_CASE(apple_clpc_gpu_cold_wake_test),
 	KUNIT_CASE(apple_clpc_gpu_request_lifetime_test),
 	KUNIT_CASE(apple_clpc_gpu_provider_removal_test),
+	KUNIT_CASE(apple_clpc_low_power_roundup_test),
+	KUNIT_CASE(apple_clpc_low_power_auto_test),
+	KUNIT_CASE(apple_clpc_profile_ops_test),
 	{}
 };
 static struct kunit_suite apple_clpc_suite = {
@@ -2463,6 +2764,7 @@ static const struct of_device_id apple_clpc_of_match[] = {
 	{ .compatible = "apple,t8152-clpc", .data = &apple_clpc_hw_t8152 },
 	{ .compatible = "apple,t6041-max-clpc", .data = &apple_clpc_hw_t6041 },
 	{ .compatible = "apple,t6041-clpc", .data = &apple_clpc_hw_t6040 },
+	{ .compatible = "apple,clpc", .data = &apple_clpc_hw_generic },
 	{}
 };
 MODULE_DEVICE_TABLE(of, apple_clpc_of_match);

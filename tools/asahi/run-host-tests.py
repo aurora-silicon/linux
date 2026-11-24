@@ -89,6 +89,7 @@ ASAHI_TESTS = {
 
 
     'm3-packet-completion-tests.py': [(out(), PASS), (out() + ['--mutate'], KILL)],
+    'm3-recovery-tests.py': [(out(), PASS), (out() + ['--mutate'], KILL)],
     'm3-stamp-admission-tests.py': [(out(), PASS),
                                      (out() + ['--mutation', 'live-reseed'], KILL)],
     'hardware-defaults-tests.py': [([], PASS)],
@@ -182,6 +183,8 @@ ASAHI_TESTS = {
                                    'missing-control-firmware', 'missing-control-descriptor',
                                    'missing-owner-ipc', 'missing-owner-firmware',
                                    'missing-owner-descriptor', 'missing-owner-arena'), out()),
+    # A DP audio PCM open reads a replaced service's successor; a gone service opens unplugged.
+    'dcpaud-open-fallback-tests.py': [([], PASS)] + mutations('--mutation', ('no-retry', 'wait-any', 'gone-fails', 'keep-cookie', 'mask-all'), []),
     # a7638d51880c, the parent of the fix, ran pm_runtime_force_suspend in the late
     # slot, so the dp-audio domain dropped under a running DCP.
     'dcpaud-sleep-hold-tests.py': [(out(), PASS)]
@@ -301,7 +304,7 @@ ASAHI_TESTS = {
     'pmu-rtc-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('ack-clobber', 'arm-ack', 'offset-seconds',
                                    'offset-sign', 'event-bit', 'wrong-control',
-                                   'maverick-event', 'stowe-offset', 'baku-limit',
+                                   'maverick-event', 'stowe-offset', 'reg-base', 'baku-limit',
                                    'set-no-round', 'set-negative'), out()),
     'perf-mmap-alias-lifecycle-tests.py': [([], PASS)],
     'qspi-nvram-tests.py': [(out('--output'), PASS)],
