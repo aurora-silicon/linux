@@ -135,6 +135,23 @@ struct dcp_color_mode {
 	u8 depth;
 };
 
+#define DCP_COLOR_FLAG_UNSAFE	(1U << 0)
+#define DCP_COLOR_FLAG_DSC	(1U << 1)
+#define DCP_MAX_COLOR_ENTRIES	64
+
+/* Compact colour element retained per timing, sorted by descending score. */
+struct dcp_color_entry {
+	u32 id;
+	u8 eotf : 3;
+	u8 format : 4;
+	u8 range : 1;
+	u8 colorimetry : 5;
+	u8 flags : 2;
+	u8 reserved : 1;
+	u8 depth;
+	u8 pad;
+};
+
 /*
  * Represents a single display mode. These mode objects are populated at
  * runtime based on the TimingElements dictionary sent by the DCP.
@@ -184,6 +201,9 @@ struct dcp_display_mode {
 	/* Immutable receipt provenance; never retag a cached exception. */
 	struct dcp_metadata_ticket unsafe_rgb8_ticket;
 	u64 unsafe_rgb8_service_epoch;
+	/* Real colour elements reported for this timing, descending by score. */
+	struct dcp_color_entry colors[DCP_MAX_COLOR_ENTRIES];
+	u8 nr_colors;
 };
 
 struct dimension {

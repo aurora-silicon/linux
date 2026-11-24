@@ -586,13 +586,68 @@ static unsigned int pq_mode_rank(const struct color_mode *cmode)
 	if (cmode->pixel_encoding == DCP_COLOR_FORMAT_RGB &&
 	    cmode->colorimetry == DCP_COLORIMETRY_BT2020_RGB &&
 	    cmode->dynamic_range == DCP_COLOR_YCBCR_RANGE_FULL)
-		rank = 3;
+		rank = 7;
 	else if (cmode->pixel_encoding == DCP_COLOR_FORMAT_YCBCR444 &&
+		 cmode->colorimetry == DCP_COLORIMETRY_BT2020_YCC)
+		rank = 5;
+	else if ((cmode->pixel_encoding == DCP_COLOR_FORMAT_YCBCR422 ||
+		  cmode->pixel_encoding == DCP_COLOR_FORMAT_YCBCR422_DP ||
+		  cmode->pixel_encoding == DCP_COLOR_FORMAT_YCBCR422_HDMI) &&
+		 cmode->colorimetry == DCP_COLORIMETRY_BT2020_YCC)
+		rank = 3;
+	else if (cmode->pixel_encoding == DCP_COLOR_FORMAT_YCBCR420 &&
 		 cmode->colorimetry == DCP_COLORIMETRY_BT2020_YCC)
 		rank = 1;
 	else
 		return 0;
 	return rank + (cmode->depth == 10);
+}
+
+static void record_color_entry(struct dcp_display_mode *out,
+			       s64 scores[DCP_MAX_COLOR_ENTRIES],
+			       const struct color_mode *cmode,
+			       const struct timing_color_restrictions *limits,
+			       bool limits_known)
+{
+	struct dcp_color_entry entry = {};
+	unsigned int pos, end;
+
+	if (cmode->colorimetry < 0 || cmode->colorimetry >= DCP_COLORIMETRY_COUNT ||
+	    cmode->depth < 8 || cmode->depth > 12 ||
+	    cmode->dynamic_range < 0 || cmode->dynamic_range >= DCP_COLOR_YCBCR_RANGE_COUNT ||
+	    cmode->eotf < 0 || cmode->eotf >= DCP_EOTF_COUNT ||
+	    cmode->pixel_encoding < 0 || cmode->pixel_encoding >= DCP_COLOR_FORMAT_COUNT)
+		return;
+
+	entry.id = cmode->id;
+	entry.eotf = cmode->eotf;
+	entry.format = cmode->pixel_encoding;
+	entry.range = cmode->dynamic_range;
+	entry.colorimetry = cmode->colorimetry;
+	entry.depth = cmode->depth;
+	if (limits_known) {
+		if (timing_color_contains(&limits->unsafe, cmode->id))
+			entry.flags |= DCP_COLOR_FLAG_UNSAFE;
+		if (timing_color_contains(&limits->dsc_required, cmode->id))
+			entry.flags |= DCP_COLOR_FLAG_DSC;
+	}
+
+	pos = out->nr_colors;
+	while (pos > 0 && scores[pos - 1] < cmode->score)
+		pos--;
+	if (pos >= DCP_MAX_COLOR_ENTRIES)
+		return;
+	end = out->nr_colors < DCP_MAX_COLOR_ENTRIES ? out->nr_colors : DCP_MAX_COLOR_ENTRIES - 1;
+	if (end > pos) {
+		memmove(&out->colors[pos + 1], &out->colors[pos],
+			(end - pos) * sizeof(out->colors[0]));
+		memmove(&scores[pos + 1], &scores[pos],
+			(end - pos) * sizeof(scores[0]));
+	}
+	out->colors[pos] = entry;
+	scores[pos] = cmode->score;
+	if (out->nr_colors < DCP_MAX_COLOR_ENTRIES)
+		out->nr_colors++;
 }
 
 /*
@@ -627,6 +682,7 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 {
 	struct iterator outer_it;
 	struct dcp_color_mode bootstrap = { .score = -1 };
+	s64 color_scores[DCP_MAX_COLOR_ENTRIES];
 	unsigned int best_sdr_rank = 0, best_unsafe_rank = 0, best_pq_rank = 0;
 	unsigned int best_rgb_rank = 0;
 	int ret = 0;
@@ -635,6 +691,7 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 	out->sdr.score = -1;
 	out->best.score = -1;
 	out->pq.score = -1;
+	out->nr_colors = 0;
 	out->sdr_usable = false;
 	out->sdr_unsafe = false;
 	out->has_bootstrap = false;
@@ -719,6 +776,7 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 				       cmode.depth, cmode.colorimetry,
 				       cmode.eotf, cmode.dynamic_range,
 				       cmode.pixel_encoding);
+		record_color_entry(out, color_scores, &cmode, limits, limits_known);
 
 		if (limits_known)
 			collect_pq_mode(&out->pq, &best_pq_rank, &cmode, limits,

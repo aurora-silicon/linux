@@ -3917,6 +3917,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	struct dcp_display_mode selected, *mode = &selected;
 	struct dcp_modeset_cookie *modeset;
 	struct dcp_wait_cookie *cookie;
+	struct dcp_color_mode selected_color = { .score = -1 };
 	struct dcp_color_mode *cmode = NULL;
 	int ret;
 
@@ -3932,24 +3933,26 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 		return -EIO;
 	}
 
-	/* An HDR commit scans out through the timing's PQ element. */
-	if (dcp->pq_requested && mode->pq.score >= 0)
+	if (!dcp_select_color_mode(mode, &dcp->color_req, &selected_color)) {
+		mode->color_mode_id = selected_color.id;
+		cmode = &selected_color;
+	} else if (dcp->pq_requested && mode->pq.score >= 0) {
 		mode->color_mode_id = mode->pq.id;
+		cmode = &mode->pq;
+	} else if (mode->color_mode_id == mode->sdr_rgb.id) {
+		cmode = &mode->sdr_rgb;
+	} else if (mode->color_mode_id == mode->sdr_444.id) {
+		cmode = &mode->sdr_444;
+	} else if (mode->color_mode_id == mode->sdr.id) {
+		cmode = &mode->sdr;
+	} else if (mode->color_mode_id == mode->best.id) {
+		cmode = &mode->best;
+	}
 
 	dev_dbg(dcp->dev,
 		"set_digital_out_mode(color:%d timing:%d) " DRM_MODE_FMT "\n",
 		mode->color_mode_id, mode->timing_mode_id,
 		DRM_MODE_ARG(&crtc_state->mode));
-	if (mode->color_mode_id == mode->pq.id && mode->pq.score >= 0)
-		cmode = &mode->pq;
-	else if (mode->color_mode_id == mode->sdr_rgb.id)
-		cmode = &mode->sdr_rgb;
-	else if (mode->color_mode_id == mode->sdr_444.id)
-		cmode = &mode->sdr_444;
-	else if (mode->color_mode_id == mode->sdr.id)
-		cmode = &mode->sdr;
-	else if (mode->color_mode_id == mode->best.id)
-		cmode = &mode->best;
 	if (cmode)
 		dev_dbg(dcp->dev,
 			"color mode depth:%hhu format:%u colorimetry:%u eotf:%u range:%u vrr:%u\n",
@@ -3960,7 +3963,12 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 		.color_mode_id = mode->color_mode_id,
 		.timing_mode_id = mode->timing_mode_id
 	};
-	dcp->output_pq = dcp->pq_requested && mode->pq.score >= 0;
+	if (cmode)
+		dcp->active_color = *cmode;
+	else
+		dcp->active_color.score = -1;
+	dcp->output_pq = cmode && cmode->eotf == DCP_EOTF_ST_2084;
+	dcp->output_hdr = cmode && cmode->eotf != DCP_EOTF_SDR_GAMMA;
 
 	/* VRR modes need swap timestamps, see iomfb_flush(); so do fixed internal timings. */
 	dcp->use_timestamps = mode->needs_timestamps;
@@ -4178,6 +4186,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 {
 	struct dcp_display_mode selected, *mode = &selected;
 	struct dcp_wait_cookie *cookie;
+	struct dcp_color_mode selected_color = { .score = -1 };
 	struct dcp_color_mode *cmode = NULL;
 	bool paired = false;
 	bool keep_mode = false;
@@ -4219,9 +4228,21 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 		return -EIO;
 	}
 
-	/* An HDR commit scans out through the timing's PQ element. */
-	if (dcp->pq_requested && mode->pq.score >= 0)
+	if (!dcp_select_color_mode(mode, &dcp->color_req, &selected_color)) {
+		mode->color_mode_id = selected_color.id;
+		cmode = &selected_color;
+	} else if (dcp->pq_requested && mode->pq.score >= 0) {
 		mode->color_mode_id = mode->pq.id;
+		cmode = &mode->pq;
+	} else if (mode->color_mode_id == mode->sdr_rgb.id) {
+		cmode = &mode->sdr_rgb;
+	} else if (mode->color_mode_id == mode->sdr_444.id) {
+		cmode = &mode->sdr_444;
+	} else if (mode->color_mode_id == mode->sdr.id) {
+		cmode = &mode->sdr;
+	} else if (mode->color_mode_id == mode->best.id) {
+		cmode = &mode->best;
+	}
 
 	/* The connection's audio link runs through the mode set. */
 	av_audio_before_modeset(dcp);
@@ -4230,16 +4251,6 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 		 "set_digital_out_mode(color:%d timing:%d) " DRM_MODE_FMT "\n",
 		 mode->color_mode_id, mode->timing_mode_id,
 		 DRM_MODE_ARG(&crtc_state->mode));
-	if (mode->color_mode_id == mode->pq.id && mode->pq.score >= 0)
-		cmode = &mode->pq;
-	else if (mode->color_mode_id == mode->sdr_rgb.id)
-		cmode = &mode->sdr_rgb;
-	else if (mode->color_mode_id == mode->sdr_444.id)
-		cmode = &mode->sdr_444;
-	else if (mode->color_mode_id == mode->sdr.id)
-		cmode = &mode->sdr;
-	else if (mode->color_mode_id == mode->best.id)
-		cmode = &mode->best;
 	if (dcp_is_ext26(dcp)) {
 		if (mode->sdr_rgb.score < 0 || mode->sdr_rgb.depth != 8 ||
 		    mode->sdr_rgb.format != DCP_COLOR_FORMAT_RGB || crtc_state->vrr_enabled)
@@ -4269,7 +4280,12 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 		.color_mode_id = mode->color_mode_id,
 		.timing_mode_id = mode->timing_mode_id
 	};
-	dcp->output_pq = dcp->pq_requested && mode->pq.score >= 0;
+	if (cmode)
+		dcp->active_color = *cmode;
+	else
+		dcp->active_color.score = -1;
+	dcp->output_pq = cmode && cmode->eotf == DCP_EOTF_ST_2084;
+	dcp->output_hdr = cmode && cmode->eotf != DCP_EOTF_SDR_GAMMA;
 
 	/* Built-in ProMotion panels require timestamps even in fixed-120 mode. */
 	dcp->use_timestamps = mode->needs_timestamps && dcp->main_display;
@@ -4398,7 +4414,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	/* A firmware 27 pair took them on both engines (dcp_peer_finish_v27()). */
 	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL ||
 	    (dcp->fw_compat == DCP_FIRMWARE_V_27_0 && !dcp_has_panel(dcp) && !paired))
-		dcp_external_hdr_hints(dcp, dcp->output_pq);
+		dcp_external_hdr_hints(dcp, dcp->output_hdr);
 	dcp_link_report(dcp, &crtc_state->mode);
 
 	return 0;
@@ -4531,14 +4547,39 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 			req->surf[l].base.colorspace = DCP_COLORSPACE_P3_D65;
 
 		/*
-		 * On a PQ output the compositor has already encoded RGB
-		 * surfaces for the sink: BT.2020 primaries, PQ code values.
-		 * An EDR panel takes the same and maps them into its headroom.
+		 * On an HDR output the compositor has already encoded RGB
+		 * surfaces for the sink: BT.2020 primaries, PQ or HLG code
+		 * values.  An EDR panel takes PQ and maps it into its headroom.
+		 * Wide-gamut SDR outputs tag RGB surfaces with their target
+		 * primaries so DCP passes them through without sRGB gamut
+		 * remapping.
 		 */
-		if ((dcp->output_pq || dcp->output_edr) &&
-		    !new_state->fb->format->is_yuv) {
-			req->surf[l].base.colorspace = DCP_COLORSPACE_BT2020;
-			req->surf[l].base.xfer_func = DCP_XFER_FUNC_PQ;
+		if (!new_state->fb->format->is_yuv) {
+			if (dcp->output_pq || dcp->output_edr) {
+				req->surf[l].base.colorspace = DCP_COLORSPACE_BT2020;
+				req->surf[l].base.xfer_func = DCP_XFER_FUNC_PQ;
+			} else if (dcp->output_hdr &&
+				   dcp->active_color.eotf == DCP_EOTF_BT_2100) {
+				req->surf[l].base.colorspace = DCP_COLORSPACE_BT2020;
+				req->surf[l].base.xfer_func = DCP_XFER_FUNC_HLG;
+			} else if (!dcp_has_panel(dcp) &&
+				   dcp->active_color.score >= 0) {
+				switch (dcp->active_color.colorimetry) {
+				case DCP_COLORIMETRY_BT2020_RGB:
+				case DCP_COLORIMETRY_BT2020_YCC:
+				case DCP_COLORIMETRY_BT2020_CYCC:
+					req->surf[l].base.colorspace = DCP_COLORSPACE_BT2020;
+					break;
+				case DCP_COLORIMETRY_DCI_P3_RGB_D65:
+					req->surf[l].base.colorspace = DCP_COLORSPACE_P3_D65;
+					break;
+				case DCP_COLORIMETRY_DCI_P3_RGB_THEATER:
+					req->surf[l].base.colorspace = DCP_COLORSPACE_DCI_P3;
+					break;
+				default:
+					break;
+				}
+			}
 		}
 
 #if DCP_FW_H17(DCP_FW_VER)

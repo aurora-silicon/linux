@@ -28,6 +28,7 @@
 #include "dptxep.h"
 #include "dcp_backlight.h"
 #include "dcp-announce.h"
+#include "dcp-color.h"
 #include "dcp-display-metadata.h"
 #include "dcp-metadata-epoch.h"
 #include "dcp-180hz.h"
@@ -826,11 +827,15 @@ struct apple_dcp {
 	bool iomfb_template_pq;
 	/*
 	 * The mode set asks for a PQ signal; output_pq: the one set carries it;
-	 * output_edr: a panel shows the PQ content as EDR, edr_sent: swaps
-	 * still carry EDR state the firmware must be told to drop.
+	 * output_hdr: any non-SDR EOTF (PQ/HLG/HDR-gamma); output_edr: a panel
+	 * shows the PQ content as EDR, edr_sent: swaps still carry EDR state
+	 * the firmware must be told to drop.
 	 */
+	struct dcp_color_request color_req;
+	struct dcp_color_mode active_color;
 	bool pq_requested;
 	bool output_pq;
+	bool output_hdr;
 	bool output_edr;
 	bool edr_sent;
 	/*

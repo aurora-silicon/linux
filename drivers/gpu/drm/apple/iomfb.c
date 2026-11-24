@@ -3419,7 +3419,7 @@ static void dcp_hdr_metadata_sync(struct apple_dcp *dcp, struct drm_crtc *crtc,
 	bool same;
 	int transport, ret;
 
-	if (!dcp->output_pq || READ_ONCE(dcp->crashed) ||
+	if (!dcp->output_hdr || READ_ONCE(dcp->crashed) ||
 	    !dcp_hdr_metadata_live(to_apple_crtc(crtc)->dcp))
 		return;
 	conn_state = dcp_crtc_connector_state(dcp, crtc, commit);
@@ -3427,7 +3427,7 @@ static void dcp_hdr_metadata_sync(struct apple_dcp *dcp, struct drm_crtc *crtc,
 	    conn_state->hdr_output_metadata->length != sizeof(struct hdr_output_metadata))
 		return;
 	if (((const struct hdr_output_metadata *)conn_state->hdr_output_metadata->data)
-		    ->hdmi_metadata_type1.eotf != HDMI_EOTF_SMPTE_ST2084 ||
+		    ->hdmi_metadata_type1.eotf == HDMI_EOTF_TRADITIONAL_GAMMA_SDR ||
 	    dcp_hdr_data(data, conn_state->hdr_output_metadata->data))
 		return;
 
@@ -3463,29 +3463,57 @@ static void dcp_hdr_metadata_sync(struct apple_dcp *dcp, struct drm_crtc *crtc,
 	afk_service_put(service);
 }
 
-/* Only an SDR or a PQ signal, and PQ only where the timing has an element. */
+static void dcp_crtc_color_request(struct apple_dcp *dcp, struct drm_crtc *crtc,
+				   struct drm_atomic_commit *commit,
+				   struct dcp_color_request *req)
+{
+	const struct drm_connector_state *conn_state =
+		dcp_crtc_connector_state(dcp, crtc, commit);
+
+	*req = (struct dcp_color_request) {
+		.eotf = dcp_crtc_eotf(dcp, crtc, commit),
+		.colorspace = conn_state ? conn_state->colorspace :
+					   DRM_MODE_COLORIMETRY_DEFAULT,
+		.color_format = conn_state ? conn_state->color_format :
+					     DRM_CONNECTOR_COLOR_FORMAT_AUTO,
+		.broadcast_rgb = conn_state ? conn_state->hdmi.broadcast_rgb :
+					      DRM_HDMI_BROADCAST_RGB_AUTO,
+		.max_bpc = conn_state ? conn_state->max_requested_bpc : 0,
+		.allow_hdr = dcp_hdr_output_supported(dcp),
+		.allow_dsc = READ_ONCE(dcp->iomfb_template_pq) && !dcp_has_panel(dcp),
+		.allow_unsafe_sdr = dcp->hw.iomfb_method_profile !=
+				    DCP_IOMFB_METHODS_H17P_EXTERNAL,
+		.default_rgb = dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+			       !dcp_has_panel(dcp),
+	};
+}
+
+/* Validate requested EOTF, colorspace, format, range and bpc against the timing. */
 int dcp_crtc_check_hdr(struct apple_dcp *dcp, struct drm_crtc *crtc,
 		       struct drm_atomic_commit *commit)
 {
 	struct drm_crtc_state *crtc_state = drm_atomic_get_new_crtc_state(commit, crtc);
+	struct dcp_color_request req;
+	struct dcp_color_mode selected;
 	struct dcp_display_mode mode;
 
 	if (!crtc_state || !crtc_state->enable ||
 	    !drm_atomic_crtc_needs_modeset(crtc_state))
 		return 0;
-	switch (dcp_crtc_eotf(dcp, crtc, commit)) {
-	case HDMI_EOTF_TRADITIONAL_GAMMA_SDR:
-		return 0;
-	case HDMI_EOTF_SMPTE_ST2084:
-		if (dcp_panel_edr_supported(dcp))
+	dcp_crtc_color_request(dcp, crtc, commit, &req);
+	if (dcp_panel_edr_supported(dcp)) {
+		if (req.eotf == HDMI_EOTF_TRADITIONAL_GAMMA_SDR ||
+		    req.eotf == HDMI_EOTF_SMPTE_ST2084)
 			return 0;
-		if (dcp_hdr_output_supported(dcp) &&
-		    lookup_mode(dcp, &crtc_state->mode, &mode) && mode.pq.score >= 0)
-			return 0;
-		fallthrough;
-	default:
 		return -EINVAL;
 	}
+	if (dcp_color_request_is_default(&req) &&
+	    req.eotf == HDMI_EOTF_TRADITIONAL_GAMMA_SDR &&
+	    req.colorspace == DRM_MODE_COLORIMETRY_DEFAULT)
+		return 0;
+	if (!lookup_mode(dcp, &crtc_state->mode, &mode))
+		return -EINVAL;
+	return dcp_select_color_mode(&mode, &req, &selected);
 }
 
 /* The user may own drm_display_mode, so we need to search for our copy */
@@ -3638,11 +3666,13 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 	if (crtc_state->mode.hdisplay == 0 && crtc_state->mode.vdisplay == 0)
 		return 0;
 
-	dcp->pq_requested = dcp_crtc_eotf(dcp, crtc, commit) == HDMI_EOTF_SMPTE_ST2084;
+	dcp_crtc_color_request(dcp, crtc, commit, &dcp->color_req);
+	dcp->pq_requested = dcp->color_req.eotf == HDMI_EOTF_SMPTE_ST2084;
 	dcp->output_edr = dcp->pq_requested && dcp_panel_edr_supported(dcp) &&
 			  dcp_crtc_bt2020(dcp, crtc, commit);
 	dcp->pq_requested &= dcp_hdr_output_supported(dcp);
-	if (!dcp->pq_requested)
+	if (dcp->color_req.eotf == HDMI_EOTF_TRADITIONAL_GAMMA_SDR ||
+	    !dcp_hdr_output_supported(dcp))
 		dcp_hdr_infoframe_stop(dcp);
 	dcp_hdr_metadata_forget(dcp);
 	dcp_mode_begin(&dcp->mode_state);

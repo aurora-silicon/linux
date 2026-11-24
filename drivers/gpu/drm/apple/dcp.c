@@ -5081,6 +5081,9 @@ static void _dcp_poweroff(struct apple_dcp *dcp)
 		break;
 	}
 	/* The link set up again starts without HDR10 metadata. */
+	dcp->active_color.score = -1;
+	dcp->output_pq = false;
+	dcp->output_hdr = false;
 	dcp_hdr_metadata_forget(dcp);
 }
 
@@ -7530,6 +7533,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	spin_lock_init(&dcp->mode_state.lock);
 	spin_lock_init(&dcp->metadata.lock);
 	spin_lock_init(&dcp->hdr.lock);
+	dcp->active_color.score = -1;
 	mutex_init(&dcp->dcpavserv.lock);
 	INIT_WORK(&dcp->dcpavserv.close_wq, dcpavserv_close_work);
 	ret = dcpavserv_edid_retry_init(dcp);
