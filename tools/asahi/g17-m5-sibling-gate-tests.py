@@ -333,7 +333,10 @@ struct Entry { queue: Slot }
 struct Qids { fit: bool }
 impl Qids { fn compute_fits(&self, _: usize) -> bool { self.fit } }
 struct Admission;
-impl Admission { fn queues(&self) -> u32 { 1 } }
+impl Admission {
+    fn queues(&self) -> u32 { 1 }
+    fn render_demand(&self, extra: usize) -> usize { 1 + extra }
+}
 struct Teardown;
 impl Teardown { fn releasing(&self, _: &Arc<Context>) -> bool { false } }
 struct Registry { compute: Vec<Option<Entry>>, qids: Qids, admission: Admission, teardown: Teardown }

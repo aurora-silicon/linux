@@ -445,7 +445,7 @@ impl Registry {
         if let Some((_, qid)) = vacant {
             return Some(SiblingSource::Vacant(qid));
         }
-        if self.qids.compute_fits(self.admission.queues() as usize) {
+        if self.qids.compute_fits(self.admission.render_demand(0)) {
             return Some(SiblingSource::Fresh);
         }
         // A pool release in flight ends in a vacant queue; give back one at a time.

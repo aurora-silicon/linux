@@ -131,9 +131,9 @@ MUTATIONS = {
                             '        foreign.map(', '            .any(|queue| queue.vacancy_pending() && false)\n        {\n'
                             '            return None;\n        }\n        foreign.map(')],
     # Give another VM's pool back while a fresh QID fits.
-    'foreign-before-fresh': [('runtime', '        if self.qids.compute_fits(self.admission.queues() as usize) {\n'
+    'foreign-before-fresh': [('runtime', '        if self.qids.compute_fits(self.admission.render_demand(0)) {\n'
                               '            return Some(SiblingSource::Fresh);\n        }\n        // A pool release',
-                              '        if foreign.is_none() && self.qids.compute_fits(self.admission.queues() as usize) {\n'
+                              '        if foreign.is_none() && self.qids.compute_fits(self.admission.render_demand(0)) {\n'
                               '            return Some(SiblingSource::Fresh);\n        }\n        // A pool release')],
     # A re-armed sibling is bound as the owner's primary.
     'rearm-binds-primary': [('runtime', '        if channel_index == 0 {\n            queue.bind_owner(owner, context.clone())',
@@ -361,7 +361,10 @@ struct Entry { queue: Slot }
 struct Qids { fit: bool }
 impl Qids { fn compute_fits(&self, _: usize) -> bool { self.fit } }
 struct Admission;
-impl Admission { fn queues(&self) -> u32 { 4 } }
+impl Admission {
+    fn queues(&self) -> u32 { 4 }
+    fn render_demand(&self, extra: usize) -> usize { 4 + extra }
+}
 struct Teardown { releasing: Vec<u32> }
 impl Teardown { fn releasing(&self, context: &Arc<Context>) -> bool { self.releasing.contains(&context.id) } }
 struct Registry { compute: Vec<Option<Entry>>, qids: Qids, admission: Admission, teardown: Teardown }

@@ -414,7 +414,10 @@ impl Qids {{
 }}
 
 struct Admission {{ queues: u32 }}
-impl Admission {{ fn queues(&self) -> u32 {{ self.queues }} }}
+impl Admission {{
+    fn queues(&self) -> u32 {{ self.queues }}
+    fn render_demand(&self, extra: usize) -> usize {{ self.queues as usize + extra }}
+}}
 
 struct Teardown {{ releasing_id: Option<u32>, render_acked: bool }}
 impl Teardown {{
