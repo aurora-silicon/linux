@@ -1061,7 +1061,7 @@ impl RootV27_2 {
             let page = alloc.shared_ro.alloc_generic::<u8>(mmu::UAT_PGSZ, mmu::UAT_PGSZ, None)?;
             fw::types::GpuArray::empty(page, mmu::UAT_PGSZ)?
         };
-        let mut globals = alloc.shared_ro.array_empty::<u8>(0xe48)?;
+        let mut globals = alloc.shared_ro.array_empty::<u8>(g14_v27_2_abi::GLOBALS_BYTES)?;
         {
             let data = globals.as_mut_slice();
             for (offset, value) in [(0x58, 0xffffu16), (0x5a, 0x28), (0x5c, 0xffff)] {
@@ -1072,6 +1072,10 @@ impl RootV27_2 {
                 put32(data, at, value);
             }
             put32(data, 0x6e, 1);
+            // The firmware's progress checks and compute watchdog, as M3 and M4 27.2 set them.
+            for (at, value) in g14_v27_2_abi::GLOBALS_PROGRESS {
+                put32(data, at, value);
+            }
             crate::pgtable::clean_poc(data.as_ptr(), data.len());
         }
         let mut control = alloc.shared.array_empty::<u8>(0xe850)?;
