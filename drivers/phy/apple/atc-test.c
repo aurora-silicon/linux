@@ -1351,43 +1351,18 @@ static void atcphy_test_t8132_restore_mode(struct kunit *test)
 			   PIPEHANDLER_AON_GEN_DWC3_RESET_N);
 }
 
-static void atcphy_test_t8103_usb3_machine_scope(struct kunit *test)
+/* The handoff follows the PIPE handler generation, whatever the machine. */
+static void atcphy_test_t8103_usb3_generation_scope(struct kunit *test)
 {
-	static const struct {
-		const char *compatible;
-		bool enabled;
-	} cases[] = {
-		{ "apple,t8103", true },
-		{ "apple,t6000", false },
-		{ "apple,t6001", false },
-		{ "apple,t6002", false },
-		{ "apple,t8112", false },
-		{ "apple,t6020", false },
-		{ "apple,t6021", false },
-		{ "apple,t6022", false },
-		{ "apple,t8122", false },
-		{ "apple,t6030", false },
-		{ "apple,t6031", false },
-		{ "apple,t6034", false },
-		{ "apple,t8140", false },
-		{ "apple,t8142", false },
-	};
-	struct property compatible = { .name = "compatible" };
-	struct device_node root = { .properties = &compatible };
-
-	for (size_t i = 0; i < ARRAY_SIZE(cases); i++) {
-		compatible.value = (void *)cases[i].compatible;
-		compatible.length = strlen(cases[i].compatible) + 1;
-		/* M2 and Pro/Max PHYs select this same fallback hardware row. */
-		KUNIT_EXPECT_EQ(test, atcphy_has_t8103_usb3_workaround(&atcphy_hw_t8103, &root),
-				cases[i].enabled);
-		KUNIT_EXPECT_FALSE(test,
-			atcphy_has_t8103_usb3_workaround(&atcphy_hw_t8122, &root));
-	}
+	KUNIT_EXPECT_TRUE(test, atcphy_has_t8103_usb3_workaround(&atcphy_hw_t8103));
+	KUNIT_EXPECT_FALSE(test, atcphy_has_t8103_usb3_workaround(&atcphy_hw_t8122));
+	KUNIT_EXPECT_FALSE(test, atcphy_has_t8103_usb3_workaround(&atcphy_hw_t8132));
+	KUNIT_EXPECT_FALSE(test, atcphy_has_t8103_usb3_workaround(&atcphy_hw_t8140));
+	KUNIT_EXPECT_FALSE(test, atcphy_has_t8103_usb3_workaround(&atcphy_hw_t8142));
 }
 
 static struct kunit_case atcphy_mux_test_cases[] = {
-	KUNIT_CASE(atcphy_test_t8103_usb3_machine_scope),
+	KUNIT_CASE(atcphy_test_t8103_usb3_generation_scope),
 	KUNIT_CASE(atcphy_test_target_mode),
 	KUNIT_CASE(atcphy_test_target_mode_fixed_hub),
 	KUNIT_CASE(atcphy_test_target_mode_t8132),
