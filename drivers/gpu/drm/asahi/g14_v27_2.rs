@@ -47,6 +47,7 @@ use crate::{
 #[allow(dead_code)]
 mod recovery_logic;
 use recovery_logic::{RecoveryAction, SnapshotEntry};
+use crate::g14_v27_2_abi::{self, Stopped};
 
 /// RTKit endpoints of the GPU firmware.
 const EP_FIRMWARE: u8 = 0x20;
@@ -888,27 +889,30 @@ impl Runtime {
         packet.finish(Err(err));
     }
 
-    /// Marks the work the firmware stopped: the render pair if one is published (a render is
-    /// published alone), else the oldest unretired compute command and the rest of its packet.
-    /// Returns whether anything was published.
-    fn blame(&self, state: &mut State, error: Error, slot: i32) -> bool {
-        if let Some(flight) = state.rendering.as_mut() {
-            flight.doomed = Some(error);
-            let owner = &flight.packet.owner;
-            dev_err!(self.dev, "GPU: stopped render of {}[{}] (slot {}, {:?})\n",
-                     owner.process(), owner.pid, slot, error);
-            return true;
+    /// Marks the work the firmware's snapshot named (`g14_v27_2_abi::Attribution`): the
+    /// published render pair, or the compute command with that completion stamp and the rest of
+    /// its packet. Err(EIO) if that work is no longer tracked: the caller then fails all work.
+    fn blame(&self, state: &mut State, error: Error, slot: i32, work: Stopped) -> Result {
+        match work {
+            Stopped::Render => {
+                let Some(flight) = state.rendering.as_mut() else { return Err(EIO); };
+                flight.doomed = Some(error);
+                let owner = &flight.packet.owner;
+                dev_err!(self.dev, "GPU: stopped render of {}[{}] (slot {}, {:?})\n",
+                         owner.process(), owner.pid, slot, error);
+            }
+            Stopped::Compute(stamp) => {
+                let Some(packet) = state.inflight.iter().find(|f| f.stamp.raw() == stamp)
+                    .map(|f| f.packet.clone()) else { return Err(EIO); };
+                let owned = |f: &&mut Inflight| Arc::ptr_eq(&f.packet, &packet);
+                for flight in state.inflight.iter_mut().filter(owned) {
+                    flight.doomed.get_or_insert(error);
+                }
+                dev_err!(self.dev, "GPU: stopped compute {:#x} of {}[{}] (slot {}, {:?})\n",
+                         stamp, packet.owner.process(), packet.owner.pid, slot, error);
+            }
         }
-        let Some(packet) = state.inflight.first().map(|f| f.packet.clone()) else {
-            dev_err!(self.dev, "GPU: firmware stopped with nothing published (slot {})\n", slot);
-            return false;
-        };
-        for flight in state.inflight.iter_mut().filter(|f| Arc::ptr_eq(&f.packet, &packet)) {
-            flight.doomed = Some(error);
-        }
-        dev_err!(self.dev, "GPU: stopped compute of {}[{}] (slot {}, {:?})\n",
-                 packet.owner.process(), packet.owner.pid, slot, error);
-        true
+        Ok(())
     }
 
     /// Whether every command marked by `blame` has left its queue.
@@ -961,7 +965,7 @@ impl Runtime {
     fn recover(&self, state: &mut State, error: Error, slot: i32) -> Result {
         state.root.log_timeout(&self.dev);
         let mut rounds = 0;
-        let mut blamed = false;
+        let mut previous = None;
         loop {
             if self.wait_recovery(state, false, 0, PHASE1_WAIT_MS)?.is_none() {
                 dev_err!(self.dev, "GPU: firmware reported {:?} (slot {}) but did not enter recovery\n",
@@ -975,6 +979,16 @@ impl Runtime {
                 return Err(EIO);
             }
             let generation = state.root.halt_count()?;
+            if !g14_v27_2_abi::new_round(previous, generation) {
+                dev_err!(self.dev, "GPU: recovery generation {} repeated\n", generation);
+                return Err(EPROTO);
+            }
+            previous = Some(generation);
+            // Retired work must not be blamed: refresh the retired position first.
+            self.advance(state)?;
+            let render = state.rendering.as_ref()
+                .map(|f| [f.stamps[TILER].raw(), f.stamps[FRAGMENT].raw()]);
+            let mut attribution = g14_v27_2_abi::Attribution::default();
             let mut entries = 0;
             let mut stopped_tiler = false;
             for i in 0..gpu::RECOVERY_SNAPSHOT_ENTRIES {
@@ -982,16 +996,25 @@ impl Runtime {
                 let Some(entry) = SnapshotEntry::decode(flags, target) else { break; };
                 entries += 1;
                 stopped_tiler |= gpu::stopped_tiler(entry.flags);
+                let retired = state.retired_total;
+                let inflight = &state.inflight;
+                attribution.add(entry.flags, entry.target, render, |stamp| {
+                    inflight.iter().any(|f| f.stamp.raw() == stamp && f.ordinal > retired)
+                });
                 if entries <= 8 {
                     dev_err!(self.dev,
                              "GPU: recovery {} entry {}: flags {:#x} (event {:#x}) target {:#x}\n",
                              generation, i, entry.flags, entry.event, entry.target);
                 }
             }
-            if !blamed {
-                blamed = true;
-                self.blame(state, error, slot);
-            }
+            // Every round is attributed: work behind the first stopped command can time out in
+            // turn. Unnamed or ambiguous stopped work keeps the fail-stop.
+            let Some(work) = attribution.result() else {
+                dev_err!(self.dev, "GPU: recovery {} names no single tracked command ({} entries)\n",
+                         generation, entries);
+                return Err(EIO);
+            };
+            self.blame(state, error, slot, work)?;
             if stopped_tiler {
                 if let Some(flight) = state.rendering.as_ref() {
                     let ta_left = state.root.render_retired(TILER, flight.targets[TILER])?;

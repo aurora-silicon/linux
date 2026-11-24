@@ -89,6 +89,63 @@ pub(crate) const fn stopped_tiler(flags: u32) -> bool {
     flags & 9 == 9
 }
 
+/// The tracked work a recovery snapshot names. A snapshot entry's target is the completion
+/// stamp the stopped command would have written (J473: compute stamp 0x7900 written, entry
+/// {0x7, 0x7a00}; tiler stamp 0x2156500 written, entry {0x1f, 0x2156600}).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Stopped {
+    /// The published render pair (either of its completion stamps).
+    Render,
+    /// The published compute command with this completion stamp.
+    Compute(u32),
+}
+
+/// Attribution of one recovery round: every valid snapshot entry must name the same tracked,
+/// unretired work, else the round is ambiguous and the caller fails all work (fail-stop).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct Attribution {
+    work: Option<Stopped>,
+    ambiguous: bool,
+}
+
+impl Attribution {
+    /// Adds a valid entry. `render` holds the published render pair's completion stamps;
+    /// `compute(stamp)` says whether an unretired compute command carries that stamp.
+    pub(crate) fn add(&mut self, flags: u32, target: u32, render: Option<[u32; 2]>,
+                      compute: impl Fn(u32) -> bool) {
+        let as_render = render.is_some_and(|stamps| stamps.contains(&target));
+        // A stopped tiler can only be the render pair.
+        let as_compute = !stopped_tiler(flags) && compute(target);
+        let work = match (as_render, as_compute) {
+            (true, false) => Stopped::Render,
+            (false, true) => Stopped::Compute(target),
+            _ => {
+                self.ambiguous = true;
+                return;
+            }
+        };
+        match self.work {
+            None => self.work = Some(work),
+            Some(seen) if seen == work => {}
+            Some(_) => self.ambiguous = true,
+        }
+    }
+
+    /// The stopped work, if the round named exactly one tracked command.
+    pub(crate) fn result(self) -> Option<Stopped> {
+        if self.ambiguous { None } else { self.work }
+    }
+}
+
+/// A further recovery round while stopped work drains must carry a new generation; the same
+/// generation again means the host misread the handshake.
+pub(crate) const fn new_round(previous: Option<u64>, generation: u64) -> bool {
+    match previous {
+        None => true,
+        Some(p) => generation != p,
+    }
+}
+
 /// Event ring record kinds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum EventKind {
@@ -224,5 +281,50 @@ mod tests {
         assert!(!stopped_tiler(0x7));
         assert!(!stopped_tiler(0x8));
         assert!(stopped_tiler(0x9 | (0x70 << 4)));
+    }
+
+    #[test]
+    fn a_completed_front_entry_is_not_blamed_for_a_later_stop() {
+        // Host list: 0x7900 completed but not yet retired by the host, 0x7a00 stopped.
+        let unretired = [0x7900u32, 0x7a00, 0x7b00];
+        let mut a = Attribution::default();
+        a.add(0x7, 0x7a00, None, |s| unretired.contains(&s));
+        assert_eq!(a.result(), Some(Stopped::Compute(0x7a00)));
+    }
+
+    #[test]
+    fn render_entries_name_the_published_pair() {
+        let pair = Some([0x2156600, 0x3156600]);
+        let mut a = Attribution::default();
+        a.add(0x1f, 0x2156600, pair, |_| false);
+        a.add(0x7, 0x3156600, pair, |_| false);
+        assert_eq!(a.result(), Some(Stopped::Render));
+        // A stopped tiler that matches no published pair is not pinned on compute.
+        let mut a = Attribution::default();
+        a.add(0x1f, 0x7a00, None, |s| s == 0x7a00);
+        assert_eq!(a.result(), None);
+    }
+
+    #[test]
+    fn untracked_mixed_or_colliding_entries_fail_stop() {
+        let mut a = Attribution::default();
+        assert_eq!(a.result(), None);
+        a.add(0x7, 0x7c00, None, |s| s == 0x7a00);
+        assert_eq!(a.result(), None);
+        let mut a = Attribution::default();
+        a.add(0x7, 0x7a00, None, |s| s == 0x7a00 || s == 0x7b00);
+        a.add(0x7, 0x7b00, None, |s| s == 0x7a00 || s == 0x7b00);
+        assert_eq!(a.result(), None);
+        let mut a = Attribution::default();
+        a.add(0x7, 0x3156600, Some([0x2156600, 0x3156600]), |s| s == 0x3156600);
+        assert_eq!(a.result(), None);
+    }
+
+    #[test]
+    fn recovery_rounds_while_draining_need_a_new_generation() {
+        assert!(new_round(None, 1));
+        assert!(new_round(Some(1), 2));
+        assert!(!new_round(Some(2), 2));
+        assert!(new_round(Some(u64::MAX), 0));
     }
 }
