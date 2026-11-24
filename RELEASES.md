@@ -4,6 +4,10 @@ This repository has one long-lived branch, `main`. Every change lands there
 through a pull request, and every release is built from a commit on `main` by
 [`kernel-release.yml`](.github/workflows/kernel-release.yml).
 
+The organisation-wide rules (branch names, who may tag, the merge gate) are in
+[branching-and-releases](https://github.com/aurora-silicon/agent-guidelines/blob/main/policy/branching-and-releases.md);
+this file adds the kernel build details.
+
 ## Channels
 
 | Channel | Where | Built when | Changes? |
@@ -45,7 +49,8 @@ Stable releases are time-boxed. On the release cadence:
    (M1 Pro, M2 Air, M2 mini, M3 Air, M4 Air, M4 Pro, Neo) boots it with no new
    failures compared with the previous stable release. The gate looks for
    regressions only; missing features do not block a tag.
-2. Tag it and push the tag:
+2. An Owner tags it and pushes the tag (only Owners create `v*` tags, and
+   nobody moves or deletes one):
 
    ```sh
    git tag -a v0.2.0 -m 'Aurora v0.2.0' <sha>
@@ -53,6 +58,9 @@ Stable releases are time-boxed. On the release cadence:
    ```
 
 3. The workflow builds it and publishes the release with generated notes.
+
+Versions are `X.Y.Z`: Y goes up for a regular release, Z for a hotfix, and a
+new upstream base is at least a minor bump.
 
 Never hold a tag for unfinished work. Work that is not ready stays in its pull
 request and goes out in the next release. The workflow refuses a tag that is

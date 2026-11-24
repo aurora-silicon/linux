@@ -97,7 +97,8 @@ For kernel patches, also follow the existing
   and `hotfix/v<X.Y.Z>` a short-lived branch for a stable hotfix (see
   [RELEASES.md](RELEASES.md)).
 
-There are no long-lived release or per-platform branches.
+There are no long-lived release or per-platform branches. The full rules are in
+[branching-and-releases](https://github.com/aurora-silicon/agent-guidelines/blob/main/policy/branching-and-releases.md).
 
 `main` takes changes only through pull requests: no direct pushes, no force
 pushes and no deletion. Merged branches are deleted automatically, so start
