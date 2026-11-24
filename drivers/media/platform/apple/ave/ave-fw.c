@@ -40,6 +40,7 @@ static const u32 ave_known_text_crc[] = {
 	0x69c54454, /* encoder firmware 9003.78.0 (macOS 26.0.x) */
 	AVE_FW_TEXT_CRC_T6040_25G83, /* encoder firmware 9003.78.0 / T6040 */
 	AVE_FW_TEXT_CRC_T6041_25G83, /* encoder firmware 9003.78.0 / M4 Max */
+	AVE_FW_TEXT_CRC_T8132_25G83, /* encoder firmware 9003.78.0 / T8132 */
 	AVE_FW_TEXT_CRC_T6050_26A428, /* encoder firmware macOS 27.0 26A428 / T6050 */
 	AVE_FW_TEXT_CRC_T6050_26C5035, /* encoder firmware macOS 27.3 26C5035r / T6050 */
 	AVE_FW_TEXT_CRC_T8142_26A428, /* encoder firmware 9013.45.1, macOS 27.0 26A428 / T8142 */
