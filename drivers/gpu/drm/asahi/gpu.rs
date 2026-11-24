@@ -106,6 +106,17 @@ const EP_DOORBELL: u8 = 0x21;
 const MSG_INIT: u64 = 0x81 << 48;
 const INIT_DATA_MASK: u64 = (1 << 44) - 1;
 
+/// The firmware-endpoint message that hands the firmware its root at `address`.
+pub(crate) const fn init_message(address: u64) -> u64 {
+    MSG_INIT | (address & INIT_DATA_MASK)
+}
+
+/// The G14 firmware-27.2 root and the records only it uses.
+#[cfg(all(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_M3_T8122))]
+mod v27_2;
+#[cfg(all(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_M3_T8122))]
+pub(crate) use v27_2::*;
+
 const RX_WORK_PENDING: u32 = 1 << 0;
 const RX_WORK_RUNNING: u32 = 1 << 1;
 
@@ -127,6 +138,10 @@ const DOORBELL_DEVCTRL: u64 = 0x11;
 // Upper kernel half VA address ranges.
 /// Private (cached) firmware structure VA range base.
 const IOVA_KERN_PRIV_RANGE: Range<u64> = 0xffffffa000000000..0xffffffa600000000;
+/// The G14 firmware-27.2 timestamp aperture, inside the private range: the private allocator
+/// stays below it in that profile.
+#[cfg(all(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_M3_T8122))]
+const IOVA_G14_V27_2_TIMESTAMP_RANGE: Range<u64> = 0xffffffa181400000..0xffffffa185400000;
 /// Private (cached) GPU-RO firmware structure VA range base.
 const IOVA_KERN_GPU_RO_RANGE: Range<u64> = 0xffffffa600000000..0xffffffa800000000;
 /// Shared (uncached) firmware structure VA range base.
@@ -176,6 +191,17 @@ pub(crate) struct KernelAllocators {
     #[allow(dead_code)]
     pub(crate) gpu: alloc::DefaultAllocator,
     pub(crate) gpu_ro: alloc::DefaultAllocator,
+}
+
+/// What [`GpuManager::build_graph`] builds the records for.
+#[derive(Copy, Clone)]
+pub(crate) enum GraphProfile {
+    /// The manager's own firmware: map the registers, use the whole private range.
+    Native,
+    /// The G14 firmware-27.2 root (gpu/v27_2.rs) built on these records: no register
+    /// mappings, and the private range ends below that firmware's timestamp aperture.
+    #[cfg(all(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_M3_T8122))]
+    G14V27_2,
 }
 
 /// Receive (GPU->driver) ring buffer channels.
@@ -663,13 +689,42 @@ impl GpuManager::ver {
         cfg: &'static hw::HwConfig,
     ) -> Result<Arc<GpuManager::ver>> {
         let uat = Self::make_uat(dev, cfg)?;
+        let mgr = Self::build_graph(dev, res, cfg, uat, GraphProfile::Native)?;
+        let rtkit =
+            rtkit::RtKit::<GpuManager::ver>::new(dev.as_ref().as_ref(), None, 0, mgr.clone())?;
+
+        *mgr.rtkit.lock() = Some(rtkit);
+
+        {
+            let mut rxc = mgr.rx_channels.lock();
+            rxc.event.set_manager(mgr.clone());
+            rxc.stats.set_manager(mgr.clone());
+        }
+
+        Ok(mgr)
+    }
+
+    /// Build the manager and its firmware records without attaching RTKit.
+    #[inline(never)]
+    pub(crate) fn build_graph(
+        dev: &AsahiDrmDevice,
+        res: &regs::Resources<'_>,
+        cfg: &'static hw::HwConfig,
+        uat: KBox<mmu::Uat>,
+        profile: GraphProfile,
+    ) -> Result<Arc<GpuManager::ver>> {
         let dyncfg = Self::make_dyncfg(dev, res, cfg, &uat)?;
+        let private_end = match profile {
+            GraphProfile::Native => IOVA_KERN_PRIV_RANGE.end,
+            #[cfg(all(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_M3_T8122))]
+            GraphProfile::G14V27_2 => IOVA_G14_V27_2_TIMESTAMP_RANGE.start,
+        };
 
         let mut alloc = KernelAllocators {
             private: alloc::DefaultAllocator::new(
                 dev,
                 uat.kernel_vm(),
-                IOVA_KERN_PRIV_RANGE,
+                IOVA_KERN_PRIV_RANGE.start..private_end,
                 0x80,
                 mmu::PROT_FW_PRIV_RW,
                 1024 * 1024,
@@ -812,14 +867,16 @@ impl GpuManager::ver {
                 }
             });
 
+        // The 27.2 root publishes its own register table (gpu/v27_2.rs).
+        let map_registers = matches!(profile, GraphProfile::Native);
         for (i, map) in cfg.io_mappings.iter().enumerate() {
-            if let Some(map) = map.as_ref() {
+            if let Some(map) = map.as_ref().filter(|_| map_registers) {
                 Self::iomap(&mut mgr, cfg, i, map)?;
             }
         }
 
         #[ver(V >= V13_0B4)]
-        if let Some(base) = cfg.sram_base {
+        if let Some(base) = cfg.sram_base.filter(|_| map_registers) {
             let size = cfg.sram_size.unwrap();
             let iova = mgr.as_mut().alloc_mmio_iova(size);
 
@@ -842,20 +899,7 @@ impl GpuManager::ver {
             mgr.as_mut().io_mappings_mut().push(mapping, GFP_KERNEL)?;
         }
 
-        let mgr = Arc::from(mgr);
-
-        let rtkit =
-            rtkit::RtKit::<GpuManager::ver>::new(dev.as_ref().as_ref(), None, 0, mgr.clone())?;
-
-        *mgr.rtkit.lock() = Some(rtkit);
-
-        {
-            let mut rxc = mgr.rx_channels.lock();
-            rxc.event.set_manager(mgr.clone());
-            rxc.stats.set_manager(mgr.clone());
-        }
-
-        Ok(mgr)
+        Ok(Arc::from(mgr))
     }
 
     /// Return a mutable reference to the initdata member
@@ -1606,7 +1650,7 @@ impl Gpu for GpuManager::ver {
         rtk.as_mut().start_endpoint(EP_FIRMWARE)?;
         rtk.as_mut().start_endpoint(EP_DOORBELL)?;
         rtk.as_mut()
-            .send_message(EP_FIRMWARE, MSG_INIT | (initdata & INIT_DATA_MASK))?;
+            .send_message(EP_FIRMWARE, init_message(initdata))?;
         rtk.as_mut()
             .send_message(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_DEVCTRL)?;
         core::mem::drop(guard);
