@@ -1680,6 +1680,10 @@ static void __exit apple_soc_cpufreq_module_exit(void)
 }
 module_exit(apple_soc_cpufreq_module_exit);
 
+#if IS_ENABLED(CONFIG_ARM_APPLE_SOC_CPUFREQ_KUNIT_TEST)
+#include "apple-soc-cpufreq-test.c"
+#endif
+
 MODULE_DEVICE_TABLE(of, apple_soc_cpufreq_of_match);
 MODULE_AUTHOR("Hector Martin <marcan@marcan.st>");
 MODULE_DESCRIPTION("Apple SoC CPU cluster DVFS driver");

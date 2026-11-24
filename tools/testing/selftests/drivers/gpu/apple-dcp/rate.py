@@ -920,6 +920,10 @@ static int __attribute__((unused)) dcp_direct_crossbar_link(struct apple_dcp *d,
         'static void dcpavserv_teardown(', 'void dpavservep_detach(',
         'bool dcpavserv_edid_current(', 'bool dcpavserv_edid_service_current(',
     ])
+    # dcp-fabric.c decides it in the driver; each scenario below defines it.
+    transport = transport.replace('static bool dcpavserv_admission_current(',
+        'static bool dcp_is_typec_output(struct apple_dcp *d);\n'
+        'static bool dcpavserv_admission_current(', 1)
     mode_helpers = iomfb[iomfb.index('static struct dcp_display_mode *dcp_modes_snapshot('):iomfb.index('int dcp_get_modes(')]
     # The link line of a processor whose hardware description asks for it
     # (hw.link_report, T6050's external ones): no processor here does.
@@ -1251,8 +1255,10 @@ static void panel_dimension_probes(void) {
     puts("PASS: internal panel dimensions survive repeated EDID clears; firmware size and DT fallback; external EDID size preserved");
 }
 """
+    # The panel scenarios model a Type-C output, as the hotplug ones.
     unit = unit.replace('int main(int argc,char **argv) {',
-                        checks + 'int main(int argc,char **argv) {')
+                        'static bool dcp_is_typec_output(struct apple_dcp *d) { (void)d; return true; }\n'
+                        + checks + 'int main(int argc,char **argv) {')
     return unit.replace('    transport_edid=raw;',
                         '    transport_edid=raw;panel_dimension_probes();', 1)
 

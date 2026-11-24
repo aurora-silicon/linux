@@ -50,6 +50,7 @@ config DRM_ASAHI_G16
 config DRM_ASAHI_G18
 	bool "Apple M6 (G18G, T8152) support (experimental)"
 	depends on DRM_ASAHI && ARM64
+	depends on APPLE_CLPC=y || APPLE_CLPC=DRM_ASAHI || APPLE_CLPC=n
 	select WANT_DEV_COREDUMP
 	help
 	  Backend for the Mac mini M6 (J873) GPU and its 26A428 firmware.

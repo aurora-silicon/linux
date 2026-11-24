@@ -2125,6 +2125,18 @@ bool apple_rtkit_v27_rx_drained(struct apple_rtkit *rtk)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_v27_rx_drained);
 
+/*
+ * A co-processor adopted from the bootloader has already sent its endpoint
+ * map. A client that starts one of its application endpoints by hand
+ * registers it here, so its messages are not reported as undiscovered.
+ */
+void apple_rtkit_adopt_ep(struct apple_rtkit *rtk, u8 ep)
+{
+	if (ep >= APPLE_RTKIT_APP_ENDPOINT_START)
+		set_bit(ep, rtk->endpoints);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_adopt_ep);
+
 int apple_rtkit_start_ep(struct apple_rtkit *rtk, u8 endpoint)
 {
 	u64 msg;
@@ -2289,12 +2301,60 @@ static int apple_rtkit_inherit_buffers(
 	return 0;
 }
 
+/*
+ * The endpoint map the previous owner received for this session. Management
+ * is always present; system endpoints are limited to those RTKit implements
+ * here, so that an unknown one is not silently ignored.
+ */
+static int apple_rtkit_inherit_endpoints(
+	struct apple_rtkit *rtk, const struct apple_rtkit_adopted_session *session)
+{
+	static const u8 system_endpoints[] = {
+		APPLE_RTKIT_EP_MGMT,	 APPLE_RTKIT_EP_CRASHLOG,
+		APPLE_RTKIT_EP_SYSLOG,	 APPLE_RTKIT_EP_DEBUG,
+		APPLE_RTKIT_EP_IOREPORT, APPLE_RTKIT_EP_COREANALYTICS,
+		APPLE_RTKIT_EP_OSLOG,	 APPLE_RTKIT_EP_TRACEKIT,
+	};
+	DECLARE_BITMAP(known, APPLE_RTKIT_APP_ENDPOINT_START) = {};
+	DECLARE_BITMAP(map, APPLE_RTKIT_MAX_ENDPOINTS);
+	unsigned int i;
+
+	BUILD_BUG_ON(APPLE_RTKIT_ADOPTED_EPMAP_WORDS * 32 !=
+		     APPLE_RTKIT_MAX_ENDPOINTS);
+
+	if (session->protocol_version < APPLE_RTKIT_MIN_SUPPORTED_VERSION ||
+	    session->protocol_version > APPLE_RTKIT_MAX_SUPPORTED_VERSION ||
+	    (rtk->ops->protocol_version &&
+	     session->protocol_version != rtk->ops->protocol_version))
+		return -EINVAL;
+
+	bitmap_from_arr32(map, session->epmap, APPLE_RTKIT_MAX_ENDPOINTS);
+	for (i = 0; i < ARRAY_SIZE(system_endpoints); i++)
+		set_bit(system_endpoints[i], known);
+	if (!test_bit(APPLE_RTKIT_EP_MGMT, map))
+		return -EINVAL;
+	for (i = 0; i < APPLE_RTKIT_APP_ENDPOINT_START; i++)
+		if (test_bit(i, map) && !test_bit(i, known))
+			return -EINVAL;
+	/* A retained buffer belongs to an endpoint the session has. */
+	if ((rtk->crashlog_buffer.size && !test_bit(APPLE_RTKIT_EP_CRASHLOG, map)) ||
+	    (rtk->syslog_buffer.size && !test_bit(APPLE_RTKIT_EP_SYSLOG, map)) ||
+	    (rtk->ioreport_buffer.size && !test_bit(APPLE_RTKIT_EP_IOREPORT, map)) ||
+	    (rtk->oslog_buffer.size && !test_bit(APPLE_RTKIT_EP_OSLOG, map)))
+		return -EINVAL;
+
+	bitmap_copy(rtk->endpoints, map, APPLE_RTKIT_MAX_ENDPOINTS);
+	rtk->version = session->protocol_version;
+	return 0;
+}
+
 static struct apple_rtkit *__apple_rtkit_init(struct device *dev, void *cookie,
 					      const char *mbox_name, int mbox_idx,
 					      const struct apple_rtkit_ops *ops,
 					      bool adopted,
 					      const struct apple_rtkit_inherited_buffer *buffers,
-					      unsigned int count, bool track_saved)
+					      unsigned int count, bool track_saved,
+					      const struct apple_rtkit_adopted_session *session)
 {
 	struct apple_rtkit *rtk;
 	int ret;
@@ -2376,6 +2436,12 @@ static struct apple_rtkit *__apple_rtkit_init(struct device *dev, void *cookie,
 	/* Inherited system traffic may arrive as soon as mailbox RX is armed. */
 	if (adopted)
 		apple_rtkit_mark_running(rtk);
+	/* The firmware's own endpoint map replaces the assumed one. */
+	if (session) {
+		ret = apple_rtkit_inherit_endpoints(rtk, session);
+		if (ret)
+			goto destroy_wq;
+	}
 
 	ret = apple_rtkit_claim_rx(rtk);
 	if (ret)
@@ -2403,7 +2469,7 @@ struct apple_rtkit *apple_rtkit_init(struct device *dev, void *cookie,
 					    const struct apple_rtkit_ops *ops)
 {
 	return __apple_rtkit_init(dev, cookie, mbox_name, mbox_idx, ops, false,
-				  NULL, 0, false);
+				  NULL, 0, false, NULL);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_init);
 
@@ -2412,7 +2478,7 @@ struct apple_rtkit *apple_rtkit_init_adopted(struct device *dev, void *cookie,
 					     const struct apple_rtkit_ops *ops)
 {
 	return __apple_rtkit_init(dev, cookie, mbox_name, mbox_idx, ops, true,
-				  NULL, 0, false);
+				  NULL, 0, false, NULL);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_init_adopted);
 
@@ -2471,9 +2537,23 @@ struct apple_rtkit *apple_rtkit_init_adopted_with_buffers(
 	const struct apple_rtkit_inherited_buffer *buffers, unsigned int count)
 {
 	return __apple_rtkit_init(dev, cookie, mbox_name, mbox_idx, ops, true,
-				  buffers, count, false);
+				  buffers, count, false, NULL);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_init_adopted_with_buffers);
+
+struct apple_rtkit *apple_rtkit_init_adopted_with_session(
+	struct device *dev, void *cookie, const char *mbox_name, int mbox_idx,
+	const struct apple_rtkit_ops *ops,
+	const struct apple_rtkit_adopted_session *session)
+{
+	if (!session)
+		return ERR_PTR(-EINVAL);
+
+	return __apple_rtkit_init(dev, cookie, mbox_name, mbox_idx, ops, true,
+				  session->buffers, session->num_buffers, false,
+				  session);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_init_adopted_with_session);
 
 static int apple_rtkit_wait_for_completion(struct apple_rtkit *rtk,
 					   struct completion *c)
@@ -3528,7 +3608,7 @@ struct apple_rtkit *devm_apple_rtkit_init_m5_saved(struct device *dev, void *coo
 	int ret;
 
 	rtk = __apple_rtkit_init(dev, cookie, mbox_name, mbox_idx, ops, false,
-				NULL, 0, true);
+				NULL, 0, true, NULL);
 	if (IS_ERR(rtk))
 		return rtk;
 	ret = devm_add_action_or_reset(dev, apple_rtkit_free_wrapper, rtk);
