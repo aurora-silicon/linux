@@ -55,6 +55,55 @@ static void avd_hevc_geometry_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, avd_hevc_check_sps_geometry(&sps), c->ret);
 }
 
+/*
+ * Pre-streaming format negotiation (e.g. Chromium V4L2VideoDecoder::SetExtCtrlsInit)
+ * supplies coded dimensions, chroma_format_idc and bit depth with zeroed CTB size
+ * fields. Format validation accepts those while full geometry validation still
+ * requires 16x16..64x64 CTBs.
+ */
+static void avd_hevc_sps_fmt_init_test(struct kunit *test)
+{
+	struct v4l2_ctrl_hevc_sps sps = {
+		.pic_width_in_luma_samples = 1280,
+		.pic_height_in_luma_samples = 720,
+		.chroma_format_idc = 1,
+	};
+	struct avd_dev *dev;
+	struct avd_ctx *ctx;
+
+	dev = kunit_kzalloc(test, sizeof(*dev), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, dev);
+	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	ctx->dev = dev;
+	ctx->coded_fmt.fmt.pix_mp.width = 1280;
+	ctx->coded_fmt.fmt.pix_mp.height = 720;
+
+	/* 8-bit and 10-bit 4:2:0 pre-streaming init controls */
+	KUNIT_EXPECT_EQ(test, avd_hevc_validate_sps_fmt(ctx, &sps), 0);
+	KUNIT_EXPECT_EQ(test, avd_hevc_check_sps_geometry(&sps), -EINVAL);
+
+	sps.bit_depth_luma_minus8 = 2;
+	sps.bit_depth_chroma_minus8 = 2;
+	KUNIT_EXPECT_EQ(test, avd_hevc_validate_sps_fmt(ctx, &sps), 0);
+
+	/* Oversized or unsupported formats remain rejected pre-streaming */
+	sps.pic_width_in_luma_samples = 1920;
+	KUNIT_EXPECT_EQ(test, avd_hevc_validate_sps_fmt(ctx, &sps), -EINVAL);
+	sps.pic_width_in_luma_samples = 1280;
+	sps.chroma_format_idc = 3;
+	KUNIT_EXPECT_EQ(test, avd_hevc_validate_sps_fmt(ctx, &sps), -EINVAL);
+	sps.chroma_format_idc = 2;
+	KUNIT_EXPECT_EQ(test, avd_hevc_validate_sps_fmt(ctx, &sps), -EINVAL);
+	sps.chroma_format_idc = 1;
+	sps.bit_depth_luma_minus8 = 4;
+	sps.bit_depth_chroma_minus8 = 4;
+	KUNIT_EXPECT_EQ(test, avd_hevc_validate_sps_fmt(ctx, &sps), -EINVAL);
+	sps.bit_depth_luma_minus8 = 2;
+	sps.bit_depth_chroma_minus8 = 0;
+	KUNIT_EXPECT_EQ(test, avd_hevc_validate_sps_fmt(ctx, &sps), -EINVAL);
+}
+
 struct avd_hevc_tiles_case {
 	const char *desc;
 	bool uniform;
@@ -367,6 +416,7 @@ static void avd_hevc_entry_points_sum_test(struct kunit *test)
 
 static struct kunit_case avd_hevc_test_cases[] = {
 	KUNIT_CASE_PARAM(avd_hevc_geometry_test, avd_hevc_geometry_gen_params),
+	KUNIT_CASE(avd_hevc_sps_fmt_init_test),
 	KUNIT_CASE_PARAM(avd_hevc_tiles_test, avd_hevc_tiles_gen_params),
 	KUNIT_CASE(avd_hevc_tiles_array_test),
 	KUNIT_CASE(avd_hevc_no_tiles_test),

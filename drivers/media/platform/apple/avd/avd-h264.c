@@ -707,8 +707,9 @@ avd_h264_sps_image_fmt(const struct v4l2_ctrl_h264_sps *sps)
  * format, which S_FMT rounds up to whole macroblocks, so a picture must fit
  * in it.
  */
-VISIBLE_IF_KUNIT int avd_h264_validate_sps(struct avd_ctx *ctx,
-					   const struct v4l2_ctrl_h264_sps *sps)
+VISIBLE_IF_KUNIT int
+avd_h264_validate_sps_fmt(struct avd_ctx *ctx,
+			  const struct v4l2_ctrl_h264_sps *sps)
 {
 	u32 width = (sps->pic_width_in_mbs_minus1 + 1) * 16;
 	u32 height = (sps->pic_height_in_map_units_minus1 + 1) * 16 *
@@ -733,6 +734,18 @@ VISIBLE_IF_KUNIT int avd_h264_validate_sps(struct avd_ctx *ctx,
 	if (sps->chroma_format_idc == 2 && sps->bit_depth_luma_minus8 == 2)
 		/* 4:2:2 10 bit would need P210; P010 is too small for its chroma */
 		return -EINVAL;
+
+	return 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(avd_h264_validate_sps_fmt);
+
+VISIBLE_IF_KUNIT int avd_h264_validate_sps(struct avd_ctx *ctx,
+					   const struct v4l2_ctrl_h264_sps *sps)
+{
+	int ret = avd_h264_validate_sps_fmt(ctx, sps);
+
+	if (ret)
+		return ret;
 	if (!(sps->flags & V4L2_H264_SPS_FLAG_FRAME_MBS_ONLY))
 		/* no interlaced support */
 		return -EINVAL;
@@ -793,7 +806,14 @@ static int avd_h264_start(struct avd_ctx *ctx)
 	if (!ctrl)
 		return -EINVAL;
 
-	ret = avd_h264_validate_sps(ctx, ctrl->p_cur.p_h264_sps);
+	/*
+	 * Pre-streaming format-negotiation controls (for example Chromium's
+	 * V4L2VideoDecoder::SetExtCtrlsInit) populate chroma format and bit
+	 * depth with flags == 0 before the first frame request supplies the
+	 * parsed SPS. Validate the picture format here; avd_h264_run() enforces
+	 * full avd_h264_validate_sps() (including FRAME_MBS_ONLY) per frame.
+	 */
+	ret = avd_h264_validate_sps_fmt(ctx, ctrl->p_cur.p_h264_sps);
 	if (ret)
 		return ret;
 
@@ -1256,8 +1276,18 @@ static void avd_h264_adjust_decoded_fmt(struct avd_ctx *ctx,
 
 static int avd_h264_try_ctrl(struct avd_ctx *ctx, struct v4l2_ctrl *ctrl)
 {
-	if (ctrl->id == V4L2_CID_STATELESS_H264_SPS)
-		return avd_h264_validate_sps(ctx, ctrl->p_new.p_h264_sps);
+	if (ctrl->id == V4L2_CID_STATELESS_H264_SPS) {
+		struct vb2_queue *vq =
+			ctx->fh.m2m_ctx ?
+				v4l2_m2m_get_vq(ctx->fh.m2m_ctx,
+						V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) :
+				NULL;
+
+		if (vq && vb2_is_streaming(vq))
+			return avd_h264_validate_sps(ctx,
+						     ctrl->p_new.p_h264_sps);
+		return avd_h264_validate_sps_fmt(ctx, ctrl->p_new.p_h264_sps);
+	}
 	if (ctrl->id == V4L2_CID_STATELESS_H264_PPS)
 		return avd_h264_validate_pps(ctx, ctrl->p_new.p_h264_pps);
 	if (ctrl->id == V4L2_CID_STATELESS_H264_SLICE_PARAMS)
