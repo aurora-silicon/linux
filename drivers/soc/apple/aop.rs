@@ -3051,7 +3051,8 @@ impl AopHwConfig {
     }
 }
 
-const HW_CFG_T8103: AopHwConfig = AopHwConfig {
+/// T8103 (M1) with the 13.5 firmware: no firmware regions in DRAM.
+const HW_CFG_T8103_DIRECT: AopHwConfig = AopHwConfig {
     ec0p: 0x020000,
     ncal: Some(0),
     aopt: 1,
@@ -3069,6 +3070,15 @@ const HW_CFG_T8103: AopHwConfig = AopHwConfig {
     bootargs_word_access: false,
     halt_on_failed_start: false,
     without_fw_regions: None,
+};
+/// T8103 (M1): from firmware 27 on, the AOP runs its external code and data
+/// from DRAM, which the bootloader reserves in `memory-region`, and stops
+/// before its RTKit HELLO unless they are mapped and ED0p is written. A boot
+/// with no regions reserved (firmware 13.5) starts it as before.
+const HW_CFG_T8103: AopHwConfig = AopHwConfig {
+    fw_regions: true,
+    without_fw_regions: Some(&HW_CFG_T8103_DIRECT),
+    ..HW_CFG_T8103_DIRECT
 };
 /// `nCal` keeps the firmware's own value, as on T6040: the J413 image carries 1,
 /// and with 0 the firmware never announces its accelerometer and gyroscope.
