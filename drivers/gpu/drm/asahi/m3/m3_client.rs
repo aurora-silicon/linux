@@ -63,7 +63,7 @@ pub(crate) fn admit_vm_for(
         let refusals = REFUSALS.fetch_add(1, Ordering::Relaxed).saturating_add(1);
         if refusals <= REFUSALS_LOGGED {
             let task = kernel::current!();
-            let comm = task_comm(task);
+            let comm = super::m3_submit::task_comm(task);
             let len = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
             let name = core::str::from_utf8(&comm[..len]).unwrap_or("?");
             let last = if refusals == REFUSALS_LOGGED {
@@ -87,19 +87,6 @@ pub(crate) fn admit_vm_for(
     }
 }
 
-/// The name of `task`, for log lines only.
-pub(crate) fn task_comm(task: &kernel::task::Task) -> [u8; 16] {
-    let mut name = [0u8; 16];
-    // SAFETY: `comm` is a fixed-size array inside the live task. It is read byte by byte with
-    // volatile loads because a concurrent rename may change it; a torn name is only printed.
-    unsafe {
-        let comm = core::ptr::addr_of!((*task.as_ptr()).comm).cast::<u8>();
-        for (i, byte) in name.iter_mut().enumerate() {
-            *byte = comm.add(i).read_volatile();
-        }
-    }
-    name
-}
 
 /// Bytes at the start of a compute control stream whose launch records are checked.
 const LAUNCH_WINDOW: usize = 4096;

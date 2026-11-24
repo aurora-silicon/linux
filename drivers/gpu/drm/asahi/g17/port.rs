@@ -18,7 +18,7 @@ use super::{
     },
     qos,
 };
-use core::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use kernel::{
     new_mutex, new_spinlock,
     prelude::*,
@@ -35,6 +35,9 @@ const PRIORITIES: usize = Policy::PRIORITIES as usize;
 /// work bound by host refills. While the GPU is the bottleneck the burst gains nothing, and at the
 /// SoC's thermal limit the power it takes comes out of the GPU's clock.
 const RX_UTIL_MIN_GPU_BOUND: u32 = 256;
+const RX_STATE_UNSET: u8 = 0;
+const RX_STATE_DEFAULT: u8 = 1;
+const RX_STATE_GPU_BOUND: u8 = 2;
 
 /// One priority class's compute work ring: its slot array and the cursors of its two firmware
 /// consumers and of the host producer.
@@ -104,6 +107,8 @@ pub(super) struct Port {
     /// The request last made, `None` before the first.
     #[pin]
     rx_applied: SpinLock<Option<Option<u32>>>,
+    /// Lock-free mirror of `rx_applied` (`RX_STATE_*`) so steady-state updates avoid locking.
+    rx_state: AtomicU8,
     /// Serializes every render publication, with or without the device mutex: the tiling
     /// and fragment work rings have one host producer at a time, and same-VM attachment
     /// overlaps are ordered by publication order (see hazard.rs).
@@ -116,6 +121,13 @@ pub(super) struct Port {
     /// Full firmware effort is applied; cleared before an idle clear rechecks `submissions`.
     effort_full: AtomicBool,
     demand: super::power::Demand,
+    /// Serializes busy-share window accounting and CLPC busy updates.
+    #[pin]
+    busy: SpinLock<super::power::BusyShare>,
+    /// Mirrored from `busy` and `qos` for a lock-free fast path in `note_gpu_activity()`.
+    busy_window_start: AtomicU64,
+    busy_below_top: AtomicBool,
+    oldest_in_flight_any: AtomicU64,
     statistics_epoch: AtomicU64,
     last_submission_ns: AtomicU64,
     submissions: AtomicU64,
@@ -169,11 +181,16 @@ impl Port {
                 rx: SetOnce::new(),
                 feed,
                 rx_applied <- new_spinlock!(None, "g17::Port::rx_applied"),
+                rx_state: AtomicU8::new(RX_STATE_UNSET),
                 render <- new_mutex!((), "g17::Port::render"),
                 generation: AtomicU64::new(0),
                 publications: AtomicU64::new(0),
                 effort_full: AtomicBool::new(false),
                 demand,
+                busy <- new_spinlock!(super::power::BusyShare::new(), "g17::Port::busy"),
+                busy_window_start: AtomicU64::new(0),
+                busy_below_top: AtomicBool::new(false),
+                oldest_in_flight_any: AtomicU64::new(0),
                 statistics_epoch: AtomicU64::new(0),
                 last_submission_ns: AtomicU64::new(0),
                 submissions: AtomicU64::new(0),
@@ -427,10 +444,14 @@ impl Port {
         policy: Policy,
     ) -> Result<qos::Publication> {
         let view = self.qos_view()?;
-        let publication = self
-            .qos
-            .lock()
-            .publish(&view, owner, scheduler, policy, qos::clock)?;
+        let publication = {
+            let mut qos = self.qos.lock();
+            let publication =
+                qos.publish(&view, owner, scheduler, policy, qos::clock, super::now_ns())?;
+            self.oldest_in_flight_any
+                .store(qos.oldest_in_flight_any(), Ordering::Relaxed);
+            publication
+        };
         self.rx_update();
         Ok(publication)
     }
@@ -443,17 +464,31 @@ impl Port {
         policy: Policy,
     ) -> Result<[qos::Publication; 2]> {
         let view = self.qos_view()?;
-        let publications =
-            self.qos
-                .lock()
-                .publish_owners(&view, owners, scheduler, policy, qos::clock)?;
+        let publications = {
+            let mut qos = self.qos.lock();
+            let publications = qos.publish_owners(
+                &view,
+                owners,
+                scheduler,
+                policy,
+                qos::clock,
+                super::now_ns(),
+            )?;
+            self.oldest_in_flight_any
+                .store(qos.oldest_in_flight_any(), Ordering::Relaxed);
+            publications
+        };
         self.rx_update();
         Ok(publications)
     }
 
     pub(super) fn qos_cancel(&self, publication: qos::Publication) -> Result {
         let view = self.qos_view()?;
-        self.qos.lock().cancel(&view, publication)
+        let mut qos = self.qos.lock();
+        qos.cancel(&view, publication)?;
+        self.oldest_in_flight_any
+            .store(qos.oldest_in_flight_any(), Ordering::Relaxed);
+        Ok(())
     }
 
     /// Clears the QoS table rows of released QoS IDs (`QosIds::forget_released`); returns
@@ -468,7 +503,12 @@ impl Port {
 
     pub(super) fn qos_complete(&self, owners: &[qos::Owner]) -> Result {
         let view = self.qos_view()?;
-        self.qos.lock().complete(&view, owners)?;
+        {
+            let mut qos = self.qos.lock();
+            qos.complete(&view, owners, super::now_ns())?;
+            self.oldest_in_flight_any
+                .store(qos.oldest_in_flight_any(), Ordering::Relaxed);
+        }
         self.rx_update();
         Ok(())
     }
@@ -481,10 +521,33 @@ impl Port {
         let Some(rx) = self.rx.as_ref() else {
             return;
         };
-        let want = self.feed.gpu_bound().then_some(RX_UTIL_MIN_GPU_BOUND);
+        let want_state = if self.feed.gpu_bound() {
+            RX_STATE_GPU_BOUND
+        } else {
+            RX_STATE_DEFAULT
+        };
+        if self.rx_state.load(Ordering::SeqCst) == want_state {
+            return;
+        }
         let mut applied = self.rx_applied.lock();
-        if *applied != Some(want) && rx.set(want).is_ok() {
-            *applied = Some(want);
+        // Publish the transitioning state before re-reading `feed.gpu_bound()`,
+        // so a concurrent caller observing a newer feed state cannot return
+        // early against the stale mirrored value while this update is in flight.
+        self.rx_state.store(RX_STATE_UNSET, Ordering::SeqCst);
+        let gpu_bound = self.feed.gpu_bound();
+        let want = gpu_bound.then_some(RX_UTIL_MIN_GPU_BOUND);
+        let want_state = if gpu_bound {
+            RX_STATE_GPU_BOUND
+        } else {
+            RX_STATE_DEFAULT
+        };
+        if *applied != Some(want) {
+            if rx.set(want).is_ok() {
+                *applied = Some(want);
+                self.rx_state.store(want_state, Ordering::Release);
+            }
+        } else {
+            self.rx_state.store(want_state, Ordering::Release);
         }
     }
 
@@ -538,7 +601,15 @@ impl Port {
 
     pub(super) fn set_effort_full(&self, full: bool) {
         self.effort_full.store(full, Ordering::SeqCst);
-        self.demand.set_active(full);
+        if full {
+            self.demand.set_active(true);
+        } else {
+            let mut busy = self.busy.lock();
+            self.demand.set_active(false);
+            busy.clear_active();
+            self.busy_window_start.store(0, Ordering::Relaxed);
+            self.busy_below_top.store(false, Ordering::Relaxed);
+        }
     }
 
     /// The next statistics drain and reader discard what the decoder holds.
@@ -548,6 +619,76 @@ impl Port {
 
     pub(super) fn statistics_epoch(&self) -> u64 {
         self.statistics_epoch.load(Ordering::Acquire)
+    }
+
+    /// Reports the busiest GPU engine's share of the last window (including unretired
+    /// in-flight commands) to CLPC once a window elapses or an in-flight command
+    /// saturates its engine. Lock-free on the common in-window path.
+    pub(super) fn report_busy(&self, now_ns: u64) {
+        if !self.demand.has_provider() {
+            return;
+        }
+        let start = self.busy_window_start.load(Ordering::Relaxed);
+        let window_due =
+            start == 0 || now_ns.saturating_sub(start) >= super::power::BUSY_WINDOW_NS;
+        let long_due = !window_due
+            && self.busy_below_top.load(Ordering::Relaxed)
+            && {
+                let oldest = self.oldest_in_flight_any.load(Ordering::Relaxed);
+                oldest != 0
+                    && now_ns.saturating_sub(oldest) >= super::power::BUSY_LONG_COMMAND_NS
+            };
+        if !window_due && !long_due {
+            return;
+        }
+        // Read retired time (Acquire) before qos (lock Acquire): retirement calls
+        // qos_complete() before usage::Client::add() Release-adds ENGINE_NS, so we
+        // never observe both the retired time and the old in-flight timestamp.
+        let retired = crate::usage::ENGINE_NS
+            .each_ref()
+            .map(|ns| ns.load(Ordering::Acquire));
+        let oldest = self.qos.lock().oldest_in_flight();
+        let now_ns = super::now_ns().max(now_ns);
+        let mut busy = self.busy.lock();
+        if let Some(permille) = busy.sample(now_ns, retired, oldest) {
+            self.demand.set_busy(permille);
+        }
+        self.busy_window_start
+            .store(busy.window_start().map_or(0, |s| s.max(1)), Ordering::Relaxed);
+        self.busy_below_top
+            .store(busy.below_top(), Ordering::Relaxed);
+    }
+
+    /// Lifts CLPC to the top memory/fabric column immediately when a sustained busy run
+    /// ([`super::power::BusyRuns::bound`]) begins while the last reported share is below
+    /// the top column. Lock-free once at the top column.
+    pub(super) fn lift_busy_if_below_top(&self, now_ns: u64) {
+        if !self.demand.has_provider() || !self.busy_below_top.load(Ordering::Relaxed) {
+            return;
+        }
+        let retired = crate::usage::ENGINE_NS
+            .each_ref()
+            .map(|ns| ns.load(Ordering::Acquire));
+        let oldest = self.qos.lock().oldest_in_flight();
+        let now_ns = super::now_ns().max(now_ns);
+        let mut busy = self.busy.lock();
+        if let Some(permille) = busy.lift_saturated(now_ns, retired, oldest) {
+            self.demand.set_busy(permille);
+        }
+        self.busy_window_start
+            .store(busy.window_start().map_or(0, |s| s.max(1)), Ordering::Relaxed);
+        self.busy_below_top
+            .store(busy.below_top(), Ordering::Relaxed);
+    }
+
+    /// Wake delay (ns) for `idle_check` while a solo long command is running below
+    /// the top CLPC busy column, or `None` when already at top or idle.
+    pub(super) fn busy_recheck_delay(&self, now_ns: u64) -> Option<u64> {
+        if !self.demand.has_provider() || !self.busy_below_top.load(Ordering::Relaxed) {
+            return None;
+        }
+        let oldest = self.oldest_in_flight_any.load(Ordering::Relaxed);
+        super::power::BusyShare::recheck_delay_for(now_ns, oldest)
     }
 
     pub(super) fn note_gpu_activity(&self) {
@@ -561,9 +702,10 @@ impl Port {
         {
             self.statistics_epoch.fetch_add(1, Ordering::Release);
         }
-        self.last_submission_ns
-            .store(super::now_ns(), Ordering::Relaxed);
+        let now_ns = super::now_ns();
+        self.last_submission_ns.store(now_ns, Ordering::Relaxed);
         self.demand.set_active(true);
+        self.report_busy(now_ns);
     }
 
     pub(super) fn write_power(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {

@@ -857,7 +857,7 @@ struct PmpHwConfig {
 enum Ep7 {
     /// Never started.
     No,
-    /// Only on the retained J713 board.
+    /// Only on T8132 boards with a retained, qualified PMP session.
     RetainedBoard,
     /// On every board with this SoC.
     Always,
@@ -942,8 +942,9 @@ impl platform::Driver for PmpDriver {
     type Data<'bound> = PmpDriver;
 
     fn suppress_bind_attrs() -> bool {
-        // Retained J713 power votes have no teardown path, and an unbound T8140 PMP still runs.
-        // SAFETY: read-only machine identity checks; other machines remain unchanged.
+        // Retained J713 power votes have no teardown path, and an unbound PMP that registered
+        // with the sleep driver still runs.
+        // SAFETY: read-only machine identity and device tree checks.
         unsafe { bindings::apple_pmp_keep_bound() }
     }
 
@@ -988,7 +989,7 @@ impl platform::Driver for PmpDriver {
         }
         data.patch_bootargs(&pmp_mmio, &patches, cfg.check_bootargs_uuid)?;
         // EP7 is a startup dependency on every T6041 PMP, and on the
-        // retained J713 PMP among the T8132 boards.
+        // retained, qualified PMP session among the T8132 boards.
         let needs_coreanalytics = match cfg.coreanalytics {
             Ep7::No => false,
             Ep7::Always => true,

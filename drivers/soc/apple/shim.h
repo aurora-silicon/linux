@@ -218,9 +218,8 @@ struct device;
 
 int sep_diag_register(struct device *dev, const char *profile,
 		      size_t profile_len, bool cold, bool sepos13, bool xart);
-void sep_diag_set_policy(bool provision_keybag, bool trusted_keys,
-			 bool filevault_api, bool xarm_trace, bool refkey_v2,
-			 bool identity_override);
+void sep_diag_set_policy(bool trusted_keys, bool filevault_api,
+			 bool xarm_trace, bool refkey_v2, bool identity_override);
 void sep_diag_set_identity_source(unsigned int source);
 void sep_diag_set_attach(bool attached);
 void sep_diag_set_endpoints(unsigned int count);
@@ -309,7 +308,7 @@ void sep_tk_set_blob_len(struct trusted_key_payload *p, unsigned int n);
 bool sep_keystore_only(void);
 bool sep_keystore_user_bags(void);
 int sep_complete_attach_register(struct device *dev, void *ctx,
-                                int (*complete)(void *ctx));
+				int (*complete)(void *ctx));
 void sep_complete_attach_unregister(struct device *dev);
 void sep_diag_keystore_ended(void);
 void sep_diag_set_xart(bool writable);

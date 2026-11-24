@@ -112,6 +112,7 @@
 				      "gfx-data", "gfx1-data",
 				      "gfx-data-shared-ro", "gfx1-data-shared-ro";
 		mboxes = <&gfx_asc>, <&gfx1_asc>;
+		apple,clpc = <&clpc>;
 	};
 
 	/*

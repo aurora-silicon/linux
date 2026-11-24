@@ -99,12 +99,18 @@ pub(crate) struct Rings {
 }
 
 impl Rings {
-    /// `m5`: the firmware runs the M5 protocol ([`super::stats::protocol`]).
-    pub(crate) fn new(graph: super::fw::variant::InitGraph, m5: bool) -> Result<Self> {
+    /// `protocol`: the records the firmware sends beyond utilisation
+    /// ([`super::telemetry::Protocol`]).
+    /// `max_pstate`: highest valid performance state index for `0x1b` reports.
+    pub(crate) fn new(
+        graph: super::fw::variant::InitGraph,
+        protocol: super::telemetry::Protocol,
+        max_pstate: u32,
+    ) -> Result<Self> {
         Ok(Self {
             quarantined: [[false; 2]; 2],
             reports: super::reports::Reports::new()?,
-            telemetry: super::telemetry::Telemetry::new(super::stats::protocol(graph, m5)),
+            telemetry: super::telemetry::Telemetry::new(protocol, max_pstate),
             max_age_ns: super::stats::max_age_ns(graph),
             suspended: false,
             discard_statistics: [false; 2],

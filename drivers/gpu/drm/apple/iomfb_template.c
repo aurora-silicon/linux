@@ -19,6 +19,7 @@
 #include <linux/overflow.h>
 #include <linux/pm_runtime.h>
 #include <linux/slab.h>
+#include <linux/soc/apple/mcc.h>
 #include <linux/unaligned.h>
 
 #include <drm/drm_color_mgmt.h>
@@ -737,7 +738,7 @@ static u32 dcpep_cb_zero(struct apple_dcp *dcp)
 	return 0;
 }
 
-static void dcp_report_swap_complete(struct apple_dcp *dcp, u32 id, ktime_t now)
+static void dcp_report_swap_complete(struct apple_dcp *dcp, u32 id, ktime_t now, bool shown)
 {
 	bool retire = true;
 	if (dcp_is_ext26(dcp)) {
@@ -790,8 +791,18 @@ static void dcp_report_swap_complete(struct apple_dcp *dcp, u32 id, ktime_t now)
 		dcp->crashed = true;
 		return;
 	}
-	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
+		/* Only a displayed KMS swap that touched boot slot zero retires it. */
+		if (dcp->boot_surface_pending && shown && dcp->iomfb.next_scanout &&
+		    !iomfb_present_brightness_only_h17p(dcp) &&
+		    (DCP_FW_SWAP(dcp).swap.swap_enabled & BIT(0))) {
+			WRITE_ONCE(dcp->boot_surface_pending, false);
+			dev_info(dcp->dev, "boot scanout retired by displayed swap %u\n", id);
+			if (dcp->boot_scanout_reserved)
+				apple_mcc_boot_scanout_retired(dcp->dev->of_node);
+		}
 		retire = iomfb_present_complete_h17p(dcp);
+	}
 #endif
 #if DCP_FW_DESKTOP_26(DCP_FW_VER)
 	/* Late or duplicate completions cannot retire the replacement's flip. */
@@ -825,15 +836,17 @@ static void dcp_report_swap_complete(struct apple_dcp *dcp, u32 id, ktime_t now)
 }
 
 #if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
-struct dcp_peer_completion { u32 id; ktime_t time; };
+struct dcp_peer_completion { u32 id; ktime_t time; bool shown; };
+
 static void dcp_peer_report_on_owner(struct apple_dcp *owner, void *data, void *cookie)
 {
 	struct dcp_peer_completion *completion = data;
-	dcp_report_swap_complete(owner, completion->id, completion->time);
+	dcp_report_swap_complete(owner, completion->id, completion->time, completion->shown);
 }
-static void dcp_peer_queue_completion(struct apple_dcp *owner, u32 id, ktime_t time)
+
+static void dcp_peer_queue_completion(struct apple_dcp *owner, u32 id, ktime_t time, bool shown)
 {
-	struct dcp_peer_completion completion = { id, time };
+	struct dcp_peer_completion completion = { id, time, shown };
 	if (iomfb_queue_callback(owner, dcp_peer_report_on_owner, &completion,
 				 sizeof(completion), NULL)) {
 		WRITE_ONCE(owner->crashed, true);
@@ -848,10 +861,15 @@ static void dcpep_cb_swap_complete(struct apple_dcp *dcp,
 	ktime_t now = dcp_is_ext26(dcp) ? ns_to_ktime(dcp->ext26_rx_ns) : ktime_get();
 	trace_iomfb_swap_complete(dcp, resp->swap_id);
 #if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
-	if (dcp_peer_swap_complete_v27(dcp, resp->swap_id, now, dcp_peer_queue_completion))
+	if (dcp_peer_swap_complete_v27(dcp, resp->swap_id, now, resp->unkbool,
+				       dcp_peer_queue_completion))
 		return;
 #endif
-	dcp_report_swap_complete(dcp, resp->swap_id, now);
+#if DCP_FW_H17(DCP_FW_VER)
+	dcp_report_swap_complete(dcp, resp->swap_id, now, resp->unkbool);
+#else
+	dcp_report_swap_complete(dcp, resp->swap_id, now, false);
+#endif
 }
 
 /* special */
@@ -1105,8 +1123,15 @@ dcpep_cb_get_uint_prop(struct apple_dcp *dcp, struct dcp_get_uint_prop_req *req)
 	    .value = 0
 	};
 
-	if (dcp->panel.has_mini_led &&
-	    memcmp(req->obj, "SUMP", sizeof(req->obj)) == 0) { /* "PMUS */
+	/*
+	 * "PMUS"/"Temperature": the battery temperature in 0.1 K.  Every
+	 * firmware with a panel asks for it from TableCompensator::
+	 * set_PMU_service(), mini-LED or not: the OLED firmware (27.x on the
+	 * K116s) uses it as the panel's initial temperature guess and logs
+	 * "failed to read PMU temperature property!" when the reply is
+	 * false.  The H17P table already answers it unconditionally.
+	 */
+	if (memcmp(req->obj, "SUMP", sizeof(req->obj)) == 0) { /* "PMUS */
 	    if (strncmp(req->key, "Temperature", sizeof(req->key)) == 0) {
 		resp.value = dcp_pmu_temperature(dcp->dev);
 		resp.ret = true;
@@ -2874,6 +2899,9 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 #endif
 	dcp_prepare_clear_swap(dcp, swap);
 #endif
+	/* The clear swap takes the panel to 0 (dcp_prepare_clear_swap()). */
+	if (dcp_has_panel(dcp))
+		dcp_backlight_presented(dcp, 0);
 
 	dcp_swap_start(dcp, false, &swap_req, dcp_swap_clear_started, cookie);
 
@@ -2978,9 +3006,11 @@ void DCP_FW_NAME(iomfb_blank)(struct apple_dcp *dcp)
 	kref_get(&cookie->refcount);
 
 	dcp_prepare_clear_swap(dcp, swap);
-	if (dcp_has_panel(dcp))
+	if (dcp_has_panel(dcp)) {
 		iomfb_encode_backlight_swap_h17p((u8 *)&swap->swap, 0,
 						 dcp->brightness.maximum, true);
+		dcp_backlight_presented(dcp, 0);
+	}
 
 	dcp_swap_start(dcp, false, &swap_req, dcp_swap_clear_started, cookie);
 	ret = wait_for_completion_timeout(&cookie->done, msecs_to_jiffies(500));
@@ -3495,6 +3525,9 @@ static void dcp_swap_started(struct apple_dcp *dcp, void *data, void *cookie)
 			dcp_drm_crtc_vblank(dcp->crtc);
 		return;
 	}
+#if DCP_FW_H17(DCP_FW_VER)
+	iomfb_prepare_indicator_h17p(dcp);
+#endif
 #if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
 	if (dcp_peer_start_second(dcp, resp))
 		return;
@@ -3899,11 +3932,15 @@ static void dcp_modeset_select(struct apple_dcp *dcp, void *out, void *cookie)
 int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 			       struct drm_crtc_state *crtc_state)
 {
-	struct dcp_display_mode selected, *mode = &selected;
+	struct dcp_display_mode *mode __free(kfree) = kzalloc_obj(*mode);
 	struct dcp_modeset_cookie *modeset;
 	struct dcp_wait_cookie *cookie;
+	struct dcp_color_mode selected_color = { .score = -1 };
 	struct dcp_color_mode *cmode = NULL;
 	int ret;
+
+	if (!mode)
+		return -ENOMEM;
 
 	if (dcp->crashed)
 		return -ENODEV;
@@ -3917,35 +3954,44 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 		return -EIO;
 	}
 
-	/* An HDR commit scans out through the timing's PQ element. */
-	if (dcp->pq_requested && mode->pq.score >= 0)
+	if (!dcp_select_color_mode(mode, &dcp->color_req, &selected_color)) {
+		mode->color_mode_id = selected_color.id;
+		cmode = &selected_color;
+	} else if (dcp->pq_requested && mode->pq.score >= 0) {
 		mode->color_mode_id = mode->pq.id;
+		cmode = &mode->pq;
+	} else if (mode->color_mode_id == mode->sdr_rgb.id) {
+		cmode = &mode->sdr_rgb;
+	} else if (mode->color_mode_id == mode->sdr_444.id) {
+		cmode = &mode->sdr_444;
+	} else if (mode->color_mode_id == mode->sdr.id) {
+		cmode = &mode->sdr;
+	} else if (mode->color_mode_id == mode->best.id) {
+		cmode = &mode->best;
+	}
 
 	dev_dbg(dcp->dev,
 		"set_digital_out_mode(color:%d timing:%d) " DRM_MODE_FMT "\n",
 		mode->color_mode_id, mode->timing_mode_id,
 		DRM_MODE_ARG(&crtc_state->mode));
-	if (mode->color_mode_id == mode->pq.id && mode->pq.score >= 0)
-		cmode = &mode->pq;
-	else if (mode->color_mode_id == mode->sdr_rgb.id)
-		cmode = &mode->sdr_rgb;
-	else if (mode->color_mode_id == mode->sdr_444.id)
-		cmode = &mode->sdr_444;
-	else if (mode->color_mode_id == mode->sdr.id)
-		cmode = &mode->sdr;
-	else if (mode->color_mode_id == mode->best.id)
-		cmode = &mode->best;
 	if (cmode)
 		dev_dbg(dcp->dev,
 			"color mode depth:%hhu format:%u colorimetry:%u eotf:%u range:%u vrr:%u\n",
 			cmode->depth, cmode->format, cmode->colorimetry,
 			cmode->eotf, cmode->range, mode->vrr);
 
-	dcp->mode = (struct dcp_set_digital_out_mode_req) {
-		.color_mode_id = mode->color_mode_id,
-		.timing_mode_id = mode->timing_mode_id
-	};
-	dcp->output_pq = dcp->pq_requested && mode->pq.score >= 0;
+	scoped_guard(spinlock_irqsave, &dcp->hdr.lock) {
+		dcp->mode = (struct dcp_set_digital_out_mode_req) {
+			.color_mode_id = mode->color_mode_id,
+			.timing_mode_id = mode->timing_mode_id
+		};
+		if (cmode)
+			dcp->active_color = *cmode;
+		else
+			dcp->active_color.score = -1;
+		dcp->output_pq = cmode && cmode->eotf == DCP_EOTF_ST_2084;
+		dcp->output_hdr = cmode && cmode->eotf != DCP_EOTF_SDR_GAMMA;
+	}
 
 	/* VRR modes need swap timestamps, see iomfb_flush(); so do fixed internal timings. */
 	dcp->use_timestamps = mode->needs_timestamps;
@@ -4161,12 +4207,16 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 #endif
 			       )
 {
-	struct dcp_display_mode selected, *mode = &selected;
+	struct dcp_display_mode *mode __free(kfree) = kzalloc_obj(*mode);
 	struct dcp_wait_cookie *cookie;
+	struct dcp_color_mode selected_color = { .score = -1 };
 	struct dcp_color_mode *cmode = NULL;
 	bool paired = false;
 	bool keep_mode = false;
 	int ret;
+
+	if (!mode)
+		return -ENOMEM;
 
 #if DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER < DCP_FW_VERSION(27, 0, 0)
 	if (dcp_is_ext26(dcp)) {
@@ -4204,9 +4254,21 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 		return -EIO;
 	}
 
-	/* An HDR commit scans out through the timing's PQ element. */
-	if (dcp->pq_requested && mode->pq.score >= 0)
+	if (!dcp_select_color_mode(mode, &dcp->color_req, &selected_color)) {
+		mode->color_mode_id = selected_color.id;
+		cmode = &selected_color;
+	} else if (dcp->pq_requested && mode->pq.score >= 0) {
 		mode->color_mode_id = mode->pq.id;
+		cmode = &mode->pq;
+	} else if (mode->color_mode_id == mode->sdr_rgb.id) {
+		cmode = &mode->sdr_rgb;
+	} else if (mode->color_mode_id == mode->sdr_444.id) {
+		cmode = &mode->sdr_444;
+	} else if (mode->color_mode_id == mode->sdr.id) {
+		cmode = &mode->sdr;
+	} else if (mode->color_mode_id == mode->best.id) {
+		cmode = &mode->best;
+	}
 
 	/* The connection's audio link runs through the mode set. */
 	av_audio_before_modeset(dcp);
@@ -4215,16 +4277,6 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 		 "set_digital_out_mode(color:%d timing:%d) " DRM_MODE_FMT "\n",
 		 mode->color_mode_id, mode->timing_mode_id,
 		 DRM_MODE_ARG(&crtc_state->mode));
-	if (mode->color_mode_id == mode->pq.id && mode->pq.score >= 0)
-		cmode = &mode->pq;
-	else if (mode->color_mode_id == mode->sdr_rgb.id)
-		cmode = &mode->sdr_rgb;
-	else if (mode->color_mode_id == mode->sdr_444.id)
-		cmode = &mode->sdr_444;
-	else if (mode->color_mode_id == mode->sdr.id)
-		cmode = &mode->sdr;
-	else if (mode->color_mode_id == mode->best.id)
-		cmode = &mode->best;
 	if (dcp_is_ext26(dcp)) {
 		if (mode->sdr_rgb.score < 0 || mode->sdr_rgb.depth != 8 ||
 		    mode->sdr_rgb.format != DCP_COLOR_FORMAT_RGB || crtc_state->vrr_enabled)
@@ -4250,11 +4302,18 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 		    dcp->mode.color_mode_id == mode->color_mode_id &&
 		    dcp->mode.timing_mode_id == mode->timing_mode_id;
 #endif
-	dcp->mode = (struct dcp_set_digital_out_mode_req){
-		.color_mode_id = mode->color_mode_id,
-		.timing_mode_id = mode->timing_mode_id
-	};
-	dcp->output_pq = dcp->pq_requested && mode->pq.score >= 0;
+	scoped_guard(spinlock_irqsave, &dcp->hdr.lock) {
+		dcp->mode = (struct dcp_set_digital_out_mode_req){
+			.color_mode_id = mode->color_mode_id,
+			.timing_mode_id = mode->timing_mode_id
+		};
+		if (cmode)
+			dcp->active_color = *cmode;
+		else
+			dcp->active_color.score = -1;
+		dcp->output_pq = cmode && cmode->eotf == DCP_EOTF_ST_2084;
+		dcp->output_hdr = cmode && cmode->eotf != DCP_EOTF_SDR_GAMMA;
+	}
 
 	/* Built-in ProMotion panels require timestamps even in fixed-120 mode. */
 	dcp->use_timestamps = mode->needs_timestamps && dcp->main_display;
@@ -4309,11 +4368,12 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 		complete_set_digital_out_mode(dcp, NULL, cookie);
 	} else
 #endif
-	if (mode->vrr &&
-		   dcp->hw.iomfb_method_profile !=
-		   DCP_IOMFB_METHODS_H17P_EXTERNAL)
+	if ((mode->vrr || dcp->vrr_enabled) &&
+	    dcp->hw.iomfb_method_profile !=
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL)
 		dcp_set_adaptive_sync(dcp,
-				      crtc_state->vrr_enabled ? mode->min_vrr : 0,
+				      mode->vrr && crtc_state->vrr_enabled ?
+				      mode->min_vrr : 0,
 				      cookie);
 	else
 		dcp_set_digital_out_mode(dcp, false, &dcp->mode,
@@ -4383,7 +4443,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	/* A firmware 27 pair took them on both engines (dcp_peer_finish_v27()). */
 	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL ||
 	    (dcp->fw_compat == DCP_FIRMWARE_V_27_0 && !dcp_has_panel(dcp) && !paired))
-		dcp_external_hdr_hints(dcp, dcp->output_pq);
+		dcp_external_hdr_hints(dcp, dcp->output_hdr);
 	dcp_link_report(dcp, &crtc_state->mode);
 
 	return 0;
@@ -4516,14 +4576,39 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 			req->surf[l].base.colorspace = DCP_COLORSPACE_P3_D65;
 
 		/*
-		 * On a PQ output the compositor has already encoded RGB
-		 * surfaces for the sink: BT.2020 primaries, PQ code values.
-		 * An EDR panel takes the same and maps them into its headroom.
+		 * On an HDR output the compositor has already encoded RGB
+		 * surfaces for the sink: BT.2020 primaries, PQ or HLG code
+		 * values.  An EDR panel takes PQ and maps it into its headroom.
+		 * Wide-gamut SDR outputs tag RGB surfaces with their target
+		 * primaries so DCP passes them through without sRGB gamut
+		 * remapping.
 		 */
-		if ((dcp->output_pq || dcp->output_edr) &&
-		    !new_state->fb->format->is_yuv) {
-			req->surf[l].base.colorspace = DCP_COLORSPACE_BT2020;
-			req->surf[l].base.xfer_func = DCP_XFER_FUNC_PQ;
+		if (!new_state->fb->format->is_yuv) {
+			if (dcp->output_pq || dcp->output_edr) {
+				req->surf[l].base.colorspace = DCP_COLORSPACE_BT2020;
+				req->surf[l].base.xfer_func = DCP_XFER_FUNC_PQ;
+			} else if (dcp->output_hdr &&
+				   dcp->active_color.eotf == DCP_EOTF_BT_2100) {
+				req->surf[l].base.colorspace = DCP_COLORSPACE_BT2020;
+				req->surf[l].base.xfer_func = DCP_XFER_FUNC_HLG;
+			} else if (!dcp_has_panel(dcp) &&
+				   dcp->active_color.score >= 0) {
+				switch (dcp->active_color.colorimetry) {
+				case DCP_COLORIMETRY_BT2020_RGB:
+				case DCP_COLORIMETRY_BT2020_YCC:
+				case DCP_COLORIMETRY_BT2020_CYCC:
+					req->surf[l].base.colorspace = DCP_COLORSPACE_BT2020;
+					break;
+				case DCP_COLORIMETRY_DCI_P3_RGB_D65:
+					req->surf[l].base.colorspace = DCP_COLORSPACE_P3_D65;
+					break;
+				case DCP_COLORIMETRY_DCI_P3_RGB_THEATER:
+					req->surf[l].base.colorspace = DCP_COLORSPACE_DCI_P3;
+					break;
+				default:
+					break;
+				}
+			}
 		}
 
 #if DCP_FW_H17(DCP_FW_VER)
@@ -4535,14 +4620,28 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		if (dcp->hw.iomfb_method_profile ==
 			    DCP_IOMFB_METHODS_H17P_EXTERNAL &&
 		    !new_state->fb->format->is_yuv &&
-		    req->surf[l].base.colorspace == DCP_COLORSPACE_P3_D65)
+		    req->surf[l].base.colorspace == DCP_COLORSPACE_P3_D65 &&
+		    (dcp->active_color.score < 0 ||
+		     dcp->active_color.colorimetry != DCP_COLORIMETRY_DCI_P3_RGB_D65))
 			req->surf[l].base.colorspace = DCP_COLORSPACE_UNSPECIFIED;
 #endif
 	}
 
+#if DCP_FW_H17(DCP_FW_VER)
+	/*
+	 * Keep sending an explicit slot-zero update until a displayed KMS
+	 * completion confirms the boot scanout has retired. An enabled primary
+	 * plane is pulled into the atomic commit by apple_atomic_check(); if
+	 * slot zero is still absent here, the primary plane is disabled and
+	 * slot zero should be cleared.
+	 */
+	if (dcp->boot_surface_pending && !(req->swap.swap_enabled & BIT(0)))
+		req->swap.swap_enabled |= BIT(0);
+#endif
+
 	if (!has_surface && !crtc_state->color_mgmt_changed) {
 		if (crtc_state->enable && crtc_state->active &&
-		    !crtc_state->planes_changed) {
+		    !crtc_state->planes_changed && !dcp->boot_surface_pending) {
 			schedule_work(&dcp->vblank_wq);
 			return;
 		}
@@ -4608,10 +4707,12 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 			   dcp->brightness.bl_dev->props.brightness :
 			   dcp->brightness.nits;
 
-		if (nits > 0)
+		if (nits > 0) {
 			iomfb_encode_backlight_swap_h17p((u8 *)&req->swap, nits,
 							 dcp->brightness.maximum,
 							 true);
+			dcp_backlight_presented(dcp, nits);
+		}
 #else
 #if DCP_FW_LAYOUT_14_7(DCP_FW_VER)
 		req->swap.bl_update = 1;
@@ -4620,6 +4721,7 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 #endif
 		req->swap.bl_value = dcp->brightness.dac;
 		req->swap.bl_power = 0x40;
+		dcp_backlight_presented(dcp, dcp->brightness.level);
 #endif
 		dcp->brightness.update = false;
 	}
@@ -4899,6 +5001,13 @@ static void dcp_started(struct apple_dcp *dcp, void *data, void *cookie)
 	dev_info(dcp->dev, "DCP booted\n");
 
 	iomfb_get_color_remap_mode(dcp, false, &color_remap, init_1, cookie);
+}
+
+/* These sessions program the catalogue's colour ID and tag PQ surfaces. */
+static void iomfb_template_start(struct apple_dcp *dcp)
+{
+	WRITE_ONCE(dcp->iomfb_template_pq, true);
+	dcp_start_signal(dcp, false, dcp_started, NULL);
 }
 
 void DCP_FW_NAME(iomfb_shutdown)(struct apple_dcp *dcp)
