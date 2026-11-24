@@ -599,6 +599,31 @@ pub(crate) fn validate_sampler<A: GpuAddressSpace>(
     Ok(())
 }
 
+/// Validates a helper program descriptor for a queue whose commands encode helpers: either no
+/// helper (all fields zero), or a tagged program offset that names a readable program in the
+/// queue's USC window and an 8-byte-aligned argument block that the submitting VM maps
+/// read-write. The configuration word is only accepted together with a program.
+pub(crate) fn validate_helper<A: GpuAddressSpace>(
+    queue: QueueUscWindow,
+    address_space: &A,
+    helper: UapiHelperProgram,
+) -> Result<(), UapiTranslateError> {
+    if helper
+        == (UapiHelperProgram {
+            binary: 0,
+            config: 0,
+            data: 0,
+        })
+    {
+        return Ok(());
+    }
+    queue.full_program(address_space, helper.binary)?;
+    if helper.data & 7 != 0 {
+        return Err(UapiTranslateError::AddressAlignment);
+    }
+    require_range(address_space, helper.data, 8, GpuAccess::ReadWrite)
+}
+
 pub(crate) fn validate_attachments<A: GpuAddressSpace>(
     address_space: &A,
     attachments: &UapiAttachmentList,

@@ -398,9 +398,17 @@ impl queue::Queue for Queue {
             // The common translator validates the original command/attachment
             // addresses; this M3 scheduling hint changes none of them.
             payload.flags &= !wide;
-            // The common translator refuses helpers; a queue that encodes one takes it here.
+            // The common translator refuses helpers; a queue that encodes one validates and
+            // takes it here.
             let empty=agx_uapi::UapiHelperProgram{binary:0,config:0,data:0};
-            let helper=if self.samplers_and_helpers {core::mem::replace(&mut payload.helper,empty)} else {empty};
+            let helper=if self.samplers_and_helpers {
+                agx_uapi::validate_helper(agx_uapi::QueueUscWindow{base:self.usc,user_start:0x4000,user_end:(1u64<<42)-0x8000},
+                    &AddressSpace(&self.vm),payload.helper).map_err(|e| {
+                        pr_err!("M3 compute helper rejected {:?}: helper={:?}\n",e,payload.helper);
+                        EINVAL
+                    })?;
+                core::mem::replace(&mut payload.helper,empty)
+            } else {empty};
             render_attachments.push([crate::m3::agx_attachments::Attachments::EMPTY;2],GFP_KERNEL)?;
             flushes.push(encode_attachments(&self.vm,&attachments)?,GFP_KERNEL)?;
             let c=agx_uapi::translate_compute_command(payload,attachments,
@@ -500,6 +508,10 @@ fn validate_render(r: agx_uapi::UapiRenderCommand, usc: u64, space: &AddressSpac
     for p in [r.background,r.end_of_tile,r.partial_background,r.partial_end_of_tile] {
         window.full_program(space,p.usc).map_err(|_| EINVAL)?;
         if !space.covers(usc+u64::from(p.usc & !63),64,GpuAccess::Read) { return Err(EINVAL); }
+    }
+    // Only a queue that encodes helpers gets here with one (refused above otherwise).
+    for helper in [r.vertex_helper,r.fragment_helper] {
+        agx_uapi::validate_helper(window,space,helper).map_err(|_| EINVAL)?;
     }
     Ok(())
 }
