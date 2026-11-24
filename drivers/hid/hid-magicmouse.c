@@ -2730,9 +2730,6 @@ static int apple_taptic_init_mtp(struct magicmouse_sc *msc,
 	INIT_WORK(&msc->haptic_deep_release_work,
 		  magicmouse_deep_release_worker);
 
-	if (haptic_deep_keycode)
-		magicmouse_setup_force_input(msc);
-
 	/* FF_HAPTIC has to be in ffbit before the FF device is created. */
 	input_set_capability(msc->input, EV_FF, FF_HAPTIC);
 
@@ -2751,6 +2748,13 @@ static int apple_taptic_init_mtp(struct magicmouse_sc *msc,
 		dev_err(&trackpad_hdev->dev, "Failed to create force-feedback device.\n");
 		return ret;
 	}
+
+	/*
+	 * Only now: if the FF device could not be created there are no
+	 * haptics, and no Force Click device must be left registered.
+	 */
+	if (haptic_deep_keycode)
+		magicmouse_setup_force_input(msc);
 
 	ff = msc->input->ff;
 	ff->private = haptic_dev;
