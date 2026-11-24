@@ -68,9 +68,45 @@ static void dcp_firmware_27_method_admission(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, missing, 1U);
 }
 
+/*
+ * The firmware 27 display sleep sends its calls by their 27.0 IDs, so only a table that gives
+ * each of them that ID carries it: 27.0's (and the J714s copy), not 27.2's or 27.3's.
+ */
+static void dcp_firmware_27_sleep_methods(struct kunit *test)
+{
+	const struct dcp_method_entry *earlier = iomfb_v27_methods("27.0.0");
+	struct dcp_method_entry *table;
+
+	KUNIT_ASSERT_NOT_NULL(test, earlier);
+	KUNIT_EXPECT_NULL(test, iomfb_v27_sleep_missing_method(earlier));
+	KUNIT_EXPECT_STREQ(test, iomfb_v27_sleep_missing_method(iomfb_v27_methods("27.2.0")),
+			   earlier[dcpep_set_power_state].name);
+	KUNIT_EXPECT_STREQ(test, iomfb_v27_sleep_missing_method(iomfb_v27_methods("27.3.0")),
+			   earlier[dcpep_set_power_state].name);
+	KUNIT_EXPECT_STREQ(test, iomfb_v27_sleep_missing_method(NULL),
+			   earlier[dcpep_set_power_state].name);
+
+	/*
+	 * The J714s copy differs in a call the sleep does not make; one sleep call with another
+	 * ID, or none, is enough to refuse the sleep.
+	 */
+	table = kunit_kmalloc(test, sizeof(*earlier) * dcpep_num_methods, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, table);
+	memcpy(table, earlier, sizeof(*earlier) * dcpep_num_methods);
+	memcpy(table[dcpep_swap_submit].tag, "A407", sizeof(table[dcpep_swap_submit].tag));
+	KUNIT_EXPECT_NULL(test, iomfb_v27_sleep_missing_method(table));
+	memcpy(table[dcpep_is_main_display].tag, "A462", sizeof(table[dcpep_is_main_display].tag));
+	KUNIT_EXPECT_STREQ(test, iomfb_v27_sleep_missing_method(table),
+			   earlier[dcpep_is_main_display].name);
+	memset(table[dcpep_unnamed_500].tag, 0, sizeof(table[dcpep_unnamed_500].tag));
+	KUNIT_EXPECT_STREQ(test, iomfb_v27_sleep_missing_method(table),
+			   earlier[dcpep_unnamed_500].name);
+}
+
 static struct kunit_case dcp_firmware_cases[] = {
 	KUNIT_CASE(dcp_firmware_13_5_compat),
 	KUNIT_CASE(dcp_firmware_27_method_admission),
+	KUNIT_CASE(dcp_firmware_27_sleep_methods),
 	{}
 };
 

@@ -309,6 +309,7 @@ static int of_property_read_u32_array(const struct device_node *np, const char *
 }
 #define DCP_FW_VERSION_STR_LEN 32
 #define GFP_KERNEL 0
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #define dev_err(...) ((void)0)
 static void *devm_kmemdup(struct device *dev, const void *src, size_t len, unsigned int gfp)
 {

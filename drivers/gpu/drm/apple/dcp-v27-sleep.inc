@@ -414,6 +414,26 @@ static void dcp_v27_sleep_invalidate(struct apple_dcp *dcp)
 	apple_sleep_v27_prepared(dcp->dev, false);
 }
 
+/*
+ * Whether this build's method table carries every call of the display sleep under the ID the
+ * sleep sends (iomfb_v27_sleep_missing_method()). A deep sleep the T6050 sleep would run with
+ * a processor whose table does not is refused at the device .prepare, before any device
+ * suspends, with one line; s2idle never comes here (no pm_suspend_via_firmware()). Without
+ * it the sleep would send IDs that the build gives to other methods, or to none.
+ */
+static int dcp_v27_sleep_known(struct apple_dcp *dcp)
+{
+	char compat[DCP_FW_VERSION_STR_LEN] = "";
+	const char *missing = iomfb_v27_sleep_missing_method(dcp->v27_methods);
+
+	if (!missing)
+		return 0;
+	dcp_read_fw_version(dcp->dev, "apple,firmware-compat", compat);
+	dev_warn(dcp->dev, "deep sleep refused: firmware %s gives the display sleep's %s another ID or none; s2idle is not affected\n",
+		 compat, missing);
+	return -EOPNOTSUPP;
+}
+
 /* DCPEXT0..3, from the processors' DT index (the internal display's is 0). */
 static unsigned int dcp_v27_ext_nr(struct apple_dcp *dcp)
 {
@@ -1016,6 +1036,12 @@ static int dcp_v27_sleep_endpoints_open(struct apple_dcp *dcp)
 		ep = READ_ONCE(dcp->sleep_v27_ep[id - 0x20]);
 		if (ep)
 			continue;
+		/*
+		 * A ring already runs there without being tracked for the sleep: starting the
+		 * endpoint again makes the firmware assert. Refused before anything is sent.
+		 */
+		if (!IS_ERR_OR_NULL(dcp_afkep(dcp, id)))
+			return -EPROTO;
 		if (served && !s->ext_wq) {
 			/* Not ordered and not the endpoint's: a call waits for its reply. */
 			s->ext_wq = alloc_workqueue("apple-dcp-ext-av", WQ_UNBOUND, 0);
@@ -1434,6 +1460,9 @@ static int dcp_v27_sleep_prepare(struct apple_dcp *dcp)
 	int ret;
 
 	dcp_v27_sleep_invalidate(dcp);
+	/* .prepare refused it already; no call goes out under an ID this build does not carry. */
+	if (iomfb_v27_sleep_missing_method(dcp->v27_methods))
+		return -EOPNOTSUPP;
 	/* Refused before anything changes: the sleep RPCs' arguments come from the DT. */
 	if (!iomfb_v27_sleep_described(dcp)) {
 		dev_warn(dcp->dev, "V27 sleep: no sleep RPC arguments in the DT\n");
@@ -1745,6 +1774,7 @@ static void dcp_v27_dark_replug_owed(struct apple_dcp *dcp)
 static void dcp_v27_dark_replug_owed(struct apple_dcp *dcp) { }
 static bool dcp_v27_sleep_selected(struct apple_dcp *dcp) { return false; }
 static void dcp_v27_sleep_invalidate(struct apple_dcp *dcp) { }
+static int dcp_v27_sleep_known(struct apple_dcp *dcp) { return 0; }
 static int dcp_v27_sleep_suspend(struct apple_dcp *dcp) { return -EOPNOTSUPP; }
 static int dcp_v27_sleep_resume(struct apple_dcp *dcp) { return -EOPNOTSUPP; }
 #endif

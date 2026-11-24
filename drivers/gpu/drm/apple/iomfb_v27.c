@@ -320,6 +320,41 @@ const char *iomfb_v27_missing_method(const struct dcp_method_entry *methods,
 	return first;
 }
 
+/*
+ * The calls of the firmware 27 display sleep that have an entry in the method tables. The
+ * sleep sends each one by its 27.0 ID (dcp-v27-sleep.inc, iomfb_v27_rpc()), so it may run on
+ * a build only if that build's table gives every one of them the same ID. Its two other calls
+ * have no table entry: A115 keeps its ID on 27.2, and A442 goes out only with A484 or A489,
+ * which are checked here.
+ */
+static const enum dcpep_method iomfb_v27_sleep_methods[] = {
+	dcpep_set_power_state,
+	dcpep_unnamed_500,
+	dcpep_pipe_cfg_414,
+	dcpep_pipe_query_478,
+	dcpep_pipe_set_476,
+	dcpep_is_main_display,
+};
+
+/*
+ * The driver's name for the first call of the firmware 27 display sleep that @methods does
+ * not carry under the ID the sleep sends (every one, without a table), NULL if it carries
+ * them all.
+ */
+const char *iomfb_v27_sleep_missing_method(const struct dcp_method_entry *methods)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(iomfb_v27_sleep_methods); i++) {
+		enum dcpep_method m = iomfb_v27_sleep_methods[i];
+
+		if (!methods || memcmp(methods[m].tag, dcp_methods_27_0[m].tag,
+				       sizeof(methods[m].tag)))
+			return dcp_methods_27_0[m].name;
+	}
+	return NULL;
+}
+
 /* The template's calls resolve through the table probe chose for this build. */
 #define dcp_methods (dcp->v27_methods)
 

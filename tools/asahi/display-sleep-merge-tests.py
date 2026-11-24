@@ -56,28 +56,32 @@ assert prefix.index(v27) < prefix.index(native)
 pre = common + r'''
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x,v) ((x)=(v))
-struct apple_dcp { bool v27, native26, crashed, ext26_blocked, ext26_pm_preparing, ext26_pm_work_off; int ext26_blank_work; };
+struct apple_dcp { bool v27, v27_known, native26, crashed, ext26_blocked, ext26_pm_preparing, ext26_pm_work_off; int ext26_blank_work; };
 struct device { struct apple_dcp *d; };
 static int invalidations, cancellations, disables; static bool firmware;
 static void *dev_get_drvdata(struct device *v) { return v->d; }
 static bool pm_suspend_via_firmware(void) { return firmware; }
 static bool dcp_v27_sleep_selected(struct apple_dcp *d) { return d->v27; }
 static void dcp_v27_sleep_invalidate(struct apple_dcp *d) { invalidations++; }
+static int dcp_v27_sleep_known(struct apple_dcp *d) { return d->v27_known ? 0 : -EOPNOTSUPP; }
 static bool dcp_is_ext26(struct apple_dcp *d) { return d->native26; }
 static void cancel_work_sync(int *w) { cancellations++; }
 static void dcp_disable_typec_work(struct apple_dcp *d, bool sync) { disables++; }
 '''
 tests = r'''
 int main(void) {
- struct apple_dcp d={.v27=true,.native26=true}; struct device dev={.d=&d}; firmware=true;
+ struct apple_dcp d={.v27=true,.v27_known=true,.native26=true}; struct device dev={.d=&d}; firmware=true;
  assert(dcp_platform_prepare(&dev)==0 && invalidations==1 && cancellations==0 && !d.ext26_pm_preparing);
+ /* A deep sleep whose display sleep the build's table does not carry: refused, nothing else runs. */
+ d.v27_known=false; assert(dcp_platform_prepare(&dev)==-EOPNOTSUPP && invalidations==2 && cancellations==0);
  d.v27=false; d.crashed=true; assert(dcp_platform_prepare(&dev)==-EIO && cancellations==0);
  d.crashed=false; assert(dcp_platform_prepare(&dev)==0 && cancellations==1 && disables==1 && d.ext26_pm_work_off);
- d.native26=false; d.v27=true; firmware=false; assert(dcp_platform_prepare(&dev)==42 && invalidations==1);
+ d.native26=false; d.v27=true; firmware=false; assert(dcp_platform_prepare(&dev)==42 && invalidations==2);
 }
 '''
 for label, body, negative in [('prepare', prefix, False),
                               ('prepare-drop-v27', prefix.replace(v27, ''), True),
+                              ('prepare-ignore-known', prefix.replace('return dcp_v27_sleep_known(dcp);', 'return 0;'), True),
                               ('prepare-drop-native', prefix.replace(native, ''), True),
                               ('prepare-reverse-order', prefix.replace(v27, '').replace(native, native + '\n' + v27), True)]:
     run(label, pre + body + '\nreturn 42;\n}\n' + tests, negative)
@@ -222,5 +226,5 @@ for label, body, version, negative in [('mode26', mode, 26, False), ('mode27', m
     code = pre + 'static int evaluate(struct apple_dcp *dcp,bool keep_mode,struct cookie *cookie) { int ret;\n' + body + '{ modesets++; }\nreturn 0;\n}\n' + tests
     run(label, code, negative, extra=(f'-DDCP_FW_VER={version}',))
 
-assert len(results) == 17
-print('PASS: 17 compiled merge-boundary runs, including runtime controls', flush=True)
+assert len(results) == 18
+print('PASS: 18 compiled merge-boundary runs, including runtime controls', flush=True)
