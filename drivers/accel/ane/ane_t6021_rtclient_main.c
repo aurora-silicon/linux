@@ -4121,7 +4121,9 @@ static int ane_rtclient_sleep_stop27(struct ane_rtclient *ane,
 
 /*
  * After a 27.x restart (@ret its result): every program open before the
- * sleep is loaded again behind its handle, then admission reopens. A failed
+ * sleep is loaded again behind its handle, then admission reopens. The
+ * restart booted a new firmware on a CPU whose domains went off, so a
+ * quarantine of the old one ends (ane_h16_session_recovered()). A failed
  * boot or replay leaves the session parked, so its waiters fail at once.
  */
 static void ane_rtclient_session_resume(struct ane_rtclient *ane, int ret, u64 start)
@@ -4132,6 +4134,9 @@ static void ane_rtclient_session_resume(struct ane_rtclient *ane, int ret, u64 s
 
 	if (!ret) {
 		ane_h16_session_restart(s);
+		/* The old firmware's domains went off: nothing reads its memory. */
+		if (s->quarantined)
+			ane_h16_session_recovered(s);
 		ret = ane_h16_session_replay(s, &replayed, &first);
 	}
 	if (ret)
