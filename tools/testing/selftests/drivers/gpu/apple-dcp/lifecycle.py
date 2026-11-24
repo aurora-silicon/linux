@@ -1844,12 +1844,13 @@ enum dcp_firmware_version { DCP_FIRMWARE_UNKNOWN, DCP_FIRMWARE_V_12_3, DCP_FIRMW
     DCP_FIRMWARE_V_14_7, DCP_FIRMWARE_V_14_7_TEMPLATE, DCP_FIRMWARE_V_26_6,
     DCP_FIRMWARE_V_26_6_DESKTOP, DCP_FIRMWARE_V_27_0 };
 struct apple_dcp {
-    bool crashed, external, external_native, quiescing, main_display, panel, iomfb_template_pq;
+    bool crashed, external, external_native, quiescing, main_display, panel, iomfb_template_pq, vrr_enabled;
     int peer_check; /* what the firmware 27 paired-timing check answers */
     unsigned int nr_typec_routes;
     enum dcp_firmware_version fw_compat;
     struct { int iomfb_method_profile; } hw;
     struct { bool valid; } mode_state;
+    struct { bool vrr_failed; } *desktop;
     struct apple_connector *connector;
     void *dev;
 };
@@ -1955,6 +1956,7 @@ FW27_VRR    dcp.crashed = true;
     # processors ignore a live minimum rate and still apply it with a mode set.
     desktop = r"""    dcp.fw_compat = DCP_FIRMWARE_V_26_6_DESKTOP;
     dcp.iomfb_template_pq = true;
+    dcp.vrr_enabled = true;
     dcp.hw.iomfb_method_profile = 0;
     dcp.mode_state.valid = true;
     dcp.connector = &connector;
@@ -1979,7 +1981,27 @@ FW27_VRR    dcp.crashed = true;
         }
         cases++;
     }
+    /* Adopted desktop 26.6 panel boot mode starts fixed (!dcp.vrr_enabled):
+     * enabling VRR_ENABLED triggers one modeset to arm adaptive sync unless vrr_failed. */
+    {
+        __typeof__(*dcp.desktop) ds = { .vrr_failed = false };
+        dcp.desktop = &ds;
+        dcp.main_display = true;
+        dcp.vrr_enabled = false;
+        state.crtc.enable = true;
+        state.no_old_crtc = false;
+        state.old_crtc.vrr_enabled = false;
+        state.crtc.vrr_enabled = true;
+        state.crtc.mode_changed = false;
+        assert(dcp_crtc_atomic_check(&crtc, &state) == 0 && state.crtc.mode_changed);
+        ds.vrr_failed = true;
+        state.crtc.mode_changed = false;
+        assert(dcp_crtc_atomic_check(&crtc, &state) == 0 && !state.crtc.mode_changed);
+        dcp.desktop = NULL;
+        cases += 2;
+    }
     dcp.main_display = false;
+    dcp.vrr_enabled = false;
     dcp.iomfb_template_pq = false;
     dcp.fw_compat = DCP_FIRMWARE_UNKNOWN;
 """

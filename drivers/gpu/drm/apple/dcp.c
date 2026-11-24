@@ -2222,14 +2222,20 @@ int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_commit *commi
 
 	/*
 	 * On desktop 26.6 firmware the panel takes VRR_ENABLED with the next
-	 * frame, without a mode set (see dcp_vrr_update()).  Other template
-	 * pipes change adaptive sync inside iomfb_modeset() via a full mode
-	 * set, except firmware 27 panels which do not re-modeset on VRR.
+	 * frame, without a mode set (see dcp_vrr_update()), once a mode set
+	 * has armed adaptive sync.  An adopted boot mode starts fixed
+	 * (!dcp->vrr_enabled), so enabling VRR_ENABLED the first time still
+	 * needs one mode set; other template pipes change adaptive sync inside
+	 * iomfb_modeset() via a full mode set, except firmware 27 panels which
+	 * do not re-modeset on VRR.
 	 */
 	if (READ_ONCE(dcp->iomfb_template_pq) &&
 	    !(dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
 	      (dcp->main_display || dcp_has_panel(dcp))) &&
-	    crtc_state->enable && !dcp_vrr_live(dcp)) {
+	    crtc_state->enable &&
+	    !(dcp_vrr_live(dcp) &&
+	      (READ_ONCE(dcp->vrr_enabled) || !crtc_state->vrr_enabled ||
+	       (dcp->desktop && READ_ONCE(dcp->desktop->vrr_failed))))) {
 		struct drm_crtc_state *old =
 			drm_atomic_get_old_crtc_state(commit, crtc);
 

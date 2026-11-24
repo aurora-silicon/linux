@@ -3053,12 +3053,18 @@ static int dcp_takeover_adopt(struct apple_dcp *dcp, const struct drm_display_mo
 
 	if (!sel)
 		return -ENOENT;
-	dcp->mode = (struct dcp_set_digital_out_mode_req) {
-		.color_mode_id = sel->color_mode_id,
-		.timing_mode_id = sel->timing_mode_id,
-	};
+	scoped_guard(spinlock_irqsave, &dcp->hdr.lock) {
+		dcp->mode = (struct dcp_set_digital_out_mode_req) {
+			.color_mode_id = sel->color_mode_id,
+			.timing_mode_id = sel->timing_mode_id,
+		};
+		if (dcp_default_sdr_color(sel, &dcp->active_color))
+			dcp->active_color.score = -1;
+		dcp->output_pq = false;
+		dcp->output_hdr = false;
+		dcp->vrr_enabled = false;
+	}
 	dcp->use_timestamps = sel->needs_timestamps;
-	dcp->vrr_enabled = false;
 	d->mode_live = true;
 	d->takeover_adopted = true;
 	dev_info(dcp->dev, "takeover: adopting the live mode (color:%u timing:%u) " DRM_MODE_FMT "\n",
