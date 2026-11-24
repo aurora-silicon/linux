@@ -178,6 +178,10 @@ ASAHI_TESTS = {
                                    'missing-control-firmware', 'missing-control-descriptor',
                                    'missing-owner-ipc', 'missing-owner-firmware',
                                    'missing-owner-descriptor', 'missing-owner-arena'), out()),
+    # A fixed (non-Type-C) output takes its DP AV service again after a sleep.
+    'dpavserv-admission-tests.py': [([], PASS)]
+        + mutations('--mutation', ('old-cable-wait', 'ignore-generation', 'ignore-cable',
+                                     'ignore-quiescing'), []),
     'dcp-bw-scratch-window-tests.py': [([], PASS)] + mutations('--mutation', ('old-check', 'start-only'), []),
     'clpc-gpu-demand-tests.py': [([], PASS)],
     'clpc-high-power-cleanup-tests.py': [(out(), PASS),
@@ -293,6 +297,9 @@ ASAHI_TESTS = {
                                    'mailbox-minimum', 'version-string', 'message-string'), out()),
     'rtkit-oslog-tests.py': [(out(), PASS)]
         + mutations('--mutate', ('admission', 'channel', 'counter', 'reset', 'buffer'), out()),
+    'rtkit-adopted-session-tests.py': [(out(), PASS)]
+        + mutations('--mutation', ('no-management', 'any-system', 'any-version',
+                                   'ignore-ops-version', 'any-buffer-endpoint'), out()),
     'rtkit-retained-tests.py': [(out(), PASS)],
     't6030-clock-tests.py': [(out(), PASS)],
     't6030-display-admission-tests.py': [(out('--output'), PASS), (out('--output') + ['--mutations'], PASS)],

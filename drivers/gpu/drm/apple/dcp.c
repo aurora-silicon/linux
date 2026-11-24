@@ -14,6 +14,7 @@
 #include <linux/dma-fence.h>
 #include <linux/gpio/consumer.h>
 #include <linux/iommu.h>
+#include <linux/of_reserved_mem.h>
 #include <linux/jiffies.h>
 #include <linux/kconfig.h>
 #include <linux/kernel.h>
@@ -1855,6 +1856,170 @@ static int dcp_check_iova_contiguous(struct iommu_domain *domain,
 	return 0;
 }
 
+#define DCP_RTKIT_HANDOFF		"dcp-live-v1"
+#define DCP_RTKIT_LIVE_BUFFER_CELLS	5
+#define DCP_RTKIT_LIVE_MAX_BUFFERS	4
+
+struct dcp_rtkit_live {
+	struct apple_rtkit_adopted_session session;
+	struct apple_rtkit_inherited_buffer buffers[DCP_RTKIT_LIVE_MAX_BUFFERS];
+};
+
+/*
+ * Inside one of this DCP's no-map reserved-memory carveouts. Those are also what
+ * the IOMMU core rebuilds the DCP's DART mappings from when it takes over a
+ * locked root, so a buffer outside them would lose its mapping at attach. A
+ * region in the linear map would alias the write-combined mapping of the buffer
+ * with a cacheable one, and a reusable (CMA) region could be handed out.
+ */
+static bool dcp_rtkit_live_carveout(struct device_node *np, phys_addr_t phys,
+				    size_t size)
+{
+	int i, count = of_count_phandle_with_args(np, "memory-region", NULL);
+	bool found = false;
+
+	for (i = 0; !found && i < count; i++) {
+		struct device_node *mem = of_parse_phandle(np, "memory-region", i);
+		struct reserved_mem *rmem;
+
+		if (!mem)
+			break;
+		rmem = of_reserved_mem_lookup(mem);
+		found = rmem && of_property_present(mem, "no-map") &&
+			!of_property_present(mem, "reusable") &&
+			phys >= rmem->base && size <= rmem->size &&
+			phys - rmem->base <= rmem->size - size;
+		of_node_put(mem);
+	}
+	return found;
+}
+
+static void dcp_rtkit_live_unmap(struct dcp_rtkit_live *live)
+{
+	unsigned int i;
+
+	for (i = 0; i < live->session.num_buffers; i++)
+		vunmap(live->buffers[i].shmem.private);
+	live->session.num_buffers = 0;
+}
+
+/*
+ * A boot stage that negotiated RTKit with this DCP and handed it over running
+ * describes the session on the node, with the RTKit handoff properties of other
+ * co-processors handed over running: apple,rtkit-handoff ("dcp-live-v1") and
+ * apple,rtkit-buffers (<ep dva_hi dva_lo size is_mapped> per system buffer, the
+ * device address being the DART input address), plus apple,rtkit-version and
+ * apple,rtkit-epmap (word i = endpoints 32i..32i+31). Each buffer lies in one of
+ * the node's memory-region carveouts, mapped there through its iommu-addresses.
+ * Such a firmware does not repeat HELLO or EPMAP. Returns 1 with the session
+ * filled in, 0 without a description, or an error for one that cannot be adopted
+ * safely.
+ */
+static int dcp_rtkit_live_parse(struct apple_dcp *dcp, struct dcp_rtkit_live *live)
+{
+	u32 cells[DCP_RTKIT_LIVE_MAX_BUFFERS * DCP_RTKIT_LIVE_BUFFER_CELLS];
+	struct device_node *np = dcp->dev->of_node;
+	struct iommu_domain *domain;
+	const char *handoff;
+	int count, i, ret;
+	u32 version;
+
+	if (!of_property_present(np, "apple,rtkit-handoff"))
+		return 0;
+	ret = of_property_read_string(np, "apple,rtkit-handoff", &handoff);
+	if (ret)
+		return ret;
+	if (strcmp(handoff, DCP_RTKIT_HANDOFF)) {
+		dev_err(dcp->dev, "unknown RTKit handoff \"%s\"\n", handoff);
+		return -EINVAL;
+	}
+	if (!(readl_relaxed(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL) &
+	      APPLE_DCP_COPROC_CPU_CONTROL_RUN)) {
+		dev_err(dcp->dev, "live RTKit session without a running CPU\n");
+		return -ENODEV;
+	}
+	ret = of_property_read_u32(np, "apple,rtkit-version", &version);
+	if (ret || version > U16_MAX)
+		return ret ?: -EINVAL;
+	live->session.protocol_version = version;
+	ret = of_property_read_u32_array(np, "apple,rtkit-epmap",
+					 live->session.epmap,
+					 APPLE_RTKIT_ADOPTED_EPMAP_WORDS);
+	if (ret)
+		return ret;
+
+	/* A session without shared buffers has the property, empty. */
+	if (!of_find_property(np, "apple,rtkit-buffers", NULL))
+		return -EINVAL;
+	count = of_property_count_u32_elems(np, "apple,rtkit-buffers");
+	if (count == -ENODATA)
+		count = 0;
+	if (count < 0 || count > ARRAY_SIZE(cells) ||
+	    count % DCP_RTKIT_LIVE_BUFFER_CELLS)
+		return -EINVAL;
+	if (count) {
+		ret = of_property_read_u32_array(np, "apple,rtkit-buffers",
+						 cells, count);
+		if (ret)
+			return ret;
+	}
+	count /= DCP_RTKIT_LIVE_BUFFER_CELLS;
+
+	domain = iommu_get_domain_for_dev(dcp->dev);
+	if (count && !domain)
+		return -ENODEV;
+
+	live->session.buffers = live->buffers;
+	for (i = 0; i < count; i++) {
+		const u32 *t = &cells[i * DCP_RTKIT_LIVE_BUFFER_CELLS];
+		struct apple_rtkit_inherited_buffer *b = &live->buffers[i];
+		u64 iova = (u64)t[1] << 32 | t[2];
+		u64 size = t[3];
+		phys_addr_t phys;
+
+		/* The system endpoints with shared buffers, as for other handoffs. */
+		if ((t[0] != 1 && t[0] != 2 && t[0] != 4 && t[0] != 8) ||
+		    t[4] > 1 || !size || size > SZ_16M || !PAGE_ALIGNED(iova) ||
+		    !PAGE_ALIGNED(size) || iova + size < iova) {
+			ret = -EINVAL;
+			goto fail;
+		}
+		/* The DCP's own DART says where the buffer is; it must be contiguous. */
+		phys = iommu_iova_to_phys(domain, iova);
+		ret = phys ? dcp_check_iova_contiguous(domain, iova, size, phys) : -ENXIO;
+		if (ret) {
+			dev_err(dcp->dev, "live RTKit buffer ep%u iova %#llx+%#llx is not mapped\n",
+				t[0], iova, size);
+			goto fail;
+		}
+		if (!dcp_rtkit_live_carveout(np, phys, size)) {
+			dev_err(dcp->dev, "live RTKit buffer %pa+%#llx is not in a DCP carveout\n",
+				&phys, size);
+			ret = -EACCES;
+			goto fail;
+		}
+
+		/* Firmware writes without CPU cache maintenance. */
+		ret = dcp_vmap_wc(phys, size, &b->shmem.iomem, &b->shmem.private);
+		if (ret)
+			goto fail;
+		b->endpoint = t[0];
+		b->shmem.iova = iova;
+		b->shmem.size = size;
+		/*
+		 * The is_mapped cell only says who placed the buffer; Linux has
+		 * mapped every one here, and is_mapped makes RTKit unmap it.
+		 */
+		b->shmem.is_mapped = true;
+		live->session.num_buffers = i + 1;
+	}
+	return 1;
+
+fail:
+	dcp_rtkit_live_unmap(live);
+	return ret;
+}
+
 int dcp_rtk_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
 {
 	struct apple_dcp *dcp = cookie;
@@ -2324,16 +2489,15 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 	bool late_hpd = dcp_ext_dptx_607(dcp);
 	bool t8132 = dcp_is_t8132_ext(dcp);
 	/*
-	 * A DP2HDMI output on the 13.5 firmware line asserts its own HPD, in
-	 * dcp_enable_dp2hdmi_hpd(), and the connect asks the firmware for HPD
-	 * only on a DisplayPort connector or a late-HPD path, so this firmware
-	 * is never asked to detect the sink and never sends the link
-	 * configuration the wait below looks for. Treat the timeout as
-	 * non-fatal, as the compact and late-HPD cases do, instead of
-	 * withdrawing the display.
+	 * A DP2HDMI output asserts its own HPD, in dcp_enable_dp2hdmi_hpd().
+	 * The 13.5 firmware line is then never asked to detect the sink and
+	 * never sends the link configuration the wait below looks for, and a
+	 * session a boot stage handed over has a link it already trained.
+	 * Treat the timeout as non-fatal there, as the compact and late-HPD
+	 * cases do, instead of withdrawing the display.
 	 */
 	bool dp2hdmi = dcp->hdmi_hpd && !dcp_is_typec_output(dcp) &&
-		       dcp->fw_compat == DCP_FIRMWARE_V_13_5;
+		       (dcp->fw_compat == DCP_FIRMWARE_V_13_5 || dcp->rtkit_adopted);
 	bool compact, withdrawn;
 	unsigned long timeout;
 	u64 generation;
@@ -2507,8 +2671,9 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 		ret = 0;
 	} else if (!ret && dp2hdmi) {
 		/*
-		 * The converter holds HPD itself, and dptxport_set_hpd() below runs
-		 * only for a DisplayPort connector, so nothing is asserted here.
+		 * The converter holds HPD itself; dptxport_set_hpd() below raises
+		 * the firmware's HPD only on an adopted session, whose release at
+		 * start dropped it.
 		 */
 		dev_dbg(dcp->dev,
 			"dcp_dptx_connect: no link configuration on port %u, HPD is the converter's\n",
@@ -2531,7 +2696,8 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 
 	usleep_range(5, 10);
 
-	if (dcp->connector_type == DRM_MODE_CONNECTOR_DisplayPort || late_hpd) {
+	if (dcp->connector_type == DRM_MODE_CONNECTOR_DisplayPort || late_hpd ||
+	    (dp2hdmi && dcp->rtkit_adopted)) {
 		ret = dptxport_set_hpd(dcp->dptxport[port].service, true);
 		if (ret && late_hpd)
 			dev_err(dcp->dev,
@@ -4772,6 +4938,24 @@ int dcp_start(struct platform_device *pdev)
 		if (ret) {
 			dev_warn(dcp->dev, "Failed to start DPTX endpoint: %d\n",
 				 ret);
+		} else if (dcp->rtkit_adopted &&
+			   dptx_service_available(&dcp->dptxport[0])) {
+			/*
+			 * The boot stage that handed this DCP over left the
+			 * port's display up on a link it trained. Release it,
+			 * so that the next connect trains the link and reads
+			 * the sink again: until then the firmware only has its
+			 * default modes and no EDID. Its HPD goes low as well;
+			 * dcp_dptx_connect() raises it again after the link wait,
+			 * so that the firmware sees the display plugged.
+			 */
+			ret = dptxport_set_hpd(dcp->dptxport[0].service, false);
+			if (!ret)
+				ret = dptxport_release_display(dcp->dptxport[0].service);
+			if (ret)
+				dev_warn(dcp->dev, "adopted DPTX display not released: %d\n",
+					 ret);
+			ret = 0;
 #ifdef DCP_DPTX_DISCONNECT_ON_INIT
 		/*
 		 * This disconnect / connect cycle on init is only necessary
@@ -6136,6 +6320,14 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 		(strncmp(fw_str, "14.7.0", sizeof(compat_str)) == 0))
 		return DCP_FIRMWARE_V_14_7_TEMPLATE;
 
+	/*
+	 * The loader reports the method ABI for each DCP. Legacy match data
+	 * leaves the ABI to this property, so accept a complete table here
+	 * when the reported ABI has no legacy implementation.
+	 */
+	if (iomfb_v27_methods(compat_str))
+		return dcp_v27_method_table(dev, compat_str);
+
 	dev_err(dev, "DCP firmware-compat %s (FW: %s) is not supported\n",
 		compat_str, fw_str);
 
@@ -6474,7 +6666,9 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 {
 	struct device_node *panel_np;
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
+	struct dcp_rtkit_live live_rtkit = {};
 	u32 cpu_ctrl;
+	int live = 0;
 	int ret;
 
 	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
@@ -6730,12 +6924,30 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 			       dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
 	}
 
+	/*
+	 * Check a handed-over session before anything is retained for it: a
+	 * description that fails leaves the DCP unbound and nothing pinned.
+	 * Its buffers are in no-map carveouts, which the kernel never hands out.
+	 */
+	live = dcp_rtkit_live_parse(dcp, &live_rtkit);
+	if (live < 0) {
+		ret = dev_err_probe(dev, live, "Invalid live RTKit handoff\n");
+		goto err_piodma;
+	}
 	/* Registering the mailbox can already expose RTKit buffer requests. */
 	ret = dcp_pin_live_session(dcp);
-	if (ret)
+	if (ret) {
+		if (live)
+			dcp_rtkit_live_unmap(&live_rtkit);
 		goto err_piodma;
+	}
 	/* External H17P supplies shared-buffer addresses during RTKit startup. */
-	if (dcp->hw.iomfb_method_profile ==
+	if (live)
+		dcp->rtk = apple_rtkit_init_adopted_with_session(
+			dev, dcp, "mbox", 0,
+			dcp->hw.link_report ? &link_report_rtkit_ops : &rtkit_ops,
+			&live_rtkit.session);
+	else if (dcp->hw.iomfb_method_profile ==
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL)
 		dcp->rtk = apple_rtkit_init(dev, dcp, "mbox", 0,
 					    &external_h17p_rtkit_ops);
@@ -6744,6 +6956,8 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 	else
 		dcp->rtk = apple_rtkit_init(dev, dcp, "mbox", 0, &rtkit_ops);
 	if (IS_ERR(dcp->rtk)) {
+		if (live)
+			dcp_rtkit_live_unmap(&live_rtkit);
 		ret = dev_err_probe(dev, PTR_ERR(dcp->rtk),
 				    "Failed to initialize RTKit\n");
 		goto err_piodma;
@@ -6751,6 +6965,7 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 	ret = devm_add_action_or_reset(dev, dcp_release_rtkit, dcp);
 	if (ret)
 		goto err_piodma;
+	dcp->rtkit_adopted = live;
 	dcp_s2r_check_dt(dcp);
 	/* After a warm restart its log counters need echoing, or it refuses its next idle. */
 	if (dcp->hw.s2r || dcp->hw.s2r_ext)
@@ -6763,7 +6978,9 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 		dev_dbg(dev, "negotiating RTKit with the running DCP\n");
 
 	/* Announce host readiness before awaiting external IOP readiness. */
-	if (dcp->hw.iomfb_method_profile ==
+	if (live)
+		ret = 0;	/* HELLO and EPMAP happened before the handoff */
+	else if (dcp->hw.iomfb_method_profile ==
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL)
 		ret = apple_rtkit_wake_early_ap(dcp->rtk);
 	else if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
@@ -6902,6 +7119,9 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 			drm_dev_get(dcp->crtc->base.dev);
 			dcp->drm_retained = true;
 		}
+		/* Its handler talks to the session this unbind leaves behind. */
+		if (dcp->hdmi_hpd_irq)
+			disable_irq(dcp->hdmi_hpd_irq);
 		iomfb_queue_stop(dcp);
 		afk_quiesce(dcp->avep);
 		afk_quiesce(dcp->dptxep);
@@ -6928,6 +7148,7 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 			dcp->announce.stopped = true;
 		disable_delayed_work_sync(&dcp->announce_wq);
 		dcp_test_point(dcp, DCP_TEST_UNBIND_ANNOUNCE_STOPPED);
+		disable_delayed_work_sync(&dcp->swap_watchdog_wq);
 		cancel_work_sync(&dcp->vblank_wq);
 		if (dcp->connector)
 			cancel_work_sync(&dcp->connector->hotplug_wq);
@@ -7342,6 +7563,9 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 	dcp->hw = *(struct apple_dcp_hw_data *)of_device_get_match_data(dev);
+	/* A boot stage handed this DCP over running: keep its session. */
+	if (of_property_present(dev->of_node, "apple,rtkit-handoff"))
+		dcp->hw.adopt_live_session = true;
 	/* The link report: on the board it has run on (dcp_j714s_ext()). */
 	if (!dcp_j714s_ext(dev))
 		dcp->hw.link_report = false;
