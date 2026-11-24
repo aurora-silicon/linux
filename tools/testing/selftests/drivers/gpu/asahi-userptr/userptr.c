@@ -340,6 +340,8 @@ TEST_F(asahi, memlock_does_not_bound)
 	uint32_t h = 0;
 	void *mem;
 
+	/* The kernel says so, for userspace that checks before it imports. */
+	EXPECT_TRUE(self->params.features & DRM_ASAHI_FEATURE_USERPTR_NO_MEMLOCK);
 	ASSERT_EQ(0, drop_cap_ipc_lock());
 	ASSERT_EQ(0, getrlimit(RLIMIT_MEMLOCK, &old));
 	mem = mmap(NULL, size, PROT_READ | PROT_WRITE,

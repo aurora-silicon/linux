@@ -101,6 +101,7 @@ properties:
           - const: apple,t8103-pciec
       - const: apple,t6000-pciec
       - const: apple,t6050-pciec
+      - const: apple,t8142-pciec
       - items:
           - const: apple,t8132-pciec
           - const: apple,t8122-pciec
@@ -374,6 +375,7 @@ allOf:
           contains:
             enum:
               - apple,t8132-pciec
+              - apple,t8142-pciec
               - apple,t6040-pciec
     then:
       required:
@@ -501,6 +503,7 @@ allOf:
               - apple,t6000-pciec
               - apple,t6040-pciec
               - apple,t6050-pciec
+              - apple,t8142-pciec
     then:
       properties:
         reg:
