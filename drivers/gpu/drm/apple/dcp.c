@@ -9917,10 +9917,13 @@ static int dcp_platform_suspend(struct device *dev)
 		 * that stays attached reports it unplugged, and nothing
 		 * connects it again after the wake: its HPD stays high, so no
 		 * edge comes, and a CRTC userspace turned off for the unplug
-		 * never runs dcp_poweron().
+		 * never runs dcp_poweron(). A T6030 native output's resume sets
+		 * its PHY and crossbar up again (dcp_fabric_hdmi_reinit()),
+		 * which needs the link down, so it is still released.
 		 */
 		if (!dcp->active_typec_route &&
-		    gpiod_get_value_cansleep(dcp->hdmi_hpd) <= 0) {
+		    (dcp->external_native ||
+		     gpiod_get_value_cansleep(dcp->hdmi_hpd) <= 0)) {
 			disconnected_hpd_event(dcp->connector);
 			dcp_dptx_disconnect(dcp, 0);
 		}
@@ -9937,6 +9940,23 @@ static int dcp_platform_suspend(struct device *dev)
 	dcp_hold_for_sleep(dcp);
 
 	return 0;
+}
+
+/*
+ * The suspend kept an attached HDMI display's link (dcp_platform_suspend()).
+ * One unplugged during the sleep made no edge the masked HPD IRQ saw, and
+ * nothing else reports it: release it now, as an unplug while awake is.
+ */
+static void dcp_hdmi_unplugged_in_sleep(struct apple_dcp *dcp)
+{
+	if (READ_ONCE(dcp->active_typec_route) || !dcp->connector ||
+	    !READ_ONCE(dcp->connector->connected) ||
+	    gpiod_get_value_cansleep(dcp->hdmi_hpd) != 0)
+		return;
+	dev_info(dcp->dev, "HDMI display unplugged during sleep\n");
+	disconnected_hpd_event(dcp->connector);
+	dcp_dptx_disconnect(dcp, 0);
+	dcp_fabric_hdmi_unplugged(dcp);
 }
 
 static int dcp_platform_resume(struct device *dev)
@@ -9985,6 +10005,9 @@ static int dcp_platform_resume(struct device *dev)
 	/* The HDMI output's PHY and crossbar may have lost their setup in sleep. */
 	if (dcp->external_native)
 		dcp_fabric_hdmi_reinit(dcp, "after system sleep");
+	/* Before the HPD IRQ comes back: an edge from now on is replayed. */
+	if (dcp->hdmi_hpd_irq)
+		dcp_hdmi_unplugged_in_sleep(dcp);
 	/* Observe future edges before sampling any edges lost in sleep. */
 	if (dcp->hdmi_hpd_irq)
 		dcp_fabric_run_resume(&dcp_resume_ops, dcp);

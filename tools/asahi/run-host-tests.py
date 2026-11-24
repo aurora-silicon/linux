@@ -186,6 +186,10 @@ ASAHI_TESTS = {
     # A DCP whose firmware runs through the sleep holds its DP PHYs' domains.
     'dcp-sleep-phy-hold-tests.py': [([], PASS)]
         + mutations('--mutation', ('no-route', 'no-own-phy', 'class-device', 'no-err-check'), []),
+    # An HDMI display kept through a sleep but unplugged during it is released on resume.
+    'dcp-hdmi-sleep-unplug-tests.py': [([], PASS)]
+        + mutations('--mutation', ('keep-native', 'gpio-error', 'ignore-borrowed', 'no-fabric',
+                                     'no-resume-check'), []),
     'dcp-bw-scratch-window-tests.py': [([], PASS)] + mutations('--mutation', ('old-check', 'start-only'), []),
     'clpc-gpu-demand-tests.py': [([], PASS)],
     'clpc-high-power-cleanup-tests.py': [(out(), PASS),
