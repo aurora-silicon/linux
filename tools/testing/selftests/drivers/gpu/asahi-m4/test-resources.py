@@ -2180,7 +2180,8 @@ pub mod g16 {
         let last = WARM_PB_SLOTS - 1;
         for i in 0..last {
             assert_eq!(sync::Arc::strong_count(&pb_arenas[i]), 1, "PB arena {i} reclaimed");
-            assert_eq!(sync::Arc::strong_count(&epochs[i]), 1, "PB epoch {i} reclaimed");
+            // pb_mgr_table[i] still names this epoch's manager: it stays until replaced.
+            assert_eq!(sync::Arc::strong_count(&epochs[i]), 2, "PB epoch {i} still bound");
             assert_eq!(sync::Arc::strong_count(&pass_arenas[i]), 1, "pass arena {i} reclaimed");
             assert_eq!(sync::Arc::strong_count(&comp_arenas[i]), 1, "compute arena {i} reclaimed");
             assert_eq!(sync::Arc::strong_count(&vms[i]), 2);
@@ -2231,9 +2232,30 @@ pub mod g16 {
         assert!(!p.reclaim_closed());
         assert!(!s.reclaim_closed());
         assert_eq!(sync::Arc::strong_count(&pb_arenas[last]), 1);
-        assert_eq!(sync::Arc::strong_count(&epochs[last]), 1);
         assert_eq!(sync::Arc::strong_count(&pass_arenas[last]), 1);
         assert_eq!(sync::Arc::strong_count(&comp_arenas[last]), 1);
+        // VM 17's epoch replaced slot 0's; the other slots keep their closed owners' epochs.
+        assert_eq!(sync::Arc::strong_count(&epochs[0]), 1, "replaced PB epoch 0 released");
+        for i in 1..WARM_PB_SLOTS {
+            assert_eq!(sync::Arc::strong_count(&epochs[i]), 2, "PB epoch {i} still bound");
+        }
+        // Each epoch is released once a newer epoch retires on its own slot.
+        for i in 1..WARM_PB_SLOTS {
+            let next = vm(520 + i as u64);
+            let e = g16::pools::PbEpoch::new(
+                &factory,
+                &next,
+                g16::budget::Budget::reserve(&budget, 1).unwrap().take().unwrap(),
+            ).unwrap();
+            e.prepare(i, g16::hw::client::pb_heap(0), 512).unwrap();
+            e.expose();
+            let b = p.bind(i, false);
+            p.hold_alloc(i, &next, None, None).unwrap();
+            p.publish_flight(i);
+            p.retire_flight(i, &e, b, true).unwrap();
+            assert_eq!(sync::Arc::strong_count(&epochs[i]), 1, "replaced PB epoch {i} released");
+        }
+        assert!(!p.reclaim_closed());
         drop(epochs);
         for (i, v) in vms.iter().enumerate() {
             assert_eq!(sync::Arc::strong_count(v), 1, "closed VM {i} fully released");
@@ -2379,14 +2401,15 @@ pub mod g16 {
         drop(prep1);
         vm1.vm.close();
 
-        // Reclaim evicts VM1's VmState, RenderArena, PbEpoch, and ComputeArena immediately,
-        // WHILE retaining its tiny VM-free firmware PB & UMA leases until overwritten!
+        // Reclaim evicts VM1's RenderArena and ComputeArena immediately and retains its
+        // firmware PB & UMA leases until overwritten. PB slot 0's epoch keeps VM1's VmState
+        // (TTBAT slot) and page list until a newer epoch retires on slot 0.
         assert!(!p.reclaim_closed());
         assert!(!s.reclaim_closed());
-        assert_eq!(sync::Arc::strong_count(&vm1), 1, "VM1 VmState/TTBAT must release immediately");
+        assert_eq!(sync::Arc::strong_count(&vm1), 2, "VM1 TTBAT slot stays with its PB epoch");
         assert_eq!(sync::Arc::strong_count(&r_arena1), 1, "VM1 RenderArena/PB heap must release");
         assert_eq!(sync::Arc::strong_count(&c_arena1), 1, "VM1 ComputeArena/32MiB pool must release");
-        assert_eq!(sync::Arc::strong_count(&pb_lease1), 2, "pb_mgr_table[0] lease must stay mapped");
+        assert_eq!(sync::Arc::strong_count(&pb_lease1), 3, "pb_mgr_table[0] lease held by epoch + retained_pb");
         assert_eq!(sync::Arc::strong_count(&uma1), 2, "render uma_mgr_table[33] lease must stay mapped");
         assert_eq!(sync::Arc::strong_count(&c_uma1), 2, "compute uma_mgr_table[1] lease must stay mapped");
 
@@ -2398,6 +2421,7 @@ pub mod g16 {
         p.cancel_alloc(0);
         assert_eq!(sync::Arc::strong_count(&uma1), 2);
         assert_eq!(sync::Arc::strong_count(&uma3), 2);
+        assert_eq!(sync::Arc::strong_count(&vm1), 2);
 
         let mut cc3_cancel = Claims::new();
         assert_eq!(s.claim_compute_for(&prep3, &mut cc3_cancel, Some(vm3.id)).unwrap(), Some(0));
@@ -2420,6 +2444,7 @@ pub mod g16 {
         p.publish_flight(0);
         p.retire_flight(0, &e3, b3, true).unwrap();
         assert_eq!(sync::Arc::strong_count(&pb_lease1), 1, "overwritten pb_mgr_table[0] lease dropped");
+        assert_eq!(sync::Arc::strong_count(&vm1), 1, "replaced PB epoch releases VM1's TTBAT slot");
         assert_eq!(sync::Arc::strong_count(&uma1), 1, "overwritten render uma_mgr_table[33] lease dropped");
         assert_eq!(sync::Arc::strong_count(&pb_lease3), 3, "new PB lease held by epoch + retained_pb");
         assert_eq!(sync::Arc::strong_count(&uma3), 3, "new render UMA lease held by pool + retained_uma");
@@ -2518,6 +2543,72 @@ pub mod g16 {
             assert_eq!(sync::Arc::strong_count(v), 1, "closed VM {i} fully released after displacement");
         }
     }
+
+    // A closed VM's PB slot 3 is displaced by slot 4 and reclaimed. pb_mgr_table[3] still names
+    // its epoch's manager; gPM_SP(0) wrote that manager's page list (DYNAMIC, 0x704000cb40)
+    // through ctx 46 after the epoch was gone: "write unmapped level 0 unit 0xe0 ctx 46".
+    #[test]fn closed_vm_pb_epoch_keeps_page_list_and_context_until_slot_replacement_retires(){
+        use g16::resources::PbOwnerArena;
+
+        let factory = g16::object::Factory;
+        let budget = g16::budget::Budget::new().unwrap();
+        let mut p = g16::pools::Pools::new(&driver::AsahiDrmDevice(device::Device));
+        let epoch = |v: &sync::Arc<g16::vm::VmState>, k: usize| {
+            let e = g16::pools::PbEpoch::new(
+                &factory,
+                v,
+                g16::budget::Budget::reserve(&budget, 1).unwrap().take().unwrap(),
+            ).unwrap();
+            e.prepare(k, g16::hw::client::pb_heap(0), 512).unwrap();
+            e.expose();
+            e
+        };
+
+        // VM X (ctx 46) runs and retires on PB slot 3; VM Y then retires on slot 4.
+        let x = vm(46);
+        let x_arena = sync::Arc::new(render_arena(KVec::new()), 0).unwrap();
+        let ex = epoch(&x, 3);
+        let x_records = ex.records_lease();
+        let bx = p.bind(3, false);
+        p.hold_alloc(3, &x, Some(PbOwnerArena::Base(x_arena.clone())), None).unwrap();
+        p.publish_flight(3);
+        p.retire_flight(3, &ex, bx, true).unwrap();
+        let y = vm(47);
+        let ey = epoch(&y, 4);
+        let by = p.bind(4, false);
+        p.hold_alloc(4, &y, None, None).unwrap();
+        p.publish_flight(4);
+        p.retire_flight(4, &ey, by, true).unwrap();
+
+        // X closes. Its arena and PB heap go, but not the epoch firmware still names.
+        x.vm.close();
+        assert!(!p.reclaim_closed(), "a retained owner epoch alone must not keep reclaim armed");
+        assert!(!p.reclaim_closed());
+        assert_eq!(sync::Arc::strong_count(&x_arena), 1, "closed VM's render arena reclaimed");
+        assert_eq!(sync::Arc::strong_count(&ex), 2, "slot 3 epoch (page list) reclaimed early");
+        assert_eq!(sync::Arc::strong_count(&x), 2, "ctx 46 released while its lists are named");
+        assert!(sync::Arc::strong_count(&x_records) >= 2);
+        assert!(p.reusable(3, &x).is_none());
+
+        // A new VM's InitBM epoch rebinds slot 3. The old binding stays intact while that
+        // render is in flight and goes only with its full retirement.
+        let z = vm(48);
+        assert_eq!(p.pick_slot_in_mask_blocks(&z, false, 0b11000, 3, 512), Some(3));
+        let ez = epoch(&z, 3);
+        let bz = p.bind(3, false);
+        p.hold_alloc(3, &z, None, None).unwrap();
+        p.publish_flight(3);
+        assert!(p.reclaim_closed(), "rebinding render still in flight");
+        assert_eq!(sync::Arc::strong_count(&ex), 2);
+        assert_eq!(sync::Arc::strong_count(&x), 2);
+        p.retire_flight(3, &ez, bz, true).unwrap();
+        assert_eq!(sync::Arc::strong_count(&ex), 1, "replaced epoch released");
+        drop(ex);
+        assert_eq!(sync::Arc::strong_count(&x), 1, "closed VM released after replacement");
+        assert_eq!(sync::Arc::strong_count(&x_records), 1);
+        assert!(!p.reclaim_closed());
+    }
+
 }
 '''
 poll_source = (production/'poll.rs').read_text()

@@ -416,6 +416,9 @@ impl PoolSet {
 pub(crate) struct Pools {
     pub(crate) dev: ARef<device::Device>,
     pub(crate) stats: PbStats,
+    /// The epoch whose manager `pb_mgr_table[k]` names, kept until a newer epoch retires on
+    /// slot `k`, also after its VM closed: it maps the manager's page and block lists and keeps
+    /// the VM's TTBAT slot bound, the context through which those lists are written.
     owners: [Option<Arc<PbEpoch>>; sizes::PB_SLOTS],
     /// VM-free firmware leases keeping each `parameter_id`'s `pb_manager` + `counter` page mapped
     /// for firmware's global `pb_mgr_table[parameter_id]` across closed-VM reclaim until a newer
@@ -904,13 +907,24 @@ impl Pools {
             *keep = false;
         }
     }
-    /// Releases displaced PB/UMA allocator leases owned by closed VMs while preserving active,
+    /// Releases the displaced render arenas and PB heaps of closed VMs while preserving active,
     /// in-flight, undisplaced, and quarantined slots. Returns `true` if any non-quarantined
-    /// slot still holds a closed-VM lease awaiting retirement or displacement.
+    /// slot still holds such a closed-VM lease awaiting retirement or displacement.
+    ///
+    /// The owner epoch itself stays until a newer epoch retires on its slot
+    /// ([`Self::retire_flight`]): `pb_mgr_table[k]` keeps naming its manager, and the parameter
+    /// manager can still write that manager's page list through the context of the epoch's VM.
     pub(crate) fn reclaim_closed(&mut self) -> bool {
         let mut remaining = false;
         for k in 0..sizes::PB_SLOTS {
             if self.quarantined[k] {
+                continue;
+            }
+            let pending = self.pending_vms[k].is_some()
+                || self.pending_arenas[k].is_some()
+                || self.pending_uma[k].is_some();
+            // Only the owner epoch is left; the next epoch to retire on the slot releases it.
+            if !pending && self.owner_vms[k].is_none() && self.owner_arenas[k].is_none() {
                 continue;
             }
             let closed = self.owner_vms[k]
@@ -925,12 +939,7 @@ impl Pools {
             if !closed {
                 continue;
             }
-            if self.slot_displaced(k)
-                && self.pending_vms[k].is_none()
-                && self.pending_arenas[k].is_none()
-                && self.pending_uma[k].is_none()
-            {
-                self.owners[k] = None;
+            if self.slot_displaced(k) && !pending {
                 self.owner_vms[k] = None;
                 self.owner_arenas[k] = None;
                 self.keep[k] = false;
