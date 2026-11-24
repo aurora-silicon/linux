@@ -185,6 +185,22 @@ config APPLE_RTKIT_HELPER
 
 	  Say 'y' here if you have an Apple SoC.
 
+config APPLE_RTKIT_HELPER_KUNIT_TEST
+	bool "KUnit tests for the Apple RTKit helper co-processor" if !KUNIT_ALL_TESTS
+	depends on APPLE_RTKIT_HELPER=y && KUNIT=y && SUSPEND
+	default KUNIT_ALL_TESTS
+	help
+	  Hand the helper's shared memory callbacks the buffer requests a
+	  co-processor sends (no address, addresses in and around the SRAM
+	  region, zero, unaligned and wrapping sizes, repeats), parse the
+	  buffer inventory of a handed over session from a device node built
+	  by the test, and walk the AP power notices of a sleep: prepare,
+	  suspend, resume and complete, unanswered and late answered idle
+	  notices. The RTKit AP power call is a static stub and the ASC and
+	  SRAM registers are kernel memory. The tests touch no hardware.
+
+	  If unsure, say N.
+
 config APPLE_SART
 	tristate "Apple SART DMA address filter"
 	depends on ARCH_APPLE || COMPILE_TEST
