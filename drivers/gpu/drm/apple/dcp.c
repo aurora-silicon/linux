@@ -10258,21 +10258,10 @@ static int dcp_platform_suspend(struct device *dev)
 	return 0;
 }
 
-/*
- * The suspend kept an attached HDMI display's link (dcp_platform_suspend()).
- * One unplugged during the sleep made no edge the masked HPD IRQ saw, and
- * nothing else reports it: release it now, as an unplug while awake is.
- */
-static void dcp_hdmi_unplugged_in_sleep(struct apple_dcp *dcp)
+void dcp_hdmi_disconnect(struct apple_dcp *dcp)
 {
-	if (READ_ONCE(dcp->active_typec_route) || !dcp->connector ||
-	    !READ_ONCE(dcp->connector->connected) ||
-	    gpiod_get_value_cansleep(dcp->hdmi_hpd) != 0)
-		return;
-	dev_info(dcp->dev, "HDMI display unplugged during sleep\n");
 	disconnected_hpd_event(dcp->connector);
 	dcp_dptx_disconnect(dcp, 0);
-	dcp_fabric_hdmi_unplugged(dcp);
 }
 
 static int dcp_platform_resume(struct device *dev)

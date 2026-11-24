@@ -193,7 +193,7 @@ ASAHI_TESTS = {
     # An HDMI display kept through a sleep but unplugged during it is released on resume.
     'dcp-hdmi-sleep-unplug-tests.py': [([], PASS)]
         + mutations('--mutation', ('keep-native', 'gpio-error', 'ignore-borrowed', 'no-fabric',
-                                     'no-resume-check'), []),
+                                     'no-fabric-lock', 'no-resume-check'), []),
     # A fixed (non-Type-C) output takes its DP AV service again after a sleep.
     'dpavserv-admission-tests.py': [([], PASS)]
         + mutations('--mutation', ('old-cable-wait', 'ignore-generation', 'ignore-cable',

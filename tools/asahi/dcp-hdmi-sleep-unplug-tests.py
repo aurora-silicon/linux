@@ -9,10 +9,10 @@ edge anyone sees: dcp_hdmi_unplugged_in_sleep() releases it on resume, before
 the IRQ comes back. A T6030 native output still releases the link at suspend,
 because its resume sets the PHY and crossbar up again.
 
-The fixture compiles the HDMI block of dcp_platform_suspend() and
-dcp_hdmi_unplugged_in_sleep() from drivers/gpu/drm/apple/dcp.c against mocks
-and checks which displays are released. --mutation names a change to the
-production code that the matrix must kill.
+The fixture compiles the HDMI block of dcp_platform_suspend() and the
+fabric's dcp_hdmi_unplugged_in_sleep() against mocks. It checks which
+outputs are released and that the fabric lock covers the resume release.
+--mutation names a change to the production code that the matrix must kill.
 """
 import argparse
 import re
@@ -23,6 +23,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 DCP = 'drivers/gpu/drm/apple/dcp.c'
+FABRIC = 'drivers/gpu/drm/apple/dcp-fabric.c'
 RESUME_CALL = '\tif (dcp->hdmi_hpd_irq)\n\t\tdcp_hdmi_unplugged_in_sleep(dcp);\n'
 
 MUTATIONS = {
@@ -33,11 +34,11 @@ MUTATIONS = {
     'gpio-error': ('gpiod_get_value_cansleep(dcp->hdmi_hpd) != 0)\n\t\treturn;',
                    'gpiod_get_value_cansleep(dcp->hdmi_hpd) > 0)\n\t\treturn;'),
     # Release the HDMI connector while a Type-C display owns the pipeline.
-    'ignore-borrowed': ('if (READ_ONCE(dcp->active_typec_route) || !dcp->connector ||',
+    'ignore-borrowed': ('if (dcp->active_typec_route || !dcp->connector ||',
                         'if (!dcp->connector ||'),
     # Leave the hybrid fabric thinking HDMI is still there.
-    'no-fabric': ('\tdcp_dptx_disconnect(dcp, 0);\n\tdcp_fabric_hdmi_unplugged(dcp);\n}',
-                  '\tdcp_dptx_disconnect(dcp, 0);\n}'),
+    'no-fabric': ('\tdcp_fabric_hdmi_unplugged_locked(dcp);\n', ''),
+    'no-fabric-lock': ('\tguard(mutex)(&dcp_typec_fabric_lock);\n', ''),
     # Never look for an unplug after the sleep.
     'no-resume-check': (RESUME_CALL, ''),
 }
@@ -53,7 +54,7 @@ def block(text, start):
     raise AssertionError('unbalanced production block')
 
 def function(text, name):
-    match = re.search(r'\n(static [^\n;]*\b' + name + r'\([^;{}]*\)\n)\{', text)
+    match = re.search(r'\n((?:static )?[^\n;]*\b' + name + r'\([^;{}]*\)\n)\{', text)
     assert match, name
     return block(text, match.start(1))
 
@@ -79,7 +80,26 @@ static int gpiod_get_value_cansleep(struct gpio_desc *g) { return g->level; }
 static void disable_irq(int irq) { irq_off++; }
 static void disconnected_hpd_event(struct apple_connector *c) { c->connected = false; hpd_events++; }
 static int dcp_dptx_disconnect(struct apple_dcp *d, int port) { disconnects++; return 0; }
-static void dcp_fabric_hdmi_unplugged(struct apple_dcp *d) { fabric_unplugs++; }
+static int dcp_typec_fabric_lock;
+static int *hold_lock(int *lock)
+{
+	assert(!*lock);
+	*lock = 1;
+	return lock;
+}
+static void release_lock(int **lock) { **lock = 0; }
+#define guard(kind) int *held_##kind __attribute__((cleanup(release_lock))) = hold_lock
+static void dcp_hdmi_disconnect(struct apple_dcp *dcp)
+{
+	assert(dcp_typec_fabric_lock);
+	disconnected_hpd_event(dcp->connector);
+	dcp_dptx_disconnect(dcp, 0);
+}
+static void dcp_fabric_hdmi_unplugged_locked(struct apple_dcp *d)
+{
+	assert(dcp_typec_fabric_lock);
+	fabric_unplugs++;
+}
 static void reset(void) { hpd_events = disconnects = fabric_unplugs = irq_off = 0; }
 '''
 
@@ -158,10 +178,15 @@ def main():
     args = parser.parse_args()
 
     source = (ROOT / DCP).read_text()
+    unplug = function((ROOT / FABRIC).read_text(), 'dcp_hdmi_unplugged_in_sleep')
     if args.mutation:
         old, new = MUTATIONS[args.mutation]
-        assert source.count(old) == 1, args.mutation
-        source = source.replace(old, new)
+        if old in unplug:
+            assert unplug.count(old) == 1, args.mutation
+            unplug = unplug.replace(old, new)
+        else:
+            assert source.count(old) == 1, args.mutation
+            source = source.replace(old, new)
 
     resume = function(source, 'dcp_platform_resume')
     # The release runs while the HPD IRQ is still masked: an edge from then
@@ -173,8 +198,7 @@ def main():
 
     suspend = function(source, 'dcp_platform_suspend')
     hdmi = block(suspend, suspend.index('\tif (dcp->hdmi_hpd_irq) {\n\t\tdisable_irq'))
-    code = HARNESS + function(source, 'dcp_hdmi_unplugged_in_sleep') + \
-        CHECKS.replace('SUSPEND', hdmi)
+    code = HARNESS + unplug + CHECKS.replace('SUSPEND', hdmi)
 
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / 'check.c'

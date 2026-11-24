@@ -1213,12 +1213,12 @@ static void dcp_hdmi_capacity_available(void *ctx)
  * never tracked: when the hold expires, the desktop has let the HDMI CRTC go
  * and the hybrid is free for a Type-C display again.
  */
-void dcp_fabric_hdmi_unplugged(struct apple_dcp *dcp)
+static void dcp_fabric_hdmi_unplugged_locked(struct apple_dcp *dcp)
 {
 	unsigned long flags;
 	u64 generation;
 
-	guard(mutex)(&dcp_typec_fabric_lock);
+	lockdep_assert_held(&dcp_typec_fabric_lock);
 	generation = dcp_hdmi_edge(dcp);
 	if (!generation)
 		return;
@@ -1228,6 +1228,31 @@ void dcp_fabric_hdmi_unplugged(struct apple_dcp *dcp)
 	dcp_hdmi_sample(dcp, generation, gpiod_get_value_cansleep(dcp->hdmi_hpd));
 	/* A Type-C display that gave its pipes to this one takes them back. */
 	dcp_fabric_hybrid_kick(dcp, 0);
+}
+
+void dcp_fabric_hdmi_unplugged(struct apple_dcp *dcp)
+{
+	guard(mutex)(&dcp_typec_fabric_lock);
+	dcp_fabric_hdmi_unplugged_locked(dcp);
+}
+
+/*
+ * Release a fixed HDMI link unplugged while its HPD IRQ was masked. Hold
+ * the fabric lock from the ownership check through the presence update so
+ * a Type-C route cannot take the same DPTX port during the release.
+ */
+void dcp_hdmi_unplugged_in_sleep(struct apple_dcp *dcp)
+{
+	guard(mutex)(&dcp_typec_fabric_lock);
+
+	if (dcp->active_typec_route || !dcp->connector ||
+	    !READ_ONCE(dcp->connector->connected) ||
+	    gpiod_get_value_cansleep(dcp->hdmi_hpd) != 0)
+		return;
+
+	dev_info(dcp->dev, "HDMI display unplugged during sleep\n");
+	dcp_hdmi_disconnect(dcp);
+	dcp_fabric_hdmi_unplugged_locked(dcp);
 }
 
 static void dcp_hdmi_settle_work(struct work_struct *work)
