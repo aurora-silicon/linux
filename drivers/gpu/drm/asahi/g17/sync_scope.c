@@ -47,7 +47,7 @@ static DEFINE_PER_CPU(struct llist_head *, active_scopes);
 
 bool asahi_g17_is_scope(struct dma_fence *fence)
 {
-	return fence && fence->ops == &scope_ops;
+	return fence && rcu_access_pointer(fence->ops) == &scope_ops;
 }
 
 static struct asahi_g17_scope *to_scope(struct dma_fence *fence)
