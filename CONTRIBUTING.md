@@ -79,3 +79,32 @@ or sensitive, say so rather than substituting data from another Mac.
 
 For kernel patches, also follow the existing
 [kernel submission guidance](Documentation/process/submitting-patches.rst).
+
+## Contributing code
+
+`main` is the only branch work lands in. Open every pull request against
+`main` from a short-lived branch:
+
+- `feat/<topic>` for new work, `fix/<topic>` for fixes.
+- `wip/<topic>` for work you park without a pull request. It is not merged
+  from directly; open a `feat/` or `fix/` pull request when it is ready.
+- `archive/<name>` holds old branches kept for their history. Do not push to them.
+- `feat/<area>-<name>` can also be a topic branch for a large feature that
+  takes several pull requests: the parts are reviewed as pull requests into
+  the topic branch, the whole is regression-tested there and lands on `main`
+  as one pull request, and the topic branch is then deleted.
+- `rebase/v<version>` is the single branch for an upstream version upgrade,
+  and `hotfix/v<X.Y.Z>` a short-lived branch for a stable hotfix (see
+  [RELEASES.md](RELEASES.md)).
+
+There are no long-lived release or per-platform branches.
+
+`main` takes changes only through pull requests: no direct pushes, no force
+pushes and no deletion. Merged branches are deleted automatically, so start
+new work from a fresh branch off `main` instead of reusing a merged one. Do
+not stack long chains of pull requests on each other; if you must, retarget
+the stacked ones to `main` before their base is merged.
+
+Releases are cut from `main` on a fixed cadence and never wait for unfinished
+work. How the edge, nightly and stable channels are built is in
+[RELEASES.md](RELEASES.md).
