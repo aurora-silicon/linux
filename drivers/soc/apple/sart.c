@@ -609,3 +609,7 @@ module_platform_driver(apple_sart_driver);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Sven Peter <sven@svenpeter.dev>");
 MODULE_DESCRIPTION("Apple SART driver");
+
+#if IS_ENABLED(CONFIG_APPLE_SART_KUNIT_TEST)
+#include "sart-test.c"
+#endif

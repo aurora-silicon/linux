@@ -152,11 +152,12 @@ properties:
 
   apple,sleep-wakeup-path:
     description:
-      A consumer of this domain is stopped by the system sleep's final commit,
-      after the noirq phase, and stays on the wakeup path until then. The OS
-      keeps the domain on through system sleep while a device under it is on
-      the wakeup path, also when the domain was off when the power controller
-      probed. Other domains are unaffected.
+      A consumer of this domain can keep running into system sleep, until the
+      sleep's final commit after the noirq phase or through the whole sleep,
+      and is then on the wakeup path. The OS keeps the domain on through
+      system sleep while a device under it is on the wakeup path, also when
+      the domain was off when the power controller probed. Other domains are
+      unaffected.
     type: boolean
 
   apple,firmware-owned:

@@ -56,8 +56,9 @@ const _: () = {
     assert!(queue_limit(0) == crate::mmu::MAX_EXECUTION_CONTEXTS);
     // Compute keeps this many channels even with every execution context open.
     assert!(QID_COUNT - FULL_RENDER_RESERVE >= 4);
-    // The reserve counts one pair per owner. A second pair of an owner comes
-    // only from surplus (g17::pairs), never from this reserve.
+    // Future queue headroom caps at one pair per execution context; compute
+    // reservation still protects current pair demand (including live siblings
+    // and teardown-held released pairs) above that cap.
     assert!(FULL_RENDER_RESERVE == 2 * crate::mmu::MAX_EXECUTION_CONTEXTS as usize + 2);
 };
 
@@ -130,7 +131,7 @@ impl QueueIds {
         engine: DataMaster,
         preferred: Option<u8>,
     ) -> Result<Id> {
-        self.reserve_for(owner, engine, preferred, crate::mmu::MAX_EXECUTION_CONTEXTS as usize)
+        self.reserve_for(owner, engine, preferred, queue_limit(self.floor) as usize)
     }
 
     fn render_ids(&self) -> usize {
@@ -141,10 +142,18 @@ impl QueueIds {
             .count()
     }
 
+    /// Total dedicated render pairs the QID table can hold beside the
+    /// bootstrap reservations and installed compute channels.
+    pub(crate) fn render_pair_capacity(&self) -> usize {
+        (self.render_ids() + (QID_COUNT - self.floor - self.leased))
+            .saturating_sub(2)
+            / 2
+    }
+
     /// Whether `queues` open logical queues can each still install a dedicated
     /// render pair, beside the bootstrap reservations and installed compute.
     pub(crate) fn render_fits(&self, queues: usize) -> bool {
-        self.render_ids() + (QID_COUNT - self.floor - self.leased) >= 2 * queues + 2
+        self.render_pair_capacity() >= queues
     }
 
     /// Whether a render pair not yet built can still reserve both of its identities.
@@ -155,22 +164,38 @@ impl QueueIds {
     /// Whether a fresh compute identity fits beside the render reserve of
     /// `queues` open logical queues, without reserving it.
     pub(crate) fn compute_fits(&self, queues: usize) -> bool {
-        let initial = self.leased == QID_COUNT - self.floor
-            && self.initial_render.iter().flatten().any(|id| self.can_cancel_unpublished(*id));
-        self.compute_room(queues, usize::from(initial))
+        self.compute_fits_with_reclaim(queues, 0)
     }
 
-    fn compute_room(&self, queues: usize, replacement: usize) -> bool {
+    /// Whether a fresh compute identity fits once `reclaim_render_ids`
+    /// unpublished render identities are cancelled first.
+    pub(crate) fn compute_fits_with_reclaim(
+        &self,
+        queues: usize,
+        reclaim_render_ids: usize,
+    ) -> bool {
+        let initial = self.leased == QID_COUNT - self.floor
+            && self.initial_render.iter().flatten().any(|id| self.can_cancel_unpublished(*id));
+        self.compute_room(queues, usize::from(initial).max(reclaim_render_ids))
+    }
+
+    fn compute_room(&self, pairs: usize, replacement: usize) -> bool {
         // Existing render identities already satisfy this reservation. Counting
         // them twice can refuse compute even while physical QIDs remain free.
         // Replacing an initial reservation consumes one render identity.
         // Include that transition when protecting render's minimum, and
         // count the replacement as available compute capacity.
+        //
+        // Cap future queue headroom at `FULL_RENDER_RESERVE - self.floor`, but
+        // always protect every pair in current demand (`2 * pairs + 2`) so
+        // compute cannot strand an open queue when live siblings or
+        // teardown-held pairs push demand above `queue_limit(self.floor)`.
         let render = self.render_ids();
+        let current = 2 * pairs + 2;
+        let with_headroom = render_reserve(pairs).min(FULL_RENDER_RESERVE - self.floor);
+        let reserve = current.max(with_headroom);
         QID_COUNT - self.floor - self.leased + replacement
-            > render_reserve(queues)
-                .min(FULL_RENDER_RESERVE - self.floor)
-                .saturating_sub(render - replacement)
+            > reserve.saturating_sub(render.saturating_sub(replacement))
     }
 
     /// As [`Self::reserve`], with the compute reserve sized for `queues` open
@@ -388,6 +413,46 @@ mod accounting_tests {
         assert_eq!(ids.leased, QID_COUNT);
         assert_eq!(ids.reserve(1002, DataMaster::Fragment, None), Err(EINVAL));
     }
+
+    #[test]
+    fn compute_reserve_protects_sibling_demand_above_context_limit() {
+        let mut ids = table();
+        ids.reserve_initial_render().unwrap();
+        let max = crate::mmu::MAX_EXECUTION_CONTEXTS as usize;
+        // 58 open queues + 1 live sibling = 59 pairs demand (above MAX_EXECUTION_CONTEXTS).
+        let demand = max + 1;
+        // Install 57 first pairs + 1 sibling = 58 pairs (116 render IDs) plus 2 bootstrap IDs.
+        let mut owner = 100u64;
+        for _ in 0..max {
+            let t = ids.reserve_for(owner, DataMaster::Tiling, None, demand).unwrap();
+            ids.publish(t).unwrap();
+            owner += 1;
+            let f = ids.reserve_for(owner, DataMaster::Fragment, None, demand).unwrap();
+            ids.publish(f).unwrap();
+            owner += 1;
+        }
+        // Compute takes all remaining QIDs except the 2 needed for the 58th queue's first pair.
+        let compute_budget = QID_COUNT - (2 * demand + 2);
+        for _ in 0..compute_budget {
+            let c = ids.reserve_for(owner, DataMaster::Compute, None, demand).unwrap();
+            ids.publish(c).unwrap();
+            owner += 1;
+        }
+        assert_eq!(ids.render_pair_capacity(), demand);
+        assert!(!ids.compute_fits(demand));
+        assert_eq!(
+            ids.reserve_for(owner, DataMaster::Compute, None, demand),
+            Err(ENOSPC)
+        );
+        // The last open queue can still install its first pair.
+        assert!(ids.render_pair_fits());
+        let t = ids.reserve_for(owner, DataMaster::Tiling, None, demand).unwrap();
+        let f = ids
+            .reserve_for(owner + 1, DataMaster::Fragment, None, demand)
+            .unwrap();
+        ids.publish(t).unwrap();
+        ids.publish(f).unwrap();
+    }
 }
 
 // Aliases drop before their backing. A compute queue is allocated low first;
@@ -410,7 +475,7 @@ struct RenderStorage {
     // The lower alias drops before its backing.
     low: mmu::KernelMapping,
     high: KernelObject,
-    /// The client VM the storage was created for, whose alias of it lasts as long as that VM.
+    /// The client VM the storage was created for, or last handed to.
     vm: u64,
     /// That VM's status, which tells when its client closed it.
     status: Option<Arc<super::status::VmStatus>>,
@@ -425,13 +490,11 @@ impl RenderStorage {
 
 /// Render ring storage outlives its rings for the life of the device.
 ///
-/// A client VM keeps each render ring alias it installs until the VM closes,
-/// while an installed pair whose identities were never published can be
-/// reclaimed and its rings dropped. Freeing that storage would hand its shared
-/// lower address to another ring; a client still aliasing the old pages there
-/// that later receives the new ring could not alias it (`prepare_client_alias`
-/// fails with EFAULT). Retired storage is therefore kept and reused by later
-/// rings: an address keeps naming the same pages, so every alias stays valid.
+/// An installed pair whose identities were never published can be reclaimed
+/// and its rings dropped. Retired storage is kept and reused by later rings, so
+/// a ring's shared lower address keeps naming the same pages. A client's views
+/// of a ring belong to the render pair holding it (`Pair::client_kicks`),
+/// which drops them before the ring, so no VM has a view of retired storage.
 #[pin_data]
 pub(crate) struct RenderRings {
     #[pin]
@@ -461,8 +524,7 @@ impl RenderRings {
     }
 
     /// Reusable storage created for `client`, else storage whose VM its client has closed,
-    /// which then belongs to `client`. Storage of another open VM is never handed out: that VM
-    /// keeps its read-write alias of the pages, so it could read and write the new ring.
+    /// which then belongs to `client`. Storage of another open VM is never handed out.
     fn take(&self, client: &mmu::Vm) -> Option<RenderStorage> {
         let vm = client.id();
         let mut stock = self.stock.lock();
@@ -518,8 +580,8 @@ impl Drop for RenderRing {
     }
 }
 
-/// An installed queue's permanent ring. Client aliases are held by the bound
-/// context graph and must be dropped before this object.
+/// An installed queue's permanent ring. A render ring's client views are held by its pair
+/// for its time in their VM and must be dropped before this object.
 pub(crate) struct Queue {
     backing: Backing,
     id: Id,
@@ -587,9 +649,9 @@ impl Queue {
         })
     }
 
-    /// Retired storage of a never-written ring is reused first. Its address
-    /// names the same pages in every client that aliases it, so an existing
-    /// alias in `client` is kept (None) and a missing one is created.
+    /// Retired storage of a never-written ring is reused first. The returned view of the ring
+    /// in `client` is new: views belong to the pair that holds the ring, which drops them before
+    /// the ring, so retired storage has none.
     pub(crate) fn render(
         alloc: &Allocator<'_>,
         id: Id,
@@ -613,8 +675,9 @@ impl Queue {
                 ring.storage
                     .high
                     .prepare_alias(client, address, CLIENT_KICK_PROT, false);
-            // On failure the storage returns to the stock and a fresh ring is built.
-            if let Ok(alias) = alias {
+            // On failure, or if `client` still had a view of the pages, the storage returns to
+            // the stock and a fresh ring is built.
+            if let Ok(Some(alias)) = alias {
                 return Ok((
                     Self {
                         backing: Backing::Render(ring),
@@ -622,7 +685,7 @@ impl Queue {
                         timestamp: KickTimestamp::FIRST,
                         previous: None,
                     },
-                    alias,
+                    Some(alias),
                 ));
             }
         }
@@ -736,7 +799,7 @@ impl Queue {
         Ok(())
     }
 
-    /// Reuse a permanent client view only when every page names this ring.
+    /// Reuse the pair's client view only when every page names this ring.
     pub(crate) fn prepare_client_alias(&self, vm: &mmu::Vm) -> Result<Option<mmu::KernelMapping>> {
         let object = match &self.backing {
             Backing::Compute { low, .. } => low,

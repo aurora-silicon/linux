@@ -179,6 +179,10 @@ pub(super) struct InitData {
     active_effort: u32,
     /// The M5 firmware build's layout, where [`Self::m5`].
     graph: &'static super::fw::m5::initdata::Graph,
+    /// Power-policy layout of the M5 firmware build.
+    m5_policy: &'static crate::g17::fw::m5::initdata::M5PolicyMap,
+    /// Status-config layout of the M5 firmware build.
+    m5_status_config: &'static crate::g17::fw::m5::initdata::M5StatusConfigMap,
     outer_credits: Option<Arc<outer_credit::Credits>>,
     // Live publication uses interior writes under the device mutex. This owner is Send but not
     // Sync, so safe host code cannot issue those writes concurrently through shared references.
@@ -300,6 +304,8 @@ impl InitData {
             v26b123: false,
             active_effort: 0,
             graph: &super::fw::m5::initdata::M5_GRAPH,
+            m5_policy: &crate::g17::fw::m5::initdata::M5_26A428_POLICY,
+            m5_status_config: &crate::g17::fw::m5::initdata::M5_26A428_STATUS_CONFIG,
             outer_credits: None,
             _single_publisher: core::marker::PhantomData,
             aliases: KVec::new(),
@@ -853,16 +859,8 @@ impl InitData {
         Ok(values)
     }
 
-    /// Publishes an M5 compute record on the shared compute ring under the device mutex.
-    pub(super) fn publish_work(
-        &self,
-        priority: u8,
-        record: &super::fw::channels::WorkSlot,
-    ) -> Result<u32> {
-        self.publish_work_at(priority, record, None)
-    }
-
-    /// [`Self::publish_work`] against the cursors of a room check made earlier under the same
+    /// Publishes an M5 compute record on the shared compute ring under the device mutex,
+    /// against the cursors of a room check made earlier under the same
     /// hold of the device mutex ([`Self::m5_compute_room`]), or a fresh read for None.
     pub(super) fn publish_work_at(
         &self,

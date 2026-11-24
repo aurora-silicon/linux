@@ -109,6 +109,7 @@ struct t8152_display {
 };
 
 /* t8152_atc.c */
+int t8152_atc_boot_link(struct device *dev);
 int t8152_atc_init(struct t8152_display *disp);
 bool t8152_atc_release(struct t8152_display *disp);
 

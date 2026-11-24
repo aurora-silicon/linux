@@ -186,6 +186,28 @@ struct apple_rtkit *apple_rtkit_init_adopted_with_buffers(
 	const struct apple_rtkit_ops *ops,
 	const struct apple_rtkit_inherited_buffer *buffers, unsigned int count);
 
+#define APPLE_RTKIT_ADOPTED_EPMAP_WORDS 8
+
+/*
+ * Negotiated state from the previous owner of a running session: the
+ * protocol version, the endpoint map the firmware advertised (word i holds
+ * endpoints 32i..32i+31) and the retained system buffers. The parent driver
+ * verifies that the co-processor runs and the backing of each buffer.
+ * Application endpoints in the map each need a start from the new owner.
+ * Everything is copied before mailbox RX starts.
+ */
+struct apple_rtkit_adopted_session {
+	const struct apple_rtkit_inherited_buffer *buffers;
+	unsigned int num_buffers;
+	u32 epmap[APPLE_RTKIT_ADOPTED_EPMAP_WORDS];
+	u16 protocol_version;
+};
+
+struct apple_rtkit *apple_rtkit_init_adopted_with_session(
+	struct device *dev, void *cookie, const char *mbox_name, int mbox_idx,
+	const struct apple_rtkit_ops *ops,
+	const struct apple_rtkit_adopted_session *session);
+
 /*
  * Free an instance of apple_rtkit.
  */
