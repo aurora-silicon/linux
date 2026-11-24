@@ -2150,6 +2150,10 @@ static int sio_probe(struct platform_device *pdev)
 	err = sio_send_dt_params(sio);
 	if (err < 0)
 		return dev_err_probe(&pdev->dev, err, "failed to send boot-up parameters\n");
+	if (sio->tables_mismatch) {
+		sio->firmware_only = true;
+		goto rpm_put;
+	}
 
 	err = sio_alloc_shmem(sio);
 	if (err < 0)
