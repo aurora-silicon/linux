@@ -2454,7 +2454,7 @@ enum {
  * To support run-time toggling of sched features, all the translation units
  * (but core.c) reference the sysctl_sched_features defined in core.c.
  */
-extern __read_mostly unsigned int sysctl_sched_features;
+extern __read_mostly u64 sysctl_sched_features;
 
 #ifdef CONFIG_JUMP_LABEL
 
@@ -2472,7 +2472,7 @@ extern struct static_key sched_feat_keys[__SCHED_FEAT_NR];
 
 #else /* !CONFIG_JUMP_LABEL: */
 
-#define sched_feat(x) (sysctl_sched_features & (1UL << __SCHED_FEAT_##x))
+#define sched_feat(x) (sysctl_sched_features & (1ULL << __SCHED_FEAT_##x))
 
 #endif /* !CONFIG_JUMP_LABEL */
 

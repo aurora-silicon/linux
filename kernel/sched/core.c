@@ -167,11 +167,12 @@ __setup("sched_proxy_exec", setup_proxy_exec);
  * at compile time and compiler optimization based on features default.
  */
 #define SCHED_FEAT(name, enabled)	\
-	(1UL << __SCHED_FEAT_##name) * enabled |
-__read_mostly unsigned int sysctl_sched_features =
+	(1ULL << __SCHED_FEAT_##name) * enabled |
+__read_mostly u64 sysctl_sched_features =
 #include "features.h"
 	0;
 #undef SCHED_FEAT
+static_assert(__SCHED_FEAT_NR <= 64);
 
 /*
  * Print a warning if need_resched is set for the given duration (if
