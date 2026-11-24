@@ -426,8 +426,6 @@ struct apple_dart {
 	u32 sleep_gated : 1;
 	/* Locked roots may hold firmware slots that mirror Linux mappings. */
 	u32 fw_mirror : 1;
-	/* A T8132 internal display DART of a handed-over DCP (fw_mirror, not borrowed). */
-	u32 t8132_dcp_v27 : 1;
 	/*
 	 * fw_mirror's four-level locked roots hold firmware's own subtrees, which
 	 * are recorded and reserved (apple_dart_snapshot_fw_tree()). Set only for
@@ -4565,18 +4563,20 @@ static void apple_dart_get_fw_resv_regions(struct device *dev,
 }
 
 /*
- * A T8132 internal display DART on the 27.2 image (fw_mirror): the boot loader
- * re-exports the firmware's own segments as iommu-addresses, which the core
- * maps read-write, and uncached for this non-coherent DCP. The firmware's
- * leaves say what those pages are: its text read-only, all of it cacheable.
- * A Linux table in a slot the firmware holds must mirror its leaves exactly
- * (apple_dart_fw_slot_mirrors()), so give each such region the protection the
+ * A fw_mirror DART (locked, no reserved-table handoff, not borrowed) on a
+ * three-level root: a boot loader may re-export the firmware's own segments
+ * as iommu-addresses, which the core maps read-write, and uncached for a
+ * non-coherent client such as a DCP. The firmware's leaves say what those
+ * pages are: its text read-only, all of it cacheable. A Linux table in a slot
+ * the firmware holds must mirror its leaves exactly (apple_dart_fw_slot_mirrors(),
+ * apple_dart_check_fw_map()), so give each such region the protection the
  * live leaves give every one of its pages. A region whose pages are not mapped
  * there, map elsewhere or disagree keeps its protection, and the attach then
- * refuses it as before.
+ * refuses it as before. A region whose protection already matches is left
+ * alone, so this changes only a mapping the attach would otherwise refuse.
  */
-static void __apple_dart_t8132_dcp_v27_fw_prot(struct apple_dart_master_cfg *cfg,
-					       struct device *dev, struct list_head *head)
+static void __apple_dart_fw_mirror_prot(struct apple_dart_master_cfg *cfg,
+					struct device *dev, struct list_head *head)
 {
 	const int mask = IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE;
 	struct iommu_resv_region *region;
@@ -4590,7 +4590,8 @@ static void __apple_dart_t8132_dcp_v27_fw_prot(struct apple_dart_master_cfg *cfg
 	if (!cfg || !cfg->stream_maps[0].dart || cfg->stream_maps[1].dart)
 		return;
 	dart = cfg->stream_maps[0].dart;
-	if (!dart->t8132_dcp_v27 || !dart->locked || dart->hw->fmt != APPLE_DART2)
+	if (!dart->fw_mirror || dart->fw_handoff || !dart->locked ||
+	    dart->hw->fmt != APPLE_DART2)
 		return;
 	entries = dart->pgsize / sizeof(u64);
 	sid = find_first_bit(cfg->stream_maps[0].sidmap, dart->num_streams);
@@ -4666,9 +4667,9 @@ static void __apple_dart_t8132_dcp_v27_fw_prot(struct apple_dart_master_cfg *cfg
 	memunmap(root);
 }
 
-static void apple_dart_t8132_dcp_v27_fw_prot(struct device *dev, struct list_head *head)
+static void apple_dart_fw_mirror_prot(struct device *dev, struct list_head *head)
 {
-	__apple_dart_t8132_dcp_v27_fw_prot(dev_iommu_priv_get(dev), dev, head);
+	__apple_dart_fw_mirror_prot(dev_iommu_priv_get(dev), dev, head);
 }
 
 static void apple_dart_get_resv_regions(struct device *dev,
@@ -4700,7 +4701,7 @@ static void apple_dart_get_resv_regions(struct device *dev,
 
 	/* Keep the translated-domain requirement and inherited translations. */
 	iommu_dma_get_resv_regions(dev, head);
-	apple_dart_t8132_dcp_v27_fw_prot(dev, head);
+	apple_dart_fw_mirror_prot(dev, head);
 	apple_dart_get_fw_resv_regions(dev, head);
 }
 
@@ -6086,7 +6087,6 @@ params_done:
 		dev_err(dev, "T8132 internal display DART: NOT locked: refusing\n");
 	else if (t8132_dcp)
 		dev_err(dev, "T8132 internal display DART: locked with a reserved-table handoff: refusing\n");
-	dart->t8132_dcp_v27 = t8132_dcp;
 	if (t8132_dcp && !dart->fw_mirror) {
 		ret = -EINVAL;
 		goto err_clk_disable;
