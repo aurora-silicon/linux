@@ -18,19 +18,41 @@ use super::event::Events;
 use super::fw::channels::{
     DevCtl, SubmitRecord, RING_SLOTS, STATE_COMPLETION, STATE_READ, STATE_WRITE,
 };
+use super::fw::graph::qinfo_row2;
 use super::hw::{self, rings};
 use super::initdata::InitData;
 use super::object::{Class, FwObject, Objects, Placement, Request};
 use super::regs::{rmb, wmb};
 use super::Firmware;
 
-/// A submit channel.
+/// A submit pipe. The firmware has one submit channel per pipe for each scheduling class:
+/// channel `pipe + PIPES * class`, rung with `pipe | class << 2`. That is the pairing macOS
+/// 26B123 uses on the J773g, as an HV trace records it: each store to channel k's write cell
+/// is followed by doorbell `k % 3 | (k / 3) << 2`, and its application queues (class 2) go to
+/// channels 6, 7 and 8.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Channel {
     Ta = 0,
     Fs = 1,
     Compute = 2,
 }
+
+/// Submit pipes per scheduling class.
+const PIPES: u32 = 3;
+
+impl Channel {
+    /// The submit channel of this pipe in the class every G16 queue record declares.
+    pub(crate) const fn index(self) -> usize {
+        (self as u32 + PIPES * qinfo_row2::CLASS_VALUE) as usize
+    }
+
+    /// The pipe and class bits of this channel's doorbell.
+    pub(crate) const fn doorbell(self) -> u64 {
+        self as u64 | (qinfo_row2::CLASS_VALUE as u64) << 2
+    }
+}
+
+const _: () = assert!((qinfo_row2::CLASS_VALUE as u64 + 1) * PIPES as u64 <= rings::CHANNELS);
 
 /// A ring and its state block.
 pub(crate) struct Ring {
@@ -120,9 +142,9 @@ impl Channels {
         })
     }
 
-    /// A submit channel's ring.
+    /// A submit pipe's ring.
     pub(crate) fn channel(&self, channel: Channel) -> &Ring {
-        &self.submit[channel as usize]
+        &self.submit[channel.index()]
     }
 
     /// The host producer of `channel`.
@@ -157,7 +179,7 @@ impl Channels {
     fn post_inner(&mut self, channel: Channel, record: &SubmitRecord, ahead: bool) -> Result<u32> {
         let ch = channel as usize;
         let producer = self.producer[ch];
-        let ring = &self.submit[ch];
+        let ring = self.channel(channel);
         let consumer = ring.read()?;
         if consumer >= RING_SLOTS || producer >= RING_SLOTS {
             return Err(super::boot::eproto());

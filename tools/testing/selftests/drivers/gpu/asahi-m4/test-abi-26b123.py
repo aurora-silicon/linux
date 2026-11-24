@@ -192,6 +192,139 @@ def expect_queue(old):
     return bytes(new)
 
 
+def item(text, declaration):
+    start = text.index(declaration)
+    at = text.index('{', start)
+    depth, end = 1, at + 1
+    while depth:
+        depth += (text[end] == '{') - (text[end] == '}')
+        end += 1
+    return text[start:end]
+
+
+SUBMIT_CLASS_HARNESS = r'''
+#![allow(dead_code)]
+mod fw {
+    #[path = "__G16__/fw/graph.rs"]
+    pub(crate) mod graph;
+}
+mod hw { __RINGS__ }
+use fw::graph::{qinfo, qinfo_row2};
+use hw::rings;
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+__ENUM__
+__PIPES__
+__METHODS__
+__GUARD__
+
+/// macOS 26B123 on the J773g, HV trace hv27b-gpuwake: every write-cell store and the
+/// doorbell low bits that followed it, with the channel whose RUNTIME descriptor names that
+/// write cell (`sgx + 0xd60000 + 0x20 * pipe + 8 * class`).
+const MACOS_PAIRS: [(usize, u64, u64); 7] = [
+    (0, 0x00, 0x00),
+    (6, 0x10, 0x08),
+    (1, 0x20, 0x01),
+    (7, 0x30, 0x09),
+    (2, 0x40, 0x02),
+    (8, 0x50, 0x0a),
+    (11, 0x58, 0x0e),
+];
+
+/// The scheduling words of a macOS 26B123 application (class 2) queue record, and of a
+/// WindowServer/system (class 0) one, as the final UAT dump of hv27b-gpuwake holds them.
+const MACOS_CLASS2: [(usize, u32); 7] =
+    [(0x30, 2), (0x34, 2), (0x38, 0), (0x3c, 0xffff0000), (0x40, 0), (0x44, 2), (0x48, u32::MAX)];
+const MACOS_CLASS0: [(usize, u32); 7] = [
+    (0x30, 0), (0x34, 0), (0x38, 0xffff0000), (0x3c, u32::MAX), (0x40, 1), (0x44, 1),
+    (0x48, u32::MAX),
+];
+
+fn word(image: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes(image[at..at + 4].try_into().unwrap())
+}
+
+#[test]
+fn every_pipe_submits_on_the_channel_and_doorbell_of_its_records_class() {
+    let class = qinfo_row2::CLASS_VALUE as usize;
+    for (pipe, ch) in [(0, Channel::Ta), (1, Channel::Fs), (2, Channel::Compute)] {
+        assert_eq!(ch.index(), pipe + 3 * class);
+        assert_eq!(ch.doorbell(), (pipe | class << 2) as u64);
+        assert!(ch.index() < rings::CHANNELS as usize);
+        // The same channel and doorbell as macOS for that pipe and class.
+        let pair = MACOS_PAIRS.iter().find(|p| p.0 == ch.index()).unwrap();
+        assert_eq!(pair.2, ch.doorbell());
+        assert_eq!(pair.1, 0x20 * pipe as u64 + 8 * class as u64);
+    }
+    for (k, cell, doorbell) in MACOS_PAIRS {
+        assert_eq!(cell, 0x20 * (k % 3) as u64 + 8 * (k / 3) as u64);
+        assert_eq!(doorbell, ((k % 3) | (k / 3) << 2) as u64);
+    }
+    assert_eq!((Channel::Ta.index(), Channel::Fs.index(), Channel::Compute.index()), (6, 7, 8));
+    assert_eq!(
+        (Channel::Ta.doorbell(), Channel::Fs.doorbell(), Channel::Compute.doorbell()),
+        (0x8, 0x9, 0xa)
+    );
+}
+
+#[test]
+fn queue_records_declare_the_class_their_channels_carry() {
+    let image = fw::graph::queue_image_for(
+        &qinfo::V26B123,
+        0xfffffc2000100000,
+        0xfffffc2000104000,
+        0xfffffc2000108000,
+        0xfffffc200010c000,
+        0xfffffc2000110000,
+    );
+    for (at, value) in MACOS_CLASS2 {
+        assert_eq!(word(&image, at), value, "class 2 word {at:#x}");
+    }
+    assert!(MACOS_CLASS0.iter().any(|&(at, value)| word(&image, at) != value));
+    assert_eq!(word(&image, qinfo_row2::CLASS), qinfo_row2::CLASS_VALUE);
+    assert_eq!(word(&image, qinfo::V26B123.class_c), qinfo_row2::CLASS_VALUE);
+    // 25G83 keeps the same class at its own class_c.
+    let old =
+        fw::graph::queue_image_for(&qinfo::V25G83, 1 << 12, 2 << 12, 3 << 12, 4 << 12, 5 << 12);
+    assert_eq!(word(&old, qinfo::V25G83.class_c), qinfo_row2::CLASS_VALUE);
+}
+'''
+
+
+def submit_class(root, out):
+    """The production submit channel/doorbell mapping and queue-record class words of G16
+    against the channels, doorbells and record words of the macOS 26B123 HV trace."""
+    g16 = root / 'drivers/gpu/drm/asahi/g16'
+    channel = (g16 / 'channel.rs').read_text()
+    hw = (g16 / 'hw.rs').read_text()
+    boot = (g16 / 'boot.rs').read_text()
+    engine = (g16 / 'engine.rs').read_text()
+    # Every ring access and every doorbell goes through the pipe's class mapping.
+    assert '&self.submit[channel.index()]' in item(channel, 'pub(crate) fn channel(&self')
+    post = item(channel, 'fn post_inner(')
+    assert 'let ring = self.channel(channel);' in post and 'self.submit[' not in post
+    assert channel.count('self.submit[') == 1, 'channel() must be the only submit-ring index'
+    assert 'hw::engine::DOORBELL | channel.doorbell()' in item(boot, 'pub(crate) fn ring(&mut self')
+    # A record names its pipe, not its channel.
+    assert 'kind: channel as u32,' in engine
+    lines = channel.splitlines()
+    source = (SUBMIT_CLASS_HARNESS.replace('__G16__', str(g16))
+              .replace('__RINGS__', item(hw, 'pub(crate) mod rings {'))
+              .replace('__ENUM__', item(channel, 'pub(crate) enum Channel {'))
+              .replace('__PIPES__', next(x for x in lines if x.startswith('const PIPES: u32')))
+              .replace('__METHODS__', item(channel, 'impl Channel {'))
+              .replace('__GUARD__', next(x for x in lines if x.startswith(
+                  'const _: () = assert!((qinfo_row2::CLASS_VALUE'))))
+    (out / 'submit-class.rs').write_text(source)
+    for command in [rustc() + ['--edition=2021', '--test', str(out / 'submit-class.rs'), '-o',
+                               str(out / 'submit-class')],
+                    [str(out / 'submit-class')]]:
+        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True)
+        print(result.stdout, end='', flush=True)
+        if result.returncode:
+            raise SystemExit(result.returncode)
+
+
 def main():
     start = time.monotonic()
     root, out = kernel_root(), output_dir()
@@ -222,6 +355,7 @@ def main():
     queue = (out / 'queue.bin').read_bytes()
     assert queue[0xb4:] == expect_queue(queue[:0xb4]), 'queue info'
     checked += 0xb4
+    submit_class(root, out)
     print(f'26B123 encodings match the independent offset oracle: {checked} bytes '
           '(InitData, TA/FS/compute work and sequences, queue info)')
     report = {'passed': True, 'cpu_only': True, 'hardware_execution': False,

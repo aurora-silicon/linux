@@ -557,9 +557,9 @@ impl Session {
         self.rtkit.send(endpoint, message)
     }
 
-    /// Rings a submit channel's doorbell: EP 0x21 `0x0083 << 48 | channel`.
+    /// Rings a submit pipe's doorbell: EP 0x21 `0x0083 << 48 | pipe | class << 2`.
     pub(crate) fn ring(&mut self, channel: Channel) -> Result {
-        self.send(hw::ep::DOORBELL, hw::engine::DOORBELL | channel as u64)
+        self.send(hw::ep::DOORBELL, hw::engine::DOORBELL | channel.doorbell())
     }
 }
 

@@ -1996,7 +1996,7 @@ impl Firmware {
         if f.is_some_and(|f| f.renders != 0) {
             dev_info!(
                 self.graph.dev.as_ref(),
-                "G16:   render: draw={} ta {:#x}/{:#x}/{:#x} done={} read={} write={} head={} ch0={}/{}; fs {:#x}/{:#x}/{:#x} done={} read={} write={} head={} ch1={}/{}; stage events={}/{}\n",
+                "G16:   render: draw={} ta {:#x}/{:#x}/{:#x} done={} read={} write={} head={} ta_ch={}/{}; fs {:#x}/{:#x}/{:#x} done={} read={} write={} head={} fs_ch={}/{}; stage events={}/{}\n",
                 e.draw,
                 e.ta_target,
                 rd(&r.user_stamp[0], 0),

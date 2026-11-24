@@ -72,6 +72,11 @@ pub(crate) mod qinfo_row2 {
     pub(crate) const UNK_48: usize = 0x48;
     /// Row 0 (class 0): +0x38 mask, +0x40 = 1, +0x48 = 1.
     pub(crate) const ROW0_MASK_VALUE: u64 = 0xffffffffffff0000;
+    /// The scheduling class every G16 queue record declares at `CLASS`, `CLASS_B` and the
+    /// layout's `class_c`: the class macOS 26B123 gives application queues (its WindowServer
+    /// and system queues declare class 0). A queue's records go to that class's submit channel
+    /// of its pipe (`channel::Channel::index`).
+    pub(crate) const CLASS_VALUE: u32 = 2;
 }
 
 /// Queue state (0x60 bytes, firmware-only, never cached).
@@ -199,9 +204,9 @@ pub(crate) fn queue_image_for(
     }
     for (at, value) in [
         (0x2c, u32::MAX),
-        (0x30, 2u32),
-        (0x34, 2),
-        (layout.class_c, 2),
+        (qinfo_row2::CLASS, qinfo_row2::CLASS_VALUE),
+        (qinfo_row2::CLASS_B, qinfo_row2::CLASS_VALUE),
+        (layout.class_c, qinfo_row2::CLASS_VALUE),
         (layout.unk_4c, u32::MAX),
     ] {
         q[at..at + 4].copy_from_slice(&value.to_le_bytes());
