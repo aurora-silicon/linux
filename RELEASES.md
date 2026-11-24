@@ -1,8 +1,9 @@
 # Aurora kernel releases
 
-This repository has one long-lived branch, `main`. Every change lands there
-through a pull request, and every release is built from a commit on `main` by
-[`kernel-release.yml`](.github/workflows/kernel-release.yml).
+This repository has one long-lived branch, `main`. Changes land through pull
+requests. [Linux PR 3064](https://github.com/aurora-silicon/linux/pull/3064)
+introduces the release workflow and shared kernel configuration. Each channel
+becomes available after its first successful publication.
 
 The organisation-wide rules (branch names, who may tag, the merge gate) are in
 [branching-and-releases](https://github.com/aurora-silicon/agent-guidelines/blob/main/policy/branching-and-releases.md);
@@ -16,7 +17,7 @@ this file adds the kernel build details.
 | nightly | prerelease tag [`aurora-nightly`](https://github.com/aurora-silicon/linux/releases/tag/aurora-nightly) | once a day, if `main` moved since the last nightly | tag and assets replaced each night |
 | edge | prerelease tag [`aurora-edge`](https://github.com/aurora-silicon/linux/releases/tag/aurora-edge) | every push to `main` (a newer push cancels the running build) | tag and assets replaced on every push |
 
-Each release body names the exact `main` commit it was built from. `edge` is
+Each release body names its exact source commit. `edge` is
 for testing what just merged; `nightly` is the candidate pool for the next
 stable tag; `stable` is what distributions ship by default.
 
@@ -62,9 +63,9 @@ Stable releases are time-boxed. On the release cadence:
 Versions are `X.Y.Z`: Y goes up for a regular release, Z for a hotfix, and a
 new upstream base is at least a minor bump.
 
-Never hold a tag for unfinished work. Work that is not ready stays in its pull
-request and goes out in the next release. The workflow refuses a tag that is
-not on `main` and never overwrites a stable release that already exists.
+Unfinished work remains in its pull request for a later release. The workflow
+accepts stable tags on `main` and the hotfix branches described below. Stable
+releases must remain immutable.
 
 ## Hotfixes
 

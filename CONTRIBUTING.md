@@ -80,6 +80,12 @@ or sensitive, say so rather than substituting data from another Mac.
 For kernel patches, also follow the existing
 [kernel submission guidance](Documentation/process/submitting-patches.rst).
 
+## Pull request rules
+
+See [Aurora Silicon's pull request rules](https://github.com/aurora-silicon/agent-guidelines)
+and run the [pre-PR checklist](https://github.com/aurora-silicon/agent-guidelines/blob/main/pre-pr-checklist.md)
+before opening a pull request.
+
 ## Contributing code
 
 `main` is the only branch work lands in. Open every pull request against
@@ -100,11 +106,10 @@ For kernel patches, also follow the existing
 There are no long-lived release or per-platform branches. The full rules are in
 [branching-and-releases](https://github.com/aurora-silicon/agent-guidelines/blob/main/policy/branching-and-releases.md).
 
-`main` takes changes only through pull requests: no direct pushes, no force
-pushes and no deletion. Merged branches are deleted automatically, so start
-new work from a fresh branch off `main` instead of reusing a merged one. Do
-not stack long chains of pull requests on each other; if you must, retarget
-the stacked ones to `main` before their base is merged.
+`main` takes changes only through pull requests. The branch rules prevent
+direct pushes, force pushes and deletion. Start new work from a fresh branch
+off `main`. Retarget any stacked pull requests before their base is merged
+and its branch is deleted.
 
 Releases are cut from `main` on a fixed cadence and never wait for unfinished
 work. How the edge, nightly and stable channels are built is in
