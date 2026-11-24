@@ -69,7 +69,7 @@ static void dcp_peer_finish_v27(struct apple_dcp *dcp, struct apple_dcp *peer)
 	if (!dcp_peer_both_v27(dcp, peer, "A449", config, sizeof(config), NULL, 0x7c, false) &&
 	    !dcp_peer_param_v27(dcp, peer, 3, 1, 0x10000) &&
 	    !dcp_peer_both_v27(dcp, peer, "A453", &zero, sizeof(zero), tile, sizeof(tile), false) &&
-	    !dcp_peer_param_v27(dcp, peer, 6, 1, dcp->output_pq ? 0x20000 : 0x10000))
+	    !dcp_peer_param_v27(dcp, peer, 6, 1, dcp->output_hdr ? 0x20000 : 0x10000))
 		dev_info(dcp->dev, "paired engines report %ux%u each\n",
 			 le32_to_cpu(tile[0]), le32_to_cpu(tile[1]));
 }

@@ -9,7 +9,15 @@
 
 &avd {
 	compatible = "apple,t6041-max-avd", "apple,t6041-avd", "apple,t8132-avd";
-	power-domains = <&ps_avd_sys>;
+	power-domains = <&ps_avd_sys>, <&pmc_soc_max>;
+	power-domain-names = "core", "perf";
+};
+
+&ave {
+	power-domains = <&ps_venc0_dma>, <&ps_venc0_pipe4>,
+			<&ps_venc0_pipe5>, <&ps_venc0_me0>, <&ps_venc0_me1>,
+			<&pmc_soc_max>;
+	power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1", "perf";
 };
 
 /*
@@ -339,10 +347,37 @@
 &pmc {
 	#cooling-cells = <2>;
 	apple,static-voters = <1 3>;
+
+	/*
+	 * SoC fabric rail floor (rail 1, AP voter agent 3). T6041 has four
+	 * SOC states (0-3; ADT pmp dvfs-domain and pmgr voltage-states0/28/29):
+	 * state 2 (VMAX, 815 mV) already reaches the maximum SOC_AFC clock
+	 * (2004 MHz) and matches ADT AVD-SOC-VMAX and VENC0-SOC-VMAX; state 3
+	 * (VOVD, 820 mV) only raises SOC_AFI (975 -> 1300 MHz) and is voted by
+	 * CLPC for CPU/GPU demand.
+	 */
+	pmc_soc_max: floor-soc-max {
+		label = "soc-vmax";
+		#power-domain-cells = <0>;
+		apple,rail = <1>;
+		apple,level = <2>;
+	};
 };
 
+/*
+ * The GPU's memory states by the busy share the GPU driver reports, measured
+ * on a J616c: DCS 1, 2, 4 or 5 and fabric 0, 0, 0 or 3, split at 160, 500
+ * and 800 permille, and the top column with no share reported. The top
+ * column matches apple_clpc_hw_t6041's DCS 5 / fabric 3 floor (full memory
+ * bandwidth), so busy GPU work keeps it; light work such as scrolling a
+ * browser gets the lower columns. With a 3 GB/s copy: DCS 0 / fabric 0
+ * 5.46 W at 309 ns DRAM latency, DCS 3 6.22 W at 166 ns, DCS 4 6.92 W at
+ * 114 ns, DCS 5 7.04 W at 113 ns.
+ */
 &clpc {
 	compatible = "apple,t6041-max-clpc", "apple,t6041-clpc";
+	apple,gpu-busy-memory-states = <1 2 4 5>, <0 0 0 3>;
+	apple,gpu-busy-permille = <160 500 800>;
 };
 
 / {
@@ -674,6 +709,71 @@
 				<&ps_venc1_pipe5>, <&ps_venc1_me0>, <&ps_venc1_me1>;
 		power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1";
 		iommus = <&ave1_dart0 0>, <&ave1_dart1 0>;
+		status = "disabled";
+	};
+};
+
+/*
+ * First ProRes engine (ADT /arm-io/apr0) and its DART, from the J616c ADT.
+ * apr0 sits in the SCODEC block (PMGR bank 0 / pmgr_aux: FAB1_SOC 0x2d0,
+ * SCODEC 0x328, SCODEC_STREAMING 0x330) with core, wrapper and aux windows.
+ */
+&pmgr_aux {
+	ps_fab1_soc: power-controller@2d0 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2d0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "fab1_soc";
+		power-domains = <&ps_afi>;
+		apple,always-on;
+		status = "disabled";
+	};
+
+	ps_scodec: power-controller@328 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x328 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "scodec";
+		power-domains = <&ps_fab1_soc>;
+		status = "disabled";
+	};
+
+	ps_scodec_streaming: power-controller@330 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x330 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "scodec_streaming";
+		power-domains = <&ps_scodec>;
+		status = "disabled";
+	};
+};
+
+/ {
+	apr0: video-codec@301000000 {
+		compatible = "apple,t6041-prores", "apple,prores";
+		reg = <0x3 0x01000000 0x0 0x4000>,
+		      <0x3 0x00000000 0x0 0x1000000>,
+		      <0x3 0x010c0000 0x0 0x4000>;
+		reg-names = "core", "wrapper", "aux";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1960 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_scodec_streaming>;
+		iommus = <&apr0_dart 1>;
+		resets = <&ps_scodec>;
+		status = "disabled";
+	};
+
+	apr0_dart: iommu@301020000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x3 0x01020000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x0 0x300 0x0>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1959 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_scodec>;
 		status = "disabled";
 	};
 };

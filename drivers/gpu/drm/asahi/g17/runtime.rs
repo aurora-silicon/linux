@@ -1598,6 +1598,7 @@ impl compute::Host for ComputeHost<'_> {
     }
     fn note_submission(&mut self) -> Result {
         self.shared.note_submitter();
+        self.port.note_gpu_activity();
         self.shared.note_gpu_activity();
         self.effort.submit();
         self.effort.note_waiters(super::now_ns(), super::fence::waiters());
@@ -1751,7 +1752,7 @@ impl super::Firmware {
         }
         // No descriptor, accounting or inner producer changes precede this
         // reservation; dropping it unused returns the work-ring slot. M5 compute takes its
-        // slot on the work ring M5 render shares, under this mutex (InitData::publish_work):
+        // slot on the work ring M5 render shares, under this mutex (InitData::publish_work_at):
         // a full ring is refused here, before a queue install or kick changes any state.
         let mut outer_cursors = None;
         let outer = if self.init.is_m5() {

@@ -2779,10 +2779,14 @@ static void bcm4377_reset_work(struct work_struct *work)
 	 * Remove and probe again: probe resets the function and boots the
 	 * firmware from scratch. device_reprobe() frees the old bcm4377_data,
 	 * which is why this work and its device reference live outside it.
+	 * A timeout during system resume gets here while the driver core
+	 * blocks probing: the probe is deferred and runs once resume completes.
 	 */
 	ret = device_reprobe(&rw->pdev->dev);
 	/* A BCM4388 defers until its Wi-Fi function is bound again: the retry binds it. */
-	if (ret && ret != -EPROBE_DEFER)
+	if (ret == -EPROBE_DEFER)
+		dev_info(&rw->pdev->dev, "reprobe after command timeout deferred\n");
+	else if (ret)
 		dev_err(&rw->pdev->dev, "reprobe after command timeout failed: %d\n", ret);
 
 	pci_dev_put(rw->pdev);
