@@ -721,21 +721,11 @@
 
 /*
  * First ProRes engine (ADT /arm-io/apr0) and its DART, from the J616c ADT.
- * apr0 sits in the SCODEC block (PMGR bank 0 / pmgr_aux: FAB1_SOC 0x2d0,
- * SCODEC 0x328, SCODEC_STREAMING 0x330) with core, wrapper and aux windows.
+ * apr0 sits in the SCODEC block (PMGR bank 0 / pmgr_aux: FAB1_SOC 0x2d0 in
+ * t6041-pmgr.dtsi, SCODEC 0x328, SCODEC_STREAMING 0x330) with core, wrapper
+ * and aux windows.
  */
 &pmgr_aux {
-	ps_fab1_soc: power-controller@2d0 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x2d0 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "fab1_soc";
-		power-domains = <&ps_afi>;
-		apple,always-on;
-		status = "disabled";
-	};
-
 	ps_scodec: power-controller@328 {
 		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x328 4>;
@@ -826,3 +816,5 @@
 &ave {
 	status = "okay";
 };
+
+#include "t6041-pmgr.dtsi"
