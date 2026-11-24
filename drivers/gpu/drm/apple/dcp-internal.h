@@ -370,6 +370,11 @@ struct apple_dcp_hw_data {
 	 * for one second.
 	 */
 	unsigned int afk_timeout_ms;
+	/*
+	 * Firmware 27 reaches its register windows through its DART here, so map_reg maps
+	 * them there (T8103: its power-down faults on an unmapped window otherwise).
+	 */
+	bool map_reg_dart;
 };
 
 enum dcp_test_point {
@@ -728,6 +733,8 @@ struct apple_dcp {
 
 	/* Display registers mappable to the DCP */
 	struct resource *disp_registers[MAX_DISP_REGISTERS];
+	/* Their DART mappings with hw.map_reg_dart, made at the firmware's first map_reg */
+	dma_addr_t map_reg_dva[MAX_DISP_REGISTERS];
 	unsigned int nr_disp_registers;
 
 	struct resource disp_bw_scratch_res;
