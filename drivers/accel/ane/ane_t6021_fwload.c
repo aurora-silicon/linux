@@ -527,18 +527,16 @@ static int ane_t6021_fw_patch(struct ane_t6021 *ane, u8 *img)
 
 /*
  * The native H14 firmware has a different TEXT/DATA layout from the
- * disk-loaded image. Use the layout reported by the loader to match the
- * boot ABI, and take the physical and device addresses from the handoff.
+ * disk-loaded image. A handoff whose sizes match the disk-loaded image is
+ * the legacy layout; any other layout is the loader's own and is taken
+ * whole from the handoff: physical addresses, sizes and device addresses.
  */
 static int ane_t6021_fw_preload_check(struct device *dev,
 				     const struct ane_fw_image *legacy,
 				     struct ane_t6021_preload *preload)
 {
 	struct ane_t6021_preload p;
-	struct ane_fw_platform layout = {
-		/* H14 native layout, from the ADT's segment-ranges. */
-		.preload_size = { 0xd8000, 0x614000 },
-	};
+	struct ane_fw_platform layout = {};
 	struct device_node *np = dev->of_node;
 	u64 text_end, data_end;
 	unsigned int i;
@@ -567,6 +565,11 @@ static int ane_t6021_fw_preload_check(struct device *dev,
 	    p.size[1] == legacy->segs[1].vmsize)
 		return 0;
 
+	for (i = 0; i < ARRAY_SIZE(p.size); i++)
+		if (!p.size[i] || !IS_ALIGNED(p.size[i], SZ_16K))
+			return -EINVAL;
+	/* The layout is the handoff's: only placement and overlap are checked. */
+	memcpy(layout.preload_size, p.size, sizeof(p.size));
 	memcpy(layout.preload_dva, p.dva, sizeof(p.dva));
 	if (!ane_fw_preload_ranges_valid(&layout, p.phys, p.size, p.dva) ||
 	    !ane_t6021_rvbar_entry_ok(p.dva[0]) || !p.dva[0])
