@@ -95,6 +95,7 @@
 #include <linux/of_graph.h>
 #include <linux/of_platform.h>
 #include <linux/notifier.h>
+#include <linux/reboot.h>
 #include <linux/pci-apple.h>
 #include <linux/pinctrl/consumer.h>
 #include <linux/platform_device.h>
@@ -171,6 +172,10 @@ struct apple_cio_hw {
 	bool gen4_link_recovery;
 	/* Leave the host router's TMU to its firmware; host TMU constants. */
 	bool host_tmu;
+	/* Drain PSD runtime power-off before the PHY is reset or reused. */
+	bool psd_power_cycle;
+	/* Stop a started router before a reboot shuts its PCIe and DARTs down. */
+	bool stop_at_reboot;
 	/* Deep sleep removes the CIO domains, including an attached router. */
 	bool sleep_removes_domains;
 	/* Start the router again at once after a wake. */
@@ -213,6 +218,18 @@ static const struct apple_cio_hw apple_cio_t8132_hw = {
 	.strict_fw_ready = true,
 	.no_host_clx = true,
 	.dp = &apple_dpin_m4,
+};
+
+/* MXWrap-v2p3 is started by reconfiguration, using its counted mailbox. */
+static const struct apple_cio_hw apple_cio_t8152_hw = {
+	.psd_power_cycle = true,
+	.stop_at_reboot = true,
+	.type7 = true,
+	.lstx_after_boot = true,
+	.strict_fw_ready = true,
+	.no_host_clx = true,
+	.no_asym = true,
+	.dp = &apple_dpin_disabled,
 };
 
 /*
@@ -522,6 +539,7 @@ struct apple_cio {
 	u64 link_lost_cycle_activity; /* remote activity at the last cycle */
 	bool link_lost_restart; /* protected by lock: cycle requested */
 	struct notifier_block pm_notifier;
+	struct notifier_block reboot_notifier;
 	/*
 	 * T6050: the displays behind this port go at the start of the sleep's entry, before any
 	 * port's power-off. @sleep_dp_paused: this entry closed the DP IN admission;
@@ -1327,7 +1345,8 @@ static void apple_cio_of_node_put(void *data)
 
 static bool apple_cio_pciec_eligible(const struct device_node *np)
 {
-	return of_device_is_compatible(np, "apple,t6040-pciec") ||
+	return of_device_is_compatible(np, "apple,t8152-pciec") ||
+	       of_device_is_compatible(np, "apple,t6040-pciec") ||
 	       of_device_is_compatible(np, "apple,t8103-pciec") ||
 	       of_device_is_compatible(np, "apple,t6000-pciec") ||
 	       of_device_is_compatible(np, "apple,t6050-pciec") ||
@@ -2614,7 +2633,8 @@ static int apple_nhi_probe(struct platform_device *pdev)
 
 	/* The T6050 router is the Type 7 one released by a RUN store. */
 	if (acio->type7 !=
-	    (of_device_is_compatible(pdev->dev.of_node, "apple,t8142-usb4-nhi") ||
+	    (of_device_is_compatible(pdev->dev.of_node, "apple,t8152-usb4-nhi") ||
+	     of_device_is_compatible(pdev->dev.of_node, "apple,t8142-usb4-nhi") ||
 	     of_device_is_compatible(pdev->dev.of_node, "apple,t6040-usb4-nhi") ||
 	     of_device_is_compatible(pdev->dev.of_node, "apple,t6050-usb4-nhi")) ||
 	    acio->hw->run_store !=
@@ -3120,6 +3140,7 @@ static const struct of_device_id apple_nhi_match[] = {
 	{
 		.compatible = "apple,t6050-usb4-nhi",
 	},
+	{ .compatible = "apple,t8152-usb4-nhi" },
 	{
 		.compatible = "apple,t8142-usb4-nhi",
 	},
@@ -3330,6 +3351,26 @@ static void apple_cio_test_log_guards(struct apple_cio *acio)
 	dev_info(acio->dev, "TEST sv6t7: ACIO stop, its domain links go next: PS_PROT%s\n", buf);
 }
 
+static void apple_cio_release_domains(struct apple_cio *acio)
+{
+	int n, i, ret;
+
+	for (n = 0; n < acio->pd_list->num_pds; n++) {
+		i = acio->hw->psd_power_cycle ? acio->pd_list->num_pds - 1 - n : n;
+		dev_pm_syscore_device(acio->pd_list->pd_devs[i], false);
+		if (!acio->pd_list->pd_links[i])
+			continue;
+		device_link_del(acio->pd_list->pd_links[i]);
+		acio->pd_list->pd_links[i] = NULL;
+		if (!acio->hw->psd_power_cycle)
+			continue;
+		/* Link removal only queues idle; finish it before returning. */
+		ret = pm_runtime_suspend(acio->pd_list->pd_devs[i]);
+		if (ret < 0)
+			dev_warn(acio->dev, "PSD domain %d failed to suspend: %d\n", i, ret);
+	}
+}
+
 /**
  * apple_cio_stop - Stop and power down the ACIO complex
  * @acio: ACIO complex to stop
@@ -3340,7 +3381,7 @@ static void apple_cio_test_log_guards(struct apple_cio *acio)
  */
 static void apple_cio_stop(struct apple_cio *acio)
 {
-	int ret, i;
+	int ret;
 
 	lockdep_assert_held(&acio->lock);
 	if (!acio->current_cable_info)
@@ -3365,12 +3406,7 @@ static void apple_cio_stop(struct apple_cio *acio)
 	apple_cio_test_log_guards(acio);
 
 	/* Finally, remove the links to the PD domains to power everything off */
-	for (i = 0; i < acio->pd_list->num_pds; i++) {
-		if (acio->pd_list->pd_links[i])
-			device_link_del(acio->pd_list->pd_links[i]);
-		acio->pd_list->pd_links[i] = NULL;
-		dev_pm_syscore_device(acio->pd_list->pd_devs[i], false);
-	}
+	apple_cio_release_domains(acio);
 
 	acio->current_cable_info = 0;
 	acio->resume_link_failed = false;
@@ -3631,12 +3667,7 @@ remove_links:
 	acio->rtk = NULL;
 	apple_cio_cpu_halt(acio);
 	/* Cut power to reset the entire block  */
-	for (i = 0; i < acio->pd_list->num_pds; i++) {
-		if (acio->pd_list->pd_links[i])
-			device_link_del(acio->pd_list->pd_links[i]);
-		acio->pd_list->pd_links[i] = NULL;
-		dev_pm_syscore_device(acio->pd_list->pd_devs[i], false);
-	}
+	apple_cio_release_domains(acio);
 	return ret;
 }
 
@@ -4509,6 +4540,24 @@ static int apple_cio_pcie_notify(struct notifier_block *nb,
 	return NOTIFY_OK;
 }
 
+/*
+ * A reboot or power-off shuts the PCIe-C host and the router's and the
+ * tunnel's DARTs down before this device, with the router still running
+ * over them. Stop a started router first, as the port driver does for an
+ * unplugged cable, and refuse a new start from then on.
+ */
+static int apple_cio_reboot_notify(struct notifier_block *nb, unsigned long action,
+				   void *data)
+{
+	struct apple_cio *acio = container_of(nb, struct apple_cio, reboot_notifier);
+
+	guard(mutex)(&acio->lock);
+	acio->removing = true;
+	if (acio->current_cable_info)
+		apple_cio_stop(acio);
+	return NOTIFY_DONE;
+}
+
 static int apple_cio_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -4777,6 +4826,10 @@ static int apple_cio_probe(struct platform_device *pdev)
 	acio->pm_notifier_dp.notifier_call = apple_cio_dp_pm_notify;
 	acio->pm_notifier_dp.priority = 20;
 	register_pm_notifier(&acio->pm_notifier_dp);
+	if (acio->hw->stop_at_reboot) {
+		acio->reboot_notifier.notifier_call = apple_cio_reboot_notify;
+		register_reboot_notifier(&acio->reboot_notifier);
+	}
 	return 0;
 }
 
@@ -4784,6 +4837,8 @@ static void apple_cio_remove(struct platform_device *pdev)
 {
 	struct apple_cio *acio = platform_get_drvdata(pdev);
 
+	if (acio->hw->stop_at_reboot)
+		unregister_reboot_notifier(&acio->reboot_notifier);
 	/* Refuse new activation before draining callbacks and workers. */
 	scoped_guard(mutex, &acio->lock)
 		acio->removing = true;
@@ -4817,6 +4872,7 @@ static const struct of_device_id apple_acio_match[] = {
 		.compatible = "apple,t6050-usb4-acio",
 		.data = &apple_cio_t6050_hw,
 	},
+	{ .compatible = "apple,t8152-usb4-acio", .data = &apple_cio_t8152_hw },
 	{
 		.compatible = "apple,t8142-usb4-acio",
 		.data = &apple_cio_t8142_hw,
