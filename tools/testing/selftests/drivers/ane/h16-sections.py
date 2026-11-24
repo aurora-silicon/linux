@@ -18,10 +18,11 @@ derives them from the HWX alone:
   stream references. A slot takes its base from the program descriptor
   qword at +0x10 * (slot + 1); a surface base binds that surface's buffer
   ID, the __DATA base binds the scratch ID, the __KERN_0 base binds the
-  kernel resource index 1007, and a zero base (a config-word slot) stays
-  unbound. An H14 descriptor has no slot table: slot 3 is the __DATA
-  scratch, and from slot 4 come the first input, the output, then the
-  other inputs, in segment order.
+  kernel resource index 1007 (as does the __TEXT,__const base of a program
+  without __KERN_0, which LOAD slot 1 carries), and a zero base (a
+  config-word slot) stays unbound. On H14 the table runs from slot 1:
+  __TEXT,__const, slot 3 the __DATA scratch, and from slot 4 the first
+  input, the output, then the other inputs, in segment order.
 - procedure: the fixed one-procedure form.
 - text properties: one segment covering the whole __TEXT,__text stream,
   with one block per task.
@@ -82,6 +83,7 @@ def parse(hwx):
     if len(hwx) < 32 or u32(hwx, 0) != 0xbeefface or u32(hwx, 8) not in PROLOGUE:
         raise HwxError("not an H14, H16G or H17 HWX")
     surfaces, text, kernel, scratch, descriptor, tensors = [], None, None, None, None, {}
+    constants = None
     pos = 32
     for _ in range(u32(hwx, 16)):
         cmd, size = u32(hwx, pos), u32(hwx, pos + 4)
@@ -101,6 +103,8 @@ def parse(hwx):
                     surfaces.append({"vm": svm, "allocation": vmsize, "direction": prot})
                 elif segment == "__TEXT" and name == "__text":
                     text = (svm, ssize, soff)
+                elif segment == "__TEXT" and name == "__const":
+                    constants = svm
                 elif segment == "__KERN_0" and name == "__kern_0":
                     kernel = (svm, ssize, soff)
                 elif segment == "__DATA" and name == "__bss":
@@ -128,7 +132,7 @@ def parse(hwx):
         s["span"] = span
     if sum(s["direction"] == 2 for s in surfaces) != 1:
         raise HwxError("an H16 program has exactly one output")
-    return surfaces, text, kernel, scratch, descriptor
+    return surfaces, text, kernel, scratch, descriptor, constants
 
 
 def register_valid(word, subtype=7):
@@ -174,7 +178,7 @@ def walk(stream, prologue, subtype=7):
 
 def build(hwx):
     """Return the four sections, in H16_LOAD kind order, and the buffer IDs."""
-    surfaces, (text_vm, text_size, text_off), kernel, scratch, descriptor = parse(hwx)
+    surfaces, (text_vm, text_size, text_off), kernel, scratch, descriptor, constants = parse(hwx)
     stream = hwx[text_off:text_off + text_size]
     subtype = u32(hwx, 8)
     tasks, slots = walk(stream, PROLOGUE[subtype], subtype)
@@ -199,14 +203,7 @@ def build(hwx):
         struct.pack_into("<I", generic, e + 0x28, 0xffff)
 
     def slot_base(slot):
-        if subtype != H14:
-            return u64(hwx, descriptor + 0x10 * (slot + 1))
-        if slot == 3:
-            return scratch[0] if scratch else 0
-        inputs = [s["vm"] for s in surfaces if s["direction"] == 1]
-        output = [s["vm"] for s in surfaces if s["direction"] == 2]
-        order = inputs[:1] + output + inputs[1:]
-        return order[slot - 4] if 4 <= slot < 4 + len(order) else 0
+        return u64(hwx, descriptor + 0x10 * (slot + 1))
 
     refs = []
     for slot in sorted(slots):
@@ -219,6 +216,8 @@ def build(hwx):
         elif scratch and base == scratch[0]:
             refs.append((slot, scratch_id))
         elif kernel and base == kernel[0]:
+            refs.append((slot, RESOURCE_KERNEL))
+        elif not kernel and base == constants:
             refs.append((slot, RESOURCE_KERNEL))
         else:
             raise HwxError("BAR slot %d base %#x names no surface, scratch or kernel" %

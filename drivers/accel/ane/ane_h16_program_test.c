@@ -899,20 +899,24 @@ static struct ane_h16_hwx_snapshot *h14_add(struct kunit *test, const void *aux[
 }
 
 /*
- * The H14 container: a 0x890-byte descriptor without a slot table, eight-word
- * task headers, segments a, b (inputs) then y (output). Slot 4 binds the
- * first input, slot 5 the output and slot 6 the second input; the program
- * loads and runs on an H14 session with no custom BAR record.
+ * The H14 container: a 0x890-byte descriptor whose BAR slot table starts at
+ * slot 1, eight-word task headers, segments a, b (inputs) then y (output).
+ * Slot 1 binds the __TEXT/__const coefficients, slot 4 the first input, slot
+ * 5 the output and slot 6 the second input; the program loads and runs on an
+ * H14 session with no custom BAR record. A descriptor whose output slot is
+ * empty is refused.
  */
 static void program_h14_add_hwx_test(struct kunit *test)
 {
 	static const u32 ids[3] = { 5, 6, 4 }, classes[3] = { 0, 0, 1 };
 	struct prog_fw *f = fw_create_family(test, 14);
-	struct ane_h16_hwx_snapshot *snapshot;
+	struct ane_h16_hwx_snapshot *snapshot, bad = {};
 	struct ane_h16_program *p = NULL;
 	const void *aux[ANE_H16_AUX_COUNT];
 	size_t aux_size[ANE_H16_AUX_COUNT];
+	const u8 *descriptor;
 	unsigned int i;
+	u8 *copy;
 
 	KUNIT_ASSERT_NOT_NULL(test, f);
 	snapshot = h14_add(test, aux, aux_size);
@@ -921,14 +925,23 @@ static void program_h14_add_hwx_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, snapshot->info.subtype, ANE_HWX_SUBTYPE_H14);
 	KUNIT_EXPECT_EQ(test, snapshot->info.tasks, 1);
 	KUNIT_EXPECT_EQ(test, snapshot->info.kernel.size, 0);
-	KUNIT_EXPECT_EQ(test, ane_h16_hwx_slot_base(&snapshot->info, NULL, 4),
+	descriptor = (const u8 *)snapshot->bytes + snapshot->info.program_offset;
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_slot_base(&snapshot->info, descriptor, 1),
+			snapshot->info.constants.vm);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_slot_base(&snapshot->info, descriptor, 4),
 			snapshot->info.surfaces[0].section.vm);
-	KUNIT_EXPECT_EQ(test, ane_h16_hwx_slot_base(&snapshot->info, NULL, 5),
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_slot_base(&snapshot->info, descriptor, 5),
 			snapshot->info.surfaces[2].section.vm);
-	KUNIT_EXPECT_EQ(test, ane_h16_hwx_slot_base(&snapshot->info, NULL, 6),
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_slot_base(&snapshot->info, descriptor, 6),
 			snapshot->info.surfaces[1].section.vm);
-	KUNIT_EXPECT_EQ(test, ane_h16_hwx_slot_base(&snapshot->info, NULL, 3), 0);
-	KUNIT_EXPECT_EQ(test, ane_h16_hwx_slot_base(&snapshot->info, NULL, 7), 0);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_slot_base(&snapshot->info, descriptor, 3), 0);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_slot_base(&snapshot->info, descriptor, 7), 0);
+
+	copy = kunit_kmalloc(test, H14_ADD_HWX_SIZE, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, copy);
+	memcpy(copy, snapshot->bytes, H14_ADD_HWX_SIZE);
+	memset(copy + snapshot->info.program_offset + 0x60, 0, 8);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_snapshot_create(copy, H14_ADD_HWX_SIZE, &bad), -ENOEXEC);
 
 	KUNIT_ASSERT_EQ(test, ane_h16_session_load(&f->s, snapshot, aux, aux_size, &p), 0);
 	KUNIT_ASSERT_NOT_NULL(test, p);
