@@ -678,7 +678,7 @@ system_root() {
 	air) _hd="apple,j613 apple,t8122"; _hg=$G15G ;;
 	*) _hd="apple,j516s apple,t6030"; _hg=$G15S ;;
 	esac
-	_hr=$(mkroot "handoff-$1" "$_hd" "$_hg" yes 1 yes)
+	_hr=$(mkroot "handoff-$1" "$_hd" "$_hg" yes 1 yes "${3:-asahi}")
 	mkdir -p "$_hr/etc/mesa-m3"
 	: > "$_hr/etc/mesa-m3/disable"
 	cat > "$_hr/opt/mesa-m3/libexec/mesa-m3-system-check" <<'H'
@@ -748,6 +748,58 @@ if [ "$(cat "$HRA/opt/mesa-m3/libexec/system-check.args")" = "$(printf '/dev/dri
 else echo 'FAIL  handoff: helper argv/environment'; fail=1; fi
 HRP=$(system_root root-optout pro)
 handoff "$HRP" none yes
+# The 7.3 kernels name the GPU driver "aurora" ("asahi" is only a module alias).
+# The admission accepts it on both SoCs.
+for soc in air pro; do
+	HR=$(system_root "aurora-$soc" "$soc" aurora)
+	handoff "$HR" none yes
+done
+# On "aurora" the system Mesa is not refused, so no session falls back to
+# software there: not a failed admission, not the default T8122 session
+# (experimental), not a T6030 the /opt/mesa-m3 profile cannot use. A driver
+# that only starts with "aurora" is not admitted.
+aurora_state() { # NAME ROOT WANT_REASON
+	_ao=$(env -i PATH="$T/bin:/usr/bin:/bin" HOME="$T/home" FAKE_LOG="$T/log" \
+		XDG_CURRENT_DESKTOP=Hyprland "$TSH" -c '
+		MESA_M3_SESSION_ENV_NO_RUN=1 . "$1"
+		mesa_m3_session_env "$2"
+		printf "software=%s\nmarker=%s\n" "${LIBGL_ALWAYS_SOFTWARE:-}" "${MESA_M3_FALLBACK:-}"
+		cat "$2/run/user/$(id -u)/mesa-m3-session.state"
+	' sh "$ENVFILE" "$2")
+	if printf '%s\n' "$_ao" | grep -qx 'fallback=none' &&
+		printf '%s\n' "$_ao" | grep -qx 'software=' &&
+		printf '%s\n' "$_ao" | grep -qx 'decision=inactive' &&
+		printf '%s\n' "$_ao" | grep -qx "reason=$3" &&
+		! printf '%s\n' "$_ao" | grep -q 'detail=.*system Mesa on /usr admits'; then
+		echo "ok    $1: reason=$3 fallback=none, nothing exported"
+	else
+		echo "FAIL  $1: want reason=$3 fallback=none and no admission: $_ao"; fail=1
+	fi
+}
+HR=$(system_root aurora-probe-fail pro aurora)
+: > "$HR/opt/mesa-m3/libexec/system-check.fail"
+aurora_state aurora-probe-fail "$HR" opt-out
+HR=$(system_root aurora-x pro aurora-x)
+aurora_state aurora-x "$HR" opt-out
+HR=$(mkroot aurora-default-air "apple,j613 apple,t8122" "$G15G" yes 1 yes aurora)
+aurora_state aurora-default-air "$HR" experimental
+HR=$(mkroot aurora-default-pro "apple,j516s apple,t6030" "$G15S" yes 1 yes aurora)
+aurora_state aurora-default-pro "$HR" no-gpu
+# A kernel built with the native G15 backend binds the T6030 to that backend's
+# own driver: "asahi-g15" on 7.2, "aurora-g15" on 7.3. The admission accepts
+# both, a failed admission there does not fall back to software, and neither
+# does the default session. A near-miss name is not admitted.
+for drv in asahi-g15 aurora-g15; do
+	HR=$(system_root "$drv" pro "$drv")
+	handoff "$HR" none yes
+	HR=$(system_root "$drv-probe-fail" pro "$drv")
+	: > "$HR/opt/mesa-m3/libexec/system-check.fail"
+	aurora_state "$drv-probe-fail" "$HR" opt-out
+	HR=$(mkroot "$drv-default-pro" "apple,j516s apple,t6030" "$G15S" yes 1 yes "$drv")
+	aurora_state "$drv-default-pro" "$HR" no-gpu
+done
+HR=$(system_root asahi-g15x pro asahi-g15x)
+aurora_state asahi-g15x "$HR" opt-out
 handoff "$HRP" none yes LIBGL_ALWAYS_SOFTWARE=1 MESA_M3_FALLBACK=software
 for mode in fail sleep; do
 	HR=$(system_root "probe-$mode" pro)

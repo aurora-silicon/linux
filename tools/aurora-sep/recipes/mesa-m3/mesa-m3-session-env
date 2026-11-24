@@ -59,10 +59,16 @@
 #   active            all passed: the session uses /opt/mesa-m3
 # M1, M2, the M3 Max and anything else are left alone.
 #
-# When it does not use /opt/mesa-m3 but an M3 render node is there and this
-# user can open it, the system Mesa would be refused by the kernel (it is not
-# M3-aware), and a compositor that renders through an EGL device on that node
-# (Hyprland) would stop at start. For every inactive reason except user-setup
+# When it does not use /opt/mesa-m3 but an M3 render node of the pre-7.3
+# "asahi" driver is there and this user can open it, the system Mesa would be
+# refused by the kernel (it is not M3-aware), and a compositor that renders
+# through an EGL device on that node (Hyprland) would stop at start. On the
+# 7.3 kernels' "aurora" driver, and on the native G15 backend's "asahi-g15"
+# (7.2) or "aurora-g15" (7.3) driver that a kernel built with
+# CONFIG_DRM_ASAHI_G15 binds to the T6030, the system Mesa is not refused, so
+# none of this applies there: the session keeps it (fallback=none), whatever
+# the reason.
+# For every inactive reason on an "asahi" node except user-setup
 # it therefore exports LIBGL_ALWAYS_SOFTWARE=1 (and MESA_M3_FALLBACK=software,
 # which marks it as this hook's): the session renders in software. For
 # user-setup it exports nothing: the session's own Mesa setup, which it uses,
@@ -73,7 +79,8 @@
 # display, kernel-log, user-setup and same-boot attempt checks pass and
 # mesa-m3-system-check admits /usr, the session keeps system Mesa
 # (fallback=none, no new attempt). The whole check runs in its own sh and is
-# refused after 20 seconds. mesa_m3=off stays on the software fallback.
+# refused after 20 seconds. mesa_m3=off stays on the software fallback (on an
+# "asahi" node).
 #
 # Each login writes /run/user/<uid>/mesa-m3-session.state (atomically, 0644,
 # key=value lines, first line schema=aurora.mesa-m3-session/2) and logs one
@@ -307,7 +314,10 @@ _mm3_25g83_board() {
 
 # _mm3_node_open ROOT: this is a T6030 or T8122 with a render node of its
 # asahi M3 GPU (among any others) that this user can open: the system Mesa
-# would be refused on it.
+# would be refused on it. Only the pre-7.3 "asahi" driver counts: on the
+# 7.3 "aurora" driver and the G15 backend's "asahi-g15" and "aurora-g15" the
+# system Mesa is not refused, so a session that does not use /opt/mesa-m3
+# keeps it instead of falling back to software.
 _mm3_node_open() {
 	_mm3_soc=$(_mm3_soc_of "$1")
 	[ -n "$_mm3_soc" ] || return 1
@@ -421,8 +431,16 @@ _mm3_system_admit() {
 		_mm3_node=$_mm3_n
 	done
 	[ "$_mm3_nodes" -eq 1 ] || return 1
+	# The GPU's platform driver is "asahi" before 7.3 and "aurora" from 7.3 on
+	# (2d76bcead7cc; "asahi" is then only its module alias). A kernel built
+	# with the native G15 backend (CONFIG_DRM_ASAHI_G15) binds the T6030 to
+	# that backend's own driver instead: "asahi-g15" on 7.2, "aurora-g15" on
+	# 7.3. mesa-m3-system-check below still decides whether /usr drives it.
 	_mm3_drv=$(basename "$(readlink -f "$_mm3_node/device/driver" 2>/dev/null)" 2>/dev/null)
-	[ "$_mm3_drv" = asahi ] || return 1
+	case "$_mm3_drv" in
+	aurora | aurora-g15 | asahi | asahi-g15) ;;
+	*) return 1 ;;
+	esac
 	tr '\0' '\n' 2>/dev/null < "$_mm3_node/device/of_node/compatible" | grep -qx "apple,agx-$_mm3_chip" || return 1
 	_mm3_dev="$1/dev/dri/${_mm3_node##*/}"
 	[ -r "$_mm3_dev" ] && [ -w "$_mm3_dev" ] || return 1

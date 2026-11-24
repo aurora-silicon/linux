@@ -6,7 +6,7 @@ system driver worked. The legacy package owns this hook, so the native Mesa
 package must not overwrite it or add an unconditional late unset.
 
 This change allows a file opt-out on any T8122 or T6030 board to leave system
-Mesa selected. The device tree must name exactly one board and one SoC. It requires one accessible Asahi render node, the matching
+Mesa selected. The device tree must name exactly one board and one SoC. It requires one accessible render node of the Apple GPU driver ("aurora" from the 7.3 kernels on, "asahi" before; on a kernel built with the native G15 backend the T6030's is "aurora-g15" or "asahi-g15"), the matching
 native display, a readable healthy kernel journal, no unmatched same-boot
 legacy login attempt, and no conflicting environment or later user settings.
 A bounded helper then opens the exact EGL device using only `/usr` libraries
@@ -28,8 +28,11 @@ returns within a 20-second timeout, so a stalled journal, home directory or
 scanner refuses instead of holding the login. The helper keeps its own
 5-second timeout.
 
-A failed check keeps the existing software fallback. `mesa_m3=off` and
-`nomodeset` remain recovery choices. Other SoCs remain outside this system
+On an "asahi" node a failed check keeps the existing software fallback, and
+`mesa_m3=off` and `nomodeset` remain recovery choices. On an "aurora",
+"aurora-g15" or "asahi-g15" node there is no software fallback: the session
+keeps system Mesa whether the check passes or fails, and only the state and
+journal detail differ. Other SoCs remain outside this system
 handoff. Explicit legacy profile selection is unchanged.
 No opt-in flags, attempt records or success markers are added or removed.
 Only the exact software-fallback pair previously exported by this hook can
@@ -40,9 +43,11 @@ The helper proves only that the system EGL device and a context open. It does
 not allocate GBM buffers, render or present. A system-Mesa login that passes
 admission and then fails later is not recorded: this path writes no attempt,
 so the legacy success-marker check cannot see it, and the next login is
-admitted again. Recover with `mesa_m3=off` on the kernel command line or by
-removing the opt-out file. Separate system-Mesa attempt and success markers
-would make that recovery automatic.
+admitted again. On an "asahi" node, recover with `mesa_m3=off` on the kernel
+command line or by removing the opt-out file. Separate system-Mesa attempt
+and success markers would make that recovery automatic. On an "aurora",
+"aurora-g15" or "asahi-g15" node this hook offers no recovery: both leave the
+session on system Mesa.
 
 Run the host checks from this directory (a writable TMPDIR may be needed):
 
