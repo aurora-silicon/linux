@@ -135,9 +135,10 @@ struct dcp_color_mode {
 	u8 depth;
 };
 
-#define DCP_COLOR_FLAG_UNSAFE	(1U << 0)
-#define DCP_COLOR_FLAG_DSC	(1U << 1)
-#define DCP_MAX_COLOR_ENTRIES	64
+#define DCP_COLOR_FLAG_UNSAFE		(1U << 0)
+#define DCP_COLOR_FLAG_DSC		(1U << 1)
+#define DCP_COLOR_FLAG_DOWNSTREAM_420	(1U << 2)
+#define DCP_MAX_COLOR_ENTRIES		64
 
 /* Compact colour element retained per timing, sorted by descending score. */
 struct dcp_color_entry {
@@ -146,8 +147,7 @@ struct dcp_color_entry {
 	u8 format : 4;
 	u8 range : 1;
 	u8 colorimetry : 5;
-	u8 flags : 2;
-	u8 reserved : 1;
+	u8 flags : 3;
 	u8 depth;
 	u8 pad;
 };
@@ -204,6 +204,8 @@ struct dcp_display_mode {
 	/* Real colour elements reported for this timing, descending by score. */
 	struct dcp_color_entry colors[DCP_MAX_COLOR_ENTRIES];
 	u8 nr_colors;
+	/* Max wire bits/pixel among non-DSC unsafe SDR elements (0 if none). */
+	u8 sdr_unsafe_max_bpp;
 };
 
 struct dimension {

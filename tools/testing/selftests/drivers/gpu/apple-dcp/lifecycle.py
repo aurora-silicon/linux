@@ -1844,7 +1844,7 @@ enum dcp_firmware_version { DCP_FIRMWARE_UNKNOWN, DCP_FIRMWARE_V_12_3, DCP_FIRMW
     DCP_FIRMWARE_V_14_7, DCP_FIRMWARE_V_14_7_TEMPLATE, DCP_FIRMWARE_V_26_6,
     DCP_FIRMWARE_V_26_6_DESKTOP, DCP_FIRMWARE_V_27_0 };
 struct apple_dcp {
-    bool crashed, external, external_native, quiescing, main_display, panel;
+    bool crashed, external, external_native, quiescing, main_display, panel, iomfb_template_pq;
     int peer_check; /* what the firmware 27 paired-timing check answers */
     unsigned int nr_typec_routes;
     enum dcp_firmware_version fw_compat;
@@ -1954,6 +1954,7 @@ FW27_VRR    dcp.crashed = true;
     # VRR_ENABLED change must never become a mode set.  The external
     # processors ignore a live minimum rate and still apply it with a mode set.
     desktop = r"""    dcp.fw_compat = DCP_FIRMWARE_V_26_6_DESKTOP;
+    dcp.iomfb_template_pq = true;
     dcp.hw.iomfb_method_profile = 0;
     dcp.mode_state.valid = true;
     dcp.connector = &connector;
@@ -1979,12 +1980,14 @@ FW27_VRR    dcp.crashed = true;
         cases++;
     }
     dcp.main_display = false;
+    dcp.iomfb_template_pq = false;
     dcp.fw_compat = DCP_FIRMWARE_UNKNOWN;
 """
     # Firmware 27: its externals change adaptive sync with a full mode set, as
     # macOS switches between a timing's fixed and variable modes; the panel
     # does not. A paired timing the pair cannot take fails the check.
     fw27 = r"""    dcp.fw_compat = DCP_FIRMWARE_V_27_0;
+    dcp.iomfb_template_pq = true;
     dcp.hw.iomfb_method_profile = 0;
     dcp.mode_state.valid = true;
     dcp.connector = &connector;
@@ -2018,10 +2021,11 @@ FW27_VRR    dcp.crashed = true;
     dcp.panel = false;
     dcp.peer_check = 0;
     dcp.fw_compat = DCP_FIRMWARE_UNKNOWN;
-    /* Legacy 12.3/13.5/14.7_tpl DCPs program VRR inside iomfb_modeset(). */
+    /* Template-driven 12.3/13.5/14.7_tpl DCPs program VRR inside iomfb_modeset(). */
     const enum dcp_firmware_version tpl_fws[] = {
         DCP_FIRMWARE_V_12_3, DCP_FIRMWARE_V_13_5, DCP_FIRMWARE_V_14_7_TEMPLATE
     };
+    dcp.iomfb_template_pq = true;
     for (unsigned int i = 0; i < 3; i++) {
         dcp.fw_compat = tpl_fws[i];
         state.crtc.enable = true;
@@ -2035,6 +2039,7 @@ FW27_VRR    dcp.crashed = true;
         assert(dcp_crtc_atomic_check(&crtc, &state) == 0 && !state.crtc.mode_changed);
         cases += 2;
     }
+    dcp.iomfb_template_pq = false;
     dcp.fw_compat = DCP_FIRMWARE_UNKNOWN;
 """
     return prefix + check + suffix.replace('DESKTOP_VRR', desktop, 1).replace('FW27_VRR', fw27, 1)

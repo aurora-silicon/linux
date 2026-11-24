@@ -3914,12 +3914,15 @@ static void dcp_modeset_select(struct apple_dcp *dcp, void *out, void *cookie)
 int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 			       struct drm_crtc_state *crtc_state)
 {
-	struct dcp_display_mode selected, *mode = &selected;
+	struct dcp_display_mode *mode __free(kfree) = kzalloc_obj(*mode);
 	struct dcp_modeset_cookie *modeset;
 	struct dcp_wait_cookie *cookie;
 	struct dcp_color_mode selected_color = { .score = -1 };
 	struct dcp_color_mode *cmode = NULL;
 	int ret;
+
+	if (!mode)
+		return -ENOMEM;
 
 	if (dcp->crashed)
 		return -ENODEV;
@@ -4186,13 +4189,16 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 #endif
 			       )
 {
-	struct dcp_display_mode selected, *mode = &selected;
+	struct dcp_display_mode *mode __free(kfree) = kzalloc_obj(*mode);
 	struct dcp_wait_cookie *cookie;
 	struct dcp_color_mode selected_color = { .score = -1 };
 	struct dcp_color_mode *cmode = NULL;
 	bool paired = false;
 	bool keep_mode = false;
 	int ret;
+
+	if (!mode)
+		return -ENOMEM;
 
 #if DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER < DCP_FW_VERSION(27, 0, 0)
 	if (dcp_is_ext26(dcp)) {

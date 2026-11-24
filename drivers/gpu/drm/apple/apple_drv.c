@@ -1063,7 +1063,7 @@ static int apple_connector_attach_pq_reference(struct drm_connector *connector)
  * Colorspace (BT2020_RGB), HDR_OUTPUT_METADATA and PQ_REFERENCE_LUMINANCE.
  */
 static int apple_connector_attach_hdr(struct drm_connector *connector,
-				      bool panel_edr)
+				      bool panel_edr, bool ext_color_props)
 {
 	static const u32 panel_colorspaces = BIT(DRM_MODE_COLORIMETRY_BT2020_RGB);
 	static const u32 hdmi_colorspaces =
@@ -1125,6 +1125,8 @@ static int apple_connector_attach_hdr(struct drm_connector *connector,
 	drm_connector_attach_hdr_output_metadata_property(connector);
 	if (connector->connector_type == DRM_MODE_CONNECTOR_eDP)
 		return apple_connector_attach_pq_reference(connector);
+	if (!ext_color_props)
+		return 0;
 	ret = drm_connector_attach_broadcast_rgb_property(connector);
 	if (ret)
 		return ret;
@@ -1179,7 +1181,8 @@ static int apple_connector_create(struct drm_device *drm,
 	if (ret)
 		goto err_cleanup;
 	ret = apple_connector_attach_hdr(&connector->base,
-					 dcp_fw_compat_panel_edr(dcp));
+					 dcp_fw_compat_panel_edr(dcp),
+					 dcp_ext_color_props_supported(dcp));
 	if (ret)
 		goto err_cleanup;
 
@@ -1410,6 +1413,24 @@ VISIBLE_IF_KUNIT bool apple_typec_port_rgb8_only(struct platform_device **dcp,
 	return false;
 }
 
+static bool apple_typec_port_color_props(struct platform_device **dcp,
+					 int num_dcp,
+					 struct platform_device *pipeline,
+					 unsigned int port_idx)
+{
+	int i;
+
+	for (i = 0; i < num_dcp; i++) {
+		if (pipeline && dcp[i] != pipeline)
+			continue;
+		if (!dcp_typec_port_has_candidate(port_idx, dcp[i]))
+			continue;
+		if (dcp_ext_color_props_supported(dcp[i]))
+			return true;
+	}
+	return false;
+}
+
 /*
  * Create a connector per physical Type-C port and attach it to every
  * pipeline that can drive it. The M2 Pro/Max laptops append a second
@@ -1512,7 +1533,12 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 		 * intact; its capabilities are not the pipeline's.
 		 */
 		if (!apple_typec_port_rgb8_only(dcp, num_dcp, pipeline, port_idx)) {
-			ret = apple_connector_attach_hdr(&connector->base, false);
+			bool color_props = apple_typec_port_color_props(dcp, num_dcp,
+									pipeline,
+									port_idx);
+
+			ret = apple_connector_attach_hdr(&connector->base, false,
+							 color_props);
 			if (ret)
 				return ret;
 		}

@@ -2429,6 +2429,14 @@ u64 dcp_modes_transfer_begin(struct apple_dcp *dcp)
  * catalog, except on H17P external, which publishes an empty one. A
  * transfer started before the current attachment is never published.
  */
+static bool dcp_sdr_default_rgb(struct apple_dcp *dcp)
+{
+	return dcp->fw_compat == DCP_FIRMWARE_V_27_0 && !dcp_has_panel(dcp);
+}
+
+static const struct dcp_display_mode *
+dcp_find_mode(struct apple_dcp *dcp, const struct drm_display_mode *mode);
+
 int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *ctx,
 		      u64 generation)
 {
@@ -2461,8 +2469,7 @@ int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *ctx,
 		if (ret)
 			return ret;
 		ctx->metadata_timing = dcp_firmware_metadata_enabled(dcp);
-		ctx->sdr_default_rgb = dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
-				       !dcp_has_panel(dcp);
+		ctx->sdr_default_rgb = dcp_sdr_default_rgb(dcp);
 		/*
 		 * The template sends a timing and colour ID to DCP. It can
 		 * select an entry the timing lists as needing DSC, just as
@@ -3009,15 +3016,15 @@ static int dcp_desktop_modeset(struct apple_dcp *dcp,
 			       struct drm_crtc_state *crtc_state)
 {
 	struct dcp_desktop_state *d = dcp->desktop;
-	struct dcp_display_mode matched;
+	const struct dcp_display_mode *matched;
 
 	if (d->trial_modeset_ok) {
 		d->trial_modeset_ok = false;
 		/* The trial installed a VRR timing variable too (see the mode set). */
 		if (d->mode_live &&
-		    lookup_mode(dcp, &crtc_state->mode, &matched) &&
-		    matched.timing_mode_id == d->trial_timing_mode_id &&
-		    matched.color_mode_id == d->trial_color_mode_id) {
+		    (matched = dcp_find_mode(dcp, &crtc_state->mode)) &&
+		    matched->timing_mode_id == d->trial_timing_mode_id &&
+		    matched->color_mode_id == d->trial_color_mode_id) {
 			dev_dbg(dcp->dev, "keeping the takeover mode " DRM_MODE_FMT "\n",
 				DRM_MODE_ARG(&crtc_state->mode));
 			return 0;
@@ -3042,20 +3049,20 @@ MODULE_PARM_DESC(takeover_adopt,
 static int dcp_takeover_adopt(struct apple_dcp *dcp, const struct drm_display_mode *m)
 {
 	struct dcp_desktop_state *d = dcp->desktop;
-	struct dcp_display_mode sel;
+	const struct dcp_display_mode *sel = dcp_find_mode(dcp, m);
 
-	if (!lookup_mode(dcp, m, &sel))
+	if (!sel)
 		return -ENOENT;
 	dcp->mode = (struct dcp_set_digital_out_mode_req) {
-		.color_mode_id = sel.color_mode_id,
-		.timing_mode_id = sel.timing_mode_id,
+		.color_mode_id = sel->color_mode_id,
+		.timing_mode_id = sel->timing_mode_id,
 	};
-	dcp->use_timestamps = sel.needs_timestamps;
+	dcp->use_timestamps = sel->needs_timestamps;
 	dcp->vrr_enabled = false;
 	d->mode_live = true;
 	d->takeover_adopted = true;
 	dev_info(dcp->dev, "takeover: adopting the live mode (color:%u timing:%u) " DRM_MODE_FMT "\n",
-		 sel.color_mode_id, sel.timing_mode_id, DRM_MODE_ARG(m));
+		 sel->color_mode_id, sel->timing_mode_id, DRM_MODE_ARG(m));
 	return 0;
 }
 
@@ -3483,8 +3490,7 @@ static void dcp_crtc_color_request(struct apple_dcp *dcp, struct drm_crtc *crtc,
 		.allow_dsc = READ_ONCE(dcp->iomfb_template_pq) && !dcp_has_panel(dcp),
 		.allow_unsafe_sdr = dcp->hw.iomfb_method_profile !=
 				    DCP_IOMFB_METHODS_H17P_EXTERNAL,
-		.default_rgb = dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
-			       !dcp_has_panel(dcp),
+		.default_rgb = dcp_sdr_default_rgb(dcp),
 	};
 }
 
@@ -3495,7 +3501,7 @@ int dcp_crtc_check_hdr(struct apple_dcp *dcp, struct drm_crtc *crtc,
 	struct drm_crtc_state *crtc_state = drm_atomic_get_new_crtc_state(commit, crtc);
 	struct dcp_color_request req;
 	struct dcp_color_mode selected;
-	struct dcp_display_mode mode;
+	const struct dcp_display_mode *mode;
 
 	if (!crtc_state || !crtc_state->enable ||
 	    !drm_atomic_crtc_needs_modeset(crtc_state))
@@ -3511,16 +3517,24 @@ int dcp_crtc_check_hdr(struct apple_dcp *dcp, struct drm_crtc *crtc,
 	    req.eotf == HDMI_EOTF_TRADITIONAL_GAMMA_SDR &&
 	    req.colorspace == DRM_MODE_COLORIMETRY_DEFAULT)
 		return 0;
-	if (!READ_ONCE(dcp->iomfb_template_pq) || dcp_is_ext26(dcp))
+	if (!READ_ONCE(dcp->iomfb_template_pq) || dcp_is_ext26(dcp)) {
+		/* Fixed 8-bit SDR pipes satisfy any default SDR request with max_bpc >= 8. */
+		if (req.eotf == HDMI_EOTF_TRADITIONAL_GAMMA_SDR &&
+		    req.colorspace == DRM_MODE_COLORIMETRY_DEFAULT &&
+		    req.color_format == DRM_CONNECTOR_COLOR_FORMAT_AUTO &&
+		    req.broadcast_rgb == DRM_HDMI_BROADCAST_RGB_AUTO &&
+		    (!req.max_bpc || req.max_bpc >= 8))
+			return 0;
 		return -EINVAL;
-	if (!lookup_mode(dcp, &crtc_state->mode, &mode))
+	}
+	mode = dcp_find_mode(dcp, &crtc_state->mode);
+	if (!mode)
 		return -EINVAL;
-	return dcp_select_color_mode(&mode, &req, &selected);
+	return dcp_select_color_mode(mode, &req, &selected);
 }
 
-/* The user may own drm_display_mode, so we need to search for our copy */
-bool lookup_mode(struct apple_dcp *dcp, const struct drm_display_mode *mode,
-		 struct dcp_display_mode *out)
+static const struct dcp_display_mode *
+dcp_find_mode(struct apple_dcp *dcp, const struct drm_display_mode *mode)
 {
 	struct dcp_display_mode *modes;
 	unsigned int count, i;
@@ -3533,7 +3547,7 @@ bool lookup_mode(struct apple_dcp *dcp, const struct drm_display_mode *mode,
 				   DRM_MODE_MATCH_TIMINGS |
 					   DRM_MODE_MATCH_CLOCK)) {
 			if (!modes[i].automatic_rgb8_quirk)
-				goto found;
+				return &modes[i];
 			mutex_lock(&dcp->hpd_mutex);
 			mutex_lock(&dcp->dcpavserv.lock);
 			spin_lock_irqsave(&dcp->metadata.lock, flags);
@@ -3542,16 +3556,24 @@ bool lookup_mode(struct apple_dcp *dcp, const struct drm_display_mode *mode,
 			mutex_unlock(&dcp->dcpavserv.lock);
 			mutex_unlock(&dcp->hpd_mutex);
 			if (eligible)
-				goto found;
+				return &modes[i];
 		}
 	}
 
-	return false;
+	return NULL;
+}
 
-found:
+/* The user may own drm_display_mode, so we need to search for our copy */
+bool lookup_mode(struct apple_dcp *dcp, const struct drm_display_mode *mode,
+		 struct dcp_display_mode *out)
+{
+	const struct dcp_display_mode *found = dcp_find_mode(dcp, mode);
+
+	if (!found)
+		return false;
 	/* Callers keep a copy, never a pointer into the catalog. */
 	if (out)
-		*out = modes[i];
+		*out = *found;
 	return true;
 }
 
@@ -3565,15 +3587,15 @@ found:
 static bool dcp_mode_settable(struct apple_dcp *dcp,
 			      const struct drm_display_mode *mode)
 {
-	struct dcp_display_mode dcp_mode;
+	const struct dcp_display_mode *dcp_mode = dcp_find_mode(dcp, mode);
 
-	if (!lookup_mode(dcp, mode, &dcp_mode))
+	if (!dcp_mode)
 		return false;
 
 	if (dcp->fw_compat == DCP_FIRMWARE_H17P && !dcp_is_ext26(dcp) &&
 	    dcp->hw.iomfb_method_profile !=
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL)
-		return dcp_mode.mode.type & DRM_MODE_TYPE_PREFERRED;
+		return dcp_mode->mode.type & DRM_MODE_TYPE_PREFERRED;
 
 	/*
 	 * The T6050 internal DCP (M5 Max) crashes on 3024x1986@60 and the

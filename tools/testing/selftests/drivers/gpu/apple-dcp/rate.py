@@ -114,19 +114,29 @@ def parser_fixture(root):
     dsc_raw = bytearray(struct.pack('<I', 0xd3))
     wire(dsc_fixture, dsc_raw)
     timing_source += 'static const unsigned char dsc_blob[] = {' + ','.join(map(str,dsc_raw)) + '};\n'
-    # An unsafe-only HDMI 2.0 >340 MHz timing (e.g. 1080p180 / 1440p144): every
-    # element is in UnsafeColorElementIDs, so SDR already uses an unsafe element
-    # and PQ falls back to the best non-DSC unsafe PQ element.
+    # An unsafe-only HDMI 2.0 >340 MHz timing (e.g. 1440p144): 8-bit SDR (24 bpp)
+    # caps non-DSC unsafe PQ to <=24 bpp (12-bit 4:2:2 id 105), rejecting both
+    # DSC-required PQ (113) and over-budget non-DSC 10-bit RGB PQ (114, 30 bpp).
     unsafe_only_fixture = [dict(timing_fixture[0], ColorModes=[
-        color(80, 1, 8, 0, 10), color(105, 5, 12, 2, 7, encoding=2),
-        color(113, 9, 10, 2, 9)],
-        UnsafeColorElementIDs=[80, 105, 113], DSCRequiredColorElementIDs=[113])]
+        color(114, 20, 10, 2, 9), color(105, 5, 12, 2, 7, encoding=2),
+        color(113, 9, 10, 2, 9), color(80, 1, 8, 0, 10)],
+        UnsafeColorElementIDs=[80, 105, 113, 114], DSCRequiredColorElementIDs=[113])]
     unsafe_only_raw = bytearray(struct.pack('<I', 0xd3))
     wire(unsafe_only_fixture, unsafe_only_raw)
     timing_source += 'static const unsigned char unsafe_only_blob[] = {' + ','.join(map(str,unsafe_only_raw)) + '};\n'
-    # DP-to-HDMI bridge 4K60 YCbCr 4:2:0 via DownstreamFormat (MCDP2900 CE 119/162).
+    # Acer 1080p180-shaped unsafe-only timing: 10-bit RGB SDR (30 bpp) admits 10-bit RGB PQ (30 bpp).
+    unsafe_30bpp_fixture = [dict(timing_fixture[0], ColorModes=[
+        color(114, 20, 10, 2, 9), color(105, 5, 12, 2, 7, encoding=2),
+        color(86, 1, 10, 0, 10)],
+        UnsafeColorElementIDs=[86, 105, 114])]
+    unsafe_30bpp_raw = bytearray(struct.pack('<I', 0xd3))
+    wire(unsafe_30bpp_fixture, unsafe_30bpp_raw)
+    timing_source += 'static const unsigned char unsafe_30bpp_blob[] = {' + ','.join(map(str,unsafe_30bpp_raw)) + '};\n'
+    # DP-to-HDMI bridge 4K60 YCbCr 4:2:0 via DownstreamFormat (MCDP2900 CE 119/162),
+    # plus an upstream RGB element with DownstreamFormat=420 to prove sdr_rgb stays intact.
     ds420_fixture = [dict(timing_fixture[0], ColorModes=[
-        color(80, 242999, 8, 0, 10, encoding=0),
+        dict(color(80, 242999, 8, 0, 10, encoding=0),
+             DownstreamFormat=color(79, 242999, 8, 0, 1, encoding=1, dynamic=1)),
         color(83, 232999, 8, 0, 1, encoding=3, dynamic=1),
         dict(color(119, 202232, 8, 0, 1, encoding=3, dynamic=1),
              DownstreamFormat=color(118, 202999, 8, 0, 1, encoding=1, dynamic=1)),
@@ -369,38 +379,53 @@ int main(int argc, char **argv)
             assert(m[0].pq.id == (dsc ? 122 : 127) && m[0].pq.depth == 10);
             free(m);
         }
-        /* Unsafe-only >340 MHz timing falls back to non-DSC unsafe PQ (105),
-         * still skipping DSC-required unsafe PQ (113) even when pq_dsc is true. */
+        /* Unsafe-only >340 MHz timing falls back to non-DSC unsafe PQ within
+         * sdr_unsafe_max_bpp: 24-bpp SDR picks 12-bit 4:2:2 (105) over 30-bpp
+         * non-DSC RGB (114) and DSC-required RGB (113); 30-bpp SDR picks 114. */
         for (unsigned int dsc = 0; dsc < 2; dsc++) {
             assert(!parse(unsafe_only_blob, sizeof(unsafe_only_blob), &c));
             c.pq_dsc = dsc;
             m = enumerate_modes(&c, &n, 600, 330, 0, false, false);
             assert(!IS_ERR(m) && n == 1 && !m[0].sdr_usable && m[0].sdr_unsafe);
+            assert(m[0].sdr_unsafe_max_bpp == 24);
             assert(m[0].pq.id == 105 && m[0].pq.depth == 12 &&
                    m[0].pq.format == DCP_COLOR_FORMAT_YCBCR422);
             free(m);
         }
-        /* DP-to-HDMI bridge 4K60 DownstreamFormat exposes true wire YCbCr 4:2:0
-         * (CE 119 SDR, CE 162 PQ) without aliasing 4:4:4 (83) or 4:2:2 (105). */
+        assert(!parse(unsafe_30bpp_blob, sizeof(unsafe_30bpp_blob), &c));
+        m = enumerate_modes(&c, &n, 600, 330, 0, false, false);
+        assert(!IS_ERR(m) && n == 1 && m[0].sdr_unsafe_max_bpp == 30);
+        assert(m[0].pq.id == 114 && m[0].pq.depth == 10 &&
+               m[0].pq.format == DCP_COLOR_FORMAT_RGB);
+        free(m);
+        /* DP-to-HDMI bridge 4K60 DownstreamFormat flags true wire YCbCr 4:2:0
+         * (CE 119 SDR, CE 162 PQ) while keeping upstream format intact (CE 80
+         * stays in sdr_rgb, CE 83 stays 4:4:4, CE 105 stays 4:2:2). */
         assert(!parse(ds420_blob, sizeof(ds420_blob), &c));
         m = enumerate_modes(&c, &n, 600, 330, 0, false, false);
-        assert(!IS_ERR(m) && n == 1 && m[0].sdr_usable && m[0].sdr_444.id == 83);
+        assert(!IS_ERR(m) && n == 1 && m[0].sdr_usable &&
+               m[0].sdr_rgb.id == 80 && m[0].sdr_rgb.format == DCP_COLOR_FORMAT_RGB &&
+               m[0].sdr_444.id == 83);
         {
             unsigned int found_420_sdr = 0, found_420_pq = 0, found_444 = 0, found_422 = 0;
             for (unsigned int j = 0; j < m[0].nr_colors; j++) {
                 if (m[0].colors[j].id == 119) {
-                    assert(m[0].colors[j].format == DCP_COLOR_FORMAT_YCBCR420 &&
+                    assert(m[0].colors[j].format == DCP_COLOR_FORMAT_YCBCR444 &&
+                           (m[0].colors[j].flags & DCP_COLOR_FLAG_DOWNSTREAM_420) &&
                            !(m[0].colors[j].flags & DCP_COLOR_FLAG_UNSAFE));
                     found_420_sdr++;
                 } else if (m[0].colors[j].id == 162) {
-                    assert(m[0].colors[j].format == DCP_COLOR_FORMAT_YCBCR420 &&
+                    assert(m[0].colors[j].format == DCP_COLOR_FORMAT_YCBCR422 &&
+                           (m[0].colors[j].flags & DCP_COLOR_FLAG_DOWNSTREAM_420) &&
                            (m[0].colors[j].flags & DCP_COLOR_FLAG_UNSAFE));
                     found_420_pq++;
                 } else if (m[0].colors[j].id == 83) {
-                    assert(m[0].colors[j].format == DCP_COLOR_FORMAT_YCBCR444);
+                    assert(m[0].colors[j].format == DCP_COLOR_FORMAT_YCBCR444 &&
+                           !(m[0].colors[j].flags & DCP_COLOR_FLAG_DOWNSTREAM_420));
                     found_444++;
                 } else if (m[0].colors[j].id == 105) {
-                    assert(m[0].colors[j].format == DCP_COLOR_FORMAT_YCBCR422);
+                    assert(m[0].colors[j].format == DCP_COLOR_FORMAT_YCBCR422 &&
+                           !(m[0].colors[j].flags & DCP_COLOR_FLAG_DOWNSTREAM_420));
                     found_422++;
                 }
             }
@@ -1026,7 +1051,7 @@ static int __attribute__((unused)) dcp_direct_crossbar_link(struct apple_dcp *d,
                     + mode_helpers)
     # The desktop 26.6 VRR filter is gone once that firmware takes adaptive sync.
     vrr_filter = block(iomfb,'static bool dcp_mode_vrr_supported(')+'\n' if 'static bool dcp_mode_vrr_supported(' in iomfb else ''
-    publication = block(iomfb,'static void dcp_clear_connector_edid(')+'\n'+block(iomfb,'static void dcp_consume_edid_invalidation(')+mode_helpers+vrr_filter+block(iomfb,'int dcp_get_modes(')+block(iomfb,'bool lookup_mode(')
+    publication = block(iomfb,'static void dcp_clear_connector_edid(')+'\n'+block(iomfb,'static void dcp_consume_edid_invalidation(')+mode_helpers+vrr_filter+block(iomfb,'int dcp_get_modes(')+block(iomfb,'static const struct dcp_display_mode *\ndcp_find_mode(')+block(iomfb,'bool lookup_mode(')
     if 'dcp_edid_sdr(' in publication:
         # Keep extracting the real publication path, including its SDR helper.
         # Model only kernel allocation/DRM ownership at the host boundary.

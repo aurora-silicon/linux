@@ -42,6 +42,22 @@ static inline bool dcp_color_format_is_ycbcr422(u8 format)
 	       format == DCP_COLOR_FORMAT_YCBCR422_HDMI;
 }
 
+static inline u8 dcp_color_entry_format(const struct dcp_color_entry *e)
+{
+	if (e->flags & DCP_COLOR_FLAG_DOWNSTREAM_420)
+		return DCP_COLOR_FORMAT_YCBCR420;
+	return e->format;
+}
+
+static inline u8 dcp_color_wire_bpp(u8 format, u8 depth)
+{
+	if (format == DCP_COLOR_FORMAT_YCBCR420)
+		return (depth * 3) / 2;
+	if (dcp_color_format_is_ycbcr422(format))
+		return depth * 2;
+	return depth * 3;
+}
+
 static inline bool dcp_color_format_matches(u8 fmt, u8 req_fmt)
 {
 	switch (req_fmt) {
@@ -152,8 +168,9 @@ static inline u32 dcp_color_entry_rank(const struct dcp_color_entry *e,
 {
 	u32 fmt_rank, space_rank, depth_rank, range_rank, dsc_rank;
 	bool hdr = req->eotf != HDMI_EOTF_TRADITIONAL_GAMMA_SDR;
+	u8 fmt = dcp_color_entry_format(e);
 
-	switch (e->format) {
+	switch (fmt) {
 	case DCP_COLOR_FORMAT_RGB:
 		fmt_rank = 6;
 		break;
@@ -185,7 +202,7 @@ static inline u32 dcp_color_entry_rank(const struct dcp_color_entry *e,
 		else
 			space_rank = 1;
 	} else if (req->colorspace == DRM_MODE_COLORIMETRY_DEFAULT) {
-		if (e->format == DCP_COLOR_FORMAT_RGB) {
+		if (fmt == DCP_COLOR_FORMAT_RGB) {
 			if (req->default_rgb && e->colorimetry == DCP_COLORIMETRY_RGB)
 				space_rank = 4;
 			else if (e->colorimetry == DCP_COLORIMETRY_SRGB ||
@@ -215,7 +232,7 @@ static inline u32 dcp_color_entry_rank(const struct dcp_color_entry *e,
 		depth_rank = e->depth;
 	}
 
-	if (e->format == DCP_COLOR_FORMAT_RGB)
+	if (fmt == DCP_COLOR_FORMAT_RGB)
 		range_rank = e->range == DCP_COLOR_YCBCR_RANGE_FULL ? 2 : 1;
 	else
 		range_rank = e->range == DCP_COLOR_YCBCR_RANGE_LIMITED ? 2 : 1;
@@ -232,7 +249,7 @@ static inline void dcp_color_mode_from_entry(struct dcp_color_mode *out,
 	out->score = 0;
 	out->id = e->id;
 	out->eotf = e->eotf;
-	out->format = e->format;
+	out->format = dcp_color_entry_format(e);
 	out->colorimetry = e->colorimetry;
 	out->range = e->range;
 	out->depth = e->depth;
@@ -242,6 +259,7 @@ static inline int dcp_default_sdr_color(const struct dcp_display_mode *mode,
 					struct dcp_color_mode *out)
 {
 	const struct dcp_color_mode *cmode = NULL;
+	unsigned int i;
 
 	if (mode->color_mode_id == mode->sdr_rgb.id && mode->sdr_rgb.score >= 0)
 		cmode = &mode->sdr_rgb;
@@ -254,6 +272,12 @@ static inline int dcp_default_sdr_color(const struct dcp_display_mode *mode,
 
 	if (cmode) {
 		*out = *cmode;
+		for (i = 0; i < mode->nr_colors; i++) {
+			if (mode->colors[i].id == out->id) {
+				out->format = dcp_color_entry_format(&mode->colors[i]);
+				break;
+			}
+		}
 		return 0;
 	}
 	return -EINVAL;
@@ -286,13 +310,13 @@ static inline int dcp_select_color_mode(const struct dcp_display_mode *mode,
 	if (hdr && !req->allow_hdr)
 		return -EINVAL;
 
-	max_pass = (req->allow_unsafe_sdr &&
-		    (!hdr || (!mode->sdr_usable && mode->sdr_unsafe))) ? 2 : 1;
+	max_pass = (req->allow_unsafe_sdr && !mode->sdr_usable && mode->sdr_unsafe) ? 2 : 1;
 	for (pass = 0; pass < max_pass && !best; pass++) {
 		bool allow_unsafe = pass > 0;
 
 		for (i = 0; i < mode->nr_colors; i++) {
 			const struct dcp_color_entry *e = &mode->colors[i];
+			u8 fmt = dcp_color_entry_format(e);
 			u32 rank;
 
 			if ((e->flags & DCP_COLOR_FLAG_UNSAFE) && !allow_unsafe)
@@ -300,11 +324,14 @@ static inline int dcp_select_color_mode(const struct dcp_display_mode *mode,
 			if ((e->flags & DCP_COLOR_FLAG_DSC) && hdr &&
 			    (!req->allow_dsc || allow_unsafe))
 				continue;
+			if (allow_unsafe && hdr && mode->sdr_unsafe_max_bpp &&
+			    dcp_color_wire_bpp(fmt, e->depth) > mode->sdr_unsafe_max_bpp)
+				continue;
 			if (e->depth > max_bpc)
 				continue;
 			if (!dcp_color_eotf_matches(e->eotf, req))
 				continue;
-			if (!dcp_color_format_matches(e->format, req->color_format))
+			if (!dcp_color_format_matches(fmt, req->color_format))
 				continue;
 			if (!dcp_color_range_matches(e->range, req->broadcast_rgb))
 				continue;

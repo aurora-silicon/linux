@@ -1033,29 +1033,47 @@ int main(void)
     assert(!dcp_select_color_mode(&msi, &req, &out) && out.id == 105);
 
     /* Unsafe-only >340 MHz HDMI 2.0 timing (e.g. 1080p180 / 1440p144): SDR already uses unsafe
-     * elements (sdr_usable=false, sdr_unsafe=true), so non-DSC unsafe PQ is permitted, whereas
-     * safe timings (sdr_usable=true) strictly reject unsafe PQ. */
+     * elements (sdr_usable=false, sdr_unsafe=true), so non-DSC unsafe PQ within sdr_unsafe_max_bpp
+     * is permitted, whereas safe timings (sdr_usable=true) strictly reject unsafe SDR and PQ. */
     struct dcp_display_mode msi144 = { .sdr_rgb = acer.sdr_rgb, .color_mode_id = 80,
-        .sdr_usable = false, .sdr_unsafe = true,
+        .sdr_usable = false, .sdr_unsafe = true, .sdr_unsafe_max_bpp = 24,
         .pq = { .score = 10, .id = 105, .eotf = DCP_EOTF_ST_2084,
         .format = DCP_COLOR_FORMAT_YCBCR422, .colorimetry = DCP_COLORIMETRY_BT2020_YCC,
         .range = DCP_COLOR_YCBCR_RANGE_LIMITED, .depth = 12 } };
     add_entry(&msi144, 80, DCP_EOTF_SDR_GAMMA, DCP_COLOR_FORMAT_RGB, DCP_COLORIMETRY_SRGB, DCP_COLOR_YCBCR_RANGE_FULL, 8, DCP_COLOR_FLAG_UNSAFE);
     add_entry(&msi144, 113, DCP_EOTF_ST_2084, DCP_COLOR_FORMAT_RGB, DCP_COLORIMETRY_BT2020_RGB, DCP_COLOR_YCBCR_RANGE_FULL, 10, DCP_COLOR_FLAG_UNSAFE | DCP_COLOR_FLAG_DSC);
+    add_entry(&msi144, 114, DCP_EOTF_ST_2084, DCP_COLOR_FORMAT_RGB, DCP_COLORIMETRY_BT2020_RGB, DCP_COLOR_YCBCR_RANGE_FULL, 10, DCP_COLOR_FLAG_UNSAFE);
     add_entry(&msi144, 105, DCP_EOTF_ST_2084, DCP_COLOR_FORMAT_YCBCR422, DCP_COLORIMETRY_BT2020_YCC, DCP_COLOR_YCBCR_RANGE_LIMITED, 12, DCP_COLOR_FLAG_UNSAFE);
     req = (struct dcp_color_request){ .eotf = HDMI_EOTF_SMPTE_ST2084, .colorspace = DRM_MODE_COLORIMETRY_BT2020_YCC,
         .color_format = DRM_CONNECTOR_COLOR_FORMAT_YCBCR422, .max_bpc = 12,
         .allow_hdr = true, .allow_dsc = true, .allow_unsafe_sdr = true };
     assert(!dcp_select_color_mode(&msi144, &req, &out) && out.id == 105);
-    /* DSC-required unsafe PQ (113) MUST be rejected even with allow_dsc=true */
+    /* Non-DSC 30-bpp RGB PQ (114) exceeds 24-bpp unsafe SDR ceiling -> rejected; 30-bpp SDR admits it */
     req.color_format = DRM_CONNECTOR_COLOR_FORMAT_RGB444;
     req.colorspace = DRM_MODE_COLORIMETRY_BT2020_RGB;
     assert(dcp_select_color_mode(&msi144, &req, &out) == -EINVAL);
-    /* Same unsafe entry on a timing with sdr_usable=true MUST be rejected */
+    msi144.sdr_unsafe_max_bpp = 30;
+    assert(!dcp_select_color_mode(&msi144, &req, &out) && out.id == 114);
+    msi144.sdr_unsafe_max_bpp = 24;
+    /* DSC-required unsafe PQ (113) MUST be rejected even with allow_dsc=true and 30-bpp SDR */
+    msi144.colors[2].flags |= DCP_COLOR_FLAG_DSC;
+    msi144.sdr_unsafe_max_bpp = 30;
+    assert(dcp_select_color_mode(&msi144, &req, &out) == -EINVAL);
+    /* Same unsafe entry on a timing with sdr_usable=true MUST be rejected (for both HDR and SDR) */
     msi144.sdr_usable = true;
     req.color_format = DRM_CONNECTOR_COLOR_FORMAT_YCBCR422;
     req.colorspace = DRM_MODE_COLORIMETRY_BT2020_YCC;
     assert(dcp_select_color_mode(&msi144, &req, &out) == -EINVAL);
+    /* Explicit SDR request on a safe timing (e.g. 4K60 where only 4:2:0 is safe) MUST NOT fall through to unsafe SDR */
+    struct dcp_display_mode k4 = { .color_mode_id = 119, .sdr_usable = true, .sdr_unsafe = true };
+    add_entry(&k4, 80, DCP_EOTF_SDR_GAMMA, DCP_COLOR_FORMAT_RGB, DCP_COLORIMETRY_SRGB, DCP_COLOR_YCBCR_RANGE_FULL, 8, DCP_COLOR_FLAG_UNSAFE);
+    add_entry(&k4, 119, DCP_EOTF_SDR_GAMMA, DCP_COLOR_FORMAT_YCBCR444, DCP_COLORIMETRY_BT709, DCP_COLOR_YCBCR_RANGE_LIMITED, 8, DCP_COLOR_FLAG_DOWNSTREAM_420);
+    req = (struct dcp_color_request){ .color_format = DRM_CONNECTOR_COLOR_FORMAT_RGB444, .max_bpc = 8, .allow_unsafe_sdr = true };
+    assert(dcp_select_color_mode(&k4, &req, &out) == -EINVAL);
+    /* DownstreamFormat 4:2:0 matches YCBCR420 and reports wire YCbCr 4:2:0 while preserving upstream format */
+    req.color_format = DRM_CONNECTOR_COLOR_FORMAT_YCBCR420;
+    assert(!dcp_select_color_mode(&k4, &req, &out) && out.id == 119 && out.format == DCP_COLOR_FORMAT_YCBCR420);
+    assert(k4.colors[1].format == DCP_COLOR_FORMAT_YCBCR444);
 
     puts("PASS: colour mode selection across RGB/YCbCr 444/422/420, 8/10/12 bpc, Full/Limited, wide gamut, PQ/HLG, and -EINVAL rejection");
     return 0;
