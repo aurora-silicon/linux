@@ -552,6 +552,17 @@ failed:
 	return ret;
 }
 
+/*
+ * Whether Beta's (Bluetooth's) firmware runs with its IPC still unowned: the state
+ * btcentauri needs to take function 2. Called with the boot lock held.
+ */
+bool centauri_beta_running(struct centauri *c)
+{
+	void __iomem *bar = c->ipc ? c->ipc->bar[2] : NULL;
+
+	return bar && readl(bar + 0x18) == 2 && !readl(bar);
+}
+
 void centauri_free_ipc(struct centauri *c)
 {
 	struct centauri_ipc *ipc = c->ipc;

@@ -260,11 +260,46 @@ void centauri_recovery_request(struct centauri *c, const char *why)
 		dev_warn(&c->pdev->dev, "firmware fault (%s); checking again in 2 s\n", why);
 }
 
+static bool centauri_beta_up(struct centauri *c)
+{
+	bool up;
+
+	mutex_lock(&c->boot_lock);
+	up = READ_ONCE(c->removing) || centauri_beta_running(c);
+	mutex_unlock(&c->boot_lock);
+	return up;
+}
+
+/*
+ * The IPC start's rescan adds the Beta (Bluetooth) function before Beta's firmware runs,
+ * so btcentauri cannot take it then. Wait for that firmware and attach the function.
+ * Called without the boot lock and outside the PCI rescan lock. Returns 1 when
+ * function 2 has a driver, 0 when none took it, or a negative error.
+ */
+static int centauri_attach_beta(struct centauri *c)
+{
+	struct pci_dev *beta;
+	bool up;
+	int ret;
+
+	beta = pci_get_slot(c->pdev->bus, PCI_DEVFN(PCI_SLOT(c->pdev->devfn), 2));
+	if (!beta)
+		return -ENODEV;
+	ret = 1;
+	if (!READ_ONCE(beta->dev.driver)) {
+		ret = read_poll_timeout(centauri_beta_up, up, up, 20 * USEC_PER_MSEC,
+					10 * USEC_PER_SEC, false, c);
+		if (!ret)
+			ret = READ_ONCE(c->removing) ? -ENODEV : device_attach(&beta->dev);
+	}
+	pci_dev_put(beta);
+	return ret;
+}
+
 static void centauri_recover_worker(struct work_struct *work)
 {
 	struct centauri *c = container_of(to_delayed_work(work), struct centauri, recover_work);
 	struct device *dev = &c->pdev->dev;
-	struct pci_dev *beta;
 	unsigned long now = jiffies;
 	int ret;
 
@@ -304,17 +339,7 @@ static void centauri_recover_worker(struct work_struct *work)
 			queue_delayed_work(centauri_wq, &c->recover_work, 10 * HZ);
 		return;
 	}
-	/*
-	 * The IPC start's rescan added the Beta function before its firmware ran, so
-	 * btcentauri refused it then. Attach it now, outside the rescan lock.
-	 */
-	beta = pci_get_slot(c->pdev->bus, PCI_DEVFN(PCI_SLOT(c->pdev->devfn), 2));
-	if (beta && !beta->dev.driver)
-		dev_info(dev, "restarted; Bluetooth function attach: %d\n",
-			 device_attach(&beta->dev));
-	else
-		dev_info(dev, "restarted\n");
-	pci_dev_put(beta);
+	dev_info(dev, "restarted; Bluetooth function attach: %d\n", centauri_attach_beta(c));
 }
 
 static ssize_t centauri_boot_write(struct file *file, const char __user *buffer,
@@ -350,6 +375,14 @@ static ssize_t centauri_boot_write(struct file *file, const char __user *buffer,
 		}
 	}
 	mutex_unlock(&c->boot_lock);
+	if (value == 3 && !ret) {
+		int attached = centauri_attach_beta(c);
+
+		if (attached == 1)
+			dev_info(&c->pdev->dev, "Bluetooth function attached\n");
+		else
+			dev_warn(&c->pdev->dev, "Bluetooth function not attached: %d\n", attached);
+	}
 	return ret ?: count;
 }
 

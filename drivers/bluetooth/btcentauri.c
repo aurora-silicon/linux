@@ -1040,10 +1040,15 @@ static int cen_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (ret)
 		return ret;
 	bt->bar = pcim_iomap_table(pdev)[0];
-	if (readl(bt->bar + 0x18) != 2 || readl(bt->bar) != 0)
-		return dev_err_probe(&pdev->dev, -EBUSY,
-				     "Beta requires running firmware and unowned IPC (exec=%u ipc=%u)\n",
-				     readl(bt->bar + 0x18), readl(bt->bar));
+	/*
+	 * The function appears with the N1's IPC start, before Beta's firmware runs.
+	 * apple_centauri attaches it again once that firmware is up.
+	 */
+	if (readl(bt->bar + 0x18) != 2 || readl(bt->bar) != 0) {
+		dev_info(&pdev->dev, "waiting for Beta's firmware (exec=%u ipc=%u)\n",
+			 readl(bt->bar + 0x18), readl(bt->bar));
+		return -ENXIO;
+	}
 	ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(40));
 	if (ret)
 		return ret;
