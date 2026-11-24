@@ -398,6 +398,9 @@ struct apple_dart {
 	bool display_dark;
 	bool display_tlb_stale;
 	DECLARE_BITMAP(display_tcr_four, DART_MAX_STREAMS);
+	/* T8020: its enabled streams and translations, saved at the display's power-down */
+	u32 display_enable;
+	bool display_saved;
 	/* The address filter the loader programs, from the device tree, replayed after a sleep. */
 	void __iomem *dapf;
 	u64 *dapf_ranges;
@@ -8041,6 +8044,99 @@ int apple_dart_gapf_ready(struct device *dev)
 EXPORT_SYMBOL_GPL(apple_dart_gapf_ready);
 
 /*
+ * T8020-type display DARTs, around their DCP's power-down. On the M1 both of them are
+ * in the DCP's CPU domain and share one interrupt, so from the power-down to the
+ * power-up neither is read (host_off), and maps go to memory only (display_dark).
+ *
+ * The DCP's power cycle resets the display DART, its lock included (measured on J313),
+ * while the boot loader's wake after a real sleep sets it up locked again. So at the
+ * power-up the translations saved at the power-down are written back when they were
+ * lost and the DART is unlocked; lost and still locked, it stays off.
+ */
+static int apple_dart_t8020_display_streams(struct apple_dart *dart, u32 streams, bool on,
+					    bool flush)
+{
+	struct apple_dart_stream_map map = { .dart = dart };
+	void __iomem *enable = dart->regs + dart->hw->enable_streams;
+	unsigned long bits = streams;
+	unsigned int sid, idx;
+	u32 error;
+	int ret = 0;
+
+	if (on) {
+		if (!READ_ONCE(dart->host_off) && !READ_ONCE(dart->display_dark))
+			return 0;
+		if (dart->display_saved && !apple_dart_state_retained(dart)) {
+			/* Not rewritable: it stays off and dark, and its streams stay off. */
+			if (apple_dart_is_locked(dart)) {
+				dev_err(dart->dev, "translations lost at the power-down, and locked\n");
+				return -EIO;
+			}
+			/* Reset with its domain: set up as at a resume, with its translations */
+			ret = apple_dart_hw_reset(dart);
+			if (ret && ret != -EBUSY)
+				dev_warn(dart->dev, "reset at power-on: %d\n", ret);
+			for (sid = 0; sid < dart->num_streams; sid++) {
+				for (idx = 0; idx < dart->hw->ttbr_count; idx++)
+					writel(dart->save_ttbr[sid][idx],
+					       dart->regs + DART_TTBR(dart, sid, idx));
+				writel(dart->save_tcr[sid], dart->regs + DART_TCR(dart, sid));
+			}
+			ret = 0;
+			dev_dbg(dart->dev, "translations put back at power-on\n");
+		}
+		error = readl(dart->regs + DART_T8020_ERROR);
+		if (error & DART_T8020_ERROR_FLAG)
+			writel(error, dart->regs + DART_T8020_ERROR);
+		if (dart->display_saved)
+			writel(readl(enable) | (dart->display_enable & streams), enable);
+		/* Maps and unmaps while it was off left their invalidations to here. */
+		bitmap_fill(map.sidmap, dart->num_streams);
+		if (dart->hw->invalidate_tlb(&map))
+			dev_err(dart->dev, "TLB invalidation at power-on failed\n");
+		dart->host_off_slept = false;
+		dart->display_saved = false;
+		dart->sleep_flushed = false;
+		WRITE_ONCE(dart->display_tlb_stale, false);
+		WRITE_ONCE(dart->display_dark, false);
+		WRITE_ONCE(dart->host_off, false);
+		return ret;
+	}
+
+	/*
+	 * The first power-down call sets it off, flushed or not (the display DART's comes from
+	 * its firmware, without a flush). A later one, as after a sleep that didn't reach the
+	 * commit, may find the domains off already, and leaves it.
+	 */
+	if (READ_ONCE(dart->host_off))
+		return 0;
+	if (!READ_ONCE(dart->display_dark)) {
+		apple_dart_save_state(dart);
+		dart->display_enable = readl(enable);
+		dart->display_saved = true;
+		for (sid = 0; sid < dart->num_streams; sid++)
+			__assign_bit(sid, dart->display_tcr_four,
+				     dart->save_tcr[sid] & dart->hw->tcr_4level);
+		WRITE_ONCE(dart->display_dark, true);
+	}
+	writel(readl(enable) & ~streams, enable);
+	if (flush) {
+		for_each_set_bit(sid, &bits, dart->num_streams)
+			set_bit(sid, map.sidmap);
+		ret = dart->hw->invalidate_tlb(&map);
+		if (ret) {
+			dev_err(dart->dev, "flush for a power-down failed: %d\n", ret);
+			return ret;
+		}
+		dart->sleep_flushed = true;
+	}
+	/* Its interrupt handler checks this before it reads anything. */
+	WRITE_ONCE(dart->host_off, true);
+
+	return 0;
+}
+
+/*
  * What macOS writes to T8140's display DARTs around a display power cycle:
  * measured under aura, with the offsets the driver has no name for. It never
  * writes their TCR or TTBR, and reads the same values back after each power-on,
@@ -8056,6 +8152,9 @@ int apple_dart_display_streams(struct device *dev, u32 streams, bool on, bool fl
 	unsigned int sid;
 	u32 status;
 	int ret;
+
+	if (dart->hw->type == DART_T8020)
+		return apple_dart_t8020_display_streams(dart, streams, on, flush);
 
 	if (on) {
 		apple_dart_gapf_protect(dart);
