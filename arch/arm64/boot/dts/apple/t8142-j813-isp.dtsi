@@ -118,7 +118,30 @@
 &{/soc} {
 	isp_dart0: iommu@4a28c0000 {
 		compatible = "apple,t8142-dart", "apple,t8110-dart";
-		reg = <0x4 0xa28c0000 0x0 0xc000>;
+		reg = <0x4 0xa28c0000 0x0 0xc000>,
+		      <0x4 0xa28d0000 0x0 0x4000>;
+		reg-names = "dart", "dapf";
+		/*
+		 * The loader's address filter, from the ADT's dart-isp
+		 * dapf-instance-0 (its sixth reg window) in the ADT's order:
+		 * the firmware's PMGR, PMP and DSID windows. Every entry's
+		 * last word is 0xcc3 there. The filter goes off with the ISP
+		 * system domain and is written back when the DART powers up
+		 * again, so the firmware can start again after the ISP was
+		 * powered down between streams.
+		 */
+		apple,dapf-ranges = /bits/ 64 <0x380704000 0x380704063
+					     0x380730000 0x380733fff
+					     0x380e3c000 0x380e3c003
+					     0x39062c000 0x390658003
+					     0x421660000 0x421660003
+					     0x220104000 0x2201162fc
+					     0x3803c0000 0x3803e4000
+					     0x382724000 0x382724004
+					     0x3a1340000 0x3a13409fc
+					     0x3a1358000 0x3a1363ffc>;
+		apple,dapf-r20 = <0xcc3 0xcc3 0xcc3 0xcc3 0xcc3
+				  0xcc3 0xcc3 0xcc3 0xcc3 0xcc3>;
 		#iommu-cells = <1>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 443 IRQ_TYPE_LEVEL_HIGH>;
@@ -181,9 +204,9 @@
 
 /*
  * The J813 IMX958 (sensor version 0x958) as its firmware lists it: 13 configs,
- * among them 3040x2880 (config 7) and a binned 1520x1440 (config 10); half
- * of them report doubled heights and are left out. Its setfile is
- * apple/isp_2224_01XX.dat (from macOS appleh16camerad).
+ * among them 3040x2880 (config 7) and two binned 1520x1440 modes (configs 8
+ * and 10); half of them report doubled heights and are left out. Its setfile
+ * is apple/isp_2224_01XX.dat (from macOS appleh16camerad).
  */
 #include "isp-common.dtsi"
 
@@ -191,39 +214,82 @@
 	apple,temporal-filter = <1>;
 
 	/*
-	 * All presets scale from the full-resolution sensor mode (config 7).
-	 * In the binned mode (config 10, 1520x1440) the firmware's AWB keeps
-	 * the setfile's default white point and the picture is magenta; in
-	 * config 7 it converges.
+	 * All presets scale from the binned sensor mode config 8 (3040x2880
+	 * binned 2x2 to 1520x1440), with centred crops. Binning averages four
+	 * pixels: indoors it shows about half the colour noise of the
+	 * full-resolution config 7, for some fine detail. In the other binned
+	 * mode, config 10, the firmware's AWB keeps the setfile's default
+	 * white point and the picture is magenta; in configs 7 and 8 it
+	 * converges.
+	 *
+	 * The driver derives the other call sizes from these crops only
+	 * without upscaling. The binned crops are too small for the portrait
+	 * sizes, 1760x1328 and 1552x1552, so those are listed too, with the
+	 * crops the driver derived in config 7, halved.
 	 */
 	sensor-presets {
 		/* 1280x720 */
 		preset0 {
-			apple,config-index = <7>;
-			apple,input-size = <3040 2880>;
+			apple,config-index = <8>;
+			apple,input-size = <1520 1440>;
 			apple,output-size = <1280 720>;
-			apple,crop = <0 584 3040 1710>;
+			apple,crop = <0 292 1520 856>;
 		};
 		/* 1440x1080 (4:3) */
 		preset1 {
-			apple,config-index = <7>;
-			apple,input-size = <3040 2880>;
+			apple,config-index = <8>;
+			apple,input-size = <1520 1440>;
 			apple,output-size = <1440 1080>;
-			apple,crop = <80 360 2880 2160>;
+			apple,crop = <40 180 1440 1080>;
 		};
 		/* 1080x1080 (1:1) */
 		preset2 {
-			apple,config-index = <7>;
-			apple,input-size = <3040 2880>;
+			apple,config-index = <8>;
+			apple,input-size = <1520 1440>;
 			apple,output-size = <1080 1080>;
-			apple,crop = <440 360 2160 2160>;
+			apple,crop = <220 180 1080 1080>;
 		};
 		/* 1920x1080 */
 		preset3 {
-			apple,config-index = <7>;
-			apple,input-size = <3040 2880>;
+			apple,config-index = <8>;
+			apple,input-size = <1520 1440>;
 			apple,output-size = <1920 1080>;
-			apple,crop = <0 584 3040 1710>;
+			apple,crop = <0 292 1520 856>;
+		};
+		/* 1080x1920 */
+		preset4 {
+			apple,config-index = <8>;
+			apple,input-size = <1520 1440>;
+			apple,output-size = <1080 1920>;
+			apple,crop = <458 184 604 1072>;
+		};
+		/* 1760x1328 */
+		preset5 {
+			apple,config-index = <8>;
+			apple,input-size = <1520 1440>;
+			apple,output-size = <1760 1328>;
+			apple,crop = <44 180 1432 1080>;
+		};
+		/* 1328x1760 */
+		preset6 {
+			apple,config-index = <8>;
+			apple,input-size = <1520 1440>;
+			apple,output-size = <1328 1760>;
+			apple,crop = <386 224 748 992>;
+		};
+		/* 1552x1552 */
+		preset7 {
+			apple,config-index = <8>;
+			apple,input-size = <1520 1440>;
+			apple,output-size = <1552 1552>;
+			apple,crop = <220 180 1080 1080>;
+		};
+		/* 960x1280 */
+		preset8 {
+			apple,config-index = <8>;
+			apple,input-size = <1520 1440>;
+			apple,output-size = <960 1280>;
+			apple,crop = <356 180 808 1080>;
 		};
 	};
 };

@@ -36,6 +36,17 @@ pub(crate) enum InitGraph {
     V25G83,
 }
 
+/// The InitData layouts of an M5 firmware build ([`super::m5::initdata`]). A build names its
+/// layouts; the M5 graph builds them, and a build that names none is refused.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum M5Layouts {
+    /// The 26A428 graph: version word 0x0c8e_0339_8728_04c0 and its allocation sizes.
+    V26A428,
+    /// The 27.2 (26B123) graph: version word 0x0c8e_4339_8728_04c0, a larger power policy
+    /// (0x12728) and status config (0x790), the 26A428 HW data.
+    V26B123,
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum QueueRegistration {
     Firmware,
@@ -62,8 +73,15 @@ pub(crate) struct Variant {
     pub(crate) mcache: bool,
     /// Renders may set the few-primitives auxiliary framebuffer flag.
     pub(crate) few_primitives: bool,
+    /// Renders may carry DRM_ASAHI_RENDER_STAGE_PREFIXES: the tiling kick waits on its own,
+    /// narrower render and compute prefixes, the fragment kick on the whole ones. The M5
+    /// command set accepts them in its own validation.
+    pub(crate) render_stage_prefixes: bool,
     /// The firmware runs ray-traversal work (ray queries and intersection programs).
     pub(crate) ray_traversal: bool,
+    /// Ray-traversal commands run for one client at a time, with other clients' compute
+    /// commands kept out meanwhile ([`crate::g17::traversal`]).
+    pub(crate) traversal_exclusion: bool,
     /// Renders may carry ray-query stages. The M5 command set has none: it encodes no render
     /// ray-query state.
     pub(crate) render_ray_query: bool,
@@ -77,9 +95,14 @@ pub(crate) struct Variant {
     pub(crate) programs: super::render::RegisterPrograms,
     /// Use 0x1c890 = 1, 0x1c918 = 0 in V25G83-format tiling arrays (device/build policy).
     pub(crate) ta_mode_1: bool,
+    /// The normal maximum of a G17P tiler heap in blocks, which bounds host growth and the
+    /// firmware's own (device/build policy).
+    pub(crate) tvb_normal_blocks: usize,
     pub(crate) compute: super::compute::ComputeProgram,
     pub(crate) opening_record: bool,
     pub(crate) split_firmware_area: bool,
+    /// Uses the 26B123 initialization layouts and scheduler-release opcode.
+    pub(crate) v26b123: bool,
     /// Command validation applies the M5 command set: resource commands, the M5 render and
     /// compute flags, 8x MSAA and the M5 tile-buffer limit.
     pub(crate) m5_commands: bool,
@@ -87,6 +110,24 @@ pub(crate) struct Variant {
     /// work. The bare-metal M5 firmware powers the cores for work by its own policy: under a
     /// hold, the M5 Ultra's core-power witness reads unpowered until the hold is released.
     pub(crate) registration_power_hold: bool,
+    /// The InitData layouts the M5 graph must build for this firmware; `None` off M5.
+    pub(crate) m5_layouts: Option<M5Layouts>,
+    /// A context takes its render pool identity when it is created, not at its first render,
+    /// so that identities held by render graphs kept until the firmware stops refuse new
+    /// contexts with an error instead of failing a context's first render. Set for the A18
+    /// Pro and M4 Max (`25G83`/`26B123`); M4 Pro and M4 Max `25F84` keep the first-render
+    /// claim until tested on that hardware.
+    pub(crate) render_id_at_create: bool,
+    /// Cached descriptor storage, queue records and queue configuration that come back
+    /// after their owner's release was consumed are reused once the firmware has consumed
+    /// every control record published before they came back, not only after a later one.
+    /// Set for the A18 Pro. Elsewhere they keep the stricter fence of 34b438de, which fixed
+    /// an M4 Pro crash on a recycled work state; extending this needs a create/destroy-heavy
+    /// queue test on that hardware.
+    pub(crate) objects_after_release: bool,
+    /// What the firmware reports in its statistics ring beyond utilisation
+    /// ([`crate::g17::telemetry::Protocol`]).
+    pub(crate) telemetry_protocol: crate::g17::telemetry::Protocol,
 }
 
 /// A firmware build a SoC supports, identified by its loaded TEXT.
@@ -126,17 +167,25 @@ pub(crate) const V26A428: Variant = Variant {
     registration: QueueRegistration::PoweredRenderPairs,
     mcache: true,
     few_primitives: true,
+    render_stage_prefixes: true,
     ray_traversal: true,
+    traversal_exclusion: true,
     render_ray_query: true,
     fragment_busy: true,
     lead_commands: false,
     programs: super::render::RegisterPrograms::G17P,
     ta_mode_1: false,
+    tvb_normal_blocks: super::buffer::NORMAL_MAX_BLOCKS,
     compute: super::compute::ComputeProgram::G17P,
     opening_record: true,
     split_firmware_area: false,
+    v26b123: false,
     m5_commands: false,
     registration_power_hold: true,
+    m5_layouts: None,
+    render_id_at_create: true,
+    objects_after_release: true,
+    telemetry_protocol: crate::g17::telemetry::Protocol::PSTATE_16MS,
 };
 
 /// The M4 Pro firmware (25G83, `mBoot-18000.161.10`).
@@ -158,7 +207,11 @@ pub(crate) const V25G83: Variant = Variant {
     mcache: false,
     // A fragment stage with the few-primitives flag hangs.
     few_primitives: false,
+    // Not measured on this firmware.
+    render_stage_prefixes: false,
     ray_traversal: true,
+    // Not measured on this firmware.
+    traversal_exclusion: false,
     render_ray_query: true,
     // When a tiling pass runs out of memory with this set, the firmware resumes it without
     // adding memory and the tiler stops silently; macOS always writes 0.
@@ -166,20 +219,38 @@ pub(crate) const V25G83: Variant = Variant {
     lead_commands: true,
     programs: super::render::RegisterPrograms::V25G83,
     ta_mode_1: false,
+    tvb_normal_blocks: super::buffer::NORMAL_MAX_BLOCKS,
     compute: super::compute::ComputeProgram::G17P,
     opening_record: true,
     split_firmware_area: false,
+    v26b123: false,
     m5_commands: false,
     registration_power_hold: true,
+    m5_layouts: None,
+    render_id_at_create: false,
+    objects_after_release: false,
+    telemetry_protocol: crate::g17::telemetry::Protocol::NONE,
 };
 
 /// The 26A428 firmware of the M5 GPUs, which runs the M5 protocol (the M5 graph, queues and
 /// command set).
 pub(crate) const V26A428_M5: Variant = Variant {
     m5_commands: true,
+    // Not measured on the M5 firmware.
+    traversal_exclusion: false,
     render_ray_query: false,
     registration_power_hold: false,
+    m5_layouts: Some(M5Layouts::V26A428),
+    render_id_at_create: false,
+    objects_after_release: false,
+    telemetry_protocol: crate::g17::telemetry::Protocol::PSTATE_8MS,
     ..V26A428
+};
+
+/// The 27.2 M5 firmware (26B123): the 26A428 M5 protocol with the 26B123 InitData layouts.
+pub(crate) const V26B123_M5: Variant = Variant {
+    m5_layouts: Some(M5Layouts::V26B123),
+    ..V26A428_M5
 };
 
 pub(crate) const V25F84: Variant = Variant {
@@ -191,8 +262,16 @@ pub(crate) const V25F84: Variant = Variant {
     ..V25G83
 };
 
+/// The T6041 27.2 firmware (26B123, `mBoot-20457.41.3`).
+pub(crate) const V26B123: Variant = Variant {
+    split_firmware_area: false,
+    v26b123: true,
+    ..V25F84
+};
+
 const _: () = {
     assert!(super::queue::PointerBlock::valid_layout(&V26A428.pointers));
     assert!(super::queue::PointerBlock::valid_layout(&V25G83.pointers));
     assert!(super::queue::PointerBlock::valid_layout(&V25F84.pointers));
+    assert!(super::queue::PointerBlock::valid_layout(&V26B123.pointers));
 };

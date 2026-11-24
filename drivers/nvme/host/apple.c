@@ -13,6 +13,7 @@
 #include <linux/blk-crypto.h>
 #include <linux/blk-crypto-profile.h>
 #include <linux/blkdev.h>
+#include <linux/part_stat.h>
 #include <linux/blk-mq.h>
 #include <linux/crash_dump.h>
 #include <linux/delay.h>
@@ -46,6 +47,8 @@
 #include <linux/time64.h>
 
 #include "nvme.h"
+#include "apple-m5-policy.h"
+#include <linux/soc/apple/sleep-ans.h>
 
 #define APPLE_ANS_BOOT_TIMEOUT	  USEC_PER_SEC
 #define APPLE_ANS_SLEEP_SHN_TIMEOUT USEC_PER_SEC
@@ -71,6 +74,15 @@
 
 #define APPLE_ANS_LINEAR_ASQ_DB	 0x2490c
 #define APPLE_ANS_LINEAR_IOSQ_DB 0x24910
+
+/*
+ * ADT nvme-secure-reg-layout (T8152, macOS AppleANS2NVMeController with its
+ * 0x92a flag set): AQA/ASQ/ACQ and the I/O queue registers move up by
+ * 0x4000 and LINEAR_SQ_CTRL moves into the NVMMU block. CC/CSTS, the
+ * doorbells and the NVMMU TCB registers stay where they are.
+ */
+#define APPLE_ANS_SECURE_QREG_SHIFT	 0x4000
+#define APPLE_ANS_SECURE_LINEAR_SQ_CTRL	 0x2813c
 
 #define APPLE_NVMMU_NUM_TCBS	  0x28100
 #define APPLE_NVMMU_ASQ_TCB_BASE  0x28108
@@ -180,11 +192,6 @@ static inline void apple_nvme_enable_queue(struct apple_nvme_queue *q)
 	smp_store_release(&q->enabled, true);
 }
 
-static inline void apple_nvme_disable_queue(struct apple_nvme_queue *q)
-{
-	WRITE_ONCE(q->enabled, false);
-}
-
 /*
  * The apple_nvme_iod describes the data in an I/O.
  *
@@ -200,9 +207,11 @@ struct apple_nvme_iod {
 	dma_addr_t first_dma;
 	unsigned int dma_len; /* length of single DMA segment mapping */
 	struct scatterlist *sg;
+	bool irq_counted;
 };
 
 struct apple_nvme_hw {
+	const struct apple_nvme_m5_policy *m5_sleep;
 	bool has_lsq_nvmmu;
 	bool has_queue_count;
 	bool has_separate_nvmmu;
@@ -217,6 +226,8 @@ struct apple_nvme_hw {
 	bool cold_reset;
 	/* Firmware-driven suspend has been traced on this controller. */
 	bool sleep_traced;
+	/* ... or derived and never run: only with nvme_apple.sleep_untested */
+	bool sleep_untested;
 	/* The last endpoint map reply from that trace */
 	u32 sleep_epmap_last_mask;
 	/* Higher namespaces are the firmware's, and a Flush to one faults the controller. */
@@ -225,12 +236,16 @@ struct apple_nvme_hw {
 	u32 sleep_shn;
 	/* The ANS is never reset through PMGR here, so no reset is named. */
 	bool reset_optional;
+	bool secure_reg_layout;
+	/* Also send the NVMe shutdown notification (CC.SHN) on removal. */
+	bool shutdown_notify;
 	u32 max_queue_depth;
 	unsigned long quirks;
 };
 
 struct apple_nvme {
 	struct device *dev;
+	struct apple_nvme_m5_sleep m5;
 	struct kref ref;
 	/* Serializes the post-M4 controller disable with reset and teardown. */
 	struct mutex disable_lock;
@@ -293,6 +308,10 @@ struct apple_nvme {
 
 	int irq;
 	spinlock_t lock;
+	/* Non-polled (admin + interrupt I/O) requests submitted to hardware. */
+	unsigned int irq_inflight;
+	/* A poller consumed completions the CQ interrupt was raised for. */
+	bool polled_cqes;
 
 	/*
 	 * Delayed cache flush handling state
@@ -315,6 +334,22 @@ struct apple_nvme {
 static DEFINE_MUTEX(apple_nvme_quarantine_lock);
 static LIST_HEAD(apple_nvme_quarantines);
 
+/* Only the M5 Pro's firmware sleep is fenced; s2idle is unchanged. */
+static bool apple_nvme_m5_retained(struct apple_nvme *anv)
+{
+	return READ_ONCE(anv->quarantined) || READ_ONCE(anv->m5.rebuild_aborted);
+}
+
+static bool apple_nvme_m5_fenced(struct apple_nvme *anv)
+{
+	enum apple_nvme_m5_phase phase = READ_ONCE(anv->m5.phase);
+
+	return READ_ONCE(anv->m5.rebuild_aborted) || phase == APPLE_M5_ANS_PREPARED || phase == APPLE_M5_ANS_FINAL ||
+	       phase == APPLE_M5_ANS_STARTING || phase == APPLE_M5_ANS_FAILED;
+}
+
+static void apple_nvme_m5_fail_locked(struct apple_nvme *anv, int error);
+
 static inline void apple_nvme_writeq(struct apple_nvme *anv, u64 value,
 				     void __iomem *addr)
 {
@@ -334,6 +369,15 @@ unsigned int flush_interval = 1000;
 module_param(flush_interval, uint, 0644);
 MODULE_PARM_DESC(flush_interval,
 		 "Grace period in msecs between flushes (ignored on post-M4 ANS)");
+
+/*
+ * Stop ANS for a deep sleep on a controller whose sleep path was never run (T8142). Off by
+ * default: the root disk stays up through a sleep the SoC refuses.
+ */
+static bool sleep_untested;
+module_param(sleep_untested, bool, 0444);
+MODULE_PARM_DESC(sleep_untested,
+		 "Stop ANS for a deep sleep where that path is untested (default 0)");
 
 static_assert(sizeof(struct nvme_command) == 64);
 static_assert(sizeof(struct apple_nvmmu_tcb) == 128);
@@ -363,7 +407,7 @@ static void apple_nvme_put_resource_owner(void *data)
 	struct apple_nvme *anv = data;
 
 	WRITE_ONCE(anv->detached, true);
-	if (!READ_ONCE(anv->quarantined))
+	if (!apple_nvme_m5_retained(anv))
 		kref_put(&anv->ref, apple_nvme_release);
 }
 
@@ -407,12 +451,58 @@ static int apple_nvme_read_handoff(struct apple_nvme *anv)
 	return apple_nvme_can_adopt_rtkit(anv) ? 0 : -EIO;
 }
 
+static u32 apple_nvme_qreg(const struct apple_nvme *anv, u32 reg)
+{
+	return anv->hw->secure_reg_layout ? reg + APPLE_ANS_SECURE_QREG_SHIFT : reg;
+}
+
+static u32 apple_nvme_lsq_ctrl(const struct apple_nvme *anv)
+{
+	return anv->hw->secure_reg_layout ? APPLE_ANS_SECURE_LINEAR_SQ_CTRL :
+					     APPLE_ANS_LINEAR_SQ_CTRL;
+}
+
 static inline struct apple_nvme *queue_to_apple_nvme(struct apple_nvme_queue *q)
 {
 	if (q->is_adminq)
 		return container_of(q, struct apple_nvme, adminq);
 
 	return container_of(q, struct apple_nvme, ioq);
+}
+
+static inline void apple_nvme_disable_queue(struct apple_nvme_queue *q)
+{
+	struct apple_nvme *anv = queue_to_apple_nvme(q);
+	unsigned long flags;
+
+	spin_lock_irqsave(&anv->lock, flags);
+	WRITE_ONCE(q->enabled, false);
+	spin_unlock_irqrestore(&anv->lock, flags);
+}
+
+static inline void apple_nvme_account_irq_submit(struct apple_nvme_queue *q,
+						 struct request *req)
+{
+	struct apple_nvme *anv = queue_to_apple_nvme(q);
+	struct apple_nvme_iod *iod = blk_mq_rq_to_pdu(req);
+
+	lockdep_assert_held(&anv->lock);
+	if (q->is_adminq || !(req->cmd_flags & REQ_POLLED)) {
+		iod->irq_counted = true;
+		anv->irq_inflight++;
+	}
+}
+
+static inline void apple_nvme_account_irq_done(struct apple_nvme *anv,
+					       struct request *req)
+{
+	struct apple_nvme_iod *iod = blk_mq_rq_to_pdu(req);
+
+	lockdep_assert_held(&anv->lock);
+	if (iod->irq_counted) {
+		iod->irq_counted = false;
+		anv->irq_inflight--;
+	}
 }
 
 static unsigned int apple_nvme_queue_depth(struct apple_nvme_queue *q)
@@ -439,7 +529,7 @@ static void apple_nvme_rtkit_crashed(void *cookie, const void *crashlog, size_t 
 	struct apple_nvme *anv = cookie;
 	unsigned long flags;
 
-	if (READ_ONCE(anv->quarantined) || READ_ONCE(anv->removing))
+	if (apple_nvme_m5_retained(anv) || READ_ONCE(anv->removing))
 		return;
 	dev_warn(anv->dev, "RTKit crashed; unable to recover without a reboot");
 	/*
@@ -448,7 +538,7 @@ static void apple_nvme_rtkit_crashed(void *cookie, const void *crashlog, size_t 
 	 * callback scheduling with closing this gate before work cancellation.
 	 */
 	spin_lock_irqsave(&anv->event_lock, flags);
-	if (anv->reset_ready && !READ_ONCE(anv->quarantined) &&
+	if (anv->reset_ready && !apple_nvme_m5_retained(anv) &&
 	    !READ_ONCE(anv->removing))
 		nvme_reset_ctrl(&anv->ctrl);
 	spin_unlock_irqrestore(&anv->event_lock, flags);
@@ -501,7 +591,7 @@ static int apple_nvme_sart_dma_setup(void *cookie,
 	struct apple_nvme *anv = cookie;
 	int ret;
 
-	if (READ_ONCE(anv->quarantined) || READ_ONCE(anv->removing))
+	if (apple_nvme_m5_retained(anv) || READ_ONCE(anv->removing))
 		return -ESHUTDOWN;
 	if (!bfr->size)
 		return -EINVAL;
@@ -601,7 +691,8 @@ static void apple_nvmmu_inval(struct apple_nvme_queue *q, unsigned int tag)
 }
 
 static void apple_nvme_submit_cmd_t8015(struct apple_nvme_queue *q,
-				  struct nvme_command *cmd)
+					struct nvme_command *cmd,
+					struct request *req)
 {
 	struct apple_nvme *anv = queue_to_apple_nvme(q);
 
@@ -616,6 +707,7 @@ static void apple_nvme_submit_cmd_t8015(struct apple_nvme_queue *q,
 	if (++q->sq_tail == apple_nvme_queue_depth(q))
 		q->sq_tail = 0;
 
+	apple_nvme_account_irq_submit(q, req);
 	writel(q->sq_tail, q->sq_db);
 	spin_unlock_irq(&anv->lock);
 }
@@ -665,6 +757,7 @@ static void apple_nvme_submit_cmd_t8103(struct apple_nvme_queue *q,
 	 * and the final CQ update.
 	 */
 	spin_lock_irq(&anv->lock);
+	apple_nvme_account_irq_submit(q, req);
 	writel(tag, q->sq_db);
 	spin_unlock_irq(&anv->lock);
 }
@@ -932,6 +1025,22 @@ static void apple_nvme_complete_batch(struct io_comp_batch *iob)
 	nvme_complete_batch(iob, apple_nvme_unmap_rq);
 }
 
+static void apple_nvme_complete_direct(struct rq_list *list)
+{
+	struct request *req;
+
+	while ((req = rq_list_pop(list)) != NULL)
+		apple_nvme_complete_rq(req);
+}
+
+static void apple_nvme_finish_completions(struct io_comp_batch *iob,
+					  struct rq_list *direct)
+{
+	if (!rq_list_empty(&iob->req_list))
+		apple_nvme_complete_batch(iob);
+	apple_nvme_complete_direct(direct);
+}
+
 static inline bool apple_nvme_cqe_pending(struct apple_nvme_queue *q)
 {
 	struct nvme_completion *hcqe = &q->cqes[q->cq_head];
@@ -949,7 +1058,8 @@ apple_nvme_queue_tagset(struct apple_nvme *anv, struct apple_nvme_queue *q)
 }
 
 static inline void apple_nvme_handle_cqe(struct apple_nvme_queue *q,
-					 struct io_comp_batch *iob, u16 idx)
+					 struct io_comp_batch *iob,
+					 struct rq_list *direct, u16 idx)
 {
 	struct apple_nvme *anv = queue_to_apple_nvme(q);
 	struct nvme_completion *cqe = &q->cqes[idx];
@@ -965,11 +1075,13 @@ static inline void apple_nvme_handle_cqe(struct apple_nvme_queue *q,
 		return;
 	}
 
+	apple_nvme_account_irq_done(anv, req);
+
 	if (!nvme_try_complete_req(req, cqe->status, cqe->result) &&
 	    !blk_mq_add_to_batch(req, iob,
 				 nvme_req(req)->status != NVME_SC_SUCCESS,
 				 apple_nvme_complete_batch))
-		apple_nvme_complete_rq(req);
+		rq_list_add_tail(direct, req);
 }
 
 static inline void apple_nvme_update_cq_head(struct apple_nvme_queue *q)
@@ -985,7 +1097,8 @@ static inline void apple_nvme_update_cq_head(struct apple_nvme_queue *q)
 }
 
 static bool apple_nvme_poll_cq(struct apple_nvme_queue *q,
-			       struct io_comp_batch *iob)
+			       struct io_comp_batch *iob,
+			       struct rq_list *direct)
 {
 	bool found = false;
 
@@ -997,7 +1110,7 @@ static bool apple_nvme_poll_cq(struct apple_nvme_queue *q,
 		 * the cqe requires a full read memory barrier
 		 */
 		dma_rmb();
-		apple_nvme_handle_cqe(q, iob, q->cq_head);
+		apple_nvme_handle_cqe(q, iob, direct, q->cq_head);
 		apple_nvme_update_cq_head(q);
 	}
 
@@ -1007,27 +1120,39 @@ static bool apple_nvme_poll_cq(struct apple_nvme_queue *q,
 	return found;
 }
 
-static bool apple_nvme_handle_cq(struct apple_nvme_queue *q, bool force)
+static bool apple_nvme_drain_cq(struct apple_nvme_queue *q, bool force,
+				struct io_comp_batch *iob,
+				struct rq_list *direct)
 {
-	bool found;
-	DEFINE_IO_COMP_BATCH(iob);
-
 	if (!apple_nvme_queue_enabled(q) && !force)
 		return false;
 
-	found = apple_nvme_poll_cq(q, &iob);
+	return apple_nvme_poll_cq(q, iob, direct);
+}
 
-	if (!rq_list_empty(&iob.req_list))
-		apple_nvme_complete_batch(&iob);
+static bool apple_nvme_handle_cq(struct apple_nvme_queue *q, bool force)
+{
+	struct apple_nvme *anv = queue_to_apple_nvme(q);
+	DEFINE_IO_COMP_BATCH(iob);
+	struct rq_list direct = {};
+	unsigned long flags;
+	bool found;
 
+	spin_lock_irqsave(&anv->lock, flags);
+	found = apple_nvme_drain_cq(q, force, &iob, &direct);
+	spin_unlock_irqrestore(&anv->lock, flags);
+
+	apple_nvme_finish_completions(&iob, &direct);
 	return found;
 }
 
-static bool apple_nvme_handle_queues(struct apple_nvme *anv)
+static bool apple_nvme_handle_queues(struct apple_nvme *anv,
+				     struct io_comp_batch *iob,
+				     struct rq_list *direct)
 {
-	bool found = apple_nvme_handle_cq(&anv->ioq, false);
+	bool found = apple_nvme_drain_cq(&anv->ioq, false, iob, direct);
 
-	found |= apple_nvme_handle_cq(&anv->adminq, false);
+	found |= apple_nvme_drain_cq(&anv->adminq, false, iob, direct);
 	return found;
 }
 
@@ -1040,7 +1165,9 @@ static bool apple_nvme_handle_queues(struct apple_nvme *anv)
  */
 #define APPLE_NVME_LATE_CQE_US	100
 
-static bool apple_nvme_wait_late_cqe(struct apple_nvme *anv)
+static bool apple_nvme_wait_late_cqe(struct apple_nvme *anv,
+				     struct io_comp_batch *iob,
+				     struct rq_list *direct)
 {
 	ktime_t end;
 
@@ -1051,7 +1178,7 @@ static bool apple_nvme_wait_late_cqe(struct apple_nvme *anv)
 	end = ktime_add_us(ktime_get(), APPLE_NVME_LATE_CQE_US);
 	do {
 		udelay(1);
-		if (apple_nvme_handle_queues(anv))
+		if (apple_nvme_handle_queues(anv, iob, direct))
 			return true;
 	} while (ktime_before(ktime_get(), end));
 
@@ -1061,15 +1188,30 @@ static bool apple_nvme_wait_late_cqe(struct apple_nvme *anv)
 static irqreturn_t apple_nvme_irq(int irq, void *data)
 {
 	struct apple_nvme *anv = data;
+	DEFINE_IO_COMP_BATCH(iob);
+	struct rq_list direct = {};
 	unsigned long flags;
-	bool handled;
+	bool handled, polled;
 
+	if (apple_nvme_m5_fenced(anv))
+		return IRQ_NONE;
 	spin_lock_irqsave(&anv->lock, flags);
-	handled = apple_nvme_handle_queues(anv);
-	if (!handled)
-		handled = apple_nvme_wait_late_cqe(anv);
+	handled = apple_nvme_handle_queues(anv, &iob, &direct);
+	polled = anv->polled_cqes;
+	anv->polled_cqes = false;
+	/*
+	 * The CQ keeps its interrupt when the queue is also polled, and a
+	 * poller usually reaps the entry before this handler runs. Skip the
+	 * late-CQE wait only when no interrupt-driven or admin command is in
+	 * flight, and still claim the interrupt if a poller reaped entries.
+	 */
+	if (!handled && (anv->irq_inflight || !polled))
+		handled = apple_nvme_wait_late_cqe(anv, &iob, &direct);
+	if (!handled && polled)
+		handled = true;
 	spin_unlock_irqrestore(&anv->lock, flags);
 
+	apple_nvme_finish_completions(&iob, &direct);
 	return handled ? IRQ_HANDLED : IRQ_NONE;
 }
 
@@ -1166,8 +1308,17 @@ static blk_status_t apple_nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
 	struct nvme_command *cmnd = &iod->cmd;
 	blk_status_t ret;
 
+	/* nvme_start_ctrl() may unquiesce internally. Only the PM owner may
+	 * publish I/O after the complete rebuild, and terminal admin is fenced.
+	 */
+	if (apple_nvme_m5_fenced(anv))
+		return BLK_STS_IOERR;
+	if (!q->is_adminq && READ_ONCE(anv->m5.rebuild_active))
+		return BLK_STS_RESOURCE;
+
 	iod->npages = -1;
 	iod->nents = 0;
+	iod->irq_counted = false;
 
 	/*
 	 * We should not need to do this, but we're still using this to
@@ -1203,6 +1354,8 @@ static blk_status_t apple_nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
 			goto out_free_cmd;
 	}
 
+	if (anv->hw->m5_sleep)
+		atomic64_inc(&anv->m5.submissions);
 	nvme_start_request(req);
 
 	if (apple_nvme_delayed_flush(anv, ns, req)) {
@@ -1213,7 +1366,7 @@ static blk_status_t apple_nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
 	if (anv->hw->has_lsq_nvmmu)
 		apple_nvme_submit_cmd_t8103(q, cmnd, req);
 	else
-		apple_nvme_submit_cmd_t8015(q, cmnd);
+		apple_nvme_submit_cmd_t8015(q, cmnd, req);
 
 	return BLK_STS_OK;
 
@@ -1305,13 +1458,16 @@ static void apple_nvme_disable_legacy(struct apple_nvme *anv, bool shutdown)
 	nvme_quiesce_admin_queue(&anv->ctrl);
 
 	/* last chance to complete any requests before nvme_cancel_request */
-	spin_lock_irqsave(&anv->lock, flags);
 	apple_nvme_handle_cq(&anv->ioq, true);
 	apple_nvme_handle_cq(&anv->adminq, true);
-	spin_unlock_irqrestore(&anv->lock, flags);
 
 	nvme_cancel_tagset(&anv->ctrl);
 	nvme_cancel_admin_tagset(&anv->ctrl);
+
+	spin_lock_irqsave(&anv->lock, flags);
+	anv->irq_inflight = 0;
+	anv->polled_cqes = false;
+	spin_unlock_irqrestore(&anv->lock, flags);
 
 	/*
 	 * The driver will not be starting up queues again if shutting down so
@@ -1334,15 +1490,17 @@ static void apple_nvme_quarantine(struct apple_nvme *anv, int error)
 	 * The retained requests keep blk-mq timeouts and completions pointing
 	 * into this module until reboot.
 	 */
-	__module_get(THIS_MODULE);
+	if (!anv->m5.rebuild_pinned)
+		__module_get(THIS_MODULE);
 	apple_nvme_set_reset_ready(anv, false);
 	disable_irq(anv->irq);
-	if (anv->pd_count > 1) {
+	if (anv->pd_count > 1 && !anv->m5.rebuild_pinned) {
 		for (i = 0; i < anv->pd_count; i++)
 			pm_runtime_get_noresume(anv->pd_dev[i]);
 	}
 	mutex_lock(&apple_nvme_quarantine_lock);
-	list_add_tail(&anv->quarantine_node, &apple_nvme_quarantines);
+	if (list_empty(&anv->quarantine_node))
+		list_add_tail(&anv->quarantine_node, &apple_nvme_quarantines);
 	mutex_unlock(&apple_nvme_quarantine_lock);
 	nvme_change_ctrl_state(&anv->ctrl, NVME_CTRL_DELETING);
 	nvme_mark_namespaces_dead(&anv->ctrl);
@@ -1358,7 +1516,7 @@ static int apple_nvme_disable_locked(struct apple_nvme *anv, bool shutdown)
 	int ret;
 
 	lockdep_assert_held(&anv->disable_lock);
-	if (READ_ONCE(anv->quarantined))
+	if (apple_nvme_m5_retained(anv) || apple_nvme_m5_fenced(anv))
 		return -EIO;
 
 	state = nvme_ctrl_state(&anv->ctrl);
@@ -1383,10 +1541,13 @@ static int apple_nvme_disable_locked(struct apple_nvme *anv, bool shutdown)
 	 * The final system shutdown is the exception for SHN: without it the
 	 * controller counts every Linux shutdown as unsafe (SMART
 	 * unsafe_shutdowns) and recovers on the next start, which slows the
-	 * loader and the first seconds of I/O. A failed SHN changes nothing:
-	 * the CC.EN clear below still runs.
+	 * loader and the first seconds of I/O. Where the firmware handles it,
+	 * removal sends it too. A failed SHN changes nothing: the CC.EN clear
+	 * below still runs.
 	 */
-	if (READ_ONCE(anv->final_shutdown) && !apple_rtkit_is_crashed(anv->rtk)) {
+	if ((READ_ONCE(anv->final_shutdown) ||
+	     (shutdown && anv->hw->shutdown_notify && READ_ONCE(anv->removing))) &&
+	    !apple_rtkit_is_crashed(anv->rtk)) {
 		ret = nvme_disable_ctrl(&anv->ctrl, true);
 		if (ret)
 			dev_warn(anv->dev, "shutdown notification failed: %d\n", ret);
@@ -1397,12 +1558,14 @@ static int apple_nvme_disable_locked(struct apple_nvme *anv, bool shutdown)
 		return ret;
 	}
 
-	spin_lock_irqsave(&anv->lock, flags);
 	apple_nvme_handle_cq(&anv->ioq, true);
 	apple_nvme_handle_cq(&anv->adminq, true);
-	spin_unlock_irqrestore(&anv->lock, flags);
 	nvme_cancel_tagset(&anv->ctrl);
 	nvme_cancel_admin_tagset(&anv->ctrl);
+	spin_lock_irqsave(&anv->lock, flags);
+	anv->irq_inflight = 0;
+	anv->polled_cqes = false;
+	spin_unlock_irqrestore(&anv->lock, flags);
 	if (shutdown) {
 		nvme_unquiesce_io_queues(&anv->ctrl);
 		nvme_unquiesce_admin_queue(&anv->ctrl);
@@ -1427,7 +1590,7 @@ static int apple_nvme_disable(struct apple_nvme *anv, bool shutdown)
 static int apple_nvme_sleep_quiesce(struct apple_nvme *anv)
 {
 	guard(mutex)(&anv->disable_lock);
-	if (READ_ONCE(anv->quarantined))
+	if (apple_nvme_m5_retained(anv))
 		return -EIO;
 
 	if (!test_bit(NVME_CTRL_FROZEN, &anv->ctrl.flags))
@@ -1455,7 +1618,8 @@ static void apple_nvme_recovery_work(struct work_struct *work)
 	 * The timeout callback must return before cancellation waits for the
 	 * block layer's reference to that request. This worker owns the stop.
 	 */
-	if (READ_ONCE(anv->quarantined) || READ_ONCE(anv->removing))
+	if (apple_nvme_m5_retained(anv) || READ_ONCE(anv->removing) ||
+	    apple_nvme_m5_fenced(anv))
 		goto done;
 	mutex_lock(&anv->disable_lock);
 	ret = apple_nvme_disable_locked(anv, false);
@@ -1487,12 +1651,11 @@ static enum blk_eh_timer_return apple_nvme_timeout(struct request *req)
 	struct apple_nvme *anv = queue_to_apple_nvme(q);
 	struct nvme_completion *cqe = &q->cqes[q->cq_head];
 	enum nvme_ctrl_state state = nvme_ctrl_state(&anv->ctrl);
-	unsigned long flags;
 	u32 cc, csts;
 
 	if (blk_mq_request_completed(req))
 		return BLK_EH_DONE;
-	if (READ_ONCE(anv->quarantined))
+	if (apple_nvme_m5_retained(anv) || apple_nvme_m5_fenced(anv))
 		return BLK_EH_RESET_TIMER;
 	cc = readl(anv->mmio_nvme + NVME_REG_CC);
 	csts = readl(anv->mmio_nvme + NVME_REG_CSTS);
@@ -1503,9 +1666,7 @@ static enum blk_eh_timer_return apple_nvme_timeout(struct request *req)
 	 * interrupt cannot turn a completed initialization command into a reset.
 	 */
 	if (!apple_rtkit_is_crashed(anv->rtk) && !(csts & NVME_CSTS_CFS)) {
-		spin_lock_irqsave(&anv->lock, flags);
 		apple_nvme_handle_cq(q, false);
-		spin_unlock_irqrestore(&anv->lock, flags);
 		if (blk_mq_request_completed(req)) {
 			dev_warn(anv->dev,
 				 "I/O %d(aq:%d) timeout in state %d: completion polled\n",
@@ -1579,6 +1740,11 @@ static enum blk_eh_timer_return apple_nvme_timeout(struct request *req)
 			 READ_ONCE(cqe->command_id));
 		if (blk_mq_request_started(req) &&
 		    !blk_mq_request_completed(req)) {
+			unsigned long flags;
+
+			spin_lock_irqsave(&anv->lock, flags);
+			apple_nvme_account_irq_done(anv, req);
+			spin_unlock_irqrestore(&anv->lock, flags);
 			nvme_req(req)->status = NVME_SC_HOST_ABORTED_CMD;
 			nvme_req(req)->flags |= NVME_REQ_CANCELLED;
 			blk_mq_complete_request(req);
@@ -1606,16 +1772,39 @@ static int apple_nvme_poll(struct blk_mq_hw_ctx *hctx,
 {
 	struct apple_nvme_queue *q = hctx->driver_data;
 	struct apple_nvme *anv = queue_to_apple_nvme(q);
-	bool found;
+	struct rq_list direct = {};
+	bool found = false;
 	unsigned long flags;
 
-	if (READ_ONCE(anv->quarantined) || READ_ONCE(anv->detached))
-		return 0;
 	spin_lock_irqsave(&anv->lock, flags);
-	found = apple_nvme_poll_cq(q, iob);
+	if (!apple_nvme_m5_retained(anv) && !READ_ONCE(anv->detached) &&
+	    !apple_nvme_m5_fenced(anv)) {
+		found = apple_nvme_drain_cq(q, false, iob, &direct);
+		if (found)
+			anv->polled_cqes = true;
+	}
 	spin_unlock_irqrestore(&anv->lock, flags);
 
+	apple_nvme_complete_direct(&direct);
 	return found;
+}
+
+/*
+ * There is one I/O queue. Map a second hardware context (HCTX_TYPE_POLL) onto
+ * it with shared tags so polled I/O (io_uring IOPOLL, RWF_HIPRI) works while
+ * keeping tags unique across both contexts as the NVMMU requires.
+ */
+static void apple_nvme_map_queues(struct blk_mq_tag_set *set)
+{
+	set->map[HCTX_TYPE_DEFAULT].nr_queues = 1;
+	set->map[HCTX_TYPE_DEFAULT].queue_offset = 0;
+	blk_mq_map_queues(&set->map[HCTX_TYPE_DEFAULT]);
+	if (set->nr_maps <= HCTX_TYPE_POLL)
+		return;
+	set->map[HCTX_TYPE_READ].nr_queues = 0;
+	set->map[HCTX_TYPE_POLL].nr_queues = 1;
+	set->map[HCTX_TYPE_POLL].queue_offset = 1;
+	blk_mq_map_queues(&set->map[HCTX_TYPE_POLL]);
 }
 
 static const struct blk_mq_ops apple_nvme_mq_admin_ops = {
@@ -1633,6 +1822,7 @@ static const struct blk_mq_ops apple_nvme_mq_ops = {
 	.init_request = apple_nvme_init_request,
 	.timeout = apple_nvme_timeout,
 	.poll = apple_nvme_poll,
+	.map_queues = apple_nvme_map_queues,
 };
 
 static void apple_nvme_init_queue(struct apple_nvme_queue *q)
@@ -1658,7 +1848,7 @@ static void apple_nvme_init_queue(struct apple_nvme_queue *q)
 static void apple_nvme_wait_freeze(struct apple_nvme *anv)
 {
 	while (!nvme_wait_freeze_timeout(&anv->ctrl)) {
-		if (READ_ONCE(anv->abort_reset) || READ_ONCE(anv->quarantined))
+		if (READ_ONCE(anv->abort_reset) || apple_nvme_m5_retained(anv))
 			return;
 	}
 }
@@ -1697,7 +1887,7 @@ static void apple_nvme_stop_crashed_session(struct apple_nvme *anv)
 
 static bool apple_nvme_sleep_wait_on(struct apple_nvme *anv);
 
-static void apple_nvme_reset_work(struct work_struct *work)
+static void apple_nvme_reset_work_impl(struct work_struct *work)
 {
 	unsigned int nr_io_queues = 1;
 	bool phase_locked = false;
@@ -1712,7 +1902,13 @@ static void apple_nvme_reset_work(struct work_struct *work)
 		mutex_lock(&anv->disable_lock);
 		phase_locked = true;
 	}
-	if (READ_ONCE(anv->quarantined) || READ_ONCE(anv->removing)) {
+	if (apple_nvme_m5_retained(anv) || READ_ONCE(anv->removing)) {
+		if (phase_locked)
+			mutex_unlock(&anv->disable_lock);
+		return;
+	}
+	if (apple_nvme_m5_fenced(anv) ||
+	    READ_ONCE(anv->m5.phase) == APPLE_M5_ANS_PREPARING) {
 		if (phase_locked)
 			mutex_unlock(&anv->disable_lock);
 		return;
@@ -1922,10 +2118,10 @@ rtkit_ready:
 		 */
 		if (!anv->lsq_in_nvmmu) {
 			writel(APPLE_ANS_LINEAR_SQ_EN,
-			       anv->mmio_nvme + APPLE_ANS_LINEAR_SQ_CTRL);
+			       anv->mmio_nvme + apple_nvme_lsq_ctrl(anv));
 			if (anv->hw->needs_ioq_registers) {
 				u32 lsq_ctrl = readl(anv->mmio_nvme +
-						     APPLE_ANS_LINEAR_SQ_CTRL);
+						     apple_nvme_lsq_ctrl(anv));
 
 				if (!(lsq_ctrl & APPLE_ANS_LINEAR_SQ_EN)) {
 					dev_err(anv->dev,
@@ -1948,9 +2144,11 @@ rtkit_ready:
 		if (anv->hw->needs_ioq_registers)
 			ioqa_depth--;
 		ioqa = ioqa_depth | (ioqa_depth << 16);
-		writel(ioqa, anv->mmio_nvme + APPLE_ANS_MAX_PEND_CMDS_CTRL);
+		writel(ioqa, anv->mmio_nvme +
+			     apple_nvme_qreg(anv, APPLE_ANS_MAX_PEND_CMDS_CTRL));
 		if (anv->hw->needs_ioq_registers &&
-		    readl(anv->mmio_nvme + APPLE_ANS_MAX_PEND_CMDS_CTRL) != ioqa) {
+		    readl(anv->mmio_nvme +
+			  apple_nvme_qreg(anv, APPLE_ANS_MAX_PEND_CMDS_CTRL)) != ioqa) {
 			dev_err(anv->dev, "failed to program I/O queue aperture\n");
 			ret = -EIO;
 			goto out;
@@ -1964,11 +2162,11 @@ rtkit_ready:
 	/* Setup the admin queue */
 	aqa = APPLE_NVME_AQ_DEPTH - 1;
 	aqa |= aqa << 16;
-	writel(aqa, anv->mmio_nvme + NVME_REG_AQA);
+	writel(aqa, anv->mmio_nvme + apple_nvme_qreg(anv, NVME_REG_AQA));
 	apple_nvme_writeq(anv, anv->adminq.sq_dma_addr,
-			  anv->mmio_nvme + NVME_REG_ASQ);
+			  anv->mmio_nvme + apple_nvme_qreg(anv, NVME_REG_ASQ));
 	apple_nvme_writeq(anv, anv->adminq.cq_dma_addr,
-			  anv->mmio_nvme + NVME_REG_ACQ);
+			  anv->mmio_nvme + apple_nvme_qreg(anv, NVME_REG_ACQ));
 
 	if (anv->hw->has_lsq_nvmmu) {
 		/* Setup NVMMU for both queues */
@@ -2010,6 +2208,11 @@ rtkit_ready:
 	if (ret)
 		goto out;
 
+	/* A late Identify completion cannot revive an expired owner. */
+	if (apple_nvme_m5_fenced(anv)) {
+		ret = -ECANCELED;
+		goto out;
+	}
 	dev_dbg(anv->dev, "Creating IOCQ");
 	ret = apple_nvme_create_cq(anv);
 	if (ret)
@@ -2022,7 +2225,7 @@ rtkit_ready:
 	if (anv->hw->needs_ioq_registers) {
 		mutex_lock(&anv->disable_lock);
 		phase_locked = true;
-		if (READ_ONCE(anv->quarantined) || READ_ONCE(anv->removing) ||
+		if (apple_nvme_m5_retained(anv) || READ_ONCE(anv->removing) ||
 		    READ_ONCE(anv->abort_reset)) {
 			ret = -ECANCELED;
 			goto out;
@@ -2035,10 +2238,10 @@ rtkit_ready:
 		 * dedicated registers. Without them it crashes and its crash log
 		 * reports null I/O SQ and CQ addresses.
 		 */
-		apple_nvme_writeq(anv, anv->ioq.cq_dma_addr,
-				  anv->mmio_nvme + APPLE_ANS_IOCQ_REGISTER);
-		apple_nvme_writeq(anv, anv->ioq.sq_dma_addr,
-				  anv->mmio_nvme + APPLE_ANS_IOSQ_REGISTER);
+		apple_nvme_writeq(anv, anv->ioq.cq_dma_addr, anv->mmio_nvme +
+				  apple_nvme_qreg(anv, APPLE_ANS_IOCQ_REGISTER));
+		apple_nvme_writeq(anv, anv->ioq.sq_dma_addr, anv->mmio_nvme +
+				  apple_nvme_qreg(anv, APPLE_ANS_IOSQ_REGISTER));
 	}
 	nr_io_queues = 1;
 	if (anv->hw->has_queue_count) {
@@ -2053,7 +2256,8 @@ rtkit_ready:
 
 	anv->ctrl.queue_count = nr_io_queues + 1;
 
-	nvme_unquiesce_io_queues(&anv->ctrl);
+	if (!READ_ONCE(anv->m5.rebuild_active))
+		nvme_unquiesce_io_queues(&anv->ctrl);
 	if (phase_locked) {
 		/*
 		 * Do not hold disable_lock while waiting for the requests that
@@ -2065,17 +2269,28 @@ rtkit_ready:
 		mutex_unlock(&anv->disable_lock);
 		apple_nvme_wait_freeze(anv);
 		mutex_lock(&anv->disable_lock);
-		if (READ_ONCE(anv->quarantined) || READ_ONCE(anv->removing) ||
+		if (apple_nvme_m5_retained(anv) || READ_ONCE(anv->removing) ||
 		    READ_ONCE(anv->abort_reset)) {
-			nvme_unfreeze(&anv->ctrl);
+			if (!READ_ONCE(anv->m5.rebuild_active))
+				nvme_unfreeze(&anv->ctrl);
 			ret = -ECANCELED;
 			goto out;
 		}
 	} else {
 		nvme_wait_freeze(&anv->ctrl);
 	}
-	blk_mq_update_nr_hw_queues(&anv->tagset, 1);
-	nvme_unfreeze(&anv->ctrl);
+	blk_mq_update_nr_hw_queues(&anv->tagset, anv->tagset.nr_hw_queues);
+	if (!READ_ONCE(anv->m5.rebuild_active)) {
+		nvme_unfreeze(&anv->ctrl);
+		if (anv->hw->m5_sleep)
+			anv->m5.frozen = false;
+	}
+
+	if (READ_ONCE(anv->m5.rebuild_active) && anv->m5.rebuild_after_wake) {
+		ret = apple_rtkit_ans_check(anv->rtk);
+		if (ret)
+			goto out;
+	}
 
 	if (!nvme_change_ctrl_state(&anv->ctrl, NVME_CTRL_LIVE)) {
 		dev_warn(anv->ctrl.device,
@@ -2083,6 +2298,10 @@ rtkit_ready:
 		ret = -ENODEV;
 		goto out_remove_sq;
 	}
+
+	/* M5 remains REBUILDING even if nvme_start_ctrl unquiesces. The
+	 * bounded PM owner, not this worker, releases admission and retention.
+	 */
 
 	/*
 	 * nvme_start_ctrl() sends Set Features if the controller reports
@@ -2106,6 +2325,14 @@ out_remove_cq:
 	if (!anv->hw->needs_ioq_registers)
 		apple_nvme_remove_cq(anv);
 out:
+	if (READ_ONCE(anv->m5.rebuild_active)) {
+		if (!phase_locked)
+			mutex_lock(&anv->disable_lock);
+		WRITE_ONCE(anv->m5.rebuild_result, ret);
+		apple_nvme_m5_fail_locked(anv, ret);
+		mutex_unlock(&anv->disable_lock);
+		return;
+	}
 	if (phase_locked)
 		mutex_unlock(&anv->disable_lock);
 	dev_warn(anv->ctrl.device, "Reset failure status: %d\n", ret);
@@ -2116,6 +2343,26 @@ out:
 	nvme_mark_namespaces_dead(&anv->ctrl);
 	if (!queue_work(nvme_wq, &anv->remove_work))
 		nvme_put_ctrl(&anv->ctrl);
+}
+
+/* Completion reports a worker result; it never publishes the M5 owner. */
+static void apple_nvme_reset_work(struct work_struct *work)
+{
+	struct apple_nvme *anv = container_of(work, struct apple_nvme, ctrl.reset_work);
+
+	apple_nvme_reset_work_impl(work);
+	if (!READ_ONCE(anv->m5.rebuild_active))
+		return;
+	mutex_lock(&anv->disable_lock);
+	if (apple_nvme_m5_retained(anv) || READ_ONCE(anv->abort_reset) ||
+	    READ_ONCE(anv->removing) || nvme_ctrl_state(&anv->ctrl) != NVME_CTRL_LIVE) {
+		if (anv->m5.rebuild_result == -EINPROGRESS)
+			anv->m5.rebuild_result = -EIO;
+	} else {
+		anv->m5.rebuild_result = 0;
+	}
+	mutex_unlock(&anv->disable_lock);
+	complete(&anv->m5.rebuild_done);
 }
 
 static void apple_nvme_remove_dead_ctrl_work(struct work_struct *work)
@@ -2131,7 +2378,8 @@ static int apple_nvme_reg_read32(struct nvme_ctrl *ctrl, u32 off, u32 *val)
 {
 	struct apple_nvme *anv = ctrl_to_apple_nvme(ctrl);
 
-	if (READ_ONCE(anv->quarantined) || READ_ONCE(anv->detached))
+	if (apple_nvme_m5_retained(anv) || READ_ONCE(anv->detached) ||
+	    apple_nvme_m5_fenced(anv))
 		return -ENODEV;
 	*val = readl(anv->mmio_nvme + off);
 	return 0;
@@ -2141,7 +2389,8 @@ static int apple_nvme_reg_write32(struct nvme_ctrl *ctrl, u32 off, u32 val)
 {
 	struct apple_nvme *anv = ctrl_to_apple_nvme(ctrl);
 
-	if (READ_ONCE(anv->quarantined) || READ_ONCE(anv->detached))
+	if (apple_nvme_m5_retained(anv) || READ_ONCE(anv->detached) ||
+	    apple_nvme_m5_fenced(anv))
 		return -ENODEV;
 	writel(val, anv->mmio_nvme + off);
 	return 0;
@@ -2151,7 +2400,8 @@ static int apple_nvme_reg_read64(struct nvme_ctrl *ctrl, u32 off, u64 *val)
 {
 	struct apple_nvme *anv = ctrl_to_apple_nvme(ctrl);
 
-	if (READ_ONCE(anv->quarantined) || READ_ONCE(anv->detached))
+	if (apple_nvme_m5_retained(anv) || READ_ONCE(anv->detached) ||
+	    apple_nvme_m5_fenced(anv))
 		return -ENODEV;
 	*val = readq(anv->mmio_nvme + off);
 	return 0;
@@ -2197,7 +2447,7 @@ static void devm_apple_nvme_put_tag_set(void *data)
 	struct blk_mq_tag_set *set = data;
 	struct apple_nvme *anv = queue_to_apple_nvme(set->driver_data);
 
-	if (!READ_ONCE(anv->quarantined))
+	if (!apple_nvme_m5_retained(anv))
 		blk_mq_free_tag_set(set);
 }
 
@@ -2222,8 +2472,8 @@ static int apple_nvme_alloc_tagsets(struct apple_nvme *anv)
 		return ret;
 
 	anv->tagset.ops = &apple_nvme_mq_ops;
-	anv->tagset.nr_hw_queues = 1;
-	anv->tagset.nr_maps = 1;
+	anv->tagset.nr_hw_queues = 2;
+	anv->tagset.nr_maps = HCTX_MAX_TYPES;
 	/*
 	 * Tags are used as an index to the NVMMU and must be unique across
 	 * both queues. The admin queue gets the first APPLE_NVME_AQ_DEPTH which
@@ -2235,6 +2485,18 @@ static int apple_nvme_alloc_tagsets(struct apple_nvme *anv)
 	anv->tagset.numa_node = NUMA_NO_NODE;
 	anv->tagset.cmd_size = sizeof(struct apple_nvme_iod);
 	anv->tagset.driver_data = &anv->ioq;
+	/*
+	 * ANS has one I/O queue, so the block layer would default it to
+	 * mq-deadline like any single-queue device. With a scheduler attached,
+	 * every unplugged request (O_DIRECT sync reads, for instance) is
+	 * dispatched from a kblockd worker instead of the submitting task,
+	 * which adds a context switch to each I/O. Start without a scheduler,
+	 * as PCIe NVMe controllers do; one can still be selected through sysfs.
+	 * Share tags across the default and poll hardware contexts so every
+	 * tag maps to a unique NVMMU TCB slot.
+	 */
+	anv->tagset.flags = BLK_MQ_F_TAG_HCTX_SHARED |
+			    BLK_MQ_F_NO_SCHED_BY_DEFAULT;
 
 	ret = blk_mq_alloc_tag_set(&anv->tagset);
 	if (ret)
@@ -2258,7 +2520,7 @@ static void apple_nvme_free_queue(void *data)
 	size_t sq_size = anv->hw->has_lsq_nvmmu ?
 		depth * sizeof(struct nvme_command) : depth << APPLE_NVME_IOSQES;
 
-	if (READ_ONCE(anv->quarantined))
+	if (apple_nvme_m5_retained(anv))
 		return;
 	if (q->tcbs)
 		dma_free_coherent(anv->dev,
@@ -2322,7 +2584,7 @@ static void apple_nvme_detach_genpd(struct apple_nvme *anv)
 {
 	int i;
 
-	if (anv->pd_count <= 1 || READ_ONCE(anv->quarantined))
+	if (anv->pd_count <= 1 || apple_nvme_m5_retained(anv))
 		return;
 
 	for (i = anv->pd_count - 1; i >= 0; i--) {
@@ -2377,7 +2639,7 @@ static void apple_nvme_free_pools(void *data)
 {
 	struct apple_nvme *anv = data;
 
-	if (READ_ONCE(anv->quarantined))
+	if (apple_nvme_m5_retained(anv))
 		return;
 	mempool_destroy(anv->iod_mempool);
 	dma_pool_destroy(anv->prp_small_pool);
@@ -2389,6 +2651,9 @@ static void apple_nvme_free_rtkit(void *data)
 	struct apple_nvme *anv = data;
 
 	apple_nvme_set_reset_ready(anv, false);
+	/* A timed-out reset may still be using the RTKit object itself. */
+	if (apple_nvme_m5_retained(anv))
+		return;
 	guard(mutex)(&anv->disable_lock);
 	if (anv->hw->needs_ioq_registers)
 		apple_rtkit_free_retaining_buffers(anv->rtk);
@@ -2470,6 +2735,11 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 		ret = -ENXIO;
 		goto out_detach_genpd;
 	}
+	/*
+	 * PRP list entries must be NVME_CTRL_PAGE_SIZE aligned, so a bounced
+	 * segment has to keep its offset within the controller page.
+	 */
+	dma_set_min_align_mask(dev, NVME_CTRL_PAGE_SIZE - 1);
 
 	anv->irq = platform_get_irq(pdev, 0);
 	if (anv->irq < 0) {
@@ -2705,6 +2975,10 @@ static int apple_nvme_sleep_last_stop(void *data)
 	return ret ? 1 : 0;
 }
 
+static void apple_nvme_keep_link_powered(struct apple_nvme *anv);
+
+#include "apple-m5-sleep.h"
+
 static int apple_nvme_probe(struct platform_device *pdev)
 {
 	struct apple_nvme *anv;
@@ -2733,7 +3007,9 @@ static int apple_nvme_probe(struct platform_device *pdev)
 
 	INIT_DELAYED_WORK(&anv->flush_dwork, apple_nvme_flush_work);
 
-	if (anv->hw->sleep_traced) {
+	if (anv->hw->sleep_traced && (!anv->hw->sleep_untested || sleep_untested)) {
+		if (anv->hw->sleep_untested)
+			dev_warn(anv->dev, "firmware stop for sleep enabled, untested on this SoC\n");
 		anv->sleep_registered =
 			!apple_sleep_coproc_register(anv->dev, anv->mmio_coproc, true,
 						     apple_nvme_sleep_last_stop, anv);
@@ -2764,6 +3040,14 @@ static void apple_nvme_remove(struct platform_device *pdev)
 {
 	struct apple_nvme *anv = platform_get_drvdata(pdev);
 
+	if (anv->m5.registered)
+		apple_sleep_coproc_unregister(anv->dev);
+	if (apple_nvme_m5_fenced(anv)) {
+		WRITE_ONCE(anv->removing, true);
+		guard(mutex)(&anv->disable_lock);
+		apple_nvme_m5_fail_locked(anv, -ESHUTDOWN);
+		return;
+	}
 	if (anv->sleep_registered)
 		apple_sleep_coproc_unregister(anv->dev);
 	WRITE_ONCE(anv->removing, true);
@@ -2804,6 +3088,11 @@ static void apple_nvme_shutdown(struct platform_device *pdev)
 	struct apple_nvme *anv = platform_get_drvdata(pdev);
 
 	WRITE_ONCE(anv->removing, true);
+	if (apple_nvme_m5_fenced(anv)) {
+		guard(mutex)(&anv->disable_lock);
+		apple_nvme_m5_fail_locked(anv, -ESHUTDOWN);
+		return;
+	}
 	WRITE_ONCE(anv->final_shutdown, true);
 	apple_nvme_set_reset_ready(anv, false);
 	flush_delayed_work(&anv->flush_dwork);
@@ -2852,6 +3141,9 @@ static int apple_nvme_resume_early(struct device *dev)
 	void __iomem *control = anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL;
 	int ret;
 
+	if (anv->hw->m5_sleep && anv->m5.registered &&
+	    READ_ONCE(anv->m5.phase) != APPLE_M5_ANS_LIVE)
+		return apple_nvme_m5_resume_early(anv);
 
 	if (!anv->hw->needs_ioq_registers || !anv->suspended || !anv->sleep_idled)
 		return 0;
@@ -2912,8 +3204,12 @@ static int apple_nvme_resume(struct device *dev)
 {
 	struct apple_nvme *anv = dev_get_drvdata(dev);
 
+	if (anv->hw->m5_sleep && anv->m5.registered &&
+	    READ_ONCE(anv->m5.phase) != APPLE_M5_ANS_LIVE)
+		return apple_nvme_m5_resume(anv);
+
 	if (anv->hw->needs_ioq_registers) {
-		if (READ_ONCE(anv->quarantined))
+		if (apple_nvme_m5_retained(anv))
 			return -EIO;
 		if (!anv->suspended)
 			return 0;
@@ -3031,6 +3327,10 @@ static int apple_nvme_suspend(struct device *dev)
 	struct apple_nvme *anv = dev_get_drvdata(dev);
 	int ret;
 
+	if (anv->hw->m5_sleep && pm_suspend_target_state == PM_SUSPEND_MEM &&
+	    pm_suspend_via_firmware())
+		return apple_nvme_m5_prepare(anv);
+
 	if (anv->hw->needs_ioq_registers) {
 		/* A sleep right after a wake, as from a dark wake: let that reset finish first. */
 		flush_work(&anv->ctrl.reset_work);
@@ -3125,6 +3425,11 @@ static const struct apple_nvme_hw apple_nvme_t8132_hw = {
 	.needs_ioq_registers = true,
 	.cold_reset = true,
 	.max_queue_depth = 64,
+	/* T8140's values: T8132's sleep path hasn't been traced. */
+	.sleep_traced = true,
+	.sleep_epmap_last_mask = BIT(0),
+	.sleep_flush_max_nsid = 1,
+	.sleep_shn = NVME_CC_SHN_MASK,
 	/* Explicit flushes are required for writes to survive a reset on J713. */
 	.quirks = NVME_QUIRK_BROKEN_FUA,
 };
@@ -3155,6 +3460,12 @@ static const struct apple_nvme_hw apple_nvme_t8142_hw = {
 	.has_separate_nvmmu = true,
 	.needs_ioq_registers = true,
 	.max_queue_depth = 64,
+	/* T8140's values, as T8132 runs them: never run on T8142. */
+	.sleep_traced = true,
+	.sleep_untested = true,
+	.sleep_epmap_last_mask = BIT(0),
+	.sleep_flush_max_nsid = 1,
+	.sleep_shn = NVME_CC_SHN_MASK,
 	.quirks = NVME_QUIRK_BROKEN_FUA,
 };
 
@@ -3173,12 +3484,13 @@ static const struct apple_nvme_hw apple_nvme_t6040_hw = {
 };
 
 /*
- * T6050 (M5 Ultra) ANS on bare metal: T6040's split layout (a 64 KiB "nvme"
+ * T6050 (M5 family, including J714s M5 Pro) ANS on bare metal: T6040's split layout (a 64 KiB "nvme"
  * block, a separate NVMMU, linear submission queues), 64 queue entries. Like
  * every post-M4 ANS without cold_reset it is never reset through PMGR, so no
  * reset is named.
  */
 static const struct apple_nvme_hw apple_nvme_t6050_hw = {
+	.m5_sleep = &apple_nvme_t6050_sleep_policy,
 	.has_lsq_nvmmu = true,
 	.has_separate_nvmmu = true,
 	.needs_ioq_registers = true,
@@ -3189,6 +3501,22 @@ static const struct apple_nvme_hw apple_nvme_t6050_hw = {
 	.quirks = NVME_QUIRK_NO_APST | NVME_QUIRK_BROKEN_FUA,
 };
 
+/*
+ * T8152 uses the post-M4 queue setup, but its NVMe registers and NVMMU share
+ * one window (0x325cc0000 on J873) like T8103, with the secure register
+ * layout. There is no T8152 PMGR driver yet, so the controller has no reset
+ * line in the DT.
+ */
+static const struct apple_nvme_hw apple_nvme_t8152_hw = {
+	.has_lsq_nvmmu = true,
+	.needs_ioq_registers = true,
+	.reset_optional = true,
+	.secure_reg_layout = true,
+	.shutdown_notify = true,
+	.max_queue_depth = 64,
+	.quirks = NVME_QUIRK_BROKEN_FUA,
+};
+
 static const struct of_device_id apple_nvme_of_match[] = {
 	{ .compatible = "apple,t6041-nvme-ans2", .data = &apple_nvme_t6040_hw },
 	{ .compatible = "apple,t6050-nvme-ans2", .data = &apple_nvme_t6050_hw },
@@ -3197,6 +3525,7 @@ static const struct of_device_id apple_nvme_of_match[] = {
 	{ .compatible = "apple,t8132-nvme-ans2", .data = &apple_nvme_t8132_hw },
 	{ .compatible = "apple,t8140-nvme-ans2", .data = &apple_nvme_t8140_hw },
 	{ .compatible = "apple,t8142-nvme-ans2", .data = &apple_nvme_t8142_hw },
+	{ .compatible = "apple,t8152-nvme-ans2", .data = &apple_nvme_t8152_hw },
 	{ .compatible = "apple,nvme-ans2", .data = &apple_nvme_t8103_hw },
 	{},
 };

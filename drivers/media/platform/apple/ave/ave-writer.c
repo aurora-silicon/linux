@@ -843,6 +843,9 @@ static void ave_start_config(const struct ave_params *p, u8 *cmd,
 	ave_start_put32(cmd, l->codec_flags, hevc ? 0x2000002 : 2);
 	ave_start_put32(cmd, l->bit_depth, depth);
 	ave_start_put8(cmd, l->ref_compression, 1);
+	/* A reordered 6070 picture has two active references and needs both MEs. */
+	ave_start_put16(cmd, l->multi_me,
+			p->bframes && fw->kind == AVE_LAYOUT_6070 ? 1 : 0);
 
 	if (!hevc) {
 		u32 profile_idc = p->high ? 100 : (p->profile == 2 ? 66 : 77);
@@ -885,7 +888,6 @@ static void ave_start_config(const struct ave_params *p, u8 *cmd,
 				ave_put16(cmd, l->h264_scaling_8x8 + 2 * i,
 					  AVE_AVC_FLAT_SCALING_WEIGHT);
 		ave_start_put32(cmd, l->h264_sve_count, 1);
-		ave_start_put16(cmd, l->h264_multi_me, p->bframes ? 1 : 0);
 		ave_start_put32(cmd, l->h264_profile,
 				fw->kind == AVE_LAYOUT_6070 ? profile_idc : p->profile);
 		ave_start_put32(cmd, l->h264_level,

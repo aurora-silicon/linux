@@ -19,6 +19,7 @@ mod der;
 mod diag;
 mod dt;
 mod fv;
+mod hibe;
 mod hwrng;
 mod image;
 mod key;
@@ -38,7 +39,9 @@ mod scrd;
 mod sensor;
 mod shim;
 mod shmem;
+mod skdl;
 mod sks;
+mod sse;
 mod stac;
 mod store;
 mod transfer;
@@ -830,6 +833,15 @@ struct SepData {
     pnon_named: Atomic<bool>,
     pnon_layout: Atomic<u32>,
     pnon_done: Atomic<bool>,
+
+    // What discovery said about the endpoints the driver checks and sends
+    // nothing to (see `sse`, `hibe`, `skdl`).
+    sse_named: Atomic<bool>,
+    sse_layout: Atomic<u32>,
+    hibe_named: Atomic<bool>,
+    hibe_layout: Atomic<u32>,
+    skdl_named: Atomic<bool>,
+    skdl_layout: Atomic<u32>,
     #[pin]
     scrd_probe: Mutex<ScrdProbe>,
     #[pin]
@@ -868,6 +880,8 @@ struct SepData {
     key_touch_active: Atomic<bool>,
     /// `SEP_KEY_CANCEL`: ends the touch-gated operation that is waiting.
     key_touch_cancel: Atomic<bool>,
+    /// An unconfirmed credential disposal disables private key operations.
+    key_context_failed: Atomic<bool>,
     // The enclave status of the last /dev/sep-key signature (self-test).
     last_key_status: Atomic<u32>,
 
@@ -1075,19 +1089,17 @@ impl SepData {
         let xart_start = module_parameters::xart_start_sector.value();
         let xart_guard =
             xart_guard::level(module_parameters::xart_guard.value(), profile.xart_guard);
+        // SEP writes are always on. Only the key-store-only initrd phase opens
+        // the store read-only, until complete_attach reopens it writable.
         let xart_writes = if keystore_only {
-            attach::initrd_xart_writes(
-                module_parameters::xart_writes.value() != 0,
-                keystore_user_bags,
-                xart_guard,
-            )
+            attach::initrd_xart_writes(keystore_user_bags, xart_guard)
         } else {
-            module_parameters::xart_writes.value() != 0
+            true
         };
         if keystore_user_bags && !xart_writes {
             dev_info_ratelimited!(
                 dev,
-                "initrd: per-user key bags need xart_writes=1 and no xART guard; they wait for the real root\n"
+                "initrd: per-user key bags need xART writes, which the xART guard holds back until the real root (its list lives there); they wait for the real root\n"
             );
         }
         // The qualified 26.6.2 lane uses only the boot-forwarded identity.
@@ -1236,6 +1248,12 @@ impl SepData {
                 pnon_named: Atomic::new(false),
                 pnon_layout: Atomic::new(0),
                 pnon_done: Atomic::new(false),
+                sse_named: Atomic::new(false),
+                sse_layout: Atomic::new(0),
+                hibe_named: Atomic::new(false),
+                hibe_layout: Atomic::new(0),
+                skdl_named: Atomic::new(false),
+                skdl_layout: Atomic::new(0),
                 dma_ring <- new_mutex!(Some(dma_ring)),
                 sbio_exchange_lock <- new_mutex!(()),
                 sbio_rx <- new_mutex!(transfer::Reassembly::new()),
@@ -1250,6 +1268,7 @@ impl SepData {
                 key_touch <- new_mutex!(None),
                 key_touch_active: Atomic::new(false),
                 key_touch_cancel: Atomic::new(false),
+                key_context_failed: Atomic::new(false),
                 last_key_status: Atomic::new(0),
                 bio_lockout: Atomic::new(false),
                 bio_after_boot: Atomic::new(false),
@@ -2195,7 +2214,7 @@ impl SepData {
         {
             dev_warn_ratelimited!(
                 self.dev,
-                "xART: refused the enclave's write (op 0x{:02x}): writes are disabled (xart_writes=0)\n",
+                "xART: refused the enclave's write (op 0x{:02x}): the store is open read-only (the key-store-only initrd phase, or a failed writable reopen)\n",
                 req.opcode
             );
         }
@@ -2753,13 +2772,20 @@ impl SepData {
     }
 
     pub(crate) fn close_unlock_evaluation(&self, handle: &[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]) {
+        let _ = self.delete_unlock_evaluation(handle);
+    }
+
+    pub(crate) fn delete_unlock_evaluation(&self, handle: &[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]) -> Result<()> {
         match self.scrd_command(&crate::scrd::scrd_context_delete(handle)) {
-            Some((0, _)) => {}
-            other => dev_warn_ratelimited!(
-                self.dev,
-                "scrd: deleting the unlock evaluation answered {:?}\n",
-                other.map(|(status, _)| status)
-            ),
+            Some((0, _)) => Ok(()),
+            other => {
+                dev_warn_ratelimited!(
+                    self.dev,
+                    "scrd: deleting the unlock evaluation answered {:?}\n",
+                    other.map(|(status, _)| status)
+                );
+                Err(EIO)
+            }
         }
     }
 
@@ -2974,6 +3000,10 @@ impl SepData {
         Self::queue_stac_online(this.clone());
         // The enclave's account of the LocalPolicy that admitted this boot.
         Self::queue_pnon_digest(this.clone());
+        // As macOS does at boot, these are checked and sent nothing.
+        this.sse_attach();
+        this.hibe_attach();
+        this.skdl_attach();
         Self::arm_settle(this);
     }
 
@@ -2992,11 +3022,6 @@ impl SepData {
 
     fn finish_attach(&self) -> Result<()> {
         self.wait_for_trusted_ready()?;
-        if module_parameters::provision_keybag.value() != 0
-            && module_parameters::xart_writes.value() == 0
-        {
-            return Err(EINVAL);
-        }
 
         // Wait out a cached-keybag consumer before enabling persistent writes.
         // All opens below resolve against PID 1's current (real) root.
@@ -3009,7 +3034,7 @@ impl SepData {
         *store = None;
         let reopened = (|| {
             let mut new = xart_store::Store::open_owner(
-                module_parameters::xart_writes.value() != 0,
+                true,
                 module_parameters::xart_start_sector.value(),
             )?;
             if new.writes_enabled() {
@@ -3030,6 +3055,9 @@ impl SepData {
                     module_parameters::xart_start_sector.value(),
                 )
                 .ok();
+                // diag/xart must not keep reading "enabled" (keystore_only=2
+                // without a guard opened the store writable at probe).
+                diag::xart_state(false, None);
                 return Err(e);
             }
         };
@@ -3113,6 +3141,12 @@ impl SepData {
 
             pnon::EP_PNON => self.on_pnon(msg),
 
+            sse::EP_SSE => self.on_sse(msg),
+
+            hibe::EP_HIBE => self.on_hibe(msg),
+
+            skdl::EP_SKDL => self.on_skdl(msg),
+
             proto::EP_BOOT => self.on_boot(msg),
 
             ep => {
@@ -3160,6 +3194,9 @@ impl SepData {
                 let _ = table.slot(f.param);
                 self.stac_discovered(&f);
                 self.pnon_discovered(&f);
+                self.sse_discovered(&f);
+                self.hibe_discovered(&f);
+                self.skdl_discovered(&f);
                 diag::endpoints(table.eps.len());
                 if f.ty == proto::DISCOVER_TYPE_DESCRIPTOR {
                     diag::endpoint(f.param, (msg.msg0 >> 32) as u32);
@@ -3515,13 +3552,6 @@ impl platform::Driver for SepDriver {
         _info: Option<&'bound Self::IdInfo>,
     ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
         let dev: &device::Device<device::Core<'_>> = pdev.as_ref();
-        if !attach::requested()
-            && module_parameters::provision_keybag.value() != 0
-            && module_parameters::xart_writes.value() == 0
-        {
-            dev_err_ratelimited!(dev, "provision_keybag=1 requires xart_writes=1\n");
-            return Err(EINVAL);
-        }
         let sep_node = dt::DtNode::of_device(dev).ok_or(ENODEV)?;
 
         // J700's SEP DART window starts above 4 GiB. Leave the proven masks
@@ -3550,7 +3580,6 @@ impl platform::Driver for SepDriver {
         // from "pending" on. Diagnostics are not worth failing the probe for.
         let guard = data.with_store(|store| store.guard_state()).flatten();
         let policy = diag::Policy {
-            provision_keybag: module_parameters::provision_keybag.value() != 0,
             trusted_keys: module_parameters::trusted_keys.value() != 0,
             filevault_api: module_parameters::filevault_api.value() != 0,
             xarm_trace: module_parameters::xarm_trace.value() != 0,
@@ -3662,17 +3691,9 @@ module! {
             default: 1,
             description: "Register the SEP FileVault kernel API; 0 leaves it disabled",
         },
-        xart_writes: u8 {
-            default: 1,
-            description: "Allow shared xART writes only if APFS proves a single unsnapshotted .gl extent; set to 0 for read-only operation",
-        },
         xart_start_sector: u64 {
             default: 0,
             description: "Expected 512-byte start sector of the APFS .gl extent in the iBoot container. Zero accepts the APFS result; nonzero must match it and cannot override it",
-        },
-        provision_keybag: u8 {
-            default: 1,
-            description: "Create the Linux identity keybag when none exists; set to 0 to disable first-boot provisioning; requires xart_writes=1",
         },
         xart_guard: i8 {
             default: -1,

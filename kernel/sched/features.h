@@ -95,6 +95,13 @@ SCHED_FEAT(TTWU_QUEUE, true)
 SCHED_FEAT(SIS_UTIL, true)
 
 /*
+ * Wake a task that runs only briefly between sleeps on the waking CPU when
+ * the waker also runs briefly and is alone there, instead of on an idle CPU.
+ * See wake_short_local().
+ */
+SCHED_FEAT(WAKE_SHORT_LOCAL, true)
+
+/*
  * Issue a WARN when we do multiple update_rq_clock() calls
  * in a single rq->lock section. Default disabled because the
  * annotations are not complete.

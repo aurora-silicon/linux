@@ -126,4 +126,35 @@ static inline void dcp_peer_split_swap_v27(struct dcp_swap_submit_req_v27 *left,
 	}
 }
 
+/* The same for the A407 request (dcp->v27_a407); its six further surfaces are never presented. */
+static inline void dcp_peer_split_swap_v27_a407(struct dcp_swap_submit_req_v27_a407 *left,
+						struct dcp_swap_submit_req_v27_a407 *right,
+						u32 tile_width)
+{
+	*right = *left;
+	for (unsigned int i = 0; i < ARRAY_SIZE(left->surf_null); i++) {
+		struct dcp_rect src = left->swap.src_rect[i];
+		struct dcp_rect dst = left->swap.dst_rect[i];
+		bool present = !left->surf_null[i];
+		struct dcp_swap_submit_req_v27_a407 *halves[] = {left, right};
+
+		for (unsigned int side = 0; side < 2; side++) {
+			struct dcp_swap_submit_req_v27_a407 *req = halves[side];
+			struct dcp_rect clipped_src, clipped_dst;
+
+			if (present && dcp_peer_clip_surface_v27(&src, &dst,
+				side * tile_width, tile_width, &clipped_src, &clipped_dst)) {
+				req->swap.src_rect[i] = clipped_src;
+				req->swap.dst_rect[i] = clipped_dst;
+			} else {
+				req->surf_null[i] = true;
+				req->surf_iova[i] = 0;
+				req->swap.surf_ids[i] = 0;
+				memset(&req->swap.src_rect[i], 0, sizeof(req->swap.src_rect[i]));
+				memset(&req->swap.dst_rect[i], 0, sizeof(req->swap.dst_rect[i]));
+			}
+		}
+	}
+}
+
 #endif

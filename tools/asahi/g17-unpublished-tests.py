@@ -64,7 +64,7 @@ fn main(){
   match guard {
    0=>q.unpublished_binding=false,
    1=>q.exit=Some(Exit{phase:Phase::Acknowledged}),
-   2=>q.active.push(Active{packet:Arc::new(Packet{completion:Arc::new(Completion)}),ticket:None,observed:None,qos_pending:false}).unwrap(),
+   2=>q.active.push(Active{packet:Arc::new(Packet{completion:Arc::new(Completion)}),ticket:None,observed:None,qos_pending:false,stamps_owed:false}).unwrap(),
    3=>q.replays.push(Arc::new(Packet{completion:Arc::new(Completion)})).unwrap(),
    4=>q.growing=true,
    5=>q.quarantined=true,

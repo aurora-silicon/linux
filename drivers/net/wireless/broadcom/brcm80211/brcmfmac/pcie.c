@@ -8,6 +8,7 @@
 #include <linux/of.h>
 #include <linux/firmware.h>
 #include <linux/pci.h>
+#include <linux/soc/apple/radio-sleep.h>
 #include <linux/vmalloc.h>
 #include <linux/delay.h>
 #include <linux/interrupt.h>
@@ -412,6 +413,10 @@ struct brcmf_otp_params {
 
 struct brcmf_pciedev_info {
 	enum brcmf_pcie_state state;
+	/* Published only after the asynchronous firmware setup has completed. */
+	bool setup_complete;
+	/* This binding blocked reset work for the active radio transaction. */
+	bool sleep_reset_blocked;
 	bool in_irq;
 	struct pci_dev *pdev;
 	char fw_name[BRCMF_FW_NAME_LEN];
@@ -452,6 +457,8 @@ struct brcmf_pciedev_info {
 	struct brcmf_otp_params otp;
 	bool fwseed;
 	bool fw_dead;
+	/* A firmware death asked for a reset that has not run yet. */
+	bool reset_wanted;
 	u32 recoveries;
 	unsigned long recovery_window;
 #ifdef DEBUG
@@ -984,6 +991,7 @@ static void brcmf_pcie_fw_died(struct brcmf_pciedev_info *devinfo,
 	/* Fail further firmware commands at once instead of timing out. */
 	if (bus)
 		brcmf_bus_change_state(bus, BRCMF_BUS_DOWN);
+	WRITE_ONCE(devinfo->reset_wanted, true);
 	brcmf_fw_crashed(dev);
 }
 
@@ -1278,6 +1286,7 @@ static int brcmf_pcie_request_irq(struct brcmf_pciedev_info *devinfo)
 
 	brcmf_pcie_intr_disable(devinfo);
 	bus->wowl_wake = pci_pme_capable(pdev, PCI_D3hot);
+	bus->wowl_s2idle_only = false;
 
 	brcmf_dbg(PCIE, "Enter\n");
 
@@ -1312,6 +1321,7 @@ static int brcmf_pcie_request_irq(struct brcmf_pciedev_info *devinfo)
 		}
 		devinfo->wowl_irq = true;
 		bus->wowl_wake = true;
+		bus->wowl_s2idle_only = true;
 	}
 	devinfo->irq_allocated = true;
 	return 0;
@@ -1343,6 +1353,7 @@ static void brcmf_pcie_release_irq(struct brcmf_pciedev_info *devinfo)
 		devinfo->wakeup_created = false;
 	}
 	devinfo->wowl_irq = false;
+	bus->wowl_s2idle_only = false;
 	brcmf_pcie_intr_disable(devinfo);
 	free_irq(pdev->irq, devinfo);
 	pci_disable_msi(pdev);
@@ -1904,6 +1915,11 @@ static int brcmf_pcie_reset(struct device *dev)
 	struct brcmf_fw_request *fwreq;
 	int err;
 
+	if (apple_radio_sleep_owned(dev))
+		return -EBUSY;
+
+	WRITE_ONCE(devinfo->reset_wanted, false);
+	WRITE_ONCE(devinfo->setup_complete, false);
 	devinfo->state = BRCMFMAC_PCIE_STATE_DOWN;
 	brcmf_pcie_intr_disable(devinfo);
 	if (devinfo->irq_allocated)
@@ -2804,6 +2820,8 @@ static void brcmf_pcie_setup(struct device *dev, int ret,
 	brcmf_pcie_bus_console_read(devinfo, false);
 
 	brcmf_pcie_fwcon_timer(devinfo, true);
+	/* Publish completed firmware setup before suspend admission. */
+	smp_store_release(&devinfo->setup_complete, true);
 
 	return;
 
@@ -3088,22 +3106,6 @@ brcmf_pcie_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	brcmf_dbg(PCIE, "Enter %x:%x\n", pdev->vendor, pdev->device);
 
-	/*
-	 * T8132's BCM4388 IOVA aperture starts above 1 TiB and the message-buffer
-	 * ABI carries full 64-bit host addresses, so do not retain PCI's
-	 * conservative 32-bit default DMA mask on this platform.
-	 */
-	if (pdev->device == BRCM_PCIE_4388_DEVICE_ID &&
-	    of_machine_is_compatible("apple,t8132")) {
-		ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(42));
-		if (ret) {
-			pci_err(pdev, "failed to enable 42-bit DMA: %d\n", ret);
-			return ret;
-		}
-		pci_info(pdev, "using 42-bit DMA addresses\n");
-	}
-
-
 	ret = -ENOMEM;
 	devinfo = kzalloc_obj(*devinfo);
 	if (devinfo == NULL)
@@ -3289,6 +3291,33 @@ brcmf_pcie_remove(struct pci_dev *pdev)
 
 #ifdef CONFIG_PM
 
+static struct pci_driver brcmf_pciedrvr;
+
+static void brcmf_pcie_sleep_finish(struct device *dev)
+{
+	struct brcmf_pciedev_info *devinfo;
+	struct brcmf_bus *bus;
+
+	/* Async setup failure may unbind us after suspend refused admission. */
+	device_lock(dev);
+	if (dev->driver != &brcmf_pciedrvr.driver)
+		goto unlock;
+	bus = dev_get_drvdata(dev);
+	if (!bus)
+		goto unlock;
+	devinfo = bus->bus_priv.pcie->devinfo;
+	/* A replacement binding has no cleanup pending from this transaction. */
+	if (!devinfo->sleep_reset_blocked)
+		goto unlock;
+	devinfo->sleep_reset_blocked = false;
+	brcmf_bus_allow_reset_work(bus);
+	/* The sleep dropped the reset of a firmware that died during it. */
+	if (READ_ONCE(devinfo->reset_wanted))
+		brcmf_bus_schedule_reset(bus);
+unlock:
+	device_unlock(dev);
+}
+
 static int brcmf_pcie_pm_leave_D3(struct device *dev);
 
 static void brcmf_pcie_wowl_wake(struct brcmf_bus *bus,
@@ -3370,7 +3399,7 @@ static int brcmf_pcie_pm_enter_D3(struct device *dev)
 	struct brcmf_pciedev_info *devinfo;
 	struct brcmf_bus *bus;
 	struct brcmf_if *ifp;
-	int ifidx;
+	int ifidx, ret;
 
 	brcmf_dbg(PCIE, "Enter\n");
 
@@ -3383,6 +3412,18 @@ static int brcmf_pcie_pm_enter_D3(struct device *dev)
 	if (devinfo->wowl_irq && devinfo->wowl_enabled &&
 	    pm_suspend_target_state != PM_SUSPEND_TO_IDLE)
 		return -EOPNOTSUPP;
+
+	ret = apple_radio_sleep_endpoint_prepare(dev, brcmf_pcie_sleep_finish);
+	if (ret)
+		return ret;
+	/* Drain a recovery already running when the platform acquired its lease. */
+	if (apple_radio_sleep_owned(dev)) {
+		brcmf_bus_cancel_reset_work(bus);
+		devinfo->sleep_reset_blocked = true;
+		/* A reset can have returned while firmware loading is still async. */
+		if (!smp_load_acquire(&devinfo->setup_complete))
+			return -EBUSY;
+	}
 
 	/* Stop new packets and drain ndo_start_xmit before taking the bus down.
 	 * The BUS reason prevents completion flow control from waking the queue.
@@ -3418,8 +3459,10 @@ static int brcmf_pcie_pm_enter_D3(struct device *dev)
 	}
 
 	devinfo->state = BRCMFMAC_PCIE_STATE_DOWN;
-
-	return 0;
+	ret = apple_radio_sleep_endpoint_suspended(dev);
+	if (ret)
+		brcmf_pcie_pm_leave_D3(dev);
+	return ret;
 }
 
 
@@ -3430,6 +3473,9 @@ static int brcmf_pcie_pm_leave_D3(struct device *dev)
 	struct pci_dev *pdev;
 	int err;
 
+	err = apple_radio_sleep_endpoint_resume(dev);
+	if (err)
+		return err;
 	brcmf_dbg(PCIE, "Enter\n");
 
 	bus = dev_get_drvdata(dev);
@@ -3464,11 +3510,17 @@ static int brcmf_pcie_pm_leave_D3(struct device *dev)
 		brcmf_bus_change_state(bus, BRCMF_BUS_UP);
 		brcmf_msgbuf_resume(bus->drvr);
 		brcmf_pcie_fwcon_timer(devinfo, true);
+		apple_radio_sleep_endpoint_resumed(dev, 0);
 		return 0;
 	}
 
 cleanup:
 	devinfo->state = BRCMFMAC_PCIE_STATE_DOWN;
+	if (apple_radio_sleep_owned(dev)) {
+		/* Lost firmware/rings violate retention; reset/reprobe is not recovery. */
+		apple_radio_sleep_endpoint_resumed(dev, -EUCLEAN);
+		return -EUCLEAN;
+	}
 	brcmf_chip_detach(devinfo->ci);
 	devinfo->ci = NULL;
 	pdev = devinfo->pdev;

@@ -105,6 +105,9 @@ static void dwc3_enable_susphy(struct dwc3 *d,bool v) { assert(v&&d->dis_u3_susp
 static void device_init_wakeup(struct device *d,bool b) { (void)d;(void)b; }
 static void platform_device_unregister(struct platform_device *d);
 static void dwc3_gadget_exit(struct dwc3 *d) { (void)d;assert(0); }
+static unsigned quiesce_calls;
+/* The glue's PM quiesce (its notifier off, its sleep work drained) runs before the host goes, and stops new starts. */
+static void __attribute__((unused)) dwc3_apple_pm_quiesce(struct dwc3_apple *d) { assert(!host_remove_calls);quiesce_calls++;d->shutting_down=true; }
 static int dwc3_apple_core_stop(struct dwc3_apple *d) { (void)d;return 0; }
 static void usb_role_switch_unregister(void *s) { (void)s; }
 static void dwc3_core_remove_no_shutdown(struct dwc3 *d) { (void)d; }
@@ -163,17 +166,20 @@ int main(void) {
   xhci_context=(struct xhci_hcd){0};
   inject_remove=true;removal_started=blocked_attempt=release_remove=false;
   atomic_store(&early_write,false);atomic_store(&handoff_active,true);
-  susphy_calls=host_remove_calls=0;
+  susphy_calls=host_remove_calls=quiesce_calls=0;
   int ret=safe(&p);
   atomic_store(&handoff_active,false);
   pthread_mutex_lock(&schedule_mutex);release_remove=true;pthread_cond_broadcast(&schedule_cond);pthread_mutex_unlock(&schedule_mutex);
   assert(pthread_join(remove_thread,NULL)==0);
   fprintf(stderr,"connected teardown target=%d ret=%d early_write=%d susphy=%d host_remove=%d\n",remove_target,ret,atomic_load(&early_write),susphy_calls,host_remove_calls);
   assert(ret==0&&!atomic_load(&early_write)&&host_remove_calls==1);
-  assert(susphy_calls==(remove_target?0:1));balanced(&p);
+  assert(susphy_calls==(remove_target?0:1));QUIESCE_CHECK balanced(&p);
  }
  puts("PASS actual PM wrapper connected to driver-core/DWC3/xHCI removal; synchronous teardown waits until owned transaction ends");
  return 0;
 }
 '''
+ # Only a glue that quiesces its PM work in remove is held to it.
+ quiesce='assert(quiesce_calls==(remove_target?0:1));' if 'dwc3_apple_pm_quiesce(appledwc);' in glue else ''
+ controls=controls.replace('QUIESCE_CHECK ',quiesce)
  return unit+prefix+functions+controls

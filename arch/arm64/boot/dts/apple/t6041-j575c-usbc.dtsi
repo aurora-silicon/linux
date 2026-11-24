@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
- * USB-C DisplayPort on the J575c's back-right-middle port (typec1): dcpext1,
- * the ATC1 display crossbar and atcphy1 in DP alt mode, driven by hpm1. The
- * same chain as the J616c's typec1 (t6041-j616c-usbc.dtsi). The adapters it
- * was tested with negotiate pin assignment D, whose two DP lanes run on the
- * USB3 PHY, so this needs t6041-j575c-usb3.dtsi.
+ * USB-C DisplayPort on the J575c's four back Type-C ports (typec0-3):
+ * dcpext1, the ATC0-3 display crossbars and atcphy0-3 in DP alt mode, driven
+ * by hpm0-3, as dcpext1 on the J614c/J616c (t6041-j616c-usbc.dtsi) with the
+ * fourth port added. The J575c ADT has atc0-3-dpxbar at the J616c's
+ * addresses. The adapters it was tested with negotiate pin assignment D,
+ * whose two DP lanes run on the USB3 PHY, so this needs t6041-j575c-usb3.dtsi.
  *
- * dcpext1, its DARTs, mailbox, crossbar and Type-C route are disabled: the
+ * dcpext1, its DARTs, mailbox, crossbars and Type-C routes are disabled: the
  * display gate enables them once the boot loader has filled dcpext1's
- * firmware memory. A disabled route is no mode switch, so typec1 then keeps
- * USB2 and PD as before.
+ * firmware memory. A disabled route is no mode switch, so the ports then keep
+ * USB and PD as before.
  */
 
 / {
@@ -50,19 +51,33 @@
 &dcpext1 {
 	apple,iomfb-surfaces = <1 1 0 0>;
 	apple,connector-type = "USB-C";
-	phys = <&atcphy1 PHY_TYPE_DP>;
-	phy-names = "typec1";
-	mux-controls = <&atcphy1_xbar 0>;
-	mux-control-names = "typec1";
-	/* indexed by route */
-	apple,typec-dptx-phys = <0 1 2>;
-	apple,typec-mux-indices = <2 2 2>;
+	phys = <&atcphy0 PHY_TYPE_DP>, <&atcphy1 PHY_TYPE_DP>,
+	       <&atcphy2 PHY_TYPE_DP>, <&atcphy3 PHY_TYPE_DP>;
+	phy-names = "typec0", "typec1", "typec2", "typec3";
+	mux-controls = <&atcphy0_xbar 0>, <&atcphy1_xbar 0>,
+		       <&atcphy2_xbar 0>, <&atcphy3_xbar 0>;
+	mux-control-names = "typec0", "typec1", "typec2", "typec3";
+	/* indexed by route; dcpext1 ufp 1 port 0 = crossbar state 2, as on the M4 Pro */
+	apple,typec-dptx-phys = <0 1 2 3>;
+	apple,typec-mux-indices = <2 2 2 2>;
 	memory-region = <&dcpext1_text>, <&dcpext1_data>, <&dcpext1_heap>;
 	memory-region-names = "text", "data", "heap";
 
 	typec-routes {
 		#address-cells = <1>;
 		#size-cells = <0>;
+
+		route@0 {
+			reg = <0>;
+			mode-switch;
+			status = "disabled";
+
+			port {
+				dcpext1_typec0: endpoint {
+					remote-endpoint = <&typec0_dcpext1>;
+				};
+			};
+		};
 
 		route@1 {
 			reg = <1>;
@@ -75,22 +90,110 @@
 				};
 			};
 		};
+
+		route@2 {
+			reg = <2>;
+			mode-switch;
+			status = "disabled";
+
+			port {
+				dcpext1_typec2: endpoint {
+					remote-endpoint = <&typec2_dcpext1>;
+				};
+			};
+		};
+
+		route@3 {
+			reg = <3>;
+			mode-switch;
+			status = "disabled";
+
+			port {
+				dcpext1_typec3: endpoint {
+					remote-endpoint = <&typec3_dcpext1>;
+				};
+			};
+		};
+	};
+};
+
+&typec0 {
+	ports {
+		port@3 {
+			#address-cells = <1>;
+			#size-cells = <0>;
+			reg = <3>;
+
+			typec0_dcpext1: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&dcpext1_typec0>;
+			};
+		};
 	};
 };
 
 &typec1 {
 	ports {
 		port@3 {
+			#address-cells = <1>;
+			#size-cells = <0>;
 			reg = <3>;
-			typec1_dcpext1: endpoint {
+
+			typec1_dcpext1: endpoint@0 {
+				reg = <0>;
 				remote-endpoint = <&dcpext1_typec1>;
 			};
 		};
 	};
 };
 
-/* The DP mux of typec1 (the tunables and USB3 are in t6041-j575c-usb3.dtsi) */
+&typec2 {
+	ports {
+		port@3 {
+			#address-cells = <1>;
+			#size-cells = <0>;
+			reg = <3>;
+
+			typec2_dcpext1: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&dcpext1_typec2>;
+			};
+		};
+	};
+};
+
+&typec3 {
+	ports {
+		port@3 {
+			#address-cells = <1>;
+			#size-cells = <0>;
+			reg = <3>;
+
+			typec3_dcpext1: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&dcpext1_typec3>;
+			};
+		};
+	};
+};
+
+/* The DP muxes (the tunables and USB3 are in t6041-j575c-usb3.dtsi) */
+&atcphy0 {
+	mode-switch;
+	orientation-switch;
+};
+
 &atcphy1 {
+	mode-switch;
+	orientation-switch;
+};
+
+&atcphy2 {
+	mode-switch;
+	orientation-switch;
+};
+
+&atcphy3 {
 	mode-switch;
 	orientation-switch;
 };

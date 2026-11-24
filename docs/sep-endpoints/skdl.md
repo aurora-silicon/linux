@@ -11,7 +11,7 @@ its userspace consumer and the features that depend on it. A key-related name
 is insufficient to classify it as key derivation, key distribution, a data
 locker or a Secure Storage Component interface. No such expansion is asserted.
 
-Linux has no skdl client. Resolving it is necessary for endpoint parity, but no
+Linux checks the endpoint at boot and sends it nothing (`drivers/soc/apple/skdl.rs`, `diag/skdl`). Resolving it is necessary for endpoint parity, but no
 specific Linux feature can yet be claimed to depend on it. It must remain a
 visible unresolved capability rather than an apparently successful stub.
 

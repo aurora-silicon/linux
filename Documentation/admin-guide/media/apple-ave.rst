@@ -67,10 +67,22 @@ those nodes. A probe with a valid handoff reports the verified CRCs without
 starting the coprocessor. An unknown layout refuses stream start before
 allocating session buffers or acquiring runtime power.
 
+T8122 (M3) with the macOS 27.2 firmware (TEXT 0x134000, DATA 0x128000, TEXT
+CRC ``918d70d3``) encodes H.264 and HEVC: the firmware boots on the boot
+configuration handshake as device 17 with handshake type 17 and speaks the
+26B123 command layout, while the coprocessor registers and their start are the
+T8112 ones. The rest of the M3 generation (T6030, T6031 and both dies of T6032)
+is probe-only. Its encoders have the T8112 register windows, interrupt order and
+power states, but their firmware builds have not been seen yet, so no build
+size is pinned: any
+loader-verified handoff binds, the probe logs both segment sizes and CRCs,
+and the coprocessor is never started. The nodes stay disabled until the
+loader hands their firmware over.
+
 Command sizes, offsets, descriptor groups, constants, Process subtype and
 buffer sizes are selected by the verified TEXT CRC, independently of the
 SoC match data. ``69c54454`` and ``68d5f9f6`` select the 9003.78.0 layout and
-``87279429`` the 26A428 one.
+``87279429`` (T6050) and ``8a3784bd`` (T8142) the 26A428 one.
 There is no fallback layout and zero is not a wildcard CRC. Hardware boot
 qualification is a separate requirement; presenting the J700 CRC on T6041
 does not authorize the J700 boot sequence.
@@ -86,6 +98,14 @@ buffer; an HEVC slice header comes back in the slot's 16 KiB buffer, the only
 per-slot buffer its Process command carries, and must start with an Annex B
 start code. The 26A428 capture and the J700 capture used different OS
 versions; a SoC compatible cannot identify a command ABI.
+
+The M5 (T8142) with a macOS 27.0 stub gets the same firmware version
+(AppleAVE2FW 9013.45.1) built for its chip: TEXT 0x154000, DATA 0x12c000,
+TEXT CRC ``8a3784bd``. AppleAVE2 and the firmware share one device table, in
+which T8142 is device 27; the driver boots it and names it in the handshake
+as device 27, device type 27, and clears the SVE idle word at mailbox +0x118
+as on T6050 (both chips use the same SVE register block). Its start has not
+been traced under macOS.
 
 The public API continues to offer 8-bit NV12 and VBR/CBR. CQ and Main10
 layout facts are exercised by host tests without exposing new V4L2 modes.
@@ -105,7 +125,7 @@ checkout, add ``--compare-baseline /path/to/old/drivers/media/platform/apple/ave
 Private capture comparisons must keep captured images outside the source tree
 and mask only addresses, session tokens, clocks and host bookkeeping fields.
 
-With debugfs mounted, ``apple-ave/last_start_h264``,
+With debugfs mounted, ``apple-ave-<dev>/last_start_h264``,
 ``last_start_hevc``, ``last_process0_h264`` and ``last_process0_hevc`` hold the
 last Start command built and the first Process command of the last session,
 for comparison with reference captures.

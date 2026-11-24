@@ -206,13 +206,20 @@ int sep_sensor_irq_wait(unsigned int timeout_ms);
 #define SEP_DIAG_PNON_FAILED		3
 #define SEP_DIAG_PNON_DIGEST_LEN	48
 
+/* Mirrored by diag.rs (Offer): endpoints checked at bring-up, sent nothing. */
+#define SEP_DIAG_OFFER_PENDING		0
+#define SEP_DIAG_OFFER_IDLE		1
+#define SEP_DIAG_OFFER_ABSENT		2
+#define SEP_DIAG_EP_SSE			0x0c
+#define SEP_DIAG_EP_HIBE		0x14
+#define SEP_DIAG_EP_SKDL		0x17
+
 struct device;
 
 int sep_diag_register(struct device *dev, const char *profile,
 		      size_t profile_len, bool cold, bool sepos13, bool xart);
-void sep_diag_set_policy(bool provision_keybag, bool trusted_keys,
-			 bool filevault_api, bool xarm_trace, bool refkey_v2,
-			 bool identity_override);
+void sep_diag_set_policy(bool trusted_keys, bool filevault_api,
+			 bool xarm_trace, bool refkey_v2, bool identity_override);
 void sep_diag_set_identity_source(unsigned int source);
 void sep_diag_set_attach(bool attached);
 void sep_diag_set_endpoints(unsigned int count);
@@ -234,6 +241,8 @@ void sep_diag_set_os_identity(int source);
 void sep_diag_set_hwrng(bool registered);
 void sep_diag_set_stac(int state);
 void sep_diag_set_pnon(int state, const u8 *digest, size_t len);
+void sep_diag_set_offer(u8 endpoint, int state);
+unsigned int sep_diag_sse_event(void);
 unsigned int sep_diag_xarm_failed(void);
 unsigned int sep_diag_unhandled(void);
 void sep_diag_sleep(bool entering);
@@ -299,7 +308,7 @@ void sep_tk_set_blob_len(struct trusted_key_payload *p, unsigned int n);
 bool sep_keystore_only(void);
 bool sep_keystore_user_bags(void);
 int sep_complete_attach_register(struct device *dev, void *ctx,
-                                int (*complete)(void *ctx));
+				int (*complete)(void *ctx));
 void sep_complete_attach_unregister(struct device *dev);
 void sep_diag_keystore_ended(void);
 void sep_diag_set_xart(bool writable);

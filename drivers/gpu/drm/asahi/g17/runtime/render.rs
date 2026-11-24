@@ -232,18 +232,86 @@ impl RenderState {
 }
 
 impl Registry {
-    /// Yield unused warming only when admission has run out of physical slots.
-    /// Previously published graphs keep their existing ownership and retirement
-    /// rules. The caller destroys returned backing after dropping the device lock.
+    /// Whether at least one unused render entry holds unpublished QIDs that
+    /// [`Self::reclaim_unused_render_spare`] can cancel for compute.
+    pub(super) fn has_cancelable_render_spare(&self) -> Result<bool> {
+        for slot in 1..RENDER_SLOTS {
+            let Some(entry) = self.render.entries[slot].as_ref() else {
+                continue;
+            };
+            if entry.constructing
+                || entry.preparing.is_some()
+                || entry.growing
+                || entry.pending_error.is_some()
+                || entry.pending_timeout
+            {
+                continue;
+            }
+            if !entry
+                .reservation
+                .ids
+                .iter()
+                .all(|id| self.qids.can_cancel_unpublished(*id))
+            {
+                continue;
+            }
+            let expected = if let Some(pair) = entry.pair.as_ref() {
+                if pair.can_yield_unused()? {
+                    Some(entry.reservation.owner)
+                } else {
+                    continue;
+                }
+            } else if entry.context.is_none() {
+                None
+            } else {
+                continue;
+            };
+            if self
+                .admission
+                .can_reassign_unused_spare(slot as u8, expected, None)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Yield unused warming or idle drained published siblings when admission
+    /// has run out of physical slots. Compute only cancels unpublished
+    /// identities; render can also detach an idle drained published sibling so
+    /// a new owner reuses its installed QIDs via `bind_owner()`. The caller
+    /// destroys returned backing after dropping the device lock.
     pub(super) fn reclaim_unused_render_spare(
         &mut self,
         owner: Option<u64>,
         require_ids: bool,
     ) -> Result<Option<UnusedRenderSpare>> {
-        // Prefer an empty reservation or an already parked channel.
-        for with_backing in [false, true] {
+        if owner.is_some_and(|owner| owner == 0 || self.admission.owns_live_slot(owner)) {
+            return Ok(None);
+        }
+        // Prefer an empty reservation or an already parked channel, then a
+        // reusable or warmed unpublished pair, then an idle drained published
+        // sibling (render only).
+        for pass in 0..3u8 {
+            if pass == 2 && owner.is_none() {
+                break;
+            }
+            let with_backing = pass != 0;
             for slot in 1..RENDER_SLOTS {
+                if with_backing
+                    && self.render.entries[slot].as_ref().is_some_and(|entry| {
+                        entry.pair.is_some()
+                            && !entry.constructing
+                            && entry.preparing.is_none()
+                            && !entry.growing
+                            && entry.pending_error.is_none()
+                            && !entry.pending_timeout
+                    })
+                {
+                    self.render.collect_retired(slot)?;
+                }
                 let mut warm = false;
+                let mut detach = false;
                 let expected = if let Some(entry) = self.render.entries[slot].as_ref() {
                     if entry.constructing
                         || entry.preparing.is_some()
@@ -269,10 +337,17 @@ impl Registry {
                         if !with_backing {
                             continue;
                         }
-                        if owner.is_some() && pair.reusable()? {
-                            None
-                        } else if pair.can_yield_unused()? {
-                            warm = true;
+                        if pass == 1 {
+                            if owner.is_some() && pair.reusable()? {
+                                None
+                            } else if pair.can_yield_unused()? {
+                                warm = true;
+                                Some(entry.reservation.owner)
+                            } else {
+                                continue;
+                            }
+                        } else if pair.detachable()? && !self.teardown.releasing(pair.context()) {
+                            detach = true;
                             Some(entry.reservation.owner)
                         } else {
                             continue;
@@ -289,10 +364,14 @@ impl Registry {
                     }
                     None
                 };
-                if !self
-                    .admission
-                    .reassign_unused_spare(slot as u8, expected, owner)
-                {
+                let claimed = if detach {
+                    self.admission
+                        .release_unused_sibling(slot as u8, expected, true)
+                } else {
+                    self.admission
+                        .reassign_unused_spare(slot as u8, expected, owner)
+                };
+                if !claimed {
                     continue;
                 }
                 if owner.is_none() {
@@ -322,6 +401,161 @@ impl Registry {
                     entry.context = None;
                     entry.pool = None;
                     binding = Some(retired);
+                } else if detach {
+                    let entry = self.render.entries[slot].as_mut().ok_or(EIO)?;
+                    entry.pair.as_mut().ok_or(EIO)?.release_owner();
+                    self.hold_render_slot(slot);
+                }
+                return Ok(Some(UnusedRenderSpare {
+                    _entry: None,
+                    _binding: binding,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Slots whose live-sibling claim can be dropped under admission's lock
+    /// without modifying `render.entries` or dropping backing off-lock:
+    /// `(reclaimable_mask, installed_mask)`.
+    pub(super) fn reclaimable_render_slots(&self) -> Result<(u64, u64)> {
+        let mut reclaimable = 0u64;
+        let mut installed = 0u64;
+        for slot in 1..RENDER_SLOTS {
+            let bit = 1u64 << slot;
+            let Some(entry) = self.render.entries[slot].as_ref() else {
+                reclaimable |= bit;
+                continue;
+            };
+            if entry.constructing
+                || entry.preparing.is_some()
+                || entry.growing
+                || entry.pending_error.is_some()
+                || entry.pending_timeout
+            {
+                continue;
+            }
+            if let Some(pair) = entry.pair.as_ref() {
+                if pair.reusable()? {
+                    reclaimable |= bit;
+                    installed |= bit;
+                }
+            } else if entry.parked.is_some() && entry.context.is_none() {
+                reclaimable |= bit;
+                installed |= bit;
+            }
+        }
+        Ok((reclaimable, installed))
+    }
+
+    /// Reclaim one idle live sibling (unbuilt, parked, reusable, warmed
+    /// unpublished, or idle drained published) so a new logical queue can take
+    /// its first pair. Published siblings keep their installed QIDs and detach
+    /// only that slot's owner so the next queue reuses them via `bind_owner()`.
+    /// The caller destroys any returned backing after dropping the device lock.
+    pub(super) fn reclaim_unused_render_sibling(&mut self) -> Result<Option<UnusedRenderSpare>> {
+        for pass in 0..3u8 {
+            let with_backing = pass != 0;
+            for slot in 1..RENDER_SLOTS {
+                if with_backing
+                    && self.render.entries[slot].as_ref().is_some_and(|entry| {
+                        entry.pair.is_some()
+                            && !entry.constructing
+                            && entry.preparing.is_none()
+                            && !entry.growing
+                            && entry.pending_error.is_none()
+                            && !entry.pending_timeout
+                    })
+                {
+                    self.render.collect_retired(slot)?;
+                }
+                let mut warm = false;
+                let mut detach = false;
+                let mut keep_installed = false;
+                let expected = if let Some(entry) = self.render.entries[slot].as_ref() {
+                    if entry.constructing
+                        || entry.preparing.is_some()
+                        || entry.growing
+                        || entry.pending_error.is_some()
+                        || entry.pending_timeout
+                    {
+                        continue;
+                    }
+                    let cancelable = entry
+                        .reservation
+                        .ids
+                        .iter()
+                        .all(|id| self.qids.can_cancel_unpublished(*id));
+                    keep_installed = !cancelable;
+                    if let Some(pair) = entry.pair.as_ref() {
+                        if !with_backing {
+                            continue;
+                        }
+                        if pass == 1 {
+                            if pair.reusable()? {
+                                None
+                            } else if pair.can_yield_unused()? {
+                                warm = true;
+                                Some(entry.reservation.owner)
+                            } else {
+                                continue;
+                            }
+                        } else if pair.detachable()? && !self.teardown.releasing(pair.context()) {
+                            detach = true;
+                            keep_installed = true;
+                            Some(entry.reservation.owner)
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        if with_backing || entry.context.is_some() {
+                            continue;
+                        }
+                        None
+                    }
+                } else {
+                    if with_backing {
+                        continue;
+                    }
+                    None
+                };
+                if !self
+                    .admission
+                    .release_unused_sibling(slot as u8, expected, keep_installed)
+                {
+                    continue;
+                }
+                if !keep_installed {
+                    let entry = self.render.entries[slot].take();
+                    if let Some(entry) = entry.as_ref() {
+                        for id in entry.reservation.ids {
+                            self.qids.cancel_unpublished(id)?;
+                        }
+                        if let Some(pair) = entry.pair.as_ref() {
+                            self.buffers.unreserve_owner(pair.buffer_id())?;
+                        }
+                        self.note_build_room();
+                    }
+                    return Ok(Some(UnusedRenderSpare {
+                        _entry: entry,
+                        _binding: None,
+                    }));
+                }
+                let mut binding = None;
+                if warm {
+                    let entry = self.render.entries[slot].as_mut().ok_or(EIO)?;
+                    let mut pair = entry.pair.take().ok_or(EIO)?;
+                    self.buffers.unreserve_owner(pair.buffer_id())?;
+                    pair.release_owner();
+                    let (parked, retired) = KBox::into_inner(pair).park();
+                    entry.parked = Some(parked);
+                    entry.context = None;
+                    entry.pool = None;
+                    binding = Some(retired);
+                } else if detach {
+                    let entry = self.render.entries[slot].as_mut().ok_or(EIO)?;
+                    entry.pair.as_mut().ok_or(EIO)?.release_owner();
+                    self.hold_render_slot(slot);
                 }
                 return Ok(Some(UnusedRenderSpare {
                     _entry: None,
@@ -364,7 +598,20 @@ impl Registry {
 
     /// Tell admission whether another render pair can still be built.
     pub(super) fn note_build_room(&self) {
-        self.admission.note_build_room(self.qids.render_pair_fits());
+        self.admission.note_build_room(
+            self.qids.render_pair_fits(),
+            self.qids.render_pair_capacity(),
+        );
+    }
+
+    #[cfg(CONFIG_KUNIT = "y")]
+    pub(super) fn publish_render_ids(&mut self, slot: u8) -> Result {
+        let ids = self.render.entry(slot)?.reservation.ids;
+        for id in ids {
+            self.qids.publish(id)?;
+        }
+        self.admission.note_published(slot);
+        Ok(())
     }
 
     pub(super) fn ensure_render_ids(&mut self, slot: u8, owner: u64) -> Result {
@@ -503,7 +750,10 @@ impl Registry {
         error: Error,
         deferred: &mut DeferredBatch,
     ) -> Result {
-        for entry in self.render.entries.iter_mut().flatten() {
+        for (slot, entry) in self.render.entries.iter_mut().enumerate() {
+            let Some(entry) = entry.as_mut() else {
+                continue;
+            };
             if !entry
                 .context
                 .as_ref()
@@ -513,12 +763,67 @@ impl Registry {
             }
             if let Some(pair) = entry.pair.as_mut() {
                 pair.quarantine(error, &mut |event| deferred.push(event))?;
+                // An idle pair has no lease to carry the quarantine into admission.
+                self.admission.set_held(slot, render_hold(&self.teardown, pair));
             } else if entry.preparing.is_some() || entry.growing {
                 entry.pending_error = Some((status.clone(), error));
             }
         }
         Ok(())
     }
+
+    /// Under the device mutex: sets the admission hold of `slot` from its entry
+    /// ([`render_hold`]). A pair lent out keeps its bit until it is put back, which calls this
+    /// again, but is held at once if the release of its context is armed meanwhile (its owner
+    /// closed during a growth, which takes no lease). A slot without an installed pair (none
+    /// yet, parked, or no entry) is not held.
+    pub(super) fn hold_render_slot(&self, slot: usize) {
+        if let Some(held) = self.render_slot_held(slot) {
+            self.admission.set_held(slot, held);
+        }
+    }
+
+    /// [`Self::hold_render_slot`] for every slot: where a scheduler release is armed (an owner
+    /// closes or a rebind displaces a context), where consumed releases park their pairs, and
+    /// on each housekeeping pass.
+    pub(super) fn sync_render_holds(&self) {
+        let (mut slots, mut held) = (0u64, 0u64);
+        for slot in 1..RENDER_SLOTS {
+            if let Some(hold) = self.render_slot_held(slot) {
+                slots |= 1u64 << slot;
+                held |= u64::from(hold) << slot;
+            }
+        }
+        self.admission.sync_held(slots, held);
+    }
+
+    /// The hold of `slot`, or None to keep it while its pair is lent out.
+    fn render_slot_held(&self, slot: usize) -> Option<bool> {
+        let Some(entry) = self.render.entries.get(slot).and_then(Option::as_ref) else {
+            return Some(false);
+        };
+        match entry.pair.as_ref() {
+            Some(pair) => Some(render_hold(&self.teardown, pair)),
+            None if entry.preparing.is_some() || entry.growing => entry
+                .context
+                .as_ref()
+                .is_some_and(|context| self.teardown.releasing(context))
+                .then_some(true),
+            None => Some(false),
+        }
+    }
+}
+
+/// Whether admission gives the slot of `pair` to no owner but its own open one
+/// ([`crate::g17::queue::admission::Pool::set_held`]). Another owner can bind the pair only
+/// when it keeps no work nobody else can bind past ([`Pair::unreusable_work`]) and the scheduler
+/// release of the context it is bound to is not pending: from its owner's close until the
+/// firmware consumed that release and the teardown parked the pair, `build_render_pair` and
+/// `rebind_pair` refuse every other owner (`teardown::Pending::releasing`). A closed context
+/// waiting for its compute, its pools or its kill stays there for as long, and every client
+/// given such a slot waited out its publication bound and lost its device.
+fn render_hold(teardown: &crate::g17::teardown::Pending, pair: &Pair) -> bool {
+    pair.unreusable_work() || teardown.releasing(pair.context())
 }
 
 struct Host<'a> {
@@ -823,6 +1128,9 @@ impl crate::g17::Firmware {
         let result = operation(&mut pair, &mut host);
         host.release_registration();
         self.queues.render.entries[slot].as_mut().ok_or(EIO)?.pair = Some(pair);
+        // Still under the device mutex: the retirements this pass deferred drop their leases
+        // only after it is released, so another owner never sees the slot free in between.
+        self.queues.hold_render_slot(slot);
         result
     }
 
@@ -1125,9 +1433,9 @@ impl Registry {
 
     /// Gives back the USC backing of render pools whose client VM pressure
     /// reclaim evicted (an idle VM) and whose final free-list release was
-    /// consumed. The vacated backings go to the worker's deferred batch, which
-    /// frees them after the device mutex; a later job of that client re-arms
-    /// the pool first.
+    /// consumed, and of the pools that kept graphs still hold. The vacated
+    /// backings go to the worker's deferred batch, which frees them after the
+    /// device mutex; a later job of an evicted client re-arms its pool first.
     pub(in crate::g17) fn vacate_evicted_render_pools(
         &mut self,
         init: &crate::g17::initdata::InitData,
@@ -1146,6 +1454,20 @@ impl Registry {
                 continue;
             };
             if pool.vacant() || !render.pools.idle(pool.id()) || !pool.client_evicted() {
+                continue;
+            }
+            if let Some(backing) = pool.vacate() {
+                deferred.defer_render_backing(backing);
+            }
+        }
+        // A kept graph's pool is never staged again; its pages go back once
+        // its final free-list release is consumed.
+        for graph in render.kept_graphs.iter() {
+            if !deferred.render_backing_room() {
+                break;
+            }
+            let pool = graph.pool();
+            if pool.vacant() || !render.pools.released(u32::from(pool.id()), pool.control_va()) {
                 continue;
             }
             if let Some(backing) = pool.vacate() {
@@ -1271,6 +1593,7 @@ impl Registry {
         &self,
         packet: &Arc<Packet>,
         renewals: u8,
+        excuse: crate::g17::timeout::Excuse,
     ) -> Option<crate::g17::timeout::Verdict> {
         let own = self
             .render
@@ -1291,6 +1614,7 @@ impl Registry {
             crate::g17::timeout::attribute(
                 own,
                 renewals,
+                excuse,
                 Iterator::chain(self.render_timeout_heads(), computes),
             )
         })
@@ -1302,7 +1626,18 @@ impl RenderState {
         writeln!(f, "retired_render_bindings used={} total={}", self.retired.len(), self.retired.capacity())?;
         writeln!(f, "firmware_linked_render_graphs kept={} leaked={}", self.kept_graphs.len(),
                  teardown::LEAKED_GRAPHS.load(core::sync::atomic::Ordering::Relaxed))?;
+        let unsettled = self.entries.iter().flatten()
+            .filter_map(|entry| entry.pair.as_ref())
+            .filter(|pair| pair.drain_failures() != 0)
+            .count();
+        writeln!(f, "drained_render_pairs unsettled={} failures={} recovered={} out_of_service={}", unsettled,
+                 settle::SETTLE_FAILURES.load(core::sync::atomic::Ordering::Relaxed),
+                 settle::SETTLE_RECOVERED.load(core::sync::atomic::Ordering::Relaxed),
+                 settle::SETTLE_PARKED.load(core::sync::atomic::Ordering::Relaxed))?;
         self.pools.write_capacity(f)?;
+        for pair in self.entries.iter().flatten().filter_map(|entry| entry.pair.as_ref()) {
+            pair.write_hold(f)?;
+        }
         for (slot, entry) in self.entries.iter().enumerate() {
             if let Some(context) = entry.as_ref().and_then(|entry| entry.context.as_ref()) {
                 context.write_capacity(f, "render", slot)?;
@@ -1313,6 +1648,18 @@ impl RenderState {
 }
 
 impl Registry {
+    /// The kick-ring views of one parked pair whose VM's client has closed it
+    /// (`ParkedPair::take_closed_views`), for the caller to drop off the device lock; `None`
+    /// once no parked pair holds any.
+    pub(in crate::g17) fn take_closed_parked_views(
+        &mut self,
+    ) -> Option<[Option<crate::mmu::KernelMapping>; 2]> {
+        self.render.entries.iter_mut().flatten().find_map(|entry| {
+            let views = entry.parked.as_mut()?.take_closed_views();
+            views.iter().any(Option::is_some).then_some(views)
+        })
+    }
+
     /// Give idle private backing to another ready client under capacity pressure.
     /// Keep graph/QID/context ownership; the next use rearms the same pool after
     /// its consumed release, exactly as eviction-driven reclaim does.

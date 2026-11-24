@@ -16,7 +16,7 @@ use super::{
 use crate::{
     driver::AsahiDrmDevice,
     file,
-    hw::t8140::{dynamic, resources as cfg},
+    hw::t8140::resources as cfg,
     mmu,
 };
 use core::sync::atomic::{
@@ -175,6 +175,15 @@ impl Destinations {
         self.stamps.iter().any(Option::is_some)
     }
 
+    #[cfg(CONFIG_KUNIT = "y")]
+    pub(super) fn empty() -> Self {
+        Self {
+            stamps: core::array::from_fn(|_| None),
+            render: false,
+            handed: AtomicBool::new(false),
+        }
+    }
+
     fn iter(&self) -> core::slice::Iter<'_, Option<Destination>> {
         self.stamps.iter()
     }
@@ -211,24 +220,75 @@ impl Output {
     }
 }
 
-enum HostOutput {
+enum HostOutputKind {
     Immediate(Output),
     Ordered(Arc<Publication>),
 }
 
+pub(super) struct HostOutput(HostOutputKind);
+
 impl HostOutput {
-    fn output(&self) -> &Output {
-        match self {
-            Self::Immediate(output) => output,
-            Self::Ordered(publication) => publication.output(),
+    /// Both render and compute commands use an ordered [`Publication`] when
+    /// they write host timestamps or inherit ordered host predecessors:
+    /// timestamp-writing compute must expose a [`Publication`] so overlapping
+    /// cross-engine consumers can chain behind it, and compute consumers with
+    /// host predecessors must chain behind theirs. When `host_predecessors` is
+    /// false, activation clears the sentinel immediately so `finish()`
+    /// publishes synchronously with no extra delay.
+    fn new(
+        output: Output,
+        status: Arc<VmStatus>,
+        host_predecessors: bool,
+        has_outputs: bool,
+    ) -> Result<Self> {
+        if host_predecessors || has_outputs {
+            Ok(Self(HostOutputKind::Ordered(Publication::new(
+                output, status,
+            )?)))
+        } else {
+            Ok(Self(HostOutputKind::Immediate(output)))
         }
     }
 
-    fn finish(&self, result: Result<[u64; 4]>) {
-        match self {
-            Self::Immediate(output) => output.publish(result),
-            Self::Ordered(publication) => publication.finish(result),
+    fn output(&self) -> &Output {
+        match &self.0 {
+            HostOutputKind::Immediate(output) => output,
+            HostOutputKind::Ordered(publication) => publication.output(),
         }
+    }
+
+    pub(super) fn publication(&self) -> Option<Arc<Publication>> {
+        match &self.0 {
+            HostOutputKind::Ordered(publication) => Some(publication.clone()),
+            HostOutputKind::Immediate(_) => None,
+        }
+    }
+
+    pub(super) fn finish(&self, result: Result<[u64; 4]>) {
+        match &self.0 {
+            HostOutputKind::Immediate(output) => output.publish(result),
+            HostOutputKind::Ordered(publication) => publication.finish(result),
+        }
+    }
+
+    #[cfg(CONFIG_KUNIT = "y")]
+    pub(super) fn test_pair(
+        contexts: &FenceContexts,
+        status: &Arc<VmStatus>,
+        host_predecessors: bool,
+        has_outputs: bool,
+    ) -> Result<(Self, Fence)> {
+        let fence = fence::independent(contexts)?;
+        let handle = Fence::from_fence(&fence);
+        let output = Output {
+            fence,
+            member: fence::Aggregate::test_member(contexts)?,
+            destinations: Destinations::empty(),
+        };
+        Ok((
+            Self::new(output, status.clone(), host_predecessors, has_outputs)?,
+            handle,
+        ))
     }
 }
 
@@ -247,7 +307,7 @@ impl ComputeTimestamps {
             vm,
             // Canonical shared queue aliases may be installed in this VM later.
             // Private timestamp pages must never occupy their retained addresses.
-            dynamic::CLIENT_LOWER,
+            vm.client_private_range(),
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
@@ -370,7 +430,7 @@ impl M5ComputeTimestamps {
 pub(crate) struct Completion {
     status: Arc<VmStatus>,
     output: HostOutput,
-    // Present only when this command's public result may wait for a render
+    // Present only when this command's public result may wait for a
     // predecessor's host writes. DRM credits must follow the terminal result.
     terminal: Option<UserFence<CompletionFence>>,
     compute: Option<PooledTimestamps>,
@@ -380,7 +440,10 @@ pub(crate) struct Completion {
     /// `compute` alone does not identify the engine.
     is_compute: bool,
     feed: Option<Arc<super::feed::Feed>>,
-    usage: Arc<crate::usage::Client>,
+    /// The command's execution context, whose busy run its execution extends
+    /// ([`super::feed::Feed::note_work`]).
+    context_id: u32,
+    usage: Arc<crate::usage::Lane<Arc<crate::usage::Client>>>,
     sources: Option<Arc<super::sync_input::Sources>>,
     #[pin]
     vm_job: Mutex<Option<mmu::VmJobGuard>>,
@@ -418,10 +481,10 @@ impl Completion {
         host_predecessors: bool,
         feed: Option<Arc<super::feed::Feed>>,
         sources: Option<Arc<super::sync_input::Sources>>,
-        usage: Arc<crate::usage::Client>,
+        usage: Arc<crate::usage::Lane<Arc<crate::usage::Client>>>,
     ) -> Result<Arc<Self>> {
         let fence = fence::independent(contexts)?;
-        let ordered = !compute && (host_predecessors || destinations.iter().any(Option::is_some));
+        let has_outputs = destinations.has_outputs();
         let terminal = if host_predecessors {
             Some(fence::independent(contexts)?)
         } else {
@@ -432,11 +495,12 @@ impl Completion {
             member,
             destinations,
         };
-        let output = if ordered {
-            HostOutput::Ordered(Publication::new(output, context.status().clone())?)
-        } else {
-            HostOutput::Immediate(output)
-        };
+        let output = HostOutput::new(
+            output,
+            context.status().clone(),
+            host_predecessors,
+            has_outputs,
+        )?;
         // M5 compute binds its timestamp pair in its physical queue's page at publication.
         let is_compute = compute;
         let compute = if compute && !context.is_m5() {
@@ -453,6 +517,7 @@ impl Completion {
                 m5_compute <- new_mutex!(None, "M5 queue timestamps"),
                 is_compute,
                 feed,
+                context_id: context.id(),
                 usage,
                 sources,
                 vm_job <- new_mutex!(Some(vm_job), "G17 command VM pin"),
@@ -481,10 +546,7 @@ impl Completion {
             .map_or_else(|| self.fence(), |fence| Fence::from_fence(fence))
     }
     pub(crate) fn publication(&self) -> Option<Arc<Publication>> {
-        match &self.output {
-            HostOutput::Ordered(publication) => Some(publication.clone()),
-            HostOutput::Immediate(_) => None,
-        }
+        self.output.publication()
     }
     fn signal_terminal(&self, result: Result<[u64; 4]>) {
         if let Some(fence) = &self.terminal {
@@ -733,7 +795,7 @@ impl Completion {
 
     /// A non-poisoning ECANCELED or ENODATA (work a recovery discarded or dropped) stays out of
     /// the VM status, as the UAPI documents for work another VM's recovery discarded:
-    /// Honeykrisp reads any status error as a lost device. Every other failure reaches the client.
+    /// Borealis reads any status error as a lost device. Every other failure reaches the client.
     fn report(&self, error: Error) {
         if self.poisons(error) {
             self.status.record(error);
@@ -858,9 +920,13 @@ impl Completion {
             if self.is_compute {
                 if let Some([start, end]) = compute {
                     feed.note_pass(start, end);
+                    feed.note_work(self.context_id, start, end);
                 }
             } else {
                 feed.note_pass(ticks[2], ticks[3]);
+                // The whole render, from the first of its two halves that ran to the last.
+                let start = [ticks[0], ticks[2]].into_iter().filter(|&tick| tick != 0).min();
+                feed.note_work(self.context_id, start.unwrap_or(0), ticks[1].max(ticks[3]));
             }
         }
         if let Err(error) = result {

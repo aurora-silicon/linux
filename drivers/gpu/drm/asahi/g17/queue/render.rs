@@ -186,6 +186,16 @@ pub(crate) enum Registration {
     M5(crate::g17::fw::m5::queue::HardwareSubmission),
 }
 
+/// A tiler heap growth the host makes before publishing a render, to this many blocks.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum HostGrowth {
+    /// The pair is idle: the page list and the PB descriptor are rebuilt.
+    Idle(usize),
+    /// The pair has work in flight: blocks are only appended to the inventory,
+    /// as for a firmware grow request.
+    Busy(usize),
+}
+
 /// Installed kick backing remains owned even when this pair has no logical
 /// owner. Commands retain their exact descriptor and allocation generations.
 pub(crate) struct Pair {
@@ -196,6 +206,11 @@ pub(crate) struct Pair {
     /// acknowledgement: the pair keeps its owner and graph until then.
     channel_error: bool,
     kick_aliases: Option<[Option<mmu::KernelMapping>; 2]>,
+    /// The read-only views of the two kick rings in the VM of the pair's contexts, installed with
+    /// its first graph in that VM. They belong to the pair's time in that VM, not to the VM: they
+    /// go before the pair runs a context of another VM, so its previous owner cannot read the
+    /// new owner's kick entries. Dropped before `kicks`.
+    client_kicks: [Option<mmu::KernelMapping>; 2],
     memory: KBox<memory::Memory>,
     kicks: [kick::Queue; 2],
     free_list: Arc<RenderPool>,
@@ -255,7 +270,34 @@ pub(crate) struct Pair {
     configured_context: Option<u32>,
     /// QoS slot named by those configurations.
     configured_qos: Option<u8>,
+    /// Failed attempts to settle this pair after the firmware drained it, and when the next
+    /// attempt is due (host ns); see [`Pair::note_drain_failure`].
+    drain_failures: u32,
+    drain_retry_at: u64,
 }
+
+/// First delay after a failed settlement of a drained pair; each further failure doubles it up
+/// to [`DRAIN_RETRY_MAX_NS`].
+const DRAIN_RETRY_MIN_NS: u64 = 1_000_000;
+const DRAIN_RETRY_MAX_NS: u64 = 1_000_000_000;
+/// After this many failed attempts (about 7 s) the pair is left out of service: its clients
+/// already failed with the quarantine, and it is re-checked only every
+/// [`DRAIN_PARKED_RETRY_NS`], silently.
+pub(crate) const DRAIN_RETRY_LIMIT: u32 = 16;
+const DRAIN_PARKED_RETRY_NS: u64 = 10_000_000_000;
+
+/// The wait after the `failures`th consecutive failed settlement of a drained pair.
+pub(crate) fn drain_retry_delay(failures: u32) -> u64 {
+    if failures >= DRAIN_RETRY_LIMIT {
+        DRAIN_PARKED_RETRY_NS
+    } else {
+        DRAIN_RETRY_MIN_NS
+            .checked_shl(failures.saturating_sub(1))
+            .unwrap_or(DRAIN_RETRY_MAX_NS)
+            .min(DRAIN_RETRY_MAX_NS)
+    }
+}
+
 impl Pair {
     #[inline(never)]
     #[expect(
@@ -326,6 +368,7 @@ impl Pair {
         storage.write_init(kernel::try_init!(Self {
             pool_pin,
             kick_aliases: Some([ta_alias, fragment_alias]),
+            client_kicks: [None, None],
             memory,
             kicks: [tiling, fragment],
             free_list,
@@ -363,6 +406,8 @@ impl Pair {
             configuration: None,
             configured_context: None,
             configured_qos: None,
+            drain_failures: 0,
+            drain_retry_at: 0,
             channel_error: false,
         }))
     }
@@ -573,6 +618,7 @@ impl Pair {
             },
             programs: self.variant.programs,
             ta_mode_1: self.variant.ta_mode_1,
+            clusters: self.clusters,
             deflake: deflake_layout,
         };
         self.memory.graph.claim(ordinal)?;
@@ -633,9 +679,61 @@ struct RenderBarriers {
     fragment_types: [u8; 5 + crate::g17::hazard::PUBLICATION_BARRIERS],
 }
 
-/// The last fragment kick published on any pair: on the J813 the next tiling kick waits for it
-/// (see [`Pair::publish`]).
-static J813_LAST_FRAGMENT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The last fragment kick published on any pair, and the last one of a render with an API task
+/// stage. The next tiling kick may wait for one of them ([`CrossPairOrder`]).
+static LAST_FRAGMENT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static LAST_TASK_FRAGMENT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Which earlier fragment kick, published on any pair, a render's tiling kick waits for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CrossPairOrder {
+    /// A render with an API task stage waits for the last fragment kick of such a render.
+    TaskAfterTask,
+    /// Every render waits for the last fragment kick of any render.
+    All,
+}
+
+/// A pair holding a task-stage group failed or was quarantined, or the firmware dropped its groups: no
+/// later task-stage render waits for the recorded fragment kick, which may not complete. The order
+/// only sequences tiling and carries no data, so dropping it is always safe; the next task-stage
+/// render may then overlap one still running elsewhere, once. Task-stage renders already published
+/// behind that kick stay ordered behind it in the firmware until it completes or their own
+/// watchdogs end them.
+fn release_task_order() {
+    LAST_TASK_FRAGMENT.store(0, core::sync::atomic::Ordering::Release);
+}
+
+/// Whether `packet` is a render with an API task stage.
+fn packet_uses_task(packet: &Packet) -> bool {
+    matches!(&packet.command, Validated::Render { resources: Some(programs), .. } if programs.uses_task())
+}
+
+impl CrossPairOrder {
+    /// On the J813 macOS 27.0's TA kick for render n names render n - 1's 3D kick (see
+    /// [`Pair::publish`]). Everywhere else a task-stage render's tiling kick waits for the
+    /// previous task-stage render's fragment kick, so that two clients' task-stage tiling
+    /// never runs at once.
+    fn of(j813: bool) -> Self {
+        if j813 { Self::All } else { Self::TaskAfterTask }
+    }
+
+    /// The fragment kick a tiling kick of a render with (`task`) or without an API task stage
+    /// waits for, if any.
+    fn source(self, task: bool) -> Option<&'static core::sync::atomic::AtomicU64> {
+        match self {
+            Self::All => Some(&LAST_FRAGMENT),
+            Self::TaskAfterTask => task.then_some(&LAST_TASK_FRAGMENT),
+        }
+    }
+
+    /// The dependency a tiling kick of the pair `qids` gets from the recorded fragment kick `last`:
+    /// none without one, nor, for the task-stage order, when it is the pair's own, because a pair's
+    /// tiling ring already runs its own kicks in order.
+    fn dependency(self, last: u64, qids: [u8; 2]) -> Option<KickDependency> {
+        let last = KickDependency::from_word(last).filter(|d| d.word() != 0 && d.qid() != qids[0])?;
+        (self != Self::TaskAfterTask || last.qid() != qids[1]).then_some(last)
+    }
+}
 
 fn render_barriers(
     fragment_stage: bool,
@@ -877,6 +975,8 @@ impl Pair {
         // The J813's (common 26A428) items carry configuration, descriptor and announcement in
         // one publication; macOS 27.0 never publishes a configuration alone there.
         let j813 = crate::g17::J813_FORMS.load(Ordering::Relaxed);
+        let host_only_render_kicks =
+            m5 && !j813 && self.board.is_some_and(|board| board.host_only_render_kicks);
         if m5 && !j813 && self.registered.is_none() {
             if self.installed == [true; 2] {
                 // The cold-install configuration pair must be consumed first.
@@ -933,11 +1033,12 @@ impl Pair {
         }
         let queues = qids.map(|qid| self.memory.graph.queue_va(qid));
         let Validated::Render {
-            pass, ray_query, ..
+            pass, ray_query, resources, ..
         } = &packet.command
         else {
             return Err(EINVAL);
         };
+        let task = resources.as_ref().is_some_and(|programs| programs.uses_task());
         let own_tiling = KickDependency::new(qids[0], kicks[0]).ok_or(EINVAL)?;
         let mut barriers =
             render_barriers(pass.fragment_barriers, pass.stage_prefixes, dependencies, own_tiling,
@@ -947,11 +1048,12 @@ impl Pair {
         // 3D kick (every such dependency in its captured queues). Without it a TA ran beside
         // another context's 3D, and that 3D fetched its own tile data (ISP parameter fetch,
         // requestor 0x9a) through the TA's VM slot, or slot 0, and faulted.
-        if j813 {
-            let last = KickDependency::from_word(
-                J813_LAST_FRAGMENT.load(core::sync::atomic::Ordering::Acquire),
-            )
-            .filter(|d| d.word() != 0 && d.qid() != qids[0]);
+        // Everywhere else renders with an API task stage are ordered the same way among
+        // themselves: eight clients' task-stage renders run at once started tiling, consumed
+        // their kicks and never ended, and none of them was ever stamped.
+        let order = CrossPairOrder::of(j813);
+        if let Some(source) = order.source(task) {
+            let last = order.dependency(source.load(core::sync::atomic::Ordering::Acquire), qids);
             if let Some(last) = last {
                 if barriers.tiling_count < barriers.tiling.len() {
                     barriers.tiling[barriers.tiling_count] = last;
@@ -1002,9 +1104,8 @@ impl Pair {
                 },
             },
             mcache,
-            // M5 tiling kicks also retain the last event of the mask, except on the J813, whose
-            // macOS 27.0 TA and 3D kicks name no event at all.
-            event_mask: if m5 && stage == 0 && !j813 {
+            // Common 26A428 and the host-only form use an empty tiling event mask.
+            event_mask: if m5 && stage == 0 && !j813 && !host_only_render_kicks {
                 [0, 0, 0, 1u64 << 62]
             } else {
                 abi::RENDER_KICK_EVENT_MASK
@@ -1061,6 +1162,16 @@ impl Pair {
         let tiling_kick = tiling_kick.prepare_entry(&ta_args)?;
         let fragment_kick = fragment_kick.prepare_entry(&fragment_args)?;
         let memory = &mut *self.memory;
+        // For a firmware that supports host-only kicks, an installed render
+        // pair with work in flight can use the host-port kick alone:
+        // another item-ring notification has no new configuration or lead
+        // command to publish. Keep the ordinary inner publication for the
+        // first command, a drained restart, a rebind, and a class change.
+        let sparse_inner = host_only_render_kicks
+            && self.active.front().is_some() && self.previous.is_none()
+            && self.registered == Some(policy.priority()) && !self.context_update
+            && !self.identity_update && !present.into_iter().any(|value| value)
+            && !leads.into_iter().any(|value| value);
         let lanes = [
             publication::Lane::new(
                 &memory.graph,
@@ -1071,6 +1182,7 @@ impl Pair {
                 present[0],
                 kicks[0],
                 leads[0],
+                sparse_inner,
             )?,
             publication::Lane::new(
                 &memory.graph,
@@ -1081,6 +1193,7 @@ impl Pair {
                 present[1],
                 kicks[1],
                 leads[1],
+                sparse_inner,
             )?,
         ];
         let windows = [lanes[0].window, lanes[1].window];
@@ -1235,7 +1348,10 @@ impl Pair {
         self.ordinal = next_ordinal;
         if let Some(fragment) = KickDependency::new(qids[1], kicks[1]) {
             packet.completion.note_render_publication(fragment);
-            J813_LAST_FRAGMENT.store(fragment.word(), core::sync::atomic::Ordering::Release);
+            LAST_FRAGMENT.store(fragment.word(), core::sync::atomic::Ordering::Release);
+            if task {
+                LAST_TASK_FRAGMENT.store(fragment.word(), core::sync::atomic::Ordering::Release);
+            }
         }
         self.cursors = windows.map(|window| window.target());
         for stage in 0..2 {
@@ -1301,6 +1417,7 @@ impl Pair {
                 true,
                 kicks[0],
                 false,
+                false,
             )?,
             publication::Lane::new(
                 &self.memory.graph,
@@ -1310,6 +1427,7 @@ impl Pair {
                 configs[1],
                 true,
                 kicks[1],
+                false,
                 false,
             )?,
         ];
@@ -1444,6 +1562,8 @@ impl Pair {
         })();
         if let Err(error) = publish {
             self.quarantined = true;
+            // The firmware may never run this kick, and its own watchdog will not end it.
+            self.release_task_order_if_held();
             self.active
                 .back()
                 .ok_or(EIO)?
@@ -1619,14 +1739,19 @@ impl Pair {
     /// started and never finished, which the error alone does not say. The first few groups of a
     /// boot report; the rest would repeat them.
     pub(crate) fn report_timeout(&self, stamps: [u32; 2], state: u32) {
+        /// Timeouts reported per boot: enough for every client of a parallel batch; the rest repeat them.
+        const REPORTS: u32 = 8;
         static REPORTED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-        if REPORTED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) >= 4 {
+        if REPORTED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) >= REPORTS {
             return;
         }
         let Some(front) = self.active.front() else {
             return;
         };
         let ordinal = front.ticket.ordinal;
+        // M5: tiling start and end, fragment start and end; which of them were written says
+        // which half of the render stopped.
+        let stages = self.memory.stage_timestamps(ordinal).unwrap_or_default();
         let Ok(snapshot) = observation::snapshot(&self.memory, ordinal) else {
             pr_warn!(
                 "G17: render timeout slot {} ordinal {}: its graph could not be read\n",
@@ -1636,7 +1761,7 @@ impl Pair {
             return;
         };
         pr_warn!(
-            "G17: render timeout slot {} ordinal {} qids {:?}: stamps [{:#x}, {:#x}], recovery state {}, pass [{:#x}, {:#x}], tiler {:?}, fragment {:?}, job list {}\n",
+            "G17: render timeout slot {} ordinal {} qids {:?}: stamps [{:#x}, {:#x}], recovery state {}, pass [{:#x}, {:#x}], stages [{:#x}, {:#x}, {:#x}, {:#x}], tiler {:?}, fragment {:?}, job list {}\n",
             self.slot,
             ordinal,
             self.qids(),
@@ -1645,6 +1770,10 @@ impl Pair {
             state,
             snapshot.pass[0],
             snapshot.pass[1],
+            stages[0],
+            stages[1],
+            stages[2],
+            stages[3],
             snapshot.cursors[0],
             snapshot.cursors[1],
             if snapshot.job_list_empty { "empty" } else { "not empty" }
@@ -1667,6 +1796,7 @@ impl Pair {
                 published: active.published,
                 finished: false,
                 failed: self.quarantined,
+                excused: active.packet.within_allowance(crate::g17::now_ns()),
             })
     }
 
@@ -1695,17 +1825,37 @@ impl Pair {
     pub(crate) fn oldest_packet(&self) -> Option<Arc<Packet>> {
         self.active.front().map(|active| active.packet.clone())
     }
-    /// Sample PM feedback only after this pair's exact retirement. Busy pairs
-    /// keep their current capacity and let firmware request growth as needed.
-    pub(crate) fn host_growth_target(&mut self, packet: &Packet) -> Result<Option<usize>> {
-        let required =
+    /// Sample PM feedback only after this pair's exact retirement. A busy pair
+    /// grows ahead of the render only by appending blocks to its inventory, as a
+    /// firmware grow request does (`buffer::Manager::busy_target`), and otherwise
+    /// keeps its current capacity and lets firmware request growth as needed.
+    pub(crate) fn host_growth_target(&mut self, packet: &Packet) -> Result<Option<HostGrowth>> {
+        let mut required =
             m5_render_submission::layout(&packet.command, self.clusters, self.variant.programs)?
                 .tvb_blocks;
-        self.memory
-            .manager
-            .note_required(required, crate::g17::now_ns());
+        // A mesh workgroup whose output is in flight when the tiler heap runs out loses part of
+        // it, whether the firmware then grows the heap or partial-renders, and the tile-count
+        // estimate does not see mesh output. Size the heap of a render with mesh shading ahead
+        // of it, to the size its automatic growth reaches after one such render.
+        if matches!(&packet.command, Validated::Render { pass, resources, .. }
+            if pass.mesh_output || resources.as_ref().is_some_and(|p| p.uses_mesh()))
+        {
+            if let Some(floor) = self.memory.manager.mesh_floor() {
+                required = required.max(floor);
+            }
+        }
+        let now = crate::g17::now_ns();
+        self.memory.manager.note_required(required, now);
         if self.in_flight() {
-            return Ok(None);
+            if self.quarantined {
+                return Ok(None);
+            }
+            let client = self.memory.context.vm().memory_client().cloned();
+            return Ok(self
+                .memory
+                .manager
+                .busy_target(required, now, client.as_ref())?
+                .map(HostGrowth::Busy));
         }
         if !self.idle_for_context(self.context())? {
             return Err(EBUSY);
@@ -1721,11 +1871,108 @@ impl Pair {
         // ERANGE: a 16384x16384 no-attachment render after smaller ones lost the device
         // (dEQP-GLES31.functional.fbo.no_attachments.maximums.*).
         let required = required.max(feedback).min(self.memory.manager.max_blocks());
-        Ok((required > self.memory.manager.blocks()).then_some(required))
+        Ok((required > self.memory.manager.blocks()).then_some(HostGrowth::Idle(required)))
     }
 
+    /// A quarantined pair, or a closed owner's pair that holds only groups whose stamps are
+    /// owed (`Active::stamps_owed`): those already reported to their clients, and nothing but
+    /// the stamps (or a kill of the context) releases their descriptors.
     pub(crate) fn needs_drain(&self) -> bool {
-        self.quarantined
+        self.quarantined || self.holds_only_owed_stamps()
+    }
+
+    fn holds_only_owed_stamps(&self) -> bool {
+        self.owner.is_none()
+            && self.prepared.is_none()
+            && self.active.len() != 0
+            && self.active.iter().all(|active| active.stamps_owed)
+    }
+
+    /// Work no other owner can bind this pair past: a quarantine, or a group whose stamps are
+    /// owed. Only the firmware draining the pair (the stamps, or a kill of its context) or a
+    /// processor stop ends either, so admission holds the slot from every other owner meanwhile.
+    pub(crate) fn unreusable_work(&self) -> bool {
+        self.quarantined || self.active.iter().any(|active| active.stamps_owed)
+    }
+
+    /// Whether a settlement attempt of this drained pair is due at `now`.
+    pub(crate) fn drain_due(&self, now: u64) -> bool {
+        now >= self.drain_retry_at
+    }
+
+    /// Host ns until the next settlement attempt, if one is waiting for its backoff.
+    pub(crate) fn drain_delay(&self, now: u64) -> Option<u64> {
+        (self.drain_failures != 0 && self.drain_retry_at > now).then(|| self.drain_retry_at - now)
+    }
+
+    /// Records a failed settlement at `now` and returns the number of consecutive failures.
+    /// The next attempt waits `DRAIN_RETRY_MIN_NS << (failures - 1)`, at most
+    /// `DRAIN_RETRY_MAX_NS`; from `DRAIN_RETRY_LIMIT` on, `DRAIN_PARKED_RETRY_NS`.
+    pub(crate) fn note_drain_failure(&mut self, now: u64) -> u32 {
+        self.drain_failures = self.drain_failures.saturating_add(1);
+        self.drain_retry_at = now.saturating_add(drain_retry_delay(self.drain_failures));
+        self.drain_failures
+    }
+
+    /// Consecutive failed settlements since the pair last settled.
+    pub(crate) fn drain_failures(&self) -> u32 {
+        self.drain_failures
+    }
+
+    /// One debugfs line for a pair that is quarantined or holds work: what keeps it.
+    pub(crate) fn write_hold(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
+        if !self.quarantined && self.active.len() == 0 && self.prepared.is_none() {
+            return Ok(());
+        }
+        writeln!(
+            f,
+            "render_pair slot={} context={} owner={} quarantined={} active={} owed={} prepared={} ordinal={} freelist={:?} unstamped={} killed={} kill_published={} drain_failures={}",
+            self.slot,
+            self.context().id(),
+            u8::from(self.owner.is_some()),
+            u8::from(self.quarantined),
+            self.active.len(),
+            self.active.iter().filter(|active| active.stamps_owed).count(),
+            u8::from(self.prepared.is_some()),
+            self.ordinal,
+            self.free_list.counters().ok(),
+            u8::from(self.executed_unstamped()),
+            u8::from(self.context_killed()),
+            u8::from(self.context().kill_published()),
+            self.drain_failures
+        )
+    }
+
+    /// Bounded state of a pair whose settlement failed, for the log.
+    pub(crate) fn report_drain(&self, host: &impl Host) {
+        let stamps = host.stamps(self.qids());
+        pr_warn!(
+            "G17: drained render slot={} qids={:?} owner={} quarantined={} active={} prepared={} stamps={:?} freelist={:?} killed={} unstamped={}\n",
+            self.slot,
+            self.qids(),
+            self.owner.is_some(),
+            self.quarantined,
+            self.active.len(),
+            self.prepared.is_some(),
+            stamps,
+            self.free_list.counters(),
+            self.context_killed(),
+            self.executed_unstamped()
+        );
+        for active in self.active.iter().take(4) {
+            pr_warn!(
+                "G17: drained render slot={} ordinal={} owned={} published={} flist={} qos={} failed={} stamps_owed={} drained={:?}\n",
+                self.slot,
+                active.ticket.ordinal,
+                self.memory.owns(active.ticket.ordinal),
+                active.outer_published,
+                active.flist_completed,
+                active.qos_completed,
+                active.failed,
+                active.stamps_owed,
+                active.drained_result.map(|result| result.err())
+            );
+        }
     }
 
     pub(crate) fn oldest_spared(&self) -> Option<bool> {
@@ -1820,6 +2067,13 @@ impl Pair {
             && Arc::ptr_eq(self.context(), context)
             && context.is_current())
     }
+    /// Releases the task-stage order ([`release_task_order`]) if this pair holds a task-stage group.
+    fn release_task_order_if_held(&self) {
+        if self.active.iter().any(|active| packet_uses_task(&active.packet)) {
+            release_task_order();
+        }
+    }
+
     /// Classification controls VM poisoning. Every failed render fence settles,
     /// while command memory remains owned until paired retirement or stop.
     pub(crate) fn quarantine(
@@ -1828,6 +2082,9 @@ impl Pair {
         defer: &mut impl FnMut(Deferred) -> Result,
     ) -> Result {
         self.quarantined = true;
+        // Its groups end here, without their own watchdogs: none of their fragment kicks may hold
+        // the task-stage order of other clients.
+        self.release_task_order_if_held();
         // Successors published after recovery can still fail behind its spared
         // head. Classify the whole failing group before any fence can settle.
         if self
@@ -1841,6 +2098,11 @@ impl Pair {
         }
         for active in self.active.iter_mut() {
             active.packet.completion.quarantine_render();
+            if active.stamps_owed {
+                // Already reported to its client: only its descriptor is still held.
+                active.failed = true;
+                continue;
+            }
             if !active.failed {
                 defer(Deferred::FailedOwned(
                     active.packet.completion.clone(),
@@ -2147,6 +2409,8 @@ impl Pair {
                 return Ok(false);
             }
         }
+        // The firmware dropped these groups: their fragment kicks may not complete as published.
+        self.release_task_order_if_held();
         if decision == Decision::Fail {
             return self.fail_dropped(host, defer);
         }
@@ -2419,8 +2683,11 @@ impl Pair {
     /// the firmware's job list, so neither the stamp proof nor the abandoned-group proof
     /// ever holds and the pair would stay quarantined, keeping its context, until the
     /// processors stop.
+    ///
+    /// A closed owner's pair that holds only groups whose stamps are owed counts too: they
+    /// ran and were reported, and only the stamps they never got hold their descriptors.
     fn executed_unstamped(&self) -> bool {
-        self.quarantined
+        (self.quarantined || self.holds_only_owed_stamps())
             // Only for a closed owner: a live owner would go on publishing into a context
             // whose work list still links the unstamped node.
             && self.owner.is_none()
@@ -2498,24 +2765,32 @@ impl Pair {
 
     /// Fresh proof after asynchronous control publication is the ownership
     /// boundary. A refused deferred item leaves the precise owner available.
+    /// Returns whether the proof held and released every group of the pair.
     pub(crate) fn release_witnessed(
         &mut self,
         host: &impl Host,
         defer: &mut impl FnMut(Deferred) -> Result,
-    ) -> Result {
+    ) -> Result<bool> {
         if self.active.iter().any(|a| !a.flist_completed) || !self.firmware_drained(host)? {
-            return Ok(());
+            return Ok(false);
         }
         while let Some(active) = self.active.front() {
-            let result = active.drained_result.ok_or(EIO)?;
-            defer(Deferred::Drained(active.packet.completion.clone(), result))?;
+            // A group retired on its pass record was reported then (`stamps_owed`): the pair-wide
+            // proof above covers its stamps too (or the kill of its context), so only its
+            // descriptor is released. It has no drained result of its own.
+            if !active.stamps_owed {
+                let result = active.drained_result.ok_or(EIO)?;
+                defer(Deferred::Drained(active.packet.completion.clone(), result))?;
+            }
             let ordinal = active.ticket.ordinal;
             self.memory.retire(ordinal)?;
             self.active.pop().ok_or(EIO)?;
         }
         self.quarantined = false;
+        self.drain_failures = 0;
+        self.drain_retry_at = 0;
         self.resync();
-        Ok(())
+        Ok(true)
     }
 
     /// The registry first polls the completed prefix through this exact Arc.
@@ -2532,6 +2807,7 @@ impl Pair {
         if !self.active.iter().any(|a| Arc::ptr_eq(&a.packet, packet)) {
             return Ok(false);
         }
+        self.release_task_order_if_held();
         // Groups the firmware dropped unexecuted are published again, with their successors.
         if self.replay_abandoned(host, defer, false)? {
             return Ok(true);
@@ -2666,10 +2942,13 @@ impl Pair {
             &mut self.memory,
             &mut self.pending_aliases,
             &mut self.kick_aliases,
+            &mut self.client_kicks,
         )
     }
 }
 
+/// Installs a graph's memory. The new kick ring views in `kick_aliases` go to `views`, the
+/// pair's views in the graph's VM ([`Pair::client_kicks`]).
 fn install_memory(
     alloc: &Allocator<'_>,
     descriptors: &crate::g17::object::KernelObject,
@@ -2677,6 +2956,7 @@ fn install_memory(
     memory: &mut memory::Memory,
     pending_aliases: &mut Option<KVec<mmu::KernelMapping>>,
     kick_aliases: &mut Option<[Option<mmu::KernelMapping>; 2]>,
+    views: &mut [Option<mmu::KernelMapping>; 2],
 ) -> Result {
     use core::sync::atomic::{fence, Ordering};
     if pending_aliases.is_none() && kick_aliases.is_none() {
@@ -2685,8 +2965,6 @@ fn install_memory(
     if !memory.context.is_current() || kick_aliases.is_none() {
         return Err(EIO);
     }
-    let mut driver = KVec::new();
-    driver.reserve(2, GFP_KERNEL)?;
     let aliases = memory.take_persistent(pending_aliases.as_mut().ok_or(EIO)?)?;
     let context = memory.context.clone();
     let vm = context.vm();
@@ -2715,10 +2993,11 @@ fn install_memory(
         }
         fence(Ordering::SeqCst);
         staged = Some(previous);
-        for mapping in kick_aliases.take().ok_or(EIO)?.into_iter().flatten() {
-            driver.push(mapping, GFP_KERNEL)?;
+        for (view, alias) in views.iter_mut().zip(kick_aliases.take().ok_or(EIO)?) {
+            if alias.is_some() {
+                *view = alias;
+            }
         }
-        vm.append_driver_mappings(driver)?;
         Ok(())
     })();
     if let Err(error) = result {
@@ -2760,6 +3039,10 @@ pub(crate) struct PreparedBinding {
 /// The registry retains displaced backing until this exact context's release
 /// is acknowledged. A warm binding retains the old context without its graph.
 pub(crate) struct RetiredBinding {
+    /// Views of the kick rings in `context`'s VM that a pair parked after the VM's client
+    /// closed it gave up (`Pair::park`). Only held: declared first, they drop before the
+    /// memory and the context below.
+    _client_kicks: [Option<mmu::KernelMapping>; 2],
     memory: Option<KBox<memory::Memory>>,
     context: Arc<Context>,
     pool: Arc<RenderPool>,
@@ -2800,6 +3083,9 @@ impl Pair {
                 previous.ready = true;
             }
         }
+    }
+    pub(crate) fn graph_started(&self) -> bool {
+        self.graph_started
     }
     pub(crate) fn forget_registration(&mut self) {
         self.registered = None;
@@ -2914,16 +3200,20 @@ impl Pair {
             .into_iter()
             .all(|c| c.done == c.read && c.read == c.write))
     }
-    pub(crate) fn reusable(&self) -> Result<bool> {
+    /// Idle, drained, and free of pending retirement or channel errors so a
+    /// live owner's sibling can be detached or a closed owner's pair reused.
+    pub(crate) fn detachable(&self) -> Result<bool> {
         let previous_ready = self
             .previous
             .as_ref()
             .is_none_or(|p| p.memory.is_none() && self.context_update && !p.ready);
         Ok(!self.channel_error
-            && self.owner.is_none()
             && self.displaced.is_none()
             && previous_ready
             && self.idle_for_context(self.context())?)
+    }
+    pub(crate) fn reusable(&self) -> Result<bool> {
+        Ok(self.owner.is_none() && self.detachable()?)
     }
     /// An M5 pool may be replaced without changing the pair's live logical
     /// owner. Commands already using the pair must drain, and an earlier
@@ -2999,10 +3289,25 @@ impl Pair {
             let pm_generation = pm_generation.ok_or(EINVAL)?;
             let layout =
                 m5_render_submission::layout(&first.command, self.clusters, self.variant.programs)?;
+            // A context of another VM gets the rings cleared before its VM is given its view,
+            // so it cannot read the entries earlier owners' commands left, as for a parked pair.
+            // The pair is bindable, hence idle: the firmware consumed every entry.
+            let other_vm = self.context().vm().id() != context.vm().id();
+            if other_vm {
+                for kick in &mut self.kicks {
+                    kick.clear_render_ring()?;
+                }
+            }
             let aliases = [
                 self.kicks[0].prepare_client_alias(context.vm())?,
                 self.kicks[1].prepare_client_alias(context.vm())?,
             ];
+            // A view the VM already has is the one this pair holds for it.
+            for (alias, view) in aliases.iter().zip(&self.client_kicks) {
+                if alias.is_none() && (other_vm || view.is_none()) {
+                    return Err(EFAULT);
+                }
+            }
             let (memory, persistent) = memory::Memory::new(
                 alloc,
                 pool,
@@ -3059,6 +3364,7 @@ impl Pair {
             } else {
                 None
             };
+            let mut views = [None, None];
             let installed = install_memory(
                 alloc,
                 descriptors,
@@ -3066,6 +3372,7 @@ impl Pair {
                 memory,
                 &mut binding.aliases,
                 &mut binding.kicks,
+                &mut views,
             );
             if let Err(error) = installed {
                 if let Some((slot, mappings)) = moved {
@@ -3074,6 +3381,16 @@ impl Pair {
                 return Err(error);
             }
             drop(moved);
+            // The previous VM's views go before the new owner's first kick entry is written.
+            if self.context().vm().id() != binding.context.vm().id() {
+                drop(core::mem::replace(&mut self.client_kicks, views));
+            } else {
+                for (view, alias) in self.client_kicks.iter_mut().zip(views) {
+                    if alias.is_some() {
+                        *view = alias;
+                    }
+                }
+            }
         } else {
             // The same logical context keeps its M5 queue records: their host
             // words already name it, and a rewrite would store firmware-owned
@@ -3092,6 +3409,7 @@ impl Pair {
             .take()
             .map(|memory| core::mem::replace(&mut self.memory, memory));
         let retired = RetiredBinding {
+            _client_kicks: [None, None],
             memory: old_memory,
             context: old_context,
             pool: old_pool,
@@ -3132,6 +3450,42 @@ pub(crate) fn completion_noted(qids: [u8; 2], masks: [u64; 2]) -> bool {
     masks[fragment / 64] & (1u64 << (fragment % 64)) != 0
 }
 
+#[kunit_tests(asahi_g17_render_cross_pair_order)]
+mod cross_pair_order_tests {
+    use super::{CrossPairOrder, LAST_FRAGMENT, LAST_TASK_FRAGMENT};
+    use crate::g17::fw::kick::{KickDependency, KickTimestamp};
+
+    fn is(source: Option<&'static core::sync::atomic::AtomicU64>,
+        want: &'static core::sync::atomic::AtomicU64) -> bool {
+        source.is_some_and(|source| core::ptr::eq(source, want))
+    }
+
+    fn word(qid: u8) -> u64 {
+        KickDependency::new(qid, KickTimestamp::FIRST).map_or(0, |d| d.word())
+    }
+
+    #[test]
+    fn the_j813_orders_every_render_and_elsewhere_only_task_stage_ones() {
+        let j813 = CrossPairOrder::of(true);
+        assert!(is(j813.source(false), &LAST_FRAGMENT));
+        assert!(is(j813.source(true), &LAST_FRAGMENT));
+        let other = CrossPairOrder::of(false);
+        assert!(other.source(false).is_none());
+        assert!(is(other.source(true), &LAST_TASK_FRAGMENT));
+    }
+
+    #[test]
+    fn a_task_stage_render_waits_only_for_another_pairs_fragment_kick() {
+        let order = CrossPairOrder::TaskAfterTask;
+        assert!(order.dependency(word(9), [4, 5]).map(|d| d.word()) == Some(word(9)));
+        // Its own pair's previous fragment kick: the tiling ring already orders it.
+        assert!(order.dependency(word(5), [4, 5]).is_none());
+        assert!(order.dependency(0, [4, 5]).is_none());
+        // The J813 order keeps its own pair's kick, as before.
+        assert!(CrossPairOrder::All.dependency(word(5), [4, 5]).map(|d| d.word()) == Some(word(5)));
+    }
+}
+
 #[kunit_tests(asahi_g17_render_completion_noted)]
 mod completion_noted_tests {
     use super::completion_noted;
@@ -3162,5 +3516,31 @@ mod completion_noted_tests {
         let mut both = bit(3);
         both[1] |= bit(68)[1];
         assert!(completion_noted([3, 68], both));
+    }
+}
+
+#[kunit_tests(asahi_g17_render_drain_retry)]
+mod drain_retry_tests {
+    use super::{drain_retry_delay, DRAIN_RETRY_LIMIT};
+
+    #[test]
+    fn backoff_doubles_from_a_millisecond_to_a_second() {
+        assert_eq!(drain_retry_delay(1), 1_000_000);
+        assert_eq!(drain_retry_delay(2), 2_000_000);
+        assert_eq!(drain_retry_delay(10), 512_000_000);
+        assert_eq!(drain_retry_delay(11), 1_000_000_000);
+        assert_eq!(drain_retry_delay(DRAIN_RETRY_LIMIT - 1), 1_000_000_000);
+    }
+
+    #[test]
+    fn a_pair_left_out_of_service_is_checked_every_ten_seconds() {
+        assert_eq!(drain_retry_delay(DRAIN_RETRY_LIMIT), 10_000_000_000);
+        assert_eq!(drain_retry_delay(u32::MAX), 10_000_000_000);
+    }
+
+    #[test]
+    fn the_limit_is_reached_within_ten_seconds() {
+        let total: u64 = (1..DRAIN_RETRY_LIMIT).map(drain_retry_delay).sum();
+        assert!(total < 10_000_000_000);
     }
 }

@@ -80,7 +80,8 @@ static int devm_request_threaded_irq(struct device*d,int irq,int(*h)(int,void*),
 enum dwc3_apple_state {DWC3_APPLE_PROBE_PENDING,DWC3_APPLE_NO_CABLE,DWC3_APPLE_HOST,DWC3_APPLE_DEVICE,DWC3_APPLE_SUSPENDED};
 #define DWC3_GCTL_PRTCAP_HOST 1
 struct dwc3 {int num_usb3_ports,num_usb2_ports;int usb3_generic_phy[2],usb2_generic_phy[2],usb3_phy,usb2_phy;int current_dr_role;bool dis_u3_susphy_quirk;};
-struct dwc3_apple {struct device*dev;struct dwc3 dwc;int lock,reset;enum dwc3_apple_state state;bool fixed_hub,host_only,rpm_held,core_active,core_exit_pending,reset_pending,dt_dis_u3_susphy,sleep_ddr;unsigned usb3_power_off_pending,usb2_power_off_pending;int usb2_phy;};
+struct dwc3_apple {struct device*dev;struct dwc3 dwc;int lock,reset;enum dwc3_apple_state state;bool fixed_hub,host_only,rpm_held,core_active,core_exit_pending,reset_pending,dt_dis_u3_susphy,sleep_ddr;unsigned usb3_power_off_pending,usb2_power_off_pending;int usb2_phy;
+ int sleep_pm_lock;enum dwc3_apple_sleep_phase sleep_phase;bool sleep_syscore;};
 static void apple_sleep_usb_slp_ddr(bool on){(void)on;}
 static int core_error,host_error,gadget_error,reset_error,role_error,start_role;
 static unsigned rpm_puts;
@@ -179,6 +180,12 @@ int main(int argc,char**argv){
    reset_error=0;n=core_exits;exits=role_exits;
    assert(!dwc3_apple_exit(&a)&&!d.syscore&&!a.reset_pending&&!a.rpm_held&&rpm_puts==puts+4);
    assert(core_exits==n&&role_exits==exits);
+   /* In an open sleep epoch device prepare must still run: the glue records that it wants
+    * the syscore mark without setting it, and a core stop drops both. */
+   a.sleep_phase=DWC3_APPLE_SLEEP_PREPARING;
+   assert(!dwc3_apple_init(&a,role)&&!d.syscore&&a.sleep_syscore);
+   assert(!dwc3_apple_exit(&a)&&!d.syscore&&!a.sleep_syscore);
+   a.sleep_phase=DWC3_APPLE_SLEEP_IDLE;
   }
  }else if(!strcmp(argv[1],"regulatory")){
   enum {N25=MT7932_CHANNELS_2G+MT7932_CHANNELS_5G,SIX13=N25+3,VLP=N25+5};
@@ -264,13 +271,15 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--old-usb', action='store_true')
     parser.add_argument('--old-regulatory', action='store_true')
-    parser.add_argument('--mutation', choices=['sep-syscore', 'wake-irq', 'rx-suspend', 'stale-policy', 'usb-rpm', 'vlp-client', 'six-band'])
+    parser.add_argument('--mutation', choices=['sep-syscore', 'wake-irq', 'rx-suspend', 'stale-policy', 'usb-rpm', 'usb-epoch-syscore',
+                                               'vlp-client', 'six-band'])
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     files = {
         'drivers/soc/apple/dockchannel.c': ['dockchannel_init_wakeup'],
         'drivers/soc/apple/pm_shim.c': ['sep_pm_release_domains', 'sep_pm_keep_domains'],
-        'drivers/usb/dwc3/dwc3-apple.c': ['dwc3_apple_core_stop', 'dwc3_apple_init', 'dwc3_apple_exit'],
+        # dwc3_apple_syscore() first: the three after it call it.
+        'drivers/usb/dwc3/dwc3-apple.c': ['dwc3_apple_syscore', 'dwc3_apple_core_stop', 'dwc3_apple_init', 'dwc3_apple_exit'],
         'drivers/net/wireless/mediatek/mt7932/six.h': ['mt7932_6g_class'],
         'drivers/net/wireless/mediatek/mt7932/startup.c': ['mt_channel', 'mt_policy_disable', 'mt_regulatory_notify'],
     }
@@ -279,7 +288,9 @@ def main():
         source = (ROOT/path).read_text()
         for name in names:
             text = source
-            if args.old_usb and path.endswith('dwc3-apple.c') and name != 'dwc3_apple_core_stop' or args.old_regulatory and name == 'mt_regulatory_notify':
+            # The old USB control takes only init and exit from the old revision, which has no syscore helper.
+            if (args.old_usb and path.endswith('dwc3-apple.c') and name not in ('dwc3_apple_core_stop', 'dwc3_apple_syscore')
+                    or args.old_regulatory and name == 'mt_regulatory_notify'):
                 text = subprocess.check_output(['git', 'show', '990a45b609dd:'+path], cwd=ROOT, text=True)
             bodies[name] = function(text, name)
     headers = [ROOT/'drivers/net/wireless/mediatek/mt7932/channels.h',
@@ -299,8 +310,14 @@ def main():
         raise ValueError('dockchannel RX IRQ request')
     bodies['dockchannel_request_rx'] = ('static int dockchannel_request_rx(struct device *dev, struct dockchannel *dockchannel)\n'
                                         '{\n\tint ret;\n\n' + request[0] + '\treturn ret;\n}\n')
-    at = PREFIX.index('struct mt7932 {')
-    code = PREFIX[:at] + header + PREFIX[at:] + '\n'.join(bodies.values()) + MAIN
+    # The glue's sleep epoch enum, from the driver, for the syscore helper and the model struct.
+    dwc3 = (ROOT/'drivers/usb/dwc3/dwc3-apple.c').read_text()
+    phase = re.search(r'^enum dwc3_apple_sleep_phase \{[^}]*\};', dwc3, re.M)
+    if not phase:
+        raise ValueError('DWC3 Apple sleep phase enum')
+    prefix = PREFIX.replace('struct dwc3_apple {', phase[0] + '\nstruct dwc3_apple {', 1)
+    at = prefix.index('struct mt7932 {')
+    code = prefix[:at] + header + prefix[at:] + '\n'.join(bodies.values()) + MAIN
     if not args.old_usb:
         code = code.replace(',DWC3_APPLE_SUSPENDED', '')
     mutations = {
@@ -310,6 +327,7 @@ def main():
         'rx-suspend': ('IRQF_NO_AUTOEN | IRQF_NO_SUSPEND', 'IRQF_NO_AUTOEN'),
         'stale-policy': ('generation != READ_ONCE(m->reg_generation)', 'false'),
         'usb-rpm': ('pm_runtime_put_autosuspend(appledwc->dev);', '(void)0;'),
+        'usb-epoch-syscore': ('enable && appledwc->sleep_phase != DWC3_APPLE_SLEEP_PREPARING', 'enable'),
         'vlp-client': ('return flags & IEEE80211_CHAN_NO_6GHZ_VLP_CLIENT ?', 'return false ?'),
         'six-band': ('(policy->six_channels & BIT_ULL((channel - 1) / 4))', 'true'),
     }

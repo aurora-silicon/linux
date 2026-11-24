@@ -41,6 +41,8 @@ def fixture():
     admission = (item(preparation, "pub(super) struct Admission<'a>") + '\n' +
                  item(preparation, "impl<'a> Admission<'a>")).replace('pub(super) ', '').replace('super::now_ns()', 'now_ns()').replace('super::timeout::', '')
     gate = item(preparation, 'pub(super) fn enter_until(').replace('pub(super) ', '')
+    waits = '#[derive(Clone,Copy,Debug,PartialEq)]\n' + item(preparation, 'pub(super) enum AdmissionWait').replace('pub(super) ', '')
+    waits += '\n' + next(line for line in preparation.splitlines() if 'const ADMISSION_WAITS:' in line).replace('pub(super) ', '')
     queue_wait = next(line for line in preparation.splitlines() if 'const QUEUE_WAIT_NS:' in line).replace('pub(super) ', '')
     return r'''
 #![allow(dead_code,unused_variables,irrefutable_let_patterns)]
@@ -56,6 +58,7 @@ const PUBLICATION_WAIT_NS:u64=if QUEUE_WAIT_NS>RECOVERY_WAIT_NS{QUEUE_WAIT_NS}el
 static NOW:AtomicU64=AtomicU64::new(0);static CALLS:AtomicUsize=AtomicUsize::new(0);
 static MODE:AtomicUsize=AtomicUsize::new(0);static CANCEL:AtomicU64=AtomicU64::new(u64::MAX);
 static STATUS:AtomicU64=AtomicU64::new(u64::MAX);static CLOSED:AtomicBool=AtomicBool::new(false);
+static REPORTED:AtomicUsize=AtomicUsize::new(usize::MAX);
 fn now_ns()->u64{NOW.load(Ordering::SeqCst)}
 fn advance(ns:u64){NOW.fetch_add(ns,Ordering::SeqCst);assert!(now_ns()<=PUBLICATION_WAIT_NS+4_000_000_000,"admission budget exceeded");}
 mod kernel{pub mod time{
@@ -63,7 +66,7 @@ mod kernel{pub mod time{
  pub struct Delta(pub u64);impl Delta{pub fn from_millis(ms:u64)->Self{Self(ms*1_000_000)}pub fn from_micros(us:i64)->Self{Self(us as u64*1_000)}}
  pub mod delay{pub fn fsleep(d:super::Delta){crate::advance(d.0);}}
 }}
-''' + admission + r'''
+''' + waits + '\n' + admission + r'''
 struct Wait;
 impl Wait{fn lock(&self){}}
 struct Changed;
@@ -97,7 +100,8 @@ impl Queues{
  fn release_compute_witness(&self,_:&Init,_:&(),_:u64,_:&mut DeferredBatch)->Result<bool>{Ok(MODE.load(Ordering::SeqCst)==2)}
 }
 struct Firmware{recovery:Recovery,init:Init,queues:Queues,port:()}
-impl Firmware{fn replay_compute(&mut self,_:&mut DeferredBatch)->Result{Ok(())}fn publish_compute(&mut self,_:u64,_:Arc<Packet>,_:&[()],_:&mut DeferredBatch)->Result{Err(EAGAIN)}}
+// Mode 6: the publication itself refuses with EBUSY (no recovery): an immediate error, not a spent budget.
+impl Firmware{fn replay_compute(&mut self,_:&mut DeferredBatch)->Result{Ok(())}fn publish_compute(&mut self,_:u64,_:Arc<Packet>,_:&[()],_:&mut DeferredBatch)->Result{if MODE.load(Ordering::SeqCst)==6{advance(5_000_000);Err(EBUSY)}else{Err(EAGAIN)}}}
 struct State(Mutex<Option<Box<Firmware>>>);impl State{fn lock(&self)->MutexGuard<'_,Option<Box<Firmware>>>{self.0.lock().unwrap()}}
 struct Available;impl Available{fn observe(&self)->u64{now_ns()}}
 struct Shared{preparations:Arc<Gate>,state:State,crashed:AtomicBool,compute_blocks:usize,active_cores:u32,progress:Available}impl Shared{fn queue_events(&self){}}
@@ -120,6 +124,14 @@ impl Backend{
   admission.check()
  }
  fn admission_open(&self)->Result{Ok(())}
+ // Records the wait the reported budget mostly went to (usize::MAX: no report).
+ fn report_admission_expiry(&self,admission:&Admission<'_>){
+  let (total,spent)=admission.spent_ms();
+  // No wait timed: nothing to name (max_by_key would pick the last kind).
+  let most=if spent.iter().all(|&ms|ms==0){usize::MAX-1}else{(0..ADMISSION_WAITS).max_by_key(|&w|spent[w]).unwrap()};
+  assert!(spent.iter().sum::<u64>()<=total+1,"waits are timed once each");
+  REPORTED.store(most,Ordering::SeqCst);
+ }
  // The real ensure_compute forwards the original context into this allocation
  // boundary. Each success loses its binding before the publication mutex.
  fn build_compute(&self,_:usize,admission:&Admission<'_>)->Result{
@@ -131,9 +143,11 @@ fn main(){
  let b=Backend{owner:1,context:Context,shared:Shared{compute_blocks:21,active_cores:1,progress:Available,preparations:Arc::new(Gate{wait:Wait,changed:Changed}),state:State(Mutex::new(Some(Box::new(Firmware{recovery:Recovery,init:Init,queues:Queues,port:()})))),crashed:AtomicBool::new(false)}};
  let p=Arc::new(Packet{command:Validated::Compute{scratch:Scratch},completion:Completion});
  for mode in 0..4 {
-  MODE.store(mode,Ordering::SeqCst);NOW.store(0,Ordering::SeqCst);CALLS.store(0,Ordering::SeqCst);
+  MODE.store(mode,Ordering::SeqCst);NOW.store(0,Ordering::SeqCst);CALLS.store(0,Ordering::SeqCst);REPORTED.store(usize::MAX,Ordering::SeqCst);
   let r=b.compute_packet(&p,&mut DeferredBatch);
   assert_eq!(r,Err(EBUSY),"one admission budget covers binding theft/recovery/publication");
+  let named=[AdmissionWait::Channel,AdmissionWait::Recovery,AdmissionWait::Publication,AdmissionWait::Publication][mode];
+  assert_eq!(REPORTED.load(Ordering::SeqCst),named as usize,"the report names the wait the budget went to");
   let budget=if mode==1{PUBLICATION_WAIT_NS}else{QUEUE_WAIT_NS};
   assert!(now_ns()>=budget&&now_ns()<=budget+10_000_000,"admission budget exceeded");
   if mode==0{assert_eq!(CALLS.load(Ordering::SeqCst),(QUEUE_WAIT_NS/500_000_000) as usize);assert_eq!(now_ns(),QUEUE_WAIT_NS);}
@@ -141,16 +155,26 @@ fn main(){
  }
  // A context without a free work state waits for one under the admission
  // deadline instead of failing the packet at once.
- MODE.store(4,Ordering::SeqCst);NOW.store(0,Ordering::SeqCst);CALLS.store(0,Ordering::SeqCst);
+ MODE.store(4,Ordering::SeqCst);NOW.store(0,Ordering::SeqCst);CALLS.store(0,Ordering::SeqCst);REPORTED.store(usize::MAX,Ordering::SeqCst);
  let r=b.compute_packet(&p,&mut DeferredBatch);
  assert_eq!(r,Err(EBUSY),"a busy work state ends at the admission deadline");
+ assert_eq!(REPORTED.load(Ordering::SeqCst),AdmissionWait::WorkState as usize,"the report names the wait the budget went to");
  assert!(now_ns()>=QUEUE_WAIT_NS&&now_ns()<=QUEUE_WAIT_NS+10_000_000,"a busy work state waits for the admission deadline");
  println!("PASS busy work state waits elapsed_ms={}",now_ns()/1_000_000);
+ // An EBUSY refusal before the deadline is returned as before and is not a spent budget.
+ MODE.store(6,Ordering::SeqCst);NOW.store(0,Ordering::SeqCst);REPORTED.store(usize::MAX,Ordering::SeqCst);
+ let r=b.compute_packet(&p,&mut DeferredBatch);
+ assert_eq!(r,Err(EBUSY),"a refusal is returned at once");
+ assert!(now_ns()<QUEUE_WAIT_NS,"a refusal is returned at once");
+ assert_eq!(REPORTED.load(Ordering::SeqCst),usize::MAX,"only a spent budget is reported");
+ println!("PASS an early refusal is not reported elapsed_ms={}",now_ns()/1_000_000);
  for status in [false,true] {
   MODE.store(2,Ordering::SeqCst);NOW.store(0,Ordering::SeqCst);CALLS.store(0,Ordering::SeqCst);
   if status{STATUS.store(10_000_000,Ordering::SeqCst);}else{CANCEL.store(10_000_000,Ordering::SeqCst);}
+  REPORTED.store(usize::MAX,Ordering::SeqCst);
   let r=b.compute_packet(&p,&mut DeferredBatch);
   assert_eq!(r,Err(if status{EIO}else{ECANCELED}),"nested unavailable-capacity wait must check packet");
+  assert_eq!(REPORTED.load(Ordering::SeqCst),usize::MAX,"only a spent budget is reported");
   assert_eq!(now_ns(),10_000_000,"nested unavailable-capacity cancellation/status must be prompt");assert_eq!(CALLS.load(Ordering::SeqCst),0);
   STATUS.store(u64::MAX,Ordering::SeqCst);CANCEL.store(u64::MAX,Ordering::SeqCst);
  }
@@ -179,11 +203,14 @@ def main():
     source = fixture()
     mutants = [
         ('fixed', source, ''),
-        ('renew-on-binding-loss', source.replace('let admission = Admission::new(deadline, &check);\n        let progress = &self.shared.progress;\n        let outer = self.outer_domain();\n        loop {', 'let progress = &self.shared.progress;\n        let outer = self.outer_domain();\n        loop {\n            let admission = Admission::new(now_ns().saturating_add(QUEUE_WAIT_NS), &check);'), 'admission budget exceeded'),
+        ('renew-on-binding-loss', source.replace('            loop {\n                admission.check()?;', '            loop {\n                let admission = Admission::new(now_ns().saturating_add(QUEUE_WAIT_NS), &check);\n                admission.check()?;'), 'admission budget exceeded'),
         ('ignore-deadline', source.replace('if now_ns() >= self.deadline.get()', 'if false'), 'admission budget exceeded'),
         ('render-work-state', source.replace('acquire(crate::g17::job::Engine::Compute)', 'acquire(crate::g17::job::Engine::Render)'), 'compute admission takes a compute work state'),
         ('omit-gate-check', source.replace('            admission.check()?;\n            match self.try_enter()', '            match self.try_enter()').replace('admission.slice_ms()?', '10'), 'gate wake storm'),
         ('no-recovery-extension', source.replace('admission.extend_for_recovery();', ''), 'recovery extension'),
+        ('report-every-error', source.replace('if matches!(result, Err(error) if error == EBUSY) && !packet.is_published() && admission.expired() {', 'if result.is_err() {'), 'only a spent budget is reported'),
+        ('report-without-expiry', source.replace(' && admission.expired() {', ' {'), 'only a spent budget is reported'),
+        ('untimed-publication', source.replace('admission.timed(wait, || self.wait_release(progress, observed, &admission))?;', 'self.wait_release(progress, observed, &admission)?;'), 'the report names the wait'),
     ]
     # Bind the old unbounded mutant with the review's eventual cancellation.
     mutants[1] = (mutants[1][0], mutants[1][1].replace('for mode in 0..4 {', 'CANCEL.store(PUBLICATION_WAIT_NS+10_000_000_000,Ordering::SeqCst);\n for mode in 0..4 {'), mutants[1][2])

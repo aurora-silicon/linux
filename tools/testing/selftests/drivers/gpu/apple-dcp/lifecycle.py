@@ -3,7 +3,7 @@
 """Actual disconnect authority, DWC3 teardown and firmware resource admission."""
 from pathlib import Path
 import re
-from common import block, apple_function, internal_inline, atc_mux_without_pm, source_defines, ATC_POST_TUNABLE, tipd_pm_header, firmware_lineage, atc_restore_helpers, atc_cio_helpers
+from common import block, apple_function, internal_inline, atc_mux_without_pm, source_defines, ATC_POST_TUNABLE, tipd_pm_header, firmware_lineage, atc_restore_helpers, atc_cio_helpers, atc_cfg_helpers
 
 def disconnect(root):
     # Copyright 2026 Ryan Murray
@@ -148,6 +148,8 @@ struct apple_dcp {
  struct dcp_announce announce;
  /* T6030 external processors only; an H17P display is never one. */
  bool external_native; int external_retries; struct delayed_work external_retry_wq;
+ /* A display a J714s firmware 27 sleep released; never set here. */
+ bool sleep_v27_torn;
 };
 #define atomic_set(p, v) (*(p) = (v))
 struct platform_device { struct apple_dcp *data; };
@@ -209,6 +211,8 @@ struct tps6598x { void *partner, *dev, *port, *psy; int lock; u32 data_status; e
 struct cd321x { struct tps6598x tps; struct cd321x_status update_status;
  struct cd321x_pm_state pm; struct delayed_work update_work, resume_work;
  struct typec_mux_state state; bool state_valid, display_route_active, cur_partner_is_pd;
+ /* A wake's first port state, applied without the debounce until a retry clears it */
+ bool sleep_plug, wake_apply;
  bool dp_irq_hpd, dp_sink_reported,dp_sid_valid;
  u32 dp_status,dp_conf; void *port_altmode_dp;
  struct usb_pd_identity cur_partner_identity; void *connector_fwnode, *tbt_switch, *mux; };
@@ -270,6 +274,10 @@ static void __attribute__((unused)) typec_unregister_altmode(void *a)
 #define typec_set_orientation(...) ((void)0)
 #define typec_set_data_role(...) ((void)0)
 #define power_supply_changed(...) ((void)0)
+/* J714s only (tipd_boot_power_on()): this fixture's machine never keeps the boot power state. */
+static void __attribute__((unused)) tipd_boot_host_started(struct tps6598x *t, enum usb_role r)
+{ (void)t; (void)r; }
+static void __attribute__((unused)) tipd_boot_order_done(struct tps6598x *t) { (void)t; }
 '''
     tests = r'''
 static int failures, checks;
@@ -289,6 +297,7 @@ static void init(void)
  display.typec_generation = 4;
  port.tps.partner = (void *)1; port.tps.role_sw = &role; role = USB_ROLE_HOST;
  port.pm.phase = CD321X_PM_RUNNING; port.state_valid = true; port.state.mode = 2;
+ port.wake_apply = true;
  port.display_route_active = true; port.connector_fwnode = (void *)1;
  settle_error = power_error = hpd_error = release_error = 0;
  tbt_error = role_error = safe_error = mode_error = 0;
@@ -312,7 +321,7 @@ int main(void)
   CHECK(display.external_error == -ETIMEDOUT);
   CHECK(display.dptxport[0].connected && display.pipe_enabled_h17p);
   CHECK(!display.external_stopped && !display.typec_crtc_off);
-  CHECK(port.display_route_active && !port.state_valid);
+  CHECK(port.display_route_active && !port.state_valid && !port.wake_apply);
   CHECK(port.pm.phase == CD321X_PM_REVALIDATE && port.pm.attempts_left == CD321X_RESUME_ATTEMPTS);
   CHECK(notices > 0 && releases == 0);
   callback(true); CHECK(!sink.connected);
@@ -515,6 +524,43 @@ static void __attribute__((unused)) dcp_relink_link_up(int *s, u64 generation, u
  CHECK(!roles && port.pm.phase == CD321X_PM_REVALIDATE);
  CHECK(sink.connected && !notices && !port.display_route_active);
 ''')
+    # The J714s's macOS USBw after an attach is a port controller command, not part of these
+    # display scenarios: the update calls it, and here it does nothing.
+    if 'cd321x_macos_usbw(cd321x);' in funcs:
+        shim += ('\nstruct cd321x;\n'
+                 'static void cd321x_macos_usbw(struct cd321x *cd321x) { (void)cd321x; }\n')
+    # Whether DisplayPort pin D joins the running USB 3 link (typec_mux_dp_joins_usb()) is the
+    # scenario's choice: off in the display scenarios above, on in the ones added here.
+    if 'cd321x_dp_joins_usb(cd321x, &st)' in funcs:
+        shim += ('\nstruct cd321x; struct cd321x_status;\n'
+                 'static bool joins;\n'
+                 'static bool cd321x_dp_joins_usb(struct cd321x *cd321x,\n'
+                 '                                const struct cd321x_status *st)\n'
+                 '{ (void)cd321x; (void)st; return joins; }\n')
+        end = ' printf("%d assertions, %d failures\\n", checks, failures); return !!failures;\n}\n'
+        assert tests.count(end) == 1
+        tests = tests.replace(end, r''' /*
+  * Pin D comes to a connection that runs USB 3. Joined, the role is set only once, to the
+  * host it already is; a provider that still fails the change gets the role stopped and the
+  * update retried; without the mux's word the role stops first, as for any mode change.
+  */
+ for (int t = 0; t < 3; t++) {
+  init(); port.display_route_active = false; joins = t < 2;
+  port.tps.data_status = TPS_DATA_STATUS_USB2_CONNECTION | TPS_DATA_STATUS_USB3_CONNECTION;
+  port.update_status.status = TPS_STATUS_PLUG_PRESENT;
+  port.update_status.data_status = port.tps.data_status | TPS_DATA_STATUS_DP_CONNECTION;
+  port.update_status.data_status_changed = TPS_DATA_STATUS_DP_CONNECTION;
+  mode_error = t == 1 ? -EIO : 0;
+  cd321x_update_work(&port.update_work.work);
+  if (t == 0)
+   CHECK(roles == 1 && role == USB_ROLE_HOST && port.pm.phase == CD321X_PM_RUNNING);
+  else if (t == 1)
+   CHECK(roles == 1 && role == USB_ROLE_NONE && port.pm.phase == CD321X_PM_REVALIDATE);
+  else
+   CHECK(roles == 2 && role == USB_ROLE_HOST && port.pm.phase == CD321X_PM_RUNNING);
+ }
+ joins = false;
+''' + end)
     # How long a held mux has been retried is measured on the driver's clock.
     if 'jiffies_to_msecs(jiffies)' in funcs:
         shim += ('\nstatic unsigned long jiffies;\n'
@@ -549,10 +595,11 @@ def bounce(root):
          ' struct { bool connected, closed, tile_hint; void *service, *atcphy; int linkcfg_completion; } dptxport[1];\n'
          ' void *phy, *dev, *active_typec_route;\n'
          ' int dptx_die, dptx_phy, dptx_dfp_port, connector_type;\n'
-         ' bool external, external_link_ready, crashed;\n'
+         ' bool external, external_link_ready, crashed, rtkit_adopted;\n'
          ' bool typec_work_enabled;' + ('' if '\n int fw_compat;' in unit else ' int fw_compat;') +
          ' struct { bool fw_14_7_endpoints; } hw;\n'
-         ' struct { bool active; } split;')
+         ' struct { bool active; } split;\n'
+         ' bool hdmi_hpd;')
     old_raw = unit[unit.index('static int dcp_dptx_connect_raw('):]
     old_raw = old_raw[:old_raw.index('return raw_error; }') + len('return raw_error; }')]
     sessions = bool(SESSION_RAW.search(dcp))
@@ -579,6 +626,7 @@ typedef uint8_t u8;
 #define dev_info(...) ((void)0)
 #define DRM_MODE_CONNECTOR_DisplayPort 10
 #define DCP_FIRMWARE_H17P 17
+#define DCP_FIRMWARE_V_13_5 2
 #define DPTX_CONNECT_TIMEOUT 2000
 #define DPTX_TUNNEL_CONNECT_TIMEOUT 8000
 static void mutex_lock(int *m) { (void)m; }
@@ -737,6 +785,25 @@ int main(void)
                      '  assert(!"T8132 dcpext teardown in an H17P scenario"); return -ENODEV; }\n')
     if 'static unsigned long jiffies;' not in unit:
         firmware += '\nstatic unsigned long jiffies;\n'
+    if 'dcp_dptx_wait_linkcfg(' in raw:
+        # Only T6050 watches the tunnel: this H17P link waits as before.
+        firmware += ('#define DCP_LINKCFG_POLL_MS 50\n'
+                     '#ifndef min_t\n#define min_t(t, a, b) ((t)(a) < (t)(b) ? (t)(a) : (t)(b))\n#endif\n'
+                     '#ifndef max_t\n#define max_t(t, a, b) ((t)(a) > (t)(b) ? (t)(a) : (t)(b))\n#endif\n'
+                     '#ifndef msecs_to_jiffies\n#define msecs_to_jiffies(x) (x)\n#endif\n'
+                     'static bool dcp_watches_tunnel_withdrawal(void) { return false; }\n'
+                     'static bool dcp_tb_tunnel_withdrawn(struct apple_dcp *d, u32 port)\n'
+                     '{ (void)d; (void)port; assert(!"tunnel watch in an H17P scenario"); return false; }\n' +
+                     apple_function(root, 'dcp_dptx_wait_linkcfg'))
+    if 'dcp_assert_hpd_before_link_wait(' in raw:
+        # The HPD assertion before the link wait, as the driver has it. This scenario is a
+        # Type-C H17P link, so the fixed-HDMI branch is not taken.
+        swap(' bool hdmi_hpd;',
+             ' int fixed_connector_type; void *hdmi_hpd;')
+        firmware += ('static int __attribute__((unused)) gpiod_get_value_cansleep(void *gpio)\n'
+                     '{ (void)gpio; assert(!"fixed HDMI GPIO in a Type-C scenario"); return 0; }\n'
+                     '#ifndef DRM_MODE_CONNECTOR_HDMIA\n#define DRM_MODE_CONNECTOR_HDMIA 11\n#endif\n' +
+                     apple_function(root, 'dcp_assert_hpd_before_link_wait'))
     # unless the update work already needed the clock
     clock = 'static unsigned jiffies_to_msecs(unsigned long t) { return t; }\n'
     if clock in unit:
@@ -1077,6 +1144,10 @@ def teardown(root):
     for name in ('atcphy_mode_configuration', 'atcphy_hw', 'atcphy_dp_link_rate_configuration'):
         decls.append(block(files['atc'], files['atc'].index('struct ' + name + ' {')) + ';')
     decls.append(block(files['state'], files['state'].index('enum dwc3_apple_state {')) + ';')
+    # The glue's PM sleep epoch, for its syscore helper, role switch and the model struct.
+    phase = 'enum dwc3_apple_sleep_phase {'
+    decls.append(block(files['apple'], files['apple'].index(phase)) + ';' if phase in files['apple']
+                 else 'enum dwc3_apple_sleep_phase { DWC3_APPLE_SLEEP_IDLE, DWC3_APPLE_SLEEP_PREPARING };')
     role = 'static inline enum dwc3_apple_state dwc3_apple_state_for_role('
     if role in files['state']:
         decls.append(block(files['state'], files['state'].index(role)))
@@ -1105,7 +1176,7 @@ def teardown(root):
                 '_atcphy_dwc3_reset_assert', 'atcphy_dwc3_reset_assert', 'atcphy_mux_set'),
         'phy': ('phy_init', 'phy_exit', 'phy_reset', 'phy_power_on', 'phy_power_off'),
         'core': ('dwc3_phy_power_on', 'dwc3_phy_power_off', 'dwc3_phy_exit', 'dwc3_core_exit'),
-        'apple': ('dwc3_apple_host_before_core_init', 'dwc3_apple_core_stop', 'dwc3_apple_core_init', 'dwc3_apple_core_start',
+        'apple': ('dwc3_apple_syscore', 'dwc3_apple_host_before_core_init', 'dwc3_apple_core_stop', 'dwc3_apple_core_init', 'dwc3_apple_core_start',
                   'dwc3_apple_init', 'dwc3_apple_exit', 'dwc3_usb_role_switch_set'),
     }
     names['core'] = ('dwc3_phy_power_on', 'dwc3_phy_power_off', 'dwc3_phy_exit',
@@ -1120,7 +1191,7 @@ def teardown(root):
     names = {n: tuple(name for name in group if re.search(r'^(?:static [^\n]*\b|(?:int|void) )' + name + r'\(', files[n], re.M))
              for n, group in names.items()}
     context = (fn('atc', 'core_read32') + '\n' + fn('atc', 'atcphy_get_mode_config') + '\n' + fn('atc', 'j700_field_update') + '\n' + files['dp'][files['dp'].index('/* Masks are the union'):files['dp'].index('/* Retry only the idle operations')])
-    functions = atc_cio_helpers(files['atc']) + '\n\n'.join(fn(n, name) for n, group in names.items() for name in group)
+    functions = atc_cio_helpers(files['atc']) + atc_cfg_helpers(files['atc']) + '\n\n'.join(fn(n, name) for n, group in names.items() for name in group)
     definitions = []
     lines = iter(files['atc'].splitlines())
     for line in lines:
@@ -1202,7 +1273,10 @@ struct device_node { bool named; unsigned count; };
 struct device { struct device_node *of_node; };
 struct platform_device { struct device dev; int num_resources; struct resource resources[10]; };
 #define to_platform_device(d) ((struct platform_device *)(d))
+/* Resource-profile tests carry, but never dereference, the sleep layout. */
+static const unsigned dcp_s2r_t8140;
 struct apple_dcp_hw_data {
+    const void *s2r_layout;
     unsigned num_dptx_ports; bool adopt_live_session;
     int iomfb_method_profile,firmware_compat;
     const struct resource *firmware_clock;
@@ -1420,7 +1494,8 @@ def readiness(root):
     # The T8122 dcpext wrapper moved the pipe's probe into dcp_platform_probe_pipe().
     probe = function(dcp, 'static int dcp_platform_probe_pipe(' if 'static int dcp_platform_probe_pipe(' in dcp
                      else 'static int dcp_platform_probe(')
-    publish = probe[probe.rindex('\tif (dcp->hw.iomfb_method_profile ==\n\t    DCP_IOMFB_METHODS_H17P_EXTERNAL) {'):]
+    publish_marker = '\tif (dcp_is_retained_external(dcp)) {' if 'dcp_is_retained_external(dcp)' in probe else '\tif (dcp->hw.iomfb_method_profile ==\n\t    DCP_IOMFB_METHODS_H17P_EXTERNAL) {'
+    publish = probe[probe.rindex(publish_marker):]
     # Which processor must come up before the boot framebuffer is taken over.
     header = root / 'drivers/gpu/drm/apple/apple_boot_display.h'
     boot_display = ''
@@ -1778,12 +1853,13 @@ enum dcp_firmware_version { DCP_FIRMWARE_UNKNOWN, DCP_FIRMWARE_V_12_3, DCP_FIRMW
     DCP_FIRMWARE_V_14_7, DCP_FIRMWARE_V_14_7_TEMPLATE, DCP_FIRMWARE_V_26_6,
     DCP_FIRMWARE_V_26_6_DESKTOP, DCP_FIRMWARE_V_27_0 };
 struct apple_dcp {
-    bool crashed, external, external_native, quiescing, main_display, panel;
+    bool crashed, external, external_native, quiescing, main_display, panel, iomfb_template_pq, vrr_enabled;
     int peer_check; /* what the firmware 27 paired-timing check answers */
     unsigned int nr_typec_routes;
     enum dcp_firmware_version fw_compat;
     struct { int iomfb_method_profile; } hw;
     struct { bool valid; } mode_state;
+    struct { bool vrr_failed; } *desktop;
     struct apple_connector *connector;
     void *dev;
 };
@@ -1888,6 +1964,8 @@ FW27_VRR    dcp.crashed = true;
     # VRR_ENABLED change must never become a mode set.  The external
     # processors ignore a live minimum rate and still apply it with a mode set.
     desktop = r"""    dcp.fw_compat = DCP_FIRMWARE_V_26_6_DESKTOP;
+    dcp.iomfb_template_pq = true;
+    dcp.vrr_enabled = true;
     dcp.hw.iomfb_method_profile = 0;
     dcp.mode_state.valid = true;
     dcp.connector = &connector;
@@ -1912,13 +1990,35 @@ FW27_VRR    dcp.crashed = true;
         }
         cases++;
     }
+    /* Adopted desktop 26.6 panel boot mode starts fixed (!dcp.vrr_enabled):
+     * enabling VRR_ENABLED triggers one modeset to arm adaptive sync unless vrr_failed. */
+    {
+        __typeof__(*dcp.desktop) ds = { .vrr_failed = false };
+        dcp.desktop = &ds;
+        dcp.main_display = true;
+        dcp.vrr_enabled = false;
+        state.crtc.enable = true;
+        state.no_old_crtc = false;
+        state.old_crtc.vrr_enabled = false;
+        state.crtc.vrr_enabled = true;
+        state.crtc.mode_changed = false;
+        assert(dcp_crtc_atomic_check(&crtc, &state) == 0 && state.crtc.mode_changed);
+        ds.vrr_failed = true;
+        state.crtc.mode_changed = false;
+        assert(dcp_crtc_atomic_check(&crtc, &state) == 0 && !state.crtc.mode_changed);
+        dcp.desktop = NULL;
+        cases += 2;
+    }
     dcp.main_display = false;
+    dcp.vrr_enabled = false;
+    dcp.iomfb_template_pq = false;
     dcp.fw_compat = DCP_FIRMWARE_UNKNOWN;
 """
     # Firmware 27: its externals change adaptive sync with a full mode set, as
     # macOS switches between a timing's fixed and variable modes; the panel
     # does not. A paired timing the pair cannot take fails the check.
     fw27 = r"""    dcp.fw_compat = DCP_FIRMWARE_V_27_0;
+    dcp.iomfb_template_pq = true;
     dcp.hw.iomfb_method_profile = 0;
     dcp.mode_state.valid = true;
     dcp.connector = &connector;
@@ -1951,6 +2051,26 @@ FW27_VRR    dcp.crashed = true;
     dcp.main_display = false;
     dcp.panel = false;
     dcp.peer_check = 0;
+    dcp.fw_compat = DCP_FIRMWARE_UNKNOWN;
+    /* Template-driven 12.3/13.5/14.7_tpl DCPs program VRR inside iomfb_modeset(). */
+    const enum dcp_firmware_version tpl_fws[] = {
+        DCP_FIRMWARE_V_12_3, DCP_FIRMWARE_V_13_5, DCP_FIRMWARE_V_14_7_TEMPLATE
+    };
+    dcp.iomfb_template_pq = true;
+    for (unsigned int i = 0; i < 3; i++) {
+        dcp.fw_compat = tpl_fws[i];
+        state.crtc.enable = true;
+        state.crtc.vrr_enabled = true;
+        state.crtc.mode_changed = false;
+        state.no_old_crtc = false;
+        state.old_crtc.vrr_enabled = false;
+        assert(dcp_crtc_atomic_check(&crtc, &state) == 0 && state.crtc.mode_changed);
+        state.crtc.mode_changed = false;
+        state.old_crtc.vrr_enabled = true;
+        assert(dcp_crtc_atomic_check(&crtc, &state) == 0 && !state.crtc.mode_changed);
+        cases += 2;
+    }
+    dcp.iomfb_template_pq = false;
     dcp.fw_compat = DCP_FIRMWARE_UNKNOWN;
 """
     return prefix + check + suffix.replace('DESKTOP_VRR', desktop, 1).replace('FW27_VRR', fw27, 1)

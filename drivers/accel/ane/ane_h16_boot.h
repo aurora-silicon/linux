@@ -4,6 +4,7 @@
 
 #include <linux/slab.h>
 
+#include "ane_fw_platform.h"
 #include "ane_fw_transport.h"
 
 enum ane_h16_stage {
@@ -65,6 +66,12 @@ struct ane_h16_tunables {
 	bool c1ppt;
 	u32 lock_offset;
 	u32 lock_mask;
+	/*
+	 * Load strobes: bits the block clears once it has taken the value
+	 * (a power cycle of a sub-block clears them while the lock and the
+	 * values stay). A locked group is checked without them.
+	 */
+	u32 strobe;
 };
 
 /* Selected only after the immutable resident firmware identity passes. */
@@ -115,6 +122,7 @@ struct ane_h16_profile {
 	const char *identity;
 	const struct ane_h16_preload_rule *preload;
 	const struct ane_h16_build *build;
+	bool require_dart_unlocked;
 };
 
 struct ane_h16_boot;
@@ -147,6 +155,7 @@ struct ane_h16_boot_ops {
 struct ane_h16_boot {
 	const struct ane_fw_platform *soc;
 	const struct ane_h16_build *build;
+	bool require_dart_unlocked;
 	/* Chosen from the DART revision in preflight. */
 	const struct ane_h16_mmio *mmio;
 	const struct ane_h16_boot_ops *ops;
@@ -156,7 +165,7 @@ struct ane_h16_boot {
 	struct ane_fw_surface pool;
 	struct ane_fw_surface ipc;
 	struct ane_fw_surface heap;
-	u64 ranges[4][2];
+	u64 ranges[ANE_FW_DAPF_MAX][2];
 	u32 requests[5];
 	u32 tick;
 	/* The PMU aperture base for SET_SNE_PMU_BASE2 at startup; 0: not sent. */
@@ -274,6 +283,25 @@ static inline int ane_h16_select_mmio(struct ane_h16_boot *b)
 	return -ENODEV;
 }
 
+/* TTBR/TCR protection is bit 0, separate from the DAPF lock at +0x208. */
+static inline int ane_h16_dart_protection(struct ane_h16_boot *b, bool require_unlocked)
+{
+	unsigned int i;
+	u32 protected = 0;
+
+	if (!b->mmio)
+		return -ENODEV;
+	for (i = 0; i < 3; i++) {
+		u32 value = b->ops->read32(b->ctx, ANE_H16_DART0 + i,
+					 b->mmio->dart_protect);
+
+		b->ops->log(b->ctx, require_unlocked ? "DART map protect" :
+			   "DART preflight protect", i, value);
+		protected |= value & BIT(0);
+	}
+	return require_unlocked && protected ? -EPERM : 0;
+}
+
 static inline int ane_h16_preflight(struct ane_h16_boot *b)
 {
 	const struct ane_h16_build *f = b->build;
@@ -299,6 +327,9 @@ static inline int ane_h16_preflight(struct ane_h16_boot *b)
 	if (control || rvbar != f->expected_rvbar)
 		return -EBUSY;
 	ret = ane_h16_select_mmio(b);
+	if (ret)
+		return ret;
+	ret = ane_h16_dart_protection(b, false);
 	if (ret)
 		return ret;
 	ret = ane_h16_faults(b, true);
@@ -331,7 +362,8 @@ static inline bool ane_h16_dapf_record(struct ane_h16_boot *b, unsigned int reco
 }
 
 /*
- * Compare the four records with apple,dapf-ranges. Preflight only reports.
+ * Compare the platform's records with apple,dapf-ranges. Preflight only
+ * reports.
  * The bank loses its records whenever its power domain does, so map writes
  * every record that differs, in the order the t8110 bank takes them, and
  * reads it back. A bank whose lock word has bit 2 set and that differs is
@@ -343,20 +375,20 @@ static inline int ane_h16_dapf(struct ane_h16_boot *b, bool program)
 	enum ane_h16_window owner = ANE_H16_DART0 + b->soc->dapf_dart;
 	u32 protect = b->ops->read32(b->ctx, owner, m->dart_protect);
 	u32 lock = b->ops->read32(b->ctx, owner, m->dart_lock);
-	unsigned int record, matched = 0;
-	bool match[4];
+	unsigned int record, matched = 0, count = b->soc->dapf_count;
+	bool match[ANE_FW_DAPF_MAX];
 
 	b->ops->log(b->ctx, "DAPF protect/lock", protect, lock);
-	for (record = 0; record < 4; record++) {
+	for (record = 0; record < count; record++) {
 		match[record] = ane_h16_dapf_record(b, record);
 		matched += match[record];
 	}
-	b->ops->log(b->ctx, "DAPF records matching", matched, 4);
-	if (!program || matched == 4)
+	b->ops->log(b->ctx, "DAPF records matching", matched, count);
+	if (!program || matched == count)
 		return 0;
 	if (lock & BIT(2))
 		return -EPERM;
-	for (record = 0; record < 4; record++) {
+	for (record = 0; record < count; record++) {
 		u32 off = m->dapf_records + record * m->dapf_stride;
 
 		if (match[record])
@@ -369,7 +401,7 @@ static inline int ane_h16_dapf(struct ane_h16_boot *b, bool program)
 		if (!ane_h16_dapf_record(b, record))
 			return -EIO;
 	}
-	b->ops->log(b->ctx, "DAPF records written/read back", 4 - matched, 4);
+	b->ops->log(b->ctx, "DAPF records written/read back", count - matched, count);
 	return 0;
 }
 
@@ -407,30 +439,46 @@ static inline int ane_h16_prepare(struct ane_h16_boot *b)
 {
 	const struct ane_h16_build *f = b->build;
 	unsigned int i, j;
-	int ret = ane_h16_ce(b);
+	int ret;
 
-	if (ret)
-		return ret;
+	if (f->ce) {
+		ret = ane_h16_ce(b);
+		if (ret)
+			return ret;
+	}
 	for (i = 0; i < f->tunable_count; i++) {
 		const struct ane_h16_tunables *group = &f->tunables[i];
 
 		if (group->c1ppt && !f->c1ppt)
 			continue;
+		if (group->window == ANE_H16_XL && !b->soc->has_xl) {
+			b->ops->log(b->ctx, "tunables skipped: no XL window", group->window,
+				    group->count);
+			continue;
+		}
 		if (group->lock_mask &&
 		    (b->ops->read32(b->ctx, group->window, group->base +
 				    group->lock_offset) & group->lock_mask)) {
+			unsigned int bad = 0, cleared = 0;
+
 			for (j = 0; j < group->count; j++) {
 				const struct ane_h16_tunable *v = &group->values[j];
 				u32 value = b->ops->read32(b->ctx, group->window,
 							group->base + v->offset);
+				u32 mask = v->mask & ~group->strobe;
 
-				if ((value & v->mask) != (v->value & v->mask)) {
+				if ((value ^ v->value) & v->mask & group->strobe)
+					cleared++;
+				if ((value & mask) != (v->value & mask)) {
 					b->ops->log(b->ctx, "locked tunable offset/value",
 						    group->base + v->offset, value);
-					return -EPERM;
+					bad++;
 				}
 			}
-			b->ops->log(b->ctx, "tunables locked match", group->window, group->count);
+			if (bad)
+				return -EPERM;
+			b->ops->log(b->ctx, "tunables locked match/strobes cleared",
+				    group->count, cleared);
 			continue;
 		}
 		for (j = 0; j < group->count; j++) {

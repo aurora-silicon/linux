@@ -4,6 +4,16 @@
 use super::*;
 use crate::{g18::uapi::application::G18ApplicationRender,g18::uapi::application_runtime::{self as g18_application_runtime,Frame}};
 
+/// The VMs the audit's page walk read, as they were: the client VM and the
+/// mapping epochs of the storage, client, kernel and kernel-lower VMs. A
+/// client VM's id() comes from the device's 64-bit VM id counter and is never
+/// given to another VM, so a VM created after one was freed never matches.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WalkKey {
+    client: u64,
+    epochs: [u64; 4],
+}
+
 pub(crate) struct ApplicationJob {
     pub(crate) job: KBox<G18GraphicsJob>,
     storage: mmu::Vm,
@@ -17,6 +27,8 @@ pub(crate) struct ApplicationJob {
     client_frames: u32,
     /// The current render's adapter-derived private-memory selection.
     scratch: Option<crate::g18::uapi::graphics_scratch::G18RenderScratchSelection>,
+    /// What the last page walk proved; None before the first.
+    pub(crate) walked: Option<WalkKey>,
 }
 
 impl ApplicationJob {
@@ -27,9 +39,25 @@ impl ApplicationJob {
         // payload and PB backing stay retained but no capture bytes execute.
         job.aliases.clear();
         Ok(KBox::new(Self {job,storage,user_aliases:KVec::new(),pool_aliases:KVec::new(),
-            guard:None,scene,generation:0,retired:true,client_frames:0,scratch:None},GFP_KERNEL)?)
+            guard:None,scene,generation:0,retired:true,client_frames:0,scratch:None,walked:None},GFP_KERNEL)?)
     }
     pub(crate) fn frame(&self) -> Frame {Frame::new(self.generation).expect("admitted frame")}
+    /// Grow the PB of the frame in flight for a firmware TVB grow request
+    /// naming its slot and context. The client aliases join the client's
+    /// other PB aliases; a later client maps every block afresh.
+    pub(crate) fn grow_parameter_buffer(&mut self, dev: &AsahiDrmDevice, buffer_slot: u32,
+        vm_slot: u32) -> Result<u32> {
+        use crate::g18::uapi::render_policy::{PB_GROW_BLOCKS,PB_MAX_BLOCKS};
+        if self.retired || buffer_slot!=self.job.parameter_buffer.command_fields().pb_slot
+            || vm_slot!=u32::from(self.job.context_id()) {return Err(ENOENT);}
+        self.user_aliases.reserve(2,GFP_KERNEL)?;
+        let vm=self.job.vm().clone();
+        let client=vm.memory_client().cloned();
+        let (added,aliases)=self.job.parameter_buffer.grow(dev,&self.storage,&vm,client.as_ref(),
+            PB_GROW_BLOCKS,PB_MAX_BLOCKS)?;
+        for alias in aliases {let _=self.user_aliases.push_within_capacity(alias);}
+        Ok(added)
+    }
     /// The last frame kicked to both graphics queues (0 before the first).
     pub(crate) fn submitted_generation(&self) -> u32 {self.generation}
     pub(crate) fn quarantine(&mut self) {
@@ -154,8 +182,19 @@ impl ApplicationJob {
         let mut pass=self.job.pass()?;pass.stamps=[self.frame().stamp();2];Ok(pass)
     }
 
+    /// The VMs a page walk reads, as they are now; None while one is being
+    /// changed.
+    pub(crate) fn walk_key(&self, uat: &mmu::Uat) -> Option<WalkKey> {
+        let mut epochs=[0;4];
+        for (epoch,vm) in epochs.iter_mut().zip([&self.storage,self.job.vm(),uat.kernel_vm(),uat.kernel_lower_vm()]) {
+            *epoch=vm.mapping_validation_epoch()?;
+        }
+        Some(WalkKey{client:self.job.vm().id(),epochs})
+    }
+
+    /// `walk`: also prove the job's mappings page by page (see walk_key()).
     pub(crate) fn audit(&mut self, dev: &AsahiDrmDevice, uat: &mmu::Uat,
-        pb: &G18PbReadback, uma: &[u64;16], mut pages: usize) -> Result {
+        pb: &G18PbReadback, uma: &[u64;16], mut pages: usize, walk: bool) -> Result {
         let frame=self.frame();let pass=self.pass()?;
         if frame.generation==1 {self.job.queues.audit_before_pass(uat,&pass)?;}
         if pb.counter!=frame.generation || uma.iter().all(|v|*v==0)
@@ -163,30 +202,36 @@ impl ApplicationJob {
         let scheduler=self.job.scheduler.snapshot(0)?;
         if scheduler.submitted!=frame.submitted()-2 || scheduler.completed!=frame.submitted()-2
             || scheduler.linked!=0 || self.job.stamps()?!=[frame.previous_stamp();2] {return Err(EBUSY);}
+        if walk {
         for target in &self.job.targets {
-            for off in (0..target.logical_size).step_by(mmu::UAT_PGSZ) {
-                let low=target.iova()+off as u64;let pa=self.storage.translate_iova(low)?;
-                if self.job.vm().translate_iova(low)?!=pa || self.job.vm().translate_iova(low+va::COMPACT_BIAS)?!=pa {return Err(EFAULT);}pages+=1;
-            }
+            let pa=self.storage.translate_pages(target.iova(),target.logical_size)?;
+            if self.job.vm().translate_pages(target.iova(),target.logical_size)?!=pa
+                || self.job.vm().translate_pages(target.iova()+va::COMPACT_BIAS,target.logical_size)?!=pa {return Err(EFAULT);}
+            pages+=pa.len();
         }
         pages+=self.job.parameter_buffer.audit_job_mappings(uat,self.job.vm(),va::COMPACT_BIAS)?;
-        for off in (0..va::GRAPHICS_JOB_BYTES).step_by(mmu::UAT_PGSZ) {
-            let pa=uat.kernel_vm().translate_iova(va::GRAPHICS_JOB_HIGH+off as u64)?;
-            for vm in [uat.kernel_lower_vm(),self.job.vm()] {
-                if vm.translate_iova(va::GRAPHICS_JOB_LOW+off as u64)?!=pa {return Err(EFAULT);}
-            }pages+=1;
+        let pa=uat.kernel_vm().translate_pages(va::GRAPHICS_JOB_HIGH,va::GRAPHICS_JOB_BYTES)?;
+        for vm in [uat.kernel_lower_vm(),self.job.vm()] {
+            if vm.translate_pages(va::GRAPHICS_JOB_LOW,va::GRAPHICS_JOB_BYTES)?!=pa {return Err(EFAULT);}
         }
+        pages+=pa.len();
         for (address,bytes) in [(va::GRAPHICS_SIGNALS,va::GRAPHICS_SIGNALS_BYTES),
             (va::GRAPHICS_SCHEDULER_START,0x8000),(va::PB_TABLE,0x4000),(va::UMA_TABLE,0x8000)] {
-            for off in (0..bytes).step_by(mmu::UAT_PGSZ) {uat.kernel_vm().translate_iova(address+off as u64)?;pages+=1;}
+            pages+=uat.kernel_vm().translate_pages(address,bytes)?.len();
         }
-        let expected=self.job.encoded.as_ref().ok_or(EINVAL)?.digests;
-        self.job.graph.with_bytes_mut(|out| {
-            if crate::g18::fw::graphics_payload::fnv64(&out[..cmd::G18_TA_COMMAND_BYTES])!=expected[0]
-                || crate::g18::fw::graphics_payload::fnv64(&out[0x4000..0x4000+cmd::G18_3D_COMMAND_BYTES])!=expected[1] {return Err(EIO);}Ok(())
+        }
+        // Compared byte for byte with the encoder's cached copy, which reads
+        // the write-combined graph in wide loads; hashing both every frame
+        // cost about 100 us between two jobs.
+        let job=&mut *self.job;
+        let encoded=job.encoded.as_ref().ok_or(EINVAL)?;
+        let (ta,fragment)=encoded.commands();
+        job.graph.with_bytes_mut(|out| {
+            if out[..cmd::G18_TA_COMMAND_BYTES]!=*ta
+                || out[assembly::FRAGMENT_OFFSET..assembly::FRAGMENT_OFFSET+cmd::G18_3D_COMMAND_BYTES]!=*fragment {return Err(EIO);}Ok(())
         })?;
         if frame.generation<=3 {
-            for (name,digest) in assembly::DIGEST_NAMES.iter().zip(expected) {
+            for (name,digest) in assembly::DIGEST_NAMES.iter().zip(encoded.digests()) {
                 dev_info!(dev.as_ref(),"G18_APP_DIGEST frame={} name={} fnv={:#018x}\n",frame.generation,name,digest);
             }
             dev_info!(dev.as_ref(),"G18_APP_AUDIT frame={} pb=resident uma=match translations={} previous_stamp={:#x}\n",frame.generation,pages,frame.previous_stamp());

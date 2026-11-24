@@ -80,6 +80,8 @@ enum apple_smc_boot_stage {
 	APPLE_SMC_ERROR_CRASHED
 };
 
+struct apple_smc_wake_reason;
+
 /**
  * struct apple_smc
  * @dev: Underlying device struct for the physical backend device
@@ -101,6 +103,8 @@ enum apple_smc_boot_stage {
  * @mutex: Mutex for non-atomic mode
  * @lock: Spinlock for atomic mode
  */
+struct apple_sleep_smc_policy;
+
 struct apple_smc {
 	struct device *dev;
 
@@ -116,12 +120,46 @@ struct apple_smc {
 	bool ap_notified;
 	/* Told of a coming sleep, and not yet of its end. */
 	bool sleep_warned;
+	const struct apple_sleep_smc_policy *sleep_policy;
+	u64 sleep_warn_ack;
+	bool sleep_pmvc_info;
+	/* WKTP (1-byte writable) supported: notify SMC on full wake. */
+	bool has_wktp;
+	/* The saved scope's pmVC after ANS, and when it was answered. */
+	bool saved_pmvc_sent;
+	u64 saved_pmvc_at;
+	/* T6050's saved-context ownership over a sleep. Protected by the
+	 * command mutex, or by the exclusive synchronized RX/PM scope. RX may
+	 * resolve only the matching pending ID; timeout never cancels SRAM use.
+	 */
+	bool saved_enabled, saved_blocked, saved_scope, saved_committed;
+	bool saved_pending, saved_recovery, saved_wake;
+	int saved_fault, saved_notice_error, saved_restore_error;
+	/*
+	 * T6050: the wake record and waka, taken cleanly right after AP ON at the platform
+	 * wake (the sleep driver's .woken), for the noirq resume; when waka was answered.
+	 */
+	bool woken_done, woken_mbsw;
+	u64 waka_at;
+	/* T6050: MSLD as read right after waka, for the noirq resume's lid handling */
+	bool wake_lid_read;
+	u8 wake_lid;
+	int wake_lid_ret;
+	u64 saved_unexpected;
 	/* To be told at the noirq suspend, after the debug link's cut. */
 	bool sleep_warn_late;
 	/* In a noirq phase: replies are polled for. */
 	bool polled;
 	/* MBSW at the last wake: what the SMC had woken the AP for. */
 	u64 wake_record;
+	/*
+	 * J714s: dark wakes since the last full wake (for a port or the radio alone), those for the
+	 * radio alone among them, and when the last sleep began.
+	 */
+	unsigned int dark_wakes, radio_dark_wakes;
+	ktime_t sleep_entry_boot, sleep_entry_mono;
+	/* MBSW's bits as this SoC numbers them, from the probe. */
+	const struct apple_smc_wake_reason *wake_reasons;
 
 	struct completion init_done;
 	enum apple_smc_boot_stage boot_stage;
@@ -162,6 +200,20 @@ int apple_smc_read(struct apple_smc *smc, smc_key key, void *buf, size_t size);
  * Return: Zero on success, negative errno on error
  */
 int apple_smc_write(struct apple_smc *smc, smc_key key, const void *buf, size_t size);
+
+/**
+ * apple_smc_write_noirq - apple_smc_write() from another device's noirq callbacks
+ * @smc: Pointer to apple_smc struct
+ * @key: smc_key data will be written to
+ * @buf: Buffer from which size bytes of data will be written to SMC
+ * @size: Number of bytes to be written
+ *
+ * The reply is polled for: device interrupts are off. Only for a caller that a
+ * device link orders before the SMC's noirq suspend and after its noirq resume.
+ *
+ * Return: Zero on success, negative errno on error
+ */
+int apple_smc_write_noirq(struct apple_smc *smc, smc_key key, const void *buf, size_t size);
 
 /**
  * apple_smc_enter_atomic - Enter atomic mode to be able to use apple_smc_write_atomic
@@ -281,15 +333,45 @@ APPLE_SMC_TYPE_OPS(s8)
 struct device;
 
 /*
+ * Hotspot fan-assistance thresholds read from the machine's SMC hwmon device
+ * tree node (macsmc_soc_die active trip temperature, hysteresis-derived
+ * release temperature, and minimum hold time).
+ */
+struct macsmc_hwmon_fan_assist {
+	int trigger_mc;
+	int release_mc;
+	unsigned int hold_ms;
+};
+
+/*
  * The SMC hwmon cell's fan control for a kernel thermal policy (a GPU
  * governor): see drivers/hwmon/macsmc-hwmon.c.
  */
 #if IS_REACHABLE(CONFIG_SENSORS_MACSMC_HWMON)
 int macsmc_hwmon_fans_request(struct device *dev, unsigned int permille,
 			      unsigned int min_step_rpm);
+int macsmc_hwmon_fans_request_manual(struct device *dev, unsigned int permille,
+				     unsigned int min_step_rpm);
+bool macsmc_hwmon_hotspot_assist_available(void);
+int macsmc_hwmon_hotspot_assist_policy(struct device *dev,
+				       struct macsmc_hwmon_fan_assist *policy);
 #else
 static inline int macsmc_hwmon_fans_request(struct device *dev, unsigned int permille,
 					    unsigned int min_step_rpm)
+{
+	return -ENODEV;
+}
+static inline int macsmc_hwmon_fans_request_manual(struct device *dev, unsigned int permille,
+						   unsigned int min_step_rpm)
+{
+	return -ENODEV;
+}
+static inline bool macsmc_hwmon_hotspot_assist_available(void)
+{
+	return false;
+}
+static inline int macsmc_hwmon_hotspot_assist_policy(struct device *dev,
+						     struct macsmc_hwmon_fan_assist *policy)
 {
 	return -ENODEV;
 }

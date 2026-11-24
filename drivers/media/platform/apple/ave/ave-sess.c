@@ -169,18 +169,26 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 	/*
 	 * HEVC Main 10 encodes P010 input; Main encodes NV12. The firmware
 	 * takes 16-bit samples for Main 10 (macOS converts 8-bit input to that
-	 * first), so other pairings are refused rather than converted.
+	 * first), so other pairings are refused rather than converted. S_FMT
+	 * sets the profile from the raw format, so only a profile set after it
+	 * gets here.
 	 */
 	if ((p->codec == AVE_CODEC_HEVC &&
 	     ctx->hevc_profile == V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10) !=
-	    (p->sample_bytes == 2))
+	    (p->sample_bytes == 2)) {
+		dev_info_ratelimited(ctx->ave->dev, "%s%s does not take %s input\n",
+				     p->codec == AVE_CODEC_HEVC ? "HEVC " : "H.264",
+				     p->codec != AVE_CODEC_HEVC ? "" :
+				     p->sample_bytes == 2 ? "Main" : "Main 10",
+				     p->sample_bytes == 2 ? "10-bit P010" : "8-bit NV12");
 		return -EINVAL;
+	}
 	if (ctx->ave->layout->kind == AVE_LAYOUT_6070 && p->sample_bytes != 1)
 		return -EOPNOTSUPP;
 	/*
-	 * The 6070 path is qualified for 8-bit H.264 (low delay and one B per
-	 * P) and HEVC Main (low delay) with frame widths in whole macroblocks;
-	 * wider-than-coded widths are not yet.
+	 * The 6070 path supports 8-bit H.264 and HEVC Main, including one B per
+	 * P, with frame widths in whole macroblocks. Wider-than-coded widths are
+	 * not yet supported.
 	 */
 	if (ctx->ave->layout->kind == AVE_LAYOUT_6070 && p->width % 16)
 		return -EOPNOTSUPP;
@@ -201,11 +209,6 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 	p->intra_only = p->codec == AVE_CODEC_H264 && ctx->gop_size == 1;
 	p->bframes = !baseline && !p->intra_only && ctx->b_frames;
 	p->reorder_off = !ctx->b_frames;
-	/* 6070 HEVC with B pictures stops answering; code it as low delay. */
-	if (ctx->ave->layout->kind == AVE_LAYOUT_6070 && p->codec == AVE_CODEC_HEVC) {
-		p->bframes = false;
-		p->reorder_off = true;
-	}
 	p->refs = p->intra_only ? 1 : p->bframes ? 5 : 2;
 	p->slots = p->bframes ? 5 : 3;
 	/*
@@ -263,10 +266,15 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 	if (p->rc_mode == AVE_RC_CQ)
 		p->coded_cap = ALIGN(p->coded_cap * 2, SZ_16K);
 	p->coded_cap = max_t(u32, p->coded_cap, AVE_CODED_MIN);
-	if (ctx->ave->layout->counted &&
+	if (ctx->ave->layout->counted && !ctx->ave->layout->any_gop &&
 	    (p->fps_num != 30ULL * p->fps_den ||
-	     (!p->bframes && (p->codec == AVE_CODEC_HEVC || (!baseline && !p->intra_only)))))
+	     (!p->bframes && (p->codec == AVE_CODEC_HEVC || (!baseline && !p->intra_only))))) {
+		dev_info(ctx->ave->dev,
+			 "%s layout: only 30 fps with 3 B-frames is qualified (asked %u/%u fps, %s B-frames)\n",
+			 ctx->ave->layout->name, p->fps_num, p->fps_den,
+			 p->bframes ? "with" : "no");
 		return -EOPNOTSUPP;
+	}
 	return 0;
 }
 
@@ -756,6 +764,10 @@ static void ave_note_copy(struct ave_ctx *ctx, u32 stride, const char *how)
  * buffer with their own, smaller line size instead, which shows in the
  * payload size; such frames are copied to a per-slot buffer in the
  * encoder's layout.
+ *
+ * The encoder reads a whole coded frame (p->ch lines, the size S_FMT
+ * reports) from the address it is given, so every address handed out here
+ * has that much memory behind it.
  */
 int ave_sess_input(struct ave_ctx *ctx, unsigned int slot, struct vb2_v4l2_buffer *src,
 		   dma_addr_t *input)
@@ -767,6 +779,7 @@ int ave_sess_input(struct ave_ctx *ctx, unsigned int slot, struct vb2_v4l2_buffe
 	u32 used = vb2_get_plane_payload(vb, 0) - min(off, vb2_get_plane_payload(vb, 0));
 	u32 crows = DIV_ROUND_UP(p->height, 2), rows = p->height + crows;
 	u32 width = ALIGN(p->width, 2) * p->sample_bytes, stride;
+	size_t frame = (size_t)p->stride * p->ch * 3 / 2;
 	struct ave_buf *b = &sess->slot[slot].bounce;
 	const u8 *from;
 	u8 *to;
@@ -774,6 +787,12 @@ int ave_sess_input(struct ave_ctx *ctx, unsigned int slot, struct vb2_v4l2_buffe
 
 	*input = vb2_dma_contig_plane_dma_addr(vb, 0) + off;
 	if (!used || used >= p->stride * rows || used % rows || used / rows < width) {
+		if ((size_t)off + frame > vb2_plane_size(vb, 0)) {
+			dev_err_ratelimited(ctx->ave->dev,
+					    "OUTPUT plane has no %zu byte frame after offset %u\n",
+					    frame, off);
+			return -EINVAL;
+		}
 		if (IS_ALIGNED(*input, 64))
 			return 0;
 		dev_err(ctx->ave->dev, "OUTPUT plane at %pad is not 64-byte aligned\n", input);
@@ -793,10 +812,11 @@ int ave_sess_input(struct ave_ctx *ctx, unsigned int slot, struct vb2_v4l2_buffe
 	 * Buffers the driver allocated (MMAP) are large enough for the
 	 * encoder's layout: spread the lines out in place, last line first,
 	 * so no extra DMA space is needed. Imported buffers may be shared
-	 * with other users and get a copy instead.
+	 * with other users and get a copy instead, and so does a buffer whose
+	 * data_offset leaves the picture off the encoder's 64-byte alignment.
 	 */
-	if (vb->memory == VB2_MEMORY_MMAP &&
-	    vb2_plane_size(vb, 0) >= off + (size_t)p->stride * rows) {
+	if (vb->memory == VB2_MEMORY_MMAP && IS_ALIGNED(*input, 64) &&
+	    vb2_plane_size(vb, 0) >= (size_t)off + frame) {
 		to = (u8 *)from;
 		for (u32 y = rows; y-- > 0;)
 			memmove(to + y * p->stride, from + y * stride, width);
@@ -804,7 +824,7 @@ int ave_sess_input(struct ave_ctx *ctx, unsigned int slot, struct vb2_v4l2_buffe
 		return 0;
 	}
 
-	ret = ave_alloc(ctx->ave, b, p->stride * rows, 0);
+	ret = ave_alloc(ctx->ave, b, frame, 0);
 	if (ret) {
 		dev_err(ctx->ave->dev, "no room to copy %u byte stride input\n", stride);
 		return ret;

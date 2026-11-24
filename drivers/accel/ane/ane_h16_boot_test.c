@@ -23,6 +23,11 @@ struct ane_h16_sim {
 	u32 command_count;
 	u32 scratch_writes;
 	u32 tuning_writes;
+	/* Tuning writes expected before the first scratch write; XL writes seen. */
+	u32 expect_tuning;
+	u32 xl_writes;
+	/* Engine registers below 0x5000 keep what is written, like the AXI block. */
+	u32 engine[0x5000 / 4];
 	u32 dapf_writes;
 	u32 mailbox_polls;
 	u32 maps;
@@ -34,6 +39,8 @@ struct ane_h16_sim {
 	u32 timeout_scratch;
 	u64 timeout_head;
 	u32 lock;
+	u32 protect[3];
+	u32 protect_reads;
 	u32 fault;
 	u32 fault_address_reads;
 	u32 channel_request;
@@ -84,8 +91,10 @@ static void sim_check_dart(struct ane_h16_sim *s, enum ane_h16_window w, u32 off
 	KUNIT_ASSERT_NOT_NULL(s->test, m);
 	if (off == m->dart_fault || off == m->dart_address_lo || off == m->dart_address_hi)
 		return;
+	if (off == m->dart_protect)
+		return;
 	KUNIT_EXPECT_EQ(s->test, w, ANE_H16_DART0 + s->soc.dapf_dart);
-	KUNIT_EXPECT_TRUE(s->test, off == m->dart_protect || off == m->dart_lock);
+	KUNIT_EXPECT_EQ(s->test, off, m->dart_lock);
 }
 
 static void sim_check_dapf(struct ane_h16_sim *s, u32 off, u32 width)
@@ -94,7 +103,8 @@ static void sim_check_dapf(struct ane_h16_sim *s, u32 off, u32 width)
 
 	KUNIT_ASSERT_NOT_NULL(s->test, m);
 	KUNIT_EXPECT_GE(s->test, off, m->dapf_records);
-	KUNIT_EXPECT_LE(s->test, off + width, m->dapf_records + 4 * m->dapf_stride);
+	KUNIT_EXPECT_LE(s->test, off + width,
+			m->dapf_records + s->soc.dapf_count * m->dapf_stride);
 	KUNIT_EXPECT_LE(s->test, off + width, s->soc.dapf_size);
 }
 
@@ -108,7 +118,11 @@ static u32 sim_read32(void *ctx, enum ane_h16_window w, u32 off)
 		sim_check_dart(s, w, off);
 		if (off == s->soc.dart_params)
 			return s->dart_params;
-		if (off == s->mmio.dart_protect || off == s->mmio.dart_lock)
+		if (off == s->mmio.dart_protect) {
+			s->protect_reads |= BIT(w - ANE_H16_DART0);
+			return s->protect[w - ANE_H16_DART0];
+		}
+		if (off == s->mmio.dart_lock)
 			return s->lock;
 		if (off == s->mmio.dart_fault)
 			return s->fault;
@@ -130,6 +144,8 @@ static u32 sim_read32(void *ctx, enum ane_h16_window w, u32 off)
 			return s->scratch[(off - s->soc.scratch) / 4];
 		if (off == s->soc.irq_status)
 			return s->irq;
+		if (off < sizeof(s->engine))
+			return s->engine[off / 4];
 	}
 	return 0xa5a5a5a5;
 }
@@ -233,7 +249,7 @@ static void sim_write32(void *ctx, enum ane_h16_window w, u32 off, u32 value)
 		if (s->scratch_writes < 8) {
 			KUNIT_EXPECT_EQ(s->test, cell, s->scratch_writes);
 			KUNIT_EXPECT_EQ(s->test, value, 0U);
-			KUNIT_EXPECT_EQ(s->test, s->tuning_writes, 103U);
+			KUNIT_EXPECT_EQ(s->test, s->tuning_writes, s->expect_tuning);
 		}
 		s->scratch_writes++;
 		s->scratch[cell] = value;
@@ -307,6 +323,10 @@ static void sim_write32(void *ctx, enum ane_h16_window w, u32 off, u32 value)
 	/* The selected AXI and XL tables must finish before scratch writes. */
 	KUNIT_EXPECT_TRUE(s->test, !s->boot.ran || s->reset);
 	s->tuning_writes++;
+	if (w == ANE_H16_XL)
+		s->xl_writes++;
+	else if (off < sizeof(s->engine))
+		s->engine[off / 4] = value;
 }
 
 static void sim_write64(void *ctx, enum ane_h16_window w, u32 off, u64 value)
@@ -541,7 +561,7 @@ static void sim_program_dapf(struct ane_h16_sim *s)
 {
 	unsigned int i;
 
-	for (i = 0; i < 4; i++) {
+	for (i = 0; i < s->soc.dapf_count; i++) {
 		u32 *p = &s->dapf[(s->mmio.dapf_records + i * s->mmio.dapf_stride) / 4];
 		u64 end = s->boot.ranges[i][1] & s->mmio.dapf_end_mask;
 
@@ -574,6 +594,8 @@ static int sim_init(struct kunit *test)
 	s->soc.dapf_dart = 0;
 	s->soc.dapf_offset = 0x10000;
 	s->soc.dapf_size = SZ_16K;
+	s->soc.dapf_count = 4;
+	s->soc.has_xl = true;
 	s->soc.scratch = 0x1880020;
 	s->soc.doorbell = 0x1884000;
 	s->soc.irq_status = 0x188c000;
@@ -585,10 +607,11 @@ static int sim_init(struct kunit *test)
 	s->boot.ops = &sim_ops;
 	s->boot.transport_ops = &sim_transport_ops;
 	s->boot.ctx = s;
-	for (i = 0; i < 4; i++) {
+	for (i = 0; i < ANE_FW_DAPF_MAX; i++) {
 		s->boot.ranges[i][0] = 0x500000000ULL + i * SZ_16K;
 		s->boot.ranges[i][1] = s->boot.ranges[i][0] + 3;
 	}
+	s->expect_tuning = 103;
 	/* The J616s bank after iBoot: power-on values, flags 0. */
 	for (i = 0; i < ARRAY_SIZE(s->dapf); i++)
 		s->dapf[i] = i % 16 ? 0x5a5a0000 | i : 0;
@@ -1113,6 +1136,29 @@ static void ane_h16_map_failure_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, s->pins, 0U);
 }
 
+/* Every DART is observed; only bit 0 prevents fresh translation ownership. */
+static void ane_h16_dart_protection_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+	unsigned int i;
+
+	KUNIT_EXPECT_EQ(test, ane_h16_dart_protection(&s->boot, true), -ENODEV);
+	KUNIT_EXPECT_EQ(test, s->protect_reads, 0U);
+	KUNIT_ASSERT_EQ(test, ane_h16_select_mmio(&s->boot), 0);
+	for (i = 0; i < 3; i++) {
+		s->protect[i] = BIT(0);
+		s->protect_reads = 0;
+		KUNIT_EXPECT_EQ(test, ane_h16_dart_protection(&s->boot, true), -EPERM);
+		KUNIT_EXPECT_EQ(test, s->protect_reads, 7U);
+		KUNIT_EXPECT_EQ(test, ane_h16_dart_protection(&s->boot, false), 0);
+		s->protect[i] = BIT(1) | BIT(2);
+	}
+	KUNIT_EXPECT_EQ(test, ane_h16_dart_protection(&s->boot, true), 0);
+	KUNIT_EXPECT_EQ(test, s->dapf_writes, 0U);
+	KUNIT_EXPECT_EQ(test, s->maps, 0U);
+	KUNIT_EXPECT_EQ(test, s->scratch_writes, 0U);
+}
+
 static void ane_h16_locked_matching_test(struct kunit *test)
 {
 	struct ane_h16_sim *s = test->priv;
@@ -1131,6 +1177,7 @@ static void ane_h16_dapf_program_test(struct kunit *test)
 	unsigned int i;
 
 	KUNIT_ASSERT_EQ(test, ane_h16_run(&s->boot, ANE_H16_PREFLIGHT), 0);
+	KUNIT_EXPECT_EQ(test, s->protect_reads, 7U);
 	KUNIT_EXPECT_EQ(test, s->dapf_writes, 0U);
 	KUNIT_ASSERT_EQ(test, ane_h16_run(&s->boot, ANE_H16_MAP), 0);
 	KUNIT_EXPECT_EQ(test, s->dapf_writes, 20U);
@@ -1224,13 +1271,162 @@ static void ane_h16_foreign_free_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, s->boot.transport.shared_retired[0]);
 }
 
+/* The T8132: five DAPF records, no XL window, its own engine writes. */
+static void sim_use_t8132(struct ane_h16_sim *s)
+{
+	s->build = ane_h16_build_t8132_25g83;
+	s->soc.dapf_count = 5;
+	s->soc.has_xl = false;
+	s->expect_tuning = ARRAY_SIZE(ane_t8132_axi2af) + ARRAY_SIZE(ane_t8132_axi) +
+			   ARRAY_SIZE(ane_t8132_axi_wd) +
+			   ARRAY_SIZE(ane_t8132_axi_lock);
+}
+
+/* Map programs and reads back all five T8132 records. */
+static void ane_h16_dapf_five_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+	unsigned int i;
+
+	sim_use_t8132(s);
+	KUNIT_ASSERT_EQ(test, ane_h16_run(&s->boot, ANE_H16_MAP), 0);
+	KUNIT_EXPECT_EQ(test, s->dapf_writes, 25U);
+	for (i = 0; i < 5; i++)
+		KUNIT_EXPECT_TRUE(test, ane_h16_dapf_record(&s->boot, i));
+}
+
+/* A fifth record that does not read back fails map before RUN. */
+static void ane_h16_dapf_five_readback_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+
+	sim_use_t8132(s);
+	s->dapf_stuck = 4;
+	KUNIT_EXPECT_EQ(test, ane_h16_run(&s->boot, ANE_H16_MAP), -EIO);
+	KUNIT_EXPECT_EQ(test, s->dapf_writes, 25U);
+	KUNIT_EXPECT_FALSE(test, s->boot.ran);
+}
+
+/* A platform without the XL window skips the build's XL tunables. */
+static void ane_h16_no_xl_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+
+	s->soc.has_xl = false;
+	s->expect_tuning = 103 - ARRAY_SIZE(ane_h16_xl);
+	KUNIT_ASSERT_EQ(test, ane_h16_run(&s->boot, ANE_H16_STARTUP), 0);
+	KUNIT_EXPECT_EQ(test, s->xl_writes, 0U);
+}
+
+/* H15 (T8122): no CE block, no tunables, five DAPF records, DART rev 0x200. */
+static void ane_h16_t8122_no_ce_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+
+	s->build = ane_h15_build_t8122_26b123;
+	s->mmio = ane_h15_mmio_t8122[0];
+	s->dart_params = 0x2a2a0200;
+	s->soc.h16_mmio = ane_h15_mmio_t8122;
+	s->soc.h16_mmio_count = ARRAY_SIZE(ane_h15_mmio_t8122);
+	s->soc.dapf_count = 5;
+	s->soc.has_xl = false;
+	s->ce_timeout = true;
+	s->expect_tuning = 0;
+	KUNIT_ASSERT_EQ(test, ane_h16_run(&s->boot, ANE_H16_STARTUP), 0);
+	KUNIT_EXPECT_EQ(test, s->tuning_writes, 0U);
+	KUNIT_EXPECT_EQ(test, s->ce_ack, 0ULL);
+	KUNIT_EXPECT_EQ(test, s->dapf_writes, 25U);
+}
+
+/* The T8132 boots with its own engine writes only: no XL or C1PPT. */
+static void ane_h16_t8132_tunables_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+
+	sim_use_t8132(s);
+	KUNIT_ASSERT_EQ(test, ane_h16_run(&s->boot, ANE_H16_STARTUP), 0);
+	KUNIT_EXPECT_EQ(test, s->xl_writes, 0U);
+	KUNIT_EXPECT_EQ(test, s->engine[0], 0x8000001bU);
+	KUNIT_EXPECT_EQ(test, s->engine[0xdfc / 4], 1U);
+}
+
+/*
+ * Within one power cycle the T8132 engine set stays locked: a second
+ * preparation writes nothing when the values match and refuses a changed one.
+ */
+static void ane_h16_t8132_locked_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+	u32 writes;
+
+	sim_use_t8132(s);
+	KUNIT_ASSERT_EQ(test, ane_h16_prepare(&s->boot), 0);
+	writes = s->tuning_writes;
+	KUNIT_EXPECT_EQ(test, writes, s->expect_tuning);
+	KUNIT_EXPECT_EQ(test, ane_h16_prepare(&s->boot), 0);
+	KUNIT_EXPECT_EQ(test, s->tuning_writes, writes);
+	s->engine[0x4 / 4] ^= 0x10000;
+	KUNIT_EXPECT_EQ(test, ane_h16_prepare(&s->boot), -EPERM);
+}
+
+/*
+ * An aborted system suspend cycles the T8132 sub-blocks under a held
+ * ANE_SYS: the AXI2AF words lose their bit-31 load strobe, the lock and the
+ * fields stay. The locked set still matches; a changed field is refused.
+ */
+static void ane_h16_t8132_locked_strobe_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+	unsigned int i;
+	u32 writes;
+
+	sim_use_t8132(s);
+	KUNIT_ASSERT_EQ(test, ane_h16_prepare(&s->boot), 0);
+	writes = s->tuning_writes;
+	for (i = 0; i < ARRAY_SIZE(ane_t8132_axi2af); i++)
+		s->engine[ane_t8132_axi2af[i].offset / 4] &= ~BIT(31);
+	KUNIT_EXPECT_EQ(test, s->engine[0], 0x1bU);
+	KUNIT_EXPECT_EQ(test, ane_h16_prepare(&s->boot), 0);
+	KUNIT_EXPECT_EQ(test, s->tuning_writes, writes);
+	s->engine[0] ^= 0x1;
+	KUNIT_EXPECT_EQ(test, ane_h16_prepare(&s->boot), -EPERM);
+	KUNIT_EXPECT_EQ(test, s->tuning_writes, writes);
+}
+
+/*
+ * Only the AXI2AF words have the strobe: a bit-31 field further up that
+ * clears, or a lost write-disable bit, is refused.
+ */
+static void ane_h16_t8132_locked_wd_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+
+	sim_use_t8132(s);
+	KUNIT_ASSERT_EQ(test, ane_h16_prepare(&s->boot), 0);
+	s->engine[0x314 / 4] &= ~BIT(31);
+	KUNIT_EXPECT_EQ(test, ane_h16_prepare(&s->boot), -EPERM);
+	s->engine[0x314 / 4] |= BIT(31);
+	KUNIT_EXPECT_EQ(test, ane_h16_prepare(&s->boot), 0);
+	s->engine[ane_t8132_axi_wd[0].offset / 4] = 0;
+	KUNIT_EXPECT_EQ(test, ane_h16_prepare(&s->boot), -EPERM);
+}
+
 static struct kunit_case ane_h16_boot_cases[] = {
 	KUNIT_CASE(ane_h16_alloc_reuse_test),
 	KUNIT_CASE(ane_h16_happy_test),
+	KUNIT_CASE(ane_h16_dart_protection_test),
 	KUNIT_CASE(ane_h16_locked_matching_test),
 	KUNIT_CASE(ane_h16_dapf_program_test),
 	KUNIT_CASE(ane_h16_dapf_partial_test),
 	KUNIT_CASE(ane_h16_dapf_readback_test),
+	KUNIT_CASE(ane_h16_dapf_five_test),
+	KUNIT_CASE(ane_h16_dapf_five_readback_test),
+	KUNIT_CASE(ane_h16_no_xl_test),
+	KUNIT_CASE(ane_h16_t8122_no_ce_test),
+	KUNIT_CASE(ane_h16_t8132_tunables_test),
+	KUNIT_CASE(ane_h16_t8132_locked_test),
+	KUNIT_CASE(ane_h16_t8132_locked_strobe_test),
+	KUNIT_CASE(ane_h16_t8132_locked_wd_test),
 	KUNIT_CASE(ane_h16_unknown_revision_test),
 	KUNIT_CASE(ane_h16_heap_overlap_test),
 	KUNIT_CASE(ane_h16_native_free_test),

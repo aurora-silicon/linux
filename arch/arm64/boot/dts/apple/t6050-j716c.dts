@@ -15,6 +15,7 @@
 
 #define T6050_J716C
 #include "t6050-max.dtsi"
+#include "hwmon-fan-dual.dtsi"
 
 / {
 	compatible = "apple,j716c", "apple,t6050", "apple,arm-platform";
@@ -47,6 +48,8 @@
 			compatible = "apple,simple-framebuffer", "simple-framebuffer";
 			reg = <0 0 0 0>; /* To be filled by the loader */
 			/* Format properties will be added by the loader */
+			/* Scanned out by the internal DCP, handed off or not. */
+			display = <&dcp>;
 			status = "disabled";
 		};
 	};
@@ -176,16 +179,32 @@
 
 /*
  * Pin 112's register (0x29c0001c0) takes an SError when read, so only the pins a node
- * here names are exposed: 80 (PCIe port 0's PERST#, ADT pci-bridge0 function-perst).
+ * here names are exposed: 80 (PCIe port 0's PERST#, ADT pci-bridge0 function-perst) and
+ * 138 (the Touch ID sensor's data-ready line).
  * A reserved line cannot be requested, so a node that names a new pin opens it here too.
  */
 &pinctrl_ap {
-	gpio-reserved-ranges = <0 80>, <81 140>;
+	gpio-reserved-ranges = <0 80>, <81 57>, <139 82>;
 };
 
-/* This board's SMC fan and power keys are not yet checked */
+/*
+ * Inherit apple,discover-temperatures and apple,soc-die-keys ("TCMb") from
+ * t6050-die0.dtsi so all readable T* float sensors are discovered and TCMb
+ * supplies the macsmc_soc_die thermal zone for the GPU thermal governor.
+ * T6050 spells the fan mode keys F0md/F1md and accepts manual fan targets.
+ */
 &smc_hwmon {
-	status = "disabled";
+	status = "okay";
+
+	fan-F0Ac {
+		apple,fan-mode = "F0md";
+		apple,fan-manual-control;
+	};
+
+	fan-F1Ac {
+		apple,fan-mode = "F1md";
+		apple,fan-manual-control;
+	};
 };
 
 /*
@@ -197,8 +216,23 @@
 	status = "okay";
 };
 
+/* The MTP and its DockChannel FIFO, which carry the keyboard and trackpad */
+&mtp_mbox {
+	status = "okay";
+};
+
+&mtp_dart {
+	status = "okay";
+};
+
+&mtp {
+	status = "okay";
+};
+
 /* The keyboard and trackpad: the HID transport on the MTP's DockChannel FIFO */
 &mtp_dockchannel {
+	status = "okay";
+
 	mtp_hid: input@8000 {
 		compatible = "apple,dockchannel-hid";
 		reg = <0x8000 0x1000>, <0xc000 0x1000>,
@@ -246,8 +280,73 @@
 			63 2e 00 06 02 69 4f 53 00 00 00 00];
 };
 
+/*
+ * Touch ID (ADT spi2/mesa), wired as on the J714s: the Mesa sensor (sensor-id
+ * 0x3356) at 8 MHz on chip select 0, powered by NUB GPIO 21 (function-mesa_pwr),
+ * data ready on AP GPIO 138. The controller's clock (ADT clock-ids 451) is the
+ * 24 MHz reference.
+ */
+&ps_nub_gpio {
+	status = "okay";
+};
+
+&nub_gpio0 {
+	status = "okay";
+};
+
+&ps_spi2 {
+	status = "okay";
+};
+
+&spi2 {
+	clocks = <&clkref>;
+	status = "okay";
+
+	mesa: fingerprint@0 {
+		compatible = "apple,mesa-fingerprint";
+		reg = <0>;
+		spi-max-frequency = <8000000>;
+		spi-cpol;
+		spi-cs-setup-delay-ns = <20>;
+		spi-cs-hold-delay-ns = <20>;
+		enable-gpios = <&nub_gpio0 21 GPIO_ACTIVE_HIGH>;
+		interrupt-parent = <&pinctrl_ap>;
+		interrupts = <138 IRQ_TYPE_EDGE_RISING>;
+		/* Per-device factory data from this Mac's own iBoot system container */
+		firmware-name = "apple/mesacal-j716c.bin", "apple/msrk-j716c.bin";
+	};
+};
+
 #include "t6050-j716c-isp.dtsi"
 #include "t6050-j716c-gpu-panel.dtsi"
 
 #include "t6050-j716c-display.dtsi"
 #include "t6050-j716c-left-usb4.dtsi"
+#include "t6050-j716c-sep.dtsi"
+
+#include "t6050-j716c-sleep.dtsi"
+#include "t6050-j716c-sleep-full.dtsi"
+
+/*
+ * The Neural Engine, started only after the boot loader's preload hand-off.
+ * ANE_SYS sits behind FAB8_SOC (kept on for the SEP above) and FAB9_SOC (on for
+ * the camera).
+ */
+#include "t6050-j714s-ane.dtsi"
+
+/* The port controllers follow the sleep's command rules (tipd: woken first, read at intervals) */
+&hpm0 {
+	apple,sleep-ssps-rules;
+};
+
+&hpm1 {
+	apple,sleep-ssps-rules;
+};
+
+&hpm2 {
+	apple,sleep-ssps-rules;
+};
+
+&hpm5 {
+	apple,sleep-ssps-rules;
+};

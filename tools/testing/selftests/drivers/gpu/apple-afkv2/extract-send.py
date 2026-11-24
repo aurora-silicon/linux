@@ -31,6 +31,11 @@ prefix = r'''
 #include "afkv2-codec.h"
 #include "afk_reply.h"
 #define SZ_1M 1048576U
+#define SZ_16K 16384UL
+#define SZ_16M (16UL<<20)
+#ifndef ALIGN
+#define ALIGN(x,a) (((x)+(a)-1)&~((a)-1))
+#endif
 #define U32_MAX 0xffffffffU
 #define MSEC_PER_SEC 1000U
 #define GFP_KERNEL 0
@@ -43,6 +48,7 @@ prefix = r'''
 #define kmalloc(n,f) malloc(n)
 #define kfree(p) free(p)
 #define READ_ONCE(x) (x)
+#define WRITE_ONCE(x,v) ((x)=(v))
 #define spin_lock_irqsave(l,f) ((void)(l),(f)=0)
 #define spin_unlock_irqrestore(l,f) ((void)(l),(void)(f))
 #define dma_rmb() do {} while(0)
@@ -63,10 +69,11 @@ struct cmd_info {
  size_t reply_len; bool reply_len_valid;
  bool done,free_on_ack; int *completion;
 };
-struct dcp { void *dev; bool quiescing,external; void *rtk; };
+struct dcp { void *dev; bool quiescing,external,crashed,ext26; void *rtk; };
+static bool dcp_is_ext26(const struct dcp *dcp) { return dcp->ext26; }
 struct afk_ringbuffer { bool ready; };
 struct apple_dcp_afkep { struct dcp *dcp; bool wire_v2,inline_v2,compact; int endpoint,lock;u8 *command_tags;
- struct afk_ringbuffer txbfr,rxbfr; };
+ struct afk_ringbuffer txbfr,rxbfr; size_t ext26_command_bytes; unsigned int ext26_command_count; };
 struct ops { const char *name; };
 struct apple_epic_service {
  struct apple_dcp_afkep *ep; struct ops *ops; unsigned int channel; unsigned long cmd_map[1];
@@ -222,8 +229,34 @@ int main(void)
  assert(frees==before_late+2);
  s.enabled=true;s.torndown=false;timeout=0;
  assert(!afk_send_command_timeout_len(&s,0xc0,request,112,output,32888,&status,1000,&received));
- assert(!s.cmd_map[0] && s.users==1);free(output);
- puts("PASS: extracted production sender, 128-byte command envelope / 32888-byte reply, short OOB, strict/legacy callers, legacy reply lengths, compact status and actual late-ACK ownership");
+ assert(!s.cmd_map[0] && s.users==1);
+ /* J613 ext26 keeps every command's DMA: a budget bounds it, a timeout latches crashed. */
+ dcp.ext26=true;unsigned int ext_frees=frees,ext_sends=sends;
+ assert(!afk_send_command_timeout_len(&s,0xc0,request,112,output,32888,&status,1000,&received));
+ size_t charge=ep.ext26_command_bytes;
+ assert(received==32888 && frees==ext_frees && sends==ext_sends+1 && !s.cmd_map[0]);
+ assert(ep.ext26_command_count==1 && charge==SZ_16K+ALIGN(32888,SZ_16K));
+ free(s.cmds[0].rxbuf);free(s.cmds[0].txbuf);
+ ep.ext26_command_bytes=SZ_16M-charge+1;
+ assert(afk_send_command_timeout_len(&s,0xc0,request,112,output,32888,&status,1000,&received)==-ENOSPC);
+ assert(ep.ext26_command_count==1 && ep.ext26_command_bytes==SZ_16M-charge+1);
+ ep.ext26_command_bytes=SZ_16M-charge;
+ assert(!afk_send_command_timeout_len(&s,0xc0,request,112,output,32888,&status,1000,&received));
+ assert(ep.ext26_command_bytes==SZ_16M && ep.ext26_command_count==2 && frees==ext_frees);
+ free(s.cmds[0].rxbuf);free(s.cmds[0].txbuf);
+ ep.ext26_command_bytes=0;ep.ext26_command_count=255;
+ assert(afk_send_command_timeout_len(&s,0xc0,request,112,output,32888,&status,1000,&received)==-ENOSPC);
+ assert(ep.ext26_command_count==255);ep.ext26_command_count=0;dcp.crashed=true;
+ assert(afk_send_command_timeout_len(&s,0xc0,request,112,output,32888,&status,1000,&received)==-EIO);
+ assert(!ep.ext26_command_count && sends==ext_sends+2 && s.users==1 && !s.cmd_map[0]);
+ dcp.crashed=false;timeout=1;
+ assert(afk_send_command_timeout_len(&s,0xc0,request,112,output,32888,&status,1000,&received)==-ETIMEDOUT);
+ assert(dcp.crashed && s.cmd_map[0] && !s.cmds[0].free_on_ack && !s.cmds[0].completion);
+ assert(frees==ext_frees && s.users==1 && ep.ext26_command_count==1);
+ assert(afk_send_command_timeout_len(&s,0xc0,request,112,output,32888,&status,1000,&received)==-EIO);
+ assert(sends==ext_sends+3 && s.users==1);
+ free(s.cmds[0].rxbuf);free(s.cmds[0].txbuf);s.cmd_map[0]=0;free(output);
+ puts("PASS: extracted production sender, 128-byte command envelope / 32888-byte reply, short OOB, strict/legacy callers, legacy reply lengths, compact status, actual late-ACK ownership and the ext26 budget");
 }
 '''
 bodies = [function(r"static u32 afk_compact_next_status", "compact status allocator"),

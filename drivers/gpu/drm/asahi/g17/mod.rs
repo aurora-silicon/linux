@@ -35,6 +35,7 @@ pub(crate) mod context;
 mod data_segment;
 mod dependency;
 mod sync_input;
+pub(crate) mod exec_share;
 pub(crate) mod sync_output;
 mod trace;
 #[cfg(CONFIG_DRM_ASAHI_G15)]
@@ -68,6 +69,7 @@ mod teardown;
 pub(crate) mod telemetry;
 mod thermal;
 mod timeout;
+mod traversal;
 mod validation;
 
 use core::any::Any;
@@ -271,15 +273,12 @@ pub(crate) struct CoreLayout {
 
 /// Where a G17 target's crash log buffers live.
 pub(crate) enum CrashBuffers {
-    /// One buffer per [`Role`] that the firmware requests at a fixed address of the kernel
-    /// lower root, mapped by the driver before the coprocessors start.
-    Fixed([FixedBuffer; 2]),
     /// The firmware places its crash log in its own data segment, the `fw-data` reserved
     /// region, and asks for it there by physical address.
     FirmwareData,
     /// As [`CrashBuffers::FirmwareData`] when the boot loader describes the data segment as
-    /// the `fw-data` region. A boot loader that does not gets the driver's own buffers, as
-    /// [`CrashBuffers::Fixed`], at the low bits of the physical address the firmware asks for;
+    /// the `fw-data` region. A boot loader that does not gets the driver's own buffers, one per
+    /// [`Role`], at the low bits of the physical address the firmware asks for;
     /// the firmware does not write its crash log there.
     FirmwareDataOrFixed([FixedBuffer; 2]),
 }
@@ -367,10 +366,20 @@ pub(crate) struct CrashLog {
 
 /// The CPU mapping of a crash log buffer.
 enum CrashLogMap {
-    /// The driver's buffer ([`CrashBuffers::Fixed`]).
+    /// The driver's buffer ([`CrashBuffers::FirmwareDataOrFixed`]).
     Object(shmem::VMapOwned<AsahiObject>),
     /// A buffer in the firmware's data segment ([`CrashBuffers::FirmwareData`]).
     FirmwareData(data_segment::DataSegmentLog),
+}
+
+impl CrashLog {
+    /// Map only the range firmware requested within its loader-reserved data.
+    pub(crate) fn from_firmware(dev: &device::Device, iova: usize, size: usize) -> Result<Self> {
+        Ok(Self {
+            iova,
+            map: CrashLogMap::FirmwareData(data_segment::DataSegmentLog::map(dev, iova, size)?),
+        })
+    }
 }
 
 impl rtkit::Buffer for CrashLog {
@@ -481,14 +490,7 @@ impl rtkit::Operations for RoleOps {
             });
         }
         // The firmware places its buffers in its data segment, at their physical address.
-        Ok(CrashLog {
-            iova,
-            map: CrashLogMap::FirmwareData(data_segment::DataSegmentLog::map(
-                &data.shared.dev,
-                iova,
-                size,
-            )?),
-        })
+        CrashLog::from_firmware(&data.shared.dev, iova, size)
     }
 }
 
@@ -560,7 +562,6 @@ impl Coprocessor {
     ) -> Result<Coprocessor> {
         let index = role as usize;
         let fixed = match &cfg.crash_buffers {
-            CrashBuffers::Fixed(buffers) => Some(buffers),
             CrashBuffers::FirmwareData => None,
             CrashBuffers::FirmwareDataOrFixed(buffers) => {
                 let described = data_segment::described(dev.as_ref().as_ref());
@@ -898,21 +899,10 @@ impl Firmware {
         power::release(self)
     }
 
-    /// Retry a temporarily unavailable transaction once under a registration
-    /// power hold. Other access errors propagate to the retained owner.
-    fn submit_m5_work(&mut self, submission: &fw::m5::queue::HardwareSubmission) -> Result {
-        match self.bridge.regs.submit_m5_work(submission) {
-            Err(error) if error == EAGAIN => {
-                self.acquire_registration_power()?;
-                self.bridge.regs.submit_m5_work(submission)
-            }
-            result => result,
-        }
-    }
-
     /// Both outer slots and their capacity are checked before any host-port
-    /// write. An EAGAIN retry drops the old views and revalidates them under a
-    /// power hold. After a successful transaction, publication is infallible.
+    /// write. The host command port needs no core power, and its transaction
+    /// fails only once the register mapping is gone; the error propagates.
+    /// After a successful transaction, publication is infallible.
     fn submit_m5_render_pair(
         &mut self,
         priority: u8,
@@ -923,35 +913,26 @@ impl Firmware {
         deferred: bool,
         cursors: Option<[u32; 3]>,
     ) -> Result<[u32; 2]> {
-        let mut commit_accounting = Some(commit_accounting);
-        let mut publish_inner = Some(publish_inner);
-        let mut cursors = cursors;
-        for attempt in 0..2 {
-            let pair = self.init.m5_work_pair(priority, &records[0], &records[1], cursors.take())?;
-            pair.prepare();
-            if let Some(commit) = commit_accounting.take() { commit()?; }
-            match self.bridge.regs.submit_m5_work(submission) {
-                Err(error) if error == EAGAIN && attempt == 0 => {
-                    drop(pair);
-                    self.acquire_registration_power()?;
-                }
-                Err(error) => return Err(error),
-                Ok(()) => {
-                    if let Some(publish) = publish_inner.take() { publish(); }
-                    return Ok(if deferred { pair.next() } else { pair.publish() });
-                }
-            }
-        }
-        Err(EAGAIN)
+        let pair = self.init.m5_work_pair(priority, &records[0], &records[1], cursors)?;
+        pair.prepare();
+        commit_accounting()?;
+        self.bridge.regs.submit_m5_work(submission)?;
+        publish_inner();
+        Ok(if deferred { pair.next() } else { pair.publish() })
     }
 
     /// Called at actual submission publication, not while a queued job is merely being built.
     fn note_submission(&mut self) -> Result {
+        let now = now_ns();
         self.primary.state.shared.note_submitter();
         self.port.note_gpu_activity();
         self.primary.state.shared.note_gpu_activity();
         self.effort.submit();
-        self.effort.note_waiters(now_ns(), fence::waiters());
+        self.effort.note_waiters(now, fence::waiters());
+        self.effort.note_bound(self.primary.state.shared.feed.busy_run());
+        if self.effort.bound() {
+            self.port.lift_busy_if_below_top(now);
+        }
         self.apply_effort(power::FULL_EFFORT)
     }
 
@@ -970,6 +951,11 @@ impl Firmware {
         // must not look idle merely because it has no subsequent submission.
         if self.effort.applied() != 0 && thermal::requested() {
             self.governor.note_activity(now);
+        }
+        // Without the budget controller only the fan assistance runs (FanBoost::apply).
+        if !thermal::enabled() {
+            let busy = thermal::requested() && self.governor.recent_activity(now);
+            return (busy || fans, thermal::CpuAdvice::Release, busy);
         }
         let Ok(current) = self.init.m5_power_budget() else {
             return (false, thermal::CpuAdvice::Release, false);
@@ -1007,8 +993,8 @@ impl Firmware {
         effort: u32,
     ) -> Result {
         // The performance-controller demand follows the requested effort; the firmware is
-        // given, and the state records, the M5 value (InitData::submission_effort).
-        let published = init.submission_effort(effort, state.waited());
+        // given, and the state records, the published value (InitData::submission_effort).
+        let published = init.submission_effort(effort, state.waited(), state.bound());
         port.set_effort_full(effort == power::FULL_EFFORT);
         if state.applied() == published {
             // M5 maps region C read-only to the firmware: once confirmed, the word holds
@@ -1049,9 +1035,17 @@ impl Firmware {
         if submitted {
             self.effort.submit();
         }
-        // A waiter that began or ended since the last note moves the effort while work streams.
-        if self.effort.streaming() && self.effort.note_waiters(now_ns, fence::waiters()) {
-            self.apply_effort(power::FULL_EFFORT)?;
+        // A waiter or a busy run that began or ended since the last note moves the effort while
+        // work streams.
+        if self.effort.streaming() {
+            let waiters = self.effort.note_waiters(now_ns, fence::waiters());
+            let bound = self.effort.note_bound(self.primary.state.shared.feed.busy_run());
+            if self.effort.bound() {
+                self.port.lift_busy_if_below_top(now_ns);
+            }
+            if waiters || bound {
+                self.apply_effort(power::FULL_EFFORT)?;
+            }
         }
         let effort = match self.effort.idle(now_ns, in_flight || submitted) {
             power::IdleAction::None => None,
@@ -1062,17 +1056,20 @@ impl Firmware {
                     self.effort.submit();
                     return Ok(Some(power::IDLE_HOLD_NS));
                 }
+                self.primary.state.shared.feed.end_busy_run();
                 self.apply_effort(0)?;
                 None
             }
             power::IdleAction::Recheck(delay) => Some(delay),
         };
-        Ok(
-            match (effort, self.idle_hold(now_ns, in_flight || submitted)) {
-                (Some(a), Some(b)) => Some(a.min(b)),
-                (a, b) => a.or(b),
-            },
-        )
+        let busy_recheck = if in_flight {
+            self.port.report_busy(now_ns);
+            self.port.busy_recheck_delay(now_ns)
+        } else {
+            None
+        };
+        let hold = self.idle_hold(now_ns, in_flight || submitted);
+        Ok([effort, hold, busy_recheck].into_iter().flatten().min())
     }
 
     /// Drives the idle hold (see power::Hold); returns the delay in ns for its next check. A
@@ -1191,6 +1188,9 @@ struct Shared {
     clusters: u32,
     active_cores: u32,
     variant: &'static fw::Variant,
+    /// Highest valid performance state index for 0x1b telemetry reports, derived from the
+    /// state-frequency table.
+    max_pstate: u32,
     /// Layout of compute queues' operand-state buffers for this GPU's cores.
     operand_state: &'static fw::compute::OperandState,
     /// The M5 board ([`Config::m5`]) of an M5 profile.
@@ -1210,6 +1210,8 @@ struct Shared {
     sleeping: AtomicBool,
     /// A sleep holds preparations closed, so a recovery settling meanwhile doesn't reopen them.
     sleep_gate: AtomicBool,
+    /// Deadline to reopen an uncommitted sleep after a late preparation drain; zero otherwise.
+    sleep_cancel_deadline: AtomicU64,
     /// The power state word as it was before the firmware stopped.
     sleep_ps: AtomicU32,
     /// The stop the sleep's commit makes, from `.prepare` to `.complete`; null otherwise.
@@ -1231,6 +1233,8 @@ struct Shared {
     /// returns, an owner closes, a teardown parks, and on every event pass
     /// while a render publisher waits (firmware consumption has no event).
     renders: Arc<availability::Availability>,
+    /// Which commands may enter the GPU beside a command that traces rays.
+    traversal: Arc<runtime::traversal::Gate>,
     /// Unbound compute publishers which can reuse a retired channel.
     compute_demand: AtomicU32,
     #[pin]
@@ -1357,6 +1361,7 @@ impl WorkItem<POLL_WORK> for Shared {
     type Pointer = Arc<Shared>;
     fn run(this: Arc<Shared>) {
         if this.sleeping() {
+            this.sleep_cancel_poll();
             return;
         }
         let result = {
@@ -1505,8 +1510,12 @@ impl Shared {
     }
 
     fn queue_poll(self: &Arc<Self>) {
+        self.queue_poll_after(1);
+    }
+
+    fn queue_poll_after(self: &Arc<Self>, delay_ms: u32) {
         let _ = workqueue::system_highpri()
-            .enqueue_delayed::<Arc<Self>, POLL_WORK>(self.clone(), msecs_to_jiffies(1));
+            .enqueue_delayed::<Arc<Self>, POLL_WORK>(self.clone(), msecs_to_jiffies(delay_ms));
     }
 
     fn queue_governor(self: &Arc<Self>) {
@@ -1637,6 +1646,16 @@ impl Gpu {
         }
         let m5 = cfg.profile.is_m5();
         if m5 {
+            // The M5 graph builds the InitData layouts the firmware build names. A build that
+            // names none is refused here, before anything is written to the GPU.
+            if variant.m5_layouts.is_none() {
+                dev_err!(
+                    dev.as_ref(),
+                    "No M5 InitData layouts for this GPU firmware build ({:?})\n",
+                    variant.m5_layouts
+                );
+                return Err(ENODEV);
+            }
             let board = cfg.m5.ok_or(EINVAL)?;
             J813_FORMS.store(board.j813_forms(), core::sync::atomic::Ordering::Relaxed);
             // Hold the J813's GFX power domain for the session, as the G15 and G16 paths do
@@ -1701,6 +1720,7 @@ impl Gpu {
         let queues = availability::Availability::new()?;
         let preparations = preparation::Gate::with_waiters(Some(progress.clone()))?;
         let renders = availability::Availability::new()?;
+        let traversal = runtime::traversal::Gate::new()?;
         let reclaim = runtime::teardown::ReclaimBatch::new()?;
         let feed = feed::Feed::new(m5)?;
         let alternate = cfg.core_layout.cores.is_some_and(|(clusters, cores)| {
@@ -1743,6 +1763,10 @@ impl Gpu {
             },
             GFP_KERNEL,
         )?;
+        let frequencies = Self::state_frequencies(dev, cfg, variant, id.num_clusters)?;
+        let max_pstate = frequencies
+            .as_ref()
+            .map_or(0, stats::StateFrequencies::max_pstate);
         let shared = Arc::pin_init(
             pin_init!(Shared {
                 drm <- new_mutex!(Some(dev.into()), "g17::Shared::drm"),
@@ -1750,6 +1774,7 @@ impl Gpu {
                 clusters: id.num_clusters,
                 active_cores,
                 variant,
+                max_pstate,
                 operand_state: &cfg.core_layout.operand_state,
                 m5_board: cfg.m5.filter(|_| m5),
                 deflake: cfg.core_layout.deflake,
@@ -1761,6 +1786,7 @@ impl Gpu {
                 crashed: AtomicBool::new(false),
                 sleeping: AtomicBool::new(false),
                 sleep_gate: AtomicBool::new(false),
+                sleep_cancel_deadline: AtomicU64::new(0),
                 sleep_ps: AtomicU32::new(0),
                 sleep_commit: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
                 feed,
@@ -1770,6 +1796,7 @@ impl Gpu {
                 progress,
                 queues,
                 renders,
+                traversal,
                 compute_demand: AtomicU32::new(0),
                 work <- new_work!("g17::Shared::work"),
                 housekeeping: AtomicBool::new(true),
@@ -1818,7 +1845,7 @@ impl Gpu {
         )?;
         let stats = Arc::new(
             crate::stats::StatsSnapshot {
-                g17_reader: Some(stats::Reader(shared.clone())),
+                g17_reader: Some(stats::Reader(shared.clone(), frequencies)),
                 ..Default::default()
             },
             GFP_KERNEL,
@@ -1875,11 +1902,15 @@ impl Gpu {
         let others = builds
             .iter()
             .filter(|build| Some(build.os_version) != version);
+        // Measure the loaded TEXT once and try each build against it. A build that is not this
+        // image is not an error while another one may be: only when none is, say what was
+        // measured and what is supported.
+        let mut measured = Self::measure_text(dev)?;
         let mut identified = None;
         for build in Iterator::chain(preferred, others) {
-            if Self::identify_image(dev, build).is_err() {
+            let Some(image) = measured.find(build.images) else {
                 continue;
-            }
+            };
             let admits = build.config.is_none_or(|config| {
                 config
                     .core_layout
@@ -1887,14 +1918,31 @@ impl Gpu {
                     .is_none_or(|measured| measured == cores)
             });
             if admits {
-                identified = Some(build);
+                identified = Some((build, image));
                 break;
             }
-            identified.get_or_insert(build);
+            identified.get_or_insert((build, image));
         }
-        if let Some(build) = identified {
+        if let Some((build, image)) = identified {
+            dev_info!(dev.as_ref(), "GPU firmware build: {}\n", image.name);
             dev_info!(dev.as_ref(), "GPU firmware: {}\n", build.name);
             return Ok((build.variant, build.config));
+        }
+        dev_err!(
+            dev.as_ref(),
+            "unsupported GPU firmware build: {}\n",
+            measured.identity(builds.iter().flat_map(|build| build.images))
+        );
+        // Builds that differ only in their core layout share an image: list each image once.
+        // Compare by name and digest; the address of a `const`-promoted entry is not unique.
+        let images = || builds.iter().flat_map(|build| build.images);
+        for (i, image) in images().enumerate() {
+            if !images()
+                .take(i)
+                .any(|seen| (seen.name, seen.text_sha256) == (image.name, image.text_sha256))
+            {
+                dev_err!(dev.as_ref(), "supported: {}\n", image.name);
+            }
         }
         dev_err!(
             dev.as_ref(),
@@ -1904,19 +1952,33 @@ impl Gpu {
         Err(ENODEV)
     }
 
-    /// Checks that the loaded TEXT (the `fw-text` region) is one of `build`'s images, with the DATA size
-    /// of the `fw-data` region. The version property is only a selection hint.
-    fn identify_image(dev: &AsahiDrmDevice, build: &'static fw::variant::Build) -> Result {
-        let node = dev.as_ref().as_ref().of_node().ok_or(EINVAL)?;
-        let text = node.reserved_mem_region_to_resource_byname(c_str!("fw-text"))?;
-        let data = node.reserved_mem_region_to_resource_byname(c_str!("fw-data"))?;
-        let start = text.start();
-        let end = start.checked_add(text.size()).ok_or(EINVAL)?;
-        crate::fwid::identify(dev.as_ref().as_ref(), start..end, data.size(), build.images)
-            .inspect_err(|e| {
-                dev_err!(dev.as_ref(), "GPU firmware image not admitted: {:?}\n", e)
-            })?;
-        Ok(())
+    /// Measures the loaded TEXT (the `fw-text` region), with the DATA size of the `fw-data`
+    /// region, for [`Self::firmware_variant`] to identify among the builds. The version
+    /// property is only a selection hint.
+    fn measure_text(dev: &AsahiDrmDevice) -> Result<crate::fwid::Measured> {
+        let measure = || {
+            let node = dev.as_ref().as_ref().of_node().ok_or(EINVAL)?;
+            let text = node.reserved_mem_region_to_resource_byname(c_str!("fw-text"))?;
+            let data = node.reserved_mem_region_to_resource_byname(c_str!("fw-data"))?;
+            let start = text.start();
+            let end = start.checked_add(text.size()).ok_or(EINVAL)?;
+            crate::fwid::measure(start..end, data.size())
+        };
+        measure().inspect_err(|e| {
+            if *e == EAGAIN {
+                dev_err!(
+                    dev.as_ref(),
+                    "GPU firmware TEXT changed while it was measured\n"
+                );
+            } else {
+                // A missing or bad fw-text/fw-data region: a DT or boot loader mismatch.
+                dev_err!(
+                    dev.as_ref(),
+                    "GPU firmware image not measured (fw-text/fw-data): {:?}\n",
+                    e
+                );
+            }
+        })
     }
 
     /// The macOS version the boot loader reports for the boot firmware that loaded the GPU
@@ -1927,6 +1989,39 @@ impl Gpu {
             .get_property::<KVec<u32>>(c_str!("apple,firmware-version"))
             .ok()?;
         cells.as_slice().try_into().ok()
+    }
+
+    /// The frequency of each performance state the firmware reports
+    /// ([`stats::reports_pstate`]): M5's from its board, the A18 Pro's and T6041's from the
+    /// operating points their performance table A names. Their records do not name the table;
+    /// on the A18 Pro, at the top state where the GPU runs while work is in flight, a sustained
+    /// FP32 FMA load completes faster than table B's frequency there allows. On T6041 both
+    /// tables map state 10 to OPP 15 (1578 MHz) and only differ on states 5..=9 on the
+    /// J616C (32-core; 40-core differs on 6..=9), so those mid-state frequencies are nominal
+    /// (taken from table A) until measured by a mid-state ALU benchmark. `None` where the
+    /// firmware reports no state.
+    fn state_frequencies(
+        dev: &AsahiDrmDevice,
+        cfg: &'static Config,
+        variant: &fw::variant::Variant,
+        clusters: u32,
+    ) -> Result<Option<stats::StateFrequencies>> {
+        if !stats::reports_pstate(variant.telemetry_protocol) {
+            return Ok(None);
+        }
+        if let Some(board) = cfg.m5 {
+            return Ok(stats::StateFrequencies::new(
+                board.perf_states.iter().map(|state| state.0),
+            ));
+        }
+        let perf = cfg.perf()?;
+        let opps = initdata::InitData::opps(dev, cfg.opps, clusters)?;
+        let mut mhz = [0u32; fw::initdata::PERF_STATES];
+        for (slot, &index) in mhz.iter_mut().zip(perf.states_a.iter()) {
+            let opp = opps.get(usize::from(index)).ok_or(EINVAL)?;
+            *slot = u32::try_from(opp.freq_hz / 1_000_000)?;
+        }
+        Ok(stats::StateFrequencies::new(mhz.into_iter()))
     }
 
     /// Returns the highest advertised operating-point frequency without changing table order.
@@ -2036,7 +2131,11 @@ impl Gpu {
                     shared.feed.clone(),
                 )?,
                 seen_submissions: 0,
-                rings: channel::Rings::new(shared.variant.graph)?,
+                rings: channel::Rings::new(
+                    shared.variant.graph,
+                    shared.variant.telemetry_protocol,
+                    shared.max_pstate,
+                )?,
                 recovery: recovery::State::new(),
                 effort: power::Effort::new(),
                 hold: power::Hold::new(),
@@ -2051,7 +2150,7 @@ impl Gpu {
                     Some(shared.queues.clone()),
                     Some(shared.renders.clone()),
                 ),
-                pool: object::Pool::new()?,
+                pool: object::Pool::new(shared.variant.objects_after_release)?,
                 render_rings: kick::RenderRings::new()?,
                 render_ids: freelist::RenderIds::new()?,
                 init: initdata::InitData::new(),
@@ -2097,7 +2196,7 @@ impl Gpu {
             .inspect_err(at("root adoption"))?;
         session
             .init
-            .build_m5(dev, &session.uat, id, board)
+            .build_m5(dev, &session.uat, id, board, shared.variant)
             .inspect_err(at("M5 graph"))?;
         session
             .init
@@ -2240,7 +2339,11 @@ impl Gpu {
                     shared.feed.clone(),
                 )?,
                 seen_submissions: 0,
-                rings: channel::Rings::new(shared.variant.graph)?,
+                rings: channel::Rings::new(
+                    shared.variant.graph,
+                    shared.variant.telemetry_protocol,
+                    shared.max_pstate,
+                )?,
                 recovery: recovery::State::new(),
                 effort: power::Effort::new(),
                 hold: power::Hold::new(),
@@ -2255,7 +2358,7 @@ impl Gpu {
                     Some(shared.queues.clone()),
                     Some(shared.renders.clone()),
                 ),
-                pool: object::Pool::new()?,
+                pool: object::Pool::new(shared.variant.objects_after_release)?,
                 render_rings: kick::RenderRings::new()?,
                 render_ids: freelist::RenderIds::new()?,
                 init: initdata::InitData::new(),
@@ -2421,6 +2524,10 @@ impl Gpu {
 }
 
 impl gpu::Gpu for Gpu {
+    fn max_cmdbuf_size(&self) -> usize {
+        command::MAX_STREAM
+    }
+
     fn syncobj_wait_hint(&self) -> Option<(u32, u32)> {
         self.shared.feed.wait_hint()
     }
@@ -2453,12 +2560,29 @@ impl gpu::Gpu for Gpu {
         self.shared.crashed.load(Ordering::Acquire)
     }
 
+    /// A parked render pair keeps its views of the kick rings in the VM that last ran on it
+    /// while that VM is open. Once the client has closed the VM (its status says so before
+    /// this runs), they go, one pair at a time and dropped off the device lock, so they do not
+    /// keep the VM's page tables alive. A pair that parks or returns after this sees the
+    /// closed status itself.
+    fn vm_closed(&self, _vm: &mmu::Vm) {
+        loop {
+            let views = (*self.shared.state.lock())
+                .as_deref_mut()
+                .and_then(|firmware| firmware.queues.take_closed_parked_views());
+            let Some(views) = views else { break };
+            drop(views);
+        }
+    }
+
     fn get_params(&self, params: &mut uapi::drm_asahi_params_global) -> Result {
         params.features |=
             u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS)
                 | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS)
                 | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS)
-                | sync_output::FEATURE_CUMULATIVE_SIGNALS;
+                | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS)
+                | sync_output::FEATURE_CUMULATIVE_SIGNALS
+                | crate::file::DRM_ASAHI_FEATURE_COMPUTE_TIMEOUT;
         let variant = self.shared.variant;
         // The M5 command set has no AS-build flag: its validation refuses one.
         if !variant.m5_commands {
@@ -2466,6 +2590,14 @@ impl gpu::Gpu for Gpu {
         }
         if variant.few_primitives {
             params.features |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FEW_PRIMITIVES);
+        }
+        // Only the A18 Pro heap sizes itself for it; other command sets accept the hint too.
+        if !variant.m5_commands {
+            params.features |= crate::file::DRM_ASAHI_FEATURE_RENDER_MESH_OUTPUT;
+        }
+        // The M5 command set reports it with M5_FEATURES.
+        if !variant.m5_commands && variant.render_stage_prefixes {
+            params.features |= crate::file::DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2;
         }
         if variant.render_ray_query {
             params.features |=
@@ -2515,13 +2647,16 @@ impl gpu::Gpu for Gpu {
         true
     }
 
-    /// The G17 runtime never programs fault_control into the firmware, so unmapped reads are not
-    /// guaranteed to return zero. Advertising soft faults made Mesa point out-of-bounds vec3/vec4
-    /// vertex fetches at address 0 and skip bounds checks on bounded loads; on T6040 those reads
-    /// returned non-zero data (2026-10-19: every robustness2 rgba32 vertex_attribute_fetch case
-    /// failed; all pass with soft faults off).
+    /// The G17 firmware takes no fault_control. Its own fault mode gives soft faults: a shader
+    /// load of an unmapped client address returns zero and a store or atomic to one is dropped,
+    /// with no fault reported (measured on the M4 Pro, firmware 25G83). The driver gives every
+    /// queue of the family the same fault setting, 1 in `QueueConfig::unk_66`, the word the M5
+    /// firmware names soft_fault_enabled, so this is not a per-SoC property. Advertise it unless
+    /// fault_control asks for anything else. The first 0x74000 bytes of a client VM are mapped,
+    /// not unmapped memory: they hold the execution context's views (`CONTEXT_VIEWS`, the null
+    /// view at address 0).
     fn supports_soft_faults(&self) -> bool {
-        false
+        crate::module_parameters::fault_control.value() == 0xb
     }
 
     fn queue_limits(&self) -> Option<uapi::drm_asahi_queue_limits> {

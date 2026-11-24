@@ -298,7 +298,34 @@ static const struct v4l2_m2m_ops aj_m2m_ops = {
 
 /* ---- formats ---------------------------------------------------------- */
 
-/* Raw input: Y rows then interleaved CbCr rows in one buffer, full range. */
+/*
+ * The engine encodes the samples as they arrive: it converts neither range
+ * nor matrix, so the colorimetry of the raw input is the client's to state,
+ * as for any stateful encoder, and CAPTURE reports the same. A client that
+ * gives none gets what JPEG itself carries, full-range BT.601. Refusing
+ * every other description makes clients fail: GStreamer's v4l2jpegenc
+ * passes the camera's colorimetry through and gives up when S_FMT returns
+ * another one.
+ */
+static void aj_fill_colorimetry(struct v4l2_pix_format_mplane *pix)
+{
+	if (pix->colorspace == V4L2_COLORSPACE_DEFAULT ||
+	    pix->colorspace > V4L2_COLORSPACE_DCI_P3) {
+		pix->colorspace = V4L2_COLORSPACE_SRGB;
+		pix->ycbcr_enc = V4L2_YCBCR_ENC_601;
+		pix->quantization = V4L2_QUANTIZATION_FULL_RANGE;
+		pix->xfer_func = V4L2_XFER_FUNC_SRGB;
+		return;
+	}
+	if (pix->ycbcr_enc > V4L2_YCBCR_ENC_SMPTE240M)
+		pix->ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
+	if (pix->quantization > V4L2_QUANTIZATION_LIM_RANGE)
+		pix->quantization = V4L2_QUANTIZATION_DEFAULT;
+	if (pix->xfer_func > V4L2_XFER_FUNC_SMPTE2084)
+		pix->xfer_func = V4L2_XFER_FUNC_DEFAULT;
+}
+
+/* Raw input: Y rows then interleaved CbCr rows in one buffer. */
 static void aj_fill_raw(const struct apple_jpeg *jpeg, struct v4l2_pix_format_mplane *pix)
 {
 	bool is422 = pix->pixelformat == V4L2_PIX_FMT_NV16 &&
@@ -319,11 +346,7 @@ static void aj_fill_raw(const struct apple_jpeg *jpeg, struct v4l2_pix_format_mp
 	/* Chroma follows the visible luma rows; the tail covers the MCU rows. */
 	pix->plane_fmt[0].bytesperline = layout.bytesperline;
 	pix->plane_fmt[0].sizeimage = layout.sizeimage;
-	/* JPEG carries full-range BT.601; the engine does no range conversion. */
-	pix->colorspace = V4L2_COLORSPACE_SRGB;
-	pix->ycbcr_enc = V4L2_YCBCR_ENC_601;
-	pix->quantization = V4L2_QUANTIZATION_FULL_RANGE;
-	pix->xfer_func = V4L2_XFER_FUNC_SRGB;
+	aj_fill_colorimetry(pix);
 }
 
 /*
@@ -889,6 +912,8 @@ static const struct of_device_id aj_of_match[] = {
 	{ .compatible = "apple,t6041-jpeg", .data = &apple_jpeg_t6041 },
 	{ .compatible = "apple,t8132-jpeg", .data = &apple_jpeg_t6041 },
 	{ .compatible = "apple,t6050-jpeg", .data = &apple_jpeg_t6050 },
+	/* T6050's revision, reset image and job programming (traced on a J815). */
+	{ .compatible = "apple,t8142-jpeg", .data = &apple_jpeg_t6050 },
 	{ .compatible = "apple,t8140-jpeg", .data = &apple_jpeg_t8140 },
 	{ }
 };

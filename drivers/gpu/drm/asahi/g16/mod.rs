@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! G16 GPU support (T8132, M4: J713; the qualified 25G83 firmware).
+//! G16 GPU support (T8132, M4: J713 and J773g; the qualified 25G83 firmware, and the 26B123
+//! firmware's ABI, whose start is refused until its remaining unknowns are known).
 //!
 //! G16 firmware is *classic*: one ring per engine (TA, FS, compute) and ordering expressed by
 //! in-ring barrier records that wait on another queue's stamp, unlike the G17 kick-ring/QID
@@ -67,6 +68,7 @@ mod queue;
 mod recovery;
 mod regs;
 mod resources;
+mod sleep;
 mod slots;
 mod timestamp;
 mod uat;
@@ -74,7 +76,7 @@ mod vm;
 
 use core::any::Any;
 use core::ops::Range;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 use kernel::{
     c_str,
@@ -146,10 +148,10 @@ impl platform::Driver for Driver {
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
 
     fn pm_ops() -> Option<&'static kernel::bindings::dev_pm_ops> {
-        crate::driver::sleep_refuse_ops()
+        Some(sleep::ops())
     }
 
-    /// The firmware session cannot be stopped once started.
+    /// The firmware session cannot be stopped by an unbind.
     fn suppress_bind_attrs() -> bool {
         true
     }
@@ -213,6 +215,13 @@ pub(crate) struct Shared {
     pub(crate) rtkit_buffer: AtomicU64,
     /// A firmware session whose start or backend start failed: retained, rings still drained.
     pub(crate) orphaned: AtomicBool,
+    /// From a system sleep's `.prepare` until the firmware restarted: nothing reads its
+    /// registers and nothing is published.
+    pub(crate) sleeping: AtomicBool,
+    /// The GFX power state word from before a system sleep.
+    sleep_ps: AtomicU32,
+    /// The stop left to a system sleep's commit, until `.complete` finishes it.
+    sleep_commit: AtomicPtr<core::ffi::c_void>,
     #[pin]
     pub(crate) orphan: Mutex<Option<KBox<boot::Orphan>>>,
     #[pin]
@@ -359,6 +368,9 @@ pub(crate) struct Gpu {
     pub(crate) shared: Arc<Shared>,
     /// The adopted UAT, for creating and binding user VMs without the device lock.
     pub(crate) uat: Arc<mmu::Uat>,
+    /// Live VM registry, kept directly on `Gpu` so `vm_closed()` still breaks resource-cache
+    /// cycles even if `shared.state` is absent (fail-stop or teardown).
+    vms: Arc<vm::Registry>,
 }
 
 impl Gpu {
@@ -391,6 +403,9 @@ impl Gpu {
                 data,
                 rtkit_buffer: AtomicU64::new(0),
                 orphaned: AtomicBool::new(false),
+                sleeping: AtomicBool::new(false),
+                sleep_ps: AtomicU32::new(0),
+                sleep_commit: AtomicPtr::new(core::ptr::null_mut()),
                 orphan <- new_mutex!(None, "g16::Shared::orphan"),
                 poll <- new_delayed_work!("g16::Shared::poll"),
                 resnap <- HrTimer::new(),
@@ -404,6 +419,7 @@ impl Gpu {
         let (id, max_frequency_khz) = (booted.id, booted.max_frequency_khz);
         // The backend: graphs, slots, pools, engine, recovery and VM registry.
         let firmware = Firmware::start_backend(dev, booted, &shared, power)?;
+        let vms = firmware.vms.clone();
         *shared.state.lock() = Some(firmware);
         // The engine's statistics file (a debugfs failure does not fail the probe).
         if let Err(error) = shared.start_engine() {
@@ -417,6 +433,7 @@ impl Gpu {
                 ids: Default::default(),
                 shared,
                 uat,
+                vms,
             },
             GFP_KERNEL,
         )?;
@@ -445,7 +462,7 @@ impl Firmware {
         dev: &AsahiDrmDevice,
         booted: boot::Booted,
         shared: &Arc<Shared>,
-        power: power::Power,
+        mut power: power::Power,
     ) -> Result<KBox<Firmware>> {
         let boot::Booted {
             session,
@@ -459,6 +476,7 @@ impl Firmware {
             dev.as_ref(),
             "G16: firmware at READY, starting the backend\n"
         );
+        power.set_table(init.rows);
         let orphan = |session: boot::Session,
                       objects: object::Objects,
                       channels: channel::Channels,
@@ -612,15 +630,7 @@ impl gpu::Gpu for Gpu {
         vm::new_vm(self, kernel_range, file_id)
     }
     fn vm_closed(&self, vm: &mmu::Vm) {
-        let registry = self
-            .shared
-            .state
-            .lock()
-            .as_ref()
-            .map(|state| state.vms.clone());
-        if let Some(registry) = registry {
-            registry.close(vm.id());
-        }
+        self.vms.close(vm.id());
     }
 
     fn new_queue(

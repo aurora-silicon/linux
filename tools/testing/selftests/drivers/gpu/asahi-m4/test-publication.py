@@ -39,7 +39,8 @@ impl Progress {
     fn count(&self)->u32{self.count}
     fn set_pending(&self,v:bool){self.pending.store(v,Ordering::Relaxed)}
 }
-struct Job { id:u32,vm:Vm,queue:Queue,progress:Progress,commands:Vec<Command>,dependency:Result,terminal_marked:AtomicBool }
+struct Resources;impl Resources{fn compute_units(&self)->Result<usize>{Ok(2)}}
+struct Job { id:u32,vm:Vm,queue:Queue,progress:Progress,commands:Vec<Command>,dependency:Result,terminal_marked:AtomicBool,resources:Resources }
 impl Job {
     fn check_command_dependencies(&self,_index:u32)->Result{self.dependency}
     fn mark_terminal_retired(&self)->Result{assert!(!self.progress.pending.load(Ordering::Relaxed));self.terminal_marked.store(true,Ordering::Relaxed);Ok(())}
@@ -57,11 +58,14 @@ impl Engine {
     __UNPEND__
 }
 struct Checks;impl Checks{fn check(&self)->Result{Ok(())}fn health(&self)->Result{Ok(())}}
+struct Shared{sleeping:AtomicBool}
+struct Session{shared:Shared}impl Session{fn check(&self)->Result{Ok(())}}
 struct Recovery{error:Option<Error>,publication_wait_deadline:Option<u64>}impl Recovery{fn failed(&self)->Option<Error>{self.error}}
 struct Slots{compute_exhausted:bool,render_exhausted:bool,releases:u32,quarantines:u32}
 impl Slots{
     fn compute_exhausted(&self)->bool{self.compute_exhausted}
     fn render_exhausted(&self)->bool{self.render_exhausted}
+    fn compute_exhausted_within(&self,_units:usize)->bool{self.compute_exhausted}
     fn release(&mut self,_claims:&mut Claims){self.releases+=1;}
     fn quarantine(&mut self,_claims:&mut Claims){self.quarantines+=1;}
 }
@@ -107,11 +111,14 @@ struct Stage{result:Result,visible:bool}
 #[derive(Default)]struct Power{work:Vec<bool>}
 impl Power{fn report_work(&mut self,in_flight:bool){self.work.push(in_flight);}}
 struct Firmware{
-    session:Checks,objects:Checks,recovery:Recovery,engine:Engine,slots:Slots,power:Power,
+    session:Session,objects:Checks,recovery:Recovery,engine:Engine,slots:Slots,power:Power,
     unavailable:Vec<(usize,Error)>,stages:VecDeque<Stage>,retained:Vec<u32>,attempted:Vec<u32>,fail_stops:u32,
 }
 impl Firmware {
     fn mark_class_unavailable(&mut self,class:usize,error:Error){self.unavailable.push((class,error));}
+    // Queuing behind in-flight compute is exercised on hardware; this recorder keeps the
+    // serialized selection and error isolation under test.
+    fn can_queue_behind(&self,_job:&Arc<Job>)->bool{false}
     fn service_power(&self)->Result{Ok(())}
     fn drain_rings(&mut self)->Result{Ok(())}
     fn check_hangs(&mut self,_done:&mut Completions)->Result{Ok(())}
@@ -137,15 +144,16 @@ impl Firmware {
     }
     __PUBLISH_PREFIX__
     __PUBLISH__
+    __PUBLISH_CHECKED__
 }
 fn job(id:u32,render:bool,sent:u32,dependency:Result)->Arc<Job>{
     Arc::new(Job{id,vm:Vm{status:Status(AtomicU32::new(0)),slot:id},
         queue:Queue{turn:AtomicU64::new(0),priority:0},
         progress:Progress{sent:AtomicU32::new(sent),count:sent+1,pending:AtomicBool::new(true)},
-        commands:vec![if render{Command::Render(())}else{Command::Compute(())};sent as usize+1],dependency,terminal_marked:AtomicBool::new(false)})
+        commands:vec![if render{Command::Render(())}else{Command::Compute(())};sent as usize+1],dependency,terminal_marked:AtomicBool::new(false),resources:Resources})
 }
 fn firmware(jobs:Vec<Arc<Job>>,stages:Vec<(Result,bool)>)->Firmware{
-    Firmware{session:Checks,objects:Checks,recovery:Recovery{error:None,publication_wait_deadline:None},
+    Firmware{session:Session{shared:Shared{sleeping:AtomicBool::new(false)}},objects:Checks,recovery:Recovery{error:None,publication_wait_deadline:None},
         engine:Engine{ordinal:0,draw:0,pending:jobs,flights:vec![],frozen:false,turn:0,stats:Stats::default(),chan_wait:false},
         slots:Slots{compute_exhausted:false,render_exhausted:false,releases:0,quarantines:0},power:Power::default(),
         unavailable:vec![],stages:stages.into_iter().map(|(result,visible)|Stage{result,visible}).collect(),
@@ -221,6 +229,12 @@ fn firmware(jobs:Vec<Arc<Job>>,stages:Vec<(Result,bool)>)->Firmware{
         assert_eq!(f.publish(&mut done),Err(ETIMEDOUT));
         assert_eq!(f.recovery.publication_wait_deadline,Some(deadline));
     }
+    #[test]fn nothing_is_published_during_a_system_sleep(){
+        let mut f=firmware(vec![job(1,false,0,Ok(()))],vec![(Ok(()),true)]);f.session.shared.sleeping.store(true,Ordering::Relaxed);
+        let mut done=vec![];assert_eq!(f.publish(&mut done),Ok(()));
+        assert!(done.is_empty());assert!(f.attempted.is_empty());assert_eq!(f.engine.pending.len(),1);assert!(f.power.work.is_empty());
+        f.session.shared.sleeping.store(false,Ordering::Relaxed);assert_eq!(f.publish(&mut done),Ok(()));assert_eq!(f.attempted,[1]);
+    }
 
 }
 '''
@@ -231,6 +245,7 @@ for token, declaration in {
     '__UNPEND__': 'fn unpend(&mut self',
     '__PUBLISH_PREFIX__': 'fn publish_prefix(',
     '__PUBLISH__': 'pub(crate) fn publish(&mut self',
+    '__PUBLISH_CHECKED__': 'pub(crate) fn publish_checked(&mut self',
     '__DESCRIPTOR_CONTAINMENT__': 'if encode::preserve_compute_descriptor(',
     '__PUBLISH_PRODUCER__': 'fn publish_producer(',
 }.items():

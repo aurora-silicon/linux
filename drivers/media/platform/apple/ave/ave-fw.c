@@ -36,14 +36,19 @@
  * a layout from ave_layout_for_crc(); command formats change between builds.
  */
 static const u32 ave_known_text_crc[] = {
-	0x2ce7359e, /* AppleAVE2FW 9003.78.0 */
-	0x69c54454, /* AppleAVE2FW 9003.78.0 (macOS 26.0.x) */
-	AVE_FW_TEXT_CRC_T6040_25G83, /* AppleAVE2FW 9003.78.0 / T6040 */
-	AVE_FW_TEXT_CRC_T6041_25G83, /* AppleAVE2FW 9003.78.0 / M4 Max */
-	AVE_FW_TEXT_CRC_T6050_26A428, /* AppleAVE2FW, macOS 27.0 26A428 / T6050 */
-	AVE_FW_TEXT_CRC_T6050_26C5035, /* AppleAVE2FW, macOS 27.3 26C5035r / T6050 */
-	0x460c7a7c, /* AppleAVE2FW 6070.11.1 / T6000 */
-	0x25bfd039, /* AppleAVE2FW 6070.11.1 / T8112 */
+	0x2ce7359e, /* encoder firmware 9003.78.0 */
+	0x69c54454, /* encoder firmware 9003.78.0 (macOS 26.0.x) */
+	AVE_FW_TEXT_CRC_T6040_25G83, /* encoder firmware 9003.78.0 / T6040 */
+	AVE_FW_TEXT_CRC_T6041_25G83, /* encoder firmware 9003.78.0 / M4 Max */
+	AVE_FW_TEXT_CRC_T6050_26A428, /* encoder firmware macOS 27.0 26A428 / T6050 */
+	AVE_FW_TEXT_CRC_T6050_26C5035, /* encoder firmware macOS 27.3 26C5035r / T6050 */
+	AVE_FW_TEXT_CRC_T8142_26A428, /* encoder firmware 9013.45.1, macOS 27.0 26A428 / T8142 */
+	AVE_FW_TEXT_CRC_T8122_26B123, /* encoder firmware macOS 27.2 26B123 / T8122 */
+	AVE_FW_TEXT_CRC_T8112_26B123, /* encoder firmware macOS 27.2 26B123 / T8112 */
+	AVE_FW_TEXT_CRC_T8132_26B123, /* encoder firmware macOS 27.2 26B123 / T8132 */
+	AVE_FW_TEXT_CRC_T8142_26B123, /* encoder firmware 9013.55.1, macOS 27.2 26B123 / T8142 */
+	0x460c7a7c, /* encoder firmware 6070.11.1 / T6000 */
+	0x25bfd039, /* encoder firmware 6070.11.1 / T8112 */
 };
 
 static int ave_fw_chosen_crc(struct ave_dev *ave, const char *name, u32 *crc)
@@ -180,7 +185,7 @@ int ave_fw_text_boot_crc(const void *text, size_t size, u32 word_off,
 
 /*
  * A known TEXT CRC (the M4 Pro build) stays as it is; any other is retried
- * with the per-boot word zeroed (the M4 Max build).
+ * with the per-boot word zeroed (the M4 Max and M4 27.2 builds).
  */
 static int ave_fw_text_boot_id(struct ave_dev *ave, u32 *crc)
 {
@@ -216,14 +221,46 @@ static int ave_fw_text_id(struct ave_dev *ave, u32 *crc)
 	return ret;
 }
 
-/* The variant's build with these segment sizes, or NULL. */
+/*
+ * The variant's build with these segment sizes and, unless crc is 0, this
+ * TEXT CRC, or NULL. Builds may share segment sizes; the CRC tells them apart.
+ */
 static const struct ave_fw_build *ave_fw_find_build(const struct ave_variant *v,
-						    size_t text, size_t data)
+						    size_t text, size_t data, u32 crc)
 {
 	for (unsigned int i = 0; i < v->build_count; i++)
-		if (text == v->builds[i].text_size && data == v->builds[i].data_size)
+		if (text == v->builds[i].text_size && data == v->builds[i].data_size &&
+		    (!crc || crc == v->builds[i].text_crc))
 			return &v->builds[i];
 	return NULL;
+}
+
+/*
+ * Whether TEXT/DATA segments of these sizes are a build the variant pins.
+ * ave_fw_probe() refuses the firmware when they are not.
+ */
+bool ave_fw_sizes_match(const struct ave_variant *v, size_t text, size_t data)
+{
+	if (v->build_count)
+		return ave_fw_find_build(v, text, data, 0);
+	return text == v->fw_text_size &&
+	       (data == v->fw_data_size ||
+		(v->fw_data_size_alt && data == v->fw_data_size_alt));
+}
+
+/*
+ * The variant for the build the bootloader preloaded: the matched one, or
+ * the first of its later builds whose segment sizes these are. Sizes alone
+ * pick the variant; ave_fw_probe() then refuses a TEXT CRC that is not the
+ * picked build's, so later builds of one encoder need sizes of their own.
+ */
+const struct ave_variant *ave_fw_select_build(const struct ave_variant *v,
+					      size_t text, size_t data)
+{
+	for (const struct ave_variant *n = v; n; n = n->next_build)
+		if (ave_fw_sizes_match(n, text, data))
+			return n;
+	return v;
 }
 
 /*
@@ -234,8 +271,8 @@ int ave_fw_probe(struct ave_dev *ave)
 {
 	struct device *dev = ave->dev;
 	const struct ave_fw_build *build = NULL;
-	u32 text_crc, data_crc, want, want_crc = ave->variant->text_crc;
-	bool known = !ave->variant->boot_qualified;
+	u32 text_crc, data_crc, want, want_crc;
+	bool known;
 	int ret;
 
 	if (of_count_phandle_with_args(dev->of_node, "memory-region", NULL) !=
@@ -248,20 +285,25 @@ int ave_fw_probe(struct ave_dev *ave)
 	if (ret)
 		return dev_err_probe(dev, ret, "bad firmware reservation\n");
 
+	ave->variant = ave_fw_select_build(ave->variant, ave->text.size,
+					   ave->data.size);
+	want_crc = ave->variant->text_crc;
+	known = !ave->variant->boot_qualified;
 	if (ave->variant->build_count) {
 		build = ave_fw_find_build(ave->variant, ave->text.size,
-					  ave->data.size);
+					  ave->data.size, 0);
 		if (!build)
 			return dev_err_probe(dev, -EINVAL,
 					     "unexpected firmware segment sizes (TEXT %#zx DATA %#zx)\n",
 					     ave->text.size, ave->data.size);
 		want_crc = build->text_crc;
-	} else if (ave->text.size != ave->variant->fw_text_size ||
-		   (ave->data.size != ave->variant->fw_data_size &&
-		    (!ave->variant->fw_data_size_alt ||
-		     ave->data.size != ave->variant->fw_data_size_alt))) {
+	} else if (!ave->variant->boot_qualified && !ave->variant->fw_text_size) {
+		/* A probe-only variant that pins no build takes any segment sizes. */
+	} else if (!ave_fw_sizes_match(ave->variant, ave->text.size,
+				       ave->data.size)) {
 		return dev_err_probe(dev, -EINVAL,
-				     "unexpected firmware segment sizes\n");
+				     "unexpected firmware segment sizes (TEXT %#zx DATA %#zx)\n",
+				     ave->text.size, ave->data.size);
 	}
 	if ((ave->text.phys < ave->data.phys + ave->data.size &&
 	     ave->data.phys < ave->text.phys + ave->text.size) ||
@@ -300,6 +342,16 @@ int ave_fw_probe(struct ave_dev *ave)
 		return dev_err_probe(dev, ret,
 				     "firmware text link cell is not the DATA address\n");
 	known |= ave_fw_known_crc(text_crc);
+	if (build) {
+		const struct ave_fw_build *same_size =
+			ave_fw_find_build(ave->variant, ave->text.size,
+					  ave->data.size, text_crc);
+
+		if (same_size) {
+			build = same_size;
+			want_crc = build->text_crc;
+		}
+	}
 	if (!known || (want_crc && text_crc != want_crc))
 		return dev_err_probe(dev, -ENODEV,
 				     "unsupported firmware (text CRC %08x)\n",
@@ -333,8 +385,8 @@ int ave_fw_probe(struct ave_dev *ave)
 	if (!ave->variant->boot_qualified || !ave->layout)
 		dev_info(
 			dev,
-			"probe only: firmware TEXT %08x DATA %08x needs qualification\n",
-			text_crc, data_crc);
+			"probe only: firmware TEXT %#zx CRC %08x, DATA %#zx CRC %08x needs qualification\n",
+			ave->text.size, text_crc, ave->data.size, data_crc);
 	else if (!ave->layout->encode_ready)
 		dev_info(
 			dev,
@@ -907,6 +959,65 @@ static int ave_fw_stop_unanswered(struct ave_dev *ave)
 	return 0;
 }
 
+/*
+ * A 6070 firmware that stopped answering in the middle of a session (a
+ * Process or Close timeout) keeps its power, because a halt the firmware
+ * did not confirm proves nothing about its DMA. Once every session is gone
+ * it gets one more Halt; whether or not that is confirmed, the core is then
+ * stopped and must read back stopped, and the engines get a settle interval
+ * before the power goes. That makes it a halted firmware like any other:
+ * every buffer a session handed it stays quarantined, runtime PM cycles the
+ * VENC power (genpd drops the DARTs after the encoder), and the next session
+ * cold-starts the firmware and reaps that memory. Without this the encoder
+ * stayed broken until reboot after a single hung frame. Recoveries count
+ * against the history; a clean session end clears it. Caller holds hw_lock.
+ */
+static int ave_fw_stop_hung(struct ave_dev *ave)
+{
+	u32 val;
+	int ret = -EIO;
+
+	for (unsigned int i = 0; i < AVE_MAX_SESSIONS; i++)
+		if (ave->sessions[i])
+			return -EBUSY;
+	if (!ave_recovery_allow(&ave->recovery, jiffies)) {
+		dev_err_ratelimited(ave->dev,
+				    "firmware recovery limit: 3 attempts per 10 minutes without a clean session end\n");
+		return -EBUSY;
+	}
+	ave->recovery_count++;
+	dev_warn(ave->dev, "firmware recovery %u: stopping the hung firmware and cycling VENC power\n",
+		 ave->recovery_count);
+
+	if (ave->ipc_fw_base && ave->ring[0].slots && !ave->inject_wedge) {
+		writel(0, ave->mbox + AVE_MBOX_SCRATCH(0));
+		ave->fw_state = AVE_FW_RUNNING;
+		ret = ave_cmd_halt(ave);
+		if (!ret)
+			ret = readl_poll_timeout(ave->mbox + AVE_MBOX_SCRATCH(0), val,
+						 val == AVE_BOOT_MAGIC, 100,
+						 AVE_HUNG_HALT_TIMEOUT_US);
+		ave->fw_state = AVE_FW_BROKEN;
+	}
+	if (ret)
+		dev_warn(ave->dev, "hung firmware did not confirm its Halt (%d); stopping its core\n",
+			 ret);
+	writel(0, ave->coproc + ave->variant->regs->ctrl);
+	ret = readl_poll_timeout(ave->coproc + ave->variant->regs->ctrl, val,
+				 !val, 100, AVE_MBOX_TIMEOUT_US);
+	if (ret) {
+		dev_err(ave->dev, "hung firmware core did not stop (CTRL %#x)\n", val);
+		return -EIO;
+	}
+	/* Engine traffic already issued drains before the power gate. */
+	msleep(AVE_HALT_SETTLE_MS);
+	ave->fw_state = AVE_FW_HALTED;
+	ave->inject_wedge = false;
+	memset(ave->ring, 0, sizeof(ave->ring));
+	ave->ipc_fw_base = 0;
+	return 0;
+}
+
 /* Caller holds hw_lock. */
 int ave_fw_ensure_running(struct ave_dev *ave)
 {
@@ -1008,6 +1119,7 @@ void ave_fw_halt(struct ave_dev *ave)
 	ave->fw_state = AVE_FW_HALTED;
 	memset(ave->ring, 0, sizeof(ave->ring));
 	ave->ipc_fw_base = 0;
+	ave_recovery_reset(&ave->recovery);
 }
 
 /*
@@ -1026,6 +1138,10 @@ int ave_fw_shutdown(struct ave_dev *ave)
 		ave_fw_halt(ave);
 		return ave->fw_state == AVE_FW_HALTED ? 0 : -EBUSY;
 	case AVE_FW_BROKEN:
+		/* 6070: a hung firmware with no session left is stopped and power cycled. */
+		if (ave->layout && ave->layout->abi->transport->scratch_halt)
+			return ave_fw_stop_hung(ave);
+		return -EBUSY;
 	case AVE_FW_RECOVERING:
 		return -EBUSY;
 	default:

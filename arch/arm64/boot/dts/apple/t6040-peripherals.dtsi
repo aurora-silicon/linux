@@ -188,7 +188,7 @@
 		reg-names = "core", "wrapper", "aux";
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1960 IRQ_TYPE_LEVEL_HIGH>;
-		power-domains = <&ps_scodec>;
+		power-domains = <&ps_scodec_streaming>;
 		iommus = <&apr0_dart 1>;
 		resets = <&ps_scodec>;
 		status = "disabled";

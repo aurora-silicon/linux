@@ -68,6 +68,10 @@ fn stats_show(shared: &Arc<Shared>, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 impl Shared {
     /// One poll pass (the poll work item).
     pub(crate) fn run_poll(self: Arc<Self>) {
+        // The domain may be off. The sleep's end queues a pass.
+        if self.sleeping.load(Ordering::Acquire) {
+            return;
+        }
         let signalling = kernel::dma_fence::SignallingGuard::new();
         let mut done = Completions::new();
         {
@@ -115,7 +119,11 @@ impl Shared {
                 firmware.engine.shared = Some(self.clone());
             }
             let accepted = firmware.enqueue(job);
-            if accepted.is_ok() {
+            // Nothing is published while a render is in flight: the poll pass after its
+            // retirement publishes this job. Skipping the pass here keeps queued submissions
+            // from holding the device lock (ring drains, health checks) on that path.
+            let render_busy = firmware.engine.flights.iter().any(|f| f.renders != 0);
+            if accepted.is_ok() && !render_busy {
                 if let Err(error) = firmware.publish(&mut done) {
                     firmware.fail_stop(error, &mut done);
                     self.fail_stop(error);
@@ -208,7 +216,6 @@ pub(crate) fn stamp_reached(obs: u32, own: u32, tail: u32) -> bool {
 }
 
 /// Cursor `c` of a ring of `m` entries passed end `h` of entries from `b`, within tail `t`.
-#[allow(dead_code)]
 pub(crate) fn ring_passed(c: u32, b: u32, h: u32, t: u32, m: u32) -> bool {
     let d = |x: u32| x.wrapping_add(m).wrapping_sub(b) % m;
     let (dc, dh, dt) = (d(c), d(h), d(t));
@@ -242,7 +249,9 @@ impl Firmware {
         lap.lap(&mut self.engine.prof.retire_ns);
         self.answer_growth()?;
         self.check_hangs(done)?;
-        let published = self.publish(done);
+        let published = self
+            .service_power()
+            .and_then(|()| self.publish_checked(done));
         let s = &mut self.engine.stats;
         if self.engine.flights.is_empty() && s.idle_from_ns != 0 {
             // Idle with nothing ready is not a gap: the clients are late.
@@ -298,6 +307,33 @@ impl Firmware {
         o.r32(offset)
     }
 
+    /// A compute unit's GPU start and end ticks. 25G83 writes them into the unit's ITS pair;
+    /// ABIs with `work_ticks` leave ITS 0/0 and write them into the work object. The ITS pair
+    /// is used whenever it holds an interval.
+    fn compute_ticks(&self, unit: &super::slots::ComputeSlot) -> Result<(u64, u64)> {
+        let (start, end) = (unit.its.r64(0)?, unit.its.r64(8)?);
+        if start != 0 && end > start {
+            return Ok((start, end));
+        }
+        let Some((start_off, end_off)) = self.init.abi.compute().work_ticks else {
+            return Ok((start, end));
+        };
+        let w = &unit.work;
+        // Work tick offsets are 4-byte aligned (not 8-byte), so read hi/lo/hi to avoid tearing.
+        let at = |o: usize| -> Result<u64> {
+            for _ in 0..4 {
+                let hi1 = w.r32(o + 4)?;
+                let lo = w.r32(o)?;
+                let hi2 = w.r32(o + 4)?;
+                if hi1 == hi2 {
+                    return Ok(u64::from(lo) | (u64::from(hi1) << 32));
+                }
+            }
+            Err(EIO)
+        };
+        Ok((at(start_off)?, at(end_off)?))
+    }
+
     /// Exact M4 queue and submit-pipe proof for one serialized publication. Event
     /// notifications are wakeups; neither an event nor elapsed time releases an owner.
     pub(crate) fn queue_receipt(
@@ -324,7 +360,7 @@ impl Firmware {
                     return Ok(false);
                 }
             }
-            if info.r32(0x80)? != 0 {
+            if info.r32(self.init.abi.qinfo().busy)? != 0 {
                 return Ok(false);
             }
         }
@@ -335,6 +371,40 @@ impl Firmware {
             return Ok(false);
         }
         Ok(true)
+    }
+
+    /// In-order receipt of compute flight `f` with later flights queued behind it: the NC
+    /// READ cursor (and with uncached queue info its consumers) passed its ring entries,
+    /// and the submit pipe's read and completion cursors passed its record.
+    fn queue_passed(
+        &self,
+        channel: Channel,
+        state: &super::object::FwObject,
+        info: &super::object::FwObject,
+        f: &Flight,
+    ) -> Result<bool> {
+        let cap = super::hw::sizes::QUEUE_CAP;
+        let tail = self.engine.head;
+        if f.head >= cap || f.c_start >= cap || tail >= cap {
+            return Err(EINVAL);
+        }
+        if !ring_passed(state.r32(qstate::READ)?, f.c_start, f.head, tail, cap) {
+            return Ok(false);
+        }
+        if !super::hw::tuning::FW_CACHED {
+            for offset in [0x20, 0x24, 0x28] {
+                if !ring_passed(info.r32(offset)?, f.c_start, f.head, tail, cap) {
+                    return Ok(false);
+                }
+            }
+        }
+        let slots = super::fw::channels::RING_SLOTS;
+        let record = f.rec[2];
+        let first = (record + slots - 1) % slots;
+        let producer = self.channels.producer(channel);
+        let pipe = self.channels.channel(channel);
+        Ok(ring_passed(pipe.read()?, first, record, producer, slots)
+            && ring_passed(pipe.completion()?, first, record, producer, slots))
     }
 
     /// A full receipt includes stage and notifier stamps, every physical consumer,
@@ -355,7 +425,32 @@ impl Firmware {
         };
         rmb();
         let mut full = true;
-        if f.computes != 0 {
+        // Later compute flights queued behind this one: the queue, pipe and stamp cells
+        // already moved on, so their receipt is "passed", in order; the newest flight keeps
+        // the exact receipt.
+        let behind = self.engine.flights.len() > 1;
+        if f.computes != 0 && behind {
+            let g = &self.graph.compute;
+            let e = &self.engine;
+            if !stamp_reached(g.fw_stamp.r32(0)?, f.target, e.target)
+                || !self.queue_passed(Channel::Compute, &g.qstate, &g.qinfo, f)?
+            {
+                return Ok(Retirement::Pending);
+            }
+            let k = f.claims.slot[0] as usize;
+            let unit = f.job.resources.compute_unit(k)?;
+            let submitted = unit.counter.r64(0)?;
+            let (start, end) = self.compute_ticks(unit)?;
+            let stamp = g.notifier.r32(notifier_page::COMPUTE_STAMP)?;
+            full &= stamp_reached(stamp, f.target, e.target)
+                && (stamp != f.target
+                    || g.notifier.r32(notifier_page::COMPUTE_CONTEXT)? == f.job.vm.slot)
+                && submitted != 0
+                && unit.work.r64(compute::DESCRIPTOR_COMPLETED)? == submitted
+                && unit.work.r64(compute::DESCRIPTOR_COUNTER)? == unit.counter.va
+                && start != 0
+                && end > start;
+        } else if f.computes != 0 {
             let g = &self.graph.compute;
             if g.fw_stamp.r32(0)? != f.target
                 || !self.queue_receipt(Channel::Compute, &g.qstate, &g.qinfo, f.head, f.rec[2])?
@@ -363,10 +458,9 @@ impl Firmware {
                 return Ok(Retirement::Pending);
             }
             let k = f.claims.slot[0] as usize;
-            let unit = f.job.resources.compute()?.compute.get(k).ok_or(EINVAL)?;
+            let unit = f.job.resources.compute_unit(k)?;
             let submitted = unit.counter.r64(0)?;
-            let start = unit.its.r64(0)?;
-            let end = unit.its.r64(8)?;
+            let (start, end) = self.compute_ticks(unit)?;
             full &= g.notifier.r32(notifier_page::COMPUTE_STAMP)? == f.target
                 && g.notifier.r32(notifier_page::COMPUTE_CONTEXT)? == f.job.vm.slot
                 && submitted != 0
@@ -428,14 +522,11 @@ impl Firmware {
         Ok(Retirement::Pending)
     }
 
-    /// Logs the non-zero fault banks of `state`.
+    /// Logs the fault bank of `state` when it holds a fault.
     #[allow(dead_code)]
     pub(crate) fn log_fault(&self, state: &EngineState) {
-        for bank in 0..2 {
-            let (f, va) = (state.status[bank], state.address[bank]);
-            if f == 0 {
-                continue;
-            }
+        let (bank, f, va) = (state.bank, state.status, state.address);
+        if f != 0 {
             let access = if (f >> 4) & 1 != 0 { "read" } else { "write" };
             let reason = if (f >> 1) & 7 != 0 {
                 "reason!=unmapped"
@@ -490,9 +581,11 @@ impl Firmware {
             if f.renders != 0 {
                 self.recovery.last_retired[1] = Some(f.ta_target);
                 self.recovery.last_retired[2] = Some(f.fs_target);
-                let committed = f.job.resources.pb(f.first).and_then(|epoch| {
-                    self.pools
-                        .retire_binding(timestamp_claims.pass[0] as usize, epoch)
+                let committed = f.pb.as_ref().ok_or(EINVAL).and_then(|epoch| {
+                    let k = timestamp_claims.pass[0] as usize;
+                    self.pools.retire_binding(k, epoch)?;
+                    self.pools.retire_epoch(k, f.pb_binding, result.is_ok());
+                    Ok(())
                 });
                 if let Err(error) = committed {
                     self.retain(&f.job);
@@ -514,6 +607,10 @@ impl Firmware {
         } else {
             // Only an actual passed abort lacks the full owner receipt. An affected job
             // with a full normal receipt fails its fence without poisoning healthy storage.
+            if f.renders != 0 {
+                // The quarantined slot is not picked again, but keep no epoch of it for reuse.
+                self.pools.forget(timestamp_claims.pass[0] as usize);
+            }
             self.slots.quarantine(&mut f.claims);
             self.retain(&f.job);
             self.recovery.aborted_receipts = self.recovery.aborted_receipts.saturating_add(1);
@@ -552,6 +649,15 @@ impl Firmware {
         let job = f.job.clone();
         let p = &job.progress;
         p.next.store(p.next() + f.count as u32, Ordering::Relaxed);
+        if result.is_err() {
+            // Its queue's later commands queued behind it fail with it, as unpublished ones
+            // are cancelled: they never report a successful receipt after this hole.
+            for later in self.engine.flights.iter_mut() {
+                if Arc::ptr_eq(&later.job.queue, &job.queue) {
+                    later.doomed = true;
+                }
+            }
+        }
         if let Err(error) = result {
             if p.is_pending() {
                 // Drop its unpublished commands.
@@ -650,13 +756,7 @@ impl Firmware {
             match command {
                 super::command::Command::Compute(command) => {
                     let index = *slots.get(compute).ok_or(EINVAL)? as usize;
-                    let unit = flight
-                        .job
-                        .resources
-                        .compute()?
-                        .compute
-                        .get(index)
-                        .ok_or(EINVAL)?;
+                    let unit = flight.job.resources.compute_unit(index)?;
                     let ticks = [unit.its.r64(0)?, unit.its.r64(8)?, 0, 0];
                     command
                         .timestamp_outputs
@@ -746,10 +846,9 @@ impl Firmware {
             );
         }
         for k in 0..(f.computes as usize).min(f.claims.slot_count as usize) {
-            let Some(arena) = f.job.resources.compute.as_ref() else {
+            let Ok(c) = f.job.resources.compute_unit(f.claims.slot[k] as usize) else {
                 return;
             };
-            let c = &arena.compute[f.claims.slot[k] as usize];
             stage(&c.its, 0, &mut s.cdm_ticks, crate::usage::Engine::Compute);
         }
         if hi > lo {
@@ -789,7 +888,12 @@ impl Firmware {
         let (g, r, e) = (&self.graph.compute, &self.graph.render, &self.engine);
         let ch = &self.channels;
         let rd = |o: &super::object::FwObject, off| o.r32(off).unwrap_or(0xdeadbeef);
-        let state = self.session.regs.engine_state().unwrap_or_default();
+        let state = self
+            .session
+            .engine_state()
+            .ok()
+            .flatten()
+            .unwrap_or_default();
         let f = e.oldest();
         let ms = f.map_or(0, |f| now_ns().wrapping_sub(f.published_ns) / 1_000_000);
 
@@ -986,6 +1090,19 @@ impl Firmware {
             s.span_ticks / 24
         )?;
         // The phase timers of debug_flags bit 49, and the scrub flush waits.
+        {
+            let s = &self.engine.stats;
+            writeln!(
+                f,
+                "pipeline: behind {} max_flights {} compute_published {} hold {}/{}/{}",
+                s.behind,
+                s.max_flights,
+                self.slots.compute_published(),
+                s.hold[0],
+                s.hold[1],
+                s.hold[2]
+            )?;
+        }
         let p = &self.engine.prof;
         writeln!(
             f,

@@ -23,6 +23,8 @@ const KILL_WAIT_BOUNDS_NS: [u64; 4] = [10_000_000, 100_000_000, 1_000_000_000, 5
 /// A failed context's kill waiting this long is reported, once per kill and at most once per
 /// this interval across kills.
 const SLOW_KILL_WAIT_NS: u64 = 5_000_000_000;
+/// How often a closed context whose kill waits is looked at again ([`Firmware::kill_retry_delay`]).
+const KILL_RETRY_NS: u64 = 100_000_000;
 static SLOW_KILL_WARNED_NS: AtomicU64 = AtomicU64::new(0);
 /// Failed contexts' kills published beside other contexts' compute under GPU memory pressure,
 /// and when the last one was: at most one per [`PRESSED_KILL_INTERVAL_NS`], so the memory of
@@ -60,6 +62,43 @@ fn render_kill_target(listed: u128, own: u128) -> Option<u8> {
 /// its compute queue still looked like a render-only candidate.
 fn render_kill_eligible(age: u64, killed: bool, executed: bool, compute_clear: bool) -> bool {
     age >= RENDER_KILL_DELAY_NS && !killed && executed && compute_clear
+}
+
+/// How a closed context whose render pairs are idle for a kill (`teardown_idle`) is killed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KillRoute {
+    /// Through the exit of one of its compute queues (`publish_compute_exit`).
+    Compute,
+    /// On its render pairs' behalf (`publish_render_kill`).
+    Render,
+    /// Not now.
+    None,
+}
+
+/// The kill route of a closed context: whether a compute command of it failed (`failed`), its
+/// render pools were all released (`pools_released`), a kill of it would release render pairs
+/// whose commands all ran unstamped and no kill of it was published yet (`executed`), a compute
+/// queue of it will exit (`exit_pending`), and [`render_kill_eligible`] (`render_eligible`).
+///
+/// A compute exit never waits for what only the kill releases. Executed pairs keep their pool
+/// leases until the kill is acknowledged (`Pair::firmware_drained`): those of a failed context,
+/// and those of a context whose compute commands retired without their stamps or timed out.
+/// Without `executed`, the second kind waited for those pools on its compute exit, while the
+/// render-only kill waited for the compute queue still holding those commands. Neither kill
+/// was published, and the context, its pairs, compute queues and pools stayed held until the
+/// processors stopped. With no compute queue left to exit, the render pairs carry the kill
+/// instead: otherwise a quarantined pair whose last group ran but was never stamped, and whose
+/// pool lease is already released, keeps the context (and its pair) held.
+fn kill_route(failed: bool, pools_released: bool, executed: bool, exit_pending: bool, render_eligible: bool)
+    -> KillRoute
+{
+    if exit_pending && (failed || pools_released || executed) {
+        KillRoute::Compute
+    } else if render_eligible {
+        KillRoute::Render
+    } else {
+        KillRoute::None
+    }
 }
 
 /// The one admission owner of every pair a kill holds, if there is one.
@@ -182,18 +221,18 @@ impl Firmware {
                 self.queues.teardown.clear_kill_wait(index);
                 continue;
             }
-            // A failed context's executed pairs keep their pool leases until the kill is
-            // acknowledged (`Pair::firmware_drained`), so its kill cannot wait for them.
-            let result = if self.compute_failed(&context) || self.queues.render.teardown_pools_released(&context) {
-                // Only a render-only kill's wait lives on the entry; a compute kill keeps its
-                // own on the queue.
-                self.queues.teardown.clear_kill_wait(index);
-                self.publish_compute_exit(&context, age, now, &mut pressed)
-            } else if self.render_kill_candidate(index, &context, age) {
-                self.publish_render_kill(index, &context, now, &mut pressed)
-            } else {
-                self.queues.teardown.clear_kill_wait(index);
-                Ok(())
+            let result = match self.kill_route_for(index, &context, age) {
+                KillRoute::Compute => {
+                    // Only a render-only kill's wait lives on the entry; a compute kill keeps
+                    // its own on the queue.
+                    self.queues.teardown.clear_kill_wait(index);
+                    self.publish_compute_exit(&context, age, now, &mut pressed)
+                }
+                KillRoute::Render => self.publish_render_kill(index, &context, now, &mut pressed),
+                KillRoute::None => {
+                    self.queues.teardown.clear_kill_wait(index);
+                    Ok(())
+                }
             };
             if let Err(error) = result {
                 dev_err!(
@@ -238,7 +277,7 @@ impl Firmware {
         }) else {
             return Ok(());
         };
-        let failed = self.compute_failed(context);
+        let failed = self.kill_waits_as_failed(context);
         if self.render_control_backpressured() {
             return Ok(());
         }
@@ -324,7 +363,9 @@ impl Firmware {
             .as_mut()
             .and_then(|entry| entry.queue.as_deref_mut())
             .ok_or(EIO)?;
-        if failed {
+        // A wait taken under the failed context's rule ends here, also when the kill is now
+        // published under the other one (the pairs it would have released drained meanwhile).
+        if failed || queue.kill_waiting(now).is_some() {
             record_kill_wait(queue.take_kill_wait(now));
         }
         if beside {
@@ -344,6 +385,37 @@ impl Firmware {
             );
         }
         Ok(())
+    }
+
+    /// [`kill_route`] for the closed context at teardown `index`, closed `age` ago.
+    fn kill_route_for(&self, index: usize, context: &Arc<Context>, age: u64) -> KillRoute {
+        kill_route(
+            self.compute_failed(context),
+            self.queues.render.teardown_pools_released(context),
+            self.kill_releases_executed_render(context),
+            self.compute_exit_pending(context),
+            self.render_kill_candidate(index, context, age),
+        )
+    }
+
+    /// A kill of `context` would release render pairs of it whose commands all ran but were
+    /// never stamped (`Pair::executed_for_kill`), and no kill of it was published yet. Only that
+    /// kill releases them. Never a second time: a second kill of a killed context made the
+    /// firmware fault on the killed pair's own tiling queue (see `render_kill_eligible`). Not on
+    /// M5, which never kills a context on its render pairs' behalf.
+    fn kill_releases_executed_render(&self, context: &Arc<Context>) -> bool {
+        !self.init.is_m5() && !context.kill_published() && self.queues.render.executed_slots(context) != 0
+    }
+
+    /// A compute exit of `context` waits only for other contexts' compute to pause
+    /// ([`Self::foreign_compute_running`]), as a failed context's kill and a render-only kill
+    /// do, instead of for all of their work ([`Self::kill_unsafe`]). That holds when its compute
+    /// failed ([`Self::compute_failed`]), and when the kill releases executed render pairs:
+    /// those are what a render-only kill releases, and nothing else does. `kill_unsafe` also
+    /// waits for other clients' render work, and it gives no warning and has no memory-pressure
+    /// escape. Under a steady render load the pairs, pools and memory would stay held.
+    fn kill_waits_as_failed(&self, context: &Arc<Context>) -> bool {
+        self.compute_failed(context) || self.kill_releases_executed_render(context)
     }
 
     /// A closed context whose compute side is clean, with render pairs whose commands all ran
@@ -457,6 +529,10 @@ impl Firmware {
     /// acknowledgement; such a kill takes the next moment without foreign compute instead.
     /// Render work is not waited for. A GPU that retired nothing for [`LIVENESS_NS`] has
     /// stopped. The wait is Neo's; M5 publishes its kills at once.
+    ///
+    /// A closed owner's queue whose commands all retired without their stamps runs nothing and
+    /// is itself waiting for a kill (`Queue::running_commands`). It is not waited for: two
+    /// closed contexts left that way would otherwise wait for each other's kill.
     fn foreign_compute_running(&self, context: &Arc<Context>, now: u64) -> bool {
         if self.init.is_m5() {
             return false;
@@ -464,7 +540,7 @@ impl Firmware {
         let stalled = crate::g17::recovery::since_retired(now).is_none_or(|since| since >= LIVENESS_NS);
         !stalled
             && self.queues.compute.iter().flatten().filter_map(|entry| entry.queue.as_deref()).any(|queue| {
-                queue.in_flight() && !queue.context().is_some_and(|bound| Arc::ptr_eq(bound, context))
+                queue.running_commands() && !queue.context().is_some_and(|bound| Arc::ptr_eq(bound, context))
             })
     }
 
@@ -474,6 +550,32 @@ impl Firmware {
     /// all of the context's render pairs idle; the pairs behind such a failure become idle when
     /// their commands have executed (`Pair::firmware_drained`), so by then nothing of the
     /// context runs any more.
+    /// Delay to the next event pass while a closed context waits for its kill: a compute exit
+    /// or a render-only kill that was not published yet, typically because other contexts'
+    /// work was running ([`Self::kill_unsafe`], [`Self::foreign_compute_running`]). Without a
+    /// pass after that work ends, an idle GPU would never publish the kill, and the closed
+    /// context would keep its quarantined queues, pairs and memory while the next clients
+    /// run out of room.
+    pub(in crate::g17) fn kill_retry_delay(&self) -> Option<u64> {
+        let now = now_ns();
+        (0..self.queues.teardown.len())
+            .any(|index| {
+                self.queues.teardown.closed(index, now).is_some_and(|(context, _)| {
+                    !context.kill_published()
+                        && (self.compute_exit_pending(&context)
+                            || self.queues.render.executed_slots(&context) != 0)
+                })
+            })
+            .then_some(KILL_RETRY_NS)
+    }
+
+    /// A compute queue of `context` will exit, now or once its delay passed.
+    fn compute_exit_pending(&self, context: &Arc<Context>) -> bool {
+        self.queues.compute.iter().flatten().filter_map(|entry| entry.queue.as_deref()).any(|queue| {
+            queue.exit_candidate(context, u64::MAX) || queue.exit_published(context)
+        })
+    }
+
     fn compute_failed(&self, context: &Arc<Context>) -> bool {
         self.queues.compute.iter().flatten().filter_map(|entry| entry.queue.as_deref()).any(|queue| {
             queue.context().is_some_and(|bound| Arc::ptr_eq(bound, context))
@@ -486,9 +588,10 @@ impl Firmware {
     /// closed context's commands left alone retire like any others once the GPU
     /// reaches them, so its queues stay quarantined and retained until then. Only
     /// a GPU that retired nothing for [`LIVENESS_NS`] has stopped, and then the
-    /// kill proceeds. A context whose compute failed ([`Self::compute_failed`])
-    /// is not left alone, since its held commands never retire: its kill waits
-    /// only for other contexts' compute ([`Self::foreign_compute_running`]).
+    /// kill proceeds. A context whose compute failed ([`Self::compute_failed`]),
+    /// or whose kill releases executed render pairs, is not left alone, since its
+    /// held commands never retire: its kill waits only for other contexts' compute
+    /// ([`Self::kill_waits_as_failed`], [`Self::foreign_compute_running`]).
     ///
     /// On M5 the wait ends [`RECOVERY_WAIT_MS`] after the context closed (`age`): a closed
     /// context's command that never terminates would otherwise hold its queue, pairs and
@@ -544,7 +647,23 @@ impl Firmware {
 
 #[kernel::macros::kunit_tests(asahi_g17_render_kill_target)]
 mod render_kill_target_tests {
-    use super::{hold_owner, render_kill_eligible, render_kill_target, RENDER_KILL_DELAY_NS};
+    use super::{hold_owner, kill_route, render_kill_eligible, render_kill_target, KillRoute, RENDER_KILL_DELAY_NS};
+
+    #[test]
+    fn executed_render_pairs_do_not_hold_back_their_compute_exit() {
+        // Compute that retired without its stamps or timed out, beside an executed pair that
+        // holds its pool: the kill goes through the compute exit.
+        assert_eq!(kill_route(false, false, true, true, false), KillRoute::Compute);
+        // As before: a failed context, or one whose pools are released.
+        assert_eq!(kill_route(true, false, false, true, false), KillRoute::Compute);
+        assert_eq!(kill_route(false, true, false, true, false), KillRoute::Compute);
+        // No compute queue will exit: the render pairs carry the kill, or nothing does.
+        assert_eq!(kill_route(false, true, true, false, true), KillRoute::Render);
+        assert_eq!(kill_route(false, false, true, false, false), KillRoute::None);
+        // A compute exit pending while the pools are held, and the kill would release no
+        // executed pair (there is none, or the context was killed already): nothing, as before.
+        assert_eq!(kill_route(false, false, false, true, false), KillRoute::None);
+    }
 
     #[test]
     fn a_killed_context_is_never_killed_again() {

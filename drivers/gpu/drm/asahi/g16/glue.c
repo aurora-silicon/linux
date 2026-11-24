@@ -4,9 +4,11 @@
  * and macros. The module pin is retain.c's. Built only with CONFIG_DRM_ASAHI_G16.
  */
 #include <linux/device.h>
+#include <asm/arch_timer.h>
 #include <linux/atomic.h>
 #include <linux/dma-map-ops.h>
 #include <linux/io.h>
+#include <linux/iopoll.h>
 #include <linux/ioport.h>
 #include <linux/mm.h>
 #include <linux/mfd/syscon.h>
@@ -23,6 +25,8 @@
 #include <linux/soc/apple/pmp-cooling.h>
 #include <linux/soc/apple/pmp-telemetry.h>
 #include <linux/thermal.h>
+
+#include "glue.h"
 
 bool asahi_g16_board(void);
 int asahi_g16_display_prepare(struct device *dev);
@@ -41,11 +45,14 @@ struct asahi_g16_cooling {
 	struct device_node *pmp_node;
 	struct apple_pmp_cooling policy;
 	struct thermal_cooling_device *cdev;
+	/* The last reading from a sensor that was valid, and when. */
+	u64 valid_ns;
+	long valid_mc;
 };
 
 struct asahi_g16_cooling *asahi_g16_cooling_register(struct device *dev);
 void asahi_g16_cooling_unregister(struct asahi_g16_cooling *cooling);
-int asahi_g16_cooling_sample(struct asahi_g16_cooling *cooling, u64 now,
+int asahi_g16_cooling_sample(struct asahi_g16_cooling *cooling, u64 now, bool idle,
 			    long *temperature, u32 *governor, u32 *power,
 			    u32 *backstop);
 int asahi_g16_clpc_gpu_get(struct device *dev, struct apple_clpc_gpu **out);
@@ -131,8 +138,10 @@ void asahi_g16_cooling_unregister(struct asahi_g16_cooling *cooling)
 
 /* Serialized by the GPU owner. Provider lifetime and MMIO access stay with
  * PMP: this consumer owns no SRAM mapping and cannot restart its firmware.
+ * An idle GPU samples about twice a second and makes no heat, so with nothing
+ * in flight the last cool reading stands for as long as the sensors stay dark.
  */
-int asahi_g16_cooling_sample(struct asahi_g16_cooling *cooling, u64 now,
+int asahi_g16_cooling_sample(struct asahi_g16_cooling *cooling, u64 now, bool idle,
 			    long *temperature, u32 *governor, u32 *power,
 			    u32 *backstop)
 {
@@ -140,6 +149,18 @@ int asahi_g16_cooling_sample(struct asahi_g16_cooling *cooling, u64 now,
 
 	*temperature = 0;
 	ret = apple_pmp_telemetry_get_hotspot(cooling->pmp_node, temperature);
+	if (!ret) {
+		cooling->valid_ns = now;
+		cooling->valid_mc = *temperature;
+	} else if (ret == -ENODATA && cooling->valid_ns &&
+		   (idle || now - cooling->valid_ns < APPLE_PMP_GATED_HOLD_NS) &&
+		   cooling->valid_mc < APPLE_PMP_GATED_HOLD_MC) {
+		*temperature = cooling->valid_mc;
+		/* Idle makes no heat: the 2 s with work in flight start with the work. */
+		if (idle)
+			cooling->valid_ns = now;
+		ret = 0;
+	}
 	apple_pmp_cooling_sample(&cooling->policy, now, *temperature, ret);
 	*governor = atomic_read(&cooling->state);
 	*power = apple_pmp_gpu_power_state(cooling->pmp);
@@ -148,10 +169,53 @@ int asahi_g16_cooling_sample(struct asahi_g16_cooling *cooling, u64 now,
 	return ret;
 }
 
-/* Whether this is a qualified J713/T8132 board. */
+/*
+ * genpd never turned the GFX domain's TVM gate off, so a sleep that lost it goes
+ * unnoticed: the domain then doesn't come on. Enabled here if it's found clear.
+ */
+int asahi_g16_tvm_enable(struct device *dev);
+int asahi_g16_tvm_enable(struct device *dev)
+{
+	struct device_node *gfx, *tvm;
+	void __iomem *reg;
+	u32 val;
+	int ret = 0;
+
+	gfx = of_parse_phandle(dev->of_node, "power-domains", 0);
+	if (!gfx)
+		return -EINVAL;
+	tvm = of_parse_phandle(gfx, "power-domains", 0);
+	of_node_put(gfx);
+	if (!tvm)
+		return -EINVAL;
+	reg = of_iomap(tvm, 0);
+	of_node_put(tvm);
+	if (!reg)
+		return -ENOMEM;
+	val = readl(reg);
+	dev_dbg(dev, "GFX TVM gate after the sleep: %#x\n", val);
+	if (!(val & BIT(0))) {
+		writel(val | BIT(0), reg);
+		ret = readl_poll_timeout(reg, val, val & BIT(0), 1, 1000);
+	}
+	iounmap(reg);
+
+	return ret;
+}
+
+/* Whether this T8132 board's retained PMP carries the GPU's AGX vote. */
 bool asahi_g16_board(void)
 {
-	return apple_pmp_j713_board();
+	return apple_pmp_t8132_retained_board();
+}
+
+/*
+ * The system counter frequency the boot loader programmed, in Hz: the clock the
+ * ADT counts GPU power sample periods in.
+ */
+u32 asahi_g16_timebase_hz(void)
+{
+	return arch_timer_get_cntfrq();
 }
 
 /*

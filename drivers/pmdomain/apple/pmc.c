@@ -275,9 +275,13 @@ static int apple_pmc_agent_enable(struct apple_pmc *pmc, unsigned int agent,
 	return ret;
 }
 
+static struct platform_driver apple_pmc_driver;
+
 static struct apple_pmc *apple_pmc_from_dev(struct device *dev)
 {
-	return dev ? dev_get_drvdata(dev) : NULL;
+	if (!dev || dev->driver != &apple_pmc_driver.driver)
+		return NULL;
+	return dev_get_drvdata(dev);
 }
 
 /**
@@ -1553,6 +1557,12 @@ static int apple_pmc_resume_early(struct device *dev)
 			ret = ret ?: err;
 		}
 	}
+	/*
+	 * The AP agent's word also holds its DCS vote, which a deep sleep's commit zeroes
+	 * (apple-sleep, T8132 and T8142). Cast it again: a no-op if it stayed.
+	 */
+	if (!(pmc->floor_rails & BIT(pmc->hw->dcs_rail)))
+		apple_pmc_dcs_vote(pmc);
 	raw_spin_unlock_irqrestore(&pmc->lock, flags);
 	if (ret)
 		dev_err(dev, "state not restored after sleep: %d\n", ret);

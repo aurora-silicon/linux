@@ -35,25 +35,27 @@ static inline bool ane_h16_register_valid(u32 word)
 
 /*
  * A stream opens with a 16-byte frame: little-endian u32 @prologue, then
- * twelve reserved zero bytes. H16 programs open with 1; every measured H17
- * program opens with 0. The last task may end at the end of the section;
- * every other task is padded with zeros to 16 bytes. This structural gate
- * does not replace container/tensor/aperture validation.
+ * twelve reserved zero bytes. H15/H16/H17 programs share this framing with
+ * @header_words fixed words per task (8 on H15, 9 on H16 and H17). The last
+ * task may end at the end of the section; every other task is padded with
+ * zeros to 16 bytes. This structural gate does not replace container/tensor/
+ * aperture validation.
  */
 static inline int
-ane_hx_task_stream_validate_limit(const void *text, size_t size, u32 expected_tasks,
-				  u32 prologue, u32 *record_limit, size_t *final_end)
+ane_hx_task_stream_validate_hdr(const void *text, size_t size, u32 expected_tasks,
+				u32 prologue, unsigned int fixed_header_words,
+				u32 *record_limit, size_t *final_end)
 {
 	const u8 *p = text;
 	size_t pos = 16, last = 0;
 	u32 tasks = 0, limit = 0;
 
-	if (!p || !expected_tasks || size < 16 || size > ANE_H16_TASK_MAX ||
-	    (size & 3) || get_unaligned_le32(p) != prologue ||
-	    memchr_inv(p + 4, 0, 12))
+	if (!p || !expected_tasks || !fixed_header_words || size < 16 ||
+	    size > ANE_H16_TASK_MAX || (size & 3) ||
+	    get_unaligned_le32(p) != prologue || memchr_inv(p + 4, 0, 12))
 		return -ENOEXEC;
 	while (pos < size) {
-		u32 words, header_words = 9;
+		u32 words, header_words = fixed_header_words;
 		size_t end, padded, rec;
 
 		if (size - pos < 16)
@@ -65,10 +67,10 @@ ane_hx_task_stream_validate_limit(const void *text, size_t size, u32 expected_ta
 			pos += 16;
 			continue;
 		}
-		if (words < 9 || words > (size - pos) / 4)
+		if (words < fixed_header_words || words > (size - pos) / 4)
 			return -ENOEXEC;
 		end = pos + words * 4;
-		if ((get_unaligned_le32(p + pos + 8 * 4) & 3) == 3)
+		if ((get_unaligned_le32(p + pos + (fixed_header_words - 1) * 4) & 3) == 3)
 			header_words++;
 		if (words < header_words)
 			return -ENOEXEC;
@@ -115,6 +117,14 @@ ane_hx_task_stream_validate_limit(const void *text, size_t size, u32 expected_ta
 	if (final_end)
 		*final_end = last;
 	return 0;
+}
+
+static inline int
+ane_hx_task_stream_validate_limit(const void *text, size_t size, u32 expected_tasks,
+				  u32 prologue, u32 *record_limit, size_t *final_end)
+{
+	return ane_hx_task_stream_validate_hdr(text, size, expected_tasks, prologue, 9,
+					       record_limit, final_end);
 }
 
 static inline int

@@ -139,6 +139,12 @@ pub(crate) use residency::{Gate as ResidencyGate, VmShrinker};
 
 /// PPL magic number for the handoff region
 const PPL_MAGIC: u64 = 0x4b1d000000000002;
+/// Written by the G18G GFX firmware of macOS 27.2 (RTKit 3514.41.1) to the
+/// handoff's firmware magic while it maps the handoff region during its own
+/// boot, whether or not a peer exists. It is not a
+/// PPL handshake reply (that is [`PPL_MAGIC`]); 3514.0.15 writes nothing.
+#[cfg(CONFIG_DRM_ASAHI_G18)]
+const FW_BOOT_MAGIC_V3: u64 = 0x4b1d000000000003;
 
 /// Number of supported context entries in the TTBAT
 const UAT_NUM_CTX: usize = 64;
@@ -233,6 +239,12 @@ pub(crate) struct UatQuirks {
     /// Store GPU-only mappings of client and kernel-lower tables as AP 0 with the access in
     /// PXN (read) and UXN (write), the form the firmware itself uses, instead of AP 2.
     pub(crate) native_gpu_permissions: bool,
+    /// Keep the shared pool window and the client-private window at their original split
+    /// (`hw::t8140::dynamic::LOWER`, `CLIENT_LOWER`) instead of the A18 Pro's
+    /// (`WIDE_LOWER`, `WIDE_CLIENT_LOWER`), which holds the render pools of every execution
+    /// context at once. The M4 Max uses the wider pool window too: with 40 cores its compute
+    /// pools outgrow the largest free range of the narrow one. The M4 Pro could too.
+    pub(crate) narrow_pool_window: bool,
 }
 
 impl UatQuirks {
@@ -245,6 +257,7 @@ impl UatQuirks {
         handoff_slot: 0,
         handoff_unk2: 0,
         native_gpu_permissions: false,
+        narrow_pool_window: false,
     };
 }
 
@@ -402,13 +415,35 @@ impl Drop for MappingMutation {
     }
 }
 
+/// The most bytes of the client-private window one VM has had mapped at a time.
+static CLIENT_PRIVATE_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
+
+/// See [`CLIENT_PRIVATE_HIGH_WATER`] (diagnostics).
+pub(crate) fn client_private_high_water() -> u64 {
+    CLIENT_PRIVATE_HIGH_WATER.load(Ordering::Relaxed)
+}
+
 /// Where client-private aliases are placed: [`layout::CLIENT_PRIVATE_RANGE`] on M5,
-/// outside every Mesa window; the A18 Pro's arena otherwise.
-pub(crate) fn client_private_range(m5: bool) -> Range<u64> {
+/// outside every Mesa window; the SoC's arena next to the shared pool window otherwise.
+fn client_private_range(m5: bool, narrow_pool_window: bool) -> Range<u64> {
     if m5 {
         layout::CLIENT_PRIVATE_RANGE
-    } else {
+    } else if narrow_pool_window {
         crate::hw::t8140::dynamic::CLIENT_LOWER
+    } else {
+        crate::hw::t8140::dynamic::WIDE_CLIENT_LOWER
+    }
+}
+
+/// The shared window of canonical lower objects (render and compute pools and the small
+/// mappings of hardware queues) next to [`client_private_range`].
+fn pool_window(m5: bool, narrow_pool_window: bool) -> Range<u64> {
+    if m5 {
+        layout::CANONICAL_RANGE
+    } else if narrow_pool_window {
+        crate::hw::t8140::dynamic::LOWER
+    } else {
+        crate::hw::t8140::dynamic::WIDE_LOWER
     }
 }
 
@@ -636,9 +671,8 @@ impl gpuvm::DriverGpuVm for VmInner {
         ).map_err(|_| EOVERFLOW)? + 1;
         let _mutation = self.mapping_addition();
         let (map_addr, map_length) = (op.addr(), op.length() as usize);
-        let mut iova = op.addr();
         let mut left = op.length() as usize;
-        let mut offset = op.gem_offset() as usize;
+        let offset = op.gem_offset() as usize;
 
         let one_page = op.flags().contains(gpuvm::GpuVaFlag::REPEAT);
 
@@ -661,7 +695,7 @@ impl gpuvm::DriverGpuVm for VmInner {
         if is_sparse_tile(op.flags()) {
             // Kernel tile fill: the GEM only anchors the GPUVA.
             let result = if one_page {
-                self.map_sparse_tile(iova..iova + left as u64, ctx.prot)
+                self.map_sparse_tile(map_addr..map_addr + left as u64, ctx.prot)
             } else {
                 Err(EINVAL)
             };
@@ -675,53 +709,25 @@ impl gpuvm::DriverGpuVm for VmInner {
         // Never acquire the object reservation from inside the GPUVM map callback.
         let segments = op.vm_bo().data().segments.lock();
         let sgt = segments.as_ref().ok_or(EFAULT)?;
-        for &(dma_address, dma_len) in sgt.iter() {
-            let mut addr = dma_address as usize;
-            let mut len = dma_len as usize;
-
-            if left == 0 {
-                break;
-            }
-
-            if offset > 0 {
-                let skip = len.min(offset);
-                addr += skip;
-                len -= skip;
-                offset -= skip;
-            }
-            if len == 0 {
-                continue;
-            }
-
-            assert!(offset == 0);
-
-            if one_page {
-                len = left;
-            } else {
-                len = len.min(left);
-            }
-
+        if left > 0 {
             mod_dev_dbg!(
                 self.dev,
-                "MMU: map: {:#x}:{:#x} -> {:#x} [OP={}]\n",
-                addr,
-                len,
-                iova,
+                "MMU: map_segments: {:#x}+{:#x} [OP={}]\n",
+                map_addr,
+                left,
                 one_page
             );
-
-            if let Err(error) = self.page_table.map_pages(
-                iova..(iova + len as u64),
-                addr as PhysicalAddr,
+            if let Err(error) = self.page_table.map_segments(
+                map_addr..(map_addr + left as u64),
+                sgt.iter()
+                    .map(|&(dma_address, dma_len)| (dma_address as PhysicalAddr, dma_len as usize)),
+                offset,
                 ctx.prot,
                 one_page,
             ) {
                 self.rollback_failed_map(map_addr, map_length as u64);
                 return Err(error);
             }
-
-            left -= len;
-            iova += len as u64;
         }
 
         drop(segments);
@@ -1105,7 +1111,7 @@ impl VmInner {
 
     /// Install only into the empty range reserved by `map_node`.
     fn map_node_prepared(&mut self, node: &mm::Node<(), KernelMappingInner>, prot: Prot) -> Result {
-        let mut iova = node.start();
+        let iova = node.start();
         let segments = node
             .bo
             .as_ref()
@@ -1114,60 +1120,24 @@ impl VmInner {
             .data()
             .segments
             .lock();
-        let mut offset = node.offset;
-        let mut left = node.mapped_size;
 
         if let Some(segments) = &*segments {
-            for (dma_address, dma_len) in segments.iter() {
-                if left == 0 {
-                    break;
-                }
-
-                // TODO: proper DMA address/length handling
-                let mut addr = *dma_address as usize;
-                let mut len: usize = *dma_len as usize;
-
-                if (offset | addr | len | iova as usize) & UAT_PGMSK != 0 {
-                    dev_err!(
-                        self.dev.as_ref(),
-                        "MMU: KernelMapping {:#x}:{:#x} -> {:#x} is not page-aligned\n",
-                        addr,
-                        len,
-                        iova
-                    );
-                    return Err(EINVAL);
-                }
-
-                if offset > 0 {
-                    let skip = len.min(offset);
-                    addr += skip;
-                    len -= skip;
-                    offset -= skip;
-                }
-
-                len = len.min(left);
-
-                if len == 0 {
-                    continue;
-                }
-
+            if node.mapped_size > 0 {
                 mod_dev_dbg!(
                     self.dev,
-                    "MMU: map: {:#x}:{:#x} -> {:#x}\n",
-                    addr,
-                    len,
-                    iova
+                    "MMU: map_node_prepared: {:#x}+{:#x}\n",
+                    iova,
+                    node.mapped_size
                 );
-
-                self.page_table.map_pages(
-                    iova..(iova + len as u64),
-                    addr as PhysicalAddr,
+                self.page_table.map_segments(
+                    iova..(iova + node.mapped_size as u64),
+                    segments
+                        .iter()
+                        .map(|&(dma_address, dma_len)| (dma_address as PhysicalAddr, dma_len as usize)),
+                    node.offset,
                     prot,
                     false,
                 )?;
-
-                iova += len as u64;
-                left -= len;
             }
         }
 
@@ -1200,6 +1170,10 @@ pub(crate) struct Vm {
     gpuvm: ARef<gpuvm::GpuVm<VmInner>>,
     dummy_obj: ARef<gem::Object>,
     binding: Arc<Mutex<VmBinding>>,
+    /// Bytes of the client-private window ([`Vm::client_private_range`]) this VM has mapped.
+    private_bytes: Arc<AtomicU64>,
+    /// [`UatQuirks::narrow_pool_window`].
+    narrow_pool_window: bool,
 }
 no_debug!(Vm);
 
@@ -1466,6 +1440,8 @@ pub(crate) struct KernelMappingInner {
     prot: Prot,
     offset: usize,
     mapped_size: usize,
+    /// The owning VM's count of client-private bytes, for a mapping placed in that window.
+    private: Option<Arc<AtomicU64>>,
 }
 
 /// A kernel CPU mapping of a timestamp buffer's GEM backing. Dropping it takes the object's
@@ -1975,6 +1951,9 @@ impl Drop for KernelMapping {
         owner.tlbi_contexts_naming_root(self.iova(), self.size());
         drop(_mutation);
         drop(owner);
+        if let Some(private) = self.0.private.as_ref() {
+            private.fetch_sub(self.0.mapped_size as u64, Ordering::Relaxed);
+        }
         // SAFETY: Every normal path reaches this exactly once, after all GPUVM locks have
         // been released. Uncertain M4 paths return earlier, retaining the node and its pins.
         unsafe { ManuallyDrop::drop(&mut self.0) };
@@ -2007,6 +1986,7 @@ struct UatShared {
     map_kernel_to_user: bool,
     handoff_rgn: UatRegion,
     ttbs_rgn: UatRegion,
+    clean_poc: bool,
     quirks: UatQuirks,
 }
 
@@ -2036,9 +2016,11 @@ impl UatShared {
         }
     }
 
-    /// Writes back context-table slot `idx` after it changed, where this SoC needs it.
+    /// Writes back context-table slot `idx` after it changed, where the UAT
+    /// walker does not snoop the CPU caches (either an adopted UAT or a SoC
+    /// with `quirks.clean_tables`).
     fn publish_slot(&self, idx: usize) {
-        if self.quirks.clean_tables {
+        if self.clean_poc || self.quirks.clean_tables {
             let slot = core::ptr::from_ref(&self.ttbs()[idx]).cast::<u8>();
             pgtable::clean_poc(slot, size_of::<SlotTTBS>());
             pgtable::poc_barrier();
@@ -2294,7 +2276,7 @@ impl Handoff {
     fn init(&self, firmware: UatFirmware, slot: u32, unk2: u8) -> Result {
         #[cfg(CONFIG_DRM_ASAHI_G18)]
         if firmware.is_no_peer()
-            && (self.magic_fw.load(Ordering::Acquire) != 0
+            && (!matches!(self.magic_fw.load(Ordering::Acquire), 0 | FW_BOOT_MAGIC_V3)
                 || self.lock_fw.load(Ordering::Acquire) != 0)
         {
             pr_err!("T8152 handoff: unexpected firmware peer; refusing no-peer mode\n");
@@ -2430,6 +2412,7 @@ impl Vm {
     ) -> Result<Vm> {
         let dummy_obj = gem::new_kernel_object(&dev, UAT_PGSZ)?;
         let is_kernel = ttb.is_some();
+        let narrow_pool_window = uat_inner.quirks.narrow_pool_window;
 
         let page_table = if let Some(ttb) = ttb {
             UatPageTable::new_with_ttb(
@@ -2525,6 +2508,8 @@ impl Vm {
             memory: None,
             dummy_obj: dummy_obj.gem.clone(),
             binding,
+            private_bytes: Arc::new(AtomicU64::new(0), GFP_KERNEL)?,
+            narrow_pool_window,
         })
     }
 
@@ -2532,6 +2517,11 @@ impl Vm {
     #[cfg_attr(not(any(CONFIG_DRM_ASAHI_M5, CONFIG_DRM_ASAHI_G18)), allow(dead_code))]
     pub(crate) fn kernel_range(&self) -> Range<u64> {
         self.kernel_range.clone()
+    }
+
+    /// Where this client VM's private aliases are placed.
+    pub(crate) fn client_private_range(&self) -> Range<u64> {
+        client_private_range(self.m5, self.narrow_pool_window)
     }
 
     /// Attach a status before sharing a newly created user VM with queues.
@@ -2564,6 +2554,11 @@ impl Vm {
     /// attribution compares and logs VMs by it).
     pub(crate) fn id(&self) -> u64 {
         self.id
+    }
+
+    /// Created by an M5 GPU's UAT ([`Uat::is_m5`]).
+    pub(crate) fn is_m5(&self) -> bool {
+        self.m5
     }
 
     /// Copies `buf.len()` bytes of GPU-readable memory at `va` of this VM into `buf`, for admission
@@ -2842,6 +2837,8 @@ impl Vm {
                 _gem: None,
                 offset: object_range.start,
                 mapped_size: size,
+                private: (range == self.client_private_range())
+                    .then(|| self.private_bytes.clone()),
             },
             reserved_size as u64,
             alignment,
@@ -2875,6 +2872,10 @@ impl Vm {
             return Err(ret.err().unwrap_or(EIO));
         }
         ret?;
+        if let Some(private) = node.private.as_ref() {
+            let used = private.fetch_add(size as u64, Ordering::Relaxed) + size as u64;
+            CLIENT_PRIVATE_HIGH_WATER.fetch_max(used, Ordering::Relaxed);
+        }
         Ok(KernelMapping(ManuallyDrop::new(node)))
     }
 
@@ -2947,6 +2948,7 @@ impl Vm {
                 _gem: None,
                 offset: 0,
                 mapped_size: size,
+                private: None,
             },
             addr,
             reserved_size as u64,
@@ -3120,6 +3122,7 @@ impl Vm {
                 _gem: None,
                 offset: 0,
                 mapped_size: size,
+                private: None,
             },
             iova,
             size as u64,
@@ -3566,6 +3569,7 @@ impl Uat {
                         map_kernel_to_user,
                         handoff_rgn,
                         ttbs_rgn,
+                        clean_poc: true,
                         quirks: UatQuirks::DEFAULT,
                     },
                     "uat_shared"
@@ -3980,11 +3984,12 @@ impl Uat {
     /// Canonical lower objects are aliased into every owning client VM.
     /// Sparse VA reservation has no physical-memory cost.
     pub(crate) fn kernel_lower_dynamic_range(&self) -> Range<u64> {
-        if self.is_m5() {
-            layout::CANONICAL_RANGE
-        } else {
-            crate::hw::t8140::dynamic::LOWER
-        }
+        pool_window(self.is_m5(), self.inner.quirks.narrow_pool_window)
+    }
+
+    /// Where client VMs of this UAT place their private aliases ([`Vm::client_private_range`]).
+    pub(crate) fn client_private_range(&self) -> Range<u64> {
+        client_private_range(self.is_m5(), self.inner.quirks.narrow_pool_window)
     }
 
     /// The MMU's arenas an M5 client VM keeps from userspace binds, even while they
@@ -4174,6 +4179,7 @@ impl Uat {
                         map_kernel_to_user: false,
                         handoff_rgn,
                         ttbs_rgn,
+                        clean_poc: shared_quirks.clean_tables,
                         quirks: shared_quirks,
                     },
                     "uat_shared"
@@ -4446,5 +4452,144 @@ mod execution_context_tests {
         fences[7] = u64::MAX;
         assert_eq!(pick(only, &returns, &fences, 11), (9, false));
         assert!(pick_returned(core::iter::empty(), &returns, &fences, 0).is_none());
+    }
+}
+
+/// The word GPU firmware 27.2 on G14 exchanges through the handoff region's magic fields.
+#[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+const MAGIC_G14_V27_2: u64 = 0x4b1d000000000003;
+
+/// The loader's UAT regions as GPU firmware 27.2 on G14 uses them. The driver mirrors its
+/// kernel window into the firmware's shared second-level table and names its own trees in
+/// TTBAT context 0 before the ASC starts.
+#[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+pub(crate) struct FirmwareWindow {
+    handoff: UatRegion,
+    ttbs: UatRegion,
+    tables: UatRegion,
+    shared_l2: UatRegion,
+    entries: KVec<u64>,
+    lower_root: u64,
+    pa_mask: u64,
+}
+
+#[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+impl FirmwareWindow {
+    /// Maps the four regions. Fails with `EBUSY` unless the handoff is idle and the shared
+    /// table and context 0 are empty.
+    pub(crate) fn reserve(dev: &device::Device, geometry: UatGeometry) -> Result<Self> {
+        let handoff = Uat::map_region(dev, c"handoff", HANDOFF_SIZE, true)?;
+        let ttbs = Uat::map_region(dev, c"ttbs", UAT_PGSZ, true)?;
+        let tables = Uat::map_region(dev, c"pagetables", UAT_PGSZ, true)?;
+        let shared_l2 = Uat::map_region(dev, c"shared-l2", UAT_PGSZ, true)?;
+        let this = Self {
+            handoff, ttbs, tables, shared_l2,
+            entries: KVec::from_elem(0u64, UAT_PGSZ / 8, GFP_KERNEL)?,
+            lower_root: 0,
+            pa_mask: ((1u64 << geometry.oas) - 1) & !(UAT_PGMSK as u64),
+        };
+        let h = this.handoff();
+        if h.magic_ap.load(Ordering::Acquire) != 0 || h.magic_fw.load(Ordering::Acquire) != 0
+            || h.lock_ap.load(Ordering::Acquire) != 0 || h.lock_fw.load(Ordering::Acquire) != 0
+            || !this.empty() {
+            return Err(EBUSY);
+        }
+        Ok(this)
+    }
+
+    fn handoff(&self) -> &Handoff {
+        // SAFETY: map_region checked the size of the handoff reservation; only its aligned
+        // atomic fields are used.
+        unsafe { &*self.handoff.map.ptr().cast::<Handoff>() }
+    }
+
+    fn shared(&self) -> &[AtomicU64; UAT_PGSZ / 8] {
+        // SAFETY: the shared-l2 reservation is one mapped 16 KiB table.
+        unsafe { &*self.shared_l2.map.ptr().cast::<[AtomicU64; UAT_PGSZ / 8]>() }
+    }
+
+    fn context(&self) -> &SlotTTBS {
+        // SAFETY: the TTBAT reservation holds at least one aligned slot.
+        unsafe { &*self.ttbs.map.ptr().cast::<SlotTTBS>() }
+    }
+
+    fn empty(&self) -> bool {
+        let context = self.context();
+        self.shared().iter().all(|w| w.load(Ordering::Acquire) == 0)
+            && context.ttb0.load(Ordering::Acquire) == 0 && context.ttb1.load(Ordering::Acquire) == 0
+    }
+
+    /// The regions to adopt the UAT from.
+    pub(crate) fn regions(&self) -> AdoptedRegions {
+        AdoptedRegions {
+            handoff: self.handoff.base..self.handoff.base + UAT_PGSZ as PhysicalAddr,
+            ttbs: self.ttbs.base..self.ttbs.base + UAT_PGSZ as PhysicalAddr,
+            kernel_root: self.tables.base,
+        }
+    }
+
+    /// Copies the kernel window's second-level entries from `uat` and writes all of its tables
+    /// back. Call after the last allocation the firmware is to reach.
+    pub(crate) fn mirror(&mut self, uat: &Uat) -> Result {
+        let mask = self.pa_mask;
+        let root = uat.kernel_window_root();
+        let entries = &mut self.entries;
+        // SAFETY: the adopted UAT's driver-owned window root and its second level are live
+        // RAM tables.
+        unsafe {
+            let upper = pgtable::with_root_entries(None, root, 3, |w| w[2].load(Ordering::Acquire))?;
+            if upper & 3 != 3 { return Err(EINVAL); }
+            pgtable::with_root_entries(None, upper & mask, entries.len(), |w| {
+                for (entry, word) in entries.iter_mut().zip(w) {
+                    *entry = word.load(Ordering::Acquire);
+                }
+            })?;
+        }
+        // The window's last 4 GiB is the MMIO range: its register mappings use one table.
+        let first_io = (0xf_0000_0000u64 >> 25) as usize;
+        if entries[first_io..].iter().filter(|w| **w != 0).count() != 1 { return Err(EINVAL); }
+        for &w in entries.iter().filter(|w| **w != 0) {
+            if w & 3 != 3 { return Err(EINVAL); }
+            crate::g15::uat::clean_page(w & mask)?;
+        }
+        crate::g15::uat::clean_lower(uat)?;
+        self.lower_root = uat.kernel_lower_root();
+        Ok(())
+    }
+
+    /// Installs the mirrored window and names the driver's trees in context 0.
+    pub(crate) fn install(&self) -> Result {
+        if !self.empty() || self.lower_root == 0 { return Err(EBUSY); }
+        for (word, value) in self.shared().iter().zip(self.entries.iter()) {
+            if *value != 0 { word.store(*value, Ordering::Release); }
+        }
+        let context = self.context();
+        context.ttb0.store(self.lower_root | TTBR_VALID, Ordering::Release);
+        context.ttb1.store(self.tables.base | TTBR_VALID, Ordering::Release);
+        pgtable::clean_poc(self.ttbs.map.ptr(), size_of::<SlotTTBS>());
+        pgtable::clean_poc(self.shared_l2.map.ptr(), UAT_PGSZ);
+        pgtable::poc_barrier();
+        Ok(())
+    }
+
+    /// Announces the host to the firmware; call just before starting the ASC.
+    pub(crate) fn announce(&self) {
+        self.handoff().magic_ap.store(MAGIC_G14_V27_2, Ordering::Release);
+        fence(Ordering::SeqCst);
+    }
+
+    /// Whether the firmware has answered the announcement.
+    pub(crate) fn answered(&self) -> bool {
+        self.handoff().magic_fw.load(Ordering::Acquire) == MAGIC_G14_V27_2
+    }
+
+    /// Whether the firmware still names the shared table and context 0 as installed.
+    pub(crate) fn intact(&self) -> bool {
+        // SAFETY: the firmware's kernel root is one mapped 16 KiB table.
+        let root = unsafe { &*self.tables.map.ptr().cast::<[AtomicU64; 4]>() };
+        let context = self.context();
+        root[2].load(Ordering::Acquire) & self.pa_mask == self.shared_l2.base
+            && context.ttb0.load(Ordering::Acquire) == self.lower_root | TTBR_VALID
+            && context.ttb1.load(Ordering::Acquire) == self.tables.base | TTBR_VALID
     }
 }

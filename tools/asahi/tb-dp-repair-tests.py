@@ -45,7 +45,7 @@ struct tb_nhi {unsigned long quirks;};
 #define BIT(n) (1UL<<(n))
 #define QUIRK_NO_SYSTEM_SLEEP BIT(5)
 struct tb {int lock;struct device dev;void*wq;struct tb_switch*root_switch;struct tb_nhi*nhi;};
-struct tb_cm {bool hotplug_active;struct work_struct dp_tunnel_work;bool dp_tunnel_pending;struct work_struct dp_relink_run;bool dp_host_hold_shared;};
+struct tb_cm {bool hotplug_active,resume_cleanup_pending;struct work_struct dp_tunnel_work;bool dp_tunnel_pending;struct work_struct dp_relink_run;bool dp_host_hold_shared;};
 struct domain {struct tb tb;struct tb_cm cm;};
 _Static_assert(offsetof(struct domain,cm)==sizeof(struct tb),"mock private storage adjacency");
 #define INIT_WORK(w,handler) ((w)->fn=(handler))
@@ -80,6 +80,8 @@ static void guard_mutex_unlock(int**x){if(*x)mutex_unlock(*x);}
      !scope_done;scope_done=scope)
 static int tb_domain_unregister_unplugged_xdomains(struct tb*t){return unplugged_xdomains;}
 static void tb_scan_switch(struct tb_switch*s){CHECK(lock_depth==1 && s);scan_calls++;}
+/* These cases never defer topology cleanup; the dock PM suite covers it. */
+static void tb_resume_cleanup(struct tb*t){CHECK(0);}
 static void tb_restore_dp_resources(struct tb_switch*s){CHECK(lock_depth==1 && s);restore_calls++;}
 static void kref_get(struct kref*k){CHECK(k->count>0);k->count++;}
 static void kref_put(struct kref*k,void(*destroy)(struct kref*)){CHECK(k->count>0);if(!--k->count)destroy(k);}

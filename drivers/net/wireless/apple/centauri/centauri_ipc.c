@@ -38,6 +38,11 @@ struct centauri_ipc {
 	struct cen_buffer *alpha_log;
 	struct cen_buffer *msi[3];
 	unsigned int vectors[3];
+	/* Function 0 holding another function's vectors: what that function's devres frees. */
+	struct centauri_vector_ref {
+		struct centauri *c;
+		unsigned int function;
+	} vector_ref[3];
 	u16 cchi_head, cchi_tail;
 };
 
@@ -228,7 +233,7 @@ static int message(struct cen_context *ctx, void __iomem *doorbell,
 {
 	u16 head = ctx->message_head;
 	u8 *descriptor;
-	u16 tail;
+	__le16 tail;
 	int ret;
 
 	if (head >= 15 || !length || length > 512)
@@ -269,7 +274,7 @@ static int cchi_init(struct centauri *c)
 {
 	struct centauri_ipc *ipc = c->ipc;
 	u8 config[4] = {9, 0, 0xff, 0xff}, *entry;
-	u16 tail;
+	__le16 tail;
 	int i, ret;
 
 	ipc->cchi_rx = buffer_alloc(c, 0, SZ_32K);
@@ -351,6 +356,22 @@ static irqreturn_t function_irq(int irq, void *data)
  * keeps the DMA mailbox below (polled). Alpha asks first: on the J873 the 10GbE NIC shares
  * the controller's 32 vectors and only one block of 16 is left.
  */
+/*
+ * The handlers on another function's vectors go before that function's devres frees the
+ * vectors (pcim): removing the PCIe host removes function 1 first, which freed its MSIs
+ * under function 0's handlers ("removing non-empty directory 'irq/96', leaking at least
+ * 'centauri'", J815 radio host unbind) and left function 0 freeing IRQs that were gone.
+ */
+static void release_foreign_vectors(void *data)
+{
+	struct centauri_vector_ref *ref = data;
+	struct centauri_ipc *ipc = ref->c->ipc;
+	struct pci_dev *pdev = ipc->function[ref->function];
+
+	while (ipc->vectors[ref->function])
+		free_irq(pci_irq_vector(pdev, --ipc->vectors[ref->function]), ref->c);
+}
+
 static int request_vectors(struct centauri *c, unsigned int function)
 {
 	struct pci_dev *pdev = c->ipc->function[function];
@@ -369,6 +390,17 @@ static int request_vectors(struct centauri *c, unsigned int function)
 		}
 	}
 	c->ipc->vectors[function] = count;
+	if (pdev != c->pdev) {
+		c->ipc->vector_ref[function].c = c;
+		c->ipc->vector_ref[function].function = function;
+		ret = devm_add_action(&pdev->dev, release_foreign_vectors,
+				      &c->ipc->vector_ref[function]);
+		if (ret) {
+			release_foreign_vectors(&c->ipc->vector_ref[function]);
+			pci_free_irq_vectors(pdev);
+			return ret;
+		}
+	}
 	return 0;
 }
 
@@ -376,6 +408,9 @@ static void free_vectors(struct centauri *c, unsigned int function)
 {
 	struct pci_dev *pdev = c->ipc->function[function];
 
+	if (pdev != c->pdev)
+		devm_remove_action(&pdev->dev, release_foreign_vectors,
+				   &c->ipc->vector_ref[function]);
 	while (c->ipc->vectors[function])
 		free_irq(pci_irq_vector(pdev, --c->ipc->vectors[function]), c);
 	pci_free_irq_vectors(pdev);

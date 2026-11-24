@@ -20,15 +20,20 @@ pub(crate) mod policy;
 use core::{ffi::c_void, ptr::NonNull};
 use kernel::{device, prelude::*, sync::aref::ARef};
 
-use super::fw::initdata::globals;
+use super::fw::initdata;
 use super::recovery::now_ns;
 use super::regs::wmb;
 use super::Firmware;
-use policy::{COOLING_MAX, PSTATE_MAX};
+use policy::{COOLING_MAX, TOP_DEFAULT};
 
-static_assert!(globals::PSTATE_SELECTORS[0] == 0x88);
-static_assert!(globals::PSTATE_SELECTORS[1] == 0x8c);
-static_assert!(globals::PSTATE_SELECTORS[2] == 0x98);
+// The three Globals p-state selectors: 0x88, 0x8c and 0x98 in 25G83; four bytes later in
+// 26B123, which inserted a word at 0x38.
+static_assert!(initdata::V25G83.pstate_selectors[0] == 0x88);
+static_assert!(initdata::V25G83.pstate_selectors[1] == 0x8c);
+static_assert!(initdata::V25G83.pstate_selectors[2] == 0x98);
+static_assert!(initdata::V26B123.pstate_selectors[0] == 0x8c);
+static_assert!(initdata::V26B123.pstate_selectors[1] == 0x90);
+static_assert!(initdata::V26B123.pstate_selectors[2] == 0x9c);
 
 extern "C" {
     fn asahi_g16_clpc_gpu_get(dev: *mut c_void, out: *mut *mut c_void) -> core::ffi::c_int;
@@ -39,6 +44,7 @@ extern "C" {
     fn asahi_g16_cooling_sample(
         cooling: *mut c_void,
         now: u64,
+        idle: bool,
         temperature: *mut core::ffi::c_long,
         governor: *mut u32,
         power: *mut u32,
@@ -72,7 +78,7 @@ impl Cooling {
         })
     }
 
-    fn sample(&mut self, now: u64, power: &mut Sample) -> Result {
+    fn sample(&mut self, now: u64, idle: bool, power: &mut Sample) -> Result {
         let mut mc: core::ffi::c_long = 0;
         // SAFETY: The C allocation and PMP phandle outlive this call, all output
         // pointers are valid, and the caller holds the GPU device mutex.
@@ -80,6 +86,7 @@ impl Cooling {
             asahi_g16_cooling_sample(
                 self.inner.as_ptr(),
                 now,
+                idle,
                 &mut mc,
                 &mut power.governor,
                 &mut power.budget,
@@ -153,6 +160,8 @@ pub(crate) struct Power {
     cooling: Cooling,
     sample: Sample,
     last_sample_ns: Option<u64>,
+    /// The board's top state: S9 on the ten-row tables, S10 on the J773g table.
+    pub(crate) top: u32,
     pub(crate) configured: u32,
     pub(crate) user: u32,
     pub(crate) effective: u32,
@@ -168,7 +177,7 @@ pub(crate) struct Power {
 }
 
 impl Power {
-    /// The Main image initializes all nine active states. Initdata publishes
+    /// The Main image initializes every active state of the board's table. Initdata publishes
     /// startup S1 before INIT; this object starts with that same effective state.
     pub(crate) fn new(dev: &device::Device) -> Result<Self> {
         Ok(Self {
@@ -183,8 +192,9 @@ impl Power {
                 backstop: COOLING_MAX,
             },
             last_sample_ns: None,
-            configured: PSTATE_MAX,
-            user: PSTATE_MAX,
+            top: TOP_DEFAULT,
+            configured: TOP_DEFAULT,
+            user: TOP_DEFAULT,
             effective: 1,
             temperature_mc: 0,
             governor: COOLING_MAX,
@@ -198,6 +208,17 @@ impl Power {
         })
     }
 
+    /// Adopts the board's firmware table, `rows` rows including off, before the first
+    /// governed publication: its top row is the governor's top state and configured
+    /// ceiling. The J773g table has eleven rows, so its top state is S10.
+    pub(crate) fn set_table(&mut self, rows: u32) {
+        let top = policy::top_of(rows);
+        self.top = top;
+        self.configured = top;
+        self.user = top;
+        self.utilization.top = top;
+    }
+
     /// Reports a change of work in flight to the CLPC: the memory and fabric
     /// floor follows it, not the GFX power state.
     pub(crate) fn report_work(&mut self, in_flight: bool) {
@@ -207,10 +228,10 @@ impl Power {
         }
     }
 
-    fn ceiling(&mut self, now: u64) -> (u32, bool) {
+    fn ceiling(&mut self, now: u64, idle: bool) -> (u32, bool) {
         if policy::read_due(self.last_sample_ns, now) {
             self.last_sample_ns = Some(now);
-            self.sensor_error = self.cooling.sample(now, &mut self.sample).err();
+            self.sensor_error = self.cooling.sample(now, idle, &mut self.sample).err();
             if self.sensor_error.is_some() {
                 self.sensor_errors += 1;
             }
@@ -219,7 +240,7 @@ impl Power {
             self.budget = self.sample.budget;
         }
         let level = self.governor.max(self.budget).max(self.sample.backstop);
-        let ceiling = PSTATE_MAX - level.min(COOLING_MAX);
+        let ceiling = policy::cooling_ceiling(self.top, level);
         let limit = policy::limit(self.configured, ceiling, self.user);
         let decision = (
             limit,
@@ -248,7 +269,8 @@ impl Firmware {
             return Err(error);
         }
         let now = now_ns();
-        let (limit, decision) = self.power.ceiling(now);
+        let idle = self.engine.flights.is_empty();
+        let (limit, decision) = self.power.ceiling(now, idle);
         let target = self
             .power
             .utilization
@@ -270,7 +292,7 @@ impl Firmware {
             return Ok(());
         }
         let globals = self.init.globals.as_ref().ok_or(ENODEV)?;
-        for offset in globals::PSTATE_SELECTORS {
+        for offset in self.init.abi.initdata().pstate_selectors {
             globals.w32(offset, target * 100)?;
         }
         wmb();

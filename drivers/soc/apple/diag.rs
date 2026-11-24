@@ -31,7 +31,6 @@ extern "C" {
         xart: bool,
     ) -> c_int;
     fn sep_diag_set_policy(
-        provision_keybag: bool,
         trusted_keys: bool,
         filevault_api: bool,
         xarm_trace: bool,
@@ -59,6 +58,8 @@ extern "C" {
     fn sep_diag_set_hwrng(registered: bool);
     fn sep_diag_set_stac(state: c_int);
     fn sep_diag_set_pnon(state: c_int, digest: *const u8, len: usize);
+    fn sep_diag_set_offer(endpoint: u8, state: c_int);
+    fn sep_diag_sse_event() -> c_uint;
     fn sep_diag_xarm_failed() -> c_uint;
     fn sep_diag_unhandled() -> c_uint;
     fn sep_diag_log_summary(dev: *mut c_void);
@@ -99,7 +100,6 @@ pub(crate) enum Restore {
 
 /// Boot-time policy, without identity values or key material.
 pub(crate) struct Policy {
-    pub provision_keybag: bool,
     pub trusted_keys: bool,
     pub filevault_api: bool,
     pub xarm_trace: bool,
@@ -154,7 +154,6 @@ pub(crate) fn register(
     // SAFETY: the facts are fixed before the attribute group is published.
     unsafe {
         sep_diag_set_policy(
-            policy.provision_keybag,
             policy.trusted_keys,
             policy.filevault_api,
             policy.xarm_trace,
@@ -348,6 +347,61 @@ pub(crate) fn pnon(state: Pnon, digest: Option<&[u8; crate::pnon::DIGEST_LEN]>) 
     // SAFETY: `ptr` is null or points at `len` readable bytes for the call;
     // the shim copies them.
     unsafe { sep_diag_set_pnon(state as c_int, ptr, len) };
+}
+
+/// An endpoint the driver checks at bring-up and sends nothing to, as
+/// `SEP_DIAG_OFFER_*` in `shim.h` spells the reported states.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Offer {
+    /// Discovered with its name and the layout the driver knows.
+    Idle,
+    /// Discovered with another name or layout; left alone.
+    Unknown,
+    /// Not discovered.
+    Absent,
+}
+
+impl Offer {
+    pub(crate) fn of(present: bool, named: bool, layout_known: bool) -> Offer {
+        match (present, named && layout_known) {
+            (false, _) => Offer::Absent,
+            (true, true) => Offer::Idle,
+            (true, false) => Offer::Unknown,
+        }
+    }
+
+    fn state(self) -> c_int {
+        match self {
+            Offer::Idle => 1,
+            // Reported as absent: the driver does not use it.
+            Offer::Unknown | Offer::Absent => 2,
+        }
+    }
+}
+
+/// The secure-element sharing endpoint at bring-up (see `sse`).
+pub(crate) fn sse(offer: Offer) {
+    // SAFETY: no preconditions; updates one word.
+    unsafe { sep_diag_set_offer(crate::sse::EP_SSE, offer.state()) };
+}
+
+/// The hibernation endpoint at bring-up (see `hibe`).
+pub(crate) fn hibe(offer: Offer) {
+    // SAFETY: no preconditions; updates one word.
+    unsafe { sep_diag_set_offer(crate::hibe::EP_HIBE, offer.state()) };
+}
+
+/// The kernel deny-list endpoint at bring-up (see `skdl`).
+pub(crate) fn skdl(offer: Offer) {
+    // SAFETY: no preconditions; updates one word.
+    unsafe { sep_diag_set_offer(crate::skdl::EP_SKDL, offer.state()) };
+}
+
+/// The secure-element sharing service announced an event. Returns how many
+/// it has announced since probe, this one included.
+pub(crate) fn sse_event() -> u32 {
+    // SAFETY: no preconditions; updates one word.
+    unsafe { sep_diag_sse_event() }
 }
 
 /// The driver answered an xART request with the failure status. Returns how

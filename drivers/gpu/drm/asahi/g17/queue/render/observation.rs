@@ -69,7 +69,7 @@ pub(super) fn snapshot(memory: &memory::Memory, ordinal: u64) -> Result<retireme
     let head = memory.context.work_head()?;
     Ok(retirement::Snapshot {
         cursors,
-        job_list_empty: head == [0, memory.context.work_head_va()],
+        job_list_empty: head == [0, memory.context.work_head_address()],
         pass: memory.pass(ordinal)?,
     })
 }

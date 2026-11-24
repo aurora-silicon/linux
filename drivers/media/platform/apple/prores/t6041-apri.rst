@@ -7,10 +7,9 @@ T6041 ProRes initialization data
 The driver can carry ProRes initialization rows built in, and on T6041 a
 machine may override them with ``apple/prores-t6041-init.bin``, an APRI
 container generated for that Mac from its own macOS and not distributed with
-Linux.  T6041 has no built-in rows yet, so until they are added the device
-binds only when the file is present.  Without it, the driver logs one info
-line and returns -ENODEV before any register is mapped.  T6000 and T8140 use
-their built-in rows and do not request this file.
+Linux.  Without the file, T6041 uses its built-in rows: the 82, 80 and 62
+values macOS writes to the three windows before its first job.  T6000 and
+T8140 use their built-in rows and do not request this file.
 
 When the file is present, the driver reads and validates the whole of it
 before mapping device registers.  An invalid file makes the device fail to
@@ -56,11 +55,31 @@ The container deliberately has no MMIO addresses, selectors, power policy,
 or arbitrary write commands.  File integrity is the responsibility of the
 package that installs the per-Mac file.
 
+T8132
+=====
+
+``apple/prores-t8132-init.bin`` is the T6041 container with ``soc = 0x8132``
+and a wrapper block of 48 entries instead of 62: 2,560 bytes in all. macOS
+brings up the T8132 engine with read-modify-write tables of 82 (SCODEC
+system), 80 (core) and 48 (AXI wrapper) rows, below ``+0x4040`` in the
+wrapper window. The driver has no built-in T8132 rows, so that engine probes
+only with the file.
+
 T6050
 =====
 
 ``apple/prores-t6050-init.bin`` is the same container with ``soc = 0x6050``,
 ``block_count = 4`` and a fourth block, SCODEC control (ID 4, 12 entries,
-offsets below ``0x4000``): 2,880 bytes in all.  The driver has no built-in
-T6050 rows, so that engine probes only with the file.  The control rows are
+offsets below ``0x4000``): 2,880 bytes in all.  Without the file, T6050 uses
+its built-in rows: the 82, 12, 80 and 62 values macOS writes to the system,
+control, core and wrapper windows before its first job.  The control rows are
 applied after the system rows and before the core rows.
+
+T8142
+=====
+
+``apple/prores-t8142-init.bin`` has T6050's four blocks with ``soc = 0x8142``
+and a 38-entry wrapper block: 2,592 bytes in all.  Like T6050, T8142 has
+built-in rows, the 82 system, 12 control, 80 core and 38 wrapper values macOS
+27.2.1 writes before its first job on a J815, so the file is optional and,
+when present, replaces them.

@@ -41,6 +41,7 @@ Hardware Monitoring Kernel Drivers
    adt7475
    aht10
    amc6821
+   apple-aon-ptd-hwmon
    aps-379
    aquacomputer_d5next
    arctic_fan_controller

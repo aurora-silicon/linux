@@ -97,6 +97,45 @@ struct apple_rtkit_crashlog_regs {
 } __packed;
 static_assert(sizeof(struct apple_rtkit_crashlog_regs) == 0x350);
 
+/* How much of a section without a decoder is printed, and how much per line. */
+#define APPLE_RTKIT_CRASHLOG_UNKNOWN_DUMP 0x100
+#define APPLE_RTKIT_CRASHLOG_UNKNOWN_LINE 32
+
+/*
+ * A section this file has no decoder for: its name and the start of its
+ * payload. An exception log of the PMP has no 'Cstr' to say what went wrong;
+ * its call stack ('Ccst') and task state are in sections such as these.
+ */
+static void apple_rtkit_crashlog_dump_unknown(struct apple_rtkit *rtk, u32 fourcc,
+					      const u8 *bfr, size_t size)
+{
+	static const char hex[] = "0123456789abcdef";
+	char line[APPLE_RTKIT_CRASHLOG_UNKNOWN_LINE * 3 + 1], name[5];
+	size_t len = size, i, j, n;
+
+	if (len > APPLE_RTKIT_CRASHLOG_UNKNOWN_DUMP)
+		len = APPLE_RTKIT_CRASHLOG_UNKNOWN_DUMP;
+	for (i = 0; i < 4; i++) {
+		u8 c = fourcc >> (24 - 8 * i);
+
+		name[i] = c >= 0x20 && c < 0x7f ? c : '.';
+	}
+	name[4] = 0;
+	dev_warn(rtk->dev, "RTKit:  + '%s', %zu bytes", name, size);
+	for (i = 0; i < len; i += APPLE_RTKIT_CRASHLOG_UNKNOWN_LINE) {
+		n = len - i;
+		if (n > APPLE_RTKIT_CRASHLOG_UNKNOWN_LINE)
+			n = APPLE_RTKIT_CRASHLOG_UNKNOWN_LINE;
+		for (j = 0; j < n; j++) {
+			line[3 * j] = hex[bfr[i + j] >> 4];
+			line[3 * j + 1] = hex[bfr[i + j] & 0xf];
+			line[3 * j + 2] = ' ';
+		}
+		line[n ? 3 * n - 1 : 0] = 0;
+		dev_warn(rtk->dev, "RTKit:  + %03zx: %s", i, line);
+	}
+}
+
 static void apple_rtkit_crashlog_dump_str(struct apple_rtkit *rtk, u8 *bfr,
 					  size_t size)
 {
@@ -442,6 +481,9 @@ void apple_rtkit_crashlog_dump(struct apple_rtkit *rtk, u8 *bfr, size_t size)
 			dev_warn(rtk->dev,
 				 "RTKit: Unknown crashlog section: %x",
 				 section_fourcc);
+			apple_rtkit_crashlog_dump_unknown(rtk, section_fourcc,
+							  bfr + offset + 16,
+							  section_size - 16);
 		}
 
 		offset += section_size;

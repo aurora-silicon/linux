@@ -14,9 +14,10 @@
 //! stopped and publication closed until the next real sleep, with the domain on so that everything
 //! behind it stays reachable. That sleep then only has the domain left to lower.
 //!
-//! Where the sleep driver takes it, `.prepare` only drains and checks for quiet, and the sleep's
-//! commit makes the whole stop in C, with interrupts off and every refusal behind it. A sleep
-//! refused before then finds the firmware never stopped. Elsewhere `.prepare` stops it.
+//! `.prepare` only drains and checks for quiet, and the sleep's commit makes the whole stop in C,
+//! with interrupts off and every refusal behind it. A sleep refused before then finds the firmware
+//! never stopped. Where the commit can't take the stop, `.prepare` refuses the sleep: a stop of its
+//! own would leave the firmware stopped after any later refusal, until the next real sleep.
 
 use super::{Firmware, Role, Shared};
 use core::sync::atomic::Ordering;
@@ -31,6 +32,9 @@ use kernel::{
 /// Time work in flight gets to finish before the sleep is refused.
 const DRAIN_NS: u64 = 3_000_000_000;
 const DRAIN_TICK_MS: i64 = 2;
+/// Match the existing maximum compute admission wait before declaring a late builder stalled.
+const CANCEL_RETRY_NS: u64 = super::preparation::QUEUE_WAIT_NS;
+const CANCEL_CHECK_MS: u32 = 20;
 
 unsafe extern "C" {
     fn asahi_g17_pmp_request(dev: *mut core::ffi::c_void, enable: bool) -> core::ffi::c_int;
@@ -47,7 +51,7 @@ unsafe extern "C" {
         bridge: bool,
     ) -> *mut core::ffi::c_void;
     fn asahi_g17_commit_finish(commit: *mut core::ffi::c_void, saved: *mut u32) -> bool;
-    fn asahi_g17_commit_required() -> bool;
+    fn asahi_g17_commit_stops_firmware() -> bool;
 }
 
 /// What `.complete` does after a sleep whose stop was left to the commit.
@@ -55,7 +59,7 @@ unsafe extern "C" {
 enum AfterCommit {
     /// Refused before the commit: the firmware never stopped, so only publication reopens.
     Running,
-    /// Stopped at the commit, or its power lost anyway: as after [`down`].
+    /// Stopped at the commit, or its power lost anyway: the firmware has to restart.
     Stopped,
 }
 
@@ -67,15 +71,10 @@ fn after_commit(stopped: bool, real: bool) -> AfterCommit {
     }
 }
 
-/// What stopping and restarting the firmware touches, in the order [`down`] and [`up`] use it.
+/// What restarting the firmware and lowering or raising its domain touches, in the order [`up`]
+/// uses it. The stop itself is the sleep's commit's.
 pub(super) trait Hardware {
     fn has_secondary(&self) -> bool;
-    /// RTKit AP and IOP idle, each acknowledged.
-    fn idle(&mut self, role: Role) -> Result;
-    /// Back from idle with no restart, after a refusal. One that fails loses the device.
-    fn wake(&mut self, role: Role);
-    /// Mailbox off, then run bit off, for an instance that acknowledged idle.
-    fn stop(&mut self, role: Role);
     /// The PMP's request for the GPU. It may use a device it's told is in use, so the request is
     /// only ever set with the domain on.
     fn request(&mut self, enable: bool);
@@ -95,32 +94,6 @@ pub(super) trait Hardware {
     fn restart(&mut self, role: Role) -> Result;
     /// Ends the power-on transition, on every instance.
     fn power_on_done(&mut self) -> Result;
-}
-
-/// Stops the firmware and lowers the domain. An error leaves the firmware running, so the caller
-/// refuses the sleep. Both instances idle before either stops, so that a refusal by the second
-/// still has a way back. A domain that is slow to go off isn't an error here: the sleep driver
-/// checks it at the commit.
-pub(super) fn down<H: Hardware>(hw: &mut H) -> Result {
-    if let Err(error) = hw.idle(Role::Primary) {
-        hw.wake(Role::Primary);
-        return Err(error);
-    }
-    if hw.has_secondary() {
-        if let Err(error) = hw.idle(Role::Secondary) {
-            hw.wake(Role::Secondary);
-            hw.wake(Role::Primary);
-            return Err(error);
-        }
-    }
-    hw.stop(Role::Primary);
-    let _ = hw.gating(false);
-    if hw.has_secondary() {
-        hw.stop(Role::Secondary);
-    }
-    hw.request(false);
-    lower_domain(hw);
-    Ok(())
 }
 
 /// Lowers the domain, with the firmware stopped.
@@ -155,33 +128,16 @@ impl Hardware for Firmware {
         self.secondary.is_some()
     }
 
-    fn idle(&mut self, role: Role) -> Result {
-        self.coprocessor(role)?.rtkit.with(|rtkit| rtkit.idle())
-    }
-
-    fn wake(&mut self, role: Role) {
-        let result = match self.coprocessor(role) {
-            Ok(coprocessor) => coprocessor.rtkit.with(|rtkit| rtkit.wake()),
-            Err(error) => Err(error),
-        };
-        // EINVAL: it never left the on state.
-        if result.is_err_and(|error| error != EINVAL) {
-            self.primary.state.shared.lose_device_quietly();
-        }
-    }
-
-    fn stop(&mut self, role: Role) {
-        if let Ok(coprocessor) = self.coprocessor(role) {
-            coprocessor.rtkit.with(|rtkit| rtkit.mailbox_off());
-            coprocessor.stop();
-        }
-    }
-
     fn request(&mut self, enable: bool) {
         self.primary.state.shared.pmp_request(enable);
     }
 
     fn gating(&mut self, enable: bool) -> Result {
+        // A target without the bridge (the M5): its core gating, written once at probe, is
+        // lost when a real sleep powers the domain off. Written again before the run bit.
+        if enable && !self.bridge.enabled {
+            return self.bridge.regs.enable_g17_gating();
+        }
         self.bridge.set_gating(enable)
     }
 
@@ -392,9 +348,68 @@ impl Shared {
         }
     }
 
-    /// Undoes everything short of a stopped firmware. A builder that never finishes would keep
-    /// publication closed for good, and that is a lost device.
-    fn sleep_cancel(self: &Arc<Self>) {
+    fn sleep_cancel_reopenable(&self) -> bool {
+        self.sleeping()
+            && self.sleep_gate.load(Ordering::Acquire)
+            && !self.crashed.load(Ordering::Acquire)
+            && self.sleep_commit.load(Ordering::Acquire).is_null()
+            && self.preparations.closed_and_recoverable()
+    }
+
+    /// Only used when the commit never stopped firmware. The gate must join the entire
+    /// invalidated preparation epoch before new builders can publish into the same session.
+    fn reopen_cancelled_sleep(self: &Arc<Self>) -> bool {
+        if !self.sleep_cancel_reopenable() || !self.preparations.reopen() {
+            return false;
+        }
+        self.sleep_cancel_deadline.store(0, Ordering::Release);
+        // Clear ownership first: another PM prepare cannot pass sleeping() until the gate
+        // flag is settled, and the retry worker makes no further state changes after that.
+        self.sleep_gate.store(false, Ordering::Release);
+        self.sleeping.store(false, Ordering::Release);
+        self.queue_events();
+        true
+    }
+
+    /// This poll only retries software admission. It never runs the normal poll or touches
+    /// registers while asleep, even if the uncommitted session cannot be reopened.
+    pub(super) fn sleep_cancel_poll(self: &Arc<Self>) {
+        let deadline = self.sleep_cancel_deadline.load(Ordering::Acquire);
+        if deadline == 0 {
+            return;
+        }
+        if super::now_ns() >= deadline || !self.sleep_cancel_reopenable() {
+            self.sleep_cancel_deadline.store(0, Ordering::Release);
+            dev_warn!(self.dev.as_ref(), "GPU sleep cancellation could not reopen its session\n");
+            return;
+        }
+        if !self.reopen_cancelled_sleep() {
+            self.queue_poll_after(CANCEL_CHECK_MS);
+        }
+    }
+
+    /// Undoes everything short of a stopped firmware. T6050 keeps an uncertain session owned:
+    /// marking it lost here would let the runtime worker stop firmware before the commit.
+    fn sleep_cancel(self: &Arc<Self>, commit_only: bool) {
+        if commit_only {
+            self.sleeping.store(true, Ordering::Release);
+            self.join_event_workers();
+            let drained = self
+                .preparations
+                .wait_drained_until(super::now_ns().saturating_add(DRAIN_NS));
+            if drained.is_ok() && self.reopen_cancelled_sleep() {
+                return;
+            }
+            if drained.is_err() && self.sleep_cancel_reopenable() {
+                self.sleep_cancel_deadline.store(
+                    super::now_ns().saturating_add(CANCEL_RETRY_NS),
+                    Ordering::Release,
+                );
+                self.queue_poll_after(CANCEL_CHECK_MS);
+            }
+            dev_warn!(self.dev.as_ref(), "GPU sleep cancellation retains its session\n");
+            return;
+        }
         self.sleeping.store(false, Ordering::Release);
         self.sleep_gate.store(false, Ordering::Release);
         let drained = self
@@ -428,32 +443,22 @@ impl Shared {
         true
     }
 
-    /// Leaves the stop to the commit. False, with the reason logged, if it can't be. Where only
-    /// the commit may stop it, that refuses the sleep instead: a refusal after an earlier stop
-    /// would leave it stopped.
-    fn sleep_leave_for_commit(&self, firmware: &mut Firmware) -> Result<bool> {
+    /// Leaves the stop to the commit, or refuses the sleep if the commit can't take it: a stop
+    /// here would leave the firmware stopped after any later refusal, until the next real sleep.
+    fn sleep_leave_for_commit(&self, firmware: &mut Firmware) -> Result {
         match firmware.leave_for_commit() {
             Ok(commit) => {
                 self.sleep_commit.store(commit, Ordering::Release);
                 dev_dbg!(self.dev.as_ref(), "GPU firmware left running for the sleep's commit\n");
-                Ok(true)
+                Ok(())
             }
-            // SAFETY: Reads the sleep driver's state.
-            Err(error) if unsafe { asahi_g17_commit_required() } => {
+            Err(error) => {
                 dev_err!(
                     self.dev.as_ref(),
                     "no GPU stop at the commit ({:?}): refusing the sleep\n",
                     error
                 );
                 Err(EBUSY)
-            }
-            Err(error) => {
-                dev_warn!(
-                    self.dev.as_ref(),
-                    "no GPU stop at the commit ({:?}): stopping it now\n",
-                    error
-                );
-                Ok(false)
             }
         }
     }
@@ -471,7 +476,7 @@ impl Shared {
         Some(stopped)
     }
 
-    /// After the commit stopped the firmware: the books it left, as [`down`] would have them.
+    /// After the commit stopped the firmware: the books it left for each stopped instance.
     fn sleep_settle_commit(&self) {
         let mut state = self.state.lock();
         if let Some(firmware) = (*state).as_deref_mut() {
@@ -479,10 +484,13 @@ impl Shared {
         }
     }
 
-    /// Closes publication, waits for quiet, and leaves the stop to the sleep's commit where the
-    /// sleep driver takes it, or stops the firmware. A refusal changes nothing.
-    fn sleep_down(self: &Arc<Self>) -> Result {
+    /// Closes publication, waits for quiet, and leaves the stop to the sleep's commit. A refusal
+    /// changes nothing.
+    fn sleep_down(self: &Arc<Self>, commit_only: bool) -> Result {
         if self.sleeping() {
+            if commit_only {
+                return Err(EBUSY);
+            }
             let mut state = self.state.lock();
             if let Some(firmware) = (*state).as_deref_mut() {
                 lower_domain(firmware);
@@ -502,14 +510,12 @@ impl Shared {
                 if !firmware.sleep_quiet(super::now_ns())? {
                     return Err(EBUSY);
                 }
-                if self.sleep_leave_for_commit(firmware)? {
-                    return Ok(());
-                }
-                down(firmware)
+                self.sleep_leave_for_commit(firmware)
             });
         match result {
             Ok(()) => Ok(()),
-            Err(error) if error == ENODEV || self.crashed.load(Ordering::Acquire) => {
+            Err(error) if !commit_only &&
+                (error == ENODEV || self.crashed.load(Ordering::Acquire)) => {
                 // Nothing to save: let the worker finish detaching what's left, and then the
                 // domain only has to be off for the sleep.
                 self.sleeping.store(false, Ordering::Release);
@@ -524,7 +530,7 @@ impl Shared {
                 Ok(())
             }
             Err(error) => {
-                self.sleep_cancel();
+                self.sleep_cancel(commit_only);
                 Err(error)
             }
         }
@@ -541,6 +547,18 @@ impl Shared {
                     if result.is_ok() {
                         // The cores lost power, so the next command on each pair installs it again.
                         firmware.queues.forget_render_registrations();
+                        // So did every M5 compute queue's host-port configuration: it goes out
+                        // again here, before publication reopens and so before any doorbell.
+                        let (_, failed) = firmware
+                            .queues
+                            .restore_compute_port_configurations(&firmware.bridge.regs);
+                        if failed != 0 {
+                            dev_warn!(
+                                self.dev.as_ref(),
+                                "{} GPU compute queues not configured again after the wake\n",
+                                failed
+                            );
+                        }
                         firmware.rings.invalidate_statistics();
                         firmware.port.statistics_epoch_bump();
                     }
@@ -579,14 +597,16 @@ impl Shared {
 impl super::Gpu {
     /// Called before any device suspends. Only a sleep that powers the SoC down gets here.
     pub(crate) fn sleep_prepare(&self) -> Result {
-        if !self.cfg.sleep_restart {
+        // SAFETY: Reads the sleep driver's state: true where the commit stops the firmware.
+        let commit_stop = unsafe { asahi_g17_commit_stops_firmware() };
+        if !self.cfg.sleep_restart && !commit_stop {
             dev_warn!(
                 self.shared.dev.as_ref(),
                 "no firmware restart on this chip, refusing sleep\n"
             );
             return Err(EBUSY);
         }
-        let result = self.shared.sleep_down();
+        let result = self.shared.sleep_down(self.cfg.chip_id == 0x6050);
         if let Err(error) = result {
             dev_warn!(self.shared.dev.as_ref(), "GPU refused sleep: {:?}\n", error);
         }
@@ -606,10 +626,15 @@ impl super::Gpu {
                     self.shared.dev.as_ref(),
                     "sleep refused before the commit: GPU firmware never stopped\n"
                 );
-                self.shared.sleep_cancel();
+                self.shared.sleep_cancel(self.cfg.chip_id == 0x6050);
                 return;
             }
             self.shared.sleep_settle_commit();
+        }
+        if self.cfg.chip_id == 0x6050 && !real {
+            // With no physical wake, even an uncertain or stopped session stays owned.
+            // Neither a refusal nor a missing commit receipt authorizes power or restart.
+            return;
         }
         if !real && self.shared.sleep_hold() {
             return;
@@ -624,9 +649,6 @@ mod tests {
 
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     enum Call {
-        Idle(Role),
-        Wake(Role),
-        Stop(Role),
         Request(bool),
         Gating(bool),
         Bridge(bool),
@@ -664,9 +686,6 @@ mod tests {
 
     impl Hardware for Fake {
         fn has_secondary(&self) -> bool { self.secondary }
-        fn idle(&mut self, role: Role) -> Result { self.note(Call::Idle(role)) }
-        fn wake(&mut self, role: Role) { let _ = self.note(Call::Wake(role)); }
-        fn stop(&mut self, role: Role) { let _ = self.note(Call::Stop(role)); }
         fn request(&mut self, enable: bool) { let _ = self.note(Call::Request(enable)); }
         fn gating(&mut self, enable: bool) -> Result { self.note(Call::Gating(enable)) }
         fn bridge(&mut self, enable: bool) -> Result { self.note(Call::Bridge(enable)) }
@@ -679,23 +698,6 @@ mod tests {
     }
 
     use Role::{Primary as P, Secondary as S};
-
-    #[test]
-    fn down_idles_the_primary_first_and_lowers_the_domain_last() {
-        let mut hw = Fake::new(true, None);
-        assert_eq!(down(&mut hw), Ok(()));
-        assert!(hw.called(&[
-            Call::Idle(P),
-            Call::Idle(S),
-            Call::Stop(P),
-            Call::Gating(false),
-            Call::Stop(S),
-            Call::Request(false),
-            Call::AutoOff,
-            Call::Bridge(false),
-            Call::Lower,
-        ]));
-    }
 
     #[test]
     fn up_restarts_the_secondary_first_and_ends_the_transition_last() {
@@ -716,17 +718,6 @@ mod tests {
     #[test]
     fn a_single_instance_never_names_a_secondary() {
         let mut hw = Fake::new(false, None);
-        assert_eq!(down(&mut hw), Ok(()));
-        assert!(hw.called(&[
-            Call::Idle(P),
-            Call::Stop(P),
-            Call::Gating(false),
-            Call::Request(false),
-            Call::AutoOff,
-            Call::Bridge(false),
-            Call::Lower,
-        ]));
-        let mut hw = Fake::new(false, None);
         assert_eq!(up(&mut hw), Ok(()));
         assert!(hw.called(&[
             Call::Raise,
@@ -737,30 +728,6 @@ mod tests {
             Call::Restart(P),
             Call::Done,
         ]));
-    }
-
-    #[test]
-    fn a_refused_idle_touches_nothing_past_the_firmware() {
-        for call in [Call::Idle(P), Call::Idle(S)] {
-            let mut hw = Fake::new(true, Some(call));
-            assert_eq!(down(&mut hw), Err(EIO));
-            let past = |c: &Call| !matches!(c, Call::Idle(_) | Call::Wake(_));
-            assert!(!hw.calls.iter().flatten().any(past));
-        }
-    }
-
-    #[test]
-    fn a_primary_that_refuses_idle_is_woken_and_nothing_stops() {
-        let mut hw = Fake::new(true, Some(Call::Idle(P)));
-        assert_eq!(down(&mut hw), Err(EIO));
-        assert!(hw.called(&[Call::Idle(P), Call::Wake(P)]));
-    }
-
-    #[test]
-    fn a_secondary_that_refuses_idle_wakes_both_and_stops_nothing() {
-        let mut hw = Fake::new(true, Some(Call::Idle(S)));
-        assert_eq!(down(&mut hw), Err(EIO));
-        assert!(hw.called(&[Call::Idle(P), Call::Idle(S), Call::Wake(S), Call::Wake(P)]));
     }
 
     #[test]
@@ -778,12 +745,6 @@ mod tests {
         let mut hw = Fake::new(true, None);
         lower_domain(&mut hw);
         assert!(hw.called(&[Call::AutoOff, Call::Bridge(false), Call::Lower]));
-    }
-
-    #[test]
-    fn a_slow_domain_does_not_fail_down() {
-        let mut hw = Fake::new(false, Some(Call::Lower));
-        assert_eq!(down(&mut hw), Ok(()));
     }
 
     #[test]

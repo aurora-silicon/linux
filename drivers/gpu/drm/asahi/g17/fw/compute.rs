@@ -9,7 +9,10 @@
 
 use kernel::prelude::*;
 
-use super::kick::{KickTimestamp, RegisterArray, RegisterArrayBinding, RegisterWrite};
+use super::kick::{
+    KickTimestamp, McacheClass, McacheRange, McacheTable, RegisterArray, RegisterArrayBinding,
+    RegisterWrite, WriteRange, MCACHE_INLINE_RANGES,
+};
 use super::queue::CommandTag;
 use super::{
     offset_va, sampler_max, stamp_value, timestamp_end_va, work_key, ObjectIds, UNK_0A599,
@@ -684,6 +687,30 @@ impl ComputeDescriptor {
         }
         self.usage_va = args.usage_fw_va;
         self.context_generation = args.context_generation;
+        Ok(())
+    }
+
+    /// The MCache table naming `count` ranges in the main register array's
+    /// MCache space, as seen through `descriptor_va` (the address
+    /// [`Self::register_bindings`] takes), or `None` for none.
+    pub(crate) fn mcache_table(descriptor_va: u64, count: usize) -> Result<Option<McacheTable>> {
+        if count == 0 {
+            return Ok(None);
+        }
+        if count > MCACHE_INLINE_RANGES {
+            return Err(EINVAL);
+        }
+        let offset = Self::REGISTERS_OFFSET + core::mem::offset_of!(RegisterArray, mcache) as u64;
+        Ok(Some(McacheTable::new(offset_va(descriptor_va, offset)?, count)?))
+    }
+
+    /// Writes the ranges [`Self::mcache_table`] names, translated in UAT
+    /// context `context`.
+    pub(crate) fn write_mcache(&mut self, writes: &[WriteRange], context: u8) -> Result {
+        let ranges = self.registers.mcache.get_mut(..writes.len()).ok_or(EINVAL)?;
+        for (range, write) in ranges.iter_mut().zip(writes) {
+            *range = McacheRange::new(write, McacheClass::Attachment, context)?;
+        }
         Ok(())
     }
 

@@ -15,6 +15,7 @@
 #include <linux/perf/arm_pmuv3.h>
 #include <linux/platform_device.h>
 
+#include <asm/apple-idle.h>
 #include <asm/apple_m1_pmu.h>
 #include <asm/irq_regs.h>
 #include <asm/perf_event.h>
@@ -770,14 +771,26 @@ static void __m1_pmu_set_mode(u8 mode)
 	isb();
 }
 
+#ifdef CONFIG_ARCH_APPLE
+static void apple_pmu_wfi_freeze_set(bool active)
+{
+	this_cpu_write(apple_pmu_wfi_freeze, active);
+}
+#else
+static void apple_pmu_wfi_freeze_set(bool active) { }
+#endif
+
 static void m1_pmu_start(struct arm_pmu *cpu_pmu)
 {
+	/* arm_pmu only starts the PMU with at least one event on it. */
+	apple_pmu_wfi_freeze_set(true);
 	__m1_pmu_set_mode(PMCR0_IMODE_FIQ);
 }
 
 static void m1_pmu_stop(struct arm_pmu *cpu_pmu)
 {
 	__m1_pmu_set_mode(PMCR0_IMODE_OFF);
+	apple_pmu_wfi_freeze_set(false);
 }
 
 static int m1_pmu_map_event(struct perf_event *event)
@@ -856,6 +869,7 @@ static void m1_pmu_reset(void *info)
 	int i;
 
 	__m1_pmu_set_mode(PMCR0_IMODE_OFF);
+	apple_pmu_wfi_freeze_set(false);
 
 	for (i = 0; i < M1_PMU_NR_COUNTERS; i++) {
 		m1_pmu_disable_counter(i);
@@ -992,6 +1006,20 @@ static int t6050_pmu_init(struct arm_pmu *cpu_pmu)
 	return 0;
 }
 
+/*
+ * The M5 (T8142) cores count as the M5 Pro and Max cores do: XNU's event
+ * table is the same in both kernels, and macOS's event database for the
+ * M5 lists the same counter classes, so take T6050's tables.
+ */
+static int t8142_pmu_init(struct arm_pmu *cpu_pmu)
+{
+	int ret = t6050_pmu_init(cpu_pmu);
+
+	if (!ret)
+		cpu_pmu->name = "apple_t8142_pmu";
+	return ret;
+}
+
 static int m4_pmu_t8140_init(struct arm_pmu *cpu_pmu)
 {
 	cpu_pmu->name = "apple_t8140_pmu";
@@ -1002,6 +1030,7 @@ static const struct of_device_id m1_pmu_of_device_ids[] = {
 	{ .compatible = "apple,t8140-pmu",	.data = m4_pmu_t8140_init, },
 	{ .compatible = "apple,t6040-pmu",	.data = m4_pmu_t6040_init, },
 	{ .compatible = "apple,t6050-pmu",	.data = t6050_pmu_init, },
+	{ .compatible = "apple,t8142-pmu",	.data = t8142_pmu_init, },
 	{ .compatible = "apple,avalanche-pmu",	.data = m2_pmu_avalanche_init, },
 	{ .compatible = "apple,blizzard-pmu",	.data = m2_pmu_blizzard_init, },
 	{ .compatible = "apple,icestorm-pmu",	.data = m1_pmu_ice_init, },
@@ -1025,3 +1054,7 @@ static struct platform_driver m1_pmu_driver = {
 };
 
 module_platform_driver(m1_pmu_driver);
+
+#if IS_ENABLED(CONFIG_APPLE_M1_CPU_PMU_KUNIT_TEST)
+#include "apple_m1_cpu_pmu-test.c"
+#endif

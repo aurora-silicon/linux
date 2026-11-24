@@ -68,7 +68,7 @@ static int sio_t6041_run(struct sio_t6041_test *t, const u32 *params, unsigned i
 
 	t->count = 0;
 	err = sio_t6041_collect(params, n, sio_t6041_windows, ARRAY_SIZE(sio_t6041_windows),
-				addr, size);
+				addr, size, false);
 	if (err)
 		return err;
 	return sio_t6041_send_params(&t->sio, addr, size, sio_t6041_set_param);

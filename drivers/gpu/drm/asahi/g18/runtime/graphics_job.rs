@@ -8,9 +8,27 @@ use crate::{g18::buffer::object::MappedObject, g18::runtime::graphics_memory::G1
         G18ParameterBuffer, G18PbAddresses, G18PbPolicy, G18QueuedPass, G18PbReadback}};
 use crate::{driver::AsahiDrmDevice, g18::fw::render_params::G17pRenderParameters,
     g18::address_map as va, g18::fw::render as regs, g18::fw::render_command as cmd,
-    g18::fw::render_assembly::{self as assembly, EncodedJob, RenderVariant}, mmu};
+    g18::fw::render_assembly::{self as assembly, RenderVariant}, g18::fw::sksm::M5SksmRce, mmu};
 use core::sync::atomic::{fence, Ordering};
 use kernel::prelude::*;
+
+/// An encoded render: its RCE records and the cached copy of its TA and 3D
+/// commands, as copied to the graph. The copy (`G18_TA_COMMAND_BYTES` +
+/// `G18_3D_COMMAND_BYTES`, about 11 KiB) lives as long as the job, so the
+/// audits can compare the graph's read-back with it.
+pub(crate) struct EncodedJob { pub rce: [[M5SksmRce; 4]; 2], commands: KVec<u8> }
+
+impl EncodedJob {
+    /// The TA and the 3D command.
+    pub(crate) fn commands(&self) -> (&[u8], &[u8]) {
+        self.commands.split_at(cmd::G18_TA_COMMAND_BYTES)
+    }
+    /// The [`assembly::digests`] of the commands, for the logs.
+    pub(crate) fn digests(&self) -> [u64; 7] {
+        let (ta, fragment) = self.commands();
+        assembly::digests(ta, fragment)
+    }
+}
 
 pub(crate) struct G18GraphicsJob {
     // Payload's context lease retracts before the additional job mappings drop.
@@ -105,7 +123,7 @@ impl G18GraphicsJob {
             metrics_high: va::PB_METRICS_HIGH, metrics_low: va::PB_METRICS_LOW,
             scene_scratch_low: va::PB_SCENE_SCRATCH, blocks_low: va::PB_BLOCKS,
             discard_low: va::PB_DISCARD, user_view_delta: 0,
-        }, G18PbPolicy { blocks: 8, capacity: 1650, pm_154: 550, pm_15c: 1650,
+        }, G18PbPolicy { blocks: crate::g18::uapi::render_policy::PB_BLOCKS, capacity: crate::g18::uapi::render_policy::PB_CAPACITY, pm_154: 550, pm_15c: 1650,
             pm_1d4: 0, scene_count: 80, scene: 1, slot: 0, generation: 1 })?;
         parameter_buffer.alias_low_window(program.vm(), program.vm(), va::COMPACT_BIAS)?;
         p.cycle = parameter_buffer.scene_cycle();
@@ -185,7 +203,7 @@ impl G18GraphicsJob {
         for (address,bytes) in [(va::GRAPHICS_SIGNALS,va::GRAPHICS_SIGNALS_BYTES),
             (va::GRAPHICS_SCHEDULER_START,0x8000),(va::PB_TABLE,0x4000),
             (va::UMA_TABLE,0x8000),(va::GRAPHICS_UMA_STATE,0x8000)] {
-            for off in (0..bytes).step_by(mmu::UAT_PGSZ) { uat.kernel_vm().translate_iova(address+off as u64)?;pages+=1; }
+            pages += uat.kernel_vm().translate_pages(address,bytes)?.len();
         }
         // Captured shader/VDM/PPP pages are immutable except terminate/poison.
         // Validate all enabled direct register pointer inputs; bind/flag words
@@ -225,15 +243,13 @@ impl G18GraphicsJob {
             let digest=self.program.terminated_digest(self.parameters.encoder)?;
             dev_info!(dev.as_ref(), "G18_RENDER_DIGEST name=terminated-vdm-page fnv={:#018x}\n",digest);
         }
-        let expected=self.encoded.as_ref().ok_or(EINVAL)?.digests;
+        let (ta_expected,fr_expected)=self.encoded.as_ref().ok_or(EINVAL)?.commands();
         self.graph.with_bytes_mut(|bytes| {
             let ta=&bytes[..cmd::G18_TA_COMMAND_BYTES];
             let fr=&bytes[assembly::FRAGMENT_OFFSET..assembly::FRAGMENT_OFFSET+cmd::G18_3D_COMMAND_BYTES];
-            let f=crate::g18::fw::graphics_payload::fnv64;
-            let actual=[f(ta),f(fr),f(&ta[0x60..0x60+91*12]),f(&fr[0xa0..0xa0+92*12]),
-                f(&fr[0x7c0..0x7c0+17*12]),f(&fr[0xee0..0xee0+24*12]),f(&fr[0x1600..0x1600+12*12])];
-            if actual!=expected {return Err(EIO);}
-            for (name,digest) in assembly::DIGEST_NAMES.iter().zip(actual) {
+            if ta!=ta_expected || fr!=fr_expected {return Err(EIO);}
+            // Equal to the read-back: hash the cached copy, not the write-combined graph.
+            for (name,digest) in assembly::DIGEST_NAMES.iter().zip(assembly::digests(ta_expected,fr_expected)) {
                 dev_info!(dev.as_ref(), "G18_RENDER_DIGEST name={} fnv={:#018x}\n",name,digest);
             }
             Ok(())
@@ -303,13 +319,22 @@ impl G18GraphicsJob {
         // zero is valid for every field. Initialize the allocation in place.
         unsafe { core::ptr::write_bytes(workspace.as_mut_ptr(), 0, 1); }
         let mut workspace = unsafe { workspace.assume_init() };
-        let encoded = self.graph.with_bytes_mut(|bytes| {
+        // Encode in cached memory and copy the commands to the write-combined
+        // graph at once: the encoder reads what it writes. The cached copy is
+        // kept for the audit's comparison.
+        let mut commands = KVec::from_elem(0u8, cmd::G18_TA_COMMAND_BYTES + cmd::G18_3D_COMMAND_BYTES,
+            GFP_KERNEL)?;
+        let (ta, fragment) = commands.split_at_mut(cmd::G18_TA_COMMAND_BYTES);
+        let rce = assembly::encode_into(ta.try_into().map_err(|_| EINVAL)?,
+            fragment.try_into().map_err(|_| EINVAL)?,
+            &self.parameters, &self.controls, inputs, &mut workspace).map_err(|_| EINVAL)?;
+        self.graph.with_bytes_mut(|bytes| {
             let (ta_page, rest) = bytes.split_at_mut(assembly::FRAGMENT_OFFSET);
-            assembly::encode_into((&mut ta_page[..cmd::G18_TA_COMMAND_BYTES]).try_into().map_err(|_| EINVAL)?,
-                (&mut rest[..cmd::G18_3D_COMMAND_BYTES]).try_into().map_err(|_| EINVAL)?,
-                &self.parameters, &self.controls, inputs, &mut workspace).map_err(|_| EINVAL)
+            ta_page[..cmd::G18_TA_COMMAND_BYTES].copy_from_slice(ta);
+            rest[..cmd::G18_3D_COMMAND_BYTES].copy_from_slice(fragment);
+            Ok(())
         })?;
-        self.encoded = Some(encoded);
+        self.encoded = Some(EncodedJob { rce, commands });
         fence(Ordering::SeqCst);
         Ok(())
     }
@@ -317,21 +342,17 @@ impl G18GraphicsJob {
     fn audit_mappings(&self, uat: &mmu::Uat) -> Result<usize> {
         let mut count = self.program.audit()?;
         for target in self.targets.iter() {
-            for offset in (0..target.logical_size).step_by(mmu::UAT_PGSZ) {
-                let low = target.iova() + offset as u64;
-                if self.vm().translate_iova(low)? != self.vm().translate_iova(va::COMPACT_BIAS + low)? {
-                    return Err(EFAULT);
-                }
-                count += 1;
+            let low = self.vm().translate_pages(target.iova(), target.logical_size)?;
+            if self.vm().translate_pages(va::COMPACT_BIAS + target.iova(), target.logical_size)? != low {
+                return Err(EFAULT);
             }
+            count += low.len();
         }
-        for offset in (0..va::GRAPHICS_JOB_BYTES).step_by(mmu::UAT_PGSZ) {
-            let pa = uat.kernel_vm().translate_iova(va::GRAPHICS_JOB_HIGH + offset as u64)?;
-            for vm in [uat.kernel_lower_vm(), self.vm()] {
-                if vm.translate_iova(va::GRAPHICS_JOB_LOW + offset as u64)? != pa { return Err(EFAULT); }
-            }
-            count += 1;
+        let pa = uat.kernel_vm().translate_pages(va::GRAPHICS_JOB_HIGH, va::GRAPHICS_JOB_BYTES)?;
+        for vm in [uat.kernel_lower_vm(), self.vm()] {
+            if vm.translate_pages(va::GRAPHICS_JOB_LOW, va::GRAPHICS_JOB_BYTES)? != pa { return Err(EFAULT); }
         }
+        count += pa.len();
         Ok(count)
     }
 
@@ -359,7 +380,7 @@ impl G18GraphicsJob {
             ("pb-metrics", va::PB_METRICS_LOW, 0x4000, self.context_id()),
             ("pb-scene-scratch", va::PB_SCENE_SCRATCH, 0x4000, self.context_id()),
             ("pb-discard", va::PB_DISCARD, 0x8000, self.context_id()),
-            ("pb-blocks", va::PB_BLOCKS, 8*0x80000, self.context_id()),
+            ("pb-blocks", va::PB_BLOCKS, crate::g18::uapi::render_policy::PB_BLOCKS as usize*0x80000, self.context_id()),
             ("uma-state", va::GRAPHICS_UMA_STATE, 0xa0, 0),
             ("uma-counter", va::GRAPHICS_UMA_COUNTER, 8, 0),
             ("uma-list", va::GRAPHICS_UMA_LIST, 0x2000, 0),

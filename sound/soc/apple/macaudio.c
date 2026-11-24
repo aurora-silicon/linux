@@ -183,6 +183,21 @@ struct macaudio_platform_cfg {
 	 * front-end owns the DMA channel of one serializer (AOP-fed models).
 	 */
 	bool spk_secondary_only;
+	/*
+	 * No voltage or current sense reaches the AP, so no protection daemon
+	 * can govern the speakers, and there is no sense PCM. "Speaker Volume
+	 * Unlock" does not apply: the SN012776 volumes stay at the floor until
+	 * the interface is on the "Speaker Protection" lease, and playback
+	 * starts only after a grant, which runs them at safe_vol, its
+	 * operating gain and their ceiling.
+	 */
+	bool spk_fixed_ceiling;
+	/*
+	 * With spk_fixed_ceiling: the amp level safe_vol was computed for. At
+	 * any other level the same volume drives the speaker differently, so
+	 * the speakers stay off.
+	 */
+	int spk_ceiling_level;
 };
 
 static const char *volume_control_names[] = {
@@ -401,6 +416,26 @@ static bool macaudio_spk_leased(const struct macaudio_snd_data *ma)
 	return READ_ONCE(ma->spk_iface) == MACAUDIO_SPK_IFACE_LEASE;
 }
 
+/* Only a "Speaker Protection" lease may lift these speakers (spk_fixed_ceiling) */
+static bool macaudio_spk_lease_only(const struct macaudio_platform_cfg *cfg)
+{
+	return cfg->spk_fixed_ceiling;
+}
+
+/*
+ * The SN012776 volumes' limit: the floor while locked; unlocked, 0 dB, or
+ * on a lease-only machine safe_vol, and there only under the lease.
+ */
+static int macaudio_sn012776_vlimit(const struct macaudio_platform_cfg *cfg,
+				    bool unlock, bool leased)
+{
+	if (macaudio_spk_lease_only(cfg))
+		return unlock && leased ? SN012776_DB(cfg->safe_vol) : 1;
+	if (unlock)
+		return SN012776_0DB;
+	return 1; //SN012776_DB(cfg->safe_vol);
+}
+
 
 SND_SOC_DAILINK_DEFS(primary,
 	DAILINK_COMP_ARRAY(COMP_CPU("mca-pcm-0")), // CPU
@@ -527,10 +562,7 @@ static void macaudio_vlimit_unlock(struct macaudio_snd_data *ma, bool unlock)
 			max = 1; //TAS5770_DB(ma->cfg->safe_vol);
 		break;
 	case AMP_SN012776:
-		if (unlock)
-			max = SN012776_0DB;
-		else
-			max = 1; //SN012776_DB(ma->cfg->safe_vol);
+		max = macaudio_sn012776_vlimit(ma->cfg, unlock, macaudio_spk_leased(ma));
 		break;
 	case AMP_SSM3515:
 		if (unlock)
@@ -757,6 +789,10 @@ static void macaudio_vlimit_update(struct macaudio_snd_data *ma)
 	 * ceiling until the interface switches back (macaudio_spk_leave_lease()).
 	 */
 	if (macaudio_spk_leased(ma))
+		return;
+
+	/* No protection daemon can hold these speakers: nothing to unlock */
+	if (macaudio_spk_lease_only(ma->cfg))
 		return;
 
 	/* Check that someone is holding the main lock */
@@ -1026,7 +1062,11 @@ static long macaudio_spk_gain(const struct macaudio_snd_data *ma, bool granted)
 	case AMP_TAS5770:
 		return granted ? TAS5770_0DB : 0;
 	case AMP_SN012776:
-		return granted ? SN012776_0DB : 0;
+		if (!granted)
+			return 0;
+		/* The volumes' limit is the ceiling, so is the operating gain */
+		return ma->cfg->spk_fixed_ceiling ? SN012776_DB(ma->cfg->safe_vol) :
+						    SN012776_0DB;
 	case AMP_MAX98360A:
 		return granted ? MAX98360A_0DB : MAX98360A_DB(ma->cfg->safe_vol);
 	default:
@@ -1156,6 +1196,10 @@ static void macaudio_spk_ramp_down(struct macaudio_snd_data *ma, ktime_t deadlin
 	lockdep_assert_held(&ma->spk_mutex);
 
 	for (i = 0; i < ARRAY_SIZE(macaudio_spk_ramp_db); i++) {
+		/* A fixed ceiling is the operating gain: start below it */
+		if (ma->cfg->spk_fixed_ceiling &&
+		    macaudio_spk_ramp_db[i] >= ma->cfg->safe_vol)
+			continue;
 		if (!ktime_before(ktime_get(), deadline))
 			return;
 		/* A failure here is the floor's to catch; it notifies the end */
@@ -2389,10 +2433,21 @@ static int macaudio_sn012776_level(struct device_node *amp)
 }
 
 /*
+ * A fixed ceiling holds only at the amp level it was computed for.
+ */
+static bool macaudio_sn012776_level_allowed(const struct macaudio_platform_cfg *cfg,
+					    int level)
+{
+	return level >= 0 && (!cfg->spk_fixed_ceiling || level == cfg->spk_ceiling_level);
+}
+
+/*
  * Speakers on SN012776 amps run only when every amp has its level from the
- * Mac; a boot loader that does not pass it leaves them off.
+ * Mac, and under a fixed ceiling only at the level that ceiling was computed
+ * for; otherwise they stay off.
  */
 static bool macaudio_sn012776_levels_present(struct device *dev,
+					     const struct macaudio_platform_cfg *cfg,
 					     struct device_node *codec)
 {
 	struct of_phandle_args args;
@@ -2407,8 +2462,13 @@ static bool macaudio_sn012776_levels_present(struct device *dev,
 		if (level < 0)
 			dev_err(dev, "%pOF: %s amp level from the boot loader\n", args.np,
 				level == -ENOENT ? "no" : "out-of-range");
+		else if (!macaudio_sn012776_level_allowed(cfg, level))
+			dev_err(dev, "%pOF: amp level %d, the fixed ceiling holds only at %d\n",
+				args.np, level, cfg->spk_ceiling_level);
+		else if (cfg->spk_fixed_ceiling)
+			dev_info(dev, "%pOF: amp level %d from the boot loader\n", args.np, level);
 		of_node_put(args.np);
-		if (level < 0)
+		if (!macaudio_sn012776_level_allowed(cfg, level))
 			return false;
 	}
 	return n > 0;
@@ -2648,16 +2708,18 @@ static int macaudio_parse_of(struct macaudio_snd_data *ma)
 			if (ma->cfg->amp == AMP_SN012776) {
 				struct device_node *spk_codec = of_get_child_by_name(np, "codec");
 				bool levels = spk_codec &&
-					macaudio_sn012776_levels_present(card->dev, spk_codec);
+					macaudio_sn012776_levels_present(card->dev, ma->cfg,
+									 spk_codec);
 
 				of_node_put(spk_codec);
 				if (!levels) {
-					dev_err(card->dev, "the boot loader passed no amp levels, disabling speakers\n");
+					dev_err(card->dev, "no usable amp levels from the boot loader, disabling speakers\n");
 					continue;
 				}
 			}
 			ma->has_speakers = 1;
-			if (ma->cfg->amp != AMP_SSM3515 && ma->cfg->safe_vol != 0)
+			if (ma->cfg->amp != AMP_SSM3515 && ma->cfg->safe_vol != 0 &&
+			    !ma->cfg->spk_fixed_ceiling)
 				ma->has_sense = 1;
 		}
 
@@ -4056,6 +4118,32 @@ struct macaudio_platform_cfg macaudio_j873_cfg = {
 };
 
 /*
+ * J775c and J775d (T6050, Mac Studio M5 Max and M5 Ultra): as on J714s, the
+ * AOP firmware owns the audio fabric and the CPU component is the AOP audio
+ * driver. The jack is a CS42L84 on "cout", the speaker one SN012776 on
+ * "spkr" in a frame of 250 BCLKs of 12 MHz.
+ *
+ * The speaker stays off. The ADT's audio-speaker stream lists one TX slot and
+ * no RX (sense) slot, so the speaker can only be run under a protection lease
+ * held by speakerguardd with a no-sense model, as on the J773g; that model
+ * does not exist for these machines yet. Until it does there is no safe
+ * level: macaudio_speakers_allowed() keeps the speaker off, as on the J873.
+ * The jack is unaffected.
+ */
+struct macaudio_platform_cfg macaudio_j775_cfg = {
+	.enable_speakers = false,
+	.amp = AMP_SN012776,
+	.speakers = SPKR_1W,
+	.stereo = false,
+	.safe_vol = 0,
+	.fe_dai_names = { "j873-pcm-0", "j873-pcm-1", "j873-pcm-2" },
+	.dai_fmt = SND_SOC_DAIFMT_DSP_A | SND_SOC_DAIFMT_CBC_CFC | SND_SOC_DAIFMT_IB_NF,
+	.spk_dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_CBC_CFC |
+		       SND_SOC_DAIFMT_GATED | SND_SOC_DAIFMT_NB_IF,
+	.spk_secondary_only = true,
+};
+
+/*
  * J813 (T8142, MacBook Air M5 13"): as on J873, the AOP firmware owns the
  * audio fabric and the CPU component is the T8152-style AOP audio driver.
  * The jack is a CS42L84 on "cout"; the speakers are four SN012776 (one
@@ -4208,12 +4296,13 @@ struct macaudio_platform_cfg macaudio_j614_cfg = {
 };
 
 /*
- * J604 (T8132, MacBook Pro 14" M4): the J614s's amps, frame and chassis,
- * but its speakers have not been brought up. Keep them off entirely: the
- * speaker link is not bound, so no stream ever reaches the amps.
+ * J604 (T8132, MacBook Pro 14" M4): the J614s's six amps, two woofers and a
+ * tweeter per side, on all six playback and twelve sense slots of the same
+ * frame. The speakers stay at their safe level until speakersafetyd takes
+ * them with the J604 profile.
  */
 struct macaudio_platform_cfg macaudio_j604_cfg = {
-	.enable_speakers = false,
+	.enable_speakers = true,
 	.amp = AMP_SN012776,
 	.speakers = SPKR_2W1T,
 	.stereo = true,
@@ -4391,7 +4480,7 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	{ .compatible = "apple,j575c-macaudio-jack", .data = &macaudio_j616_jack_cfg },
 	/* j613    AID20   sn012776    15      2x 1W+1T Compat: apple,j413-macaudio */
 	/* j615    AID21   sn012776    15      2x 2W+1T Compat: apple,j415-macaudio */
-	/* j604    -       sn012776    15      2x 2W+1T (AOP-fed; speakers off until bring-up) */
+	/* j604    -       sn012776    15      2x 2W+1T (AOP-fed) */
 	{ .compatible = "apple,j604-macaudio", .data = &macaudio_j604_cfg },
 	/* j604    -       cs42l84     -       the jack, a card of its own (AOP-fed) */
 	{ .compatible = "apple,j604-macaudio-jack", .data = &macaudio_j616_jack_cfg },
@@ -4411,6 +4500,8 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	{ .compatible = "apple,j700-macaudio", .data = &macaudio_j700_cfg },
 	/* j714    -       sn012776    15      2x 2W+1T (AOP-fed, V/I sense) */
 	{ .compatible = "apple,j714-macaudio", .data = &macaudio_j714_cfg },
+	/* k116    -       sn012776    15      2x 2W+1T (AOP-fed, V/I sense; the 16" PROLED chassis, J714's amps and frame) */
+	{ .compatible = "apple,k116-macaudio", .data = &macaudio_j714_cfg },
 	/* j713    -       sn012776    15      2x 1W+1T (AOP-fed, one serializer) */
 	{ .compatible = "apple,j713-macaudio", .data = &macaudio_j713_cfg },
 	/* The J713 jack runs on the AOP like the J616s one. */
@@ -4424,6 +4515,10 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	{ .compatible = "apple,j773-macaudio-jack", .data = &macaudio_j616_jack_cfg },
 	/* j873    AID48   sn012776    15      1x 1W    (AOP-fed, no protection) */
 	{ .compatible = "apple,j873-macaudio", .data = &macaudio_j873_cfg },
+	/* j775c   -       sn012776    -       1x 1W    (AOP-fed, no sense: speaker off) */
+	{ .compatible = "apple,j775c-macaudio", .data = &macaudio_j775_cfg },
+	/* j775d   -       sn012776    -       1x 1W    (AOP-fed, no sense: speaker off) */
+	{ .compatible = "apple,j775d-macaudio", .data = &macaudio_j775_cfg },
 	/* j813    AID?    sn012776    15      2x 1W+1T (AOP-fed, V/I sense) */
 	{ .compatible = "apple,j813-macaudio", .data = &macaudio_j813_cfg },
 	/* j815    AID43   sn012776    15      2x 2W+1T (AOP-fed, V/I sense) */

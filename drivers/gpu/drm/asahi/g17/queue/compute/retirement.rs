@@ -101,17 +101,25 @@ pub(crate) enum StampWait {
     /// The bound passed while the ioctl's work-state node still runs kicks: the stamp is not
     /// late, and the wait counts again from the given host time.
     Restart(u64),
-    /// The node drained and the stamp is still missing after the bound: retire on the record.
+    /// The node drained and the stamp is still missing after the bound, or the watchdog ended
+    /// the wait ([`STAMP_WAIT_EXPIRED`]): retire on the record.
     Aged,
 }
 
+/// The latch time a watchdog that gave up on a command with its record present stores: its
+/// stamp wait is over, however long the rest of its ioctl runs.
+pub(crate) const STAMP_WAIT_EXPIRED: u64 = 0;
+
 /// The stamp wait of a command whose exact record was latched at `observed_at` (host ns) and
 /// whose stamp is still missing, at `now`. `drained` reports whether every kick counted on the
-/// command's work-state node completed; it is asked only once the bound has passed.
+/// command's work-state node completed; it is asked only once the bound has passed, and never
+/// for a wait the watchdog ended.
 pub(crate) fn stamp_wait(observed_at: Option<u64>, now: u64, drained: impl FnOnce() -> bool)
     -> StampWait
 {
-    if !record_aged(observed_at, now) {
+    if observed_at == Some(STAMP_WAIT_EXPIRED) {
+        StampWait::Aged
+    } else if !record_aged(observed_at, now) {
         StampWait::Waiting
     } else if drained() {
         StampWait::Aged
@@ -594,6 +602,11 @@ mod tests {
         // The node drained and the stamp is still missing after the bound.
         assert_eq!(stamp_wait(Some(late), late + STAMP_FALLBACK_NS, || true), StampWait::Aged);
         assert_eq!(stamp_wait(Some(at), late, || true), StampWait::Aged);
+        // The watchdog ended the wait: the node is not asked, and the bound does not apply.
+        for now in [0, 1, late] {
+            assert_eq!(stamp_wait(Some(STAMP_WAIT_EXPIRED), now, || panic!("node read")),
+                StampWait::Aged);
+        }
     }
 
     #[test]

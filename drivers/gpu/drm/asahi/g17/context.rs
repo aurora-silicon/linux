@@ -8,9 +8,9 @@
 
 mod identity;
 use super::{
-    freelist::{RenderIds, RenderPool},
+    freelist::{RenderId, RenderIds, RenderPool},
     fw::{context as fw, queue::Policy},
-    object::{Allocator, CpuMap, Family, KernelObject, Pool, PooledObject},
+    object::{Allocator, CpuMap, Family, KernelObject, Pool, PooledObject, ReturnMark},
     status::VmStatus,
 };
 use crate::mmu::{self, ExecutionContext, Vm, UAT_PGSZ};
@@ -231,20 +231,30 @@ pub(crate) struct Context {
     order: Arc<Mutex<Order>>,
     work: Arc<Mutex<WorkStorage>>,
     work_base: u64,
+    /// How far the work storage's address reached the firmware, kept up to date by every
+    /// accessor that hands it out (A18 Pro, cached storage only; see [`ReturnMark`]).
+    work_mark: Option<Arc<ReturnMark>>,
     render: Arc<Mutex<Option<Arc<RenderPool>>>>,
+    /// The render pool identity taken with the context
+    /// ([`super::fw::Variant::render_id_at_create`]), until its render pool takes it over or
+    /// the closed context is reclaimed.
+    render_id: Arc<Mutex<Option<RenderId>>>,
     render_blocks: AtomicUsize,
     /// Timestamp pages of retired compute commands, mapped in this context's VM.
     compute_timestamps: Arc<super::completion::ComputeTimestampCache>,
     /// Fixed for the context's life. Physical queues bound to it carry this
     /// profile in every record, ring, doorbell and registration.
     policy: Policy,
+    /// This logical queue's use of the execution context its VM's queues share
+    /// (`super::exec_share`); `None` on M5.
+    share: Option<super::exec_share::Use>,
 }
 impl Context {
     #[expect(
         clippy::too_many_arguments,
         reason = "A context takes its allocators, identities and both admission domains."
     )]
-    pub(crate) fn new(
+    pub(super) fn new(
         alloc: &Allocator<'_>,
         pool: &Arc<Pool>,
         qos: &Arc<QosIds>,
@@ -253,6 +263,8 @@ impl Context {
         policy: Policy,
         state_returns: Arc<super::availability::Availability>,
         compute_returns: Arc<super::availability::Availability>,
+        share: Option<super::exec_share::Use>,
+        render_id: Option<RenderId>,
     ) -> Result<Self> {
         let status = execution.vm().status().ok_or(EINVAL)?.clone();
         let hold = execution.hold(super::channel::control_fence)?;
@@ -297,6 +309,7 @@ impl Context {
             CpuMap::WriteCombined,
         )?;
         let work_base = object.gpu_va();
+        let work_mark = object.return_mark();
         object.write(
             UAT_PGSZ + 0x400,
             fw::WorkHead {
@@ -320,6 +333,8 @@ impl Context {
             GFP_KERNEL,
         )?;
         let render = Arc::pin_init(new_mutex!(None, "G17 context private memory"), GFP_KERNEL)?;
+        let render_id =
+            Arc::pin_init(new_mutex!(render_id, "G17 context render pool identity"), GFP_KERNEL)?;
         let order =
             Arc::pin_init(new_mutex!(Order::new(), "G17 context admission order"), GFP_KERNEL)?;
         Ok(Self {
@@ -335,16 +350,22 @@ impl Context {
             render_seen: AtomicBool::new(false),
             qos,
             owner_pid,
-            states: WorkStates::new(),
+            states: match &share {
+                Some(share) => WorkStates::shared(share.claims().clone()),
+                None => WorkStates::new(),
+            },
             state_returns,
             compute_returns,
             order,
             work,
             work_base,
+            work_mark,
             render,
+            render_id,
             render_blocks: AtomicUsize::new(super::fw::freelist::RENDER_BLOCKS),
             compute_timestamps: super::completion::ComputeTimestampCache::new()?,
             policy,
+            share,
         })
     }
     pub(crate) fn vm(&self) -> &Vm {
@@ -420,7 +441,14 @@ impl Context {
     /// Scheduler release and command retirement have both been witnessed.
     /// Keep installed storage alive while returning the finite TTBAT identity.
     pub(crate) fn release_execution(&self) {
-        self.execution.release();
+        match &self.share {
+            Some(share) => share.release_execution(),
+            None => self.execution.release(),
+        }
+    }
+    /// `other` runs in this context's shared execution context.
+    pub(crate) fn shares_execution(&self, other: &Context) -> bool {
+        self.share.is_some() && core::ptr::eq(&*self.execution, &*other.execution)
     }
     pub(crate) fn scheduler_generation(&self) -> u32 {
         self.scheduler_generation
@@ -429,6 +457,11 @@ impl Context {
     /// scheduler page and the work storage holding the job-list head. A retained
     /// physical queue keeps these after dropping the context itself.
     pub(crate) fn retain_firmware_pages(&self) -> FirmwarePages {
+        // The retained record is replaced without a control-ring witness, so the work
+        // storage keeps the strict fence when it comes back.
+        if let Some(mark) = &self.work_mark {
+            mark.retain();
+        }
         FirmwarePages {
             _scheduler: self.scheduler.clone(),
             _work: self.work.clone(),
@@ -442,11 +475,18 @@ impl Context {
     /// the same work storage (the object cache hands it out again) made the firmware recover
     /// the GPU. Keep the storage mapped and out of reuse until firmware stop; returns whether
     /// it was linked.
+    ///
+    /// An empty list means that no record or command the firmware still follows names the
+    /// storage: on the A18 Pro it may be reused as soon as it comes back, unless a retained
+    /// queue record names it (see [`ReturnMark`]). The caller observed the control ring on the
+    /// cursor snapshot that proved the release consumed, so the witness already covers it.
     pub(crate) fn retain_linked_work(&self, pool: &Arc<Pool>) -> bool {
         // An unreadable head counts as linked: retaining is the safe side.
-        let linked = self.work_head().map_or(true, |head| head != [0, self.work_head_va()]);
+        let linked = self.work_head().map_or(true, |head| head != [0, self.work_head_address()]);
         if linked {
             self.work.lock().object.retain_until_stop(pool);
+        } else if let Some(mark) = &self.work_mark {
+            mark.released(super::channel::control_witnessed());
         }
         linked
     }
@@ -455,11 +495,24 @@ impl Context {
     /// linked and the scheduler page shows no kill. Unreadable state counts as linked.
     pub(crate) fn firmware_may_link(&self) -> bool {
         let killed = super::queue::compute::exit::State::read(self).map_or(0, |state| state.killed);
-        must_retain(self.work_head().ok(), self.work_head_va(), killed)
+        must_retain(self.work_head().ok(), self.work_head_address(), killed)
     }
 
+    /// The work-list head, for a queue record: the firmware may follow it from then on.
     pub(crate) fn work_head_va(&self) -> u64 {
+        self.expose_work();
+        self.work_head_address()
+    }
+    /// The work-list head's address for comparisons with the host's own reads. It must not
+    /// reach the firmware: use [`Self::work_head_va`] for that.
+    pub(crate) fn work_head_address(&self) -> u64 {
         self.work_base + (UAT_PGSZ + 0x400) as u64
+    }
+    /// The work storage's address is being handed to the firmware.
+    fn expose_work(&self) {
+        if let Some(mark) = &self.work_mark {
+            mark.expose();
+        }
     }
     /// Shared scheduler list head, sampled under the context's storage lock.
     pub(crate) fn work_head(&self) -> Result<[u64; 2]> {
@@ -544,9 +597,14 @@ impl Context {
                     self.vm(),
                     plan.geometry,
                 )?,
-                None => {
-                    RenderPool::new(alloc, ids, render_global, self.vm(), self.render_blocks())?
-                }
+                None => RenderPool::new(
+                    alloc,
+                    ids,
+                    render_global,
+                    self.vm(),
+                    self.render_blocks(),
+                    Some(&self.render_id),
+                )?,
             },
             GFP_KERNEL,
         )?;
@@ -560,6 +618,11 @@ impl Context {
     /// context itself until replacement; they never use the render pool.
     pub(crate) fn take_render_pool(&self) -> Option<Arc<RenderPool>> {
         self.render.lock().take()
+    }
+    /// Gives back the identity a closed context took at creation and never used: compute
+    /// bindings may retain the context itself until they are replaced.
+    pub(crate) fn release_render_id(&self) {
+        drop(self.render_id.lock().take());
     }
     pub(crate) fn render_pools_released(&self, released: impl Fn(u32, u64) -> bool) -> bool {
         self.render
@@ -643,11 +706,13 @@ impl WorkStateLease {
         }
         self.context.states.older_live(word)
     }
+    /// This ioctl's node, for a command: the firmware may follow it from then on.
     pub(crate) fn node_va(&self) -> Result<u64> {
         let word = self.word();
         if word == FREE {
             return Err(EINVAL);
         }
+        self.context.expose_work();
         Ok(self.context.work_base + u64::from(word & 63) * NODE_STRIDE as u64)
     }
     /// Whether the firmware completed every kick counted so far on this ioctl's node. It stores

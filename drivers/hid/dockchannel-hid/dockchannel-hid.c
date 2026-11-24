@@ -877,10 +877,48 @@ static void dchid_close(struct hid_device *hdev)
 	WRITE_ONCE(iface->open, false);
 }
 
+/*
+ * The K116s MTP firmware (AppleMTPFirmwareMac-6310.85.7) describes the
+ * multi-touch interface's one input report with a 4-byte Report Size of
+ * 0x80000 bits (64 KiB), which the HID core refuses (16384 bits at most), so
+ * no driver can bind and the firmware upload a bind triggers never happens.
+ * The report's size is not used by the transport: the MTP's reports arrive
+ * through raw_event with their own framing. Clamp any such item to the
+ * maximum the core accepts, in place, so the item layout stays the same.
+ */
+static void dchid_clamp_report_size(struct hid_device *hdev, u8 *desc, size_t len)
+{
+	size_t i = 0;
+
+	while (i < len) {
+		u8 hdr = desc[i], size = hdr & 3, type = (hdr >> 2) & 3, tag = hdr >> 4;
+
+		if (hdr == 0xfe) { /* long item */
+			if (i + 2 >= len)
+				return;
+			i += 3 + desc[i + 1];
+			continue;
+		}
+		if (size == 3)
+			size = 4;
+		/* Global item, Report Size, 4-byte value */
+		if (type == 1 && tag == 7 && size == 4 && i + 4 < len) {
+			u32 val = get_unaligned_le32(&desc[i + 1]);
+
+			if (val > 16384) {
+				hid_info(hdev, "clamping report size %u to 16384 bits\n", val);
+				put_unaligned_le32(16384, &desc[i + 1]);
+			}
+		}
+		i += 1 + size;
+	}
+}
+
 static int dchid_parse(struct hid_device *hdev)
 {
 	struct dchid_iface *iface = hdev->driver_data;
 
+	dchid_clamp_report_size(hdev, iface->hid_desc, iface->hid_desc_len);
 	return hid_parse_report(hdev, iface->hid_desc, iface->hid_desc_len);
 }
 
@@ -1802,6 +1840,31 @@ static void dockchannel_hid_remove(struct platform_device *pdev)
 	}
 }
 
+/* The feature report each interface's node gives for a firmware-driven sleep, if any. */
+static void dchid_send_sleep_reports(struct dockchannel_hid *dchid)
+{
+	int i, len, ret;
+
+	for (i = 0; i < MAX_INTERFACES; i++) {
+		struct dchid_iface *iface = dchid->ifaces[i];
+		const void *prop;
+		void *report;
+
+		if (!iface || !iface->of_node)
+			continue;
+		prop = of_get_property(iface->of_node, "apple,sleep-report", &len);
+		if (!prop || len <= 0)
+			continue;
+		report = kmemdup(prop, len, GFP_KERNEL);
+		if (!report)
+			continue;
+		ret = dchid_cmd(iface, HID_FEATURE_REPORT, REQ_SET_REPORT, report, len, NULL, 0);
+		kfree(report);
+		if (ret < 0)
+			dev_warn(dchid->dev, "%s: sleep report not sent: %d\n", iface->name, ret);
+	}
+}
+
 /*
  * The coprocessor keeps running across suspend-to-idle, and its RTKit session
  * and the trackpad AFE power sequence are not restartable. Mark the sleep
@@ -1827,6 +1890,7 @@ static int dockchannel_hid_suspend(struct device *dev)
 			goto unwind;
 	}
 	if (pm_suspend_via_firmware()) {
+		dchid_send_sleep_reports(dchid);
 		/* A firmware that doesn't answer isn't a reason to stay awake. */
 		ret = dchid_host_state(dchid, HOST_STATE_SLEEP);
 		if (ret)

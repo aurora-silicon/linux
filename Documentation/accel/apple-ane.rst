@@ -69,7 +69,8 @@ absolute session deadline and a bounded 64-bit mailbox transport.
 H16 task streams begin with little-endian ``u32 1`` and twelve reserved zero
 bytes. This marker precedes the first aligned task; it is not a task count.
 The initial H16 gate rejects a zero marker, other values and nonzero reserved
-bytes. The public H16 encoder fixes this prologue at commit
+bytes. H17 streams open with 0 or 1; the gate refuses every other value.
+The public H16 encoder fixes this prologue at commit
 ``927013f5480768b07c8e62a866e1514c41aba778`` of
 ``joshuaswarren/mil-hwx-compiler``, in
 ``plugins/H16G/Encoding/H16GALUEncoder.mm``.
@@ -690,9 +691,14 @@ stage that has not run yet, up to the one written, for diagnosis.
 A stage at or below the completed one is refused with ``-EALREADY``. There
 is no module parameter and no H14 boot parameter changes the H16 path. H17 still refuses ownership and registration.
 All build-dependent boot values and ordered masked updates belong to the
-H16 27.0 (26A428) match-data profile. The existing preload validator must
-accept the resident image before that profile can run. Live mutable patchbay
-and firmware tunable values are preserved, with no disk firmware owner.
+H16 27.0 (26A428) match-data build shared by the supported H16 profiles
+(27.0 26A428, 27.2 26B123, 26.6.2 25G83, and 26.5.2 25F84). The preload
+validator must accept the resident image before a profile can run.
+The T8132 (M4) has its own builds: 26.6.2 25G83 and 27.2 26B123. Each firmware
+build of an SoC may hand over its own TEXT and DATA sizes (27.2 on the T8132:
+0xbc000 and 0x2b0000); the driver picks the build whose sizes and IOVAs the
+loader handed over, and each preload rule checks the sizes it was made for. Live mutable
+patchbay and firmware tunable values are preserved, with no disk firmware owner.
 
 ``preflight`` raises the five real domains through genpd, in DT order, and
 checks every requested/ACTUAL low byte twice before reading the engine.
@@ -701,7 +707,8 @@ three DART fault status/address words, version/protect/lock headers and four
 DAPF records per instance against ``apple,dapf-ranges``. The ANE backend
 writes no engine, DART or DAPF register at this rung. Genpd owns power writes.
 
-``map`` claims an exclusive, singleton IOMMU group and an unmanaged domain
+``map`` logs all three DART protection words (enforcing bit 0 clear on the
+27.2 26B123 profile) before claiming an exclusive, singleton IOMMU group and an unmanaged domain
 covering the three SID-0 DART instances. Private surfaces currently require
 a DMA-coherent client; noncoherent clients refuse pool allocation before RUN. No
 unexported architecture cache helper is called from the module. It checks
@@ -821,8 +828,9 @@ The ``ane-h16-boot`` KUnit suite uses a simulated engine, scratch cells,
 mailbox polling and rings. It covers startup including allocation service,
 missing READY, wrong/stale table publication, oversized IPC/heap requests,
 channel bounds, locked DAPF differences, nonzero acks, scratch-3 timeout,
-zero tick, default refusal and quarantine after RUN. It also covers matching
-locked DAPF, heap/shared overlap, native FREE, foreign FREE and control refusal.
+zero tick, default refusal and quarantine after RUN. It also covers DART
+protection refusal, matching locked DAPF, heap/shared overlap, native FREE,
+foreign FREE and control refusal.
 
 H16 program stage
 -----------------

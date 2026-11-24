@@ -54,6 +54,8 @@ struct ave_mctf_layout;
 #define AVE_IPC_BYTES (20 * SZ_1M)
 #define AVE_IPC_CHANNEL_OFF 0x4000
 #define AVE_IPC_HANDSHAKE_OFF 0x24000
+/* Most channel descriptors any firmware publishes (the 6070 one: 7). */
+#define AVE_IPC_MAX_CHANNELS 8
 #define AVE_IPC_SHARED_OFF 0x28000
 #define AVE_IPC_SHARED_BYTES SZ_64K
 #define AVE_IPC_CMD_OFF 0x40000
@@ -168,7 +170,7 @@ enum ave_opcode {
 /* The M4 Pro (T6040) build of the same 25G83 firmware. */
 #define AVE_FW_TEXT_CRC_T6040_25G83 0x68d5f9f6
 /*
- * The M4 Max (J575c) build of AppleAVE2FW 9003.78.0, as iBoot 25G83 loads it:
+ * The M4 Max (J575c) build of encoder firmware 9003.78.0, as iBoot 25G83 loads it:
  * DATA is 0x130000, and the loader writes a per-boot word at TEXT 0x4224, so
  * this is the TEXT CRC with that word zeroed.
  */
@@ -176,6 +178,22 @@ enum ave_opcode {
 #define AVE_FW_TEXT_CRC_T6050_26A428 0x87279429
 /* macOS 27.3 beta 1 (26C5035r) / T6050: TEXT 0x158000, DATA 0x134000. */
 #define AVE_FW_TEXT_CRC_T6050_26C5035 0xc25b4ddb
+/* The M5 (T8142) build of the same 26A428 firmware (encoder firmware 9013.45.1). */
+#define AVE_FW_TEXT_CRC_T8142_26A428 0x8a3784bd
+/* The M4 (T8132) build preloaded by the macOS 27.2 (26B123) stub. */
+#define AVE_FW_TEXT_CRC_T8132_26B123 0x99fc929a
+/* The M3 (T8122) build preloaded by the macOS 27.2 (26B123) stub. */
+#define AVE_FW_TEXT_CRC_T8122_26B123 0x918d70d3
+/*
+ * The M2 (T8112) build preloaded by the macOS 27.2 (26B123) stub, with the
+ * per-boot word at TEXT 0x4224 zeroed.
+ */
+#define AVE_FW_TEXT_CRC_T8112_26B123 0x077a3444
+/*
+ * The M5 build of macOS 27.2 (26B123; 27.2.1 26B131 ships it unchanged),
+ * AppleAVE2FW 9013.55.1: TEXT 0x154000, DATA 0x12c000, as 26A428's.
+ */
+#define AVE_FW_TEXT_CRC_T8142_26B123 0x24eb4625
 
 struct ave_ctx;
 
@@ -237,6 +255,16 @@ struct ave_variant {
 	u32 mbox_idle;
 	/* Restore DATA from the boot snapshot before every start, the first included. */
 	bool restore_data_first;
+	/*
+	 * The same encoder running another firmware build that a newer
+	 * bootloader preloads, with a start and command protocol of its own.
+	 * The firmware segment sizes the bootloader reserved select it.
+	 * NULL when there is none. Use builds[] when the builds differ only
+	 * in TEXT CRC (and command layout) but start the same way; use
+	 * next_build when a build needs other start fields (boot device,
+	 * handshake type, boot word, DATA handling) and has sizes of its own.
+	 */
+	const struct ave_variant *next_build;
 
 	size_t extra0_size;
 	/* Register sequence and boot/hello configuration have been qualified. */
@@ -503,6 +531,8 @@ struct ave_ctx {
 	struct v4l2_fh fh;
 	struct ave_dev *ave;
 	struct v4l2_ctrl_handler hdl;
+	struct v4l2_ctrl *hevc_profile_ctrl;
+	bool hevc_profile_auto; /* Main 10 was set by S_FMT, not the client */
 	struct v4l2_pix_format_mplane src_fmt;
 	struct v4l2_pix_format_mplane dst_fmt;
 	struct v4l2_fract timeperframe;
@@ -547,11 +577,15 @@ static inline struct ave_ctx *ave_file_to_ctx(struct file *file)
 	return container_of(file_to_v4l2_fh(file), struct ave_ctx, fh);
 }
 
-extern const struct ave_variant ave_t6000, ave_t6041, ave_t8112;
+extern const struct ave_variant ave_t6000, ave_t6041, ave_t8112, ave_t8132,
+	ave_m3;
 
 /* ave-fw.c */
 u64 ave_fw_vcbar(const struct ave_variant *variant, u64 text_iova);
 int ave_fw_probe(struct ave_dev *ave);
+bool ave_fw_sizes_match(const struct ave_variant *v, size_t text, size_t data);
+const struct ave_variant *ave_fw_select_build(const struct ave_variant *v,
+					      size_t text, size_t data);
 int ave_fw_text_id_crc(const void *text, size_t size, u32 cell_off,
 		       u64 data_iova, u32 *crc);
 int ave_fw_text_boot_crc(const void *text, size_t size, u32 word_off,

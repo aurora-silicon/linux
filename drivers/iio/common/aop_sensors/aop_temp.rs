@@ -6,6 +6,10 @@
 //! Its fake-HID report carries a signed Q16.16 Celsius value and an AOP
 //! timestamp. Calibration data, when supplied by the bootloader, is sent
 //! unchanged before reports are enabled.
+//!
+//! The AOP core creates a device for the service whenever the firmware
+//! announces it, and the driver binds to that device by name. A device tree
+//! node for the service is optional; it only carries the calibration.
 
 use core::{
     ffi::{c_int, c_void},
@@ -16,7 +20,7 @@ use core::{
 use kernel::{
     bindings, c_str,
     device::{self, Core},
-    module_platform_driver, new_spinlock, of, platform,
+    driver, new_spinlock, of, platform,
     prelude::*,
     soc::apple::aop::{EPICService, FakehidListener, FakehidRegistration, AOP},
     sync::{
@@ -25,6 +29,7 @@ use kernel::{
         Arc, SpinLock,
     },
     types::{ForeignOwnable, Opaque},
+    ThisModule,
 };
 
 const SUBTYPE_SET_PROPERTY: u16 = 4;
@@ -81,23 +86,26 @@ struct Control {
 
 impl Control {
     fn new(dev: &device::Device, aop: Arc<dyn AOP>, service: EPICService) -> Result<Arc<Self>> {
-        let node = dev.fwnode().ok_or(ENODEV)?;
         let mut packets = KVec::new();
-        for (prop, name) in CALIBRATION {
-            if !node.property_present(name) {
-                continue;
+        // Without a device tree node for the service there is no calibration
+        // to send; the sensor then runs on its defaults.
+        if let Some(node) = dev.fwnode() {
+            for (prop, name) in CALIBRATION {
+                if !node.property_present(name) {
+                    continue;
+                }
+                let len = node.property_count_elem::<u8>(name)?;
+                let data = node
+                    .property_read_array_vec::<u8>(name, len)?
+                    .required_by(dev)?;
+                let Some(packet) = location0_packet(&data) else {
+                    dev_err!(dev, "{:?} holds no calibration for location 0\n", name);
+                    return Err(EINVAL);
+                };
+                let mut owned = KVec::new();
+                owned.extend_from_slice(packet, GFP_KERNEL)?;
+                packets.push((prop, owned), GFP_KERNEL)?;
             }
-            let len = node.property_count_elem::<u8>(name)?;
-            let data = node
-                .property_read_array_vec::<u8>(name, len)?
-                .required_by(dev)?;
-            let Some(packet) = location0_packet(&data) else {
-                dev_err!(dev, "{:?} holds no calibration for location 0\n", name);
-                return Err(EINVAL);
-            };
-            let mut owned = KVec::new();
-            owned.extend_from_slice(packet, GFP_KERNEL)?;
-            packets.push((prop, owned), GFP_KERNEL)?;
         }
         if packets.is_empty() {
             dev_dbg!(
@@ -562,10 +570,30 @@ impl platform::Driver for IIOAopTempDriver {
     }
 }
 
-module_platform_driver! {
-    type: IIOAopTempDriver,
+/// The AOP core creates the device of a service, named after the service,
+/// whenever the firmware announces that service. Registering the driver under
+/// the same name lets the platform bus bind it on every machine whose AOP
+/// offers the service, with or without a device tree node for it.
+const SERVICE_NAME: &CStr = c_str!("als-temp");
+
+#[pin_data]
+struct IIOAopTempModule {
+    #[pin]
+    _driver: driver::Registration<platform::Adapter<IIOAopTempDriver>>,
+}
+
+impl kernel::InPlaceModule for IIOAopTempModule {
+    fn init(module: &'static ThisModule) -> impl PinInit<Self, Error> {
+        try_pin_init!(Self {
+            _driver <- driver::Registration::new(SERVICE_NAME, module),
+        })
+    }
+}
+
+module! {
+    type: IIOAopTempModule,
     name: "iio_aop_temp",
     description: "AOP temperature sensor driver",
     license: "Dual MIT/GPL",
-    alias: ["platform:iio_aop_temp"],
+    alias: ["platform:als-temp"],
 }

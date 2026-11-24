@@ -19,6 +19,7 @@ typedef uint64_t u64;
 #define dev_dbg(...) ((void)0)
 #define dev_warn(...) ((void)0)
 #define dev_err(...) ((void)0)
+#define dev_info(...) ((void)0)
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x, v) ((x) = (v))
 #define EXPORT_SYMBOL_GPL(x)
@@ -40,6 +41,10 @@ struct apple_atcphy {
 	bool tunnel_clock_on;
 	u8 tunnel_rate, tunnel_users, tunnel_dpin_rate[2];
 	unsigned tunnel_source[2];
+	bool tunnel_ack_stale;
+	struct {
+		bool prepared, changed, restored;
+	} cio_sleep;
 };
 struct phy {
 	const void *ops;
@@ -293,6 +298,22 @@ int main(int argc, char **argv)
 		unsigned saved = writes;
 		assert(clock_call(&phy, 0, 0, 0x14) == -EBUSY &&
 		       writes == saved);
+		return 0;
+	}
+	if (!strcmp(name, "stale-ack") || !strcmp(name, "unflagged-ack")) {
+		/* What a CIO sleep's PHY power cycle leaves: ACK, with no request. */
+		u32 ack = BIT(1);
+
+		memcpy(regs + AUSPLL_APB_CMD_OVERRIDE, &ack, 4);
+		d.tunnel_ack_stale = !strcmp(name, "stale-ack");
+		if (!d.tunnel_ack_stale) {
+			assert(clock_call(&phy, 0, 0, 0x14) == -EBUSY && !writes);
+			return 0;
+		}
+		assert(!clock_call(&phy, 0, 0, 0x14));
+		assert(d.tunnel_clock_on && !d.tunnel_ack_stale && stop_requests == 1);
+		assert(!clock_call(&phy, 0, 0, 0));
+		assert(!d.tunnel_clock_on && stop_requests == 2);
 		return 0;
 	}
 	if (!strcmp(name, "invalid-source")) {
