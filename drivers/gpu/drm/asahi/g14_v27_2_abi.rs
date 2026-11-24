@@ -71,6 +71,52 @@ impl GrowRequest {
     }
 }
 
+/// Control-object recovery words (the recovery block G16 and M3 answer in their FirmwareData):
+/// the u64 recovery generation, which growth requests also carry; 0x10 on, the recovery phase
+/// (firmware 1 -> host 2 -> firmware 3 -> host 0); the snapshot of the work the firmware
+/// stopped, {flags u32, target u32} pairs, at the same offset as in the M3 object, up to the
+/// next recovery field. Seen on the J473: a stopped tiler {0x1f, its next stamp}, a stopped
+/// compute {0x7, its next stamp}.
+pub(crate) const RECOVERY_GENERATION: usize = 0x4bf0;
+pub(crate) const RECOVERY_PHASE: usize = 0x4c00;
+pub(crate) const RECOVERY_SNAPSHOT: usize = 0x4298;
+const RECOVERY_SNAPSHOT_END: usize = 0x4b20;
+pub(crate) const RECOVERY_SNAPSHOT_ENTRIES: usize = (RECOVERY_SNAPSHOT_END - RECOVERY_SNAPSHOT) / 8;
+
+/// A snapshot entry of a stopped tiler (valid + tiler bits): its TPC storage must be cleared
+/// before the host answers phase 2, as G16 does.
+pub(crate) const fn stopped_tiler(flags: u32) -> bool {
+    flags & 9 == 9
+}
+
+/// Event ring record kinds.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EventKind {
+    /// 0: the firmware stopped on a GPU fault and entered recovery.
+    Fault,
+    /// 4: the firmware timed out a command (slot at `TIMEOUT_SLOT_OFFSET`) and entered recovery.
+    Timeout,
+    /// 6: a buffer growth request.
+    Grow,
+    /// 7: the firmware rejected a channel record.
+    ChannelError,
+    /// Anything else (stage flags, statistics): nothing for the host to answer.
+    Notification,
+}
+
+/// Byte offset of the slot a timeout record names.
+pub(crate) const TIMEOUT_SLOT_OFFSET: usize = 0x0c;
+
+pub(crate) const fn event_kind(kind: u32) -> EventKind {
+    match kind {
+        0 => EventKind::Fault,
+        4 => EventKind::Timeout,
+        6 => EventKind::Grow,
+        7 => EventKind::ChannelError,
+        _ => EventKind::Notification,
+    }
+}
+
 #[cfg_attr(not(test), kunit_tests(asahi_g14_fw_queues))]
 #[cfg_attr(test, allow(dead_code))]
 mod tests {
@@ -147,5 +193,36 @@ mod tests {
                 0
             ]
         );
+    }
+
+    #[test]
+    fn recovery_events_are_decoded_and_others_stay_notifications() {
+        assert_eq!(event_kind(0), EventKind::Fault);
+        assert_eq!(event_kind(4), EventKind::Timeout);
+        assert_eq!(event_kind(6), EventKind::Grow);
+        assert_eq!(event_kind(7), EventKind::ChannelError);
+        for kind in [1, 2, 3, 5, 8, u32::MAX] {
+            assert_eq!(event_kind(kind), EventKind::Notification);
+        }
+        // The H1 record [4, 0, 0, 1, ...]: slot in the fourth word.
+        assert_eq!(TIMEOUT_SLOT_OFFSET / 4, 3);
+    }
+
+    #[test]
+    fn recovery_block_geometry_matches_the_g16_order() {
+        // Phase 0x10 above the u64 generation, as in the G16/M3 FirmwareData.
+        assert_eq!(RECOVERY_PHASE - RECOVERY_GENERATION, 0x10);
+        assert_eq!(RECOVERY_SNAPSHOT_ENTRIES, 273);
+        assert!(RECOVERY_SNAPSHOT + 8 * RECOVERY_SNAPSHOT_ENTRIES <= RECOVERY_SNAPSHOT_END);
+        assert!(RECOVERY_SNAPSHOT_END <= RECOVERY_GENERATION);
+    }
+
+    #[test]
+    fn only_a_valid_tiler_entry_clears_tiler_storage() {
+        // J473 snapshots: stopped tiler {0x1f, ..}, stopped compute {0x7, ..}.
+        assert!(stopped_tiler(0x1f));
+        assert!(!stopped_tiler(0x7));
+        assert!(!stopped_tiler(0x8));
+        assert!(stopped_tiler(0x9 | (0x70 << 4)));
     }
 }

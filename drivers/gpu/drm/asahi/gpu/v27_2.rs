@@ -10,7 +10,7 @@
 
 use super::*;
 use kernel::device;
-use crate::g14_v27_2_abi::{self, GrowRequest, QueueError};
+use crate::g14_v27_2_abi::{self, EventKind, GrowRequest, QueueError};
 use crate::g17::fw::m5::initdata as abi;
 use crate::hw::{RegisterBaseV27_2, RegisterV27_2};
 use crate::m3::m3_init_26 as directory26;
@@ -40,6 +40,11 @@ const STATISTICS_RING: usize = 16;
 /// Ring geometries: the trace ring has 512 records of 0x48 bytes, the others 256.
 const TRACE_RECORDS: u32 = 512;
 const RING_RECORDS: u32 = 256;
+use crate::g14_v27_2_abi::{
+    RECOVERY_GENERATION as CONTROL_RECOVERY_GENERATION, RECOVERY_PHASE as CONTROL_RECOVERY_PHASE,
+    RECOVERY_SNAPSHOT as CONTROL_RECOVERY_SNAPSHOT,
+};
+pub(crate) use crate::g14_v27_2_abi::{stopped_tiler, RECOVERY_SNAPSHOT_ENTRIES};
 /// Queue capacity at position block +0x50 (16 x the 0x50 channels).
 const QUEUE_CAPACITY: u32 = 0x500;
 /// Upper performance-state cap, in hundredths, at globals +0x98: the first state above idle.
@@ -473,6 +478,11 @@ impl CommandPool {
 }
 
 pub(crate) enum FirmwareEvent {
+    /// Kind 0: the firmware stopped on a GPU fault and halted for recovery.
+    Fault,
+    /// Kind 4: the firmware timed out a command (the slot it names at +0xc) and halted for
+    /// recovery.
+    Timeout { slot: i32 },
     Grow(GrowRequest),
     ChannelError,
     Notification,
@@ -557,6 +567,15 @@ impl RootV27_2 {
     pub(crate) fn render_queue(&self, dm: usize) -> (QueueInfo, event::EventValue) {
         let queue = &self.render_queues[dm];
         (queue.info(self.render_states[dm]), queue.event.current_noncoherent())
+    }
+
+    /// Whether the render queue's retired position reached `target`, stamp or not: a command
+    /// the firmware stopped for recovery leaves the queue without writing its stamp.
+    pub(crate) fn render_retired(&self, dm: usize, target: u32) -> Result<bool> {
+        let queue = &self.render_queues[dm];
+        crate::pgtable::clean_invalidate_poc(queue.positions.as_slice().as_ptr(), 0x60);
+        crate::pgtable::poc_barrier();
+        Ok(Self::word(&queue.positions, 0)? == target)
     }
 
     pub(crate) fn render_done(&self, dm: usize, target: u32, stamp: event::EventValue) -> Result<bool> {
@@ -708,14 +727,37 @@ impl RootV27_2 {
         crate::pgtable::clean_invalidate_poc(ring.as_slice()[at..].as_ptr(), RECEIVE_BYTES);
         crate::pgtable::poc_barrier();
         let word = |offset| Self::word(ring, at + offset);
-        let event = match word(0)? {
-            6 => FirmwareEvent::Grow(GrowRequest::decode([
+        let event = match g14_v27_2_abi::event_kind(word(0)?) {
+            EventKind::Grow => FirmwareEvent::Grow(GrowRequest::decode([
                 word(4)?, word(8)?, word(0x0c)?, word(0x10)?, word(0x14)?, word(0x18)?,
             ])),
-            7 => FirmwareEvent::ChannelError,
-            _ => FirmwareEvent::Notification,
+            EventKind::Fault => FirmwareEvent::Fault,
+            EventKind::Timeout => FirmwareEvent::Timeout {
+                slot: word(g14_v27_2_abi::TIMEOUT_SLOT_OFFSET)? as i32,
+            },
+            EventKind::ChannelError => FirmwareEvent::ChannelError,
+            EventKind::Notification => FirmwareEvent::Notification,
         };
         Ok(Some((read, event)))
+    }
+
+    /// Reads control words from `from` into `out`.
+    pub(crate) fn control_snapshot(&self, from: usize, out: &mut [u32]) -> Result {
+        let at = self.control.as_slice()[from..].as_ptr();
+        crate::pgtable::clean_invalidate_poc(at, out.len() * 4);
+        crate::pgtable::poc_barrier();
+        for (i, w) in out.iter_mut().enumerate() {
+            *w = Self::word(&self.control, from + 4 * i)?;
+        }
+        Ok(())
+    }
+
+    /// Writes one control word and makes it visible to the firmware.
+    pub(crate) fn control_store(&self, at: usize, value: u32) -> Result {
+        self.control.shared_index(at)?.store(value, Ordering::Release);
+        crate::pgtable::clean_poc(self.control.as_slice()[at..].as_ptr(), 4);
+        crate::pgtable::poc_barrier();
+        Ok(())
     }
 
     pub(crate) fn consume_event(&self, cursor: u32) -> Result {
@@ -726,8 +768,31 @@ impl RootV27_2 {
         Ok(())
     }
 
+    /// The recovery phase. The firmware publishes 1 after it reported a fault or a command
+    /// timeout and stopped every queue; it runs nothing until the host's answers.
+    pub(crate) fn recovery_phase(&self) -> Result<u32> {
+        let mut word = [0u32];
+        self.control_snapshot(CONTROL_RECOVERY_PHASE, &mut word)?;
+        Ok(word[0])
+    }
+
+    /// Answers a recovery phase (2 at phase 1, 0 at phase 3).
+    pub(crate) fn answer_recovery(&self, phase: u32) -> Result {
+        self.control_store(CONTROL_RECOVERY_PHASE, phase)
+    }
+
+    /// Snapshot entry `i` of the stopped work: (flags, target). Bit 0 of flags marks a valid
+    /// entry; the first invalid one ends the snapshot.
+    pub(crate) fn recovery_entry(&self, i: usize) -> Result<(u32, u32)> {
+        if i >= RECOVERY_SNAPSHOT_ENTRIES { return Err(EINVAL); }
+        let mut words = [0u32; 2];
+        self.control_snapshot(CONTROL_RECOVERY_SNAPSHOT + 8 * i, &mut words)?;
+        Ok((words[0], words[1]))
+    }
+
+    /// The recovery generation (u64). Growth requests carry the value current when sent.
     pub(crate) fn halt_count(&self) -> Result<u64> {
-        const OFFSET: usize = 0x4bf0;
+        const OFFSET: usize = CONTROL_RECOVERY_GENERATION;
         crate::pgtable::clean_invalidate_poc(self.control.as_slice()[OFFSET..].as_ptr(), 8);
         crate::pgtable::poc_barrier();
         Ok(u64::from(Self::word(&self.control, OFFSET)?)

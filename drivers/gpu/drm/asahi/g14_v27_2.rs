@@ -40,6 +40,14 @@ use crate::{
     m3::m3_submit::{Command, Packet},
 };
 
+/// The recovery handshake is the one G16 answers: share its decisions (which phase the host may
+/// answer, how a snapshot entry decodes, the recovery-storm window) instead of restating them.
+/// Its FirmwareData offsets are G16's own and unused here.
+#[path = "g16/recovery/logic.rs"]
+#[allow(dead_code)]
+mod recovery_logic;
+use recovery_logic::{RecoveryAction, SnapshotEntry};
+
 /// RTKit endpoints of the GPU firmware.
 const EP_FIRMWARE: u8 = 0x20;
 const EP_DOORBELL: u8 = 0x21;
@@ -58,6 +66,14 @@ const RETIRE_WAIT_US: i64 = 2000;
 const RESOURCE_RETRY_MS: u32 = 10;
 /// Work item for the poll. Ordinary firmware notifications can still queue immediate work.
 const RETRY_WORK: u64 = 1;
+/// The firmware's recovery handshake (the G16/M3 order and limits): phase 1 follows the error
+/// event within 50 ms; the whole handshake within 1 s; then the stopped work leaves its queue.
+const PHASE1_WAIT_MS: i64 = 50;
+const HANDSHAKE_MS: i64 = 1000;
+const RECOVERY_DRAIN_MS: i64 = 1000;
+/// Further recoveries answered while the stopped work drains (work behind it can time out in
+/// turn) before the runtime gives up.
+const FURTHER_RECOVERIES: u32 = 4;
 
 struct FirmwareWait {
     since: Instant<Monotonic>,
@@ -399,6 +415,8 @@ struct Inflight {
     /// Queue publications up to and including this command, counted from take-over.
     ordinal: u64,
     started: Instant<Monotonic>,
+    /// Set when the firmware stopped this command: it fails its packet when it leaves the queue.
+    doomed: Option<Error>,
     _bind: mmu::VmBind,
 }
 
@@ -411,6 +429,7 @@ struct RenderFlight {
     stamps: [event::EventValue; 2],
     targets: [u32; 2],
     started: Instant<Monotonic>,
+    doomed: Option<Error>,
 }
 
 struct State {
@@ -447,6 +466,12 @@ struct State {
     accepting: bool,
     submitted: u64,
     retired: u64,
+    /// A fault or timeout the firmware reported (error, named slot), answered by `recover`.
+    firmware_error: Option<(Error, i32)>,
+    recoveries: u64,
+    /// Recovery-storm window (`recovery_logic::admit`): its start and the recoveries in it.
+    recovery_window: u64,
+    recovery_count: u32,
 }
 
 impl State {
@@ -706,7 +731,8 @@ impl Runtime {
         let ordinal = state.published + 1;
         // Commit ownership before the firmware can see the new work.
         state.inflight.push(Inflight { packet: packet.clone(), last, stamp, slot, ordinal,
-            publication_error: None, started: Instant::now(), _bind: bind }, GFP_KERNEL)?;
+            publication_error: None, started: Instant::now(), doomed: None, _bind: bind },
+            GFP_KERNEL)?;
         packet.mark_published();
         submission.publish();
         state.last = stamp;
@@ -762,7 +788,7 @@ impl Runtime {
         let fs_post = state.root.stage_render(FRAGMENT, &fs_work)?;
         state.rendering = Some(RenderFlight {
             packet: packet.clone(), last, bind, scene, slots, stamps,
-            targets: [ta_post.target(), fs_post.target()], started: Instant::now(),
+            targets: [ta_post.target(), fs_post.target()], started: Instant::now(), doomed: None,
         });
         queue.published();
         packet.mark_published();
@@ -801,19 +827,26 @@ impl Runtime {
 
     fn retire_render(&self, state: &mut State) -> Result {
         let Some(flight) = state.rendering.as_ref() else { return Ok(()); };
-        let mut ta_done = state.root.render_done(TILER, flight.targets[TILER], flight.stamps[TILER])?;
-        let mut fs_done = state.root.render_done(FRAGMENT, flight.targets[FRAGMENT], flight.stamps[FRAGMENT])?;
+        let (targets, stamps, doomed, started) =
+            (flight.targets, flight.stamps, flight.doomed, flight.started);
+        let done = |root: &RootV27_2, dm: usize| -> Result<bool> {
+            // A command the firmware stopped leaves its queue without reaching its stamp.
+            if doomed.is_some() { root.render_retired(dm, targets[dm]) }
+            else { root.render_done(dm, targets[dm], stamps[dm]) }
+        };
+        let mut ta_done = done(&state.root, TILER)?;
+        let mut fs_done = done(&state.root, FRAGMENT)?;
         if !(ta_done && fs_done)
-            && state.root.render_queue(TILER).1 >= flight.stamps[TILER]
-            && state.root.render_queue(FRAGMENT).1 >= flight.stamps[FRAGMENT]
+            && state.root.render_queue(TILER).1 >= stamps[TILER]
+            && state.root.render_queue(FRAGMENT).1 >= stamps[FRAGMENT]
         {
             // As on the compute queue, the final stamp precedes the retired cursor and
             // there may be no separate notification when the cursor changes.
             let start = Instant::<Monotonic>::now();
             while !(ta_done && fs_done) && start.elapsed() < Delta::from_micros(RETIRE_WAIT_US) {
                 fsleep(Delta::from_micros(20));
-                ta_done = state.root.render_done(TILER, flight.targets[TILER], flight.stamps[TILER])?;
-                fs_done = state.root.render_done(FRAGMENT, flight.targets[FRAGMENT], flight.stamps[FRAGMENT])?;
+                ta_done = done(&state.root, TILER)?;
+                fs_done = done(&state.root, FRAGMENT)?;
             }
         }
         if ta_done && fs_done {
@@ -821,18 +854,194 @@ impl Runtime {
             for slot in flight.slots {
                 self.retire_slot(state, slot);
             }
-            if flight.last {
+            if let Some(err) = flight.doomed {
+                self.fail_doomed(state, &flight.packet, err);
+            } else if flight.last {
                 flight.packet.retired();
             } else if !state.pending(&flight.packet) {
                 flight.packet.release_guard();
             }
-        } else if flight.started.elapsed() > Delta::from_millis(COMMAND_TIMEOUT_MS) {
+        } else if started.elapsed() > Delta::from_millis(COMMAND_TIMEOUT_MS) {
             dev_err!(self.dev, "GPU: render timed out: TA retired={} fragment retired={}\n", ta_done, fs_done);
+            if state.root.recovery_phase()? == 1 && doomed.is_none() {
+                // The firmware stopped it and halted, but its event was not seen.
+                return self.recover(state, ETIMEDOUT, -1);
+            }
             state.root.log_timeout(&self.dev);
             state.fault.log(&self.dev);
             return Err(ETIMEDOUT);
         }
         Ok(())
+    }
+
+    /// Fails a packet the firmware stopped, once none of its commands is in a queue: its
+    /// unpublished commands are withdrawn, and its VM records the error (the client sees a
+    /// lost context). Other clients' work is not touched.
+    fn fail_doomed(&self, state: &mut State, packet: &Arc<Packet>, err: Error) {
+        if state.owns(packet) { return; }
+        if let Some(i) = state.pending.iter().position(|(p, _)| Arc::ptr_eq(p, packet)) {
+            let _ = state.pending.remove(i);
+        }
+        packet.release_guard();
+        // Record it even if a racing scheduler timeout already claimed the fence (as fail_all).
+        if let Some(status) = packet.vm.status() { status.record(err); }
+        packet.finish(Err(err));
+    }
+
+    /// Marks the work the firmware stopped: the render pair if one is published (a render is
+    /// published alone), else the oldest unretired compute command and the rest of its packet.
+    /// Returns whether anything was published.
+    fn blame(&self, state: &mut State, error: Error, slot: i32) -> bool {
+        if let Some(flight) = state.rendering.as_mut() {
+            flight.doomed = Some(error);
+            let owner = &flight.packet.owner;
+            dev_err!(self.dev, "GPU: stopped render of {}[{}] (slot {}, {:?})\n",
+                     owner.process(), owner.pid, slot, error);
+            return true;
+        }
+        let Some(packet) = state.inflight.first().map(|f| f.packet.clone()) else {
+            dev_err!(self.dev, "GPU: firmware stopped with nothing published (slot {})\n", slot);
+            return false;
+        };
+        for flight in state.inflight.iter_mut().filter(|f| Arc::ptr_eq(&f.packet, &packet)) {
+            flight.doomed = Some(error);
+        }
+        dev_err!(self.dev, "GPU: stopped compute of {}[{}] (slot {}, {:?})\n",
+                 packet.owner.process(), packet.owner.pid, slot, error);
+        true
+    }
+
+    /// Whether every command marked by `blame` has left its queue.
+    fn doomed_retired(&self, state: &mut State) -> Result<bool> {
+        if let Some(flight) = state.rendering.as_ref() {
+            if flight.doomed.is_some() {
+                return Ok(state.root.render_retired(TILER, flight.targets[TILER])?
+                    && state.root.render_retired(FRAGMENT, flight.targets[FRAGMENT])?);
+            }
+        }
+        let Some(ordinal) =
+            state.inflight.iter().rev().find(|f| f.doomed.is_some()).map(|f| f.ordinal)
+            else { return Ok(true); };
+        self.advance(state)?;
+        Ok(state.retired_total >= ordinal)
+    }
+
+    /// Waits up to `ms` for the firmware's next recovery phase: 1 before the host answered,
+    /// 3 with the same `generation` after it answered 2. Ok(None) on timeout; Err(EPROTO) on
+    /// any phase the protocol does not allow (`recovery_logic::action`).
+    fn wait_recovery(&self, state: &mut State, answered: bool, generation: u64, ms: i64)
+        -> Result<Option<RecoveryAction>> {
+        let start = Instant::<Monotonic>::now();
+        loop {
+            let phase = state.root.recovery_phase()?;
+            let same = !answered || state.root.halt_count()? == generation;
+            match recovery_logic::action(phase, answered, same) {
+                RecoveryAction::Wait => {}
+                RecoveryAction::ProtocolError => {
+                    dev_err!(self.dev, "GPU: recovery phase {} (answered {}, same generation {})\n",
+                             phase, answered, same);
+                    return Err(EPROTO);
+                }
+                found => return Ok(Some(found)),
+            }
+            if start.elapsed() > Delta::from_millis(ms) { return Ok(None); }
+            if state.peer.is_crashed() { return Err(EIO); }
+            let _ = state.root.drain();
+            fsleep(Delta::from_millis(1));
+        }
+    }
+
+    /// The firmware recovery handshake after a fault or command timeout (the G16/M3 protocol).
+    /// The firmware stops every queue and publishes phase 1 with a generation and a snapshot of
+    /// the stopped work; the host marks that work (`blame`), clears the tiler storage of a
+    /// stopped tiler, answers 2, waits for 3 with the same generation and answers 0. The stopped
+    /// work then leaves its queue and fails only its own packet and VM; the next recoveries
+    /// while it drains are answered the same way, a bounded number of times. Errors here fail
+    /// all work (the runtime is not trusted).
+    fn recover(&self, state: &mut State, error: Error, slot: i32) -> Result {
+        state.root.log_timeout(&self.dev);
+        let mut rounds = 0;
+        let mut blamed = false;
+        loop {
+            if self.wait_recovery(state, false, 0, PHASE1_WAIT_MS)?.is_none() {
+                dev_err!(self.dev, "GPU: firmware reported {:?} (slot {}) but did not enter recovery\n",
+                         error, slot);
+                return Err(ETIMEDOUT);
+            }
+            let now = <Monotonic as kernel::time::ClockSource>::ktime_get() as u64;
+            if !recovery_logic::admit(now, &mut state.recovery_window, &mut state.recovery_count) {
+                dev_err!(self.dev, "GPU: {} recoveries in {} s; not answering more\n",
+                         recovery_logic::WINDOW_LIMIT, recovery_logic::WINDOW_NS / 1_000_000_000);
+                return Err(EIO);
+            }
+            let generation = state.root.halt_count()?;
+            let mut entries = 0;
+            let mut stopped_tiler = false;
+            for i in 0..gpu::RECOVERY_SNAPSHOT_ENTRIES {
+                let (flags, target) = state.root.recovery_entry(i)?;
+                let Some(entry) = SnapshotEntry::decode(flags, target) else { break; };
+                entries += 1;
+                stopped_tiler |= gpu::stopped_tiler(entry.flags);
+                if entries <= 8 {
+                    dev_err!(self.dev,
+                             "GPU: recovery {} entry {}: flags {:#x} (event {:#x}) target {:#x}\n",
+                             generation, i, entry.flags, entry.event, entry.target);
+                }
+            }
+            if !blamed {
+                blamed = true;
+                self.blame(state, error, slot);
+            }
+            if stopped_tiler {
+                if let Some(flight) = state.rendering.as_ref() {
+                    let ta_left = state.root.render_retired(TILER, flight.targets[TILER])?;
+                    if !ta_left {
+                        flight.scene.clear_tpc()?;
+                        dev_err!(self.dev, "GPU: cleared the stopped tiler's TPC storage\n");
+                    }
+                }
+            }
+            let start = Instant::<Monotonic>::now();
+            state.root.answer_recovery(2)?;
+            let mut reached = self.wait_recovery(state, true, generation, HANDSHAKE_MS / 2)?;
+            if reached.is_none() {
+                dev_warn!(self.dev, "GPU: no recovery phase 3 in {} ms; ringing the device-control doorbell\n",
+                          HANDSHAKE_MS / 2);
+                let _ = state.peer.as_mut().send_message(EP_DOORBELL, gpu::DEVICE_CONTROL_KICK);
+                reached = self.wait_recovery(state, true, generation, HANDSHAKE_MS / 2)?;
+            }
+            if reached != Some(RecoveryAction::Resume) {
+                return Err(ETIMEDOUT);
+            }
+            state.root.answer_recovery(0)?;
+            dev_err!(self.dev, "GPU: recovery {} answered in {} ms ({} snapshot entries)\n",
+                     generation, start.elapsed().as_millis(), entries);
+            let start = Instant::<Monotonic>::now();
+            loop {
+                let _ = state.root.drain();
+                if self.doomed_retired(state)? {
+                    state.recoveries += 1;
+                    // Work behind the stopped command waited out the recovery: restart its clocks.
+                    let now = Instant::now();
+                    for flight in state.inflight.iter_mut() { flight.started = now; }
+                    dev_err!(self.dev,
+                             "GPU: recovered ({} so far): stopped work left the queue after {} ms\n",
+                             state.recoveries, start.elapsed().as_millis());
+                    return Ok(());
+                }
+                if state.root.recovery_phase()? == 1 { break; }
+                if start.elapsed() > Delta::from_millis(RECOVERY_DRAIN_MS) {
+                    dev_err!(self.dev, "GPU: stopped work did not leave the queue\n");
+                    state.root.log_timeout(&self.dev);
+                    return Err(ETIMEDOUT);
+                }
+                fsleep(Delta::from_millis(1));
+            }
+            rounds += 1;
+            dev_err!(self.dev, "GPU: firmware entered recovery again while the stopped work drained ({})\n",
+                     rounds);
+            if rounds > FURTHER_RECOVERIES { return Err(EIO); }
+        }
     }
 
     /// Reads the queue's retired position into `retired_total`.
@@ -885,6 +1094,15 @@ impl Runtime {
                     state.root.consume_event(cursor)?;
                     return Err(EIO);
                 }
+                FirmwareEvent::Timeout { slot } => {
+                    dev_err!(self.dev, "GPU firmware timed out a command (slot {})\n", slot);
+                    state.firmware_error.get_or_insert((ETIMEDOUT, slot));
+                }
+                FirmwareEvent::Fault => {
+                    dev_err!(self.dev, "GPU firmware reported a GPU fault\n");
+                    state.fault.log(&self.dev);
+                    state.firmware_error.get_or_insert((EIO, -1));
+                }
                 FirmwareEvent::Grow(_) | FirmwareEvent::Notification => {}
             }
             state.waiting_control = None;
@@ -907,6 +1125,13 @@ impl Runtime {
             self.fail_all(state, err);
             return;
         }
+        if let Some((error, slot)) = state.firmware_error.take() {
+            if let Err(err) = self.recover(state, error, slot) {
+                dev_err!(self.dev, "GPU: recovery failed ({:?}); failing all work\n", err);
+                self.fail_all(state, err);
+                return;
+            }
+        }
         if let Err(err) = self.retire_render(state) { self.fail_all(state, err); return; }
         if let Err(e) = self.advance(state) { self.fail_all(state, e); return; }
         // The completion stamp is written before the firmware's post-processing advances the
@@ -925,10 +1150,14 @@ impl Runtime {
         }
         while !state.inflight.is_empty() {
             let front = &state.inflight[0];
-            if state.retired_total >= front.ordinal {
+            let (ordinal, started, unblamed, expected) =
+                (front.ordinal, front.started, front.doomed.is_none(), front.stamp.raw());
+            if state.retired_total >= ordinal {
                 if let Ok(done) = state.inflight.remove(0) {
                     self.retire_slot(state, done.slot);
-                    if let Some(err) = done.publication_error {
+                    if let Some(err) = done.doomed {
+                        self.fail_doomed(state, &done.packet, err);
+                    } else if let Some(err) = done.publication_error {
                         done.packet.release_guard();
                         done.packet.finish(Err(err));
                     } else if done.last {
@@ -939,9 +1168,17 @@ impl Runtime {
                 }
                 continue;
             }
-            if front.started.elapsed() > Delta::from_millis(COMMAND_TIMEOUT_MS) {
+            if started.elapsed() > Delta::from_millis(COMMAND_TIMEOUT_MS) {
                 dev_err!(self.dev, "GPU: compute command timed out: stamp={:#x} expected={:#x} submitted={} completed={}\n",
-                         state.queue_stamp(), front.stamp.raw(), state.submitted, state.retired);
+                         state.queue_stamp(), expected, state.submitted, state.retired);
+                if unblamed && state.root.recovery_phase().unwrap_or(0) == 1 {
+                    // The firmware stopped it and halted, but its event was not seen.
+                    if let Err(err) = self.recover(state, ETIMEDOUT, -1) {
+                        self.fail_all(state, err);
+                        return;
+                    }
+                    continue;
+                }
                 state.root.log_timeout(&self.dev);
                 state.fault.log(&self.dev);
                 self.fail_all(state, ETIMEDOUT);
@@ -1146,6 +1383,10 @@ impl Backend {
             accepting: true,
             submitted: 0,
             retired: 0,
+            firmware_error: None,
+            recoveries: 0,
+            recovery_window: 0,
+            recovery_count: 0,
         });
         // From here the firmware's messages run the service; one run consumes anything it
         // published before.

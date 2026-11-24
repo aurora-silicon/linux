@@ -76,6 +76,11 @@ impl Prep {
     pub(crate) fn slot(&self) -> u32 {
         self.scene.slot()
     }
+
+    /// Clears the tiler's TPC storage after a firmware recovery stopped the tiler.
+    pub(crate) fn clear_tpc(&self) -> Result {
+        self.scene.clear_tpc(self.tile.tpc_size)
+    }
 }
 
 fn to_cmdbuf(r: &UapiRenderCommand) -> kernel::uapi::drm_asahi_cmd_render {
