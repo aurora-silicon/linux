@@ -27,6 +27,12 @@ mod g18;
 #[cfg(CONFIG_DRM_ASAHI_M5)]
 mod m5;
 mod gpu;
+#[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+mod g14_v27_2;
+#[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+mod g14_v27_2_abi;
+#[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+mod g14_v27_2_render;
 mod hw;
 mod initdata;
 mod m3;

@@ -62,11 +62,8 @@ static struct {
 	struct device *power_hwmon;
 	unsigned int rail_mw[3];
 	int power_error;
-	u64 power_report_ns;
 	u64 gpu_epoch;
 	bool power_polling;
-	/* The shared measured-rail power budget restricts the CPUs and the GPU. */
-	bool power_budget;
 	unsigned int guard_level;
 	bool enabled;
 	long cached_mc;
@@ -95,38 +92,18 @@ module_param_named(sample_count, pmp_thermal.sample_count, ullong, 0444);
 module_param_named(governor_count, pmp_thermal.governor_count, ullong, 0444);
 module_param_named(ready, pmp_thermal.ready, bool, 0444);
 
-/*
- * The shared measured-rail power budget below is the fanless Airs' policy:
- * 8 W sustained for the CPU and GPU rails together, a 600 J burst, and a
- * slow climb toward a die temperature target. Machines whose device tree
- * describes one or more SMC fans (fan-* children under apple,smc-hwmon)
- * report the rails without restricting CPU/GPU states; the die protection,
- * thermal governor and critical shutdown still apply.
- */
-static bool apple_pmp_machine_has_fan(void)
-{
-	for_each_compatible_node_scoped(hwmon, NULL, "apple,smc-hwmon") {
-		if (!of_device_is_available(hwmon))
-			continue;
-		for_each_available_child_of_node_scoped(hwmon, child) {
-			if (of_node_name_prefix(child, "fan-"))
-				return true;
-		}
-	}
-	return false;
-}
-
 static int apple_pmp_power_status(char *buffer, const struct kernel_param *kp)
 {
 	struct apple_pmp_power_policy *p = &pmp_thermal.power;
 
 	guard(mutex)(&pmp_thermal.lock);
 	return scnprintf(buffer, PAGE_SIZE,
-		"ns=%llu p_mw=%u e_mw=%u gpu_mw=%u total_mw=%d sustainable_mw=%d allowed_mw=%d credit_mj=%lld filtered_mc=%d p_level=%u e_level=%u gpu_level=%u fault=%d error=%d\n",
+		"ns=%llu p_mw=%u e_mw=%u gpu_mw=%u total_mw=%d sustainable_mw=%d allowed_mw=%d credit_mj=%lld filtered_mc=%d p_level=%u e_level=%u gpu_level=%u fault=%d error=%d budget=%d\n",
 		p->last_ns, pmp_thermal.rail_mw[0], pmp_thermal.rail_mw[1],
 		pmp_thermal.rail_mw[2], p->total_mw, p->sustainable_mw,
 		p->allowed_mw, p->credit_mj, p->filtered_mc,
-		p->level[0], p->level[1], p->level[2], p->fault, pmp_thermal.power_error);
+		p->level[0], p->level[1], p->level[2], p->fault, pmp_thermal.power_error,
+		!p->unbudgeted);
 }
 static const struct kernel_param_ops apple_pmp_power_status_ops = {
 	.get = apple_pmp_power_status,
@@ -205,14 +182,10 @@ static void apple_pmp_power_work(struct work_struct *work)
 	 * for a read started in its own epoch, even if detach/attach was brief.
 	 */
 	u64 epoch = apple_pmp_gpu_epoch(pmp_thermal.sensors);
-	bool budget = pmp_thermal.power_budget;
 	bool dark = false;
 	u64 now;
 	int ret;
 
-	/* Without a budget a slow SMC read must not let the GPU's level go stale. */
-	if (!budget && epoch)
-		apple_pmp_gpu_publish(pmp_thermal.sensors, epoch, 0, ktime_get_ns());
 	ret = apple_pmp_power_read_rails(mw);
 	/* The running reader cannot read zero on both CPU rails. A firmware
 	 * reset/all-zero image must not refill the energy bucket; an idle
@@ -243,10 +216,8 @@ static void apple_pmp_power_work(struct work_struct *work)
 			  now - pmp_thermal.cooling.last_ns > 500000000ULL))
 		ret = -EAGAIN;
 	pmp_thermal.power_error = ret;
-	if (!ret) {
+	if (!ret)
 		memcpy(pmp_thermal.rail_mw, mw, sizeof(mw));
-		pmp_thermal.power_report_ns = now;
-	}
 	if (pmp_thermal.gpu_epoch != epoch) {
 		pmp_thermal.gpu_epoch = epoch;
 		p->level[2] = 8;
@@ -258,30 +229,25 @@ static void apple_pmp_power_work(struct work_struct *work)
 		/*
 		 * Nothing else restricts the GPU's budget while the sensors are
 		 * dark: a zero publication selects full protection, and the next
-		 * real budget sample republishes its level at once.
+		 * real budget sample republishes its level at once. On fan-cooled
+		 * boards there is no temperature-driven energy budget, so keep
+		 * rail freshness and hwmon totals current while dark instead of
+		 * turning a >2 s dark span into a fault clamp on wake.
 		 */
-		if (budget)
-			apple_pmp_gpu_publish(pmp_thermal.sensors, epoch, 8, 0);
-		else
-			apple_pmp_gpu_publish(pmp_thermal.sensors, epoch, 0,
-					      active & BIT(2) ? now : 0);
+		if (p->unbudgeted)
+			apple_pmp_power_dark(p, now, mw);
+		apple_pmp_gpu_publish(pmp_thermal.sensors, epoch, 8, 0);
 	} else {
 		apple_pmp_power_sample(p, now, mw, pmp_thermal.cached_mc, ret);
-		if (!budget) {
-			/* Reported only: the samples still fill the hwmon channels. */
-			p->level[0] = 0;
-			p->level[1] = 0;
-			p->level[2] = 0;
-		}
 		apple_pmp_gpu_publish(pmp_thermal.sensors, epoch, p->level[2],
-				      active & BIT(2) ? (budget ? p->last_ns : now) : 0);
+				      active & BIT(2) ? p->last_ns : 0);
 	}
 	pr_debug("apple-pmp-thermal: power ns=%llu mc=%ld p_mw=%u e_mw=%u gpu_mw=%u total_mw=%d sustainable_mw=%d allowed_mw=%d credit_mj=%lld p_level=%u e_level=%u gpu_level=%u error=%d\n",
 		now, pmp_thermal.cached_mc, mw[0], mw[1], mw[2], p->total_mw,
 		p->sustainable_mw, p->allowed_mw, p->credit_mj,
 		p->level[0], p->level[1], p->level[2], ret);
 	mutex_unlock(&pmp_thermal.lock);
-	if (ret && budget)
+	if (ret)
 		pr_warn_ratelimited("apple-pmp-thermal: power telemetry error %d, retaining minimum CPU/GPU ceilings\n",
 				    ret);
 	schedule_delayed_work(&pmp_thermal.power_work, msecs_to_jiffies(500));
@@ -299,20 +265,11 @@ static int apple_pmp_power_read(struct device *dev, enum hwmon_sensor_types type
 	guard(mutex)(&pmp_thermal.lock);
 	if (type != hwmon_power || attr != hwmon_power_input || channel < 0 || channel > 3)
 		return -EINVAL;
-	if (pmp_thermal.power_budget) {
-		if (pmp_thermal.power.fault || pmp_thermal.power_error ||
-		    ktime_get_ns() - pmp_thermal.power.last_ns > APPLE_PMP_POWER_STALE_NS)
-			return -EAGAIN;
-		*value = 1000L * (channel == 3 ? pmp_thermal.power.total_mw :
-				  pmp_thermal.rail_mw[channel]);
-	} else {
-		if (pmp_thermal.power_error || !pmp_thermal.power_report_ns ||
-		    ktime_get_ns() - pmp_thermal.power_report_ns > APPLE_PMP_POWER_STALE_NS)
-			return -EAGAIN;
-		*value = 1000L * (channel == 3 ?
-				  pmp_thermal.rail_mw[0] + pmp_thermal.rail_mw[1] +
-				  pmp_thermal.rail_mw[2] : pmp_thermal.rail_mw[channel]);
-	}
+	if (pmp_thermal.power.fault || pmp_thermal.power_error ||
+	    ktime_get_ns() - pmp_thermal.power.last_ns > APPLE_PMP_POWER_STALE_NS)
+		return -EAGAIN;
+	*value = 1000L * (channel == 3 ? pmp_thermal.power.total_mw :
+			  pmp_thermal.rail_mw[channel]);
 	return 0;
 }
 
@@ -325,7 +282,8 @@ static int apple_pmp_power_label(struct device *dev, enum hwmon_sensor_types typ
 	};
 	if (type != hwmon_power || channel < 0 || channel > 3)
 		return -EINVAL;
-	*label = labels[channel];
+	*label = channel == 3 && pmp_thermal.power.unbudgeted ?
+		 "CPU/GPU rail sum" : labels[channel];
 	return 0;
 }
 static const struct hwmon_ops apple_pmp_power_ops = {
@@ -414,10 +372,8 @@ static int apple_pmp_guard(unsigned int level)
 		unsigned int power_level = pmp_thermal.power.level[i];
 		unsigned int effective;
 
-		if (!pmp_thermal.power_budget)
-			power_level = 0;
-		else if (!pmp_thermal.power.last_ns || ktime_get_ns() -
-			 pmp_thermal.power.last_ns > APPLE_PMP_POWER_STALE_NS)
+		if (!pmp_thermal.power.last_ns || ktime_get_ns() -
+		    pmp_thermal.power.last_ns > APPLE_PMP_POWER_STALE_NS)
 			power_level = 8;
 		effective = max(level, power_level);
 
@@ -876,6 +832,24 @@ static int apple_pmp_add_cluster(unsigned int index)
 	return 0;
 }
 
+/*
+ * A board whose available SMC hwmon node describes an available fan (a child
+ * with apple,fan-maximum) is fan cooled: the SMC appears to set the fan speed
+ * from the heat the SoC makes, so the fanless Airs' energy budget would
+ * starve the fan. The die guard below applies unchanged.
+ */
+static bool apple_pmp_unbudgeted(void)
+{
+	for_each_compatible_node_scoped(hwmon, NULL, "apple,smc-hwmon") {
+		if (!of_device_is_available(hwmon))
+			continue;
+		for_each_available_child_of_node_scoped(hwmon, child)
+			if (of_property_present(child, "apple,fan-maximum"))
+				return true;
+	}
+	return false;
+}
+
 static int apple_pmp_thermal_setup(void)
 {
 	struct cpufreq_policy *policies[2];
@@ -888,8 +862,10 @@ static int apple_pmp_thermal_setup(void)
 		return ret;
 	for (i = 0; i < ARRAY_SIZE(pmp_thermal.clusters); i++)
 		pmp_thermal.clusters[i].policy = policies[i];
-	apple_pmp_power_init(&pmp_thermal.power);
-	pmp_thermal.power_budget = !apple_pmp_machine_has_fan();
+	if (apple_pmp_unbudgeted())
+		apple_pmp_power_init_unbudgeted(&pmp_thermal.power);
+	else
+		apple_pmp_power_init(&pmp_thermal.power);
 	apple_pmp_cooling_init(&pmp_thermal.cooling);
 	pmp_thermal.guard_level = 8;
 	for (i = 0; i < ARRAY_SIZE(pmp_thermal.clusters); i++) {
@@ -938,8 +914,9 @@ static int apple_pmp_thermal_setup(void)
 			goto fail;
 	}
 	pr_info("apple-pmp-thermal: T8132 provisional policy: CPU/GPU cooling from 106 C, target 110 C, full protection 115 C, three >=120 C samples for shutdown, 5 ms sampling from 95 C or while cooling (100 ms below), 100 ms governor, %s\n",
-		pmp_thermal.power_budget ? "shared measured-rail power budget" :
-		"rail power reported, no power budget");
+		pmp_thermal.power.unbudgeted ?
+		"no power budget (fan cooled; rail faults still restrict)" :
+		"shared measured-rail power budget");
 	pmp_thermal.ready = true;
 	return 0;
 fail:
@@ -973,7 +950,6 @@ static int apple_pmp_thermal_probe(struct platform_device *pdev)
 	pmp_thermal.sensors = sensors;
 	pmp_thermal.cached_error = -EAGAIN;
 	pmp_thermal.power_error = -EAGAIN;
-	pmp_thermal.power_report_ns = 0;
 	pmp_thermal.valid_ns = 0;
 	pmp_thermal.critical = (struct apple_pmp_confirmation) {};
 	pmp_thermal.shutdown_requested = false;
@@ -1020,12 +996,9 @@ static void apple_pmp_thermal_complete(struct device *dev)
 		/* The sleep is no telemetry gap, nor cool time to refill the bucket. */
 		if (p->last_ns)
 			p->last_ns = now;
-		if (pmp_thermal.power_report_ns)
-			pmp_thermal.power_report_ns = now;
 		if (p->active & BIT(2))
 			apple_pmp_gpu_publish(pmp_thermal.sensors, pmp_thermal.gpu_epoch,
-					      pmp_thermal.power_budget ? p->level[2] : 0,
-					      pmp_thermal.power_budget ? p->last_ns : now);
+					      p->level[2], p->last_ns);
 	}
 	if (pmp_thermal.power_polling)
 		schedule_delayed_work(&pmp_thermal.power_work, msecs_to_jiffies(500));
@@ -1045,9 +1018,24 @@ static void apple_pmp_thermal_remove(struct platform_device *pdev)
 	apple_pmp_thermal_cleanup();
 }
 
+/*
+ * A reboot or power-off tells the SMC the system is going down and then puts it
+ * in atomic mode, which fails every ordinary read with -EIO. Left running, the
+ * power reader logs an error every 500 ms until the machine resets, burying
+ * whatever a stalled shutdown printed. Stop the reader. Its budgets go stale as
+ * they would after failed reads, so the CPU/GPU fall back to their minimum
+ * ceilings; the die sampler keeps running.
+ */
+static void apple_pmp_thermal_shutdown(struct platform_device *pdev)
+{
+	cancel_delayed_work_sync(&pmp_thermal.setup_work);
+	cancel_delayed_work_sync(&pmp_thermal.power_work);
+}
+
 static struct platform_driver apple_pmp_thermal_driver = {
 	.probe = apple_pmp_thermal_probe,
 	.remove = apple_pmp_thermal_remove,
+	.shutdown = apple_pmp_thermal_shutdown,
 	.driver = {
 		.name = "apple-pmp-thermal",
 		.pm = pm_sleep_ptr(&apple_pmp_thermal_pm_ops),

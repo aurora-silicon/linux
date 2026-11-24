@@ -61,7 +61,7 @@ parser = command[command.index('/// One command of the stream.'):command.index('
 g17 = (ROOT / 'drivers/gpu/drm/asahi/g17/command.rs').read_text()
 # The stage-prefix offset and the render payload reader precede the parser.
 g17_parser = g17[g17.index('/// Where a render command\'s stage-prefix fields start'):g17.index('#[derive(Clone, Copy, PartialEq, Eq)]')]
-g17_constants = '\n'.join(re.findall(r'const (?:RENDER_BASE_SIZE|COMPUTE_BASE_SIZE): usize = .*?;|const (?:RENDER_TIMESTAMP_COPIES|COMPUTE_TIMESTAMP_COPIES): Range<usize> = .*?;', g17, re.S))
+g17_constants = '\n'.join(re.findall(r'const (?:RENDER_BASE_SIZE|COMPUTE_BASE_SIZE|ATTACHMENT_KINDS): usize = .*?;|const (?:RENDER_TIMESTAMP_COPIES|COMPUTE_TIMESTAMP_COPIES): Range<usize> = .*?;', g17, re.S))
 reader = (ROOT / 'drivers/gpu/drm/asahi/util.rs').read_text()
 reader = reader[reader.index('pub(crate) unsafe trait AnyBitPattern:'):]
 harness = r'''
@@ -356,8 +356,16 @@ fn historical_priors_enforce_entry_bounds() {
     let order=Order::new([4,8],[2,1],[1,NONE],[3,7],RENDER).unwrap();
     assert_eq!(order.sequence,7);
     assert_eq!(order.wait_through,[Some(5),Some(7)]);
-    assert!(!order.ready([6,6]));
-    assert!(order.ready([6,7]));
+    assert!(!order.ready([6,6],[6,6]));
+    assert!(order.ready([6,7],[6,7]));
+    // A compute command may follow published compute predecessors (the firmware compute
+    // queue runs them in order); every cross-engine dependency still needs completion.
+    let compute=Order::new([0,2],[0,0],[NONE,NONE],[0,2],COMPUTE).unwrap();
+    assert!(!compute.ready([0,1],[0,1]));
+    assert!(compute.ready([0,1],[0,2]));
+    let render=Order::new([0,2],[0,0],[NONE,NONE],[0,2],RENDER).unwrap();
+    assert!(!render.ready([0,1],[0,2]));
+    assert!(render.ready([0,2],[0,2]));
 }
 #[test]
 fn geometry_capacity_boundary_uses_the_real_encoder() {

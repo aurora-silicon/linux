@@ -44,6 +44,7 @@
 #include <linux/cpu.h>
 #include <linux/cpumask.h>
 #include <linux/completion.h>
+#include <linux/cpuidle.h>
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/err.h>
@@ -6027,14 +6028,21 @@ static int apple_sleep_enter_prepare(struct apple_sleep *s)
 static int apple_sleep_enter_saved(unsigned long unused)
 {
 	struct apple_sleep *s = apple_sleep;
-	int ret = s->soc->ops->cpu_prepare(s->mbox->boot_mpidr);
+	int ret;
 
+	/*
+	 * cpu_suspend() calls its finisher with RCU not watching. Up to the commit this one
+	 * takes locks, logs and looks at work items: RCU watches until then.
+	 */
+	ct_cpuidle_exit();
+	ret = s->soc->ops->cpu_prepare(s->mbox->boot_mpidr);
+	if (!ret)
+		ret = apple_sleep_enter_prepare(s);
+	if (!ret)
+		pm_set_resume_via_firmware();
+	ct_cpuidle_enter();
 	if (ret)
 		return ret;
-	ret = apple_sleep_enter_prepare(s);
-	if (ret)
-		return ret;
-	pm_set_resume_via_firmware();
 	/* cpu_suspend has already saved boot context. Commit never returns. */
 	return apple_sleep_commit(0);
 }

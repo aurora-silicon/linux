@@ -210,12 +210,16 @@
 		compatible = "apple,t8142-cluster-cpufreq";
 		reg = <0x2 0x10e20000 0 0x1000>;
 		#performance-domain-cells = <0>;
+		/* E lane follows the ADT ordering; no changing sample yet. */
+		apple,fast-die-effort = <&pmp_report 0>;
 	};
 
 	cpufreq_p: performance-controller@211e20000 {
 		compatible = "apple,t8142-cluster-cpufreq";
 		reg = <0x2 0x11e20000 0 0x1000>;
 		#performance-domain-cells = <0>;
+		/* P lane has been observed under Linux CPU load. */
+		apple,fast-die-effort = <&pmp_report 1>;
 	};
 
 	/*
@@ -259,9 +263,8 @@
 		reg-names = "smc", "sram";
 		mboxes = <&smc_mbox>;
 
-		hwmon {
+		smc_hwmon: hwmon {
 			compatible = "apple,smc-hwmon";
-			apple,discover-temperatures;
 		};
 
 		smc_gpio: gpio {
@@ -514,5 +517,25 @@
 };
 
 &jpeg1 {
+	status = "okay";
+};
+
+/*
+ * SIO AES engine, software keys only. It registers below the CPU's aes-ce, so
+ * it is used only when asked for by driver name.
+ */
+&ps_sio {
+	status = "okay";
+};
+
+&ps_aes {
+	status = "okay";
+};
+
+&sio_dart {
+	status = "okay";
+};
+
+&aes {
 	status = "okay";
 };

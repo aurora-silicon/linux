@@ -12,6 +12,7 @@
 #include <linux/rculist.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
+#include <linux/soc/apple/pmp-display.h>
 #include <linux/workqueue.h>
 #include <linux/soc/apple/pmp-telemetry.h>
 #include <linux/soc/apple/pmp-temps.h>
@@ -19,12 +20,7 @@
 
 bool apple_pmp_telemetry_retained_board(void)
 {
-	struct device_node *np = of_find_compatible_node(NULL, NULL,
-							 "apple,t8132-pmp-v2");
-	bool match = np && of_device_is_available(np);
-
-	of_node_put(np);
-	return match;
+	return apple_pmp_t8132_retained_board();
 }
 
 static LIST_HEAD(apple_pmp_telemetry_list);

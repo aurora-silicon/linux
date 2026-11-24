@@ -314,6 +314,15 @@ impl Aggregate {
         self.source().member_done(&self.0, result);
         self.source().owner_done();
     }
+    #[cfg(CONFIG_KUNIT = "y")]
+    pub(super) fn test_member(contexts: &FenceContexts) -> Result<Member> {
+        let mut fence = export_fallback(contexts)?;
+        fence.source = Some(Submission::with_work(None, false)?);
+        let aggregate = Self(fence.into());
+        let member = aggregate.member();
+        aggregate.finish_enqueue(Ok(()));
+        Ok(member)
+    }
 }
 
 pub(crate) struct Member {

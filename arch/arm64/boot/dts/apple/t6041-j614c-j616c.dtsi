@@ -1761,7 +1761,12 @@
 	phandle = <&dcp>;
 
 	panel: panel {
-		apple,max-brightness = <500>;
+		/*
+		 * The panel's user-accessible SDR maximum in nits (ADT backlight
+		 * user-accessible-max-nits on a J616c), as the J616s gets without
+		 * the property. 500 kept the panel below macOS's range.
+		 */
+		apple,max-brightness = <600>;
 		status = "disabled";
 	};
 };
@@ -2303,6 +2308,8 @@
 		operating-points-v2 = <&gpu_opp>;
 		apple,cs-opp = <&gpu_cs_opp>;
 		apple,afr-opp = <&gpu_afr_opp>;
+		/* Avoid a core power cycle between interactive submissions, then release. */
+		apple,idle-off-delay-ms = <16>;
 		apple,firmware-version = <26 5 2>;
 };
 
