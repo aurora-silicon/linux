@@ -474,6 +474,33 @@ impl BusyShare {
         self.below_top
     }
 
+    /// Immediately lifts the reported share to 1000 permille when a sustained busy run
+    /// ([`BusyRuns::bound`]) begins while below the top CLPC column, and re-baselines the
+    /// measurement window at `now_ns` so short back-to-back commands are neither trapped
+    /// at a low memory/fabric floor for up to [`BUSY_WINDOW_NS`] nor diluted by prior
+    /// light activity.
+    pub(super) fn lift_saturated(
+        &mut self,
+        now_ns: u64,
+        retired_ns: [u64; crate::usage::NUM_ENGINES],
+        oldest_in_flight: [u64; crate::usage::NUM_ENGINES],
+    ) -> Option<u32> {
+        if !self.below_top {
+            return None;
+        }
+        self.start_ns = Some(now_ns);
+        self.retired_ns = retired_ns;
+        for (slot, &since) in self.in_flight_ns.iter_mut().zip(oldest_in_flight.iter()) {
+            *slot = if since != 0 {
+                now_ns.saturating_sub(since)
+            } else {
+                0
+            };
+        }
+        self.below_top = false;
+        Some(1000)
+    }
+
     pub(super) fn window_start(&self) -> Option<u64> {
         self.start_ns
     }
@@ -847,6 +874,40 @@ mod tests {
         // No report until a fresh 200 ms window of the new burst completes.
         assert_eq!(share.sample(2190 * NS_MS, [0, 414 * NS_MS, 0], [0, 0, 0]), None);
         assert_eq!(share.sample(2200 * NS_MS, [0, 420 * NS_MS, 0], [0, 0, 0]), Some(600));
+    }
+
+    #[test]
+    fn sustained_busy_run_lifts_short_dispatches_mid_window() {
+        const NS_MS: u64 = 1_000_000;
+        let mut share = BusyShare::new();
+        // Light compositor establishes a 50 permille floor (below top).
+        assert_eq!(share.sample(1000 * NS_MS, [0, 0, 0], [0, 0, 0]), None);
+        assert_eq!(share.sample(1200 * NS_MS, [0, 10 * NS_MS, 0], [0, 0, 0]), Some(50));
+        assert!(share.below_top());
+        // Short (<50 ms) compute dispatches saturate the GPU starting at t=1300 ms.
+        // At t=1316 ms BusyRuns::bound triggers lift_saturated(), lifting immediately.
+        assert_eq!(
+            share.lift_saturated(1316 * NS_MS, [0, 14 * NS_MS, 16 * NS_MS], [0, 0, 0]),
+            Some(1000)
+        );
+        assert!(!share.below_top());
+        // Repeated calls while already at top are a no-op.
+        assert_eq!(
+            share.lift_saturated(1332 * NS_MS, [0, 14 * NS_MS, 32 * NS_MS], [0, 0, 0]),
+            None
+        );
+        // The re-baselined 200 ms window [1316, 1516] measures the burst cleanly (1000 permille).
+        assert_eq!(
+            share.sample(1516 * NS_MS, [0, 14 * NS_MS, 216 * NS_MS], [0, 0, 0]),
+            Some(1000)
+        );
+        assert!(!share.below_top());
+        // Once the burst ends, the next window returns cleanly to the light compositor share.
+        assert_eq!(
+            share.sample(1716 * NS_MS, [0, 24 * NS_MS, 216 * NS_MS], [0, 0, 0]),
+            Some(50)
+        );
+        assert!(share.below_top());
     }
 }
 

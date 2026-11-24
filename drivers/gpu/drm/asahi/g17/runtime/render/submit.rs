@@ -829,6 +829,15 @@ impl crate::g17::Firmware {
                 &mut |event| deferred.push(event),
             )
         });
+        let entry = self.queues.render.entry(slot)?;
+        let started = packet.is_published()
+            || entry
+                .pair
+                .as_ref()
+                .is_some_and(|pair| pair.graph_started());
+        if started && !entry.closed {
+            self.queues.admission.note_published(slot);
+        }
         if packet.is_published() {
             self.queues.render.entry_mut(slot)?.published = true;
         } else if result.is_err() {
