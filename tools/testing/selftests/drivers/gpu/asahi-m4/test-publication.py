@@ -94,8 +94,8 @@ type Result<T=()> = std::result::Result<T,Error>;
 macro_rules! dev_err {($($argument:tt)*)=>{()};}
 __PUBLICATION_ERROR__
 #[derive(Copy,Clone,Debug,PartialEq,Eq)]enum Channel { Ta = 0, Fs = 1, Compute = 2 }
-#[derive(Copy,Clone)]struct ComputeCommand { query_access: bool }
-impl ComputeCommand { fn is_rt(&self) -> bool { false } }
+#[derive(Copy,Clone)]struct ComputeCommand { query_access: bool, rt: bool }
+impl ComputeCommand { fn is_rt(&self) -> bool { self.rt } }
 #[derive(Copy,Clone)]enum Command { Compute(ComputeCommand), Render(()) }
 struct Status(AtomicU32);impl Status{fn get(&self)->u32{self.0.load(Ordering::Relaxed)}}
 struct Vm { status:Status, slot:u32 }
@@ -129,8 +129,9 @@ type Completions=Vec<(u32,Result)>;
 fn complete(done:&mut Completions,job:&Arc<Job>,result:Result){done.push((job.id,result));}
 #[derive(Default)]struct Stats{hold:[u64;3],grouped:u64}
 struct Claims;
-struct Flight{job:Arc<Job>,claims:Claims,group:Vec<Arc<Job>>,computes:u32,renders:u32,compute_pipe:u8,doomed:bool,recovery_suspect:bool,initbm:bool}
-impl Flight{fn new(job:Arc<Job>)->Self{Self{job,claims:Claims,group:vec![],computes:0,renders:0,compute_pipe:0,doomed:false,recovery_suspect:false,initbm:false}}}
+struct Flight{job:Arc<Job>,claims:Claims,group:Vec<Arc<Job>>,computes:u32,renders:u32,compute_pipe:u8,rt_compute:bool,doomed:bool,recovery_suspect:bool,initbm:bool}
+impl Flight{fn new(job:Arc<Job>)->Self{Self{job,claims:Claims,group:vec![],computes:0,renders:0,compute_pipe:0,rt_compute:false,doomed:false,recovery_suspect:false,initbm:false}}}
+__SCS_COMPUTE_CONFLICT__
 struct Engine{ordinal:u64,draw:u64,pending:Vec<Arc<Job>>,flights:Vec<Flight>,frozen:bool,turn:u64,stats:Stats,chan_wait:bool,slot_wait:bool,ta_wave_wait:bool}
 impl Engine {
     __PICK__
@@ -283,7 +284,7 @@ fn job_on_vm(id:u32,vm:Arc<Vm>,render:bool,sent:u32,dependency:Result)->Arc<Job>
     Arc::new(Job{id,vm,
         queue:Queue::new(0,0),
         progress:Progress{sent:AtomicU32::new(sent),count:sent+1,pending:AtomicBool::new(true)},
-        commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access:true})};sent as usize+1],dependency,terminal_marked:AtomicBool::new(false),resources:Resources})
+        commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access:true,rt:false})};sent as usize+1],dependency,terminal_marked:AtomicBool::new(false),resources:Resources})
 }
 fn job(id:u32,render:bool,sent:u32,dependency:Result)->Arc<Job>{
     job_on_vm(id,mk_vm(id),render,sent,dependency)
@@ -437,7 +438,7 @@ fn firmware(jobs:Vec<Arc<Job>>,stages:Vec<(Result,bool)>)->Firmware{
             id,vm:vm1.clone(),
             queue:Queue::new(0,priority),
             progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
-            commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access:false})}],
+            commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access:false,rt:false})}],
             dependency:Ok(()),terminal_marked:AtomicBool::new(false),resources:Resources,
         });
         // Head render (prio 2) is blocked behind active render flight; alt-class fallback
@@ -556,7 +557,7 @@ fn firmware(jobs:Vec<Arc<Job>>,stages:Vec<(Result,bool)>)->Firmware{
         let mk_q=|id:u32,q:Arc<Queue>,render:bool|Arc::new(Job{
             id,vm:vm1.clone(),queue:q,
             progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
-            commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access:false})}],
+            commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access:false,rt:false})}],
             dependency:Ok(()),terminal_marked:AtomicBool::new(false),resources:Resources,
         });
         // q1 has blocked render job 1 followed by compute job 2 on the SAME queue q1;
@@ -641,7 +642,7 @@ fn firmware(jobs:Vec<Arc<Job>>,stages:Vec<(Result,bool)>)->Firmware{
         let mk=|id:u32,render:bool,query_access:bool,dep:Result|Arc::new(Job{
             id,vm:vm1.clone(),queue:q1.clone(),
             progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
-            commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access})}],
+            commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access,rt:false})}],
             dependency:dep,terminal_marked:AtomicBool::new(false),resources:Resources,
         });
         // Seed 4 active TA passes so TA wave pacing is active.
@@ -788,6 +789,7 @@ mod queue_behind_scope {
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     __RENDER_BARRIER_PLAN__
     __PLAN_RENDER_BARRIERS__
+    __SCS_COMPUTE_CONFLICT__
     impl QueueBehindHost {
         __NEEDS_ENGINE_DRAIN__
         __BLOCKED_ON_SLOT_HEADROOM__
@@ -805,7 +807,7 @@ mod queue_behind_scope {
         let q1=Queue::new(0,0);
         let mk=|id:u32,vm:Arc<Vm>,queue:Arc<Queue>,render:bool|Arc::new(QueueBehindJob{
             id,vm,queue,progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
-            commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access:true})}],
+            commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access:true,rt:false})}],
             order:Order{engine:if render{command::RENDER}else{command::COMPUTE},sequence:u64::from(id),wait_through:[None,None]},
             extra_orders:vec![],dependency:Ok(()),resources:Resources,fw_waits:vec![],
         });
@@ -843,6 +845,60 @@ mod queue_behind_scope {
         p.slots.compute_available=false;
         assert!(!p.can_queue_behind(&j2));
     }
+    #[test]fn scs_compute_shares_the_compute_engine_only_with_scs_compute_of_its_vm(){
+        // gpubench compute.long: a ray-query lane (vm1) beside a long-ALU lane (vm2). The
+        // ray-query dispatch was reported complete with its results unwritten whenever the
+        // other lane's compute ran with it, and its stores then faulted in its closed VM.
+        let vm1=Arc::new(Vm{status:Status(AtomicU32::new(0)),slot:1});
+        let vm2=Arc::new(Vm{status:Status(AtomicU32::new(0)),slot:2});
+        let q1=Queue::new(0,0);
+        let q2=Queue::new(0,0);
+        let mk=|id:u32,vm:Arc<Vm>,queue:Arc<Queue>,rt:bool|Arc::new(QueueBehindJob{
+            id,vm,queue,progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
+            commands:vec![Command::Compute(ComputeCommand{query_access:false,rt})],
+            order:Order{engine:command::COMPUTE,sequence:u64::from(id),wait_through:[None,None]},
+            extra_orders:vec![],dependency:Ok(()),resources:Resources,fw_waits:vec![],
+        });
+        let flight=|job:Arc<QueueBehindJob>,rt_compute:bool,compute_pipe:u8|QueueBehindFlight{job,group:vec![],first:0,count:1,computes:1,renders:0,compute_pipe,rt_compute,target:0x100,cstamp:[0x100;16],r_ta_stamp:[0;16],r_fs_stamp:[0;16],fs_target:0,initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false};
+        let rq=mk(1,vm1.clone(),q1.clone(),true);
+        let rq_next=mk(2,vm1.clone(),q1.clone(),true);
+        let rq_post=mk(3,vm1.clone(),q1.clone(),false);
+        let alu=mk(4,vm2.clone(),q2.clone(),false);
+        let rq_vm2=mk(5,vm2.clone(),q2.clone(),true);
+        let mut p=QueueBehindHost{
+            graph:QueueBehindGraph::new(),
+            engine:QueueBehindEngine{ordinal:1,draw:1,ta_target:0,next_compute_pipe:0,flights:vec![flight(rq.clone(),true,0)]},
+            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
+            pools:QueueBehindPools{exhausted:false,can_pipeline:true,block_pipeline_vm:None},
+        };
+        // Behind an SCS flight only SCS compute of its own VM queues, so one ray-query
+        // queue keeps pipelining.
+        assert!(p.can_queue_behind(&rq_next));
+        assert!(!p.needs_engine_drain(&rq_next));
+        for j in [&alu,&rq_post,&rq_vm2] {
+            assert!(!p.can_queue_behind(j));
+            assert!(p.needs_engine_drain(j));
+        }
+        // SCS compute does not start beside non-SCS compute on either pipe.
+        for pipe in [0u8,1] {
+            p.engine.flights=vec![flight(alu.clone(),false,pipe)];
+            assert!(!p.can_queue_behind(&rq));
+            assert!(p.needs_engine_drain(&rq));
+            assert!(p.can_queue_behind(&rq_post));
+            assert!(!p.needs_engine_drain(&rq_post));
+        }
+        // A render flight of its own VM does not hold it; once SCS compute is gone, the rest
+        // overlaps as before.
+        let mut render=flight(mk(6,vm1.clone(),q1.clone(),false),false,0);
+        render.computes=0;
+        render.renders=1;
+        p.engine.flights=vec![render];
+        assert!(!p.needs_engine_drain(&rq));
+        assert!(p.can_queue_behind(&rq));
+        p.engine.flights=vec![flight(rq_post.clone(),false,0)];
+        assert!(p.can_queue_behind(&alu));
+        assert!(!p.needs_engine_drain(&alu));
+    }
     #[test]fn compute_query_access_waits_for_timed_predecessor_unless_no_query_access(){
         let vm1=Arc::new(Vm{status:Status(AtomicU32::new(0)),slot:1});
         let q1=Queue::new(0,0);
@@ -850,7 +906,7 @@ mod queue_behind_scope {
         let mk=|id:u32,queue:Arc<Queue>,query_access:bool,wait_vdm:Option<u64>,wait_cdm:Option<u64>|Arc::new(QueueBehindJob{
             id,vm:vm1.clone(),queue,
             progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
-            commands:vec![Command::Compute(ComputeCommand{query_access})],
+            commands:vec![Command::Compute(ComputeCommand{query_access,rt:false})],
             order:Order{engine:command::COMPUTE,sequence:u64::from(id),wait_through:[wait_vdm,wait_cdm]},
             extra_orders:vec![],dependency:Ok(()),resources:Resources,fw_waits:vec![],
         });
@@ -893,7 +949,7 @@ mod queue_behind_scope {
         let q1=Queue::new(0,0);
         let mk=|id:u32,vm:Arc<Vm>,render:bool|Arc::new(QueueBehindJob{
             id,vm,queue:q1.clone(),progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
-            commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access:true})}],
+            commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access:true,rt:false})}],
             order:Order{engine:if render{command::RENDER}else{command::COMPUTE},sequence:u64::from(id),wait_through:[None,None]},
             extra_orders:vec![],dependency:Ok(()),resources:Resources,fw_waits:vec![],
         });
@@ -938,7 +994,7 @@ mod queue_behind_scope {
         let q2=Queue::new(0,0);
         let mk=|id:u32,vm:Arc<Vm>,queue:Arc<Queue>,render:bool|Arc::new(QueueBehindJob{
             id,vm,queue,progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
-            commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access:false})}],
+            commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access:false,rt:false})}],
             order:Order{engine:if render{command::RENDER}else{command::COMPUTE},sequence:u64::from(id),wait_through:[None,None]},
             extra_orders:vec![],dependency:Ok(()),resources:Resources,fw_waits:vec![],
         });
@@ -980,7 +1036,7 @@ mod queue_behind_scope {
         let mk=|id:u32,queue:Arc<Queue>,render:bool,seq:u64,wait:[Option<u64>;2]|Arc::new(QueueBehindJob{
             id,vm:vm1.clone(),queue,
             progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
-            commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access:false})}],
+            commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access:false,rt:false})}],
             order:Order{engine:if render{command::RENDER}else{command::COMPUTE},sequence:seq,wait_through:wait},
             extra_orders:vec![],dependency:Ok(()),resources:Resources,fw_waits:vec![],
         });
@@ -1012,7 +1068,7 @@ mod queue_behind_scope {
         let multi_c=Arc::new(QueueBehindJob{
             id:6,vm:vm1.clone(),queue:q1.clone(),
             progress:Progress{sent:AtomicU32::new(0),count:3,pending:AtomicBool::new(true)},
-            commands:vec![Command::Compute(ComputeCommand{query_access:false});3],
+            commands:vec![Command::Compute(ComputeCommand{query_access:false,rt:false});3],
             order:Order{engine:command::COMPUTE,sequence:1,wait_through:[None,None]},
             extra_orders:vec![
                 Order{engine:command::COMPUTE,sequence:1,wait_through:[None,None]},
@@ -1052,7 +1108,7 @@ mod queue_behind_scope {
         let mk=|id:u32,render:bool,seq:u64,wait:[Option<u64>;2]|Arc::new(QueueBehindJob{
             id,vm:vm1.clone(),queue:q1.clone(),
             progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
-            commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access:false})}],
+            commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access:false,rt:false})}],
             order:Order{engine:if render{command::RENDER}else{command::COMPUTE},sequence:seq,wait_through:wait},
             extra_orders:vec![],dependency:Ok(()),resources:Resources,fw_waits:vec![],
         });
@@ -1094,7 +1150,7 @@ mod queue_behind_scope {
         let c_job=Arc::new(QueueBehindJob{
             id:1,vm:vm1.clone(),queue:q_comp.clone(),
             progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
-            commands:vec![Command::Compute(ComputeCommand{query_access:false})],
+            commands:vec![Command::Compute(ComputeCommand{query_access:false,rt:false})],
             order:Order{engine:command::COMPUTE,sequence:1,wait_through:[None,None]},
             extra_orders:vec![],dependency:Ok(()),resources:Resources,fw_waits:vec![],
         });
@@ -1131,7 +1187,7 @@ mod queue_behind_scope {
         let mk=|id:u32,render:bool,seq:u64,wait:[Option<u64>;2]|Arc::new(QueueBehindJob{
             id,vm:vm1.clone(),queue:q1.clone(),
             progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
-            commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access:false})}],
+            commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access:false,rt:false})}],
             order:Order{engine:if render{command::RENDER}else{command::COMPUTE},sequence:seq,wait_through:wait},
             extra_orders:vec![],dependency:Ok(()),resources:Resources,fw_waits:vec![],
         });
@@ -1289,7 +1345,7 @@ mod queue_behind_scope {
         let mk=|id:u32,vm:Arc<Vm>,render:bool,dep:Result,query_access:bool,wait:[Option<u64>;2]|Arc::new(QueueBehindJob{
             id,vm,queue:q1.clone(),
             progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
-            commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access})}],
+            commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access,rt:false})}],
             order:Order{engine:if render{command::RENDER}else{command::COMPUTE},sequence:u64::from(id),wait_through:wait},
             extra_orders:vec![],dependency:dep,resources:Resources,fw_waits:vec![],
         });
@@ -1633,7 +1689,7 @@ mod queue_behind_scope {
         let mk=|id:u32,vm:Arc<Vm>,queue:Arc<Queue>,seq:u64|Arc::new(QueueBehindJob{
             id,vm,queue,
             progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
-            commands:vec![Command::Compute(ComputeCommand{query_access:false})],
+            commands:vec![Command::Compute(ComputeCommand{query_access:false,rt:false})],
             order:Order{engine:command::COMPUTE,sequence:seq,wait_through:[None,None]},
             extra_orders:vec![],dependency:Ok(()),resources:Resources,fw_waits:vec![],
         });
@@ -1681,7 +1737,7 @@ mod queue_behind_scope {
         let mk=|id:u32,seq:u64,wait_c:Option<u64>|Arc::new(QueueBehindJob{
             id,vm:vm1.clone(),queue:q1.clone(),
             progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
-            commands:vec![Command::Compute(ComputeCommand{query_access:false})],
+            commands:vec![Command::Compute(ComputeCommand{query_access:false,rt:false})],
             order:Order{engine:command::COMPUTE,sequence:seq,wait_through:[None,wait_c]},
             extra_orders:vec![],dependency:Ok(()),resources:Resources,fw_waits:vec![],
         });
@@ -1741,7 +1797,7 @@ mod queue_behind_scope {
         let c1=Arc::new(QueueBehindJob{
             id:1,vm:vm1.clone(),queue:q1.clone(),
             progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
-            commands:vec![Command::Compute(ComputeCommand{query_access:false})],
+            commands:vec![Command::Compute(ComputeCommand{query_access:false,rt:false})],
             order:Order{engine:command::COMPUTE,sequence:1,wait_through:[None,None]},
             extra_orders:vec![],dependency:Ok(()),resources:Resources,fw_waits:vec![],
         });
@@ -1755,7 +1811,7 @@ mod queue_behind_scope {
         let c2_wait_q1=Arc::new(QueueBehindJob{
             id:3,vm:vm1.clone(),queue:q2.clone(),
             progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
-            commands:vec![Command::Compute(ComputeCommand{query_access:false})],
+            commands:vec![Command::Compute(ComputeCommand{query_access:false,rt:false})],
             order:Order{engine:command::COMPUTE,sequence:1,wait_through:[None,None]},
             extra_orders:vec![],dependency:Ok(()),resources:Resources,
             fw_waits:vec![fence::FwWait{queue:q1.clone(),last_ordinal:[Some(1),Some(1)]}],
@@ -1763,7 +1819,7 @@ mod queue_behind_scope {
         let c2_query_wait_q1=Arc::new(QueueBehindJob{
             id:4,vm:vm1.clone(),queue:q2.clone(),
             progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
-            commands:vec![Command::Compute(ComputeCommand{query_access:true})],
+            commands:vec![Command::Compute(ComputeCommand{query_access:true,rt:false})],
             order:Order{engine:command::COMPUTE,sequence:2,wait_through:[None,None]},
             extra_orders:vec![],dependency:Ok(()),resources:Resources,
             fw_waits:vec![fence::FwWait{queue:q1.clone(),last_ordinal:[None,Some(1)]}],
@@ -2514,12 +2570,13 @@ for token, declaration in {
     '__CROSS_ENGINE_WAIT__': 'fn cross_engine_wait(',
     '__WAIT_COMPUTE_STAMPS_FOR__': 'fn wait_compute_stamps_for(',
     '__CHOOSE_COMPUTE_PIPE__': 'fn choose_compute_pipe(',
+    '__SCS_COMPUTE_CONFLICT__': 'fn scs_compute_conflict(',
     '__WAIT_TARGET__': 'struct WaitTarget {',
     '__CROSS_ENGINE_BARRIER_TYPE__': 'const fn cross_engine_barrier_type(',
     '__RENDER_BARRIER_PLAN__': 'struct RenderBarrierPlan {',
     '__PLAN_RENDER_BARRIERS__': 'fn plan_render_barriers(',
 }.items():
-    harness = harness.replace(token, item(declaration).replace("super::command::", "crate::command::").replace("super::recovery::", "crate::recovery::").replace("super::hw::", "crate::hw::").replace("super::resources::", "crate::resources::").replace("super::queue::QueueState", "crate::Queue").replace("super::fence::", "crate::fence::"))
+    harness = harness.replace(token, item(declaration).replace("super::command::", "crate::command::").replace("super::recovery::", "crate::recovery::").replace("super::hw::", "crate::hw::").replace("super::resources::", "crate::resources::").replace("super::queue::QueueState", "crate::Queue").replace("super::vm::VmState", "crate::Vm").replace("super::fence::", "crate::fence::"))
 unit = output / 'publication.rs'
 unit.write_text(harness)
 log = ''
