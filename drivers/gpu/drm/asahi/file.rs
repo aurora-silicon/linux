@@ -588,7 +588,10 @@ impl File {
         // Every backend admits the USC cache invalidate in the VDM root barrier.
         params.features |= uapi::DRM_ASAHI_FEATURE_VDM_USC_INVALIDATE as u64;
         if Self::supports_user_memory(reg_data) {
-            params.features |= uapi::DRM_ASAHI_FEATURE_USERPTR as u64;
+            // GEM_USERPTR pins are bounded by the GPU memory ledger only, not by
+            // RLIMIT_MEMLOCK (UserPages::pin()).
+            params.features |= uapi::DRM_ASAHI_FEATURE_USERPTR as u64
+                | uapi::DRM_ASAHI_FEATURE_USERPTR_NO_MEMLOCK as u64;
         }
         if Self::supports_residency_control(reg_data) {
             params.features |= uapi::DRM_ASAHI_FEATURE_GEM_RESIDENCY as u64;
