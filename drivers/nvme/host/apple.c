@@ -58,6 +58,11 @@
 #define APPLE_ANS_COPROC_CPU_CONTROL	 0x44
 #define APPLE_ANS_COPROC_CPU_CONTROL_RUN BIT(4)
 #define APPLE_ANS_COPROC_CPU_STATUS	 0x48
+/*
+ * A word of the NVMe block that gates its SART (measured on M1). The boot loader leaves 1
+ * here, and a firmware sleep, which takes ANS's power, leaves 0: put back before ANS runs again.
+ */
+#define APPLE_ANS_SART_POWER		0x13e8
 
 #define APPLE_ANS_ACQ_DB  0x1004
 #define APPLE_ANS_IOCQ_DB 0x100c
@@ -274,6 +279,12 @@ struct apple_nvme {
 	u32 sleep_csts;
 	/* ANS came back across a sleep, or failed to. reset_work picks these up. */
 	bool sleep_restarted;
+	/* A firmware sleep took ANS's power: its next start is from that power-on */
+	bool fw_sleep_restart;
+	/* This suspend idled ANS for a firmware sleep, whether or not the sleep happened */
+	bool fw_sleep_idled;
+	/* The SART power word as it was before that sleep */
+	u32 sart_power;
 	bool sleep_failed;
 	/* Run bit set after a sleep, and not yet reported on. */
 	bool sleep_restarting;
@@ -1781,6 +1792,7 @@ static void apple_nvme_reset_work_impl(struct work_struct *work)
 		container_of(work, struct apple_nvme, ctrl.reset_work);
 	enum nvme_ctrl_state state = nvme_ctrl_state(&anv->ctrl);
 	bool inherited = !anv->owns_rtkit;
+	bool fw_sleep;
 
 	if (anv->hw->needs_ioq_registers) {
 		mutex_lock(&anv->disable_lock);
@@ -1921,6 +1933,9 @@ static void apple_nvme_reset_work_impl(struct work_struct *work)
 			goto booted;
 		}
 
+		fw_sleep = READ_ONCE(anv->fw_sleep_restart);
+		WRITE_ONCE(anv->fw_sleep_restart, false);
+
 		ret = reset_control_assert(anv->reset);
 		if (ret)
 			goto out;
@@ -1933,10 +1948,27 @@ static void apple_nvme_reset_work_impl(struct work_struct *work)
 		if (ret)
 			goto out;
 
+		/*
+		 * After a firmware sleep, out of reset and before the run bit: the SART's
+		 * power word, and the mailbox's enables, which went with ANS's power.
+		 */
+		if (fw_sleep) {
+			if (readl(anv->mmio_nvme + APPLE_ANS_SART_POWER) != anv->sart_power)
+				writel(anv->sart_power, anv->mmio_nvme + APPLE_ANS_SART_POWER);
+			/* Only after a sleep that didn't happen: the wake wrote them already. */
+			if (anv->sart)
+				apple_sart_restore_early(anv->sart);
+			ret = apple_rtkit_mbox_restore(anv->rtk);
+			if (ret)
+				goto out;
+		}
+
 		writel(APPLE_ANS_COPROC_CPU_CONTROL_RUN,
 		       anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
 
 		ret = apple_rtkit_boot(anv->rtk);
+		if (fw_sleep && !ret)
+			dev_info(anv->dev, "ANS: on after the sleep\n");
 	} else {
 		ret = apple_rtkit_wake(anv->rtk);
 	}
@@ -3111,6 +3143,14 @@ static int apple_nvme_resume(struct device *dev)
 		WRITE_ONCE(anv->suspended, false);
 		return nvme_try_sched_reset(&anv->ctrl);
 	}
+	/*
+	 * A firmware sleep took ANS's power: the reset work starts it from that power-on. A
+	 * sleep that didn't happen after ANS was idled for it leaves it idle with its SART
+	 * gated: the same start, from its reset, with the SART's entries written back.
+	 */
+	if (anv->rtk && (pm_resume_via_firmware() || anv->fw_sleep_idled))
+		WRITE_ONCE(anv->fw_sleep_restart, true);
+	anv->fw_sleep_idled = false;
 	return nvme_reset_ctrl(&anv->ctrl);
 }
 
@@ -3271,9 +3311,32 @@ static int apple_nvme_suspend(struct device *dev)
 	}
 
 	if (apple_rtkit_is_running(anv->rtk)) {
-		ret = apple_rtkit_shutdown(anv->rtk);
+		if (pm_suspend_target_state == PM_SUSPEND_MEM && pm_suspend_via_firmware()) {
+			/*
+			 * A firmware sleep takes ANS's power. ANS is put in IDLE, both
+			 * the AP's state and its own, as for a sleep it is woken from:
+			 * after its power-on it then brings its flash links back itself.
+			 * In IDLE it gates its SART, so the SART's entries and the word
+			 * that gates it are read before that.
+			 */
+			anv->sart_power = readl(anv->mmio_nvme + APPLE_ANS_SART_POWER);
+			if (anv->sart)
+				apple_sart_save_now(anv->sart);
+			anv->fw_sleep_idled = true;
+			ret = apple_rtkit_idle(anv->rtk);
+			if (!ret)
+				ret = apple_rtkit_reinit(anv->rtk);
+		} else {
+			ret = apple_rtkit_shutdown(anv->rtk);
+		}
 
 		writel(0, anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
+		/* Refused here, so no resume follows: ANS starts again now, from its reset. */
+		if (ret && anv->fw_sleep_idled) {
+			anv->fw_sleep_idled = false;
+			WRITE_ONCE(anv->fw_sleep_restart, true);
+			nvme_reset_ctrl(&anv->ctrl);
+		}
 	}
 
 	return ret;
