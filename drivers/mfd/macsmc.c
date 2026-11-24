@@ -1909,7 +1909,10 @@ static int __apple_smc_resume_noirq(struct device *dev)
  * again there, before the PCI core restores the functions behind them, and the ports' power
  * enables are SMC GPIOs. The mailbox's interrupt is still off, so until the early resume the
  * replies are fetched, as this driver fetches its own in its noirq callbacks. A consumer's
- * device link orders its noirq resume after this one.
+ * device link orders its noirq resume after this one. Once resume_device_irqs() has turned the
+ * interrupt on again, before the early resume, a reply can come in either way: the fetch and
+ * the interrupt handler drain the mailbox under the same lock, and the one that takes the reply
+ * completes the command the other waits on.
  */
 static int apple_smc_resume_noirq(struct device *dev)
 {
