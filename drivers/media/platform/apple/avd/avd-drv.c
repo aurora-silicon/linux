@@ -100,9 +100,11 @@ int avd_init_job(struct avd_ctx *ctx, enum avd_codec codec, size_t segments)
 
 	job->codec = codec;
 	job->num = 0;
+	job->overflow = false;
 	/* A table that was built but never submitted still belongs to us. */
 	kvfree(job->segments);
 	job->segments = kvcalloc(segments, sizeof(*job->segments), GFP_KERNEL);
+	job->max = job->segments ? segments : 0;
 	if (!job->segments)
 		ret = -ENOMEM;
 	return ret;
@@ -188,10 +190,6 @@ static int avd_open(struct file *filp)
 
 	ctx->dev = avd;
 
-	ret = avd_buf_alloc(avd, &ctx->inst, fifo_size());
-	if (ret)
-		goto err_free_ctx;
-
 	INIT_LIST_HEAD(&ctx->queue_node);
 	ctx->next_dep = AVD_DEP_PREV_DONE;
 
@@ -219,7 +217,6 @@ err_cleanup_m2m_ctx:
 	v4l2_m2m_ctx_release(ctx->fh.m2m_ctx);
 
 err_free_ctx:
-	avd_buf_free(avd, &ctx->inst);
 	kfree(ctx);
 	return ret;
 }
@@ -468,7 +465,7 @@ static const struct avd_variant avd_t8140_variant = {
 	.submit_offset = 0x40,
 	.submit_queue_max_offset = 0x44,
 	.submit_queue_status_offset = 0x7c,
-	.quirks = AVD_QUIRK_HEVC_V5_HEADER | AVD_QUIRK_V5_QUEUE_PACING,
+	.quirks = AVD_QUIRK_HEVC_V5_HEADER,
 };
 
 static const struct avd_variant avd_t8132_variant = {
@@ -741,6 +738,12 @@ static int avd_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
+	/*
+	 * Neither width has a named source: the LSR encodings would allow 39
+	 * bits (compressed-plane addresses, addr >> 7 in one word) and 42 is
+	 * unexplained for the Apple backend. See
+	 * https://github.com/aurora-silicon/linux/issues/2451.
+	 */
 	ret = dma_set_mask_and_coherent(avd->dev,
 			DMA_BIT_MASK(avd_backend_is_apple(avd) ? 42 :
 			     (avd->variant->quirks & AVD_QUIRK_LSR) ? 38 : 64));
@@ -843,6 +846,9 @@ static struct platform_driver avd_driver = {
 	},
 };
 module_platform_driver(avd_driver);
+#if IS_REACHABLE(CONFIG_VIDEO_APPLE_AVD_KUNIT_TEST)
+#include "avd-variant-test.c"
+#endif
 
 MODULE_LICENSE("GPL v2");
 MODULE_DESCRIPTION("Apple avd v4l2 sl m2m");

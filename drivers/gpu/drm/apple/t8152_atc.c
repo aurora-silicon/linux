@@ -13,7 +13,7 @@
  * set up the lanes again), drive settings, the DCP -> ATCn/DFP0 crossbar
  * route, and with the display off or unplugged a full power down and a cold
  * start. A DCP drives one USB-C port at a time: the one it claims from the
- * shared ports while polling their PD controllers.
+ * shared ports once their Type-C state shows a sink (t8152_typec.c).
  */
 
 #include <linux/bits.h>
@@ -53,7 +53,6 @@ struct t8152_atc_port {
 	unsigned int index;		/* ATC instance */
 	/* display crossbar DFP endpoint of this ATC */
 	u32 dfp;
-	struct spmi_device *pd;
 	/* AP DisplayPort AUX controller aux0 (shared), for the EDID */
 	struct t8152_aux *aux;
 	/* PMGR power states of the four ATC dependencies */
@@ -84,6 +83,9 @@ struct t8152_atc {
 /* J873 has one display crossbar. Claims outlive firmware PHY power cycles. */
 static DEFINE_MUTEX(atc_owner_lock);
 static struct device *atc_owner[4];
+/* The bootloader's link from the main DCP, read once: t8152_atc_boot_link(). */
+static bool atc_boot_read;
+static int atc_boot_link;
 /* All three DCPs borrow the same AP AUX controller for EDID reads. */
 static DEFINE_MUTEX(atc_aux_lock);
 
@@ -692,7 +694,9 @@ static int atc_detect(struct t8152_display *disp, bool *flipped)
 	atc->next = atc->cur;
 	/* Keep a monitor on its controller, including while userspace blanks it. */
 	if (atc_owner[atc->cur->index] == disp->dev) {
-		ret = t8152_pd_sink(atc->cur->pd, flipped, &atc->cur->next_lanes);
+		ret = t8152_typec_sink(disp, atc->cur->index, flipped,
+				       &atc->cur->next_lanes);
+		/* The plug changed: a new sink */
 		if (ret > 0 && (atc->cur->swap != *flipped ||
 				atc->cur->lanes != atc->cur->next_lanes))
 			disp->hpd = 0;
@@ -706,7 +710,7 @@ static int atc_detect(struct t8152_display *disp, bool *flipped)
 		struct t8152_atc_port *port = &atc->port[i];
 
 		if (atc_owner[port->index] ||
-		    t8152_pd_sink(port->pd, flipped, &port->next_lanes) <= 0)
+		    t8152_typec_sink(disp, port->index, flipped, &port->next_lanes) <= 0)
 			continue;
 		atc_owner[port->index] = disp->dev;
 		atc->next = port;
@@ -739,7 +743,6 @@ static void atc_select(struct t8152_display *disp)
 	dev_info(disp->dev, "USB-C display on ATC%u now, was ATC%u\n",
 		 port->index, atc->cur->index);
 	atc->cur = port;
-	disp->pd = port->pd;
 	disp->dcp_output = port->dfp;
 }
 
@@ -785,6 +788,27 @@ static void __iomem *atc_map(struct t8152_display *disp, struct device_node *np,
 	return devm_ioremap(disp->dev, res.start, resource_size(&res));
 }
 
+/*
+ * The PHY block hangs the bus while it is power-gated: look at it only with
+ * its DP dependencies and the common PSD up.
+ */
+static bool atc_powered(void __iomem *ps, void __iomem *psd)
+{
+	return (readl(ps) & 0xf0) == 0xf0 && !(readl(psd + ATC_PSD_STATE) & 7);
+}
+
+/* The crossbar routes the port from the DCP with this dp-source. */
+static bool atc_routed(void __iomem *base, u32 dp_source)
+{
+	return ((readl(base + ATC_XBAR + 0x44) >> 20) & 0xf) == dp_source * 2;
+}
+
+/* Common block out of reset and AUX up, as the bootloader leaves a link. */
+static bool atc_link_up(u32 cfg)
+{
+	return (cfg & 0x1f) == 0x1b;
+}
+
 static int atc_port_init(struct t8152_display *disp, struct t8152_atc *atc,
 			 struct device_node *np, void __iomem *dp_clock)
 {
@@ -796,9 +820,6 @@ static int atc_port_init(struct t8152_display *disp, struct t8152_atc *atc,
 	port->psd = atc_map(disp, np, "atc-psd");
 	if (!port->base || !port->ps || !port->psd)
 		return -ENOMEM;
-	port->pd = t8152_pd_get(np);
-	if (IS_ERR_OR_NULL(port->pd))
-		return port->pd ? PTR_ERR(port->pd) : -ENODEV;
 	/* The node without ports is ATC3's (J873g back-right). */
 	port->dfp = 3;
 	of_property_read_u32(np, "apple,dfp-endpoint", &port->dfp);
@@ -817,23 +838,15 @@ static int atc_port_init(struct t8152_display *disp, struct t8152_atc *atc,
 	port->tunable_len[1] /= sizeof(__be32);
 	atc->nports++;
 
-	/*
-	 * The PHY block hangs the bus while it is power-gated: look at it only
-	 * with its DP dependencies and the common PSD up.
-	 */
-	if ((readl(port->ps) & 0xf0) != 0xf0 ||
-	    (readl(port->psd + ATC_PSD_STATE) & 7)) {
+	if (!atc_powered(port->ps, port->psd)) {
 		dev_info(disp->dev, "ATC%u: powered down\n", port->index);
 		return 0;
 	}
 	/* A different DCP may already be driving this port. */
-	if (atc_owner[port->index] ||
-	    ((readl(port->base + ATC_XBAR + 0x44) >> 20) & 0xf) !=
-							 disp->dp_source * 2)
+	if (atc_owner[port->index] || !atc_routed(port->base, disp->dp_source))
 		return 0;
-	/* Common block out of reset and AUX up, as the bootloader leaves it. */
 	cfg = readl(port->base + ATC_CFG);
-	port->active = (cfg & 0x1f) == 0x1b;
+	port->active = atc_link_up(cfg);
 	if ((readl(port->base + 0x4c) & 0x1f) == 0x10 ||
 	    (readl(port->base + 0x4c) & 0x1f) == 0x11) {
 		port->lanes = 2;
@@ -855,6 +868,67 @@ static int atc_port_init(struct t8152_display *disp, struct t8152_atc *atc,
 		 port->index, port->active, port->link_rate, port->route_started,
 		 port->swap, cfg);
 	return 0;
+}
+
+static void __iomem *atc_iomap(struct device_node *np, const char *name)
+{
+	int i = of_property_match_string(np, "reg-names", name);
+
+	return i < 0 ? NULL : of_iomap(np, i);
+}
+
+/* 1 with a bootloader link from this dp-source, 0 without, or an error. */
+static int atc_port_boot_link(struct device_node *np, u32 dp_source)
+{
+	void __iomem *base = atc_iomap(np, "atc");
+	void __iomem *ps = atc_iomap(np, "atc-ps");
+	void __iomem *psd = atc_iomap(np, "atc-psd");
+	int ret = -ENODEV;
+
+	/* What atc_port_init() adopts. A port in USB4 routes from no DCP. */
+	if (base && ps && psd)
+		ret = atc_powered(ps, psd) && atc_routed(base, dp_source) &&
+		      atc_link_up(readl(base + ATC_CFG));
+	if (psd)
+		iounmap(psd);
+	if (ps)
+		iounmap(ps);
+	if (base)
+		iounmap(base);
+	return ret;
+}
+
+/*
+ * 1 when the bootloader left a DisplayPort link from the main DCP
+ * (dp-source 0) on one of the USB-C ports, 0 when every port was read and
+ * none has one, an error when a port could not be read. The DCPs share the
+ * ports (the DCPEXTs' apple,usb-c-ports name the main DCP), so the first DCP
+ * to probe reads them, before any DCP claims or powers one, and the others
+ * get its answer.
+ */
+int t8152_atc_boot_link(struct device *dev)
+{
+	struct device_node *ports __free(device_node) =
+		of_parse_phandle(dev->of_node, "apple,usb-c-ports", 0);
+	struct device_node *np = ports ?: dev->of_node;
+	bool children = false;
+
+	guard(mutex)(&atc_owner_lock);
+	if (atc_boot_read)
+		return atc_boot_link;
+	atc_boot_read = true;
+	atc_boot_link = 0;
+	for_each_child_of_node_scoped(np, child) {
+		if (!of_property_present(child, "apple,dfp-endpoint"))
+			continue;
+		children = true;
+		atc_boot_link = atc_port_boot_link(child, 0);
+		if (atc_boot_link)
+			break;
+	}
+	if (!children)
+		atc_boot_link = atc_port_boot_link(np, 0);
+	return atc_boot_link;
 }
 
 int t8152_atc_init(struct t8152_display *disp)
@@ -916,7 +990,7 @@ int t8152_atc_init(struct t8152_display *disp)
 	atc->next = atc->cur;
 	disp->phy = &atc_ops;
 	disp->phy_priv = atc;
-	disp->pd = atc->cur->pd;
+	disp->usbc = true;
 	disp->dcp_output = atc->cur->dfp;
 	dev_info(disp->dev, "USB-C display on ATC%u (%u ports)\n", atc->cur->index,
 		 atc->nports);

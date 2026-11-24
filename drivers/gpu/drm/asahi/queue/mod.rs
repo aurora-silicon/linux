@@ -724,7 +724,9 @@ impl Queue::ver {
         )?;
         let entity = sched::Entity::new(&sched, sched::Priority::Kernel)?;
 
-        let buffer = buffer::Buffer::ver::new(gpu, alloc, ualloc.clone(), ualloc_priv, mgr)?;
+        let buffer = buffer::Buffer::ver::new(
+            gpu, alloc, ualloc.clone(), ualloc_priv, mgr, buffer::ParameterListPlacement::VmPrivate,
+        )?;
 
         let gpu_context = Arc::new(
             workqueue::GpuContext::new(dev.clone(), alloc, buffer.any_ref())?,

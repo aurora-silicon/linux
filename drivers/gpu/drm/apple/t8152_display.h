@@ -4,15 +4,15 @@
  * that no subsystem driver covers yet: the ATC PHYs' DisplayPort lanes and
  * their display crossbar route (t8152_atc.c), the HDMI port's dedicated
  * DisplayPort PHY and PS190 converter (t8152_hdmi.c), the AP's DisplayPort
- * AUX controllers that read the sink's EDID (t8152_aux.c), the rear USB-C
- * ports' ACE3 PD controllers (t8152_pd.c), and the DPTX port service the
- * DCP firmware calls into for the PHY (t8152_dptx.c).
+ * AUX controllers that read the sink's EDID (t8152_aux.c), and the DPTX port
+ * service the DCP firmware calls into for the PHY (t8152_dptx.c). The rear
+ * USB-C ports' DisplayPort alt mode state comes from their Type-C port
+ * driver, through the ports' shared display switches (t8152_typec.c).
  *
- * Interim: the ATC DisplayPort mode moves to drivers/phy/apple/atc.c, the
- * ACE3 controllers to tipd, and the choice of port with DP alt mode to the
- * Type-C route layer of dcp-fabric.c, each in its own change. Until then
- * these files program the registers themselves, for the iBoot interface
- * DCPs of iomfb_iboot.c alone.
+ * Interim: the ATC DisplayPort mode moves to drivers/phy/apple/atc.c and the
+ * choice of port with DP alt mode to the Type-C route layer of dcp-fabric.c,
+ * each in its own change. Until then these files program the registers
+ * themselves, for the iBoot interface DCPs of iomfb_iboot.c alone.
  */
 #ifndef __APPLE_T8152_DISPLAY_H__
 #define __APPLE_T8152_DISPLAY_H__
@@ -24,9 +24,9 @@ struct apple_epic_service_ops;
 struct device;
 struct device_node;
 struct gpio_desc;
-struct spmi_device;
 struct t8152_display;
 struct t8152_hdmi;
+struct t8152_typec;
 
 /* SET_DRIVE_SETTINGS and GET_DRIVE_SETTINGS records, one per lane */
 struct t8152_drive_settings {
@@ -90,8 +90,9 @@ struct t8152_display {
 	/* optional sink HPD line (HDMI), polled; the last level seen */
 	struct gpio_desc *hpd_gpio;
 	int hpd;
-	/* USB-C: the PD controller of the port in use */
-	struct spmi_device *pd;
+	/* USB-C: plug and HPD come from the ports' display switches */
+	bool usbc;
+	struct t8152_typec *typec;
 	/* HDMI PHY: DCPEXT0's, or the main DCP's on an HDMI-only boot */
 	bool hdmi;
 	/*
@@ -109,6 +110,7 @@ struct t8152_display {
 };
 
 /* t8152_atc.c */
+int t8152_atc_boot_link(struct device *dev);
 int t8152_atc_init(struct t8152_display *disp);
 bool t8152_atc_release(struct t8152_display *disp);
 
@@ -126,10 +128,10 @@ int t8152_aux_init(struct t8152_display *disp, struct t8152_aux *aux);
 int t8152_aux_read_edid(struct t8152_display *disp, struct t8152_aux *aux,
 			u8 *buf, size_t size);
 
-/* t8152_pd.c */
-struct spmi_device *t8152_pd_get(struct device_node *np);
-int t8152_pd_sink(struct spmi_device *pd, bool *flipped, u32 *lanes);
-int t8152_pd_reconnect(struct t8152_display *disp);
+/* t8152_typec.c, see also iomfb_iboot.h */
+int t8152_typec_init(struct t8152_display *disp);
+int t8152_typec_sink(struct t8152_display *disp, u32 index, bool *flipped,
+		     u32 *lanes);
 
 /* t8152_dptx.c */
 extern const struct apple_epic_service_ops t8152_dptx_port_ops;

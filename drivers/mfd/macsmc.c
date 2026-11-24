@@ -55,6 +55,9 @@
 /* Restart and power-off go through atomic writes; give the SMC time. */
 #define SMC_ATOMIC_TIMEOUT_MS	5000
 
+/* WKTP wake type: 0 exits Silent Running / Power Nap for a full wake. */
+#define SMC_WAKE_TYPE_FULL	0U
+
 static const struct mfd_cell apple_smc_devs[] = {
 	MFD_CELL_NAME("macsmc-input"),
 	MFD_CELL_NAME("macsmc-power"),
@@ -635,6 +638,30 @@ static const struct apple_smc_wake_reason apple_smc_j714s_wake_reasons[] = {
 	{ 43, "USB2_plug" }, { 44, "USB2_wake" }, { 45, "aupo" }, { 48, "rtc" }, { }
 };
 
+static void apple_smc_write_full_wake(struct apple_smc *smc)
+{
+	int ret;
+
+	ret = apple_smc_write_u8(smc, SMC_KEY(WKTP), SMC_WAKE_TYPE_FULL);
+	if (ret < 0)
+		dev_warn(smc->dev, "Failed to write WKTP = %u: %d\n",
+			 SMC_WAKE_TYPE_FULL, ret);
+}
+
+static void apple_smc_probe_wktp(struct apple_smc *smc)
+{
+	struct apple_smc_key_info info;
+	int ret;
+
+	ret = apple_smc_get_key_info(smc, SMC_KEY(WKTP), &info);
+	if (ret < 0 || info.size != sizeof(u8) ||
+	    !(info.flags & APPLE_SMC_WRITABLE))
+		return;
+
+	smc->has_wktp = true;
+	apple_smc_write_full_wake(smc);
+}
+
 static int apple_smc_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -731,6 +758,8 @@ static int apple_smc_probe(struct platform_device *pdev)
 	ret = devm_add_action_or_reset(dev, apple_smc_disable_notifications, smc);
 	if (ret)
 		return ret;
+
+	apple_smc_probe_wktp(smc);
 
 	t6050 = of_device_is_compatible(dev->of_node, "apple,t6050-smc");
 	if (t6050)
@@ -1723,6 +1752,9 @@ static void apple_smc_complete(struct device *dev)
 		smc->sleep_warned = false;
 	}
 	smc->sleep_policy = NULL;
+
+	if (smc->has_wktp && !pm_dark_wake())
+		apple_smc_write_full_wake(smc);
 }
 
 /*

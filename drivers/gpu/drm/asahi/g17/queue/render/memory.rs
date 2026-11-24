@@ -603,6 +603,7 @@ impl Memory {
                 buffer_id: buffer_id.0,
                 generation: pm_generation,
                 first_ordinal: ordinal,
+                normal_blocks: variant.tvb_normal_blocks,
             },
         )?;
         let predecessor = crate::g17::ids::OBJECTS.object()?;

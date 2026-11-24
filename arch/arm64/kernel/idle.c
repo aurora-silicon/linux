@@ -8,6 +8,7 @@
 #include <linux/irqflags.h>
 
 #include <asm/apple-idle.h>
+#include <asm/apple_m1_pmu.h>
 #include <asm/barrier.h>
 #include <asm/cpuidle.h>
 #include <asm/cpufeature.h>
@@ -90,11 +91,41 @@ static __always_inline bool apple_wfi_needs_save(void)
 {
 	return unlikely(READ_ONCE(apple_wfi_loses_regs));
 }
+
+DEFINE_PER_CPU(bool, apple_pmu_wfi_freeze);
+EXPORT_PER_CPU_SYMBOL_GPL(apple_pmu_wfi_freeze);
+
+/*
+ * On M4 and later Apple cores some cycle counters keep counting in WFI
+ * (for example, M5 Max Sawtooth cores at about 1.5 GHz), which inflates
+ * CPU-wide perf counts with idle time. Freeze the counters and their
+ * interrupt across WFI whenever perf events are active on this CPU.
+ */
+static __always_inline void apple_wfi(void)
+{
+	/* Idle runs with preemption disabled: the raw accessor is enough. */
+	if (unlikely(__this_cpu_read(apple_pmu_wfi_freeze))) {
+		u64 pmcr0 = read_sysreg_s(SYS_IMP_APL_PMCR0_EL1);
+
+		write_sysreg_s(pmcr0 & ~(PMCR0_CNT_ENABLE_0_7 |
+					 PMCR0_CNT_ENABLE_8_9 |
+					 PMCR0_IMODE),
+			       SYS_IMP_APL_PMCR0_EL1);
+		isb();
+		apple_cpu_wfi();
+		write_sysreg_s(pmcr0, SYS_IMP_APL_PMCR0_EL1);
+		isb();
+	} else {
+		apple_cpu_wfi();
+	}
+}
 #else
 static __always_inline bool apple_wfi_needs_save(void)
 {
 	return false;
 }
+
+static __always_inline void apple_wfi(void) { }
 #endif
 
 /*
@@ -120,7 +151,7 @@ void __cpuidle cpu_do_idle(void)
 			 * them, even when the same task resumes on this CPU.
 			 */
 			fpsimd_save_and_flush_cpu_state();
-			apple_cpu_wfi();
+			apple_wfi();
 		} else {
 			dsb(sy);
 			wfi();
