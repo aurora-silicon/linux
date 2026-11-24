@@ -73,7 +73,7 @@ def fixture():
             'pair.retire(None, generation, state, host,', 'pair.fail_after_observation(packet, error, host,')
     # A first signal gives the lease back without ending a quarantine (the `complete` mock).
     ordered(item(completion, 'fn complete_with_compute('),
-            'if self.signalled.swap(true, Ordering::AcqRel) {\n            return;\n        }',
+            'if self.signalled.swap(true, Ordering::AcqRel) {\n            return false;\n        }',
             'self.release_healthy();')
     # The drain release runs once the drain proof, event service and accounting passed.
     ordered(item(settle, 'fn drain_render_slot('), 'pair.firmware_drained(host)', 'self.service_runtime_events(deferred)',
@@ -175,6 +175,7 @@ pub struct Completion {
     sources: Option<Arc<Sources>>,
     vm_job: Mutex<Option<VmJobGuard>>,
     render: Mutex<Option<RenderLease>>,
+    is_compute: bool,
     signalled: AtomicBool,
     accepted: AtomicBool,
     spared: AtomicBool,
@@ -188,13 +189,14 @@ impl Completion {
     fn report(&self, _: Error) {}
     fn signal_terminal(&self, result: Result<[u64; 4]>) { *self.result.lock() = Some(result); }
     /// The lease handling of the real complete_with_compute (checked against it above).
-    fn complete(&self, result: Result<[u64; 4]>) { self.complete_with_compute(result, None) }
-    fn complete_with_compute(&self, result: Result<[u64; 4]>, _: Option<[u64; 2]>) {
+    fn complete(&self, result: Result<[u64; 4]>) -> bool { self.complete_with_compute(result, None) }
+    fn complete_with_compute(&self, result: Result<[u64; 4]>, _: Option<[u64; 2]>) -> bool {
         if self.signalled.swap(true, Ordering::AcqRel) {
-            return;
+            return false;
         }
         self.release_healthy();
         self.signal_terminal(result);
+        true
     }
 ''' + command + '\n}\n' + item(completion, 'pub(crate) enum Deferred {') + '\n' + item(completion, 'impl Deferred {') + r'''
 
@@ -290,6 +292,7 @@ fn command(pool: &Arc<Pool>, lease: RenderLease) -> Command {
     let completion = Arc::new(Completion {
         status: Arc::new(Status), output: Output, sources: Some(Arc::new(Sources)),
         vm_job: Mutex::new(Some(guard)), render: Mutex::new(Some(lease)),
+        is_compute: false,
         signalled: AtomicBool::new(false), accepted: AtomicBool::new(true), spared: AtomicBool::new(false),
         result: Mutex::new(None),
     });
