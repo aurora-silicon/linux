@@ -137,6 +137,9 @@ struct aura_s2r_mailbox {
 #define WDT_WD0_COUNT		0x00
 #define WDT_WD0_CTL		0x0c
 #define WDT_WD1_COUNT		0x10
+#define WDT_WD1_BITE		0x14
+#define WDT_WD1_CTL		0x1c
+#define WDT_WD1_RESET_EN	BIT(2)
 #define WDT_WD2_COUNT		0x20
 #define WDT_WD2_ALARM		0x28
 #define WDT_WD2_CTL		0x2c
@@ -807,6 +810,13 @@ struct apple_sleep_soc {
 	 * the commit (apple_sleep.early_wfi): XNU's order (T8142, J813 ten-core trace).
 	 */
 	bool early_cpu_wfi;
+	/*
+	 * The sleep's safety net is WD1 (count +0x10, bite +0x14, control +0x1c, reset enable
+	 * bit 2), which apple_wdt also drives: the one it had is put back at .end.
+	 */
+	bool wdt_wd1;
+	/* The SMC gets pmVC and WKTP before slpa (gen 1, as t6000 has them) */
+	bool smc_gen1_keys;
 };
 
 struct apple_sleep {
@@ -1080,6 +1090,9 @@ struct apple_sleep {
 	/* The radio's port stop at the commit (sleep_radio_port_stop()), and its first timeout */
 	int radio_stop_ret;
 	const char *radio_stop_step;
+	/* With wdt_wd1: WD1's control and bite time at .begin, put back at .end */
+	u32 wd1_saved_ctl, wd1_saved_bite;
+	bool wd1_saved;
 };
 
 static struct apple_sleep *apple_sleep;
@@ -1802,10 +1815,20 @@ MODULE_PARM_DESC(j813_smc_late,
 
 bool apple_sleep_smc_defer_notice(void)
 {
-	return apple_sleep && READ_ONCE(sleep_j813_smc_late) &&
-		of_machine_is_compatible("apple,j813") && pm_suspend_via_firmware();
+	if (!apple_sleep || !pm_suspend_via_firmware())
+		return false;
+	/* Gen 1 (T8103): SEP sleeps before the SMC is told, as on macOS and t6000. */
+	if (apple_sleep->soc->smc_gen1_keys)
+		return true;
+	return READ_ONCE(sleep_j813_smc_late) && of_machine_is_compatible("apple,j813");
 }
 EXPORT_SYMBOL_GPL(apple_sleep_smc_defer_notice);
+
+bool apple_sleep_smc_gen1_keys(void)
+{
+	return apple_sleep && apple_sleep->soc->smc_gen1_keys && pm_suspend_via_firmware();
+}
+EXPORT_SYMBOL_GPL(apple_sleep_smc_gen1_keys);
 
 int apple_sleep_smc_register(struct device *dev,
 		int (*late_notice)(void *data, u64 *sent, u64 *ack), void *data)
@@ -3275,7 +3298,8 @@ static int apple_sleep_refuse(struct apple_sleep *s)
 	}
 
 	/* Only ANS's driver can stop it, and it doesn't come back without a real sleep. */
-	if (!idled && (sleep_ps_on(s, d->ans) || sleep_ps_on(s, d->apcie_sys_gp))) {
+	if (!idled && ((d->ans && sleep_ps_on(s, d->ans)) ||
+		       (d->apcie_sys_gp && sleep_ps_on(s, d->apcie_sys_gp)))) {
 		dev_err(s->dev, "refused: ANS or PCIe is on with no driver to stop it\n");
 		refused = true;
 	}
@@ -4481,6 +4505,13 @@ static void apple_sleep_lower_io(struct apple_sleep *s)
 
 static void apple_sleep_set_wd2(struct apple_sleep *s, unsigned int secs)
 {
+	if (s->soc->wdt_wd1) {
+		writel(0, s->wdt + WDT_WD1_CTL);
+		writel(0, s->wdt + WDT_WD1_COUNT);
+		writel(secs * WDT_TICKS_PER_S, s->wdt + WDT_WD1_BITE);
+		writel(WDT_WD1_RESET_EN, s->wdt + WDT_WD1_CTL);
+		return;
+	}
 	writel(0, s->wdt + WDT_WD2_CTL);
 	writel(0, s->wdt + WDT_WD2_COUNT);
 	writel(secs * WDT_TICKS_PER_S, s->wdt + WDT_WD2_ALARM);
@@ -5968,7 +5999,13 @@ static int apple_sleep_enter_prepare(struct apple_sleep *s)
 		step = "coprocessor checks";
 		ret = apple_sleep_coprocs_check(s);
 	}
-	if (!ret && !s->soc->ops->commit_notice) {
+	if (!ret && !s->soc->ops->commit_notice && apple_sleep_smc_defer_notice()) {
+		/* The notice comes after SEP's stop, where it can't refuse: its lane is held. */
+		step = "SMC scope";
+		if (!s->smc.dev || !s->smc.late_notice || !s->smc.saved_ops || !s->smc.held)
+			ret = -EBUSY;
+	}
+	if (!ret && !s->soc->ops->commit_notice && !apple_sleep_smc_defer_notice()) {
 		step = "SMC notice";
 		ret = apple_sleep_smc_late_notice(s);
 	}
@@ -6014,6 +6051,11 @@ static int apple_sleep_enter_prepare(struct apple_sleep *s)
 		ret = s->soc->ops->commit_notice(s);
 		if (ret)
 			panic("Apple committed SMC notice failed after peer stop: %d", ret);
+	} else if (apple_sleep_smc_defer_notice()) {
+		/* Gen 1: the SMC hears last, after SEP and the other coprocessors stopped. */
+		ret = apple_sleep_smc_late_notice(s);
+		if (ret)
+			panic("Apple SMC sleep notice failed after peer stop: %d", ret);
 	}
 	if (!s->soc->regions)
 		apple_sleep_usb_down(s);
@@ -6462,6 +6504,12 @@ static int apple_sleep_begin(suspend_state_t state)
 		apple_sleep->smc_woke_alone = false;
 		sleep_pins_save(apple_sleep);
 	}
+	/* Before apple_wdt's suspend stops it: what user space had, for .end */
+	if (apple_sleep->soc->wdt_wd1 && !apple_sleep->wd1_saved) {
+		apple_sleep->wd1_saved_ctl = readl(apple_sleep->wdt + WDT_WD1_CTL);
+		apple_sleep->wd1_saved_bite = readl(apple_sleep->wdt + WDT_WD1_BITE);
+		apple_sleep->wd1_saved = true;
+	}
 	apple_sleep_set_wd2(apple_sleep, WDT_SUSPEND_SECS);
 	pm_set_suspend_via_firmware();
 	sleep_ans_late_open();
@@ -6479,8 +6527,18 @@ static void apple_sleep_end(void)
 	/* Nothing left by now after a wake; the platform wake takes it */
 	if (pm_suspend_via_firmware() && apple_sleep->soc->ops->pmu_wake)
 		apple_sleep->soc->ops->pmu_wake(apple_sleep);
-	if (pm_suspend_via_firmware())
+	if (pm_suspend_via_firmware() && apple_sleep->soc->wdt_wd1) {
+		/* After apple_wdt's resume: WD1 as user space had it before the sleep */
+		if (apple_sleep->wd1_saved) {
+			writel(0, apple_sleep->wdt + WDT_WD1_CTL);
+			writel(0, apple_sleep->wdt + WDT_WD1_COUNT);
+			writel(apple_sleep->wd1_saved_bite, apple_sleep->wdt + WDT_WD1_BITE);
+			writel(apple_sleep->wd1_saved_ctl, apple_sleep->wdt + WDT_WD1_CTL);
+			apple_sleep->wd1_saved = false;
+		}
+	} else if (pm_suspend_via_firmware()) {
 		writel(0, apple_sleep->wdt + WDT_WD2_CTL);
+	}
 }
 
 /*
@@ -6778,6 +6836,12 @@ static int apple_sleep_prepare(void)
 
 	/* Every device .suspend has run: no owner registers after this. */
 	sleep_ans_late_close();
+	/*
+	 * WD1 on its own (T8103): apple_wdt's .suspend stopped it, and nothing else would reset
+	 * a hang between here and the commit, which arms it again.
+	 */
+	if (s && s->soc->wdt_wd1 && pm_suspend_via_firmware())
+		apple_sleep_set_wd2(s, WDT_SUSPEND_SECS);
 	sleep_note_at(s, 0, PMU_NOTE_MAGIC);
 	sleep_note_at(s, 2, 0);
 	sleep_note_at(s, 3, ++attempts);
@@ -6997,6 +7061,11 @@ static int apple_sleep_map_displays(struct apple_sleep *s)
 	return 0;
 }
 
+static void apple_sleep_iounmap(void *base)
+{
+	iounmap((void __iomem __force *)base);
+}
+
 static void __iomem *apple_sleep_map(struct device *dev, const char *name)
 {
 	struct device_node *np = dev->of_node;
@@ -7010,7 +7079,17 @@ static void __iomem *apple_sleep_map(struct device *dev, const char *name)
 	if (of_address_to_resource(np, index, &res))
 		return IOMEM_ERR_PTR(-EINVAL);
 
-	/* Shared with the drivers of these blocks, so not claimed. */
+	/*
+	 * Shared with the drivers of these blocks, so not claimed. Non-posted where the bus says
+	 * so: on T8103 a posted write to these blocks is an SError.
+	 */
+	if (res.flags & IORESOURCE_MEM_NONPOSTED) {
+		base = ioremap_np(res.start, resource_size(&res));
+		if (!base ||
+		    devm_add_action_or_reset(dev, apple_sleep_iounmap, (void __force *)base))
+			return IOMEM_ERR_PTR(-ENOMEM);
+		return base;
+	}
 	base = devm_ioremap(dev, res.start, resource_size(&res));
 	if (!base)
 		return IOMEM_ERR_PTR(-ENOMEM);
@@ -7912,13 +7991,14 @@ static int apple_sleep_probe(struct platform_device *pdev)
 				 READ_ONCE(sleep_el1_wfi) >= 2 ? "EL1 on every core" : "EL1 on the boot core",
 				 &(phys_addr_t){ __pa_symbol(t8142_el1_wfi_stub) });
 		}
-		dev_info(dev, "probe: pwrgate wake %#x %#x cpm %#x %#x, commit %#x, clusters %#x %#x\n",
-			 readl(s->pwrgate + s->soc->pwrgate_wake[0]),
-			 readl(s->pwrgate + s->soc->pwrgate_wake[1]),
-			 readl(s->pwrgate + s->soc->pwrgate_cpm[0]),
-			 readl(s->pwrgate + s->soc->pwrgate_cpm[1]), readl(s->commit),
-			 readl(s->cluster + s->soc->cluster_cpu[0]),
-			 readl(s->cluster + s->soc->cluster_cpu[1]));
+		if (s->pwrgate)
+			dev_info(dev, "probe: pwrgate wake %#x %#x cpm %#x %#x, commit %#x, clusters %#x %#x\n",
+				 readl(s->pwrgate + s->soc->pwrgate_wake[0]),
+				 readl(s->pwrgate + s->soc->pwrgate_wake[1]),
+				 readl(s->pwrgate + s->soc->pwrgate_cpm[0]),
+				 readl(s->pwrgate + s->soc->pwrgate_cpm[1]), readl(s->commit),
+				 readl(s->cluster + s->soc->cluster_cpu[0]),
+				 readl(s->cluster + s->soc->cluster_cpu[1]));
 		dev_warn(dev, "sleep data derived for this SoC, untested: deep sleep is %s, and %s\n",
 			 READ_ONCE(sleep_deep) ? "offered (apple_sleep.deep=1)" : "off (apple_sleep.deep=1 offers it)",
 			 READ_ONCE(sleep_untested_commit) ? "the commit is allowed" :
@@ -9622,6 +9702,8 @@ static const struct apple_sleep_soc t8142_sleep_soc = {
 	.wake_last_word = GENMASK(11, 0),
 };
 
+#include "sleep-t8103.h"
+
 /*
  * Qualified profiles expose system sleep. Inventory-only profiles match for a
  * precise refusal and cannot reach hardware preparation or suspend_set_ops().
@@ -9633,6 +9715,7 @@ static const struct of_device_id apple_sleep_of_match[] = {
 	{ .compatible = "apple,t8142-sleep", .data = &t8142_sleep_soc },
 	{ .compatible = "apple,t6050-sleep", .data = &t6050_sleep_soc },
 	{ .compatible = "apple,t6050-j716c-sleep", .data = &t6050_j716c_sleep_soc },
+	{ .compatible = "apple,t8103-sleep", .data = &t8103_sleep_soc },
 	{ }
 };
 
