@@ -211,12 +211,6 @@ struct apple_soc_cpufreq_info {
 	u32 transition_timeout_us;
 	/* Highest P-state allowed without a thermal policy; 0 if not capped. */
 	u32 max_unmanaged_pstate;
-	/*
-	 * A board DT whose thermal zones list the cluster's CPU as a cooling
-	 * device is that thermal policy: it lifts max_unmanaged_pstate and
-	 * stands in for needs_thermal_policy's fast die-temperature limit.
-	 */
-	bool zone_cooling_qualifies;
 	u64 min_pstate;
 	u64 max_pstate;
 	u64 cur_pstate_mask;
@@ -234,8 +228,6 @@ struct apple_cpu_priv {
 	unsigned int expected_pstate;
 	struct freq_qos_request unmanaged_cap;
 	bool thermal_owned;
-	/* zone_cooling_qualifies, and the DT's thermal zones cool the cluster */
-	bool zone_cooled;
 	/*
 	 * Lazy verification, see apple_soc_cpufreq_lazy_request(): the lock
 	 * serialises the command register, expected_pstate and
@@ -323,16 +315,18 @@ static const struct apple_soc_cpufreq_info soc_t8142_info = {
 };
 
 /*
- * T8152 ACC uses state 2 as the first OPP and shares P/M requests. Above
- * state 3 it needs a board thermal policy: thermal zones in the DT that
- * throttle the cluster's CPUs (the J873g's SMC zones).
+ * T8152 ACC uses state 2 as the first OPP and shares P/M requests. It has no
+ * PMP fast die-temperature loop, so states above 3 are held back until the
+ * board's thermal policy takes ownership, see
+ * apple_soc_cpufreq_set_thermal_owner(): the SMC thermal zones once they
+ * throttle the cluster (macsmc-hwmon). This bootstrap ceiling is a Linux
+ * restriction, not a firmware thermal or safety limit.
  */
 static const struct apple_soc_cpufreq_info soc_t8152_info = {
 	.verify_transition = true,
-	.needs_thermal_policy = true,
+	.needs_thermal_owner = true,
 	.transition_timeout_us = 2000,
 	.max_unmanaged_pstate = 3,
-	.zone_cooling_qualifies = true,
 	.min_pstate = 2,
 	.max_pstate = 31,
 	.ps1_mask = APPLE_DVFS_CMD_PS1,
@@ -1193,8 +1187,7 @@ static int apple_fast_die_init(struct cpufreq_policy *policy,
 	parsed = of_parse_phandle_with_fixed_args(cluster, "apple,fast-die-effort",
 						  1, 0, &args);
 	/* Required thermal admission must fail closed with an older DT. */
-	if (parsed == -ENOENT &&
-	    (!priv->info->needs_thermal_policy || priv->zone_cooled))
+	if (parsed == -ENOENT && !priv->info->needs_thermal_policy)
 		return 0;
 
 	while (policy->freq_table[n].frequency != CPUFREQ_TABLE_END)
@@ -1401,50 +1394,6 @@ int apple_soc_cpufreq_set_thermal_owner(struct cpufreq_policy *policy, bool owne
 }
 EXPORT_SYMBOL_GPL(apple_soc_cpufreq_set_thermal_owner);
 
-/* Whether a cooling map of a thermal zone in zones lists cpu as a device */
-static bool apple_soc_cpufreq_cpu_cooled(struct device_node *zones,
-					 struct device_node *cpu)
-{
-	for_each_available_child_of_node_scoped(zones, zone) {
-		struct device_node *maps __free(device_node) =
-			of_get_child_by_name(zone, "cooling-maps");
-
-		if (!maps)
-			continue;
-		for_each_child_of_node_scoped(maps, map) {
-			struct of_phandle_args args;
-			int i;
-
-			for (i = 0;; i++) {
-				if (of_parse_phandle_with_args(map, "cooling-device",
-							       "#cooling-cells", i,
-							       &args))
-					break;
-				of_node_put(args.np);
-				if (args.np == cpu)
-					return true;
-			}
-		}
-	}
-	return false;
-}
-
-/*
- * Whether the DT's thermal zones throttle the cluster: the board thermal
- * policy that zone_cooling_qualifies accepts. The cluster's cpufreq cooling
- * device is registered for the node of policy->cpu, so that is the node a
- * cooling map has to name. A tree without one keeps the SoC's ceiling.
- */
-static bool apple_soc_cpufreq_zone_cooled(struct cpufreq_policy *policy)
-{
-	struct device_node *zones __free(device_node) =
-		of_find_node_by_path("/thermal-zones");
-	struct device_node *np __free(device_node) =
-		of_cpu_device_node_get(policy->cpu);
-
-	return zones && np && apple_soc_cpufreq_cpu_cooled(zones, np);
-}
-
 static int apple_soc_cpufreq_init(struct cpufreq_policy *policy)
 {
 	struct cpufreq_frequency_table *p;
@@ -1545,12 +1494,8 @@ static int apple_soc_cpufreq_init(struct cpufreq_policy *policy)
 		priv->expected_pstate = state;
 	}
 
-	priv->zone_cooled = info->zone_cooling_qualifies &&
-			    apple_soc_cpufreq_zone_cooled(policy);
-
 	/* SoCs without a qualified thermal policy keep their bootstrap ceiling. */
-	if (info->max_unmanaged_pstate && !info->needs_thermal_owner &&
-	    !priv->zone_cooled) {
+	if (info->max_unmanaged_pstate && !info->needs_thermal_owner) {
 		cpufreq_for_each_valid_entry(p, freq_table) {
 			if (p->driver_data <= info->max_unmanaged_pstate)
 				continue;
