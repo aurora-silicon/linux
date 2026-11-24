@@ -207,6 +207,16 @@ properties:
     $ref: /schemas/types.yaml#/definitions/uint32-array
     description: Pins neither saved nor restored.
 
+  apple,vdd-cio-request:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      The value the sleep entry writes to the SMC's pmVC key to hold the
+      VDD_CIO rail up over the transition - the board's rail enable mask with
+      bit 8 set. The rail is power-gated otherwise, and one the SMC drops
+      during the transition races the sleep engine's hand-over of the Type-C
+      ports. Omitted on a board whose mask is not known, and then no request
+      is made.
+
 required:
   - compatible
   - reg
