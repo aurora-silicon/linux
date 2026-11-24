@@ -21,6 +21,44 @@ pub(crate) mod qinfo {
     /// u64 scheduling context VA, then u64 4.
     pub(crate) const SCHED_CTX: usize = 0xa4;
     pub(crate) const UNK_AC: usize = 0xac;
+
+    /// The queue-info words that move between firmware ABIs.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) struct Layout {
+        /// Bytes of the firmware-owned header (what it invalidates on a new queue); the queue
+        /// scratch follows it in the same object.
+        pub(crate) header: usize,
+        /// u32 2, read as a byte by the firmware (row 2's `UNK_48`).
+        pub(crate) class_c: usize,
+        /// u32 `u32::MAX`.
+        pub(crate) unk_4c: usize,
+        pub(crate) uuid: usize,
+        /// u64 scheduling context VA.
+        pub(crate) sched_ctx: usize,
+        /// Firmware u32 busy flag: 1 from when the firmware takes a record until DONE (+0x20)
+        /// reaches the head (+0x28).
+        pub(crate) busy: usize,
+    }
+
+    pub(crate) const V25G83: Layout = Layout {
+        header: 0xb0,
+        class_c: super::qinfo_row2::UNK_48,
+        unk_4c: UNK_4C,
+        uuid: UUID,
+        sched_ctx: SCHED_CTX,
+        busy: 0x80,
+    };
+
+    /// 26B123 queue-info header (0x80 bytes): class_c at 0x44, unk_4c at 0x48, uuid at 0x4c,
+    /// busy at 0x54, scheduling context aligned at 0x78, and queue scratch starting at 0x80.
+    pub(crate) const V26B123: Layout = Layout {
+        header: 0x80,
+        class_c: 0x44,
+        unk_4c: 0x48,
+        uuid: 0x4c,
+        sched_ctx: 0x78,
+        busy: 0x54,
+    };
 }
 
 /// Queue-info scheduling rows (the firmware's recognized policy rows).
@@ -115,9 +153,22 @@ pub(crate) mod pools {
     pub(crate) const SEEDS: usize = 8192;
 }
 
-/// The nonzero queue header; the rest of the fresh 0x24c0 object remains zero. Keeping the
-/// scratch inside this object is part of the M4 ABI, not a separate buffer allocation.
+/// The nonzero 25G83 queue header; the rest of the fresh 0x24c0 object remains zero. Keeping
+/// the scratch inside this object is part of the M4 ABI, not a separate buffer allocation.
 pub(crate) fn queue_image(
+    state: u64,
+    ring: u64,
+    list: u64,
+    queue: u64,
+    context: u64,
+) -> [u8; 0xb4] {
+    queue_image_for(&qinfo::V25G83, state, ring, list, queue, context)
+}
+
+/// The nonzero queue header of `layout`'s ABI, zero-padded to 0xb4 bytes; the scratch starts
+/// right after the firmware-owned header. The same 0x24c0 object holds either.
+pub(crate) fn queue_image_for(
+    layout: &qinfo::Layout,
     state: u64,
     ring: u64,
     list: u64,
@@ -129,9 +180,9 @@ pub(crate) fn queue_image(
         (0, state),
         (8, ring),
         (0x10, list),
-        (0x18, queue + 0xb0),
+        (0x18, queue + layout.header as u64),
         (0x38, qinfo_row2::MASK_VALUE),
-        (0xa4, context),
+        (layout.sched_ctx, context),
     ] {
         q[at..at + 8].copy_from_slice(&value.to_le_bytes());
     }
@@ -139,8 +190,8 @@ pub(crate) fn queue_image(
         (0x2c, u32::MAX),
         (0x30, 2u32),
         (0x34, 2),
-        (0x48, 2),
-        (0x4c, u32::MAX),
+        (layout.class_c, 2),
+        (layout.unk_4c, u32::MAX),
     ] {
         q[at..at + 4].copy_from_slice(&value.to_le_bytes());
     }
