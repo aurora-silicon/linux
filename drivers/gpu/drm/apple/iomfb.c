@@ -3511,6 +3511,8 @@ int dcp_crtc_check_hdr(struct apple_dcp *dcp, struct drm_crtc *crtc,
 	    req.eotf == HDMI_EOTF_TRADITIONAL_GAMMA_SDR &&
 	    req.colorspace == DRM_MODE_COLORIMETRY_DEFAULT)
 		return 0;
+	if (!READ_ONCE(dcp->iomfb_template_pq) || dcp_is_ext26(dcp))
+		return -EINVAL;
 	if (!lookup_mode(dcp, &crtc_state->mode, &mode))
 		return -EINVAL;
 	return dcp_select_color_mode(&mode, &req, &selected);

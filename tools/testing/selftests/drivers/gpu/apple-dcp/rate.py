@@ -357,12 +357,15 @@ int main(int argc, char **argv)
             free(m);
         }
         /* Unsafe-only >340 MHz timing falls back to non-DSC unsafe PQ (105),
-         * still skipping DSC-required unsafe PQ (113) when pq_dsc is false. */
-        assert(!parse(unsafe_only_blob, sizeof(unsafe_only_blob), &c));
-        m = enumerate_modes(&c, &n, 600, 330, 0, false, false);
-        assert(!IS_ERR(m) && n == 1 && !m[0].sdr_usable && m[0].sdr_unsafe);
-        assert(m[0].pq.id == 105 && m[0].pq.depth == 12);
-        free(m);
+         * still skipping DSC-required unsafe PQ (113) even when pq_dsc is true. */
+        for (unsigned int dsc = 0; dsc < 2; dsc++) {
+            assert(!parse(unsafe_only_blob, sizeof(unsafe_only_blob), &c));
+            c.pq_dsc = dsc;
+            m = enumerate_modes(&c, &n, 600, 330, 0, false, false);
+            assert(!IS_ERR(m) && n == 1 && !m[0].sdr_usable && m[0].sdr_unsafe);
+            assert(m[0].pq.id == 105 && m[0].pq.depth == 12);
+            free(m);
+        }
         /* The default modes; the timing ID that carries DRM_MODE_TYPE_PREFERRED. */
         static const struct { const unsigned char *blob; size_t size; bool internal; u32 id; } d[] = {
             { default_acer, sizeof(default_acer), false, 2 },

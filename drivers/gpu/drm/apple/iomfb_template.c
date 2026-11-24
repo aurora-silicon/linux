@@ -4276,16 +4276,18 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 		    dcp->mode.color_mode_id == mode->color_mode_id &&
 		    dcp->mode.timing_mode_id == mode->timing_mode_id;
 #endif
-	dcp->mode = (struct dcp_set_digital_out_mode_req){
-		.color_mode_id = mode->color_mode_id,
-		.timing_mode_id = mode->timing_mode_id
-	};
-	if (cmode)
-		dcp->active_color = *cmode;
-	else
-		dcp->active_color.score = -1;
-	dcp->output_pq = cmode && cmode->eotf == DCP_EOTF_ST_2084;
-	dcp->output_hdr = cmode && cmode->eotf != DCP_EOTF_SDR_GAMMA;
+	scoped_guard(spinlock_irqsave, &dcp->hdr.lock) {
+		dcp->mode = (struct dcp_set_digital_out_mode_req){
+			.color_mode_id = mode->color_mode_id,
+			.timing_mode_id = mode->timing_mode_id
+		};
+		if (cmode)
+			dcp->active_color = *cmode;
+		else
+			dcp->active_color.score = -1;
+		dcp->output_pq = cmode && cmode->eotf == DCP_EOTF_ST_2084;
+		dcp->output_hdr = cmode && cmode->eotf != DCP_EOTF_SDR_GAMMA;
+	}
 
 	/* Built-in ProMotion panels require timestamps even in fixed-120 mode. */
 	dcp->use_timestamps = mode->needs_timestamps && dcp->main_display;
@@ -4592,7 +4594,9 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		if (dcp->hw.iomfb_method_profile ==
 			    DCP_IOMFB_METHODS_H17P_EXTERNAL &&
 		    !new_state->fb->format->is_yuv &&
-		    req->surf[l].base.colorspace == DCP_COLORSPACE_P3_D65)
+		    req->surf[l].base.colorspace == DCP_COLORSPACE_P3_D65 &&
+		    (dcp->active_color.score < 0 ||
+		     dcp->active_color.colorimetry != DCP_COLORIMETRY_DCI_P3_RGB_D65))
 			req->surf[l].base.colorspace = DCP_COLORSPACE_UNSPECIFIED;
 #endif
 	}

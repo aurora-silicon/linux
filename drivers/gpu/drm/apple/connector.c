@@ -200,6 +200,8 @@ static int color_state_show(struct seq_file *m, void *data)
 	bool hdr_service, hdr_infoframe, hdr_sent_valid;
 	u32 timing_id, color_id;
 
+	bool vrr_enabled, output_pq, output_hdr, output_edr;
+
 	if (!pdev) {
 		seq_puts(m, "pipeline: none\n");
 		return 0;
@@ -210,10 +212,14 @@ static int color_state_show(struct seq_file *m, void *data)
 		return 0;
 	}
 
-	timing_id = dcp->mode.timing_mode_id;
-	color_id = dcp->mode.color_mode_id;
-	cm = dcp->active_color;
 	scoped_guard(spinlock_irqsave, &dcp->hdr.lock) {
+		timing_id = dcp->mode.timing_mode_id;
+		color_id = dcp->mode.color_mode_id;
+		cm = dcp->active_color;
+		vrr_enabled = dcp->vrr_enabled;
+		output_pq = dcp->output_pq;
+		output_hdr = dcp->output_hdr;
+		output_edr = dcp->output_edr;
 		hdr_service = !!dcp->hdr.service;
 		hdr_infoframe = dcp->hdr.infoframe;
 		hdr_sent_valid = dcp->hdr.sent_valid;
@@ -235,10 +241,10 @@ static int color_state_show(struct seq_file *m, void *data)
 	} else {
 		seq_puts(m, "depth: none\n");
 	}
-	seq_printf(m, "vrr_enabled: %u\n", dcp->vrr_enabled);
-	seq_printf(m, "output_pq: %u\n", dcp->output_pq);
-	seq_printf(m, "output_hdr: %u\n", dcp->output_hdr);
-	seq_printf(m, "output_edr: %u\n", dcp->output_edr);
+	seq_printf(m, "vrr_enabled: %u\n", vrr_enabled);
+	seq_printf(m, "output_pq: %u\n", output_pq);
+	seq_printf(m, "output_hdr: %u\n", output_hdr);
+	seq_printf(m, "output_edr: %u\n", output_edr);
 	seq_printf(m, "hdr_service: %u\n", hdr_service);
 	seq_printf(m, "hdr_infoframe: %u\n", hdr_infoframe);
 	seq_printf(m, "hdr_sent_valid: %u\n", hdr_sent_valid);

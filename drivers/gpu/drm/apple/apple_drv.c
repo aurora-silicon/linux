@@ -1134,6 +1134,8 @@ static int apple_connector_attach_hdr(struct drm_connector *connector,
 	/* drm_connector_attach_max_bpc_property() populates connector->state. */
 	if (!connector->state)
 		apple_connector_reset(connector);
+	if (!connector->state)
+		return -ENOMEM;
 	return drm_connector_attach_max_bpc_property(connector, 8, 12);
 }
 

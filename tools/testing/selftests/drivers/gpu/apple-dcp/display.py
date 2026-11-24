@@ -1040,13 +1040,20 @@ int main(void)
         .format = DCP_COLOR_FORMAT_YCBCR422, .colorimetry = DCP_COLORIMETRY_BT2020_YCC,
         .range = DCP_COLOR_YCBCR_RANGE_LIMITED, .depth = 12 } };
     add_entry(&msi144, 80, DCP_EOTF_SDR_GAMMA, DCP_COLOR_FORMAT_RGB, DCP_COLORIMETRY_SRGB, DCP_COLOR_YCBCR_RANGE_FULL, 8, DCP_COLOR_FLAG_UNSAFE);
+    add_entry(&msi144, 113, DCP_EOTF_ST_2084, DCP_COLOR_FORMAT_RGB, DCP_COLORIMETRY_BT2020_RGB, DCP_COLOR_YCBCR_RANGE_FULL, 10, DCP_COLOR_FLAG_UNSAFE | DCP_COLOR_FLAG_DSC);
     add_entry(&msi144, 105, DCP_EOTF_ST_2084, DCP_COLOR_FORMAT_YCBCR422, DCP_COLORIMETRY_BT2020_YCC, DCP_COLOR_YCBCR_RANGE_LIMITED, 12, DCP_COLOR_FLAG_UNSAFE);
     req = (struct dcp_color_request){ .eotf = HDMI_EOTF_SMPTE_ST2084, .colorspace = DRM_MODE_COLORIMETRY_BT2020_YCC,
         .color_format = DRM_CONNECTOR_COLOR_FORMAT_YCBCR422, .max_bpc = 12,
-        .allow_hdr = true, .allow_unsafe_sdr = true };
+        .allow_hdr = true, .allow_dsc = true, .allow_unsafe_sdr = true };
     assert(!dcp_select_color_mode(&msi144, &req, &out) && out.id == 105);
+    /* DSC-required unsafe PQ (113) MUST be rejected even with allow_dsc=true */
+    req.color_format = DRM_CONNECTOR_COLOR_FORMAT_RGB444;
+    req.colorspace = DRM_MODE_COLORIMETRY_BT2020_RGB;
+    assert(dcp_select_color_mode(&msi144, &req, &out) == -EINVAL);
     /* Same unsafe entry on a timing with sdr_usable=true MUST be rejected */
     msi144.sdr_usable = true;
+    req.color_format = DRM_CONNECTOR_COLOR_FORMAT_YCBCR422;
+    req.colorspace = DRM_MODE_COLORIMETRY_BT2020_YCC;
     assert(dcp_select_color_mode(&msi144, &req, &out) == -EINVAL);
 
     puts("PASS: colour mode selection across RGB/YCbCr 444/422/420, 8/10/12 bpc, Full/Limited, wide gamut, PQ/HLG, and -EINVAL rejection");

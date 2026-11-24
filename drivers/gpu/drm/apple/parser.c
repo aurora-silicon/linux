@@ -785,8 +785,7 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 					handle->pq_dsc, false);
 			if (!external_sdr)
 				collect_pq_mode(&unsafe_pq, &best_unsafe_pq_rank,
-						&cmode, limits, handle->pq_dsc,
-						true);
+						&cmode, limits, false, true);
 		}
 		if (cmode.eotf == DCP_EOTF_SDR_GAMMA &&
 		    (!limits_known ||

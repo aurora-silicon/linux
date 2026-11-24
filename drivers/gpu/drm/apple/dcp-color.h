@@ -297,7 +297,8 @@ static inline int dcp_select_color_mode(const struct dcp_display_mode *mode,
 
 			if ((e->flags & DCP_COLOR_FLAG_UNSAFE) && !allow_unsafe)
 				continue;
-			if ((e->flags & DCP_COLOR_FLAG_DSC) && hdr && !req->allow_dsc)
+			if ((e->flags & DCP_COLOR_FLAG_DSC) && hdr &&
+			    (!req->allow_dsc || allow_unsafe))
 				continue;
 			if (e->depth > max_bpc)
 				continue;
