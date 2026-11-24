@@ -19,8 +19,8 @@ def method(source, signature):
 
 MOCKS = r"""
 use std::cell::Cell;
-use std::sync::{Mutex, atomic::{AtomicBool, Ordering}};
-#[derive(Clone, Copy)]
+use std::sync::{Mutex, atomic::{AtomicU8, Ordering}};
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Error(i32);
 impl Error {
     fn to_errno(self) -> i32 { self.0 }
@@ -28,6 +28,8 @@ impl Error {
 type Result = std::result::Result<(), Error>;
 const EIO: Error = Error(-5);
 const EBUSY: Error = Error(-16);
+const ENODEV: Error = Error(-19);
+const ETIMEDOUT: Error = Error(-110);
 const ECANCELED: Error = Error(-125);
 
 #[derive(Default)]
@@ -40,6 +42,11 @@ impl Vm {
     fn record(&self, error: Error) {
         if self.error.get() == 0 {
             self.error.set(error.0);
+        }
+    }
+    fn record_if_device_loss(&self, error: Error) {
+        if error == EIO || error == ETIMEDOUT || error == ENODEV {
+            self.record(error);
         }
     }
     fn submit(&self) -> Result {
@@ -66,7 +73,7 @@ impl Guard {
 struct Packet<'a> {
     vm: &'a Vm,
     vm_job: JobGuard,
-    finish_claimed: AtomicBool,
+    finish_state: AtomicU8,
     completion: Fence,
     commands: [(); 1],
 }
@@ -89,7 +96,7 @@ impl<'a> Packet<'a> {
         Self {
             vm,
             vm_job: JobGuard(Mutex::new(guard.then(Guard::default))),
-            finish_claimed: AtomicBool::new(false),
+            finish_state: AtomicU8::new(0),
             completion: Fence::default(),
             commands: [()],
         }
@@ -143,6 +150,32 @@ fn terminal_vm_error_remains_visible_and_blocks_the_same_vm() {
     assert_eq!(vm.submit().unwrap_err().0, -5);
     assert_eq!(faulty.completion.signals.get(), 1);
     assert_eq!(faulty.completion.error.get(), -5);
+}
+
+#[test]
+fn cancel_before_terminal_fault_records_vm_error_without_resignaling() {
+    let vm = Vm::default();
+    let packet = Packet::new(&vm, true);
+    packet.fail_packet(ECANCELED);
+    assert_eq!(vm.error.get(), 0);
+    assert_eq!(packet.completion.signals.get(), 1);
+    assert_eq!(packet.completion.error.get(), -125);
+    packet.finish(Err(EIO));
+    assert_eq!(vm.error.get(), -5);
+    assert_eq!(packet.completion.signals.get(), 1);
+    assert_eq!(packet.completion.error.get(), -125);
+}
+
+#[test]
+fn fail_packet_records_device_loss_errors() {
+    for err in [EIO, ETIMEDOUT, ENODEV] {
+        let vm = Vm::default();
+        let packet = Packet::new(&vm, false);
+        packet.fail_packet(err);
+        assert_eq!(vm.error.get(), err.0);
+        assert_eq!(packet.completion.error.get(), err.0);
+        assert_eq!(packet.completion.signals.get(), 1);
+    }
 }
 """
 
