@@ -3595,27 +3595,19 @@ static int cd321x_remove(struct tps6598x *tps)
  * J716c: the boot port keeps a USB2 repeater connection.
  * J575c: a connection that was up before Linux keeps its Type-C retimer set up
  * from before the host PHY ran, so SuperSpeed stays in RxDetect until the
- * partner is replugged. Byte 7 of register 0x7e has bit 3 set once the
- * controller has completed an attach with the OS running (after a replug, and
- * under macOS) and bit 2 in the inherited state; renegotiate only without
- * bit 3. A failure leaves the port as it was (USB2 only) instead of failing
- * the probe.
+ * partner is replugged. Every such connection is renegotiated: the controller
+ * reports nothing that tells it apart from one whose SuperSpeed side trains.
+ * A failure leaves the port as it was (USB2 only) instead of failing the probe.
  */
-#define CD321X_ATTACH_STATE_REG		0x7e
-#define CD321X_ATTACH_STATE_BYTE	7
-#define CD321X_ATTACH_STATE_DONE	BIT(3)
-
 struct cd321x_inherited_board {
 	const char *compatible;
 	u8 key[4];
-	bool check_attach_state;
 	bool best_effort;
 };
 
 static const struct cd321x_inherited_board cd321x_inherited_boards[] = {
 	{ .compatible = "apple,j716c", .key = { '6', '1', '7', 'J' } },
-	{ .compatible = "apple,j575c", .key = { '5', '7', '5', 'J' },
-	  .check_attach_state = true, .best_effort = true },
+	{ .compatible = "apple,j575c", .key = { '5', '7', '5', 'J' }, .best_effort = true },
 };
 
 static const struct cd321x_inherited_board *cd321x_inherited_board(void)
@@ -3626,19 +3618,6 @@ static const struct cd321x_inherited_board *cd321x_inherited_board(void)
 		if (of_machine_is_compatible(cd321x_inherited_boards[i].compatible))
 			return &cd321x_inherited_boards[i];
 	return NULL;
-}
-
-static int cd321x_attach_state_done(struct tps6598x *tps)
-{
-	u8 state[CD321X_ATTACH_STATE_BYTE + 1];
-	int ret;
-
-	ret = tps6598x_block_read(tps, CD321X_ATTACH_STATE_REG, state, sizeof(state));
-	if (ret)
-		return ret;
-	dev_dbg(tps->dev, "inherited connection, attach state 0x%02x\n",
-		state[CD321X_ATTACH_STATE_BYTE]);
-	return !!(state[CD321X_ATTACH_STATE_BYTE] & CD321X_ATTACH_STATE_DONE);
 }
 
 static int __cd321x_reset_inherited_connection(struct tps6598x *tps,
@@ -3653,11 +3632,6 @@ static int __cd321x_reset_inherited_connection(struct tps6598x *tps,
 	mode = tps6598x_check_mode(tps);
 	if (mode != TPS_MODE_APP && mode != TPS_MODE_APP1)
 		return 0;
-	if (board->check_attach_state) {
-		ret = cd321x_attach_state_done(tps);
-		if (ret)
-			return ret < 0 ? ret : 0;
-	}
 
 	/* All suppliers are available, but no USB or router session has started. */
 	ret = tps6598x_exec_cmd(tps, "LOCK", sizeof(board->key), board->key, sizeof(result),

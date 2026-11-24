@@ -345,6 +345,12 @@ struct avd_ctx {
 	void *priv;
 
 	struct avd_comp comp;
+	/*
+	 * Picture format the codec sized its per-stream scratch for at
+	 * STREAMON, if it sizes any from the picture format.
+	 */
+	bool scratch_sized;
+	enum avd_image_fmt scratch_fmt;
 	int fifo_idx;
 	/* Pictures of this context the queue may hold at once (0 or 1: one). */
 	unsigned int max_frames;
@@ -368,9 +374,12 @@ void avd_job_finish_no_pm(struct avd_ctx *ctx, enum vb2_buffer_state result);
 void avd_job_finish(struct avd_ctx *ctx, enum vb2_buffer_state result);
 
 void avd_run_preamble(struct avd_ctx *ctx, struct avd_run *run);
+int avd_check_run_image_fmt(struct avd_ctx *ctx, enum avd_image_fmt image_fmt);
 void avd_run_postamble(struct avd_ctx *ctx, struct avd_run *run);
+int avd_ctrl_copy(struct avd_ctx *ctx, u32 id, void *dst, size_t size);
 
 #if IS_ENABLED(CONFIG_KUNIT)
+int avd_ctrl_copy_value(struct v4l2_ctrl *ctrl, void *dst, size_t size);
 bool avd_h264_find_slice_data(const u8 *data, u32 len, u32 header_len,
 			      u32 *off);
 bool avd_h264_slice_fits(const struct v4l2_ctrl_h264_sps *sps, size_t held,
@@ -380,10 +389,33 @@ bool avd_h264_scaling_is_flat(const struct v4l2_ctrl_h264_pps *pps,
 int avd_hevc_check_sps_geometry(const struct v4l2_ctrl_hevc_sps *sps);
 int avd_hevc_check_tiles(const struct v4l2_ctrl_hevc_sps *sps,
 			 const struct v4l2_ctrl_hevc_pps *pps);
+int avd_hevc_check_slices(const struct v4l2_ctrl_hevc_sps *sps,
+			  const struct v4l2_ctrl_hevc_pps *pps,
+			  const struct v4l2_ctrl_hevc_decode_params *decode,
+			  const struct v4l2_ctrl_hevc_slice_params *slices,
+			  u32 num_slices, const u32 *entry_points,
+			  u32 num_entry_points, u32 payload);
 int avd_hevc_kunit_compute_tiles(const struct v4l2_ctrl_hevc_sps *sps,
 				 const struct v4l2_ctrl_hevc_pps *pps,
 				 u32 *tile_ids, size_t n);
+int avd_av1_check_tiles(struct device *dev, unsigned int tile_rows,
+			unsigned int tile_cols,
+			const struct v4l2_ctrl_av1_tile_group_entry *tile_group,
+			unsigned int entries, size_t payload);
+struct v4l2_ctrl_av1_tile_group_entry *
+avd_av1_copy_tile_group(struct v4l2_ctrl *ctrl, unsigned int *entries);
+int avd_av1_check_frame_size(const struct v4l2_ctrl_av1_frame *frame,
+			     u32 width, u32 height);
+int avd_h264_validate_sps(struct avd_ctx *ctx,
+			  const struct v4l2_ctrl_h264_sps *sps);
+size_t avd_h264_start_slices(const struct v4l2_ctrl_h264_sps *sps);
+int avd_try_capture_fmt(struct file *file, void *priv, struct v4l2_format *f);
+int avd_s_capture_fmt(struct file *file, void *priv, struct v4l2_format *f);
 int avd_vp9_check_tiling(const struct v4l2_ctrl_vp9_frame *frame);
+int avd_vp9_next_tile(const u8 *data, u32 payload, bool last, u32 *offset,
+		      u32 *size);
+bool avd_vp9_frame_fits(const struct v4l2_ctrl_vp9_frame *frame, u32 width,
+			u32 height);
 #endif
 
 extern const struct avd_coded_fmt_ops avd_h264_fmt_ops;

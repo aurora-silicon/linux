@@ -1667,13 +1667,15 @@ int dptxep_init(struct apple_dcp *dcp)
 			 * up so a later announce can still bind.
 			 */
 			/*
-			 * A firmware-27 external processor whose ports are not
-			 * on this endpoint announces nothing here either (a 27.2
-			 * dcpext on DPTX_ENDPOINT_V2 where its firmware does not
-			 * advertise DPTX_ENDPOINT, see dcp_v27_dptx_layout()).
+			 * A firmware-27 external processor, or a firmware-27
+			 * DCP with Type-C routes, whose ports are not on this
+			 * endpoint announces nothing here either (a 27.2 DCP on
+			 * DPTX_ENDPOINT_V2 where its firmware does not advertise
+			 * DPTX_ENDPOINT, see dcp_v27_dptx_layout()).
 			 */
 			if (dcp_fw_is_14_7(dcp) || dcp_is_ext26(dcp) ||
-			    (dcp->fw_compat == DCP_FIRMWARE_V_27_0 && dcp->dcpext)) {
+			    (dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+			     (dcp->dcpext || dcp->nr_typec_routes))) {
 				dev_info(dcp->dev,
 					 "DPTX port %u not announced yet\n", port);
 				return 0;

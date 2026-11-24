@@ -543,6 +543,24 @@ enum drm_asahi_feature {
  */
 #define DRM_ASAHI_FEATURE_ASYNC_SUBMIT ((1ULL) << 39)
 
+/*
+ * DRM_ASAHI_FEATURE_VDM_USC_INVALIDATE: the render-start VDM barrier at the
+ * root of a render's VDM stream may set the USC cache invalidate (bit 3).
+ * Reported on every GPU: the kernel's stream checks admit the barrier word
+ * with or without it. A feature bit like those of enum drm_asahi_feature,
+ * defined here like bit 32.
+ */
+#define DRM_ASAHI_FEATURE_VDM_USC_INVALIDATE ((1ULL) << 40)
+
+/*
+ * DRM_ASAHI_FEATURE_COMPUTE_ONLY: the device runs compute commands only.
+ * DRM_ASAHI_CMD_RENDER is refused, so the device cannot serve graphics APIs;
+ * userspace should not offer it for them. Compute commands, the VM and GEM
+ * interfaces are unaffected. A feature bit like those of enum
+ * drm_asahi_feature, defined here like bit 32.
+ */
+#define DRM_ASAHI_FEATURE_COMPUTE_ONLY ((1ULL) << 41)
+
 #define DRM_ASAHI_PARAM_GROUP_VM_STATUS 1
 #define DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS 2
 
@@ -774,12 +792,12 @@ struct drm_asahi_gem_create {
  * object stays the parent's memory. The CPU and GPU views are coherent
  * without cache maintenance.
  *
- * The pinned pages count against the caller's RLIMIT_MEMLOCK, together with
- * its other long-term pins, unless it has CAP_IPC_LOCK (ENOMEM otherwise),
- * and their size against the client and device limits of
+ * The size of the object counts against the client and device limits of
  * drm_asahi_params_global::client_memory_limit and
- * drm_asahi_params_global::memory_limit (ENOMEM). They are never released by
- * memory-pressure reclaim.
+ * drm_asahi_params_global::memory_limit (ENOMEM), as that of a
+ * DRM_IOCTL_ASAHI_GEM_CREATE object does. The pinned pages are shown in the
+ * caller's VmPin (mm->pinned_vm) but are not limited by its RLIMIT_MEMLOCK.
+ * They are never released by memory-pressure reclaim.
  *
  * Without DRM_ASAHI_GEM_USERPTR_READ_ONLY, the whole range must be mapped
  * writable, and not be a shared mapping of a file whose filesystem tracks

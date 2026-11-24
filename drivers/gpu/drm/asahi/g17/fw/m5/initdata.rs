@@ -1857,7 +1857,7 @@ const COMMON26_POLICY_BOOT_TIMESTAMP: usize = 0x6c14;
 /// initPowerAndPerformanceData stores (the G18 backend's G18G_26A428_POLICY_BANDS). 26A428
 /// inserts 0x680 bytes between the AON PTD pointer and the boot timestamp; the 25G76 words
 /// there have no place.
-const COMMON26_POLICY_BANDS: &[LayoutBand] = &[
+pub(crate) const COMMON26_POLICY_BANDS: &[LayoutBand] = &[
     band(0x0000, 0x009c, 0, Evidence::ProducerChecked),
     band(0x00a0, 0x0200, 0x10, Evidence::ProducerChecked),
     band(0x09b8, 0x295c, 0x10, Evidence::ProducerChecked),
@@ -2438,6 +2438,9 @@ pub(crate) struct Board {
     /// Whether explicit waits on other kicks take the completion class
     /// ([`Board::completion_inputs`]).
     completion_inputs: bool,
+    /// Whether firmware accepts tiling kicks without an entry signal and retained
+    /// render pairs kicked through the host port alone.
+    pub(crate) host_only_render_kicks: bool,
 }
 
 /// M5 Pro: two clusters of ten cores.
@@ -2467,6 +2470,7 @@ pub(crate) const J714: Board = Board {
     fan_curve_start_mc: 84_000,
     g17d_forms: false,
     completion_inputs: true,
+    host_only_render_kicks: false,
 };
 
 /// M5 Max: four clusters of ten cores.
@@ -2498,6 +2502,10 @@ pub(crate) const J716C: Board = Board {
     fan_curve_start_mc: 84_000,
     g17d_forms: false,
     completion_inputs: false,
+    // Qualified on G17C's 26A428 image. G17S uses completion-class inputs,
+    // G17D has distinct kick encodings, and common 26A428 publishes descriptors
+    // on the item ring. Qualify those interfaces separately.
+    host_only_render_kicks: true,
 };
 
 /// J775D's performance controllers run from P3.
@@ -2539,6 +2547,7 @@ pub(crate) const J775D: Board = Board {
     fan_curve_start_mc: 97_000,
     g17d_forms: true,
     completion_inputs: false,
+    host_only_render_kicks: false,
 };
 
 /// M5 (T8142, MacBook Air J813): one cluster of ten core slots, eight enabled. Values from the
@@ -2578,6 +2587,7 @@ pub(crate) const J813: Board = Board {
     fan_curve_start_mc: 84_000,
     g17d_forms: false,
     completion_inputs: false,
+    host_only_render_kicks: false,
 };
 
 /// The J813 on its macOS 27.2 (26B123) firmware: the same board on the common 26B123 graph.

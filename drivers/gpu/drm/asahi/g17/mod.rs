@@ -375,6 +375,16 @@ enum CrashLogMap {
     FirmwareData(data_segment::DataSegmentLog),
 }
 
+impl CrashLog {
+    /// Map only the range firmware requested within its loader-reserved data.
+    pub(crate) fn from_firmware(dev: &device::Device, iova: usize, size: usize) -> Result<Self> {
+        Ok(Self {
+            iova,
+            map: CrashLogMap::FirmwareData(data_segment::DataSegmentLog::map(dev, iova, size)?),
+        })
+    }
+}
+
 impl rtkit::Buffer for CrashLog {
     fn iova(&self) -> Result<usize> {
         Ok(self.iova)
@@ -483,14 +493,7 @@ impl rtkit::Operations for RoleOps {
             });
         }
         // The firmware places its buffers in its data segment, at their physical address.
-        Ok(CrashLog {
-            iova,
-            map: CrashLogMap::FirmwareData(data_segment::DataSegmentLog::map(
-                &data.shared.dev,
-                iova,
-                size,
-            )?),
-        })
+        CrashLog::from_firmware(&data.shared.dev, iova, size)
     }
 }
 
@@ -2523,6 +2526,21 @@ impl gpu::Gpu for Gpu {
 
     fn is_crashed(&self) -> bool {
         self.shared.crashed.load(Ordering::Acquire)
+    }
+
+    /// A parked render pair keeps its views of the kick rings in the VM that last ran on it
+    /// while that VM is open. Once the client has closed the VM (its status says so before
+    /// this runs), they go, one pair at a time and dropped off the device lock, so they do not
+    /// keep the VM's page tables alive. A pair that parks or returns after this sees the
+    /// closed status itself.
+    fn vm_closed(&self, _vm: &mmu::Vm) {
+        loop {
+            let views = (*self.shared.state.lock())
+                .as_deref_mut()
+                .and_then(|firmware| firmware.queues.take_closed_parked_views());
+            let Some(views) = views else { break };
+            drop(views);
+        }
     }
 
     fn get_params(&self, params: &mut uapi::drm_asahi_params_global) -> Result {

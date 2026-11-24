@@ -55,8 +55,8 @@ typedef uint64_t dma_addr_t;
 #define AVD_MAX_INST 512
 #define AVD_CODEC_AV1 3
 #define AVD_MAX_FRAMES 16
-#define AVD_IMG_FMT_420_10BIT 1
-#define AVD_IMG_FMT_422_10BIT 2
+enum avd_image_fmt { AVD_IMG_FMT_ANY, AVD_IMG_FMT_420_8BIT, AVD_IMG_FMT_420_10BIT,
+ AVD_IMG_FMT_422_8BIT, AVD_IMG_FMT_422_10BIT };
 #define AVD_FRAME_SUBMITTED 2
 #define AVD_FRAME_DONE 3
 #define IRQ_HANDLED 1
@@ -418,7 +418,9 @@ static bool valid_data=true;
 static struct vb2_v4l2_buffer *v4l2_m2m_next_src_buf(void *m) { (void)m;return fixture_run.base.bufs.src; }
 static size_t vb2_get_plane_payload(struct vb2_buffer *b,int p) { (void)b;(void)p;return valid_data?16:2; }
 static void *vb2_plane_vaddr(struct vb2_buffer *b,int p) { (void)b;(void)p;static u8 data[16];return data; }
-static void avd_h264_run_preamble(struct avd_ctx *ctx,struct avd_h264_run *r) { (void)ctx;*r=fixture_run; }
+static int avd_h264_run_preamble(struct avd_ctx *ctx,struct avd_h264_run *r) { (void)ctx;*r=fixture_run;return 0; }
+/* The run-time format check has its own KUnit suite (avd-fmt-test.c). */
+static int avd_check_run_image_fmt(struct avd_ctx *ctx,int f) { (void)ctx;(void)f;return 0; }
 static void avd_run_postamble(struct avd_ctx *ctx,struct avd_run *r) { (void)ctx;(void)r;postambles++; }
 static bool avd_h264_slice_fits(const struct v4l2_ctrl_h264_sps *s,size_t n,size_t b,u32 l,size_t z)
 { (void)s;(void)b;(void)l;(void)z;return n<20; }
@@ -550,7 +552,7 @@ def prepare_regressions(out):
     code += function((ROOT / 'avd-backend-open.c').read_text(), 'avd_open_build_program')
     code += function((ROOT / 'avd-hevc.c').read_text(), 'avd_hevc_check_sps_geometry')
     code += function((ROOT / 'avd-hevc.c').read_text(), 'avd_hevc_validate_sps')
-    code += RUN_FIXTURE + function(source, 'avd_h264_run') + RUN_MAIN
+    code += RUN_FIXTURE + function(source, 'avd_h264_sps_image_fmt') + function(source, 'avd_h264_run') + RUN_MAIN
     dest = out / 'prepare.c'
     dest.write_text(code)
     exe = dest.with_suffix('')
