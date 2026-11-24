@@ -161,6 +161,10 @@ pub(super) struct ServiceResult {
     pub(super) target_error: Option<Error>,
     /// Every VM found guilty had failed before, and the restart dropped one of its commands.
     pub(super) leftover: bool,
+    /// The restart found guilty VMs and is charged to them ([`VmStatus::charge_restart`]): each
+    /// was found guilty for the first time, which costs its client the device, or still held
+    /// work from then. It does not count toward the device's storm limit.
+    pub(super) charged: bool,
 }
 
 impl State {
@@ -177,6 +181,7 @@ impl State {
     }
     /// Like timeouts, restarts with work retired between them start a new window: each one
     /// still costs the guilty client its device, but only restarts without progress stop the GPU.
+    /// Restarts charged to their guilty clients (`ServiceResult::charged`) are not counted.
     pub(super) fn restart_limit(&mut self, now: u64) -> bool {
         self.restarts.note_unless_progress(now, safety::retired())
     }
@@ -314,7 +319,8 @@ pub(super) fn service<H: Host>(
     report_clients(host, request.generation, &entries, request.blamed);
 
     let (listed, exact, fallback) = (entries.listed, entries.exact, entries.fallback);
-    let (cancelled, blame, leftover) = classify(host, entries, request.blamed, attribution);
+    let (cancelled, blame, leftover, charged) =
+        classify(host, entries, request.blamed, attribution);
     if listed != 0 && host.is_m5() {
         // The M5 table only classifies (read_entries): each command is retired from its own
         // queue's records, replayed when it never ran.
@@ -346,7 +352,7 @@ pub(super) fn service<H: Host>(
     }
     let scan_error = host.rescan_compute().err();
     host.release_retired_compute();
-    Ok(ServiceResult { scan_error, target_error, leftover })
+    Ok(ServiceResult { scan_error, target_error, leftover, charged })
 }
 
 /// Names the client of each queue the recovery table lists, and of the blamed queue, before any
@@ -426,9 +432,13 @@ fn read_entries<H: Host>(host: &mut H) -> Entries {
 /// Also returns whether the firmware's blamed QID is still guilty after attribution: a blamed
 /// render that had not started while others had (or with no culprit at all) is innocent, and its
 /// work is spared like that of every other innocent VM instead of failing with EIO.
-/// Last, whether every guilty VM had failed before this restart and it dropped one of their
+/// Then whether every guilty VM had failed before this restart and it dropped one of their
 /// commands: a failed VM publishes nothing new, so such restarts end with its queued work.
-fn classify<Q: Queues>(queues: &mut Q, entries: Entries, blamed: Option<u8>, attribution: Attribution) -> (u128, bool, bool) {
+/// Last, whether the restart is charged to the guilty VMs ([`VmStatus::charge_restart`], with
+/// the commands each holds): one client's faults or hangs then cost only that client, however
+/// many VMs it opens. A restart without a guilty VM, or one that keeps blaming a VM for more
+/// than the work it held, is the device's.
+fn classify<Q: Queues>(queues: &mut Q, entries: Entries, blamed: Option<u8>, attribution: Attribution) -> (u128, bool, bool, bool) {
     let mut guilty_qids = entries.guilty | blamed.map_or(0, |qid| 1u128 << qid);
     let cancelled = entries.cancelled;
     match attribution {
@@ -439,7 +449,7 @@ fn classify<Q: Queues>(queues: &mut Q, entries: Entries, blamed: Option<u8>, att
     let no_culprit = attribution == Attribution::NoCulprit;
     let blame = blamed.is_some_and(|qid| guilty_qids & (1u128 << qid) != 0);
     if guilty_qids == 0 && !no_culprit {
-        return (0, blame, false);
+        return (0, blame, false, false);
     }
     let mut guilty: [Option<Arc<VmStatus>>; MAX_GUILTY_VMS] = Default::default();
     let mut count = 0;
@@ -475,7 +485,7 @@ fn classify<Q: Queues>(queues: &mut Q, entries: Entries, blamed: Option<u8>, att
         }
     }
     if unresolved || (count == 0 && collateral == 0 && !no_culprit) {
-        return (0, blame, false);
+        return (0, blame, false, false);
     }
     let known = |status: &Arc<VmStatus>| guilty[..count].iter().flatten().any(|known| Arc::ptr_eq(known, status));
     let mut dropped = false;
@@ -484,20 +494,27 @@ fn classify<Q: Queues>(queues: &mut Q, entries: Entries, blamed: Option<u8>, att
     }
     let leftover = count != 0 && dropped && guilty[..count].iter().flatten().all(|status| status.get() != 0);
     guilty[..count].iter().flatten().for_each(|status| status.note_recovery_guilty());
+    // Commands each guilty VM holds, counted as they are classified.
+    let held: [core::cell::Cell<u32>; MAX_GUILTY_VMS] = Default::default();
     let spared = queues.classify_work(&|status| {
-        guilty[..count]
-            .iter()
-            .find_map(|known| {
-                known
-                    .as_ref()
-                    .filter(|known| Arc::ptr_eq(known, status))
-                    .map(|_| Class::Guilty)
-            })
+        let known = guilty[..count].iter()
+            .position(|known| known.as_ref().is_some_and(|known| Arc::ptr_eq(known, status)));
+        match known {
+            Some(index) => {
+                held[index].set(held[index].get().saturating_add(1));
+                Class::Guilty
+            }
             // A VM an earlier recovery found guilty stays guilty. Spared, its leftover work would
             // make the next blame on it collateral, and that restart would count as a storm.
-            .unwrap_or(if status.recovery_guilty() { Class::Guilty } else { Class::Spared })
+            None if status.recovery_guilty() => Class::Guilty,
+            None => Class::Spared,
+        }
     });
-    (cancelled & !(guilty_qids & !collateral) & spared, blame, leftover)
+    // Every guilty VM is charged, even once one of them is over its count.
+    let charged = count != 0 && guilty[..count].iter().zip(&held).fold(true, |charged, (status, held)| {
+        status.as_ref().is_some_and(|status| status.charge_restart(held.get())) && charged
+    });
+    (cancelled & !(guilty_qids & !collateral) & spared, blame, leftover, charged)
 }
 
 
@@ -719,12 +736,35 @@ mod tests {
     #[test]
     fn only_dropped_work_of_an_already_failed_vm_is_leftover() {
         let mut queues = owners();
-        // A first failure counts toward the storm.
+        // A VM's first failure is not leftover work.
         assert!(!leftover(&mut queues, 60));
         queues.0[2].1.record(EIO);
         assert!(leftover(&mut queues, 60));
         // The restart dropped nothing of the failed VM.
         assert!(!leftover(&mut queues, 40));
+    }
+
+    #[test]
+    fn restarts_are_charged_to_their_guilty_clients_and_only_unblamed_ones_to_the_device() {
+        let mut queues = owners();
+        let charged = |queues: &mut Owners, attribution| {
+            classify(queues, Entries::default(), None, attribution).3
+        };
+        // Nobody to blame: the device's.
+        assert!(!charged(&mut queues, Attribution::NoCulprit));
+        assert!(!charged(&mut queues, Attribution::Firmware));
+        // Each VM pays for its first restart, then for one more per command it held then (two
+        // each here).
+        assert!(charged(&mut queues, Attribution::Queues(1u128 << 60)));
+        for _ in 0..3 {
+            assert!(charged(&mut queues, Attribution::Queues(1u128 << 40)));
+        }
+        // A firmware that keeps blaming a for work it no longer holds stops the GPU as before,
+        // even with b, still within its count, blamed beside it.
+        assert!(!charged(&mut queues, Attribution::Queues(1u128 << 40)));
+        assert!(!charged(&mut queues, Attribution::Queues((1u128 << 40) | (1u128 << 60))));
+        assert!(charged(&mut queues, Attribution::Queues(1u128 << 60)));
+        assert!(!charged(&mut queues, Attribution::Queues(1u128 << 60)));
     }
 
     #[test]

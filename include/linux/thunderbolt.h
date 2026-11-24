@@ -74,6 +74,7 @@ enum tb_security_level {
  * @remote_activity: Successful stock remote discovery exchanges
  * @nhi: Pointer to the NHI structure
  * @ctl: Control channel for this domain
+ * @noirq_ctl_retained: Control rings stayed active during noirq suspend
  * @wq: Ordered workqueue for all domain specific work
  * @root_switch: Root switch of this domain
  * @cm_ops: Connection manager specific operations vector
@@ -88,6 +89,7 @@ struct tb {
 	atomic64_t remote_activity;
 	struct tb_nhi *nhi;
 	struct tb_ctl *ctl;
+	bool noirq_ctl_retained;
 	struct workqueue_struct *wq;
 	struct tb_switch *root_switch;
 	const struct tb_cm_ops *cm_ops;
