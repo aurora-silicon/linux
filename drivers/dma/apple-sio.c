@@ -871,7 +871,8 @@ static struct dma_async_tx_descriptor *sio_prep_dma_cyclic(
 	struct sio_chan *siochan = to_sio_chan(chan);
 	struct sio_tx *siotx;
 
-	if (direction != sio_chan_direction(siochan->no))
+	if (siochan->host->tables_mismatch ||
+	    direction != sio_chan_direction(siochan->no))
 		return NULL;
 
 	siotx = sio_alloc_tx(siochan, buf_addr, buf_len, period_len, GFP_NOWAIT);
@@ -1944,25 +1945,13 @@ static const char *sio_dt_params_name(struct sio_data *sio)
 
 	if (sio->protocol != 10)
 		return "apple,sio-firmware-params";
-	if (!of_property_present(np, "apple,sio-firmware-params-v10")) {
-		u32 key, size;
-		int i, n = of_property_count_u32_elems(np, "apple,sio-firmware-params");
+	if (!sio_t6030_check_node(np, "apple,sio-firmware-params-v10"))
+		return "apple,sio-firmware-params-v10";
+	if (!sio_t6030_check_node(np, "apple,sio-firmware-params"))
+		return "apple,sio-firmware-params";
 
-		/* The earlier layout's five 32-byte shim records are never protocol 10's */
-		for (i = 0; i + 1 < n; i += 2)
-			if (!of_property_read_u32_index(np, "apple,sio-firmware-params", i, &key) &&
-			    key == 0x23 &&
-			    !of_property_read_u32_index(np, "apple,sio-firmware-params", i + 1,
-							&size) &&
-			    size == 5 * 32)
-				sio->tables_mismatch = true;
-		return "apple,sio-firmware-params";
-	}
-	if (sio_t6030_check_node(np, "apple,sio-firmware-params-v10")) {
-		sio->tables_mismatch = true;
-		return "apple,sio-firmware-params";
-	}
-	return "apple,sio-firmware-params-v10";
+	sio->tables_mismatch = true;
+	return NULL;
 }
 
 static int sio_send_dt_params(struct sio_data *sio)
@@ -1975,8 +1964,10 @@ static int sio_send_dt_params(struct sio_data *sio)
 		return sio->hw->send_dt_params(sio);
 
 	propname = sio_dt_params_name(sio);
-	if (sio->tables_mismatch)
+	if (!propname) {
 		dev_err(sio->dev, "boot tables are not for SIO protocol 10; no DMA\n");
+		return 0;
+	}
 
 	nparams = of_property_count_u32_elems(np, propname);
 	if (nparams < 0) {

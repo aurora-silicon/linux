@@ -325,12 +325,11 @@ static void sio_low_window_params_test(struct kunit *test)
 		{ "/sio-t6030-test/sio-low-window-test-both", 9, "apple,sio-firmware-params", false },
 		{ "/sio-t6030-test/sio-low-window-test-both", 10, "apple,sio-firmware-params-v10",
 		  false },
-		{ "/sio-t6030-test/sio-low-window-test-bad-v10", 10, "apple,sio-firmware-params",
-		  true },
+		{ "/sio-t6030-test/sio-low-window-test-bad-v10", 10, NULL, true },
 		{ "/sio-t6030-test/sio-low-window-test-bad-v10", 9, "apple,sio-firmware-params",
 		  false },
 		/* An older loader: the earlier tables only */
-		{ "/sio-t6030-test/sio-t6030-test-earlier", 10, "apple,sio-firmware-params", true },
+		{ "/sio-t6030-test/sio-t6030-test-earlier", 10, NULL, true },
 		{ "/sio-t6030-test/sio-t6030-test-earlier", 9, "apple,sio-firmware-params", false },
 		/* T6030: its protocol-10 tables are the first list */
 		{ "/sio-t6030-test/sio-t6030-test-v10", 10, "apple,sio-firmware-params", false },
@@ -342,6 +341,7 @@ static void sio_low_window_params_test(struct kunit *test)
 	for (i = 0; i < ARRAY_SIZE(cases); i++) {
 		struct device_node *np __free(device_node) = of_find_node_by_path(cases[i].path);
 		struct sio_data *sio = kunit_kzalloc(test, sizeof(*sio), GFP_KERNEL);
+		const char *propname;
 
 		KUNIT_ASSERT_NOT_NULL_MSG(test, np, "%s", cases[i].path);
 		KUNIT_ASSERT_NOT_NULL(test, dev);
@@ -349,11 +349,29 @@ static void sio_low_window_params_test(struct kunit *test)
 		dev->of_node = np;
 		sio->dev = dev;
 		sio->protocol = cases[i].protocol;
-		KUNIT_EXPECT_STREQ_MSG(test, sio_dt_params_name(sio), cases[i].prop, "%s v%u",
-				       cases[i].path, cases[i].protocol);
+		propname = sio_dt_params_name(sio);
+		if (cases[i].prop)
+			KUNIT_EXPECT_STREQ_MSG(test, propname, cases[i].prop, "%s v%u",
+					       cases[i].path, cases[i].protocol);
+		else
+			KUNIT_EXPECT_NULL(test, propname);
 		KUNIT_EXPECT_EQ_MSG(test, sio->tables_mismatch, cases[i].mismatch, "%s v%u",
 				    cases[i].path, cases[i].protocol);
 	}
+}
+
+static void sio_protocol10_cyclic_without_tables_test(struct kunit *test)
+{
+	struct sio_data *sio = kunit_kzalloc(test, sizeof(*sio), GFP_KERNEL);
+	struct sio_chan *chan = kunit_kzalloc(test, sizeof(*chan), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, sio);
+	KUNIT_ASSERT_NOT_NULL(test, chan);
+	sio->tables_mismatch = true;
+	chan->host = sio;
+
+	KUNIT_EXPECT_NULL(test, sio_prep_dma_cyclic(&chan->vc.chan, 0, 4096, 1024,
+						   sio_chan_direction(chan->no), 0));
 }
 
 static struct kunit_case sio_t6030_test_cases[] = {
@@ -366,6 +384,7 @@ static struct kunit_case sio_t6030_test_cases[] = {
 	KUNIT_CASE(sio_t6030_device_tree_test),
 	KUNIT_CASE(sio_t6030_probe_test),
 	KUNIT_CASE(sio_low_window_params_test),
+	KUNIT_CASE(sio_protocol10_cyclic_without_tables_test),
 	{}
 };
 
