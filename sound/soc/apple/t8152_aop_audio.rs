@@ -1293,9 +1293,25 @@ unsafe fn sense_ring<'a>(
     data.sense_ring.as_ref()
 }
 
+/// Hardware description for the VMALLOC sense front-end: require at least one
+/// ring period per ALSA period so even the minimum two-period buffer holds
+/// incoming ring batches without XRUNning on the first callback.
+fn sense_pcm_hw(formats: u64, ring_period_bytes: usize) -> bindings::snd_pcm_hardware {
+    let mut hw = pcm_hw();
+    hw.info |= bindings::SNDRV_PCM_INFO_BLOCK_TRANSFER | bindings::SNDRV_PCM_INFO_BATCH;
+    hw.formats = formats;
+    hw.period_bytes_min = hw.period_bytes_min.max(ring_period_bytes);
+    hw.periods_max = (hw.buffer_bytes_max / hw.period_bytes_min) as u32;
+    hw
+}
+
 /// The sense front-end's buffer: plain memory the ring callback copies whole
 /// frames into.
-fn sense_open(substream: *mut bindings::snd_pcm_substream, formats: u64) -> i32 {
+fn sense_open(
+    substream: *mut bindings::snd_pcm_substream,
+    formats: u64,
+    ring_period_bytes: usize,
+) -> i32 {
     // SAFETY: a live substream in its open.
     unsafe {
         if (*substream).dma_buffer.dev.type_ == bindings::SNDRV_DMA_TYPE_UNKNOWN as i32 {
@@ -1310,10 +1326,7 @@ fn sense_open(substream: *mut bindings::snd_pcm_substream, formats: u64) -> i32 
                 return ret;
             }
         }
-        let mut hw = pcm_hw();
-        hw.info |= bindings::SNDRV_PCM_INFO_BLOCK_TRANSFER | bindings::SNDRV_PCM_INFO_BATCH;
-        hw.formats = formats;
-        (*(*substream).runtime).hw = hw;
+        (*(*substream).runtime).hw = sense_pcm_hw(formats, ring_period_bytes);
     }
     0
 }
@@ -1344,7 +1357,7 @@ unsafe extern "C" fn asoc_pcm_open(
     };
     if fe == 2 && !playback {
         if let Some(ring) = &data.sense_ring {
-            let ret = sense_open(substream, data.cfg.sense_formats);
+            let ret = sense_open(substream, data.cfg.sense_formats, ring.period_bytes());
             if ret < 0 {
                 return ret;
             }
@@ -2350,8 +2363,35 @@ mod tests {
 
     #[test]
     fn sense_ring_fe_space_guards_overrun() {
-        // Small legal capture buffer (two 12-frame periods) cannot fit one 120-frame ring period
-        assert!(!sense_ring_has_fe_space(24, 0, 0, SENSE_RING_PERIOD_FRAMES));
+        // Every supported multi-amp geometry constrains ALSA negotiation so the
+        // smallest admitted buffer (2 periods of period_bytes_min) exceeds one
+        // 120-frame ring batch and cannot XRUN on an empty capture buffer.
+        for cfg in [&HW_CFG_T8142, &HW_CFG_T8142_6AMP, &HW_CFG_T6050] {
+            let frame = cfg.sense_channels as usize * 2;
+            let ring = SenseRing::new(frame);
+            let hw = sense_pcm_hw(cfg.sense_formats, ring.period_bytes());
+            assert_eq!(hw.period_bytes_min, ring.period_bytes());
+            assert!(hw.period_bytes_min <= hw.period_bytes_max);
+            assert_eq!(hw.periods_min, 2);
+            assert!(hw.periods_min <= hw.periods_max);
+            let min_period_frames = hw.period_bytes_min / frame;
+            let min_buffer_frames = hw.periods_min as usize * min_period_frames;
+            assert_eq!(min_period_frames, SENSE_RING_PERIOD_FRAMES);
+            assert_eq!(min_buffer_frames, 2 * SENSE_RING_PERIOD_FRAMES);
+            assert!(sense_ring_has_fe_space(
+                min_buffer_frames,
+                0,
+                0,
+                SENSE_RING_PERIOD_FRAMES
+            ));
+            assert!(!sense_ring_has_fe_space(
+                min_buffer_frames,
+                SENSE_RING_PERIOD_FRAMES,
+                0,
+                SENSE_RING_PERIOD_FRAMES
+            ));
+        }
+
         // Exact full-buffer advance (e.g. 120 frames into a 120-frame buffer) wraps the
         // modulo pointer back to the same offset, so it must trigger XRUN; strictly less fits.
         assert!(!sense_ring_has_fe_space(120, 0, 0, 120));
