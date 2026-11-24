@@ -19,7 +19,8 @@ def main():
     parts = phy.parking(args.source)
     production = parts["production"]
     original = block(production, "static int atcphy_usb3_power_off(")
-    guard = "if (atcphy_modes[atcphy->mode].enable_dp_aux)\n\t\treturn 0;"
+    guard = ("if (atcphy_modes[atcphy->mode].enable_dp_aux &&\n"
+             "\t    atcphy->hw->gen != ATCPHY_GENERATION_T8132)\n\t\treturn 0;")
     assert original.count(guard) == 1
     mutant = original.replace(guard, "/* negative control: incorrectly cut a live DP link */")
     units = {

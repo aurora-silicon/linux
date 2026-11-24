@@ -1328,6 +1328,26 @@ restrict all boosts temporarily by modifying sched_util_clamp_min. As soon as
 this restriction is lifted, the requested sched_util_clamp_min_rt_default
 will take effect.
 
+sched_util_clamp_background
+===========================
+
+Enables/disables automatic utilization capping of SCHED_IDLE tasks on
+asymmetric CPU capacity systems (default 1).
+
+When enabled on a system with asymmetric CPU capacities
+(sched_asym_cpucapacity active), the effective uclamp.min and uclamp.max of
+non-RT/DL SCHED_IDLE tasks are capped at the capacity of the smallest active
+CPU in an asymmetric scheduling domain (derived from arch_scale_cpu_capacity()
+whenever scheduling domains are rebuilt). This biases background SCHED_IDLE
+work toward efficiency cores and limits frequency scaling when it spills onto
+higher-capacity cores, taking precedence over task and cgroup clamp requests
+while preserving tighter system defaults.
+
+Setting this knob to 0 disables the cap. Symmetric systems are unaffected
+regardless of the setting. Changes take effect for each task at its next
+enqueue; a CPU-bound SCHED_IDLE task that never sleeps retains its previous
+effective clamp until it is next enqueued.
+
 seccomp
 =======
 

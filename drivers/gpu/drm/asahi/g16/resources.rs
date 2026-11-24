@@ -13,12 +13,17 @@ use super::{
     vm::VmState,
 };
 use crate::mmu;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use kernel::{
-    new_mutex,
+    new_mutex, new_spinlock,
     prelude::*,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, SpinLock},
 };
+
+/// Never-exposed PB epochs a VM keeps for its next renders. With PB epoch reuse most
+/// renders never expose the epoch prepared for them; allocating and mapping a fresh one per
+/// render submit costs far more than the render itself.
+const SPARE_EPOCHS: usize = 4;
 
 pub(crate) struct ComputeArena(crate::cleanup::Deferred<ComputeInner>);
 impl core::ops::Deref for ComputeArena {
@@ -34,17 +39,30 @@ pub(crate) struct ComputeInner {
     _bind: mmu::VmBind,
     _live: Arc<super::vm::LiveToken>,
 }
+/// Compute units every VM gets with its first compute command; more are added
+/// ([`Cache::prepare`]) once it submits compute back to back.
+pub(crate) const BASE_COMPUTE_UNITS: usize = 2;
+
+/// Back-to-back compute submissions (each within [`BURST_GAP_NS`] of the previous) after
+/// which a VM gets its extension units; a single submission with [`BURST_COMMANDS`] compute
+/// commands qualifies at once.
+const BURST_SUBMITS: u32 = 3;
+const BURST_GAP_NS: u64 = 2_000_000;
+const BURST_COMMANDS: usize = 3;
+
 impl ComputeArena {
+    /// Units `units` (their index fixes their client addresses and hardware UMA slot).
     fn new(
         factory: &Factory,
         bind: &mmu::VmBind,
         vm: &mmu::Vm,
         live: &Arc<super::vm::LiveToken>,
+        units: core::ops::Range<usize>,
     ) -> Result<Arc<Self>> {
         let mut objects = factory.objects(vm);
-        let mut compute = KVec::with_capacity(2, GFP_KERNEL)?;
-        for k in 0..2 {
-            compute.push(ComputeSlot::new(&mut objects, k)?, GFP_KERNEL)?;
+        let mut compute = KVec::with_capacity(units.len(), GFP_KERNEL)?;
+        for k in units {
+            compute.push(ComputeSlot::new(&mut objects, k as u64)?, GFP_KERNEL)?;
         }
         objects.finish_private()?;
         Ok(Arc::new(
@@ -116,12 +134,23 @@ impl RenderArena {
 #[derive(Default)]
 struct Ready {
     compute: Option<Arc<ComputeArena>>,
+    /// Units from [`BASE_COMPUTE_UNITS`] on, for a VM that keeps compute queued.
+    compute_ext: Option<Arc<ComputeArena>>,
     render: Option<Arc<RenderArena>>,
+    /// Last compute submission and the back-to-back run it continues.
+    last_compute_ns: u64,
+    burst: u32,
 }
 #[pin_data]
 pub(crate) struct Cache {
     #[pin]
     ready: Mutex<Ready>,
+    /// Never-exposed epochs returned by retired jobs (at most [`SPARE_EPOCHS`]). Each holds
+    /// the VM, which holds this cache: [`Self::close`] breaks that cycle.
+    #[pin]
+    spares: SpinLock<KVec<Arc<PbEpoch>>>,
+    /// The VM's client closed: no arena or spare is kept here any more.
+    closed: AtomicBool,
     pub(crate) factory: Factory,
     bind: mmu::VmBind,
     live: Arc<super::vm::LiveToken>,
@@ -134,24 +163,65 @@ impl Cache {
         live: Arc<super::vm::LiveToken>,
     ) -> Result<Arc<Self>> {
         let budget = super::budget::Budget::new()?;
+        let spares = KVec::with_capacity(SPARE_EPOCHS, GFP_KERNEL)?;
         Arc::pin_init(
             pin_init!(Self { ready <- new_mutex!(Ready::default(), "g16::resources"),
+            spares <- new_spinlock!(spares, "g16::spare_epochs"),
+            closed: AtomicBool::new(false),
             factory, bind, live, budget }),
             GFP_KERNEL,
         )
     }
-    pub(crate) fn prepare(&self, vm: &Arc<VmState>, commands: &[Command]) -> Result<Prepared> {
-        let compute = commands.iter().any(|c| matches!(c, Command::Compute(_)));
+    /// Returns a retired job's never-exposed epoch for the next renders. Any context.
+    fn give_back(&self, epoch: Arc<PbEpoch>) {
+        let mut spares = self.spares.lock();
+        // Without room, or once the client closed, the epoch drops: its deferred cleanup
+        // unmaps it as before.
+        if !self.closed.load(Ordering::Acquire) {
+            let _ = spares.push_within_capacity(epoch);
+        }
+    }
+
+    /// The VM's client closed. Lets go of the arenas and spare epochs: what jobs and the
+    /// hardware slots' last-owner leases still need, they hold themselves.
+    pub(crate) fn close(&self) {
+        let spares = {
+            let mut spares = self.spares.lock();
+            self.closed.store(true, Ordering::Release);
+            core::mem::take(&mut *spares)
+        };
+        drop(spares);
+        let ready = {
+            let mut ready = self.ready.lock();
+            (
+                ready.compute.take(),
+                ready.compute_ext.take(),
+                ready.render.take(),
+            )
+        };
+        drop(ready);
+    }
+
+    pub(crate) fn prepare(
+        self: &Arc<Self>,
+        vm: &Arc<VmState>,
+        commands: &[Command],
+    ) -> Result<Prepared> {
+        let computes = commands
+            .iter()
+            .filter(|c| matches!(c, Command::Compute(_)))
+            .count();
+        let compute = computes != 0;
         let render_count = commands
             .iter()
             .filter(|c| matches!(c, Command::Render(_)))
             .count();
         let render = render_count != 0;
         let mut epochs = super::budget::Budget::reserve(&self.budget, render_count.try_into()?)?;
-        let (compute, render) = {
+        let (compute, compute_ext, render) = {
             // Never held by publication, completion, recovery or fence signalling.
             let mut ready = self.ready.lock();
-            if vm.status.get() != 0 || vm.vm.is_closed() {
+            if vm.status.get() != 0 || vm.vm.is_closed() || self.closed.load(Ordering::Acquire) {
                 return Err(EIO);
             }
             if compute && ready.compute.is_none() {
@@ -160,7 +230,33 @@ impl Cache {
                     &self.bind,
                     &vm.vm,
                     &self.live,
+                    0..BASE_COMPUTE_UNITS,
                 )?);
+            }
+            if compute {
+                // SAFETY: ktime_get has no preconditions.
+                let now = unsafe { kernel::bindings::ktime_get() } as u64;
+                ready.burst = if now.wrapping_sub(ready.last_compute_ns) < BURST_GAP_NS {
+                    ready.burst.saturating_add(1)
+                } else {
+                    0
+                };
+                ready.last_compute_ns = now;
+                let units = super::params::compute_units();
+                if ready.compute_ext.is_none()
+                    && units > BASE_COMPUTE_UNITS
+                    && (ready.burst >= BURST_SUBMITS || computes >= BURST_COMMANDS)
+                {
+                    // Best effort: without them the VM keeps one command in flight.
+                    ready.compute_ext = ComputeArena::new(
+                        &self.factory,
+                        &self.bind,
+                        &vm.vm,
+                        &self.live,
+                        BASE_COMPUTE_UNITS..units,
+                    )
+                    .ok();
+                }
             }
             if render && ready.render.is_none() {
                 ready.render = Some(RenderArena::new(
@@ -176,6 +272,7 @@ impl Cache {
             }
             (
                 if compute { ready.compute.clone() } else { None },
+                if compute { ready.compute_ext.clone() } else { None },
                 if render { ready.render.clone() } else { None },
             )
         };
@@ -183,7 +280,13 @@ impl Cache {
         for command in commands {
             pb.push(
                 if matches!(command, Command::Render(_)) {
-                    Some(PbEpoch::new(&self.factory, vm, epochs.take()?)?)
+                    // A spare keeps the budget permit it was created with; the reservation
+                    // returns the unused credit when it drops.
+                    let spare = self.spares.lock().pop();
+                    Some(match spare {
+                        Some(epoch) if epoch.unexposed() => epoch,
+                        _ => PbEpoch::new(&self.factory, vm, epochs.take()?)?,
+                    })
                 } else {
                     None
                 },
@@ -195,8 +298,10 @@ impl Cache {
         }
         Ok(Prepared {
             compute,
+            compute_ext,
             render,
             pb,
+            cache: Some(self.clone()),
         })
     }
 }
@@ -204,12 +309,59 @@ impl Cache {
 /// Immutable references carried by an accepted job. No fallible lazy work in the engine.
 pub(crate) struct Prepared {
     pub(crate) compute: Option<Arc<ComputeArena>>,
+    /// The VM's extension compute units when the job was prepared.
+    pub(crate) compute_ext: Option<Arc<ComputeArena>>,
     pub(crate) render: Option<Arc<RenderArena>>,
     pb: KVec<Option<Arc<PbEpoch>>>,
+    /// The VM cache that unused epochs return to.
+    cache: Option<Arc<Cache>>,
+}
+
+impl Drop for Prepared {
+    fn drop(&mut self) {
+        let Some(cache) = self.cache.take() else {
+            return;
+        };
+        for epoch in self.pb.iter_mut().filter_map(Option::take) {
+            if epoch.unexposed() {
+                cache.give_back(epoch);
+            }
+        }
+    }
 }
 impl Prepared {
     pub(crate) fn compute(&self) -> Result<&ComputeArena> {
         self.compute.as_deref().ok_or(EINVAL)
+    }
+    /// Compute units this job can use.
+    pub(crate) fn compute_units(&self) -> Result<usize> {
+        Ok(self.compute()?.compute.len()
+            + self.compute_ext.as_deref().map_or(0, |e| e.compute.len()))
+    }
+    /// The arena holding compute unit `k`.
+    pub(crate) fn compute_arena(&self, k: usize) -> Option<Arc<ComputeArena>> {
+        let base = self.compute.as_ref()?;
+        if k < base.compute.len() {
+            Some(base.clone())
+        } else {
+            self.compute_ext.clone()
+        }
+    }
+    /// The render arena.
+    pub(crate) fn render_arena(&self) -> Option<Arc<RenderArena>> {
+        self.render.clone()
+    }
+    /// Compute unit `k`: the VM's base units, then its extension units.
+    pub(crate) fn compute_unit(&self, k: usize) -> Result<&ComputeSlot> {
+        let base = &self.compute()?.compute;
+        match base.get(k) {
+            Some(unit) => Ok(unit),
+            None => self
+                .compute_ext
+                .as_deref()
+                .and_then(|e| e.compute.get(k - base.len()))
+                .ok_or(EINVAL),
+        }
     }
     pub(crate) fn render(&self) -> Result<&RenderArena> {
         self.render.as_deref().ok_or(EINVAL)

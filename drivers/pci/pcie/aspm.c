@@ -923,12 +923,39 @@ static void pcie_aspm_override_default_link_state(struct pcie_link_state *link)
 			link->aspm_default |= PCIE_LINK_STATE_L0S;
 		if (link->aspm_support & PCIE_LINK_STATE_L1)
 			link->aspm_default |= PCIE_LINK_STATE_L1;
+		/*
+		 * L1 PM Substates need CLKREQ# between the two ports. Enable
+		 * them by default only on links whose devicetree node says the
+		 * signal is routed.
+		 */
+		if (pcie_link_has_aspm_override(link, "supports-clkreq"))
+			link->aspm_default |= link->aspm_support & PCIE_LINK_STATE_L1SS;
 		override = link->aspm_default & ~link->aspm_enabled;
 		if (override)
-			pci_info(pdev, "ASPM: default states%s%s\n",
+			pci_info(pdev, "ASPM: default states%s%s%s%s%s%s\n",
 				 FLAG(override, L0S, " L0s"),
-				 FLAG(override, L1, " L1"));
+				 FLAG(override, L1, " L1"),
+				 FLAG(override, L1_1, " ASPM-L1.1"),
+				 FLAG(override, L1_2, " ASPM-L1.2"),
+				 FLAG(override, L1_1_PCIPM, " PCI-PM-L1.1"),
+				 FLAG(override, L1_2_PCIPM, " PCI-PM-L1.2"));
 	}
+}
+
+/*
+ * Clock PM, like the L1 PM Substates, needs CLKREQ#. On devicetree platforms,
+ * enable it by default on links whose node says the signal is routed.
+ */
+static void pcie_clkpm_override_default_link_state(struct pcie_link_state *link)
+{
+	if (!of_have_populated_dt() || !link->clkpm_capable ||
+	    link->clkpm_disable || link->clkpm_default)
+		return;
+	if (!pcie_link_has_aspm_override(link, "supports-clkreq"))
+		return;
+
+	link->clkpm_default = 1;
+	pci_dbg(link->downstream, "ASPM: default Clock PM (supports-clkreq)\n");
 }
 
 static void pcie_aspm_cap_init(struct pcie_link_state *link, int blacklist)
@@ -1256,6 +1283,7 @@ void pcie_aspm_init_link_state(struct pci_dev *pdev)
 
 	/* Setup initial Clock PM state */
 	pcie_clkpm_cap_init(link, blacklist);
+	pcie_clkpm_override_default_link_state(link);
 
 	/*
 	 * At this stage drivers haven't had an opportunity to change the
