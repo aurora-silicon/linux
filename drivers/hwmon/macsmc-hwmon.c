@@ -21,6 +21,8 @@
  */
 
 #include <linux/bitfield.h>
+#include <linux/cpufreq.h>
+#include <linux/cpumask.h>
 #include <linux/ctype.h>
 #include <linux/debugfs.h>
 #include <linux/delay.h>
@@ -33,9 +35,11 @@
 #include <linux/platform_device.h>
 #include <linux/pm.h>
 #include <linux/seq_file.h>
+#include <linux/soc/apple/cpufreq-thermal.h>
 #include <linux/string.h>
 #include <linux/sysfs.h>
 #include <linux/thermal.h>
+#include <linux/workqueue.h>
 
 #define MAX_LABEL_LENGTH	32
 
@@ -132,6 +136,11 @@ struct macsmc_hwmon {
 	/* DT-supplied hotspot fan-assistance trip on macsmc_soc_die. */
 	struct macsmc_hwmon_fan_assist fan_assist;
 	bool fan_assist_valid;
+	/* CPU clusters (policy->cpu) whose higher states these zones own */
+	struct delayed_work cpu_owner_work;
+	cpumask_t cpu_owned;
+	cpumask_t cpu_refused;
+	unsigned int cpu_owner_tries;
 };
 
 static ssize_t thermal_pressure_level_show(struct device *dev,
@@ -1640,6 +1649,193 @@ static int macsmc_hwmon_die_register(struct macsmc_hwmon *hwmon)
 }
 #endif
 
+#if IS_ENABLED(CONFIG_THERMAL_OF) && IS_ENABLED(CONFIG_CPU_THERMAL) && \
+	IS_REACHABLE(CONFIG_ARM_APPLE_SOC_CPUFREQ)
+/*
+ * CPU cluster ownership
+ *
+ * A SoC whose cpufreq driver holds each cluster below its higher states until
+ * a board thermal policy protects it (T8152) gets that policy from this
+ * device's thermal zones: DT zones fed by these sensors whose cooling maps
+ * throttle a cluster's cpufreq cooling device. A cluster is handed over only
+ * when every such map is live: its zone is registered, the map's trip is
+ * passive, and the thermal core has bound that trip to the cluster's cooling
+ * device. Any map that is not keeps the cluster at its ceiling. Ownership is
+ * given back before the zones go away.
+ */
+#define MACSMC_CPU_OWNER_TRIES	120
+
+struct macsmc_hwmon_cpu_map {
+	struct thermal_zone_device *tz;
+	struct device_node *trip_np;
+	struct thermal_cooling_device *cdev;
+	int ret;
+};
+
+static int macsmc_hwmon_cpu_map_trip(struct thermal_trip *trip, void *data)
+{
+	struct macsmc_hwmon_cpu_map *map = data;
+
+	if (trip->priv != map->trip_np)
+		return 0;
+	if (trip->type != THERMAL_TRIP_PASSIVE)
+		map->ret = -EINVAL;
+	else if (!thermal_trip_is_bound_to_cdev(map->tz, trip, map->cdev))
+		map->ret = -ENOLINK;
+	else
+		map->ret = 0;
+	return 1;
+}
+
+/*
+ * The clusters (by policy->cpu) that the CPU cooling maps of this device's
+ * zones protect, in @ready, and those with a map that is not live, in
+ * @refused. -EPROBE_DEFER while a named cluster has no cpufreq policy or
+ * cooling device yet.
+ */
+static int macsmc_hwmon_cpu_maps(struct macsmc_hwmon *hwmon, struct cpumask *ready,
+				 struct cpumask *refused)
+{
+	struct device_node *zones __free(device_node) =
+		of_find_node_by_path("/thermal-zones");
+	int ret = 0;
+
+	cpumask_clear(ready);
+	cpumask_clear(refused);
+	if (!zones)
+		return 0;
+
+	for_each_available_child_of_node_scoped(zones, zone) {
+		struct device_node *maps __free(device_node) = NULL;
+		struct thermal_zone_device *tz;
+		struct of_phandle_args sensor;
+
+		if (of_parse_phandle_with_args(zone, "thermal-sensors",
+					       "#thermal-sensor-cells", 0, &sensor))
+			continue;
+		of_node_put(sensor.np);
+		if (sensor.np != hwmon->dev->of_node)
+			continue;
+		maps = of_get_child_by_name(zone, "cooling-maps");
+		if (!maps)
+			continue;
+		/* thermal_of registers a zone under its node name. */
+		tz = thermal_zone_get_zone_by_name(zone->name);
+
+		for_each_child_of_node_scoped(maps, map) {
+			struct device_node *trip_np __free(device_node) =
+				of_parse_phandle(map, "trip", 0);
+			struct of_phandle_args cooling;
+			int i;
+
+			for (i = 0; !of_parse_phandle_with_args(map, "cooling-device",
+								 "#cooling-cells", i, &cooling); i++) {
+				struct macsmc_hwmon_cpu_map check = { .ret = -ENOENT };
+				struct cpufreq_policy *policy;
+				int cpu = of_cpu_node_to_id(cooling.np);
+
+				of_node_put(cooling.np);
+				if (cpu < 0)
+					continue;
+				policy = cpufreq_cpu_get(cpu);
+				if (!policy || !policy->cdev) {
+					if (policy)
+						cpufreq_cpu_put(policy);
+					ret = -EPROBE_DEFER;
+					continue;
+				}
+				if (!IS_ERR(tz) && trip_np) {
+					check.tz = tz;
+					check.trip_np = trip_np;
+					check.cdev = policy->cdev;
+					for_each_thermal_trip(tz, macsmc_hwmon_cpu_map_trip, &check);
+				}
+				cpumask_set_cpu(policy->cpu, check.ret ? refused : ready);
+				cpufreq_cpu_put(policy);
+			}
+		}
+	}
+	cpumask_andnot(ready, ready, refused);
+	return ret;
+}
+
+static void macsmc_hwmon_cpu_owner_work(struct work_struct *work)
+{
+	struct macsmc_hwmon *hwmon = container_of(to_delayed_work(work), struct macsmc_hwmon,
+						  cpu_owner_work);
+	cpumask_t ready, refused;
+	int cpu, ret, pending;
+
+	pending = macsmc_hwmon_cpu_maps(hwmon, &ready, &refused);
+
+	for_each_cpu(cpu, &refused) {
+		if (cpumask_test_and_set_cpu(cpu, &hwmon->cpu_refused))
+			continue;
+		dev_warn(hwmon->dev,
+			 "CPU%d cluster keeps its cpufreq ceiling: a cooling map of its thermal zones is not bound\n",
+			 cpu);
+	}
+
+	for_each_cpu(cpu, &ready) {
+		struct cpufreq_policy *policy;
+
+		if (cpumask_test_cpu(cpu, &hwmon->cpu_owned))
+			continue;
+		policy = cpufreq_cpu_get(cpu);
+		if (!policy)
+			continue;
+		ret = apple_soc_cpufreq_set_thermal_owner(policy, true);
+		cpufreq_cpu_put(policy);
+		/* -ENODEV: this SoC does not hold the cluster back. */
+		if (!ret) {
+			cpumask_set_cpu(cpu, &hwmon->cpu_owned);
+			dev_info(hwmon->dev,
+				 "CPU%d cluster: higher states handed to its thermal zones\n", cpu);
+		} else if (ret != -ENODEV) {
+			dev_warn(hwmon->dev, "CPU%d cluster: ownership refused: %d\n", cpu, ret);
+		}
+	}
+
+	if (pending != -EPROBE_DEFER)
+		return;
+	if (++hwmon->cpu_owner_tries < MACSMC_CPU_OWNER_TRIES)
+		schedule_delayed_work(&hwmon->cpu_owner_work, HZ);
+	else
+		dev_warn(hwmon->dev,
+			 "CPU clusters without a cpufreq cooling device keep their ceiling\n");
+}
+
+static void macsmc_hwmon_cpu_release(void *data)
+{
+	struct macsmc_hwmon *hwmon = data;
+	int cpu;
+
+	cancel_delayed_work_sync(&hwmon->cpu_owner_work);
+	for_each_cpu(cpu, &hwmon->cpu_owned) {
+		struct cpufreq_policy *policy = cpufreq_cpu_get(cpu);
+
+		if (policy) {
+			apple_soc_cpufreq_set_thermal_owner(policy, false);
+			cpufreq_cpu_put(policy);
+		}
+	}
+	cpumask_clear(&hwmon->cpu_owned);
+}
+
+/* Called once the zones are registered; released before they are removed. */
+static int macsmc_hwmon_cpu_owner_init(struct macsmc_hwmon *hwmon)
+{
+	INIT_DELAYED_WORK(&hwmon->cpu_owner_work, macsmc_hwmon_cpu_owner_work);
+	schedule_delayed_work(&hwmon->cpu_owner_work, 0);
+	return devm_add_action_or_reset(hwmon->dev, macsmc_hwmon_cpu_release, hwmon);
+}
+#else
+static int macsmc_hwmon_cpu_owner_init(struct macsmc_hwmon *hwmon)
+{
+	return 0;
+}
+#endif
+
 /*
  * debugfs "keys": every key the SMC reports, with its type, size and flags, and the value of the
  * readable 32-bit float keys whose names start with 'T' (temperatures, in millidegrees Celsius)
@@ -1885,6 +2081,10 @@ static int macsmc_hwmon_probe(struct platform_device *pdev)
 	macsmc_hwmon_debugfs_init(hwmon);
 
 	ret = macsmc_hwmon_die_register(hwmon);
+	if (ret)
+		return ret;
+
+	ret = macsmc_hwmon_cpu_owner_init(hwmon);
 	if (ret)
 		return ret;
 

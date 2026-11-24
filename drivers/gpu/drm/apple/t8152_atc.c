@@ -13,7 +13,7 @@
  * set up the lanes again), drive settings, the DCP -> ATCn/DFP0 crossbar
  * route, and with the display off or unplugged a full power down and a cold
  * start. A DCP drives one USB-C port at a time: the one it claims from the
- * shared ports while polling their PD controllers.
+ * shared ports once their Type-C state shows a sink (t8152_typec.c).
  */
 
 #include <linux/bits.h>
@@ -53,7 +53,6 @@ struct t8152_atc_port {
 	unsigned int index;		/* ATC instance */
 	/* display crossbar DFP endpoint of this ATC */
 	u32 dfp;
-	struct spmi_device *pd;
 	/* AP DisplayPort AUX controller aux0 (shared), for the EDID */
 	struct t8152_aux *aux;
 	/* PMGR power states of the four ATC dependencies */
@@ -695,7 +694,9 @@ static int atc_detect(struct t8152_display *disp, bool *flipped)
 	atc->next = atc->cur;
 	/* Keep a monitor on its controller, including while userspace blanks it. */
 	if (atc_owner[atc->cur->index] == disp->dev) {
-		ret = t8152_pd_sink(atc->cur->pd, flipped, &atc->cur->next_lanes);
+		ret = t8152_typec_sink(disp, atc->cur->index, flipped,
+				       &atc->cur->next_lanes);
+		/* The plug changed: a new sink */
 		if (ret > 0 && (atc->cur->swap != *flipped ||
 				atc->cur->lanes != atc->cur->next_lanes))
 			disp->hpd = 0;
@@ -709,7 +710,7 @@ static int atc_detect(struct t8152_display *disp, bool *flipped)
 		struct t8152_atc_port *port = &atc->port[i];
 
 		if (atc_owner[port->index] ||
-		    t8152_pd_sink(port->pd, flipped, &port->next_lanes) <= 0)
+		    t8152_typec_sink(disp, port->index, flipped, &port->next_lanes) <= 0)
 			continue;
 		atc_owner[port->index] = disp->dev;
 		atc->next = port;
@@ -742,7 +743,6 @@ static void atc_select(struct t8152_display *disp)
 	dev_info(disp->dev, "USB-C display on ATC%u now, was ATC%u\n",
 		 port->index, atc->cur->index);
 	atc->cur = port;
-	disp->pd = port->pd;
 	disp->dcp_output = port->dfp;
 }
 
@@ -820,9 +820,6 @@ static int atc_port_init(struct t8152_display *disp, struct t8152_atc *atc,
 	port->psd = atc_map(disp, np, "atc-psd");
 	if (!port->base || !port->ps || !port->psd)
 		return -ENOMEM;
-	port->pd = t8152_pd_get(np);
-	if (IS_ERR_OR_NULL(port->pd))
-		return port->pd ? PTR_ERR(port->pd) : -ENODEV;
 	/* The node without ports is ATC3's (J873g back-right). */
 	port->dfp = 3;
 	of_property_read_u32(np, "apple,dfp-endpoint", &port->dfp);
@@ -993,7 +990,7 @@ int t8152_atc_init(struct t8152_display *disp)
 	atc->next = atc->cur;
 	disp->phy = &atc_ops;
 	disp->phy_priv = atc;
-	disp->pd = atc->cur->pd;
+	disp->usbc = true;
 	disp->dcp_output = atc->cur->dfp;
 	dev_info(disp->dev, "USB-C display on ATC%u (%u ports)\n", atc->cur->index,
 		 atc->nports);
