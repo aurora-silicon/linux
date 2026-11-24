@@ -113,6 +113,13 @@ ASAHI_TESTS = {
     'binding-lifetime-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('no-close', 'no-join'), out()),
     'apple-pwm-pm-tests.py': [([], PASS), (['--negative-control'], PASS)],
+    # 70a00e583b032 underflows get_timeleft() on cur > bite and ignores the reconfig reg.
+    'apple-wdt-tests.py': [(out(), PASS),
+                           (out() + ['--old-ref', '70a00e583b032'], KILL)]
+        + mutations('--mutation', ('ignore-sleep-handoff', 'no-bark-in-start', 'no-status-clear',
+                                   'reconfig-before-bark', 'register-after-arm',
+                                   'hwrunning-after-arm', 'no-wd1-adopt',
+                                   'no-t6050-wake-restore'), out()),
     'apple-m4-pmu-tests.py': [([], PASS)]
         + mutations('--mutation', ('m1-layout', 'cycles-anywhere', 'expose-8-9', 'flags-in-event'), []),
     'apple-dart-dapf-tests.py': [(out(), PASS)]
