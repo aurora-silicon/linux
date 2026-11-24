@@ -99,7 +99,8 @@ echo "dtbs: $(cd "$O/arch/arm64/boot/dts" && find . -name '*.dtb' | wc -l)"
 echo "::group::pacman-pkg"
 if command -v makepkg >/dev/null; then
 	rm -f "$O"/*.pkg.tar.*
-	if mk PACMAN_PKGBASE="$PKGBASE" PACMAN_EXTRAPACKAGES=headers \
+	# Debian/Ubuntu's makepkg.conf defaults to .pkg.tar.gz.
+	if PKGEXT=.pkg.tar.zst mk PACMAN_PKGBASE="$PKGBASE" PACMAN_EXTRAPACKAGES=headers \
 		MAKEPKGOPTS="--nodeps --noconfirm" pacman-pkg; then
 		cp "$O"/*.pkg.tar.zst "$D/"
 	else

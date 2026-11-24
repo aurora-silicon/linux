@@ -164,7 +164,8 @@ jobs:
 
       - name: Install makepkg (for make pacman-pkg)
         continue-on-error: true
-        run: sudo apt-get install -y --no-install-recommends makepkg
+        # makepkg looks pacman up at start and exits without it.
+        run: sudo apt-get install -y --no-install-recommends makepkg pacman-package-manager
 
       - name: Install Rust
         run: |
