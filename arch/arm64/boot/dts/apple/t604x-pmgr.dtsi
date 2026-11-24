@@ -431,6 +431,8 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "atc0_common_dp";
+		/* The PHY coprocessor can keep running through s2idle. */
+		apple,sleep-wakeup-path;
 		power-domains = <&ps_atc0_phymxwrap>;
 	};
 
@@ -467,6 +469,8 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "atc1_common_dp";
+		/* The PHY coprocessor can keep running through s2idle. */
+		apple,sleep-wakeup-path;
 		power-domains = <&ps_atc1_phymxwrap>;
 	};
 
@@ -503,6 +507,8 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "atc2_common_dp";
+		/* The PHY coprocessor can keep running through s2idle. */
+		apple,sleep-wakeup-path;
 		power-domains = <&ps_atc2_phymxwrap>;
 	};
 };
@@ -578,6 +584,8 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "atc3_common_dp";
+		/* The PHY coprocessor can keep running through s2idle. */
+		apple,sleep-wakeup-path;
 		status = "disabled";
 	};
 

@@ -214,6 +214,19 @@ static int hwx_segment(struct hwx_parser *p, const u8 *c, u32 length)
 	return 0;
 }
 
+/*
+ * The fp32 trailer word at +0x880 (+0x8a0 with scratch) is 10000.0f in HWX
+ * from ANECompiler 10.205 and mil-hwx-compiler, and 1000.0f in H16 and H17
+ * HWX from ANECompiler 10.302 (macOS 27.3). Both load; any other value is
+ * refused.
+ */
+static u32 hwx_trailer_value(const u8 *c, u32 offset)
+{
+	u32 value = get_unaligned_le32(c + offset);
+
+	return value == 0x447a0000 ? value : 0x461c4000;
+}
+
 static int hwx_program(struct hwx_parser *p)
 {
 	const u8 *c = p->bytes + p->info.program_offset;
@@ -299,7 +312,7 @@ static int hwx_program(struct hwx_parser *p)
 	put_unaligned_le32(mixed ? 4 : 2, expected + 0x870);
 	put_unaligned_le32(mixed ? 2 : 7, expected + 0x878);
 	put_unaligned_le32(8, expected + 0x87c);
-	put_unaligned_le32(mixed ? get_unaligned_le32(c + 0x858) : 0x461c4000,
+	put_unaligned_le32(mixed ? get_unaligned_le32(c + 0x858) : hwx_trailer_value(c, 0x880),
 			   expected + 0x880);
 	put_unaligned_le32(mixed ? 3 : 9, expected + 0x888);
 	put_unaligned_le32(8, expected + 0x88c);
@@ -308,7 +321,7 @@ static int hwx_program(struct hwx_parser *p)
 		put_unaligned_le32(8, expected + 0x894);
 		put_unaligned_le32(7, expected + 0x898);
 		put_unaligned_le32(8, expected + 0x89c);
-		put_unaligned_le32(0x461c4000, expected + 0x8a0);
+		put_unaligned_le32(hwx_trailer_value(c, 0x8a0), expected + 0x8a0);
 		put_unaligned_le32(9, expected + 0x8a8);
 		put_unaligned_le32(8, expected + 0x8ac);
 	}
@@ -366,6 +379,36 @@ static int hwx_tensor_for(struct hwx_parser *p, u32 index, u32 *used)
 	return match;
 }
 
+/*
+ * Surface element formats: the descriptor's format code (+0x24) and the
+ * element size in bytes (+0x68) always come as one of these pairs in
+ * Apple's H16 and H17 objects. Observed 8-bit objects align rows to 64
+ * bytes like fp16 ones, so a row can be shorter than 2 * width and
+ * hwx_tensor() checks only the width * element floor (not row alignment).
+ * Any other pair (fp32, packed or unknown formats) stays refused.
+ */
+static const struct {
+	u32 format, element;
+} hwx_formats[] = {
+	{ 5, 2 },	/* fp16 */
+	{ 2, 1 },	/* int8 */
+	{ 3, 1 },	/* uint8 */
+};
+
+static u32 hwx_element_size(const u8 *c)
+{
+	u32 format = get_unaligned_le32(c + 0x24);
+	unsigned int i;
+
+	if (get_unaligned_le32(c + 0x6c))
+		return 0;
+	for (i = 0; i < ARRAY_SIZE(hwx_formats); i++)
+		if (hwx_formats[i].format == format &&
+		    hwx_formats[i].element == get_unaligned_le32(c + 0x68))
+			return hwx_formats[i].element;
+	return 0;
+}
+
 static int hwx_tensor(struct hwx_parser *p, u32 index, u32 tensor)
 {
 	struct ane_h16_hwx_surface *b = &p->info.surfaces[index];
@@ -375,17 +418,19 @@ static int hwx_tensor(struct hwx_parser *p, u32 index, u32 tensor)
 	u64 n, channels, height, width, row, plane, batch, minimum;
 	size_t symbol_length, short_length;
 	unsigned int i;
+	u32 element;
 
 	if (length < 0xd48 || length > SZ_16K || get_unaligned_le32(c + 0xc) != 0x34a ||
 	    get_unaligned_le32(c + 0x10) != 3 ||
 	    get_unaligned_le32(c + 0x14) != b->direction ||
 	    get_unaligned_le32(c + 0x18) != 0xd38 || !hwx_zero(c, 0x1c, 0x20) ||
 	    get_unaligned_le32(c + 0x20) != 0xd3d ||
-	    get_unaligned_le32(c + 0x24) != 5 ||
 	    get_unaligned_le32(c + 0x38) != 1 || !hwx_zero(c, 0x3c, 0x50) ||
-	    get_unaligned_le64(c + 0x68) != 2 ||
 	    get_unaligned_le32(c + 0x78) != 1 || !hwx_zero(c, 0x88, 0xd38) ||
 	    memcmp(c + 0xd38, "main", 5))
+		return -ENOEXEC;
+	element = hwx_element_size(c);
+	if (!element)
 		return -ENOEXEC;
 	n = get_unaligned_le32(c + 0x28);
 	channels = get_unaligned_le32(c + 0x2c);
@@ -395,7 +440,7 @@ static int hwx_tensor(struct hwx_parser *p, u32 index, u32 tensor)
 	plane = get_unaligned_le64(c + 0x58);
 	row = get_unaligned_le64(c + 0x60);
 	if (!n || !channels || !height || !width ||
-	    check_mul_overflow(width, 2ULL, &minimum) || row < minimum ||
+	    check_mul_overflow(width, (u64)element, &minimum) || row < minimum ||
 	    check_mul_overflow(height, row, &minimum) || plane < minimum ||
 	    check_mul_overflow(channels, plane, &minimum) || batch < minimum ||
 	    get_unaligned_le64(c + 0x70) != batch ||

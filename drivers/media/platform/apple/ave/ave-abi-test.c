@@ -2,7 +2,6 @@
 /* Byte equality against the pre-ABI-refactor 9003 command builders. */
 #include <kunit/device.h>
 #include <kunit/test.h>
-#include <linux/module.h>
 #include <linux/crc32.h>
 #include <linux/errno.h>
 #include <linux/string.h>
@@ -1499,6 +1498,69 @@ static void ave_26b123_layout(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, ave_layout_for_crc(AVE_FW_TEXT_CRC_T8122_26B123), b);
 }
 
+/*
+ * The M2 with the 27.2 stub: the reserved segment sizes select the 27.2
+ * build's own start (device 12, handshake type 12) and the 26B123 layout;
+ * the 13.5 build keeps the M2's 6070 start. Other sizes fall back to
+ * ave_t8112, whose size check in ave_fw_probe() then refuses them.
+ */
+static void ave_t8112_26b123_build(struct kunit *test)
+{
+	const struct ave_variant *n = ave_t8112.next_build;
+
+	KUNIT_ASSERT_NOT_NULL(test, n);
+	KUNIT_EXPECT_PTR_EQ(test, ave_fw_select_build(&ave_t8112, 0xd0000, 0x128000),
+			    &ave_t8112);
+	KUNIT_EXPECT_PTR_EQ(test, ave_fw_select_build(&ave_t8112, 0x11c000, 0x128000), n);
+	KUNIT_EXPECT_PTR_EQ(test, ave_fw_select_build(&ave_t8112, 0x11c000, 0x12c000),
+			    &ave_t8112);
+	KUNIT_EXPECT_PTR_EQ(test, ave_fw_select_build(&ave_t8112, 0x134000, 0x128000),
+			    &ave_t8112);
+	/* The near misses are refused: no variant of the chain pins them. */
+	KUNIT_EXPECT_FALSE(test, ave_fw_sizes_match(&ave_t8112, 0x11c000, 0x12c000));
+	KUNIT_EXPECT_FALSE(test, ave_fw_sizes_match(&ave_t8112, 0x134000, 0x128000));
+	KUNIT_EXPECT_FALSE(test, ave_fw_sizes_match(n, 0x11c000, 0x12c000));
+	KUNIT_EXPECT_TRUE(test, ave_fw_sizes_match(&ave_t8112, 0xd0000, 0x128000));
+	KUNIT_EXPECT_TRUE(test, ave_fw_sizes_match(n, 0x11c000, 0x128000));
+	KUNIT_EXPECT_NULL(test, n->next_build);
+	KUNIT_EXPECT_TRUE(test, n->boot_qualified);
+	KUNIT_EXPECT_PTR_EQ(test, n->regs, ave_t8112.regs);
+	KUNIT_EXPECT_EQ(test, n->boot_device_id, 12U);
+	KUNIT_EXPECT_EQ(test, n->device_type, 12U);
+	KUNIT_EXPECT_EQ(test, n->boot_arg_value, 0x10000U);
+	KUNIT_EXPECT_EQ(test, n->timebase_multiplier, 1U);
+	KUNIT_EXPECT_EQ(test, n->mbox_idle, 0x38U);
+	KUNIT_EXPECT_TRUE(test, n->restore_data_first);
+	KUNIT_EXPECT_EQ(test, n->text_link_cell, 0U);
+	/* The Mac mini's loader sets the word at TEXT 0x4224 on every boot. */
+	KUNIT_EXPECT_EQ(test, n->text_boot_word, 0x4224U);
+	/* The 27.2 builds' reference buffer sizing, as on the M3 and M4. */
+	KUNIT_EXPECT_EQ(test, n->lfs_ref_scale, 2U);
+	KUNIT_EXPECT_EQ(test, ave_t8112.lfs_ref_scale, 1U);
+	KUNIT_EXPECT_EQ(test, n->extra0_size, 0U);
+	KUNIT_EXPECT_EQ(test, n->vcbar_flags, (u64)AVE_COPROC_VCBAR_VALID);
+	KUNIT_EXPECT_EQ(test, ave_fw_vcbar(n, 0x800000000ULL), 0x800000001ULL);
+	KUNIT_EXPECT_EQ(test, n->text_crc, AVE_FW_TEXT_CRC_T8112_26B123);
+	{
+		const u32 off = n->text_boot_word, size = off + 0x40;
+		u8 *text = kunit_kzalloc(test, size, GFP_KERNEL);
+		u32 zeroed, a, b;
+
+		KUNIT_ASSERT_NOT_NULL(test, text);
+		zeroed = crc32_le(~0U, text, size) ^ ~0U;
+		put_unaligned_le32(0x003d0000, text + off);
+		KUNIT_EXPECT_EQ(test, ave_fw_text_boot_crc(text, size, off, &a), 0);
+		put_unaligned_le32(0x00a10000, text + off);
+		KUNIT_EXPECT_EQ(test, ave_fw_text_boot_crc(text, size, off, &b), 0);
+		/* Any per-boot value gives the zeroed-word CRC. */
+		KUNIT_EXPECT_EQ(test, a, zeroed);
+		KUNIT_EXPECT_EQ(test, b, zeroed);
+	}
+	KUNIT_EXPECT_PTR_EQ(test, ave_layout_for_crc(n->text_crc), &ave_layout_26b123);
+	KUNIT_EXPECT_PTR_EQ(test, ave_layout_for_crc(ave_t8112.text_crc),
+			    &ave_layout_6070_11_1);
+}
+
 static void ave_t6041_text_boot_word(struct kunit *test)
 {
 	const u32 off = ave_t6041.text_boot_word, size = off + 0x100;
@@ -1509,6 +1571,10 @@ static void ave_t6041_text_boot_word(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, off, 0x4224U);
 	KUNIT_EXPECT_EQ(test, ave_t6041.fw_data_size_alt, 0x130000U);
 	KUNIT_EXPECT_EQ(test, ave_t6041.text_link_cell, 0U);
+	/* The M4 27.2 build: the same word, set per boot by some loaders. */
+	KUNIT_EXPECT_EQ(test, ave_t8132.text_boot_word, off);
+	KUNIT_EXPECT_EQ(test, ave_t8132.text_crc, AVE_FW_TEXT_CRC_T8132_26B123);
+	KUNIT_EXPECT_EQ(test, ave_t8132.text_link_cell, 0U);
 	for (u32 i = 0; i < size; i++)
 		text[i] = i * 7 + 3;
 	memset(text + off, 0, 4);
@@ -1568,6 +1634,7 @@ static struct kunit_case ave_abi_cases[] = {
 	KUNIT_CASE(ave_6070_smalloc),
 	KUNIT_CASE(ave_m3_probe_only),
 	KUNIT_CASE(ave_26b123_layout),
+	KUNIT_CASE(ave_t8112_26b123_build),
 	{}
 };
 
@@ -1576,5 +1643,3 @@ static struct kunit_suite ave_abi_suite = {
 	.test_cases = ave_abi_cases,
 };
 kunit_test_suite(ave_abi_suite);
-
-MODULE_LICENSE("GPL");

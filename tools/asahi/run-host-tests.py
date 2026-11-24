@@ -37,6 +37,7 @@ ROOT = Path(__file__).resolve().parents[2]
 ASAHI = ROOT / 'tools/asahi'
 GPU = ROOT / 'tools/testing/selftests/drivers/gpu'
 APPLE = ROOT / 'tools/testing/selftests/drivers/apple'
+AVE_TESTS = ROOT / 'drivers/media/platform/apple/ave/tests'
 
 PASS = 'pass'
 KILL = 'kill'
@@ -78,8 +79,11 @@ ASAHI_TESTS = {
 
     'dcpext26-startup-tests.py': [([], PASS)],
     'iomfb-startup-tests.py': [([], PASS)],
+    'atc-dp-drive-tests.py': [([], PASS)] + mutations(
+        '--mutation', ['eopnotsupp', 'accept-with-rate', 'refuse-drive'], []),
     'dcp-v27-dptx-layout-tests.py': [([], PASS)] + mutations(
-        '--mutation', ['ignore-advertisement', 'ignore-pinned', 'ignore-dcpext'], []),
+        '--mutation', ['ignore-advertisement', 'ignore-pinned', 'ignore-dcpext',
+                       'ignore-typec-routes'], []),
     'dcpext26-wire-tests.py': [([], PASS)],
     'pmp-native26-tests.py': [([], PASS)],
 
@@ -162,7 +166,8 @@ ASAHI_TESTS = {
         + [(out() + ['--ref', '9260e1f021e075713931f3c23c0a5fa1da936b0b'], KILL)],
     'brcmf-suspend-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('country-gate', 'queue-reasons', 'worker-gate',
-                                   'resume-order', 'tx-drain', 'lpas-resume'), out()),
+                                   'resume-order', 'tx-drain', 'lpas-resume',
+                                   'wowl-s2idle-only'), out()),
     'brcmf-wowl-filter-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('base-order', 'mask-last', 'totsize', 'no-track'), out()),
     'brcmfmac-scan-timeout-tests.py': [(out('--output'), PASS)],
@@ -176,6 +181,23 @@ ASAHI_TESTS = {
                                    'missing-control-firmware', 'missing-control-descriptor',
                                    'missing-owner-ipc', 'missing-owner-firmware',
                                    'missing-owner-descriptor', 'missing-owner-arena'), out()),
+    # a7638d51880c, the parent of the fix, ran pm_runtime_force_suspend in the late
+    # slot, so the dp-audio domain dropped under a running DCP.
+    'dcpaud-sleep-hold-tests.py': [(out(), PASS)]
+        + mutations('--mutation', ('bound-only', 'stopped-holds', 'invert-runs', 'no-lock',
+                                     'leak-device', 'leak-node', 'ignore-dcp'), out())
+        + [(out() + ['--ref', 'a7638d51880ce077cfb3edfa7ff638de2be74c85'], KILL)],
+    # A DCP whose firmware runs through the sleep holds its DP PHYs' domains.
+    'dcp-sleep-phy-hold-tests.py': [([], PASS)]
+        + mutations('--mutation', ('no-route', 'no-own-phy', 'class-device', 'no-err-check'), []),
+    # An HDMI display kept through a sleep but unplugged during it is released on resume.
+    'dcp-hdmi-sleep-unplug-tests.py': [([], PASS)]
+        + mutations('--mutation', ('keep-native', 'gpio-error', 'ignore-borrowed', 'no-fabric',
+                                     'no-fabric-lock', 'no-resume-check'), []),
+    # A fixed (non-Type-C) output takes its DP AV service again after a sleep.
+    'dpavserv-admission-tests.py': [([], PASS)]
+        + mutations('--mutation', ('old-cable-wait', 'ignore-generation', 'ignore-cable',
+                                     'ignore-quiescing'), []),
     'dcp-bw-scratch-window-tests.py': [([], PASS)] + mutations('--mutation', ('old-check', 'start-only'), []),
     'clpc-gpu-demand-tests.py': [([], PASS)],
     'clpc-high-power-cleanup-tests.py': [(out(), PASS),
@@ -291,6 +313,9 @@ ASAHI_TESTS = {
                                    'mailbox-minimum', 'version-string', 'message-string'), out()),
     'rtkit-oslog-tests.py': [(out(), PASS)]
         + mutations('--mutate', ('admission', 'channel', 'counter', 'reset', 'buffer'), out()),
+    'rtkit-adopted-session-tests.py': [(out(), PASS)]
+        + mutations('--mutation', ('no-management', 'any-system', 'any-version',
+                                   'ignore-ops-version', 'any-buffer-endpoint'), out()),
     'rtkit-retained-tests.py': [(out(), PASS)],
     't6030-clock-tests.py': [(out(), PASS)],
     't6030-display-admission-tests.py': [(out('--output'), PASS), (out('--output') + ['--mutations'], PASS)],
@@ -331,6 +356,12 @@ SUITES = [
     ('apple-afkv2-gcc', GPU / 'apple-afkv2', ['sh', 'run-afkv2-tests.sh']),
     ('apple-afkv2-clang', GPU / 'apple-afkv2', ['sh', 'run-afkv2-tests.sh']),
     ('t8140-external-bw', GPU, ['python3', '-I', '-B', 'test_t8140_external_bw.py']),
+    # The AVE encoder's own harnesses: the production command, session and
+    # recovery code built against host boundaries.
+    ('ave-host', AVE_TESTS, ['python3', '-I', '-B', 'run.py', '--build', '{out}']),
+    ('ave-recovery', AVE_TESTS, ['python3', '-I', '-B', 'run-recovery.py']),
+    ('ave-input', AVE_TESTS, ['python3', '-I', '-B', 'run-input.py']),
+    ('ave-ipc', AVE_TESTS, ['python3', '-I', '-B', 'run-ipc.py']),
 ]
 
 # tools/testing/selftests/drivers/apple: the host-runnable harnesses build the

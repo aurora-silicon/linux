@@ -66,11 +66,11 @@ typedef void (*dcp_callback_t)(struct apple_dcp *, void *, void *);
 
 #define TRAMPOLINE_IN(func, handler, T_in)                                    \
 	typedef void (*callback_##handler)(struct apple_dcp *, T_in *);       \
-                                                                              \
+									      \
 	static bool __maybe_unused func(struct apple_dcp *dcp, int tag, void *out, void *in) \
 	{                                                                     \
 		callback_##handler cb = handler;                              \
-                                                                              \
+									      \
 		trace_iomfb_callback(dcp, tag, #handler);                     \
 		cb(dcp, in);                                                  \
 		return true;                                                  \
@@ -78,12 +78,12 @@ typedef void (*dcp_callback_t)(struct apple_dcp *, void *, void *);
 
 #define TRAMPOLINE_INOUT(func, handler, T_in, T_out)                          \
 	typedef T_out (*callback_##handler)(struct apple_dcp *, T_in *);      \
-                                                                              \
+									      \
 	static bool __maybe_unused func(struct apple_dcp *dcp, int tag, void *out, void *in) \
 	{                                                                     \
 		T_out *typed_out = out;                                       \
 		callback_##handler cb = handler;                              \
-                                                                              \
+									      \
 		trace_iomfb_callback(dcp, tag, #handler);                     \
 		*typed_out = cb(dcp, in);                                     \
 		return true;                                                  \
@@ -93,7 +93,7 @@ typedef void (*dcp_callback_t)(struct apple_dcp *, void *, void *);
 	static bool __maybe_unused func(struct apple_dcp *dcp, int tag, void *out, void *in) \
 	{                                                                     \
 		T_out *typed_out = out;                                       \
-                                                                              \
+									      \
 		trace_iomfb_callback(dcp, tag, #handler);                     \
 		*typed_out = handler(dcp);                                    \
 		return true;                                                  \

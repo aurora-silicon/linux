@@ -9,7 +9,7 @@ The actual admission helper restricts the workaround to base M1 machines;
 T600x/T8112/T602x still match the T8103 PHY fallback but keep their previous
 single-poll/BIST/role behavior. OF compatible lookup is a modeled boundary.
 The DT-to-driver match contract is checked from the actual sources.
-T8132 cases cover CIO ownership during USB host shutdown; its lane setup
+CIO ownership during USB host shutdown is covered on T8103 and T8132; T8132 lane setup
 and electrical behavior are not modeled. Hardware qualification remains necessary.
 Run --mutations for sensitivity checks.
 """
@@ -414,14 +414,17 @@ static void power_off_preserves_dp_and_finishes_pending(void) {
  assert(atcphy_usb3_power_off(&phy)==-ETIMEDOUT);assert(!configure_calls);
  unlock_ret=0;assert(!atcphy_usb3_power_off(&phy));assert(p.mode==APPLE_ATCPHY_MODE_USB3_DP&&!configure_calls&&!p.t8103_usb3_retry&&!p.t8103_dummy_pending);
 }
-static void t8132_usb_stop_keeps_cio_until_mux_disconnect(void) {
+static void usb_stop_keeps_cio_until_mux_disconnect(void) {
  const enum atcphy_mode modes[] = { APPLE_ATCPHY_MODE_TBT, APPLE_ATCPHY_MODE_USB4 };
- for (unsigned i=0;i<2;i++) {
-  reset(ATCPHY_GENERATION_T8132,false);p.mode=modes[i];p.typec_mode=modes[i];p.host_active=true;
+ /* Every generation: T8112 and T600x run the T8103 PHY sequence. */
+ const enum atcphy_generation gens[] = { ATCPHY_GENERATION_T8103, ATCPHY_GENERATION_T8132 };
+ for (unsigned g=0;g<2;g++) for (unsigned i=0;i<2;i++) {
+  reset(gens[g],false);p.mode=modes[i];p.typec_mode=modes[i];p.host_active=true;
   assert(!atcphy_usb3_power_off(&phy));
   assert(!p.host_active&&p.mode==modes[i]&&!configure_calls&&atcphy_rpm_busy(&p));
   assert(!atcphy_dwc3_reset_assert(&p.rcdev,0));
   assert(p.mode==modes[i]&&!configure_calls&&atcphy_rpm_busy(&p)&&usb2_power_off_calls==1);
+  if (gens[g]!=ATCPHY_GENERATION_T8132) continue; /* the OFF lane setup is modeled for T8132 only */
   model_t8132_off=true;
   assert(!atcphy_mux_switch(&p,APPLE_ATCPHY_MODE_OFF));
   assert(p.mode==APPLE_ATCPHY_MODE_OFF&&configure_calls==1&&!atcphy_rpm_busy(&p));
@@ -695,7 +698,7 @@ int main(void) {
  TEST(usb4_and_dead_parking_single_poll);TEST(early_host_and_device);TEST(early_admission_and_failure);TEST(later_off_and_bist_unchanged);TEST(success_only_all_generations);
  TEST(live_lock_failure_restores_masks);TEST(live_park_then_pending_completion);TEST(legacy_live_dispatch_and_generation);TEST(pending_blocks_lane_and_backend);
  TEST(canceled_lane_change_reconnects);TEST(role_finishes_pending);TEST(target_failure_preserves_reconnect);TEST(nonusb_commit_clears_retry);TEST(dp_assignment_d_retains_usb3);TEST(modern_safe_refusal_retained);
- TEST(fixed_hub_host_dispatch);TEST(reset_release_retries_before_writes);TEST(reset_assert_failure_and_stop);TEST(power_off_preserves_dp_and_finishes_pending);TEST(t8132_usb_stop_keeps_cio_until_mux_disconnect);TEST(setup_known_reset_clears_obligations);TEST(target_mode_table_and_dirty);
+ TEST(fixed_hub_host_dispatch);TEST(reset_release_retries_before_writes);TEST(reset_assert_failure_and_stop);TEST(power_off_preserves_dp_and_finishes_pending);TEST(usb_stop_keeps_cio_until_mux_disconnect);TEST(setup_known_reset_clears_obligations);TEST(target_mode_table_and_dirty);
  TEST(lock_timeout_left_to_caller);
  printf("%u ATCPHY USB3 host cases passed\n",tests);
 }
@@ -815,7 +818,16 @@ def harness(source):
     return PRELUDE + defines + "\n" + "\n".join(usb_defines) + "\n" + types + "\n" + table + stubs + functions + scope_c + TESTS
 
 
-MUTATIONS = {'t8132-device-role-refused': ('atcphy_usb3_set_mode',
+MUTATIONS = {'usb-stop-keeps-dirty-cio': ('atcphy_usb3_power_off',
+ 'atcphy_mode_is_cio(atcphy->mode) && !atcphy->mode_dirty)', 'atcphy_mode_is_cio(atcphy->mode))'),
+ 'usb-stop-drops-cio': ('atcphy_usb3_power_off',
+ 'atcphy_mode_is_cio(atcphy->mode) && !atcphy->mode_dirty', 'false'),
+ 'usb-stop-keeps-usb-too': ('atcphy_usb3_power_off',
+ 'atcphy_mode_is_cio(atcphy->mode) && !atcphy->mode_dirty', '!atcphy->mode_dirty'),
+ 'usb-stop-keeps-cio-t8132-only': ('atcphy_usb3_power_off',
+ 'atcphy_mode_is_cio(atcphy->mode) && !atcphy->mode_dirty',
+ 'atcphy->hw->gen == ATCPHY_GENERATION_T8132 && atcphy_mode_is_cio(atcphy->mode) && !atcphy->mode_dirty'),
+'t8132-device-role-refused': ('atcphy_usb3_set_mode',
  'if (atcphy->t8132_ss) {',
  'if (atcphy->t8132_ss) {\n\t\t\treturn -EOPNOTSUPP;'),
  't8132-device-role-not-remembered': ('atcphy_mux_switch',
@@ -835,13 +847,6 @@ MUTATIONS = {'t8132-device-role-refused': ('atcphy_usb3_set_mode',
  't8132-pin-d-keeps-dp': ('enum atcphy_mode atcphy_t8132_device_mode',
  'mode == APPLE_ATCPHY_MODE_USB3 || mode == APPLE_ATCPHY_MODE_USB3_DP',
  'mode == APPLE_ATCPHY_MODE_USB3'),
- 't8132-usb-stop-keeps-dirty-cio': ('atcphy_usb3_power_off',
- '&&\n\t    !atcphy->mode_dirty)', ')'),
- 't8132-usb-stop-drops-cio': ('atcphy_usb3_power_off',
- 'atcphy->hw->gen == ATCPHY_GENERATION_T8132 && atcphy_mode_is_cio(atcphy->mode)', 'false'),
- 't8132-usb-stop-keeps-usb-too': ('atcphy_usb3_power_off',
- 'atcphy->hw->gen == ATCPHY_GENERATION_T8132 && atcphy_mode_is_cio(atcphy->mode)',
- 'atcphy->hw->gen == ATCPHY_GENERATION_T8132'),
  'no-live-retry': ('atcphy_pipehandler_lock_live', '? 10 : 1;', '? 1 : 1;'),
  'retry-later-generations': ('atcphy_pipehandler_lock_live', '? 10 : 1;', '? 10 : 10;'),
  'sleep-after-last': ('atcphy_pipehandler_lock_live', 'if (attempt + 1 < attempts)', 'if (true)'),
