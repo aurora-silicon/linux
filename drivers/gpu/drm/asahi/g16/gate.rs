@@ -21,6 +21,8 @@ use super::{command::cover_locked, command::USC_WINDOW, params};
 use crate::mmu;
 
 const VDM_ROOT: u32 = 0x21000960;
+/// USC cache invalidate bit of the VDM root barrier (DRM_ASAHI_FEATURE_VDM_USC_INVALIDATE).
+const VDM_ROOT_USC_INVAL: u32 = 0x8;
 const CDM_TERMINATE: u32 = 0x40000000;
 const CDM_BARRIERS: [u32; 4] = [0x60000160, 0x600215fe, 0x60001560, 0x600201fe];
 const CDM_LINK: u32 = 0x20000000;
@@ -121,7 +123,8 @@ fn program(
 
 /// VDM admission for a batch of root streams under an already-held VM read lock.
 /// Reads only the 4-byte root word for a single pass to minimize PoC cache maintenance,
-/// and caches up to 256 intra-page bytes across multi-pass batches.
+/// and caches up to 256 intra-page bytes across multi-pass batches. Each normal root stream
+/// opens with the G16 barrier, with or without the USC cache invalidate.
 pub(crate) fn vdm_batch_locked(guard: &mut mmu::VmReadGuard<'_>, vas: &[u64]) -> Result {
     if vas.is_empty() || !params::stream_gate() {
         return Ok(());
@@ -145,7 +148,7 @@ pub(crate) fn vdm_batch_locked(guard: &mut mmu::VmReadGuard<'_>, vas: &[u64]) ->
         }
         let off = (va - win_va) as usize;
         let word = u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
-        if word != VDM_ROOT {
+        if word & !VDM_ROOT_USC_INVAL != VDM_ROOT {
             return Err(reject("VDM root", va, &[word]));
         }
     }

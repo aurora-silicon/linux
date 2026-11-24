@@ -95,16 +95,19 @@ struct apple_epic_service {
     bool pending_open;const char *pending_name,*pending_class;s64 pending_unit;
 };
 /* v27_closed_teardown: set only by a J714s firmware 27 sleep. */
-struct apple_dcp_afkep { u8 *command_tags;bool lock,stopping;void *wq;struct work_struct service_work;struct apple_dcp *dcp;const struct apple_epic_service_ops *ops;bool wire_v2,inline_v2,match_epic_name,v27_closed_teardown;u32 endpoint;unsigned int num_channels;struct apple_epic_service services[AFK_MAX_CHANNEL]; };
+struct apple_dcp_afkep { u8 *command_tags;bool lock,stopping;void *wq;struct work_struct service_work;struct apple_dcp *dcp;const struct apple_epic_service_ops *ops,*unmatched_ops;bool wire_v2,inline_v2,match_epic_name,v27_closed_teardown;u32 endpoint;unsigned int num_channels;int service_wq;struct apple_epic_service services[AFK_MAX_CHANNEL]; };
+#define wake_up_all(q) ((void)(q))
 struct apple_connector { void *dcp;bool connected,edid_invalidation_pending;struct { int registration_state; } base;unsigned int hotplug_wq; };
 struct apple_dcp {
     void *dev;int fw_compat;struct apple_dcp_afkep *dcpavservep;struct apple_connector *connector;
     bool external_physically_absent,hpd_mutex,quiescing,typec_cable_connected;u64 typec_generation;unsigned int nr_modes;
-    struct { int iomfb_method_profile,firmware_compat; bool fw_14_7_endpoints; unsigned int num_dptx_ports; } hw; bool ext_dead,external_native;
+    struct { int iomfb_method_profile,firmware_compat; bool fw_14_7_endpoints,afk_announced_names; unsigned int num_dptx_ports; } hw; bool ext_dead,external_native;
     struct { bool lock,enabled;u64 epoch;int enable_completion;struct apple_epic_service *service,*opened;
              u64 opened_epoch,close_gen,terminated_epoch,close_epoch;bool opening;struct work_struct close_wq; } dcpavserv;
     /* A J714s firmware 27 processor's: this one is not. */
     bool v27_j714s, v27_sleep_transport; struct apple_dcp_afkep *sleep_v27_ep[0x20], *panelav[0x20];
+    /* Not a dcpext: none of these scenarios is an external processor. */
+    bool dcpext;
 };
 '''+internal_inline(root,'dcp_fw_is_14_7')+internal_inline(root,'dcp_is_v14_7_external')+internal_inline(root,'dcp_is_v27_external')+r'''struct epic_cmd { u32 retcode;u64 rxbuf,txbuf;u32 rxlen,txlen; };
 static unsigned int dma_frees,opens;
@@ -144,6 +147,8 @@ struct item { const char *key,*value; s64 integer; };
 struct dcp_parse_ctx { struct item *items;unsigned int count,index;bool key; };
 struct iterator { struct dcp_parse_ctx *handle;unsigned int idx,len; };
 #define kfree(p) free((void *)(p))
+#define GFP_KERNEL 0
+#define kstrdup(s,f) strdup(s)
 #define PTR_ERR(p) ((int)(intptr_t)(p))
 static struct item announcement_items[3];
 static int parse(u8 *p,size_t n,struct dcp_parse_ctx *ctx)
@@ -168,7 +173,7 @@ static int skip(struct dcp_parse_ctx *h) { assert(!h->key);h->index++;h->key=tru
            function('afk.h','static inline bool\nafk_service_reinit('),function('afk.h','static inline void afk_service_discard('),
            function('afk.h','static inline void afk_service_publish('),
            function('epic/dpavservep.c','static void dcpavserv_notify_edid('),function('epic/dpavservep.c','static bool dcpavserv_identity('),
-           function('epic/dpavservep.c','static bool dcpavserv_admission_current('),function('epic/dpavservep.c','static int dcpavserv_prepare('),
+           '/* These scenarios model a Type-C output (dcp-fabric.c decides it in the driver). */\nstatic bool dcp_is_typec_output(struct apple_dcp *d) { (void)d; return true; }\n'+function('epic/dpavservep.c','static bool dcpavserv_admission_current('),function('epic/dpavservep.c','static int dcpavserv_prepare('),
            function('epic/dpavservep.c','static int dcpavserv_revalidate('),function('epic/dpavservep.c','static void dcpavserv_init('),function('epic/dpavservep.c','static void dcpavserv_invalidate_edid('),
            function('epic/dpavservep.c','static void dcpavserv_teardown('),function('epic/dpavservep.c','void dpavservep_detach('),
            function('afk.c','static const struct apple_epic_service_ops *\nafk_match_service('),
@@ -572,7 +577,7 @@ def admission(root):
 
     av = (base / 'epic/dpavservep.c').read_text()
     af = (base / 'afk.c').read_text()
-    announce = af[af.index('static void afk_recv_handle_init('):af.index('static void afk_recv_handle_init(') + 6500]
+    announce = af[af.index('static void afk_recv_handle_init('):af.index('static void afk_recv_handle_init(') + 7000]
     assert announce.index('ops->prepare(service,') < announce.index('EPIC_CAT_REPORT, AFKV2_OPEN')
     assert '.prepare = dcpavserv_prepare,' in av and '.prepare = dcpdpserv_prepare,' in av
     prefix = r'''
@@ -693,7 +698,7 @@ static int afk_receive_message(struct apple_dcp_afkep *ep, u64 message)
              function('dcp.c', 'static struct apple_dcp_afkep *dcp_afkep('),
              function('dcp.c', 'static void dcp_recv_msg('),
              function('epic/dpavservep.c', 'static bool dcpavserv_identity('),
-             function('epic/dpavservep.c', 'static bool dcpavserv_admission_current('),
+             '/* These scenarios model a Type-C output (dcp-fabric.c decides it in the driver). */\nstatic bool dcp_is_typec_output(struct apple_dcp *d) { (void)d; return true; }\n' + function('epic/dpavservep.c', 'static bool dcpavserv_admission_current('),
              function('epic/dpavservep.c', 'static int dcpavserv_prepare('),
              function('epic/dpavservep.c', 'static int dcpdpserv_prepare('),
              function('epic/dpavservep.c', 'static void dcpavserv_init('),

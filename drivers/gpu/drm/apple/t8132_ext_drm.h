@@ -4,6 +4,7 @@
 #define __APPLE_T8132_EXT_DRM_H__
 
 #include <linux/kconfig.h>
+#include <linux/notifier.h>
 #include <linux/types.h>
 
 struct device;
@@ -15,7 +16,7 @@ struct drm_atomic_commit;
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8132)
 int t8132_ext_drm_init(struct drm_device *drm);
-/* First in the DRM device's teardown: the PM notifier and the work stopped. */
+/* First in the DRM device's teardown: the sleep handling and the work stopped. */
 void t8132_ext_drm_fini(struct drm_device *drm);
 /* The objects of these outputs are not apple_crtc/apple_connector/apple_plane. */
 bool t8132_ext_crtc(const struct drm_crtc *crtc);
@@ -28,6 +29,8 @@ void t8132_ext_drm_flip_done(struct device *dcpext);
 /* Whether @state has one of these CRTCs, and wait for their flips. */
 bool t8132_ext_drm_in_commit(struct drm_atomic_commit *state);
 void t8132_ext_drm_wait_flips(struct drm_atomic_commit *state);
+/* System-sleep event from appledrm's PM notifier: a notifier return value. */
+int t8132_ext_drm_pm_event(unsigned long event);
 #else
 static inline int t8132_ext_drm_init(struct drm_device *drm) { return 0; }
 static inline void t8132_ext_drm_fini(struct drm_device *drm) { }
@@ -38,6 +41,7 @@ static inline void t8132_ext_drm_hotplug(struct device *dcpext) { }
 static inline void t8132_ext_drm_flip_done(struct device *dcpext) { }
 static inline bool t8132_ext_drm_in_commit(struct drm_atomic_commit *state) { return false; }
 static inline void t8132_ext_drm_wait_flips(struct drm_atomic_commit *state) { }
+static inline int t8132_ext_drm_pm_event(unsigned long event) { return NOTIFY_DONE; }
 #endif
 
 #endif

@@ -2770,14 +2770,20 @@ static void bcm4377_reset_work(struct work_struct *work)
 {
 	struct bcm4377_reset_work *rw =
 		container_of(work, struct bcm4377_reset_work, work);
+	int ret;
 
 	/*
 	 * Remove and probe again: probe resets the function and boots the
 	 * firmware from scratch. device_reprobe() frees the old bcm4377_data,
 	 * which is why this work and its device reference live outside it.
+	 * A timeout during system resume gets here while the driver core
+	 * blocks probing: the probe is deferred and runs once resume completes.
 	 */
-	if (device_reprobe(&rw->pdev->dev))
-		dev_err(&rw->pdev->dev, "reprobe after command timeout failed\n");
+	ret = device_reprobe(&rw->pdev->dev);
+	if (ret == -EPROBE_DEFER)
+		dev_info(&rw->pdev->dev, "reprobe after command timeout deferred\n");
+	else if (ret)
+		dev_err(&rw->pdev->dev, "reprobe after command timeout failed: %d\n", ret);
 
 	pci_dev_put(rw->pdev);
 	kfree(rw);

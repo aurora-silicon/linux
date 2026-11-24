@@ -292,7 +292,9 @@ fn vdm_check(vm: &mmu::Vm, vas: &[u64]) -> kernel::prelude::Result {
 }
 #[test]
 fn vdm_m4_root_barrier() {
-    assert!(vdm_check(&vm_for(&[0x21000960]), &[BASE]).is_ok());
+    for word in [0x21000960, 0x21000968] {
+        assert!(vdm_check(&vm_for(&[word]), &[BASE]).is_ok());
+    }
     for word in [0, 0x21000964, 0x40000000] {
         assert!(vdm_check(&vm_for(&[word]), &[BASE]).is_err());
     }
