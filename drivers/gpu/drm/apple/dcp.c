@@ -10053,10 +10053,37 @@ static void dcp_t8132_sleep_stopped(struct apple_dcp *dcp)
 	WRITE_ONCE(dcp->t8132_release_late, false);
 }
 
+/**
+ * dcp_sleep_keeps_firmware - whether a DCP's firmware runs through this sleep
+ * @dev: the DCP device
+ *
+ * For blocks the DCP's firmware drives (DP audio), from their late suspend,
+ * after every device's .suspend. It takes the DCP's device lock, which can
+ * sleep, so it is not for the noirq phase. True when the DCP's suspend left
+ * its coprocessor running with its domains on, or when no driver is bound
+ * (a boot stage or an earlier bind may have left the firmware running).
+ * False when the suspend stopped the firmware (S2R, the 27.x sleep, an M4
+ * stop or power gate) or never ran it.
+ */
+bool dcp_sleep_keeps_firmware(struct device *dev)
+{
+	struct apple_dcp *dcp;
+	bool runs;
+
+	device_lock(dev);
+	dcp = dev->driver ? dev_get_drvdata(dev) : NULL;
+	runs = !dev->driver || (dcp && dcp->sleep_fw_runs);
+	device_unlock(dev);
+
+	return runs;
+}
+EXPORT_SYMBOL_GPL(dcp_sleep_keeps_firmware);
+
 static int dcp_platform_suspend(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
+	dcp->sleep_fw_runs = false;
 	/* Its power sequences may crash the DCP and blank the panel. */
 	if (dcp_takeover_was_aborted(dcp))
 		return -EBUSY;
@@ -10115,7 +10142,10 @@ static int dcp_platform_suspend(struct device *dev)
 			return ret;
 		}
 		dcp_t8132_sleep_stopped(dcp);
+		dcp->sleep_fw_runs = !iomfb_m4_sleep_stopped(dcp);
 		device_set_wakeup_path(dev);
+		if (dcp->sleep_fw_runs)
+			dcp_sleep_hold_phys(dcp);
 		return 0;
 	}
 	if (dcp_is_ext26(dcp) && pm_suspend_target_state != PM_SUSPEND_TO_IDLE) {
@@ -10170,7 +10200,9 @@ static int dcp_platform_suspend(struct device *dev)
 		/* Pair with the H17P unpark; native26 has its own retained resume. */
 		if (dcp_is_external_h17p(dcp))
 			dcp_typec_route_park(dcp);
+		dcp->sleep_fw_runs = true;
 		device_set_wakeup_path(dev);
+		dcp_sleep_hold_phys(dcp);
 		if (dcp_is_ext26(dcp))
 			dev_dbg(dev, "native26 retained s2idle stop; firmware and supplier leases held\n");
 		return 0;
@@ -10193,7 +10225,21 @@ static int dcp_platform_suspend(struct device *dev)
 
 	if (dcp->hdmi_hpd_irq) {
 		disable_irq(dcp->hdmi_hpd_irq);
-		if (!dcp->active_typec_route) {
+		/*
+		 * The firmware runs through this sleep, so the HDMI output
+		 * keeps its link as through DPMS off (see dcp_poweroff()), and
+		 * resume lights it again through dcp_poweron(). Only a display
+		 * that is gone is reported and released here. Releasing one
+		 * that stays attached reports it unplugged, and nothing
+		 * connects it again after the wake: its HPD stays high, so no
+		 * edge comes, and a CRTC userspace turned off for the unplug
+		 * never runs dcp_poweron(). A T6030 native output's resume sets
+		 * its PHY and crossbar up again (dcp_fabric_hdmi_reinit()),
+		 * which needs the link down, so it is still released.
+		 */
+		if (!dcp->active_typec_route &&
+		    (dcp->external_native ||
+		     gpiod_get_value_cansleep(dcp->hdmi_hpd) <= 0)) {
 			disconnected_hpd_event(dcp->connector);
 			dcp_dptx_disconnect(dcp, 0);
 		}
@@ -10203,17 +10249,26 @@ static int dcp_platform_suspend(struct device *dev)
 	 * domains to stay on. We need this as we do not support full
 	 * shutdown properly yet.
 	 */
+	dcp->sleep_fw_runs = true;
 	device_set_wakeup_path(dev);
+	dcp_sleep_hold_phys(dcp);
 	/* Last: the steps above still talk to the coprocessor. */
 	dcp_hold_for_sleep(dcp);
 
 	return 0;
 }
 
+void dcp_hdmi_disconnect(struct apple_dcp *dcp)
+{
+	disconnected_hpd_event(dcp->connector);
+	dcp_dptx_disconnect(dcp, 0);
+}
+
 static int dcp_platform_resume(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
+	dcp->sleep_fw_runs = false;
 	if (dcp_takeover_was_aborted(dcp))
 		return 0;
 	if (dcp_is_iboot(dcp))
@@ -10257,6 +10312,9 @@ static int dcp_platform_resume(struct device *dev)
 	/* The HDMI output's PHY and crossbar may have lost their setup in sleep. */
 	if (dcp->external_native)
 		dcp_fabric_hdmi_reinit(dcp, "after system sleep");
+	/* Before the HPD IRQ comes back: an edge from now on is replayed. */
+	if (dcp->hdmi_hpd_irq)
+		dcp_hdmi_unplugged_in_sleep(dcp);
 	/* Observe future edges before sampling any edges lost in sleep. */
 	if (dcp->hdmi_hpd_irq)
 		dcp_fabric_run_resume(&dcp_resume_ops, dcp);

@@ -896,6 +896,12 @@ struct apple_dcp {
 	struct delayed_work secure_poll_wq;
 	/* Stopped and not restarted, which outlives a suspend that gets refused. */
 	bool s2r_fw_down;
+	/*
+	 * Its last system suspend left the firmware running and its domains on
+	 * (wakeup path), see dcp_sleep_keeps_firmware(). Cleared by the next
+	 * suspend and resume.
+	 */
+	bool sleep_fw_runs;
 	/* DCPEXT kept down through a dark wake, see dcp_s2r_dark_finish(). */
 	bool s2r_dark_held;
 	struct notifier_block s2r_pm_nb;

@@ -181,6 +181,19 @@ ASAHI_TESTS = {
                                    'missing-control-firmware', 'missing-control-descriptor',
                                    'missing-owner-ipc', 'missing-owner-firmware',
                                    'missing-owner-descriptor', 'missing-owner-arena'), out()),
+    # a7638d51880c, the parent of the fix, ran pm_runtime_force_suspend in the late
+    # slot, so the dp-audio domain dropped under a running DCP.
+    'dcpaud-sleep-hold-tests.py': [(out(), PASS)]
+        + mutations('--mutation', ('bound-only', 'stopped-holds', 'invert-runs', 'no-lock',
+                                     'leak-device', 'leak-node', 'ignore-dcp'), out())
+        + [(out() + ['--ref', 'a7638d51880ce077cfb3edfa7ff638de2be74c85'], KILL)],
+    # A DCP whose firmware runs through the sleep holds its DP PHYs' domains.
+    'dcp-sleep-phy-hold-tests.py': [([], PASS)]
+        + mutations('--mutation', ('no-route', 'no-own-phy', 'class-device', 'no-err-check'), []),
+    # An HDMI display kept through a sleep but unplugged during it is released on resume.
+    'dcp-hdmi-sleep-unplug-tests.py': [([], PASS)]
+        + mutations('--mutation', ('keep-native', 'gpio-error', 'ignore-borrowed', 'no-fabric',
+                                     'no-fabric-lock', 'no-resume-check'), []),
     # A fixed (non-Type-C) output takes its DP AV service again after a sleep.
     'dpavserv-admission-tests.py': [([], PASS)]
         + mutations('--mutation', ('old-cable-wait', 'ignore-generation', 'ignore-cable',
