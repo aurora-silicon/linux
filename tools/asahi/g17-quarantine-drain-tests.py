@@ -84,8 +84,11 @@ def fixture():
     at = pairs.index('const SIBLING_BACKLOG')
     backlog = pairs[at:pairs.index('\n}\n', pairs.index('fn sibling_backlog', at)) + 3]
     state = '\n'.join(item(admission, name) for name in [
-        'const fn new(', 'fn exhausted(', 'fn owner_quarantine(', 'fn refusal(', 'fn advance(',
-        'fn set_owner(', 'fn take_idle(', 'fn acquire(', 'fn claim_sibling(', 'fn usable(', 'fn position(', 'fn release(',
+        'const fn new(', 'fn owns_live(', 'fn has_live_owner(', 'fn exhausted(', 'fn owner_quarantine(', 'fn refusal(', 'fn advance(',
+        'fn set_owner(', 'fn take_idle(', 'fn acquire(', 'fn acquire_for(', 'fn live_owners(', 'fn live_siblings(',
+        'fn reclaimable_siblings_in(', 'fn reclaimable_siblings(', 'fn promotes_reclaimable_sibling(',
+        'fn can_lease_slot(', 'fn unavailable_released(', 'fn total_pair_demand(', 'fn pair_demand(',
+        'fn claim_sibling(', 'fn usable(', 'fn position(', 'fn release(',
         'fn rehabilitate(', 'fn pair_drained(&mut self', 'fn retained(', 'fn used('])
     pool = '\n'.join(item(admission, name) for name in [
         'pub(crate) fn release_owner(', 'pub(crate) fn release_retained_owners_after_processor_stop(',

@@ -53,6 +53,7 @@
 
 #include "apple_boot_display.h"
 #include "apple_resume.h"
+#include "dcp-hdr-metadata.h"
 #include "dcp.h"
 #include "plane.h"
 #include "iomfb_m4.h"
@@ -283,9 +284,13 @@ retry:
 	drm_connector_list_iter_begin(dev, &iter);
 	drm_for_each_connector_iter(conn, &iter) {
 		struct drm_connector_state *cs = conn->state;
+		u8 default_bpc = conn->max_bpc_property ? 12 : 0;
 
 		if (!cs->crtc || (!cs->hdr_output_metadata &&
-				  cs->colorspace == DRM_MODE_COLORIMETRY_DEFAULT))
+				  cs->colorspace == DRM_MODE_COLORIMETRY_DEFAULT &&
+				  cs->color_format == DRM_CONNECTOR_COLOR_FORMAT_AUTO &&
+				  cs->hdmi.broadcast_rgb == DRM_HDMI_BROADCAST_RGB_AUTO &&
+				  (!default_bpc || cs->max_requested_bpc == default_bpc)))
 			continue;
 		cs = drm_atomic_get_connector_state(state, conn);
 		if (IS_ERR(cs)) {
@@ -295,6 +300,10 @@ retry:
 		drm_property_blob_put(cs->hdr_output_metadata);
 		cs->hdr_output_metadata = NULL;
 		cs->colorspace = DRM_MODE_COLORIMETRY_DEFAULT;
+		cs->color_format = DRM_CONNECTOR_COLOR_FORMAT_AUTO;
+		cs->hdmi.broadcast_rgb = DRM_HDMI_BROADCAST_RGB_AUTO;
+		if (default_bpc)
+			cs->max_requested_bpc = default_bpc;
 		changed = true;
 	}
 	drm_connector_list_iter_end(&iter);
@@ -819,11 +828,82 @@ err:
 	return ret;
 }
 
+static int apple_atomic_check(struct drm_device *dev,
+			      struct drm_atomic_commit *state)
+{
+	struct drm_plane *plane;
+	struct drm_plane_state *old_plane_state, *new_plane_state;
+	struct drm_crtc *crtc;
+	struct drm_crtc_state *crtc_state;
+	int i, ret;
+
+	ret = drm_atomic_helper_check_modeset(dev, state);
+	if (ret)
+		return ret;
+
+	/*
+	 * Until a displayed KMS swap retires the boot scanout, pull the CRTC
+	 * and its primary plane into every commit touching that CRTC so a
+	 * cursor- or overlay-only commit replays the intended slot-zero state
+	 * and framebuffer reference inside the atomic transaction.
+	 */
+	for_each_oldnew_plane_in_state(state, plane, old_plane_state,
+				       new_plane_state, i) {
+		struct drm_crtc *targets[2] = {
+			old_plane_state->crtc,
+			new_plane_state->crtc,
+		};
+
+		for (int t = 0; t < ARRAY_SIZE(targets); t++) {
+			struct drm_crtc *target = targets[t];
+
+			if (!target || t8132_ext_crtc(target))
+				continue;
+			if (!dcp_boot_surface_pending(to_apple_crtc(target)->dcp))
+				continue;
+			crtc_state = drm_atomic_get_crtc_state(state, target);
+			if (IS_ERR(crtc_state))
+				return PTR_ERR(crtc_state);
+		}
+	}
+
+	for_each_new_crtc_in_state(state, crtc, crtc_state, i) {
+		struct drm_plane_state *plane_state;
+
+		if (t8132_ext_crtc(crtc) || !crtc->primary)
+			continue;
+		if (!crtc_state->enable || !crtc_state->active)
+			continue;
+		if (!dcp_boot_surface_pending(to_apple_crtc(crtc)->dcp))
+			continue;
+
+		plane_state = drm_atomic_get_plane_state(state, crtc->primary);
+		if (IS_ERR(plane_state))
+			return PTR_ERR(plane_state);
+		crtc_state->planes_changed = true;
+	}
+
+	if (dev->mode_config.normalize_zpos) {
+		ret = drm_atomic_normalize_zpos(dev, state);
+		if (ret)
+			return ret;
+	}
+
+	ret = drm_atomic_helper_check_planes(dev, state);
+	if (ret)
+		return ret;
+
+	if (state->legacy_cursor_update)
+		state->async_update = !drm_atomic_helper_async_check(dev, state);
+
+	return 0;
+}
+
 static const struct drm_mode_config_funcs apple_mode_config_funcs = {
 	.atomic_state_alloc	= apple_atomic_state_alloc,
 	.atomic_state_clear	= apple_atomic_state_clear,
 	.atomic_state_free	= apple_atomic_state_free,
-	.atomic_check		= drm_atomic_helper_check,
+	.atomic_check		= apple_atomic_check,
 	.atomic_commit		= apple_atomic_commit,
 	.fb_create		= drm_gem_fb_create,
 };
@@ -893,10 +973,19 @@ static void apple_connector_early_unregister(struct drm_connector *connector)
 	apple_connector_backlight_early_unregister(to_apple_connector(connector));
 }
 
+static void apple_connector_reset(struct drm_connector *connector)
+{
+	drm_atomic_helper_connector_reset(connector);
+	if (connector->state && connector->max_bpc_property) {
+		connector->state->max_requested_bpc = 12;
+		connector->state->max_bpc = 12;
+	}
+}
+
 static const struct drm_connector_funcs apple_connector_funcs = {
 	.fill_modes		= drm_helper_probe_single_connector_modes,
 	.destroy		= appledrm_connector_cleanup,
-	.reset			= drm_atomic_helper_connector_reset,
+	.reset			= apple_connector_reset,
 	.atomic_duplicate_state	= drm_atomic_helper_connector_duplicate_state,
 	.atomic_destroy_state	= drm_atomic_helper_connector_destroy_state,
 	.detect			= apple_connector_detect,
@@ -959,21 +1048,36 @@ static int apple_connector_atomic_check(struct drm_connector *conn,
 {
 	struct drm_connector_state *old = drm_atomic_get_old_connector_state(state, conn);
 	struct drm_connector_state *new = drm_atomic_get_new_connector_state(state, conn);
+	const struct drm_property_blob *blob = new->hdr_output_metadata;
 	struct drm_crtc_state *crtc_state;
 
-	if (!new->crtc || (old->colorspace == new->colorspace &&
-			   drm_connector_atomic_hdr_metadata_equal(old, new)))
+	if (blob && (blob->length != sizeof(struct hdr_output_metadata) ||
+		     !dcp_hdr_is_type1(blob->data)))
+		return -EINVAL;
+
+	if (!new->crtc)
+		return 0;
+	if (old->colorspace == new->colorspace &&
+	    old->color_format == new->color_format &&
+	    old->hdmi.broadcast_rgb == new->hdmi.broadcast_rgb &&
+	    old->max_requested_bpc == new->max_requested_bpc &&
+	    drm_connector_atomic_hdr_metadata_equal(old, new))
 		return 0;
 	crtc_state = drm_atomic_get_crtc_state(state, new->crtc);
 	if (IS_ERR(crtc_state))
 		return PTR_ERR(crtc_state);
 	/*
-	 * The output colour element follows the EOTF and colorspace, so a
-	 * change of either is a mode set.  Where the firmware takes HDR10
-	 * static metadata on a live link, a new block alone is sent with this
-	 * commit's flush (dcp_hdr_metadata_sync()) and the colour mode stays.
+	 * The output colour element follows EOTF, colorspace, format, range
+	 * and bit depth, so changing any of them requires a mode set.  Where
+	 * the firmware takes HDR10 static metadata on a live link, updating
+	 * the metadata payload alone is sent with this commit's flush
+	 * (dcp_hdr_metadata_sync()) and the colour mode stays.
 	 */
-	if (old->colorspace == new->colorspace && old->crtc == new->crtc &&
+	if (old->colorspace == new->colorspace &&
+	    old->color_format == new->color_format &&
+	    old->hdmi.broadcast_rgb == new->hdmi.broadcast_rgb &&
+	    old->max_requested_bpc == new->max_requested_bpc &&
+	    old->crtc == new->crtc &&
 	    apple_connector_eotf(old) == apple_connector_eotf(new) &&
 	    to_apple_connector(conn)->dcp &&
 	    dcp_hdr_metadata_live(to_apple_connector(conn)->dcp))
@@ -1023,28 +1127,65 @@ static int apple_connector_attach_pq_reference(struct drm_connector *connector)
 }
 
 /*
- * External displays can take a PQ BT.2020 signal where the firmware
- * offers one, and a desktop 26.x panel PQ content it shows as EDR;
- * dcp_crtc_atomic_check() refuses it elsewhere.
+ * External displays expose the colour properties backed by DCP's per-timing
+ * ColorModes catalogue (Colorspace, HDR_OUTPUT_METADATA, Broadcast RGB,
+ * color format, max bpc); dcp_crtc_atomic_check() validates each request
+ * against the active timing's catalogue.  An internal panel with EDR
+ * headroom (dcp_panel_edr()) exposes Colorspace (BT2020_RGB),
+ * HDR_OUTPUT_METADATA and PQ_REFERENCE_LUMINANCE; an SDR panel offers no
+ * HDR at all.
  */
 static int apple_connector_attach_hdr(struct drm_connector *connector,
-				      bool panel_edr)
+				      bool panel_edr, bool ext_color_props)
 {
-	const u32 colorspaces = BIT(DRM_MODE_COLORIMETRY_BT2020_RGB);
+	static const u32 panel_colorspaces = BIT(DRM_MODE_COLORIMETRY_BT2020_RGB);
+	static const u32 hdmi_colorspaces =
+		BIT(DRM_MODE_COLORIMETRY_SMPTE_170M_YCC) |
+		BIT(DRM_MODE_COLORIMETRY_BT709_YCC) |
+		BIT(DRM_MODE_COLORIMETRY_XVYCC_601) |
+		BIT(DRM_MODE_COLORIMETRY_XVYCC_709) |
+		BIT(DRM_MODE_COLORIMETRY_SYCC_601) |
+		BIT(DRM_MODE_COLORIMETRY_OPYCC_601) |
+		BIT(DRM_MODE_COLORIMETRY_OPRGB) |
+		BIT(DRM_MODE_COLORIMETRY_BT2020_CYCC) |
+		BIT(DRM_MODE_COLORIMETRY_BT2020_RGB) |
+		BIT(DRM_MODE_COLORIMETRY_BT2020_YCC) |
+		BIT(DRM_MODE_COLORIMETRY_DCI_P3_RGB_D65) |
+		BIT(DRM_MODE_COLORIMETRY_DCI_P3_RGB_THEATER);
+	static const u32 dp_colorspaces =
+		BIT(DRM_MODE_COLORIMETRY_RGB_WIDE_FIXED) |
+		BIT(DRM_MODE_COLORIMETRY_RGB_WIDE_FLOAT) |
+		BIT(DRM_MODE_COLORIMETRY_OPRGB) |
+		BIT(DRM_MODE_COLORIMETRY_DCI_P3_RGB_D65) |
+		BIT(DRM_MODE_COLORIMETRY_BT2020_RGB) |
+		BIT(DRM_MODE_COLORIMETRY_BT601_YCC) |
+		BIT(DRM_MODE_COLORIMETRY_BT709_YCC) |
+		BIT(DRM_MODE_COLORIMETRY_XVYCC_601) |
+		BIT(DRM_MODE_COLORIMETRY_XVYCC_709) |
+		BIT(DRM_MODE_COLORIMETRY_SYCC_601) |
+		BIT(DRM_MODE_COLORIMETRY_OPYCC_601) |
+		BIT(DRM_MODE_COLORIMETRY_BT2020_CYCC) |
+		BIT(DRM_MODE_COLORIMETRY_BT2020_YCC);
+	static const unsigned long ext_color_formats =
+		BIT(DRM_OUTPUT_COLOR_FORMAT_RGB444) |
+		BIT(DRM_OUTPUT_COLOR_FORMAT_YCBCR444) |
+		BIT(DRM_OUTPUT_COLOR_FORMAT_YCBCR422) |
+		BIT(DRM_OUTPUT_COLOR_FORMAT_YCBCR420);
 	int ret;
 
 	switch (connector->connector_type) {
 	case DRM_MODE_CONNECTOR_eDP:
 		if (!panel_edr)
 			return 0;
-		fallthrough;
+		ret = drm_mode_create_dp_colorspace_property(connector, panel_colorspaces);
+		break;
 	/* A desktop 26.x Type-C route is a pipeline output carrying DisplayPort. */
 	case DRM_MODE_CONNECTOR_USB:
 	case DRM_MODE_CONNECTOR_DisplayPort:
-		ret = drm_mode_create_dp_colorspace_property(connector, colorspaces);
+		ret = drm_mode_create_dp_colorspace_property(connector, dp_colorspaces);
 		break;
 	case DRM_MODE_CONNECTOR_HDMIA:
-		ret = drm_mode_create_hdmi_colorspace_property(connector, colorspaces);
+		ret = drm_mode_create_hdmi_colorspace_property(connector, hdmi_colorspaces);
 		break;
 	default:
 		return 0;
@@ -1057,7 +1198,20 @@ static int apple_connector_attach_hdr(struct drm_connector *connector,
 	drm_connector_attach_hdr_output_metadata_property(connector);
 	if (connector->connector_type == DRM_MODE_CONNECTOR_eDP)
 		return apple_connector_attach_pq_reference(connector);
-	return 0;
+	if (!ext_color_props)
+		return 0;
+	ret = drm_connector_attach_broadcast_rgb_property(connector);
+	if (ret)
+		return ret;
+	ret = drm_connector_attach_color_format_property(connector, ext_color_formats);
+	if (ret)
+		return ret;
+	/* drm_connector_attach_max_bpc_property() populates connector->state. */
+	if (!connector->state)
+		apple_connector_reset(connector);
+	if (!connector->state)
+		return -ENOMEM;
+	return drm_connector_attach_max_bpc_property(connector, 8, 12);
 }
 
 static const struct drm_crtc_helper_funcs apple_crtc_helper_funcs = {
@@ -1099,8 +1253,8 @@ static int apple_connector_create(struct drm_device *drm,
 	ret = drm_connector_attach_vrr_capable_property(&connector->base);
 	if (ret)
 		goto err_cleanup;
-	ret = apple_connector_attach_hdr(&connector->base,
-					 dcp_fw_compat_panel_edr(dcp));
+	ret = apple_connector_attach_hdr(&connector->base, dcp_panel_edr(dcp),
+					 dcp_ext_color_props_supported(dcp));
 	if (ret)
 		goto err_cleanup;
 
@@ -1331,6 +1485,24 @@ VISIBLE_IF_KUNIT bool apple_typec_port_rgb8_only(struct platform_device **dcp,
 	return false;
 }
 
+static bool apple_typec_port_color_props(struct platform_device **dcp,
+					 int num_dcp,
+					 struct platform_device *pipeline,
+					 unsigned int port_idx)
+{
+	int i;
+
+	for (i = 0; i < num_dcp; i++) {
+		if (pipeline && dcp[i] != pipeline)
+			continue;
+		if (!dcp_typec_port_has_candidate(port_idx, dcp[i]))
+			continue;
+		if (dcp_ext_color_props_supported(dcp[i]))
+			return true;
+	}
+	return false;
+}
+
 /*
  * Create a connector per physical Type-C port and attach it to every
  * pipeline that can drive it. The M2 Pro/Max laptops append a second
@@ -1433,7 +1605,12 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 		 * intact; its capabilities are not the pipeline's.
 		 */
 		if (!apple_typec_port_rgb8_only(dcp, num_dcp, pipeline, port_idx)) {
-			ret = apple_connector_attach_hdr(&connector->base, false);
+			bool color_props = apple_typec_port_color_props(dcp, num_dcp,
+									pipeline,
+									port_idx);
+
+			ret = apple_connector_attach_hdr(&connector->base, false,
+							 color_props);
 			if (ret)
 				return ret;
 		}

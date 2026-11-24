@@ -2779,10 +2779,9 @@ impl SepData {
         match self.scrd_command(&crate::scrd::scrd_context_delete(handle)) {
             Some((0, _)) => Ok(()),
             other => {
-                self.key_context_failed.store(true, Relaxed);
                 dev_warn_ratelimited!(
                     self.dev,
-                    "scrd: deleting the unlock evaluation answered {:?}; private key operations disabled until reboot\n",
+                    "scrd: deleting the unlock evaluation answered {:?}\n",
                     other.map(|(status, _)| status)
                 );
                 Err(EIO)

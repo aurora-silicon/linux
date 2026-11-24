@@ -168,10 +168,4 @@ impl Generation {
             }
         }
     }
-
-    pub(in crate::g17) fn retire(&mut self, ordinal: u64) -> Result {
-        if self.ordinal != Some(ordinal) { return Err(EIO); }
-        self.ordinal = None;
-        Ok(())
-    }
 }
