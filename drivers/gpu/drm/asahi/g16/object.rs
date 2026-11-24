@@ -46,12 +46,14 @@ pub(crate) enum Class {
     Shared,
     /// Firmware and GPU, ASC-cached.
     SharedCached,
-    /// Firmware-only, ASC-cached (AttrIndex 0) behind a cacheable host mapping: the leaf macOS
-    /// 26B123 gives its per-queue command objects and the G13-G15 private-allocator contract
-    /// (`PROT_FW_PRIV_RW` behind `gem::new_kernel_object`). Only for records the host writes
-    /// before publication and the firmware only reads, with no client or lower alias, and only
+    /// ASC-cached (AttrIndex 0) behind a cacheable host mapping: the leaf macOS 26B123 gives its
+    /// per-queue command objects and the G13-G15 private-allocator contract (`PROT_FW_PRIV_RW`
+    /// behind `gem::new_kernel_object`). Only for command records the host writes before
+    /// publication and never reads back what the firmware writes, with no client alias, and only
     /// from device-lifetime allocators ([`Factory::persistent_objects`]): an ASC-cached M4
-    /// mapping has no qualified teardown, so its owner is never dropped.
+    /// mapping has no qualified teardown, so its owner is never dropped. A kernel GPU task lower
+    /// alias stays uncached, as macOS maps its work items for the GPU; host stores to such an
+    /// object are cleaned to the point of coherency for it ([`FwObject::write`]).
     FwCoherent,
     /// Firmware device mapping.
     #[allow(dead_code)]
@@ -108,6 +110,9 @@ pub(crate) struct FwObject {
     // Subrecords retain the owning WC vmap as well as their GEM.
     _parent: Option<Arc<FwObject>>,
     limit: Option<usize>,
+    /// Host stores go through a cacheable view the GPU reads through its uncached lower alias:
+    /// each store is cleaned to the point of coherency.
+    clean: bool,
 }
 
 // SAFETY: The object only refers to kernel memory shared with the firmware; every host access
@@ -156,9 +161,18 @@ impl FwObject {
                 backing: gem::ObjectRef::new(object.gem()),
                 _parent: Some(object.clone()),
                 limit: Some(size),
+                clean: object.clean,
             },
             GFP_KERNEL,
         )?)
+    }
+
+    /// Makes host stores to `len` bytes at `p` visible to an uncached GPU alias.
+    fn stored(&self, p: *const u8, len: usize) {
+        if self.clean {
+            crate::pgtable::clean_poc(p, len);
+            crate::pgtable::poc_barrier();
+        }
     }
 
     /// Copies bytes into the object before it is published, or into host-owned words.
@@ -167,6 +181,7 @@ impl FwObject {
         // SAFETY: `p` is valid for `bytes.len()` bytes of the object's mapping, which no Rust
         // reference aliases.
         unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len()) };
+        self.stored(p, bytes.len());
         Ok(())
     }
 
@@ -175,6 +190,7 @@ impl FwObject {
         let p = self.ptr(offset, len)?;
         // SAFETY: As for `write`.
         unsafe { core::ptr::write_bytes(p, value, len) };
+        self.stored(p, len);
         Ok(())
     }
 
@@ -184,6 +200,7 @@ impl FwObject {
         if p as usize % 4 == 0 {
             // SAFETY: `p` is valid and aligned for a u32.
             unsafe { p.cast::<u32>().write_volatile(value.to_le()) };
+            self.stored(p, 4);
             Ok(())
         } else {
             self.write(offset, &value.to_le_bytes())
@@ -196,6 +213,7 @@ impl FwObject {
         if p as usize % 8 == 0 {
             // SAFETY: `p` is valid and aligned for a u64.
             unsafe { p.cast::<u64>().write_volatile(value.to_le()) };
+            self.stored(p, 8);
             Ok(())
         } else {
             self.write(offset, &value.to_le_bytes())
@@ -404,8 +422,8 @@ impl Factory {
         }
     }
 
-    /// The device-lifetime render microsequences and barrier records of pass slot `k`, shared by
-    /// every VM's [`super::slots::PassSlot`] `k`.
+    /// The device-lifetime render command records of pass slot `k`, shared by every VM's
+    /// [`super::slots::PassSlot`] `k`.
     pub(crate) fn pass_cmds(&self, k: usize) -> Result<super::slots::PassCmds> {
         self.render_cmds.get(self, k)
     }
@@ -505,10 +523,7 @@ impl Objects {
         if !matches!(req.placement, Placement::Anywhere)
             || !matches!(req.class, Class::Fw | Class::Shared | Class::FwCoherent)
             || (req.class == Class::FwCoherent
-                && (!self.persistent
-                    || req.client.is_some()
-                    || req.lower.is_some()
-                    || client_range.is_some()))
+                && (!self.persistent || req.client.is_some() || client_range.is_some()))
             || req.size == 0
             || req.offset >= hw::PAGE as usize
         {
@@ -534,11 +549,16 @@ impl Objects {
         let registered = self.dev.registration_guard().ok_or(ENODEV)?;
         let parent: &kernel::platform::Device<kernel::device::Bound> = registered.as_ref();
         gem::prepare_new_object(&backing.gem, parent.as_ref())?;
+        let clean = req.class == Class::FwCoherent && req.lower.is_some();
         let cpu = if req.cpu {
             let vmap = backing.vmap()?;
             let pointer = NonNull::new(vmap.addr.cast::<u8>()).ok_or(ENOMEM)?;
             // SAFETY: Fresh private mapping spans bytes and has not been exposed.
             unsafe { core::ptr::write_bytes(pointer.as_ptr(), 0, bytes) };
+            if clean {
+                crate::pgtable::clean_poc(pointer.as_ptr(), bytes);
+                crate::pgtable::poc_barrier();
+            }
             Some(pointer)
         } else {
             None
@@ -622,6 +642,7 @@ impl Objects {
                 backing,
                 _parent: None,
                 limit: None,
+                clean,
             },
             GFP_KERNEL,
         )?;
@@ -777,6 +798,7 @@ impl Objects {
                 backing,
                 _parent: None,
                 limit: None,
+                clean: false,
             })
             .into();
         self.retained.push(object.clone(), GFP_KERNEL)?;

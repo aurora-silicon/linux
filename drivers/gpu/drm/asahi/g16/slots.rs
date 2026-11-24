@@ -264,14 +264,18 @@ impl ComputeSlot {
     }
 }
 
-/// The render microsequences and barrier records of one pass slot index, shared by every VM's
-/// [`PassSlot`] of that index: the index is device-global and claimed by one flight at a time.
-/// They are written by the host before publication and only read by the firmware, so they take
-/// the firmware-cached [`Class::FwCoherent`] view macOS 26B123 gives its per-queue command
-/// objects. Each microsequence keeps its own page; the barrier records share one page, as the
-/// compute unit's barriers do.
+/// The render command records of one pass slot index (TA and FS work images, microsequences and
+/// barrier records), shared by every VM's [`PassSlot`] of that index: the index is device-global
+/// and claimed by one flight at a time. The host writes them before publication and never reads
+/// back what the firmware writes, so they take the firmware-cached [`Class::FwCoherent`] view
+/// macOS 26B123 gives its per-queue command objects. The work images keep their uncached kernel
+/// GPU task lower alias, as macOS maps its work items for the GPU. Each work image and
+/// microsequence keeps its own page; the barrier records share one page, as the compute unit's
+/// barriers do.
 #[derive(Clone)]
 pub(crate) struct PassCmds {
+    pub(crate) ta_work: Arc<FwObject>,
+    pub(crate) fs_work: Arc<FwObject>,
     pub(crate) ta_seq: Arc<FwObject>,
     pub(crate) fs_seq: Arc<FwObject>,
     pub(crate) own_barrier: Arc<FwObject>,
@@ -293,13 +297,37 @@ impl PassCmds {
     const FS_COMPUTE: usize = Self::COMPUTE + barrier::SIZE * sizes::COMPUTE_PIPES;
     const BARRIERS: usize = Self::FS_COMPUTE + barrier::SIZE * sizes::COMPUTE_PIPES;
 
-    /// Allocates one pass slot index's set from a device-lifetime allocator
+    /// Allocates pass slot index `i`'s set from a device-lifetime allocator
     /// ([`Factory::persistent_objects`]), which the caller never drops.
-    pub(crate) fn new(o: &mut Objects) -> Result<Self> {
+    pub(crate) fn new(o: &mut Objects, i: u64) -> Result<Self> {
         let coherent = Class::FwCoherent;
+        let off = client::pass_off(i);
+        let mut work = |size, page, offset| {
+            o.alloc(super::object::Request {
+                size,
+                class: coherent,
+                placement: super::object::Placement::Anywhere,
+                offset,
+                client: None,
+                lower: Some(page),
+                cpu: true,
+            })
+        };
+        let fs_work = work(
+            fs::WORK_SIZE,
+            client::FS_WORK_PAGE + off,
+            client::FS_WORK_OFF as usize,
+        )?;
+        let ta_work = work(
+            ta::WORK_SIZE,
+            client::TA_WORK_PAGE + off,
+            client::TA_WORK_OFF as usize,
+        )?;
         let barriers = alloc(o, Self::BARRIERS, coherent, None, 0, false)?;
         let record = |offset, size| FwObject::view(&barriers, offset, size);
         Ok(Self {
+            ta_work,
+            fs_work,
             ta_seq: alloc(o, ta::SEQ_OBJECT, coherent, None, 0, false)?,
             fs_seq: alloc(o, fs::SEQ_OBJECT, coherent, None, 0, false)?,
             own_barrier: record(Self::OWN, barrier::SIZE)?,
@@ -343,7 +371,7 @@ pub(crate) struct PassSlot {
 
 impl PassSlot {
     /// Allocates pass slot `i`'s objects, with their client leaf classes, around the
-    /// device-lifetime microsequences and barrier records `cmds` of index `i`.
+    /// device-lifetime command records `cmds` of index `i`.
     pub(crate) fn new(o: &mut Objects, i: u64, pre_records: u32, cmds: &PassCmds) -> Result<Self> {
         let sh = Class::Shared;
         let off = client::pass_off(i);
@@ -421,18 +449,6 @@ impl PassSlot {
             0,
             false,
         )?;
-        let fs_work = alloc_work(
-            o,
-            fs::WORK_SIZE,
-            client::FS_WORK_PAGE + off,
-            client::FS_WORK_OFF as usize,
-        )?;
-        let ta_work = alloc_work(
-            o,
-            ta::WORK_SIZE,
-            client::TA_WORK_PAGE + off,
-            client::TA_WORK_OFF as usize,
-        )?;
         Ok(Self {
             aux,
             pre,
@@ -442,8 +458,8 @@ impl PassSlot {
             scene_user,
             scene_list,
             fs_scratch,
-            fs_work,
-            ta_work,
+            fs_work: cmds.fs_work.clone(),
+            ta_work: cmds.ta_work.clone(),
             ta_seq: cmds.ta_seq.clone(),
             fs_seq: cmds.fs_seq.clone(),
             ta_scratch: alloc(o, 0x10000, sh, None, 0, false)?,

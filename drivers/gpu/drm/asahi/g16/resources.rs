@@ -28,10 +28,11 @@ struct PersistentPassCmds {
     cmds: Option<PassCmds>,
 }
 
-/// The firmware-cached render microsequences and barrier records of every pass slot index
-/// (`0..RENDER_SLOTS`), created on first use and kept until reboot. A pass slot index is
-/// device-global and claimed by one flight at a time, so every VM's [`PassSlot`] of an index
-/// shares its records, and closing a VM drops no firmware-cached mapping.
+/// The firmware-cached render command records (work images, microsequences and barrier records)
+/// of every pass slot index (`0..RENDER_SLOTS`), created on first use and kept until reboot. A
+/// pass slot index is device-global and claimed by one flight at a time, so every VM's
+/// [`PassSlot`] of an index shares its records, and closing a VM drops no firmware-cached
+/// mapping.
 #[pin_data]
 pub(crate) struct RenderCmds {
     #[pin]
@@ -66,7 +67,7 @@ impl RenderCmds {
             GFP_KERNEL,
         )?;
         // From here on a failure leaks the allocator with whatever it mapped.
-        let cmds = PassCmds::new(&mut set.objects)?;
+        let cmds = PassCmds::new(&mut set.objects, k as u64)?;
         set.objects.finish_private()?;
         set.cmds = Some(cmds.clone());
         *entry = Some(set);
@@ -221,15 +222,15 @@ impl ComputeUnitSet {
 pub(crate) const BASE_RENDER_SLOTS: usize = super::hw::sizes::BASE_RENDER_SLOTS;
 /// Demand-grown extension render pass slot tiers (`BASE_RENDER_SLOTS..hw::sizes::RENDER_SLOTS`).
 ///
-/// Each extension `PassSlot` backs 3.47 MiB (2 MiB TPC + 1 MiB tilemap + 480 KiB metadata and
-/// scratch; its microsequences and barriers are the device-lifetime [`RenderCmds`] of its index).
-/// Growing in four bounded chunks keeps compositor and shallow desktop VMs on Tier 0
-/// (~20.8 MiB), keeps 20-31 pass workloads on Tier 2 without paying for 48 slots, and keeps
-/// every tier's client-object batch well below `MAX_CLIENT` (512):
-/// - Tier 0 (`2..8`, 6 slots, +20.81 MiB / 20.81 MiB cum): compositors, 2-6 pass frames.
-/// - Tier 1 (`8..18`, 10 slots, +34.69 MiB / 55.50 MiB cum): moderate multi-pass bursts.
-/// - Tier 2 (`18..32`, 14 slots, +48.56 MiB / 104.06 MiB cum): 20-31 pass pipelined frames.
-/// - Tier 3 (`32..RENDER_SLOTS`, 16 slots, +55.50 MiB / 159.56 MiB cum at 48 slots): deep
+/// Each extension `PassSlot` backs 3.44 MiB (2 MiB TPC + 1 MiB tilemap + 448 KiB metadata and
+/// scratch; its work images, microsequences and barriers are the device-lifetime [`RenderCmds`]
+/// of its index). Growing in four bounded chunks keeps compositor and shallow desktop VMs on
+/// Tier 0 (~20.6 MiB), keeps 20-31 pass workloads on Tier 2 without paying for 48 slots, and
+/// keeps every tier's client-object batch well below `MAX_CLIENT` (512):
+/// - Tier 0 (`2..8`, 6 slots, +20.63 MiB / 20.63 MiB cum): compositors, 2-6 pass frames.
+/// - Tier 1 (`8..18`, 10 slots, +34.38 MiB / 55.00 MiB cum): moderate multi-pass bursts.
+/// - Tier 2 (`18..32`, 14 slots, +48.13 MiB / 103.13 MiB cum): 20-31 pass pipelined frames.
+/// - Tier 3 (`32..RENDER_SLOTS`, 16 slots, +55.00 MiB / 158.13 MiB cum at 48 slots): deep
 ///   multi-pass bursts (160 client mappings <= `MAX_CLIENT`).
 pub(crate) const EXT_RENDER_TIERS: [(usize, usize); 4] = [
     (BASE_RENDER_SLOTS, 8),
@@ -380,7 +381,7 @@ fn should_expand_compute_ext(
 /// Steady 60/120 Hz single-pass depth-1 clients finish each frame before the next arrives
 /// (`active_passes == 0`, `render_count == 1`, inter-frame gap >= `BURST_GAP_NS`) and stay
 /// on the two base pass slots (~48.9 MiB). Extension tiers grow on demand: Tier 0 (`2..8`,
-/// +20.8 MiB) allocates when a base pass slot is quarantined, a VM overlaps an in-flight render,
+/// +20.6 MiB) allocates when a base pass slot is quarantined, a VM overlaps an in-flight render,
 /// submits a multi-pass command stream (`render_count >= BASE_RENDER_SLOTS`), or sustains a
 /// sub-2 ms back-to-back burst; higher tiers allocate only when live passes plus this submission
 /// and one displacement slot exceed the currently backed capacity.

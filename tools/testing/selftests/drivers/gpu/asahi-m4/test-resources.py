@@ -131,7 +131,7 @@ pub mod g16 {
         }
         pub fn test_cmds(k:u64)->crate::g16::slots::PassCmds{
             if let Some(c)=PASS_CMDS.with(|p|p.borrow().iter().find(|e|e.0==k).map(|e|e.1.clone())){return c;}
-            let c=PERSISTENT.with(|p|{let mut p=p.borrow_mut();crate::g16::slots::PassCmds::new(p.get_or_insert_with(Objects::persistent)).unwrap()});
+            let c=PERSISTENT.with(|p|{let mut p=p.borrow_mut();crate::g16::slots::PassCmds::new(p.get_or_insert_with(Objects::persistent),k).unwrap()});
             PASS_CMDS.with(|p|p.borrow_mut().push((k,c.clone())));c
         }
         impl Objects{
@@ -139,7 +139,7 @@ pub mod g16 {
             pub fn persistent()->Self{Self{objects:vec![],persistent:true}}
             pub fn finish_private(&mut self)->Result{Ok(())}
             pub fn alloc_dynamic_client(&mut self,size:usize)->Result<Arc<FwObject>>{self.alloc(Request{size,class:Class::Shared,placement:Placement::Anywhere,offset:0,client:Some((0x7040000000,super::hw::pte::LEAF_NC)),lower:None,cpu:true})}
-            pub fn alloc(&mut self,r:Request)->Result<Arc<FwObject>>{if r.class==Class::FwCoherent&&(!self.persistent||r.client.is_some()||r.lower.is_some()){return Err(EINVAL);}let bytes=(r.size+r.offset+0x3fff)&!0x3fff;let va=NEXT_VA.fetch_add(bytes as u64+0x4000,std::sync::atomic::Ordering::Relaxed);let x=Arc::new(FwObject{class:r.class,client_leaf:r.client.map(|c|c.1),va:va+r.offset as u64,gva:r.client.map(|c|c.0+r.offset as u64),lower_gva:r.lower.map(|g|g+r.offset as u64),lower_leaf:r.lower.map(|_|super::hw::pte::LOWER),size:r.size,mapped:bytes,offset:r.offset,data:std::sync::Arc::new(std::sync::Mutex::new(if r.cpu{vec![0;bytes]}else{vec![]})),fills:std::sync::Mutex::new(Vec::new()),fail_fill:std::sync::atomic::AtomicBool::new(false),write_bytes:std::sync::atomic::AtomicUsize::new(0)},0)?;self.objects.push(x.clone());ALL_OBJECTS.with(|a|a.borrow_mut().push(x.clone()));Ok(x)}
+            pub fn alloc(&mut self,r:Request)->Result<Arc<FwObject>>{if r.class==Class::FwCoherent&&(!self.persistent||r.client.is_some()){return Err(EINVAL);}let bytes=(r.size+r.offset+0x3fff)&!0x3fff;let va=NEXT_VA.fetch_add(bytes as u64+0x4000,std::sync::atomic::Ordering::Relaxed);let x=Arc::new(FwObject{class:r.class,client_leaf:r.client.map(|c|c.1),va:va+r.offset as u64,gva:r.client.map(|c|c.0+r.offset as u64),lower_gva:r.lower.map(|g|g+r.offset as u64),lower_leaf:r.lower.map(|_|super::hw::pte::LOWER),size:r.size,mapped:bytes,offset:r.offset,data:std::sync::Arc::new(std::sync::Mutex::new(if r.cpu{vec![0;bytes]}else{vec![]})),fills:std::sync::Mutex::new(Vec::new()),fail_fill:std::sync::atomic::AtomicBool::new(false),write_bytes:std::sync::atomic::AtomicUsize::new(0)},0)?;self.objects.push(x.clone());ALL_OBJECTS.with(|a|a.borrow_mut().push(x.clone()));Ok(x)}
         }
     }
     pub mod graph {
@@ -354,18 +354,23 @@ pub mod g16 {
         assert!(matches!(vm.alloc(req(Class::FwCoherent,None,None)),Err(EINVAL)));
         let mut dev=Objects::persistent();
         assert!(matches!(dev.alloc(req(Class::FwCoherent,Some((0x7040000000,g16::hw::pte::LEAF_NC)),None)),Err(EINVAL)));
-        assert!(matches!(dev.alloc(req(Class::FwCoherent,None,Some(0x70f1000000))),Err(EINVAL)));
+        assert!(dev.alloc(req(Class::FwCoherent,None,Some(0x70f1000000))).is_ok());
         // Two VMs' pass slot 3 share index 3's records; neither VM arena owns any of them.
         let (mut a,mut b)=(Objects::new(),Objects::new());
         let pa=g16::slots::PassSlot::new(&mut a,3,1,&crate::g16::object::test_cmds(3)).unwrap();
         let pb=g16::slots::PassSlot::new(&mut b,3,1,&crate::g16::object::test_cmds(3)).unwrap();
-        let records=|p:&g16::slots::PassSlot|[p.ta_seq.clone(),p.fs_seq.clone(),p.own_barrier.clone(),p.prev_barrier.clone(),p.ta_fs_barrier.clone(),p.fs_dep.clone(),p.compute_barrier.clone(),p.fs_compute_barrier.clone()];
+        let records=|p:&g16::slots::PassSlot|[p.ta_seq.clone(),p.fs_seq.clone(),p.own_barrier.clone(),p.prev_barrier.clone(),p.ta_fs_barrier.clone(),p.fs_dep.clone(),p.compute_barrier.clone(),p.fs_compute_barrier.clone(),p.ta_work.clone(),p.fs_work.clone()];
         let (ra,rb)=(records(&pa),records(&pb));
-        for (x,y) in ra.iter().zip(rb.iter()){
+        for (i,(x,y)) in ra.iter().zip(rb.iter()).enumerate(){
             assert!(crate::sync::Arc::ptr_eq(x,y));
             assert_eq!(x.class,Class::FwCoherent);
-            assert_eq!((x.gva,x.lower_gva,x.client_leaf),(None,None,None));
+            assert_eq!((x.gva,x.client_leaf),(None,None));
+            // Only the work images have the (uncached) kernel GPU task lower alias.
+            assert_eq!(x.lower_gva.is_some(),i>=8);
         }
+        assert!(ra[8..].iter().all(|o|o.lower_leaf==Some(g16::hw::pte::LOWER)));
+        assert_eq!((pa.refs().ta_work_gva,pa.refs().fs_work_gva),(pb.refs().ta_work_gva,pb.refs().fs_work_gva));
+        assert_eq!((pa.refs().ta_work,pa.refs().ta_work_gva),(ra[8].va,ra[8].lower_gva.unwrap()));
         assert!(a.objects.iter().chain(b.objects.iter()).all(|o|o.class!=Class::FwCoherent));
         assert!(a.objects.iter().chain(b.objects.iter()).all(|o|ra.iter().all(|r|!crate::sync::Arc::ptr_eq(o,r))));
         let pc=g16::slots::PassSlot::new(&mut b,4,1,&crate::g16::object::test_cmds(4)).unwrap();
@@ -374,10 +379,10 @@ pub mod g16 {
         // records of one page; the encoders name the shared records.
         assert_eq!((pa.ta_seq.va&0x3fff,pa.fs_seq.va&0x3fff),(0,0));
         let page=ra[2].va&!0x3fff;
-        let mut spans:Vec<(u64,u64)>=ra[2..].iter().map(|o|(o.va,o.va+o.size as u64)).collect();
+        let mut spans:Vec<(u64,u64)>=ra[2..8].iter().map(|o|(o.va,o.va+o.size as u64)).collect();
         spans.sort();
         assert!(spans.windows(2).all(|w|w[0].1<=w[1].0));
-        assert!(ra[2..].iter().all(|o|o.va&!0x3fff==page&&o.va%0x40==0&&o.va+o.size as u64<=page+0x4000));
+        assert!(ra[2..8].iter().all(|o|o.va&!0x3fff==page&&o.va%0x40==0&&o.va+o.size as u64<=page+0x4000));
         assert_eq!((pa.refs().ta_seq,pa.refs().fs_seq),(pb.refs().ta_seq,pb.refs().fs_seq));
         assert_eq!((pa.refs().ta_seq,pa.refs().fs_seq),(pa.ta_seq.va,pa.fs_seq.va));
         // Closing VM a drops its arena and pass slot: the device table still owns and hands
@@ -389,12 +394,16 @@ pub mod g16 {
             let p=p.borrow();let owned=&p.as_ref().unwrap().objects;
             assert!(owned.iter().any(|o|crate::sync::Arc::ptr_eq(o,&rb[0])));
             assert!(owned.iter().any(|o|crate::sync::Arc::ptr_eq(o,&rb[1])));
+            assert!(owned.iter().any(|o|crate::sync::Arc::ptr_eq(o,&rb[8])));
+            assert!(owned.iter().any(|o|crate::sync::Arc::ptr_eq(o,&rb[9])));
             assert!(owned.iter().all(|o|o.class==Class::FwCoherent));
         });
         drop(pb);drop(pc);drop(b);
     }
     #[test]fn work_has_kernel_lower_alias_without_application_alias(){
         let mut o=Objects::new();let slots=Slots::new().unwrap();let arena=arenas(&mut o);
+        assert!(arena.compute.compute.iter().all(|s|s.work.class==g16::object::Class::Shared));
+        assert!(arena.render.passes.iter().all(|s|s.ta_work.class==g16::object::Class::FwCoherent&&s.fs_work.class==g16::object::Class::FwCoherent));
         let work=arena.compute.compute.iter().map(|s|&s.work)
             .chain(arena.render.passes.iter().flat_map(|s|[&s.ta_work,&s.fs_work]));
         for object in work {
@@ -402,7 +411,7 @@ pub mod g16 {
             assert_eq!(object.client_leaf,None);
             assert!(object.lower_gva.is_some());
             assert_eq!(object.lower_leaf,Some(0x00c0000000000c8b));
-            assert_eq!(object.class,g16::object::Class::Shared);
+            assert!(object.class==g16::object::Class::Shared||object.class==g16::object::Class::FwCoherent);
             assert!(object.va>=0xfffffc2000000000);
             let lower=object.lower_gva.unwrap();
             for client in &o.objects {
@@ -1535,23 +1544,24 @@ pub mod g16 {
         g16::slots::PassSlot::new(&mut o_base, 0, 1, &crate::g16::object::test_cmds((0) as u64)).unwrap();
         let base_slot_bytes: usize = o_base.objects.iter().map(|obj| obj.mapped).sum();
         // Microsequences and barrier records are the device-lifetime records of the index.
-        assert_eq!(base_slot_bytes, (16 * 1024 + 8 * 1024 + 480) * 1024);
+        assert_eq!(base_slot_bytes, (16 * 1024 + 8 * 1024 + 448) * 1024);
         let mut o_ext = Objects::new();
         g16::slots::PassSlot::new(&mut o_ext, 2, 1, &crate::g16::object::test_cmds((2) as u64)).unwrap();
         let ext_slot_bytes: usize = o_ext.objects.iter().map(|obj| obj.mapped).sum();
-        assert_eq!(ext_slot_bytes, (2 * 1024 + 1024 + 480) * 1024);
-        // Each index's device-lifetime records: two microsequence pages and one barrier page.
+        assert_eq!(ext_slot_bytes, (2 * 1024 + 1024 + 448) * 1024);
+        // Each index's device-lifetime records: two work image pages, two microsequence pages
+        // and one barrier page.
         let indices = crate::g16::object::PASS_CMDS.with(|p| p.borrow().len());
         let device_bytes: usize = crate::g16::object::PERSISTENT
             .with(|p| p.borrow().as_ref().unwrap().objects.iter().map(|obj| obj.mapped).sum());
-        assert_eq!((indices, device_bytes), (2, 2 * 3 * 16 * 1024));
+        assert_eq!((indices, device_bytes), (2, 2 * 5 * 16 * 1024));
         // Cumulative extension backing across the 4 demand-grown tiers:
-        // Tier 0 (6 ext): 20.8125 MiB, Tier 1 (16 ext): 55.50 MiB,
-        // Tier 2 (30 ext): 104.0625 MiB, Tier 3 (46 ext): 159.5625 MiB.
-        assert_eq!((tier0_end - BASE_RENDER_SLOTS) * ext_slot_bytes, 21_312 * 1024);
-        assert_eq!((tier1_end - BASE_RENDER_SLOTS) * ext_slot_bytes, 56_832 * 1024);
-        assert_eq!((tier2_end - BASE_RENDER_SLOTS) * ext_slot_bytes, 106_560 * 1024);
-        assert_eq!((full_end - BASE_RENDER_SLOTS) * ext_slot_bytes, 163_392 * 1024);
+        // Tier 0 (6 ext): 20.625 MiB, Tier 1 (16 ext): 55.00 MiB,
+        // Tier 2 (30 ext): 103.125 MiB, Tier 3 (46 ext): 158.125 MiB.
+        assert_eq!((tier0_end - BASE_RENDER_SLOTS) * ext_slot_bytes, 21_120 * 1024);
+        assert_eq!((tier1_end - BASE_RENDER_SLOTS) * ext_slot_bytes, 56_320 * 1024);
+        assert_eq!((tier2_end - BASE_RENDER_SLOTS) * ext_slot_bytes, 105_600 * 1024);
+        assert_eq!((full_end - BASE_RENDER_SLOTS) * ext_slot_bytes, 161_920 * 1024);
     }
 
     #[test]fn base_compute_quarantine_expands_fresh_vm_and_recovers_displacement(){
@@ -2861,6 +2871,14 @@ budget += r'''
 source=source.replace('__BUDGET__',budget.replace('//!','//'))
 source = source.replace('__LIVE_TOKEN__' ,item((production/'vm.rs').read_text(),'pub(crate) struct LiveToken')).replace('__LIVE_DROP__',item((production/'vm.rs').read_text(),'impl Drop for LiveToken'))
 resources_source = (production/'resources.rs').read_text()
+object_source = (production/'object.rs').read_text()
+# A firmware-cached object with an uncached GPU lower alias is cleaned to the point of
+# coherency after every host store; only that combination sets the flag.
+stored_fn = item(object_source, 'fn stored(&self')
+assert 'crate::pgtable::clean_poc(' in stored_fn and 'crate::pgtable::poc_barrier()' in stored_fn, 'FwObject::stored must clean and complete'
+for store in ('pub(crate) fn write(', 'pub(crate) fn fill(', 'pub(crate) fn w32(', 'pub(crate) fn w64('):
+    assert 'self.stored(' in item(object_source, store), store + ' must clean firmware-cached GPU-aliased stores'
+assert object_source.count('let clean = req.class == Class::FwCoherent && req.lower.is_some();') == 1, 'only FwCoherent work with a lower alias cleans its stores'
 assert 'pub(crate) struct ComputeUnitSet {' in resources_source, 'resources.rs must split compute units into per-unit ComputeArenas'
 assert 'ComputeArena::new(factory, bind, vm, live, k, placement)?' in resources_source, 'ComputeUnitSet::new must allocate one ComputeArena per unit'
 assert 'compute_ext: Option<Arc<ComputeUnitSet>>' in resources_source, 'compute_ext must use ComputeUnitSet so undisplaced slots pin only one unit'
