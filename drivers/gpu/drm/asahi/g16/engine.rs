@@ -286,7 +286,7 @@ pub(crate) struct Flight {
     pub(crate) target: u32,
     pub(crate) head: u32,
     pub(crate) c_start: u32,
-    /// Render: final TA/FS stamps, ring ends and ring positions before the prefix.
+    /// Render: final TA/FS stamps, ring ends and ring positions.
     pub(crate) ta_target: u32,
     pub(crate) fs_target: u32,
     pub(crate) ta_head: u32,
@@ -2475,7 +2475,9 @@ impl Firmware {
                     .publish_pb_batch(a, f.uma_submitted, f.renders)?;
                 self.pools.publish_flight(a);
                 // Notifier service dereferences u32 counters; the host ordering ledger
-                // remains u64. Eight-byte spacing is retained allocation padding.
+                // remains u64. Eight-byte spacing is retained allocation padding. Always
+                // advance both TA and FS thresholds to the newest published draw ordinal
+                // so firmware never skips updating `TA_STAMP` on fast tail flights.
                 self.graph.render.threshold.w32(0, prefix.draw as u32)?;
                 self.graph.render.threshold.w32(8, prefix.draw as u32)?;
             } else {

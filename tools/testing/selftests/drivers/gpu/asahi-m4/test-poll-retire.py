@@ -65,7 +65,8 @@ const AUX_DRAIN_NS: u64 = 10_000_000;
 const EVENT_RETIRE_POLLS: u32 = 11;
 mod hw {
     pub mod sizes {
-        pub const TA_WAVE_PASSES: usize = 8;
+        pub const TA_WAVE_PASSES: usize = 4;
+        pub const TA_WAVE_REFILL: usize = TA_WAVE_PASSES / 2;
         pub const COMPUTE_PIPES: usize = 2;
     }
 }
@@ -891,41 +892,60 @@ fn pending_slot_wait_arms_short_repoll_without_breaking_ta_only_or_frozen() {
 }
 
 #[test]
-fn ta_only_irq_wakes_ta_wave_wait_without_spinning_retry_tail() {
+fn ta_only_irq_wakes_ta_wave_wait_with_hysteresis_and_short_repoll() {
     CLOCK.with(|c| c.set(100_000));
     let mut fw = Firmware::new();
     fw.engine.flights.push(Flight {
         computes: 0,
         compute_pipe: 0,
-        renders: 8,
+        renders: 4,
         target: 0,
-        fs_target: 0x800,
+        fs_target: 0x400,
     });
-    fw.engine.fs_target = 0x800;
+    fw.engine.fs_target = 0x400;
     fw.engine.pending.push(Arc::new(Job { id: 2 }));
     fw.engine.ta_wave_wait = true;
-    fw.ta_pending = 8;
+    fw.ta_pending = 4;
     fw.drain_stage_delta = 1;
     fw.drain_fs_delta = 0;
 
     let mut retry_tail = false;
     let mut deferred = false;
     let mut done = vec![];
-    // TA still full (8 >= 8): no publish_checked wakeup and no retry_tail spin.
+    // TA still full (4 > TA_WAVE_REFILL=2): no publish_checked wakeup yet, but ta_wave_wait
+    // keeps non_terminal_only false so a 0x70 IRQ retries tail.
     assert!(fw
         .poll_step(true, EVENT_RETIRE_POLLS, &mut retry_tail, &mut deferred, &mut done)
         .unwrap());
     assert_eq!(fw.publish_checked_calls, 0);
-    assert!(!retry_tail);
-    assert!(!fw.engine.short_repoll);
+    assert!(retry_tail);
 
-    // TA finishes one pass (ta_pending drops to 7 < 8) on a TA-only 0x70 IRQ while FS is still
-    // running: immediately wakes publish_checked() without spinning retry_tail or short_repoll.
-    fw.ta_pending = 7;
+    // TA drops to 3 (> TA_WAVE_REFILL=2): hysteresis avoids 1-pass stub drip, while
+    // tail == 0 arms short_repoll because ta_wave_wait is active.
+    fw.ta_pending = 3;
+    retry_tail = false;
+    assert!(fw
+        .poll_step(true, 0, &mut retry_tail, &mut deferred, &mut done)
+        .unwrap());
+    assert_eq!(fw.publish_checked_calls, 0);
+    assert!(!retry_tail);
+    assert!(fw.engine.short_repoll);
+
+    // TA drains to 2 (<= TA_WAVE_REFILL): immediately wakes publish_checked() to launch the
+    // next wave cleanly.
+    fw.ta_pending = 2;
+    assert!(fw
+        .poll_step(true, 0, &mut retry_tail, &mut deferred, &mut done)
+        .unwrap());
+    assert_eq!(fw.publish_checked_calls, 1);
+    assert!(fw.engine.short_repoll);
+
+    // Once ta_wave_wait clears, a TA-only 0x70 IRQ stays non_terminal_only (no spin/short_repoll).
+    fw.engine.ta_wave_wait = false;
+    retry_tail = false;
     assert!(fw
         .poll_step(true, EVENT_RETIRE_POLLS, &mut retry_tail, &mut deferred, &mut done)
         .unwrap());
-    assert_eq!(fw.publish_checked_calls, 1);
     assert!(!retry_tail);
     assert!(!fw.engine.short_repoll);
 }

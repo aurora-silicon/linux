@@ -681,14 +681,16 @@ impl Firmware {
         }
         published?;
         // A TA-only (0x70) EP 0x20 interrupt while FS is still running does not signal flight
-        // retirement: avoid burning the receipt-tail spin or arming a short repoll storm for it.
+        // retirement: avoid burning the receipt-tail spin or arming a short repoll storm for it,
+        // unless a render queue is actively waiting on TA wave headroom (`ta_wave_wait`).
         let non_terminal_only = !retired_any
             && term_before.is_some()
             && self.events.stage_events != stage_before
             && self.oldest_terminal_events() == term_before
             && !self.oldest_stamp_reached()
             && !self.recovery.receipt_fault
-            && !recovery_pending;
+            && !recovery_pending
+            && !self.engine.ta_wave_wait;
         // After an EP 0x20 event, retry up to `EVENT_RETIRE_POLLS` times (outside the device
         // lock) only while no flight has retired yet and flights remain in flight. Once any
         // flight retires, stop spinning so deeper queues do not burn tail waits per interrupt.
@@ -714,12 +716,13 @@ impl Firmware {
         }
         // If a terminal EP 0x20 event arrived with flights outstanding and nothing retired within
         // the trailing polls, or a ready same-VM pending job is blocked on slot/flight/work-ring
-        // headroom, repoll at `repoll_us` instead of sleeping `resnap_us`.
+        // or TA-wave headroom, repoll at `repoll_us` instead of sleeping `resnap_us`.
         self.engine.short_repoll = !self.engine.flights.is_empty()
             && !self.engine.frozen
             && !non_terminal_only
             && ((evented && had_flights && !retired_any)
-                || (!self.engine.pending.is_empty() && self.engine.slot_wait));
+                || (!self.engine.pending.is_empty()
+                    && (self.engine.slot_wait || self.engine.ta_wave_wait)));
         Ok(!self.engine.flights.is_empty()
             || self.engine.chan_wait
             || self.recovery.needs_repoll()
@@ -780,9 +783,10 @@ impl Firmware {
         Some((compute, render))
     }
 
-    /// Whether a render job paused by `TA_WAVE_PASSES` pacing can publish its next wave now.
+    /// Whether a render job paused by `TA_WAVE_PASSES` pacing has enough TA headroom to publish
+    /// the next wave without dribbling 1-pass stub flights.
     fn ta_wave_ready(&self) -> bool {
-        self.engine.ta_wave_wait && self.ta_pending_passes() < super::hw::sizes::TA_WAVE_PASSES
+        self.engine.ta_wave_wait && self.ta_pending_passes() <= super::hw::sizes::TA_WAVE_REFILL
     }
 
     /// Cheap single-stage stamp check for the oldest compute pipe 0/1 and oldest render flights'
