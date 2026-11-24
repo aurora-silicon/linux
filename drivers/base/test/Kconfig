@@ -20,6 +20,6 @@ config DRIVER_PE_KUNIT_TEST
 	default KUNIT_ALL_TESTS
 
 config DRIVER_SWNODE_KUNIT_TEST
-	tristate "KUnit Tests for software node fw_devlink links" if !KUNIT_ALL_TESTS
+	tristate "KUnit Tests for software nodes" if !KUNIT_ALL_TESTS
 	depends on KUNIT
 	default KUNIT_ALL_TESTS

@@ -142,6 +142,9 @@ struct kioctx {
 		 * We batch accesses to it with a percpu version.
 		 */
 		atomic_t	reqs_available;
+
+		/* Requests whose completion has yet to be posted. */
+		atomic_t	reqs_in_flight;
 	} ____cacheline_aligned_in_smp;
 
 	struct {
@@ -847,6 +850,7 @@ static struct kioctx *ioctx_alloc(unsigned nr_events)
 		goto err;
 
 	atomic_set(&ctx->reqs_available, ctx->nr_events - 1);
+	atomic_set(&ctx->reqs_in_flight, 0);
 	ctx->req_batch = (ctx->nr_events - 1) / (num_possible_cpus() * 4);
 	if (ctx->req_batch < 1)
 		ctx->req_batch = 1;
@@ -1118,6 +1122,7 @@ static inline struct aio_kiocb *aio_get_req(struct kioctx *ctx)
 	}
 
 	percpu_ref_get(&ctx->reqs);
+	atomic_inc(&ctx->reqs_in_flight);
 	req->ki_ctx = ctx;
 	INIT_LIST_HEAD(&req->ki_list);
 	refcount_set(&req->ki_refcnt, 2);
@@ -1206,6 +1211,7 @@ static void aio_complete(struct aio_kiocb *iocb)
 	/* after flagging the request as done, we
 	 * must never even look at it again
 	 */
+	atomic_dec(&ctx->reqs_in_flight);
 	smp_wmb();	/* make event visible before updating tail */
 
 	ctx->tail = tail;
@@ -1408,8 +1414,17 @@ static long read_events(struct kioctx *ctx, long min_nr, long nr,
 		if (aio_read_events(ctx, min_nr, nr, event, &ret) || ret2)
 			break;
 
-		if (nr_got == ret)
-			schedule();
+		if (nr_got == ret) {
+			/*
+			 * Mark the wait as iowait when this context has a
+			 * request in flight, even if another thread submitted
+			 * it. An idle event loop sleeps normally.
+			 */
+			if (atomic_read(&ctx->reqs_in_flight))
+				io_schedule();
+			else
+				schedule();
+		}
 	}
 
 	finish_wait(&ctx->wait, &w.w);
@@ -2114,6 +2129,7 @@ static int io_submit_one(struct kioctx *ctx, struct iocb __user *user_iocb,
 	 * means that we need to destroy req ourselves.
 	 */
 	if (unlikely(err)) {
+		atomic_dec(&ctx->reqs_in_flight);
 		iocb_destroy(req);
 		put_reqs_available(ctx, 1);
 	}
