@@ -610,6 +610,9 @@ pub(crate) struct Engine {
     pub(crate) ta_wave_wait: bool,
     /// An EP 0x20 event arrived with a flight still settling its final receipt: repoll sooner.
     pub(crate) short_repoll: bool,
+    /// An idle poll pass inside the housekeeping cadence skipped housekeeping: queue a backup
+    /// poll so it runs once the cadence elapses.
+    pub(crate) housekeeping_owed: bool,
     /// Absolute deadline (`ktime_get_ns`) for busy-state same-queue horizon micro-coalescing
     /// (0 when no batch is held).
     pub(crate) coalesce_deadline_ns: u64,
@@ -657,6 +660,7 @@ impl Engine {
             slot_wait: false,
             ta_wave_wait: false,
             short_repoll: false,
+            housekeeping_owed: false,
             coalesce_deadline_ns: 0,
             progress_flight: [0; 3],
             progress: [None; 4],

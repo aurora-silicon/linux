@@ -163,6 +163,7 @@ struct Engine {
     slot_wait: bool,
     ta_wave_wait: bool,
     short_repoll: bool,
+    housekeeping_owed: bool,
     coalesce_deadline_ns: u64,
     frozen: bool,
     stats: Stats,
@@ -334,6 +335,7 @@ struct Firmware {
     housekeeping_calls: u32,
     aux_drain_calls: u32,
     power_calls: u32,
+    hot_drain_calls: u32,
 }
 
 impl Firmware {
@@ -364,6 +366,7 @@ impl Firmware {
                 slot_wait: false,
                 ta_wave_wait: false,
                 short_repoll: false,
+                housekeeping_owed: false,
                 coalesce_deadline_ns: 0,
                 frozen: false,
                 stats: Stats::default(),
@@ -391,6 +394,7 @@ impl Firmware {
             housekeeping_calls: 0,
             aux_drain_calls: 0,
             power_calls: 0,
+            hot_drain_calls: 0,
         }
     }
 
@@ -409,6 +413,10 @@ impl Firmware {
         Ok(())
     }
     fn drain_rings(&mut self) -> Result {
+        Ok(())
+    }
+    fn drain_events_and_stats(&mut self) -> Result {
+        self.hot_drain_calls += 1;
         Ok(())
     }
     fn drain_auxiliary_rings(&mut self) -> Result {
@@ -469,6 +477,52 @@ impl Firmware {
     __OLDEST_TERMINAL_EVENTS__
     __TA_WAVE_READY__
     __OLDEST_STAMP_REACHED__
+}
+
+#[test]
+fn idle_poll_step_runs_full_housekeeping_only_on_its_cadence() {
+    let mut fw = Firmware::new();
+    let (mut retry_tail, mut hk_deferred, mut done) = (false, false, vec![]);
+    let mut idle_pass = |fw: &mut Firmware, now: u64| {
+        CLOCK.with(|c| c.set(now));
+        fw.poll_step(false, 0, &mut retry_tail, &mut hk_deferred, &mut done)
+            .unwrap()
+    };
+    // Due: the full idle housekeeping runs and owes nothing.
+    assert!(!idle_pass(&mut fw, 2_000_000));
+    assert_eq!((fw.power_calls, fw.hot_drain_calls), (1, 0));
+    assert_eq!(fw.last_housekeeping_ns, 2_000_000);
+    assert!(!fw.engine.housekeeping_owed);
+    // Inside the cadence: only the event and statistics rings drain; the rest is owed.
+    assert!(!idle_pass(&mut fw, 2_300_000));
+    assert_eq!((fw.power_calls, fw.hot_drain_calls), (1, 1));
+    assert_eq!(fw.last_housekeeping_ns, 2_000_000);
+    assert!(fw.engine.housekeeping_owed);
+    // A recovery found by that drain runs the full pass inside the cadence.
+    fw.recovery.pending = true;
+    assert!(idle_pass(&mut fw, 2_400_000));
+    assert_eq!((fw.power_calls, fw.hot_drain_calls), (2, 2));
+    assert_eq!(fw.last_housekeeping_ns, 2_400_000);
+    assert!(!fw.engine.housekeeping_owed);
+    fw.recovery.pending = false;
+    // So does a receipt fault, without a hot drain first.
+    fw.recovery.receipt_fault = true;
+    assert!(!idle_pass(&mut fw, 2_500_000));
+    assert_eq!((fw.power_calls, fw.hot_drain_calls), (3, 2));
+    fw.recovery.receipt_fault = false;
+    assert!(!idle_pass(&mut fw, 2_600_000));
+    assert_eq!((fw.power_calls, fw.hot_drain_calls), (3, 3));
+    assert!(fw.engine.housekeeping_owed);
+    // Once the cadence elapses the owed housekeeping runs.
+    assert!(!idle_pass(&mut fw, 3_500_000));
+    assert_eq!((fw.power_calls, fw.hot_drain_calls), (4, 3));
+    assert!(!fw.engine.housekeeping_owed);
+    // Periodic housekeeping also settles what an idle pass owed.
+    assert!(!idle_pass(&mut fw, 3_600_000));
+    assert!(fw.engine.housekeeping_owed);
+    CLOCK.with(|c| c.set(4_600_000));
+    fw.run_housekeeping(&mut done).unwrap();
+    assert!(!fw.engine.housekeeping_owed);
 }
 
 #[test]
@@ -1749,7 +1803,7 @@ for command in [
     json.dumps(
         {
             'passed': True,
-            'tests': 23,
+            'tests': 24,
             'cpu_only': True,
             'hardware_execution': False,
             'scope': 'Verbatim production submit_locked inline retirement and poll_step TA-only non-spin logic.',

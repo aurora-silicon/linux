@@ -100,6 +100,18 @@ impl Shared {
         self.mod_poll(kernel::time::msecs_to_jiffies((delay_ns / 1_000_000) as u32).max(1));
     }
 
+    /// Queues the backup poll for idle housekeeping that a pass skipped inside its cadence, at
+    /// the end of that cadence. It may replace a later idle power poll: that pass runs the
+    /// housekeeping, including `service_power()`, and arms the power poll again.
+    fn queue_owed_housekeeping(self: &Arc<Self>, firmware: &Firmware) {
+        if !firmware.engine.housekeeping_owed || firmware.recovery.failed().is_some() {
+            return;
+        }
+        let elapsed = now_ns().wrapping_sub(firmware.last_housekeeping_ns);
+        let ms = HOUSEKEEPING_NS.saturating_sub(elapsed).div_ceil(1_000_000) as u32;
+        self.mod_poll(kernel::time::msecs_to_jiffies(ms).max(1));
+    }
+
     /// One poll pass (the poll work item).
     pub(crate) fn run_poll(self: Arc<Self>) {
         // The domain may be off. The sleep's end queues a pass.
@@ -158,6 +170,7 @@ impl Shared {
                     // floor hold is still pending so both expire cleanly to idle power.
                     Ok(false) => {
                         self.arm_idle_power_poll(firmware);
+                        self.queue_owed_housekeeping(firmware);
                         if firmware.recovery.failed().is_some() {
                             self.cancel_resnap();
                         } else {
@@ -670,14 +683,29 @@ impl Firmware {
         // failure of the next prefix. Drain the receive rings before deciding, published or
         // not, so the error count is current and idle log/trace/stats traffic is consumed. With
         // prefixes published the retirement loop below drains first.
+        //
+        // Inside the housekeeping cadence, with no recovery pending, an idle pass drains only
+        // the event and statistics rings, which carry completion and recovery notifications.
+        // The session, object, power and auxiliary ring checks then wait for the cadence, so
+        // back-to-back shallow submissions do not repeat them, under the device lock, between
+        // one completion and the next SUBMIT. `run_poll()` queues a backup poll for them.
         if !had_flights {
-            self.session.check()?;
-            self.objects.health()?;
-            self.service_power()?;
-            self.last_housekeeping_ns = now;
-            self.last_aux_drain_ns = now;
-            ran_housekeeping = true;
-            self.drain_rings()?;
+            let full = housekeeping_due || self.recovery.receipt_fault || {
+                self.drain_events_and_stats()?;
+                self.recovery_pending()?
+            };
+            if full {
+                self.session.check()?;
+                self.objects.health()?;
+                self.service_power()?;
+                self.last_housekeeping_ns = now;
+                self.last_aux_drain_ns = now;
+                ran_housekeeping = true;
+                self.engine.housekeeping_owed = false;
+                self.drain_rings()?;
+            } else {
+                self.engine.housekeeping_owed = true;
+            }
             self.reclaim_closed_vm_slots();
             if self.recovery_idle()? && self.engine.pending.is_empty() {
                 let _ = self.slots.take_scrub_woke();
@@ -817,6 +845,7 @@ impl Firmware {
             self.last_aux_drain_ns = now;
         }
         self.last_housekeeping_ns = now;
+        self.engine.housekeeping_owed = false;
         self.reclaim_closed_vm_slots();
         if !self.engine.flights.is_empty() || recovery_pending {
             self.check_hangs(done)?;
