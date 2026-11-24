@@ -314,13 +314,24 @@ static struct device_node *__init t8132_find_gfx(void)
 static int __init t8132_platform_handoff(void)
 {
 	const void *data = __dtb_t8132_platform_data_begin;
-	struct device_node *soc, *pmp = NULL, *gpu = NULL, *gfx = NULL;
+	struct device_node *pmgr, *soc, *pmp = NULL, *gpu = NULL, *gfx = NULL;
 	struct of_changeset *cs;
 	unsigned int added = 0, changed = 0;
 	int root, node, ret;
 
-	if (!apple_t8132_firmware_path())
+	/*
+	 * Assume the 26.6.2-qualified PMGR ownership policy also applies on newer
+	 * firmware (such as macOS 27.2): without it, off the qualified path Linux
+	 * owns every domain in the board tree, auto-PM included, and the J773g
+	 * takes an SError when its PCIe controller probes. A domain newly claimed
+	 * by newer firmware would still stay owned by Linux until updated here.
+	 * Key on the PMGR block node itself rather than the machine compatible;
+	 * only the PMP/GFX memory compatibility nodes stay with the qualified path.
+	 */
+	pmgr = of_find_compatible_node(NULL, NULL, "apple,t8132-pmgr");
+	if (!pmgr)
 		return 0;
+	of_node_put(pmgr);
 	if (fdt_check_header(data))
 		return -EINVAL;
 	soc = of_find_node_by_path("/soc");
@@ -335,6 +346,8 @@ static int __init t8132_platform_handoff(void)
 	ret = t8132_pmgr_policy(cs, &changed, apple_t8132_air());
 	if (ret)
 		goto destroy;
+	if (!apple_t8132_firmware_path())
+		goto apply;
 
 	pmp = of_find_compatible_node(NULL, NULL, "apple,t8132-pmp-v2");
 	gpu = of_find_compatible_node(NULL, NULL, "apple,agx-t8132");
