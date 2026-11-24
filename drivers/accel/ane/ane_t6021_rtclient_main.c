@@ -1125,8 +1125,9 @@ static int ane_rtclient_session_register(struct ane_rtclient *ane)
 }
 
 /*
- * System sleep parks a 27.x engine until reboot: from then on every request
- * of the session fails instead of waiting on a stopped CPU.
+ * A 27.x engine that cannot restart (no pristine preload, a failed stop or
+ * boot) stays parked until reboot: from then on every request of the
+ * session fails instead of waiting on a stopped CPU.
  */
 static void ane_rtclient_session_park(struct ane_rtclient *ane)
 {
@@ -3805,6 +3806,33 @@ static int ane_rtclient_rs_power_cycle(void *ctx)
 	return ane_rtclient_rs_ready(ctx);
 }
 
+/*
+ * The 27.x half of a cold restart. The firmware, booted again from the
+ * pristine preload DATA (ane_t6021_fwload_reload()), publishes its channel
+ * table again: attach a fresh shared transport to it (new IPC and command
+ * arena; the old ones retire with the restart), take the boot ACK and run
+ * the startup exchange, answering its SHAREDMALLOC requests, as at probe.
+ * The open programs are replayed behind their handles afterwards
+ * (ane_rtclient_session_resume()).
+ */
+static int ane_rtclient_rs_boot27(struct ane_rtclient *ane)
+{
+	int ret;
+
+	/* A latched error of the old instance must not fail the new one. */
+	atomic_set(&ane_t6021_quarantined, 0);
+	if (!ane->chman_ok || !ane_rtclient_host_init(ane))
+		return -EPROTO;
+	dma_wmb();
+	writel(ANE_T6021_BOOT_ACK, ane->engine + ANE_MBI_SCRATCH0 + 4 * 3);
+	ret = ane_rtclient_ack_wait(ane);
+	if (!ret)
+		ret = ane_rtclient_fw_startup(ane);
+	if (ret)
+		return ret;
+	return atomic_read(&ane_t6021_quarantined) ? -EIO : 0;
+}
+
 static int ane_rtclient_rs_boot(void *ctx)
 {
 	struct ane_rtclient_restart *rs = ctx;
@@ -3860,8 +3888,9 @@ static int ane_rtclient_rs_boot(void *ctx)
 	if (ret || !a->fw_alive || !a->booted)
 		return ret ?: -ETIMEDOUT;
 	ane_rtclient_validate_chman(ane);
-	/* No 27.x restart yet: ane_rtclient_rs_prepare() fences it. */
-	if (!ane->chman_ok || ane->fw_table || !ane_rtclient_host_init(ane))
+	if (ane->fw_table)
+		return ane_rtclient_rs_boot27(ane);
+	if (!ane->chman_ok || !ane_rtclient_host_init(ane))
 		return -EPROTO;
 	dma_wmb();
 	writel(ANE_T6021_BOOT_ACK, ane->engine + ANE_MBI_SCRATCH0 + 4 * 3);
@@ -3910,10 +3939,11 @@ static int ane_rtclient_rs_prepare(struct ane_rtclient_restart *rs)
 	lockdep_assert_held(&ane_t6021_fw_lock);
 	if (!ane->registered)
 		return -EOPNOTSUPP;
-	/* The legacy transport can restart only with a pristine firmware
-	 * source. RTKit and later-generation ownership stay fenced.
+	/* Either transport restarts only with a pristine firmware source
+	 * (for 27.x the kernel's copy of the preload DATA). RTKit stays
+	 * fenced; 27.x also needs its program session.
 	 */
-	if (ane->fw_table || !a || ane->rtk ||
+	if ((ane->fw_table && (!ane->transport || !ane->session)) || !a || ane->rtk ||
 	    !legacy_only || !scratch3_ack || !legacy_query || fw_start_rtb_mode ||
 	    fw_start_table_mode != 2 || !ane_t6021_fwload_recoverable(a))
 		return -EOPNOTSUPP;
@@ -4042,6 +4072,76 @@ static int ane_rtclient_restart(struct ane_rtclient *ane)
  */
 static int ane_rtclient_sleep_park(void *ctx);
 
+/*
+ * The 27.x firmware has no shutdown command: as on the H16/H17 cold sleep
+ * path (ane_fw_cold_cycle_down()), the engine goes off under the firmware
+ * once nothing is in flight. Admission closes and every request drains
+ * (ane_h16_session_sleep()), then RUN is cleared and the ASC must read
+ * STOPPED before system PM removes power. Without a restart source the
+ * engine is parked until reboot instead, as before.
+ */
+static int ane_rtclient_sleep_stop27(struct ane_rtclient *ane,
+				     struct ane_rtclient_restart *rs)
+{
+	struct ane_fw_transport *t = ane->transport;
+	unsigned int ch;
+	int ret;
+
+	ret = ane_rtclient_rs_prepare(rs);
+	if (ret == -EOPNOTSUPP) {
+		dev_info(ane->dev, "suspend: no 27.x restart source; parked until reboot\n");
+		ane_rtclient_session_park(ane);
+		return ret;
+	}
+	if (ret)
+		return ret;
+	ane_h16_session_sleep(ane->session, true);
+	for (ch = 0; ch < ANE_FW_CHANNELS; ch++) {
+		if (t->pending[ch].active) {
+			/* Nothing was stopped: refuse this sleep, keep running. */
+			ane_h16_session_sleep(ane->session, false);
+			devm_kfree(ane->dev, rs->fresh);
+			kfree(rs->retired);
+			WRITE_ONCE(ane->recovering, false);
+			return -EBUSY;
+		}
+	}
+	ret = ane_t6021_restart_stop(&ane_rtclient_restart_ops, rs, false);
+	if (ret) {
+		ane_rtclient_rs_finish(rs, true, ANE_T6021_RESTART_STOP, ret);
+		ane_rtclient_session_park(ane);
+		ane_h16_session_sleep(ane->session, false);
+		return ret;
+	}
+	dev_info(ane->dev, "suspend: 27.x firmware stopped; cold boot from the preload on resume\n");
+	return 0;
+}
+
+/*
+ * After a 27.x restart (@ret its result): every program open before the
+ * sleep is loaded again behind its handle, then admission reopens. A failed
+ * boot or replay leaves the session parked, so its waiters fail at once.
+ */
+static void ane_rtclient_session_resume(struct ane_rtclient *ane, int ret, u64 start)
+{
+	struct ane_h16_session *s = ane->session;
+	unsigned int replayed = 0;
+	u64 first = 0;
+
+	if (!ret) {
+		ane_h16_session_restart(s);
+		ret = ane_h16_session_replay(s, &replayed, &first);
+	}
+	if (ret)
+		ane_rtclient_session_park(ane);
+	ane_h16_session_sleep(s, false);
+	dev_info(ane->dev,
+		 "resume %s: 27.x cold boot from the preload, %u programs replayed, first program ready %lld ms, %llu ms total\n",
+		 ret ? "FAILED" : "ok", replayed,
+		 first ? (s64)div_u64(first - start, NSEC_PER_MSEC) : -1LL,
+		 div_u64(ktime_get_ns() - start, NSEC_PER_MSEC));
+}
+
 static int ane_rtclient_sleep_stop(void *ctx)
 {
 	struct ane_rtclient *ane = ctx;
@@ -4055,21 +4155,22 @@ static int ane_rtclient_sleep_stop(void *ctx)
 	 */
 	if ((!planned && !ane_t6021_hung_stop) || ane->sleep_restart)
 		return -EBUSY;
-	/* 27.x firmware has no shutdown command or restart here yet: the
-	 * sleep parks it and the device stays unavailable until reboot.
-	 */
-	if (ane->fw_table) {
-		dev_info(ane->dev,
-			 "suspend: no restart for 27.x firmware yet; parked until reboot\n");
-		ane_rtclient_session_park(ane);
-		return ane_rtclient_sleep_park(ane);
-	}
 	rs = kzalloc_obj(*rs);
 	if (!rs)
 		return -ENOMEM;
 	rs->ane = ane;
 	rs->cycle.ane = ane;
 	rs->unplanned = !planned;
+	if (ane->fw_table) {
+		ret = ane_rtclient_sleep_stop27(ane, rs);
+		if (ret == -EOPNOTSUPP) {
+			kfree(rs);
+			return ane_rtclient_sleep_park(ane);
+		}
+		if (ret)
+			goto free;
+		goto stopped;
+	}
 	ret = ane_rtclient_rs_prepare(rs);
 	if (ret)
 		goto free;
@@ -4078,6 +4179,7 @@ static int ane_rtclient_sleep_stop(void *ctx)
 		ane_rtclient_rs_finish(rs, true, ANE_T6021_RESTART_STOP, ret);
 		goto free;
 	}
+stopped:
 	rs->cpu_off_known = rs->cycle.pd->pwgate_nb_added;
 	rs->cpu_off_mark = READ_ONCE(rs->cycle.pd->cpu_off_count);
 	ane->sleep_restart = rs;
@@ -4130,6 +4232,7 @@ static int ane_rtclient_sleep_restart_deferred(void *ctx)
 	struct ane_rtclient_restart *rs = ane->sleep_restart;
 	enum ane_t6021_restart_stage stage = ANE_T6021_RESTART_CYCLE;
 	bool cycle = ane->sleep_cycle;
+	u64 start;
 	int ret;
 
 	lockdep_assert_held(&ane_t6021_fw_lock);
@@ -4137,6 +4240,7 @@ static int ane_rtclient_sleep_restart_deferred(void *ctx)
 		return -EIO;
 	ane->sleep_restart = NULL;
 	ane->sleep_cycle = false;
+	start = ktime_get_ns();
 	ret = cycle ? ane_rtclient_rs_power_cycle(rs) : ane_rtclient_rs_ready(rs);
 	if (!ret) {
 		stage = ANE_T6021_RESTART_BOOT;
@@ -4144,6 +4248,8 @@ static int ane_rtclient_sleep_restart_deferred(void *ctx)
 	}
 	ret = ane_rtclient_rs_finish(rs, true, stage, ret);
 	kfree(rs);
+	if (ane->fw_table && ane->session)
+		ane_rtclient_session_resume(ane, ret, start);
 	/* Cleared only now: wedged_show() reads it without the lock. */
 	WRITE_ONCE(ane->sleep_deferred, false);
 	return ret;
