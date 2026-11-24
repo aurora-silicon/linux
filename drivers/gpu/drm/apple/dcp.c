@@ -7408,7 +7408,12 @@ static int dcp_desktop_probe_routes(struct apple_dcp *dcp)
 static int dcp_m4_hdmi_prepare(struct apple_dcp *dcp)
 {
 	struct device *dev = dcp->dev;
-	int ret;
+	struct gpio_desc *hpd;
+	int hpd_level, ret;
+
+	hpd = devm_gpiod_get_optional(dev, "hdmi-hpd", GPIOD_IN);
+	if (IS_ERR(hpd))
+		return dev_err_probe(dev, PTR_ERR(hpd), "HDMI HPD GPIO unavailable");
 
 	dcp->hw.num_dptx_ports = 1;
 	dcp->phy = devm_phy_get(dev, "dp-phy");
@@ -7436,7 +7441,24 @@ static int dcp_m4_hdmi_prepare(struct apple_dcp *dcp)
 	if (IS_ERR(dcp->dp2hdmi_pwren))
 		return dev_err_probe(dev, PTR_ERR(dcp->dp2hdmi_pwren),
 				     "DP2HDMI power GPIO unavailable\n");
-	msleep(100);
+	/*
+	 * Give a connected sink time to assert HPD after the rails turn on.
+	 * An unplugged output can stay low indefinitely, so a timeout does
+	 * not prevent adoption of the retained DCP session.
+	 */
+	if (hpd) {
+		ret = read_poll_timeout(gpiod_get_value_cansleep, hpd_level,
+					hpd_level != 0, 1000, 100000, false, hpd);
+		if (hpd_level < 0) {
+			dev_warn(dev, "failed to sample HDMI HPD: %d\n", hpd_level);
+			msleep(100);
+		} else if (ret) {
+			dev_dbg(dev, "HDMI HPD stayed low during converter startup\n");
+		}
+	} else {
+		/* Older device trees do not expose HPD. Keep their settle time. */
+		msleep(100);
+	}
 	dev_info(dev, "fixed HDMI PHY and converter rails prepared\n");
 	return 0;
 }

@@ -75,6 +75,8 @@
 	apple,dptx-phy = <4>;
 	phys = <&dptx_phy>;
 	phy-names = "dp-phy";
+	/* ADT dp2hdmi-gpio0: hdmi_hpd on AOP GPIO 41. */
+	hdmi-hpd-gpios = <&pinctrl_aop 41 GPIO_ACTIVE_HIGH>;
 	hdmi-pwren-gpios = <&smc_gpio 15 GPIO_ACTIVE_HIGH>;
 	dp2hdmi-pwren-gpios = <&smc_gpio 26 GPIO_ACTIVE_HIGH>;
 	status = "okay";
