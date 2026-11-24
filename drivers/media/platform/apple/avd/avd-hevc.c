@@ -1211,10 +1211,11 @@ avd_hevc_check_slices(const struct v4l2_ctrl_hevc_sps *sps,
 }
 EXPORT_SYMBOL_IF_KUNIT(avd_hevc_check_slices);
 
-static int avd_hevc_validate_sps(struct avd_ctx *ctx,
-				 const struct v4l2_ctrl_hevc_sps *sps)
+VISIBLE_IF_KUNIT int
+avd_hevc_validate_sps_fmt(struct avd_ctx *ctx,
+			  const struct v4l2_ctrl_hevc_sps *sps)
 {
-	if (avd_hevc_check_sps_geometry(sps))
+	if (!sps->pic_width_in_luma_samples || !sps->pic_height_in_luma_samples)
 		return -EINVAL;
 	if (sps->pic_width_in_luma_samples > ctx->coded_fmt.fmt.pix_mp.width ||
 	    sps->pic_height_in_luma_samples > ctx->coded_fmt.fmt.pix_mp.height)
@@ -1241,6 +1242,16 @@ static int avd_hevc_validate_sps(struct avd_ctx *ctx,
 		return -EINVAL;
 
 	return 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(avd_hevc_validate_sps_fmt);
+
+static int avd_hevc_validate_sps(struct avd_ctx *ctx,
+				 const struct v4l2_ctrl_hevc_sps *sps)
+{
+	if (avd_hevc_check_sps_geometry(sps))
+		return -EINVAL;
+
+	return avd_hevc_validate_sps_fmt(ctx, sps);
 }
 
 static int avd_hevc_alloc_bufs(struct avd_ctx *ctx, struct avd_hevc_bank *bank)
@@ -1750,8 +1761,27 @@ done:
 
 static int avd_hevc_try_ctrl(struct avd_ctx *ctx, struct v4l2_ctrl *ctrl)
 {
-	if (ctrl->id == V4L2_CID_STATELESS_HEVC_SPS)
-		return avd_hevc_validate_sps(ctx, ctrl->p_new.p_hevc_sps);
+	if (ctrl->id == V4L2_CID_STATELESS_HEVC_SPS) {
+		const struct v4l2_ctrl_hevc_sps *sps = ctrl->p_new.p_hevc_sps;
+		struct vb2_queue *vq =
+			ctx->fh.m2m_ctx ?
+				v4l2_m2m_get_vq(ctx->fh.m2m_ctx,
+						V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) :
+				NULL;
+
+		/*
+		 * Pre-streaming format negotiation (e.g. Chromium
+		 * SetExtCtrlsInit) populates dimensions, chroma format and bit
+		 * depth while leaving CTB size fields zeroed. Defer the CTB
+		 * geometry check until streaming / avd_hevc_run().
+		 */
+		if ((!vq || !vb2_is_streaming(vq)) &&
+		    !sps->log2_min_luma_coding_block_size_minus3 &&
+		    !sps->log2_diff_max_min_luma_coding_block_size)
+			return avd_hevc_validate_sps_fmt(ctx, sps);
+
+		return avd_hevc_validate_sps(ctx, sps);
+	}
 
 	return 0;
 }

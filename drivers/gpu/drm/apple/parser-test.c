@@ -1428,8 +1428,9 @@ static void parser_panel_identity(struct kunit *test)
 	struct dcp_parse_ctx ctx;
 	const struct drm_edid *edid;
 	const struct edid *raw;
-	struct dcp_display_mode modes[2] = {};
+	struct dcp_display_mode *modes = kunit_kcalloc(test, 2, sizeof(*modes), GFP_KERNEL);
 
+	KUNIT_ASSERT_NOT_NULL(test, modes);
 	modes[0].mode = (struct drm_display_mode) {
 		.clock = 540005, .hdisplay = 3456, .hsync_start = 3500,
 		.hsync_end = 3550, .htotal = 4000, .vdisplay = 2160,
@@ -1457,7 +1458,7 @@ static void parser_panel_identity(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, parse(blob->data, blob->size, &ctx), 0);
 	KUNIT_ASSERT_EQ(test, parse_panel_metadata(&ctx, &metadata), 0);
 	KUNIT_EXPECT_STREQ(test, metadata.name, "Synthetic Int");
-	edid = dcp_panel_edid(&metadata, NULL, modes, ARRAY_SIZE(modes), 345, 223);
+	edid = dcp_panel_edid(&metadata, NULL, modes, 2, 345, 223);
 	KUNIT_ASSERT_FALSE(test, IS_ERR(edid));
 	KUNIT_EXPECT_TRUE(test, drm_edid_valid(edid));
 	raw = drm_edid_raw(edid);

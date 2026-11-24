@@ -1303,7 +1303,7 @@ void iomfb_start_h17p(struct apple_dcp *dcp)
 	}
 	WRITE_ONCE(dcp->pipe_enabled_h17p, false);
 	dcp->cb_handlers = cb_handlers;
-	dcp_start_signal(dcp, false, dcp_started, NULL);
+	iomfb_template_start(dcp);
 }
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_KUNIT_TEST)

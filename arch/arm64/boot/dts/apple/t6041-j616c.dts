@@ -107,3 +107,28 @@
 &aes {
 	status = "okay";
 };
+
+/*
+ * First ProRes encoder (apr0) and its DART. Runs with SCODEC_STREAMING (and
+ * SCODEC) powered; uses the driver's built-in T6041 power-up rows, optionally
+ * overridden by apple/prores-t6041-init.bin.
+ */
+&ps_fab1_soc {
+	status = "okay";
+};
+
+&ps_scodec {
+	status = "okay";
+};
+
+&ps_scodec_streaming {
+	status = "okay";
+};
+
+&apr0_dart {
+	status = "okay";
+};
+
+&apr0 {
+	status = "okay";
+};

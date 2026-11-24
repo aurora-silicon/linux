@@ -29,6 +29,7 @@
 #include "dptxep.h"
 #include "dcp_backlight.h"
 #include "dcp-announce.h"
+#include "dcp-color.h"
 #include "dcp-display-metadata.h"
 #include "dcp-metadata-epoch.h"
 #include "dcp-180hz.h"
@@ -318,7 +319,8 @@ struct apple_dcp_hw_data {
 	 * The endpoint the DPTX port services are announced on, where it is not
 	 * the firmware's default (DPTX_ENDPOINT_V2 on firmware 27): the T8142
 	 * dcpext announces them on DPTX_ENDPOINT. 0: the default, or on a
-	 * firmware-27 dcpext what its firmware advertises (dcp_v27_dptx_layout()).
+	 * firmware-27 dcpext or DCP with Type-C routes what its firmware
+	 * advertises (dcp_v27_dptx_layout()).
 	 */
 	u8 dptx_endpoint;
 	/*
@@ -413,18 +415,6 @@ struct dcp_desktop_state {
 	u32 vrr_min_on, vrr_min_off, vrr_min_sent;
 	/* The frame's colour matrix, sent after an adaptive sync update. */
 	struct iomfb_set_matrix_req matrix;
-	/*
-	 * HDR10 static metadata (external processors): the pinned
-	 * dcpav-service-epic service, the Type 1 body last sent on this link
-	 * (taken or refused), if any, and whether the firmware took one, so
-	 * that the link carries a Dynamic Range and Mastering InfoFrame.
-	 * hdr_lock protects all of them.
-	 */
-	spinlock_t hdr_lock;
-	struct apple_epic_service *av_service;
-	u8 hdr_sent[24];
-	bool hdr_sent_valid;
-	bool hdr_infoframe;
 	u32 present_id;
 	bool present_pending;
 	/*
@@ -501,6 +491,8 @@ struct apple_dcp {
 	struct iomfb_m4 *v26_6;
 	/* An adopted session has no confirmed firmware DMA stop boundary. */
 	bool retain_dma;
+	/* RTKit session handed over running by a boot stage (apple,rtkit-handoff) */
+	bool rtkit_adopted;
 	/*
 	 * Allocates AFK rings where the DMA API cannot, on an adopted
 	 * J713 external DCP whose DART only takes the retained allocator.
@@ -825,13 +817,28 @@ struct apple_dcp {
 	bool typec_hpd_held;
 	bool use_timestamps;
 	bool vrr_enabled;
+	struct {
+		/* Pins the AV service and tracks HDR10 metadata for its link. */
+		spinlock_t lock;
+		struct apple_epic_service *service;
+		u64 generation;
+		u8 sent[24];
+		bool sent_valid;
+		bool infoframe;
+	} hdr;
+	/* The selected IOMFB backend programs catalogue colour IDs and PQ surfaces. */
+	bool iomfb_template_pq;
 	/*
 	 * The mode set asks for a PQ signal; output_pq: the one set carries it;
-	 * output_edr: a panel shows the PQ content as EDR, edr_sent: swaps
-	 * still carry EDR state the firmware must be told to drop.
+	 * output_hdr: any non-SDR EOTF (PQ/HLG/HDR-gamma); output_edr: a panel
+	 * shows the PQ content as EDR, edr_sent: swaps still carry EDR state
+	 * the firmware must be told to drop.
 	 */
+	struct dcp_color_request color_req;
+	struct dcp_color_mode active_color;
 	bool pq_requested;
 	bool output_pq;
+	bool output_hdr;
 	bool output_edr;
 	bool edr_sent;
 	/*
@@ -896,6 +903,12 @@ struct apple_dcp {
 	struct delayed_work secure_poll_wq;
 	/* Stopped and not restarted, which outlives a suspend that gets refused. */
 	bool s2r_fw_down;
+	/*
+	 * Its last system suspend left the firmware running and its domains on
+	 * (wakeup path), see dcp_sleep_keeps_firmware(). Cleared by the next
+	 * suspend and resume.
+	 */
+	bool sleep_fw_runs;
 	/* DCPEXT kept down through a dark wake, see dcp_s2r_dark_finish(). */
 	bool s2r_dark_held;
 	struct notifier_block s2r_pm_nb;

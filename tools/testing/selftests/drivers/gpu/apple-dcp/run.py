@@ -61,6 +61,7 @@ def main():
         ('audio', 'cec-only-av-endpoint', audio.cec_only_endpoint, ((),), ()),
         ('display', 'desktop-gamma', desktop.gamma, ((),), ()),
         ('display', 'hdr-static-metadata', display.hdr_metadata, ((),), ()),
+        ('display', 'color-mode-selection', display.color_selection, ((),), ()),
         ('display', 'ctm-encoding', colorimetry.ctm, ((),), ()),
         ('lifecycle', 'desktop-modeset-unmap', desktop.modeset_unmap, ((),), ()),
         ('lifecycle', 'desktop-unknown-modeset-recovery', desktop.modeset_unknown, ((),), ()),

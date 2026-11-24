@@ -32,7 +32,7 @@ pre = pre.replace('struct vb2_buffer { struct { size_t length; } planes[1]; dma_
                   'struct vb2_buffer { struct { size_t length; } planes[1]; dma_addr_t dma; void *cpu; size_t payload; u64 timestamp; };')
 pre = pre.replace('struct avd_comp comp; unsigned int bank;', 'struct avd_comp comp; unsigned int bank; struct { unsigned int width,height,bit_depth; } vp9;')
 pre = pre.replace('struct vb2_v4l2_buffer *dst; } bufs;', 'struct vb2_v4l2_buffer *src,*dst; } bufs;')
-pre = pre.replace('unsigned int fifo_idx, pp_total;', 'unsigned int fifo_idx, pp_total, max_frames; int ctrl_hdl;')
+pre = pre.replace('unsigned int fifo_idx, pp_total;', 'unsigned int fifo_idx, pp_total, max_frames; int ctrl_hdl; bool scratch_sized; enum avd_image_fmt scratch_fmt;')
 pre = pre.replace('static int avd_buf_alloc(struct avd_dev *d, struct avd_buf *b, size_t n)',
                   '#ifdef AVD_TEST_VP_READY\nstatic struct avd_ctx *allocating_ctx;\nstatic int fail_alloc_after;\nstatic bool avd_vp9_ready(struct avd_ctx *);\n#endif\nstatic int avd_buf_alloc(struct avd_dev *d, struct avd_buf *b, size_t n)')
 pre = pre.replace('{ (void)d; free(b->cpu); b->cpu = calloc(1,n);',
@@ -106,6 +106,11 @@ static void avd_run_preamble(struct avd_ctx *ctx,struct avd_run *run) {
  (void)ctx;memset(run,0,sizeof(*run));run->bufs.src=current_src;run->bufs.dst=current_dst;
  run->coded_in=current_src->vb2_buf.dma;run->comp_out=current_dst->vb2_buf.dma;
  run->y_out=run->comp_out+0x100000;run->uv_out=run->comp_out+0x300000;
+}
+/* avd-fmt-test.c independently exercises the run image format check. */
+static int avd_check_run_image_fmt(struct avd_ctx *ctx, int fmt)
+{
+ (void)ctx;(void)fmt;return 0;
 }
 static void avd_run_postamble(struct avd_ctx *ctx,struct avd_run *run) { (void)ctx;(void)run; }
 static int avd_init_job(struct avd_ctx *ctx,int codec,size_t segments) {

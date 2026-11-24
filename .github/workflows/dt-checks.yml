@@ -7,7 +7,7 @@ name: Device tree checks
 
 on:
   pull_request:
-    branches: [integration/aurora, aurora-wip]
+    branches: [main]
     paths:
       - 'arch/arm64/boot/dts/apple/**'
       - 'Documentation/devicetree/bindings/**'
@@ -15,7 +15,7 @@ on:
       - 'scripts/dtc/**'
       - '.github/workflows/dt-checks.yml'
   push:
-    branches: [integration/aurora]
+    branches: [main]
     paths:
       - 'arch/arm64/boot/dts/apple/**'
       - 'Documentation/devicetree/bindings/**'

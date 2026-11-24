@@ -817,7 +817,7 @@ bool iomfb_v27_callback_size_valid(unsigned int tag, u32 input, u32 output)
 void iomfb_start_v27(struct apple_dcp *dcp)
 {
 	dcp->cb_handlers = cb_handlers;
-	dcp_start_signal(dcp, false, dcp_started, NULL);
+	iomfb_template_start(dcp);
 }
 
 #undef DCP_FW_VER
