@@ -12,6 +12,10 @@
 # Every build boots under QEMU and loads every module it ships (which also runs
 # the KUnit suites built as modules) before anything is published.
 #
+# The aurora-* channel tags are protected by a ruleset; the publish job moves
+# them over SSH with the release deploy key (secret RELEASE_DEPLOY_KEY), only
+# forward and with a lease. Stable releases attach to the v* tag an Owner pushed.
+#
 # The configuration is the fleet configuration (aurora_defconfig + asahi.config)
 # built with the fleet toolchain versions pinned below. Modules are signed with
 # a key generated for each run and thrown away afterwards; lab fleet kits are
@@ -285,6 +289,43 @@ jobs:
           EOF
           cat notes.md
 
+      - name: Move the channel tag
+        if: needs.plan.outputs.channel == 'edge' || needs.plan.outputs.channel == 'nightly'
+        env:
+          DEPLOY_KEY: ${{ secrets.RELEASE_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          tag="aurora-$CHANNEL"
+          # Rolling channel tags only move forward: the new commit must contain
+          # the one the tag points at now (a rewritten main stops here).
+          old=$(gh api "repos/$GH_REPO/git/ref/tags/$tag" -q .object.sha 2>/dev/null || true)
+          if [ -n "$old" ]; then
+            status=$(gh api "repos/$GH_REPO/compare/$old...$SHA" -q .status)
+            case "$status" in
+            ahead|identical) ;;
+            *) echo "::error::$tag is at $old, which $SHA does not contain ($status)"; exit 1 ;;
+            esac
+          fi
+          [ "$old" = "$SHA" ] && { echo "$tag already at $SHA"; exit 0; }
+          # The aurora-* tags are protected by a ruleset that only the release
+          # deploy key may bypass; GITHUB_TOKEN cannot move them.
+          if [ -z "$DEPLOY_KEY" ]; then
+            echo "::error::$tag is protected; add the release deploy key's private half as the RELEASE_DEPLOY_KEY secret (public half: a write deploy key)"
+            exit 1
+          fi
+          install -m 0700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/release_key
+          chmod 0600 ~/.ssh/release_key
+          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+          git init -q tagger
+          cd tagger
+          git remote add origin "git@github.com:$GH_REPO.git"
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/release_key -o IdentitiesOnly=yes"
+          git fetch -q --depth 1 origin "$SHA"
+          # The lease makes the push fail if the tag moved since it was read.
+          git push --force-with-lease="refs/tags/$tag:$old" origin "$SHA:refs/tags/$tag"
+          rm -f ~/.ssh/release_key
+
       - name: Publish rolling prerelease
         if: needs.plan.outputs.channel == 'edge' || needs.plan.outputs.channel == 'nightly'
         run: |
@@ -292,9 +333,6 @@ jobs:
           tag="aurora-$CHANNEL"
           title="Aurora kernel $CHANNEL ($(cut -c1-12 <<<"$SHA"))"
           if gh release view "$tag" >/dev/null 2>&1; then
-            # Move the channel tag to the new commit. main only moves forward,
-            # so this is a fast-forward of the tag; a rewritten main fails here.
-            gh api -X PATCH "repos/$GH_REPO/git/refs/tags/$tag" -f sha="$SHA" -F force=false >/dev/null
             gh release edit "$tag" --prerelease --title "$title" --notes-file notes.md
             gh release upload "$tag" dist/* --clobber
             keep=$(cd dist && ls)
@@ -302,7 +340,7 @@ jobs:
               grep -qxF "$a" <<<"$keep" || gh release delete-asset "$tag" "$a" -y
             done
           else
-            gh release create "$tag" dist/* --target "$SHA" --prerelease --latest=false \
+            gh release create "$tag" dist/* --verify-tag --prerelease --latest=false \
               --title "$title" --notes-file notes.md
           fi
           gh release view "$tag" --json tagName,isPrerelease,assets -q '{tag: .tagName, prerelease: .isPrerelease, assets: [.assets[].name]}'
