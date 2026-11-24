@@ -225,7 +225,7 @@ jobs:
 
   smoke:
     needs: [plan, build]
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-26.04-arm
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
@@ -244,6 +244,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends qemu-system-arm busybox-static zstd cpio
+          qemu-system-aarch64 --version
 
       - name: Boot under QEMU and load every module
         run: |

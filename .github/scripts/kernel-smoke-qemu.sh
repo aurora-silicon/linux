@@ -82,11 +82,26 @@ if [ -w /dev/kvm ] && [ "$(uname -m)" = aarch64 ]; then ACCEL=kvm; fi
 CPU=max; [ $ACCEL = kvm ] && CPU=host
 echo "qemu: accel=$ACCEL kernel=$KREL"
 set +e
-timeout "$QEMU_TIMEOUT" qemu-system-aarch64 -M virt -accel $ACCEL -cpu $CPU -smp 4 -m 6G \
+: > "$OUT/console.log"
+timeout -k 10 "$QEMU_TIMEOUT" qemu-system-aarch64 -M virt -accel "$ACCEL" -cpu "$CPU" -smp 4 -m 6G \
 	-nographic -no-reboot -nic none -kernel "$IMG" -initrd "$OUT/initramfs.cpio.zst" \
-	-append "console=ttyAMA0 rdinit=/init panic=-1 loglevel=1 log_buf_len=128M kunit.enable=1" \
-	> "$OUT/console.log" 2>&1
+	-append "console=ttyAMA0 earlycon=pl011,0x09000000 rdinit=/init panic=-1 loglevel=4 log_buf_len=128M kunit.enable=1" \
+	>> "$OUT/console.log" 2>&1 &
+QEMU_PID=$!
+trap 'kill -TERM "$QEMU_PID" 2>/dev/null || true' EXIT
+
+BOOT_DEADLINE=$((SECONDS + 300))
+while kill -0 "$QEMU_PID" 2>/dev/null && ! grep -q '^SMOKE-BEGIN ' "$OUT/console.log"; do
+	if (( SECONDS >= BOOT_DEADLINE )); then
+		echo "qemu: smoke init did not start within 300 seconds"
+		kill -TERM "$QEMU_PID" 2>/dev/null
+		break
+	fi
+	sleep 2
+done
+wait "$QEMU_PID"
 QRC=$?
+trap - EXIT
 set -e
 echo "qemu exit $QRC"
 
