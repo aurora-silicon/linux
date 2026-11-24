@@ -1969,7 +1969,8 @@ void dcp_hotplug(struct work_struct *work)
 	dcp = platform_get_drvdata(pdev);
 	dev_info(dcp->dev, "%s() connected:%d valid_mode:%d nr_modes:%u\n", __func__,
 		 connector->connected, READ_ONCE(dcp->mode_state.valid), dcp->nr_modes);
-	if (READ_ONCE(connector->connected) && READ_ONCE(dcp->mode_state.valid))
+	if (dcp_t604x_relinks() && READ_ONCE(connector->connected) &&
+	    READ_ONCE(dcp->mode_state.valid))
 		complete(&dcp->t6041_plugged);
 	if (READ_ONCE(dcp->mode_state.valid))
 		dcp->tunnel_power_cycles = 0;
