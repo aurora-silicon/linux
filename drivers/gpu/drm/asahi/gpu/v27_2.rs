@@ -927,12 +927,14 @@ impl RootV27_2 {
     /// Builds the root, the boot job and every record they name.
     pub(crate) fn build(graph: &Arc<GpuManagerG14V13_5>, board: &BoardV27_2) -> Result<fw::types::GpuObject<Self>> {
         let cfg = graph.cfg;
+        let g13 = cfg.gpu_gen == hw::GpuGen::G13;
         let pwr = &graph.dyncfg.pwr;
         let states = &pwr.perf_states;
         let id = &graph.dyncfg.id;
         // Inputs the controller below is built from, all from the DT and the ID registers.
         let [core_mask] = id.core_masks.as_slice() else { return Err(EINVAL); };
-        if !pwr.power_zones.is_empty() || pwr.max_power_mw == 0 || pwr.max_power_mw > i32::MAX as u32
+        if (!g13 && !pwr.power_zones.is_empty()) || pwr.power_zones.len() > 5
+            || pwr.max_power_mw == 0 || pwr.max_power_mw > i32::MAX as u32
             || states.last().map(|s| s.pwr_mw) != Some(pwr.max_power_mw)
             || pwr.power_sample_period == 0
             || pwr.ppm_filter_time_constant_ms < pwr.power_sample_period
@@ -942,7 +944,7 @@ impl RootV27_2 {
             || states.windows(2).any(|s| s[1].pwr_mw <= s[0].pwr_mw || s[1].freq_hz <= s[0].freq_hz)
             || pwr.perf_base_pstate == 0 || pwr.perf_base_pstate as usize >= states.len()
             || core_mask.count_ones() != id.total_active_cores || id.total_active_cores == 0
-            || cfg.shared3_tab.len() != 16
+            || (!g13 && cfg.shared3_tab.len() != 16)
             || board.copy_bytes == 0 || board.sgx_size < 0xe14000 {
             return Err(EINVAL);
         }
@@ -951,8 +953,16 @@ impl RootV27_2 {
         if sensors == 0 || sensors >> 32 != 0 || cfg.fast_sensor_mask_alt[0] != sensors {
             return Err(EINVAL);
         }
-        // The SRAM voltage of each operating point, published by the loader from the ADT.
+        // The SRAM voltage of each operating point: published by the loader from the ADT on G14,
+        // or derived from apple,min-sram-microvolt on G13 where the ADT has no perf-states-sram.
         let sram_table = Self::sram_table(states.len())?;
+        if !g13 && sram_table.is_none() {
+            return Err(EINVAL);
+        }
+        let min_sram_mv = pwr.min_sram_microvolt / 1000;
+        if sram_table.is_none() && min_sram_mv == 0 {
+            return Err(EINVAL);
+        }
 
         let mut alloc = graph.alloc();
         graph.event_manager.sync_initial_stamps();
@@ -1052,45 +1062,66 @@ impl RootV27_2 {
             for (i, word) in [old.chip_id, old.unk_454, old.unk_458, old.unk_45c].into_iter().enumerate() {
                 put32(hw, chip + 4 * i, word);
             }
-            // From the power sample period to the fragment count, the 27.2 block keeps the 13.5
-            // HwDataB words in order, at the chip id's distance: the firmware's power sampling
-            // period, the cache-flush and feature enables and the fragment count.
-            use core::mem::offset_of;
-            type Old = fw::initdata::raw::HwDataBG14V13_5;
-            let shift = chip - offset_of!(Old, chip_id);
-            for (at, value) in [
-                (offset_of!(Old, power_sample_period), old.power_sample_period),
-                (offset_of!(Old, unk_49c), old.unk_49c), (offset_of!(Old, unk_4a0), old.unk_4a0),
-                (offset_of!(Old, unk_4a4), old.unk_4a4), (offset_of!(Old, unk_4c0), old.unk_4c0),
-                (offset_of!(Old, unk_4f0), old.unk_4f0), (offset_of!(Old, unk_4f4), old.unk_4f4),
-                (offset_of!(Old, unk_504), old.unk_504), (offset_of!(Old, unk_524), old.unk_524),
-                (offset_of!(Old, unk_534), old.unk_534), (offset_of!(Old, num_frags), old.num_frags),
-            ] {
-                put32(hw, at + shift, value);
+            if !g13 {
+                // From the power sample period to the fragment count, the 27.2 block keeps the 13.5
+                // HwDataB words in order, at the chip id's distance: the firmware's power sampling
+                // period, the cache-flush and feature enables and the fragment count.
+                use core::mem::offset_of;
+                type Old = fw::initdata::raw::HwDataBG14V13_5;
+                let shift = chip - offset_of!(Old, chip_id);
+                for (at, value) in [
+                    (offset_of!(Old, power_sample_period), old.power_sample_period),
+                    (offset_of!(Old, unk_49c), old.unk_49c), (offset_of!(Old, unk_4a0), old.unk_4a0),
+                    (offset_of!(Old, unk_4a4), old.unk_4a4), (offset_of!(Old, unk_4c0), old.unk_4c0),
+                    (offset_of!(Old, unk_4f0), old.unk_4f0), (offset_of!(Old, unk_4f4), old.unk_4f4),
+                    (offset_of!(Old, unk_504), old.unk_504), (offset_of!(Old, unk_524), old.unk_524),
+                    (offset_of!(Old, unk_534), old.unk_534), (offset_of!(Old, num_frags), old.num_frags),
+                ] {
+                    put32(hw, at + shift, value);
+                }
+                put64(hw, offset_of!(Old, unk_4e0) + shift, old.unk_4e0.0);
             }
-            put64(hw, offset_of!(Old, unk_4e0) + shift, old.unk_4e0.0);
         });
-        // Inline words the stock host producer fixes for a gpu,t8112 node without model-slow.
-        for (offset, value) in [(0xfc8u32, 0u32), (0xfd8, 1), (0xfec, 24000), (0xff0, 1),
-                                (0xffc, 1), (0x2724, 1), (0x2754, 1),
-                                (0xfc4, 1), (0xfdc, 1), (0xfe0, 0), (0x1028, 0),
-                                (0x109c, 0), (0x1064, 0), (0x2728, 0)] {
-            put32(hw, offset as usize, value);
+        if g13 {
+            // Inline words for G13G (T8103) firmware 27.2.1 (26B131): derived from the 13.5
+            // configuration and the chip's register capabilities (no CRE on T8103).
+            for (at, v) in [
+                (0xfc0, 1u32), (0xfe4, 1), (0xff4, pwr.power_sample_period), (0x1000, 1), (0x1004, 1),
+                (0x1020, 0x1f), (0x1050, 1), (0x1054, 1), (0x1068, 0x31), (0x1088, 1),
+                (0x10a4, id.num_frags * id.num_clusters), (0x10a8, 1),
+                (0x10cc, 0), (0x10d0, 0),
+                (0x2664, cfg.max_num_gps), (0x2668, 3), (0x266c, 7), (0x2670, 7),
+                (0x267c, 0), (0x2680, 0), (0x2684, id.total_active_cores),
+                (0x268c, 1), (0x26a8, 0xe_0000),
+                (0x26b0, 1), (0x26b4, 1), (0x26b8, 0), (0x26c0, 1), (0x26c4, 1),
+                (0x277c, 0x1_0000), (0x2780, 0x1_0000),
+            ] {
+                put32(hw, at, v);
+            }
+            hw[0x26d0..0x2700].fill(0xff);
+        } else {
+            // Inline words the stock host producer fixes for a gpu,t8112 node without model-slow.
+            for (offset, value) in [(0xfc8u32, 0u32), (0xfd8, 1), (0xfec, 24000), (0xff0, 1),
+                                    (0xffc, 1), (0x2724, 1), (0x2754, 1),
+                                    (0xfc4, 1), (0xfdc, 1), (0xfe0, 0), (0x1028, 0),
+                                    (0x109c, 0), (0x1064, 0), (0x2728, 0)] {
+                put32(hw, offset as usize, value);
+            }
+            // Per-engine kick masks. The firmware gives an engine a kick slot only for bits set
+            // here, so an engine whose mask is left zero is never scheduled. The tiler takes one
+            // bit per cluster; the fragment and compute engines take one bit per configured core.
+            let low_bits = |n: u32| if n < 32 { (1u32 << n) - 1 } else { u32::MAX };
+            put32(hw, 0x2668, low_bits(id.num_clusters));
+            for offset in [0x266c, 0x2670] {
+                put32(hw, offset, low_bits(id.total_active_cores));
+            }
+            // Firmware-managed operating points, CRE and event-assisted operating-point completion.
+            for offset in [0xfc0, 0x26b8, 0x1054] {
+                put32(hw, offset, 1);
+            }
+            put64(hw, 0x267c, u64::from(*core_mask));
+            put32(hw, 0x2684, id.total_active_cores);
         }
-        // Per-engine kick masks. The firmware gives an engine a kick slot only for bits set
-        // here, so an engine whose mask is left zero is never scheduled. The tiler takes one
-        // bit per cluster; the fragment and compute engines take one bit per configured core.
-        let low_bits = |n: u32| if n < 32 { (1u32 << n) - 1 } else { u32::MAX };
-        put32(hw, 0x2668, low_bits(id.num_clusters));
-        for offset in [0x266c, 0x2670] {
-            put32(hw, offset, low_bits(id.total_active_cores));
-        }
-        // Firmware-managed operating points, CRE and event-assisted operating-point completion.
-        for offset in [0xfc0, 0x26b8, 0x1054] {
-            put32(hw, offset, 1);
-        }
-        put64(hw, 0x267c, u64::from(*core_mask));
-        put32(hw, 0x2684, id.total_active_cores);
         // Operating points, in the 13.5 HwDataB order the 27.2 block keeps: power above the
         // lowest state and frequency above the base state as f32 percentages, MHz, the per-lane
         // core and SRAM voltages, the chip's SRAM power coefficient per state and the identity
@@ -1112,18 +1143,26 @@ impl RootV27_2 {
         }
         for (i, state) in states.iter().enumerate() {
             let [mv] = state.volt_mv.as_slice() else { return Err(EINVAL); };
-            let (freq, voltage) = sram_table[i * 8..i * 8 + 8].split_at(4);
-            let sram_mv = u32::from_le_bytes(voltage.try_into().map_err(|_| EINVAL)?);
-            if u32::from_le_bytes(freq.try_into().map_err(|_| EINVAL)?) != state.freq_hz || sram_mv < *mv || sram_mv == 0 {
-                return Err(EINVAL);
-            }
+            let sram_mv = if let Some(table) = sram_table.as_ref() {
+                let (freq, voltage) = table[i * 8..i * 8 + 8].split_at(4);
+                let value = u32::from_le_bytes(voltage.try_into().map_err(|_| EINVAL)?);
+                if u32::from_le_bytes(freq.try_into().map_err(|_| EINVAL)?) != state.freq_hz || value < *mv || value == 0 {
+                    return Err(EINVAL);
+                }
+                value
+            } else {
+                (*mv).max(min_sram_mv)
+            };
             let mhz = state.freq_hz / 1_000_000;
             put32(hw, abi::COMMON26_HW_PERF_FREQUENCY + i * 4, mhz);
             put32(hw, abi::COMMON26_HW_PERF_SCALE + i * 4, cfg.sram_k.to_bits());
+            let sram_lanes = if g13 { 1 } else { abi::COMMON26_HW_PERF_LANES };
             for lane in 0..abi::COMMON26_HW_PERF_LANES {
                 let row = i * abi::COMMON26_HW_PERF_ROW_STRIDE + lane * 4;
                 put32(hw, abi::COMMON26_HW_PERF_CORE_VOLTAGE + row, *mv);
-                put32(hw, abi::COMMON26_HW_PERF_SRAM_VOLTAGE + row, sram_mv);
+                if lane < sram_lanes {
+                    put32(hw, abi::COMMON26_HW_PERF_SRAM_VOLTAGE + row, sram_mv);
+                }
             }
         }
         for index in 0..abi::COMMON26_HW_PERF_ROWS {
@@ -1190,21 +1229,40 @@ impl RootV27_2 {
             for (offset, value) in [(0x58, 0xffffu16), (0x5a, 0x28), (0x5c, 0xffff)] {
                 data[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
             }
-            let ceiling = pwr.perf_max_pstate * 100;
-            for (at, value) in [(0x84, pwr.max_power_mw), (0x88, ceiling), (0x8c, ceiling), (0x98, ceiling)] {
-                put32(data, at, value);
-            }
-            // The shared power tables the 13.5 InitData built from the chip configuration and
-            // the DT operating points (the G14 curves scale with each state's frequency and
-            // voltage). Left zero, the firmware runs the upper states without them.
-            base.hwdata_a.with(|a, _| {
-                put_shared1(data, GLOBALS_SHARED1, &a.hws1);
-                put_shared2(data, GLOBALS_SHARED2, &a.hws2);
-            });
             put32(data, 0x6e, 1);
-            // The firmware's progress checks and compute watchdog, as M3 and M4 27.2 set them.
-            for (at, value) in g14_v27_2_abi::GLOBALS_PROGRESS {
-                put32(data, at, value);
+            let ceiling = pwr.perf_max_pstate * 100;
+            if g13 {
+                for (at, value) in [
+                    (0x24, 3000u32), (0x30, 1), (0x38, 1), (0x40, 120),
+                    (0x60, 0x1_0000), (0x64, 0x1_0000), (0x68, 0x3_0000), (0x78, 1),
+                    (0x84, pwr.max_power_mw), (0x88, ceiling), (0x8c, ceiling), (0x98, ceiling),
+                    (0x128, u32::MAX), (0x18c, 0xffff), (0x1b4, 0x800), (0x1b8, 0x1555),
+                    (0x1d0, u32::MAX), (0x1e8, u32::MAX), (0x6bc, 0xc0_0007),
+                    (0x7ec, 1), (0x7f0, 1), (0x7f4, 100), (0x7f8, 100),
+                    (0x990, 400_000), (0x998, 40), (0x99c, 10), (0x9a0, 250), (0x9a4, 1),
+                    (0x9b8, 2), (0x9bc, 40), (0x9c0, 5), (0x9c8, 40), (0x9cc, 50),
+                    (0x9d0, 1), (0x9d8, 50), (0xe08, 250), (0xe28, 3), (0xe2c, 1),
+                ] {
+                    put32(data, at, value);
+                }
+                data[0xec..0x128].fill(0xff);
+                data[0x1bc..0x1d0].fill(0xff);
+                data[0x1dc..0x1e8].fill(0xff);
+            } else {
+                for (at, value) in [(0x84, pwr.max_power_mw), (0x88, ceiling), (0x8c, ceiling), (0x98, ceiling)] {
+                    put32(data, at, value);
+                }
+                // The shared power tables the 13.5 InitData built from the chip configuration and
+                // the DT operating points (the G14 curves scale with each state's frequency and
+                // voltage). Left zero, the firmware runs the upper states without them.
+                base.hwdata_a.with(|a, _| {
+                    put_shared1(data, GLOBALS_SHARED1, &a.hws1);
+                    put_shared2(data, GLOBALS_SHARED2, &a.hws2);
+                });
+                // The firmware's progress checks and compute watchdog, as M3 and M4 27.2 set them.
+                for (at, value) in g14_v27_2_abi::GLOBALS_PROGRESS {
+                    put32(data, at, value);
+                }
             }
             crate::pgtable::clean_poc(data.as_ptr(), data.len());
         }
@@ -1226,28 +1284,61 @@ impl RootV27_2 {
         owners.push(alloc.gpu.array_empty::<u8>(0x4000)?, GFP_KERNEL)?;
         let mut power = alloc.shared.array_empty::<u8>(0x6a0)?;
         {
-            // Cold mirrors of the controller's power and temperature-loop values.
-            let gains = base.hwdata_a.with(|a, _| (a.ppm_kp.to_bits(), a.ppm_ki_dt.to_bits()));
             let data = power.as_mut_slice();
-            for (at, value) in [(0x12c, pwr.max_power_mw), (0x130, gains.0), (0x134, gains.1)] {
-                put32(data, at, value);
-            }
-            // The average-power filter and the third shared power table, as the 13.5 Globals
-            // carries them (built from the DT power values and the chip configuration).
-            graph.initdata.globals.with(|g, _| {
+            if g13 {
+                let period = pwr.power_sample_period;
+                let dt = crate::float::F32::from(period) / crate::f32!(1000.0);
+                let zone = pwr.power_zones.first();
                 for (at, value) in [
-                    (0x10, g.avg_power_filter_tc_periods), (0x14, g.avg_power_ki_dt.to_bits()),
-                    (0x18, g.avg_power_kp.to_bits()), (0x1c, g.avg_power_min_duty_cycle),
-                    (0x20, g.avg_power_target_filter_tc),
+                    (0x0c, 0u32),
+                    (0x10, pwr.avg_power_filter_tc_ms / period),
+                    (0x14, (pwr.avg_power_ki_only * dt).to_bits()),
+                    (0x18, pwr.avg_power_kp.to_bits()),
+                    (0x1c, pwr.avg_power_min_duty_cycle),
+                    (0x20, pwr.avg_power_target_filter_tc),
+                    (0x24, zone.map_or(0, |z| z.target)),
+                    (0x28, zone.map_or(0, |z| z.target.saturating_sub(z.target_offset))),
+                    (0x2c, zone.map_or(0, |z| z.filter_tc)),
+                    (0xc8, cfg.da.unk_8cc),
+                    (0xcc, 8000),
+                    (0xd0, cfg.da.unk_87c as u32),
+                    (0xd8, pwr.fast_die0_proportional_gain.to_bits()),
+                    (0xdc, (pwr.fast_die0_integral_gain * dt).to_bits()),
+                    (0xf0, 9900), (0xf4, 200),
+                    (0x108, crate::f32!(100.0).to_bits()), (0x10c, crate::f32!(400.0).to_bits()),
+                    (0x110, 200),
+                    (0x12c, pwr.max_power_mw),
+                    (0x130, pwr.ppm_kp.to_bits()),
+                    (0x134, (pwr.ppm_ki * dt).to_bits()),
+                    (0x5e0, 1), (0x5e4, 0x1b),
+                    (0x624, crate::f32!(15.0).to_bits()), (0x628, crate::f32!(5.0).to_bits()),
+                    (0x62c, 32), (0x630, pwr.perf_max_pstate * 100), (0x640, 500), (0x68c, 1),
                 ] {
                     put32(data, at, value);
                 }
-                put_shared3(data, POWER_SHARED3, &g.hws3);
-            });
-            let initial = controller.as_slice();
-            for (dst, src) in [(0xc8, 0x22d4), (0xcc, 0x2280), (0xd0, 0x2284),
-                               (0xd4, 0x22cc), (0xd8, 0x22b4), (0xdc, 0x22a4)] {
-                data[dst..dst + 4].copy_from_slice(&initial[src..src + 4]);
+            } else {
+                // Cold mirrors of the controller's power and temperature-loop values.
+                let gains = base.hwdata_a.with(|a, _| (a.ppm_kp.to_bits(), a.ppm_ki_dt.to_bits()));
+                for (at, value) in [(0x12c, pwr.max_power_mw), (0x130, gains.0), (0x134, gains.1)] {
+                    put32(data, at, value);
+                }
+                // The average-power filter and the third shared power table, as the 13.5 Globals
+                // carries them (built from the DT power values and the chip configuration).
+                graph.initdata.globals.with(|g, _| {
+                    for (at, value) in [
+                        (0x10, g.avg_power_filter_tc_periods), (0x14, g.avg_power_ki_dt.to_bits()),
+                        (0x18, g.avg_power_kp.to_bits()), (0x1c, g.avg_power_min_duty_cycle),
+                        (0x20, g.avg_power_target_filter_tc),
+                    ] {
+                        put32(data, at, value);
+                    }
+                    put_shared3(data, POWER_SHARED3, &g.hws3);
+                });
+                let initial = controller.as_slice();
+                for (dst, src) in [(0xc8, 0x22d4), (0xcc, 0x2280), (0xd0, 0x2284),
+                                   (0xd4, 0x22cc), (0xd8, 0x22b4), (0xdc, 0x22a4)] {
+                    data[dst..dst + 4].copy_from_slice(&initial[src..src + 4]);
+                }
             }
             crate::pgtable::clean_poc(data.as_ptr(), data.len());
         }
@@ -1294,8 +1385,8 @@ impl RootV27_2 {
     }
 
     /// The loader's `adt-perf-states-sram` table under `/chosen/aurora-gpu-resources/sgx`
-    /// (frequency and SRAM millivolts per state).
-    fn sram_table(states: usize) -> Result<KVec<u8>> {
+    /// (frequency and SRAM millivolts per state), if present.
+    fn sram_table(states: usize) -> Result<Option<KVec<u8>>> {
         let chosen = kernel::of::chosen().ok_or(ENODEV)?;
         let is = |name: Option<KVec<u8>>, want: &[u8]| {
             name.as_deref().is_some_and(|n| n.strip_suffix(b"\0").unwrap_or(n) == want)
@@ -1304,14 +1395,15 @@ impl RootV27_2 {
             if !is(parent.get_opt_property::<KVec<u8>>(c"name")?, b"aurora-gpu-resources") { continue; }
             for child in parent.children() {
                 if is(child.get_opt_property::<KVec<u8>>(c"name")?, b"sgx") {
-                    let table = child.get_opt_property::<KVec<u8>>(c"adt-perf-states-sram")?
-                        .ok_or(ENODEV)?;
+                    let Some(table) = child.get_opt_property::<KVec<u8>>(c"adt-perf-states-sram")? else {
+                        return Ok(None);
+                    };
                     if table.len() != states * 8 { return Err(EINVAL); }
-                    return Ok(table);
+                    return Ok(Some(table));
                 }
             }
         }
-        Err(EINVAL)
+        Ok(None)
     }
 
     /// The power and thermal controller (directory +0x485): the 13.5 calibrated values of the
@@ -1354,16 +1446,19 @@ impl RootV27_2 {
             put32(policy, at, value);
         }
         // Per-sensor corrections from the chip's coefficient tables (13.5 unk_coef_a/unk_coef_b),
-        // indexed from the first fast-die sensor id. A sensor without a coefficient refuses.
+        // indexed from the first fast-die sensor id. G13 carries no per-sensor coefficient tables;
+        // on chips that do, a sensor without a coefficient refuses.
         const FIRST_SENSOR: usize = 7;
-        let coef_a = cfg.unk_coef_a.first().ok_or(EINVAL)?;
-        let coef_b = cfg.unk_coef_b.first().ok_or(EINVAL)?;
-        for (at, coef) in [(0x2320, coef_a), (0x2420, coef_a), (0x2f38, coef_b), (0x3038, coef_b)] {
-            for sid in (0..64usize).filter(|sid| sensors & (1u64 << sid) != 0) {
-                let value = sid.checked_sub(FIRST_SENSOR).and_then(|index| coef.get(index))
-                    .ok_or(EINVAL)?;
-                put32(policy, at + 4 * sid, value.to_bits());
+        if let (Some(coef_a), Some(coef_b)) = (cfg.unk_coef_a.first(), cfg.unk_coef_b.first()) {
+            for (at, coef) in [(0x2320, coef_a), (0x2420, coef_a), (0x2f38, coef_b), (0x3038, coef_b)] {
+                for sid in (0..64usize).filter(|sid| sensors & (1u64 << sid) != 0) {
+                    let value = sid.checked_sub(FIRST_SENSOR).and_then(|index| coef.get(index))
+                        .ok_or(EINVAL)?;
+                    put32(policy, at + 4 * sid, value.to_bits());
+                }
             }
+        } else if cfg.gpu_gen != hw::GpuGen::G13 {
+            return Err(EINVAL);
         }
         put64(policy, 0x2f28, sensors);
         put32(policy, 0x3ba8, 1);

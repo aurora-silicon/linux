@@ -91,8 +91,10 @@ unsafe impl Sync for AscControl {}
 
 impl AscControl {
     fn new(phys: u64) -> Result<Self> {
-        // SAFETY: `phys` is the ASC register window of this platform device.
-        let ptr = unsafe { kernel::bindings::ioremap(phys, 0x4000) };
+        // SAFETY: `phys` is the ASC register window of this platform device. Apple SoC fabrics
+        // require non-posted MMIO (`nonposted-mmio`); a posted write to ASC_CPU_CONTROL resets
+        // T8103 immediately.
+        let ptr = unsafe { kernel::bindings::ioremap_np(phys, 0x4000) };
         if ptr.is_null() { return Err(ENOMEM); }
         Ok(Self(ptr.cast()))
     }
@@ -138,7 +140,7 @@ impl FaultStatus {
             return Err(EINVAL);
         }
         // SAFETY: the page lies inside this platform device's SGX register window.
-        let page = unsafe { kernel::bindings::ioremap(sgx + base as u64, 0x1000) };
+        let page = unsafe { kernel::bindings::ioremap_np(sgx + base as u64, 0x1000) };
         if page.is_null() { return Err(ENOMEM); }
         Ok(Self { page: page.cast(), info: info - base, addr: addr.map(|a| a - base), g14x })
     }
@@ -276,7 +278,7 @@ fn wait(root: &RootV27_2, ms: i64, mut done: impl FnMut() -> Result<bool>) -> Re
 fn set_idle_policy(root: &RootV27_2, peer: &mut Peer, allow_off: bool) -> Result {
     let (target, generation) = root.publish_idle_policy(allow_off)?;
     peer.as_mut().send_message(EP_DOORBELL, gpu::DEVICE_CONTROL_KICK)?;
-    wait(root, 500, || Ok(root.idle_progress()? == [target; 3] && root.idle_acknowledgement()? == generation))
+    wait(root, 3000, || Ok(root.idle_progress()? == [target; 3] && root.idle_acknowledgement()? == generation))
 }
 
 /// Stops firmware that no runtime owns: allow power-off, then RTKit power-off, then the ASC
