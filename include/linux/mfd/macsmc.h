@@ -123,6 +123,8 @@ struct apple_smc {
 	const struct apple_sleep_smc_policy *sleep_policy;
 	u64 sleep_warn_ack;
 	bool sleep_pmvc_info;
+	/* WKTP (1-byte writable) supported: notify SMC on full wake. */
+	bool has_wktp;
 	/* The saved scope's pmVC after ANS, and when it was answered. */
 	bool saved_pmvc_sent;
 	u64 saved_pmvc_at;
