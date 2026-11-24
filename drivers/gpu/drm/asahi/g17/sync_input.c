@@ -94,10 +94,11 @@ struct dma_fence *asahi_g17_merge_fences(struct dma_fence *const *fences, size_t
 	struct dma_fence_unwrap *cursors;
 	struct dma_fence *merged;
 
-	cursors = kmalloc_array(count, sizeof(*cursors), GFP_KERNEL);
+	/* One cursor per fence the command waits for: no contiguous pages needed. */
+	cursors = kvmalloc_array(count, sizeof(*cursors), GFP_KERNEL_ACCOUNT);
 	if (!cursors)
 		return NULL;
 	merged = __dma_fence_unwrap_merge(count, (struct dma_fence **)fences, cursors);
-	kfree(cursors);
+	kvfree(cursors);
 	return merged;
 }

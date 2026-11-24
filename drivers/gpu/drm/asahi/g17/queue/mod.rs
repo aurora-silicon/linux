@@ -111,8 +111,8 @@ pub(crate) struct Queue<B: Backend> {
 }
 
 type ValidatedBatch = (
-    KVec<(Validated, Order, Destinations)>,
-    KVec<mmu::VmJobGuard>,
+    KVVec<(Validated, Order, Destinations)>,
+    KVVec<mmu::VmJobGuard>,
 );
 
 impl<B: Backend> Queue<B> {
@@ -336,9 +336,12 @@ impl<B: Backend> Queue<B> {
             });
         }
         let failure_count = failures.iter().flatten().count();
-        let mut dependencies = KVec::with_capacity(
+        // These grow with the producers this command waits for, which userspace decides: the
+        // other engine's unfinished commands alone can number thousands. So they need no
+        // contiguous pages and are charged to the caller.
+        let mut dependencies = KVVec::with_capacity(
             inputs.len() + count + timestamp_count + failure_count,
-            GFP_KERNEL,
+            GFP_KERNEL_ACCOUNT,
         )?;
         // Host-waited producers are checked on the host instead of in firmware.
         let (host_count, firmware_count) = if host_waits {
@@ -346,22 +349,22 @@ impl<B: Backend> Queue<B> {
         } else {
             (0, count)
         };
-        let mut checked_inputs = KVec::with_capacity(
+        let mut checked_inputs = KVVec::with_capacity(
             inputs.len() + host_count + timestamp_count + failure_count,
-            GFP_KERNEL,
+            GFP_KERNEL_ACCOUNT,
         )?;
-        let mut firmware = KVec::with_capacity(firmware_count, GFP_KERNEL)?;
+        let mut firmware = KVVec::with_capacity(firmware_count, GFP_KERNEL_ACCOUNT)?;
         for fence in failures.into_iter().flatten() {
-            checked_inputs.push(fence.clone(), GFP_KERNEL)?;
-            dependencies.push(fence.clone(), GFP_KERNEL)?;
+            checked_inputs.push(fence.clone(), GFP_KERNEL_ACCOUNT)?;
+            dependencies.push(fence.clone(), GFP_KERNEL_ACCOUNT)?;
         }
         // Same-engine parents order GPU execution, not the host's timestamp
         // writes. Only timestamp publishers need these completion waits and
         // status checks; ordinary compute keeps its existing queue ordering.
         for (_, fences) in timestamps {
             if fences.ready.raw() == fences.completed.raw() {
-                checked_inputs.push(fences.completed.clone(), GFP_KERNEL)?;
-                dependencies.push(fences.ready.clone(), GFP_KERNEL)?;
+                checked_inputs.push(fences.completed.clone(), GFP_KERNEL_ACCOUNT)?;
+                dependencies.push(fences.ready.clone(), GFP_KERNEL_ACCOUNT)?;
             }
         }
         for (_, fences) in frontier {
@@ -374,11 +377,11 @@ impl<B: Backend> Queue<B> {
             if host_waits {
                 // Keep other-engine producers on the host until completion, and
                 // propagate their errors before publishing the consumer.
-                dependencies.push(fences.completed.clone(), GFP_KERNEL)?;
-                checked_inputs.push(fences.completed.clone(), GFP_KERNEL)?;
+                dependencies.push(fences.completed.clone(), GFP_KERNEL_ACCOUNT)?;
+                checked_inputs.push(fences.completed.clone(), GFP_KERNEL_ACCOUNT)?;
             } else {
-                dependencies.push(fences.ready.clone(), GFP_KERNEL)?;
-                firmware.push(fences.completed.clone(), GFP_KERNEL)?;
+                dependencies.push(fences.ready.clone(), GFP_KERNEL_ACCOUNT)?;
+                firmware.push(fences.completed.clone(), GFP_KERNEL_ACCOUNT)?;
             }
         }
         // Each command owns every input fence; independent engines may publish in
@@ -398,14 +401,14 @@ impl<B: Backend> Queue<B> {
                 {
                     continue;
                 }
-                dependencies.push(fence.clone(), GFP_KERNEL)?;
-                checked_inputs.push(fence.clone(), GFP_KERNEL)?;
+                dependencies.push(fence.clone(), GFP_KERNEL_ACCOUNT)?;
+                checked_inputs.push(fence.clone(), GFP_KERNEL_ACCOUNT)?;
             }
         }
         if let Some(sources) = &sources {
             for ready in sources.publication_waits() {
-                dependencies.push(ready.clone(), GFP_KERNEL)?;
-                checked_inputs.push(ready.clone(), GFP_KERNEL)?;
+                dependencies.push(ready.clone(), GFP_KERNEL_ACCOUNT)?;
+                checked_inputs.push(ready.clone(), GFP_KERNEL_ACCOUNT)?;
             }
         }
         // Publish from the ioctl whenever nothing has to wait, at any depth.
@@ -463,7 +466,9 @@ impl<B: Backend> Queue<B> {
         // starts only after the entire ioctl has been validated and pinned.
         let base = self.sequence;
         let mut preceding = [0; 2];
-        let mut pending = KVec::with_capacity(1, GFP_KERNEL)?;
+        // Up to MAX_COMMANDS_PER_SUBMISSION commands of over a kilobyte each: a high-order
+        // block of contiguous pages they do not need. Charged to the caller.
+        let mut pending = KVVec::with_capacity(1, GFP_KERNEL_ACCOUNT)?;
         while let Some(command) = parser.next()? {
             let mut payload = self
                 .proof
@@ -506,11 +511,11 @@ impl<B: Backend> Queue<B> {
                 }
             }
             .map_err(|error| refused("its timestamp destinations", error))?;
-            pending.push((payload, order, destinations), GFP_KERNEL)?;
+            pending.push((payload, order, destinations), GFP_KERNEL_ACCOUNT)?;
         }
         parser.finish()?;
         // Every accepted command pins the VM before any command is enqueued.
-        let mut guards = KVec::with_capacity(pending.len(), GFP_KERNEL)?;
+        let mut guards = KVVec::with_capacity(pending.len(), GFP_KERNEL_ACCOUNT)?;
         guards
             .push_within_capacity(parse_guard)
             .map_err(|_| ENOMEM)?;
