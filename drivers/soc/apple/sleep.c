@@ -818,6 +818,8 @@ struct apple_sleep_soc {
 	bool radio_retrain;
 	/* A core restarted after the commit takes the deep WFI in the holding pen. */
 	bool pen_deep;
+	/* apple_sleep.observer_ms works here too (T8142's E core 0 observer) */
+	bool observer;
 	/*
 	 * The stopped cores take their deep WFI before the boot core's last mile, not after
 	 * the commit (apple_sleep.early_wfi): XNU's order (T8142, J813 ten-core trace).
@@ -2770,6 +2772,10 @@ static u8 t8142_obs_sample(struct apple_sleep *s)
 	for (i = 0; i < soc->wake_words; i++)
 		if (readl(s->wake + soc->wake_status + 4 * i) & s->wake_armed[i])
 			f |= BIT(6);
+	/* An own-wake SoC's observer: any status word at all (T6030: seven from +0x24) */
+	for (i = 0; soc->observer && soc->own_wake && i < 7; i++)
+		if (readl(s->wake + 0x24 + 4 * i))
+			f |= BIT(6);
 	if (READ_ONCE(t8142_obs_boot_wfi))
 		f |= BIT(7);
 	return f;
@@ -2795,19 +2801,38 @@ static void t8142_observe(struct apple_sleep *s, unsigned int ms)
 		b[i] = t8142_obs_sample(s);
 	}
 	sleep_note_at(s, 2, b[0]);
+	if (s->soc->observer) {
+		/* T6030: at the last sample, PCPU0's (the boot core) and PCPU1's (this) ps words */
+		sleep_note_at(s, 3, readl(s->ps + 0x30));
+		sleep_note_at(s, 4, readl(s->ps + 0x38));
+		sleep_note(s, 0x6b);
+		return;
+	}
 	sleep_note_at(s, 3, b[1]);
 	sleep_note_at(s, 4, b[2]);
 	sleep_note(s, 0x6a);
 }
 
-static void sleep_cpu_off(u64 mpidr)
+/* The observer core, if apple_sleep.observer_ms asks for one: it watches, then sleeps. */
+static void sleep_cpu_observe(u64 mpidr)
 {
 	struct apple_sleep *s = apple_sleep;
 	unsigned int ms = READ_ONCE(sleep_observer_ms);
 
-	if (ms && s && s->soc->ops->deep_wfi_arm == t8142_deep_wfi_arm &&
-	    (mpidr & MPIDR_HWID_BITMASK) == 0)
+	/*
+	 * T8142: E core 0. T6030's commit sequence turns complex E off under a running core, so
+	 * there it is the boot core's neighbour in its own complex, which stays up to its WFI.
+	 */
+	if (ms && s && ((s->soc->ops->deep_wfi_arm == t8142_deep_wfi_arm &&
+			 (mpidr & MPIDR_HWID_BITMASK) == 0) ||
+			(s->soc->observer &&
+			 (mpidr & MPIDR_HWID_BITMASK) == (s->mbox->boot_mpidr ^ 1))))
 		t8142_observe(s, ms);
+}
+
+static void sleep_cpu_off(u64 mpidr)
+{
+	sleep_cpu_observe(mpidr);
 	sleep_deep_wfi();
 }
 
@@ -2816,6 +2841,7 @@ static void sleep_cpu_down_off(u64 mpidr)
 {
 	if (apple_sleep && apple_sleep->soc->ops->cpu_down)
 		apple_sleep->soc->ops->cpu_down(apple_sleep, mpidr);
+	sleep_cpu_observe(mpidr);
 	sleep_deep_wfi();
 }
 
@@ -5845,7 +5871,7 @@ static void apple_sleep_dcs_down(struct apple_sleep *s)
 static void __noreturn sleep_boot_wfi(struct apple_sleep *s)
 {
 	bool t8142 = s->soc->ops->deep_wfi_arm == t8142_deep_wfi_arm, noted = false;
-	bool observed = t8142 && READ_ONCE(sleep_observer_ms);
+	bool observed = (t8142 || s->soc->observer) && READ_ONCE(sleep_observer_ms);
 	u64 t0;
 
 	if (observed) {
