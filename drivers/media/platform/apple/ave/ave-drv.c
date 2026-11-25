@@ -68,6 +68,35 @@ const struct ave_variant ave_t6000 = {
 	.boot_qualified = true,
 };
 
+/*
+ * The M2 (T8112) with the macOS 27.2 (26B123) stub, as on the Mac mini
+ * (J473): the bootloader preloads TEXT 0x11c000 and DATA 0x128000. Like the
+ * M4's 27.2 loaders, it sets the word at TEXT 0x4224 on every boot; with that
+ * word zeroed the TEXT CRC is 077a3444. It is the M2 encoder's build of the
+ * firmware version the M3 runs on 27.2, and it starts the same way: the boot
+ * configuration handshake as device 12 with handshake type 12, the 26B123
+ * command layout, codec clocks ungated by clearing the mailbox idle word,
+ * the bootloader's code base (marked valid) left as it is, and DATA restored
+ * from the boot snapshot before every start.
+ */
+static const struct ave_variant ave_t8112_26b123 = {
+	.regs = &ave_coproc_6070,
+	.fw_text_size = 0x11c000,
+	.fw_data_size = 0x128000,
+	.boot_device_id = 12,
+	.boot_arg_value = AVE_COPROC_BOOT_ARG_VALUE,
+	.timebase_multiplier = 1,
+	.vcbar_mask = GENMASK_ULL(41, 11),
+	.vcbar_flags = AVE_COPROC_VCBAR_VALID,
+	.device_type = 12,
+	.lfs_ref_scale = 2,
+	.text_crc = AVE_FW_TEXT_CRC_T8112_26B123,
+	.text_boot_word = 0x4224,
+	.mbox_idle = 0x38,
+	.restore_data_first = true,
+	.boot_qualified = true,
+};
+
 const struct ave_variant ave_t8112 = {
 	.regs = &ave_coproc_6070,
 	.fw_text_size = 0xd0000,
@@ -84,6 +113,7 @@ const struct ave_variant ave_t8112 = {
 
 	.extra0_size = 0x4000,
 	.boot_qualified = true,
+	.next_build = &ave_t8112_26b123,
 };
 
 /*

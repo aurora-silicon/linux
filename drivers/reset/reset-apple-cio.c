@@ -77,6 +77,15 @@
 #define T8142_CIO_CTRL_INIT_BUSY(port) BIT(2 * (port) + 1)
 #define T8142_CIO_CTRL_BUSY_MASK 0xaa
 
+/* T8152: the request and its completion are in two registers, one bit per port. */
+#define T8152_CIO_INIT_REQ 0x68
+#define T8152_CIO_INIT_DONE 0x6c
+/* A request waits until none of its port pair (0-1 or 2-3) is pending. */
+#define T8152_CIO_INIT_PAIR_MASK(port) ((port) < 2 ? GENMASK(1, 0) : GENMASK(3, 2))
+#define T8152_CIO_POLL_US 10
+/* As long as a t6050 reconfiguration. */
+#define T8152_CIO_TIMEOUT_US APPLE_CIO_RESET_T6050_TIMEOUT_US
+
 struct apple_cio_reset;
 
 struct apple_cio_reset_variant {
@@ -199,6 +208,34 @@ static int t8142_cio_deassert(struct apple_cio_reset *priv, unsigned long id)
 				       APPLE_CIO_RESET_POLL_US,
 				       APPLE_CIO_RESET_TIMEOUT_US);
 }
+
+static int t8152_cio_deassert(struct apple_cio_reset *priv, unsigned long id)
+{
+	u32 val;
+	int ret;
+
+	guard(mutex)(&priv->lock);
+	ret = regmap_read_poll_timeout(priv->regmap, T8152_CIO_INIT_REQ, val,
+				       !(val & T8152_CIO_INIT_PAIR_MASK(id)),
+				       T8152_CIO_POLL_US, T8152_CIO_TIMEOUT_US);
+	if (ret)
+		return ret;
+	ret = regmap_write(priv->regmap, T8152_CIO_INIT_REQ, BIT(id));
+	if (ret)
+		return ret;
+	ret = regmap_read_poll_timeout(priv->regmap, T8152_CIO_INIT_DONE, val,
+				       val & BIT(id), T8152_CIO_POLL_US,
+				       T8152_CIO_TIMEOUT_US);
+	if (ret)
+		return ret;
+	/* Acknowledge the completion. */
+	return regmap_write(priv->regmap, T8152_CIO_INIT_DONE, BIT(id));
+}
+
+static const struct apple_cio_reset_variant apple_t8152_cio_reset = {
+	.nr_resets = 4,
+	.deassert = t8152_cio_deassert,
+};
 
 static const struct apple_cio_reset_variant apple_t8142_cio_reset = {
 	.nr_resets = 4,
@@ -330,6 +367,7 @@ static int apple_cio_reset_probe(struct platform_device *pdev)
 }
 
 static const struct of_device_id apple_cio_reset_match[] = {
+	{ .compatible = "apple,t8152-cio-reset", .data = &apple_t8152_cio_reset },
 	{
 		.compatible = "apple,t6050-cio-reset",
 		.data = &apple_t6050_cio_reset,
@@ -366,3 +404,7 @@ module_platform_driver(apple_cio_reset_driver);
 MODULE_AUTHOR("Sven Peter <sven@kernel.org>");
 MODULE_DESCRIPTION("Apple SoC CIO block reset driver");
 MODULE_LICENSE("Dual MIT/GPL");
+
+#if IS_ENABLED(CONFIG_RESET_APPLE_CIO_KUNIT_TEST)
+#include "reset-apple-cio-test.c"
+#endif

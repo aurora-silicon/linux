@@ -11,7 +11,7 @@ mod attribution;
 mod slot;
 mod safety;
 pub(crate) use safety::{note_retired, since_retired};
-pub(crate) use attribution::{Record, Sources, PAGE_FAULT};
+pub(crate) use attribution::{fault_qids, Record, Sources};
 pub(crate) use attribution::Attribution;
 
 pub(super) fn slot_key(slot: usize, slot_keys: Option<u64>) -> Option<u64> {
@@ -177,8 +177,12 @@ pub(super) trait Queues {
     /// (`Context::restarted_since_kill`). Without this, a kill finished just before a restart
     /// that the host had not observed yet would wait for a restart that may never come.
     fn note_kill_sightings(&self, _generation: u64) {}
-    /// Optional diagnostics: logs the MMU fault banks while the firmware is halted.
-    fn report_mmu_fault(&self) {}
+    /// Logs the MMU fault banks while the firmware is halted and returns the UAT slots
+    /// (context IDs) of the faulting accesses as a mask; 0 without a decodable user fault.
+    fn report_mmu_fault(&self) -> u64 { 0 }
+    /// Read while firmware is halted, like `render_pass_started`. The QIDs of every queue with
+    /// an in-flight packet whose context is in `slots`; None if there is none.
+    fn fault_culprit(&self, _slots: u64) -> Option<u128> { None }
     fn settle_blamed_render(&mut self, qid: u8, error: Error);
     fn settle_cancelled_renders(&mut self, qids: u128);
     fn rescan_compute(&mut self) -> Result;
@@ -335,7 +339,7 @@ pub(super) fn service<H: Host>(
     let mut sources = host.fault_sources()?;
     sources.report(request.generation, super::queue::compute::retirement::stampless_total(),
         request.blamed);
-    host.report_mmu_fault();
+    let fault_slots = host.report_mmu_fault();
     if let Some(qid) = request.blamed {
         host.report_blamed_render(qid);
     }
@@ -346,6 +350,8 @@ pub(super) fn service<H: Host>(
         |qid, stamp| host.render_pass_started(qid, stamp));
     let attribution = sources.host_fallback(attribution,
         || host.render_culprit(request.blamed?));
+    let attribution = sources.fault_override(attribution, request.blamed, fault_slots,
+        |slots| host.fault_culprit(slots));
     if let Attribution::Suspects(qids) = attribution {
         pr_warn!("G17: recovery gen {} suspects queues {:#x}\n", request.generation, qids);
     }
