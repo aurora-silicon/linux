@@ -114,6 +114,10 @@ ASAHI_TESTS = {
     'aop-als-channel-tests.py': [([], PASS)],
     'aop-als-calibration-tests.py': [([], PASS)],
     'aop-bootargs-tests.py': [([], PASS)],
+    # 24dc422773c9 registers another child device for each repeated service announcement.
+    'aop-service-tests.py': [([], PASS),
+                             (['--old-ref', '24dc422773c9beb9e99ee9e1ab713e9d6abb1e7b'], PASS)]
+        + mutations('--mutation', ('no-work-release', 'no-slot-release', 'no-register-release'), [], PASS),
     'mtp-pm-tests.py': [(out(), PASS),
                          (out() + ['--old-transport', '4db3a5a22c43'], PASS),
                          (out() + ['--old-mouse', '62d2045d8928'], PASS)],
@@ -270,7 +274,7 @@ ASAHI_TESTS = {
                                    'drop-direct-claim-on-fallback', 'pin-single-die'), []),
     'g17-m5-event-placement-tests.py': [([], PASS)]
         + mutations('--mutation', ('percpu-always', 'unbound-always', 'aim-local',
-                                   'record-always', 'not-reclaim', 'split-flag'), []),
+                                   'record-m5-only', 'not-reclaim', 'split-flag'), []),
     'g17-m5-render-fast-done-tests.py': [([], PASS)]
         + mutations('--mutation', ('hold-m5-outer-across-doorbell',
                                    'hold-render-lock-across-doorbell',
@@ -354,6 +358,9 @@ ASAHI_TESTS = {
     'radio-sleep-fence-tests.py': [([], PASS)],
     'radio-sleep-power-tests.py': [([], PASS)],
     'radio-sleep-snapshot-tests.py': [([], PASS)],
+    # cacf35543b4d serves endpoint 7 for every co-processor.
+    'rtkit-coreanalytics-tests.py': [(out(), PASS),
+                                     (out() + ['--old-ref', 'cacf35543b4d534fccef3033bd2ddbb415a325b2'], PASS)],
     'rtkit-crashlog-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('buffer-header', 'section-header', 'section-size', 'footer-room',
                                    'mailbox-minimum', 'version-string', 'message-string'), out()),

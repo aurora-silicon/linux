@@ -900,8 +900,9 @@ impl Firmware {
     }
 
     /// Both outer slots and their capacity are checked before any host-port
-    /// write. An EAGAIN retry drops the old views and revalidates them under a
-    /// power hold. After a successful transaction, publication is infallible.
+    /// write. The host command port needs no core power, and its transaction
+    /// fails only once the register mapping is gone; the error propagates.
+    /// After a successful transaction, publication is infallible.
     fn submit_m5_render_pair(
         &mut self,
         priority: u8,
@@ -912,26 +913,12 @@ impl Firmware {
         deferred: bool,
         cursors: Option<[u32; 3]>,
     ) -> Result<[u32; 2]> {
-        let mut commit_accounting = Some(commit_accounting);
-        let mut publish_inner = Some(publish_inner);
-        let mut cursors = cursors;
-        for attempt in 0..2 {
-            let pair = self.init.m5_work_pair(priority, &records[0], &records[1], cursors.take())?;
-            pair.prepare();
-            if let Some(commit) = commit_accounting.take() { commit()?; }
-            match self.bridge.regs.submit_m5_work(submission) {
-                Err(error) if error == EAGAIN && attempt == 0 => {
-                    drop(pair);
-                    self.acquire_registration_power()?;
-                }
-                Err(error) => return Err(error),
-                Ok(()) => {
-                    if let Some(publish) = publish_inner.take() { publish(); }
-                    return Ok(if deferred { pair.next() } else { pair.publish() });
-                }
-            }
-        }
-        Err(EAGAIN)
+        let pair = self.init.m5_work_pair(priority, &records[0], &records[1], cursors)?;
+        pair.prepare();
+        commit_accounting()?;
+        self.bridge.regs.submit_m5_work(submission)?;
+        publish_inner();
+        Ok(if deferred { pair.next() } else { pair.publish() })
     }
 
     /// Called at actual submission publication, not while a queued job is merely being built.
@@ -1315,13 +1302,13 @@ struct Shared {
     /// waits for another, and finished after the device mutex is released.
     #[pin]
     render_collector: Mutex<runtime::DeferredBatch>,
-    /// M5: the event work runs beside the CPU that last published work, in its affinity pod.
-    follows_submitter: bool,
-    /// Multi-die M5: restrict each scheduler's ordered submit queue to the creating CPU's
-    /// cluster to avoid cross-die migration. Single-die M5 parts leave schedulers unpinned so
-    /// queues created on one thread do not contend on a single cluster under multi-queue load.
+    /// Always aim event work at the publishing CPU on M5, including within a cluster.
+    aim_events_at_submitter: bool,
+    /// Restrict each scheduler's ordered submit queue to the creating CPU's cluster.
+    /// Single-die M5 leaves schedulers unpinned so queues created on one thread can
+    /// spread among clusters under multi-queue load.
     pin_scheduler_cluster: bool,
-    /// M5: the CPU of the last publication, `u32::MAX` before the first.
+    /// The CPU of the last publication, `u32::MAX` before the first.
     submitter: AtomicU32,
     #[pin]
     grow: Work<Shared, GROW_WORK>,
@@ -1499,10 +1486,17 @@ impl Shared {
         if !self.submission_enabled {
             return;
         }
+        // Outside M5, use the queuing CPU when it is already in the submitter's cluster.
         // Already queued if this fails, which is just as good.
+        let here = kernel::cpu::CpuId::current();
         let _ = match self.submitter() {
-            Some(cpu) => self.events.enqueue_on::<Arc<Shared>, EVENT_WORK>(cpu, self.clone()),
-            None => self.events.enqueue::<Arc<Shared>, EVENT_WORK>(self.clone()),
+            Some(cpu)
+                if self.aim_events_at_submitter
+                    || !kernel::cpumask::Cpumask::cluster_of(here).test(cpu) =>
+            {
+                self.events.enqueue_on::<Arc<Shared>, EVENT_WORK>(cpu, self.clone())
+            }
+            _ => self.events.enqueue::<Arc<Shared>, EVENT_WORK>(self.clone()),
         };
     }
 
@@ -1513,7 +1507,7 @@ impl Shared {
 
     /// The queue of [`Self::events`].
     ///
-    /// Event work that follows the submitter is aimed at the publishing CPU by
+    /// On M5 the event work is aimed at the publishing CPU by
     /// [`Self::queue_event_records`]. Its queue is unbound, so that CPU only selects the affinity
     /// pod, the CPUs sharing its L2, and the scheduler wakes the worker on an idle CPU of the pod:
     /// beside the submitter and on its die, wherever the completion interrupt was taken. On a
@@ -1523,26 +1517,27 @@ impl Shared {
     /// worker could not spin on them: it would sleep until the submitter unlocks and then preempt
     /// it again, two context switches of the submitter per completion.
     ///
-    /// Otherwise the queue is per-CPU and the event work runs on the CPU that queues it, as on
-    /// `system_highpri_wq`.
-    fn new_events_queue(follows_submitter: bool) -> Result<workqueue::OwnedQueue> {
-        if follows_submitter {
+    /// On other G17 parts the queue is per-CPU. The worker runs on the CPU that queues it when
+    /// it already shares the submitter's cluster, or on the publishing CPU otherwise.
+    fn new_events_queue(aim_events_at_submitter: bool) -> Result<workqueue::OwnedQueue> {
+        if aim_events_at_submitter {
             workqueue::OwnedQueue::new_unbound_reclaim(c"aurora_g17_events", true)
         } else {
             workqueue::OwnedQueue::new_percpu_reclaim(c"aurora_g17_events", true)
         }
     }
 
-    /// Whether each scheduler's submit queue should be restricted to the creating CPU's cluster
-    /// (multi-die M5 only).
+    /// Whether to restrict each scheduler's submit queue to the creating CPU's cluster.
     pub(super) fn pin_scheduler_cluster(&self) -> bool {
         self.pin_scheduler_cluster
     }
 
-    /// Records the publishing CPU for the event work's placement (M5).
+    /// Records the publishing CPU for the event work's placement.
     fn note_submitter(&self) {
-        if self.follows_submitter {
-            self.submitter.store(kernel::cpu::CpuId::current().as_u32(), Ordering::Relaxed);
+        let cpu = kernel::cpu::CpuId::current().as_u32();
+        // The completion side reads this line; write it only when the submitter moves.
+        if self.submitter.load(Ordering::Relaxed) != cpu {
+            self.submitter.store(cpu, Ordering::Relaxed);
         }
     }
 
@@ -1834,9 +1829,9 @@ impl Gpu {
         let render_policy = if m5 { Some(render_resources::M5Policy::new(&id)?) } else { None };
         // The bare-metal M5 boot runs both engines; other M5 profiles take no submission.
         let submits = !m5 || cfg.profile == FirmwareProfile::M5PublishedRoots;
-        // The event work follows the submitter on M5, which decides its queue's kind.
-        let follows_submitter = m5;
-        let events = Arc::new(Shared::new_events_queue(follows_submitter)?, GFP_KERNEL)?;
+        // Target the publishing CPU's affinity pod on M5, even from within the same cluster.
+        let aim_events_at_submitter = m5;
+        let events = Arc::new(Shared::new_events_queue(aim_events_at_submitter)?, GFP_KERNEL)?;
         let frequencies = Self::state_frequencies(dev, cfg, variant, id.num_clusters)?;
         let max_pstate = frequencies
             .as_ref()
@@ -1889,8 +1884,8 @@ impl Gpu {
                     "g17::Shared::worker_deferred"
                 ),
                 render_collector <- new_mutex!(render_collector, "g17::Shared::render_collector"),
-                follows_submitter,
-                pin_scheduler_cluster: m5 && id.num_dies > 1,
+                aim_events_at_submitter,
+                pin_scheduler_cluster: !m5 || id.num_dies > 1,
                 submitter: AtomicU32::new(u32::MAX),
                 grow <- new_work!("g17::Shared::grow"),
                 reclaim_work <- new_work!("g17::Shared::reclaim_work"),

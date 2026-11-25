@@ -26,16 +26,16 @@ Checks:
    cluster or on the other die runs in the submitter's pod, never preempting a
    submitter that is publishing; the worker follows a moved submitter; before
    the first publication the work is queued locally.
-2. Other G17 parts: the queue is per-CPU and the event work runs on the CPU
-   that queued it, as on `system_highpri_wq`, whatever CPU published.
-3. Structure: `Gpu::new()` derives the queue and `Shared::follows_submitter`
+2. Other G17 parts: the queue is per-CPU. When the queuing CPU and publisher
+   share a cluster, the work stays local; otherwise it runs on the publishing CPU.
+3. Structure: `Gpu::new()` derives the queue and `Shared::aim_events_at_submitter`
    from one value, `aurora_g17_events` is allocated only by `new_events_queue()`,
    and the schedulers' timeout work still uses that queue.
 
 Mutations: `percpu-always` is the previous code (a per-CPU queue on every part),
-`unbound-always`, `aim-local` (never aim at the submitter), `record-always`
-(record the submitter on every part), `not-reclaim`, and `split-flag` (the queue
-kind no longer follows `follows_submitter`).
+`unbound-always`, `aim-local` (never aim at the submitter), `record-m5-only`
+(record the submitter only on M5), `not-reclaim`, and `split-flag` (the queue
+kind no longer follows `aim_events_at_submitter`).
 """
 import argparse
 import os
@@ -66,8 +66,8 @@ def replace_once(text, old, new):
 
 UNBOUND = 'workqueue::OwnedQueue::new_unbound_reclaim(c"aurora_g17_events", true)'
 PERCPU = 'workqueue::OwnedQueue::new_percpu_reclaim(c"aurora_g17_events", true)'
-DERIVE = 'let follows_submitter = m5;'
-CONSTRUCT = 'let events = Arc::new(Shared::new_events_queue(follows_submitter)?, GFP_KERNEL)?;'
+DERIVE = 'let aim_events_at_submitter = m5;'
+CONSTRUCT = 'let events = Arc::new(Shared::new_events_queue(aim_events_at_submitter)?, GFP_KERNEL)?;'
 
 
 def build_harness(mutation=None):
@@ -93,16 +93,18 @@ def build_harness(mutation=None):
     elif mutation == 'aim-local':
         queue_records = replace_once(
             queue_records,
-            'Some(cpu) => self.events.enqueue_on::<Arc<Shared>, EVENT_WORK>(cpu, self.clone()),',
-            'Some(_) => self.events.enqueue::<Arc<Shared>, EVENT_WORK>(self.clone()),')
-    elif mutation == 'record-always':
-        note = replace_once(note, 'if self.follows_submitter {', 'if true {')
+            'if self.aim_events_at_submitter\n'
+            '                    || !kernel::cpumask::Cpumask::cluster_of(here).test(cpu) =>',
+            'if false =>')
+    elif mutation == 'record-m5-only':
+        note = replace_once(note, 'if self.submitter.load(Ordering::Relaxed) != cpu {',
+                            'if self.aim_events_at_submitter && self.submitter.load(Ordering::Relaxed) != cpu {')
 
-    # Gpu::new() derives both the queue and Shared::follows_submitter from one value, the
-    # one the harness's `Shared::new_m5()`/`Shared::new_other()` pass.
-    field = '                follows_submitter,\n'
+    # Gpu::new() derives both the queue and Shared::aim_events_at_submitter from one value, the
+    # value the harness passes to `Shared::build()`.
+    field = '                aim_events_at_submitter,\n'
     derive_ok = src.count(DERIVE) == 1 and src.count(CONSTRUCT) == 1
-    field_ok = (derive_ok and src.count(field) == 1 and 'follows_submitter: m5,' not in src
+    field_ok = (derive_ok and src.count(field) == 1 and 'aim_events_at_submitter: m5,' not in src
                 and src.index(DERIVE) < src.index(CONSTRUCT) < src.index(field))
     only_here = src.count('c"aurora_g17_events"') == new_queue.count('c"aurora_g17_events"') == 2
     fence_ok = 'self.events.clone()' in item(src, 'fn fence_queue(')
@@ -113,6 +115,8 @@ use std::sync::atomic::{{AtomicU32, Ordering}};
 use std::sync::Arc;
 
 type Result<T = (), E = ()> = core::result::Result<T, E>;
+
+const CPUS_PER_CLUSTER: u32 = 6;
 
 mod kernel {{
     pub mod cpu {{
@@ -140,6 +144,23 @@ mod kernel {{
             let result = f();
             CURRENT.with(|current| current.set(previous));
             result
+        }}
+    }}
+
+    pub mod cpumask {{
+        use super::cpu::CpuId;
+        use crate::CPUS_PER_CLUSTER;
+
+        pub struct Cpumask(u32);
+
+        impl Cpumask {{
+            pub fn cluster_of(cpu: CpuId) -> Self {{
+                Self(cpu.as_u32() / CPUS_PER_CLUSTER)
+            }}
+
+            pub fn test(&self, cpu: CpuId) -> bool {{
+                cpu.as_u32() / CPUS_PER_CLUSTER == self.0
+            }}
         }}
     }}
 }}
@@ -199,7 +220,7 @@ const EVENT_WORK: u64 = 0;
 struct Shared {{
     submission_enabled: bool,
     events: Arc<workqueue::OwnedQueue>,
-    follows_submitter: bool,
+    aim_events_at_submitter: bool,
     submitter: AtomicU32,
 }}
 
@@ -214,14 +235,14 @@ impl Shared {{
 }}
 
 impl Shared {{
-    /// As `Gpu::new()` builds it: the queue kind and `follows_submitter` from one value.
+    /// As `Gpu::new()` builds it: the queue kind and `aim_events_at_submitter` from one value.
     fn build(m5: bool) -> Arc<Self> {{
-        let follows_submitter = m5;
-        let events = Arc::new(Shared::new_events_queue(follows_submitter).expect("events queue"));
+        let aim_events_at_submitter = m5;
+        let events = Arc::new(Shared::new_events_queue(aim_events_at_submitter).expect("events queue"));
         Arc::new(Shared {{
             submission_enabled: true,
             events,
-            follows_submitter,
+            aim_events_at_submitter,
             submitter: AtomicU32::new(u32::MAX),
         }})
     }}
@@ -244,12 +265,12 @@ struct Topology {{
 }}
 
 impl Topology {{
-    fn new(dies: u32, clusters_per_die: u32, cpus_per_cluster: u32) -> Self {{
+    fn new(dies: u32, clusters_per_die: u32) -> Self {{
         let mut cluster = Vec::new();
         let mut die = Vec::new();
         for d in 0..dies {{
             for c in 0..clusters_per_die {{
-                for _ in 0..cpus_per_cluster {{
+                for _ in 0..CPUS_PER_CLUSTER {{
                     cluster.push(d * clusters_per_die + c);
                     die.push(d);
                 }}
@@ -313,7 +334,7 @@ fn test_other_queue_kind() {{
 /// The measured case: the completion interrupt is taken on the CPU of the submitter, which
 /// is in the middle of a publication.
 fn test_m5_completion_on_submitter_cpu() {{
-    let topo = Topology::new(1, 3, 6);
+    let topo = Topology::new(1, 3);
     let shared = Shared::build(true);
     shared.publish_on(16);
     let busy = busy(&topo, &[16]);
@@ -326,7 +347,7 @@ fn test_m5_completion_on_submitter_cpu() {{
 }}
 
 fn test_m5_completion_on_other_cluster() {{
-    let topo = Topology::new(1, 3, 6);
+    let topo = Topology::new(1, 3);
     let shared = Shared::build(true);
     shared.publish_on(16);
     let busy = busy(&topo, &[16, 2]);
@@ -339,7 +360,7 @@ fn test_m5_completion_on_other_cluster() {{
 }}
 
 fn test_m5_two_dies() {{
-    let topo = Topology::new(2, 2, 6);
+    let topo = Topology::new(2, 2);
     let shared = Shared::build(true);
     shared.publish_on(20);
     let busy = busy(&topo, &[20, 3]);
@@ -352,7 +373,7 @@ fn test_m5_two_dies() {{
 
 fn test_m5_idle_submitter() {{
     // A submitter waiting on a fence leaves its CPU idle: running there preempts nobody.
-    let topo = Topology::new(1, 3, 6);
+    let topo = Topology::new(1, 3);
     let shared = Shared::build(true);
     shared.publish_on(16);
     let busy = busy(&topo, &[]);
@@ -365,7 +386,7 @@ fn test_m5_idle_submitter() {{
 fn test_m5_submitter_moves() {{
     // Two submitters on different clusters: the event work follows the last one, and never
     // preempts either while it publishes.
-    let topo = Topology::new(1, 3, 6);
+    let topo = Topology::new(1, 3);
     let shared = Shared::build(true);
     shared.publish_on(16);
     shared.publish_on(7);
@@ -378,7 +399,7 @@ fn test_m5_submitter_moves() {{
 }}
 
 fn test_m5_before_first_publication() {{
-    let topo = Topology::new(1, 3, 6);
+    let topo = Topology::new(1, 3);
     let shared = Shared::build(true);
     assert!(shared.submitter().is_none());
     let call = shared.complete_on(4);
@@ -389,7 +410,7 @@ fn test_m5_before_first_publication() {{
 
 fn test_m5_completion_stream() {{
     // Every completion of a deep queue arrives while the submitter publishes the next job.
-    let topo = Topology::new(1, 3, 6);
+    let topo = Topology::new(1, 3);
     let shared = Shared::build(true);
     let mut switches = 0;
     for job in 0..64u32 {{
@@ -404,16 +425,20 @@ fn test_m5_completion_stream() {{
     assert_eq!(switches, 0, "completions must not cost the submitter context switches");
 }}
 
-fn test_other_runs_on_queuer() {{
-    let topo = Topology::new(1, 3, 6);
+fn test_other_cluster_routing() {{
+    let topo = Topology::new(1, 3);
     let shared = Shared::build(false);
     shared.publish_on(16);
-    assert!(shared.submitter().is_none(), "only M5 records the submitter");
+    assert_eq!(shared.submitter().unwrap().as_u32(), 16);
     let busy = busy(&topo, &[3, 16]);
-    let call = shared.complete_on(3);
-    assert_eq!(call, Call::Local {{ queuer: 3 }});
-    assert_eq!(worker_cpu(&topo, &shared.events, call, &busy), 3,
-               "other G17 parts run the event work where it is queued, as system_highpri_wq");
+
+    let cross_cluster = shared.complete_on(3);
+    assert_eq!(cross_cluster, Call::On {{ cpu: 16 }});
+    assert_eq!(worker_cpu(&topo, &shared.events, cross_cluster, &busy), 16);
+
+    let same_cluster = shared.complete_on(14);
+    assert_eq!(same_cluster, Call::Local {{ queuer: 14 }});
+    assert_eq!(worker_cpu(&topo, &shared.events, same_cluster, &busy), 14);
 }}
 
 fn test_disabled_submission() {{
@@ -421,7 +446,7 @@ fn test_disabled_submission() {{
     let shared = Arc::new(Shared {{
         submission_enabled: false,
         events: shared.events.clone(),
-        follows_submitter: true,
+        aim_events_at_submitter: true,
         submitter: AtomicU32::new(u32::MAX),
     }});
     shared.publish_on(16);
@@ -430,8 +455,8 @@ fn test_disabled_submission() {{
 }}
 
 fn main() {{
-    assert!({str(derive_ok).lower()}, "Gpu::new() must derive the events queue from follows_submitter");
-    assert!({str(field_ok).lower()}, "Shared::follows_submitter must take the value the queue was built for");
+    assert!({str(derive_ok).lower()}, "Gpu::new() must derive the events queue from aim_events_at_submitter");
+    assert!({str(field_ok).lower()}, "Shared::aim_events_at_submitter must take the value the queue was built for");
     assert!({str(only_here).lower()}, "aurora_g17_events must be allocated only by Shared::new_events_queue()");
     assert!({str(fence_ok).lower()}, "the schedulers' timeout work must stay on the events queue");
     test_m5_completion_on_submitter_cpu();
@@ -441,7 +466,7 @@ fn main() {{
     test_m5_submitter_moves();
     test_m5_before_first_publication();
     test_m5_completion_stream();
-    test_other_runs_on_queuer();
+    test_other_cluster_routing();
     test_disabled_submission();
     test_m5_queue_kind();
     test_other_queue_kind();
@@ -458,7 +483,7 @@ def main():
             'percpu-always',
             'unbound-always',
             'aim-local',
-            'record-always',
+            'record-m5-only',
             'not-reclaim',
             'split-flag',
         ],

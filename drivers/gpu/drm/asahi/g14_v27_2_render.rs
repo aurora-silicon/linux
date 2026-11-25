@@ -92,6 +92,8 @@ fn to_cmdbuf(r: &UapiRenderCommand) -> kernel::uapi::drm_asahi_cmd_render {
     c.sample_size_B = r.sample_size;
     c.ppp_ctrl = r.ppp_control;
     c.ppp_multisamplectl = r.multisample_control;
+    // The tiling parameters carry the vertex helper's configuration, as in the 13.5 command.
+    c.vertex_helper.cfg = r.vertex_helper.config;
     c
 }
 
@@ -224,7 +226,8 @@ fn header(b: &mut [u8], kind: u32, c: &Common) {
     put64(b, 0x10, c.tracking);
 }
 
-/// Write the destinations used by both internal timestamp paths.
+/// Write the destinations used by both internal timestamp paths. `user` names the command's
+/// pair of user destinations, or is 0 ([`crate::g14_v27_2_abi::user_timestamp_pointer`]).
 fn timestamp_op(
     s: &mut [u8],
     at: usize,
@@ -234,7 +237,7 @@ fn timestamp_op(
     ts_pointers: u64,
     internal0: u64,
     internal1: u64,
-    user: [u64; 2],
+    user: u64,
 ) {
     put32(s, at, if start { 0x8000_0003 } else { 3 });
     put64(s, at + 0x04, command_time);
@@ -245,7 +248,7 @@ fn timestamp_op(
         if start { ts_pointers } else { ts_pointers + 8 },
     );
     put64(s, at + 0x1c, q.queue);
-    put64(s, at + 0x24, user[usize::from(!start)]);
+    put64(s, at + 0x24, user);
     put64(s, at + 0x2c, internal0);
     put64(s, at + 0x34, internal1);
 }
@@ -430,6 +433,7 @@ pub(crate) fn encode_vertex(
     put64(cmd, 0x5dc, c.timestamps + 8);
     put64(cmd, 0x5e4, timestamps[0]);
     put64(cmd, 0x5ec, timestamps[1]);
+    let user = crate::g14_v27_2_abi::user_timestamp_pointer(c.cmd_va + 0x5e4, timestamps);
     let internal0 = c.cmd_va + 0x61c;
     let internal1 = c.cmd_va + 0x538;
     let flag = c.cmd_va + 0x568;
@@ -469,7 +473,7 @@ pub(crate) fn encode_vertex(
         ts,
         internal0,
         internal1,
-        timestamps,
+        user,
     );
     put32(s, 0x1e8, 0x0000_0100);
     timestamp_op(
@@ -481,7 +485,7 @@ pub(crate) fn encode_vertex(
         ts,
         internal0,
         internal1,
-        timestamps,
+        user,
     );
     let fin = 0x238;
     put32(s, fin, 6);
@@ -933,6 +937,7 @@ pub(crate) fn encode_fragment(
     let ts = va(frag_at(offset_of!(Rf, timestamp_pointers)));
     put64(cmd, 0x948, timestamps[0]);
     put64(cmd, 0x950, timestamps[1]);
+    let user = crate::g14_v27_2_abi::user_timestamp_pointer(va(0x948), timestamps);
     let internal0 = va(0x980);
     let internal1 = va(0x89c);
     let (jp1, jp2) = (va(0x80), va(0x3c8));
@@ -989,7 +994,7 @@ pub(crate) fn encode_fragment(
         ts,
         internal0,
         internal1,
-        timestamps,
+        user,
     );
     put32(s, 0x200, 0x0001_0000); // wait for the fragment pipe
     timestamp_op(
@@ -1001,7 +1006,7 @@ pub(crate) fn encode_fragment(
         ts,
         internal0,
         internal1,
-        timestamps,
+        user,
     );
     // op 8 FinalizeFragment (0xbc).
     let fin = 0x250;
