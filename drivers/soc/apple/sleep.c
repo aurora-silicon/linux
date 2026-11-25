@@ -7691,13 +7691,16 @@ static void apple_sleep_put_node(void *np)
 /*
  * A register sequence the device tree supplies, as <kind block offset value> each, run in
  * order. Bits 7:0 of kind: write the value, read, set the value's bits, clear them, write back
- * what is read, wait for the value's bits to be set, wait for them to be clear, a 16-bit write.
- * Bits 31:16: a wait's timeout in ms (0: 10 ms); bit 8: its timeout is not an error. What a
- * block number names is the profile's own.
+ * what is read, wait for the value's bits to be set, wait for them to be clear, a 16-bit write;
+ * then for 64-bit registers, read and written whole: a write of the value as the high word
+ * with the low word 0, and a clear of the value's bits in the low word. Bits 31:16: a wait's
+ * timeout in ms (0: 10 ms); bit 8: its timeout is not an error. What a block number names is
+ * the profile's own.
  */
 enum {
 	SLEEP_OP_WRITE, SLEEP_OP_READ, SLEEP_OP_SET, SLEEP_OP_CLEAR, SLEEP_OP_REWRITE,
-	SLEEP_OP_WAIT_SET, SLEEP_OP_WAIT_CLEAR, SLEEP_OP_WRITE16, SLEEP_OP_KINDS,
+	SLEEP_OP_WAIT_SET, SLEEP_OP_WAIT_CLEAR, SLEEP_OP_WRITE16, SLEEP_OP_WRITE64_HI,
+	SLEEP_OP_CLEAR64, SLEEP_OP_KINDS,
 };
 
 #define SLEEP_OP_KIND		GENMASK(7, 0)
@@ -7717,6 +7720,9 @@ static unsigned int sleep_op_width(u32 kind)
 		return 2;
 	case SLEEP_OP_WRITE ... SLEEP_OP_WAIT_CLEAR:
 		return 4;
+	case SLEEP_OP_WRITE64_HI:
+	case SLEEP_OP_CLEAR64:
+		return 8;
 	default:
 		return 0;
 	}
@@ -7805,6 +7811,12 @@ static unsigned int sleep_seq_run(void __iomem *const *blk, const struct sleep_s
 			break;
 		case SLEEP_OP_WRITE16:
 			writew(op[3], reg);
+			break;
+		case SLEEP_OP_WRITE64_HI:
+			writeq((u64)op[3] << 32, reg);
+			break;
+		case SLEEP_OP_CLEAR64:
+			writeq(readq(reg) & ~(u64)op[3], reg);
 			break;
 		}
 		if (ret && !(op[0] & SLEEP_OP_OPTIONAL))

@@ -516,6 +516,11 @@ static void apple_sleep_test_seq_fits(struct kunit *test)
 		/* A block smaller than the access, or none */
 		{ { SLEEP_OP_WRITE, 0, 0x0, 0 }, 0x2, false },
 		{ { SLEEP_OP_WRITE, 0, 0x0, 0 }, 0, false },
+		/* 64-bit: 8-byte aligned, 8 bytes left */
+		{ { SLEEP_OP_WRITE64_HI, 0, 0xff8, 1 }, 0x1000, true },
+		{ { SLEEP_OP_CLEAR64, 0, 0xffc, 1 }, 0x1000, false },
+		{ { SLEEP_OP_CLEAR64, 0, 0x4, 1 }, 0x1000, false },
+		{ { SLEEP_OP_CLEAR64, 0, 0xfffffff8, 1 }, 0x1000, false },
 		/* No such kind */
 		{ { SLEEP_OP_KINDS, 0, 0x0, 0 }, 0x1000, false },
 		{ { 0xff, 0, 0x0, 0 }, 0x1000, false },
@@ -527,8 +532,37 @@ static void apple_sleep_test_seq_fits(struct kunit *test)
 				    "case %u", i);
 }
 
+/*
+ * The 64-bit kinds read and write their register whole: a clear keeps the high word and the
+ * low word's other bits, and the write puts its value in the high word.
+ */
+static void apple_sleep_test_seq_run64(struct kunit *test)
+{
+	static const u32 ops[] = {
+		SLEEP_OP_CLEAR64, 0, 0x0, 0x1,
+		SLEEP_OP_CLEAR64, 0, 0x0, 0x2,
+		SLEEP_OP_WRITE64_HI, 0, 0x8, 0x20000000,
+		SLEEP_OP_CLEAR, 0, 0x10, 0x1,
+	};
+	const struct sleep_seq seq = { .op = ops, .n = ARRAY_SIZE(ops) / 4 };
+	u64 *regs = kunit_kzalloc(test, 3 * sizeof(*regs), GFP_KERNEL);
+	void __iomem *blk[1];
+
+	KUNIT_ASSERT_NOT_NULL(test, regs);
+	regs[0] = 0x0000000100000007ULL;
+	regs[1] = 0xffffffffffffffffULL;
+	regs[2] = 0xffffffff00000003ULL;
+	blk[0] = (void __force __iomem *)regs;
+	KUNIT_EXPECT_EQ(test, sleep_seq_run(blk, &seq), 0);
+	KUNIT_EXPECT_EQ(test, regs[0], 0x0000000100000004ULL);
+	KUNIT_EXPECT_EQ(test, regs[1], 0x2000000000000000ULL);
+	/* The 32-bit clear touches only the low word */
+	KUNIT_EXPECT_EQ(test, regs[2], 0xffffffff00000002ULL);
+}
+
 static struct kunit_case apple_sleep_test_cases[] = {
 	KUNIT_CASE(apple_sleep_test_seq_fits),
+	KUNIT_CASE(apple_sleep_test_seq_run64),
 	KUNIT_CASE(apple_sleep_test_layout),
 	KUNIT_CASE(apple_sleep_test_t6050),
 	KUNIT_CASE(apple_sleep_test_j716c_inventory),
