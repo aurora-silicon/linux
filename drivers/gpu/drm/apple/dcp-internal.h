@@ -928,6 +928,11 @@ struct apple_dcp {
 	bool s2r_stopped;
 	/* DPMS off stopped the firmware and lowered the domains; DPMS on brings them back. */
 	bool dpms_powered_off;
+	/*
+	 * The firmware confirmed the scanout stop of a set_power_state(0) and no power-on has
+	 * started since: its D572(0) has come and gone, and a second set_power_state(0) gets none.
+	 */
+	bool pipe_off;
 	/* Refused its idle with the display off: the firmware still runs, the display is dark. */
 	bool s2r_refused_off;
 	/* The firmware's secure mailbox, where it has one. */
