@@ -163,6 +163,18 @@ const fn cross_engine_barrier_type(producer_initbm: bool, consumer_initbm: bool)
     BarrierType::from_stamp_only(!producer_initbm && !consumer_initbm)
 }
 
+/// Whether a compute command of `vm` that runs shader-context scratch (SCS) work (`scs`), or
+/// does not, must wait for compute flight `f` to retire before it is published.
+///
+/// SCS compute (ray queries, and every compute command of a job with SCS scratch) shares the
+/// compute engine only with SCS compute of its own VM. Each compute work item sets the
+/// engine's SCS state in its register list, enabled for SCS work and disabled otherwise. An
+/// SCS item that other compute overlaps is reported complete while its stores are still in
+/// flight, and they land after its fence has signalled, also after its VM is gone.
+fn scs_compute_conflict(f: &Flight, vm: &Arc<super::vm::VmState>, scs: bool) -> bool {
+    f.computes != 0 && (f.rt_compute != scs || (scs && !Arc::ptr_eq(&f.job.vm, vm)))
+}
+
 /// Resolved ring-barrier placement for one render pass (legacy, `FRAGMENT_BARRIERS`, or
 /// `DRM_ASAHI_RENDER_STAGE_PREFIXES`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -1308,7 +1320,7 @@ impl Firmware {
                 f.doomed
                     || f.recovery_suspect
                     || f.initbm
-                    || (is_rt_compute && f.computes != 0 && f.compute_pipe != 0)
+                    || (is_compute && scs_compute_conflict(f, &job.vm, is_rt_compute))
                     || (((is_compute && f.renders != 0) || (is_render && f.computes != 0))
                         && !Arc::ptr_eq(&f.job.vm, &job.vm))
             })
@@ -1477,13 +1489,14 @@ impl Firmware {
                     .flights
                     .iter()
                     .any(|f| f.renders != 0 && !Arc::ptr_eq(&f.job.vm, &job.vm));
-                let rt_pipe1_busy = (job.resources.compute_scs() || c.is_rt())
-                    && e.flights
-                        .iter()
-                        .any(|f| f.computes != 0 && f.compute_pipe != 0);
+                let scs = job.resources.compute_scs() || c.is_rt();
+                let scs_conflict = e
+                    .flights
+                    .iter()
+                    .any(|f| scs_compute_conflict(f, &job.vm, scs));
                 let compute_count: usize = e.flights.iter().map(|f| f.computes as usize).sum();
                 !cross_vm_render
-                    && !rt_pipe1_busy
+                    && !scs_conflict
                     && !waits_for_timestamps
                     && compute_count < params::compute_flights()
                     && !self.slots.compute_exhausted()
