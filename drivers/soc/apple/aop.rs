@@ -3196,13 +3196,25 @@ const HW_CFG_T6041: AopHwConfig = AopHwConfig {
 /// the DART's DAPF programmed and its windows reserved alongside the firmware
 /// segments.
 const HW_CFG_T8132: AopHwConfig = HW_CFG_T6040;
-/// M3-family AOP (T8122, T6030 and T6031): as T6040. iBoot leaves the AOP
-/// halted with its external code, data and log in DRAM, which the bootloader
-/// reserves in `memory-region`; the 27.2 firmware reads its `__EDATA` base
-/// from `ED0p`. A bootloader that reserves none leaves it to start as
-/// `apple,t6020-aop`, as before.
-const HW_CFG_T8122: AopHwConfig = AopHwConfig {
+/// M3-family AOP without SoC-specific sleep endpoints (T6030 and T6031): as
+/// T6040. iBoot leaves the AOP halted with its external code, data and log in
+/// DRAM, which the bootloader reserves in `memory-region`; the 27.2 firmware
+/// reads its `__EDATA` base from `ED0p`. A bootloader that reserves none leaves
+/// it to start as `apple,t6020-aop`, as before.
+const HW_CFG_T6030: AopHwConfig = AopHwConfig {
     without_fw_regions: Some(&HW_CFG_T6020),
+    ..HW_CFG_T6040
+};
+/// T8122 fallback when the bootloader supplies no firmware `memory-region`:
+/// keeps the T6020 boot path while still stopping the T8122 sleep endpoints.
+const HW_CFG_T8122_NO_FW_REGIONS: AopHwConfig = AopHwConfig {
+    sleep_endpoints: &[0x2b, 0x2a, 0x25, 0x27, 0x20, 0x23, 0x29, 0x24, 0x21, 0x28, 0x26, 0x22],
+    ..HW_CFG_T6020
+};
+/// T8122 (M3): as `HW_CFG_T6030`, plus T8122's twelve deep-sleep AFK endpoints.
+const HW_CFG_T8122: AopHwConfig = AopHwConfig {
+    sleep_endpoints: &[0x2b, 0x2a, 0x25, 0x27, 0x20, 0x23, 0x29, 0x24, 0x21, 0x28, 0x26, 0x22],
+    without_fw_regions: Some(&HW_CFG_T8122_NO_FW_REGIONS),
     ..HW_CFG_T6040
 };
 /// T8140: the firmware is started with the boot arguments the bootloader
@@ -3335,8 +3347,8 @@ kernel::of_device_table!(
         (of::DeviceId::new(c_str!("apple,t8112-aop")), &HW_CFG_T8112),
         (of::DeviceId::new(c_str!("apple,t6000-aop")), &HW_CFG_T6000),
         (of::DeviceId::new(c_str!("apple,t8122-aop")), &HW_CFG_T8122),
-        (of::DeviceId::new(c_str!("apple,t6030-aop")), &HW_CFG_T8122),
-        (of::DeviceId::new(c_str!("apple,t6031-aop")), &HW_CFG_T8122),
+        (of::DeviceId::new(c_str!("apple,t6030-aop")), &HW_CFG_T6030),
+        (of::DeviceId::new(c_str!("apple,t6031-aop")), &HW_CFG_T6030),
         (of::DeviceId::new(c_str!("apple,t6020-aop")), &HW_CFG_T6020),
         (of::DeviceId::new(c_str!("apple,t8140-aop")), &HW_CFG_T8140),
         (of::DeviceId::new(c_str!("apple,t6041-aop")), &HW_CFG_T6041),
