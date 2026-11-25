@@ -36,6 +36,7 @@ mod module_parameters {
 }
 pub struct QueueLimits;
 trait Backend {
+    fn backend_feature_flags(&self) -> u64 { 0 }
     fn supports_vm_status(&self) -> bool { false }
     fn queue_limits(&self) -> Option<QueueLimits> { None }
     __SHARED__
