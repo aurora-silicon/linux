@@ -28,6 +28,7 @@
 #include "dptxep.h"
 #include "dcp_backlight.h"
 #include "dcp-announce.h"
+#include "dcp-color.h"
 #include "dcp-display-metadata.h"
 #include "dcp-metadata-epoch.h"
 #include "dcp-180hz.h"
@@ -208,6 +209,12 @@ struct dcp_brightness {
 	u32 fade_from;
 	u32 fade_to;
 	bool fading;
+	/*
+	 * Without the present-coupled policy: the level the last present set
+	 * (struct dcp_bl_presented), while nits is the firmware's report.
+	 * Under the backlight lock.
+	 */
+	struct dcp_bl_presented presented;
 };
 
 struct audiosrv_data;
@@ -220,9 +227,9 @@ struct dcp_panel {
 	int height_mm;
 	/// panel has a mini-LED backlight
 	bool has_mini_led;
-	/// peak panel luminance in nits, for EDR (desktop 26.x; 0 if unknown)
+	/// peak panel luminance in nits, for EDR (0 if unknown or no EDR headroom)
 	u32 peak_nits;
-	/// EDR headroom ceiling x1000 from the ADT (desktop 26.x; 0 if none)
+	/// EDR headroom ceiling x1000 from the ADT (0: the panel has no EDR headroom)
 	u32 edr_ceiling;
 	/// calibrated colour target from the raw ADT; NULL if not given
 	const struct dcp_color_space *color_target;
@@ -308,12 +315,15 @@ struct apple_dcp_hw_data {
 	/*
 	 * The endpoint the DPTX port services are announced on, where it is not
 	 * the firmware's default (DPTX_ENDPOINT_V2 on firmware 27): the T8142
-	 * dcpext announces them on DPTX_ENDPOINT. 0: the default.
+	 * dcpext announces them on DPTX_ENDPOINT. 0: the default, or on a
+	 * firmware-27 dcpext or DCP with Type-C routes what its firmware
+	 * advertises (dcp_v27_dptx_layout()).
 	 */
 	u8 dptx_endpoint;
 	/*
 	 * Open the DPTX controller endpoint before the ports, as for H17P
 	 * externals: the T8142 dcpext announces AppleDCPDPTXController there.
+	 * Also set by dcp_v27_dptx_layout().
 	 */
 	bool dptx_controller;
 	/*
@@ -337,6 +347,29 @@ struct apple_dcp_hw_data {
 	 * firmware 27.0 and 27.2.1), so there is no secure port to idle before the IOP.
 	 */
 	bool s2r_no_secure_port;
+	/*
+	 * Every AFK endpoint speaks AFKv2 (see afk_init()), whatever the
+	 * firmware interface: for a firmware that does so on all of them
+	 * without an IOMFB interface version that implies it.
+	 */
+	bool afk_v2;
+	/*
+	 * The RTKit session is taken over without its endpoint map (see
+	 * apple_rtkit_init_adopted()): afk_start() registers each endpoint
+	 * with RTKit before starting it.
+	 */
+	bool afk_adopt_endpoints;
+	/*
+	 * AFK services are matched by the name in their announcement; the
+	 * properties after it are not parsed (afk_recv_handle_init()).
+	 */
+	bool afk_announced_names;
+	/*
+	 * How long AFK waits for the firmware to start or stop an endpoint
+	 * and to answer a command or service call (afk_timeout_ms()); zero
+	 * for one second.
+	 */
+	unsigned int afk_timeout_ms;
 };
 
 enum dcp_test_point {
@@ -379,18 +412,6 @@ struct dcp_desktop_state {
 	u32 vrr_min_on, vrr_min_off, vrr_min_sent;
 	/* The frame's colour matrix, sent after an adaptive sync update. */
 	struct iomfb_set_matrix_req matrix;
-	/*
-	 * HDR10 static metadata (external processors): the pinned
-	 * dcpav-service-epic service, the Type 1 body last sent on this link
-	 * (taken or refused), if any, and whether the firmware took one, so
-	 * that the link carries a Dynamic Range and Mastering InfoFrame.
-	 * hdr_lock protects all of them.
-	 */
-	spinlock_t hdr_lock;
-	struct apple_epic_service *av_service;
-	u8 hdr_sent[24];
-	bool hdr_sent_valid;
-	bool hdr_infoframe;
 	u32 present_id;
 	bool present_pending;
 	/*
@@ -431,7 +452,10 @@ struct dcp_desktop_state {
 
 /* TODO: move IOMFB members to its own struct */
 struct dcpext_scanout;
+struct t8152_display;
+struct dcp_iboot;
 struct dcp_hdmi;
+struct dcp_cec;
 
 bool dcp_desktop_present_complete(struct apple_dcp *dcp, u32 id);
 void dcp_panel_metadata_replace(struct apple_dcp *dcp,
@@ -464,6 +488,8 @@ struct apple_dcp {
 	struct iomfb_m4 *v26_6;
 	/* An adopted session has no confirmed firmware DMA stop boundary. */
 	bool retain_dma;
+	/* RTKit session handed over running by a boot stage (apple,rtkit-handoff) */
+	bool rtkit_adopted;
 	/*
 	 * Allocates AFK rings where the DMA API cannot, on an adopted
 	 * J713 external DCP whose DART only takes the retained allocator.
@@ -552,11 +578,23 @@ struct apple_dcp {
 
 	/* firmware version and compatible firmware version */
 	enum dcp_firmware_version fw_compat;
+	/* T8152: the DisplayPort hardware behind the DPTX port (t8152_display.h) */
+	struct t8152_display *t8152;
+	/* DCP_FIRMWARE_IBOOT: the display driven through it (iomfb_iboot.h) */
+	struct dcp_iboot *iboot;
 	/* Bumped by every iomfb poweron; see afk_compact_slot(). */
 	u32 afk_power_gen;
+	/*
+	 * AFK endpoints the bootloader left running, bit N for endpoint
+	 * 0x20 + N, from its hand-off: afk_start() stops each before its
+	 * INIT. Zero for a processor without such a hand-off.
+	 */
+	u32 afk_live_endpoints;
 	/* Firmware 27.x: the method IDs of this build (iomfb_v27_methods()). */
 	const struct dcp_method_entry *v27_methods;
 	bool external;
+	/* Any external processor (apple,dcpext), whatever its SoC; set at probe. */
+	bool dcpext;
 	/* A desktop 26.x external processor (apple,t6041-dcpext) */
 	bool desktop_external;
 	/*
@@ -776,13 +814,28 @@ struct apple_dcp {
 	bool typec_hpd_held;
 	bool use_timestamps;
 	bool vrr_enabled;
+	struct {
+		/* Pins the AV service and tracks HDR10 metadata for its link. */
+		spinlock_t lock;
+		struct apple_epic_service *service;
+		u64 generation;
+		u8 sent[24];
+		bool sent_valid;
+		bool infoframe;
+	} hdr;
+	/* The selected IOMFB backend programs catalogue colour IDs and PQ surfaces. */
+	bool iomfb_template_pq;
 	/*
 	 * The mode set asks for a PQ signal; output_pq: the one set carries it;
-	 * output_edr: a panel shows the PQ content as EDR, edr_sent: swaps
-	 * still carry EDR state the firmware must be told to drop.
+	 * output_hdr: any non-SDR EOTF (PQ/HLG/HDR-gamma); output_edr: a panel
+	 * shows the PQ content as EDR, edr_sent: swaps still carry EDR state
+	 * the firmware must be told to drop.
 	 */
+	struct dcp_color_request color_req;
+	struct dcp_color_mode active_color;
 	bool pq_requested;
 	bool output_pq;
+	bool output_hdr;
 	bool output_edr;
 	bool edr_sent;
 	/*
@@ -847,6 +900,12 @@ struct apple_dcp {
 	struct delayed_work secure_poll_wq;
 	/* Stopped and not restarted, which outlives a suspend that gets refused. */
 	bool s2r_fw_down;
+	/*
+	 * Its last system suspend left the firmware running and its domains on
+	 * (wakeup path), see dcp_sleep_keeps_firmware(). Cleared by the next
+	 * suspend and resume.
+	 */
+	bool sleep_fw_runs;
 	/* DCPEXT kept down through a dark wake, see dcp_s2r_dark_finish(). */
 	bool s2r_dark_held;
 	struct notifier_block s2r_pm_nb;
@@ -880,6 +939,8 @@ struct apple_dcp {
 
 	/* clear all surfaces on init */
 	bool surfaces_cleared;
+	bool boot_surface_pending;
+	bool boot_scanout_reserved;
 
 	/* enable CRC calculation */
 	bool crc_enabled;
@@ -961,6 +1022,10 @@ struct apple_dcp {
 
 	/* V27 sleep: the panel's next mode set is the mode it already has */
 	bool v27_keep_mode;
+	/* Since the V27 wake: the panel's video interface opened, firmware reported the panel */
+	struct completion v27_wake_video, v27_wake_hotplug;
+#define V27_WAKE_VIDEO_MS	1500
+#define V27_WAKE_HOTPLUG_MS	250
 	/* V27 sleep: the output area of the call being pushed holds this (an in/out word) */
 	const void *push_out_prefill;
 
@@ -992,6 +1057,11 @@ struct apple_dcp {
 	 * Activate/Deactivate belong to it until its answer is in.
 	 */
 	bool t8132_release_late;
+	/*
+	 * T8132 dcpext: its display was released and its route parked for a
+	 * deep sleep (dcp_t8132_sleep_release()), to be connected again after it.
+	 */
+	bool t8132_sleep_released;
 	/* DPTX feeds a Thunderbolt DP IN adapter, not the Type-C PHY lanes */
 	bool dptx_tunnel;
 	/* DFP port in the DPTX target: 0 = dpphy, 1 = dpin0, 2 = dpin1 */
@@ -1163,7 +1233,21 @@ struct apple_dcp {
 	struct dcp_desktop_state *desktop;
 	/* Internal panel identity; NULL without an internal panel. */
 	struct dcp_panel_identity *panel_identity;
+	struct dcp_cec *cec;
 };
+
+/* A DCP driven through the firmware's iBoot interface alone. */
+static inline bool dcp_is_iboot(const struct apple_dcp *dcp)
+{
+	return dcp->fw_compat == DCP_FIRMWARE_IBOOT;
+}
+
+struct apple_rtkit_shmem;
+/* The common RTKit shared memory hooks, for a processor with its own RTKit ops. */
+int dcp_rtk_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr);
+void dcp_rtk_shmem_destroy(void *cookie, struct apple_rtkit_shmem *bfr);
+/* Keep a session that cannot be stopped, its DMA and this driver until reboot. */
+int dcp_retain_live_session(struct apple_dcp *dcp);
 
 /* T8132 firmware uses its own wire codec, with the common DRM/KMS owner. */
 static inline bool iomfb_is_m4(const struct apple_dcp *dcp)
@@ -1294,6 +1378,18 @@ static inline void dcp_takeover_adopt_proven(struct apple_dcp *dcp)
 		WRITE_ONCE(dcp->desktop->takeover_adopted, false);
 }
 
+/*
+ * Firmware interfaces whose swaps carry EDR, i.e. that the driver's EDR path
+ * implements (dcp_edr_prepare()): desktop 26.x and firmware 27.  This is the
+ * interface ABI, not the panel: whether a panel has EDR headroom comes from
+ * its ADT (dcp_panel_edr()).
+ */
+static inline bool dcp_fw_swap_has_edr(struct apple_dcp *dcp)
+{
+	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
+	       dcp->fw_compat == DCP_FIRMWARE_V_27_0;
+}
+
 static inline bool dcp_vrr_live(struct apple_dcp *dcp)
 {
 	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && dcp->main_display &&
@@ -1332,12 +1428,20 @@ static inline bool dcp_is_v14_7_external(const struct apple_dcp *dcp)
 }
 
 /*
- * Firmware 27's external processors (the T6050 DCPEXTs): their DP/HDMI
- * audio service is the desktop one, on endpoint 0x2b (see av.c).
+ * Firmware 27's external processors with its own DPTX endpoint layout (the
+ * T6050 and firmware-27 T6041 DCPEXTs, ports on DPTX_ENDPOINT_V2): their
+ * DP/HDMI audio service is the desktop one, on endpoint 0x2b (see av.c).
+ *
+ * A firmware-27 DCP on the classic layout (the T8112 DCPs, whose 27.2
+ * firmware advertises its ports on DPTX_ENDPOINT, dcp_v27_dptx_layout())
+ * has the classic audio service on AV_ENDPOINT: there 0x2b is HDCP only.
+ * The layout is read as set at probe, so that the DP audio driver, which
+ * binds before the DCP starts, sees the same role as the DCP.
  */
 static inline bool dcp_is_v27_external(const struct apple_dcp *dcp)
 {
-	return dcp->fw_compat == DCP_FIRMWARE_V_27_0 && dcp->hw.num_dptx_ports;
+	return dcp->fw_compat == DCP_FIRMWARE_V_27_0 && dcp->hw.num_dptx_ports &&
+	       dcp->hw.dptx_endpoint == DPTX_ENDPOINT_V2;
 }
 
 /* The 14.7 internal panel (J514S/J516S), presented through DCPLink. */

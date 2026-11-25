@@ -9,10 +9,34 @@
 #include <linux/compiler_types.h>
 #include <linux/errno.h>
 #include <linux/kconfig.h>
+#include <linux/of.h>
 #include <linux/types.h>
 
 struct device;
-struct device_node;
+struct resource;
+
+/*
+ * A T6050 machine whose device tree describes the firmware-driven sleep. What a
+ * driver does for that sleep follows the description, not a list of boards.
+ * With @prop: the description also has that property.
+ */
+static inline bool apple_t6050_sleep_property(const char *prop)
+{
+	struct device_node *np;
+	bool ret;
+
+	if (!of_machine_is_compatible("apple,t6050"))
+		return false;
+	np = of_find_compatible_node(NULL, NULL, "apple,t6050-sleep");
+	ret = np && of_device_is_available(np) && (!prop || of_property_read_bool(np, prop));
+	of_node_put(np);
+	return ret;
+}
+
+static inline bool apple_t6050_sleep_described(void)
+{
+	return apple_t6050_sleep_property(NULL);
+}
 
 /* The SMC's sleep messages: the pmVC value and the spacings between them, used as floors */
 struct apple_sleep_smc_policy {
@@ -32,6 +56,11 @@ struct apple_sleep_smc_saved_ops {
 	int (*commit_notice)(void *data, u64 *sent, u64 *ack);
 	int (*late_notice)(void *data, u64 *sent, u64 *ack);
 	int (*end)(void *data);
+	/*
+	 * Optional, right after a clean .end at the platform wake, before the SoC's PMU wake steps:
+	 * the SMC's first wake commands (its wake record, waka).
+	 */
+	void (*woken)(void *data);
 	/* Optional, after the irreversible stops: pmVC alone, before late_notice (which then skips it). */
 	int (*pmvc)(void *data);
 };
@@ -251,6 +280,18 @@ void apple_sleep_restore_pins(void);
  * sleep engine's PMGR reset of its own domains, its DARTs kept. The caller starts it after.
  */
 int apple_sleep_engine_reset(struct device *dev);
+
+/*
+ * Watchdog handoff over a firmware-driven suspend. Between .begin and .end the
+ * sleep driver owns WD2 as its suspend/resume safety net; at .end it clears WD2
+ * and invokes @restore so a watchdog driver sharing that WD2 block can re-arm
+ * its active timer. Registration matches @wdt against any available sleep node's
+ * "wdt" region; watchdogs without a matching sleep node return 0 without registering.
+ */
+int apple_sleep_wdt_register(struct device *dev, const struct resource *wdt,
+			     void (*restore)(void *data), void *data);
+void apple_sleep_wdt_unregister(struct device *dev);
+bool apple_sleep_wdt_active(struct device *dev);
 #else
 static inline const struct apple_sleep_smc_policy *apple_sleep_smc_policy(void) { return NULL; }
 static inline bool apple_sleep_smc_defer_notice(void) { return false; }
@@ -457,6 +498,21 @@ static inline void apple_sleep_restore_pins(void)
 static inline int apple_sleep_engine_reset(struct device *dev)
 {
 	return -EOPNOTSUPP;
+}
+
+static inline int apple_sleep_wdt_register(struct device *dev, const struct resource *wdt,
+					   void (*restore)(void *data), void *data)
+{
+	return 0;
+}
+
+static inline void apple_sleep_wdt_unregister(struct device *dev)
+{
+}
+
+static inline bool apple_sleep_wdt_active(struct device *dev)
+{
+	return false;
 }
 #endif
 
