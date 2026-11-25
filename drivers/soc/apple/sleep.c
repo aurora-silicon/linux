@@ -1685,6 +1685,89 @@ bool apple_sleep_coproc_stopped(struct device *dev)
 }
 EXPORT_SYMBOL_GPL(apple_sleep_coproc_stopped);
 
+/*
+ * The general-purpose PCIe host's driver, once registered, and its report for the sleep
+ * under way: .begin opens the sleep with none, .end closes it and drops the report.
+ */
+static struct {
+	struct device *dev;
+	unsigned int ready;
+	bool open;
+} apple_sleep_gp_host;
+static DEFINE_MUTEX(apple_sleep_gp_host_lock);
+
+/* Whether an available sleep controller names @np as its apple,pcie-host */
+static bool sleep_names_pcie_host(const struct device_node *np)
+{
+	struct device_node *sleep;
+
+	for_each_node_with_property(sleep, "apple,pcie-host") {
+		struct device_node *host;
+		bool named;
+
+		if (!of_device_is_available(sleep))
+			continue;
+		host = of_parse_phandle(sleep, "apple,pcie-host", 0);
+		named = host && host == np;
+		of_node_put(host);
+		if (named) {
+			of_node_put(sleep);
+			return true;
+		}
+	}
+	return false;
+}
+
+/* From the tree alone, so that the host's driver may probe before this one */
+int apple_sleep_pcie_host_register(struct device *dev)
+{
+	if (!dev->of_node || !sleep_names_pcie_host(dev->of_node))
+		return -ENODEV;
+
+	guard(mutex)(&apple_sleep_gp_host_lock);
+	if (apple_sleep_gp_host.dev && apple_sleep_gp_host.dev != dev)
+		return -EBUSY;
+	WRITE_ONCE(apple_sleep_gp_host.ready, 0);
+	WRITE_ONCE(apple_sleep_gp_host.dev, dev);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_sleep_pcie_host_register);
+
+void apple_sleep_pcie_host_unregister(struct device *dev)
+{
+	guard(mutex)(&apple_sleep_gp_host_lock);
+	if (apple_sleep_gp_host.dev != dev)
+		return;
+	WRITE_ONCE(apple_sleep_gp_host.ready, 0);
+	WRITE_ONCE(apple_sleep_gp_host.dev, NULL);
+}
+EXPORT_SYMBOL_GPL(apple_sleep_pcie_host_unregister);
+
+void apple_sleep_pcie_host_set_ready(struct device *dev, unsigned int ready)
+{
+	guard(mutex)(&apple_sleep_gp_host_lock);
+	if (apple_sleep_gp_host.dev != dev)
+		return;
+	/* Made outside a sleep, it would count for the next: it counts for none. */
+	WRITE_ONCE(apple_sleep_gp_host.ready, apple_sleep_gp_host.open ? ready : 0);
+}
+EXPORT_SYMBOL_GPL(apple_sleep_pcie_host_set_ready);
+
+static void apple_sleep_gp_host_open(bool open)
+{
+	guard(mutex)(&apple_sleep_gp_host_lock);
+	apple_sleep_gp_host.open = open;
+	WRITE_ONCE(apple_sleep_gp_host.ready, 0);
+}
+
+/* At the refusal, with interrupts off: what the driver bound to @host reported for this sleep */
+static unsigned int apple_sleep_gp_host_ready(struct device *host)
+{
+	if (READ_ONCE(apple_sleep_gp_host.dev) != host)
+		return 0;
+	return READ_ONCE(apple_sleep_gp_host.ready);
+}
+
 static bool apple_sleep_external_commit;
 
 void apple_sleep_set_commit_stops_coprocs(bool enable)
@@ -3485,6 +3568,58 @@ static void sleep_wake_masks(struct apple_sleep *s, u32 *val)
 		sleep_wake_unmask(s, val, s->wake_enable[i]);
 }
 
+/*
+ * The GP host, whatever its domain reads at this moment: it comes back cold after a real sleep
+ * (the t5 trace). Only apple,pcie-host says which host that is: without it, or with no device
+ * behind it, a bound host whose domain reads off at this moment would pass. A driver bound to
+ * it must have stopped it for this sleep and, for one that commits, be able to set it up again
+ * from power-off; its domain may then still be on, for the commit to take, as macOS's does.
+ * Unbound, it refuses with its domain on.
+ */
+static bool apple_sleep_refuse_gp_host(struct apple_sleep *s)
+{
+	bool dry = s->soc->untested && !READ_ONCE(sleep_untested_commit);
+	struct platform_device *host;
+	bool refused = false;
+	unsigned int ready;
+
+	if (!s->gp_host_np) {
+		dev_err(s->dev, "refused: no apple,pcie-host names the PCIe host on APCIE_SYS_GP\n");
+		return true;
+	}
+	host = of_find_device_by_node(s->gp_host_np);
+	if (!host) {
+		dev_err(s->dev, "refused: %pOF, the PCIe host on APCIE_SYS_GP, has no device\n",
+			s->gp_host_np);
+		return true;
+	}
+
+	if (!READ_ONCE(host->dev.driver)) {
+		if (sleep_ps_on(s, s->soc->ps.apcie_sys_gp)) {
+			dev_err(s->dev, "refused: the PCIe host on APCIE_SYS_GP is on with no driver to stop it\n");
+			refused = true;
+		}
+		goto out;
+	}
+	ready = apple_sleep_gp_host_ready(&host->dev);
+	if (!(ready & APPLE_SLEEP_PCIE_HOST_RETAINED)) {
+		dev_err(s->dev, "refused: %s holds the PCIe host on APCIE_SYS_GP and hasn't stopped it for this sleep\n",
+			dev_name(&host->dev));
+		refused = true;
+	} else if (!dry && !(ready & APPLE_SLEEP_PCIE_HOST_COLD)) {
+		dev_err(s->dev, "refused: %s can't set the PCIe host on APCIE_SYS_GP up again after a real sleep\n",
+			dev_name(&host->dev));
+		refused = true;
+	} else {
+		dev_info(s->dev, "%s stopped the PCIe host on APCIE_SYS_GP for this sleep%s\n",
+			 dev_name(&host->dev), ready & APPLE_SLEEP_PCIE_HOST_COLD ?
+			 ", and can set it up again from power-off" : "");
+	}
+out:
+	put_device(&host->dev);
+	return refused;
+}
+
 /* The last checks, then the stray words lowered: what has stopped may not return until a wake. */
 /*
  * Where APCIE_SYS_GP is the general-purpose PCIe host's own, ANS and that host answer
@@ -3505,35 +3640,8 @@ static bool apple_sleep_refuse_ans_gp(struct apple_sleep *s, bool idled)
 		dev_err(s->dev, "refused: ANS is on with no driver to stop it\n");
 		refused = true;
 	}
-	/* No driver of that host has a qualified stop and restore of its port yet. */
-	if (sleep_ps_on(s, d->apcie_sys_gp)) {
-		dev_err(s->dev, "refused: the PCIe host on APCIE_SYS_GP is on with no driver to stop it\n");
+	if (apple_sleep_refuse_gp_host(s))
 		refused = true;
-	}
-	/*
-	 * Bound, it refuses whatever its domain reads at this moment: the host comes back cold
-	 * after a real sleep (the t5 trace), and no driver of it restores that yet. Only
-	 * apple,pcie-host says which host that is: without it, or with no device behind it, a
-	 * bound host whose domain reads off at this moment would pass.
-	 */
-	if (!s->gp_host_np) {
-		dev_err(s->dev, "refused: no apple,pcie-host names the PCIe host on APCIE_SYS_GP\n");
-		refused = true;
-	} else {
-		struct platform_device *host = of_find_device_by_node(s->gp_host_np);
-
-		if (!host) {
-			dev_err(s->dev, "refused: %pOF, the PCIe host on APCIE_SYS_GP, has no device\n",
-				s->gp_host_np);
-			refused = true;
-		} else if (READ_ONCE(host->dev.driver)) {
-			dev_err(s->dev, "refused: %s is bound to the PCIe host on APCIE_SYS_GP, with no qualified stop\n",
-				dev_name(&host->dev));
-			refused = true;
-		}
-		if (host)
-			put_device(&host->dev);
-	}
 	return refused;
 }
 
@@ -6868,12 +6976,15 @@ static int apple_sleep_begin(suspend_state_t state)
 	}
 	pm_set_suspend_via_firmware();
 	sleep_ans_late_open();
+	/* The GP PCIe host's report counts for this sleep alone. */
+	apple_sleep_gp_host_open(true);
 
 	return 0;
 }
 
 static void apple_sleep_end(void)
 {
+	apple_sleep_gp_host_open(false);
 	WRITE_ONCE(sleep_deep_requested, false);
 	sleep_ans_late_release(true);
 	sleep_v27_scope_end();

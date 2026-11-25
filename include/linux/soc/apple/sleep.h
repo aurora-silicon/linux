@@ -6,6 +6,7 @@
 #ifndef _LINUX_SOC_APPLE_SLEEP_H_
 #define _LINUX_SOC_APPLE_SLEEP_H_
 
+#include <linux/bits.h>
 #include <linux/compiler_types.h>
 #include <linux/errno.h>
 #include <linux/kconfig.h>
@@ -82,6 +83,21 @@ struct apple_sleep_smc_saved_ops {
 	/* Optional, after the irreversible stops: pmVC alone, before late_notice (which then skips it). */
 	int (*pmvc)(void *data);
 };
+
+/*
+ * The general-purpose PCIe host that a sleep controller names (apple,pcie-host, T6030). While
+ * a driver is bound to it, a deep sleep is refused unless that driver has reported the host
+ * ready for the sleep under way, which .begin starts with no report and .end ends:
+ *  - APPLE_SLEEP_PCIE_HOST_RETAINED: the functions' DMA has stopped and what a refused sleep
+ *    needs to reopen the host is saved (the ports, their routes and interrupts, the
+ *    functions, the DARTs), with its power, PERST# and links still up;
+ *  - APPLE_SLEEP_PCIE_HOST_COLD: the host can also be set up again from power-off, which a
+ *    sleep that commits needs.
+ * The register call says whether the sleep controller names @dev; a report of 0 takes the
+ * last one back.
+ */
+#define APPLE_SLEEP_PCIE_HOST_RETAINED	BIT(0)
+#define APPLE_SLEEP_PCIE_HOST_COLD	BIT(1)
 
 #if IS_ENABLED(CONFIG_APPLE_SOC_SLEEP)
 const struct apple_sleep_smc_policy *apple_sleep_smc_policy(void);
@@ -291,6 +307,11 @@ void apple_sleep_radio_port_wake(unsigned int step);
 
 /* T6050: from its noirq resume: 0 once the root complex runs again; else nothing there is read. */
 int apple_sleep_radio_rc_ready(void);
+
+/* The general-purpose PCIe host's readiness (APPLE_SLEEP_PCIE_HOST_*) */
+int apple_sleep_pcie_host_register(struct device *dev);
+void apple_sleep_pcie_host_unregister(struct device *dev);
+void apple_sleep_pcie_host_set_ready(struct device *dev, unsigned int ready);
 
 /*
  * T6050: whether the last sleep entry, refused, switched the power word of @pd (a power
@@ -534,6 +555,19 @@ static inline void apple_sleep_radio_port_wake(unsigned int step)
 static inline int apple_sleep_radio_rc_ready(void)
 {
 	return 0;
+}
+
+static inline int apple_sleep_pcie_host_register(struct device *dev)
+{
+	return -ENODEV;
+}
+
+static inline void apple_sleep_pcie_host_unregister(struct device *dev)
+{
+}
+
+static inline void apple_sleep_pcie_host_set_ready(struct device *dev, unsigned int ready)
+{
 }
 
 static inline bool apple_sleep_refusal_cycled(struct device_node *pd)
