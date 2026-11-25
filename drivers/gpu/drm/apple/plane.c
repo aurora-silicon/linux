@@ -3,11 +3,14 @@
  * Copyright (C) The Asahi Linux Contributors
  */
 
+#include <drm/drm_atomic_uapi.h>
+
 #include "plane.h"
 #include "dcp.h"
 
 #include "dcp.h"
 #include "dcp-internal.h"
+#include "dcp-indicator.h"
 #include "iomfb_internal.h"
 
 #include "iomfb_plane.h"
@@ -236,6 +239,40 @@ static int apple_plane_atomic_check(struct drm_plane *plane,
 
 	new_plane_state = drm_atomic_get_new_plane_state(commit, plane);
 
+	if (to_apple_plane(plane)->indicator) {
+		struct drm_plane_state *old = drm_atomic_get_old_plane_state(commit, plane);
+		struct drm_crtc_state *old_crtc_new = old->crtc ?
+			drm_atomic_get_new_crtc_state(commit, old->crtc) : NULL;
+
+		switch (dcp_ind_plane_check(old, new_plane_state, old_crtc_new,
+					    commit == READ_ONCE(to_apple_plane(plane)->indicator_commit),
+					    &dcp_indicator_fb_funcs)) {
+		case DCP_IND_PLANE_REJECT:
+			return -EINVAL;
+		case DCP_IND_PLANE_RESTORE: {
+			int ret = drm_atomic_set_crtc_for_plane(new_plane_state, old->crtc);
+
+			if (ret)
+				return ret;
+			drm_atomic_set_fb_for_plane(new_plane_state, old->fb);
+			new_plane_state->crtc_x = old->crtc_x;
+			new_plane_state->crtc_y = old->crtc_y;
+			new_plane_state->crtc_w = old->crtc_w;
+			new_plane_state->crtc_h = old->crtc_h;
+			new_plane_state->src_x = old->src_x;
+			new_plane_state->src_y = old->src_y;
+			new_plane_state->src_w = old->src_w;
+			new_plane_state->src_h = old->src_h;
+			new_plane_state->alpha = old->alpha;
+			new_plane_state->pixel_blend_mode = old->pixel_blend_mode;
+			new_plane_state->rotation = old->rotation;
+			break;
+		}
+		case DCP_IND_PLANE_PASS:
+			break;
+		}
+	}
+
 	if (!new_plane_state->crtc)
 		return 0;
 
@@ -459,13 +496,13 @@ static void apple_plane_atomic_update(struct drm_plane *plane,
 	}
 
 	/*
-	 * DCP doesn't support XBGR8 / XRGB8 / XBGR2101010 natively. Blending as
+	 * DCP doesn't support XBGR8 / XRGB8 / XRGB2101010 natively. Blending as
 	 * pre-multiplied alpha with a black background can be used as
 	 * workaround for the bottommost plane.
 	 */
 	if (fmt->format == DRM_FORMAT_XRGB8888 ||
 	    fmt->format == DRM_FORMAT_XBGR8888 ||
-	    fmt->format == DRM_FORMAT_XBGR2101010 ||
+	    fmt->format == DRM_FORMAT_XRGB2101010 ||
 	    base->pixel_blend_mode == DRM_MODE_BLEND_PREMULTI)
 		is_premultiplied = true;
 
@@ -618,7 +655,7 @@ static const struct drm_plane_helper_funcs apple_plane_helper_funcs = {
 // Duplicate drm_atomic_helper_plane_reset but allocate struct apple_plane_state
 static void apple_plane_reset(struct drm_plane *plane)
 {
-        struct apple_plane_state *state = to_apple_plane_state(plane->state);
+	struct apple_plane_state *state = to_apple_plane_state(plane->state);
 	if (state) {
 		apple_plane_cleanup_fb(plane, &state->base);
 		__drm_atomic_helper_plane_destroy_state(&state->base);
@@ -634,17 +671,17 @@ static void apple_plane_reset(struct drm_plane *plane)
 static struct drm_plane_state *
 apple_plane_duplicate_state(struct drm_plane *plane)
 {
-        struct apple_plane_state *apple_plane_state, *old_apple_plane_state;
+	struct apple_plane_state *apple_plane_state, *old_apple_plane_state;
 
 	if (!plane->state)
 		return NULL;
 
-        old_apple_plane_state = to_apple_plane_state(plane->state);
-        apple_plane_state = kzalloc(sizeof(*apple_plane_state), GFP_KERNEL);
-        if (!apple_plane_state)
-                return NULL;
+	old_apple_plane_state = to_apple_plane_state(plane->state);
+	apple_plane_state = kzalloc(sizeof(*apple_plane_state), GFP_KERNEL);
+	if (!apple_plane_state)
+		return NULL;
 
-        __drm_atomic_helper_plane_duplicate_state(plane, &apple_plane_state->base);
+	__drm_atomic_helper_plane_duplicate_state(plane, &apple_plane_state->base);
 
 	apple_plane_state->surf = old_apple_plane_state->surf;
 	apple_plane_state->src_rect = old_apple_plane_state->src_rect;
