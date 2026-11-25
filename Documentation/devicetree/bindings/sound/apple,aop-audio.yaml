@@ -20,6 +20,8 @@ description: |
 select:
   properties:
     compatible:
+      minItems: 1
+      maxItems: 2
       items:
         - enum:
             - apple,t6000-aop-audio
@@ -29,6 +31,7 @@ select:
             - apple,t8103-aop-audio
             - apple,t8112-aop-audio
             - apple,t8122-aop-audio
+      additionalItems: true
   required:
     - compatible
 
