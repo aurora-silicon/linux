@@ -589,9 +589,9 @@ pub(crate) fn thermal_hot_param() -> (u64, bool) {
 
 /// Whether to start the runtime backend on a T8122 (`asahi.m3_backend`), and say why not.
 ///
-/// The runtime starts only on the boards the T8122 table allows (the M3 MacBook Airs), with
-/// `auto` and `runtime` alike: it has not run on any T8122, so nothing forces it onto another
-/// board. The G15 manager backend is T6030-only.
+/// The runtime starts only where the boot loader handed the GPU over
+/// (`m3_board::handed_over`), with `auto` and `runtime` alike: nothing forces it onto a GPU
+/// that was not handed over. The G15 manager backend is T6030-only.
 pub(crate) fn t8122_backend(pdev: &platform::Device<Core<'_>>) -> bool {
     let dev = pdev.as_ref();
     match M3_BACKEND.load(Ordering::Relaxed) {
@@ -606,11 +606,11 @@ pub(crate) fn t8122_backend(pdev: &platform::Device<Core<'_>>) -> bool {
             );
             false
         }
-        _ if crate::m3::m3_board::runtime_validated_board(&crate::m3::m3_soc::T8122) => true,
+        _ if crate::m3::m3_board::handed_over(dev) => true,
         _ => {
             dev_info!(
                 dev,
-                "M3: no GPU backend on this T8122 board: the runtime backend may start only on the M3 MacBook Airs (J613, J615)\n"
+                "M3: no GPU backend: the boot loader did not hand the GPU over (no firmware segment description on the GPU node)\n"
             );
             false
         }
