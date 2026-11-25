@@ -61,6 +61,59 @@
 		#address-cells = <2>;
 		#size-cells = <0>;
 
+		/*
+		 * Three clusters: E (6 cores), P (2) and M (4); P and M share a
+		 * performance domain. capacity-dmips-mhz is single-thread work per
+		 * MHz relative to a P core, from integer, compression and sort
+		 * loops at each cluster's top P-state.
+		 */
+		cpu-map {
+			cluster0 {
+				core0 {
+					cpu = <&cpu0>;
+				};
+				core1 {
+					cpu = <&cpu1>;
+				};
+				core2 {
+					cpu = <&cpu2>;
+				};
+				core3 {
+					cpu = <&cpu3>;
+				};
+				core4 {
+					cpu = <&cpu4>;
+				};
+				core5 {
+					cpu = <&cpu5>;
+				};
+			};
+
+			cluster1 {
+				core0 {
+					cpu = <&cpu6>;
+				};
+				core1 {
+					cpu = <&cpu7>;
+				};
+			};
+
+			cluster2 {
+				core0 {
+					cpu = <&cpu8>;
+				};
+				core1 {
+					cpu = <&cpu9>;
+				};
+				core2 {
+					cpu = <&cpu10>;
+				};
+				core3 {
+					cpu = <&cpu11>;
+				};
+			};
+		};
+
 		cpu0: cpu@0 {
 			compatible = "apple,t8152-e";
 			device_type = "cpu";
@@ -68,7 +121,9 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
 			operating-points-v2 = <&m6_e_opp>;
+			capacity-dmips-mhz = <800>;
 			performance-domains = <&m6_e_cpufreq>;
+			#cooling-cells = <2>;
 		};
 
 		cpu1: cpu@1 {
@@ -78,7 +133,9 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
 			operating-points-v2 = <&m6_e_opp>;
+			capacity-dmips-mhz = <800>;
 			performance-domains = <&m6_e_cpufreq>;
+			#cooling-cells = <2>;
 		};
 
 		cpu2: cpu@2 {
@@ -88,7 +145,9 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
 			operating-points-v2 = <&m6_e_opp>;
+			capacity-dmips-mhz = <800>;
 			performance-domains = <&m6_e_cpufreq>;
+			#cooling-cells = <2>;
 		};
 
 		cpu3: cpu@3 {
@@ -98,7 +157,9 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
 			operating-points-v2 = <&m6_e_opp>;
+			capacity-dmips-mhz = <800>;
 			performance-domains = <&m6_e_cpufreq>;
+			#cooling-cells = <2>;
 		};
 
 		cpu4: cpu@4 {
@@ -108,7 +169,9 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
 			operating-points-v2 = <&m6_e_opp>;
+			capacity-dmips-mhz = <800>;
 			performance-domains = <&m6_e_cpufreq>;
+			#cooling-cells = <2>;
 		};
 
 		cpu5: cpu@5 {
@@ -118,7 +181,9 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
 			operating-points-v2 = <&m6_e_opp>;
+			capacity-dmips-mhz = <800>;
 			performance-domains = <&m6_e_cpufreq>;
+			#cooling-cells = <2>;
 		};
 
 		cpu6: cpu@10100 {
@@ -128,7 +193,9 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
 			operating-points-v2 = <&m6_pm_opp>;
+			capacity-dmips-mhz = <1024>;
 			performance-domains = <&m6_pm_cpufreq>;
+			#cooling-cells = <2>;
 		};
 
 		cpu7: cpu@10101 {
@@ -138,7 +205,9 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
 			operating-points-v2 = <&m6_pm_opp>;
+			capacity-dmips-mhz = <1024>;
 			performance-domains = <&m6_pm_cpufreq>;
+			#cooling-cells = <2>;
 		};
 
 		cpu8: cpu@40102 {
@@ -148,7 +217,9 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
 			operating-points-v2 = <&m6_pm_opp>;
+			capacity-dmips-mhz = <819>;
 			performance-domains = <&m6_pm_cpufreq>;
+			#cooling-cells = <2>;
 		};
 
 		cpu9: cpu@40103 {
@@ -158,7 +229,9 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
 			operating-points-v2 = <&m6_pm_opp>;
+			capacity-dmips-mhz = <819>;
 			performance-domains = <&m6_pm_cpufreq>;
+			#cooling-cells = <2>;
 		};
 
 		cpu10: cpu@40104 {
@@ -168,7 +241,9 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
 			operating-points-v2 = <&m6_pm_opp>;
+			capacity-dmips-mhz = <819>;
 			performance-domains = <&m6_pm_cpufreq>;
+			#cooling-cells = <2>;
 		};
 
 		cpu11: cpu@40105 {
@@ -178,7 +253,9 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
 			operating-points-v2 = <&m6_pm_opp>;
+			capacity-dmips-mhz = <819>;
 			performance-domains = <&m6_pm_cpufreq>;
+			#cooling-cells = <2>;
 		};
 	};
 
@@ -193,6 +270,26 @@
 			opp-hz = /bits/ 64 <1152000000>;
 			opp-level = <3>;
 		};
+		opp-1584000000 {
+			opp-hz = /bits/ 64 <1584000000>;
+			opp-level = <4>;
+		};
+		opp-1980000000 {
+			opp-hz = /bits/ 64 <1980000000>;
+			opp-level = <5>;
+		};
+		opp-2304000000 {
+			opp-hz = /bits/ 64 <2304000000>;
+			opp-level = <6>;
+		};
+		opp-2640000000 {
+			opp-hz = /bits/ 64 <2640000000>;
+			opp-level = <7>;
+		};
+		opp-2940000000 {
+			opp-hz = /bits/ 64 <2940000000>;
+			opp-level = <8>;
+		};
 	};
 	m6_pm_opp: opp-table-pm {
 		compatible = "operating-points-v2";
@@ -204,6 +301,78 @@
 		opp-1728000000 {
 			opp-hz = /bits/ 64 <1728000000>;
 			opp-level = <3>;
+		};
+		opp-2040000000 {
+			opp-hz = /bits/ 64 <2040000000>;
+			opp-level = <4>;
+		};
+		opp-2340000000 {
+			opp-hz = /bits/ 64 <2340000000>;
+			opp-level = <5>;
+		};
+		opp-2640000000 {
+			opp-hz = /bits/ 64 <2640000000>;
+			opp-level = <6>;
+		};
+		opp-2940000000 {
+			opp-hz = /bits/ 64 <2940000000>;
+			opp-level = <7>;
+		};
+		opp-3216000000 {
+			opp-hz = /bits/ 64 <3216000000>;
+			opp-level = <8>;
+		};
+		opp-3468000000 {
+			opp-hz = /bits/ 64 <3468000000>;
+			opp-level = <9>;
+		};
+		opp-3696000000 {
+			opp-hz = /bits/ 64 <3696000000>;
+			opp-level = <10>;
+		};
+		opp-3924000000 {
+			opp-hz = /bits/ 64 <3924000000>;
+			opp-level = <11>;
+		};
+		opp-4092000000 {
+			opp-hz = /bits/ 64 <4092000000>;
+			opp-level = <12>;
+		};
+		opp-4272000000 {
+			opp-hz = /bits/ 64 <4272000000>;
+			opp-level = <13>;
+		};
+		opp-4416000000 {
+			opp-hz = /bits/ 64 <4416000000>;
+			opp-level = <14>;
+		};
+		opp-4476000000 {
+			opp-hz = /bits/ 64 <4476000000>;
+			opp-level = <15>;
+		};
+		opp-4512000000 {
+			opp-hz = /bits/ 64 <4512000000>;
+			opp-level = <16>;
+		};
+		opp-4536000000 {
+			opp-hz = /bits/ 64 <4536000000>;
+			opp-level = <17>;
+		};
+		opp-4584000000 {
+			opp-hz = /bits/ 64 <4584000000>;
+			opp-level = <18>;
+		};
+		opp-4644000000 {
+			opp-hz = /bits/ 64 <4644000000>;
+			opp-level = <19>;
+		};
+		opp-4692000000 {
+			opp-hz = /bits/ 64 <4692000000>;
+			opp-level = <20>;
+		};
+		opp-4788000000 {
+			opp-hz = /bits/ 64 <4788000000>;
+			opp-level = <21>;
 		};
 	};
 
@@ -332,9 +501,9 @@
 						   "boot_error_count", "panic_count";
 			};
 
-			hwmon {
+			m6_smc_hwmon: hwmon {
 				compatible = "apple,smc-hwmon";
-				apple,discover-temperatures;
+				#thermal-sensor-cells = <1>;
 
 				fan-F0Ac {
 					apple,key-id = "F0Ac";
@@ -504,3 +673,5 @@
 #include "t8152-j873-audio.dtsi"
 #include "t8152-j873-dcp.dtsi"
 #include "t8152-j873-avd.dtsi"
+#include "t8152-j873-thermal.dtsi"
+#include "t8152-j873-usb4.dtsi"

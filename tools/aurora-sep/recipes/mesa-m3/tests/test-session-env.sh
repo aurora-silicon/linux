@@ -10,6 +10,9 @@ T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
 fail=0
 UID_=$(id -u)
+# The shell this suite runs under, for the cases that must exercise it.
+TSH=sh
+[ -z "${BASH_VERSION:-}" ] || TSH=bash
 
 mkdir -p "$T/bin" "$T/home"
 # journalctl, as the hook calls it (the whole kernel log of this boot):
@@ -36,6 +39,7 @@ verdictok) normal; echo "asahi 292400000.gpu: M3 G15G verdict: firmware-running:
 g15g) normal; echo "asahi 292400000.gpu: M3 G15G: firmware crashed, retained crashlog bytes=4096" ;;
 noperm) : ;;
 error) echo "Failed to open journal: Permission denied" >&2; exit 1 ;;
+stall) sleep 60; normal ;;
 esac
 exit 0
 J
@@ -664,6 +668,246 @@ mkdir -p "$J516S/etc/mesa-m3"
 echo j613-25g83-hal200 > "$J516S/etc/mesa-m3/t8122-profile"
 expect "$J516S" profile-mismatch J613
 rm "$J516S/etc/mesa-m3/t8122-profile"
+
+
+# System Mesa handoff: opt-out must not strand a qualified native /usr
+# installation in software rendering. Every failed admission retains recovery.
+# The helper is a stub here; its real board/renderer/provenance tests are separate.
+system_root() {
+	case "$2" in
+	air) _hd="apple,j613 apple,t8122"; _hg=$G15G ;;
+	*) _hd="apple,j516s apple,t6030"; _hg=$G15S ;;
+	esac
+	_hr=$(mkroot "handoff-$1" "$_hd" "$_hg" yes 1 yes "${3:-asahi}")
+	mkdir -p "$_hr/etc/mesa-m3"
+	: > "$_hr/etc/mesa-m3/disable"
+	cat > "$_hr/opt/mesa-m3/libexec/mesa-m3-system-check" <<'H'
+#!/bin/sh
+here=${0%/*}
+printf '%s\n' "$@" > "$here/system-check.args"
+env | sort > "$here/system-check.env"
+[ ! -e "$here/system-check.sleep" ] || sleep 8
+[ ! -e "$here/system-check.fail" ]
+H
+	chmod +x "$_hr/opt/mesa-m3/libexec/mesa-m3-system-check"
+	# The bounded admission sources the installed hook again in its own sh.
+	cp "$ENVFILE" "$_hr/opt/mesa-m3/libexec/mesa-m3-session-env"
+	echo "$_hr"
+}
+handoff() { # ROOT FALLBACK HELPER_CALLED [VAR=value...]
+	_hr=$1 _hfb=$2 _hc=$3
+	shift 3
+	rm -f "$_hr/opt/mesa-m3/libexec/system-check.args"
+	_ha="$_hr$T/home/.local/state/mesa-m3/attempt"
+	_hbefore=missing
+	[ ! -f "$_ha" ] || _hbefore=$(sha256sum "$_ha" | cut -d' ' -f1)
+	_ho=$(env -i PATH="$T/bin:/usr/bin:/bin" HOME="$T/home" FAKE_LOG="$T/log" \
+		XDG_CURRENT_DESKTOP=Hyprland "$@" "$TSH" -c '
+		MESA_M3_SESSION_ENV_NO_RUN=1 . "$1"
+		mesa_m3_session_env "$2"
+		printf "software=%s\nmarker=%s\nlegacy=%s\n" "${LIBGL_ALWAYS_SOFTWARE:-}" "${MESA_M3_FALLBACK:-}" "${MESA_M3_SESSION:-}"
+		cat "$2/run/user/$(id -u)/mesa-m3-session.state"
+	' sh "$ENVFILE" "$_hr")
+	_hafter=missing
+	[ ! -f "$_ha" ] || _hafter=$(sha256sum "$_ha" | cut -d' ' -f1)
+	_hcalled=no
+	[ ! -e "$_hr/opt/mesa-m3/libexec/system-check.args" ] || _hcalled=yes
+	if printf '%s\n' "$_ho" | grep -qx "fallback=$_hfb" &&
+		printf '%s\n' "$_ho" | grep -qx 'decision=inactive' &&
+		printf '%s\n' "$_ho" | grep -qx 'reason=opt-out' &&
+		printf '%s\n' "$_ho" | grep -qx 'legacy=' &&
+		[ "$_hc" = "$_hcalled" ] && [ "$_hbefore" = "$_hafter" ]; then
+		echo "ok    ${_hr##*/}: fallback=$_hfb helper=$_hc, legacy attempt unchanged"
+	else
+		echo "FAIL  ${_hr##*/}: want fallback=$_hfb helper=$_hc; got helper=$_hcalled attempt=$_hbefore/$_hafter: $_ho"
+		fail=1
+	fi
+	if [ "$_hfb" = none ]; then
+		if ! printf '%s\n' "$_ho" | grep -qx 'software=' ||
+			! printf '%s\n' "$_ho" | grep -qx 'marker=' ||
+			! printf '%s\n' "$_ho" | grep -q 'detail=.*system Mesa on /usr admits'; then
+			echo "FAIL  ${_hr##*/}: system admission exports or state detail: $_ho"; fail=1
+		fi
+	else
+		if ! printf '%s\n' "$_ho" | grep -qx 'software=1' ||
+			! printf '%s\n' "$_ho" | grep -qx 'marker=software' ||
+			printf '%s\n' "$_ho" | grep -q 'detail=.*system Mesa on /usr admits'; then
+			echo "FAIL  ${_hr##*/}: recovery exports or state detail: $_ho"; fail=1
+		fi
+	fi
+}
+HRA=$(system_root user-optout air)
+rm "$HRA/etc/mesa-m3/disable"
+mkdir -p "$HRA$T/home/.config/mesa-m3"
+: > "$HRA$T/home/.config/mesa-m3/disable"
+handoff "$HRA" none yes
+if [ "$(cat "$HRA/opt/mesa-m3/libexec/system-check.args")" = "$(printf '/dev/dri/renderD128\nt8122')" ] &&
+	grep -qx 'PATH=/usr/bin:/bin' "$HRA/opt/mesa-m3/libexec/system-check.env" &&
+	[ -z "$(grep -vE '^(PATH=/usr/bin:/bin|PWD=.*|SHLVL=[0-9]+|_=.*)$' "$HRA/opt/mesa-m3/libexec/system-check.env")" ]; then
+	echo 'ok    handoff: helper receives exact device/SoC and empty selector environment'
+else echo 'FAIL  handoff: helper argv/environment'; fail=1; fi
+HRP=$(system_root root-optout pro)
+handoff "$HRP" none yes
+# The 7.3 kernels name the GPU driver "aurora" ("asahi" is only a module alias).
+# The admission accepts it on both SoCs.
+for soc in air pro; do
+	HR=$(system_root "aurora-$soc" "$soc" aurora)
+	handoff "$HR" none yes
+done
+# On "aurora" the system Mesa is not refused, so no session falls back to
+# software there: not a failed admission, not the default T8122 session
+# (experimental), not a T6030 the /opt/mesa-m3 profile cannot use. A driver
+# that only starts with "aurora" is not admitted.
+aurora_state() { # NAME ROOT WANT_REASON
+	_ao=$(env -i PATH="$T/bin:/usr/bin:/bin" HOME="$T/home" FAKE_LOG="$T/log" \
+		XDG_CURRENT_DESKTOP=Hyprland "$TSH" -c '
+		MESA_M3_SESSION_ENV_NO_RUN=1 . "$1"
+		mesa_m3_session_env "$2"
+		printf "software=%s\nmarker=%s\n" "${LIBGL_ALWAYS_SOFTWARE:-}" "${MESA_M3_FALLBACK:-}"
+		cat "$2/run/user/$(id -u)/mesa-m3-session.state"
+	' sh "$ENVFILE" "$2")
+	if printf '%s\n' "$_ao" | grep -qx 'fallback=none' &&
+		printf '%s\n' "$_ao" | grep -qx 'software=' &&
+		printf '%s\n' "$_ao" | grep -qx 'decision=inactive' &&
+		printf '%s\n' "$_ao" | grep -qx "reason=$3" &&
+		! printf '%s\n' "$_ao" | grep -q 'detail=.*system Mesa on /usr admits'; then
+		echo "ok    $1: reason=$3 fallback=none, nothing exported"
+	else
+		echo "FAIL  $1: want reason=$3 fallback=none and no admission: $_ao"; fail=1
+	fi
+}
+HR=$(system_root aurora-probe-fail pro aurora)
+: > "$HR/opt/mesa-m3/libexec/system-check.fail"
+aurora_state aurora-probe-fail "$HR" opt-out
+HR=$(system_root aurora-x pro aurora-x)
+aurora_state aurora-x "$HR" opt-out
+HR=$(mkroot aurora-default-air "apple,j613 apple,t8122" "$G15G" yes 1 yes aurora)
+aurora_state aurora-default-air "$HR" experimental
+HR=$(mkroot aurora-default-pro "apple,j516s apple,t6030" "$G15S" yes 1 yes aurora)
+aurora_state aurora-default-pro "$HR" no-gpu
+# A kernel built with the native G15 backend binds the T6030 to that backend's
+# own driver: "asahi-g15" on 7.2, "aurora-g15" on 7.3. The admission accepts
+# both, a failed admission there does not fall back to software, and neither
+# does the default session. A near-miss name is not admitted.
+for drv in asahi-g15 aurora-g15; do
+	HR=$(system_root "$drv" pro "$drv")
+	handoff "$HR" none yes
+	HR=$(system_root "$drv-probe-fail" pro "$drv")
+	: > "$HR/opt/mesa-m3/libexec/system-check.fail"
+	aurora_state "$drv-probe-fail" "$HR" opt-out
+	HR=$(mkroot "$drv-default-pro" "apple,j516s apple,t6030" "$G15S" yes 1 yes "$drv")
+	aurora_state "$drv-default-pro" "$HR" no-gpu
+done
+HR=$(system_root asahi-g15x pro asahi-g15x)
+aurora_state asahi-g15x "$HR" opt-out
+handoff "$HRP" none yes LIBGL_ALWAYS_SOFTWARE=1 MESA_M3_FALLBACK=software
+for mode in fail sleep; do
+	HR=$(system_root "probe-$mode" pro)
+	: > "$HR/opt/mesa-m3/libexec/system-check.$mode"
+	handoff "$HR" software yes
+done
+for mode in missing not-executable; do
+	HR=$(system_root "probe-$mode" pro)
+	if [ "$mode" = missing ]; then rm "$HR/opt/mesa-m3/libexec/mesa-m3-system-check";
+	else chmod 600 "$HR/opt/mesa-m3/libexec/mesa-m3-system-check"; fi
+	handoff "$HR" software no
+done
+for mode in missing-cmdline missing-detector; do
+	HR=$(system_root "$mode" pro)
+	if [ "$mode" = missing-cmdline ]; then rm "$HR/proc/cmdline";
+	else rm "$HR/opt/mesa-m3/libexec/mesa-m3-user-setup"; fi
+	handoff "$HR" software no
+done
+for flag in mesa_m3=off nomodeset; do
+	HR=$(system_root "kernel-$flag" pro)
+	echo "root=UUID=x rw $flag quiet" > "$HR/proc/cmdline"
+	handoff "$HR" software no
+done
+for journal in noperm error match bank dcp g15g verdict; do
+	HR=$(system_root "journal-$journal" pro)
+	handoff "$HR" software no FAKE_JOURNAL="$journal"
+done
+# Any single board of the SoC reaches the helper, which decides on the GPU.
+HR=$(system_root board-j615 air)
+nul apple,j615 apple,t8122 > "$HR/proc/device-tree/compatible"
+handoff "$HR" none yes
+HR=$(system_root board-j504 air)
+nul apple,j504 apple,t8122 > "$HR/proc/device-tree/compatible"
+handoff "$HR" none yes
+HR=$(system_root board-j514s pro)
+nul apple,j514s apple,t6030 > "$HR/proc/device-tree/compatible"
+handoff "$HR" none yes
+# Two boards, two SoCs or no board stay refused. Without a board table the
+# hook cannot tell which SoC a board belongs to; the GPU and display checks
+# are keyed on the SoC compatible instead.
+for dt in 'apple,j613 apple,j615 apple,t8122' 'apple,t6030' \
+	'apple,j516s apple,t6030 apple,t8122'; do
+	HR=$(system_root "board-$(printf '%s' "$dt" | tr ' ,' '--')" pro)
+	nul $dt > "$HR/proc/device-tree/compatible"
+	# Match the GPU to the ambiguous board's first SoC so the old fallback
+	# remains observable; the system handoff must still refuse it.
+	case "$dt" in *t8122*) nul apple,agx-t8122 apple,agx-t6030 > "$HR/sys/devices/platform/gpu0/of_node/compatible" ;; esac
+	handoff "$HR" software no
+done
+HR=$(system_root no-display pro)
+rm "$HR/sys/class/drm/card2/device"
+handoff "$HR" software no
+HR=$(system_root wrong-display pro)
+nul apple,t8122-display-subsystem > "$HR/sys/devices/platform/display/of_node/compatible"
+handoff "$HR" software no
+HR=$(system_root two-nodes pro)
+mkdir "$HR/sys/class/drm/renderD129"
+handoff "$HR" software no
+for variable in LIBGL_ALWAYS_SOFTWARE=1 \
+	LD_LIBRARY_PATH=/opt/mesa-m3/lib \
+	VK_DRIVER_FILES=/opt/mesa-m3/share/vulkan/icd.d/asahi_icd.aarch64.json \
+	__EGL_VENDOR_LIBRARY_FILENAMES=/opt/mesa-m3/share/glvnd/egl_vendor.d/50_mesa.json \
+	ASAHI_M3_EXPERIMENTAL=1 XDG_CURRENT_DESKTOP=chonkstep; do
+	HR=$(system_root "override-${variable%%=*}" pro)
+	handoff "$HR" software no "$variable"
+done
+for value in 'LIBGL_DRIVERS_PATH=/opt/mesa-m3/lib/dri' 'VK_DRIVER_FILES=$UNKNOWN' \
+	'export LIBGL_ALWAYS_SOFTWARE+=1' 'export LD_LIBRARY_PATH+=/opt/custom/lib'; do
+	HR=$(system_root "late-${value%%=*}" pro)
+	mkdir -p "$HR$T/home/.config/uwsm"
+	printf '%s\n' "$value" > "$HR$T/home/.config/uwsm/env"
+	handoff "$HR" software no
+done
+for variable in GBM_BACKEND=nvidia-drm MESA_GL_VERSION_OVERRIDE=4.6; do
+	HR=$(system_root "override-${variable%%=*}" pro)
+	handoff "$HR" software no "$variable"
+done
+HR=$(system_root no-installed-hook pro)
+rm "$HR/opt/mesa-m3/libexec/mesa-m3-session-env"
+handoff "$HR" software no
+# A stalled journal or scanner refuses within the bound (20 s, then 2 s to
+# kill) and keeps the software fallback, instead of holding the login.
+HR=$(system_root stalled-journal pro)
+_hstart=$(date +%s)
+handoff "$HR" software no FAKE_JOURNAL=stall
+_hspent=$(( $(date +%s) - _hstart ))
+if [ "$_hspent" -le 30 ]; then echo "ok    stalled-journal: refused after ${_hspent}s"
+else echo "FAIL  stalled-journal: took ${_hspent}s"; fail=1; fi
+HR=$(system_root stalled-detector pro)
+printf '#!/bin/sh\nsleep 60\n' > "$HR/opt/mesa-m3/libexec/mesa-m3-user-setup"
+_hstart=$(date +%s)
+handoff "$HR" software no
+_hspent=$(( $(date +%s) - _hstart ))
+if [ "$_hspent" -le 30 ]; then echo "ok    stalled-detector: refused after ${_hspent}s"
+else echo "FAIL  stalled-detector: took ${_hspent}s"; fail=1; fi
+HR=$(system_root failed-legacy-login pro)
+HATT="$HR$T/home/.local/state/mesa-m3/attempt"
+HOK="$HR$T/home/.local/state/mesa-m3/session-ok"
+mkdir -p "${HATT%/*}"
+printf 'schema=aurora.mesa-m3-attempt/2\nboot_id=boot-a\nsession_id=5\nhook_run_id=old-run\n' > "$HATT"
+handoff "$HR" software no
+printf 'schema=aurora.mesa-m3-session-ok/1\nboot_id=boot-a\nsession_id=wrong\nhook_run_id=old-run\n' > "$HOK"
+handoff "$HR" software no
+sed -i 's/session_id=wrong/session_id=5/' "$HOK"
+handoff "$HR" none yes
+rm "$HOK"
+sed -i 's/boot_id=boot-a/boot_id=old-boot/' "$HATT"
+handoff "$HR" none yes
 
 [ "$fail" = 0 ] && echo "ALL PASS" || echo "SOME FAILED"
 exit "$fail"
