@@ -2,6 +2,7 @@
 #ifndef __LINUX_SOC_APPLE_DART_H__
 #define __LINUX_SOC_APPLE_DART_H__
 
+#include <linux/bits.h>
 #include <linux/kconfig.h>
 #include <linux/errno.h>
 #include <linux/err.h>
@@ -178,6 +179,24 @@ static inline int apple_dart_fw_remote(struct device *dev, dma_addr_t iova, bool
 static inline int apple_dart_set_host_resumes(struct device *dev) { return -EOPNOTSUPP; }
 static inline int apple_dart_host_resume(struct device *dev) { return -EOPNOTSUPP; }
 static inline int apple_dart_host_restart(struct device *dev) { return -EOPNOTSUPP; }
+#endif
+
+/*
+ * The physical range behind a buffer a co-processor's firmware names, for a CPU mapping:
+ * contiguous over every IOMMU page it touches, in DRAM outside System RAM. The flags
+ * choose what resolves a DVA: Linux's own mappings, those the firmware kept, or both.
+ */
+#define APPLE_DART_FW_LINUX	BIT(0)
+#define APPLE_DART_FW_RETAINED	BIT(1)
+#if IS_REACHABLE(CONFIG_APPLE_DART)
+int apple_dart_fw_range(struct device *dev, dma_addr_t iova, size_t size,
+			unsigned int flags, phys_addr_t *phys);
+#else
+static inline int apple_dart_fw_range(struct device *dev, dma_addr_t iova, size_t size,
+				      unsigned int flags, phys_addr_t *phys)
+{
+	return -ENODEV;
+}
 #endif
 
 /* For a consumer whose firmware gates itself around a firmware-driven suspend. */

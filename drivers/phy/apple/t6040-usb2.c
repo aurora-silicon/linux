@@ -2009,6 +2009,8 @@ static int t6040_dp_validate(struct phy *phy, enum phy_mode mode, int submode,
 	return 0;
 }
 
+static int t6040_tun_rate_locked(struct t6040_usb2_phy *tphy, unsigned int dpin, u8 rate);
+
 static int t6040_dp_configure(struct phy *phy, union phy_configure_opts *opts_)
 {
 	struct t6040_usb2_phy *tphy = phy_get_drvdata(phy);
@@ -2017,6 +2019,13 @@ static int t6040_dp_configure(struct phy *phy, union phy_configure_opts *opts_)
 	int ret;
 
 	guard(mutex)(&tphy->lock);
+	/* A DP tunnel's pixel clock, PHY in CIO: see "DP tunnels" below. */
+	if (opts->set_tunnel_rate) {
+		if (opts->set_rate || opts->set_lanes || opts->set_voltages ||
+		    opts->tunnel_dpin > 1)
+			return -EINVAL;
+		return t6040_tun_rate_locked(tphy, opts->tunnel_dpin, opts->tunnel_rate);
+	}
 	if (!tphy->dp_up)
 		return -EINVAL;
 	if ((opts->set_lanes || opts->set_voltages) &&
@@ -2086,8 +2095,8 @@ static const struct phy_ops t6040_dp_phy_ops = {
  * whose select field divides it per link rate. DP IN adapter 0 is taken to
  * use PCLK1 and clock switch 1, adapter 1 PCLK2 and switch 2 (the PHY does
  * not choose: the index is the display controller's). Driven only by
- * appledrm through apple_atc_dp_tunnel_rate(), and only while the PHY is in
- * CIO.
+ * appledrm, through phy_configure() with the DP options' set_tunnel_rate
+ * (t6040_dp_configure()), and only while the PHY is in CIO.
  */
 #define T6040_CORE_RCAL1		0x804	/* AUS40CMN_DIG RCAL1 */
 #define T6040_CORE_RCAL1_DONE		BIT(0)
@@ -2167,7 +2176,8 @@ static void t6040_tun_pll_stop(struct t6040_usb2_phy *tphy)
 		dev_warn(tphy->dev, "DP tunnel: AUSPLL release timed out (cmd %#x, pclk status %#x)\n",
 			 readl(core + T6040_CORE_AUSPLL_CMD),
 			 readl(core + T6040_CORE_DP_PCLK_STATUS));
-	t6040_usb2_clear32(core + T6040_CORE_AUSPLL_CLKOUT_MASTER, 0x8);
+	/* Both outputs the start set: a stale 0x800 reads as "in use" next time. */
+	t6040_usb2_clear32(core + T6040_CORE_AUSPLL_CLKOUT_MASTER, 0x808);
 	tphy->tun_pll = false;
 }
 
@@ -2197,7 +2207,7 @@ static int t6040_tun_pll_start(struct t6040_usb2_phy *tphy)
 	t6040_usb2_set32(core + T6040_CORE_CMN_OVRD, 0x20);
 	udelay(1);
 	t6040_usb2_set32(core + T6040_CORE_CMN_BIAS, T6040_CORE_CMN_BIAS_BGBIAS_EN_OV);
-	usleep_range(15, 20);
+	udelay(15);
 	if (readl_poll_timeout(core + T6040_CORE_RCAL1, v, v & T6040_CORE_RCAL1_DONE, 1, 100))
 		dev_dbg(tphy->dev, "DP tunnel: RCAL not done (%#x)\n", v);
 
@@ -2210,10 +2220,15 @@ static int t6040_tun_pll_start(struct t6040_usb2_phy *tphy)
 	t6040_usb2_set32(core + T6040_CORE_AUSPLL_CLKOUT_MASTER, 0x808);
 	tphy->tun_pll = true;
 
+	/*
+	 * Toggle protocol, as in the stop: the request flips REQ and waits for
+	 * ACK to follow, whichever level a PHY reset left it at. The pixel
+	 * clock must lock either way.
+	 */
 	ack = readl(core + T6040_CORE_AUSPLL_CMD) & T6040_CORE_AUSPLL_CMD_ACK;
-	if (t6040_tun_pll_cmd(tphy, (ack ? 0 : T6040_CORE_AUSPLL_CMD_REQ) | 0x10000000, true) ||
+	if (t6040_tun_pll_cmd(tphy, (ack ? 0 : T6040_CORE_AUSPLL_CMD_REQ) | 0x10000000, !ack) ||
 	    readl_poll_timeout(core + T6040_CORE_DP_PCLK_STATUS, v,
-			       !!(v & T6040_CORE_DP_PCLK_STATUS_LOCK) == !ack,
+			       v & T6040_CORE_DP_PCLK_STATUS_LOCK,
 			       10, 500 * USEC_PER_MSEC) ||
 	    t6040_tun_pll_cmd(tphy, (ack ? T6040_CORE_AUSPLL_CMD_REQ : 0) | 0x10010000, ack)) {
 		dev_err(tphy->dev, "DP tunnel: AUSPLL did not lock (cmd %#x, pclk status %#x)\n",
@@ -2242,6 +2257,9 @@ static void t6040_tun_select_write(struct t6040_usb2_phy *tphy, unsigned int dpi
 	/* PCLK1 is DP IN 1's prerequisite at its own rate, unless DP IN 0 runs on it. */
 	if (dpin == 1 && !tphy->tun_rate[0])
 		t6040_tun_select_field(&v, &t6040_tun_pclk[0], sel, true);
+	/* Retuning DP IN 0 must not gate PCLK1 under a running DP IN 1. */
+	if (dpin == 0 && tphy->tun_rate[1])
+		v |= t6040_tun_pclk[0].en;
 	writel(v, ctrl0);
 	writel((v & ~T6040_CORE_TX_DP_CTRL0_ENABLES) | t6040_tun_enables(tphy), ctrl0);
 }
@@ -2295,8 +2313,7 @@ static void t6040_tun_stop_all_locked(struct t6040_usb2_phy *tphy)
 	dev_info(tphy->dev, "DP tunnel clocks off\n");
 }
 
-static int __maybe_unused t6040_tun_rate_locked(struct t6040_usb2_phy *tphy, unsigned int dpin,
-						u8 rate)
+static int t6040_tun_rate_locked(struct t6040_usb2_phy *tphy, unsigned int dpin, u8 rate)
 {
 	int sel, ret;
 	u8 old = tphy->tun_rate[dpin];
@@ -2340,10 +2357,11 @@ static int __maybe_unused t6040_tun_rate_locked(struct t6040_usb2_phy *tphy, uns
 	t6040_tun_select_write(tphy, dpin, sel);
 	/* DP IN 1 alone: switch 1 passes PCLK1, its prerequisite. */
 	if (dpin == 1 && !tphy->tun_rate[0] && !tphy->tun_pre) {
+		/* Owned before it is gated on, so a timeout below also releases it. */
+		tphy->tun_pre = true;
 		ret = t6040_tun_switch(tphy, 0, true);
 		if (ret)
 			goto switch_failed;
-		tphy->tun_pre = true;
 	} else if (dpin == 0) {
 		tphy->tun_pre = false;	/* DP IN 0 owns switch 1 again */
 	}
@@ -2361,26 +2379,6 @@ switch_failed:
 		 readl(t6040_core(tphy) + T6040_CORE_DP_PCLK_STATUS));
 	return 0;
 }
-
-/*
- * The dp-tunnel.h provider for appledrm, which looks it up with symbol_get()
- * and asks it before the ATC PHY's apple_atc_dp_tunnel_rate(): the names are
- * this driver's own, so a kernel can build both PHY drivers. There is no
- * open: the rate call does all of it, as on every SoC but t600x.
- */
-int apple_t6040_dp_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate)
-{
-	struct t6040_usb2_phy *tphy;
-
-	if (!phy || phy->ops != &t6040_dp_phy_ops)
-		return -ENODEV;
-	if (dpin > 1)
-		return -EINVAL;
-	tphy = phy_get_drvdata(phy);
-	guard(mutex)(&tphy->lock);
-	return t6040_tun_rate_locked(tphy, dpin, rate);
-}
-EXPORT_SYMBOL_GPL(apple_t6040_dp_tunnel_rate);
 
 /* ---- CIO: USB4/Thunderbolt (PHY mode 2) ----
  *
@@ -3186,6 +3184,12 @@ static int t6040_usb3_probe(struct t6040_usb2_phy *tphy, struct platform_device 
 	ret = devm_add_action_or_reset(dev, t6040_rtkit_cleanup, tphy);
 	if (ret)
 		return ret;
+	/*
+	 * Stop the transport after verifying the mailbox so it drops its
+	 * runtime-PM reference while the port is idle; the first attach
+	 * starts it again in t6040_usb3_cpu_start().
+	 */
+	t6040_rtkit_stop_transport(tphy);
 
 	ret = t6040_debugfs_init(tphy);
 	if (ret)

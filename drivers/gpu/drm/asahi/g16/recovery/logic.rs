@@ -19,19 +19,21 @@ pub(crate) const fn stamp_reached(obs: u32, own: u32, tail: u32) -> bool {
 /// `CONFIG_RUST_OVERFLOW_CHECKS`).
 #[allow(dead_code)]
 pub(crate) const fn ring_passed(c: u32, b: u32, h: u32, t: u32, m: u32) -> bool {
+    if m == 0 || c >= m || b >= m || h >= m || t >= m {
+        return false;
+    }
     let dc = c.wrapping_add(m).wrapping_sub(b) % m;
     let dh = h.wrapping_add(m).wrapping_sub(b) % m;
     let dt = t.wrapping_add(m).wrapping_sub(b) % m;
     dh <= dc && dc <= dt
 }
 
-/// FirmwareData words and affected-work snapshot geometry.
-pub(crate) const SNAPSHOT: usize = 0x40b8;
-pub(crate) const SNAPSHOT_ENTRIES: usize = 448;
-pub(crate) const GENERATION: usize = 0x4fa0;
-pub(crate) const PHASE: usize = 0x4fb0;
+// The FirmwareData words (phase, generation, affected-work snapshot) are per firmware ABI:
+// `fw::initdata::FirmwareData`.
 pub(crate) const RECOVERY_BUDGET_NS: u64 = 1_000_000_000;
 pub(crate) const EVENT_WAIT_NS: u64 = 50_000_000;
+/// Bounded wait before dismissing a trailing phase-0 recovery notification on an idle GPU.
+pub(crate) const PHANTOM_PHASE0_WAIT_NS: u64 = 50_000_000;
 pub(crate) const WINDOW_NS: u64 = 10_000_000_000;
 pub(crate) const WINDOW_LIMIT: u32 = 32;
 #[allow(dead_code)]
@@ -80,6 +82,17 @@ pub(crate) enum RecoveryAction {
     ProtocolError,
 }
 
+/// A type-4 or 0x16 notification drained after a completed recovery leaves phase at 0 with
+/// no flights in flight. Consume it after a short bounded wait instead of spinning to fail-stop.
+pub(crate) const fn phantom_phase0(
+    phase: u32,
+    answered: bool,
+    flights_empty: bool,
+    elapsed_ns: u64,
+) -> bool {
+    phase == 0 && !answered && flights_empty && elapsed_ns >= PHANTOM_PHASE0_WAIT_NS
+}
+
 /// Only the host writes phases 2 and 0; the firmware publishes phases 1 and 3.
 /// An acknowledged recovery may not return to phase 0 or start a new phase 1.
 pub(crate) fn action(phase: u32, answered: bool, generation_matches: bool) -> RecoveryAction {
@@ -89,6 +102,36 @@ pub(crate) fn action(phase: u32, answered: bool, generation_matches: bool) -> Re
         (2, true) => RecoveryAction::Wait,
         (3, true) if generation_matches => RecoveryAction::Resume,
         _ => RecoveryAction::ProtocolError,
+    }
+}
+
+/// Where a recovery that ran past [`RECOVERY_BUDGET_NS`] stopped, from the last phase the host
+/// read and whether the host had acknowledged phase 1 ([`action`]'s inputs).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Stall {
+    /// The firmware announced a recovery but never published phase 1.
+    NotHalted,
+    /// The firmware published phase 1 and the host had not acknowledged it.
+    NotAcknowledged,
+    /// The host acknowledged phase 1 and the firmware never published phase 3.
+    NotResumed,
+}
+
+impl Stall {
+    pub(crate) const fn of(phase: u32, answered: bool) -> Self {
+        match (phase, answered) {
+            (_, true) => Self::NotResumed,
+            (1, false) => Self::NotAcknowledged,
+            _ => Self::NotHalted,
+        }
+    }
+
+    pub(crate) const fn describe(self) -> &'static str {
+        match self {
+            Self::NotHalted => "firmware never halted in phase 1",
+            Self::NotAcknowledged => "phase 1 not acknowledged",
+            Self::NotResumed => "firmware never published phase 3",
+        }
     }
 }
 
@@ -113,15 +156,63 @@ impl SnapshotEntry {
     }
 }
 
-/// A late snapshot can name the last complete receipt even after its flight was removed.
-pub(crate) fn last_retired_target(last: &[Option<u32>; 3], event: u32, target: u32) -> bool {
-    let index = match event {
-        15 => 0,
-        0x70 => 1,
-        0x71 => 2,
-        _ => return false,
-    };
-    last[index] == Some(target)
+/// Bounded per-stage history of recently retired firmware stamps.
+pub(crate) const RETIRED_STAMPS_CAP: usize = 64;
+/// Number of compute pipes tracked by [`RetiredStamps`] (matches `hw::sizes::COMPUTE_PIPES`).
+pub(crate) const RETIRED_COMPUTE_PIPES: usize = 8;
+/// Total retired-stamp stages: compute pipes `0..RETIRED_COMPUTE_PIPES`, TA, FS.
+pub(crate) const RETIRED_STAGES: usize = RETIRED_COMPUTE_PIPES + 2;
+
+/// Bounded per-stage ring of recently retired compute pipe and TA/FS firmware stamps
+/// so a late recovery snapshot arriving after pipelined retirement resolves any recently
+/// retired member, not only the single newest flight.
+#[derive(Clone, Debug)]
+pub(crate) struct RetiredStamps {
+    stamps: [[u32; RETIRED_STAMPS_CAP]; RETIRED_STAGES],
+    len: [u8; RETIRED_STAGES],
+    next: [u8; RETIRED_STAGES],
+}
+
+impl RetiredStamps {
+    pub(crate) const fn new() -> Self {
+        Self {
+            stamps: [[0; RETIRED_STAMPS_CAP]; RETIRED_STAGES],
+            len: [0; RETIRED_STAGES],
+            next: [0; RETIRED_STAGES],
+        }
+    }
+
+    /// Initializes an uninitialized heap slot to the empty zero state without materializing a
+    /// multi-kilobyte temporary on the caller's stack.
+    #[allow(dead_code)]
+    pub(crate) fn init_zero(slot: &mut core::mem::MaybeUninit<Self>) {
+        // SAFETY: All fields of `RetiredStamps` are integer arrays for which all-zeroes is valid
+        // and identical to `RetiredStamps::new()`.
+        unsafe { core::ptr::write_bytes(slot.as_mut_ptr(), 0, 1) };
+    }
+
+    pub(crate) fn push(&mut self, stage: usize, target: u32) {
+        if stage >= RETIRED_STAGES {
+            return;
+        }
+        let idx = self.next[stage] as usize;
+        self.stamps[stage][idx] = target;
+        self.next[stage] = ((idx + 1) % RETIRED_STAMPS_CAP) as u8;
+        if (self.len[stage] as usize) < RETIRED_STAMPS_CAP {
+            self.len[stage] += 1;
+        }
+    }
+
+    pub(crate) fn contains(&self, event: u32, target: u32) -> bool {
+        let stage = match event {
+            e if (15..15 + RETIRED_COMPUTE_PIPES as u32).contains(&e) => (e - 15) as usize,
+            0x70 => RETIRED_COMPUTE_PIPES,
+            0x71 => RETIRED_COMPUTE_PIPES + 1,
+            _ => return false,
+        };
+        let len = self.len[stage] as usize;
+        self.stamps[stage][..len].contains(&target)
+    }
 }
 
 pub(crate) const fn expired(now: u64, deadline: u64) -> bool {
@@ -134,6 +225,67 @@ pub(crate) fn renew(now: u64, deadline_ms: u32, compute_deadline_ms: u32) -> (u6
         host_deadline(now, deadline_ms),
         host_deadline(now, compute_deadline_ms),
     )
+}
+
+/// Ray traversal and acceleration-structure builds can run past one administrative deadline
+/// (CTS stress). As on the M4 Pro (g17 `timeout::select`: two-second polls plus four extra
+/// ones), a job with such a command gets at least ten seconds per flight. Still bounded:
+/// this is an allowance, not evidence of GPU progress.
+pub(crate) const LONG_DEADLINE_MS: u32 = 10_000;
+
+/// The administrative deadline of a long job, ms: at least [`LONG_DEADLINE_MS`], unless the
+/// deadline is disabled (zero).
+pub(crate) const fn long_deadline_ms(milliseconds: u32) -> u32 {
+    if milliseconds == 0 || milliseconds >= LONG_DEADLINE_MS {
+        milliseconds
+    } else {
+        LONG_DEADLINE_MS
+    }
+}
+
+/// The four host deadlines renewed together: ordinary and compute-only, each plain and for a
+/// long job.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Deadlines {
+    pub(crate) any: u64,
+    pub(crate) compute: u64,
+    pub(crate) long_any: u64,
+    pub(crate) long_compute: u64,
+}
+
+impl Deadlines {
+    pub(crate) const EXPIRED: Self = Self {
+        any: EXPIRED,
+        compute: EXPIRED,
+        long_any: EXPIRED,
+        long_compute: EXPIRED,
+    };
+
+    /// All four from `now`.
+    pub(crate) fn renew(now: u64, deadline_ms: u32, compute_deadline_ms: u32) -> Self {
+        let (any, compute) = renew(now, deadline_ms, compute_deadline_ms);
+        let (long_any, long_compute) = renew(
+            now,
+            long_deadline_ms(deadline_ms),
+            long_deadline_ms(compute_deadline_ms),
+        );
+        Self {
+            any,
+            compute,
+            long_any,
+            long_compute,
+        }
+    }
+
+    /// The deadline of the oldest flight: compute-only or not, of a long job or not.
+    pub(crate) const fn select(&self, compute_only: bool, long: bool) -> u64 {
+        match (compute_only, long) {
+            (true, false) => self.compute,
+            (false, false) => self.any,
+            (true, true) => self.long_compute,
+            (false, true) => self.long_any,
+        }
+    }
 }
 
 /// Zero explicitly opts long-running work out of the host's administrative watchdog.
@@ -166,17 +318,33 @@ mod tests {
 
     #[test]
     fn late_snapshot_requires_exact_stage_target_and_real_full_receipt() {
-        assert!(!last_retired_target(&[None; 3], 0x70, 0));
-        let last = [Some(0x100), Some(0), Some(0x200)];
-        for (event, target) in [(15, 0x100), (0x70, 0), (0x71, 0x200)] {
-            assert!(last_retired_target(&last, event, target));
-            assert!(!last_retired_target(
-                &last,
-                event,
-                target.wrapping_add(0x100)
-            ));
+        let mut retired = RetiredStamps::new();
+        assert!(!retired.contains(0x70, 0));
+        retired.push(0, 0x100);
+        retired.push(1, 0x300);
+        retired.push(RETIRED_COMPUTE_PIPES - 1, 0x700);
+        retired.push(RETIRED_COMPUTE_PIPES, 0);
+        retired.push(RETIRED_COMPUTE_PIPES + 1, 0x200);
+        for (event, target) in [
+            (15, 0x100),
+            (16, 0x300),
+            (15 + RETIRED_COMPUTE_PIPES as u32 - 1, 0x700),
+            (0x70, 0),
+            (0x71, 0x200),
+        ] {
+            assert!(retired.contains(event, target));
+            assert!(!retired.contains(event, target.wrapping_add(0x100)));
         }
-        assert!(!last_retired_target(&last, 0x72, 0));
+        assert!(!retired.contains(0x72, 0));
+        // Pipelined bursts retain all recent stamps up to RETIRED_STAMPS_CAP and evict oldest.
+        let mut ring = RetiredStamps::new();
+        for i in 0..(RETIRED_STAMPS_CAP as u32 + 4) {
+            ring.push(0, (i + 1) << 8);
+        }
+        assert!(!ring.contains(15, 0x100));
+        assert!(!ring.contains(15, 0x400));
+        assert!(ring.contains(15, 0x500));
+        assert!(ring.contains(15, (RETIRED_STAMPS_CAP as u32 + 4) << 8));
     }
 
     #[test]
@@ -192,6 +360,24 @@ mod tests {
             assert_eq!(action(phase, false, true), RecoveryAction::ProtocolError);
         }
         assert_eq!(action(3, true, false), RecoveryAction::ProtocolError);
+    }
+
+    #[test]
+    fn budget_overrun_names_the_phase_that_never_arrived() {
+        // dcp103b: a type-4 event and its statistics arrived, then 1000 ms passed. Which side
+        // stalled follows from the last phase read and whether the host had answered.
+        assert_eq!(Stall::of(0, false), Stall::NotHalted);
+        assert_eq!(Stall::of(1, false), Stall::NotAcknowledged);
+        assert_eq!(Stall::of(2, true), Stall::NotResumed);
+        for phase in [3, 4, u32::MAX] {
+            assert_eq!(Stall::of(phase, false), Stall::NotHalted);
+        }
+        let all = [Stall::NotHalted, Stall::NotAcknowledged, Stall::NotResumed];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a.describe(), b.describe());
+            }
+        }
     }
 
     #[test]
@@ -227,8 +413,6 @@ mod tests {
                 .event,
             15
         );
-        assert_eq!(SNAPSHOT + SNAPSHOT_ENTRIES * 8, 0x4eb8);
-        assert!(SNAPSHOT + SNAPSHOT_ENTRIES * 8 <= GENERATION);
     }
 
     #[test]
@@ -246,12 +430,12 @@ mod tests {
 
     #[test]
     fn deadlines_are_absolute_and_do_not_wrap() {
-        assert_eq!(PHASE, 0x4fb0);
         let first_record_ns = 5_000_000_000;
         let deadline = first_record_ns + RECOVERY_BUDGET_NS;
         assert!(!expired(deadline, deadline));
         assert!(expired(deadline + 1, deadline));
         assert!(EVENT_WAIT_NS < RECOVERY_BUDGET_NS);
+        assert!(PHANTOM_PHASE0_WAIT_NS < RECOVERY_BUDGET_NS);
         assert!(ABORT_GRACE_NS < RECOVERY_BUDGET_NS);
         assert!(expired(1, EXPIRED));
         assert_eq!(renew(7, 5000, 1000), (5_000_000_007, 1_000_000_007));
@@ -292,6 +476,16 @@ mod tests {
     }
 
     #[test]
+    fn phantom_phase0_clears_only_idle_unanswered_phase0_after_wait() {
+        assert!(!phantom_phase0(0, false, true, PHANTOM_PHASE0_WAIT_NS - 1));
+        assert!(phantom_phase0(0, false, true, PHANTOM_PHASE0_WAIT_NS));
+        assert!(!phantom_phase0(0, false, false, PHANTOM_PHASE0_WAIT_NS));
+        assert!(!phantom_phase0(0, true, true, PHANTOM_PHASE0_WAIT_NS));
+        assert!(!phantom_phase0(1, false, true, PHANTOM_PHASE0_WAIT_NS));
+        assert!(!phantom_phase0(2, true, true, PHANTOM_PHASE0_WAIT_NS));
+    }
+
+    #[test]
     fn stamps_and_wrapping_receipts() {
         assert!(!stamp_reached(0, 0x100, 0x300));
         assert!(!stamp_reached(0x101, 0x100, 0x300));
@@ -300,6 +494,8 @@ mod tests {
         assert!(stamp_reached(0x100, 0xffff_ff00, 0x200));
         assert!(ring_passed(2, 0xfe, 1, 5, 256));
         assert!(!ring_passed(0xff, 0xfe, 1, 5, 256));
+        assert!(!ring_passed(256, 0, 1, 2, 256));
+        assert!(!ring_passed(257, 0, 1, 2, 256));
         assert!(!ring_passed(u32::MAX, 0, 1, 5, 256));
     }
 }

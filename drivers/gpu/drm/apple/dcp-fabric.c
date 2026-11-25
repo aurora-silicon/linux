@@ -459,28 +459,28 @@ bool dcp_is_typec_only(struct platform_device *pdev)
 }
 
 /*
- * The DP tunnel clock of @phy: T6040's Type-C PHY's, or else the ATC PHY's.
- * Each provider turns away the other's PHY, so a kernel can build both.
+ * Whether @phy's own PLL clocks the DP IN adapters of its USB4 router, so that
+ * the tunnel's pixel clock is set through phy_configure(), a property of the
+ * PHY: the T6040 ATC PHY (M4 Pro/Max, also on T6041) feeds DP IN 0 and 1 from
+ * its AUSPLL. Such a PHY also needs no apple_atc_dp_tunnel_open().
  */
+static bool dcp_phy_clocks_tunnel(struct phy *phy)
+{
+	return phy && of_device_is_compatible(phy->dev.of_node, "apple,t6040-atcphy");
+}
+
+/* Start the tunnel pixel clock of DP IN @dpin at link rate code @rate, or stop it (0). */
 static int dcp_phy_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate)
 {
-	typeof(apple_t6040_dp_tunnel_rate) *t6040;
-	typeof(apple_atc_dp_tunnel_rate) *atc;
-	int ret;
+	union phy_configure_opts opts = {
+		.dp = {
+			.set_tunnel_rate = 1,
+			.tunnel_dpin = dpin,
+			.tunnel_rate = rate,
+		},
+	};
 
-	t6040 = symbol_get(apple_t6040_dp_tunnel_rate);
-	if (t6040) {
-		ret = t6040(phy, dpin, rate);
-		symbol_put(apple_t6040_dp_tunnel_rate);
-		if (ret != -ENODEV)
-			return ret;
-	}
-	atc = symbol_get(apple_atc_dp_tunnel_rate);
-	if (!atc)
-		return -ENOENT;
-	ret = atc(phy, dpin, rate);
-	symbol_put(apple_atc_dp_tunnel_rate);
-	return ret;
+	return phy_configure(phy, &opts);
 }
 
 static int dcp_route_clock_rate(struct apple_dcp_typec_route *route,
@@ -506,6 +506,14 @@ static int dcp_route_clock_rate(struct apple_dcp_typec_route *route,
 		return ret;
 	}
 
+	/* A PHY whose own PLL feeds the DP IN pixel clocks takes the rate itself. */
+	if (dcp_phy_clocks_tunnel(phy)) {
+		ret = dcp_phy_tunnel_rate(phy, dpin, rate);
+		if (!ret)
+			route->tunnel_rate = rate;
+		return ret;
+	}
+
 	/* A T8132 dcpext names its source (2 or 4), as T6030 does. */
 	if (of_machine_is_compatible("apple,t6030") || t8132) {
 		typeof(apple_atc_dp_tunnel_rate_source) *fn;
@@ -523,7 +531,16 @@ static int dcp_route_clock_rate(struct apple_dcp_typec_route *route,
 		if (route->mux_index != 0)
 			return -ENOENT;
 	}
-	return dcp_phy_tunnel_rate(phy, dpin, rate);
+	{
+		typeof(apple_atc_dp_tunnel_rate) *fn;
+
+		fn = symbol_get(apple_atc_dp_tunnel_rate);
+		if (!fn)
+			return -ENOENT;
+		ret = fn(phy, dpin, rate);
+		symbol_put(apple_atc_dp_tunnel_rate);
+	}
+	return ret;
 }
 
 /*
@@ -547,6 +564,7 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route);
 static int dcp_dpxbar_preselect(struct mux_control *mux, int state);
 static bool dcp_xbar_t8142(struct mux_control *mux);
+static bool dcp_xbar_t6041(struct mux_control *mux);
 
 static int dcp_dpxbar_tunnel_select_source(struct mux_control *mux, int state)
 {
@@ -844,11 +862,13 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 			} else {
 				ret = dcp_dpxbar_preselect(route->active_xbar, MUX_IDLE_DISCONNECT);
 				/*
-				 * The T8142-layout crossbar writes an output only when it
-				 * is selected: one never selected is idle already.
+				 * The T8142-layout and runtime-PM T6041
+				 * crossbars write an output only when it is
+				 * selected: one never selected is idle already.
 				 */
 				if (ret == -EOPNOTSUPP &&
 				    (dcp_xbar_t8142(route->active_xbar) ||
+				     dcp_xbar_t6041(route->active_xbar) ||
 				     dcp_typec_route_no_dp_alt(route)))
 					ret = 0;
 			}
@@ -2297,17 +2317,27 @@ static bool dcp_xbar_t8142(struct mux_control *mux)
 					      "apple,t8142-display-crossbar");
 }
 
+/* The T6041-layout crossbar (one per ATC on T6040/T6041) */
+static bool dcp_xbar_t6041(struct mux_control *mux)
+{
+	return mux && of_device_is_compatible(mux->chip->dev.parent->of_node,
+					      "apple,t6041-display-crossbar");
+}
+
 /*
  * Tunnel routes whose crossbar must point the DP IN output at its pipeline
  * before the firmware uses AUX through it, i.e. from DCP's Activate: the T6030
- * 14.7 pipeline on its T602X crossbar (other T602X tunnels keep their order)
- * and firmware 27 on the T8142-layout crossbar. Selecting routes the output
- * only; its clocks follow the link.
+ * 14.7 pipeline on its T602X crossbar (other T602X tunnels keep their order),
+ * the T6041 crossbar on every firmware (its runtime-PM path only writes the
+ * mux while selected), and firmware 27 on the T8142-layout crossbar. Selecting
+ * routes the output only; its clocks follow the link.
  */
 static bool dcp_t602x_tunnel_route(struct apple_dcp_typec_route *route)
 {
 	if (!route || !route->tunnel || !route->active_xbar)
 		return false;
+	if (dcp_xbar_t6041(route->active_xbar))
+		return true;
 	if (route->dcp->fw_compat == DCP_FIRMWARE_V_27_0)
 		return dcp_xbar_t8142(route->active_xbar);
 	return route->dcp->fw_compat == DCP_FIRMWARE_V_14_7 &&
@@ -2367,6 +2397,9 @@ static void dcp_tunnel_prepare(struct apple_dcp_typec_route *route,
 	if (ret && ret != -EOPNOTSUPP)
 		dev_warn(dcp->dev, "DP tunnel crossbar preselect failed: %d\n", ret);
 
+	/* The clock call starts everything on a PHY that clocks the tunnel. */
+	if (dcp_phy_clocks_tunnel(dcp->phy))
+		return;
 	open = symbol_get(apple_atc_dp_tunnel_open);
 	if (!open)
 		return;
@@ -2415,6 +2448,12 @@ static int dcp_tunnel_split_up_locked(struct apple_dcp *dcp)
 		ret = mux_control_try_select(dcp->split.xbar, dcp->split.mux_state);
 		if (!ret)
 			dcp->split.xbar_up = true;
+		/*
+		 * T6041 DP IN selection reserves and routes the mux only, so
+		 * the first link up also enables the connection clocks.
+		 */
+		if (!ret && dcp_xbar_t6041(dcp->split.xbar))
+			ret = dcp_dpxbar_link(dcp->split.xbar, true);
 	} else {
 		ret = dcp_dpxbar_link(dcp->split.xbar, true);
 	}
@@ -2552,7 +2591,13 @@ int dcp_tunnel_crossbar_up(struct apple_dcp *dcp, u32 unit)
 		ret = mux_control_try_select(route->active_xbar, route->mux_index);
 		if (!ret)
 			route->xbar_up = true;
-		/* T602X DP IN selection reserves and routes the mux only. */
+		/*
+		 * T602X, T6041 and T8142 DP IN selection reserves and routes
+		 * the mux only, so the first link up also enables the
+		 * connection: without this its clocks stay off until a
+		 * retrain, and a mode set that keeps the trained link (5K on
+		 * 26.6) never gets any video.
+		 */
 		if (!ret && dcp_t602x_tunnel_route(route)) {
 			ret = dcp_tunnel_xbar_configure(route);
 			if (!ret)
@@ -2847,6 +2892,14 @@ int dcp_tunnel_dpin_activate(struct apple_dcp *dcp, u32 unit, bool active)
 	if (unit) {
 		if (!dcp->split.active || !dcp->split.generation || !dcp->split.set_active)
 			return 0;
+		if (active && dcp_xbar_t6041(dcp->split.xbar) &&
+		    !dcp->split.xbar_up) {
+			ret = mux_control_try_select(dcp->split.xbar,
+						     dcp->split.mux_state);
+			if (ret)
+				return ret;
+			dcp->split.xbar_up = true;
+		}
 		return dcp->split.set_active(dcp->split.binding, active);
 	}
 	/* Route the upstream engine before firmware begins AUX negotiation.
@@ -3188,8 +3241,19 @@ static int dcp_tb_split_teardown_locked(struct apple_dcp_typec_port *port,
 	scoped_guard(mutex, &dcp->tb_lock) {
 		/* Retire the callback before dropping its clock reference. */
 		dcp->split.active = false;
-		if (dcp->phy)
-			dcp_phy_tunnel_rate(dcp->phy, 1, 0);
+		if (dcp->phy) {
+			if (dcp_phy_clocks_tunnel(dcp->phy)) {
+				dcp_phy_tunnel_rate(dcp->phy, 1, 0);
+			} else {
+				typeof(apple_atc_dp_tunnel_rate) *stop =
+					symbol_get(apple_atc_dp_tunnel_rate);
+
+				if (stop) {
+					stop(dcp->phy, 1, 0);
+					symbol_put(apple_atc_dp_tunnel_rate);
+				}
+			}
+		}
 		if (dcp->split.xbar) {
 			if (dcp->split.xbar_up)
 				mux_control_deselect(dcp->split.xbar);

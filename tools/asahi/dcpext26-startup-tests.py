@@ -222,6 +222,11 @@ transport=pre+r'''
 #define current ((void *)1)
 #define dma_wmb() ((void)0)
 #define dma_rmb() ((void)0)
+#define smp_store_release(p,v) (*(p)=(v))
+#define smp_mb__before_atomic() ((void)0)
+typedef int atomic_t;
+#define atomic_inc(v) ((*(v))++)
+#define atomic_dec(v) ((*(v))--)
 #define trace_iomfb_push(...)
 #define IOMFB_METHOD(t,n) [n]={#n,{t[0],t[1],t[2],t[3]},{0},{0}}
 #define IOMFB_METHOD_H17(t,h,n) [n]={#n,{t[0],t[1],t[2],t[3]},{h[0],h[1],h[2],h[3]},{0}}
@@ -230,7 +235,7 @@ struct apple_dcp;typedef void (*dcp_callback_t)(struct apple_dcp *,void *,void *
 struct dcp_method_entry {const char *name;char tag[4],tag_h17g[4],tag_ext26[4];};
 '''
 transport+=block(ih,'enum dcp_context_id {')+'\n'+block(ih,'struct dcp_packet_header {')+'\n'+block(internal,'struct dcp_channel {')+'\n'+block(ih,'enum dcpep_method {')+r'''
-struct apple_dcp {const void *push_out_prefill;void *dev;u8 *shmem;int fw_compat;bool native,crashed,quiescing,ext26_blocked,ext26_power_sent;u64 ext26_power_ns;struct {int iomfb_method_profile;}hw;struct {void *owner;} iomfb;struct dcp_channel ch_cb,ch_cmd,ch_oobcb,ch_oobcmd,ch_async,ch_oobasync;};
+struct apple_dcp {const void *push_out_prefill;void *dev;u8 *shmem;int fw_compat;bool native,crashed,quiescing,ext26_blocked,ext26_power_sent;u64 ext26_power_ns;struct {int iomfb_method_profile;}hw;struct {void *owner;} iomfb;struct dcp_channel ch_cb,ch_cmd,ch_oobcb,ch_oobcmd,ch_async,ch_oobasync;atomic_t pending_acks;};
 static bool iomfb_uses_queue(struct apple_dcp *d){return true;}
 static bool dcp_is_ext26(struct apple_dcp *d){return d->native;}
 static bool dcp_fail_stop(struct apple_dcp *d){return d->native;}

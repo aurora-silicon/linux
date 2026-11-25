@@ -962,6 +962,12 @@ impl Queue {
             visit(active.packet.completion.status());
         }
     }
+    /// The context ID (UAT slot) of every in-flight packet.
+    pub(crate) fn visit_contexts(&self, visit: &mut dyn FnMut(u32)) {
+        for active in self.active.iter() {
+            visit(active.packet.context.id());
+        }
+    }
     /// A recovery record names this queue and the completion stamp of the
     /// command it interrupted, `kick << 8` like the queue's stamp. Without a
     /// stamp match the oldest published command is marked.
@@ -1038,6 +1044,18 @@ impl Queue {
         self.retired_by_teardown
             || self.retire_pending
             || masks.is_none_or(|m| m[self.qid() as usize / 64] & (1 << (self.qid() % 64)) != 0)
+    }
+
+    pub(crate) fn needs_scan_retire(&self, masks: Option<[u64; 2]>) -> bool {
+        self.configuration.is_some() || (!self.quarantined && self.selected(masks))
+    }
+
+    pub(crate) fn has_terminal(&self) -> bool {
+        self.terminal.is_some()
+    }
+
+    pub(crate) fn awaiting_witness(&self) -> bool {
+        self.awaiting_witness
     }
     /// Stage every unlatched exact identity before the device's single shared-ring scan,
     /// whichever queues the scan's batch retires.

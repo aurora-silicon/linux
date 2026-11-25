@@ -8,6 +8,32 @@ use core::sync::atomic::Ordering;
 use kernel::{prelude::*, sync::Arc};
 
 impl crate::g17::Firmware {
+    /// Whether `observe_renders` has any deferred settlement or in-flight render observation
+    /// pending. Pure compute passes can skip dropping and re-acquiring the device mutex when false.
+    pub(in crate::g17) fn render_observation_needed(&self) -> bool {
+        for slot in 1..self.queues.render.entries.len() {
+            let Some(entry) = self.queues.render.entries[slot].as_ref() else {
+                continue;
+            };
+            let Some(pair) = entry.pair.as_ref() else {
+                continue;
+            };
+            if entry.pending_error.is_some() || entry.pending_timeout || entry.closed {
+                return true;
+            }
+            if !self.recovery.pending()
+                && entry.preparing.is_none()
+                && !entry.growing
+                && pair.published_in_flight()
+                && (crate::g17::queue::render::completion_noted(pair.qids(), entry.event_masks)
+                    || pair.stamp_waiting())
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     /// The first slot from `start` whose pair has news to observe: published work in flight, the
     /// fragment queue's notification seen (`completion_noted`), and an observation the pair accepts.
     fn next_render_observation(&mut self, start: usize) -> Result<Option<usize>> {
@@ -83,7 +109,7 @@ impl crate::g17::Shared {
             let Some(firmware) = (*state).as_deref_mut() else {
                 return Ok(());
             };
-            firmware.queues.retain_render_completions(masks);
+            let _ = firmware.queues.retain_render_completions(masks);
             // Returned preparers can have deferred a VM failure or timeout.
             // Only this full worker collector runs their final observations.
             for slot in 1..firmware.queues.render.entries.len() {

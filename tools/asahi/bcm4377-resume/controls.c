@@ -108,24 +108,6 @@ int main(int argc,char **argv) {
 		recover(&b);
 		assert(rebind_count == 1);
 		break;
-	case 46:
-		/* Power lost in a real sleep: no resume command, a quiet rebind instead. */
-		assert(!bcm4377_suspend(&dev));
-		host_power_lost = true;
-		assert(!bcm4377_resume(&dev));
-		assert(power_rebinds == 1 && b.needs_reset && !b.quiesced && !b.resume_powered);
-		/* The close before the rebind owes no reset; without a rebind it does. */
-		bcm4377_hci_close(&h);
-		assert(!dev_warnings);
-		b.reset_pending = 0;
-		bcm4377_hci_close(&h);
-		assert(dev_warnings == 1);
-		/* not below a host whose ports kept their power */
-		host_power_lost = false;
-		assert(!bcm4377_suspend(&dev));
-		assert(!bcm4377_resume(&dev));
-		assert(power_rebinds == 1);
-		break;
  default:abort();
  }
 	if (atoi(argv[1]) == 6 || atoi(argv[1]) == 44 || atoi(argv[1]) == 45)

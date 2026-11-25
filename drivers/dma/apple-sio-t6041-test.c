@@ -265,6 +265,7 @@ static void sio_t6041_match_test(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, sio_hw_t8140.arrays, &sio_t6041_arrays);
 	KUNIT_EXPECT_TRUE(test, sio_hw_t8140.check_boot_tables == sio_t6041_check_boot_tables);
 	KUNIT_EXPECT_EQ(test, sio_hw_t6041.protocol, 10U);
+	KUNIT_EXPECT_TRUE(test, sio_hw_t6041.stop_at_commit);
 	KUNIT_EXPECT_TRUE(test, sio_hw_t6041.clear_period_desc);
 	KUNIT_EXPECT_PTR_EQ(test, sio_hw_t6041.arrays, &sio_t6041_arrays);
 	/* Protocol 10 alone is T6030's too, which keeps its own contract. */

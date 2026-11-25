@@ -3,7 +3,7 @@
 """Actual disconnect authority, DWC3 teardown and firmware resource admission."""
 from pathlib import Path
 import re
-from common import block, apple_function, internal_inline, atc_mux_without_pm, source_defines, ATC_POST_TUNABLE, tipd_pm_header, firmware_lineage, atc_restore_helpers, atc_cio_helpers
+from common import block, apple_function, internal_inline, atc_mux_without_pm, source_defines, ATC_POST_TUNABLE, tipd_pm_header, firmware_lineage, atc_restore_helpers, atc_cio_helpers, atc_cfg_helpers
 
 def disconnect(root):
     # Copyright 2026 Ryan Murray
@@ -795,6 +795,15 @@ int main(void)
                      'static bool dcp_tb_tunnel_withdrawn(struct apple_dcp *d, u32 port)\n'
                      '{ (void)d; (void)port; assert(!"tunnel watch in an H17P scenario"); return false; }\n' +
                      apple_function(root, 'dcp_dptx_wait_linkcfg'))
+    if 'dcp_assert_hpd_before_link_wait(' in raw:
+        # The HPD assertion before the link wait, as the driver has it. This scenario is a
+        # Type-C H17P link, so the fixed-HDMI branch is not taken.
+        swap(' bool hdmi_hpd;',
+             ' int fixed_connector_type; void *hdmi_hpd;')
+        firmware += ('static int __attribute__((unused)) gpiod_get_value_cansleep(void *gpio)\n'
+                     '{ (void)gpio; assert(!"fixed HDMI GPIO in a Type-C scenario"); return 0; }\n'
+                     '#ifndef DRM_MODE_CONNECTOR_HDMIA\n#define DRM_MODE_CONNECTOR_HDMIA 11\n#endif\n' +
+                     apple_function(root, 'dcp_assert_hpd_before_link_wait'))
     # unless the update work already needed the clock
     clock = 'static unsigned jiffies_to_msecs(unsigned long t) { return t; }\n'
     if clock in unit:
@@ -1182,7 +1191,7 @@ def teardown(root):
     names = {n: tuple(name for name in group if re.search(r'^(?:static [^\n]*\b|(?:int|void) )' + name + r'\(', files[n], re.M))
              for n, group in names.items()}
     context = (fn('atc', 'core_read32') + '\n' + fn('atc', 'atcphy_get_mode_config') + '\n' + fn('atc', 'j700_field_update') + '\n' + files['dp'][files['dp'].index('/* Masks are the union'):files['dp'].index('/* Retry only the idle operations')])
-    functions = atc_cio_helpers(files['atc']) + '\n\n'.join(fn(n, name) for n, group in names.items() for name in group)
+    functions = atc_cio_helpers(files['atc']) + atc_cfg_helpers(files['atc']) + '\n\n'.join(fn(n, name) for n, group in names.items() for name in group)
     definitions = []
     lines = iter(files['atc'].splitlines())
     for line in lines:

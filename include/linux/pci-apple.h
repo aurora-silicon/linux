@@ -30,19 +30,6 @@ void apple_pcie_tunnel_cio_lost(struct device *dev);
 int apple_pcie_tunnel_cio_finish(struct device *dev);
 
 /*
- * For the driver of endpoint @pdev in its resume: whether its host is one whose ports lose
- * their power in a firmware sleep, and this resume follows one.
- */
-#if IS_REACHABLE(CONFIG_PCIE_APPLE)
-bool apple_pcie_s2r_power_lost(struct pci_dev *pdev);
-#else
-static inline bool apple_pcie_s2r_power_lost(struct pci_dev *pdev)
-{
-	return false;
-}
-#endif
-
-/*
  * T6050, for the driver of the endpoint below root port @bridge. Whether the host gave the
  * endpoint its warm reset at this wake, before the link came up; and, for a link that never
  * went down, the port taken down, the reset given, the port brought up again. From the

@@ -19,6 +19,7 @@
 #include <linux/overflow.h>
 #include <linux/pm_runtime.h>
 #include <linux/slab.h>
+#include <linux/soc/apple/mcc.h>
 #include <linux/unaligned.h>
 
 #include <drm/drm_color_mgmt.h>
@@ -737,7 +738,7 @@ static u32 dcpep_cb_zero(struct apple_dcp *dcp)
 	return 0;
 }
 
-static void dcp_report_swap_complete(struct apple_dcp *dcp, u32 id, ktime_t now)
+static void dcp_report_swap_complete(struct apple_dcp *dcp, u32 id, ktime_t now, bool shown)
 {
 	bool retire = true;
 	if (dcp_is_ext26(dcp)) {
@@ -790,8 +791,18 @@ static void dcp_report_swap_complete(struct apple_dcp *dcp, u32 id, ktime_t now)
 		dcp->crashed = true;
 		return;
 	}
-	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
+		/* Only a displayed KMS swap that touched boot slot zero retires it. */
+		if (dcp->boot_surface_pending && shown && dcp->iomfb.next_scanout &&
+		    !iomfb_present_brightness_only_h17p(dcp) &&
+		    (DCP_FW_SWAP(dcp).swap.swap_enabled & BIT(0))) {
+			WRITE_ONCE(dcp->boot_surface_pending, false);
+			dev_info(dcp->dev, "boot scanout retired by displayed swap %u\n", id);
+			if (dcp->boot_scanout_reserved)
+				apple_mcc_boot_scanout_retired(dcp->dev->of_node);
+		}
 		retire = iomfb_present_complete_h17p(dcp);
+	}
 #endif
 #if DCP_FW_DESKTOP_26(DCP_FW_VER)
 	/* Late or duplicate completions cannot retire the replacement's flip. */
@@ -825,15 +836,17 @@ static void dcp_report_swap_complete(struct apple_dcp *dcp, u32 id, ktime_t now)
 }
 
 #if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
-struct dcp_peer_completion { u32 id; ktime_t time; };
+struct dcp_peer_completion { u32 id; ktime_t time; bool shown; };
+
 static void dcp_peer_report_on_owner(struct apple_dcp *owner, void *data, void *cookie)
 {
 	struct dcp_peer_completion *completion = data;
-	dcp_report_swap_complete(owner, completion->id, completion->time);
+	dcp_report_swap_complete(owner, completion->id, completion->time, completion->shown);
 }
-static void dcp_peer_queue_completion(struct apple_dcp *owner, u32 id, ktime_t time)
+
+static void dcp_peer_queue_completion(struct apple_dcp *owner, u32 id, ktime_t time, bool shown)
 {
-	struct dcp_peer_completion completion = { id, time };
+	struct dcp_peer_completion completion = { id, time, shown };
 	if (iomfb_queue_callback(owner, dcp_peer_report_on_owner, &completion,
 				 sizeof(completion), NULL)) {
 		WRITE_ONCE(owner->crashed, true);
@@ -848,10 +861,15 @@ static void dcpep_cb_swap_complete(struct apple_dcp *dcp,
 	ktime_t now = dcp_is_ext26(dcp) ? ns_to_ktime(dcp->ext26_rx_ns) : ktime_get();
 	trace_iomfb_swap_complete(dcp, resp->swap_id);
 #if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
-	if (dcp_peer_swap_complete_v27(dcp, resp->swap_id, now, dcp_peer_queue_completion))
+	if (dcp_peer_swap_complete_v27(dcp, resp->swap_id, now, resp->unkbool,
+				       dcp_peer_queue_completion))
 		return;
 #endif
-	dcp_report_swap_complete(dcp, resp->swap_id, now);
+#if DCP_FW_H17(DCP_FW_VER)
+	dcp_report_swap_complete(dcp, resp->swap_id, now, resp->unkbool);
+#else
+	dcp_report_swap_complete(dcp, resp->swap_id, now, false);
+#endif
 }
 
 /* special */
@@ -2555,6 +2573,7 @@ void DCP_FW_NAME(iomfb_poweron)(struct apple_dcp *dcp)
 	u32 handle;
 #endif
 	dev_info(dcp->dev, "dcp_poweron() starting\n");
+	WRITE_ONCE(dcp->pipe_off, false);
 #if DCP_FW_H17(DCP_FW_VER)
 	if (dcp_is_ext26(dcp))
 		return; /* Native26 publishes A473 only after a successful A413. */
@@ -3015,10 +3034,12 @@ close_client:
 		dev_dbg(dcp->dev,
 			"setPowerState(0) finished with %d ms to spare",
 			jiffies_to_msecs(ret));
-		if (dcp_power_stop_confirmed(poff_cookie))
+		if (dcp_power_stop_confirmed(poff_cookie)) {
 			dcp_release_all_retained_framebuffers(dcp);
-		else
+			WRITE_ONCE(dcp->pipe_off, true);
+		} else {
 			dev_warn(dcp->dev, "scanout stop was not confirmed\n");
+		}
 	}
 
 	kref_put(&poff_cookie->refcount, release_wait_cookie);
@@ -3282,6 +3303,12 @@ dcpep_cb_hotplug_v26_6(struct apple_dcp *dcp, struct dcp_hotplug_req_v26_6 *req)
 	/* The firmware shuts an external pipe down with its display. */
 	if (!dcp->main_display && !connected)
 		dcp->desktop->ext_pipe_off = true;
+
+	/* Signal T6041 S2R resume before dcpep_cb_hotplug() skips main_display. */
+	if (connected) {
+		dev_dbg(dcp->dev, "D575 hotplug connected=1\n");
+		complete(&dcp->s2r_hpd_done);
+	}
 
 	dcpep_cb_hotplug(dcp, &connected);
 
@@ -4359,6 +4386,21 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	keep_mode = dcp->v27_j714s && xchg(&dcp->v27_keep_mode, false) &&
 		    dcp->mode.color_mode_id == mode->color_mode_id &&
 		    dcp->mode.timing_mode_id == mode->timing_mode_id;
+	/*
+	 * Firmware 27.2: sent once the panel's video interface is open again and the firmware
+	 * has reported the panel, which it does after the open.
+	 */
+	if (keep_mode && iomfb_v27_methods_renumbered(dcp->v27_methods)) {
+		if (!wait_for_completion_timeout(&dcp->v27_wake_video,
+						 msecs_to_jiffies(V27_WAKE_VIDEO_MS)))
+			dev_warn(dcp->dev, "V27 wake: panel video interface not open after %u ms\n",
+				 V27_WAKE_VIDEO_MS);
+		else if (!wait_for_completion_timeout(&dcp->v27_wake_hotplug,
+						      msecs_to_jiffies(V27_WAKE_HOTPLUG_MS)))
+			dev_warn(dcp->dev, "V27 wake: no hotplug report %u ms after the panel's open\n",
+				 V27_WAKE_HOTPLUG_MS);
+		keep_mode = false;
+	}
 #endif
 	scoped_guard(spinlock_irqsave, &dcp->hdr.lock) {
 		dcp->mode = (struct dcp_set_digital_out_mode_req){
@@ -4685,9 +4727,21 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 #endif
 	}
 
+#if DCP_FW_H17(DCP_FW_VER)
+	/*
+	 * Keep sending an explicit slot-zero update until a displayed KMS
+	 * completion confirms the boot scanout has retired. An enabled primary
+	 * plane is pulled into the atomic commit by apple_atomic_check(); if
+	 * slot zero is still absent here, the primary plane is disabled and
+	 * slot zero should be cleared.
+	 */
+	if (dcp->boot_surface_pending && !(req->swap.swap_enabled & BIT(0)))
+		req->swap.swap_enabled |= BIT(0);
+#endif
+
 	if (!has_surface && !crtc_state->color_mgmt_changed) {
 		if (crtc_state->enable && crtc_state->active &&
-		    !crtc_state->planes_changed) {
+		    !crtc_state->planes_changed && !dcp->boot_surface_pending) {
 			schedule_work(&dcp->vblank_wq);
 			return;
 		}
@@ -4844,8 +4898,12 @@ static void res_max_panel_brightness(struct apple_dcp *dcp, void *out, void *coo
 {
 	u32 peak = out ? get_unaligned_le32(out) >> 16 : 0;
 
-	/* Only a peak above the SDR range gives EDR headroom. */
-	if (peak > dcp->brightness.maximum && peak <= 10000) {
+	/*
+	 * Only a panel with EDR headroom (the ADT's EDRPotentialHeadroom) and a
+	 * peak above the SDR range shows PQ content as EDR.
+	 */
+	if (dcp->panel.edr_ceiling && peak > dcp->brightness.maximum &&
+	    peak <= 10000) {
 		dev_info(dcp->dev, "panel peak luminance %u nits\n", peak);
 		WRITE_ONCE(dcp->panel.peak_nits, peak);
 	}

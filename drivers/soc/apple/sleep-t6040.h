@@ -3,7 +3,6 @@
  * T6040 (M4 Pro) suspend to RAM. Included by sleep.c after the T6050 part, as that one is.
  * See the profile at the end for what it matches and when it refuses.
  */
-#include <linux/mfd/macsmc.h>
 #include <linux/mfd/syscon.h>
 #include <linux/regmap.h>
 
@@ -276,8 +275,6 @@ struct t6040_apcie_st {
 struct t6040_sleep {
 	struct device *dev;
 	struct apple_sleep *core;
-	/* The SMC pmVC (VDD_CIO) request from the DT; 0 when the board gives none. */
-	u32 pmvc;
 	struct t6040_sleep_group *groups;
 	unsigned int ngroups;
 	/* The dry run level of the suspend in progress, from .begin to .end; 0 otherwise. */
@@ -1589,17 +1586,6 @@ static void t6040_gp_pcie_clk(struct t6040_sleep *s)
 	s->gp_clk_timeouts = timeouts;
 }
 
-/*
- * The VDD_CIO rail request (SMC key pmVC) is written in each .begin (t6040_sleep_pmvc()).
- */
-
-/* The SMC node is apple,t6041-smc + apple,t8103-smc here (macsmc's match list). */
-static const struct of_device_id t6040_smc_match[] = {
-	{ .compatible = "apple,t8103-smc" },
-	{ .compatible = "apple,smc" },
-	{}
-};
-
 /* 0 once the word at @off reads off, -EBUSY before, -EIO if it can't be read. */
 static int t6040_regmap_ps_off(struct regmap *map, u32 off, u32 *cur)
 {
@@ -2162,8 +2148,6 @@ static int t6040_sleep_map_regs(struct apple_sleep *c)
 	t6040_sleep_map_gp(s);
 	t6040_ed_map(dev);
 
-	of_property_read_u32(dev->of_node, "apple,vdd-cio-request", &s->pmvc);
-
 	s->mbox = c->mbox;
 	c->ps = s->soc_east;
 	c->wdt = s->wdt;
@@ -2172,39 +2156,6 @@ static int t6040_sleep_map_regs(struct apple_sleep *c)
 	t6040_sleep = s;
 
 	return 0;
-}
-
-/*
- * The VDD_CIO rail request (SMC key pmVC), written in each .begin: the rail's enable mask
- * | 0x100, from the DT (apple,vdd-cio-request). The mask is the board's, so a board whose
- * value the DT does not give gets no request rather than a guessed one. A kernel whose SMC
- * driver this built-in code cannot call (not built, or a module) links without the call and
- * says so.
- */
-static void t6040_sleep_pmvc(struct t6040_sleep *s)
-{
-	struct platform_device *pdev;
-	struct device_node *np;
-	struct apple_smc *smc;
-
-	if (!s->pmvc) {
-		dev_warn_once(s->dev, "pmVC: no VDD_CIO request in the device tree\n");
-		return;
-	}
-	if (!IS_REACHABLE(CONFIG_MFD_MACSMC)) {
-		dev_warn_once(s->dev, "pmVC: the SMC driver is not built in\n");
-		return;
-	}
-	np = of_find_matching_node(NULL, t6040_smc_match);
-	pdev = np ? of_find_device_by_node(np) : NULL;
-	of_node_put(np);
-	smc = pdev ? platform_get_drvdata(pdev) : NULL;
-	if (smc)
-		apple_smc_request_pmvc(smc, s->pmvc);
-	else
-		dev_warn(s->dev, "pmVC: no SMC to write to\n");
-	if (pdev)
-		put_device(&pdev->dev);
 }
 
 /* Before device suspend: the AOP islands as they are, the DCS power words to automatic mode. */
@@ -2216,7 +2167,6 @@ static int t6040_sleep_begin(struct apple_sleep *c)
 	s->returned = false;
 	memset(s->gp_saved, 0, sizeof(s->gp_saved));
 	t6040_aop_ps_save(s);
-	t6040_sleep_pmvc(s);
 	t6040_dcs_dyn_pg(s);
 	timeouts = t6040_dcs_ps_auto_on(s);
 	if (timeouts)
