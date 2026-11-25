@@ -77,32 +77,22 @@ echo "::group::build"
 mk Image.gz modules dtbs
 echo "::endgroup::"
 
-KREL=$(cat "$O/include/config/kernel.release")
-M=$O/modroot
-rm -rf "$M"
-mk INSTALL_MOD_PATH="$M" INSTALL_MOD_STRIP=1 modules_install
-rm -f "$M/lib/modules/$KREL/build" "$M/lib/modules/$KREL/source"
-
-TAR=(tar --sort=name --mtime="$KBUILD_BUILD_TIMESTAMP" --owner=0 --group=0 --numeric-owner)
-cp "$O/arch/arm64/boot/Image.gz" "$D/Image-$KREL.gz"
-cp "$O/.config" "$D/config-$KREL"
-cp "$O/System.map" "$D/System.map-$KREL"
-"${TAR[@]}" --zstd -C "$M" -cf "$D/modules-$KREL.tar.zst" "lib/modules/$KREL"
-"${TAR[@]}" --zstd -C "$O/arch/arm64/boot/dts" -cf "$D/dtbs-$KREL.tar.zst" \
-	$(cd "$O/arch/arm64/boot/dts" && find . -name '*.dtb' | sort)
-cp "$O/certs/signing_key.x509" "$D/module-signing-cert-$KREL.der"
-git -C "$S" rev-parse HEAD > "$D/source.commit"
-echo "$KREL" > "$D/kernel.release"
-echo "modules: $(find "$M/lib/modules/$KREL" -name '*.ko*' | wc -l)"
-echo "dtbs: $(cd "$O/arch/arm64/boot/dts" && find . -name '*.dtb' | wc -l)"
-
+ARCH_RUNTIME=
 echo "::group::pacman-pkg"
 if command -v makepkg >/dev/null; then
 	rm -f "$O"/*.pkg.tar.*
 	# Debian/Ubuntu's makepkg.conf defaults to .pkg.tar.gz.
 	if PKGEXT=.pkg.tar.zst mk PACMAN_PKGBASE="$PKGBASE" PACMAN_EXTRAPACKAGES=headers \
 		MAKEPKGOPTS="--nodeps --noconfirm" pacman-pkg; then
-		cp "$O"/*.pkg.tar.zst "$D/"
+		runtimes=("$O"/"$PKGBASE"-[0-9]*.pkg.tar.zst)
+		headers=("$O"/"$PKGBASE"-headers-[0-9]*.pkg.tar.zst)
+		if [[ ${#runtimes[@]} -ne 1 || ! -f ${runtimes[0]} ||
+		      ${#headers[@]} -ne 1 || ! -f ${headers[0]} ]]; then
+			echo "::error::expected one Arch runtime and one headers package"; exit 1
+		fi
+		ARCH_RUNTIME=${runtimes[0]}
+		ARCH_HEADERS=${headers[0]}
+		cp "$ARCH_RUNTIME" "$ARCH_HEADERS" "$D/"
 	else
 		echo "::warning::make pacman-pkg failed; release ships without the Arch package"
 	fi
@@ -110,6 +100,32 @@ else
 	echo "::warning::makepkg not installed; skipping the Arch package"
 fi
 echo "::endgroup::"
+
+KREL=$(cat "$O/include/config/kernel.release")
+if [[ -n $ARCH_RUNTIME ]]; then
+	member="usr/lib/modules/$KREL/build"
+	tar --zstd -xOf "$ARCH_HEADERS" "$member/.config" > "$D/config-$KREL"
+	tar --zstd -xOf "$ARCH_HEADERS" "$member/System.map" > "$D/System.map-$KREL"
+	bash "$S/.github/scripts/kernel-release-stage-arch.sh" \
+		"$ARCH_RUNTIME" "$KREL" "$D/System.map-$KREL" "$D"
+else
+	M=$O/modroot
+	rm -rf "$M"
+	mk INSTALL_MOD_PATH="$M" INSTALL_MOD_STRIP=1 modules_install
+	rm -f "$M/lib/modules/$KREL/build" "$M/lib/modules/$KREL/source"
+
+	TAR=(tar --sort=name --mtime="$KBUILD_BUILD_TIMESTAMP" --owner=0 --group=0 --numeric-owner)
+	cp "$O/arch/arm64/boot/Image.gz" "$D/Image-$KREL.gz"
+	cp "$O/.config" "$D/config-$KREL"
+	cp "$O/System.map" "$D/System.map-$KREL"
+	"${TAR[@]}" --zstd -C "$M" -cf "$D/modules-$KREL.tar.zst" "lib/modules/$KREL"
+	"${TAR[@]}" --zstd -C "$O/arch/arm64/boot/dts" -cf "$D/dtbs-$KREL.tar.zst" \
+		$(cd "$O/arch/arm64/boot/dts" && find . -name '*.dtb' | sort)
+fi
+cp "$O/certs/signing_key.x509" "$D/module-signing-cert-$KREL.der"
+git -C "$S" rev-parse HEAD > "$D/source.commit"
+echo "$KREL" > "$D/kernel.release"
+echo "dtbs: $(cd "$O/arch/arm64/boot/dts" && find . -name '*.dtb' | wc -l)"
 
 # The private signing key stays on the builder for this run only.
 rm -f "$O/certs/signing_key.pem"

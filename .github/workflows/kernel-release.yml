@@ -38,6 +38,7 @@ on:
     paths:
       - '.github/workflows/kernel-release.yml'
       - '.github/scripts/kernel-release-build.sh'
+      - '.github/scripts/kernel-release-stage-arch.sh'
       - '.github/scripts/kernel-smoke-qemu.sh'
       - '.github/scripts/kernel-smoke-expected.txt'
       - 'arch/arm64/configs/aurora_defconfig'
