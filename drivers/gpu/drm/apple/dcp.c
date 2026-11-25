@@ -11443,12 +11443,18 @@ static int dcp_t6041_stop_one(struct device *dev, void *data)
 				}
 				dev_dbg(dev, "no D572(0) %u ms after the power-off\n",
 					DCP_T6040_D572_MS);
-				if (dcp->s2r_disp_dart)
-					apple_dart_display_streams(dcp->s2r_disp_dart,
-								   DCP_S2R_DISP_STREAMS, false,
-								   false);
 			}
 			WRITE_ONCE(dcp->s2r_active, false);
+			/*
+			 * T6040: turn the streams off whether or not D572(0) came. Its handler
+			 * turns off only the layout's streams; an external DCP's are flushed as
+			 * well, as that DCP goes dark below.
+			 */
+			if (t6040 && dcp->s2r_disp_dart) {
+				apple_dart_display_streams(dcp->s2r_disp_dart, DCP_S2R_DISP_STREAMS,
+							   false, relink);
+				streams_off = true;
+			}
 		}
 		/* T6040: nothing may be in flight through them once their blocks go off. */
 		if (t6040 && dcp->s2r_disp_dart) {
