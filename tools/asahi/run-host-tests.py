@@ -273,6 +273,9 @@ ASAHI_TESTS = {
     'g17-kill-route-tests.py': [([], PASS)]
         + mutations('--mutation', ('no-executed-route', 'no-executed-input', 'kill-twice', 'executed-on-m5',
                                    'unsafe-wait', 'owed-blocks-kill', 'open-owed-skipped'), []),
+    'g17-m5-direct-compute-tests.py': [([], PASS)]
+        + mutations('--mutation', ('no-pre-recovery-drain', 'direct-debits-published',
+                                   'scope-allows-reserve'), []),
     'g17-m5-effort-tests.py': [([], PASS)]
         + mutations('--mutation', ('m5-ignores-bound',), []),
     'g17-firmware-selection-tests.py': [([], PASS)],
@@ -287,6 +290,9 @@ ASAHI_TESTS = {
     'g17-quarantine-drain-tests.py': [([], PASS)]
         + mutations('--mutation', ('no-drain-release', 'without-witness', 'ignore-leases', 'no-last-lease',
                                    'witness-covers-later-failure', 'unquarantined-drain'), []),
+    'g17-render-direct-recovery-tests.py': [([], PASS)]
+        + mutations('--mutation', ('recovery-state-eio', 'drop-generation-check',
+                                   'wrong-j813-pipe'), []),
     'g17-resource-tests.py': [([], PASS)],
     'g17-shared-pool-tests.py': [([], PASS)],
     'g17-t6041-initdata-tests.py': [([], PASS)],

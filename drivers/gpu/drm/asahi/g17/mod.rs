@@ -1286,6 +1286,9 @@ struct Shared {
     /// wherever the completion IRQ thread first ran (see `queue_event_records`). On M5 it is
     /// unbound, so a worker of that CPU's affinity pod (its L2) runs it; elsewhere it is per-CPU.
     events: Arc<workqueue::OwnedQueue>,
+    /// Preallocated completion collector owned exclusively by `run_runtime_events`.
+    #[pin]
+    worker_deferred: Mutex<Option<runtime::DeferredBatch>>,
     /// The CPU of the last publication, `u32::MAX` before the first.
     submitter: AtomicU32,
     #[pin]
@@ -1949,6 +1952,7 @@ impl Gpu {
         let max_pstate = frequencies
             .as_ref()
             .map_or(0, stats::StateFrequencies::max_pstate);
+        let worker_deferred = runtime::DeferredBatch::worker()?;
         let shared = Arc::pin_init(
             pin_init!(Shared {
                 drm <- new_mutex!(Some(dev.into()), "g17::Shared::drm"),
@@ -1992,6 +1996,10 @@ impl Gpu {
                 governor_armed: AtomicBool::new(false),
                 governor_activity_ns: AtomicU64::new(0),
                 events,
+                worker_deferred <- new_mutex!(
+                    Some(worker_deferred),
+                    "g17::Shared::worker_deferred"
+                ),
                 submitter: AtomicU32::new(u32::MAX),
                 grow <- new_work!("g17::Shared::grow"),
                 reclaim_work <- new_work!("g17::Shared::reclaim_work"),
