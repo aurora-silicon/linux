@@ -7890,6 +7890,15 @@ static void sleep_seq_save(void __iomem *const *blk, struct sleep_seq *seq)
 	seq->have_saved = true;
 }
 
+/* @seq's entries and saved words cleaned to the point of coherency, for a wake without caches */
+static void sleep_seq_clean(const struct sleep_seq *seq)
+{
+	if (seq->n)
+		dcache_clean_poc((unsigned long)seq->op, (unsigned long)(seq->op + 4 * seq->n));
+	if (seq->saved)
+		dcache_clean_poc((unsigned long)seq->saved, (unsigned long)(seq->saved + seq->n));
+}
+
 /*
  * @seq on the blocks @blk names. An entry fails for a wait that timed out, other than an
  * optional one, or for a restore or guard with nothing saved, which writes nothing and, for a

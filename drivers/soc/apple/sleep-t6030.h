@@ -370,12 +370,40 @@ static void t6030_sleep_commit_regs(struct apple_sleep *s)
 	sleep_ps_save(s);
 }
 
-/* The commit word no sooner after the SMC's AP idle than the policy's spacing, as on macOS */
+/*
+ * What the wake reads before the caches are on again, cleaned to the point of coherency: the
+ * kernel's data and resume context, this stack, the sleep state and its power word books, the
+ * wake sequences with the words read for them, and this profile's state, its flags included.
+ */
+static void t6030_sleep_clean(struct apple_sleep *s)
+{
+	const struct apple_sleep_soc *soc = s->soc;
+	struct t6030_sleep *t = t6030_state(s);
+
+	t8132_clean_ram();
+	dcache_clean_poc((unsigned long)task_stack_page(current),
+			 (unsigned long)task_stack_page(current) + THREAD_SIZE);
+	dcache_clean_poc((unsigned long)s, (unsigned long)(s + 1));
+	dcache_clean_poc((unsigned long)s->ps_commit,
+			 (unsigned long)(s->ps_commit + soc->ps_all.count));
+	dcache_clean_poc((unsigned long)s->ps_aon_commit,
+			 (unsigned long)(s->ps_aon_commit + soc->ps_aon_all.count));
+	sleep_seq_clean(&t->wake_early);
+	sleep_seq_clean(&t->wake);
+	dcache_clean_poc((unsigned long)t, (unsigned long)(t + 1));
+	dsb(sy);
+}
+
+/*
+ * The last step before the commit word: the clean, then no sooner after the SMC's AP idle than
+ * the policy's spacing, as on macOS
+ */
 static void t6030_sleep_pre_commit(struct apple_sleep *s)
 {
 	u64 at = s->smc_idle_sent + (u64)arch_timer_get_cntfrq() *
 		 s->soc->smc_policy->idle_to_timer_us / USEC_PER_SEC;
 
+	t6030_sleep_clean(s);
 	while (__arch_counter_get_cntpct() < at)
 		cpu_relax();
 }
