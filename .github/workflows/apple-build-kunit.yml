@@ -11,7 +11,7 @@ name: Apple build and KUnit
 
 on:
   pull_request:
-    branches: [integration/aurora, aurora-wip]
+    branches: [main, integration/aurora, aurora-wip]
     paths:
       - 'arch/arm64/configs/**'
       - 'drivers/accel/ane/**'
@@ -38,7 +38,7 @@ on:
       - '.github/workflows/apple-build-kunit.yml'
   # Same paths as pull_request, so an unrelated merge does not start the jobs.
   push:
-    branches: [integration/aurora]
+    branches: [main, integration/aurora]
     paths:
       - 'arch/arm64/configs/**'
       - 'drivers/accel/ane/**'
