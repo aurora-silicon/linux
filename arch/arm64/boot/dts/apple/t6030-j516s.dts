@@ -33,6 +33,32 @@
 	firmware-name = "apple/tpmtfw-j516s.bin";
 };
 
+/*
+ * The SEP, for its sleep only (apple_sep's T6030/J516s profile brings up nothing else). The
+ * alias makes the loader publish its manifests on the node. SID 0's window is the one the
+ * 26B123 ioreg records for dart-sep (vm-base 0x10000004000, vm-size 0xffff0000), present
+ * before the DART probes.
+ */
+/ {
+	aliases {
+		sep = &sep;
+	};
+};
+
+&sep_dart {
+	apple,dma-range = /bits/ 64 <0x10000004000 0xffff0000>;
+	apple,dma-offset = /bits/ 64 <0x0>;
+	status = "okay";
+};
+
+&sep_mbox {
+	status = "okay";
+};
+
+&sep {
+	status = "okay";
+};
+
 &wifi0 {
 	brcm,board-type = "apple,jura";
 };
