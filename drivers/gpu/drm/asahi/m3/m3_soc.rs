@@ -113,9 +113,6 @@ pub(crate) struct Soc {
     pub(crate) board: &'static str,
     /// GPU node compatible.
     pub(crate) gpu: &'static str,
-    /// Boards the runtime starts on by default and registers a render node on. On a T8122 it
-    /// starts on no other board, whatever `asahi.m3_backend` says (`m3_params::t8122_backend`).
-    pub(crate) validated_boards: &'static [&'static [u8]],
     /// GPU clusters, and core slots per cluster.
     pub(crate) clusters: u32,
     pub(crate) cores_per_cluster: u32,
@@ -284,9 +281,8 @@ pub(crate) static T8122: Soc = Soc {
     gpu_revision_id: hw::GpuRevisionID::C0,
     board: "apple,t8122",
     gpu: "apple,agx-t8122",
-    // The M3 MacBook Airs (13" J613, 15" J615). Allowed, not validated: the runtime has not run
-    // on either, and starts only behind a boot loader that hands the GPU over.
-    validated_boards: &[b"apple,j613", b"apple,j615"],
+    // The runtime starts only behind a boot loader that hands the GPU over
+    // (`m3_board::handed_over`).
     clusters: 1,
     cores_per_cluster: 10,
     mailbox_compatibles: &[

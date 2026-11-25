@@ -173,9 +173,10 @@ properties:
   apple,display-power:
     $ref: /schemas/types.yaml#/definitions/phandle
     description:
-      A node whose ps, pwrgate and pmc-dcp registers hold the display power
-      words this coprocessor's driver writes around a firmware restart, such
-      as an apple,t8140-display-power node.
+      A node describing the display power-state words (or PMGR power-domain
+      chains), power-gate retention words and pmc-dcp counter that this
+      coprocessor's driver writes around a firmware restart, such as an
+      apple,t8140-display-power or apple,t6041-display-power node.
 
   apple,bw-scratch:
     $ref: /schemas/types.yaml#/definitions/phandle-array
@@ -380,6 +381,14 @@ properties:
   apple,dcp-index:
     $ref: /schemas/types.yaml#/definitions/uint32
     description: Display coprocessor index on multi-DCP systems.
+
+  apple,sleep-host-stop:
+    type: boolean
+    description:
+      The SoC's suspend-to-RAM needs this display coprocessor and the external
+      ones stopped, and their power domains lowered, by the operating system
+      before the sleep commit, and the internal one restarted after the wake.
+      The firmware doesn't take the display down for the sleep itself.
 
   apple,typec-hybrid-first:
     type: boolean

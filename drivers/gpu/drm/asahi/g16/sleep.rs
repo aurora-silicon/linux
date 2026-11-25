@@ -60,6 +60,8 @@ impl Firmware {
 
     /// The run bit and the RTKit handshake, with the firmware's state as it was left.
     fn sleep_restart(&mut self) -> Result {
+        // Start the next render on each pass slot fresh after the firmware restarts.
+        self.pools.invalidate();
         self.session.rtkit.warm_restart()?;
         let control = self.session.regs.asc_control()?;
         self.session.regs.set_asc_control(control | ASC_RUN)?;

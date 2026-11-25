@@ -986,7 +986,9 @@ const HW_CFG_T6041: PmpHwConfig = PmpHwConfig {
     dma_mask: Some(DmaMask::new::<42>()),
     check_bootargs_uuid: true,
     coreanalytics: Ep7::Always,
-    sram_backup: None,
+    // 26.6.2 firmware (J616C): __DATA at 0x500761000, 0x7d000 bytes; the 27.2 firmware has it at
+    // 0x62000. Kept across a real sleep.
+    sram_backup: Some((0x61000, 0x7d000)),
     sram_backup_data: false,
     self_ack_start: false,
     confirm_ioreg_len: false,

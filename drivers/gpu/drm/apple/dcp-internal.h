@@ -254,6 +254,43 @@ struct dcp_s2r_layout {
 };
 
 /*
+ * One display power chain parsed from a child node of
+ * apple,t6041-display-power. domains[] is ordered sys, fe, cpu, then child
+ * sub-domains (parent-before-child; powered off in reverse).
+ */
+struct dcp_t6041_chain {
+	const char *name;
+	u32 reg;
+	bool is_main;
+	void __iomem *gapf;
+	void __iomem *pg_a;
+	void __iomem *pg_b;
+	void __iomem *fabric;
+	void __iomem **domains;
+	u32 *child_saved;
+	unsigned int num_domains;
+};
+
+/*
+ * Mapped register windows and display power chains from apple,display-power
+ * (apple,t6041-display-power) for host-driven T6041 suspend-to-RAM; mapped
+ * once at probe.
+ */
+struct dcp_t6041_power {
+	void __iomem *pmc_dcp;
+	void __iomem *pwrgate;
+	void __iomem *pwrgate_aux;
+	void __iomem *gapf;
+	void __iomem *axi2af;
+	struct dcp_t6041_chain *chains;
+	unsigned int num_chains;
+	struct dcp_t6041_chain *main_chain;
+	bool child_valid;
+	u32 boot_ps[3];
+	bool boot_ps_valid;
+};
+
+/*
  * Identity of a fixed internal panel, for the EDID published on its
  * connector.  Any processor with an internal panel allocates it; the boot
  * loader's ADT supplies the fallback, and firmware metadata or a raw panel
@@ -606,6 +643,8 @@ struct apple_dcp {
 	 */
 	bool ext_failsafe;
 	bool ext_dead;
+	/* T6041 S2R: this external DCP's firmware stop ran in a sleep of this boot */
+	bool t6041_ext_seen;
 	/*
 	 * A T6030 external processor in the main DRM device: the kernel starts
 	 * its firmware on first use, its modes come from the attached display.
@@ -747,6 +786,8 @@ struct apple_dcp {
 
 	struct dcp_channel ch_cmd, ch_oobcmd;
 	struct dcp_channel ch_cb, ch_oobcb, ch_async, ch_oobasync;
+	/* In-flight dcp_ack() mailbox sends not yet queued to RTKit. */
+	atomic_t pending_acks;
 
 	/* iomfb EP callback handlers */
 	const iomfb_cb_handler *cb_handlers;
@@ -931,6 +972,9 @@ struct apple_dcp {
 	bool s2r_power_oob;
 	u8 s2r_step;
 	struct completion s2r_dart_done;
+	struct completion s2r_hpd_done;
+	bool sleep_host_stop;
+	struct dcp_t6041_power t6041_power;
 	struct device *s2r_disp_dart;
 	struct device *s2r_dcp_dart;
 
