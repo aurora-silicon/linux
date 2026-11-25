@@ -278,7 +278,10 @@ impl Submission {
         let vm_status = work.as_ref().map(|work| work.status().clone());
         Arc::pin_init(
             pin_init!(Self {
-                state <- new_mutex!(State { work, ready: None, published: None }, "G17 submission work state"),
+                state <- new_mutex!(
+                    State { work, ready: None, published: None },
+                    "G17 submission work state"
+                ),
                 vm_status,
                 remaining: AtomicU8::new(1),
                 error: AtomicI32::new(0),
