@@ -676,6 +676,8 @@ struct pci_host_bridge {
 	 * Immutable after probing; driver-coordinated resets remain permitted.
 	 */
 	unsigned int	reset_sensitive:1;
+	/* Keep firmware-assigned bus numbers on this host bridge hierarchy. */
+	unsigned int	no_reassign_bus:1;
 
 	/* Resource alignment requirements */
 	resource_size_t (*align_resource)(struct pci_dev *dev,

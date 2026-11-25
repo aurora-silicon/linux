@@ -358,6 +358,29 @@
  * init (drivers/soc/apple/dt.rs).
  */
 &pmgr {
+	/*
+	 * From the J815 ADT, as on J813: GPIO at +0x120 and SEP at +0xc00, both
+	 * always on (the enclave gates its own domain). The SEP driver stages its
+	 * sleep request on the SEP word, so the node has to name it.
+	 */
+	ps_gpio: power-controller@120 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x120 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "gpio";
+		apple,always-on;
+	};
+
+	ps_sep: power-controller@c00 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0xc00 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "sep";
+		apple,always-on;
+	};
+
 	ps_spi2: power-controller@440 {
 		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x440 4>;
@@ -375,6 +398,7 @@
 		mboxes = <&sep_mbox>;
 		mbox-names = "mbox";
 		iommus = <&sep_dart 0>;
+		power-domains = <&ps_sep>, <&ps_gpio>;
 		status = "disabled";
 	};
 

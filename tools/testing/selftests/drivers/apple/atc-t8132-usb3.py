@@ -92,7 +92,8 @@ static void fsleep(unsigned n) { (void)n; }
 '''
     declarations = r'''
 struct apple_tunable { unsigned id; };
-struct atcphy_hw { int gen; bool usb2_only, has_usb2phy_reg, park_pipe_unlocked; u32 usb2phy_sig_host; };
+struct atcphy_hw { int gen; bool usb2_only, has_usb2phy_reg, park_pipe_unlocked; u32 usb2phy_sig_host;
+    u32 cfg_offset, sync_reset; };
 enum suspend_state { PM_SUSPEND_TO_IDLE = 1, PM_SUSPEND_MEM = 3 };
 static enum suspend_state pm_suspend_target_state;
 static bool rpm_suspended;
@@ -106,7 +107,7 @@ struct apple_atcphy {
     bool t8132_ss, t8132_common_owned, t8132_suspended, t8132_failed, host_active;
     bool ss_tunables, mode_dirty, pipe_pending, swap_lanes;
     bool cio_tunables, t8132_dp_alt, fixed_usb2, hibernated, pd_was_off, idle_rpm;
-    bool t8103_dummy_pending, t8103_usb3_workaround;
+    bool t8103_dummy_pending, t8103_usb3_workaround, fixed_usb3, cio_only;
     unsigned tunnel_users;
     struct { bool prepared, changed, restored; } cio_sleep;
     int mode, pipe_state, lock;
@@ -122,6 +123,8 @@ struct phy { struct apple_atcphy *atc; unsigned power_count,init_count,mutex;
 struct device { struct apple_atcphy *atc; };
 static struct apple_atcphy *dev_get_drvdata(struct device *d) { return d->atc; }
 static struct apple_atcphy *phy_get_drvdata(struct phy *p) { return p->atc; }
+/* T8152 only: these rows run T8132, which never reaches it. */
+static void atcphy_lanes_down_t8152(struct apple_atcphy *a) { (void)a; assert(0); }
 static u32 core[0x24000/4], usb2[0x4000/4], pipe_regs[0x4000/4];
 static unsigned tunes[16], tune_count, reset_releases, bist_phase, writes, core_reads;
 static unsigned stall_power, stall_bist, expected_tunes, stall_sleep;
@@ -215,7 +218,7 @@ static void apple_tunable_apply(void *regs, struct apple_tunable *t)
 }
 '''
     names = ["atcphy_mode_is_cio", "atcphy_usb2_sig_host", "atcphy_t8132_dp_on",
-             "atcphy_usb2_power_off", "atcphy_power_off", "atcphy_usb2_power_on",
+             "atcphy_cfg", "atcphy_usb2_power_off", "atcphy_power_off", "atcphy_usb2_power_on",
              "atcphy_t8132_cold", "atcphy_t8132_common_start", "atcphy_t8132_phy_stop",
              "atcphy_t8132_full_stop",
              "atcphy_configure_t8132", "atcphy_usb2_set_mode", "atcphy_t8132_bist_pulse",
@@ -734,6 +737,7 @@ static int dwc3_core_probe(struct dwc3_probe_data *d) {
 static void mutex_init(int *p) { *p=0; }
 static bool dwc3_apple_has_fixed_hub(struct device *d,unsigned *port) { (void)d;(void)port;return false; }
 static bool dwc3_apple_host_only(struct device *d) { (void)d;return false; }
+static bool dwc3_apple_idle_rpm(const char *np) { (void)np;return false; }
 static bool device_property_read_bool(struct device *d,const char *name) { (void)d;(void)name;return false; }
 static void spin_lock_init(int *p) { *p=0; }
 static void publish_owner(struct platform_device *pdev,struct dwc3_apple *appledwc)

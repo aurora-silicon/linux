@@ -5836,6 +5836,23 @@ bool iomfb_m4_ext_stopped(struct apple_dcp *owner)
 	return stopped;
 }
 
+/*
+ * Its CPU is down for the sleep: an external DCP stopped for a deep sleep, or
+ * an internal one powered down with its domains (iomfb_m4_power_gate()).
+ */
+bool iomfb_m4_sleep_stopped(struct apple_dcp *owner)
+{
+	struct iomfb_m4 *dcp = owner->v26_6;
+	bool stopped;
+
+	if (!dcp)
+		return false;
+	mutex_lock(&dcp->lock);
+	stopped = dcp->ext_stopped || dcp->gated;
+	mutex_unlock(&dcp->lock);
+	return stopped;
+}
+
 /* apple-drm, a consumer of this device, has blanked the panel before this. */
 int iomfb_m4_suspend(struct apple_dcp *owner)
 {

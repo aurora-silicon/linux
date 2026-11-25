@@ -116,7 +116,7 @@
 	apple,temporal-filter = <1>;
 };
 
-/* Touch ID; its data-ready line (AP GPIO 199) is left out, so it polls. */
+/* Touch ID */
 &spi2 {
 	status = "okay";
 };
@@ -124,6 +124,8 @@
 &mesa {
 	status = "okay";
 	enable-gpios = <&pinctrl_nub 29 GPIO_ACTIVE_HIGH>;
+	interrupt-parent = <&pinctrl_ap>;
+	interrupts = <199 IRQ_TYPE_EDGE_RISING>;
 	spi-cs-setup-delay-ns = <20>;
 	spi-cs-hold-delay-ns = <20>;
 };

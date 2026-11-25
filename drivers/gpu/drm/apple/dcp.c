@@ -14,15 +14,18 @@
 #include <linux/dma-fence.h>
 #include <linux/gpio/consumer.h>
 #include <linux/iommu.h>
+#include <linux/of_reserved_mem.h>
 #include <linux/jiffies.h>
 #include <linux/kconfig.h>
 #include <linux/kernel.h>
 #include <linux/kref.h>
+#include <linux/kthread.h>
 #include <linux/module.h>
 #include <linux/mux/driver.h>
 #include <linux/soc/apple/dart.h>
 #include <linux/soc/apple/display.h>
 #include <linux/soc/apple/dp-tunnel.h>
+#include <linux/soc/apple/mcc.h>
 #include <linux/moduleparam.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
@@ -77,6 +80,7 @@
 #include "dptx-service.h"
 #include "iomfb.h"
 #include "iomfb_internal.h"
+#include "iomfb_iboot.h"
 #include "iomfb_m4.h"
 #include "ibootep.h"
 #include "iomfb_internal.h"
@@ -114,15 +118,15 @@ static bool dcp_session_retained(struct device *dev)
 	return retained;
 }
 
-static int dcp_pin_live_session(struct apple_dcp *dcp)
+/*
+ * Keep a live session's DMA device, domain use and this driver until reboot,
+ * and refuse a new probe of its device after an unbind.
+ */
+int dcp_retain_live_session(struct apple_dcp *dcp)
 {
 	struct dcp_session_ref *session;
 
-	if ((!dcp->hw.adopt_live_session &&
-	     dcp->hw.iomfb_method_profile !=
-	     DCP_IOMFB_METHODS_H17P_EXTERNAL) ||
-	    !dcp_fail_stop(dcp) ||
-	    dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G || dcp->retain_dma)
+	if (dcp->retain_dma)
 		return 0;
 	session = kzalloc_obj(*session);
 	if (!session)
@@ -141,6 +145,17 @@ static int dcp_pin_live_session(struct apple_dcp *dcp)
 	mutex_unlock(&dcp_retained_sessions_lock);
 	dev_dbg(dcp->dev, "live DCP DMA resources retained until reboot\n");
 	return 0;
+}
+
+static int dcp_pin_live_session(struct apple_dcp *dcp)
+{
+	if ((!dcp->hw.adopt_live_session &&
+	     dcp->hw.iomfb_method_profile !=
+	     DCP_IOMFB_METHODS_H17P_EXTERNAL) ||
+	    !dcp_fail_stop(dcp) ||
+	    dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G || dcp->retain_dma)
+		return 0;
+	return dcp_retain_live_session(dcp);
 }
 
 static void dcp_release_dma_domain(void *data)
@@ -244,18 +259,24 @@ static void dcp_secure_port_start(struct apple_dcp *dcp)
 }
 
 /* Between the main mailbox's AP idle and its IOP idle. */
-static void dcp_secure_port_idle(void *data)
+static int dcp_secure_port_idle_strict(void *data)
 {
 	struct apple_dcp *dcp = data;
 	int ret;
 
 	if (!dcp->secure_rtk || !dcp->secure_answered)
-		return;
+		return 0;
 
 	dcp_secure_poll_stop(dcp);
 	ret = apple_rtkit_port_idle(dcp->secure_rtk, DCP_SECURE_TIMEOUT_MS);
 	if (ret)
 		dev_warn(dcp->dev, "secure port AP idle not acknowledged: %d\n", ret);
+	return ret;
+}
+
+static void dcp_secure_port_idle(void *data)
+{
+	dcp_secure_port_idle_strict(data);
 }
 
 static void dcp_release_secure_rtkit(void *data)
@@ -272,10 +293,18 @@ static int dcp_secure_port_init(struct apple_dcp *dcp)
 {
 	struct device *dev = dcp->dev;
 
-	if (of_property_match_string(dev->of_node, "mbox-names", "secure") < 0)
+	/*
+	 * The secure mailbox is the second of mboxes, or named by apple,secure-mbox where the
+	 * boot loader wants mboxes to hold the one ASC mailbox (it refuses the display handoff
+	 * otherwise).
+	 */
+	if (of_property_match_string(dev->of_node, "mbox-names", "secure") >= 0)
+		dcp->secure_rtk = apple_rtkit_init(dev, dcp, "secure", 0, &dcp_secure_rtkit_ops);
+	else if (of_property_present(dev->of_node, "apple,secure-mbox"))
+		dcp->secure_rtk = apple_rtkit_init_mbox_prop(dev, dcp, "apple,secure-mbox",
+							     &dcp_secure_rtkit_ops);
+	else
 		return 0;
-
-	dcp->secure_rtk = apple_rtkit_init(dev, dcp, "secure", 0, &dcp_secure_rtkit_ops);
 	if (IS_ERR(dcp->secure_rtk)) {
 		int ret = PTR_ERR(dcp->secure_rtk);
 
@@ -301,7 +330,8 @@ static void dcp_s2r_check_dt(struct apple_dcp *dcp)
 	struct device_node *np = dcp->dev->of_node;
 	bool power = of_property_present(np, "apple,display-power");
 	bool secure = dcp->hw.s2r_no_secure_port ||
-		      of_property_match_string(np, "mbox-names", "secure") >= 0;
+		      of_property_match_string(np, "mbox-names", "secure") >= 0 ||
+		      of_property_present(np, "apple,secure-mbox");
 
 	if (dcp->hw.s2r && (!power || !secure)) {
 		dev_info(dcp->dev, "no %s in the device tree, the firmware keeps running\n",
@@ -467,12 +497,13 @@ MODULE_PARM_DESC(t6050_ext_sleep,
 /*
  * What a T6050 external display processor gained outside the firmware 27 sleep itself (the
  * Type-C reconnect skipped for a crashed one, a crashed one refusing a deep sleep before
- * anything is stopped, the link line) is in force on the board it has run on, the J714s.
- * Elsewhere, other boards with the same SoC included, these are as before.
+ * anything is stopped, the link line) is in force where the sleep's description has the
+ * display coprocessors sleep by their method table (apple,display-method-sleep). Elsewhere,
+ * other boards with the same SoC included, these are as before.
  */
 static bool dcp_j714s_ext(struct device *dev)
 {
-	return of_machine_is_compatible("apple,j714s") &&
+	return apple_t6050_sleep_property("apple,display-method-sleep") &&
 	       of_device_is_compatible(dev->of_node, "apple,t6050-dcpext");
 }
 
@@ -1293,14 +1324,19 @@ static void dcp_panel_read_adt(struct apple_dcp *dcp)
 	if (dcp->panel_identity)
 		dcp->panel_identity->adt = panel.identity;
 	dcp->panel.color_target = ret ? NULL : dcp_panel_gamut_color_space(panel.gamut);
-	if (desktop || dcp->fw_compat == DCP_FIRMWARE_V_27_0)
-		dcp->panel.edr_ceiling = dcp_edr_ceiling(panel.edr_potential_headroom);
+	/*
+	 * Whether the panel has EDR headroom at all is the machine's to say: an
+	 * XDR panel's backlight node carries EDRPotentialHeadroom above 1.0, an
+	 * SDR panel none.  Without it the panel gets no peak, so it shows no PQ
+	 * content as EDR and offers userspace no HDR (dcp_panel_edr()).
+	 */
+	dcp->panel.edr_ceiling = dcp_edr_ceiling(panel.edr_potential_headroom);
 	/*
 	 * Firmware 27 reports no peak (desktop 26.x: res_max_panel_brightness()).
 	 * The ADT's LmaxProduct gives it (1600 nits on the M5 Pro).  Only a peak
 	 * above the SDR range gives headroom.
 	 */
-	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
+	if (dcp->panel.edr_ceiling && dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
 		u32 peak = panel.lmax_product >> 16;
 
 		if (peak > dcp->brightness.maximum && peak <= 10000) {
@@ -1843,7 +1879,171 @@ static int dcp_check_iova_contiguous(struct iommu_domain *domain,
 	return 0;
 }
 
-static int dcp_rtk_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
+#define DCP_RTKIT_HANDOFF		"dcp-live-v1"
+#define DCP_RTKIT_LIVE_BUFFER_CELLS	5
+#define DCP_RTKIT_LIVE_MAX_BUFFERS	4
+
+struct dcp_rtkit_live {
+	struct apple_rtkit_adopted_session session;
+	struct apple_rtkit_inherited_buffer buffers[DCP_RTKIT_LIVE_MAX_BUFFERS];
+};
+
+/*
+ * Inside one of this DCP's no-map reserved-memory carveouts. Those are also what
+ * the IOMMU core rebuilds the DCP's DART mappings from when it takes over a
+ * locked root, so a buffer outside them would lose its mapping at attach. A
+ * region in the linear map would alias the write-combined mapping of the buffer
+ * with a cacheable one, and a reusable (CMA) region could be handed out.
+ */
+static bool dcp_rtkit_live_carveout(struct device_node *np, phys_addr_t phys,
+				    size_t size)
+{
+	int i, count = of_count_phandle_with_args(np, "memory-region", NULL);
+	bool found = false;
+
+	for (i = 0; !found && i < count; i++) {
+		struct device_node *mem = of_parse_phandle(np, "memory-region", i);
+		struct reserved_mem *rmem;
+
+		if (!mem)
+			break;
+		rmem = of_reserved_mem_lookup(mem);
+		found = rmem && of_property_present(mem, "no-map") &&
+			!of_property_present(mem, "reusable") &&
+			phys >= rmem->base && size <= rmem->size &&
+			phys - rmem->base <= rmem->size - size;
+		of_node_put(mem);
+	}
+	return found;
+}
+
+static void dcp_rtkit_live_unmap(struct dcp_rtkit_live *live)
+{
+	unsigned int i;
+
+	for (i = 0; i < live->session.num_buffers; i++)
+		vunmap(live->buffers[i].shmem.private);
+	live->session.num_buffers = 0;
+}
+
+/*
+ * A boot stage that negotiated RTKit with this DCP and handed it over running
+ * describes the session on the node, with the RTKit handoff properties of other
+ * co-processors handed over running: apple,rtkit-handoff ("dcp-live-v1") and
+ * apple,rtkit-buffers (<ep dva_hi dva_lo size is_mapped> per system buffer, the
+ * device address being the DART input address), plus apple,rtkit-version and
+ * apple,rtkit-epmap (word i = endpoints 32i..32i+31). Each buffer lies in one of
+ * the node's memory-region carveouts, mapped there through its iommu-addresses.
+ * Such a firmware does not repeat HELLO or EPMAP. Returns 1 with the session
+ * filled in, 0 without a description, or an error for one that cannot be adopted
+ * safely.
+ */
+static int dcp_rtkit_live_parse(struct apple_dcp *dcp, struct dcp_rtkit_live *live)
+{
+	u32 cells[DCP_RTKIT_LIVE_MAX_BUFFERS * DCP_RTKIT_LIVE_BUFFER_CELLS];
+	struct device_node *np = dcp->dev->of_node;
+	struct iommu_domain *domain;
+	const char *handoff;
+	int count, i, ret;
+	u32 version;
+
+	if (!of_property_present(np, "apple,rtkit-handoff"))
+		return 0;
+	ret = of_property_read_string(np, "apple,rtkit-handoff", &handoff);
+	if (ret)
+		return ret;
+	if (strcmp(handoff, DCP_RTKIT_HANDOFF)) {
+		dev_err(dcp->dev, "unknown RTKit handoff \"%s\"\n", handoff);
+		return -EINVAL;
+	}
+	if (!(readl_relaxed(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL) &
+	      APPLE_DCP_COPROC_CPU_CONTROL_RUN)) {
+		dev_err(dcp->dev, "live RTKit session without a running CPU\n");
+		return -ENODEV;
+	}
+	ret = of_property_read_u32(np, "apple,rtkit-version", &version);
+	if (ret || version > U16_MAX)
+		return ret ?: -EINVAL;
+	live->session.protocol_version = version;
+	ret = of_property_read_u32_array(np, "apple,rtkit-epmap",
+					 live->session.epmap,
+					 APPLE_RTKIT_ADOPTED_EPMAP_WORDS);
+	if (ret)
+		return ret;
+
+	/* A session without shared buffers has the property, empty. */
+	if (!of_find_property(np, "apple,rtkit-buffers", NULL))
+		return -EINVAL;
+	count = of_property_count_u32_elems(np, "apple,rtkit-buffers");
+	if (count == -ENODATA)
+		count = 0;
+	if (count < 0 || count > ARRAY_SIZE(cells) ||
+	    count % DCP_RTKIT_LIVE_BUFFER_CELLS)
+		return -EINVAL;
+	if (count) {
+		ret = of_property_read_u32_array(np, "apple,rtkit-buffers",
+						 cells, count);
+		if (ret)
+			return ret;
+	}
+	count /= DCP_RTKIT_LIVE_BUFFER_CELLS;
+
+	domain = iommu_get_domain_for_dev(dcp->dev);
+	if (count && !domain)
+		return -ENODEV;
+
+	live->session.buffers = live->buffers;
+	for (i = 0; i < count; i++) {
+		const u32 *t = &cells[i * DCP_RTKIT_LIVE_BUFFER_CELLS];
+		struct apple_rtkit_inherited_buffer *b = &live->buffers[i];
+		u64 iova = (u64)t[1] << 32 | t[2];
+		u64 size = t[3];
+		phys_addr_t phys;
+
+		/* The system endpoints with shared buffers, as for other handoffs. */
+		if ((t[0] != 1 && t[0] != 2 && t[0] != 4 && t[0] != 8) ||
+		    t[4] > 1 || !size || size > SZ_16M || !PAGE_ALIGNED(iova) ||
+		    !PAGE_ALIGNED(size) || iova + size < iova) {
+			ret = -EINVAL;
+			goto fail;
+		}
+		/* The DCP's own DART says where the buffer is; it must be contiguous. */
+		phys = iommu_iova_to_phys(domain, iova);
+		ret = phys ? dcp_check_iova_contiguous(domain, iova, size, phys) : -ENXIO;
+		if (ret) {
+			dev_err(dcp->dev, "live RTKit buffer ep%u iova %#llx+%#llx is not mapped\n",
+				t[0], iova, size);
+			goto fail;
+		}
+		if (!dcp_rtkit_live_carveout(np, phys, size)) {
+			dev_err(dcp->dev, "live RTKit buffer %pa+%#llx is not in a DCP carveout\n",
+				&phys, size);
+			ret = -EACCES;
+			goto fail;
+		}
+
+		/* Firmware writes without CPU cache maintenance. */
+		ret = dcp_vmap_wc(phys, size, &b->shmem.iomem, &b->shmem.private);
+		if (ret)
+			goto fail;
+		b->endpoint = t[0];
+		b->shmem.iova = iova;
+		b->shmem.size = size;
+		/*
+		 * The is_mapped cell only says who placed the buffer; Linux has
+		 * mapped every one here, and is_mapped makes RTKit unmap it.
+		 */
+		b->shmem.is_mapped = true;
+		live->session.num_buffers = i + 1;
+	}
+	return 1;
+
+fail:
+	dcp_rtkit_live_unmap(live);
+	return ret;
+}
+
+int dcp_rtk_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
 {
 	struct apple_dcp *dcp = cookie;
 	int ret;
@@ -1904,7 +2104,7 @@ static int dcp_rtk_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
 	return 0;
 }
 
-static void dcp_rtk_shmem_destroy(void *cookie, struct apple_rtkit_shmem *bfr)
+void dcp_rtk_shmem_destroy(void *cookie, struct apple_rtkit_shmem *bfr)
 {
 	struct apple_dcp *dcp = cookie;
 
@@ -2045,16 +2245,20 @@ int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_commit *commi
 
 	/*
 	 * On desktop 26.6 firmware the panel takes VRR_ENABLED with the next
-	 * frame, without a mode set (see dcp_vrr_update()).  The external
-	 * processors ignore a new minimum rate on a live mode, so they still
-	 * change adaptive sync with a mode set, as firmware 27's externals do:
-	 * macOS switches between a timing's fixed and variable modes with a
-	 * full mode set.
+	 * frame, without a mode set (see dcp_vrr_update()), once a mode set
+	 * has armed adaptive sync.  An adopted boot mode starts fixed
+	 * (!dcp->vrr_enabled), so enabling VRR_ENABLED the first time still
+	 * needs one mode set; other template pipes change adaptive sync inside
+	 * iomfb_modeset() via a full mode set, except firmware 27 panels which
+	 * do not re-modeset on VRR.
 	 */
-	if ((dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
-	     (dcp->fw_compat == DCP_FIRMWARE_V_27_0 && !dcp->main_display &&
-	      !dcp_has_panel(dcp))) &&
-	    crtc_state->enable && !dcp_vrr_live(dcp)) {
+	if (READ_ONCE(dcp->iomfb_template_pq) &&
+	    !(dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+	      (dcp->main_display || dcp_has_panel(dcp))) &&
+	    crtc_state->enable &&
+	    !(dcp_vrr_live(dcp) &&
+	      (READ_ONCE(dcp->vrr_enabled) || !crtc_state->vrr_enabled ||
+	       (dcp->desktop && READ_ONCE(dcp->desktop->vrr_failed))))) {
 		struct drm_crtc_state *old =
 			drm_atomic_get_old_crtc_state(commit, crtc);
 
@@ -2297,6 +2501,37 @@ static unsigned long dcp_dptx_wait_linkcfg(struct apple_dcp *dcp, u32 port,
 }
 
 /*
+ * A fixed HDMI port can come up from the boot loader with a default surface
+ * already active, in which case the firmware does not start fresh link
+ * training while AP HPD is withheld. Assert AP HPD from the converter's real
+ * HPD GPIO before waiting for link configuration, except on paths where HPD
+ * has another owner (such as 13.5 DP2HDMI, where the converter holds HPD on
+ * its own and linkcfg timeout is non-fatal, or an adopted session whose
+ * post-wait path drives HPD).
+ */
+static int dcp_assert_hpd_before_link_wait(struct apple_dcp *dcp, u32 port,
+					   bool late_hpd, bool skip_fixed_hdmi)
+{
+	bool typec = dcp_is_typec_output(dcp);
+	bool fixed_hdmi = !typec && !skip_fixed_hdmi &&
+			  dcp->fixed_connector_type == DRM_MODE_CONNECTOR_HDMIA &&
+			  dcp->hdmi_hpd;
+	int level;
+
+	if (late_hpd || (!typec && !fixed_hdmi))
+		return 0;
+	if (fixed_hdmi) {
+		level = gpiod_get_value_cansleep(dcp->hdmi_hpd);
+		if (level <= 0)
+			return level < 0 ? level : -ENOLINK;
+	}
+	if (dcp_uses_t6020_tunnel_flow(dcp))
+		return dptxport_set_hpd_timeout(dcp->dptxport[port].service,
+						true, 8000);
+	return dptxport_set_hpd(dcp->dptxport[port].service, true);
+}
+
+/*
  * Connect DPTX port @port. On failure, @retryable (if given) tells whether
  * the attempt left nothing outstanding in the firmware, so that a later
  * connection may simply try again: the service was not published yet, or a
@@ -2312,16 +2547,15 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 	bool late_hpd = dcp_ext_dptx_607(dcp);
 	bool t8132 = dcp_is_t8132_ext(dcp);
 	/*
-	 * A DP2HDMI output on the 13.5 firmware line asserts its own HPD, in
-	 * dcp_enable_dp2hdmi_hpd(), and the connect asks the firmware for HPD
-	 * only on a DisplayPort connector or a late-HPD path, so this firmware
-	 * is never asked to detect the sink and never sends the link
-	 * configuration the wait below looks for. Treat the timeout as
-	 * non-fatal, as the compact and late-HPD cases do, instead of
-	 * withdrawing the display.
+	 * A DP2HDMI output asserts its own HPD, in dcp_enable_dp2hdmi_hpd().
+	 * The 13.5 firmware line is then never asked to detect the sink and
+	 * never sends the link configuration the wait below looks for, and a
+	 * session a boot stage handed over has a link it already trained.
+	 * Treat the timeout as non-fatal there, as the compact and late-HPD
+	 * cases do, instead of withdrawing the display.
 	 */
 	bool dp2hdmi = dcp->hdmi_hpd && !dcp_is_typec_output(dcp) &&
-		       dcp->fw_compat == DCP_FIRMWARE_V_13_5;
+		       (dcp->fw_compat == DCP_FIRMWARE_V_13_5 || dcp->rtkit_adopted);
 	bool compact, withdrawn;
 	unsigned long timeout;
 	u64 generation;
@@ -2448,19 +2682,17 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 		goto out_release;
 	}
 	dcp->dptxport[port].connected = true;
-	if (dcp_is_typec_output(dcp) && !late_hpd) {
-		if (dcp_uses_t6020_tunnel_flow(dcp))
-			ret = dptxport_set_hpd_timeout(dcp->dptxport[port].service,
-						       true, 8000);
+	ret = dcp_assert_hpd_before_link_wait(dcp, port, late_hpd, dp2hdmi);
+	if (ret) {
+		if (ret == -ENOLINK)
+			dev_dbg(dcp->dev,
+				"dcp_dptx_connect: HDMI HPD dropped before assert\n");
 		else
-			ret = dptxport_set_hpd(dcp->dptxport[port].service, true);
-		if (ret) {
 			dev_err(dcp->dev,
-				"dcp_dptx_connect: failed to assert Type-C HPD: %d\n",
+				"dcp_dptx_connect: failed to assert AP HPD: %d\n",
 				ret);
-			dcp->dptxport[port].connected = false;
-			goto out_release;
-		}
+		dcp->dptxport[port].connected = false;
+		goto out_release;
 	}
 
 	mutex_unlock(&dcp->hpd_mutex);
@@ -2495,8 +2727,9 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 		ret = 0;
 	} else if (!ret && dp2hdmi) {
 		/*
-		 * The converter holds HPD itself, and dptxport_set_hpd() below runs
-		 * only for a DisplayPort connector, so nothing is asserted here.
+		 * The converter holds HPD itself; dptxport_set_hpd() below raises
+		 * the firmware's HPD only on an adopted session, whose release at
+		 * start dropped it.
 		 */
 		dev_dbg(dcp->dev,
 			"dcp_dptx_connect: no link configuration on port %u, HPD is the converter's\n",
@@ -2519,7 +2752,8 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 
 	usleep_range(5, 10);
 
-	if (dcp->connector_type == DRM_MODE_CONNECTOR_DisplayPort || late_hpd) {
+	if (dcp->connector_type == DRM_MODE_CONNECTOR_DisplayPort || late_hpd ||
+	    (dp2hdmi && dcp->rtkit_adopted)) {
 		ret = dptxport_set_hpd(dcp->dptxport[port].service, true);
 		if (ret && late_hpd)
 			dev_err(dcp->dev,
@@ -4142,13 +4376,26 @@ bool dcp_fw_compat_is_desktop(struct platform_device *pdev)
 	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP;
 }
 
-/* Firmware whose panel shows PQ content as EDR (dcp_panel_edr_supported()). */
-bool dcp_fw_compat_panel_edr(struct platform_device *pdev)
+/*
+ * Whether @pdev's internal panel can show PQ content as EDR: the panel has
+ * EDR headroom (the ADT's EDRPotentialHeadroom, see dcp_panel_read_adt()),
+ * and the firmware interface is one whose swaps carry EDR, which the driver
+ * implements for desktop 26.x and firmware 27 (dcp_panel_edr_supported()).
+ */
+bool dcp_panel_edr(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
-	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
-	       dcp->fw_compat == DCP_FIRMWARE_V_27_0;
+	return dcp_fw_swap_has_edr(dcp) && dcp_has_panel(dcp) &&
+	       dcp->panel.edr_ceiling;
+}
+
+/* External connectors driven by iomfb_template support full colour selection. */
+bool dcp_ext_color_props_supported(struct platform_device *pdev)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	return !dcp_is_ext26(dcp) && !dcp_fw_compat_is_14_7(pdev);
 }
 
 bool dcp_fw_compat_is_14_7(struct platform_device *pdev)
@@ -4224,37 +4471,7 @@ static const struct apple_epic_service_ops dcp_compact_aux_ops[] = {
 static void dcp_av_service_init(struct apple_epic_service *service,
 				const char *name, const char *class, s64 unit)
 {
-	struct dcp_desktop_state *d = service->ep->dcp->desktop;
-	struct apple_epic_service *old;
-
-	service = afk_service_get(service);
-	if (!service)
-		return;
-	scoped_guard(spinlock_irqsave, &d->hdr_lock) {
-		old = d->av_service;
-		d->av_service = service;
-		d->hdr_sent_valid = false;
-		d->hdr_infoframe = false;
-	}
-	if (old)
-		afk_service_put(old);
-}
-
-static void dcp_av_service_teardown(struct apple_epic_service *service)
-{
-	struct dcp_desktop_state *d = service->ep->dcp->desktop;
-	bool owned;
-
-	scoped_guard(spinlock_irqsave, &d->hdr_lock) {
-		owned = d->av_service == service;
-		if (owned) {
-			d->av_service = NULL;
-			d->hdr_sent_valid = false;
-			d->hdr_infoframe = false;
-		}
-	}
-	if (owned)
-		afk_service_put(service);
+	dcp_hdr_service_bind(service);
 }
 
 static const struct apple_epic_service_ops dcp_ext_av_service_ops[] = {
@@ -4262,7 +4479,7 @@ static const struct apple_epic_service_ops dcp_ext_av_service_ops[] = {
 		.name = "dcpav-service-epic",
 		.reusable = true,
 		.init = dcp_av_service_init,
-		.teardown = dcp_av_service_teardown,
+		.teardown = dcp_hdr_service_unbind,
 	},
 	{
 		.name = "*",
@@ -4657,6 +4874,9 @@ static int dcp_ext26_start_services(struct apple_dcp *dcp)
  * whose firmware advertises both of those gets the controller and its ports
  * there.
  *
+ * A primary DCP can also serve external ports when the device tree connects
+ * Type-C display routes to it.
+ *
  * Decided here, not at probe: RTKit is woken at bind, and its endpoint map is
  * known only from then on. Hardware data that names an endpoint keeps it:
  * T8142's dcpext (the same layout), and the T6050 and firmware-27 T6041
@@ -4664,8 +4884,8 @@ static int dcp_ext26_start_services(struct apple_dcp *dcp)
  */
 static void dcp_v27_dptx_layout(struct apple_dcp *dcp)
 {
-	if (dcp->fw_compat != DCP_FIRMWARE_V_27_0 || !dcp->dcpext ||
-	    dcp->hw.dptx_endpoint)
+	if (dcp->fw_compat != DCP_FIRMWARE_V_27_0 ||
+	    (!dcp->dcpext && !dcp->nr_typec_routes) || dcp->hw.dptx_endpoint)
 		return;
 	if (!apple_rtkit_has_endpoint(dcp->rtk, DPTX_CONTROLLER_ENDPOINT) ||
 	    !apple_rtkit_has_endpoint(dcp->rtk, DPTX_ENDPOINT))
@@ -4760,6 +4980,24 @@ int dcp_start(struct platform_device *pdev)
 		if (ret) {
 			dev_warn(dcp->dev, "Failed to start DPTX endpoint: %d\n",
 				 ret);
+		} else if (dcp->rtkit_adopted &&
+			   dptx_service_available(&dcp->dptxport[0])) {
+			/*
+			 * The boot stage that handed this DCP over left the
+			 * port's display up on a link it trained. Release it,
+			 * so that the next connect trains the link and reads
+			 * the sink again: until then the firmware only has its
+			 * default modes and no EDID. Its HPD goes low as well;
+			 * dcp_dptx_connect() raises it again after the link wait,
+			 * so that the firmware sees the display plugged.
+			 */
+			ret = dptxport_set_hpd(dcp->dptxport[0].service, false);
+			if (!ret)
+				ret = dptxport_release_display(dcp->dptxport[0].service);
+			if (ret)
+				dev_warn(dcp->dev, "adopted DPTX display not released: %d\n",
+					 ret);
+			ret = 0;
 #ifdef DCP_DPTX_DISCONNECT_ON_INIT
 		/*
 		 * This disconnect / connect cycle on init is only necessary
@@ -4890,8 +5128,6 @@ static void _dcp_poweroff(struct apple_dcp *dcp)
 		iomfb_poweroff_v26_6_desktop(dcp);
 		if (dcp->edr_hm)
 			dcp->edr_restart = true;
-		/* The link set up again starts without HDR10 metadata. */
-		dcp_hdr_metadata_forget(dcp);
 		break;
 	case DCP_FIRMWARE_V_26_6:
 		iomfb_v26_6_poweroff(dcp);
@@ -4913,6 +5149,13 @@ static void _dcp_poweroff(struct apple_dcp *dcp)
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
 		break;
 	}
+	/* The link set up again starts without HDR10 metadata. */
+	scoped_guard(spinlock_irqsave, &dcp->hdr.lock) {
+		dcp->active_color.score = -1;
+		dcp->output_pq = false;
+		dcp->output_hdr = false;
+	}
+	dcp_hdr_metadata_forget(dcp);
 }
 
 static void dcp_resume_enable_irq(void *ctx)
@@ -5914,31 +6157,25 @@ static bool dcp_ext26_admitted(struct device_node *np)
 }
 
 /*
- * J716c shares the 27.0 endpoint-control wire format, not the J714s normal
- * IOMFB method or panel profile. Establish this before RTKit can receive any
- * application traffic, including traffic that invalidates a later inventory.
+ * Firmware 27 (T6050) sleep endpoint-control transport. Establish this before
+ * RTKit can receive any application traffic, including traffic that invalidates
+ * a later inventory. Admitted for a T6050 DCP/DCPEXT whose firmware 27 method
+ * table has an ID for every call the sleep sends.
  */
 static bool dcp_v27_sleep_transport_supported(struct apple_dcp *dcp)
 {
 	struct device *dev = dcp->dev;
-	char compat[DCP_FW_VERSION_STR_LEN];
 
 	if (!IS_ENABLED(CONFIG_APPLE_SOC_SLEEP))
 		return false;
-	if (dcp->v27_j714s)
-		return true;
-	if (!of_machine_is_compatible("apple,j716c") ||
-	    !of_machine_is_compatible("apple,t6050") ||
-	    !(of_device_is_compatible(dev->of_node, "apple,t6050-dcp") ||
+	if (!(of_device_is_compatible(dev->of_node, "apple,t6050-dcp") ||
 	      of_device_is_compatible(dev->of_node, "apple,t6050-dcpext")) ||
 	    !dcp->hw.adopt_live_session ||
 	    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_DEFAULT ||
 	    dcp->fw_compat != DCP_FIRMWARE_V_27_0)
 		return false;
 
-	/* The enum also covers later 27.x method tables. */
-	return dcp_read_fw_version(dev, "apple,firmware-compat", compat) >= 0 &&
-	       !strcmp(compat, "27.0.0");
+	return iomfb_v27_sleep_methods_complete(dcp->v27_methods);
 }
 
 /*
@@ -6124,6 +6361,14 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 		(strncmp(fw_str, "14.7.0", sizeof(compat_str)) == 0))
 		return DCP_FIRMWARE_V_14_7_TEMPLATE;
 
+	/*
+	 * The loader reports the method ABI for each DCP. Legacy match data
+	 * leaves the ABI to this property, so accept a complete table here
+	 * when the reported ABI has no legacy implementation.
+	 */
+	if (iomfb_v27_methods(compat_str))
+		return dcp_v27_method_table(dev, compat_str);
+
 	dev_err(dev, "DCP firmware-compat %s (FW: %s) is not supported\n",
 		compat_str, fw_str);
 
@@ -6227,41 +6472,15 @@ VISIBLE_IF_KUNIT void dcp_enable_typec_work(struct apple_dcp *dcp)
 	}
 }
 
-static int dcp_firmware_metadata_v27(struct apple_dcp *dcp)
+/*
+ * The provider clocks firmware 27 asks for by index (getClockFrequency):
+ * apple,clock-ids, published by the boot loader from the ADT.
+ */
+static int dcp_firmware_clocks_v27(struct apple_dcp *dcp)
 {
 	struct device *dev = dcp->dev;
-	struct device_node *fb;
-	struct resource resource;
 	int clocks, index, ret;
 
-	/*
-	 * The framebuffer region is the one the boot loader scanned out of; it
-	 * backs the firmware's default framebuffer.  An external processor the
-	 * boot loader drove no display from (T6050's dcpext4, the HDMI port's)
-	 * has none: it binds without one, and its default-framebuffer requests
-	 * are refused (dfb_region_size 0).
-	 */
-	index = of_property_match_string(dev->of_node, "memory-region-names",
-					 "framebuffer");
-	if (index == -ENODATA || index == -EINVAL) {
-		dcp->dfb_region_size = 0;
-		dev_info(dev, "no boot framebuffer\n");
-		goto clocks;
-	}
-	if (index < 0)
-		return index;
-	fb = of_parse_phandle(dev->of_node, "memory-region", index);
-	if (!fb)
-		return -EINVAL;
-	ret = of_address_to_resource(fb, 0, &resource);
-	of_node_put(fb);
-	if (ret)
-		return ret;
-	dcp->dfb_region_size = resource_size(&resource);
-	if (!dcp->dfb_region_size)
-		return -EINVAL;
-
-clocks:
 	/*
 	 * T6041 device trees carry the single 712 MHz disp0 clock unless the
 	 * boot loader publishes the two /arm-io/disp0 provider clocks
@@ -6302,6 +6521,15 @@ clocks:
 	if (clocks < 0 || clocks > 64)
 		return -EINVAL;
 	/*
+	 * An explicitly empty table: the firmware takes no provider clocks
+	 * (every T602x display processor on 27.2). A display clock the node
+	 * lists is the DCP's own clock, not a provider clock.
+	 */
+	if (!clocks) {
+		dcp->num_firmware_clocks = 0;
+		return 0;
+	}
+	/*
 	 * A DCP that also boots earlier firmware (T8142) lists the clock those
 	 * use first and names the provider clocks "firmware-<index>". Take only
 	 * the named ones here.
@@ -6334,6 +6562,56 @@ clocks:
 	return 0;
 }
 
+static int dcp_firmware_metadata_v27(struct apple_dcp *dcp)
+{
+	struct device *dev = dcp->dev;
+	struct device_node *fb;
+	struct resource resource;
+	int index, ret;
+
+	/*
+	 * The framebuffer region is the one the boot loader scanned out of; it
+	 * backs the firmware's default framebuffer.  An external processor the
+	 * boot loader drove no display from (T6050's dcpext4, the HDMI port's)
+	 * has none: it binds without one, and its default-framebuffer requests
+	 * are refused (dfb_region_size 0).
+	 */
+	index = of_property_match_string(dev->of_node, "memory-region-names",
+					 "framebuffer");
+	if (index == -ENODATA || index == -EINVAL) {
+		dcp->dfb_region_size = 0;
+		dev_info(dev, "no boot framebuffer\n");
+		return dcp_firmware_clocks_v27(dcp);
+	}
+	if (index < 0)
+		return index;
+	fb = of_parse_phandle(dev->of_node, "memory-region", index);
+	if (!fb)
+		return -EINVAL;
+	ret = of_address_to_resource(fb, 0, &resource);
+	of_node_put(fb);
+	if (ret)
+		return ret;
+	dcp->dfb_region_size = resource_size(&resource);
+	if (!dcp->dfb_region_size)
+		return -EINVAL;
+	/*
+	 * The boot surface is on screen until a displayed swap of ours
+	 * replaces it. Reserve its retirement record before any present.
+	 * Without the record the display still takes over, and a cache
+	 * controller waiting on it keeps allocation off.
+	 */
+	ret = apple_mcc_boot_scanout_reserve(dev->of_node);
+	if (ret == -ENOMEM)
+		dev_warn(dev, "no boot scanout record: system cache allocation stays off\n");
+	else if (ret)
+		return ret;
+	dcp->boot_scanout_reserved = !ret;
+	WRITE_ONCE(dcp->boot_surface_pending, true);
+
+	return dcp_firmware_clocks_v27(dcp);
+}
+
 static bool dcp_external_is_idle(struct apple_dcp *dcp)
 {
 	u32 control = readl_relaxed(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
@@ -6350,12 +6628,17 @@ static bool dcp_external_is_idle(struct apple_dcp *dcp)
  * drive the full panel (aura: chosen.asahi,show-notch=1). Follow it, so the
  * mode covers the same rows as the boot framebuffer did.
  */
-static bool boot_show_notch(void)
+static bool dcp_boot_show_notch(const struct device_node *chosen)
 {
 	const char *val;
 
-	return !of_property_read_string(of_chosen, "asahi,show-notch", &val) &&
+	return !of_property_read_string(chosen, "asahi,show-notch", &val) &&
 	       !strcmp(val, "1");
+}
+
+static bool boot_show_notch(void)
+{
+	return dcp_boot_show_notch(of_chosen);
 }
 
 /*
@@ -6457,7 +6740,9 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 {
 	struct device_node *panel_np;
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
+	struct dcp_rtkit_live live_rtkit = {};
 	u32 cpu_ctrl;
+	int live = 0;
 	int ret;
 
 	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
@@ -6713,12 +6998,30 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 			       dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
 	}
 
+	/*
+	 * Check a handed-over session before anything is retained for it: a
+	 * description that fails leaves the DCP unbound and nothing pinned.
+	 * Its buffers are in no-map carveouts, which the kernel never hands out.
+	 */
+	live = dcp_rtkit_live_parse(dcp, &live_rtkit);
+	if (live < 0) {
+		ret = dev_err_probe(dev, live, "Invalid live RTKit handoff\n");
+		goto err_piodma;
+	}
 	/* Registering the mailbox can already expose RTKit buffer requests. */
 	ret = dcp_pin_live_session(dcp);
-	if (ret)
+	if (ret) {
+		if (live)
+			dcp_rtkit_live_unmap(&live_rtkit);
 		goto err_piodma;
+	}
 	/* External H17P supplies shared-buffer addresses during RTKit startup. */
-	if (dcp->hw.iomfb_method_profile ==
+	if (live)
+		dcp->rtk = apple_rtkit_init_adopted_with_session(
+			dev, dcp, "mbox", 0,
+			dcp->hw.link_report ? &link_report_rtkit_ops : &rtkit_ops,
+			&live_rtkit.session);
+	else if (dcp->hw.iomfb_method_profile ==
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL)
 		dcp->rtk = apple_rtkit_init(dev, dcp, "mbox", 0,
 					    &external_h17p_rtkit_ops);
@@ -6727,6 +7030,8 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 	else
 		dcp->rtk = apple_rtkit_init(dev, dcp, "mbox", 0, &rtkit_ops);
 	if (IS_ERR(dcp->rtk)) {
+		if (live)
+			dcp_rtkit_live_unmap(&live_rtkit);
 		ret = dev_err_probe(dev, PTR_ERR(dcp->rtk),
 				    "Failed to initialize RTKit\n");
 		goto err_piodma;
@@ -6734,6 +7039,7 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 	ret = devm_add_action_or_reset(dev, dcp_release_rtkit, dcp);
 	if (ret)
 		goto err_piodma;
+	dcp->rtkit_adopted = live;
 	dcp_s2r_check_dt(dcp);
 	/* After a warm restart its log counters need echoing, or it refuses its next idle. */
 	if (dcp->hw.s2r || dcp->hw.s2r_ext)
@@ -6746,7 +7052,9 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 		dev_dbg(dev, "negotiating RTKit with the running DCP\n");
 
 	/* Announce host readiness before awaiting external IOP readiness. */
-	if (dcp->hw.iomfb_method_profile ==
+	if (live)
+		ret = 0;	/* HELLO and EPMAP happened before the handoff */
+	else if (dcp->hw.iomfb_method_profile ==
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL)
 		ret = apple_rtkit_wake_early_ap(dcp->rtk);
 	else if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
@@ -6885,6 +7193,9 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 			drm_dev_get(dcp->crtc->base.dev);
 			dcp->drm_retained = true;
 		}
+		/* Its handler talks to the session this unbind leaves behind. */
+		if (dcp->hdmi_hpd_irq)
+			disable_irq(dcp->hdmi_hpd_irq);
 		iomfb_queue_stop(dcp);
 		afk_quiesce(dcp->avep);
 		afk_quiesce(dcp->dptxep);
@@ -6911,6 +7222,7 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 			dcp->announce.stopped = true;
 		disable_delayed_work_sync(&dcp->announce_wq);
 		dcp_test_point(dcp, DCP_TEST_UNBIND_ANNOUNCE_STOPPED);
+		disable_delayed_work_sync(&dcp->swap_watchdog_wq);
 		cancel_work_sync(&dcp->vblank_wq);
 		if (dcp->connector)
 			cancel_work_sync(&dcp->connector->hotplug_wq);
@@ -7158,6 +7470,347 @@ static void dcp_t8132_ext_routes(struct apple_dcp *dcp)
 
 static int dcp_s2r_pm_register(struct apple_dcp *dcp);
 
+/* A DCP node with apple,sleep-host-stop: the SoC's sleep needs the display stopped from here. */
+static bool dcp_sleep_host_stop;
+static bool dcp_sleep_host_stop_missing;
+static struct apple_dcp *dcp_t6041_host;
+
+static void dcp_t6041_host_release(void *data)
+{
+	struct apple_dcp *dcp = data;
+
+	if (READ_ONCE(dcp_t6041_host) == dcp) {
+		WRITE_ONCE(dcp_sleep_host_stop, false);
+		WRITE_ONCE(dcp_t6041_host, NULL);
+	}
+}
+
+#define DCP_T6041_MAX_PMGR_MAPS 16
+
+struct dcp_t6041_pmgr_map {
+	struct device_node *np;
+	void __iomem *base;
+	resource_size_t size;
+};
+
+struct dcp_t6041_pmgr_cache {
+	struct dcp_t6041_pmgr_map maps[DCP_T6041_MAX_PMGR_MAPS];
+	unsigned int count;
+};
+
+static void dcp_t6041_iounmap(void *base)
+{
+	iounmap((__force void __iomem *)base);
+}
+
+static void dcp_t6041_pmgr_cache_put(struct dcp_t6041_pmgr_cache *cache)
+{
+	unsigned int i;
+
+	for (i = 0; i < cache->count; i++)
+		of_node_put(cache->maps[i].np);
+}
+
+static void __iomem *dcp_t6041_map_reg(struct device *dev, struct device_node *np,
+				       const char *name, resource_size_t min_size,
+				       resource_size_t *out_size)
+{
+	struct resource res;
+	resource_size_t size;
+	void __iomem *base;
+	int index;
+
+	index = of_property_match_string(np, "reg-names", name);
+	if (index < 0)
+		return IOMEM_ERR_PTR(index);
+	if (of_address_to_resource(np, index, &res))
+		return IOMEM_ERR_PTR(-EINVAL);
+	size = resource_size(&res);
+	if (size < min_size) {
+		dev_err(dev, "%pOF reg '%s' too small (%pa < %pa)\n",
+			np, name, &size, &min_size);
+		return IOMEM_ERR_PTR(-EINVAL);
+	}
+
+	/* Shared with the PMGR, PMC and fabric drivers, so not claimed. */
+	base = devm_ioremap(dev, res.start, size);
+	if (!base)
+		return IOMEM_ERR_PTR(-ENOMEM);
+	if (out_size)
+		*out_size = size;
+
+	return base;
+}
+
+static void __iomem *dcp_t6041_map_ps_node(struct device *dev,
+					   struct dcp_t6041_pmgr_cache *cache,
+					   struct device_node *ps_np)
+{
+	struct device_node *pmgr_np __free(device_node) = of_get_parent(ps_np);
+	struct dcp_t6041_pmgr_map *map = NULL;
+	struct resource res;
+	resource_size_t size;
+	void __iomem *base;
+	unsigned int i;
+	u32 off;
+	int ret;
+
+	if (!pmgr_np) {
+		dev_err(dev, "%pOF has no parent pmgr node\n", ps_np);
+		return IOMEM_ERR_PTR(-EINVAL);
+	}
+	if (of_property_read_u32_index(ps_np, "reg", 0, &off)) {
+		dev_err(dev, "%pOF missing reg offset\n", ps_np);
+		return IOMEM_ERR_PTR(-EINVAL);
+	}
+
+	for (i = 0; i < cache->count; i++) {
+		if (cache->maps[i].np == pmgr_np) {
+			map = &cache->maps[i];
+			break;
+		}
+	}
+
+	if (!map) {
+		if (cache->count >= ARRAY_SIZE(cache->maps)) {
+			dev_err(dev, "too many distinct pmgr parents for %pOF\n", ps_np);
+			return IOMEM_ERR_PTR(-ENOSPC);
+		}
+		if (of_address_to_resource(pmgr_np, 0, &res)) {
+			dev_err(dev, "%pOF missing parent pmgr reg\n", pmgr_np);
+			return IOMEM_ERR_PTR(-EINVAL);
+		}
+		size = resource_size(&res);
+		/* Shared with the PMGR driver, so mapped via of_iomap without claiming. */
+		base = of_iomap(pmgr_np, 0);
+		if (!base)
+			return IOMEM_ERR_PTR(-ENOMEM);
+		ret = devm_add_action_or_reset(dev, dcp_t6041_iounmap, (__force void *)base);
+		if (ret)
+			return IOMEM_ERR_PTR(ret);
+
+		map = &cache->maps[cache->count++];
+		map->np = of_node_get(pmgr_np);
+		map->base = base;
+		map->size = size;
+	}
+
+	if ((off & 3) || off > map->size || map->size - off < sizeof(u32)) {
+		dev_err(dev, "%pOF reg offset %#x out of bounds for %pOF (%pa)\n",
+			ps_np, off, pmgr_np, &map->size);
+		return IOMEM_ERR_PTR(-EINVAL);
+	}
+
+	return map->base + off;
+}
+
+static int dcp_t6041_parse_chain(struct device *dev, struct dcp_t6041_power *pwr,
+				 struct dcp_t6041_pmgr_cache *cache,
+				 struct device_node *child,
+				 resource_size_t gapf_size,
+				 resource_size_t pg_size,
+				 resource_size_t pg_aux_size,
+				 struct dcp_t6041_chain *chain)
+{
+	struct of_phandle_args args;
+	resource_size_t pg_lim;
+	void __iomem *pg_base;
+	u32 gapf_off, pg_off[2];
+	bool pg_aux;
+	int count, i;
+
+	if (of_property_read_u32(child, "reg", &chain->reg)) {
+		dev_err(dev, "%pOF missing reg\n", child);
+		return -EINVAL;
+	}
+	if (of_property_read_string(child, "label", &chain->name))
+		chain->name = child->name;
+
+	chain->is_main = of_property_read_bool(child, "apple,main-chain");
+	pg_aux = of_property_read_bool(child, "apple,pwrgate-aux");
+
+	if (of_property_read_u32(child, "apple,gapf-offset", &gapf_off) ||
+	    (gapf_off & 3) || gapf_off > gapf_size || gapf_size - gapf_off < sizeof(u32)) {
+		dev_err(dev, "%pOF invalid apple,gapf-offset\n", child);
+		return -EINVAL;
+	}
+	chain->gapf = pwr->gapf + gapf_off;
+
+	pg_base = pg_aux ? pwr->pwrgate_aux : pwr->pwrgate;
+	pg_lim = pg_aux ? pg_aux_size : pg_size;
+	if (of_property_read_u32_array(child, "apple,pwrgate-offsets", pg_off, 2) ||
+	    (pg_off[0] & 3) || pg_off[0] > pg_lim || pg_lim - pg_off[0] < sizeof(u32) ||
+	    (pg_off[1] & 3) || pg_off[1] > pg_lim || pg_lim - pg_off[1] < sizeof(u32)) {
+		dev_err(dev, "%pOF invalid apple,pwrgate-offsets\n", child);
+		return -EINVAL;
+	}
+	chain->pg_a = pg_base + pg_off[0];
+	chain->pg_b = pg_base + pg_off[1];
+
+	if (of_property_present(child, "apple,fabric-domain")) {
+		struct device_node *fab_np __free(device_node) =
+			of_parse_phandle(child, "apple,fabric-domain", 0);
+
+		if (!fab_np) {
+			dev_err(dev, "%pOF invalid apple,fabric-domain\n", child);
+			return -EINVAL;
+		}
+		chain->fabric = dcp_t6041_map_ps_node(dev, cache, fab_np);
+		if (IS_ERR(chain->fabric))
+			return PTR_ERR(chain->fabric);
+	} else if (chain->is_main) {
+		dev_err(dev, "%pOF main chain missing apple,fabric-domain\n", child);
+		return -EINVAL;
+	}
+
+	count = of_count_phandle_with_args(child, "power-domains", "#power-domain-cells");
+	if (count < 3) {
+		dev_err(dev, "%pOF needs at least 3 power-domains (got %d)\n", child, count);
+		return -EINVAL;
+	}
+
+	chain->domains = devm_kcalloc(dev, count, sizeof(*chain->domains), GFP_KERNEL);
+	if (!chain->domains)
+		return -ENOMEM;
+	chain->num_domains = count;
+
+	for (i = 0; i < count; i++) {
+		int ret = of_parse_phandle_with_args(child, "power-domains",
+						     "#power-domain-cells", i, &args);
+		void __iomem *reg;
+
+		if (ret) {
+			dev_err(dev, "%pOF power-domains[%d] parse failed: %d\n", child, i, ret);
+			return ret;
+		}
+		reg = dcp_t6041_map_ps_node(dev, cache, args.np);
+		of_node_put(args.np);
+		if (IS_ERR(reg))
+			return PTR_ERR(reg);
+		chain->domains[i] = reg;
+	}
+
+	if (chain->is_main && count > 3) {
+		chain->child_saved = devm_kcalloc(dev, count - 3, sizeof(*chain->child_saved),
+						  GFP_KERNEL);
+		if (!chain->child_saved)
+			return -ENOMEM;
+	}
+
+	return 0;
+}
+
+static int dcp_t6041_map_power(struct apple_dcp *dcp)
+{
+	struct device *dev = dcp->dev;
+	struct device_node *np __free(device_node) =
+		of_parse_phandle(dev->of_node, "apple,display-power", 0);
+	struct dcp_t6041_power *pwr = &dcp->t6041_power;
+	struct dcp_t6041_pmgr_cache cache = {};
+	resource_size_t pg_size = 0, pg_aux_size = 0, gapf_size = 0;
+	const struct {
+		const char *name;
+		void __iomem **dst;
+		resource_size_t min_size;
+		resource_size_t *out_size;
+	} regs[] = {
+		{ "pmc-dcp",     &pwr->pmc_dcp,     0x8, NULL },
+		{ "pwrgate",     &pwr->pwrgate,     0x4, &pg_size },
+		{ "pwrgate-aux", &pwr->pwrgate_aux, 0x4, &pg_aux_size },
+		{ "gapf",        &pwr->gapf,        0x4, &gapf_size },
+		{ "axi2af",      &pwr->axi2af,      0xc, NULL },
+	};
+	unsigned int nchains = 0, idx = 0, main_count = 0, i, j;
+	int ret;
+
+	if (!np)
+		return -ENODEV;
+	if (!of_device_is_compatible(np, "apple,t6041-display-power"))
+		return -EINVAL;
+
+	for (i = 0; i < ARRAY_SIZE(regs); i++) {
+		void __iomem *base = dcp_t6041_map_reg(dev, np, regs[i].name,
+						       regs[i].min_size, regs[i].out_size);
+
+		if (IS_ERR(base)) {
+			dev_err(dev, "apple,display-power reg '%s' failed: %ld\n",
+				regs[i].name, PTR_ERR(base));
+			ret = PTR_ERR(base);
+			goto err;
+		}
+		*regs[i].dst = base;
+	}
+
+	for_each_available_child_of_node_scoped(np, child) {
+		if (!of_node_name_eq(child, "chain"))
+			continue;
+		nchains++;
+	}
+	if (!nchains) {
+		dev_err(dev, "%pOF has no chain child nodes\n", np);
+		ret = -EINVAL;
+		goto err;
+	}
+
+	pwr->chains = devm_kcalloc(dev, nchains, sizeof(*pwr->chains), GFP_KERNEL);
+	if (!pwr->chains) {
+		ret = -ENOMEM;
+		goto err;
+	}
+	pwr->num_chains = nchains;
+
+	for_each_available_child_of_node_scoped(np, child) {
+		if (!of_node_name_eq(child, "chain"))
+			continue;
+		ret = dcp_t6041_parse_chain(dev, pwr, &cache, child,
+					    gapf_size, pg_size, pg_aux_size,
+					    &pwr->chains[idx]);
+		if (ret)
+			goto err;
+		if (pwr->chains[idx].is_main)
+			main_count++;
+		idx++;
+	}
+
+	if (main_count != 1) {
+		dev_err(dev, "%pOF expected exactly 1 apple,main-chain, got %u\n",
+			np, main_count);
+		ret = -EINVAL;
+		goto err;
+	}
+
+	/* Order chains by ascending reg address so lowering order matches DT. */
+	for (i = 1; i < nchains; i++) {
+		struct dcp_t6041_chain key = pwr->chains[i];
+
+		for (j = i; j > 0 && pwr->chains[j - 1].reg > key.reg; j--)
+			pwr->chains[j] = pwr->chains[j - 1];
+		pwr->chains[j] = key;
+	}
+	for (i = 1; i < nchains; i++) {
+		if (pwr->chains[i].reg == pwr->chains[i - 1].reg) {
+			dev_err(dev, "%pOF duplicate chain reg %u\n",
+				np, pwr->chains[i].reg);
+			ret = -EINVAL;
+			goto err;
+		}
+	}
+	for (i = 0; i < nchains; i++) {
+		if (pwr->chains[i].is_main) {
+			pwr->main_chain = &pwr->chains[i];
+			break;
+		}
+	}
+
+	dcp_t6041_pmgr_cache_put(&cache);
+	return 0;
+
+err:
+	dcp_t6041_pmgr_cache_put(&cache);
+	memset(pwr, 0, sizeof(*pwr));
+	return ret;
+}
+
 static int dcp_platform_probe_pipe(struct platform_device *pdev)
 {
 	const struct apple_dcp_hw_data *hw = of_device_get_match_data(&pdev->dev);
@@ -7180,8 +7833,16 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	}
 
 	fw_compat = dcp_check_firmware_version(dev);
-	if (fw_compat == DCP_FIRMWARE_UNKNOWN)
+	if (fw_compat == DCP_FIRMWARE_UNKNOWN) {
+		/*
+		 * The firmware does not change until the next boot, so this
+		 * processor never registers its Type-C display routes: disable
+		 * them, so that the port controllers that name them as their
+		 * mode switch do not wait for them, and USB on the ports goes on.
+		 */
+		dcp_typec_routes_disable_dev(dev);
 		return -ENODEV;
+	}
 	if (fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
 	    (fw_compat == DCP_FIRMWARE_V_27_0 &&
 	     of_device_is_compatible(dev->of_node, "apple,t6041-dcp"))) {
@@ -7222,6 +7883,8 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 
 	INIT_LIST_HEAD(&dcp->swapped_out_fbs);
 	mutex_init(&dcp->swapped_out_fbs_lock);
+	init_completion(&dcp->v27_wake_video);
+	init_completion(&dcp->v27_wake_hotplug);
 	ret = dcp_backlight_init(dcp, dev);
 	if (ret)
 		return ret;
@@ -7229,7 +7892,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 
 	dcp->fw_compat = fw_compat;
 	dcp->v27_j714s = fw_compat == DCP_FIRMWARE_V_27_0 &&
-			 of_machine_is_compatible("apple,j714s");
+			 apple_t6050_sleep_property("apple,display-method-sleep");
 	/*
 	 * Probe-lifetime like the desktop state: component bind opens a devres
 	 * group on this device and releases it on failure or unbind.
@@ -7267,7 +7930,6 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 		dcp->desktop = devm_kzalloc(dev, sizeof(*dcp->desktop), GFP_KERNEL);
 		if (!dcp->desktop)
 			return -ENOMEM;
-		spin_lock_init(&dcp->desktop->hdr_lock);
 		/*
 		 * The opaque client identity of the IOMFB calls.  The firmware's
 		 * own client passes a kernel pointer there; pass a random value
@@ -7311,12 +7973,17 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	dcp_fabric_init(dcp);
 	spin_lock_init(&dcp->mode_state.lock);
 	spin_lock_init(&dcp->metadata.lock);
+	spin_lock_init(&dcp->hdr.lock);
+	dcp->active_color.score = -1;
 	mutex_init(&dcp->dcpavserv.lock);
 	INIT_WORK(&dcp->dcpavserv.close_wq, dcpavserv_close_work);
 	ret = dcpavserv_edid_retry_init(dcp);
 	if (ret)
 		return ret;
 	dcp->hw = *(struct apple_dcp_hw_data *)of_device_get_match_data(dev);
+	/* A boot stage handed this DCP over running: keep its session. */
+	if (of_property_present(dev->of_node, "apple,rtkit-handoff"))
+		dcp->hw.adopt_live_session = true;
 	/* The link report: on the board it has run on (dcp_j714s_ext()). */
 	if (!dcp_j714s_ext(dev))
 		dcp->hw.link_report = false;
@@ -7429,9 +8096,27 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	of_property_read_u32(dev->of_node, "apple,dcp-endpoint", &dcp->peer_endpoint);
 	if (of_property_read_bool(dev->of_node, "apple,typec-hybrid-first"))
 		dcp_typec_hybrid_first_dt();
+	if (of_property_read_bool(dev->of_node, "apple,sleep-host-stop")) {
+		ret = dcp_t6041_map_power(dcp);
+		if (ret) {
+			dev_err(dev,
+				"apple,display-power unusable (%d): host-driven sleep disabled\n",
+				ret);
+			WRITE_ONCE(dcp_sleep_host_stop_missing, true);
+		} else {
+			dcp->sleep_host_stop = true;
+			WRITE_ONCE(dcp_t6041_host, dcp);
+			WRITE_ONCE(dcp_sleep_host_stop, true);
+			ret = devm_add_action_or_reset(dev, dcp_t6041_host_release, dcp);
+			if (ret)
+				return ret;
+		}
+	}
 	of_property_read_u32(dev->of_node, "apple,dptx-phy", &dcp->dptx_phy);
 	of_property_read_u32(dev->of_node, "apple,dptx-die", &dcp->dptx_die);
 	dcp->fixed_dptx_phy = dcp->dptx_phy;
+	init_completion(&dcp->s2r_dart_done);
+	init_completion(&dcp->s2r_hpd_done);
 	init_completion(&dcp->typec_iomfb_hpd_ready);
 	INIT_DELAYED_WORK(&dcp->typec_reconnect_wq,
 			  dcp_typec_reconnect_work);
@@ -7907,12 +8592,53 @@ static int dcp_platform_probe_t8132_ext(struct platform_device *pdev)
  * bind's, may still appear (bounded by the deferred probe timeout); on any
  * other failure join as an unusable pipe.
  */
+/*
+ * A DCP driven through the iBoot interface alone (DCP_FIRMWARE_IBOOT,
+ * iomfb_iboot.c): no component of a display subsystem, with a DRM device of
+ * its own. Its adopted session cannot be stopped: once the firmware is
+ * touched, its DMA and this driver stay until reboot, and a failed start
+ * leaves the device bound without a display.
+ */
+static int dcp_platform_probe_iboot(struct platform_device *pdev)
+{
+	struct device *dev = &pdev->dev;
+	struct apple_dcp *dcp;
+	int ret;
+
+	if (dcp_session_retained(dev))
+		return dev_err_probe(dev, -EBUSY, "Previous live DCP session requires a reboot\n");
+	dcp = kzalloc_obj(*dcp);
+	if (!dcp)
+		return -ENOMEM;
+	ret = devm_add_action_or_reset(dev, dcp_release_context, dcp);
+	if (ret)
+		return ret;
+	dcp->dev = dev;
+	dcp->hw = *(struct apple_dcp_hw_data *)of_device_get_match_data(dev);
+	dcp->fw_compat = dcp->hw.firmware_compat;
+	ret = iommu_device_use_default_domain(dev);
+	if (ret)
+		return ret;
+	ret = devm_add_action_or_reset(dev, dcp_release_dma_domain, dcp);
+	if (ret)
+		return ret;
+	platform_set_drvdata(pdev, dcp);
+	return dcp_iboot_probe(dcp);
+}
+
 static int dcp_platform_probe(struct platform_device *pdev)
 {
+	const struct apple_dcp_hw_data *hw = of_device_get_match_data(&pdev->dev);
 	struct device *dev = &pdev->dev;
 	struct apple_dcp *dcp;
 	void *group;
 	int ret;
+
+	if (hw->firmware_compat == DCP_FIRMWARE_IBOOT) {
+		/* The port controllers wait for the USB-C display switches. */
+		t8152_typec_register(dev);
+		return dcp_platform_probe_iboot(pdev);
+	}
 
 	/* t6041_dcpext=0: stay off the external processors' hardware. */
 	if (of_device_is_compatible(dev->of_node, "apple,t6041-dcpext") &&
@@ -7972,6 +8698,11 @@ static void dcp_platform_remove(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
+	/* No component and none of the works below; see dcp_iboot_remove(). */
+	if (dcp && dcp_is_iboot(dcp)) {
+		dcp_iboot_remove(dcp);
+		return;
+	}
 	if (dcp) {
 		cancel_work_sync(&dcp->s2r_prewarm_work);
 		cancel_delayed_work_sync(&dcp->s2r_prewarm_off_wq);
@@ -8030,6 +8761,9 @@ VISIBLE_IF_KUNIT void dcp_platform_shutdown(struct platform_device *pdev)
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
 	if (dcp_takeover_was_aborted(dcp))
+		return;
+	/* The iBoot interface's display stays as it is: no component to remove. */
+	if (dcp && dcp_is_iboot(dcp))
 		return;
 
 	if (dcp && iomfb_is_m4(dcp)) {
@@ -8262,6 +8996,9 @@ static void dcp_platform_complete(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
+	/* The iBoot interface's display stays powered across system sleep. */
+	if (dcp_is_iboot(dcp))
+		return;
 	if (dcp_is_ext26(dcp)) {
 		WRITE_ONCE(dcp->ext26_pm_preparing, false);
 		if (dcp->ext26_pm_work_off && !READ_ONCE(dcp->ext26_blocked) &&
@@ -8356,6 +9093,10 @@ static const struct dcp_s2r_layout *dcp_s2r_layout(struct apple_dcp *dcp)
 		return &dcp_s2r_t8142_ext[dcp->index - 1];
 	return dcp->hw.s2r_layout ?: &dcp_s2r_t8140;
 }
+
+/* T6041's display stop and restart for its own sleep driver, below: T8140's DART streams. */
+#define DCP_S2R_DISP_STREAMS	(dcp_s2r_t8140.disp_streams)
+#define DCP_S2R_DCP_STREAMS	(dcp_s2r_t8140.dcp_streams)
 #define DCP_PS_MIN		GENMASK(19, 16)
 
 static struct device *dcp_s2r_find_dart(struct device_node *np)
@@ -8398,13 +9139,18 @@ static void dcp_s2r_find_darts(struct apple_dcp *dcp)
 
 void dcp_s2r_dart_power(struct apple_dcp *dcp, u32 on)
 {
+	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
+		dev_dbg(dcp->dev, "D572(%u) s2r_active=%u\n",
+			on, READ_ONCE(dcp->s2r_active));
+
 	if (!READ_ONCE(dcp->s2r_active))
 		return;
 
 	if (dcp->s2r_disp_dart)
 		apple_dart_display_streams(dcp->s2r_disp_dart, dcp_s2r_layout(dcp)->disp_streams,
 					   on, false);
-	complete(&dcp->s2r_dart_done);
+	if (dcp->fw_compat != DCP_FIRMWARE_V_26_6_DESKTOP || !on)
+		complete(&dcp->s2r_dart_done);
 }
 
 static bool dcp_s2r_capable(struct apple_dcp *dcp)
@@ -8895,6 +9641,15 @@ static int dcp_s2r_domains_off(struct apple_dcp *dcp)
 	if (ret)
 		goto out;
 
+	/*
+	 * The display DART goes off with these domains, and every framebuffer is mapped
+	 * into it: an unmap while they are off, a client freeing a buffer after DPMS off,
+	 * would reach its registers and reset the SoC. The firmware's D572 does not say
+	 * so on every firmware (27.2 reports 1 at the stop). Dark until the domains are
+	 * back, as for an external DCP.
+	 */
+	if (dcp->s2r_disp_dart)
+		apple_dart_power_dark(dcp->s2r_disp_dart, true);
 	if (pmc)
 		dcp_pmc_set(dcp, pmc, false);
 	val = readl(ps + l->disp_cpu);
@@ -9204,6 +9959,9 @@ static int dcp_s2r_warm_restart(struct apple_dcp *dcp)
 	ret = dcp_s2r_domains_on(dcp);
 	if (ret)
 		return ret;
+	/* Powered again: the invalidations held while it was dark run now. */
+	if (dcp->s2r_disp_dart)
+		apple_dart_power_dark(dcp->s2r_disp_dart, false);
 
 	/* After the domains, whose writes it would reject, the DART protects them again. */
 	if (dcp->s2r_dcp_dart)
@@ -9740,13 +10498,43 @@ static void dcp_t8132_sleep_stopped(struct apple_dcp *dcp)
 	WRITE_ONCE(dcp->t8132_release_late, false);
 }
 
+/**
+ * dcp_sleep_keeps_firmware - whether a DCP's firmware runs through this sleep
+ * @dev: the DCP device
+ *
+ * For blocks the DCP's firmware drives (DP audio), from their late suspend,
+ * after every device's .suspend. It takes the DCP's device lock, which can
+ * sleep, so it is not for the noirq phase. True when the DCP's suspend left
+ * its coprocessor running with its domains on, or when no driver is bound
+ * (a boot stage or an earlier bind may have left the firmware running).
+ * False when the suspend stopped the firmware (S2R, the 27.x sleep, an M4
+ * stop or power gate) or never ran it.
+ */
+bool dcp_sleep_keeps_firmware(struct device *dev)
+{
+	struct apple_dcp *dcp;
+	bool runs;
+
+	device_lock(dev);
+	dcp = dev->driver ? dev_get_drvdata(dev) : NULL;
+	runs = !dev->driver || (dcp && dcp->sleep_fw_runs);
+	device_unlock(dev);
+
+	return runs;
+}
+EXPORT_SYMBOL_GPL(dcp_sleep_keeps_firmware);
+
 static int dcp_platform_suspend(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
+	dcp->sleep_fw_runs = false;
 	/* Its power sequences may crash the DCP and blank the panel. */
 	if (dcp_takeover_was_aborted(dcp))
 		return -EBUSY;
+	/* The iBoot interface's display stays powered across system sleep. */
+	if (dcp_is_iboot(dcp))
+		return 0;
 
 	/*
 	 * An external DCP given up at probe may never have set up the works
@@ -9799,7 +10587,10 @@ static int dcp_platform_suspend(struct device *dev)
 			return ret;
 		}
 		dcp_t8132_sleep_stopped(dcp);
+		dcp->sleep_fw_runs = !iomfb_m4_sleep_stopped(dcp);
 		device_set_wakeup_path(dev);
+		if (dcp->sleep_fw_runs)
+			dcp_sleep_hold_phys(dcp);
 		return 0;
 	}
 	if (dcp_is_ext26(dcp) && pm_suspend_target_state != PM_SUSPEND_TO_IDLE) {
@@ -9854,7 +10645,9 @@ static int dcp_platform_suspend(struct device *dev)
 		/* Pair with the H17P unpark; native26 has its own retained resume. */
 		if (dcp_is_external_h17p(dcp))
 			dcp_typec_route_park(dcp);
+		dcp->sleep_fw_runs = true;
 		device_set_wakeup_path(dev);
+		dcp_sleep_hold_phys(dcp);
 		if (dcp_is_ext26(dcp))
 			dev_dbg(dev, "native26 retained s2idle stop; firmware and supplier leases held\n");
 		return 0;
@@ -9877,7 +10670,21 @@ static int dcp_platform_suspend(struct device *dev)
 
 	if (dcp->hdmi_hpd_irq) {
 		disable_irq(dcp->hdmi_hpd_irq);
-		if (!dcp->active_typec_route) {
+		/*
+		 * The firmware runs through this sleep, so the HDMI output
+		 * keeps its link as through DPMS off (see dcp_poweroff()), and
+		 * resume lights it again through dcp_poweron(). Only a display
+		 * that is gone is reported and released here. Releasing one
+		 * that stays attached reports it unplugged, and nothing
+		 * connects it again after the wake: its HPD stays high, so no
+		 * edge comes, and a CRTC userspace turned off for the unplug
+		 * never runs dcp_poweron(). A T6030 native output's resume sets
+		 * its PHY and crossbar up again (dcp_fabric_hdmi_reinit()),
+		 * which needs the link down, so it is still released.
+		 */
+		if (!dcp->active_typec_route &&
+		    (dcp->external_native ||
+		     gpiod_get_value_cansleep(dcp->hdmi_hpd) <= 0)) {
 			disconnected_hpd_event(dcp->connector);
 			dcp_dptx_disconnect(dcp, 0);
 		}
@@ -9887,18 +10694,29 @@ static int dcp_platform_suspend(struct device *dev)
 	 * domains to stay on. We need this as we do not support full
 	 * shutdown properly yet.
 	 */
+	dcp->sleep_fw_runs = true;
 	device_set_wakeup_path(dev);
+	dcp_sleep_hold_phys(dcp);
 	/* Last: the steps above still talk to the coprocessor. */
 	dcp_hold_for_sleep(dcp);
 
 	return 0;
 }
 
+void dcp_hdmi_disconnect(struct apple_dcp *dcp)
+{
+	disconnected_hpd_event(dcp->connector);
+	dcp_dptx_disconnect(dcp, 0);
+}
+
 static int dcp_platform_resume(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
+	dcp->sleep_fw_runs = false;
 	if (dcp_takeover_was_aborted(dcp))
+		return 0;
+	if (dcp_is_iboot(dcp))
 		return 0;
 
 	if (dcp_v27_sleep_selected(dcp) && READ_ONCE(dcp->sleep_v27_closed))
@@ -9939,6 +10757,9 @@ static int dcp_platform_resume(struct device *dev)
 	/* The HDMI output's PHY and crossbar may have lost their setup in sleep. */
 	if (dcp->external_native)
 		dcp_fabric_hdmi_reinit(dcp, "after system sleep");
+	/* Before the HPD IRQ comes back: an edge from now on is replayed. */
+	if (dcp->hdmi_hpd_irq)
+		dcp_hdmi_unplugged_in_sleep(dcp);
 	/* Observe future edges before sampling any edges lost in sleep. */
 	if (dcp->hdmi_hpd_irq)
 		dcp_fabric_run_resume(&dcp_resume_ops, dcp);
@@ -10136,8 +10957,29 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8142_dcpext = {
 	.s2r_layout = &dcp_s2r_t8142_ext[0],
 };
 
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8152)
+/*
+ * T8152 (J873g): the DCP and both DCPEXTs, driven through the firmware's
+ * iBoot interface (disp0-service, dispext-service) over AFKv2, with the
+ * DPAV controller and DPTX port endpoints opened as the firmware expects
+ * them. The bootloader leaves each session running or quiesced; a running
+ * one is taken without the RTKit handshake.
+ */
+static const struct apple_dcp_hw_data apple_dcp_hw_t8152_iboot = {
+	.num_dptx_ports = 2,
+	.firmware_compat = DCP_FIRMWARE_IBOOT,
+	.afk_v2 = true,
+	.afk_adopt_endpoints = true,
+	.afk_announced_names = true,
+	.afk_timeout_ms = 3000,
+};
+#endif
+
 static const struct of_device_id of_match[] = {
 	{ .compatible = "apple,t8142-dcpext", .data = &apple_dcp_hw_t8142_dcpext },
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8152)
+	{ .compatible = "apple,t8152-dcp-iboot", .data = &apple_dcp_hw_t8152_iboot },
+#endif
 	{ .compatible = "apple,t6041-dcp", .data = &apple_dcp_hw_t6041, },
 	{ .compatible = "apple,t6041-dcpext", .data = &apple_dcp_hw_t6041_dcpext, },
 	{ .compatible = "apple,t6050-dcp", .data = &apple_dcp_hw_t6050 },
@@ -10177,6 +11019,760 @@ static struct platform_driver apple_platform_driver = {
 	},
 };
 
+/*
+ * T6041 suspend-to-RAM: each display firmware is stopped from Linux before the sleep, from the
+ * display subsystem's own suspend, and the internal one is restarted warm after the wake.
+ */
+static int dcp_stop_poller(void *data)
+{
+	while (!kthread_should_stop()) {
+		apple_rtkit_poll(data);
+		usleep_range(500, 1000);
+	}
+	return 0;
+}
+
+static int dcp_t6041_recommit(struct apple_dcp *dcp);
+
+static int dcp_t6041_stop_one(struct device *dev, void *data)
+{
+	struct apple_dcp *dcp = dev_get_drvdata(dev);
+	bool external = *(bool *)data;
+	struct task_struct *poller;
+	bool keep_set = false;
+	bool powered_off = false;
+	/* The display DART's streams turned off here, not by a D572(0). */
+	bool streams_off = false;
+	bool idle_attempted = false;
+	bool idle;
+	u32 ctrl, status;
+	int ret;
+
+	/* dcp->external is only set on T6030. */
+	if (!dcp || IS_ERR_OR_NULL(dcp->rtk) || dcp->sleep_host_stop == external)
+		return 0;
+	/*
+	 * An external DCP stopped for an earlier sleep stays down, with its domains forced off by
+	 * the power word step: reading its registers again hung the second sleep of a boot (11 Nov).
+	 */
+	if (external) {
+		/* Also one that was never running: the power word step took its domains down too. */
+		if (READ_ONCE(dcp->ext_dead) || dcp->t6041_ext_seen)
+			return 0;
+	}
+	if (!apple_rtkit_is_running(dcp->rtk)) {
+		if (external) {
+			dcp_s2r_find_darts(dcp);
+			if (dcp->s2r_disp_dart)
+				apple_dart_display_streams(dcp->s2r_disp_dart,
+							   DCP_S2R_DISP_STREAMS, false, true);
+			dcp->t6041_ext_seen = true;
+		}
+		dcp_s2r_put_darts(dcp);
+		return 0;
+	}
+	dcp_drain_for_sleep(dcp);
+	cancel_delayed_work_sync(&dcp->swap_watchdog_wq);
+	iomfb_pause_presentation(dcp, true);
+	iomfb_queue_settle(dcp, msecs_to_jiffies(500));
+	dcp_s2r_find_darts(dcp);
+	if (!external) {
+		if (dcp->s2r_disp_dart)
+			apple_dart_display_keep(dcp->s2r_disp_dart, DCP_S2R_DISP_STREAMS, true);
+		if (dcp->s2r_dcp_dart)
+			apple_dart_display_keep(dcp->s2r_dcp_dart, DCP_S2R_DCP_STREAMS, true);
+		keep_set = true;
+		/*
+		 * As linux#1477 dcp_t6041_s2r_stop: the pipe off through the firmware, then wait for
+		 * its calls to settle. No av_service_disconnect: the firmware answered it with an
+		 * unplug (HPD removed), and after the warm restart it refused every mode set with
+		 * "HPD is 0 link_status is 0" (10 Nov). No display sleep transition after the
+		 * power-off either.
+		 */
+		/*
+		 * The firmware's D572(0) after the power-off says it is done with the display, and
+		 * dcp_s2r_dart_power() turns the display DART's streams off right there, as macOS
+		 * does. Turned off while the pipe still scanned out, they crashed the firmware
+		 * (axi_rd_err, 11 Nov). Without D572(0) abort sleep instead of tearing down domains
+		 * while scanning out.
+		 */
+		/*
+		 * A DPMS off before the sleep (the desktop blanking on a lid close) already ran
+		 * set_power_state(0), and its scanout stop was confirmed: its D572(0) came then,
+		 * while s2r_active was clear, and a second set_power_state(0) gets none. Turn the
+		 * display DART's streams off as that D572(0) would have; the pipe no longer scans
+		 * out.
+		 */
+		if (READ_ONCE(dcp->pipe_off)) {
+			dev_info(dev, "display already off: no second power-off\n");
+			if (dcp->s2r_disp_dart) {
+				apple_dart_display_streams(dcp->s2r_disp_dart,
+							   DCP_S2R_DISP_STREAMS, false, false);
+				streams_off = true;
+			}
+		} else {
+			unsigned long d572 = msecs_to_jiffies(DCP_S2R_D572_TIMEOUT_MS);
+
+			reinit_completion(&dcp->s2r_dart_done);
+			WRITE_ONCE(dcp->s2r_active, true);
+			_dcp_poweroff(dcp);
+			powered_off = true;
+			if (!wait_for_completion_timeout(&dcp->s2r_dart_done, d572)) {
+				WRITE_ONCE(dcp->s2r_active, false);
+				dev_err(dev, "no D572 after the power-off\n");
+				ret = -ETIMEDOUT;
+				goto err_unwind;
+			}
+			WRITE_ONCE(dcp->s2r_active, false);
+		}
+		if (read_poll_timeout(iomfb_channels_idle, idle, idle, 1000, 200000, false, dcp)) {
+			dev_err(dev, "display calls still in flight after the power-off\n");
+			ret = -ETIMEDOUT;
+			goto err_unwind;
+		}
+	}
+	ret = iomfb_s2r_500_v26_6_desktop(dcp);
+	if (ret) {
+		dev_err(dev, "no reply to A500: %d\n", ret);
+		goto err_unwind;
+	}
+	if (read_poll_timeout(iomfb_channels_idle, idle, idle, 1000, 100000, false, dcp)) {
+		dev_err(dev, "display calls still in flight after A500\n");
+		ret = -ETIMEDOUT;
+		goto err_unwind;
+	}
+	idle_attempted = true;
+	ret = apple_rtkit_idle(dcp->rtk);
+	if (ret) {
+		poller = kthread_run(dcp_stop_poller, dcp->rtk, "dcpstop");
+		ret = apple_rtkit_idle(dcp->rtk);
+		if (!IS_ERR(poller))
+			kthread_stop(poller);
+	}
+	if (ret) {
+		dev_err(dev, "the firmware didn't go idle for the sleep: %d\n", ret);
+		goto err_unwind;
+	}
+	apple_rtkit_poll(dcp->rtk);
+	/*
+	 * T6041 desktop firmware reaches status 0x6d (IDLE set, STOPPED clear) on
+	 * apple_rtkit_idle(). Both AP and IOP have already acknowledged IDLE here,
+	 * so proceed even if IDLE is late, matching apple_rtkit_sleep_idle().
+	 */
+	ret = readl_poll_timeout(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS, status,
+				 status & APPLE_DCP_COPROC_CPU_STATUS_IDLE, 100, 50000);
+	if (ret)
+		dev_warn(dev, "coprocessor did not set IDLE after RTKit idle: status %#x\n",
+			 status);
+	/*
+	 * QUIESCED and SLEEP after idle: T23 reached STOPPED (0x6e) only this way. Not for the
+	 * internal DCP: linux#1477 stops it at the idle (A500, idle, mailbox off, run bit, bit 5)
+	 * and its warm restart then works; after a shutdown ours crashed in the restart (10 Nov,
+	 * data abort at 0xffffffff00000040 right after the first shmem_setup).
+	 */
+	if (external) {
+		dcp->t6041_ext_seen = true;
+		ret = apple_rtkit_shutdown(dcp->rtk);
+		if (ret)
+			dev_warn(dev, "external coprocessor shutdown failed: %d\n", ret);
+		if (readl_poll_timeout(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS, status,
+				       (status & (APPLE_DCP_COPROC_CPU_STATUS_IDLE |
+						  APPLE_DCP_COPROC_CPU_STATUS_STOPPED)) ==
+				       (APPLE_DCP_COPROC_CPU_STATUS_IDLE |
+					APPLE_DCP_COPROC_CPU_STATUS_STOPPED), 100, 50000))
+			dev_warn(dev, "external coprocessor did not reach stopped: status %#x\n",
+				 status);
+	}
+	WRITE_ONCE(dcp->crashed, true);
+	WRITE_ONCE(dcp->ext_dead, true);
+	WRITE_ONCE(dcp->s2r_fw_down, true);
+	apple_rtkit_mailbox_off(dcp->rtk);
+	dcp_s2r_cpu_stop(dcp);
+	ret = readl_poll_timeout(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL, ctrl,
+				 !(ctrl & APPLE_DCP_COPROC_CPU_CONTROL_RUN), 100, 10000);
+	if (ret) {
+		dev_err(dev, "coprocessor RUN bit did not clear: control %#x\n", ctrl);
+		dcp_s2r_put_darts(dcp);
+		return ret;
+	}
+	/*
+	 * External display DARTs go dark for good while their block is still on:
+	 * the power word step forces the external display domains off and nothing raises
+	 * them, but the framebuffers are mapped through all display DARTs, so every
+	 * later unmap would flush a DART behind a dead block (11 Nov).
+	 * Marked dark, the flush only publishes to memory.
+	 */
+	if (external && dcp->s2r_disp_dart)
+		apple_dart_display_streams(dcp->s2r_disp_dart, DCP_S2R_DISP_STREAMS,
+					   false, true);
+	ret = dcp_s2r_stop_streams(dcp);
+	dcp_s2r_put_darts(dcp);
+	if (ret) {
+		dev_err(dev, "failed to stop DCP DART streams: %d\n", ret);
+		return ret;
+	}
+
+	return 0;
+
+err_unwind:
+	if (!external) {
+		if (keep_set) {
+			if (dcp->s2r_disp_dart)
+				apple_dart_display_keep(dcp->s2r_disp_dart,
+							DCP_S2R_DISP_STREAMS, false);
+			if (dcp->s2r_dcp_dart)
+				apple_dart_display_keep(dcp->s2r_dcp_dart,
+							DCP_S2R_DCP_STREAMS, false);
+		}
+		if ((powered_off || streams_off) && dcp->s2r_disp_dart)
+			apple_dart_display_streams(dcp->s2r_disp_dart,
+						   DCP_S2R_DISP_STREAMS, true, false);
+	}
+	dcp_s2r_put_darts(dcp);
+	iomfb_pause_presentation(dcp, false);
+	if (idle_attempted) {
+		int ap_ret = apple_rtkit_ap_power(dcp->rtk, true);
+
+		if (ap_ret)
+			dev_warn(dev, "AP on after failed stop: %d\n", ap_ret);
+	}
+	if (!external && powered_off) {
+		if (dcp_t6041_recommit(dcp))
+			dev_err(dev, "display recovery after failed stop failed\n");
+		else
+			dcp_backlight_s2r_restore(dcp);
+	}
+	return ret;
+}
+
+/*
+ * The power words of each display CPU down, after its firmware stopped. The fabric rejects
+ * writes to a DCP's CPU word until bit 4 of its GAPF slice is clear: ADT
+ * clock-protection-slice-index, 0x100 + 0x40 * index. Then macOS's order on the Neo.
+ */
+static int dcp_t6041_word_try(struct device *dev, struct dcp_t6041_power *pwr,
+			      struct dcp_t6041_chain *chain)
+{
+	void __iomem *gapf = chain->gapf;
+	void __iomem *rsys = chain->domains[0];
+	void __iomem *rfe = chain->domains[1];
+	void __iomem *rcpu = chain->domains[2];
+	void __iomem *ra = chain->pg_a;
+	void __iomem *rb = chain->pg_b;
+	void __iomem *rfab = NULL;
+	unsigned int i;
+	u32 val, fab = 0, cur;
+	int ret = 0;
+
+	val = readl(gapf);
+	writel(val & ~BIT(4), gapf);
+	if (readl_poll_timeout(gapf, cur, !(cur & BIT(4)), 10, 5000)) {
+		dev_err(dev, "dcp %s: GAPF write protection stayed set: %#x\n",
+			chain->name, cur);
+		return -ETIMEDOUT;
+	}
+	val = readl(rcpu);
+	writel(val & ~(BIT(28) | GENMASK(9, 8)), rcpu);
+	if (readl_poll_timeout(rcpu, cur, !(cur & BIT(28)), 10, 5000)) {
+		dev_err(dev, "dcp %s: CPU auto-enable did not clear: %#x\n",
+			chain->name, cur);
+		return -ETIMEDOUT;
+	}
+	val = cur;
+	/*
+	 * Everything macOS's sleep check wants off under this CPU, last first: DSC, PPP, GPL,
+	 * GP1, GP0, DPEXT, DBE. iBoot leaves them on over a DCP Linux never started.
+	 */
+	if (chain->is_main && chain->child_saved) {
+		for (i = 3; i < chain->num_domains; i++)
+			chain->child_saved[i - 3] = readl(chain->domains[i]);
+		pwr->child_valid = true;
+	}
+	for (i = chain->num_domains; i-- > 3; ) {
+		void __iomem *sub = chain->domains[i];
+
+		val = readl(sub);
+		if (val & BIT(28)) {
+			val &= ~(BIT(28) | GENMASK(9, 8));
+			writel(val, sub);
+		}
+		writel((val & ~GENMASK(3, 0)) | GENMASK(9, 8), sub);
+		if (readl_poll_timeout(sub, cur, !FIELD_GET(GENMASK(7, 4), cur),
+				       50, 20000)) {
+			dev_err(dev, "dcp %s: child %u did not power off: %#x\n",
+				chain->name, i - 2, cur);
+			return -ETIMEDOUT;
+		}
+	}
+	val = readl(rcpu);
+	/*
+	 * Two things the restart sets that boot did not have, undone before the lowering: bit 0 of
+	 * both words of bridge 4 (boot 0x10000 / 0x101330, after a restart 0x10001 / 0x101331) and the
+	 * display voter count at pmc-dcp (boot 0, after a restart 1). With them left, the
+	 * second lowering of a boot ends with FE 0x200 and SYS 0x800 (bit 11) instead of 0x300 / 0x300.
+	 */
+	if (chain->is_main) {
+		writel(readl(pwr->axi2af + 0x4) & ~1U, pwr->axi2af + 0x4);
+		writel(readl(pwr->axi2af + 0x8) & ~1U, pwr->axi2af + 0x8);
+		writel(0, pwr->pmc_dcp);
+	}
+	if (chain->fabric) {
+		/*
+		 * The internal display's SYS hangs off fab6_soc, which gates itself as soon as
+		 * nothing under it is on. Lowered while the fabric is already going (second stop
+		 * of a boot, the external pipes long off), SYS latches PARENT_OFF (reads 0x800,
+		 * FE 0x200), the sleep engine waits on that bit and the chip resets. So: the
+		 * fabric on by hand until SYS is down.
+		 */
+		rfab = chain->fabric;
+		fab = readl(rfab);
+		writel((fab & ~(BIT(28) | GENMASK(9, 8) | GENMASK(3, 0))) | 0xf, rfab);
+		if (readl_poll_timeout(rfab, cur, FIELD_GET(GENMASK(7, 4), cur) == 0xf,
+				       50, 20000)) {
+			dev_err(dev, "dcp %s: fabric domain not on: %#x\n", chain->name, cur);
+			ret = -ETIMEDOUT;
+			goto restore_fab;
+		}
+	}
+	writel(3, ra);
+	writel(0, rb);
+	writel((val & ~GENMASK(3, 0)) | GENMASK(9, 8), rcpu);
+	val = readl(rfe);
+	if (val & BIT(28))
+		writel(val & ~(BIT(28) | GENMASK(9, 8)), rfe);
+	writel((readl(rfe) & ~GENMASK(3, 0)) | GENMASK(9, 8), rfe);
+	val = readl(rsys);
+	if (val & BIT(28))
+		writel(val & ~(BIT(28) | GENMASK(9, 8)), rsys);
+	writel((readl(rsys) & ~GENMASK(3, 0)) | GENMASK(9, 8), rsys);
+	/*
+	 * Verify CPU, FE and SYS all reach off; macOS polls up to 50 ms here. The internal
+	 * chain must also not have latched PARENT_OFF (bit 11), see above.
+	 */
+	if (readl_poll_timeout(rcpu, cur,
+			       !FIELD_GET(GENMASK(7, 4), cur) &&
+			       (!chain->is_main || !(cur & BIT(11))),
+			       50, 100000)) {
+		dev_err(dev, "dcp %s: cpu still %#x\n", chain->name, cur);
+		ret = -ETIMEDOUT;
+		goto restore_fab;
+	}
+	if (readl_poll_timeout(rfe, cur,
+			       !FIELD_GET(GENMASK(7, 4), cur) &&
+			       (!chain->is_main || !(cur & BIT(11))),
+			       50, 100000)) {
+		dev_err(dev, "dcp %s: fe still %#x\n", chain->name, cur);
+		ret = -ETIMEDOUT;
+		goto restore_fab;
+	}
+	if (readl_poll_timeout(rsys, cur,
+			       !FIELD_GET(GENMASK(7, 4), cur) &&
+			       (!chain->is_main || !(cur & BIT(11))),
+			       50, 100000)) {
+		dev_err(dev, "dcp %s: sys still %#x\n", chain->name, cur);
+		ret = -ETIMEDOUT;
+		goto restore_fab;
+	}
+restore_fab:
+	if (rfab) {
+		/* Back to automatic, as it was; the flag bits are write-one-to-clear, left alone. */
+		writel((readl(rfab) & ~(GENMASK(9, 8) | BIT(28))) | (fab & BIT(28)), rfab);
+		if (readl_poll_timeout(rfab, cur, (cur & BIT(28)) == (fab & BIT(28)), 10, 5000)) {
+			dev_err(dev, "dcp %s: fabric auto-enable did not restore: %#x\n",
+				chain->name, cur);
+			if (!ret)
+				ret = -ETIMEDOUT;
+		}
+	}
+
+	return ret;
+}
+
+/*
+ * After a real wake: the internal DCP back, as linux#1477 does it for the M4 Pro
+ * (t6040_disp_back, dcp_t6041_s2r_domains_on, dcp_t6041_s2r_resume, the warm restart and the
+ * mode set of dcp_hib_recommit): DISP_SYS on, the retention pair (A := 0, B := 1), DISP_FE on,
+ * the GAPF protection off, DISP_CPU on, its child domains as the stop found them, the PMC voter,
+ * both DARTs' streams, the idled firmware restarted, the pipe powered and the mode set again.
+ */
+static int dcp_t6041_recommit(struct apple_dcp *dcp)
+{
+	struct apple_crtc *acrtc = READ_ONCE(dcp->crtc);
+	struct drm_modeset_acquire_ctx ctx;
+	struct drm_atomic_commit *state;
+	struct drm_crtc_state *cs;
+	struct drm_crtc *crtc;
+	ktime_t start = ktime_get();
+	bool idle;
+	int ret;
+
+	reinit_completion(&dcp->s2r_hpd_done);
+	iomfb_poweron_v26_6_desktop(dcp);
+	if (dcp->desktop && dcp->desktop->poweron_result) {
+		dev_err(dcp->dev, "display power-on after the sleep failed (%u)\n",
+			dcp->desktop->poweron_result);
+		return dcp->desktop->poweron_result == 1 ? -ETIMEDOUT : -EIO;
+	}
+	if (!wait_for_completion_timeout(&dcp->s2r_hpd_done, msecs_to_jiffies(1000))) {
+		dev_err(dcp->dev, "no D575 hotplug %lld ms after power-on\n",
+			ktime_ms_delta(ktime_get(), start));
+		return -ETIMEDOUT;
+	}
+	dev_dbg(dcp->dev, "D575 hotplug ready %lld ms after power-on\n",
+		ktime_ms_delta(ktime_get(), start));
+	if (read_poll_timeout(iomfb_channels_idle, idle, idle, 1000, 200000, false, dcp)) {
+		dev_err(dcp->dev, "display calls still in flight after D575\n");
+		return -ETIMEDOUT;
+	}
+	if (!acrtc)
+		return 0;
+	crtc = &acrtc->base;
+	DRM_MODESET_LOCK_ALL_BEGIN(crtc->dev, ctx, 0, ret);
+	if (!crtc->state->active) {
+		ret = 0;
+		goto unlock;
+	}
+	state = drm_atomic_commit_alloc(crtc->dev);
+	if (!state) {
+		ret = -ENOMEM;
+		goto unlock;
+	}
+	state->acquire_ctx = &ctx;
+	cs = drm_atomic_get_crtc_state(state, crtc);
+	if (IS_ERR(cs)) {
+		ret = PTR_ERR(cs);
+		goto put;
+	}
+	cs->mode_changed = true;
+	ret = drm_atomic_add_affected_connectors(state, crtc);
+	if (!ret)
+		ret = drm_atomic_add_affected_planes(state, crtc);
+	if (!ret)
+		ret = drm_atomic_commit(state);
+put:
+	drm_atomic_commit_put(state);
+unlock:
+	DRM_MODESET_LOCK_ALL_END(crtc->dev, ctx, ret);
+	return ret;
+}
+
+/*
+ * The internal display's SYS, FE and CPU power words as they were before the first stop (from
+ * boot: SYS and FE with no flags, the CPU word 0x1000030f, automatic). The restart leaves the CPU
+ * word manual (0x0f0003ff) and SYS/FE with both flags, and the first display power-off after such
+ * a wake hung the machine (11 Nov, run 6). Captured once and put back once the display runs again.
+ */
+static int dcp_t6041_boot_ps_io(struct apple_dcp *dcp, bool restore)
+{
+	static const char *const names[3] = { "sys", "fe", "cpu" };
+	struct dcp_t6041_power *pwr = &dcp->t6041_power;
+	const struct dcp_t6041_chain *main = pwr->main_chain;
+	bool idle;
+	u32 cur;
+	int i;
+
+	if (!main || main->num_domains < 3)
+		return -EINVAL;
+
+	if (!restore) {
+		if (pwr->boot_ps_valid)
+			return 0;
+		for (i = 0; i < 3; i++)
+			pwr->boot_ps[i] = readl(main->domains[i]);
+		pwr->boot_ps_valid = true;
+		return 0;
+	}
+
+	if (!pwr->boot_ps_valid)
+		return 0;
+
+	if (read_poll_timeout(iomfb_channels_idle, idle, idle, 1000, 200000, false, dcp)) {
+		dev_err(dcp->dev, "display calls still in flight before restoring boot power words\n");
+		return -ETIMEDOUT;
+	}
+	for (i = 0; i < 3; i++) {
+		if (!pwr->boot_ps[i])
+			continue;
+		if (readl_poll_timeout(main->domains[i], cur,
+				       FIELD_GET(GENMASK(7, 4), cur) == 0xf && !(cur & BIT(11)),
+				       50, 10000)) {
+			dev_err(dcp->dev, "display %s power word not on before restore: %#x\n",
+				names[i], cur);
+			return -ETIMEDOUT;
+		}
+	}
+	for (i = 0; i < 3; i++) {
+		u32 want = pwr->boot_ps[i] & ~0xf0U;
+
+		if (!pwr->boot_ps[i])
+			continue;
+		writel(want, main->domains[i]);
+		if (want & BIT(28)) {
+			/*
+			 * AUTO_ENABLE lets hardware drop PS_ACTUAL to 0 while the DCP CPU sits
+			 * idle in WFI, so poll target + AUTO_ENABLE + !PARENT_OFF instead.
+			 */
+			if (readl_poll_timeout(main->domains[i], cur,
+					       (cur & (BIT(28) | GENMASK(3, 0))) ==
+					       (want & (BIT(28) | GENMASK(3, 0))) &&
+					       !(cur & BIT(11)), 50, 10000)) {
+				dev_err(dcp->dev,
+					"display %s power word did not restore auto-enable: %#x\n",
+					names[i], cur);
+				return -ETIMEDOUT;
+			}
+		} else {
+			if (readl_poll_timeout(main->domains[i], cur,
+					       FIELD_GET(GENMASK(7, 4), cur) == 0xf &&
+					       !(cur & BIT(11)), 50, 10000)) {
+				dev_err(dcp->dev,
+					"display %s power word did not stay on after restore: %#x\n",
+					names[i], cur);
+				return -ETIMEDOUT;
+			}
+		}
+	}
+
+	return 0;
+}
+
+static int dcp_t6041_start_one(struct device *dev, void *data)
+{
+	struct apple_dcp *dcp = dev_get_drvdata(dev);
+	struct dcp_t6041_power *pwr;
+	const struct dcp_t6041_chain *main;
+	void __iomem *rsys, *rfe, *rcpu, *gapf, *pmc;
+	unsigned int i;
+	u32 v, cur, to = 0;
+	int ret, ps_ret;
+
+	if (!dcp || IS_ERR_OR_NULL(dcp->rtk) || !dcp->sleep_host_stop)
+		return 0;
+	pwr = &dcp->t6041_power;
+	main = pwr->main_chain;
+	if (!main || main->num_domains < 3)
+		return -EINVAL;
+	rsys = main->domains[0];
+	rfe = main->domains[1];
+	rcpu = main->domains[2];
+	gapf = main->gapf;
+	pmc = pwr->pmc_dcp;
+
+	v = readl(rsys) & ~(GENMASK(9, 8) | GENMASK(3, 0) | BIT(28));
+	/*
+	 * As macOS's wake writes them: target on with both flag bits clear (0xf). Raised with the
+	 * flags kept (0x30f) the word reads 0x3ff, a later write can't clear them, and the next
+	 * lowering then latches bit 11 on SYS (0x800) and leaves FE at 0x200: the sleep engine waits
+	 * on that bit and the chip resets (second sleep of a boot, 11 Nov).
+	 */
+	writel((v & ~0x30fU) | 0xf, rsys);
+	if (readl_poll_timeout(rsys, cur,
+			       FIELD_GET(GENMASK(7, 4), cur) == 0xf && !(cur & BIT(11)),
+			       50, 10000))
+		to |= BIT(0);
+	writel(0, main->pg_a);
+	writel(1, main->pg_b);
+	/*
+	 * Bridge 4 stays as boot has it (bit 0 of both words clear, 0x10000 / 0x101330), unlike
+	 * macOS's wake: with it set, the driver's own display power-off after a wake froze the whole
+	 * machine right after "dcp_poweroff() done" (login after a wake, sddm restart; 11 Nov).
+	 */
+	v = readl(rfe) & ~(GENMASK(9, 8) | GENMASK(3, 0) | BIT(28));
+	writel((v & ~0x30fU) | 0xf, rfe);
+	if (readl_poll_timeout(rfe, cur,
+			       FIELD_GET(GENMASK(7, 4), cur) == 0xf && !(cur & BIT(11)),
+			       50, 10000))
+		to |= BIT(1);
+	writel(readl(gapf) & ~BIT(4), gapf);
+	if (readl_poll_timeout(gapf, cur, !(cur & BIT(4)), 10, 5000))
+		to |= BIT(3);
+	v = readl(rcpu);
+	writel((v & ~(0x30fU | BIT(28))) | 0xf, rcpu);
+	mb();
+	if (readl_poll_timeout(rcpu, cur,
+			       FIELD_GET(GENMASK(7, 4), cur) == 0xf && !(cur & BIT(11)),
+			       50, 10000))
+		to |= BIT(2);
+	for (i = 3; i < main->num_domains && pwr->child_valid && main->child_saved; i++) {
+		void __iomem *cw = main->domains[i];
+		u32 want = main->child_saved[i - 3];
+
+		if (!(want & 0xf) || (readl(cw) & 0xf0))
+			continue;
+		writel(want, cw);
+		if (readl_poll_timeout(cw, cur, cur & 0xf0, 50, 2000))
+			to |= (i - 3 < 24) ? BIT(8 + (i - 3)) : BIT(31);
+	}
+	dcp_pmc_set(dcp, pmc, true);
+	if (to & 0xf) {
+		dev_err(dev, "display domains not on after the sleep: %#x\n", to);
+		return -ETIMEDOUT;
+	}
+	if (to)
+		dev_warn(dev, "display child domains not on after the sleep: %#x\n", to);
+
+	dcp_s2r_find_darts(dcp);
+	if (dcp->s2r_disp_dart) {
+		apple_dart_display_keep(dcp->s2r_disp_dart, DCP_S2R_DISP_STREAMS, false);
+		apple_dart_display_streams(dcp->s2r_disp_dart, DCP_S2R_DISP_STREAMS, true, false);
+	}
+	if (dcp->s2r_dcp_dart) {
+		apple_dart_display_keep(dcp->s2r_dcp_dart, DCP_S2R_DCP_STREAMS, false);
+		apple_dart_display_streams(dcp->s2r_dcp_dart, DCP_S2R_DCP_STREAMS, true, false);
+	}
+	dcp_s2r_put_darts(dcp);
+
+	WRITE_ONCE(dcp->crashed, false);
+	WRITE_ONCE(dcp->ext_dead, false);
+	ret = apple_rtkit_power_cycled_return(dcp->rtk,
+					      dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
+	if (ret) {
+		dev_err(dev, "the firmware's warm restart after the sleep failed: %d\n", ret);
+		WRITE_ONCE(dcp->crashed, true);
+		return ret;
+	}
+	WRITE_ONCE(dcp->s2r_fw_down, false);
+	/*
+	 * Before the mode set, not after it: the commit's swap is what hands the firmware the
+	 * console's framebuffer, and fbcon draws into that memory without committing again. With
+	 * presentation still paused the swap was dropped and the panel stayed black with everything
+	 * else up (10 Nov).
+	 */
+	iomfb_pause_presentation(dcp, false);
+	ret = dcp_t6041_recommit(dcp);
+	if (ret)
+		dev_err(dev, "mode set after the sleep failed: %d\n", ret);
+	/*
+	 * Always restore backlight and boot power words once domains and RTKit warm restart
+	 * succeeded, even if recommit timed out (e.g., wake with lid closed): leaving disp_cpu
+	 * manual hangs the next display power-off.
+	 */
+	dcp_backlight_s2r_restore(dcp);
+	ps_ret = dcp_t6041_boot_ps_io(dcp, true);
+	return ret ?: ps_ret;
+}
+
+static bool dcp_t6041_down, dcp_t6041_words;
+
+/* @np's first DART, dark if its driver is bound. */
+static void dcp_t6041_dart_dark(struct device_node *np)
+{
+	struct device_node *dart = np ? of_parse_phandle(np, "iommus", 0) : NULL;
+	struct platform_device *pdev = dart ? of_find_device_by_node(dart) : NULL;
+
+	of_node_put(dart);
+	if (!pdev)
+		return;
+	if (device_is_bound(&pdev->dev))
+		apple_dart_power_dark(&pdev->dev, true);
+	put_device(&pdev->dev);
+}
+
+/*
+ * Every external chain's DARTs, dark before their domains go off. The display subsystem maps
+ * every framebuffer through the display DARTs, and an unmap after the wake (an sddm restart, a
+ * logout) flushed one behind a dead block and stopped the machine (12 Nov). By node, so a chain
+ * whose DCP never bound, which the display subsystem skips as unusable, is covered too, and so
+ * is every chain a board enables, not only the first two.
+ */
+static void dcp_t6041_ext_darts_dark(void)
+{
+	struct device_node *np, *piodma;
+
+	for_each_compatible_node(np, NULL, "apple,t6041-dcpext") {
+		if (!of_device_is_available(np))
+			continue;
+		piodma = of_get_child_by_name(np, "piodma");
+		dcp_t6041_dart_dark(piodma);
+		of_node_put(piodma);
+		dcp_t6041_dart_dark(np);
+	}
+}
+
+enum dcp_t6041_step { DCP_S2R_FW_STOP, DCP_S2R_WORDS_DOWN, DCP_S2R_START };
+
+/* Each step once per sleep. */
+static int dcp_t6041_s2r_step(enum dcp_t6041_step step)
+{
+	struct apple_dcp *host = READ_ONCE(dcp_t6041_host);
+	bool external = true;
+	unsigned int i;
+	int ret;
+
+	if (!host)
+		return -ENODEV;
+
+	if (step == DCP_S2R_START) {
+		if (!dcp_t6041_down)
+			return 0;
+		dcp_t6041_down = false;
+		dcp_t6041_words = false;
+		return driver_for_each_device(&apple_platform_driver.driver, NULL, NULL,
+					      dcp_t6041_start_one);
+	}
+	if (step == DCP_S2R_WORDS_DOWN) {
+		if (dcp_t6041_words || !dcp_t6041_down)
+			return 0;
+		dcp_t6041_words = true;
+		dcp_t6041_ext_darts_dark();
+		for (i = 0; i < host->t6041_power.num_chains; i++) {
+			ret = dcp_t6041_word_try(host->dev, &host->t6041_power,
+						 &host->t6041_power.chains[i]);
+			if (ret)
+				return ret;
+		}
+		return 0;
+	}
+	if (dcp_t6041_down)
+		return 0;
+	dcp_t6041_boot_ps_io(host, false);
+	ret = driver_for_each_device(&apple_platform_driver.driver, NULL, &external,
+				     dcp_t6041_stop_one);
+	if (ret)
+		return ret;
+	external = false;
+	ret = driver_for_each_device(&apple_platform_driver.driver, NULL, &external,
+				     dcp_t6041_stop_one);
+	if (ret) {
+		if (READ_ONCE(host->s2r_fw_down))
+			dcp_t6041_down = true;
+		return ret;
+	}
+	dcp_t6041_down = true;
+	return 0;
+}
+
+/* T6041: the display down for a real sleep and back after it. */
+int dcp_t6041_s2r_all(bool start)
+{
+	int ret;
+
+	if (!READ_ONCE(dcp_sleep_host_stop)) {
+		if (!start && READ_ONCE(dcp_sleep_host_stop_missing)) {
+			pr_err("apple-dcp: host-driven sleep required but apple,display-power unavailable\n");
+			return -ENODEV;
+		}
+		return 0;
+	}
+	if (start)
+		return dcp_t6041_s2r_step(DCP_S2R_START);
+	if (dcp_t6041_down)
+		return 0;
+	ret = dcp_t6041_s2r_step(DCP_S2R_FW_STOP);
+	if (ret) {
+		if (dcp_t6041_down && dcp_t6041_s2r_step(DCP_S2R_START))
+			pr_err("apple-dcp: T6041 S2R display unwind failed\n");
+		return ret;
+	}
+	ret = dcp_t6041_s2r_step(DCP_S2R_WORDS_DOWN);
+	if (ret) {
+		if (dcp_t6041_s2r_step(DCP_S2R_START))
+			pr_err("apple-dcp: T6041 S2R display unwind failed\n");
+		return ret;
+	}
+	return 0;
+}
+
 int __init dcp_register(void)
 {
 	return platform_driver_register(&apple_platform_driver);
@@ -10185,8 +11781,11 @@ int __init dcp_register(void)
 void dcp_unregister(void)
 {
 	platform_driver_unregister(&apple_platform_driver);
+	t8152_typec_unregister();
 }
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST)
 #include "dcp_external_audio_test.c"
+#include "dcp_handoff_test.c"
+#include "dcp-firmware-test.c"
 #endif

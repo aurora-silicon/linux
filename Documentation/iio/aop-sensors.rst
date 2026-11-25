@@ -52,8 +52,14 @@ them; the mapping to the machine's axes is not established yet. A raw read
 before the first sample returns ``ENODATA``.
 
 Both devices have a buffer that takes X, Y and Z together, with an optional
-timestamp taken when the report arrives. The reports stop when the system
-goes to sleep and start again, with the calibration resent, when it wakes.
+timestamp taken when the report arrives. Reports stay off while nobody reads
+them: enabling the buffer starts them and disabling it stops them, while direct
+sysfs reads start them on demand and stop them again once reads go quiet. A
+failed direct-read start backs off for the same idle window so polling clients
+cannot hammer a failing service. The calibration packets are sent once at probe
+and conservatively again after firmware suspend, hibernation or restore, rather
+than on every start or s2idle resume. Around system sleep any active stream is
+stopped and restored on wake only if a buffer is still enabled.
 
 If both devices bind but every raw read returns ``ENODATA``, check the AOP
 core's ``nCal`` boot argument for the SoC. The T6040 firmware accepts the
