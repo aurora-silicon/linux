@@ -290,8 +290,6 @@
 };
 
 &atc1_dpxbar {
-	power-domains = <&ps_atc1_usb_aon>, <&ps_atc1_common>;
-	power-domain-names = "usb-aon", "common";
 	status = "okay";
 };
 
@@ -329,8 +327,6 @@
 
 /* The left-back crossbar (the inventory's, as atc1_dpxbar) and the PHY's tunnel clock gates */
 &atc0_dpxbar {
-	power-domains = <&ps_atc0_usb_aon>, <&ps_atc0_common>;
-	power-domain-names = "usb-aon", "common";
 	status = "disabled";
 };
 

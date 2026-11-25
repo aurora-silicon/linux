@@ -1642,6 +1642,8 @@
 		compatible = "apple,t6050-display-crossbar", "apple,t8142-display-crossbar";
 		reg = <0x2 0xa324c000 0x0 0x4000>;
 		#mux-control-cells = <1>;
+		power-domains = <&ps_atc0_usb_aon>, <&ps_atc0_common>;
+		power-domain-names = "usb-aon", "common";
 		status = "disabled";
 	};
 
@@ -1677,6 +1679,8 @@
 		compatible = "apple,t6050-display-crossbar", "apple,t8142-display-crossbar";
 		reg = <0x2 0xab24c000 0x0 0x4000>;
 		#mux-control-cells = <1>;
+		power-domains = <&ps_atc1_usb_aon>, <&ps_atc1_common>;
+		power-domain-names = "usb-aon", "common";
 		status = "disabled";
 	};
 
@@ -1742,6 +1746,8 @@
 		compatible = "apple,t6050-display-crossbar", "apple,t8142-display-crossbar";
 		reg = <0x3 0x8b24c000 0x0 0x4000>;
 		#mux-control-cells = <1>;
+		power-domains = <&ps_atc3_usb_aon>, <&ps_atc3_common>;
+		power-domain-names = "usb-aon", "common";
 		status = "disabled";
 	};
 #endif
