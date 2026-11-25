@@ -19,6 +19,7 @@
 #include "../dcp-internal.h"
 #include "../dcp-fabric.h"
 #include "../connector.h"
+#include "../iomfb_internal.h"
 #include "../trace.h"
 
 static void dcpavserv_notify_edid(struct apple_epic_service *service)
@@ -33,6 +34,16 @@ static void dcpavserv_notify_edid(struct apple_epic_service *service)
 		return;
 	/* get_modes may already have run before this service was announced. */
 	schedule_work(&connector->hotplug_wq);
+}
+
+static bool dcpavserv_hdr_class(const char *class)
+{
+	return class &&
+		(!strcmp(class, "DCPDP13Service") ||
+		 !strcmp(class, "DCPDPService") ||
+		 !strcmp(class, "AppleDCPDP2HDMI") ||
+		 !strcmp(class, "AppleDCPMCDP29XX") ||
+		 !strcmp(class, "AppleDCPMCDP2900"));
 }
 
 static bool dcpavserv_identity(struct apple_epic_service *service, const char *name,
@@ -148,6 +159,9 @@ static void dcpavserv_init(struct apple_epic_service *service, const char *name,
 			dcp->dcpavserv.opened = NULL;
 			dcp->dcpavserv.opened_epoch = 0;
 			service->cookie = &dcp->dcpavserv;
+			if (!dcp->desktop && !dcp_is_ext26(dcp) &&
+			    dcpavserv_hdr_class(class))
+				dcp_hdr_service_bind(service);
 			complete(&dcp->dcpavserv.enable_completion);
 			published = true;
 		}
@@ -193,6 +207,7 @@ static void dcpavserv_teardown(struct apple_epic_service *service)
 
 	mutex_lock(&dcp->dcpavserv.lock);
 	if (dcp->dcpavserv.service == service) {
+		dcp_hdr_service_unbind(service);
 		dcp->dcpavserv.enabled = false;
 		dcp->dcpavserv.service = NULL;
 		dcp->dcpavserv.epoch++;
@@ -222,6 +237,7 @@ void dpavservep_detach(struct apple_dcp *dcp)
 	dcp->dcpavserv.opened_epoch = 0;
 	reinit_completion(&dcp->dcpavserv.enable_completion);
 	if (service) {
+		dcp_hdr_service_unbind(service);
 		afk_service_retire(service);
 		dcpavserv_invalidate_edid(dcp);
 	}

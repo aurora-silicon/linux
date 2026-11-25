@@ -204,6 +204,7 @@ mod t8122_hwdata;
 
 pub(crate) mod m3_init_26;
 mod m3_profile;
+mod m3_recovery;
 pub(crate) mod m3_mmio_26;
 
 #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
