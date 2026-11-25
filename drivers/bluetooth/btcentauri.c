@@ -1007,9 +1007,15 @@ static int cen_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	struct cen_bt *bt;
 	struct hci_dev *hdev;
 	int ret;
+	struct pci_host_bridge *bridge = pci_find_host_bridge(pdev->bus);
 
-	if (!(of_machine_is_compatible("apple,j813") || of_machine_is_compatible("apple,j815") ||
-	      of_machine_is_compatible("apple,j873g")) ||
+	/*
+	 * The T6050 transport (btcentauri_t6050.c) owns every N1 function behind
+	 * an "apple,t6050-pcie" host, as in centauri_pci.c. Any other host is
+	 * ours; the firmware and IPC state are checked below.
+	 */
+	if ((bridge && bridge->dev.parent &&
+	     of_device_is_compatible(bridge->dev.parent->of_node, "apple,t6050-pcie")) ||
 	    PCI_FUNC(pdev->devfn) != 2)
 		return -ENODEV;
 	bt = devm_kzalloc(&pdev->dev, sizeof(*bt), GFP_KERNEL);
@@ -1164,7 +1170,13 @@ static int cen_suspend(struct device *dev)
 	bt->transport_paused = true;
 	mutex_unlock(&bt->lock);
 	cancel_delayed_work_sync(&bt->poll);
-	if (of_machine_is_compatible("apple,j813") && bt->ipc_requested) {
+	/*
+	 * Tell Beta's firmware the host is going to sleep on every N1 board, as
+	 * Alpha does. Only a running firmware can take the request; one that
+	 * isn't running has nothing to quiesce.
+	 */
+	if (bt->ipc_requested && readl(bt->bar + 0x18) == 2 &&
+	    readl(bt->bar) == 2) {
 		bt->transport_sleep_sent = true;
 		ret = cen_transport_state(bt, true);
 		if (ret)

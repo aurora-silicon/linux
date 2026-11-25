@@ -697,6 +697,23 @@ impl<T, U: Allocation<T>> GpuArray<T, U> {
     }
 }
 
+#[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+impl<U: Allocation<u8>> GpuArray<u8, U> {
+    /// Aligned index in a shared firmware ring, accessed without borrowing its payload.
+    pub(crate) fn shared_index(&self, offset: usize) -> Result<&core::sync::atomic::AtomicU32> {
+        if offset.checked_add(4).is_none_or(|end| end > self.len) {
+            return Err(EINVAL);
+        }
+        let ptr = self.raw.wrapping_add(offset).cast::<u32>();
+        if !ptr.is_aligned() {
+            return Err(EINVAL);
+        }
+        // SAFETY: bounds and alignment checked; the shared ring ABI accesses
+        // this word only in aligned 32-bit transactions while the ring is live.
+        Ok(unsafe { core::sync::atomic::AtomicU32::from_ptr(ptr) })
+    }
+}
+
 impl<T, U: Allocation<T>> Deref for GpuArray<T, U> {
     type Target = GpuOnlyArray<T, U>;
 
