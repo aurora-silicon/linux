@@ -129,7 +129,9 @@ config APPLE_PMP_REPORT_START_KUNIT_TEST
 	  failed checks, a PMP driver that does not bind, a PMP that does not
 	  report ready or acknowledge its startup requests, consumers that
 	  time out, and the teardown of the report and its entries while a
-	  start or a consumer waits. The report region is simulated in
+	  start or a consumer waits. Also reads the fast die-temperature
+	  effort of a report: its lanes, reports that have none or do not
+	  run, and the T8142 layout. The report region is simulated in
 	  memory. Only useful for kernel developers.
 
 endif

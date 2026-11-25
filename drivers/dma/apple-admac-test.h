@@ -185,9 +185,63 @@ static void admac_realign_only_a_configured_capture(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, admac_resume_realigns(&adchan));
 }
 
+/*
+ * The client's peripheral config is only valid while it configures the
+ * channel: a restore after a system sleep keeps the frame size taken then and
+ * does not read the client's memory again.
+ */
+static void admac_restore_keeps_the_frame_size(struct kunit *test)
+{
+	struct dma_slave_config config = {};
+	struct admac_chan *adchan;
+	struct admac_data *ad;
+	void *regs;
+	u32 *frame;
+
+	/* A capture channel (1) of a two-channel controller, its registers plain memory */
+	ad = kunit_kzalloc(test, struct_size(ad, channels, 2), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ad);
+	ad->nchannels = 2;
+	regs = kunit_kzalloc(test, REG_CHAN_BASE(ad, 2), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, regs);
+	ad->base = (void __iomem *)regs;
+	adchan = &ad->channels[1];
+	adchan->no = 1;
+	adchan->host = ad;
+
+	frame = kunit_kzalloc(test, sizeof(*frame), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, frame);
+	*frame = 16;
+
+	config.direction = DMA_DEV_TO_MEM;
+	config.src_addr_width = DMA_SLAVE_BUSWIDTH_4_BYTES;
+	config.src_port_window_size = 4;
+	config.peripheral_config = frame;
+	config.peripheral_size = sizeof(*frame);
+	KUNIT_ASSERT_EQ(test, admac_device_config(&adchan->chan, &config), 0);
+	KUNIT_EXPECT_EQ(test, adchan->realign_bytes, 16);
+	KUNIT_EXPECT_TRUE(test, adchan->cfg_valid);
+	KUNIT_EXPECT_NULL(test, adchan->cfg.peripheral_config);
+	KUNIT_EXPECT_EQ(test, adchan->cfg.peripheral_size, 0);
+
+	/* The client's memory is reused, the channel's registers are lost */
+	memset(frame, 0xa5, sizeof(*frame));
+	writel_relaxed(0, ad->base + REG_BUS_WIDTH(ad, adchan->no));
+	adchan->lost = true;
+	admac_restore_chan(adchan);
+
+	KUNIT_EXPECT_FALSE(test, adchan->lost);
+	KUNIT_EXPECT_EQ(test, adchan->realign_bytes, 16);
+	KUNIT_EXPECT_NULL(test, adchan->cfg.peripheral_config);
+	/* The rest of the configuration is programmed again */
+	KUNIT_EXPECT_EQ(test, readl_relaxed(ad->base + REG_BUS_WIDTH(ad, adchan->no)),
+			BUS_WIDTH_32BIT | BUS_WIDTH_FRAME_4_WORDS);
+}
+
 static struct kunit_case admac_realign_cases[] = {
 	KUNIT_CASE(admac_realign_needs_a_frame_size),
 	KUNIT_CASE(admac_realign_only_a_configured_capture),
+	KUNIT_CASE(admac_restore_keeps_the_frame_size),
 	{}
 };
 

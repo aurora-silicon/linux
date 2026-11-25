@@ -949,3 +949,107 @@
 		firmware-name = "apple/mesacal-k116s.bin", "apple/msrk-k116s.bin";
 	};
 };
+
+/*
+ * The PMU's RTC and its alarm. ADT: the PMU's info-rtc (0x2002),
+ * info-rtc_alarm_offset (0x2008), info-rtc_irq_mask_offset (0x200e),
+ * info-rtc_alarm_ctrl (0x2000) and info-rtc_scrpad (0x2100), the registers of
+ * the T6041 PMU. It raises no interrupt on this SoC: an armed alarm can only
+ * wake the machine from a firmware sleep, not from s2idle.
+ */
+&pmu {
+	pmu_rtc: rtc {
+		compatible = "apple,t6050-pmu-rtc", "apple,t6041-pmu-rtc";
+		nvmem-cells = <&rtc_offset>;
+		nvmem-cell-names = "rtc_offset";
+		wakeup-source;
+	};
+};
+
+/*
+ * The video encoder's power states, as on the J714s. iBoot leaves VENC0_SYS on, and the SoC does
+ * not enter the firmware-driven sleep with it on. Enabled and unused, genpd turns it off at
+ * boot. No encoder is described yet.
+ */
+&ps_fab1_piogw {
+	apple,firmware-owned;
+	status = "okay";
+};
+
+&ps_fab0_soc {
+	apple,always-on;
+	status = "okay";
+};
+
+&ps_venc0_sys {
+	status = "okay";
+};
+
+&ps_venc0_dma {
+	status = "okay";
+};
+
+&ps_venc0_pipe4 {
+	status = "okay";
+};
+
+&ps_venc0_pipe5 {
+	status = "okay";
+};
+
+&ps_venc0_me0 {
+	status = "okay";
+};
+
+&ps_venc0_me1 {
+	status = "okay";
+};
+
+/*
+ * Deep sleep: the sleep controller's description and the J714s's SoC values, then what differs
+ * on this board (firmware 27.2).
+ */
+#include "t6050-k116s-sleep.dtsi"
+/* No USB4 router is described on this board: without the J714s's CIO sleep part. */
+#define T6050_SLEEP_SOC_NO_CIO
+#include "t6050-j714s-sleep-soc.dtsi"
+
+/*
+ * macOS on this board parks the four clock words with 0x80100000 in the last 0.5 ms before its
+ * commit (traced as an aura guest); the J714s's values have bit 10 set.
+ */
+&sleep {
+	apple,seq-commit-sio =
+		<0x0 17 0x290 0x400024f>,
+		<0x0 17 0x2a0 0x400024f>,
+		<0x1 51 0xa0 0x0>,
+		<0x0 51 0xa0 0x80100000>,
+		<0x1 51 0xa0 0x0>,
+		<0x1 51 0xa4 0x0>,
+		<0x0 51 0xa4 0x80100000>,
+		<0x1 51 0xa4 0x0>,
+		<0x1 51 0x94 0x0>,
+		<0x0 51 0x94 0x80100000>,
+		<0x1 51 0x94 0x0>,
+		<0x1 51 0x90 0x0>,
+		<0x0 51 0x90 0x80100000>,
+		<0x1 51 0x90 0x0>;
+};
+
+/*
+ * The PMP firmware's __DATA starts at 0x56000 on 27.2 (ADT pmp0 segment-ranges: __TEXT 0x56000
+ * bytes, __DATA 0x9b000 bytes), not at the J714s's 0x58000. With the wrong range kept over the
+ * sleep the PMP does not come back (endpoint discovery -62).
+ */
+&pmp0 {
+	apple,sram-keep = <0x56000 0x9b000>;
+};
+
+/*
+ * The panel's plug takes about 2.9 ms here from the video interface's announcement to the
+ * firmware's "ioav i/f is now closed", and the next round of reports follows about 33 ms later.
+ * With the J714s's 2500 us the open landed 25 us before the close.
+ */
+&dcp {
+	apple,panel-video-open-delay-us = <10000>;
+};
