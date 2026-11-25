@@ -1,0 +1,82 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * MacBook Air M4 (J713, J715) DisplayPort audio over the USB-C ports, as the
+ * ADT has it: each external display processor's audio is a dp-audio node,
+ * dcpext0 -> dp-audio1 (SIO DMA channel 0x66, power state DPA1 under DPA_P)
+ * and dcpext1 -> dp-audio2 (0x68, DPA2). dp-audio0 belongs to the internal
+ * panel's DCP, which has no audio sink, and stays off.
+ *
+ * SIO (t8132-sio.dtsi) supplies the sample stream; the boot loader enables
+ * it. Without such a loader each interface waits for its DMA channel and
+ * nothing else changes.
+ */
+
+/ {
+	dpaudio1: audio-controller-1 {
+		compatible = "apple,t8132-dpaudio", "apple,dpaudio";
+		dmas = <&sio 0x66>;
+		dma-names = "tx";
+		power-domains = <&ps_dpa1>;
+		status = "okay";
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				dpaudio1_dcpext0: endpoint {
+					remote-endpoint = <&dcpext0_audio>;
+				};
+			};
+		};
+	};
+
+	dpaudio2: audio-controller-2 {
+		compatible = "apple,t8132-dpaudio", "apple,dpaudio";
+		dmas = <&sio 0x68>;
+		dma-names = "tx";
+		power-domains = <&ps_dpa2>;
+		status = "okay";
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				dpaudio2_dcpext1: endpoint {
+					remote-endpoint = <&dcpext1_audio>;
+				};
+			};
+		};
+	};
+};
+
+&dcpext0 {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			dcpext0_audio: endpoint {
+				remote-endpoint = <&dpaudio1_dcpext0>;
+			};
+		};
+	};
+};
+
+&dcpext1 {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			dcpext1_audio: endpoint {
+				remote-endpoint = <&dpaudio2_dcpext1>;
+			};
+		};
+	};
+};
