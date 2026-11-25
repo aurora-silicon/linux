@@ -7,10 +7,12 @@
 #include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/rtnetlink.h>
+#include <linux/seq_file.h>
 #include <linux/unaligned.h>
 #include <linux/workqueue.h>
 #include <net/cfg80211.h>
 #include <net/regulatory.h>
+#include <net/sock.h>
 #include "centauri_t6050.h"
 
 #define CR_BASE 0x100000
@@ -26,7 +28,22 @@
 #define DATA_TX_BUFFER (SZ_16M + SZ_8M)
 #define DATA_RX_SLOTS 2048
 #define DATA_TX_SLOTS 2048
-#define DATA_TX_QUEUE_LIMIT DATA_TX_SLOTS
+/*
+ * Frames waiting for a ring slot, and frames the firmware holds until it
+ * reports them sent. Both queues are first-in first-out and shared by every
+ * flow, so what does not fit waits in the qdisc instead, where it is
+ * scheduled per flow. 512 frames are about 25 ms at ~240 Mbit/s; the ring
+ * itself holds 2047 (about 100 ms).
+ */
+#define DATA_TX_QUEUE_LIMIT 128
+#define DATA_TX_INFLIGHT_MAX 512
+/*
+ * TCP sizes its bursts, its small-queue budget and (BBR) the extra
+ * congestion window it allows for them at 1 ms of its pacing rate (shift
+ * 10). Aggregation on a shared Wi-Fi channel wants more: mac80211 sets 8 ms
+ * (shift 7) on every socket it transmits for, and so does this driver.
+ */
+#define DATA_TX_PACING_SHIFT 7
 
 static_assert(DATA_TX_BUFFER >=
 	      CEN_ALPHA_SCRATCH_OFFSET + CEN_ALPHA_SCRATCH_SIZE);
@@ -72,12 +89,15 @@ struct centauri_t6050_wifi {
 	size_t reply_capacity, reply_size;
 	bool stopping, command_failed;
 	bool tx_paused, transport_paused, host_sleep_sent, transport_sleep_sent;
+	bool regulatory_deferred;
+	u8 country_deferred[3];
+	bool host_events_fallback_logged;
 	bool scan_abort, connect_abort;
 	u8 scan_sequence;
 	bool connecting, connected, connect_event, disconnect_event;
 	bool disconnect_pending;
 	/* PM callbacks and the normal disconnect producer serialize on lock. */
-	bool pm_prepared;
+	bool pm_prepared, pm_wowlan_armed;
 	struct centauri_wifi_disconnect_receipt pm_disconnect;
 	u16 connect_status, scan_status, disconnect_status;
 	struct ieee80211_channel *connect_channel;
@@ -90,6 +110,8 @@ struct centauri_t6050_wifi {
 	bool data_tx_busy[DATA_TX_SLOTS];
 	u32 data_tx_submitted, data_tx_completed, data_tx_failed;
 	u32 data_tx_coalesced, data_tx_bad;
+	u32 data_tx_capped, data_tx_cap_bypassed;
+	unsigned long data_tx_completed_at;
 	s8 station_signal;
 	bool station_signal_valid;
 	unsigned long station_signal_at, connected_at;
@@ -111,6 +133,9 @@ struct centauri_t6050_wifi {
 	u8 avoid_ssid[IEEE80211_MAX_SSID_LEN];
 	size_t avoid_ssid_len;
 	unsigned long avoid_until;
+	/* Received frames wait here for rx_napi, whose poll hands them to GRO. */
+	struct napi_struct rx_napi;
+	struct sk_buff_head rx_gro_queue;
 };
 
 static int query_link_status(struct centauri_t6050_wifi *wifi);
@@ -353,10 +378,30 @@ static bool data_rx_frame(const u8 *packet, unsigned int capacity,
 	return *offset <= capacity && *frame_length <= capacity - *offset;
 }
 
+static int rx_poll(struct napi_struct *napi, int budget)
+{
+	struct centauri_t6050_wifi *wifi =
+		container_of(napi, struct centauri_t6050_wifi, rx_napi);
+	struct sk_buff *skb;
+	int done = 0;
+
+	while (done < budget && (skb = skb_dequeue(&wifi->rx_gro_queue))) {
+		napi_gro_receive(napi, skb);
+		done++;
+	}
+	if (done < budget && napi_complete_done(napi, done) &&
+	    !skb_queue_empty(&wifi->rx_gro_queue))
+		napi_schedule(napi);
+	return done;
+}
+
 static void drain_data_rx(struct centauri_t6050_wifi *wifi)
 {
 	u16 head, tail, post;
 	unsigned int processed = 0;
+	struct sk_buff_head frames;
+
+	__skb_queue_head_init(&frames);
 
 	if (!(wifi->data_rings_open & BIT(4)) || readl(wifi->a.bar + 8) != 2)
 		return;
@@ -408,7 +453,7 @@ static void drain_data_rx(struct centauri_t6050_wifi *wifi)
 				skb->ip_summed = CHECKSUM_NONE;
 				wifi->netdev->stats.rx_packets++;
 				wifi->netdev->stats.rx_bytes += frame_length;
-				netif_rx(skb);
+				__skb_queue_tail(&frames, skb);
 			} else {
 				wifi->netdev->stats.rx_dropped++;
 			}
@@ -430,6 +475,19 @@ static void drain_data_rx(struct centauri_t6050_wifi *wifi)
 		index_write(wifi, 3, 12, post);
 		dma_wmb();
 		writel(1, wifi->a.bar + 0x1050);
+	}
+	/*
+	 * Hand the batch to the NAPI context, so that GRO coalesces a flow's
+	 * segments (and TCP acknowledges each coalesced run once, not every
+	 * other segment) before they reach the stack.
+	 */
+	if (!skb_queue_empty(&frames)) {
+		spin_lock_bh(&wifi->rx_gro_queue.lock);
+		skb_queue_splice_tail_init(&frames, &wifi->rx_gro_queue);
+		spin_unlock_bh(&wifi->rx_gro_queue.lock);
+		local_bh_disable();
+		napi_schedule(&wifi->rx_napi);
+		local_bh_enable();
 	}
 }
 
@@ -486,6 +544,7 @@ static void drain_data_tx(struct centauri_t6050_wifi *wifi)
 			}
 			if (count > 1)
 				wifi->data_tx_coalesced++;
+			wifi->data_tx_completed_at = jiffies;
 			for (i = 0; i < count; i++) {
 				unsigned int slot = (first + i) % DATA_TX_SLOTS;
 
@@ -515,9 +574,28 @@ static void drain_data_tx(struct centauri_t6050_wifi *wifi)
 		u8 *descriptor = wifi->a.window + 0x540000 + post * 32;
 		struct sk_buff *skb;
 		u64 metadata = 6ULL << 27;
+		u32 inflight = wifi->data_tx_submitted - wifi->data_tx_completed;
 
 		if (wifi->data_tx_busy[post] || next == index_read(wifi, 1, 25))
 			break;
+		/*
+		 * Keep at most DATA_TX_INFLIGHT_MAX frames with the firmware. A
+		 * completion that never comes would hold its frame's place for
+		 * good, so the cap gives way once no completion has arrived for
+		 * half a second (beacon reports keep this path running).
+		 */
+		if (inflight >= DATA_TX_INFLIGHT_MAX &&
+		    !skb_queue_empty(&wifi->data_tx_queue)) {
+			if (time_before(jiffies,
+					wifi->data_tx_completed_at + HZ / 2)) {
+				wifi->data_tx_capped++;
+				break;
+			}
+			if (!wifi->data_tx_cap_bypassed++)
+				dev_warn(&wifi->control->pdev->dev,
+					 "Wi-Fi TX: no completion for %u in-flight frames; posting past the cap\n",
+					 inflight);
+		}
 		skb = skb_dequeue(&wifi->data_tx_queue);
 		if (!skb)
 			break;
@@ -535,10 +613,12 @@ static void drain_data_tx(struct centauri_t6050_wifi *wifi)
 		metadata |= 4ULL << 15;
 		put_unaligned_le64(metadata, descriptor + 16);
 		put_unaligned_le64(2000000, descriptor + 24);
+		if (wifi->data_tx_submitted == wifi->data_tx_completed)
+			wifi->data_tx_completed_at = jiffies;
 		wifi->data_tx_length[post] = skb->len;
 		wifi->data_tx_busy[post] = true;
 		wifi->data_tx_submitted++;
-		dev_kfree_skb_any(skb);
+		dev_consume_skb_any(skb);
 		post = next;
 		posted = true;
 	}
@@ -685,7 +765,7 @@ static int command_reply(struct centauri_t6050_wifi *wifi, u32 id,
 			 const void *payload, size_t size, void *reply,
 			 size_t *reply_size, bool *submitted)
 {
-	u16 slot = wifi->command_head, sequence = ++wifi->sequence;
+	u16 slot = wifi->command_head, sequence;
 	int ret;
 	u32 stage;
 	u8 *packet, *descriptor;
@@ -693,6 +773,10 @@ static int command_reply(struct centauri_t6050_wifi *wifi, u32 id,
 
 	if (submitted)
 		*submitted = false;
+	/* The PCI link can go down after the host-sleep command. */
+	if (wifi->host_sleep_sent)
+		return -EHOSTDOWN;
+	sequence = ++wifi->sequence;
 	if (wifi->command_failed)
 		return -EIO;
 	if (size > BUFFER_SIZE - 24)
@@ -893,6 +977,18 @@ static void channels_apply(struct centauri_t6050_wifi *wifi)
 	dev_info(&wifi->control->pdev->dev,
 		 "Wi-Fi firmware channels: 2.4 GHz %u, 5 GHz %u, 6 GHz %u (%u entries)\n",
 		 counted[0], counted[1], counted[2], list[0]);
+}
+
+static void country_set(struct centauri_t6050_wifi *wifi, const u8 country[3])
+{
+	int ret = command(wifi, 9, country, 3);
+
+	if (ret)
+		dev_err(&wifi->control->pdev->dev,
+			"firmware country update failed: %d\n", ret);
+	else
+		firmware_report(wifi, 19, wifi->hw_channels,
+				&wifi->hw_channels_blob);
 }
 
 /*
@@ -1942,6 +2038,32 @@ static int wait_disconnect(struct centauri_t6050_wifi *wifi)
 	return 0;
 }
 
+static bool data_tx_in_flight(struct centauri_t6050_wifi *wifi)
+{
+	unsigned int i;
+
+	for (i = 0; i < DATA_TX_SLOTS; i++)
+		if (wifi->data_tx_busy[i])
+			return true;
+	return false;
+}
+
+static void drain_tx_in_flight(struct centauri_t6050_wifi *wifi)
+{
+	unsigned long deadline = jiffies + msecs_to_jiffies(100);
+
+	lockdep_assert_held(&wifi->lock);
+	while (data_tx_in_flight(wifi) && time_before(jiffies, deadline)) {
+		drain(wifi);
+		if (!data_tx_in_flight(wifi) || wifi->command_failed ||
+		    READ_ONCE(wifi->stopping) || readl(wifi->a.bar + 8) != 2)
+			break;
+		usleep_range(500, 1000);
+	}
+	if (data_tx_in_flight(wifi))
+		drain(wifi);
+}
+
 static int wifi_disconnect(struct wiphy *wiphy, struct net_device *netdev,
 			   u16 reason)
 {
@@ -1988,6 +2110,8 @@ static int wifi_disconnect(struct wiphy *wiphy, struct net_device *netdev,
 	wifi->connected = false;
 	netif_stop_queue(netdev);
 	skb_queue_purge(&wifi->data_tx_queue);
+	if (!READ_ONCE(wifi->stopping))
+		drain_tx_in_flight(wifi);
 	netif_carrier_off(netdev);
 	if (connected)
 		cfg80211_disconnected(netdev, reason, NULL, 0, true,
@@ -2006,6 +2130,7 @@ void centauri_t6050_wifi_pm_prepare(struct centauri_t6050 *c)
 		return;
 	mutex_lock(&wifi->lock);
 	wifi->pm_disconnect = (struct centauri_wifi_disconnect_receipt) {};
+	wifi->pm_wowlan_armed = false;
 	wifi->pm_prepared = true;
 	mutex_unlock(&wifi->lock);
 }
@@ -2024,6 +2149,46 @@ int centauri_t6050_wifi_pm_error(struct centauri_t6050 *c)
 	return ret;
 }
 
+bool centauri_t6050_wifi_pm_disconnected(struct centauri_t6050 *c)
+{
+	struct centauri_t6050_wifi *wifi = c->wifi;
+	bool disconnected = false;
+
+	if (!wifi)
+		return false;
+	mutex_lock(&wifi->lock);
+	if (wifi->pm_prepared)
+		disconnected = wifi->pm_disconnect.seen;
+	mutex_unlock(&wifi->lock);
+	return disconnected;
+}
+
+bool centauri_t6050_wifi_wowlan_armed(struct centauri_t6050 *c)
+{
+	struct centauri_t6050_wifi *wifi = c->wifi;
+	bool armed = false;
+
+	if (!wifi)
+		return false;
+	mutex_lock(&wifi->lock);
+	if (wifi->pm_prepared)
+		armed = wifi->pm_wowlan_armed;
+	mutex_unlock(&wifi->lock);
+	return armed;
+}
+
+void centauri_t6050_wifi_mark_failed(struct centauri_t6050 *c)
+{
+	struct centauri_t6050_wifi *wifi = c->wifi;
+
+	if (!wifi)
+		return;
+	mutex_lock(&wifi->lock);
+	WRITE_ONCE(wifi->stopping, true);
+	wifi->command_failed = true;
+	mutex_unlock(&wifi->lock);
+}
+
 void centauri_t6050_wifi_pm_complete(struct centauri_t6050 *c)
 {
 	struct centauri_t6050_wifi *wifi = c->wifi;
@@ -2032,6 +2197,7 @@ void centauri_t6050_wifi_pm_complete(struct centauri_t6050 *c)
 		return;
 	mutex_lock(&wifi->lock);
 	/* Keep the receipt until the next prepare; it is not a sleep proof. */
+	wifi->pm_wowlan_armed = false;
 	wifi->pm_prepared = false;
 	mutex_unlock(&wifi->lock);
 }
@@ -2076,14 +2242,21 @@ static int alpha_transport_state(struct centauri_t6050_wifi *wifi, bool asleep)
 	return ret;
 }
 
-static int alpha_host_power(struct centauri_t6050_wifi *wifi, bool asleep)
+#define CEN_HOST_EVENTS_LEGACY	85
+#define CEN_HOST_EVENTS_FULL	91
+
+static int alpha_host_power_send(struct centauri_t6050_wifi *wifi, bool asleep,
+				 u8 event_count)
 {
 	static const u8 sleep_events[] = { 24, 26, 27, 15, 51, 8, 9, 10, 84 };
-	u8 payload[98] = {}, events[86] = {}, sleep_option = 1;
+	u8 payload[3 + 5 + 4 + 1 + CEN_HOST_EVENTS_FULL] = {};
+	u8 events[1 + CEN_HOST_EVENTS_FULL] = {};
+	u8 sleep_option = 1;
 	u16 state = 0;
 	u8 hint = 0;
 	size_t size = 3;
-	int i, ret;
+	unsigned int i;
+	int ret;
 
 	lockdep_assert_held(&wifi->lock);
 	if (readl(wifi->a.bar + 8) != 2)
@@ -2097,33 +2270,48 @@ static int alpha_host_power(struct centauri_t6050_wifi *wifi, bool asleep)
 		events[0] = ARRAY_SIZE(sleep_events);
 		memcpy(events + 1, sleep_events, sizeof(sleep_events));
 	} else {
-		events[0] = sizeof(events) - 1;
-		for (i = 0; i < events[0]; i++)
+		events[0] = event_count;
+		for (i = 0; i < event_count; i++)
 			events[i + 1] = i;
 	}
-	append_tlv(payload, &size, 280, events, sizeof(events));
+	append_tlv(payload, &size, 280, events, 1 + event_count);
 	ret = command(wifi, 6, payload, size);
 	dev_dbg(&wifi->control->pdev->dev,
-		"Alpha firmware host %s (connected=%d state=%u): ret=%d status=%u exec=%u\n",
-		asleep ? "sleep" : "awake", wifi->connected, state, ret,
-		wifi->reply_status, readl(wifi->a.bar + 8));
+		"Alpha firmware host %s (connected=%d state=%u events=%u tlv280=%u): ret=%d status=%u exec=%u\n",
+		asleep ? "sleep" : "awake", wifi->connected, state,
+		events[0], 1 + event_count, ret, wifi->reply_status,
+		readl(wifi->a.bar + 8));
 	return ret;
 }
 
-static bool data_tx_in_flight(struct centauri_t6050_wifi *wifi)
+static int alpha_host_power(struct centauri_t6050_wifi *wifi, bool asleep)
 {
-	unsigned int i;
+	u16 full_status;
+	int ret;
 
-	for (i = 0; i < DATA_TX_SLOTS; i++)
-		if (wifi->data_tx_busy[i])
-			return true;
-	return false;
+	if (asleep)
+		return alpha_host_power_send(wifi, true, CEN_HOST_EVENTS_LEGACY);
+
+	ret = alpha_host_power_send(wifi, false, CEN_HOST_EVENTS_FULL);
+	if (ret == -EREMOTEIO && readl(wifi->a.bar + 8) == 2) {
+		full_status = wifi->reply_status;
+		ret = alpha_host_power_send(wifi, false, CEN_HOST_EVENTS_LEGACY);
+		if (!ret && !wifi->host_events_fallback_logged) {
+			wifi->host_events_fallback_logged = true;
+			dev_info(&wifi->control->pdev->dev,
+				 "Alpha host wake fell back from %u to %u events (status=%u)\n",
+				 CEN_HOST_EVENTS_FULL, CEN_HOST_EVENTS_LEGACY,
+				 full_status);
+		}
+	}
+	return ret;
 }
 
 static int alpha_resume_locked(struct centauri_t6050_wifi *wifi)
 {
 	int ret;
 
+	ASSERT_RTNL();
 	lockdep_assert_held(&wifi->lock);
 	if (wifi->transport_sleep_sent) {
 		ret = alpha_transport_state(wifi, false);
@@ -2132,10 +2320,22 @@ static int alpha_resume_locked(struct centauri_t6050_wifi *wifi)
 		wifi->transport_sleep_sent = false;
 	}
 	if (wifi->host_sleep_sent) {
-		ret = alpha_host_power(wifi, false);
-		if (ret)
-			return ret;
+		/* Under the mutex, only the wake command can pass the gate. */
 		wifi->host_sleep_sent = false;
+		ret = alpha_host_power(wifi, false);
+		if (ret) {
+			wifi->host_sleep_sent = true;
+			return ret;
+		}
+	}
+	if (wifi->regulatory_deferred) {
+		if (wifi->configured && wifi->country_deferred[0])
+			country_set(wifi, wifi->country_deferred);
+		memset(wifi->country_deferred, 0, sizeof(wifi->country_deferred));
+		wifi->regulatory_deferred = false;
+		channels_apply(wifi);
+		if (wifi->command_failed)
+			return -EIO;
 	}
 	WRITE_ONCE(wifi->transport_paused, false);
 	WRITE_ONCE(wifi->tx_paused, false);
@@ -2152,7 +2352,6 @@ static int alpha_resume_locked(struct centauri_t6050_wifi *wifi)
 int centauri_t6050_wifi_suspend(struct centauri_t6050 *c)
 {
 	struct centauri_t6050_wifi *wifi = c->wifi;
-	unsigned long deadline;
 	unsigned int i;
 	int ret;
 
@@ -2178,16 +2377,7 @@ int centauri_t6050_wifi_suspend(struct centauri_t6050 *c)
 		mutex_unlock(&wifi->lock);
 		return -EIO;
 	}
-	deadline = jiffies + msecs_to_jiffies(100);
-	while (data_tx_in_flight(wifi) && time_before(jiffies, deadline)) {
-		drain(wifi);
-		if (!data_tx_in_flight(wifi) || wifi->command_failed ||
-		    READ_ONCE(wifi->stopping) || readl(wifi->a.bar + 8) != 2)
-			break;
-		usleep_range(500, 1000);
-	}
-	if (data_tx_in_flight(wifi))
-		drain(wifi);
+	drain_tx_in_flight(wifi);
 	if (data_tx_in_flight(wifi) || wifi->command_failed ||
 	    READ_ONCE(wifi->stopping) || readl(wifi->a.bar + 8) != 2) {
 		ret = data_tx_in_flight(wifi) ? -EBUSY : -EIO;
@@ -2207,15 +2397,24 @@ int centauri_t6050_wifi_suspend(struct centauri_t6050 *c)
 		synchronize_irq(pci_irq_vector(c->alpha_irqs.pdev, i));
 	cancel_work_sync(&wifi->link_work);
 
+	/* Match the regulatory notifier's lock order for suspend unwind. */
+	rtnl_lock();
 	mutex_lock(&wifi->lock);
 	ret = alpha_transport_state(wifi, true);
 	if (!ret) {
 		wifi->transport_sleep_sent = true;
 		mutex_unlock(&wifi->lock);
+		rtnl_unlock();
 		return 0;
 	}
-	alpha_resume_locked(wifi);
+	if (alpha_resume_locked(wifi)) {
+		dev_warn(&c->pdev->dev,
+			 "Alpha host wake failed during suspend unwind\n");
+		WRITE_ONCE(wifi->stopping, true);
+		wifi->command_failed = true;
+	}
 	mutex_unlock(&wifi->lock);
+	rtnl_unlock();
 	return ret;
 
 out_unpause:
@@ -2235,9 +2434,11 @@ int centauri_t6050_wifi_resume(struct centauri_t6050 *c)
 
 	if (!wifi)
 		return 0;
+	rtnl_lock();
 	mutex_lock(&wifi->lock);
 	ret = alpha_resume_locked(wifi);
 	mutex_unlock(&wifi->lock);
+	rtnl_unlock();
 	return ret;
 }
 
@@ -2252,9 +2453,11 @@ static int wifi_suspend(struct wiphy *wiphy, struct cfg80211_wowlan *wowlan)
 		ret = (wowlan->any && wifi->connected && !wifi->connecting &&
 		       !wifi->disconnect_pending && !wifi->command_failed &&
 		       !READ_ONCE(wifi->stopping)) ? 0 : 1;
+		wifi->pm_wowlan_armed = !ret;
 		mutex_unlock(&wifi->lock);
 		return ret;
 	}
+	wifi->pm_wowlan_armed = false;
 	/* cfg80211 already called normal leave; do not send another command. */
 	if (wifi->pm_prepared)
 		ret = wifi->pm_disconnect.error;
@@ -2292,20 +2495,19 @@ static void wifi_regulatory(struct wiphy *wiphy,
 	u8 country[3] = { request->alpha2[0], request->alpha2[1], 1 };
 	bool named = country[0] >= 'A' && country[0] <= 'Z' &&
 		     country[1] >= 'A' && country[1] <= 'Z';
-	int ret;
 
 	mutex_lock(&wifi->lock);
-	if (wifi->configured && named) {
-		ret = command(wifi, 9, country, sizeof(country));
-		if (ret)
-			dev_err(&wifi->control->pdev->dev,
-				"firmware country update failed: %d\n", ret);
-		else
-			firmware_report(wifi, 19, wifi->hw_channels,
-					&wifi->hw_channels_blob);
+	if (wifi->host_sleep_sent) {
+		/* Keep the last named country across cfg80211's world updates. */
+		if (named)
+			memcpy(wifi->country_deferred, country, sizeof(country));
+		wifi->regulatory_deferred = true;
+	} else {
+		if (wifi->configured && named)
+			country_set(wifi, country);
+		/* cfg80211 has just recomputed the channel flags. */
+		channels_apply(wifi);
 	}
-	/* cfg80211 has just recomputed the channel flags from its own rules. */
-	channels_apply(wifi);
 	mutex_unlock(&wifi->lock);
 }
 
@@ -2392,9 +2594,13 @@ static int net_open(struct net_device *netdev)
 
 	netif_carrier_off(netdev);
 	netif_stop_queue(netdev);
+	skb_queue_purge(&wifi->rx_gro_queue);
+	napi_enable(&wifi->rx_napi);
 	mutex_lock(&wifi->lock);
 	ret = wifi->configured ? data_start(wifi) : -ENETDOWN;
 	mutex_unlock(&wifi->lock);
+	if (ret)
+		napi_disable(&wifi->rx_napi);
 	return ret;
 }
 
@@ -2406,6 +2612,8 @@ static int net_stop(struct net_device *netdev)
 	cancel_scan(wifi);
 	netif_stop_queue(netdev);
 	skb_queue_purge(&wifi->data_tx_queue);
+	napi_disable(&wifi->rx_napi);
+	skb_queue_purge(&wifi->rx_gro_queue);
 	return 0;
 }
 
@@ -2428,6 +2636,7 @@ static netdev_tx_t net_transmit(struct sk_buff *skb, struct net_device *netdev)
 		netif_stop_queue(netdev);
 		return NETDEV_TX_BUSY;
 	}
+	sk_pacing_shift_update(skb->sk, DATA_TX_PACING_SHIFT);
 	skb_queue_tail(&wifi->data_tx_queue, skb);
 	if (skb_queue_len(&wifi->data_tx_queue) >= DATA_TX_QUEUE_LIMIT)
 		netif_stop_queue(netdev);
@@ -2635,6 +2844,27 @@ static int query_link_status(struct centauri_t6050_wifi *wifi)
 	return ret;
 }
 
+static int data_stats_show(struct seq_file *m, void *unused)
+{
+	struct centauri_t6050_wifi *wifi = m->private;
+
+	mutex_lock(&wifi->lock);
+	seq_printf(m,
+		   "rx received %u reposted %u bad %u\n"
+		   "tx submitted %u completed %u in_flight %u failed %u bad %u coalesced %u\n"
+		   "tx queued %u capped %u cap_bypassed %u\n",
+		   wifi->data_rx_received, wifi->data_rx_reposted,
+		   wifi->data_rx_bad, wifi->data_tx_submitted,
+		   wifi->data_tx_completed,
+		   wifi->data_tx_submitted - wifi->data_tx_completed,
+		   wifi->data_tx_failed, wifi->data_tx_bad,
+		   wifi->data_tx_coalesced, skb_queue_len(&wifi->data_tx_queue),
+		   wifi->data_tx_capped, wifi->data_tx_cap_bypassed);
+	mutex_unlock(&wifi->lock);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(data_stats);
+
 int centauri_t6050_wifi_register(struct centauri_t6050 *c)
 {
 	struct centauri_t6050_wifi *wifi;
@@ -2647,6 +2877,7 @@ int centauri_t6050_wifi_register(struct centauri_t6050 *c)
 	wifi->control = c;
 	mutex_init(&wifi->lock);
 	skb_queue_head_init(&wifi->data_tx_queue);
+	skb_queue_head_init(&wifi->rx_gro_queue);
 	INIT_WORK(&wifi->scan_work, scan_worker);
 	INIT_WORK(&wifi->connect_work, connect_worker);
 	INIT_WORK(&wifi->link_work, link_worker);
@@ -2662,6 +2893,7 @@ int centauri_t6050_wifi_register(struct centauri_t6050 *c)
 	}
 	*(struct centauri_t6050_wifi **)wiphy_priv(wifi->wiphy) = wifi;
 	*(struct centauri_t6050_wifi **)netdev_priv(wifi->netdev) = wifi;
+	netif_napi_add(wifi->netdev, &wifi->rx_napi, rx_poll);
 	set_wiphy_dev(wifi->wiphy, &c->pdev->dev);
 	wifi->wiphy->interface_modes = BIT(NL80211_IFTYPE_STATION);
 	wifi->wiphy->max_scan_ssids = 1;
@@ -2727,6 +2959,8 @@ int centauri_t6050_wifi_register(struct centauri_t6050 *c)
 			    &wifi->hw_channels_blob);
 	debugfs_create_blob("system_caps", 0400, wifi->wiphy->debugfsdir,
 			    &wifi->system_caps_blob);
+	debugfs_create_file("data_stats", 0400, wifi->wiphy->debugfsdir, wifi,
+			    &data_stats_fops);
 	rtnl_lock();
 	channels_apply(wifi);
 	rtnl_unlock();
@@ -2776,6 +3010,7 @@ void centauri_t6050_wifi_unregister(struct centauri_t6050 *c)
 	skb_queue_purge(&wifi->data_tx_queue);
 	if (wifi->netdev && wifi->netdev->reg_state == NETREG_REGISTERED)
 		unregister_netdev(wifi->netdev);
+	skb_queue_purge(&wifi->rx_gro_queue);
 	if (wifi->registered)
 		wiphy_unregister(wifi->wiphy);
 	if (wifi->wiphy)

@@ -98,7 +98,9 @@ static int nvmem_cell_get_u8(struct nvmem_cell *cell)
 
 static int nvmem_cell_set_u8(struct nvmem_cell *cell, u8 val)
 {
-	return nvmem_cell_write(cell, &val, sizeof(val));
+	int ret = nvmem_cell_write(cell, &val, sizeof(val));
+
+	return ret < 0 ? ret : 0;
 }
 
 /*

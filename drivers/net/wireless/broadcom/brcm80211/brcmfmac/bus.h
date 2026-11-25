@@ -165,6 +165,8 @@ struct brcmf_bus_stats {
  * @always_use_fws_queue: bus wants use queue also when fwsignal is inactive.
  * @wowl_transport: bus can keep the firmware running during system sleep.
  * @wowl_wake: platform can route a wake signal from the device.
+ * @wowl_s2idle_only: the wake signal only works while the link stays up (in-band
+ *	MSI): there is no WoWLAN in a system sleep deeper than suspend-to-idle.
  * @ops: callbacks for this bus instance.
  * @msgbuf: msgbuf protocol parameters provided by bus layer.
  * @list: member used to add this bus instance to linked list.
@@ -187,6 +189,7 @@ struct brcmf_bus {
 	bool always_use_fws_queue;
 	bool wowl_transport;
 	bool wowl_wake;
+	bool wowl_s2idle_only;
 	bool removing;		/* device removal in progress; quiesce async work */
 	struct mutex bus_reset_lock;
 

@@ -27,6 +27,11 @@
 		#endif
 	};
 
+	clpc: performance-controller {
+		compatible = "apple,t8112-clpc", "apple,clpc";
+		apple,smc = <&smc>;
+	};
+
 	cpus {
 		#address-cells = <2>;
 		#size-cells = <0>;
