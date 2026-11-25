@@ -1326,6 +1326,54 @@ static void apple_dart_test_host_power_tables(struct kunit *test)
 }
 #endif
 
+/* The live-handoff check reads a consumer's stream maps as of_xlate fills them: no fwspec ids. */
+static void apple_dart_test_live_check(struct kunit *test)
+{
+	struct apple_dart *dart = apple_dart_test_t8110(test, "dart-live");
+	struct apple_dart *other = apple_dart_test_t8110(test, "dart-other");
+	struct apple_dart_master_cfg *cfg = kunit_kzalloc(test, sizeof(*cfg), GFP_KERNEL);
+	unsigned long *sids;
+
+	KUNIT_ASSERT_NOT_NULL(test, cfg);
+	sids = cfg->stream_maps[0].sidmap;
+	cfg->stream_maps[0].dart = dart;
+	set_bit(DART_LIVE_SID, sids);
+
+	/* Not a live-handoff DART, no stream maps, or another DART's */
+	KUNIT_EXPECT_EQ(test, apple_dart_live_check(dart, cfg, true), -ENODEV);
+	dart->live_mtp = true;
+	KUNIT_EXPECT_EQ(test, apple_dart_live_check(dart, NULL, true), -ENODEV);
+	other->live_mtp = true;
+	KUNIT_EXPECT_EQ(test, apple_dart_live_check(other, cfg, true), -ENODEV);
+	KUNIT_EXPECT_FALSE(test, READ_ONCE(dart->live_mtp_idle));
+
+	KUNIT_EXPECT_EQ(test, apple_dart_live_check(dart, cfg, true), 0);
+	KUNIT_EXPECT_TRUE(test, READ_ONCE(dart->live_mtp_idle));
+
+	/* Before AP on, the stream must be in bypass; its enable word reads 0 on J516s. */
+	KUNIT_EXPECT_EQ(test, apple_dart_live_check(dart, cfg, false), -EIO);
+	KUNIT_EXPECT_FALSE(test, READ_ONCE(dart->live_mtp_idle));
+	writel(dart->hw->tcr_bypass, dart->regs + DART_TCR(dart, DART_LIVE_SID));
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + dart->hw->enable_streams), 0U);
+	KUNIT_EXPECT_EQ(test, apple_dart_live_check(dart, cfg, false), 0);
+	writel(0, dart->regs + DART_TCR(dart, DART_LIVE_SID));
+	KUNIT_EXPECT_EQ(test, apple_dart_live_check(dart, cfg, false), -EIO);
+
+	/* Another stream beside it, another stream instead, or a second DART: not the handoff */
+	set_bit(0, sids);
+	KUNIT_EXPECT_EQ(test, apple_dart_live_check(dart, cfg, true), -ENODEV);
+	clear_bit(0, sids);
+	clear_bit(DART_LIVE_SID, sids);
+	set_bit(2, sids);
+	KUNIT_EXPECT_EQ(test, apple_dart_live_check(dart, cfg, true), -ENODEV);
+	clear_bit(2, sids);
+	set_bit(DART_LIVE_SID, sids);
+	cfg->stream_maps[1].dart = other;
+	KUNIT_EXPECT_EQ(test, apple_dart_live_check(dart, cfg, true), -ENODEV);
+	cfg->stream_maps[1].dart = NULL;
+	KUNIT_EXPECT_EQ(test, apple_dart_live_check(dart, cfg, true), 0);
+}
+
 static struct kunit_case apple_dart_test_cases[] = {
 	KUNIT_CASE(apple_dart_test_strict_engines),
 	KUNIT_CASE(apple_dart_test_topology),
@@ -1364,6 +1412,7 @@ static struct kunit_case apple_dart_test_cases[] = {
 	KUNIT_CASE(apple_dart_test_host_power_slept_foreign_valid),
 	KUNIT_CASE(apple_dart_test_host_power_invalid_ttbr_no_sleep),
 #endif
+	KUNIT_CASE(apple_dart_test_live_check),
 	{}
 };
 

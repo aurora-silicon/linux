@@ -425,6 +425,8 @@ struct apple_dart {
 	/* J613 MTP keeps issuing DMA in the boot loader identity domain. */
 	bool live_mtp;
 	bool live_mtp_sleep;
+	/* Its firmware answered the AP idle notice of the firmware-driven sleep under way. */
+	bool live_mtp_idle;
 	u32 four_level : 1;
 	u32 locked : 1;
 	u32 tunneled : 1;
@@ -7680,29 +7682,110 @@ int apple_dart_state_restore(struct device *dev)
 }
 EXPORT_SYMBOL_GPL(apple_dart_state_restore);
 
+/* The stream apple,bypass-handoff-streams names; probe accepts no other. */
+#define DART_LIVE_SID	1
+
+/*
+ * The live stream as the firmware's DMA needs it: in bypass. Its enable bit is no witness: on
+ * J516s's MTP DART the stream-enable words read 0 while its firmware's DMA runs in bypass.
+ */
+static bool apple_dart_live_stream_ok(struct apple_dart *dart)
+{
+	return apple_dart_readl(dart, DART_TCR(dart, DART_LIVE_SID)) == dart->hw->tcr_bypass;
+}
+
+/*
+ * The checks of apple_dart_live_sleep() on a consumer's own stream maps, as of_xlate filled
+ * them: the live-handoff DART and the live stream alone. Before AP on, that stream must still
+ * be in bypass.
+ */
+static int apple_dart_live_check(struct apple_dart *dart, const struct apple_dart_master_cfg *cfg,
+				 bool idle)
+{
+	unsigned int i;
+
+	if (!dart->live_mtp || !cfg || cfg->stream_maps[0].dart != dart)
+		return -ENODEV;
+	for (i = 1; i < MAX_DARTS_PER_DEVICE; i++)
+		if (cfg->stream_maps[i].dart)
+			return -ENODEV;
+	if (bitmap_weight(cfg->stream_maps[0].sidmap, DART_MAX_STREAMS) != 1 ||
+	    !test_bit(DART_LIVE_SID, cfg->stream_maps[0].sidmap))
+		return -ENODEV;
+	WRITE_ONCE(dart->live_mtp_idle, idle);
+	return idle || apple_dart_live_stream_ok(dart) ? 0 : -EIO;
+}
+
+/**
+ * apple_dart_live_sleep() - A live coprocessor's AP idle notice around a firmware-driven sleep
+ * @consumer: the coprocessor, translating through the stream a live-handoff DART kept
+ *	(apple,bypass-handoff-streams)
+ * @idle: true once its firmware has answered the sleep's AP idle notice; false before the
+ *	AP on notice that ends it
+ *
+ * Only after the first may the sleep keep the stream running (apple_dart_system_suspend()).
+ * The second also checks that the stream is still in bypass, as the firmware's DMA needs.
+ *
+ * Return: 0; -ENODEV if @consumer doesn't translate through a live-handoff apple-dart, by
+ * its live stream alone; -EIO if the stream left bypass, when the firmware must not be told
+ * anything.
+ */
+int apple_dart_live_sleep(struct device *consumer, bool idle)
+{
+	struct iommu_fwspec *fwspec = dev_iommu_fwspec_get(consumer);
+	struct device *dev;
+	int ret = -ENODEV;
+
+	if (!fwspec || !fwspec->iommu_fwnode)
+		return -ENODEV;
+	dev = bus_find_device_by_fwnode(&platform_bus_type, fwspec->iommu_fwnode);
+	if (!dev)
+		return -ENODEV;
+	/* Only an apple-dart provider's consumers carry its stream maps as private data. */
+	if (dev->driver == &apple_dart_driver.driver && dev_get_drvdata(dev))
+		ret = apple_dart_live_check(dev_get_drvdata(dev), dev_iommu_priv_get(consumer),
+					    idle);
+	put_device(dev);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_dart_live_sleep);
+
 /*
  * A firmware-driven sleep takes the DARTs in the noirq phase, which every device finishes
  * before any early resume: coprocessors such as the PMP and SIO restart their firmware in
  * their early resume, and its first DMA has to find the DART already restored. Any other
  * sleep keeps the normal phase, which the PCIe-C tunnel DARTs need: their host stops and
- * restarts the port clock in its own noirq callbacks. The adopted J613 MTP stays live:
- * system s2idle must retain, never reset it.
+ * restarts the port clock in its own noirq callbacks. An adopted live MTP stays live and is
+ * never reset: in s2idle, and in a firmware-driven sleep once its firmware has answered that
+ * sleep's AP idle notice (apple_dart_live_sleep()). In macOS's J516s sleep the MTP hears
+ * only the AP idle notice and AP on at the wake, with no restart.
  */
+/* The live stream kept: PMGR's ACTIVE_WAKEUP domains and their ancestors stay powered. */
+static int apple_dart_live_keep(struct device *dev, struct apple_dart *dart, const char *how)
+{
+	if (!apple_dart_live_stream_ok(dart))
+		return -EIO;
+	device_set_awake_path(dev);
+	dart->live_mtp_sleep = true;
+	dev_dbg(dev, "live MTP %s: retaining clocks, supplier power and bypass stream 1\n", how);
+	return 0;
+}
+
 static int apple_dart_system_suspend(struct device *dev)
 {
 	struct apple_dart *dart = dev_get_drvdata(dev);
 
 	if (!dart->live_mtp)
 		return pm_suspend_via_firmware() ? 0 : pm_runtime_force_suspend(dev);
+	/*
+	 * A firmware-driven sleep decides in .suspend_noirq: the idle notice may come only in
+	 * its coprocessor's .suspend_late (J516s and T6050 send it after the HID packets).
+	 */
+	if (pm_suspend_via_firmware())
+		return 0;
 	if (pm_suspend_target_state != PM_SUSPEND_TO_IDLE)
 		return -EBUSY;
-	if (apple_dart_readl(dart, DART_TCR(dart, 1)) != dart->hw->tcr_bypass)
-		return -EIO;
-	/* PMGR's ACTIVE_WAKEUP domains and their ancestors must stay powered. */
-	device_set_awake_path(dev);
-	dart->live_mtp_sleep = true;
-	dev_dbg(dev, "live MTP s2idle: retaining clocks, supplier power and bypass stream 1\n");
-	return 0;
+	return apple_dart_live_keep(dev, dart, "s2idle");
 }
 
 static int apple_dart_system_resume(struct device *dev)
@@ -7714,11 +7797,11 @@ static int apple_dart_system_resume(struct device *dev)
 	if (!dart->live_mtp_sleep)
 		return 0;
 	dart->live_mtp_sleep = false;
-	if (apple_dart_readl(dart, DART_TCR(dart, 1)) != dart->hw->tcr_bypass) {
-		dev_err(dev, "live MTP bypass lost across s2idle; refusing reset of inherited DMA\n");
+	if (!apple_dart_live_stream_ok(dart)) {
+		dev_err(dev, "live MTP bypass lost across sleep; refusing reset of inherited DMA\n");
 		return -EIO;
 	}
-	dev_dbg(dev, "live MTP s2idle: bypass retained; no reset or invalidate\n");
+	dev_dbg(dev, "live MTP: bypass retained across sleep; no reset or invalidate\n");
 	return 0;
 }
 
@@ -7729,6 +7812,15 @@ static __maybe_unused int apple_dart_sys_suspend_noirq(struct device *dev)
 	if (READ_ONCE(dart->m5_sleep_owner)) {
 		dart->v27_noirq_skip = true;
 		return 0;
+	}
+	/* Kept running by apple_dart_system_suspend(): its runtime suspend would refuse. */
+	if (dart->live_mtp_sleep)
+		return 0;
+	/* After every .suspend_late: kept only once the firmware has answered the idle notice. */
+	if (dart->live_mtp && pm_suspend_via_firmware()) {
+		if (!READ_ONCE(dart->live_mtp_idle))
+			return -EBUSY;
+		return apple_dart_live_keep(dev, dart, "sleep");
 	}
 
 	return pm_suspend_via_firmware() ? pm_runtime_force_suspend(dev) : 0;
@@ -7742,6 +7834,9 @@ static __maybe_unused int apple_dart_sys_resume_noirq(struct device *dev)
 		dart->v27_noirq_skip = false;
 		return 0;
 	}
+	/* Never reset: apple_dart_system_resume() checks the stream it kept. */
+	if (dart->live_mtp_sleep)
+		return 0;
 	return pm_suspend_via_firmware() ? apple_dart_resume_noirq(dev) : 0;
 }
 

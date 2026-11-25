@@ -221,6 +221,8 @@ int apple_dart_m5_display_rewrite(struct device *dev);
 int apple_dart_state_save(struct device *dev);
 int apple_dart_state_restore(struct device *dev);
 void apple_dart_sleep_restore_lost(struct device *dev, bool lost);
+/* A live coprocessor's answered AP idle notice around a firmware-driven sleep. */
+int apple_dart_live_sleep(struct device *consumer, bool idle);
 #else
 static inline bool apple_dart_sleep_listed(struct device *dev)
 {
@@ -277,6 +279,11 @@ static inline int apple_dart_state_restore(struct device *dev)
 
 static inline void apple_dart_sleep_restore_lost(struct device *dev, bool lost)
 {
+}
+
+static inline int apple_dart_live_sleep(struct device *consumer, bool idle)
+{
+	return -ENODEV;
 }
 #endif
 
