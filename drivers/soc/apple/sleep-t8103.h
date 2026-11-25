@@ -318,6 +318,17 @@ static const u32 t8103_cg_commit_off[] = {
 #define T8103_DCS_WQ_FLUSH	0xa30
 #define T8103_DCS_FLUSH_US	330
 
+/*
+ * NCO channels 0..4 clock the externally-clocked MCA PMGR domains (ps_mca0..5). The SoC sleep
+ * entry sequence writes and polls those domains; if a channel's enable bit was cleared after
+ * an audio stream closed, the PMGR transition hangs busy and resets the SoC. Enable any
+ * disabled channel across the commit and turn it back off on wake.
+ */
+#define T8103_NCO		0x23b044000ULL
+#define T8103_NCO_CHANS		5
+#define T8103_NCO_STRIDE	0x4000
+#define T8103_NCO_CTRL_EN	BIT(31)
+
 /* AIC: each CPU's IPI mask set at +0x5024 and its status at +0x5004, 0x80 per CPU */
 #define T8103_AIC_CPU		0x23b105000ULL
 #define T8103_AIC_CPU_STRIDE	0x80
@@ -356,8 +367,9 @@ static const u32 t8103_aon_boot_auto[] = {
 };
 
 static struct t8103_sleep {
-	void __iomem *mcc_bcast, *mcc_planes, *dcs, *aic_cpu;
+	void __iomem *mcc_bcast, *mcc_planes, *dcs, *aic_cpu, *nco;
 	void __iomem *bridges[ARRAY_SIZE(t8103_bridges)];
+	u8 nco_forced;
 	/* The SoC clock muxes from T8103_MUX_SOC at the commit, and those the wake put back */
 	u32 mux_snap[40];
 	u64 mux_fixed;
@@ -740,8 +752,10 @@ static int t8103_sleep_map_regs(struct apple_sleep *s)
 	t->mcc_planes = t8103_ioremap(s, T8103_MCC_PLANES, T8103_MCC_NPLANES * T8103_MCC_STRIDE);
 	t->dcs = t8103_ioremap(s, T8103_DCS_BASE, T8103_DCS_NCHAN * T8103_DCS_STRIDE);
 	t->aic_cpu = t8103_ioremap(s, T8103_AIC_CPU, T8103_AIC_CPUS * T8103_AIC_CPU_STRIDE);
-	if (!t->mcc_bcast || !t->mcc_planes || !t->dcs || !t->aic_cpu)
-		return dev_err_probe(s->dev, -ENOMEM, "MCC, DCS or AIC CPU block not mapped\n");
+	t->nco = t8103_ioremap(s, T8103_NCO, T8103_NCO_CHANS * T8103_NCO_STRIDE);
+	if (!t->mcc_bcast || !t->mcc_planes || !t->dcs || !t->aic_cpu || !t->nco)
+		return dev_err_probe(s->dev, -ENOMEM,
+				     "MCC, DCS, AIC CPU or NCO block not mapped\n");
 	t->dcs_perf = t8103_ioremap(s, T8103_DCS_PERF, 4);
 	t->pmp_asc = t8103_ioremap(s, T8103_PMP_ASC, 0x100);
 	t->pmp_mbox = t8103_ioremap(s, T8103_PMP_MBOX, 0x1000);
@@ -827,6 +841,7 @@ static int t8103_sleep_begin(struct apple_sleep *s)
 	t->cluster_timeouts = 0;
 	t->mux_wake_timeouts = 0;
 	t->gfx_wake_err = 0;
+	t->nco_forced = 0;
 	memset(t->cluster_wake_ret, 0, sizeof(t->cluster_wake_ret));
 	t->aop_slp_ddr = t8103_aop_bound();
 	if (t->aop_slp_ddr)
@@ -1421,6 +1436,20 @@ static void t8103_sleep_commit_regs(struct apple_sleep *s)
 					      T8103_MUX_TIMEOUT_US))
 			t->mux_timeouts++;
 	}
+	/*
+	 * Externally-clocked MCA power domains (ps_mca0..5) hang BUSY in the sleep sequencer
+	 * if their NCO channel is disabled. Enable any disabled channel for the commit.
+	 */
+	t->nco_forced = 0;
+	for (i = 0; i < T8103_NCO_CHANS; i++) {
+		void __iomem *reg = t->nco + i * T8103_NCO_STRIDE;
+
+		v = readl(reg);
+		if (!(v & T8103_NCO_CTRL_EN)) {
+			writel(v | T8103_NCO_CTRL_EN, reg);
+			t->nco_forced |= BIT(i);
+		}
+	}
 	for (i = 0; i < ARRAY_SIZE(t->mux_snap); i++)
 		t->mux_snap[i] = readl(s->clk_mux + T8103_MUX_SOC + i * 4);
 	/* E4: the CPU complexes' and voltage monitors' quiesce */
@@ -1544,6 +1573,14 @@ static void t8103_sleep_wake(struct apple_sleep *s)
 					      T8103_MUX_TIMEOUT_US))
 			t->mux_wake_timeouts++;
 	}
+	/* Turn back off any NCO channel the commit enabled so clk-apple-nco state matches. */
+	for (i = 0; i < T8103_NCO_CHANS; i++) {
+		void __iomem *reg = t->nco + i * T8103_NCO_STRIDE;
+
+		if (t->nco_forced & BIT(i))
+			writel(readl(reg) & ~T8103_NCO_CTRL_EN, reg);
+	}
+	t->nco_forced = 0;
 	/*
 	 * A cluster's ACC answers only while the cluster is powered: after a real sleep both
 	 * were off until W3, and an access before that is an external abort.
