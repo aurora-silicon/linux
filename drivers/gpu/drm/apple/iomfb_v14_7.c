@@ -147,13 +147,15 @@ static const struct dcp_v14_board dcp_v14_board_j615 = {
  * The colour matrix methods are this image's, and so is the panel level
  * block the J613 qualified (brightness in nits, 500 at most here). Its swaps
  * keep zero timestamps as on the Airs. Every panel timing and the
- * display clock are logged for the first boots.
+ * display clock are logged for the first boots. Selected by the T8122 DCP
+ * and the panel node the board device tree puts under it
+ * (apple,panel-j504), not by the machine.
  */
 static const struct dcp_v14_board dcp_v14_board_j504 = {
 	.name = "J504",
 	.debugfs = "dcp-j504",
 	.dcp_compatible = "apple,t8122-dcp",
-	.machine = "apple,j504",
+	.panel = "apple,panel-j504",
 	.firmware_uuid = DCP_V14_J613_FIRMWARE_UUID,
 	.handoff = "apple,t8122-handoff",
 	.panel_width = 3024,
@@ -1666,6 +1668,7 @@ static int dcp_v14_cpu_running(struct device *dev, const char *name)
  */
 const struct dcp_v14_board *dcp_v14_board_select(dcp_v14_compat_fn dcp_is,
 						 dcp_v14_compat_fn machine_is,
+						 dcp_v14_compat_fn panel_is,
 						 const void *ctx, bool *dcp_known)
 {
 	const struct dcp_v14_board *board;
@@ -1678,6 +1681,8 @@ const struct dcp_v14_board *dcp_v14_board_select(dcp_v14_compat_fn dcp_is,
 			continue;
 		*dcp_known = true;
 		if (board->machine && !machine_is(ctx, board->machine))
+			continue;
+		if (board->panel && !panel_is(ctx, board->panel))
 			continue;
 		return board;
 	}
@@ -1699,13 +1704,22 @@ static bool dcp_v14_machine_is(const void *np, const char *compat)
 	return of_machine_is_compatible(compat);
 }
 
+/* The panel the board device tree puts under the DCP node. */
+static bool dcp_v14_panel_is(const void *np, const char *compat)
+{
+	struct device_node *panel __free(device_node) =
+		of_get_child_by_name(np, "panel");
+
+	return panel && of_device_is_compatible(panel, compat);
+}
+
 const struct dcp_v14_board *iomfb_v14_7_board(struct device *dev)
 {
 	const struct dcp_v14_board *board;
 	bool dcp_known;
 
-	board = dcp_v14_board_select(dcp_v14_node_is, dcp_v14_machine_is, dev->of_node,
-				     &dcp_known);
+	board = dcp_v14_board_select(dcp_v14_node_is, dcp_v14_machine_is, dcp_v14_panel_is,
+				     dev->of_node, &dcp_known);
 	if (board)
 		return board;
 	if (dcp_known) {
@@ -1715,13 +1729,18 @@ const struct dcp_v14_board *iomfb_v14_7_board(struct device *dev)
 	return NULL;
 }
 
+/*
+ * A record selected by its panel node was matched to that panel, so its own
+ * panel_nits decides; the records still selected by the machine keep their
+ * machine list.
+ */
 static bool dcp_v14_panel_nits_admit(const struct dcp_v14_board *board,
 				     dcp_v14_compat_fn machine_is, const void *ctx)
 {
 	return board && board->panel_nits &&
-		(machine_is(ctx, "apple,j514s") || machine_is(ctx, "apple,j516s") ||
-		 machine_is(ctx, "apple,j516c") || machine_is(ctx, "apple,j613") ||
-		 machine_is(ctx, "apple,j504"));
+		(board->panel ||
+		 machine_is(ctx, "apple,j514s") || machine_is(ctx, "apple,j516s") ||
+		 machine_is(ctx, "apple,j516c") || machine_is(ctx, "apple,j613"));
 }
 
 const char *iomfb_v14_7_board_name(const struct dcp_v14_board *board)
