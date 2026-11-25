@@ -118,6 +118,8 @@ struct t6030_sleep {
 	struct sleep_seq prepare, notice, commit, wake_early, wake;
 	u32 notify_saved[2];
 	bool notify_staged;
+	u32 wake_saved[7];
+	u32 wake_status[7];
 	u32 lowered_saved[ARRAY_SIZE(t6030_lowered)];
 	unsigned int nlowered;
 	u32 auto_saved[ARRAY_SIZE(t6030_auto_off)];
@@ -558,6 +560,43 @@ static void t6030_sleep_wfi_again(struct apple_sleep *s)
 }
 
 /*
+ * The wake block (nub-ap-ctrl) as macOS 27.2 on J516s has it: a mask word per 32 sources from
+ * +0x08 (1 masks), the sticky status words from +0x24, seven of each (the ADT's sources end at
+ * 214). macOS writes the masks once at boot, all set but its ap-wake-sources (its first
+ * access: +0x08 = 0xfffffff7, source 3 alone), and reads the status words at its wake: +0x34
+ * bit 31 there, source 159, NUB.SPMI0.SW3.IRQ, the PMU's RTC alarm. iBoot leaves every word 0.
+ */
+#define T6030_WAKE_MASK			0x08
+#define T6030_WAKE_STATUS		0x24
+#define T6030_WAKE_WORDS		7
+
+static void t6030_wake_masks_set(struct apple_sleep *s)
+{
+	struct t6030_sleep *t = t6030_state(s);
+	u32 val[T6030_WAKE_WORDS];
+	unsigned int i;
+
+	for (i = 0; i < T6030_WAKE_WORDS; i++) {
+		t->wake_saved[i] = readl(s->wake + T6030_WAKE_MASK + 4 * i);
+		val[i] = U32_MAX;
+	}
+	for (i = 0; i < s->wake_enable_count; i++)
+		if (s->wake_enable[i] / 32 < T6030_WAKE_WORDS)
+			val[s->wake_enable[i] / 32] &= ~BIT(s->wake_enable[i] % 32);
+	for (i = 0; i < T6030_WAKE_WORDS; i++)
+		writel(val[i], s->wake + T6030_WAKE_MASK + 4 * i);
+}
+
+static void t6030_wake_masks_restore(struct apple_sleep *s)
+{
+	struct t6030_sleep *t = t6030_state(s);
+	unsigned int i;
+
+	for (i = 0; i < T6030_WAKE_WORDS; i++)
+		writel(t->wake_saved[i], s->wake + T6030_WAKE_MASK + 4 * i);
+}
+
+/*
  * After the enclave, before the coprocessors stop: the PMU's stage, the notify masks, then the
  * votes. macOS's nub-spmi-a0 word comes before the first vote in every run.
  */
@@ -570,6 +609,7 @@ static void t6030_sleep_prepare_regs(struct apple_sleep *s)
 	t->notify_saved[0] = readl(s->spmi_a0 + SPMI_NOTIFY_ENABLE);
 	t->notify_saved[1] = readl(s->spmi + SPMI_NOTIFY_ENABLE);
 	t->notify_staged = true;
+	t6030_wake_masks_set(s);
 	writel(s->soc->spmi_notify_sleep, s->spmi_a0 + SPMI_NOTIFY_ENABLE);
 	writel(s->soc->spmi_notify_sleep, s->spmi + SPMI_NOTIFY_ENABLE);
 	if (sleep_seq_run_strict(t->blk, &t->prepare))
@@ -582,6 +622,7 @@ static void t6030_sleep_undo_regs(struct apple_sleep *s)
 
 	if (!t->notify_staged)
 		return;
+	t6030_wake_masks_restore(s);
 	/* nub-spmi0 first, as macOS's wake */
 	writel(t->notify_saved[1], s->spmi + SPMI_NOTIFY_ENABLE);
 	writel(t->notify_saved[0], s->spmi_a0 + SPMI_NOTIFY_ENABLE);
@@ -869,6 +910,8 @@ static void t6030_sleep_wake(struct apple_sleep *s)
 	unsigned int i;
 
 	sleep_note(s, 0x70);
+	for (i = 0; i < T6030_WAKE_WORDS; i++)
+		t->wake_status[i] = readl(s->wake + T6030_WAKE_STATUS + 4 * i);
 	t6030_sleep_wake_seq(s, &t->wake_early, "apple,seq-wake-early");
 	sleep_note(s, 0x71);
 	/* SIO_CPU is in both lists: its value before the lowering is the one before the entry */
