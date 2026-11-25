@@ -1685,18 +1685,33 @@ impl InitData {
     /// pipelined compute and render loops that keep the GPU continuously busy without blocking on
     /// an unsignalled fence would otherwise fall to the base performance state.
     ///
-    /// The other G17 SoCs publish the full effort while `bound`, and stream other work with the
-    /// lowest effort that keeps it above the base performance state ([`active_effort`]), leaving
-    /// the rest to the firmware: work that the firmware let fall to the base state stalled the GPU
-    /// under concurrent load (a firmware recovery with no fault), and a full effort on every
-    /// submission held the top state whatever the load. A waiter doesn't tell paced work from a
-    /// submit-and-wait loop, because paced work has one too (the compositor, or the next frame's
-    /// fence).
-    pub(super) fn submission_effort(&self, effort: u32, waited: bool, bound: bool) -> u32 {
+    /// The other G17 SoCs publish the full effort while `bound` or while a host thread is waiting
+    /// on a pure-compute submission (`compute_waited`): a submit-and-wait loop queues nothing
+    /// behind its command, so the firmware alone keeps it at the bottom state however busy the GPU
+    /// is, and a compute burst resuming after a CPU gap longer than the 2 ms firmware idle-off
+    /// delay would otherwise run at [`active_effort`] for 16 ms before `BusyRuns::bound` fires.
+    /// Other work streams with the lowest effort that keeps it above the base performance state
+    /// ([`active_effort`]), leaving the rest to the firmware: work that the firmware let fall to
+    /// the base state stalled the GPU under concurrent load (a firmware recovery with no fault),
+    /// and a full effort on every submission held the top state whatever the load. A generic
+    /// render waiter doesn't tell paced work from a submit-and-wait loop, because paced work has
+    /// one too (the compositor, or the next frame's fence); pure-compute waiters exclude paced
+    /// render compositors.
+    pub(super) fn submission_effort(
+        &self,
+        effort: u32,
+        waited: bool,
+        bound: bool,
+        compute_waited: bool,
+    ) -> u32 {
         if self.m5 {
             return if waited || bound { effort } else { 0 };
         }
-        if bound { effort } else { effort.min(self.active_effort) }
+        if bound || compute_waited {
+            effort
+        } else {
+            effort.min(self.active_effort)
+        }
     }
 
     /// Writes the effort input in firmware order, then cleans its cache line to coherency.
