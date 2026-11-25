@@ -21,7 +21,7 @@ const HOUSEKEEPING_NS: u64 = 1_000_000;
 
 /// Whether an event pass must run full housekeeping now rather than deferring it to the
 /// periodic cadence. Transient idle gaps between sparse submissions defer housekeeping until
-/// `HOUSEKEEPING_NS` elapses (bounded by [`deferred_housekeeping_delay`]) so completions avoid
+/// `HOUSEKEEPING_NS` elapses (bounded by [`deferred_housekeeping_delay`]) so M5 completions avoid
 /// repeated report drains and uncached power-register reads.
 fn housekeeping_due(
     requested: bool,
@@ -69,23 +69,6 @@ struct Service<'a> {
 impl event::Transport for Service<'_> {
     fn roles(&self) -> &'static [Role] {
         self.firmware.roles()
-    }
-    fn reports_after_signal(&self) -> bool {
-        self.firmware.init.is_m5()
-    }
-    fn trace(&mut self, role: Role) {
-        let firmware = &mut *self.firmware;
-        firmware
-            .rings
-            .drain_trace(&firmware.primary.state.shared.dev, &firmware.init, role);
-    }
-    fn statistics(&mut self, role: Role) {
-        let firmware = &mut *self.firmware;
-        firmware.observe_statistics_power();
-        firmware
-            .rings
-            .drain_statistics(&firmware.primary.state.shared.dev, &firmware.init, role);
-        firmware.observe_statistics_power();
     }
     fn drain(
         &mut self,
@@ -378,9 +361,8 @@ impl Firmware {
         Ok(())
     }
 
-    /// Drains every role's trace ring, then their statistics rings. On M5 the event worker calls
-    /// this after it has signalled the completions of its pass: the reports are not scheduling
-    /// inputs.
+    /// Drains every role's trace ring, then their statistics rings. The event worker calls this
+    /// after it has signalled the completions of its pass: the reports are not scheduling inputs.
     fn drain_reports(&mut self) {
         let dev = &self.primary.state.shared.dev;
         for &role in self.roles() {
@@ -392,14 +374,6 @@ impl Firmware {
         for &role in self.roles() {
             self.rings.drain_statistics(&self.primary.state.shared.dev, &self.init, role);
             self.observe_statistics_power();
-        }
-    }
-
-    /// Drains post-signal trace and statistics reports on firmware families that defer them past
-    /// completion signalling.
-    fn drain_post_signal_reports(&mut self) {
-        if self.init.is_m5() {
-            self.drain_reports();
         }
     }
 
@@ -601,14 +575,14 @@ impl crate::g17::Shared {
                 // publisher. Joining builders must happen after unlocking.
                 self.preparations.close();
             }
-            // Steady-state compute or render completions with no replays, no waiters and
-            // housekeeping not yet due finish in this single device-mutex hold; fences are
-            // signalled right after unlocking. Transient idle intervals defer housekeeping to the
-            // cadence timer rather than draining reports on every completion.
+            // On M5, compute or render completions with no replays, no waiters and housekeeping
+            // not yet due finish in this single device-mutex hold. Fences signal after unlocking.
+            // Transient idle intervals can defer housekeeping and reports to the cadence timer.
             let mut fast_done = false;
             let mut render_changed = false;
             let mut rescan = false;
-            if !recover
+            if firmware.init.is_m5()
+                && !recover
                 && !requested
                 && !self.crashed.load(core::sync::atomic::Ordering::Acquire)
             {
@@ -724,12 +698,13 @@ impl crate::g17::Shared {
         if self.crashed.load(core::sync::atomic::Ordering::Acquire) {
             return Err(EIO);
         }
-        // Capture pre-recovery trace/statistics reports before firmware restart resets the
-        // report rings, matching the non-throttled post-signal ordering.
-        let mut reports_drained = false;
+        // Completions have signalled. Drain reports now unless M5 can defer them to
+        // housekeeping. Recovery must capture reports before restart resets their rings.
+        let reports_drained = recover || !firmware.init.is_m5();
+        if reports_drained {
+            firmware.drain_reports();
+        }
         if recover {
-            firmware.drain_post_signal_reports();
-            reports_drained = true;
             firmware.service_runtime_recovery(deferred)?;
             if !firmware.recovery.pending()
                 && !self.sleep_gate.load(core::sync::atomic::Ordering::Acquire)
@@ -804,9 +779,8 @@ impl crate::g17::Shared {
             self.housekeeping_ns
                 .store(now, core::sync::atomic::Ordering::Relaxed);
             if !reports_drained {
-                // The completions above are signalled; reports are throttled to the
-                // housekeeping cadence while work stays in flight.
-                firmware.drain_post_signal_reports();
+                // M5 deferred these reports until housekeeping was due.
+                firmware.drain_reports();
             }
             if !firmware.recovery.pending() {
                 lingers = firmware.expire_render_lingers(now)?;

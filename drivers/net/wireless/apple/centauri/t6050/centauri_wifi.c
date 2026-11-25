@@ -89,12 +89,13 @@ struct centauri_t6050_wifi {
 	size_t reply_capacity, reply_size;
 	bool stopping, command_failed;
 	bool tx_paused, transport_paused, host_sleep_sent, transport_sleep_sent;
+	bool host_events_fallback_logged;
 	bool scan_abort, connect_abort;
 	u8 scan_sequence;
 	bool connecting, connected, connect_event, disconnect_event;
 	bool disconnect_pending;
 	/* PM callbacks and the normal disconnect producer serialize on lock. */
-	bool pm_prepared;
+	bool pm_prepared, pm_wowlan_armed;
 	struct centauri_wifi_disconnect_receipt pm_disconnect;
 	u16 connect_status, scan_status, disconnect_status;
 	struct ieee80211_channel *connect_channel;
@@ -2019,6 +2020,32 @@ static int wait_disconnect(struct centauri_t6050_wifi *wifi)
 	return 0;
 }
 
+static bool data_tx_in_flight(struct centauri_t6050_wifi *wifi)
+{
+	unsigned int i;
+
+	for (i = 0; i < DATA_TX_SLOTS; i++)
+		if (wifi->data_tx_busy[i])
+			return true;
+	return false;
+}
+
+static void drain_tx_in_flight(struct centauri_t6050_wifi *wifi)
+{
+	unsigned long deadline = jiffies + msecs_to_jiffies(100);
+
+	lockdep_assert_held(&wifi->lock);
+	while (data_tx_in_flight(wifi) && time_before(jiffies, deadline)) {
+		drain(wifi);
+		if (!data_tx_in_flight(wifi) || wifi->command_failed ||
+		    READ_ONCE(wifi->stopping) || readl(wifi->a.bar + 8) != 2)
+			break;
+		usleep_range(500, 1000);
+	}
+	if (data_tx_in_flight(wifi))
+		drain(wifi);
+}
+
 static int wifi_disconnect(struct wiphy *wiphy, struct net_device *netdev,
 			   u16 reason)
 {
@@ -2065,6 +2092,8 @@ static int wifi_disconnect(struct wiphy *wiphy, struct net_device *netdev,
 	wifi->connected = false;
 	netif_stop_queue(netdev);
 	skb_queue_purge(&wifi->data_tx_queue);
+	if (!READ_ONCE(wifi->stopping))
+		drain_tx_in_flight(wifi);
 	netif_carrier_off(netdev);
 	if (connected)
 		cfg80211_disconnected(netdev, reason, NULL, 0, true,
@@ -2083,6 +2112,7 @@ void centauri_t6050_wifi_pm_prepare(struct centauri_t6050 *c)
 		return;
 	mutex_lock(&wifi->lock);
 	wifi->pm_disconnect = (struct centauri_wifi_disconnect_receipt) {};
+	wifi->pm_wowlan_armed = false;
 	wifi->pm_prepared = true;
 	mutex_unlock(&wifi->lock);
 }
@@ -2101,6 +2131,46 @@ int centauri_t6050_wifi_pm_error(struct centauri_t6050 *c)
 	return ret;
 }
 
+bool centauri_t6050_wifi_pm_disconnected(struct centauri_t6050 *c)
+{
+	struct centauri_t6050_wifi *wifi = c->wifi;
+	bool disconnected = false;
+
+	if (!wifi)
+		return false;
+	mutex_lock(&wifi->lock);
+	if (wifi->pm_prepared)
+		disconnected = wifi->pm_disconnect.seen;
+	mutex_unlock(&wifi->lock);
+	return disconnected;
+}
+
+bool centauri_t6050_wifi_wowlan_armed(struct centauri_t6050 *c)
+{
+	struct centauri_t6050_wifi *wifi = c->wifi;
+	bool armed = false;
+
+	if (!wifi)
+		return false;
+	mutex_lock(&wifi->lock);
+	if (wifi->pm_prepared)
+		armed = wifi->pm_wowlan_armed;
+	mutex_unlock(&wifi->lock);
+	return armed;
+}
+
+void centauri_t6050_wifi_mark_failed(struct centauri_t6050 *c)
+{
+	struct centauri_t6050_wifi *wifi = c->wifi;
+
+	if (!wifi)
+		return;
+	mutex_lock(&wifi->lock);
+	WRITE_ONCE(wifi->stopping, true);
+	wifi->command_failed = true;
+	mutex_unlock(&wifi->lock);
+}
+
 void centauri_t6050_wifi_pm_complete(struct centauri_t6050 *c)
 {
 	struct centauri_t6050_wifi *wifi = c->wifi;
@@ -2109,6 +2179,7 @@ void centauri_t6050_wifi_pm_complete(struct centauri_t6050 *c)
 		return;
 	mutex_lock(&wifi->lock);
 	/* Keep the receipt until the next prepare; it is not a sleep proof. */
+	wifi->pm_wowlan_armed = false;
 	wifi->pm_prepared = false;
 	mutex_unlock(&wifi->lock);
 }
@@ -2153,14 +2224,21 @@ static int alpha_transport_state(struct centauri_t6050_wifi *wifi, bool asleep)
 	return ret;
 }
 
-static int alpha_host_power(struct centauri_t6050_wifi *wifi, bool asleep)
+#define CEN_HOST_EVENTS_LEGACY	85
+#define CEN_HOST_EVENTS_FULL	91
+
+static int alpha_host_power_send(struct centauri_t6050_wifi *wifi, bool asleep,
+				 u8 event_count)
 {
 	static const u8 sleep_events[] = { 24, 26, 27, 15, 51, 8, 9, 10, 84 };
-	u8 payload[98] = {}, events[86] = {}, sleep_option = 1;
+	u8 payload[3 + 5 + 4 + 1 + CEN_HOST_EVENTS_FULL] = {};
+	u8 events[1 + CEN_HOST_EVENTS_FULL] = {};
+	u8 sleep_option = 1;
 	u16 state = 0;
 	u8 hint = 0;
 	size_t size = 3;
-	int i, ret;
+	unsigned int i;
+	int ret;
 
 	lockdep_assert_held(&wifi->lock);
 	if (readl(wifi->a.bar + 8) != 2)
@@ -2174,27 +2252,41 @@ static int alpha_host_power(struct centauri_t6050_wifi *wifi, bool asleep)
 		events[0] = ARRAY_SIZE(sleep_events);
 		memcpy(events + 1, sleep_events, sizeof(sleep_events));
 	} else {
-		events[0] = sizeof(events) - 1;
-		for (i = 0; i < events[0]; i++)
+		events[0] = event_count;
+		for (i = 0; i < event_count; i++)
 			events[i + 1] = i;
 	}
-	append_tlv(payload, &size, 280, events, sizeof(events));
+	append_tlv(payload, &size, 280, events, 1 + event_count);
 	ret = command(wifi, 6, payload, size);
 	dev_dbg(&wifi->control->pdev->dev,
-		"Alpha firmware host %s (connected=%d state=%u): ret=%d status=%u exec=%u\n",
-		asleep ? "sleep" : "awake", wifi->connected, state, ret,
-		wifi->reply_status, readl(wifi->a.bar + 8));
+		"Alpha firmware host %s (connected=%d state=%u events=%u tlv280=%u): ret=%d status=%u exec=%u\n",
+		asleep ? "sleep" : "awake", wifi->connected, state,
+		events[0], 1 + event_count, ret, wifi->reply_status,
+		readl(wifi->a.bar + 8));
 	return ret;
 }
 
-static bool data_tx_in_flight(struct centauri_t6050_wifi *wifi)
+static int alpha_host_power(struct centauri_t6050_wifi *wifi, bool asleep)
 {
-	unsigned int i;
+	u16 full_status;
+	int ret;
 
-	for (i = 0; i < DATA_TX_SLOTS; i++)
-		if (wifi->data_tx_busy[i])
-			return true;
-	return false;
+	if (asleep)
+		return alpha_host_power_send(wifi, true, CEN_HOST_EVENTS_LEGACY);
+
+	ret = alpha_host_power_send(wifi, false, CEN_HOST_EVENTS_FULL);
+	if (ret == -EREMOTEIO && readl(wifi->a.bar + 8) == 2) {
+		full_status = wifi->reply_status;
+		ret = alpha_host_power_send(wifi, false, CEN_HOST_EVENTS_LEGACY);
+		if (!ret && !wifi->host_events_fallback_logged) {
+			wifi->host_events_fallback_logged = true;
+			dev_info(&wifi->control->pdev->dev,
+				 "Alpha host wake fell back from %u to %u events (status=%u)\n",
+				 CEN_HOST_EVENTS_FULL, CEN_HOST_EVENTS_LEGACY,
+				 full_status);
+		}
+	}
+	return ret;
 }
 
 static int alpha_resume_locked(struct centauri_t6050_wifi *wifi)
@@ -2229,7 +2321,6 @@ static int alpha_resume_locked(struct centauri_t6050_wifi *wifi)
 int centauri_t6050_wifi_suspend(struct centauri_t6050 *c)
 {
 	struct centauri_t6050_wifi *wifi = c->wifi;
-	unsigned long deadline;
 	unsigned int i;
 	int ret;
 
@@ -2255,16 +2346,7 @@ int centauri_t6050_wifi_suspend(struct centauri_t6050 *c)
 		mutex_unlock(&wifi->lock);
 		return -EIO;
 	}
-	deadline = jiffies + msecs_to_jiffies(100);
-	while (data_tx_in_flight(wifi) && time_before(jiffies, deadline)) {
-		drain(wifi);
-		if (!data_tx_in_flight(wifi) || wifi->command_failed ||
-		    READ_ONCE(wifi->stopping) || readl(wifi->a.bar + 8) != 2)
-			break;
-		usleep_range(500, 1000);
-	}
-	if (data_tx_in_flight(wifi))
-		drain(wifi);
+	drain_tx_in_flight(wifi);
 	if (data_tx_in_flight(wifi) || wifi->command_failed ||
 	    READ_ONCE(wifi->stopping) || readl(wifi->a.bar + 8) != 2) {
 		ret = data_tx_in_flight(wifi) ? -EBUSY : -EIO;
@@ -2291,7 +2373,12 @@ int centauri_t6050_wifi_suspend(struct centauri_t6050 *c)
 		mutex_unlock(&wifi->lock);
 		return 0;
 	}
-	alpha_resume_locked(wifi);
+	if (alpha_resume_locked(wifi)) {
+		dev_warn(&c->pdev->dev,
+			 "Alpha host wake failed during suspend unwind\n");
+		WRITE_ONCE(wifi->stopping, true);
+		wifi->command_failed = true;
+	}
 	mutex_unlock(&wifi->lock);
 	return ret;
 
@@ -2329,9 +2416,11 @@ static int wifi_suspend(struct wiphy *wiphy, struct cfg80211_wowlan *wowlan)
 		ret = (wowlan->any && wifi->connected && !wifi->connecting &&
 		       !wifi->disconnect_pending && !wifi->command_failed &&
 		       !READ_ONCE(wifi->stopping)) ? 0 : 1;
+		wifi->pm_wowlan_armed = !ret;
 		mutex_unlock(&wifi->lock);
 		return ret;
 	}
+	wifi->pm_wowlan_armed = false;
 	/* cfg80211 already called normal leave; do not send another command. */
 	if (wifi->pm_prepared)
 		ret = wifi->pm_disconnect.error;

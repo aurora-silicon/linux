@@ -70,11 +70,24 @@ struct Sample {
     valid: bool,
 }
 
-/// One buffer scan. A quaternion is aligned like `IIO_DECLARE_QUATERNION()`.
+/// One buffer scan. A quaternion is aligned like `IIO_DECLARE_QUATERNION()`,
+/// which rounds the scan up to a multiple of its 16 bytes. The IIO core
+/// copies all of that, so the tail is a field that is written, not padding.
 #[repr(C, align(16))]
 struct Scan {
     quat: [i32; 4],
     timestamp: i64,
+    pad: u64,
+}
+
+impl Scan {
+    fn new(quat: [i32; 4], timestamp: i64) -> Self {
+        Self {
+            quat,
+            timestamp,
+            pad: 0,
+        }
+    }
 }
 
 fn le_u32(data: &[u8], at: usize) -> Option<u32> {
@@ -259,7 +272,7 @@ impl State {
         *self.sample.lock() = Sample { quat, valid: true };
         // SAFETY: The polling work is disabled before the IIO device is freed.
         let timestamp = unsafe { bindings::iio_get_time_ns(self.iio.0) };
-        let scan = Scan { quat, timestamp };
+        let scan = Scan::new(quat, timestamp);
         // SAFETY: `scan` contains the complete only data channel followed by
         // the timestamp, and the IIO core copies it synchronously.
         unsafe { bindings::iio_push_to_buffers(self.iio.0, ptr::from_ref(&scan).cast()) };
@@ -1016,4 +1029,48 @@ module! {
     description: "AOP device-motion fusion driver",
     license: "Dual MIT/GPL",
     alias: ["platform:devmotion6"],
+}
+
+#[kunit_tests(iio_aop_devmotion)]
+mod tests {
+    use super::*;
+    use core::mem::MaybeUninit;
+
+    /// The bytes the IIO core takes for a scan of `channels`, all enabled:
+    /// each element at a multiple of its size, a repeated one counted to the
+    /// next power of two, and the total a multiple of the largest, as
+    /// `iio_compute_scan_bytes()` lays them out.
+    fn scan_bytes(channels: &[bindings::iio_chan_spec]) -> usize {
+        let mut bytes = 0usize;
+        let mut largest = 1;
+        for chan in channels {
+            // SAFETY: The channels of this driver use the plain scan type.
+            let scan_type = unsafe { chan.__bindgen_anon_1.scan_type };
+            let repeat = usize::from(scan_type.repeat.max(1)).next_power_of_two();
+            let len = usize::from(scan_type.storagebits) / 8 * repeat;
+            bytes = bytes.next_multiple_of(len) + len;
+            largest = largest.max(len);
+        }
+        bytes.next_multiple_of(largest)
+    }
+
+    #[test]
+    fn scan_is_written_in_full() {
+        let size = scan_bytes(&[quaternion_channel(), timestamp_channel()]);
+        assert_eq!(mem::size_of::<Scan>(), size);
+
+        let written = mem::size_of::<[i32; 4]>() + mem::size_of::<i64>();
+        let mut slot = MaybeUninit::<Scan>::uninit();
+        // SAFETY: `slot` is valid for a write of one `Scan`, first of a byte
+        // pattern and then of a scan built as `State::publish()` builds it.
+        unsafe {
+            ptr::write_bytes(slot.as_mut_ptr(), 0xa5, 1);
+            slot.as_mut_ptr().write(Scan::new([1, 2, 3, 4], 5));
+        }
+        for at in written..size {
+            // SAFETY: `at` is within `slot`, all of which was written above.
+            let byte = unsafe { slot.as_ptr().cast::<u8>().add(at).read_volatile() };
+            assert_eq!(byte, 0);
+        }
+    }
 }

@@ -106,6 +106,16 @@ jobs:
             --baseline-dtb-dir "$RUNNER_TEMP/dt/out-base/arch/arm64/boot/dts/apple" \
             2>&1 | tee "$RUNNER_TEMP/dt/dart-pd.log"
 
+      - name: Sibling drift, base vs head (warnings only)
+        if: ${{ !cancelled() && steps.dt.outputs.base != '' }}
+        run: |
+          set -o pipefail
+          python3 scripts/dtc/apple-sibling-drift-test.py
+          python3 scripts/dtc/apple-sibling-drift.py \
+            --dtb-dir "$RUNNER_TEMP/dt/out-head/arch/arm64/boot/dts/apple" \
+            --baseline-dtb-dir "$RUNNER_TEMP/dt/out-base/arch/arm64/boot/dts/apple" \
+            2>&1 | tee "$RUNNER_TEMP/dt/sibling-drift.log"
+
       - name: Keep the warning lists
         if: always()
         uses: actions/upload-artifact@v4
@@ -115,4 +125,5 @@ jobs:
             ${{ runner.temp }}/dt/*.warn
             ${{ runner.temp }}/dt/coverage.log
             ${{ runner.temp }}/dt/dart-pd.log
+            ${{ runner.temp }}/dt/sibling-drift.log
           if-no-files-found: ignore
