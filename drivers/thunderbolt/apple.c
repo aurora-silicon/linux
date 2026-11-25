@@ -284,7 +284,8 @@ static const struct apple_cio_hw apple_cio_t6040_hw = {
 	.lstx_after_boot = true,
 	.strict_fw_ready = true,
 	.no_host_clx = true,
-	.dp = &apple_dpin_disabled,
+	/* The T8132 (M4) DP IN flow; the PHY's AUSPLL is the pixel clock. */
+	.dp = &apple_dpin_m4,
 };
 
 #define APPLE_CIO_NHI_HOP_COUNT 0x0
@@ -536,7 +537,7 @@ struct apple_cio {
 	unsigned int start_gen; /* protected by lock: bumped by every start */
 	unsigned int link_lost_gen; /* start_gen when the peer went away */
 	unsigned int link_lost_cycles; /* protected by lock */
-	u64 link_lost_cycle_activity; /* remote activity at the last cycle */
+	u64 link_lost_cycle_activity; /* remote activity of this domain at the last cycle */
 	bool link_lost_restart; /* protected by lock: cycle requested */
 	struct notifier_block pm_notifier;
 	struct notifier_block reboot_notifier;
@@ -670,6 +671,9 @@ static const struct of_device_id apple_dpin_qualified_soc[] = {
 	{ .compatible = "apple,t6021" },
 	{ .compatible = "apple,t6030" },
 	{ .compatible = "apple,t8132" },
+	/* T6040/T6041 (M4 Pro/Max): M4 DP IN flow, PHY tunnel pixel clock */
+	{ .compatible = "apple,t6040" },
+	{ .compatible = "apple,t6041" },
 	/* T6050: t8103 DP IN handshake, M3 flow, four DP IN adapters */
 	{ .compatible = "apple,t6050" },
 	{},
@@ -2795,6 +2799,13 @@ static int apple_nhi_probe(struct platform_device *pdev)
 		acio->pcie_pm_prepared = false;
 		acio->pcie_resume_expected = false;
 	}
+	/*
+	 * A port restart rebuilds the domain, whose remote activity count starts
+	 * again at zero. Compare the next link loss against that, not against
+	 * the count of the domain that went away: any discovery on this domain
+	 * then marks the restart as having worked.
+	 */
+	WRITE_ONCE(acio->link_lost_cycle_activity, 0);
 	ret = tb_domain_add(anhi->tb, false);
 	if (ret) {
 		dev_err_probe(anhi->dev, ret, "failed to add TB domain\n");

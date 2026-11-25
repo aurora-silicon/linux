@@ -48,10 +48,13 @@ start and end operations. The shared G17 backend runs several commands of one
 queue at once, so their stages overlap. It charges each engine of a queue the
 union of that queue's stage intervals (exact, because a queue's stages retire in
 the order they started), so a queue never counts more than the wall time on one
-engine. Queues of one file still add up. The other backends sum their intervals
-without merging overlapping commands on the same engine. Missing, zero-start or
-reversed intervals are ignored. Failed or cancelled commands do not contribute
-incomplete intervals;
+engine. Queues of one file still add up on G17. Native G16 executes pipelined
+commands and dual-pipe compute across sibling queues of one DRM file, so it
+unions overlapping stage intervals per file (``Client::add_union``) to keep each
+engine bounded by wall time. The other backends sum their intervals without
+merging overlapping commands on the same engine. Missing, zero-start or reversed
+intervals are ignored. Failed or cancelled commands do not contribute incomplete
+intervals;
 successful stages that retired before a later failure remain counted. An
 unexecuted G17 replay contributes only when it eventually retires successfully.
 There is no submit-to-completion wall-time fallback in the current backends.

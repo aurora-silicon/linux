@@ -109,7 +109,17 @@ fn render(out: &std::path::Path) {
     u.utile_width_px = 16; u.utile_height_px = 32; u.sample_size_B = 4;
     u.flags = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_RSRC_SPEC_HI;
     u.vdm_ctrl_stream_base = g + 0xa00000;
-    u.depth.base = g + 0xe00000; u.stencil.base = g + 0xf00000;
+    u.zls_ctrl = (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4)
+        | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 8)
+        | (1 << 14) | (1 << 15) | (1 << 18) | (1 << 19);
+    u.depth.base = g + 0xe00000;
+    u.depth.stride = (2 << 14) | 1;
+    u.depth.comp_base = g + 0xe80000;
+    u.depth.comp_stride = 3 << 14;
+    u.stencil.base = g + 0xf00000;
+    u.stencil.stride = (1 << 14) | 1;
+    u.stencil.comp_base = g + 0xf80000;
+    u.stencil.comp_stride = 2 << 14;
     u.bg.usc = 0x10000; u.eot.usc = 0x20000;
     let r = encode::RenderRefs {
         notifier: f + 0x800000, qinfo: [f + 0xf00000, f + 0x1000000],
@@ -129,6 +139,14 @@ fn render(out: &std::path::Path) {
         aux_gva: g + 0xb00000, ..Default::default()
     };
     let geo = encode::Geometry::new(&u, p.heap_gva);
+    assert_eq!(geo.isp_control, 0xc000);
+    let mut u_few = u;
+    u_few.flags |= uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_FEW_PRIMITIVES;
+    let geo_few = encode::Geometry::new(&u_few, p.heap_gva);
+    assert_eq!(geo_few.isp_control, 0xc001);
+    let mut u_few_dbias = u_few;
+    u_few_dbias.flags |= uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_DBIAS_IS_INT;
+    assert_eq!(encode::Geometry::new(&u_few_dbias, p.heap_gva).isp_control, 0x4c001);
     let ts = [f + 0xffc000100, 0, 0, f + 0xffc000118];
     let mut images = Vec::new();
     for (ta_layout, fs_layout) in [(&ta::V25G83, &fs::V25G83), (&ta::V26B123, &fs::V26B123)] {
@@ -136,6 +154,15 @@ fn render(out: &std::path::Path) {
         let mut fw_ = [0xa5; fs::WORK_SIZE]; let mut fq = [0xa5; fs::SEQ_SIZE];
         encode::encode_ta_for(ta_layout, &r, &p, &u, &ts, 7, 0x300, &geo, None, &mut tw, &mut tq);
         encode::encode_fs_for(fs_layout, &r, &p, &u, &ts, 7, 1 << 40, 1, 0x300, &geo, &mut fw_, &mut fq);
+        // Verify FEW_PRIMITIVES sets bit 0 of ISP register 0x15021 (fs::SEL[21]).
+        let mut fw_few = [0xa5; fs::WORK_SIZE];
+        let mut fq_few = [0xa5; fs::SEQ_SIZE];
+        encode::encode_fs_for(
+            fs_layout, &r, &p, &u_few, &ts, 7, 1 << 40, 1, 0x300, &geo_few,
+            &mut fw_few, &mut fq_few,
+        );
+        assert_eq!(r32(&fw_few, fs::REGS + 21 * 12), 0x15021);
+        assert_eq!(r64(&fw_few, fs::REGS + 21 * 12 + 4), 0xc001);
         images.push((tw, tq, fw_, fq));
     }
     // The 25G83 entry points are the 25G83 layouts.
@@ -159,6 +186,52 @@ fn render(out: &std::path::Path) {
     // The 26B123 timestamp op stores two u64s after the completion target: host-free.
     assert!(tw[0x927..0x937].iter().all(|&b| b == 0));
     assert!(fw_[0xc6f..0xc7f].iter().all(|&b| b == 0));
+    // Compressed ZLS register records (fs::SEL[44..52]) and JobParameters3 mirrors.
+    let expected_zls_regs = [
+        (44, 0x153c1u32, u.depth.comp_base),
+        (45, 0x15411, u64::from(u.depth.comp_stride)),
+        (46, 0x153c9, u.depth.comp_base),
+        (47, 0x15431, u64::from(u.depth.comp_stride)),
+        (48, 0x153d1, u.stencil.comp_base),
+        (49, 0x15419, u64::from(u.stencil.comp_stride)),
+        (50, 0x153d9, u.stencil.comp_base),
+        (51, 0x15439, u64::from(u.stencil.comp_stride)),
+    ];
+    for (_, _, fw_img, _) in &images {
+        for &(slot, sel, val) in &expected_zls_regs {
+            let at = fs::REGS + slot * 12;
+            assert_eq!(r32(fw_img, at), sel);
+            assert_eq!(r64(fw_img, at + 4), val);
+        }
+        assert_eq!(r64(fw_img, 0x938), u.zls_ctrl);
+        assert_eq!(r64(fw_img, 0x958), u64::from(u.depth.comp_stride));
+        assert_eq!(r64(fw_img, 0x970), u.depth.comp_base);
+        assert_eq!(r64(fw_img, 0x988), u64::from(u.stencil.comp_stride));
+        assert_eq!(r64(fw_img, 0x9a0), u.stencil.comp_base);
+    }
+    // Clean same-VM reuse overwrites only 0..HEAD_ACTIVE_SIZE and TAIL_ACTIVE_START..WORK_SIZE;
+    // verify an uncompressed pass leaves no stale compressed ZLS register or mirror values.
+    let mut plain = u;
+    plain.zls_ctrl = 0;
+    plain.depth = Default::default();
+    plain.stencil = Default::default();
+    let mut plain_fw = [0xa5; fs::WORK_SIZE];
+    let mut plain_fq = [0xa5; fs::SEQ_SIZE];
+    encode::encode_fs_for(
+        &fs::V26B123, &r, &p, &plain, &ts, 7, 1 << 40, 2, 0x400, &geo,
+        &mut plain_fw, &mut plain_fq,
+    );
+    let mut reused = *fw_;
+    reused[..fs::HEAD_ACTIVE_SIZE].copy_from_slice(&plain_fw[..fs::HEAD_ACTIVE_SIZE]);
+    reused[fs::TAIL_ACTIVE_START..].copy_from_slice(&plain_fw[fs::TAIL_ACTIVE_START..]);
+    for &(slot, sel, _) in &expected_zls_regs {
+        let at = fs::REGS + slot * 12;
+        assert_eq!(r32(&reused, at), sel);
+        assert_eq!(r64(&reused, at + 4), 0);
+    }
+    for off in [0x938usize, 0x958, 0x970, 0x988, 0x9a0] {
+        assert_eq!(r64(&reused, off), 0);
+    }
     for (name, (tw, tq, fw_, fq)) in ["25g83", "26b123"].iter().zip(&images) {
         let mut all = tw.to_vec(); all.extend(tq); all.extend(fw_); all.extend(fq);
         std::fs::write(out.join(format!("render-{name}.bin")), all).unwrap();
@@ -176,7 +249,7 @@ fn compute_work(out: &std::path::Path) {
         context_store_gva: g + 0x500000, counter_fw: f + 0x500000,
         pool_state_gva: g + 0x600000, page_list_gva: g + 0x700000, usc_base: 1 << 40,
         record_fw: f + 0x700000, binding_generation: 200, uma_slot: 3, command_id: 9,
-        compute_index: 8, work_818: 0, target_stamp: 0x900, submitted: 5,
+        compute_index: 8, work_818: 0, target_stamp: 0x900, submitted: 5, event: compute::EVENT,
     };
     let c = uapi::drm_asahi_cmd_compute {
         cdm_ctrl_stream_base: g + 0x300000, cdm_ctrl_stream_end: g + 0x300200,
@@ -365,6 +438,10 @@ fn main() {
     assert!(main[0x640 + 28 * 0x28..0x640 + 29 * 0x28].iter().all(|&b| b == 0));
     let power = object(&v26, l, id::POWER_PERFORMANCE);
     assert_eq!(r64(power, 0x3b98), input().va[id::TEMPERATURE]);
+    assert_eq!(r32(object(&v25, &wire::V25G83, id::GLOBALS), 0x9c8), 750);
+    assert_eq!(r32(object(&v26, l, id::GLOBALS), 0x9cc), 750);
+    assert_eq!(r32(object(&v25, &wire::V25G83, id::GLOBALS), 0x9cc), 800);
+    assert_eq!(r32(object(&v26, l, id::GLOBALS), 0x9d0), 800);
     std::fs::write(out.join("initdata-25g83.bin"), &v25).unwrap();
     std::fs::write(out.join("initdata-26b123.bin"), &v26).unwrap();
     render(&out);

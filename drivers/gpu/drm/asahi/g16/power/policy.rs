@@ -13,8 +13,18 @@ pub(crate) const PSTATE_MAX: u32 = 10;
 pub(crate) const TOP_DEFAULT: u32 = 9;
 pub(crate) const COOLING_MAX: u32 = 8;
 pub(crate) const SAMPLE_NS: u64 = 5_000_000;
-/// Utilization window of the governor.
+/// Utilization window of the governor (slow decay cadence).
 pub(crate) const WINDOW_NS: u64 = 20_000_000;
+/// Fast upward ramp window aligned with the PMP sampling cadence ([`SAMPLE_NS`], 5 ms = 1/4
+/// of [`WINDOW_NS`]) so active bursts step up before the full window closes without
+/// overshooting on light periodic desktop frames.
+pub(crate) const RAMP_WINDOW_NS: u64 = SAMPLE_NS;
+/// Short idle hold before dropping the CLPC active hint between consecutive jobs.
+/// `drivers/soc/apple/clpc.c` already holds DCS/fabric rails for `APPLE_CLPC_HOLD_MS` (32 ms)
+/// on a `APPLE_CLPC_SAMPLE_MS` (4 ms) cadence; a 2 ms hold (half of `APPLE_CLPC_SAMPLE_MS`)
+/// bridges sub-ms depth-1 inter-job gaps and avoids redundant `mod_delayed_work(..., 0)`
+/// flushes without holding across 60 Hz (16.67 ms) or 120 Hz (8.33 ms) frame periods.
+pub(crate) const CLPC_IDLE_HOLD_NS: u64 = 2_000_000;
 /// Lowest governed state. On the J713 S1-S3 draw under 0.1 W for a desktop
 /// load and S4 several times that; S3 runs at 2.4 times the clock of S1.
 pub(crate) const FLOOR: u32 = 3;
@@ -88,6 +98,99 @@ pub(crate) fn demand(current: u32, util: u32, average: u32, top: u32) -> u32 {
     next.clamp(FLOOR, top)
 }
 
+/// Fast upward-only demand step for partial burst windows ([`RAMP_WINDOW_NS`]):
+/// matches [`demand`]'s upward thresholds (`>= 70%` -> `top`, `>= 40%` -> `+1`) and
+/// never decays, so light periodic frames cannot pump to `top` while sustained bursts
+/// still reach `top` within one 5 ms sample.
+pub(crate) fn ramp_demand(current: u32, util: u32, top: u32) -> u32 {
+    let top = top.clamp(FLOOR, PSTATE_MAX);
+    let next = if util >= 70 {
+        top
+    } else if util >= 40 {
+        current.saturating_add(1)
+    } else {
+        current
+    };
+    next.max(current).clamp(FLOOR, top)
+}
+
+/// CLPC active-floor hysteresis: keeps the memory and fabric floor raised for
+/// [`CLPC_IDLE_HOLD_NS`] after flights drain so short `d=1` inter-job gaps do
+/// not drop and re-raise CLPC on every submission.
+pub(crate) struct ClpcHold {
+    reported: Option<bool>,
+    idle_since: Option<u64>,
+}
+
+impl ClpcHold {
+    pub(crate) const fn new() -> Self {
+        Self {
+            reported: None,
+            idle_since: None,
+        }
+    }
+
+    /// Updates work-in-flight state. Returns `Some(active)` only when the
+    /// CLPC provider must transition immediately.
+    pub(crate) fn report(&mut self, in_flight: bool, now: u64) -> Option<bool> {
+        if in_flight {
+            self.idle_since = None;
+            if self.reported != Some(true) {
+                self.reported = Some(true);
+                return Some(true);
+            }
+            return None;
+        }
+        if self.reported == Some(true) {
+            self.idle_since.get_or_insert(now);
+            None
+        } else if self.reported.is_none() {
+            self.reported = Some(false);
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    /// Releases a held CLPC floor once [`CLPC_IDLE_HOLD_NS`] has elapsed idle.
+    pub(crate) fn expire(&mut self, now: u64) -> bool {
+        if self.reported == Some(true)
+            && self
+                .idle_since
+                .is_some_and(|since| now.wrapping_sub(since) >= CLPC_IDLE_HOLD_NS)
+        {
+            self.idle_since = None;
+            self.reported = Some(false);
+            return true;
+        }
+        false
+    }
+
+    /// Immediately drops the CLPC floor (fail-stop or system sleep).
+    pub(crate) fn release_now(&mut self) -> bool {
+        self.idle_since = None;
+        if self.reported != Some(false) {
+            self.reported = Some(false);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Whether the CLPC floor is currently being held across an idle gap.
+    pub(crate) fn holding(&self) -> bool {
+        self.reported == Some(true) && self.idle_since.is_some()
+    }
+}
+
+/// Maximum inter-flight idle gap bridged for active-burst GPU demand.
+/// Matches [`CLPC_IDLE_HOLD_NS`] (2 ms): back-to-back `d=1` CPU-recording bursts
+/// sit well below 2 ms while 60 Hz (16.67 ms) and 120 Hz (8.33 ms) desktop frames
+/// exceed it cleanly and stay at [`FLOOR`].
+const BURST_GAP_NS: u64 = CLPC_IDLE_HOLD_NS;
+/// Consecutive sub-`BURST_GAP_NS` turnarounds required before bridging short gaps.
+const BURST_STREAK_ON: u32 = 4;
+
 /// Busy-time accounting over the governor's windows. The engine reports each
 /// publication and drain; each power service closes the window once it is due.
 pub(crate) struct Governor {
@@ -98,6 +201,8 @@ pub(crate) struct Governor {
     pub(crate) top: u32,
     window_ns: u64,
     busy_since: Option<u64>,
+    idle_since: Option<u64>,
+    burst_streak: u32,
     busy_ns: u64,
 }
 
@@ -109,19 +214,35 @@ impl Governor {
             top: TOP_DEFAULT,
             window_ns: 0,
             busy_since: None,
+            idle_since: None,
+            burst_streak: 0,
             busy_ns: 0,
         }
     }
 
     /// The engine published work; it stays busy until [`Governor::idle`].
     pub(crate) fn busy(&mut self, now: u64) {
-        self.busy_since.get_or_insert(now);
+        if self.busy_since.is_none() {
+            if let Some(idle_at) = self.idle_since.take() {
+                let gap = now.saturating_sub(idle_at);
+                if gap < BURST_GAP_NS {
+                    self.burst_streak = self.burst_streak.saturating_add(1);
+                    if self.burst_streak >= BURST_STREAK_ON {
+                        self.busy_ns = self.busy_ns.saturating_add(gap);
+                    }
+                } else {
+                    self.burst_streak = 0;
+                }
+            }
+            self.busy_since = Some(now);
+        }
     }
 
     /// The engine drained.
     pub(crate) fn idle(&mut self, now: u64) {
         if let Some(since) = self.busy_since.take() {
             self.busy_ns += now.saturating_sub(since);
+            self.idle_since = Some(now);
         }
     }
 
@@ -131,12 +252,34 @@ impl Governor {
         self.busy_since.is_none() && self.demand > FLOOR
     }
 
+    /// Whether a busy engine below its ceiling has enough partial-window
+    /// utilization to step up before the full [`WINDOW_NS`] window closes.
+    pub(crate) fn ramp_due(&self, now: u64, limit: u32) -> bool {
+        let cap = self.top.min(limit);
+        if self.demand >= cap || self.busy_since.is_none() {
+            return false;
+        }
+        let window = now.wrapping_sub(self.window_ns);
+        if window < RAMP_WINDOW_NS {
+            return false;
+        }
+        let active = self.busy_since.map_or(0, |s| now.saturating_sub(s));
+        let util = utilization(self.busy_ns.saturating_add(active), window);
+        ramp_demand(self.demand, util, self.top).min(limit) > self.demand
+    }
+
     /// Closes the window once it is due and returns the state to publish
     /// under the ceiling `limit`; `busy` is whether flights are outstanding.
     pub(crate) fn govern(&mut self, now: u64, limit: u32, busy: bool) -> u32 {
         // Recovery can drop flights without a drain.
         if !busy {
             self.idle(now);
+            if self
+                .idle_since
+                .is_some_and(|at| now.saturating_sub(at) >= BURST_GAP_NS)
+            {
+                self.burst_streak = 0;
+            }
         }
         let window = now.wrapping_sub(self.window_ns);
         if window >= WINDOW_NS {
@@ -149,6 +292,13 @@ impl Governor {
             self.demand = demand(self.demand.min(limit), util, self.average, self.top);
             self.window_ns = now;
             self.busy_ns = 0;
+        } else if busy && window >= RAMP_WINDOW_NS && self.demand < self.top.min(limit) {
+            let active = self.busy_since.map_or(0, |since| now.saturating_sub(since));
+            let util = utilization(self.busy_ns.saturating_add(active), window);
+            let next = ramp_demand(self.demand.min(limit), util, self.top).min(limit);
+            if next > self.demand {
+                self.demand = next;
+            }
         }
         self.demand.min(limit)
     }
@@ -386,5 +536,134 @@ mod tests {
         assert_eq!(cooling_ceiling(10, COOLING_MAX), 1);
         assert_eq!(cooling_ceiling(10, u32::MAX), 1);
         assert_eq!(limit(10, cooling_ceiling(10, 0), 10), 10);
+    }
+
+    #[test]
+    fn fast_ramp_raises_active_bursts_while_preserving_decay_and_cooling_ceiling() {
+        let mut g = started();
+        g.top = PSTATE_MAX;
+        // Simulate d=1 back-to-back burst (80% busy) from FLOOR: reaches S10 at 5 ms.
+        let mut t = T;
+        for _ in 0..20 {
+            g.busy(t);
+            g.idle(t + 200_000);
+            t += 250_000;
+        }
+        assert_eq!(t, T + RAMP_WINDOW_NS);
+        g.busy(t);
+        assert!(g.ramp_due(t, PSTATE_MAX));
+        assert_eq!(g.govern(t, PSTATE_MAX, true), PSTATE_MAX);
+        assert!(!g.ramp_due(t, PSTATE_MAX));
+
+        // Moderate 50% active load steps +1 (aligned with demand()), never jumps to top
+        // and never decays before the full 20 ms window.
+        let mut g = started();
+        g.top = PSTATE_MAX;
+        g.busy(T);
+        g.idle(T + 2_500_000);
+        g.busy(T + RAMP_WINDOW_NS);
+        assert!(g.ramp_due(T + RAMP_WINDOW_NS, PSTATE_MAX));
+        assert_eq!(g.govern(T + RAMP_WINDOW_NS, PSTATE_MAX, true), FLOOR + 1);
+        g.idle(T + RAMP_WINDOW_NS);
+        assert_eq!(g.govern(T + WINDOW_NS - 1, PSTATE_MAX, false), FLOOR + 1);
+
+        // Light 60 Hz compositor frames (2.5 ms busy every 16.67 ms -> 15% over 20 ms)
+        // never pump to top and settle back at FLOOR.
+        let mut g = started();
+        g.top = PSTATE_MAX;
+        let mut now = T;
+        for _ in 0..10 {
+            g.busy(now);
+            assert!(g.govern(now + 2_500_000, PSTATE_MAX, true) <= FLOOR + 1);
+            g.idle(now + 2_500_000);
+            now += 16_666_667;
+            let state = g.govern(now, PSTATE_MAX, false);
+            assert!(state <= FLOOR + 1);
+        }
+        assert_eq!(g.demand, FLOOR);
+
+        // Thermal cooling ceiling clamps stored demand too: relaxing by one level steps
+        // cleanly to cap + 1 rather than jumping straight to top.
+        let mut g = started();
+        g.top = PSTATE_MAX;
+        g.busy(T);
+        let cap = cooling_ceiling(PSTATE_MAX, 5);
+        assert_eq!(g.govern(T + RAMP_WINDOW_NS, cap, true), cap);
+        assert_eq!(g.demand, cap);
+        assert!(!g.ramp_due(T + RAMP_WINDOW_NS, cap));
+        // Even if the ceiling opens to TOP right after the capped ramp, stored demand
+        // stays at `cap` until new utilization above `cap` is observed.
+        g.idle(T + RAMP_WINDOW_NS + 1);
+        assert_eq!(g.govern(T + RAMP_WINDOW_NS + 2, PSTATE_MAX, false), cap);
+        assert_eq!(g.demand, cap);
+    }
+
+    #[test]
+    fn clpc_hold_keeps_floor_across_short_gaps_and_releases_on_expiry_or_reset() {
+        let mut hold = ClpcHold::new();
+        assert!(!hold.holding());
+        assert_eq!(hold.report(true, T), Some(true));
+        assert!(!hold.holding());
+        // Short idle gap (< 2 ms): CLPC stays active without toggling.
+        assert_eq!(hold.report(false, T + 200_000), None);
+        assert!(hold.holding());
+        assert!(!hold.expire(T + 200_000 + CLPC_IDLE_HOLD_NS - 1));
+        assert_eq!(hold.report(true, T + 500_000), None);
+        assert!(!hold.holding());
+        // Full 2 ms idle expires and releases the CLPC floor (well below 60/120 Hz frames).
+        assert_eq!(hold.report(false, T + 1_000_000), None);
+        assert!(hold.holding());
+        assert!(hold.expire(T + 1_000_000 + CLPC_IDLE_HOLD_NS));
+        assert!(!hold.holding());
+        assert!(!hold.expire(T + 1_000_000 + 2 * CLPC_IDLE_HOLD_NS));
+        // Fail-stop / sleep drops CLPC immediately regardless of hold timer.
+        assert_eq!(hold.report(true, T + 30_000_000), Some(true));
+        assert_eq!(hold.report(false, T + 30_100_000), None);
+        assert!(hold.holding());
+        assert!(hold.release_now());
+        assert!(!hold.holding());
+        assert!(!hold.release_now());
+    }
+
+    #[test]
+    fn active_burst_demand_ramps_low_duty_d1_while_preserving_120hz_and_idle_decay() {
+        // Low-duty d=1 CPU-recording-bound burst: 170 us GPU + 600 us host gap (22% raw duty,
+        // < 2 ms turnaround). Bridges short refill gaps after BURST_STREAK_ON and ramps to top.
+        let mut g = started();
+        g.top = PSTATE_MAX;
+        let mut t = T;
+        for _ in 0..8 {
+            g.busy(t);
+            g.idle(t + 170_000);
+            t += 770_000;
+        }
+        assert!(t - T >= RAMP_WINDOW_NS);
+        g.busy(t);
+        assert!(g.ramp_due(t, PSTATE_MAX));
+        assert_eq!(g.govern(t, PSTATE_MAX, true), PSTATE_MAX);
+
+        // Once idle, burst streak resets after 2 ms and demand decays cleanly back to FLOOR.
+        g.idle(t + 170_000);
+        let mut now = t + 170_000;
+        for _ in 0..20 {
+            now += WINDOW_NS;
+            let _ = g.govern(now, PSTATE_MAX, false);
+        }
+        assert_eq!(g.demand, FLOOR);
+        assert!(!g.decaying());
+
+        // 120 Hz desktop pacing (2 ms busy every 8.33 ms -> 6.33 ms gap >= 2 ms) never bridges
+        // gaps and stays bounded at FLOOR.
+        let mut g = started();
+        g.top = PSTATE_MAX;
+        let mut now = T;
+        for _ in 0..16 {
+            g.busy(now);
+            assert!(g.govern(now + 2_000_000, PSTATE_MAX, true) <= FLOOR + 1);
+            g.idle(now + 2_000_000);
+            now += 8_333_333;
+            assert!(g.govern(now, PSTATE_MAX, false) <= FLOOR + 1);
+        }
+        assert_eq!(g.demand, FLOOR);
     }
 }

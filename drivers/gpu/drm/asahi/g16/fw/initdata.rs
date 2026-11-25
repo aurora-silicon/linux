@@ -425,8 +425,15 @@ const GLOBALS_FIXED: &[(usize, u32)] = &[
     (0x9b8, 2),
     (0x9bc, 40),
     (0x9c0, 5),
-    (0x9c8, 40),
-    (0x9cc, 50),
+    // Firmware DM2 (compute) progress-watchdog thresholds (~4 ms/tick):
+    // - 0x9c8 (26B123 0x9cc): secondary DM2 soft-preempt watchdog, raised from 40 (~0.16 s)
+    //   to 750 (~3.0 s) so legitimate long/contended compute dispatches (e.g. 1.5 s solo
+    //   workloads) complete without premature kill while staying below the 5 s host fail-stop.
+    // - 0x9cc (26B123 0x9d0): primary DM2 recovery watchdog, raised from 50 (~0.20 s) to 800
+    //   (~3.2 s) so legitimate compute dispatches complete while real hangs still trigger
+    //   firmware recovery well before the 5 s host fail-stop deadline.
+    (0x9c8, 750),
+    (0x9cc, 800),
 ];
 
 /// Fixed 25G83 POWER_PERFORMANCE offsets remapped into every ABI; shared by `encode_for` and
