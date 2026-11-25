@@ -105,6 +105,16 @@ static const u32 t6030_macos_down[] = {
 	0x190, 0x218, 0x178,			/* AFT0, I2C5, PMGR_SOC_OCLA */
 };
 
+/*
+ * The other way: off under Linux, on at macOS's commit (PLAN §4, linux-diff.tsv), the shared
+ * core's ps_macos_on pattern: GPIO, I2C0/4/7/8, SPI0 and UART0-6. Raised by .commit_regs,
+ * AUTO_ENABLE clear, each left as it was before the entry at the wake.
+ */
+static const u32 t6030_macos_up[] = {
+	0x120, 0x1f0, 0x210, 0x228, 0x230, 0x260,
+	0x2a0, 0x2a8, 0x2b0, 0x2b8, 0x2c0, 0x2c8, 0x2d0,
+};
+
 /* And in "ps-aon": NUB_SPI0 and NUB_OCLA (0x200 at macOS's commit) */
 static const u32 t6030_macos_down_aon[] = { 0x88, 0x90 };
 
@@ -125,9 +135,13 @@ struct t6030_sleep {
 	u32 auto_saved[ARRAY_SIZE(t6030_auto_off)];
 	bool auto_staged;
 	u32 down_saved[ARRAY_SIZE(t6030_macos_down)];
+	u32 up_saved[ARRAY_SIZE(t6030_macos_up)];
 	u32 down_aon_saved[ARRAY_SIZE(t6030_macos_down_aon)];
 	bool down_staged;
 	u8 down_stuck;
+	/* The GP PCIe host's (apple,pcie-host) PHY and clock blocks, shared with its driver */
+	void __iomem *gp_phy, *gp_phy_ip, *gp_clkgen, *gp_axi2af;
+	int gp_park_ret;
 	/* The PMU's RTC alarm as the entry found it, for the rearm after the commit word */
 	u8 alarm_compare[4];
 	bool alarm_valid;
@@ -178,6 +192,37 @@ static int t6030_sleep_seq_get(struct apple_sleep *s, const char *name, struct s
 	if (!seq->n)
 		return dev_err_probe(s->dev, -ENODATA, "no %s\n", name);
 	return 0;
+}
+
+/* One of the GP PCIe host's reg entries by name, mapped once (not claimed), or NULL */
+static void __iomem *t6030_gp_block(struct apple_sleep *s, struct device_node *host,
+				    const char *name)
+{
+	struct resource res;
+	int i = of_property_match_string(host, "reg-names", name);
+
+	if (i < 0 || of_address_to_resource(host, i, &res))
+		return NULL;
+	return apple_sleep_ioremap(s->dev, &res);
+}
+
+/* Without all four the park is left out: the host's driver keeps them as they are. */
+static void t6030_gp_map(struct apple_sleep *s)
+{
+	struct t6030_sleep *t = t6030_state(s);
+	struct device_node *host = of_parse_phandle(s->dev->of_node, "apple,pcie-host", 0);
+
+	if (!host)
+		return;
+	t->gp_phy = t6030_gp_block(s, host, "phy-shared");
+	t->gp_phy_ip = t6030_gp_block(s, host, "phy-ip");
+	t->gp_clkgen = t6030_gp_block(s, host, "clkgen");
+	t->gp_axi2af = t6030_gp_block(s, host, "axi2af");
+	of_node_put(host);
+	if (!t->gp_phy || !t->gp_phy_ip || !t->gp_clkgen || !t->gp_axi2af) {
+		dev_warn(s->dev, "the GP PCIe host's PHY and clock blocks: not all mapped, no park\n");
+		t->gp_phy = NULL;
+	}
 }
 
 static int t6030_sleep_map_regs(struct apple_sleep *s)
@@ -246,6 +291,7 @@ static int t6030_sleep_map_regs(struct apple_sleep *s)
 	if (ret)
 		return ret;
 
+	t6030_gp_map(s);
 	return apple_sleep_read_wake_sources(s);
 }
 
@@ -681,6 +727,78 @@ static int t6030_sleep_commit_notice(struct apple_sleep *s)
 }
 
 /*
+ * The GP PCIe host's PHY parked and its clock generator off, as macOS 27.2 on J516s does them
+ * on the boot core after the other cores stop (t5): the PHY in two steps around APCIE_PHY_SW's
+ * lowering, then its AXI bridge and the clock generator, waited on. pcie0's own sleep stop
+ * holds its domains and leaves all of this running, so that a refused sleep finds the host
+ * untouched; past the commit nothing comes back but a cold start.
+ */
+#define T6030_GP_PHY_CTRL		0x0
+#define T6030_GP_PHY_CFG		0x4
+#define T6030_GP_PHYIP_6C		0x6c
+#define T6030_GP_PHYIP_7C		0x7c
+#define T6030_GP_AXI2AF_600		0x600
+#define T6030_GP_CLK_CTRL		0x0
+#define T6030_GP_CLK_BUSY		BIT(31)
+#define T6030_GP_POLL_US		1000
+
+static bool t6030_gp_up(struct apple_sleep *s)
+{
+	return t6030_state(s)->gp_phy && sleep_ps_on(s, T6030_PS_APCIE_SYS_GP) &&
+	       sleep_ps_on(s, T6030_PS_APCIE_PHY_SW);
+}
+
+static void t6030_gp_phy_park(struct apple_sleep *s)
+{
+	struct t6030_sleep *t = t6030_state(s);
+	void __iomem *phy = t->gp_phy;
+	int ret = 0;
+	u32 v;
+
+	t->gp_park_ret = -ENODEV;
+	if (!t6030_gp_up(s))
+		return;
+	writel(readl(phy + T6030_GP_PHY_CTRL), phy + T6030_GP_PHY_CTRL);
+	writel(readl(t->gp_phy_ip + T6030_GP_PHYIP_6C) & ~GENMASK(3, 2),
+	       t->gp_phy_ip + T6030_GP_PHYIP_6C);
+	readl(t->gp_phy_ip + T6030_GP_PHYIP_7C);
+	writel(0xf000000, t->gp_phy_ip + T6030_GP_PHYIP_7C);
+	writel(readl(phy + T6030_GP_PHY_CTRL) | BIT(7), phy + T6030_GP_PHY_CTRL);
+	writel(readl(phy + T6030_GP_PHY_CTRL) & ~BIT(1), phy + T6030_GP_PHY_CTRL);
+	ret |= readl_poll_timeout_atomic(phy + T6030_GP_PHY_CTRL, v, !(v & BIT(3)), 1,
+					 T6030_GP_POLL_US);
+	writel(readl(phy + T6030_GP_PHY_CTRL) & ~BIT(0), phy + T6030_GP_PHY_CTRL);
+	ret |= readl_poll_timeout_atomic(phy + T6030_GP_PHY_CTRL, v, !(v & BIT(2)), 1,
+					 T6030_GP_POLL_US);
+	writel(readl(phy + T6030_GP_PHY_CTRL) & ~BIT(9), phy + T6030_GP_PHY_CTRL);
+	writel(readl(phy + T6030_GP_PHY_CFG) & ~BIT(4), phy + T6030_GP_PHY_CFG);
+	writel(readl(phy + T6030_GP_PHY_CFG) & ~BIT(0), phy + T6030_GP_PHY_CFG);
+	t->gp_park_ret = ret ? -ETIMEDOUT : 0;
+}
+
+/* After APCIE_PHY_SW is off: the AXI bridge's bit 16, then the clock generator off */
+static void t6030_gp_clk_off(struct apple_sleep *s)
+{
+	struct t6030_sleep *t = t6030_state(s);
+	void __iomem *clk = t->gp_clkgen;
+	u32 v;
+
+	if (t->gp_park_ret == -ENODEV)
+		return;
+	writel(readl(t->gp_axi2af + T6030_GP_AXI2AF_600) & ~BIT(16),
+	       t->gp_axi2af + T6030_GP_AXI2AF_600);
+	writel(readl(clk + T6030_GP_CLK_CTRL) & ~BIT(5), clk + T6030_GP_CLK_CTRL);
+	writel(readl(clk + T6030_GP_CLK_CTRL) | BIT(1), clk + T6030_GP_CLK_CTRL);
+	readl_poll_timeout_atomic(clk + T6030_GP_CLK_CTRL, v, v & T6030_GP_CLK_BUSY, 1,
+				  T6030_GP_POLL_US);
+	writel(readl(clk + T6030_GP_CLK_CTRL) & ~BIT(0), clk + T6030_GP_CLK_CTRL);
+	if (readl_poll_timeout_atomic(clk + T6030_GP_CLK_CTRL, v, !(v & T6030_GP_CLK_BUSY), 1,
+				      T6030_GP_POLL_US))
+		t->gp_park_ret = -ETIMEDOUT;
+	writel(readl(clk + T6030_GP_CLK_CTRL) | BIT(2), clk + T6030_GP_CLK_CTRL);
+}
+
+/*
  * t6030_macos_down[] and _aon[] off, each saved first; one that doesn't go off is counted
  * (t->down_stuck), not fatal: macOS has them off long before its commit, with no order of its
  * own in the window.
@@ -700,6 +818,13 @@ static void t6030_sleep_down(struct apple_sleep *s)
 			continue;
 		sleep_ps_lower(s, t6030_macos_down[i]);
 		if (sleep_ps_wait_off(s, t6030_macos_down[i]))
+			t->down_stuck++;
+	}
+	for (i = 0; i < ARRAY_SIZE(t6030_macos_up); i++) {
+		t->up_saved[i] = readl(s->ps + t6030_macos_up[i]);
+		if (FIELD_GET(PS_ACTUAL, t->up_saved[i]) == 0xf)
+			continue;
+		if (sleep_ps_raise_start(s, t6030_macos_up[i]))
 			t->down_stuck++;
 	}
 	for (i = 0; i < ARRAY_SIZE(t6030_macos_down_aon); i++) {
@@ -728,6 +853,8 @@ static void t6030_sleep_down_unstage(struct apple_sleep *s)
 		return;
 	for (i = 0; i < ARRAY_SIZE(t6030_macos_down); i++)
 		t6030_sleep_unstage(s, t6030_macos_down[i], t->down_saved[i]);
+	for (i = 0; i < ARRAY_SIZE(t6030_macos_up); i++)
+		t6030_sleep_unstage(s, t6030_macos_up[i], t->up_saved[i]);
 }
 
 static void t6030_sleep_down_aon_back(struct apple_sleep *s)
@@ -762,8 +889,10 @@ static void t6030_sleep_commit_regs(struct apple_sleep *s)
 	/* A core that didn't take its stop would keep the engine waiting at the commit */
 	if (s->cpus_stop_ret)
 		t6030_sleep_failed("the other cores' stop");
+	t6030_gp_phy_park(s);
 	if (t6030_sleep_lower(s, T6030_LOWER_PHY, ARRAY_SIZE(t6030_lowered)))
 		t6030_sleep_failed("storage PHY power word");
+	t6030_gp_clk_off(s);
 	for (i = 0; i < ARRAY_SIZE(t6030_auto_off); i++)
 		t->auto_saved[i] = readl(s->ps + t6030_auto_off[i]);
 	t->auto_staged = true;
@@ -1072,6 +1201,7 @@ static const struct apple_sleep_soc t6030_sleep_soc = {
 	 * A7-M3 power-down controls (aura's reset path puts CYC_OVRD back in retention)
 	 */
 	.pen_deep = true,
+	.observer = true,
 	/* No write to WD2's registers in any of macOS's entries */
 	.no_wd2 = true,
 	/* pcie0 (Wi-Fi, the card reader) holds APCIE_SYS_GP; ANS is on APCIE_SYS_ST */
