@@ -1400,6 +1400,32 @@
 };
 
 /*
+ * First ProRes encoder (apr0) and its DART, as on the J616c. The J575c's ADT
+ * has apr0 and dart-apr0 at the t6041.dtsi addresses and interrupts. apr0
+ * runs with SCODEC_STREAMING (and SCODEC) powered and uses the driver's
+ * built-in T6041 power-up rows.
+ */
+&ps_fab1_soc {
+	status = "okay";
+};
+
+&ps_scodec {
+	status = "okay";
+};
+
+&ps_scodec_streaming {
+	status = "okay";
+};
+
+&apr0_dart {
+	status = "okay";
+};
+
+&apr0 {
+	status = "okay";
+};
+
+/*
  * Three of the four back Thunderbolt ports, with the J773s's PD controllers
  * (nub-spmi-a0 0xc, 0xa and 0x8 for ATC0-2), as on the J616c.
  * t6041-j575c-atc3.dtsi adds the fourth (hpm3 at 0x6, ATC3), and
