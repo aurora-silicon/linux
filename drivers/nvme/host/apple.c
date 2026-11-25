@@ -273,6 +273,8 @@ struct apple_nvme {
 	bool sleep_failed;
 	/* Run bit set after a sleep, and not yet reported on. */
 	bool sleep_restarting;
+	/* Pre-M4: the first reset after a real sleep checks the SART before the run bit. */
+	bool sleep_sart;
 	ktime_t sleep_run_time;
 	bool sleep_registered;
 	unsigned long recovery_flags;
@@ -1900,6 +1902,28 @@ static void apple_nvme_stop_crashed_session(struct apple_nvme *anv)
 
 static bool apple_nvme_sleep_wait_on(struct apple_nvme *anv);
 
+/*
+ * Pre-M4, at the first reset after a real sleep, right before the run bit: the SART entries
+ * noirq resume wrote back have to read as before the sleep, or ANS's firmware runs without its
+ * own memory. One the reset took is written back. One that doesn't hold fails the reset, before
+ * any DMA. A SART with nothing to check against (before SARTv3) is left as it was.
+ */
+static int apple_nvme_sleep_sart(struct apple_nvme *anv)
+{
+	int ret;
+
+	if (!anv->sleep_sart)
+		return 0;
+	anv->sleep_sart = false;
+	ret = apple_sart_restore_owned(anv->sart);
+	if (ret == -EOPNOTSUPP)
+		return 0;
+	if (ret)
+		dev_err(anv->dev, "ANS's SART entries did not come back after the sleep: %d\n",
+			ret);
+	return ret;
+}
+
 static void apple_nvme_reset_work_impl(struct work_struct *work)
 {
 	unsigned int nr_io_queues = 1;
@@ -2059,6 +2083,10 @@ static void apple_nvme_reset_work_impl(struct work_struct *work)
 			goto out;
 
 		ret = reset_control_deassert(anv->reset);
+		if (ret)
+			goto out;
+
+		ret = apple_nvme_sleep_sart(anv);
 		if (ret)
 			goto out;
 
@@ -3245,6 +3273,7 @@ static int apple_nvme_resume(struct device *dev)
 		WRITE_ONCE(anv->suspended, false);
 		return nvme_try_sched_reset(&anv->ctrl);
 	}
+	anv->sleep_sart = pm_resume_via_firmware();
 	return nvme_reset_ctrl(&anv->ctrl);
 }
 
