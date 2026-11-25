@@ -783,6 +783,24 @@ static void unregister_reboot_notifier(struct notifier_block *n) { (void)n;asser
         assert controls.count(probed) == 1
         controls = controls.replace(probed, probed + '  assert(reboots==1&&c.reboot_nb_registered&&c.reboot_nb.notifier_call==cd321x_reboot_notify);\n', 1)
 
+    # Newer trees do not wait for the driver core to give up on a missing router.
+    if 'cd321x_tbt_switch_keep_waiting(' not in core:
+        assert late_watch
+        stub = 'static bool keep_waiting=true;\nstatic bool cd321x_tbt_switch_keep_waiting(struct device *d) { (void)d;return keep_waiting; }\n'
+        assert mocks.count(stub) == 1
+        mocks = mocks.replace(stub, '', 1)
+        wait = r''' /* Missing router defers while suppliers may still bind, then is optional. */
+ reset(&c);switch_error=-EPROBE_DEFER;
+ assert(cd321x_register_port(&c.tps,&connector)==-EPROBE_DEFER);balanced();
+ reset(&c);switch_error=-EPROBE_DEFER;keep_waiting=false;
+'''
+        assert controls.count(wait) == 1
+        controls = controls.replace(wait, ''' /* A missing router is optional at once. */
+ reset(&c);switch_error=-EPROBE_DEFER;
+''', 1)
+        controls = controls.replace('keep_waiting=true;', '').replace('keep_waiting=false;', '')
+        assert 'keep_waiting' not in controls
+
     return prefix + pm + mocks + production + '\n#define TEST_DEFER 1\n#define TEST_FWNODE 1\n' + controls
 
 

@@ -89,6 +89,8 @@ ASAHI_TESTS = {
     'dcp-v27-dptx-layout-tests.py': [([], PASS)] + mutations(
         '--mutation', ['ignore-advertisement', 'ignore-pinned', 'ignore-dcpext',
                        'ignore-typec-routes'], []),
+    'dptx-set-active-lane-count-tests.py': [([], PASS)] + mutations(
+        '--mutation', ['drop-fixed-phy', 'skip-all-unexpected'], []),
     'dcpext26-wire-tests.py': [([], PASS)],
     'pmp-native26-tests.py': [([], PASS)],
 
@@ -114,6 +116,10 @@ ASAHI_TESTS = {
     'aop-als-channel-tests.py': [([], PASS)],
     'aop-als-calibration-tests.py': [([], PASS)],
     'aop-bootargs-tests.py': [([], PASS)],
+    # 24dc422773c9 registers another child device for each repeated service announcement.
+    'aop-service-tests.py': [([], PASS),
+                             (['--old-ref', '24dc422773c9beb9e99ee9e1ab713e9d6abb1e7b'], PASS)]
+        + mutations('--mutation', ('no-work-release', 'no-slot-release', 'no-register-release'), [], PASS),
     'mtp-pm-tests.py': [(out(), PASS),
                          (out() + ['--old-transport', '4db3a5a22c43'], PASS),
                          (out() + ['--old-mouse', '62d2045d8928'], PASS)],
@@ -123,6 +129,13 @@ ASAHI_TESTS = {
     'binding-lifetime-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('no-close', 'no-join'), out()),
     'apple-pwm-pm-tests.py': [([], PASS), (['--negative-control'], PASS)],
+    # 70a00e583b032 underflows get_timeleft() on cur > bite and ignores the reconfig reg.
+    'apple-wdt-tests.py': [(out(), PASS),
+                           (out() + ['--old-ref', '70a00e583b032'], KILL)]
+        + mutations('--mutation', ('ignore-sleep-handoff', 'no-bark-in-start', 'no-status-clear',
+                                   'reconfig-before-bark', 'register-after-arm',
+                                   'hwrunning-after-arm', 'no-wd1-adopt',
+                                   'no-t6050-wake-restore'), out()),
     'apple-m4-pmu-tests.py': [([], PASS)]
         + mutations('--mutation', ('m1-layout', 'cycles-anywhere', 'expose-8-9', 'flags-in-event'), []),
     'apple-dart-dapf-tests.py': [(out(), PASS)]
@@ -181,6 +194,7 @@ ASAHI_TESTS = {
     'brcmfmac-sleep-lifetime-tests.py': [([], PASS)],
     'cio-native-tests.py': [(out('--output'), PASS)],
     'centauri-wifi-pm-tests.py': [(out(), PASS), (out() + ['--negative-controls'], PASS)],
+    'centauri-scan-tests.py': [(out(), PASS), (out() + ['--negative-controls'], PASS)],
     'centauri-bt-arena-tests.py': [(out(), PASS), (out() + ['--negative-controls'], PASS)],
     'centauri-recovery-tests.py': [(out(), PASS), (out() + ['--negative-controls'], PASS)],
     'centauri-physical-recovery-tests.py': [(out(), PASS)]
@@ -261,6 +275,9 @@ ASAHI_TESTS = {
     'g17-kill-route-tests.py': [([], PASS)]
         + mutations('--mutation', ('no-executed-route', 'no-executed-input', 'kill-twice', 'executed-on-m5',
                                    'unsafe-wait', 'owed-blocks-kill', 'open-owed-skipped'), []),
+    'g17-m5-direct-compute-tests.py': [([], PASS)]
+        + mutations('--mutation', ('no-pre-recovery-drain', 'direct-debits-published',
+                                   'scope-allows-reserve'), []),
     'g17-m5-effort-tests.py': [([], PASS)]
         + mutations('--mutation', ('m5-ignores-bound',), []),
     'g17-firmware-selection-tests.py': [([], PASS)],
@@ -275,6 +292,9 @@ ASAHI_TESTS = {
     'g17-quarantine-drain-tests.py': [([], PASS)]
         + mutations('--mutation', ('no-drain-release', 'without-witness', 'ignore-leases', 'no-last-lease',
                                    'witness-covers-later-failure', 'unquarantined-drain'), []),
+    'g17-render-direct-recovery-tests.py': [([], PASS)]
+        + mutations('--mutation', ('recovery-state-eio', 'drop-generation-check',
+                                   'wrong-j813-pipe'), []),
     'g17-resource-tests.py': [([], PASS)],
     'g17-shared-pool-tests.py': [([], PASS)],
     'g17-t6041-initdata-tests.py': [([], PASS)],
@@ -327,9 +347,15 @@ ASAHI_TESTS = {
     'radio-sleep-fence-tests.py': [([], PASS)],
     'radio-sleep-power-tests.py': [([], PASS)],
     'radio-sleep-snapshot-tests.py': [([], PASS)],
+    # cacf35543b4d serves endpoint 7 for every co-processor.
+    'rtkit-coreanalytics-tests.py': [(out(), PASS),
+                                     (out() + ['--old-ref', 'cacf35543b4d534fccef3033bd2ddbb415a325b2'], PASS)],
     'rtkit-crashlog-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('buffer-header', 'section-header', 'section-size', 'footer-room',
                                    'mailbox-minimum', 'version-string', 'message-string'), out()),
+    # cacf35543b4d steps from an unaligned crash log buffer by the page size and maps it cacheable, unchecked.
+    'rtkit-crashlog-map-tests.py': [(out(), PASS),
+                                    (out() + ['--old-ref', 'cacf35543b4d534fccef3033bd2ddbb415a325b2'], PASS)],
     'rtkit-oslog-tests.py': [(out(), PASS)]
         + mutations('--mutate', ('admission', 'channel', 'counter', 'reset', 'buffer'), out()),
     'rtkit-adopted-session-tests.py': [(out(), PASS)]

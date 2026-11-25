@@ -312,6 +312,8 @@ pub(crate) struct Client {
     committed: AtomicU64,
     /// Size of those whose backing the GPU currently holds.
     resident: AtomicU64,
+    /// Bytes of the device's firmware timestamp window this client's bound buffers hold.
+    timestamp_window: AtomicU64,
 }
 
 impl Client {
@@ -320,6 +322,7 @@ impl Client {
             Self {
                 committed: AtomicU64::new(0),
                 resident: AtomicU64::new(0),
+                timestamp_window: AtomicU64::new(0),
             },
             GFP_KERNEL,
         )?)
@@ -331,6 +334,37 @@ impl Client {
 
     pub(crate) fn resident(&self) -> u64 {
         self.resident.load(Ordering::Relaxed)
+    }
+
+    /// Bytes of the firmware timestamp window this client holds.
+    #[cfg(CONFIG_KUNIT = "y")]
+    pub(crate) fn timestamp_window(&self) -> u64 {
+        self.timestamp_window.load(Ordering::Relaxed)
+    }
+
+    /// Takes `bytes` of the firmware timestamp window for `client` if its share stays within
+    /// `limit` (which must not be 0); the returned [`WindowShare`] gives them back when dropped.
+    /// Concurrent callers cannot overshoot.
+    pub(crate) fn take_window(client: &Arc<Self>, bytes: u64, limit: u64) -> Option<WindowShare> {
+        if limit == 0 || !try_add_within(&client.timestamp_window, bytes, limit, 0) {
+            return None;
+        }
+        Some(WindowShare {
+            client: client.clone(),
+            bytes,
+        })
+    }
+}
+
+/// Bytes of the firmware timestamp window held by one bound buffer of a client.
+pub(crate) struct WindowShare {
+    client: Arc<Client>,
+    bytes: u64,
+}
+
+impl Drop for WindowShare {
+    fn drop(&mut self) {
+        sub(&self.client.timestamp_window, self.bytes);
     }
 }
 

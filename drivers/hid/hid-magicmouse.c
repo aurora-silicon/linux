@@ -63,13 +63,13 @@ MODULE_PARM_DESC(report_undeciphered, "Report undeciphered multi-touch state fie
 
 /*
  * Waveform shaping, writable at runtime and applied on the next effect
- * upload. Zero means "use the per-transport default": the MTP machines keep
- * the values their firmware was tuned with, the SPI actuator in a J313 needs
- * a much softer, weaker waveform. The SPI numbers were judged by feel there.
+ * upload. Zero means "use the default" (magicmouse_haptic_waveform()): on MTP
+ * the press and release follow the actuator firmware's own click, the SPI
+ * actuator in a J313 needs a much softer, weaker waveform.
  */
 static u8 haptic_softness;
 module_param(haptic_softness, byte, 0644);
-MODULE_PARM_DESC(haptic_softness, "softness of the press and release waveforms, 1-255 (0: 0xf0 on SPI, 0x90 on MTP)");
+MODULE_PARM_DESC(haptic_softness, "softness of the press and release waveforms, 1-255 (0: 0xf0 on SPI, the firmware click's on MTP)");
 
 static u8 haptic_deep_softness;
 module_param(haptic_deep_softness, byte, 0644);
@@ -77,7 +77,7 @@ MODULE_PARM_DESC(haptic_deep_softness, "softness of the deep-click waveform, 1-2
 
 static u8 haptic_strength;
 module_param(haptic_strength, byte, 0644);
-MODULE_PARM_DESC(haptic_strength, "strength at 100% intensity for press and release, 1-255 (0: 0x28 on SPI, 0xff on MTP)");
+MODULE_PARM_DESC(haptic_strength, "strength at 100% intensity for press and release, 1-255 (0: 0x28 on SPI, the firmware click's on MTP)");
 
 static u8 haptic_deep_strength;
 module_param(haptic_deep_strength, byte, 0644);
@@ -294,6 +294,9 @@ struct effect_job {
  * @haptic_button_down: The host-derived button is pressed.
  * @haptic_deep_down: The host-derived click is in its deep stage.
  * @haptic_suspended: The transport is suspending or suspended; send nothing.
+ * @fw_click: The MTP actuator firmware's own press and release waveforms
+ *            (apple_taptic_get_waveform()), read on first use and again after
+ *            resume; @len 0 when the firmware has none.
  * @hdev: Pointer to the underlying HID device.
  * @work: Workqueue to handle initialization retry for quirky devices.
  * @work_held: @work was pending at suspend and must run again on resume.
@@ -340,6 +343,11 @@ struct magicmouse_sc {
 	bool haptic_button_down;
 	bool haptic_deep_down;
 	bool haptic_suspended;
+	struct {
+		bool read;
+		u8 len;
+		u8 body[63];
+	} fw_click[2];
 
 	struct hid_device *hdev;
 	struct delayed_work work;
@@ -1941,8 +1949,12 @@ static int magicmouse_switch_mode(struct input_dev *trackpad_idev, int mode)
 	return apple_taptic_switch_modes(actuator, mode);
 }
 
-static u8 magicmouse_haptic_softness(struct hid_device *hdev, bool deep);
-static u8 magicmouse_haptic_strength(struct hid_device *hdev, bool deep);
+static void magicmouse_haptic_waveform(struct magicmouse_sc *msc,
+				       struct hid_device *actuator, u16 usage,
+				       u8 *strength, u8 *softness);
+static int magicmouse_taptic_play(struct magicmouse_sc *msc,
+				  struct hid_device *actuator, u16 usage,
+				  u8 strength, u8 softness);
 static void magicmouse_haptic_release_mode(struct magicmouse_sc *msc);
 static void magicmouse_haptic_release_mode_locked(struct magicmouse_sc *msc);
 
@@ -1988,13 +2000,13 @@ static void magicmouse_haptic_pulses(struct magicmouse_sc *msc, u16 usage,
 		hid_info(msc->hdev, "host-driven click feedback active\n");
 	}
 
-	strength = magicmouse_haptic_strength(msc->hdev, deep);
-	softness = magicmouse_haptic_softness(msc->hdev, deep);
+	magicmouse_haptic_waveform(msc, actuator, usage, &strength, &softness);
 	gap = (deep && haptic_deep_gap_ms) ? haptic_deep_gap_ms
 					   : haptic_pulse_gap_ms;
 
 	for (i = 0; i < pulses; i++) {
-		ret = apple_taptic_send(actuator, usage, strength, softness);
+		ret = magicmouse_taptic_play(msc, actuator, usage, strength,
+					     softness);
 		if (ret) {
 			hid_warn(msc->hdev,
 				 "click waveform failed (%d); returning click feedback to the firmware\n",
@@ -2257,6 +2269,8 @@ static void magicmouse_haptic_resume(struct magicmouse_sc *msc)
 		}
 		msc->haptic_suspended = false;
 	}
+	/* The firmware may have been restarted with other strengths. */
+	memset(msc->fw_click, 0, sizeof(msc->fw_click));
 
 	if (haptic_press || magicmouse_haptic_effects_loaded(msc))
 		mode = HID_HAPTIC_MODE_HOST;
@@ -2452,34 +2466,96 @@ static void magicmouse_battery_timer_tick(struct timer_list *t)
 }
 
 #if IS_ENABLED(CONFIG_HID_APPLE_MTP_HAPTIC)
-static bool magicmouse_effect_is_deep(const struct ff_effect *effect)
+/*
+ * The firmware's own click waveform for a press or release on an MTP
+ * actuator, or NULL. A host click plays the same waveform: macOS leaves the
+ * actuator with these strengths at its default (Medium) click setting, and
+ * the shape differs between machines. Read once, and again after resume.
+ */
+static const u8 *magicmouse_fw_click(struct magicmouse_sc *msc,
+				     struct hid_device *actuator, u16 usage,
+				     u8 *len)
 {
-	return effect->u.haptic.hid_usage ==
-	       (APPLE_HP_WAVEFORMDEEPCLICK & HID_USAGE);
+	unsigned int i;
+	int ret;
+
+	if (msc->hdev->bus == BUS_SPI || !actuator ||
+	    (usage != (HID_HP_WAVEFORMPRESS & HID_USAGE) &&
+	     usage != (HID_HP_WAVEFORMRELEASE & HID_USAGE)))
+		return NULL;
+
+	i = usage == (HID_HP_WAVEFORMRELEASE & HID_USAGE);
+	if (!msc->fw_click[i].read) {
+		msc->fw_click[i].read = true;
+		ret = apple_taptic_get_waveform(actuator, usage,
+						msc->fw_click[i].body,
+						sizeof(msc->fw_click[i].body));
+		msc->fw_click[i].len = ret > 0 ? ret : 0;
+		if (ret > 0)
+			hid_dbg(msc->hdev,
+				"%s waveform from the firmware: strength 0x%02x softness 0x%02x, %d bytes\n",
+				i ? "release" : "press", msc->fw_click[i].body[1],
+				msc->fw_click[i].body[2], ret);
+		else
+			hid_dbg(msc->hdev, "no firmware %s waveform (%d)\n",
+				i ? "release" : "press", ret);
+	}
+	*len = msc->fw_click[i].len;
+	return *len ? msc->fw_click[i].body : NULL;
 }
 
-static u8 magicmouse_haptic_softness(struct hid_device *hdev, bool deep)
+/*
+ * The strength and softness a host-played waveform uses. A module parameter
+ * wins; otherwise an MTP press or release takes the firmware click's own
+ * values (magicmouse_fw_click()). A full-scale host click felt firmer than
+ * macOS on every MTP Mac. The deep click has no firmware waveform and stays
+ * at full scale, as does a press or release the firmware does not report.
+ * The SPI actuator in a J313 needs a much softer, weaker waveform; its
+ * numbers were judged by feel there.
+ */
+static void magicmouse_haptic_waveform(struct magicmouse_sc *msc,
+				       struct hid_device *actuator, u16 usage,
+				       u8 *strength, u8 *softness)
 {
-	u8 configured = deep ? haptic_deep_softness : haptic_softness;
+	bool deep = usage == (APPLE_HP_WAVEFORMDEEPCLICK & HID_USAGE);
+	u8 set_strength = deep ? haptic_deep_strength : haptic_strength;
+	u8 set_softness = deep ? haptic_deep_softness : haptic_softness;
+	bool spi = msc->hdev->bus == BUS_SPI;
+	const u8 *fw;
+	u8 len;
 
-	if (configured)
-		return configured;
-	if (hdev->bus != BUS_SPI)
-		return 0x90;
+	*strength = spi && !deep ? 0x28 : 0xff;
+	*softness = spi ? (deep ? 0xd0 : 0xf0) : 0x90;
 
-	return deep ? 0xd0 : 0xf0;
+	fw = magicmouse_fw_click(msc, actuator, usage, &len);
+	if (fw) {
+		*strength = fw[1];
+		*softness = fw[2];
+	}
+
+	if (set_strength)
+		*strength = set_strength;
+	if (set_softness)
+		*softness = set_softness;
 }
 
-static u8 magicmouse_haptic_strength(struct hid_device *hdev, bool deep)
+/* Play @usage: the firmware's own waveform where it has one, else ours. */
+static int magicmouse_taptic_play(struct magicmouse_sc *msc,
+				  struct hid_device *actuator, u16 usage,
+				  u8 strength, u8 softness)
 {
-	u8 configured = deep ? haptic_deep_strength : haptic_strength;
+	u8 body[sizeof(msc->fw_click[0].body)];
+	const u8 *fw;
+	u8 len;
 
-	if (configured)
-		return configured;
-	if (hdev->bus != BUS_SPI)
-		return 0xff;
+	fw = magicmouse_fw_click(msc, actuator, usage, &len);
+	if (!fw)
+		return apple_taptic_send(actuator, usage, strength, softness);
 
-	return deep ? 0xff : 0x28;
+	memcpy(body, fw, len);
+	body[1] = strength;
+	body[2] = softness;
+	return apple_taptic_send_waveform(actuator, body, len);
 }
 
 static int apple_upload_effects(struct input_dev *trackpad_idev,
@@ -2492,7 +2568,6 @@ static int apple_upload_effects(struct input_dev *trackpad_idev,
 	struct effect_job *job = &msc->haptic_effects[effect->id];
 	unsigned long flags;
 	u8 strength, softness;
-	bool deep;
 	int ret;
 
 	switch (effect->u.haptic.hid_usage) {
@@ -2511,10 +2586,9 @@ static int apple_upload_effects(struct input_dev *trackpad_idev,
 	if (!actuator)
 		return -ENODEV;
 
-	deep = magicmouse_effect_is_deep(effect);
-	strength = min_t(u16, 100, effect->u.haptic.intensity) *
-		magicmouse_haptic_strength(trackpad_hdev, deep) / 100;
-	softness = magicmouse_haptic_softness(trackpad_hdev, deep);
+	magicmouse_haptic_waveform(msc, actuator, effect->u.haptic.hid_usage,
+				   &strength, &softness);
+	strength = min_t(u16, 100, effect->u.haptic.intensity) * strength / 100;
 
 	/* The actuator may have been rebound or reset since the last upload. */
 	ret = magicmouse_switch_mode(trackpad_idev, HID_HAPTIC_MODE_HOST);
@@ -2565,7 +2639,7 @@ static void haptic_playback_worker(struct work_struct *ws)
 		}
 		WRITE_ONCE(job->msc->haptics->mode, HID_HAPTIC_MODE_HOST);
 	}
-	if (apple_taptic_send(actuator, type, strength, softness))
+	if (magicmouse_taptic_play(job->msc, actuator, type, strength, softness))
 		hid_warn(actuator, "cannot play the haptic effect\n");
 }
 

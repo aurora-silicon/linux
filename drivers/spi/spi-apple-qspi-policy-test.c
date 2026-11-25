@@ -183,6 +183,8 @@ static void qspi_policy_gd_status(struct kunit *test)
 	/* The J700 GD25UF16E part: QE is set for good and BP0 by iBoot. */
 	KUNIT_EXPECT_TRUE(test, apple_qspi_gd_status_allows_write(0x00, 0x02, 0x1c));
 	KUNIT_EXPECT_TRUE(test, apple_qspi_gd_status_allows_write(0x04, 0x02, 0x1c));
+	/* The J775D GD25UF64E part: QE only, no block protection tolerated. */
+	KUNIT_EXPECT_TRUE(test, apple_qspi_gd_status_allows_write(0x00, 0x02, 0));
 	KUNIT_EXPECT_FALSE(test, apple_qspi_gd_status_allows_write(0x04, 0x02, 0));
 	/* SRP0, SRP1 and LB1 to LB3 stay as found and do not block a write. */
 	KUNIT_EXPECT_TRUE(test, apple_qspi_gd_status_allows_write(0x80, 0x3b, 0x1c));
@@ -204,8 +206,10 @@ static void qspi_policy_part_status(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, apple_qspi_part_status_allows_write(0xef, 0x20, 0, 0, 0x1c));
 	KUNIT_EXPECT_FALSE(test, apple_qspi_part_status_allows_write(0xc8, 0x20, 0, 0, 0x1c));
 	KUNIT_EXPECT_FALSE(test, apple_qspi_part_status_allows_write(0xef, 0, 0, 0x04, 0x1c));
-	/* GigaDevice SR3 bit 2 is LPE, a power setting. */
+	/* GigaDevice SR3 bit 2 is LPE, a power setting; J775D leaves SR3 0x20. */
 	KUNIT_EXPECT_TRUE(test, apple_qspi_part_status_allows_write(0xc8, 0, 0, 0x04, 0x1c));
+	KUNIT_EXPECT_TRUE(test, apple_qspi_part_status_allows_write(0xc8, 0x00, 0x02, 0x20, 0));
+	KUNIT_EXPECT_FALSE(test, apple_qspi_part_status_allows_write(0xc8, 0x04, 0x02, 0x20, 0));
 	KUNIT_EXPECT_TRUE(test, apple_qspi_part_status_allows_write(0xef, 0, 0x04, 0, 0x1c));
 	KUNIT_EXPECT_FALSE(test, apple_qspi_part_status_allows_write(0xc8, 0, 0x04, 0, 0x1c));
 	KUNIT_EXPECT_FALSE(test, apple_qspi_part_status_allows_write(0xc2, 0x20, 0, 0, 0x1c));
@@ -273,12 +277,15 @@ static void qspi_policy_parts(struct kunit *test)
 	static const unsigned char known[][3] = {
 		{ 0xef, 0x65, 0x17 }, { 0xc2, 0x2b, 0x27 },
 		{ 0xef, 0x65, 0x15 }, { 0xc8, 0x83, 0x15 },
+		{ 0xc8, 0x83, 0x17 },
 	};
-	static const unsigned int sizes[] = { 0x800000, 0x800000, 0x200000, 0x200000 };
-	static const unsigned char bp_ok[] = { 0, 0, 0x1c, 0x1c };
+	static const unsigned int sizes[] = { 0x800000, 0x800000, 0x200000, 0x200000,
+					      0x800000 };
+	static const unsigned char bp_ok[] = { 0, 0, 0x1c, 0x1c, 0 };
 	static const unsigned char unknown[][3] = {
 		{ 0xef, 0x65, 0x16 }, { 0xef, 0x40, 0x17 }, { 0xc2, 0x2b, 0x28 },
-		{ 0xc8, 0x60, 0x15 }, { 0, 0, 0 }, { 0xff, 0xff, 0xff },
+		{ 0xc8, 0x60, 0x15 }, { 0xc8, 0x83, 0x16 }, { 0xc8, 0x83, 0x18 },
+		{ 0, 0, 0 }, { 0xff, 0xff, 0xff },
 	};
 	const struct apple_qspi_part *part;
 	unsigned int i;

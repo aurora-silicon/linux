@@ -51,6 +51,7 @@ static const struct dcp_method_entry dcp_methods[dcpep_num_methods] = {
 	IOMFB_METHOD("A469", iomfbep_abort_swaps_dcp),
 	IOMFB_METHOD("A473", dcpep_set_power_state),
 	IOMFB_METHOD("A474", dcpep_pipe_query_474),
+	IOMFB_METHOD("A500", dcpep_unnamed_500),
 	/* A364 get_mode_info and A420/A421 gamma: see iomfb_template.c */
 };
 
@@ -58,6 +59,22 @@ static const struct dcp_method_entry dcp_methods[dcpep_num_methods] = {
 #define DCP_FW_VER DCP_FW_VERSION_DESKTOP(26, 6, 0)
 
 #include "iomfb_template.c"
+
+/*
+ * D572: 0 when the firmware is done with the display, 1 when it wants it back. Only a
+ * sleep path waiting for it (s2r_active) acts on it; the firmware takes a zero status.
+ */
+static bool trampoline_dart_power_v26_6_desktop(struct apple_dcp *dcp, int tag, void *out,
+						void *in)
+{
+	const struct dcp_packet_header *header = in - sizeof(*header);
+
+	/* A bool in a 4-byte slot: its upper padding bytes are not cleared. */
+	if (header->in_len >= sizeof(u32))
+		dcp_s2r_dart_power(dcp, !!*(const u8 *)in);
+
+	return trampoline_zero(dcp, tag, out, in);
+}
 
 /*
  * D114 periodically publishes dictionary-valued statistics: the analytics
@@ -236,14 +253,16 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[565] = trampoline_true, /* set_property_bool */
 	[567] = trampoline_true, /* set_property_str */
 	/* a zero status for both its start and stop events */
-	[572] = trampoline_zero,
+	[572] = trampoline_dart_power_v26_6_desktop,
 	[575] = trampoline_hotplug,
 	[576] = trampoline_nop,
 	[581] = trampoline_nop,
 	[582] = trampoline_true, /* create_default_fb_surface */
+	[583] = trampoline_nop, /* clear_default_surface */
 	[588] = trampoline_nop, /* resize_default_fb_surface_gated */
 	[590] = trampoline_swap_complete,
 	[592] = trampoline_swap_complete_intent_gated,
+	[597] = trampoline_zero, /* sleep test: (0, 4), purpose unknown */
 	[593] = trampoline_abort_swap_ap_gated,
 	/* a four-byte padded notification; only its first byte is read */
 	[594] = trampoline_enable_backlight_message_ap_gated,
@@ -330,9 +349,11 @@ static const struct dcp_cb_min_v26_6_desktop cb_min[IOMFB_MAX_CB] = {
 	[576] = CB_MIN(0, 0),
 	[581] = CB_MIN(0, 0),
 	[582] = CB_MIN(0, sizeof(u8)),
+	[583] = CB_MIN(0, 0),
 	[588] = CB_MIN(0, 0),
 	[590] = CB_MIN(sizeof(struct DCP_FW_NAME(dc_swap_complete_resp)), 0),
 	[592] = CB_MIN(sizeof(dcp_swap_intent_t), 0),
+	[597] = CB_MIN(0, sizeof(u32)),
 	[593] = CB_MIN(sizeof(u32), 0),
 	[594] = CB_MIN(sizeof(u8), 0),
 	[595] = CB_MIN(0, 0),
