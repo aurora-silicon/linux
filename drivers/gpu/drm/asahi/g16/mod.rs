@@ -251,8 +251,8 @@ pub(crate) struct Shared {
     /// Set by external state changes (VM teardown, unstarted queue cancellation) so the next
     /// `poll_step()` re-evaluates `publish_checked()` even while unrelated flights are active.
     pub(crate) publish_wake: AtomicBool,
-    /// Set on VM close (and re-armed while any non-quarantined slot still holds a closed VM)
-    /// so displaced closed-VM slot leases are reclaimed without scanning on the hot path.
+    /// Set on VM close and when its last unpublished render reservation is released.
+    /// Re-armed while a closed VM still holds a lease awaiting reclaim.
     pub(crate) closed_vm_reclaim: AtomicBool,
     /// CPU that last submitted work, for placing the per-CPU completion worker.
     pub(crate) submitter: AtomicU32,
@@ -505,6 +505,12 @@ impl Shared {
         if self.started.load(Ordering::Acquire) && !self.sleeping.load(Ordering::Acquire) {
             self.poll_now();
         }
+    }
+
+    /// Arms and wakes the poll worker to reclaim closed VM leases.
+    pub(crate) fn wake_closed_vm_reclaim(self: &Arc<Self>) {
+        self.closed_vm_reclaim.store(true, Ordering::Release);
+        self.wake_publish();
     }
 
     /// Latches the fail-stop state.
@@ -904,8 +910,7 @@ impl gpu::Gpu for Gpu {
     }
     fn vm_closed(&self, vm: &mmu::Vm) {
         self.vms.close(vm.id());
-        self.shared.closed_vm_reclaim.store(true, Ordering::Release);
-        self.shared.wake_publish();
+        self.shared.wake_closed_vm_reclaim();
     }
 
     fn new_queue(

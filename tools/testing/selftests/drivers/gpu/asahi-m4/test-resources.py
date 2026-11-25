@@ -174,13 +174,42 @@ pub mod g16 {
     pub mod vm {
         use crate::{mmu,sync::Arc};
         use core::sync::atomic::{AtomicBool,Ordering};
-        pub struct MockVm(AtomicBool);
+        use super::resources::reservations::Cache;
+        pub struct MockVm {
+            closed: AtomicBool,
+            unpublished: AtomicBool,
+            cache: Option<Arc<Cache>>,
+            _live: Option<Arc<LiveToken>>,
+        }
         impl MockVm{
-            pub fn new()->Self{Self(AtomicBool::new(false))}
-            pub fn is_closed(&self)->bool{self.0.load(Ordering::Acquire)}
-            pub fn close(&self){self.0.store(true,Ordering::Release);}
+            pub fn new() -> Self {
+                Self {
+                    closed: AtomicBool::new(false),
+                    unpublished: AtomicBool::new(false),
+                    cache: None,
+                    _live: None,
+                }
+            }
+            pub fn tracked(cache: Arc<Cache>) -> (Self, std::sync::Arc<AtomicBool>) {
+                let live = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1));
+                let released = std::sync::Arc::new(AtomicBool::new(false));
+                let registry = Arc::new(Registry { live: live.clone() }, 0).unwrap();
+                let bind = mmu::VmBind { live, released: released.clone() };
+                let token = Arc::new(LiveToken { registry, bind: Some(bind), file_id: 0 }, 0).unwrap();
+                (Self { cache: Some(cache), _live: Some(token), ..Self::new() }, released)
+            }
+            pub fn is_closed(&self)->bool{self.closed.load(Ordering::Acquire)}
+            pub fn close(&self){self.closed.store(true,Ordering::Release);}
+            // Accepted renders still unpublished (the VM cache's standby reservations).
+            pub fn set_unpublished(&self,v:bool){self.unpublished.store(v,Ordering::Release);}
         }
         pub struct VmState{pub id:u64,pub slot:u32,pub generation:u8,pub vm:MockVm}
+        impl VmState {
+            pub fn renders_unpublished(&self) -> bool {
+                self.vm.unpublished.load(Ordering::Acquire)
+                    || self.vm.cache.as_ref().is_some_and(|cache| cache.renders_unpublished())
+            }
+        }
         struct Registry{live:std::sync::Arc<std::sync::atomic::AtomicU32>}impl Registry{fn release(&self,_file:u64){self.live.fetch_sub(1,Ordering::AcqRel);}}
         __LIVE_TOKEN__
         __LIVE_DROP__
@@ -257,6 +286,197 @@ pub mod g16 {
         pub(crate) const BASE_RENDER_SLOTS: usize = super::hw::sizes::BASE_RENDER_SLOTS;
         const BASE_PB_SLOTS: usize = super::hw::sizes::BASE_PB_SLOTS;
         __RENDER_BURST__
+
+        pub(crate) mod reservations {
+            use super::{ComputeArena as ComputeUnitSet, PoolExtArena, RenderArena};
+            use crate::{
+                device::Device,
+                driver::AsahiDrmDevice,
+                g16::{budget::Budget, object::Factory, pools::{PbEpoch, Pools}, slots::Slots, vm::{MockVm, VmState}},
+                sync::{Arc, CondVar, Mutex},
+                KVec,
+            };
+            use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+            #[derive(Default)]
+            pub(crate) struct Shared {
+                closed_vm_reclaim: AtomicBool,
+                publish_wake: AtomicBool,
+                started: AtomicBool,
+                sleeping: AtomicBool,
+                poll_queued: AtomicBool,
+            }
+            impl Shared {
+                __WAKE_PUBLISH__
+                __WAKE_CLOSED_VM_RECLAIM__
+
+                fn poll_now(&self) {
+                    self.poll_queued.store(true, Ordering::Release);
+                }
+            }
+
+            __STANDBY__
+            __SPARE_EPOCHS__
+            struct RenderExtArena;
+            struct PbHeapExtArena;
+            const EXT_RENDER_TIERS: [(); 0] = [];
+            const PB_HEAP_EXT_TIERS: [(); 0] = [];
+            const EXT_PB_SLOTS: usize = 1;
+
+            pub(crate) struct Cache {
+                standby: Mutex<Standby>,
+                standby_available: CondVar,
+                closed: AtomicBool,
+                active_render_passes: AtomicU32,
+                shared: Arc<Shared>,
+            }
+            impl Cache {
+                __RELEASE_RESERVED__
+                __RELEASE_RENDER_PASSES__
+                __RENDERS_UNPUBLISHED__
+            }
+
+            __PREPARED__
+            __DROP_PREPARED__
+            impl Prepared {
+                __COMMIT_RENDER__
+                __DISCARD_UNPUBLISHED__
+            }
+
+            struct Engine {
+                shared: Option<Arc<Shared>>,
+            }
+            struct Firmware {
+                engine: Engine,
+                pools: Pools,
+                slots: Slots,
+            }
+            impl Firmware {
+                __RECLAIM_CLOSED_VM_SLOTS__
+
+                fn idle_poll(&mut self) {
+                    let shared = self.engine.shared.as_ref().unwrap();
+                    assert!(shared.poll_queued.swap(false, Ordering::AcqRel), "poll must be queued");
+                    self.reclaim_closed_vm_slots();
+                }
+            }
+
+            fn displaced_vm(credits: u32) -> (
+                Firmware, Arc<Cache>, Arc<VmState>, Arc<PbEpoch>, std::sync::Arc<AtomicBool>, Prepared,
+            ) {
+                let shared = Arc::new(Shared::default(), 0).unwrap();
+                shared.started.store(true, Ordering::Release);
+                let cache = Arc::new(Cache {
+                    standby: Mutex::new(Standby { epochs: KVec::new(), reserved: credits, waiters: 0 }),
+                    standby_available: CondVar::new(),
+                    closed: AtomicBool::new(false),
+                    active_render_passes: AtomicU32::new(credits),
+                    shared: shared.clone(),
+                }, 0).unwrap();
+                let (vm, released) = MockVm::tracked(cache.clone());
+                let vm = Arc::new(VmState { id: 1, slot: 1, generation: 1, vm }, 0).unwrap();
+                let replacement = crate::resources::vm(2);
+                let mut pools = Pools::new(&AsahiDrmDevice(Device));
+                let budget = Budget::new().unwrap();
+                for _ in 0..credits {
+                    let credit = Budget::reserve(&budget, 1).unwrap().take().unwrap();
+                    cache.standby.lock().epochs.push(PbEpoch::new(&Factory, &vm, credit).unwrap(), 0).unwrap();
+                }
+                let epoch = exposed_epoch(&budget, &vm, 0);
+                let newer = exposed_epoch(&budget, &replacement, 0);
+                for (owner, backing) in [(&vm, &epoch), (&replacement, &newer)] {
+                    let binding = pools.bind(0, false);
+                    pools.hold_alloc(0, owner, None, None).unwrap();
+                    pools.publish_flight(0);
+                    pools.retire_flight(0, backing, binding, true).unwrap();
+                }
+                let firmware = Firmware {
+                    engine: Engine { shared: Some(shared) },
+                    pools,
+                    slots: Slots::new().unwrap(),
+                };
+                let prepared = Prepared {
+                    active_renders: AtomicU32::new(credits),
+                    unpublished_renders: AtomicU32::new(credits),
+                    cache: Some(cache.clone()),
+                    compute: None,
+                    compute_ext: None,
+                    compute_scs: false,
+                    render: None,
+                    render_scs: false,
+                    render_ext: [],
+                    pb_heap_ext: [],
+                    pb_ext: [Some(Arc::new(PoolExtArena, 0).unwrap())],
+                };
+                (firmware, cache, vm, epoch, released, prepared)
+            }
+
+            fn exposed_epoch(budget: &Arc<Budget>, vm: &Arc<VmState>, slot: usize) -> Arc<PbEpoch> {
+                let credit = Budget::reserve(budget, 1).unwrap().take().unwrap();
+                let e = PbEpoch::new(&Factory, vm, credit).unwrap();
+                e.prepare(slot, crate::g16::hw::client::pb_heap(0), 512).unwrap();
+                e.expose();
+                e
+            }
+
+            #[test]
+            fn cancel_last_unpublished_render_wakes_idle_reclaim_and_releases_asid() {
+                let (mut fw, cache, vm, epoch, released, job) = displaced_vm(1);
+                vm.vm.close();
+                cache.closed.store(true, Ordering::Release);
+                cache.shared.wake_closed_vm_reclaim();
+                fw.idle_poll();
+                assert!(cache.shared.closed_vm_reclaim.load(Ordering::Acquire));
+                assert_eq!(Arc::strong_count(&epoch), 2, "vm_last still holds the epoch");
+                assert!(!cache.shared.poll_queued.load(Ordering::Acquire));
+                drop(epoch);
+                drop(vm);
+                assert!(!released.load(Ordering::Acquire));
+
+                drop(job);
+                assert_eq!(cache.standby.lock().reserved, 0);
+                fw.idle_poll();
+                assert!(!cache.shared.closed_vm_reclaim.load(Ordering::Acquire));
+                assert!(released.load(Ordering::Acquire), "idle poll released the ASID and last PB epoch");
+            }
+
+            #[test]
+            fn passed_abort_returns_unpublished_credits_and_preserves_quarantine() {
+                let (mut fw, cache, vm, old_epoch, released, job) = displaced_vm(3);
+                let aborted = cache.standby.lock().epochs.pop().unwrap();
+                aborted.prepare(1, crate::g16::hw::client::pb_heap(0), 512).unwrap();
+                aborted.expose();
+                fw.pools.bind(1, false);
+                fw.pools.hold_alloc(1, &vm, None, None).unwrap();
+                fw.pools.publish_flight(1);
+                job.commit_render(1);
+                vm.vm.close();
+                cache.closed.store(true, Ordering::Release);
+                cache.shared.wake_closed_vm_reclaim();
+                fw.idle_poll();
+                assert_eq!(Arc::strong_count(&old_epoch), 2);
+                assert_eq!(cache.standby.lock().reserved, 2);
+
+                fw.pools.quarantine_flight(1, Some(aborted.clone()));
+                let retained = Arc::new(job, 0).unwrap();
+                retained.discard_unpublished_renders();
+                retained.discard_unpublished_renders();
+                let reserved = cache.standby.lock().reserved;
+                assert_eq!(reserved, 0);
+                assert_eq!(cache.active_render_passes.load(Ordering::Acquire), 1);
+                fw.idle_poll();
+                assert_eq!(Arc::strong_count(&old_epoch), 1, "vm_last released the displaced epoch");
+                assert_eq!(fw.pools.quarantined_mask(), 1 << 1);
+                assert_eq!(Arc::strong_count(&aborted), 2);
+                assert!(retained.pb_ext[0].is_some(), "retained job still owns its arena");
+                drop(old_epoch);
+                drop(aborted);
+                drop(vm);
+                assert!(!released.load(Ordering::Acquire), "quarantine pins the published ASID");
+                drop(retained);
+                assert_eq!(cache.active_render_passes.load(Ordering::Acquire), 0);
+            }
+        }
     }
     pub mod boot {pub fn eproto()->crate::Error{crate::Error(71)}}
     pub mod engine {
@@ -631,7 +851,7 @@ pub mod g16 {
         s.release(&mut claims);s.note_published(&claims);assert_eq!(s.stats.cross_vm_retargets,[1,0]);
     }
 
-    fn vm(id:u64)->sync::Arc<g16::vm::VmState>{
+    pub(super) fn vm(id:u64)->sync::Arc<g16::vm::VmState>{
         sync::Arc::new(
             g16::vm::VmState{id,slot:id as u32,generation:1,vm:g16::vm::MockVm::new()},0,
         ).unwrap()
@@ -1060,7 +1280,8 @@ pub mod g16 {
         let _=p.bind(1,false);p.publish_flight(1);
         p.invalidate();
         p.quarantine_flight(1,Some(e3.clone()));
-        assert_eq!(sync::Arc::strong_count(&e2),2,"prior slot owner epoch must stay mapped");
+        // e2 is slot 1's prior owner and VM2's last retired epoch.
+        assert_eq!(sync::Arc::strong_count(&e2),3,"prior slot owner epoch must stay mapped");
         assert_eq!(sync::Arc::strong_count(&e3),2,"aborted fresh epoch must stay mapped");
         // Render class must NOT wedge: slot 2 is fresh and needed_slots advances to 3.
         assert!(!p.exhausted());
@@ -2969,6 +3190,130 @@ pub mod g16 {
         assert!(!p.reclaim_closed());
     }
 
+    // Live cross-VM steal of a warm PB slot (display manager active: kwin, its helpers and 16
+    // clients over 16 warm slots). VM A's epoch owns slot 3. VM B's fresh epoch rebinds slot 3
+    // and retires, replacing owners[3] while A is still open. A's next render is a cold InitBM
+    // on slot 4, the only flight; gPM_SP(0) then writes the old epoch's page list through A's
+    // context: "write unmapped level 0 unit 0xe0 ctx 62 ... flights=1 live_vm=Some(108)".
+    #[test]fn live_vm_displaced_pb_epoch_keeps_page_list_until_its_next_render_retires(){
+        let factory = g16::object::Factory;
+        let budget = g16::budget::Budget::new().unwrap();
+        let mut p = g16::pools::Pools::new(&driver::AsahiDrmDevice(device::Device));
+        let epoch = |v: &sync::Arc<g16::vm::VmState>, k: usize| {
+            let e = g16::pools::PbEpoch::new(
+                &factory,
+                v,
+                g16::budget::Budget::reserve(&budget, 1).unwrap().take().unwrap(),
+            ).unwrap();
+            e.prepare(k, g16::hw::client::pb_heap(0), 512).unwrap();
+            e.expose();
+            e
+        };
+        let run = |p: &mut g16::pools::Pools, v: &sync::Arc<g16::vm::VmState>, k: usize,
+                   e: &sync::Arc<g16::pools::PbEpoch>, completed: bool| {
+            let b = p.bind(k, false);
+            p.hold_alloc(k, v, None, None).unwrap();
+            p.publish_flight(k);
+            p.retire_flight(k, e, b, completed).unwrap();
+        };
+
+        let a = vm(62);
+        let b = vm(5);
+        let ea1 = epoch(&a, 3);
+        run(&mut p, &a, 3, &ea1, true);
+        let eb = epoch(&b, 3);
+        run(&mut p, &b, 3, &eb, true);
+        assert!(p.reusable(3, &a).is_none(), "slot 3 is bound to B's epoch");
+        assert_eq!(sync::Arc::strong_count(&ea1), 2, "A's page list unmapped while A is open");
+        assert_eq!(p.stats.kept, 1);
+
+        // A's next render binds slot 4 with InitBM. The old list stays while it is in flight
+        // and after a failed retirement, which need not have run the InitBM.
+        let ea2 = epoch(&a, 4);
+        let b2 = p.bind(4, false);
+        p.hold_alloc(4, &a, None, None).unwrap();
+        p.publish_flight(4);
+        assert_eq!(sync::Arc::strong_count(&ea1), 2);
+        p.retire_flight(4, &ea2, b2, false).unwrap();
+        assert_eq!(sync::Arc::strong_count(&ea1), 2, "a failed render released the old list");
+        let ea3 = epoch(&a, 4);
+        run(&mut p, &a, 4, &ea3, true);
+        assert_eq!(sync::Arc::strong_count(&ea1), 1, "released after A's newer render retired");
+        assert_eq!(sync::Arc::strong_count(&ea3), 3, "slot 4 owner and A's last epoch");
+        assert_eq!(sync::Arc::strong_count(&eb), 3, "slot 3 owner and B's last epoch");
+        // Warm reuse of the same epoch changes nothing.
+        run(&mut p, &b, 3, &eb, true);
+        assert_eq!(sync::Arc::strong_count(&eb), 3);
+        assert_eq!(p.stats.kept, 1);
+        // Open VMs never keep reclaim armed.
+        assert!(!p.take_closed_vm_last());
+        assert!(!p.reclaim_closed());
+    }
+
+    // A closed VM keeps its last epoch while a render it accepted waits for publication or
+    // retirement, and loses it once none does, so its context and lists are not pinned.
+    #[test]fn closed_vm_last_pb_epoch_waits_for_its_accepted_renders(){
+        let factory = g16::object::Factory;
+        let budget = g16::budget::Budget::new().unwrap();
+        let mut p = g16::pools::Pools::new(&driver::AsahiDrmDevice(device::Device));
+        let epoch = |v: &sync::Arc<g16::vm::VmState>, k: usize| {
+            let e = g16::pools::PbEpoch::new(
+                &factory,
+                v,
+                g16::budget::Budget::reserve(&budget, 1).unwrap().take().unwrap(),
+            ).unwrap();
+            e.prepare(k, g16::hw::client::pb_heap(0), 512).unwrap();
+            e.expose();
+            e
+        };
+        let run = |p: &mut g16::pools::Pools, v: &sync::Arc<g16::vm::VmState>, k: usize,
+                   e: &sync::Arc<g16::pools::PbEpoch>| {
+            let b = p.bind(k, false);
+            p.hold_alloc(k, v, None, None).unwrap();
+            p.publish_flight(k);
+            p.retire_flight(k, e, b, true).unwrap();
+        };
+
+        let a = vm(20);
+        let b = vm(21);
+        let ea1 = epoch(&a, 3);
+        run(&mut p, &a, 3, &ea1);
+        let eb = epoch(&b, 3);
+        run(&mut p, &b, 3, &eb);
+        assert_eq!(sync::Arc::strong_count(&ea1), 2);
+
+        // A closes with an accepted render not yet published.
+        a.vm.set_unpublished(true);
+        a.vm.close();
+        assert!(p.reclaim_closed(), "accepted render of the closed VM still unpublished");
+        assert_eq!(sync::Arc::strong_count(&ea1), 2);
+        // It publishes a fresh InitBM epoch on slot 4.
+        a.vm.set_unpublished(false);
+        let ea2 = epoch(&a, 4);
+        let b2 = p.bind(4, false);
+        p.hold_alloc(4, &a, None, None).unwrap();
+        p.publish_flight(4);
+        assert!(p.reclaim_closed(), "render of the closed VM in flight");
+        assert_eq!(sync::Arc::strong_count(&ea1), 2);
+        p.retire_flight(4, &ea2, b2, true).unwrap();
+        assert_eq!(sync::Arc::strong_count(&ea1), 1, "older epoch released after the InitBM");
+        assert!(p.take_closed_vm_last(), "a closed VM's entry asks for another reclaim pass");
+        assert!(!p.take_closed_vm_last());
+        // B retires on slot 5, so slot 4 is displaced; nothing of A is pending any more.
+        let eb5 = epoch(&b, 5);
+        run(&mut p, &b, 5, &eb5);
+        assert!(!p.reclaim_closed());
+        assert_eq!(sync::Arc::strong_count(&ea2), 2, "only slot 4's owner keeps A's last epoch");
+        drop(ea1);
+        drop(ea2);
+        // Slot 4's owner holds A until a newer epoch retires there.
+        assert_eq!(sync::Arc::strong_count(&a), 2);
+        let eb4 = epoch(&b, 4);
+        run(&mut p, &b, 4, &eb4);
+        assert_eq!(sync::Arc::strong_count(&a), 1, "closed VM fully released");
+        assert!(!p.reclaim_closed());
+    }
+
 }
 '''
 poll_source = (production/'poll.rs').read_text()
@@ -2980,8 +3325,9 @@ assert 'self.enqueue_scrubs(scrubs)' in poll_source, 'poll.rs must enqueue scrub
 assert 'OwnedQueue::new_unbound_reclaim(c_str!("aurora_g16_scrub"), false)' in mod_source
 assert 'self.scrub_wq.drain();' in sleep_source, 'sleep.rs::join_workers must drain scrub_wq'
 assert 'closed_vm_reclaim' in mod_source
-assert 'self.shared.closed_vm_reclaim.store(true, Ordering::Release);' in mod_source
+assert 'self.shared.wake_closed_vm_reclaim();' in item(mod_source, 'fn vm_closed(')
 assert 'reclaim_closed_vm_slots' in poll_source
+assert 'job.resources.discard_unpublished_renders();' in item(poll_source, 'if p.is_pending()')
 lifetime_source = (production.parent / 'mmu' / 'lifetime.rs').read_text()
 is_closed_fn = item(lifetime_source, 'pub(crate) fn is_closed(')
 assert '.lock()' not in is_closed_fn, 'Vm::is_closed() must be lock-free'
@@ -3014,6 +3360,24 @@ budget += r'''
 source=source.replace('__BUDGET__',budget.replace('//!','//'))
 source = source.replace('__LIVE_TOKEN__' ,item((production/'vm.rs').read_text(),'pub(crate) struct LiveToken')).replace('__LIVE_DROP__',item((production/'vm.rs').read_text(),'impl Drop for LiveToken'))
 resources_source = (production/'resources.rs').read_text()
+for placeholder, source_text, declaration in (
+    ('__WAKE_PUBLISH__', mod_source, 'pub(crate) fn wake_publish('),
+    ('__WAKE_CLOSED_VM_RECLAIM__', mod_source, 'pub(crate) fn wake_closed_vm_reclaim('),
+    ('__STANDBY__', resources_source, 'struct Standby {'),
+    ('__RELEASE_RESERVED__', resources_source, 'fn release_reserved('),
+    ('__RELEASE_RENDER_PASSES__', resources_source, 'fn release_render_passes('),
+    ('__RENDERS_UNPUBLISHED__', resources_source, 'pub(crate) fn renders_unpublished('),
+    ('__PREPARED__', resources_source, 'pub(crate) struct Prepared {'),
+    ('__DROP_PREPARED__', resources_source, 'impl Drop for Prepared'),
+    ('__COMMIT_RENDER__', resources_source, 'pub(crate) fn commit_render('),
+    ('__DISCARD_UNPUBLISHED__', resources_source, 'pub(crate) fn discard_unpublished_renders('),
+    ('__RECLAIM_CLOSED_VM_SLOTS__', poll_source, 'pub(crate) fn reclaim_closed_vm_slots('),
+):
+    method = item(source_text, declaration)
+    # The host Arc wrapper uses Deref without the kernel's arbitrary self types.
+    source = source.replace(placeholder, method.replace('self: &Arc<Self>', '&self'))
+source = source.replace('__SPARE_EPOCHS__', next(
+    line for line in resources_source.splitlines() if line.startswith('const SPARE_EPOCHS:')))
 object_source = (production/'object.rs').read_text()
 # A firmware-cached object with an uncached GPU lower alias is cleaned to the point of
 # coherency after every host store; only that combination sets the flag.
@@ -3090,9 +3454,10 @@ for command in [
     (out/'resource-host.log').write_text(log)
     if result.returncode:
         raise SystemExit(result.returncode)
-files = ['graph.rs', 'slots.rs', 'pools.rs', 'pools/lifetime.rs', 'fw/buffer.rs', 'fw/graph.rs', 'fw/work.rs', 'hw.rs', 'resources.rs', 'budget.rs']
+files = ['graph.rs', 'slots.rs', 'pools.rs', 'pools/lifetime.rs', 'fw/buffer.rs', 'fw/graph.rs', 'fw/work.rs', 'hw.rs', 'resources.rs', 'budget.rs', 'mod.rs', 'poll.rs', 'vm.rs']
+test_count = int(next(line.split()[3] for line in log.splitlines() if line.startswith('test result: ok.')))
 (out/'resource-host.json').write_text(json.dumps({
-    'result': 'pass', 'tests': 41,
+    'result': 'pass', 'tests': test_count,
     'scope': 'Actual production allocation, initialization and lifetime code against a CPU-only backing recorder; no hardware qualification.',
     'private_rw_pte': hex(private_rw),
     'private_rw_reference': 'Qualified J713 NC read/write leaf attributes',
