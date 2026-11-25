@@ -35,7 +35,7 @@ pub(crate) use publication::{Prepared as PreparedPublication, Publication};
 
 struct Destination {
     // The buffer keeps its GPU alias and its CPU mapping alive.
-    buffer: Arc<crate::timestamp::Buffer>,
+    buffer: Arc<crate::timestamp::Bound>,
     offset: usize,
     /// The destination's address in the firmware timestamp window, if its buffer is mapped there.
     window_va: Option<u64>,
