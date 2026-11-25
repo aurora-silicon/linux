@@ -383,6 +383,13 @@ int sep_pm_commit_prepare(void *ptr, void *mbox, u64 msg0, u32 msg1, u64 reply, 
 		ret = -ENODEV;
 		goto err;
 	}
+	/* Without the list the commit saves nothing, and the wake puts nothing back. */
+	if (!apple_dart_sleep_listed(c->dart)) {
+		dev_err(c->dart,
+			"no apple,sleep-restore list: the enclave can't sleep at the commit\n");
+		ret = -EOPNOTSUPP;
+		goto err;
+	}
 	/* Read only, but mapped as its bus asks, as every other mapping of that page. */
 	if (res.flags & IORESOURCE_MEM_NONPOSTED)
 		c->ps = ioremap_np(res.start + offset, sizeof(u32));
