@@ -586,7 +586,7 @@ struct sched_entity {
 	unsigned char			custom_slice;
 	/* MEM_SPREAD: classified memory-bound, see mem_spread_tick() */
 	unsigned char			mem_bound;
-	/* MEM_SPREAD: L1D load misses per us of running, moving average */
+	/* MEM_SPREAD: L1D load misses per 1000 active cycles, moving average */
 	unsigned short			mem_rate;
 
 	u64				exec_start;

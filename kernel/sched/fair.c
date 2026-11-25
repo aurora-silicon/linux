@@ -52,6 +52,7 @@
 #include <linux/ratelimit.h>
 #include <linux/task_work.h>
 #include <linux/rbtree_augmented.h>
+#include <linux/cpufreq.h>
 #include <linux/debugfs.h>
 #include <linux/perf_event.h>
 
@@ -6351,32 +6352,39 @@ static inline int task_fits_cpu(struct task_struct *p, int cpu)
  * GB/s on macOS, which spreads them over the clusters within a few hundred
  * milliseconds but keeps compute-bound threads on the Everest cores.
  *
- * The signal is the rate of L1D load misses per microsecond of running,
+ * The signal is L1D load misses per 1,000 estimated active cycles (MPKC),
  * from one pinned CPU-wide perf counter per CPU (the generic L1D read miss
- * cache event; no counter, no classification). On an M5 Max a triad
- * thread misses 6,600 times per us alone on an Everest core, 1,600 with
- * six sharing that cluster and 2,000 alone on a Sawtooth core, dependent
- * adds 0-1 times. Stall events cannot tell them apart (a dependent add
- * chain stalls the back end more than triad does), and
- * the stall on L1D misses grows with contention, so it would fall as soon
- * as a task is spread and the classification would oscillate. The rate is
- * sampled at the tick, attributed to the running task only when it ran
- * the whole period (no context switch since the previous tick), averaged
- * per task over samples with weight 2^-shift, and classified with
- * hysteresis (memory-bound at high, no longer below low). Tasks inherit
- * their parent's state at fork. The counters exist only while MEM_SPREAD
- * (off by default) is on or debugfs sched/mem_spread/sample is set; the
- * sample setting classifies without changing placement.
+ * cache event) divided by the cycles estimated from each CPU's reported
+ * hardware maximum frequency (cpufreq_get_hw_max_freq()) scaled by live
+ * frequency invariance (arch_scale_freq_capacity()). Normalizing by active
+ * cycles removes clock-rate and DVFS dependence across heterogeneous
+ * clusters and SoC generations without pinning a second PMU counter:
+ * streaming workloads sustain 140-840 MPKC even under cluster contention
+ * while cache-heavy compute (7-Zip) stays around 15-16 MPKC across both
+ * P and M cores, well below the 100/50 MPKC hysteresis thresholds (1 miss
+ * per 10 cycles to classify, below 1 per 20 cycles to clear). Stall events
+ * cannot tell them apart (a dependent add chain stalls the back end more
+ * than triad does), and the stall on L1D misses grows with contention, so
+ * it would fall as soon as a task is spread and oscillate.
+ *
+ * The rate is sampled at the tick, attributed to the running task only
+ * when it ran the whole period (no context switch since the previous tick),
+ * averaged per task over samples with weight 2^-shift, and classified with
+ * hysteresis. Tasks inherit their parent's state at fork. Counters are
+ * opened only on multi-LLC systems while MEM_SPREAD is on, or whenever
+ * debugfs sched/mem_spread/sample is set (which classifies without
+ * changing placement).
  */
 static DEFINE_STATIC_KEY_FALSE(sched_mem_sample);
 
-static unsigned int sysctl_mem_spread_high = 500;
-static unsigned int sysctl_mem_spread_low = 250;
+static unsigned int sysctl_mem_spread_high = 100;
+static unsigned int sysctl_mem_spread_low = 50;
 static unsigned int sysctl_mem_spread_shift = 3;
 static bool mem_spread_sample;
 
 struct mem_spread_cpu {
 	struct perf_event	*event;
+	unsigned int		max_freq_khz;
 	/* Counter, curr's run time and switch count at the previous tick */
 	struct perf_event	*last_event;
 	u64			last_count;
@@ -6409,10 +6417,11 @@ static void mem_spread_tick(struct rq *rq, struct task_struct *curr)
 {
 	struct mem_spread_cpu *ms = this_cpu_ptr(&mem_spread_cpu);
 	struct perf_event *event = READ_ONCE(ms->event);
+	unsigned int max_khz = READ_ONCE(ms->max_freq_khz);
 	struct sched_entity *se = &curr->se;
 	u64 count, exec = se->sum_exec_runtime;
 
-	if (!event || perf_event_read_local(event, &count, NULL, NULL)) {
+	if (!event || !max_khz || perf_event_read_local(event, &count, NULL, NULL)) {
 		ms->last_event = NULL;
 		return;
 	}
@@ -6420,8 +6429,13 @@ static void mem_spread_tick(struct rq *rq, struct task_struct *curr)
 	if (ms->last_event == event && ms->last_switches == rq->nr_switches &&
 	    exec > ms->last_exec + 100 * NSEC_PER_USEC) {
 		unsigned int shift = min(READ_ONCE(sysctl_mem_spread_shift), 8U);
-		u64 rate = div64_u64((count - ms->last_count) * NSEC_PER_USEC,
-				     exec - ms->last_exec);
+		unsigned long freq_khz =
+			(u64)max_khz * arch_scale_freq_capacity(cpu_of(rq)) >>
+			SCHED_CAPACITY_SHIFT;
+		u64 kcycles = mul_u64_u32_div(exec - ms->last_exec,
+					      max_t(u32, freq_khz, 1U),
+					      NSEC_PER_SEC);
+		u64 rate = kcycles ? div64_u64(count - ms->last_count, kcycles) : 0;
 		int avg = se->mem_rate;
 
 		avg += ((int)min_t(u64, rate, U16_MAX) - avg) >> shift;
@@ -6462,17 +6476,36 @@ static struct perf_event *mem_spread_create_event(int cpu)
 	return event;
 }
 
+/* Whether online CPUs span more than one LLC; CPU hotplug lock held. */
+static bool mem_spread_multi_llc(void)
+{
+	int first = cpumask_first(cpu_online_mask);
+	int cpu;
+
+	if (first >= nr_cpu_ids)
+		return false;
+	for_each_online_cpu(cpu) {
+		if (!cpus_share_cache(cpu, first))
+			return true;
+	}
+	return false;
+}
+
 static inline bool mem_spread_wanted(void)
 {
-	return sched_feat(MEM_SPREAD) || READ_ONCE(mem_spread_sample);
+	return (sched_feat(MEM_SPREAD) && mem_spread_multi_llc()) ||
+	       READ_ONCE(mem_spread_sample);
 }
 
 /* Give @cpu its counter if it has none; CPU hotplug lock held. */
 static bool mem_spread_start_cpu(int cpu)
 {
 	struct mem_spread_cpu *ms = per_cpu_ptr(&mem_spread_cpu, cpu);
+	unsigned int max_khz = cpufreq_get_hw_max_freq(cpu);
 	struct perf_event *event;
 
+	if (max_khz)
+		WRITE_ONCE(ms->max_freq_khz, max_khz);
 	if (ms->event)
 		return true;
 	event = mem_spread_create_event(cpu);
@@ -6521,6 +6554,14 @@ static void mem_spread_update_events(struct work_struct *work)
 	}
 }
 
+static DECLARE_WORK(mem_spread_work, mem_spread_update_events);
+
+/* Set up or release the counters after MEM_SPREAD or sample changed. */
+void sched_mem_spread_update(void)
+{
+	schedule_work(&mem_spread_work);
+}
+
 /*
  * CPU hotplug: perf takes CPU-wide events off a CPU that goes offline and
  * does not put them back when it returns, so release the counter before
@@ -6530,8 +6571,12 @@ static void mem_spread_update_events(struct work_struct *work)
  */
 static int mem_spread_cpu_online(unsigned int cpu)
 {
-	if (mem_spread_wanted() && mem_spread_start_cpu(cpu))
-		static_branch_enable_cpuslocked(&sched_mem_sample);
+	if (mem_spread_wanted()) {
+		if (!static_branch_unlikely(&sched_mem_sample))
+			schedule_work(&mem_spread_work);
+		else if (mem_spread_start_cpu(cpu))
+			static_branch_enable_cpuslocked(&sched_mem_sample);
+	}
 	return 0;
 }
 
@@ -6555,13 +6600,26 @@ static int mem_spread_cpu_offline(unsigned int cpu)
 	return 0;
 }
 
-static DECLARE_WORK(mem_spread_work, mem_spread_update_events);
-
-/* Set up or release the counters after MEM_SPREAD or sample changed. */
-void sched_mem_spread_update(void)
+#ifdef CONFIG_CPU_FREQ
+static int mem_spread_cpufreq_notify(struct notifier_block *nb,
+				     unsigned long val, void *data)
 {
-	schedule_work(&mem_spread_work);
+	struct cpufreq_policy *policy = data;
+	int cpu;
+
+	if (val != CPUFREQ_CREATE_POLICY)
+		return NOTIFY_DONE;
+
+	for_each_cpu(cpu, policy->related_cpus)
+		WRITE_ONCE(per_cpu_ptr(&mem_spread_cpu, cpu)->max_freq_khz,
+			   policy->cpuinfo.max_freq);
+	return NOTIFY_DONE;
 }
+
+static struct notifier_block mem_spread_cpufreq_nb = {
+	.notifier_call = mem_spread_cpufreq_notify,
+};
+#endif
 
 /*
  * If MEM_SPREAD is on from boot, set the counters up once the CPU PMU drivers
@@ -6570,13 +6628,18 @@ void sched_mem_spread_update(void)
  */
 static int __init sched_mem_spread_init(void)
 {
-	int ret = cpuhp_setup_state_nocalls(CPUHP_AP_ONLINE_DYN, "sched/mem_spread:online",
-					    mem_spread_cpu_online, mem_spread_cpu_offline);
+	int ret;
 
+#ifdef CONFIG_CPU_FREQ
+	cpufreq_register_notifier(&mem_spread_cpufreq_nb,
+				  CPUFREQ_POLICY_NOTIFIER);
+#endif
+	ret = cpuhp_setup_state_nocalls(CPUHP_AP_ONLINE_DYN, "sched/mem_spread:online",
+					mem_spread_cpu_online, mem_spread_cpu_offline);
 	if (ret < 0)
 		pr_warn("sched: MEM_SPREAD: no CPU hotplug state (%d), CPUs that go offline lose their counter\n",
 			ret);
-	if (mem_spread_wanted())
+	if (sched_feat(MEM_SPREAD) || READ_ONCE(mem_spread_sample))
 		sched_mem_spread_update();
 	return 0;
 }
@@ -6610,8 +6673,9 @@ static int mem_spread_status_show(struct seq_file *m, void *v)
 		struct mem_spread_cpu *ms = per_cpu_ptr(&mem_spread_cpu, cpu);
 		struct task_struct *curr = rcu_dereference(cpu_rq(cpu)->curr);
 
-		seq_printf(m, "cpu%d %s samples %lu curr %d %s rate %u bound %u\n", cpu,
-			   READ_ONCE(ms->event) ? "counting" : "-", READ_ONCE(ms->samples),
+		seq_printf(m, "cpu%d %s max_khz %u samples %lu curr %d %s rate %u bound %u\n",
+			   cpu, READ_ONCE(ms->event) ? "counting" : "-",
+			   READ_ONCE(ms->max_freq_khz), READ_ONCE(ms->samples),
 			   task_pid_nr(curr), curr->comm, READ_ONCE(curr->se.mem_rate),
 			   READ_ONCE(curr->se.mem_bound));
 	}

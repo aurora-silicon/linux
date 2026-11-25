@@ -112,10 +112,12 @@ SCHED_FEAT(FORK_LOCAL, true)
  * Spread memory-bound tasks evenly across LLCs (on Apple SoCs, clusters,
  * whose memory bandwidth is limited per cluster) instead of packing them
  * onto the biggest CPUs; other tasks are placed as usual. Tasks are
- * classified from a per-CPU PMU count of L1D load misses, see
- * mem_spread_tick(); without such a counter nothing changes.
+ * classified from a per-CPU PMU count of L1D load misses normalized per
+ * 1,000 estimated active cycles from each CPU's reported clock frequency,
+ * see mem_spread_tick(); on single-LLC systems or without a supported
+ * counter and clock rate nothing changes.
  */
-SCHED_FEAT(MEM_SPREAD, false)
+SCHED_FEAT(MEM_SPREAD, true)
 
 /*
  * Issue a WARN when we do multiple update_rq_clock() calls
