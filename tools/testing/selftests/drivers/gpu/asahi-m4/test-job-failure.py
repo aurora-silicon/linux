@@ -109,6 +109,7 @@ impl Shared {
         Arc::new(Self{crashed:AtomicBool::new(false),sleeping:AtomicBool::new(false),recovering:AtomicBool::new(false),contended:AtomicBool::new(false),submitted:Mutex::new(vec![]),submit_result:Ok(())})
     }
     fn note_submitter(&self) {}
+    fn wake_publish(&self) {}
     fn submit(&self,job:Arc<Job>)->Result {
         self.submitted.lock().unwrap().push(job.id); self.submit_result
     }

@@ -136,6 +136,33 @@ impl Progress {
     }
 }
 
+/// Resolved in-flight producer target for a hardware ring barrier.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct WaitTarget {
+    stamp: u32,
+    /// True if the waited producer flight carries `InitBM` (buffer-manager initialization).
+    initbm: bool,
+}
+
+/// Selects the hardware ring barrier type for a same-VM handoff.
+///
+/// Unlike G15 (`g15/hw.rs: CROSS_ENGINE_HOLD` — "Never both type 0"), G16 (M4 25G83/26B123)
+/// does not require a software-job hold on one cross-engine direction when neither side
+/// carries `InitBM`. On G16, every stage (CDM, TA, FS) executes its `FINALIZE`
+/// micro-sequence — flushing stage caches to the shared coherent fabric — before firmware
+/// advances `fw_stamp`, so waiting on `fw_stamp` with `BarrierType::Stamp` (type 0) in both
+/// directions (`fs2c` and `c2ta`/`c2fs`) avoids hold bubbles within one VM (same ASID and
+/// UAT page tables). Zero-fault M4 J773g runs (13,873 `fs2c` and 20,506 `c2ta` type-0
+/// handoffs) confirm no GPU wedge or hang, while CTS synchronization / pipeline-barrier
+/// coverage validates producer-to-consumer memory visibility.
+///
+/// Keep `BarrierType::Hold` (type 1) whenever either producer or consumer carries `InitBM`
+/// (checked against both the waited target and any live `InitBM` flight). Cross-VM switches,
+/// recovery paths, and `query_access` CPU-timestamp waits drain `flights` completely first.
+const fn cross_engine_barrier_type(producer_initbm: bool, consumer_initbm: bool) -> BarrierType {
+    BarrierType::from_stamp_only(!producer_initbm && !consumer_initbm)
+}
+
 /// Resolved ring-barrier placement for one render pass (legacy, `FRAGMENT_BARRIERS`, or
 /// `DRM_ASAHI_RENDER_STAGE_PREFIXES`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -1149,6 +1176,9 @@ impl Firmware {
         }
         match command(job, sent) {
             Some(Command::Compute(c)) => {
+                // G16 publishes timestamp results into user query-pool BOs on CPU during flight
+                // retirement, so dispatches without DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS must wait
+                // for prior timestamped flights in their dependency prefix to retire first.
                 let waits_for_timestamps = c.query_access
                     && job.command_order(sent).is_some_and(|o| {
                         let waits_class = |class: usize| {
@@ -1199,17 +1229,17 @@ impl Firmware {
         }
     }
 
-    /// Resolves a same-queue target stamp for `class` (`RENDER` -> `r_fs_stamp`, `COMPUTE` ->
-    /// `cstamp`) when `target_seq` names an in-flight command of `job.queue` or an earlier member
-    /// of an in-progress render batch `current`. Returns `Ok(None)` when no barrier was requested
-    /// or the waited prefix has already retired.
+    /// Resolves a same-queue target stamp and producer `InitBM` state for `class` (`RENDER` ->
+    /// `r_fs_stamp`, `COMPUTE` -> `cstamp`) when `target_seq` names an in-flight command of
+    /// `job.queue` or an earlier member of an in-progress render batch `current`. Returns
+    /// `Ok(None)` when no barrier was requested or the waited prefix has already retired.
     fn wait_stamp_for_with(
         &self,
         job: &Arc<Job>,
         class: usize,
         target_seq: Option<u64>,
         current: Option<&Flight>,
-    ) -> Result<Option<u32>> {
+    ) -> Result<Option<WaitTarget>> {
         let Some(last) = target_seq else {
             return Ok(None);
         };
@@ -1226,7 +1256,10 @@ impl Firmware {
                     if flight.job.command_order(k as u32).is_some_and(|fo| {
                         fo.engine == super::command::COMPUTE && fo.sequence == last
                     }) {
-                        return Ok(Some(*flight.cstamp.get(member).ok_or(EAGAIN)?));
+                        return Ok(Some(WaitTarget {
+                            stamp: *flight.cstamp.get(member).ok_or(EAGAIN)?,
+                            initbm: flight.initbm,
+                        }));
                     }
                     member += 1;
                 }
@@ -1235,7 +1268,10 @@ impl Firmware {
                         if j2.command_order(k).is_some_and(|fo| {
                             fo.engine == super::command::COMPUTE && fo.sequence == last
                         }) {
-                            return Ok(Some(*flight.cstamp.get(member).ok_or(EAGAIN)?));
+                            return Ok(Some(WaitTarget {
+                                stamp: *flight.cstamp.get(member).ok_or(EAGAIN)?,
+                                initbm: flight.initbm,
+                            }));
                         }
                         member += 1;
                     }
@@ -1243,7 +1279,7 @@ impl Firmware {
             }
             return Err(EAGAIN);
         }
-        let find_render = |flight: &Flight| -> Option<u32> {
+        let find_render = |flight: &Flight| -> Option<WaitTarget> {
             if flight.renders == 0 || !Arc::ptr_eq(&flight.job.queue, &job.queue) {
                 return None;
             }
@@ -1255,17 +1291,20 @@ impl Firmware {
                     .command_order(k)
                     .is_some_and(|fo| fo.engine == super::command::RENDER && fo.sequence == last)
                 {
-                    return Some(flight.r_fs_stamp[member]);
+                    return Some(WaitTarget {
+                        stamp: flight.r_fs_stamp[member],
+                        initbm: flight.initbm,
+                    });
                 }
             }
             None
         };
-        if let Some(stamp) = current.and_then(find_render) {
-            return Ok(Some(stamp));
+        if let Some(target) = current.and_then(find_render) {
+            return Ok(Some(target));
         }
         for flight in &self.engine.flights {
-            if let Some(stamp) = find_render(flight) {
-                return Ok(Some(stamp));
+            if let Some(target) = find_render(flight) {
+                return Ok(Some(target));
             }
         }
         Err(EAGAIN)
@@ -1277,15 +1316,20 @@ impl Firmware {
         job: &Arc<Job>,
         class: usize,
         target_seq: Option<u64>,
-    ) -> Result<Option<u32>> {
+    ) -> Result<Option<WaitTarget>> {
         self.wait_stamp_for_with(job, class, target_seq, None)
     }
 
-    /// Resolves a same-queue cross-engine barrier target stamp when `job`'s command `index`
-    /// waits on an in-flight command of `other` engine (`RENDER` -> `fs_target`, `COMPUTE` ->
-    /// `target`). Returns `Ok(None)` when no cross-engine barrier was requested or the waited
-    /// prefix has already retired.
-    fn cross_engine_wait(&self, job: &Arc<Job>, index: u32, other: usize) -> Result<Option<u32>> {
+    /// Resolves a same-queue cross-engine barrier target when `job`'s command `index` waits on
+    /// an in-flight command of `other` engine (`RENDER` -> `r_fs_stamp`, `COMPUTE` -> `cstamp`).
+    /// Returns `Ok(None)` when no cross-engine barrier was requested or the waited prefix has
+    /// already retired.
+    fn cross_engine_wait(
+        &self,
+        job: &Arc<Job>,
+        index: u32,
+        other: usize,
+    ) -> Result<Option<WaitTarget>> {
         let target_seq = job
             .command_order(index)
             .and_then(|o| o.wait_through[other]);
@@ -1825,7 +1869,7 @@ impl Firmware {
             if render {
                 let a = f.pb_slot as usize;
                 f.pb.as_ref().ok_or(EINVAL)?.expose();
-                job.resources.commit_render();
+                job.resources.commit_render(f.renders);
                 job.resources
                     .publish_pb_batch(a, f.uma_submitted, f.renders)?;
                 self.pools.publish_flight(a);
@@ -2086,25 +2130,36 @@ impl Firmware {
             )?;
         }
         let wait_render = self.cross_engine_wait(job, cmd_index, super::command::RENDER)?;
-        if let Some(wait_fs) = wait_render {
+        let fs2c_bar = if let Some(wait_fs) = wait_render {
+            // Check producer InitBM explicitly in addition to the scheduler drain guard so
+            // FS -> CDM handoff: downgrade to `BarrierType::Stamp` (type 0) only when neither
+            // the waited render nor any live flight carries `InitBM`; G16 FS `FINALIZE` flushes
+            // caches before advancing `fw_stamp[1]` (see `cross_engine_barrier_type`).
+            let producer_initbm = wait_fs.initbm || self.engine.flights.iter().any(|fl| fl.initbm);
+            let bar_type = cross_engine_barrier_type(producer_initbm, false);
             let bar = encode::barrier(
                 self.graph.render.fw_stamp[1].va,
-                wait_fs,
+                wait_fs.stamp,
                 0x71,
                 target,
                 0,
-                BarrierType::Hold,
+                bar_type,
             );
             s.barrier.write(0, &bar)?;
-        }
+            Some((wait_fs.stamp, bar_type))
+        } else {
+            None
+        };
         f.uma_submitted = submitted;
         f.csubmitted[member] = submitted;
         f.has_timestamps |= !cmd.timestamp_outputs.is_empty();
         wmb();
-        if let Some(wait_fs) = wait_render {
+        if let Some((wait_fs, bar_type)) = fs2c_bar {
             g.ring.w64(8 * pf.c_head as usize, s.barrier.va)?;
             pf.c_head = (pf.c_head + 1) % sizes::QUEUE_CAP;
-            self.engine.stats.fs2c0 += 1;
+            if bar_type == BarrierType::Stamp {
+                self.engine.stats.fs2c0 += 1;
+            }
             f.cwait[member] = wait_fs;
         } else {
             f.cwait[member] = 0;
@@ -2177,8 +2232,11 @@ impl Firmware {
             params::early_tiling(),
             prev_fs,
             order.is_some_and(|o| o.wait_through[super::command::RENDER].is_none()),
-            ta_wait_fs,
-            [ta_wait_compute, fs_wait_compute],
+            ta_wait_fs.map(|w| w.stamp),
+            [
+                ta_wait_compute.map(|w| w.stamp),
+                fs_wait_compute.map(|w| w.stamp),
+            ],
         );
         // Claim performs only a qualified per-use scrub, never allocator/list reset.
         self.slots
@@ -2292,17 +2350,23 @@ impl Firmware {
             r.ring[0].w64(8 * pf.ta_head as usize, epoch.initbm.va)?;
             pf.ta_head = (pf.ta_head + 1) % cap;
         }
+        // Pipelined same-VM render->render and cross-engine (CDM->TA, CDM->FS) barriers use
+        // `BarrierType::Stamp` (type 0) only when neither producer, any live flight, nor this
+        // consumer carries `InitBM`: G16 `FINALIZE` flushes producer caches before advancing
+        // `fw_stamp` (unlike G15's `CROSS_ENGINE_HOLD`; see `cross_engine_barrier_type`).
+        // Cross-VM transitions and recovery paths drain completely before publishing.
+        let producer_initbm = pf.initbm
+            || self.engine.flights.iter().any(|fl| fl.initbm)
+            || ta_wait_compute.is_some_and(|w| w.initbm)
+            || fs_wait_compute.is_some_and(|w| w.initbm)
+            || ta_wait_fs.is_some_and(|w| w.initbm);
+        let render_bar = cross_engine_barrier_type(producer_initbm, init_buffer);
         // When pipelining behind an in-flight or same-batch same-VM render, insert explicit
         // hardware ordering barriers on the TA/FS rings. Fragment-only, barrier-free, or staged
         // renders whose TA prefix stops before the prior FS overlap TA(N) with FS(N-1) (TA waits
         // on prior TA plus any older in-flight FS named by `ta_wait_through`; FS waits on prior
         // FS then own TA); otherwise TA(N) waits on prior FS to preserve full vertex visibility.
         if has_prior_render {
-            // Pipelined same-VM non-InitBM render->render barriers wait on the producer's
-            // firmware stamp only (type 0), matching `own_barrier` and G15's
-            // `RENDER_INTERNAL_HOLD = 0`, so consecutive TA/FS stages hand off without a
-            // software-job hold bubble. Cross-engine barriers (`fs2c`/`c2ta`) stay `Hold`.
-            let render_bar = BarrierType::from_stamp_only(!init_buffer);
             let (wait_va, wait_stamp, wait_event) = if plan.early {
                 (r.fw_stamp[0].va, prev_ta, 0x70)
             } else {
@@ -2354,12 +2418,14 @@ impl Firmware {
                 15,
                 target,
                 work::barrier::RENDER_WAIT_UUID,
-                BarrierType::Hold,
+                render_bar,
             );
             p.compute_barrier.write(0, &cbar)?;
             r.ring[0].w64(8 * pf.ta_head as usize, p.compute_barrier.va)?;
             pf.ta_head = (pf.ta_head + 1) % cap;
-            self.engine.stats.c2ta0 += 1;
+            if render_bar == BarrierType::Stamp {
+                self.engine.stats.c2ta0 += 1;
+            }
         }
         if let Some(wait_c) = plan.fs_compute_wait {
             let fcbar = encode::barrier(
@@ -2368,12 +2434,14 @@ impl Firmware {
                 15,
                 target,
                 work::barrier::RENDER_WAIT_UUID,
-                BarrierType::Hold,
+                render_bar,
             );
             p.fs_compute_barrier.write(0, &fcbar)?;
             r.ring[1].w64(8 * pf.fs_head as usize, p.fs_compute_barrier.va)?;
             pf.fs_head = (pf.fs_head + 1) % cap;
-            self.engine.stats.c2ta0 += 1;
+            if render_bar == BarrierType::Stamp {
+                self.engine.stats.c2ta0 += 1;
+            }
         }
         // The paired fragment always requires the native explicit TA dependency.
         let own = encode::barrier(

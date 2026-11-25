@@ -45,15 +45,31 @@ assert 'const COMPUTE_SLOTS: usize = COMPUTE_UNITS;' in hw_src
 assert 'const HORIZON_JOBS: u32 = COMPUTE_UNITS as u32;' in hw_src
 prefix_render_fn = item('fn prefix_render(')
 prefix_compute_fn = item('fn prefix_compute(')
-assert 'let render_bar = BarrierType::from_stamp_only(!init_buffer);' in prefix_render_fn
-assert prefix_render_fn.count('render_bar,') == 3, prefix_render_fn
+can_queue_behind_fn = item('fn can_queue_behind(')
+assert 'let render_bar = cross_engine_barrier_type(producer_initbm, init_buffer);' in prefix_render_fn
+assert (
+    prefix_render_fn.index('let render_bar = cross_engine_barrier_type(producer_initbm, init_buffer);')
+    < prefix_render_fn.rindex('if has_prior_render')
+), 'render_bar must be hoisted ahead of has_prior_render for c2ta/c2fs barriers'
+assert prefix_render_fn.count('render_bar,') == 5, prefix_render_fn
 assert 'p.ta_fs_barrier.write(0, &ta_fs)?;' in prefix_render_fn
 assert 'p.compute_barrier.write(0, &cbar)?;' in prefix_render_fn
 assert 'p.fs_compute_barrier.write(0, &fcbar)?;' in prefix_render_fn
-assert 'BarrierType::Hold,' in prefix_render_fn[prefix_render_fn.index('plan.ta_compute_wait'):prefix_render_fn.index('p.compute_barrier.write')]
-assert 'BarrierType::Hold,' in prefix_render_fn[prefix_render_fn.index('plan.fs_compute_wait'):prefix_render_fn.index('p.fs_compute_barrier.write')]
+c2ta_slice = prefix_render_fn[
+    prefix_render_fn.index('plan.ta_compute_wait'):prefix_render_fn.index('p.compute_barrier.write')
+]
+c2fs_slice = prefix_render_fn[
+    prefix_render_fn.index('plan.fs_compute_wait'):prefix_render_fn.index('p.fs_compute_barrier.write')
+]
+fs2c_slice = prefix_compute_fn[
+    prefix_compute_fn.index('wait_render'):prefix_compute_fn.index('s.barrier.write')
+]
+assert 'render_bar,' in c2ta_slice and 'BarrierType::Hold' not in c2ta_slice
+assert 'render_bar,' in c2fs_slice and 'BarrierType::Hold' not in c2fs_slice
 assert 'BarrierType::Stamp,' in prefix_render_fn[prefix_render_fn.index('let own = encode::barrier'):prefix_render_fn.index('p.own_barrier.write')]
-assert 'BarrierType::Hold,' in prefix_compute_fn[prefix_compute_fn.index('wait_render'):prefix_compute_fn.index('s.barrier.write')]
+assert 'cross_engine_barrier_type(producer_initbm, false)' in fs2c_slice
+assert 'bar_type,' in fs2c_slice and 'BarrierType::Hold' not in fs2c_slice
+assert 'let waits_for_timestamps = c.query_access' in can_queue_behind_fn
 assert 'DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2' in params_src
 
 
@@ -518,6 +534,19 @@ mod queue_behind_scope {
         }
     }
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    enum BarrierType {
+        Stamp = 0,
+        Hold = 1,
+    }
+    impl BarrierType {
+        const fn from_stamp_only(stamp_only: bool) -> Self {
+            if stamp_only { Self::Stamp } else { Self::Hold }
+        }
+    }
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    __WAIT_TARGET__
+    __CROSS_ENGINE_BARRIER_TYPE__
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     __RENDER_BARRIER_PLAN__
     __PLAN_RENDER_BARRIERS__
     impl QueueBehindHost {
@@ -666,8 +695,8 @@ mod queue_behind_scope {
             pools:QueueBehindPools{exhausted:false,can_pipeline:true},
         };
         // Same-queue FS -> CDM barrier resolves render's fs_target; CDM -> TA resolves compute's target.
-        assert_eq!(p.cross_engine_wait(&c1,0,command::RENDER),Ok(Some(0x500)));
-        assert_eq!(p.cross_engine_wait(&r2_after_c1,0,command::COMPUTE),Ok(Some(0x700)));
+        assert_eq!(p.cross_engine_wait(&c1,0,command::RENDER),Ok(Some(WaitTarget{stamp:0x500,initbm:false})));
+        assert_eq!(p.cross_engine_wait(&r2_after_c1,0,command::COMPUTE),Ok(Some(WaitTarget{stamp:0x700,initbm:false})));
         // No-barrier / independent-queue submits emit no cross-engine barrier.
         assert_eq!(p.cross_engine_wait(&c_nobarrier,0,command::RENDER),Ok(None));
         assert_eq!(p.cross_engine_wait(&c_other_q,0,command::RENDER),Ok(None));
@@ -700,9 +729,46 @@ mod queue_behind_scope {
             slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
             pools:QueueBehindPools{exhausted:false,can_pipeline:true},
         };
-        assert_eq!(pm.cross_engine_wait(&r_wait_c2,0,command::COMPUTE),Ok(Some(0x200)));
-        assert_eq!(pm.cross_engine_wait(&r_wait_c3,0,command::COMPUTE),Ok(Some(0x300)));
+        assert_eq!(pm.cross_engine_wait(&r_wait_c2,0,command::COMPUTE),Ok(Some(WaitTarget{stamp:0x200,initbm:false})));
+        assert_eq!(pm.cross_engine_wait(&r_wait_c3,0,command::COMPUTE),Ok(Some(WaitTarget{stamp:0x300,initbm:false})));
         assert_eq!(pm.cross_engine_wait(&r_wait_missing,0,command::COMPUTE),Err(EAGAIN));
+    }
+    #[test]fn cross_engine_barrier_keeps_hold_when_producer_or_consumer_carries_initbm(){
+        // Healthy same-VM non-InitBM handoffs downgrade to BarrierType::Stamp (type 0).
+        assert_eq!(cross_engine_barrier_type(false, false), BarrierType::Stamp);
+        // Any InitBM on either producer (including FS -> CDM) or consumer keeps BarrierType::Hold.
+        assert_eq!(cross_engine_barrier_type(true, false), BarrierType::Hold);
+        assert_eq!(cross_engine_barrier_type(false, true), BarrierType::Hold);
+        assert_eq!(cross_engine_barrier_type(true, true), BarrierType::Hold);
+
+        // Verify wait_stamp_for_with / cross_engine_wait propagate producer flight.initbm.
+        let vm1=Arc::new(Vm{status:Status(AtomicU32::new(0)),slot:1});
+        let q1=Arc::new(Queue{turn:AtomicU64::new(0),priority:0,completed:[AtomicU64::new(0),AtomicU64::new(0)]});
+        let mk=|id:u32,render:bool,seq:u64,wait:[Option<u64>;2]|Arc::new(QueueBehindJob{
+            id,vm:vm1.clone(),queue:q1.clone(),
+            progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
+            commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access:false})}],
+            order:Order{engine:if render{command::RENDER}else{command::COMPUTE},sequence:seq,wait_through:wait},
+            extra_orders:vec![],dependency:Ok(()),resources:Resources,
+        });
+        let r_initbm=mk(1,true,1,[None,None]);
+        let c_after_r=mk(2,false,1,[Some(1),None]);
+        let r_after_r=mk(3,true,2,[Some(1),None]);
+        let host=QueueBehindHost{
+            engine:QueueBehindEngine{ordinal:1,draw:1,flights:vec![QueueBehindFlight{
+                job:r_initbm,group:vec![],first:0,count:1,computes:0,renders:1,target:0,
+                cstamp:[0;16],r_fs_stamp:{let mut a=[0;16];a[0]=0x900;a},fs_target:0x900,
+                initbm:true,has_timestamps:false,doomed:false,recovery_suspect:false,
+            }]},
+            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
+            pools:QueueBehindPools{exhausted:false,can_pipeline:true},
+        };
+        let fs2c = host.cross_engine_wait(&c_after_r, 0, command::RENDER).unwrap().unwrap();
+        assert_eq!(fs2c, WaitTarget { stamp: 0x900, initbm: true });
+        assert_eq!(cross_engine_barrier_type(fs2c.initbm, false), BarrierType::Hold);
+        let r2r = host.wait_stamp_for(&r_after_r, command::RENDER, Some(1)).unwrap().unwrap();
+        assert_eq!(r2r, WaitTarget { stamp: 0x900, initbm: true });
+        assert_eq!(cross_engine_barrier_type(r2r.initbm, false), BarrierType::Hold);
     }
     #[test]fn publish_checked_uses_transport_without_repeating_session_check(){
         let mut fw=firmware(vec![job(1,false,0,Ok(()))],vec![(Ok(()),true)]);
@@ -778,8 +844,8 @@ mod queue_behind_scope {
             slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
             pools:QueueBehindPools{exhausted:false,can_pipeline:true},
         };
-        assert_eq!(p.cross_engine_wait(&r_wait_c2,0,command::COMPUTE),Ok(Some(0x200)));
-        assert_eq!(p.cross_engine_wait(&r_wait_c3,0,command::COMPUTE),Ok(Some(0x300)));
+        assert_eq!(p.cross_engine_wait(&r_wait_c2,0,command::COMPUTE),Ok(Some(WaitTarget{stamp:0x200,initbm:false})));
+        assert_eq!(p.cross_engine_wait(&r_wait_c3,0,command::COMPUTE),Ok(Some(WaitTarget{stamp:0x300,initbm:false})));
         // Active computes sum flight.computes: 16 batched computes saturates compute_flights().
         assert!(p.can_queue_behind(&c4));
         p.engine.flights[0].computes=16;
@@ -818,9 +884,9 @@ mod queue_behind_scope {
             pools:QueueBehindPools{exhausted:false,can_pipeline:true},
         };
         // Lookup into published multi-pass render flight resolves interior and tail passes.
-        assert_eq!(p.wait_stamp_for(&next_r,command::RENDER,Some(1)),Ok(Some(0x100)));
-        assert_eq!(p.wait_stamp_for(&next_r,command::RENDER,Some(2)),Ok(Some(0x200)));
-        assert_eq!(p.wait_stamp_for(&next_r,command::RENDER,Some(3)),Ok(Some(0x300)));
+        assert_eq!(p.wait_stamp_for(&next_r,command::RENDER,Some(1)),Ok(Some(WaitTarget{stamp:0x100,initbm:false})));
+        assert_eq!(p.wait_stamp_for(&next_r,command::RENDER,Some(2)),Ok(Some(WaitTarget{stamp:0x200,initbm:false})));
+        assert_eq!(p.wait_stamp_for(&next_r,command::RENDER,Some(3)),Ok(Some(WaitTarget{stamp:0x300,initbm:false})));
         assert_eq!(p.wait_stamp_for(&next_r,command::RENDER,Some(4)),Err(EAGAIN));
         // Lookup against an in-progress same-batch flight resolves earlier pass before publish.
         let mut cur_fs=[0u32;16];
@@ -829,7 +895,7 @@ mod queue_behind_scope {
             job:next_r.clone(),group:vec![],first:0,count:1,computes:0,renders:1,target:0,cstamp:[0;16],r_fs_stamp:cur_fs,fs_target:0x400,
             initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false,
         };
-        assert_eq!(p.wait_stamp_for_with(&next_r,command::RENDER,Some(4),Some(&cur)),Ok(Some(0x400)));
+        assert_eq!(p.wait_stamp_for_with(&next_r,command::RENDER,Some(4),Some(&cur)),Ok(Some(WaitTarget{stamp:0x400,initbm:false})));
         // Active renders sum flight.renders: 15 batched renders saturates render_flights().
         assert!(p.can_queue_behind(&next_r));
         p.engine.flights[0].renders=15;
@@ -1362,6 +1428,8 @@ for token, declaration in {
     '__WAIT_STAMP_FOR_WITH__': 'fn wait_stamp_for_with(',
     '__WAIT_STAMP_FOR__': 'fn wait_stamp_for(',
     '__CROSS_ENGINE_WAIT__': 'fn cross_engine_wait(',
+    '__WAIT_TARGET__': 'struct WaitTarget {',
+    '__CROSS_ENGINE_BARRIER_TYPE__': 'const fn cross_engine_barrier_type(',
     '__RENDER_BARRIER_PLAN__': 'struct RenderBarrierPlan {',
     '__PLAN_RENDER_BARRIERS__': 'fn plan_render_barriers(',
 }.items():
@@ -1378,7 +1446,7 @@ for command in [rustc() + ['--edition=2021', '--test', str(unit), '-o', str(outp
     if result.returncode:
         raise SystemExit(result.returncode)
 (output/'publication.json').write_text(json.dumps({
-    'passed': True, 'tests': 60, 'cpu_only': True, 'hardware_execution': False,
+    'passed': True, 'tests': 61, 'cpu_only': True, 'hardware_execution': False,
     'scope': 'Verbatim production publication wrapper, selection, error isolation and descriptor-error containment branch; wire encoder, descriptor failure injection and transport replaced by CPU recorders.',
     'source_sha256': sha(production),
 }, indent=2)+'\n')

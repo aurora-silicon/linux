@@ -156,7 +156,7 @@ impl PassSlot {
     /// Allocates pass slot `i`'s objects, with their client leaf classes.
     pub(crate) fn new(o: &mut Objects, i: u64, pre_records: u32) -> Result<Self> {
         let sh = Class::Shared;
-        let (ps, ws) = (i * client::PASS_STRIDE, i * client::WORK_STRIDE);
+        let off = client::pass_off(i);
         let tpc = if i >= sizes::BASE_RENDER_SLOTS as u64 {
             client::TPC_SLOT_SIZE
         } else {
@@ -169,32 +169,25 @@ impl PassSlot {
         };
         let _ = pre_records;
 
-        let aux = alloc(
-            o,
-            0x20000,
-            sh,
-            Client::nc(client::AUX + i * client::AUX_STRIDE),
-            0,
-            false,
-        )?;
+        let aux = alloc(o, 0x20000, sh, Client::nc(client::AUX + off), 0, false)?;
         let mut pre = KVec::with_capacity(3, GFP_KERNEL)?;
         pre.push(
-            alloc(o, 0x4000, sh, Client::nc(client::PRE0_PAGE + ps), 0, false)?,
+            alloc(o, 0x4000, sh, Client::nc(client::PRE0_PAGE + off), 0, false)?,
             GFP_KERNEL,
         )?;
         pre.push(
-            alloc(o, 0x4000, sh, Client::nc(client::PRE1_PAGE + ps), 0, false)?,
+            alloc(o, 0x4000, sh, Client::nc(client::PRE1_PAGE + off), 0, false)?,
             GFP_KERNEL,
         )?;
         pre.push(
-            alloc(o, 0x4000, sh, Client::nc(client::PRE2_PAGE + ps), 0, false)?,
+            alloc(o, 0x4000, sh, Client::nc(client::PRE2_PAGE + off), 0, false)?,
             GFP_KERNEL,
         )?;
         let tpc = alloc(
             o,
             tpc as usize,
             sh,
-            Client::nc(client::TPC + i * client::TPC_SLOT_STRIDE),
+            Client::nc(client::TPC + off),
             0,
             false,
         )?;
@@ -202,7 +195,7 @@ impl PassSlot {
             o,
             tilemap as usize,
             sh,
-            Client::nc(client::TILEMAP + i * client::TPC_SLOT_STRIDE),
+            Client::nc(client::pass_tilemap(i)),
             0,
             false,
         )?;
@@ -210,7 +203,7 @@ impl PassSlot {
             o,
             0x4000,
             sh,
-            Client::nc(client::HEAP_META_PAGE + ps),
+            Client::nc(client::HEAP_META_PAGE + off),
             0,
             false,
         )?;
@@ -218,7 +211,7 @@ impl PassSlot {
             o,
             0x10000,
             sh,
-            Client::nc(client::SCENE_USER + ps),
+            Client::nc(client::SCENE_USER + off),
             0,
             false,
         )?;
@@ -226,7 +219,7 @@ impl PassSlot {
             o,
             super::fw::buffer::SCENE_LIST_SIZE,
             sh,
-            Client::nc(client::SCENE_LIST + ps),
+            Client::nc(client::SCENE_LIST + off),
             0,
             false,
         )?;
@@ -234,20 +227,20 @@ impl PassSlot {
             o,
             0x10000,
             sh,
-            Client::nc(client::FS_SCRATCH + ps),
+            Client::nc(client::FS_SCRATCH + off),
             0,
             false,
         )?;
         let fs_work = alloc_work(
             o,
             fs::WORK_SIZE,
-            client::FS_WORK_PAGE + ws,
+            client::FS_WORK_PAGE + off,
             client::FS_WORK_OFF as usize,
         )?;
         let ta_work = alloc_work(
             o,
             ta::WORK_SIZE,
-            client::TA_WORK_PAGE + ws,
+            client::TA_WORK_PAGE + off,
             client::TA_WORK_OFF as usize,
         )?;
         Ok(Self {
@@ -446,7 +439,7 @@ pub(crate) struct ComputeOwners {
 }
 
 /// Bitmask of valid render pass slot indices (`0..sizes::RENDER_SLOTS`).
-const PASS_MASK: u32 = (1u32 << sizes::RENDER_SLOTS) - 1;
+const PASS_MASK: u32 = u32::MAX >> (32 - sizes::RENDER_SLOTS);
 
 /// Shared atomic coordination between `Shared::state` slot selection/claims and off-lock
 /// pre-scrubbing of displaced render pass slots.
@@ -455,8 +448,14 @@ struct ScrubState {
     scrubbing: AtomicU32,
     /// Displaced pass slots whose clean same-VM spans were zeroed off-lock.
     clean_mask: AtomicU32,
+    /// Incremented by [`Self::clear_all_clean`] on recovery so an in-flight async scrub that
+    /// started before recovery can never publish a stale `clean_mask` bit afterwards.
+    generation: AtomicU64,
     /// Set if slot selection found eligible slots blocked only by an in-flight off-lock scrub.
     waiter: AtomicBool,
+    /// Set when an off-lock scrub finished while `waiter` was pending so the next `poll_step()`
+    /// retries `publish_checked()` even if no flight retired.
+    woke: AtomicBool,
     /// Off-lock scrub counters folded into [`SlotStats`] on subsequent locked access.
     pass_scrubs: AtomicU64,
     tilemap_clear_bytes: AtomicU64,
@@ -467,7 +466,9 @@ impl ScrubState {
         Self {
             scrubbing: AtomicU32::new(0),
             clean_mask: AtomicU32::new(0),
+            generation: AtomicU64::new(0),
             waiter: AtomicBool::new(false),
+            woke: AtomicBool::new(false),
             pass_scrubs: AtomicU64::new(0),
             tilemap_clear_bytes: AtomicU64::new(0),
         }
@@ -491,7 +492,8 @@ impl ScrubState {
     }
 
     fn clear_all_clean(&self) {
-        self.clean_mask.store(0, Ordering::Release);
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.clean_mask.store(0, Ordering::SeqCst);
     }
 }
 
@@ -500,16 +502,21 @@ pub(crate) struct PendingScrub {
     slot: usize,
     arena: super::resources::PassOwnerArena,
     state: Arc<ScrubState>,
+    generation: u64,
     done: bool,
 }
 
 impl PendingScrub {
-    fn run_one(&mut self) -> bool {
+    pub(crate) fn run_one(&mut self) -> bool {
         let bit = 1u32 << self.slot;
-        let ok = if let Some((pass, tilemap_dirty)) = self.arena.pass_and_tilemap_dirty(self.slot) {
+        let ok = if self.state.generation.load(Ordering::Acquire) != self.generation {
+            false
+        } else if let Some((pass, tilemap_dirty)) = self.arena.pass_and_tilemap_dirty(self.slot) {
             let dirty = tilemap_dirty.load(Ordering::Acquire);
             match pass.scrub_clean(1, dirty) {
                 Ok(()) => {
+                    // Order scrubbed WC bytes before clearing dirty / publishing clean_mask.
+                    super::engine::wmb();
                     tilemap_dirty.store(0, Ordering::Release);
                     self.state.pass_scrubs.fetch_add(1, Ordering::Relaxed);
                     self.state
@@ -522,12 +529,19 @@ impl PendingScrub {
         } else {
             false
         };
-        if ok {
-            self.state.clean_mask.fetch_or(bit, Ordering::Release);
+        if ok && self.state.generation.load(Ordering::SeqCst) == self.generation {
+            self.state.clean_mask.fetch_or(bit, Ordering::SeqCst);
+            if self.state.generation.load(Ordering::SeqCst) != self.generation {
+                self.state.clean_mask.fetch_and(!bit, Ordering::SeqCst);
+            }
         }
         self.state.scrubbing.fetch_and(!bit, Ordering::SeqCst);
         self.done = true;
-        self.state.waiter.swap(false, Ordering::SeqCst)
+        let woke = self.state.waiter.swap(false, Ordering::SeqCst);
+        if woke {
+            self.state.woke.store(true, Ordering::Release);
+        }
+        woke
     }
 }
 
@@ -554,6 +568,10 @@ impl ScrubBatch {
         }
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     fn push(&mut self, item: PendingScrub) -> bool {
         if self.len >= sizes::RENDER_SLOTS {
             return false;
@@ -562,16 +580,45 @@ impl ScrubBatch {
         self.len += 1;
         true
     }
+}
 
-    /// Runs every staged off-lock pass scrub. Returns `true` if a waiting submitter needs wakeup.
-    pub(crate) fn run(mut self) -> bool {
-        let mut wake = false;
-        for slot in &mut self.items[..self.len] {
-            if let Some(mut item) = slot.take() {
-                wake |= item.run_one();
+/// Zero-allocation slot-indexed queue handed to the async pass-scrub workqueue.
+///
+/// Each pass slot `0..sizes::RENDER_SLOTS` keeps its `scrubbing` bit set while a
+/// [`PendingScrub`] is queued or running, so at most one entry per slot exists at once.
+pub(crate) struct ScrubQueue {
+    slots: [Option<PendingScrub>; sizes::RENDER_SLOTS],
+}
+
+impl ScrubQueue {
+    pub(crate) const fn new() -> Self {
+        Self {
+            slots: [const { None }; sizes::RENDER_SLOTS],
+        }
+    }
+
+    /// Moves every staged scrub from `batch` into the queue. Returns `true` if any was queued.
+    pub(crate) fn push_batch(&mut self, mut batch: ScrubBatch) -> bool {
+        let mut pushed = false;
+        for slot in &mut batch.items[..batch.len] {
+            if let Some(item) = slot.take() {
+                let idx = item.slot;
+                self.slots[idx] = Some(item);
+                pushed = true;
             }
         }
-        wake
+        batch.len = 0;
+        pushed
+    }
+
+    /// Pops the next queued pass scrub, if any.
+    pub(crate) fn pop(&mut self) -> Option<PendingScrub> {
+        for slot in &mut self.slots {
+            if slot.is_some() {
+                return slot.take();
+            }
+        }
+        None
     }
 }
 
@@ -732,6 +779,10 @@ impl Slots {
     pub(crate) fn scrubbing_active(&self) -> bool {
         self.scrub.scrubbing.load(Ordering::Acquire) != 0
     }
+    /// Consumes the wakeup flag set when an off-lock scrub unblocks a waiting render submitter.
+    pub(crate) fn take_scrub_woke(&self) -> bool {
+        self.scrub.woke.swap(false, Ordering::AcqRel)
+    }
     /// Total pass scrubs including completed off-lock pre-scrubs.
     pub(crate) fn pass_scrubs_total(&self) -> u64 {
         self.stats
@@ -774,10 +825,12 @@ impl Slots {
                 continue;
             };
             self.scrub.scrubbing.fetch_or(bit, Ordering::SeqCst);
+            let generation = self.scrub.generation.load(Ordering::Acquire);
             let item = PendingScrub {
                 slot: k,
                 arena,
                 state: self.scrub.clone(),
+                generation,
                 done: false,
             };
             if !self.render.staged.push(item) {

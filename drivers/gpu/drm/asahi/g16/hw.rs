@@ -640,17 +640,23 @@ pub(crate) mod client {
     pub(crate) const PB_PAGE_LIST: u64 = 0x7012040000;
     pub(crate) const PB_PAGE_LIST_SIZE: u64 = 0x8000;
 
-    // Host-chosen client VA layout for render pass slots within 0x7020000000..0x7040000000
-    // (512 MiB). Firmware takes explicit 64-bit VAs for each pass object rather than
-    // indexing by stride. One pass slot spans +0x0..+0x1c00000 (28 MiB: TILEMAP at +0x1400000
-    // plus TILEMAP_SIZE = 0x800000), rounded up to a 32 MiB power-of-two stride (4 MiB guard)
-    // so 16 slots fill the 512 MiB window (matching COMPUTE_UNITS = 16).
+    // Host-chosen client VA layout for render pass resources within 0x7020000000..0x7040000000
+    // (512 MiB). Firmware takes explicit 64-bit VAs for each pass object rather than indexing
+    // by stride:
+    // - Base slots `0..BASE_RENDER_SLOTS` keep 32 MiB intervals with full 16 MiB TPC / 8 MiB
+    //   tilemap capacity for worst-case geometries.
+    // - Extension slots `BASE_RENDER_SLOTS..RENDER_SLOTS` pack into 8 MiB intervals starting at
+    //   `EXT_PASS_BASE` (`0x7024000000`) with 2 MiB TPC / 1 MiB tilemap capacity, fitting 32
+    //   total pass slots (`0x7020000000..0x7033000000`, leaving 208 MiB free below 0x7040000000).
     pub(crate) const FS_WORK_PAGE: u64 = 0x7020000000;
     pub(crate) const FS_WORK_OFF: u64 = 0;
     pub(crate) const TA_WORK_PAGE: u64 = 0x7020004000;
     pub(crate) const TA_WORK_OFF: u64 = 0;
     pub(crate) const WORK_STRIDE: u64 = 0x02000000;
     pub(crate) const PASS_STRIDE: u64 = WORK_STRIDE;
+    pub(crate) const EXT_PASS_STRIDE: u64 = 0x00800000;
+    pub(crate) const EXT_PASS_BASE: u64 =
+        FS_WORK_PAGE + (super::sizes::BASE_RENDER_SLOTS as u64) * PASS_STRIDE;
     pub(crate) const PRE0_PAGE: u64 = 0x7020080000;
     pub(crate) const PRE1_PAGE: u64 = 0x70200a0000;
     pub(crate) const PRE2_PAGE: u64 = 0x70200c0000;
@@ -669,6 +675,27 @@ pub(crate) mod client {
     pub(crate) const TPC_SLOT_SIZE: u64 = 0x200000;
     pub(crate) const TILEMAP_SLOT_SIZE: u64 = 0x100000;
     pub(crate) const TPC_SLOT_STRIDE: u64 = WORK_STRIDE;
+    pub(crate) const EXT_TILEMAP_OFF: u64 = (TPC - FS_WORK_PAGE) + TPC_SLOT_SIZE;
+
+    pub(crate) const fn pass_base(i: u64) -> u64 {
+        if i < super::sizes::BASE_RENDER_SLOTS as u64 {
+            FS_WORK_PAGE + i * PASS_STRIDE
+        } else {
+            EXT_PASS_BASE + (i - super::sizes::BASE_RENDER_SLOTS as u64) * EXT_PASS_STRIDE
+        }
+    }
+
+    pub(crate) const fn pass_off(i: u64) -> u64 {
+        pass_base(i) - FS_WORK_PAGE
+    }
+
+    pub(crate) const fn pass_tilemap(i: u64) -> u64 {
+        if i < super::sizes::BASE_RENDER_SLOTS as u64 {
+            TILEMAP + i * PASS_STRIDE
+        } else {
+            pass_base(i) + EXT_TILEMAP_OFF
+        }
+    }
     pub(crate) const CT: u64 = 0x7080000000;
     pub(crate) const CT_STRIDE: u64 = 0x1000000;
     pub(crate) const CT_SIZE: u64 = 0x400000;
@@ -695,12 +722,27 @@ pub(crate) mod sizes {
         assert!(super::client::render_descriptor(3) + 0x4000 <= super::client::FS_WORK_PAGE);
     const _: () =
         assert!(super::client::render_descriptor(5) + 0x4000 <= super::client::render_base(0));
+    /// Worst-case firmware work-ring entries consumed per pipelined render pass on TA
+    /// (`prev_barrier`, `ta_fs_barrier`, `compute_barrier`, `ta_work`) and FS (`fs_dep`,
+    /// `fs_compute_barrier`, `own_barrier`, `fs_work`). `InitBM` runs only on an idle engine
+    /// (`initbm` + `ta_work` = 2 entries).
+    pub(crate) const MAX_RENDER_RING_ENTRIES: usize = 4;
+    /// Worst-case firmware work-ring entries per compute command (`fs2c` barrier + `work`).
+    pub(crate) const MAX_COMPUTE_RING_ENTRIES: usize = 2;
     /// Base render pass slots allocated on first render (full TPC/tilemap capacity).
     pub(crate) const BASE_RENDER_SLOTS: usize = 2;
-    /// Retained render pass slots per VM at most (host client-VA budget: 512 MiB / 32 MiB
-    /// stride = 16, not a firmware limit). A slot is reused only after a later render retired
-    /// (displacing it), so `n` slots keep up to `n - 1` renders in flight.
-    pub(crate) const RENDER_SLOTS: usize = 16;
+    /// Retained render pass slots per VM at most. A slot is reused only after a later render
+    /// retired (displacing it), so `n` slots keep up to `n - 1` renders in flight.
+    ///
+    /// Sized inside both the host client-VA window (`0x7020000000..0x7040000000`) and firmware
+    /// queue/recovery capacities: `31` in-flight passes consume at most `31 * 4 = 124` entries of
+    /// each 256-entry TA/FS work ring (`QUEUE_CAP = 256`, 255 usable), share hardware UMA slot
+    /// `RENDER_UMA_SLOT` (33) via the active PB/UMA descriptor, post at most `FLIGHTS = 32`
+    /// `SubmitRecord`s (vs `AHEAD_RECORDS = 128` / `RING_SLOTS = 256`), and stay far below the
+    /// firmware recovery `snapshot_entries = 448` limit.
+    pub(crate) const RENDER_SLOTS: usize = 32;
+    const _: () = assert!(RENDER_SLOTS >= BASE_RENDER_SLOTS && RENDER_SLOTS <= 32);
+    const _: () = assert!((RENDER_SLOTS - 1) * MAX_RENDER_RING_ENTRIES < QUEUE_CAP as usize);
     const _: () = assert!(super::client::AUX + 0x20000 <= super::client::SCENE_LIST);
     const _: () = assert!(super::client::SCENE_LIST + 0x4000 <= super::client::TPC);
     const _: () = assert!(super::client::TPC + super::client::TPC_SIZE <= super::client::TILEMAP);
@@ -709,13 +751,14 @@ pub(crate) mod sizes {
             <= super::client::FS_WORK_PAGE + super::client::PASS_STRIDE
     );
     const _: () = assert!(
-        super::client::FS_WORK_PAGE + (RENDER_SLOTS as u64) * super::client::PASS_STRIDE
-            <= 0x7040000000
+        super::client::EXT_TILEMAP_OFF + super::client::TILEMAP_SLOT_SIZE
+            <= super::client::EXT_PASS_STRIDE
     );
+    const _: () = assert!(super::client::pass_base(RENDER_SLOTS as u64) <= 0x7040000000);
     pub(crate) const CT_BUFS: usize = 0;
     pub(crate) const CLUSTER_PB_PAGES: u32 = 0x3c;
     pub(crate) const MAX_ATTACHMENTS: usize = 16;
-    pub(crate) const MAX_CLIENT: usize = 320;
+    pub(crate) const MAX_CLIENT: usize = 512;
     pub(crate) const PB_PAGES: u32 = 8192;
     pub(crate) const PB_BLOCKS: u32 = 2048;
     pub(crate) const PB_LIST_RECORDS: u32 = 4096;
@@ -724,10 +767,19 @@ pub(crate) mod sizes {
     /// each other on their engine rings while cross-VM and cross-engine transitions drain.
     pub(crate) const FLIGHTS: usize = 32;
     /// Retained compute units per VM at most; each unit owns its own hardware UMA slot
-    /// (`COMPUTE_UMA_SLOT + index`). A unit is reused only after a later publication retired
-    /// (it displaced the unit), so `n` units keep up to `n - 1` compute commands in flight.
-    pub(crate) const COMPUTE_UNITS: usize = 16;
+    /// (`COMPUTE_UMA_SLOT + index`, fitting in `1..RENDER_UMA_SLOT = 33`). A unit is reused
+    /// only after a later publication retired (it displaced the unit), so `n` units keep up to
+    /// `n - 1` compute commands in flight (`17 * 2 = 34` entries of the 256-entry compute work
+    /// ring `QUEUE_CAP`, well inside `AHEAD_RECORDS = 128`, `RING_SLOTS = 256`, and recovery
+    /// `snapshot_entries = 448`).
+    pub(crate) const COMPUTE_UNITS: usize = 18;
+    const _: () = assert!(COMPUTE_UNITS >= 2);
+    const _: () = assert!((COMPUTE_UNITS - 1) * MAX_COMPUTE_RING_ENTRIES < QUEUE_CAP as usize);
     const _: () = assert!(super::client::compute_base(COMPUTE_UNITS as u64) <= super::client::PB_HEAP);
+    const _: () = assert!(
+        super::engine::COMPUTE_UMA_SLOT + (COMPUTE_UNITS as u32)
+            <= super::engine::RENDER_UMA_SLOT
+    );
     /// Maximum jobs folded into one barrier-free compute horizon prefix.
     pub(crate) const HORIZON_JOBS: u32 = COMPUTE_UNITS as u32;
     /// Jobs admitted to the engine per logical queue: enough to keep a queue's commands

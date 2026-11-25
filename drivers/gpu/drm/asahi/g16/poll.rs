@@ -38,12 +38,12 @@ use super::fw::work::compute;
 use super::job::{self, Completions, Job};
 use super::recovery::logic::Retirement;
 use super::regs::EngineState;
-use super::{params, Firmware, Shared, FAST_POLL_WORK, POLL_WORK};
+use super::{params, Firmware, Shared, FAST_POLL_WORK, POLL_WORK, SCRUB_WORK};
 use crate::module_parameters;
 
 /// Cadence of periodic housekeeping (power governor, window health, administrative hang check).
 const HOUSEKEEPING_NS: u64 = 1_000_000;
-/// Maximum trailing receipt polls after an EP 0x20 event (stepped 1/2/5 us, ~48 us total).
+/// Maximum trailing receipt polls after an EP 0x20 event (stepped 1/2/3/4/5 us, 45 us total).
 const EVENT_RETIRE_POLLS: u32 = 11;
 /// Minimum interval between 1-jiffy delayed-work safety backup rearms (2 ms).
 const BACKUP_REARM_NS: u64 = 2_000_000;
@@ -145,19 +145,21 @@ impl Shared {
                         self.fail_stop(error);
                     }
                 }
-                let allow_stage = firmware.recovery.failed().is_none() && !firmware.engine.frozen;
+                let allow_stage = firmware.recovery.failed().is_none()
+                    && !firmware.engine.frozen
+                    && !self.sleeping.load(Ordering::Acquire);
                 scrubs = firmware.slots.stage_and_take_scrubs(allow_stage);
             }
             job::complete_all(done);
-            if scrubs.run() {
-                self.poll_now();
-            }
+            self.enqueue_scrubs(scrubs);
             if !retry_tail {
                 break;
             }
             let delay_us = match step {
                 0 => 1,
                 1 => 2,
+                2 => 3,
+                3 => 4,
                 _ => 5,
             };
             tail -= 1;
@@ -215,7 +217,7 @@ impl Shared {
                 pub_res = firmware.session.transport().and_then(|()| {
                     let retired_any = firmware.retire_once(done)?;
                     firmware.answer_growth()?;
-                    if firmware.recovery.receipt_fault || firmware.recovery_pending()? {
+                    if firmware.recovery.receipt_fault || recovery_pending {
                         firmware.check_hangs(done)?;
                     }
                     if was_evented && !retired_any && !firmware.engine.flights.is_empty() {
@@ -224,7 +226,7 @@ impl Shared {
                             && firmware.oldest_terminal_events() == term_before
                             && !firmware.oldest_stamp_reached()
                             && !firmware.recovery.receipt_fault
-                            && !firmware.recovery_pending().unwrap_or(true);
+                            && !recovery_pending;
                         if !non_terminal_only {
                             self.evented.store(true, Ordering::Release);
                         }
@@ -273,13 +275,13 @@ impl Shared {
             let mut state = self.state.lock();
             let firmware = state.as_deref_mut().ok_or(ENODEV)?;
             let res = self.submit_locked(firmware, job, &mut done);
-            let allow_stage = firmware.recovery.failed().is_none() && !firmware.engine.frozen;
+            let allow_stage = firmware.recovery.failed().is_none()
+                && !firmware.engine.frozen
+                && !self.sleeping.load(Ordering::Acquire);
             (res, firmware.slots.stage_and_take_scrubs(allow_stage))
         };
         job::complete_all(done);
-        if scrubs.run() {
-            self.poll_now();
-        }
+        self.enqueue_scrubs(scrubs);
         drop(signalling);
         self.notify_wedged();
         accepted
@@ -304,8 +306,9 @@ impl Shared {
             match state.as_deref_mut() {
                 Some(firmware) => {
                     let res = self.submit_locked(firmware, job, &mut done);
-                    let allow_stage =
-                        firmware.recovery.failed().is_none() && !firmware.engine.frozen;
+                    let allow_stage = firmware.recovery.failed().is_none()
+                        && !firmware.engine.frozen
+                        && !self.sleeping.load(Ordering::Acquire);
                     scrubs = firmware.slots.stage_and_take_scrubs(allow_stage);
                     res
                 }
@@ -313,12 +316,47 @@ impl Shared {
             }
         };
         job::complete_all(done);
-        if scrubs.run() {
-            self.poll_now();
-        }
+        self.enqueue_scrubs(scrubs);
         drop(signalling);
         self.notify_wedged();
         Some(accepted)
+    }
+
+    /// Hands staged displaced pass scrubs to the dedicated unbound scrub workqueue so SUBMIT
+    /// and completion polling never stall on write-combining zeroing.
+    pub(crate) fn enqueue_scrubs(self: &Arc<Self>, batch: super::slots::ScrubBatch) {
+        if batch.is_empty() {
+            return;
+        }
+        let mut queue = self.scrub_queue.lock();
+        if self.sleeping.load(Ordering::Acquire) {
+            drop(queue);
+            drop(batch);
+            return;
+        }
+        if queue.push_batch(batch) {
+            // Queue under `scrub_queue` so `sleep.rs::join_workers()` cannot overlap
+            // `scrub_wq.drain()` with a concurrent enqueue once `sleeping` is set.
+            let _ = self
+                .scrub_wq
+                .enqueue::<Arc<Shared>, SCRUB_WORK>(self.clone());
+        }
+    }
+
+    /// Drains queued displaced pass scrubs on the dedicated unbound scrub workqueue.
+    pub(crate) fn run_scrubs(self: &Arc<Self>) {
+        loop {
+            let Some(mut item) = self.scrub_queue.lock().pop() else {
+                break;
+            };
+            if self.sleeping.load(Ordering::Acquire) {
+                drop(item);
+                break;
+            }
+            if item.run_one() && !self.sleeping.load(Ordering::Acquire) {
+                self.poll_now();
+            }
+        }
     }
 
     /// Deliver userspace notification outside the device mutex and fence completion path.
@@ -348,9 +386,15 @@ impl Shared {
     }
 
     /// Disarms the completion hrtimer when idle or entering system sleep.
+    ///
+    /// Always takes `resnap_handle` rather than checking a lock-free shadow flag so
+    /// `sleep::join_workers()` strictly orders with any concurrent `rearm()`: `sleep_down()`
+    /// stores `sleeping = true` before calling `cancel_resnap()`, and `rearm()` re-checks
+    /// `sleeping` under `resnap_handle.lock()` before installing a new handle.
     pub(crate) fn cancel_resnap(&self) {
+        let mut handle = self.resnap_handle.lock();
         self.resnap_deadline_ns.store(0, Ordering::Release);
-        drop(self.resnap_handle.lock().take());
+        drop(handle.take());
     }
 
     /// Queues the backup poll on `system_highpri_wq` after `delay` jiffies, or moves an already
@@ -375,6 +419,9 @@ impl Shared {
     /// Re-checks a published command soon: hrtimer, with a throttled 1-jiffy backup; sooner while
     /// a ready prefix waits for record consumption or a post-event receipt tail is settling.
     pub(crate) fn rearm(self: &Arc<Self>, soon: bool) {
+        if self.sleeping.load(Ordering::Acquire) {
+            return;
+        }
         let mut us = params::resnap_us();
         if soon && module_parameters::g16_repoll_us.value() != 0 {
             us = params::repoll_us();
@@ -384,9 +431,15 @@ impl Shared {
         let armed_ns = self.resnap_deadline_ns.load(Ordering::Acquire);
         if armed_ns == 0 || armed_ns <= now || target_ns.saturating_add(5_000) < armed_ns {
             let mut handle = self.resnap_handle.lock();
-            drop(handle.take());
-            self.resnap_deadline_ns.store(target_ns, Ordering::Release);
-            *handle = Some(self.clone().start(Delta::from_micros(i64::from(us))));
+            if self.sleeping.load(Ordering::Acquire) {
+                return;
+            }
+            let armed_ns = self.resnap_deadline_ns.load(Ordering::Acquire);
+            if armed_ns == 0 || armed_ns <= now || target_ns.saturating_add(5_000) < armed_ns {
+                drop(handle.take());
+                self.resnap_deadline_ns.store(target_ns, Ordering::Release);
+                *handle = Some(self.clone().start(Delta::from_micros(i64::from(us))));
+            }
         }
         let backup_ns = self.backup_deadline_ns.load(Ordering::Acquire);
         if now >= backup_ns {
@@ -464,6 +517,7 @@ impl Firmware {
                 return Ok(false);
             }
         }
+        let was_frozen = self.engine.frozen;
         let stage_before = self.events.stage_events;
         let term_before = self.oldest_terminal_events();
         let mut lap = Lap::start();
@@ -471,13 +525,35 @@ impl Firmware {
         let retired_any = self.retire_once(done)?;
         lap.lap(&mut self.engine.prof.retire_ns);
         self.answer_growth()?;
-        if self.recovery.receipt_fault || self.recovery_pending()? {
+        let recovery_pending = self.recovery.receipt_fault || self.recovery_pending()?;
+        if recovery_pending {
             self.check_hangs(done)?;
         }
-        let published = if self.engine.pending.is_empty() {
-            Ok(())
-        } else {
+        let unfrozen = was_frozen && !self.engine.frozen;
+        let scrub_woke = self.slots.take_scrub_woke();
+        let publish_woke = self
+            .engine
+            .shared
+            .as_ref()
+            .is_some_and(|shared| shared.publish_wake.swap(false, Ordering::AcqRel));
+        // Skip redundant `publish_checked()` walks on busy polls where nothing could have
+        // unblocked `engine.pending`. `Prepared::drop` releases standby PB epochs only for
+        // `Cache::prepare` waiters (`standby_available`, which enter `submit_locked()` directly),
+        // while `publish_woke` covers external state changes (VM close, unstarted queue
+        // cancellation) so pending jobs never wait on the 1 ms housekeeping tick.
+        let should_publish = !self.engine.pending.is_empty()
+            && (retired_any
+                || !had_flights
+                || self.engine.flights.is_empty()
+                || self.engine.chan_wait
+                || unfrozen
+                || scrub_woke
+                || publish_woke
+                || housekeeping_due);
+        let published = if should_publish {
             self.publish_checked(done)
+        } else {
+            Ok(())
         };
         if self.engine.flights.is_empty() {
             self.power.report_work(false);
@@ -501,7 +577,7 @@ impl Firmware {
             && self.oldest_terminal_events() == term_before
             && !self.oldest_stamp_reached()
             && !self.recovery.receipt_fault
-            && !self.recovery_pending().unwrap_or(true);
+            && !recovery_pending;
         // After an EP 0x20 event, retry up to `EVENT_RETIRE_POLLS` times (outside the device
         // lock) only while no flight has retired yet and flights remain in flight. Once any
         // flight retires, stop spinning so deeper queues do not burn tail waits per interrupt.
@@ -655,6 +731,9 @@ impl Firmware {
         // Recovery may force stage progress: authenticate it before any receipt.
         if self.recovery.receipt_fault || self.recovery_pending()? {
             self.check_hangs(done)?;
+        }
+        if self.engine.flights.is_empty() {
+            return Ok(false);
         }
         let mut retired_any = false;
         let (mut check_compute, mut check_render) = (true, true);
