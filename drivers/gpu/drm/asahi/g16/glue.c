@@ -269,18 +269,26 @@ struct asahi_g16_cooling *asahi_g16_cooling_register(struct device *dev)
 	INIT_DELAYED_WORK(&cooling->zone_poll, asahi_g16_zone_poll_fn);
 	cooling->zone_err = -ENODATA;
 	cooling->pmp_node = of_parse_phandle(dev->of_node, "apple,pmp", 0);
+	/* A disabled PMP node never probes, so it provides no telemetry. */
+	if (cooling->pmp_node && !of_device_is_available(cooling->pmp_node)) {
+		of_node_put(cooling->pmp_node);
+		cooling->pmp_node = NULL;
+	}
 	if (cooling->pmp_node) {
 		atomic_set(&cooling->state, 8);
 		cooling->pmp = apple_pmp_gpu_get(dev);
 		if (IS_ERR(cooling->pmp)) {
-			ret = PTR_ERR(cooling->pmp);
+			ret = dev_err_probe(dev, PTR_ERR(cooling->pmp),
+					    "PMP telemetry from %pOF unavailable\n",
+					    cooling->pmp_node);
 			goto put_node;
 		}
 	} else {
 		/*
-		 * Without an apple,pmp supplier, thermal-zone telemetry drives
-		 * the fail-closed backstop (starting at maximum cooling) while
-		 * the cooling device remains available to thermal policy.
+		 * Without an available apple,pmp supplier, thermal-zone
+		 * telemetry drives the fail-closed backstop (starting at maximum
+		 * cooling) while the cooling device remains available to thermal
+		 * policy.
 		 */
 		atomic_set(&cooling->state, 0);
 	}
