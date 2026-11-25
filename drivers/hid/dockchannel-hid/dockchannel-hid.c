@@ -1985,10 +1985,11 @@ static void dchid_send_sleep_reports(struct dockchannel_hid *dchid)
  * The coprocessor keeps running across suspend-to-idle, and its RTKit session
  * and the trackpad AFE power sequence are not restartable. Mark the sleep
  * window, in which input may wake the system and requests from the HID core
- * fail fast. A firmware-driven suspend also sets the host state, after the idle
- * notice the helper sends in its .prepare, and the wake sets it back after the
- * helper's .resume has sent the on notice, the device link ordering the two. That
- * is macOS's order.
+ * fail fast. A firmware-driven suspend also sets the host state: after the idle
+ * notice the helper sends in its .prepare, or before the one it sends in its
+ * .suspend_late where macOS sends these packets first. The wake sets it back
+ * once the helper has confirmed its AP on, the device link ordering the two.
+ * That is macOS's order.
  */
 static int dockchannel_hid_suspend(struct device *dev)
 {
@@ -2039,11 +2040,12 @@ static int dockchannel_hid_resume(struct device *dev)
 	struct device *helper = dchid->helper_link->supplier;
 	int i, ret = 0;
 
-	if (dchid->host_asleep || dchid->wake_pending) {
+	if (pm_suspend_via_firmware() || dchid->wake_pending) {
 		/*
 		 * AP on goes first, as in macOS, also when a refused sleep skipped the helper's
-		 * own .resume. Until it is answered nothing is sent, and the drivers stay
-		 * suspended with their requests failing fast; a lost session stays so.
+		 * own .resume, and whether or not the host state was set. Until it is answered
+		 * nothing is sent, and the drivers stay suspended with their requests failing
+		 * fast; a lost session stays so. Only a host state that was set is set back.
 		 */
 		ret = apple_rtkit_helper_ap_wake(helper);
 		if (ret) {
