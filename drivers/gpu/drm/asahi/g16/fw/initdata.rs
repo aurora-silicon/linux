@@ -502,6 +502,11 @@ pub(crate) const G15G_26B123: Layout = Layout {
     // The shared3 block's state word (+0x62ac + 8): with the block all zero the G15G firmware
     // never takes the first device-control records.
     state_bound: Some(0x62b4),
+    // GLOBALS as the G15 family's 26B123 InitData version lays it out (the same version as
+    // G15S): the words from 25G83 +0xe28 on sit 5 bytes up, not G16G's 4. With G16G's runs the
+    // soft-fault word (25G83 +0xe28 = 3) lands one byte low, the firmware reads 0 there and an
+    // unmapped shader write faults the context instead of being dropped.
+    globals: G15S_26B123.globals,
     ..V26B123
 };
 
