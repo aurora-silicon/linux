@@ -83,6 +83,14 @@ properties:
       port loses its configuration in a deep sleep and is trained again after
       the wake.
 
+  apple,pcie-host:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      The general-purpose PCIe host on the SoC's own PCIe power domain (on T6030
+      the Wi-Fi, Bluetooth and card reader host). Its ports and DARTs come back
+      cold after a deep sleep. While a driver is bound to it, the sleep is
+      refused until that driver can stop and restore the host.
+
   apple,radio-perst:
     $ref: /schemas/types.yaml#/definitions/phandle-array
     items:
@@ -339,6 +347,15 @@ allOf:
       properties:
         apple,radio-host: false
         apple,radio-perst: false
+  - if:
+      not:
+        properties:
+          compatible:
+            contains:
+              const: apple,t6030-sleep
+    then:
+      properties:
+        apple,pcie-host: false
 
 additionalProperties: false
 
