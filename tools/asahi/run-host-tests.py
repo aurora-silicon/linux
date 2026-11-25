@@ -142,11 +142,11 @@ ASAHI_TESTS = {
     'apple-dart-fw-harness-tests.py': [([], PASS)],
     'apple-dart-range-tests.py': [([], PASS)],
     # 551b937502b5 gives up on a stalled J700 display invalidate after 2 ms; the
-    # every-handoff mutation waits it out on every handed-off DART, not just the display's.
+    # every-dart mutation waits it out on every locked DART, not just the display's.
     'apple-dart-tlb-stall-tests.py': [(['--dtc', '{dtc}'], PASS),
                                       (['--ref', '551b937502b54b0d1eb250bba6d9442b3672a0fb'],
                                        KILL),
-                                      (['--dtc', '{dtc}', '--mutation', 'every-handoff'],
+                                      (['--dtc', '{dtc}', '--mutation', 'every-dart'],
                                        KILL)],
     'apple-router-sleep-tests.py': [(out('--output'), PASS)],
     'asahi-stats-raw-tests.py': [([], PASS)],

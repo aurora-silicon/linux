@@ -462,7 +462,7 @@ struct apple_dart {
 	bool commands_gated;
 	/* TLB commands written, counted under the lock: see apple_dart_t8110_tlb_wait(). */
 	unsigned long tlb_commands;
-	/* A handed-off DART a display subsystem scans out through: apple_dart_display_scanout(). */
+	/* A locked DART a display subsystem scans out through: apple_dart_display_scanout(). */
 	bool display_scanout;
 	/*
 	 * A real sleep took the ISP host streams' registers: the next runtime resume, its
@@ -1081,9 +1081,10 @@ static bool apple_dart_fw_handoff_enabled(const struct apple_dart *dart)
  * Whether an available display subsystem, the component master the DRM driver
  * binds and the loader walks for the scan-out DARTs it hands off, lists a
  * stream of @np in its iommus: the display pipe scans out through this DART.
- * On J700 that is disp0 and dispext0. The DCP and DCPEXT firmware DARTs are
- * named only by their coprocessors, and a PCIe device such as the Wi-Fi
- * reaches its DART through its host bridge's iommu-map.
+ * On J700 that is disp0 and dispext0, on J815 disp0, dispext0 and dispext1.
+ * The DCP and DCPEXT firmware DARTs are named only by their coprocessors, and
+ * a PCIe device such as the Wi-Fi reaches its DART through its host bridge's
+ * iommu-map.
  */
 static bool apple_dart_display_scanout(struct device_node *np)
 {
@@ -1782,16 +1783,17 @@ static bool apple_dart_t8110_tlb_settled(struct apple_dart *dart,
  * held: before a command (@issued 0) until it is idle, after one until
  * command @issued finished.
  *
- * On J700 the boot loader hands the display DARTs' roots off (fw_handoff).
- * There a range invalidate of the internal display's stream 0 can stay busy
- * well past DART_T8110_FLUSH_BUSY_TIMEOUT while the display pipe changes
- * what it scans out (screen locker, panel power-off, after a resume),
- * reading 0x8700e100, and it finishes on its own: the next commands work.
- * Giving up fails the mapping of a framebuffer the compositor imports, and
- * returns from an unmap while the TLB can still translate to the pages its
- * caller frees next. So keep waiting on the DARTs the display subsystem
- * scans out through (display_scanout: disp0 and dispext0), not on the
- * handed-off DCP firmware DARTs or any other device's DART, for up to
+ * On J700 (whose boot loader hands the display DARTs' roots off) and on
+ * J815 (locked, no handoff) a range invalidate of the internal display's
+ * stream 0 can stay busy well past DART_T8110_FLUSH_BUSY_TIMEOUT while the
+ * display pipe changes what it scans out (compositor start, screen locker,
+ * panel power-off, after a resume), reading 0x8700e100, and it finishes on
+ * its own: the next commands work. Giving up fails the mapping of a
+ * framebuffer the compositor imports, and returns from an unmap while the
+ * TLB can still translate to the pages its caller frees next. So keep
+ * waiting on the locked DARTs the display subsystem scans out through
+ * (display_scanout: disp0, and dispext0 when the loader locked it), not on
+ * the DCP firmware DARTs or any other device's DART, for up to
  * DART_T8110_FLUSH_STALL_TIMEOUT more, without the lock and with interrupts
  * as the caller had them. Every command here waits for an idle engine
  * before it is written, so the engine needs no lock meanwhile (the
@@ -1814,7 +1816,7 @@ static int apple_dart_t8110_tlb_wait(struct apple_dart *dart, unsigned long *fla
 		!(*status & DART_T8110_TLB_CMD_BUSY), 1,
 		DART_T8110_FLUSH_BUSY_TIMEOUT, false, dart,
 		DART_T8110_TLB_CMD);
-	if (!ret || !range || !dart->fw_handoff || !dart->display_scanout ||
+	if (!ret || !range || !dart->display_scanout ||
 	    dart->ctc_flush || dart->sleep_restore.count)
 		return ret;
 
@@ -6261,7 +6263,8 @@ params_done:
 				    &dart->sleep_restore_late);
 	/* Reserved table-page lifetime requires the matched three-level loader. */
 	dart->fw_handoff = apple_dart_fw_handoff_enabled(dart);
-	dart->display_scanout = dart->fw_handoff && apple_dart_display_scanout(dev->of_node);
+	/* Only a locked DART takes the range invalidates apple_dart_t8110_tlb_wait() waits out. */
+	dart->display_scanout = dart->locked && apple_dart_display_scanout(dev->of_node);
 	/*
 	 * Preserve our retained-root path when no reserved-table handoff exists.
 	 * T6050's boot loader leaves every display DART locked on four-level
