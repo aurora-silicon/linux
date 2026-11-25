@@ -2902,8 +2902,13 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 #endif
 
 #if DCP_FW_H17(DCP_FW_VER)
-	/* H17P has no known safe pipe-off or surface-free transition. */
-	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
+	/*
+	 * H17P has no known safe pipe-off or surface-free transition for
+	 * its panel. An external pipe stops like the H17G one: otherwise
+	 * DPMS off leaves it scanning out the last frame.
+	 */
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
+	    dcp_has_panel(dcp))
 		return;
 #endif
 
@@ -2925,7 +2930,8 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 	kref_get(&cookie->refcount);
 
 #if DCP_FW_H17(DCP_FW_VER)
-	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G)
+	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G ||
+	    !dcp_has_panel(dcp))
 		dcp_prepare_clear_swap(dcp, swap);
 #else
 #if DCP_FW_DESKTOP_26(DCP_FW_VER)
