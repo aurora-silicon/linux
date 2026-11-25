@@ -1847,7 +1847,9 @@ static int dcp_v27_sleep_resume(struct apple_dcp *dcp) { return -EOPNOTSUPP; }
  * calls; RTKit idle and RUN off; the DARTs held; the display domains off with their retention
  * set. From its resume, whether the sleep happened or was given up before its commit, the
  * same way: the domains up, the DARTs back, the firmware restarted warm and the wake's calls.
- * The DRM device's resume then powers the panel on with its CRTC and sets its mode.
+ * The DRM device's resume then powers the panel on with its CRTC and sets its mode. Each call
+ * and check before the idle refuses the sleep with the firmware running; past the idle only a
+ * power cycle brings it back.
  */
 #if IS_ENABLED(CONFIG_APPLE_SOC_SLEEP)
 
@@ -1868,26 +1870,36 @@ static int dcp_v27_sleep_resume(struct apple_dcp *dcp) { return -EOPNOTSUPP; }
 #define V27_EARLY_HOLD_MS	12
 #define V27_EARLY_POWER_US	50000
 
+/* The display's power states, the CPU's first: the DCP's power domain and its parents. */
+enum { V27_EARLY_PS_CPU, V27_EARLY_PS_FE, V27_EARLY_PS_SYS, V27_EARLY_PS_N };
+
 struct dcp_v27_early {
 	/* The firmware's DART and the display's, held while the domains are off */
 	struct apple_dart_v27_cycle *firmware, *display;
+	/*
+	 * Each DART that came back without what it held, left dark and gated: the firmware
+	 * never runs again until a reboot. Kept across sleeps, as the stopped CPU is.
+	 */
+	bool firmware_lost, display_lost;
+	/* The domains' floors, cleared for the power cycle as macOS has them, until put back */
+	u32 min[V27_EARLY_PS_N];
+	bool min_saved;
+	/* When the last domain read off */
 	ktime_t off_at;
-	/* The panel's own power state was on: the stop turned it off, after the display stage. */
-	bool soft_on;
 	bool closed, workers_off;
-	/* RTKit idled: from here the firmware comes back only from a power cycle. */
-	bool idled;
 	/* RUN off by this sleep, and the domains lowered by it: the resume undoes both. */
 	bool stopped, powered_off;
 	/* The sleep's steps, each with its result and time, for one line. */
-	char steps[160];
+	char steps[256];
 	unsigned int steps_len;
 	ktime_t steps_start;
 };
 
+/* Firmware 27.2, whose ABI the DT's sleep arguments are: its method table, by identity. */
 static bool dcp_v27_early_selected(struct apple_dcp *dcp)
 {
 	return dcp->hw.v27_early_stop && dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+	       dcp->v27_methods && dcp->v27_methods == iomfb_v27_methods("27.2.0") &&
 	       dcp->hw.adopt_live_session && !dcp->external &&
 	       iomfb_v27_sleep_methods_complete(dcp->v27_methods) &&
 	       iomfb_v27_sleep_described(dcp) &&
@@ -1937,20 +1949,6 @@ static unsigned int dcp_v27_early_endpoints(struct apple_dcp *dcp,
 	return n;
 }
 
-/* Every command of those endpoints answered, within @ms: else the endpoint, or 0. */
-static unsigned int dcp_v27_early_endpoints_busy(struct apple_dcp *dcp, unsigned int ms)
-{
-	struct apple_dcp_afkep *eps[0x28];
-	unsigned int n = dcp_v27_early_endpoints(dcp, eps, ARRAY_SIZE(eps)), i;
-	bool idle;
-
-	for (i = 0; i < n; i++)
-		if (read_poll_timeout(afk_host_idle, idle, idle, 1000, ms * USEC_PER_MSEC, false,
-				      eps[i]))
-			return eps[i]->endpoint;
-	return 0;
-}
-
 static void dcp_v27_early_endpoints_flush(struct apple_dcp *dcp)
 {
 	struct apple_dcp_afkep *eps[0x28];
@@ -1958,6 +1956,31 @@ static void dcp_v27_early_endpoints_flush(struct apple_dcp *dcp)
 
 	for (i = 0; i < n; i++)
 		flush_workqueue(eps[i]->wq);
+}
+
+/*
+ * Every command of those endpoints answered within @ms, each checked once RTKit's receive
+ * work and the endpoint's own have been joined, as afk_host_idle() wants them: else the
+ * endpoint still waiting, or 0.
+ */
+static unsigned int dcp_v27_early_endpoints_busy(struct apple_dcp *dcp, unsigned int ms)
+{
+	ktime_t deadline = ktime_add_ms(ktime_get(), ms);
+	struct apple_dcp_afkep *eps[0x28];
+	unsigned int n = dcp_v27_early_endpoints(dcp, eps, ARRAY_SIZE(eps)), i;
+
+	for (;;) {
+		apple_rtkit_flush_rx(dcp->rtk);
+		dcp_v27_early_endpoints_flush(dcp);
+		apple_rtkit_flush_rx(dcp->rtk);
+		for (i = 0; i < n && afk_host_idle(eps[i]); i++)
+			;
+		if (i == n)
+			return 0;
+		if (ktime_after(ktime_get(), deadline))
+			return eps[i]->endpoint;
+		usleep_range(1000, 2000);
+	}
 }
 
 /*
@@ -2030,61 +2053,92 @@ static void dcp_v27_early_reopen(struct apple_dcp *dcp, struct dcp_v27_early *e)
 }
 
 /*
- * The calls before the stop, as macOS's: the display's own power state off, after the
- * display stage where the DT gives it, and A500's wake form, as its display sleep sends them;
- * then the sleep's A489, A484 with the sleep's flags (the hard power state), A115 and A500's
- * sleep form. The plain A484(0) is answered once the pipe no longer scans out.
+ * The display stage, where the DT gives its arguments: A414, A489 twice, A487, A489 and A412,
+ * as macOS sends them before the panel's own power state in either direction. A call that is
+ * not answered fails it.
+ */
+static int dcp_v27_early_stage(struct apple_dcp *dcp)
+{
+	u8 args[IOMFB_V27_STAGE_ARGS];
+	const struct {
+		char tag[4] __nonstring;
+		u8 in, out;
+		const u8 *data;
+	} seq[] = {
+		{ "A414", 8, 8, args },
+		{ "A489", 0, 4, NULL },
+		{ "A489", 0, 4, NULL },
+		{ "A487", 4, 0, args + 8 },
+		{ "A489", 0, 4, NULL },
+		{ "A412", 0, 4, NULL },
+	};
+	unsigned int i;
+	int ret;
+
+	if (iomfb_v27_display_args(dcp, true, args))
+		return 0;
+	for (i = 0; i < ARRAY_SIZE(seq); i++) {
+		ret = iomfb_v27_sleep_call(dcp, seq[i].tag, seq[i].data, seq[i].in, seq[i].out);
+		if (ret) {
+			dev_warn(dcp->dev, "V27 sleep: display stage %.4s: %d\n", seq[i].tag, ret);
+			return ret;
+		}
+	}
+	return 0;
+}
+
+/*
+ * The calls before the stop, as macOS's, each of them answered: the display stage and the
+ * panel's own power state off, as its display sleep sends them, whether or not this driver
+ * powered the pipe, so that the pipe is known not to scan out; then A500's wake form, the
+ * sleep's A489, A484 with the sleep's flags (the hard power state), A115 and A500's sleep
+ * form.
  */
 static int dcp_v27_early_calls_off(struct apple_dcp *dcp, struct dcp_v27_early *e)
 {
 	int ret;
 
-	if (e->soft_on) {
-		dcp_v27_display_stage(dcp, false, false, false);
+	ret = dcp_v27_early_step(e, "stage", dcp_v27_early_stage(dcp));
+	if (!ret)
 		ret = dcp_v27_early_step(e, "plain-off", iomfb_v27_sleep_plain(dcp, false));
-		if (ret)
-			return ret;
-		iomfb_v27_sleep_rpc(dcp, true, true);
-	}
-	iomfb_v27_sleep_call(dcp, "A489", NULL, 0, 4);
-	ret = dcp_v27_early_step(e, "A484", iomfb_v27_sleep_rpc(dcp, false, false));
-	if (ret)
-		return ret;
-	ret = iomfb_v27_sleep_a115(dcp, false);
-	if (ret)
-		dev_warn(dcp->dev, "V27 sleep: A115(0): %d\n", ret);
-	return dcp_v27_early_step(e, "A500", iomfb_v27_sleep_rpc(dcp, true, false));
+	if (!ret)
+		ret = dcp_v27_early_step(e, "A500-wake", iomfb_v27_sleep_rpc(dcp, true, true));
+	if (!ret)
+		ret = dcp_v27_early_step(e, "A489",
+					 iomfb_v27_sleep_call(dcp, "A489", NULL, 0, 4));
+	if (!ret)
+		ret = dcp_v27_early_step(e, "A484", iomfb_v27_sleep_rpc(dcp, false, false));
+	if (!ret)
+		ret = dcp_v27_early_step(e, "A115", iomfb_v27_sleep_a115(dcp, false));
+	if (!ret)
+		ret = dcp_v27_early_step(e, "A500", iomfb_v27_sleep_rpc(dcp, true, false));
+	return ret;
 }
 
 /*
  * The calls after the restart, or after a stop given up before the idle, as macOS's wake on
- * J516s sends them up to the display's own power state: A500's wake form, A489, A484 with the
- * flags, A115, then the display stage if the panel was lit. The panel's own power state comes
- * on with its CRTC, through the DRM device's resume (iomfb_poweron_v27()), as at boot: the
- * pipe is off until then.
+ * J516s sends them up to the display's own power state, each of them answered: A500's wake
+ * form, A489, A484 with the flags, A115, then the display stage. The panel's own power state
+ * comes on with its CRTC, through the DRM device's resume (iomfb_poweron_v27()), as at boot:
+ * the pipe is off until then. The first failure is the result.
  */
 static int dcp_v27_early_calls_on(struct apple_dcp *dcp, struct dcp_v27_early *e)
 {
 	int ret;
 
-	iomfb_v27_sleep_rpc(dcp, true, true);
-	iomfb_v27_sleep_call(dcp, "A489", NULL, 0, 4);
-	ret = iomfb_v27_sleep_rpc(dcp, false, true);
+	ret = dcp_v27_early_step(e, "A500-wake", iomfb_v27_sleep_rpc(dcp, true, true));
+	if (!ret)
+		ret = dcp_v27_early_step(e, "A489",
+					 iomfb_v27_sleep_call(dcp, "A489", NULL, 0, 4));
+	if (!ret)
+		ret = dcp_v27_early_step(e, "A484(1)", iomfb_v27_sleep_rpc(dcp, false, true));
 	WRITE_ONCE(dcp->pipe_enabled_h17p, false);
-	if (ret) {
-		dev_err(dcp->dev, "V27 wake: A484(1) with the flags: %d\n", ret);
-		return ret;
-	}
-	ret = iomfb_v27_sleep_a115(dcp, true);
-	if (ret)
-		dev_warn(dcp->dev, "V27 wake: A115(1): %d\n", ret);
-	if (e->soft_on)
-		dcp_v27_display_stage(dcp, false, false, false);
-	return 0;
+	if (!ret)
+		ret = dcp_v27_early_step(e, "A115(1)", iomfb_v27_sleep_a115(dcp, true));
+	if (!ret)
+		ret = dcp_v27_early_step(e, "stage", dcp_v27_early_stage(dcp));
+	return ret;
 }
-
-/* The display's power states, the CPU's first: the DCP's power domain and its parents. */
-enum { V27_EARLY_PS_CPU, V27_EARLY_PS_FE, V27_EARLY_PS_SYS, V27_EARLY_PS_N };
 
 /*
  * Their nodes, as the DT chains them from the DCP, each at the word the layout names: the sleep
@@ -2128,10 +2182,37 @@ static void dcp_v27_early_unmap(void __iomem *ps, void __iomem *pwrgate, void __
 		iounmap(pmc);
 }
 
+static u32 dcp_v27_early_word(struct apple_dcp *dcp, unsigned int i)
+{
+	const struct dcp_s2r_layout *l = dcp_s2r_layout(dcp);
+
+	return i == V27_EARLY_PS_CPU ? l->disp_cpu : i == V27_EARLY_PS_FE ? l->disp_fe :
+	       l->disp_sys;
+}
+
+/* The domains' floors back, as the PMGR's driver set them: on every exit of the power-on */
+static void dcp_v27_early_floors(struct apple_dcp *dcp, struct dcp_v27_early *e,
+				 void __iomem *ps)
+{
+	unsigned int i;
+	u32 word;
+
+	if (!e->min_saved)
+		return;
+	for (i = 0; i < V27_EARLY_PS_N; i++) {
+		word = dcp_v27_early_word(dcp, i);
+		writel((readl(ps + word) & ~(DCP_PS_MIN | DCP_PS_FLAGS)) | e->min[i], ps + word);
+	}
+	e->min_saved = false;
+}
+
 /*
  * The display domains off, as macOS's power-off on J516s (the t5 trace), T8140's order: the
  * CPU word's auto-enable off, its retention words for the power gate, then the CPU, the front
- * end and the system lowered, each read off before the next.
+ * end and the system lowered, each read off before the next. macOS's words have no floor:
+ * the one the PMGR's driver set (apple,min-state) is kept aside, cleared with each word's
+ * auto-enable, until the power-on puts it back. The least time off counts from the last word
+ * read off.
  */
 static int dcp_v27_early_domains_off(struct apple_dcp *dcp, struct dcp_v27_early *e)
 {
@@ -2139,7 +2220,7 @@ static int dcp_v27_early_domains_off(struct apple_dcp *dcp, struct dcp_v27_early
 	void __iomem *ps = NULL, *pwrgate = NULL, *pmc = NULL;
 	struct device_node *np[V27_EARLY_PS_N];
 	unsigned int i;
-	u32 val;
+	u32 val, word;
 	int ret;
 
 	ret = dcp_v27_early_chain(dcp, np);
@@ -2148,15 +2229,26 @@ static int dcp_v27_early_domains_off(struct apple_dcp *dcp, struct dcp_v27_early
 	if (!ret) {
 		/* Lowered at least in part from here: the power-on undoes it. */
 		e->powered_off = true;
-		e->off_at = ktime_get_boottime();
 		dcp->s2r_domains_up = false;
-		val = readl(ps + l->disp_cpu);
-		if (val & DCP_PS_AUTO_ENABLE)
-			writel(val & ~(DCP_PS_AUTO_ENABLE | DCP_PS_FLAGS), ps + l->disp_cpu);
-		writel(DCP_RET_FF_GATED, pwrgate + l->ret_ff);
-		writel(DCP_RET_MEM_GATED, pwrgate + l->ret_mem);
-		for (i = 0; !ret && i < V27_EARLY_PS_N; i++)
+		if (!e->min_saved) {
+			for (i = 0; i < V27_EARLY_PS_N; i++)
+				e->min[i] = readl(ps + dcp_v27_early_word(dcp, i)) & DCP_PS_MIN;
+			e->min_saved = true;
+		}
+		for (i = 0; !ret && i < V27_EARLY_PS_N; i++) {
+			word = dcp_v27_early_word(dcp, i);
+			/* Auto-enable off and no floor in one write, as macOS's word reads then */
+			val = readl(ps + word);
+			if (val & (DCP_PS_AUTO_ENABLE | DCP_PS_MIN))
+				writel(val & ~(DCP_PS_AUTO_ENABLE | DCP_PS_FLAGS | DCP_PS_MIN),
+				       ps + word);
+			if (i == V27_EARLY_PS_CPU) {
+				writel(DCP_RET_FF_GATED, pwrgate + l->ret_ff);
+				writel(DCP_RET_MEM_GATED, pwrgate + l->ret_mem);
+			}
 			ret = apple_sleep_domain_set(np[i], false);
+		}
+		e->off_at = ktime_get_boottime();
 		if (ret)
 			dev_err(dcp->dev, "V27 sleep: %pOFn not off: %d\n", np[i - 1], ret);
 	}
@@ -2168,7 +2260,8 @@ static int dcp_v27_early_domains_off(struct apple_dcp *dcp, struct dcp_v27_early
 /*
  * macOS's power-on on J516s: the system word, then the front end, as the sleep raises a word
  * (on with auto-enable off, auto-enable once it reads on); then the CPU, its retention words
- * as they were before the power gate once it reads on, then its auto-enable.
+ * as they were before the power gate once it reads on, then its auto-enable. The floors go
+ * back on every exit.
  */
 static int dcp_v27_early_domains_on(struct apple_dcp *dcp, struct dcp_v27_early *e)
 {
@@ -2199,6 +2292,8 @@ static int dcp_v27_early_domains_on(struct apple_dcp *dcp, struct dcp_v27_early 
 		writel(DCP_RET_MEM_ON, pwrgate + l->ret_mem);
 		ret = apple_sleep_domain_set(np[V27_EARLY_PS_CPU], true);
 	}
+	if (ps)
+		dcp_v27_early_floors(dcp, e, ps);
 	if (ret)
 		dev_err(dcp->dev, "V27 wake: display power words not on: %d (CPU %#x)\n", ret, now);
 	dcp_v27_early_unmap(ps, pwrgate, pmc);
@@ -2212,7 +2307,8 @@ static int dcp_v27_early_domains_on(struct apple_dcp *dcp, struct dcp_v27_early 
 
 /*
  * With the CPU stopped: its DARTs held, the firmware's first as macOS writes it right after RUN
- * off, then the display's; then the domains off.
+ * off, then the display's; then the domains off. A DART that came back without its state stays
+ * dark and gated as it was left: nothing reads it, and it goes off with the domains.
  */
 static int dcp_v27_early_power_down(struct apple_dcp *dcp, struct dcp_v27_early *e)
 {
@@ -2222,9 +2318,9 @@ static int dcp_v27_early_power_down(struct apple_dcp *dcp, struct dcp_v27_early 
 		return 0;
 	if (!dcp->s2r_dcp_dart || !dcp->s2r_disp_dart)
 		dcp_s2r_find_darts(dcp);
-	if (!e->firmware)
+	if (!e->firmware && !e->firmware_lost)
 		ret = apple_dart_v27_cycle_off(dcp->s2r_dcp_dart, dcp->dev, &e->firmware);
-	if (!ret && !e->display)
+	if (!ret && !e->display && !e->display_lost)
 		ret = apple_dart_v27_cycle_off(dcp->s2r_disp_dart, dcp->dev, &e->display);
 	if (dcp_v27_early_step(e, "darts", ret))
 		return ret;
@@ -2232,8 +2328,32 @@ static int dcp_v27_early_power_down(struct apple_dcp *dcp, struct dcp_v27_early 
 }
 
 /*
- * After the idle: RUN off twice once the CPU is down, then the power-down. Any failure leaves
- * what is done for dcp_v27_early_restart() to undo.
+ * Both DARTs back as they were, before the firmware may run again: one that comes back without
+ * its translations is never used by it again, until a reboot.
+ */
+static int dcp_v27_early_darts_on(struct apple_dcp *dcp, struct dcp_v27_early *e)
+{
+	int ret = 0;
+
+	if (e->firmware_lost || e->display_lost || !e->firmware || !e->display)
+		return -EUCLEAN;
+	if (apple_dart_v27_cycle_on(e->firmware)) {
+		e->firmware_lost = true;
+		ret = -EIO;
+	}
+	e->firmware = NULL;
+	if (apple_dart_v27_cycle_on(e->display)) {
+		e->display_lost = true;
+		ret = -EIO;
+	}
+	e->display = NULL;
+	return ret;
+}
+
+/*
+ * After the idle: RUN off twice once the CPU reads idle and stopped, then the power-down. A
+ * CPU that does not read stopped is left as it is, RUN on and its DARTs untouched, for the
+ * caller to wake. Any later failure leaves what is done for dcp_v27_early_restart() to undo.
  */
 static int dcp_v27_early_stop(struct apple_dcp *dcp, struct dcp_v27_early *e)
 {
@@ -2242,12 +2362,16 @@ static int dcp_v27_early_stop(struct apple_dcp *dcp, struct dcp_v27_early *e)
 	int ret;
 
 	/* Both set once the firmware's last message has been read, as macOS waits for them. */
-	if (readl_poll_timeout(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS, status,
-			       (status & (APPLE_DCP_COPROC_CPU_STATUS_IDLE |
-					  APPLE_DCP_COPROC_CPU_STATUS_STOPPED)) ==
-			       (APPLE_DCP_COPROC_CPU_STATUS_IDLE |
-				APPLE_DCP_COPROC_CPU_STATUS_STOPPED), 100, 5000))
-		dev_warn(dcp->dev, "V27 sleep: idle status not set: %#x\n", status);
+	ret = readl_poll_timeout(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS, status,
+				 (status & (APPLE_DCP_COPROC_CPU_STATUS_IDLE |
+					    APPLE_DCP_COPROC_CPU_STATUS_STOPPED)) ==
+				 (APPLE_DCP_COPROC_CPU_STATUS_IDLE |
+				  APPLE_DCP_COPROC_CPU_STATUS_STOPPED), 100, 5000);
+	if (dcp_v27_early_step(e, "cpu-idle", ret)) {
+		dev_err(dcp->dev, "V27 sleep: the CPU did not stop after its idle: status %#x\n",
+			status);
+		return ret;
+	}
 	apple_rtkit_mailbox_off(dcp->rtk);
 	dcp_v27_early_endpoints_flush(dcp);
 	dcp_s2r_cpu_stop(dcp);
@@ -2261,38 +2385,41 @@ static int dcp_v27_early_stop(struct apple_dcp *dcp, struct dcp_v27_early *e)
 }
 
 /*
- * The firmware back from a stop, from what that stop did: the domains on, the DARTs back,
- * RTKit restarted warm, RUN on and the boot's handshake, then the wake's calls. The same after
- * a sleep that happened as after one given up: the domains were off in both. A firmware that
- * does not come back stays stopped, its RUN bit off again, and is taken as crashed: the panel
- * stays dark, the next sleep starts it again.
+ * The firmware back from a stop, from what that stop did: the domains on, both DARTs back
+ * and checked, RTKit restarted warm, RUN on and the boot's handshake, then the wake's calls
+ * and the IOMFB queue settled. The same after a sleep that happened as after one given up:
+ * the domains were off in both. Nothing clears the crash mark or sets RUN before both DARTs
+ * are back as they were. A firmware that does not come back is stopped cold again, its queue
+ * left closed, and taken as crashed, which resumes its CRTC disabled (dcp_crtc_mode_fixup());
+ * the next sleep starts it from a power cycle again. Returns the first failure.
  */
 static int dcp_v27_early_restart(struct apple_dcp *dcp, struct dcp_v27_early *e)
 {
 	void __iomem *control = dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL;
-	const char *step = "power-on";
-	int ret = 0, err;
+	const char *step = "DART";
+	int ret = -EUCLEAN;
 
-	/* An idled firmware comes back only from a power cycle: one now, if the stop had none. */
-	if (e->stopped && !e->powered_off && !(readl(control) & APPLE_DCP_COPROC_CPU_CONTROL_RUN))
-		dcp_v27_early_power_down(dcp, e);
-	if (e->powered_off)
+	if (e->firmware_lost || e->display_lost)
+		goto lost;
+	/* An idled firmware comes back only from a power cycle: the stop's, or one now. */
+	if (e->stopped && !e->powered_off) {
+		step = "power cycle";
+		ret = readl(control) & APPLE_DCP_COPROC_CPU_CONTROL_RUN ? -EBUSY :
+		      dcp_v27_early_power_down(dcp, e);
+		if (ret)
+			goto lost;
+	}
+	if (e->powered_off) {
+		step = "power-on";
 		ret = dcp_v27_early_domains_on(dcp, e);
-	if (ret)
-		goto lost;
-	step = "DART";
-	if (e->firmware) {
-		ret = apple_dart_v27_cycle_on(e->firmware);
-		e->firmware = NULL;
+		if (ret)
+			goto lost;
 	}
-	if (e->display) {
-		err = apple_dart_v27_cycle_on(e->display);
-		e->display = NULL;
-		ret = ret ?: err;
-	}
-	if (ret)
-		goto lost;
 	if (e->stopped) {
+		step = "DART";
+		ret = dcp_v27_early_darts_on(dcp, e);
+		if (ret)
+			goto lost;
 		step = "RTKit";
 		dcp_s2r_forget_crash(dcp);
 		ret = apple_rtkit_warm_restart(dcp->rtk);
@@ -2304,20 +2431,15 @@ static int dcp_v27_early_restart(struct apple_dcp *dcp, struct dcp_v27_early *e)
 		if (ret)
 			goto stop;
 		e->stopped = false;
-		e->idled = false;
 	}
+	step = "wake calls";
 	ret = dcp_v27_early_calls_on(dcp, e);
-	/*
-	 * An answered refusal leaves a running firmware: the panel may stay dark, no more. One
-	 * that answers nothing is stopped again, for the next sleep to start it from a cycle.
-	 */
-	if (ret == -ETIMEDOUT) {
-		step = "wake calls";
+	if (ret)
 		goto stop;
-	}
+	step = "settle";
 	ret = iomfb_queue_settle(dcp, msecs_to_jiffies(1000));
 	if (ret)
-		dev_warn(dcp->dev, "V27 wake: the IOMFB queue did not settle: %d\n", ret);
+		goto stop;
 	WRITE_ONCE(dcp->s2r_fw_down, false);
 	dcp_v27_early_reopen(dcp, e);
 	dcp_s2r_put_darts(dcp);
@@ -2327,9 +2449,11 @@ static int dcp_v27_early_restart(struct apple_dcp *dcp, struct dcp_v27_early *e)
 stop:
 	dcp_s2r_cpu_stop(dcp);
 	e->stopped = true;
+	WRITE_ONCE(dcp->s2r_fw_down, true);
 lost:
-	dev_err(dcp->dev, "V27 wake: firmware not back at %s: %d (control %#x); the display stays off\n",
-		step, ret, e->powered_off ? 0 : readl(control));
+	dev_err(dcp->dev, "V27 wake: firmware not back at %s: %d (control %#x; DART lost %d/%d); the display stays off:%s\n",
+		step, ret, e->powered_off ? 0 : readl(control), e->firmware_lost,
+		e->display_lost, e->steps);
 	WRITE_ONCE(dcp->crashed, true);
 	return ret;
 }
@@ -2346,14 +2470,17 @@ static int dcp_v27_early_suspend(struct apple_dcp *dcp)
 	int ret = 0;
 
 	/*
-	 * Left stopped by a restart that failed: it stays so, RUN off and, where that can be done,
-	 * its domains down, so that the next resume starts it from a power cycle again.
+	 * Left stopped by a restart that failed: it stays so, RUN off and its domains down, so
+	 * that the next resume starts it from a power cycle again. Without that power-down the
+	 * sleep is refused.
 	 */
 	if (e && e->stopped) {
 		if (!e->powered_off) {
 			if (readl(control) & APPLE_DCP_COPROC_CPU_CONTROL_RUN)
 				return -EBUSY;
-			dcp_v27_early_power_down(dcp, e);
+			ret = dcp_v27_early_power_down(dcp, e);
+			if (ret)
+				return ret;
 		}
 		device_set_wakeup_path(dcp->dev);
 		return 0;
@@ -2370,8 +2497,8 @@ static int dcp_v27_early_suspend(struct apple_dcp *dcp)
 		dev_info(dcp->dev, "V27 sleep: refused, no saved mode-config state\n");
 		return -EBUSY;
 	}
-	/* A lit pipe goes off by the display's own power state: its arguments from the DT. */
-	if (READ_ONCE(dcp->pipe_enabled_h17p) && iomfb_v27_display_args(dcp, false, args)) {
+	/* The pipe goes off by the display's own power state: its arguments from the DT. */
+	if (iomfb_v27_display_args(dcp, false, args)) {
 		dev_info(dcp->dev, "V27 sleep: refused, no arguments in the DT to turn the panel off\n");
 		return -EOPNOTSUPP;
 	}
@@ -2408,6 +2535,7 @@ static int dcp_v27_early_suspend(struct apple_dcp *dcp)
 		}
 		dcp->v27_early = e;
 	}
+	/* Not stopped, so no DART was lost and no floor is kept aside: a fresh start. */
 	memset(e, 0, sizeof(*e));
 	e->steps_start = ktime_get();
 	dcp_v27_early_inventory(dcp);
@@ -2417,14 +2545,14 @@ static int dcp_v27_early_suspend(struct apple_dcp *dcp)
 	ret = dcp_v27_early_step(e, "settle", iomfb_queue_settle(dcp, msecs_to_jiffies(500)));
 	if (ret)
 		goto reopen;
-	e->soft_on = READ_ONCE(dcp->pipe_enabled_h17p);
 	ret = dcp_v27_early_calls_off(dcp, e);
 	if (ret)
 		goto undo;
 	/* What the firmware sends after A500 is answered before the idle. */
 	usleep_range(5000, 6000);
-	if (read_poll_timeout(iomfb_channels_idle, idle, idle, 1000, 100000, false, dcp))
-		dev_warn(dcp->dev, "V27 sleep: firmware calls still in flight before the idle\n");
+	ret = read_poll_timeout(iomfb_channels_idle, idle, idle, 1000, 100000, false, dcp);
+	if (dcp_v27_early_step(e, "drain", ret))
+		goto undo;
 	busy = dcp_v27_early_endpoints_busy(dcp, 250);
 	if (busy) {
 		dev_warn(dcp->dev, "V27 sleep: endpoint %#x has a command unanswered\n", busy);
@@ -2444,9 +2572,13 @@ static int dcp_v27_early_suspend(struct apple_dcp *dcp)
 			dev_warn(dcp->dev, "V27 sleep: AP on after the refused idle failed\n");
 		goto undo;
 	}
-	e->idled = true;
 	ret = dcp_v27_early_stop(dcp, e);
 	dev_info(dcp->dev, "V27 sleep: internal DCP stop:%s; result %d\n", e->steps, ret);
+	if (ret && !e->stopped) {
+		/* Nothing stopped and no DART touched: woken from its idle, as a stopped CPU is. */
+		ret = dcp_v27_early_step(e, "wake", apple_rtkit_wake(dcp->rtk));
+		goto undo;
+	}
 	if (ret) {
 		/* A device whose suspend fails gets no resume: back up here, the sleep refused. */
 		dcp_v27_early_restart(dcp, e);
@@ -2457,8 +2589,17 @@ static int dcp_v27_early_suspend(struct apple_dcp *dcp)
 	return 0;
 undo:
 	dev_info(dcp->dev, "V27 sleep: internal DCP stop refused:%s\n", e->steps);
-	if (dcp_v27_early_calls_on(dcp, e) == -ETIMEDOUT)
+	ret = dcp_v27_early_calls_on(dcp, e);
+	if (!ret)
+		ret = iomfb_queue_settle(dcp, msecs_to_jiffies(1000));
+	if (ret) {
+		/* No answer, or the wrong one: nothing more is sent to it, its CRTC resumes off. */
+		dev_err(dcp->dev, "V27 sleep: the firmware not back from the refused stop: %d:%s\n",
+			ret, e->steps);
 		WRITE_ONCE(dcp->crashed, true);
+		dcp_s2r_put_darts(dcp);
+		return -EBUSY;
+	}
 reopen:
 	dcp_v27_early_reopen(dcp, e);
 	dcp_s2r_put_darts(dcp);
@@ -2469,11 +2610,9 @@ static int dcp_v27_early_resume(struct apple_dcp *dcp)
 {
 	struct dcp_v27_early *e = dcp->v27_early;
 
-	/* Also when the restart fails: the sleep's outcome is not this device's to refuse. */
 	if (e->stopped || e->powered_off || e->firmware || e->display)
-		dcp_v27_early_restart(dcp, e);
-	else
-		dcp_v27_early_reopen(dcp, e);
+		return dcp_v27_early_restart(dcp, e);
+	dcp_v27_early_reopen(dcp, e);
 	return 0;
 }
 #else
