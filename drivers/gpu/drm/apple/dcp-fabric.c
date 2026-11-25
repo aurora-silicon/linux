@@ -5032,8 +5032,10 @@ static int dcp_register_typec_routes_present(void *data)
 		dcp->nr_typec_routes++;
 	}
 
-	if (!dcp->nr_typec_routes)
-		return dev_err_probe(dev, -EINVAL, "Type-C route container is empty\n");
+	if (!dcp->nr_typec_routes) {
+		dev_info(dev, "no usable Type-C display routes\n");
+		return 0;
+	}
 
 	dcp->phy_managed_by_typec = true;
 	return 0;
@@ -5064,8 +5066,12 @@ int dcp_register_typec_routes(struct apple_dcp *dcp)
 	struct device_node *routes __free(device_node) =
 		of_get_child_by_name(dcp->dev->of_node, "typec-routes");
 	struct dcp_route_probe_context ctx = { .dcp = dcp, .routes = routes };
+	bool has_routes = dcp_typec_routes_available(routes);
 
-	return dcp_fabric_run_probe(!!routes, dcp_register_typec_routes_present, &ctx);
+	if (routes && !has_routes)
+		dev_info(dcp->dev, "no usable Type-C display routes\n");
+
+	return dcp_fabric_run_probe(has_routes, dcp_register_typec_routes_present, &ctx);
 }
 
 /*
