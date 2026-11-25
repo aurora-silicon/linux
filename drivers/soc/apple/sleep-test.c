@@ -539,6 +539,9 @@ static void apple_sleep_test_seq_fits(struct kunit *test)
 		/* A 32-bit restore */
 		{ { SLEEP_OP_RESTORE, 0, 0xffc, 0 }, 0x1000, true },
 		{ { SLEEP_OP_RESTORE, 0, 0x1000, 0 }, 0x1000, false },
+		/* A guard's width is its register's */
+		{ { SLEEP_OP_IF_SAVED, 0, 0xffc, 1 }, 0x1000, true },
+		{ { SLEEP_OP_IF_SAVED64, 0, 0xffc, 1 }, 0x1000, false },
 		/* No such kind */
 		{ { SLEEP_OP_KINDS, 0, 0x0, 0 }, 0x1000, false },
 		{ { 0xff, 0, 0x0, 0 }, 0x1000, false },
@@ -579,9 +582,9 @@ static void apple_sleep_test_seq_run64(struct kunit *test)
 }
 
 /*
- * The 64-bit set keeps the rest of its register. A restore writes back what sleep_seq_save()
- * read, whatever the register holds by then, a 32-bit one only its low word; with nothing
- * saved it writes nothing and counts as failed.
+ * A strict run: a restore writes back what sleep_seq_save() read, whatever the register holds
+ * by then, a 32-bit one only its low word, and the 64-bit set keeps the rest of its register.
+ * With nothing saved the run stops at the first restore: nothing after it runs.
  */
 static void apple_sleep_test_seq_restore(struct kunit *test)
 {
@@ -602,24 +605,110 @@ static void apple_sleep_test_seq_restore(struct kunit *test)
 	regs[0] = 0x1122334455667788ULL;
 	regs[1] = 0xaaaaaaaabbbbbbbbULL;
 	regs[2] = 0xffffffff00000001ULL;
-	KUNIT_EXPECT_EQ(test, sleep_seq_run(blk, &seq), 2);
+	KUNIT_EXPECT_EQ(test, sleep_seq_run_strict(blk, &seq), -ENODATA);
 	KUNIT_EXPECT_EQ(test, regs[0], 0x1122334455667788ULL);
 	KUNIT_EXPECT_EQ(test, regs[1], 0xaaaaaaaabbbbbbbbULL);
-	KUNIT_EXPECT_EQ(test, regs[2], 0xffffffff00000005ULL);
+	KUNIT_EXPECT_EQ(test, regs[2], 0xffffffff00000001ULL);
 
 	sleep_seq_save(blk, &seq);
 	regs[0] = 0;
 	regs[1] = 0;
-	KUNIT_EXPECT_EQ(test, sleep_seq_run(blk, &seq), 0);
+	KUNIT_EXPECT_EQ(test, sleep_seq_run_strict(blk, &seq), 0);
 	KUNIT_EXPECT_EQ(test, regs[0], 0x1122334455667788ULL);
 	KUNIT_EXPECT_EQ(test, regs[1], 0x00000000bbbbbbbbULL);
 	KUNIT_EXPECT_EQ(test, regs[2], 0xffffffff00000005ULL);
+}
+
+/*
+ * A guard runs its span only where its register, as saved, had one of its bits: a mask bit
+ * off at the entry is never set at the wake, nor are the words that go with it. With nothing
+ * saved a strict run stops at the guard and runs none of its span.
+ */
+static void apple_sleep_test_seq_guard(struct kunit *test)
+{
+	static const u32 ops[] = {
+		SLEEP_OP_IF_SAVED64 | FIELD_PREP_CONST(SLEEP_OP_SPAN, 2), 0, 0x0, 0x1,
+		SLEEP_OP_RESTORE64, 0, 0x8, 0,
+		SLEEP_OP_SET64, 0, 0x0, 0x1,
+		SLEEP_OP_IF_SAVED64 | FIELD_PREP_CONST(SLEEP_OP_SPAN, 2), 0, 0x0, 0x2,
+		SLEEP_OP_RESTORE64, 0, 0x10, 0,
+		SLEEP_OP_SET64, 0, 0x0, 0x2,
+		SLEEP_OP_SET64, 0, 0x18, 0x8,
+	};
+	u64 *regs = kunit_kzalloc(test, 4 * sizeof(*regs), GFP_KERNEL);
+	u64 *saved = kunit_kcalloc(test, ARRAY_SIZE(ops) / 4, sizeof(*saved), GFP_KERNEL);
+	struct sleep_seq seq = { .op = ops, .n = ARRAY_SIZE(ops) / 4, .saved = saved };
+	void __iomem *blk[1];
+
+	KUNIT_ASSERT_NOT_NULL(test, regs);
+	KUNIT_ASSERT_NOT_NULL(test, saved);
+	blk[0] = (void __force __iomem *)regs;
+	KUNIT_EXPECT_EQ(test, sleep_seq_run_strict(blk, &seq), -ENODATA);
+	KUNIT_EXPECT_EQ(test, regs[0], 0ULL);
+	KUNIT_EXPECT_EQ(test, regs[3], 0ULL);
+
+	/* At the entry: bit 0 on, bit 1 off, each way's word set */
+	regs[0] = 0x1;
+	regs[1] = 0x1111;
+	regs[2] = 0x2222;
+	sleep_seq_save(blk, &seq);
+	/* The sleep: the mask cleared, the words lost */
+	regs[0] = 0;
+	regs[1] = 0;
+	regs[2] = 0;
+	KUNIT_EXPECT_EQ(test, sleep_seq_run_strict(blk, &seq), 0);
+	KUNIT_EXPECT_EQ(test, regs[0], 0x1ULL);
+	KUNIT_EXPECT_EQ(test, regs[1], 0x1111ULL);
+	KUNIT_EXPECT_EQ(test, regs[2], 0ULL);
+	/* After the guards, unconditional again */
+	KUNIT_EXPECT_EQ(test, regs[3], 0x8ULL);
+}
+
+/* What the parser refuses, entry by entry */
+static void apple_sleep_test_seq_check(struct kunit *test)
+{
+	const struct {
+		u32 op[8];
+		unsigned int n;
+		bool saves;
+		int ret;
+	} cases[] = {
+		{ { SLEEP_OP_WRITE, 0, 0x0, 1 }, 1, false, 0 },
+		/* Reserved bits, and a flag on a kind that takes none */
+		{ { SLEEP_OP_WRITE | BIT(9), 0, 0x0, 1 }, 1, false, -ERANGE },
+		{ { SLEEP_OP_WRITE | SLEEP_OP_OPTIONAL, 0, 0x0, 1 }, 1, false, -ERANGE },
+		{ { SLEEP_OP_SET | FIELD_PREP(SLEEP_OP_TIMEOUT, 5), 0, 0x0, 1 }, 1, false,
+		  -ERANGE },
+		{ { SLEEP_OP_WAIT_SET | SLEEP_OP_OPTIONAL | FIELD_PREP(SLEEP_OP_TIMEOUT, 5), 0, 0x0,
+		    1 }, 1, false, 0 },
+		/* What needs a save, in a sequence without one */
+		{ { SLEEP_OP_RESTORE64, 0, 0x0, 0 }, 1, false, -ERANGE },
+		{ { SLEEP_OP_RESTORE64, 0, 0x0, 0 }, 1, true, 0 },
+		{ { SLEEP_OP_RESTORE64, 0, 0x0, 1 }, 1, true, -ERANGE },
+		/* A guard's span: not empty, and inside the sequence */
+		{ { SLEEP_OP_IF_SAVED, 0, 0x0, 1, SLEEP_OP_WRITE, 0, 0x4, 1 }, 2, true, -ERANGE },
+		{ { SLEEP_OP_IF_SAVED | FIELD_PREP(SLEEP_OP_SPAN, 1), 0, 0x0, 1,
+		    SLEEP_OP_WRITE, 0, 0x4, 1 }, 2, true, 0 },
+		{ { SLEEP_OP_IF_SAVED | FIELD_PREP(SLEEP_OP_SPAN, 2), 0, 0x0, 1,
+		    SLEEP_OP_WRITE, 0, 0x4, 1 }, 2, true, -ERANGE },
+		{ { SLEEP_OP_IF_SAVED | FIELD_PREP(SLEEP_OP_SPAN, 1), 0, 0x0, 1,
+		    SLEEP_OP_WRITE, 0, 0x4, 1 }, 2, false, -ERANGE },
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		int ret = sleep_op_check(cases[i].op, 0, cases[i].n, 0x1000, cases[i].saves);
+
+		KUNIT_EXPECT_EQ_MSG(test, ret, cases[i].ret, "case %u", i);
+	}
 }
 
 static struct kunit_case apple_sleep_test_cases[] = {
 	KUNIT_CASE(apple_sleep_test_seq_fits),
 	KUNIT_CASE(apple_sleep_test_seq_run64),
 	KUNIT_CASE(apple_sleep_test_seq_restore),
+	KUNIT_CASE(apple_sleep_test_seq_guard),
+	KUNIT_CASE(apple_sleep_test_seq_check),
 	KUNIT_CASE(apple_sleep_test_layout),
 	KUNIT_CASE(apple_sleep_test_t6050),
 	KUNIT_CASE(apple_sleep_test_j716c_inventory),

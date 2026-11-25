@@ -7729,29 +7729,37 @@ static void apple_sleep_put_node(void *np)
 
 /*
  * A register sequence the device tree supplies, as <kind block offset value> each, run in
- * order. Bits 7:0 of kind: write the value, read, set the value's bits, clear them, write back
- * what is read, wait for the value's bits to be set, wait for them to be clear, a 16-bit write;
- * then for 64-bit registers, read and written whole: a write of the value as the high word
- * with the low word 0, a clear of the value's bits in the low word, a set of them, a read;
- * then a write of what sleep_seq_save() read from the register, 32-bit and 64-bit, whose value
- * is unused. Bits 31:16: a wait's timeout in ms (0: 10 ms); bit 8: its timeout, or a restore
- * with nothing saved, is not an error. What a block number names is the profile's own.
+ * order. Bits 7:0 of kind:
+ *  - 0 to 7: write the value, read, set the value's bits, clear them, write back what is
+ *    read, wait for the value's bits to be set, wait for them to be clear, a 16-bit write;
+ *  - 8 to 11, on 64-bit registers read and written whole: a write of the value as the high
+ *    word with the low word 0, a clear of the value's bits in the low word, a set of them, a
+ *    read;
+ *  - 12 and 13: a 32-bit and a 64-bit write of what sleep_seq_save() read from the register;
+ *  - 14 and 15: the next entries, as many as bits 31:16 say, run only if the 32-bit or 64-bit
+ *    register, as sleep_seq_save() read it, had one of the value's bits set.
+ * A wait's bits 31:16 are its timeout in ms (0: 10 ms), and bit 8 makes the timeout no error.
+ * Kinds 12 to 15 need a sleep_seq_save() first, and a restore's value is 0. Every other bit is
+ * reserved. What a block number names is the profile's own.
  */
 enum {
 	SLEEP_OP_WRITE, SLEEP_OP_READ, SLEEP_OP_SET, SLEEP_OP_CLEAR, SLEEP_OP_REWRITE,
 	SLEEP_OP_WAIT_SET, SLEEP_OP_WAIT_CLEAR, SLEEP_OP_WRITE16, SLEEP_OP_WRITE64_HI,
 	SLEEP_OP_CLEAR64, SLEEP_OP_SET64, SLEEP_OP_READ64, SLEEP_OP_RESTORE, SLEEP_OP_RESTORE64,
-	SLEEP_OP_KINDS,
+	SLEEP_OP_IF_SAVED, SLEEP_OP_IF_SAVED64, SLEEP_OP_KINDS,
 };
 
 #define SLEEP_OP_KIND		GENMASK(7, 0)
 #define SLEEP_OP_OPTIONAL	BIT(8)
+#define SLEEP_OP_RESERVED	GENMASK(15, 9)
 #define SLEEP_OP_TIMEOUT	GENMASK(31, 16)
+/* A guard's span: how many of the entries that follow it are covered */
+#define SLEEP_OP_SPAN		SLEEP_OP_TIMEOUT
 
 struct sleep_seq {
 	const u32 *op;
 	unsigned int n;
-	/* What sleep_seq_save() read for each restore op, by op; NULL without restore ops */
+	/* What sleep_seq_save() read for each restore and guard, by entry; NULL without them */
 	u64 *saved;
 	bool have_saved;
 };
@@ -7764,9 +7772,11 @@ static unsigned int sleep_op_width(u32 kind)
 		return 2;
 	case SLEEP_OP_WRITE ... SLEEP_OP_WAIT_CLEAR:
 	case SLEEP_OP_RESTORE:
+	case SLEEP_OP_IF_SAVED:
 		return 4;
 	case SLEEP_OP_WRITE64_HI ... SLEEP_OP_READ64:
 	case SLEEP_OP_RESTORE64:
+	case SLEEP_OP_IF_SAVED64:
 		return 8;
 	default:
 		return 0;
@@ -7781,25 +7791,50 @@ static bool sleep_op_fits(const u32 *op, u32 size)
 	return width && size >= width && op[2] <= size - width && !(op[2] % width);
 }
 
-static bool sleep_op_restores(const u32 *op)
+/* Whether entries of @kind read their register at sleep_seq_save() */
+static bool sleep_op_saved(u32 kind)
 {
-	u32 kind = FIELD_GET(SLEEP_OP_KIND, op[0]);
+	return kind >= SLEEP_OP_RESTORE && kind <= SLEEP_OP_IF_SAVED64;
+}
 
-	return kind == SLEEP_OP_RESTORE || kind == SLEEP_OP_RESTORE64;
+/*
+ * Entry @i of the @n at @op, its block @size bytes, in a sequence that @saves or not: 0, or
+ * -ERANGE for an access outside its block or misaligned, a reserved bit, a flag on a kind that
+ * takes none, a kind that needs a save where none is made, a restore with a value, or a guard
+ * whose span is empty or leaves the sequence.
+ */
+static int sleep_op_check(const u32 *op, unsigned int i, unsigned int n, u32 size, bool saves)
+{
+	const u32 *e = &op[4 * i];
+	u32 kind = FIELD_GET(SLEEP_OP_KIND, e[0]), span = FIELD_GET(SLEEP_OP_SPAN, e[0]);
+	bool wait = kind == SLEEP_OP_WAIT_SET || kind == SLEEP_OP_WAIT_CLEAR;
+	bool guard = kind == SLEEP_OP_IF_SAVED || kind == SLEEP_OP_IF_SAVED64;
+
+	if (!sleep_op_fits(e, size) || (e[0] & SLEEP_OP_RESERVED))
+		return -ERANGE;
+	if (((e[0] & SLEEP_OP_OPTIONAL) && !wait) || (span && !wait && !guard))
+		return -ERANGE;
+	if (sleep_op_saved(kind) && !saves)
+		return -ERANGE;
+	if ((kind == SLEEP_OP_RESTORE || kind == SLEEP_OP_RESTORE64) && e[3])
+		return -ERANGE;
+	if (guard && (!span || span >= n - i))
+		return -ERANGE;
+	return 0;
 }
 
 /*
  * The DT property @name as a sequence. @block_size gives the size of block @b, mapping it if
- * needed, or 0 where the profile has no such block. 0 with an empty sequence without the
- * property. -ERANGE, and nothing of it to run, where an entry is of no known kind, names a
- * block the DT doesn't map, or an offset its access doesn't fit at or isn't aligned to.
+ * needed, or 0 where the profile has no such block. Only a sequence that @saves, for which
+ * the profile calls sleep_seq_save(), may have kinds 12 to 15. 0 with an empty sequence without
+ * the property. -ERANGE, and nothing of it to run, for an entry sleep_op_check() refuses.
  */
 static int sleep_seq_get(struct apple_sleep *s, const char *name, struct sleep_seq *seq,
-			 u32 (*block_size)(struct apple_sleep *s, u32 b))
+			 u32 (*block_size)(struct apple_sleep *s, u32 b), bool saves)
 {
 	int len = of_property_count_u32_elems(s->dev->of_node, name);
+	bool saved = false;
 	unsigned int i;
-	bool restores = false;
 	u32 *op;
 
 	seq->n = 0;
@@ -7814,19 +7849,19 @@ static int sleep_seq_get(struct apple_sleep *s, const char *name, struct sleep_s
 		return -ENOMEM;
 	if (of_property_read_u32_array(s->dev->of_node, name, op, len))
 		return -EINVAL;
-	for (i = 0; i < len; i += 4) {
-		u32 size = sleep_op_width(FIELD_GET(SLEEP_OP_KIND, op[i])) ?
-			   block_size(s, op[i + 1]) : 0;
+	for (i = 0; i < len / 4; i++) {
+		u32 kind = FIELD_GET(SLEEP_OP_KIND, op[4 * i]);
+		u32 size = sleep_op_width(kind) ? block_size(s, op[4 * i + 1]) : 0;
 
-		if (!sleep_op_fits(&op[i], size)) {
-			dev_warn(s->dev, "%s: entry %u is outside its block or misaligned\n", name,
-				 i / 4);
+		if (sleep_op_check(op, i, len / 4, size, saves)) {
+			dev_warn(s->dev, "%s: entry %u is outside its block, misaligned or malformed\n",
+				 name, i);
 			devm_kfree(s->dev, op);
 			return -ERANGE;
 		}
-		restores |= sleep_op_restores(&op[i]);
+		saved |= sleep_op_saved(kind);
 	}
-	if (restores) {
+	if (saved) {
 		seq->saved = devm_kcalloc(s->dev, len / 4, sizeof(*seq->saved), GFP_KERNEL);
 		if (!seq->saved)
 			return -ENOMEM;
@@ -7836,36 +7871,41 @@ static int sleep_seq_get(struct apple_sleep *s, const char *name, struct sleep_s
 	return 0;
 }
 
-/* Each restore op's register of @seq read now, for sleep_seq_run() to write back */
+/* Each restore's and guard's register of @seq read now, for sleep_seq_run_strict() */
 static void sleep_seq_save(void __iomem *const *blk, struct sleep_seq *seq)
 {
 	unsigned int i;
 
 	for (i = 0; i < seq->n; i++) {
 		const u32 *op = &seq->op[4 * i];
-		void __iomem *reg = blk[op[1]] + op[2];
+		u32 kind = FIELD_GET(SLEEP_OP_KIND, op[0]);
 
-		if (FIELD_GET(SLEEP_OP_KIND, op[0]) == SLEEP_OP_RESTORE)
-			seq->saved[i] = readl(reg);
-		else if (FIELD_GET(SLEEP_OP_KIND, op[0]) == SLEEP_OP_RESTORE64)
-			seq->saved[i] = readq(reg);
+		if (!sleep_op_saved(kind))
+			continue;
+		if (sleep_op_width(kind) == 8)
+			seq->saved[i] = readq(blk[op[1]] + op[2]);
+		else
+			seq->saved[i] = readl(blk[op[1]] + op[2]);
 	}
 	seq->have_saved = true;
 }
 
 /*
- * @seq on the blocks @blk names: the number of waits that timed out and restores with nothing
- * saved, which write nothing, other than optional ones
+ * @seq on the blocks @blk names. An entry fails for a wait that timed out, other than an
+ * optional one, or for a restore or guard with nothing saved, which writes nothing and, for a
+ * guard, runs none of its span. With @strict the run stops at the first that fails and returns
+ * its error; without, it goes on and returns how many failed.
  */
-static unsigned int sleep_seq_run(void __iomem *const *blk, const struct sleep_seq *seq)
+static int sleep_seq_exec(void __iomem *const *blk, const struct sleep_seq *seq, bool strict)
 {
-	unsigned int i, timeouts = 0;
+	unsigned int i, failed = 0;
 	u32 v;
 
 	for (i = 0; i < seq->n; i++) {
 		const u32 *op = &seq->op[4 * i];
 		void __iomem *reg = blk[op[1]] + op[2];
 		u32 ms = FIELD_GET(SLEEP_OP_TIMEOUT, op[0]) ?: 10;
+		u32 span = FIELD_GET(SLEEP_OP_SPAN, op[0]);
 		int ret = 0;
 
 		switch (FIELD_GET(SLEEP_OP_KIND, op[0])) {
@@ -7917,11 +7957,33 @@ static unsigned int sleep_seq_run(void __iomem *const *blk, const struct sleep_s
 			else
 				ret = -ENODATA;
 			break;
+		case SLEEP_OP_IF_SAVED:
+		case SLEEP_OP_IF_SAVED64:
+			if (!seq->have_saved)
+				ret = -ENODATA;
+			if (ret || !(seq->saved[i] & op[3]))
+				i += span;
+			break;
 		}
-		if (ret && !(op[0] & SLEEP_OP_OPTIONAL))
-			timeouts++;
+		if (!ret || (op[0] & SLEEP_OP_OPTIONAL))
+			continue;
+		if (strict)
+			return ret;
+		failed++;
 	}
-	return timeouts;
+	return failed;
+}
+
+/* @seq, every entry, whatever fails: the number that failed */
+static unsigned int sleep_seq_run(void __iomem *const *blk, const struct sleep_seq *seq)
+{
+	return sleep_seq_exec(blk, seq, false);
+}
+
+/* @seq up to the first entry that fails: 0, or that entry's error */
+static int sleep_seq_run_strict(void __iomem *const *blk, const struct sleep_seq *seq)
+{
+	return sleep_seq_exec(blk, seq, true);
 }
 
 #include "sleep-t6050.h"

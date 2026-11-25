@@ -116,7 +116,8 @@ static u32 t6030_block(struct apple_sleep *s, u32 b)
 		return 0;
 	if (t->blk[b])
 		return t->blk_size[b];
-	if (of_address_to_resource(s->dev->of_node, b, &res))
+	/* An entry's alignment is checked against the block: the block's own must hold too */
+	if (of_address_to_resource(s->dev->of_node, b, &res) || !IS_ALIGNED(res.start, sizeof(u64)))
 		return 0;
 	/* Shared with the drivers of those blocks: not claimed */
 	t->blk[b] = devm_ioremap(s->dev, res.start, resource_size(&res));
@@ -124,10 +125,14 @@ static u32 t6030_block(struct apple_sleep *s, u32 b)
 	return t->blk_size[b];
 }
 
-/* All of them, each whole: one missing, empty or with an entry that doesn't fit fails the probe */
-static int t6030_sleep_seq_get(struct apple_sleep *s, const char *name, struct sleep_seq *seq)
+/*
+ * All of them, each whole: one missing, empty or with an entry that doesn't fit fails the probe.
+ * Only the wake's, read at .commit_regs, may restore or test what was read.
+ */
+static int t6030_sleep_seq_get(struct apple_sleep *s, const char *name, struct sleep_seq *seq,
+			       bool saves)
 {
-	int ret = sleep_seq_get(s, name, seq, t6030_block);
+	int ret = sleep_seq_get(s, name, seq, t6030_block, saves);
 
 	if (ret)
 		return dev_err_probe(s->dev, ret, "%s unusable\n", name);
@@ -194,11 +199,11 @@ static int t6030_sleep_map_regs(struct apple_sleep *s)
 		.slpa_to_idle_us = v[3], .idle_to_timer_us = v[4], .waka_to_pmvc_us = v[5],
 	};
 
-	ret = t6030_sleep_seq_get(s, "apple,seq-prepare", &t->prepare) ?:
-	      t6030_sleep_seq_get(s, "apple,seq-notice", &t->notice) ?:
-	      t6030_sleep_seq_get(s, "apple,seq-commit", &t->commit) ?:
-	      t6030_sleep_seq_get(s, "apple,seq-wake-early", &t->wake_early) ?:
-	      t6030_sleep_seq_get(s, "apple,seq-wake", &t->wake);
+	ret = t6030_sleep_seq_get(s, "apple,seq-prepare", &t->prepare, false) ?:
+	      t6030_sleep_seq_get(s, "apple,seq-notice", &t->notice, false) ?:
+	      t6030_sleep_seq_get(s, "apple,seq-commit", &t->commit, false) ?:
+	      t6030_sleep_seq_get(s, "apple,seq-wake-early", &t->wake_early, true) ?:
+	      t6030_sleep_seq_get(s, "apple,seq-wake", &t->wake, true);
 	if (ret)
 		return ret;
 
@@ -274,7 +279,7 @@ static void t6030_sleep_prepare_regs(struct apple_sleep *s)
 	t->notify_staged = true;
 	writel(s->soc->spmi_notify_sleep, s->spmi_a0 + SPMI_NOTIFY_ENABLE);
 	writel(s->soc->spmi_notify_sleep, s->spmi + SPMI_NOTIFY_ENABLE);
-	if (sleep_seq_run(t->blk, &t->prepare))
+	if (sleep_seq_run_strict(t->blk, &t->prepare))
 		t6030_sleep_failed("apple,seq-prepare");
 }
 
@@ -316,7 +321,7 @@ static void t6030_sleep_after_early(struct apple_sleep *s)
 	t6030_sleep_check_stops();
 	if (t6030_sleep_lower(s, T6030_LOWER_SIO_CPU, T6030_LOWER_PMP))
 		t6030_sleep_failed("SIO CPU power word");
-	if (sleep_seq_run(t->blk, &t->notice))
+	if (sleep_seq_run_strict(t->blk, &t->notice))
 		t6030_sleep_failed("apple,seq-notice");
 }
 
@@ -359,7 +364,7 @@ static void t6030_sleep_commit_regs(struct apple_sleep *s)
 	t->auto_staged = true;
 	sleep_seq_save(t->blk, &t->wake_early);
 	sleep_seq_save(t->blk, &t->wake);
-	if (sleep_seq_run(t->blk, &t->commit))
+	if (sleep_seq_run_strict(t->blk, &t->commit))
 		t6030_sleep_failed("apple,seq-commit");
 	/* Every listed word as the commit leaves it, for the wake's report */
 	sleep_ps_save(s);
@@ -385,15 +390,19 @@ static void t6030_sleep_unstage(struct apple_sleep *s, u32 offset, u32 before)
 		s->ps_commit[i] = before;
 }
 
-/* A wake sequence, once, with what .commit_regs read for it */
-static void t6030_sleep_wake_run(struct apple_sleep *s, struct sleep_seq *seq, const char *name)
+/*
+ * A wake sequence, once, with what .commit_regs read for it. Past the commit there is no
+ * going back: a sequence without its snapshot or with an entry that fails ends here, never in
+ * a wake with the memory side half restored.
+ */
+static void t6030_sleep_wake_seq(struct apple_sleep *s, struct sleep_seq *seq, const char *name)
 {
 	struct t6030_sleep *t = t6030_state(s);
-	unsigned int failed = sleep_seq_run(t->blk, seq);
+	int ret = sleep_seq_run_strict(t->blk, seq);
 
 	seq->have_saved = false;
-	if (failed)
-		dev_err(s->dev, "%s: %u entries failed\n", name, failed);
+	if (ret)
+		panic("T6030 wake: %s failed: %d", name, ret);
 }
 
 /*
@@ -409,7 +418,7 @@ static void t6030_sleep_wake(struct apple_sleep *s)
 
 	writel(CLUSTER_ON, s->cluster + T6030_CLUSTER_E);
 	writel(CLUSTER_ON, s->cluster + T6030_CLUSTER_P);
-	t6030_sleep_wake_run(s, &t->wake_early, "apple,seq-wake-early");
+	t6030_sleep_wake_seq(s, &t->wake_early, "apple,seq-wake-early");
 	/* SIO_CPU is in both lists: its value before the lowering is the one before the entry */
 	if (t->auto_staged)
 		for (i = 0; i < ARRAY_SIZE(t6030_auto_off); i++)
@@ -419,7 +428,7 @@ static void t6030_sleep_wake(struct apple_sleep *s)
 	t->auto_staged = false;
 	t->nlowered = 0;
 	sleep_ps_rewake(s);
-	t6030_sleep_wake_run(s, &t->wake, "apple,seq-wake");
+	t6030_sleep_wake_seq(s, &t->wake, "apple,seq-wake");
 	t6030_sleep_undo_regs(s);
 }
 
