@@ -677,7 +677,7 @@ T8122_SLEEP_FIXTURE = r'''
 #include <stdio.h>
 #include <string.h>
 struct apple_dpin_policy { int unused; };
-static const struct apple_dpin_policy apple_dpin_m1;
+static const struct apple_dpin_policy apple_dpin_m1, apple_dpin_m2;
 struct apple_cio_hw {
     bool sleep_removes_domains;
     bool restart_on_wake;
@@ -749,33 +749,42 @@ int main(void)
     static const char *const t8103_compat[] = {
         "apple,t8103-usb4-acio", NULL
     };
+    static const char *const t6020_compat[] = {
+        "apple,t6020-usb4-acio", "apple,t8103-usb4-acio", NULL
+    };
     const struct apple_cio_hw *t8122 = match_of(t8122_compat);
     const struct apple_cio_hw *t8103 = match_of(t8103_compat);
+    const struct apple_cio_hw *t6020 = match_of(t6020_compat);
     assert(t8122 == &apple_cio_t8122_hw);
     assert(t8103 == &apple_cio_t8103_hw);
-    assert(t8122->sleep_removes_domains);
-    assert(t8122->restart_on_wake);
-    assert(t8122->phy_shared_with_dwc3);
-    assert(t8122->dp == &apple_dpin_m1);
+    assert(t6020 == &apple_cio_t6020_hw);
+    assert(t8122->sleep_removes_domains && t8103->sleep_removes_domains);
+    assert(t8122->restart_on_wake && t8103->restart_on_wake);
+    assert(t8122->phy_shared_with_dwc3 && t8103->phy_shared_with_dwc3);
+    assert(t8122->dp == &apple_dpin_m1 && t8103->dp == &apple_dpin_m1);
 
     struct apple_cio acio_t8122 = { .hw = t8122 };
     struct apple_cio acio_t8103 = { .hw = t8103 };
+    struct apple_cio acio_t6020 = { .hw = t6020 };
 
-    /* mem_sleep=deep + mem tears down T8122 ACIO, leaves T8103 unchanged. */
+    /* mem_sleep=deep + mem tears down T8103 and T8122 ACIO, leaves T6020 unchanged. */
     default_s2idle = false;
     no_platform = false;
     assert(apple_cio_sleep_removes_domains(&acio_t8122));
-    assert(!apple_cio_sleep_removes_domains(&acio_t8103));
+    assert(apple_cio_sleep_removes_domains(&acio_t8103));
+    assert(!apple_cio_sleep_removes_domains(&acio_t6020));
 
     /* s2idle keeps the port up. */
     default_s2idle = true;
     no_platform = false;
     assert(!apple_cio_sleep_removes_domains(&acio_t8122));
+    assert(!apple_cio_sleep_removes_domains(&acio_t8103));
 
     /* freeze keeps the port up even when mem_sleep=deep is the default. */
     default_s2idle = false;
     no_platform = true;
     assert(!apple_cio_sleep_removes_domains(&acio_t8122));
+    assert(!apple_cio_sleep_removes_domains(&acio_t8103));
 
     /* Shared ATC PHY: ACIO PM notifier must run before DWC3's. */
     struct dwc3_apple dwc = { 0 };
@@ -785,7 +794,7 @@ int main(void)
         assert(!chain[i]->notifier_call());
     assert(pci_off && phy_off);
 
-    puts("PASS: T8122 ACIO deep-sleep teardown, freeze/s2idle preservation, and DWC3 PM order");
+    puts("PASS: T8103/T8122 ACIO deep-sleep teardown, freeze/s2idle preservation, and DWC3 PM order");
     return 0;
 }
 '''
@@ -794,7 +803,7 @@ int main(void)
 def test_t8122_cio_sleep(out, acio):
     dwc = (ROOT / 'drivers/usb/dwc3/dwc3-apple.c').read_text()
     hw_defs = []
-    for sym in ('apple_cio_t8103_hw', 'apple_cio_t8122_hw'):
+    for sym in ('apple_cio_t8103_hw', 'apple_cio_t8122_hw', 'apple_cio_t6020_hw'):
         m = re.search(r'^static const struct apple_cio_hw ' + sym +
                       r' = \{.*?\n\};', acio, re.M | re.S)
         assert m, sym
@@ -807,8 +816,9 @@ def test_t8122_cio_sleep(out, acio):
         r'\.compatible\s*=\s*"([^"]+)"\s*,\s*\.data\s*=\s*(&apple_cio_\w+_hw)',
         match_block.group())
     match_lines = [f'    {{ "{c}", {d} }},' for c, d in entries
-                   if c in ('apple,t8122-usb4-acio', 'apple,t8103-usb4-acio')]
-    assert len(match_lines) == 2, match_lines
+                   if c in ('apple,t8122-usb4-acio', 'apple,t6020-usb4-acio',
+                            'apple,t8103-usb4-acio')]
+    assert len(match_lines) == 3, match_lines
     code = T8122_SLEEP_FIXTURE
     code = code.replace('/* PRODUCTION_HW */', '\n'.join(hw_defs))
     code = code.replace('/* MATCH_ENTRIES */', '\n'.join(match_lines))
@@ -822,8 +832,22 @@ def test_t8122_cio_sleep(out, acio):
         'ret = register_pm_notifier(&appledwc->pm_nb);'))
     muts = {
         't8122-drop-match': ('    { "apple,t8122-usb4-acio", &apple_cio_t8122_hw },', ''),
-        't8122-drop-sleep-removes-domains': ('\t.sleep_removes_domains = true,\n', ''),
-        't8122-drop-phy-shared': ('\t.phy_shared_with_dwc3 = true,\n', ''),
+        't8103-drop-sleep-removes-domains': (
+            'static const struct apple_cio_hw apple_cio_t8103_hw = {\n'
+            '\t.sleep_removes_domains = true,\n',
+            'static const struct apple_cio_hw apple_cio_t8103_hw = {\n'),
+        't8122-drop-sleep-removes-domains': (
+            'static const struct apple_cio_hw apple_cio_t8122_hw = {\n'
+            '\t.sleep_removes_domains = true,\n',
+            'static const struct apple_cio_hw apple_cio_t8122_hw = {\n'),
+        't8122-drop-phy-shared': (
+            'static const struct apple_cio_hw apple_cio_t8122_hw = {\n'
+            '\t.sleep_removes_domains = true,\n'
+            '\t.restart_on_wake = true,\n'
+            '\t.phy_shared_with_dwc3 = true,\n',
+            'static const struct apple_cio_hw apple_cio_t8122_hw = {\n'
+            '\t.sleep_removes_domains = true,\n'
+            '\t.restart_on_wake = true,\n'),
     }
     cases = {'t8122-cio-sleep': code}
     for name, (old, new) in muts.items():
