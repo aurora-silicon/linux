@@ -1837,25 +1837,6 @@ static int __init gate_t8122_dcpext_setup(char *arg)
 }
 early_param("apple_t8122_display.dcpext", gate_t8122_dcpext_setup);
 
-/*
- * Whether the external display DART joins the display subsystem's domain:
- * -1 lets the board device tree decide (apple,no-shared-display-dart keeps
- * it out and mirrors framebuffers through the fbdma child instead); 0 and 1
- * override the board default.
- */
-static int gate_t8122_dcpext_disp_dart __initdata = -1;
-
-static int __init gate_t8122_dcpext_disp_dart_setup(char *arg)
-{
-	bool share;
-	int ret = kstrtobool(arg, &share);
-
-	if (!ret)
-		gate_t8122_dcpext_disp_dart = share;
-	return ret;
-}
-early_param("apple_t8122_display.dcpext_disp_dart", gate_t8122_dcpext_disp_dart_setup);
-
 /* The most display crossbars a T8122 dcpext's routes switch: ATC0's and ATC1's. */
 #define GATE_T8122_XBARS	2
 
@@ -1962,8 +1943,6 @@ static int __init gate_t8122_dcpext_alias(struct of_changeset *cs,
 static int __init gate_t8122_dcpext_shares_dart(struct device_node *np,
 						struct device_node *fbdma)
 {
-	if (gate_t8122_dcpext_disp_dart >= 0)
-		return gate_t8122_dcpext_disp_dart;
 	if (!of_property_read_bool(np, "apple,no-shared-display-dart"))
 		return 1;
 	return fbdma ? 0 : -ENODEV;

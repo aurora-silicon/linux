@@ -155,7 +155,6 @@ static int gt_fixture_t6041 __initdata = -1;
 static int gt_live_soc __initdata = -1;
 
 struct gate_test {
-	int dcpext_disp_dart;	/* apple_t8122_display.dcpext_disp_dart, as booted */
 	const struct gt_soc *s;
 	struct of_changeset cs;	/* this case's own edits to the test tree */
 	bool requested, t6031_requested;
@@ -415,8 +414,6 @@ static int __init gt_init(struct kunit *test, const struct gt_soc *s)
 		return -ENOMEM;
 	test->priv = t;
 	t->s = s;
-	t->dcpext_disp_dart = gate_t8122_dcpext_disp_dart;
-	gate_t8122_dcpext_disp_dart = -1;
 	t->pmp_uuid = s->pmp_uuid;
 	/* As the boot left them: the test kernel's command line sets neither. */
 	t->requested = gate_requested;
@@ -462,7 +459,6 @@ static void __init gt_exit(struct kunit *test)
 		gate_cs_free(gate_t8122_dcpext_cs);
 		gate_t8122_dcpext_cs = NULL;
 	}
-	gate_t8122_dcpext_disp_dart = t->dcpext_disp_dart;
 	/* The gate leaves its changes applied only when it enabled the display. */
 	if (gate_pmp_ovcs) {
 		of_changeset_revert(&gate_pmp_cs);
@@ -1100,27 +1096,6 @@ static void __init gate_t8122_dcpext_board_no_fbdma(struct kunit *test)
 	gt_expect_dcpext(test, false, NULL);
 }
 
-/* =0 keeps the DART out on a board that would share. */
-static void __init gate_t8122_dcpext_forced_unshared(struct kunit *test)
-{
-	gt_require_display_driver(test);
-	gt_t8122_dcpext_firmware(test, gt_v14_7, gt_v14_7);
-	KUNIT_ASSERT_EQ(test, gate_t8122_dcpext_disp_dart_setup("0"), 0);
-	gt_run(test);
-	gt_expect_dcpext_mode(test, true, false, NULL);
-}
-
-/* =1 shares on a board that mirrors, and disables its fbdma child. */
-static void __init gate_t8122_dcpext_forced_shared(struct kunit *test)
-{
-	gt_require_display_driver(test);
-	gt_t8122_dcpext_firmware(test, gt_v14_7, gt_v14_7);
-	gt_add_bool(test, GT_T8122_DCPEXT, "apple,no-shared-display-dart");
-	KUNIT_ASSERT_EQ(test, gate_t8122_dcpext_disp_dart_setup("1"), 0);
-	gt_run(test);
-	gt_expect_dcpext_mode(test, true, true, NULL);
-}
-
 /* On 27.2 with apple,no-shared-display-dart, DARTs get the panel window and fbdma stays on. */
 static void __init gate_t8122_dcpext_v27_2_mirrors(struct kunit *test)
 {
@@ -1314,8 +1289,6 @@ static struct kunit_case gate_t8122_cases[] __refdata = {
 	KUNIT_CASE(gate_t8122_dcpext_other_marker),
 	KUNIT_CASE(gate_t8122_dcpext_board_mirrors),
 	KUNIT_CASE(gate_t8122_dcpext_board_no_fbdma),
-	KUNIT_CASE(gate_t8122_dcpext_forced_unshared),
-	KUNIT_CASE(gate_t8122_dcpext_forced_shared),
 	KUNIT_CASE(gate_t8122_dcpext_v27_2),
 	KUNIT_CASE(gate_t8122_dcpext_v27_2_mirrors),
 	KUNIT_CASE(gate_t8122_dcpext_v27_2_internal_v14),
