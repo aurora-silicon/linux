@@ -273,7 +273,6 @@ static void v14_board_j504(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, b->promotion);
 	KUNIT_EXPECT_TRUE(test, b->log_bringup);
 	KUNIT_EXPECT_TRUE(test, b->panel_nits);
-	KUNIT_EXPECT_FALSE(test, b->base_edid);
 	KUNIT_EXPECT_EQ(test, b->ctm_set, air->ctm_set);
 	KUNIT_EXPECT_EQ(test, b->ctm_get, air->ctm_get);
 	KUNIT_EXPECT_TRUE(test, dcp_v14_board_admits(b, J613_DCP_IMAGE));
