@@ -517,4 +517,13 @@ struct prctl_mm_map {
 # define PR_AURORA_AMX_AVAILABLE	0
 # define PR_AURORA_AMX_IN_USE		1
 
+/*
+ * Query whether the kernel maintains the current logical CPU index in
+ * TPIDRRO_EL0 for native 64-bit EL0 tasks (arm64).
+ * Returns 1 when enabled for the calling task, 0 when unavailable for the
+ * calling task (such as compat 32-bit tasks, which use TPIDRRO_EL0 for TLS),
+ * or -EINVAL on unsupported kernels/architectures or non-zero arguments.
+ */
+#define PR_GET_TPIDRRO_CPU		0x7F1DBB0
+
 #endif /* _LINUX_PRCTL_H */

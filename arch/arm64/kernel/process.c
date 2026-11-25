@@ -554,14 +554,23 @@ void tls_preserve_current_state(void)
 		current->thread.tpidr2_el0 = read_sysreg_s(SYS_TPIDR2_EL0);
 }
 
+static u64 tls_tpidrro_value(struct task_struct *next, unsigned int cpu)
+{
+	if (is_compat_thread(task_thread_info(next)))
+		return next->thread.uw.tp_value;
+
+	if (IS_ENABLED(CONFIG_ARM64_TPIDRRO_CPU))
+		return cpu;
+
+	return 0;
+}
+
 static void tls_thread_switch(struct task_struct *next)
 {
 	tls_preserve_current_state();
 
-	if (is_compat_thread(task_thread_info(next)))
-		write_sysreg(next->thread.uw.tp_value, tpidrro_el0);
-	else
-		write_sysreg(0, tpidrro_el0);
+	write_sysreg(tls_tpidrro_value(next, raw_smp_processor_id()),
+		     tpidrro_el0);
 
 	write_sysreg(*task_user_tls(next), tpidr_el0);
 	if (system_supports_tpidr2())
@@ -1177,6 +1186,23 @@ void arch_setup_new_exec(void)
 #ifdef CONFIG_ARM64_MEMORY_MODEL_CONTROL
 	arch_prctl_mem_model_set(current, PR_SET_MEM_MODEL_DEFAULT);
 #endif
+
+#ifdef CONFIG_ARM64_TPIDRRO_CPU
+	/*
+	 * tls_thread_flush() runs before SET_PERSONALITY(), so refresh
+	 * tpidrro_el0 here for the new personality (64->32 must clear the
+	 * CPU index; 32->64 and initial kthread exec must install it).
+	 */
+	preempt_disable();
+	if (is_compat_task()) {
+		current->thread.uw.tp_value = 0;
+		barrier();
+		write_sysreg(0, tpidrro_el0);
+	} else {
+		write_sysreg(smp_processor_id(), tpidrro_el0);
+	}
+	preempt_enable();
+#endif
 }
 
 #ifdef CONFIG_ARM64_TAGGED_ADDR_ABI
@@ -1307,3 +1333,19 @@ int set_tsc_mode(unsigned int val)
 
 	return do_set_tsc_mode(val);
 }
+
+#ifdef CONFIG_ARM64_TPIDRRO_CPU
+static int arch_prctl_get_tpidrro_cpu_for_task(struct task_struct *t)
+{
+	return is_compat_thread(task_thread_info(t)) ? 0 : 1;
+}
+
+int arch_prctl_get_tpidrro_cpu(void)
+{
+	return arch_prctl_get_tpidrro_cpu_for_task(current);
+}
+#endif
+
+#if IS_ENABLED(CONFIG_ARM64_TPIDRRO_CPU_KUNIT_TEST)
+#include "tpidrro_kunit.c"
+#endif

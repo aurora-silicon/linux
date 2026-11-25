@@ -2487,6 +2487,20 @@ config ARM64_APPLE_AMX
 	  and its 5 KiB register file is saved and restored across context
 	  switches. Boot with apple_amx=off to keep AMX disabled.
 
+config ARM64_TPIDRRO_CPU
+	bool "Expose current logical CPU index in TPIDRRO_EL0"
+	default y
+	help
+	  Maintain the current logical CPU index in TPIDRRO_EL0 for native
+	  64-bit EL0 tasks and advertise support via prctl(PR_GET_TPIDRRO_CPU).
+	  This allows emulators such as FEX-Emu to read the CPU index with a
+	  single MRS instruction for x86 RDTSCP/RDPID and CPUID queries
+	  instead of issuing a getcpu() syscall, matching the Windows ARM64
+	  ABI.
+
+	  Compat 32-bit tasks continue to use TPIDRRO_EL0 for their TLS
+	  pointer and receive 0 from PR_GET_TPIDRRO_CPU.
+
 config RELOCATABLE
 	bool "Build a relocatable kernel image" if EXPERT
 	select ARCH_HAS_RELR
