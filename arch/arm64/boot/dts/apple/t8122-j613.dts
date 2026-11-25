@@ -432,3 +432,8 @@
 	/* Per-device factory data from this Mac's own iBoot system container. */
 	firmware-name = "apple/mesacal-j613.bin";
 };
+
+/* The J613 MTP firmware cannot be restarted once quiesced: hand it over running. */
+&mtp {
+	apple,rtkit-keep-running;
+};

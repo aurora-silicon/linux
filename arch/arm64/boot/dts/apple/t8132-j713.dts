@@ -194,9 +194,9 @@
 };
 
 /*
- * The words the firmware-27 stop of the internal DCP writes (appledrm.s2r_untested),
- * the same ones the deep sleep lowers: pmc-dcp, the PMGR power states and its power
- * gate block.
+ * The words the firmware-27 stop of the internal DCP writes (by default, see
+ * dcp_s2r_layout_from_dt()), the same ones the deep sleep lowers: pmc-dcp, the PMGR
+ * power states and its power gate block.
  */
 &soc {
 	dcp_power: display-power@3828a9c14 {

@@ -85,12 +85,14 @@
  * processor has that memory and the display subsystem is enabled, before any
  * device exists (see gate_t6041_max_run()).
  *
- * The M4 Mac mini (J773g, apple,t8132) on macOS 27.2 is handed over as the
- * J575c is: aura fills dcpext0's and dcpext1's firmware memory, adds their
- * firmware clocks, leaves the main DCP running idle and enables the display
- * subsystem on iBoot's boot framebuffer. The gate enables the HDMI chain
- * behind dcpext0 the same way (see gate_t8132_j773g_run()). On the M4 26.6.2
- * firmware path the J713 dcpext routes below apply instead.
+ * On T8132 (apple,t8132) off the M4 26.6.2 firmware path (first the Mac mini,
+ * J773g, on macOS 27.2), aura hands over external display processors as on the
+ * J575c: it fills their firmware memory, adds their firmware clocks, and
+ * enables the display subsystem on iBoot's boot framebuffer. For any
+ * apple,t8132-dcpext with a fixed dp-phy running the pinned 27.2 image, the
+ * gate derives the chain from its phandles and enables it in one changeset
+ * (see gate_t8132_run()). On the M4 26.6.2 firmware path (and on M4 Airs) the
+ * J713 dcpext routes below apply instead.
  */
 
 #define pr_fmt(fmt) fmt
@@ -172,6 +174,14 @@ static const char gate_pmp_uuid[] __initconst = "2F4EB4C4-001B-3ACF-A9A0-68D8E42
 static const char gate_t8122_pmp_uuid[] __initconst = "3B18C886-4C70-349B-B1C4-70F35DE2C5CD";
 
 /*
+ * The T8122 PMP image of the 27.2 (26B123) system firmware. The PMP report
+ * driver checks the running image against the values the boot loader passes
+ * and reads the soc-device records from them, so the same PMP support takes
+ * either image.
+ */
+static const char gate_t8122_pmp_uuid_27_2[] __initconst = "C6CCB960-AC83-34A2-9493-C3131BD5AE4B";
+
+/*
  * The T6031 PMP image, as the J516C ADT names it (iop-pmp-nub, passed on by
  * the boot loader in /chosen/asahi,t6031-pmp). It is not the T6030 image.
  */
@@ -210,6 +220,7 @@ struct gate_soc {
 	const char *dcp_full_name;	/* the DCP node the PMP overlay expects, under /soc */
 	const char *pmp_values;		/* the boot loader's PMP values for this Mac */
 	const char *pmp_uuid;		/* the PMP image the PMP support is written for */
+	const char *pmp_uuid_alt;	/* another PMP image it takes, or NULL */
 	const char *report_compat;	/* the PMP report the overlay adds, or the reused one */
 	const char *disp_entry;		/* its display request entry, which the DCP waits for */
 	const u8 *pmp_dtbo, *pmp_dtbo_end;	/* NULL: no PMP description built in */
@@ -281,6 +292,7 @@ static const struct gate_soc gate_t8122 __initconst = {
 	.dcp_full_name = "dcp@28ec00000",
 	.pmp_values = "/chosen/asahi,t8122-pmp",
 	.pmp_uuid = gate_t8122_pmp_uuid,
+	.pmp_uuid_alt = gate_t8122_pmp_uuid_27_2,
 	.report_compat = "apple,t8122-pmp-v2-report",
 	.disp_entry = "report@7",
 	.reuse_pmp = true,
@@ -359,19 +371,21 @@ static const struct gate_soc gate_t6041_max __initconst = {
 	.run = gate_t6041_max_run,
 };
 
-static void __init gate_t8132_j773g_run(void);
+static void __init gate_t8132_run(void);
 
 /*
- * T8132 Mac mini (J773g) off the M4 26.6.2 firmware path: no internal display
- * handoff, only its HDMI chain, as on the J575c.
+ * T8132 off the M4 26.6.2 firmware path (the Airs take
+ * gate_j713_dcpext_routes() before gate_socs[] is walked): enable any
+ * fixed-DP external display chain (phy-names = "dp-phy") running the pinned
+ * 27.2 image, as on the J575c.
  */
-static const struct gate_soc gate_t8132_j773g __initconst = {
-	.machine = "apple,j773g",
+static const struct gate_soc gate_t8132 __initconst = {
+	.machine = "apple,t8132",
 	.prefix = "apple-t8132-display: ",
 	.name = "T8132",
 	.dcp_compat = "apple,t8132-dcp",
 	.display_compat = "apple,t8132-display-subsystem",
-	.run = gate_t8132_j773g_run,
+	.run = gate_t8132_run,
 };
 
 static const struct gate_soc *const gate_socs[] __initconst = {
@@ -380,7 +394,7 @@ static const struct gate_soc *const gate_socs[] __initconst = {
 	&gate_t6031,
 	&gate_t6041,
 	&gate_t6041_max,
-	&gate_t8132_j773g,
+	&gate_t8132,
 };
 
 /* The SoC this boot runs on, if the gate serves it. */
@@ -789,9 +803,12 @@ static int __init gate_pmp_resolve(struct device_node **np, struct device_node *
 			gate_pmp_values = NULL;
 			return -EINVAL;
 		}
-		if (strcmp(uuid, gate_soc->pmp_uuid)) {
-			gate_warn("PMP not added: this Mac's PMP firmware image is %s, not %s\n",
-				uuid, gate_soc->pmp_uuid);
+		if (strcmp(uuid, gate_soc->pmp_uuid) &&
+		    (!gate_soc->pmp_uuid_alt || strcmp(uuid, gate_soc->pmp_uuid_alt))) {
+			gate_warn("PMP not added: this Mac's PMP firmware image is %s, not %s%s%s\n",
+				uuid, gate_soc->pmp_uuid,
+				gate_soc->pmp_uuid_alt ? " or " : "",
+				gate_soc->pmp_uuid_alt ?: "");
 			of_node_put(gate_pmp_values);
 			gate_pmp_values = NULL;
 			return -EINVAL;
@@ -3324,7 +3341,7 @@ static void __init gate_t6041_max_run(void)
 	if (!internal)
 		internal = of_find_compatible_node(NULL, NULL, gate_soc->dcp_compat);
 	if (gate_t6041_v27_unapproved(internal, false)) {
-		staged_info("firmware 27 internal display only, external displays left off\n");
+		staged_info("unapproved firmware 27 on internal dcp, external displays left off\n");
 		of_node_put(internal);
 		of_node_put(display);
 		return;
@@ -3359,16 +3376,29 @@ static void __init gate_t6041_max_run(void)
  * every available route. Enable them only for a dcpext the boot loader handed
  * over (apple,t8132-dcpext-firmware-ready = 1). A handed-over dcpext that is
  * not adopted then disables them again, see dcp_platform_probe_t8132_ext().
- * Only the device tree changes here; no register is touched.
+ * Only the T8132 display driver binds a dcpext and can do that, so without it,
+ * or with nomodeset, the routes stay disabled: the ports would wait for mode
+ * switches that never register. Only the device tree changes here; no
+ * register is touched.
  */
 static void __init gate_j713_dcpext_routes(void)
 {
-	struct of_changeset *cs = gate_cs_alloc();
+	struct of_changeset *cs;
 	struct device_node *np;
 	unsigned int n = 0;
 	u32 ready;
 	int ret = 0;
 
+	if (!IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8132)) {
+		pr_info("apple-j713-display: dcpext Type-C routes left disabled: the T8132 display driver is not built\n");
+		return;
+	}
+	if (IS_ENABLED(CONFIG_VIDEO) && video_firmware_drivers_only()) {
+		pr_info("apple-j713-display: dcpext Type-C routes left disabled: nomodeset is on the command line\n");
+		return;
+	}
+
+	cs = gate_cs_alloc();
 	if (!cs)
 		return;
 	for_each_compatible_node(np, NULL, "apple,t8132-dcpext") {
@@ -3411,7 +3441,7 @@ static void __init gate_j713_dcpext_routes(void)
  * once the internal handoff has enabled the display subsystem; a dcpext
  * without firmware memory or with another image is left as it is.
  */
-static int __init gate_j713_v27_dispext_dart(struct device_node *dcp, struct device_node **dart)
+static int __init gate_t8132_v27_dispext_dart(struct device_node *dcp, struct device_node **dart)
 {
 	struct of_phandle_args args;
 	struct device_node *piodma;
@@ -3429,7 +3459,7 @@ static int __init gate_j713_v27_dispext_dart(struct device_node *dcp, struct dev
 }
 
 /* Its PIODMA child is disabled in the SoC tree, as for the J773g: enable it. */
-static int __init gate_j713_v27_piodma(struct of_changeset *cs, struct device_node *dcp)
+static int __init gate_t8132_v27_piodma(struct of_changeset *cs, struct device_node *dcp)
 {
 	struct device_node *piodma;
 	int ret = 0;
@@ -3443,7 +3473,7 @@ static int __init gate_j713_v27_piodma(struct of_changeset *cs, struct device_no
 	return ret;
 }
 
-static bool __init gate_j713_v27_memory(struct device_node *dcp)
+static bool __init gate_t8132_v27_memory(struct device_node *dcp)
 {
 	struct device_node *region;
 	int i, n;
@@ -3474,18 +3504,124 @@ static bool __init gate_has_typec_routes(struct device_node *dcp)
 	return has;
 }
 
-static void __init gate_j713_dcpext_v27(void)
+/*
+ * The display subsystem's iommus with each display DART in @darts that it
+ * does not name yet appended once, on the stream ID the subsystem uses on its
+ * own display DART (its first entry): the scanout of every pipe has the same
+ * stream layout.
+ */
+static int __init gate_t8132_v27_display_iommus(struct of_changeset *cs,
+						struct device_node *display,
+						struct device_node *const *darts, unsigned int n)
+{
+	bool present[2] = {};
+	struct of_phandle_args args;
+	unsigned int add = 0, i, k, nr = 0;
+	struct property *old, *prop;
+	__be32 *value;
+	u32 sid = 0;
+	int ret;
+
+	if (n > ARRAY_SIZE(present))
+		return -E2BIG;
+	old = of_find_property(display, "iommus", NULL);
+	if (!old)
+		return -EINVAL;
+	for (i = 0; !of_parse_phandle_with_args(display, "iommus", "#iommu-cells", i, &args); i++) {
+		bool one_cell = args.args_count == 1;
+
+		if (one_cell && !i)
+			sid = args.args[0];
+		for (k = 0; k < n; k++)
+			if (args.np == darts[k])
+				present[k] = true;
+		of_node_put(args.np);
+		if (!one_cell)
+			return -EINVAL;
+		nr++;
+	}
+	/*
+	 * Every entry parsed, one-cell each, and nothing after them: a
+	 * malformed entry is refused, not dropped from the copy below.
+	 */
+	if (!nr || of_count_phandle_with_args(display, "iommus", "#iommu-cells") != (int)nr ||
+	    old->length != 2 * nr * sizeof(*value))
+		return -EINVAL;
+	for (k = 0; k < n; k++) {
+		if (!darts[k]->phandle)
+			return -EINVAL;
+		/* Two dcpexts never share a display DART; count each once. */
+		for (i = 0; i < k; i++)
+			if (darts[i] == darts[k])
+				present[k] = true;
+		if (!present[k])
+			add++;
+	}
+	if (!add)
+		return 0;
+
+	prop = kzalloc_obj(*prop);
+	value = kmalloc_array(2 * (nr + add), sizeof(*value), GFP_KERNEL);
+	if (!prop || !value) {
+		kfree(prop);
+		kfree(value);
+		return -ENOMEM;
+	}
+	memcpy(value, old->value, old->length);
+	for (i = 2 * nr, k = 0; k < n; k++) {
+		if (present[k])
+			continue;
+		value[i++] = cpu_to_be32(darts[k]->phandle);
+		value[i++] = cpu_to_be32(sid);
+	}
+	prop->name = "iommus";
+	prop->length = 2 * (nr + add) * sizeof(*value);
+	prop->value = value;
+	ret = of_changeset_update_property(cs, display, prop);
+	/*
+	 * Once in the changeset, an applied or reverted update leaves it on the
+	 * node's dead properties, as the of_changeset_update_prop_*() helpers do.
+	 */
+	if (ret) {
+		kfree(prop);
+		kfree(value);
+	}
+	return ret;
+}
+
+/*
+ * Selected by its nodes alone, on any board and either firmware path: an
+ * available T8132 dcpext handed over with the 27.2 image
+ * (apple_t8132_dcpext_v27_2()) that has Type-C routes, its text, data and
+ * heap firmware memory, and an enabled display subsystem. A fixed-PHY dcpext
+ * (the J773g's HDMI dcpext0) has no Type-C routes and keeps its own chain.
+ */
+static void __init gate_t8132_dcpext_v27(void)
 {
 	struct device_node *darts[2] = {}, *display, *np;
+	const char *why = NULL;
 	struct of_changeset *cs;
-	struct property *old, *prop;
 	unsigned int n = 0, i;
-	__be32 *value;
 	int ret = 0;
 
 	display = of_find_compatible_node(NULL, NULL, "apple,t8132-display-subsystem");
 	if (!display)
 		return;
+	/*
+	 * As for the J613 (gate_t8122_dcpext()): enabled routes make the
+	 * Type-C port controllers wait for the display driver's mode switches.
+	 * Without a T8132 display driver, not built or kept off by nomodeset,
+	 * none registers and USB is lost on both ports.
+	 */
+	if (!IS_ENABLED(CONFIG_DRM_APPLE) || !IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8132))
+		why = "the T8132 display driver is not built";
+	else if (IS_ENABLED(CONFIG_VIDEO) && video_firmware_drivers_only())
+		why = "nomodeset is on the command line";
+	if (why) {
+		pr_info("apple-t8132-display: 27.2 dcpext Type-C routes left disabled: %s\n", why);
+		of_node_put(display);
+		return;
+	}
 	cs = gate_cs_alloc();
 	if (!cs) {
 		of_node_put(display);
@@ -3497,13 +3633,13 @@ static void __init gate_j713_dcpext_v27(void)
 		/* A fixed-PHY (HDMI) dcpext has its own chain. */
 		if (!gate_has_typec_routes(np))
 			continue;
-		if (!gate_j713_v27_memory(np)) {
-			pr_info("apple-j713-display: %pOF: 27.2 image without firmware memory, left off\n",
+		if (!gate_t8132_v27_memory(np)) {
+			pr_info("apple-t8132-display: %pOF: 27.2 image without firmware memory, left off\n",
 				np);
 			continue;
 		}
 		if (!of_device_is_available(display)) {
-			pr_info("apple-j713-display: %pOF: display subsystem not enabled, left off\n",
+			pr_info("apple-t8132-display: %pOF: display subsystem not enabled, left off\n",
 				np);
 			continue;
 		}
@@ -3512,9 +3648,9 @@ static void __init gate_j713_dcpext_v27(void)
 			of_node_put(np);
 			break;
 		}
-		ret = gate_j713_v27_dispext_dart(np, &darts[n]);
+		ret = gate_t8132_v27_dispext_dart(np, &darts[n]);
 		if (!ret)
-			ret = gate_j713_v27_piodma(cs, np);
+			ret = gate_t8132_v27_piodma(cs, np);
 		if (!ret)
 			ret = gate_ext_routes(cs, np, "okay");
 		if (ret) {
@@ -3523,77 +3659,23 @@ static void __init gate_j713_dcpext_v27(void)
 		}
 		n++;
 	}
-	if (ret || !n)
-		goto out;
-
-	/* The display subsystem's iommus, each new display DART appended once. */
-	old = of_find_property(display, "iommus", NULL);
-	if (!old || old->length % (2 * sizeof(__be32))) {
-		ret = -EINVAL;
-		goto out;
-	}
-	prop = kzalloc_obj(*prop);
-	value = kmalloc(old->length + n * 2 * sizeof(*value), GFP_KERNEL);
-	if (!prop || !value) {
-		kfree(prop);
-		kfree(value);
-		ret = -ENOMEM;
-		goto out;
-	}
-	memcpy(value, old->value, old->length);
-	for (i = 0; i < n; i++) {
-		value[old->length / sizeof(*value) + 2 * i] = cpu_to_be32(darts[i]->phandle);
-		value[old->length / sizeof(*value) + 2 * i + 1] = cpu_to_be32(0);
-		if (!darts[i]->phandle)
-			ret = -EINVAL;
-	}
-	prop->name = "iommus";
-	prop->length = old->length + n * 2 * sizeof(*value);
-	prop->value = value;
-	if (ret) {
-		kfree(prop);
-		kfree(value);
-		goto out;
-	}
-	ret = of_changeset_update_property(cs, display, prop);
-	if (!ret)
+	if (!ret && n)
+		ret = gate_t8132_v27_display_iommus(cs, display, darts, n);
+	if (!ret && n)
 		ret = of_changeset_apply(cs);
-out:
+
 	for (i = 0; i < ARRAY_SIZE(darts); i++)
 		of_node_put(darts[i]);
 	of_node_put(display);
 	if (ret)
-		pr_err("apple-j713-display: 27.2 dcpext Type-C routes left disabled: %d\n", ret);
+		pr_err("apple-t8132-display: 27.2 dcpext Type-C routes left disabled: %d\n", ret);
 	else if (n)
-		pr_info("apple-j713-display: 27.2: Type-C routes and display DARTs enabled for %u dcpext(s)\n",
+		pr_info("apple-t8132-display: 27.2: Type-C routes and display DARTs enabled for %u dcpext(s)\n",
 			n);
 	/* Applied, it stays: the live tree refers to it. */
 	if (ret || !n)
 		gate_cs_free(cs);
 }
-
-/*
- * The J773g's HDMI chain on macOS 27.2 (t8132-j773g.dts): the LPDPTX PHY,
- * dcpext0's firmware and display DARTs, its mailbox, its PIODMA child, then
- * dcpext0. As on the J575c no PMP runs and no DISPEXT0 power domain is
- * described for them: iBoot leaves the pipe powered. No Type-C route: dcpext0
- * drives only the HDMI port here.
- */
-static const char *const t8132_j773g_hdmi_nodes[] = {
-	"/soc/phy@39a700000",
-	"/soc/iommu@286340000",
-	"/soc/iommu@286300000",
-	"/soc/mailbox@286e08000",
-	"/soc/dcp@286e00000/piodma",
-	"/soc/dcp@286e00000",
-};
-
-static const struct gate_staged t8132_j773g_hdmi = {
-	"/soc/iommu@286300000", t8132_j773g_hdmi_nodes, ARRAY_SIZE(t8132_j773g_hdmi_nodes),
-};
-
-/* Applied, it stays: the live tree refers to it. */
-static struct of_changeset t8132_j773g_cs;
 
 /* The display subsystem's iommus become <@dart 0>, whatever they were. */
 static int __init gate_iommus_set(struct of_changeset *cs, struct device_node *display,
@@ -3619,97 +3701,259 @@ static int __init gate_iommus_set(struct of_changeset *cs, struct device_node *d
 	return of_changeset_update_property(cs, display, prop);
 }
 
+enum {
+	T8132_HDMI_PHY,
+	T8132_HDMI_FW_DART,
+	T8132_HDMI_DISP_DART,
+	T8132_HDMI_MBOX,
+	T8132_HDMI_PIODMA,
+	T8132_HDMI_DCP,
+	T8132_HDMI_NR,
+};
+
 /*
- * The J773g on macOS 27.2: dcpext0 drives the HDMI port, as macOS does there,
- * through the firmware-27 backend (apple_t8132_dcpext_v27_2()). Its chain is
- * enabled in one changeset once aura has given dcpext0 its firmware memory and
- * enabled the display subsystem, and only for the pinned 27.2 image.
- *
- * The display subsystem's iommus are set to dispext0's DART instead of having
- * it appended, as on the J575c: the main pipe's display DART (disp0) belongs
- * to the main DCP, which iBoot leaves running and nothing hands over on this
- * firmware, and the DART driver never probes it there (apple-dart.c). Left in
- * the iommus, it would hold the display subsystem's probe forever. The main
- * DCP's own nodes are left as the device tree has them: its driver refuses it
- * off the M4 firmware path (dcp_check_firmware_version()).
+ * Check that every memory-region of @np is an available apple,asc-mem node,
+ * as staged_firmware_memory() does for path-addressed stages.
  */
-static void __init gate_t8132_j773g_run(void)
+static bool __init staged_node_firmware_memory(struct device_node *np)
 {
-	const struct gate_staged *st = &t8132_j773g_hdmi;
-	const char *dcp_path = st->nodes[st->nr - 1];
-	struct device_node *display, *np;
-	bool approved;
+	struct device_node *chosen, *region;
+	int i, n;
+	u32 record[2];
+
+	n = of_count_phandle_with_args(np, "memory-region", NULL);
+	for (i = 0; i < n; i++) {
+		region = of_parse_phandle(np, "memory-region", i);
+		if (region && of_device_is_available(region) &&
+		    of_device_is_compatible(region, "apple,asc-mem")) {
+			of_node_put(region);
+			continue;
+		}
+		of_node_put(region);
+		n = -ENODEV;
+		break;
+	}
+	if (n > 0)
+		return true;
+	chosen = of_find_node_by_path("/chosen");
+	if (chosen && !of_property_read_u32_array(chosen, "m4,dcpext", record, 2))
+		staged_err("%pOF: no firmware memory (loader record <%u %u>), nothing enabled\n",
+			   np, record[0], record[1]);
+	else
+		staged_err("%pOF: no firmware memory, nothing enabled\n", np);
+	of_node_put(chosen);
+	return false;
+}
+
+/*
+ * A T8132 internal display processor handed over with the 27.2 (26B123) image
+ * and firmware-27 clock metadata (apple,clock-ids): present on a laptop with
+ * an internal panel (e.g. a 14-inch MacBook Pro), absent on a headless Mac
+ * mini whose main DCP is left running idle.
+ */
+static bool __init gate_t8132_dcp_v27_2(const struct device_node *np)
+{
+	return apple_dcp_image_v27_2(np, "apple,t8132-dcp",
+				     APPLE_T8132_DCP_26B123_UUID) &&
+	       of_property_present(np, "apple,clock-ids");
+}
+
+static void __init gate_t8132_put_nodes(struct device_node *nodes[T8132_HDMI_NR])
+{
 	unsigned int i;
-	int ret;
+
+	for (i = 0; i < T8132_HDMI_NR; i++) {
+		of_node_put(nodes[i]);
+		nodes[i] = NULL;
+	}
+}
+
+/*
+ * Derive a fixed-DP T8132 dcpext's chain from its own DT phandles: the dp-phy
+ * PHY, firmware DART (iommus), display DART (piodma's iommus), mailbox
+ * (mboxes), piodma child, then the dcpext node itself.
+ */
+static int __init gate_t8132_resolve_fixed_dp(struct device_node *dcp,
+					      int phy_idx,
+					      struct device_node *nodes[T8132_HDMI_NR])
+{
+	struct of_phandle_args args;
+
+	memset(nodes, 0, T8132_HDMI_NR * sizeof(*nodes));
+
+	if (of_parse_phandle_with_args(dcp, "phys", "#phy-cells", phy_idx, &args))
+		goto fail;
+	nodes[T8132_HDMI_PHY] = args.np;
+
+	if (of_parse_phandle_with_args(dcp, "iommus", "#iommu-cells", 0, &args))
+		goto fail;
+	nodes[T8132_HDMI_FW_DART] = args.np;
+
+	if (of_parse_phandle_with_args(dcp, "mboxes", "#mbox-cells", 0, &args))
+		goto fail;
+	nodes[T8132_HDMI_MBOX] = args.np;
+
+	nodes[T8132_HDMI_PIODMA] = of_get_child_by_name(dcp, "piodma");
+	if (!nodes[T8132_HDMI_PIODMA])
+		goto fail;
+
+	if (of_parse_phandle_with_args(nodes[T8132_HDMI_PIODMA], "iommus",
+				       "#iommu-cells", 0, &args))
+		goto fail;
+	nodes[T8132_HDMI_DISP_DART] = args.np;
+
+	nodes[T8132_HDMI_DCP] = of_node_get(dcp);
+	return 0;
+
+fail:
+	gate_t8132_put_nodes(nodes);
+	return -EINVAL;
+}
+
+/* Every node of @nodes is distinct and still disabled, and its processor has firmware memory. */
+static bool __init gate_t8132_fixed_dp_ready(struct device_node *nodes[T8132_HDMI_NR])
+{
+	unsigned int i, j;
+
+	if (!staged_node_firmware_memory(nodes[T8132_HDMI_DCP]))
+		return false;
+	for (i = 0; i < T8132_HDMI_NR; i++) {
+		if (!nodes[i])
+			return false;
+		for (j = 0; j < i; j++) {
+			if (nodes[j] == nodes[i]) {
+				staged_err("%pOF: duplicate node in chain, nothing enabled\n",
+					   nodes[i]);
+				return false;
+			}
+		}
+		if (of_device_is_available(nodes[i])) {
+			staged_err("%pOF: already enabled, nothing changed\n", nodes[i]);
+			return false;
+		}
+	}
+	return true;
+}
+
+/*
+ * T8132 on macOS 27.2 (off the M4 26.6.2 firmware path): any apple,t8132-dcpext
+ * wired to a fixed DP PHY (phy-names = "dp-phy", e.g. the J773g HDMI port)
+ * runs through the firmware-27 backend (apple_t8132_dcpext_v27_2()). Its chain
+ * is derived from its DT phandles and enabled in one changeset once aura has
+ * given it firmware memory and enabled the display subsystem, and only for the
+ * pinned 27.2 image.
+ *
+ * When the main DCP is also handed over on 27.2 (a T8132 laptop with an
+ * internal panel), dispext's display DART is appended to the display
+ * subsystem's iommus so the internal panel keeps its DART. When the main DCP
+ * is not handed over (a headless Mac mini), disp0's DART is left unprobed by
+ * apple-dart and would hold the display subsystem's probe forever, so iommus
+ * is replaced with dispext's DART instead.
+ */
+static void __init gate_t8132_run(void)
+{
+	struct device_node *display = NULL, *internal, *dcp;
+	struct device_node *nodes[T8132_HDMI_NR];
+	bool append_dart = false;
+	bool display_checked = false;
+	unsigned int i;
+	int phy_idx, ret;
 
 	if (IS_ENABLED(CONFIG_VIDEO) && video_firmware_drivers_only())
 		return;
 	staged_prefix = gate_soc->prefix;
 
-	np = of_find_node_by_path(dcp_path);
-	if (!np)
-		return;		/* a tree without the external pipes */
-	approved = apple_t8132_dcpext_v27_2(np);
-	if (!approved && of_property_present(np, "apple,firmware-compat"))
-		staged_info("%s: not the 27.2 (26B123) image, HDMI left off\n", dcp_path);
-	of_node_put(np);
-	if (!approved)
-		return;
+	for_each_compatible_node(dcp, NULL, "apple,t8132-dcpext") {
+		struct of_changeset *cs;
 
-	display = of_find_node_by_path("disp0");
-	if (!display || !of_device_is_compatible(display, gate_soc->display_compat)) {
-		staged_err("no display subsystem, HDMI left off\n");
-		of_node_put(display);
-		return;
-	}
-	if (!of_device_is_available(display)) {
-		staged_info("display subsystem not enabled, HDMI left off\n");
-		of_node_put(display);
-		return;
-	}
-	if (!staged_ready(st)) {
-		of_node_put(display);
-		return;
-	}
+		phy_idx = of_property_match_string(dcp, "phy-names", "dp-phy");
+		if (phy_idx < 0)
+			continue;
 
-	of_changeset_init(&t8132_j773g_cs);
-	np = of_find_node_by_path(st->dart);
-	ret = np ? gate_iommus_set(&t8132_j773g_cs, display, np) : -ENODEV;
-	of_node_put(np);
-	for (i = 0; !ret && i < st->nr; i++) {
-		np = of_find_node_by_path(st->nodes[i]);
-		ret = np ? of_changeset_update_prop_string(&t8132_j773g_cs, np, "status", "okay") :
-			   -ENODEV;
-		of_node_put(np);
-	}
-	if (!ret)
-		ret = of_changeset_apply(&t8132_j773g_cs);
-	if (ret) {
-		of_changeset_destroy(&t8132_j773g_cs);
-		staged_err("%s: could not enable the HDMI chain: %d\n", dcp_path, ret);
-	} else {
-		staged_info("%s enabled for HDMI; display subsystem on %s only\n", dcp_path,
-			    st->dart);
+		if (!apple_t8132_dcpext_v27_2(dcp)) {
+			if (of_property_present(dcp, "apple,firmware-compat"))
+				staged_info("%pOF: not the 27.2 (26B123) image, HDMI left off\n",
+					    dcp);
+			continue;
+		}
+
+		if (!display_checked) {
+			display_checked = true;
+			display = of_find_node_by_path("disp0");
+			if (!display)
+				display = of_find_compatible_node(NULL, NULL,
+								  gate_soc->display_compat);
+			if (!display || !of_device_is_compatible(display,
+								 gate_soc->display_compat)) {
+				staged_err("no display subsystem, HDMI left off\n");
+				of_node_put(display);
+				of_node_put(dcp);
+				return;
+			}
+			if (!of_device_is_available(display)) {
+				staged_info("display subsystem not enabled, HDMI left off\n");
+				of_node_put(display);
+				of_node_put(dcp);
+				return;
+			}
+			internal = of_find_node_by_path("dcp");
+			if (!internal)
+				internal = of_find_compatible_node(NULL, NULL,
+								   gate_soc->dcp_compat);
+			append_dart = gate_t8132_dcp_v27_2(internal);
+			of_node_put(internal);
+		}
+
+		if (gate_t8132_resolve_fixed_dp(dcp, phy_idx, nodes)) {
+			staged_err("%pOF: incomplete fixed-DP chain, HDMI left off\n", dcp);
+			continue;
+		}
+		if (!gate_t8132_fixed_dp_ready(nodes)) {
+			gate_t8132_put_nodes(nodes);
+			continue;
+		}
+
+		cs = gate_cs_alloc();
+		if (!cs) {
+			staged_err("%pOF: could not allocate changeset\n", dcp);
+			gate_t8132_put_nodes(nodes);
+			continue;
+		}
+		ret = append_dart ?
+		      gate_iommus_append(cs, display, nodes[T8132_HDMI_DISP_DART]) :
+		      gate_iommus_set(cs, display, nodes[T8132_HDMI_DISP_DART]);
+		for (i = 0; !ret && i < T8132_HDMI_NR; i++)
+			ret = of_changeset_update_prop_string(cs, nodes[i], "status", "okay");
+		if (!ret)
+			ret = of_changeset_apply(cs);
+		if (ret) {
+			gate_cs_free(cs);
+			staged_err("%pOF: could not enable the HDMI chain: %d\n", dcp, ret);
+		} else {
+			staged_info("%pOF enabled for HDMI; display subsystem %s %pOF\n", dcp,
+				    append_dart ? "appended" : "on",
+				    nodes[T8132_HDMI_DISP_DART]);
+			append_dart = true;
+		}
+		gate_t8132_put_nodes(nodes);
 	}
 	of_node_put(display);
 }
 
-/* Runs before of_platform_default_populate_init() at arch_initcall_sync. */
-static int __init apple_display_gate(void)
+static void __init apple_display_gate_soc(void)
 {
 	int i;
 
 	if (apple_t8132_firmware_path()) {
 		gate_j713_dcpext_routes();
-		gate_j713_dcpext_v27();
-		return 0;
+		return;
 	}
 
 	for (i = 0; i < ARRAY_SIZE(gate_socs) && !gate_soc; i++)
 		if (of_machine_is_compatible(gate_socs[i]->machine))
 			gate_soc = gate_socs[i];
 	if (!gate_soc)
-		return 0;
+		return;
 
 	/* The exact 25G83 tree (J613; J615 experimental) has its own firmware and PMP admission gate. */
 	if (of_machine_is_compatible("apple,j613") || of_machine_is_compatible("apple,j615")) {
@@ -3718,13 +3962,25 @@ static int __init apple_display_gate(void)
 
 		of_node_put(dcp);
 		if (native)
-			return 0;
+			return;
 	}
 
 	if (gate_soc->run)
 		gate_soc->run();
 	else
 		gate_run();
+}
+
+/* Runs before of_platform_default_populate_init() at arch_initcall_sync. */
+static int __init apple_display_gate(void)
+{
+	apple_display_gate_soc();
+	/*
+	 * After the SoC's own gate, which may set the display subsystem's
+	 * iommus (the J773g's HDMI chain): the 27.2 Type-C dcpexts' display
+	 * DARTs are appended to whatever it left.
+	 */
+	gate_t8132_dcpext_v27();
 	return 0;
 }
 arch_initcall(apple_display_gate);
