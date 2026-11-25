@@ -7731,10 +7731,14 @@ int apple_dart_host_resume(struct device *dev)
 	scoped_guard(spinlock_irqsave, &dart->lock)
 		WRITE_ONCE(dart->commands_gated, false);
 	ret = apple_dart_resume(dev);
-	if (ret)
+	if (ret) {
+		/* Not restored: gated again, so that nothing reaches it before the host retries */
+		scoped_guard(spinlock_irqsave, &dart->lock)
+			WRITE_ONCE(dart->commands_gated, true);
 		dev_err(dev, "restore after its host came back failed: %d\n", ret);
-	else
+	} else {
 		dev_info(dev, "restored after its host came back\n");
+	}
 	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_dart_host_resume);
