@@ -291,6 +291,13 @@ pub(crate) fn new_kernel_object_wc(dev: &AsahiDrmDevice, size: usize) -> Result<
     new_kernel_object_mapped(dev, size, true, true)
 }
 
+/// Create a new kernel-owned GEM object that is not counted as kernel memory: its owner holds a
+/// user charge for it ([`memacct::Charge::user`]), and counting both would take its size twice
+/// from the device limit.
+pub(crate) fn new_kernel_object_user_charged(dev: &AsahiDrmDevice, size: usize) -> Result<ObjectRef> {
+    new_kernel_object_mapped(dev, size, false, false)
+}
+
 /// Create a new kernel-owned write-combined GEM object that is not counted as kernel memory:
 /// its owner holds a user charge for it ([`memacct::Charge::user`]), and counting both would
 /// take its size twice from the device limit.

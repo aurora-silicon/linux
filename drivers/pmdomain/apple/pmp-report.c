@@ -35,7 +35,6 @@
 #include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/pmp-report.h>
-#include <linux/soc/apple/t8132.h>
 #include <linux/string.h>
 #include <linux/suspend.h>
 #include <linux/unaligned.h>
@@ -711,8 +710,7 @@ int apple_pmp_report_wait_supplier_ready(struct device *supplier, unsigned int t
 	struct platform_device *pdev;
 	struct apple_pmp_report *rep;
 	u64 status;
-	bool t8132 = apple_t8132_firmware_path() &&
-		of_device_is_compatible(supplier->of_node, "apple,t8132-pmp-v2");
+	bool t8132 = of_device_is_compatible(supplier->of_node, "apple,t8132-pmp-v2");
 	int ret;
 
 	/* A declared report always takes the existing native25 path below. */

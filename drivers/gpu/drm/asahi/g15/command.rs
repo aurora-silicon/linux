@@ -146,8 +146,8 @@ pub(crate) struct Context<'a> {
     pub(crate) usc_base: u64,
 }
 
-struct CheckedContext<'a> {
-    vm: &'a mut mmu::VmReadGuard,
+struct CheckedContext<'a, 'b> {
+    vm: &'a mut mmu::VmReadGuard<'b>,
     usc_base: u64,
 }
 
@@ -383,7 +383,7 @@ impl Timestamps<'_> {
 /// GPU access: a driver range ENOENT, outside the user range EINVAL, an unmapped page ENOENT, a
 /// page without the access EACCES.
 pub(crate) fn cover(
-    vm: &mut mmu::VmReadGuard,
+    vm: &mut mmu::VmReadGuard<'_>,
     start: u64,
     end: u64,
     read: bool,
@@ -419,7 +419,7 @@ pub(crate) fn cover(
 
 /// Attachment spans, 128-byte granular, actually mapped with `write` or read access.
 fn check_attachments(
-    vm: &mut mmu::VmReadGuard,
+    vm: &mut mmu::VmReadGuard<'_>,
     list: &[uapi::drm_asahi_attachment],
     write: bool,
 ) -> Result {
@@ -482,7 +482,7 @@ fn geometry_bytes(cmd: &uapi::drm_asahi_cmd_render) -> (u64, u64) {
 }
 
 /// Per-command render admission.
-fn check_render(context: &mut CheckedContext<'_>, cmd: &uapi::drm_asahi_cmd_render) -> Result {
+fn check_render(context: &mut CheckedContext<'_, '_>, cmd: &uapi::drm_asahi_cmd_render) -> Result {
     let vm = &mut *context.vm;
     let allowed = PROCESS_EMPTY_TILES
         | NO_VERTEX_CLUSTERING
@@ -567,7 +567,7 @@ fn check_render(context: &mut CheckedContext<'_>, cmd: &uapi::drm_asahi_cmd_rend
 
 /// Per-command compute admission.
 fn check_compute(
-    context: &mut CheckedContext<'_>,
+    context: &mut CheckedContext<'_, '_>,
     cmd: &uapi::drm_asahi_cmd_compute,
     attachments: &[uapi::drm_asahi_attachment],
 ) -> Result {

@@ -137,12 +137,12 @@ int apple_dart_v27_claim(struct device *dev, struct device *owner,
 		return -EBUSY;
 	}
 	if (dev->driver != &apple_dart_driver.driver || !(d = dev_get_drvdata(dev)) ||
-	    !d->v27_provider || !mutex_trylock(&d->v27_lifecycle)) {
+	    !d->v27_provider || down_trylock(&d->v27_lifecycle)) {
 		device_unlock(dev);
 		return -ENODEV;
 	}
 	if (!try_module_get(THIS_MODULE)) {
-		mutex_unlock(&d->v27_lifecycle);
+		up(&d->v27_lifecycle);
 		device_unlock(dev);
 		return -ENODEV;
 	}
@@ -340,7 +340,7 @@ free:
 unlock:
 	module_put(THIS_MODULE);
 	put_device(dev);
-	mutex_unlock(&d->v27_lifecycle);
+	up(&d->v27_lifecycle);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_dart_v27_claim);
@@ -459,7 +459,7 @@ int apple_dart_v27_finish(struct apple_dart_v27_lease *l, bool stopped)
 	WRITE_ONCE(d->m5_sleep_owner, NULL);
 	WRITE_ONCE(d->v27_restoring, false);
 	pm_runtime_put_noidle(d->dev);
-	mutex_unlock(&d->v27_lifecycle);
+	up(&d->v27_lifecycle);
 	module_put(l->module);
 	put_device(provider);
 	kfree(l);
