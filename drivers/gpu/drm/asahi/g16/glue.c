@@ -165,31 +165,16 @@ static int asahi_g16_zone_trip_cb(struct thermal_trip *trip, void *data)
 	return 0;
 }
 
-static bool asahi_g16_zone_read_limits(const char *name, long *release_mc,
-				       long *hot_mc, long *critical_mc)
+static bool asahi_g16_zone_limits_valid(struct asahi_g16_zone_trips *trips)
 {
-	struct asahi_g16_zone_trips trips = {};
-	struct thermal_zone_device *tz;
-
-	tz = thermal_zone_get_zone_by_name(name);
-	if (IS_ERR(tz))
-		return false;
-	if (thermal_zone_for_each_trip(tz, asahi_g16_zone_trip_cb, &trips))
-		return false;
-	if (!trips.have_critical && trips.have_hot &&
-	    trips.max_passive_mc > trips.hot_mc) {
-		trips.critical_mc = trips.max_passive_mc;
-		trips.have_critical = true;
+	if (!trips->have_critical && trips->have_hot &&
+	    trips->max_passive_mc > trips->hot_mc) {
+		trips->critical_mc = trips->max_passive_mc;
+		trips->have_critical = true;
 	}
-	if (!trips.have_hot || !trips.have_critical ||
-	    trips.release_mc <= 0 || trips.release_mc > trips.hot_mc ||
-	    trips.critical_mc <= trips.hot_mc)
-		return false;
-
-	*release_mc = trips.release_mc;
-	*hot_mc = trips.hot_mc;
-	*critical_mc = trips.critical_mc;
-	return true;
+	return trips->have_hot && trips->have_critical &&
+	       trips->release_mc > 0 && trips->release_mc <= trips->hot_mc &&
+	       trips->critical_mc > trips->hot_mc;
 }
 
 static void asahi_g16_zone_poll_fn(struct work_struct *work)
@@ -202,7 +187,8 @@ static void asahi_g16_zone_poll_fn(struct work_struct *work)
 	long hot_mc = 0;
 	long critical_mc = 0;
 	bool found = false;
-	bool limits_valid = false;
+	bool have_limits = false;
+	bool limits_valid = true;
 	int ret = -ENODEV;
 	unsigned int i;
 	unsigned int delay_ms;
@@ -211,29 +197,29 @@ static void asahi_g16_zone_poll_fn(struct work_struct *work)
 		return;
 
 	for (i = 0; i < ARRAY_SIZE(asahi_g16_die_zones); i++) {
-		long z_rel = 0, z_hot = 0, z_crit = 0;
-		int temp = 0;
-		int err = thermal_zone_get_temp_by_name(asahi_g16_die_zones[i],
-							&temp);
+		struct asahi_g16_zone_trips trips = {};
+		int temp, err;
+
+		err = thermal_zone_get_temp_and_trips(asahi_g16_die_zones[i],
+						      &temp, asahi_g16_zone_trip_cb,
+						      &trips);
 
 		if (!err) {
 			if (!found || temp > hottest)
 				hottest = temp;
 			found = true;
 
-			if (asahi_g16_zone_read_limits(asahi_g16_die_zones[i],
-						       &z_rel, &z_hot,
-						       &z_crit)) {
-				if (!limits_valid) {
-					release_mc = z_rel;
-					hot_mc = z_hot;
-					critical_mc = z_crit;
-					limits_valid = true;
-				} else {
-					release_mc = min(release_mc, z_rel);
-					hot_mc = min(hot_mc, z_hot);
-					critical_mc = min(critical_mc, z_crit);
-				}
+			if (!asahi_g16_zone_limits_valid(&trips)) {
+				limits_valid = false;
+			} else if (!have_limits) {
+				release_mc = trips.release_mc;
+				hot_mc = trips.hot_mc;
+				critical_mc = trips.critical_mc;
+				have_limits = true;
+			} else {
+				release_mc = min(release_mc, trips.release_mc);
+				hot_mc = min(hot_mc, trips.hot_mc);
+				critical_mc = min(critical_mc, trips.critical_mc);
 			}
 		} else if (err != -ENODEV) {
 			ret = err;
@@ -244,7 +230,7 @@ static void asahi_g16_zone_poll_fn(struct work_struct *work)
 	}
 	if (found)
 		ret = 0;
-	if (!found || !limits_valid || release_mc <= 0 ||
+	if (!found || !have_limits || !limits_valid || release_mc <= 0 ||
 	    release_mc > hot_mc || critical_mc <= hot_mc)
 		limits_valid = false;
 
