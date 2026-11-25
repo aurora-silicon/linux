@@ -17,8 +17,20 @@ unsafe extern "C" {
     fn asahi_g17_collect_fences_coalesced(head: *mut bindings::dma_fence,
         out: *mut Leaf, capacity: usize) -> i32;
     fn asahi_g17_put_fence(fence: *mut bindings::dma_fence);
+    fn asahi_g17_fence_order(a: *mut bindings::dma_fence, b: *mut bindings::dma_fence) -> i32;
     fn asahi_g17_merge_fences(fences: *const *mut bindings::dma_fence, count: usize)
         -> *mut bindings::dma_fence;
+}
+
+impl super::dependency::FenceOrder for Fence {
+    fn order(&self, earlier: &Self) -> super::dependency::FenceOrdering {
+        // SAFETY: Both fences are live references; the helper only reads them.
+        match unsafe { asahi_g17_fence_order(self.raw(), earlier.raw()) } {
+            1 => super::dependency::FenceOrdering::Later,
+            0 => super::dependency::FenceOrdering::NotLater,
+            _ => super::dependency::FenceOrdering::OtherContext,
+        }
+    }
 }
 
 /// One fence that signals once all of `fences` have (see `job::MERGED_DEPENDENCIES`).

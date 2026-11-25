@@ -329,9 +329,10 @@ impl<B: Backend> Queue<B> {
         }
         let failure_count = failures.iter().flatten().count();
         let mut dependencies = KVec::with_capacity(
+            // The firmware-ordered producers add one scheduled fence between them.
             inputs.len()
                 + ordering_host_waits.len()
-                + ordering_firmware_waits.len()
+                + usize::from(!ordering_firmware_waits.is_empty())
                 + failure_count,
             GFP_KERNEL,
         )?;
@@ -349,10 +350,16 @@ impl<B: Backend> Queue<B> {
             dependencies.push(fence.clone(), GFP_KERNEL)?;
             checked_inputs.push(fence, GFP_KERNEL)?;
         }
-        for (scheduled, completed) in ordering_firmware_waits {
-            dependencies.push(scheduled, GFP_KERNEL)?;
-            firmware.push(completed, GFP_KERNEL)?;
+        // Firmware orders execution after each producer; the scheduler needs only the latest
+        // scheduled fence of them (dependency::ProducerWaits).
+        let mut producer_waits = super::dependency::ProducerWaits::new();
+        for (scheduled, completed) in &ordering_firmware_waits {
+            producer_waits.producer(scheduled, |fence| {
+                Ok(dependencies.push(fence.clone(), GFP_KERNEL)?)
+            })?;
+            firmware.push(completed.clone(), GFP_KERNEL)?;
         }
+        producer_waits.finish(|fence| Ok(dependencies.push(fence.clone(), GFP_KERNEL)?))?;
         // Each command owns every input fence; independent engines may publish in
         // either order and must each consume an input's error status before running.
         for sync in inputs {
