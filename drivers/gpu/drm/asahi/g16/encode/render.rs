@@ -402,14 +402,14 @@ pub(crate) fn encode_fs_for(
         u64::from(u.depth.stride),
         u64::from(u.stencil.stride),
         u64::from(u.stencil.stride),
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
+        u.depth.comp_base,
+        u64::from(u.depth.comp_stride),
+        u.depth.comp_base,
+        u64::from(u.depth.comp_stride),
+        u.stencil.comp_base,
+        u64::from(u.stencil.comp_stride),
+        u.stencil.comp_base,
+        u64::from(u.stencil.comp_stride),
         p.tilemap_gva,
         geo.layer_metadata,
         u64::from(geo.region_stride) << 26,
@@ -476,12 +476,16 @@ pub(crate) fn encode_fs_for(
     put64(w, 0x940, 0x04040404);
     put64(w, 0x948, u.depth.base);
     put64(w, 0x950, u64::from(u.depth.stride));
+    put64(w, 0x958, u64::from(u.depth.comp_stride));
     put64(w, 0x960, u.depth.base);
     put64(w, 0x968, u.depth.base);
+    put64(w, 0x970, u.depth.comp_base);
     put64(w, 0x978, u.stencil.base);
     put64(w, 0x980, u64::from(u.stencil.stride));
+    put64(w, 0x988, u64::from(u.stencil.comp_stride));
     put64(w, 0x990, u.stencil.base);
     put64(w, 0x998, u.stencil.base);
+    put64(w, 0x9a0, u.stencil.comp_base);
     put64(w, 0x9b8, u64::from(geo.tilebuffer_control));
     put64(w, 0x9c0, u64::from(geo.isp_control));
     put64(

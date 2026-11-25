@@ -23,6 +23,56 @@ use kernel::{
 
 use crate::file::SyncItem;
 
+/// Inline storage for the common 0-2 input fences, spilling to a heap `KVec` above 2.
+pub(crate) enum InputFences {
+    Empty,
+    One([Fence; 1]),
+    Two([Fence; 2]),
+    Heap(KVec<Fence>),
+}
+
+impl InputFences {
+    pub(crate) const fn new() -> Self {
+        Self::Empty
+    }
+
+    pub(crate) fn push(&mut self, fence: Fence) -> Result {
+        match self {
+            Self::Heap(vec) => vec.push(fence, GFP_KERNEL)?,
+            Self::Two(_) => {
+                // Allocate before moving inline entries so OOM leaves `self` intact.
+                let mut vec = KVec::with_capacity(4, GFP_KERNEL)?;
+                if let Self::Two([a, b]) = core::mem::replace(self, Self::Empty) {
+                    let _ = vec.push_within_capacity(a);
+                    let _ = vec.push_within_capacity(b);
+                    let _ = vec.push_within_capacity(fence);
+                }
+                *self = Self::Heap(vec);
+            }
+            Self::One(_) => {
+                if let Self::One([a]) = core::mem::replace(self, Self::Empty) {
+                    *self = Self::Two([a, fence]);
+                }
+            }
+            Self::Empty => *self = Self::One([fence]),
+        }
+        Ok(())
+    }
+}
+
+impl core::ops::Deref for InputFences {
+    type Target = [Fence];
+
+    fn deref(&self) -> &[Fence] {
+        match self {
+            Self::Empty => &[],
+            Self::One(items) => items,
+            Self::Two(items) => items,
+            Self::Heap(vec) => vec,
+        }
+    }
+}
+
 /// Reads a retained dependency's completion status without waiting or invoking callbacks.
 pub(crate) fn dependency_status(fence: &Fence) -> i32 {
     // SAFETY: The Fence reference keeps its dma_fence alive throughout the status read.
@@ -84,6 +134,9 @@ impl FenceOps for JobFenceOps {
     }
 }
 
+/// Stack batch size for signalling completed fences outside `Timeline::pending`.
+const SIGNAL_BATCH: usize = 8;
+
 /// An accepted fence of a timeline that has not signalled yet.
 struct Pending {
     fence: UserFence<JobFenceOps>,
@@ -98,6 +151,11 @@ pub(crate) struct Timeline {
     jobs: FenceContexts,
     /// One context for the error fences of refused submissions, each signalled at creation.
     errors: FenceContexts,
+    /// Serializes dma-fence signalling outside `pending` so fences of this context always
+    /// signal in creation order without holding `pending` across callbacks.
+    /// Lock order: `signaller` -> `pending` (never reversed; `next()` locks only `pending`).
+    #[pin]
+    signaller: Mutex<()>,
     /// Accepted fences that have not signalled, oldest first.
     #[pin]
     pending: Mutex<KVec<Pending>>,
@@ -113,6 +171,7 @@ impl Timeline {
             try_pin_init!(Self {
                 jobs: FenceContexts::new(1, c_str!("aurora_g16_queue"), TIMELINE_KEY)?,
                 errors,
+                signaller <- new_mutex!((), "g16::Timeline::signaller"),
                 pending <- new_mutex!(KVec::new(), "g16::Timeline::pending"),
                 allocation_failure,
             }),
@@ -141,32 +200,60 @@ impl Timeline {
         })
     }
 
-    /// Records the result of `fence` and signals every completed fence at the head, in order.
+    /// Records the result of `fence` and signals every completed fence at the head, in order,
+    /// without holding `pending` across `dma_fence_signal` callbacks.
     fn complete(&self, fence: &UserFence<JobFenceOps>, result: Result) {
-        let mut pending = self.pending.lock();
-        let Some(entry) = pending
-            .iter_mut()
-            .find(|entry| entry.fence.raw() == fence.raw())
-        else {
-            // Already signalled.
-            return;
-        };
-        if entry.result.is_some() {
-            return;
-        }
-        entry.result = Some(result);
-        let mut signalled = 0;
-        for entry in pending.iter() {
-            let Some(result) = entry.result else {
-                break;
+        let head_ready = {
+            let mut pending = self.pending.lock();
+            let Some(entry) = pending
+                .iter_mut()
+                .find(|entry| entry.fence.raw() == fence.raw())
+            else {
+                // Already signalled.
+                return;
             };
-            if let Err(error) = result {
-                entry.fence.set_error(error);
+            if entry.result.is_some() {
+                return;
             }
-            entry.fence.signal();
-            signalled += 1;
+            entry.result = Some(result);
+            pending.first().is_some_and(|entry| entry.result.is_some())
+        };
+        if !head_ready {
+            return;
         }
-        drop(pending.drain(..signalled));
+        let _signaller = self.signaller.lock();
+        loop {
+            let mut batch: [Option<(UserFence<JobFenceOps>, Result)>; SIGNAL_BATCH] =
+                [const { None }; SIGNAL_BATCH];
+            let (count, more) = {
+                let mut pending = self.pending.lock();
+                let ready = pending
+                    .iter()
+                    .take(SIGNAL_BATCH)
+                    .take_while(|entry| entry.result.is_some())
+                    .count();
+                let mut idx = 0;
+                for entry in pending.drain(..ready) {
+                    if let Some(res) = entry.result {
+                        batch[idx] = Some((entry.fence, res));
+                        idx += 1;
+                    }
+                }
+                let more = pending.first().is_some_and(|entry| entry.result.is_some());
+                (idx, more)
+            };
+            for item in &mut batch[..count] {
+                if let Some((fence, res)) = item.take() {
+                    if let Err(error) = res {
+                        fence.set_error(error);
+                    }
+                    fence.signal();
+                }
+            }
+            if !more {
+                break;
+            }
+        }
     }
 
     /// A signalled fence carrying `error`, for the output syncs of a refused submission.

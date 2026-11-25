@@ -43,8 +43,8 @@ use crate::module_parameters;
 
 /// Cadence of periodic housekeeping (power governor, window health, administrative hang check).
 const HOUSEKEEPING_NS: u64 = 1_000_000;
-/// Maximum trailing 5 us receipt polls after an EP 0x20 event (50 us covers firmware WC tails).
-const EVENT_RETIRE_POLLS: u32 = 10;
+/// Maximum trailing receipt polls after an EP 0x20 event (stepped 1/2/5 us, ~48 us total).
+const EVENT_RETIRE_POLLS: u32 = 11;
 /// Minimum interval between 1-jiffy delayed-work safety backup rearms (2 ms).
 const BACKUP_REARM_NS: u64 = 2_000_000;
 
@@ -76,6 +76,22 @@ fn stats_show(shared: &Arc<Shared>, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 }
 
 impl Shared {
+    /// Schedules a delayed poll while idle so DVFS utilization decays to S1 and a held CLPC
+    /// memory/fabric floor expires cleanly after all flights drain.
+    fn arm_idle_power_poll(self: &Arc<Self>, firmware: &Firmware) {
+        if firmware.recovery.failed().is_some() {
+            return;
+        }
+        let delay_ns = if firmware.power.clpc_holding() {
+            super::power::policy::CLPC_IDLE_HOLD_NS
+        } else if firmware.power.utilization.decaying() {
+            super::power::policy::WINDOW_NS
+        } else {
+            return;
+        };
+        self.mod_poll(kernel::time::msecs_to_jiffies((delay_ns / 1_000_000) as u32).max(1));
+    }
+
     /// One poll pass (the poll work item).
     pub(crate) fn run_poll(self: Arc<Self>) {
         // The domain may be off. The sleep's end queues a pass.
@@ -93,6 +109,7 @@ impl Shared {
                 break;
             }
             let mut done = Completions::new();
+            let mut scrubs = super::slots::ScrubBatch::new();
             let mut retry_tail = false;
             if let Some(firmware) = self.state.lock().as_deref_mut() {
                 if self.sleeping.load(Ordering::Acquire) {
@@ -116,32 +133,36 @@ impl Shared {
                     Ok(true) => {
                         self.rearm(firmware.engine.chan_wait || firmware.engine.short_repoll)
                     }
-                    // Idle: one more pass after a window gives the state back. A failed
-                    // engine's poll no longer services power, so it has nothing to give back.
-                    Ok(false)
-                        if firmware.recovery.failed().is_none()
-                            && firmware.power.utilization.decaying() =>
-                    {
-                        self.mod_poll(kernel::time::msecs_to_jiffies(
-                            (super::power::policy::WINDOW_NS / 1_000_000) as u32,
-                        ));
+                    // Idle: arm a delayed poll while DVFS utilization is decaying or a CLPC
+                    // floor hold is still pending so both expire cleanly to idle power.
+                    Ok(false) => {
+                        self.arm_idle_power_poll(firmware);
                         self.cancel_resnap();
                     }
-                    Ok(false) => self.cancel_resnap(),
                     Err(error) => {
                         self.cancel_resnap();
                         firmware.fail_stop(error, &mut done);
                         self.fail_stop(error);
                     }
                 }
+                let allow_stage = firmware.recovery.failed().is_none() && !firmware.engine.frozen;
+                scrubs = firmware.slots.stage_and_take_scrubs(allow_stage);
             }
             job::complete_all(done);
+            if scrubs.run() {
+                self.poll_now();
+            }
             if !retry_tail {
                 break;
             }
+            let delay_us = match step {
+                0 => 1,
+                1 => 2,
+                _ => 5,
+            };
             tail -= 1;
             step += 1;
-            delay::udelay(Delta::from_micros(5));
+            delay::udelay(Delta::from_micros(delay_us));
         }
 
         if housekeeping_deferred && !self.sleeping.load(Ordering::Acquire) {
@@ -154,6 +175,8 @@ impl Shared {
                         self.fail_stop(error);
                     } else if firmware.recovery.needs_repoll() || firmware.engine.frozen {
                         self.rearm(false);
+                    } else if firmware.engine.flights.is_empty() {
+                        self.arm_idle_power_poll(firmware);
                     }
                 }
             }
@@ -175,27 +198,66 @@ impl Shared {
         let accepted = firmware.enqueue(job);
         if accepted.is_ok() && !self.sleeping.load(Ordering::Acquire) {
             let now = now_ns();
-            let full = now.wrapping_sub(firmware.last_housekeeping_ns) >= HOUSEKEEPING_NS
-                || self.evented.load(Ordering::Acquire)
-                || firmware.recovery_pending().unwrap_or(true);
-            let pub_res = if full {
-                let r = firmware.publish(done);
-                if r.is_ok() {
-                    firmware.last_housekeeping_ns = now;
-                }
-                r
-            } else {
-                firmware
-                    .session
-                    .transport()
-                    .and_then(|()| firmware.publish_checked(done))
-            };
+            let housekeeping_due =
+                now.wrapping_sub(firmware.last_housekeeping_ns) >= HOUSEKEEPING_NS;
+            let had_flights = !firmware.engine.flights.is_empty();
+            let was_evented = had_flights && self.evented.swap(false, Ordering::AcqRel);
+            let recovery_pending = firmware.recovery_pending().unwrap_or(true);
+            let mut pub_res = Ok(());
+            if had_flights
+                && (was_evented
+                    || housekeeping_due
+                    || recovery_pending
+                    || firmware.oldest_stamp_reached())
+            {
+                let stage_before = firmware.events.stage_events;
+                let term_before = firmware.oldest_terminal_events();
+                pub_res = firmware.session.transport().and_then(|()| {
+                    let retired_any = firmware.retire_once(done)?;
+                    firmware.answer_growth()?;
+                    if firmware.recovery.receipt_fault || firmware.recovery_pending()? {
+                        firmware.check_hangs(done)?;
+                    }
+                    if was_evented && !retired_any && !firmware.engine.flights.is_empty() {
+                        let non_terminal_only = term_before.is_some()
+                            && firmware.events.stage_events != stage_before
+                            && firmware.oldest_terminal_events() == term_before
+                            && !firmware.oldest_stamp_reached()
+                            && !firmware.recovery.receipt_fault
+                            && !firmware.recovery_pending().unwrap_or(true);
+                        if !non_terminal_only {
+                            self.evented.store(true, Ordering::Release);
+                        }
+                    }
+                    Ok(())
+                });
+            }
+            if pub_res.is_ok() {
+                pub_res = if housekeeping_due || recovery_pending {
+                    let r = firmware.publish(done);
+                    if r.is_ok() {
+                        firmware.last_housekeeping_ns = now;
+                    }
+                    r
+                } else {
+                    firmware.publish_checked(done)
+                };
+            }
+            if pub_res.is_ok()
+                && !firmware.engine.flights.is_empty()
+                && firmware.power.needs_ramp(now)
+            {
+                pub_res = firmware.service_power();
+            }
             if let Err(error) = pub_res {
                 firmware.fail_stop(error, done);
                 self.fail_stop(error);
             }
             if !firmware.engine.flights.is_empty() || firmware.engine.chan_wait {
                 self.rearm(firmware.engine.chan_wait);
+            } else {
+                firmware.power.report_work(false);
+                self.arm_idle_power_poll(firmware);
             }
         }
         accepted
@@ -207,33 +269,53 @@ impl Shared {
     pub(crate) fn submit(self: &Arc<Self>, job: Arc<Job>) -> Result {
         let signalling = kernel::dma_fence::SignallingGuard::new();
         let mut done = Completions::new();
-        let accepted = {
+        let (accepted, scrubs) = {
             let mut state = self.state.lock();
             let firmware = state.as_deref_mut().ok_or(ENODEV)?;
-            self.submit_locked(firmware, job, &mut done)
+            let res = self.submit_locked(firmware, job, &mut done);
+            let allow_stage = firmware.recovery.failed().is_none() && !firmware.engine.frozen;
+            (res, firmware.slots.stage_and_take_scrubs(allow_stage))
         };
         job::complete_all(done);
+        if scrubs.run() {
+            self.poll_now();
+        }
         drop(signalling);
         self.notify_wedged();
         accepted
     }
 
-    /// Non-blocking variant of [`Self::submit`] for inline SUBMIT ioctl publication: returns
-    /// `None` without sleeping when `Shared::state` is contended so `drm_sched` publishes instead.
+    /// Inline SUBMIT ioctl publication: acquires `Shared::state` directly when the GPU is
+    /// neither sleeping nor recovering so brief poll-lock overlap does not bounce ready
+    /// submissions onto `drm_sched` kworker wakeups. Returns `None` during sleep or recovery
+    /// so `drm_sched` handles those paths without stalling SUBMIT.
     pub(crate) fn try_submit_inline(self: &Arc<Self>, job: Arc<Job>) -> Option<Result> {
+        if self.sleeping.load(Ordering::Acquire) || self.recovering.load(Ordering::Acquire) {
+            return None;
+        }
         let signalling = kernel::dma_fence::SignallingGuard::new();
         let mut done = Completions::new();
+        let mut scrubs = super::slots::ScrubBatch::new();
         let accepted = {
-            let mut state = self.state.try_lock()?;
+            let mut state = self.state.lock();
             if self.sleeping.load(Ordering::Acquire) {
                 return None;
             }
             match state.as_deref_mut() {
-                Some(firmware) => self.submit_locked(firmware, job, &mut done),
+                Some(firmware) => {
+                    let res = self.submit_locked(firmware, job, &mut done);
+                    let allow_stage =
+                        firmware.recovery.failed().is_none() && !firmware.engine.frozen;
+                    scrubs = firmware.slots.stage_and_take_scrubs(allow_stage);
+                    res
+                }
                 None => Err(ENODEV),
             }
         };
         job::complete_all(done);
+        if scrubs.run() {
+            self.poll_now();
+        }
         drop(signalling);
         self.notify_wedged();
         Some(accepted)
@@ -382,6 +464,8 @@ impl Firmware {
                 return Ok(false);
             }
         }
+        let stage_before = self.events.stage_events;
+        let term_before = self.oldest_terminal_events();
         let mut lap = Lap::start();
         let start = lap.on().then(now_ns);
         let retired_any = self.retire_once(done)?;
@@ -409,12 +493,22 @@ impl Firmware {
             self.engine.prof.poll_ns += now_ns().wrapping_sub(start);
         }
         published?;
+        // A TA-only (0x70) EP 0x20 interrupt while FS is still running does not signal flight
+        // retirement: avoid burning the receipt-tail spin or arming a short repoll storm for it.
+        let non_terminal_only = !retired_any
+            && term_before.is_some()
+            && self.events.stage_events != stage_before
+            && self.oldest_terminal_events() == term_before
+            && !self.oldest_stamp_reached()
+            && !self.recovery.receipt_fault
+            && !self.recovery_pending().unwrap_or(true);
         // After an EP 0x20 event, retry up to `EVENT_RETIRE_POLLS` times (outside the device
         // lock) only while no flight has retired yet and flights remain in flight. Once any
-        // flight retires, stop spinning so deeper queues do not burn 50 us per interrupt.
+        // flight retires, stop spinning so deeper queues do not burn tail waits per interrupt.
         if evented
             && had_flights
             && !retired_any
+            && !non_terminal_only
             && tail != 0
             && !self.engine.flights.is_empty()
             && !self.recovery.receipt_fault
@@ -431,18 +525,22 @@ impl Firmware {
                 self.run_housekeeping(done)?;
             }
         }
-        // If an EP 0x20 event arrived with flights outstanding and nothing retired within the
-        // trailing polls, repoll at `repoll_us` instead of sleeping `resnap_us`.
-        self.engine.short_repoll =
-            evented && had_flights && !retired_any && !self.engine.flights.is_empty();
+        // If a terminal EP 0x20 event arrived with flights outstanding and nothing retired within
+        // the trailing polls, repoll at `repoll_us` instead of sleeping `resnap_us`.
+        self.engine.short_repoll = evented
+            && had_flights
+            && !retired_any
+            && !non_terminal_only
+            && !self.engine.flights.is_empty();
         Ok(!self.engine.flights.is_empty()
             || self.engine.chan_wait
             || self.recovery.needs_repoll()
             || self.engine.frozen)
     }
 
-    /// Periodic 1 ms housekeeping (session/object health, power governor, administrative hang
-    /// checks), run after retired completion fences have been signalled when work retired.
+    /// Periodic 1 ms housekeeping (session/object health, power governor, auxiliary log/trace
+    /// ring drain, administrative hang checks), run after retired completion fences have been
+    /// signalled when work retired.
     pub(crate) fn run_housekeeping(&mut self, done: &mut Completions) -> Result {
         if self.recovery.failed().is_some() {
             return Ok(());
@@ -451,6 +549,7 @@ impl Firmware {
         self.session.check()?;
         self.objects.health()?;
         self.service_power()?;
+        self.drain_auxiliary_rings()?;
         self.last_housekeeping_ns = now_ns();
         if !self.engine.flights.is_empty()
             || self.recovery.receipt_fault
@@ -461,27 +560,110 @@ impl Firmware {
         Ok(())
     }
 
-    /// Drains the rings and retires all currently complete flights without sleeping. Returns
-    /// whether at least one flight retired. A receipt fault is left in
-    /// `Recovery::receipt_fault` for the hang checks.
+    /// Terminal completion-event counters for the oldest active flight of each class
+    /// (`(compute_events, fs_events)`), used to distinguish TA-only (0x70) non-terminal events.
+    fn oldest_terminal_events(&self) -> Option<(Option<u32>, Option<u32>)> {
+        if self.engine.flights.is_empty()
+            || self
+                .engine
+                .flights
+                .iter()
+                .any(|f| f.computes != 0 && f.renders != 0)
+        {
+            return None;
+        }
+        let compute = self
+            .engine
+            .flights
+            .iter()
+            .any(|f| f.computes != 0)
+            .then_some(self.events.compute_events);
+        let render = self
+            .engine
+            .flights
+            .iter()
+            .any(|f| f.renders != 0)
+            .then_some(self.events.fs_events);
+        Some((compute, render))
+    }
+
+    /// Cheap single-stage stamp check for the oldest compute and oldest render flights' terminal
+    /// stages so `submit_locked()` can eagerly retire finished work without scanning all rings
+    /// when nothing has completed.
+    fn oldest_stamp_reached(&self) -> bool {
+        if self.engine.flights.is_empty() {
+            return false;
+        }
+        let mut oldest_compute: Option<&Flight> = None;
+        let mut compute_behind = false;
+        let mut oldest_render: Option<&Flight> = None;
+        let mut render_behind = false;
+        for f in self.engine.flights.iter() {
+            if f.computes != 0 {
+                if oldest_compute.is_none() {
+                    oldest_compute = Some(f);
+                } else {
+                    compute_behind = true;
+                }
+            }
+            if f.renders != 0 {
+                if oldest_render.is_none() {
+                    oldest_render = Some(f);
+                } else {
+                    render_behind = true;
+                }
+            }
+            if compute_behind && render_behind {
+                break;
+            }
+        }
+        rmb();
+        if let Some(f) = oldest_compute {
+            if let Ok(obs) = self.graph.compute.fw_stamp.r32(0) {
+                let reached = if compute_behind {
+                    stamp_reached(obs, f.target, self.engine.target)
+                } else {
+                    obs == f.target
+                };
+                if reached {
+                    return true;
+                }
+            }
+        }
+        if let Some(f) = oldest_render {
+            if let Ok(obs) = self.graph.render.fw_stamp[1].r32(0) {
+                let reached = if render_behind {
+                    stamp_reached(obs, f.fs_target, self.engine.fs_target)
+                } else {
+                    obs == f.fs_target
+                };
+                if reached {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Drains the event/stats rings and retires all currently complete oldest compute and render
+    /// flights independently without sleeping. Returns whether at least one flight retired. A
+    /// receipt fault is left in `Recovery::receipt_fault` for the hang checks.
     pub(crate) fn retire_once(&mut self, done: &mut Completions) -> Result<bool> {
         let mut lap = Lap::start();
-        self.drain_rings()?;
+        self.drain_events_and_stats()?;
         lap.lap(&mut self.engine.prof.drain_ns);
         // Recovery may force stage progress: authenticate it before any receipt.
         if self.recovery.receipt_fault || self.recovery_pending()? {
             self.check_hangs(done)?;
         }
         let mut retired_any = false;
-        let mut ret = self.retired();
-        while let Ok(receipt) = ret {
-            if !receipt.complete() {
-                break;
-            }
-            let outcome = self.retire_outcome(receipt);
-            self.retire_oldest(receipt, outcome, done);
+        let (mut check_compute, mut check_render) = (true, true);
+        let mut ret = self.retired_flight_classes(&mut check_compute, &mut check_render);
+        while let Ok(Some((index, receipt))) = ret {
+            let outcome = self.retire_outcome_at(index, receipt);
+            self.retire_oldest(index, receipt, outcome, done);
             retired_any = true;
-            ret = self.retired();
+            ret = self.retired_flight_classes(&mut check_compute, &mut check_render);
         }
         self.recovery.receipt_fault = ret.is_err();
         Ok(retired_any)
@@ -496,11 +678,18 @@ impl Firmware {
     /// ABIs with `work_ticks` leave ITS 0/0 and write them into the work object. The ITS pair
     /// is used whenever it holds an interval.
     fn compute_ticks(&self, unit: &super::slots::ComputeSlot) -> Result<(u64, u64)> {
+        Self::compute_ticks_with(self.init.abi.compute().work_ticks, unit)
+    }
+
+    fn compute_ticks_with(
+        work_ticks: Option<(usize, usize)>,
+        unit: &super::slots::ComputeSlot,
+    ) -> Result<(u64, u64)> {
         let (start, end) = (unit.its.r64(0)?, unit.its.r64(8)?);
         if start != 0 && end > start {
             return Ok((start, end));
         }
-        let Some((start_off, end_off)) = self.init.abi.compute().work_ticks else {
+        let Some((start_off, end_off)) = work_ticks else {
             return Ok((start, end));
         };
         let w = &unit.work;
@@ -600,146 +789,235 @@ impl Firmware {
     /// receipt omits only the writes firmware does not make for an aborted command,
     /// after the recovery grace period and its queue/pipe/stage passed proof.
     pub(crate) fn retired(&mut self) -> Result<Retirement> {
-        match self.retired_snapshot() {
+        self.retired_at(0)
+    }
+
+    fn retired_at(&mut self, index: usize) -> Result<Retirement> {
+        match self.retired_snapshot_at(index) {
             // A changing packed receipt is not an authenticated firmware failure.
             Err(error) if error == EAGAIN => Ok(Retirement::Pending),
             result => result,
         }
     }
 
+    /// Inspects the oldest compute flight and oldest render flight independently so either
+    /// class can retire as soon as its hardware receipt settles without waiting on the other.
+    pub(crate) fn retired_flight(&mut self) -> Result<Option<(usize, Retirement)>> {
+        let (mut check_compute, mut check_render) = (true, true);
+        self.retired_flight_classes(&mut check_compute, &mut check_render)
+    }
+
+    /// Like [`Self::retired_flight`], skipping classes that are inactive or already known
+    /// pending in the current [`Self::retire_once`] pass and never polling a mixed flight twice.
+    fn retired_flight_classes(
+        &mut self,
+        check_compute: &mut bool,
+        check_render: &mut bool,
+    ) -> Result<Option<(usize, Retirement)>> {
+        let (mut compute_idx, mut render_idx) = (None, None);
+        if *check_compute || *check_render {
+            for (i, f) in self.engine.flights.iter().enumerate() {
+                if *check_compute && compute_idx.is_none() && f.computes != 0 {
+                    compute_idx = Some(i);
+                }
+                if *check_render && render_idx.is_none() && f.renders != 0 {
+                    render_idx = Some(i);
+                }
+                if (!*check_compute || compute_idx.is_some())
+                    && (!*check_render || render_idx.is_some())
+                {
+                    break;
+                }
+            }
+        }
+        if compute_idx.is_none() {
+            *check_compute = false;
+        }
+        if render_idx.is_none() {
+            *check_render = false;
+        }
+        if let Some(index) = compute_idx {
+            let receipt = self.retired_at(index)?;
+            if receipt.complete() {
+                return Ok(Some((index, receipt)));
+            }
+            *check_compute = false;
+            if render_idx == Some(index) {
+                *check_render = false;
+                render_idx = None;
+            }
+        }
+        if let Some(index) = render_idx {
+            let receipt = self.retired_at(index)?;
+            if receipt.complete() {
+                return Ok(Some((index, receipt)));
+            }
+            *check_render = false;
+        }
+        Ok(None)
+    }
+
     fn retired_snapshot(&mut self) -> Result<Retirement> {
-        let Some(f) = self.engine.oldest() else {
+        self.retired_snapshot_at(0)
+    }
+
+    fn retired_snapshot_at(&mut self, index: usize) -> Result<Retirement> {
+        let Some(f) = self.engine.flights.get(index) else {
             return Ok(Retirement::Pending);
         };
         rmb();
         let mut full = true;
-        // Later compute flights queued behind this one: the queue, pipe and stamp cells
-        // already moved on, so their receipt is "passed", in order; the newest flight keeps
-        // the exact receipt.
-        let behind = self.engine.flights.len() > 1;
-        if f.computes != 0 && behind {
+        let mut ticks = [0u64; 4];
+        // Later flights of the same engine class queued behind this one: that class's queue,
+        // pipe and stamp cells already moved on, so its receipt is "passed", in order; the
+        // newest flight of a class keeps the exact receipt.
+        if f.computes != 0 {
+            let compute_behind = self
+                .engine
+                .flights
+                .iter()
+                .filter(|o| o.computes != 0)
+                .nth(1)
+                .is_some();
             let g = &self.graph.compute;
-            let e = &self.engine;
-            if !stamp_reached(g.fw_stamp.r32(0)?, f.target, e.target)
-                || !self.queue_passed(Channel::Compute, &g.qstate, &g.qinfo, f)?
-            {
-                return Ok(Retirement::Pending);
+            if compute_behind {
+                let e = &self.engine;
+                if !stamp_reached(g.fw_stamp.r32(0)?, f.target, e.target)
+                    || !self.queue_passed(Channel::Compute, &g.qstate, &g.qinfo, f)?
+                {
+                    return Ok(Retirement::Pending);
+                }
+                let stamp = g.notifier.r32(notifier_page::COMPUTE_STAMP)?;
+                full &= stamp_reached(stamp, f.target, e.target)
+                    && (stamp != f.target
+                        || g.notifier.r32(notifier_page::COMPUTE_CONTEXT)? == f.job.vm.slot);
+            } else {
+                if g.fw_stamp.r32(0)? != f.target
+                    || !self.queue_receipt(Channel::Compute, &g.qstate, &g.qinfo, f.head, f.rec[2])?
+                {
+                    return Ok(Retirement::Pending);
+                }
+                full &= g.notifier.r32(notifier_page::COMPUTE_STAMP)? == f.target
+                    && g.notifier.r32(notifier_page::COMPUTE_CONTEXT)? == f.job.vm.slot;
             }
-            let k = f.claims.slot[0] as usize;
-            let unit = f.job.resources.compute_unit(k)?;
-            let submitted = unit.counter.r64(0)?;
-            let (start, end) = self.compute_ticks(unit)?;
-            let stamp = g.notifier.r32(notifier_page::COMPUTE_STAMP)?;
-            full &= stamp_reached(stamp, f.target, e.target)
-                && (stamp != f.target
-                    || g.notifier.r32(notifier_page::COMPUTE_CONTEXT)? == f.job.vm.slot)
-                && submitted != 0
-                && unit.work.r64(compute::DESCRIPTOR_COMPLETED)? == submitted
-                && unit.work.r64(compute::DESCRIPTOR_COUNTER)? == unit.counter.va
-                && start != 0
-                && end > start;
-        } else if f.computes != 0 {
-            let g = &self.graph.compute;
-            if g.fw_stamp.r32(0)? != f.target
-                || !self.queue_receipt(Channel::Compute, &g.qstate, &g.qinfo, f.head, f.rec[2])?
-            {
-                return Ok(Retirement::Pending);
+            let count = f.claims.slot_count as usize;
+            full &= count != 0 && count == f.computes as usize;
+            if full {
+                for m in 0..count {
+                    let k = f.claims.slot[m] as usize;
+                    let unit = f.job.resources.compute_unit(k)?;
+                    let submitted = f.csubmitted[m];
+                    if submitted == 0
+                        || unit.counter.r64(0)? != submitted
+                        || unit.work.r64(compute::DESCRIPTOR_COMPLETED)? != submitted
+                        || unit.work.r64(compute::DESCRIPTOR_COUNTER)? != unit.counter.va
+                    {
+                        full = false;
+                        break;
+                    }
+                    let (start, end) = self.compute_ticks(unit)?;
+                    if start == 0 || end <= start {
+                        full = false;
+                        break;
+                    }
+                    if m == 0 && count == 1 {
+                        ticks = [start, end, 0, 0];
+                    }
+                }
             }
-            let k = f.claims.slot[0] as usize;
-            let unit = f.job.resources.compute_unit(k)?;
-            let submitted = unit.counter.r64(0)?;
-            let (start, end) = self.compute_ticks(unit)?;
-            full &= g.notifier.r32(notifier_page::COMPUTE_STAMP)? == f.target
-                && g.notifier.r32(notifier_page::COMPUTE_CONTEXT)? == f.job.vm.slot
-                && submitted != 0
-                && unit.work.r64(compute::DESCRIPTOR_COMPLETED)? == submitted
-                && unit.work.r64(compute::DESCRIPTOR_COUNTER)? == unit.counter.va
-                && start != 0
-                && end > start;
         }
-        if f.renders != 0 && behind {
+        if f.renders != 0 {
+            let render_behind = self
+                .engine
+                .flights
+                .iter()
+                .filter(|o| o.renders != 0)
+                .nth(1)
+                .is_some();
             let g = &self.graph.render;
-            let e = &self.engine;
-            if !stamp_reached(g.fw_stamp[0].r32(0)?, f.ta_target, e.ta_target)
-                || !stamp_reached(g.fw_stamp[1].r32(0)?, f.fs_target, e.fs_target)
-                || !self.queue_passed(Channel::Ta, &g.qstate[0], &g.qinfo[0], f)?
-                || !self.queue_passed(Channel::Fs, &g.qstate[1], &g.qinfo[1], f)?
-            {
-                return Ok(Retirement::Pending);
-            }
-            let k = f.claims.pass[0] as usize;
             let a = f.pb_slot as usize;
-            let unit = f.job.resources.render_pass(k)?;
-            let ta_start = unit.scene.r64(0x600)?;
-            let ta_end = unit.scene.r64(0x608)?;
-            let fs_start = unit.scene.r64(0x620)?;
-            let fs_end = unit.scene.r64(0x628)?;
-            let ta_stamp = g.notifier.r32(notifier_page::TA_STAMP)?;
-            let fs_stamp = g.notifier.r32(notifier_page::FS_STAMP)?;
-            full &= stamp_reached(ta_stamp, f.ta_target, e.ta_target)
-                && (ta_stamp != f.ta_target
-                    || g.notifier.r32(notifier::CONTEXT)? == f.job.vm.slot)
-                && stamp_reached(fs_stamp, f.fs_target, e.fs_target)
-                && (fs_stamp != f.fs_target
-                    || g.notifier
+            if render_behind {
+                let e = &self.engine;
+                // Check FS (terminal stage) before TA so running renders fail fast on 1 WC read.
+                if !stamp_reached(g.fw_stamp[1].r32(0)?, f.fs_target, e.fs_target)
+                    || !stamp_reached(g.fw_stamp[0].r32(0)?, f.ta_target, e.ta_target)
+                    || !self.queue_passed(Channel::Ta, &g.qstate[0], &g.qinfo[0], f)?
+                    || !self.queue_passed(Channel::Fs, &g.qstate[1], &g.qinfo[1], f)?
+                {
+                    return Ok(Retirement::Pending);
+                }
+                let fs_stamp = g.notifier.r32(notifier_page::FS_STAMP)?;
+                let ta_stamp = g.notifier.r32(notifier_page::TA_STAMP)?;
+                full &= stamp_reached(fs_stamp, f.fs_target, e.fs_target)
+                    && (fs_stamp != f.fs_target
+                        || g.notifier
+                            .r32(notifier_page::FS_RECORD + notifier::CONTEXT)?
+                            == f.job.vm.slot)
+                    && stamp_reached(ta_stamp, f.ta_target, e.ta_target)
+                    && (ta_stamp != f.ta_target
+                        || g.notifier.r32(notifier::CONTEXT)? == f.job.vm.slot)
+                    && f.job
+                        .resources
+                        .pb_retired_at(a, f.uma_submitted)?;
+            } else {
+                // Check FS (terminal stage) before TA so running renders fail fast on 1 WC read.
+                if g.fw_stamp[1].r32(0)? != f.fs_target
+                    || g.fw_stamp[0].r32(0)? != f.ta_target
+                    || !self.queue_receipt(
+                        Channel::Ta,
+                        &g.qstate[0],
+                        &g.qinfo[0],
+                        f.ta_head,
+                        f.rec[0],
+                    )?
+                    || !self.queue_receipt(
+                        Channel::Fs,
+                        &g.qstate[1],
+                        &g.qinfo[1],
+                        f.fs_head,
+                        f.rec[1],
+                    )?
+                {
+                    return Ok(Retirement::Pending);
+                }
+                full &= g.notifier.r32(notifier_page::FS_STAMP)? == f.fs_target
+                    && g.notifier.r32(notifier_page::TA_STAMP)? == f.ta_target
+                    && g.notifier.r32(notifier::CONTEXT)? == f.job.vm.slot
+                    && g.notifier
                         .r32(notifier_page::FS_RECORD + notifier::CONTEXT)?
-                        == f.job.vm.slot)
-                && f.job
-                    .resources
-                    .render()?
-                    .pools
-                    .retired_at(a, f.uma_submitted)?
-                && ta_start != 0
-                && ta_end > ta_start
-                && fs_start != 0
-                && fs_end > fs_start;
-        } else if f.renders != 0 {
-            let g = &self.graph.render;
-            if g.fw_stamp[0].r32(0)? != f.ta_target
-                || g.fw_stamp[1].r32(0)? != f.fs_target
-                || !self.queue_receipt(
-                    Channel::Ta,
-                    &g.qstate[0],
-                    &g.qinfo[0],
-                    f.ta_head,
-                    f.rec[0],
-                )?
-                || !self.queue_receipt(
-                    Channel::Fs,
-                    &g.qstate[1],
-                    &g.qinfo[1],
-                    f.fs_head,
-                    f.rec[1],
-                )?
-            {
-                return Ok(Retirement::Pending);
+                        == f.job.vm.slot
+                    && f.job.resources.pb_retired(a)?;
             }
-            let k = f.claims.pass[0] as usize;
-            let a = f.pb_slot as usize;
-            let unit = f.job.resources.render_pass(k)?;
-            let ta_start = unit.scene.r64(0x600)?;
-            let ta_end = unit.scene.r64(0x608)?;
-            let fs_start = unit.scene.r64(0x620)?;
-            let fs_end = unit.scene.r64(0x628)?;
-            full &= g.notifier.r32(notifier_page::TA_STAMP)? == f.ta_target
-                && g.notifier.r32(notifier_page::FS_STAMP)? == f.fs_target
-                && g.notifier.r32(notifier::CONTEXT)? == f.job.vm.slot
-                && g.notifier
-                    .r32(notifier_page::FS_RECORD + notifier::CONTEXT)?
-                    == f.job.vm.slot
-                && f.job.resources.render()?.pools.retired(a)?
-                && ta_start != 0
-                && ta_end > ta_start
-                && fs_start != 0
-                && fs_end > fs_start;
+            if full {
+                let count = (f.renders as usize).min(f.claims.pass.len());
+                for m in 0..count {
+                    let k = f.claims.pass[m] as usize;
+                    let unit = f.job.resources.render_pass(k)?;
+                    let ta_start = unit.scene.r64(0x600)?;
+                    let ta_end = unit.scene.r64(0x608)?;
+                    let fs_start = unit.scene.r64(0x620)?;
+                    let fs_end = unit.scene.r64(0x628)?;
+                    if count == 1 && f.computes == 0 {
+                        ticks = [ta_start, ta_end, fs_start, fs_end];
+                    }
+                    full &= ta_start != 0
+                        && ta_end > ta_start
+                        && fs_start != 0
+                        && fs_end > fs_start;
+                    if !full {
+                        break;
+                    }
+                }
+            }
         }
         if full {
+            self.engine.retired_ticks = ticks;
             return Ok(Retirement::Full);
         }
         if f.recovery_suspect && now_ns().saturating_sub(f.recovery_started_ns) >= 20_000_000 {
             // Queues, pipes and every participating stage passed the retained command.
             // The firmware recovered it without normal completion: fail and quarantine.
-            if let Some(f) = self.engine.flights.first_mut() {
+            if let Some(f) = self.engine.flights.get_mut(index) {
                 f.doomed = true;
             }
             return Ok(Retirement::Aborted);
@@ -773,40 +1051,66 @@ impl Firmware {
         }
     }
 
-    /// Retire the oldest prefix's scheduling ownership. Only a full normal receipt retires
-    /// its storage; a passed abort quarantines it. Job failure independently drops remaining
-    /// unpublished commands even when the storage fully retired.
+    /// Publishes lockless quarantine hints so `SUBMIT` expands extension and recovery slots
+    /// immediately when a base or PB allocator slot has been permanently quarantined.
+    pub(crate) fn sync_quarantine_hints(&self) {
+        if let Some(shared) = &self.engine.shared {
+            shared
+                .base_compute_quarantined
+                .store(self.slots.base_compute_quarantined(), Ordering::Release);
+            shared
+                .base_render_quarantined
+                .store(self.slots.base_render_quarantined(), Ordering::Release);
+            shared
+                .needed_pb_slots
+                .store(self.pools.needed_slots() as u32, Ordering::Release);
+        }
+    }
+
+    /// Retire the flight at `index` (the oldest of its engine class). Only a full normal receipt
+    /// retires its storage; a passed abort quarantines it. Job failure independently drops
+    /// remaining unpublished commands even when the storage fully retired.
     pub(crate) fn retire_oldest(
         &mut self,
+        index: usize,
         receipt: Retirement,
         result: Result,
         done: &mut Completions,
     ) {
-        if self.engine.flights.is_empty() {
+        if index >= self.engine.flights.len() {
             return;
         }
-        let Ok(mut f) = self.engine.flights.remove(0) else {
+        let Ok(mut f) = self.engine.flights.remove(index) else {
             return;
         };
         let timestamp_claims = f.claims;
+        let retired_ticks = self.engine.retired_ticks;
+        self.engine.retired_ticks = [0; 4];
         if result.is_ok() {
-            self.stat_retire(&f);
+            self.stat_retire(&f, retired_ticks);
         }
         if receipt.owner_retired() {
             if let Err(error) = self.slots.retire(&mut f.claims) {
                 self.slots.quarantine(&mut f.claims);
+                self.sync_quarantine_hints();
                 self.retain(&f.job);
                 complete(done, &f.job, Err(error));
+                for j2 in f.group.iter() {
+                    self.retain(j2);
+                    complete(done, j2, Err(error));
+                }
                 self.fail_stop(error, done);
                 core::mem::forget(f);
                 return;
             }
-            if f.computes != 0 {
-                self.recovery.last_retired[0] = Some(f.target);
+            for &stamp in &f.cstamp[..(f.computes as usize).min(f.cstamp.len())] {
+                self.recovery.last_retired.push(0, stamp);
             }
             if f.renders != 0 {
-                self.recovery.last_retired[1] = Some(f.ta_target);
-                self.recovery.last_retired[2] = Some(f.fs_target);
+                for m in 0..(f.renders as usize).min(f.r_ta_stamp.len()) {
+                    self.recovery.last_retired.push(1, f.r_ta_stamp[m]);
+                    self.recovery.last_retired.push(2, f.r_fs_stamp[m]);
+                }
                 let committed = f.pb.as_ref().ok_or(EINVAL).and_then(|epoch| {
                     self.pools.retire_flight(
                         f.pb_slot as usize,
@@ -823,9 +1127,20 @@ impl Firmware {
                     return;
                 }
             }
-            if let Err(error) = f.job.note_full_retirement(f.first as u32, f.count as u32) {
+            let retired_ok = (|| -> Result {
+                f.job.note_full_retirement(f.first as u32, f.count as u32)?;
+                for j2 in f.group.iter() {
+                    j2.note_full_retirement(0, j2.progress.count())?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = retired_ok {
                 self.retain(&f.job);
                 complete(done, &f.job, Err(error));
+                for j2 in f.group.iter() {
+                    self.retain(j2);
+                    complete(done, j2, Err(error));
+                }
                 self.fail_stop(error, done);
                 core::mem::forget(f);
                 return;
@@ -844,7 +1159,11 @@ impl Firmware {
                 self.pools.quarantine_flight(f.pb_slot as usize, f.pb.take());
             }
             self.slots.quarantine(&mut f.claims);
+            self.sync_quarantine_hints();
             self.retain(&f.job);
+            for j2 in f.group.iter() {
+                self.retain(j2);
+            }
             self.recovery.aborted_receipts = self.recovery.aborted_receipts.saturating_add(1);
         }
         if self.slots.compute_exhausted() {
@@ -857,6 +1176,10 @@ impl Firmware {
             if let Err(error) = self.publish_timestamps(&f, &timestamp_claims) {
                 self.retain(&f.job);
                 complete(done, &f.job, Err(error));
+                for j2 in f.group.iter() {
+                    self.retain(j2);
+                    complete(done, j2, Err(error));
+                }
                 self.fail_stop(error, done);
                 core::mem::forget(f);
                 return;
@@ -867,19 +1190,47 @@ impl Firmware {
                 if let Err(error) = f.job.command_retired(index as u32) {
                     self.retain(&f.job);
                     complete(done, &f.job, Err(error));
+                    for j2 in f.group.iter() {
+                        self.retain(j2);
+                        complete(done, j2, Err(error));
+                    }
                     self.fail_stop(error, done);
                     core::mem::forget(f);
                     return;
                 }
+            }
+            for j2 in f.group.iter() {
+                for index in 0..j2.progress.count() {
+                    if let Err(error) = j2.command_retired(index) {
+                        self.retain(&f.job);
+                        complete(done, &f.job, Err(error));
+                        for j3 in f.group.iter() {
+                            self.retain(j3);
+                            complete(done, j3, Err(error));
+                        }
+                        self.fail_stop(error, done);
+                        core::mem::forget(f);
+                        return;
+                    }
+                }
+            }
+            if receipt.owner_retired() && f.renders != 0 {
+                self.slots.note_render_retired();
             }
         }
         if self.engine.flights.is_empty() {
             // Drained: a gap until the next publication.
             self.engine.stats.idle_from_ns = now_ns();
             self.power.utilization.idle(self.engine.stats.idle_from_ns);
+            self.power.report_work(false);
         }
-        // The next prefix starts executing about now.
-        self.renew_deadlines();
+        // The next prefix on the retired flight's class(es) starts executing about now.
+        if f.renders != 0 {
+            self.renew_render_deadline();
+        }
+        if f.computes != 0 {
+            self.renew_compute_deadline();
+        }
         let job = f.job.clone();
         let p = &job.progress;
         p.next.store(p.next() + f.count as u32, Ordering::Relaxed);
@@ -911,6 +1262,10 @@ impl Firmware {
                 if let Err(proof_error) = job.mark_terminal_retired() {
                     self.retain(&job);
                     complete(done, &job, Err(proof_error));
+                    for j2 in f.group.iter() {
+                        self.retain(j2);
+                        complete(done, j2, Err(proof_error));
+                    }
                     self.fail_stop(proof_error, done);
                     core::mem::forget(f);
                     return;
@@ -918,57 +1273,96 @@ impl Firmware {
             }
             complete(done, &job, Err(error));
         }
-        if p.next() < p.sent() || p.sent() < p.count() {
-            return; // more of it published or still to publish
+        let job_done = p.next() >= p.sent() && p.sent() >= p.count();
+        if job_done {
+            let s = &mut self.engine.stats;
+            if result.is_ok() {
+                s.jobs += 1;
+                s.job_cmds += u64::from(p.count());
+                s.job_max = s.job_max.max(u64::from(p.count()));
+            }
+            complete(done, &job, Ok(()));
         }
-        let s = &mut self.engine.stats;
-        if result.is_ok() {
-            s.jobs += 1;
-            s.job_cmds += u64::from(p.count());
-            s.job_max = s.job_max.max(u64::from(p.count()));
-        }
-        complete(done, &job, Ok(()));
-        // The rest of a compute horizon, after the first job (fence order).
+        // Complete folded compute-horizon jobs unconditionally (even if an earlier render
+        // command of `job` is still in flight; `Timeline` preserves queue fence order).
         for j2 in f.group.iter() {
             let p2 = &j2.progress;
             p2.next.store(p2.count(), Ordering::Relaxed);
             match result {
-                Err(error) => complete(done, j2, Err(error)),
+                Err(error) => {
+                    if receipt.owner_retired()
+                        && self.engine.flights.iter().all(|other| {
+                            !Arc::ptr_eq(&other.job, j2)
+                                && other.group.iter().all(|member| !Arc::ptr_eq(member, j2))
+                        })
+                    {
+                        if let Err(proof_error) = j2.mark_terminal_retired() {
+                            self.retain(j2);
+                            complete(done, j2, Err(proof_error));
+                            self.fail_stop(proof_error, done);
+                            core::mem::forget(f);
+                            return;
+                        }
+                    }
+                    complete(done, j2, Err(error));
+                }
                 Ok(()) => {
+                    let s = &mut self.engine.stats;
                     s.jobs += 1;
                     s.job_cmds += u64::from(p2.count());
                     s.job_max = s.job_max.max(u64::from(p2.count()));
+                    complete(done, j2, Ok(()));
                 }
             }
-            complete(done, j2, Ok(()));
         }
     }
 
-    /// Progress of the oldest prefix: a FW stamp of an engine on which it still has unreached
-    /// work moved since the last poll (later prefixes' work on other engines does not count).
-    /// Renews the deadline; the first call for a prefix only records its position.
+    /// Progress of the oldest compute and oldest render flights: a FW stamp of an engine on
+    /// which its oldest flight still has unreached work moved since the last poll. Renews the
+    /// deadline; the first call for a flight pair only records its position.
     /// [`Self::check_hangs`] calls it while no firmware recovery notification is pending.
     pub(crate) fn progress(&mut self) {
-        let Some(f) = self.engine.oldest() else {
+        if self.engine.flights.is_empty() {
             return;
-        };
+        }
         let (g, r, e) = (&self.graph.compute, &self.graph.render, &self.engine);
+        let (mut fc, mut fr) = (None, None);
+        for f in e.flights.iter() {
+            if fc.is_none() && f.computes != 0 {
+                fc = Some(f);
+            }
+            if fr.is_none() && f.renders != 0 {
+                fr = Some(f);
+            }
+            if fc.is_some() && fr.is_some() {
+                break;
+            }
+        }
         // None denotes an inactive/reached stage. A real unreached stamp may be zero
         // immediately after native wrap and must remain distinguishable from completion.
         let pending =
             |observed, own, tail| (!stamp_reached(observed, own, tail)).then_some(observed);
         let (mut c, mut ta, mut fs) = (None, None, None);
-        if f.computes != 0 {
-            c = pending(g.fw_stamp.r32(0).unwrap_or(0), f.target, e.target);
+        let mut published = [0u64; 2];
+        if let Some(fc) = fc {
+            c = pending(g.fw_stamp.r32(0).unwrap_or(0), fc.target, e.target);
+            published[0] = fc.published_ns;
         }
-        if f.renders != 0 {
-            ta = pending(r.fw_stamp[0].r32(0).unwrap_or(0), f.ta_target, e.ta_target);
-            fs = pending(r.fw_stamp[1].r32(0).unwrap_or(0), f.fs_target, e.fs_target);
+        if let Some(fr) = fr {
+            ta = pending(r.fw_stamp[0].r32(0).unwrap_or(0), fr.ta_target, e.ta_target);
+            fs = pending(r.fw_stamp[1].r32(0).unwrap_or(0), fr.fs_target, e.fs_target);
+            published[1] = fr.published_ns;
         }
-        let moved = e.progress_flight == f.published_ns && [c, ta, fs] != e.progress;
-        let published = f.published_ns;
-        if moved {
-            self.renew_deadlines();
+        let compute_moved =
+            fc.is_some() && e.progress_flight[0] == published[0] && c != e.progress[0];
+        let render_moved = fr.is_some()
+            && e.progress_flight[1] == published[1]
+            && [ta, fs] != [e.progress[1], e.progress[2]];
+        if compute_moved {
+            self.renew_compute_deadline();
+        }
+        if render_moved {
+            self.renew_render_deadline();
         }
         self.engine.progress_flight = published;
         self.engine.progress = [c, ta, fs];
@@ -991,26 +1385,50 @@ impl Firmware {
             match command {
                 super::command::Command::Compute(command) => {
                     let index = *slots.get(compute).ok_or(EINVAL)? as usize;
-                    let unit = flight.job.resources.compute_unit(index)?;
-                    let ticks = [unit.its.r64(0)?, unit.its.r64(8)?, 0, 0];
-                    command
-                        .timestamp_outputs
-                        .publish(ticks, super::hw::COMMAND_TIMESTAMP_HZ);
+                    if !command.timestamp_outputs.is_empty() {
+                        let unit = flight.job.resources.compute_unit(index)?;
+                        let (start, end) = self.compute_ticks(unit)?;
+                        let ticks = [start, end, 0, 0];
+                        command
+                            .timestamp_outputs
+                            .publish(ticks, super::hw::COMMAND_TIMESTAMP_HZ);
+                    }
                     compute += 1;
                 }
                 super::command::Command::Render(command) => {
                     let index = *passes.get(render).ok_or(EINVAL)? as usize;
-                    let pass = flight.job.resources.render_pass(index)?;
-                    let ticks = [
-                        pass.scene.r64(0x600)?,
-                        pass.scene.r64(0x608)?,
-                        pass.scene.r64(0x620)?,
-                        pass.scene.r64(0x628)?,
-                    ];
-                    command
-                        .timestamp_outputs
-                        .publish(ticks, super::hw::COMMAND_TIMESTAMP_HZ);
+                    if !command.timestamp_outputs.is_empty() {
+                        let pass = flight.job.resources.render_pass(index)?;
+                        let ticks = [
+                            pass.scene.r64(0x600)?,
+                            pass.scene.r64(0x608)?,
+                            pass.scene.r64(0x620)?,
+                            pass.scene.r64(0x628)?,
+                        ];
+                        command
+                            .timestamp_outputs
+                            .publish(ticks, super::hw::COMMAND_TIMESTAMP_HZ);
+                    }
                     render += 1;
+                }
+            }
+        }
+        for member in flight.group.iter() {
+            for command in member.commands.iter() {
+                match command {
+                    super::command::Command::Compute(command) => {
+                        let index = *slots.get(compute).ok_or(EINVAL)? as usize;
+                        if !command.timestamp_outputs.is_empty() {
+                            let unit = flight.job.resources.compute_unit(index)?;
+                            let (start, end) = self.compute_ticks(unit)?;
+                            let ticks = [start, end, 0, 0];
+                            command
+                                .timestamp_outputs
+                                .publish(ticks, super::hw::COMMAND_TIMESTAMP_HZ);
+                        }
+                        compute += 1;
+                    }
+                    super::command::Command::Render(_) => return Err(EINVAL),
                 }
             }
         }
@@ -1019,7 +1437,7 @@ impl Firmware {
 
     /// A retired prefix: publication to retirement (including any wait behind its
     /// predecessor), event times, internal stage times of its members.
-    fn stat_retire(&mut self, f: &Flight) {
+    fn stat_retire(&mut self, f: &Flight, ticks: [u64; 4]) {
         let now = now_ns();
         let d = now.wrapping_sub(f.published_ns);
         let kind = if f.computes != 0 && f.renders != 0 {
@@ -1031,53 +1449,82 @@ impl Firmware {
         };
         let (mut lo, mut hi) = (u64::MAX, 0u64);
         let (mut first, mut last) = (u64::MAX, 0u64);
+        let work_ticks = self.init.abi.compute().work_ticks;
         let s = &mut self.engine.stats;
 
-        // Add one stage interval read from internal timestamp cells (start, end).
-        let mut stage = |o: &super::object::FwObject,
-                         off: usize,
-                         sum: &mut u64,
-                         engine: crate::usage::Engine| {
-            let (Ok(start_lo), Ok(start_hi), Ok(end_lo), Ok(end_hi)) =
-                (o.r32(off), o.r32(off + 4), o.r32(off + 8), o.r32(off + 12))
-            else {
-                return;
+        let mut add_interval =
+            |start: u64, end: u64, sum: &mut u64, engine: crate::usage::Engine| {
+                if start == 0 || end < start {
+                    return;
+                }
+                f.job
+                    .queue
+                    .usage
+                    .add(engine, start, end, super::hw::COMMAND_TIMESTAMP_HZ as u32);
+                *sum = sum.saturating_add(end - start);
+                lo = lo.min(start);
+                hi = hi.max(end);
             };
-            let start = u64::from(start_hi) << 32 | u64::from(start_lo);
-            let end = u64::from(end_hi) << 32 | u64::from(end_lo);
-            if start == 0 || end < start {
-                return;
-            }
-            f.job
-                .queue
-                .usage
-                .add(engine, start, end, super::hw::COMMAND_TIMESTAMP_HZ as u32);
-            *sum = sum.saturating_add(end - start);
-            lo = lo.min(start);
-            hi = hi.max(end);
-        };
-        for k in 0..f.renders as usize {
-            let Ok(p) = f.job.resources.render_pass(f.claims.pass[k] as usize) else {
-                return;
-            };
-            stage(
-                &p.scene,
-                0x600,
+        if f.renders == 1 && f.computes == 0 && ticks[0] != 0 {
+            add_interval(
+                ticks[0],
+                ticks[1],
                 &mut s.ta_ticks,
                 crate::usage::Engine::Vertex,
             );
-            stage(
-                &p.scene,
-                0x620,
+            add_interval(
+                ticks[2],
+                ticks[3],
                 &mut s.fs_ticks,
                 crate::usage::Engine::Fragment,
             );
-        }
-        for k in 0..(f.computes as usize).min(f.claims.slot_count as usize) {
-            let Ok(c) = f.job.resources.compute_unit(f.claims.slot[k] as usize) else {
-                return;
+        } else if f.computes == 1 && f.renders == 0 && ticks[0] != 0 {
+            add_interval(
+                ticks[0],
+                ticks[1],
+                &mut s.cdm_ticks,
+                crate::usage::Engine::Compute,
+            );
+        } else {
+            // Multi-command prefix fallback: read each member's internal timestamp cells.
+            let mut stage = |o: &super::object::FwObject,
+                             off: usize,
+                             sum: &mut u64,
+                             engine: crate::usage::Engine| {
+                let (Ok(start_lo), Ok(start_hi), Ok(end_lo), Ok(end_hi)) =
+                    (o.r32(off), o.r32(off + 4), o.r32(off + 8), o.r32(off + 12))
+                else {
+                    return;
+                };
+                let start = u64::from(start_hi) << 32 | u64::from(start_lo);
+                let end = u64::from(end_hi) << 32 | u64::from(end_lo);
+                add_interval(start, end, sum, engine);
             };
-            stage(&c.its, 0, &mut s.cdm_ticks, crate::usage::Engine::Compute);
+            for k in 0..f.renders as usize {
+                let Ok(p) = f.job.resources.render_pass(f.claims.pass[k] as usize) else {
+                    return;
+                };
+                stage(
+                    &p.scene,
+                    0x600,
+                    &mut s.ta_ticks,
+                    crate::usage::Engine::Vertex,
+                );
+                stage(
+                    &p.scene,
+                    0x620,
+                    &mut s.fs_ticks,
+                    crate::usage::Engine::Fragment,
+                );
+            }
+            for k in 0..(f.computes as usize).min(f.claims.slot_count as usize) {
+                let Ok(c) = f.job.resources.compute_unit(f.claims.slot[k] as usize) else {
+                    return;
+                };
+                if let Ok((start, end)) = Self::compute_ticks_with(work_ticks, c) {
+                    add_interval(start, end, &mut s.cdm_ticks, crate::usage::Engine::Compute);
+                }
+            }
         }
         if hi > lo {
             s.span_ticks = s.span_ticks.saturating_add(hi - lo);
@@ -1288,7 +1735,9 @@ impl Firmware {
         writeln!(
             f,
             "pass_scrub: passes {} tpc_clear_bytes {} tilemap_clear_bytes {}",
-            slots.pass_scrubs, slots.tpc_clear_bytes, slots.tilemap_clear_bytes
+            self.slots.pass_scrubs_total(),
+            slots.tpc_clear_bytes,
+            self.slots.tilemap_clear_bytes_total()
         )?;
         writeln!(f, "type0: fs2c {} c2ta {}", s.fs2c0, s.c2ta0)?;
         write!(f, "horizon:")?;

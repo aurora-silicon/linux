@@ -194,7 +194,9 @@ const FAST_POLL_WORK: u64 = 1;
 /// Capacity hint for `drm_syncobj_wait` during active submit bursts (mirroring G17's wait hint).
 const WAIT_UTIL_MIN: u32 = 512;
 const WAIT_HINT_MS: u32 = 8;
-const WAIT_HINT_ACTIVE_NS: u64 = 50_000_000;
+const WAIT_HINT_GAP_NS: u64 = 4_000_000;
+const WAIT_HINT_STREAK_ON: u32 = 8;
+const WAIT_HINT_LINGER_NS: u64 = 8_000_000;
 
 /// Device state shared with the RTKit callbacks and the poll work.
 #[pin_data]
@@ -214,8 +216,10 @@ pub(crate) struct Shared {
     pub(crate) submitter: AtomicU32,
     /// Monotonic timestamp (ns) of the previous submit, for active-burst wait hints.
     pub(crate) last_submit_ns: AtomicU64,
-    /// Whether the most recent submit continued an active burst within [`WAIT_HINT_ACTIVE_NS`].
-    pub(crate) wait_hint_active: AtomicBool,
+    /// Consecutive back-to-back submits within [`WAIT_HINT_GAP_NS`].
+    pub(crate) wait_hint_streak: AtomicU32,
+    /// Monotonic deadline (ns) until which `syncobj_wait_hint` stays active (0 when expired).
+    pub(crate) wait_hint_until_ns: AtomicU64,
     /// Next armed hrtimer expiry (monotonic ns, 0 when disarmed).
     pub(crate) resnap_deadline_ns: AtomicU64,
     /// Next 1-jiffy backup delayed-work schedule bound (monotonic ns).
@@ -234,6 +238,14 @@ pub(crate) struct Shared {
     /// From a system sleep's `.prepare` until the firmware restarted: nothing reads its
     /// registers and nothing is published.
     pub(crate) sleeping: AtomicBool,
+    /// Firmware recovery is active under `Shared::state` (may sleep up to 1000 ms).
+    pub(crate) recovering: AtomicBool,
+    /// Whether any base compute unit (`0..BASE_COMPUTE_UNITS`) has been quarantined.
+    pub(crate) base_compute_quarantined: AtomicBool,
+    /// Whether any base render pass slot (`0..BASE_RENDER_SLOTS`) has been quarantined.
+    pub(crate) base_render_quarantined: AtomicBool,
+    /// Contiguous PB/UMA allocator slots (`BASE_PB_SLOTS..=PB_SLOTS`) needed across quarantines.
+    pub(crate) needed_pb_slots: AtomicU32,
     /// The GFX power state word from before a system sleep.
     sleep_ps: AtomicU32,
     /// The stop left to a system sleep's commit, until `.complete` finishes it.
@@ -294,15 +306,24 @@ impl Shared {
             .store(kernel::cpu::CpuId::current().as_u32(), Ordering::Relaxed);
         let now = engine::now_ns();
         let prev = self.last_submit_ns.swap(now, Ordering::Relaxed);
-        self.wait_hint_active.store(
-            prev != 0 && now.wrapping_sub(prev) <= WAIT_HINT_ACTIVE_NS,
-            Ordering::Relaxed,
-        );
+        if prev != 0 && now.wrapping_sub(prev) <= WAIT_HINT_GAP_NS {
+            let streak = self
+                .wait_hint_streak
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1);
+            if streak >= WAIT_HINT_STREAK_ON {
+                self.wait_hint_until_ns
+                    .store(now.saturating_add(WAIT_HINT_LINGER_NS), Ordering::Relaxed);
+            }
+        } else {
+            self.wait_hint_streak.store(1, Ordering::Relaxed);
+        }
     }
 
     /// Temporary `drm_syncobj_wait` capacity hint while a client is submitting back to back.
     pub(crate) fn syncobj_wait_hint(&self) -> Option<(u32, u32)> {
-        if cfg!(CONFIG_UCLAMP_TASK) && self.wait_hint_active.load(Ordering::Relaxed) {
+        let until = self.wait_hint_until_ns.load(Ordering::Relaxed);
+        if cfg!(CONFIG_UCLAMP_TASK) && until != 0 && engine::now_ns() <= until {
             Some((WAIT_UTIL_MIN, WAIT_HINT_MS))
         } else {
             None
@@ -462,7 +483,8 @@ impl Gpu {
                 evented: AtomicBool::new(false),
                 submitter: AtomicU32::new(u32::MAX),
                 last_submit_ns: AtomicU64::new(0),
-                wait_hint_active: AtomicBool::new(false),
+                wait_hint_streak: AtomicU32::new(0),
+                wait_hint_until_ns: AtomicU64::new(0),
                 resnap_deadline_ns: AtomicU64::new(0),
                 backup_deadline_ns: AtomicU64::new(0),
                 error: AtomicI32::new(0),
@@ -471,6 +493,10 @@ impl Gpu {
                 rtkit_buffer: AtomicU64::new(0),
                 orphaned: AtomicBool::new(false),
                 sleeping: AtomicBool::new(false),
+                recovering: AtomicBool::new(false),
+                base_compute_quarantined: AtomicBool::new(false),
+                base_render_quarantined: AtomicBool::new(false),
+                needed_pb_slots: AtomicU32::new(hw::sizes::BASE_PB_SLOTS as u32),
                 sleep_ps: AtomicU32::new(0),
                 sleep_commit: AtomicPtr::new(core::ptr::null_mut()),
                 events,
@@ -659,7 +685,7 @@ impl gpu::Gpu for Gpu {
     }
 
     fn queue_limits(&self) -> Option<uapi::drm_asahi_queue_limits> {
-        None
+        Some(params::queue_limits())
     }
 
     fn base_clock_hz(&self) -> u32 {

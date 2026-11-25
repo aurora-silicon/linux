@@ -3,10 +3,10 @@
 //! Module parameters and the GET_PARAMS identity.
 //!
 //! With the shared `file.rs` additions (VM_STATUS and VM_STATUS_MIRROR from `supports_vm_status`,
-//! SOFT_FAULTS suppressed by `soft_faults`, VDM_USC_INVALIDATE), G16 advertises per-command
-//! input readiness/errors, exact queue-local historical prefixes, fragment-only render barriers,
-//! and `COMPUTE_NO_QUERY_ACCESS`. No independent hardware queue reservation or ray queries are
-//! advertised.
+//! SOFT_FAULTS suppressed by `soft_faults`, VDM_USC_INVALIDATE, and `INDEPENDENT_QUEUES` from
+//! `queue_limits`), G16 advertises per-command input readiness/errors, exact queue-local
+//! historical prefixes, fragment-only and staged render barriers (`RENDER_STAGE_PREFIXES_V2`),
+//! independent logical queues, and `COMPUTE_NO_QUERY_ACCESS`. Ray queries are not advertised.
 
 use kernel::{prelude::*, uapi};
 
@@ -90,7 +90,8 @@ pub(crate) fn fill(gpu: &Gpu, params: &mut uapi::drm_asahi_params_global) -> Res
     params.features |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS)
         | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS)
         | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS)
-        | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS);
+        | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS)
+        | crate::file::DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2;
     params.gpu_generation = GPU_GENERATION;
     params.gpu_variant = gpu.cfg.gpu_variant as u32;
     params.gpu_revision = gpu.cfg.gpu_revision;
@@ -107,4 +108,14 @@ pub(crate) fn fill(gpu: &Gpu, params: &mut uapi::drm_asahi_params_global) -> Res
         *(params.core_masks.get_mut(i).ok_or(EIO)?) = (*mask).into();
     }
     Ok(())
+}
+
+/// QUEUE_LIMITS: a policy bound on logical queues (they own no firmware state) and the
+/// number of prefixes in flight.
+pub(crate) fn queue_limits() -> uapi::drm_asahi_queue_limits {
+    uapi::drm_asahi_queue_limits {
+        max_queues: hw::sizes::MAX_QUEUES,
+        max_in_flight_per_queue: hw::sizes::FLIGHTS as u32,
+        ..Default::default()
+    }
 }

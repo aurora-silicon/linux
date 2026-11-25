@@ -29,7 +29,7 @@
 //! [`mmu::VmJobGuard`] keeps the VM's mappings and its VM state keeps the VM's TTBAT slot until
 //! the last `Arc<Job>` drops.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use kernel::{
     c_str,
     cpu::CpuId,
@@ -44,8 +44,8 @@ use kernel::{
 };
 
 use super::{
-    command::{Command, Order},
-    fence::JobFence,
+    command::{Command, Commands, Order, Orders},
+    fence::{InputFences, JobFence},
     hw,
     queue::QueueState,
     vm::VmState,
@@ -97,18 +97,20 @@ pub(crate) struct Job {
     /// The job's VM (TTBAT slot, status).
     pub(crate) vm: Arc<VmState>,
     /// Validated commands, in submission order (at most 64).
-    pub(crate) commands: KVec<Command>,
+    pub(crate) commands: Commands,
     pub(crate) resources: super::resources::Prepared,
     /// Immutable dependency/order ledger, one entry for every accepted command.
-    orders: KVec<Order>,
+    orders: Orders,
     /// The job's hardware fence.
     pub(crate) fence: JobFence,
     /// The engine's bookkeeping; `progress.signaled` makes [`Job::complete`] act once.
     pub(crate) progress: super::engine::Progress,
     /// Inputs and resolved historical-prefix dependencies, held through every command.
-    inputs: KVec<Fence>,
-    /// Consecutive commands with full owner-retirement proof; an aborted receipt never counts.
-    full_retired: AtomicU32,
+    inputs: InputFences,
+    /// Bitmask of commands (`0..MAX_COMMANDS`) with full owner-retirement proof; an aborted
+    /// receipt never sets its bit. Tracks per-command bits so concurrent compute/render
+    /// commands within one job may retire in either hardware completion order.
+    full_retired: AtomicU64,
     /// No future publication and every previously published owner fully retired. This proof
     /// is separate from an error result: an affected full receipt may still fail the job.
     terminal_retired: AtomicBool,
@@ -133,12 +135,12 @@ impl Job {
         id: u64,
         queue: Arc<QueueState>,
         vm: Arc<VmState>,
-        commands: KVec<Command>,
-        orders: KVec<Order>,
+        commands: Commands,
+        orders: Orders,
         resources: super::resources::Prepared,
         fence: JobFence,
         guard: mmu::VmJobGuard,
-        inputs: KVec<Fence>,
+        inputs: InputFences,
     ) -> Result<Arc<Self>> {
         if commands.len() != orders.len() {
             return Err(EINVAL);
@@ -159,7 +161,7 @@ impl Job {
                 fence,
                 progress,
                 inputs,
-                full_retired: AtomicU32::new(0),
+                full_retired: AtomicU64::new(0),
                 terminal_retired: AtomicBool::new(false),
                 // Scheduler free can race the final off-lock completion reference.
                 // Prepare destruction work before acceptance; dropping a completed job
@@ -241,31 +243,34 @@ impl Job {
         self.started.load(Ordering::Acquire)
     }
 
-    /// Attempts to submit a ready job directly from SUBMIT ioctl context without waiting for
-    /// the drm_sched worker wakeup. Only runs when all input fences are already signalled,
-    /// the device and VM are healthy, and `Shared::state` is uncontended (`try_lock`); on
-    /// contention or pending dependencies it returns without setting `started` so drm_sched
-    /// runs the job in queue order.
-    pub(crate) fn try_start_inline(self: &Arc<Self>, shared: &Arc<Shared>) {
+    /// Attempts to submit a ready job directly from SUBMIT ioctl context, bypassing `drm_sched`.
+    /// Only runs when all input fences are already signalled, the device and VM are healthy,
+    /// and the GPU is neither sleeping nor recovering; returns `true` when the job was started
+    /// inline (accepted or already finished with error), or `false` to fall back to `drm_sched`.
+    pub(crate) fn try_start_inline(self: &Arc<Self>, shared: &Arc<Shared>) -> bool {
         if shared.crashed.load(Ordering::Acquire)
             || shared.sleeping.load(Ordering::Acquire)
+            || shared.recovering.load(Ordering::Acquire)
             || self.vm.status.get() != 0
         {
-            return;
+            return false;
         }
         if let Some(order) = self.orders.first() {
             if self.queue.check(order).is_err() {
-                return;
+                return false;
             }
         }
         if super::fence::check_dependencies(&self.inputs).is_err() {
-            return;
+            return false;
         }
         if let Some(result) = shared.try_submit_inline(self.clone()) {
             self.started.store(true, Ordering::Release);
             if let Err(error) = result {
                 self.finish(Err(if error == ENODEV { EIO } else { error }), false);
             }
+            true
+        } else {
+            false
         }
     }
 
@@ -310,6 +315,93 @@ impl Job {
     /// Returns the immutable dependency order for command `index`.
     pub(crate) fn command_order(&self, index: u32) -> Option<Order> {
         self.orders.get(index as usize).copied()
+    }
+
+    /// Whether command `index` is a ready, barrier-free compute command continuing a compute
+    /// horizon at queue-local compute ordinal `expected`.
+    pub(crate) fn can_fold_horizon_cmd(&self, index: u32, expected: u64) -> bool {
+        if self.terminal_retired.load(Ordering::Acquire) || self.vm.status.get() != 0 {
+            return false;
+        }
+        let Some(Command::Compute(_)) = self.commands.get(index as usize) else {
+            return false;
+        };
+        let Some(order) = self.orders.get(index as usize) else {
+            return false;
+        };
+        order.engine == super::command::COMPUTE
+            && order.sequence == expected
+            && order.wait_through == [None, None]
+            && self.queue.check(order).is_ok()
+            && super::fence::check_dependencies(&self.inputs).is_ok()
+    }
+
+    /// Whether every command of this job is a ready, barrier-free compute command continuing
+    /// sequentially from `first_expected`.
+    pub(crate) fn can_fold_horizon_job(&self, first_expected: u64) -> bool {
+        let count = self.progress.count();
+        if count == 0
+            || self.progress.sent() != 0
+            || self.terminal_retired.load(Ordering::Acquire)
+            || self.vm.status.get() != 0
+            || super::fence::check_dependencies(&self.inputs).is_err()
+        {
+            return false;
+        }
+        for k in 0..count {
+            let Some(expected) = first_expected.checked_add(u64::from(k)) else {
+                return false;
+            };
+            let Some(Command::Compute(_)) = self.commands.get(k as usize) else {
+                return false;
+            };
+            let Some(order) = self.orders.get(k as usize) else {
+                return false;
+            };
+            if order.engine != super::command::COMPUTE
+                || order.sequence != expected
+                || order.wait_through != [None, None]
+                || self.queue.check(order).is_err()
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Whether command `index` is a ready render command continuing a same-SUBMIT render batch
+    /// at queue-local render ordinal `expected` (treating `expected - 1` as already published
+    /// within the in-progress render flight).
+    pub(crate) fn can_fold_render_cmd(&self, index: u32, expected: u64) -> bool {
+        if self.terminal_retired.load(Ordering::Acquire) || self.vm.status.get() != 0 {
+            return false;
+        }
+        let Some(Command::Render(_)) = self.commands.get(index as usize) else {
+            return false;
+        };
+        let Some(order) = self.orders.get(index as usize) else {
+            return false;
+        };
+        if order.engine != super::command::RENDER
+            || order.sequence != expected
+            || self.queue.check(order).is_err()
+            || super::fence::check_dependencies(&self.inputs).is_err()
+        {
+            return false;
+        }
+        let completed = self
+            .queue
+            .completed
+            .each_ref()
+            .map(|value| value.load(Ordering::Acquire));
+        let mut published = self
+            .queue
+            .published
+            .each_ref()
+            .map(|value| value.load(Ordering::Acquire));
+        published[super::command::RENDER] =
+            published[super::command::RENDER].max(expected.saturating_sub(1));
+        order.ready(completed, published)
     }
 
     /// Checks the retained dependency set for each command immediately before publication.
@@ -370,17 +462,33 @@ impl Job {
         Ok(())
     }
 
-    /// Records a consecutive full owner receipt independently of success/error attribution.
+    /// Records a unique full owner receipt independently of success/error attribution.
     /// Only the receipt owner may call this after successful resource-ledger retirement.
     pub(crate) fn note_full_retirement(&self, first: u32, count: u32) -> Result {
         let end = first.checked_add(count).ok_or(EOVERFLOW)?;
-        if count == 0 || end > self.progress.sent() {
+        if count == 0 || end > self.progress.sent() || end > 64 {
             return Err(EINVAL);
         }
-        self.full_retired
-            .compare_exchange(first, end, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| EIO)?;
-        Ok(())
+        let bits = if count == 64 {
+            u64::MAX
+        } else {
+            ((1u64 << count) - 1) << first
+        };
+        let mut current = self.full_retired.load(Ordering::Acquire);
+        loop {
+            if current & bits != 0 {
+                return Err(EIO);
+            }
+            match self.full_retired.compare_exchange_weak(
+                current,
+                current | bits,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     /// Certifies a terminal job before publishing its error. The caller first removes it
@@ -389,9 +497,14 @@ impl Job {
     /// A never-published job has the same proof with all three counters equal to zero.
     pub(crate) fn mark_terminal_retired(&self) -> Result {
         let sent = self.progress.sent();
+        let expected = if sent >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << sent) - 1
+        };
         if self.progress.is_pending()
             || self.progress.next() != sent
-            || self.full_retired.load(Ordering::Acquire) != sent
+            || self.full_retired.load(Ordering::Acquire) != expected
         {
             return Err(EIO);
         }
@@ -483,9 +596,20 @@ pub(crate) fn complete_all(mut done: Completions) {
 struct SchedJob {
     job: Arc<Job>,
     shared: Arc<Shared>,
-    /// Signalled once `run()`, `cancel()`, or `drop()` finishes handing off `job`.
-    /// Preserves queue-local inline-submit ordering without retaining `Arc<Job>`.
-    scheduled: Arc<AtomicBool>,
+    /// Count of queued (unstarted) `drm_sched` jobs on this queue. Decremented once when
+    /// `run()`, `cancel()`, or `drop()` completes so inline submission preserves queue order
+    /// without retaining `Arc<Job>` in [`Scheduler`].
+    pending_sched: Arc<core::sync::atomic::AtomicUsize>,
+    counted: bool,
+}
+
+impl SchedJob {
+    fn finish_pending(&mut self) {
+        if self.counted {
+            self.counted = false;
+            self.pending_sched.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
 }
 
 impl sched::JobImpl for SchedJob {
@@ -499,7 +623,7 @@ impl sched::JobImpl for SchedJob {
     fn run(job: &mut Self) -> Result<Option<Fence>> {
         let fence = job.job.fence.fence();
         job.job.start(&job.shared);
-        job.scheduled.store(true, Ordering::Release);
+        job.finish_pending();
         Ok(Some(fence))
     }
 
@@ -510,7 +634,7 @@ impl sched::JobImpl for SchedJob {
 
     fn cancel(job: &mut Self) {
         job.job.cancel_unstarted();
-        job.scheduled.store(true, Ordering::Release);
+        job.finish_pending();
     }
 }
 
@@ -518,7 +642,7 @@ impl Drop for SchedJob {
     fn drop(&mut self) {
         // Entity teardown frees jobs it never ran without calling `cancel`.
         self.job.cancel_unstarted();
-        self.scheduled.store(true, Ordering::Release);
+        self.finish_pending();
     }
 }
 
@@ -528,10 +652,10 @@ pub(crate) struct Scheduler {
     // drains), and only then the scheduler is finalized.
     entity: sched::Entity<SchedJob>,
     _scheduler: sched::Scheduler<SchedJob>,
-    /// Completion flag of the most recently queued (non-inline) job of this queue; an inline
-    /// submit is permitted only once this predecessor has started or been cancelled, without
-    /// retaining the predecessor `Arc<Job>` (and its `VmJobGuard` or prepared arenas).
-    last_scheduled: Option<Arc<AtomicBool>>,
+    /// Number of jobs currently queued in `drm_sched` that have not yet started or cancelled.
+    /// Inline submit is permitted only when zero, preserving strict queue order without
+    /// retaining any `Arc<Job>` (or its `VmJobGuard` / prepared arenas).
+    pending_sched: Arc<core::sync::atomic::AtomicUsize>,
 }
 
 impl Scheduler {
@@ -554,33 +678,37 @@ impl Scheduler {
         )?;
         // With one run queue, only the kernel priority is valid.
         let entity = sched::Entity::new(&scheduler, sched::Priority::Kernel)?;
+        let pending_sched = Arc::new(core::sync::atomic::AtomicUsize::new(0), GFP_KERNEL)?;
         Ok(Self {
             entity,
             _scheduler: scheduler,
-            last_scheduled: None,
+            pending_sched,
         })
     }
 
-    /// Pushes a job that waits for its retained inputs. On failure the job is cancelled (not counted as
-    /// submitted work of its VM) and the error is returned.
+    /// Pushes a job that waits for its retained inputs. When the predecessor has already
+    /// started and all inputs are signalled, submits directly inline and bypasses `drm_sched`
+    /// allocation and kworker wakeup. On failure the job is cancelled (not counted as submitted
+    /// work of its VM) and the error is returned.
     pub(crate) fn push(&mut self, job: Arc<Job>, shared: Arc<Shared>) -> Result {
         shared.note_submitter();
-        let prev_started = match &self.last_scheduled {
-            Some(done) if done.load(Ordering::Acquire) => {
-                self.last_scheduled = None;
-                true
-            }
-            Some(_) => false,
-            None => true,
-        };
+        let prev_started = self.pending_sched.load(Ordering::Acquire) == 0;
         let handle = job.clone();
-        let scheduled = Arc::new(AtomicBool::new(false), GFP_KERNEL)?;
+        if prev_started {
+            handle.accepted.store(true, Ordering::Release);
+            if handle.try_start_inline(&shared) {
+                return Ok(());
+            }
+            handle.accepted.store(false, Ordering::Release);
+        }
+        self.pending_sched.fetch_add(1, Ordering::AcqRel);
         let mut pending = self.entity.new_job(
             1,
             SchedJob {
                 job,
-                shared: shared.clone(),
-                scheduled: scheduled.clone(),
+                shared,
+                pending_sched: self.pending_sched.clone(),
+                counted: true,
             },
         )?;
         for fence in handle.inputs.iter() {
@@ -588,14 +716,6 @@ impl Scheduler {
         }
         let armed = pending.arm();
         handle.accepted.store(true, Ordering::Release);
-        if prev_started {
-            handle.try_start_inline(&shared);
-        }
-        if handle.is_started() {
-            scheduled.store(true, Ordering::Release);
-        } else {
-            self.last_scheduled = Some(scheduled);
-        }
         armed.push();
         Ok(())
     }

@@ -29,6 +29,8 @@ write = function(shared, 'fn write(&self, ticks: u64, frequency_hz: u64)')
 checked_offset = function(shared, 'fn checked_offset(')
 publish = function(shared, 'pub(crate) fn publish(&self, ticks: [u64; 4], frequency_hz: u64)')
 retire = function(poll, 'fn publish_timestamps(&self, flight: &Flight, claims: &super::slots::Claims)')
+compute_ticks = function(poll, 'fn compute_ticks(&self, unit: &super::slots::ComputeSlot)')
+compute_ticks_with = function(poll, 'fn compute_ticks_with(')
 source = r'''
 #![allow(dead_code)]
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering, fence as barrier};
@@ -63,6 +65,7 @@ struct Destination{cpu:TimestampMapping}
 impl Destination { __WRITE__ }
 struct Destinations([Option<Destination>;4]);
 impl Destinations {
+    fn is_empty(&self)->bool{self.0.iter().all(Option::is_none)}
     fn iter(&self)->core::slice::Iter<'_,Option<Destination>>{self.0.iter()}
     __PUBLISH__
 }
@@ -147,29 +150,55 @@ fn expected(ticks:u64)->u64{((ticks as u128)*125/3)as u64}
 mod backend {
     use super::*;
     pub mod hw{pub const COMMAND_TIMESTAMP_HZ:u64=24_000_000;}
-    pub mod slots{pub struct Claims{pub slot:[u8;2],pub slot_count:u32,pub pass:[u8;2]}}
+    pub mod slots{
+        use super::*;
+        pub struct Claims{pub slot:[u8;16],pub slot_count:u32,pub pass:[u8;2]}
+        pub type ComputeSlot = Compute;
+    }
     pub mod command{
         use super::*;
         pub struct Compute{pub timestamp_outputs:Destinations}
         pub struct Render{pub timestamp_outputs:Destinations}
         pub enum Command{Compute(Compute),Render(Render)}
     }
-    pub struct Cells(pub [u64;4]);impl Cells{pub fn r64(&self,offset:usize)->Result<u64>{
-        match offset{0=>Ok(self.0[0]),8=>Ok(self.0[1]),0x600=>Ok(self.0[0]),0x608=>Ok(self.0[1]),0x620=>Ok(self.0[2]),0x628=>Ok(self.0[3]),_=>Err(EINVAL)}
-    }}
-    pub struct Compute{pub its:Cells}pub struct Pass{pub scene:Cells}
+    pub struct Cells(pub [u64;4]);impl Cells{
+        pub fn r64(&self,offset:usize)->Result<u64>{
+            match offset{0=>Ok(self.0[0]),8=>Ok(self.0[1]),0x600=>Ok(self.0[0]),0x608=>Ok(self.0[1]),0x620=>Ok(self.0[2]),0x628=>Ok(self.0[3]),_=>Err(EINVAL)}
+        }
+        pub fn r32(&self,offset:usize)->Result<u32>{
+            let v=match offset{0x100=>self.0[0],0x104=>self.0[0]>>32,0x108=>self.0[1],0x10c=>self.0[1]>>32,_=>return Err(EINVAL)};
+            Ok(v as u32)
+        }
+    }
+    pub struct Compute{pub its:Cells,pub work:Cells}pub struct Pass{pub scene:Cells}
+    pub struct ComputeAbi{pub work_ticks:Option<(usize,usize)>}
+    pub struct Abi{pub compute:ComputeAbi}
+    impl Abi{pub fn compute(&self)->&ComputeAbi{&self.compute}}
+    pub struct Init{pub abi:Abi}
     pub struct Scrub{pub compute:Vec<Compute>,pub passes:Vec<Pass>}
-    pub struct Slots{pub scrub:Scrub}pub struct Firmware{pub slots:Slots}
+    pub struct Slots{pub scrub:Scrub}pub struct Firmware{pub slots:Slots,pub init:Init}
     pub struct Resources{pub compute:Vec<Compute>,pub passes:Vec<Pass>}
     impl Resources{pub fn compute(&self)->Result<&Self>{Ok(self)}pub fn render(&self)->Result<&Self>{Ok(self)}pub fn compute_unit(&self,k:usize)->Result<&Compute>{self.compute.get(k).ok_or(super::EINVAL)}pub fn render_pass(&self,k:usize)->Result<&Pass>{self.passes.get(k).ok_or(super::EINVAL)}}
     pub struct Job{pub commands:Vec<command::Command>,pub resources:Resources}
-    pub struct Flight{pub job:Job,pub first:usize,pub count:usize,pub renders:u32}
-    pub mod poll{use super::*;impl Firmware{ __RETIRE__ }}
+    pub struct Flight{pub job:Job,pub group:Vec<Job>,pub first:usize,pub count:usize,pub renders:u32}
+    pub mod poll{
+        use super::*;
+        const EIO:i32=-5;
+        impl Firmware{
+            __COMPUTE_TICKS__
+            __COMPUTE_TICKS_WITH__
+            __RETIRE__
+        }
+    }
 }
 use backend::*;
-fn firmware()->Firmware{Firmware{slots:Slots{scrub:Scrub{compute:vec![],passes:vec![]}}}}
+fn firmware()->Firmware{Firmware{slots:Slots{scrub:Scrub{compute:vec![],passes:vec![]}},init:Init{abi:Abi{compute:ComputeAbi{work_ticks:None}}}}}
 fn resources()->Resources{Resources{
-    compute:vec![Compute{its:Cells([10,20,0,0])},Compute{its:Cells([30,40,0,0])}],
+    compute:vec![
+        Compute{its:Cells([10,20,0,0]),work:Cells([0,0,0,0])},
+        Compute{its:Cells([30,40,0,0]),work:Cells([0,0,0,0])},
+        Compute{its:Cells([50,60,0,0]),work:Cells([0,0,0,0])},
+    ],
     passes:vec![Pass{scene:Cells([100,200,300,400])},Pass{scene:Cells([500,600,700,800])}]
 }}
 #[test]fn retirement_uses_claimed_hardware_cells_and_endpoint_order(){
@@ -177,8 +206,9 @@ fn resources()->Resources{Resources{
     let flight=Flight{job:Job{commands:vec![
         command::Command::Compute(command::Compute{timestamp_outputs:outputs(&compute)}),
         command::Command::Render(command::Render{timestamp_outputs:outputs(&render)})
-    ],resources:resources()},first:0,count:2,renders:1};
-    let claims=slots::Claims{slot:[1,0],slot_count:1,pass:[1,0]};
+    ],resources:resources()},group:vec![],first:0,count:2,renders:1};
+    let mut slot=[0u8;16];slot[0]=1;
+    let claims=slots::Claims{slot,slot_count:1,pass:[1,0]};
     firmware().publish_timestamps(&flight,&claims).unwrap();
     assert_eq!(compute.words[0].load(Ordering::Relaxed),expected(30));
     assert_eq!(compute.words[1].load(Ordering::Relaxed),expected(40));
@@ -186,18 +216,65 @@ fn resources()->Resources{Resources{
         assert_eq!(render.words[index].load(Ordering::Relaxed),expected(ticks));
     }
 }
+#[test]fn batched_compute_horizon_group_timestamps_publish_for_all_members(){
+    let c0=backing();let c1=backing();let c2=backing();
+    let flight=Flight{
+        job:Job{commands:vec![command::Command::Compute(command::Compute{timestamp_outputs:outputs(&c0)})],resources:resources()},
+        group:vec![
+            Job{commands:vec![command::Command::Compute(command::Compute{timestamp_outputs:outputs(&c1)})],resources:Resources{compute:vec![],passes:vec![]}},
+            Job{commands:vec![command::Command::Compute(command::Compute{timestamp_outputs:outputs(&c2)})],resources:Resources{compute:vec![],passes:vec![]}},
+        ],
+        first:0,count:1,renders:0,
+    };
+    let mut slot=[0u8;16];slot[0]=0;slot[1]=1;slot[2]=2;
+    let claims=slots::Claims{slot,slot_count:3,pass:[0,0]};
+    firmware().publish_timestamps(&flight,&claims).unwrap();
+    assert_eq!((c0.words[0].load(Ordering::Relaxed),c0.words[1].load(Ordering::Relaxed)),(expected(10),expected(20)));
+    assert_eq!((c1.words[0].load(Ordering::Relaxed),c1.words[1].load(Ordering::Relaxed)),(expected(30),expected(40)));
+    assert_eq!((c2.words[0].load(Ordering::Relaxed),c2.words[1].load(Ordering::Relaxed)),(expected(50),expected(60)));
+}
 #[test]fn invalid_command_span_and_missing_claim_are_rejected(){
     let memory=backing();let mut flight=Flight{job:Job{commands:vec![
         command::Command::Compute(command::Compute{timestamp_outputs:outputs(&memory)})
-    ],resources:resources()},first:usize::MAX,count:2,renders:0};
-    let mut claims=slots::Claims{slot:[0,0],slot_count:1,pass:[0,0]};
+    ],resources:resources()},group:vec![],first:usize::MAX,count:2,renders:0};
+    let mut claims=slots::Claims{slot:[0;16],slot_count:1,pass:[0,0]};
     assert_eq!(firmware().publish_timestamps(&flight,&claims),Err(EOVERFLOW));
     flight.first=1;assert_eq!(firmware().publish_timestamps(&flight,&claims),Err(EINVAL));
     flight.first=0;flight.count=1;claims.slot_count=0;
     assert_eq!(firmware().publish_timestamps(&flight,&claims),Err(EINVAL));
     assert_eq!(memory.words[0].load(Ordering::Relaxed),u64::MAX);
 }
-'''.replace('__CHECKED_OFFSET__', checked_offset).replace('__STORE__', store).replace('__VMAP_STORE__', vmap_store.replace('.timestamp_lock.lock()', '.timestamp_lock.lock().unwrap()')).replace('__CACHE_POLICY__', cache_policy).replace('__WRITE__', write).replace('__PUBLISH__', publish).replace('__RETIRE__', retire.replace('fn publish_timestamps', 'pub(crate) fn publish_timestamps'))
+#[test]fn empty_timestamp_outputs_skip_hardware_cell_reads(){
+    let flight=Flight{job:Job{commands:vec![
+        command::Command::Compute(command::Compute{timestamp_outputs:Destinations(core::array::from_fn(|_|None))}),
+        command::Command::Render(command::Render{timestamp_outputs:Destinations(core::array::from_fn(|_|None))}),
+    ],resources:Resources{compute:vec![],passes:vec![]}},group:vec![],first:0,count:2,renders:1};
+    let claims=slots::Claims{slot:[0;16],slot_count:1,pass:[0,0]};
+    firmware().publish_timestamps(&flight,&claims).unwrap();
+}
+#[test]fn work_ticks_fallback_publishes_compute_timestamps_for_26b123(){
+    let c0=backing();let c1=backing();
+    let mut fw=firmware();
+    fw.init.abi.compute.work_ticks=Some((0x100,0x108));
+    let res=Resources{
+        compute:vec![
+            Compute{its:Cells([0,0,0,0]),work:Cells([0x1_0000_0070,0x1_0000_0090,0,0])},
+            Compute{its:Cells([0,0,0,0]),work:Cells([0x2_0000_0010,0x2_0000_0040,0,0])},
+        ],
+        passes:vec![],
+    };
+    let flight=Flight{
+        job:Job{commands:vec![command::Command::Compute(command::Compute{timestamp_outputs:outputs(&c0)})],resources:res},
+        group:vec![Job{commands:vec![command::Command::Compute(command::Compute{timestamp_outputs:outputs(&c1)})],resources:Resources{compute:vec![],passes:vec![]}}],
+        first:0,count:1,renders:0,
+    };
+    let mut slot=[0u8;16];slot[0]=0;slot[1]=1;
+    let claims=slots::Claims{slot,slot_count:2,pass:[0,0]};
+    fw.publish_timestamps(&flight,&claims).unwrap();
+    assert_eq!((c0.words[0].load(Ordering::Relaxed),c0.words[1].load(Ordering::Relaxed)),(expected(0x1_0000_0070),expected(0x1_0000_0090)));
+    assert_eq!((c1.words[0].load(Ordering::Relaxed),c1.words[1].load(Ordering::Relaxed)),(expected(0x2_0000_0010),expected(0x2_0000_0040)));
+}
+'''.replace('__CHECKED_OFFSET__', checked_offset).replace('__STORE__', store).replace('__VMAP_STORE__', vmap_store.replace('.timestamp_lock.lock()', '.timestamp_lock.lock().unwrap()')).replace('__CACHE_POLICY__', cache_policy).replace('__WRITE__', write).replace('__PUBLISH__', publish).replace('__COMPUTE_TICKS__', compute_ticks).replace('__COMPUTE_TICKS_WITH__', compute_ticks_with).replace('__RETIRE__', retire.replace('fn publish_timestamps', 'pub(crate) fn publish_timestamps'))
 path = out / 'timestamps-host.rs'
 path.write_text(source)
 subprocess.run(rustc() + ['--edition=2021', '--test', str(path), '-o', str(out / 'timestamps-host')], check=True)

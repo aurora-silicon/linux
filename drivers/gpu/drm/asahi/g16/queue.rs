@@ -3,7 +3,12 @@
 //! Logical queues: `crate::queue::Queue` for G16.
 //!
 //! Logical queues own no firmware state: they are independent scheduling entities over the one
-//! shared graph, executed in one total order across queues and VMs. QUEUE_CREATE validates
+//! shared graph, sharing the device's compute and render engines across queues and VMs. A
+//! per-file host credit bounds each open DRM file's live logical queues to the advertised
+//! `MAX_QUEUES` (ENOSPC when full) while `file.rs`'s `queue_share::Share` bounds multi-file
+//! hoarding per process, so one client cannot exhaust logical-queue creation for another
+//! process (such as a compositor). It reserves no hardware graph or execution context.
+//! QUEUE_CREATE validates
 //! `usc_exec_base` (4 GiB aligned, the window inside the user range) and refuses a failed VM or
 //! GPU (EIO); HIGH/REALTIME are refused by the shared `file.rs`. Ray-query scratch layouts are
 //! refused by the shared default `reserve_render_scs` (RENDER_RAY_QUERY is never advertised).
@@ -29,7 +34,7 @@ use kernel::{dma_fence::Fence, prelude::*, sync::Arc, uapi, xarray};
 
 use super::{
     command::{self, USC_WINDOW},
-    fence::{Syncs, Timeline},
+    fence::{InputFences, Syncs, Timeline},
     hw,
     job::{Job, Scheduler},
     params,
@@ -93,6 +98,28 @@ impl QueueState {
     }
 }
 
+/// One per-file logical-queue credit, released after the queue scheduler drains.
+struct QueueCredit {
+    usage: Arc<crate::usage::Client>,
+}
+
+impl QueueCredit {
+    fn acquire(usage: &Arc<crate::usage::Client>) -> Result<Self> {
+        if !usage.try_acquire_queue(hw::sizes::MAX_QUEUES) {
+            return Err(ENOSPC);
+        }
+        Ok(Self {
+            usage: usage.clone(),
+        })
+    }
+}
+
+impl Drop for QueueCredit {
+    fn drop(&mut self) {
+        self.usage.release_queue();
+    }
+}
+
 /// A G16 logical queue.
 pub(crate) struct Queue {
     // Dropped first: QUEUE_DESTROY drains the scheduler before anything else goes.
@@ -103,6 +130,8 @@ pub(crate) struct Queue {
     vm: Arc<VmState>,
     shared: Arc<Shared>,
     timeline: Arc<Timeline>,
+    // Last field: all preceding fields (especially scheduler) drop before capacity returns.
+    _credit: QueueCredit,
 }
 
 impl Queue {
@@ -134,6 +163,7 @@ impl Queue {
         if vm_state.status.get() != 0 {
             return Err(EIO);
         }
+        let credit = QueueCredit::acquire(&usage)?;
         let timeline = Timeline::new()?;
         let scheduler = Scheduler::new(&gpu.shared.dev)?;
         let state = Arc::new(
@@ -157,6 +187,7 @@ impl Queue {
             vm: vm_state,
             shared: gpu.shared.clone(),
             timeline,
+            _credit: credit,
         })
     }
 
@@ -188,23 +219,28 @@ impl Queue {
         })?;
         // Refused jobs add no accepted ordinals; check every prepared dependency before
         // publishing a fence or extending the queue's accepted frontier.
-        for order in &submission.orders {
+        for order in submission.orders.iter() {
             self.state.check(order)?;
         }
-        let mut inputs = KVec::with_capacity(syncs.inputs().len(), GFP_KERNEL)?;
+        let mut inputs = InputFences::new();
         for sync in syncs.inputs() {
             if let Some(fence) = &sync.fence {
-                inputs.push(fence.clone(), GFP_KERNEL)?;
+                inputs.push(fence.clone())?;
             }
         }
         // Allocate and map private backing before a fence or accepted ordinal exists.
         // No GPU completion lock is held; reclaim can wait for earlier hardware work.
+        let hints = super::resources::PrepareHints {
+            expand_compute_ext: self.shared.base_compute_quarantined.load(Ordering::Acquire),
+            expand_render_ext: self.shared.base_render_quarantined.load(Ordering::Acquire),
+            pb_slots: self.shared.needed_pb_slots.load(Ordering::Acquire) as usize,
+        };
         let resources = self
             .vm
             .resources
             .as_ref()
             .ok_or(EIO)?
-            .prepare(&self.vm, &submission.commands)?;
+            .prepare(&self.vm, &submission.commands, hints)?;
         let fence = self.timeline.next()?;
         let job = Job::new(
             id,

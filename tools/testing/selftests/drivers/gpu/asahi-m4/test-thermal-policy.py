@@ -199,11 +199,15 @@ for path, call in [
         ('engine.rs', 'self.power.utilization.busy(now);'),
         ('poll.rs', 'self.power.utilization.idle(self.engine.stats.idle_from_ns);'),
         ('power.rs', '.govern(now, limit, !self.engine.flights.is_empty());'),
-        ('poll.rs', 'Ok(false)\n                        if firmware.recovery.failed().is_none()\n'
-                    '                            && firmware.power.utilization.decaying() =>\n'
-                    '                    {\n                        self.mod_poll('),
+        ('poll.rs', 'fn arm_idle_power_poll(self: &Arc<Self>, firmware: &Firmware)'),
+        ('poll.rs', 'if firmware.power.clpc_holding() {'),
+        ('poll.rs', 'else if firmware.power.utilization.decaying() {'),
+        ('power.rs', 'if idle && self.power.clpc_hold.expire(now) {'),
+        ('recovery.rs', 'self.power.release_clpc_now();'),
+        ('sleep.rs', 'firmware.power.release_clpc_now();'),
 ]:
     assert (G16/path).read_text().count(call) == 1, (path, call)
+assert (G16/'poll.rs').read_text().count('self.arm_idle_power_poll(firmware);') == 3
 print('Governor connected at publication, drain, power service and idle re-arm')
 print(json.dumps(report,indent=2))
 

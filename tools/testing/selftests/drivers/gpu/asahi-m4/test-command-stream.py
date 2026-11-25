@@ -58,7 +58,12 @@ names = ['drm_asahi_cmd_header', 'drm_asahi_attachment', 'drm_asahi_cmd_render',
          'drm_asahi_timestamp', 'drm_asahi_timestamps', 'drm_asahi_helper_program',
          'drm_asahi_render_ray_query_stage']
 constants = command[command.index('/// Largest command buffer.'):command.index('/// A validated render command.')]
+inline_containers = command[command.index('/// Inline storage for the common 1-2 command submission'):command.index('/// A validated SUBMIT.')]
 parser = command[command.index('/// One command of the stream.'):command.index('/// Checks that `[start, end)`')]
+render_admission = (
+    command[command.index('/// Checks that `[start, end)`'):command.index('/// Parses the attachment list')]
+    + command[command.index('/// Whether a GVA can be named by a 32-bit compact pointer.'):command.index('/// Per-command compute admission.')]
+)
 g17 = (ROOT / 'drivers/gpu/drm/asahi/g17/command.rs').read_text()
 # The stage-prefix offset and the render payload reader precede the parser.
 g17_parser = g17[g17.index('/// Where a render command\'s stage-prefix fields start'):g17.index('#[derive(Clone, Copy, PartialEq, Eq)]')]
@@ -306,6 +311,85 @@ fn g17_resource_lists_apply_to_later_commands_until_cleared() {
     }
 }
 #[test]
+fn g16_stage_prefixes_v2_framing_and_tiling_narrowing() {
+    let mut m5 = uapi::drm_asahi_cmd_render_m5 { legacy: render(), ..Default::default() };
+    m5.legacy.flags = STAGE_PREFIXES;
+    m5.legacy.prior_vdm = 5;
+    m5.legacy.prior_cdm = 9;
+    m5.stage_prefixes.ta_vdm_barrier = NONE;
+    m5.stage_prefixes.ta_cdm_barrier = NONE;
+    m5.stage_prefixes.ta_prior_vdm = 3;
+    m5.stage_prefixes.ta_prior_cdm = 0;
+
+    // Rejected when early_tiling is disabled; accepted when enabled.
+    let wire = entry(CMD_RENDER, &data(&m5), [NONE; 2]);
+    assert!(check_stream(&wire, false).is_err());
+    assert!(check_stream(&wire, true).is_ok());
+
+    // Exact 480-byte payload, zero reserved fields, zero ray-query bytes, mutually exclusive with FRAGMENT_BARRIERS.
+    assert!(check_stream(&entry(CMD_RENDER, &data(&m5)[..448], [NONE; 2]), true).is_err());
+    let mut over = data(&m5);
+    over.extend([0u8; 8]);
+    assert!(check_stream(&entry(CMD_RENDER, &over, [NONE; 2]), true).is_err());
+    for field in 0..4 {
+        let mut bad = m5;
+        match field {
+            0 => bad.stage_prefixes.reserved0 = 1,
+            1 => bad.stage_prefixes.reserved1 = 1,
+            2 => bad.stage_prefixes.reserved2 = 1,
+            _ => bad.stage_prefixes.reserved3 = 1,
+        }
+        assert!(check_stream(&entry(CMD_RENDER, &data(&bad), [NONE; 2]), true).is_err());
+    }
+    let mut both = m5;
+    both.legacy.flags |= FRAGMENT_BARRIERS;
+    assert!(check_stream(&entry(CMD_RENDER, &data(&both), [NONE; 2]), true).is_err());
+    let mut rq = m5;
+    rq.legacy.ray_query[0].scs_layout = 1;
+    assert!(check_stream(&entry(CMD_RENDER, &data(&rq), [NONE; 2]), true).is_err());
+
+    // Without STAGE_PREFIXES, nonzero trailing bytes past 448 are rejected; zero tail is accepted.
+    let mut plain = m5;
+    plain.legacy.flags = 0;
+    assert!(check_stream(&entry(CMD_RENDER, &data(&plain), [NONE; 2]), true).is_err());
+    plain.stage_prefixes = Default::default();
+    assert!(check_stream(&entry(CMD_RENDER, &data(&plain), [NONE; 2]), true).is_ok());
+
+    // Out-of-bounds in-stream ta_vdm_barrier / ta_cdm_barrier are rejected by check_stream.
+    let mut bad_bar = m5;
+    bad_bar.stage_prefixes.ta_vdm_barrier = 1;
+    assert!(check_stream(&entry(CMD_RENDER, &data(&bad_bar), [NONE; 2]), true).is_err());
+    let mut bad_cdm = m5;
+    bad_cdm.stage_prefixes.ta_cdm_barrier = 1;
+    assert!(check_stream(&entry(CMD_RENDER, &data(&bad_cdm), [NONE; 2]), true).is_err());
+
+    // In-stream barriers following prior compute + render succeed in check_stream.
+    let mut seq = entry(CMD_COMPUTE, &data(&compute())[..64], [NONE; 2]);
+    seq.extend(entry(CMD_RENDER, &data(&render())[..256], [NONE; 2]));
+    let mut staged = m5;
+    staged.stage_prefixes.ta_vdm_barrier = 1;
+    staged.stage_prefixes.ta_cdm_barrier = 1;
+    seq.extend(entry(CMD_RENDER, &data(&staged), [1, 1]));
+    assert!(check_stream(&seq, true).is_ok());
+
+    // Order::narrow_tiling allows narrower TA prefixes (including TA-no-compute while FS waits)
+    // and rejects any TA prefix wider than the fragment prefix.
+    let mut full = Order::new([10, 20], [2, 1], [2, 1], [10, 20], RENDER).unwrap();
+    assert_eq!(full.wait_through, [Some(12), Some(21)]);
+    assert_eq!(full.ta_wait_through, [Some(12), Some(21)]);
+    let ta_narrow = Order::new([10, 20], [2, 1], [1, NONE], [0, 0], RENDER).unwrap();
+    assert_eq!(full.narrow_tiling(&ta_narrow), Ok(()));
+    assert_eq!(full.wait_through, [Some(12), Some(21)]);
+    assert_eq!(full.ta_wait_through, [Some(11), None]);
+
+    let ta_too_wide_vdm = Order::new([10, 20], [2, 1], [2, NONE], [0, 0], RENDER).unwrap();
+    let mut full_vdm1 = Order::new([10, 20], [2, 1], [1, 1], [0, 0], RENDER).unwrap();
+    assert_eq!(full_vdm1.narrow_tiling(&ta_too_wide_vdm), Err(EINVAL));
+    let ta_too_wide_cdm = Order::new([10, 20], [2, 1], [NONE, 1], [0, 0], RENDER).unwrap();
+    let mut full_nocdm = Order::new([10, 20], [2, 1], [2, NONE], [0, 0], RENDER).unwrap();
+    assert_eq!(full_nocdm.narrow_tiling(&ta_too_wide_cdm), Err(EINVAL));
+}
+#[test]
 fn unsupported_flags_and_compute_fields() {
     for flag in [1u32,4,1<<19,FRAGMENT_BARRIERS] {
         let mut r=render(); r.flags=flag;
@@ -366,14 +450,18 @@ fn historical_priors_enforce_entry_bounds() {
     assert_eq!(order.wait_through,[Some(5),Some(7)]);
     assert!(!order.ready([6,6],[6,6]));
     assert!(order.ready([6,7],[6,7]));
-    // Same-engine commands may follow published predecessors (ordered on the hardware
-    // engine rings); every cross-engine dependency still needs completion.
+    // Same-engine and same-VM cross-engine commands may follow published predecessors
+    // (ordered on the hardware engine rings and cross-engine ring barriers).
     let compute=Order::new([0,2],[0,0],[NONE,NONE],[0,2],COMPUTE).unwrap();
     assert!(!compute.ready([0,1],[0,1]));
     assert!(compute.ready([0,1],[0,2]));
     let render=Order::new([0,2],[0,0],[NONE,NONE],[0,2],RENDER).unwrap();
-    assert!(!render.ready([0,1],[0,2]));
+    assert!(!render.ready([0,1],[0,1]));
+    assert!(render.ready([0,1],[0,2]));
     assert!(render.ready([0,2],[0,2]));
+    let compute_after_render=Order::new([2,0],[0,0],[NONE,NONE],[2,0],COMPUTE).unwrap();
+    assert!(!compute_after_render.ready([1,0],[1,0]));
+    assert!(compute_after_render.ready([1,0],[2,0]));
     let render_next=Order::new([2,0],[0,0],[NONE,NONE],[2,0],RENDER).unwrap();
     assert!(!render_next.ready([1,0],[1,0]));
     assert!(render_next.ready([1,0],[2,0]));
@@ -412,12 +500,321 @@ fn mixed_batch_rejects_before_any_command_can_publish() {
     assert_eq!(result,Err(E2BIG));
     assert_eq!(publications,0,"a rejected render must prevent the earlier compute publishing");
 }
+mod inline_submit_containers {
+    use super::{Order, Result, COMPUTE, NONE, RENDER};
+    use std::cell::Cell;
+
+    const ENOMEM: i32 = -12;
+    const GFP_KERNEL: u32 = 0;
+
+    std::thread_local! {
+        static ALLOCS: Cell<u32> = const { Cell::new(0) };
+        static FAIL_NEXT: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(crate) mod timestamp {
+        #[derive(Debug, PartialEq, Eq)]
+        pub(crate) struct Destinations(pub(crate) u32);
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub(crate) struct Command(pub(crate) u32);
+
+    pub(crate) struct KVec<T>(Vec<T>);
+    impl<T> KVec<T> {
+        fn with_capacity(cap: usize, _flags: u32) -> Result<Self> {
+            if FAIL_NEXT.with(|f| f.replace(false)) {
+                return Err(ENOMEM);
+            }
+            ALLOCS.with(|a| a.set(a.get() + 1));
+            Ok(Self(Vec::with_capacity(cap)))
+        }
+        fn push(&mut self, v: T, _flags: u32) -> Result {
+            if FAIL_NEXT.with(|f| f.replace(false)) {
+                return Err(ENOMEM);
+            }
+            self.0.push(v);
+            Ok(())
+        }
+        fn push_within_capacity(&mut self, v: T) -> std::result::Result<(), T> {
+            self.0.push(v);
+            Ok(())
+        }
+        fn get_mut(&mut self, idx: usize) -> Option<&mut T> {
+            self.0.get_mut(idx)
+        }
+    }
+    impl<T> core::ops::Deref for KVec<T> {
+        type Target = [T];
+        fn deref(&self) -> &[T] { &self.0 }
+    }
+
+    INLINE_CONTAINERS
+
+    #[test]
+    fn inline_commands_orders_and_resolved_skip_heap_up_to_two_and_spill_safely() {
+        ALLOCS.with(|a| a.set(0));
+        let mut cmds = Commands::new();
+        let mut orders = Orders::new();
+        let mut resolved = Resolved::new();
+        let o0 = Order::new([0, 0], [0, 0], [NONE; 2], [0; 2], COMPUTE).unwrap();
+        let o1 = Order::new([0, 0], [0, 1], [NONE; 2], [0; 2], RENDER).unwrap();
+        let o2 = Order::new([0, 0], [1, 1], [NONE; 2], [0; 2], COMPUTE).unwrap();
+        cmds.push(Command(1)).unwrap();
+        cmds.push(Command(2)).unwrap();
+        orders.push(o0).unwrap();
+        orders.push(o1).unwrap();
+        resolved.push(timestamp::Destinations(11)).unwrap();
+        resolved.push(timestamp::Destinations(22)).unwrap();
+        assert_eq!(ALLOCS.with(|a| a.get()), 0);
+        assert_eq!(&*cmds, &[Command(1), Command(2)]);
+        assert_eq!(&*orders, &[o0, o1]);
+
+        // OOM on 2 -> 3 spill preserves inline entries.
+        FAIL_NEXT.with(|f| f.set(true));
+        assert_eq!(cmds.push(Command(3)), Err(ENOMEM));
+        assert_eq!(&*cmds, &[Command(1), Command(2)]);
+        FAIL_NEXT.with(|f| f.set(true));
+        assert_eq!(orders.push(o2), Err(ENOMEM));
+        assert_eq!(&*orders, &[o0, o1]);
+        FAIL_NEXT.with(|f| f.set(true));
+        assert_eq!(resolved.push(timestamp::Destinations(33)), Err(ENOMEM));
+        assert_eq!(ALLOCS.with(|a| a.get()), 0);
+
+        // Spill to heap preserves exact FIFO order across all 3 containers.
+        cmds.push(Command(3)).unwrap();
+        orders.push(o2).unwrap();
+        resolved.push(timestamp::Destinations(33)).unwrap();
+        assert_eq!(ALLOCS.with(|a| a.get()), 3);
+        assert_eq!(&*cmds, &[Command(1), Command(2), Command(3)]);
+        assert_eq!(&*orders, &[o0, o1, o2]);
+        assert_eq!(resolved.next(), Some(timestamp::Destinations(11)));
+        assert_eq!(resolved.next(), Some(timestamp::Destinations(22)));
+        assert_eq!(resolved.next(), Some(timestamp::Destinations(33)));
+        assert_eq!(resolved.next(), None);
+    }
+}
+mod render_admission_tests {
+    use super::{
+        check_render_helpers, hw, uapi, Result, DBIAS_IS_INT, EINVAL, FRAGMENT_BARRIERS,
+        MAX_DIMENSION, MAX_LAYERS, MAX_TILE_BUFFER, PROCESS_EMPTY_TILES, RSRC_SPEC_HI,
+        STAGE_PREFIXES, ZLS_METADATA_STRIDE,
+    };
+    const ENOENT: i32 = -2;
+    const EACCES: i32 = -13;
+
+    pub(crate) mod vm {
+        pub(crate) fn reserved_ranges() -> &'static [core::ops::Range<u64>] {
+            &[]
+        }
+    }
+    pub(crate) mod params {
+        pub(crate) fn early_tiling() -> bool { true }
+    }
+    pub(crate) mod gate {
+        use super::{mmu, Result};
+        pub(crate) fn vdm(_vm: &mmu::Vm, _va: u64) -> Result { Ok(()) }
+    }
+    pub(crate) mod mmu {
+        pub(crate) const UAT_PGMSK: usize = 0x3fff;
+        pub(crate) struct Vm {
+            pub(crate) maps: Vec<(u64, u64, bool, bool)>,
+            pub(crate) batch_calls: std::cell::Cell<usize>,
+        }
+        impl Vm {
+            pub(crate) fn covers_range(&self, start: u64, size: u64, read: bool, write: bool) -> bool {
+                let Some(end) = start.checked_add(size) else { return false };
+                self.maps.iter().any(|&(s, e, r, w)| {
+                    start >= s && end <= e && (!read || r) && (!write || w)
+                })
+            }
+            pub(crate) fn covers_ranges_batch(&self, ranges: &[(u64, u64, u8)]) -> (bool, usize) {
+                self.batch_calls.set(self.batch_calls.get() + 1);
+                for (i, &(start, size, acc)) in ranges.iter().enumerate() {
+                    if !self.covers_range(start, size, acc & 1 != 0, acc & 2 != 0) {
+                        return (false, i);
+                    }
+                }
+                (true, ranges.len())
+            }
+        }
+    }
+    pub(crate) struct Context<'a> {
+        pub(crate) vm: &'a mmu::Vm,
+        pub(crate) usc_base: u64,
+    }
+    RENDER_ADMISSION
+
+    fn check_render_one(
+        ctx: &Context<'_>,
+        cmd: &uapi::drm_asahi_cmd_render,
+        vertex: &[uapi::drm_asahi_attachment],
+        fragment: &[uapi::drm_asahi_attachment],
+    ) -> Result {
+        let mut batch = SpanBatch::new();
+        check_render(&mut batch, ctx, cmd, vertex, fragment)?;
+        batch.flush(ctx.vm)
+    }
+
+    const BASE_GVA: u64 = 0x10_0000_0000;
+    fn base_vm() -> mmu::Vm {
+        mmu::Vm {
+            maps: vec![
+                (BASE_GVA, BASE_GVA + 0x10_0000, true, false),
+                (BASE_GVA + 0x20_0000, BASE_GVA + 0x40_0000, true, true),
+                (BASE_GVA + 0x50_0000, BASE_GVA + 0x51_0000, true, false),
+            ],
+            batch_calls: std::cell::Cell::new(0),
+        }
+    }
+    fn base_cmd() -> uapi::drm_asahi_cmd_render {
+        uapi::drm_asahi_cmd_render {
+            width_px: 64,
+            height_px: 64,
+            layers: 1,
+            samples: 1,
+            utile_width_px: 32,
+            utile_height_px: 32,
+            sample_size_B: 8,
+            vdm_ctrl_stream_base: BASE_GVA,
+            isp_scissor_base: BASE_GVA + 0x100,
+            ..Default::default()
+        }
+    }
+    const Z_COMP: u64 = (1 << 1) | (1 << 2) | (1 << 5) | (1 << 6) | (1 << 15) | (1 << 19);
+    const S_COMP: u64 = (1 << 3) | (1 << 4) | (1 << 7) | (1 << 8) | (1 << 14) | (1 << 18);
+
+    #[test]
+    fn compressed_zls_1x_layered_and_2x_accepted() {
+        let vm = base_vm();
+        let ctx = Context { vm: &vm, usc_base: 1 << 40 };
+        // 1x compressed D32F depth + stencil.
+        let mut cmd = base_cmd();
+        cmd.zls_ctrl = Z_COMP | S_COMP;
+        cmd.depth.base = BASE_GVA + 0x20_0000;
+        cmd.depth.comp_base = BASE_GVA + 0x24_0000;
+        cmd.stencil.base = BASE_GVA + 0x28_0000;
+        cmd.stencil.comp_base = BASE_GVA + 0x2c_0000;
+        assert_eq!(check_render_one(&ctx, &cmd, &[], &[]), Ok(()));
+        // 1x compressed D16 depth (Z Format = 2 at bits 25..26).
+        let mut d16 = base_cmd();
+        d16.zls_ctrl = Z_COMP | (2 << 25);
+        d16.depth.base = BASE_GVA + 0x20_0000;
+        d16.depth.comp_base = BASE_GVA + 0x24_0000;
+        assert_eq!(check_render_one(&ctx, &d16, &[], &[]), Ok(()));
+        // 2x MSAA compressed depth.
+        let mut msaa2 = d16;
+        msaa2.samples = 2;
+        assert_eq!(check_render_one(&ctx, &msaa2, &[], &[]), Ok(()));
+        // Layered compressed depth/stencil with comp_stride == 0 (1 line = 0x80) and nonzero stride.
+        let mut layered = cmd;
+        layered.layers = 4;
+        layered.depth.stride = (1 << 14) | 1;
+        layered.stencil.stride = (1 << 14) | 1;
+        assert_eq!(check_render_one(&ctx, &layered, &[], &[]), Ok(()));
+        layered.depth.comp_stride = 3 << 14;
+        layered.stencil.comp_stride = 2 << 14;
+        assert_eq!(check_render_one(&ctx, &layered, &[], &[]), Ok(()));
+    }
+
+    #[test]
+    fn compressed_zls_invalid_ctrl_alignment_and_vm_spans_rejected() {
+        let vm = base_vm();
+        let ctx = Context { vm: &vm, usc_base: 1 << 40 };
+        let valid = || {
+            let mut cmd = base_cmd();
+            cmd.zls_ctrl = Z_COMP | S_COMP;
+            cmd.depth.base = BASE_GVA + 0x20_0000;
+            cmd.depth.comp_base = BASE_GVA + 0x24_0000;
+            cmd.stencil.base = BASE_GVA + 0x28_0000;
+            cmd.stencil.comp_base = BASE_GVA + 0x2c_0000;
+            cmd
+        };
+        // Asymmetric compress bits per plane.
+        for bit in [1u64 << 2, 1 << 6, 1 << 4, 1 << 8] {
+            let mut bad = valid();
+            bad.zls_ctrl ^= bit;
+            assert_eq!(check_render_one(&ctx, &bad, &[], &[]), Err(EINVAL));
+        }
+        // Unaligned comp_stride or comp_base.
+        for bad_stride in [1u32, 0x4001, 0x3fff] {
+            let mut bad = valid();
+            bad.depth.comp_stride = bad_stride;
+            assert_eq!(check_render_one(&ctx, &bad, &[], &[]), Err(EINVAL));
+        }
+        let mut bad = valid();
+        bad.depth.comp_base += 2;
+        assert_eq!(check_render_one(&ctx, &bad, &[], &[]), Err(EINVAL));
+        // comp_base without compress bits, compress bits without comp_base, stride without base.
+        let mut bad = valid();
+        bad.zls_ctrl &= !((1 << 2) | (1 << 6));
+        assert_eq!(check_render_one(&ctx, &bad, &[], &[]), Err(EINVAL));
+        let mut bad = valid();
+        bad.depth.comp_base = 0;
+        assert_eq!(check_render_one(&ctx, &bad, &[], &[]), Err(EINVAL));
+        let mut bad = valid();
+        bad.zls_ctrl = Z_COMP;
+        bad.stencil = Default::default();
+        bad.stencil.comp_stride = 1 << 14;
+        assert_eq!(check_render_one(&ctx, &bad, &[], &[]), Err(EINVAL));
+        // Unmapped comp_base -> ENOENT; read-only comp_base -> EACCES.
+        let mut unmapped = valid();
+        unmapped.depth.comp_base = BASE_GVA + 0x60_0000;
+        assert_eq!(check_render_one(&ctx, &unmapped, &[], &[]), Err(ENOENT));
+        let mut ro = valid();
+        ro.depth.comp_base = BASE_GVA + 0x50_0000;
+        assert_eq!(check_render_one(&ctx, &ro, &[], &[]), Err(EACCES));
+        // Layered metadata span extending past mapped range -> ENOENT.
+        let mut past_end = valid();
+        past_end.layers = 4;
+        past_end.depth.stride = 1;
+        past_end.stencil.stride = 1;
+        past_end.depth.comp_base = BASE_GVA + 0x3f_c000;
+        past_end.depth.comp_stride = 0x100 << 14;
+        assert_eq!(check_render_one(&ctx, &past_end, &[], &[]), Err(ENOENT));
+    }
+
+    #[test]
+    fn submit_wide_span_batch_dedups_and_flushes_once_across_passes() {
+        let vm = base_vm();
+        let ctx = Context { vm: &vm, usc_base: 1 << 40 };
+        let mut batch = SpanBatch::new();
+        for pass in 0..4u64 {
+            let mut cmd = base_cmd();
+            cmd.vdm_ctrl_stream_base = BASE_GVA + pass * 0x20;
+            cmd.zls_ctrl = Z_COMP;
+            cmd.depth.base = BASE_GVA + 0x20_0000 + pass * 0x4000;
+            cmd.depth.comp_base = BASE_GVA + 0x24_0000 + pass * 0x4000;
+            assert_eq!(check_render(&mut batch, &ctx, &cmd, &[], &[]), Ok(()));
+        }
+        assert_eq!(vm.batch_calls.get(), 0);
+        assert_eq!(batch.flush(&vm), Ok(()));
+        assert_eq!(vm.batch_calls.get(), 1);
+
+        // Unmapped or read-only span on a later pass still reports exact ENOENT / EACCES.
+        let mut bad_unmapped = base_cmd();
+        bad_unmapped.zls_ctrl = Z_COMP;
+        bad_unmapped.depth.base = BASE_GVA + 0x20_0000;
+        bad_unmapped.depth.comp_base = BASE_GVA + 0x60_0000;
+        assert_eq!(check_render(&mut batch, &ctx, &base_cmd(), &[], &[]), Ok(()));
+        assert_eq!(check_render(&mut batch, &ctx, &bad_unmapped, &[], &[]), Ok(()));
+        assert_eq!(batch.flush(&vm), Err(ENOENT));
+
+        let mut bad_ro = bad_unmapped;
+        bad_ro.depth.comp_base = BASE_GVA + 0x50_0000;
+        assert_eq!(check_render(&mut batch, &ctx, &base_cmd(), &[], &[]), Ok(()));
+        assert_eq!(check_render(&mut batch, &ctx, &bad_ro, &[], &[]), Ok(()));
+        assert_eq!(batch.flush(&vm), Err(EACCES));
+    }
+}
 '''
 replacements = {'FULL_UAPI': str(BINDINGS), 'READER': reader,
                 'CAPACITIES': capacities, 'FW_GRAPH': str(SOURCE.parent/'fw/graph.rs'),
                 'FW_WORK': str(SOURCE.parent/'fw/work.rs'), 'FULL_ENCODER': str(SOURCE.parent/'encode.rs'),
                 'IMPLS': '\n'.join('unsafe impl AnyBitPattern for uapi::' + name + ' {}' for name in names),
                 'PRODUCTION_CONSTANTS': constants, 'PRODUCTION_PARSER': parser.replace('super::encode::', 'encode::'),
+                'INLINE_CONTAINERS': inline_containers.replace('crate::timestamp::', 'timestamp::'),
+                'RENDER_ADMISSION': render_admission.replace('super::vm::', 'vm::').replace('super::params::', 'params::'),
                 'G17_CONSTANTS': g17_constants, 'G17_PARSER': g17_parser}
 for key in sorted(replacements,key=len,reverse=True):
     harness = harness.replace(key,replacements[key])

@@ -53,12 +53,12 @@ pub(crate) fn push_completion(done: &mut Completions, job: &Arc<Job>, result: Re
 pub(crate) struct Recovery {
     pub(crate) deadline_ns: u64,
     pub(crate) compute_deadline_ns: u64,
-    /// A long command warning is diagnostic, not evidence that the GPU has stopped.
-    warning_deadline_ns: u64,
+    /// Per-class (render, compute) long-command warning deadlines; diagnostic only.
+    warning_deadline_ns: [u64; 2],
     pub(crate) long_commands: u64,
     pub(crate) publication_wait_deadline: Option<u64>,
-    /// Last fully retired compute/TA/FS identity, for late recovery snapshots.
-    pub(crate) last_retired: [Option<u32>; 3],
+    /// Recently retired compute/TA/FS stamps, for late recovery snapshots.
+    pub(crate) last_retired: logic::RetiredStamps,
     /// Queue engine order: render, compute. A quarantined/exhausted class stays offline.
     pub(crate) unavailable: [Option<Error>; 2],
     pub(crate) errors_seen: u32,
@@ -81,10 +81,10 @@ impl Recovery {
         Self {
             deadline_ns: logic::EXPIRED,
             compute_deadline_ns: logic::EXPIRED,
-            warning_deadline_ns: u64::MAX,
+            warning_deadline_ns: [u64::MAX; 2],
             long_commands: 0,
             publication_wait_deadline: None,
-            last_retired: [None; 3],
+            last_retired: logic::RetiredStamps::new(),
             unavailable: [None; 2],
             errors_seen: 0,
             statistics_seen: 0,
@@ -114,15 +114,24 @@ impl Firmware {
         &self.pools.dev
     }
 
+    pub(crate) fn renew_render_deadline(&mut self) {
+        let now = now_ns();
+        self.recovery.deadline_ns = logic::renew(now, params::deadline_ms(), 0).0;
+        self.recovery.warning_deadline_ns[super::command::RENDER] =
+            now.saturating_add(5_000_000_000);
+    }
+
+    pub(crate) fn renew_compute_deadline(&mut self) {
+        let now = now_ns();
+        self.recovery.compute_deadline_ns =
+            logic::renew(now, 0, params::compute_deadline_ms()).1;
+        self.recovery.warning_deadline_ns[super::command::COMPUTE] =
+            now.saturating_add(5_000_000_000);
+    }
+
     pub(crate) fn renew_deadlines(&mut self) {
-        let (deadline, compute) = logic::renew(
-            now_ns(),
-            params::deadline_ms(),
-            params::compute_deadline_ms(),
-        );
-        self.recovery.deadline_ns = deadline;
-        self.recovery.compute_deadline_ns = compute;
-        self.recovery.warning_deadline_ns = now_ns().saturating_add(5_000_000_000);
+        self.renew_render_deadline();
+        self.renew_compute_deadline();
     }
 
     fn new_recovery(&self) -> bool {
@@ -147,11 +156,11 @@ impl Firmware {
     /// A full hardware receipt still fails an explicitly affected job. Merely
     /// suspect work can complete normally; the poll owner separately proves an
     /// abort before retiring it without a full receipt.
-    pub(crate) fn retire_outcome(&mut self, receipt: Retirement) -> Result {
+    pub(crate) fn retire_outcome_at(&mut self, index: usize, receipt: Retirement) -> Result {
         let affected = self
             .engine
             .flights
-            .first()
+            .get(index)
             .is_some_and(|flight| flight.doomed);
         if receipt.job_failed(affected) {
             Err(EIO)
@@ -190,21 +199,41 @@ impl Firmware {
         if !self.engine.flights.is_empty() {
             self.progress();
             let now = now_ns();
-            if logic::expired(now, self.recovery.warning_deadline_ns) {
-                self.recovery.warning_deadline_ns = u64::MAX;
-                self.recovery.long_commands = self.recovery.long_commands.saturating_add(1);
-                dev_warn!(self.dev(), "M4 GPU command has no completion-stamp progress for 5s; execution may still be active\n");
-            }
-            let compute_only = self
+            let has_render = self.engine.flights.iter().any(|flight| flight.renders != 0);
+            let has_compute = self
                 .engine
-                .oldest()
-                .is_some_and(|flight| flight.computes != 0 && flight.renders == 0);
-            let deadline = if compute_only {
-                self.recovery.compute_deadline_ns
-            } else {
-                self.recovery.deadline_ns
-            };
-            if logic::expired(now, deadline) {
+                .flights
+                .iter()
+                .any(|flight| flight.computes != 0);
+            if has_render
+                && logic::expired(
+                    now,
+                    self.recovery.warning_deadline_ns[super::command::RENDER],
+                )
+            {
+                self.recovery.warning_deadline_ns[super::command::RENDER] = u64::MAX;
+                self.recovery.long_commands = self.recovery.long_commands.saturating_add(1);
+                dev_warn!(
+                    self.dev(),
+                    "M4 GPU render command has no completion-stamp progress for 5s; execution may still be active\n"
+                );
+            }
+            if has_compute
+                && logic::expired(
+                    now,
+                    self.recovery.warning_deadline_ns[super::command::COMPUTE],
+                )
+            {
+                self.recovery.warning_deadline_ns[super::command::COMPUTE] = u64::MAX;
+                self.recovery.long_commands = self.recovery.long_commands.saturating_add(1);
+                dev_warn!(
+                    self.dev(),
+                    "M4 GPU compute command has no completion-stamp progress for 5s; execution may still be active\n"
+                );
+            }
+            if (has_render && logic::expired(now, self.recovery.deadline_ns))
+                || (has_compute && logic::expired(now, self.recovery.compute_deadline_ns))
+            {
                 dev_err!(
                     self.dev(),
                     "M4 GPU administrative command deadline exceeded without firmware recovery; retaining owners and fail-stop (not proof of quiescence)\n"
@@ -316,7 +345,7 @@ impl Firmware {
     pub(crate) fn fail_flights(&mut self, error: Error, done: &mut Completions) {
         let flights = core::mem::take(&mut self.engine.flights);
         // A failed device never publishes again: release the memory floor now.
-        self.power.report_work(false);
+        self.power.release_clpc_now();
         for flight in flights.iter() {
             for job in Iterator::chain(core::iter::once(&flight.job), flight.group.iter()) {
                 push_completion(done, job, Err(error));
@@ -373,6 +402,22 @@ impl Firmware {
     }
 
     fn recover(&mut self) -> Result {
+        struct RecoveringGuard(Option<Arc<super::Shared>>);
+        impl Drop for RecoveringGuard {
+            fn drop(&mut self) {
+                if let Some(shared) = &self.0 {
+                    shared
+                        .recovering
+                        .store(false, core::sync::atomic::Ordering::Release);
+                }
+            }
+        }
+        if let Some(shared) = &self.engine.shared {
+            shared
+                .recovering
+                .store(true, core::sync::atomic::Ordering::Release);
+        }
+        let _recovering = RecoveringGuard(self.engine.shared.clone());
         let start = self.events.recovery_started_ns.unwrap_or_else(now_ns);
         self.recovery.running = true;
         self.engine.frozen = true;

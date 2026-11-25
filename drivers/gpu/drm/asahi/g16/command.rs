@@ -37,8 +37,28 @@ const PROCESS_EMPTY_TILES: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_P
 const RSRC_SPEC_HI: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_RSRC_SPEC_HI;
 const DBIAS_IS_INT: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_DBIAS_IS_INT;
 const FRAGMENT_BARRIERS: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_FRAGMENT_BARRIERS;
+const STAGE_PREFIXES: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_STAGE_PREFIXES;
 const COMPUTE_NO_QUERY_ACCESS: u32 =
     uapi::drm_asahi_compute_flags_DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS as u32;
+
+const RENDER_STAGE_PREFIXES_OFF: usize =
+    offset_of!(uapi::drm_asahi_cmd_render_m5, stage_prefixes);
+const RENDER_M5_SIZE: usize = size_of::<uapi::drm_asahi_cmd_render_m5>();
+
+const _: () = {
+    assert!(RENDER_STAGE_PREFIXES_OFF == size_of::<uapi::drm_asahi_cmd_render>());
+    assert!(size_of::<uapi::drm_asahi_cmd_render>() == 448);
+    assert!(RENDER_M5_SIZE == 480);
+    assert!(offset_of!(uapi::drm_asahi_render_stage_prefixes, ta_cdm_barrier) == 0);
+    assert!(offset_of!(uapi::drm_asahi_render_stage_prefixes, reserved0) == 2);
+    assert!(offset_of!(uapi::drm_asahi_render_stage_prefixes, reserved1) == 4);
+    assert!(offset_of!(uapi::drm_asahi_render_stage_prefixes, ta_prior_cdm) == 8);
+    assert!(offset_of!(uapi::drm_asahi_render_stage_prefixes, ta_vdm_barrier) == 16);
+    assert!(offset_of!(uapi::drm_asahi_render_stage_prefixes, reserved2) == 18);
+    assert!(offset_of!(uapi::drm_asahi_render_stage_prefixes, reserved3) == 20);
+    assert!(offset_of!(uapi::drm_asahi_render_stage_prefixes, ta_prior_vdm) == 24);
+    assert!(size_of::<uapi::drm_asahi_render_stage_prefixes>() == 32);
+};
 
 const CMD_RENDER: u32 = uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_RENDER;
 const CMD_COMPUTE: u32 = uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_COMPUTE;
@@ -49,6 +69,7 @@ const SET_COMPUTE_ATTACHMENTS: u32 = uapi::drm_asahi_cmd_type_DRM_ASAHI_SET_COMP
 const MAX_DIMENSION: u16 = 16384;
 const MAX_LAYERS: u16 = 2048;
 const MAX_TILE_BUFFER: u32 = 32768;
+const ZLS_METADATA_STRIDE: u64 = 0x80;
 /// Size of a queue's USC window.
 pub(crate) const USC_WINDOW: u64 = 1 << 32;
 
@@ -65,6 +86,7 @@ pub(crate) struct Order {
     pub(crate) engine: usize,
     pub(crate) sequence: u64,
     pub(crate) wait_through: [Option<u64>; 2],
+    pub(crate) ta_wait_through: [Option<u64>; 2],
 }
 
 impl Order {
@@ -108,19 +130,31 @@ impl Order {
             engine,
             sequence: sequences[engine],
             wait_through,
+            ta_wait_through: wait_through,
         })
     }
 
-    /// A same-engine command cannot jump a hole in its queue's completed frontier.
-    /// Cross-engine historical dependencies end at the named prefix, even while later
-    /// commands in that older submission remain pending.
+    /// Narrows the tiling half's prefixes to `tiling` (`DRM_ASAHI_RENDER_STAGE_PREFIXES`),
+    /// requiring each stage prefix to stay within the command's full fragment prefix.
+    pub(crate) fn narrow_tiling(&mut self, tiling: &Self) -> Result {
+        for index in 0..2 {
+            if tiling.wait_through[index].unwrap_or(0) > self.wait_through[index].unwrap_or(0) {
+                return Err(EINVAL);
+            }
+        }
+        self.ta_wait_through = tiling.wait_through;
+        Ok(())
+    }
+
+    /// A same-engine command cannot jump a hole in its queue's published frontier.
+    /// Cross-engine dependencies may also follow published predecessors via hardware
+    /// ring barriers (FS -> CDM and CDM -> TA) while same-VM work pipelines; cross-VM
+    /// switches, InitBM and timestamp query accesses still drain to completion.
     pub(crate) fn ready(&self, completed: [u64; 2], published: [u64; 2]) -> bool {
-        // Same-engine order and barriers are kept by the firmware engine rings (in-order
-        // CDM execution for compute, explicit TA/FS barriers for pipelined renders): the
-        // same-engine published frontier suffices. Every cross-engine dependency still waits
-        // for the other engine's completed frontier.
-        let mut frontier = completed;
-        frontier[self.engine] = published[self.engine].max(completed[self.engine]);
+        let frontier = [
+            published[RENDER].max(completed[RENDER]),
+            published[COMPUTE].max(completed[COMPUTE]),
+        ];
         frontier[self.engine].checked_add(1) == Some(self.sequence)
             && self
                 .wait_through
@@ -158,12 +192,158 @@ pub(crate) enum Command {
     Compute(KBox<ComputeCommand>),
 }
 
+/// Inline storage for the common 1-2 command submission, spilling to a heap `KVec` above 2.
+pub(crate) enum Commands {
+    Empty,
+    One([Command; 1]),
+    Two([Command; 2]),
+    Heap(KVec<Command>),
+}
+
+impl Commands {
+    fn new() -> Self {
+        Self::Empty
+    }
+
+    fn push(&mut self, command: Command) -> Result {
+        match self {
+            Self::Heap(vec) => vec.push(command, GFP_KERNEL)?,
+            Self::Two(_) => {
+                // Allocate before moving inline entries so OOM leaves `self` intact.
+                let mut vec = KVec::with_capacity(4, GFP_KERNEL)?;
+                if let Self::Two([a, b]) = core::mem::replace(self, Self::Empty) {
+                    let _ = vec.push_within_capacity(a);
+                    let _ = vec.push_within_capacity(b);
+                    let _ = vec.push_within_capacity(command);
+                }
+                *self = Self::Heap(vec);
+            }
+            Self::One(_) => {
+                if let Self::One([a]) = core::mem::replace(self, Self::Empty) {
+                    *self = Self::Two([a, command]);
+                }
+            }
+            Self::Empty => *self = Self::One([command]),
+        }
+        Ok(())
+    }
+}
+
+impl core::ops::Deref for Commands {
+    type Target = [Command];
+
+    fn deref(&self) -> &[Command] {
+        match self {
+            Self::Empty => &[],
+            Self::One(items) => items,
+            Self::Two(items) => items,
+            Self::Heap(vec) => vec,
+        }
+    }
+}
+
+/// Inline storage for the common 1-2 command ordinals, spilling to a heap `KVec` above 2.
+pub(crate) enum Orders {
+    Empty,
+    One([Order; 1]),
+    Two([Order; 2]),
+    Heap(KVec<Order>),
+}
+
+impl Orders {
+    fn new() -> Self {
+        Self::Empty
+    }
+
+    fn push(&mut self, order: Order) -> Result {
+        match self {
+            Self::Heap(vec) => vec.push(order, GFP_KERNEL)?,
+            Self::Two([a, b]) => {
+                let (a, b) = (*a, *b);
+                let mut vec = KVec::with_capacity(4, GFP_KERNEL)?;
+                let _ = vec.push_within_capacity(a);
+                let _ = vec.push_within_capacity(b);
+                let _ = vec.push_within_capacity(order);
+                *self = Self::Heap(vec);
+            }
+            Self::One([a]) => *self = Self::Two([*a, order]),
+            Self::Empty => *self = Self::One([order]),
+        }
+        Ok(())
+    }
+}
+
+impl core::ops::Deref for Orders {
+    type Target = [Order];
+
+    fn deref(&self) -> &[Order] {
+        match self {
+            Self::Empty => &[],
+            Self::One(items) => items,
+            Self::Two(items) => items,
+            Self::Heap(vec) => vec,
+        }
+    }
+}
+
+/// Inline storage for transient resolved timestamp destinations during SUBMIT validation.
+enum Resolved {
+    Empty,
+    One(Option<crate::timestamp::Destinations>),
+    Two([Option<crate::timestamp::Destinations>; 2]),
+    Heap {
+        items: KVec<Option<crate::timestamp::Destinations>>,
+        index: usize,
+    },
+}
+
+impl Resolved {
+    fn new() -> Self {
+        Self::Empty
+    }
+
+    fn push(&mut self, dest: crate::timestamp::Destinations) -> Result {
+        match self {
+            Self::Heap { items, .. } => items.push(Some(dest), GFP_KERNEL)?,
+            Self::Two(_) => {
+                let mut items = KVec::with_capacity(4, GFP_KERNEL)?;
+                if let Self::Two([a, b]) = core::mem::replace(self, Self::Empty) {
+                    let _ = items.push_within_capacity(a);
+                    let _ = items.push_within_capacity(b);
+                    let _ = items.push_within_capacity(Some(dest));
+                }
+                *self = Self::Heap { items, index: 0 };
+            }
+            Self::One(_) => {
+                if let Self::One(a) = core::mem::replace(self, Self::Empty) {
+                    *self = Self::Two([a, Some(dest)]);
+                }
+            }
+            Self::Empty => *self = Self::One(Some(dest)),
+        }
+        Ok(())
+    }
+
+    fn next(&mut self) -> Option<crate::timestamp::Destinations> {
+        match self {
+            Self::Empty => None,
+            Self::One(slot) => slot.take(),
+            Self::Two(slots) => slots[0].take().or_else(|| slots[1].take()),
+            Self::Heap { items, index } => {
+                let item = items.get_mut(*index)?.take();
+                *index += 1;
+                item
+            }
+        }
+    }
+}
+
 /// A validated SUBMIT.
 pub(crate) struct Submission {
     /// The commands, in submission order.
-    pub(crate) commands: KVec<Command>,
+    pub(crate) commands: Commands,
     /// Exact per-command queue-local ordinals, allocated before scheduler acceptance.
-    pub(crate) orders: KVec<Order>,
+    pub(crate) orders: Orders,
     /// Render and compute commands, for the queue's accepted-command accounting.
     pub(crate) counts: [u64; 2],
 }
@@ -181,8 +361,8 @@ pub(crate) struct Context<'a> {
 pub(crate) struct Prepared<'a> {
     bytes: &'a [u8],
     /// CPU views and their backing resolved before scheduler acceptance.
-    resolved: KVec<crate::timestamp::Destinations>,
-    orders: KVec<Order>,
+    resolved: Resolved,
+    orders: Orders,
     counts: [u64; 2],
 }
 
@@ -245,6 +425,71 @@ fn payload<T: AnyBitPattern>(bytes: &[u8]) -> Result<T> {
         return Err(EINVAL);
     }
     Reader::new(bytes).read_up_to(bytes.len())
+}
+
+/// Decodes the 32-byte `drm_asahi_render_stage_prefixes` tail from a 480-byte
+/// `drm_asahi_cmd_render_m5` payload without adding a duplicate `AnyBitPattern` impl.
+fn decode_stage_prefixes(tail: &[u8]) -> Result<uapi::drm_asahi_render_stage_prefixes> {
+    let bytes: &[u8; 32] = tail.try_into().map_err(|_| EINVAL)?;
+    let u16_at = |o: usize| u16::from_le_bytes([bytes[o], bytes[o + 1]]);
+    let u32_at = |o: usize| {
+        u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]])
+    };
+    let u64_at = |o: usize| {
+        u64::from_le_bytes([
+            bytes[o],
+            bytes[o + 1],
+            bytes[o + 2],
+            bytes[o + 3],
+            bytes[o + 4],
+            bytes[o + 5],
+            bytes[o + 6],
+            bytes[o + 7],
+        ])
+    };
+    Ok(uapi::drm_asahi_render_stage_prefixes {
+        ta_cdm_barrier: u16_at(0),
+        reserved0: u16_at(2),
+        reserved1: u32_at(4),
+        ta_prior_cdm: u64_at(8),
+        ta_vdm_barrier: u16_at(16),
+        reserved2: u16_at(18),
+        reserved3: u32_at(20),
+        ta_prior_vdm: u64_at(24),
+    })
+}
+
+/// Decodes a render command. With `DRM_ASAHI_RENDER_STAGE_PREFIXES`, the payload must be
+/// the exact 480-byte `drm_asahi_cmd_render_m5` with zero reserved fields and without
+/// `DRM_ASAHI_RENDER_FRAGMENT_BARRIERS`. Without the flag, any trailing bytes must be zero.
+fn render_payload(
+    bytes: &[u8],
+) -> Result<(
+    uapi::drm_asahi_cmd_render,
+    Option<uapi::drm_asahi_render_stage_prefixes>,
+)> {
+    let head_len = bytes.len().min(RENDER_STAGE_PREFIXES_OFF);
+    let cmd: uapi::drm_asahi_cmd_render = Reader::new(&bytes[..head_len]).read_up_to(head_len)?;
+    let tail = bytes.get(RENDER_STAGE_PREFIXES_OFF..).unwrap_or(&[]);
+    if cmd.flags & STAGE_PREFIXES != 0 {
+        if bytes.len() != RENDER_M5_SIZE || cmd.flags & FRAGMENT_BARRIERS != 0 {
+            return Err(EINVAL);
+        }
+        let prefixes = decode_stage_prefixes(tail)?;
+        if prefixes.reserved0 != 0
+            || prefixes.reserved1 != 0
+            || prefixes.reserved2 != 0
+            || prefixes.reserved3 != 0
+        {
+            return Err(EINVAL);
+        }
+        Ok((cmd, Some(prefixes)))
+    } else {
+        if tail.iter().any(|&byte| byte != 0) {
+            return Err(EINVAL);
+        }
+        Ok((cmd, None))
+    }
 }
 
 /// Whether `[start, start + size)` is a nonempty range inside `range`.
@@ -313,20 +558,38 @@ pub(crate) fn check_stream(bytes: &[u8], early_tiling: bool) -> Result {
         }
         match entry.kind {
             CMD_RENDER => {
-                let packet: uapi::drm_asahi_cmd_render = payload(entry.payload)?;
+                let (packet, prefixes) = render_payload(entry.payload)?;
                 let cmd = &packet;
                 // Ray-query extensions belong to G17; reject every nonzero byte
-                // beyond the common historical-prefix fields on G16.
+                // between the common historical-prefix fields and the stage-prefix tail.
                 let end = offset_of!(uapi::drm_asahi_cmd_render, prior_cdm) + size_of::<u64>();
-                if entry.payload.get(end..).is_some_and(|tail| tail.iter().any(|&b| b != 0)) {
+                let rq_end = entry.payload.len().min(RENDER_STAGE_PREFIXES_OFF);
+                if entry
+                    .payload
+                    .get(end..rq_end)
+                    .is_some_and(|tail| tail.iter().any(|&b| b != 0))
+                {
                     return Err(EINVAL);
+                }
+                if let Some(prefixes) = prefixes {
+                    if (prefixes.ta_vdm_barrier != NONE
+                        && u32::from(prefixes.ta_vdm_barrier) > counts[RENDER])
+                        || (prefixes.ta_cdm_barrier != NONE
+                            && u32::from(prefixes.ta_cdm_barrier) > counts[COMPUTE])
+                    {
+                        return Err(EINVAL);
+                    }
                 }
                 check_render_helpers(cmd)?;
                 // M4 HAL200 resource words carry all four high halves.
                 let allowed = PROCESS_EMPTY_TILES
                     | DBIAS_IS_INT
                     | RSRC_SPEC_HI
-                    | if early_tiling { FRAGMENT_BARRIERS } else { 0 };
+                    | if early_tiling {
+                        FRAGMENT_BARRIERS | STAGE_PREFIXES
+                    } else {
+                        0
+                    };
                 if cmd.flags & !allowed != 0
                     || !(1..=MAX_DIMENSION).contains(&cmd.width_px)
                     || !(1..=MAX_DIMENSION).contains(&cmd.height_px)
@@ -405,10 +668,9 @@ pub(crate) fn check_stream(bytes: &[u8], early_tiling: bool) -> Result {
     Ok(())
 }
 
-/// Checks that `[start, end)` (rounded out to pages) is user memory mapped with the requested
-/// GPU access: a driver range ENOENT, outside the user range EINVAL, an unmapped page ENOENT, a
-/// page without the access EACCES.
-pub(crate) fn cover(vm: &mmu::Vm, start: u64, end: u64, read: bool, write: bool) -> Result {
+/// Checks that `[start, end)` (rounded out to pages) lies inside the user address range and
+/// outside every driver-reserved range, returning `(first_page, byte_size)`.
+fn align_span(start: u64, end: u64) -> Result<(u64, u64)> {
     let mask = mmu::UAT_PGMSK as u64;
     if end <= start {
         return Err(EINVAL);
@@ -428,17 +690,86 @@ pub(crate) fn cover(vm: &mmu::Vm, start: u64, end: u64, read: bool, write: bool)
     if first < range.start || last > range.end {
         return Err(EINVAL);
     }
-    if vm.covers_range(first, last - first, read, write) {
+    Ok((first, last - first))
+}
+
+/// Checks that `[start, end)` (rounded out to pages) is user memory mapped with the requested
+/// GPU access: a driver range ENOENT, outside the user range EINVAL, an unmapped page ENOENT, a
+/// page without the access EACCES.
+pub(crate) fn cover(vm: &mmu::Vm, start: u64, end: u64, read: bool, write: bool) -> Result {
+    let (first, size) = align_span(start, end)?;
+    if vm.covers_range(first, size, read, write) {
         Ok(())
-    } else if vm.covers_range(first, last - first, false, false) {
+    } else if vm.covers_range(first, size, false, false) {
         Err(EACCES)
     } else {
         Err(ENOENT)
     }
 }
 
+/// Batches page-aligned GPUVM coverage checks under one `gpuvm.lock_inner()` hold while
+/// preserving exact per-span `ENOENT` / `EACCES` / `EINVAL` error reporting on failure.
+struct SpanBatch {
+    ranges: [(u64, u64, u8); 48],
+    len: usize,
+}
+
+impl SpanBatch {
+    const fn new() -> Self {
+        Self {
+            ranges: [(0, 0, 0); 48],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, vm: &mmu::Vm, start: u64, end: u64, read: bool, write: bool) -> Result {
+        let (first, size) = align_span(start, end)?;
+        let access = u8::from(read) | (u8::from(write) << 1);
+        if self.ranges[..self.len]
+            .iter()
+            .any(|&(a, s, acc)| a == first && s == size && (acc & access) == access)
+        {
+            return Ok(());
+        }
+        if self.len == self.ranges.len() {
+            self.flush(vm)?;
+        }
+        self.ranges[self.len] = (first, size, access);
+        self.len += 1;
+        Ok(())
+    }
+
+    fn flush(&mut self, vm: &mmu::Vm) -> Result {
+        let n = self.len;
+        if n == 0 {
+            return Ok(());
+        }
+        self.len = 0;
+        if vm.covers_ranges_batch(&self.ranges[..n]).0 {
+            return Ok(());
+        }
+        for &(first, size, access) in &self.ranges[..n] {
+            let read = access & 1 != 0;
+            let write = access & 2 != 0;
+            if !vm.covers_range(first, size, read, write) {
+                return if vm.covers_range(first, size, false, false) {
+                    Err(EACCES)
+                } else {
+                    Err(ENOENT)
+                };
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Attachment spans, 128-byte granular, actually mapped with `write` or read access.
-fn check_attachments(vm: &mmu::Vm, list: &[uapi::drm_asahi_attachment], write: bool) -> Result {
+fn check_attachments(
+    batch: &mut SpanBatch,
+    vm: &mmu::Vm,
+    list: &[uapi::drm_asahi_attachment],
+    write: bool,
+) -> Result {
     for attachment in list {
         let end = attachment
             .pointer
@@ -452,7 +783,7 @@ fn check_attachments(vm: &mmu::Vm, list: &[uapi::drm_asahi_attachment], write: b
         if (last - first) / 128 > u64::from(u32::MAX) {
             return Err(EINVAL);
         }
-        cover(vm, first, last, true, write)?;
+        batch.push(vm, first, last, true, write)?;
     }
     Ok(())
 }
@@ -481,27 +812,42 @@ fn compact(gva: u64) -> bool {
     (0x1000000000..0x9000000000).contains(&gva)
 }
 
-/// Validate uncompressed Z/S register state and coverage through each layer base.
-/// This is a minimum span check, not a complete plane-extent validation: the UAPI
-/// does not describe the complete ZLS surface layout. The encoded stride is a
-/// register word, not a byte distance (the C HAL200 contract).
+/// Validate Z/S register state (including compressed metadata) and coverage through each layer
+/// base. This is a minimum span check, not a complete plane-extent validation: the UAPI does
+/// not describe the complete ZLS surface layout. The encoded stride is a register word, not a
+/// byte distance (the C HAL200 contract).
 fn check_zls_plane(
+    batch: &mut SpanBatch,
     context: &Context<'_>,
     cmd: &uapi::drm_asahi_cmd_render,
     stencil: bool,
 ) -> Result {
-    let (z, mask) = if stencil {
-        (&cmd.stencil, (1u64 << 3) | (1 << 7) | (1 << 14) | (1 << 18))
+    let (z, mask, comp_mask) = if stencil {
+        (
+            &cmd.stencil,
+            (1u64 << 3) | (1 << 4) | (1 << 7) | (1 << 8) | (1 << 14) | (1 << 18),
+            (1u64 << 4) | (1 << 8),
+        )
     } else {
         (
             &cmd.depth,
-            (1u64 << 1) | (1 << 5) | (1 << 15) | (1 << 19) | (3 << 25),
+            (1u64 << 1) | (1 << 2) | (1 << 5) | (1 << 6) | (1 << 15) | (1 << 19) | (3 << 25),
+            (1u64 << 2) | (1 << 6),
         )
     };
-    if (z.base == 0 && (z.stride != 0 || cmd.zls_ctrl & mask != 0))
+    let compressed = cmd.zls_ctrl & comp_mask != 0;
+    if (z.base == 0
+        && (z.stride != 0
+            || z.comp_base != 0
+            || z.comp_stride != 0
+            || cmd.zls_ctrl & mask != 0))
         || (z.base != 0 && cmd.layers > 1 && z.stride == 0)
         || (z.stride != 0 && z.stride & 0x3fff != 1)
         || z.base & 3 != 0
+        || (z.comp_base == 0 && z.comp_stride != 0)
+        || (z.comp_base != 0) != compressed
+        || z.comp_base & 3 != 0
+        || z.comp_stride & 0x3fff != 0
     {
         return Err(EINVAL);
     }
@@ -511,10 +857,24 @@ fn check_zls_plane(
             .checked_mul(u64::from(cmd.layers - 1))
             .and_then(|bytes| bytes.checked_add(1))
             .ok_or(EINVAL)?;
-        cover(
+        batch.push(
             context.vm,
             z.base,
             z.base.checked_add(minimum).ok_or(EINVAL)?,
+            true,
+            true,
+        )?;
+    }
+    if z.comp_base != 0 {
+        let distance = (u64::from(z.comp_stride >> 14) + 1) * ZLS_METADATA_STRIDE;
+        let minimum = distance
+            .checked_mul(u64::from(cmd.layers - 1))
+            .and_then(|bytes| bytes.checked_add(1))
+            .ok_or(EINVAL)?;
+        batch.push(
+            context.vm,
+            z.comp_base,
+            z.comp_base.checked_add(minimum).ok_or(EINVAL)?,
             true,
             true,
         )?;
@@ -528,15 +888,22 @@ fn check_zls_plane(
     Ok(())
 }
 
-/// Per-command render admission.
-fn check_render(context: &Context<'_>, cmd: &uapi::drm_asahi_cmd_render) -> Result {
+/// Per-command render admission. Pushes VM spans into `batch` so a multi-pass SUBMIT flushes
+/// coverage once across all passes.
+fn check_render(
+    batch: &mut SpanBatch,
+    context: &Context<'_>,
+    cmd: &uapi::drm_asahi_cmd_render,
+    vertex: &[uapi::drm_asahi_attachment],
+    fragment: &[uapi::drm_asahi_attachment],
+) -> Result {
     check_render_helpers(cmd)?;
     let vm = context.vm;
     let allowed = PROCESS_EMPTY_TILES
         | RSRC_SPEC_HI
         | DBIAS_IS_INT
         | if super::params::early_tiling() {
-            FRAGMENT_BARRIERS
+            FRAGMENT_BARRIERS | STAGE_PREFIXES
         } else {
             0
         };
@@ -555,20 +922,15 @@ fn check_render(context: &Context<'_>, cmd: &uapi::drm_asahi_cmd_render) -> Resu
         || cmd.sampler_heap != 0
         || cmd.sampler_count != 0
         || cmd.ppp_ctrl & !0x203 != 0
-        || cmd.zls_ctrl & !0x00000000060cc0aa != 0
+        || cmd.zls_ctrl & !0x00000000060cc1fe != 0
         || cmd.isp_zls_pixels & 0xc0000000 != 0
         || !matches!((cmd.zls_ctrl >> 25) & 3, 0 | 2)
         || ((cmd.zls_ctrl >> 1) & 1) != ((cmd.zls_ctrl >> 5) & 1)
+        || ((cmd.zls_ctrl >> 2) & 1) != ((cmd.zls_ctrl >> 6) & 1)
         || ((cmd.zls_ctrl >> 3) & 1) != ((cmd.zls_ctrl >> 7) & 1)
+        || ((cmd.zls_ctrl >> 4) & 1) != ((cmd.zls_ctrl >> 8) & 1)
     {
         return Err(EINVAL);
-    }
-    if cmd.stencil.comp_base != 0
-        || cmd.stencil.comp_stride != 0
-        || cmd.depth.comp_base != 0
-        || cmd.depth.comp_stride != 0
-    {
-        return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
     }
     // VDM: compact-addressable and readable; scissor: four-byte aligned.
     let vdm = cmd.vdm_ctrl_stream_base;
@@ -576,9 +938,8 @@ fn check_render(context: &Context<'_>, cmd: &uapi::drm_asahi_cmd_render) -> Resu
     if vdm & 3 != 0 || !compact(vdm) || scissor == 0 || scissor & 3 != 0 {
         return Err(EINVAL);
     }
-    cover(vm, vdm, vdm + 4, true, false)?;
-    gate::vdm(vm, vdm)?;
-    cover(
+    batch.push(vm, vdm, vdm + 4, true, false)?;
+    batch.push(
         vm,
         scissor,
         scissor.checked_add(4).ok_or(EINVAL)?,
@@ -590,7 +951,7 @@ fn check_render(context: &Context<'_>, cmd: &uapi::drm_asahi_cmd_render) -> Resu
         if base & 3 != 0 {
             return Err(EINVAL);
         }
-        cover(vm, base, base.checked_add(4).ok_or(EINVAL)?, true, false)?;
+        batch.push(vm, base, base.checked_add(4).ok_or(EINVAL)?, true, false)?;
     } else if cmd.flags & DBIAS_IS_INT != 0 {
         return Err(EINVAL);
     }
@@ -599,7 +960,7 @@ fn check_render(context: &Context<'_>, cmd: &uapi::drm_asahi_cmd_render) -> Resu
             return Err(EINVAL);
         }
         let base = cmd.isp_oclqry_base;
-        cover(vm, base, base.checked_add(8).ok_or(EINVAL)?, true, true)?;
+        batch.push(vm, base, base.checked_add(8).ok_or(EINVAL)?, true, true)?;
     }
     for program in [&cmd.bg, &cmd.eot, &cmd.partial_bg, &cmd.partial_eot] {
         if program.usc == 0 {
@@ -609,7 +970,7 @@ fn check_render(context: &Context<'_>, cmd: &uapi::drm_asahi_cmd_render) -> Resu
             .usc_base
             .checked_add(u64::from(program.usc & !63))
             .ok_or(EINVAL)?;
-        cover(
+        batch.push(
             vm,
             address,
             address.checked_add(64).ok_or(EINVAL)?,
@@ -617,13 +978,16 @@ fn check_render(context: &Context<'_>, cmd: &uapi::drm_asahi_cmd_render) -> Resu
             false,
         )?;
     }
-    check_zls_plane(context, cmd, false)?;
-    check_zls_plane(context, cmd, true)?;
+    check_zls_plane(batch, context, cmd, false)?;
+    check_zls_plane(batch, context, cmd, true)?;
+    check_attachments(batch, vm, vertex, true)?;
+    check_attachments(batch, vm, fragment, true)?;
     Ok(())
 }
 
 /// Per-command compute admission.
 fn check_compute(
+    batch: &mut SpanBatch,
     context: &Context<'_>,
     cmd: &uapi::drm_asahi_cmd_compute,
     attachments: &[uapi::drm_asahi_attachment],
@@ -641,9 +1005,10 @@ fn check_compute(
     {
         return Err(EINVAL);
     }
-    cover(vm, base, end, true, false)?;
-    gate::cdm(vm, context.usc_base, base, end)?;
-    check_attachments(vm, attachments, true)
+    batch.push(vm, base, end, true, false)?;
+    check_attachments(batch, vm, attachments, true)?;
+    batch.flush(vm)?;
+    gate::cdm(vm, context.usc_base, base, end)
 }
 
 /// Resolves timestamps and exact historical-prefix dependencies of a valid stream
@@ -654,48 +1019,41 @@ pub(crate) fn prepare<'a>(
     accepted: [u64; 2],
     objects: Pin<&xarray::XArray<KBox<file::Object>>>,
 ) -> Result<Prepared<'a>> {
-    let mut resolved = KVec::new();
-    for entry in stream(bytes) {
-        let entry = entry?;
-        let outputs = match entry.kind {
-            CMD_RENDER => {
-                let packet: uapi::drm_asahi_cmd_render = payload(entry.payload)?;
-                let cmd = &packet;
-                crate::timestamp::Destinations::resolve_aligned(
-                    objects,
-                    &[cmd.ts_vtx, cmd.ts_frag],
-                )?
-            }
-            CMD_COMPUTE => {
-                let packet: uapi::drm_asahi_cmd_compute = payload(entry.payload)?;
-                let cmd = &packet;
-                crate::timestamp::Destinations::resolve_aligned(objects, &[cmd.ts])?
-            }
-            _ => continue,
-        };
-        resolved.push(outputs, GFP_KERNEL)?;
-    }
-
-    // Historical priors and header barriers.
+    let mut resolved = Resolved::new();
+    let mut orders = Orders::new();
     let mut preceding = [0u16; 2];
-    let mut orders = KVec::with_capacity(resolved.len(), GFP_KERNEL)?;
     for entry in stream(bytes) {
         let entry = entry?;
-        let (engine, prior) = match entry.kind {
+        let (outputs, engine, prior, prefixes) = match entry.kind {
             CMD_RENDER => {
-                let packet: uapi::drm_asahi_cmd_render = payload(entry.payload)?;
-                (RENDER, [packet.prior_vdm, packet.prior_cdm])
+                let (packet, prefixes) = render_payload(entry.payload)?;
+                let outputs = crate::timestamp::Destinations::resolve_aligned(
+                    objects,
+                    &[packet.ts_vtx, packet.ts_frag],
+                )?;
+                (outputs, RENDER, [packet.prior_vdm, packet.prior_cdm], prefixes)
             }
             CMD_COMPUTE => {
                 let packet: uapi::drm_asahi_cmd_compute = payload(entry.payload)?;
-                (COMPUTE, [packet.prior_vdm, packet.prior_cdm])
+                let outputs =
+                    crate::timestamp::Destinations::resolve_aligned(objects, &[packet.ts])?;
+                (outputs, COMPUTE, [packet.prior_vdm, packet.prior_cdm], None)
             }
             _ => continue,
         };
-        orders.push(
-            Order::new(accepted, preceding, entry.barriers, prior, engine)?,
-            GFP_KERNEL,
-        )?;
+        resolved.push(outputs)?;
+        let mut order = Order::new(accepted, preceding, entry.barriers, prior, engine)?;
+        if let Some(prefixes) = prefixes {
+            let tiling = Order::new(
+                accepted,
+                preceding,
+                [prefixes.ta_vdm_barrier, prefixes.ta_cdm_barrier],
+                [prefixes.ta_prior_vdm, prefixes.ta_prior_cdm],
+                RENDER,
+            )?;
+            order.narrow_tiling(&tiling)?;
+        }
+        orders.push(order)?;
         preceding[engine] += 1;
     }
 
@@ -713,15 +1071,19 @@ impl Prepared<'_> {
     pub(crate) fn validate(self, context: &Context<'_>) -> Result<Submission> {
         let Prepared {
             bytes,
-            resolved,
+            mut resolved,
             orders,
             counts,
         } = self;
-        let mut commands = KVec::with_capacity(resolved.len(), GFP_KERNEL)?;
+        let mut commands = Commands::new();
         let mut vertex = KVec::new();
         let mut fragment = KVec::new();
         let mut compute = KVec::new();
-        let mut resolved = resolved.into_iter();
+        let mut batch = SpanBatch::new();
+        let mut vdm_vas = [0u64; MAX_COMMANDS as usize];
+        let mut vdm_count = 0usize;
+        let mut rem_renders = counts[RENDER];
+        let mut rem_computes = counts[COMPUTE];
         for entry in stream(bytes) {
             let entry = entry?;
             match entry.kind {
@@ -729,42 +1091,51 @@ impl Prepared<'_> {
                 SET_FRAGMENT_ATTACHMENTS => fragment = attachment_list(entry.payload)?,
                 SET_COMPUTE_ATTACHMENTS => compute = attachment_list(entry.payload)?,
                 CMD_RENDER => {
-                    let packet: uapi::drm_asahi_cmd_render = payload(entry.payload)?;
+                    let (packet, _) = render_payload(entry.payload)?;
                     let cmd = &packet;
                     let outputs = resolved.next().ok_or(EINVAL)?;
-                    check_render(context, cmd)?;
-                    check_attachments(context.vm, &vertex, true)?;
-                    check_attachments(context.vm, &fragment, true)?;
-                    commands.push(
-                        Command::Render(KBox::new(
-                            RenderCommand {
-                                cmd: *cmd,
-                                timestamp_outputs: outputs,
-                                vertex_attachments: copy_list(&[&vertex])?,
-                                fragment_attachments: copy_list(&[&fragment])?,
-                            },
-                            GFP_KERNEL,
-                        )?),
+                    check_render(&mut batch, context, cmd, &vertex, &fragment)?;
+                    if vdm_count >= vdm_vas.len() {
+                        return Err(EINVAL);
+                    }
+                    vdm_vas[vdm_count] = cmd.vdm_ctrl_stream_base;
+                    vdm_count += 1;
+                    rem_renders = rem_renders.checked_sub(1).ok_or(EINVAL)?;
+                    let (vertex_attachments, fragment_attachments) = if rem_renders == 0 {
+                        (core::mem::take(&mut vertex), core::mem::take(&mut fragment))
+                    } else {
+                        (copy_list(&[&vertex])?, copy_list(&[&fragment])?)
+                    };
+                    commands.push(Command::Render(KBox::new(
+                        RenderCommand {
+                            cmd: *cmd,
+                            timestamp_outputs: outputs,
+                            vertex_attachments,
+                            fragment_attachments,
+                        },
                         GFP_KERNEL,
-                    )?;
+                    )?))?;
                 }
                 CMD_COMPUTE => {
                     let packet: uapi::drm_asahi_cmd_compute = payload(entry.payload)?;
                     let cmd = &packet;
-                    check_compute(context, cmd, &compute)?;
+                    check_compute(&mut batch, context, cmd, &compute)?;
                     let outputs = resolved.next().ok_or(EINVAL)?;
-                    commands.push(
-                        Command::Compute(KBox::new(
-                            ComputeCommand {
-                                cmd: *cmd,
-                                attachments: copy_list(&[&compute])?,
-                                timestamp_outputs: outputs,
-                                query_access: cmd.flags & COMPUTE_NO_QUERY_ACCESS == 0,
-                            },
-                            GFP_KERNEL,
-                        )?),
+                    rem_computes = rem_computes.checked_sub(1).ok_or(EINVAL)?;
+                    let attachments = if rem_computes == 0 {
+                        core::mem::take(&mut compute)
+                    } else {
+                        copy_list(&[&compute])?
+                    };
+                    commands.push(Command::Compute(KBox::new(
+                        ComputeCommand {
+                            cmd: *cmd,
+                            attachments,
+                            timestamp_outputs: outputs,
+                            query_access: cmd.flags & COMPUTE_NO_QUERY_ACCESS == 0,
+                        },
                         GFP_KERNEL,
-                    )?;
+                    )?))?;
                 }
                 _ => return Err(EINVAL),
             }
@@ -772,6 +1143,8 @@ impl Prepared<'_> {
         if commands.is_empty() {
             return Err(EINVAL);
         }
+        batch.flush(context.vm)?;
+        gate::vdm_batch(context.vm, &vdm_vas[..vdm_count])?;
         Ok(Submission {
             counts,
             commands,

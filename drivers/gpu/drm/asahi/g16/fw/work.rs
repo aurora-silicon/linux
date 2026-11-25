@@ -65,6 +65,11 @@ pub(crate) mod compute;
 /// TA work image and microsequence.
 pub(crate) mod ta {
     pub(crate) const WORK_SIZE: usize = 0x940;
+    /// Active non-zero head (`0..HEAD_ACTIVE_SIZE`) and tail (`TAIL_ACTIVE_START..WORK_SIZE`)
+    /// spans of a TA work image. The intervening zero gap is cleared on full scrubs and skipped
+    /// on clean same-VM reuse.
+    pub(crate) const HEAD_ACTIVE_SIZE: usize = 0x360;
+    pub(crate) const TAIL_ACTIVE_START: usize = 0x740;
     pub(crate) const SEQ_SIZE: usize = 0x300;
     pub(crate) const SEQ_OBJECT: usize = 0x1000;
     pub(crate) const REGS: usize = 0x40;
@@ -107,6 +112,9 @@ pub(crate) mod ta {
             && l.auxiliary + 8 <= WORK_SIZE
     }
     const _: () = assert!(valid(&V25G83) && valid(&V26B123));
+    const _: () = assert!(REGS + SEL.len() * super::REG_RECORD <= HEAD_ACTIVE_SIZE);
+    const _: () = assert!(HEAD_ACTIVE_SIZE <= TAIL_ACTIVE_START);
+    const _: () = assert!(TAIL_ACTIVE_START <= WORK_SIZE);
     pub(crate) const SEL: [u32; 66] = [
         0x1748, 0x10141, 0x1c039, 0x1c9c8, 0x1c0a1, 0x1c031, 0x1c9c0, 0x1c051, 0x1c061, 0x10149,
         0x10139, 0x10111, 0x1c9b0, 0x10119, 0x1c9b8, 0x1c958, 0x1c950, 0x1c930, 0x1c880, 0x1c079,
@@ -121,6 +129,11 @@ pub(crate) mod ta {
 /// FS work image and microsequence.
 pub(crate) mod fs {
     pub(crate) const WORK_SIZE: usize = 0xca0;
+    /// Active non-zero head (`0..HEAD_ACTIVE_SIZE`) and tail (`TAIL_ACTIVE_START..WORK_SIZE`)
+    /// spans of an FS work image. The intervening zero gap is cleared on full scrubs and skipped
+    /// on clean same-VM reuse.
+    pub(crate) const HEAD_ACTIVE_SIZE: usize = 0x460;
+    pub(crate) const TAIL_ACTIVE_START: usize = 0x780;
     pub(crate) const SEQ_SIZE: usize = 0x380;
     pub(crate) const SEQ_OBJECT: usize = 0x1000;
     pub(crate) const REGS: usize = 0x80;
@@ -166,6 +179,9 @@ pub(crate) mod fs {
             && l.flag < WORK_SIZE
     }
     const _: () = assert!(valid(&V25G83) && valid(&V26B123));
+    const _: () = assert!(REGS + SEL.len() * super::REG_RECORD <= HEAD_ACTIVE_SIZE);
+    const _: () = assert!(HEAD_ACTIVE_SIZE <= TAIL_ACTIVE_START);
+    const _: () = assert!(TAIL_ACTIVE_START <= WORK_SIZE);
     pub(crate) const SEL: [u32; 82] = [
         0x1739, 0x10009, 0x15379, 0x15381, 0x15369, 0x15371, 0x15131, 0x15139, 0x100a1, 0x15069,
         0x15071, 0x16058, 0x10019, 0x100b1, 0x16030, 0x100d9, 0xa301, 0x10791, 0x16098, 0x15109,

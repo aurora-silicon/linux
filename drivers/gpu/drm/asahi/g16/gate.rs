@@ -62,15 +62,13 @@ impl Window {
     /// unless the record crosses it). Unreadable memory: EFAULT.
     fn words(&mut self, vm: &mmu::Vm, va: u64, count: usize) -> Result<[u32; 10]> {
         let n = count.checked_mul(4).filter(|&n| n <= 40).ok_or(EINVAL)?;
-        cover(vm, va, va.checked_add(n as u64).ok_or(EINVAL)?, true, false)?;
-        let cached = self.len != 0
-            && va >= self.va
-            && va
-                .checked_add(n as u64)
-                .is_some_and(|end| end <= self.va + self.len as u64);
+        let end = va.checked_add(n as u64).ok_or(EINVAL)?;
+        let cached = self.len != 0 && va >= self.va && end <= self.va + self.len as u64;
         if !cached {
             let in_page = mmu::UAT_PGSZ - (va as usize & mmu::UAT_PGMSK);
             let len = n.max(self.bytes.len().min(in_page));
+            let cover_end = va.checked_add(len as u64).ok_or(EINVAL)?;
+            cover(vm, va, cover_end, true, false)?;
             self.len = 0;
             vm.read_user(va, &mut self.bytes[..len])
                 .map_err(|_| EFAULT)?;
@@ -105,17 +103,36 @@ fn program(vm: &mmu::Vm, usc: u64, address: u64, checked: &mut Option<u64>) -> R
     Ok(())
 }
 
-/// VDM admission: a normal root stream opens with the G16 barrier, with or
-/// without the USC cache invalidate.
-pub(crate) fn vdm(vm: &mmu::Vm, va: u64) -> Result {
-    if !params::stream_gate() {
+/// VDM admission for a batch of root streams under a single VM read lock, caching up to
+/// 256 intra-page bytes across adjacent VDM roots (for example in a multi-pass render SUBMIT).
+/// Each normal root stream opens with the G16 barrier, with or without the USC cache
+/// invalidate.
+pub(crate) fn vdm_batch(vm: &mmu::Vm, vas: &[u64]) -> Result {
+    if vas.is_empty() || !params::stream_gate() {
         return Ok(());
     }
-    let mut bytes = [0u8; 4];
-    vm.read_user(va, &mut bytes).map_err(|_| EFAULT)?;
-    let word = u32::from_le_bytes(bytes);
-    if word & !VDM_ROOT_USC_INVAL != VDM_ROOT {
-        return Err(reject("VDM root", va, &[word]));
+    let mut guard = vm.read_lock().map_err(|_| EFAULT)?;
+    let mut win_va = 0u64;
+    let mut win_len = 0usize;
+    let mut buf = [0u8; 256];
+    for &va in vas {
+        let end = va.checked_add(4).ok_or(EINVAL)?;
+        let cached = win_len != 0 && va >= win_va && end <= win_va + win_len as u64;
+        if !cached {
+            let in_page = mmu::UAT_PGSZ - (va as usize & mmu::UAT_PGMSK);
+            let len = buf.len().min(in_page);
+            if len < 4 {
+                return Err(EINVAL);
+            }
+            guard.read_user(va, &mut buf[..len]).map_err(|_| EFAULT)?;
+            win_va = va;
+            win_len = len;
+        }
+        let off = (va - win_va) as usize;
+        let word = u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
+        if word & !VDM_ROOT_USC_INVAL != VDM_ROOT {
+            return Err(reject("VDM root", va, &[word]));
+        }
     }
     Ok(())
 }

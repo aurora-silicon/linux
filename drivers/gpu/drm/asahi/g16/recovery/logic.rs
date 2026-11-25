@@ -123,15 +123,50 @@ impl SnapshotEntry {
     }
 }
 
-/// A late snapshot can name the last complete receipt even after its flight was removed.
-pub(crate) fn last_retired_target(last: &[Option<u32>; 3], event: u32, target: u32) -> bool {
-    let index = match event {
-        15 => 0,
-        0x70 => 1,
-        0x71 => 2,
-        _ => return false,
-    };
-    last[index] == Some(target)
+/// Bounded per-stage history of recently retired firmware stamps.
+pub(crate) const RETIRED_STAMPS_CAP: usize = 64;
+
+/// Bounded per-stage ring of recently retired compute/TA/FS firmware stamps so a late
+/// recovery snapshot arriving after pipelined retirement resolves any recently retired
+/// member, not only the single newest flight.
+#[derive(Clone, Debug)]
+pub(crate) struct RetiredStamps {
+    stamps: [[u32; RETIRED_STAMPS_CAP]; 3],
+    len: [u8; 3],
+    next: [u8; 3],
+}
+
+impl RetiredStamps {
+    pub(crate) const fn new() -> Self {
+        Self {
+            stamps: [[0; RETIRED_STAMPS_CAP]; 3],
+            len: [0; 3],
+            next: [0; 3],
+        }
+    }
+
+    pub(crate) fn push(&mut self, stage: usize, target: u32) {
+        if stage >= 3 {
+            return;
+        }
+        let idx = self.next[stage] as usize;
+        self.stamps[stage][idx] = target;
+        self.next[stage] = ((idx + 1) % RETIRED_STAMPS_CAP) as u8;
+        if (self.len[stage] as usize) < RETIRED_STAMPS_CAP {
+            self.len[stage] += 1;
+        }
+    }
+
+    pub(crate) fn contains(&self, event: u32, target: u32) -> bool {
+        let stage = match event {
+            15 => 0,
+            0x70 => 1,
+            0x71 => 2,
+            _ => return false,
+        };
+        let len = self.len[stage] as usize;
+        self.stamps[stage][..len].contains(&target)
+    }
 }
 
 pub(crate) const fn expired(now: u64, deadline: u64) -> bool {
@@ -176,17 +211,25 @@ mod tests {
 
     #[test]
     fn late_snapshot_requires_exact_stage_target_and_real_full_receipt() {
-        assert!(!last_retired_target(&[None; 3], 0x70, 0));
-        let last = [Some(0x100), Some(0), Some(0x200)];
+        let mut retired = RetiredStamps::new();
+        assert!(!retired.contains(0x70, 0));
+        retired.push(0, 0x100);
+        retired.push(1, 0);
+        retired.push(2, 0x200);
         for (event, target) in [(15, 0x100), (0x70, 0), (0x71, 0x200)] {
-            assert!(last_retired_target(&last, event, target));
-            assert!(!last_retired_target(
-                &last,
-                event,
-                target.wrapping_add(0x100)
-            ));
+            assert!(retired.contains(event, target));
+            assert!(!retired.contains(event, target.wrapping_add(0x100)));
         }
-        assert!(!last_retired_target(&last, 0x72, 0));
+        assert!(!retired.contains(0x72, 0));
+        // Pipelined bursts retain all recent stamps up to RETIRED_STAMPS_CAP and evict oldest.
+        let mut ring = RetiredStamps::new();
+        for i in 0..(RETIRED_STAMPS_CAP as u32 + 4) {
+            ring.push(0, (i + 1) << 8);
+        }
+        assert!(!ring.contains(15, 0x100));
+        assert!(!ring.contains(15, 0x400));
+        assert!(ring.contains(15, 0x500));
+        assert!(ring.contains(15, (RETIRED_STAMPS_CAP as u32 + 4) << 8));
     }
 
     #[test]
