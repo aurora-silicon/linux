@@ -72,6 +72,22 @@
 		reg = <0x3 0xa5060000 0x0 0x20000>;
 		interrupts = <AIC_IRQ 1259 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_sio>;
+		status = "disabled";
+	};
+
+	/*
+	 * ADT /arm-io/aes (aes,s8000, aes-version 5): the engine, shared control
+	 * and auxiliary control windows; DART-SIO mapper-aes is stream 1.
+	 */
+	aes: crypto@3a500c000 {
+		compatible = "apple,t8142-aes", "apple,aes";
+		reg = <0x3 0xa500c000 0x0 0x4000>,
+		      <0x3 0x882dc000 0x0 0x8000>,
+		      <0x3 0x88078000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 1246 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_aes>;
+		iommus = <&sio_dart 1>;
 		status = "disabled";
 	};
 
@@ -165,7 +181,6 @@
 		power-domains = <&ps_ane_sys>;
 		/* The firmware DVAs reach 0x100_xxxx_xxxx. */
 		apple,dma-range = <0x0 0x0 0x400 0x0>;
-		status = "disabled";
 	};
 
 	ane_dart1: iommu@421820000 {
@@ -176,7 +191,6 @@
 		interrupts = <AIC_IRQ 752 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_ane_sys>;
 		apple,dma-range = <0x0 0x0 0x400 0x0>;
-		status = "disabled";
 	};
 
 	ane_dart2: iommu@421840000 {
@@ -187,7 +201,6 @@
 		interrupts = <AIC_IRQ 752 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_ane_sys>;
 		apple,dma-range = <0x0 0x0 0x400 0x0>;
-		status = "disabled";
 	};
 
 	/*
@@ -196,6 +209,9 @@
 	 * boot loader hands the preload over as firmware-text and firmware-data.
 	 * PWGATE is the ADT's reg[2] (PMGR +0x24000) + 0x3640, measured under
 	 * macOS 27.2.1.
+	 * Every T8142 board has it (same ane/dart-ane in the J704, J813 and J815
+	 * ADTs), so it is on by default; the boot loader hands the preload over
+	 * by this compatible and disables the node when the ADT has none.
 	 */
 	ane: ane@420000000 {
 		compatible = "apple,t8142-ane";
@@ -214,7 +230,6 @@
 					     0x3807002e8 0x3807002eb
 					     0x38070c008 0x38070c00b
 					     0x582668000 0x582668003>;
-		status = "disabled";
 	};
 
 	scaler0_dart: iommu@305260000 {
@@ -227,7 +242,10 @@
 		status = "disabled";
 	};
 
-	/* ADT dart-jpeg: one DART for both engines, jpeg0 on SID 0, jpeg1 on SID 1. */
+	/*
+	 * ADT dart-jpeg: one DART for both engines, jpeg0 on SID 0, jpeg1 on SID 1.
+	 * The JPEG engines need no firmware and are on every T8142 board.
+	 */
 	jpeg_dart: iommu@301020000 {
 		compatible = "apple,t8142-dart", "apple,t8110-dart";
 		reg = <0x3 0x1020000 0x0 0xc000>;
@@ -236,7 +254,6 @@
 		/* ADT vm-base 0x100_0000_0000, vm-size 0x300_0000_0000 */
 		apple,dma-range = <0x100 0x0 0x300 0x0>;
 		power-domains = <&ps_jpg>;
-		status = "disabled";
 	};
 
 	/*
@@ -249,7 +266,6 @@
 		interrupts = <AIC_IRQ 1156 IRQ_TYPE_LEVEL_HIGH>;
 		iommus = <&jpeg_dart 0>;
 		power-domains = <&ps_jpg>;
-		status = "disabled";
 	};
 
 	jpeg1: jpeg@301060000 {
@@ -258,7 +274,6 @@
 		interrupts = <AIC_IRQ 1159 IRQ_TYPE_LEVEL_HIGH>;
 		iommus = <&jpeg_dart 1>;
 		power-domains = <&ps_jpg>;
-		status = "disabled";
 	};
 
 	apr_dart: iommu@3a1020000 {
@@ -586,7 +601,6 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "jpg";
-		status = "disabled";
 	};
 
 	/* ADT pmgr device SCODEC (id 336): the ProRes engine and its DART. */
@@ -598,6 +612,28 @@
 		label = "scodec";
 	};
 
+	/* ADT pmgr device SIO (id 66). Owned by the firmware that runs the SIO. */
+	ps_sio: power-controller@2b0 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2b0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "sio";
+		apple,firmware-owned;
+		status = "disabled";
+	};
+
+	/* ADT pmgr device AES (id 96), the SIO AES engine. */
+	ps_aes: power-controller@3a0 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3a0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "aes";
+		power-domains = <&ps_sio>;
+		status = "disabled";
+	};
+
 	/* ADT pmgr device ANE_SYS (id 73), parent AFISOCNI3 (no power state). */
 	ps_ane_sys: power-controller@2e8 {
 		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
@@ -605,7 +641,6 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "ane_sys";
-		status = "disabled";
 	};
 
 	ps_msr: power-controller@2a8 {
@@ -637,7 +672,6 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "venc_sys";
-		status = "disabled";
 	};
 
 	ps_venc_dma: power-controller@8000 {
@@ -647,7 +681,6 @@
 		#reset-cells = <0>;
 		label = "venc_dma";
 		power-domains = <&ps_venc_sys>;
-		status = "disabled";
 	};
 
 	ps_venc_pipe4: power-controller@8008 {
@@ -657,7 +690,6 @@
 		#reset-cells = <0>;
 		label = "venc_pipe4";
 		power-domains = <&ps_venc_dma>;
-		status = "disabled";
 	};
 
 	ps_venc_pipe5: power-controller@8010 {
@@ -667,7 +699,6 @@
 		#reset-cells = <0>;
 		label = "venc_pipe5";
 		power-domains = <&ps_venc_dma>;
-		status = "disabled";
 	};
 
 	ps_venc_me0: power-controller@8018 {
@@ -677,7 +708,6 @@
 		#reset-cells = <0>;
 		label = "venc_me0";
 		power-domains = <&ps_venc_dma>;
-		status = "disabled";
 	};
 
 	ps_venc_me1: power-controller@8020 {
@@ -687,7 +717,6 @@
 		#reset-cells = <0>;
 		label = "venc_me1";
 		power-domains = <&ps_venc_me0>;
-		status = "disabled";
 	};
 };
 
@@ -759,7 +788,9 @@
 	 * preloaded by iBoot and handed over by the boot loader, which adds the
 	 * memory regions. dart-ave is two DARTs (DART and CPUDART) on one IRQ;
 	 * stream 12 carries the temporal filter engines and must translate
-	 * through the encoder's domain, not bypass.
+	 * through the encoder's domain, not bypass. On by default (same ave and
+	 * dart-ave in the J704, J813 and J815 ADTs); the boot loader disables
+	 * the encoder when the ADT has no preload.
 	 */
 	ave_dart0: iommu@281080000 {
 		compatible = "apple,t8142-dart", "apple,t8110-dart";
@@ -768,7 +799,6 @@
 		power-domains = <&ps_venc_sys>;
 		#iommu-cells = <1>;
 		apple,dma-range = <0x100 0x00004000 0x0 0xffffc000>;
-		status = "disabled";
 	};
 
 	ave_dart1: iommu@2810a0000 {
@@ -778,7 +808,6 @@
 		power-domains = <&ps_venc_sys>;
 		#iommu-cells = <1>;
 		apple,dma-range = <0x100 0x00004000 0x0 0xffffc000>;
-		status = "disabled";
 	};
 
 	ave: video-codec@281100000 {
@@ -797,7 +826,6 @@
 		power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1";
 		iommus = <&ave_dart0 0>, <&ave_dart0 12>,
 			 <&ave_dart1 0>, <&ave_dart1 12>;
-		status = "disabled";
 	};
 
 	scaler0: scaler@305000000 {

@@ -539,8 +539,9 @@ EXPORT_SYMBOL_GPL(apple_mbox_ascwrap_v6_cpu_stopped);
 
 static bool apple_mbox_is_g17(const struct apple_mbox *mbox)
 {
-	return mbox->ascwrap_v6.role == APPLE_MBOX_ASCWRAP_V6_ROLE_GFX ||
-	       mbox->ascwrap_v6.role == APPLE_MBOX_ASCWRAP_V6_ROLE_GFX1;
+	return (!mbox->hw || !mbox->hw->is_ascwrap_v8) &&
+	       (mbox->ascwrap_v6.role == APPLE_MBOX_ASCWRAP_V6_ROLE_GFX ||
+		mbox->ascwrap_v6.role == APPLE_MBOX_ASCWRAP_V6_ROLE_GFX1);
 }
 int apple_mbox_ascwrap_v6_get_cpu_state(struct apple_mbox *mbox,
 				     u32 *control, u32 *status)
@@ -912,9 +913,9 @@ static int apple_mbox_poll_locked(struct apple_mbox *mbox)
 }
 
 /*
- * Threaded receive handler only: apply the consumer's minimum utilization to
- * this thread. As an RT thread it otherwise runs with the RT default, which
- * makes schedutil raise its CPU cluster to the top frequency on every message.
+ * Threaded receive handler only (woken on G17 budget saturation): apply the
+ * consumer's minimum utilization to this thread so flood throttling does not
+ * leave schedutil raising its CPU cluster to the top RT default frequency.
  */
 static void apple_mbox_apply_rx_util_min(struct apple_mbox *mbox)
 {
@@ -976,10 +977,6 @@ static irqreturn_t apple_mbox_recv_irq(int irq, void *data)
 	unsigned long flags;
 	int consumed = 0;
 
-	/* Only the G17 receive handler is threaded (see apple_mbox_probe()). */
-	if (apple_mbox_is_g17(mbox))
-		apple_mbox_apply_rx_util_min(mbox);
-
 	spin_lock_irqsave(&mbox->rx_lock, flags);
 	if (likely(!READ_ONCE(mbox->removing)))
 		consumed = apple_mbox_poll_locked(mbox);
@@ -987,13 +984,38 @@ static irqreturn_t apple_mbox_recv_irq(int irq, void *data)
 		apple_mbox_v8_rx_irq_guard(mbox, consumed);
 	spin_unlock_irqrestore(&mbox->rx_lock, flags);
 
-	/* G17 uses a oneshot threaded IRQ. Leave it masked during this sleep
-	 * so a firmware flood cannot monopolize a CPU at IRQ-thread priority.
-	 * The level condition retriggers after return; no message is discarded.
-	 */
-	if (apple_mbox_is_g17(mbox) && consumed == APPLE_G17_MBOX_RX_BUDGET)
-		usleep_range(1000, 2000);
+	return IRQ_HANDLED;
+}
 
+static irqreturn_t apple_mbox_g17_recv_irq(int irq, void *data)
+{
+	struct apple_mbox *mbox = data;
+	unsigned long flags;
+	int consumed = 0;
+
+	spin_lock_irqsave(&mbox->rx_lock, flags);
+	if (likely(!READ_ONCE(mbox->removing)))
+		consumed = apple_mbox_poll_locked(mbox);
+	spin_unlock_irqrestore(&mbox->rx_lock, flags);
+
+	/*
+	 * Normal completions drain completely in hard IRQ without waking the
+	 * IRQ thread. Only a saturated budget hands off to the oneshot thread
+	 * to sleep with the level line masked so a firmware flood cannot
+	 * monopolize a CPU.
+	 */
+	if (unlikely(consumed == APPLE_G17_MBOX_RX_BUDGET))
+		return IRQ_WAKE_THREAD;
+
+	return IRQ_HANDLED;
+}
+
+static irqreturn_t apple_mbox_g17_recv_thread(int irq, void *data)
+{
+	struct apple_mbox *mbox = data;
+
+	apple_mbox_apply_rx_util_min(mbox);
+	usleep_range(1000, 2000);
 	return IRQ_HANDLED;
 }
 
@@ -1339,14 +1361,14 @@ static void apple_mbox_quiesce(void *data)
 	pm_runtime_barrier(mbox->dev);
 }
 
-struct apple_mbox *apple_mbox_get(struct device *dev, int index)
+struct apple_mbox *apple_mbox_get_prop(struct device *dev, const char *prop, int index)
 {
 	struct of_phandle_args args;
 	struct platform_device *pdev;
 	struct apple_mbox *mbox;
 	int ret;
 
-	ret = of_parse_phandle_with_args(dev->of_node, "mboxes", "#mbox-cells",
+	ret = of_parse_phandle_with_args(dev->of_node, prop, "#mbox-cells",
 					 index, &args);
 	if (ret || !args.np)
 		return ERR_PTR(ret);
@@ -1372,6 +1394,12 @@ out_put_pdev:
 	put_device(&pdev->dev);
 
 	return mbox;
+}
+EXPORT_SYMBOL(apple_mbox_get_prop);
+
+struct apple_mbox *apple_mbox_get(struct device *dev, int index)
+{
+	return apple_mbox_get_prop(dev, "mboxes", index);
 }
 EXPORT_SYMBOL(apple_mbox_get);
 
@@ -1631,8 +1659,9 @@ static int apple_mbox_probe(struct platform_device *pdev)
 			return -ENOMEM;
 
 		if (apple_mbox_is_g17(mbox))
-			ret = devm_request_threaded_irq(dev, mbox->irq_recv_not_empty, NULL,
-							apple_mbox_recv_irq,
+			ret = devm_request_threaded_irq(dev, mbox->irq_recv_not_empty,
+							apple_mbox_g17_recv_irq,
+							apple_mbox_g17_recv_thread,
 							IRQF_ONESHOT | IRQF_NO_AUTOEN |
 							IRQF_NO_SUSPEND,
 							irqname, mbox);
@@ -1953,6 +1982,8 @@ static const struct apple_mbox_hw apple_mbox_t8152_smc_hw = {
 
 static const struct of_device_id apple_mbox_of_match[] = {
 	{ .compatible = "apple,t8152-smc-mailbox", .data = &apple_mbox_t8152_smc_hw },
+	/* The AOP's ASC wrapper mailbox has the SMC mailbox's counted FIFOs. */
+	{ .compatible = "apple,t8152-ascwrap-v8-mailbox", .data = &apple_mbox_t8152_smc_hw },
 	{ .compatible = "apple,t6031-agx-asc-mailbox", .data = &apple_mbox_asc_hw },
 	{ .compatible = "apple,t8122-agx-asc-mailbox", .data = &apple_mbox_asc_hw },
 	{ .compatible = "apple,t8152-gfx-ascwrap-v8", .data = &apple_mbox_t8152_gfx_ascwrap_v8_hw },

@@ -57,7 +57,10 @@ use kernel::{
         self,
         ASC_CPU_CONTROL, //
     },
-    str::CString,
+    str::{
+        BStr,
+        CString, //
+    },
     sync::{
         aref::ARef,
         atomic::{
@@ -216,6 +219,7 @@ const ALS_SENSOR_BLOB_LEN: usize = 193;
 const ALS_SENSOR_MESSAGE_LEN: usize = 216;
 
 mod aop_ring;
+mod aop_services;
 
 /// Index into the AFK endpoint tables for RTKit endpoint `ep`, if it is one
 /// of the endpoints this driver drives.
@@ -1307,10 +1311,11 @@ struct AopData {
     epic_v4: bool,
     /// Runs the service registrations one at a time; drained on removal.
     registration_queue: OwnedQueue,
-    /// Serializes queueing a registration with the start of removal, so that
-    /// nothing is queued once the queue drains. Never held across a drain.
+    /// The services that have a device, registered or queued. Taken to queue
+    /// a registration and by the start of removal, so that nothing is queued
+    /// once the queue drains. Never held across a drain.
     #[pin]
-    registration_gate: Mutex<()>,
+    registration_gate: Mutex<aop_services::Claims>,
     /// Set once by the first teardown; later teardowns return at once.
     removing: Atomic<bool>,
     /// Set when the transport starts closing; no call is started after it.
@@ -1432,11 +1437,13 @@ impl WorkItem for AopServiceRegisterWork {
         // transport, but nothing on that path takes this lock.
         let mut subdevices = this.data.subdevices.lock();
         if subdevices.reserve(1, GFP_KERNEL).is_err() {
+            drop(subdevices);
             dev_err!(
                 this.data.dev,
                 "Failed to allocate the device slot for service {:?}",
                 this.name
             );
+            this.data.registration_gate.lock().release(this.service);
             return;
         }
         // SAFETY: `info` is a valid, fully initialized `platform_device_info`
@@ -1445,12 +1452,14 @@ impl WorkItem for AopServiceRegisterWork {
         drop(fwnode);
         match pdev.and_then(|pdev| NonNull::new(pdev).ok_or(EINVAL)) {
             Err(e) => {
+                drop(subdevices);
                 dev_err!(
                     this.data.dev,
                     "Failed to create device for service {:?}: {:?}",
                     this.name,
                     e
                 );
+                this.data.registration_gate.lock().release(this.service);
             }
             Ok(pdev) => {
                 if let Err(child) = subdevices.push_within_capacity(ChildDevice(pdev)) {
@@ -1500,7 +1509,11 @@ impl AopData {
         order.extend_from_slice(default, GFP_KERNEL)?;
         Ok(order)
     }
-    fn new(dev: &platform::Device<Core<'_>>, cfg: &AopHwConfig) -> Result<Arc<AopData>> {
+    fn new(
+        dev: &platform::Device<Core<'_>>,
+        cfg: &AopHwConfig,
+        setup_port: bool,
+    ) -> Result<Arc<AopData>> {
         let sleep_endpoints = Self::endpoint_order(
             dev.as_ref(),
             c_str!("apple,sleep-endpoints"),
@@ -1512,18 +1525,19 @@ impl AopData {
             cfg.wake_endpoints,
         )?;
         let registration_queue = OwnedQueue::new_ordered(c_str!("apple-aop"))?;
-        let setup_queue = if cfg.setup_port {
+        let setup_queue = if setup_port {
             Some(OwnedQueue::new_ordered(c_str!("apple-aop-setup"))?)
         } else {
             None
         };
+        let claims = aop_services::Claims::new()?;
         Arc::pin_init(
             pin_init!(
                 AopData {
                     dev: dev.as_ref().into(),
                     epic_v4: cfg.epic_v4,
                     registration_queue,
-                    registration_gate <- new_mutex!(()),
+                    registration_gate <- new_mutex!(claims),
                     removing: Atomic::new(false),
                     transport_closing: Atomic::new(false),
                     cpu_started: Atomic::new(false),
@@ -1591,9 +1605,14 @@ impl AopData {
                     let mut init = ep_guard.start(rtk.as_mut());
                     if init == Err(ETIMEDOUT) {
                         // The mailbox stayed full for the whole send timeout,
-                        // so the request was never written. The firmware can
-                        // still be busy finishing its own boot: send it once
-                        // more, which checks the mailbox again first.
+                        // so the request was never written and a resend is
+                        // safe. The send already waits on the mailbox's
+                        // send-empty interrupt, and the firmware sends no
+                        // other event when it reads its inbound FIFO again.
+                        // Seen on a J616s warm boot with a slow firmware
+                        // start (#547); why the FIFO stays full after the
+                        // power handshake is open (#2344). Resend once,
+                        // logged, then fail the endpoint.
                         dev_warn!(
                             self.dev,
                             "Endpoint {:#04x}: AFK init not sent (mailbox full); retrying",
@@ -1640,29 +1659,41 @@ impl AopData {
             channel,
             endpoint: ep.index,
         };
-        let dev_name = match name {
-            b"aop-audio" => c_str!("audio"),
-            b"las" => c_str!("las"),
-            b"als" => c_str!("als"),
-            b"accel" => c_str!("accel"),
-            b"gyro" => c_str!("gyro"),
-            b"devmotion6" => c_str!("devmotion6"),
-            b"als-temp" => c_str!("als-temp"),
-            _ => {
-                return Ok(());
-            }
-        };
         // The child's probe calls back into the transport, so it runs from a
         // work item with the endpoint lock dropped. The gate orders queueing
         // it against removal, which drains the queue after setting the flag.
-        let gate = self.registration_gate.lock();
+        let mut claims = self.registration_gate.lock();
         if self.removing.load(Acquire) {
             return Ok(());
         }
-        let work = AopServiceRegisterWork::new(dev_name, self.clone(), svc)?;
-        self.registration_queue.enqueue(work);
-        drop(gate);
-        Ok(())
+        let dev_name = match claims.claim(svc, name) {
+            Ok(Some(dev_name)) => dev_name,
+            Ok(None) => return Ok(()),
+            Err(e) => {
+                // Counted and logged as the endpoint's other dropped
+                // messages are, with what the firmware announced.
+                ep.drop_message(
+                    &self.dev,
+                    fmt!(
+                        "service \"{}\" on channel {}: {:?} (its name or channel has a device)",
+                        BStr::from_bytes(name),
+                        channel,
+                        e
+                    ),
+                );
+                return Ok(());
+            }
+        };
+        match AopServiceRegisterWork::new(dev_name, self.clone(), svc) {
+            Ok(work) => {
+                self.registration_queue.enqueue(work);
+                Ok(())
+            }
+            Err(e) => {
+                claims.release(svc);
+                Err(e)
+            }
+        }
     }
 
     /// Hands a report to its listener; `Ok(false)` when there is none.
@@ -2113,6 +2144,14 @@ impl AopData {
             return Err(EINVAL);
         }
         Ok((phys, iova, size))
+    }
+
+    /// Whether the bootloader reserved any firmware `memory-region` for `dev`.
+    fn has_fw_regions(dev: &device::Device) -> bool {
+        // SAFETY: `dev` is a live device being probed.
+        let np = unsafe { (*dev.as_raw()).of_node };
+        // SAFETY: `np` is the device's node, valid while it is bound.
+        !np.is_null() && unsafe { bindings::of_reserved_mem_region_count(np) } > 0
     }
 
     /// Checks the firmware segments the AOP runs from DRAM (T6040). The
@@ -3025,6 +3064,22 @@ struct AopHwConfig {
     bootargs_word_access: bool,
     /// Halt the co-processor again when its start fails (T6040).
     halt_on_failed_start: bool,
+    /// The configuration to start with when the bootloader reserved no
+    /// firmware `memory-region` for a `fw_regions` block: the segments iBoot
+    /// left in DRAM are then neither reserved nor mapped, so it runs as its
+    /// fallback compatible's block did (T8122: `apple,t6020-aop`).
+    without_fw_regions: Option<&'static AopHwConfig>,
+}
+
+impl AopHwConfig {
+    /// The configuration to start the block with, given whether the
+    /// bootloader reserved its firmware regions.
+    fn for_regions(&'static self, has_fw_regions: bool) -> &'static AopHwConfig {
+        match self.without_fw_regions {
+            Some(alt) if self.fw_regions && !has_fw_regions => alt,
+            _ => self,
+        }
+    }
 }
 
 const HW_CFG_T8103: AopHwConfig = AopHwConfig {
@@ -3044,6 +3099,7 @@ const HW_CFG_T8103: AopHwConfig = AopHwConfig {
     fw_regions: false,
     bootargs_word_access: false,
     halt_on_failed_start: false,
+    without_fw_regions: None,
 };
 /// `nCal` keeps the firmware's own value, as on T6040: the J413 image carries 1,
 /// and with 0 the firmware never announces its accelerometer and gyroscope.
@@ -3064,6 +3120,7 @@ const HW_CFG_T8112: AopHwConfig = AopHwConfig {
     fw_regions: false,
     bootargs_word_access: false,
     halt_on_failed_start: false,
+    without_fw_regions: None,
 };
 /// `nCal` keeps the firmware's own value, as on T8112.
 const HW_CFG_T6000: AopHwConfig = AopHwConfig {
@@ -3083,6 +3140,7 @@ const HW_CFG_T6000: AopHwConfig = AopHwConfig {
     fw_regions: false,
     bootargs_word_access: false,
     halt_on_failed_start: false,
+    without_fw_regions: None,
 };
 const HW_CFG_T6020: AopHwConfig = AopHwConfig {
     ec0p: 0x0100_00000000,
@@ -3101,6 +3159,7 @@ const HW_CFG_T6020: AopHwConfig = AopHwConfig {
     fw_regions: false,
     bootargs_word_access: false,
     halt_on_failed_start: false,
+    without_fw_regions: None,
 };
 /// T6040 (J616s): the firmware's external code and log live in DRAM, mapped
 /// through the reserved regions the bootloader describes; the RTKit firmware
@@ -3124,11 +3183,20 @@ const HW_CFG_T6040: AopHwConfig = AopHwConfig {
     fw_regions: true,
     bootargs_word_access: true,
     halt_on_failed_start: true,
+    without_fw_regions: None,
 };
 /// T8132 (J713): as T6040. The bootloader hands the AOP over the same way, with
 /// the DART's DAPF programmed and its windows reserved alongside the firmware
 /// segments.
 const HW_CFG_T8132: AopHwConfig = HW_CFG_T6040;
+/// T8122 (M3): as T6040. iBoot leaves the AOP halted with its external code,
+/// data and log in DRAM, which the bootloader reserves in `memory-region`;
+/// the 27.2 firmware reads its `__EDATA` base from `ED0p`. A bootloader that
+/// reserves none leaves it to start as `apple,t6020-aop`, as before.
+const HW_CFG_T8122: AopHwConfig = AopHwConfig {
+    without_fw_regions: Some(&HW_CFG_T6020),
+    ..HW_CFG_T6040
+};
 /// T8140: the firmware is started with the boot arguments the bootloader
 /// left, boots through the setup port and speaks EPIC version 4. Of the
 /// advertised AFK endpoints, the application map is 0x20 misc, 0x21
@@ -3151,6 +3219,7 @@ const HW_CFG_T8140: AopHwConfig = AopHwConfig {
     fw_regions: false,
     bootargs_word_access: false,
     halt_on_failed_start: false,
+    without_fw_regions: None,
 };
 /// T8152: like T8140, but the setup port (mailbox 1 of the AOP bank, and the
 /// ADT aop-exclave-mailbox) is not reachable from the AP: both bus-error.
@@ -3171,6 +3240,7 @@ const HW_CFG_T8152: AopHwConfig = AopHwConfig {
     fw_regions: false,
     bootargs_word_access: false,
     halt_on_failed_start: false,
+    without_fw_regions: None,
 };
 
 /// T8142 (M5): booted through a setup port as on T8140, at the ADT's
@@ -3195,6 +3265,7 @@ const HW_CFG_T8142: AopHwConfig = AopHwConfig {
     fw_regions: false,
     bootargs_word_access: false,
     halt_on_failed_start: false,
+    without_fw_regions: None,
 };
 /// T6050 (M5 Pro and Max): booted as T8142, through the setup port at
 /// AOP ASC + 0x4007c000. Its EPMAP also names system endpoint 4, which never
@@ -3255,6 +3326,7 @@ kernel::of_device_table!(
         (of::DeviceId::new(c_str!("apple,t8103-aop")), &HW_CFG_T8103),
         (of::DeviceId::new(c_str!("apple,t8112-aop")), &HW_CFG_T8112),
         (of::DeviceId::new(c_str!("apple,t6000-aop")), &HW_CFG_T6000),
+        (of::DeviceId::new(c_str!("apple,t8122-aop")), &HW_CFG_T8122),
         (of::DeviceId::new(c_str!("apple,t6020-aop")), &HW_CFG_T6020),
         (of::DeviceId::new(c_str!("apple,t8140-aop")), &HW_CFG_T8140),
         (of::DeviceId::new(c_str!("apple,t6041-aop")), &HW_CFG_T6040),
@@ -3279,7 +3351,14 @@ impl platform::Driver for AopDriver {
         pdev: &'bound platform::Device<Core<'_>>,
         info: Option<&'bound Self::IdInfo>,
     ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
-        let cfg = info.ok_or(ENODEV)?;
+        let matched: &'static AopHwConfig = info.ok_or(ENODEV)?;
+        let cfg = matched.for_regions(AopData::has_fw_regions(pdev.as_ref()));
+        if !core::ptr::eq(cfg, matched) {
+            dev_info!(
+                pdev.as_ref(),
+                "No firmware memory-region from the bootloader: starting with the fallback compatible's configuration"
+            );
+        }
         if RETIRED.load(Acquire) {
             dev_err!(
                 pdev.as_ref(),
@@ -3303,7 +3382,14 @@ impl platform::Driver for AopDriver {
         } else {
             None
         };
-        let data = AopData::new(pdev, cfg)?;
+        // The setup-port boot opens the mailbox named "setup"; a device tree
+        // that gives the AOP no such mailbox gets the boot without it.
+        let setup_port = cfg.setup_port
+            && pdev.as_ref().fwnode().is_some_and(|node| {
+                node.property_match_string(c_str!("mbox-names"), c_str!("setup"))
+                    .is_ok()
+            });
+        let data = AopData::new(pdev, cfg, setup_port)?;
         // Whatever fails below leaves the AOP running and its children
         // registering; the same teardown as unbind's cleans that up.
         let probe_guard = ScopeGuard::new_with_data(data.clone(), |data| data.remove());
@@ -3329,12 +3415,12 @@ impl platform::Driver for AopDriver {
             rtkit::RtKit::<AopData>::new(pdev.as_ref(), None, 0, data.clone())?
         };
         data.rtkit.lock().as_mut().set(Some(rtkit));
-        if cfg.setup_port {
+        if setup_port {
             AopData::setup_open(&data, pdev.as_ref())?;
         }
         asc_mmio.update(ASC_CPU_CONTROL, |r| r.with_const_cpu_run::<1>());
         data.cpu_started.store(true, Release);
-        let started = if cfg.setup_port {
+        let started = if setup_port {
             // The RTKit handshake up to AP power on comes first, then the
             // setup port's own power state and endpoint buffers, and only
             // then the AFK endpoints.

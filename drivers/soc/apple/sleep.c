@@ -44,6 +44,7 @@
 #include <linux/cpu.h>
 #include <linux/cpumask.h>
 #include <linux/completion.h>
+#include <linux/cpuidle.h>
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/err.h>
@@ -140,6 +141,7 @@ struct aura_s2r_mailbox {
 #define WDT_WD2_COUNT		0x20
 #define WDT_WD2_ALARM		0x28
 #define WDT_WD2_CTL		0x2c
+#define WDT_WD2_CTL_IRQ_STATUS	BIT(1)
 #define WDT_TICKS_PER_S		24000000
 /* The sleep's own safety net: ADT /arm-io/wdt simple-reconfig-wdog-icc-time. */
 #define WDT_SLEEP_SECS		5
@@ -148,9 +150,10 @@ struct aura_s2r_mailbox {
 
 #define AON_AP_DEADLINE		0x08
 /*
- * T8142: a word of the watchdog's second page (/arm-io/wdt + 0x802c). macOS's entry
- * read-modify-writes it from 0 to 0x20 right before WD0's control and WD2 (26B131 trace,
- * 11.1 ms before the S2R timer); XNU writes 0x10 there during boot. Meaning unknown.
+ * Simple-reconfig WD2 routing word (bits 5:4: 01 = run-time cold reset, 10 = sleep-commit
+ * routing). Lives at wdt-aux + 0x2c on T6050 and aon-misc + 0x2c (/arm-io/wdt + 0x802c) on
+ * T8142; sleep saves it before commit (T6050 DT sequence writes 0x20, T8142 ORs 0x20) and
+ * restores the saved value on wake.
  */
 #define AON_WDT_SLEEP		0x2c
 
@@ -955,6 +958,7 @@ struct apple_sleep {
 	/* Per-attempt M5 ANS receipt; survives platform .wake reporting. */
 	int ans_m5_wake_error;
 	int pcie_ans_on_ret;
+	int apcie_port_clk_ret[2];
 	void __iomem *apcie_axi;
 	void __iomem *apcie_cio3pll;
 	void __iomem *apcie_clkgen;
@@ -965,6 +969,10 @@ struct apple_sleep {
 	bool apcie_port_down;
 	void __iomem *apcie_port;
 	void __iomem *apcie_port_phy;
+	/* Ports no host sets up again after a real sleep: no managed radio contract */
+	bool apcie_ports_unowned;
+	void __iomem *apcie_port2;
+	void __iomem *apcie_port2_phy;
 	void __iomem *apcie_engine;
 	void __iomem *apcie_fabric;
 	struct apple_tunable *apcie_axi_tunable;
@@ -1855,6 +1863,125 @@ void apple_sleep_smc_unregister(struct device *dev)
 }
 EXPORT_SYMBOL_GPL(apple_sleep_smc_unregister);
 
+static const struct of_device_id apple_sleep_of_match[];
+
+static DEFINE_SPINLOCK(apple_sleep_wdt_lock);
+static struct device *apple_sleep_wdt_dev;
+static void (*apple_sleep_wdt_restore)(void *data);
+static void *apple_sleep_wdt_data;
+static bool apple_sleep_wd2_owned;
+
+static bool apple_sleep_wdt_same_block(const struct resource *sleep_wdt,
+				       const struct resource *wdt)
+{
+	if (!sleep_wdt || !wdt)
+		return false;
+	return sleep_wdt->start == wdt->start;
+}
+
+static bool apple_sleep_dt_owns_wdt(const struct resource *wdt)
+{
+	struct device_node *np = NULL;
+	bool found = false;
+
+	if (!wdt)
+		return false;
+
+	for_each_matching_node(np, apple_sleep_of_match) {
+		struct resource res;
+		int idx;
+
+		if (!of_device_is_available(np))
+			continue;
+		idx = of_property_match_string(np, "reg-names", "wdt");
+		if (idx < 0 || of_address_to_resource(np, idx, &res))
+			continue;
+		if (apple_sleep_wdt_same_block(&res, wdt)) {
+			found = true;
+			of_node_put(np);
+			break;
+		}
+	}
+
+	return found;
+}
+
+static int apple_sleep_wdt_register_matched(struct device *dev, bool matched,
+					    void (*restore)(void *data), void *data)
+{
+	unsigned long flags;
+
+	if (!dev || !restore)
+		return -EINVAL;
+	if (!matched)
+		return 0;
+
+	spin_lock_irqsave(&apple_sleep_wdt_lock, flags);
+	if (apple_sleep_wdt_dev && apple_sleep_wdt_dev != dev) {
+		spin_unlock_irqrestore(&apple_sleep_wdt_lock, flags);
+		return -EBUSY;
+	}
+	apple_sleep_wdt_dev = dev;
+	apple_sleep_wdt_restore = restore;
+	apple_sleep_wdt_data = data;
+	spin_unlock_irqrestore(&apple_sleep_wdt_lock, flags);
+
+	return 0;
+}
+
+int apple_sleep_wdt_register(struct device *dev, const struct resource *wdt,
+			     void (*restore)(void *data), void *data)
+{
+	if (!dev || !wdt || !restore)
+		return -EINVAL;
+
+	return apple_sleep_wdt_register_matched(dev, apple_sleep_dt_owns_wdt(wdt),
+						restore, data);
+}
+EXPORT_SYMBOL_GPL(apple_sleep_wdt_register);
+
+void apple_sleep_wdt_unregister(struct device *dev)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&apple_sleep_wdt_lock, flags);
+	if (apple_sleep_wdt_dev == dev) {
+		apple_sleep_wdt_dev = NULL;
+		apple_sleep_wdt_restore = NULL;
+		apple_sleep_wdt_data = NULL;
+	}
+	spin_unlock_irqrestore(&apple_sleep_wdt_lock, flags);
+}
+EXPORT_SYMBOL_GPL(apple_sleep_wdt_unregister);
+
+bool apple_sleep_wdt_active(struct device *dev)
+{
+	unsigned long flags;
+	bool active;
+
+	if (!dev)
+		return false;
+
+	spin_lock_irqsave(&apple_sleep_wdt_lock, flags);
+	active = apple_sleep_wd2_owned && apple_sleep_wdt_dev == dev;
+	spin_unlock_irqrestore(&apple_sleep_wdt_lock, flags);
+
+	return active;
+}
+EXPORT_SYMBOL_GPL(apple_sleep_wdt_active);
+
+static void apple_sleep_wdt_end(void __iomem *wdt)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&apple_sleep_wdt_lock, flags);
+	writel(0, wdt + WDT_WD2_CTL);
+	if (apple_sleep_wdt_restore)
+		apple_sleep_wdt_restore(apple_sleep_wdt_data);
+	apple_sleep_wd2_owned = false;
+	spin_unlock_irqrestore(&apple_sleep_wdt_lock, flags);
+}
+
 void apple_sleep_display_quiesced(struct device *dev, bool quiesced)
 {
 	struct apple_sleep *s = apple_sleep;
@@ -1911,10 +2038,10 @@ static int apple_sleep_validate_cpu_topology(struct apple_sleep *s)
 		    soc->cpu_cores_per_cluster > 32)
 		return dev_err_probe(s->dev, -EINVAL, "invalid CPU-start geometry\n");
 
-	if (soc->machine && (!of_machine_is_compatible(soc->machine) ||
-	    cpu_logical_map(0) != soc->boot_mpidr ||
-	    num_possible_cpus() != soc->cpu_count))
-		return dev_err_probe(s->dev, -EINVAL, "unsupported board/CPU inventory\n");
+	/* The node's compatible chose the profile: its machine is where it was measured */
+	if (soc->machine && (cpu_logical_map(0) != soc->boot_mpidr ||
+			     num_possible_cpus() != soc->cpu_count))
+		return dev_err_probe(s->dev, -EINVAL, "unsupported CPU inventory\n");
 
 	index = of_property_match_string(np, "reg-names", "cpu-start");
 	if (index < 0)
@@ -3844,6 +3971,35 @@ static void sleep_apcie_port_stop_once(struct apple_sleep *s)
 	sleep_apcie_port_stop(s);
 }
 
+/*
+ * A port that no host sets up again after a real sleep (one without the managed radio
+ * contract) gets its clocks back as the loader set them at boot: the DART in its unit is
+ * clocked by the port and its resume reads it. PERST# and the link stay as the wake left them.
+ * It stops before the reset release when a clock doesn't ack: the wake's report names the port.
+ */
+static int sleep_apcie_port_clock(void __iomem *port, void __iomem *phy)
+{
+	u32 val;
+	int ret;
+
+	if (!port || !phy)
+		return 0;
+	writel(readl(port + APCIE_PORT_APPCLK) | APCIE_PORT_APPCLK_EN, port + APCIE_PORT_APPCLK);
+	writel(readl(phy) & ~(APCIE_PHY_CTRL_CLK0REQ | APCIE_PHY_CTRL_CLK1REQ), phy);
+	writel(readl(phy) | APCIE_PHY_CTRL_CLK0REQ, phy);
+	ret = readl_poll_timeout_atomic(phy, val, val & APCIE_PHY_CTRL_CLK0ACK, 1, APCIE_POLL_US);
+	if (ret)
+		return ret;
+	writel(readl(phy) | APCIE_PHY_CTRL_CLK1REQ, phy);
+	ret = readl_poll_timeout_atomic(phy, val, val & APCIE_PHY_CTRL_CLK1ACK, 1, APCIE_POLL_US);
+	if (ret)
+		return ret;
+	writel(readl(phy) & ~APCIE_PHY_CTRL_RESET, phy);
+	writel(readl(phy) | APCIE_PORT_PHY_EN0, phy);
+	writel(readl(phy) | APCIE_PORT_PHY_EN1, phy);
+	return 0;
+}
+
 /* A poll here only paces the steps: the power goes next whatever it reads. */
 static void sleep_apcie_phy_off(struct apple_sleep *s)
 {
@@ -4605,10 +4761,41 @@ static void sleep_ps_rewake(struct apple_sleep *s)
 		s->ps_rewake_timeouts += redo_aon[i];
 }
 
+/*
+ * Which blocks lost their power across this sleep: a coprocessor whose word is listed lost its
+ * firmware as well, whatever the wake wrote back, and a driver that talks to it after the wake
+ * talks to a reset block. A line at info for the PMGR or the always-on PMGR only when one of
+ * its words was lost; the usual case, every word back on, is at debug.
+ */
+
+static void sleep_ps_report_off(struct apple_sleep *s, const char *name,
+				const struct apple_sleep_words *w, const u32 *commit,
+				const u32 *woke)
+{
+	char buf[384];
+	int i, len = 0, off = 0;
+
+	for (i = 0; i < w->count; i++) {
+		if (!FIELD_GET(PS_TARGET, commit[i]) || FIELD_GET(PS_ACTUAL, woke[i]))
+			continue;
+		off++;
+		if (len < sizeof(buf) - 8)
+			len += scnprintf(buf + len, sizeof(buf) - len, " %#x", w->offset[i]);
+	}
+	if (off)
+		dev_info(s->dev, "%s: %d words on at the commit were off at the wake:%s\n", name,
+			 off, buf);
+	else
+		dev_dbg(s->dev, "%s: all words on at the commit were on at the wake\n", name);
+}
+
 static void sleep_ps_rewake_report(struct apple_sleep *s)
 {
 	const struct apple_sleep_words *all = &s->soc->ps_all, *aon = &s->soc->ps_aon_all;
 	int i;
+
+	sleep_ps_report_off(s, "PMGR", all, s->ps_commit, s->ps_woke);
+	sleep_ps_report_off(s, "AON PMGR", aon, s->ps_aon_commit, s->ps_aon_woke);
 
 	dev_dbg(s->dev, "power words: %u written back, %u not on in time\n", s->ps_rewoken,
 		s->ps_rewake_timeouts);
@@ -5798,6 +5985,14 @@ static void t8132_wake(struct apple_sleep *s)
 
 	if (s->pcie_ans_stopped)
 		s->pcie_ans_on_ret = apple_sleep_raise_apcie(s);
+	s->apcie_port_clk_ret[0] = 0;
+	s->apcie_port_clk_ret[1] = 0;
+	if (s->pcie_ans_stopped && !s->pcie_ans_on_ret && s->apcie_ports_unowned) {
+		s->apcie_port_clk_ret[0] = sleep_apcie_port_clock(s->apcie_port,
+								  s->apcie_port_phy);
+		s->apcie_port_clk_ret[1] = sleep_apcie_port_clock(s->apcie_port2,
+								  s->apcie_port2_phy);
+	}
 	s->apcie_port_down = true;
 	s->pins_lost = s->pins_saved_valid;
 }
@@ -5954,14 +6149,21 @@ static int apple_sleep_enter_prepare(struct apple_sleep *s)
 static int apple_sleep_enter_saved(unsigned long unused)
 {
 	struct apple_sleep *s = apple_sleep;
-	int ret = s->soc->ops->cpu_prepare(s->mbox->boot_mpidr);
+	int ret;
 
+	/*
+	 * cpu_suspend() calls its finisher with RCU not watching. Up to the commit this one
+	 * takes locks, logs and looks at work items: RCU watches until then.
+	 */
+	ct_cpuidle_exit();
+	ret = s->soc->ops->cpu_prepare(s->mbox->boot_mpidr);
+	if (!ret)
+		ret = apple_sleep_enter_prepare(s);
+	if (!ret)
+		pm_set_resume_via_firmware();
+	ct_cpuidle_enter();
 	if (ret)
 		return ret;
-	ret = apple_sleep_enter_prepare(s);
-	if (ret)
-		return ret;
-	pm_set_resume_via_firmware();
 	/* cpu_suspend has already saved boot context. Commit never returns. */
 	return apple_sleep_commit(0);
 }
@@ -6389,7 +6591,14 @@ static int apple_sleep_begin(suspend_state_t state)
 		apple_sleep->smc_woke_alone = false;
 		sleep_pins_save(apple_sleep);
 	}
-	apple_sleep_set_wd2(apple_sleep, WDT_SUSPEND_SECS);
+	{
+		unsigned long flags;
+
+		spin_lock_irqsave(&apple_sleep_wdt_lock, flags);
+		apple_sleep_wd2_owned = true;
+		apple_sleep_set_wd2(apple_sleep, WDT_SUSPEND_SECS);
+		spin_unlock_irqrestore(&apple_sleep_wdt_lock, flags);
+	}
 	pm_set_suspend_via_firmware();
 	sleep_ans_late_open();
 
@@ -6407,7 +6616,7 @@ static void apple_sleep_end(void)
 	if (pm_suspend_via_firmware() && apple_sleep->soc->ops->pmu_wake)
 		apple_sleep->soc->ops->pmu_wake(apple_sleep);
 	if (pm_suspend_via_firmware())
-		writel(0, apple_sleep->wdt + WDT_WD2_CTL);
+		apple_sleep_wdt_end(apple_sleep->wdt);
 }
 
 /*
@@ -6840,6 +7049,12 @@ static void apple_sleep_report(void)
 	if (s->pcie_ans_stopped && s->pcie_ans_on_ret)
 		dev_err(s->dev, "ANS's PCIe block did not come up after the wake: %d\n",
 			s->pcie_ans_on_ret);
+	if (s->apcie_port_clk_ret[0])
+		dev_err(s->dev, "PCIe port 0's PHY clocks did not ack after the wake: %d\n",
+			s->apcie_port_clk_ret[0]);
+	if (s->apcie_port_clk_ret[1])
+		dev_err(s->dev, "PCIe port 2's PHY clocks did not ack after the wake: %d\n",
+			s->apcie_port_clk_ret[1]);
 }
 
 static int apple_sleep_valid(suspend_state_t state)
@@ -7202,6 +7417,9 @@ static void apple_sleep_map_apcie(struct apple_sleep *s)
 
 	s->apcie_port = apple_sleep_apcie_block(s, np, "port0", NULL, NULL);
 	s->apcie_port_phy = apple_sleep_apcie_block(s, np, "phy0", NULL, NULL);
+	s->apcie_port2 = apple_sleep_apcie_block(s, np, "port2", NULL, NULL);
+	s->apcie_port2_phy = apple_sleep_apcie_block(s, np, "phy2", NULL, NULL);
+	s->apcie_ports_unowned = !of_property_present(np, "apple,managed-sids");
 	engine = of_parse_phandle(np, "apple,piodma", 0);
 	if (engine) {
 		s->apcie_engine = apple_sleep_apcie_block(s, engine, "engine", NULL, NULL);

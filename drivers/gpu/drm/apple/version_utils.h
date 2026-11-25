@@ -10,7 +10,7 @@
 #define DCP_FW_UNION(u) (u).DCP_FW
 #define DCP_FW_SUFFIX CONCATENATE(_, DCP_FW)
 #define DCP_FW_NAME(name) CONCATENATE(name, DCP_FW_SUFFIX)
-#define DCP_FW_VERSION(x, y, z) ( ((x) << 16) | ((y) << 8) | (z) )
+#define DCP_FW_VERSION(x, y, z) (((x) << 16) | ((y) << 8) | (z))
 
 /*
  * 26.x firmware exists in two unrelated wire lineages.  The H17-generation
@@ -62,6 +62,12 @@ enum dcp_firmware_version {
 	 */
 	DCP_FIRMWARE_V_26_6_DESKTOP,
 	DCP_FIRMWARE_V_27_0,
+	/*
+	 * A DCP driven through its firmware's iBoot interface alone
+	 * (disp0-service, dispext-service; see ibootep.c), not through
+	 * IOMFB: the T8152 one.
+	 */
+	DCP_FIRMWARE_IBOOT,
 };
 
 #endif /*__APPLE_VERSION_UTILS_H__*/

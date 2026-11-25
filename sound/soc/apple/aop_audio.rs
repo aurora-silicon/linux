@@ -540,8 +540,8 @@ struct SndSocAopHwConfig {
     bytes_per_sample: u32,
     hf_decimator: bool,
     // The T6040 firmware takes the microphone setup macOS sends. LPAI property 301 is the
-    // read-only stream description; the channel masks are property 300 (12 bytes). A refusal of
-    // any of the configuration steps is logged and not fatal, so the next step's answer is seen.
+    // read-only stream description; the channel masks are property 300 (12 bytes). A refused
+    // step leaves out the microphones it sets up (see the probe), not the speaker or jack.
     t6040_flow: bool,
 }
 
@@ -695,8 +695,12 @@ impl SndSocAopData {
         };
         let msg = AudioSetDeviceProp::new(AUDIO_DEV_LPAI, 300, ctl);
         let ret = self.epic_wrapped_call(&msg)?;
-        dev_dbg!(self.dev, "lpai channel control (prop 300): {:#x}\n", ret);
         if ret != 0 {
+            dev_err!(
+                self.dev,
+                "Unable to set lpai channel masks, return code {:#x}\n",
+                ret
+            );
             return Err(EIO);
         }
         Ok(())
@@ -1176,6 +1180,23 @@ impl platform::Driver for AopAudio {
 }
 
 impl SndSocAopDriver {
+    /// Registers only the speaker and jack streams the node lists, for a
+    /// machine whose microphones are absent or could not be set up; `err`
+    /// when it lists none either.
+    fn without_microphones(data: Arc<SndSocAopData>, streams: bool, err: Error) -> Result<Self> {
+        if !streams {
+            return Err(err);
+        }
+        let mut this = SndSocAopDriver {
+            card: ptr::null_mut(),
+            mic: aop_lid::MicLid::new()?,
+            spkr: None,
+            lpai: None,
+        };
+        this.spkr = Some(aop_spkr::SpeakerComponent::register(data)?);
+        Ok(this)
+    }
+
     fn probe(
         pdev: &platform::Device<Core<'_>>,
         info: &'static SndSocAopHwConfig,
@@ -1213,17 +1234,7 @@ impl SndSocAopDriver {
         // channel: its firmware has no PDM devices, so attach only the
         // speaker and jack streams.
         if info.t6040_flow && !listed(c_str!("dma")) {
-            if !streams {
-                return Err(ENODEV);
-            }
-            let mut this = SndSocAopDriver {
-                card: ptr::null_mut(),
-                mic: aop_lid::MicLid::new()?,
-                spkr: None,
-                lpai: None,
-            };
-            this.spkr = Some(aop_spkr::SpeakerComponent::register(data)?);
-            return Ok(this);
+            return Self::without_microphones(data, streams, ENODEV);
         }
         for dev in [AUDIO_DEV_PDM0, AUDIO_DEV_HPAI, AUDIO_DEV_LPAI] {
             data.audio_attach_device(dev)?;
@@ -1233,20 +1244,37 @@ impl SndSocAopDriver {
         }
         if info.t6040_flow {
             // Property 301 is the read-only stream description on this firmware (writing it
-            // returns 0xE00002CF, kIOReturnNotWritable). Follow macOS: channel masks are property
-            // 300. A refusal is reported and does not stop the probe.
-            if data.set_lpai_channel_control().is_err() {
-                dev_warn!(data.dev, "lpai channel control refused, continuing\n");
-            }
-            if data.set_pdm_config().is_err() {
-                dev_warn!(data.dev, "pdm config refused, continuing\n");
-            }
-            if data.set_decimator_config_hf().is_err() {
-                dev_warn!(data.dev, "decimator config refused, continuing\n");
+            // returns 0xE00002CF, kIOReturnNotWritable); the channel masks are property 300.
+            // The masks are the low-power microphone's: without them the card offers the
+            // array alone. Without the PDM and decimator setup the array would capture
+            // from whatever the firmware held, so no microphone is offered; the speaker
+            // and jack streams do not depend on it and are still registered.
+            let lpai_masks = data
+                .set_lpai_channel_control()
+                .inspect_err(|e| {
+                    dev_err!(
+                        data.dev,
+                        "lpai channel masks not set ({:?}): no low-power microphone\n",
+                        e
+                    );
+                })
+                .is_ok();
+            if let Err(e) = data
+                .set_pdm_config()
+                .and_then(|()| data.set_decimator_config_hf())
+            {
+                dev_err!(
+                    data.dev,
+                    "microphone setup failed ({:?}): no microphones\n",
+                    e
+                );
+                return Self::without_microphones(data, streams, e);
             }
             // The low-power microphone's ring goes through the audio node's
             // own DART stream; a node without one has the array only.
-            let lpai = if data.fwnode.property_present(c_str!("iommus")) {
+            let lpai = if !lpai_masks {
+                None
+            } else if data.fwnode.property_present(c_str!("iommus")) {
                 // SAFETY: no DMA is in flight on this device yet.
                 unsafe { pdev.dma_set_mask_and_coherent(DmaMask::new::<42>())? };
                 aop_lpai::LpaiCapture::new_ring(

@@ -24,6 +24,7 @@ PRELUDE = r'''
 #define AVD_RECOVER_GAP_MS 20
 #define AVD_STORM_MAX 2
 #define AVD_STORM_WINDOW 60000
+#define AVD_QUIRK_NO_RECOVERY_RESET (1U << 5)
 #define msecs_to_jiffies(x) (x)
 #define jiffies_to_msecs(x) ((unsigned int)(x))
 #define time_before(a,b) ((long)((a)-(b))<0)
@@ -41,6 +42,7 @@ typedef int irqreturn_t;
 struct avd_dev;
 struct avd_ctx { bool session_started; };
 struct frame { int state,status; };
+struct avd_variant { unsigned int quirks; };
 struct avd_backend_ops {
  void (*shutdown)(struct avd_dev *);
  int (*resume)(struct avd_dev *);
@@ -53,6 +55,7 @@ struct queue {
 struct avd_dev {
  void *dev,*domain,*empty_domain,*rstc,*compat_active;
  const struct avd_backend_ops *backend;
+ const struct avd_variant *variant;
  struct {
   bool dart_active,dma_parked,irq_enabled,hw_on;
   int irq,hw_lock,lock;unsigned int irq_gen;
@@ -98,6 +101,7 @@ static void avd_pm_drain_unmaps(struct avd_dev *avd) { assert(avd->pm.dart_activ
 
 MAIN = r'''
 static const struct avd_backend_ops backend={.shutdown=shutdown_backend};
+static const struct avd_variant no_recovery_reset = { .quirks = AVD_QUIRK_NO_RECOVERY_RESET };
 static const struct queue queue={.idle=idle,.resubmit=resubmit};
 static int domain_token,empty_token;
 static void init(void) {
@@ -110,6 +114,11 @@ int main(void) {
  init();assert(!avd_pm_recover(&d));assert(resets==1&&boots==1&&attaches==1&&detaches==1);
  assert(!d.pm.dma_parked&&!d.pm.irq_enabled&&attached==d.domain);
  avd_pm_enable_irq(&d);assert(irq_opens==1);
+ init();
+ d.variant = &no_recovery_reset;
+ assert(avd_pm_recover(&d) == -EIO);
+ assert(attaches == 1 && !resets && !boots && !detaches);
+ assert(d.pm.dma_parked && !d.pm.irq_enabled && attached == d.empty_domain);
  init();reset_error=-EIO;d.frames[0].state=AVD_FRAME_SUBMITTED;avd_reset_queue(&d,-ETIMEDOUT);
  assert(d.faulted&&resets==1&&!boots&&!detaches&&d.pm.dma_parked&&attached==d.empty_domain);
  assert(d.frames[0].state==AVD_FRAME_DONE&&!d.pm.irq_enabled);
@@ -129,7 +138,7 @@ int main(void) {
  jiffies=d.rest_until;assert(!avd_pm_recover(&d));assert(resets==3&&!d.pm.dma_parked);
  init();attach_error=-EIO;assert(avd_pm_recover(&d)==-EIO);assert(!resets&&!boots&&!detaches);
  init();d.pm.dart_active=false;assert(avd_pm_park(&d)==-EHOSTDOWN);assert(!shutdowns&&!resets&&!attaches);
- puts("PASS: production recovery/PM: park before reset, failed reset/boot stays blocked, budget rests, parked resume never boots, expiry recovery");
+ puts("PASS: production recovery/PM: park before reset, no-reset variant stays parked, failed reset/boot stays blocked, budget rests, parked resume never boots, expiry recovery");
 }
 '''
 

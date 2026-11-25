@@ -20,6 +20,7 @@ typedef uint64_t dma_addr_t;
 #define SZ_16K 0x4000U
 #define SZ_1M 0x100000U
 #define U32_MAX UINT32_MAX
+#define GENMASK(h, l) ((~0UL >> (63 - (h))) & (~0UL << (l)))
 #define GENMASK_ULL(h, l) ((~0ULL >> (63 - (h))) & (~0ULL << (l)))
 #define BIT(n) (1U << (n))
 #define BIT_ULL(n) (1ULL << (n))
@@ -73,6 +74,7 @@ static inline void sort(void *p, size_t n, size_t size,
 }
 
 #define dev_err(...) test_log(__VA_ARGS__)
+#define dev_err_ratelimited(...) test_log(__VA_ARGS__)
 #define dev_info(...) test_log(__VA_ARGS__)
 #define dev_dbg(...) test_log(__VA_ARGS__)
 #define dev_warn(...) test_log(__VA_ARGS__)
