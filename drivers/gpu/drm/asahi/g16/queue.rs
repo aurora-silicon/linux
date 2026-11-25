@@ -76,6 +76,9 @@ pub(crate) struct QueueState {
     /// engine when a job arrives.
     pub(crate) owned: [AtomicU32; 32],
     pub(crate) owned_index: AtomicU32,
+    /// EWMA of retired per-command CDM GPU execution duration (microseconds) for adaptive
+    /// 1-pipe affinity vs 2-pipe heavy compute fanout.
+    pub(crate) compute_ewma_us: AtomicU32,
 }
 
 impl QueueState {
@@ -123,6 +126,20 @@ impl QueueState {
         }
         let shift = seq.wrapping_sub(completed).wrapping_sub(2);
         shift < 64 && (self.compute_ooo.load(Ordering::Acquire) & (1u64 << shift)) != 0
+    }
+
+    /// Updates the lock-free EWMA of recent retired per-command CDM GPU execution duration
+    /// (microseconds) for this queue using a symmetric 50% step so transitions between light
+    /// and heavy compute streams adapt within 2-3 completions.
+    pub(crate) fn note_compute_us(&self, us: u32) {
+        let us = us.clamp(1, 100_000);
+        let prev = self.compute_ewma_us.load(Ordering::Relaxed);
+        let next = if prev == 0 {
+            us
+        } else {
+            prev.saturating_add(us) / 2
+        };
+        self.compute_ewma_us.store(next, Ordering::Relaxed);
     }
 }
 
@@ -212,6 +229,7 @@ impl Queue {
                 published: [const { AtomicU64::new(0) }; 2],
                 owned: [const { AtomicU32::new(0) }; 32],
                 owned_index: AtomicU32::new(0),
+                compute_ewma_us: AtomicU32::new(0),
             },
             GFP_KERNEL,
         )?;

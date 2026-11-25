@@ -141,7 +141,18 @@ impl Shared {
                 ) {
                     Ok(true) if retry_tail => {}
                     Ok(true) => {
-                        self.rearm(firmware.engine.chan_wait || firmware.engine.short_repoll)
+                        let soon = firmware.engine.chan_wait || firmware.engine.short_repoll;
+                        if firmware.engine.coalesce_deadline_ns != 0 && !soon {
+                            let rem_us = (firmware
+                                .engine
+                                .coalesce_deadline_ns
+                                .saturating_sub(now_ns())
+                                .div_ceil(1000) as u32)
+                                .clamp(1, super::hw::sizes::COALESCE_WINDOW_US);
+                            self.rearm_after(rem_us.min(self.rearm_us(false)));
+                        } else {
+                            self.rearm(soon);
+                        }
                     }
                     // Idle: arm a delayed poll while DVFS utilization is decaying or a CLPC
                     // floor hold is still pending so both expire cleanly to idle power.
@@ -271,20 +282,26 @@ impl Shared {
                     Ok(())
                 });
             }
+            let mut coalesce_us = None;
             if pub_res.is_ok() {
                 if retired_any || !had_flights {
                     firmware.reclaim_closed_vm_slots();
                 }
-                pub_res = if recovery_pending {
-                    let r = firmware.publish(done);
-                    if r.is_ok() {
-                        firmware.last_housekeeping_ns = now;
-                        firmware.last_aux_drain_ns = now;
-                    }
-                    r
-                } else {
-                    firmware.publish_checked(done)
-                };
+                if !recovery_pending && !retired_any && !restored_event && had_flights {
+                    coalesce_us = firmware.defer_busy_coalesce(now);
+                }
+                if coalesce_us.is_none() {
+                    pub_res = if recovery_pending {
+                        let r = firmware.publish(done);
+                        if r.is_ok() {
+                            firmware.last_housekeeping_ns = now;
+                            firmware.last_aux_drain_ns = now;
+                        }
+                        r
+                    } else {
+                        firmware.publish_checked(done)
+                    };
+                }
             }
             if pub_res.is_ok()
                 && !firmware.engine.flights.is_empty()
@@ -300,11 +317,15 @@ impl Shared {
                 // If an EP 0x20 event retired an older flight while later flights remain active,
                 // or arrived before the oldest receipt became visible, arm a short repoll so
                 // trailing completions never fall back to `resnap_us`.
-                self.rearm(
-                    firmware.engine.chan_wait
-                        || restored_event
-                        || (was_evented && retired_any && !firmware.engine.flights.is_empty()),
-                );
+                if let Some(us) = coalesce_us {
+                    self.rearm_after(us.min(self.rearm_us(false)));
+                } else {
+                    self.rearm(
+                        firmware.engine.chan_wait
+                            || restored_event
+                            || (was_evented && retired_any && !firmware.engine.flights.is_empty()),
+                    );
+                }
             } else {
                 firmware.power.report_work(false);
                 self.arm_idle_power_poll(firmware);
@@ -527,10 +548,15 @@ impl Shared {
     /// Re-checks a published command soon: hrtimer, with a throttled 1-jiffy backup; sooner while
     /// a ready prefix waits for record consumption or a post-event receipt tail is settling.
     pub(crate) fn rearm(self: &Arc<Self>, soon: bool) {
+        self.rearm_after(self.rearm_us(soon));
+    }
+
+    /// Arms the poll hrtimer for `us` microseconds (coalescing with an already-armed deadline
+    /// within 5 us) plus the throttled 1-jiffy backup poll.
+    pub(crate) fn rearm_after(self: &Arc<Self>, us: u32) {
         if self.sleeping.load(Ordering::Acquire) {
             return;
         }
-        let us = self.rearm_us(soon);
         let now = now_ns();
         let target_ns = now.saturating_add(u64::from(us) * 1000);
         let armed_ns = self.resnap_deadline_ns.load(Ordering::Acquire);
@@ -683,6 +709,8 @@ impl Firmware {
         // while `publish_woke` covers external state changes (VM close, unstarted queue
         // cancellation) and `ta_wave_ready()` wakes TA-wave-paced renders when a `0x70` TA
         // pass finishes while FS is still running.
+        let coalesce_due = self.engine.coalesce_deadline_ns != 0
+            && (!evented || now >= self.engine.coalesce_deadline_ns);
         let should_publish = !self.engine.pending.is_empty()
             && (retired_any
                 || !had_flights
@@ -692,6 +720,7 @@ impl Firmware {
                 || scrub_woke
                 || publish_woke
                 || self.ta_wave_ready()
+                || coalesce_due
                 || housekeeping_due);
         let published = if should_publish {
             self.publish_checked(done)
@@ -816,10 +845,13 @@ impl Firmware {
         Some((compute, render))
     }
 
-    /// Whether a render job paused by `TA_WAVE_PASSES` pacing has enough TA headroom to publish
+    /// Whether a render job paused by TA wave pacing has enough TA headroom to publish
     /// the next wave without dribbling 1-pass stub flights.
     fn ta_wave_ready(&self) -> bool {
-        self.engine.ta_wave_wait && self.ta_pending_passes() <= super::hw::sizes::TA_WAVE_REFILL
+        let cap = self.active_ta_wave_cap();
+        self.engine.ta_wave_wait
+            && self.ta_pending_passes()
+                <= cap.saturating_sub(super::hw::sizes::TA_WAVE_REFILL_HEADROOM)
     }
 
     /// Cheap single-stage stamp check for the oldest compute pipe 0/1 and oldest render flights'
@@ -1836,6 +1868,8 @@ impl Firmware {
         };
         let (mut lo, mut hi) = (u64::MAX, 0u64);
         let (mut first, mut last) = (u64::MAX, 0u64);
+        let mut cdm_flight_ticks = 0u64;
+        let mut cdm_counted = 0u32;
         let work_ticks = self.init.abi.compute().work_ticks;
         let s = &mut self.engine.stats;
 
@@ -1872,6 +1906,10 @@ impl Firmware {
                 &mut s.cdm_ticks,
                 crate::usage::Engine::Compute,
             );
+            if ticks[1] >= ticks[0] {
+                cdm_flight_ticks = ticks[1] - ticks[0];
+                cdm_counted = 1;
+            }
         } else {
             // Multi-command prefix fallback: read each member's internal timestamp cells.
             let mut stage = |o: &super::object::FwObject,
@@ -1910,8 +1948,19 @@ impl Firmware {
                 };
                 if let Ok((start, end)) = Self::compute_ticks_with(work_ticks, c) {
                     add_interval(start, end, &mut s.cdm_ticks, crate::usage::Engine::Compute);
+                    if start != 0 && end >= start {
+                        cdm_flight_ticks = cdm_flight_ticks.saturating_add(end - start);
+                        cdm_counted += 1;
+                    }
                 }
             }
+        }
+        if cdm_counted != 0 {
+            let per_cmd_ticks = cdm_flight_ticks / u64::from(cdm_counted);
+            let per_cmd_us = (per_cmd_ticks.saturating_mul(1_000_000)
+                / super::hw::COMMAND_TIMESTAMP_HZ)
+                .clamp(1, 100_000) as u32;
+            f.job.queue.note_compute_us(per_cmd_us);
         }
         if hi > lo {
             s.span_ticks = s.span_ticks.saturating_add(hi - lo);

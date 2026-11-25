@@ -181,6 +181,15 @@ pub(crate) struct RenderCommand {
     /// Explicit hardware attachments in effect for each render engine.
     pub(crate) vertex_attachments: KVec<uapi::drm_asahi_attachment>,
     pub(crate) fragment_attachments: KVec<uapi::drm_asahi_attachment>,
+    /// Whether this pass exceeds the light-TA wave threshold (multi-layer or large tilemap).
+    pub(crate) heavy_ta: bool,
+}
+
+impl RenderCommand {
+    /// Whether this render pass requires the conservative `TA_WAVE_PASSES` wave window.
+    pub(crate) fn is_heavy_ta(&self) -> bool {
+        self.heavy_ta
+    }
 }
 
 /// A validated compute command.
@@ -1517,6 +1526,9 @@ pub(crate) fn parse_stream(bytes: &[u8], early_tiling: bool) -> Result<ParsedStr
                 };
                 let vertex_attachments = take_render(&mut vertex, false)?;
                 let fragment_attachments = take_render(&mut fragment, true)?;
+                let heavy_ta = packet.layers > 1
+                    || super::encode::Geometry::new(&packet, 0).tilemap_bytes
+                        > hw::sizes::TA_LIGHT_TILEMAP_BYTES;
                 commands.push(Command::Render(KBox::new(
                     RenderCommand {
                         cmd: packet,
@@ -1525,6 +1537,7 @@ pub(crate) fn parse_stream(bytes: &[u8], early_tiling: bool) -> Result<ParsedStr
                         timestamp_outputs: crate::timestamp::Destinations::empty(),
                         vertex_attachments,
                         fragment_attachments,
+                        heavy_ta,
                     },
                     GFP_KERNEL,
                 )?))?;

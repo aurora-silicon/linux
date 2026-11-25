@@ -344,6 +344,8 @@ pub(crate) struct Flight {
     pub(crate) has_timestamps: bool,
     /// Whether this flight runs ray-tracing or SCS-scratch compute (pinned to compute pipe 0).
     pub(crate) rt_compute: bool,
+    /// Whether this flight includes any heavy-TA render pass (multi-layer or large tilemap).
+    pub(crate) heavy_render: bool,
 }
 
 impl Flight {
@@ -386,6 +388,7 @@ impl Flight {
             initbm: false,
             has_timestamps: false,
             rt_compute: false,
+            heavy_render: false,
         }
     }
 }
@@ -607,6 +610,9 @@ pub(crate) struct Engine {
     pub(crate) ta_wave_wait: bool,
     /// An EP 0x20 event arrived with a flight still settling its final receipt: repoll sooner.
     pub(crate) short_repoll: bool,
+    /// Absolute deadline (`ktime_get_ns`) for busy-state same-queue horizon micro-coalescing
+    /// (0 when no batch is held).
+    pub(crate) coalesce_deadline_ns: u64,
     /// Progress tracking of the oldest compute pipe 0/1 and render flights.
     pub(crate) progress_flight: [u64; 3],
     pub(crate) progress: [Option<u32>; 4],
@@ -651,6 +657,7 @@ impl Engine {
             slot_wait: false,
             ta_wave_wait: false,
             short_repoll: false,
+            coalesce_deadline_ns: 0,
             progress_flight: [0; 3],
             progress: [None; 4],
             stats: KBox::zeroed(GFP_KERNEL)?,
@@ -999,6 +1006,7 @@ impl Firmware {
         self.engine.chan_wait = false;
         self.engine.slot_wait = false;
         self.engine.ta_wave_wait = false;
+        self.engine.coalesce_deadline_ns = 0;
         while self.recovery.failed().is_none()
             && !self.engine.frozen
             && !self.engine.pending.is_empty()
@@ -1015,15 +1023,36 @@ impl Firmware {
             // while preserving per-queue FIFO, unless the head job itself requires
             // `flights` to drain to empty first (unprimed cold InitBM render, failed
             // VM, or recovery/InitBM in flight).
-            if !self.engine.flights.is_empty() && !self.can_queue_behind(&job) {
+            let mut ta_pending: Option<usize> = None;
+            if !self.engine.flights.is_empty()
+                && !self.can_queue_behind_with_ta(&job, &mut ta_pending)
+            {
                 if self.needs_engine_drain(&job) {
                     self.engine.stats.hold[0] += 1;
                     break;
                 }
-                let ta_wave_paused = self.ta_pending_passes() >= super::hw::sizes::TA_WAVE_PASSES;
+                let ta_val = *ta_pending.get_or_insert_with(|| self.ta_pending_passes());
+                let ta_wave_paused = ta_val >= self.active_ta_wave_cap();
                 let mut alt: Option<usize> = None;
                 for (i, cand) in self.engine.pending.iter().enumerate() {
-                    if i == index || !self.can_queue_behind(cand) {
+                    if i == index {
+                        continue;
+                    }
+                    // Fast O(1) skip for blocked head-queue followers: `Engine::pick` chose the
+                    // earliest pending job of `job.queue`, so later jobs of the same queue are
+                    // FIFO-blocked unless an independent non-query compute may bypass TA-wave
+                    // paused renders.
+                    if i > index
+                        && Arc::ptr_eq(&cand.queue, &job.queue)
+                        && !(ta_wave_paused
+                            && matches!(
+                                command(cand, cand.progress.sent()),
+                                Some(Command::Compute(c)) if !c.query_access
+                            ))
+                    {
+                        continue;
+                    }
+                    if !self.can_queue_behind_with_ta(cand, &mut ta_pending) {
                         continue;
                     }
                     // Preserve per-queue FIFO: never jump a later job of a queue ahead
@@ -1042,7 +1071,8 @@ impl Firmware {
                             )
                             && matches!(
                                 command(earlier, earlier.progress.sent()),
-                                Some(Command::Render(_))
+                                Some(Command::Render(r))
+                                    if ta_val >= self.ta_wave_cap_for(r.is_heavy_ta())
                             )
                             && !self.needs_engine_drain(earlier)
                             && earlier
@@ -1075,17 +1105,16 @@ impl Firmware {
                             .pending
                             .iter()
                             .any(|cand| self.blocked_on_slot_headroom(cand));
-                        self.engine.ta_wave_wait = self.ta_pending_passes()
-                            >= super::hw::sizes::TA_WAVE_PASSES
-                            && self.engine.pending.iter().any(|cand| {
-                                matches!(
-                                    command(cand, cand.progress.sent()),
-                                    Some(Command::Render(_))
-                                ) && !self.needs_engine_drain(cand)
-                                    && cand
-                                        .check_command_dependencies(cand.progress.sent())
-                                        .is_ok()
-                            });
+                        self.engine.ta_wave_wait = self.engine.pending.iter().any(|cand| {
+                            matches!(
+                                command(cand, cand.progress.sent()),
+                                Some(Command::Render(r))
+                                    if ta_val >= self.ta_wave_cap_for(r.is_heavy_ta())
+                            ) && !self.needs_engine_drain(cand)
+                                && cand
+                                    .check_command_dependencies(cand.progress.sent())
+                                    .is_ok()
+                        });
                         self.engine.stats.hold[0] += 1;
                         break;
                     }
@@ -1185,12 +1214,12 @@ impl Firmware {
                     if job.progress.sent() == job.progress.count() {
                         self.engine.unpend(&job); // fully published
                     }
-                    // Ring TA/FS immediately once a render wave fills TA_WAVE_PASSES so the GPU
-                    // starts tiling right away instead of waiting behind another loop iteration
-                    // or an alt-class compute publication.
+                    // Ring TA/FS immediately once a render wave fills the active TA wave window so
+                    // the GPU starts tiling right away instead of waiting behind another loop
+                    // iteration or an alt-class compute publication.
                     if pending_rings & ((1u8 << (Channel::Fs as u8)) | (1u8 << (Channel::Ta as u8)))
                         != 0
-                        && self.ta_pending_passes() >= super::hw::sizes::TA_WAVE_PASSES
+                        && self.ta_pending_passes() >= self.active_ta_wave_cap()
                     {
                         if let Err(e) = self.flush_doorbells(&mut pending_rings) {
                             dev_err!(
@@ -1408,6 +1437,45 @@ impl Firmware {
         pending
     }
 
+    /// Adaptive TA wave window for a candidate render pass: conservative `TA_WAVE_PASSES` (4)
+    /// when either the candidate or any active render flight is heavy (multi-layer or tilemap
+    /// above `TA_LIGHT_TILEMAP_BYTES`), and `TA_WAVE_PASSES_LIGHT` (8) for light single-layer
+    /// render bursts.
+    fn ta_wave_cap_for(&self, cand_heavy: bool) -> usize {
+        if cand_heavy
+            || self
+                .engine
+                .flights
+                .iter()
+                .any(|fl| fl.renders != 0 && fl.heavy_render)
+        {
+            super::hw::sizes::TA_WAVE_PASSES
+        } else {
+            super::hw::sizes::TA_WAVE_PASSES_LIGHT
+        }
+    }
+
+    /// Active TA wave window across in-flight renders and pending render heads, used for
+    /// immediate wave doorbell flushes and `ta_wave_ready()` hysteresis.
+    pub(crate) fn active_ta_wave_cap(&self) -> usize {
+        if self
+            .engine
+            .flights
+            .iter()
+            .any(|fl| fl.renders != 0 && fl.heavy_render)
+            || self.engine.pending.iter().any(|cand| {
+                matches!(
+                    command(cand, cand.progress.sent()),
+                    Some(Command::Render(r)) if r.is_heavy_ta()
+                )
+            })
+        {
+            super::hw::sizes::TA_WAVE_PASSES
+        } else {
+            super::hw::sizes::TA_WAVE_PASSES_LIGHT
+        }
+    }
+
     /// Whether `job`'s next command may be published behind the flights in flight:
     ///
     /// - Compute queues behind healthy non-InitBM compute flights of any VM or same-VM
@@ -1428,6 +1496,14 @@ impl Firmware {
     ///   firmware DM1 timeout. Cold InitBM priming renders and every failure or recovery path
     ///   still drain the engine first.
     fn can_queue_behind(&self, job: &Arc<Job>) -> bool {
+        let mut ta_pending = None;
+        self.can_queue_behind_with_ta(job, &mut ta_pending)
+    }
+
+    /// [`Self::can_queue_behind`] with an optional caller-hoisted cache of
+    /// [`Self::ta_pending_passes`] so scanning many pending jobs performs at most one WC stamp
+    /// read per pass.
+    fn can_queue_behind_with_ta(&self, job: &Arc<Job>, ta_pending: &mut Option<usize>) -> bool {
         let e = &self.engine;
         let sent = job.progress.sent();
         if job.vm.status.get() != 0
@@ -1506,15 +1582,16 @@ impl Firmware {
                         .compute_slot_mask()
                         .is_ok_and(|mask| self.slots.compute_available_in_mask(mask))
             }
-            Some(Command::Render(_)) => {
+            Some(Command::Render(r)) => {
                 let cross_vm_compute = e
                     .flights
                     .iter()
                     .any(|f| f.computes != 0 && !Arc::ptr_eq(&f.job.vm, &job.vm));
                 let render_count: usize = e.flights.iter().map(|f| f.renders as usize).sum();
+                let ta_cap = self.ta_wave_cap_for(r.is_heavy_ta());
                 !cross_vm_compute
                     && render_count < params::render_flights()
-                    && self.ta_pending_passes() < super::hw::sizes::TA_WAVE_PASSES
+                    && *ta_pending.get_or_insert_with(|| self.ta_pending_passes()) < ta_cap
                     && !self.slots.render_exhausted()
                     && !self.pools.exhausted()
                     && super::recovery::logic::next_ordinal(e.draw).is_some()
@@ -1538,6 +1615,209 @@ impl Firmware {
             }
             None => false,
         }
+    }
+
+    /// Whether `self.engine.pending` is an eligible single-queue, single-VM busy horizon
+    /// batch that can accumulate more same-queue commands before publishing.
+    fn can_defer_busy_coalesce(&self, now: u64) -> bool {
+        if self.recovery.failed().is_some()
+            || self.engine.frozen
+            || self.engine.flights.is_empty()
+            || self.engine.pending.is_empty()
+            || self.engine.flights.len() >= super::hw::sizes::FLIGHTS
+            || self.engine.chan_wait
+            || self.engine.slot_wait
+            || self.engine.ta_wave_wait
+            || self
+                .engine
+                .flights
+                .iter()
+                .any(|f| f.doomed || f.recovery_suspect || f.initbm)
+        {
+            return false;
+        }
+        let head = &self.engine.pending[0];
+        let head_sent = head.progress.sent();
+        if head.vm.status.get() != 0
+            || head.long()
+            || !self.can_queue_behind(head)
+            || self
+                .engine
+                .flights
+                .iter()
+                .any(|fl| !Arc::ptr_eq(&fl.job.queue, &head.queue))
+            || self
+                .engine
+                .pending
+                .iter()
+                .any(|j| !Arc::ptr_eq(&j.queue, &head.queue) || !Arc::ptr_eq(&j.vm, &head.vm))
+        {
+            return false;
+        }
+        let Some(head_order) = head.command_order(head_sent) else {
+            return false;
+        };
+        match command(head, head_sent) {
+            Some(Command::Compute(c)) => {
+                if head.resources.compute_scs()
+                    || c.is_rt()
+                    || head_order.wait_through != [None, None]
+                    || !head.fw_waits.is_empty()
+                    || self.compute_queue_is_heavy(&head.queue, now)
+                {
+                    return false;
+                }
+                let queue_active: usize = self
+                    .engine
+                    .flights
+                    .iter()
+                    .filter(|fl| fl.computes != 0 && Arc::ptr_eq(&fl.job.queue, &head.queue))
+                    .map(|fl| fl.computes as usize)
+                    .sum();
+                if queue_active < 2 {
+                    return false;
+                }
+                let Some(mut next_seq) = head_order.sequence.checked_add(1) else {
+                    return false;
+                };
+                let mut pending_cmds = 1usize;
+                for k in (head_sent + 1)..head.progress.count() {
+                    let Some(Command::Compute(c2)) = command(head, k) else {
+                        return false;
+                    };
+                    if c2.is_rt() || !head.can_fold_horizon_cmd(k, next_seq) {
+                        return false;
+                    }
+                    let Some(s) = next_seq.checked_add(1) else {
+                        return false;
+                    };
+                    next_seq = s;
+                    pending_cmds += 1;
+                }
+                for j in &self.engine.pending[1..] {
+                    let n = j.progress.count();
+                    if j.long()
+                        || j.resources.compute_scs()
+                        || !j.can_fold_horizon_job(next_seq)
+                        || (0..n).any(|k| {
+                            matches!(command(j, k), Some(Command::Compute(c2)) if c2.is_rt())
+                        })
+                    {
+                        return false;
+                    }
+                    let Some(s) = next_seq.checked_add(u64::from(n)) else {
+                        return false;
+                    };
+                    next_seq = s;
+                    pending_cmds += n as usize;
+                }
+                let active_computes: usize = self
+                    .engine
+                    .flights
+                    .iter()
+                    .map(|fl| fl.computes as usize)
+                    .sum();
+                let Ok(slot_mask) = head.resources.compute_slot_mask() else {
+                    return false;
+                };
+                let pipe =
+                    self.choose_compute_pipe(&head.queue, [None, None], slot_mask, false, false);
+                let free_c = self.slots.free_compute_in_mask_for_pipe(slot_mask, pipe) as usize;
+                let cap = super::hw::sizes::COALESCE_MAX_CMDS
+                    .min(free_c)
+                    .min(params::compute_flights().saturating_sub(active_computes))
+                    .min(super::hw::sizes::COMPUTE_SLOTS);
+                cap > 1 && pending_cmds < cap
+            }
+            Some(Command::Render(r)) => {
+                if head.resources.render_scs() || !head.fw_waits.is_empty() {
+                    return false;
+                }
+                let queue_active: usize = self
+                    .engine
+                    .flights
+                    .iter()
+                    .filter(|fl| fl.renders != 0 && Arc::ptr_eq(&fl.job.queue, &head.queue))
+                    .map(|fl| fl.renders as usize)
+                    .sum();
+                if queue_active < 2 {
+                    return false;
+                }
+                let Some(mut next_seq) = head_order.sequence.checked_add(1) else {
+                    return false;
+                };
+                let mut wave_heavy = r.is_heavy_ta();
+                let mut pending_cmds = 1usize;
+                for k in (head_sent + 1)..head.progress.count() {
+                    if !head.can_fold_render_cmd(k, next_seq) {
+                        return false;
+                    }
+                    if matches!(command(head, k), Some(Command::Render(r2)) if r2.is_heavy_ta()) {
+                        wave_heavy = true;
+                    }
+                    let Some(s) = next_seq.checked_add(1) else {
+                        return false;
+                    };
+                    next_seq = s;
+                    pending_cmds += 1;
+                }
+                for j in &self.engine.pending[1..] {
+                    let n = j.progress.count();
+                    if j.long()
+                        || j.resources.render_scs()
+                        || !j.can_fold_render_horizon_job(next_seq)
+                    {
+                        return false;
+                    }
+                    if (0..n).any(|k| {
+                        matches!(command(j, k), Some(Command::Render(r2)) if r2.is_heavy_ta())
+                    }) {
+                        wave_heavy = true;
+                    }
+                    let Some(s) = next_seq.checked_add(u64::from(n)) else {
+                        return false;
+                    };
+                    next_seq = s;
+                    pending_cmds += n as usize;
+                }
+                let active_renders: usize = self
+                    .engine
+                    .flights
+                    .iter()
+                    .map(|fl| fl.renders as usize)
+                    .sum();
+                let wave_cap = self.ta_wave_cap_for(wave_heavy);
+                let ta_room = wave_cap.saturating_sub(self.ta_pending_passes());
+                let cap = super::hw::sizes::COALESCE_MAX_CMDS
+                    .min(params::render_flights().saturating_sub(active_renders))
+                    .min(ta_room)
+                    .min(super::hw::sizes::RENDER_SLOTS);
+                cap > 1 && pending_cmds < cap
+            }
+            None => false,
+        }
+    }
+
+    /// Defers immediate publication for up to `COALESCE_WINDOW_US` while a single queue already
+    /// has `>= 2` active commands in flight so consecutive same-queue `SUBMIT` ioctls accumulate
+    /// into one multi-command flight (up to `COALESCE_MAX_CMDS`), cutting `SubmitRecord`s, WC
+    /// producer updates, and doorbells without delaying `d=1`/`d=2`, barriered streams, RT/SCS
+    /// work, or multi-queue/cross-VM handoffs.
+    pub(crate) fn defer_busy_coalesce(&mut self, now: u64) -> Option<u32> {
+        if !self.can_defer_busy_coalesce(now) {
+            self.engine.coalesce_deadline_ns = 0;
+            return None;
+        }
+        if self.engine.coalesce_deadline_ns == 0 {
+            self.engine.coalesce_deadline_ns =
+                now.saturating_add(super::hw::sizes::COALESCE_WINDOW_NS);
+        }
+        if now >= self.engine.coalesce_deadline_ns {
+            self.engine.coalesce_deadline_ns = 0;
+            return None;
+        }
+        let rem_ns = self.engine.coalesce_deadline_ns.saturating_sub(now);
+        Some((rem_ns.div_ceil(1000) as u32).clamp(1, super::hw::sizes::COALESCE_WINDOW_US))
     }
 
     /// Resolves the newest in-flight target stamp and producer `InitBM` state for `class`
@@ -1808,19 +2088,54 @@ impl Firmware {
         Ok(waits)
     }
 
+    /// Whether `queue`'s recent or active compute work is heavy enough to benefit from 2-pipe
+    /// CDM fanout rather than 1-pipe affinity and horizon folding:
+    /// - per-queue retired CDM GPU duration EWMA `>= COMPUTE_HEAVY_EMA_US`, or
+    /// - a sole active single-command compute flight of `queue` on its pipe has already been
+    ///   executing for `>= COMPUTE_HEAVY_INFLIGHT_NS` without completing (instant detection
+    ///   before retirement updates the EWMA, while queued multi-flight light bursts never false-
+    ///   trigger from queueing age).
+    fn compute_queue_is_heavy(&self, queue: &Arc<super::queue::QueueState>, now: u64) -> bool {
+        if queue.compute_ewma_us.load(Ordering::Relaxed) >= super::hw::sizes::COMPUTE_HEAVY_EMA_US {
+            return true;
+        }
+        let mut pipe_flights = [0usize; super::hw::sizes::COMPUTE_PIPES];
+        for fl in &self.engine.flights {
+            if fl.computes != 0 {
+                let p = (fl.compute_pipe as usize).min(super::hw::sizes::COMPUTE_PIPES - 1);
+                pipe_flights[p] += 1;
+            }
+        }
+        self.engine.flights.iter().any(|fl| {
+            let p = (fl.compute_pipe as usize).min(super::hw::sizes::COMPUTE_PIPES - 1);
+            fl.computes == 1
+                && pipe_flights[p] == 1
+                && Arc::ptr_eq(&fl.job.queue, queue)
+                && fl.published_ns != 0
+                && now.saturating_sub(fl.published_ns)
+                    >= super::hw::sizes::COMPUTE_HEAVY_INFLIGHT_NS
+        })
+    }
+
     /// Chooses which compute pipe (`0..COMPUTE_PIPES`) executes the next compute command:
     /// - Base-only/SCS VMs (bits strictly in `0..PIPE1_COMPUTE_START`) or states where pipe 1
     ///   has no available unit in `slot_mask` stay on pipe 0 so `0..PIPE1_COMPUTE_START` never
     ///   split across two pipes.
     /// - If the command waits only on one pipe, reuse that pipe (in-order ring, zero `c2c`
     ///   barrier).
-    /// - If barrier-free (`[None, None]`) or waiting on both pipes (`[Some, Some]`), pick the
-    ///   pipe with fewer active compute commands, breaking ties by `next_compute_pipe`.
+    /// - If barrier-free (`[None, None]`), `!heavy_compute`, and `queue` already has an active
+    ///   compute flight on a single pipe with free units, keep that light queue pipe-affine so
+    ///   consecutive horizon submits fold onto one workqueue without splitting across pipes.
+    /// - Otherwise (heavy compute streams, other queues, cross-VM compute, or waiting on both
+    ///   pipes `[Some, Some]`), pick the pipe with fewer active compute commands, breaking ties
+    ///   by `next_compute_pipe`.
     fn choose_compute_pipe(
         &self,
+        queue: &Arc<super::queue::QueueState>,
         waits: [Option<WaitTarget>; sizes::COMPUTE_PIPES],
         slot_mask: u32,
         rt_compute: bool,
+        heavy_compute: bool,
     ) -> usize {
         if rt_compute
             || self
@@ -1833,27 +2148,47 @@ impl Firmware {
             return 0;
         }
         match waits {
-            [Some(_), None] => 0,
-            [None, Some(_)] => 1,
-            _ => {
-                if !self.slots.compute_available_in_mask_for_pipe(slot_mask, 0) {
-                    return 1;
-                }
-                let mut active = [0usize; sizes::COMPUTE_PIPES];
+            [Some(_), None] => return 0,
+            [None, Some(_)] => return 1,
+            [None, None] if !heavy_compute => {
+                let mut q_pipe: Option<usize> = None;
                 for fl in &self.engine.flights {
-                    if fl.computes != 0 {
+                    if fl.computes != 0 && Arc::ptr_eq(&fl.job.queue, queue) {
                         let p = (fl.compute_pipe as usize).min(sizes::COMPUTE_PIPES - 1);
-                        active[p] += fl.computes as usize;
+                        match q_pipe {
+                            None => q_pipe = Some(p),
+                            Some(prev) if prev == p => {}
+                            Some(_) => {
+                                q_pipe = None;
+                                break;
+                            }
+                        }
                     }
                 }
-                if active[0] < active[1] {
-                    0
-                } else if active[1] < active[0] {
-                    1
-                } else {
-                    (self.engine.next_compute_pipe as usize) % sizes::COMPUTE_PIPES
+                if let Some(p) = q_pipe {
+                    if self.slots.compute_available_in_mask_for_pipe(slot_mask, p) {
+                        return p;
+                    }
                 }
             }
+            [None, None] | [Some(_), Some(_)] => {}
+        }
+        if !self.slots.compute_available_in_mask_for_pipe(slot_mask, 0) {
+            return 1;
+        }
+        let mut active = [0usize; sizes::COMPUTE_PIPES];
+        for fl in &self.engine.flights {
+            if fl.computes != 0 {
+                let p = (fl.compute_pipe as usize).min(sizes::COMPUTE_PIPES - 1);
+                active[p] += fl.computes as usize;
+            }
+        }
+        if active[0] < active[1] {
+            0
+        } else if active[1] < active[0] {
+            1
+        } else {
+            (self.engine.next_compute_pipe as usize) % sizes::COMPUTE_PIPES
         }
     }
 
@@ -2069,8 +2404,8 @@ impl Firmware {
         } else {
             &[Channel::Compute]
         };
-        let (compute_pipe, c_waits) = if render {
-            (0usize, [None; sizes::COMPUTE_PIPES])
+        let (compute_pipe, c_waits, heavy_compute) = if render {
+            (0usize, [None; sizes::COMPUTE_PIPES], false)
         } else {
             let slot_mask = job.resources.compute_slot_mask()?;
             let rt_compute = job.resources.compute_scs()
@@ -2080,7 +2415,12 @@ impl Firmware {
                 job.command_order(index)
                     .and_then(|o| o.wait_through[super::command::COMPUTE]),
             )?;
-            (self.choose_compute_pipe(waits, slot_mask, rt_compute), waits)
+            let heavy = self.compute_queue_is_heavy(&job.queue, now_ns());
+            (
+                self.choose_compute_pipe(&job.queue, waits, slot_mask, rt_compute, heavy),
+                waits,
+                heavy,
+            )
         };
         let pipe_behind = !render
             && self
@@ -2198,11 +2538,13 @@ impl Firmware {
                     }
                 }
                 let active_computes = active_pipe[0] + active_pipe[1];
-                // Keep barrier-free work balanced across both compute pipes: fold extra commands
-                // into this pipe only when the alternate pipe already has deeper queued work, so
-                // independent submits distribute across pipes 0 and 1 in the same doorbell batch.
-                let pipe_fold_cap =
-                    active_pipe[1 - compute_pipe].saturating_sub(active_pipe[compute_pipe] + 1);
+                // Keep heavy barrier-free compute balanced across both CDM pipes while light
+                // single-queue compute streams stay pipe-affine and fold freely into one batch.
+                let pipe_fold_cap = if heavy_compute && c_waits == [None; sizes::COMPUTE_PIPES] {
+                    active_pipe[1 - compute_pipe].saturating_sub(active_pipe[compute_pipe] + 1)
+                } else {
+                    usize::MAX
+                };
                 let used = prefix.c_head.wrapping_sub(c_read) % sizes::QUEUE_CAP;
                 let ring_more = (sizes::QUEUE_CAP.saturating_sub(4)).saturating_sub(used) as usize;
                 let mut more_slots = free_c
@@ -2370,10 +2712,18 @@ impl Firmware {
                         .iter()
                         .map(|fl| fl.renders as usize)
                         .sum();
+                    let ta_pending_before = self.ta_pending_passes();
+                    let mut wave_heavy =
+                        self.ta_wave_cap_for(r.is_heavy_ta()) == sizes::TA_WAVE_PASSES;
+                    let wave_cap = if wave_heavy {
+                        sizes::TA_WAVE_PASSES
+                    } else {
+                        sizes::TA_WAVE_PASSES_LIGHT
+                    };
                     let mut more_renders = params::render_flights()
                         .saturating_sub(active_renders + 1)
                         .min(sizes::RENDER_SLOTS.saturating_sub(1))
-                        .min(sizes::TA_WAVE_PASSES.saturating_sub(self.ta_pending_passes() + 1));
+                        .min(wave_cap.saturating_sub(ta_pending_before + 1));
                     while more_renders > 0 && end < job.progress.count() {
                         let Some(next_seq) = last_seq.and_then(|s| s.checked_add(1)) else {
                             break;
@@ -2386,6 +2736,18 @@ impl Firmware {
                         let Some(Command::Render(r2)) = command(job, end) else {
                             break;
                         };
+                        if r2.is_heavy_ta() && !wave_heavy {
+                            if ta_pending_before + prefix.renders as usize + 1
+                                > sizes::TA_WAVE_PASSES
+                            {
+                                break;
+                            }
+                            wave_heavy = true;
+                            more_renders = more_renders.min(
+                                sizes::TA_WAVE_PASSES
+                                    .saturating_sub(ta_pending_before + prefix.renders as usize),
+                            );
+                        }
                         let Some(o2) = job.command_order(end) else {
                             break;
                         };
@@ -2461,7 +2823,7 @@ impl Firmware {
                         more_renders -= 1;
                     }
                     // Cross-job render horizon: fold subsequent ready render-only jobs of
-                    // the same queue and VM into the same <= TA_WAVE_PASSES flight, sharing
+                    // the same queue and VM into the same adaptive TA wave flight, sharing
                     // one TA/FS producer advance, one UMA submitted update, and one doorbell.
                     // Any non-qualifying job of this queue ends the scan so no later job
                     // overtakes it.
@@ -2514,14 +2876,18 @@ impl Firmware {
                             {
                                 break;
                             }
-                            let mut picked = [0usize; sizes::TA_WAVE_PASSES];
+                            let mut picked = [0usize; sizes::TA_WAVE_PASSES_LIGHT];
                             let mut picked_mask = f.claims.pass_mask;
                             let mut precheck_ok = true;
+                            let mut job_heavy = false;
                             for k in 0..n2 {
                                 let Some(Command::Render(r2)) = command(&j2, k) else {
                                     precheck_ok = false;
                                     break;
                                 };
+                                if r2.is_heavy_ta() {
+                                    job_heavy = true;
+                                }
                                 let Some(o2) = j2.command_order(k) else {
                                     precheck_ok = false;
                                     break;
@@ -2578,7 +2944,13 @@ impl Firmware {
                                 picked[k as usize] = slot;
                                 picked_mask |= 1u64 << slot;
                             }
-                            if !precheck_ok || f.group.reserve(1, GFP_NOWAIT).is_err() {
+                            if !precheck_ok
+                                || (job_heavy
+                                    && !wave_heavy
+                                    && ta_pending_before + prefix.renders as usize + n2_usize
+                                        > sizes::TA_WAVE_PASSES)
+                                || f.group.reserve(1, GFP_NOWAIT).is_err()
+                            {
                                 break;
                             }
                             let _ = f.group.push_within_capacity(j2.clone());
@@ -2607,6 +2979,12 @@ impl Firmware {
                             }
                             last_seq = Some(first_seq + u64::from(n2 - 1));
                             more_renders -= n2_usize;
+                            if job_heavy && !wave_heavy {
+                                wave_heavy = true;
+                                let ta_in_wave = ta_pending_before + prefix.renders as usize;
+                                more_renders = more_renders
+                                    .min(sizes::TA_WAVE_PASSES.saturating_sub(ta_in_wave));
+                            }
                         }
                     }
                 }
@@ -3152,6 +3530,7 @@ impl Firmware {
             (refs, false)
         };
         f.has_timestamps |= !cmd.timestamp_outputs.is_empty();
+        f.heavy_render |= cmd.is_heavy_ta();
         let p = resources.render_pass(k)?;
         let pass = p.refs();
         let heap_bytes = if cmd.cmd.layers > 1 { 0x1000 } else { 0x200 };

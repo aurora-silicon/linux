@@ -782,13 +782,19 @@ pub(crate) mod sizes {
     /// Worst-case firmware work-ring entries per compute command (`fs2c` barrier + cross-pipe
     /// `c2c` barrier + `work`).
     pub(crate) const MAX_COMPUTE_RING_ENTRIES: usize = 3;
-    /// Maximum unfinished TA passes kept in flight at once so multi-pass render bursts stay
-    /// inside M4 firmware's `<= 4`-pass TA/scene pipeline without throttling single-pass
-    /// pipelining (where TA finishes well ahead of FS).
+    /// Maximum unfinished TA passes kept in flight at once for heavy multi-layer or large-tilemap
+    /// renders so heavy bursts stay inside M4 firmware's `<= 4`-pass TA/scene pipeline.
     pub(crate) const TA_WAVE_PASSES: usize = 4;
-    /// Unfinished TA pass count at or below which a TA-wave-paused render queue wakes to
+    /// Maximum unfinished TA passes kept in flight at once for light single-layer renders
+    /// (`tilemap_bytes <= TA_LIGHT_TILEMAP_BYTES`), doubling the wave window for light render
+    /// bursts and deeper micro-coalesced batches.
+    pub(crate) const TA_WAVE_PASSES_LIGHT: usize = 8;
+    /// Tilemap byte threshold at or below which a single-layer render qualifies for
+    /// `TA_WAVE_PASSES_LIGHT`.
+    pub(crate) const TA_LIGHT_TILEMAP_BYTES: u64 = 64 * 1024;
+    /// Headroom below the active TA wave cap at which a TA-wave-paused render queue wakes to
     /// launch the next wave, avoiding 1-pass stub drips.
-    pub(crate) const TA_WAVE_REFILL: usize = TA_WAVE_PASSES / 2;
+    pub(crate) const TA_WAVE_REFILL_HEADROOM: usize = 2;
     /// Base render pass slots allocated on first render (full TPC/tilemap capacity).
     pub(crate) const BASE_RENDER_SLOTS: usize = 2;
     /// Retained render pass slots per VM at most. A slot is reused only after a later render
@@ -896,10 +902,22 @@ pub(crate) mod sizes {
     );
     /// Maximum jobs folded into one barrier-free compute horizon prefix.
     pub(crate) const HORIZON_JOBS: u32 = COMPUTE_UNITS as u32;
-    /// Jobs admitted to the engine per logical queue: enough to keep a queue's commands
-    /// in flight back to back without scheduler backpressure stalls; exact prior-command
+    /// Maximum commands accumulated in a busy-state horizon micro-coalescing batch before
+    /// immediate publication, and maximum hold window (18 us) while a queue already has >= 2
+    /// active commands in flight.
+    pub(crate) const COALESCE_MAX_CMDS: usize = 6;
+    pub(crate) const COALESCE_WINDOW_US: u32 = 18;
+    pub(crate) const COALESCE_WINDOW_NS: u64 = (COALESCE_WINDOW_US as u64) * 1000;
+    /// Per-queue retired CDM execution EWMA threshold (microseconds) at or above which
+    /// barrier-free compute fans out across both CDM pipes instead of staying 1-pipe affine.
+    pub(crate) const COMPUTE_HEAVY_EMA_US: u32 = 200;
+    /// Elapsed wall-clock time (nanoseconds) on a sole active single-command compute flight
+    /// that immediately classifies the queue as heavy before its first retirement updates EWMA.
+    pub(crate) const COMPUTE_HEAVY_INFLIGHT_NS: u64 = 180_000;
+    /// Jobs admitted to the engine per logical queue: enough to keep deep queues (`d=64`)
+    /// queued back to back without scheduler backpressure stalls; exact prior-command
     /// dependencies still gate each one.
-    pub(crate) const SCHEDULER_CREDITS: u32 = 32;
+    pub(crate) const SCHEDULER_CREDITS: u32 = 64;
     /// Unconsumed records per 256-entry channel ring a prefix may be posted behind.
     pub(crate) const AHEAD_RECORDS: u32 = 128;
     /// Policy bound on logical queues reported in QUEUE_LIMITS (not a firmware limit).
