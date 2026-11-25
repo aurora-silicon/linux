@@ -44,7 +44,10 @@ pub(crate) mod glue {
 
     extern "C" {
         fn asahi_g16_board() -> bool;
-        fn asahi_g16_display_prepare(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
+        fn asahi_g16_display_prepare(
+            dev: *mut core::ffi::c_void,
+            display_compat: *const core::ffi::c_char,
+        ) -> core::ffi::c_int;
         fn asahi_g16_timebase_hz() -> u32;
         fn asahi_g16_hold_power(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
         fn asahi_g16_ram_disjoint(start: u64, size: u64) -> bool;
@@ -70,9 +73,14 @@ pub(crate) mod glue {
     }
 
     /// Links the GPU to the published native display, or defers until it is.
-    pub(crate) fn display_prepare(dev: &device::Device) -> Result {
-        // SAFETY: `dev` is the bound GPU device; the helper only adds a device link.
-        kernel::error::to_result(unsafe { asahi_g16_display_prepare(dev.as_raw().cast()) })
+    pub(crate) fn display_prepare(dev: &device::Device, display_compatible: &[u8]) -> Result {
+        let Ok(cstr) = core::ffi::CStr::from_bytes_with_nul(display_compatible) else {
+            return Err(EINVAL);
+        };
+        // SAFETY: `dev` is the bound GPU device; `cstr` is NUL-terminated.
+        kernel::error::to_result(unsafe {
+            asahi_g16_display_prepare(dev.as_raw().cast(), cstr.as_ptr().cast())
+        })
     }
 
     /// The system counter frequency in Hz, as the boot loader programmed it.
@@ -631,7 +639,7 @@ pub(crate) fn admit(
             return Err(err);
         }
     }
-    glue::display_prepare(dev).inspect_err(|e| {
+    glue::display_prepare(dev, cfg.display_compatible).inspect_err(|e| {
         if *e != EPROBE_DEFER {
             dev_err!(dev, "native display not admitted: {:?}\n", e);
         }

@@ -33,7 +33,6 @@
 #include "glue.h"
 
 bool asahi_g16_board(void);
-int asahi_g16_display_prepare(struct device *dev);
 int asahi_g16_hold_power(struct device *dev);
 bool asahi_g16_ram_disjoint(u64 start, u64 size);
 void __iomem *asahi_g16_ioremap_wc(u64 start, size_t size);
@@ -463,26 +462,25 @@ u32 asahi_g16_timebase_hz(void)
  * without one (no internal panel, or none qualified) starts on the boot
  * framebuffer.
  */
-int asahi_g16_display_prepare(struct device *dev)
+int asahi_g16_display_prepare(struct device *dev, const char *display_compat)
 {
-	bool t6030 = of_device_is_compatible(dev->of_node, "apple,agx-t6030");
 	struct device_node *np;
 	bool handed_over;
 	int ret;
 
-	np = of_find_compatible_node(NULL, NULL,
-				     t6030 ? "apple,t6030-display-subsystem" :
-					     "apple,t8132-display-subsystem");
+	if (!display_compat || !*display_compat)
+		return -EINVAL;
+	np = of_find_compatible_node(NULL, NULL, display_compat);
 	handed_over = np && of_device_is_available(np);
-	of_node_put(np);
 	if (!handed_over) {
+		of_node_put(np);
 		dev_info_once(dev, "G16: no native display this boot; starting on the boot framebuffer\n");
 		return 0;
 	}
-	ret = t6030 ? apple_drm_t6030_link_device(dev) : apple_drm_t8132_link_device(dev);
+	ret = apple_drm_link_device(dev, np);
+	of_node_put(np);
 	if (ret == -EPROBE_DEFER)
-		dev_info_once(dev, "G16: waiting for the %s native display to register\n",
-			      t6030 ? "T6030" : "T8132");
+		dev_info_once(dev, "G16: waiting for %s to register\n", display_compat);
 	return ret;
 }
 

@@ -42,6 +42,8 @@ pub(crate) struct Config {
     pub(crate) hw_ids: &'static [HwId],
     /// Compatible of the original ADT SGX node.
     pub(crate) adt_compatible: &'static [u8],
+    /// NUL-terminated compatible of the native display subsystem supplier.
+    pub(crate) display_compatible: &'static [u8],
     /// Qualified boot-loader handoffs.
     pub(crate) layouts: &'static [&'static FwLayout],
     /// Qualified firmware builds.
@@ -93,6 +95,7 @@ pub(crate) mod t8132 {
             counts: 0x0011010a,
         }],
         adt_compatible: b"gpu,t8132",
+        display_compatible: b"apple,t8132-display-subsystem\0",
         layouts: &[&FW_25G83, &FW_26B123],
         firmware: &[
             FirmwareBuild {
@@ -322,6 +325,7 @@ pub(crate) mod t6030 {
             counts: 0x00110209,
         }],
         adt_compatible: b"gpu,t6030",
+        display_compatible: b"apple,t6030-display-subsystem\0",
         layouts: &[&LAYOUT],
         firmware: &[FirmwareBuild {
             name: "Apple GFX 26B123 G15S (build b000, iBoot-filled ranges zeroed)",
