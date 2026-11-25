@@ -116,6 +116,31 @@ pub(crate) fn wake_kick(abstime_offset: u64) -> Message {
     }
 }
 
+/// The rate of the AP's absolute time: the 24 MHz timebase-frequency of every CPU in J516s's
+/// ADT, at which both traced wake messages decode. Linux's counter may run faster: 1 GHz on
+/// J516s and T8140.
+pub(crate) const ABSTIME_HZ: u64 = 24_000_000;
+
+/// `ticks` of a counter running at `counter_hz`, in absolute-time ticks, rounded down. Exact
+/// in u64 for a counter no slower than the timebase; 0 for a counter without a rate.
+pub(crate) fn abstime_ticks(ticks: u64, counter_hz: u32) -> u64 {
+    let hz = u64::from(counter_hz);
+    if hz == 0 {
+        return 0;
+    }
+    // The remainder is below 2^32, so its product stays below 2^57.
+    (ticks / hz)
+        .wrapping_mul(ABSTIME_HZ)
+        .wrapping_add((ticks % hz) * ABSTIME_HZ / hz)
+}
+
+/// The absolute-time offset after a sleep the counter timed from `stop` to `wake`, from
+/// `offset` before it: lowered by the sleep's length in absolute-time ticks. The counter may
+/// wrap in between.
+pub(crate) fn abstime_offset_after(offset: u64, stop: u64, wake: u64, counter_hz: u32) -> u64 {
+    offset.wrapping_sub(abstime_ticks(wake.wrapping_sub(stop), counter_hz))
+}
+
 /// The control messages a woken enclave sends without being asked, in order.
 pub(crate) const WAKE_TYPES: [u8; 2] = [0x0d, 0x10];
 
@@ -342,6 +367,36 @@ mod tests {
         assert_eq!(f.ep, EP_CONTROL);
         assert_eq!(f.ty, CONTROL_REPLY_TYPE);
         assert_eq!(f.tag, TAG_SLEEP);
+    }
+
+    #[test]
+    fn a_sleep_lowers_the_offset_in_timebase_ticks() {
+        const GHZ: u32 = 1_000_000_000;
+        // Linux's 1 GHz counter: 60 s asleep is 1.44e9 ticks of the 24 MHz timebase.
+        let offset = abstime_offset_after(0, 5_000_000_000, 65_000_000_000, GHZ);
+        assert_eq!(offset as i64, -1_440_000_000);
+        // A second sleep, of 59.828 s, adds to the first.
+        let offset = abstime_offset_after(offset, 90_000_000_000, 149_828_000_000, GHZ);
+        assert_eq!(offset as i64, -1_440_000_000 - 1_435_872_000);
+        // t5's word, from the 59.869207125 s it stands for.
+        assert_eq!(
+            abstime_offset_after(0, 0, 59_869_207_125, GHZ),
+            0xffff_ffff_aa5b_3dd5
+        );
+        // A counter at the timebase's own rate passes through.
+        assert_eq!(
+            abstime_offset_after(0, 7, 24_000_007, 24_000_000) as i64,
+            -24_000_000
+        );
+        // A counter without a rate changes nothing.
+        assert_eq!(abstime_offset_after(5, 0, 1_000, 0), 5);
+    }
+
+    #[test]
+    fn a_counter_wrap_in_a_sleep_counts_its_length() {
+        // 1 s before the wrap to 59 s after it.
+        let offset = abstime_offset_after(0, u64::MAX - 999_999_999, 59_000_000_000, 1_000_000_000);
+        assert_eq!(offset as i64, -1_440_000_000);
     }
 
     #[test]

@@ -31,6 +31,7 @@
 
 #include <clocksource/arm_arch_timer.h>
 
+#include <asm/arch_timer.h>
 #include <asm/virt.h>
 
 #include "shim.h"
@@ -206,42 +207,43 @@ int sep_pm_dart_restore(void *ptr)
 }
 
 /*
- * The enclave's first message after its wake is the AP's absolute-time offset, as macOS
- * sends it. macOS's absolute time is the counter plus that offset, which starts at zero at
- * boot, and it stops while the AP sleeps: each sleep lowers the offset by the counter ticks
- * it took. A sleep counts here from the enclave's gate, after which it reads no time, to the
- * early wake. Seen from the enclave, absolute time then never goes back.
+ * The AP's absolute time, whose offset the enclave's wake message carries (proto.rs), stops
+ * while the AP sleeps. Each physical sleep is timed here on the counter, to syscore resume
+ * from the later of syscore suspend and, where the commit tells the enclave, its gate. By
+ * then the enclave reads no time, so as it sees it absolute time never goes back. An attempt
+ * the platform refused is dropped at its syscore resume.
  */
 static struct {
-	u64 offset;
-	u64 at_gate;	/* absolute time when the enclave gated */
-	bool asleep;	/* at_gate is set, and the wake not yet counted */
-} sep_pm_abstime;
+	u64 stop, wake;
+	bool stopped;	/* this attempt's stop is set */
+	bool slept;	/* stop and wake bound a sleep no wake message has counted */
+} sep_pm_sleep;
 
-/* The enclave gated itself: absolute time stops here. */
-static void sep_pm_abstime_stop(void)
+static void sep_pm_sleep_stop(void)
 {
-	sep_pm_abstime.at_gate = arch_timer_read_counter() + sep_pm_abstime.offset;
-	sep_pm_abstime.asleep = true;
+	sep_pm_sleep.stop = arch_timer_read_counter();
+	sep_pm_sleep.stopped = true;
 }
 
-/* Absolute time runs again from the counter's value now. */
-static void sep_pm_abstime_start(void)
+/* The last step before the platform's: every attempt that reaches it. */
+static int sep_pm_syscore_suspend(void *data)
 {
-	if (!sep_pm_abstime.asleep)
-		return;
-	sep_pm_abstime.offset = sep_pm_abstime.at_gate - arch_timer_read_counter();
-	sep_pm_abstime.asleep = false;
+	sep_pm_sleep_stop();
+	return 0;
 }
 
-/* The early wake, before any device resumes: only a sleep the platform returned from. */
+/* The first step after the platform's, before any device resumes. */
 static void sep_pm_syscore_resume(void *data)
 {
-	if (pm_resume_via_firmware())
-		sep_pm_abstime_start();
+	if (sep_pm_sleep.stopped && pm_resume_via_firmware()) {
+		sep_pm_sleep.wake = arch_timer_read_counter();
+		sep_pm_sleep.slept = true;
+	}
+	sep_pm_sleep.stopped = false;
 }
 
 static const struct syscore_ops sep_pm_syscore_ops = {
+	.suspend = sep_pm_syscore_suspend,
 	.resume = sep_pm_syscore_resume,
 };
 
@@ -249,11 +251,19 @@ static struct syscore sep_pm_syscore = {
 	.ops = &sep_pm_syscore_ops,
 };
 
-/* The wake message's payload, as two's complement. */
-u64 sep_pm_abstime_offset(void)
+/*
+ * For the wake message: the counter at the last sleep's stop and at its wake, and its rate.
+ * False if no sleep has ended since the last call. Every real wake sends one wake message.
+ */
+bool sep_pm_last_sleep(u64 *stop, u64 *wake, u32 *hz)
 {
-	sep_pm_abstime_start();
-	return sep_pm_abstime.offset;
+	if (!sep_pm_sleep.slept)
+		return false;
+	sep_pm_sleep.slept = false;
+	*stop = sep_pm_sleep.stop;
+	*wake = sep_pm_sleep.wake;
+	*hz = arch_timer_get_cntfrq();
+	return true;
 }
 
 #define SEP_PM_POLL_US		20
@@ -397,7 +407,8 @@ out:
 	c->gate_valid = true;
 	if (c->gate_ret)
 		panic("SEP SLEEP did not gate after send: %d state %#x", c->gate_ret, c->state);
-	sep_pm_abstime_stop();
+	/* Later than syscore suspend: the enclave read the time until it gated. */
+	sep_pm_sleep_stop();
 
 	return 0;
 }
@@ -545,9 +556,6 @@ static int __maybe_unused sep_pm_suspend_noirq(struct device *dev)
 	ret = sep_pm_wait_gated(dev, 5000);
 	if (ret > 0)
 		ret = -ETIMEDOUT;
-	/* Asleep from here: gated, or with no domain to see it by. */
-	if (!ret || ret == -ENOENT)
-		sep_pm_abstime_stop();
 	if (ret == -ENOENT)
 		return 0;
 	if (ret) {

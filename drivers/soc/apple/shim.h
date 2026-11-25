@@ -37,7 +37,7 @@ int sep_pm_dart_prepare(void *dev);
 bool sep_pm_platform_commit(void);
 int sep_pm_commit_prepare(void *dev, void *mbox, u64 msg0, u32 msg1, u64 reply, u64 mask);
 int sep_pm_commit_finish(void *dev);
-u64 sep_pm_abstime_offset(void);
+bool sep_pm_last_sleep(u64 *stop, u64 *wake, u32 *hz);
 extern const struct dev_pm_ops sep_pm_ops;
 
 /* -- hwrng_shim.c ------------------------------------------------------- */

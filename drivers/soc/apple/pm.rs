@@ -50,7 +50,7 @@ extern "C" {
         mask: u64,
     ) -> c_int;
     fn sep_pm_commit_finish(dev: *mut c_void) -> c_int;
-    fn sep_pm_abstime_offset() -> u64;
+    fn sep_pm_last_sleep(stop: *mut u64, wake: *mut u64, hz: *mut u32) -> bool;
     pub(crate) static sep_pm_ops: kernel::bindings::dev_pm_ops;
 }
 
@@ -131,11 +131,17 @@ pub(crate) fn commit_finish(dev: &kernel::device::Device) -> Option<bool> {
     }
 }
 
-/// The AP's absolute-time offset, which the enclave's wake message carries: kept across
-/// sleeps, and lowered by each one the enclave slept through.
-pub(crate) fn abstime_offset() -> u64 {
-    // SAFETY: no preconditions; the shim reads the counter and its own state.
-    unsafe { sep_pm_abstime_offset() }
+/// The AP's absolute-time offset for the enclave's wake message, from `offset` before the
+/// sleep that just ended: see [`crate::proto::abstime_offset_after`]. Unchanged if no sleep
+/// ended since the last call.
+pub(crate) fn abstime_offset(offset: u64) -> u64 {
+    let (mut stop, mut wake, mut hz) = (0u64, 0u64, 0u32);
+    // SAFETY: the shim only writes the three values through these pointers.
+    if unsafe { sep_pm_last_sleep(&mut stop, &mut wake, &mut hz) } {
+        crate::proto::abstime_offset_after(offset, stop, wake, hz)
+    } else {
+        offset
+    }
 }
 
 /// How long the enclave gets to gate its domain once it has answered (told at suspend).

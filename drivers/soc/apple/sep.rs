@@ -694,6 +694,9 @@ struct SepData {
     // A sleep-only profile's bring-up completed: endpoints found, the xART buffer registered
     // and a NOP answered. Its enclave's sleep is armed only then.
     sleep_ready: Atomic<bool>,
+    /// The AP's absolute-time offset the last wake message carried: zero at boot, kept across
+    /// sleeps (see `proto::abstime_offset_after`).
+    abstime_offset: Atomic<u64>,
 
     #[pin]
     ool_xarm: Mutex<Option<OolPair>>,
@@ -1246,6 +1249,7 @@ impl SepData {
                 sleep_unanswered: Atomic::new(false),
                 control_answered: Atomic::new(false),
                 sleep_ready: Atomic::new(false),
+                abstime_offset: Atomic::new(0),
                 ool_xarm <- new_mutex!(Some(ool_xarm)),
                 ool_sbio <- new_mutex!(Some(ool_sbio)),
                 ool_sks <- new_mutex!(Some(ool_sks)),
@@ -1928,7 +1932,9 @@ impl SepData {
         match self.mbox.lock().as_ref() {
             Some(mbox) => {
                 mbox.set_recv_enabled(true);
-                Self::ring(mbox, proto::wake_kick(pm::abstime_offset()))?;
+                let offset = pm::abstime_offset(self.abstime_offset.load(Relaxed));
+                self.abstime_offset.store(offset, Relaxed);
+                Self::ring(mbox, proto::wake_kick(offset))?;
             }
             None => return Err(ENODEV),
         }
