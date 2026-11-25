@@ -3,11 +3,12 @@
 //! Module parameters and the GET_PARAMS identity.
 //!
 //! With the shared `file.rs` additions (VM_STATUS and VM_STATUS_MIRROR from `supports_vm_status`,
-//! SOFT_FAULTS suppressed by `soft_faults`, VDM_USC_INVALIDATE, and `INDEPENDENT_QUEUES` from
-//! `queue_limits`), G16 advertises per-command input readiness/errors, exact queue-local historical
-//! prefixes, fragment-only and staged render barriers (`RENDER_STAGE_PREFIXES_V2`), independent
-//! logical queues, `FEW_PRIMITIVES`, `COMPUTE_NO_QUERY_ACCESS`, render ray queries
-//! (`RENDER_RAY_QUERY`) and bounded AS builds (`BOUNDED_AS_BUILD`).
+//! SOFT_FAULTS from `soft_faults` and `fault_control`, VDM_USC_INVALIDATE, and
+//! `INDEPENDENT_QUEUES` from `queue_limits`), G16 advertises per-command input readiness/errors,
+//! exact queue-local historical prefixes, fragment-only and staged render barriers
+//! (`RENDER_STAGE_PREFIXES_V2`), independent logical queues, `FEW_PRIMITIVES`,
+//! `COMPUTE_NO_QUERY_ACCESS`, render ray queries (`RENDER_RAY_QUERY`) and bounded AS builds
+//! (`BOUNDED_AS_BUILD`).
 
 use kernel::{prelude::*, uapi};
 
