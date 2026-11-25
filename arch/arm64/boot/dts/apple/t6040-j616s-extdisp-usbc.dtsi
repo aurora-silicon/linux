@@ -36,18 +36,7 @@
 	/delete-property/ apple,always-on;
 };
 
-/* tipd switches the PHY into DP alt mode through the connector graph. */
-&atcphy0 {
-	mode-switch;
-};
-
-&atcphy1 {
-	mode-switch;
-};
-
-&atcphy2 {
-	mode-switch;
-};
+/* The PHYs are the connectors' mode switches: see t6040-usb4-typec.dtsi. */
 
 /*
  * Type-C display routes through the display fabric, as T6030 and J700:

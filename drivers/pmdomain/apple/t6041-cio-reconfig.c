@@ -2,9 +2,13 @@
 /*
  * Apple T6041 CIO cluster reconfiguration controller
  *
- * The three CIO ports share one PMGR register. Each port has a request bit
- * and a busy bit sixteen positions above it. Firmware waits before and after
- * the read/modify/write request, with a 192 ms budget for each wait.
+ * The CIO ports share one PMGR register. Each port has a request bit and a
+ * busy bit sixteen positions above it. Firmware waits before and after the
+ * read/modify/write request, with a 192 ms budget for each wait.
+ *
+ * The PMGR has four of them (ADT pmgr CIO0-RECONFIG to CIO3-RECONFIG) on
+ * every T6040/T6041 board, whether or not the board wires the fourth router:
+ * the J575c does (ADT acio3), the laptops don't.
  */
 
 #include <linux/bits.h>
@@ -18,7 +22,7 @@
 #include <linux/regmap.h>
 #include <linux/reset-controller.h>
 
-#define T6041_CIO_RECONFIG_PORTS	3
+#define T6041_CIO_RECONFIG_PORTS	4
 #define T6041_CIO_RECONFIG_POLL_US	100
 #define T6041_CIO_RECONFIG_TIMEOUT_US	192000
 
