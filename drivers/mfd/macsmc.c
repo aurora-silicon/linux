@@ -963,17 +963,34 @@ static int apple_smc_notice_idle(struct apple_smc *smc)
 #define SMC_WKTP_SLEEP		2
 #define SMC_WKTP_AWAKE		0
 
-/* WKTP back to 0 after a full wake, or after a sleep that ended in a refusal. */
+/*
+ * WKTP back to 0 after a full wake, or after a sleep that ended in a refusal. Until the SMC has
+ * taken it, the next full wake or refusal writes it again.
+ */
 static void apple_smc_wake_full(struct apple_smc *smc)
 {
 	int ret;
 
 	if (!smc->wake_silent)
 		return;
-	smc->wake_silent = false;
 	ret = apple_smc_write_u8(smc, SMC_KEY(WKTP), SMC_WKTP_AWAKE);
-	if (ret)
+	if (ret) {
 		dev_err(smc->dev, "Failed to write WKTP = %u: %d\n", SMC_WKTP_AWAKE, ret);
+		return;
+	}
+	smc->wake_silent = false;
+}
+
+/*
+ * A sleep's warning or wake that the SMC wasn't told the end of: quarantined, as no further
+ * command goes out after this. The owed WKTP goes first, while one still may: the guard
+ * refuses it from here on, and the SMC would treat all the time awake as a power nap.
+ */
+static void apple_smc_enter_recovery(struct apple_smc *smc, int err)
+{
+	apple_smc_wake_full(smc);
+	smc->saved_recovery = true;
+	smc->saved_restore_error = err;
 }
 
 static int apple_smc_sleep_commit(struct apple_smc *smc)
@@ -1238,9 +1255,8 @@ static void apple_smc_sleep_wake(struct apple_smc *smc, bool woken)
 			ret = apple_smc_write_u32(smc, SMC_KEY(pmVC), smc->sleep_policy->pmvc);
 		}
 		if (ret) {
-			smc->saved_recovery = true;
-			smc->saved_restore_error = ret;
 			dev_err(smc->dev, "SMC wake policy failed: %d\n", ret);
+			apple_smc_enter_recovery(smc, ret);
 			return;
 		}
 	}
@@ -1765,8 +1781,7 @@ static int apple_smc_sleep_prepare(struct apple_smc *smc)
 			int rollback = apple_smc_write_u32(smc, SMC_KEY(MBSE), SMC_KEY(waka));
 
 			if (rollback) {
-				smc->saved_recovery = true;
-				smc->saved_restore_error = rollback;
+				apple_smc_enter_recovery(smc, rollback);
 			} else {
 				smc->sleep_warned = false;
 			}
@@ -1845,9 +1860,8 @@ static void apple_smc_complete(struct device *dev)
 				ret = apple_smc_write_u32(smc, SMC_KEY(pmVC), smc->sleep_policy->pmvc);
 			}
 			if (ret) {
-				smc->saved_recovery = true;
-				smc->saved_restore_error = ret;
 				dev_err(smc->dev, "SMC sleep warning rollback failed: %d\n", ret);
+				apple_smc_enter_recovery(smc, ret);
 				return;
 			}
 		} else {
@@ -1856,10 +1870,9 @@ static void apple_smc_complete(struct device *dev)
 		smc->sleep_warned = false;
 	}
 	smc->sleep_policy = NULL;
-	if (smc->has_wktp && !pm_dark_wake()) {
-		smc->wake_silent = false;
+	/* Owed from a sleep, the key is apple_smc_wake_full()'s: written there until taken. */
+	if (smc->has_wktp && !pm_dark_wake() && !smc->wake_silent)
 		apple_smc_write_full_wake(smc);
-	}
 	/* A commit the SMC refused, or dark wakes that ended in a refusal. */
 	apple_smc_wake_full(smc);
 }
