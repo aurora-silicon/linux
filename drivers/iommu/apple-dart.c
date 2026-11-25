@@ -6961,13 +6961,13 @@ static int apple_dart_sleep_wait_tlb(struct apple_dart *dart)
 /*
  * A sleep list, with its config words as the DART had them before the sleep. A TLB command in
  * it finishes before the next write, as macOS's wake waits for its flush. Returns 0, or
- * -ETIMEDOUT if one didn't.
+ * -ETIMEDOUT if one didn't, where the list stops.
  */
 static int apple_dart_sleep_write_kept(struct apple_dart *dart,
 				       const struct apple_dart_sleep_list *list)
 {
 	unsigned int i;
-	int ret = 0, err;
+	int ret;
 
 	for (i = 0; i < list->count; i++) {
 		u32 off = list->pairs[2 * i];
@@ -6976,11 +6976,11 @@ static int apple_dart_sleep_write_kept(struct apple_dart *dart,
 				  off);
 		if (dart->hw->type != DART_T8110 || off != DART_T8110_TLB_CMD)
 			continue;
-		err = apple_dart_sleep_wait_tlb(dart);
-		if (!ret)
-			ret = err;
+		ret = apple_dart_sleep_wait_tlb(dart);
+		if (ret)
+			return ret;
 	}
-	return ret;
+	return 0;
 }
 
 /* Whether a sleep list stops streams, which the restore then has to start again. */
@@ -7098,16 +7098,19 @@ static int apple_dart_sleep_check(struct apple_dart *dart)
 
 /*
  * Under the lock, with a snapshot. Returns 0, or -ETIMEDOUT if a TLB command it waits for
- * didn't finish.
+ * didn't finish. One in a list ends the restore there: nothing more is written, no stream is
+ * enabled, and the gate a prepare list set stays.
  */
 static int apple_dart_sleep_put_back(struct apple_dart *dart, bool lost)
 {
 	unsigned int sid, idx, i;
-	int ret = 0, err;
+	int ret = 0;
 
 	dart->sleep_saved = false;
 	if (lost) {
 		ret = apple_dart_sleep_write_kept(dart, &dart->sleep_restore);
+		if (ret)
+			return ret;
 		for (sid = 0; sid < dart->num_streams; sid++) {
 			if (!dart->save_tcr[sid] && !dart->save_ttbr[sid][0])
 				continue;
@@ -7118,15 +7121,14 @@ static int apple_dart_sleep_put_back(struct apple_dart *dart, bool lost)
 		}
 	}
 	if (lost || dart->sleep_gated) {
-		err = apple_dart_sleep_write_kept(dart, &dart->sleep_restore_late);
-		if (!ret)
-			ret = err;
+		ret = apple_dart_sleep_write_kept(dart, &dart->sleep_restore_late);
+		if (ret)
+			return ret;
 		for (i = 0; i < BITS_TO_U32(dart->num_streams); i++)
 			apple_dart_writel(dart, dart->sleep_enable[i],
 					  dart->hw->enable_streams + 4 * i);
-		err = apple_dart_sleep_wait_tlb(dart);
-		if (!ret)
-			ret = err;
+		/* With the streams on, the gate goes even if this wait fails, as it always did. */
+		ret = apple_dart_sleep_wait_tlb(dart);
 	}
 	if (dart->sleep_gated) {
 		dart->sleep_gated = false;
