@@ -37,6 +37,7 @@
 #include <drm/drm_print.h>
 #include <drm/drm_vblank.h>
 
+#include "av.h"
 #include "cec.h"
 #include "dcp.h"
 #include "dcp-hdr-metadata.h"
@@ -349,17 +350,22 @@ static u16 dcp_packet_start(struct dcp_channel *ch, u8 depth)
 /* Pushes and pops the depth of the call stack with safety checks */
 static u8 dcp_push_depth(u8 *depth)
 {
-	u8 ret = (*depth)++;
+	u8 ret = *depth;
 
 	WARN_ON(ret >= DCP_MAX_CALL_DEPTH);
+	WRITE_ONCE(*depth, ret + 1);
 	return ret;
 }
 
 static u8 dcp_pop_depth(u8 *depth)
 {
-	WARN_ON((*depth) == 0);
+	u8 val = *depth;
 
-	return --(*depth);
+	WARN_ON(val == 0);
+	val--;
+	/* Pair with iomfb_channels_idle() so callers observe prior ACK sends. */
+	smp_store_release(depth, val);
+	return val;
 }
 
 /* Older firmware and the H17G method profile retain their existing transport. */
@@ -373,9 +379,14 @@ static bool iomfb_uses_queue(struct apple_dcp *dcp)
 
 bool iomfb_channels_idle(struct apple_dcp *dcp)
 {
-	return !dcp->ch_cmd.depth && !dcp->ch_cb.depth &&
-	       !dcp->ch_oobcmd.depth && !dcp->ch_oobcb.depth &&
-	       !dcp->ch_async.depth && !dcp->ch_oobasync.depth;
+	/* Pair with dcp_pop_depth() / dcp_ack() pending_acks ordering. */
+	return !smp_load_acquire(&dcp->ch_cmd.depth) &&
+	       !smp_load_acquire(&dcp->ch_cb.depth) &&
+	       !smp_load_acquire(&dcp->ch_oobcmd.depth) &&
+	       !smp_load_acquire(&dcp->ch_oobcb.depth) &&
+	       !smp_load_acquire(&dcp->ch_async.depth) &&
+	       !smp_load_acquire(&dcp->ch_oobasync.depth) &&
+	       !atomic_read_acquire(&dcp->pending_acks);
 }
 
 enum iomfb_opaque_x_state {
@@ -1441,11 +1452,21 @@ void dcp_ack(struct apple_dcp *dcp, enum dcp_context_id context)
 {
 	struct dcp_channel *ch = dcp_get_channel(dcp, context);
 
+	/*
+	 * Track the in-flight ACK before popping ch->depth so a concurrent
+	 * iomfb_channels_idle() poll cannot see idle before the ACK is queued
+	 * to RTKit, while popping ch->depth before sending so DCP's next
+	 * callback cannot race ch->depth.
+	 */
+	atomic_inc(&dcp->pending_acks);
 	dcp_pop_depth(&ch->depth);
 	if (dcp_is_ext26(dcp))
 		dma_wmb();
 	dcp_send_message(dcp, IOMFB_ENDPOINT,
 			 dcpep_ack(context));
+	/* Order dcp_send_message() before publishing pending_acks == 0. */
+	smp_mb__before_atomic();
+	atomic_dec(&dcp->pending_acks);
 }
 
 /*
@@ -2954,6 +2975,11 @@ int dcp_get_modes(struct drm_connector *connector)
 	}
 
 edid_done:
+	/*
+	 * The connector's ELD follows its EDID: a card connected before this
+	 * EDID was published (a Type-C route's service opens first) takes it now.
+	 */
+	av_audio_sink_changed(dcp);
 	/* Discovery can replace the catalogue while the OOB read waits. */
 	if (dcp_is_ext26(dcp)) {
 		if (READ_ONCE(dcp->crashed) || READ_ONCE(dcp->ext26_blocked))
@@ -3227,14 +3253,14 @@ static bool dcp_hdr_output_supported(struct apple_dcp *dcp)
 }
 
 /*
- * A desktop 26.x or firmware 27 panel keeps its SDR link and shows PQ
- * content as EDR, given the panel's peak (see res_max_panel_brightness()).
+ * A desktop 26.x or firmware 27 panel with EDR headroom (dcp_panel_edr())
+ * keeps its SDR link and shows PQ content as EDR, given the panel's peak
+ * (see res_max_panel_brightness()).
  */
 static bool dcp_panel_edr_supported(struct apple_dcp *dcp)
 {
-	return (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
-		dcp->fw_compat == DCP_FIRMWARE_V_27_0) &&
-	       dcp_has_panel(dcp) && READ_ONCE(dcp->panel.peak_nits);
+	return dcp_fw_swap_has_edr(dcp) && dcp_has_panel(dcp) &&
+	       dcp->panel.edr_ceiling && READ_ONCE(dcp->panel.peak_nits);
 }
 
 /* The state of the connector on @crtc that @commit sets up. */
@@ -3707,6 +3733,22 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 	/* ignore no mode, poweroff is handled elsewhere */
 	if (crtc_state->mode.hdisplay == 0 && crtc_state->mode.vdisplay == 0)
 		return 0;
+
+	/*
+	 * The DCP of an HDMI output plugs the display in only some time after
+	 * its link came up (dcp_poweron() connects it): a second or more after
+	 * a system resume, as the converter and the display wake up. A mode set
+	 * before that fails in the firmware ("setmode failed", the pipe not
+	 * enabled) after a 200 ms wait. Leave the mode unset instead: the
+	 * hotplug that connects the display finds the mode invalid with the
+	 * CRTC active, and sets it again (dcp_hotplug()).
+	 */
+	if (dcp->hdmi_hpd && !dcp_is_typec_output(dcp) && dcp->connector &&
+	    !READ_ONCE(dcp->connector->connected)) {
+		dev_dbg(dcp->dev, "HDMI display not plugged in yet: mode set deferred to its hotplug\n");
+		dcp_mode_set_valid(&dcp->mode_state, false);
+		return -EAGAIN;
+	}
 
 	dcp_crtc_color_request(dcp, crtc, commit, &dcp->color_req);
 	dcp->pq_requested = dcp->color_req.eotf == HDMI_EOTF_SMPTE_ST2084;

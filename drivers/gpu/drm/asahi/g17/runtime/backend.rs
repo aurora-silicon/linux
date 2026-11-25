@@ -157,7 +157,7 @@ impl job::Backend for Backend {
             let status = job::fence_status(input);
             if status > 0 { continue; }
             if status < 0 { return None; }
-            let leaves = sync_input::collect(input)?;
+            let leaves = sync_input::collect_coalesced(input)?;
             for leaf in &leaves {
                 if leaf.status > 0 { continue; }
                 if leaf.status < 0 { return None; }

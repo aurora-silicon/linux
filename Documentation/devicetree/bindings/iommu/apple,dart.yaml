@@ -33,6 +33,8 @@ properties:
           - apple,t8110-dart
           - apple,t6000-dart
           - apple,t8152-dart-gen3
+          - apple,t8152-acio-dart
+          - apple,t8152-pciec-dart
           - apple,t8152-avd-dart
       - items:
           - const: apple,t8140-ane-dart
@@ -384,6 +386,8 @@ allOf:
           contains:
             enum:
               - apple,t8152-dart-gen3
+              - apple,t8152-acio-dart
+              - apple,t8152-pciec-dart
               - apple,t8152-avd-dart
     then:
       description:
@@ -392,9 +396,12 @@ allOf:
         locked, and the operating system only adds page table entries in
         root slots that are empty at handoff. Their TLB command register
         answers translation queries; a stream is invalidated through the
-        TLB invalidation aperture instead. The T8152 AVD instance uses the
-        same invalidation aperture, but starts unlocked with inactive streams
-        and is initialized by the operating system after its PSD domain is on.
+        TLB invalidation aperture instead. The DARTs of the rear USB4
+        routers (ACIO NHI streams) and of their PCIe-C tunnels use the same
+        invalidation aperture, each at its own slot, but start unlocked with
+        inactive streams and are initialized by the operating system.
+        The T8152 AVD instance uses the same aperture, starts unlocked with
+        inactive streams and is initialized after its PSD domain is on.
       properties:
         reg:
           minItems: 2
@@ -422,6 +429,19 @@ allOf:
         - power-domains
         - apple,dma-range
         - apple,tunable
+
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,t8152-acio-dart
+              - apple,t8152-pciec-dart
+    then:
+      # apple,tunable: the bootloader copies it from the ADT (dart-acioN,
+      # dart-apciecN); a device tree describes these DARTs without one.
+      required:
+        - apple,dma-range
 
 additionalProperties: false
 

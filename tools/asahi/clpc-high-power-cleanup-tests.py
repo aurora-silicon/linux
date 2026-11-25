@@ -65,11 +65,11 @@ struct apple_clpc {
     struct apple_clpc_ane *ane;
     struct mutex sample_lock;
     struct delayed_work work, idle_work;
-    bool has_pmc, stopped, high_power, high_power_sent, policy_nb_added, low_power, auto_low_power;
+    bool has_pmc, stopped, high_power, high_power_sent, policy_nb_added, low_power;
     u8 high_power_seq;
     enum platform_profile_option profile;
     unsigned long power_next, ane_until;
-    unsigned low_power_khz, ane_qos_khz, nr_clusters, agent, mask, saved_floor;
+    unsigned low_power_khz, low_power_mw, ane_qos_khz, nr_clusters, agent, mask, saved_floor;
     struct freq_qos_request ane_qos;
     struct cluster clusters[2];
     struct vote vote[APPLE_CLPC_RAILS];
@@ -78,9 +78,6 @@ struct apple_clpc {
 };
 static void __attribute__((unused)) *cpu_possible_mask;
 static bool __attribute__((unused)) cpumask_equal(void *a, void *b) { return a == b; }
-static bool __attribute__((unused)) apple_clpc_has_profile_ceiling(const struct apple_clpc *c) {
-    return c->low_power_khz || c->auto_low_power;
-}
 static void __attribute__((unused)) apple_clpc_find_clusters(struct apple_clpc *c) { (void)c; }
 static void __attribute__((unused)) apple_clpc_profile_limit(struct apple_clpc *c) { (void)c; }
 static struct mutex apple_clpc_clients_lock;

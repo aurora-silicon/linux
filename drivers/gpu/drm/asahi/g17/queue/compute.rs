@@ -962,6 +962,12 @@ impl Queue {
             visit(active.packet.completion.status());
         }
     }
+    /// The context ID (UAT slot) of every in-flight packet.
+    pub(crate) fn visit_contexts(&self, visit: &mut dyn FnMut(u32)) {
+        for active in self.active.iter() {
+            visit(active.packet.context.id());
+        }
+    }
     /// A recovery record names this queue and the completion stamp of the
     /// command it interrupted, `kick << 8` like the queue's stamp. Without a
     /// stamp match the oldest published command is marked.

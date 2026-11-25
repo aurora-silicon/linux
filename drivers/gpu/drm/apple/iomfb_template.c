@@ -2785,6 +2785,40 @@ int DCP_FW_NAME(iomfb_s2r_power)(struct apple_dcp *dcp, bool on, bool named_call
 }
 #endif
 
+#if DCP_FW_DESKTOP_26(DCP_FW_VER)
+DCP_THUNK_IN(dcp_unnamed_500, dcpep_unnamed_500, u32);
+
+static void dcp_s2r_500_done(struct apple_dcp *dcp, void *out, void *cookie)
+{
+	struct dcp_wait_cookie *wait = cookie;
+
+	complete(&wait->done);
+	kref_put(&wait->refcount, release_wait_cookie);
+}
+
+/* Sleep test: H17P's A500, same number and bytes as this firmware's neighbours. */
+int DCP_FW_NAME(iomfb_s2r_500)(struct apple_dcp *dcp)
+{
+	struct dcp_wait_cookie *cookie;
+	unsigned long left;
+	u32 val = 0xaaaa0000;
+
+	cookie = kzalloc_obj(*cookie);
+	if (!cookie)
+		return -ENOMEM;
+	init_completion(&cookie->done);
+	kref_init(&cookie->refcount);
+	kref_get(&cookie->refcount);
+
+	dcp_unnamed_500(dcp, false, &val, dcp_s2r_500_done, cookie);
+
+	left = wait_for_completion_timeout(&cookie->done, msecs_to_jiffies(1000));
+	kref_put(&cookie->refcount, release_wait_cookie);
+
+	return left ? 0 : -ETIMEDOUT;
+}
+#endif
+
 static bool dcp_power_stop_confirmed(struct dcp_wait_cookie *cookie)
 {
 	/* H17P does not confirm that scanout has stopped. */
@@ -3224,6 +3258,12 @@ dcpep_cb_hotplug_v26_6(struct apple_dcp *dcp, struct dcp_hotplug_req_v26_6 *req)
 	/* The firmware shuts an external pipe down with its display. */
 	if (!dcp->main_display && !connected)
 		dcp->desktop->ext_pipe_off = true;
+
+	/* Signal T6041 S2R resume before dcpep_cb_hotplug() skips main_display. */
+	if (connected) {
+		dev_dbg(dcp->dev, "D575 hotplug connected=1\n");
+		complete(&dcp->s2r_hpd_done);
+	}
 
 	dcpep_cb_hotplug(dcp, &connected);
 
@@ -4301,6 +4341,21 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	keep_mode = dcp->v27_j714s && xchg(&dcp->v27_keep_mode, false) &&
 		    dcp->mode.color_mode_id == mode->color_mode_id &&
 		    dcp->mode.timing_mode_id == mode->timing_mode_id;
+	/*
+	 * Firmware 27.2: sent once the panel's video interface is open again and the firmware
+	 * has reported the panel, which it does after the open.
+	 */
+	if (keep_mode && iomfb_v27_methods_renumbered(dcp->v27_methods)) {
+		if (!wait_for_completion_timeout(&dcp->v27_wake_video,
+						 msecs_to_jiffies(V27_WAKE_VIDEO_MS)))
+			dev_warn(dcp->dev, "V27 wake: panel video interface not open after %u ms\n",
+				 V27_WAKE_VIDEO_MS);
+		else if (!wait_for_completion_timeout(&dcp->v27_wake_hotplug,
+						      msecs_to_jiffies(V27_WAKE_HOTPLUG_MS)))
+			dev_warn(dcp->dev, "V27 wake: no hotplug report %u ms after the panel's open\n",
+				 V27_WAKE_HOTPLUG_MS);
+		keep_mode = false;
+	}
 #endif
 	scoped_guard(spinlock_irqsave, &dcp->hdr.lock) {
 		dcp->mode = (struct dcp_set_digital_out_mode_req){
@@ -4798,8 +4853,12 @@ static void res_max_panel_brightness(struct apple_dcp *dcp, void *out, void *coo
 {
 	u32 peak = out ? get_unaligned_le32(out) >> 16 : 0;
 
-	/* Only a peak above the SDR range gives EDR headroom. */
-	if (peak > dcp->brightness.maximum && peak <= 10000) {
+	/*
+	 * Only a panel with EDR headroom (the ADT's EDRPotentialHeadroom) and a
+	 * peak above the SDR range shows PQ content as EDR.
+	 */
+	if (dcp->panel.edr_ceiling && peak > dcp->brightness.maximum &&
+	    peak <= 10000) {
 		dev_info(dcp->dev, "panel peak luminance %u nits\n", peak);
 		WRITE_ONCE(dcp->panel.peak_nits, peak);
 	}
