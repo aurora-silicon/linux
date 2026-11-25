@@ -296,6 +296,17 @@ ASAHI_TESTS = {
                                    'skip-epoch-check',
                                    'unconditional-changed-notify',
                                    'skip-generation-bump'), []),
+    'g17-m5-cross-qid-direct-tests.py': [([], PASS)]
+        + mutations('--mutation', ('no-chain-dedup',
+                                   'coalesce-failed-leaf',
+                                   'hint-blind-spot',
+                                   'skip-epoch-check',
+                                   'skip-recovery-recheck',
+                                   'lock-per-leaf',
+                                   'hold-m5-outer-compute-host',
+                                   'same-qid-emits-barrier',
+                                   'lock-has-published-epoch',
+                                   'lock-same-vm'), []),
     'g17-m5-effort-tests.py': [([], PASS)]
         + mutations('--mutation', ('m5-ignores-bound',), []),
     'g17-firmware-selection-tests.py': [([], PASS)],
