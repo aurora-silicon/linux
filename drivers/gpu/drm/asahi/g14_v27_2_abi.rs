@@ -76,15 +76,19 @@ impl GrowRequest {
 /// them (`m3_power_26`, `g16/fw/initdata`), with the 13.5 names: 0x24 relaxed compute kill
 /// timeout (ms), 0x78 command submission enabled, 0x998/0x99c/0x9a0 progress-check intervals
 /// of 3D/TA/compute (firmware polls), 0x9c8 compute context-switch timeout (ms), 0x9cc compute
-/// kill timeout (ms), 0xe28. Left zero, the firmware's progress recovery (armed in HwDataB)
+/// kill timeout (ms), 0x9b8/0x9bc/0x9c0 the compute back-off words (0x9bc is the G15 layout's
+/// `cdm_backoff_timeout`), 0xe28. Left zero, the firmware's progress recovery (armed in HwDataB)
 /// times out TA and compute work that runs past a poll within a second or two. The TA interval
 /// is the 100 polls the M3 runtime uses for long vertex loops (`m3_config`), not 10.
-pub(crate) const GLOBALS_PROGRESS: [(usize, u32); 8] = [
+pub(crate) const GLOBALS_PROGRESS: [(usize, u32); 11] = [
     (0x24, 3000),
     (0x78, 1),
     (0x998, 40),
     (0x99c, 100),
     (0x9a0, 250),
+    (0x9b8, 2),
+    (0x9bc, 40),
+    (0x9c0, 5),
     (0x9c8, 40),
     (0x9cc, 50),
     (0xe28, 3),
