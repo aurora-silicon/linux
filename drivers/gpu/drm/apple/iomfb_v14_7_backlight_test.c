@@ -378,7 +378,7 @@ static bool v14_bl_queued(struct apple_dcp_v14 *v14)
 }
 
 /*
- * The production paths on J615 and J514C: no policy is consulted, no
+ * The production paths on J514C: no policy is consulted, no
  * level is encoded, the work does nothing, sleep leaves the gate alone.
  */
 static void v14_bl_other_boards_untouched(struct kunit *test)
