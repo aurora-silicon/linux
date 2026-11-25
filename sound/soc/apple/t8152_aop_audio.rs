@@ -239,7 +239,124 @@ impl Service {
 struct SpkrState {
     open: bool,
     running: bool,
+    /// True only after `pw0 ` has been verified and before any `pwrd`
+    /// transition attempt. `SenseRing` may only be armed while
+    /// `!running && pw0_verified`.
+    pw0_verified: bool,
     resume_run: bool,
+}
+
+impl SpkrState {
+    const fn new() -> Self {
+        Self {
+            open: false,
+            running: false,
+            pw0_verified: false,
+            resume_run: false,
+        }
+    }
+
+    fn ensure_pw0(
+        &mut self,
+        spkr_running: &AtomicFlag,
+        set_pw0: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        if self.running || (self.open && !self.pw0_verified) {
+            self.pw0_verified = false;
+            set_pw0()?;
+            self.running = false;
+            self.pw0_verified = true;
+            spkr_running.store(false, Relaxed);
+        }
+        Ok(())
+    }
+
+    fn start_with_ring(
+        &mut self,
+        spkr_running: &AtomicFlag,
+        ring_stop: impl Fn(),
+        ring_start: impl FnOnce() -> Result<()>,
+        set_pwrd: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        if self.running || !self.pw0_verified {
+            return Err(EIO);
+        }
+        ring_stop();
+        ring_start()?;
+        self.pw0_verified = false;
+        if let Err(e) = set_pwrd() {
+            ring_stop();
+            return Err(e);
+        }
+        self.running = true;
+        spkr_running.store(true, Relaxed);
+        Ok(())
+    }
+
+    fn stop(
+        &mut self,
+        spkr_running: &AtomicFlag,
+        has_ring: bool,
+        set_pw0: impl FnOnce() -> Result<()>,
+        ring_stop: impl FnOnce(),
+    ) -> Result<()> {
+        self.ensure_pw0(spkr_running, set_pw0)?;
+        if has_ring {
+            ring_stop();
+        }
+        Ok(())
+    }
+
+    fn prepare_with_ring(
+        &mut self,
+        spkr_running: &AtomicFlag,
+        quiesce: impl FnOnce() -> Result<()>,
+        set_pw0: impl FnOnce() -> Result<()>,
+        ring_stop: impl Fn(),
+        ring_start: impl FnOnce() -> Result<()>,
+        set_pwrd: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        if self.running || !self.pw0_verified {
+            quiesce()?;
+            self.pw0_verified = false;
+            set_pw0()?;
+            self.running = false;
+            self.pw0_verified = true;
+            spkr_running.store(false, Relaxed);
+        }
+        self.start_with_ring(spkr_running, ring_stop, ring_start, set_pwrd)
+    }
+
+    fn suspend(
+        &mut self,
+        spkr_running: &AtomicFlag,
+        has_ring: bool,
+        set_pw0: impl FnOnce() -> Result<()>,
+        ring_stop: impl FnOnce(),
+    ) -> Result<()> {
+        let was_running = self.running;
+        let res = self.ensure_pw0(spkr_running, set_pw0);
+        if has_ring {
+            ring_stop();
+        }
+        self.resume_run = was_running;
+        res
+    }
+
+    fn resume_with_ring(
+        &mut self,
+        spkr_running: &AtomicFlag,
+        set_pw0: impl FnOnce() -> Result<()>,
+        ring_stop: impl Fn(),
+        ring_start: impl FnOnce() -> Result<()>,
+        set_pwrd: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        if !mem::take(&mut self.resume_run) || !self.open {
+            return Ok(());
+        }
+        self.ensure_pw0(spkr_running, set_pw0)?;
+        self.start_with_ring(spkr_running, ring_stop, ring_start, set_pwrd)
+    }
 }
 
 const SENSE_RATE: u64 = 48000;
@@ -864,10 +981,12 @@ impl T8152AopAudio {
     /// since boot attaches `spkr` and raises `pw0 ` so the audio fabric is up
     /// without disturbing an already-running speaker stream.
     fn sense_startup(&self) -> Result<()> {
-        let st = self.spkr_state.lock();
+        let mut st = self.spkr_state.lock();
         self.attach(&self.spkr)?;
         if !st.running {
+            st.pw0_verified = false;
             self.set_power(&self.spkr, POWER_STATE_PW0)?;
+            st.pw0_verified = true;
         }
         Ok(())
     }
@@ -875,6 +994,7 @@ impl T8152AopAudio {
     fn spkr_startup(&self) -> Result<()> {
         let mut st = self.spkr_state.lock();
         self.attach(&self.spkr)?;
+        st.pw0_verified = false;
         self.set_power(&self.spkr, POWER_STATE_PW0)?;
         if let Err(e) = self.mca_up() {
             let _ = self.set_power(&self.spkr, POWER_STATE_PW0);
@@ -882,74 +1002,73 @@ impl T8152AopAudio {
         }
         st.open = true;
         st.running = false;
+        st.pw0_verified = true;
         st.resume_run = false;
         self.spkr.running.store(false, Relaxed);
         Ok(())
     }
 
-    /// Arms the sense ring on the stopped serializer, then raises `pwrd`.
-    fn spkr_start_with_ring(&self, st: &mut SpkrState, ring: &SenseRing) -> Result<()> {
-        ring.stop();
-        ring.start(&self.dev)?;
-        if let Err(e) = self.set_power(&self.spkr, POWER_STATE_PWRD) {
-            ring.stop();
-            return Err(e);
-        }
-        st.running = true;
-        self.spkr.running.store(true, Relaxed);
-        Ok(())
-    }
-
     /// Speaker prepare: when a sense ring is in use, every playback prepare
     /// starts a fresh serializer with the ring armed first so offset 0 is slot
-    /// 0 of a frame. If the serializer was still running (re-prepare after an
-    /// underrun or resume), `quiesce` mutes the amps before stopping the clock.
+    /// 0 of a frame. If the serializer was still running or its `pw0 ` state is
+    /// unconfirmed (re-prepare after an underrun, failed stop, or resume),
+    /// `quiesce` mutes the amps before stopping the clock.
     fn spkr_prepare(&self, quiesce: impl FnOnce() -> Result<()>) -> Result<()> {
         let mut st = self.spkr_state.lock();
         let Some(ring) = &self.sense_ring else {
             if !st.running {
+                st.pw0_verified = false;
                 self.set_power(&self.spkr, POWER_STATE_PWRD)?;
                 st.running = true;
                 self.spkr.running.store(true, Relaxed);
             }
             return Ok(());
         };
-        if st.running {
-            quiesce()?;
-            self.set_power(&self.spkr, POWER_STATE_PW0)?;
-            st.running = false;
-            self.spkr.running.store(false, Relaxed);
-        }
-        self.spkr_start_with_ring(&mut st, ring)
+        st.prepare_with_ring(
+            &self.spkr.running,
+            quiesce,
+            || self.set_power(&self.spkr, POWER_STATE_PW0),
+            || ring.stop(),
+            || ring.start(&self.dev),
+            || self.set_power(&self.spkr, POWER_STATE_PWRD),
+        )
     }
 
-    fn spkr_stop_locked(&self, st: &mut SpkrState) {
-        if st.running {
-            if let Err(e) = self.set_power(&self.spkr, POWER_STATE_PW0) {
-                dev_err!(self.dev, "spkr: pw0 failed: {:?}\n", e);
-            }
-            st.running = false;
-            self.spkr.running.store(false, Relaxed);
+    fn spkr_pw0(&self) -> Result<()> {
+        if let Err(e) = self.set_power(&self.spkr, POWER_STATE_PW0) {
+            dev_err!(self.dev, "spkr: pw0 failed: {:?}\n", e);
+            return Err(e);
         }
-        if let Some(ring) = &self.sense_ring {
-            ring.stop();
-        }
+        Ok(())
     }
 
-    fn spkr_hw_free(&self) {
+    fn spkr_stop_locked(&self, st: &mut SpkrState) -> Result<()> {
+        st.stop(
+            &self.spkr.running,
+            self.sense_ring.is_some(),
+            || self.spkr_pw0(),
+            || {
+                if let Some(ring) = &self.sense_ring {
+                    ring.stop();
+                }
+            },
+        )
+    }
+
+    fn spkr_hw_free(&self) -> Result<()> {
         if self.sense_ring.is_none() {
-            return;
+            return Ok(());
         }
         let mut st = self.spkr_state.lock();
-        self.spkr_stop_locked(&mut st);
+        self.spkr_stop_locked(&mut st)
     }
 
     fn spkr_shutdown(&self) {
         {
             let mut st = self.spkr_state.lock();
+            let _ = self.spkr_stop_locked(&mut st);
             st.open = false;
             st.resume_run = false;
-            self.spkr_stop_locked(&mut st);
             // Release the ring and its ADMAC channel while the fabric is still
             // powered (`pw0 `) and before the MCA leaves power down.
             if let Some(ring) = &self.sense_ring {
@@ -959,13 +1078,12 @@ impl T8152AopAudio {
         self.mca_down();
     }
 
-    fn spkr_suspend(&self) {
-        if self.sense_ring.is_none() {
-            return;
-        }
+    fn spkr_suspend(&self) -> Result<()> {
+        let Some(ring) = &self.sense_ring else {
+            return Ok(());
+        };
         let mut st = self.spkr_state.lock();
-        st.resume_run = st.running;
-        self.spkr_stop_locked(&mut st);
+        st.suspend(&self.spkr.running, true, || self.spkr_pw0(), || ring.stop())
     }
 
     fn spkr_resume(&self) -> Result<()> {
@@ -973,10 +1091,13 @@ impl T8152AopAudio {
             return Ok(());
         };
         let mut st = self.spkr_state.lock();
-        if !mem::take(&mut st.resume_run) || !st.open {
-            return Ok(());
-        }
-        self.spkr_start_with_ring(&mut st, ring)
+        st.resume_with_ring(
+            &self.spkr.running,
+            || self.spkr_pw0(),
+            || ring.stop(),
+            || ring.start(&self.dev),
+            || self.set_power(&self.spkr, POWER_STATE_PWRD),
+        )
     }
 
     /// `pwrd`: the firmware starts the serializer clocks and the stream.
@@ -1684,7 +1805,9 @@ unsafe extern "C" fn be_hw_free(
     // SAFETY: by the caller's contract.
     if let Some((data, svc)) = unsafe { be_service(dai, substream) } {
         if ptr::eq(svc, &data.spkr) {
-            data.spkr_hw_free();
+            if let Err(e) = data.spkr_hw_free() {
+                return e.to_errno();
+            }
         }
     }
     0
@@ -1712,8 +1835,10 @@ unsafe extern "C" fn be_shutdown(
 /// Called by ASoC on this driver's registered component.
 unsafe extern "C" fn asoc_suspend(component: *mut bindings::snd_soc_component) -> i32 {
     // SAFETY: by the caller's contract.
-    unsafe { component_data(component) }.spkr_suspend();
-    0
+    match unsafe { component_data(component) }.spkr_suspend() {
+        Ok(()) => 0,
+        Err(e) => e.to_errno(),
+    }
 }
 
 /// # Safety
@@ -2241,11 +2366,7 @@ impl platform::Driver for T8152AopAudioDriver {
                 cout: Service::new(from_fourcc(b"cout"), "cout", true),
                 cin: Service::new(from_fourcc(b"cin "), "cin", true),
                 spkr: Service::new(from_fourcc(b"spkr"), "spkr", false),
-                spkr_state <- new_mutex!(SpkrState {
-                    open: false,
-                    running: false,
-                    resume_run: false,
-                }),
+                spkr_state <- new_mutex!(SpkrState::new()),
                 sense_ring,
                 mca,
                 cfg,
@@ -2403,5 +2524,340 @@ mod tests {
         assert!(!sense_ring_has_fe_space(1024, 512, 240, 360));
         // Overflow in unread + pending + incoming fails closed
         assert!(!sense_ring_has_fe_space(1024, usize::MAX, 0, 1));
+    }
+
+    #[test]
+    fn spkr_state_requires_verified_pw0_before_rearm() {
+        use core::cell::Cell;
+
+        let spkr_running = AtomicFlag::new(false);
+        let ring_starts = Cell::new(0u32);
+        let ring_stops = Cell::new(0u32);
+        let pw0_calls = Cell::new(0u32);
+        let quiesce_calls = Cell::new(0u32);
+
+        let mut st = SpkrState {
+            open: true,
+            running: false,
+            pw0_verified: true,
+            resume_run: false,
+        };
+
+        // Initial prepare arms ring and enters running (`pw0_verified` clears).
+        assert!(st
+            .prepare_with_ring(
+                &spkr_running,
+                || {
+                    quiesce_calls.set(quiesce_calls.get() + 1);
+                    Ok(())
+                },
+                || {
+                    pw0_calls.set(pw0_calls.get() + 1);
+                    Ok(())
+                },
+                || ring_stops.set(ring_stops.get() + 1),
+                || {
+                    ring_starts.set(ring_starts.get() + 1);
+                    Ok(())
+                },
+                || Ok(()),
+            )
+            .is_ok());
+        assert!(st.running);
+        assert!(!st.pw0_verified);
+        assert!(spkr_running.load(Relaxed));
+        assert_eq!(ring_starts.get(), 1);
+        assert_eq!(pw0_calls.get(), 0);
+
+        // If AOP rejects `pw0 ` on stop (`hw_free` / `suspend`), running stays
+        // true, `pw0_verified` stays false, and DMA is not stopped.
+        let stops_before = ring_stops.get();
+        assert_eq!(
+            st.stop(
+                &spkr_running,
+                true,
+                || Err(EIO),
+                || ring_stops.set(ring_stops.get() + 1),
+            ),
+            Err(EIO)
+        );
+        assert!(st.running);
+        assert!(!st.pw0_verified);
+        assert!(spkr_running.load(Relaxed));
+        assert_eq!(ring_stops.get(), stops_before);
+
+        // Next prepare fails closed if `pw0 ` still fails, without rearming RX.
+        assert_eq!(
+            st.prepare_with_ring(
+                &spkr_running,
+                || {
+                    quiesce_calls.set(quiesce_calls.get() + 1);
+                    Ok(())
+                },
+                || Err(EIO),
+                || ring_stops.set(ring_stops.get() + 1),
+                || {
+                    ring_starts.set(ring_starts.get() + 1);
+                    Ok(())
+                },
+                || Ok(()),
+            ),
+            Err(EIO)
+        );
+        assert_eq!(quiesce_calls.get(), 1);
+        assert_eq!(ring_starts.get(), 1);
+        assert!(st.running);
+
+        // Even if `resume_run` were set while `pw0 ` is unverified and `pw0 `
+        // still fails on resume, resume fails closed without arming RX.
+        st.resume_run = true;
+        assert_eq!(
+            st.resume_with_ring(
+                &spkr_running,
+                || Err(EIO),
+                || ring_stops.set(ring_stops.get() + 1),
+                || {
+                    ring_starts.set(ring_starts.get() + 1);
+                    Ok(())
+                },
+                || Ok(()),
+            ),
+            Err(EIO)
+        );
+        assert_eq!(ring_starts.get(), 1);
+
+        // Once `pw0 ` succeeds, prepare verifies it and rearms the ring cleanly.
+        assert!(st
+            .prepare_with_ring(
+                &spkr_running,
+                || {
+                    quiesce_calls.set(quiesce_calls.get() + 1);
+                    Ok(())
+                },
+                || {
+                    pw0_calls.set(pw0_calls.get() + 1);
+                    Ok(())
+                },
+                || ring_stops.set(ring_stops.get() + 1),
+                || {
+                    ring_starts.set(ring_starts.get() + 1);
+                    Ok(())
+                },
+                || Ok(()),
+            )
+            .is_ok());
+        assert_eq!(pw0_calls.get(), 1);
+        assert_eq!(ring_starts.get(), 2);
+        assert!(st.running);
+
+        // Suspend with failed `pw0 ` stops RX and records restart intent so
+        // resume must verify `pw0 ` before rearming.
+        let stops_before = ring_stops.get();
+        assert_eq!(
+            st.suspend(
+                &spkr_running,
+                true,
+                || Err(EIO),
+                || ring_stops.set(ring_stops.get() + 1),
+            ),
+            Err(EIO)
+        );
+        assert_eq!(ring_stops.get(), stops_before + 1);
+        assert!(st.resume_run);
+        assert!(st.running);
+        assert!(!st.pw0_verified);
+
+        // Suspend with verified `pw0 ` stops DMA, then resume restarts cleanly
+        // without an extra `pw0 ` call.
+        assert!(st
+            .suspend(
+                &spkr_running,
+                true,
+                || Ok(()),
+                || ring_stops.set(ring_stops.get() + 1),
+            )
+            .is_ok());
+        assert!(!st.running);
+        assert!(st.pw0_verified);
+        assert!(st.resume_run);
+        assert!(st
+            .resume_with_ring(
+                &spkr_running,
+                || {
+                    pw0_calls.set(pw0_calls.get() + 1);
+                    Ok(())
+                },
+                || ring_stops.set(ring_stops.get() + 1),
+                || {
+                    ring_starts.set(ring_starts.get() + 1);
+                    Ok(())
+                },
+                || Ok(()),
+            )
+            .is_ok());
+        assert_eq!(pw0_calls.get(), 1);
+        assert_eq!(ring_starts.get(), 3);
+        assert!(st.running);
+
+        // An unconfirmed `pwrd` transition clears `pw0_verified` so the next
+        // prepare re-verifies `pw0 ` before arming RX again.
+        assert!(st
+            .stop(
+                &spkr_running,
+                true,
+                || Ok(()),
+                || ring_stops.set(ring_stops.get() + 1),
+            )
+            .is_ok());
+        assert_eq!(
+            st.prepare_with_ring(
+                &spkr_running,
+                || Ok(()),
+                || Ok(()),
+                || ring_stops.set(ring_stops.get() + 1),
+                || {
+                    ring_starts.set(ring_starts.get() + 1);
+                    Ok(())
+                },
+                || Err(EIO),
+            ),
+            Err(EIO)
+        );
+        assert!(!st.running);
+        assert!(!st.pw0_verified);
+        assert_eq!(ring_starts.get(), 4);
+        assert!(st
+            .prepare_with_ring(
+                &spkr_running,
+                || {
+                    quiesce_calls.set(quiesce_calls.get() + 1);
+                    Ok(())
+                },
+                || {
+                    pw0_calls.set(pw0_calls.get() + 1);
+                    Ok(())
+                },
+                || ring_stops.set(ring_stops.get() + 1),
+                || {
+                    ring_starts.set(ring_starts.get() + 1);
+                    Ok(())
+                },
+                || Ok(()),
+            )
+            .is_ok());
+        assert_eq!(pw0_calls.get(), 2);
+        assert_eq!(ring_starts.get(), 5);
+    }
+
+    #[test]
+    fn spkr_state_suspend_pw0_failure_and_resume() {
+        use core::cell::Cell;
+
+        let spkr_running = AtomicFlag::new(true);
+        let ring_stops = Cell::new(0u32);
+        let ring_starts = Cell::new(0u32);
+        let pw0_calls = Cell::new(0u32);
+        let pwrd_calls = Cell::new(0u32);
+
+        let mut st = SpkrState {
+            open: true,
+            running: true,
+            pw0_verified: false,
+            resume_run: false,
+        };
+
+        // Failed `pw0 ` during suspend still stops/synchronizes RX and records
+        // restart intent so resume verifies `pw0 ` before rearming.
+        assert_eq!(
+            st.suspend(
+                &spkr_running,
+                true,
+                || {
+                    pw0_calls.set(pw0_calls.get() + 1);
+                    Err(EIO)
+                },
+                || ring_stops.set(ring_stops.get() + 1),
+            ),
+            Err(EIO)
+        );
+        assert_eq!(pw0_calls.get(), 1);
+        assert_eq!(ring_stops.get(), 1);
+        assert!(st.running);
+        assert!(!st.pw0_verified);
+        assert!(st.resume_run);
+        assert!(spkr_running.load(Relaxed));
+
+        // Resume fails closed without rearming RX if retry `pw0 ` still fails.
+        assert_eq!(
+            st.resume_with_ring(
+                &spkr_running,
+                || {
+                    pw0_calls.set(pw0_calls.get() + 1);
+                    Err(EIO)
+                },
+                || ring_stops.set(ring_stops.get() + 1),
+                || {
+                    ring_starts.set(ring_starts.get() + 1);
+                    Ok(())
+                },
+                || {
+                    pwrd_calls.set(pwrd_calls.get() + 1);
+                    Ok(())
+                },
+            ),
+            Err(EIO)
+        );
+        assert_eq!(pw0_calls.get(), 2);
+        assert_eq!(ring_starts.get(), 0);
+        assert_eq!(pwrd_calls.get(), 0);
+        assert!(st.running);
+        assert!(!st.pw0_verified);
+        assert!(!st.resume_run);
+        assert!(spkr_running.load(Relaxed));
+
+        // Another suspend with `pw0 ` failing still stops RX and records intent;
+        // when retry `pw0 ` succeeds on resume, RX is cleanly rearmed before `pwrd`.
+        assert_eq!(
+            st.suspend(
+                &spkr_running,
+                true,
+                || {
+                    pw0_calls.set(pw0_calls.get() + 1);
+                    Err(EIO)
+                },
+                || ring_stops.set(ring_stops.get() + 1),
+            ),
+            Err(EIO)
+        );
+        assert_eq!(pw0_calls.get(), 3);
+        assert_eq!(ring_stops.get(), 2);
+        assert!(st.resume_run);
+
+        assert!(st
+            .resume_with_ring(
+                &spkr_running,
+                || {
+                    pw0_calls.set(pw0_calls.get() + 1);
+                    Ok(())
+                },
+                || ring_stops.set(ring_stops.get() + 1),
+                || {
+                    ring_starts.set(ring_starts.get() + 1);
+                    Ok(())
+                },
+                || {
+                    pwrd_calls.set(pwrd_calls.get() + 1);
+                    Ok(())
+                },
+            )
+            .is_ok());
+        assert_eq!(pw0_calls.get(), 4);
+        assert_eq!(ring_stops.get(), 3);
+        assert_eq!(ring_starts.get(), 1);
+        assert_eq!(pwrd_calls.get(), 1);
+        assert!(st.running);
+        assert!(!st.pw0_verified);
+        assert!(!st.resume_run);
+        assert!(spkr_running.load(Relaxed));
     }
 }
