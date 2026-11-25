@@ -49,6 +49,7 @@ const ASC_CPU_CONTROL: usize = 0x44;
 const ASC_RUN: u32 = 0x10;
 
 #[cfg(CONFIG_APPLE_SOC_SLEEP)]
+#[allow(improper_ctypes)]
 unsafe extern "C" {
     fn apple_sleep_commit_stops_coprocs() -> bool;
     fn apple_sleep_coproc_register_first(
@@ -554,6 +555,9 @@ struct State {
     accepting: bool,
     submitted: u64,
     retired: u64,
+    /// Set when a sleep/wake failure may have left the GPU domain unpowered or stopped so
+    /// teardown skips live-hardware MMIO and RTKit operations.
+    hardware_unreachable: bool,
     #[cfg(CONFIG_APPLE_SOC_SLEEP)]
     commit_stop: Option<KBox<CommitStop>>,
 }
@@ -1265,6 +1269,7 @@ impl Runtime {
             }
             if !real {
                 dev_warn!(self.dev, "GPU: sleep refused after commit stop; firmware stays stopped\n");
+                state.hardware_unreachable = true;
                 self.notify.set_deep_sleeping(self, false);
                 self.asleep.store(false, Ordering::Release);
                 self.fail_all(state, EIO);
@@ -1277,6 +1282,7 @@ impl Runtime {
                     commit.idle_ret,
                     wake_err
                 );
+                state.hardware_unreachable = true;
                 self.notify.set_deep_sleeping(self, false);
                 self.asleep.store(false, Ordering::Release);
                 self.fail_all(state, EIO);
@@ -1360,20 +1366,30 @@ impl Runtime {
             unsafe { apple_sleep_coproc_unregister(self.dev.as_raw()) };
         }
         self.fail_all(&mut state, ENODEV);
-        let allowed = set_idle_policy(&state.root, &mut state.peer, true);
-        let root = &state.root;
-        let _ = wait(root, 500, || Ok(root.firmware_running()? == 0));
-        let running = root.firmware_running();
-        let forced = (running != Ok(0)).then(|| {
-            // SAFETY: the RTKit instance is live and owned here.
-            kernel::error::to_result(unsafe { kernel::bindings::apple_rtkit_poweroff(state.peer.as_raw()) })
-        });
-        state.asc.halt();
-        dev_info!(self.dev, "GPU stopped: allow-off={:?} running={:?} forced-off={:?} submitted={} completed={} notifications={} late={} skipped-slots={} deferred-cursors={}\n",
-                  allowed, running, forced, state.submitted, state.retired,
-                  self.notify.messages.load(Ordering::Relaxed), state.late, state.skipped, state.deferred);
-        if running != Ok(0) && forced != Some(Ok(())) {
-            dev_err!(self.dev, "GPU firmware did not stop; a reset is required\n");
+        if state.hardware_unreachable {
+            dev_info!(
+                self.dev,
+                "GPU stopped: skipping hardware teardown after failed sleep/wake (submitted={} completed={} notifications={})\n",
+                state.submitted,
+                state.retired,
+                self.notify.messages.load(Ordering::Relaxed)
+            );
+        } else {
+            let allowed = set_idle_policy(&state.root, &mut state.peer, true);
+            let root = &state.root;
+            let _ = wait(root, 500, || Ok(root.firmware_running()? == 0));
+            let running = root.firmware_running();
+            let forced = (running != Ok(0)).then(|| {
+                // SAFETY: the RTKit instance is live and owned here.
+                kernel::error::to_result(unsafe { kernel::bindings::apple_rtkit_poweroff(state.peer.as_raw()) })
+            });
+            state.asc.halt();
+            dev_info!(self.dev, "GPU stopped: allow-off={:?} running={:?} forced-off={:?} submitted={} completed={} notifications={} late={} skipped-slots={} deferred-cursors={}\n",
+                      allowed, running, forced, state.submitted, state.retired,
+                      self.notify.messages.load(Ordering::Relaxed), state.late, state.skipped, state.deferred);
+            if running != Ok(0) && forced != Some(Ok(())) {
+                dev_err!(self.dev, "GPU firmware did not stop; a reset is required\n");
+            }
         }
         // Keep everything the firmware could reach for the rest of the boot, halted or not:
         // its page tables still name these pages, and the boot handoff window that start()
@@ -1476,6 +1492,7 @@ impl Backend {
             accepting: true,
             submitted: 0,
             retired: 0,
+            hardware_unreachable: false,
             #[cfg(CONFIG_APPLE_SOC_SLEEP)]
             commit_stop: None,
         });
