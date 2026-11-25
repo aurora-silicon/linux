@@ -36,62 +36,97 @@ static inline bool ane_h16_register_valid(u32 word)
 	return false;
 }
 
+/* Values after record header @h: a dense run, or one plus a scatter mask's bits. */
+static inline u32 ane_hx_record_count(u32 h)
+{
+	return h & BIT(31) ? 1 + hweight32((h >> 15) & 0xffff) : ((h >> 15) & 0x3f) + 1;
+}
+
 /*
  * A stream opens with a 16-byte frame: little-endian u32 @prologue, then
  * twelve reserved zero bytes. H15/H16/H17 programs share this framing with
- * @header_words fixed words per task (8 on H15, 9 on H16 and H17). The last
- * task may end at the end of the section; every other task is padded with
- * zeros to 16 bytes. This structural gate does not replace container/tensor/
- * aperture validation.
+ * @header_words fixed words per task (8 on H15, 9 on H16 and H17, from the
+ * HWX target), the task's length in words in bits 16-26 of the first. Low
+ * bits 3 in the last fixed word add one more header word. The last task may
+ * end at the end of the section; every other task is padded with zeros to
+ * 16 bytes, and a 16-byte zero block may stand between tasks.
+ *
+ * ane_hx_task_frame() is the one walk of this framing: the structural gate,
+ * the relocation check of the HWX validator and the DMA bound all step
+ * through a stream with it, so they cannot disagree on where a task's
+ * records start.
+ */
+struct ane_hx_task {
+	size_t rec, end;	/* the task's records */
+	size_t next;		/* the next task or zero block */
+};
+
+/*
+ * Frame the task or zero block at @pos of a stream of @size bytes. Returns 1
+ * for a task, 0 for a zero block (only @t->next is set) and -ENOEXEC for a
+ * frame that does not fit or is not padded with zeros.
+ */
+static inline int ane_hx_task_frame(const u8 *p, size_t size, size_t pos,
+				    unsigned int header_words, struct ane_hx_task *t)
+{
+	u32 words;
+
+	if (!header_words || pos > size || size - pos < 16)
+		return -ENOEXEC;
+	words = (get_unaligned_le32(p + pos) >> 16) & 0x7ff;
+	if (!words) {
+		t->next = pos + 16;
+		return memchr_inv(p + pos, 0, 16) ? -ENOEXEC : 0;
+	}
+	if (words < header_words || words > (size - pos) / 4)
+		return -ENOEXEC;
+	t->end = pos + words * 4;
+	if ((get_unaligned_le32(p + pos + (header_words - 1) * 4) & 3) == 3)
+		header_words++;
+	if (words < header_words)
+		return -ENOEXEC;
+	t->rec = pos + header_words * 4;
+	t->next = t->end == size ? size : ALIGN(t->end, 16);
+	if (t->next > size || memchr_inv(p + t->end, 0, t->next - t->end))
+		return -ENOEXEC;
+	return 1;
+}
+
+/*
+ * The structural gate over the framing above. Every record names registers
+ * of the H16 image. This gate does not replace container/tensor/aperture
+ * validation.
  */
 static inline int
 ane_hx_task_stream_validate_hdr(const void *text, size_t size, u32 expected_tasks,
-				u32 prologue, unsigned int fixed_header_words,
+				u32 prologue, unsigned int header_words,
 				u32 *record_limit, size_t *final_end)
 {
 	const u8 *p = text;
 	size_t pos = 16, last = 0;
 	u32 tasks = 0, limit = 0;
 
-	if (!p || !expected_tasks || !fixed_header_words || size < 16 ||
-	    size > ANE_H16_TASK_MAX || (size & 3) ||
+	if (!p || !expected_tasks || size < 16 || size > ANE_H16_TASK_MAX || (size & 3) ||
 	    get_unaligned_le32(p) != prologue || memchr_inv(p + 4, 0, 12))
 		return -ENOEXEC;
 	while (pos < size) {
-		u32 words, header_words = fixed_header_words;
-		size_t end, padded, rec;
+		struct ane_hx_task t;
+		int ret = ane_hx_task_frame(p, size, pos, header_words, &t);
+		size_t rec;
 
-		if (size - pos < 16)
-			return -ENOEXEC;
-		words = (get_unaligned_le32(p + pos) >> 16) & 0x7ff;
-		if (!words) {
-			if (memchr_inv(p + pos, 0, 16))
-				return -ENOEXEC;
-			pos += 16;
+		if (ret < 0)
+			return ret;
+		pos = t.next;
+		if (!ret)
 			continue;
-		}
-		if (words < fixed_header_words || words > (size - pos) / 4)
-			return -ENOEXEC;
-		end = pos + words * 4;
-		if ((get_unaligned_le32(p + pos + (fixed_header_words - 1) * 4) & 3) == 3)
-			header_words++;
-		if (words < header_words)
-			return -ENOEXEC;
-		rec = pos + header_words * 4;
 		/* A record needs at least one header and one register value. */
-		limit += (end - rec) / 8;
-		while (rec < end) {
-			u32 h = get_unaligned_le32(p + rec);
-			u32 base = h & 0x7fff;
-			u32 mask = (h >> 15) & 0xffff;
-			u32 count, i;
+		limit += (t.end - t.rec) / 8;
+		for (rec = t.rec; rec < t.end; ) {
+			u32 h = get_unaligned_le32(p + rec), count = ane_hx_record_count(h);
+			u32 base = h & 0x7fff, mask = (h >> 15) & 0xffff, i;
 
 			rec += 4;
-			if (h & BIT(31))
-				count = 1 + hweight32(mask);
-			else
-				count = ((h >> 15) & 0x3f) + 1;
-			if (count > (end - rec) / 4 || !ane_h16_register_valid(base))
+			if (count > (t.end - rec) / 4 || !ane_h16_register_valid(base))
 				return -ENOEXEC;
 			if (h & BIT(31)) {
 				for (i = 0; i < 16; i++)
@@ -105,11 +140,7 @@ ane_hx_task_stream_validate_hdr(const void *text, size_t size, u32 expected_task
 			}
 			rec += count * 4;
 		}
-		padded = end == size ? end : ALIGN(end, 16);
-		if (padded > size || memchr_inv(p + end, 0, padded - end))
-			return -ENOEXEC;
-		last = end;
-		pos = padded;
+		last = t.end;
 		if (++tasks > expected_tasks)
 			return -ENOEXEC;
 	}
@@ -198,6 +229,29 @@ static inline bool ane_hx_dma_config(u32 addr)
 	       (addr >= 0x5520 && addr <= 0x555c);
 }
 
+/*
+ * Whether configuration word @w at @addr enables its DMA: any non-zero value
+ * except a coefficient lane's idle form, 0x20 in the low half, which
+ * lookup-table tasks write for the lanes they do not fetch.
+ */
+static inline bool ane_hx_dma_config_on(u32 addr, u32 w)
+{
+	return w && !(addr >= 0x5520 && addr <= 0x555c && (w & 0xffff) == 0x20);
+}
+
+/*
+ * A count of @n steps @stride apart. Only a zero stride lets a zero count be
+ * read as one: the kernel cannot bound what a zero count moves when the
+ * engine steps by the stride.
+ */
+static inline int ane_hx_dma_count(u32 n, u32 stride, u64 *count)
+{
+	if (!n && stride)
+		return -ENOEXEC;
+	*count = max(1U, n);
+	return 0;
+}
+
 /* Byte address of value @i of the record with header @h. */
 static inline u32 ane_hx_record_addr(u32 h, u32 i)
 {
@@ -211,37 +265,35 @@ static inline u32 ane_hx_record_addr(u32 h, u32 i)
 	return (base + bit + 1) * 4;
 }
 
-static inline u32 ane_hx_record_count(u32 h)
-{
-	return h & BIT(31) ? 1 + hweight32((h >> 15) & 0xffff) : ((h >> 15) & 0x3f) + 1;
-}
-
 /*
  * Bytes an input or output DMA stream touches from its base: the last
  * element of the last row, plane, depth slice and group. Interleave k packs
  * k channels into each element, so a plane holds k channels (the measured
  * matmul staging writes 128 channels interleaved 8 as 16 planes of 2 KiB, its
- * exact scratch).
+ * exact scratch). The row, plane, depth and group strides follow the base;
+ * a zero height, channel, depth or group count is one only with a zero
+ * stride (ane_hx_dma_count()).
  */
 static inline int ane_hx_dma_tile(const u32 *img, u32 base, u64 *extent)
 {
 	static const u8 bytes[] = { 1, 1, 2, 4 };
 	bool dst = base == 0x5108;
 	u32 stride = base + 8, format = dst ? 0x5138 : base == 0x4d10 ? 0x4d68 : 0x4d6c;
-	u32 dim = dst ? 0x14 : 0x4, f = img[ane_hx_dma_index(format)];
-	u64 k = max(1U, (f >> 24) & 0xf), n[5], sum, term;
+	u32 dim = dst ? 0x14 : 0x4, f = img[ane_hx_dma_index(format)], step;
+	u64 k = max(1U, (f >> 24) & 0xf), n, sum, term;
 	unsigned int i;
 
-	for (i = 0; i < 4; i++)
-		n[i] = max(1U, img[ane_hx_dma_index(dim + 4 * i)]);
-	n[4] = max(1U, img[ane_hx_dma_index(0x24)]);
-	n[2] = DIV_ROUND_UP(n[2], k);
-	sum = n[0] * bytes[(f >> 12) & 3] * k;
-	for (i = 1; i < 5; i++)
-		if (check_mul_overflow(n[i] - 1, (u64)img[ane_hx_dma_index(stride + 4 * (i - 1))],
-				       &term) ||
+	sum = (u64)max(1U, img[ane_hx_dma_index(dim)]) * bytes[(f >> 12) & 3] * k;
+	for (i = 1; i < 5; i++) {
+		step = img[ane_hx_dma_index(stride + 4 * (i - 1))];
+		if (ane_hx_dma_count(img[ane_hx_dma_index(i < 4 ? dim + 4 * i : 0x24)], step, &n))
+			return -ENOEXEC;
+		if (i == 2)
+			n = DIV_ROUND_UP(n, k);
+		if (check_mul_overflow(n - 1, (u64)step, &term) ||
 		    check_add_overflow(sum, term, &sum))
 			return -ENOEXEC;
+	}
 	*extent = sum;
 	return 0;
 }
@@ -252,23 +304,30 @@ static inline int ane_hx_dma_tile(const u32 *img, u32 base, u64 *extent)
  * size 0x5504; an unset size is 64), then every group (stride 0x5518) and
  * every output channel group (stride 0x551c) after the first. An output
  * channel group is 16 << (common word 0x40 & 7) channels, 128 when that
- * word is unset.
+ * word is unset. As with a zero width, a lane of size 0 is refused rather
+ * than read as nothing, and a zero group or channel count is one only with
+ * a zero stride.
  */
 static inline int ane_hx_dma_kernel(const u32 *img, u64 *extent)
 {
-	u64 lanes = 0, groups, ocgs, term;
+	u32 group_stride = img[ane_hx_dma_index(0x5518)];
+	u32 ocg_stride = img[ane_hx_dma_index(0x551c)];
+	u64 lanes = 0, size, groups, ocgs, term;
 	unsigned int i;
 
-	for (i = 0; i < 16; i++)
-		lanes = max(lanes, (u64)img[ane_hx_dma_index(0x5560 + 4 * i)] +
-			    max(img[ane_hx_dma_index(0x55a0 + 4 * i)],
-				img[ane_hx_dma_index(0x5504)]));
-	groups = max(1U, img[ane_hx_dma_index(0x24)]) - 1;
-	ocgs = DIV_ROUND_UP((u64)max(1U, img[ane_hx_dma_index(0x1c)]),
-			    16U << (img[ane_hx_dma_index(0x40)] & 7)) - 1;
-	if (check_mul_overflow(groups, (u64)img[ane_hx_dma_index(0x5518)], &term) ||
+	for (i = 0; i < 16; i++) {
+		size = max(img[ane_hx_dma_index(0x55a0 + 4 * i)], img[ane_hx_dma_index(0x5504)]);
+		if (!size)
+			return -ENOEXEC;
+		lanes = max(lanes, img[ane_hx_dma_index(0x5560 + 4 * i)] + size);
+	}
+	if (ane_hx_dma_count(img[ane_hx_dma_index(0x24)], group_stride, &groups) ||
+	    ane_hx_dma_count(img[ane_hx_dma_index(0x1c)], ocg_stride, &ocgs))
+		return -ENOEXEC;
+	ocgs = DIV_ROUND_UP(ocgs, 16U << (img[ane_hx_dma_index(0x40)] & 7));
+	if (check_mul_overflow(groups - 1, (u64)group_stride, &term) ||
 	    check_add_overflow(lanes, term, &lanes) ||
-	    check_mul_overflow(ocgs, (u64)img[ane_hx_dma_index(0x551c)], &term) ||
+	    check_mul_overflow(ocgs - 1, (u64)ocg_stride, &term) ||
 	    check_add_overflow(lanes, term, extent))
 		return -ENOEXEC;
 	return 0;
@@ -278,14 +337,25 @@ static inline int ane_hx_dma_kernel(const u32 *img, u64 *extent)
 static const u16 ane_hx_dma_base_addr[] = { 0x4d10, 0x4d28, 0x5108, 0x5510, 0x5618 };
 #define ANE_HX_DMA_BASES ARRAY_SIZE(ane_hx_dma_base_addr)
 
-/* A register image, and each base's slot and offset as last written into it. */
+/*
+ * One task's register image, the image words it wrote, and each base's slot
+ * and offset as it wrote them.
+ */
 struct ane_hx_dma_state {
 	u32 img[ANE_HX_DMA_WORDS];
+	DECLARE_BITMAP(set, ANE_HX_DMA_WORDS);
 	u64 offset[ANE_HX_DMA_BASES];
 	u8 slot[ANE_HX_DMA_BASES];
 	u8 written;		/* bit b: base b was written */
 };
 
+/*
+ * The reset values of the image: a task starts from them, and a program
+ * may leave out every word that holds its reset value. On the J775D's H17 a
+ * second task that leaves out the output base or a row stride runs with
+ * the reset value 0, and one that leaves out the widths does not run with
+ * the first task's.
+ */
 static inline void ane_hx_dma_defaults(struct ane_hx_dma_state *st)
 {
 	unsigned int i;
@@ -317,7 +387,14 @@ static inline bool ane_hx_other_allowed(u32 addr)
 /*
  * Apply one task's records (bytes [rec, end) of @p) to @st, refusing the
  * header forms the task stream never uses. A relocated record covering a
- * base's [lo, hi] pair sets that base's slot and offset.
+ * base's [lo, hi] pair sets that base's slot and offset. Any other
+ * relocation names the slot 4 custom BAR and takes its value
+ * (ane_h16_custom_bars()), which this check does not see, so the
+ * configuration word must already enable its DMA: that value must not be
+ * able to turn a DMA on.
+ * A word written twice in one task must repeat its value, and a base its
+ * slot too, so no earlier write names anything unchecked; H17 programs
+ * repeat source 2's base unchanged.
  */
 static inline int ane_hx_dma_apply(const u8 *p, size_t rec, size_t end,
 				   struct ane_hx_dma_state *st)
@@ -337,29 +414,40 @@ static inline int ane_hx_dma_apply(const u8 *p, size_t rec, size_t end,
 		if (!(h & BIT(31)) && ((h & (BIT(21) | BIT(22) | BIT(30))) || (!reloc && slot)))
 			return -ENOEXEC;
 		if (reloc && count == 2 && ane_hx_dma_base(first) && !(first & 4)) {
+			u64 offset = get_unaligned_le32(p + rec) |
+				     (u64)get_unaligned_le32(p + rec + 4) << 32;
+
 			for (b = 0; ane_hx_dma_base_addr[b] != first; b++)
 				;
-			st->offset[b] = get_unaligned_le32(p + rec) |
-					(u64)get_unaligned_le32(p + rec + 4) << 32;
+			if ((st->written & BIT(b)) && st->slot[b] != slot)
+				return -ENOEXEC;
+			st->offset[b] = offset;
 			st->slot[b] = slot;
 			st->written |= BIT(b);
 		} else if (reloc) {
 			if (slot != 4)
 				return -ENOEXEC;
 			for (i = 0; i < count; i++)
-				if (!ane_hx_dma_config(first + 4 * i))
+				if (!ane_hx_dma_config(first + 4 * i) ||
+				    !ane_hx_dma_config_on(first + 4 * i,
+							  get_unaligned_le32(p + rec + 4 * i)))
 					return -ENOEXEC;
 		}
 		for (i = 0; i < count; i++) {
 			u32 addr = ane_hx_record_addr(h, i);
+			u32 w = get_unaligned_le32(p + rec + 4 * i);
 
 			if (!reloc && ane_hx_dma_base(addr))
 				return -ENOEXEC;
 			index = ane_hx_dma_index(addr);
-			if (index >= 0)
-				st->img[index] = get_unaligned_le32(p + rec + 4 * i);
-			else if (get_unaligned_le32(p + rec + 4 * i) && !ane_hx_other_allowed(addr))
+			if (index < 0) {
+				if (w && !ane_hx_other_allowed(addr))
+					return -ENOEXEC;
+				continue;
+			}
+			if (test_and_set_bit(index, st->set) && st->img[index] != w)
 				return -ENOEXEC;
+			st->img[index] = w;
 		}
 		rec += count * 4;
 	}
@@ -392,32 +480,39 @@ static inline int ane_hx_dma_image_check(const u32 *img)
 }
 
 /*
- * What one task enables it must also locate: an input DMA source, the output
- * DMA or the lookup table with a non-zero configuration needs its relocated
- * base in the same task, and a height and channel count that are not zero.
- * A zero width, depth or group count is read as one: the compiler writes 0
- * for them, and a zero width is in the 256 x 256 matmul that runs correctly
- * on an M4 Pro. The coefficient DMA is not held to this: lookup-table tasks
- * configure it without a base (see ane_hx_task_stream_dma_validate()).
+ * What one task enables it must also locate and size. Each DMA has its
+ * configuration words: source 1 0x4d00, source 2 0x4d04, the destination
+ * 0x5100, the 16 coefficient lanes 0x5520-0x555c and the lookup table's
+ * 0x5600-0x5614, which enable it as ane_hx_dma_config_on() says. An
+ * enabled DMA needs its relocated base in the same task, and an enabled
+ * input or output stream a width, height and channel count that are not
+ * zero. A zero width is not read as one: on the J775D's H17 a task without
+ * widths stalled the engine, and on H16 a matmul without them ran 256 wide.
+ * A zero depth or group count is one only with a zero stride, which every
+ * program that leaves them out has (ane_hx_dma_tile()).
  */
 static inline int ane_hx_dma_enabled_check(const struct ane_hx_dma_state *st)
 {
 	static const struct { u16 config, last, dim; u8 base; } dma[] = {
 		{ 0x4d00, 0x4d00, 0x4, 0 }, { 0x4d04, 0x4d04, 0x4, 1 },
-		{ 0x5100, 0x5100, 0x14, 2 }, { 0x5600, 0x5614, 0, 4 },
+		{ 0x5100, 0x5100, 0x14, 2 }, { 0x5520, 0x555c, 0, 3 },
+		{ 0x5600, 0x5614, 0, 4 },
 	};
 	unsigned int i;
-	u32 a, on;
+	bool on;
+	u32 a;
 
 	for (i = 0; i < ARRAY_SIZE(dma); i++) {
-		for (a = dma[i].config, on = 0; a <= dma[i].last; a += 4)
-			on |= st->img[ane_hx_dma_index(a)];
+		for (a = dma[i].config, on = false; a <= dma[i].last; a += 4)
+			if (ane_hx_dma_config_on(a, st->img[ane_hx_dma_index(a)]))
+				on = true;
 		if (!on)
 			continue;
-		if (!(st->written & BIT(dma[i].base)) ||
-		    (dma[i].dim && (!st->img[ane_hx_dma_index(dma[i].dim + 4)] ||
-				    !st->img[ane_hx_dma_index(dma[i].dim + 8)])))
+		if (!(st->written & BIT(dma[i].base)))
 			return -ENOEXEC;
+		for (a = dma[i].dim; dma[i].dim && a <= dma[i].dim + 8; a += 4)
+			if (!st->img[ane_hx_dma_index(a)])
+				return -ENOEXEC;
 	}
 	return 0;
 }
@@ -450,27 +545,25 @@ static inline int ane_hx_dma_fits(const struct ane_hx_dma_state *st, unsigned in
 }
 
 /*
- * Bound every DMA base of an already validated stream. @bound[s] is the size
- * of the buffer the operation section binds to BAR slot s, 0 when it binds
- * none. A base must be a relocated [lo, hi] record on a bound slot, and its
- * offset plus the extent of its transfer must stay inside that buffer.
+ * Bound every DMA base of an already validated stream with @header_words
+ * fixed words per task. @bound[s] is the size of the buffer the operation
+ * section binds to BAR slot s, 0 when it binds none. A base must be a
+ * relocated [lo, hi] record on a bound slot, and its offset plus the extent
+ * of its transfer must stay inside that buffer.
  *
- * Whether the engine starts each task from its defaults or keeps registers
- * from the task before is not known, so both readings are checked:
- *  - each task over the defaults: the bases it writes, with its own words,
- *    and every DMA it enables has its base in the task;
- *  - a running image over the whole stream, from the defaults: after each
- *    task, every base written so far, with the geometry in force then. This
- *    also bounds a coefficient DMA configured without a base of its own.
- * Programs leave out words that hold the default even when an earlier task
- * set another value; such a stream fits only the first reading and is
- * refused.
+ * Each task is checked on its own words over the reset values, which is the
+ * state the engine runs it from (see ane_hx_dma_defaults()). A word a task
+ * leaves out holds its reset value, whatever an earlier task wrote there,
+ * and a DMA the task does not enable reads and writes nothing. No base can
+ * reach a later task either: every DMA a task enables has its base written
+ * in that task (ane_hx_dma_enabled_check()).
  */
 static inline int
-ane_hx_task_stream_dma_validate(const void *text, size_t size,
+ane_hx_task_stream_dma_validate(const void *text, size_t size, unsigned int header_words,
 				const u64 bound[ANE_HX_DMA_SLOTS])
 {
-	struct ane_hx_dma_state *task, *run;
+	struct ane_hx_dma_state *task;
+	struct ane_hx_task t;
 	const u8 *p = text;
 	size_t pos = 16;
 	unsigned int b;
@@ -478,53 +571,27 @@ ane_hx_task_stream_dma_validate(const void *text, size_t size,
 
 	if (!p || !bound || size < 16 || size > ANE_H16_TASK_MAX || (size & 3))
 		return -ENOEXEC;
-	task = kmalloc_array(2, sizeof(*task), GFP_KERNEL);
+	task = kmalloc_obj(*task);
 	if (!task)
 		return -ENOMEM;
-	run = task + 1;
-	ane_hx_dma_defaults(run);
-	while (!ret && pos < size) {
-		u32 words, header_words = 9;
-		size_t end, rec;
-
-		if (size - pos < 16) {
-			ret = -ENOEXEC;
+	while (pos < size) {
+		ret = ane_hx_task_frame(p, size, pos, header_words, &t);
+		if (ret < 0)
 			break;
-		}
-		words = (get_unaligned_le32(p + pos) >> 16) & 0x7ff;
-		if (!words) {
-			pos += 16;
+		pos = t.next;
+		if (!ret)
 			continue;
-		}
-		if (words < 9 || words > (size - pos) / 4) {
-			ret = -ENOEXEC;
-			break;
-		}
-		end = pos + words * 4;
-		if ((get_unaligned_le32(p + pos + 8 * 4) & 3) == 3)
-			header_words++;
-		if (words < header_words) {
-			ret = -ENOEXEC;
-			break;
-		}
-		rec = pos + header_words * 4;
 		ane_hx_dma_defaults(task);
-		ret = ane_hx_dma_apply(p, rec, end, task);
+		ret = ane_hx_dma_apply(p, t.rec, t.end, task);
 		if (!ret)
 			ret = ane_hx_dma_image_check(task->img);
 		if (!ret)
 			ret = ane_hx_dma_enabled_check(task);
-		if (!ret)
-			ret = ane_hx_dma_apply(p, rec, end, run);
-		if (!ret)
-			ret = ane_hx_dma_image_check(run->img);
-		for (b = 0; !ret && b < ANE_HX_DMA_BASES; b++) {
+		for (b = 0; !ret && b < ANE_HX_DMA_BASES; b++)
 			if (task->written & BIT(b))
 				ret = ane_hx_dma_fits(task, b, bound);
-			if (!ret && (run->written & BIT(b)))
-				ret = ane_hx_dma_fits(run, b, bound);
-		}
-		pos = end == size ? end : ALIGN(end, 16);
+		if (ret)
+			break;
 	}
 	kfree(task);
 	return ret;

@@ -54,6 +54,8 @@ struct ane_h16_hwx {
 	struct ane_h16_hwx_section text, constants, kernel, scratch;
 	/* Target; a backend accepts only its own engine's subtype. */
 	u32 subtype;
+	/* Fixed words per task of the target's task stream (ane_hx_task_frame()). */
+	u32 task_header_words;
 	struct ane_h16_hwx_surface surfaces[ANE_H16_SURFACES];
 	u32 surface_count;
 	u32 tasks;

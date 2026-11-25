@@ -467,7 +467,7 @@ int ane_h16_operation_validate(const struct ane_h16_hwx_snapshot *snapshot,
 	if (hwx->kernel.size && !kernel_bound)
 		goto out;
 	ret = ane_hx_task_stream_dma_validate((const u8 *)snapshot->bytes + hwx->text.offset,
-					      hwx->text.size, bound);
+					      hwx->text.size, hwx->task_header_words, bound);
 out:
 	kfree(bound);
 	return ret;
