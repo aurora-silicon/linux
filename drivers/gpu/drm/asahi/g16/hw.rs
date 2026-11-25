@@ -542,6 +542,9 @@ pub(crate) mod rings {
     pub(crate) const LOG_RINGS: usize = 9;
     pub(crate) const LOG_STATE_SIZE: usize = 0x1b0;
     pub(crate) const LOG_RING_SIZE: usize = 0x28800;
+    pub(crate) const LOG_PAYLOAD_SIZE: usize = 0xd8;
+    pub(crate) const LOG_PAYLOAD_TEXT_OFFSET: usize = 0x10;
+    pub(crate) const LOG_PAYLOAD_TEXT_SIZE: usize = 0xc8;
     pub(crate) const TRACE_RING_SIZE: usize = 0x9000;
     pub(crate) const STATS_RING_SIZE: usize = 0x4800;
     pub(crate) const FWCTL_RING_SIZE: usize = 0x4000;

@@ -74,6 +74,7 @@ pub(crate) struct Recovery {
     window_ns: u64,
     window_count: u32,
     running: bool,
+    pub(crate) fwlog_remaining: usize,
 }
 
 impl Recovery {
@@ -96,6 +97,7 @@ impl Recovery {
             window_ns: 0,
             window_count: 0,
             running: false,
+            fwlog_remaining: super::channel::RECOVERY_FWLOG_CAP,
         }
     }
 
@@ -418,6 +420,59 @@ impl Firmware {
         self.recovery_prepare_suspects(stage, event, asid)
     }
 
+    /// Decodes and logs every non-zero fault bank captured while firmware is halted in phase 1,
+    /// together with whether the faulting context matches any in-flight flight or open VM.
+    #[inline(never)]
+    fn log_recovery_faults(&self, scan: Option<&super::regs::FaultScan>, event: u32) {
+        let Some(scan) = scan else {
+            dev_warn!(
+                self.dev(),
+                "G16: fault_scan: GPU powered down (event={:#x}, flights={})\n",
+                event,
+                self.engine.flights.len()
+            );
+            return;
+        };
+        let mut nonzero = 0usize;
+        for entry in &scan.banks {
+            if entry.status == 0 {
+                continue;
+            }
+            nonzero += 1;
+            self.log_fault(entry);
+            let ctx = ((entry.status >> 17) & 0x3f) as u32;
+            let flight_matches = self
+                .engine
+                .flights
+                .iter()
+                .filter(|f| f.job.vm.slot == ctx)
+                .count();
+            let live_vm = self.vms.find_by_slot(ctx);
+            dev_warn!(
+                self.dev(),
+                "G16: fault bank {} attribution: busy={} saved_bank={} ctx={} flight_matches={} live_vm={:?} event={:#x} flights={}\n",
+                entry.bank,
+                scan.busy,
+                scan.saved_bank,
+                ctx,
+                flight_matches,
+                live_vm,
+                event,
+                self.engine.flights.len()
+            );
+        }
+        if nonzero == 0 {
+            dev_warn!(
+                self.dev(),
+                "G16: fault_scan: all 8 banks zero (busy={}, saved_bank={}, event={:#x}, flights={})\n",
+                scan.busy,
+                scan.saved_bank,
+                event,
+                self.engine.flights.len()
+            );
+        }
+    }
+
     fn recover(&mut self) -> Result {
         struct RecoveringGuard(Option<Arc<super::Shared>>);
         impl Drop for RecoveringGuard {
@@ -441,16 +496,31 @@ impl Firmware {
         let deadline = start.saturating_add(logic::RECOVERY_BUDGET_NS);
         let mut answered = false;
         let mut generation = 0;
+        let mut last_phase = 0;
         loop {
             if let Some(error) = self.transport_error() {
                 return Err(error);
             }
             let now = now_ns();
             if logic::expired(now, deadline) {
-                dev_err!(self.dev(), "M4 GPU recovery exceeded 1000 ms\n");
+                let _ = self.drain_auxiliary_rings();
+                // Which side stalled, and whether tiling or fragment work was left behind.
+                let stage = self.recovery_snapshot().unwrap_or_default();
+                dev_err!(
+                    self.dev(),
+                    "M4 GPU recovery exceeded 1000 ms: {} (phase {}, TA {:#x}/{:#x}, FS {:#x}/{:#x}, {} flights)\n",
+                    logic::Stall::of(last_phase, answered).describe(),
+                    last_phase,
+                    stage[0],
+                    self.engine.ta_target,
+                    stage[1],
+                    self.engine.fs_target,
+                    self.engine.flights.len()
+                );
                 return Err(ETIMEDOUT);
             }
             let phase = self.firmware_r32(self.init.firmware_data().phase)?;
+            last_phase = phase;
             let current_generation = if phase == 1 || phase == 3 {
                 self.firmware_generation()?
             } else {
@@ -495,10 +565,13 @@ impl Firmware {
                     self.events.grow.clear();
                     let stage = self.recovery_snapshot()?;
                     // Powered down, the GPU holds no fault to read.
-                    let fault = self.session.fault_scan()?.unwrap_or_default();
-                    let asid = Some(fault.status)
-                        .filter(|status| status & 1 != 0)
-                        .map(|status| ((status >> 17) & 0x3f) as u32)
+                    let scan = self.session.fault_scan()?;
+                    self.log_recovery_faults(scan.as_ref(), event);
+                    let _ = self.drain_auxiliary_rings();
+                    let asid = scan
+                        .as_ref()
+                        .and_then(super::regs::FaultScan::first_latched)
+                        .map(|fault| ((fault.status >> 17) & 0x3f) as u32)
                         .filter(|asid| *asid >= 1);
                     self.mark_recovery(stage, event, asid)?;
                     // Snapshot reads and all TPC repairs precede acknowledgement.
@@ -508,6 +581,7 @@ impl Firmware {
                     answered = true;
                 }
                 RecoveryAction::Resume => {
+                    let _ = self.drain_auxiliary_rings();
                     barrier();
                     self.firmware_w32(self.init.firmware_data().phase, 0)?;
                     barrier();
@@ -516,6 +590,7 @@ impl Firmware {
                     self.recovery.statistics_seen = self.events.recovery_statistics;
                     self.events.recovery_started_ns = None;
                     self.recovery.running = false;
+                    self.recovery.fwlog_remaining = super::channel::RECOVERY_FWLOG_CAP;
                     self.engine.frozen = false;
                     self.renew_deadlines();
                     dev_warn!(
@@ -541,10 +616,12 @@ impl Firmware {
                         self.engine.flights.is_empty(),
                         now.saturating_sub(start),
                     ) {
+                        let _ = self.drain_auxiliary_rings();
                         self.recovery.errors_seen = self.events.errors;
                         self.recovery.statistics_seen = self.events.recovery_statistics;
                         self.events.recovery_started_ns = None;
                         self.recovery.running = false;
+                        self.recovery.fwlog_remaining = super::channel::RECOVERY_FWLOG_CAP;
                         self.engine.frozen = false;
                         dev_warn!(
                             self.dev(),

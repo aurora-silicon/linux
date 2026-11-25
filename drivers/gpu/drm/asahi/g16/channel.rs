@@ -55,6 +55,9 @@ impl Ring {
     }
 }
 
+/// Maximum firmware log entries printed per recovery before suppressing excess entries.
+pub(crate) const RECOVERY_FWLOG_CAP: usize = 32;
+
 /// The channels and rings.
 pub(crate) struct Channels {
     /// The 12 submit channels (TA, FS and compute are used).
@@ -63,6 +66,8 @@ pub(crate) struct Channels {
     pub(crate) event: Ring,
     /// The nine log sub-rings share one state object (9 x 0x30) and one ring object.
     pub(crate) log: Ring,
+    /// Backing payload buffer (`LOG_DATA`, 9 x 256 x 0xd8) indexed by firmware log records.
+    log_data: Arc<FwObject>,
     pub(crate) trace: Ring,
     pub(crate) stats: Ring,
     /// Allocated for the firmware; the host never uses it.
@@ -93,6 +98,7 @@ impl Channels {
         devctl: Ring,
         event: Ring,
         log: Ring,
+        log_data: Arc<FwObject>,
         trace: Ring,
         stats: Ring,
         fwctl: Ring,
@@ -112,6 +118,7 @@ impl Channels {
             devctl,
             event,
             log,
+            log_data,
             trace,
             stats,
             _fwctl: fwctl,
@@ -222,17 +229,92 @@ impl Channels {
         );
     }
 
-    /// Consumes a receive ring to its firmware producer.
-    fn drain_one(ring: &Ring, offset: usize, capacity: u32) -> Result {
-        let producer = ring.state.r32(offset + STATE_WRITE)?;
-        let consumer = ring.state.r32(offset + STATE_READ)?;
-        if producer >= capacity || consumer >= capacity {
+    /// Drains one firmware log sub-ring. Outside recovery (`budget` is `None`), advances the
+    /// consumer directly without touching the payload pages. During recovery (`Some(remaining)`),
+    /// prints up to the last `*remaining` entries and counts any older/excess entries suppressed.
+    #[inline(never)]
+    fn drain_log_ring(
+        &self,
+        dev: &kernel::device::Device,
+        thread: usize,
+        budget: Option<&mut usize>,
+        suppressed: &mut usize,
+    ) -> Result {
+        let offset = thread * 0x30;
+        let producer = self.log.state.r32(offset + STATE_WRITE)?;
+        let mut consumer = self.log.state.r32(offset + STATE_READ)?;
+        if producer >= RING_SLOTS || consumer >= RING_SLOTS {
             return Err(super::boot::eproto());
         }
-        if consumer != producer {
-            ring.state.w32(offset + STATE_READ, producer)?;
-            wmb();
+        if consumer == producer {
+            return Ok(());
         }
+        if let Some(remaining) = budget {
+            rmb();
+            let pending = producer.wrapping_sub(consumer) % RING_SLOTS;
+            if (pending as usize) > *remaining {
+                let skip = pending as usize - *remaining;
+                *suppressed = suppressed.saturating_add(skip);
+                consumer = (consumer + skip as u32) % RING_SLOTS;
+            }
+            while consumer != producer {
+                let entry_off =
+                    (thread * RING_SLOTS as usize + consumer as usize) * rings::EVENT_RECORD;
+                let kind = self.log.ring.r32(entry_off)?;
+                let slot = self.log.ring.r32(entry_off + 8)?;
+                let payload_idx = thread * RING_SLOTS as usize + (slot & 255) as usize;
+                let payload_off = payload_idx * rings::LOG_PAYLOAD_SIZE;
+                let ptype = self.log_data.r32(payload_off)?;
+                let seq = self.log_data.r32(payload_off + 4)?;
+                let mut text = [0u8; rings::LOG_PAYLOAD_TEXT_SIZE];
+                self.log_data
+                    .read(payload_off + rings::LOG_PAYLOAD_TEXT_OFFSET, &mut text)?;
+                let len = text.iter().position(|&b| b == 0).unwrap_or(text.len());
+                let line = core::str::from_utf8(&text[..len])
+                    .ok()
+                    .map(|s| s.trim_end_matches(['\r', '\n']));
+                match line {
+                    Some(msg) if !msg.is_empty() && kind == 2 && ptype == 3 => {
+                        dev_warn!(
+                            dev,
+                            "G16: fwlog[{}] seq={} slot={}: {}\n",
+                            thread,
+                            seq,
+                            slot,
+                            msg
+                        );
+                    }
+                    Some(msg) if !msg.is_empty() => {
+                        dev_warn!(
+                            dev,
+                            "G16: fwlog[{}] kind={} ptype={} seq={} slot={}: {}\n",
+                            thread,
+                            kind,
+                            ptype,
+                            seq,
+                            slot,
+                            msg
+                        );
+                    }
+                    _ => {
+                        dev_warn!(
+                            dev,
+                            "G16: fwlog[{}] kind={} ptype={} seq={} slot={} (non-text len={})\n",
+                            thread,
+                            kind,
+                            ptype,
+                            seq,
+                            slot,
+                            len
+                        );
+                    }
+                }
+                *remaining = remaining.saturating_sub(1);
+                consumer = (consumer + 1) % RING_SLOTS;
+            }
+        }
+        self.log.state.w32(offset + STATE_READ, producer)?;
+        wmb();
         Ok(())
     }
 
@@ -252,19 +334,37 @@ impl Channels {
         result
     }
 
-    /// Drains the nine log sub-rings and the ktrace receive ring.
-    pub(crate) fn drain_auxiliary_rings(&self, dev: &kernel::device::Device) -> Result {
+    /// Drains the nine log sub-rings and the ktrace receive ring. When `fwlog_budget` is `Some`,
+    /// prints drained firmware log records up to the remaining budget.
+    pub(crate) fn drain_auxiliary_rings_with_log(
+        &self,
+        dev: &kernel::device::Device,
+        mut fwlog_budget: Option<&mut usize>,
+    ) -> Result {
         let mut result = Ok(());
+        let mut suppressed = 0usize;
         let mut keep = |r: Result| {
             if result.is_ok() {
                 result = r;
             }
         };
         for i in 0..rings::LOG_RINGS {
-            keep(Self::drain_one(&self.log, i * 0x30, 256));
+            keep(self.drain_log_ring(dev, i, fwlog_budget.as_deref_mut(), &mut suppressed));
+        }
+        if suppressed != 0 {
+            dev_warn!(
+                dev,
+                "G16: fwlog: suppressed {} additional entries during recovery\n",
+                suppressed
+            );
         }
         keep(self.drain_trace(dev));
         result
+    }
+
+    /// Drains the nine log sub-rings and the ktrace receive ring silently.
+    pub(crate) fn drain_auxiliary_rings(&self, dev: &kernel::device::Device) -> Result {
+        self.drain_auxiliary_rings_with_log(dev, None)
     }
 
     /// Drains every receive ring: events (decoded into `events`), the nine log sub-rings, trace
@@ -410,7 +510,12 @@ impl Firmware {
     /// Drains the receive rings and decodes events. Called on full housekeeping and idle passes.
     pub(crate) fn drain_rings(&mut self) -> Result {
         let dev = self.session.dev.clone();
-        self.channels.drain_rings(&dev, &mut self.events)
+        let mut result = self.channels.drain_events_and_stats(&dev, &mut self.events);
+        let aux = self.drain_auxiliary_rings();
+        if result.is_ok() {
+            result = aux;
+        }
+        result
     }
 
     /// Drains only the event and statistics rings on the hot retirement path.
@@ -419,9 +524,12 @@ impl Firmware {
         self.channels.drain_events_and_stats(&dev, &mut self.events)
     }
 
-    /// Drains the auxiliary log and trace rings on periodic housekeeping passes.
+    /// Drains the auxiliary log and trace rings on periodic housekeeping passes. Prints firmware
+    /// log records (bounded per recovery) whenever a firmware recovery is pending or running.
     pub(crate) fn drain_auxiliary_rings(&mut self) -> Result {
         let dev = self.session.dev.clone();
-        self.channels.drain_auxiliary_rings(&dev)
+        let log_fwlog = self.recovery.receipt_fault || self.recovery_pending().unwrap_or(false);
+        let budget = log_fwlog.then_some(&mut self.recovery.fwlog_remaining);
+        self.channels.drain_auxiliary_rings_with_log(&dev, budget)
     }
 }

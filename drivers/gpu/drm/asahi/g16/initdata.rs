@@ -150,6 +150,7 @@ pub(crate) fn build(
         pair(&graph, id::DEVCTRL_STATE, id::DEVCTRL_RING),
         pair(&graph, id::EVENT_STATE, id::EVENT_DATA),
         pair(&graph, id::LOG_STATE, id::LOG_ENTRIES),
+        graph[id::LOG_DATA].clone(),
         pair(&graph, id::KTRACE_STATE, id::KTRACE_DATA),
         pair(&graph, id::STATISTICS_STATE, id::STATISTICS_DATA),
         // FWCTL state and ring share one allocation (ring starts at+0x40).
