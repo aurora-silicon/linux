@@ -1960,11 +1960,39 @@ static int bcm4377_hci_set_bdaddr(struct hci_dev *hdev, const bdaddr_t *bdaddr)
 	return 0;
 }
 
+/*
+ * The ACL transfer ring takes at most MAX_ACL_PAYLOAD_SIZE bytes per entry
+ * (HCI_MAX_ACL_SIZE of data), and bcm4377_enqueue() refuses anything larger.
+ * The core fragments ACL data to the MTUs the controller reports, so a
+ * controller that reports more than the ring takes would have every larger
+ * fragment dropped. Fragment to what the ring takes instead.
+ */
+static void bcm4377_clamp_acl_mtu(struct hci_dev *hdev)
+{
+	struct bcm4377_data *bcm4377 = hci_get_drvdata(hdev);
+
+	if (hdev->acl_mtu > HCI_MAX_ACL_SIZE) {
+		dev_info(&bcm4377->pdev->dev,
+			 "controller ACL MTU %u exceeds the ACL ring's %u, using %u\n",
+			 hdev->acl_mtu, HCI_MAX_ACL_SIZE, HCI_MAX_ACL_SIZE);
+		hdev->acl_mtu = HCI_MAX_ACL_SIZE;
+	}
+
+	if (hdev->le_mtu > HCI_MAX_ACL_SIZE) {
+		dev_info(&bcm4377->pdev->dev,
+			 "controller LE MTU %u exceeds the ACL ring's %u, using %u\n",
+			 hdev->le_mtu, HCI_MAX_ACL_SIZE, HCI_MAX_ACL_SIZE);
+		hdev->le_mtu = HCI_MAX_ACL_SIZE;
+	}
+}
+
 static int bcm4377_hci_post_init(struct hci_dev *hdev)
 {
 	struct bcm4377_data *bcm4377 = hci_get_drvdata(hdev);
 	const bdaddr_t *bda = NULL;
 	int ret;
+
+	bcm4377_clamp_acl_mtu(hdev);
 
 	if (!bcm4377->cal_needed)
 		return 0;
