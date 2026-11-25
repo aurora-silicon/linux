@@ -25,7 +25,9 @@ OUT=$(realpath -m "$4")
 HERE=$(dirname "$(realpath "$0")")
 EXPECTED=$HERE/kernel-smoke-expected.txt
 QEMU_TIMEOUT=${QEMU_TIMEOUT:-9000}
-MOD_TIMEOUT=${MOD_TIMEOUT:-120}
+# Per-module watchdog. Compute-heavy KUnit suites (raid6) need more than two
+# minutes under emulation on the hosted ARM runners.
+MOD_TIMEOUT=${MOD_TIMEOUT:-300}
 
 mkdir -p "$OUT"
 R=$(mktemp -d "$OUT/initramfs.XXXXXX")
@@ -79,7 +81,9 @@ rm -rf "$R"; trap - EXIT
 
 ACCEL=tcg
 if [ -w /dev/kvm ] && [ "$(uname -m)" = aarch64 ]; then ACCEL=kvm; fi
-CPU=max; [ $ACCEL = kvm ] && CPU=host
+# pauth-impdef: the architected pointer-authentication algorithm is slow to
+# emulate, and this kernel signs every return address.
+CPU=max,pauth-impdef=on; [ $ACCEL = kvm ] && CPU=host
 echo "qemu: accel=$ACCEL kernel=$KREL"
 set +e
 : > "$OUT/console.log"
