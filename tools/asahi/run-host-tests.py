@@ -269,9 +269,14 @@ ASAHI_TESTS = {
         + mutations('--mutation', ('own-finished', 'no-retire-glue', 'retire-unchecked', 'no-expiry',
                                    'no-step-past', 'pop-owed', 'head-includes-owed', 'held-stamped-pops',
                                    'crossed-behind-owed', 'owed-classified', 'rebind-check-entry',
-                                   'timeout-fails-retired', 'no-owed-poll'), []),
+                                   'timeout-fails-retired', 'no-owed-poll', 'count-recordless',
+                                   'count-owed-twice'), []),
     'g17-compute-deadline-tests.py': [([], PASS)],
     'g17-compute-growth-deadline-tests.py': [([], PASS)],
+    'g17-compute-retired-tests.py': [([], PASS)]
+        + mutations('--mutation', ('queue-under-lock', 'binding-under-lock', 'drain-under-lock',
+                                   'drain-local-on-eagain', 'finish-stops-at-error',
+                                   'early-return-skips-finish', 'overwrite-full'), []),
     'g17-kill-route-tests.py': [([], PASS)]
         + mutations('--mutation', ('no-executed-route', 'no-executed-input', 'kill-twice', 'executed-on-m5',
                                    'unsafe-wait', 'owed-blocks-kill', 'open-owed-skipped'), []),
@@ -307,6 +312,29 @@ ASAHI_TESTS = {
                                    'same-qid-emits-barrier',
                                    'lock-has-published-epoch',
                                    'lock-same-vm'), []),
+    'g17-m5-sibling-compute-tests.py': [([], PASS)]
+        + mutations('--mutation', ('fixed-object-ids', 'primary-before-sibling',
+                                   'exit-ack-stops-first', 'direct-allows-multi-barrier',
+                                   'direct-blocks-sibling', 'direct-locks-sibling-when-idle',
+                                   'direct-skips-multi', 'same-qid-pipelined'), []),
+    'g17-m5-sibling-gate-tests.py': [([], PASS)]
+        + mutations('--mutation', ('sources-fan-out', 'select-sources-anywhere', 'tiny-fans-out',
+                                   'no-sustain-run', 'short-keeps-run', 'direct-ignores-gate',
+                                   'direct-can-add-ungated', 'wants-ignores-sustained',
+                                   'select-ignores-sustained', 'cell-drops-sustained',
+                                   'fans-out-locks-first', 'keep-run-across-owners', 'overlap-at-one',
+                                   'direct-ignores-in-flight', 'select-ignores-in-flight',
+                                   'wants-ignores-in-flight', 'detour-at-one'), []),
+    'g17-m5-sibling-rearm-tests.py': [([], PASS)]
+        + mutations('--mutation', ('old-headroom', 'no-vacant-sibling', 'no-foreign-sibling',
+                                   'steal-shareable', 'steal-unowned', 'ignore-rearm-reservation',
+                                   'ignore-releasing', 'parallel-give-back', 'foreign-before-fresh',
+                                   'rearm-binds-primary', 'try-add-ignores-waiters', 'try-add-skips-rearm',
+                                   'rearm-any-index', 'primary-own-give-back'), []),
+    'g17-compute-multi-channel-feature-tests.py': [([], PASS)]
+        + mutations('--mutation', ('always-multi', 'never-multi', 'not-reported', 'per-board-gate',
+                                   'colliding-bit', 'unsynced-binding', 'forms-gate',
+                                   'max-channels', 'multi-channel-max'), []),
     'g17-m5-effort-tests.py': [([], PASS)]
         + mutations('--mutation', ('m5-ignores-bound',), []),
     'g17-firmware-selection-tests.py': [([], PASS)],

@@ -2,10 +2,11 @@
 
 //! Scheduler callbacks and the off-lock fence boundary of a logical queue.
 
-use super::{Backend, DeferredBatch};
+use super::{Backend, DeferredBatch, PerChannel, Uninstalled};
 use crate::g17::{
     completion::Deferred,
     job::{self, Engine, Packet},
+    queue::compute::Binding,
 };
 use core::sync::atomic::Ordering;
 use kernel::{dma_fence::{Fence, RawDmaFence}, drm::sched, prelude::*, sync::Arc};
@@ -34,30 +35,21 @@ impl Backend {
         // No outer preparation lease survives compute_packet's return. Hold a
         // fresh epoch through alias destruction so recovery can join this work.
         loop {
-        let lease = self.shared.preparations.enter(false)?;
-        let mut retired = None;
-        let mut state = self.shared.state.lock();
-        let firmware = state.as_deref_mut().ok_or(ENODEV)?;
-        if !lease.is_current() { drop(state); drop(lease); continue; }
-        let mut binding = None;
-        if let Some(index) = firmware.queues.compute.iter().position(|entry| {
-            entry.as_ref().and_then(|entry| entry.queue.as_deref())
-                .is_some_and(|queue| queue.owner() == Some(self.owner))
-        }) {
-            let entry = firmware.queues.compute[index].as_mut().ok_or(EIO)?;
-            let (cancel, replaced) = entry.queue.as_deref_mut().ok_or(EIO)?
-                .rollback_unpublished(self.owner, &self.context)?;
-            binding = replaced;
-            if cancel {
-                retired = entry.queue.take().map(|queue| (entry.reservation, queue));
-            }
-        }
-        drop(state);
-        drop(binding);
-        self.finish_uninstalled_compute(retired)?;
-        self.shared.channels.notify();
-        self.shared.queue_events();
-        return Ok(());
+            let lease = self.shared.preparations.enter(false)?;
+            let mut retired: PerChannel<Uninstalled> = Default::default();
+            let mut bindings: PerChannel<Binding> = Default::default();
+            let mut state = self.shared.state.lock();
+            let firmware = state.as_deref_mut().ok_or(ENODEV)?;
+            if !lease.is_current() { drop(state); drop(lease); continue; }
+            let result = firmware.queues.rollback_unpublished_compute(
+                self.owner, &self.context, &mut retired, &mut bindings);
+            drop(state);
+            // Off-lock, and after a failure too: no cancelled queue's reservation stays behind.
+            drop(bindings);
+            let finished = self.finish_retired_compute(&mut retired);
+            self.shared.channels.notify();
+            self.shared.queue_events();
+            return result.and(finished);
         }
     }
 

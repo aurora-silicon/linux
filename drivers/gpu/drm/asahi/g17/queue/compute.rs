@@ -270,7 +270,7 @@ impl Graph {
         &mut self,
         context: Arc<Context>,
         kick_alias: mmu::KernelMapping,
-        pool_alias: mmu::KernelMapping,
+        pool_alias: Option<mmu::KernelMapping>,
     ) -> Result<Binding> {
         if !context.is_current() {
             return Err(EFAULT);
@@ -292,7 +292,7 @@ impl Graph {
             .map(|context| context.alias_in(vm, private.clone(), page, prot)).transpose()?;
         Ok(Binding {
             _kick_alias: kick_alias,
-            pool_alias: Some(pool_alias),
+            pool_alias,
             descriptors: Some(descriptors),
             preempt,
             usage,
@@ -379,12 +379,8 @@ impl Graph {
     fn vacate_ring(&mut self) -> Option<DescriptorRing> {
         self.ring.take()
     }
-    fn rearm_ring(&mut self, ring: DescriptorRing) -> Result {
-        if self.ring.is_some() {
-            return Err(EBUSY);
-        }
-        self.ring = Some(ring);
-        Ok(())
+    fn rearm_ring(&mut self, ring: DescriptorRing) -> Option<DescriptorRing> {
+        self.ring.replace(ring)
     }
     /// `cursors`: this publication's snapshot (M5), else a fresh read.
     fn ensure_record_slot(&self, slot: usize, cursors: Option<Cursors>) -> Result {
@@ -659,6 +655,14 @@ pub(crate) struct AdmissionState {
 
 pub(crate) struct Queue {
     owner: Option<u64>,
+    /// Per-owner channel index (0 for primary, 1..COMPUTE_CHANNELS_MAX for M5 siblings).
+    channel_index: u8,
+    /// Whether this queue currently holds a `Context::note_compute_binding(true)` count.
+    binding_noted: bool,
+    /// Consecutive retired kicks of the bound owner whose firmware execution record ran at least
+    /// [`crate::g17::pairs::SIBLING_EXECUTION_NS`] ([`crate::g17::pairs::heavy_run`]); zero for a
+    /// new owner.
+    heavy_run: u8,
     /// Scheduler/work pages of an exited last owner whose context was dropped;
     /// the installed queue record still names them until the next owner binds.
     retained_owner: Option<crate::g17::context::FirmwarePages>,
@@ -751,18 +755,56 @@ impl Queue {
         m5: bool,
         mcache: bool,
     ) -> Result<Self> {
+        Self::new_channel(
+            alloc,
+            objects,
+            backing,
+            owner,
+            context,
+            pointers,
+            operand_state,
+            board,
+            program,
+            m5,
+            mcache,
+            0,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "A sibling compute queue takes the same physical graph inputs plus its channel \
+                  identity."
+    )]
+    pub(crate) fn new_channel(
+        alloc: &Allocator<'_>,
+        objects: &Arc<Pool>,
+        backing: Backing,
+        owner: u64,
+        context: Arc<Context>,
+        pointers: PointerLayout,
+        operand_state: &'static OperandState,
+        board: Option<&'static Board>,
+        program: ComputeProgram,
+        m5: bool,
+        mcache: bool,
+        channel_index: u8,
+    ) -> Result<Self> {
         let Backing { mut pool, mut kick } = backing;
         let (active, replays) = (Fifo::new()?, Fifo::new()?);
         let mut graph =
             Graph::new(alloc, objects, &context, pointers, operand_state, board, program, m5, mcache)?;
         let kick_alias = kick.map_client(context.vm())?;
-        let pool_alias = pool.map_client(context.vm())?;
+        let pool_alias = Some(pool.map_client(context.vm())?);
         let binding = graph.bind(context.clone(), kick_alias, pool_alias)?;
         context.mark_published();
         context.note_compute_binding(true);
         crate::g17::trace::bind(crate::g17::trace::COMPUTE, kick.id().qid(), context.id(), 0);
         Ok(Self {
             owner: Some(owner),
+            channel_index,
+            binding_noted: true,
+            heavy_run: 0,
             retained_owner: None,
             pool_phase: PoolPhase::Populated,
             release_sent_ns: None,
@@ -880,6 +922,46 @@ impl Queue {
     }
     pub(crate) fn owner(&self) -> Option<u64> {
         self.owner
+    }
+    pub(crate) fn channel_index(&self) -> u8 {
+        self.channel_index
+    }
+    pub(crate) fn is_primary(&self) -> bool {
+        self.channel_index == 0
+    }
+    pub(crate) fn active_len(&self) -> usize {
+        self.active.len
+    }
+    pub(crate) fn has_replays(&self) -> bool {
+        self.replays.len != 0
+    }
+    pub(crate) fn configuring(&self) -> bool {
+        self.configuration.is_some()
+    }
+    pub(crate) fn has_ring(&self) -> bool {
+        self.graph.ring.is_some()
+    }
+    /// The bound owner's recent kicks on this channel ran sustained heavy work
+    /// ([`crate::g17::pairs::sustained`]).
+    pub(crate) fn sustained(&self) -> bool {
+        crate::g17::pairs::sustained(self.heavy_run)
+    }
+    fn clear_binding_note(&mut self) {
+        if self.binding_noted {
+            if let Some(binding) = &self.binding {
+                binding.context.note_compute_binding(false);
+            }
+            self.binding_noted = false;
+        }
+    }
+    fn clear_owner(&mut self, stamp_released_at: bool) {
+        self.clear_binding_note();
+        self.owner = None;
+        self.channel_index = 0;
+        self.heavy_run = 0;
+        if stamp_released_at {
+            self.released_at = now_ns();
+        }
     }
     /// The bound owner's context; `None` once an exited owner was detached.
     pub(crate) fn context(&self) -> Option<&Arc<Context>> {
@@ -1299,8 +1381,7 @@ impl Queue {
                     drop(self.previous.take());
                     self.retirement_ready = self.active.len == 0;
                     if self.released && self.retirement_ready {
-                        self.owner = None;
-                        self.released_at = now_ns();
+                        self.clear_owner(true);
                     }
                 }
                 // It was reported when it retired: step past it.
@@ -1312,6 +1393,9 @@ impl Queue {
                         self.active.get_mut(at).ok_or(EIO)?.qos_pending = false;
                     }
                     let front = self.active.get(at).ok_or(EIO)?;
+                    // Only an exact execution record measures the kick: a recordless retirement
+                    // carries a synthesized envelope.
+                    let execution = front.observed.map(|record| record.timestamps);
                     if let Some(ticket) = front.ticket {
                         crate::g17::recovery::note_retired();
                         crate::g17::trace::complete(
@@ -1335,6 +1419,9 @@ impl Queue {
                         Err(error) => Deferred::Retired(completion, Err(error)),
                     })?;
                     self.retire_pending = false;
+                    if let Some([start, end]) = execution {
+                        self.heavy_run = crate::g17::pairs::heavy_run(self.heavy_run, start, end);
+                    }
                     if stampless || at != 0 {
                         // A completion record is no witness that the firmware is done with the
                         // descriptor: it can still store the stamp through it. Keep the command
@@ -1357,8 +1444,7 @@ impl Queue {
                     drop(self.previous.take());
                     self.retirement_ready = self.active.len == 0;
                     if self.released && self.retirement_ready {
-                        self.owner = None;
-                        self.released_at = now_ns();
+                        self.clear_owner(true);
                     }
                 }
                 Ok(None) | Err(EAGAIN) => {
@@ -1531,8 +1617,7 @@ impl Queue {
             self.retire_pending = false;
             self.retirement_ready = true;
             if self.released {
-                self.owner = None;
-                self.released_at = now_ns();
+                self.clear_owner(true);
             }
         }
         Ok(())
@@ -1897,6 +1982,27 @@ impl Queue {
             && !self.source_hint.has_readers(&self.source_readers)
     }
     pub(crate) fn bind_owner(&mut self, owner: u64, context: Arc<Context>) -> Result {
+        self.bind_owner_channel(owner, context, 0)
+    }
+    /// Binds a reusable physical queue with its own dedicated compute pool as an additional
+    /// compute channel of `owner`.
+    pub(crate) fn bind_sibling(
+        &mut self,
+        owner: u64,
+        context: Arc<Context>,
+        channel_index: u8,
+    ) -> Result {
+        if !self.graph.m5 || self.pool_phase != PoolPhase::Populated || self.graph.ring.is_none() {
+            return Err(EBUSY);
+        }
+        self.bind_owner_channel(owner, context, channel_index)
+    }
+    fn bind_owner_channel(
+        &mut self,
+        owner: u64,
+        context: Arc<Context>,
+        channel_index: u8,
+    ) -> Result {
         if !self.reusable() {
             return Err(EBUSY);
         }
@@ -1944,7 +2050,7 @@ impl Queue {
                 self.kick.clear_ring()?;
                 let kick_alias = self.kick.map_client(context.vm())?;
                 let pool_alias = self.pool.map_client(context.vm())?;
-                self.graph.bind(context.clone(), kick_alias, pool_alias)
+                self.graph.bind(context.clone(), kick_alias, Some(pool_alias))
             })();
             let binding = match moved {
                 Ok(binding) => binding,
@@ -1970,7 +2076,9 @@ impl Queue {
             self.retained_owner = None;
         }
         context.mark_published();
+        self.clear_binding_note();
         context.note_compute_binding(true);
+        self.binding_noted = true;
         crate::g17::trace::bind(
             crate::g17::trace::COMPUTE,
             self.qid(),
@@ -1978,6 +2086,8 @@ impl Queue {
             if same_vm { 2 } else { 1 },
         );
         self.owner = Some(owner);
+        self.channel_index = channel_index;
+        self.heavy_run = 0;
         self.rearm_for = None;
         self.unpublished_binding = true;
         self.released = false;
@@ -1988,10 +2098,9 @@ impl Queue {
     /// True allows the registry to cancel the never-published QID and drop this graph. An
     /// installed graph remains retained even after the logical owner exits without work.
     pub(crate) fn release_owner(&mut self) -> Result<bool> {
-        if let Some(binding) = &self.binding {
-            binding.context.note_compute_binding(false);
-        }
+        self.clear_binding_note();
         if !self.installed && self.active.len == 0 && !self.quarantined && self.previous.is_none() {
+            self.clear_owner(false);
             return Ok(true);
         }
         self.released = true;
@@ -2024,8 +2133,7 @@ impl Queue {
                 self.retirement_ready = true;
             }
             if self.retirement_ready {
-                self.owner = None;
-                self.released_at = now_ns();
+                self.clear_owner(true);
             }
         }
         Ok(false)
@@ -2052,6 +2160,27 @@ impl Queue {
         // QID pressure), not at every owner exit: releasing and re-arming the pool of each
         // exited owner's idle queue left a later command retired without a completion stamp.
         Some(binding)
+    }
+    /// A recycled vacant sibling queue whose descriptor ring still awaits off-lock release
+    /// before re-arming with fresh backing.
+    pub(crate) fn take_recycled_ring(&mut self) -> Option<Vacated> {
+        if !self.recycled_pending()
+            || self.pool_phase != PoolPhase::Vacant
+            || self.graph.ring.is_none()
+        {
+            return None;
+        }
+        let descriptors = self
+            .binding
+            .as_mut()
+            .and_then(|binding| binding.descriptors.take());
+        let ring = self.graph.vacate_ring();
+        Some(Vacated {
+            _alias: None,
+            _pages: None,
+            _descriptors: descriptors,
+            _ring: ring,
+        })
     }
     /// An idle retained queue whose USC backing may be given back.
     pub(crate) fn vacate_candidate(&self) -> bool {
@@ -2164,10 +2293,9 @@ impl Queue {
         self.replay_prepared = false;
         self.submitted = 0;
         self.kick.clear_parent_after_recovery();
-        self.owner = None;
+        self.clear_owner(true);
         self.released = true;
         self.retirement_ready = true;
-        self.released_at = now_ns();
         self.needs_fresh_backing = true;
         Ok(())
     }
@@ -2242,21 +2370,40 @@ impl Queue {
         }))
     }
     /// Installs fresh backing into a vacant pool; returns the descriptor row data
-    /// the caller writes before binding an owner.
+    /// the caller writes before binding an owner, plus any previous sibling descriptor
+    /// ring to drop off-lock.
     pub(crate) fn rearm(
         &mut self,
         pages: crate::g17::freelist::Pages,
         ring: DescriptorRing,
-    ) -> Result<PoolDescriptor> {
+    ) -> Result<(PoolDescriptor, Option<Vacated>)> {
         if !self.can_rearm() {
             return Err(EAGAIN);
         }
-        self.graph.rearm_ring(ring)?;
-        self.pool.rearm(pages)?;
+        let descriptors = self
+            .binding
+            .as_mut()
+            .and_then(|binding| binding.descriptors.take());
+        let old_ring = self.graph.rearm_ring(ring);
+        if let Err(error) = self.pool.rearm(pages) {
+            if let Some(old) = old_ring {
+                let _ = self.graph.rearm_ring(old);
+            }
+            if let (Some(binding), Some(descriptors)) = (self.binding.as_mut(), descriptors) {
+                binding.descriptors = Some(descriptors);
+            }
+            return Err(error);
+        }
         self.pool_phase = PoolPhase::Populated;
         self.release_sent_ns = None;
         self.needs_fresh_backing = false;
-        self.pool.descriptor()
+        let vacated = (old_ring.is_some() || descriptors.is_some()).then_some(Vacated {
+            _alias: None,
+            _pages: None,
+            _descriptors: descriptors,
+            _ring: old_ring,
+        });
+        Ok((self.pool.descriptor()?, vacated))
     }
     pub(crate) fn pool_fits(&self, required: ComputeCapacity) -> bool {
         !self.growing && self.pool_phase == PoolPhase::Populated && self.pool.fits_capacity(required)
@@ -2491,15 +2638,42 @@ impl Queue {
         through: Option<u64>,
         recovery_state: u32,
     ) -> Result<Option<crate::g17::fw::kick::KickDependency>> {
+        self.dependency_checked(owner, status, through, recovery_state, false)
+    }
+
+    /// As [`Self::dependency`], additionally requiring every covered active kick to carry a
+    /// visible completion (`DRM_ASAHI_COMPUTE_VISIBLE_COMPLETION`) when `require_visible` is set.
+    /// A covered kick without visible completion returns `EAGAIN` so the consumer waits for it
+    /// to retire on the host.
+    pub(crate) fn dependency_checked(
+        &self,
+        owner: u64,
+        status: &Arc<VmStatus>,
+        through: Option<u64>,
+        recovery_state: u32,
+        require_visible: bool,
+    ) -> Result<Option<crate::g17::fw::kick::KickDependency>> {
         if through.is_none() || self.owner != Some(owner) {
             return Ok(None);
         }
-        let Some(active) = self
+        let mut newest = None;
+        for active in self
             .active
             .iter()
             .filter(|a| crate::g17::job::Order::contains(through, a.packet.order.sequence))
-            .last()
-        else {
+        {
+            if require_visible {
+                let visible = matches!(
+                    &active.packet.command,
+                    crate::g17::command::Validated::Compute { visible_completion: true, .. }
+                );
+                if !visible {
+                    return Err(EAGAIN);
+                }
+            }
+            newest = Some(active);
+        }
+        let Some(active) = newest else {
             return Ok(None);
         };
         if self.quarantined && self.spared_quarantine {
@@ -2806,13 +2980,22 @@ impl Queue {
         let predecessor = KickPredecessor::new(qid, kick_parent)?;
         let matrix_ops = self.graph.m5 && *requested_matrix_ops;
         let m5_board = if self.graph.m5 { Some(self.graph.board.ok_or(EINVAL)?) } else { None };
-        // Every earlier kick of this queue has retired, so the parent has completed.
+        // Each physical QID owns a single preemption/operand/usage/status/stamp set: only take the
+        // pipelined parent class once every earlier kick on this physical channel has retired.
+        // On multi-channel boards (M5 Pro), concurrency comes strictly from independent kicks
+        // running across distinct sibling QIDs because they carry no barrier on each other.
         let parent_retired = self.active.len == 0
             && self.replays.len == 0
             && !self.quarantined
             && !self.awaiting_witness;
         let parent_class = m5_board
             .map(|board| crate::g17::fw::m5::compute::parent_dependency(board, parent_retired));
+        let multi_channel = m5_board.is_some_and(crate::g17::fw::m5::compute::multi_channel);
+        let (m5_ordinal, m5_object_ids) = if multi_channel {
+            packet.context.next_compute_identity()
+        } else {
+            (self.ordinal, 0x0000_0001_0000_0001)
+        };
         let m5_args = m5_board.zip(parent_class).map(|(board, parent_class)| {
             let tuple = crate::g17::fw::m5::compute::kick_tuple(board, parent_class);
             crate::g17::fw::m5::compute::DescriptorArgs {
@@ -2824,7 +3007,7 @@ impl Queue {
                 preempt_va: addresses.preempt, cdm_va: *cdm_va, operand_va: addresses.operand,
                 usage_va: addresses.usage, free_list_slot: u32::from(self.pool.id()),
                 context_id: args.context_id, work_state: work_word,
-                object_ids: 0x0000_0001_0000_0001,
+                object_ids: m5_object_ids,
                 resource_policy: plan.map_or(0xf5_0040_0020, |p| u64::from(p.pressure) << 32 | 0x0040_0020),
                 preempt_state_offset: tuple.preempt_state_offset,
                 // The board's core layout sizes the operand state, as on G17P.
@@ -2839,13 +3022,15 @@ impl Queue {
             },
             common26_tail: board.graph.is_common26(),
             descriptor_va: descriptor_low,
-            // M5 Pro's descriptors carry the ordinal as the submission sequence too, as macOS's do.
-            submit_sequence: if board.completion_inputs() { u64::from(self.ordinal) } else { 0 },
+            // M5 Pro's descriptors carry the shared context ordinal as both submit_sequence and
+            // completion_ordinal.
+            submit_sequence: if board.completion_inputs() { u64::from(m5_ordinal) } else { 0 },
             work_state_va: work_node,
             cdm_end_va: *cdm_end_va, stamp_va: [args.stamp_va, args.aux_stamp_va],
             stamp_value: crate::g17::fw::stamp_value(kick_timestamp.get() as u32), qid: u32::from(qid),
+            channel_index: if multi_channel { u32::from(self.channel_index) } else { 0 },
             kick_timestamp: kick_timestamp.get(),
-            completion_ordinal: crate::g17::fw::m5::compute::completion_ordinal(board, self.ordinal),
+            completion_ordinal: crate::g17::fw::m5::compute::completion_ordinal(board, m5_ordinal),
             status_va: args.status_va, timestamp_va: [timestamp_va, timestamp_va + 8],
             shared_control_va: self.pool.control_va(),
             event_metadata: crate::g17::fw::m5::compute::completion_forms(board).1,
@@ -2966,7 +3151,8 @@ impl Queue {
                 let target = self.pool.reserve_submission()?;
                 let qos = host.qos_publish(qos::Owner { qid, qos: identity.qos, data_master: 2 },
                     identity.scheduler, policy).or_else(|error| {
-                        self.pool.cancel_unpublished(target)?; Err(error)
+                        self.pool.cancel_unpublished(target)?;
+                        Err(error)
                     })?;
                 self.active.back_mut().ok_or(EIO)?.qos_pending = true;
                 // `cursors` is this publication's snapshot: no second read of the ring.
@@ -3201,7 +3387,7 @@ impl Queue {
         self.configuration.take().ok_or(EIO)?.release();
         if self.ordinal == 0 && self.active.len == 0 && self.replays.len == 0 {
             self.retirement_ready = true;
-            if self.released { self.owner = None; }
+            if self.released { self.clear_owner(false); }
         }
         Ok(())
     }
@@ -3613,7 +3799,9 @@ impl Queue {
         {
             return Ok((false, None));
         }
+        self.clear_binding_note();
         if !self.installed {
+            self.clear_owner(false);
             return Ok((true, None));
         }
         let mut retired = None;
@@ -3635,9 +3823,14 @@ impl Queue {
         self.unpublished_binding = false;
         self.retirement_ready = true;
         self.released = true;
-        self.owner = None;
-        self.released_at = now_ns();
+        self.clear_owner(true);
         Ok((false, retired))
+    }
+}
+
+impl Drop for Queue {
+    fn drop(&mut self) {
+        self.clear_binding_note();
     }
 }
 
