@@ -286,6 +286,9 @@ impl Shared {
 impl Gpu {
     /// Called before any device suspends. Only a sleep that powers the SoC down gets here.
     fn sleep_prepare(&self) -> Result {
+        if !self.cfg.deep_sleep {
+            return Err(EBUSY);
+        }
         let result = self.shared.sleep_down();
         if let Err(error) = result {
             dev_warn!(self.shared.dev.as_ref(), "GPU refused sleep: {:?}\n", error);

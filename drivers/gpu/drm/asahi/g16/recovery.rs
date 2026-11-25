@@ -339,7 +339,7 @@ impl Firmware {
     /// register is read.
     fn floor_power(&mut self, error: Error) {
         let before = self.power.effective;
-        let selectors = self.init.abi.initdata().pstate_selectors;
+        let selectors = self.init.layout.pstate_selectors;
         let mut ok = 0usize;
         let mut failed = 0usize;
         if let Some(globals) = self.init.globals.as_ref() {
@@ -466,7 +466,7 @@ impl Firmware {
             return;
         };
         let mut nonzero = 0usize;
-        for entry in &scan.banks {
+        for entry in scan.banks() {
             if entry.status == 0 {
                 continue;
             }
@@ -496,7 +496,8 @@ impl Firmware {
         if nonzero == 0 {
             dev_warn!(
                 self.dev(),
-                "G16: fault_scan: all 8 banks zero (busy={}, saved_bank={}, event={:#x}, flights={})\n",
+                "G16: fault_scan: all {} banks zero (busy={}, saved_bank={}, event={:#x}, flights={})\n",
+                scan.banks().len(),
                 scan.busy,
                 scan.saved_bank,
                 event,

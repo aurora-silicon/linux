@@ -181,6 +181,7 @@ pub(crate) struct Window {
     /// Observed firmware-owned root words; only the exact qualified forward transition is
     /// accepted after RUN, never a rollback or an unrelated physical table.
     firmware_root: [u64; 2],
+    abi: hw::FwAbi,
     text_pa: u64,
     data_pa: u64,
     /// The leaves the boot loader builds in this firmware's page tables (none for a firmware
@@ -202,6 +203,7 @@ impl Window {
             snapshot: KVec::from_elem(0u64, ENTRIES, GFP_KERNEL)?,
             published: false,
             firmware_root: [0; 2],
+            abi: adt.layout.abi,
             text_pa: adt.text.start,
             data_pa: adt.data.start,
             // Admission refuses a layout with either unknown; never guess them here.
@@ -453,6 +455,7 @@ impl Window {
     /// Confirms the shared root still names the driver's reserved L2 and only recognizes
     /// the qualified firmware-owned forward transitions in root[0..1].
     fn verify_root(&mut self) -> Result {
+        let (table_offset, attributes) = self.abi.live_root_table();
         for index in 0..2 {
             let observed = self.root.io().try_read64(index * 8)?;
             if observed == self.firmware_root[index] {
@@ -461,7 +464,7 @@ impl Window {
             let expected = if index == 0 {
                 (self.root.phys() + hw::PAGE) | 0x403
             } else {
-                (self.root.phys() + 0x10000) | 0x00200000000004cb
+                (self.root.phys() + table_offset) | attributes
             };
             if self.firmware_root[index] != 0 || observed != expected {
                 return Err(EIO);
@@ -469,7 +472,7 @@ impl Window {
             self.firmware_root[index] = observed;
         }
         let root = self.root.io().try_read64(WINDOW_INDEX * 8)?;
-        if root != self.shared_l2.phys() | 3 && root != self.shared_l2.phys() | 0x00200000000004cb {
+        if root != self.shared_l2.phys() | 3 && root != self.shared_l2.phys() | attributes {
             return Err(EIO);
         }
         Ok(())

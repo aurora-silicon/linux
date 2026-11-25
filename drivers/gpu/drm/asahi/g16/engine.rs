@@ -2601,7 +2601,8 @@ impl Firmware {
                     return Err(EAGAIN);
                 }
                 let e = job.resources.take_pb()?;
-                if let Err(err) = e.prepare_with_scs(
+                if let Err(err) = e.prepare_with_scs_for(
+                    self.init.abi.pb_manager(),
                     alloc_slot,
                     job.resources.pb_heap_gva(alloc_slot)?,
                     heap_blocks,
@@ -2635,7 +2636,7 @@ impl Firmware {
                 pb_mgr: a.pb_mgr,
                 scene_list: 0,
                 mgr_misc: a.mgr_misc,
-                pb_init_blocks: a.init_blocks,
+                pb_init_blocks: epoch.heap_blocks(),
                 parameter_id: a.parameter_id,
                 generation,
                 activity: [self.init.ta_activity.va + 4, self.init.fs_activity.va + 8],
@@ -2679,7 +2680,7 @@ impl Firmware {
             pb_mgr: epoch.manager.va,
             scene_list: 0,
             mgr_misc: epoch.misc.va,
-            pb_init_blocks: a.init_blocks,
+            pb_init_blocks: epoch.heap_blocks(),
             parameter_id: a.parameter_id,
             generation: job.vm.generation,
             activity: [self.init.ta_activity.va + 4, self.init.fs_activity.va + 8],
@@ -3062,7 +3063,8 @@ impl Firmware {
                 }
             }
             Command::Render(r) => {
-                let geometry = Geometry::new(&r.cmd, 0);
+                let geometry =
+                    Geometry::new_for(&r.cmd, 0, self.cfg.num_clusters, self.cfg.gpu_generation);
                 let n = job.resources.render_passes()?;
                 if (0..n).all(|k| {
                     job.resources.render_pass(k).is_err_and(|_| true)
@@ -3153,7 +3155,12 @@ impl Firmware {
                         if ta_used >= sizes::QUEUE_CAP - 6 || fs_used >= sizes::QUEUE_CAP - 6 {
                             break;
                         }
-                        let geo2 = Geometry::new(&r2.cmd, 0);
+                        let geo2 = Geometry::new_for(
+                            &r2.cmd,
+                            0,
+                            self.cfg.num_clusters,
+                            self.cfg.gpu_generation,
+                        );
                         let Some(k2) = self.slots.pick_pass_in_for(
                             &job.resources,
                             &geo2,
@@ -3289,7 +3296,12 @@ impl Firmware {
                                     precheck_ok = false;
                                     break;
                                 };
-                                let geo2 = Geometry::new(&r2.cmd, 0);
+                                let geo2 = Geometry::new_for(
+                            &r2.cmd,
+                            0,
+                            self.cfg.num_clusters,
+                            self.cfg.gpu_generation,
+                        );
                                 let Some(slot) = self.slots.pick_pass_in_for(
                                     &job.resources,
                                     &geo2,
@@ -3355,7 +3367,12 @@ impl Firmware {
                                 let Some(Command::Render(r2)) = command(&j2, k) else {
                                     return Err(EINVAL);
                                 };
-                                let geo2 = Geometry::new(&r2.cmd, 0);
+                                let geo2 = Geometry::new_for(
+                            &r2.cmd,
+                            0,
+                            self.cfg.num_clusters,
+                            self.cfg.gpu_generation,
+                        );
                                 let slot = picked[k as usize];
                                 let member = prefix.renders as usize;
                                 f.claims.pass[member] = slot as u32;
@@ -3715,9 +3732,12 @@ impl Firmware {
         let fs2c_bar = if let Some(wait_fs) = wait_render {
             // Check producer InitBM explicitly in addition to the scheduler drain guard so
             // FS -> CDM handoff: downgrade to `BarrierType::Stamp` (type 0) only when neither
-            // the waited render nor any live flight carries `InitBM`; G16 FS `FINALIZE` flushes
-            // caches before advancing `fw_stamp[1]` (see `cross_engine_barrier_type`).
-            let producer_initbm = wait_fs.initbm || self.engine.flights.iter().any(|fl| fl.initbm);
+            // the waited render nor any live flight carries `InitBM` and the GPU does not need
+            // G15's cross-engine hold; G16 FS `FINALIZE` flushes caches before advancing
+            // `fw_stamp[1]` (see `cross_engine_barrier_type`).
+            let producer_initbm = self.cfg.cross_engine_hold
+                || wait_fs.initbm
+                || self.engine.flights.iter().any(|fl| fl.initbm);
             let bar_type = cross_engine_barrier_type(producer_initbm, false);
             let bar = encode::barrier(
                 self.graph.render.fw_stamp[1].va,
@@ -3978,7 +3998,12 @@ impl Firmware {
             &mut scratch.fss[..],
         );
         encode::render_attachments(&mut scratch.tas[..], 0, &cmd.vertex_attachments);
-        encode::render_attachments(&mut scratch.fss[..], 1, &cmd.fragment_attachments);
+        encode::render_attachments_for(
+            &mut scratch.fss[..],
+            1,
+            self.init.abi.fs().finalize,
+            &cmd.fragment_attachments,
+        );
         let full_work = self.slots.render_needs_full_work(k);
         if full_work {
             encode::fill_scene(&refs, &pass, &mut scratch.scene[..]);
