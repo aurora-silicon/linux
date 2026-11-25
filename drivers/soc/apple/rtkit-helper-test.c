@@ -48,7 +48,21 @@ struct rtkh_test {
 
 	unsigned int saved_flags;
 	suspend_state_t saved_target;
+
+	/* The DART's answers to the live session's sleep, when the stub is active. */
+	unsigned int dart_calls;
+	int dart_idle_ret;
+	int dart_wake_ret;
 };
+
+static int rtkh_stub_dart_live(struct apple_rtkit_helper *helper, bool idle)
+{
+	struct kunit *test = kunit_get_current_test();
+	struct rtkh_test *ctx = test->priv;
+
+	ctx->dart_calls++;
+	return idle ? ctx->dart_idle_ret : ctx->dart_wake_ret;
+}
 
 static int rtkh_stub_send_ap_power(struct apple_rtkit_helper *helper, bool on)
 {
@@ -796,7 +810,9 @@ static void rtkh_pm_ap_on_fails(struct kunit *test)
 	pm_set_suspend_via_firmware();
 	ctx->ret[1] = -ETIMEDOUT;
 	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_prepare(dev), 0);
-	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_resume(dev), 0);
+	/* Returned, not swallowed, and kept for the input consumer that asks later. */
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_resume(dev), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_ap_wake(dev), -ETIMEDOUT);
 	KUNIT_EXPECT_FALSE(test, ctx->helper.ap_idle);
 	KUNIT_EXPECT_FALSE(test, ctx->helper.idle_unanswered);
 	apple_rtkit_helper_complete(dev);
@@ -825,6 +841,110 @@ static void rtkh_pm_adopted_s2idle(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, device_awake_path(dev));
 	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_resume(dev), -EHOSTDOWN);
 	KUNIT_EXPECT_EQ(test, ctx->ncalls, 0);
+}
+
+/*
+ * An adopted session in a firmware-driven sleep: AP on only once its CPU is found still
+ * running (no live-handoff DART here to ask), and a lost one hears nothing more.
+ */
+static void rtkh_pm_adopted_fw_sleep(struct kunit *test)
+{
+	struct rtkh_test *ctx = test->priv;
+	struct device *dev = ctx->dev;
+	static const bool want[] = { false, true, false };
+
+	ctx->helper.adopted = true;
+	pm_set_suspend_via_firmware();
+	rtkh_set_run(ctx, true);
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_prepare(dev), 0);
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_suspend(dev), 0);
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_resume(dev), 0);
+	apple_rtkit_helper_complete(dev);
+	KUNIT_EXPECT_FALSE(test, apple_rtkit_helper_session_lost(dev));
+
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_prepare(dev), 0);
+	rtkh_set_run(ctx, false);
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_resume(dev), -EHOSTDOWN);
+	apple_rtkit_helper_complete(dev);
+	KUNIT_EXPECT_TRUE(test, apple_rtkit_helper_session_lost(dev));
+	KUNIT_EXPECT_FALSE(test, ctx->helper.ap_idle);
+	/* No AP on for the lost session, and no further sleep. */
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_prepare(dev), -EHOSTDOWN);
+	rtkh_expect_calls(test, want, ARRAY_SIZE(want));
+}
+
+/* A live-handoff DART that took the idle notice must answer for its stream before AP on. */
+static void rtkh_pm_adopted_dart_live(struct kunit *test)
+{
+	struct rtkh_test *ctx = test->priv;
+	struct device *dev = ctx->dev;
+	static const bool want[] = { false, true, false };
+
+	kunit_activate_static_stub(test, apple_rtkit_helper_dart_live, rtkh_stub_dart_live);
+	ctx->helper.adopted = true;
+	ctx->helper.dart_required = true;
+	pm_set_suspend_via_firmware();
+	rtkh_set_run(ctx, true);
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_prepare(dev), 0);
+	KUNIT_EXPECT_EQ(test, ctx->dart_calls, 1U);
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_resume(dev), 0);
+	KUNIT_EXPECT_EQ(test, ctx->dart_calls, 2U);
+
+	/* The stream left bypass, or the DART is gone: lost, though the CPU still runs. */
+	ctx->dart_wake_ret = -ENODEV;
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_prepare(dev), 0);
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_resume(dev), -ENODEV);
+	KUNIT_EXPECT_TRUE(test, apple_rtkit_helper_session_lost(dev));
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_prepare(dev), -EHOSTDOWN);
+	rtkh_expect_calls(test, want, ARRAY_SIZE(want));
+}
+
+/* An idle notice answered late: the AP on before the next one is checked too. */
+static void rtkh_pm_adopted_late_answer_checked(struct kunit *test)
+{
+	struct rtkh_test *ctx = test->priv;
+	struct device *dev = ctx->dev;
+	static const bool want[] = { false };
+
+	kunit_activate_static_stub(test, apple_rtkit_helper_dart_live, rtkh_stub_dart_live);
+	ctx->helper.adopted = true;
+	ctx->helper.dart_required = true;
+	pm_set_suspend_via_firmware();
+	rtkh_set_run(ctx, true);
+	ctx->ret[0] = -ETIMEDOUT;
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_prepare(dev), -ETIMEDOUT);
+	apple_rtkit_helper_pm_notify(&ctx->helper.pm_nb, PM_POST_SUSPEND, NULL);
+	KUNIT_ASSERT_TRUE(test, ctx->helper.idle_pending);
+
+	/* The DART is asked before that AP on too, though no idle notice was taken. */
+	ctx->rtk.ap_power_state = RTKH_TEST_PWR_IDLE;
+	ctx->dart_wake_ret = -EIO;
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_prepare(dev), -EIO);
+	KUNIT_EXPECT_EQ(test, ctx->dart_calls, 1U);
+	KUNIT_EXPECT_TRUE(test, apple_rtkit_helper_session_lost(dev));
+	rtkh_expect_calls(test, want, ARRAY_SIZE(want));
+}
+
+/*
+ * A sleep refused after the input consumer's .suspend and before this one's: the consumer
+ * asks for AP on before its host state, and the late .complete sends nothing more.
+ */
+static void rtkh_pm_ap_wake_early_abort(struct kunit *test)
+{
+	struct rtkh_test *ctx = test->priv;
+	struct device *dev = ctx->dev;
+	static const bool want[] = { false, true };
+
+	pm_set_suspend_via_firmware();
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_prepare(dev), 0);
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_ap_wake(dev), 0);
+	KUNIT_EXPECT_FALSE(test, ctx->helper.ap_idle);
+	apple_rtkit_helper_complete(dev);
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_ap_wake(dev), 0);
+	rtkh_expect_calls(test, want, ARRAY_SIZE(want));
+
+	ctx->helper.lost = true;
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_ap_wake(dev), -EHOSTDOWN);
 }
 
 static void rtkh_pm_adopted_refuses(struct kunit *test)
@@ -903,6 +1023,10 @@ static struct kunit_case apple_rtkit_helper_test_cases[] = {
 	KUNIT_CASE(rtkh_pm_notify_other_events),
 	KUNIT_CASE(rtkh_pm_ap_on_fails),
 	KUNIT_CASE(rtkh_pm_adopted_s2idle),
+	KUNIT_CASE(rtkh_pm_adopted_fw_sleep),
+	KUNIT_CASE(rtkh_pm_adopted_dart_live),
+	KUNIT_CASE(rtkh_pm_adopted_late_answer_checked),
+	KUNIT_CASE(rtkh_pm_ap_wake_early_abort),
 	KUNIT_CASE(rtkh_pm_adopted_refuses),
 	KUNIT_CASE(rtkh_preserves_input),
 	KUNIT_CASE(rtkh_pm_register),

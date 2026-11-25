@@ -14,6 +14,7 @@
 #include <linux/of_reserved_mem.h>
 #include <linux/platform_device.h>
 #include <linux/pm_wakeup.h>
+#include <linux/soc/apple/dart.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/rtkit-helper.h>
 #include <linux/soc/apple/t8132.h>
@@ -52,6 +53,12 @@ struct apple_rtkit_helper {
 	bool idle_unanswered;
 	/* An idle notice that still had no answer when its sleep ended. */
 	bool idle_pending;
+	/* The adopted session didn't keep what it needs across a sleep: no restart exists. */
+	bool lost;
+	/* A live-handoff DART keeps the adopted session's stream: found at probe, always checked */
+	bool dart_required;
+	/* The last sleep's AP on: its result stands until the next answered idle notice. */
+	int wake_ret;
 	/* Ends a sleep whose .prepare failed, which gets no .complete. */
 	struct notifier_block pm_nb;
 
@@ -68,6 +75,14 @@ bool apple_rtkit_helper_preserves_input(struct device *dev)
 	return helper && helper->preserved;
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_helper_preserves_input);
+
+bool apple_rtkit_helper_session_lost(struct device *dev)
+{
+	struct apple_rtkit_helper *helper = dev_get_drvdata(dev);
+
+	return helper && READ_ONCE(helper->lost);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_helper_session_lost);
 
 static int apple_rtkit_helper_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
 {
@@ -253,6 +268,7 @@ static int apple_rtkit_helper_inherit_buffers(
 }
 
 static int apple_rtkit_helper_pm_register(struct apple_rtkit_helper *helper);
+static int apple_rtkit_helper_dart_live(struct apple_rtkit_helper *helper, bool idle);
 
 static int apple_rtkit_helper_probe(struct platform_device *pdev)
 {
@@ -361,6 +377,12 @@ static int apple_rtkit_helper_probe(struct platform_device *pdev)
 		ret = apple_rtkit_helper_pm_register(helper);
 		if (ret)
 			return ret;
+		/* Whether a live-handoff DART answers for this session at every AP on. */
+		ret = apple_rtkit_helper_dart_live(helper, false);
+		if (ret && ret != -ENODEV)
+			return dev_err_probe(dev, ret,
+					     "the live-handoff DART stream isn't in bypass\n");
+		helper->dart_required = !ret;
 
 		/* There is no safe module-unload boundary for the retained session. */
 		__module_get(THIS_MODULE);
@@ -411,6 +433,17 @@ static int apple_rtkit_helper_send_ap_power(struct apple_rtkit_helper *helper, b
 	return apple_rtkit_ap_power(helper->rtk, on);
 }
 
+/* The DART's side of an adopted session's sleep: the KUnit test replaces it with a static stub. */
+static int apple_rtkit_helper_dart_live(struct apple_rtkit_helper *helper, bool idle)
+{
+#if IS_ENABLED(CONFIG_APPLE_RTKIT_HELPER_KUNIT_TEST)
+	KUNIT_STATIC_STUB_REDIRECT(apple_rtkit_helper_dart_live, helper, idle);
+#endif
+	return apple_dart_live_sleep(helper->dev, idle);
+}
+
+static int apple_rtkit_helper_check_live(struct apple_rtkit_helper *helper);
+
 static int apple_rtkit_helper_ap_power(struct apple_rtkit_helper *helper, bool on)
 {
 	int ret = apple_rtkit_helper_send_ap_power(helper, on);
@@ -433,6 +466,8 @@ static int apple_rtkit_helper_ap_idle(struct apple_rtkit_helper *helper)
 
 	if (helper->ap_idle)
 		return 0;
+	if (helper->lost)
+		return -EHOSTDOWN;
 	/*
 	 * A firmware that never answered the last idle notice still holds it: T8142's MTP
 	 * asserts on a second ("Invalid AP power") and takes the keyboard and trackpad with
@@ -446,6 +481,10 @@ static int apple_rtkit_helper_ap_idle(struct apple_rtkit_helper *helper)
 		}
 		helper->idle_pending = false;
 		dev_info(helper->dev, "the last AP idle notice was answered late, sending AP on first\n");
+		/* Checked first, as every AP on after a sleep is. */
+		ret = apple_rtkit_helper_check_live(helper);
+		if (ret)
+			return ret;
 		if (apple_rtkit_helper_send_ap_power(helper, true)) {
 			dev_err(helper->dev, "AP on after the late answer not answered: no sleep\n");
 			helper->idle_pending = true;
@@ -456,18 +495,82 @@ static int apple_rtkit_helper_ap_idle(struct apple_rtkit_helper *helper)
 	if (ret)
 		return ret;
 	helper->ap_idle = true;
+	helper->wake_ret = 0;
+	/* Only now may a live-handoff DART keep the adopted session's stream. */
+	if (helper->dart_required) {
+		ret = apple_rtkit_helper_dart_live(helper, true);
+		if (ret) {
+			dev_err(helper->dev, "the live-handoff DART didn't take the idle notice: %d\n",
+				ret);
+			return ret;
+		}
+	}
 	dev_dbg(helper->dev, "AP idle notice answered for a sleep\n");
 	return 0;
 }
 
-static void apple_rtkit_helper_ap_on(struct apple_rtkit_helper *helper)
+/*
+ * An adopted session can't be restarted. Before its firmware hears anything after a sleep,
+ * check what it kept from before: the DART stream it was handed over in bypass, and its CPU
+ * running. The MTP has no power domain of its own to ask; these registers answer for it.
+ * Lost, it is told nothing more, and its input consumer sends nothing either.
+ */
+static int apple_rtkit_helper_check_live(struct apple_rtkit_helper *helper)
 {
-	if (!helper->ap_idle)
-		return;
-	helper->ap_idle = false;
-	if (!apple_rtkit_helper_ap_power(helper, true))
-		dev_dbg(helper->dev, "AP on notice answered after a sleep\n");
+	int ret;
+
+	if (!helper->adopted)
+		return 0;
+	/* A live-handoff DART answers for its stream at every AP on, or the session is lost. */
+	ret = helper->dart_required ? apple_rtkit_helper_dart_live(helper, false) : 0;
+	if (ret) {
+		WRITE_ONCE(helper->lost, true);
+		dev_err(helper->dev, "adopted session's DART stream not kept across the sleep (%d); refusing firmware restart\n",
+			ret);
+		return ret;
+	}
+	if (!(readl(helper->asc_base + APPLE_ASC_CPU_CONTROL) & APPLE_ASC_CPU_CONTROL_RUN)) {
+		WRITE_ONCE(helper->lost, true);
+		dev_err(helper->dev, "adopted session lost ASC RUN across the sleep; refusing firmware restart\n");
+		return -EHOSTDOWN;
+	}
+	return 0;
 }
+
+static int apple_rtkit_helper_ap_on(struct apple_rtkit_helper *helper)
+{
+	int ret;
+
+	if (!helper->ap_idle)
+		return helper->wake_ret;
+	helper->ap_idle = false;
+	ret = apple_rtkit_helper_check_live(helper);
+	if (!ret)
+		ret = apple_rtkit_helper_ap_power(helper, true);
+	if (!ret)
+		dev_dbg(helper->dev, "AP on notice answered after a sleep\n");
+	/* Kept for the input consumer, which asks after this device's own callbacks. */
+	helper->wake_ret = ret;
+	return ret;
+}
+
+/*
+ * The AP on notice that ends a firmware-driven sleep, sent now unless it went already. The
+ * input consumer calls this before it tells the firmware the host is awake: also after a
+ * sleep refused between the consumer's .suspend and this device's, when the PM core calls no
+ * .resume here and .complete comes only after the consumer's .resume.
+ */
+int apple_rtkit_helper_ap_wake(struct device *dev)
+{
+	struct apple_rtkit_helper *helper = dev_get_drvdata(dev);
+
+	if (!helper)
+		return -ENODEV;
+	if (READ_ONCE(helper->lost))
+		return -EHOSTDOWN;
+	return apple_rtkit_helper_ap_on(helper);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_helper_ap_wake);
 
 /*
  * macOS tells this coprocessor first of all. Told before any driver stops its own,
@@ -573,12 +676,14 @@ static int __maybe_unused apple_rtkit_helper_suspend(struct device *dev)
 static int __maybe_unused apple_rtkit_helper_resume(struct device *dev)
 {
 	struct apple_rtkit_helper *helper = dev_get_drvdata(dev);
+	int ret;
 
-	/* After a firmware-driven suspend's idle notice; nothing otherwise. */
-	apple_rtkit_helper_ap_on(helper);
-	if (!helper->adopted)
-		return 0;
+	/* After a firmware-driven suspend's idle notice, checked first; nothing otherwise. */
+	ret = apple_rtkit_helper_ap_on(helper);
+	if (ret || !helper->adopted)
+		return ret;
 	if (!(readl(helper->asc_base + APPLE_ASC_CPU_CONTROL) & APPLE_ASC_CPU_CONTROL_RUN)) {
+		WRITE_ONCE(helper->lost, true);
 		dev_err(dev, "adopted MTP lost ASC RUN; refusing firmware restart\n");
 		return -EHOSTDOWN;
 	}
