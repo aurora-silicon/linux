@@ -293,6 +293,9 @@ ASAHI_TESTS = {
     'g17-m5-effort-tests.py': [([], PASS)]
         + mutations('--mutation', ('m5-ignores-bound',), []),
     'g17-firmware-selection-tests.py': [([], PASS)],
+    'g17-freelist-lease-direct-tests.py': [([], PASS)]
+        + mutations('--mutation', ('reject-preparing-complete', 'snapshot-rollback',
+                                   'drop-pending-flush', 'drop-doorbell-loss'), []),
     'g17-growth-gate-tests.py': [([], PASS)],
     'g17-growth-tests.py': [([], PASS)],
     'g17-object-fence-tests.py': [([], PASS)]
