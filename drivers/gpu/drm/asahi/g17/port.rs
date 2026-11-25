@@ -465,13 +465,8 @@ impl Port {
         self.regs.as_ref().ok_or(ENODEV)?.submit_m5_work_held(submission)
     }
 
-    /// Counts `submissions` in the M5 submission-history table without taking the device mutex.
-    pub(super) fn note_m5_submission_history(&self, submissions: u8) -> Result {
-        let mut geometry = self.m5_outer.lock();
-        self.note_m5_submission_history_locked(&mut geometry, submissions)
-    }
-
-    /// [`Self::note_m5_submission_history`] while the caller already holds `m5_outer`.
+    /// Counts `submissions` in the M5 submission-history table without taking the device mutex,
+    /// while the caller holds `m5_outer`.
     pub(super) fn note_m5_submission_history_locked(
         &self,
         geometry: &mut MutexGuard<'_, Option<(u32, u64, u64)>>,
