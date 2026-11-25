@@ -122,19 +122,36 @@ fn performance_source(regions: &[Range<u64>]) -> Result<(KVVec<u8>, u64)> {
 
 /// Whether the boot loader selected this backend. Presence is enough to route probe;
 /// admission independently validates the property and the complete handoff.
-pub(super) fn has_handoff(dev: &device::Device) -> bool {
-    dev.of_node().is_some_and(|node| {
-        !matches!(
-            node.get_opt_property::<u32>(c_str!("apple,g16-handoff-version")),
-            Ok(None)
-        )
-    })
+pub(super) fn has_handoff(dev: &device::Device, cfg: &Config) -> bool {
+    dev.of_node()
+        .is_some_and(|node| !matches!(node.get_opt_property::<u32>(cfg.handoff_property), Ok(None)))
+}
+
+/// Whether this backend owns `dev` under `cfg`: the handoff marker is present and, where `cfg`
+/// names `firmware_compat` values, the handoff also describes one of its layouts and
+/// `apple,firmware-compat` is one of those values. A compatible that another backend also
+/// serves (`needs_handoff_marker`) is probed only then.
+pub(crate) fn claims(dev: &device::Device, cfg: &Config) -> bool {
+    if !has_handoff(dev, cfg) {
+        return false;
+    }
+    if cfg.firmware_compat.is_empty() {
+        return true;
+    }
+    if layout(dev, cfg).is_none() {
+        return false;
+    }
+    let Some(node) = dev.of_node() else {
+        return false;
+    };
+    let compat: Result<KVec<u32>> = node.get_property(c_str!("apple,firmware-compat"));
+    compat.is_ok_and(|compat| cfg.firmware_compat.iter().any(|c| compat.as_slice() == c))
 }
 
 /// The boot loader's handoff for the loaded firmware: its version, segment VAs and flags.
-fn handoff(dev: &device::Device) -> Result<(u32, KVec<u64>, KVec<u32>)> {
+fn handoff(dev: &device::Device, cfg: &Config) -> Result<(u32, KVec<u64>, KVec<u32>)> {
     let node = dev.of_node().ok_or(EINVAL)?;
-    let version: u32 = node.get_property(c_str!("apple,g16-handoff-version"))?;
+    let version: u32 = node.get_property(cfg.handoff_property)?;
     let vas: KVec<u64> = node.get_property(c_str!("apple,firmware-segment-vas"))?;
     let flags: KVec<u32> = node.get_property(c_str!("apple,firmware-segment-flags"))?;
     Ok((version, vas, flags))
@@ -142,7 +159,7 @@ fn handoff(dev: &device::Device) -> Result<(u32, KVec<u64>, KVec<u32>)> {
 
 /// The firmware layout the boot loader's handoff describes, if it describes a known one.
 pub(crate) fn layout(dev: &device::Device, cfg: &Config) -> Option<&'static hw::FwLayout> {
-    let (version, vas, flags) = handoff(dev).ok()?;
+    let (version, vas, flags) = handoff(dev, cfg).ok()?;
     cfg.layouts
         .iter()
         .copied()
@@ -153,7 +170,7 @@ pub(crate) fn layout(dev: &device::Device, cfg: &Config) -> Option<&'static hw::
 #[inline(never)]
 pub(crate) fn read(dev: &device::Device, cfg: &Config) -> Result<KBox<GpuAdt>> {
     let node = dev.of_node().ok_or(EINVAL)?;
-    let (version, vas, flags) = handoff(dev)?;
+    let (version, vas, flags) = handoff(dev, cfg)?;
     let names: KVec<u8> = node.get_property(c_str!("memory-region-names"))?;
     let phandles: KVec<u32> = node.get_property(c_str!("memory-region"))?;
     let layout = cfg

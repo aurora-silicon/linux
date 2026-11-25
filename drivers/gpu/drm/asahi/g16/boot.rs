@@ -1013,11 +1013,7 @@ pub(crate) fn start(
         id.counts,
         id.cores
     );
-    if !cfg
-        .hw_ids
-        .iter()
-        .any(|h| h.version == id.version && h.counts == id.counts)
-    {
+    if !cfg.hw_ids.iter().any(|h| h.matches(id.version, id.counts)) {
         dev_err!(
             d,
             "unsupported GPU hardware: version {:#x} counts {:#x}\n",

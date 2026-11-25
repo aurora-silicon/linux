@@ -189,6 +189,9 @@ pub(crate) struct Layout {
     /// ADT (`clpc` low-peak limiter properties and `sgx` sample period), where the build has
     /// them.
     pub(crate) power_limiter: Option<PowerLimiter>,
+    /// POWER_PERFORMANCE u32 that must lie above every performance-state index, where the build
+    /// has one: the number of performance rows is written there.
+    pub(crate) state_bound: Option<usize>,
 }
 
 /// POWER_PERFORMANCE offsets of the words derived from the GPU power sample period and
@@ -345,6 +348,7 @@ pub(crate) const V25G83: Layout = Layout {
     power_policy: &[],
     power_sampling: None,
     power_limiter: None,
+    state_bound: None,
 };
 
 /// The 26B123 InitData ABI: the same 31 objects and pointers, with
@@ -437,6 +441,7 @@ pub(crate) const V26B123: Layout = Layout {
         filter_tc_ms: 0xad8,
         filter_tc_clks: 0xae0,
     }),
+    state_bound: None,
 };
 
 /// G15S 26B123 keeps the protocol layouts and ADT-derived power sampling/limiter encoding while
@@ -466,6 +471,58 @@ pub(crate) const G15S_26B123: Layout = Layout {
     globals: &[run(0, 0x38, 0), run(0x38, 0xe28, 4), run(0xe28, 0xe47, 5)],
     globals_policy: &[(0xe31, 1)],
     ..V26B123
+};
+
+/// G15G (T8122 C0) 26B123: the G16G 26B123 objects, register-map positions and protocol, with
+/// the InitData version this image accepts (measured on the J615, linux#2781: the G16G version,
+/// 0x0391, 0x0393 and 0x0395 in the differing field fault right after the root), the T8122
+/// register blocks, and the words the m3 27.2 runtime adds to the performance object.
+pub(crate) const G15G_26B123: Layout = Layout {
+    name: "26B123 G15G",
+    version: 0x0c8a836f039404b8,
+    loaders: &G15G_LOADERS,
+    // 26.6.2 slots 2, 5-7, 30, 33, 34, 37, 38 and 41-43 carry write mode 2 while empty
+    // (`m3_mmio_26::empty_mode`); at their 26B123 positions (`slots_26b123`).
+    empty_loader_modes: (1 << 2) | (7 << 5) | (1 << 35) | (3 << 38) | (3 << 42) | (7 << 46),
+    // Two words this InitData family adds, 1 each as the G14 27.2 path sets them, next to the
+    // four power-up words (linux#2781 `relocate_26b123`).
+    power_policy: &[
+        (0x9c, 1),
+        (0xa0, 1),
+        (0xa4, 1),
+        (0xa8, 1),
+        (0x2f34, 1),
+        (0x6ac8, 1),
+    ],
+    // The shared3 block's state word (+0x62ac + 8): with the block all zero the G15G firmware
+    // never takes the first device-control records.
+    state_bound: Some(0x62b4),
+    ..V26B123
+};
+
+/// The T8122 register blocks behind each logical 26.6.2 slot (`m3_mmio_26::area` with the
+/// T8122 blocks of `m3_adt_config::T8122_IO_MAPPINGS`).
+const G15G_LOADERS: [Loader; LOADER_COUNT] = {
+    const SGX: u64 = 0x290000000;
+    let mut out = [EMPTY; LOADER_COUNT];
+    out[0] = mmio(0x2d1014000, 0x4000, 0, 2);
+    // The memory cache, two banks, as on T8132.
+    out[3] = LOADERS[3];
+    out[9] = mmio(0x2d03d0000, 0x1000, 0, 2);
+    out[10] = mmio(0x2d03c0000, 0x2000, 0, 0);
+    out[12] = mmio(0x31145c000, 0x4000, 0, 2);
+    out[14] = mmio(0x2d0280000, 0x8000, 0, 0);
+    out[17] = mmio(SGX, 0x20000, 0, 2);
+    out[26] = mmio(SGX + 0xd04000, 0x8000, 0xd04000, 2);
+    out[27] = mmio(SGX + 0xd0d000, 0x1000, 0xd0d000, 2);
+    out[28] = mmio(SGX + 0xd50000, 0x8000, 0xd50000, 2);
+    out[29] = mmio(SGX + 0xd10000, 0x4000, 0xd10000, 2);
+    out[31] = mmio(SGX + 0xd40000, 0x4000, 0xd40000, 2);
+    out[32] = mmio(SGX + 0xd60000, 0x8000, 0xd60000, 2);
+    out[35] = mmio(SGX + 0xe00000, 0x4000, 0xe00000, 2);
+    out[39] = mmio(SGX + 0xe08000, 0x8000, 0, 2);
+    out[40] = mmio(SGX + 0xe1c000, 0x4000, 0xe1c000, 2);
+    out
 };
 
 const fn slots_g15s() -> [Option<u8>; LOADER_COUNT] {
@@ -811,6 +868,12 @@ const fn retention_fits(layout: &Layout) -> bool {
     }
 }
 const _: () = assert!(layout_fits(&V25G83) && layout_fits(&V26B123) && layout_fits(&G15S_26B123));
+const _: () = assert!(layout_fits(&G15G_26B123));
+const _: () = assert!(match G15G_26B123.state_bound {
+    Some(at) =>
+        power_slot_clear(&G15G_26B123, at) && power_policy_overlaps(G15G_26B123.power_policy, at),
+    None => false,
+});
 
 /// One logical loader record, including its page offset and exact PTE class.
 #[derive(Clone, Copy, Debug)]
@@ -1563,6 +1626,9 @@ pub(crate) fn encode_for(
     // proved at compile time by layout_fits().
     for &(at, value) in layout.power_policy {
         put32(p, at, value)?;
+    }
+    if let Some(at) = layout.state_bound {
+        put32(p, at, input.performance.count as u32)?;
     }
     if let (Some(sampling), Some((period, samples))) = (layout.power_sampling, sampling_values) {
         for &at in sampling.period {
