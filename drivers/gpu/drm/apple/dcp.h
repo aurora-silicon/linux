@@ -91,7 +91,7 @@ int dcp_get_connector_type(struct platform_device *pdev);
 bool dcp_fw_compat_is_12_x(struct platform_device *pdev);
 bool dcp_fw_compat_is_14_7(struct platform_device *pdev);
 bool dcp_fw_compat_is_desktop(struct platform_device *pdev);
-bool dcp_fw_compat_panel_edr(struct platform_device *pdev);
+bool dcp_panel_edr(struct platform_device *pdev);
 bool dcp_ext_color_props_supported(struct platform_device *pdev);
 unsigned int dcp_gamma_lut_size(struct platform_device *pdev);
 /* T6041 external display processors may join the DRM device. */
@@ -156,6 +156,7 @@ int dcp_dptx_park(struct apple_dcp *dcp);
 int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port);
 bool dcp_hold_resume_event(struct platform_device *pdev);
 bool dcp_s2r_firmware_stopped(struct platform_device *pdev);
+int dcp_t6041_s2r_all(bool start);
 
 int iomfb_start_rtkit(struct apple_dcp *dcp);
 void iomfb_ext26_start(struct apple_dcp *dcp);
