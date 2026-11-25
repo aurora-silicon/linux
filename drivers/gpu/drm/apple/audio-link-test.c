@@ -767,6 +767,30 @@ static void dcpaud_eld_refresh_keeps_name_without_edid(struct kunit *test)
 	KUNIT_EXPECT_MEMEQ(test, dcpaud->eld + DRM_ELD_MONITOR_NAME_STRING, "QG270 S3", 8);
 }
 
+/* The sieve holds what the parameters allow only, whatever it held before. */
+static void dcpaud_sieve_takes_params_only(struct kunit *test)
+{
+	struct snd_pcm_hw_params *params = kunit_kzalloc(test, sizeof(*params), GFP_KERNEL);
+	struct dcp_sound_format_mask sieve;
+	struct snd_interval *i;
+
+	KUNIT_ASSERT_NOT_NULL(test, params);
+	snd_mask_set_format(hw_param_mask(params, SNDRV_PCM_HW_PARAM_FORMAT),
+			    SNDRV_PCM_FORMAT_S24_LE);
+	i = hw_param_interval(params, SNDRV_PCM_HW_PARAM_CHANNELS);
+	i->min = 2;
+	i->max = 2;
+	i = hw_param_interval(params, SNDRV_PCM_HW_PARAM_RATE);
+	i->min = 48000;
+	i->max = 48000;
+
+	memset(&sieve, 0xff, sizeof(sieve));
+	dcpaud_fill_fmt_sieve(params, &sieve);
+	KUNIT_EXPECT_EQ(test, sieve.rates, snd_pcm_rate_to_rate_bit(48000));
+	KUNIT_EXPECT_EQ(test, sieve.nchans, BIT(2));
+	KUNIT_EXPECT_EQ(test, sieve.formats, SNDRV_PCM_FMTBIT_S24_LE);
+}
+
 static struct kunit_case dcpaud_link_cases[] = {
 	KUNIT_CASE(dcpaud_link_release_instance),
 	KUNIT_CASE(dcpaud_disconnect_sync_completes_live_owner),
@@ -790,6 +814,7 @@ static struct kunit_case dcpaud_link_cases[] = {
 	KUNIT_CASE(dcpaud_eld_refresh_takes_monitor_name),
 	KUNIT_CASE(dcpaud_eld_refresh_needs_connection),
 	KUNIT_CASE(dcpaud_eld_refresh_keeps_name_without_edid),
+	KUNIT_CASE(dcpaud_sieve_takes_params_only),
 	{}
 };
 
