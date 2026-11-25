@@ -17,6 +17,8 @@ static void macaudio_admission_needs_a_safe_level(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, macaudio_speakers_allowed(&macaudio_j873_cfg));
 	/* The Mac Studio M5: no sense and no protection owner yet, speaker off */
 	KUNIT_EXPECT_FALSE(test, macaudio_speakers_allowed(&macaudio_j775_cfg));
+	/* K114: the J714 amps and frame, but no safe level for the chassis */
+	KUNIT_EXPECT_FALSE(test, macaudio_speakers_allowed(&macaudio_k114_cfg));
 	cfg = macaudio_j413_cfg;
 	cfg.safe_vol = 0;
 	KUNIT_EXPECT_FALSE(test, macaudio_speakers_allowed(&cfg));
