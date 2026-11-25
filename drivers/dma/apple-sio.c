@@ -189,6 +189,8 @@ struct sio_data {
 	/* The firmware is stopped for a system sleep. */
 	bool asleep;
 	bool firmware_only;
+	/* Protocol 10 firmware given the earlier boot tables: no DMA, which would crash it */
+	bool tables_mismatch;
 	bool commit_registered;
 	bool commit_used;
 	u32 protocol;
@@ -370,16 +372,16 @@ static int sio_t6030_windows(struct device_node *np, struct sio_t6030_window *wi
 	return err == -ENOENT ? n : err;
 }
 
-/* 0 when the node's boot tables are protocol-10 tables inside its mapped windows */
-static int sio_t6030_check_node(struct device_node *np)
+/* 0 when the node's boot tables in propname are protocol-10 tables inside its mapped windows */
+static int sio_t6030_check_node(struct device_node *np, const char *propname)
 {
 	struct sio_t6030_window windows[SIO_T6030_WINDOWS_MAX];
 	u32 params[2 * SIO_T6030_PARAMS_MAX];
 	int nparams, nwindows;
 
-	nparams = of_property_count_u32_elems(np, "apple,sio-firmware-params");
+	nparams = of_property_count_u32_elems(np, propname);
 	if (nparams <= 0 || nparams > ARRAY_SIZE(params) ||
-	    of_property_read_u32_array(np, "apple,sio-firmware-params", params, nparams))
+	    of_property_read_u32_array(np, propname, params, nparams))
 		return -EINVAL;
 	nwindows = sio_t6030_windows(np, windows, ARRAY_SIZE(windows));
 	if (nwindows < 0)
@@ -389,7 +391,7 @@ static int sio_t6030_check_node(struct device_node *np)
 
 static int sio_t6030_check_boot_tables(struct device *dev)
 {
-	if (sio_t6030_check_node(dev->of_node)) {
+	if (sio_t6030_check_node(dev->of_node, "apple,sio-firmware-params")) {
 		dev_err(dev, "boot tables are not for SIO protocol 10; leaving the SIO stopped\n");
 		return -ENODEV;
 	}
@@ -697,12 +699,13 @@ static const struct sio_hw_data sio_hw_t6050 = {
 };
 
 /*
- * The T6050 description is in force on the board it has run on. On another T6050 board the
- * node is taken as before: by its generic compatible.
+ * The T6050 description, with its stop at the sleep's commit, is in force on the boards
+ * that describe the sleep. On another T6050 board the node is taken as before: by its
+ * generic compatible.
  */
 static bool sio_t6050_board(void)
 {
-	return of_machine_is_compatible("apple,j714s");
+	return apple_t6050_sleep_described();
 }
 
 static const struct of_device_id sio_of_match[] = {
@@ -869,7 +872,8 @@ static struct dma_async_tx_descriptor *sio_prep_dma_cyclic(
 	struct sio_chan *siochan = to_sio_chan(chan);
 	struct sio_tx *siotx;
 
-	if (direction != sio_chan_direction(siochan->no))
+	if (siochan->host->tables_mismatch ||
+	    direction != sio_chan_direction(siochan->no))
 		return NULL;
 
 	siotx = sio_alloc_tx(siochan, buf_addr, buf_len, period_len, GFP_NOWAIT);
@@ -1678,6 +1682,9 @@ static int sio_device_config(struct dma_chan *chan,
 	struct sio_shmem_chan_config cfg;
 	int ret;
 
+	if (sio->tables_mismatch)
+		return -ENODEV;
+
 	if (config->peripheral_config) {
 		if (config->peripheral_size != sizeof(struct apple_sio_idle))
 			return -EINVAL;
@@ -1926,14 +1933,42 @@ free_shmem:
 	return err;
 }
 
+/*
+ * A low-window SIO (M1, M2) takes the earlier boot tables when its firmware reports protocol 9
+ * and T6030's when it reports protocol 10 (the M2's 27.2 firmware, with an ADT the same as its
+ * 13.5 one's), so the boot loader passes T6030's tables as a second list, used for protocol 10.
+ * A protocol-10 firmware given only the earlier tables (an older boot loader) crashes at its
+ * first channel configuration; keep the firmware running for sleep, but offer it no DMA.
+ */
+static const char *sio_dt_params_name(struct sio_data *sio)
+{
+	struct device_node *np = sio->dev->of_node;
+
+	if (sio->protocol != 10)
+		return "apple,sio-firmware-params";
+	if (!sio_t6030_check_node(np, "apple,sio-firmware-params-v10"))
+		return "apple,sio-firmware-params-v10";
+	if (!sio_t6030_check_node(np, "apple,sio-firmware-params"))
+		return "apple,sio-firmware-params";
+
+	sio->tables_mismatch = true;
+	return NULL;
+}
+
 static int sio_send_dt_params(struct sio_data *sio)
 {
 	struct device_node *np = sio->dev->of_node;
-	const char *propname = "apple,sio-firmware-params";
+	const char *propname;
 	int nparams, err, i;
 
 	if (sio->hw->send_dt_params)
 		return sio->hw->send_dt_params(sio);
+
+	propname = sio_dt_params_name(sio);
+	if (!propname) {
+		dev_err(sio->dev, "boot tables are not for SIO protocol 10; no DMA\n");
+		return 0;
+	}
 
 	nparams = of_property_count_u32_elems(np, propname);
 	if (nparams < 0) {
@@ -2116,6 +2151,10 @@ static int sio_probe(struct platform_device *pdev)
 	err = sio_send_dt_params(sio);
 	if (err < 0)
 		return dev_err_probe(&pdev->dev, err, "failed to send boot-up parameters\n");
+	if (sio->tables_mismatch) {
+		sio->firmware_only = true;
+		goto rpm_put;
+	}
 
 	err = sio_alloc_shmem(sio);
 	if (err < 0)
@@ -2223,6 +2262,13 @@ static __maybe_unused int sio_suspend_late(struct device *dev)
 
 	if (sio->commit_registered && apple_sleep_commit_stops_coprocs()) {
 		apple_sleep_coproc_set_ready(dev, true);
+		/*
+		 * The commit stops it, through its ASC and mailbox, after the noirq
+		 * phase: keep its power domain up until then, as genpd would power it
+		 * down with the device runtime-suspended. Read with the domain down,
+		 * both answer with an external abort.
+		 */
+		device_set_wakeup_path(dev);
 		sio->commit_used = true;
 		sio->asleep = true;
 		return 0;

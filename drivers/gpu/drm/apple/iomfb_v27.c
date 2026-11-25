@@ -164,6 +164,22 @@ static const struct dcp_method_entry dcp_methods_27_0[dcpep_num_methods] = {
 	 * the IOMFB calls around it; 27.2 moved both to A550/A551.
 	 */
 	IOMFB_METHOD("A500", dcpep_unnamed_500),
+	IOMFB_METHOD("A115", dcpep_v27_sleep_a115),
+	IOMFB_METHOD("A442", dcpep_v27_wake_a442),
+	IOMFB_METHOD("A360", dcpep_v27_peer_a360),
+	IOMFB_METHOD("A361", dcpep_v27_peer_a361),
+	IOMFB_METHOD("A362", dcpep_v27_peer_a362),
+	IOMFB_METHOD("A364", dcpep_v27_peer_a364),
+	IOMFB_METHOD("A365", dcpep_v27_peer_a365),
+	IOMFB_METHOD("A366", dcpep_v27_peer_a366),
+	IOMFB_METHOD("A367", dcpep_v27_peer_a367),
+	IOMFB_METHOD("A368", dcpep_v27_peer_a368),
+	IOMFB_METHOD("A369", dcpep_v27_peer_a369),
+	IOMFB_METHOD("A370", dcpep_v27_peer_a370),
+	IOMFB_METHOD("A371", dcpep_v27_peer_a371),
+	IOMFB_METHOD("A372", dcpep_v27_peer_a372),
+	IOMFB_METHOD("A373", dcpep_v27_peer_a373),
+	IOMFB_METHOD("A449", dcpep_v27_peer_a449),
 };
 
 /*
@@ -222,6 +238,22 @@ static const struct dcp_method_entry dcp_methods_27_2[dcpep_num_methods] = {
 	 * dispatch where 26A428's compares 'A500' (0x1df68c vs 0x1de0dc, same code).
 	 */
 	IOMFB_METHOD("A550", dcpep_unnamed_500),
+	IOMFB_METHOD("A115", dcpep_v27_sleep_a115),
+	IOMFB_METHOD("A492", dcpep_v27_wake_a442),
+	IOMFB_METHOD("A360", dcpep_v27_peer_a360),
+	IOMFB_METHOD("A361", dcpep_v27_peer_a361),
+	IOMFB_METHOD("A362", dcpep_v27_peer_a362),
+	IOMFB_METHOD("A364", dcpep_v27_peer_a364),
+	IOMFB_METHOD("A365", dcpep_v27_peer_a365),
+	IOMFB_METHOD("A366", dcpep_v27_peer_a366),
+	IOMFB_METHOD("A367", dcpep_v27_peer_a367),
+	IOMFB_METHOD("A368", dcpep_v27_peer_a368),
+	IOMFB_METHOD("A369", dcpep_v27_peer_a369),
+	IOMFB_METHOD("A370", dcpep_v27_peer_a370),
+	IOMFB_METHOD("A371", dcpep_v27_peer_a371),
+	IOMFB_METHOD("A372", dcpep_v27_peer_a372),
+	IOMFB_METHOD("A373", dcpep_v27_peer_a373),
+	IOMFB_METHOD("A499", dcpep_v27_peer_a449),
 };
 
 /*
@@ -270,6 +302,76 @@ const struct dcp_method_entry *iomfb_v27_methods(const char *compat)
 }
 
 /*
+ * Translate @tag, a 27.0 ID named directly by sleep or paired-mode callers,
+ * into the build of @methods (4 bytes in @out). On 27.0 (including the J714s
+ * copy) the tag is sent unchanged. On a renumbered build every ID must come
+ * from @methods; a missing entry returns -EOPNOTSUPP instead of sending an
+ * unknown tag that would panic the firmware.
+ */
+int iomfb_v27_tag(const struct dcp_method_entry *methods, const char *tag, char *out)
+{
+	unsigned int i;
+	char in[4];
+
+	if (!methods)
+		return -EOPNOTSUPP;
+	memcpy(in, tag, 4);
+	if (!iomfb_v27_methods_renumbered(methods)) {
+		memcpy(out, in, 4);
+		return 0;
+	}
+	for (i = 0; i < dcpep_num_methods; i++) {
+		if (dcp_methods_27_0[i].tag[0] && !memcmp(dcp_methods_27_0[i].tag, in, 4)) {
+			if (!methods[i].tag[0])
+				return -EOPNOTSUPP;
+			memcpy(out, methods[i].tag, 4);
+			return 0;
+		}
+	}
+	return -EOPNOTSUPP;
+}
+
+/* Whether @methods is a build's table whose AP method IDs differ from 27.0's. */
+bool iomfb_v27_methods_renumbered(const struct dcp_method_entry *methods)
+{
+	unsigned int i;
+
+	if (!methods || methods == dcp_methods_27_0)
+		return false;
+	for (i = 0; i < dcpep_num_methods; i++) {
+		if (memcmp(methods[i].tag, dcp_methods_27_0[i].tag, 4) &&
+		    !(i == dcpep_swap_submit && !memcmp(methods[i].tag, "A407", 4)))
+			return true;
+	}
+	return false;
+}
+
+static const enum dcpep_method iomfb_v27_sleep_methods[] = {
+	dcpep_is_main_display,
+	dcpep_pipe_cfg_414,
+	dcpep_set_power_state,
+	dcpep_pipe_set_476,
+	dcpep_pipe_query_478,
+	dcpep_unnamed_500,
+	dcpep_v27_sleep_a115,
+	dcpep_v27_wake_a442,
+};
+
+/* Whether @methods names an ID for every call the firmware 27 display sleep sends. */
+bool iomfb_v27_sleep_methods_complete(const struct dcp_method_entry *methods)
+{
+	unsigned int i;
+
+	if (!methods)
+		return false;
+	for (i = 0; i < ARRAY_SIZE(iomfb_v27_sleep_methods); i++) {
+		if (!methods[iomfb_v27_sleep_methods[i]].tag[0])
+			return false;
+	}
+	return true;
+}
+
+/*
  * The 27.0 table for the J714s, the board the firmware 27 sleep has run on (dcp->v27_j714s): a
  * copy with the sleep's A500 added. The shared table keeps the methods it had, so every other
  * machine sends what it sent, and a 27.2 or 27.3 build is judged against the same list as
@@ -309,9 +411,14 @@ const char *iomfb_v27_missing_method(const struct dcp_method_entry *methods,
 
 	*count = 0;
 	for (i = 0; i < dcpep_num_methods; i++) {
-		/* Only a firmware sleep sends unnamed_500, and it checks the build's table. */
+		/*
+		 * Only sleep and paired-mode paths send unnamed_500 and the
+		 * v27-optional entries; each checks the build's table before
+		 * sending.
+		 */
 		if (!dcp_methods_27_0[i].tag[0] || methods[i].tag[0] ||
-		    i == dcpep_dfb_ready_query || i == dcpep_unnamed_500)
+		    i == dcpep_dfb_ready_query || i == dcpep_unnamed_500 ||
+		    i >= dcpep_v27_sleep_a115)
 			continue;
 		if (!first)
 			first = dcp_methods_27_0[i].name;
@@ -406,6 +513,9 @@ static bool trampoline_hotplug_h17p(struct apple_dcp *dcp, int tag,
 	if (!(request->tiled_display_null & 1))
 		memcpy(out, request->tiled_display,
 		       sizeof(request->tiled_display));
+	/* The V27 wake's mode set waits for the firmware's report of the panel */
+	if (request->connected && dcp->v27_j714s)
+		complete(&dcp->v27_wake_hotplug);
 	return trampoline_hotplug(dcp, tag, out, in);
 }
 
@@ -702,6 +812,12 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[587] = trampoline_nop,
 	[588] = trampoline_nop,
 	[589] = trampoline_swap_info_h17p,
+	/*
+	 * 27.2 sends this 20-byte notification with no reply after swaps (the
+	 * macOS handler next to swap_info is the buffer-release notification);
+	 * nothing here consumes it.
+	 */
+	[590] = trampoline_nop,
 
 	[592] = trampoline_nop,
 	[594] = trampoline_swap_complete,
@@ -788,6 +904,7 @@ static const struct {
 	[587] = { 0x0, 0x0 },
 	[588] = { 0x18, 0x0 },
 	[589] = { 0xe4, 0xe0 },
+	[590] = { 0x14, 0x0 },
 	[592] = { 0x0, 0x0 },
 	[594] = { 0x730, 0x0 },
 	[596] = { 0x14, 0x0 },
@@ -810,7 +927,7 @@ bool iomfb_v27_callback_size_valid(unsigned int tag, u32 input, u32 output)
 void iomfb_start_v27(struct apple_dcp *dcp)
 {
 	dcp->cb_handlers = cb_handlers;
-	dcp_start_signal(dcp, false, dcp_started, NULL);
+	iomfb_template_start(dcp);
 }
 
 #undef DCP_FW_VER

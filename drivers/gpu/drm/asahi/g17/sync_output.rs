@@ -13,7 +13,7 @@ unsafe extern "C" {
         error: *mut i32) -> *mut core::ffi::c_void;
     fn asahi_g17_signals_free(bundle: *mut core::ffi::c_void);
     fn asahi_g17_signals_publish(bundle: *mut core::ffi::c_void,
-        current: *mut bindings::dma_fence) -> i32;
+        current: *mut bindings::dma_fence, compute_only: bool) -> i32;
     fn asahi_g17_signals_fail(bundle: *mut core::ffi::c_void,
         failure: *mut bindings::dma_fence);
 }
@@ -48,10 +48,10 @@ impl SignalBundle {
         Ok(Self(raw))
     }
 
-    pub(crate) fn publish(&mut self, current: &Fence) -> Result {
+    pub(crate) fn publish(&mut self, current: &Fence, compute_only: bool) -> Result {
         // SAFETY: The bundle and current fence are owned for this call; C takes
         // its own references on publication and reports failure before any store.
-        let error = unsafe { asahi_g17_signals_publish(self.0, current.raw()) };
+        let error = unsafe { asahi_g17_signals_publish(self.0, current.raw(), compute_only) };
         if error == 0 { Ok(()) } else { Err(Error::from_errno(error)) }
     }
 

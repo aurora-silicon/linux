@@ -3200,13 +3200,13 @@ bool iomfb_v14_7_external_showing(struct apple_dcp *dcp,
 				  const struct drm_display_mode *drm_mode)
 {
 	struct apple_dcp_v14 *v14 = dcp->v14;
-	struct dcp_display_mode mode = {};
+	struct dcp_display_mode *mode __free(kfree) = kzalloc_obj(*mode);
 	bool live;
 
-	if (!dcp->external_native || !v14 || !lookup_mode(dcp, drm_mode, &mode))
+	if (!mode || !dcp->external_native || !v14 || !lookup_mode(dcp, drm_mode, mode))
 		return false;
 	mutex_lock(&v14->lock);
-	live = dcp_v14_external_described(v14) && dcp_v14_external_mode_live(v14, &mode);
+	live = dcp_v14_external_described(v14) && dcp_v14_external_mode_live(v14, mode);
 	mutex_unlock(&v14->lock);
 	return live;
 }
@@ -3235,10 +3235,12 @@ static void dcp_v14_audio_on(struct apple_dcp *dcp)
 static int dcp_v14_external_modeset(struct apple_dcp *dcp, struct drm_crtc_state *crtc_state)
 {
 	struct apple_dcp_v14 *v14 = dcp->v14;
-	struct dcp_display_mode mode = {};
+	struct dcp_display_mode *mode __free(kfree) = kzalloc_obj(*mode);
 	bool audio_off = false;
 	int ret = 0;
 
+	if (!mode)
+		return -ENOMEM;
 	if (!v14 || READ_ONCE(v14->failed) || !v14->opened)
 		return -EIO;
 	/*
@@ -3254,7 +3256,7 @@ static int dcp_v14_external_modeset(struct apple_dcp *dcp, struct drm_crtc_state
 	if (ret)
 		goto out;
 	/* Only after the wait: a new description replaces the catalog. */
-	if (!lookup_mode(dcp, &crtc_state->mode, &mode)) {
+	if (!lookup_mode(dcp, &crtc_state->mode, mode)) {
 		mutex_unlock(&v14->lock);
 		ret = -EINVAL;
 		goto out;
@@ -3264,10 +3266,11 @@ static int dcp_v14_external_modeset(struct apple_dcp *dcp, struct drm_crtc_state
 	 * it again only restarts its timings under the display. A retry or a
 	 * replayed CRTC lands here when the display came back as it was.
 	 */
-	if (dcp_v14_external_mode_live(v14, &mode)) {
+	if (dcp_v14_external_mode_live(v14, mode)) {
 		mutex_unlock(&v14->lock);
 		dev_info(dcp->dev, "display mode " DRM_MODE_FMT " (timing %u, color %u) already active and showing\n",
-			 DRM_MODE_ARG(&crtc_state->mode), mode.timing_mode_id, mode.color_mode_id);
+			 DRM_MODE_ARG(&crtc_state->mode),
+			 mode->timing_mode_id, mode->color_mode_id);
 		atomic_set(&dcp->external_retries, 0);
 		dcp_mode_set_valid(&dcp->mode_state, true);
 		if (dcp->avep)
@@ -3279,7 +3282,7 @@ static int dcp_v14_external_modeset(struct apple_dcp *dcp, struct drm_crtc_state
 	if (READ_ONCE(v14->failed))
 		ret = -EIO;
 	if (!ret)
-		ret = dcp_v14_set_mode(v14, mode.color_mode_id, mode.timing_mode_id);
+		ret = dcp_v14_set_mode(v14, mode->color_mode_id, mode->timing_mode_id);
 	if (!ret)
 		ret = dcp_v14_set_power(v14, true);
 	/*
@@ -3292,19 +3295,19 @@ static int dcp_v14_external_modeset(struct apple_dcp *dcp, struct drm_crtc_state
 	 * before the first swap.
 	 */
 	if (!ret)
-		ret = dcp_v14_set_mode(v14, mode.color_mode_id, mode.timing_mode_id);
+		ret = dcp_v14_set_mode(v14, mode->color_mode_id, mode->timing_mode_id);
 	if (!ret) {
-		v14->panel_width = mode.mode.hdisplay;
-		v14->panel_height = mode.mode.vdisplay;
-		v14->mode_timing = mode.timing_mode_id;
-		v14->mode_color = mode.color_mode_id;
+		v14->panel_width = mode->mode.hdisplay;
+		v14->panel_height = mode->mode.vdisplay;
+		v14->mode_timing = mode->timing_mode_id;
+		v14->mode_color = mode->color_mode_id;
 		v14->mode_swaps = 0;
 		v14->mode_live = true;
 	}
 	mutex_unlock(&v14->lock);
 out:
 	dev_info(dcp->dev, "display mode " DRM_MODE_FMT " (timing %u, color %u): %d\n",
-		 DRM_MODE_ARG(&crtc_state->mode), mode.timing_mode_id, mode.color_mode_id, ret);
+		 DRM_MODE_ARG(&crtc_state->mode), mode->timing_mode_id, mode->color_mode_id, ret);
 	if (ret) {
 		/*
 		 * A mode that is gone, or a description that never settled:
