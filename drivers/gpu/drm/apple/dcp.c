@@ -8225,7 +8225,12 @@ display_is_off:
 	idle_sent = true;
 	ret = apple_rtkit_idle_with(dcp->rtk, dcp_secure_port_idle, dcp);
 	if (ret) {
-		/* Answer what it still has queued, its log counters among them, and ask again. */
+		/*
+		 * Answer what it still has queued, its log counters among them, and ask again.
+		 * That queued messages are the cause is not shown: the one recorded refusal
+		 * (-62 after 1137 ms on J700) was refused again. Kept until counted; see
+		 * https://github.com/aurora-silicon/linux/issues/2347
+		 */
 		dev_warn(dcp->dev, "firmware refused idle after %lld ms: %d, control %#x status %#x: retrying once\n",
 			 ktime_ms_delta(ktime_get(), start), ret,
 			 readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL),
