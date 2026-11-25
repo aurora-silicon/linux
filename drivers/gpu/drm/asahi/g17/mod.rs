@@ -1076,12 +1076,14 @@ impl Firmware {
             }
             power::IdleAction::Recheck(delay) => Some(delay),
         };
-        Ok(
-            match (effort, self.idle_hold(now_ns, in_flight || submitted)) {
-                (Some(a), Some(b)) => Some(a.min(b)),
-                (a, b) => a.or(b),
-            },
-        )
+        let busy_recheck = if in_flight {
+            self.port.report_busy(now_ns);
+            self.port.busy_recheck_delay(now_ns)
+        } else {
+            None
+        };
+        let hold = self.idle_hold(now_ns, in_flight || submitted);
+        Ok([effort, hold, busy_recheck].into_iter().flatten().min())
     }
 
     /// Drives the idle hold (see power::Hold); returns the delay in ns for its next check. A
@@ -1200,6 +1202,9 @@ struct Shared {
     clusters: u32,
     active_cores: u32,
     variant: &'static fw::Variant,
+    /// Highest valid performance state index for 0x1b telemetry reports, derived from the
+    /// state-frequency table.
+    max_pstate: u32,
     /// Layout of compute queues' operand-state buffers for this GPU's cores.
     operand_state: &'static fw::compute::OperandState,
     /// The M5 board ([`Config::m5`]) of an M5 profile.
@@ -1762,6 +1767,10 @@ impl Gpu {
             },
             GFP_KERNEL,
         )?;
+        let frequencies = Self::state_frequencies(dev, cfg, variant, id.num_clusters)?;
+        let max_pstate = frequencies
+            .as_ref()
+            .map_or(0, stats::StateFrequencies::max_pstate);
         let shared = Arc::pin_init(
             pin_init!(Shared {
                 drm <- new_mutex!(Some(dev.into()), "g17::Shared::drm"),
@@ -1769,6 +1778,7 @@ impl Gpu {
                 clusters: id.num_clusters,
                 active_cores,
                 variant,
+                max_pstate,
                 operand_state: &cfg.core_layout.operand_state,
                 m5_board: cfg.m5.filter(|_| m5),
                 deflake: cfg.core_layout.deflake,
@@ -1837,7 +1847,6 @@ impl Gpu {
             directory.read_only_file(c"hardware_data", reports::HardwareDataView(shared.clone())),
             GFP_KERNEL,
         )?;
-        let frequencies = Self::state_frequencies(dev, cfg, variant, id.num_clusters)?;
         let stats = Arc::new(
             crate::stats::StatsSnapshot {
                 g17_reader: Some(stats::Reader(shared.clone(), frequencies)),
@@ -1952,18 +1961,21 @@ impl Gpu {
     }
 
     /// The frequency of each performance state the firmware reports
-    /// ([`stats::reports_pstate`]): M5's from its board, the A18 Pro's from the operating
-    /// points its performance table A names. The A18 Pro's records do not name the table, but
-    /// at its top state, where it runs while work is in flight, a sustained FP32 FMA load
-    /// completes faster than table B's frequency there allows. `None` where the firmware
-    /// reports no state.
+    /// ([`stats::reports_pstate`]): M5's from its board, the A18 Pro's and T6041's from the
+    /// operating points their performance table A names. Their records do not name the table;
+    /// on the A18 Pro, at the top state where the GPU runs while work is in flight, a sustained
+    /// FP32 FMA load completes faster than table B's frequency there allows. On T6041 both
+    /// tables map state 10 to OPP 15 (1578 MHz) and only differ on states 5..=9 on the
+    /// J616C (32-core; 40-core differs on 6..=9), so those mid-state frequencies are nominal
+    /// (taken from table A) until measured by a mid-state ALU benchmark. `None` where the
+    /// firmware reports no state.
     fn state_frequencies(
         dev: &AsahiDrmDevice,
         cfg: &'static Config,
         variant: &fw::variant::Variant,
         clusters: u32,
     ) -> Result<Option<stats::StateFrequencies>> {
-        if !stats::reports_pstate(variant.graph, variant.m5_commands) {
+        if !stats::reports_pstate(variant.telemetry_protocol) {
             return Ok(None);
         }
         if let Some(board) = cfg.m5 {
@@ -2088,7 +2100,11 @@ impl Gpu {
                     shared.feed.clone(),
                 )?,
                 seen_submissions: 0,
-                rings: channel::Rings::new(shared.variant.graph, shared.variant.m5_commands)?,
+                rings: channel::Rings::new(
+                    shared.variant.graph,
+                    shared.variant.telemetry_protocol,
+                    shared.max_pstate,
+                )?,
                 recovery: recovery::State::new(),
                 effort: power::Effort::new(),
                 hold: power::Hold::new(),
@@ -2292,7 +2308,11 @@ impl Gpu {
                     shared.feed.clone(),
                 )?,
                 seen_submissions: 0,
-                rings: channel::Rings::new(shared.variant.graph, shared.variant.m5_commands)?,
+                rings: channel::Rings::new(
+                    shared.variant.graph,
+                    shared.variant.telemetry_protocol,
+                    shared.max_pstate,
+                )?,
                 recovery: recovery::State::new(),
                 effort: power::Effort::new(),
                 hold: power::Hold::new(),

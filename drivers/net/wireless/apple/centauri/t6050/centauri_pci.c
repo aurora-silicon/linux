@@ -401,7 +401,8 @@ static int centauri_t6050_port_cycle(struct pci_dev *endpoint)
 	if (ret)
 		goto stopped;
 	ret = pcibios_err_to_errno(pci_write_config_word(endpoint, pm + PCI_PM_CTRL,
-		(pmctrl & ~PCI_PM_CTRL_STATE_MASK) | PCI_D3hot | PCI_PM_CTRL_PME_ENABLE));
+		(pmctrl & ~PCI_PM_CTRL_STATE_MASK) | (__force u16)PCI_D3hot |
+		PCI_PM_CTRL_PME_ENABLE));
 	if (ret)
 		goto stopped;
 	usleep_range(10000, 11000);
@@ -1030,7 +1031,7 @@ static void centauri_t6050_set_d3hot(struct pci_dev *pdev)
 	if (!pci_read_config_word(pdev, pdev->pm_cap + PCI_PM_CTRL, &pmctrl)) {
 		pci_write_config_word(pdev, pdev->pm_cap + PCI_PM_CTRL,
 				      (pmctrl & ~PCI_PM_CTRL_STATE_MASK) |
-				      PCI_D3hot | PCI_PM_CTRL_PME_ENABLE);
+				      (__force u16)PCI_D3hot | PCI_PM_CTRL_PME_ENABLE);
 		mdelay(pdev->d3hot_delay);
 	}
 }
@@ -1042,7 +1043,7 @@ static void centauri_t6050_ensure_d0(struct pci_dev *pdev)
 	if (!pdev || !pdev->pm_cap)
 		return;
 	if (!pci_read_config_word(pdev, pdev->pm_cap + PCI_PM_CTRL, &pmctrl) &&
-	    (pmctrl & PCI_PM_CTRL_STATE_MASK) != PCI_D0) {
+	    (pmctrl & PCI_PM_CTRL_STATE_MASK) != (__force u16)PCI_D0) {
 		pci_write_config_word(pdev, pdev->pm_cap + PCI_PM_CTRL,
 				      pmctrl & ~PCI_PM_CTRL_STATE_MASK);
 		mdelay(pdev->d3hot_delay);

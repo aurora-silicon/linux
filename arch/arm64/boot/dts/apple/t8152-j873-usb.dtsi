@@ -1,0 +1,141 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * J873g USB2 host bring-up: usb-drd1 (back-left port) and usb-drd2
+ * (front ports via the on-board hub).
+ * The loader powers the controllers and sets up the USB2 side of their ATC
+ * PHYs for host mode before Linux starts (there is no T8152 ATC PHY or Type-C
+ * support yet).
+ * The controllers are described by their DWC3 core region, as hosts behind
+ * their two DARTs (apple,t8152-dwc3); their PHY reset, and on the Type-C port
+ * the role switch, exist but are left to the loader.
+ * Resources are from the 26A434 ADT: dart-usb1/2, usb-drd1/2 (on atc-phy1 and
+ * atc-phy2) and the pmgr devices ATC1_USB_AON/USB and ATC2_USB_AON/USB.
+ *
+ * dart-usb1 and dart-usb2 each have two DART instances (ADT reg[0] and
+ * reg[1], 0xc000 each, sharing one interrupt). t8152-peripherals.dtsi lists
+ * both windows on one node (dwc3_1_dart, dwc3_2_dart), but the DART driver
+ * drives one instance per node and the binding reads a second reg entry as
+ * DAPF or auxiliary registers. Keep instance 0 on the shared node, with its
+ * own window only, and describe instance 1 as a node of its own.
+ */
+
+&dwc3_1_dart {
+	reg = <0x4 0x0b020000 0x0 0xc000>;
+	power-domains = <&ps_atc1_usb>;
+	status = "okay";
+};
+
+&dwc3_2_dart {
+	reg = <0x3 0x83020000 0x0 0xc000>;
+	power-domains = <&ps_atc2_usb>;
+	status = "okay";
+};
+
+/ {
+	soc {
+		/*
+		 * The ATCs' PMGR power states (ADT pmgr devices ATCn_USB_AON and
+		 * ATCn_USB from 0x308290100, 0x40 apart per ATC). The ADT gives
+		 * usb-drd1/2 service-gates 175/176, but those PSD service blocks
+		 * (0x303a1af00, 0x303a1b000) take a bus error from the CPU.
+		 *
+		 * The loader leaves them on; they hold the controllers' reset and
+		 * the USB2 PHY setup it did, which Linux cannot redo yet. So they
+		 * stay on, without automatic power management.
+		 */
+		pmgr_atc: power-management@308290000 {
+			compatible = "apple,t8152-pmgr", "apple,t8103-pmgr",
+				     "syscon", "simple-mfd";
+			#address-cells = <1>;
+			#size-cells = <1>;
+			reg = <0x3 0x08290000 0x0 0x1000>;
+
+			ps_atc1_usb_aon: power-controller@140 {
+				compatible = "apple,t8152-pmgr-pwrstate",
+					     "apple,t8103-pmgr-pwrstate";
+				reg = <0x140 4>;
+				#power-domain-cells = <0>;
+				#reset-cells = <0>;
+				label = "atc1_usb_aon";
+				apple,no-auto-pm;
+				apple,always-on;
+			};
+
+			ps_atc1_usb: power-controller@160 {
+				compatible = "apple,t8152-pmgr-pwrstate",
+					     "apple,t8103-pmgr-pwrstate";
+				reg = <0x160 4>;
+				#power-domain-cells = <0>;
+				#reset-cells = <0>;
+				label = "atc1_usb";
+				power-domains = <&ps_atc1_usb_aon>;
+				apple,no-auto-pm;
+				apple,always-on;
+			};
+
+			ps_atc2_usb_aon: power-controller@180 {
+				compatible = "apple,t8152-pmgr-pwrstate",
+					     "apple,t8103-pmgr-pwrstate";
+				reg = <0x180 4>;
+				#power-domain-cells = <0>;
+				#reset-cells = <0>;
+				label = "atc2_usb_aon";
+				apple,no-auto-pm;
+				apple,always-on;
+			};
+
+			ps_atc2_usb: power-controller@1a0 {
+				compatible = "apple,t8152-pmgr-pwrstate",
+					     "apple,t8103-pmgr-pwrstate";
+				reg = <0x1a0 4>;
+				#power-domain-cells = <0>;
+				#reset-cells = <0>;
+				label = "atc2_usb";
+				power-domains = <&ps_atc2_usb_aon>;
+				apple,no-auto-pm;
+				apple,always-on;
+			};
+		};
+
+		dwc3_1_dart_1: iommu@40b040000 {
+			compatible = "apple,t8152-dart", "apple,t8110-dart";
+			reg = <0x4 0x0b040000 0x0 0xc000>;
+			interrupts = <AIC_IRQ 1679 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <1>;
+			power-domains = <&ps_atc1_usb>;
+		};
+
+		usb1: usb@40a430000 {
+			compatible = "apple,t8152-dwc3";
+			reg = <0x4 0x0a430000 0x0 0xcd00>;
+			interrupts = <AIC_IRQ 1692 IRQ_TYPE_LEVEL_HIGH>;
+			dr_mode = "host";
+			maximum-speed = "high-speed";
+			iommus = <&dwc3_1_dart 0>, <&dwc3_1_dart_1 1>;
+			power-domains = <&ps_atc1_usb>;
+			snps,dis_u2_susphy_quirk;
+			snps,dis_u3_susphy_quirk;
+		};
+
+		dwc3_2_dart_1: iommu@383040000 {
+			compatible = "apple,t8152-dart", "apple,t8110-dart";
+			reg = <0x3 0x83040000 0x0 0xc000>;
+			interrupts = <AIC_IRQ 1750 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <1>;
+			power-domains = <&ps_atc2_usb>;
+		};
+
+		/* usb-drd2: on-board VL822 hub behind the two front USB-C ports. */
+		usb2: usb@382430000 {
+			compatible = "apple,t8152-dwc3";
+			reg = <0x3 0x82430000 0x0 0xcd00>;
+			interrupts = <AIC_IRQ 1763 IRQ_TYPE_LEVEL_HIGH>;
+			dr_mode = "host";
+			maximum-speed = "high-speed";
+			iommus = <&dwc3_2_dart 0>, <&dwc3_2_dart_1 1>;
+			power-domains = <&ps_atc2_usb>;
+			snps,dis_u2_susphy_quirk;
+			snps,dis_u3_susphy_quirk;
+		};
+	};
+};
