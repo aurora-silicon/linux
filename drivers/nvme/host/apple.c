@@ -3159,30 +3159,27 @@ static void apple_nvme_shutdown(struct platform_device *pdev)
 static void apple_nvme_t8122_warm_resume(struct apple_nvme *anv)
 {
 	void __iomem *control = anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL;
-	bool via_fw = pm_resume_via_firmware();
 	int ret;
 
 	if (!xchg(&anv->t8122_warm_sleep, false))
 		return;
 
-	if (via_fw) {
-		apple_sleep_restore_pins();
-		if (anv->sart)
-			apple_sart_replay(anv->sart);
-	}
+	/*
+	 * A sleep refused before the commit left ANS powered, so a warm
+	 * restart without a power cycle can hang; fall back to the cold PMGR
+	 * reset path in apple_nvme_reset_work_impl().
+	 */
+	if (!pm_resume_via_firmware())
+		return;
+
+	apple_sleep_restore_pins();
+	if (anv->sart)
+		apple_sart_replay(anv->sart);
 	apple_rtkit_set_warm_epmap_mask(anv->rtk, BIT(0));
 	anv->sleep_run_time = ktime_get();
-	if (via_fw) {
-		ret = apple_rtkit_sleep_return_start(anv->rtk, control);
-	} else {
-		ret = apple_rtkit_warm_restart(anv->rtk);
-		if (!ret)
-			writel(readl(control) | APPLE_ANS_COPROC_CPU_CONTROL_RUN,
-			       control);
-	}
+	ret = apple_rtkit_sleep_return_start(anv->rtk, control);
 	if (ret) {
-		dev_err(anv->dev, "ANS warm restart failed (via_fw=%d): %d\n",
-			via_fw, ret);
+		dev_err(anv->dev, "ANS warm restart failed: %d\n", ret);
 		anv->sleep_failed = true;
 	} else {
 		WRITE_ONCE(anv->sleep_restarting, true);
@@ -3455,7 +3452,8 @@ static int apple_nvme_suspend(struct device *dev)
 	if (apple_rtkit_is_running(anv->rtk)) {
 		if (anv->hw->warm_sleep &&
 		    pm_suspend_target_state == PM_SUSPEND_MEM &&
-		    pm_suspend_via_firmware()) {
+		    pm_suspend_via_firmware() &&
+		    !apple_sleep_dry_run()) {
 			anv->sleep_failed = false;
 			anv->sleep_restarted = false;
 			ret = apple_rtkit_idle(anv->rtk);
