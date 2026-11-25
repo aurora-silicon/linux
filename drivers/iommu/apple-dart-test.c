@@ -1326,7 +1326,106 @@ static void apple_dart_test_host_power_tables(struct kunit *test)
 }
 #endif
 
+static void apple_dart_test_cache_coherency(struct kunit *test)
+{
+	struct apple_dart_master_cfg cfg = {};
+	struct apple_dart *primary, *secondary;
+	struct apple_dart_dcp *dummy_dcp;
+	struct device *dev;
+
+	dev = kunit_device_register(test, "apple-dart-coherency-test");
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, dev);
+	dev->iommu = kunit_kzalloc(test, sizeof(*dev->iommu), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, dev->iommu);
+
+	primary = kunit_kzalloc(test, sizeof(*primary), GFP_KERNEL);
+	secondary = kunit_kzalloc(test, sizeof(*secondary), GFP_KERNEL);
+	dummy_dcp = kunit_kzalloc(test, sizeof(*dummy_dcp), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, primary);
+	KUNIT_ASSERT_NOT_NULL(test, secondary);
+	KUNIT_ASSERT_NOT_NULL(test, dummy_dcp);
+	primary->pgsize = PAGE_SIZE;
+	secondary->pgsize = PAGE_SIZE;
+
+	dev_assign_dma_coherent(dev, true);
+
+	/* Missing or empty master config cannot advertise cache coherency. */
+	KUNIT_EXPECT_FALSE(test, apple_dart_capable(dev, IOMMU_CAP_CACHE_COHERENCY));
+	dev->iommu->priv = &cfg;
+	KUNIT_EXPECT_FALSE(test, apple_dart_capable(dev, IOMMU_CAP_CACHE_COHERENCY));
+
+	/* Coherent device behind ordinary unlocked DARTs (including per_stream/tunneled). */
+	cfg.stream_maps[0].dart = primary;
+	cfg.stream_maps[1].dart = secondary;
+	KUNIT_EXPECT_TRUE(test, apple_dart_capable(dev, IOMMU_CAP_CACHE_COHERENCY));
+	primary->per_stream = true;
+	secondary->tunneled = true;
+	KUNIT_EXPECT_TRUE(test, apple_dart_capable(dev, IOMMU_CAP_CACHE_COHERENCY));
+	KUNIT_EXPECT_FALSE(test,
+			   apple_dart_capable(dev, IOMMU_CAP_ENFORCE_CACHE_COHERENCY));
+
+	/* Non-coherent devices must never advertise cache coherency. */
+	dev_assign_dma_coherent(dev, false);
+	if (!dev_is_dma_coherent(dev))
+		KUNIT_EXPECT_FALSE(test,
+				   apple_dart_capable(dev, IOMMU_CAP_CACHE_COHERENCY));
+	dev_assign_dma_coherent(dev, true);
+
+	/* Any ineligible DART in a multi-DART stream map must reject the device. */
+	secondary->pgsize = PAGE_SIZE * 2;
+	KUNIT_EXPECT_FALSE(test, apple_dart_capable(dev, IOMMU_CAP_CACHE_COHERENCY));
+	secondary->pgsize = PAGE_SIZE;
+
+	secondary->locked = true;
+	KUNIT_EXPECT_FALSE(test, apple_dart_capable(dev, IOMMU_CAP_CACHE_COHERENCY));
+	secondary->locked = false;
+
+	secondary->managed_sids = BIT(1) | BIT(2);
+	KUNIT_EXPECT_FALSE(test, apple_dart_capable(dev, IOMMU_CAP_CACHE_COHERENCY));
+	secondary->managed_sids = 0;
+
+	secondary->retained = true;
+	KUNIT_EXPECT_FALSE(test, apple_dart_capable(dev, IOMMU_CAP_CACHE_COHERENCY));
+	secondary->retained = false;
+
+	secondary->retained_mtp = true;
+	KUNIT_EXPECT_FALSE(test, apple_dart_capable(dev, IOMMU_CAP_CACHE_COHERENCY));
+	secondary->retained_mtp = false;
+
+	secondary->live_mtp = true;
+	KUNIT_EXPECT_FALSE(test, apple_dart_capable(dev, IOMMU_CAP_CACHE_COHERENCY));
+	secondary->live_mtp = false;
+
+	secondary->cold_ane = true;
+	KUNIT_EXPECT_FALSE(test, apple_dart_capable(dev, IOMMU_CAP_CACHE_COHERENCY));
+	secondary->cold_ane = false;
+
+	secondary->isp_host = true;
+	KUNIT_EXPECT_FALSE(test, apple_dart_capable(dev, IOMMU_CAP_CACHE_COHERENCY));
+	secondary->isp_host = false;
+
+	secondary->preserve_display = true;
+	KUNIT_EXPECT_FALSE(test, apple_dart_capable(dev, IOMMU_CAP_CACHE_COHERENCY));
+	secondary->preserve_display = false;
+
+	secondary->v27_provider = true;
+	KUNIT_EXPECT_FALSE(test, apple_dart_capable(dev, IOMMU_CAP_CACHE_COHERENCY));
+	secondary->v27_provider = false;
+
+	secondary->dcp = dummy_dcp;
+	KUNIT_EXPECT_FALSE(test, apple_dart_capable(dev, IOMMU_CAP_CACHE_COHERENCY));
+	secondary->dcp = NULL;
+
+	secondary->frontend[0] = dummy_dcp;
+	KUNIT_EXPECT_FALSE(test, apple_dart_capable(dev, IOMMU_CAP_CACHE_COHERENCY));
+	secondary->frontend[0] = NULL;
+
+	KUNIT_EXPECT_TRUE(test, apple_dart_capable(dev, IOMMU_CAP_CACHE_COHERENCY));
+	dev->iommu = NULL;
+}
+
 static struct kunit_case apple_dart_test_cases[] = {
+	KUNIT_CASE(apple_dart_test_cache_coherency),
 	KUNIT_CASE(apple_dart_test_strict_engines),
 	KUNIT_CASE(apple_dart_test_topology),
 	KUNIT_CASE(apple_dart_test_iommu_specifiers),
