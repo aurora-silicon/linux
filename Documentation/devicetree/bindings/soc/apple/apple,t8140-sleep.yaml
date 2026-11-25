@@ -130,8 +130,8 @@ properties:
   apple,seq-wake-early:
     $ref: "#/$defs/register-sequence"
     description:
-      Run at the wake right after the cluster words, before the power words
-      are back on.
+      Run first at the wake, before the power words are back on, starting
+      with the complexes' words.
 
   apple,seq-wake:
     $ref: "#/$defs/register-sequence"
@@ -355,7 +355,8 @@ $defs:
       32-bit and a 64-bit write of what the register held when read before
       the commit, whose value is 0, 14 and 15 the next entries, as many as
       bits 31:16 say, run only if the 32-bit or 64-bit register, as read
-      before the commit, had one of the value's bits set. Kinds 0 to 6 are
+      before the commit, had one of the value's bits set; spans nest and do
+      not cross. Kinds 0 to 6 are
       32-bit accesses. A wait's bits 31:16 are its timeout in ms (0 for 10
       ms), and bit 8 makes its timeout no error; no other kind takes either,
       and bits 15:9 are 0. Kinds 12 to 15 are only for apple,seq-wake-early
