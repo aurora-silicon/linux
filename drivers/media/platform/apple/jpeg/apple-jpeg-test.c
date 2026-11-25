@@ -250,11 +250,11 @@ static void apple_jpeg_t6050_layout_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, w[6].value, 8);
 	KUNIT_EXPECT_EQ(test, w[11].value, 16);
 	KUNIT_EXPECT_EQ(test, apple_jpeg_dma_ids(l, 0, w, 11), -ENOSPC);
-	/* Until the engine probe confirms them, T6050 offers 4:2:0 only. */
+	/* The T6050 job takes every subsampling; the older ones 4:2:0 and 4:2:2. */
 	KUNIT_EXPECT_TRUE(test, apple_jpeg_has_subsampling(l, AJ_SUBSAMPLING_420));
-	KUNIT_EXPECT_FALSE(test, apple_jpeg_has_subsampling(l, AJ_SUBSAMPLING_422));
-	KUNIT_EXPECT_FALSE(test, apple_jpeg_has_subsampling(l, AJ_SUBSAMPLING_444));
-	KUNIT_EXPECT_FALSE(test, apple_jpeg_has_subsampling(l, AJ_SUBSAMPLING_GREY));
+	KUNIT_EXPECT_TRUE(test, apple_jpeg_has_subsampling(l, AJ_SUBSAMPLING_422));
+	KUNIT_EXPECT_TRUE(test, apple_jpeg_has_subsampling(l, AJ_SUBSAMPLING_444));
+	KUNIT_EXPECT_TRUE(test, apple_jpeg_has_subsampling(l, AJ_SUBSAMPLING_GREY));
 	KUNIT_EXPECT_TRUE(test, apple_jpeg_has_subsampling(wide, AJ_SUBSAMPLING_422));
 	KUNIT_EXPECT_FALSE(test, apple_jpeg_has_subsampling(wide, AJ_SUBSAMPLING_444));
 }
@@ -267,6 +267,16 @@ static int apple_jpeg_index(const struct apple_jpeg_write *w, int n, int from, u
 			return i;
 	return -1;
 }
+
+/* The T6050 programming of the subsamplings besides 4:2:0, as checked on a J815 */
+static const struct apple_jpeg_t6050_case {
+	enum apple_jpeg_subsampling subsampling;
+	u32 codec, io, mcu_w, mcu_h, tile0_w, tile1_w;
+} apple_jpeg_t6050_cases[] = {
+	{ AJ_SUBSAMPLING_422, AJ_CODEC_422, AJ_IO_FLAGS_422, 16, 8, 2, 2 },
+	{ AJ_SUBSAMPLING_444, AJ_CODEC_444, AJ_IO_FLAGS_444, 8, 8, 1, 2 },
+	{ AJ_SUBSAMPLING_GREY, AJ_CODEC_GREY, AJ_IO_FLAGS_GREY, 8, 8, 1, 0 },
+};
 
 /* T6050 jobs: macOS's sequence, with 16-bit tables and no plane size registers. */
 static void apple_jpeg_t6050_job_test(struct kunit *test)
@@ -320,9 +330,30 @@ static void apple_jpeg_t6050_job_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, AJ_QTBL16(1)), 0x00110012);
 	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, AJ_QTBL16(1) + 0x7c), 0x00630063);
 
-	job.subsampling = AJ_SUBSAMPLING_422;
-	KUNIT_EXPECT_EQ(test, apple_jpeg_build_job(l, &job, w, APPLE_JPEG_MAX_WRITES),
-			-EOPNOTSUPP);
+	/* The other subsamplings: codec, chroma layout, MCU grid, tiles, header */
+	for (unsigned int i = 0; i < ARRAY_SIZE(apple_jpeg_t6050_cases); i++) {
+		const struct apple_jpeg_t6050_case *c = &apple_jpeg_t6050_cases[i];
+
+		job.subsampling = c->subsampling;
+		/* NV24's chroma rows are full width: twice the luma stride */
+		job.chroma_stride = c->subsampling == AJ_SUBSAMPLING_444 ? 2 * job.width : job.width;
+		n = apple_jpeg_build_job(l, &job, w, APPLE_JPEG_MAX_WRITES);
+		KUNIT_ASSERT_GT(test, n, 0);
+		KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, AJ_CODEC), c->codec);
+		KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, AJ_T6050_PX_MODE), c->codec);
+		KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, AJ_PX_MCUS_W),
+				DIV_ROUND_UP(job.width, c->mcu_w));
+		KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, AJ_PX_MCUS_H),
+				DIV_ROUND_UP(job.height, c->mcu_h));
+		KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, AJ_PX_PLANE0_TILE_H), c->tile0_w);
+		KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, AJ_PX_USE_PLANE1), !!c->tile1_w);
+		if (c->tile1_w)
+			KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, AJ_PX_PLANE1_TILE_H),
+					c->tile1_w);
+		KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, AJ_JPEG_IO_FLAGS),
+				AJ_IO_FLAGS_T6050 | AJ_IO_FLAGS_ORDER | c->io);
+		KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, AJ_T6050_ENC_CTRL), 0x35);
+	}
 }
 
 static void apple_jpeg_older_hwrev_test(struct kunit *test)
