@@ -63,6 +63,8 @@ pub(crate) struct Config {
     pub(crate) host_block_ready: bool,
     /// Whether the TVM gate and firmware warm restart are supported.
     pub(crate) deep_sleep: bool,
+    /// Whether FS->compute cross-engine barriers require `BarrierType::Hold` (type 1), as on G15.
+    pub(crate) cross_engine_hold: bool,
 }
 
 impl Config {
@@ -189,6 +191,7 @@ pub(crate) mod t8132 {
         host_block_zero_order: &super::start_27_2::HOST_BLOCK_ZERO_ORDER,
         host_block_ready: true,
         deep_sleep: true,
+        cross_engine_hold: false,
     };
 
     /// What iBoot writes into the 25G83 build b000 TEXT it loads, in TEXT order:
@@ -340,6 +343,7 @@ pub(crate) mod t6030 {
         host_block_zero_order: &[0, 0x1808, 0x3010],
         host_block_ready: false,
         deep_sleep: false,
+        cross_engine_hold: true,
     };
 
     const LAYOUT: FwLayout = FwLayout {
@@ -347,11 +351,13 @@ pub(crate) mod t6030 {
         segment_vas: &[UPPER, UPPER + 0x60000, UPPER + 0x18c000],
         text_size: 0x60000,
         data_size: 0x134000,
+        abi: super::FwAbi::V26B123G15S,
         initdata: &initdata::G15S_26B123,
         scratch: Scratch {
             register: HOST_BLOCK,
-            // The G15S scratch window has an unmapped page at +0x14000.
-            spans: &[(0, 0x14000), (0x18000, 0x8000)],
+            // The G15S scratch window leaves an unmapped guard page at VA +0x14000 while the
+            // physical host-register window stays contiguous across the split (+0x14000..+0x20000).
+            spans: &[(0, 0, 0x14000), (0x18000, 0x14000, 0xc000)],
             pointer: 0x12068,
         },
         // Offset on the PPL handoff page where the G15S 26B123 firmware records
@@ -434,6 +440,7 @@ pub(crate) struct Leaves {
 pub(crate) enum FwAbi {
     V25G83,
     V26B123,
+    V26B123G15S,
 }
 
 /// How the firmware's MMIO register table in loaded DATA is filled.
@@ -508,13 +515,14 @@ pub(crate) struct PplMagic {
 /// Firmware-visible alias of host registers, with the pointer InitData passes into it.
 pub(crate) struct Scratch {
     pub(crate) register: u64,
-    pub(crate) spans: &'static [(u64, u64)],
+    /// `(va_offset, pa_offset, bytes)` spans in ascending VA order.
+    pub(crate) spans: &'static [(u64, u64, u64)],
     pub(crate) pointer: u64,
 }
 
 const T8132_SCRATCH: Scratch = Scratch {
     register: HOST_BLOCK,
-    spans: &[(0, 0x8000)],
+    spans: &[(0, 0, 0x8000)],
     pointer: 0,
 };
 

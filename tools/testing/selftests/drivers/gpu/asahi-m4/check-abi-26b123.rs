@@ -301,6 +301,140 @@ fn queues(out: &std::path::Path) {
     std::fs::write(out.join("queue.bin"), all).unwrap();
 }
 
+fn g15s_26b123() {
+    let f = 0xfffffc2000000000u64;
+    let g = 0x1000000000u64;
+    // PB manager: G15S 26B123 shifts every field -4 bytes vs G16G.
+    let pb = fw::buffer::pb_manager_image_for(
+        FwAbi::V26B123G15S.pb_manager(),
+        3,
+        f + 0x400000,
+        g + 0x701a040000,
+        f + 0x500000,
+        f + 0x600000,
+        f + 0x700000,
+        512,
+    );
+    assert_eq!((r32(&pb, 0x08), r32(&pb, 0x0c)), (3, 3));
+    assert_eq!(r64(&pb, 0x1c), f + 0x400000);
+    assert_eq!(r64(&pb, 0x24), g + 0x701a040000);
+    assert_eq!(
+        (r32(&pb, 0x2c), r32(&pb, 0x30), r32(&pb, 0x34), r32(&pb, 0x38)),
+        (0x8000, 2048, 4096, 512)
+    );
+    assert_eq!((r64(&pb, 0x40), r64(&pb, 0x48)), (f + 0x500000, f + 0x600000));
+    assert_eq!((r32(&pb, 0x50), r32(&pb, 0x54)), (2047, 0x20000));
+    assert_eq!(r64(&pb, 0x60), f + 0x700000);
+    assert_eq!((r32(&pb, 0x78), r32(&pb, 0x7c)), (2048, 2048));
+
+    // QINFO: G15S 26B123 has 0x88 header with trailing u64 4 at +0x80.
+    let qi = fw::graph::queue_image_for(
+        FwAbi::V26B123G15S.qinfo(),
+        f + 0x100000, f + 0x200000, f + 0x400000, f + 0x300000, f + 0x500000,
+    );
+    assert_eq!(r64(&qi, 0x18), f + 0x300088);
+    assert_eq!(r64(&qi, 0x78), f + 0x500000);
+    assert_eq!(r64(&qi, 0x80), 4);
+
+    // 2-cluster G15S render geometry, 74-reg TA, 82-reg FS, and 0x340 FS microsequence.
+    let mut u = uapi::drm_asahi_cmd_render::default();
+    u.width_px = 640; u.height_px = 480; u.layers = 1; u.samples = 1;
+    u.utile_width_px = 32; u.utile_height_px = 32; u.sample_size_B = 4;
+    u.vdm_ctrl_stream_base = g + 0xa00000;
+    u.isp_merge_upper_x = 0x3b213cfb;
+    u.isp_merge_upper_y = 0x3ba13cfb;
+    let r = encode::RenderRefs {
+        notifier: f + 0x800000, qinfo: [f + 0xf00000, f + 0x1000000],
+        user_stamp: [f + 0x800620, f + 0x800630], fw_stamp: [f + 0x4000000, f + 0x4004000],
+        uma_mgr: [f + 0x300000, f + 0x300000], uma_aux: [f + 0x300100, f + 0x300200],
+        uma_gpu: g + 0x6000000, pb_mgr: f + 0x3000000, scene_list: g + 0x500000,
+        pb_init_blocks: 512, parameter_id: 6, generation: 254,
+        activity: [f + 0x900004, f + 0xa00008], counter: [4, 3], uma_submitted: 4,
+        uuid: 0x123401, usc_base: 1 << 40, ..Default::default()
+    };
+    let p = encode::PassRefs {
+        ta_work: f + 0xb00000, ta_work_gva: g + 0x7000000, fs_work: f + 0xc00000,
+        fs_work_gva: g + 0x8000000, ta_seq: f + 0xd00000, fs_seq: f + 0xe00000,
+        scene: f + 0x100000, tpc_gva: g + 0x200000, tpc_fw: f + 0x3200000,
+        tilemap_gva: g + 0x100000, heap_gva: g + 0x300000, scene_user_gva: g + 0x900000,
+        scratch_fw: f + 0x200000, pre_gva: [g + 0x600000, g + 0x700000, g + 0x800000],
+        aux_gva: g + 0xb00000, ..Default::default()
+    };
+    let geo1 = encode::Geometry::new(&u, p.heap_gva);
+    let geo2 = encode::Geometry::new_for(&u, p.heap_gva, 2, 15);
+    assert_eq!(geo2.tpc_bytes, 2 * geo1.tpc_bytes);
+    assert_eq!(geo2.native_tiles & 0xfffff, 0x36011);
+    let (mut tw, mut tq) = ([0xa5; ta::WORK_SIZE], [0xa5; ta::SEQ_SIZE]);
+    let (mut fw_, mut fq) = ([0xa5; fs::WORK_SIZE], [0xa5; fs::SEQ_SIZE]);
+    encode::encode_ta_for(
+        FwAbi::V26B123G15S.ta(), &r, &p, &u, &[0; 4], 7, 0x300, &geo2, None, &mut tw, &mut tq,
+    );
+    encode::encode_fs_for(
+        FwAbi::V26B123G15S.fs(), &r, &p, &u, &[0; 4], 7, 1 << 40, 1, 0x300, &geo2, &mut fw_,
+        &mut fq,
+    );
+    let att = [uapi::drm_asahi_attachment {
+        pointer: g + 0x50000000, size: 128, ..Default::default()
+    }];
+    encode::render_attachments_for(&mut fq[..], 1, FwAbi::V26B123G15S.fs().finalize, &att);
+    assert_eq!(u16::from_le_bytes(tw[0x748..0x74a].try_into().unwrap()), 74);
+    assert_eq!(r64(&tw, 0x760), p.tpc_gva);
+    assert_eq!(r32(&tw, ta::REGS + 52 * 12), 0x12099);
+    assert_eq!(r32(&tw, ta::REGS + 65 * 12), 0xa5a1);
+    assert_eq!(r64(&tw, ta::REGS + 65 * 12 + 4), 0x7f00400020);
+    assert_eq!(tq[ta::FINALIZE + 0x8d], 0);
+    assert_eq!(u16::from_le_bytes(fw_[0x788..0x78a].try_into().unwrap()), 82);
+    assert_eq!(r32(&fw_, 0x1c), 0x340);
+    assert_eq!(
+        (r32(&fw_, 0x48), r32(&fw_, 0x68), r32(&fw_, 0x6c)),
+        (0x88, u.isp_merge_upper_x, u.isp_merge_upper_y)
+    );
+    assert_eq!(r32(&fw_, fs::REGS + 61 * 12), 0x120a1);
+    assert_eq!(r32(&fw_, fs::REGS + 77 * 12), 0xa5a9);
+    assert_eq!(r64(&fw_, fs::REGS + 77 * 12 + 4), 0x9f00400020);
+    assert_eq!(r64(&fq, 0x34), p.scene + 0x4c);
+    assert_eq!((r32(&fq, 0x1e4), r32(&fq, 0x230), r32(&fq, 0x234)), (0x80000003, 1, 3));
+    assert_eq!(r32(&fq, 0x280), 8);
+    assert_eq!(fq[0x280 + 0xa4], 1);
+    assert_eq!(r64(&fq, 0x280 + 0xa5), p.fs_work + 0xc67);
+    assert_eq!((r32(&fq, 0x280 + 0xad), r32(&fq, 0x280 + 0xb4)), (0x71, 0x40000002));
+
+    // G15S 26B123 compute: 25 regs (+0x12091, no 0x10071), pre+0x1b80, 2-cluster context store.
+    let cr = encode::ComputeRefs {
+        notifier: f + 0x600400, qinfo: f + 0x200000, user_stamp: f + 0x600648,
+        fw_stamp: f + 0x600640, work: f + 0x100000, work_gva: g + 0x100000, seq: f + 0x100900,
+        preempt_gva: g + 0x200000, its: f + 0x500040, stats_fw: f + 0x300000,
+        auxiliary_fw: f + 0x400000, auxiliary_gva: g + 0x400000,
+        context_store_gva: g + 0x500000, counter_fw: f + 0x500000,
+        pool_state_gva: g + 0x600000, page_list_gva: g + 0x700000, usc_base: 1 << 40,
+        record_fw: f + 0x700000, binding_generation: 200, uma_slot: 3, command_id: 9,
+        compute_index: 8, work_818: 0, target_stamp: 0x900, submitted: 5, event: compute::EVENT,
+    };
+    let cc = uapi::drm_asahi_cmd_compute {
+        cdm_ctrl_stream_base: g + 0x300000, cdm_ctrl_stream_end: g + 0x300200,
+        ..Default::default()
+    };
+    let (mut cw, mut cq) = ([0xa5; compute::WORK_SIZE], [0xa5; compute::SEQ_SIZE]);
+    encode::encode_compute_for(
+        FwAbi::V26B123G15S.compute(), &cr, &cc, &[], &[0; 2], 1, 1, 1, &mut cw, &mut cq,
+    ).unwrap();
+    assert_eq!(u16::from_le_bytes(cw[0x728..0x72a].try_into().unwrap()), 25);
+    assert_eq!(r64(&cw, compute::REGS + 2 * 12 + 4), cr.preempt_gva + 0x1b80);
+    assert_eq!(r32(&cw, compute::REGS + 8 * 12), 0x12091);
+    assert_eq!(r32(&cw, compute::REGS + 9 * 12), 0x101d9);
+    assert_eq!(r32(&cw, compute::REGS + 24 * 12), 0xa351);
+    assert_eq!((r64(&cw, 0x873), r64(&cw, 0x87b)), (0x31cc000, 0x2308000));
+    assert_eq!(
+        (r64(&cq, 0x188), r64(&cq, 0x190), r64(&cq, 0x198), r64(&cq, 0x1a0)),
+        (
+            cr.context_store_gva,
+            cr.context_store_gva + 0x1e400,
+            cr.context_store_gva + 0x3c800,
+            cr.context_store_gva + 0x3d800,
+        )
+    );
+}
+
 fn catalog() {
     // Handoff selection and what a 26B123 start still needs.
     assert!(FW_25G83.matches(1, &[UPPER, UPPER + 0x60000], &[1, 0]));
@@ -451,5 +585,6 @@ fn main() {
     render(&out);
     compute_work(&out);
     queues(&out);
+    g15s_26b123();
     println!("26B123 layout catalog, InitData ({} / {} bytes), TA/FS/compute work and queue info encode; 25G83 entry points equal the 25G83 layouts", v25.len(), v26.len());
 }

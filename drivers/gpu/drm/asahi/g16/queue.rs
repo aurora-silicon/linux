@@ -179,6 +179,9 @@ pub(crate) struct Queue {
     timeline: Arc<Timeline>,
     /// Enabled GPU cores, which SCS memory is sized for.
     active_cores: u32,
+    /// Cluster count and GPU generation for stream admission.
+    num_clusters: u32,
+    gpu_generation: u32,
     /// Reserved render scratch pages per stage (`render_scs_layout`).
     render_scs: [u16; 2],
     // Last field: all preceding fields (especially scheduler) drop before capacity returns.
@@ -243,6 +246,8 @@ impl Queue {
             shared: gpu.shared.clone(),
             timeline,
             active_cores: gpu.id.core_masks.iter().map(|mask| mask.count_ones()).sum(),
+            num_clusters: gpu.cfg.num_clusters,
+            gpu_generation: gpu.cfg.gpu_generation,
             render_scs: [0; 2],
             _credit: credit,
         })
@@ -260,7 +265,16 @@ impl Queue {
         if sync_count > command::MAX_SYNCS {
             return Err(EINVAL);
         }
-        let parsed = command::parse_stream(bytes, params::early_tiling())?;
+        let parsed = if self.gpu_generation < 16 {
+            command::parse_stream_for(
+                bytes,
+                params::early_tiling(),
+                self.num_clusters,
+                self.gpu_generation,
+            )?
+        } else {
+            command::parse_stream(bytes, params::early_tiling())?
+        };
         if self.shared.crashed.load(Ordering::Acquire) {
             return Err(EIO);
         }
@@ -356,6 +370,9 @@ impl crate::queue::Queue for Queue {
     /// A render's UMA pool serves both stages of one render at a time, so their extra pages add
     /// up ([`super::rt::required_seeds`]).
     fn reserve_render_scs(&mut self, layouts: [u64; 2]) -> Result {
+        if self.gpu_generation < 16 {
+            return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
+        }
         if self.accepted != [0; 2] {
             return Err(EBUSY);
         }

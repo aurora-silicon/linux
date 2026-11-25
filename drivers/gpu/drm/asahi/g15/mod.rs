@@ -203,14 +203,12 @@ impl platform::Driver for Driver<'_> {
         try_pin_init!(Driver {
             _driver: {
                 let cfg = *info.ok_or(ENODEV)?;
-                if cfg.chip_id == 0x6030
-                    && pdev.as_ref().of_node().is_some_and(|node| {
-                        !matches!(
-                            node.get_opt_property::<u32>(c_str!("apple,g16-handoff-version")),
-                            Ok(None)
-                        )
-                    })
-                {
+                if pdev.as_ref().of_node().is_some_and(|node| {
+                    !matches!(
+                        node.get_opt_property::<u32>(c_str!("apple,g16-handoff-version")),
+                        Ok(None)
+                    )
+                }) {
                     return Err(ENODEV);
                 }
                 if !MODULE_READY.load(Ordering::Acquire) {

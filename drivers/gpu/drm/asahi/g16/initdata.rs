@@ -271,14 +271,14 @@ pub(crate) fn build(
         }
     }
     let scratch = &adt.layout.scratch;
-    let &(last, bytes) = scratch.spans.last().ok_or(EINVAL)?;
+    let &(last, _, bytes) = scratch.spans.last().ok_or(EINVAL)?;
     let at = objects.reserve_io(last + bytes)?;
     input.scratch = at + scratch.pointer;
     // The scratch alias uses firmware RAM attributes on these SGX registers.
-    for &(offset, bytes) in scratch.spans {
+    for &(va_offset, pa_offset, bytes) in scratch.spans {
         objects.map_mmio_class(
-            at + offset,
-            regs.sgx_pa() + scratch.register + offset,
+            at + va_offset,
+            regs.sgx_pa() + scratch.register + pa_offset,
             bytes,
             hw::pte::FW,
         )?;

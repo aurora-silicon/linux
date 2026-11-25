@@ -5,6 +5,19 @@
 
 use super::{compute, manager, pools, put16, put32, put64, put8, uapi};
 
+/// G15-only compute stage control register emitted immediately before [`REG_STAGE_CTRL`].
+const REG_G15_STAGE_CTRL: u32 = 0x12091;
+/// Shared compute stage control register.
+const REG_STAGE_CTRL: u32 = 0x101d9;
+/// HAL200 compute USC-base register (`0x10071`).
+const REG_HAL200_USC_BASE: u32 = 0x10071;
+/// Default compute stage hardware control word (`0x101d9` / G15 `0x12091`).
+const STAGE_CTRL_DEFAULT: u64 = 0x1c;
+/// Packed compute UMA page-table cache (PTC) policy word (`0xa599`): min=0x20, mid=0x40, max=0x132.
+const COMPUTE_UMA_PTC: u64 = 0x20 | (0x40 << 16) | (0x132 << 32);
+/// Packed compute DUPM resource-control word (`0xd411`): lo=1, hi=2.
+const DEFAULT_DUPM_CONTROL: u64 = 1 | (2 << 32);
+
 /// Stores the binding generation `v` as a little-endian integer of `bytes` (1 or 8) bytes.
 pub(super) fn put_generation(b: &mut [u8], off: usize, bytes: usize, v: u8) {
     if bytes == 1 {
@@ -114,9 +127,10 @@ impl ComputeRt {
     };
 }
 
-/// Register records of a compute work item at most: the 24 of [`compute::SEL`], 0x10071, the
-/// ray-query first and last records and the gated SCS driver word.
-const MAX_REGS: usize = compute::SEL.len() + 4;
+/// Register records of a compute work item at most: the 24 of [`compute::SEL`], optional G15
+/// `0x12091`, optional HAL200 `0x10071`, the ray-query first and last records and the gated SCS
+/// driver word.
+const MAX_REGS: usize = compute::SEL.len() + 5;
 
 const FW_START: u64 = 0xfffffc2000000000;
 const FW_END: u64 = 0xfffffc2ffc000000;
@@ -370,17 +384,18 @@ pub(crate) fn encode_compute_rt(
         }
     }
     let pre = r.preempt_gva;
+    let tail = layout.preempt_tail;
     let [i0, i1, i2, i3, i4, i5] = rt.intersection;
     let values = [
         pre,
         base,
-        pre + 0x1480,
-        pre + 0x1488,
-        pre + 0x1490,
-        pre + 0x1498,
+        pre + tail,
+        pre + tail + 8,
+        pre + tail + 0x10,
+        pre + tail + 0x18,
         0x154024201,
         0x10c08860,
-        0x1c,
+        STAGE_CTRL_DEFAULT,
         i0,
         i1,
         i2,
@@ -391,8 +406,8 @@ pub(crate) fn encode_compute_rt(
         rt.tail,
         rt.stack,
         rt.window,
-        0x13200400020,
-        0x200000001,
+        COMPUTE_UMA_PTC,
+        DEFAULT_DUPM_CONTROL,
         1,
         1,
         1,
@@ -409,13 +424,16 @@ pub(crate) fn encode_compute_rt(
         push(RAY_QUERY_FIRST.0, RAY_QUERY_FIRST.1);
     }
     for (&sel, &value) in compute::SEL.iter().zip(values.iter()) {
+        if sel == REG_STAGE_CTRL && layout.has_reg_12091 {
+            push(REG_G15_STAGE_CTRL, STAGE_CTRL_DEFAULT);
+        }
         push(sel, value);
         if sel == 0x1a0e9 && COMPUTE_SCS_DRIVER_WORD && rt.scs {
             push(0x1a141, rt.driver);
         }
     }
-    if r.usc_base != 0 {
-        push(0x10071, r.usc_base);
+    if layout.has_usc_base_reg && r.usc_base != 0 {
+        push(REG_HAL200_USC_BASE, r.usc_base);
     }
     if rt.scs {
         push(RAY_QUERY_LAST.0, RAY_QUERY_LAST.1);
@@ -458,8 +476,8 @@ pub(crate) fn encode_compute_rt(
     put64(w, 0x84c, ts_va[1]);
     put64(w, 0x86a, r.work + compute::DESCRIPTOR as u64);
     put8(w, 0x872, 1);
-    put64(w, 0x873, 0x1588000);
-    put64(w, 0x87b, 0xef8000);
+    put64(w, 0x873, layout.pool_words[0]);
+    put64(w, 0x87b, layout.pool_words[1]);
     put64(w, 0x883, r.auxiliary_fw);
     put_generation(
         w,
@@ -491,10 +509,10 @@ pub(crate) fn encode_compute_rt(
     put32(q, 0x158, att.len() as u32);
     put64(q, 0x160, r.work + compute::DESCRIPTOR as u64);
     put64(q, 0x178, r.auxiliary_gva);
-    put64(q, 0x188, r.context_store_gva);
-    put64(q, 0x190, r.context_store_gva + 0xf400);
-    put64(q, 0x198, r.context_store_gva + 0x1e800);
-    put64(q, 0x1a0, r.context_store_gva + 0x1f000);
+    put64(q, 0x188, r.context_store_gva + layout.context_store_offsets[0]);
+    put64(q, 0x190, r.context_store_gva + layout.context_store_offsets[1]);
+    put64(q, 0x198, r.context_store_gva + layout.context_store_offsets[2]);
+    put64(q, 0x1a0, r.context_store_gva + layout.context_store_offsets[3]);
     put64(q, 0x1a8, r.work + layout.target as u64);
     put32(q, 0x1b8, r.event);
     let requested = ts_va[0] != 0 || ts_va[1] != 0;
