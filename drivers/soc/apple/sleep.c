@@ -7732,14 +7732,16 @@ static void apple_sleep_put_node(void *np)
  * order. Bits 7:0 of kind: write the value, read, set the value's bits, clear them, write back
  * what is read, wait for the value's bits to be set, wait for them to be clear, a 16-bit write;
  * then for 64-bit registers, read and written whole: a write of the value as the high word
- * with the low word 0, and a clear of the value's bits in the low word. Bits 31:16: a wait's
- * timeout in ms (0: 10 ms); bit 8: its timeout is not an error. What a block number names is
- * the profile's own.
+ * with the low word 0, a clear of the value's bits in the low word, a set of them, a read;
+ * then a write of what sleep_seq_save() read from the register, 32-bit and 64-bit, whose value
+ * is unused. Bits 31:16: a wait's timeout in ms (0: 10 ms); bit 8: its timeout, or a restore
+ * with nothing saved, is not an error. What a block number names is the profile's own.
  */
 enum {
 	SLEEP_OP_WRITE, SLEEP_OP_READ, SLEEP_OP_SET, SLEEP_OP_CLEAR, SLEEP_OP_REWRITE,
 	SLEEP_OP_WAIT_SET, SLEEP_OP_WAIT_CLEAR, SLEEP_OP_WRITE16, SLEEP_OP_WRITE64_HI,
-	SLEEP_OP_CLEAR64, SLEEP_OP_KINDS,
+	SLEEP_OP_CLEAR64, SLEEP_OP_SET64, SLEEP_OP_READ64, SLEEP_OP_RESTORE, SLEEP_OP_RESTORE64,
+	SLEEP_OP_KINDS,
 };
 
 #define SLEEP_OP_KIND		GENMASK(7, 0)
@@ -7749,6 +7751,9 @@ enum {
 struct sleep_seq {
 	const u32 *op;
 	unsigned int n;
+	/* What sleep_seq_save() read for each restore op, by op; NULL without restore ops */
+	u64 *saved;
+	bool have_saved;
 };
 
 /* The bytes an op of @kind accesses, or 0 for a kind there is none of */
@@ -7758,9 +7763,10 @@ static unsigned int sleep_op_width(u32 kind)
 	case SLEEP_OP_WRITE16:
 		return 2;
 	case SLEEP_OP_WRITE ... SLEEP_OP_WAIT_CLEAR:
+	case SLEEP_OP_RESTORE:
 		return 4;
-	case SLEEP_OP_WRITE64_HI:
-	case SLEEP_OP_CLEAR64:
+	case SLEEP_OP_WRITE64_HI ... SLEEP_OP_READ64:
+	case SLEEP_OP_RESTORE64:
 		return 8;
 	default:
 		return 0;
@@ -7775,6 +7781,13 @@ static bool sleep_op_fits(const u32 *op, u32 size)
 	return width && size >= width && op[2] <= size - width && !(op[2] % width);
 }
 
+static bool sleep_op_restores(const u32 *op)
+{
+	u32 kind = FIELD_GET(SLEEP_OP_KIND, op[0]);
+
+	return kind == SLEEP_OP_RESTORE || kind == SLEEP_OP_RESTORE64;
+}
+
 /*
  * The DT property @name as a sequence. @block_size gives the size of block @b, mapping it if
  * needed, or 0 where the profile has no such block. 0 with an empty sequence without the
@@ -7786,9 +7799,12 @@ static int sleep_seq_get(struct apple_sleep *s, const char *name, struct sleep_s
 {
 	int len = of_property_count_u32_elems(s->dev->of_node, name);
 	unsigned int i;
+	bool restores = false;
 	u32 *op;
 
 	seq->n = 0;
+	seq->saved = NULL;
+	seq->have_saved = false;
 	if (len <= 0)
 		return 0;
 	if (len % 4)
@@ -7808,13 +7824,39 @@ static int sleep_seq_get(struct apple_sleep *s, const char *name, struct sleep_s
 			devm_kfree(s->dev, op);
 			return -ERANGE;
 		}
+		restores |= sleep_op_restores(&op[i]);
+	}
+	if (restores) {
+		seq->saved = devm_kcalloc(s->dev, len / 4, sizeof(*seq->saved), GFP_KERNEL);
+		if (!seq->saved)
+			return -ENOMEM;
 	}
 	seq->op = op;
 	seq->n = len / 4;
 	return 0;
 }
 
-/* @seq on the blocks @blk names: the number of waits that timed out, other than optional ones */
+/* Each restore op's register of @seq read now, for sleep_seq_run() to write back */
+static void sleep_seq_save(void __iomem *const *blk, struct sleep_seq *seq)
+{
+	unsigned int i;
+
+	for (i = 0; i < seq->n; i++) {
+		const u32 *op = &seq->op[4 * i];
+		void __iomem *reg = blk[op[1]] + op[2];
+
+		if (FIELD_GET(SLEEP_OP_KIND, op[0]) == SLEEP_OP_RESTORE)
+			seq->saved[i] = readl(reg);
+		else if (FIELD_GET(SLEEP_OP_KIND, op[0]) == SLEEP_OP_RESTORE64)
+			seq->saved[i] = readq(reg);
+	}
+	seq->have_saved = true;
+}
+
+/*
+ * @seq on the blocks @blk names: the number of waits that timed out and restores with nothing
+ * saved, which write nothing, other than optional ones
+ */
 static unsigned int sleep_seq_run(void __iomem *const *blk, const struct sleep_seq *seq)
 {
 	unsigned int i, timeouts = 0;
@@ -7856,6 +7898,24 @@ static unsigned int sleep_seq_run(void __iomem *const *blk, const struct sleep_s
 			break;
 		case SLEEP_OP_CLEAR64:
 			writeq(readq(reg) & ~(u64)op[3], reg);
+			break;
+		case SLEEP_OP_SET64:
+			writeq(readq(reg) | op[3], reg);
+			break;
+		case SLEEP_OP_READ64:
+			readq(reg);
+			break;
+		case SLEEP_OP_RESTORE:
+			if (seq->have_saved)
+				writel(seq->saved[i], reg);
+			else
+				ret = -ENODATA;
+			break;
+		case SLEEP_OP_RESTORE64:
+			if (seq->have_saved)
+				writeq(seq->saved[i], reg);
+			else
+				ret = -ENODATA;
 			break;
 		}
 		if (ret && !(op[0] & SLEEP_OP_OPTIONAL))

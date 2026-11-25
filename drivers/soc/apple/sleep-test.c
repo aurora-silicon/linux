@@ -533,6 +533,12 @@ static void apple_sleep_test_seq_fits(struct kunit *test)
 		{ { SLEEP_OP_CLEAR64, 0, 0xffc, 1 }, 0x1000, false },
 		{ { SLEEP_OP_CLEAR64, 0, 0x4, 1 }, 0x1000, false },
 		{ { SLEEP_OP_CLEAR64, 0, 0xfffffff8, 1 }, 0x1000, false },
+		{ { SLEEP_OP_SET64, 0, 0xffc, 1 }, 0x1000, false },
+		{ { SLEEP_OP_READ64, 0, 0xff8, 0 }, 0x1000, true },
+		{ { SLEEP_OP_RESTORE64, 0, 0x4, 0 }, 0x1000, false },
+		/* A 32-bit restore */
+		{ { SLEEP_OP_RESTORE, 0, 0xffc, 0 }, 0x1000, true },
+		{ { SLEEP_OP_RESTORE, 0, 0x1000, 0 }, 0x1000, false },
 		/* No such kind */
 		{ { SLEEP_OP_KINDS, 0, 0x0, 0 }, 0x1000, false },
 		{ { 0xff, 0, 0x0, 0 }, 0x1000, false },
@@ -572,9 +578,48 @@ static void apple_sleep_test_seq_run64(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, regs[2], 0xffffffff00000002ULL);
 }
 
+/*
+ * The 64-bit set keeps the rest of its register. A restore writes back what sleep_seq_save()
+ * read, whatever the register holds by then, a 32-bit one only its low word; with nothing
+ * saved it writes nothing and counts as failed.
+ */
+static void apple_sleep_test_seq_restore(struct kunit *test)
+{
+	static const u32 ops[] = {
+		SLEEP_OP_RESTORE64, 0, 0x0, 0,
+		SLEEP_OP_RESTORE, 0, 0x8, 0,
+		SLEEP_OP_READ64, 0, 0x10, 0,
+		SLEEP_OP_SET64, 0, 0x10, 0x4,
+	};
+	u64 *regs = kunit_kzalloc(test, 3 * sizeof(*regs), GFP_KERNEL);
+	u64 *saved = kunit_kcalloc(test, ARRAY_SIZE(ops) / 4, sizeof(*saved), GFP_KERNEL);
+	struct sleep_seq seq = { .op = ops, .n = ARRAY_SIZE(ops) / 4, .saved = saved };
+	void __iomem *blk[1];
+
+	KUNIT_ASSERT_NOT_NULL(test, regs);
+	KUNIT_ASSERT_NOT_NULL(test, saved);
+	blk[0] = (void __force __iomem *)regs;
+	regs[0] = 0x1122334455667788ULL;
+	regs[1] = 0xaaaaaaaabbbbbbbbULL;
+	regs[2] = 0xffffffff00000001ULL;
+	KUNIT_EXPECT_EQ(test, sleep_seq_run(blk, &seq), 2);
+	KUNIT_EXPECT_EQ(test, regs[0], 0x1122334455667788ULL);
+	KUNIT_EXPECT_EQ(test, regs[1], 0xaaaaaaaabbbbbbbbULL);
+	KUNIT_EXPECT_EQ(test, regs[2], 0xffffffff00000005ULL);
+
+	sleep_seq_save(blk, &seq);
+	regs[0] = 0;
+	regs[1] = 0;
+	KUNIT_EXPECT_EQ(test, sleep_seq_run(blk, &seq), 0);
+	KUNIT_EXPECT_EQ(test, regs[0], 0x1122334455667788ULL);
+	KUNIT_EXPECT_EQ(test, regs[1], 0x00000000bbbbbbbbULL);
+	KUNIT_EXPECT_EQ(test, regs[2], 0xffffffff00000005ULL);
+}
+
 static struct kunit_case apple_sleep_test_cases[] = {
 	KUNIT_CASE(apple_sleep_test_seq_fits),
 	KUNIT_CASE(apple_sleep_test_seq_run64),
+	KUNIT_CASE(apple_sleep_test_seq_restore),
 	KUNIT_CASE(apple_sleep_test_layout),
 	KUNIT_CASE(apple_sleep_test_t6050),
 	KUNIT_CASE(apple_sleep_test_j716c_inventory),

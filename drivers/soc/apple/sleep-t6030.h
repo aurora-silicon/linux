@@ -14,9 +14,10 @@
  *    apple,seq-notice (the votes again);
  *  - the PMP's stop, then .commit_notice: the PMP's and its SRAM's power words, then the
  *    SMC's slpa and AP idle;
- *  - .commit_regs, the other cores stopped: the storage PHY's power word, then the DT's
- *    apple,seq-commit (WD0 off, the AMCCs' ways and planes, the DCS, the GPU's PMGR, the
- *    CPU power gates, the perf word, AFR, the cluster words, SIO, the clock muxes and CLLT);
+ *  - .commit_regs, the other cores stopped: the storage PHY's power word, a read of each word
+ *    the wake writes back, then the DT's apple,seq-commit (WD0 off, the AMCCs' ways and
+ *    planes, the DCS, the GPU's PMGR, the CPU power gates, the perf word, AFR, the cluster
+ *    words, SIO, the clock muxes and CLLT);
  *  - .pre_commit: no sooner after the SMC's idle than the policy's spacing. The core then
  *    writes the commit word.
  *
@@ -31,8 +32,11 @@
  * stop unless apple_sleep.untested_commit=1. With the SMC policy macsmc sends nothing past
  * its warning, pmVC and wake type before that point: no slpa on a dry run.
  *
- * The wake writes the cluster words, then every power word back as Linux had it before the entry,
- * in the order macOS 27.2's wake writes them on J516s (aura's wake record), then the notify masks.
+ * The wake is macOS 27.2's on J516s, as aura's wake record has it: the cluster words, the DT's
+ * apple,seq-wake-early (CPU power gates), every power word back as Linux had it before the
+ * entry, in the order macOS writes them, the DT's apple,seq-wake (the other CPU power gates,
+ * then the AMCCs' ways and planes and the DCS back, the reverse of the commit's, with their
+ * words as read at the entry), then the notify masks.
  */
 
 /* Power words in "ps", from the J516s ADT's pmgr devices */
@@ -86,7 +90,7 @@ static const u32 t6030_auto_off[] = { T6030_PS_SIO, T6030_PS_SIO_CPU };
 struct t6030_sleep {
 	void __iomem *blk[T6030_BLOCKS];
 	u32 blk_size[T6030_BLOCKS];
-	struct sleep_seq prepare, notice, commit;
+	struct sleep_seq prepare, notice, commit, wake_early, wake;
 	u32 notify_saved[2];
 	bool notify_staged;
 	u32 lowered_saved[ARRAY_SIZE(t6030_lowered)];
@@ -120,7 +124,7 @@ static u32 t6030_block(struct apple_sleep *s, u32 b)
 	return t->blk_size[b];
 }
 
-/* All three, each whole: one missing, empty or with an entry that doesn't fit fails the probe */
+/* All of them, each whole: one missing, empty or with an entry that doesn't fit fails the probe */
 static int t6030_sleep_seq_get(struct apple_sleep *s, const char *name, struct sleep_seq *seq)
 {
 	int ret = sleep_seq_get(s, name, seq, t6030_block);
@@ -192,7 +196,9 @@ static int t6030_sleep_map_regs(struct apple_sleep *s)
 
 	ret = t6030_sleep_seq_get(s, "apple,seq-prepare", &t->prepare) ?:
 	      t6030_sleep_seq_get(s, "apple,seq-notice", &t->notice) ?:
-	      t6030_sleep_seq_get(s, "apple,seq-commit", &t->commit);
+	      t6030_sleep_seq_get(s, "apple,seq-commit", &t->commit) ?:
+	      t6030_sleep_seq_get(s, "apple,seq-wake-early", &t->wake_early) ?:
+	      t6030_sleep_seq_get(s, "apple,seq-wake", &t->wake);
 	if (ret)
 		return ret;
 
@@ -334,7 +340,10 @@ static int t6030_sleep_commit_notice(struct apple_sleep *s)
 	return 0;
 }
 
-/* The other cores stopped: the storage PHY's word, then the DT's sequence to the commit word */
+/*
+ * The other cores stopped: the storage PHY's word, then what the wake sequences write back,
+ * read before the DT's sequence to the commit word changes any of it
+ */
 static void t6030_sleep_commit_regs(struct apple_sleep *s)
 {
 	struct t6030_sleep *t = t6030_state(s);
@@ -348,6 +357,8 @@ static void t6030_sleep_commit_regs(struct apple_sleep *s)
 	for (i = 0; i < ARRAY_SIZE(t6030_auto_off); i++)
 		t->auto_saved[i] = readl(s->ps + t6030_auto_off[i]);
 	t->auto_staged = true;
+	sleep_seq_save(t->blk, &t->wake_early);
+	sleep_seq_save(t->blk, &t->wake);
 	if (sleep_seq_run(t->blk, &t->commit))
 		t6030_sleep_failed("apple,seq-commit");
 	/* Every listed word as the commit leaves it, for the wake's report */
@@ -374,10 +385,22 @@ static void t6030_sleep_unstage(struct apple_sleep *s, u32 offset, u32 before)
 		s->ps_commit[i] = before;
 }
 
+/* A wake sequence, once, with what .commit_regs read for it */
+static void t6030_sleep_wake_run(struct apple_sleep *s, struct sleep_seq *seq, const char *name)
+{
+	struct t6030_sleep *t = t6030_state(s);
+	unsigned int failed = sleep_seq_run(t->blk, seq);
+
+	seq->have_saved = false;
+	if (failed)
+		dev_err(s->dev, "%s: %u entries failed\n", name, failed);
+}
+
 /*
- * Back on the boot core, in macOS's order: the cluster words, then every power word as Linux had
- * it, macOS's wake order first (sleep_ps_rewake()), the words the entry lowered or took
- * AUTO_ENABLE from as they were before it, then the notify masks.
+ * Back on the boot core, in macOS's order: the cluster words, the CPU power gates, then every
+ * power word as Linux had it, macOS's wake order first (sleep_ps_rewake()), the words the entry
+ * lowered or took AUTO_ENABLE from as they were before it, then the memory side, then the
+ * notify masks.
  */
 static void t6030_sleep_wake(struct apple_sleep *s)
 {
@@ -386,6 +409,7 @@ static void t6030_sleep_wake(struct apple_sleep *s)
 
 	writel(CLUSTER_ON, s->cluster + T6030_CLUSTER_E);
 	writel(CLUSTER_ON, s->cluster + T6030_CLUSTER_P);
+	t6030_sleep_wake_run(s, &t->wake_early, "apple,seq-wake-early");
 	/* SIO_CPU is in both lists: its value before the lowering is the one before the entry */
 	if (t->auto_staged)
 		for (i = 0; i < ARRAY_SIZE(t6030_auto_off); i++)
@@ -395,6 +419,7 @@ static void t6030_sleep_wake(struct apple_sleep *s)
 	t->auto_staged = false;
 	t->nlowered = 0;
 	sleep_ps_rewake(s);
+	t6030_sleep_wake_run(s, &t->wake, "apple,seq-wake");
 	t6030_sleep_undo_regs(s);
 }
 
