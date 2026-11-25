@@ -291,7 +291,7 @@ bool spin_table_cpu_tracked_off(unsigned int cpu)
 	return cpumask_test_cpu(cpu, &spin_table_cpus_off);
 }
 
-static bool spin_table_pen_deep_armed, spin_table_pen_el1_on;
+static bool spin_table_pen_deep_armed, spin_table_pen_el1_on, spin_table_pen_ovrd_on;
 
 void spin_table_pen_deep_arm(bool on)
 {
@@ -302,6 +302,12 @@ void spin_table_pen_deep_arm(bool on)
 void spin_table_pen_deep_el1(bool on)
 {
 	spin_table_pen_el1_on = on;
+}
+
+/* The pen's last WFI also sets the A7-M3 power-down controls (CYC_OVRD, ACC_OVRD) */
+void spin_table_pen_deep_ovrd(bool on)
+{
+	spin_table_pen_ovrd_on = on;
 }
 
 static void spin_table_pen_deep_set(unsigned long on)
@@ -317,7 +323,8 @@ void spin_table_release_stopped(void)
 {
 	WRITE_ONCE(spin_table_stop_released, true);
 	if (spin_table_pen_deep_armed)
-		spin_table_pen_deep_set(spin_table_pen_el1_on ? 2 : 1);
+		spin_table_pen_deep_set((spin_table_pen_el1_on ? 2 : 1) |
+					(spin_table_pen_ovrd_on ? 4 : 0));
 	dsb(ish);
 	sev();
 }

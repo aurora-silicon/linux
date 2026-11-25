@@ -425,10 +425,27 @@ pen:	ldr	x4, [x3]
 	orr	x4, x4, #0x8000000000000000
 	msr_s	sys_reg(3, 5, 15, 6, 2), x4
 	/*
+	 * Bit 2: a core whose CYC_OVRD isn't locked (A7 to M3), which aura leaves in WFI mode 2
+	 * with retention: ACC_OVRD's deep-sleep settings, then WFI mode 3 without retention.
+	 */
+	tbz	x5, #2, 3f
+	mrs_s	x4, sys_reg(3, 5, 15, 6, 0)
+	and	x4, x4, #~(3 << 15)
+	mov_q	x7, (3 << 13) | (2 << 15) | (3 << 17) | (3 << 25) | (1 << 32) | (1 << 34)
+	orr	x4, x4, x7
+	msr_s	sys_reg(3, 5, 15, 6, 0), x4
+	mrs_s	x4, sys_reg(3, 5, 15, 5, 0)
+	and	x4, x4, #~(3 << 24)
+	orr	x4, x4, #(3 << 24)
+	orr	x4, x4, #1
+	msr_s	sys_reg(3, 5, 15, 5, 0), x4
+	isb
+	/*
 	 * 2 = the sleep driver asked for the last WFI at EL1 (apple_sleep.el1_wfi=2): from EL2,
 	 * MMU off (as here), every exception masked, no traps, stage 2 off, fast IPIs acked.
 	 */
-	cmp	x5, #2
+3:	and	x7, x5, #3
+	cmp	x7, #2
 	b.ne	2f
 	mrs	x4, CurrentEL
 	cmp	x4, #CurrentEL_EL2

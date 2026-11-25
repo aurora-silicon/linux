@@ -8757,8 +8757,10 @@ static int apple_sleep_probe(struct platform_device *pdev)
 				       &sleep_cpu_power_ops);
 	if (ret)
 		return dev_err_probe(dev, ret, "cannot control CPU power\n");
-	if (s->soc->pen_deep)
+	if (s->soc->pen_deep) {
 		spin_table_pen_deep_arm(true);
+		spin_table_pen_deep_ovrd(s->soc->ops->deep_wfi_arm == t6030_deep_wfi_arm);
+	}
 
 	/* Last: the exported helpers take it as a probed driver, and a failure frees s. */
 	apple_sleep = s;

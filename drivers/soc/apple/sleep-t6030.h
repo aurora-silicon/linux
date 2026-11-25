@@ -941,9 +941,36 @@ static void t6030_sleep_wake(struct apple_sleep *s)
 	sleep_note(s, 0x75);
 }
 
+/*
+ * The cores' power-down controls, A7 to M3 (aura's cpu_regs.h; XNU's arm64_prepare_for_sleep
+ * on its "global sleep" cores). CYC_OVRD is not locked before M4, and aura's init_cpu() leaves
+ * each core's WFI in mode 2 with retention: a WFI that never powers the core down, so its
+ * cluster never goes off and the sleep sequencer waits. The deep sleep wants mode 3 without
+ * retention, and ACC_OVRD's deep-sleep settings.
+ */
+#define T6030_CYC_OVRD			sys_reg(3, 5, 15, 5, 0)
+#define T6030_CYC_OVRD_WFI_MODE		GENMASK_ULL(25, 24)
+#define T6030_CYC_OVRD_DISABLE_WFI_RET	BIT_ULL(0)
+#define T6030_ACC_OVRD			sys_reg(3, 5, 15, 6, 0)
+#define T6030_ACC_OVRD_PWR_DN_SRM	GENMASK_ULL(14, 13)
+#define T6030_ACC_OVRD_DIS_L2_FLUSH	GENMASK_ULL(16, 15)
+#define T6030_ACC_OVRD_TRAIN_DOWN_LINK	GENMASK_ULL(18, 17)
+#define T6030_ACC_OVRD_POWER_DOWN_CPM	GENMASK_ULL(26, 25)
+#define T6030_ACC_OVRD_NO_PIO_ON_WFI	BIT_ULL(32)
+#define T6030_ACC_OVRD_DEEP_SLEEP	BIT_ULL(34)
+
 static void t6030_deep_wfi_arm(void)
 {
+	/* As aura's cpu_sleep(true): only the L2 flush field is cleared first, the rest ORed in */
+	sysreg_clear_set_s(T6030_ACC_OVRD, T6030_ACC_OVRD_DIS_L2_FLUSH,
+			   T6030_ACC_OVRD_PWR_DN_SRM |
+			   FIELD_PREP(T6030_ACC_OVRD_DIS_L2_FLUSH, 2) |
+			   T6030_ACC_OVRD_TRAIN_DOWN_LINK | T6030_ACC_OVRD_POWER_DOWN_CPM |
+			   T6030_ACC_OVRD_NO_PIO_ON_WFI | T6030_ACC_OVRD_DEEP_SLEEP);
+	sysreg_clear_set_s(T6030_CYC_OVRD, T6030_CYC_OVRD_WFI_MODE,
+			   FIELD_PREP(T6030_CYC_OVRD_WFI_MODE, 3) | T6030_CYC_OVRD_DISABLE_WFI_RET);
 	sysreg_clear_set_s(SYS_APL_DEEP_SLEEP, 0, DEEP_SLEEP_ENABLE);
+	isb();
 }
 
 /* Every power word in "ps" that the J516s ADT's pmgr devices name */
@@ -1040,6 +1067,11 @@ static const struct apple_sleep_soc t6030_sleep_soc = {
 	.own_wake = true,
 	/* Each core takes its deep WFI from its stop bit, before the commit, as on macOS */
 	.early_cpu_wfi = true,
+	/*
+	 * A core the sequencer restarts after the commit takes it again in the pen, with the
+	 * A7-M3 power-down controls (aura's reset path puts CYC_OVRD back in retention)
+	 */
+	.pen_deep = true,
 	/* No write to WD2's registers in any of macOS's entries */
 	.no_wd2 = true,
 	/* pcie0 (Wi-Fi, the card reader) holds APCIE_SYS_GP; ANS is on APCIE_SYS_ST */
