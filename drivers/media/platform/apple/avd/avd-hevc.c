@@ -1230,14 +1230,11 @@ avd_hevc_validate_sps_fmt(struct avd_ctx *ctx,
 	if (sps->bit_depth_luma_minus8 != 0 && sps->bit_depth_luma_minus8 != 2)
 		/* Only 8 and 10 bit have capture formats */
 		return -EINVAL;
-	if (sps->chroma_format_idc == 2 && sps->bit_depth_luma_minus8 == 2)
-		/* 4:2:2 10 bit would need P210, which is not offered */
-		return -EINVAL;
 	if (sps->chroma_format_idc > 2)
 		/*
 		 * 4:4:4 has no capture format, and its frames are never
 		 * completed: each times out and resets the whole decoder.
-		 * 4:0:0, 4:2:0 and 4:2:2 at 8 bits decode.
+		 * The capture formats cover 4:0:0, 4:2:0 and 4:2:2.
 		 */
 		return -EINVAL;
 

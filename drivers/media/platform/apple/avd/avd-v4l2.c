@@ -301,8 +301,7 @@ static const struct avd_decoded_fmt_desc avd_hevc_decoded_fmts[] = {
 		.image_fmt = AVD_IMG_FMT_422_8BIT,
 	},
 	{
-		/* TODO: missing P210 */
-		.fourcc = V4L2_PIX_FMT_P010,
+		.fourcc = V4L2_PIX_FMT_P210,
 		.image_fmt = AVD_IMG_FMT_422_10BIT,
 	},
 };
@@ -376,8 +375,7 @@ static const struct avd_decoded_fmt_desc avd_h264_decoded_fmts[] = {
 		.image_fmt = AVD_IMG_FMT_422_8BIT,
 	},
 	{
-		/* TODO: missing P210 */
-		.fourcc = V4L2_PIX_FMT_P010,
+		.fourcc = V4L2_PIX_FMT_P210,
 		.image_fmt = AVD_IMG_FMT_422_10BIT,
 	},
 };

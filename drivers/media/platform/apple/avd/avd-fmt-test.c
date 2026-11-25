@@ -14,6 +14,7 @@ static const struct avd_decoded_fmt_desc avd_fmt_test_decoded[] = {
 	{ .fourcc = V4L2_PIX_FMT_NV12, .image_fmt = AVD_IMG_FMT_420_8BIT },
 	{ .fourcc = V4L2_PIX_FMT_P010, .image_fmt = AVD_IMG_FMT_420_10BIT },
 	{ .fourcc = V4L2_PIX_FMT_NV16, .image_fmt = AVD_IMG_FMT_422_8BIT },
+	{ .fourcc = V4L2_PIX_FMT_P210, .image_fmt = AVD_IMG_FMT_422_10BIT },
 };
 
 static const struct avd_coded_fmt_desc avd_fmt_test_desc = {
@@ -99,6 +100,21 @@ static void avd_fmt_422_test(struct kunit *test)
 			-EINVAL);
 }
 
+static void avd_fmt_p210_test(struct kunit *test)
+{
+	struct avd_ctx *ctx = avd_fmt_test_ctx(test, AVD_IMG_FMT_422_10BIT,
+					       V4L2_PIX_FMT_P210);
+	struct v4l2_pix_format_mplane *pix = &ctx->decoded_fmt.fmt.pix_mp;
+
+	KUNIT_ASSERT_EQ(test, v4l2_fill_pixfmt_mp(pix, V4L2_PIX_FMT_P210, 64, 64), 0);
+	KUNIT_EXPECT_EQ(test, pix->num_planes, 1);
+	KUNIT_EXPECT_EQ(test, pix->plane_fmt[0].bytesperline, 128);
+	KUNIT_EXPECT_EQ(test, pix->plane_fmt[0].sizeimage, 16384);
+	KUNIT_EXPECT_EQ(test, avd_check_run_image_fmt(ctx, AVD_IMG_FMT_422_10BIT), 0);
+	pix->pixelformat = V4L2_PIX_FMT_P010;
+	KUNIT_EXPECT_EQ(test, avd_check_run_image_fmt(ctx, AVD_IMG_FMT_422_10BIT), -EINVAL);
+}
+
 /* Compressed storage laid out for another size does not fit either. */
 static void avd_fmt_comp_mismatch_test(struct kunit *test)
 {
@@ -137,6 +153,7 @@ static struct kunit_case avd_fmt_test_cases[] = {
 	KUNIT_CASE(avd_fmt_any_p010_test),
 	KUNIT_CASE(avd_fmt_10bit_test),
 	KUNIT_CASE(avd_fmt_422_test),
+	KUNIT_CASE(avd_fmt_p210_test),
 	KUNIT_CASE(avd_fmt_comp_mismatch_test),
 	KUNIT_CASE(avd_fmt_scratch_depth_test),
 	{}
