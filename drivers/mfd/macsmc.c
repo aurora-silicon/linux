@@ -1733,6 +1733,16 @@ static int apple_smc_prepare_policy(struct apple_smc *smc)
 	if (ret)
 		return ret;
 	smc->sleep_pmvc_at = __arch_counter_get_cntpct();
+	/*
+	 * apple,sleep-wake-type: WKTP to its sleep value right after pmVC, as macOS 27.2 does on
+	 * T6030. The wake, or a refusal, puts it back (apple_smc_wake_full()).
+	 */
+	if (smc->sleep_wake_type) {
+		smc->wake_silent = true;
+		ret = apple_smc_write_u8(smc, SMC_KEY(WKTP), SMC_WKTP_SLEEP);
+		if (ret)
+			return ret;
+	}
 	return apple_sleep_smc_register_saved(smc->dev, &apple_smc_saved_ops, smc);
 }
 
