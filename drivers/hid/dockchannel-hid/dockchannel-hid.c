@@ -215,6 +215,8 @@ struct dockchannel_hid {
 	bool suspended;
 	/* The firmware was told of a sleep and has not been told of the wake */
 	bool host_asleep;
+	/* Its HID drivers stay suspended until a wake's AP on notice is answered. */
+	bool wake_pending;
 
 	/* Held from probe on when the multi-touch interface uses power method 2 */
 	struct gpio_desc *afe_reset;
@@ -1028,6 +1030,9 @@ static int dchid_raw_request(struct hid_device *hdev,
 
 	if (READ_ONCE(iface->dchid->stopping))
 		return -ESHUTDOWN;
+	/* Its firmware is gone for good: nothing more is sent. */
+	if (apple_rtkit_helper_session_lost(iface->dchid->helper_link->supplier))
+		return -EHOSTDOWN;
 	/* Fail fast: an answer that arrives in suspend-to-idle is not waited for. */
 	if (READ_ONCE(iface->dchid->suspended))
 		return -EBUSY;
@@ -1990,6 +1995,12 @@ static int dockchannel_hid_suspend(struct device *dev)
 	struct dockchannel_hid *dchid = dev_get_drvdata(dev);
 	int i, ret;
 
+	/* Suspended since a wake whose AP on wasn't answered, and the host still asleep to it. */
+	if (dchid->wake_pending) {
+		WRITE_ONCE(dchid->suspended, true);
+		return 0;
+	}
+
 	/* HID drivers may still need the transport while preparing for sleep. */
 	for (i = 0; i < MAX_INTERFACES; i++) {
 		struct dchid_iface *iface = dchid->ifaces[i];
@@ -2025,14 +2036,36 @@ unwind:
 static int dockchannel_hid_resume(struct device *dev)
 {
 	struct dockchannel_hid *dchid = dev_get_drvdata(dev);
+	struct device *helper = dchid->helper_link->supplier;
 	int i, ret = 0;
 
-	if (dchid->host_asleep) {
-		dchid->host_asleep = false;
-		ret = dchid_host_state(dchid, HOST_STATE_AWAKE);
-		if (ret)
-			dev_warn(dev, "host state not restored: %d\n", ret);
-		ret = 0;
+	if (dchid->host_asleep || dchid->wake_pending) {
+		/*
+		 * AP on goes first, as in macOS, also when a refused sleep skipped the helper's
+		 * own .resume. Until it is answered nothing is sent, and the drivers stay
+		 * suspended with their requests failing fast; a lost session stays so.
+		 */
+		ret = apple_rtkit_helper_ap_wake(helper);
+		if (ret) {
+			dchid->wake_pending = true;
+			dev_err(dev, "AP on notice not confirmed (%d): input stays suspended\n",
+				ret);
+			return ret;
+		}
+		dchid->wake_pending = false;
+		if (dchid->host_asleep) {
+			dchid->host_asleep = false;
+			ret = dchid_host_state(dchid, HOST_STATE_AWAKE);
+			if (ret)
+				dev_warn(dev, "host state not restored: %d\n", ret);
+			ret = 0;
+		}
+	}
+
+	/* No restart exists: its drivers stay suspended and its requests keep failing fast. */
+	if (apple_rtkit_helper_session_lost(helper)) {
+		dev_err(dev, "the coprocessor's session was lost across the sleep: input not resumed\n");
+		return -EHOSTDOWN;
 	}
 
 	/* Allow feature requests again before notifying any HID driver. */
