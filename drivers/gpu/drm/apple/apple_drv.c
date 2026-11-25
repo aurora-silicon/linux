@@ -1130,8 +1130,10 @@ static int apple_connector_attach_pq_reference(struct drm_connector *connector)
  * External displays expose the colour properties backed by DCP's per-timing
  * ColorModes catalogue (Colorspace, HDR_OUTPUT_METADATA, Broadcast RGB,
  * color format, max bpc); dcp_crtc_atomic_check() validates each request
- * against the active timing's catalogue.  Internal panels with EDR expose
- * Colorspace (BT2020_RGB), HDR_OUTPUT_METADATA and PQ_REFERENCE_LUMINANCE.
+ * against the active timing's catalogue.  An internal panel with EDR
+ * headroom (dcp_panel_edr()) exposes Colorspace (BT2020_RGB),
+ * HDR_OUTPUT_METADATA and PQ_REFERENCE_LUMINANCE; an SDR panel offers no
+ * HDR at all.
  */
 static int apple_connector_attach_hdr(struct drm_connector *connector,
 				      bool panel_edr, bool ext_color_props)
@@ -1251,8 +1253,7 @@ static int apple_connector_create(struct drm_device *drm,
 	ret = drm_connector_attach_vrr_capable_property(&connector->base);
 	if (ret)
 		goto err_cleanup;
-	ret = apple_connector_attach_hdr(&connector->base,
-					 dcp_fw_compat_panel_edr(dcp),
+	ret = apple_connector_attach_hdr(&connector->base, dcp_panel_edr(dcp),
 					 dcp_ext_color_props_supported(dcp));
 	if (ret)
 		goto err_cleanup;
@@ -2281,10 +2282,23 @@ static int apple_platform_suspend(struct device *dev)
 	if (apple && apple->dark_held)
 		return 0;
 
+	if (pm_suspend_via_firmware()) {
+		int ret = dcp_t6041_s2r_all(false);
+
+		if (ret)
+			return ret;
+	}
+
 	if (apple && !apple->aborted) {
 		apple->s2r_skipped = apple_drm_firmware_stopped(apple);
-		if (!apple->s2r_skipped)
-			return drm_mode_config_helper_suspend(&apple->drm);
+		if (!apple->s2r_skipped) {
+			int ret = drm_mode_config_helper_suspend(&apple->drm);
+
+			if (ret) {
+				dcp_t6041_s2r_all(true);
+				return ret;
+			}
+		}
 	}
 
 	return 0;
@@ -2331,6 +2345,10 @@ static void apple_drm_resume_outputs(struct apple_drm_private *apple)
 static int apple_platform_resume(struct device *dev)
 {
 	struct apple_drm_private *apple = dev_get_drvdata(dev);
+
+	/* Nothing if this suspend never took the display down. */
+	if (dcp_t6041_s2r_all(true))
+		dev_err(dev, "T6041 S2R display resume failed\n");
 
 	if (!apple || apple->aborted || apple->s2r_skipped)
 		return 0;
