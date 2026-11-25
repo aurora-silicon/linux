@@ -1294,6 +1294,10 @@ struct Shared {
     /// Preallocated completion collector owned exclusively by `run_runtime_events`.
     #[pin]
     worker_deferred: Mutex<Option<runtime::DeferredBatch>>,
+    /// Restrict each scheduler's ordered submit queue to the creating CPU's cluster, beside the
+    /// event work. Single-die M5 parts leave schedulers unrestricted so queues created on one
+    /// thread do not contend on a single cluster under multi-queue load.
+    pin_scheduler_cluster: bool,
     /// The CPU of the last publication, `u32::MAX` before the first.
     submitter: AtomicU32,
     #[pin]
@@ -1646,6 +1650,12 @@ impl Shared {
     /// The queue for the schedulers' timeout work, which signals the fences of timed-out jobs.
     pub(super) fn fence_queue(&self) -> Arc<workqueue::OwnedQueue> {
         self.events.clone()
+    }
+
+    /// Whether each scheduler's submit queue should be restricted to the creating CPU's cluster
+    /// (all but single-die M5).
+    pub(super) fn pin_scheduler_cluster(&self) -> bool {
+        self.pin_scheduler_cluster
     }
 
     /// Records the publishing CPU for the event work's placement.
@@ -2005,6 +2015,7 @@ impl Gpu {
                     Some(worker_deferred),
                     "g17::Shared::worker_deferred"
                 ),
+                pin_scheduler_cluster: !m5 || id.num_dies > 1,
                 submitter: AtomicU32::new(u32::MAX),
                 grow <- new_work!("g17::Shared::grow"),
                 reclaim_work <- new_work!("g17::Shared::reclaim_work"),
