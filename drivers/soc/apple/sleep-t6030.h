@@ -469,6 +469,7 @@ static void t6030_dry_ps_on(struct apple_sleep *s)
 	dev_info(s->dev, "dry run: ps-aon on:%s\n", line);
 }
 
+static void t6030_sleep_clean_ram(void);
 static void t6030_sleep_clean(struct apple_sleep *s);
 
 /*
@@ -479,15 +480,16 @@ static void t6030_dry_clean(struct apple_sleep *s)
 {
 	bool pcore = read_cpuid_mpidr() & T6030_MPIDR_PCORE;
 	u64 hid4 = pcore ? read_sysreg_s(T6030_HID4) : read_sysreg_s(T6030_EHID4);
-	u64 t0 = __arch_counter_get_cntpct(), t1;
+	u64 t0 = __arch_counter_get_cntpct(), t1, t2, hz = arch_timer_get_cntfrq();
 
-	t6030_sleep_clean(s);
+	t6030_sleep_clean_ram();
 	t1 = __arch_counter_get_cntpct();
-	dev_info(s->dev, "dry run: %sHID4 %#llx (DISABLE_DC_MVA %d, DISABLE_DC_SW_L2 %d); the commit's clean took %llu us (spacing %u us)\n",
+	t6030_sleep_clean(s);
+	t2 = __arch_counter_get_cntpct();
+	dev_info(s->dev, "dry run: %sHID4 %#llx (DISABLE_DC_MVA %d, DISABLE_DC_SW_L2 %d); RAM clean %llu us before the AP idle, last clean %llu us in its %u us spacing\n",
 		 pcore ? "" : "E", hid4, !!(hid4 & T6030_HID4_DISABLE_DC_MVA),
-		 !!(hid4 & T6030_HID4_DISABLE_DC_SW_L2),
-		 div_u64((t1 - t0) * USEC_PER_SEC, arch_timer_get_cntfrq()),
-		 s->soc->smc_policy->idle_to_timer_us);
+		 !!(hid4 & T6030_HID4_DISABLE_DC_SW_L2), div64_u64((t1 - t0) * USEC_PER_SEC, hz),
+		 div64_u64((t2 - t1) * USEC_PER_SEC, hz), s->soc->smc_policy->idle_to_timer_us);
 }
 
 /*
@@ -839,6 +841,7 @@ static int t6030_sleep_commit_notice(struct apple_sleep *s)
 	ret = t6030_sleep_lower(s, T6030_LOWER_PMP, T6030_LOWER_PHY);
 	if (ret)
 		return ret;
+	t6030_sleep_clean_ram();
 	ret = apple_sleep_smc_commit_notice(s);
 	if (ret)
 		return ret;
@@ -1142,19 +1145,36 @@ static void t6030_clean_obj(const void *p, size_t size)
 }
 
 /*
- * Everything the wake reads before the caches are on again, past L2: all RAM in use and the
- * kernel image, then once more what was written since or lives outside the linear map, last
- * of it aura's mailbox (resume_pa); then this core's L1 and L2 by set and way. The other
- * cores clean their own at their last WFI (t6030_deep_wfi_arm()).
+ * Every page of RAM in use and the kernel image, past L2, while the other cores are held and
+ * their caches still on: before the SMC's AP idle, the ~250 ms it takes kept out of the
+ * spacing from there to the commit word. What is written after it is in a core's L1 or L2,
+ * which t6030_sleep_clean() and each core's last WFI clean, or was evicted to memory.
+ */
+static void t6030_sleep_clean_ram(void)
+{
+	u64 hid4 = t6030_dc_unblock();
+
+	t6030_clean_ram();
+	t6030_dc_reblock(hid4);
+}
+
+/*
+ * Then, right before the commit word: the kernel's data and each CPU's, the resume context,
+ * this stack, the sleep state and its books, the wake sequences with the words read for them,
+ * this profile's state, aura's mailbox (resume_pa) last, past L2 by VA; then this core's L1
+ * and L2 by set and way. The other cores clean their own at their last WFI.
  */
 static void t6030_sleep_clean(struct apple_sleep *s)
 {
 	const struct apple_sleep_soc *soc = s->soc;
 	struct t6030_sleep *t = t6030_state(s);
 	unsigned int i, stash_n = mpidr_hash_size();
+	size_t pcpu = __per_cpu_end - __per_cpu_start;
 	u64 hid4 = t6030_dc_unblock();
 
-	t6030_clean_ram();
+	t6030_clean_range((unsigned long)_sdata, (unsigned long)_end);
+	for_each_possible_cpu(i)
+		t6030_clean_obj(__per_cpu_start + per_cpu_offset(i), pcpu);
 	t6030_clean_obj(task_stack_page(current), THREAD_SIZE);
 	t6030_clean_obj(current, sizeof(*current));
 	t6030_clean_obj(s, sizeof(*s));
