@@ -48,6 +48,19 @@
 &sep_dart {
 	apple,dma-range = /bits/ 64 <0x10000004000 0xffff0000>;
 	apple,dma-offset = /bits/ 64 <0x0>;
+	/*
+	 * What macOS 27.2 writes to this DART at the wake (the t5 trace), as offset and value:
+	 * the config words, SID 0's TCR and TTBR, a TLB flush, the late config words, the error
+	 * mask, then the streams. The config words go back as Linux had them before the sleep,
+	 * and SID 0 and the streams as Linux saved them; the lists give the order around them.
+	 */
+	apple,sleep-restore = <0x210 0x0>, <0x20c 0x9e0001ff>,
+			      <0x220 0xf0f0f>, <0x224 0x80808>,
+			      <0x300 0x1>, <0x308 0x10000000>,
+			      <0x310 0x3fffffff>, <0x318 0x1>,
+			      <0x320 0x1f00000>, <0x328 0x1f0bfff>;
+	apple,sleep-restore-late = <0x80 0x0>, <0x228 0x3f3f3f3f>,
+				   <0x22c 0x1010101>, <0x104 0x0>;
 	status = "okay";
 };
 
