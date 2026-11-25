@@ -1916,15 +1916,30 @@ static bool dcpaud_eld_update(struct dcp_audio *dcpaud, const u8 *eld)
 	return changed;
 }
 
+/*
+ * Only an ELD built from an EDID replaces the stored one. The EDID code also
+ * ends here after clearing a stale EDID (an old route or service) or while a
+ * read is still to be retried; the card then keeps what it has rather than
+ * falling back to basic stereo without the monitor's name.
+ */
+static bool dcpaud_refresh_eld_from_edid(struct dcp_audio *dcpaud)
+{
+	u8 eld[DCPAUD_ELD_SIZE];
+
+	if (dcp_audio_sink_eld(dcpaud->dcp_dev, eld, DCPAUD_ELD_SIZE) ||
+	    !eld[DRM_ELD_VER])
+		return false;
+	dcpaud_build_eld(dcpaud, eld);
+	return dcpaud_eld_update(dcpaud, eld);
+}
+
 void dcpaud_refresh_eld(struct platform_device *pdev)
 {
 	struct dcp_audio *dcpaud = platform_get_drvdata(pdev);
-	u8 eld[DCPAUD_ELD_SIZE];
 
 	if (!dcpaud || !dcpaud->dcp_dev || !dcpaud->card)
 		return;
-	dcpaud_build_eld(dcpaud, eld);
-	if (dcpaud_eld_update(dcpaud, eld))
+	if (dcpaud_refresh_eld_from_edid(dcpaud))
 		snd_ctl_notify(dcpaud->card, SNDRV_CTL_EVENT_MASK_VALUE, &dcpaud->eld_ctl->id);
 }
 

@@ -742,6 +742,31 @@ static void dcpaud_eld_refresh_needs_connection(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, dcpaud->eld[DRM_ELD_VER], 0);
 }
 
+/* The EDID was cleared (stale route) or is still to be read: no ELD */
+static int dcpaud_eld_test_no_edid(struct device *dev, u8 *eld, size_t size)
+{
+	memset(eld, 0, size);
+	return -ENODATA;
+}
+
+/* A cleared or unread EDID leaves a connected card's named ELD as it is. */
+static void dcpaud_eld_refresh_keeps_name_without_edid(struct kunit *test)
+{
+	struct platform_device *pdev;
+	struct dcp_audio *dcpaud = dcpaud_link_setup(test, &pdev);
+
+	mutex_init(&dcpaud->data_lock);
+	dcpaud->connected = true;
+	kunit_activate_static_stub(test, dcp_audio_sink_eld, dcpaud_eld_test_sink);
+	KUNIT_EXPECT_TRUE(test, dcpaud_refresh_eld_from_edid(dcpaud));
+	KUNIT_EXPECT_EQ(test, drm_eld_mnl(dcpaud->eld), 8);
+
+	kunit_activate_static_stub(test, dcp_audio_sink_eld, dcpaud_eld_test_no_edid);
+	KUNIT_EXPECT_FALSE(test, dcpaud_refresh_eld_from_edid(dcpaud));
+	KUNIT_EXPECT_EQ(test, drm_eld_mnl(dcpaud->eld), 8);
+	KUNIT_EXPECT_MEMEQ(test, dcpaud->eld + DRM_ELD_MONITOR_NAME_STRING, "QG270 S3", 8);
+}
+
 static struct kunit_case dcpaud_link_cases[] = {
 	KUNIT_CASE(dcpaud_link_release_instance),
 	KUNIT_CASE(dcpaud_disconnect_sync_completes_live_owner),
@@ -764,6 +789,7 @@ static struct kunit_case dcpaud_link_cases[] = {
 	KUNIT_CASE(dcpaud_sleep_ends_cleared_dma),
 	KUNIT_CASE(dcpaud_eld_refresh_takes_monitor_name),
 	KUNIT_CASE(dcpaud_eld_refresh_needs_connection),
+	KUNIT_CASE(dcpaud_eld_refresh_keeps_name_without_edid),
 	{}
 };
 
