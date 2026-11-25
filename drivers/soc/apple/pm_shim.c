@@ -188,14 +188,18 @@ bool sep_pm_platform_commit(void)
 	return apple_sleep_commit_stops_coprocs();
 }
 
-void sep_pm_dart_restore(void *ptr)
+/* Nonzero if the DART did not come back as saved: then the enclave must not be started. */
+int sep_pm_dart_restore(void *ptr)
 {
 	struct device *dart = sep_pm_dart(ptr);
+	int ret;
 
-	if (dart) {
-		apple_dart_sleep_restore(dart);
-		put_device(dart);
-	}
+	if (!dart)
+		return -ENODEV;
+	ret = apple_dart_sleep_restore(dart);
+	put_device(dart);
+
+	return ret;
 }
 
 #define SEP_PM_POLL_US		20

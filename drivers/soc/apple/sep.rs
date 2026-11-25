@@ -1793,7 +1793,7 @@ impl SepData {
 
     /// Whether an enclave that was told and never gated still answers.
     fn sleep_probe(&self) -> Result<()> {
-        pm::dart_restore(&self.dev);
+        pm::dart_restore(&self.dev)?;
         self.sleep_release_rx();
         let op = proto::op_nop(0);
         let (idx, tag) = self.control.lock().alloc()?;
@@ -1920,7 +1920,8 @@ impl SepData {
     /// Starts a gated enclave and waits for the messages that say it's up.
     fn sleep_kick(&self) -> Result<()> {
         pm::clear_dev_disable(&self.dev)?;
-        pm::dart_restore(&self.dev);
+        // Before the receive interrupt or the doorbell: never over a DART that isn't back.
+        pm::dart_restore(&self.dev)?;
         // Arm completion before the held receive IRQ can deliver an early wake.
         self.control.lock().wake_reset();
         self.sleep_release_rx();
