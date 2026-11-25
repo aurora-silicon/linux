@@ -955,7 +955,12 @@ impl super::super::Backend {
                     Err(error) => return Err(error),
                 }
             }
-            pair.prepare(&alloc, packet, addresses)
+            pair.prepare(
+                &alloc,
+                packet,
+                addresses,
+                self.backlog.load(core::sync::atomic::Ordering::Acquire) as usize,
+            )
         })();
         let mut returned = Some(pair);
         let mut state = self.shared.state.lock();

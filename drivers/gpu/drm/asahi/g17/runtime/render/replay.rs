@@ -128,7 +128,7 @@ impl Firmware {
                 dev: &dev,
                 uat: &uat,
             };
-            pair.prepare(&alloc, &packet, addresses)
+            pair.prepare(&alloc, &packet, addresses, 0)
         });
         match prepared {
             Ok(()) => {}

@@ -514,6 +514,7 @@ impl Pair {
         alloc: &Allocator<'_>,
         packet: &Arc<Packet>,
         addresses: RenderAddresses,
+        backlog: usize,
     ) -> Result {
         if !self.room()
             || self
@@ -617,6 +618,7 @@ impl Pair {
             ray_query: *ray_query,
             resources: &resources,
             ordinal,
+            ta_notify: ta_notify(ordinal, self.active.len(), packet.batch_renders, backlog),
             ta: abi::RenderStage {
                 qid: qids[0],
                 descriptor_va: self.memory.graph.descriptor_client(0, ordinal)?,
@@ -3569,6 +3571,71 @@ impl Pair {
     }
 }
 
+/// Stride between periodic tiling-completion notifications once a deep
+/// multi-pass render stream fills the upper half of a pair's active window.
+pub(crate) const TA_NOTIFY_STRIDE: u64 = 4;
+
+const _: () = assert!(queues::RENDER_DEPTH >= 2);
+const _: () = assert!(TA_NOTIFY_STRIDE > 0);
+
+/// Decides whether a tiling kick sets [`abi::TaDescriptor::first_kick`] to
+/// request a firmware tiling-completion notification for a pair of capacity
+/// `depth`.
+///
+/// - The first kick of a pair (`ordinal == 0`) and any kick to an idle pair
+///   (`in_flight == 0`) always notify, preserving idle-pair depth-1 latency.
+/// - Single-pass submissions (`batch_renders <= 1`) already complete their own
+///   work-state node and raise a fragment completion event without stalling at
+///   any queued depth (`d4`-`d64`), so queued kicks add no tiling IRQs.
+/// - Small multi-pass frames that fit two frames in flight inside `depth`
+///   (`batch_renders <= depth / 2` and `in_flight + backlog <= depth`, such as
+///   16-pass frames at `RENDER_DEPTH == 32`) retire cleanly on each frame's
+///   fragment completion without blocking on mid-frame slots. Note that
+///   `backlog` is tracked per logical owner while `in_flight` is per pair.
+/// - Larger multi-pass batches (`batch_renders > depth / 2`) or multi-pass
+///   streams overflowing the active window (`batch_renders > 1` with
+///   `in_flight + backlog > depth`) notify once the active ring reaches its
+///   halfway mark (`in_flight >= depth / 2`), on every [`TA_NOTIFY_STRIDE`]-th
+///   ordinal and on the kick that fills the window (`in_flight + 1 >= depth`)
+///   so a 1-3-pass trickle refill near `depth` arms a tiling notification
+///   ahead of `queue_poll()` (which remains the fallback for any edge case).
+pub(crate) const fn ta_notify_for_depth(
+    ordinal: u64,
+    in_flight: usize,
+    batch_renders: u16,
+    backlog: usize,
+    depth: usize,
+) -> bool {
+    if ordinal == 0 || in_flight == 0 {
+        return true;
+    }
+    if batch_renders <= 1 || depth < 2 {
+        return false;
+    }
+    let floor = depth / 2;
+    let deep_batch =
+        (batch_renders as usize) > floor || in_flight.saturating_add(backlog) > depth;
+    deep_batch
+        && in_flight >= floor
+        && (ordinal % TA_NOTIFY_STRIDE == 0 || in_flight.saturating_add(1) >= depth)
+}
+
+/// Tiling-completion notification policy for [`queues::RENDER_DEPTH`].
+pub(crate) const fn ta_notify(
+    ordinal: u64,
+    in_flight: usize,
+    batch_renders: u16,
+    backlog: usize,
+) -> bool {
+    ta_notify_for_depth(
+        ordinal,
+        in_flight,
+        batch_renders,
+        backlog,
+        queues::RENDER_DEPTH as usize,
+    )
+}
+
 /// Whether `masks`, the stamp notifications collected for a pair whose tiling and fragment
 /// queues are `qids`, can mean a finished pass: the fragment queue's bit. A fragment kick starts
 /// only after its fragment barrier saw the tiling stamp, and retirement still checks both stamps
@@ -3703,5 +3770,162 @@ mod drain_retry_tests {
     fn the_limit_is_reached_within_ten_seconds() {
         let total: u64 = (1..DRAIN_RETRY_LIMIT).map(drain_retry_delay).sum();
         assert!(total < 10_000_000_000);
+    }
+}
+
+#[kunit_tests(asahi_g17_render_ta_notify)]
+mod ta_notify_tests {
+    use super::{queues::RENDER_DEPTH, ta_notify, ta_notify_for_depth, TA_NOTIFY_STRIDE};
+
+    #[test]
+    fn cold_start_and_idle_pair_always_notify() {
+        for batch in [0, 1, 16, 32, 64] {
+            for in_flight in [0, 1, 16, usize::from(RENDER_DEPTH) - 1] {
+                assert!(ta_notify(0, in_flight, batch, 0));
+            }
+            for ordinal in [0, 1, 2, 3, 4, 15, 31, 100, u64::MAX - 1] {
+                assert!(ta_notify(ordinal, 0, batch, 0));
+            }
+        }
+    }
+
+    #[test]
+    fn single_pass_streams_never_notify_while_busy() {
+        let depth = usize::from(RENDER_DEPTH);
+        for ordinal in 1..256 {
+            for in_flight in 1..depth {
+                for backlog in [0, 1, 16, 32, 64] {
+                    assert!(!ta_notify(ordinal, in_flight, 1, backlog));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sixteen_pass_frames_add_no_extra_notifications() {
+        let depth = usize::from(RENDER_DEPTH);
+        let frame_passes: u16 = 16;
+        // Single 16-pass frame from cold start: only ordinal 0 notifies.
+        let mut notified = 0;
+        for pass in 0..usize::from(frame_passes) {
+            if ta_notify(pass as u64, pass, frame_passes, 0) {
+                notified += 1;
+            }
+        }
+        assert_eq!(notified, 1);
+
+        // Two 16-pass frames in flight (frame N already occupies 16 slots,
+        // frame N+1 fills slots 16..31 with total active + backlog <= 32):
+        // zero extra TA notifications across all 16 passes, even under fallback.
+        for pass in 0..usize::from(frame_passes) {
+            let ordinal = 16 + pass as u64;
+            let in_flight = 16 + pass;
+            let remaining = usize::from(frame_passes) - pass;
+            assert!(in_flight + remaining <= depth);
+            assert!(!ta_notify(ordinal, in_flight, frame_passes, 0));
+            assert!(!ta_notify(ordinal, in_flight, frame_passes, remaining));
+        }
+    }
+
+    #[test]
+    fn deep_multi_pass_frames_notify_on_stride_and_window_fill() {
+        let depth = usize::from(RENDER_DEPTH);
+        let floor = depth / 2;
+        for batch in [32u16, 48, 64] {
+            // Below floor (in_flight 1..15): no premature notifications.
+            for pass in 1..floor {
+                assert!(!ta_notify(pass as u64, pass, batch, 0));
+            }
+            // Upper half (in_flight 16..31): stride + window-fill only.
+            let mut count = 0;
+            for pass in floor..depth {
+                let want = (pass as u64) % TA_NOTIFY_STRIDE == 0 || pass + 1 == depth;
+                let got = ta_notify(pass as u64, pass, batch, 0);
+                assert_eq!(got, want);
+                if got {
+                    count += 1;
+                }
+            }
+            // At depth=32, stride=4: passes 16, 20, 24, 28, and 31 notify (5 of 16).
+            assert_eq!(count, 5);
+        }
+    }
+
+    #[test]
+    fn saturated_window_never_refills_without_an_armed_notification() {
+        let depth = usize::from(RENDER_DEPTH);
+        // Simulate 100-pass and 200-pass frames draining 1, 2, 3, 4, or 8 passes
+        // per event wakeup while keeping the window saturated at `depth`.
+        for retire in [1usize, 2, 3, 4, 8] {
+            let mut ordinal = 32u64;
+            for _ in 0..200 {
+                let mut armed = false;
+                for i in 0..retire {
+                    let in_flight = depth - retire + i;
+                    // Also cover the 8-pass tail chunk of a 200-pass frame while
+                    // the next frame sits in backlog (`in_flight + backlog > depth`).
+                    let batch = if ordinal % 200 >= 192 { 8 } else { 64 };
+                    let backlog = 64;
+                    if ta_notify(ordinal, in_flight, batch, backlog) {
+                        armed = true;
+                    }
+                    ordinal += 1;
+                }
+                assert!(armed);
+            }
+        }
+    }
+
+    #[test]
+    fn multi_ioctl_overflow_and_floor_oscillation_stay_live() {
+        let depth = usize::from(RENDER_DEPTH);
+        let floor = depth / 2;
+        // Smaller multi-pass ioctls (e.g. 12 passes) that overflow RENDER_DEPTH
+        // via backlog enable strided + window-fill notifications.
+        assert!(!ta_notify(20, 20, 12, 0));
+        assert!(ta_notify(20, 20, 12, 13));
+        assert!(ta_notify(21, depth - 1, 12, 13));
+
+        // Contiguous runs at or above floor notify within every TA_NOTIFY_STRIDE
+        // kicks, and rapid oscillation around floor (15 <-> 16) continues to
+        // deliver periodic notifications whenever a stride lands at/above floor.
+        let mut contiguous_gap = 0u64;
+        for step in 0..32u64 {
+            let got = ta_notify(101 + step, floor, 64, 32);
+            if got {
+                contiguous_gap = 0;
+            } else {
+                contiguous_gap += 1;
+                assert!(contiguous_gap < TA_NOTIFY_STRIDE);
+            }
+        }
+        let mut oscillating_notifies = 0u32;
+        for step in 0..64u64 {
+            let in_flight = if step % 3 == 0 { floor - 1 } else { floor };
+            let got = ta_notify(100 + step, in_flight, 64, 32);
+            if in_flight < floor {
+                assert!(!got);
+            } else if got {
+                oscillating_notifies += 1;
+            }
+        }
+        assert!(oscillating_notifies >= 10);
+    }
+
+    #[test]
+    fn non_power_of_two_depths_and_boundaries_are_safe() {
+        for depth in [15usize, 24, 30] {
+            let floor = depth / 2;
+            assert!(ta_notify_for_depth(0, depth - 1, 1, 0, depth));
+            assert!(ta_notify_for_depth(7, 0, 1, 0, depth));
+            assert!(!ta_notify_for_depth(8, floor, 1, 64, depth));
+            assert!(!ta_notify_for_depth(8, floor, floor as u16, 0, depth));
+            assert!(ta_notify_for_depth(8, floor, floor as u16 + 1, 0, depth));
+            assert!(ta_notify_for_depth(9, depth - 1, floor as u16 + 1, 0, depth));
+        }
+        // Degenerate depth and saturation boundaries never overflow.
+        assert!(!ta_notify_for_depth(4, 1, 32, 32, 1));
+        assert!(ta_notify_for_depth(u64::MAX - 3, usize::MAX, 64, usize::MAX, 32));
+        assert!(!ta_notify_for_depth(u64::MAX, 1, 1, usize::MAX, 32));
     }
 }

@@ -388,6 +388,9 @@ pub(crate) struct RenderArgs<'a> {
     pub(crate) resources: &'a RenderResources,
     /// Submission ordinal of the render queue pair, from zero.
     pub(crate) ordinal: u64,
+    /// Whether the tiling descriptor requests a firmware tiling-completion
+    /// notification ([`TaDescriptor::first_kick`]).
+    pub(crate) ta_notify: bool,
     /// Tiling stage.
     pub(crate) ta: RenderStage,
     /// Fragment stage.
@@ -1202,25 +1205,23 @@ pub(crate) struct TaDescriptor {
     pub(crate) qid: u32,
     pub(crate) unk_8be: u32,
     /// Non-zero on the first kick of a queue pair, like the fragment descriptor's word at the same
-    /// position. Set on every kick, the firmware also notifies the host of each pass's tiling
-    /// completion. That is a retirement policy, not a descriptor layout, so every firmware build
-    /// that uses [`TaDescriptor::write`] (25G83, 25F84, 26B123, and 26A428; M5 does not use this
-    /// descriptor) keeps it set on every kick. A render queued beyond the 32-render in-flight
-    /// window raises no other firmware event when it completes, so these notifications are the
-    /// events that retire the queued renders and publish the next ones; without them those renders
-    /// wait for the poll, a jiffy later. On the J616C (HZ=250), 100 near-empty passes per frame
-    /// with two frames in flight take 1.6 ms with it, 8.8 ms without it on queued kicks and 4.2 ms
-    /// with it only on an idle pair or the kick that fills the window. A render submitted to an
-    /// idle pair also completes later without it (M4 Pro: render d1 +12%, two clients at depth 1
-    /// +18-24%). The cost of the notification on queued kicks: on the M4 Pro (25G83, HZ=1000) a
-    /// single queue of one-render submissions is 4-8% slower at depths 4-64 while frames of 32-200
-    /// passes take 36-39% less time; on the A18 Pro (J700, 26A428, HZ=1000) frames of 32-200
-    /// passes take 13-24% less time (200-pass p99 -20.7%), while 16-pass frames are 10.8% slower
-    /// on the mean with p99 frame interval 0.495 to 1.378 ms (+178%), one-render submissions are
-    /// 6-9% slower at depths 4-64, two and four processes are 7.6% and 8.2% slower, two queues are
-    /// 6.7% slower, and firmware IRQs rise 14x. The render kick entry's event mask
-    /// ([`RENDER_KICK_EVENT_MASK`]) is no substitute: it lists events the kick waits on
-    /// ([`super::m5::compute::kick_event_mask`]), not one its completion raises.
+    /// position. When set on a subsequent kick, the firmware also notifies the host when that
+    /// pass's tiling stage completes. That is a retirement policy, not a descriptor layout, so
+    /// every firmware build that uses [`TaDescriptor::write`] (25G83, 25F84, 26B123, and 26A428;
+    /// M5 uses `write_m5_commands` and is unaffected) follows [`RenderArgs::ta_notify`]
+    /// (`crate::g17::queue::render::ta_notify`).
+    ///
+    /// Setting it on every kick eliminated multi-pass poll stalls past the 32-render in-flight
+    /// window (J616C HZ=250 100-pass 8.8 -> 1.6 ms; M4 Pro HZ=1000 32-200 passes -36 to -39%;
+    /// A18 Pro 26A428 HZ=1000 32-200 passes -13 to -24%), at the cost of extra firmware IRQs on
+    /// single-pass streams (M4 Pro +4-8%, A18 Pro +6-9% at d4-d64) and small multi-pass frames
+    /// (A18 Pro 16-pass mean +10.8%, p99 0.495 -> 1.378 ms, IRQs 14x). Setting it on an idle
+    /// pair keeps depth-1 latency (M4 Pro d1 +12% without it), while deep multi-pass batches
+    /// request strided notifications once the active ring is at least half full plus on the kick
+    /// that fills the window (J616C HZ=1000: 16-pass unchanged at 0.099 -> 0.096 ms and 1.00x
+    /// firmware IRQs, 24-200 passes -22% to -72%, render.light d16 +0.1%, d32 +0.5%). The render
+    /// kick entry's event mask ([`RENDER_KICK_EVENT_MASK`]) is no substitute: it lists events
+    /// the kick waits on ([`super::m5::compute::kick_event_mask`]), not one its completion raises.
     pub(crate) first_kick: u32,
     /// Completion value of the tiling kick (see
     /// [`KickTimestamp::completion_value`]).
@@ -1327,7 +1328,7 @@ impl TaDescriptor {
         self.aux_stamp_va = args.ta.aux_stamp_va;
         self.stamp_value_2 = stamp_value;
         self.qid = args.ta.qid.into();
-        self.first_kick = 1;
+        self.first_kick = u32::from(args.ta_notify);
         self.current_id = resources.ta_ids.current.into();
         self.ordinal = args.ordinal as u32;
         self.timestamp_start_va = resources.timestamp_va;
@@ -1893,6 +1894,7 @@ mod ta_mode_tests {
             resources,
             ray_query: [ray; 2],
             ordinal: 0,
+            ta_notify: true,
             ta: stage,
             fragment: stage,
             programs: RegisterPrograms::V25G83,
@@ -1997,6 +1999,35 @@ mod ta_mode_tests {
             for (old, new) in before.iter().zip(&after) {
                 assert_eq!((old.reg, old.value), (new.reg, new.value));
                 assert_ne!({ new.reg }, 0x1c890);
+            }
+        }
+    }
+
+    #[test]
+    fn ta_descriptor_first_kick_follows_ta_notify_across_all_programs() {
+        let (pass, resources) = fixture();
+        let mut desc = KBox::<TaDescriptor>::new_uninit(GFP_KERNEL).unwrap();
+        // SAFETY: `TaDescriptor` implements `Zeroable` and is rewritten by `write()`.
+        unsafe {
+            core::ptr::write_bytes(desc.as_mut_ptr(), 0, 1);
+        }
+        // SAFETY: The descriptor was zero-initialized above.
+        let mut desc = unsafe { desc.assume_init() };
+        for programs in [RegisterPrograms::V25G83, RegisterPrograms::G17P] {
+            for (ordinal, ta_notify) in [(0, true), (1, false), (16, true), (31, false), (31, true)]
+            {
+                let mut args = args(&pass, &resources, false);
+                args.programs = programs;
+                args.ordinal = ordinal;
+                args.ta_notify = ta_notify;
+                desc.write(&args).unwrap();
+                assert_eq!({ desc.first_kick }, u32::from(ta_notify));
+                let expected_93e = if ordinal == 0 {
+                    TaDescriptor::UNK_93E_FIRST_KICK
+                } else {
+                    [0, 0]
+                };
+                assert_eq!({ desc.unk_93e }, expected_93e);
             }
         }
     }
