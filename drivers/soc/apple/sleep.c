@@ -50,6 +50,9 @@
 #include <linux/err.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
+#include <linux/memblock.h>
+#include <linux/mm.h>
+#include <linux/pgtable.h>
 #include <linux/irqchip/irq-apple-aic.h>
 #include <linux/ktime.h>
 #include <linux/moduleparam.h>
@@ -8239,15 +8242,6 @@ static void sleep_seq_save(void __iomem *const *blk, struct sleep_seq *seq)
 			seq->saved[i] = readl(blk[op[1]] + op[2]);
 	}
 	seq->have_saved = true;
-}
-
-/* @seq's entries and saved words cleaned to the point of coherency, for a wake without caches */
-static void sleep_seq_clean(const struct sleep_seq *seq)
-{
-	if (seq->n)
-		dcache_clean_poc((unsigned long)seq->op, (unsigned long)(seq->op + 4 * seq->n));
-	if (seq->saved)
-		dcache_clean_poc((unsigned long)seq->saved, (unsigned long)(seq->saved + seq->n));
 }
 
 /*

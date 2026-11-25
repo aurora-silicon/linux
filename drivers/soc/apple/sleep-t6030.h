@@ -81,6 +81,21 @@
 #define T6030_NOTE_DRY_RUN		0x31
 
 /*
+ * aura's init_cpu() sets HID4 (P) or EHID4 (E) DISABLE_DC_MVA and DISABLE_DC_SW_L2 on every
+ * M3 core, as XNU's start does. With them set the by-VA cleans and the L2 set/way ones do
+ * nothing: dcache_clean_poc() is a no-op here, so a deep sleep that drops the caches lost
+ * whatever the clean was for, aura's resume_pa among it. XNU lifts both around its sleep's
+ * clean, and so does this (T8122's, aurora-silicon/linux#3140), on the core that cleans.
+ */
+#define T6030_HID4			sys_reg(3, 0, 15, 4, 0)
+#define T6030_EHID4			sys_reg(3, 0, 15, 4, 1)
+#define T6030_HID4_DISABLE_DC_MVA	BIT_ULL(11)
+#define T6030_HID4_DISABLE_DC_SW_L2	BIT_ULL(44)
+#define T6030_HID4_DC_MASK		(T6030_HID4_DISABLE_DC_MVA | T6030_HID4_DISABLE_DC_SW_L2)
+/* Aff2: the P cores are 0x101xx */
+#define T6030_MPIDR_PCORE		BIT_ULL(16)
+
+/*
  * Lowered in this order, and raised again in reverse at the wake: SIO's CPU by .after_early,
  * the PMP and its SRAM by .commit_notice, the storage PHY by .commit_regs.
  */
@@ -332,6 +347,27 @@ static void t6030_dry_ps_on(struct apple_sleep *s)
 	dev_info(s->dev, "dry run: ps-aon on:%s\n", line);
 }
 
+static void t6030_sleep_clean(struct apple_sleep *s);
+
+/*
+ * Read-only but for the clean itself: whether this core's HID4 blocks the cleans, and how long
+ * the commit's clean takes, against the SMC's AP idle to timer spacing it runs in.
+ */
+static void t6030_dry_clean(struct apple_sleep *s)
+{
+	bool pcore = read_cpuid_mpidr() & T6030_MPIDR_PCORE;
+	u64 hid4 = pcore ? read_sysreg_s(T6030_HID4) : read_sysreg_s(T6030_EHID4);
+	u64 t0 = __arch_counter_get_cntpct(), t1;
+
+	t6030_sleep_clean(s);
+	t1 = __arch_counter_get_cntpct();
+	dev_info(s->dev, "dry run: %sHID4 %#llx (DISABLE_DC_MVA %d, DISABLE_DC_SW_L2 %d); the commit's clean took %llu us (spacing %u us)\n",
+		 pcore ? "" : "E", hid4, !!(hid4 & T6030_HID4_DISABLE_DC_MVA),
+		 !!(hid4 & T6030_HID4_DISABLE_DC_SW_L2),
+		 div_u64((t1 - t0) * USEC_PER_SEC, arch_timer_get_cntfrq()),
+		 s->soc->smc_policy->idle_to_timer_us);
+}
+
 /*
  * The last returning check: the SMC's, with its scope held. An untested profile's dry run
  * ends here, before the enclave or any coprocessor stops, and notes so in PMU scratch.
@@ -352,6 +388,7 @@ static int t6030_sleep_final_check(struct apple_sleep *s)
 	if (s->soc->untested && !READ_ONCE(sleep_untested_commit)) {
 		sleep_note(s, T6030_NOTE_DRY_RUN);
 		t6030_dry_ps_on(s);
+		t6030_dry_clean(s);
 		return -EAGAIN;
 	}
 	return 0;
@@ -867,28 +904,274 @@ static void t6030_sleep_commit_regs(struct apple_sleep *s)
 	sleep_ps_save(s);
 }
 
+/* This core's cache maintenance unblocked; returns its HID4 or EHID4 as it was */
+static __always_inline u64 t6030_dc_unblock(void)
+{
+	u64 old;
+
+	if (read_cpuid_mpidr() & T6030_MPIDR_PCORE) {
+		old = read_sysreg_s(T6030_HID4);
+		write_sysreg_s(old & ~T6030_HID4_DC_MASK, T6030_HID4);
+	} else {
+		old = read_sysreg_s(T6030_EHID4);
+		write_sysreg_s(old & ~T6030_HID4_DC_MASK, T6030_EHID4);
+	}
+	isb();
+	return old;
+}
+
+static __always_inline void t6030_dc_reblock(u64 old)
+{
+	dsb(sy);
+	if (read_cpuid_mpidr() & T6030_MPIDR_PCORE)
+		write_sysreg_s(old, T6030_HID4);
+	else
+		write_sysreg_s(old, T6030_EHID4);
+	isb();
+}
+
+/* [start, end) cleaned past L2 by VA: dc cvadp (FEAT_DPB2), dc cvap, or dc civac. Unblocked. */
+static void t6030_clean_range(unsigned long start, unsigned long end)
+{
+	unsigned long line = 4UL << ((read_cpuid_cachetype() >> CTR_EL0_DminLine_SHIFT) & 0xf);
+	unsigned int dpb = cpuid_feature_extract_unsigned_field(read_sysreg(id_aa64isar1_el1),
+								 ID_AA64ISAR1_EL1_DPB_SHIFT);
+	unsigned long addr = start & ~(line - 1);
+
+	if (dpb >= 2) {
+		for (; addr < end; addr += line)
+			asm volatile("sys #3, c7, c13, #1, %0" : : "r"(addr) : "memory");
+	} else if (dpb >= 1) {
+		for (; addr < end; addr += line)
+			asm volatile("sys #3, c7, c12, #1, %0" : : "r"(addr) : "memory");
+	} else {
+		for (; addr < end; addr += line)
+			asm volatile("dc civac, %0" : : "r"(addr) : "memory");
+	}
+	dsb(sy);
+}
+
 /*
- * What the wake reads before the caches are on again, cleaned to the point of coherency: the
- * kernel's data and resume context, this stack, the sleep state and its power word books, the
- * wake sequences with the words read for them, and this profile's state, its flags included.
+ * Every data or unified cache level this core sees (L1 and its cluster's L2), cleaned by set
+ * and way, in registers only: no store between the first dc csw and the last dsb. Unblocked.
+ */
+static __always_inline void t6030_clean_all_levels(void)
+{
+	u64 clidr, ccidx, lvl, ctype, ccsidr, lshift, way, mset, wshift, set, tmp;
+
+	asm volatile(
+		"dsb sy\n\t"
+		"mrs %[clidr], clidr_el1\n\t"
+		"mrs %[ccidx], id_aa64mmfr2_el1\n\t"
+		"ubfx %[ccidx], %[ccidx], #20, #4\n\t"
+		"mov %[lvl], #0\n\t"
+		"1:\n\t"
+		"cmp %[lvl], #7\n\t"
+		"b.hs 5f\n\t"
+		"add %[tmp], %[lvl], %[lvl], lsl #1\n\t"
+		"lsr %[ctype], %[clidr], %[tmp]\n\t"
+		"and %[ctype], %[ctype], #7\n\t"
+		"cbz %[ctype], 5f\n\t"
+		"cmp %[ctype], #2\n\t"
+		"b.lo 4f\n\t"
+		"cmp %[ctype], #4\n\t"
+		"b.hi 4f\n\t"
+		"lsl %[tmp], %[lvl], #1\n\t"
+		"msr csselr_el1, %[tmp]\n\t"
+		"isb\n\t"
+		"mrs %[ccsidr], ccsidr_el1\n\t"
+		"and %[lshift], %[ccsidr], #7\n\t"
+		"add %[lshift], %[lshift], #4\n\t"
+		"cbnz %[ccidx], 20f\n\t"
+		"ubfx %[way], %[ccsidr], #3, #10\n\t"
+		"ubfx %[mset], %[ccsidr], #13, #15\n\t"
+		"b 21f\n\t"
+		"20:\n\t"
+		"ubfx %[way], %[ccsidr], #3, #21\n\t"
+		"ubfx %[mset], %[ccsidr], #32, #24\n\t"
+		"21:\n\t"
+		"clz %w[wshift], %w[way]\n\t"
+		"2:\n\t"
+		"mov %[set], %[mset]\n\t"
+		"lsl %[ctype], %[way], %[wshift]\n\t"
+		"orr %[ctype], %[ctype], %[lvl], lsl #1\n\t"
+		"3:\n\t"
+		"lsl %[tmp], %[set], %[lshift]\n\t"
+		"orr %[tmp], %[ctype], %[tmp]\n\t"
+		"dc csw, %[tmp]\n\t"
+		"subs %[set], %[set], #1\n\t"
+		"b.ge 3b\n\t"
+		"subs %[way], %[way], #1\n\t"
+		"b.ge 2b\n\t"
+		"dsb sy\n\t"
+		"4:\n\t"
+		"add %[lvl], %[lvl], #1\n\t"
+		"b 1b\n\t"
+		"5:\n\t"
+		"msr csselr_el1, xzr\n\t"
+		"dsb sy\n\t"
+		"isb\n\t"
+		: [clidr] "=&r"(clidr), [ccidx] "=&r"(ccidx), [lvl] "=&r"(lvl),
+		  [ctype] "=&r"(ctype), [ccsidr] "=&r"(ccsidr), [lshift] "=&r"(lshift),
+		  [way] "=&r"(way), [mset] "=&r"(mset), [wshift] "=&r"(wshift),
+		  [set] "=&r"(set), [tmp] "=&r"(tmp)
+		:
+		: "cc", "memory");
+}
+
+/* Whether the kernel's tables map @addr: KFENCE's guard pages, for one, are left out */
+static bool t6030_va_mapped(unsigned long addr)
+{
+	pgd_t *pgdp = pgd_offset_k(addr);
+	p4d_t *p4dp;
+	pud_t *pudp, pud;
+	pmd_t *pmdp, pmd;
+
+	if (pgd_none(READ_ONCE(*pgdp)) || pgd_bad(READ_ONCE(*pgdp)))
+		return false;
+	p4dp = p4d_offset(pgdp, addr);
+	if (p4d_none(READ_ONCE(*p4dp)) || p4d_bad(READ_ONCE(*p4dp)))
+		return false;
+	pudp = pud_offset(p4dp, addr);
+	pud = READ_ONCE(*pudp);
+	if (pud_none(pud))
+		return false;
+	if (pud_leaf(pud))
+		return pud_valid(pud);
+	if (pud_bad(pud))
+		return false;
+	pmdp = pmd_offset(pudp, addr);
+	pmd = READ_ONCE(*pmdp);
+	if (pmd_none(pmd))
+		return false;
+	if (pmd_leaf(pmd))
+		return pmd_valid(pmd);
+	if (pmd_bad(pmd))
+		return false;
+	return pte_valid(READ_ONCE(*pte_offset_kernel(pmdp, addr)));
+}
+
+/* A run of mapped pages, cleaned once it ends */
+struct t6030_run {
+	unsigned long start, end;
+};
+
+static void t6030_run_add(struct t6030_run *r, unsigned long va)
+{
+	if (r->start && va == r->end) {
+		r->end += PAGE_SIZE;
+		return;
+	}
+	if (r->start)
+		t6030_clean_range(r->start, r->end);
+	r->start = va;
+	r->end = va + PAGE_SIZE;
+}
+
+static void t6030_run_end(struct t6030_run *r)
+{
+	if (r->start)
+		t6030_clean_range(r->start, r->end);
+	r->start = 0;
+}
+
+/*
+ * Every page of RAM in use, through the linear map: free pages hold nothing the wake reads,
+ * and are left. Then the kernel image through its own mapping. Unblocked.
+ */
+static void t6030_clean_ram(void)
+{
+	struct t6030_run run = {};
+	struct memblock_region *reg;
+	unsigned long va;
+
+	for_each_mem_region(reg) {
+		unsigned long pfn = PFN_UP(reg->base), end = PFN_DOWN(reg->base + reg->size);
+
+		if (memblock_is_nomap(reg))
+			continue;
+		while (pfn < end) {
+			struct page *page;
+			unsigned long nr = 1;
+
+			if (!pfn_valid(pfn)) {
+				t6030_run_end(&run);
+				pfn++;
+				continue;
+			}
+			page = pfn_to_page(pfn);
+			if (PageBuddy(page)) {
+				unsigned long order = page_private(page);
+
+				if (order <= MAX_PAGE_ORDER && IS_ALIGNED(pfn, 1UL << order))
+					nr = min(1UL << order, end - pfn);
+				t6030_run_end(&run);
+				pfn += nr;
+				continue;
+			}
+			va = (unsigned long)page_address(page);
+			if (!PageOffline(page) && va && t6030_va_mapped(va))
+				t6030_run_add(&run, va);
+			else
+				t6030_run_end(&run);
+			pfn++;
+		}
+		t6030_run_end(&run);
+	}
+	for (va = (unsigned long)_text & PAGE_MASK; va < PAGE_ALIGN((unsigned long)_end);
+	     va += PAGE_SIZE) {
+		if (t6030_va_mapped(va))
+			t6030_run_add(&run, va);
+		else
+			t6030_run_end(&run);
+	}
+	t6030_run_end(&run);
+}
+
+static void t6030_clean_obj(const void *p, size_t size)
+{
+	if (p && size)
+		t6030_clean_range((unsigned long)p, (unsigned long)p + size);
+}
+
+/*
+ * Everything the wake reads before the caches are on again, past L2: all RAM in use and the
+ * kernel image, then once more what was written since or lives outside the linear map, last
+ * of it aura's mailbox (resume_pa); then this core's L1 and L2 by set and way. The other
+ * cores clean their own at their last WFI (t6030_deep_wfi_arm()).
  */
 static void t6030_sleep_clean(struct apple_sleep *s)
 {
 	const struct apple_sleep_soc *soc = s->soc;
 	struct t6030_sleep *t = t6030_state(s);
+	unsigned int i, stash_n = mpidr_hash_size();
+	u64 hid4 = t6030_dc_unblock();
 
-	t8132_clean_ram();
-	dcache_clean_poc((unsigned long)task_stack_page(current),
-			 (unsigned long)task_stack_page(current) + THREAD_SIZE);
-	dcache_clean_poc((unsigned long)s, (unsigned long)(s + 1));
-	dcache_clean_poc((unsigned long)s->ps_commit,
-			 (unsigned long)(s->ps_commit + soc->ps_all.count));
-	dcache_clean_poc((unsigned long)s->ps_aon_commit,
-			 (unsigned long)(s->ps_aon_commit + soc->ps_aon_all.count));
-	sleep_seq_clean(&t->wake_early);
-	sleep_seq_clean(&t->wake);
-	dcache_clean_poc((unsigned long)t, (unsigned long)(t + 1));
-	dsb(sy);
+	t6030_clean_ram();
+	t6030_clean_obj(task_stack_page(current), THREAD_SIZE);
+	t6030_clean_obj(current, sizeof(*current));
+	t6030_clean_obj(s, sizeof(*s));
+	t6030_clean_obj(s->ps_commit, soc->ps_all.count * sizeof(*s->ps_commit));
+	t6030_clean_obj(s->ps_aon_commit, soc->ps_aon_all.count * sizeof(*s->ps_aon_commit));
+	for (i = 0; i < 2; i++) {
+		const struct sleep_seq *seq = i ? &t->wake : &t->wake_early;
+
+		t6030_clean_obj(seq->op, 4 * seq->n * sizeof(*seq->op));
+		if (seq->saved)
+			t6030_clean_obj(seq->saved, seq->n * sizeof(*seq->saved));
+	}
+	t6030_clean_obj(t, sizeof(*t));
+	if (sleep_save_stash) {
+		t6030_clean_obj(sleep_save_stash, stash_n * sizeof(*sleep_save_stash));
+		for (i = 0; i < stash_n; i++)
+			t6030_clean_obj((void *)READ_ONCE(sleep_save_stash[i]),
+					sizeof(struct sleep_stack_data));
+	}
+	t6030_clean_obj(&sleep_save_stash, sizeof(sleep_save_stash));
+	t6030_clean_obj(&mpidr_hash, sizeof(mpidr_hash));
+	t6030_clean_obj(s->mbox, sizeof(*s->mbox));
+	t6030_clean_all_levels();
+	t6030_dc_reblock(hid4);
 }
 
 /*
@@ -1053,6 +1336,15 @@ static void t6030_sleep_wake(struct apple_sleep *s)
 
 static void t6030_deep_wfi_arm(void)
 {
+	u64 hid4 = t6030_dc_unblock();
+
+	/*
+	 * This core's last stores are in by now: its L1 and its cluster's L2 back to memory, as
+	 * XNU's CleanPoC_Dcache before its sleep. A cluster's last core in cleans the L2 last.
+	 */
+	t6030_clean_all_levels();
+	t6030_dc_reblock(hid4);
+
 	/* As aura's cpu_sleep(true): only the L2 flush field is cleared first, the rest ORed in */
 	sysreg_clear_set_s(T6030_ACC_OVRD, T6030_ACC_OVRD_DIS_L2_FLUSH,
 			   T6030_ACC_OVRD_PWR_DN_SRM |
