@@ -10428,11 +10428,25 @@ static void dcp_dpms_power_off(struct apple_dcp *dcp)
 	__dcp_dpms_power_off(dcp);
 }
 
+/*
+ * Internal 26.6 DCP firmware stops cold when firmware-driven deep sleep will
+ * cut display power, because there is no cold-restart path for it yet. In a
+ * sleep dry run the coprocessor is left running and takes the ordinary suspend
+ * path instead.
+ */
+static bool dcp_sleep_owned(struct apple_dcp *dcp)
+{
+	return IS_ENABLED(CONFIG_APPLE_SOC_SLEEP) && dcp->fw_compat == DCP_FIRMWARE_V_26_6 &&
+	       !dcp->external && apple_sleep_commit_stops_coprocs() && !apple_sleep_dry_run();
+}
+
 bool dcp_s2r_firmware_stopped(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
-	return READ_ONCE(dcp->s2r_fw_down);
+	/* Whichever of this and the display subsystem suspends first: nothing commits to it. */
+	return READ_ONCE(dcp->s2r_fw_down) || READ_ONCE(dcp->sleep_cold_stopped) ||
+	       (pm_suspend_via_firmware() && dcp_sleep_owned(dcp));
 }
 
 #include "dcp-v27-sleep.inc"
@@ -10550,6 +10564,31 @@ static int dcp_platform_suspend(struct device *dev)
 
 	if (pm_suspend_via_firmware() && dcp_v27_sleep_selected(dcp))
 		return dcp_v27_sleep_suspend(dcp);
+
+	if (READ_ONCE(dcp->sleep_cold_stopped))
+		return 0;
+	if (pm_suspend_via_firmware() && dcp_sleep_owned(dcp)) {
+		u32 control = readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
+		struct apple_rtkit *rtk = dcp->rtk ?: dcp_v26_rtkit(dcp);
+
+		dev_warn(dev, "display coprocessor stopped cold for sleep (control %#x); panel stays off until reboot\n",
+			 control);
+		WRITE_ONCE(dcp->quiescing, true);
+		/*
+		 * Run the 26.6 firmware's panel-off and sleep-entry calls, then
+		 * request RTKit AP and IOP idle before halting the coprocessor.
+		 */
+		dcp_v26_sleep_calls(dcp, 2);
+		if (!IS_ERR_OR_NULL(rtk)) {
+			int ret = apple_rtkit_idle_with(rtk, dcp_secure_port_idle, dcp);
+
+			if (ret)
+				dev_warn(dev, "RTKit idle before cold stop failed: %d\n", ret);
+		}
+		WRITE_ONCE(dcp->sleep_cold_stopped, true);
+		dcp_s2r_cpu_stop(dcp);
+		return 0;
+	}
 
 	/*
 	 * J813 uses the same qualified stop as DPMS off. Probe already gates
@@ -10721,6 +10760,10 @@ static int dcp_platform_resume(struct device *dev)
 
 	if (dcp_v27_sleep_selected(dcp) && READ_ONCE(dcp->sleep_v27_closed))
 		return dcp_v27_sleep_resume(dcp);
+
+	/* Stopped cold, with no restart path until reboot. */
+	if (READ_ONCE(dcp->sleep_cold_stopped))
+		return 0;
 
 	if (dcp->s2r_stopped)
 		return dcp_s2r_resume(dcp);
