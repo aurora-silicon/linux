@@ -301,10 +301,32 @@ fn queues(out: &std::path::Path) {
     std::fs::write(out.join("queue.bin"), all).unwrap();
 }
 
+mod ring_test {
+    use super::fw::{channels::STATE_READ, initdata::TxLayout};
+    use std::sync::Arc;
+
+    type Result<T> = std::result::Result<T, ()>;
+    pub(crate) struct FwObject([u32; 5]);
+    impl FwObject {
+        fn r32(&self, offset: usize) -> Result<u32> {
+            self.0.get(offset / 4).copied().ok_or(())
+        }
+    }
+    @RING@
+
+    pub(super) fn check(tx: TxLayout, submit: u32, control: u32) {
+        let state = Arc::new(FwObject([2, 0, 5, 0, 7]));
+        for (is_control, expected) in [(false, submit), (true, control)] {
+            let ring = Ring::new(state.clone(), state.clone(), tx, is_control);
+            assert_eq!(ring.completion(), Ok(expected));
+        }
+    }
+}
+
 fn g15s_26b123() {
     let f = 0xfffffc2000000000u64;
     let g = 0x1000000000u64;
-    // PB manager: G15S 26B123 shifts every field -4 bytes vs G16G.
+    // The word after the slot ID selects the hardware bank.
     let pb = fw::buffer::pb_manager_image_for(
         FwAbi::V26B123G15S.pb_manager(),
         3,
@@ -315,7 +337,7 @@ fn g15s_26b123() {
         f + 0x700000,
         512,
     );
-    assert_eq!((r32(&pb, 0x08), r32(&pb, 0x0c)), (3, 3));
+    assert_eq!((r32(&pb, 0x08), r32(&pb, 0x0c)), (3, 0));
     assert_eq!(r64(&pb, 0x1c), f + 0x400000);
     assert_eq!(r64(&pb, 0x24), g + 0x701a040000);
     assert_eq!(
@@ -585,6 +607,14 @@ fn main() {
     render(&out);
     compute_work(&out);
     queues(&out);
+    for layout in backend_hw::t8132::CONFIG.layouts {
+        ring_test::check(layout.initdata.tx, 7, 7);
+        let pb = fw::buffer::pb_manager_image_for(layout.abi.pb_manager(), 3, 0, 0, 0, 0, 0, 1);
+        assert_eq!((r32(&pb, 0x0c), r32(&pb, 0x10)), (3, 3));
+    }
+    assert!(backend_hw::t8132::CONFIG.supports_render_scs);
+    assert!(!backend_hw::t6030::CONFIG.supports_render_scs);
+    ring_test::check(wire::G15S_26B123.tx, 2, 5);
     g15s_26b123();
     println!("26B123 layout catalog, InitData ({} / {} bytes), TA/FS/compute work and queue info encode; 25G83 entry points equal the 25G83 layouts", v25.len(), v26.len());
 }

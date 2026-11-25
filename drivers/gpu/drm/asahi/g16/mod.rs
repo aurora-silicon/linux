@@ -563,6 +563,8 @@ impl Shared {
 /// be stopped, so dropping this structure leaks the firmware-visible parts on purpose
 /// ([`Gpu::retain`]).
 pub(crate) struct Firmware {
+    /// Static hardware configuration for this GPU instance.
+    pub(crate) cfg: &'static hw::Config,
     /// RTKit, MMIO, regions, the adopted UAT and the host window.
     pub(crate) session: boot::Session,
     /// The initdata graph and its live words (Globals, Control, HardwareData, ...).
@@ -693,7 +695,7 @@ impl Gpu {
         let uat = booted.session.uat();
         let (id, max_frequency_khz) = (booted.id, booted.max_frequency_khz);
         // The backend: graphs, slots, pools, engine, recovery and VM registry.
-        let firmware = Firmware::start_backend(dev, booted, &shared, power)?;
+        let firmware = Firmware::start_backend(dev, cfg, booted, &shared, power)?;
         let vms = firmware.vms.clone();
         *shared.state.lock() = Some(firmware);
         // The engine's statistics file (a debugfs failure does not fail the probe).
@@ -735,6 +737,7 @@ impl Firmware {
     #[inline(never)]
     fn start_backend(
         dev: &AsahiDrmDevice,
+        cfg: &'static hw::Config,
         mut booted: KBox<boot::Booted>,
         shared: &Arc<Shared>,
         mut power: power::Power,
@@ -779,6 +782,7 @@ impl Firmware {
         } = KBox::into_inner(booted);
         let mut firmware = slot
             .write_init(init!(Firmware {
+                cfg,
                 session,
                 init,
                 private_factory,

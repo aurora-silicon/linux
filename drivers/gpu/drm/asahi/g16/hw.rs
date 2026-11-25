@@ -62,6 +62,8 @@ pub(crate) struct Config {
     pub(crate) host_block_ready: bool,
     /// Whether the TVM gate and firmware warm restart are supported.
     pub(crate) deep_sleep: bool,
+    /// Whether render work accepts scratch for ray queries.
+    pub(crate) supports_render_scs: bool,
     /// Whether FS->compute cross-engine barriers require `BarrierType::Hold` (type 1), as on G15.
     pub(crate) cross_engine_hold: bool,
 }
@@ -189,6 +191,7 @@ pub(crate) mod t8132 {
         host_block_zero_order: &super::start_27_2::HOST_BLOCK_ZERO_ORDER,
         host_block_ready: true,
         deep_sleep: true,
+        supports_render_scs: true,
         cross_engine_hold: false,
     };
 
@@ -343,6 +346,7 @@ pub(crate) mod t6030 {
         host_block_zero_order: &[0, 0x1808, 0x3010],
         host_block_ready: false,
         deep_sleep: false,
+        supports_render_scs: false,
         cross_engine_hold: true,
     };
 
@@ -441,6 +445,17 @@ pub(crate) enum FwAbi {
     V25G83,
     V26B123,
     V26B123G15S,
+}
+
+impl FwAbi {
+    /// Offset of the table installed in root[1] after startup, and the
+    /// descriptor attributes the firmware uses for it and the shared L2.
+    pub(crate) const fn live_root_table(self) -> (u64, u64) {
+        match self {
+            Self::V25G83 | Self::V26B123 => (4 * PAGE, 0x00200000000004cb),
+            Self::V26B123G15S => (3 * PAGE, 0x403),
+        }
+    }
 }
 
 /// How the firmware's MMIO register table in loaded DATA is filled.

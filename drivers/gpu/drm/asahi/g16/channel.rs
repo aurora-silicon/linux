@@ -61,7 +61,12 @@ impl Ring {
 
     /// The completion index in the channel's state block.
     pub(crate) fn completion(&self) -> Result<u32> {
-        self.state.r32(self.completion)
+        // Submit rings with a producer header retire at the consumer's read cursor.
+        if self.header != 0 {
+            self.read()
+        } else {
+            self.state.r32(self.completion)
+        }
     }
 
     /// The producer's write index, either in state or at the start of the ring.

@@ -51,8 +51,10 @@ pub(crate) mod pb_manager {
     /// shifted `-4` bytes from `ID_A` onward).
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(crate) struct Layout {
+        /// Primary parameter-buffer slot ID offset (`parameter_id` / PBID).
         pub(crate) id_a: usize,
-        pub(crate) id_b: usize,
+        /// Secondary slot ID offset, when the record carries a second copy.
+        pub(crate) id_b: Option<usize>,
         pub(crate) page_list_fw: usize,
         pub(crate) page_list: usize,
         pub(crate) page_list_bytes: usize,
@@ -70,7 +72,7 @@ pub(crate) mod pb_manager {
 
     pub(crate) const V25G83: Layout = Layout {
         id_a: ID_A,
-        id_b: ID_B,
+        id_b: Some(ID_B),
         page_list_fw: PAGE_LIST_FW,
         page_list: PAGE_LIST,
         page_list_bytes: PAGE_LIST_BYTES,
@@ -86,12 +88,10 @@ pub(crate) mod pb_manager {
         max_pages_b: MAX_PAGES_B,
     };
 
-    /// G15S 26B123 PB manager (`0x90`-byte firmware record invalidated by TA and InitBM):
-    /// `id_a` at `+0x08`, `id_b` at `+0x0c`, `page_list_fw` at `+0x1c`, `blocks` at `+0x38`,
-    /// `block_ctl` at `+0x48`, `counter` at `+0x60`.
+    /// G15S 26B123 uses one slot ID. The adjacent bank selector stays zero.
     pub(crate) const V26B123_G15S: Layout = Layout {
         id_a: 0x08,
-        id_b: 0x0c,
+        id_b: None,
         page_list_fw: 0x1c,
         page_list: 0x24,
         page_list_bytes: 0x2c,
@@ -184,7 +184,9 @@ pub(crate) fn pb_manager_image_for(
     let pages = blocks * PAGES_PER_BLOCK;
     let mut m = [0; pb_manager::SIZE];
     put32(&mut m, layout.id_a, id);
-    put32(&mut m, layout.id_b, id);
+    if let Some(id_b) = layout.id_b {
+        put32(&mut m, id_b, id);
+    }
     put64(&mut m, layout.page_list_fw, pages_fw);
     put64(&mut m, layout.page_list, pages_gpu);
     put32(&mut m, layout.page_list_bytes, PAGE_LIST_SIZE as u32);
