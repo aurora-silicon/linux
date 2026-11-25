@@ -192,6 +192,20 @@ static const struct apple_cio_hw apple_cio_t8103_hw = {
 	.dp = &apple_dpin_m1,
 };
 
+/*
+ * T8122 shares the T8103 ACIO register layout and DP IN policy, while deep
+ * sleep removes the CIO power domains and shares the ATC PHY with DWC3. Tear
+ * down a connected router before tasks freeze (ahead of DWC3's PM notifier)
+ * and request fresh cable state immediately on wake; s2idle and freeze leave
+ * the port up.
+ */
+static const struct apple_cio_hw apple_cio_t8122_hw = {
+	.sleep_removes_domains = true,
+	.restart_on_wake = true,
+	.phy_shared_with_dwc3 = true,
+	.dp = &apple_dpin_m1,
+};
+
 static const struct apple_cio_hw apple_cio_t6020_hw = {
 	.dp = &apple_dpin_m2,
 };
@@ -4895,6 +4909,10 @@ static const struct of_device_id apple_acio_match[] = {
 	{
 		.compatible = "apple,t6030-usb4-acio",
 		.data = &apple_cio_t6030_hw,
+	},
+	{
+		.compatible = "apple,t8122-usb4-acio",
+		.data = &apple_cio_t8122_hw,
 	},
 	{
 		.compatible = "apple,t6020-usb4-acio",

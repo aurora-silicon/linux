@@ -51,6 +51,8 @@ pub(crate) struct ComputeRefs {
     pub(crate) work: u64,
     pub(crate) work_gva: u64,
     pub(crate) seq: u64,
+    /// Zero selects the embedded `work + DESCRIPTOR`; otherwise a separate firmware UMA manager.
+    pub(crate) descriptor_fw: u64,
     pub(crate) preempt_gva: u64,
     pub(crate) its: u64,
     pub(crate) stats_fw: u64,
@@ -178,17 +180,17 @@ pub(crate) fn init_compute_pool(
     Ok(())
 }
 
-/// Restores the complete allocator descriptor into a newly encoded, unpublished work after
-/// the engine has proved A retired, distinct B displaced A in the same UMA slot, and B retired.
-/// Numeric checks here do not establish that ownership proof. The old descriptor's completion
-/// counter must equal A's cumulative submission count. Pool/list/counter backing stays pinned;
-/// only the work pointer and destination slot are rewritten. Returns the next private counter.
-pub(crate) fn preserve_compute_descriptor(
+fn validate_compute_descriptor_inner(
     r: &ComputeRefs,
     old: &[u8; compute::DESCRIPTOR_SIZE],
     submitted_before: u64,
-    w: &mut [u8; compute::WORK_SIZE],
+    check_index: bool,
 ) -> Result<u64, ComputeEncodeError> {
+    fn read32(b: &[u8], off: usize) -> u32 {
+        let mut v = [0; 4];
+        v.copy_from_slice(&b[off..off + 4]);
+        u32::from_le_bytes(v)
+    }
     fn read64(b: &[u8], off: usize) -> u64 {
         let mut v = [0; 8];
         v.copy_from_slice(&b[off..off + 8]);
@@ -199,6 +201,7 @@ pub(crate) fn preserve_compute_descriptor(
         || r.submitted != submitted_before + 1
         || r.uma_slot == 0
         || r.uma_slot > 32
+        || (check_index && read32(old, manager::INDEX) != r.uma_slot)
         || read64(old, manager::WORK) != r.work
         || read64(old, manager::FREELIST) != r.pool_state_gva
         || read64(old, manager::POOL_TABLE) != r.page_list_gva
@@ -207,10 +210,37 @@ pub(crate) fn preserve_compute_descriptor(
     {
         return Err(ComputeEncodeError::Descriptor);
     }
+    Ok(submitted_before + 1)
+}
+
+/// Validates an in-place retained compute UMA manager descriptor before reuse after displacement.
+/// Numeric checks here do not establish ownership proof; the engine proves prior retirement and
+/// distinct displacement first. Returns the next private submission counter.
+pub(crate) fn validate_compute_descriptor(
+    r: &ComputeRefs,
+    old: &[u8; compute::DESCRIPTOR_SIZE],
+    submitted_before: u64,
+) -> Result<u64, ComputeEncodeError> {
+    validate_compute_descriptor_inner(r, old, submitted_before, true)
+}
+
+/// Restores the complete allocator descriptor into a newly encoded, unpublished work after
+/// the engine has proved A retired, distinct B displaced A in the same UMA slot, and B retired.
+/// Numeric checks here do not establish that ownership proof. The old descriptor's completion
+/// counter must equal A's cumulative submission count. Pool/list/counter backing stays pinned;
+/// only the work pointer and destination slot are rewritten. Returns the next private counter.
+#[allow(dead_code)]
+pub(crate) fn preserve_compute_descriptor(
+    r: &ComputeRefs,
+    old: &[u8; compute::DESCRIPTOR_SIZE],
+    submitted_before: u64,
+    w: &mut [u8; compute::WORK_SIZE],
+) -> Result<u64, ComputeEncodeError> {
+    let next = validate_compute_descriptor_inner(r, old, submitted_before, false)?;
     w[compute::DESCRIPTOR..compute::DESCRIPTOR + compute::DESCRIPTOR_SIZE].copy_from_slice(old);
     put64(w, compute::DESCRIPTOR + manager::WORK, r.work);
     put32(w, compute::DESCRIPTOR + manager::INDEX, r.uma_slot);
-    Ok(submitted_before + 1)
+    Ok(next)
 }
 
 fn timestamp(
@@ -320,6 +350,7 @@ pub(crate) fn encode_compute_rt(
     }
     if !fw(r.work, compute::WORK_SIZE as u64)
         || !fw(r.seq, compute::SEQ_SIZE as u64)
+        || (r.descriptor_fw != 0 && !fw(r.descriptor_fw, compute::DESCRIPTOR_SIZE as u64))
         || !fw(r.qinfo, 0x24c0)
         || !fw(r.stats_fw, 0xe10)
         || !fw(r.auxiliary_fw, compute::AUX_SIZE as u64)
@@ -474,7 +505,12 @@ pub(crate) fn encode_compute_rt(
     put64(w, 0x83c, r.its + 8);
     put64(w, 0x844, ts_va[0]);
     put64(w, 0x84c, ts_va[1]);
-    put64(w, 0x86a, r.work + compute::DESCRIPTOR as u64);
+    let descriptor_fw = if r.descriptor_fw == 0 {
+        r.work + compute::DESCRIPTOR as u64
+    } else {
+        r.descriptor_fw
+    };
+    put64(w, 0x86a, descriptor_fw);
     put8(w, 0x872, 1);
     put64(w, 0x873, layout.pool_words[0]);
     put64(w, 0x87b, layout.pool_words[1]);
@@ -507,7 +543,7 @@ pub(crate) fn encode_compute_rt(
         put16(q, off + 0xe, 1);
     }
     put32(q, 0x158, att.len() as u32);
-    put64(q, 0x160, r.work + compute::DESCRIPTOR as u64);
+    put64(q, 0x160, descriptor_fw);
     put64(q, 0x178, r.auxiliary_gva);
     put64(q, 0x188, r.context_store_gva + layout.context_store_offsets[0]);
     put64(q, 0x190, r.context_store_gva + layout.context_store_offsets[1]);

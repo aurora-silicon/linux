@@ -1020,6 +1020,14 @@ const HW_CFG_T6050: PmpHwConfig = PmpHwConfig {
     confirm_ioreg_len: false,
 };
 
+/// T8122: the sleep engine reloads `__TEXT` from DRAM at the wake, and only `__DATA`
+/// (the ADT's second segment, offset 0x36000, size 0x47000) has to be kept. When the
+/// boot loader supplies `apple,sram-keep`, both offset and size come from the DT instead.
+const HW_CFG_T8122: PmpHwConfig = PmpHwConfig {
+    sram_backup: Some((0x36000, 0x47000)),
+    ..HW_CFG_DEFAULT
+};
+
 /// T8132: over a sleep only the ADT's second segment (0x68000 bytes, starting at 0x3c000 on
 /// 26.6.2/25G83 and 0x3d000 on 27.2/26B123 per ADT `segment-ranges` and SRAM header word 0x234)
 /// needs to be kept. When the boot loader supplies `apple,sram-keep`, both offset and size come
@@ -1045,6 +1053,7 @@ kernel::of_device_table!(
     OF_TABLE,
     <PmpDriver as platform::Driver>::IdInfo,
     [
+        (of::DeviceId::new(c"apple,t8122-pmp-v2"), &HW_CFG_T8122),
         (of::DeviceId::new(c"apple,t8132-pmp-v2"), &HW_CFG_T8132),
         (of::DeviceId::new(c"apple,t8140-pmp-v2"), &HW_CFG_T8140),
         (of::DeviceId::new(c"apple,t8142-pmp-v2"), &HW_CFG_T8142),

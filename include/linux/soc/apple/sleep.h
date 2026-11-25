@@ -155,6 +155,9 @@ int apple_sleep_coproc_wake_error(struct device *dev);
  */
 bool apple_sleep_commit_stops_coprocs(void);
 
+/* This firmware sleep stops before its commit: a driver must stop nothing it can't restart. */
+bool apple_sleep_dry_run(void);
+
 /*
  * Untested SoCs: a coprocessor's last stop notes its own step in PMU scratch (kept across a
  * WD2 reset), next to the sleep driver's step and the coprocessor's slot.
@@ -409,6 +412,11 @@ static inline bool apple_sleep_coprocs_ans_stopped(void)
 }
 
 static inline bool apple_sleep_commit_stops_coprocs(void)
+{
+	return false;
+}
+
+static inline bool apple_sleep_dry_run(void)
 {
 	return false;
 }

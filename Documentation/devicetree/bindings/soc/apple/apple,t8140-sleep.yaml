@@ -20,6 +20,7 @@ properties:
   compatible:
     enum:
       - apple,t8103-sleep
+      - apple,t8122-sleep
       - apple,t8132-sleep
       - apple,t8140-sleep
       - apple,t8142-sleep
@@ -117,6 +118,7 @@ allOf:
         - apple,pinctrl
       properties:
         reg:
+          minItems: 7
           maxItems: 7
         reg-names:
           items:
@@ -127,12 +129,41 @@ allOf:
             - const: cpu-start
             - const: wdt
             - const: spmi
-    else:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8122-sleep
+    then:
+      required:
+        - apple,wake-enable
       properties:
         reg:
-          minItems: 25
+          minItems: 21
+          maxItems: 21
         reg-names:
-          minItems: 25
+          items:
+            - const: ps
+            - const: pwrgate
+            - const: cpu-start
+            - const: cllt
+            - const: cluster
+            - const: commit
+            - const: wdt
+            - const: spmi
+            - const: spmi-hpm
+            - const: wake
+            - const: ps-aon
+            - const: mcc-a
+            - const: mcc-b
+            - const: mcc-c
+            - const: mcc-d
+            - const: apcie-axi
+            - const: apcie-rc
+            - const: apcie-clkgen
+            - const: apcie-phy
+            - const: apcie-phy-ip
+            - const: apcie-port0
   - if:
       properties:
         compatible:

@@ -99,8 +99,8 @@ use compute_encoder::put_generation;
 #[allow(unused_imports)] // Pure encoder utilities are exercised by the host ABI harness.
 pub(crate) use compute_encoder::{
     encode_compute, encode_compute_for, encode_compute_rt, init_compute_pool,
-    preserve_compute_descriptor, ComputeEncodeError, ComputeRefs, ComputeRt,
-    COMPUTE_SCS_DRIVER_WORD,
+    preserve_compute_descriptor, validate_compute_descriptor, ComputeEncodeError, ComputeRefs,
+    ComputeRt, COMPUTE_SCS_DRIVER_WORD,
 };
 
 /// Tiling geometry and register words of a render (accelerator count 2).

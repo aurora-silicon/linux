@@ -7141,9 +7141,18 @@ static int apple_pcie_suspend_noirq(struct device *dev)
 		return ret;
 	}
 	if (!pcie->hw->tunneled) {
-		if (apple_pcie_s2r_reinit(pcie) && pm_suspend_via_firmware())
+		bool s2r_reinit = apple_pcie_s2r_reinit(pcie) && pm_suspend_via_firmware();
+
+		if (s2r_reinit)
 			apple_pcie_hib_save(pcie);
-		if (pm_suspend_no_platform() && pcie->num_pds)
+		/*
+		 * Keep the host's power domains on across genpd noirq suspend
+		 * for s2idle and firmware sleeps: on an abandoned or dry-run
+		 * firmware sleep the commit never runs, so gating the domain
+		 * here would leave the controller unprogrammed with no wake
+		 * sequence to reinitialize it. A real commit powers it down.
+		 */
+		if ((pm_suspend_no_platform() || s2r_reinit) && pcie->num_pds)
 			return apple_pcie_hold_domains(pcie);
 		return 0;
 	}

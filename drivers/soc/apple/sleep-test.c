@@ -13,6 +13,7 @@ static const char *const apple_sleep_test_profiles[] = {
 	"apple,t6050-sleep",
 	"apple,t6050-j716c-sleep",
 	"apple,t8103-sleep",
+	"apple,t8122-sleep",
 };
 
 /*
@@ -69,7 +70,8 @@ static void apple_sleep_test_known_profiles(struct kunit *test)
 		KUNIT_EXPECT_NOT_NULL_MSG(test, id->data, "%s has no data", id->compatible);
 		KUNIT_ASSERT_LT(test, n, ARRAY_SIZE(apple_sleep_test_profiles));
 		KUNIT_EXPECT_STREQ(test, id->compatible, apple_sleep_test_profiles[n]);
-		if (!strcmp(id->compatible, "apple,t8142-sleep")) {
+		if (!strcmp(id->compatible, "apple,t8142-sleep") ||
+		    !strcmp(id->compatible, "apple,t8122-sleep")) {
 			const struct apple_sleep_soc *soc = id->data;
 
 			KUNIT_ASSERT_NOT_NULL(test, soc);

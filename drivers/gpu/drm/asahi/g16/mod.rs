@@ -753,14 +753,15 @@ impl Firmware {
             let pools = pools::Pools::new_boxed(dev)?;
             let vms = vm::Registry::new()?;
             let engine = engine::Engine::new()?;
+            let recovery = recovery::Recovery::new()?;
             let render_cmds = resources::RenderCmds::new()?;
             let compute_cmds = resources::ComputeCmds::new()?;
             let private_factory = booted.objects.private_factory(render_cmds, compute_cmds);
             let graph = graph::Graphs::finish(dev, graph_session, &private_factory)?;
             let slot = KBox::<Firmware>::new_uninit(GFP_KERNEL)?;
-            Ok((graph, private_factory, slots, pools, vms, engine, slot))
+            Ok((graph, private_factory, slots, pools, vms, engine, recovery, slot))
         })();
-        let (graph, private_factory, slots, pools, vms, engine, slot) = match backend {
+        let (graph, private_factory, slots, pools, vms, engine, recovery, slot) = match backend {
             Ok(backend) => backend,
             Err(error) => {
                 dev_err!(
@@ -792,7 +793,7 @@ impl Firmware {
                 graph,
                 slots,
                 engine,
-                recovery: recovery::Recovery::new(),
+                recovery,
                 power,
                 pools,
                 vms,
@@ -883,8 +884,10 @@ impl gpu::Gpu for Gpu {
         true
     }
 
+    /// G16 programs no fault mode into the firmware: an unmapped shader access behaves as the
+    /// firmware's default fault mode makes it. `fault_control` (default 0xb) stays the opt-out.
     fn soft_faults(&self) -> bool {
-        false
+        true
     }
 
     fn prepare_new_objects(&self) -> bool {

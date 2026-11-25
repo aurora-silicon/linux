@@ -505,3 +505,13 @@
 		};
 	};
 };
+
+&mcc {
+	apple,boot-dma-devices = <&pmp>;
+	status = "okay";
+};
+
+&sleep {
+	apple,debug-port = <&hpm0>;
+	status = "okay";
+};
