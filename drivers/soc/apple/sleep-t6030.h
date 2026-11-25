@@ -392,7 +392,8 @@ static void t6030_awake_arm(void)
 	isb();
 }
 
-static void t6030_awake_note(struct apple_sleep *s)
+/* +@at the domains on that macOS has off at its commit, +@at+1 how many "ps" words are on */
+static void t6030_domains_note(struct apple_sleep *s, u8 at)
 {
 	static const u32 words[] = {
 		T6030_PS_APCIE_GP, T6030_PS_APCIE_SYS_GP, T6030_PS_ANS, T6030_PS_DISPEXT0_CPU,
@@ -411,17 +412,21 @@ static void t6030_awake_note(struct apple_sleep *s)
 		bits |= BIT(5);
 	for (i = 0; i < all->count; i++)
 		on += sleep_ps_on(s, all->offset[i]);
+	sleep_note_at(s, at, bits);
+	sleep_note_at(s, at + 1, min(on, 0xffU));
+}
+
+static void t6030_awake_note(struct apple_sleep *s)
+{
 	sleep_note_at(s, 1, T6030_NOTE_AWAKE);
 	sleep_note_at(s, 2, min(t6030_wfi_returns, 0xffU));
-	sleep_note_at(s, 3, bits);
-	sleep_note_at(s, 4, min(on, 0xffU));
+	t6030_domains_note(s, 3);
 }
 
 /* The sleep's CLLT word: macOS writes it back before each commit word (0x1c17 on J516s) */
 #define T6030_CLLT_SLEEP		0x24
 
 /* PMU scratch +3, +4 after the commit word: the RTC control the rearm read, and how it went */
-#define T6030_NOTE_POST_TIMER_OK	0x04
 #define T6030_NOTE_POST_NO_ALARM	0xd0
 #define T6030_NOTE_POST_FAILED		0xe0
 
@@ -463,8 +468,11 @@ static void t6030_sleep_post_timer(struct apple_sleep *s)
 		v = 0x41;
 		ret = t6030_pmu_xfer(s, mask, T6050_SPMI_EXT_WRITEL, T6050_RTC_CTL, &v, NULL, 1);
 	}
-	sleep_note_at(s, 3, ctl);
-	sleep_note_at(s, 4, ret ? T6030_NOTE_POST_FAILED | step : T6030_NOTE_POST_TIMER_OK);
+	/* +3/+4 keep the commit's digest unless the rearm failed */
+	if (ret) {
+		sleep_note_at(s, 3, ctl);
+		sleep_note_at(s, 4, T6030_NOTE_POST_FAILED | step);
+	}
 	/* The notes put the done bit back in the mask: macOS's is without it from here on */
 	writel(mask, s->spmi + SPMI_NOTIFY_ENABLE);
 recommit:
@@ -632,8 +640,11 @@ static void t6030_sleep_pre_commit(struct apple_sleep *s)
 	t6030_sleep_clean(s);
 	while (__arch_counter_get_cntpct() < at)
 		cpu_relax();
-	/* The last PMU note before the commit word: past it, the engine has the sleep */
-	sleep_note_at(s, 4, 3);
+	/*
+	 * The last PMU notes before the commit word: +3 the domains on that macOS has off, +4
+	 * how many "ps" words are on (see t6030_awake_note()). Past them, the engine has the sleep.
+	 */
+	t6030_domains_note(s, 3);
 }
 
 /* The commit's record of @offset, which the rewake puts back, as it was before the entry */
@@ -806,6 +817,22 @@ static const struct apple_sleep_gate_coproc t6030_gate_coprocs[] = {
 	{ .path = "/soc/gpu@292400000" },
 };
 
+/*
+ * The ps words macOS 27.2 has OFF (actual state 0) at its commit on J516s, as the last value
+ * each had in the t1, t1b, t1c, t3 and t4 traces (ps-at-commit.tsv). The others weren't read in
+ * any window, so their state there is unknown: the dry run's list marks only these.
+ */
+static const u32 t6030_macos_off[] = {
+	0x180, 0x1c0, 0x1d0, 0x1f8, 0x200, 0x208, 0x220, 0x250, 0x258, 0x270,
+	0x3b8, 0x3c0, 0x3c8, 0x3d8, 0x3e0, 0x3f0, 0x3f8, 0x498, 0x4c8, 0x4d0,
+	0x5b8, 0xc00, 0x4000, 0x4008, 0x4010, 0x4018, 0x4020, 0x4028, 0x10000,
+};
+
+static bool t6030_macos_off_at_commit(u32 offset)
+{
+	return sleep_ps_find(t6030_macos_off, ARRAY_SIZE(t6030_macos_off), offset) >= 0;
+}
+
 static const struct apple_sleep_ops t6030_sleep_ops = {
 	.deep_wfi_arm = t6030_deep_wfi_arm,
 	.resume = cpu_resume,
@@ -826,6 +853,7 @@ static const struct apple_sleep_ops t6030_sleep_ops = {
 	.wake = t6030_sleep_wake,
 	.cpu_prepare = t6030_sleep_cpu_prepare,
 	.cpu_restore = t6030_sleep_cpu_restore,
+	.macos_off_at_commit = t6030_macos_off_at_commit,
 };
 
 static const struct apple_sleep_soc t6030_sleep_soc = {
