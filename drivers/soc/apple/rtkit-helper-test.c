@@ -616,7 +616,10 @@ static void rtkh_pm_fw_sleep_cycle(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, ctx->helper.idle_pending);
 }
 
-/* The M5 Pro's idle notice waits for .suspend_late. */
+/*
+ * The M5 Pro's and J516s's idle notice waits for .suspend_late, in the PM core's order:
+ * .suspend, where the input consumer sends its packets first, tells the firmware nothing.
+ */
 static void rtkh_pm_idle_late(struct kunit *test)
 {
 	struct rtkh_test *ctx = test->priv;
@@ -626,12 +629,14 @@ static void rtkh_pm_idle_late(struct kunit *test)
 	ctx->helper.idle_late = true;
 	pm_set_suspend_via_firmware();
 	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_prepare(dev), 0);
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_suspend(dev), 0);
 	KUNIT_EXPECT_EQ(test, ctx->ncalls, 0);
+	KUNIT_EXPECT_FALSE(test, ctx->helper.ap_idle);
 	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_suspend_late(dev), 0);
 	KUNIT_EXPECT_EQ(test, ctx->ncalls, 1);
-	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_suspend(dev), 0);
-	apple_rtkit_helper_complete(dev);
+	KUNIT_EXPECT_TRUE(test, ctx->helper.ap_idle);
 	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_resume(dev), 0);
+	apple_rtkit_helper_complete(dev);
 	rtkh_expect_calls(test, want, ARRAY_SIZE(want));
 }
 

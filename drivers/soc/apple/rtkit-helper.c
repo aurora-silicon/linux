@@ -656,10 +656,11 @@ static int __maybe_unused apple_rtkit_helper_suspend(struct device *dev)
 	/*
 	 * A firmware-driven suspend keeps this coprocessor running. It hears the
 	 * AP's power state and nothing else, so an adopted session stays live.
-	 * That is measured on T8140 and unverified on other SoCs.
+	 * That is measured on T8140 and unverified on other SoCs. An idle_late
+	 * notice waits for .suspend_late, after every device's .suspend.
 	 */
 	if (pm_suspend_via_firmware())
-		return apple_rtkit_helper_ap_idle(helper);
+		return helper->idle_late ? 0 : apple_rtkit_helper_ap_idle(helper);
 
 	if (helper->adopted && pm_suspend_target_state != PM_SUSPEND_TO_IDLE)
 		return -EBUSY;
