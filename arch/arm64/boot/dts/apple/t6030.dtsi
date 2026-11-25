@@ -1087,6 +1087,7 @@
 				    "clk-mux", "clk-perf", "ps-gpu", "amcc0", "amcc1",
 				    "dcs0", "ptd";
 			apple,display-coprocessors = <&dcp>, <&dcpext>, <&dcpext1>;
+			apple,pcie-host = <&pcie0>;
 			/* The ADT's pmgr ap-wake-sources */
 			apple,wake-enable = <3 51 74 83 87 88 89 90 91 92 93 94 104 111
 					     113 132 133 147 159 169 185 190 214>;
