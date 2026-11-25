@@ -11041,6 +11041,8 @@ static int dcp_t6041_stop_one(struct device *dev, void *data)
 	struct task_struct *poller;
 	bool keep_set = false;
 	bool powered_off = false;
+	/* The display DART's streams turned off here, not by a D572(0). */
+	bool streams_off = false;
 	bool idle_attempted = false;
 	bool idle;
 	u32 ctrl, status;
@@ -11094,18 +11096,35 @@ static int dcp_t6041_stop_one(struct device *dev, void *data)
 		 * (axi_rd_err, 11 Nov). Without D572(0) abort sleep instead of tearing down domains
 		 * while scanning out.
 		 */
-		reinit_completion(&dcp->s2r_dart_done);
-		WRITE_ONCE(dcp->s2r_active, true);
-		_dcp_poweroff(dcp);
-		powered_off = true;
-		if (!wait_for_completion_timeout(&dcp->s2r_dart_done,
-						 msecs_to_jiffies(DCP_S2R_D572_TIMEOUT_MS))) {
+		/*
+		 * A DPMS off before the sleep (the desktop blanking on a lid close) already ran
+		 * set_power_state(0), and its scanout stop was confirmed: its D572(0) came then,
+		 * while s2r_active was clear, and a second set_power_state(0) gets none. Turn the
+		 * display DART's streams off as that D572(0) would have; the pipe no longer scans
+		 * out.
+		 */
+		if (READ_ONCE(dcp->pipe_off)) {
+			dev_info(dev, "display already off: no second power-off\n");
+			if (dcp->s2r_disp_dart) {
+				apple_dart_display_streams(dcp->s2r_disp_dart,
+							   DCP_S2R_DISP_STREAMS, false, false);
+				streams_off = true;
+			}
+		} else {
+			unsigned long d572 = msecs_to_jiffies(DCP_S2R_D572_TIMEOUT_MS);
+
+			reinit_completion(&dcp->s2r_dart_done);
+			WRITE_ONCE(dcp->s2r_active, true);
+			_dcp_poweroff(dcp);
+			powered_off = true;
+			if (!wait_for_completion_timeout(&dcp->s2r_dart_done, d572)) {
+				WRITE_ONCE(dcp->s2r_active, false);
+				dev_err(dev, "no D572 after the power-off\n");
+				ret = -ETIMEDOUT;
+				goto err_unwind;
+			}
 			WRITE_ONCE(dcp->s2r_active, false);
-			dev_err(dev, "no D572 after the power-off\n");
-			ret = -ETIMEDOUT;
-			goto err_unwind;
 		}
-		WRITE_ONCE(dcp->s2r_active, false);
 		if (read_poll_timeout(iomfb_channels_idle, idle, idle, 1000, 200000, false, dcp)) {
 			dev_err(dev, "display calls still in flight after the power-off\n");
 			ret = -ETIMEDOUT;
@@ -11205,7 +11224,7 @@ err_unwind:
 				apple_dart_display_keep(dcp->s2r_dcp_dart,
 							DCP_S2R_DCP_STREAMS, false);
 		}
-		if (powered_off && dcp->s2r_disp_dart)
+		if ((powered_off || streams_off) && dcp->s2r_disp_dart)
 			apple_dart_display_streams(dcp->s2r_disp_dart,
 						   DCP_S2R_DISP_STREAMS, true, false);
 	}
