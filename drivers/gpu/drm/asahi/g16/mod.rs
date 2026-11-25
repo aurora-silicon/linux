@@ -62,6 +62,7 @@ mod graph;
 pub(crate) mod hw;
 mod initdata;
 mod job;
+mod lab;
 mod object;
 mod params;
 mod poll;
