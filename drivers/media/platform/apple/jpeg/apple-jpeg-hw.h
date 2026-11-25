@@ -36,6 +36,8 @@
 #define AJ_CODEC			0x028
 #define  AJ_CODEC_422			1
 #define  AJ_CODEC_420			3
+#define  AJ_CODEC_444			0
+#define  AJ_CODEC_GREY			4
 #define AJ_CODEC_MODE			0x02c	/* 1 encode */
 #define AJ_DECODE_ENABLE		0x034
 #define AJ_ENCODE_ENABLE		0x038
@@ -52,7 +54,7 @@
 #define AJ_PX_PLANE1_TILE_H		0x080
 #define AJ_PX_PLANE1_TILE_V		0x084
 #define AJ_PX_PLANE1_STRIDE		0x088
-#define AJ_T6050_PX_MODE		0x08c	/* T6050: the CODEC value for 4:2:0 */
+#define AJ_T6050_PX_MODE		0x08c	/* T6050: the input's chroma layout */
 #define AJ_PIXEL_FORMAT_YUV_PLANES	4
 #define AJ_T6050_PRE_ENCODE		0x1dc	/* T6050: cleared before MODE_ENCODE */
 #define AJ_T6050_ENC_CTRL		0x334
@@ -61,6 +63,8 @@
 #define  AJ_IO_FLAGS_ORDER		(BIT(4) | BIT(5))
 #define  AJ_IO_FLAGS_422		1
 #define  AJ_IO_FLAGS_420		2
+#define  AJ_IO_FLAGS_444		0
+#define  AJ_IO_FLAGS_GREY		3
 #define  AJ_IO_FLAGS_T6050		BIT(7)
 #define AJ_COMMAND			0x1004
 #define AJ_QTBL_SEL			0x100c
@@ -139,10 +143,21 @@ extern const struct apple_jpeg_variant apple_jpeg_t8112;
 extern const struct apple_jpeg_variant apple_jpeg_t8122;
 extern const struct apple_jpeg_variant apple_jpeg_t8140;
 
-/* T6050's 4:2:2 job programming is not known yet. */
-static inline bool apple_jpeg_has_422(const struct apple_jpeg_reg_layout *layout)
+/* Chroma subsampling of the raw input, which the JPEG keeps. */
+enum apple_jpeg_subsampling {
+	AJ_SUBSAMPLING_420,	/* NV12 */
+	AJ_SUBSAMPLING_422,	/* NV16 */
+	AJ_SUBSAMPLING_444,	/* NV24, T6050 job layout only */
+	AJ_SUBSAMPLING_GREY,	/* GREY, T6050 job layout only */
+};
+
+bool apple_jpeg_has_subsampling(const struct apple_jpeg_reg_layout *layout,
+				enum apple_jpeg_subsampling s);
+
+/* MCU height: 16 rows for 4:2:0, 8 for the others. */
+static inline u32 apple_jpeg_mcu_rows(enum apple_jpeg_subsampling s)
 {
-	return !layout->t6050_job;
+	return s == AJ_SUBSAMPLING_420 ? 16 : 8;
 }
 
 static inline bool
@@ -156,7 +171,7 @@ apple_jpeg_hwrev_supported(const struct apple_jpeg_variant *variant, u32 hwrev)
 struct apple_jpeg_job {
 	u32 width;
 	u32 height;
-	bool is422;		/* NV16: 4:2:2; NV12: 4:2:0 */
+	enum apple_jpeg_subsampling subsampling;
 	u32 luma_stride;
 	u32 chroma_stride;
 	u64 luma;
@@ -169,28 +184,49 @@ struct apple_jpeg_job {
 };
 
 /*
- * Raw input: one buffer, the luma rows, then the interleaved CbCr rows at
- * the same stride (V4L2 NV12/NV16). The engine prefetches its input up to
- * AJ_INPUT_END, so both planes must sit in one buffer that ends there: with
- * separate plane buffers it read past the end of whichever plane lies lower
- * and faulted. It also fetches whole MCU rows (16 for 4:2:0, 8 for 4:2:2);
- * the luma overrun lands in the chroma rows, and the buffer carries the
- * chroma rows up to the MCU boundary after the visible ones.
+ * Raw input: one buffer, the luma rows, then the interleaved CbCr rows
+ * (V4L2 NV12/NV16/NV24; GREY has no chroma). The CbCr rows have the luma
+ * stride, twice it for NV24, whose chroma is full width. The engine
+ * prefetches its input up to AJ_INPUT_END, so both planes must sit in one
+ * buffer that ends there: with separate plane buffers it read past the end
+ * of whichever plane lies lower and faulted. It also fetches whole MCU rows
+ * (16 for 4:2:0, 8 otherwise); the luma overrun lands in the chroma rows, and
+ * the buffer carries the chroma rows up to the MCU boundary after the
+ * visible ones. Without chroma, the luma rows themselves are padded to it.
  */
 struct apple_jpeg_layout {
 	u32 bytesperline;
+	u32 chroma_stride;
 	u32 chroma_offset;
 	u32 sizeimage;
 };
 
-static inline void apple_jpeg_raw_layout(u32 width, u32 height, bool is422,
+static inline void apple_jpeg_raw_layout(u32 width, u32 height,
+					 enum apple_jpeg_subsampling s,
 					 struct apple_jpeg_layout *l)
 {
-	u32 rows = ALIGN(height, is422 ? 8 : 16);
+	u32 rows = ALIGN(height, apple_jpeg_mcu_rows(s));
 
 	l->bytesperline = ALIGN(width, 16);
 	l->chroma_offset = l->bytesperline * height;
-	l->sizeimage = l->chroma_offset + l->bytesperline * (is422 ? rows : rows / 2);
+	switch (s) {
+	case AJ_SUBSAMPLING_420:
+		l->chroma_stride = l->bytesperline;
+		l->sizeimage = l->chroma_offset + l->chroma_stride * (rows / 2);
+		break;
+	case AJ_SUBSAMPLING_422:
+		l->chroma_stride = l->bytesperline;
+		l->sizeimage = l->chroma_offset + l->chroma_stride * rows;
+		break;
+	case AJ_SUBSAMPLING_444:
+		l->chroma_stride = 2 * l->bytesperline;
+		l->sizeimage = l->chroma_offset + l->chroma_stride * rows;
+		break;
+	default:
+		l->chroma_stride = 0;
+		l->sizeimage = l->bytesperline * rows;
+		break;
+	}
 }
 
 /* A kept CAPTURE size above the worst case is honoured up to this. */
