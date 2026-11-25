@@ -1457,6 +1457,8 @@ static const struct apple_dpxbar_hw apple_dpxbar_hw_t6020 = {
  * compact register map and flow: the status mirrors at 0x804/0x810/0x81c
  * follow 0x004/0x014/0x024 and 0x808/0x818 follow 0x00c/0x020, as on T6030.
  * The ADT lists nine UFP endpoints (dispext0-3, scodec0 and the DP IN ports).
+ * The ATC USB domain switches off at runtime, so it is only held while an
+ * output is selected; probe touches no register.
  */
 static const struct apple_dpxbar_hw apple_dpxbar_hw_t6041 = {
 	.n_mux = MUX_MAX,
@@ -1465,6 +1467,7 @@ static const struct apple_dpxbar_hw apple_dpxbar_hw_t6041 = {
 	.t6030_flow = true,
 	.no_tunable = true,
 	.t604x_dpin_atc = true,
+	.runtime_pm = true,
 };
 
 /*
