@@ -11,6 +11,7 @@
 //! retirement can complete its commands or their free-list references.
 
 use super::super::{Backend, DeferredBatch};
+use super::observe::FastRenderOutcome;
 use crate::g17::{
     job::Packet,
     object::Allocator,
@@ -296,19 +297,17 @@ impl crate::g17::Firmware {
 
     /// Takes a lent pair back and settles what its publication held: the
     /// free-list preparation is activated once published, rolled back with the
-    /// parameter-buffer reference otherwise.
+    /// parameter-buffer reference otherwise. True when a completion of the pair
+    /// arrived while it was lent: the caller owes the pair that observation.
     fn return_render(
         &mut self,
         slot: u8,
         loan: &mut Loan,
         activation: Option<(u16, u64)>,
         packet: &Arc<Packet>,
-    ) -> Result {
+    ) -> Result<bool> {
         self.queues.render.return_pair(slot, &mut loan.pair)?;
-        if self.queues.render.take_missed_event(slot) {
-            // The record is retired by the next pass's observation, like any completion.
-            self.primary.state.shared.queue_event_records();
-        }
+        let missed = self.queues.render.take_missed_event(slot);
         let entry = self.queues.render.entry_mut(slot)?;
         // A failure or timeout recorded against the lent pair is settled by the
         // event worker's collector, as after any other loan.
@@ -342,7 +341,7 @@ impl crate::g17::Firmware {
             self.queues.render.pools.rollback(preparation);
             self.queues.buffers.release(loan.buffer)?;
         }
-        Ok(())
+        Ok(missed)
     }
 }
 
@@ -468,13 +467,47 @@ impl Backend {
             Ok(())
         })();
         drop(m5_claim);
+        // The collector of the observation the return may owe, taken without waiting.
+        let mut collector = None;
         let returned = {
             let mut state = self.shared.state.lock();
             match (*state).as_deref_mut() {
                 Some(firmware) => {
                     let returned = firmware.return_render(slot, &mut loan, activation, packet);
+                    let returned = match returned {
+                        // A completion arrived while the pair was lent. The event pass it would
+                        // request takes the device mutex from another CPU after this owner's
+                        // next lend and finds the pair lent again: observe it here, in this
+                        // hold, unless recovery, a crash or another borrower's observation
+                        // leaves it to that pass.
+                        Ok(true) => {
+                            if !recovery_started
+                                && lease.is_current()
+                                && !self.shared.crashed.load(Ordering::Acquire)
+                            {
+                                collector = self.shared.render_collector.try_lock();
+                            }
+                            match collector.as_deref_mut() {
+                                Some(batch) => firmware.observe_returned_render(slot, batch),
+                                None => Ok(FastRenderOutcome::Fallback),
+                            }
+                            .map(|outcome| match outcome {
+                                // Retired by the next pass's observation, like any completion.
+                                FastRenderOutcome::Fallback => self.shared.queue_event_records(),
+                                FastRenderOutcome::Rescan => self.shared.queue_poll(),
+                                FastRenderOutcome::Done | FastRenderOutcome::Idle => {}
+                            })
+                        }
+                        Ok(false) => Ok(()),
+                        Err(error) => Err(error),
+                    };
                     let grow_ready = firmware.render_grow_ready();
                     drop(state);
+                    // Fences signal off the device mutex, before another borrower can collect.
+                    if let Some(batch) = collector.as_deref_mut() {
+                        batch.finish();
+                    }
+                    drop(collector);
                     if grow_ready {
                         self.shared.queue_grow();
                     }

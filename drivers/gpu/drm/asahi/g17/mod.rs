@@ -1319,14 +1319,19 @@ struct Shared {
     /// step). Publishers without the device mutex set it too.
     governor_activity_ns: AtomicU64,
     /// The queue of all work that signals job fences: the event work, and every scheduler's
-    /// timeout work. Memory reclaim may wait on those fences, so it is reclaim-safe, and high
-    /// priority. The event work runs in the cluster of the CPU that last published work, not
-    /// wherever the completion IRQ thread first ran (see `queue_event_records`). On M5 it is
-    /// unbound, so a worker of that CPU's affinity pod (its L2) runs it; elsewhere it is per-CPU.
+    /// timeout work. Memory reclaim may wait on those fences, so it is reclaim-safe, and it is
+    /// high priority, as `system_highpri_wq`. The event work runs in the cluster of the CPU that
+    /// last published work (see `queue_event_records`); [`Self::new_events_queue`] says where in
+    /// it.
     events: Arc<workqueue::OwnedQueue>,
     /// Preallocated completion collector owned exclusively by `run_runtime_events`.
     #[pin]
     worker_deferred: Mutex<Option<runtime::DeferredBatch>>,
+    /// Collector, as large as the event worker's, for the observation a render borrower owes the
+    /// pair it puts back (`Backend::render_direct`). Taken only with `try_lock`, so no borrower
+    /// waits for another, and finished after the device mutex is released.
+    #[pin]
+    render_collector: Mutex<runtime::DeferredBatch>,
     /// Restrict each scheduler's ordered submit queue to the creating CPU's cluster, beside the
     /// event work. Single-die M5 parts leave schedulers unrestricted so queues created on one
     /// thread do not contend on a single cluster under multi-queue load.
@@ -1685,6 +1690,30 @@ impl Shared {
         self.events.clone()
     }
 
+    /// The queue of [`Self::events`].
+    ///
+    /// On M5 the queue is unbound. [`Self::queue_event_records`] queues the event work where the
+    /// completion is taken when that is in the cluster of the CPU that last published work, and
+    /// aims it at that CPU otherwise. On an unbound queue either only selects the affinity pod,
+    /// the CPUs sharing that L2, and the scheduler wakes the worker on an idle CPU of the pod:
+    /// beside the submitter and on its die, wherever the completion interrupt was taken. On a
+    /// per-CPU queue the worker would run on the submitting CPU itself whenever the interrupt is
+    /// taken there and, with the higher priority, preempt the submitter for every completion,
+    /// often in the middle of a publication holding the locks the event work takes next. As
+    /// their owner would not be running, the worker could not spin on them: it would sleep until
+    /// the submitter unlocks and then preempt it again, two context switches of the submitter per
+    /// completion.
+    ///
+    /// Otherwise the queue is per-CPU and the event work runs on the CPU it is queued on, as on
+    /// `system_highpri_wq`.
+    fn new_events_queue(m5: bool) -> Result<workqueue::OwnedQueue> {
+        if m5 {
+            workqueue::OwnedQueue::new_unbound_reclaim(c"aurora_g17_events", true)
+        } else {
+            workqueue::OwnedQueue::new_percpu_reclaim(c"aurora_g17_events", true)
+        }
+    }
+
     /// Whether each scheduler's submit queue should be restricted to the creating CPU's cluster
     /// (all but single-die M5).
     pub(super) fn pin_scheduler_cluster(&self) -> bool {
@@ -1988,19 +2017,13 @@ impl Gpu {
         let render_policy = if m5 { Some(render_resources::M5Policy::new(&id)?) } else { None };
         // The bare-metal M5 boot runs both engines; other M5 profiles take no submission.
         let submits = !m5 || cfg.profile == FirmwareProfile::M5PublishedRoots;
-        let events = Arc::new(
-            if m5 {
-                workqueue::OwnedQueue::new_unbound_reclaim(c"aurora_g17_events", true)?
-            } else {
-                workqueue::OwnedQueue::new_percpu_reclaim(c"aurora_g17_events", true)?
-            },
-            GFP_KERNEL,
-        )?;
+        let events = Arc::new(Shared::new_events_queue(m5)?, GFP_KERNEL)?;
         let frequencies = Self::state_frequencies(dev, cfg, variant, id.num_clusters)?;
         let max_pstate = frequencies
             .as_ref()
             .map_or(0, stats::StateFrequencies::max_pstate);
         let worker_deferred = runtime::DeferredBatch::worker()?;
+        let render_collector = runtime::DeferredBatch::worker()?;
         let shared = Arc::pin_init(
             pin_init!(Shared {
                 drm <- new_mutex!(Some(dev.into()), "g17::Shared::drm"),
@@ -2048,6 +2071,7 @@ impl Gpu {
                     Some(worker_deferred),
                     "g17::Shared::worker_deferred"
                 ),
+                render_collector <- new_mutex!(render_collector, "g17::Shared::render_collector"),
                 pin_scheduler_cluster: !m5 || id.num_dies > 1,
                 submitter: AtomicU32::new(u32::MAX),
                 grow <- new_work!("g17::Shared::grow"),

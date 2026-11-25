@@ -69,7 +69,8 @@ def build_harness(mutation=None):
     runtime_src = (G17 / 'runtime.rs').read_text()
 
     notify_render = item(direct_src, 'fn notify_render(')
-    try_fast = item(observe_src, 'pub(in crate::g17::runtime) fn try_fast_observe_render(')
+    try_fast_entry = item(observe_src, 'pub(in crate::g17::runtime) fn try_fast_observe_render(')
+    try_fast = item(observe_src, 'fn fast_observe_renders(')
     observe_fn = item(observe_src, 'pub(in crate::g17) fn observe_renders(')
     turn = item(events_src, 'fn runtime_event_turn(')
     tracked_cv = item(mod_src, 'impl TrackedCondVar')
@@ -147,7 +148,8 @@ def build_harness(mutation=None):
         and 'self.queues.render_needs_rescan()' in try_fast
         and 'for _ in 0..crate::hw::t8140::queues::RENDER_SLOTS {' in try_fast
         and 'if !deferred.has_room(2)' in try_fast
-        and 'self.next_render_observation(1)?.is_some()' in try_fast
+        and 'self.next_render_observation_in(start, end)?.is_some()' in try_fast
+        and 'self.fast_observe_renders(1, end, deferred)' in try_fast_entry
         and 'FastRenderOutcome::Done' in try_fast
     )
 

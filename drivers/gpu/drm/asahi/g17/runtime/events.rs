@@ -547,6 +547,7 @@ impl crate::g17::Shared {
             // fences are signalled right after unlocking.
             let mut fast_done = false;
             let mut render_changed = false;
+            let mut rescan = false;
             if !recover
                 && !requested
                 && !self.crashed.load(core::sync::atomic::Ordering::Acquire)
@@ -562,6 +563,12 @@ impl crate::g17::Shared {
                             true
                         }
                         super::render::observe::FastRenderOutcome::Idle => true,
+                        // The full pass would find nothing more and arm the rescan poll.
+                        super::render::observe::FastRenderOutcome::Rescan => {
+                            render_changed = deferred.pending() != before;
+                            rescan = true;
+                            true
+                        }
                         super::render::observe::FastRenderOutcome::Fallback => {
                             render_changed = deferred.pending() != before;
                             false
@@ -570,7 +577,9 @@ impl crate::g17::Shared {
                 } else {
                     false
                 };
-                if render_clean && (compute_scan.is_some() || render_changed) {
+                // Render completions that found nothing to retire here (Idle) are owed to the
+                // borrowers of their pairs, which observe them on return.
+                if render_clean && (compute_scan.is_some() || render_changed || masks != [0; 2]) {
                     let scan = match compute_scan {
                         Some(scan) => scan,
                         None => {
@@ -609,7 +618,8 @@ impl crate::g17::Shared {
                         if let Some(delay) = firmware.idle_check(now, true)? {
                             self.queue_idle(delay);
                         }
-                        let polling = scan.polling || firmware.non_compute_runtime_polling(now);
+                        let polling =
+                            rescan || scan.polling || firmware.non_compute_runtime_polling(now);
                         if polling {
                             self.queue_poll();
                         } else if channel::Events::pending(&firmware.init, Role::Primary)?

@@ -282,6 +282,9 @@ ASAHI_TESTS = {
         + mutations('--mutation', ('unlocked-claim-outer', 'raw-compute-scope',
                                    'raw-render-scope', 'unlocked-scope-drop',
                                    'drop-direct-claim-on-fallback', 'pin-single-die'), []),
+    'g17-m5-event-placement-tests.py': [([], PASS)]
+        + mutations('--mutation', ('percpu-always', 'unbound-always', 'aim-local',
+                                   'record-never', 'not-reclaim', 'split-flag'), []),
     'g17-m5-render-fast-done-tests.py': [([], PASS)]
         + mutations('--mutation', ('hold-m5-outer-across-doorbell',
                                    'hold-render-lock-across-doorbell',
@@ -304,6 +307,12 @@ ASAHI_TESTS = {
     'g17-quarantine-drain-tests.py': [([], PASS)]
         + mutations('--mutation', ('no-drain-release', 'without-witness', 'ignore-leases', 'no-last-lease',
                                    'witness-covers-later-failure', 'unquarantined-drain'), []),
+    'g17-render-return-observe-tests.py': [([], PASS)]
+        + mutations('--mutation', ('rescan-owed', 'observe-all-slots', 'observe-ignores-gate',
+                                   'rescan-in-loop-bail', 'rescan-is-fallback', 'missed-dropped',
+                                   'observe-in-recovery', 'collector-blocks', 'finish-under-mutex',
+                                   'no-pass-requested', 'rescan-no-poll', 'worker-rescan-slow-path',
+                                   'owed-slow-path'), []),
     'g17-render-direct-recovery-tests.py': [([], PASS)]
         + mutations('--mutation', ('recovery-state-eio', 'drop-generation-check',
                                    'wrong-j813-pipe'), []),
