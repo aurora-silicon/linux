@@ -377,6 +377,12 @@ struct apple_dcp_hw_data {
 	/* A firmware 27 sleep in progress, and how it ended */
 	bool v27_sleep_protocol;
 	bool v27_sleep_recovery;
+	/*
+	 * Firmware 27: a firmware-driven system sleep stops the processor at its own suspend,
+	 * before the sleep's .enter, and restarts it warm at its resume (T6030), see
+	 * dcp_v27_early_suspend(). Needs @s2r_layout.
+	 */
+	bool v27_early_stop;
 	/* Required with @s2r */
 	const struct dcp_s2r_layout *s2r_layout;
 	/* @s2r with derived power words: off unless appledrm.s2r_untested is set */
@@ -915,6 +921,8 @@ struct apple_dcp {
 	/* Sleep endpoint inventory and control replies; not a normal RPC profile. */
 	bool v27_sleep_transport;
 	struct dcp_v27_sleep *sleep_v27;
+	/* Stopped at its own suspend for a firmware 27 sleep, see dcp_v27_early_suspend(). */
+	struct dcp_v27_early *v27_early;
 	bool sleep_v27_closed;
 	/*
 	 * Its display on a USB-C port was released for a firmware sleep and the DRM device

@@ -9186,6 +9186,21 @@ static const struct dcp_s2r_layout dcp_s2r_t8142 = {
 	.pmc_dcp = false,
 };
 
+/*
+ * T6030's, from the J516s ADT's PMGR devices (DISP_CPU, DISP_FE and DISP_SYS) and DISP_CPU's
+ * two retention words in the PMGR's power gates, which macOS 27.2 writes on J516s as T8140's
+ * around every DCP stop and start (the t5 trace). No pmc-dcp word, as on T8142. Its sleep's DART
+ * hold keeps the streams that are enabled (apple_dart_v27_cycle_off()): none are named here.
+ */
+static const struct dcp_s2r_layout dcp_s2r_t6030 = {
+	.disp_cpu = 0x10000,
+	.disp_fe = 0x258,
+	.disp_sys = 0x1c0,
+	.ret_ff = 0xe6c,
+	.ret_mem = 0xe90,
+	.pmc_dcp = false,
+};
+
 /* TEST: J813 external processors, ADT DISPEXT0/1 power words. */
 static const struct dcp_s2r_layout dcp_s2r_t8142_ext[] = {
 	{ .disp_cpu = 0x428, .disp_fe = 0x418, .disp_sys = 0x308,
@@ -10662,6 +10677,8 @@ static int dcp_platform_suspend(struct device *dev)
 
 	if (pm_suspend_via_firmware() && dcp_v27_sleep_selected(dcp))
 		return dcp_v27_sleep_suspend(dcp);
+	if (pm_suspend_via_firmware() && dcp_v27_early_selected(dcp))
+		return dcp_v27_early_suspend(dcp);
 
 	/*
 	 * J813 uses the same qualified stop as DPMS off. Probe already gates
@@ -10833,6 +10850,8 @@ static int dcp_platform_resume(struct device *dev)
 
 	if (dcp_v27_sleep_selected(dcp) && READ_ONCE(dcp->sleep_v27_closed))
 		return dcp_v27_sleep_resume(dcp);
+	if (dcp_v27_early_held(dcp))
+		return dcp_v27_early_resume(dcp);
 
 	if (dcp->s2r_stopped)
 		return dcp_s2r_resume(dcp);
@@ -10973,6 +10992,9 @@ static const struct apple_dcp_hw_data apple_dcp_hw_dcp = {
 static const struct apple_dcp_hw_data apple_dcp_hw_t6030 = {
 	.iboot_handoff = "apple,t6030-handoff",
 	.num_dptx_ports = 1,
+	/* Firmware 27.2's sleep: only with the DT's sleep arguments and display power words */
+	.v27_early_stop = true,
+	.s2r_layout = &dcp_s2r_t6030,
 };
 
 static const struct apple_dcp_hw_data apple_dcp_hw_t8122 = {
