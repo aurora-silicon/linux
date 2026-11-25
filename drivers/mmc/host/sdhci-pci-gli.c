@@ -1927,6 +1927,22 @@ static int sdhci_pci_gli_resume(struct sdhci_pci_chip *chip)
 	return sdhci_pci_resume_host(chip);
 }
 
+/*
+ * The GL9755 can lose power over system sleep (the Apple laptops cut it), and
+ * with it everything the probe wrote to its vendor registers: card detect
+ * polarity, the ASPM L1 entry delay and the D-state toggle that lets the chip
+ * enter L1.2. Without them the link keeps its clock request up after resume.
+ */
+static int gl9755_resume(struct sdhci_pci_chip *chip)
+{
+	struct sdhci_pci_slot *slot = chip->slots[0];
+
+	gl9755_hw_setting(slot);
+	gl9755_vendor_init(slot->host);
+
+	return sdhci_pci_gli_resume(chip);
+}
+
 static int gl9763e_resume(struct sdhci_pci_chip *chip)
 {
 	struct sdhci_pci_slot *slot = chip->slots[0];
@@ -2052,7 +2068,7 @@ const struct sdhci_pci_fixes sdhci_gl9755 = {
 	.remove_host	= sdhci_pci_uhs2_remove_host,
 	.ops            = &sdhci_gl9755_ops,
 #ifdef CONFIG_PM_SLEEP
-	.resume         = sdhci_pci_gli_resume,
+	.resume         = gl9755_resume,
 #endif
 };
 
