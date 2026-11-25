@@ -49,6 +49,7 @@
 
 #include "afk.h"
 #include "dcp.h"
+#include "dcp-display-metadata.h"
 #include "dcp-sdr-edid.h"
 #include "dptxep.h"
 #include "epic/dpavservep.h"
@@ -63,6 +64,7 @@
 #include "dcp-m4-property.h"
 #include "dcp-m4-frame.h"
 #include "dcp-refresh.h"
+#include "iomfb_plane.h"
 #include "parser.h"
 #include "t8132_ext_drm.h"
 
@@ -281,6 +283,8 @@ struct iomfb_m4 {
 	const struct drm_edid *ext_edid;
 	int ext_edid_link_gen;
 	unsigned int ext_edid_avserv_gen;
+	/* The primaries its frames carry, see iomfb_m4_ext_edid_published() */
+	u8 ext_colorspace;
 	/*
 	 * The sink generation, which a released route moves on (words received
 	 * before carry the old one and publish nothing); whether a
@@ -2262,6 +2266,9 @@ static int dcp_m4_runtime_swap_full(struct dcp_m4_runtime *r, bool primary,
 	if (!ret)
 		ret = dcp_m4_swap_encode_on(input, DCP_M4_SWAP_SIZE, id, primary, frame, upper,
 					    keep, brightness_change, nits, check, width, height);
+	if (!ret && ext)
+		dcp_m4_swap_set_colorspace(input, primary && frame, upper,
+					   READ_ONCE(dcp->ext_colorspace));
 	if (!ret && intent)
 		dcp_m4_swap_set_intent(input, intent, surface_id);
 	/*
@@ -3444,6 +3451,23 @@ const struct drm_edid *iomfb_m4_ext_edid(struct apple_dcp *owner)
 	mutex_unlock(&dcp->ext_modes_lock);
 	drm_edid_free(old);
 	return edid;
+}
+
+/*
+ * The firmware converts a frame from the primaries it is tagged with to the
+ * sink's, and reads an untagged frame as sRGB. A compositor draws in the gamut
+ * of the EDID the connector publishes, so a Display P3 one's frames are tagged
+ * Display P3, as the panel's are, and any other's stay untagged.
+ */
+void iomfb_m4_ext_edid_published(struct apple_dcp *owner, const struct drm_edid *edid)
+{
+	struct iomfb_m4 *dcp = owner->v26_6;
+	bool p3 = edid && dcp_edid_has_color_space(drm_edid_raw(edid),
+						   dcp_color_space_lookup("display-p3"));
+
+	if (dcp && dcp->external)
+		WRITE_ONCE(dcp->ext_colorspace,
+			   p3 ? DCP_COLORSPACE_P3_D65 : DCP_COLORSPACE_UNSPECIFIED);
 }
 
 /*

@@ -652,7 +652,10 @@ static int t8132_ext_get_modes(struct drm_connector *connector)
 			    connector->base.id, connector->name, edid);
 		edid = NULL;
 	}
-	drm_edid_connector_update(connector, edid);
+	if (drm_edid_connector_update(connector, edid))
+		iomfb_m4_ext_edid_published(owner, NULL);
+	else
+		iomfb_m4_ext_edid_published(owner, edid);
 	drm_edid_free(edid);
 	return count;
 }
