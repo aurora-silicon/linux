@@ -477,6 +477,25 @@ static int apple_sart_resume_noirq(struct device *dev)
 	return 0;
 }
 
+/* SARTv3 and SARTv4: entry i as the snapshot has it, config first, then address, then size. */
+static void apple_sart_write_saved(struct apple_sart *sart, int i)
+{
+	writel(sart->saved[i].flags, sart->regs + APPLE_SART3_CONFIG(i));
+	writel(sart->saved[i].paddr >> APPLE_SART3_PADDR_SHIFT,
+	       sart->regs + sart->ops->paddr_reg + 4 * i);
+	writel(sart->saved[i].size >> APPLE_SART3_SIZE_SHIFT,
+	       sart->regs + sart->ops->size_reg + 4 * i);
+}
+
+/* Whether entry i reads as the snapshot has it. What it reads is left in the arguments. */
+static bool apple_sart_reads_saved(struct apple_sart *sart, int i, u8 *flags,
+				   phys_addr_t *paddr, size_t *size)
+{
+	sart->ops->get_entry(sart, i, flags, paddr, size);
+	return *flags == sart->saved[i].flags && *paddr == sart->saved[i].paddr &&
+	       *size == sart->saved[i].size;
+}
+
 /*
  * A coprocessor's driver calls this right before its run bit. macOS writes the entries back
  * there, config first, then address, then size, so this does the same on SARTv3 and SARTv4.
@@ -497,14 +516,8 @@ int apple_sart_replay(struct apple_sart *sart)
 
 		if (!apple_sart_wake_writes(sart, i))
 			continue;
-		writel(sart->saved[i].flags, sart->regs + APPLE_SART3_CONFIG(i));
-		writel(sart->saved[i].paddr >> APPLE_SART3_PADDR_SHIFT,
-		       sart->regs + sart->ops->paddr_reg + 4 * i);
-		writel(sart->saved[i].size >> APPLE_SART3_SIZE_SHIFT,
-		       sart->regs + sart->ops->size_reg + 4 * i);
-		sart->ops->get_entry(sart, i, &flags, &paddr, &size);
-		if (flags == sart->saved[i].flags && paddr == sart->saved[i].paddr &&
-		    size == sart->saved[i].size)
+		apple_sart_write_saved(sart, i);
+		if (apple_sart_reads_saved(sart, i, &flags, &paddr, &size))
 			continue;
 		bad++;
 		dev_warn(sart->dev, "entry %d reads %#x %pa+%#zx, wrote %#x %pa+%#zx\n",
@@ -515,6 +528,45 @@ int apple_sart_replay(struct apple_sart *sart)
 	return bad;
 }
 EXPORT_SYMBOL_GPL(apple_sart_replay);
+
+/*
+ * For a driver that resets its coprocessor after the wake, right before the run bit: the
+ * reset may take what noirq resume wrote back. Each entry of the snapshot that is still
+ * owned, the bootloader's or one in use, has to read as before the sleep. One that doesn't is
+ * written back as apple_sart_replay() writes it, and read again. An idle entry is left alone:
+ * what it held went with its owner.
+ */
+int apple_sart_restore_owned(struct apple_sart *sart)
+{
+	int i, ret = 0;
+
+	if ((sart->ops != &sart_ops_v3 && sart->ops != &sart_ops_v4) ||
+	    !sart->replay_valid)
+		return -EOPNOTSUPP;
+
+	for (i = 0; i < APPLE_SART_MAX_ENTRIES; i++) {
+		phys_addr_t paddr;
+		size_t size;
+		u8 flags;
+
+		if (apple_sart_entry_idle(sart, i) || !apple_sart_wake_writes(sart, i))
+			continue;
+		if (apple_sart_reads_saved(sart, i, &flags, &paddr, &size))
+			continue;
+		dev_warn(sart->dev, "entry %d lost: reads %#x %pa+%#zx, writing back %#x %pa+%#zx\n",
+			 i, flags, &paddr, size, sart->saved[i].flags, &sart->saved[i].paddr,
+			 sart->saved[i].size);
+		apple_sart_write_saved(sart, i);
+		if (apple_sart_reads_saved(sart, i, &flags, &paddr, &size))
+			continue;
+		dev_err(sart->dev, "entry %d still reads %#x %pa+%#zx after its write\n",
+			i, flags, &paddr, size);
+		ret = -EIO;
+	}
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_sart_restore_owned);
 
 int apple_sart_sleep_validate(struct apple_sart *sart)
 {
