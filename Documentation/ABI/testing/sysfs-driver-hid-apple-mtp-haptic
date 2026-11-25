@@ -1,0 +1,18 @@
+What:		/sys/bus/hid/drivers/hid-apple-mtp-haptic/<dev>/click_strength
+Date:		November 2026
+KernelVersion:	7.3
+Contact:	linux-input@vger.kernel.org
+Description:
+		Strengths at which the actuator firmware plays its own click
+		waveforms while the actuator is device-controlled, written and
+		read as <press>,<release>, 1-255 each. They are used over the
+		device tree's apple,click-strength, and written again after
+		every resume.
+
+		0,0, the default, uses the device tree's values, or the
+		firmware's own when there are none; a strength set earlier is
+		then taken back to the firmware's boot value. A pair with only
+		one half 0 is refused.
+
+		Reading returns the pair last written here, not the device
+		tree's values.
