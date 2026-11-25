@@ -826,6 +826,12 @@ struct apple_sleep_soc {
 	 * and none is left running into the sleep.
 	 */
 	bool no_wd2;
+	/*
+	 * APCIE_SYS_GP is the general-purpose PCIe host's (Wi-Fi, the card reader), not ANS's,
+	 * whose link has domains of its own: at the refusal each answers for itself, and ANS's
+	 * link restore is the profile's, not the generic PCIe block's.
+	 */
+	bool gp_host_apart;
 };
 
 struct apple_sleep {
@@ -3463,6 +3469,33 @@ static void sleep_wake_masks(struct apple_sleep *s, u32 *val)
 }
 
 /* The last checks, then the stray words lowered: what has stopped may not return until a wake. */
+/*
+ * Where APCIE_SYS_GP is the general-purpose PCIe host's own, ANS and that host answer
+ * separately, and neither waives the other. Both words are logged once, whatever the outcome.
+ */
+static bool apple_sleep_refuse_ans_gp(struct apple_sleep *s, bool idled)
+{
+	const struct apple_sleep_domains *d = &s->soc->ps;
+	bool refused = false;
+
+	dev_info(s->dev, "ANS %#x, APCIE_SYS_GP %#x\n", readl(sleep_power_reg(s, d->ans)),
+		 readl(sleep_power_reg(s, d->apcie_sys_gp)));
+	/* Its driver stopped it, but no restore of its link after a real sleep is verified. */
+	if (idled) {
+		dev_err(s->dev, "refused: ANS's link has no verified restore after a real sleep\n");
+		refused = true;
+	} else if (sleep_ps_on(s, d->ans)) {
+		dev_err(s->dev, "refused: ANS is on with no driver to stop it\n");
+		refused = true;
+	}
+	/* No driver of that host has a qualified stop and restore of its port yet. */
+	if (sleep_ps_on(s, d->apcie_sys_gp)) {
+		dev_err(s->dev, "refused: the PCIe host on APCIE_SYS_GP is on with no driver to stop it\n");
+		refused = true;
+	}
+	return refused;
+}
+
 static int apple_sleep_refuse(struct apple_sleep *s)
 {
 	const struct apple_sleep_domains *d = &s->soc->ps;
@@ -3521,16 +3554,21 @@ static int apple_sleep_refuse(struct apple_sleep *s)
 	}
 
 	sleep_note(s, 0x22);
-	/* ANS's link needs these after a real power loss. */
-	if (idled && !s->soc->regions && !s->apcie_phy_tunable) {
-		dev_err(s->dev, "refused: no tunables to bring ANS's PCIe block back\n");
-		refused = true;
-	}
+	if (s->soc->gp_host_apart) {
+		if (apple_sleep_refuse_ans_gp(s, idled))
+			refused = true;
+	} else {
+		/* ANS's link needs these after a real power loss. */
+		if (idled && !s->soc->regions && !s->apcie_phy_tunable) {
+			dev_err(s->dev, "refused: no tunables to bring ANS's PCIe block back\n");
+			refused = true;
+		}
 
-	/* Only ANS's driver can stop it, and it doesn't come back without a real sleep. */
-	if (!idled && (sleep_ps_on(s, d->ans) || sleep_ps_on(s, d->apcie_sys_gp))) {
-		dev_err(s->dev, "refused: ANS or PCIe is on with no driver to stop it\n");
-		refused = true;
+		/* Only ANS's driver can stop it, and it doesn't come back without a real sleep. */
+		if (!idled && (sleep_ps_on(s, d->ans) || sleep_ps_on(s, d->apcie_sys_gp))) {
+			dev_err(s->dev, "refused: ANS or PCIe is on with no driver to stop it\n");
+			refused = true;
+		}
 	}
 
 	sleep_note(s, 0x23);

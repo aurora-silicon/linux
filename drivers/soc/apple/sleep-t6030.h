@@ -615,6 +615,8 @@ static const struct apple_sleep_soc t6030_sleep_soc = {
 	.early_cpu_wfi = true,
 	/* No write to WD2's registers in any of macOS's entries */
 	.no_wd2 = true,
+	/* pcie0 (Wi-Fi, the card reader) holds APCIE_SYS_GP; ANS is on APCIE_SYS_ST */
+	.gp_host_apart = true,
 	/* The ADT's spmi-chapel on nub-spmi0, and the sleep stage macOS writes to it */
 	.pmu_usid = 0xb,
 	.pmu_sleep_reg = 0xf801,
