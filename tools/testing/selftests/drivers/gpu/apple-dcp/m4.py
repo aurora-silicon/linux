@@ -13,7 +13,7 @@ import subprocess
 import zlib
 from pathlib import Path
 
-from common import block, run_unit
+from common import apple_function, block, run_unit
 
 HERE = Path(__file__).resolve().parent
 APPLE = Path('drivers/gpu/drm/apple')
@@ -652,8 +652,11 @@ int main(void)
 '''
 
 
-def blank(root):
+def backend(root):
+    """The actual present/blank and colour-matrix paths over a bounded mock transport."""
     backend = (root / APPLE / 'iomfb_m4.c').read_text()
+    iomfb_h = (root / APPLE / 'iomfb.h').read_text()
+    core = (root / 'drivers/gpu/drm/drm_color_mgmt.c').read_text()
     backlight = (root / APPLE / 'dcp_backlight.c').read_text()
     functions = '\n'.join(block(backlight, name) for name in (
         'bool dcp_backlight_active(', 'int dcp_backlight_dpms(',
@@ -682,6 +685,19 @@ typedef u64 dma_addr_t;
 typedef int64_t s64;
 typedef s64 ktime_t;
 #define max(x,y) ((x)>(y)?(x):(y))
+#define BIT_ULL(n) (1ULL << (n))
+#define WARN_ON(x) ((void)(x))
+#define clamp_val(v, lo, hi) ((v) < (lo) ? (lo) : (v) > (hi) ? (hi) : (v))
+#define dev_warn_ratelimited(d, ...) ((void)(d), printf(__VA_ARGS__))
+struct drm_color_ctm { u64 matrix[9]; };
+''' + block(core, 'u64 drm_color_ctm_s31_32_to_qm_n(') + '\n' + apple_function(root, 'dcp_ctm_to_fw') + '\n' + \
+        block(iomfb_h, 'struct iomfb_set_matrix_req {') + ' __attribute__((packed));\n' + \
+        block(iomfb_h, 'struct iomfb_set_matrix_resp {') + ' __attribute__((packed));\n' + r'''
+_Static_assert(sizeof(struct iomfb_set_matrix_req) == 80, "set_matrix request");
+/* What the firmware saw, in order: M a set_matrix, P a power-up, S a swap. */
+static char events[64];
+static void event(char c)
+{ size_t n=strlen(events); assert(n+1<sizeof(events)); events[n]=c; events[n+1]=0; }
 static ktime_t clock_ns;
 static ktime_t ktime_get(void) { return clock_ns += 1000; }
 static s64 ktime_us_delta(ktime_t later,ktime_t earlier) { return (later-earlier)/1000; }
@@ -703,6 +719,10 @@ struct dcp_m4_runtime { struct iomfb_m4 *dcp; };
 struct iomfb_m4 {
     struct apple_dcp *owner;
     struct dcp_m4_runtime *runtime;
+    void *dev;
+    bool external;
+    u64 ctm[9];
+    bool ctm_set,ctm_pending;
     int lock,error;
     struct drm_framebuffer *active_fb,*uncertain_fb;
     struct dcp_m4_frame active_frame;
@@ -735,7 +755,24 @@ static unsigned cache_kicks;
 static void iomfb_m4_idle_cache_kick(struct iomfb_m4 *dcp) { assert(dcp->lock==1); cache_kicks++; }
 static unsigned power_offs,power_ons;
 static int dcp_m4_set_power_state(struct iomfb_m4 *dcp,bool on)
-{ assert(dcp->lock==1); if(on) power_ons++; else power_offs++; return 0; }
+{ assert(dcp->lock==1); if(on) { power_ons++; event('P'); } else power_offs++; return 0; }
+/* The transport of set_matrix: the request as sent, the status to reply. */
+static unsigned matrix_calls;
+static u8 matrix_request[80];
+static u32 matrix_status;
+static int matrix_error;
+static int dcp_m4_runtime_call(void *cookie,unsigned method,bool remote,const void *in,
+    u32 in_size,void *out,u32 out_size)
+{
+    struct dcp_m4_runtime *r=cookie;
+    assert(r->dcp->lock==1 && method==423 && !remote);
+    assert(in_size==sizeof(matrix_request) && out_size==4);
+    memcpy(matrix_request,in,in_size); matrix_calls++; event('M');
+    /* A failed call fails the session, as dcp_m4_runtime_call_stream() does. */
+    if(matrix_error) { dcp_m4_failed(r->dcp,matrix_error); return matrix_error; }
+    put_unaligned_le32(matrix_status,out);
+    return 0;
+}
 static int dcp_m4_runtime_live(struct dcp_m4_runtime *r) { return r->dcp->error; }
 static int iomfb_m4_power_ungate(struct iomfb_m4 *dcp)
 {
@@ -756,6 +793,7 @@ static int dcp_m4_runtime_swap_brightness(struct dcp_m4_runtime *r,
     struct dcp_m4_swap_state swap={0};
     u32 before=r->dcp->owner->backlight.state.actual;
     assert(r->dcp->lock==1);
+    event('S');
     assert(!dcp_m4_swap_encode(bytes,sizeof(bytes),++publications,frame,brightness,nits));
     assert(!dcp_m4_swap_begin(&swap,publications));
     carried_brightness=brightness; carried_nits=nits;
@@ -770,7 +808,12 @@ static int dcp_m4_runtime_swap_brightness(struct dcp_m4_runtime *r,
     return 0;
 }
 ''' + functions + '\n' + '\n'.join(block(backend, name) for name in (
-        'static int iomfb_m4_swap(', 'int iomfb_m4_present(', 'int iomfb_m4_blank(')) + r'''
+        'static int iomfb_m4_swap(', 'static int iomfb_m4_send_ctm(', 'bool iomfb_m4_has_ctm(',
+        'int iomfb_m4_set_ctm(', 'int iomfb_m4_present(', 'int iomfb_m4_blank('))
+
+
+def blank(root):
+    return backend(root) + r'''
 int main(void)
 {
     for(order=0;order<2;order++) {
@@ -852,10 +895,134 @@ int main(void)
         assert(fb.refs==1 && !dcp.active_fb);
         ungate_error=0; power_gate_ms=0;
     }
+    assert(!matrix_calls);
     puts("PASS DPMS-off blank carries zero before delayed work and completes only after both exact receipts");
     puts("PASS actual present/blank retain active+uncertain DMA framebuffer references across a missing receipt");
     puts("PASS a present while the display is powered off for sleep is refused without a reference");
     puts("PASS a blank powers the display down once, and the next frame powers it back up");
+    return 0;
+}
+'''
+
+
+def ctm(root):
+    """The panel's colour matrix: when set_matrix goes out, what it carries, and its failures."""
+    return backend(root) + r'''
+#define NEG (1ULL << 63)
+static u64 coefficient(int i)
+{ u64 v=0; for(int b=7;b>=0;b--) v=v<<8|matrix_request[4+8*i+b]; return v; }
+static void expect(const char *seen)
+{ if(strcmp(events,seen)) printf("FAIL events %s, expected %s\\n",events,seen); assert(!strcmp(events,seen)); events[0]=0; }
+int main(void)
+{
+    struct drm_format_info fmt={.format=DRM_FORMAT_XRGB8888,.num_planes=1};
+    struct drm_framebuffer fb={.format=&fmt,.width=2560,.height=1664,.pitches={10240},.refs=1};
+    struct apple_dcp owner={0};
+    struct iomfb_m4 dcp={.owner=&owner};
+    struct dcp_m4_runtime runtime={.dcp=&dcp};
+    /* 4000 K-like: red kept, green and blue lowered, one negative term. */
+    struct drm_color_ctm warm={{1ULL<<32,0,0, 0,0xc0000000ULL,0, NEG|0x10000000ULL,0,0x80000000ULL}};
+    struct drm_color_ctm warmer=warm;
+    order=1;
+    owner.v26_6=&dcp; dcp.runtime=&runtime;
+    assert(!dcp_bl_init(&owner.backlight.state,500,true,120,false,0));
+    assert(iomfb_m4_has_ctm(&owner));
+
+    /* No matrix asked for (every enable says color_mgmt_changed): nothing sent. */
+    assert(!iomfb_m4_set_ctm(&owner,NULL,true));
+    assert(!iomfb_m4_set_ctm(&owner,NULL,false));
+    assert(!iomfb_m4_present(&owner,&fb,0x10000100000ULL,0x2000000));
+    expect("S");
+    assert(!matrix_calls && !dcp.ctm_set);
+
+    /* With a frame: the matrix, then that frame's swap. */
+    assert(!iomfb_m4_set_ctm(&owner,&warm,false));
+    assert(!matrix_calls && dcp.ctm_pending);
+    assert(!iomfb_m4_present(&owner,&fb,0x10000100000ULL,0x2000000));
+    expect("MS");
+    assert(matrix_calls==1 && !dcp.ctm_pending);
+    assert(get_unaligned_le32(matrix_request)==9);           /* location */
+    assert(coefficient(0)==1ULL<<32 && coefficient(4)==0xc0000000ULL);
+    assert(coefficient(6)==0xfffffffff0000000ULL);          /* -1/16, two's complement */
+    assert(coefficient(8)==0x80000000ULL && !matrix_request[76]); /* not null */
+
+    /* Unchanged (a brightness commit, say): not sent again, alone or with a frame. */
+    assert(!iomfb_m4_set_ctm(&owner,&warm,true));
+    assert(!iomfb_m4_set_ctm(&owner,&warm,false));
+    assert(!iomfb_m4_present(&owner,&fb,0x10000100000ULL,0x2000000));
+    expect("S");
+    assert(matrix_calls==1);
+
+    /* A commit without a frame: the matrix, then the frame on screen again. */
+    unsigned refs=fb.refs;
+    warmer.matrix[8]=0x40000000ULL;
+    assert(!iomfb_m4_set_ctm(&owner,&warmer,true));
+    expect("MS");
+    assert(matrix_calls==2 && coefficient(8)==0x40000000ULL && fb.refs==refs && dcp.active_fb==&fb);
+
+    /* Back to none: the identity goes out. */
+    assert(!iomfb_m4_set_ctm(&owner,NULL,true));
+    expect("MS");
+    for(int i=0;i<9;i++)
+        assert(coefficient(i)==(i%4==0 ? 1ULL<<32 : 0));
+
+    /* Blanked: kept until the frame that powers the display up, then sent first. */
+    assert(!iomfb_m4_blank(&owner));
+    expect("S");
+    assert(!iomfb_m4_set_ctm(&owner,&warm,true));
+    assert(!events[0] && dcp.ctm_pending);
+    assert(!iomfb_m4_present(&owner,&fb,0x10000100000ULL,0x2000000));
+    expect("PMS");
+
+    /* Refused: the frame is still shown, and only a new matrix is sent again. */
+    matrix_status=2;
+    assert(!iomfb_m4_set_ctm(&owner,&warmer,true));
+    expect("MS");
+    assert(!dcp.error && !dcp.ctm_pending);
+    matrix_status=0;
+    assert(!iomfb_m4_present(&owner,&fb,0x10000100000ULL,0x2000000));
+    expect("S");
+    assert(!iomfb_m4_set_ctm(&owner,&warm,true));
+    expect("MS");
+    assert(matrix_calls==6);
+
+    /* A failed transport fails the session: no swap follows, the frame on screen stays. */
+    {
+        struct drm_framebuffer next=fb;
+        struct apple_dcp o2={0};
+        struct iomfb_m4 d2={.owner=&o2};
+        struct dcp_m4_runtime r2={.dcp=&d2};
+        o2.v26_6=&d2; d2.runtime=&r2; next.refs=1;
+        assert(!dcp_bl_init(&o2.backlight.state,500,true,120,false,0));
+        assert(!iomfb_m4_present(&o2,&fb,0x10000100000ULL,0x2000000));
+        expect("S");
+        refs=fb.refs;
+        matrix_error=-ETIMEDOUT;
+        assert(!iomfb_m4_set_ctm(&o2,&warm,false));
+        assert(iomfb_m4_present(&o2,&next,0x10000300000ULL,0x2000000)==-ETIMEDOUT);
+        expect("M");
+        assert(d2.error==-ETIMEDOUT && d2.active_fb==&fb && fb.refs==refs && next.refs==1);
+        matrix_error=0;
+    }
+
+    /* An external DCP has no matrix. */
+    {
+        struct apple_dcp o3={0};
+        struct iomfb_m4 d3={.owner=&o3,.external=true};
+        struct dcp_m4_runtime r3={.dcp=&d3};
+        o3.v26_6=&d3; d3.runtime=&r3;
+        assert(!iomfb_m4_has_ctm(&o3));
+        assert(!iomfb_m4_set_ctm(&o3,&warm,true) && !events[0] && !d3.ctm_set);
+    }
+    /* Shown frames restart the idle-cache countdown; nothing here powers down. */
+    assert(cache_kicks && !scheduled && !ungates);
+    (void)cancelled; (void)ons_at_ungate; (void)deferred_kicks; (void)power_offs;
+    (void)carried_nits; (void)carried_brightness;
+    puts("PASS no set_matrix until a matrix is asked for, and none for an unchanged one");
+    puts("PASS set_matrix (location 9, two's complement Q32.32) goes before the swap that shows it");
+    puts("PASS a frameless commit presents the frame on screen again; blanked, the power-up frame carries it");
+    puts("PASS a refused matrix leaves frames going; a failed transport fails the session before any swap");
+    puts("PASS an external DCP offers no matrix");
     return 0;
 }
 '''

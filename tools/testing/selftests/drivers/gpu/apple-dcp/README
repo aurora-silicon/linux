@@ -159,6 +159,16 @@ changed value, a missing or duplicated ID 2, a second preferred element and
 more elements than the profile allows. This does not show what the firmware
 reports on hardware.
 
+The m4-panel-ctm case runs the actual colour-matrix, present and blank
+functions with a mock set_matrix transport. Nothing is sent until the CRTC
+first has a matrix, and an unchanged one is not sent again. A matrix goes out
+as set_matrix (A423, location 9, two's complement Q32.32) before the swap of
+its commit's frame, or before the frame on screen presented again for a
+commit without one; while blanked it waits for the frame that powers the
+display up. A refused matrix leaves frames going; a failed transport fails the
+session before any swap. Whether the firmware applies the matrix is a hardware
+question.
+
 run-native-m4-kms.py defaults to dry run; --compile-only needs libdrm development
 headers and never opens DRM. Explicit --execute requires root, an exact fresh
 source/Image/boot identity, the common appledrm module, a stopped display
