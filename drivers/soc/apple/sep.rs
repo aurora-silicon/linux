@@ -688,6 +688,12 @@ struct SepData {
     /// The enclave didn't answer a sleep request or a wake this boot: no deep sleep until a
     /// reboot, as a commit over a running enclave resets the SoC.
     sleep_unanswered: Atomic<bool>,
+    // A control request (EP0 NOP) got its tag-matched reply at attach: a sleep-only profile
+    // arms the enclave's sleep only then, as PHASE_READY alone doesn't say bring-up worked.
+    control_answered: Atomic<bool>,
+    // A sleep-only profile's bring-up completed: endpoints found, the xART buffer registered
+    // and a NOP answered. Its enclave's sleep is armed only then.
+    sleep_ready: Atomic<bool>,
 
     #[pin]
     ool_xarm: Mutex<Option<OolPair>>,
@@ -1097,8 +1103,11 @@ impl SepData {
         let xart_guard =
             xart_guard::level(module_parameters::xart_guard.value(), profile.xart_guard);
         // SEP writes are always on. Only the key-store-only initrd phase opens
-        // the store read-only, until complete_attach reopens it writable.
-        let xart_writes = if keystore_only {
+        // the store read-only, until complete_attach reopens it writable, and a
+        // sleep-only profile, which never does.
+        let xart_writes = if profile.sleep_only {
+            false
+        } else if keystore_only {
             attach::initrd_xart_writes(keystore_user_bags, xart_guard)
         } else {
             true
@@ -1158,7 +1167,7 @@ impl SepData {
             }
         };
 
-        let mut host_store = if keystore_only {
+        let mut host_store = if keystore_only || profile.sleep_only {
             None
         } else {
             match store::Store::open() {
@@ -1235,6 +1244,8 @@ impl SepData {
                 sleep_rx_held: Atomic::new(false),
                 sleep_at_suspend: Atomic::new(false),
                 sleep_unanswered: Atomic::new(false),
+                control_answered: Atomic::new(false),
+                sleep_ready: Atomic::new(false),
                 ool_xarm <- new_mutex!(Some(ool_xarm)),
                 ool_sbio <- new_mutex!(Some(ool_sbio)),
                 ool_sks <- new_mutex!(Some(ool_sks)),
@@ -1552,6 +1563,14 @@ impl SepData {
     /// Prepare a firmware-driven suspend without sending SLEEP. The platform
     /// owns the irreversible request, after every returnable refusal.
     pub(crate) fn sleep_enter(&self) -> Result<()> {
+        // Before either path: a sleep-only enclave whose bring-up didn't complete isn't slept.
+        if self.profile.sleep_only && !self.sleep_ready.load(Relaxed) {
+            dev_err_ratelimited!(
+                self.dev,
+                "sleep refused: the sleep-only enclave's bring-up did not complete\n"
+            );
+            return Err(EBUSY);
+        }
         // T6041: its sleep driver has no sleep core commit, so the enclave is told now.
         if !pm::platform_commit() {
             return self.sleep_enter_at_suspend();
@@ -2147,7 +2166,10 @@ impl SepData {
 
     fn control_survey(&self) {
         for param in [0x00u8, 0x01, 0xff] {
-            let _ = self.control_request(&proto::op_nop(param));
+            // control_wait matched the reply to the request's tag.
+            if let Ok(Some(_)) = self.control_request(&proto::op_nop(param)) {
+                self.control_answered.store(true, Relaxed);
+            }
         }
 
         let _ = self.control_request(&proto::op_security_mode());
@@ -2170,7 +2192,8 @@ impl SepData {
     }
 
     fn tick_ready(this: &Arc<SepData>) {
-        if this.rng.lock().is_some() {
+        // A sleep-only enclave serves nothing else, entropy included.
+        if this.profile.sleep_only || this.rng.lock().is_some() {
             return;
         }
         let used = this.rng_survey_attempts.load(Relaxed);
@@ -3214,6 +3237,22 @@ impl SepData {
             }
         }
 
+        if this.profile.sleep_only {
+            // Discovery, the control survey and the xART buffer only: nothing written, nothing
+            // enrolled. Reached only after the buffer's registration succeeded.
+            this.sleep_ready
+                .store(this.control_answered.load(Relaxed), Relaxed);
+            dev_info_ratelimited!(
+                this.dev,
+                "sleep only ({}): key store, sensor and enrolment not brought up; control answered: {}\n",
+                this.profile.name,
+                this.control_answered.load(Relaxed)
+            );
+            diag::bringup_ended();
+            this.finish_bringup();
+            Self::arm_settle(this);
+            return;
+        }
         if this.keystore_only.load(Relaxed) {
             this.run_keystore_bringup();
             diag::keystore_ended();
@@ -3244,6 +3283,10 @@ impl SepData {
 
     /// Completes the original attach without sending a second registration.
     fn complete_attach(&self) -> Result<()> {
+        // A sleep-only enclave never reopens its store writable.
+        if self.profile.sleep_only {
+            return Err(EPERM);
+        }
         self.attach_phase.lock().complete(|| self.finish_attach())
     }
 
@@ -3822,13 +3865,14 @@ impl platform::Driver for SepDriver {
 
         data.attach(&sep_node)?;
 
-        if module_parameters::filevault_api.value() != 0 {
+        // A sleep-only enclave serves nothing of its key store: no FileVault, no trusted keys.
+        if module_parameters::filevault_api.value() != 0 && !data.profile.sleep_only {
             if let Err(e) = data.register_fv_kernel() {
                 dev_err_ratelimited!(dev, "could not register the FileVault kernel API: {:?}\n", e);
             }
         }
 
-        if module_parameters::trusted_keys.value() != 0 {
+        if module_parameters::trusted_keys.value() != 0 && !data.profile.sleep_only {
             if let Err(e) = trusted::register(data.clone()) {
                 dev_warn_ratelimited!(data.dev, "trusted-keys: registration failed ({:?})\n", e);
             }

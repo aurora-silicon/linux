@@ -188,6 +188,10 @@ pub(crate) struct PlatformProfile {
     /// The `xart_guard` level when the parameter is left at its default (see
     /// [`crate::xart_guard`]).
     pub(crate) xart_guard: u8,
+    /// Only the enclave's sleep protocol is qualified: its xART store is opened read-only,
+    /// and neither the key store, the sensor, enrolment nor the Linux host-state store is
+    /// brought up. Sleep is armed only after an answered control request.
+    pub(crate) sleep_only: bool,
 }
 
 pub(crate) const T8103: PlatformProfile = PlatformProfile {
@@ -226,6 +230,7 @@ pub(crate) const T8103: PlatformProfile = PlatformProfile {
     // Off: Touch ID setup on a cold-boot SEP rewrites a session record that
     // predates Linux, so the guard would only block it.
     xart_guard: 0,
+    sleep_only: false,
 };
 
 /// M1 Pro (J316s). The M1 family cold-boots its SEP like T8103, so the boot
@@ -267,6 +272,7 @@ pub(crate) const T6000: PlatformProfile = PlatformProfile {
     // As T8103. On J316s, creating the identity keybag also rewrites a
     // session record that predates Linux.
     xart_guard: 0,
+    sleep_only: false,
 };
 
 pub(crate) const T6020: PlatformProfile = PlatformProfile {
@@ -300,6 +306,7 @@ pub(crate) const T6020: PlatformProfile = PlatformProfile {
     nonce_session: false,
     // A warm-attach enclave shared with macOS, as on T8112.
     xart_guard: 1,
+    sleep_only: false,
 };
 
 /// M2 Pro/Max on system firmware before 26.3. Their enclave refuses the
@@ -356,6 +363,7 @@ pub(crate) const T8140: PlatformProfile = PlatformProfile {
     // Linux records from before the guard's list exist here, and Linux has
     // left the macOS records unchanged on this platform.
     xart_guard: 0,
+    sleep_only: false,
 };
 
 /// MacBook Air M2 (J413, J415). iBoot leaves the SEP running and the Mesa
@@ -401,6 +409,7 @@ pub(crate) const T8112: PlatformProfile = PlatformProfile {
     nonce_session: false,
     // Guarded from its first Linux boot (2026-10-16): no record refused.
     xart_guard: 1,
+    sleep_only: false,
 };
 
 /// MacBook Air M3 (J613, J615). The J613 and J615 ADTs (26.6.2, 25G83) are
@@ -428,6 +437,25 @@ pub(crate) const T8122: PlatformProfile = PlatformProfile {
     // A warm-attach enclave shared with macOS, as on T8112.
     xart_guard: 1,
     ..T8112
+};
+
+/// MacBook Pro 16" M3 Pro (J516s). Its macOS 27.2 (26B123) ioreg records a pre-booted
+/// SEP (`sepfw-booted` = 1) whose DART aperture starts at the BIT(40) alias (`vm-base`
+/// 0x10000004000, `vm-size` 0xffff0000), as J613's does, and a Mesa sensor with
+/// `sensor-id` 0x3352 on spi2 at 0x289108000. So the SoC side is J613's.
+///
+/// Only the enclave's sleep is qualified here ([`PlatformProfile::sleep_only`]): no key store,
+/// sensor, enrolment or xART write has run on this board, and none is started. The sensor's
+/// other fields are J613's, for diagnostics only; sleep-only never opens the bus.
+pub(crate) const T6030: PlatformProfile = PlatformProfile {
+    name: "T6030/J516s (sleep only)",
+    sensor: SensorProfile {
+        controller_base: 0x2_8910_8000,
+        ..T8122.sensor
+    },
+    persistent_enrol: false,
+    sleep_only: true,
+    ..T8122
 };
 
 /// MacBook Pro 16" M4 Pro (J616s). The J616s ADT (26.6.2, 25G83) records a
@@ -542,6 +570,8 @@ static_assert!(T8132.nonce_session && T8132.wide_dma_mask);
 static_assert!(T8142.sensor.controller_base == 0x3a5108000);
 static_assert!(T8142.sensor.expected_id == T8132.sensor.expected_id);
 static_assert!(T8142.nonce_session && T8142.wide_dma_mask);
+static_assert!(T6030.sleep_only && !T6030.persistent_enrol && T6030.wide_dma_mask);
+static_assert!(!T8122.sleep_only && !T6050.sleep_only);
 
 /// Whether the machine root declares `compatible`.
 ///
@@ -697,6 +727,10 @@ fn select(
     if has(b"apple,t8122") && (has(b"apple,j613") || has(b"apple,j615")) {
         return Ok(&T8122);
     }
+    // Sleep only, and only the board whose ioreg was read.
+    if has(b"apple,t6030") && has(b"apple,j516s") {
+        return Ok(&T6030);
+    }
     // The T6040 profile is tested on J614s and J616s.
     if has(b"apple,t6040") && (has(b"apple,j616s") || has(b"apple,j614s")) {
         return Ok(&T6040);
@@ -827,6 +861,9 @@ mod tests {
         assert_eq!(picked(&[b"apple,j716c", b"apple,t6050"]), Some(T6050.name));
         assert_eq!(picked(&[b"apple,j716c", b"apple,t6041"]), None);
         assert_eq!(picked(&[b"apple,t6050"]), None);
+        assert_eq!(picked(&[b"apple,j516s", b"apple,t6030"]), Some(T6030.name));
+        assert_eq!(picked(&[b"apple,t6030"]), None);
+        assert_eq!(picked(&[b"apple,j514s", b"apple,t6030"]), None);
     }
 
     /// Touch ID has one path for every Mac. The retry limits, the lock
