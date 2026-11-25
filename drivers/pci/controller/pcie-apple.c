@@ -2970,10 +2970,17 @@ static int apple_pcie_setup_link(struct apple_pcie *pcie,
 	u32 stat;
 	int ret;
 
-	/* Bringing the link up again, after a deep sleep. */
+	/*
+	 * Bringing the link up again, after a deep sleep, which reset the pin: its mux and its
+	 * direction go back with PERST# asserted, as at probe. An input first, so that the
+	 * output reaches the pin even from a pin controller that answers from its cache.
+	 */
 	if (port->perst_gpio) {
 		reset = port->perst_gpio;
 		pwren = port->pwren_gpio;
+		ret = gpiod_direction_input(reset) ?: gpiod_direction_output(reset, 1);
+		if (ret)
+			return ret;
 		goto have_gpios;
 	}
 
