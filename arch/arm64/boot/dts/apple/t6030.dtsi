@@ -1338,6 +1338,8 @@
 			      <0x3 0x6de00000 0x0 0x100000>;
 			reg-names = "smc", "sram";
 			mboxes = <&smc_mbox>;
+			/* macOS 27.2 sets WKTP to its sleep value going to sleep on J516s. */
+			apple,sleep-wake-type;
 
 			smc_gpio: gpio@67500000 {
 				compatible = "apple,smc-gpio";
