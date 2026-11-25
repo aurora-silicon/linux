@@ -2569,8 +2569,9 @@ impl super::Firmware {
     }
 
     #[inline(never)]
-    fn publish_compute_inputs(&mut self, owner: u64, target_qid: u8, packet: Arc<super::job::Packet>,
-        dependencies: &[super::fw::kick::KickDependency], deferred: &mut DeferredBatch) -> Result
+    fn publish_compute_inputs(&mut self, owner: u64, target_qid: u8,
+        packet: Arc<super::job::Packet>, dependencies: &[super::fw::kick::KickDependency],
+        deferred: &mut DeferredBatch) -> Result
     {
         if self.recovery.pending() || super::recovery::Memory::recovery_state(&self.init)? != 0 {
             return Err(EAGAIN);
@@ -3115,7 +3116,11 @@ impl Backend {
     /// [`compute::Queue::sustained`]). Every other command streams down the primary ring: short
     /// kicks run faster there than spread over several QIDs, and a semaphore hop between queues
     /// stays on one ring per queue.
-    fn fans_out(&self, packet: &super::job::Packet, primary_sustained: impl FnOnce() -> bool) -> bool {
+    fn fans_out(
+        &self,
+        packet: &super::job::Packet,
+        primary_sustained: impl FnOnce() -> bool,
+    ) -> bool {
         self.compute_channels > 1
             && packet.order.wait_through[1].is_none()
             && packet.completion.sources().is_none()

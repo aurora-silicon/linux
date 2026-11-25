@@ -79,7 +79,11 @@ impl Backend {
             return Ok(Decision::Own);
         }
         firmware.scan_compute(None, deferred)?;
-        if !firmware.queues.compute_for_packet(self.owner, packet).is_some_and(|queue| queue.retired_held(packet)) {
+        if !firmware
+            .queues
+            .compute_for_packet(self.owner, packet)
+            .is_some_and(|queue| queue.retired_held(packet))
+        {
             return Ok(Decision::Own);
         }
         static REPORTED: AtomicU32 = AtomicU32::new(0);

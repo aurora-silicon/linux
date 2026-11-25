@@ -677,10 +677,12 @@ impl Pair {
 struct RenderBarriers {
     tiling: [KickDependency; 4 + crate::g17::pairs::COMPUTE_CHANNELS_MAX],
     tiling_count: usize,
-    fragment: [KickDependency; 3 + crate::g17::pairs::COMPUTE_CHANNELS_MAX + crate::g17::hazard::PUBLICATION_BARRIERS],
+    fragment: [KickDependency;
+        3 + crate::g17::pairs::COMPUTE_CHANNELS_MAX + crate::g17::hazard::PUBLICATION_BARRIERS],
     fragment_count: usize,
     tiling_types: [u8; 5 + crate::g17::pairs::COMPUTE_CHANNELS_MAX],
-    fragment_types: [u8; 4 + crate::g17::pairs::COMPUTE_CHANNELS_MAX + crate::g17::hazard::PUBLICATION_BARRIERS],
+    fragment_types: [u8;
+        4 + crate::g17::pairs::COMPUTE_CHANNELS_MAX + crate::g17::hazard::PUBLICATION_BARRIERS],
 }
 
 /// The last fragment kick published on any pair, and the last one of a render with an API task
@@ -749,8 +751,8 @@ fn render_barriers(
     let fragment_stage = fragment_stage || stage_prefixes;
     let mut tiling_barriers = [KickDependency::ZERO; 4 + crate::g17::pairs::COMPUTE_CHANNELS_MAX];
     let mut tiling_count = 0;
-    let mut fragment_barriers =
-        [own_tiling; 3 + crate::g17::pairs::COMPUTE_CHANNELS_MAX + crate::g17::hazard::PUBLICATION_BARRIERS];
+    let mut fragment_barriers = [own_tiling;
+        3 + crate::g17::pairs::COMPUTE_CHANNELS_MAX + crate::g17::hazard::PUBLICATION_BARRIERS];
     let mut fragment_count = 1;
     let mut tiling_types = [1; 5 + crate::g17::pairs::COMPUTE_CHANNELS_MAX];
     let mut fragment_types =

@@ -150,7 +150,13 @@ impl Firmware {
                         require_visible,
                         &mut dependencies,
                     )?;
-                    self.publish_compute_on(owner, Some(qid), packet.clone(), dependencies.as_slice(), deferred)
+                    self.publish_compute_on(
+                        owner,
+                        Some(qid),
+                        packet.clone(),
+                        dependencies.as_slice(),
+                        deferred,
+                    )
                 })() };
                 let recovery_wait = matches!(result, Err(EAGAIN) | Err(EBUSY))
                     && (self.recovery.pending()

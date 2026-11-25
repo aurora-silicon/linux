@@ -762,7 +762,8 @@ impl Queue {
 
     #[expect(
         clippy::too_many_arguments,
-        reason = "A sibling compute queue takes the same physical graph inputs plus its channel identity."
+        reason = "A sibling compute queue takes the same physical graph inputs plus its channel \
+                  identity."
     )]
     pub(crate) fn new_channel(
         alloc: &Allocator<'_>,
@@ -2152,7 +2153,9 @@ impl Queue {
     /// A recycled vacant sibling queue whose descriptor ring still awaits off-lock release
     /// before re-arming with fresh backing.
     pub(crate) fn take_recycled_ring(&mut self) -> Option<Vacated> {
-        if !self.recycled_pending() || self.pool_phase != PoolPhase::Vacant || self.graph.ring.is_none()
+        if !self.recycled_pending()
+            || self.pool_phase != PoolPhase::Vacant
+            || self.graph.ring.is_none()
         {
             return None;
         }

@@ -733,7 +733,8 @@ mod owed {
 MUTATIONS = {
     'own-finished': [('_ if own.finished => Decision::Retire,', '_ if own.finished => Decision::Own,')],
     'no-retire-glue': [('verdict.decision = self.retire_on_record(firmware, packet, &mut deferred)?;', '')],
-    'retire-unchecked': [('if !firmware.queues.compute_for_packet(self.owner, packet).is_some_and(|queue| queue.retired_held(packet)) {',
+    'retire-unchecked': [('if !firmware\n            .queues\n            .compute_for_packet(self.owner, packet)\n'
+                          '            .is_some_and(|queue| queue.retired_held(packet))\n        {',
                           'if false {')],
     'no-expiry': [('if observed_at == Some(STAMP_WAIT_EXPIRED) {', 'if false {')],
     'no-step-past': [('Ok(Some(_)) | Err(EAGAIN) if owed => at += 1,', 'Ok(Some(_)) | Err(EAGAIN) if owed => break,'),
