@@ -3778,6 +3778,42 @@ static void program_process_pool_late_free_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->hung, 0U);
 }
 
+/*
+ * A replay that cannot take its process pool (no memory) fails, and the
+ * session is quarantined as for any other failed replay.
+ */
+static void program_process_pool_replay_nomem_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test);
+	struct ane_h16_program *p = NULL;
+	struct mutex *lock = kunit_kzalloc(test, sizeof(*lock), GFP_KERNEL);
+	unsigned int replayed;
+	u64 first;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, lock);
+	mutex_init(lock);
+	f->s.ops = &fw_session_ops_hung;
+	f->t.native_free = true;
+	f->expp = true;
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+
+	f->s.lock = lock;
+	ane_h16_session_sleep(&f->s, true);
+	fw_cold_boot(f);
+	ane_h16_session_restart(&f->s);
+	ane_h16_session_recovered(&f->s);
+	f->alloc_fail = true;
+	KUNIT_EXPECT_EQ(test, ane_h16_session_replay(&f->s, &replayed, &first), -ENOMEM);
+	KUNIT_EXPECT_EQ(test, replayed, 0U);
+	KUNIT_EXPECT_TRUE(test, f->s.quarantined);
+	KUNIT_EXPECT_EQ(test, f->hung, 1U);
+	f->alloc_fail = false;
+	ane_h16_session_sleep(&f->s, false);
+	f->s.lock = NULL;
+	cancel_delayed_work_sync(&f->s.gate_work);
+}
+
 static struct kunit_case program_cases[] = {
 	KUNIT_CASE_SLOW(program_pool_rewind_test),
 	KUNIT_CASE_SLOW(program_pool_resident_test),
@@ -3843,6 +3879,7 @@ static struct kunit_case program_cases[] = {
 	KUNIT_CASE(program_process_pool_quota_test),
 	KUNIT_CASE(program_process_pool_nomem_test),
 	KUNIT_CASE(program_process_pool_late_free_test),
+	KUNIT_CASE(program_process_pool_replay_nomem_test),
 	{}
 };
 

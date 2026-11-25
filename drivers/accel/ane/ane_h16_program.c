@@ -2196,7 +2196,7 @@ int ane_h16_session_replay(struct ane_h16_session *s, unsigned int *replayed,
 		ret = h16_replay(s, p);
 		if (ret) {
 			s->ops->log(s->ctx, "PROGRAM REPLAY FAILED", p->key.program, (u64)-ret);
-			return ret;
+			return h16_fail(s, ret);
 		}
 		if (!(*replayed)++)
 			*first_ns = h16_now(s);
