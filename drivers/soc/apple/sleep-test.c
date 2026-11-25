@@ -703,12 +703,36 @@ static void apple_sleep_test_seq_check(struct kunit *test)
 	}
 }
 
+/* Guards may nest, one span inside another, but not cross */
+static void apple_sleep_test_seq_spans(struct kunit *test)
+{
+	const u32 g1 = SLEEP_OP_IF_SAVED | FIELD_PREP(SLEEP_OP_SPAN, 1);
+	const u32 g2 = SLEEP_OP_IF_SAVED | FIELD_PREP(SLEEP_OP_SPAN, 2);
+	const u32 g3 = SLEEP_OP_IF_SAVED | FIELD_PREP(SLEEP_OP_SPAN, 3);
+	const u32 nested[] = {
+		g3, 0, 0x0, 1,
+		g1, 0, 0x4, 1,
+		SLEEP_OP_WRITE, 0, 0x8, 1,
+		SLEEP_OP_WRITE, 0, 0xc, 1,
+	};
+	const u32 crossing[] = {
+		g2, 0, 0x0, 1,
+		g2, 0, 0x4, 1,
+		SLEEP_OP_WRITE, 0, 0x8, 1,
+		SLEEP_OP_WRITE, 0, 0xc, 1,
+	};
+
+	KUNIT_EXPECT_EQ(test, sleep_seq_check_spans(nested, 4), 0);
+	KUNIT_EXPECT_EQ(test, sleep_seq_check_spans(crossing, 4), -ERANGE);
+}
+
 static struct kunit_case apple_sleep_test_cases[] = {
 	KUNIT_CASE(apple_sleep_test_seq_fits),
 	KUNIT_CASE(apple_sleep_test_seq_run64),
 	KUNIT_CASE(apple_sleep_test_seq_restore),
 	KUNIT_CASE(apple_sleep_test_seq_guard),
 	KUNIT_CASE(apple_sleep_test_seq_check),
+	KUNIT_CASE(apple_sleep_test_seq_spans),
 	KUNIT_CASE(apple_sleep_test_layout),
 	KUNIT_CASE(apple_sleep_test_t6050),
 	KUNIT_CASE(apple_sleep_test_j716c_inventory),

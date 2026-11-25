@@ -7882,10 +7882,36 @@ static int sleep_op_check(const u32 *op, unsigned int i, unsigned int n, u32 siz
 }
 
 /*
+ * Whether the guards among the @n entries at @op nest: each guard inside another's span ends
+ * inside it too. 0, or -ERANGE for a span that crosses another's end.
+ */
+static int sleep_seq_check_spans(const u32 *op, unsigned int n)
+{
+	unsigned int i, j;
+
+	for (i = 0; i < n; i++) {
+		u32 kind = FIELD_GET(SLEEP_OP_KIND, op[4 * i]);
+		u32 end = i + FIELD_GET(SLEEP_OP_SPAN, op[4 * i]);
+
+		if (kind != SLEEP_OP_IF_SAVED && kind != SLEEP_OP_IF_SAVED64)
+			continue;
+		for (j = i + 1; j <= end && j < n; j++) {
+			u32 inner = FIELD_GET(SLEEP_OP_KIND, op[4 * j]);
+
+			if ((inner == SLEEP_OP_IF_SAVED || inner == SLEEP_OP_IF_SAVED64) &&
+			    j + FIELD_GET(SLEEP_OP_SPAN, op[4 * j]) > end)
+				return -ERANGE;
+		}
+	}
+	return 0;
+}
+
+/*
  * The DT property @name as a sequence. @block_size gives the size of block @b, mapping it if
  * needed, or 0 where the profile has no such block. Only a sequence that @saves, for which
  * the profile calls sleep_seq_save(), may have kinds 12 to 15. 0 with an empty sequence without
- * the property. -ERANGE, and nothing of it to run, for an entry sleep_op_check() refuses.
+ * the property. -ERANGE, and nothing of it to run, for an entry sleep_op_check() refuses or
+ * guards whose spans cross.
  */
 static int sleep_seq_get(struct apple_sleep *s, const char *name, struct sleep_seq *seq,
 			 u32 (*block_size)(struct apple_sleep *s, u32 b), bool saves)
@@ -7918,6 +7944,11 @@ static int sleep_seq_get(struct apple_sleep *s, const char *name, struct sleep_s
 			return -ERANGE;
 		}
 		saved |= sleep_op_saved(kind);
+	}
+	if (sleep_seq_check_spans(op, len / 4)) {
+		dev_warn(s->dev, "%s: guards' spans cross\n", name);
+		devm_kfree(s->dev, op);
+		return -ERANGE;
 	}
 	if (saved) {
 		seq->saved = devm_kcalloc(s->dev, len / 4, sizeof(*seq->saved), GFP_KERNEL);
