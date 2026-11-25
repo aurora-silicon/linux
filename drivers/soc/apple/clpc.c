@@ -64,6 +64,12 @@ enum apple_clpc_rail {
  * sustained heavy rendering the PMP limits the DCS again well within this, so
  * the floor stays released; light submissions that follow get the floor back
  * this long after the PMP stops limiting.
+ *
+ * This is hysteresis, not a wait for an event: the PMP's limit is its vote in
+ * the PMC floor word, a register it rewrites with no interrupt or message to
+ * the AP, and under heavy work it goes back to the top between limits. Only
+ * sampling sees it, so the floor follows the vote with this hold, measured on
+ * T8140 (51350a0d5022).
  */
 #define APPLE_CLPC_GPU_BACKOFF_MS	100
 /* Package power readings in the low-power profile: every 100 ms */
