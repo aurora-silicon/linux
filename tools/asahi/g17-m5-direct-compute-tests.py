@@ -58,7 +58,7 @@ def build_harness(mutation=None):
     turn = item(events_src, 'fn runtime_event_turn(')
     if mutation == 'no-pre-recovery-drain':
         turn = turn.replace(
-            'firmware.drain_post_signal_reports();\n            reports_drained = true;\n'
+            'firmware.drain_reports();\n            reports_drained = true;\n'
             '            firmware.service_runtime_recovery(deferred)?;',
             'firmware.service_runtime_recovery(deferred)?;',
             1,
@@ -69,7 +69,7 @@ def build_harness(mutation=None):
         turn,
         'deferred.finish();',
         'let mut reports_drained = false;',
-        'firmware.drain_post_signal_reports();\n            reports_drained = true;',
+        'firmware.drain_reports();\n            reports_drained = true;',
         'firmware.service_runtime_recovery(deferred)?;',
         'if housekeeping {',
         'if !reports_drained {',

@@ -110,8 +110,8 @@ impl Backend {
     ) -> Result<Arc<Self>> {
         // The runtime only exists to back its render node: without one (`asahi.m3_expose=0`)
         // nothing is started, rather than leaving a running firmware behind a failed probe.
-        if !crate::m3::m3_board::expose_render_node(soc) {
-            dev_info!(pdev.as_ref(), "M3: render node not registered on this board (asahi.m3_expose=1 registers it); GPU not started\n");
+        if !crate::m3::m3_board::expose_render_node(pdev.as_ref()) {
+            dev_info!(pdev.as_ref(), "M3: render node not registered: the boot loader did not hand the GPU over (asahi.m3_expose=1 registers it); GPU not started\n");
             return Err(ENODEV);
         }
         let resources = crate::m3::m3_resources::from_device(pdev, soc).inspect_err(|_| {
