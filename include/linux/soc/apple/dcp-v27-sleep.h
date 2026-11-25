@@ -50,4 +50,14 @@ int apple_dart_v27_check(struct apple_dart_v27_lease *);
 /* physical initiators stopped by the caller; never disables an unknown SID. */
 int apple_dart_v27_stop_atomic(struct apple_dart_v27_lease *);
 int apple_dart_v27_finish(struct apple_dart_v27_lease *, bool stopped);
+
+/*
+ * A display DART kept through its DCP's own power cycle, its translations retained by the
+ * domains' retention: off once the DCP's CPU has stopped and before its domains go off, on
+ * once they are up again and before the CPU runs.
+ */
+struct apple_dart_v27_cycle;
+int apple_dart_v27_cycle_off(struct device *provider, struct device *owner,
+			     struct apple_dart_v27_cycle **cycle);
+int apple_dart_v27_cycle_on(struct apple_dart_v27_cycle *cycle);
 #endif

@@ -493,3 +493,166 @@ lost:
 	return -EUCLEAN;
 }
 EXPORT_SYMBOL_GPL(apple_dart_v27_finish);
+
+/*
+ * A display DART kept through its DCP's own power cycle, for a firmware 27 sleep stopped at the
+ * DCP's suspend (T6030). The DCP sets its domains' retention up for the power gate, so the DART
+ * keeps its translations: macOS 27.2 on J516s never writes them again around the cycle, and
+ * reads the same back. Only its error reporting and its streams are written, as macOS writes
+ * them on the DCP's own DART: before the domains go off, every error masked and what is latched
+ * cleared; once they are on again, the TLB flushed, the error mask and the diagnostic lock as
+ * they were, and every stream that was enabled turned on again. Between the two the DART is dark
+ * (maps reach memory only, their invalidations wait) and its commands are gated, so that
+ * neither its interrupt nor its own sleep callbacks read a powered-off block. Only for the
+ * register layout of those DARTs, revisions before 2.2.
+ */
+struct apple_dart_v27_cycle {
+	struct apple_dart *dart;
+	struct device *owner;
+	u32 enabled[BITS_TO_U32(DART_MAX_STREAMS)];
+	u32 error_mask, diag_lock, protect, lock;
+	u32 tcr[DART_MAX_STREAMS];
+	u32 ttbr[DART_MAX_STREAMS][DART_MAX_TTBR];
+};
+
+static bool apple_dart_v27_cycle_same(struct apple_dart_v27_cycle *c, unsigned int *first)
+{
+	struct apple_dart *d = c->dart;
+	unsigned int sid, idx;
+
+	*first = d->num_streams;
+	if (readl(d->regs + DART_T8110_PROTECT) != c->protect ||
+	    readl(d->regs + DART_T8110_PROTECT_LOCK) != c->lock)
+		return false;
+	for (sid = 0; sid < d->num_streams; sid++) {
+		bool same = readl(d->regs + DART_TCR(d, sid)) == c->tcr[sid];
+
+		for (idx = 0; same && idx < d->hw->ttbr_count && idx < DART_MAX_TTBR; idx++)
+			same = readl(d->regs + DART_TTBR(d, sid, idx)) == c->ttbr[sid][idx];
+		if (!same) {
+			*first = sid;
+			return false;
+		}
+	}
+	return true;
+}
+
+/* Back to usable: ungated, then lit, which runs the invalidations it held. */
+static void apple_dart_v27_cycle_release(struct apple_dart_v27_cycle *c)
+{
+	struct apple_dart *d = c->dart;
+
+	scoped_guard(spinlock_irqsave, &d->lock)
+		WRITE_ONCE(d->commands_gated, false);
+	apple_dart_power_dark(d->dev, false);
+}
+
+int apple_dart_v27_cycle_off(struct device *dev, struct device *owner,
+			     struct apple_dart_v27_cycle **cycle)
+{
+	struct apple_dart_v27_cycle *c;
+	struct apple_dart *d;
+	unsigned int sid, idx, word;
+	int ret, idle;
+
+	*cycle = NULL;
+	if (!dev || !owner || dev->driver != &apple_dart_driver.driver || !dev_get_drvdata(dev))
+		return -ENODEV;
+	d = dev_get_drvdata(dev);
+	/* Every other way a DART is held across a sleep is its own. */
+	if (d->hw->type != DART_T8110 || d->version >= 0x0202 || d->tunneled || d->live_mtp ||
+	    d->isp_host || d->host_resumes || d->dispext || d->managed_sids ||
+	    d->preserve_display || d->sleep_saved || d->m5_sleep_owner ||
+	    apple_dart_has_borrowed(d) || READ_ONCE(d->host_off) ||
+	    READ_ONCE(d->commands_gated) || READ_ONCE(d->display_dark)) {
+		dev_info(owner, "V27 DART cycle: %s is held otherwise\n", dev_name(dev));
+		return -EOPNOTSUPP;
+	}
+	c = kzalloc(sizeof(*c), GFP_KERNEL);
+	if (!c)
+		return -ENOMEM;
+	c->dart = d;
+	c->owner = owner;
+	apple_dart_power_dark(dev, true);
+	apple_dart_quiesce_commands(dev);
+	/* Its masters stopped: nothing in flight, and no fault left behind. */
+	ret = read_poll_timeout_atomic(apple_dart_m5_idle, idle, idle != -EBUSY, 1,
+				       DART_T8110_IDLE_TIMEOUT_US, false, d);
+	ret = ret ?: idle;
+	if (ret) {
+		dev_info(owner, "V27 DART cycle: %s not idle: %d\n", dev_name(dev), ret);
+		apple_dart_v27_cycle_release(c);
+		kfree(c);
+		return ret;
+	}
+	for (sid = 0; sid < d->num_streams; sid++) {
+		c->tcr[sid] = readl(d->regs + DART_TCR(d, sid));
+		for (idx = 0; idx < d->hw->ttbr_count && idx < DART_MAX_TTBR; idx++)
+			c->ttbr[sid][idx] = readl(d->regs + DART_TTBR(d, sid, idx));
+	}
+	for (word = 0; word < BITS_TO_U32(d->num_streams); word++)
+		c->enabled[word] = readl(d->regs + DART_T8110_ENABLE_STREAMS + 4 * word);
+	c->protect = readl(d->regs + DART_T8110_PROTECT);
+	c->lock = readl(d->regs + DART_T8110_PROTECT_LOCK);
+	c->error_mask = readl(d->regs + DART_T8110_ERROR_MASK);
+	c->diag_lock = readl(d->regs + DART_T8110_DIAG_LOCK);
+	scoped_guard(spinlock_irqsave, &d->lock) {
+		writel(U32_MAX, d->regs + DART_T8110_ERROR_MASK);
+		writel(readl(d->regs + DART_T8110_ERROR), d->regs + DART_T8110_ERROR);
+		writel(U32_MAX, d->regs + DART_T8110_ERR_IRQ_STATUS);
+	}
+	get_device(dev);
+	*cycle = c;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_dart_v27_cycle_off);
+
+/*
+ * The domains are on again. A DART that lost what it held stays dark and gated: nothing may
+ * translate through tables it no longer has.
+ */
+int apple_dart_v27_cycle_on(struct apple_dart_v27_cycle *c)
+{
+	struct apple_dart *d;
+	unsigned int first, word;
+	u32 now;
+	int ret;
+
+	if (!c)
+		return -EINVAL;
+	d = c->dart;
+	if (!apple_dart_v27_cycle_same(c, &first)) {
+		dev_err(c->owner, "V27 DART cycle: %s lost its state: PROTECT %#x/%#x LOCK %#x/%#x, first stream differing %u\n",
+			dev_name(d->dev), readl(d->regs + DART_T8110_PROTECT), c->protect,
+			readl(d->regs + DART_T8110_PROTECT_LOCK), c->lock, first);
+		ret = -EIO;
+		goto out;
+	}
+	writel(FIELD_PREP(DART_T8110_TLB_CMD_OP, DART_T8110_TLB_CMD_OP_FLUSH_ALL),
+	       d->regs + DART_T8110_TLB_CMD);
+	ret = readl_poll_timeout_atomic(d->regs + DART_T8110_TLB_CMD, now,
+					!(now & DART_T8110_TLB_CMD_BUSY), 1,
+					DART_T8110_FLUSH_BUSY_TIMEOUT);
+	if (ret) {
+		dev_err(c->owner, "V27 DART cycle: %s flush: %d\n", dev_name(d->dev), ret);
+		goto out;
+	}
+	writel(c->diag_lock, d->regs + DART_T8110_DIAG_LOCK);
+	writel(c->error_mask, d->regs + DART_T8110_ERROR_MASK);
+	for (word = 0; word < BITS_TO_U32(d->num_streams); word++) {
+		writel(c->enabled[word], d->regs + DART_T8110_ENABLE_STREAMS + 4 * word);
+		now = readl(d->regs + DART_T8110_ENABLE_STREAMS + 4 * word);
+		if ((now & c->enabled[word]) != c->enabled[word]) {
+			dev_err(c->owner, "V27 DART cycle: %s streams %#x, had %#x (word %u)\n",
+				dev_name(d->dev), now, c->enabled[word], word);
+			ret = -EIO;
+			goto out;
+		}
+	}
+	apple_dart_v27_cycle_release(c);
+out:
+	put_device(d->dev);
+	kfree(c);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_dart_v27_cycle_on);
