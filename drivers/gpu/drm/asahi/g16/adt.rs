@@ -187,11 +187,25 @@ pub(crate) fn read(dev: &device::Device, cfg: &Config) -> Result<KBox<GpuAdt>> {
         );
         return Err(EINVAL);
     };
-    if phandles.len() != 6
-        || names.as_slice() != b"ttbs\0pagetables\0handoff\0shared-l2\0fw-text\0fw-data\0"
-    {
+    const CANONICAL: &[u8] = b"ttbs\0pagetables\0handoff\0shared-l2\0fw-text\0fw-data\0";
+    // A boot loader that also serves the older M3 runtime names the shared L2 table a second
+    // time, first, as "pagetables-l2". Accept that entry only as an alias: it must reference
+    // the very reservation "shared-l2" references. Anything else (a second or unknown
+    // reservation) keeps the contract refused. The six canonical regions are then looked up
+    // and validated by name below, exactly as without the alias.
+    const L2_ALIAS: &[u8] = b"pagetables-l2\0";
+    let canonical = phandles.len() == 6 && names.as_slice() == CANONICAL;
+    let aliased = phandles.len() == 7
+        && names.as_slice().len() == L2_ALIAS.len() + CANONICAL.len()
+        && names.as_slice().starts_with(L2_ALIAS)
+        && &names.as_slice()[L2_ALIAS.len()..] == CANONICAL
+        && phandles[0] == phandles[4];
+    if !canonical && !aliased {
         dev_err!(dev, "G16: unsupported boot-loader handoff contract\n");
         return Err(EINVAL);
+    }
+    if aliased {
+        dev_info!(dev, "G16: pagetables-l2 is an alias of shared-l2 (same reservation)\n");
     }
     let names = [
         c_str!("ttbs"),
