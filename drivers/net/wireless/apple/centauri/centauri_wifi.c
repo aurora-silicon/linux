@@ -934,6 +934,49 @@ static size_t build_scan(struct centauri_wifi *wifi, unsigned int chunk, u8 *buf
 	return size;
 }
 
+static bool scan_transport_stopped(struct centauri_wifi *wifi)
+{
+	return READ_ONCE(wifi->stopping) ||
+	       READ_ONCE(wifi->transport_paused) ||
+	       readl(wifi->a.bar + 8) != 2;
+}
+
+static int scan_wait_stop(struct centauri_wifi *wifi, u32 done)
+{
+	unsigned long deadline = jiffies + msecs_to_jiffies(1000);
+
+	do {
+		if (scan_transport_stopped(wifi))
+			return -EIO;
+		drain(wifi);
+		if (wifi->scans_done != done)
+			return 0;
+		mutex_unlock(&wifi->lock);
+		usleep_range(1000, 2000);
+		mutex_lock(&wifi->lock);
+	} while (time_before(jiffies, deadline));
+	if (scan_transport_stopped(wifi))
+		return -EIO;
+	drain(wifi);
+	return wifi->scans_done != done ? 0 : -ETIMEDOUT;
+}
+
+static int scan_stop_chunk(struct centauri_wifi *wifi, u32 done)
+{
+	int ret;
+
+	if (scan_transport_stopped(wifi))
+		return -EIO;
+	ret = command(wifi, 65537, NULL, 0);
+	if (wifi->scans_done != done)
+		return 0;
+	if (ret == -EREMOTEIO && wifi->reply_status == 342)
+		return 0;
+	if (ret)
+		return ret;
+	return scan_wait_stop(wifi, done);
+}
+
 static void scan_worker(struct work_struct *work)
 {
 	struct centauri_wifi *wifi = container_of(work, struct centauri_wifi, scan_work);
@@ -955,6 +998,14 @@ static void scan_worker(struct work_struct *work)
 		unsigned long deadline, progress;
 		bool stopped = false, refused = false;
 
+		if (scan_transport_stopped(wifi)) {
+			ret = -EIO;
+			break;
+		}
+		if (READ_ONCE(wifi->scan_abort)) {
+			ret = -ECANCELED;
+			break;
+		}
 		scan_size = build_scan(wifi, chunk, scan);
 		ret = command(wifi, 65551, scan, scan_size);
 		if (ret)
@@ -974,18 +1025,21 @@ static void scan_worker(struct work_struct *work)
 			   msecs_to_jiffies(max(8000U, count * 2 * SCAN_PASSIVE_DWELL_MS + 2000));
 		progress = jiffies;
 		do {
-			drain(wifi);
-			if (readl(wifi->a.bar + 8) != 2) {
-				centauri_recovery_request(wifi->control, "scan: Alpha stage");
+			if (scan_transport_stopped(wifi)) {
+				if (!READ_ONCE(wifi->stopping) && !READ_ONCE(wifi->transport_paused) &&
+				    readl(wifi->a.bar + 8) != 2)
+					centauri_recovery_request(wifi->control, "scan: Alpha stage");
 				ret = -EIO;
 				break;
 			}
+			drain(wifi);
 			if (wifi->scans_done != done)
 				break;
 			if (READ_ONCE(wifi->scan_abort)) {
-				if (!stopped)
-					command(wifi, 65537, NULL, 0);
-				ret = -ECANCELED;
+				int stop_ret = stopped ? scan_wait_stop(wifi, done) :
+					       scan_stop_chunk(wifi, done);
+
+				ret = stop_ret == -EIO ? -EIO : -ECANCELED;
 				break;
 			}
 			if (wifi->channels_seen != seen) {
@@ -1011,18 +1065,28 @@ static void scan_worker(struct work_struct *work)
 				/* The stop's own scan event ends the wait. */
 				deadline = jiffies + msecs_to_jiffies(1000);
 			}
+			mutex_unlock(&wifi->lock);
 			usleep_range(1000, 2000);
+			mutex_lock(&wifi->lock);
 		} while (time_before(jiffies, deadline));
 		if (!ret && !refused && wifi->scans_done == done) {
-			dev_warn(&wifi->control->pdev->dev,
-				 "Wi-Fi scan chunk %u: %u of %u channels, no scan event%s\n", chunk,
-				 wifi->channels_seen - channels, count,
-				 stopped ? " after the stop" : "");
-			if (!stopped)
-				command(wifi, 65537, NULL, 0);
+			if (scan_transport_stopped(wifi)) {
+				ret = -EIO;
+			} else {
+				drain(wifi);
+				if (wifi->scans_done == done) {
+					dev_warn(&wifi->control->pdev->dev,
+						 "Wi-Fi scan chunk %u: %u of %u channels, no scan event%s\n",
+						 chunk, wifi->channels_seen - channels, count,
+						 stopped ? " after the stop" : "");
+					ret = stopped ? -ETIMEDOUT :
+					      scan_stop_chunk(wifi, done);
+				}
+			}
 		}
 	}
-	info.aborted = !!ret;
+	info.aborted = !!ret || READ_ONCE(wifi->scan_abort) ||
+		       READ_ONCE(wifi->stopping);
 	request = wifi->scan_request;
 	wifi->scan_request = NULL;
 	mutex_unlock(&wifi->lock);
@@ -1268,6 +1332,9 @@ static void connect_worker(struct work_struct *work)
 		}
 	}
 	host_setup_commands(wifi);
+	drain(wifi);
+	wifi->connect_event = false;
+	wifi->disconnect_event = false;
 	slot = wifi->command_head;
 	ret = command(wifi, 131072, wifi->connect_payload, wifi->connect_size);
 	command_status = wifi->reply_status;

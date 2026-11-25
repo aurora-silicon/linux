@@ -443,6 +443,29 @@ static void cen_fixup_scan_response(u8 *event, size_t length)
 	}
 }
 
+static bool cen_rx_pending(struct cen_bt *bt)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(cen_aux_specs); i++) {
+		if (!bt->aux[i].opened || !cen_aux_specs[i].receive)
+			continue;
+		if (bt->aux[i].head != cen_tail(bt, cen_aux_specs[i].id))
+			return true;
+	}
+	if (bt->le_rx_head != cen_tail(bt, 10))
+		return true;
+	return bt->rx_head != cen_tail(bt, 7);
+}
+
+static bool cen_tx_ready(struct cen_bt *bt, struct sk_buff_head *queue,
+			 u16 ring, u16 slots, u16 head)
+{
+	if (skb_queue_empty(queue))
+		return false;
+	return (head + 1) % slots != cen_tail(bt, ring);
+}
+
 static void cen_io_work(struct work_struct *work)
 {
 	struct cen_bt *bt = container_of(work, struct cen_bt, io_work);
@@ -536,6 +559,12 @@ static void cen_io_work(struct work_struct *work)
 	     cen_transmit(bt, &bt->le_txq, 4, CEN_LE_SLOTS, CEN_LE_TX,
 			  CEN_LE_FOOTER, &bt->le_tx_head)))
 		goto protocol_error;
+	if (cen_rx_pending(bt) ||
+	    cen_tx_ready(bt, &bt->txq, 1, CEN_TX_SLOTS, bt->tx_head) ||
+	    cen_tx_ready(bt, &bt->acl_txq, 2, cen_aux_specs[0].slots,
+			 bt->acl_tx_head) ||
+	    cen_tx_ready(bt, &bt->le_txq, 4, CEN_LE_SLOTS, bt->le_tx_head))
+		schedule_work(&bt->io_work);
 	goto unlock;
 protocol_error:
 	bt->running = false;
