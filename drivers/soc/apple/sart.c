@@ -534,15 +534,17 @@ EXPORT_SYMBOL_GPL(apple_sart_replay);
  * reset may take what noirq resume wrote back. Each entry of the snapshot that is still
  * owned, the bootloader's or one in use, has to read as before the sleep. One that doesn't is
  * written back as apple_sart_replay() writes it, and read again. An idle entry is left alone:
- * what it held went with its owner.
+ * what it held went with its owner. Without the sleep's snapshot nothing says the entries
+ * are back, which is an error as well.
  */
 int apple_sart_restore_owned(struct apple_sart *sart)
 {
 	int i, ret = 0;
 
-	if ((sart->ops != &sart_ops_v3 && sart->ops != &sart_ops_v4) ||
-	    !sart->replay_valid)
+	if (sart->ops != &sart_ops_v3 && sart->ops != &sart_ops_v4)
 		return -EOPNOTSUPP;
+	if (!sart->replay_valid)
+		return -ENODATA;
 
 	for (i = 0; i < APPLE_SART_MAX_ENTRIES; i++) {
 		phys_addr_t paddr;
