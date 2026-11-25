@@ -37,19 +37,6 @@
 	wake-gpios = <&pinctrl 40 GPIO_ACTIVE_HIGH>;
 };
 
-/*
- * ADT apcie0/pci-bridge0 (Wi-Fi/BT) and pci-bridge1 (SDXC) wire CLKREQ# on
- * GPIO 0 and GPIO 1 (pinctrl-0 in t6041-j614c-j616c.dtsi). Kept to J616c
- * until J614c is tested.
- */
-&port00 {
-	supports-clkreq;
-};
-
-&port01 {
-	supports-clkreq;
-};
-
 &smc_gpio_low {
 	apple,output-templates = <0xe 0x00800000>;
 };
