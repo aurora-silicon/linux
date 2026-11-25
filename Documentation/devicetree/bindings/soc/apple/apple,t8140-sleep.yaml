@@ -89,7 +89,9 @@ properties:
       The general-purpose PCIe host on the SoC's own PCIe power domain (on T6030
       the Wi-Fi, Bluetooth and card reader host). Its ports and DARTs come back
       cold after a deep sleep. While a driver is bound to it, the sleep is
-      refused until that driver can stop and restore the host.
+      refused until that driver can stop and restore the host. Required on
+      T6030, where without it nothing tells that host apart and the sleep is
+      refused.
 
   apple,radio-perst:
     $ref: /schemas/types.yaml#/definitions/phandle-array
@@ -210,6 +212,7 @@ allOf:
         - apple,seq-commit
         - apple,seq-wake-early
         - apple,seq-wake
+        - apple,pcie-host
       properties:
         reg:
           minItems: 18
