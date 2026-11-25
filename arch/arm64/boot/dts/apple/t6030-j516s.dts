@@ -125,6 +125,21 @@
 	};
 };
 
+/*
+ * Firmware 27.2's display sleep calls on J516s, as macOS 26B123 sends them to the internal
+ * DCP (the t5 trace): set_power_state's eight bytes after the state with the sleep's flags,
+ * the AP link release's four for the sleep then the wake, the panel's own set_power_state's
+ * eight, then the display stage's arguments (eight, then four). The firmware's table names
+ * them A534, A550, A534, A464 and A537.
+ */
+&dcp {
+	apple,sleep-power-args = /bits/ 8 <0x01 0x00 0x00 0x01 0x01 0xaa 0xaa 0xaa>;
+	apple,sleep-a500-args = /bits/ 8 <0x00 0x01 0xaa 0xaa 0x00 0x00 0xaa 0xaa>;
+	apple,sleep-display-power-args = /bits/ 8 <0x00 0x00 0x00 0x00 0x00 0xaa 0xaa 0xaa>;
+	apple,sleep-display-stage-args = /bits/ 8 <0x00 0x00 0x00 0x00 0x00 0xaa 0xaa 0xaa
+						   0x01 0x00 0x00 0x00>;
+};
+
 &aop_audio {
 	apple,chassis-name = "J516";
 	apple,machine-kind = "MacBook Pro";
