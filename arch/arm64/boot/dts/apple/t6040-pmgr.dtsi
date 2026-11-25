@@ -106,7 +106,7 @@
 		#reset-cells = <0>;
 		label = "aes";
 		power-domains = <&ps_sio>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	ps_spi0: power-controller@1b8 {
