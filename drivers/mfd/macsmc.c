@@ -724,8 +724,9 @@ static int apple_smc_probe(struct platform_device *pdev)
 	mutex_init(&smc->mutex);
 	spin_lock_init(&smc->lock);
 	smc->dev = &pdev->dev;
-	smc->saved_enabled = apple_t6050_sleep_described() &&
-		of_device_is_compatible(dev->of_node, "apple,t6050-smc");
+	smc->saved_enabled = (apple_t6050_sleep_described() &&
+			      of_device_is_compatible(dev->of_node, "apple,t6050-smc")) ||
+			     apple_sleep_smc_policy_described();
 	smc->port_dark_wake = smc->saved_enabled && of_machine_is_compatible("apple,j714s");
 	/* A J714s device tree from before apple,wake-reasons */
 	if (smc->port_dark_wake && !dt_reasons)

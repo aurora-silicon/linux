@@ -38,6 +38,24 @@ static inline bool apple_t6050_sleep_described(void)
 	return apple_t6050_sleep_property(NULL);
 }
 
+/*
+ * A sleep controller in the device tree that takes the SMC through its saved-context policy
+ * (apple,smc-sleep-policy): the SMC's last notices go out with interrupts off, on the
+ * transport that runs without them.
+ */
+static inline bool apple_sleep_smc_policy_described(void)
+{
+	struct device_node *np;
+
+	for_each_node_with_property(np, "apple,smc-sleep-policy") {
+		if (of_device_is_available(np)) {
+			of_node_put(np);
+			return true;
+		}
+	}
+	return false;
+}
+
 /* The SMC's sleep messages: the pmVC value and the spacings between them, used as floors */
 struct apple_sleep_smc_policy {
 	u32 pmvc;
