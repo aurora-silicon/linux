@@ -174,6 +174,10 @@ static const u32 t8103_acc_thrtl[] = { T8103_ACC_AMX_THRTL, T8103_ACC_LLC_THRTL,
 #define T8103_PMP_ACK_US	200000
 #define T8103_PMP_IDLE_US	10000
 
+/* AGX fabric tunables programmed by the boot loader; lost when ps_gfx powers off. */
+#define T8103_AGX_FABRIC	0x205000000ULL
+static const u32 t8103_agx_regs[] = { 0x30, 0x34, 0x400, 0x600, 0x738, 0x798, 0x800 };
+
 /*
  * CLK_PERF_DCS (T8103_DCS_PERF) holds the memory clock's performance state: target in bits 3:0,
  * busy in bit 31. Moving it by more than one state in a single write leaves memory unusable on
@@ -233,6 +237,7 @@ static const u32 t8103_commit_off[] = {
  * nothing else raises them, and the DCP driver's power-up of DISP0 hangs without them. Put
  * back as the commit found them, pmp first.
  */
+#define T8103_COMMIT_OFF_GFX		0
 #define T8103_COMMIT_OFF_PMP		10
 #define T8103_COMMIT_OFF_RMX		9
 
@@ -365,6 +370,9 @@ static struct t8103_sleep {
 	u8 slc_result, aic_result;
 	void __iomem *pmp_asc, *pmp_mbox, *sio_asc, *sio_mbox;
 	void __iomem *dcp_mbox, *dcpext_asc, *dcpext_mbox;
+	void __iomem *agx_fabric;
+	u32 agx_saved[ARRAY_SIZE(t8103_agx_regs)];
+	bool agx_saved_valid;
 	/* Each coprocessor's t8103_asc_stop() result */
 	u8 pmp_result, sio_result, dcp_result, dcpext_result;
 	/* The t8103_commit_off and t8103_cg_commit_off words found or taken off */
@@ -743,6 +751,7 @@ static int t8103_sleep_map_regs(struct apple_sleep *s)
 	t->dcpext_mbox = t8103_ioremap(s, T8103_DCPEXT_MBOX, 0x1000);
 	for (i = 0; i < ARRAY_SIZE(t8103_bridges); i++)
 		t->bridges[i] = t8103_ioremap(s, t8103_bridges[i].pa, 0x1000);
+	t->agx_fabric = t8103_ioremap(s, T8103_AGX_FABRIC, 0x1000);
 	/* The commit word is the S2R timer, the clusters' words are in "ps". */
 	s->commit = s->ps_aon + T8103_S2R_TIMER;
 	s->cluster = s->ps;
@@ -829,8 +838,9 @@ static int t8103_sleep_check(struct apple_sleep *s)
 	struct t8103_sleep *t = &t8103_sleep;
 	unsigned int i, wanted = 0;
 
-	/* The GPU coprocessor doesn't survive the power cut, and it can't be started twice. */
-	if (t->gpu && device_is_bound(&t->gpu->dev)) {
+	/* Refuse a bound GPU driver unless it registered a commit stop for warm restart. */
+	if (t->gpu && device_is_bound(&t->gpu->dev) &&
+	    !apple_sleep_coproc_ready_node(t->gpu->dev.of_node)) {
 		dev_err(s->dev, "refused: the GPU's driver is bound\n");
 		return -EBUSY;
 	}
@@ -1226,6 +1236,34 @@ static void t8103_pre_smc_down(struct apple_sleep *s)
 							    T8103_SEP_GATE_US);
 		t->sep_ps = v;
 	}
+	t->commit_off = 0;
+	t->commit_lowered = 0;
+	t->agx_saved_valid = false;
+	/*
+	 * Lower GFX (and save its fabric tunables) before stopping PMP, matching macOS and
+	 * newer SoCs where GFX powers off while PMP is still running.
+	 */
+	if (!sleep_ps_on(s, t8103_commit_off[T8103_COMMIT_OFF_GFX])) {
+		t->commit_off |= BIT(T8103_COMMIT_OFF_GFX);
+	} else {
+		if (t->agx_fabric) {
+			for (i = 0; i < ARRAY_SIZE(t8103_agx_regs); i++)
+				t->agx_saved[i] = readl(t->agx_fabric + t8103_agx_regs[i]);
+			t->agx_saved_valid = true;
+		}
+		if (t->bridges[0]) {
+			writel(1, t->bridges[0] + T8103_BRIDGE_8014);
+			writel(1, t->bridges[0] + T8103_BRIDGE_82BC);
+			writel(2, t->bridges[0] + T8103_BRIDGE_82BC);
+			writel(4, t->bridges[0] + T8103_BRIDGE_82BC);
+		}
+		t->commit_saved[T8103_COMMIT_OFF_GFX] =
+			readl(s->ps + t8103_commit_off[T8103_COMMIT_OFF_GFX]);
+		t->commit_lowered |= BIT(T8103_COMMIT_OFF_GFX);
+		sleep_ps_lower(s, t8103_commit_off[T8103_COMMIT_OFF_GFX]);
+		if (!sleep_ps_wait_off(s, t8103_commit_off[T8103_COMMIT_OFF_GFX]))
+			t->commit_off |= BIT(T8103_COMMIT_OFF_GFX);
+	}
 	t8103_pmp_stop(s);
 	t->aon_commit_off = 0;
 	for (i = 0; i < ARRAY_SIZE(t8103_aon_commit_off); i++) {
@@ -1240,9 +1278,7 @@ static void t8103_pre_smc_down(struct apple_sleep *s)
 		if (!readl_poll_timeout_atomic(reg, av, !FIELD_GET(PS_ACTUAL, av), 1, 10000))
 			t->aon_commit_off |= BIT(i);
 	}
-	t->commit_off = 0;
-	t->commit_lowered = 0;
-	for (i = 0; i < ARRAY_SIZE(t8103_commit_off) - 1; i++) {
+	for (i = 1; i < ARRAY_SIZE(t8103_commit_off) - 1; i++) {
 		unsigned int b;
 
 		if (!sleep_ps_on(s, t8103_commit_off[i])) {
@@ -1528,6 +1564,14 @@ static void t8103_sleep_wake(struct apple_sleep *s)
 	if (t->commit_lowered & BIT(T8103_COMMIT_OFF_RMX))
 		sleep_ps_restore(s->ps + t8103_commit_off[T8103_COMMIT_OFF_RMX],
 				 t->commit_saved[T8103_COMMIT_OFF_RMX]);
+	if (t->commit_lowered & BIT(T8103_COMMIT_OFF_GFX)) {
+		sleep_ps_restore(s->ps + t8103_commit_off[T8103_COMMIT_OFF_GFX],
+				 t->commit_saved[T8103_COMMIT_OFF_GFX]);
+		if (t->agx_saved_valid && t->agx_fabric) {
+			for (i = 0; i < ARRAY_SIZE(t8103_agx_regs); i++)
+				writel(t->agx_saved[i], t->agx_fabric + t8103_agx_regs[i]);
+		}
+	}
 	t->commit_lowered = 0;
 	for (i = ARRAY_SIZE(t8103_aon_commit_off); i > 0; i--) {
 		unsigned int idx = i - 1;
