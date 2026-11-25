@@ -1643,10 +1643,12 @@ extern "C" {
 
 #[versions(AGX)]
 impl Gpu for GpuManager::ver {
-    /// Render commands may order their dependencies on earlier renders after
-    /// their vertex half only (DRM_ASAHI_RENDER_FRAGMENT_BARRIERS).
+    /// Render commands may make only their fragment half wait for earlier
+    /// renders (DRM_ASAHI_RENDER_FRAGMENT_BARRIERS), and the fragment half
+    /// does wait for them (DRM_ASAHI_FEATURE_ORDERED_FRAGMENT_BARRIERS).
     fn backend_feature_flags(&self) -> u64 {
         u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS)
+            | uapi::DRM_ASAHI_FEATURE_ORDERED_FRAGMENT_BARRIERS as u64
     }
 
     /// A light submission completes in tens of microseconds, so its submitter

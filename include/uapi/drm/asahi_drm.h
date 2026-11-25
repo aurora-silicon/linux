@@ -573,6 +573,17 @@ enum drm_asahi_feature {
  */
 #define DRM_ASAHI_FEATURE_USERPTR_NO_MEMLOCK ((1ULL) << 43)
 
+/*
+ * DRM_ASAHI_FEATURE_ORDERED_FRAGMENT_BARRIERS: a render command that sets
+ * DRM_ASAHI_RENDER_FRAGMENT_BARRIERS still waits for the earlier renders its
+ * barriers name: the fragment half waits for them to finish before it
+ * starts. Kernels that report DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS without
+ * this bit may drop that wait, so userspace that uses the flag to order a
+ * render after earlier ones must check for this bit. A feature bit like
+ * those of enum drm_asahi_feature, defined here like bit 32.
+ */
+#define DRM_ASAHI_FEATURE_ORDERED_FRAGMENT_BARRIERS ((1ULL) << 44)
+
 #define DRM_ASAHI_PARAM_GROUP_VM_STATUS 1
 #define DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS 2
 
