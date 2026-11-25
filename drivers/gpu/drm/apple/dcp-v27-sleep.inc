@@ -2361,14 +2361,15 @@ static int dcp_v27_early_stop(struct apple_dcp *dcp, struct dcp_v27_early *e)
 	u32 status, run;
 	int ret;
 
-	/* Both set once the firmware's last message has been read, as macOS waits for them. */
+	/*
+	 * The idle was answered; the CPU in its WFI before RUN goes off. STOPPED is not waited
+	 * for: on J516s it stays clear while RUN is set (status 0x30002d after the idle), and
+	 * macOS 27.2 reads no status bit there, only RUN before it clears it twice (t5).
+	 */
 	ret = readl_poll_timeout(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS, status,
-				 (status & (APPLE_DCP_COPROC_CPU_STATUS_IDLE |
-					    APPLE_DCP_COPROC_CPU_STATUS_STOPPED)) ==
-				 (APPLE_DCP_COPROC_CPU_STATUS_IDLE |
-				  APPLE_DCP_COPROC_CPU_STATUS_STOPPED), 100, 5000);
+				 status & APPLE_DCP_COPROC_CPU_STATUS_IDLE, 100, 5000);
 	if (dcp_v27_early_step(e, "cpu-idle", ret)) {
-		dev_err(dcp->dev, "V27 sleep: the CPU did not stop after its idle: status %#x\n",
+		dev_err(dcp->dev, "V27 sleep: the CPU not idle after its idle: status %#x\n",
 			status);
 		return ret;
 	}
@@ -2381,6 +2382,8 @@ static int dcp_v27_early_stop(struct apple_dcp *dcp, struct dcp_v27_early *e)
 				 10000);
 	if (dcp_v27_early_step(e, "run-off", ret))
 		return ret;
+	dev_info(dcp->dev, "V27 sleep: CPU status %#x at the idle, %#x with RUN off\n", status,
+		readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS));
 	return dcp_v27_early_power_down(dcp, e);
 }
 
