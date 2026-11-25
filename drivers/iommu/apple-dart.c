@@ -328,6 +328,9 @@ struct apple_dart_sleep_list {
 	unsigned int count;
 };
 
+/* The config words a sleep list writes: 0x200 to 0x22c and 0x300 to 0x32c. */
+#define DART_SLEEP_CFG_WORDS	24
+
 /*
  * The subtrees behind the slots firmware holds in a four-level locked root
  * (fw_mirror), recorded when the root is mapped: per slot, the root entry and
@@ -536,7 +539,7 @@ struct apple_dart {
 	struct apple_dart_sleep_list sleep_restore_late;
 	u32 sleep_enable[BITS_TO_U32(DART_MAX_STREAMS)];
 	/* Its own config words at the sleep, which the restore keeps. */
-	u32 sleep_cfg[20];
+	u32 sleep_cfg[DART_SLEEP_CFG_WORDS];
 
 	/* Retained radio/display state left in place across suspend-to-idle. */
 	bool s2idle_kept;
@@ -5521,9 +5524,6 @@ static void apple_dart_parse_sleep_list(struct apple_dart *dart, const struct re
 	list->pairs = pairs;
 	list->count = count / 2;
 }
-
-/* The config words a sleep list writes: 0x200 to 0x22c and 0x300 to 0x31c. */
-#define DART_SLEEP_CFG_WORDS	20
 
 static unsigned int apple_dart_sleep_cfg_off(unsigned int i)
 {
