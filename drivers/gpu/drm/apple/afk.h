@@ -258,6 +258,34 @@ static inline void afk_service_retire_channel(struct apple_epic_service *service
 	spin_unlock_irqrestore(&service->lock, flags);
 }
 
+/*
+ * A singleton service has one live instance per endpoint. The firmware
+ * announces it again on a fresh channel when the display is attached again,
+ * without closing the previous channel (as for compact services, see
+ * afk_compact_slot()). The announcement on @channel then supersedes
+ * @service: retire it, so that its slot is reclaimed once its last user
+ * lets go. The successor's init takes over the service's state.
+ */
+static inline bool afk_service_supersede(struct apple_epic_service *service,
+					 const struct apple_epic_service_ops *ops,
+					 u32 channel)
+{
+	unsigned long flags;
+	bool superseded;
+
+	if (!ops->singleton)
+		return false;
+	spin_lock_irqsave(&service->lock, flags);
+	superseded = service->ops == ops && !service->torndown &&
+		     service->channel != channel;
+	if (superseded) {
+		service->enabled = false;
+		service->torndown = true;
+	}
+	spin_unlock_irqrestore(&service->lock, flags);
+	return superseded;
+}
+
 static inline bool afk_service_matches(struct apple_epic_service *service,
 				       u32 channel)
 {

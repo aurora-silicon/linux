@@ -1060,12 +1060,14 @@ static const struct apple_epic_service_ops avep_ops[] = {
 	{
 		.name = "DCPAVSimpleVideoInterface",
 		.reusable = true,
+		.singleton = true,
 		.init = av_interface_init,
 		.teardown = av_interface_teardown,
 	},
 	{
 		.name = "DCPAVAudioInterface",
 		.reusable = true,
+		.singleton = true,
 		.init = av_audiosrv_init,
 		.report = av_audiosrv_report,
 		.teardown = av_audiosrv_teardown,
