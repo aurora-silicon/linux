@@ -333,7 +333,7 @@ enum drm_asahi_feature {
 	DRM_ASAHI_FEATURE_COMPUTE_WIDE_VISIBILITY = (1UL) << 8,
 
 	/*
-	 * Bits 10 to 15 are reported only by the G17P runtime.
+	 * Bits 10 to 16 are the HAL200/G16/G17P command-stream features.
 	 */
 
 	/**

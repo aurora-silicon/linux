@@ -9,7 +9,10 @@
 //! Render/compute attachments are retained with the immutable command; the whole
 //! VM job guard protects indirect and bindless accesses through retirement.
 //! Exact historical prefixes become immutable per-command dependencies. Ray-query state
-//! remains disabled.
+//! (RENDER_RAY_QUERY) and the AS-build flag (BOUNDED_AS_BUILD) are the M4 Pro's G17P command
+//! set ([`super::rt`]): compute scratch layouts and intersection tables, render ray-query
+//! stages, and compute flag bit 2 (alongside COMPUTE_NO_QUERY_ACCESS); every other compute
+//! flag and reserved word stays MBZ.
 
 use core::mem::{offset_of, size_of};
 use core::ops::Range;
@@ -169,6 +172,10 @@ impl Order {
 pub(crate) struct RenderCommand {
     /// The payload, zero-extended to the full UAPI structure.
     pub(crate) cmd: uapi::drm_asahi_cmd_render,
+    /// The validated ray-query state of the vertex and fragment stages.
+    pub(crate) ray_query: [super::rt::RayQueryStage; 2],
+    /// The SCS-capable UMA pool of both stages' scratch.
+    pub(crate) scs: super::rt::ScsSeeds,
     /// Retained timestamp destinations, published after full command retirement.
     pub(crate) timestamp_outputs: crate::timestamp::Destinations,
     /// Explicit hardware attachments in effect for each render engine.
@@ -179,6 +186,12 @@ pub(crate) struct RenderCommand {
 /// A validated compute command.
 pub(crate) struct ComputeCommand {
     pub(crate) cmd: uapi::drm_asahi_cmd_compute,
+    /// The validated scratch layout and intersection tables.
+    pub(crate) ray: super::rt::ComputeRay,
+    /// The SCS-capable UMA pool of the scratch.
+    pub(crate) scs: super::rt::ScsSeeds,
+    /// DRM_ASAHI_COMPUTE_AS_BUILD.
+    pub(crate) as_build: bool,
     /// The compute attachments in effect (validated writable).
     pub(crate) attachments: KVec<uapi::drm_asahi_attachment>,
     /// Retained timestamp destinations, published after full command retirement.
@@ -187,10 +200,41 @@ pub(crate) struct ComputeCommand {
     pub(crate) query_access: bool,
 }
 
+impl ComputeCommand {
+    /// Whether this compute command uses ray-tracing or SCS-scratch state.
+    pub(crate) fn is_rt(&self) -> bool {
+        self.as_build || self.ray.intersection.enabled() || self.scs.needed != 0
+    }
+}
+
 /// A validated command.
 pub(crate) enum Command {
     Render(KBox<RenderCommand>),
     Compute(KBox<ComputeCommand>),
+}
+
+impl Command {
+    /// The command traces rays or builds acceleration structures and gets the long execution
+    /// allowance, as do the other commands of its submission (`Job::long`).
+    pub(crate) fn long(&self) -> bool {
+        match self {
+            Command::Render(r) => {
+                super::rt::select(false, r.ray_query.map(|stage| stage.traces()), false)
+            }
+            Command::Compute(c) => {
+                super::rt::select(c.ray.intersection.enabled(), [false; 2], c.as_build)
+            }
+        }
+    }
+
+    /// The SCS-capable UMA pool the command runs on ([`super::rt::ScsSeeds::NONE`] without
+    /// shader-context scratch).
+    pub(crate) fn scs(&self) -> super::rt::ScsSeeds {
+        match self {
+            Command::Render(r) => r.scs,
+            Command::Compute(c) => c.scs,
+        }
+    }
 }
 
 /// Inline storage for the common 1-2 command submission, spilling to a heap `KVec` above 2.
@@ -314,6 +358,10 @@ pub(crate) struct Context<'a> {
     pub(crate) vm: &'a mmu::Vm,
     /// The queue's USC window base.
     pub(crate) usc_base: u64,
+    /// Enabled GPU cores, which SCS memory is sized for.
+    pub(crate) active_cores: u32,
+    /// The queue's reserved render scratch pages per stage (`render_scs_layout`).
+    pub(crate) render_scs: [u16; 2],
 }
 
 /// A stream whose timestamps and ordinals are resolved ([`ParsedStream::prepare`]), before its
@@ -450,6 +498,32 @@ fn render_payload(
     }
 }
 
+/// Render payload bytes before the ray-query stages: they follow the historical prefixes.
+const RAY_QUERY_START: usize = offset_of!(uapi::drm_asahi_cmd_render, prior_cdm) + size_of::<u64>();
+
+/// The ray-query stages of a render payload; a shorter payload reads both stages zeroed.
+/// Bounded by [`RENDER_STAGE_PREFIXES_OFF`] so 480-byte `STAGE_PREFIXES` tails stay separate.
+fn render_ray_query(bytes: &[u8]) -> Result<[super::rt::RayQueryStage; 2]> {
+    let rq_end = bytes.len().min(RENDER_STAGE_PREFIXES_OFF);
+    super::rt::RayQueryStage::parse_pair(bytes.get(RAY_QUERY_START..rq_end).unwrap_or(&[]))
+}
+
+/// The scratch layout and intersection tables of a compute command. The M5 auxiliary
+/// allocation and the reserved word stay MBZ.
+fn compute_ray(cmd: &uapi::drm_asahi_cmd_compute) -> Result<super::rt::ComputeRay> {
+    super::rt::ComputeRay::new(
+        cmd.scs_layout,
+        cmd.cdm_auxiliary_allocation,
+        cmd.reserved,
+        cmd.intersection_pool,
+        cmd.intersection_pool_bytes,
+        cmd.intersection_first,
+        cmd.intersection_count,
+        cmd.intersection_default_program,
+        cmd.intersection_default_control,
+    )
+}
+
 /// Whether `[start, start + size)` is a nonempty range inside `range`.
 fn inside(start: u64, size: u64, range: &Range<u64>) -> bool {
     size != 0 && start >= range.start && start < range.end && size <= range.end - start
@@ -505,20 +579,12 @@ fn validate_render_entry(
 ) -> Result<(
     uapi::drm_asahi_cmd_render,
     Option<uapi::drm_asahi_render_stage_prefixes>,
+    [super::rt::RayQueryStage; 2],
 )> {
     let (packet, prefixes) = render_payload(entry.payload)?;
     let cmd = &packet;
-    // Ray-query extensions belong to G17; reject every nonzero byte
-    // between the common historical-prefix fields and the stage-prefix tail.
-    let end = offset_of!(uapi::drm_asahi_cmd_render, prior_cdm) + size_of::<u64>();
-    let rq_end = entry.payload.len().min(RENDER_STAGE_PREFIXES_OFF);
-    if entry
-        .payload
-        .get(end..rq_end)
-        .is_some_and(|tail| tail.iter().any(|&b| b != 0))
-    {
-        return Err(EINVAL);
-    }
+    // The ray-query stages after the historical prefixes (RENDER_RAY_QUERY).
+    let ray_query = render_ray_query(entry.payload)?;
     if let Some(prefixes) = prefixes {
         if (prefixes.ta_vdm_barrier != NONE && u32::from(prefixes.ta_vdm_barrier) > counts[RENDER])
             || (prefixes.ta_cdm_barrier != NONE
@@ -556,8 +622,6 @@ fn validate_render_entry(
     {
         return Err(EINVAL);
     }
-    // `payload` rejects nonzero ray-query bytes beyond the prior
-    // extension. RENDER_RAY_QUERY is never advertised on G16.
     // Never discard unflagged high words, nor accept the flag without them.
     if cmd.flags & RSRC_SPEC_HI != 0 && entry.payload.len() < RSRC_SPEC_HI_MIN {
         return Err(EINVAL);
@@ -570,17 +634,19 @@ fn validate_render_entry(
     {
         return Err(EINVAL);
     }
-    Ok((packet, prefixes))
+    Ok((packet, prefixes, ray_query))
 }
 
 fn validate_compute_entry(
     entry: &Entry<'_>,
     range: &Range<u64>,
-) -> Result<uapi::drm_asahi_cmd_compute> {
+) -> Result<(uapi::drm_asahi_cmd_compute, super::rt::ComputeRay, bool)> {
     let packet: uapi::drm_asahi_cmd_compute = payload(entry.payload)?;
     let cmd = &packet;
-    if cmd.flags & !COMPUTE_NO_QUERY_ACCESS != 0
-        || cmd.cdm_ctrl_stream_end <= cmd.cdm_ctrl_stream_base
+    let Some(as_build) = super::rt::as_build(cmd.flags & !COMPUTE_NO_QUERY_ACCESS) else {
+        return Err(EINVAL);
+    };
+    if cmd.cdm_ctrl_stream_end <= cmd.cdm_ctrl_stream_base
         || !inside(
             cmd.cdm_ctrl_stream_base,
             cmd.cdm_ctrl_stream_end - cmd.cdm_ctrl_stream_base,
@@ -589,24 +655,16 @@ fn validate_compute_entry(
     {
         return Err(EINVAL);
     }
-    // The G17P scratch layout and intersection tables: never on G16.
     if cmd
         .ts_end_copies
         .iter()
         .any(|ts| ts.handle != 0 || ts.offset != 0)
-        || packet.scs_layout != 0
-        || packet.cdm_auxiliary_allocation != 0
-        || packet.reserved != 0
-        || packet.intersection_pool != 0
-        || packet.intersection_pool_bytes != 0
-        || packet.intersection_first != 0
-        || packet.intersection_count != 0
-        || packet.intersection_default_program != 0
-        || packet.intersection_default_control != 0
     {
         return Err(EINVAL);
     }
-    Ok(packet)
+    // The G17P scratch layout and intersection tables (RENDER_RAY_QUERY).
+    let ray = compute_ray(cmd)?;
+    Ok((packet, ray, as_build))
 }
 
 /// Checks that `[start, end)` (rounded out to pages) lies inside the user address range and
@@ -1231,6 +1289,68 @@ fn check_render(
     Ok(())
 }
 
+/// The hardware reads the intersection pool and the default intersection program: both must
+/// be mapped readable, as on the M4 Pro.
+fn check_intersection(
+    batch: &mut SpanBatch,
+    vm: &mmu::Vm,
+    tables: &super::rt::IntersectionTables,
+) -> Result {
+    if !tables.enabled() {
+        return Ok(());
+    }
+    let end = tables.pool.checked_add(tables.pool_bytes).ok_or(EINVAL)?;
+    batch.push(vm, tables.pool, end, true, false)?;
+    let code = tables.default_code();
+    if code != 0 {
+        batch.push(vm, code, code.checked_add(64).ok_or(EINVAL)?, true, false)?;
+    }
+    Ok(())
+}
+
+/// Per-command render ray-query admission. A render's scratch must fit what its queue
+/// reserved (`render_scs_layout`): the render's UMA pool was sized for that (EINVAL beyond it,
+/// as on the M4 Pro). Returns the SCS-capable pool the render runs on, sized for the
+/// reservation ([`super::rt::pool_seeds`]).
+fn check_render_ray(
+    batch: &mut SpanBatch,
+    context: &Context<'_>,
+    stages: &[super::rt::RayQueryStage; 2],
+) -> Result<super::rt::ScsSeeds> {
+    for stage in stages {
+        check_intersection(batch, context.vm, &stage.intersection)?;
+    }
+    if !stages.iter().any(|stage| stage.scratch.enabled()) {
+        return Ok(super::rt::ScsSeeds::NONE);
+    }
+    let pages = stages.map(|stage| stage.scratch.pages());
+    let needed = super::rt::required_seeds(context.active_cores, &pages)?;
+    let reserved = super::rt::required_seeds(context.active_cores, &context.render_scs)?;
+    if needed > reserved {
+        return Err(EINVAL);
+    }
+    let pool = super::rt::pool_seeds(context.active_cores, context.render_scs)?;
+    Ok(super::rt::ScsSeeds { needed, pool })
+}
+
+/// Per-command compute ray admission: the tables are mapped and the scratch fits an
+/// SCS-capable UMA pool (E2BIG). Returns the SCS-capable pool the command runs on.
+fn check_compute_ray(
+    batch: &mut SpanBatch,
+    context: &Context<'_>,
+    ray: &super::rt::ComputeRay,
+) -> Result<super::rt::ScsSeeds> {
+    check_intersection(batch, context.vm, &ray.intersection)?;
+    if !ray.scratch.enabled() {
+        return Ok(super::rt::ScsSeeds::NONE);
+    }
+    let pages = ray.scratch.pages();
+    Ok(super::rt::ScsSeeds {
+        needed: super::rt::required_seeds(context.active_cores, &[pages])?,
+        pool: super::rt::pool_seeds(context.active_cores, [pages, 0])?,
+    })
+}
+
 /// Per-command compute admission.
 fn check_compute(
     batch: &mut SpanBatch,
@@ -1240,7 +1360,7 @@ fn check_compute(
 ) -> Result<(u64, u64)> {
     let vm = context.vm;
     let (base, end) = (cmd.cdm_ctrl_stream_base, cmd.cdm_ctrl_stream_end);
-    if cmd.flags & !COMPUTE_NO_QUERY_ACCESS != 0
+    if super::rt::as_build(cmd.flags & !COMPUTE_NO_QUERY_ACCESS).is_none()
         || cmd.sampler_count != 0
         || cmd.sampler_heap != 0
         || !helper_is_empty(&cmd.helper)
@@ -1366,7 +1486,8 @@ pub(crate) fn parse_stream(bytes: &[u8], early_tiling: bool) -> Result<ParsedStr
         let next_idx = commands.len();
         match entry.kind {
             CMD_RENDER => {
-                let (packet, prefixes) = validate_render_entry(&entry, counts, early_tiling)?;
+                let (packet, prefixes, ray_query) =
+                    validate_render_entry(&entry, counts, early_tiling)?;
                 counts[RENDER] += 1;
                 if counts[RENDER] + counts[COMPUTE] > MAX_COMMANDS {
                     return Err(EINVAL);
@@ -1399,6 +1520,8 @@ pub(crate) fn parse_stream(bytes: &[u8], early_tiling: bool) -> Result<ParsedStr
                 commands.push(Command::Render(KBox::new(
                     RenderCommand {
                         cmd: packet,
+                        ray_query,
+                        scs: super::rt::ScsSeeds::NONE,
                         timestamp_outputs: crate::timestamp::Destinations::empty(),
                         vertex_attachments,
                         fragment_attachments,
@@ -1411,7 +1534,7 @@ pub(crate) fn parse_stream(bytes: &[u8], early_tiling: bool) -> Result<ParsedStr
                 })?;
             }
             CMD_COMPUTE => {
-                let packet = validate_compute_entry(&entry, &range)?;
+                let (packet, ray, as_build) = validate_compute_entry(&entry, &range)?;
                 counts[COMPUTE] += 1;
                 if counts[RENDER] + counts[COMPUTE] > MAX_COMMANDS {
                     return Err(EINVAL);
@@ -1433,6 +1556,9 @@ pub(crate) fn parse_stream(bytes: &[u8], early_tiling: bool) -> Result<ParsedStr
                 commands.push(Command::Compute(KBox::new(
                     ComputeCommand {
                         cmd: packet,
+                        ray,
+                        scs: super::rt::ScsSeeds::NONE,
+                        as_build,
                         attachments,
                         timestamp_outputs: crate::timestamp::Destinations::empty(),
                         query_access: packet.flags & COMPUTE_NO_QUERY_ACCESS == 0,
@@ -1543,7 +1669,7 @@ impl Prepared {
         proof: &mut SpanProof,
     ) -> Result<Submission> {
         let Prepared {
-            commands,
+            mut commands,
             orders,
             counts,
         } = self;
@@ -1555,7 +1681,7 @@ impl Prepared {
         {
             let scratch = &mut proof.scratch;
             scratch.batch.clear();
-            for command in commands.iter() {
+            for command in commands.iter_mut() {
                 match command {
                     Command::Render(render) => {
                         check_render(
@@ -1565,6 +1691,8 @@ impl Prepared {
                             &render.vertex_attachments,
                             &render.fragment_attachments,
                         )?;
+                        render.scs =
+                            check_render_ray(&mut scratch.batch, context, &render.ray_query)?;
                         if vdm_count >= scratch.vdm_vas.len() {
                             return Err(EINVAL);
                         }
@@ -1578,6 +1706,8 @@ impl Prepared {
                             &compute.cmd,
                             &compute.attachments,
                         )?;
+                        compute.scs =
+                            check_compute_ray(&mut scratch.batch, context, &compute.ray)?;
                         if cdm_count >= scratch.cdm_ranges.len() {
                             return Err(EINVAL);
                         }

@@ -20,7 +20,7 @@ use kernel::{prelude::*, sync::Arc};
 
 use super::channel::Channel;
 use super::command::{Command, ComputeCommand, RenderCommand};
-use super::encode::{self, ComputeRefs, Geometry, RenderRefs};
+use super::encode::{self, ComputeRefs, ComputeRt, Geometry, RenderRefs, StageRt};
 use super::fw::channels::{SubmitRecord, RING_SLOTS};
 use super::fw::graph::{notifier_page, qstate};
 use super::fw::work::{self, BarrierType};
@@ -330,6 +330,8 @@ pub(crate) struct Flight {
     pub(crate) initbm: bool,
     /// Whether this flight publishes CPU-written command timestamps on retirement.
     pub(crate) has_timestamps: bool,
+    /// Whether this flight runs ray-tracing or SCS-scratch compute (pinned to compute pipe 0).
+    pub(crate) rt_compute: bool,
 }
 
 impl Flight {
@@ -371,6 +373,7 @@ impl Flight {
             pb_binding: 0,
             initbm: false,
             has_timestamps: false,
+            rt_compute: false,
         }
     }
 }
@@ -1111,8 +1114,8 @@ impl Firmware {
                 && matches!(command(&job, job.progress.sent()), Some(Command::Compute(_)))
                 && job
                     .resources
-                    .compute_units()
-                    .is_ok_and(|n| self.slots.compute_exhausted_within(n))
+                    .compute_slot_mask()
+                    .is_ok_and(|mask| self.slots.compute_exhausted_in_mask(mask))
             {
                 self.engine.unpend(&job);
                 let _ = job.mark_terminal_retired();
@@ -1125,14 +1128,17 @@ impl Firmware {
             // immediately instead of spinning on EAGAIN and stalling unrelated compute.
             if class_error.is_none()
                 && matches!(command(&job, job.progress.sent()), Some(Command::Render(_)))
-                && (job
+                && (job.resources.pb_slot_mask().is_ok_and(|(mask, home)| {
+                    self.pools.exhausted_for_mask_mode(
+                        &job.vm,
+                        mask,
+                        home,
+                        job.resources.render_scs(),
+                    )
+                }) || job
                     .resources
-                    .pb_slot_mask()
-                    .is_ok_and(|(mask, home)| self.pools.exhausted_for_mask(&job.vm, mask, home))
-                    || job
-                        .resources
-                        .render_passes()
-                        .is_ok_and(|n| self.slots.render_exhausted_within(n)))
+                    .render_passes()
+                    .is_ok_and(|n| self.slots.render_exhausted_within(n)))
             {
                 self.engine.unpend(&job);
                 let _ = job.mark_terminal_retired();
@@ -1294,11 +1300,15 @@ impl Firmware {
         let cmd = command(job, job.progress.sent());
         let is_render = matches!(cmd, Some(Command::Render(_)));
         let is_compute = matches!(cmd, Some(Command::Compute(_)));
+        let is_rt_compute = is_compute
+            && (job.resources.compute_scs()
+                || matches!(cmd, Some(Command::Compute(c)) if c.is_rt()));
         job.vm.status.get() != 0
             || self.engine.flights.iter().any(|f| {
                 f.doomed
                     || f.recovery_suspect
                     || f.initbm
+                    || (is_rt_compute && f.computes != 0 && f.compute_pipe != 0)
                     || (((is_compute && f.renders != 0) || (is_render && f.computes != 0))
                         && !Arc::ptr_eq(&f.job.vm, &job.vm))
             })
@@ -1308,8 +1318,13 @@ impl Firmware {
                     .pb_slot_mask()
                     .and_then(|(mask, home)| Ok((mask, home, job.resources.pb_heap_blocks()?)))
                     .is_ok_and(|(mask, home, blocks)| {
-                        self.pools
-                            .can_pipeline_in_mask_blocks(&job.vm, mask, home, blocks)
+                        self.pools.can_pipeline_in_mask_blocks_mode(
+                            &job.vm,
+                            mask,
+                            home,
+                            blocks,
+                            job.resources.render_scs(),
+                        )
                     }))
     }
 
@@ -1336,8 +1351,8 @@ impl Firmware {
                     && (compute_count >= params::compute_flights()
                         || job
                             .resources
-                            .compute_units()
-                            .is_ok_and(|units| !self.slots.compute_available(units)))
+                            .compute_slot_mask()
+                            .is_ok_and(|mask| !self.slots.compute_available_in_mask(mask)))
             }
             Some(Command::Render(_)) => {
                 let render_count: usize = e.flights.iter().map(|f| f.renders as usize).sum();
@@ -1462,16 +1477,21 @@ impl Firmware {
                     .flights
                     .iter()
                     .any(|f| f.renders != 0 && !Arc::ptr_eq(&f.job.vm, &job.vm));
+                let rt_pipe1_busy = (job.resources.compute_scs() || c.is_rt())
+                    && e.flights
+                        .iter()
+                        .any(|f| f.computes != 0 && f.compute_pipe != 0);
                 let compute_count: usize = e.flights.iter().map(|f| f.computes as usize).sum();
                 !cross_vm_render
+                    && !rt_pipe1_busy
                     && !waits_for_timestamps
                     && compute_count < params::compute_flights()
                     && !self.slots.compute_exhausted()
                     && super::recovery::logic::next_ordinal(e.ordinal).is_some()
                     && job
                         .resources
-                        .compute_units()
-                        .is_ok_and(|units| self.slots.compute_available(units))
+                        .compute_slot_mask()
+                        .is_ok_and(|mask| self.slots.compute_available_in_mask(mask))
             }
             Some(Command::Render(_)) => {
                 let cross_vm_compute = e
@@ -1490,8 +1510,13 @@ impl Firmware {
                         .pb_slot_mask()
                         .and_then(|(mask, home)| Ok((mask, home, job.resources.pb_heap_blocks()?)))
                         .is_ok_and(|(mask, home, blocks)| {
-                            self.pools
-                                .can_pipeline_in_mask_blocks(&job.vm, mask, home, blocks)
+                            self.pools.can_pipeline_in_mask_blocks_mode(
+                                &job.vm,
+                                mask,
+                                home,
+                                blocks,
+                                job.resources.render_scs(),
+                            )
                         })
                     && job
                         .resources
@@ -1771,8 +1796,9 @@ impl Firmware {
     }
 
     /// Chooses which compute pipe (`0..COMPUTE_PIPES`) executes the next compute command:
-    /// - Base-only VMs (`units <= BASE_COMPUTE_UNITS`) or states where pipe 1 has no available
-    ///   extension unit stay on pipe 0 so base units `0..2` never split across two pipes.
+    /// - Base-only/SCS VMs (bits strictly in `0..PIPE1_COMPUTE_START`) or states where pipe 1
+    ///   has no available unit in `slot_mask` stay on pipe 0 so `0..PIPE1_COMPUTE_START` never
+    ///   split across two pipes.
     /// - If the command waits only on one pipe, reuse that pipe (in-order ring, zero `c2c`
     ///   barrier).
     /// - If barrier-free (`[None, None]`) or waiting on both pipes (`[Some, Some]`), pick the
@@ -1780,10 +1806,16 @@ impl Firmware {
     fn choose_compute_pipe(
         &self,
         waits: [Option<WaitTarget>; sizes::COMPUTE_PIPES],
-        units: usize,
+        slot_mask: u32,
+        rt_compute: bool,
     ) -> usize {
-        if units <= super::resources::BASE_COMPUTE_UNITS
-            || !self.slots.compute_available_for_pipe(units, 1)
+        if rt_compute
+            || self
+                .engine
+                .flights
+                .iter()
+                .any(|fl| fl.computes != 0 && fl.rt_compute)
+            || !self.slots.compute_available_in_mask_for_pipe(slot_mask, 1)
         {
             return 0;
         }
@@ -1791,7 +1823,7 @@ impl Firmware {
             [Some(_), None] => 0,
             [None, Some(_)] => 1,
             _ => {
-                if !self.slots.compute_available_for_pipe(units, 0) {
+                if !self.slots.compute_available_in_mask_for_pipe(slot_mask, 0) {
                     return 1;
                 }
                 let mut active = [0usize; sizes::COMPUTE_PIPES];
@@ -1833,12 +1865,16 @@ impl Firmware {
             .prepare_pb_in_flight(alloc_slot, draw, render_pipelined)?;
         let (pb_mask, _) = job.resources.pb_slot_mask()?;
         let heap_blocks = job.resources.pb_heap_blocks()?;
-        // Reuse this VM's retired epoch of the allocator slot when still bound and sized for the
-        // VM's current PB heap (no reseed/InitBM); if the PB heap grew, rotate onto a fresh epoch.
-        let (epoch, reused) = match self
-            .pools
-            .reusable_for_mask(alloc_slot, &job.vm, pb_mask, heap_blocks)
-        {
+        let render_scs = job.resources.render_scs();
+        // Reuse this VM's retired epoch of the allocator slot when still bound, matching the
+        // SCS mode, and sized for the VM's current PB heap (no reseed/InitBM).
+        let (epoch, reused) = match self.pools.reusable_for_mask_mode(
+            alloc_slot,
+            &job.vm,
+            pb_mask,
+            heap_blocks,
+            render_scs,
+        ) {
             Some(e) => {
                 self.pools.stats.reused += 1;
                 a.init_buffer = false;
@@ -1849,10 +1885,11 @@ impl Firmware {
                     return Err(EAGAIN);
                 }
                 let e = job.resources.take_pb()?;
-                if let Err(err) = e.prepare(
+                if let Err(err) = e.prepare_with_scs(
                     alloc_slot,
                     job.resources.pb_heap_gva(alloc_slot)?,
                     heap_blocks,
+                    render_scs,
                 ) {
                     job.resources.return_pb(e);
                     return Err(err);
@@ -2022,13 +2059,15 @@ impl Firmware {
         let (compute_pipe, c_waits) = if render {
             (0usize, [None; sizes::COMPUTE_PIPES])
         } else {
-            let units = job.resources.compute_units()?;
+            let slot_mask = job.resources.compute_slot_mask()?;
+            let rt_compute = job.resources.compute_scs()
+                || matches!(cmd, Command::Compute(c) if c.is_rt());
             let waits = self.wait_compute_stamps_for(
                 job,
                 job.command_order(index)
                     .and_then(|o| o.wait_through[super::command::COMPUTE]),
             )?;
-            (self.choose_compute_pipe(waits, units), waits)
+            (self.choose_compute_pipe(waits, slot_mask, rt_compute), waits)
         };
         let pipe_behind = !render
             && self
@@ -2133,10 +2172,11 @@ impl Firmware {
                     false,
                 )?;
                 let mut last_seq = job.command_order(index).map(|o| o.sequence);
-                let vm_units = job.resources.compute_units()?.min(sizes::COMPUTE_UNITS);
+                let slot_mask = job.resources.compute_slot_mask()?;
                 let free_c = self
                     .slots
-                    .free_compute_in_for_pipe(vm_units, compute_pipe) as usize;
+                    .free_compute_in_mask_for_pipe(slot_mask, compute_pipe)
+                    as usize;
                 let mut active_pipe = [0usize; sizes::COMPUTE_PIPES];
                 for fl in &self.engine.flights {
                     if fl.computes != 0 {
@@ -2157,8 +2197,9 @@ impl Firmware {
                     .min(sizes::COMPUTE_SLOTS.saturating_sub(1))
                     .min(ring_more)
                     .min(pipe_fold_cap);
+                let rt_head = job.resources.compute_scs() || c.is_rt();
                 // Fold trailing barrier-free compute commands of the base job first.
-                while more_slots > 0 && end < job.progress.count() {
+                while !rt_head && more_slots > 0 && end < job.progress.count() {
                     let Some(next_seq) = last_seq.and_then(|s| s.checked_add(1)) else {
                         break;
                     };
@@ -2170,6 +2211,9 @@ impl Firmware {
                     let Some(Command::Compute(c2)) = command(job, end) else {
                         break;
                     };
+                    if c2.is_rt() {
+                        break;
+                    }
                     self.prefix_compute(
                         job,
                         &job.resources,
@@ -2187,7 +2231,7 @@ impl Firmware {
                 // Compute horizon: fold subsequent ready, barrier-free compute-only jobs of
                 // the same queue and VM into the same CDM producer advance and doorbell.
                 // Any non-qualifying job of this queue ends the scan so no later job overtakes it.
-                if end == job.progress.count() {
+                if !rt_head && !job.long() && end == job.progress.count() {
                     hz_stop = Some(0);
                     let mut idx = 0;
                     while idx < self.engine.pending.len() {
@@ -2208,6 +2252,11 @@ impl Firmware {
                         if !Arc::ptr_eq(&j2.vm, &job.vm)
                             || j2.progress.sent() != 0
                             || n2 == 0
+                            || j2.long()
+                            || j2.resources.compute_scs()
+                            || (0..n2).any(|k| {
+                                matches!(command(&j2, k), Some(Command::Compute(c2)) if c2.is_rt())
+                            })
                             || !j2.can_fold_horizon_job(first_seq)
                         {
                             hz_stop = Some(3);
@@ -2420,6 +2469,8 @@ impl Firmware {
                                 break;
                             };
                             if !Arc::ptr_eq(&j2.vm, &job.vm)
+                                || j2.long() != job.long()
+                                || j2.resources.render_scs() != job.resources.render_scs()
                                 || n2 == 0
                                 || n2_usize > more_renders
                                 || !j2.can_fold_render_horizon_job(first_seq)
@@ -2819,11 +2870,12 @@ impl Firmware {
             target_stamp: target,
             submitted,
         };
+        let rt = compute_rt(&cmd.ray, s.seeds);
         let scratch = self.engine.scratch.as_deref_mut().ok_or(ENOMEM)?;
         let w = image(&mut scratch.cw)?;
         // User results are published coherently after the complete retirement receipt.
         // The firmware's internal timestamp pair remains enabled.
-        encode::encode_compute_for(
+        encode::encode_compute_rt(
             self.init.abi.compute(),
             &refs,
             &cmd.cmd,
@@ -2832,6 +2884,7 @@ impl Firmware {
             job.vm.slot,
             n,
             1,
+            &rt,
             w,
             image(&mut scratch.cq)?,
         )
@@ -2905,6 +2958,7 @@ impl Firmware {
         f.uma_submitted = submitted;
         f.csubmitted[member] = submitted;
         f.has_timestamps |= !cmd.timestamp_outputs.is_empty();
+        f.rt_compute |= resources.compute_scs() || cmd.is_rt();
         wmb();
         if let Some((wait_fs, bar_type)) = fs2c_bar {
             g.ring.w64(8 * pf.c_head as usize, s.barrier.va)?;
@@ -3051,7 +3105,14 @@ impl Firmware {
             let heap_blocks = resources.pb_heap_blocks()?;
             let alloc_slot = self
                 .pools
-                .pick_slot_in_mask_blocks(&job.vm, behind, pb_mask, pb_home, heap_blocks)
+                .pick_slot_in_mask_blocks_mode(
+                    &job.vm,
+                    behind,
+                    pb_mask,
+                    pb_home,
+                    heap_blocks,
+                    resources.render_scs(),
+                )
                 .ok_or(EAGAIN)?;
             let slot_pipelined = self.pools.slot_inflight(alloc_slot) > 0;
             let (refs, init_buffer, epoch, binding) =
@@ -3083,7 +3144,8 @@ impl Firmware {
         geometry.validate_capacity(p.tpc.size as u64, p.tilemap.size as u64)?;
         resources.set_pass_dirty(k, geometry.tpc_bytes, geometry.tilemap_bytes, heap_bytes)?;
         let scratch = self.engine.scratch.as_deref_mut().ok_or(ENOMEM)?;
-        encode::encode_ta_for(
+        let [vertex_rt, fragment_rt] = cmd.ray_query.map(|stage| stage_rt(&stage));
+        encode::encode_ta_rt(
             self.init.abi.ta(),
             &refs,
             &pass,
@@ -3093,10 +3155,11 @@ impl Firmware {
             target,
             &geometry,
             None,
+            &vertex_rt,
             image(&mut scratch.ta)?,
             image(&mut scratch.tas)?,
         );
-        encode::encode_fs_for(
+        encode::encode_fs_rt(
             self.init.abi.fs(),
             &refs,
             &pass,
@@ -3107,6 +3170,7 @@ impl Firmware {
             draw,
             target,
             &geometry,
+            &fragment_rt,
             image(&mut scratch.fs)?,
             &mut scratch.fss[..],
         );
@@ -3309,5 +3373,37 @@ impl Firmware {
         s.starve_from_ns = 0;
         let now = s.pub_ns;
         self.power.utilization.busy(now);
+    }
+}
+
+/// The compute register words of a validated command's ray state ([`super::rt`]) in a unit
+/// whose UMA pool has `seeds` freelist entries, in a freelist of
+/// [`super::rt::freelist_records`]. Without ray state in a base unit these are the words of
+/// [`ComputeRt::DISABLED`].
+fn compute_rt(ray: &super::rt::ComputeRay, seeds: u32) -> ComputeRt {
+    ComputeRt {
+        intersection: ray.intersection.words(),
+        size: ray.scratch.size_word(),
+        tail: ray.scratch.compute_tail_word(),
+        stack: ray.scratch.stack_word(),
+        window: ray.scratch.window_word(),
+        driver: ray.scratch.driver_word(),
+        scs: ray.scratch.enabled(),
+        seeds,
+        records: super::rt::freelist_records(seeds),
+    }
+}
+
+/// The TA or FS register words of a validated render stage's ray state. As the M4 Pro's
+/// render programs, a stage's tail word is its scratch tail; its auxiliary intersection word
+/// is validated but not written.
+fn stage_rt(stage: &super::rt::RayQueryStage) -> StageRt {
+    StageRt {
+        intersection: stage.intersection.words(),
+        size: stage.scratch.size_word(),
+        tail: stage.scratch.tail_word(),
+        stack: stage.scratch.stack_word(),
+        window: stage.scratch.window_word(),
+        scs: stage.scratch.enabled(),
     }
 }

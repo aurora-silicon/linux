@@ -8,7 +8,7 @@
 
 use kernel::{prelude::*, uapi};
 
-use super::fw::graph::manager;
+use super::fw::graph::{manager, pools};
 use super::fw::work::{self, barrier, compute, fs, initbm, scene, ta, REG_RECORD};
 use super::hw;
 
@@ -72,8 +72,9 @@ mod compute_encoder;
 use compute_encoder::put_generation;
 #[allow(unused_imports)] // Pure encoder utilities are exercised by the host ABI harness.
 pub(crate) use compute_encoder::{
-    encode_compute, encode_compute_for, init_compute_pool, preserve_compute_descriptor,
-    ComputeEncodeError, ComputeRefs,
+    encode_compute, encode_compute_for, encode_compute_rt, init_compute_pool,
+    preserve_compute_descriptor, ComputeEncodeError, ComputeRefs, ComputeRt,
+    COMPUTE_SCS_DRIVER_WORD,
 };
 
 /// Tiling geometry and register words of a render (accelerator count 2).
@@ -281,6 +282,7 @@ pub(crate) fn barrier(
 mod render_encoder;
 #[allow(unused_imports)] // Includes private-tail variants rejected by the shared Mesa UAPI.
 pub(crate) use render_encoder::{
-    append_fs_timestamp_copies, encode_fs, encode_fs_for, encode_ta, encode_ta_for, fill_scene,
-    initbm, render_attachments, scene, scene_prefix, scene_render, PassRefs, RenderRefs,
+    append_fs_timestamp_copies, encode_fs, encode_fs_for, encode_fs_rt, encode_ta, encode_ta_for,
+    encode_ta_rt, fill_scene, initbm, render_attachments, scene, scene_prefix, scene_render,
+    PassRefs, RenderRefs, StageRt, RENDER_SCS_ENABLE,
 };

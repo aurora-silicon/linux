@@ -51,8 +51,8 @@ pub(crate) fn push_completion(done: &mut Completions, job: &Arc<Job>, result: Re
 }
 
 pub(crate) struct Recovery {
-    pub(crate) deadline_ns: u64,
-    pub(crate) compute_deadline_ns: u64,
+    /// Per-class host deadlines, ordinary and long-job ([`logic::Deadlines`]).
+    pub(crate) deadlines: logic::Deadlines,
     /// Per-class (render, compute) long-command warning deadlines; diagnostic only.
     warning_deadline_ns: [u64; 2],
     pub(crate) long_commands: u64,
@@ -79,8 +79,7 @@ pub(crate) struct Recovery {
 impl Recovery {
     pub(crate) fn new() -> Self {
         Self {
-            deadline_ns: logic::EXPIRED,
-            compute_deadline_ns: logic::EXPIRED,
+            deadlines: logic::Deadlines::EXPIRED,
             warning_deadline_ns: [u64::MAX; 2],
             long_commands: 0,
             publication_wait_deadline: None,
@@ -116,15 +115,18 @@ impl Firmware {
 
     pub(crate) fn renew_render_deadline(&mut self) {
         let now = now_ns();
-        self.recovery.deadline_ns = logic::renew(now, params::deadline_ms(), 0).0;
+        let renewed = logic::Deadlines::renew(now, params::deadline_ms(), 0);
+        self.recovery.deadlines.any = renewed.any;
+        self.recovery.deadlines.long_any = renewed.long_any;
         self.recovery.warning_deadline_ns[super::command::RENDER] =
             now.saturating_add(5_000_000_000);
     }
 
     pub(crate) fn renew_compute_deadline(&mut self) {
         let now = now_ns();
-        self.recovery.compute_deadline_ns =
-            logic::renew(now, 0, params::compute_deadline_ms()).1;
+        let renewed = logic::Deadlines::renew(now, 0, params::compute_deadline_ms());
+        self.recovery.deadlines.compute = renewed.compute;
+        self.recovery.deadlines.long_compute = renewed.long_compute;
         self.recovery.warning_deadline_ns[super::command::COMPUTE] =
             now.saturating_add(5_000_000_000);
     }
@@ -206,6 +208,16 @@ impl Firmware {
                 .flights
                 .iter()
                 .any(|flight| flight.computes != 0);
+            let has_long_render = self
+                .engine
+                .flights
+                .iter()
+                .any(|flight| flight.renders != 0 && flight.job.long());
+            let has_long_compute = self
+                .engine
+                .flights
+                .iter()
+                .any(|flight| flight.computes != 0 && flight.job.long());
             if has_render
                 && logic::expired(
                     now,
@@ -232,8 +244,11 @@ impl Firmware {
                     "M4 GPU compute command has no completion-stamp progress for 5s; execution may still be active\n"
                 );
             }
-            if (has_render && logic::expired(now, self.recovery.deadline_ns))
-                || (has_compute && logic::expired(now, self.recovery.compute_deadline_ns))
+            // Ray traversal and AS builds: every flight of such a job (`Job::long`).
+            let render_deadline = self.recovery.deadlines.select(false, has_long_render);
+            let compute_deadline = self.recovery.deadlines.select(true, has_long_compute);
+            if (has_render && logic::expired(now, render_deadline))
+                || (has_compute && logic::expired(now, compute_deadline))
             {
                 dev_err!(
                     self.dev(),

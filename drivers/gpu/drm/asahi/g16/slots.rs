@@ -32,36 +32,139 @@ pub(crate) struct ComputeSlot {
     pub(crate) counter: Arc<FwObject>,
     pub(crate) context_store: Arc<FwObject>,
     pub(crate) aux: Arc<FwObject>,
+    /// Freelist entries of the unit's UMA pool, seeded once ([`init_uma_pool`]).
+    pub(crate) seeds: u32,
     /// VM-free firmware lease keeping `work` (containing the compute UMA manager at `+0xe00`)
     /// and `counter` mapped in context-0 UAT until a later compute retirement overwrites
     /// firmware `uma_mgr_table[1 + k]`.
     uma_lease: Arc<FwLease>,
 }
 
+/// Where a compute unit lives and how large its UMA pool is.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Placement {
+    /// The VM's base units: a 32 MiB pool at the unit's original client addresses.
+    Base,
+    /// SCS-capable units (ray-query scratch): a pool of `seeds` 4-KiB entries
+    /// ([`super::rt::required_seeds`]) and its freelist in the unit's SCS pool window, the
+    /// other records at their own client addresses, sharing ledger index and UMA slot `1 + k`
+    /// with base unit k.
+    Scs { seeds: u32 },
+}
+
+impl Placement {
+    fn pool(self, k: u64) -> u64 {
+        match self {
+            Placement::Base => client::compute_pool(k),
+            Placement::Scs { .. } => client::scs_compute_pool(k),
+        }
+    }
+    /// The base of the unit's list, preempt, auxiliary and context records.
+    fn state(self, k: u64) -> u64 {
+        match self {
+            Placement::Base => client::compute_state(k),
+            Placement::Scs { .. } => client::scs_compute_records(k),
+        }
+    }
+    /// The unit's freelist: a base unit's at its state, an SCS unit's right after its pool.
+    fn freelist(self, k: u64) -> u64 {
+        match self {
+            Placement::Base => client::compute_state(k),
+            Placement::Scs { .. } => self.pool(k) + self.pool_bytes() as u64,
+        }
+    }
+    fn work(self, k: u64) -> u64 {
+        let index = match self {
+            Placement::Base => k,
+            Placement::Scs { .. } => sizes::COMPUTE_UNITS as u64 + k,
+        };
+        client::WORK_PAGE + index * client::CWORK_STRIDE
+    }
+    /// Freelist entries of the unit's pool.
+    pub(crate) fn seeds(self) -> u32 {
+        match self {
+            Placement::Base => super::rt::BASE_SEEDS,
+            Placement::Scs { seeds } => seeds,
+        }
+    }
+    /// Bytes of the unit's pool: its seeds of 4 KiB.
+    pub(crate) fn pool_bytes(self) -> usize {
+        (u64::from(self.seeds()) * super::rt::SEED_BYTES) as usize
+    }
+    /// Bytes of the unit's freelist ([`super::rt::freelist_bytes`]).
+    pub(crate) fn freelist_bytes(self) -> usize {
+        super::rt::freelist_bytes(self.seeds()) as usize
+    }
+    /// An SCS unit's pool fits [`super::rt::MAX_SCS_SEEDS`] in whole rows, so it and its
+    /// freelist fit its window.
+    pub(crate) fn check(self) -> Result {
+        match self {
+            Placement::Base => Ok(()),
+            Placement::Scs { seeds } => {
+                if seeds == 0
+                    || seeds % super::rt::SEEDS_PER_ROW != 0
+                    || seeds > super::rt::MAX_SCS_SEEDS
+                {
+                    Err(E2BIG)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+const _: () = assert!(
+    sizes::POOL_BYTES == super::rt::BASE_SEEDS as u64 * super::rt::SEED_BYTES
+        && super::rt::window_bytes(super::rt::MAX_SCS_SEEDS) <= client::SCS_POOL_WINDOW
+);
+
 /// Initializes the private pool exactly once, before it is exposed. Never called on reuse.
-pub(crate) fn init_uma_pool(state: &FwObject, list: &FwObject, pool: u64) -> Result {
-    if pool & 0x3fff != 0 {
+/// `seeds` 4-KiB freelist entries and their 2-MiB pool-table rows; 8192 is the 32 MiB pool
+/// every unit had before SCS. The freelist `state` holds every seed, the pool table `list`
+/// every row.
+pub(crate) fn init_uma_pool(state: &FwObject, list: &FwObject, pool: u64, seeds: u32) -> Result {
+    let seeds = seeds as usize;
+    let rows = seeds / super::rt::SEEDS_PER_ROW as usize;
+    if pool & 0x3fff != 0
+        || seeds == 0
+        || seeds % super::rt::SEEDS_PER_ROW as usize != 0
+        || seeds * super::rt::RECORD_BYTES as usize > state.size
+        || rows * super::fw::buffer::uma_pools::POOL_TABLE_STRIDE > list.size
+    {
         return Err(EINVAL);
     }
     let mut chunk = [0u8; 512];
-    for first in (0..8192).step_by(64) {
+    for first in (0..seeds).step_by(64) {
         for j in 0..64 {
             chunk[j * 8..j * 8 + 8]
                 .copy_from_slice(&(pool + ((first + j) as u64) * 0x1000).to_le_bytes());
         }
         state.write(first * 8, &chunk)?;
     }
-    for i in 0..16 {
+    for i in 0..rows {
         list.w64(i * 64, (1u64 << 61) | (pool + i as u64 * 0x200000))?;
     }
     Ok(())
 }
 
 impl ComputeSlot {
+    #[allow(dead_code)]
     pub(crate) fn new(o: &mut Objects, fw_factory: &Factory, k: u64) -> Result<Self> {
+        Self::new_in(o, fw_factory, k, Placement::Base)
+    }
+
+    /// Unit `k` at `placement`.
+    pub(crate) fn new_in(
+        o: &mut Objects,
+        fw_factory: &Factory,
+        k: u64,
+        placement: Placement,
+    ) -> Result<Self> {
+        placement.check()?;
         let sh = Class::Shared;
+        let state = placement.state(k);
         let mut fw = fw_factory.fw_objects();
-        let work = alloc_work(&mut fw, 0x2000, client::WORK_PAGE + k * client::CWORK_STRIDE, 0)?;
+        let work = alloc_work(&mut fw, 0x2000, placement.work(k), 0)?;
         let counter = alloc(&mut fw, 0x80, sh, None, 0, false)?;
         let uma_lease = FwLease::new(fw)?;
         let unit = Self {
@@ -70,7 +173,7 @@ impl ComputeSlot {
                 o,
                 0x4000,
                 sh,
-                Client::nc(client::compute_preempt(k)),
+                Client::nc(state + client::COMPUTE_PREEMPT_OFF),
                 0,
                 false,
             )?,
@@ -86,42 +189,59 @@ impl ComputeSlot {
                 false,
             )?,
             pool: o.alloc(super::object::Request {
-                size: 0x2000000,
+                size: placement.pool_bytes(),
                 class: sh,
                 placement: super::object::Placement::Anywhere,
                 offset: 0,
-                client: Some((client::compute_pool(k), super::hw::pte::LEAF_NC)),
+                client: Some((placement.pool(k), super::hw::pte::LEAF_NC)),
                 lower: None,
                 cpu: false,
             })?,
             pool_state: alloc(
                 o,
-                0x20000,
+                placement.freelist_bytes(),
                 sh,
-                Client::nc(client::compute_state(k)),
+                Client::nc(placement.freelist(k)),
                 0,
                 false,
             )?,
-            page_list: alloc(o, 0x4000, sh, Client::nc(client::compute_list(k)), 0, false)?,
+            page_list: alloc(
+                o,
+                0x4000,
+                sh,
+                Client::nc(state + client::COMPUTE_LIST_OFF),
+                0,
+                false,
+            )?,
             counter,
             context_store: alloc(
                 o,
                 0x40000,
                 sh,
-                Client::nc(client::compute_context(k)),
+                Client::nc(state + client::COMPUTE_CONTEXT_OFF),
                 0,
                 false,
             )?,
-            aux: alloc(o, 0x4000, sh, Client::nc(client::compute_aux(k)), 0, false)?,
+            aux: alloc(
+                o,
+                0x4000,
+                sh,
+                Client::nc(state + client::COMPUTE_AUX_OFF),
+                0,
+                false,
+            )?,
+            seeds: placement.seeds(),
             uma_lease,
         };
         init_uma_pool(
             &unit.pool_state,
             &unit.page_list,
             unit.pool.gva.ok_or(EINVAL)?,
+            unit.seeds,
         )?;
         Ok(unit)
     }
+
     /// VM-free firmware lease keeping this unit's `work` and `counter` mapped in context-0 UAT.
     pub(crate) fn uma_lease(&self) -> Arc<FwLease> {
         self.uma_lease.clone()
@@ -143,6 +263,84 @@ impl ComputeSlot {
         self.preempt.fill(0, 0, 0x4000)
     }
 }
+
+/// The render command records of one pass slot index (TA and FS work images, microsequences and
+/// barrier records), shared by every VM's [`PassSlot`] of that index: the index is device-global
+/// and claimed by one flight at a time. The host writes them before publication and never reads
+/// back what the firmware writes, so they take the firmware-cached [`Class::FwCoherent`] view
+/// macOS 26B123 gives its per-queue command objects. The work images keep their uncached kernel
+/// GPU task lower alias, as macOS maps its work items for the GPU. Each work image and
+/// microsequence keeps its own page; the barrier records share one page, as the compute unit's
+/// barriers do.
+#[derive(Clone)]
+pub(crate) struct PassCmds {
+    pub(crate) ta_work: Arc<FwObject>,
+    pub(crate) fs_work: Arc<FwObject>,
+    pub(crate) ta_seq: Arc<FwObject>,
+    pub(crate) fs_seq: Arc<FwObject>,
+    pub(crate) own_barrier: Arc<FwObject>,
+    pub(crate) prev_barrier: Arc<FwObject>,
+    pub(crate) ta_fs_barrier: Arc<FwObject>,
+    pub(crate) fs_dep: Arc<FwObject>,
+    pub(crate) compute_barrier: Arc<FwObject>,
+    pub(crate) fs_compute_barrier: Arc<FwObject>,
+}
+
+impl PassCmds {
+    /// Barrier records in the shared page: own, prev, TA->FS, FS dependency (one record each),
+    /// then the per-pipe compute and FS-compute barriers.
+    const OWN: usize = 0;
+    const PREV: usize = barrier::SIZE;
+    const TA_FS: usize = 2 * barrier::SIZE;
+    const FS_DEP: usize = 3 * barrier::SIZE;
+    const COMPUTE: usize = 4 * barrier::SIZE;
+    const FS_COMPUTE: usize = Self::COMPUTE + barrier::SIZE * sizes::COMPUTE_PIPES;
+    const BARRIERS: usize = Self::FS_COMPUTE + barrier::SIZE * sizes::COMPUTE_PIPES;
+
+    /// Allocates pass slot index `i`'s set from a device-lifetime allocator
+    /// ([`Factory::persistent_objects`]), which the caller never drops.
+    pub(crate) fn new(o: &mut Objects, i: u64) -> Result<Self> {
+        let coherent = Class::FwCoherent;
+        let off = client::pass_off(i);
+        let mut work = |size, page, offset| {
+            o.alloc(super::object::Request {
+                size,
+                class: coherent,
+                placement: super::object::Placement::Anywhere,
+                offset,
+                client: None,
+                lower: Some(page),
+                cpu: true,
+            })
+        };
+        let fs_work = work(
+            fs::WORK_SIZE,
+            client::FS_WORK_PAGE + off,
+            client::FS_WORK_OFF as usize,
+        )?;
+        let ta_work = work(
+            ta::WORK_SIZE,
+            client::TA_WORK_PAGE + off,
+            client::TA_WORK_OFF as usize,
+        )?;
+        let barriers = alloc(o, Self::BARRIERS, coherent, None, 0, false)?;
+        let record = |offset, size| FwObject::view(&barriers, offset, size);
+        Ok(Self {
+            ta_work,
+            fs_work,
+            ta_seq: alloc(o, ta::SEQ_OBJECT, coherent, None, 0, false)?,
+            fs_seq: alloc(o, fs::SEQ_OBJECT, coherent, None, 0, false)?,
+            own_barrier: record(Self::OWN, barrier::SIZE)?,
+            prev_barrier: record(Self::PREV, barrier::SIZE)?,
+            ta_fs_barrier: record(Self::TA_FS, barrier::SIZE)?,
+            fs_dep: record(Self::FS_DEP, barrier::SIZE)?,
+            compute_barrier: record(Self::COMPUTE, barrier::SIZE * sizes::COMPUTE_PIPES)?,
+            fs_compute_barrier: record(Self::FS_COMPUTE, barrier::SIZE * sizes::COMPUTE_PIPES)?,
+        })
+    }
+}
+
+const _: () = assert!(PassCmds::BARRIERS <= super::hw::PAGE as usize);
 
 /// One render pass slot.
 pub(crate) struct PassSlot {
@@ -172,8 +370,9 @@ pub(crate) struct PassSlot {
 }
 
 impl PassSlot {
-    /// Allocates pass slot `i`'s objects, with their client leaf classes.
-    pub(crate) fn new(o: &mut Objects, i: u64, pre_records: u32) -> Result<Self> {
+    /// Allocates pass slot `i`'s objects, with their client leaf classes, around the
+    /// device-lifetime command records `cmds` of index `i`.
+    pub(crate) fn new(o: &mut Objects, i: u64, pre_records: u32, cmds: &PassCmds) -> Result<Self> {
         let sh = Class::Shared;
         let off = client::pass_off(i);
         let tpc = if i >= sizes::BASE_RENDER_SLOTS as u64 {
@@ -250,18 +449,6 @@ impl PassSlot {
             0,
             false,
         )?;
-        let fs_work = alloc_work(
-            o,
-            fs::WORK_SIZE,
-            client::FS_WORK_PAGE + off,
-            client::FS_WORK_OFF as usize,
-        )?;
-        let ta_work = alloc_work(
-            o,
-            ta::WORK_SIZE,
-            client::TA_WORK_PAGE + off,
-            client::TA_WORK_OFF as usize,
-        )?;
         Ok(Self {
             aux,
             pre,
@@ -271,35 +458,21 @@ impl PassSlot {
             scene_user,
             scene_list,
             fs_scratch,
-            fs_work,
-            ta_work,
-            ta_seq: alloc(o, ta::SEQ_OBJECT, cmd_fw(), None, 0, false)?,
-            fs_seq: alloc(o, fs::SEQ_OBJECT, cmd_fw(), None, 0, false)?,
+            fs_work: cmds.fs_work.clone(),
+            ta_work: cmds.ta_work.clone(),
+            ta_seq: cmds.ta_seq.clone(),
+            fs_seq: cmds.fs_seq.clone(),
             ta_scratch: alloc(o, 0x10000, sh, None, 0, false)?,
             scene: alloc(o, super::fw::work::scene::SIZE, sh, None, 0, false)?,
             // Internal TA start/end, FS start/end; legacy user cells likewise.
             its: alloc(o, 32, sh, None, 0, false)?,
             _uts: alloc(o, 32, Class::Fw, None, 0, false)?,
-            own_barrier: alloc(o, barrier::SIZE, cmd_fw(), None, 0, false)?,
-            prev_barrier: alloc(o, barrier::SIZE, cmd_fw(), None, 0, false)?,
-            ta_fs_barrier: alloc(o, barrier::SIZE, cmd_fw(), None, 0, false)?,
-            fs_dep: alloc(o, barrier::SIZE, cmd_fw(), None, 0, false)?,
-            compute_barrier: alloc(
-                o,
-                barrier::SIZE * sizes::COMPUTE_PIPES,
-                cmd_fw(),
-                None,
-                0,
-                false,
-            )?,
-            fs_compute_barrier: alloc(
-                o,
-                barrier::SIZE * sizes::COMPUTE_PIPES,
-                cmd_fw(),
-                None,
-                0,
-                false,
-            )?,
+            own_barrier: cmds.own_barrier.clone(),
+            prev_barrier: cmds.prev_barrier.clone(),
+            ta_fs_barrier: cmds.ta_fs_barrier.clone(),
+            fs_dep: cmds.fs_dep.clone(),
+            compute_barrier: cmds.compute_barrier.clone(),
+            fs_compute_barrier: cmds.fs_compute_barrier.clone(),
         })
     }
 
@@ -803,8 +976,17 @@ impl Slots {
             .exhausted_within(super::params::compute_units())
     }
     /// Whether none of the first `n` compute units (a VM's own) can ever be claimed again.
+    #[allow(dead_code)]
     pub(crate) fn compute_exhausted_within(&self, n: usize) -> bool {
         self.compute.lifetime.exhausted_within(n)
+    }
+    /// Whether none of the compute units in `mask` (bit `k` -> unit `k`) can ever be claimed.
+    pub(crate) fn compute_exhausted_in_mask(&self, mask: u32) -> bool {
+        self.compute.lifetime.exhausted_in_mask(mask)
+    }
+    /// Bitmask of permanently quarantined compute units (`0..COMPUTE_UNITS`).
+    pub(crate) fn quarantined_compute_mask(&self) -> u32 {
+        self.compute.lifetime.quarantined_mask()
     }
     pub(crate) fn render_exhausted(&self) -> bool {
         self.render.lifetime.exhausted()
@@ -829,20 +1011,44 @@ impl Slots {
         [self.compute.lifetime.counts(), self.render.lifetime.counts()]
     }
     /// Whether one of the first `n` compute units can be claimed now.
+    #[allow(dead_code)]
     pub(crate) fn compute_available(&self, n: usize) -> bool {
         (0..n.min(sizes::COMPUTE_UNITS)).any(|k| self.compute.lifetime.available(k))
     }
+    /// Whether any compute unit in `mask` can be claimed now.
+    pub(crate) fn compute_available_in_mask(&self, mask: u32) -> bool {
+        let mut rem = mask;
+        while rem != 0 {
+            let k = rem.trailing_zeros() as usize;
+            rem &= rem - 1;
+            if k < sizes::COMPUTE_UNITS && self.compute.lifetime.available(k) {
+                return true;
+            }
+        }
+        false
+    }
+    /// Whether any compute unit in `mask` eligible for `pipe` can be claimed now.
+    /// Pipe 0 may claim any bit in `mask`; secondary pipes stay in
+    /// `PIPE1_COMPUTE_START..COMPUTE_UNITS` so `0..PIPE1_COMPUTE_START` only ever hold pipe-0
+    /// leases.
+    pub(crate) fn compute_available_in_mask_for_pipe(&self, mask: u32, pipe: usize) -> bool {
+        let allowed = if pipe == 0 {
+            mask
+        } else {
+            mask & !((1u32 << sizes::PIPE1_COMPUTE_START) - 1)
+        };
+        self.compute_available_in_mask(allowed)
+    }
     /// Whether one of the first `n` compute units eligible for `pipe` can be claimed now.
-    /// Pipe 0 may claim `0..n`; secondary pipes stay in `BASE_COMPUTE_UNITS..n` so a 2-unit
-    /// base-only VM can never see both base units undisplaced across two pipes.
+    #[allow(dead_code)]
     pub(crate) fn compute_available_for_pipe(&self, n: usize, pipe: usize) -> bool {
         let limit = n.min(sizes::COMPUTE_UNITS);
-        let start = if pipe == 0 {
-            0
+        let mask = if limit >= 32 {
+            u32::MAX
         } else {
-            super::resources::BASE_COMPUTE_UNITS.min(limit)
+            (1u32 << limit) - 1
         };
-        (start..limit).any(|k| self.compute.lifetime.available(k))
+        self.compute_available_in_mask_for_pipe(mask, pipe)
     }
     /// Whether one of the first `n` render pass slots can be claimed now.
     #[allow(dead_code)]
@@ -1041,20 +1247,37 @@ impl Slots {
         self.free_compute_in(super::params::compute_units())
     }
     /// Available compute units within the first `n` units (a VM's prepared count).
+    #[allow(dead_code)]
     pub(crate) fn free_compute_in(&self, n: usize) -> u32 {
         self.free_compute_in_for_pipe(n, 0)
     }
+    /// Available compute units in `mask` eligible for `pipe`.
+    pub(crate) fn free_compute_in_mask_for_pipe(&self, mask: u32, pipe: usize) -> u32 {
+        let mut rem = if pipe == 0 {
+            mask
+        } else {
+            mask & !((1u32 << sizes::PIPE1_COMPUTE_START) - 1)
+        };
+        let mut count = 0u32;
+        while rem != 0 {
+            let k = rem.trailing_zeros() as usize;
+            rem &= rem - 1;
+            if k < sizes::COMPUTE_UNITS && self.compute.lifetime.available(k) {
+                count += 1;
+            }
+        }
+        count
+    }
     /// Available compute units within the first `n` units eligible for `pipe`.
+    #[allow(dead_code)]
     pub(crate) fn free_compute_in_for_pipe(&self, n: usize, pipe: usize) -> u32 {
         let limit = n.min(sizes::COMPUTE_UNITS);
-        let start = if pipe == 0 {
-            0
+        let mask = if limit >= 32 {
+            u32::MAX
         } else {
-            super::resources::BASE_COMPUTE_UNITS.min(limit)
+            (1u32 << limit) - 1
         };
-        (start..limit)
-            .filter(|&k| self.compute.lifetime.available(k))
-            .count() as u32
+        self.free_compute_in_mask_for_pipe(mask, pipe)
     }
     /// Forces a full scrub on the next claim of every slot (after firmware recovery).
     #[allow(dead_code)]
@@ -1121,25 +1344,26 @@ impl Slots {
             return Ok(None);
         }
         // Prefer a warm unit already owned by `vm_id` (`!scrub_full`), then an unowned unit,
-        // before falling back to round-robin over `start..n`: pipe 0 spans `0..n`, while
-        // secondary pipes stay in `BASE_COMPUTE_UNITS..n` so base units `0..2` only ever hold
-        // pipe-0 leases and a 2-unit VM can never hit `compute_exhausted_within(2)`.
-        let n = units.compute_units()?.min(sizes::COMPUTE_UNITS);
-        let start = if pipe == 0 {
-            0
+        // before falling back to round-robin over `allowed`: pipe 0 spans `mask`, while
+        // secondary pipes stay in `PIPE1_COMPUTE_START..COMPUTE_UNITS` so `0..PIPE1_COMPUTE_START`
+        // only ever hold pipe-0 leases and 2-unit base/SCS VMs never split across two pipes.
+        let mask = units.compute_slot_mask()?;
+        let allowed = if pipe == 0 {
+            mask
         } else {
-            super::resources::BASE_COMPUTE_UNITS
+            mask & !((1u32 << sizes::PIPE1_COMPUTE_START) - 1)
         };
-        if start >= n {
+        if allowed == 0 {
             return Ok(None);
         }
-        let span = n - start;
-        let base_cursor = (self.cursor as usize).saturating_sub(start) % span;
+        let n = sizes::COMPUTE_UNITS;
+        let base_cursor = (self.cursor as usize) % n;
         let mut chosen = None;
         if let Some(id) = vm_id {
-            for i in 0..span {
-                let k = start + (base_cursor + i) % span;
-                if !self.compute.scrub_full[k]
+            for i in 0..n {
+                let k = (base_cursor + i) % n;
+                if (allowed & (1u32 << k)) != 0
+                    && !self.compute.scrub_full[k]
                     && self.compute.owner[k]
                         .as_ref()
                         .is_some_and(|prev| prev.id == id)
@@ -1150,9 +1374,12 @@ impl Slots {
                 }
             }
             if chosen.is_none() {
-                for i in 0..span {
-                    let k = start + (base_cursor + i) % span;
-                    if self.compute.owner[k].is_none() && self.compute.lifetime.claim(k) {
+                for i in 0..n {
+                    let k = (base_cursor + i) % n;
+                    if (allowed & (1u32 << k)) != 0
+                        && self.compute.owner[k].is_none()
+                        && self.compute.lifetime.claim(k)
+                    {
                         chosen = Some(k);
                         break;
                     }
@@ -1160,9 +1387,9 @@ impl Slots {
             }
         }
         if chosen.is_none() {
-            for i in 0..span {
-                let k = start + (base_cursor + i) % span;
-                if self.compute.lifetime.claim(k) {
+            for i in 0..n {
+                let k = (base_cursor + i) % n;
+                if (allowed & (1u32 << k)) != 0 && self.compute.lifetime.claim(k) {
                     chosen = Some(k);
                     break;
                 }
@@ -1171,7 +1398,12 @@ impl Slots {
         let Some(k) = chosen else {
             return Ok(None);
         };
+        let arena_changed = self.compute.arena[k]
+            .as_ref()
+            .zip(units.compute_arena(k).as_ref())
+            .is_some_and(|(a, b)| !Arc::ptr_eq(a, b));
         let full = self.compute.scrub_full[k]
+            || arena_changed
             || vm_id.is_none_or(|id| {
                 self.compute.owner[k]
                     .as_ref()

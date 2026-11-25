@@ -10,8 +10,12 @@
 //! process (such as a compositor). It reserves no hardware graph or execution context.
 //! QUEUE_CREATE validates
 //! `usc_exec_base` (4 GiB aligned, the window inside the user range) and refuses a failed VM or
-//! GPU (EIO); HIGH/REALTIME are refused by the shared `file.rs`. Ray-query scratch layouts are
-//! refused by the shared default `reserve_render_scs` (RENDER_RAY_QUERY is never advertised).
+//! GPU (EIO); HIGH/REALTIME are refused by the shared `file.rs`. `render_scs_layout` (the
+//! largest ray-query scratch layouts of the queue's render stages) is reserved at creation:
+//! EINVAL for a malformed layout, E2BIG beyond the largest SCS-capable UMA pool; a render
+//! whose scratch exceeds the reservation is refused (EINVAL), as on the M4 Pro. The
+//! reservation also sizes the SCS-capable render pools its VM creates for it
+//! ([`super::rt::pool_seeds`]).
 //!
 //! QUEUE_DESTROY (dropping the queue) drains: the scheduler entity is torn down first, which
 //! waits (killable) until every accepted job has been handed to the engine; the engine then runs
@@ -156,6 +160,10 @@ pub(crate) struct Queue {
     vm: Arc<VmState>,
     shared: Arc<Shared>,
     timeline: Arc<Timeline>,
+    /// Enabled GPU cores, which SCS memory is sized for.
+    active_cores: u32,
+    /// Reserved render scratch pages per stage (`render_scs_layout`).
+    render_scs: [u16; 2],
     // Last field: all preceding fields (especially scheduler) drop before capacity returns.
     _credit: QueueCredit,
 }
@@ -216,6 +224,8 @@ impl Queue {
             vm: vm_state,
             shared: gpu.shared.clone(),
             timeline,
+            active_cores: gpu.id.core_masks.iter().map(|mask| mask.count_ones()).sum(),
+            render_scs: [0; 2],
             _credit: credit,
         })
     }
@@ -246,6 +256,8 @@ impl Queue {
             &command::Context {
                 vm: &self.vm.vm,
                 usc_base: self.state.usc_base,
+                active_cores: self.active_cores,
+                render_scs: self.render_scs,
             },
             &mut self.proof,
         )?;
@@ -264,6 +276,7 @@ impl Queue {
         // No GPU completion lock is held; reclaim can wait for earlier hardware work.
         let hints = super::resources::PrepareHints {
             expand_compute_ext: self.shared.base_compute_quarantined.load(Ordering::Acquire),
+            quarantined_compute_mask: self.shared.quarantined_compute_mask.load(Ordering::Acquire),
             expand_render_ext: self.shared.base_render_quarantined.load(Ordering::Acquire),
             quarantined_pb_mask: self.shared.quarantined_pb_mask.load(Ordering::Acquire),
             next_pb_slot: &self.shared.next_pb_slot,
@@ -321,6 +334,22 @@ impl Queue {
 }
 
 impl crate::queue::Queue for Queue {
+    /// RENDER_RAY_QUERY: the largest scratch layouts of the queue's vertex and fragment stages.
+    /// A render's UMA pool serves both stages of one render at a time, so their extra pages add
+    /// up ([`super::rt::required_seeds`]).
+    fn reserve_render_scs(&mut self, layouts: [u64; 2]) -> Result {
+        if self.accepted != [0; 2] {
+            return Err(EBUSY);
+        }
+        let pages = [
+            super::rt::ScratchRequest::new(layouts[0])?.pages(),
+            super::rt::ScratchRequest::new(layouts[1])?.pages(),
+        ];
+        super::rt::required_seeds(self.active_cores, &pages)?;
+        self.render_scs = pages;
+        Ok(())
+    }
+
     fn submit(
         &mut self,
         _reg_data: &crate::driver::AsahiRegData<'_>,
