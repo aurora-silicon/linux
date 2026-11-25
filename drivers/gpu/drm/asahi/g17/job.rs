@@ -270,6 +270,7 @@ impl Packet {
     }
     pub(crate) fn request_cancel(&self) -> bool {
         self.cancelled.store(true, Ordering::Release);
+        self.completion.clear_source_published();
         self.publication
             .compare_exchange(0, 3, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()

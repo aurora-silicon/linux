@@ -656,13 +656,26 @@ impl Registry {
                 dependencies.tiling_count += 1;
             }
         }
-        if let Some(queue) = self.compute(owner) {
-            dependencies.compute = queue.dependency(
+        for queue in self
+            .compute
+            .iter()
+            .flatten()
+            .filter_map(|entry| entry.queue.as_deref())
+            .filter(|queue| queue.owner() == Some(owner))
+        {
+            let tiling = queue.dependency(
                 owner,
                 packet.completion.status(),
                 packet.order.tiling_wait_through[1],
                 state,
             )?;
+            if let Some(dep) = tiling {
+                *dependencies
+                    .compute
+                    .get_mut(dependencies.compute_count)
+                    .ok_or(EOVERFLOW)? = dep;
+                dependencies.compute_count += 1;
+            }
             if packet.order.tiling_wait_through[1] != packet.order.wait_through[1] {
                 let whole = queue.dependency(
                     owner,
@@ -670,8 +683,12 @@ impl Registry {
                     packet.order.wait_through[1],
                     state,
                 )?;
-                if whole != dependencies.compute {
-                    dependencies.fragment_compute = whole;
+                if let Some(dep) = whole.filter(|dep| Some(*dep) != tiling) {
+                    *dependencies
+                        .fragment_compute
+                        .get_mut(dependencies.fragment_compute_count)
+                        .ok_or(EOVERFLOW)? = dep;
+                    dependencies.fragment_compute_count += 1;
                 }
             }
         }

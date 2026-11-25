@@ -23,8 +23,14 @@ static int collect_leaf(struct dma_fence *leaf,
 				out[i].status = status;
 			return 0;
 		}
-		if (coalesce_contexts && status == 0 && out[i].status == 0 &&
-		    out[i].fence->context == leaf->context) {
+		/*
+		 * Coalesce healthy unsignaled leaves sharing a fence context (such
+		 * as multiple points of one timeline chain), keeping only the
+		 * latest seqno. Failed leaves are never coalesced, so errors are
+		 * preserved, and neither is context 0, which names no timeline.
+		 */
+		if (coalesce_contexts && status == 0 && leaf->context != 0 &&
+		    out[i].status == 0 && out[i].fence->context == leaf->context) {
 			if (dma_fence_is_later(leaf, out[i].fence)) {
 				dma_fence_put(out[i].fence);
 				out[i].fence = dma_fence_get(leaf);

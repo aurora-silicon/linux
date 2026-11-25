@@ -106,6 +106,10 @@ pub(crate) const DRM_ASAHI_COMPUTE_VISIBLE_COMPLETION: u32 =
 /// (`drm_asahi_queue_create::compute_timeout_ms`).
 pub(crate) const DRM_ASAHI_FEATURE_COMPUTE_TIMEOUT: u64 =
     uapi::DRM_ASAHI_FEATURE_COMPUTE_TIMEOUT as u64;
+/// The kernel spreads one compute queue's independent commands over several firmware compute
+/// queues itself.
+pub(crate) const DRM_ASAHI_FEATURE_COMPUTE_MULTI_CHANNEL: u64 =
+    uapi::DRM_ASAHI_FEATURE_COMPUTE_MULTI_CHANNEL as u64;
 /// The tiling half waits only on the render and compute prefixes of the command's stage-prefix
 /// fields, its fragment half on the whole ones.
 #[allow(dead_code)]
