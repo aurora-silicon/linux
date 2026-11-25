@@ -9,7 +9,7 @@
 //! A backend whose firmware overlaps the commands of one queue charges through a [`Lane`]
 //! per queue, so each engine of a queue counts the union of its stage intervals.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Number of GPU engines tracked in [`Engine`]: vertex, fragment and compute.
 pub(crate) const NUM_ENGINES: usize = 3;
@@ -31,13 +31,47 @@ pub(crate) enum Engine {
 /// One ledger per DRM file, shared by all of its queues and VMs.
 pub(crate) struct Client {
     ns: [AtomicU64; NUM_ENGINES],
+    covered: [AtomicU64; NUM_ENGINES],
+    queues: AtomicU32,
 }
 
 impl Client {
     pub(crate) const fn new() -> Self {
         Self {
             ns: [const { AtomicU64::new(0) }; NUM_ENGINES],
+            covered: [const { AtomicU64::new(0) }; NUM_ENGINES],
+            queues: AtomicU32::new(0),
         }
+    }
+
+    /// Reserves one logical queue credit against this DRM file up to `limit`.
+    pub(crate) fn try_acquire_queue(&self, limit: u32) -> bool {
+        let mut count = self.queues.load(Ordering::Acquire);
+        loop {
+            if count >= limit {
+                return false;
+            }
+            match self.queues.compare_exchange_weak(
+                count,
+                count + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(value) => count = value,
+            }
+        }
+    }
+
+    /// Releases one logical queue credit previously acquired from this DRM file.
+    pub(crate) fn release_queue(&self) {
+        let previous = self.queues.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous != 0);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn queues(&self) -> u32 {
+        self.queues.load(Ordering::Acquire)
     }
 
     /// Called exactly once per retired stage, while its internal timestamps are retained.
@@ -66,16 +100,47 @@ impl Client {
         }
     }
 
+    /// As [`Self::add`], deduplicating overlapping stage intervals across all queues of this
+    /// DRM file (including sibling queues running concurrently on multiple hardware pipes).
+    /// Only the part of `start..end` after the file's per-engine mark is charged, and the
+    /// mark advances to `end`.
+    pub(crate) fn add_union(&self, engine: Engine, start: u64, end: u64, frequency_hz: u32) {
+        if let Some(from) = union_mark(&self.covered[engine as usize], start, end, frequency_hz) {
+            self.add(engine, from, end, frequency_hz);
+        }
+    }
+
     /// Vertex, fragment and compute, in ns. No cross-engine atomic snapshot is promised.
     pub(crate) fn snapshot(&self) -> [u64; NUM_ENGINES] {
         self.ns.each_ref().map(|ns| ns.load(Ordering::Relaxed))
     }
 }
 
-/// A stage this far behind its lane's mark is not an overlap, since no stage runs this
-/// long: the timestamps jumped, so the mark restarts at the stage instead of holding every
+/// A stage this far behind its mark is not an overlap, since no stage runs this long:
+/// the timestamps jumped, so the mark restarts at the stage instead of holding every
 /// later charge back.
 const DISCONTINUITY_S: u64 = 60;
+
+/// Advances `mark` to cover `start..end`, returning the uncovered sub-interval start `from`
+/// when `from < end`, or `None` when the interval is invalid or already covered.
+fn union_mark(mark: &AtomicU64, start: u64, end: u64, frequency_hz: u32) -> Option<u64> {
+    if start == 0 || end <= start || frequency_hz == 0 {
+        return None;
+    }
+    let limit = u64::from(frequency_hz).saturating_mul(DISCONTINUITY_S);
+    let mut covered = mark.load(Ordering::Relaxed);
+    loop {
+        let jumped = covered.saturating_sub(start) > limit;
+        let from = if jumped { start } else { start.max(covered) };
+        if from >= end {
+            return None;
+        }
+        match mark.compare_exchange_weak(covered, end, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return Some(from),
+            Err(value) => covered = value,
+        }
+    }
+}
 
 /// The engine time of one queue, charged to its file's [`Client`].
 ///
@@ -102,24 +167,9 @@ impl<P: core::ops::Deref<Target = Client>> Lane<P> {
     /// As [`Client::add`], for one retired stage of this lane's queue: only the part of
     /// `start..end` after the engine's mark is charged, and the mark moves to `end`.
     pub(crate) fn add(&self, engine: Engine, start: u64, end: u64, frequency_hz: u32) {
-        if start == 0 || end <= start || frequency_hz == 0 {
-            return;
+        if let Some(from) = union_mark(&self.covered[engine as usize], start, end, frequency_hz) {
+            self.client.add(engine, from, end, frequency_hz);
         }
-        let limit = u64::from(frequency_hz).saturating_mul(DISCONTINUITY_S);
-        let mark = &self.covered[engine as usize];
-        let mut covered = mark.load(Ordering::Relaxed);
-        let from = loop {
-            let jumped = covered.saturating_sub(start) > limit;
-            let from = if jumped { start } else { start.max(covered) };
-            if from >= end {
-                return;
-            }
-            match mark.compare_exchange_weak(covered, end, Ordering::Relaxed, Ordering::Relaxed) {
-                Ok(_) => break from,
-                Err(value) => covered = value,
-            }
-        };
-        self.client.add(engine, from, end, frequency_hz);
     }
 }
 
@@ -272,6 +322,33 @@ mod tests {
     }
 
     #[test]
+    fn client_union_deduplicates_dual_pipe_siblings_and_isolates_files() {
+        let file_a = Client::new();
+        let file_b = Client::new();
+        // Two sibling queues on the same DRM file overlapping across two CDM pipes
+        // (e.g., 543 us dispatches at depth 4).
+        const PERIOD: u64 = 13_032; // 543 us at 24 MHz
+        for i in 0..100u64 {
+            let p0_start = 1_000 + i * PERIOD;
+            let p1_start = p0_start + PERIOD / 4;
+            file_a.add_union(Engine::Compute, p0_start, p0_start + PERIOD, HZ);
+            file_a.add_union(Engine::Compute, p1_start, p1_start + PERIOD, HZ);
+        }
+        let wall = ticks_to_ns(99 * PERIOD + PERIOD / 4 + PERIOD, HZ);
+        assert_eq!(file_a.snapshot()[2], wall);
+        // Separate DRM file keeps its own union mark.
+        file_b.add_union(Engine::Compute, 1_000, 1_000 + PERIOD, HZ);
+        assert_eq!(file_b.snapshot()[2], ticks_to_ns(PERIOD, HZ));
+        // Timestamp jump > 60 s behind the mark restarts the file mark cleanly.
+        let far = 61 * u64::from(HZ);
+        file_b.add_union(Engine::Compute, 1, far, HZ);
+        let before = file_b.snapshot()[2];
+        file_b.add_union(Engine::Compute, 24, 48, HZ);
+        file_b.add_union(Engine::Compute, 36, 72, HZ);
+        assert_eq!(file_b.snapshot()[2] - before, 2_000);
+    }
+
+    #[test]
     fn a_timestamp_jump_restarts_the_mark() {
         let client = Client::new();
         let lane = Lane::new(&client);
@@ -330,5 +407,24 @@ mod tests {
             thread.join().unwrap();
         }
         assert_eq!(client.snapshot(), [0, 0, 80_000_000]);
+    }
+
+    #[test]
+    fn per_file_queue_credits_are_bounded_and_isolated() {
+        let a = Client::new();
+        let b = Client::new();
+        for i in 0..4u32 {
+            assert!(a.try_acquire_queue(4));
+            assert_eq!(a.queues(), i + 1);
+        }
+        assert!(!a.try_acquire_queue(4));
+        assert_eq!(a.queues(), 4);
+        assert!(b.try_acquire_queue(4));
+        assert_eq!(b.queues(), 1);
+        a.release_queue();
+        assert_eq!(a.queues(), 3);
+        assert!(a.try_acquire_queue(4));
+        b.release_queue();
+        assert_eq!(b.queues(), 0);
     }
 }

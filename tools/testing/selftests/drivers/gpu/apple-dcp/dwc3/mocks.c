@@ -25,7 +25,7 @@ struct apple_atcphy {
 		bool aux, pll;
 		unsigned int pairs, rate;
 	} dp_t8122;
-	bool fixed_usb2, fixed_usb3, host_active, mode_dirty, ss_tunables, dp_tunables,
+	bool fixed_usb2, fixed_usb3, cio_only, host_active, mode_dirty, ss_tunables, dp_tunables,
 		aux_power_requested;
 	unsigned int dp_owned_pmas, dp_idle_pmas;
 	unsigned int dp_usb_context_valid, dp_usb_context_dirty;
@@ -404,6 +404,12 @@ static int dwc3_host_init(struct dwc3 *d)
 		pipe_regs[PIPEHANDLER_LOCK_ACK / 4] = PIPEHANDLER_LOCK_EN;
 	}
 	return host_init_error;
+}
+
+/* The xHCI start and its USB3 routing; atc-t8132-usb3 models them. */
+static int dwc3_apple_host_start(struct dwc3_apple *a)
+{
+	return dwc3_host_init(&a->dwc);
 }
 static int dwc3_gadget_init(struct dwc3 *d)
 {

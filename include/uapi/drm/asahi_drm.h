@@ -333,7 +333,7 @@ enum drm_asahi_feature {
 	DRM_ASAHI_FEATURE_COMPUTE_WIDE_VISIBILITY = (1UL) << 8,
 
 	/*
-	 * Bits 10 to 15 are reported only by the G17P runtime.
+	 * Bits 10 to 16 are the HAL200/G16/G17P command-stream features.
 	 */
 
 	/**
@@ -572,6 +572,17 @@ enum drm_asahi_feature {
  * those of enum drm_asahi_feature, defined here like bit 32.
  */
 #define DRM_ASAHI_FEATURE_USERPTR_NO_MEMLOCK ((1ULL) << 43)
+
+/*
+ * DRM_ASAHI_FEATURE_ORDERED_FRAGMENT_BARRIERS: a render command that sets
+ * DRM_ASAHI_RENDER_FRAGMENT_BARRIERS still waits for the earlier renders its
+ * barriers name: the fragment half waits for them to finish before it
+ * starts. Kernels that report DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS without
+ * this bit may drop that wait, so userspace that uses the flag to order a
+ * render after earlier ones must check for this bit. A feature bit like
+ * those of enum drm_asahi_feature, defined here like bit 32.
+ */
+#define DRM_ASAHI_FEATURE_ORDERED_FRAGMENT_BARRIERS ((1ULL) << 44)
 
 #define DRM_ASAHI_PARAM_GROUP_VM_STATUS 1
 #define DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS 2
@@ -2313,10 +2324,12 @@ enum drm_asahi_compute_flags {
 	DRM_ASAHI_COMPUTE_USES_MATRIX = (1L << 16),
 
 	/**
-	 * @DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS: The command neither copies nor
-	 * resets queries, so it cannot observe timestamps the kernel publishes
-	 * for earlier commands and need not wait for that publication. Requires
-	 * DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS.
+	 * @DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS: The command reads and writes no
+	 * timestamp or availability word whose host publication by the kernel
+	 * is still pending for an earlier command, so it need not wait for that
+	 * publication. The command may copy or reset queries whose words are
+	 * all already published, or were never bound for host timestamps.
+	 * Requires DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS.
 	 */
 	DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS = (1L << 17),
 

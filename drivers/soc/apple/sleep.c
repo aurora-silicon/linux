@@ -44,6 +44,7 @@
 #include <linux/cpu.h>
 #include <linux/cpumask.h>
 #include <linux/completion.h>
+#include <linux/cpuidle.h>
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/err.h>
@@ -143,6 +144,7 @@ struct aura_s2r_mailbox {
 #define WDT_WD2_COUNT		0x20
 #define WDT_WD2_ALARM		0x28
 #define WDT_WD2_CTL		0x2c
+#define WDT_WD2_CTL_IRQ_STATUS	BIT(1)
 #define WDT_TICKS_PER_S		24000000
 /* The sleep's own safety net: ADT /arm-io/wdt simple-reconfig-wdog-icc-time. */
 #define WDT_SLEEP_SECS		5
@@ -151,9 +153,10 @@ struct aura_s2r_mailbox {
 
 #define AON_AP_DEADLINE		0x08
 /*
- * T8142: a word of the watchdog's second page (/arm-io/wdt + 0x802c). macOS's entry
- * read-modify-writes it from 0 to 0x20 right before WD0's control and WD2 (26B131 trace,
- * 11.1 ms before the S2R timer); XNU writes 0x10 there during boot. Meaning unknown.
+ * Simple-reconfig WD2 routing word (bits 5:4: 01 = run-time cold reset, 10 = sleep-commit
+ * routing). Lives at wdt-aux + 0x2c on T6050 and aon-misc + 0x2c (/arm-io/wdt + 0x802c) on
+ * T8142; sleep saves it before commit (T6050 DT sequence writes 0x20, T8142 ORs 0x20) and
+ * restores the saved value on wake.
  */
 #define AON_WDT_SLEEP		0x2c
 
@@ -1676,9 +1679,18 @@ int apple_sleep_coproc_wake_error(struct device *dev)
 }
 EXPORT_SYMBOL_GPL(apple_sleep_coproc_wake_error);
 
+static bool apple_sleep_external_commit;
+
+void apple_sleep_set_commit_stops_coprocs(bool enable)
+{
+	WRITE_ONCE(apple_sleep_external_commit, enable);
+}
+EXPORT_SYMBOL_GPL(apple_sleep_set_commit_stops_coprocs);
+
 bool apple_sleep_commit_stops_coprocs(void)
 {
-	return READ_ONCE(apple_sleep) && pm_suspend_via_firmware();
+	return (READ_ONCE(apple_sleep) || READ_ONCE(apple_sleep_external_commit)) &&
+	       pm_suspend_via_firmware();
 }
 EXPORT_SYMBOL_GPL(apple_sleep_commit_stops_coprocs);
 
@@ -1696,7 +1708,8 @@ static void apple_sleep_coproc_run_off(struct apple_sleep_coproc *c)
 		c->stopped = true;
 		return;
 	}
-	if (!apple_sleep->soc->regions)
+	/* T6041's own sleep driver runs this without the sleep core. */
+	if (!apple_sleep || !apple_sleep->soc->regions)
 		c->status = readl(c->asc + ASC_CPU_STATUS);
 	writel(readl(c->asc + ASC_CPU_CONTROL) & ~ASC_CPU_CONTROL_RUN, c->asc + ASC_CPU_CONTROL);
 	writel(readl(c->asc + ASC_CPU_CONTROL) & ~ASC_CPU_CONTROL_RUN, c->asc + ASC_CPU_CONTROL);
@@ -1815,6 +1828,87 @@ static void apple_sleep_coprocs_stop(struct apple_sleep *s, bool first)
 	dsb(sy);
 }
 
+/*
+ * For a SoC whose sleep has its own driver at EL2 (T6041): last refusal checks
+ * before any irreversible enclave or coprocessor stop.
+ */
+int apple_sleep_coprocs_check_all(void)
+{
+	int i, ret;
+
+	for (i = 0; i < SLEEP_COPROCS; i++) {
+		struct apple_sleep_coproc *c = &apple_sleep_coprocs[i];
+
+		if (!c->dev || !c->ready || c->stopped || !c->last_check)
+			continue;
+		ret = c->last_check(c->data);
+		if (ret) {
+			dev_err(c->dev, "refused at sleep commit: %d\n", ret);
+			return ret;
+		}
+	}
+
+	return 0;
+}
+
+/*
+ * For a SoC whose sleep has its own driver at EL2 (T6041): run the enclave's
+ * irreversible sleep request with interrupts off. A nonzero return guarantees
+ * no SLEEP request was sent.
+ */
+int apple_sleep_enclave_stop_all(void)
+{
+	int ret;
+
+	if (!apple_sleep_enclave.stop)
+		return 0;
+	ret = apple_sleep_enclave.stop(apple_sleep_enclave.data);
+	if (ret && apple_sleep_enclave.dev)
+		dev_err(apple_sleep_enclave.dev,
+			"refused before SEP SLEEP was sent: %d\n", ret);
+
+	return ret;
+}
+
+/*
+ * For a SoC whose sleep has its own driver at EL2 (T6041): both passes of the stop above,
+ * the coprocessors registered first, then the rest. Past the refusal boundary every ready
+ * coprocessor is still halted even if one @last_stop reports a negative error.
+ */
+int apple_sleep_coprocs_stop_all(void)
+{
+	int pass, i, ret, first_err = 0;
+
+	for (pass = 1; pass >= 0; pass--) {
+		for (i = 0; i < SLEEP_COPROCS; i++) {
+			struct apple_sleep_coproc *c = &apple_sleep_coprocs[i];
+
+			if (!c->dev || !c->ready || c->first != pass || c->stopped)
+				continue;
+			if (c->last_stop) {
+				ret = c->last_stop(c->data);
+				if (ret < 0 && !first_err)
+					first_err = ret;
+			}
+			apple_sleep_coproc_run_off(c);
+		}
+	}
+	dsb(sy);
+	return first_err;
+}
+
+/* For T6041: whether the coprocessor behind the storage PCIe link (ANS) was stopped. */
+bool apple_sleep_coprocs_ans_stopped(void)
+{
+	int i;
+
+	for (i = 0; i < SLEEP_COPROCS; i++)
+		if (apple_sleep_coprocs[i].dev && apple_sleep_coprocs[i].pcie_ans &&
+		    apple_sleep_coprocs[i].stopped)
+			return true;
+	return false;
+}
+
 const struct apple_sleep_smc_policy *apple_sleep_smc_policy(void)
 {
 	return apple_sleep && pm_suspend_via_firmware() ? apple_sleep->soc->smc_policy : NULL;
@@ -1896,6 +1990,125 @@ void apple_sleep_smc_unregister(struct device *dev)
 }
 EXPORT_SYMBOL_GPL(apple_sleep_smc_unregister);
 
+static const struct of_device_id apple_sleep_of_match[];
+
+static DEFINE_SPINLOCK(apple_sleep_wdt_lock);
+static struct device *apple_sleep_wdt_dev;
+static void (*apple_sleep_wdt_restore)(void *data);
+static void *apple_sleep_wdt_data;
+static bool apple_sleep_wd2_owned;
+
+static bool apple_sleep_wdt_same_block(const struct resource *sleep_wdt,
+				       const struct resource *wdt)
+{
+	if (!sleep_wdt || !wdt)
+		return false;
+	return sleep_wdt->start == wdt->start;
+}
+
+static bool apple_sleep_dt_owns_wdt(const struct resource *wdt)
+{
+	struct device_node *np = NULL;
+	bool found = false;
+
+	if (!wdt)
+		return false;
+
+	for_each_matching_node(np, apple_sleep_of_match) {
+		struct resource res;
+		int idx;
+
+		if (!of_device_is_available(np))
+			continue;
+		idx = of_property_match_string(np, "reg-names", "wdt");
+		if (idx < 0 || of_address_to_resource(np, idx, &res))
+			continue;
+		if (apple_sleep_wdt_same_block(&res, wdt)) {
+			found = true;
+			of_node_put(np);
+			break;
+		}
+	}
+
+	return found;
+}
+
+static int apple_sleep_wdt_register_matched(struct device *dev, bool matched,
+					    void (*restore)(void *data), void *data)
+{
+	unsigned long flags;
+
+	if (!dev || !restore)
+		return -EINVAL;
+	if (!matched)
+		return 0;
+
+	spin_lock_irqsave(&apple_sleep_wdt_lock, flags);
+	if (apple_sleep_wdt_dev && apple_sleep_wdt_dev != dev) {
+		spin_unlock_irqrestore(&apple_sleep_wdt_lock, flags);
+		return -EBUSY;
+	}
+	apple_sleep_wdt_dev = dev;
+	apple_sleep_wdt_restore = restore;
+	apple_sleep_wdt_data = data;
+	spin_unlock_irqrestore(&apple_sleep_wdt_lock, flags);
+
+	return 0;
+}
+
+int apple_sleep_wdt_register(struct device *dev, const struct resource *wdt,
+			     void (*restore)(void *data), void *data)
+{
+	if (!dev || !wdt || !restore)
+		return -EINVAL;
+
+	return apple_sleep_wdt_register_matched(dev, apple_sleep_dt_owns_wdt(wdt),
+						restore, data);
+}
+EXPORT_SYMBOL_GPL(apple_sleep_wdt_register);
+
+void apple_sleep_wdt_unregister(struct device *dev)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&apple_sleep_wdt_lock, flags);
+	if (apple_sleep_wdt_dev == dev) {
+		apple_sleep_wdt_dev = NULL;
+		apple_sleep_wdt_restore = NULL;
+		apple_sleep_wdt_data = NULL;
+	}
+	spin_unlock_irqrestore(&apple_sleep_wdt_lock, flags);
+}
+EXPORT_SYMBOL_GPL(apple_sleep_wdt_unregister);
+
+bool apple_sleep_wdt_active(struct device *dev)
+{
+	unsigned long flags;
+	bool active;
+
+	if (!dev)
+		return false;
+
+	spin_lock_irqsave(&apple_sleep_wdt_lock, flags);
+	active = apple_sleep_wd2_owned && apple_sleep_wdt_dev == dev;
+	spin_unlock_irqrestore(&apple_sleep_wdt_lock, flags);
+
+	return active;
+}
+EXPORT_SYMBOL_GPL(apple_sleep_wdt_active);
+
+static void apple_sleep_wdt_end(void __iomem *wdt)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&apple_sleep_wdt_lock, flags);
+	writel(0, wdt + WDT_WD2_CTL);
+	if (apple_sleep_wdt_restore)
+		apple_sleep_wdt_restore(apple_sleep_wdt_data);
+	apple_sleep_wd2_owned = false;
+	spin_unlock_irqrestore(&apple_sleep_wdt_lock, flags);
+}
+
 void apple_sleep_display_quiesced(struct device *dev, bool quiesced)
 {
 	struct apple_sleep *s = apple_sleep;
@@ -1952,10 +2165,10 @@ static int apple_sleep_validate_cpu_topology(struct apple_sleep *s)
 		    soc->cpu_cores_per_cluster > 32)
 		return dev_err_probe(s->dev, -EINVAL, "invalid CPU-start geometry\n");
 
-	if (soc->machine && (!of_machine_is_compatible(soc->machine) ||
-	    cpu_logical_map(0) != soc->boot_mpidr ||
-	    num_possible_cpus() != soc->cpu_count))
-		return dev_err_probe(s->dev, -EINVAL, "unsupported board/CPU inventory\n");
+	/* The node's compatible chose the profile: its machine is where it was measured */
+	if (soc->machine && (cpu_logical_map(0) != soc->boot_mpidr ||
+			     num_possible_cpus() != soc->cpu_count))
+		return dev_err_probe(s->dev, -EINVAL, "unsupported CPU inventory\n");
 
 	index = of_property_match_string(np, "reg-names", "cpu-start");
 	if (index < 0)
@@ -6082,14 +6295,21 @@ static int apple_sleep_enter_prepare(struct apple_sleep *s)
 static int apple_sleep_enter_saved(unsigned long unused)
 {
 	struct apple_sleep *s = apple_sleep;
-	int ret = s->soc->ops->cpu_prepare(s->mbox->boot_mpidr);
+	int ret;
 
+	/*
+	 * cpu_suspend() calls its finisher with RCU not watching. Up to the commit this one
+	 * takes locks, logs and looks at work items: RCU watches until then.
+	 */
+	ct_cpuidle_exit();
+	ret = s->soc->ops->cpu_prepare(s->mbox->boot_mpidr);
+	if (!ret)
+		ret = apple_sleep_enter_prepare(s);
+	if (!ret)
+		pm_set_resume_via_firmware();
+	ct_cpuidle_enter();
 	if (ret)
 		return ret;
-	ret = apple_sleep_enter_prepare(s);
-	if (ret)
-		return ret;
-	pm_set_resume_via_firmware();
 	/* cpu_suspend has already saved boot context. Commit never returns. */
 	return apple_sleep_commit(0);
 }
@@ -6523,7 +6743,14 @@ static int apple_sleep_begin(suspend_state_t state)
 		apple_sleep->wd1_saved_bite = readl(apple_sleep->wdt + WDT_WD1_BITE);
 		apple_sleep->wd1_saved = true;
 	}
-	apple_sleep_set_wd2(apple_sleep, WDT_SUSPEND_SECS);
+	{
+		unsigned long flags;
+
+		spin_lock_irqsave(&apple_sleep_wdt_lock, flags);
+		apple_sleep_wd2_owned = true;
+		apple_sleep_set_wd2(apple_sleep, WDT_SUSPEND_SECS);
+		spin_unlock_irqrestore(&apple_sleep_wdt_lock, flags);
+	}
 	pm_set_suspend_via_firmware();
 	sleep_ans_late_open();
 
@@ -6541,7 +6768,10 @@ static void apple_sleep_end(void)
 	if (pm_suspend_via_firmware() && apple_sleep->soc->ops->pmu_wake)
 		apple_sleep->soc->ops->pmu_wake(apple_sleep);
 	if (pm_suspend_via_firmware() && apple_sleep->soc->wdt_wd1) {
+		unsigned long flags;
+
 		/* After apple_wdt's resume: WD1 as user space had it before the sleep */
+		spin_lock_irqsave(&apple_sleep_wdt_lock, flags);
 		if (apple_sleep->wd1_saved) {
 			writel(0, apple_sleep->wdt + WDT_WD1_CTL);
 			writel(0, apple_sleep->wdt + WDT_WD1_COUNT);
@@ -6549,8 +6779,10 @@ static void apple_sleep_end(void)
 			writel(apple_sleep->wd1_saved_ctl, apple_sleep->wdt + WDT_WD1_CTL);
 			apple_sleep->wd1_saved = false;
 		}
+		apple_sleep_wd2_owned = false;
+		spin_unlock_irqrestore(&apple_sleep_wdt_lock, flags);
 	} else if (pm_suspend_via_firmware()) {
-		writel(0, apple_sleep->wdt + WDT_WD2_CTL);
+		apple_sleep_wdt_end(apple_sleep->wdt);
 	}
 }
 

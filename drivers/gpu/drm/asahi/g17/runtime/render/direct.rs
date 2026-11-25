@@ -243,16 +243,21 @@ impl crate::g17::Firmware {
         if entry.pending_error.is_some() || entry.pending_timeout {
             self.primary.state.shared.queue_events();
         }
+        let closed = entry.closed;
         let pair = entry.pair.as_mut().ok_or(EIO)?;
-        if entry.closed {
+        if closed {
             pair.release_owner();
         }
         if !packet.is_published() {
             pair.discard_prepared(packet)?;
         }
+        let published = packet.is_published() || pair.graph_started();
         // A failed publication may have quarantined the lent pair, and its owner may have
         // closed while it was lent.
         self.queues.hold_render_slot(usize::from(slot));
+        if published && !closed {
+            self.queues.admission.note_published(slot);
+        }
         if let Some((id, generation)) = activation {
             if self.queues.render.pools.activate(id, generation).is_err() {
                 self.primary.state.shared.lose_device_quietly();
@@ -303,6 +308,7 @@ impl Backend {
         if !port.note_submission() {
             return None;
         }
+        self.shared.note_submitter();
         self.shared.note_gpu_activity();
         match packet.completion.work_state().ok()?.acquire(crate::g17::job::Engine::Render) {
             Ok(_) => {}

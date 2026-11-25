@@ -27,12 +27,13 @@ HEADER = r'''
 #![allow(dead_code)]
 type Result<T = ()> = std::result::Result<T, i32>;
 const ENODEV: i32 = -19;
-macro_rules! dev_info { ($($t:tt)*) => { () }; }
-macro_rules! dev_err { ($($t:tt)*) => { () }; }
+// The device argument is dropped; the message and its arguments are still built.
+macro_rules! dev_info { ($dev:expr, $($t:tt)*) => { { let _ = format!($($t)*); } }; }
+macro_rules! dev_err { ($dev:expr, $($t:tt)*) => { { let _ = format!($($t)*); } }; }
 struct AsahiDrmDevice {
     version: Option<[u32; 3]>,
     image: u32,
-    checked: std::cell::RefCell<Vec<u32>>,
+    checked: std::rc::Rc<std::cell::RefCell<Vec<u32>>>,
 }
 struct CoreLayout {
     cores: Option<(u32, u32)>,
@@ -41,6 +42,29 @@ struct Config {
     id: u32,
     core_layout: CoreLayout,
 }
+mod fwid {
+    pub struct FirmwareBuild {
+        pub name: &'static str,
+        pub image: u32,
+        pub text_sha256: [u8; 32],
+    }
+    // The loaded TEXT, modelled by its image number; records every image it is tried against.
+    pub struct Measured {
+        pub image: u32,
+        pub checked: std::rc::Rc<std::cell::RefCell<Vec<u32>>>,
+    }
+    impl Measured {
+        pub fn find(&mut self, builds: &'static [FirmwareBuild]) -> Option<&'static FirmwareBuild> {
+            builds.iter().find(|build| {
+                self.checked.borrow_mut().push(build.image);
+                build.image == self.image
+            })
+        }
+        pub fn identity(&mut self, _: impl IntoIterator<Item = &'static FirmwareBuild>) -> u32 {
+            self.image
+        }
+    }
+}
 mod fw {
     pub struct Variant(pub u32);
     pub mod variant {
@@ -48,7 +72,7 @@ mod fw {
         pub struct Build {
             pub os_version: [u32; 3],
             pub name: &'static str,
-            pub image: u32,
+            pub images: &'static [crate::fwid::FirmwareBuild],
             pub variant: &'static Variant,
             pub config: Option<&'static crate::Config>,
         }
@@ -58,35 +82,36 @@ mod fw {
 struct Gpu;
 impl Gpu {
     fn os_firmware_version(dev: &AsahiDrmDevice) -> Option<[u32; 3]> { dev.version }
-    fn identify_image(dev: &AsahiDrmDevice, build: &'static fw::variant::Build) -> Result {
-        dev.checked.borrow_mut().push(build.image);
-        if dev.image == build.image { Ok(()) } else { Err(ENODEV) }
+    fn measure_text(dev: &AsahiDrmDevice) -> Result<fwid::Measured> {
+        Ok(fwid::Measured { image: dev.image, checked: dev.checked.clone() })
     }
 '''
 
 TESTS = r'''
 }
+static IMAGE_1: [fwid::FirmwareBuild; 1] = [fwid::FirmwareBuild { name: "image 1", image: 1, text_sha256: [1; 32] }];
+static IMAGE_2: [fwid::FirmwareBuild; 1] = [fwid::FirmwareBuild { name: "image 2", image: 2, text_sha256: [2; 32] }];
 static FIRST: fw::Variant = fw::Variant(1);
 static SECOND: fw::Variant = fw::Variant(2);
 static OWN: Config = Config { id: 7, core_layout: CoreLayout { cores: None } };
 static BUILDS: [fw::variant::Build; 2] = [
-    fw::variant::Build { os_version: [26,6,2], name: "first", image: 1, variant: &FIRST, config: None },
-    fw::variant::Build { os_version: [27,0,0], name: "second", image: 2, variant: &SECOND,
+    fw::variant::Build { os_version: [26,6,2], name: "first", images: &IMAGE_1, variant: &FIRST, config: None },
+    fw::variant::Build { os_version: [27,0,0], name: "second", images: &IMAGE_2, variant: &SECOND,
                          config: Some(&OWN) },
 ];
 // One image admitted with the configurations of two core layouts, as T6041 25G83 is.
 static FORTY: Config = Config { id: 40, core_layout: CoreLayout { cores: Some((4, 40)) } };
 static THIRTY_TWO: Config = Config { id: 32, core_layout: CoreLayout { cores: Some((4, 32)) } };
 static SHARED: [fw::variant::Build; 3] = [
-    fw::variant::Build { os_version: [26,5,2], name: "other", image: 1, variant: &FIRST, config: None },
-    fw::variant::Build { os_version: [26,6,2], name: "40", image: 2, variant: &SECOND,
+    fw::variant::Build { os_version: [26,5,2], name: "other", images: &IMAGE_1, variant: &FIRST, config: None },
+    fw::variant::Build { os_version: [26,6,2], name: "40", images: &IMAGE_2, variant: &SECOND,
                          config: Some(&FORTY) },
-    fw::variant::Build { os_version: [26,6,2], name: "32", image: 2, variant: &SECOND,
+    fw::variant::Build { os_version: [26,6,2], name: "32", images: &IMAGE_2, variant: &SECOND,
                          config: Some(&THIRTY_TWO) },
 ];
 const CORES: (u32, u32) = (4, 40);
 fn device(version: Option<[u32; 3]>, image: u32) -> AsahiDrmDevice {
-    AsahiDrmDevice { version, image, checked: std::cell::RefCell::new(Vec::new()) }
+    AsahiDrmDevice { version, image, checked: Default::default() }
 }
 fn main() {
     use fw::variant::Firmware;
