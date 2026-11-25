@@ -176,7 +176,7 @@ static int centauri_recover(struct centauri *c)
 	struct device *dev = &c->pdev->dev;
 	u32 stage = readl(c->bar + 0x8000);
 	struct pci_dev *beta;
-	int ret, i;
+	int ret, reset_ret, i;
 
 	if (!c->warm_reset)
 		return -EOPNOTSUPP;
@@ -206,31 +206,39 @@ static int centauri_recover(struct centauri *c)
 	c->boot_attempted = false;
 	c->image_response = 0;
 	c->link_ready = false;
-	ret = centauri_port_cycle(c->pdev, true);
+	ret = centauri_port_cycle(c->pdev, &reset_ret);
 	if (ret) {
 		dev_err(dev, "recovery: reset port cycle failed: %d\n", ret);
 		return ret;
 	}
 	c->link_ready = true;
+	if (reset_ret) {
+		dev_err(dev, "recovery: warm reset failed: %d\n", reset_ret);
+		return reset_ret;
+	}
 	stage = readl(c->bar + 0x8000);
 	dev_info(dev, "recovery: stage %#x after the warm reset\n", stage);
 	if (stage != 0)
 		return -EIO;
+	/* Returns once the ROM reports the image loaded (stage 4), as the boot step does. */
 	ret = centauri_rom_boot(c);
 	if (ret) {
 		dev_err(dev, "recovery: ROM boot failed: %d\n", ret);
 		return ret;
 	}
-	msleep(2000);
 	c->link_ready = false;
-	ret = centauri_port_cycle(c->pdev, false);
+	ret = centauri_port_cycle(c->pdev, NULL);
 	if (ret) {
 		dev_err(dev, "recovery: boot port cycle failed: %d\n", ret);
 		return ret;
 	}
 	c->link_ready = true;
-	dev_info(dev, "recovery: post-reset execution stage=%#x\n", readl(c->bar + 0x8000));
-	msleep(2000);
+	/* The IPC start needs the image's first stage (1) after the port cycle. */
+	ret = readl_poll_timeout(c->bar + 0x8000, stage, stage == 1, 20 * USEC_PER_MSEC,
+				 5 * USEC_PER_SEC);
+	dev_info(dev, "recovery: post-reset execution stage=%#x\n", stage);
+	if (ret)
+		return ret;
 	ret = centauri_start_ipc(c);
 	dev_info(dev, "recovery: IPC start %d\n", ret);
 	return ret;
@@ -261,11 +269,11 @@ static void centauri_recover_worker(struct work_struct *work)
 	int ret;
 
 	mutex_lock(&c->boot_lock);
-	if (READ_ONCE(c->removing) || !c->ipc) {
+	if (READ_ONCE(c->removing) || (!c->ipc && !c->restart_failed)) {
 		mutex_unlock(&c->boot_lock);
 		return;
 	}
-	if (!xchg(&c->inject_stall, false) && !centauri_wifi_stalled(c)) {
+	if (!xchg(&c->inject_stall, false) && !c->restart_failed && !centauri_wifi_stalled(c)) {
 		mutex_unlock(&c->boot_lock);
 		dev_info(dev, "firmware fault cleared; no restart\n");
 		return;
@@ -281,9 +289,19 @@ static void centauri_recover_worker(struct work_struct *work)
 	c->recover_at[ARRAY_SIZE(c->recover_at) - 1] = now;
 	dev_warn(dev, "firmware stopped; restarting the N1\n");
 	ret = centauri_recover(c);
+	/* With the link up the chip can be reset again; without it nothing more can be done. */
+	c->restart_failed = ret && c->link_ready;
 	mutex_unlock(&c->boot_lock);
+	if (ret && !c->restart_failed) {
+		dev_err(dev, "restart failed: %d, and the link is down; Wi-Fi stays down until a reboot\n",
+			ret);
+		return;
+	}
 	if (ret) {
-		dev_err(dev, "restart failed: %d\n", ret);
+		/* Counts against the same limit: at most three attempts in 30 minutes. */
+		dev_err(dev, "restart failed: %d; trying again in 10 s\n", ret);
+		if (!READ_ONCE(c->removing))
+			queue_delayed_work(centauri_wq, &c->recover_work, 10 * HZ);
 		return;
 	}
 	/*
@@ -324,7 +342,7 @@ static ssize_t centauri_boot_write(struct file *file, const char __user *buffer,
 		ret = -EBUSY;
 	} else {
 		c->link_ready = false;
-		ret = centauri_port_cycle(c->pdev, false);
+		ret = centauri_port_cycle(c->pdev, NULL);
 		if (!ret) {
 			c->link_ready = true;
 			dev_info(&c->pdev->dev, "post-reset execution stage=%#x\n",

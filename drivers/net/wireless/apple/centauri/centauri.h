@@ -41,6 +41,7 @@ struct centauri {
 	unsigned long recover_at[3];
 	bool removing;
 	bool recover_gave_up;	/* restart limit reached: requests are ignored */
+	bool restart_failed;	/* the last restart failed with the link up: try again */
 	bool warm_reset;	/* the root port describes the N1's warm reset: restart on a stop */
 	bool inject_stall;	/* debugfs test: the next check finds the firmware stopped */
 };
@@ -100,7 +101,7 @@ static inline const struct centauri_board *centauri_board(void)
 	return NULL;
 }
 
-int centauri_port_cycle(struct pci_dev *pdev, bool reset_chip);
+int centauri_port_cycle(struct pci_dev *pdev, int *reset_ret);
 bool centauri_warm_reset_described(struct pci_dev *pdev);
 int centauri_start_ipc(struct centauri *c);
 void centauri_free_ipc(struct centauri *c);
