@@ -434,7 +434,8 @@ pub(crate) enum HoldCause {
     DrainFailed,
     /// A cold `InitBM` render is in flight.
     DrainInitbm,
-    /// Compute and render of different VMs, or an SCS compute conflict.
+    /// Compute behind any flight of another VM, render behind compute of another VM, or an
+    /// SCS compute conflict.
     DrainCross,
     /// No warm PB/UMA allocator slot of the VM can take the render behind active flights.
     DrainPb,
@@ -1401,7 +1402,7 @@ impl Firmware {
                     || f.recovery_suspect
                     || f.initbm
                     || (is_compute && scs_compute_conflict(f, &job.vm, is_rt_compute))
-                    || (((is_compute && f.renders != 0) || (is_render && f.computes != 0))
+                    || ((is_compute || (is_render && f.computes != 0))
                         && !Arc::ptr_eq(&f.job.vm, &job.vm))
             })
             || (is_render && !self.render_can_pipeline(job))
@@ -1589,8 +1590,8 @@ impl Firmware {
 
     /// Whether `job`'s next command may be published behind the flights in flight:
     ///
-    /// - Compute queues behind healthy non-InitBM compute flights of any VM or same-VM
-    ///   render flights (up to [`params::compute_flights`] active computes), each in its own
+    /// - Compute queues behind healthy non-InitBM compute and render flights of its own VM
+    ///   (up to [`params::compute_flights`] active computes), each in its own
     ///   `ComputeSlot` and hardware UMA slot (`COMPUTE_UMA_SLOT + index`), unless `query_access`
     ///   is set and a same-queue predecessor in its compute or render barrier prefix has
     ///   CPU-published timestamp outputs that have not retired yet
@@ -1606,6 +1607,10 @@ impl Firmware {
     ///   dispatch from one client cannot starve another client's fragment shading into a
     ///   firmware DM1 timeout. Cold InitBM priming renders and every failure or recovery path
     ///   still drain the engine first.
+    /// - Compute never runs beside compute of another VM, on either pipe: with several clients
+    ///   dispatching barrier-free compute, the overlapped dispatches occasionally lost their
+    ///   results without a fault (loads read zero, readbacks came back empty or partial),
+    ///   which one client alone never does. G15 runs one VM at a time for the same reason.
     fn can_queue_behind(&self, job: &Arc<Job>) -> bool {
         let mut ta_pending = None;
         self.can_queue_behind_with_ta(job, &mut ta_pending)
@@ -1672,17 +1677,14 @@ impl Firmware {
                             })
                         })
                     }));
-                let cross_vm_render = e
-                    .flights
-                    .iter()
-                    .any(|f| f.renders != 0 && !Arc::ptr_eq(&f.job.vm, &job.vm));
+                let cross_vm = e.flights.iter().any(|f| !Arc::ptr_eq(&f.job.vm, &job.vm));
                 let scs = job.resources.compute_scs() || c.is_rt();
                 let scs_conflict = e
                     .flights
                     .iter()
                     .any(|f| scs_compute_conflict(f, &job.vm, scs));
                 let compute_count: usize = e.flights.iter().map(|f| f.computes as usize).sum();
-                !cross_vm_render
+                !cross_vm
                     && !scs_conflict
                     && !waits_for_timestamps
                     && compute_count < params::compute_flights()

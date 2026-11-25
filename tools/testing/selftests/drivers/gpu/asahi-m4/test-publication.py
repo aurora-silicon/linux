@@ -589,7 +589,7 @@ fn firmware(jobs:Vec<Arc<Job>>,stages:Vec<(Result,bool)>)->Firmware{
         assert_eq!(fw.attempted,[11]);
         assert_eq!(fw.engine.stats.hold[0],0);
 
-        // Cross-VM compute queues immediately behind another VM's active compute without drain.
+        // Cross-VM compute drains behind another VM's active compute (no cross-VM C<->C overlap).
         let vm1_c=job_on_vm(12,vm1.clone(),false,0,Ok(()));
         let vm2_c=job_on_vm(13,vm2.clone(),false,0,Ok(()));
         let mut fc=firmware(vec![vm2_c],vec![(Ok(()),true)]);
@@ -598,8 +598,8 @@ fn firmware(jobs:Vec<Arc<Job>>,stages:Vec<(Result,bool)>)->Firmware{
         fc.engine.flights.push(flc);
         fc.allow_behind=true;
         assert_eq!(fc.publish_checked(&mut done),Ok(()));
-        assert_eq!(fc.attempted,[13]);
-        assert_eq!(fc.engine.stats.hold[0],0);
+        assert!(fc.attempted.is_empty());
+        assert_eq!(fc.engine.stats.hold[0],1);
 
         // Cross-VM compute drains behind another VM's active render (no cross-VM R<->C overlap).
         let vm1_r2=job_on_vm(14,vm1.clone(),true,0,Ok(()));
@@ -938,10 +938,9 @@ mod queue_behind_scope {
             pools:QueueBehindPools{exhausted:false,can_pipeline:true,block_pipeline_vm:None},
         };
         assert!(p.can_queue_behind(&j2));
-        // Cross-VM compute queues behind another VM's healthy compute, but drains behind
-        // another VM's render.
-        assert!(p.can_queue_behind(&j_other_vm));
-        assert!(!p.needs_engine_drain(&j_other_vm));
+        // Cross-VM compute drains behind another VM's compute as behind its render.
+        assert!(!p.can_queue_behind(&j_other_vm));
+        assert!(p.needs_engine_drain(&j_other_vm));
         assert!(p.can_queue_behind(&j_render));
         p.engine.flights[0].doomed=true;
         assert!(!p.can_queue_behind(&j2));
@@ -995,13 +994,17 @@ mod queue_behind_scope {
             assert!(!p.can_queue_behind(j));
             assert!(p.needs_engine_drain(j));
         }
-        // SCS compute does not start beside non-SCS compute on either pipe.
+        // SCS compute does not start beside non-SCS compute on either pipe, and no compute
+        // starts beside another VM's compute.
         for pipe in [0u8,1] {
             p.engine.flights=vec![flight(alu.clone(),false,pipe)];
             assert!(!p.can_queue_behind(&rq));
             assert!(p.needs_engine_drain(&rq));
-            assert!(p.can_queue_behind(&rq_post));
-            assert!(!p.needs_engine_drain(&rq_post));
+            assert!(!p.can_queue_behind(&rq_post));
+            assert!(p.needs_engine_drain(&rq_post));
+            p.engine.flights=vec![flight(rq_post.clone(),false,pipe)];
+            assert!(!p.can_queue_behind(&rq));
+            assert!(p.needs_engine_drain(&rq));
         }
         // A render flight of its own VM does not hold it; once SCS compute is gone, the rest
         // overlaps as before.
@@ -1012,8 +1015,10 @@ mod queue_behind_scope {
         assert!(!p.needs_engine_drain(&rq));
         assert!(p.can_queue_behind(&rq));
         p.engine.flights=vec![flight(rq_post.clone(),false,0)];
-        assert!(p.can_queue_behind(&alu));
-        assert!(!p.needs_engine_drain(&alu));
+        assert!(p.can_queue_behind(&rq_post));
+        assert!(!p.needs_engine_drain(&rq_post));
+        assert!(!p.can_queue_behind(&alu));
+        assert!(p.needs_engine_drain(&alu));
     }
     #[test]fn compute_query_access_waits_for_timed_predecessor_unless_no_query_access(){
         let vm1=Arc::new(Vm{status:Status(AtomicU32::new(0)),slot:1});
@@ -1134,11 +1139,11 @@ mod queue_behind_scope {
         assert!(p.can_queue_behind(&vm1_c) && !p.needs_engine_drain(&vm1_c));
         assert!(p.can_queue_behind(&vm2_r) && !p.needs_engine_drain(&vm2_r));
         assert!(!p.can_queue_behind(&vm2_c) && p.needs_engine_drain(&vm2_c));
-        // Active VM1 Compute: same-VM R & C allowed; cross-VM C allowed; cross-VM R blocked + drains.
+        // Active VM1 Compute: same-VM R & C allowed; cross-VM C and R blocked + drain.
         p.engine.flights=vec![mk_flight(vm1_c.clone(),1,0)];
         assert!(p.can_queue_behind(&vm1_r) && !p.needs_engine_drain(&vm1_r));
         assert!(p.can_queue_behind(&vm1_c) && !p.needs_engine_drain(&vm1_c));
-        assert!(p.can_queue_behind(&vm2_c) && !p.needs_engine_drain(&vm2_c));
+        assert!(!p.can_queue_behind(&vm2_c) && p.needs_engine_drain(&vm2_c));
         assert!(!p.can_queue_behind(&vm2_r) && p.needs_engine_drain(&vm2_r));
         // Mixed active VM1 Render + VM1 Compute: both cross-VM R and cross-VM C blocked + drain.
         p.engine.flights=vec![mk_flight(vm1_r.clone(),0,1),mk_flight(vm1_c.clone(),1,0)];
@@ -1880,9 +1885,13 @@ mod queue_behind_scope {
         host.engine.next_compute_pipe=0;
         assert_eq!(host.choose_compute_pipe(&q3, [None, None], (1u32 << 24) - 1, false, false), 0);
         assert_eq!(host.choose_compute_pipe(&q1, [None, None], (1u32 << 24) - 1, false, true), 0);
-        assert!(host.can_queue_behind(&c_vm2));
+        // No compute queues beside another VM's compute flight, on either pipe.
+        assert!(!host.can_queue_behind(&c_vm2));
+        assert!(!host.can_queue_behind(&c2));
         // Same-VM compute still pipelines without draining.
+        host.engine.flights.pop();
         assert!(host.can_queue_behind(&c2));
+        assert!(!host.can_queue_behind(&c_vm2));
     }
     #[test]fn two_pipe_compute_barriers_reuse_single_pipe_and_serialize_across_both_pipes(){
         let vm1=Arc::new(Vm{status:Status(AtomicU32::new(0)),slot:1});
