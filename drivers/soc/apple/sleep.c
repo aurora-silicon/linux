@@ -4818,22 +4818,19 @@ static bool sleep_ps_dropped(u32 saved, u32 woke)
 	       FIELD_GET(PS_ACTUAL, woke) != FIELD_GET(PS_TARGET, saved);
 }
 
-/*
- * Every domain back as it was at the commit, before any driver's resume reads its block:
- * macOS's wake words first, in its order, whatever they read, if Linux had them on. Then
- * any other domain the wake left otherwise, a second time for one whose parent came later.
- */
-static void sleep_ps_rewake(struct apple_sleep *s)
+/* In a wake order: a word of "ps-aon"; the others are of "ps" */
+#define SLEEP_PS_WAKE_AON	BIT(31)
+
+/* Each domain as the wake found it, and nothing written back yet */
+static void sleep_ps_rewake_begin(struct apple_sleep *s)
 {
 	const struct apple_sleep_soc *soc = s->soc;
 	const u32 *all = soc->ps_all.offset, *aon = soc->ps_aon_all.offset;
 	unsigned int n = soc->ps_all.count, naon = soc->ps_aon_all.count;
-	bool *redo = s->ps_late, *redo_aon = s->ps_aon_late;
-	bool *done = s->ps_done, *done_aon = s->ps_aon_done;
-	int i, j, pass;
+	int i;
 
-	memset(done, 0, n * sizeof(*done));
-	memset(done_aon, 0, naon * sizeof(*done_aon));
+	memset(s->ps_done, 0, n * sizeof(*s->ps_done));
+	memset(s->ps_aon_done, 0, naon * sizeof(*s->ps_aon_done));
 	memset(s->ps_late, 0, n * sizeof(*s->ps_late));
 	memset(s->ps_aon_late, 0, naon * sizeof(*s->ps_aon_late));
 	s->ps_rewoken = 0;
@@ -4842,25 +4839,55 @@ static void sleep_ps_rewake(struct apple_sleep *s)
 		s->ps_woke[i] = readl(sleep_power_reg(s, all[i]));
 	for (i = 0; i < naon; i++)
 		s->ps_aon_woke[i] = readl(s->ps_aon + aon[i]);
+}
 
-	for (j = 0; j < soc->ps_wake_order.count; j++) {
-		i = sleep_ps_find(all, n, soc->ps_wake_order.offset[j]);
-		if (i < 0 || !FIELD_GET(PS_TARGET, s->ps_commit[i]))
-			continue;
-		done[i] = true;
-		s->ps_rewoken++;
-		if (sleep_ps_restore(sleep_power_reg(s, all[i]), s->ps_commit[i]))
-			redo[i] = true;
+/*
+ * The words of @order, in its order, whatever the wake left them at, back as they were at the
+ * commit if Linux had them on: of "ps-aon" if @aon or marked so, else of "ps". A word not on in
+ * time is retried by sleep_ps_rewake_rest().
+ */
+static void sleep_ps_rewake_words(struct apple_sleep *s, const struct apple_sleep_words *order,
+				  bool aon)
+{
+	const struct apple_sleep_soc *soc = s->soc;
+	int i, j;
+
+	for (j = 0; j < order->count; j++) {
+		u32 offset = order->offset[j] & ~SLEEP_PS_WAKE_AON;
+
+		if (aon || (order->offset[j] & SLEEP_PS_WAKE_AON)) {
+			i = sleep_ps_find(soc->ps_aon_all.offset, soc->ps_aon_all.count, offset);
+			if (i < 0 || s->ps_aon_done[i] ||
+			    !FIELD_GET(PS_TARGET, s->ps_aon_commit[i]))
+				continue;
+			s->ps_aon_done[i] = true;
+			s->ps_rewoken++;
+			if (sleep_ps_restore(s->ps_aon + offset, s->ps_aon_commit[i]))
+				s->ps_aon_late[i] = true;
+		} else {
+			i = sleep_ps_find(soc->ps_all.offset, soc->ps_all.count, offset);
+			if (i < 0 || s->ps_done[i] || !FIELD_GET(PS_TARGET, s->ps_commit[i]))
+				continue;
+			s->ps_done[i] = true;
+			s->ps_rewoken++;
+			if (sleep_ps_restore(sleep_power_reg(s, offset), s->ps_commit[i]))
+				s->ps_late[i] = true;
+		}
 	}
-	for (j = 0; j < soc->ps_aon_wake_order.count; j++) {
-		i = sleep_ps_find(aon, naon, soc->ps_aon_wake_order.offset[j]);
-		if (i < 0 || !FIELD_GET(PS_TARGET, s->ps_aon_commit[i]))
-			continue;
-		done_aon[i] = true;
-		s->ps_rewoken++;
-		if (sleep_ps_restore(s->ps_aon + aon[i], s->ps_aon_commit[i]))
-			redo_aon[i] = true;
-	}
+}
+
+/*
+ * Any other domain the wake left otherwise, then every word not yet on again, a second time
+ * for one whose parent came later. Counts what is still not on.
+ */
+static void sleep_ps_rewake_rest(struct apple_sleep *s)
+{
+	const struct apple_sleep_soc *soc = s->soc;
+	const u32 *all = soc->ps_all.offset, *aon = soc->ps_aon_all.offset;
+	unsigned int n = soc->ps_all.count, naon = soc->ps_aon_all.count;
+	bool *redo = s->ps_late, *redo_aon = s->ps_aon_late;
+	bool *done = s->ps_done, *done_aon = s->ps_aon_done;
+	int i, pass;
 
 	for (pass = 0; pass < PS_REWAKE_PASSES; pass++) {
 		for (i = 0; i < n; i++) {
@@ -4890,6 +4917,19 @@ static void sleep_ps_rewake(struct apple_sleep *s)
 		s->ps_rewake_timeouts += redo[i];
 	for (i = 0; i < naon; i++)
 		s->ps_rewake_timeouts += redo_aon[i];
+}
+
+/*
+ * Every domain back as it was at the commit, before any driver's resume reads its block:
+ * macOS's wake words first, in its order, then any other domain the wake left otherwise. A
+ * profile whose wake order has steps between its words runs the steps itself.
+ */
+static void sleep_ps_rewake(struct apple_sleep *s)
+{
+	sleep_ps_rewake_begin(s);
+	sleep_ps_rewake_words(s, &s->soc->ps_wake_order, false);
+	sleep_ps_rewake_words(s, &s->soc->ps_aon_wake_order, true);
+	sleep_ps_rewake_rest(s);
 }
 
 /*

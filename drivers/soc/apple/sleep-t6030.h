@@ -32,11 +32,17 @@
  * stop unless apple_sleep.untested_commit=1. With the SMC policy macsmc sends nothing past
  * its warning, pmVC and wake type before that point: no slpa on a dry run.
  *
- * The wake is macOS 27.2's on J516s, as aura's wake record has it: the cluster words, the DT's
- * apple,seq-wake-early (CPU power gates), every power word back as Linux had it before the
- * entry, in the order macOS writes them, the DT's apple,seq-wake (the other CPU power gates,
- * then the AMCCs' ways and planes and the DCS back, the reverse of the commit's, with their
- * words as read at the entry), then the notify masks.
+ * The wake is macOS 27.2's on J516s, as aura's wake record has it, step for step:
+ *  - the DT's apple,seq-wake-early: each complex's word, waited on, then two CPU power gates;
+ *  - the power words macOS writes before its memory side, in its order, as Linux had them;
+ *  - the DT's apple,seq-wake: the other two gates, then the AMCCs' ways and planes and the DCS,
+ *    the reverse of the commit's, only where a bit was on at the entry, each after its words
+ *    as read then;
+ *  - MCA3 and PMS_SRAM, the notify masks, the display complexes and I2C1, any other word the
+ *    wake left otherwise.
+ * Past the commit nothing goes back: a wake sequence without its snapshot or with an entry that
+ * fails, or a power word not on in the end, ends the wake in a panic that names it. What the
+ * wake reads first is cleaned to the point of coherency before the commit.
  */
 
 /* Power words in "ps", from the J516s ADT's pmgr devices */
@@ -289,8 +295,9 @@ static void t6030_sleep_undo_regs(struct apple_sleep *s)
 
 	if (!t->notify_staged)
 		return;
-	writel(t->notify_saved[0], s->spmi_a0 + SPMI_NOTIFY_ENABLE);
+	/* nub-spmi0 first, as macOS's wake */
 	writel(t->notify_saved[1], s->spmi + SPMI_NOTIFY_ENABLE);
+	writel(t->notify_saved[0], s->spmi_a0 + SPMI_NOTIFY_ENABLE);
 	t->notify_staged = false;
 }
 
@@ -418,6 +425,37 @@ static void t6030_sleep_unstage(struct apple_sleep *s, u32 offset, u32 before)
 		s->ps_commit[i] = before;
 }
 
+/* A "ps-aon" word in a wake order */
+#define T6030_AON(offset)		(SLEEP_PS_WAKE_AON | (offset))
+
+/*
+ * The power words macOS 27.2's wake on J516s writes, in the order it first writes them (aura's
+ * whole wake record), in three steps around the rest of its wake:
+ *  - before the second pair of CPU power gates and the memory side, by 3.4 ms;
+ */
+static const u32 t6030_ps_wake_early[] = {
+	0xc00, T6030_AON(0x98), 0x110, 0x118, 0x120, 0x170, 0x1b8, 0x1f0, 0x210, 0x228, 0x230,
+	0x238, 0x240, 0x248, 0x260, 0x2a0, 0x2a8, 0x2b0, 0x2b8, 0x2c0, 0x2c8, 0x2d0, 0x2e0,
+	0x408, 0x500, 0x510, 0x558, 0x568, 0x5b0, 0x5b8, 0x4e0, 0x4c8, 0x390, 0x388, 0x308,
+	0x300, 0x2f8, 0x2f0, 0x2e8, 0x2d8, 0x298, 0x290, 0x288, 0x280, 0x278, 0x270, 0x268,
+	0x250, 0x220, 0x218, 0x208, 0x200, 0x1e0, 0x1d8, 0x1d0, 0x190, 0x180, 0x178, 0x168,
+	0x160, 0x158, 0x150, 0x148, 0x140, 0x138, 0x108, T6030_AON(0xc0), T6030_AON(0xb8),
+};
+
+/*  - after the memory side, before the notify masks: MCA3, PMS_SRAM (30, 34 ms); */
+static const u32 t6030_ps_wake_mid[] = {
+	0x398, 0x4d0,
+};
+
+/*  - after the notify masks: the display complexes, then I2C1 (57-59 ms). */
+static const u32 t6030_ps_wake_late[] = {
+	0x3b8, 0x3d8, 0x3e0, 0x3c0, 0x3f0, 0x3f8, 0x1c0, 0x258, 0x10000, 0x1f8,
+};
+
+static const struct apple_sleep_words t6030_wake_early_words = SLEEP_WORDS(t6030_ps_wake_early);
+static const struct apple_sleep_words t6030_wake_mid_words = SLEEP_WORDS(t6030_ps_wake_mid);
+static const struct apple_sleep_words t6030_wake_late_words = SLEEP_WORDS(t6030_ps_wake_late);
+
 /*
  * A wake sequence, once, with what .commit_regs read for it. Past the commit there is no
  * going back: a sequence without its snapshot or with an entry that fails ends here, never in
@@ -433,19 +471,37 @@ static void t6030_sleep_wake_seq(struct apple_sleep *s, struct sleep_seq *seq, c
 		panic("T6030 wake: %s failed: %d", name, ret);
 }
 
+/* Each power word on again by now, or the wake ends here, naming the first that isn't */
+static void t6030_sleep_wake_check_ps(struct apple_sleep *s)
+{
+	const struct apple_sleep_soc *soc = s->soc;
+	int i;
+
+	if (!s->ps_rewake_timeouts)
+		return;
+	for (i = 0; i < soc->ps_all.count; i++)
+		if (s->ps_late[i])
+			panic("T6030 wake: power word %#x not on: %#x", soc->ps_all.offset[i],
+			      readl(s->ps + soc->ps_all.offset[i]));
+	for (i = 0; i < soc->ps_aon_all.count; i++)
+		if (s->ps_aon_late[i])
+			panic("T6030 wake: ps-aon word %#x not on: %#x", soc->ps_aon_all.offset[i],
+			      readl(s->ps_aon + soc->ps_aon_all.offset[i]));
+}
+
 /*
- * Back on the boot core, in macOS's order: the cluster words, the CPU power gates, then every
- * power word as Linux had it, macOS's wake order first (sleep_ps_rewake()), the words the entry
- * lowered or took AUTO_ENABLE from as they were before it, then the memory side, then the
- * notify masks.
+ * Back on the boot core, in macOS's order: the DT's apple,seq-wake-early (each complex's word,
+ * waited on, then two CPU power gates); the power words written before the memory side, as
+ * Linux had them; apple,seq-wake (the other two gates, then the memory side, only what Linux
+ * had on); MCA3 and PMS_SRAM; the notify masks; the display complexes and I2C1; any other
+ * word the wake left otherwise. The words the entry lowered or took AUTO_ENABLE from go back
+ * as they were before it.
  */
 static void t6030_sleep_wake(struct apple_sleep *s)
 {
 	struct t6030_sleep *t = t6030_state(s);
 	unsigned int i;
 
-	writel(CLUSTER_ON, s->cluster + T6030_CLUSTER_E);
-	writel(CLUSTER_ON, s->cluster + T6030_CLUSTER_P);
 	t6030_sleep_wake_seq(s, &t->wake_early, "apple,seq-wake-early");
 	/* SIO_CPU is in both lists: its value before the lowering is the one before the entry */
 	if (t->auto_staged)
@@ -455,9 +511,14 @@ static void t6030_sleep_wake(struct apple_sleep *s)
 		t6030_sleep_unstage(s, t6030_lowered[i], t->lowered_saved[i]);
 	t->auto_staged = false;
 	t->nlowered = 0;
-	sleep_ps_rewake(s);
+	sleep_ps_rewake_begin(s);
+	sleep_ps_rewake_words(s, &t6030_wake_early_words, false);
 	t6030_sleep_wake_seq(s, &t->wake, "apple,seq-wake");
+	sleep_ps_rewake_words(s, &t6030_wake_mid_words, false);
 	t6030_sleep_undo_regs(s);
+	sleep_ps_rewake_words(s, &t6030_wake_late_words, false);
+	sleep_ps_rewake_rest(s);
+	t6030_sleep_wake_check_ps(s);
 }
 
 static void t6030_deep_wfi_arm(void)
@@ -482,24 +543,6 @@ static const u32 t6030_ps_all[] = {
 	0x588, 0x590, 0x598, 0x5a0, 0x5a8, 0x5b0, 0x5b8, 0xc00, 0x4000, 0x4008,
 	0x4010, 0x4018, 0x4020, 0x4028, 0x8000, 0x8008, 0x8010, 0x8018, 0x8020, 0xc000,
 	0xc008, 0xc010, 0xc018, 0x10000,
-};
-
-/*
- * macOS 27.2's wake on J516s writes these power words, in this order, from the first guest trap
- * after the reset (aura's wake record, run t2e): "ps", then "ps-aon".
- */
-static const u32 t6030_ps_wake_order[] = {
-	0x110, 0x118, 0x120, 0x170, 0x1b8, 0x1f0, 0x210, 0x228, 0x230, 0x238, 0x240, 0x248,
-	0x260, 0x2a0, 0x2a8, 0x2b0, 0x2b8, 0x2c0, 0x2c8, 0x2d0, 0x2e0, 0x408, 0x500, 0x510,
-	0x558, 0x568, 0x5b0, 0x5b8, 0x4e0, 0x4c8, 0x398, 0x390, 0x388, 0x308, 0x300, 0x2f8,
-	0x2f0, 0x2e8, 0x2d8, 0x298, 0x290, 0x288, 0x280, 0x278, 0x270, 0x268, 0x250, 0x220,
-	0x218, 0x208, 0x200, 0x1f8, 0x1e8, 0x1e0, 0x1d8, 0x1d0, 0x190, 0x180, 0x178, 0x168,
-	0x160, 0x158, 0x150, 0x148, 0x140, 0x138, 0x4d0, 0x3c0, 0x3f0, 0x3f8, 0x3b8, 0x3d8,
-	0x3e0, 0x1c0, 0x258, 0x10000,
-};
-
-static const u32 t6030_ps_aon_wake_order[] = {
-	0x98, 0xc0, 0xb8,
 };
 
 /* And in "ps-aon" */
@@ -597,6 +640,4 @@ static const struct apple_sleep_soc t6030_sleep_soc = {
 	/* The wake block's layout isn't traced on T6030: no source is armed or read back. */
 	.ps_all = SLEEP_WORDS(t6030_ps_all),
 	.ps_aon_all = SLEEP_WORDS(t6030_ps_aon_all),
-	.ps_wake_order = SLEEP_WORDS(t6030_ps_wake_order),
-	.ps_aon_wake_order = SLEEP_WORDS(t6030_ps_aon_wake_order),
 };
