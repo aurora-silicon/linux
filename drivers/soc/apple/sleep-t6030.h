@@ -364,6 +364,59 @@ out:
 	writel(runtime_mask, s->spmi + SPMI_NOTIFY_ENABLE);
 }
 
+/*
+ * Diagnostic, untested profile only: whether the SoC ever powered down after the commit word.
+ * The boot core's timer is armed before its last WFI; a SoC that slept loses it, one whose core
+ * is still in that WFI this long after the commit says so in PMU scratch, once: +1 0x66, +2 the
+ * WFI returns so far, +3 the domains still on that macOS has off at its commit (bit 0
+ * APCIE_GP, 1 APCIE_SYS_GP, 2 ANS, 3 DISPEXT0_CPU, 4 DISPEXT1_CPU, 5 GFX, 6 DISP_CPU, 7 SEP),
+ * +4 how many "ps" words are on.
+ */
+#define T6030_AWAKE_S			30
+#define T6030_NOTE_AWAKE		0x66
+#define T6030_BLK_PS_GPU		13
+#define T6030_PS_GPU_GFX		0x110
+
+static u64 t6030_awake_at;
+static unsigned int t6030_wfi_returns;
+static bool t6030_awake_noted;
+
+static void t6030_awake_arm(void)
+{
+	t6030_awake_at = __arch_counter_get_cntpct() +
+			 (u64)arch_timer_get_cntfrq() * T6030_AWAKE_S;
+	t6030_wfi_returns = 0;
+	t6030_awake_noted = false;
+	write_sysreg(t6030_awake_at, cntp_cval_el0);
+	write_sysreg(ARCH_TIMER_CTRL_ENABLE, cntp_ctl_el0);
+	isb();
+}
+
+static void t6030_awake_note(struct apple_sleep *s)
+{
+	static const u32 words[] = {
+		T6030_PS_APCIE_GP, T6030_PS_APCIE_SYS_GP, T6030_PS_ANS, T6030_PS_DISPEXT0_CPU,
+		T6030_PS_DISPEXT1_CPU, 0, T6030_PS_DISP_CPU, T6030_PS_SEP,
+	};
+	struct t6030_sleep *t = t6030_state(s);
+	const struct apple_sleep_words *all = &s->soc->ps_all;
+	unsigned int i, on = 0;
+	u8 bits = 0;
+
+	for (i = 0; i < ARRAY_SIZE(words); i++)
+		if (words[i] && sleep_ps_on(s, words[i]))
+			bits |= BIT(i);
+	if (t->blk[T6030_BLK_PS_GPU] &&
+	    FIELD_GET(PS_ACTUAL, readl(t->blk[T6030_BLK_PS_GPU] + T6030_PS_GPU_GFX)))
+		bits |= BIT(5);
+	for (i = 0; i < all->count; i++)
+		on += sleep_ps_on(s, all->offset[i]);
+	sleep_note_at(s, 1, T6030_NOTE_AWAKE);
+	sleep_note_at(s, 2, min(t6030_wfi_returns, 0xffU));
+	sleep_note_at(s, 3, bits);
+	sleep_note_at(s, 4, min(on, 0xffU));
+}
+
 /* The sleep's CLLT word: macOS writes it back before each commit word (0x1c17 on J516s) */
 #define T6030_CLLT_SLEEP		0x24
 
@@ -417,11 +470,21 @@ static void t6030_sleep_post_timer(struct apple_sleep *s)
 recommit:
 	writel(readl(s->cllt + T6030_CLLT_SLEEP), s->cllt + T6030_CLLT_SLEEP);
 	writel(1, s->commit);
+	if (sleep_notes_on(s))
+		t6030_awake_arm();
 }
 
 /* The boot core's WFI came back: the CLLT word and the commit word again, as macOS's loop */
 static void t6030_sleep_wfi_again(struct apple_sleep *s)
 {
+	t6030_wfi_returns++;
+	if (!t6030_awake_noted && t6030_awake_at &&
+	    __arch_counter_get_cntpct() >= t6030_awake_at) {
+		write_sysreg(0, cntp_ctl_el0);
+		isb();
+		t6030_awake_noted = true;
+		t6030_awake_note(s);
+	}
 	writel(readl(s->cllt + T6030_CLLT_SLEEP), s->cllt + T6030_CLLT_SLEEP);
 	writel(1, s->commit);
 }
