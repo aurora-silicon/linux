@@ -338,6 +338,22 @@ static const struct hw_info t602x_hw = {
 };
 
 /*
+ * T6030: T602x's port layout. A port it trains powers its lane's refclk buffer up, as macOS's
+ * J516s wake does (the t5 trace clears it after the refclk acks).
+ */
+static const struct hw_info t6030_hw = {
+	.phy_lane_ctl		= 0,
+	.port_msiaddr		= PORT_T602X_MSIADDR,
+	.port_msiaddr_hi	= PORT_T602X_MSIADDR_HI,
+	.port_refclk		= 0,
+	.port_perst		= PORT_T602X_PERST,
+	.port_rid2sid		= PORT_T602X_RID2SID,
+	.port_msimap		= PORT_T602X_MSIMAP,
+	.max_rid2sid		= 512,
+	.refbuf_off		= true,
+};
+
+/*
  * T8140 uses the newer port register layout and a SID-indexed RID table.
  * Keep the PHY and application clock policy established by the bootloader;
  * runtime clock gating has not been qualified on this controller.
@@ -716,6 +732,14 @@ struct apple_pcie_port {
 	/* GP host: closed, what is below the port, and with gp_rp_closed its root port too */
 	bool			gp_closed;
 	bool			gp_rp_closed;
+	/* GP host: the root port's lists (apple,tunable-rc*), and its link registers as saved */
+	struct apple_tunable	*gp_rc_tunable[3];
+	bool			gp_dbi_saved;
+	u8			gp_pcie_cap;
+	u32			gp_lnkcap;
+	u32			gp_lnkcap2;
+	u32			gp_link_ctl;
+	u32			gp_width_speed;
 };
 
 static bool apple_radio_writer_closed(struct apple_pcie *pcie);
@@ -7980,7 +8004,248 @@ struct apple_pcie_gp {
 	bool armed;
 	/* The host lost its power with the sleep: from its root complex up */
 	bool cold;
+	/* The loader gave every window and list below, and each port's own lists */
+	bool can_cold;
+	void __iomem *axi2af;
+	void __iomem *cio3pll;
+	void __iomem *clkgen;
+	void __iomem *phy_common;
+	void __iomem *phy;
+	void __iomem *phy_ip;
+	struct apple_tunable *axi2af_tunable;
+	struct apple_tunable *cio3pll_tunable;
+	struct apple_tunable *clkgen_tunable;
+	struct apple_tunable *phy_tunable;
+	struct apple_tunable *pll_tunable;
+	struct apple_tunable *auspma_tunable;
 };
+
+/*
+ * What setting the host up from power-off takes, from the boot loader: T6030's windows (the
+ * shared PHY's, its clock generator's and its AXI bridge's) and the Apple device tree's lists
+ * for them, and each port's own lists. Without any of it the host only comes back from a
+ * refused sleep.
+ */
+static bool apple_pcie_gp_cold_probe(struct platform_device *pdev, struct apple_pcie *pcie)
+{
+	static const char *const rc_lists[] = {
+		"apple,tunable-rc", "apple,tunable-rc-gen3", "apple,tunable-rc-gen4",
+	};
+	struct apple_pcie_gp *gp = pcie->gp;
+	struct device *dev = &pdev->dev;
+	struct apple_pcie_port *port;
+	struct resource *res, *cfg;
+	char name[16];
+	int i;
+
+	if (apple_pcie_neo_get(pdev, "axi2af", "apple,tunable-axi2af", &gp->axi2af,
+			       &gp->axi2af_tunable) ||
+	    apple_pcie_neo_get(pdev, "cio3pll", "apple,tunable-cio3pll", &gp->cio3pll,
+			       &gp->cio3pll_tunable) ||
+	    apple_pcie_neo_get(pdev, "clkgen", "apple,tunable-clkgen", &gp->clkgen,
+			       &gp->clkgen_tunable) ||
+	    apple_pcie_neo_get(pdev, "phy-shared", "apple,tunable-phy", &gp->phy,
+			       &gp->phy_tunable) ||
+	    apple_pcie_neo_get(pdev, "phy-ip", "apple,tunable-phy-ip-pll", &gp->phy_ip,
+			       &gp->pll_tunable))
+		return false;
+	gp->phy_common = apple_pcie_neo_map(pdev, "phy-common", &res);
+	if (IS_ERR(gp->phy_common))
+		return false;
+	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "phy-ip");
+	gp->auspma_tunable = devm_apple_tunable_parse(dev, dev->of_node,
+						      "apple,tunable-phy-ip-auspma", res);
+	if (IS_ERR(gp->auspma_tunable))
+		return false;
+
+	cfg = platform_get_resource_byname(pdev, IORESOURCE_MEM, "config");
+	if (!cfg)
+		return false;
+	list_for_each_entry(port, &pcie->ports, entry) {
+		snprintf(name, sizeof(name), "port%d", port->idx);
+		res = platform_get_resource_byname(pdev, IORESOURCE_MEM, name);
+		if (!res)
+			return false;
+		port->tunable = devm_apple_tunable_parse(dev, port->np, "apple,tunable", res);
+		if (IS_ERR(port->tunable)) {
+			port->tunable = NULL;
+			return false;
+		}
+		for (i = 0; i < ARRAY_SIZE(rc_lists); i++) {
+			struct apple_tunable *rc;
+
+			rc = devm_apple_tunable_parse(dev, port->np, rc_lists[i], cfg);
+			if (IS_ERR(rc))
+				return false;
+			port->gp_rc_tunable[i] = rc;
+		}
+	}
+	return true;
+}
+
+/* All of it, and each root port's link registers saved for this sleep */
+static bool apple_pcie_gp_can_cold(struct apple_pcie *pcie)
+{
+	struct apple_pcie_port *port;
+
+	if (!pcie->gp->can_cold)
+		return false;
+	list_for_each_entry(port, &pcie->ports, entry)
+		if (!port->gp_dbi_saved)
+			return false;
+	return true;
+}
+
+/* The root port's link registers, as the boot loader set them, which a power-off resets */
+static void apple_pcie_gp_save_dbi(struct apple_pcie *pcie, struct apple_pcie_port *port)
+{
+	struct pci_host_bridge *bridge = pci_host_bridge_from_priv(pcie);
+	void __iomem *dbi = pcie->cfg->win + ((resource_size_t)port->idx << 15);
+	struct pci_dev *rp;
+
+	port->gp_dbi_saved = false;
+	rp = bridge->bus ? pci_get_slot(bridge->bus, PCI_DEVFN(port->idx, 0)) : NULL;
+	if (rp && rp->pcie_cap) {
+		port->gp_pcie_cap = rp->pcie_cap;
+		port->gp_lnkcap = readl_relaxed(dbi + rp->pcie_cap + PCI_EXP_LNKCAP);
+		port->gp_lnkcap2 = readl_relaxed(dbi + rp->pcie_cap + PCI_EXP_LNKCAP2);
+		port->gp_link_ctl = readl_relaxed(dbi + NEO_DBI_PORT_LINK_CONTROL);
+		port->gp_width_speed = readl_relaxed(dbi + NEO_DBI_WIDTH_SPEED_CONTROL);
+		port->gp_dbi_saved = true;
+	}
+	pci_dev_put(rp);
+}
+
+/*
+ * The shared PHY's common block's bit that reads set once the clock generator gives the PHY
+ * its 100 MHz reference: macOS's wake reads it before the PHY's clocks (the t5 trace), and
+ * m1n1 polls it on T602x.
+ */
+#define T6030_PHYCMN_CLK_REF		BIT(31)
+/* The shared PHY's lanes on, last: bit 9 alone on T6030 (the t5 trace, m1n1's T8122 order) */
+#define T6030_PHY_CTRL_LANES		BIT(9)
+
+/*
+ * The host from power-off, before any port, in the order of macOS's J516s wake (the t5 trace)
+ * and m1n1's T8122 controller set-up: the AXI bridge's, CIO3 PLL's and clock generator's lists,
+ * the clock generator started (the controls T8140's has), then the shared PHY, its list, its
+ * reference, its clocks and reset, its lanes' lists and its lanes, then the root complex.
+ */
+static int apple_pcie_t6030_common_up(struct apple_pcie *pcie)
+{
+	struct apple_pcie_gp *gp = pcie->gp;
+	u32 stat, val;
+	int ret;
+
+	apple_tunable_apply(gp->axi2af, gp->axi2af_tunable);
+	apple_tunable_apply(gp->cio3pll, gp->cio3pll_tunable);
+	apple_tunable_apply(gp->clkgen, gp->clkgen_tunable);
+	rmw_set(NEO_CLK_START_GO, gp->clkgen + NEO_CLK_START);
+	rmw_clear(NEO_CLK_OFF, gp->clkgen + NEO_CLK_CTRL);
+	ret = readl_relaxed_poll_timeout(gp->clkgen + NEO_CLK_CTRL, stat, !(stat & NEO_CLK_BUSY),
+					 1, NEO_PHY_POLL_US);
+	if (ret)
+		return ret;
+	writel_relaxed(0, pcie->base + NEO_RC_WRITE_ZERO);
+
+	apple_tunable_apply(gp->phy, gp->phy_tunable);
+	ret = readl_relaxed_poll_timeout(gp->phy_common + T6050_PHYCMN_CLK, stat,
+					 stat & T6030_PHYCMN_CLK_REF, 10, NEO_RC_POLL_US);
+	if (ret)
+		return ret;
+	ret = apple_pcie_neo_phy_clocks(gp->phy);
+	if (ret)
+		return ret;
+	rmw_clear(T6050_PHY_CTRL_RESET_T8103, gp->phy + T6050_PHY_CTRL);
+	udelay(1);
+	rmw_set(T6050_PHY_CFG_BIT0, gp->phy + T6050_PHY_CFG);
+	apple_tunable_apply(gp->phy_ip, gp->pll_tunable);
+	apple_tunable_apply(gp->phy_ip, gp->auspma_tunable);
+	rmw_set(T6050_PHY_CFG_BIT4, gp->phy + T6050_PHY_CFG);
+	ret = readl_relaxed_poll_timeout(gp->phy + T6050_PHY_STAT, stat,
+					 stat & T6050_PHY_STAT_BIT0, 10, NEO_RC_POLL_US);
+	if (ret)
+		return ret;
+	val = readl_relaxed(gp->phy_common + T6050_PHYCMN_CLK) & ~T6050_PHYCMN_CLK_MODE;
+	writel_relaxed(val | FIELD_PREP(T6050_PHYCMN_CLK_MODE, 1),
+		       gp->phy_common + T6050_PHYCMN_CLK);
+	rmw_set(T6030_PHY_CTRL_LANES, gp->phy + T6050_PHY_CTRL);
+
+	writel_relaxed(CORE_RC_T6050_PRE_RUN_BIT6 | CORE_RC_T6050_PRE_RUN_BIT8,
+		       pcie->base + CORE_RC_T6050_PRE_RUN);
+	writel_relaxed(CORE_RC_CTL_RUN, pcie->base + CORE_RC_CTL);
+	return readl_relaxed_poll_timeout(pcie->base + CORE_RC_STAT, stat,
+					  stat & CORE_RC_STAT_READY, 100, NEO_RC_POLL_US);
+}
+
+/*
+ * A T6030 port from power-off, before its clocks, as macOS's J516s wake writes it (the t5
+ * trace, as m1n1's T8122 port set-up): its controls and masks, its RID2SID slots and MSI map
+ * cleared, the rest, then the port's own list.
+ */
+static const struct apple_pcie_reset_reg apple_pcie_t6030_port_regs[] = {
+	{ 0x088, 0x00000110 },
+	{ 0x100, 0xffffffff },
+	{ 0x148, 0xffffffff },
+	{ 0x210, 0xffffffff },
+	{ 0x080, 0x00000000 },
+	{ 0x084, 0x00000000 },
+	{ 0x104, 0xfffffff0 },
+	{ 0x124, 0x00000100 },
+	{ 0x16c, 0x00000000 },
+	{ 0x13c, 0x00000010 },
+	{ 0x800, 0x00100100 },
+	{ 0x808, 0x001000ff },
+	{ 0x82c, 0x00000000 },
+};
+
+static const struct apple_pcie_reset_reg apple_pcie_t6030_port_regs2[] = {
+	{ 0x130, 0x03000000 },
+	{ 0x140, 0x00000010 },
+	{ 0x144, 0x00253770 },
+	{ 0x21c, 0x00000000 },
+	{ 0x834, 0x00000000 },
+	{ 0x83c, 0x00000000 },
+};
+
+/* The MSI map entries the wake clears (the t5 trace) */
+#define APPLE_PCIE_T6030_MSIMAP_CLEARED	256
+
+static void apple_pcie_t6030_port_regs_up(struct apple_pcie_port *port)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(apple_pcie_t6030_port_regs); i++)
+		apple_pcie_port_writel(port, apple_pcie_t6030_port_regs[i].value,
+				       apple_pcie_t6030_port_regs[i].offset);
+	for (i = 0; i < port->sid_map_sz; i++)
+		apple_pcie_port_writel(port, 0, port_rid2sid_offset(port, i));
+	for (i = 0; i < APPLE_PCIE_T6030_MSIMAP_CLEARED; i++)
+		apple_pcie_port_writel(port, 0, port->pcie->hw->port_msimap + 4 * i);
+	for (i = 0; i < ARRAY_SIZE(apple_pcie_t6030_port_regs2); i++)
+		apple_pcie_port_writel(port, apple_pcie_t6030_port_regs2[i].value,
+				       apple_pcie_t6030_port_regs2[i].offset);
+	apple_tunable_apply(port->base, port->tunable);
+}
+
+/*
+ * Its root port's registers once the port is out of reset, as m1n1 sets them up: the lists,
+ * then the link's speeds and width as the sleep found them.
+ */
+static void apple_pcie_t6030_rc_regs_up(struct apple_pcie *pcie, struct apple_pcie_port *port)
+{
+	void __iomem *dbi = pcie->cfg->win + ((resource_size_t)port->idx << 15);
+	int i;
+
+	rmw_set(NEO_DBI_RO_WR_EN, dbi + NEO_DBI_RO_WR);
+	for (i = 0; i < ARRAY_SIZE(port->gp_rc_tunable); i++)
+		apple_tunable_apply(dbi, port->gp_rc_tunable[i]);
+	writel_relaxed(port->gp_lnkcap, dbi + port->gp_pcie_cap + PCI_EXP_LNKCAP);
+	writel_relaxed(port->gp_lnkcap2, dbi + port->gp_pcie_cap + PCI_EXP_LNKCAP2);
+	writel_relaxed(port->gp_link_ctl, dbi + NEO_DBI_PORT_LINK_CONTROL);
+	writel_relaxed(port->gp_width_speed, dbi + NEO_DBI_WIDTH_SPEED_CONTROL);
+	rmw_clear(NEO_DBI_RO_WR_EN, dbi + NEO_DBI_RO_WR);
+}
 
 /* The host's port of @pdev: its root port's, or the one it is */
 static struct apple_pcie_port *apple_pcie_gp_port(struct apple_pcie *pcie, struct pci_dev *pdev)
@@ -8027,6 +8292,35 @@ static struct device *apple_pcie_gp_dart(struct apple_pcie_port *port)
 	return &pdev->dev;
 }
 
+/*
+ * A port the boot loader trained never had its PERST# and PWREN lines taken: take them now,
+ * left as they are, so that a wake from power-off holds PERST# before anything else of the
+ * host runs, as macOS's does. A port with more than one PERST# line keeps setup's handling.
+ */
+static void apple_pcie_gp_lines(struct apple_pcie *pcie, struct apple_pcie_port *port)
+{
+	struct fwnode_handle *fwnode = of_fwnode_handle(port->np);
+	struct gpio_desc *reset, *pwren;
+
+	if (port->perst_gpio ||
+	    of_count_phandle_with_args(port->np, "reset-gpios", "#gpio-cells") != 1)
+		return;
+	reset = devm_fwnode_gpiod_get(pcie->dev, fwnode, "reset", GPIOD_ASIS, "PERST#");
+	if (IS_ERR(reset))
+		return;
+	pwren = devm_fwnode_gpiod_get(pcie->dev, fwnode, "pwren", GPIOD_ASIS, "PWREN");
+	if (IS_ERR(pwren)) {
+		if (PTR_ERR(pwren) != -ENOENT) {
+			devm_gpiod_put(pcie->dev, reset);
+			return;
+		}
+		pwren = NULL;
+	}
+	port->perst = reset;
+	port->perst_gpio = reset;
+	port->pwren_gpio = pwren;
+}
+
 /* Only a conventional host, and only the one the sleep controller names */
 static void apple_pcie_gp_probe(struct platform_device *pdev, struct apple_pcie *pcie)
 {
@@ -8039,10 +8333,15 @@ static void apple_pcie_gp_probe(struct platform_device *pdev, struct apple_pcie 
 	gp = devm_kzalloc(&pdev->dev, sizeof(*gp), GFP_KERNEL);
 	if (!gp)
 		return;
-	list_for_each_entry(port, &pcie->ports, entry)
+	list_for_each_entry(port, &pcie->ports, entry) {
+		apple_pcie_gp_lines(pcie, port);
 		port->gp_dart = apple_pcie_gp_dart(port);
+	}
 	pcie->gp = gp;
-	dev_info(&pdev->dev, "deep sleep: stopped for each sleep, reopened after a refused one\n");
+	gp->can_cold = apple_pcie_gp_cold_probe(pdev, pcie);
+	dev_info(&pdev->dev, "deep sleep: stopped for each sleep, %s\n", gp->can_cold ?
+		 "set up again after a real one" :
+		 "reopened after a refused one; the loader gave nothing to set it up from power-off");
 }
 
 static void apple_pcie_gp_remove(struct apple_pcie *pcie)
@@ -8185,6 +8484,8 @@ static int apple_pcie_gp_save(struct apple_pcie *pcie)
 		return walk.err;
 
 	list_for_each_entry(port, &pcie->ports, entry) {
+		if (pcie->gp->can_cold)
+			apple_pcie_gp_save_dbi(pcie, port);
 		if (!port->gp_live || !apple_pcie_gp_own_dart(pcie, port))
 			continue;
 		ret = apple_dart_state_save(port->gp_dart);
@@ -8200,7 +8501,8 @@ static int apple_pcie_gp_save(struct apple_pcie *pcie)
 /* What this host can report for a sleep, once stopped */
 static unsigned int apple_pcie_gp_ready(struct apple_pcie *pcie)
 {
-	return APPLE_SLEEP_PCIE_HOST_RETAINED;
+	return APPLE_SLEEP_PCIE_HOST_RETAINED |
+	       (apple_pcie_gp_can_cold(pcie) ? APPLE_SLEEP_PCIE_HOST_COLD : 0);
 }
 
 /*
@@ -8265,10 +8567,28 @@ static int apple_pcie_gp_reopen(struct apple_pcie *pcie)
 	return 0;
 }
 
-/* After a real sleep, or a refused one that took the root complex down */
+/* Each domain the host is in reads on to genpd, which the sleep's wake checked */
+static bool apple_pcie_gp_powered(struct apple_pcie *pcie)
+{
+	unsigned int i;
+
+	for (i = 0; i < pcie->num_pds; i++)
+		if (!dev_pm_genpd_is_on(pcie->pds[i].dev))
+			return false;
+	return pcie->num_pds > 0;
+}
+
+/*
+ * After a real sleep, or a refused one that took the root complex down: nothing of the host
+ * answers until it is set up again. With its power on, PERST# goes back asserted on every port
+ * first, the endpoints out of reset since the pins reset; then the shared PHY and the root
+ * complex come up. The ports, whose endpoints the SMC powers, follow in the normal resume, and
+ * their root ports and what is below them stay closed until then.
+ */
 static int apple_pcie_gp_wake_noirq(struct apple_pcie *pcie)
 {
 	struct apple_pcie_port *port;
+	int ret;
 
 	WRITE_ONCE(pcie->gp_closed, true);
 	list_for_each_entry(port, &pcie->ports, entry) {
@@ -8276,7 +8596,30 @@ static int apple_pcie_gp_wake_noirq(struct apple_pcie *pcie)
 		WRITE_ONCE(port->gp_rp_closed, true);
 		WRITE_ONCE(port->gp_closed, true);
 	}
-	dev_err(pcie->dev, "deep sleep: lost its power, and nothing here sets it up again\n");
+	if (!apple_pcie_gp_can_cold(pcie)) {
+		dev_err(pcie->dev, "deep sleep: lost its power, and nothing here sets it up again\n");
+		return 0;
+	}
+	if (!apple_pcie_gp_powered(pcie)) {
+		dev_err(pcie->dev, "deep sleep: its power domain isn't on at the wake\n");
+		return 0;
+	}
+	list_for_each_entry(port, &pcie->ports, entry) {
+		if (!port->perst_gpio)
+			continue;
+		ret = gpiod_direction_input(port->perst_gpio) ?:
+		      gpiod_direction_output(port->perst_gpio, 1);
+		if (ret)
+			dev_warn(pcie->dev, "port %d: PERST# not held at the wake (%d)\n",
+				 port->idx, ret);
+	}
+	ret = apple_pcie_t6030_common_up(pcie);
+	if (ret) {
+		dev_err(pcie->dev, "deep sleep: shared PHY and root complex not back (%d), the host stays down\n",
+			ret);
+		return 0;
+	}
+	WRITE_ONCE(pcie->gp_closed, false);
 	return 0;
 }
 
@@ -8393,13 +8736,18 @@ static void apple_pcie_gp_restore(struct apple_pcie *pcie, struct apple_pcie_por
 static int apple_pcie_gp_port_up(struct apple_pcie *pcie, struct apple_pcie_port *port)
 {
 	bool rp_closed = READ_ONCE(port->gp_rp_closed);
+	bool cold = pcie->gp->cold;
 	int ret;
 
+	if (cold)
+		apple_pcie_t6030_port_regs_up(port);
 	/* A link lost while the port kept its state may still be training */
 	apple_pcie_port_rmw_clear(port, PORT_LTSSMCTL_START, PORT_LTSSMCTL);
 	ret = apple_pcie_setup_link_held(pcie, port, port->np, apple_pcie_gp_port_held);
 	if (ret)
 		return ret;
+	if (cold)
+		apple_pcie_t6030_rc_regs_up(pcie, port);
 	if (!pcie->hw->retain_clocks) {
 		if (pcie->hw->port_refclk)
 			rmw_clear(PORT_REFCLK_CGDIS, port->base + pcie->hw->port_refclk);
@@ -8584,6 +8932,7 @@ static const struct of_device_id apple_pcie_of_match[] = {
 	/* T8132 currently inherits controller and PHY setup from m1n1. */
 	{ .compatible = "apple,t8132-pcie",	.data = &t602x_hw },
 	{ .compatible = "apple,t8152-pcie",	.data = &t8152_hw },
+	{ .compatible = "apple,t6030-pcie",	.data = &t6030_hw },
 	{ .compatible = "apple,t6020-pcie",	.data = &t602x_hw },
 	{ .compatible = "apple,t8140-pcie",	.data = &t8140_hw },
 	{ .compatible = "apple,t6050-pcie",	.data = &t6050_hw },
