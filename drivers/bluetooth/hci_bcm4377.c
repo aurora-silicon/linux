@@ -3250,11 +3250,16 @@ static int bcm4377_resume(struct device *dev)
 	/*
 	 * A real sleep took the function's power: the firmware is gone, and every resume command
 	 * would only time out (two times 2 s inside the system resume, then the rebind anyway).
-	 * Skip them and rebind from the work queue; probe boots the firmware from scratch.
+	 * Restore the private BAR0 windows and mark needs_reset before queueing the rebind so
+	 * neither hci_close() during device_reprobe() nor a stray frame can write BAR0 through
+	 * unconfigured reset windows. Skip the resume commands and rebind from the work queue;
+	 * probe boots the firmware from scratch.
 	 */
 	if (pm_resume_via_firmware() && !bcm4377->dma_window_base) {
 		bcm4377->quiesced = false;
 		bcm4377->resume_powered = false;
+		bcm4377->needs_reset = true;
+		bcm4377_init_cfg(bcm4377);
 		WRITE_ONCE(bcm4377->setup_retry_blocked, false);
 		bcm4377_queue_rebind(bcm4377, "power lost in the sleep");
 		return 0;
