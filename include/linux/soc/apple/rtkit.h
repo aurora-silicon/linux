@@ -270,6 +270,14 @@ int apple_rtkit_quiesce(struct apple_rtkit *rtk);
  */
 int apple_rtkit_wake(struct apple_rtkit *rtk);
 
+/*
+ * Start a co-processor whose firmware may acknowledge IOP power on by itself
+ * once it has reported in: take that acknowledgment if it comes within
+ * @self_ack_ms, else ask for IOP power as apple_rtkit_wake() does. Call it
+ * after the co-processor's CPU has been started.
+ */
+int apple_rtkit_boot_or_wake(struct apple_rtkit *rtk, unsigned int self_ack_ms);
+
 /* Wake helpers which require AP readiness before their IOP power acknowledgment. */
 int apple_rtkit_wake_early_ap(struct apple_rtkit *rtk);
 

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! M4 25G83 HAL200 render wire records. Inputs are frozen, retained addresses;
+//! M4 HAL200 render wire records (25G83 and 26B123). Inputs are frozen, retained addresses;
 //! these builders neither allocate nor publish queue/notifier state.
 
 use super::*;
@@ -88,6 +88,7 @@ fn inline_uma(q: &mut [u8], off: usize, r: &RenderRefs, engine: usize) {
     put8(q, off + 0x34, engine as u8);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn timestamps(
     q: &mut [u8],
     off: usize,
@@ -96,11 +97,12 @@ fn timestamps(
     user: bool,
     uuid: u32,
     engine: usize,
+    auxiliary: usize,
 ) {
-    let (control, pair, auxiliary, context, user_pair) = if engine == 0 {
-        (0x8c0, 0x8c8, 0x928, 0x83c, 0x8d8)
+    let (control, pair, context, user_pair) = if engine == 0 {
+        (0x8c0, 0x8c8, 0x83c, 0x8d8)
     } else {
-        (0xc08, 0xc10, 0xc70, 0xb84, 0xc20)
+        (0xc08, 0xc10, 0xb84, 0xc20)
     };
     for end in [false, true] {
         let base = off + if end { 0x50 } else { 0 };
@@ -110,7 +112,7 @@ fn timestamps(
         put64(q, base + 0x14, work + pair + if end { 8 } else { 0 });
         put64(q, base + 0x1c, queue);
         put64(q, base + 0x24, if user { work + user_pair } else { 0 });
-        put64(q, base + 0x2c, work + auxiliary);
+        put64(q, base + 0x2c, work + auxiliary as u64);
         put64(q, base + 0x34, work + context);
         put64(q, base + 0x44, u64::from(uuid));
     }
@@ -126,9 +128,28 @@ fn internal_pair(w: &mut [u8], p: &PassRefs, engine: usize, ts: &[u64; 4]) {
     put64(w, off + 0x18, ts[2 * engine + 1]);
 }
 
-/// Encode the 66-record single-cluster tiler work and its exact 0x300 sequence.
-#[allow(clippy::too_many_arguments)]
+/// Encode the 25G83 66-record single-cluster tiler work and its exact 0x300 sequence.
+#[allow(clippy::too_many_arguments, dead_code)]
 pub(crate) fn encode_ta(
+    r: &RenderRefs,
+    p: &PassRefs,
+    u: &uapi::drm_asahi_cmd_render,
+    ts_va: &[u64; 4],
+    ctx: u32,
+    target: u32,
+    geo: &Geometry,
+    cl: Option<&ClusterLayout>,
+    w: &mut [u8; ta::WORK_SIZE],
+    q: &mut [u8; ta::SEQ_SIZE],
+) {
+    encode_ta_for(&ta::V25G83, r, p, u, ts_va, ctx, target, geo, cl, w, q)
+}
+
+/// Encode the 66-record single-cluster tiler work of `layout`'s ABI and its exact 0x300
+/// sequence.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_ta_for(
+    layout: &ta::Layout,
     r: &RenderRefs,
     p: &PassRefs,
     u: &uapi::drm_asahi_cmd_render,
@@ -242,7 +263,7 @@ pub(crate) fn encode_ta(
     put64(w, 0x8fe, r.uma_mgr[0]);
     put8(w, 0x906, 1);
     put64(w, 0x90f, r.uma_aux[0]);
-    put8(w, 0x917, r.generation);
+    put_generation(w, ta::GENERATION, layout.generation_bytes, r.generation);
 
     let work = p.ta_work;
     put32(q, 0, 5);
@@ -268,6 +289,7 @@ pub(crate) fn encode_ta(
         ts_va[0] != 0 || ts_va[1] != 0,
         r.uuid,
         0,
+        layout.auxiliary,
     );
     let f = 0x268;
     put32(q, f, 6);
@@ -283,14 +305,33 @@ pub(crate) fn encode_ta(
     put32(q, f + 0x50, target);
     put64(q, f + 0x78, p.ta_seq + 0x190);
     put32(q, f + 0x80, 0u32.wrapping_sub(f as u32));
-    put64(q, f + 0x85, work + 0x918);
+    put64(q, f + 0x85, work + layout.completion as u64);
     put8(q, f + 0x8d, 1);
     put32(q, f + 0x94, 0x40000002);
 }
 
-/// Encode the 82-record fragment work and base 0x380 sequence.
-#[allow(clippy::too_many_arguments)]
+/// Encode the 25G83 82-record fragment work and base 0x380 sequence.
+#[allow(clippy::too_many_arguments, dead_code)]
 pub(crate) fn encode_fs(
+    r: &RenderRefs,
+    p: &PassRefs,
+    u: &uapi::drm_asahi_cmd_render,
+    ts_va: &[u64; 4],
+    ctx: u32,
+    usc: u64,
+    n: u64,
+    target: u32,
+    geo: &Geometry,
+    w: &mut [u8; fs::WORK_SIZE],
+    q: &mut [u8],
+) {
+    encode_fs_for(&fs::V25G83, r, p, u, ts_va, ctx, usc, n, target, geo, w, q)
+}
+
+/// Encode the 82-record fragment work of `layout`'s ABI and base 0x380 sequence.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_fs_for(
+    layout: &fs::Layout,
     r: &RenderRefs,
     p: &PassRefs,
     u: &uapi::drm_asahi_cmd_render,
@@ -458,8 +499,8 @@ pub(crate) fn encode_fs(
     put64(w, 0xc46, r.uma_mgr[0]);
     put8(w, 0xc4e, 1);
     put64(w, 0xc57, r.uma_aux[1]);
-    put8(w, 0xc5f, r.generation);
-    put8(w, 0xc84, 1);
+    put_generation(w, fs::GENERATION, layout.generation_bytes, r.generation);
+    put8(w, layout.flag, 1);
 
     let work = p.fs_work;
     put32(q, 0, 7);
@@ -487,6 +528,7 @@ pub(crate) fn encode_fs(
         ts_va[2] != 0 || ts_va[3] != 0,
         r.uuid,
         1,
+        layout.auxiliary,
     );
     let f = 0x288;
     put32(q, f, 8);
@@ -506,7 +548,7 @@ pub(crate) fn encode_fs(
     put64(q, f + 0x64, work + 0xa58);
     put64(q, f + 0x98, p.fs_seq + 0x1b0);
     put32(q, f + 0xa0, 0u32.wrapping_sub(f as u32));
-    put64(q, f + 0xa5, work + 0xc60);
+    put64(q, f + 0xa5, work + layout.completion as u64);
     put32(q, f + 0xad, 1);
     put8(q, f + 0xb1, 1);
     put32(q, f + 0xb2, 0x71);

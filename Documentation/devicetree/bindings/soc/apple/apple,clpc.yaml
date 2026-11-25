@@ -44,8 +44,8 @@ properties:
       The machine's CPU frequency ceiling in macOS's Low Power mode, in
       MHz, as the ADT's cpu-low-power-frequency-max has it. The low-power
       platform profile holds the CPU clusters to it, up to the next
-      frequency of their tables. When absent, the driver derives a ceiling
-      from the fastest CPU cluster's operating points.
+      frequency of their tables. When absent and apple,high-power-mode is
+      not set, no platform profile is registered.
 
   apple,low-power-mw:
     $ref: /schemas/types.yaml#/definitions/uint32

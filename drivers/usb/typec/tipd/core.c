@@ -2846,21 +2846,13 @@ VISIBLE_IF_KUNIT int cd321x_reboot_notify(struct notifier_block *nb,
 }
 EXPORT_SYMBOL_IF_KUNIT(cd321x_reboot_notify);
 
-/* Separate so that the KUnit tests can choose the driver core's answer. */
-VISIBLE_IF_KUNIT bool cd321x_tbt_switch_keep_waiting(struct device *dev)
-{
-	KUNIT_STATIC_STUB_REDIRECT(cd321x_tbt_switch_keep_waiting, dev);
-
-	return driver_deferred_probe_check_state(dev) == -EPROBE_DEFER;
-}
-EXPORT_SYMBOL_IF_KUNIT(cd321x_tbt_switch_keep_waiting);
-
 /*
  * The USB4/Thunderbolt router is only needed once a USB4 or Thunderbolt link
  * comes up. If its driver is not built or has not bound yet, do not leave power
- * delivery, USB and DisplayPort on this port without a driver as well: stop
- * waiting for the router when the driver core stops waiting for missing
- * dependencies. The router can still bind later, so set @late to take it then.
+ * delivery, USB and DisplayPort on this port without a driver as well. The port
+ * takes the router whenever it binds (set @late), so it does not wait for it:
+ * waiting for the driver core to give up on a router that is not built delays
+ * every port by the deferred probe timeout.
  */
 VISIBLE_IF_KUNIT struct typec_thunderbolt_switch *
 cd321x_tbt_switch_get(struct device *dev, struct fwnode_handle *fwnode,
@@ -2870,7 +2862,7 @@ cd321x_tbt_switch_get(struct device *dev, struct fwnode_handle *fwnode,
 
 	*late = false;
 	sw = fwnode_typec_thunderbolt_switch_get(fwnode);
-	if (sw != ERR_PTR(-EPROBE_DEFER) || cd321x_tbt_switch_keep_waiting(dev))
+	if (sw != ERR_PTR(-EPROBE_DEFER))
 		return sw;
 
 	dev_info(dev, "USB4/Thunderbolt router unavailable, continuing without it until it binds\n");
@@ -2880,9 +2872,9 @@ cd321x_tbt_switch_get(struct device *dev, struct fwnode_handle *fwnode,
 EXPORT_SYMBOL_IF_KUNIT(cd321x_tbt_switch_get);
 
 /*
- * Take a router that bound after the port gave up on it, or that unbound and
- * bound again. An attached cable raises no new event, so reapply it through
- * the router as after system sleep.
+ * Take a router that bound after the port probed without it, or that unbound
+ * and bound again. An attached cable raises no new event, so reapply it
+ * through the router as after system sleep.
  */
 static void cd321x_tbt_attach_work(struct work_struct *work)
 {
