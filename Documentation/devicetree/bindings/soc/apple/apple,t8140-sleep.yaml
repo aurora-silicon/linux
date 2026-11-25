@@ -127,6 +127,18 @@ properties:
       Run once the other cores have stopped, the last steps before the
       commit word.
 
+  apple,seq-wake-early:
+    $ref: "#/$defs/register-sequence"
+    description:
+      Run at the wake right after the cluster words, before the power words
+      are back on.
+
+  apple,seq-wake:
+    $ref: "#/$defs/register-sequence"
+    description:
+      Run at the wake once the power words are back on, before the SPMI
+      notify words are.
+
 required:
   - compatible
   - reg
@@ -188,6 +200,8 @@ allOf:
         - apple,seq-prepare
         - apple,seq-notice
         - apple,seq-commit
+        - apple,seq-wake-early
+        - apple,seq-wake
       properties:
         reg:
           minItems: 18
@@ -218,6 +232,8 @@ allOf:
         apple,seq-prepare: false
         apple,seq-notice: false
         apple,seq-commit: false
+        apple,seq-wake-early: false
+        apple,seq-wake: false
   - if:
       properties:
         compatible:
@@ -335,9 +351,12 @@ $defs:
       value's bits to be set, 6 wait for them to be clear, 7 a 16-bit write,
       8 a 64-bit write of the value as the high word and 0 as the low one, 9
       a 64-bit read written back with the value's bits of its low word
-      cleared. Kinds 0 to 6 are 32-bit accesses. Bits 31:16 are a wait's
-      timeout in ms (0 for 10 ms); bit 8 a wait whose timeout is not an
-      error. The block is this node's reg entry by index, and the offset is
+      cleared, 10 the same with them set, 11 a 64-bit read, 12 and 13 a
+      32-bit and a 64-bit write of what the register held when read before
+      the commit, whose value is unused. Kinds 0 to 6 are 32-bit accesses.
+      Bits 31:16 are a wait's timeout in ms (0 for 10 ms); bit 8 a wait
+      whose timeout is not an error, or a kind 12 or 13 entry whose register
+      wasn't read. The block is this node's reg entry by index, and the offset is
       aligned to the access's width, which fits in the block.
     items:
       items:
