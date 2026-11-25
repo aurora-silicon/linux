@@ -854,13 +854,10 @@ impl RootV27_2 {
     /// Drain the telemetry rings. The event ring is consumed separately after servicing each event.
     pub(crate) fn drain(&self) -> Result {
         let consume = |state: &fw::types::GpuArray<u8>, base: usize, records: u32| -> Result {
-            crate::pgtable::clean_invalidate_poc(state.as_slice()[base..].as_ptr(), 0x30);
-            crate::pgtable::poc_barrier();
             let write = Self::word(state, base + 0x20)?;
             let read = state.shared_index(base)?;
             if write < records && read.load(Ordering::Acquire) != write {
                 read.store(write, Ordering::Release);
-                crate::pgtable::clean_poc(state.as_slice()[base..].as_ptr(), 4);
                 crate::pgtable::poc_barrier();
             }
             Ok(())
@@ -880,9 +877,12 @@ impl RootV27_2 {
 
     /// Shared status +0x10: nonzero while the firmware reports itself running.
     pub(crate) fn firmware_running(&self) -> Result<u32> {
-        crate::pgtable::clean_invalidate_poc(self.status.as_slice().as_ptr(), 0x20);
-        crate::pgtable::poc_barrier();
         Self::word(&self.status, 0x10)
+    }
+
+    /// Whether the machine's DT/ADT supplied the GPU power-controller tuning parameters.
+    pub(crate) fn has_pwr_controller(&self) -> bool {
+        self.graph.dyncfg.pwr.pwr_controller_from_dt
     }
 
     /// Whether the firmware has installed its command handlers: it clears the installation
@@ -942,7 +942,7 @@ impl RootV27_2 {
             || pwr.max_power_mw == 0 || pwr.max_power_mw > i32::MAX as u32
             || states.last().map(|s| s.pwr_mw) != Some(pwr.max_power_mw)
             || pwr.power_sample_period == 0
-            || pwr.pwr_filter_time_constant == 0
+            || (pwr.pwr_controller_from_dt && pwr.pwr_filter_time_constant == 0)
             || pwr.ppm_filter_time_constant_ms < pwr.power_sample_period
             || pwr.avg_power_filter_tc_ms < pwr.power_sample_period
             || pwr.avg_power_target_filter_tc == 0
@@ -1500,29 +1500,36 @@ impl RootV27_2 {
         }
         // The calibrated values of the 13.5 producer; only the layout and the peak length unit
         // differ. No power zones.
+        if pwr.pwr_controller_from_dt {
+            // Power controller (reason 1): populated only when the machine's DT/ADT supplied
+            // the tuning parameters, so long power-off replays (deep sleep or idle-off) keep
+            // the limiter calibrated without falling back to built-in coefficients.
+            let pwr_fields = base.hwdata_a.with(|a, _| [
+                (0x9c8, a.unk_64c),
+                (0x9d4, a.pwr_filter_a_neg.to_bits()),
+                (0x9dc, a.pwr_filter_a.to_bits()),
+                (0x9e4, a.pwr_integral_gain.to_bits()),
+                (0x9ec, a.pwr_integral_min_clamp.to_bits()),
+                (0x9f0, a.max_power_1.to_bits()),
+                (0x9f4, a.pwr_proportional_gain.to_bits()),
+                (0x9fc, a.pwr_pstate_related_k.to_bits()),
+                (0xa04, max_state),
+                (0xa08, a.max_pstate_scaled_2),
+                (0xa14, a.max_power_2),
+            ]);
+            for (at, value) in pwr_fields {
+                put32(policy, at, value);
+            }
+        }
         let samples = pwr.ppm_filter_time_constant_ms / pwr.power_sample_period;
         let fields = base.hwdata_a.with(|a, _| [
-            (0x50, 100),
-            // Power controller (reason 1): populated from the 13.5 calibrated values so long
-            // power-off replays (e.g. deep sleep or idle-off) keep the limiter calibrated.
-            (0x9c8, a.unk_64c),
-            (0x9d4, a.pwr_filter_a_neg.to_bits()),
-            (0x9dc, a.pwr_filter_a.to_bits()),
-            (0x9e4, a.pwr_integral_gain.to_bits()),
-            (0x9ec, a.pwr_integral_min_clamp.to_bits()),
-            (0x9f0, a.max_power_1.to_bits()),
-            (0x9f4, a.pwr_proportional_gain.to_bits()),
-            (0x9fc, a.pwr_pstate_related_k.to_bits()),
-            (0xa04, max_state),
-            (0xa08, a.max_pstate_scaled_2),
-            (0xa14, a.max_power_2),
-            (0xa48, max_state),
-            (0xa80, a.ppm_filter_tc_periods_x4),
+            (0x50, 100), (0xa80, a.ppm_filter_tc_periods_x4),
             (0xa8c, a.ppm_filter_a_neg.to_bits()), (0xa94, a.ppm_filter_a.to_bits()),
             (0xa9c, a.ppm_ki_dt.to_bits()), (0xaa8, a.unk_6fc.to_bits()),
             (0xaac, a.ppm_kp.to_bits()), (0xab8, a.pwr_min_duty_cycle),
             (0xabc, a.max_pstate_scaled_4), (0xacc, a.max_power_3),
             (0xad8, samples), (0x2200, a.unk_6fc.to_bits()),
+            (0xa48, max_state),
             (0xb38, a.perf_tgt_utilization), (0xb40, a.perf_boost_min_util),
             (0xb44, a.perf_boost_ce_step), (0xb58, a.perf_filter_drop_threshold),
             (0xb5c, a.perf_filter_a_neg.to_bits()), (0xb60, a.perf_filter_a2_neg.to_bits()),

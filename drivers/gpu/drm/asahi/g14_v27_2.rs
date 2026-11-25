@@ -52,13 +52,14 @@ const ASC_RUN: u32 = 0x10;
 unsafe extern "C" {
     fn apple_sleep_commit_stops_coprocs() -> bool;
     fn apple_sleep_coproc_register_first(
-        dev: *mut core::ffi::c_void,
+        dev: *mut kernel::bindings::device,
         last_stop: Option<unsafe extern "C" fn(*mut core::ffi::c_void) -> core::ffi::c_int>,
         data: *mut core::ffi::c_void,
     ) -> core::ffi::c_int;
-    fn apple_sleep_coproc_set_ready(dev: *mut core::ffi::c_void, ready: bool);
-    fn apple_sleep_coproc_stopped(dev: *mut core::ffi::c_void) -> bool;
-    fn apple_sleep_coproc_unregister(dev: *mut core::ffi::c_void);
+    fn apple_sleep_coproc_set_ready(dev: *mut kernel::bindings::device, ready: bool);
+    fn apple_sleep_coproc_stopped(dev: *mut kernel::bindings::device) -> bool;
+    fn apple_sleep_coproc_wake_error(dev: *mut kernel::bindings::device) -> core::ffi::c_int;
+    fn apple_sleep_coproc_unregister(dev: *mut kernel::bindings::device);
 }
 
 #[cfg(CONFIG_APPLE_SOC_SLEEP)]
@@ -89,11 +90,14 @@ unsafe extern "C" fn g14_v27_2_commit_stop(data: *mut core::ffi::c_void) -> core
             c.asc_ctl.cast(),
             &mut c.idle_us,
         );
+        if c.idle_ret != 0 {
+            return c.idle_ret;
+        }
         kernel::bindings::apple_rtkit_mailbox_recv_off(c.rtk);
         let ctl = kernel::bindings::readl(c.asc_ctl.cast());
         kernel::bindings::writel(ctl & !ASC_RUN, c.asc_ctl.cast());
     }
-    c.idle_ret
+    0
 }
 
 /// Commands slower than this are a hang; the firmware state is then not trusted.
@@ -184,6 +188,11 @@ impl Drop for AscControl {
 /// Whether a Fender word says the GPU is powered: a nonzero index and no request pending.
 fn gpu_powered(fender: u32) -> bool {
     fender & 0x10 == 0 && fender & 0xf != 0
+}
+
+/// Whether a Fender word says the GPU is powered off: zero index and no request pending.
+fn gpu_powered_off(fender: u32) -> bool {
+    fender & 0x1f == 0
 }
 
 /// The GPU MMU fault status, read when a command times out: a pending fault names the faulting
@@ -281,6 +290,14 @@ impl Notify {
         *self.runtime.lock() = Some(runtime);
     }
 
+    /// Toggles `deep_sleeping` under the same lock that guards `wake` and `retry`, so no
+    /// notification can race a queue drain after this returns with `deep == true`.
+    #[cfg(CONFIG_APPLE_SOC_SLEEP)]
+    fn set_deep_sleeping(&self, runtime: &Runtime, deep: bool) {
+        let _guard = self.runtime.lock();
+        runtime.deep_sleeping.store(deep, Ordering::Release);
+    }
+
     /// After this returns, nothing queues service work.
     fn detach(&self) -> Option<Arc<Runtime>> {
         self.runtime.lock().take()
@@ -343,11 +360,27 @@ fn wait(root: &RootV27_2, ms: i64, mut done: impl FnMut() -> Result<bool>) -> Re
 }
 
 /// Publishes an idle-policy record and waits until the firmware has consumed and
+/// acknowledged it. On error, returns `(published, err)` where `published` is true if the
+/// control record was already written to shared memory before the failure.
+fn try_set_idle_policy(
+    root: &RootV27_2,
+    peer: &mut Peer,
+    allow_off: bool,
+) -> core::result::Result<(), (bool, Error)> {
+    let (target, generation) = root.publish_idle_policy(allow_off).map_err(|e| (false, e))?;
+    peer.as_mut()
+        .send_message(EP_DOORBELL, gpu::DEVICE_CONTROL_KICK)
+        .map_err(|e| (true, e))?;
+    wait(root, 3000, || {
+        Ok(root.idle_progress()? == [target; 3] && root.idle_acknowledgement()? == generation)
+    })
+    .map_err(|e| (true, e))
+}
+
+/// Publishes an idle-policy record and waits until the firmware has consumed and
 /// acknowledged it.
 fn set_idle_policy(root: &RootV27_2, peer: &mut Peer, allow_off: bool) -> Result {
-    let (target, generation) = root.publish_idle_policy(allow_off)?;
-    peer.as_mut().send_message(EP_DOORBELL, gpu::DEVICE_CONTROL_KICK)?;
-    wait(root, 3000, || Ok(root.idle_progress()? == [target; 3] && root.idle_acknowledgement()? == generation))
+    try_set_idle_policy(root, peer, allow_off).map_err(|(_, e)| e)
 }
 
 /// Stops firmware that no runtime owns: allow power-off, then RTKit power-off, then the ASC
@@ -1035,6 +1068,33 @@ impl Runtime {
         self.pump(state);
     }
 
+    /// Rolls back a failed deep-sleep prepare. If an allow-off policy record was published,
+    /// keep-powered must be confirmed before reopening submissions; otherwise the backend is
+    /// failed rather than resuming with an unconfirmed idle policy.
+    #[cfg(CONFIG_APPLE_SOC_SLEEP)]
+    fn abort_deep_prepare(&self, state: &mut State, policy_published: bool, err: Error) -> Error {
+        if policy_published {
+            if let Err(rb_err) = set_idle_policy(&state.root, &mut state.peer, false) {
+                dev_err!(
+                    self.dev,
+                    "GPU: deep sleep rollback failed to restore keep-powered: {:?}\n",
+                    rb_err
+                );
+                self.fail_all(state, rb_err);
+                self.notify.set_deep_sleeping(self, false);
+                self.asleep.store(false, Ordering::Release);
+                return err;
+            }
+        }
+        self.notify.set_deep_sleeping(self, false);
+        self.asleep.store(false, Ordering::Release);
+        if self.healthy() {
+            self.pump(state);
+            self.notify.wake();
+        }
+        err
+    }
+
     /// Before a system sleep: holds new publications and lets published work retire.
     ///
     /// For suspend-to-idle (`!deep`), the firmware keeps running with its keep-powered policy
@@ -1087,15 +1147,18 @@ impl Runtime {
         }
         #[cfg(CONFIG_APPLE_SOC_SLEEP)]
         {
+            let has_pwr_controller =
+                Option::as_ref(&*guard).is_some_and(|s| s.root.has_pwr_controller());
             // SAFETY: Reads global sleep-driver availability and suspend mode.
-            if !unsafe { apple_sleep_commit_stops_coprocs() } {
+            if !has_pwr_controller || !unsafe { apple_sleep_commit_stops_coprocs() } {
                 if let Some(state) = Option::as_mut(&mut *guard) {
                     self.asleep.store(false, Ordering::Release);
                     self.pump(state);
                 }
                 return Err(EBUSY);
             }
-            self.deep_sleeping.store(true, Ordering::Release);
+            // Close Notify admission under its spinlock before dropping `state` and draining.
+            self.notify.set_deep_sleeping(self, true);
             drop(guard);
             // Flush any queued retry or service work; `deep_sleeping` keeps new work out.
             // SAFETY: `self.retry` is an initialized, pinned delayed work item.
@@ -1108,25 +1171,25 @@ impl Runtime {
 
             let mut guard = self.state.lock();
             let Some(state) = Option::as_mut(&mut *guard) else {
-                self.deep_sleeping.store(false, Ordering::Release);
+                self.notify.set_deep_sleeping(self, false);
                 return Ok(());
             };
             if !self.healthy() || state.running() {
-                self.deep_sleeping.store(false, Ordering::Release);
-                self.asleep.store(false, Ordering::Release);
-                self.pump(state);
-                return Err(EBUSY);
+                return Err(self.abort_deep_prepare(state, false, EBUSY));
             }
-            if let Err(err) = set_idle_policy(&state.root, &mut state.peer, true) {
+            if let Err((published, err)) = try_set_idle_policy(&state.root, &mut state.peer, true) {
                 dev_err!(self.dev, "GPU: deep sleep refused, allow-off failed: {:?}\n", err);
-                self.deep_sleeping.store(false, Ordering::Release);
-                self.asleep.store(false, Ordering::Release);
-                self.pump(state);
-                return Err(err);
+                return Err(self.abort_deep_prepare(state, published, err));
             }
-            let _ = wait(&state.root, 200, || {
-                Ok(state.root.firmware_running()? == 0 || state.asc.fender() & 0xf == 0)
-            });
+            if let Err(err) = wait(&state.root, 500, || Ok(gpu_powered_off(state.asc.fender()))) {
+                dev_err!(
+                    self.dev,
+                    "GPU: deep sleep refused, GPU did not power off (fender={:#x}): {:?}\n",
+                    state.asc.fender(),
+                    err
+                );
+                return Err(self.abort_deep_prepare(state, true, err));
+            }
             // SAFETY: `ASC_CPU_CONTROL` lies within the mapped ASC page.
             let asc_ctl = unsafe { state.asc.0.add(ASC_CPU_CONTROL) };
             let commit = match KBox::new(CommitStop {
@@ -1137,13 +1200,7 @@ impl Runtime {
                 idle_us: 0,
             }, GFP_KERNEL) {
                 Ok(c) => c,
-                Err(err) => {
-                    let _ = set_idle_policy(&state.root, &mut state.peer, false);
-                    self.deep_sleeping.store(false, Ordering::Release);
-                    self.asleep.store(false, Ordering::Release);
-                    self.pump(state);
-                    return Err(err.into());
-                }
+                Err(err) => return Err(self.abort_deep_prepare(state, true, err.into())),
             };
             state.commit_stop = Some(commit);
             let data = state.commit_stop.as_deref_mut().map_or(core::ptr::null_mut(), |c| {
@@ -1153,21 +1210,17 @@ impl Runtime {
             // remains allocated at the same address until unregistered in `sleep_complete`/`stop`.
             let ret = unsafe {
                 apple_sleep_coproc_register_first(
-                    self.dev.as_raw().cast(),
+                    self.dev.as_raw(),
                     Some(g14_v27_2_commit_stop),
                     data,
                 )
             };
             if ret != 0 {
                 state.commit_stop = None;
-                let _ = set_idle_policy(&state.root, &mut state.peer, false);
-                self.deep_sleeping.store(false, Ordering::Release);
-                self.asleep.store(false, Ordering::Release);
-                self.pump(state);
-                return Err(Error::from_errno(ret));
+                return Err(self.abort_deep_prepare(state, true, Error::from_errno(ret)));
             }
             // SAFETY: `dev` was just registered above.
-            unsafe { apple_sleep_coproc_set_ready(self.dev.as_raw().cast(), true) };
+            unsafe { apple_sleep_coproc_set_ready(self.dev.as_raw(), true) };
             dev_info!(self.dev, "GPU prepared for deep sleep: submitted={} completed={} pending={}\n",
                       state.submitted, state.retired, state.pending.len());
             Ok(())
@@ -1178,17 +1231,21 @@ impl Runtime {
     pub(crate) fn sleep_complete(&self) {
         let mut guard = self.state.lock();
         let Some(state) = Option::as_mut(&mut *guard) else {
-            self.deep_sleeping.store(false, Ordering::Release);
+            #[cfg(CONFIG_APPLE_SOC_SLEEP)]
+            self.notify.set_deep_sleeping(self, false);
             self.asleep.store(false, Ordering::Release);
             return;
         };
         #[cfg(CONFIG_APPLE_SOC_SLEEP)]
         if let Some(commit) = state.commit_stop.take() {
-            // SAFETY: `dev` was registered in `sleep_prepare`.
+            // SAFETY: `dev` was registered in `sleep_prepare`; `commit` stays live until after
+            // `apple_sleep_coproc_unregister` completes.
             let stopped = commit.ran
-                || unsafe { apple_sleep_coproc_stopped(self.dev.as_raw().cast()) };
+                || unsafe { apple_sleep_coproc_stopped(self.dev.as_raw()) };
+            // SAFETY: `dev` is still registered until the unregister below.
+            let wake_err = unsafe { apple_sleep_coproc_wake_error(self.dev.as_raw()) };
             // SAFETY: Matches `apple_sleep_coproc_register_first` in `sleep_prepare`.
-            unsafe { apple_sleep_coproc_unregister(self.dev.as_raw().cast()) };
+            unsafe { apple_sleep_coproc_unregister(self.dev.as_raw()) };
             // SAFETY: Reads a global flag word.
             let real = unsafe { kernel::bindings::pm_resume_via_firmware() };
             if !stopped && !real {
@@ -1197,7 +1254,7 @@ impl Runtime {
                     dev_err!(self.dev, "GPU: failed to restore keep-powered policy: {:?}\n", err);
                     self.fail_all(state, err);
                 }
-                self.deep_sleeping.store(false, Ordering::Release);
+                self.notify.set_deep_sleeping(self, false);
                 self.asleep.store(false, Ordering::Release);
                 state.waiting_unlink = None;
                 if self.healthy() {
@@ -1208,7 +1265,19 @@ impl Runtime {
             }
             if !real {
                 dev_warn!(self.dev, "GPU: sleep refused after commit stop; firmware stays stopped\n");
-                self.deep_sleeping.store(false, Ordering::Release);
+                self.notify.set_deep_sleeping(self, false);
+                self.asleep.store(false, Ordering::Release);
+                self.fail_all(state, EIO);
+                return;
+            }
+            if commit.idle_ret != 0 || wake_err != 0 {
+                dev_err!(
+                    self.dev,
+                    "GPU: skipping warm restart after commit/wake error (idle_ret={} wake_err={})\n",
+                    commit.idle_ret,
+                    wake_err
+                );
+                self.notify.set_deep_sleeping(self, false);
                 self.asleep.store(false, Ordering::Release);
                 self.fail_all(state, EIO);
                 return;
@@ -1225,7 +1294,7 @@ impl Runtime {
                 set_idle_policy(&state.root, &mut state.peer, false)?;
                 wait(&state.root, 500, || Ok(gpu_powered(state.asc.fender())))
             })();
-            self.deep_sleeping.store(false, Ordering::Release);
+            self.notify.set_deep_sleeping(self, false);
             self.asleep.store(false, Ordering::Release);
             state.waiting_unlink = None;
             state.waiting_control = None;
@@ -1284,9 +1353,11 @@ impl Runtime {
         let mut guard = self.state.lock();
         let Some(mut state) = guard.take() else { return; };
         #[cfg(CONFIG_APPLE_SOC_SLEEP)]
-        if state.commit_stop.take().is_some() {
-            // SAFETY: Matches `apple_sleep_coproc_register_first` in `sleep_prepare`.
-            unsafe { apple_sleep_coproc_unregister(self.dev.as_raw().cast()) };
+        if let Some(_commit) = state.commit_stop.take() {
+            // SAFETY: Matches `apple_sleep_coproc_register_first` in `sleep_prepare`; PM
+            // unbind/shutdown does not run concurrently with the IRQ-off commit, and `_commit`
+            // stays alive until after unregister completes.
+            unsafe { apple_sleep_coproc_unregister(self.dev.as_raw()) };
         }
         self.fail_all(&mut state, ENODEV);
         let allowed = set_idle_policy(&state.root, &mut state.peer, true);
