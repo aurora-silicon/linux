@@ -223,7 +223,7 @@ int main(void)
     assert(apple_pmgr_ps_power_off(&ps->genpd)==-EBUSY && !map.writes);
     puts("ok 3 - read errors and lost inherited activity never request a transition");
     const char *conflicts[]={"apple,firmware-owned","apple,sleep-retained","apple,always-on","apple,min-state",
-        "apple,force-disable","apple,force-reset","apple,externally-clocked"};
+        "apple,force-disable","apple,force-reset","apple,externally-clocked","apple,auto-managed"};
     for(unsigned i=0;i<sizeof(conflicts)/sizeof(*conflicts);i++) {
         n.conflict=conflicts[i];
         assert(probe(&n,0xff,0)==-EINVAL);

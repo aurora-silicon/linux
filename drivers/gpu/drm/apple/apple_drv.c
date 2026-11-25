@@ -2282,10 +2282,23 @@ static int apple_platform_suspend(struct device *dev)
 	if (apple && apple->dark_held)
 		return 0;
 
+	if (pm_suspend_via_firmware()) {
+		int ret = dcp_t6041_s2r_all(false);
+
+		if (ret)
+			return ret;
+	}
+
 	if (apple && !apple->aborted) {
 		apple->s2r_skipped = apple_drm_firmware_stopped(apple);
-		if (!apple->s2r_skipped)
-			return drm_mode_config_helper_suspend(&apple->drm);
+		if (!apple->s2r_skipped) {
+			int ret = drm_mode_config_helper_suspend(&apple->drm);
+
+			if (ret) {
+				dcp_t6041_s2r_all(true);
+				return ret;
+			}
+		}
 	}
 
 	return 0;
@@ -2332,6 +2345,10 @@ static void apple_drm_resume_outputs(struct apple_drm_private *apple)
 static int apple_platform_resume(struct device *dev)
 {
 	struct apple_drm_private *apple = dev_get_drvdata(dev);
+
+	/* Nothing if this suspend never took the display down. */
+	if (dcp_t6041_s2r_all(true))
+		dev_err(dev, "T6041 S2R display resume failed\n");
 
 	if (!apple || apple->aborted || apple->s2r_skipped)
 		return 0;
