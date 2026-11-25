@@ -258,18 +258,24 @@ static void dcp_secure_port_start(struct apple_dcp *dcp)
 }
 
 /* Between the main mailbox's AP idle and its IOP idle. */
-static void dcp_secure_port_idle(void *data)
+static int dcp_secure_port_idle_strict(void *data)
 {
 	struct apple_dcp *dcp = data;
 	int ret;
 
 	if (!dcp->secure_rtk || !dcp->secure_answered)
-		return;
+		return 0;
 
 	dcp_secure_poll_stop(dcp);
 	ret = apple_rtkit_port_idle(dcp->secure_rtk, DCP_SECURE_TIMEOUT_MS);
 	if (ret)
 		dev_warn(dcp->dev, "secure port AP idle not acknowledged: %d\n", ret);
+	return ret;
+}
+
+static void dcp_secure_port_idle(void *data)
+{
+	dcp_secure_port_idle_strict(data);
 }
 
 static void dcp_release_secure_rtkit(void *data)
@@ -286,10 +292,18 @@ static int dcp_secure_port_init(struct apple_dcp *dcp)
 {
 	struct device *dev = dcp->dev;
 
-	if (of_property_match_string(dev->of_node, "mbox-names", "secure") < 0)
+	/*
+	 * The secure mailbox is the second of mboxes, or named by apple,secure-mbox where the
+	 * boot loader wants mboxes to hold the one ASC mailbox (it refuses the display handoff
+	 * otherwise).
+	 */
+	if (of_property_match_string(dev->of_node, "mbox-names", "secure") >= 0)
+		dcp->secure_rtk = apple_rtkit_init(dev, dcp, "secure", 0, &dcp_secure_rtkit_ops);
+	else if (of_property_present(dev->of_node, "apple,secure-mbox"))
+		dcp->secure_rtk = apple_rtkit_init_mbox_prop(dev, dcp, "apple,secure-mbox",
+							     &dcp_secure_rtkit_ops);
+	else
 		return 0;
-
-	dcp->secure_rtk = apple_rtkit_init(dev, dcp, "secure", 0, &dcp_secure_rtkit_ops);
 	if (IS_ERR(dcp->secure_rtk)) {
 		int ret = PTR_ERR(dcp->secure_rtk);
 
@@ -315,7 +329,8 @@ static void dcp_s2r_check_dt(struct apple_dcp *dcp)
 	struct device_node *np = dcp->dev->of_node;
 	bool power = of_property_present(np, "apple,display-power");
 	bool secure = dcp->hw.s2r_no_secure_port ||
-		      of_property_match_string(np, "mbox-names", "secure") >= 0;
+		      of_property_match_string(np, "mbox-names", "secure") >= 0 ||
+		      of_property_present(np, "apple,secure-mbox");
 
 	if (dcp->hw.s2r && (!power || !secure)) {
 		dev_info(dcp->dev, "no %s in the device tree, the firmware keeps running\n",
@@ -481,12 +496,13 @@ MODULE_PARM_DESC(t6050_ext_sleep,
 /*
  * What a T6050 external display processor gained outside the firmware 27 sleep itself (the
  * Type-C reconnect skipped for a crashed one, a crashed one refusing a deep sleep before
- * anything is stopped, the link line) is in force on the board it has run on, the J714s.
- * Elsewhere, other boards with the same SoC included, these are as before.
+ * anything is stopped, the link line) is in force where the sleep's description has the
+ * display coprocessors sleep by their method table (apple,display-method-sleep). Elsewhere,
+ * other boards with the same SoC included, these are as before.
  */
 static bool dcp_j714s_ext(struct device *dev)
 {
-	return of_machine_is_compatible("apple,j714s") &&
+	return apple_t6050_sleep_property("apple,display-method-sleep") &&
 	       of_device_is_compatible(dev->of_node, "apple,t6050-dcpext");
 }
 
@@ -7525,6 +7541,8 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 
 	INIT_LIST_HEAD(&dcp->swapped_out_fbs);
 	mutex_init(&dcp->swapped_out_fbs_lock);
+	init_completion(&dcp->v27_wake_video);
+	init_completion(&dcp->v27_wake_hotplug);
 	ret = dcp_backlight_init(dcp, dev);
 	if (ret)
 		return ret;
@@ -7532,7 +7550,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 
 	dcp->fw_compat = fw_compat;
 	dcp->v27_j714s = fw_compat == DCP_FIRMWARE_V_27_0 &&
-			 of_machine_is_compatible("apple,j714s");
+			 apple_t6050_sleep_property("apple,display-method-sleep");
 	/*
 	 * Probe-lifetime like the desktop state: component bind opens a devres
 	 * group on this device and releases it on failure or unbind.

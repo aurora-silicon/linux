@@ -638,6 +638,30 @@ static const struct apple_smc_wake_reason apple_smc_j714s_wake_reasons[] = {
 	{ 43, "USB2_plug" }, { 44, "USB2_wake" }, { 45, "aupo" }, { 48, "rtc" }, { }
 };
 
+/* A board's own numbering, from its device tree (apple,wake-reasons and their names) */
+static const struct apple_smc_wake_reason *apple_smc_dt_wake_reasons(struct device *dev)
+{
+	struct device_node *np = dev->of_node;
+	struct apple_smc_wake_reason *r;
+	int i, n;
+
+	n = of_property_count_u32_elems(np, "apple,wake-reasons");
+	if (n <= 0 || n != of_property_count_strings(np, "apple,wake-reason-names"))
+		return NULL;
+	r = devm_kcalloc(dev, n + 1, sizeof(*r), GFP_KERNEL);
+	if (!r)
+		return NULL;
+	for (i = 0; i < n; i++) {
+		u32 bit;
+
+		if (of_property_read_u32_index(np, "apple,wake-reasons", i, &bit) || bit > 63 ||
+		    of_property_read_string_index(np, "apple,wake-reason-names", i, &r[i].name))
+			return NULL;
+		r[i].bit = bit;
+	}
+	return r;
+}
+
 static void apple_smc_write_full_wake(struct apple_smc *smc)
 {
 	int ret;
@@ -665,6 +689,7 @@ static void apple_smc_probe_wktp(struct apple_smc *smc)
 static int apple_smc_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
+	const struct apple_smc_wake_reason *dt_reasons;
 	struct apple_smc *smc;
 	__be32 count = 0;
 	bool t6050;
@@ -673,17 +698,20 @@ static int apple_smc_probe(struct platform_device *pdev)
 	smc = devm_kzalloc(dev, sizeof(*smc), GFP_KERNEL);
 	if (!smc)
 		return -ENOMEM;
-	smc->wake_reasons = of_device_is_compatible(dev->of_node, "apple,t8132-smc") ?
-			    apple_smc_t8132_wake_reasons : apple_smc_t8140_wake_reasons;
+	dt_reasons = apple_smc_dt_wake_reasons(dev);
+	smc->wake_reasons = dt_reasons;
+	if (!smc->wake_reasons)
+		smc->wake_reasons = of_device_is_compatible(dev->of_node, "apple,t8132-smc") ?
+				    apple_smc_t8132_wake_reasons : apple_smc_t8140_wake_reasons;
 
 	mutex_init(&smc->mutex);
 	spin_lock_init(&smc->lock);
 	smc->dev = &pdev->dev;
-	smc->saved_enabled = of_machine_is_compatible("apple,t6050") &&
-		(of_machine_is_compatible("apple,j714s") ||
-		 of_machine_is_compatible("apple,j716c")) &&
+	smc->saved_enabled = apple_t6050_sleep_described() &&
 		of_device_is_compatible(dev->of_node, "apple,t6050-smc");
-	if (smc->saved_enabled && of_machine_is_compatible("apple,j714s"))
+	smc->port_dark_wake = smc->saved_enabled && of_machine_is_compatible("apple,j714s");
+	/* A J714s device tree from before apple,wake-reasons */
+	if (smc->port_dark_wake && !dt_reasons)
 		smc->wake_reasons = apple_smc_j714s_wake_reasons;
 	/* J813's late notice needs the bounded, IRQ-independent transport too. */
 	if (of_machine_is_compatible("apple,j813"))
@@ -1076,7 +1104,7 @@ static void apple_smc_dark_wake(struct apple_smc *smc)
 		return;
 	}
 	/* The J714s's rule alone: other boards with a sleep policy keep these wakes full. */
-	if (smc->wake_reasons != apple_smc_j714s_wake_reasons)
+	if (!smc->port_dark_wake)
 		return;
 	if (!is_radio && (port < 0 || smc->wake_record != BIT_ULL(port)))
 		return;
