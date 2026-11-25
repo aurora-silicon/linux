@@ -126,6 +126,8 @@ static DEFINE_MUTEX(apple_g15_display_lock);
 static struct device *apple_t6030_display;
 static struct device *apple_t6031_display;
 static struct device *apple_t8132_display;
+#define APPLE_DRM_PUBLISHED_MAX 8
+static struct device *apple_drm_published[APPLE_DRM_PUBLISHED_MAX];
 
 /* The publication slot of a G15/G16 SoC's internal display subsystem, or NULL. */
 static struct device **apple_g15_display_slot(struct device *dev)
@@ -208,6 +210,67 @@ int apple_drm_t8132_link_device(struct device *consumer)
 				     &apple_t8132_display);
 }
 EXPORT_SYMBOL_GPL(apple_drm_t8132_link_device);
+
+static int apple_drm_display_publish(struct device *dev)
+{
+	int free_slot = -1;
+	int i;
+
+	if (!dev->of_node)
+		return 0;
+	guard(mutex)(&apple_g15_display_lock);
+	for (i = 0; i < ARRAY_SIZE(apple_drm_published); i++) {
+		if (apple_drm_published[i] == dev)
+			return 0;
+		if (apple_drm_published[i] &&
+		    apple_drm_published[i]->of_node == dev->of_node)
+			return -EBUSY;
+		if (!apple_drm_published[i] && free_slot < 0)
+			free_slot = i;
+	}
+	if (free_slot < 0)
+		return -ENOSPC;
+	apple_drm_published[free_slot] = get_device(dev);
+	return 0;
+}
+
+static void apple_drm_display_withdraw(struct device *dev)
+{
+	struct device *old = NULL;
+	int i;
+
+	scoped_guard(mutex, &apple_g15_display_lock) {
+		for (i = 0; i < ARRAY_SIZE(apple_drm_published); i++) {
+			if (apple_drm_published[i] == dev) {
+				old = apple_drm_published[i];
+				apple_drm_published[i] = NULL;
+				break;
+			}
+		}
+	}
+	put_device(old);
+}
+
+int apple_drm_link_device(struct device *consumer,
+			  const struct device_node *display_node)
+{
+	struct device_link *link;
+	int i;
+
+	if (!consumer || !consumer->of_node || !display_node)
+		return -EINVAL;
+	guard(mutex)(&apple_g15_display_lock);
+	for (i = 0; i < ARRAY_SIZE(apple_drm_published); i++) {
+		if (apple_drm_published[i] &&
+		    apple_drm_published[i]->of_node == display_node) {
+			link = device_link_add(consumer, apple_drm_published[i],
+					       DL_FLAG_AUTOREMOVE_CONSUMER);
+			return link ? 0 : -EINVAL;
+		}
+	}
+	return -EPROBE_DEFER;
+}
+EXPORT_SYMBOL_GPL(apple_drm_link_device);
 
 DEFINE_DRM_GEM_DMA_FOPS(apple_fops);
 
@@ -2102,6 +2165,13 @@ static int apple_drm_init(struct device *dev)
 		drm_dev_unregister(&apple->drm);
 		goto err_unbind;
 	}
+	ret = apple_drm_display_publish(dev);
+	if (ret) {
+		apple_g15_display_withdraw(dev);
+		t8132_ext_drm_fini(&apple->drm);
+		drm_dev_unregister(&apple->drm);
+		goto err_unbind;
+	}
 
 	mutex_lock(&apple_drm_pm_lock);
 	list_add_tail(&apple->pm_node, &apple_drm_pm_list);
@@ -2124,6 +2194,7 @@ static void apple_drm_uninit(struct device *dev)
 {
 	struct apple_drm_private *apple = dev_get_drvdata(dev);
 
+	apple_drm_display_withdraw(dev);
 	apple_g15_display_withdraw(dev);
 
 	/* An aborted takeover leaves its DCPs running until the reboot. */

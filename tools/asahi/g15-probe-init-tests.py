@@ -66,6 +66,8 @@ type Result<T = ()> = std::result::Result<T, Error>;
 const ENODEV: i32 = -19;
 const EPROBE_DEFER: i32 = -517;
 const GFP_KERNEL: u32 = 0;
+#[allow(unused_macros)]
+macro_rules! c_str { ($s:literal) => { $s }; }
 macro_rules! dev_info { ($($x:tt)*) => {{}}; }
 macro_rules! dev_err { ($($x:tt)*) => {{}}; }
 thread_local! {
@@ -86,9 +88,14 @@ thread_local! {
     static PRE_ACTIVATION: Cell<u32> = const { Cell::new(0) };
 }
 struct Core<'a>(PhantomData<&'a ()>);
-struct Device { data: Cell<*mut core::ffi::c_void> }
+struct Device { data: Cell<*mut core::ffi::c_void>, g16_handoff: bool }
 impl Device {
     fn as_raw(&self) -> *mut Device { self as *const Device as *mut Device }
+    fn of_node(&self) -> Option<&Self> { Some(self) }
+    fn get_opt_property<T: Default>(&self, name: &str) -> Result<Option<T>> {
+        assert_eq!(name, "apple,g16-handoff-version");
+        Ok(self.g16_handoff.then(T::default))
+    }
     // SET_DRVDATA
 }
 mod bindings {
@@ -139,7 +146,7 @@ mod platform {
         ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound;
     }
 }
-struct Config { name: &'static str }
+struct Config { name: &'static str, chip_id: u32 }
 pub struct ThisModule;
 pub trait ModuleMetadata { const NAME: &'static std::ffi::CStr; }
 pub trait InPlaceModule: Sized {
@@ -245,9 +252,9 @@ fn reset(fail_alloc: bool, touch: bool, error: i32) {
     FAIL_ALLOC.set(fail_alloc); TOUCH.set(touch); PROBE_ERROR.set(error);
     RETAINED.set(false); ALLOCS.set(0); PROBES.set(0);
 }
-static CFG: Config = Config { name: "test" };
+static CFG: Config = Config { name: "test", chip_id: 0x6030 };
 static PDEV: platform::Device<Core<'static>> = platform::Device {
-    base: Device { data: Cell::new(core::ptr::null_mut()) }, ctx: PhantomData,
+    base: Device { data: Cell::new(core::ptr::null_mut()), g16_handoff: false }, ctx: PhantomData,
 };
 fn activation_reprobe() {
     let last = if cfg!(CONFIG_DRM_ASAHI_G16) { 3 } else { 2 };
@@ -303,7 +310,7 @@ fn main() {
         ("successful-registration-binds", false, true, 0, Ok(0), true, 1),
     ] {
         reset(allocation_fails, touched, error);
-        let pdev = platform::Device { base: Device { data: Cell::new(core::ptr::null_mut()) }, ctx: PhantomData };
+        let pdev = platform::Device { base: Device { data: Cell::new(core::ptr::null_mut()), g16_handoff: false }, ctx: PhantomData };
         let result = callback::<Driver<'static>>(&pdev, Some(&cfg));
         assert_eq!(result, expected, "{name}: callback result");
         assert_eq!(PROBES.get(), calls, "{name}: firmware probe before drvdata allocation");
@@ -316,6 +323,14 @@ fn main() {
         }
         println!("{name}: PASS");
     }
+    reset(false, true, 0);
+    let pdev = platform::Device {
+        base: Device { data: Cell::new(core::ptr::null_mut()), g16_handoff: true },
+        ctx: PhantomData,
+    };
+    assert_eq!(callback::<Driver<'static>>(&pdev, Some(&cfg)), Err(ENODEV));
+    assert_eq!(PROBES.get(), 0);
+    println!("g16-handoff-declined: PASS");
     module_cases();
 }
 '''
@@ -463,7 +478,7 @@ int main(void) {
             if name == "actual":
                 receipt["g16_control" if enable_g16 else "control"] = result
                 if r.returncode: raise SystemExit(r.stderr)
-                if r.stdout.count(": PASS\n") != (10 if enable_g16 else 9): raise SystemExit("control did not run every case")
+                if r.stdout.count(": PASS\n") != (11 if enable_g16 else 10): raise SystemExit("control did not run every case")
             else:
                 receipt["mutants"][label] = result
                 if r.returncode == 0: raise SystemExit("SURVIVED: " + name)

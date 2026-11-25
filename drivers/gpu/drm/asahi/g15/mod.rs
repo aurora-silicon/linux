@@ -209,6 +209,14 @@ impl platform::Driver for Driver<'_> {
                     return Err(ENODEV);
                 }
                 let cfg = *info.ok_or(ENODEV)?;
+                if pdev.as_ref().of_node().is_some_and(|node| {
+                    !matches!(
+                        node.get_opt_property::<u32>(c_str!("apple,g16-handoff-version")),
+                        Ok(None)
+                    )
+                }) {
+                    return Err(ENODEV);
+                }
                 dev_info!(pdev.as_ref(), "G15: probing ({})\n", cfg.name);
                 match crate::driver::AsahiPlatformDriver::probe_g15(pdev, cfg) {
                     Ok(driver) => Some(driver),
