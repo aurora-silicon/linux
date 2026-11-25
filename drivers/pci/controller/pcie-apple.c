@@ -20,6 +20,7 @@
 
 #include <linux/bitfield.h>
 #include <linux/gpio/consumer.h>
+#include <linux/gpio/driver.h>
 #include <linux/kernel.h>
 #include <linux/iopoll.h>
 #include <linux/irqchip/chained_irq.h>
@@ -312,6 +313,12 @@ struct hw_info {
 	 * 9000-byte frames at 7.0 Gbit/s; at 512 it reaches 9.93.
 	 */
 	bool no_inc_mrrs;
+	/*
+	 * A firmware sleep takes the conventional ports' power: the noirq resume
+	 * sets them up again, after the PWREN GPIOs' provider and before the
+	 * functions behind them.
+	 */
+	bool s2r_noirq;
 };
 
 static const struct hw_info t8103_hw = {
@@ -335,6 +342,19 @@ static const struct hw_info t602x_hw = {
 	.port_msimap		= PORT_T602X_MSIMAP,
 	/* 16 on t602x, guess for autodetect on future HW */
 	.max_rid2sid		= 512,
+};
+
+/* T604x: the T602x layout, with ports set up again in the noirq resume after a sleep. */
+static const struct hw_info t6041_hw = {
+	.phy_lane_ctl		= 0,
+	.port_msiaddr		= PORT_T602X_MSIADDR,
+	.port_msiaddr_hi	= PORT_T602X_MSIADDR_HI,
+	.port_refclk		= 0,
+	.port_perst		= PORT_T602X_PERST,
+	.port_rid2sid		= PORT_T602X_RID2SID,
+	.port_msimap		= PORT_T602X_MSIMAP,
+	.max_rid2sid		= 512,
+	.s2r_noirq		= true,
 };
 
 /*
@@ -2959,6 +2979,23 @@ out:
 	return ret;
 }
 
+static void apple_pcie_unlink_pwren(void *data)
+{
+	device_link_del(data);
+}
+
+/* The PWREN GPIOs' provider resumes before this host, so its noirq resume can use them. */
+static int apple_pcie_link_pwren(struct apple_pcie *pcie, struct gpio_desc *pwren)
+{
+	struct device *gpio = gpio_device_to_device(gpiod_to_gpio_device(pwren));
+	struct device_link *link;
+
+	link = device_link_add(pcie->dev, gpio, DL_FLAG_STATELESS);
+	if (!link)
+		return dev_err_probe(pcie->dev, -EINVAL, "no device link to %s\n", dev_name(gpio));
+	return devm_add_action_or_reset(pcie->dev, apple_pcie_unlink_pwren, link);
+}
+
 static int apple_pcie_setup_link(struct apple_pcie *pcie,
 				 struct apple_pcie_port *port,
 				 struct device_node *np)
@@ -3017,6 +3054,11 @@ static int apple_pcie_setup_link(struct apple_pcie *pcie,
 	if (!num_aux_resets) {
 		port->perst_gpio = reset;
 		port->pwren_gpio = pwren;
+	}
+	if (pwren && pcie->hw->s2r_noirq) {
+		ret = apple_pcie_link_pwren(pcie, pwren);
+		if (ret)
+			return ret;
 	}
 
 have_gpios:
@@ -6976,6 +7018,7 @@ static void apple_pcie_neo_save_functions(struct apple_pcie *pcie);
 static bool apple_pcie_s2r_reinit(struct apple_pcie *pcie);
 static void apple_pcie_hib_save(struct apple_pcie *pcie);
 static void apple_pcie_hib_restore_noirq(struct apple_pcie *pcie, const char *what);
+static void apple_pcie_hib_ports_up_noirq(struct apple_pcie *pcie);
 /*
  * The J716c radio drivers save PCI state without entering D3. The PCI core
  * keeps the root port in D0 as well. Its host and DART have no switchable
@@ -7683,8 +7726,11 @@ static int apple_pcie_resume_noirq(struct device *dev)
 		return ret;
 	}
 	if (!pcie->hw->tunneled) {
-		if (apple_pcie_s2r_reinit(pcie) && pm_resume_via_firmware())
+		if (apple_pcie_s2r_reinit(pcie) && pm_resume_via_firmware()) {
 			apple_pcie_hib_restore_noirq(pcie, "S2R");
+			if (pcie->hw->s2r_noirq)
+				apple_pcie_hib_ports_up_noirq(pcie);
+		}
 		return 0;
 	}
 	if (pcie->resume_failed)
@@ -7896,6 +7942,32 @@ static int apple_pcie_hib_port_up(struct apple_pcie *pcie, struct apple_pcie_por
 	return 0;
 }
 
+/*
+ * Before the PCI core's noirq resume of the functions, which waits for this host's: they
+ * find a trained link and come back through their drivers' own resume. Bring the cold ports
+ * up one after another: the noirq resume phase runs with interrupts off, so each port waits
+ * out its own PCIe link-up and 100 ms settle, and sequencing them keeps the bring-up off the
+ * async kworkers that run alongside the rest of the noirq resume.
+ */
+static void apple_pcie_hib_ports_up_noirq(struct apple_pcie *pcie)
+{
+	struct apple_pcie_port *port;
+	int ret;
+
+	list_for_each_entry(port, &pcie->ports, entry) {
+		if (!port->hib_cold)
+			continue;
+		ret = apple_pcie_hib_port_up(pcie, port);
+		if (ret)
+			dev_err(pcie->dev, "S2R: %pOF link not back (%d), its functions stay unreachable\n",
+				port->np, ret);
+		else
+			dev_info(pcie->dev, "S2R: %pOF link back before its functions resume\n", port->np);
+		port->hib_cold = false;
+	}
+	apple_pcie_hib_free_fns(pcie);
+}
+
 /* The normal phase, after the SMC (the PWREN GPIOs are its) and before the functions. */
 static int apple_pcie_resume(struct device *dev)
 {
@@ -8007,6 +8079,7 @@ static const struct of_device_id apple_pcie_of_match[] = {
 	/* T8132 currently inherits controller and PHY setup from m1n1. */
 	{ .compatible = "apple,t8132-pcie",	.data = &t602x_hw },
 	{ .compatible = "apple,t8152-pcie",	.data = &t8152_hw },
+	{ .compatible = "apple,t6041-pcie",	.data = &t6041_hw },
 	{ .compatible = "apple,t6020-pcie",	.data = &t602x_hw },
 	{ .compatible = "apple,t8140-pcie",	.data = &t8140_hw },
 	{ .compatible = "apple,t6050-pcie",	.data = &t6050_hw },
