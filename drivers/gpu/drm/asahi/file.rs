@@ -355,7 +355,37 @@ impl SyncItem {
 
 #[derive(Clone)]
 pub(crate) enum Object {
-    TimestampBuffer(Arc<crate::timestamp::Buffer>),
+    TimestampBuffer(Arc<crate::timestamp::Bound>),
+}
+
+/// Kernel memory one `GEM_BIND_OBJECT` bind keeps that no GEM object accounts for: its table entry
+/// and the bound buffer's records (an `Arc` count, the [`crate::timestamp::Bound`] and the
+/// buffer's heap records). The object's pages and its CPU mapping, which the shmem helper shares
+/// between every vmap of one object, belong to the object and are charged when it is created.
+/// Each bind is charged this much against the client's and the device's memory limits, as a user
+/// object of that size would be, so a file's binds are bounded by those limits.
+const BOUND_OBJECT_BYTES: u64 = (core::mem::size_of::<Object>()
+    + core::mem::size_of::<usize>()
+    + core::mem::size_of::<crate::timestamp::Bound>()
+    + crate::timestamp::Buffer::HEAP_BYTES) as u64;
+
+/// The firmware timestamp window is one fixed range per device that every file's firmware-aliased
+/// timestamp buffers share. A file may hold at most this fraction of it (4 MiB of a 64 MiB
+/// window), so one client cannot fill it for every other: Mesa binds one small buffer per GL
+/// context, one per timestamped query pool and one debug buffer.
+const TIMESTAMP_WINDOW_SHARE_PER_FILE: u64 = 16;
+
+/// A file's limit on window bytes for a window of `window_size` bytes (0: no window).
+fn window_limit(window_size: u64) -> u64 {
+    window_size / TIMESTAMP_WINDOW_SHARE_PER_FILE
+}
+
+/// Charges one bind to `client`, or fails with `ENOMEM` and charges nothing.
+fn admit_bind(
+    ledger: &'static memacct::Ledger,
+    client: &Arc<memacct::Client>,
+) -> Result<memacct::Commit> {
+    ledger.admit(client, BOUND_OBJECT_BYTES)
 }
 
 /// A queue in a file's table. Its count in the creating process's share of the device's
@@ -1634,21 +1664,43 @@ impl File {
             .try_into()?;
         let bo = gem::ObjectRef::new(gem::Object::lookup_handle(file, data.handle)?);
 
-        let mapping = Arc::new(
-            reg_data.gpu.map_timestamp_buffer(bo, offset..end_offset)?,
-            GFP_KERNEL,
-        )?;
-        let obj = KBox::new(Object::TimestampBuffer(mapping), GFP_KERNEL)?;
-        let handle = file
-            .inner()
-            .objects()
+        // Charge the bind and take its table slot first, so that a bind past the client's memory
+        // limit is refused (ENOMEM, as an object creation would be) before the buffer gets a
+        // window alias or a CPU mapping. A later failure drops the charge and the slot.
+        let charge = admit_bind(&memacct::LEDGER, &file.inner().mem)?;
+        let objects = file.inner().objects();
+        let resv = objects
             .lock()
-            .insert_limit(1..=u32::MAX, obj, GFP_KERNEL);
-        // StoreError owns the rejected object. Convert it only after the
-        // temporary XArray guard is gone: dropping a mapping may sleep.
-        let handle = handle? as u64;
+            .reserve_limit(1..=u32::MAX, GFP_KERNEL_ACCOUNT)?;
+        let handle: u32 = resv.index().try_into()?;
+        // Take the bound range from the file's share of the firmware timestamp window before
+        // mapping. Past its share the buffer may not go in the window: the backend maps it
+        // without one if it can, or fails with ENOSPC as for a full window. A buffer mapped
+        // without the window gives the share back at once.
+        let limit = window_limit(reg_data.gpu.timestamp_window_size());
+        let window = if limit == 0 {
+            crate::timestamp::WindowPermit::Unrestricted
+        } else {
+            match memacct::Client::take_window(&file.inner().mem, data.range, limit) {
+                Some(share) => crate::timestamp::WindowPermit::Share(share),
+                None => crate::timestamp::WindowPermit::Denied,
+            }
+        };
+        let buffer = reg_data.gpu.map_timestamp_buffer(
+            bo,
+            offset..end_offset,
+            window,
+        )?;
+        let mapping = Arc::new(
+            crate::timestamp::Bound::new(buffer, charge),
+            GFP_KERNEL_ACCOUNT,
+        )?;
+        let obj = KBox::new(Object::TimestampBuffer(mapping), GFP_KERNEL_ACCOUNT)?;
+        // fill() takes and releases the XArray lock itself, so a rejected object, which
+        // StoreError owns, is dropped outside it: dropping a mapping may sleep.
+        resv.fill(obj)?;
 
-        data.object_handle = handle as u32;
+        data.object_handle = handle;
         Ok(0)
     }
 
@@ -2017,5 +2069,71 @@ impl Drop for File {
         // SAFETY: `drop` runs on the pinned file in place, and nothing here moves it.
         let this = unsafe { Pin::new_unchecked(&*self) };
         Self::mark_clients_closed(this, |_| true);
+    }
+}
+
+#[kernel::macros::kunit_tests(asahi_bound_object_charge)]
+mod bound_object_charge_tests {
+    use super::*;
+    use crate::memacct::{Ledger, Limits};
+
+    static BINDS: Ledger = Ledger::new();
+
+    #[test]
+    fn a_bind_is_charged_its_records_and_refused_past_the_client_limit() -> Result {
+        // The charge covers the table entry, the bound record and the buffer's heap records.
+        assert!(
+            BOUND_OBJECT_BYTES as usize
+                >= core::mem::size_of::<Object>()
+                    + core::mem::size_of::<crate::timestamp::Bound>()
+                    + crate::timestamp::Buffer::HEAP_BYTES
+        );
+        BINDS.set_limits(Limits { device: 0, client: 4 * BOUND_OBJECT_BYTES });
+        let client = memacct::Client::new()?;
+        let mut held = KVec::new();
+        for _ in 0..4 {
+            held.push(admit_bind(&BINDS, &client)?, GFP_KERNEL)?;
+        }
+        assert_eq!(client.committed(), 4 * BOUND_OBJECT_BYTES);
+        // The fifth is refused with ENOMEM, as an object creation past the limit is, and
+        // charges nothing.
+        assert_eq!(admit_bind(&BINDS, &client).err(), Some(ENOMEM));
+        assert_eq!(client.committed(), 4 * BOUND_OBJECT_BYTES);
+        // An unbind gives its charge back, and the next bind fits again.
+        held.pop();
+        assert_eq!(client.committed(), 3 * BOUND_OBJECT_BYTES);
+        held.push(admit_bind(&BINDS, &client)?, GFP_KERNEL)?;
+        drop(held);
+        assert_eq!(client.committed(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn a_file_holds_at_most_its_share_of_the_timestamp_window() -> Result {
+        const MIB: u64 = 1 << 20;
+        let limit = window_limit(64 * MIB);
+        assert_eq!(limit, 4 * MIB);
+        assert_eq!(window_limit(0), 0);
+        let a = memacct::Client::new()?;
+        let b = memacct::Client::new()?;
+        // One file binds up to its share and no further, whatever the buffer sizes.
+        let first = memacct::Client::take_window(&a, 3 * MIB, limit);
+        assert!(first.is_some());
+        assert!(memacct::Client::take_window(&a, 2 * MIB, limit).is_none());
+        let second = memacct::Client::take_window(&a, MIB, limit);
+        assert!(second.is_some());
+        assert_eq!(a.timestamp_window(), 4 * MIB);
+        assert!(memacct::Client::take_window(&a, 16 * 1024, limit).is_none());
+        // Another file has its own share.
+        let other = memacct::Client::take_window(&b, 4 * MIB, limit);
+        assert!(other.is_some());
+        // An unbind gives the share back; a limit of 0 (no window) takes nothing.
+        drop(first);
+        assert_eq!(a.timestamp_window(), MIB);
+        assert!(memacct::Client::take_window(&a, MIB, 0).is_none());
+        drop((second, other));
+        assert_eq!(a.timestamp_window(), 0);
+        assert_eq!(b.timestamp_window(), 0);
+        Ok(())
     }
 }

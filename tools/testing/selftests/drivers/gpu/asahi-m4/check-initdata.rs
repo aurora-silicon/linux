@@ -24,6 +24,7 @@ fn input(variant: u64) -> initdata::Input {
         lower_parameter: 0x7000240000,
         ktrace_mask: [0, 0x12345678, 0xfedcba98][variant as usize],
         progress_recovery: u32::from(variant != 1),
+        enabled_cores: 10,
         // T8132 ADT power-sampling ticks; 25G83 writes power_sample_clks to +4/+8.
         power_sample_clks: 200_000,
         power_sample_us: 8333,

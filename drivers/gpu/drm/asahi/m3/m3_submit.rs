@@ -13,7 +13,7 @@ impl FenceOps for Completion {
     fn get_driver_name<'a>(self:&'a FenceObject<Self>)->&'a CStr {c_str!("asahi")}
     fn get_timeline_name<'a>(self:&'a FenceObject<Self>)->&'a CStr {c_str!("m3-native")}
 }
-pub(crate) struct Destination { mapping: Arc<mmu::KernelMapping>, offset: usize }
+pub(crate) struct Destination { _buffer: Arc<crate::timestamp::Bound>, iova: u64 }
 impl Destination {
     fn resolve(objects: Pin<&xarray::XArray<KBox<file::Object>>>,
         timestamp: agx_uapi::UapiTimestamp) -> Result<Option<Self>> {
@@ -27,11 +27,12 @@ impl Destination {
                 if offset & 7 != 0 || offset.checked_add(8).ok_or(EOVERFLOW)? > mapping.size() {
                     return Err(EINVAL);
                 }
-                Ok(Some(Self { mapping, offset }))
+                let iova = mapping.iova() + offset as u64;
+                Ok(Some(Self { _buffer: buffer.clone(), iova }))
             }
         }
     }
-    fn firmware_address(&self) -> u64 { self.mapping.iova() + self.offset as u64 }
+    fn firmware_address(&self) -> u64 { self.iova }
 }
 
 #[derive(Copy,Clone)]

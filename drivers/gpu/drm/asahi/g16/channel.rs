@@ -15,9 +15,8 @@ use kernel::{
 
 use super::boot::Session;
 use super::event::Events;
-use super::fw::channels::{
-    DevCtl, SubmitRecord, RING_SLOTS, STATE_COMPLETION, STATE_READ, STATE_WRITE,
-};
+use super::fw::channels::{DevCtl, SubmitRecord, RING_SLOTS, STATE_READ, STATE_WRITE};
+use super::fw::initdata::TxLayout;
 use super::hw::{self, rings};
 use super::initdata::InitData;
 use super::object::{Class, FwObject, Objects, Placement, Request};
@@ -36,22 +35,55 @@ pub(crate) enum Channel {
 pub(crate) struct Ring {
     pub(crate) state: Arc<FwObject>,
     pub(crate) ring: Arc<FwObject>,
+    completion: usize,
+    header: usize,
 }
 
 impl Ring {
+    pub(crate) fn new(
+        state: Arc<FwObject>,
+        ring: Arc<FwObject>,
+        tx: TxLayout,
+        control: bool,
+    ) -> Self {
+        Self {
+            state,
+            ring,
+            completion: tx.completion(),
+            header: tx.ring_header(control),
+        }
+    }
+
     /// The consumer's read index (state +0x00).
     pub(crate) fn read(&self) -> Result<u32> {
         self.state.r32(STATE_READ)
     }
 
-    /// The completion index (state +0x10).
+    /// The completion index in the channel's state block.
     pub(crate) fn completion(&self) -> Result<u32> {
-        self.state.r32(STATE_COMPLETION)
+        // Submit rings with a producer header retire at the consumer's read cursor.
+        if self.header != 0 {
+            self.read()
+        } else {
+            self.state.r32(self.completion)
+        }
     }
 
-    /// The producer's write index (state +0x20).
+    /// The producer's write index, either in state or at the start of the ring.
     pub(crate) fn write(&self) -> Result<u32> {
-        self.state.r32(STATE_WRITE)
+        if self.header == 0 {
+            self.state.r32(STATE_WRITE)
+        } else {
+            self.ring.r32(0)
+        }
+    }
+
+    fn set_write(&self, value: u32) -> Result {
+        if self.header == 0 {
+            self.state.w32(STATE_WRITE, value)
+        } else {
+            self.ring.w32(0, value)
+        }
     }
 }
 
@@ -95,6 +127,7 @@ impl Channels {
     /// Their state is uncached; the submit records use the qualified ASC-cached class.
     pub(crate) fn alloc_submit_and_attach(
         objects: &mut Objects,
+        tx: TxLayout,
         devctl: Ring,
         event: Ring,
         log: Ring,
@@ -106,10 +139,16 @@ impl Channels {
         let mut submit = KVec::with_capacity(rings::CHANNELS as usize, GFP_KERNEL)?;
         for _ in 0..rings::CHANNELS {
             submit.push(
-                Ring {
-                    state: fw_object(objects, rings::STATE_SIZE, false)?,
-                    ring: fw_object(objects, rings::CHANNEL_RING_SIZE, true)?,
-                },
+                Ring::new(
+                    fw_object(objects, rings::STATE_SIZE, false)?,
+                    fw_object(
+                        objects,
+                        rings::CHANNEL_RING_SIZE + tx.ring_header(false),
+                        tx == TxLayout::StateBlock,
+                    )?,
+                    tx,
+                    false,
+                ),
                 GFP_KERNEL,
             )?;
         }
@@ -142,7 +181,7 @@ impl Channels {
         self.channel(channel).read()
     }
 
-    /// The channel's write cell (state +0x20).
+    /// The channel's producer.
     pub(crate) fn write_cell(&self, channel: Channel) -> Result<u32> {
         self.channel(channel).write()
     }
@@ -179,12 +218,12 @@ impl Channels {
             return Err(EBUSY);
         }
         ring.ring.write(
-            producer as usize * rings::CHANNEL_RECORD,
+            ring.header + producer as usize * rings::CHANNEL_RECORD,
             &record.to_bytes(),
         )?;
         wmb();
         let producer = (producer + 1) % RING_SLOTS;
-        ring.state.w32(STATE_WRITE, producer)?;
+        ring.set_write(producer)?;
         wmb();
         self.producer[ch] = producer;
         Ok(producer)
@@ -203,7 +242,7 @@ impl Channels {
         self.devctl.ring.write(0, &DevCtl::op(nop).to_bytes())?;
         wmb();
         session.set_generation(1)?;
-        self.devctl.state.w32(STATE_WRITE, 1)?;
+        self.devctl.set_write(1)?;
         wmb();
         self.devctl_producer = 1;
         Ok(())
@@ -453,7 +492,7 @@ pub(crate) fn devctl_submit(
         .write(producer as usize * rings::DEVCTL_RECORD, &record.to_bytes())?;
     wmb();
     session.set_generation(next)?;
-    channels.devctl.state.w32(STATE_WRITE, next)?;
+    channels.devctl.set_write(next)?;
     wmb();
     channels.devctl_producer = next;
     session.send(hw::ep::DOORBELL, hw::engine::DEVCTL_DOORBELL)?;
