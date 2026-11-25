@@ -832,6 +832,12 @@ struct apple_sleep_soc {
 	 * link restore is the profile's, not the generic PCIe block's.
 	 */
 	bool gp_host_apart;
+	/*
+	 * A coprocessor's failed last stop ends the sleep before the commit (in the profile's
+	 * panic): its run bit is left as the failure left it, not cleared under firmware that
+	 * may still be running.
+	 */
+	bool failed_stop_ends_sleep;
 };
 
 struct apple_sleep {
@@ -1797,6 +1803,15 @@ static void apple_sleep_coproc_stop(struct apple_sleep *s, struct apple_sleep_co
 	c->stop_ret = c->last_stop ? c->last_stop(c->data) : 0;
 	if (s->soc->regions && c->pcie_ans && c->stop_ret)
 		s->ans_m5_wake_error = -EIO;
+	/*
+	 * macOS clears the run bit twice after a stop that worked. One that failed leaves
+	 * firmware in an unknown state: where that ends the sleep anyway, the failure is kept
+	 * for the profile's check and the run bit is left alone.
+	 */
+	if (c->stop_ret && s->soc->failed_stop_ends_sleep) {
+		c->stopped = true;
+		return;
+	}
 	apple_sleep_coproc_run_off(c);
 }
 

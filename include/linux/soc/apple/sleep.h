@@ -108,7 +108,8 @@ int apple_sleep_m5_dispext_power(struct device *dev, bool on);
  * interrupts off and every refusal behind it, then clears its run bit. With
  * @pcie_ans, that also lowers the PCIe and ANS domains, which nothing else may do
  * under it. @last_stop can't refuse: a nonzero return means it failed, and the sleep
- * goes on.
+ * goes on, or, on a SoC where that ends the sleep, stops there with the run bit left
+ * as the failure left it.
  */
 int apple_sleep_coproc_register(struct device *dev, void __iomem *asc, bool pcie_ans,
 				int (*last_stop)(void *data), void *data);
