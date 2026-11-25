@@ -278,6 +278,25 @@ patternProperties:
         $ref: '#/$defs/tunable'
         description: Initialization tuples relative to this port's registers.
 
+      apple,tunable-rc:
+        $ref: '#/$defs/tunable'
+        description:
+          Tuples for this port's root complex registers in the configuration
+          space, copied by the boot loader. The OS applies them when it sets the
+          port up again from power-off.
+
+      apple,tunable-rc-gen3:
+        $ref: '#/$defs/tunable'
+        description:
+          Root complex tuples for the Gen3 rate shadow registers, applied with
+          apple,tunable-rc.
+
+      apple,tunable-rc-gen4:
+        $ref: '#/$defs/tunable'
+        description:
+          Root complex tuples for the Gen4 rate shadow registers, applied with
+          apple,tunable-rc.
+
       apple,apcie-config-tunables:
         $ref: '#/$defs/t6050-tunable'
         description:
@@ -496,6 +515,29 @@ allOf:
       properties:
         reg-names:
           minItems: 10
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t6030-pcie
+    then:
+      properties:
+        reg:
+          maxItems: 16
+        reg-names:
+          description:
+            config and rc, then port<n> and phy<n> for the four root ports. The
+            windows through which the OS sets the host up again after a deep
+            sleep may follow, from ADT reg[4], [5], [6], [2] + 0x4000,
+            [2] + 0x8000 and [3] in that order. These are the AXI bridge
+            (axi2af), the CIO3 PLL (cio3pll), the clock generator (clkgen), the
+            shared PHY's common block (phy-common), the shared PHY (phy-shared)
+            and its lanes (phy-ip). The tunable lists apple,tunable-axi2af,
+            -cio3pll, -clkgen, -phy, -phy-ip-pll and -phy-ip-auspma apply to
+            axi2af, cio3pll, clkgen, phy-shared, phy-ip and phy-ip.
+          maxItems: 16
+          items:
+            pattern: "^(config|rc|(port|phy)[0-3]|axi2af|cio3pll|clkgen|phy-common|phy-shared|phy-ip)$"
   - if:
       properties:
         compatible:
