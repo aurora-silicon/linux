@@ -233,6 +233,10 @@ pub(crate) struct PowerLimiter {
 /// nearest, ties to even. The encoder runs where the kernel has no floating point. With 32-bit
 /// inputs every step fits in 64 bits.
 pub(crate) const fn f32_bits(num: u32, den: u32) -> u32 {
+    // +0.0: a zero numerator never normalizes (`n < d` would loop forever).
+    if num == 0 {
+        return 0;
+    }
     let (mut n, mut d) = (num as u64, den as u64);
     let mut exponent: i32 = 0;
     while n >= 2 * d {
@@ -256,6 +260,7 @@ pub(crate) const fn f32_bits(num: u32, den: u32) -> u32 {
 }
 const _: () = assert!(f32_bits(28, 29) == 0x3f77_2c23 && f32_bits(1, 29) == 0x3d0d_3dcb);
 const _: () = assert!(f32_bits(8333, 1) == 0x4602_3400 && f32_bits(65536, 1) == 0x4780_0000);
+const _: () = assert!(f32_bits(0, 1) == 0 && f32_bits(1, 1) == 0x3f80_0000);
 
 /// Where the RETENTION object (0x4000 zeroed bytes) is published.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1408,8 +1413,12 @@ pub(crate) fn encode_for(
         {
             return Err(());
         }
+        // The low-peak IIR filter spans `periods` sample periods. One period (the ADT's
+        // limiter time constant equals its sample period, as on the 15-inch M3 Air) is a valid
+        // filter: a_neg = (1 - 1) / 1 = +0.0 and a = 1 / 1 = +1.0, i.e. each sample is taken
+        // as is. Only a time constant shorter than one period is refused.
         let periods = input.lowpeak_limiter_tc_ms / input.power_sample_period_ms;
-        if periods < 2 {
+        if periods < 1 {
             return Err(());
         }
         let periods_x4 = periods.checked_mul(4).ok_or(())?;
