@@ -531,6 +531,9 @@ pub(crate) mod t8122 {
         segment_vas: &[UPPER, UPPER + 0x64000, UPPER + 0x118000],
         data_size: 0xbc000,
         initdata: &initdata::G15G_26B123,
+        // The G15 family's 26B123 protocol: the J615 firmware installs root[1] at root + 3
+        // pages with 0x403 attributes, the G15S convention, not G16G's.
+        abi: super::FwAbi::V26B123G15S,
         // Not known for this firmware; the host keeps reading GPU registers while it runs, as
         // the m3 runtime does.
         powered: None,
