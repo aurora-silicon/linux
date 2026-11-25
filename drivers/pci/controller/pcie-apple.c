@@ -565,7 +565,6 @@ struct apple_pcie_pd {
 
 struct apple_radio_sleep;
 
-#define APPLE_PCIE_T6050_WARM_WRITES	4
 
 struct apple_pcie {
 	struct mutex		lock;
@@ -588,10 +587,7 @@ struct apple_pcie {
 	/* Those ports back, and their functions looked for, once the resume is over */
 	struct work_struct	t6050_unpark_work;
 	/* The endpoint's warm reset, given by this host while the port is down */
-	struct platform_device	*t6050_smc;
-	u32			t6050_warm_key;
-	u32			t6050_warm_writes[2 * APPLE_PCIE_T6050_WARM_WRITES];
-	unsigned int		t6050_warm_count;
+	struct apple_smc_warm_reset t6050_warm;
 	bool			t6050_warm_done;
 	/* When this wake's bring-up of that port had the link up and its 100 ms over; 0 before */
 	ktime_t			t6050_link_up;
@@ -5546,35 +5542,14 @@ static int apple_pcie_t6050_pm_notify(struct notifier_block *nb, unsigned long a
 static void apple_pcie_t6050_warm_reset_probe(struct platform_device *pdev, struct apple_pcie *pcie,
 					      struct apple_pcie_port *port)
 {
-	struct of_phandle_args fn;
-	int count, i;
-
 	if (!IS_REACHABLE(CONFIG_MFD_MACSMC) ||
-	    of_parse_phandle_with_fixed_args(port->np, "apple,function-warm-reset", 2, 0, &fn))
+	    apple_smc_warm_reset_parse(port->np, &pcie->t6050_warm))
 		return;
-	pcie->t6050_smc = of_find_device_by_node(fn.np);
-	of_node_put(fn.np);
-	if (!pcie->t6050_smc)
-		return;
-	count = of_property_count_u32_elems(port->np, "apple,warm-reset-writes");
-	if (count < 2 || count % 2 || count > ARRAY_SIZE(pcie->t6050_warm_writes) ||
-	    of_property_read_u32_array(port->np, "apple,warm-reset-writes",
-				       pcie->t6050_warm_writes, count))
-		goto drop;
-	for (i = 1; i < count; i += 2)
-		if (pcie->t6050_warm_writes[i] > 100 * USEC_PER_MSEC)
-			goto drop;
 	/* The SMC's noirq resume comes before this host's: the reset is written from there */
-	if (!device_link_add(&pdev->dev, &pcie->t6050_smc->dev, DL_FLAG_STATELESS)) {
+	if (!device_link_add(&pdev->dev, &pcie->t6050_warm.smc->dev, DL_FLAG_STATELESS)) {
 		dev_warn(&pdev->dev, "no warm reset after a sleep: no link to the SMC\n");
-		goto drop;
+		apple_smc_warm_reset_put(&pcie->t6050_warm);
 	}
-	pcie->t6050_warm_key = fn.args[0];
-	pcie->t6050_warm_count = count / 2;
-	return;
-drop:
-	put_device(&pcie->t6050_smc->dev);
-	pcie->t6050_smc = NULL;
 }
 
 /*
@@ -5585,34 +5560,15 @@ drop:
  */
 static int apple_pcie_t6050_warm_reset(struct apple_pcie *pcie, bool noirq)
 {
-	struct apple_smc *smc;
-	unsigned int i;
-	int ret = 0;
+	int ret;
 
 	pcie->t6050_warm_done = false;
-	if (!IS_REACHABLE(CONFIG_MFD_MACSMC) || !pcie->t6050_warm_count)
+	if (!IS_REACHABLE(CONFIG_MFD_MACSMC) || !pcie->t6050_warm.count)
 		return -ENODEV;
-	smc = platform_get_drvdata(pcie->t6050_smc);
-	if (!smc) {
+	ret = apple_smc_warm_reset(&pcie->t6050_warm, noirq);
+	if (ret == -ENODEV) {
 		dev_warn(pcie->dev, "no warm reset: the SMC isn't bound\n");
-		return -ENODEV;
-	}
-	for (i = 0; i < pcie->t6050_warm_count && !ret; i++) {
-		__be32 value = cpu_to_be32(pcie->t6050_warm_writes[2 * i]);
-		u32 wait = pcie->t6050_warm_writes[2 * i + 1];
-		smc_key key = pcie->t6050_warm_key;
-
-		if (noirq) {
-			ret = apple_smc_write_noirq(smc, key, &value, sizeof(value));
-			if (!ret) {
-				mdelay(wait / USEC_PER_MSEC);
-				udelay(wait % USEC_PER_MSEC);
-			}
-		} else {
-			ret = apple_smc_write(smc, key, &value, sizeof(value));
-			if (!ret)
-				fsleep(wait);
-		}
+		return ret;
 	}
 	pcie->t6050_warm_done = !ret;
 	if (ret)
@@ -5811,7 +5767,7 @@ void apple_pcie_t6050_sleep_reset(struct pci_dev *bridge)
 {
 	struct apple_pcie *pcie = apple_pcie_t6050_from_bridge(bridge);
 
-	if (pcie && pcie->t6050_warm_count) {
+	if (pcie && pcie->t6050_warm.count) {
 		pcie->t6050_keep_alive = false;
 		pcie->t6050_reset_before_sleep = true;
 	}
@@ -5876,7 +5832,7 @@ int apple_pcie_t6050_port_recycle(struct pci_dev *bridge)
 
 	if (!pcie)
 		return -ENODEV;
-	if (!pcie->t6050_warm_count || pcie->t6050_lost || READ_ONCE(pcie->t6050_down))
+	if (!pcie->t6050_warm.count || pcie->t6050_lost || READ_ONCE(pcie->t6050_down))
 		return -EBUSY;
 	pci_save_state(bridge);
 	ret = apple_pcie_t6050_sleep_down(pcie);
@@ -7645,7 +7601,7 @@ static int apple_pcie_resume_noirq(struct device *dev)
 			/* Up, and reset unless kept alive: nothing takes it down again */
 			pcie->t6050_woke = !READ_ONCE(pcie->t6050_down) && !pcie->t6050_lost &&
 					   (!warm_reset || pcie->t6050_warm_done ||
-					    !pcie->t6050_warm_count);
+					    !pcie->t6050_warm.count);
 			list_for_each_entry(port, &pcie->ports, entry)
 				if (pcie->t6050_parked & BIT(port->idx))
 					dev_dbg(dev, "port %d at the wake: parked since before the sleep, power off, PERST# low, no functions, root port %s, DART %s; %s\n",
