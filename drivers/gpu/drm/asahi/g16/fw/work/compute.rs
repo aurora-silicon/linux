@@ -3,6 +3,15 @@
 //! J713/G16G 25G83 compute packet layout. All offsets are bytes.
 
 pub(crate) const WORK_SIZE: usize = 0x2000;
+/// Active head span of a compute work image: header (`0x00..0x18`) plus up to 28 register
+/// records (`0x20..0x170`, including USC base and RT/SCS records), 16-byte aligned. Bytes
+/// between `HEAD_ACTIVE_SIZE` and `BODY_ACTIVE_START` remain zeroed after a full write.
+pub(crate) const HEAD_ACTIVE_SIZE: usize = 0x170;
+/// First active body byte of a compute work image (`work_gva + 0x20` pointer at `0x720`).
+pub(crate) const BODY_ACTIVE_START: usize = 0x720;
+/// Exclusive end of the active body span of a compute work image (`0xf00..0xf08` tail).
+/// Bytes `BODY_ACTIVE_END..WORK_SIZE` remain zeroed after a full write.
+pub(crate) const BODY_ACTIVE_END: usize = 0xf08;
 pub(crate) const SEQ_SIZE: usize = 0x300;
 pub(crate) const SEQ_OBJECT: usize = 0x1000;
 pub(crate) const REGS: usize = 0x20;
@@ -27,7 +36,71 @@ pub(crate) const CONTEXT_STORE_SIZE: usize = 0x40000;
 pub(crate) const POOL_SIZE: usize = 0x2000000;
 pub(crate) const POOL_STATE_SIZE: usize = 0x20000;
 pub(crate) const PAGE_LIST_SIZE: usize = 0x4000;
+/// u32 of the StartCompute command: nonzero when the work's register list enables shader-context
+/// scratch (SCS). The firmware then records the work's slot as an SCS user, appends
+/// `0x017d9 = 1` to the kick's register list, and keeps the SCS state (`0x017e0`, the compute
+/// and TA windows) through its idle teardown while the slot is busy.
+pub(crate) const START_SCS: usize = 0x40;
 pub(crate) const EVENT: u32 = 15;
+/// Firmware completion events for concurrent compute pipes `0..COMPUTE_PIPES`.
+pub(crate) const EVENTS: [u32; 2] = [EVENT, 16];
+/// The binding generation.
+pub(crate) const GENERATION: usize = 0x88b;
+
+/// Compute work fields that move between firmware ABIs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Layout {
+    /// Width of the binding generation at [`GENERATION`].
+    pub(crate) generation_bytes: usize,
+    /// Target of the finalize record's +0x71 pointer.
+    pub(crate) completion: usize,
+    /// Target of the timestamp records' +0x2c ("auxiliary") pointer.
+    pub(crate) auxiliary: usize,
+    /// u32 target of the start record's +0x1a8 and the finalize record's +0x69 pointers.
+    pub(crate) target: usize,
+    /// Bytes of the work the firmware caches; the host's private parts lie beyond them.
+    pub(crate) cached: usize,
+    /// Optional `(start, end)` u64 tick offsets inside the work object when the firmware writes
+    /// compute GPU timestamps into work rather than the unit's ITS pair.
+    pub(crate) work_ticks: Option<(usize, usize)>,
+}
+
+pub(crate) const V25G83: Layout = Layout {
+    generation_bytes: 1,
+    completion: 0x88c,
+    auxiliary: 0x89c,
+    target: 0x8ac,
+    cached: 0x8c0,
+    work_ticks: None,
+};
+
+pub(crate) const V26B123: Layout = Layout {
+    generation_bytes: 8,
+    completion: 0x893,
+    auxiliary: 0x8a3,
+    target: 0x8b3,
+    cached: 0x8e0,
+    work_ticks: Some((0x7ec, 0x7f4)),
+};
+
+const fn valid(l: &Layout) -> bool {
+    l.completion == GENERATION + l.generation_bytes
+        && l.auxiliary == l.completion + 0x10
+        && l.target == l.completion + 0x20
+        && l.target + 4 <= l.cached
+        && l.cached <= SEQ_EMBEDDED
+        && SEQ_EMBEDDED + SEQ_SIZE <= NOTIFIER
+}
+const _: () = assert!(
+    valid(&V25G83)
+        && valid(&V26B123)
+        && REGS + (SEL.len() + 4) * 12 <= HEAD_ACTIVE_SIZE
+        && HEAD_ACTIVE_SIZE <= BODY_ACTIVE_START
+        && BODY_ACTIVE_START <= GENERATION
+        && DESCRIPTOR + DESCRIPTOR_SIZE <= BODY_ACTIVE_END
+        && 0xf08 <= BODY_ACTIVE_END
+        && BODY_ACTIVE_END <= WORK_SIZE
+);
 
 pub(crate) const SEL: [u32; 24] = [
     0x1a510, 0x1a420, 0x1a4d0, 0x1a4d8, 0x1a4e0, 0x1a4e8, 0x1a440, 0x1a458, 0x101d9, 0x1a089,

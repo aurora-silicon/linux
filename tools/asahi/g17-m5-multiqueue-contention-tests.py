@@ -9,8 +9,8 @@ from `drivers/gpu/drm/asahi/g17/initdata/outer_credit.rs` on the host and tests:
    and concurrent direct compute/render reservations and consumptions — verifying
    zero ring overcommits, zero `EIO`, and exact credit accounting.
 2. Structural verification of the production G17 M5 sources:
-   - `Shared::new()` restricts scheduler cluster pinning to multi-die M5
-     (`pin_scheduler_cluster: m5 && id.num_dies > 1`).
+   - `Shared::new()` leaves single-die M5 schedulers unrestricted
+     (`pin_scheduler_cluster: !m5 || id.num_dies > 1`).
    - `Backend::claim_outer()` holds `firmware.port.m5_outer_lock()` around
      `firmware.init.reserve_outer()`.
    - `Backend::publish_claimed()` and `runtime/render/prepare.rs` enter
@@ -103,8 +103,8 @@ def build_harness(mutation=None):
         )
     elif mutation == 'pin-single-die':
         mod_src = mod_src.replace(
-            'pin_scheduler_cluster: m5 && id.num_dies > 1,',
-            'pin_scheduler_cluster: m5,',
+            'pin_scheduler_cluster: !m5 || id.num_dies > 1,',
+            'pin_scheduler_cluster: true,',
             1,
         )
 
@@ -152,7 +152,7 @@ def build_harness(mutation=None):
         > compute_direct.index('if outcome.is_none() && from_held {')
     )
     cluster_pin_ok = (
-        'pin_scheduler_cluster: m5 && id.num_dies > 1,' in mod_src
+        'pin_scheduler_cluster: !m5 || id.num_dies > 1,' in mod_src
         and 'self.shared.pin_scheduler_cluster()' in creator_cluster
     )
 
@@ -364,7 +364,7 @@ fn main() {{
     assert!({str(render_scope_ok).lower()}, "render/prepare.rs must use Port::outer_scope");
     assert!({str(port_scope_ok).lower()}, "Port::outer_scope and PortOuterScope::drop must hold Port::m5_outer");
     assert!({str(direct_restore_ok).lower()}, "compute_direct must restore unspent m5_outer claim on None fallback outside cell.lock()");
-    assert!({str(cluster_pin_ok).lower()}, "scheduler cluster pinning must require multi-die M5 (num_dies > 1)");
+    assert!({str(cluster_pin_ok).lower()}, "single-die M5 must leave scheduler queues unrestricted");
     test_serialized_tight_ring_contention();
     test_fallback_preserves_claim_without_spurious_notify();
     println!("PASS g17-m5-multiqueue-contention-tests");

@@ -70,23 +70,6 @@ impl event::Transport for Service<'_> {
     fn roles(&self) -> &'static [Role] {
         self.firmware.roles()
     }
-    fn reports_after_signal(&self) -> bool {
-        self.firmware.init.is_m5()
-    }
-    fn trace(&mut self, role: Role) {
-        let firmware = &mut *self.firmware;
-        firmware
-            .rings
-            .drain_trace(&firmware.primary.state.shared.dev, &firmware.init, role);
-    }
-    fn statistics(&mut self, role: Role) {
-        let firmware = &mut *self.firmware;
-        firmware.observe_statistics_power();
-        firmware
-            .rings
-            .drain_statistics(&firmware.primary.state.shared.dev, &firmware.init, role);
-        firmware.observe_statistics_power();
-    }
     fn drain(
         &mut self,
         role: Role,
@@ -209,11 +192,7 @@ impl recovery::Memory for Service<'_> {
             }
         }
         let mut sources = self.firmware.init.fault_sources()?;
-        // M5 attribution leaves the firmware reason out (see InitData::fault_sources); a
-        // latched MMU fault is reason 3.
-        if mmu_fault && sources.reason.is_none() {
-            sources.reason = Some(recovery::PAGE_FAULT);
-        }
+        sources.settle_reason(mmu_fault, || self.firmware.port.fault_banks().ok());
         Ok(sources)
     }
 
@@ -237,6 +216,9 @@ impl recovery::Queues for Service<'_> {
     }
     fn render_culprit(&self, blamed: u8) -> Option<u128> {
         self.firmware.queues.render_culprit(blamed)
+    }
+    fn fault_culprit(&self, slots: u64) -> Option<u128> {
+        self.firmware.queues.fault_culprit(slots)
     }
     fn publish_recovery_targets(&self) -> Option<Error> {
         let mut failure = self.firmware.queues.publish_render_recovery_targets();
@@ -319,27 +301,32 @@ impl recovery::Queues for Service<'_> {
             .queues
             .report_render_recovery(qid, &self.firmware.port);
     }
-    fn report_mmu_fault(&self) {
+    fn report_mmu_fault(&self) -> u64 {
         let banks = match self.firmware.port.fault_banks() {
             Ok(banks) => banks,
             Err(error) => {
                 pr_warn!("G17: recovery MMU fault banks unreadable: {:?}\n", error);
-                return;
+                return 0;
             }
         };
+        let mut slots = 0u64;
         for (bank, &(status, address)) in banks.iter().enumerate() {
             match crate::regs::decode_fault(status, address, true) {
-                Some(info) => pr_warn!(
-                    "G17: recovery MMU fault bank {}: address {:#x} {} {:?} unit {:?} ({:#x}) level {} vm_slot {} sideband {:#x} (status {:#x})\n",
-                    bank, info.address, if info.read { "read" } else { "write" }, info.reason,
-                    info.unit, info.unit_code, info.level, info.vm_slot, info.sideband, status
-                ),
-                None => pr_info!(
-                    "G17: recovery MMU fault bank {}: no fault (status {:#x})\n",
-                    bank, status
-                ),
+                Some(info) => {
+                    pr_warn!(
+                        "G17: recovery MMU fault bank {}: address {:#x} {} {:?} unit {:?} ({:#x}) level {} vm_slot {} sideband {:#x} (status {:#x})\n",
+                        bank, info.address, if info.read { "read" } else { "write" }, info.reason,
+                        info.unit, info.unit_code, info.level, info.vm_slot, info.sideband, status
+                    );
+                    // Slot 0 is the firmware's own context, never a client's.
+                    if info.vm_slot != 0 {
+                        slots |= 1u64.checked_shl(info.vm_slot).unwrap_or(0);
+                    }
+                }
+                None => pr_info!("G17: recovery MMU fault bank {}: no fault (status {:#x})\n", bank, status),
             }
         }
+        slots
     }
     fn settle_blamed_render(&mut self, qid: u8, error: Error) {
         let result = self
@@ -378,9 +365,10 @@ impl Firmware {
         Ok(())
     }
 
-    /// Drains every role's trace ring, then their statistics rings. On M5 the event worker calls
-    /// this after it has signalled the completions of its pass: the reports are not scheduling
-    /// inputs.
+    /// Drains every role's trace ring, then their statistics rings. The event worker calls this
+    /// after it has signalled the completions of its pass: the reports are not scheduling inputs.
+    /// While work stays in flight it does so at the housekeeping cadence, and a recovery pass
+    /// does so before the restart resets the report rings.
     fn drain_reports(&mut self) {
         let dev = &self.primary.state.shared.dev;
         for &role in self.roles() {
@@ -392,14 +380,6 @@ impl Firmware {
         for &role in self.roles() {
             self.rings.drain_statistics(&self.primary.state.shared.dev, &self.init, role);
             self.observe_statistics_power();
-        }
-    }
-
-    /// Drains post-signal trace and statistics reports on firmware families that defer them past
-    /// completion signalling.
-    fn drain_post_signal_reports(&mut self) {
-        if self.init.is_m5() {
-            self.drain_reports();
         }
     }
 
@@ -728,7 +708,7 @@ impl crate::g17::Shared {
         // report rings, matching the non-throttled post-signal ordering.
         let mut reports_drained = false;
         if recover {
-            firmware.drain_post_signal_reports();
+            firmware.drain_reports();
             reports_drained = true;
             firmware.service_runtime_recovery(deferred)?;
             if !firmware.recovery.pending()
@@ -806,7 +786,7 @@ impl crate::g17::Shared {
             if !reports_drained {
                 // The completions above are signalled; reports are throttled to the
                 // housekeeping cadence while work stays in flight.
-                firmware.drain_post_signal_reports();
+                firmware.drain_reports();
             }
             if !firmware.recovery.pending() {
                 lingers = firmware.expire_render_lingers(now)?;

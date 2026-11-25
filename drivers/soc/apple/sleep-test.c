@@ -364,6 +364,136 @@ static void apple_sleep_test_region_rejects_bad_inventory(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, sleep_region_validate(&p), -EINVAL);
 }
 
+struct apple_sleep_test_wdt_saved {
+	struct device *dev;
+	void (*restore)(void *data);
+	void *data;
+	bool owned;
+};
+
+struct apple_sleep_test_wdt_ctx {
+	u32 *wdt_regs;
+	int calls;
+	u32 ctl_at_restore;
+	bool owned_at_restore;
+};
+
+struct apple_sleep_test_wdt_state {
+	struct device dev1;
+	struct device dev2;
+	u32 fake_wdt[16];
+	struct apple_sleep_test_wdt_saved saved;
+};
+
+static void apple_sleep_test_wdt_restore_global(void *data)
+{
+	struct apple_sleep_test_wdt_saved *saved = data;
+	unsigned long flags;
+
+	spin_lock_irqsave(&apple_sleep_wdt_lock, flags);
+	apple_sleep_wdt_dev = saved->dev;
+	apple_sleep_wdt_restore = saved->restore;
+	apple_sleep_wdt_data = saved->data;
+	apple_sleep_wd2_owned = saved->owned;
+	spin_unlock_irqrestore(&apple_sleep_wdt_lock, flags);
+}
+
+static void apple_sleep_test_wdt_restore_cb(void *data)
+{
+	struct apple_sleep_test_wdt_ctx *ctx = data;
+
+	ctx->calls++;
+	ctx->ctl_at_restore = ctx->wdt_regs[WDT_WD2_CTL / 4];
+	ctx->owned_at_restore = apple_sleep_wd2_owned;
+}
+
+static void apple_sleep_test_wdt_handoff(struct kunit *test)
+{
+	struct resource t6050_sleep_wdt = DEFINE_RES_MEM(0x28836c000ULL, 0x4000);
+	struct resource t6050_dev_wdt = DEFINE_RES_MEM(0x28836c000ULL, 0x4000);
+	struct resource t8142_sleep_wdt = DEFINE_RES_MEM(0x23d2b0000ULL, 0x30);
+	struct resource t8142_dev_wdt = DEFINE_RES_MEM(0x23d2b0000ULL, 0x4000);
+	struct resource die1_wdt = DEFINE_RES_MEM(0x228836c000ULL, 0x4000);
+	struct apple_sleep_test_wdt_state *st;
+	struct apple_sleep_test_wdt_ctx ctx;
+	unsigned long flags;
+
+	st = kunit_kzalloc(test, sizeof(*st), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, st);
+
+	/* Isolate global handoff state so a probed apple_wdt on J714S/J716C is untouched. */
+	spin_lock_irqsave(&apple_sleep_wdt_lock, flags);
+	st->saved.dev = apple_sleep_wdt_dev;
+	st->saved.restore = apple_sleep_wdt_restore;
+	st->saved.data = apple_sleep_wdt_data;
+	st->saved.owned = apple_sleep_wd2_owned;
+	apple_sleep_wdt_dev = NULL;
+	apple_sleep_wdt_restore = NULL;
+	apple_sleep_wdt_data = NULL;
+	apple_sleep_wd2_owned = false;
+	spin_unlock_irqrestore(&apple_sleep_wdt_lock, flags);
+	KUNIT_ASSERT_EQ(test,
+			kunit_add_action_or_reset(test, apple_sleep_test_wdt_restore_global,
+						  &st->saved), 0);
+
+	ctx = (struct apple_sleep_test_wdt_ctx){ .wdt_regs = st->fake_wdt };
+
+	/* Block matching compares resource start across differing map sizes. */
+	KUNIT_EXPECT_TRUE(test, apple_sleep_wdt_same_block(&t6050_sleep_wdt, &t6050_dev_wdt));
+	KUNIT_EXPECT_TRUE(test, apple_sleep_wdt_same_block(&t8142_sleep_wdt, &t8142_dev_wdt));
+	KUNIT_EXPECT_FALSE(test, apple_sleep_wdt_same_block(&t6050_sleep_wdt, &die1_wdt));
+	KUNIT_EXPECT_FALSE(test, apple_sleep_wdt_same_block(NULL, &t6050_dev_wdt));
+	KUNIT_EXPECT_FALSE(test, apple_sleep_wdt_same_block(&t6050_sleep_wdt, NULL));
+
+	/* Invalid arguments and unmatched watchdogs. */
+	KUNIT_EXPECT_EQ(test, apple_sleep_wdt_register_matched(NULL, true,
+							       apple_sleep_test_wdt_restore_cb,
+							       &ctx), -EINVAL);
+	KUNIT_EXPECT_EQ(test, apple_sleep_wdt_register_matched(&st->dev1, true, NULL, &ctx),
+			-EINVAL);
+	KUNIT_EXPECT_EQ(test, apple_sleep_wdt_register_matched(&st->dev2, false,
+							       apple_sleep_test_wdt_restore_cb,
+							       &ctx), 0);
+	KUNIT_EXPECT_FALSE(test, apple_sleep_wdt_active(&st->dev2));
+
+	/* Matching watchdog claims the single slot; a second claiming it gets -EBUSY. */
+	KUNIT_EXPECT_EQ(test, apple_sleep_wdt_register_matched(&st->dev1, true,
+							       apple_sleep_test_wdt_restore_cb,
+							       &ctx), 0);
+	KUNIT_EXPECT_EQ(test, apple_sleep_wdt_register_matched(&st->dev2, true,
+							       apple_sleep_test_wdt_restore_cb,
+							       &ctx), -EBUSY);
+	KUNIT_EXPECT_EQ(test, apple_sleep_wdt_register_matched(&st->dev2, false,
+							       apple_sleep_test_wdt_restore_cb,
+							       &ctx), 0);
+	KUNIT_EXPECT_FALSE(test, apple_sleep_wdt_active(&st->dev1));
+
+	/* Ownership applies only to the registered watchdog; .end orders CTL=0, restore, clear. */
+	spin_lock_irqsave(&apple_sleep_wdt_lock, flags);
+	apple_sleep_wd2_owned = true;
+	spin_unlock_irqrestore(&apple_sleep_wdt_lock, flags);
+	KUNIT_EXPECT_TRUE(test, apple_sleep_wdt_active(&st->dev1));
+	KUNIT_EXPECT_FALSE(test, apple_sleep_wdt_active(&st->dev2));
+
+	st->fake_wdt[WDT_WD2_CTL / 4] = 1;
+	apple_sleep_wdt_end((void __iomem __force *)st->fake_wdt);
+	KUNIT_EXPECT_EQ(test, ctx.calls, 1);
+	KUNIT_EXPECT_EQ(test, ctx.ctl_at_restore, 0u);
+	KUNIT_EXPECT_TRUE(test, ctx.owned_at_restore);
+	KUNIT_EXPECT_FALSE(test, apple_sleep_wdt_active(&st->dev1));
+
+	/* Unregistering a non-holder leaves the slot intact; unregistering the holder frees it. */
+	apple_sleep_wdt_unregister(&st->dev2);
+	KUNIT_EXPECT_EQ(test, apple_sleep_wdt_register_matched(&st->dev2, true,
+							       apple_sleep_test_wdt_restore_cb,
+							       &ctx), -EBUSY);
+	apple_sleep_wdt_unregister(&st->dev1);
+	KUNIT_EXPECT_EQ(test, apple_sleep_wdt_register_matched(&st->dev2, true,
+							       apple_sleep_test_wdt_restore_cb,
+							       &ctx), 0);
+	apple_sleep_wdt_unregister(&st->dev2);
+}
+
 static struct kunit_case apple_sleep_test_cases[] = {
 	KUNIT_CASE(apple_sleep_test_layout),
 	KUNIT_CASE(apple_sleep_test_t6050),
@@ -377,6 +507,7 @@ static struct kunit_case apple_sleep_test_cases[] = {
 	KUNIT_CASE(apple_sleep_test_words),
 	KUNIT_CASE(apple_sleep_test_books),
 	KUNIT_CASE(apple_sleep_test_wake_names),
+	KUNIT_CASE(apple_sleep_test_wdt_handoff),
 	{}
 };
 
