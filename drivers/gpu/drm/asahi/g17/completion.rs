@@ -175,6 +175,15 @@ impl Destinations {
         self.stamps.iter().any(Option::is_some)
     }
 
+    #[cfg(CONFIG_KUNIT = "y")]
+    pub(super) fn empty() -> Self {
+        Self {
+            stamps: core::array::from_fn(|_| None),
+            render: false,
+            handed: AtomicBool::new(false),
+        }
+    }
+
     fn iter(&self) -> core::slice::Iter<'_, Option<Destination>> {
         self.stamps.iter()
     }
@@ -211,24 +220,75 @@ impl Output {
     }
 }
 
-enum HostOutput {
+enum HostOutputKind {
     Immediate(Output),
     Ordered(Arc<Publication>),
 }
 
+pub(super) struct HostOutput(HostOutputKind);
+
 impl HostOutput {
-    fn output(&self) -> &Output {
-        match self {
-            Self::Immediate(output) => output,
-            Self::Ordered(publication) => publication.output(),
+    /// Both render and compute commands use an ordered [`Publication`] when
+    /// they write host timestamps or inherit ordered host predecessors:
+    /// timestamp-writing compute must expose a [`Publication`] so overlapping
+    /// cross-engine consumers can chain behind it, and compute consumers with
+    /// host predecessors must chain behind theirs. When `host_predecessors` is
+    /// false, activation clears the sentinel immediately so `finish()`
+    /// publishes synchronously with no extra delay.
+    fn new(
+        output: Output,
+        status: Arc<VmStatus>,
+        host_predecessors: bool,
+        has_outputs: bool,
+    ) -> Result<Self> {
+        if host_predecessors || has_outputs {
+            Ok(Self(HostOutputKind::Ordered(Publication::new(
+                output, status,
+            )?)))
+        } else {
+            Ok(Self(HostOutputKind::Immediate(output)))
         }
     }
 
-    fn finish(&self, result: Result<[u64; 4]>) {
-        match self {
-            Self::Immediate(output) => output.publish(result),
-            Self::Ordered(publication) => publication.finish(result),
+    fn output(&self) -> &Output {
+        match &self.0 {
+            HostOutputKind::Immediate(output) => output,
+            HostOutputKind::Ordered(publication) => publication.output(),
         }
+    }
+
+    pub(super) fn publication(&self) -> Option<Arc<Publication>> {
+        match &self.0 {
+            HostOutputKind::Ordered(publication) => Some(publication.clone()),
+            HostOutputKind::Immediate(_) => None,
+        }
+    }
+
+    pub(super) fn finish(&self, result: Result<[u64; 4]>) {
+        match &self.0 {
+            HostOutputKind::Immediate(output) => output.publish(result),
+            HostOutputKind::Ordered(publication) => publication.finish(result),
+        }
+    }
+
+    #[cfg(CONFIG_KUNIT = "y")]
+    pub(super) fn test_pair(
+        contexts: &FenceContexts,
+        status: &Arc<VmStatus>,
+        host_predecessors: bool,
+        has_outputs: bool,
+    ) -> Result<(Self, Fence)> {
+        let fence = fence::independent(contexts)?;
+        let handle = Fence::from_fence(&fence);
+        let output = Output {
+            fence,
+            member: fence::Aggregate::test_member(contexts)?,
+            destinations: Destinations::empty(),
+        };
+        Ok((
+            Self::new(output, status.clone(), host_predecessors, has_outputs)?,
+            handle,
+        ))
     }
 }
 
@@ -370,7 +430,7 @@ impl M5ComputeTimestamps {
 pub(crate) struct Completion {
     status: Arc<VmStatus>,
     output: HostOutput,
-    // Present only when this command's public result may wait for a render
+    // Present only when this command's public result may wait for a
     // predecessor's host writes. DRM credits must follow the terminal result.
     terminal: Option<UserFence<CompletionFence>>,
     compute: Option<PooledTimestamps>,
@@ -424,7 +484,7 @@ impl Completion {
         usage: Arc<crate::usage::Lane<Arc<crate::usage::Client>>>,
     ) -> Result<Arc<Self>> {
         let fence = fence::independent(contexts)?;
-        let ordered = !compute && (host_predecessors || destinations.iter().any(Option::is_some));
+        let has_outputs = destinations.has_outputs();
         let terminal = if host_predecessors {
             Some(fence::independent(contexts)?)
         } else {
@@ -435,11 +495,12 @@ impl Completion {
             member,
             destinations,
         };
-        let output = if ordered {
-            HostOutput::Ordered(Publication::new(output, context.status().clone())?)
-        } else {
-            HostOutput::Immediate(output)
-        };
+        let output = HostOutput::new(
+            output,
+            context.status().clone(),
+            host_predecessors,
+            has_outputs,
+        )?;
         // M5 compute binds its timestamp pair in its physical queue's page at publication.
         let is_compute = compute;
         let compute = if compute && !context.is_m5() {
@@ -485,10 +546,7 @@ impl Completion {
             .map_or_else(|| self.fence(), |fence| Fence::from_fence(fence))
     }
     pub(crate) fn publication(&self) -> Option<Arc<Publication>> {
-        match &self.output {
-            HostOutput::Ordered(publication) => Some(publication.clone()),
-            HostOutput::Immediate(_) => None,
-        }
+        self.output.publication()
     }
     fn signal_terminal(&self, result: Result<[u64; 4]>) {
         if let Some(fence) = &self.terminal {

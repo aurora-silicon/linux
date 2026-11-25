@@ -899,10 +899,13 @@ static void iomfb_v27_sleep_start(struct apple_dcp *dcp,
 		 rpc->data, iomfb_v27_sleep_done, rpc);
 	dcp->push_out_prefill = NULL;
 	if ((rpc->a442 || rpc->a442_key) && !rpc->oob) {
-		static const struct dcp_method_entry a442 = {
-			.name = "v27_a442", .tag = { 'A', '4', '4', '2' },
-		};
+		struct dcp_method_entry a442 = { .name = "v27_a442" };
 		u8 in[92];
+
+		if (iomfb_v27_tag(dcp->v27_methods, "A442", a442.tag)) {
+			dev_warn_once(dcp->dev, "skipping v27 wake A442: unmapped method tag\n");
+			return;
+		}
 
 		memset(in, 0xaa, sizeof(in));
 		memset(in, 0, 16);
@@ -911,6 +914,9 @@ static void iomfb_v27_sleep_start(struct apple_dcp *dcp,
 		if (rpc->a442_key) {
 			memset(in + 80, 0, 12);
 			in[84] = 0x20;
+		} else if (iomfb_v27_methods_renumbered(dcp->v27_methods)) {
+			/* 27.2 reads the filler as an index count and a block size. */
+			memset(in + 16, 0, sizeof(in) - 16);
 		}
 		dcp_push(dcp, true, &a442, sizeof(in), 4100, in, iomfb_v27_a442_done, NULL);
 	}
@@ -988,6 +994,9 @@ int iomfb_v27_sleep_plain(struct apple_dcp *dcp, bool on)
 
 static int iomfb_v27_rpc(struct apple_dcp *dcp, bool a500, bool on, bool flags)
 {
+	struct dcp_method_entry method = {
+		.name = a500 ? "v27_sleep_500" : "v27_sleep_power",
+	};
 	struct iomfb_v27_sleep_rpc *rpc;
 	u8 args[IOMFB_V27_SLEEP_ARGS];
 	int ret;
@@ -998,6 +1007,9 @@ static int iomfb_v27_rpc(struct apple_dcp *dcp, bool a500, bool on, bool flags)
 	    (a500 || flags ? iomfb_v27_sleep_args(dcp, a500, args) :
 			     iomfb_v27_display_args(dcp, false, args)))
 		return -EOPNOTSUPP;
+	ret = iomfb_v27_tag(dcp->v27_methods, a500 ? "A500" : "A484", method.tag);
+	if (ret)
+		return ret;
 	rpc = kzalloc_obj(*rpc);
 	if (!rpc)
 		return -ENOMEM;
@@ -1006,10 +1018,7 @@ static int iomfb_v27_rpc(struct apple_dcp *dcp, bool a500, bool on, bool flags)
 	rpc->status = ~0U;
 	rpc->transaction.start = iomfb_v27_sleep_start;
 	rpc->transaction.release = iomfb_v27_sleep_release;
-	rpc->method = (struct dcp_method_entry) {
-		.name = a500 ? "v27_sleep_500" : "v27_sleep_power",
-	};
-	memcpy(rpc->method.tag, a500 ? "A500" : "A484", 4);
+	rpc->method = method;
 	/*
 	 * Off, before each DCP's and DCPEXT's sleep idle: A484 with the sleep's flags, then
 	 * A500's sleep form. On, after the wake: A500's wake form, then A484 with the flags.
@@ -1081,6 +1090,7 @@ int iomfb_v27_sleep_a115(struct apple_dcp *dcp, bool awake)
 static int iomfb_v27_call(struct apple_dcp *dcp, const char *tag, const void *in,
 			  u32 in_len, u32 out_len, bool inout, u8 a442_key)
 {
+	struct dcp_method_entry method = { .name = "v27_display_stage" };
 	struct iomfb_v27_sleep_rpc *rpc;
 	int ret;
 
@@ -1088,6 +1098,9 @@ static int iomfb_v27_call(struct apple_dcp *dcp, const char *tag, const void *in
 	    dcp->fw_compat != DCP_FIRMWARE_V_27_0 || in_len > sizeof(rpc->data) ||
 	    (inout && out_len > sizeof(rpc->data)))
 		return -EOPNOTSUPP;
+	ret = iomfb_v27_tag(dcp->v27_methods, tag, method.tag);
+	if (ret)
+		return ret;
 	rpc = kzalloc_obj(*rpc);
 	if (!rpc)
 		return -ENOMEM;
@@ -1097,8 +1110,7 @@ static int iomfb_v27_call(struct apple_dcp *dcp, const char *tag, const void *in
 	rpc->any_reply = true;
 	rpc->transaction.start = iomfb_v27_sleep_start;
 	rpc->transaction.release = iomfb_v27_sleep_release;
-	rpc->method = (struct dcp_method_entry) { .name = "v27_display_stage" };
-	memcpy(rpc->method.tag, tag, 4);
+	rpc->method = method;
 	rpc->input = in_len;
 	rpc->output = out_len;
 	rpc->inout = inout;
@@ -3215,14 +3227,14 @@ static bool dcp_hdr_output_supported(struct apple_dcp *dcp)
 }
 
 /*
- * A desktop 26.x or firmware 27 panel keeps its SDR link and shows PQ
- * content as EDR, given the panel's peak (see res_max_panel_brightness()).
+ * A desktop 26.x or firmware 27 panel with EDR headroom (dcp_panel_edr())
+ * keeps its SDR link and shows PQ content as EDR, given the panel's peak
+ * (see res_max_panel_brightness()).
  */
 static bool dcp_panel_edr_supported(struct apple_dcp *dcp)
 {
-	return (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
-		dcp->fw_compat == DCP_FIRMWARE_V_27_0) &&
-	       dcp_has_panel(dcp) && READ_ONCE(dcp->panel.peak_nits);
+	return dcp_fw_swap_has_edr(dcp) && dcp_has_panel(dcp) &&
+	       dcp->panel.edr_ceiling && READ_ONCE(dcp->panel.peak_nits);
 }
 
 /* The state of the connector on @crtc that @commit sets up. */
@@ -3696,6 +3708,22 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 	if (crtc_state->mode.hdisplay == 0 && crtc_state->mode.vdisplay == 0)
 		return 0;
 
+	/*
+	 * The DCP of an HDMI output plugs the display in only some time after
+	 * its link came up (dcp_poweron() connects it): a second or more after
+	 * a system resume, as the converter and the display wake up. A mode set
+	 * before that fails in the firmware ("setmode failed", the pipe not
+	 * enabled) after a 200 ms wait. Leave the mode unset instead: the
+	 * hotplug that connects the display finds the mode invalid with the
+	 * CRTC active, and sets it again (dcp_hotplug()).
+	 */
+	if (dcp->hdmi_hpd && !dcp_is_typec_output(dcp) && dcp->connector &&
+	    !READ_ONCE(dcp->connector->connected)) {
+		dev_dbg(dcp->dev, "HDMI display not plugged in yet: mode set deferred to its hotplug\n");
+		dcp_mode_set_valid(&dcp->mode_state, false);
+		return -EAGAIN;
+	}
+
 	dcp_crtc_color_request(dcp, crtc, commit, &dcp->color_req);
 	dcp->pq_requested = dcp->color_req.eotf == HDMI_EOTF_SMPTE_ST2084;
 	dcp->output_edr = dcp->pq_requested && dcp_panel_edr_supported(dcp) &&
@@ -3902,6 +3930,20 @@ iomfb_scanout_prepare_h17p(struct apple_dcp *dcp, struct drm_crtc *crtc,
 		if (new_state->crtc == crtc && new_state->visible && new_state->fb) {
 			scanout->fb[slot] = new_state->fb;
 			drm_framebuffer_get(new_state->fb);
+		}
+	}
+	if (dcp->boot_surface_pending && scanout->fb[0]) {
+		struct drm_plane_state *primary = crtc->primary ?
+			drm_atomic_get_new_plane_state(state, crtc->primary) : NULL;
+
+		/*
+		 * Match the explicit slot-zero clear in iomfb_flush() when the
+		 * primary plane is disabled; dcp->iomfb.scanout keeps its own
+		 * reference pinned until completion replaces it.
+		 */
+		if (!primary || primary->crtc != crtc || !primary->visible || !primary->fb) {
+			drm_framebuffer_put(scanout->fb[0]);
+			scanout->fb[0] = NULL;
 		}
 	}
 	if (dcp_is_ext26(dcp)) {
@@ -4568,6 +4610,13 @@ static void iomfb_start(struct apple_dcp *dcp)
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
 		break;
 	}
+}
+
+bool dcp_boot_surface_pending(struct platform_device *pdev)
+{
+	struct apple_dcp *dcp = pdev ? platform_get_drvdata(pdev) : NULL;
+
+	return dcp && READ_ONCE(dcp->boot_surface_pending);
 }
 
 bool dcp_is_initialized(struct platform_device *pdev)

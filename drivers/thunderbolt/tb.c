@@ -231,10 +231,6 @@ static int tb_enable_clx(struct tb_switch *sw)
 	const struct tb_tunnel *tunnel;
 	int ret;
 
-	/* Bi-directional HiFi does not support CL states. */
-	if (sw->tb->nhi->quirks & QUIRK_TMU_HIFI_BI)
-		return 0;
-
 	/*
 	 * Currently only enable CLx for the first link. This is enough
 	 * to allow the CPU to save energy at least on Intel hardware
@@ -249,6 +245,10 @@ static int tb_enable_clx(struct tb_switch *sw)
 		return 0;
 
 	if (tb_switch_depth(sw) != 1)
+		return 0;
+
+	/* Bi-directional HiFi (non-USB4 routers, see tb_enable_tmu()) does not support CL states. */
+	if ((sw->tb->nhi->quirks & QUIRK_TMU_HIFI_BI) && !tb_switch_is_usb4(sw))
 		return 0;
 
 	/*
@@ -367,7 +367,12 @@ static int tb_enable_tmu(struct tb_switch *sw)
 {
 	int ret;
 
-	if ((sw->tb->nhi->quirks & QUIRK_TMU_HIFI_BI) && tb_route(sw)) {
+	/*
+	 * Not for USB4 routers: a host router whose firmware runs its TMU applies a mode only
+	 * on the enhanced uni-directional path below, and a dock's DP OUT has no clock without it.
+	 */
+	if ((sw->tb->nhi->quirks & QUIRK_TMU_HIFI_BI) && tb_route(sw) &&
+	    !tb_switch_is_usb4(sw)) {
 		ret = tb_switch_clx_disable(sw);
 		if (ret < 0)
 			return ret;

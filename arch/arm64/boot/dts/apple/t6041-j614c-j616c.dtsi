@@ -2308,6 +2308,8 @@
 		operating-points-v2 = <&gpu_opp>;
 		apple,cs-opp = <&gpu_cs_opp>;
 		apple,afr-opp = <&gpu_afr_opp>;
+		/* Avoid a core power cycle between interactive submissions, then release. */
+		apple,idle-off-delay-ms = <16>;
 		apple,firmware-version = <26 5 2>;
 };
 
@@ -2562,6 +2564,7 @@
 #include "t6041-j616c-hdmi.dtsi"
 #include "t6041-j616c-usbc.dtsi"
 #include "t6041-j616c-usbc-dcpext2.dtsi"
+#include "t6041-j616c-usbc-dcpext3.dtsi"
 
 /*
  * Keyboard backlight, as on the M4 Pro boards: the ADT /arm-io/pwm0 has one

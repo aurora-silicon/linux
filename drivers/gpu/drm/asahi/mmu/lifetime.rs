@@ -201,24 +201,6 @@ impl Vm {
         Ok(())
     }
 
-    /// The graph identity whose pool mappings occupy `slot` in this
-    /// VM (0 when free). A second graph cannot install there until it leaves.
-    pub(crate) fn render_pool_owner(&self, slot: u8) -> u64 {
-        self.lifetime
-            .as_ref()
-            .and_then(|lifetime| {
-                lifetime
-                    .driver
-                    .lock()
-                    .as_ref()?
-                    .render
-                    .get(usize::from(slot))?
-                    .as_ref()
-                    .map(|pool| pool.id)
-            })
-            .unwrap_or(0)
-    }
-
     pub(crate) fn render_pool_tvb_blocks(&self, slot: u8, id: u64) -> Option<usize> {
         if id == 0 {
             return None;
@@ -704,9 +686,7 @@ impl Drop for VmJobGuard {
         // Healthy last-job release need not close mapping/job admission when
         // there is no accepted cleanup to drain. Keep every recovery, close,
         // in-progress commit and failed-cleanup path on the existing drain.
-        // M5 only: other G17 GPUs keep the drain on every last release.
-        if self.vm.m5
-            && !state.blocked
+        if !state.blocked
             && !state.quarantined
             && !state.draining
             && !state.closed

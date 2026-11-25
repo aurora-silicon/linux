@@ -273,15 +273,12 @@ pub(crate) struct CoreLayout {
 
 /// Where a G17 target's crash log buffers live.
 pub(crate) enum CrashBuffers {
-    /// One buffer per [`Role`] that the firmware requests at a fixed address of the kernel
-    /// lower root, mapped by the driver before the coprocessors start.
-    Fixed([FixedBuffer; 2]),
     /// The firmware places its crash log in its own data segment, the `fw-data` reserved
     /// region, and asks for it there by physical address.
     FirmwareData,
     /// As [`CrashBuffers::FirmwareData`] when the boot loader describes the data segment as
-    /// the `fw-data` region. A boot loader that does not gets the driver's own buffers, as
-    /// [`CrashBuffers::Fixed`], at the low bits of the physical address the firmware asks for;
+    /// the `fw-data` region. A boot loader that does not gets the driver's own buffers, one per
+    /// [`Role`], at the low bits of the physical address the firmware asks for;
     /// the firmware does not write its crash log there.
     FirmwareDataOrFixed([FixedBuffer; 2]),
 }
@@ -369,7 +366,7 @@ pub(crate) struct CrashLog {
 
 /// The CPU mapping of a crash log buffer.
 enum CrashLogMap {
-    /// The driver's buffer ([`CrashBuffers::Fixed`]).
+    /// The driver's buffer ([`CrashBuffers::FirmwareDataOrFixed`]).
     Object(shmem::VMapOwned<AsahiObject>),
     /// A buffer in the firmware's data segment ([`CrashBuffers::FirmwareData`]).
     FirmwareData(data_segment::DataSegmentLog),
@@ -565,7 +562,6 @@ impl Coprocessor {
     ) -> Result<Coprocessor> {
         let index = role as usize;
         let fixed = match &cfg.crash_buffers {
-            CrashBuffers::Fixed(buffers) => Some(buffers),
             CrashBuffers::FirmwareData => None,
             CrashBuffers::FirmwareDataOrFixed(buffers) => {
                 let described = data_segment::described(dev.as_ref().as_ref());
@@ -903,21 +899,10 @@ impl Firmware {
         power::release(self)
     }
 
-    /// Retry a temporarily unavailable transaction once under a registration
-    /// power hold. Other access errors propagate to the retained owner.
-    fn submit_m5_work(&mut self, submission: &fw::m5::queue::HardwareSubmission) -> Result {
-        match self.bridge.regs.submit_m5_work(submission) {
-            Err(error) if error == EAGAIN => {
-                self.acquire_registration_power()?;
-                self.bridge.regs.submit_m5_work(submission)
-            }
-            result => result,
-        }
-    }
-
     /// Both outer slots and their capacity are checked before any host-port
-    /// write. An EAGAIN retry drops the old views and revalidates them under a
-    /// power hold. After a successful transaction, publication is infallible.
+    /// write. The host command port needs no core power, and its transaction
+    /// fails only once the register mapping is gone; the error propagates.
+    /// After a successful transaction, publication is infallible.
     fn submit_m5_render_pair(
         &mut self,
         priority: u8,
@@ -928,36 +913,26 @@ impl Firmware {
         deferred: bool,
         cursors: Option<[u32; 3]>,
     ) -> Result<[u32; 2]> {
-        let mut commit_accounting = Some(commit_accounting);
-        let mut publish_inner = Some(publish_inner);
-        let mut cursors = cursors;
-        for attempt in 0..2 {
-            let pair = self.init.m5_work_pair(priority, &records[0], &records[1], cursors.take())?;
-            pair.prepare();
-            if let Some(commit) = commit_accounting.take() { commit()?; }
-            match self.bridge.regs.submit_m5_work(submission) {
-                Err(error) if error == EAGAIN && attempt == 0 => {
-                    drop(pair);
-                    self.acquire_registration_power()?;
-                }
-                Err(error) => return Err(error),
-                Ok(()) => {
-                    if let Some(publish) = publish_inner.take() { publish(); }
-                    return Ok(if deferred { pair.next() } else { pair.publish() });
-                }
-            }
-        }
-        Err(EAGAIN)
+        let pair = self.init.m5_work_pair(priority, &records[0], &records[1], cursors)?;
+        pair.prepare();
+        commit_accounting()?;
+        self.bridge.regs.submit_m5_work(submission)?;
+        publish_inner();
+        Ok(if deferred { pair.next() } else { pair.publish() })
     }
 
     /// Called at actual submission publication, not while a queued job is merely being built.
     fn note_submission(&mut self) -> Result {
+        let now = now_ns();
         self.primary.state.shared.note_submitter();
         self.port.note_gpu_activity();
         self.primary.state.shared.note_gpu_activity();
         self.effort.submit();
-        self.effort.note_waiters(now_ns(), fence::waiters());
+        self.effort.note_waiters(now, fence::waiters());
         self.effort.note_bound(self.primary.state.shared.feed.busy_run());
+        if self.effort.bound() {
+            self.port.lift_busy_if_below_top(now);
+        }
         self.apply_effort(power::FULL_EFFORT)
     }
 
@@ -976,6 +951,11 @@ impl Firmware {
         // must not look idle merely because it has no subsequent submission.
         if self.effort.applied() != 0 && thermal::requested() {
             self.governor.note_activity(now);
+        }
+        // Without the budget controller only the fan assistance runs (FanBoost::apply).
+        if !thermal::enabled() {
+            let busy = thermal::requested() && self.governor.recent_activity(now);
+            return (busy || fans, thermal::CpuAdvice::Release, busy);
         }
         let Ok(current) = self.init.m5_power_budget() else {
             return (false, thermal::CpuAdvice::Release, false);
@@ -1060,6 +1040,9 @@ impl Firmware {
         if self.effort.streaming() {
             let waiters = self.effort.note_waiters(now_ns, fence::waiters());
             let bound = self.effort.note_bound(self.primary.state.shared.feed.busy_run());
+            if self.effort.bound() {
+                self.port.lift_busy_if_below_top(now_ns);
+            }
             if waiters || bound {
                 self.apply_effort(power::FULL_EFFORT)?;
             }
@@ -1274,15 +1257,12 @@ struct Shared {
     /// step). Publishers without the device mutex set it too.
     governor_activity_ns: AtomicU64,
     /// The queue of all work that signals job fences: the event work, and every scheduler's
-    /// timeout work. Memory reclaim may wait on those fences, so it is reclaim-safe. On M5 it is
-    /// unbound, so the event work runs in the affinity pod (the L2) of the CPU that last
-    /// published work, not on whichever CPU the completion IRQ thread first ran on; on a two-die
-    /// part that keeps completion processing on the submitter's die. Elsewhere it is per-CPU and
-    /// high priority, as `system_highpri_wq`.
+    /// timeout work. Memory reclaim may wait on those fences, so it is reclaim-safe, and high
+    /// priority. The event work runs in the cluster of the CPU that last published work, not
+    /// wherever the completion IRQ thread first ran (see `queue_event_records`). On M5 it is
+    /// unbound, so a worker of that CPU's affinity pod (its L2) runs it; elsewhere it is per-CPU.
     events: Arc<workqueue::OwnedQueue>,
-    /// M5: the event work and the scheduler workers follow the submitting CPU.
-    follows_submitter: bool,
-    /// M5: the CPU of the last publication, `u32::MAX` before the first.
+    /// The CPU of the last publication, `u32::MAX` before the first.
     submitter: AtomicU32,
     #[pin]
     grow: Work<Shared, GROW_WORK>,
@@ -1460,10 +1440,14 @@ impl Shared {
         if !self.submission_enabled {
             return;
         }
-        // Already queued if this fails, which is just as good.
+        // Here when the submitter shares this CPU's cluster: waking a worker elsewhere would only
+        // add a wakeup to every completion. Already queued if this fails, which is just as good.
+        let here = kernel::cpu::CpuId::current();
         let _ = match self.submitter() {
-            Some(cpu) => self.events.enqueue_on::<Arc<Shared>, EVENT_WORK>(cpu, self.clone()),
-            None => self.events.enqueue::<Arc<Shared>, EVENT_WORK>(self.clone()),
+            Some(cpu) if !kernel::cpumask::Cpumask::cluster_of(here).test(cpu) => {
+                self.events.enqueue_on::<Arc<Shared>, EVENT_WORK>(cpu, self.clone())
+            }
+            _ => self.events.enqueue::<Arc<Shared>, EVENT_WORK>(self.clone()),
         };
     }
 
@@ -1472,15 +1456,12 @@ impl Shared {
         self.events.clone()
     }
 
-    /// Whether the event work and the scheduler workers follow the submitting CPU (M5).
-    pub(super) fn follows_submitter(&self) -> bool {
-        self.follows_submitter
-    }
-
-    /// Records the publishing CPU for the event work's placement (M5).
+    /// Records the publishing CPU for the event work's placement.
     fn note_submitter(&self) {
-        if self.follows_submitter {
-            self.submitter.store(kernel::cpu::CpuId::current().as_u32(), Ordering::Relaxed);
+        let cpu = kernel::cpu::CpuId::current().as_u32();
+        // The completion side reads this line; write it only when the submitter moves.
+        if self.submitter.load(Ordering::Relaxed) != cpu {
+            self.submitter.store(cpu, Ordering::Relaxed);
         }
     }
 
@@ -1663,6 +1644,16 @@ impl Gpu {
         }
         let m5 = cfg.profile.is_m5();
         if m5 {
+            // The M5 graph builds the InitData layouts the firmware build names. A build that
+            // names none is refused here, before anything is written to the GPU.
+            if variant.m5_layouts.is_none() {
+                dev_err!(
+                    dev.as_ref(),
+                    "No M5 InitData layouts for this GPU firmware build ({:?})\n",
+                    variant.m5_layouts
+                );
+                return Err(ENODEV);
+            }
             let board = cfg.m5.ok_or(EINVAL)?;
             J813_FORMS.store(board.j813_forms(), core::sync::atomic::Ordering::Relaxed);
             // Hold the J813's GFX power domain for the session, as the G15 and G16 paths do
@@ -1815,7 +1806,6 @@ impl Gpu {
                 governor_armed: AtomicBool::new(false),
                 governor_activity_ns: AtomicU64::new(0),
                 events,
-                follows_submitter: m5,
                 submitter: AtomicU32::new(u32::MAX),
                 grow <- new_work!("g17::Shared::grow"),
                 reclaim_work <- new_work!("g17::Shared::reclaim_work"),
@@ -1909,11 +1899,15 @@ impl Gpu {
         let others = builds
             .iter()
             .filter(|build| Some(build.os_version) != version);
+        // Measure the loaded TEXT once and try each build against it. A build that is not this
+        // image is not an error while another one may be: only when none is, say what was
+        // measured and what is supported.
+        let mut measured = Self::measure_text(dev)?;
         let mut identified = None;
         for build in Iterator::chain(preferred, others) {
-            if Self::identify_image(dev, build).is_err() {
+            let Some(image) = measured.find(build.images) else {
                 continue;
-            }
+            };
             let admits = build.config.is_none_or(|config| {
                 config
                     .core_layout
@@ -1921,14 +1915,31 @@ impl Gpu {
                     .is_none_or(|measured| measured == cores)
             });
             if admits {
-                identified = Some(build);
+                identified = Some((build, image));
                 break;
             }
-            identified.get_or_insert(build);
+            identified.get_or_insert((build, image));
         }
-        if let Some(build) = identified {
+        if let Some((build, image)) = identified {
+            dev_info!(dev.as_ref(), "GPU firmware build: {}\n", image.name);
             dev_info!(dev.as_ref(), "GPU firmware: {}\n", build.name);
             return Ok((build.variant, build.config));
+        }
+        dev_err!(
+            dev.as_ref(),
+            "unsupported GPU firmware build: {}\n",
+            measured.identity(builds.iter().flat_map(|build| build.images))
+        );
+        // Builds that differ only in their core layout share an image: list each image once.
+        // Compare by name and digest; the address of a `const`-promoted entry is not unique.
+        let images = || builds.iter().flat_map(|build| build.images);
+        for (i, image) in images().enumerate() {
+            if !images()
+                .take(i)
+                .any(|seen| (seen.name, seen.text_sha256) == (image.name, image.text_sha256))
+            {
+                dev_err!(dev.as_ref(), "supported: {}\n", image.name);
+            }
         }
         dev_err!(
             dev.as_ref(),
@@ -1938,19 +1949,33 @@ impl Gpu {
         Err(ENODEV)
     }
 
-    /// Checks that the loaded TEXT (the `fw-text` region) is one of `build`'s images, with the DATA size
-    /// of the `fw-data` region. The version property is only a selection hint.
-    fn identify_image(dev: &AsahiDrmDevice, build: &'static fw::variant::Build) -> Result {
-        let node = dev.as_ref().as_ref().of_node().ok_or(EINVAL)?;
-        let text = node.reserved_mem_region_to_resource_byname(c_str!("fw-text"))?;
-        let data = node.reserved_mem_region_to_resource_byname(c_str!("fw-data"))?;
-        let start = text.start();
-        let end = start.checked_add(text.size()).ok_or(EINVAL)?;
-        crate::fwid::identify(dev.as_ref().as_ref(), start..end, data.size(), build.images)
-            .inspect_err(|e| {
-                dev_err!(dev.as_ref(), "GPU firmware image not admitted: {:?}\n", e)
-            })?;
-        Ok(())
+    /// Measures the loaded TEXT (the `fw-text` region), with the DATA size of the `fw-data`
+    /// region, for [`Self::firmware_variant`] to identify among the builds. The version
+    /// property is only a selection hint.
+    fn measure_text(dev: &AsahiDrmDevice) -> Result<crate::fwid::Measured> {
+        let measure = || {
+            let node = dev.as_ref().as_ref().of_node().ok_or(EINVAL)?;
+            let text = node.reserved_mem_region_to_resource_byname(c_str!("fw-text"))?;
+            let data = node.reserved_mem_region_to_resource_byname(c_str!("fw-data"))?;
+            let start = text.start();
+            let end = start.checked_add(text.size()).ok_or(EINVAL)?;
+            crate::fwid::measure(start..end, data.size())
+        };
+        measure().inspect_err(|e| {
+            if *e == EAGAIN {
+                dev_err!(
+                    dev.as_ref(),
+                    "GPU firmware TEXT changed while it was measured\n"
+                );
+            } else {
+                // A missing or bad fw-text/fw-data region: a DT or boot loader mismatch.
+                dev_err!(
+                    dev.as_ref(),
+                    "GPU firmware image not measured (fw-text/fw-data): {:?}\n",
+                    e
+                );
+            }
+        })
     }
 
     /// The macOS version the boot loader reports for the boot firmware that loaded the GPU
@@ -2168,7 +2193,7 @@ impl Gpu {
             .inspect_err(at("root adoption"))?;
         session
             .init
-            .build_m5(dev, &session.uat, id, board)
+            .build_m5(dev, &session.uat, id, board, shared.variant)
             .inspect_err(at("M5 graph"))?;
         session
             .init
@@ -2496,6 +2521,10 @@ impl Gpu {
 }
 
 impl gpu::Gpu for Gpu {
+    fn max_cmdbuf_size(&self) -> usize {
+        command::MAX_STREAM
+    }
+
     fn syncobj_wait_hint(&self) -> Option<(u32, u32)> {
         self.shared.feed.wait_hint()
     }

@@ -94,6 +94,7 @@ def main():
         ('boot', 'syslog-policy', boot.syslog, ((),), ()),
         ('boot', 't6041-v27-admission', boot.t6041_v27_admission, ((),), ()),
         ('boot', 't8122-dcpext-v27-admission', boot.t8122_dcpext_v27_admission, ((),), ('-Wno-unused-function',)),
+        ('boot', 'v27-tag-translation', boot.v27_tag_translation, ((),), ()),
         ('edid', 'dpavserv-start', edid.startup, ((),), ()),
         ('edid', 'service-rebind', edid.rebind, ((),), ()),
         ('edid', 'provider-admission', edid.admission, ((),), ()),
@@ -177,6 +178,11 @@ def main():
                     # The T6050 PMP registry-v2 buffer shares endpoint 7.
                     prefix += ('#define apple_rtkit_pmp_aux_rx(...) '
                                'assert(!"The PMP auxiliary buffer is outside this ordered-display fixture")\n')
+                    # A display co-processor doesn't take CoreAnalytics buffers.
+                    prefix += '#define apple_rtkit_ep7_served(...) false\n'
+                    # Nor does it receive messages for endpoints it doesn't serve.
+                    prefix += ('#define apple_rtkit_unserved_ep_msg(...) '
+                               'assert(!"No unserved endpoint is in this ordered-display fixture")\n')
                 unit = prefix + unit
             if unit is not None:
                 result['translation_unit_sha256'] = run_unit(name, unit, output, cases, includes if name == 'service-rebind' else (), flags)
