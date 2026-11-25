@@ -277,7 +277,6 @@ static int avd_v4l2_init(struct avd_dev *avd)
 
 	avd->mdev.dev = avd->dev;
 	strscpy(avd->mdev.model, "avd", sizeof(avd->mdev.model));
-	strscpy(avd->mdev.bus_info, "platform:avd", sizeof(avd->mdev.bus_info));
 	media_device_init(&avd->mdev);
 	avd->mdev.ops = &avd_media_ops;
 	avd->v4l2_dev.mdev = &avd->mdev;
@@ -465,7 +464,7 @@ static const struct avd_variant avd_t8140_variant = {
 	.submit_offset = 0x40,
 	.submit_queue_max_offset = 0x44,
 	.submit_queue_status_offset = 0x7c,
-	.quirks = AVD_QUIRK_HEVC_V5_HEADER | AVD_QUIRK_V5_QUEUE_PACING,
+	.quirks = AVD_QUIRK_HEVC_V5_HEADER,
 };
 
 static const struct avd_variant avd_t8132_variant = {
@@ -738,6 +737,12 @@ static int avd_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
+	/*
+	 * Neither width has a named source: the LSR encodings would allow 39
+	 * bits (compressed-plane addresses, addr >> 7 in one word) and 42 is
+	 * unexplained for the Apple backend. See
+	 * https://github.com/aurora-silicon/linux/issues/2451.
+	 */
 	ret = dma_set_mask_and_coherent(avd->dev,
 			DMA_BIT_MASK(avd_backend_is_apple(avd) ? 42 :
 			     (avd->variant->quirks & AVD_QUIRK_LSR) ? 38 : 64));

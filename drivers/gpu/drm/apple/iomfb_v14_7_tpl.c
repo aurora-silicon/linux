@@ -124,7 +124,7 @@ void DCP_FW_NAME(iomfb_start)(struct apple_dcp *dcp)
 {
 	dcp->cb_handlers = cb_handlers;
 
-	dcp_start_signal(dcp, false, dcp_started, NULL);
+	iomfb_template_start(dcp);
 }
 
 #undef DCP_FW_VER

@@ -68,9 +68,42 @@ static void dcp_firmware_27_method_admission(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, missing, 1U);
 }
 
+/*
+ * Firmware 27 provider clocks on a T602x display processor: the 27.2 ADT
+ * lists none (an empty /arm-io/disp0 and dispext<n> clock-ids), and the
+ * node keeps its display clock.
+ */
+static void dcp_firmware_27_empty_clock_table(struct kunit *test)
+{
+	static const char primary[] = "apple,t6020-dcp\0apple,dcp";
+	__be32 display = cpu_to_be32(1);
+	struct property properties[] = {
+		{ .name = "apple,clock-ids", .length = 0, .value = &display,
+		  .next = &properties[1] },
+		{ .name = "clocks", .length = sizeof(display), .value = &display,
+		  .next = &properties[2] },
+		{ .name = "compatible", .length = sizeof(primary), .value = (void *)primary },
+	};
+	struct device_node node = { .properties = properties };
+	struct device dev = { .init_name = "dcp-firmware-test", .of_node = &node };
+	struct apple_dcp *dcp = kunit_kzalloc(test, sizeof(*dcp), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, dcp);
+	dcp->dev = &dev;
+	dcp->num_firmware_clocks = 3;
+	KUNIT_EXPECT_EQ(test, dcp_firmware_clocks_v27(dcp), 0);
+	KUNIT_EXPECT_EQ(test, dcp->num_firmware_clocks, 0U);
+	KUNIT_EXPECT_NULL(test, dcp->firmware_clocks);
+
+	/* Without the table the firmware's clocks are unknown: refused. */
+	properties[0].name = "apple,unrelated";
+	KUNIT_EXPECT_EQ(test, dcp_firmware_clocks_v27(dcp), -EINVAL);
+}
+
 static struct kunit_case dcp_firmware_cases[] = {
 	KUNIT_CASE(dcp_firmware_13_5_compat),
 	KUNIT_CASE(dcp_firmware_27_method_admission),
+	KUNIT_CASE(dcp_firmware_27_empty_clock_table),
 	{}
 };
 

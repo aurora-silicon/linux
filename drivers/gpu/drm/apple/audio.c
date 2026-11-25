@@ -67,6 +67,9 @@
 #define DCPAUD_HELD_PERIOD_MAX_US	50000
 
 struct dcp_audio {
+	/* The display output the processor drives, from its device tree node */
+	const char *port_name;
+	const char *port_id;
 	struct device *dev;
 	struct device *dcp_dev;
 	struct device *dma_dev;
@@ -410,6 +413,9 @@ static int dcp_pcm_open(struct snd_pcm_substream *substream)
 		.flags = SND_DMAENGINE_PCM_DAI_FLAG_PACK,
 	};
 	struct snd_pcm_hardware hw;
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+	u64 gen;
+#endif
 	int ret;
 
 	mutex_lock(&dcpaud->data_lock);
@@ -428,7 +434,48 @@ static int dcp_pcm_open(struct snd_pcm_substream *substream)
 		goto refine;
 	}
 
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+	gen = dcp_audiosrv_instance(dcpaud->dcp_dev);
+#endif
 	ret = dcpaud_read_remote_info(dcpaud);
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+	/*
+	 * The firmware announces the audio service again while the display
+	 * link is set up again (a modeset, at boot), and refuses calls to the
+	 * instance it is replacing meanwhile. Userspace probes the PCM once
+	 * and drops an output whose open fails, so read from the successor.
+	 * The sink is taken as the successor reports it. A refusal is -EINVAL
+	 * (a non-zero retcode); a missing service, a timeout or no memory is
+	 * not waited out.
+	 */
+	if (ret == -EINVAL && dcp_audiosrv_replaced(dcpaud->dcp_dev, gen)) {
+		dev_dbg(dcpaud->dev, "sink info read failed on a replaced instance (%d), retrying\n",
+			ret);
+		mutex_lock(&dcpaud->data_lock);
+		dcpaud->open_unplugged = !dcpaud->connected;
+		dcpaud->open_cookie = dcpaud->connection_cookie;
+		mutex_unlock(&dcpaud->data_lock);
+		if (dcpaud->open_unplugged) {
+			hw = dcp_pcm_hw_unplugged;
+			goto refine;
+		}
+		ret = dcpaud_read_remote_info(dcpaud);
+	}
+#endif
+	if (ret == -ENODEV) {
+		/*
+		 * No instance answers: the service went and its unplug is on the
+		 * way. Open as unplugged, as before the plug, and with a cookie
+		 * no connection has, so that no stream op of this open takes the
+		 * sink as connected.
+		 */
+		mutex_lock(&dcpaud->data_lock);
+		dcpaud->open_unplugged = true;
+		dcpaud->open_cookie = dcpaud->connection_cookie - 1;
+		mutex_unlock(&dcpaud->data_lock);
+		hw = dcp_pcm_hw_unplugged;
+		goto refine;
+	}
 	if (ret < 0)
 		return ret;
 
@@ -1736,13 +1783,32 @@ static int dcpaud_create_jack(struct dcp_audio *dcpaud)
 			    &dcpaud->jack, true, false);
 }
 
+/*
+ * Names the card after the output its processor drives, as the device tree
+ * describes it, so that each display's card is told apart: "Apple HDMI"
+ * (card id HDMI), "Apple USB-C DisplayPort" (USBC), "Apple DisplayPort".
+ * ALSA makes a repeated id unique.
+ */
+static void dcpaud_port_names(struct dcp_audio *dcpaud, struct device_node *dcp_node)
+{
+	dcpaud->port_name = "DisplayPort";
+	dcpaud->port_id = "DisplayPort";
+	if (of_property_match_string(dcp_node, "apple,connector-type", "HDMI-A") >= 0) {
+		dcpaud->port_name = "HDMI";
+		dcpaud->port_id = "HDMI";
+	} else if (of_property_match_string(dcp_node, "apple,connector-type", "USB-C") >= 0) {
+		dcpaud->port_name = "USB-C DisplayPort";
+		dcpaud->port_id = "USBC";
+	}
+}
+
 static void dcpaud_set_card_names(struct dcp_audio *dcpaud)
 {
 	struct snd_card *card = dcpaud->card;
 
 	strscpy(card->driver, "apple_dcp", sizeof(card->driver));
-	strscpy(card->longname, "Apple DisplayPort", sizeof(card->longname));
-	strscpy(card->shortname, "Apple DisplayPort", sizeof(card->shortname));
+	snprintf(card->shortname, sizeof(card->shortname), "Apple %s", dcpaud->port_name);
+	snprintf(card->longname, sizeof(card->longname), "Apple %s audio", dcpaud->port_name);
 }
 
 #ifdef CONFIG_SND_DEBUG
@@ -1780,7 +1846,7 @@ static int dcpaud_init_snd_card(struct dcp_audio *dcpaud)
 		return -ENODEV;
 
 
-	ret = snd_card_new(dcpaud->dev, DCPAUD_CARD_SLOTS, SNDRV_DEFAULT_STR1,
+	ret = snd_card_new(dcpaud->dev, DCPAUD_CARD_SLOTS, dcpaud->port_id,
 			   THIS_MODULE, 0, &dcpaud->card);
 	if (ret)
 		return ret;
@@ -1830,6 +1896,53 @@ void dcpaud_connect(struct platform_device *pdev, bool connected)
 	dcpaud_report_hotplug(dcpaud, connected, eld);
 }
 
+/*
+ * The connected sink's ELD, built again from the connector's EDID. The ELD is
+ * built as the audio service connects, which on a Type-C processor can come
+ * before its route is up and the display's EDID is read (at boot, and as the
+ * service is published again after a sleep): the card would keep the basic
+ * fallback without the monitor's name. A card that is not connected stays so.
+ * Returns whether the stored ELD changed.
+ */
+static bool dcpaud_eld_update(struct dcp_audio *dcpaud, const u8 *eld)
+{
+	bool changed;
+
+	mutex_lock(&dcpaud->data_lock);
+	changed = dcpaud->connected && memcmp(dcpaud->eld, eld, DCPAUD_ELD_SIZE);
+	if (changed)
+		memcpy(dcpaud->eld, eld, DCPAUD_ELD_SIZE);
+	mutex_unlock(&dcpaud->data_lock);
+	return changed;
+}
+
+/*
+ * Only an ELD built from an EDID replaces the stored one. The EDID code also
+ * ends here after clearing a stale EDID (an old route or service) or while a
+ * read is still to be retried; the card then keeps what it has rather than
+ * falling back to basic stereo without the monitor's name.
+ */
+static bool dcpaud_refresh_eld_from_edid(struct dcp_audio *dcpaud)
+{
+	u8 eld[DCPAUD_ELD_SIZE];
+
+	if (dcp_audio_sink_eld(dcpaud->dcp_dev, eld, DCPAUD_ELD_SIZE) ||
+	    !eld[DRM_ELD_VER])
+		return false;
+	dcpaud_build_eld(dcpaud, eld);
+	return dcpaud_eld_update(dcpaud, eld);
+}
+
+void dcpaud_refresh_eld(struct platform_device *pdev)
+{
+	struct dcp_audio *dcpaud = platform_get_drvdata(pdev);
+
+	if (!dcpaud || !dcpaud->dcp_dev || !dcpaud->card)
+		return;
+	if (dcpaud_refresh_eld_from_edid(dcpaud))
+		snd_ctl_notify(dcpaud->card, SNDRV_CTL_EVENT_MASK_VALUE, &dcpaud->eld_ctl->id);
+}
+
 void dcpaud_disconnect(struct platform_device *pdev)
 {
 	struct dcp_audio *dcpaud;
@@ -1874,6 +1987,7 @@ static int dcpaud_comp_bind(struct device *dev, struct device *main, void *data)
 		dev_info(dev, "No audio support\n");
 		goto rpm_put;
 	}
+	dcpaud_port_names(dcpaud, dcp_node);
 
 	index = of_property_match_string(dev->of_node, "dma-names", "tx");
 	if (index < 0) {
@@ -2072,6 +2186,39 @@ static __maybe_unused int dcpaud_system_suspend(struct device *dev)
 }
 
 /*
+ * The DCP's firmware drives this block. A DCP that keeps its coprocessor
+ * running through a sleep keeps its own power domains for it, and this
+ * block's domain must stay with them: cutting it at noirq under running DCP
+ * firmware resets the machine. A DCP that stops its firmware for the sleep
+ * needs nothing held here, so the domain goes down as before. A DCP device
+ * without a driver may still run firmware that a boot stage or an earlier
+ * bind left running, so its block is kept too. Every device's .suspend has
+ * run before this late phase, so the DCP's choice is known
+ * (dcp_sleep_keeps_firmware()).
+ */
+static __maybe_unused int dcpaud_suspend_late(struct device *dev)
+{
+	struct device_node *endpoint, *dcp_node = NULL;
+	struct platform_device *dcp_pdev = NULL;
+
+	endpoint = of_graph_get_endpoint_by_regs(dev->of_node, 0, 0);
+	if (endpoint) {
+		dcp_node = of_graph_get_remote_port_parent(endpoint);
+		of_node_put(endpoint);
+	}
+	if (dcp_node && of_device_is_available(dcp_node))
+		dcp_pdev = of_find_device_by_node(dcp_node);
+	of_node_put(dcp_node);
+	if (dcp_pdev) {
+		if (dcp_sleep_keeps_firmware(&dcp_pdev->dev))
+			device_set_wakeup_path(dev);
+		put_device(&dcp_pdev->dev);
+	}
+
+	return pm_runtime_force_suspend(dev);
+}
+
+/*
  * Runtime PM stops in the late phase and comes back in the early one, so it
  * works through every device's .suspend and .resume. The display resumes
  * before this device and holds its link again in its own resume, before
@@ -2083,7 +2230,7 @@ static __maybe_unused int dcpaud_system_suspend(struct device *dev)
 static const struct dev_pm_ops dcpaud_pm_ops = {
 	.prepare = pm_sleep_ptr(dcpaud_pm_prepare),
 	SYSTEM_SLEEP_PM_OPS(dcpaud_system_suspend, NULL)
-	LATE_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
+	LATE_SYSTEM_SLEEP_PM_OPS(dcpaud_suspend_late, pm_runtime_force_resume)
 	RUNTIME_PM_OPS(dcpaud_suspend, dcpaud_resume, NULL)
 };
 
