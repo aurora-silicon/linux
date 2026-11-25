@@ -608,6 +608,11 @@ struct apple_sleep_ops {
 	void (*cpu_down)(struct apple_sleep *s, u64 mpidr);
 	/* Optional: past the point of no return, between ANS's stop and SIO's */
 	void (*after_ans)(struct apple_sleep *s);
+	/*
+	 * Optional: past the point of no return, between the stops of the coprocessors that stop
+	 * early (SIO) and the rest's. A SoC with it stops them in passes, as T6050 does.
+	 */
+	void (*after_early)(struct apple_sleep *s);
 
 	/* Pure bounded planning only; no register read/write or entry authorization. */
 	int (*plan_complex_request)(u32 observed, u32 *request);
@@ -1777,11 +1782,11 @@ static void apple_sleep_coproc_stop(struct apple_sleep *s, struct apple_sleep_co
 static void apple_sleep_coprocs_stop(struct apple_sleep *s, bool first)
 {
 	/*
-	 * Slot order, except that T6050's second pass stops ANS before the rest, as macOS
-	 * does on the M5.
+	 * Slot order, except that the second pass of T6050, or of a SoC with an after_early step,
+	 * stops ANS, then the early ones, then the rest, as macOS does on the M5 and on T6030.
 	 * The ANS owner registers at its .suspend, after the PMP's probe-time slot.
 	 */
-	bool ans_first = s->soc->regions && !first;
+	bool ans_first = (s->soc->regions || s->soc->ops->after_early) && !first;
 	int pass, i;
 
 	if (first)
@@ -1790,6 +1795,8 @@ static void apple_sleep_coprocs_stop(struct apple_sleep *s, bool first)
 	for (pass = ans_first ? 0 : 2; pass < 3; pass++) {
 		if (ans_first && pass == 1 && s->soc->ops->after_ans)
 			s->soc->ops->after_ans(s);
+		if (ans_first && pass == 2 && s->soc->ops->after_early)
+			s->soc->ops->after_early(s);
 		for (i = 0; i < SLEEP_COPROCS; i++) {
 			struct apple_sleep_coproc *c = &apple_sleep_coprocs[i];
 
