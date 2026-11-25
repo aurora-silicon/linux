@@ -89,6 +89,8 @@ struct centauri_t6050_wifi {
 	size_t reply_capacity, reply_size;
 	bool stopping, command_failed;
 	bool tx_paused, transport_paused, host_sleep_sent, transport_sleep_sent;
+	bool regulatory_deferred;
+	u8 country_deferred[3];
 	bool host_events_fallback_logged;
 	bool scan_abort, connect_abort;
 	u8 scan_sequence;
@@ -763,7 +765,7 @@ static int command_reply(struct centauri_t6050_wifi *wifi, u32 id,
 			 const void *payload, size_t size, void *reply,
 			 size_t *reply_size, bool *submitted)
 {
-	u16 slot = wifi->command_head, sequence = ++wifi->sequence;
+	u16 slot = wifi->command_head, sequence;
 	int ret;
 	u32 stage;
 	u8 *packet, *descriptor;
@@ -771,6 +773,10 @@ static int command_reply(struct centauri_t6050_wifi *wifi, u32 id,
 
 	if (submitted)
 		*submitted = false;
+	/* The PCI link can go down after the host-sleep command. */
+	if (wifi->host_sleep_sent)
+		return -EHOSTDOWN;
+	sequence = ++wifi->sequence;
 	if (wifi->command_failed)
 		return -EIO;
 	if (size > BUFFER_SIZE - 24)
@@ -971,6 +977,18 @@ static void channels_apply(struct centauri_t6050_wifi *wifi)
 	dev_info(&wifi->control->pdev->dev,
 		 "Wi-Fi firmware channels: 2.4 GHz %u, 5 GHz %u, 6 GHz %u (%u entries)\n",
 		 counted[0], counted[1], counted[2], list[0]);
+}
+
+static void country_set(struct centauri_t6050_wifi *wifi, const u8 country[3])
+{
+	int ret = command(wifi, 9, country, 3);
+
+	if (ret)
+		dev_err(&wifi->control->pdev->dev,
+			"firmware country update failed: %d\n", ret);
+	else
+		firmware_report(wifi, 19, wifi->hw_channels,
+				&wifi->hw_channels_blob);
 }
 
 /*
@@ -2293,6 +2311,7 @@ static int alpha_resume_locked(struct centauri_t6050_wifi *wifi)
 {
 	int ret;
 
+	ASSERT_RTNL();
 	lockdep_assert_held(&wifi->lock);
 	if (wifi->transport_sleep_sent) {
 		ret = alpha_transport_state(wifi, false);
@@ -2301,10 +2320,22 @@ static int alpha_resume_locked(struct centauri_t6050_wifi *wifi)
 		wifi->transport_sleep_sent = false;
 	}
 	if (wifi->host_sleep_sent) {
-		ret = alpha_host_power(wifi, false);
-		if (ret)
-			return ret;
+		/* Under the mutex, only the wake command can pass the gate. */
 		wifi->host_sleep_sent = false;
+		ret = alpha_host_power(wifi, false);
+		if (ret) {
+			wifi->host_sleep_sent = true;
+			return ret;
+		}
+	}
+	if (wifi->regulatory_deferred) {
+		if (wifi->configured && wifi->country_deferred[0])
+			country_set(wifi, wifi->country_deferred);
+		memset(wifi->country_deferred, 0, sizeof(wifi->country_deferred));
+		wifi->regulatory_deferred = false;
+		channels_apply(wifi);
+		if (wifi->command_failed)
+			return -EIO;
 	}
 	WRITE_ONCE(wifi->transport_paused, false);
 	WRITE_ONCE(wifi->tx_paused, false);
@@ -2366,11 +2397,14 @@ int centauri_t6050_wifi_suspend(struct centauri_t6050 *c)
 		synchronize_irq(pci_irq_vector(c->alpha_irqs.pdev, i));
 	cancel_work_sync(&wifi->link_work);
 
+	/* Match the regulatory notifier's lock order for suspend unwind. */
+	rtnl_lock();
 	mutex_lock(&wifi->lock);
 	ret = alpha_transport_state(wifi, true);
 	if (!ret) {
 		wifi->transport_sleep_sent = true;
 		mutex_unlock(&wifi->lock);
+		rtnl_unlock();
 		return 0;
 	}
 	if (alpha_resume_locked(wifi)) {
@@ -2380,6 +2414,7 @@ int centauri_t6050_wifi_suspend(struct centauri_t6050 *c)
 		wifi->command_failed = true;
 	}
 	mutex_unlock(&wifi->lock);
+	rtnl_unlock();
 	return ret;
 
 out_unpause:
@@ -2399,9 +2434,11 @@ int centauri_t6050_wifi_resume(struct centauri_t6050 *c)
 
 	if (!wifi)
 		return 0;
+	rtnl_lock();
 	mutex_lock(&wifi->lock);
 	ret = alpha_resume_locked(wifi);
 	mutex_unlock(&wifi->lock);
+	rtnl_unlock();
 	return ret;
 }
 
@@ -2458,20 +2495,19 @@ static void wifi_regulatory(struct wiphy *wiphy,
 	u8 country[3] = { request->alpha2[0], request->alpha2[1], 1 };
 	bool named = country[0] >= 'A' && country[0] <= 'Z' &&
 		     country[1] >= 'A' && country[1] <= 'Z';
-	int ret;
 
 	mutex_lock(&wifi->lock);
-	if (wifi->configured && named) {
-		ret = command(wifi, 9, country, sizeof(country));
-		if (ret)
-			dev_err(&wifi->control->pdev->dev,
-				"firmware country update failed: %d\n", ret);
-		else
-			firmware_report(wifi, 19, wifi->hw_channels,
-					&wifi->hw_channels_blob);
+	if (wifi->host_sleep_sent) {
+		/* Keep the last named country across cfg80211's world updates. */
+		if (named)
+			memcpy(wifi->country_deferred, country, sizeof(country));
+		wifi->regulatory_deferred = true;
+	} else {
+		if (wifi->configured && named)
+			country_set(wifi, country);
+		/* cfg80211 has just recomputed the channel flags. */
+		channels_apply(wifi);
 	}
-	/* cfg80211 has just recomputed the channel flags from its own rules. */
-	channels_apply(wifi);
 	mutex_unlock(&wifi->lock);
 }
 
