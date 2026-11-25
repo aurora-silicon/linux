@@ -30,6 +30,7 @@ properties:
     oneOf:
       - const: apple,t8103-usb4-acio
       - const: apple,t8142-usb4-acio
+      - const: apple,t8152-usb4-acio
       - const: apple,t6040-usb4-acio
       - const: apple,t6050-usb4-acio
       - items:
@@ -69,6 +70,14 @@ properties:
           - const: rc
           - const: sram
           - const: cpu
+      - description:
+          T8152, whose router CPU is started by a reconfiguration request
+          through its mailbox and has no window of its own
+        items:
+          - const: rc
+          - const: sram
+          - const: pcie-adapter
+          - const: router-ap-fw
 
   mboxes:
     maxItems: 1
@@ -185,8 +194,12 @@ properties:
     const: 1
 
   ranges:
-    maxItems: 1
-    description: Single 16 MiB MMIO window containing all child registers
+    minItems: 1
+    maxItems: 2
+    description:
+      16 MiB MMIO window containing the child registers. On T8152 a second
+      range maps the shared Gen3 DART TLB invalidation aperture for the
+      router's DART.
 
   nonposted-mmio: true
 
@@ -254,6 +267,7 @@ allOf:
               - apple,t6040-usb4-acio
               - apple,t8132-usb4-acio
               - apple,t8142-usb4-acio
+              - apple,t8152-usb4-acio
     then:
       properties:
         reg:
@@ -263,12 +277,23 @@ allOf:
   - if:
       properties:
         compatible:
+          not:
+            contains:
+              const: apple,t8152-usb4-acio
+    then:
+      properties:
+        ranges:
+          maxItems: 1
+  - if:
+      properties:
+        compatible:
           contains:
             enum:
               - apple,t6040-usb4-acio
               - apple,t6050-usb4-acio
               - apple,t8132-usb4-acio
               - apple,t8142-usb4-acio
+              - apple,t8152-usb4-acio
     then:
       properties:
         pinctrl-names:
@@ -319,6 +344,7 @@ allOf:
               enum:
                 - apple,t6050-usb4-acio
                 - apple,t8142-usb4-acio
+                - apple,t8152-usb4-acio
     then:
       properties:
         apple,tunable-router-ap-fw: false

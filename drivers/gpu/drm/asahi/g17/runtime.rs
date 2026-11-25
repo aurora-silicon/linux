@@ -2302,6 +2302,10 @@ impl DeferredBatch {
     pub(super) fn pending(&self) -> usize {
         self.values.len()
     }
+    /// Whether the preallocated batch still has room for at least `need` entries.
+    pub(super) fn has_room(&self, need: usize) -> bool {
+        self.values.capacity().saturating_sub(self.values.len()) >= need
+    }
     /// Called only after releasing the device mutex.
     pub(super) fn finish(&mut self) {
         use super::completion::Deferred;

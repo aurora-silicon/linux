@@ -169,12 +169,6 @@ properties:
       The converter drives the HDMI hot-plug detect line only while it is
       powered.
 
-  apple,usb-pd:
-    $ref: /schemas/types.yaml#/definitions/phandle
-    description:
-      The USB-C port's PD controller (SPMI), polled for the DisplayPort alt
-      mode connection and the plug orientation.
-
   hpd-gpios:
     maxItems: 1
     description:
@@ -243,20 +237,38 @@ patternProperties:
       apple,dfp-endpoint:
         $ref: /schemas/types.yaml#/definitions/uint32
         description: The ATC's display-crossbar0 DFP endpoint (ATC instance).
-      apple,usb-pd:
-        $ref: /schemas/types.yaml#/definitions/phandle
-        description: The port's PD controller (SPMI).
       apple,tunable-pre:
         $ref: /schemas/types.yaml#/definitions/uint32-matrix
         description: As the node's apple,tunable-pre, for this port's PHY.
       apple,tunable-post:
         $ref: /schemas/types.yaml#/definitions/uint32-matrix
         description: As the node's apple,tunable-post, for this port's PHY.
+      phys:
+        maxItems: 1
+        description:
+          The port's ATC PHY in DisplayPort use (PHY_TYPE_DP). A DCP powers
+          it while it drives the PHY, from before its cold start until its
+          power-down, and keeps it powered for a display the bootloader
+          started; the PHY driver powers the PHY's domains meanwhile and
+          keeps it out of USB4. The PHY refuses this while it runs USB4.
+      mode-switch:
+        type: boolean
+        description:
+          The port's display switch, one per port and shared by all DCPs
+          that can drive it. The port controller sets the port's
+          DisplayPort alt mode state, pin assignment and HPD on it; the plug
+          orientation is the Type-C port's.
+      port:
+        $ref: /schemas/graph.yaml#/properties/port
+        description:
+          Connects to the display port (port@3) of the port's
+          usb-c-connector.
+    dependencies:
+      mode-switch: [ port ]
     required:
       - reg
       - reg-names
       - apple,dfp-endpoint
-      - apple,usb-pd
 
 required:
   - compatible
@@ -311,7 +323,14 @@ examples:
                 <0x3 0x03a13a00 0x0 0xc0>;
           reg-names = "atc", "atc-ps", "atc-psd";
           apple,dfp-endpoint = <3>;
-          apple,usb-pd = <&hpm3>;
+          phys = <&atc3_phy 6>;
+          mode-switch;
+
+          port {
+            endpoint {
+              remote-endpoint = <&typec3_display>;
+            };
+          };
         };
       };
     };

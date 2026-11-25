@@ -326,6 +326,8 @@ pub(crate) struct GpuManager {
     dyncfg: hw::DynConfig,
     pub(crate) initdata: fw::types::GpuObject<fw::initdata::InitData::ver>,
     uat: mmu::Uat,
+    /// The firmware's timestamp aperture in the kernel VM, where timestamp buffers are bound.
+    timestamp_range: Range<u64>,
     crashed: AtomicBool,
     /// Set once the over-limit firmware-private garbage was reported as held.
     garbage_held: AtomicBool,
@@ -746,10 +748,10 @@ impl GpuManager::ver {
         profile: GraphProfile,
     ) -> Result<Arc<GpuManager::ver>> {
         let dyncfg = Self::make_dyncfg(dev, res, cfg, &uat)?;
-        let private_end = match profile {
-            GraphProfile::Native => IOVA_KERN_PRIV_RANGE.end,
+        let (private_end, timestamp_range) = match profile {
+            GraphProfile::Native => (IOVA_KERN_PRIV_RANGE.end, IOVA_KERN_TIMESTAMP_RANGE),
             #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
-            GraphProfile::G14V27_2 => IOVA_G14_V27_2_TIMESTAMP_RANGE.start,
+            GraphProfile::G14V27_2 => (IOVA_G14_V27_2_TIMESTAMP_RANGE.start, IOVA_G14_V27_2_TIMESTAMP_RANGE),
         };
 
         let mut alloc = KernelAllocators {
@@ -828,7 +830,8 @@ impl GpuManager::ver {
                 false,
             )?);
 
-        let mut mgr = Self::make_mgr(dev, cfg, dyncfg, uat, alloc, event_manager, initdata)?;
+        let mut mgr = Self::make_mgr(dev, cfg, dyncfg, uat, alloc, event_manager, initdata,
+                                     timestamp_range)?;
 
         {
             let fwctl = mgr.fwctl_channel.lock();
@@ -1005,6 +1008,7 @@ impl GpuManager::ver {
     ///
     /// Force disable inlining to avoid blowing up the stack.
     #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
     fn make_mgr(
         dev: &AsahiDrmDevice,
         cfg: &'static hw::HwConfig,
@@ -1013,6 +1017,7 @@ impl GpuManager::ver {
         mut alloc: KernelAllocators,
         event_manager: Arc<event::EventManager>,
         initdata: KBox<fw::types::GpuObject<fw::initdata::InitData::ver>>,
+        timestamp_range: Range<u64>,
     ) -> Result<Pin<UniqueArc<GpuManager::ver>>> {
         let mut pipes = PipeChannels::ver {
             vtx: KVec::new(),
@@ -1113,6 +1118,7 @@ impl GpuManager::ver {
                 dyncfg: KBox::<hw::DynConfig>::into_inner(dyncfg),
                 initdata: KBox::<fw::types::GpuObject<fw::initdata::InitData::ver>>::into_inner(initdata),
                 uat: KBox::<mmu::Uat>::into_inner(uat),
+                timestamp_range,
                 io_mappings: KVec::new(),
                 next_mmio_iova: IOVA_KERN_MMIO_RANGE.start,
                 rtkit <- new_mutex!(None, "rtkit"),
@@ -1787,7 +1793,7 @@ impl Gpu for GpuManager::ver {
         crate::timestamp::Buffer::firmware(bo.map_range_into_range(
             self.uat.kernel_vm(),
             range,
-            IOVA_KERN_TIMESTAMP_RANGE,
+            self.timestamp_range.clone(),
             mmu::UAT_PGSZ as u64,
             mmu::PROT_FW_SHARED_RW,
             false,

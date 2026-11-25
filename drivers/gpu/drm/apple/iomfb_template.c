@@ -4798,8 +4798,12 @@ static void res_max_panel_brightness(struct apple_dcp *dcp, void *out, void *coo
 {
 	u32 peak = out ? get_unaligned_le32(out) >> 16 : 0;
 
-	/* Only a peak above the SDR range gives EDR headroom. */
-	if (peak > dcp->brightness.maximum && peak <= 10000) {
+	/*
+	 * Only a panel with EDR headroom (the ADT's EDRPotentialHeadroom) and a
+	 * peak above the SDR range shows PQ content as EDR.
+	 */
+	if (dcp->panel.edr_ceiling && peak > dcp->brightness.maximum &&
+	    peak <= 10000) {
 		dev_info(dcp->dev, "panel peak luminance %u nits\n", peak);
 		WRITE_ONCE(dcp->panel.peak_nits, peak);
 	}

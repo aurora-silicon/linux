@@ -19,6 +19,45 @@ const SHRINK_WAKE_NS: u64 = 1_000_000_000;
 /// completion records alone keep the worker busy.
 const HOUSEKEEPING_NS: u64 = 1_000_000;
 
+/// Whether an event pass must run full housekeeping now rather than deferring it to the
+/// periodic cadence. Transient idle gaps between sparse submissions defer housekeeping until
+/// `HOUSEKEEPING_NS` elapses (bounded by [`deferred_housekeeping_delay`]) so M5 completions avoid
+/// repeated report drains and uncached power-register reads.
+fn housekeeping_due(
+    requested: bool,
+    recover: bool,
+    recovery_pending: bool,
+    teardown_pending: bool,
+    has_waiters: bool,
+    now: u64,
+    last_housekeeping_ns: u64,
+) -> bool {
+    requested
+        || recover
+        || recovery_pending
+        || teardown_pending
+        || has_waiters
+        || now.saturating_sub(last_housekeeping_ns) >= HOUSEKEEPING_NS
+}
+
+/// Remaining delay (ns) before deferred housekeeping must run when no work remains in flight.
+/// Returns `None` while work stays in flight or when housekeeping ran on this pass.
+fn deferred_housekeeping_delay(
+    in_flight: bool,
+    housekeeping_ran: bool,
+    now: u64,
+    last_housekeeping_ns: u64,
+) -> Option<u64> {
+    if in_flight || housekeeping_ran {
+        return None;
+    }
+    Some(
+        HOUSEKEEPING_NS
+            .saturating_sub(now.saturating_sub(last_housekeeping_ns))
+            .max(1),
+    )
+}
+
 struct Service<'a> {
     firmware: &'a mut Firmware,
     deferred: &'a mut DeferredBatch,
@@ -30,23 +69,6 @@ struct Service<'a> {
 impl event::Transport for Service<'_> {
     fn roles(&self) -> &'static [Role] {
         self.firmware.roles()
-    }
-    fn reports_after_signal(&self) -> bool {
-        self.firmware.init.is_m5()
-    }
-    fn trace(&mut self, role: Role) {
-        let firmware = &mut *self.firmware;
-        firmware
-            .rings
-            .drain_trace(&firmware.primary.state.shared.dev, &firmware.init, role);
-    }
-    fn statistics(&mut self, role: Role) {
-        let firmware = &mut *self.firmware;
-        firmware.observe_statistics_power();
-        firmware
-            .rings
-            .drain_statistics(&firmware.primary.state.shared.dev, &firmware.init, role);
-        firmware.observe_statistics_power();
     }
     fn drain(
         &mut self,
@@ -339,9 +361,8 @@ impl Firmware {
         Ok(())
     }
 
-    /// Drains every role's trace ring, then their statistics rings. On M5 the event worker calls
-    /// this after it has signalled the completions of its pass: the reports are not scheduling
-    /// inputs.
+    /// Drains every role's trace ring, then their statistics rings. The event worker calls this
+    /// after it has signalled the completions of its pass: the reports are not scheduling inputs.
     fn drain_reports(&mut self) {
         let dev = &self.primary.state.shared.dev;
         for &role in self.roles() {
@@ -353,14 +374,6 @@ impl Firmware {
         for &role in self.roles() {
             self.rings.drain_statistics(&self.primary.state.shared.dev, &self.init, role);
             self.observe_statistics_power();
-        }
-    }
-
-    /// Drains post-signal trace and statistics reports on firmware families that defer them past
-    /// completion signalling.
-    fn drain_post_signal_reports(&mut self) {
-        if self.init.is_m5() {
-            self.drain_reports();
         }
     }
 
@@ -547,7 +560,10 @@ impl crate::g17::Shared {
         let requested = self
             .housekeeping
             .swap(false, core::sync::atomic::Ordering::AcqRel);
-        let (recover, masks, fast_done) = {
+        let (recover, masks, fast_done, render_changed) = {
+            // Taken before `state` so single-lock render retirement observes a live preparation
+            // epoch and drops it before `wait_drained_until()` if recovery opens.
+            let fast_epoch = self.preparations.try_enter().ok();
             let mut state = self.state.lock();
             let Some(firmware) = (*state).as_deref_mut() else {
                 return Ok(());
@@ -559,37 +575,96 @@ impl crate::g17::Shared {
                 // publisher. Joining builders must happen after unlocking.
                 self.preparations.close();
             }
-            // Steady-state pure-compute completions with work still in flight, no render work
-            // to observe, no replays, no waiters and housekeeping not yet due finish in this
-            // single device-mutex hold; fences are signalled right after unlocking.
+            // On M5, compute or render completions with no replays, no waiters and housekeeping
+            // not yet due finish in this single device-mutex hold. Fences signal after unlocking.
+            // Transient idle intervals can defer housekeeping and reports to the cadence timer.
             let mut fast_done = false;
-            if !recover
+            let mut render_changed = false;
+            let mut rescan = false;
+            if firmware.init.is_m5()
+                && !recover
                 && !requested
                 && !self.crashed.load(core::sync::atomic::Ordering::Acquire)
-                && masks == [0; 2]
-                && !firmware.render_observation_needed()
             {
-                if let Some(scan) = compute_scan {
+                let needs_render = masks != [0; 2] || firmware.render_observation_needed();
+                let render_clean = if !needs_render {
+                    true
+                } else if fast_epoch.as_ref().is_some_and(|epoch| epoch.is_current()) {
+                    let before = deferred.pending();
+                    match firmware.try_fast_observe_render(deferred)? {
+                        super::render::observe::FastRenderOutcome::Done => {
+                            render_changed = true;
+                            true
+                        }
+                        super::render::observe::FastRenderOutcome::Idle => true,
+                        // The full pass would find nothing more and arm the rescan poll.
+                        super::render::observe::FastRenderOutcome::Rescan => {
+                            render_changed = deferred.pending() != before;
+                            rescan = true;
+                            true
+                        }
+                        super::render::observe::FastRenderOutcome::Fallback => {
+                            render_changed = deferred.pending() != before;
+                            false
+                        }
+                    }
+                } else {
+                    false
+                };
+                // Render completions that found nothing to retire here (Idle) are owed to the
+                // borrowers of their pairs, which observe them on return.
+                if render_clean && (compute_scan.is_some() || render_changed || masks != [0; 2]) {
+                    let scan = match compute_scan {
+                        Some(scan) => scan,
+                        None => {
+                            let mut scan = super::ComputeScan::default();
+                            for queue in firmware
+                                .queues
+                                .compute
+                                .iter()
+                                .flatten()
+                                .filter_map(|entry| entry.queue.as_deref())
+                            {
+                                scan.in_flight |= queue.in_flight();
+                                scan.replay |= queue.replay_commands() != 0;
+                                scan.polling |=
+                                    queue.retirement_polling() || queue.pool_release_pending();
+                            }
+                            scan
+                        }
+                    };
                     let now = super::now_ns();
                     let in_flight = scan.in_flight || firmware.queues.render_in_flight();
                     let no_replay = !scan.replay && !firmware.queues.render.replay_parked();
-                    let no_housekeeping = in_flight
-                        && firmware.queues.teardown.is_empty()
-                        && !self.channels.has_waiters()
-                        && !self.progress.has_waiters()
-                        && !self.queues.has_waiters()
-                        && !self.renders.has_waiters()
-                        && now.saturating_sub(
-                            self.housekeeping_ns
-                                .load(core::sync::atomic::Ordering::Relaxed),
-                        ) < HOUSEKEEPING_NS;
+                    let last_hk = self
+                        .housekeeping_ns
+                        .load(core::sync::atomic::Ordering::Relaxed);
+                    let has_waiters = self.channels.has_waiters()
+                        || self.progress.has_waiters()
+                        || self.queues.has_waiters()
+                        || self.renders.has_waiters();
+                    let no_housekeeping = !housekeeping_due(
+                        false,
+                        false,
+                        false,
+                        !firmware.queues.teardown.is_empty(),
+                        has_waiters,
+                        now,
+                        last_hk,
+                    );
                     let no_outer_or_grow =
                         !firmware.init.outer_waiting() && !firmware.render_grow_ready();
                     if no_replay && no_housekeeping && no_outer_or_grow {
-                        if let Some(delay) = firmware.idle_check(now, true)? {
+                        if let Some(delay) = firmware.idle_check(now, in_flight)? {
                             self.queue_idle(delay);
                         }
-                        let polling = scan.polling || firmware.non_compute_runtime_polling(now);
+                        if let Some(delay) =
+                            deferred_housekeeping_delay(in_flight, false, now, last_hk)
+                        {
+                            self.queue_housekeeping(delay);
+                        }
+                        let polling =
+                            rescan || scan.polling || firmware.non_compute_runtime_polling(now);
                         if polling {
                             self.queue_poll();
                         } else if channel::Events::pending(&firmware.init, Role::Primary)?
@@ -602,8 +677,11 @@ impl crate::g17::Shared {
                     }
                 }
             }
-            (recover, masks, fast_done)
+            (recover, masks, fast_done, render_changed)
         };
+        if render_changed {
+            self.note_changed();
+        }
         deferred.finish();
         crate::g17::trace::event(1);
         if fast_done {
@@ -620,12 +698,13 @@ impl crate::g17::Shared {
         if self.crashed.load(core::sync::atomic::Ordering::Acquire) {
             return Err(EIO);
         }
-        // Capture pre-recovery trace/statistics reports before firmware restart resets the
-        // report rings, matching the non-throttled post-signal ordering.
-        let mut reports_drained = false;
+        // Completions have signalled. Drain reports now unless M5 can defer them to
+        // housekeeping. Recovery must capture reports before restart resets their rings.
+        let reports_drained = recover || !firmware.init.is_m5();
+        if reports_drained {
+            firmware.drain_reports();
+        }
         if recover {
-            firmware.drain_post_signal_reports();
-            reports_drained = true;
             firmware.service_runtime_recovery(deferred)?;
             if !firmware.recovery.pending()
                 && !self.sleep_gate.load(core::sync::atomic::Ordering::Acquire)
@@ -644,11 +723,17 @@ impl crate::g17::Shared {
         firmware.replay_render(deferred)?;
         // Skip dropping and re-acquiring the device mutex around a no-op render observation.
         if masks != [0; 2] || firmware.render_observation_needed() {
+            firmware.drain_render_deferred(masks, deferred)?;
             drop(state);
-            self.observe_renders(masks, deferred)?;
+            self.observe_renders(deferred)?;
             state = self.state.lock();
             if self.crashed.load(core::sync::atomic::Ordering::Acquire) {
                 return Err(EIO);
+            }
+            if let Some(firmware) = (*state).as_deref() {
+                if !firmware.recovery.pending() && firmware.queues.render_needs_rescan() {
+                    self.queue_poll();
+                }
             }
         }
         let Some(firmware) = (*state).as_deref_mut() else {
@@ -666,23 +751,25 @@ impl crate::g17::Shared {
         let idle = firmware.idle_check(now, in_flight)?;
         // Expiries, drained pairs, exits, pool and heap trimming, teardown and M5 report
         // drains give back what retirement freed; a completion needs none of them to retire
-        // or to signal. While work is in flight and nothing waits for capacity, a pass for
-        // firmware records alone skips them. Any requested pass, recovery, teardown, a waiter,
-        // the last retirement and, at the latest, the first pass after HOUSEKEEPING_NS run
-        // them all.
-        let housekeeping = requested
-            || recover
-            || !in_flight
-            || firmware.recovery.pending()
-            || !firmware.queues.teardown.is_empty()
-            || self.channels.has_waiters()
+        // or to signal. While nothing waits for capacity and `HOUSEKEEPING_NS` has not elapsed,
+        // a pass for firmware records alone skips them; when no work stays in flight, a bounded
+        // housekeeping timer guarantees cleanup runs once the interval expires.
+        let last_hk = self
+            .housekeeping_ns
+            .load(core::sync::atomic::Ordering::Relaxed);
+        let has_waiters = self.channels.has_waiters()
             || self.progress.has_waiters()
             || self.queues.has_waiters()
-            || self.renders.has_waiters()
-            || now.saturating_sub(
-                self.housekeeping_ns
-                    .load(core::sync::atomic::Ordering::Relaxed),
-            ) >= HOUSEKEEPING_NS;
+            || self.renders.has_waiters();
+        let housekeeping = housekeeping_due(
+            requested,
+            recover,
+            firmware.recovery.pending(),
+            !firmware.queues.teardown.is_empty(),
+            has_waiters,
+            now,
+            last_hk,
+        );
         let mut lingers = None;
         let mut drains = None;
         let mut kills = None;
@@ -692,9 +779,8 @@ impl crate::g17::Shared {
             self.housekeeping_ns
                 .store(now, core::sync::atomic::Ordering::Relaxed);
             if !reports_drained {
-                // The completions above are signalled; reports are throttled to the
-                // housekeeping cadence while work stays in flight.
-                firmware.drain_post_signal_reports();
+                // M5 deferred these reports until housekeeping was due.
+                firmware.drain_reports();
             }
             if !firmware.recovery.pending() {
                 lingers = firmware.expire_render_lingers(now)?;
@@ -743,6 +829,9 @@ impl crate::g17::Shared {
             });
         if let Some(delay) = idle {
             self.queue_idle(delay);
+        }
+        if let Some(delay) = deferred_housekeeping_delay(in_flight, housekeeping, now, last_hk) {
+            self.queue_housekeeping(delay);
         }
         if firmware.recovery.pending() {
             self.preparations.close();
