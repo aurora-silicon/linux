@@ -23,6 +23,7 @@
 #define HCI_SETUP 1
 #define HCI_AUTO_OFF 2
 #define HCI_UNREGISTER 4
+#define HCI_MAX_ACL_SIZE 1024
 #define HCI_USER_CHANNEL 8
 #define HCI_RUNNING 16
 #define HCI_UP 32
@@ -45,7 +46,7 @@ static void bacpy(bdaddr_t *a,const bdaddr_t *b) { *a=*b; }
 static int bacmp(const bdaddr_t *a,const bdaddr_t *b) { return memcmp(a,b,6); }
 struct bcm4377_data;
 struct firmware { const unsigned char *data; int size; };
-struct hci_dev { struct bcm4377_data *data; unsigned int flags; void *req_workqueue,*workqueue; struct work_struct power_on,cmd_sync_work,cmd_work; struct delayed_work cmd_timer,ncmd_timer; int req_lock,cmd_cnt,suspend_state,wake_reason,wake_addr_type; bdaddr_t wake_addr; int *req_skb; void (*reset)(struct hci_dev*); bdaddr_t setup_addr,public_addr,bdaddr; };
+struct hci_dev { struct bcm4377_data *data; unsigned int flags; unsigned short acl_mtu,le_mtu; void *req_workqueue,*workqueue; struct work_struct power_on,cmd_sync_work,cmd_work; struct delayed_work cmd_timer,ncmd_timer; int req_lock,cmd_cnt,suspend_state,wake_reason,wake_addr_type; bdaddr_t wake_addr; int *req_skb; void (*reset)(struct hci_dev*); bdaddr_t setup_addr,public_addr,bdaddr; };
 struct ring { bool enabled; };
 struct pci_dev {
 	int irq, dev;
