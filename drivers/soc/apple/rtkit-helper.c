@@ -287,8 +287,12 @@ static int apple_rtkit_helper_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	helper->dev = dev;
-	/* The M5 Pro's macOS idles MTP after its two HID packets. */
-	helper->idle_late = of_device_is_compatible(helper->dev->of_node, "apple,t6050-mtp");
+	/*
+	 * The M5 Pro's macOS idles MTP after its two HID packets, and J516s's after its HID
+	 * packets too (the t5 trace: DockChannel writes 25 ms before the AP idle notice).
+	 */
+	helper->idle_late = of_device_is_compatible(helper->dev->of_node, "apple,t6050-mtp") ||
+			    of_device_is_compatible(helper->dev->of_node, "apple,t6030-mtp");
 	platform_set_drvdata(pdev, helper);
 
 	helper->asc_base = devm_platform_ioremap_resource_byname(pdev, "asc");
