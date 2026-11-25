@@ -42,9 +42,10 @@ int main(void)
  dcpavserv_notify_edid(&service);assert(queued==1 && connector.hotplug_wq==1);
  dcp.quiescing=true;dcpavserv_notify_edid(&service);assert(queued==1);
  dcp.quiescing=false;connector.dcp=&other;dcpavserv_notify_edid(&service);assert(queued==1);
- connector.dcp=&device;ep.wire_v2=false;dcpavserv_notify_edid(&service);assert(queued==1);
- ep.wire_v2=true;connector.connected=false;dcpavserv_notify_edid(&service);assert(queued==1);
- puts("PASS: actual late-EDID notification queues ready connector only; legacy/quiesce/unrouted/unregistered guarded");
+ /* legacy firmware: dcpavserv_init() calls it only for an announcement after a sinkless start */
+ connector.dcp=&device;ep.wire_v2=false;dcpavserv_notify_edid(&service);assert(queued==2 && connector.hotplug_wq==2);
+ ep.wire_v2=true;connector.connected=false;dcpavserv_notify_edid(&service);assert(queued==2);
+ puts("PASS: actual late-EDID notification queues a ready connector only; quiesce/unrouted/unregistered/disconnected guarded");
 }
 '''
 pathlib.Path(sys.argv[2]).write_text(prefix + source[match.start():end] + suffix)
