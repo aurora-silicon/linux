@@ -1398,12 +1398,19 @@ static int apple_nvme_init_request(struct blk_mq_tag_set *set,
 	return 0;
 }
 
-static void apple_nvme_disable_legacy(struct apple_nvme *anv, bool shutdown)
+/*
+ * A pre-M4 controller's stop, all of it whatever fails. The first error of its shutdown
+ * notification and its disable, or 0. One already dead (its firmware crashed, CSTS.RDY clear or
+ * CSTS.CFS set) is sent neither: with @shutdown that is -EIO, as nothing it held is known to
+ * be on flash.
+ */
+static int apple_nvme_disable_legacy(struct apple_nvme *anv, bool shutdown)
 {
 	enum nvme_ctrl_state state = nvme_ctrl_state(&anv->ctrl);
 	u32 csts = readl(anv->mmio_nvme + NVME_REG_CSTS);
 	bool dead = false, freeze = false;
 	unsigned long flags;
+	int ret = 0, err;
 
 	if (apple_rtkit_is_crashed(anv->rtk))
 		dead = true;
@@ -1448,8 +1455,12 @@ static void apple_nvme_disable_legacy(struct apple_nvme *anv, bool shutdown)
 		 * NVMe disabled state, after a clean shutdown).
 		 */
 		if (shutdown)
-			nvme_disable_ctrl(&anv->ctrl, shutdown);
-		nvme_disable_ctrl(&anv->ctrl, false);
+			ret = nvme_disable_ctrl(&anv->ctrl, shutdown);
+		err = nvme_disable_ctrl(&anv->ctrl, false);
+		if (!ret)
+			ret = err;
+	} else if (shutdown) {
+		ret = -EIO;
 	}
 
 	apple_nvme_disable_queue(&anv->ioq);
@@ -1478,6 +1489,7 @@ static void apple_nvme_disable_legacy(struct apple_nvme *anv, bool shutdown)
 		nvme_unquiesce_io_queues(&anv->ctrl);
 		nvme_unquiesce_admin_queue(&anv->ctrl);
 	}
+	return ret;
 }
 
 static void apple_nvme_quarantine(struct apple_nvme *anv, int error)
@@ -1575,6 +1587,7 @@ static int apple_nvme_disable_locked(struct apple_nvme *anv, bool shutdown)
 
 static int apple_nvme_disable(struct apple_nvme *anv, bool shutdown)
 {
+	/* Nonzero means quarantined, which a pre-M4 controller never is */
 	if (!anv->hw->needs_ioq_registers) {
 		apple_nvme_disable_legacy(anv, shutdown);
 		return 0;
@@ -3324,6 +3337,17 @@ static int apple_nvme_sleep_send_shn(struct apple_nvme *anv)
 	return ret;
 }
 
+/*
+ * A pre-M4 controller's suspend that failed. Nothing resumes a device whose own suspend failed:
+ * its reset brings it back now, as resume would, with its firmware as the failure left it.
+ */
+static int apple_nvme_suspend_failed(struct apple_nvme *anv, const char *what, int ret)
+{
+	dev_err(anv->dev, "refusing to sleep: %s failed: %d\n", what, ret);
+	nvme_reset_ctrl(&anv->ctrl);
+	return ret;
+}
+
 static int apple_nvme_suspend(struct device *dev)
 {
 	struct apple_nvme *anv = dev_get_drvdata(dev);
@@ -3356,6 +3380,11 @@ static int apple_nvme_suspend(struct device *dev)
 	}
 	if (anv->sleep_stop) {
 		anv->sleep_failed = apple_nvme_sleep_quiesce(anv);
+	} else if (!anv->hw->needs_ioq_registers) {
+		/* Not known to be on flash without a completed shutdown: no sleep then */
+		ret = apple_nvme_disable_legacy(anv, true);
+		if (ret)
+			return apple_nvme_suspend_failed(anv, "controller shutdown", ret);
 	} else {
 		ret = apple_nvme_disable(anv, true);
 		if (ret)
@@ -3393,7 +3422,9 @@ static int apple_nvme_suspend(struct device *dev)
 
 	if (apple_rtkit_is_running(anv->rtk)) {
 		ret = apple_rtkit_shutdown(anv->rtk);
-
+		/* A firmware that didn't stop keeps its run bit: only a stopped one may lose it */
+		if (ret)
+			return apple_nvme_suspend_failed(anv, "firmware stop", ret);
 		writel(0, anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
 	}
 
