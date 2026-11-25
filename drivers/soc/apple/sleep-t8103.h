@@ -373,6 +373,7 @@ static struct t8103_sleep {
 	void __iomem *agx_fabric;
 	u32 agx_saved[ARRAY_SIZE(t8103_agx_regs)];
 	bool agx_saved_valid;
+	int gfx_wake_err;
 	/* Each coprocessor's t8103_asc_stop() result */
 	u8 pmp_result, sio_result, dcp_result, dcpext_result;
 	/* The t8103_commit_off and t8103_cg_commit_off words found or taken off */
@@ -825,6 +826,7 @@ static int t8103_sleep_begin(struct apple_sleep *s)
 	t->mux_timeouts = 0;
 	t->cluster_timeouts = 0;
 	t->mux_wake_timeouts = 0;
+	t->gfx_wake_err = 0;
 	memset(t->cluster_wake_ret, 0, sizeof(t->cluster_wake_ret));
 	t->aop_slp_ddr = t8103_aop_bound();
 	if (t->aop_slp_ddr)
@@ -838,11 +840,16 @@ static int t8103_sleep_check(struct apple_sleep *s)
 	struct t8103_sleep *t = &t8103_sleep;
 	unsigned int i, wanted = 0;
 
-	/* Refuse a bound GPU driver unless it registered a commit stop for warm restart. */
-	if (t->gpu && device_is_bound(&t->gpu->dev) &&
-	    !apple_sleep_coproc_ready_node(t->gpu->dev.of_node)) {
-		dev_err(s->dev, "refused: the GPU's driver is bound\n");
-		return -EBUSY;
+	/* Refuse a bound GPU driver unless it registered a commit stop and registers are mapped. */
+	if (t->gpu && device_is_bound(&t->gpu->dev)) {
+		if (!apple_sleep_coproc_ready_node(t->gpu->dev.of_node)) {
+			dev_err(s->dev, "refused: the GPU's driver is bound\n");
+			return -EBUSY;
+		}
+		if (!t->agx_fabric || !t->bridges[0]) {
+			dev_err(s->dev, "refused: GPU fabric or bridge registers not mapped\n");
+			return -ENODEV;
+		}
 	}
 
 	for (i = 0; i < T8103_WAKE_WORDS; i++)
@@ -1239,6 +1246,12 @@ static void t8103_pre_smc_down(struct apple_sleep *s)
 	t->commit_off = 0;
 	t->commit_lowered = 0;
 	t->agx_saved_valid = false;
+	if (t->gpu && device_is_bound(&t->gpu->dev)) {
+		struct apple_sleep_coproc *gc = apple_sleep_coproc_find(&t->gpu->dev);
+
+		if (gc && gc->stop_ret)
+			panic("T8103 committed GPU stop failed: %d", gc->stop_ret);
+	}
 	/*
 	 * Lower GFX (and save its fabric tunables) before stopping PMP, matching macOS and
 	 * newer SoCs where GFX powers off while PMP is still running.
@@ -1261,8 +1274,9 @@ static void t8103_pre_smc_down(struct apple_sleep *s)
 			readl(s->ps + t8103_commit_off[T8103_COMMIT_OFF_GFX]);
 		t->commit_lowered |= BIT(T8103_COMMIT_OFF_GFX);
 		sleep_ps_lower(s, t8103_commit_off[T8103_COMMIT_OFF_GFX]);
-		if (!sleep_ps_wait_off(s, t8103_commit_off[T8103_COMMIT_OFF_GFX]))
-			t->commit_off |= BIT(T8103_COMMIT_OFF_GFX);
+		if (sleep_ps_wait_off(s, t8103_commit_off[T8103_COMMIT_OFF_GFX]))
+			panic("T8103 committed GFX power-off timed out");
+		t->commit_off |= BIT(T8103_COMMIT_OFF_GFX);
 	}
 	t8103_pmp_stop(s);
 	t->aon_commit_off = 0;
@@ -1471,6 +1485,7 @@ static void t8103_sleep_wake(struct apple_sleep *s)
 {
 	struct t8103_sleep *t = &t8103_sleep;
 	unsigned int i;
+	int pmp_ret = 0;
 	u32 v;
 
 	t8103_aic_ipi_restore(s);
@@ -1559,17 +1574,26 @@ static void t8103_sleep_wake(struct apple_sleep *s)
 			sleep_ps_restore(s->ps + t8103_commit_off[idx], 0xf);
 	}
 	if (t->commit_lowered & BIT(T8103_COMMIT_OFF_PMP))
-		sleep_ps_restore(s->ps + t8103_commit_off[T8103_COMMIT_OFF_PMP],
-				 t->commit_saved[T8103_COMMIT_OFF_PMP]);
+		pmp_ret = sleep_ps_restore(s->ps + t8103_commit_off[T8103_COMMIT_OFF_PMP],
+					   t->commit_saved[T8103_COMMIT_OFF_PMP]);
 	if (t->commit_lowered & BIT(T8103_COMMIT_OFF_RMX))
 		sleep_ps_restore(s->ps + t8103_commit_off[T8103_COMMIT_OFF_RMX],
 				 t->commit_saved[T8103_COMMIT_OFF_RMX]);
 	if (t->commit_lowered & BIT(T8103_COMMIT_OFF_GFX)) {
-		sleep_ps_restore(s->ps + t8103_commit_off[T8103_COMMIT_OFF_GFX],
-				 t->commit_saved[T8103_COMMIT_OFF_GFX]);
-		if (t->agx_saved_valid && t->agx_fabric) {
+		int gfx_ret = pmp_ret ? pmp_ret :
+			sleep_ps_restore(s->ps + t8103_commit_off[T8103_COMMIT_OFF_GFX],
+					 t->commit_saved[T8103_COMMIT_OFF_GFX]);
+
+		if (!gfx_ret && t->agx_saved_valid && t->agx_fabric) {
 			for (i = 0; i < ARRAY_SIZE(t8103_agx_regs); i++)
 				writel(t->agx_saved[i], t->agx_fabric + t8103_agx_regs[i]);
+		}
+		t->gfx_wake_err = gfx_ret;
+		if (gfx_ret && t->gpu) {
+			struct apple_sleep_coproc *gc = apple_sleep_coproc_find(&t->gpu->dev);
+
+			if (gc)
+				gc->wake_err = gfx_ret;
 		}
 	}
 	t->commit_lowered = 0;
@@ -1627,6 +1651,9 @@ static void t8103_sleep_finish(struct apple_sleep *s)
 	if (t->mux_fixed)
 		dev_info(s->dev, "T8103: clock muxes put back after the wake: %#llx\n",
 			 t->mux_fixed);
+	if (t->gfx_wake_err)
+		dev_err(s->dev, "T8103: GFX power restore failed after wake: %d\n",
+			t->gfx_wake_err);
 	dev_info(s->dev, "T8103: wake status %08x %08x %08x %08x %08x, clusters %d %d, mux timeouts %u\n",
 		 s->wake_status[0], s->wake_status[1], s->wake_status[2], s->wake_status[3],
 		 s->wake_status[4], t->cluster_wake_ret[0], t->cluster_wake_ret[1],

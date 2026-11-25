@@ -377,6 +377,7 @@ static struct apple_sleep_coproc {
 	bool stopped;
 	u32 status;
 	int stop_ret;
+	int wake_err;
 	/* No ASC: its last stop takes it whole, power word @ps included, before the others. */
 	bool first;
 	/* Between ANS and the others, whatever order they registered in. */
@@ -1650,6 +1651,8 @@ void apple_sleep_coproc_set_ready(struct device *dev, bool ready)
 		return;
 	c->ready = ready;
 	c->stopped = false;
+	c->stop_ret = 0;
+	c->wake_err = 0;
 }
 EXPORT_SYMBOL_GPL(apple_sleep_coproc_set_ready);
 
@@ -1662,6 +1665,16 @@ bool apple_sleep_coproc_stopped(struct device *dev)
 	return c && c->stopped;
 }
 EXPORT_SYMBOL_GPL(apple_sleep_coproc_stopped);
+
+int apple_sleep_coproc_wake_error(struct device *dev)
+{
+	struct apple_sleep_coproc *c;
+
+	guard(mutex)(&apple_sleep_coprocs_lock);
+	c = apple_sleep_coproc_find(dev);
+	return c ? c->wake_err : -ENODEV;
+}
+EXPORT_SYMBOL_GPL(apple_sleep_coproc_wake_error);
 
 bool apple_sleep_commit_stops_coprocs(void)
 {
