@@ -6,7 +6,7 @@ name: PMGR power state KUnit
 
 on:
   pull_request:
-    branches: [integration/aurora, aurora-wip]
+    branches: [main]
     paths:
       - 'drivers/pmdomain/apple/**'
       - 'include/linux/soc/apple/**'

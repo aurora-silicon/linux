@@ -7,7 +7,7 @@ name: Apple DRM KUnit
 
 on:
   pull_request:
-    branches: [integration/aurora, aurora-wip]
+    branches: [main]
     paths:
       - 'drivers/gpu/drm/apple/**'
       - '.github/workflows/apple-drm-kunit.yml'

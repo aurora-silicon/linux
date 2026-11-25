@@ -51,6 +51,8 @@ pub(crate) mod uma_manager {
     pub(crate) const SIZE: usize = 0xa0;
     pub(crate) const COMPLETED: usize = 0x54;
     pub(crate) const SEEDS: u32 = 8192;
+    /// Freelist records of a base pool (+0x1c), its 0x20000-byte freelist.
+    pub(crate) const RECORDS: u32 = 16384;
 }
 pub(crate) mod uma_pools {
     pub(crate) const POOLS: usize = 16;
@@ -82,7 +84,8 @@ fn put64(x: &mut [u8], off: usize, v: u64) {
     x[off..off + 8].copy_from_slice(&v.to_le_bytes());
 }
 
-/// Literal fresh M4 PB manager. The firmware and GPU page-list aliases share backing.
+/// Literal fresh M4 PB manager sized to `heap_blocks` (1..=[`MAX_BLOCKS`]).
+/// The firmware and GPU page-list aliases share backing.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn pb_manager_image(
     id: u32,
@@ -91,45 +94,56 @@ pub(crate) fn pb_manager_image(
     blocks_fw: u64,
     ring_fw: u64,
     count_fw: u64,
+    heap_blocks: u32,
 ) -> [u8; pb_manager::SIZE] {
+    let blocks = heap_blocks.clamp(1, MAX_BLOCKS);
+    let pages = blocks * PAGES_PER_BLOCK;
     let mut m = [0; pb_manager::SIZE];
     put32(&mut m, 0xc, id);
     put32(&mut m, 0x10, id);
     put64(&mut m, 0x20, pages_fw);
     put64(&mut m, 0x28, pages_gpu);
     put32(&mut m, 0x30, PAGE_LIST_SIZE as u32);
-    put32(&mut m, 0x34, MAX_PAGES);
+    put32(&mut m, 0x34, pages);
     put32(&mut m, 0x38, BLOCK_LIST_RECORDS);
-    put32(&mut m, 0x3c, MAX_BLOCKS);
+    put32(&mut m, 0x3c, blocks);
     put64(&mut m, 0x44, blocks_fw);
     put64(&mut m, 0x4c, ring_fw);
-    put32(&mut m, 0x54, MAX_PAGES - 1);
+    put32(&mut m, 0x54, pages - 1);
     put32(&mut m, 0x58, BLOCK_BYTES as u32);
     put64(&mut m, 0x64, count_fw);
-    put32(&mut m, 0x7c, MAX_PAGES);
-    put32(&mut m, 0x80, MAX_PAGES);
+    put32(&mut m, 0x7c, pages);
+    put32(&mut m, 0x80, pages);
     m
 }
 
 /// One retained M4 UMA descriptor shared by TA and FS (slot 33..64).
+/// A UMA manager whose freelist of `records` records (+0x1c) holds `seeds` entries (available
+/// and total): [`uma_manager::SEEDS`] in [`uma_manager::RECORDS`] for a base pool.
 pub(crate) fn uma_manager_image(
     descriptor: u64,
     slot: u32,
     state_gpu: u64,
     list_gpu: u64,
     submitted_fw: u64,
+    seeds: u32,
+    records: u32,
 ) -> [u8; uma_manager::SIZE] {
     let mut m = [0; uma_manager::SIZE];
     put64(&mut m, 0, descriptor);
     put32(&mut m, 8, slot);
     put32(&mut m, 0x10, 2);
     put64(&mut m, 0x14, state_gpu);
-    put32(&mut m, 0x1c, 16384);
-    put32(&mut m, 0x24, 8192);
-    put32(&mut m, 0x2c, 8192);
+    put32(&mut m, 0x1c, records);
+    put32(&mut m, 0x24, seeds);
+    put32(&mut m, 0x2c, seeds);
     put64(&mut m, 0x30, list_gpu);
     put32(&mut m, 0x40, 4);
-    put32(&mut m, 0x48, 128);
+    put32(
+        &mut m,
+        super::graph::manager::ROW_WORDS,
+        super::graph::pools::row_words(seeds),
+    );
     put64(&mut m, 0x4c, submitted_fw);
     // +0x54 is the ASC completion count; +0x5c is the compute-exclusion flag.
     // Both start at zero for paired render engines and are never AP command serials.
@@ -156,6 +170,7 @@ mod tests {
             0xfffffc2000500000,
             0xfffffc2000600000,
             0xfffffc2000700000,
+            MAX_BLOCKS,
         );
         assert_eq!(m.len(), 0xc0);
         assert_eq!((r32(&m, 0xc), r32(&m, 0x10)), (1, 1));
@@ -169,6 +184,26 @@ mod tests {
         assert_eq!(r32(&m, 0x54), 8191);
         assert_eq!(r32(&m, 0x7c), 8192);
         assert_eq!(r32(&m, 0x80), 8192);
+        // A 64 MiB heap (512 blocks / 2048 pages) describes only its backed blocks and pages.
+        let small = pb_manager_image(
+            0,
+            0xfffffc2000400000,
+            0x701a040000,
+            0xfffffc2000500000,
+            0xfffffc2000600000,
+            0xfffffc2000700000,
+            512,
+        );
+        assert_eq!(
+            (
+                r32(&small, 0x34),
+                r32(&small, 0x3c),
+                r32(&small, 0x54),
+                r32(&small, 0x7c),
+                r32(&small, 0x80),
+            ),
+            (2048, 512, 2047, 2048, 2048)
+        );
         let written = [
             (0xc, 8),
             (0x20, 16),
@@ -192,6 +227,12 @@ mod tests {
             0x7012000000,
             0x7012020000,
             0xfffffc2000700000,
+            uma_manager::SEEDS,
+            uma_manager::RECORDS,
+        );
+        assert_eq!(
+            (r32(&m, 0x1c), r32(&m, 0x24), r32(&m, 0x2c)),
+            (16384, 8192, 8192)
         );
         assert_eq!(r64(&m, 0), 0xfffffc2000400000);
         assert_eq!(r32(&m, 8), 33);

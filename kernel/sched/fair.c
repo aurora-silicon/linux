@@ -10352,7 +10352,7 @@ static int fork_local_idle_cpu(struct sched_domain *sd,
 
 	if (!llc_sd || !(llc_sd->flags & SD_BALANCE_FORK))
 		return -1;
-	for_each_cpu_wrap(i, sched_domain_span(llc_sd), cpu + 1) {
+	for_each_cpu(i, sched_domain_span(llc_sd)) {
 		if (i == cpu || !cpumask_test_cpu(i, sched_domain_span(sd)) ||
 		    !cpumask_test_cpu(i, p->cpus_ptr))
 			continue;
