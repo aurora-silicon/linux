@@ -415,6 +415,7 @@ pub(crate) fn new_vm(gpu: &Gpu, kernel_range: Range<u64>, file_id: u64) -> Resul
         factory,
         live.bind.as_ref().ok_or(EIO)?.clone(),
         live.clone(),
+        gpu.shared.clone(),
     )?;
     let inner = VmStateInner {
         id,

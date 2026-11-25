@@ -741,11 +741,10 @@ impl Firmware {
             self.reclaim_closed_vm_slots();
         }
         // Skip redundant `publish_checked()` walks on busy polls where nothing could have
-        // unblocked `engine.pending`. `Prepared::drop` releases standby PB epochs only for
-        // `Cache::prepare` waiters (`standby_available`, which enter `submit_locked()` directly),
-        // while `publish_woke` covers external state changes (VM close, unstarted queue
-        // cancellation) and `ta_wave_ready()` wakes TA-wave-paced renders when a `0x70` TA
-        // pass finishes while FS is still running.
+        // unblocked `engine.pending`. Standby release wakes `Cache::prepare` waiters, which
+        // enter `submit_locked()` directly. `publish_woke` covers external state changes
+        // including a closed VM's final reservation release. `ta_wave_ready()` wakes
+        // TA-wave-paced renders when a `0x70` TA pass finishes while FS is still running.
         let coalesce_due = self.engine.coalesce_deadline_ns != 0
             && (!evented || now >= self.engine.coalesce_deadline_ns);
         let should_publish = !self.engine.pending.is_empty()
@@ -1687,6 +1686,7 @@ impl Firmware {
                 p.pending.store(false, Ordering::Relaxed);
                 self.engine.pending.retain(|j| !Arc::ptr_eq(j, &job));
                 p.count.store(p.sent(), Ordering::Relaxed);
+                job.resources.discard_unpublished_renders();
             }
             if receipt.owner_retired()
                 && self.engine.flights.iter().all(|other| {

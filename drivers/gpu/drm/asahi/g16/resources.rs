@@ -11,6 +11,7 @@ use super::{
     pools::{PbEpoch, PoolSet},
     slots::{ComputeSlot, PassCmds, PassSlot, Placement, UnitCmds},
     vm::VmState,
+    Shared,
 };
 use crate::mmu;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -921,12 +922,14 @@ pub(crate) struct Cache {
     bind: mmu::VmBind,
     live: Arc<super::vm::LiveToken>,
     budget: Arc<super::budget::Budget>,
+    shared: Arc<Shared>,
 }
 impl Cache {
     pub(crate) fn new(
         factory: Factory,
         bind: mmu::VmBind,
         live: Arc<super::vm::LiveToken>,
+        shared: Arc<Shared>,
     ) -> Result<Arc<Self>> {
         let budget = super::budget::Budget::new()?;
         let epochs = KVec::with_capacity(super::budget::LIMIT as usize, GFP_KERNEL)?;
@@ -943,7 +946,7 @@ impl Cache {
             standby_available <- new_condvar!(),
             closed: AtomicBool::new(false),
             active_render_passes: AtomicU32::new(0),
-            factory, bind, live, budget }),
+            factory, bind, live, budget, shared }),
             GFP_KERNEL,
         )
     }
@@ -986,11 +989,13 @@ impl Cache {
         if count == 0 {
             return;
         }
-        let (mut wake, excess) = {
+        let (mut wake, reclaim, excess) = {
             let mut standby = self.standby.lock();
             standby.reserved = standby.reserved.saturating_sub(count);
             let wake = standby.waiters != 0;
-            let keep = if self.closed.load(Ordering::Acquire) {
+            let closed = self.closed.load(Ordering::Acquire);
+            let reclaim = closed && standby.reserved == 0;
+            let keep = if closed {
                 standby.reserved as usize
             } else {
                 (standby.reserved as usize).max(SPARE_EPOCHS)
@@ -1000,7 +1005,7 @@ impl Cache {
             } else {
                 None
             };
-            (wake, excess)
+            (wake, reclaim, excess)
         };
         if let Some(excess) = excess {
             drop(excess);
@@ -1029,6 +1034,14 @@ impl Cache {
         if wake {
             self.standby_available.notify_all();
         }
+        if reclaim {
+            self.shared.wake_closed_vm_reclaim();
+        }
+    }
+
+    fn release_render_passes(&self, count: u32) {
+        let previous = self.active_render_passes.fetch_sub(count, Ordering::AcqRel);
+        debug_assert!(previous >= count);
     }
 
     /// Whether accepted renders still hold standby reservations, that is, are not yet
@@ -1450,7 +1463,7 @@ impl Cache {
             render_ext,
             pb_heap_ext,
             pb_ext,
-            total_renders: render_count,
+            active_renders: AtomicU32::new(render_count),
             unpublished_renders: AtomicU32::new(render_count),
             cache,
         })
@@ -1473,8 +1486,8 @@ pub(crate) struct Prepared {
     pub(crate) pb_heap_ext: [Option<Arc<PbHeapExtArena>>; PB_HEAP_EXT_TIERS.len()],
     /// The VM's lazily allocated recovery PB/UMA allocator slots when the job was prepared.
     pub(crate) pb_ext: [Option<Arc<PoolExtArena>>; EXT_PB_SLOTS],
-    /// Total render commands accounted against `Cache::active_render_passes`.
-    total_renders: u32,
+    /// Render commands still accounted against `Cache::active_render_passes`.
+    active_renders: AtomicU32,
     /// Render commands of this job whose standby reservation has not yet been committed.
     unpublished_renders: AtomicU32,
     /// The VM cache holding the standby PB epoch pool.
@@ -1483,18 +1496,28 @@ pub(crate) struct Prepared {
 
 impl Drop for Prepared {
     fn drop(&mut self) {
-        let Some(cache) = self.cache.take() else {
+        let Some(cache) = &self.cache else {
             return;
         };
-        let previous = cache
-            .active_render_passes
-            .fetch_sub(self.total_renders, Ordering::AcqRel);
-        debug_assert!(previous >= self.total_renders);
-        let remaining = self.unpublished_renders.swap(0, Ordering::AcqRel);
-        cache.release_reserved(remaining);
+        cache.release_render_passes(*self.active_renders.get_mut());
+        cache.release_reserved(*self.unpublished_renders.get_mut());
     }
 }
 impl Prepared {
+    /// Returns canceled render credits even if the job stays retained for its published work.
+    /// The device lock serializes suffix discard with publication.
+    pub(crate) fn discard_unpublished_renders(&self) {
+        let Some(cache) = &self.cache else {
+            return;
+        };
+        let remaining = self.unpublished_renders.swap(0, Ordering::AcqRel);
+        if remaining != 0 {
+            self.active_renders.fetch_sub(remaining, Ordering::AcqRel);
+            cache.release_render_passes(remaining);
+            cache.release_reserved(remaining);
+        }
+    }
+
     pub(crate) fn compute(&self) -> Result<&ComputeUnitSet> {
         self.compute.as_deref().ok_or(EINVAL)
     }
