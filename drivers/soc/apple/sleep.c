@@ -3512,12 +3512,21 @@ static bool apple_sleep_refuse_ans_gp(struct apple_sleep *s, bool idled)
 	}
 	/*
 	 * Bound, it refuses whatever its domain reads at this moment: the host comes back cold
-	 * after a real sleep (the t5 trace), and no driver of it restores that yet.
+	 * after a real sleep (the t5 trace), and no driver of it restores that yet. Only
+	 * apple,pcie-host says which host that is: without it, or with no device behind it, a
+	 * bound host whose domain reads off at this moment would pass.
 	 */
-	if (s->gp_host_np) {
+	if (!s->gp_host_np) {
+		dev_err(s->dev, "refused: no apple,pcie-host names the PCIe host on APCIE_SYS_GP\n");
+		refused = true;
+	} else {
 		struct platform_device *host = of_find_device_by_node(s->gp_host_np);
 
-		if (host && READ_ONCE(host->dev.driver)) {
+		if (!host) {
+			dev_err(s->dev, "refused: %pOF, the PCIe host on APCIE_SYS_GP, has no device\n",
+				s->gp_host_np);
+			refused = true;
+		} else if (READ_ONCE(host->dev.driver)) {
 			dev_err(s->dev, "refused: %s is bound to the PCIe host on APCIE_SYS_GP, with no qualified stop\n",
 				dev_name(&host->dev));
 			refused = true;
@@ -8610,8 +8619,9 @@ static int apple_sleep_probe(struct platform_device *pdev)
 	}
 	if (s->soc->gp_host_apart) {
 		s->gp_host_np = of_parse_phandle(dev->of_node, "apple,pcie-host", 0);
-		if (s->gp_host_np &&
-		    devm_add_action_or_reset(dev, apple_sleep_put_node, s->gp_host_np))
+		if (!s->gp_host_np)
+			dev_warn(dev, "no apple,pcie-host: every deep sleep is refused\n");
+		else if (devm_add_action_or_reset(dev, apple_sleep_put_node, s->gp_host_np))
 			return -ENOMEM;
 	}
 	apple_sleep_map_pins(s);
