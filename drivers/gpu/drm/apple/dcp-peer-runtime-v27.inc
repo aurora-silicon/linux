@@ -112,7 +112,7 @@ static int dcp_peer_limited_stop_v27(struct apple_dcp *dcp, struct apple_dcp *pe
 int dcp_peer_modeset_v27(struct apple_dcp *dcp, u32 timing, u32 color, u32 min_vrr)
 {
 	struct apple_dcp *peer;
-	bool limited, prepared;
+	bool limited, prepared, vrr_only;
 	int ret = -EOPNOTSUPP;
 
 	if (!peer_scanout || !peer_allocation_probe ||
@@ -145,10 +145,29 @@ int dcp_peer_modeset_v27(struct apple_dcp *dcp, u32 timing, u32 color, u32 min_v
 			ret = -EBUSY;
 			goto unlock;
 		}
+		vrr_only = dcp->peer_tiling.modeset_complete &&
+			   peer->peer_tiling.modeset_complete &&
+			   dcp_peer_vrr_only_v27(&dcp->peer_frames, timing, color,
+						 min_vrr, dcp->output_hdr);
 	}
 	if (limited) {
 		ret = dcp_peer_limited_stop_v27(dcp, peer);
 		goto peer_unlock;
+	}
+	/*
+	 * Adaptive sync uses parameter 15 on both engines. Leave a running
+	 * pair installed when its timing and color are still current. If
+	 * either engine refuses the update, rebuild both with the new rate.
+	 */
+	if (vrr_only && !dcp_peer_param_v27(dcp, peer, 15, 3, min_vrr)) {
+		guard(mutex)(&dcp_peer_lock);
+		if (dcp_peer_vrr_only_v27(&dcp->peer_frames, timing, color,
+					  min_vrr, dcp->output_hdr)) {
+			dcp->peer_frames.min_vrr = min_vrr;
+			dev_dbg(dcp->dev, "paired adaptive sync minimum %#x\n", min_vrr);
+			ret = 0;
+			goto peer_unlock;
+		}
 	}
 	ret = dcp_peer_prepare_v27(dcp, peer, min_vrr);
 	if (ret)
@@ -158,7 +177,13 @@ int dcp_peer_modeset_v27(struct apple_dcp *dcp, u32 timing, u32 color, u32 min_v
 		dcp_peer_finish_v27(dcp, peer);
 	if (!ret) {
 		guard(mutex)(&dcp_peer_lock);
-		dcp->peer_frames = (struct dcp_peer_frames_v27){ .active = true };
+		dcp->peer_frames = (struct dcp_peer_frames_v27){
+			.timing = timing,
+			.color = color,
+			.min_vrr = min_vrr,
+			.output_hdr = dcp->output_hdr,
+			.active = true,
+		};
 		dev_info(dcp->dev, "paired DRM mode ready: timing=%u color=%u min_vrr=%#x\n",
 			 timing, color, min_vrr);
 	}
