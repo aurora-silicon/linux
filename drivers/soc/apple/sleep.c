@@ -7321,6 +7321,28 @@ static int apple_sleep_map_displays(struct apple_sleep *s)
 	return 0;
 }
 
+/*
+ * @res mapped as its bus asks: non-posted where the DT marks the bus nonposted-mmio, as these
+ * blocks' own drivers map them. Not claimed: those drivers share them. On T6030 a posted
+ * write to nub-spmi0 hangs the SoC; the same write non-posted goes through.
+ */
+static void apple_sleep_iounmap(void *base)
+{
+	iounmap((void __iomem *)base);
+}
+
+static void __iomem *apple_sleep_ioremap(struct device *dev, const struct resource *res)
+{
+	void __iomem *base;
+
+	if (!(res->flags & IORESOURCE_MEM_NONPOSTED))
+		return devm_ioremap(dev, res->start, resource_size(res));
+	base = ioremap_np(res->start, resource_size(res));
+	if (!base || devm_add_action_or_reset(dev, apple_sleep_iounmap, (void __force *)base))
+		return NULL;
+	return base;
+}
+
 static void __iomem *apple_sleep_map(struct device *dev, const char *name)
 {
 	struct device_node *np = dev->of_node;
@@ -7334,8 +7356,7 @@ static void __iomem *apple_sleep_map(struct device *dev, const char *name)
 	if (of_address_to_resource(np, index, &res))
 		return IOMEM_ERR_PTR(-EINVAL);
 
-	/* Shared with the drivers of these blocks, so not claimed. */
-	base = devm_ioremap(dev, res.start, resource_size(&res));
+	base = apple_sleep_ioremap(dev, &res);
 	if (!base)
 		return IOMEM_ERR_PTR(-ENOMEM);
 

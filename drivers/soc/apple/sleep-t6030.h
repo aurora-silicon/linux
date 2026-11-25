@@ -127,7 +127,7 @@ static u32 t6030_block(struct apple_sleep *s, u32 b)
 	if (of_address_to_resource(s->dev->of_node, b, &res) || !IS_ALIGNED(res.start, sizeof(u64)))
 		return 0;
 	/* Shared with the drivers of those blocks: not claimed */
-	t->blk[b] = devm_ioremap(s->dev, res.start, resource_size(&res));
+	t->blk[b] = apple_sleep_ioremap(s->dev, &res);
 	t->blk_size[b] = t->blk[b] ? resource_size(&res) : 0;
 	return t->blk_size[b];
 }
