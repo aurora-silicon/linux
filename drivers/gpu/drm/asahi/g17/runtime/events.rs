@@ -30,23 +30,6 @@ impl event::Transport for Service<'_> {
     fn roles(&self) -> &'static [Role] {
         self.firmware.roles()
     }
-    fn reports_after_signal(&self) -> bool {
-        self.firmware.init.is_m5()
-    }
-    fn trace(&mut self, role: Role) {
-        let firmware = &mut *self.firmware;
-        firmware
-            .rings
-            .drain_trace(&firmware.primary.state.shared.dev, &firmware.init, role);
-    }
-    fn statistics(&mut self, role: Role) {
-        let firmware = &mut *self.firmware;
-        firmware.observe_statistics_power();
-        firmware
-            .rings
-            .drain_statistics(&firmware.primary.state.shared.dev, &firmware.init, role);
-        firmware.observe_statistics_power();
-    }
     fn drain(
         &mut self,
         role: Role,
@@ -168,7 +151,8 @@ impl recovery::Memory for Service<'_> {
             }
         }
         let mut sources = self.firmware.init.fault_sources()?;
-        // M5 reads no firmware reason word; a latched MMU fault is reason 3.
+        // M5 attribution leaves the firmware reason out (see InitData::fault_sources); a
+        // latched MMU fault is reason 3.
         if mmu_fault && sources.reason.is_none() {
             sources.reason = Some(recovery::PAGE_FAULT);
         }
@@ -336,9 +320,8 @@ impl Firmware {
         Ok(())
     }
 
-    /// Drains every role's trace ring, then their statistics rings. On M5 the event worker calls
-    /// this after it has signalled the completions of its pass: the reports are not scheduling
-    /// inputs.
+    /// Drains every role's trace ring, then their statistics rings. The event worker calls this
+    /// after it has signalled the completions of its pass: the reports are not scheduling inputs.
     fn drain_reports(&mut self) {
         let dev = &self.primary.state.shared.dev;
         for &role in self.roles() {
@@ -391,6 +374,7 @@ impl Firmware {
             || self.hold.active()
             || self.registration_power_release_pending
             || self.effort.applied() != 0
+            || self.effort.streaming()
         {
             return Ok(false);
         }
@@ -431,10 +415,6 @@ impl Firmware {
     /// Preparation admission is already closed and all builders have joined.
     pub(super) fn service_runtime_recovery(&mut self, deferred: &mut DeferredBatch) -> Result {
         self.rings.invalidate_statistics();
-        if self.recovery.restart_limit(super::now_ns()) {
-            pr_warn!("G17: restart storm limit reached\n");
-            return Err(ETIMEDOUT);
-        }
         let shared = self.primary.state.shared.clone();
         let mut service = Service {
             firmware: self,
@@ -453,8 +433,19 @@ impl Firmware {
             .set_generation(service.firmware.recovery.generation());
         service.firmware.rings.invalidate_statistics();
         let result = result?;
-        if result.leftover && service.firmware.recovery.forgive_restart() {
-            pr_warn!("G17: recovery dropped queued work of an already failed VM; not counted as a restart storm\n");
+        // Counted once the restart is classified, so the restart that reaches the limit has
+        // still been serviced. One charged to its guilty clients costs them their devices and
+        // nobody else anything; counted for the device, a program that faulted the GPU eight
+        // times, opening it again each time, or that had queued eight faulting renders, stopped
+        // it for every client until reboot.
+        if !result.charged {
+            if service.firmware.recovery.restart_limit(super::now_ns()) {
+                pr_warn!("G17: restart storm limit reached\n");
+                return Err(ETIMEDOUT);
+            }
+            if result.leftover && service.firmware.recovery.forgive_restart() {
+                pr_warn!("G17: recovery dropped queued work of an already failed VM; not counted as a restart storm\n");
+            }
         }
         if let Some(error) = result.target_error {
             dev_warn!(
@@ -549,10 +540,8 @@ impl crate::g17::Shared {
         if self.crashed.load(core::sync::atomic::Ordering::Acquire) {
             return Err(EIO);
         }
-        if firmware.init.is_m5() {
-            // The completions above are signalled; the reports that arrived with them come after.
-            firmware.drain_reports();
-        }
+        // The completions above are signalled; the reports that arrived with them come after.
+        firmware.drain_reports();
         if recover {
             firmware.service_runtime_recovery(deferred)?;
             if !firmware.recovery.pending()

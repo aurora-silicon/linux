@@ -20,6 +20,10 @@
 #include <linux/string.h>
 #include <linux/suspend.h>
 
+#if IS_ENABLED(CONFIG_APPLE_RTKIT_HELPER_KUNIT_TEST)
+#include <kunit/static_stub.h>
+#endif
+
 #define APPLE_ASC_CPU_CONTROL		0x44
 #define APPLE_ASC_CPU_CONTROL_RUN	BIT(4)
 
@@ -299,7 +303,7 @@ static int apple_rtkit_helper_probe(struct platform_device *pdev)
 			helper->preserved = true;
 	}
 
-	if (!live && apple_t8132_live_mtp() && of_machine_is_compatible("apple,t8132")) {
+	if (!live && apple_t8132_live_mtp()) {
 		struct property *prop;
 		u32 inherited;
 		int len;
@@ -398,9 +402,18 @@ static void apple_rtkit_helper_remove(struct platform_device *pdev)
 	writel_relaxed(0, helper->asc_base + APPLE_ASC_CPU_CONTROL);
 }
 
+/* The AP power notice itself: the KUnit test replaces it with a static stub. */
+static int apple_rtkit_helper_send_ap_power(struct apple_rtkit_helper *helper, bool on)
+{
+#if IS_ENABLED(CONFIG_APPLE_RTKIT_HELPER_KUNIT_TEST)
+	KUNIT_STATIC_STUB_REDIRECT(apple_rtkit_helper_send_ap_power, helper, on);
+#endif
+	return apple_rtkit_ap_power(helper->rtk, on);
+}
+
 static int apple_rtkit_helper_ap_power(struct apple_rtkit_helper *helper, bool on)
 {
-	int ret = apple_rtkit_ap_power(helper->rtk, on);
+	int ret = apple_rtkit_helper_send_ap_power(helper, on);
 
 	if (ret)
 		dev_err(helper->dev, "AP power notice (%s) not answered: %d\n",
@@ -433,7 +446,7 @@ static int apple_rtkit_helper_ap_idle(struct apple_rtkit_helper *helper)
 		}
 		helper->idle_pending = false;
 		dev_info(helper->dev, "the last AP idle notice was answered late, sending AP on first\n");
-		if (apple_rtkit_ap_power(helper->rtk, true)) {
+		if (apple_rtkit_helper_send_ap_power(helper, true)) {
 			dev_err(helper->dev, "AP on after the late answer not answered: no sleep\n");
 			helper->idle_pending = true;
 			return -EBUSY;
@@ -543,7 +556,11 @@ static int __maybe_unused apple_rtkit_helper_suspend(struct device *dev)
 
 	if (helper->adopted && pm_suspend_target_state != PM_SUSPEND_TO_IDLE)
 		return -EBUSY;
-	if (!helper->adopted || !of_machine_is_compatible("apple,j613"))
+	/*
+	 * An adopted session (apple,rtkit-handoff) was handed over running
+	 * because it cannot be restarted, whatever the board.
+	 */
+	if (!helper->adopted)
 		return 0;
 	if (!(readl(helper->asc_base + APPLE_ASC_CPU_CONTROL) & APPLE_ASC_CPU_CONTROL_RUN))
 		return -EHOSTDOWN;
@@ -559,7 +576,7 @@ static int __maybe_unused apple_rtkit_helper_resume(struct device *dev)
 
 	/* After a firmware-driven suspend's idle notice; nothing otherwise. */
 	apple_rtkit_helper_ap_on(helper);
-	if (!helper->adopted || !of_machine_is_compatible("apple,j613"))
+	if (!helper->adopted)
 		return 0;
 	if (!(readl(helper->asc_base + APPLE_ASC_CPU_CONTROL) & APPLE_ASC_CPU_CONTROL_RUN)) {
 		dev_err(dev, "adopted MTP lost ASC RUN; refusing firmware restart\n");
@@ -611,3 +628,7 @@ module_platform_driver(apple_rtkit_helper_driver);
 MODULE_AUTHOR("Hector Martin <marcan@marcan.st>");
 MODULE_LICENSE("Dual MIT/GPL");
 MODULE_DESCRIPTION("Apple RTKit helper driver");
+
+#if IS_ENABLED(CONFIG_APPLE_RTKIT_HELPER_KUNIT_TEST)
+#include "rtkit-helper-test.c"
+#endif

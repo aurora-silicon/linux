@@ -47,6 +47,9 @@ struct dcp_audio_link_format {
 bool dcp_audiosrv_link_by_format(struct device *dev);
 
 bool dcp_audiosrv_native_link(struct device *dev);
+/* The published audio service instance; whether it was replaced since @gen */
+u64 dcp_audiosrv_instance(struct device *dev);
+bool dcp_audiosrv_replaced(struct device *dev, u64 gen);
 int dcp_audiosrv_open(struct device *dev);
 void dcp_audiosrv_close(struct device *dev);
 int dcp_audiosrv_link(struct device *dev, enum dcp_audio_link op,

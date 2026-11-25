@@ -102,6 +102,16 @@ struct avd_h264_ctx {
 	struct avd_bank bank[AVD_H264_BANKS];
 	/* bank of the picture being built */
 	struct avd_bank *b;
+
+	/* What the run being built took from the controls, see avd_ctrl_copy(). */
+	struct {
+		struct v4l2_ctrl_h264_decode_params decode_params;
+		struct v4l2_ctrl_h264_sps sps;
+		struct v4l2_ctrl_h264_pps pps;
+		struct v4l2_ctrl_h264_slice_params slice_params;
+		struct v4l2_ctrl_h264_scaling_matrix scaling_matrix;
+		struct v4l2_ctrl_h264_pred_weights pred_weights;
+	} params;
 };
 
 /* ffmpeg submits wrong timestamp, use first_mb_in_slice as a workaround */
@@ -672,9 +682,42 @@ static int avd_h264_validate_slice(struct avd_ctx *ctx,
 	return 0;
 }
 
-static int avd_h264_validate_sps(struct avd_ctx *ctx,
-				 const struct v4l2_ctrl_h264_sps *sps)
+static enum avd_image_fmt
+avd_h264_sps_image_fmt(const struct v4l2_ctrl_h264_sps *sps)
 {
+	if (sps->bit_depth_luma_minus8 == 0) {
+		if (sps->chroma_format_idc == 2)
+			return AVD_IMG_FMT_422_8BIT;
+		else
+			return AVD_IMG_FMT_420_8BIT;
+	} else if (sps->bit_depth_luma_minus8 == 2) {
+		if (sps->chroma_format_idc == 2)
+			return AVD_IMG_FMT_422_10BIT;
+		else
+			return AVD_IMG_FMT_420_10BIT;
+	}
+
+	return AVD_IMG_FMT_ANY;
+}
+
+/*
+ * H.264 7.4.2.1.1: the picture is PicWidthInMbs macroblocks wide and
+ * FrameHeightInMbs = (2 - frame_mbs_only_flag) * PicHeightInMapUnits high.
+ * The decoded buffers and the per-row scratch are sized from the OUTPUT
+ * format, which S_FMT rounds up to whole macroblocks, so a picture must fit
+ * in it.
+ */
+VISIBLE_IF_KUNIT int
+avd_h264_validate_sps_fmt(struct avd_ctx *ctx,
+			  const struct v4l2_ctrl_h264_sps *sps)
+{
+	u32 width = (sps->pic_width_in_mbs_minus1 + 1) * 16;
+	u32 height = (sps->pic_height_in_map_units_minus1 + 1) * 16 *
+		     (sps->flags & V4L2_H264_SPS_FLAG_FRAME_MBS_ONLY ? 1 : 2);
+
+	if (width > ctx->coded_fmt.fmt.pix_mp.width ||
+	    height > ctx->coded_fmt.fmt.pix_mp.height)
+		return -EINVAL;
 	if (sps->chroma_format_idc > 2)
 		/* Only 4:0:0, 4:2:0 and 4:2:2 are supported */
 		return -EINVAL;
@@ -691,12 +734,43 @@ static int avd_h264_validate_sps(struct avd_ctx *ctx,
 	if (sps->chroma_format_idc == 2 && sps->bit_depth_luma_minus8 == 2)
 		/* 4:2:2 10 bit would need P210; P010 is too small for its chroma */
 		return -EINVAL;
+
+	return 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(avd_h264_validate_sps_fmt);
+
+VISIBLE_IF_KUNIT int avd_h264_validate_sps(struct avd_ctx *ctx,
+					   const struct v4l2_ctrl_h264_sps *sps)
+{
+	int ret = avd_h264_validate_sps_fmt(ctx, sps);
+
+	if (ret)
+		return ret;
 	if (!(sps->flags & V4L2_H264_SPS_FLAG_FRAME_MBS_ONLY))
 		/* no interlaced support */
 		return -EINVAL;
 
 	return 0;
 }
+EXPORT_SYMBOL_IF_KUNIT(avd_h264_validate_sps);
+
+static bool avd_h264_sps_is_fmt_init(const struct v4l2_ctrl_h264_sps *sps)
+{
+	return !sps->flags && !sps->pic_width_in_mbs_minus1 &&
+	       !sps->pic_height_in_map_units_minus1;
+}
+
+VISIBLE_IF_KUNIT int
+avd_h264_validate_sps_ctrl(struct avd_ctx *ctx,
+			   const struct v4l2_ctrl_h264_sps *sps,
+			   bool streaming)
+{
+	if (!streaming && avd_h264_sps_is_fmt_init(sps))
+		return avd_h264_validate_sps_fmt(ctx, sps);
+
+	return avd_h264_validate_sps(ctx, sps);
+}
+EXPORT_SYMBOL_IF_KUNIT(avd_h264_validate_sps_ctrl);
 
 /* Free the slices held for one bank's picture. */
 static void avd_h264_drop_bank_slices(struct avd_ctx *ctx, struct avd_bank *bank)
@@ -715,6 +789,7 @@ static void avd_h264_stop(struct avd_ctx *ctx)
 	unsigned int i;
 
 	ctx->max_frames = 1;
+	ctx->scratch_sized = false;
 	if (!h264_ctx)
 		return;
 
@@ -736,6 +811,9 @@ static void avd_h264_stop(struct avd_ctx *ctx)
 	ctx->priv = NULL;
 }
 
+VISIBLE_IF_KUNIT size_t
+avd_h264_start_slices(const struct v4l2_ctrl_h264_sps *sps);
+
 static int avd_h264_start(struct avd_ctx *ctx)
 {
 	struct avd_h264_ctx *h264_ctx;
@@ -746,11 +824,19 @@ static int avd_h264_start(struct avd_ctx *ctx)
 	if (!ctrl)
 		return -EINVAL;
 
-	ret = avd_h264_validate_sps(ctx, ctrl->p_new.p_h264_sps);
+	/*
+	 * Pre-streaming format-negotiation controls (for example Chromium's
+	 * V4L2VideoDecoder::SetExtCtrlsInit) populate chroma format and bit
+	 * depth with flags and dimensions zeroed before the first frame
+	 * request supplies the parsed SPS. Allow that minimal init control
+	 * here while rejecting populated interlaced SPS structs upfront;
+	 * avd_h264_run() enforces full avd_h264_validate_sps() per frame.
+	 */
+	ret = avd_h264_validate_sps_ctrl(ctx, ctrl->p_cur.p_h264_sps, false);
 	if (ret)
 		return ret;
 
-	h264_ctx = kzalloc(sizeof(*h264_ctx), GFP_KERNEL);
+	h264_ctx = kzalloc(sizeof(*h264_ctx), GFP_KERNEL_ACCOUNT);
 	if (!h264_ctx)
 		return -ENOMEM;
 
@@ -762,11 +848,10 @@ static int avd_h264_start(struct avd_ctx *ctx)
 	for (unsigned int i = 0; i < h264_ctx->nbanks; i++) {
 		struct avd_bank *bank = &h264_ctx->bank[i];
 
-		/* assume one slice per row */
 		bank->alloc_slice_num =
-			ctrl->p_new.p_h264_sps->pic_height_in_map_units_minus1 + 1;
+			avd_h264_start_slices(ctrl->p_cur.p_h264_sps);
 		bank->slices = kcalloc(bank->alloc_slice_num,
-				       sizeof(*bank->slices), GFP_KERNEL);
+				       sizeof(*bank->slices), GFP_KERNEL_ACCOUNT);
 		if (!bank->slices) {
 			ret = -ENOMEM;
 			goto err_free_ctx;
@@ -777,6 +862,9 @@ static int avd_h264_start(struct avd_ctx *ctx)
 			goto err_free_ctx;
 	}
 	ctx->max_frames = h264_ctx->nbanks;
+	/* avd_h264_alloc_bufs() sized the scratch rows for this depth */
+	ctx->scratch_fmt = ctx->image_fmt;
+	ctx->scratch_sized = true;
 
 	return 0;
 
@@ -785,27 +873,10 @@ err_free_ctx:
 	return ret;
 }
 
-static void avd_h264_run_preamble(struct avd_ctx *ctx, struct avd_h264_run *run)
+static int avd_h264_run_preamble(struct avd_ctx *ctx, struct avd_h264_run *run)
 {
-	struct v4l2_ctrl *ctrl;
+	struct avd_h264_ctx *h264_ctx = ctx->priv;
 	u32 dst_len, mv_color_len;
-
-	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
-			      V4L2_CID_STATELESS_H264_DECODE_PARAMS);
-	run->decode_params = ctrl ? ctrl->p_cur.p : NULL;
-	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl, V4L2_CID_STATELESS_H264_SPS);
-	run->sps = ctrl ? ctrl->p_cur.p : NULL;
-	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl, V4L2_CID_STATELESS_H264_PPS);
-	run->pps = ctrl ? ctrl->p_cur.p : NULL;
-	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
-			      V4L2_CID_STATELESS_H264_SLICE_PARAMS);
-	run->slice_params = ctrl ? ctrl->p_cur.p : NULL;
-	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
-			      V4L2_CID_STATELESS_H264_SCALING_MATRIX);
-	run->scaling_matrix = ctrl ? ctrl->p_cur.p : NULL;
-	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
-			      V4L2_CID_STATELESS_H264_PRED_WEIGHTS);
-	run->pred_weights = ctrl ? ctrl->p_cur.p : NULL;
 
 	avd_run_preamble(ctx, &run->base);
 
@@ -814,6 +885,43 @@ static void avd_h264_run_preamble(struct avd_ctx *ctx, struct avd_h264_run *run)
 	mv_color_len = mv_color_size(ctx, fmt_width(ctx), fmt_height(ctx));
 
 	run->addresses.mv_color = run->base.y_out + (dst_len - mv_color_len);
+
+	if (run->base.setup_err)
+		return run->base.setup_err;
+
+	/*
+	 * The checks in avd_h264_run() and the builders must see the same
+	 * parameters, and the controls can be set again at any time: use
+	 * copies.
+	 */
+	if (avd_ctrl_copy(ctx, V4L2_CID_STATELESS_H264_DECODE_PARAMS,
+			  &h264_ctx->params.decode_params,
+			  sizeof(h264_ctx->params.decode_params)) ||
+	    avd_ctrl_copy(ctx, V4L2_CID_STATELESS_H264_SPS,
+			  &h264_ctx->params.sps,
+			  sizeof(h264_ctx->params.sps)) ||
+	    avd_ctrl_copy(ctx, V4L2_CID_STATELESS_H264_PPS,
+			  &h264_ctx->params.pps,
+			  sizeof(h264_ctx->params.pps)) ||
+	    avd_ctrl_copy(ctx, V4L2_CID_STATELESS_H264_SLICE_PARAMS,
+			  &h264_ctx->params.slice_params,
+			  sizeof(h264_ctx->params.slice_params)) ||
+	    avd_ctrl_copy(ctx, V4L2_CID_STATELESS_H264_SCALING_MATRIX,
+			  &h264_ctx->params.scaling_matrix,
+			  sizeof(h264_ctx->params.scaling_matrix)) ||
+	    avd_ctrl_copy(ctx, V4L2_CID_STATELESS_H264_PRED_WEIGHTS,
+			  &h264_ctx->params.pred_weights,
+			  sizeof(h264_ctx->params.pred_weights)))
+		return -EINVAL;
+
+	run->decode_params = &h264_ctx->params.decode_params;
+	run->sps = &h264_ctx->params.sps;
+	run->pps = &h264_ctx->params.pps;
+	run->slice_params = &h264_ctx->params.slice_params;
+	run->scaling_matrix = &h264_ctx->params.scaling_matrix;
+	run->pred_weights = &h264_ctx->params.pred_weights;
+
+	return 0;
 }
 
 static int avd_h264_realloc_slices(struct avd_ctx *ctx, size_t max_slices)
@@ -854,6 +962,7 @@ static int avd_h264_realloc_slices(struct avd_ctx *ctx, size_t max_slices)
 
 	memcpy(ctx->job.segments, tmp,
 	       sizeof(*ctx->job.segments) * (ctx->job.num + 1));
+	ctx->job.max = alloc_slice_num + 1;
 	kvfree(tmp);
 
 	return 0;
@@ -921,6 +1030,15 @@ static size_t avd_h264_max_slices(const struct v4l2_ctrl_h264_sps *sps)
 
 	return min_t(size_t, mbs, MAX_SLICES);
 }
+
+/* Slice table entries made at STREAMON: one slice per row to begin with. */
+VISIBLE_IF_KUNIT size_t
+avd_h264_start_slices(const struct v4l2_ctrl_h264_sps *sps)
+{
+	return min_t(size_t, sps->pic_height_in_map_units_minus1 + 1,
+		     avd_h264_max_slices(sps));
+}
+EXPORT_SYMBOL_IF_KUNIT(avd_h264_start_slices);
 
 /*
  * Coded data held for one picture. A picture of PCM macroblocks is about the
@@ -995,19 +1113,15 @@ static int avd_h264_run(struct avd_ctx *ctx)
 		      h264_ctx->b->slice_num : 0;
 	int ret;
 
-	avd_h264_run_preamble(ctx, &run);
-
-	if (run.base.setup_err) {
-		ret = run.base.setup_err;
+	ret = avd_h264_run_preamble(ctx, &run);
+	if (ret)
 		goto err_free_jobs;
-	}
-	if (!run.sps || !run.pps || !run.slice_params || !run.decode_params) {
-		ret = -EINVAL;
-		goto err_free_jobs;
-	}
 
 	/* Recheck controls applied from this request before building instructions. */
 	ret = avd_h264_validate_sps(ctx, run.sps);
+	if (!ret)
+		ret = avd_check_run_image_fmt(ctx,
+					      avd_h264_sps_image_fmt(run.sps));
 	if (!ret)
 		ret = avd_h264_validate_pps(ctx, run.pps);
 	if (!ret)
@@ -1166,24 +1280,10 @@ static void avd_h264_done(struct avd_ctx *ctx, struct vb2_v4l2_buffer *src_buf,
 static enum avd_image_fmt avd_h264_get_image_fmt(struct avd_ctx *ctx,
 						 struct v4l2_ctrl *ctrl)
 {
-	const struct v4l2_ctrl_h264_sps *sps = ctrl->p_new.p_h264_sps;
-
 	if (ctrl->id != V4L2_CID_STATELESS_H264_SPS)
 		return AVD_IMG_FMT_ANY;
 
-	if (sps->bit_depth_luma_minus8 == 0) {
-		if (sps->chroma_format_idc == 2)
-			return AVD_IMG_FMT_422_8BIT;
-		else
-			return AVD_IMG_FMT_420_8BIT;
-	} else if (sps->bit_depth_luma_minus8 == 2) {
-		if (sps->chroma_format_idc == 2)
-			return AVD_IMG_FMT_422_10BIT;
-		else
-			return AVD_IMG_FMT_420_10BIT;
-	}
-
-	return AVD_IMG_FMT_ANY;
+	return avd_h264_sps_image_fmt(ctrl->p_new.p_h264_sps);
 }
 
 static void avd_h264_adjust_decoded_fmt(struct avd_ctx *ctx,
@@ -1195,8 +1295,16 @@ static void avd_h264_adjust_decoded_fmt(struct avd_ctx *ctx,
 
 static int avd_h264_try_ctrl(struct avd_ctx *ctx, struct v4l2_ctrl *ctrl)
 {
-	if (ctrl->id == V4L2_CID_STATELESS_H264_SPS)
-		return avd_h264_validate_sps(ctx, ctrl->p_new.p_h264_sps);
+	if (ctrl->id == V4L2_CID_STATELESS_H264_SPS) {
+		struct vb2_queue *vq =
+			ctx->fh.m2m_ctx ?
+				v4l2_m2m_get_vq(ctx->fh.m2m_ctx,
+						V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) :
+				NULL;
+
+		return avd_h264_validate_sps_ctrl(ctx, ctrl->p_new.p_h264_sps,
+						  vq && vb2_is_streaming(vq));
+	}
 	if (ctrl->id == V4L2_CID_STATELESS_H264_PPS)
 		return avd_h264_validate_pps(ctx, ctrl->p_new.p_h264_pps);
 	if (ctrl->id == V4L2_CID_STATELESS_H264_SLICE_PARAMS)

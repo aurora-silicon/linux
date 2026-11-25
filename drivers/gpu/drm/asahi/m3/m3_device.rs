@@ -173,12 +173,70 @@ impl Device {
         self.sgx.try_access().ok_or(ENODEV)?.as_view().try_read32(0xe01000)
     }
 
+    /// Read-only MMU fault bank & engine busy snapshot for Extended (26.x/27.2)
+    /// profiles. Returns `Ok(true)` if any cluster fault bank has its valid bit set.
+    /// Does not acknowledge or clear hardware fault banks, and always restores
+    /// the bank selector register (`0xd800`) on exit.
+    pub(crate) fn log_extended_fault_banks(&self, vm: &crate::mmu::Vm) -> Result<bool> {
+        let sgx_guard = self.sgx.try_access().ok_or(ENODEV)?;
+        let sgx = sgx_guard.as_view();
+        let pstate = sgx.try_read32(0xe01000)? & 0xf;
+        if pstate == 0 {
+            dev_info!(
+                self.dev.as_ref(),
+                "M3 {}: GPU is powered down; skipping fault-bank snapshot\n",
+                self.soc.gpu_name
+            );
+            return Ok(false);
+        }
+        let check_busy = crate::m3::m3_params::retire_mmio(self.soc)
+            & crate::m3::m3_params::RETIRE_MMIO_BUSY
+            != 0;
+        let (c020, c120) = if check_busy {
+            (sgx.try_read64(0xc020)?, sgx.try_read64(0xc120)?)
+        } else {
+            (0, 0)
+        };
+        let selector = sgx.try_read64(0xd800)?;
+        let result = (|| -> Result<bool> {
+            let mut any_fault = false;
+            for bank in 0..u64::from(self.soc.clusters) {
+                sgx.try_write64(bank, 0xd800)?;
+                let address = sgx.try_read64(0xd8c8)?;
+                let fault = sgx.try_read64(0xd8c0)?;
+                dev_info!(
+                    self.dev.as_ref(),
+                    "M3 {}: pstate={} busy={:#x}/{:#x} bank {} fault={:#x} address={:#x}\n",
+                    self.soc.gpu_name,
+                    pstate,
+                    c020,
+                    c120,
+                    bank,
+                    fault,
+                    address << 6
+                );
+                if fault & 1 != 0 {
+                    any_fault = true;
+                    dev_info!(
+                        self.dev.as_ref(),
+                        "M3 fault mapping bank={} address={:#x} translation={:?}\n",
+                        bank,
+                        address << 6,
+                        vm.translate_iova(address << 6)
+                    );
+                }
+            }
+            Ok(any_fault)
+        })();
+        let _ = sgx.try_write64(selector, 0xd800);
+        result
+    }
+
     /// Read-only snapshot. Do not select or acknowledge fault banks here;
     /// the firmware owns those registers until recovery is ported.
     pub(crate) fn log_engine_state(&self, vm: &crate::mmu::Vm) -> Result {
         if self.firmware.profile() == super::m3_profile::Profile::Extended {
-            // Adaptive clock gating can leave individual engine banks inaccessible
-            // even while the GPU performance-state register says powered up.
+            let _ = self.log_extended_fault_banks(vm)?;
             return Ok(());
         }
         let sgx_guard = self.sgx.try_access().ok_or(ENODEV)?;
