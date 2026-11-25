@@ -26,23 +26,10 @@ enum {
 enum { T6050_DART_SEP, T6050_DART_PMP0, T6050_DART_SIO, T6050_DART_DCP, T6050_DART_APCIE0 };
 
 /*
- * Register sequences the boot loader supplies for the radio's link and the shared PCIe PHY,
- * as <kind block offset value> each, run in order. Bits 7:0 of kind: write the value, read,
- * set the value's bits, clear them, write back what is read, wait for the value's bits to be
- * set, wait for them to be clear, a 16-bit write. Bits 31:16: a wait's timeout in ms (0: 10
- * ms); bit 8: its timeout is not an error.
- */
-enum {
-	T6050_OP_WRITE, T6050_OP_READ, T6050_OP_SET, T6050_OP_CLEAR, T6050_OP_REWRITE,
-	T6050_OP_WAIT_SET, T6050_OP_WAIT_CLEAR, T6050_OP_WRITE16, T6050_OP_KINDS,
-};
-#define T6050_OP_KIND		GENMASK(7, 0)
-#define T6050_OP_OPTIONAL	BIT(8)
-#define T6050_OP_TIMEOUT	GENMASK(31, 16)
-
-/* The blocks: the radio host's config, port0 (0x24000 from it), phy0, rc, phy0's four port words
- * (0x10000 from it) and the PHY's common page below them, then the sleep's storage-phy and
- * storage-phy-ip.
+ * Register sequences the boot loader supplies for the radio's link and the shared PCIe PHY, in
+ * the core's DT format (struct sleep_seq), on these blocks: the radio host's config, port0
+ * (0x24000 from it), phy0, rc, phy0's four port words (0x10000 from it) and the PHY's common
+ * page below them, then the sleep's storage-phy and storage-phy-ip.
  */
 enum {
 	T6050_RBLK_CONFIG, T6050_RBLK_PORT, T6050_RBLK_PHY, T6050_RBLK_RC, T6050_RBLK_LANES,
@@ -64,11 +51,6 @@ enum {
 enum {
 	T6050_SEQ_BOOT, T6050_SEQ_STAGE, T6050_SEQ_WDT, T6050_SEQ_AFR, T6050_SEQ_SIO,
 	T6050_SEQ_DISP_GATE, T6050_SEQS,
-};
-
-struct t6050_ops {
-	const u32 *op;
-	unsigned int n;
 };
 
 /* An SPMI controller's peripheral sources: eight words of 32 */
@@ -144,7 +126,7 @@ struct apple_sleep_region_state {
 	/* The radio's and the shared PHY's register sequences from the DT, and their blocks */
 	void __iomem *rblk[T6050_RBLK_COUNT];
 	u32 rblk_size[T6050_RBLK_COUNT];
-	struct t6050_ops link_down, link_down_port, port_wake, dart_wake, phy_park, phy_down,
+	struct sleep_seq link_down, link_down_port, port_wake, dart_wake, phy_park, phy_down,
 			 phy_wake, seq[T6050_SEQS];
 	/* From the DT: the commit schedule, the word lists the entry and the wake take */
 	u32 sched[T6050_STEPS];
@@ -673,7 +655,7 @@ static bool t6050_storage_phy_up(struct apple_sleep *s)
 	       sleep_ps_on(s, SLEEP_REGION_WORD(T6050_PS1, T6050_PS1_APHY_ST0_AUS5));
 }
 
-static unsigned int t6050_ops_run(struct apple_sleep *s, const struct t6050_ops *ops);
+static unsigned int t6050_ops_run(struct apple_sleep *s, const struct sleep_seq *ops);
 
 /* The DT's apple,phy-park */
 static void t6050_storage_phy_park(struct apple_sleep *s)
@@ -996,17 +978,20 @@ static void t6050_sleep_boot_auto(struct apple_sleep *s)
 		r->spmi_runtime_mask = readl(s->spmi + M5_SPMI_IRQ_EN);
 }
 
-/* A block an op names: the radio's and the PHY's, an SPMI bus, or one of this node's reg entries */
-static bool t6050_ops_block(struct apple_sleep *s, u32 b)
+/*
+ * The size of the block an op names, mapped: the radio's and the PHY's, an SPMI bus, or one of
+ * this node's reg entries. 0 where there is none.
+ */
+static u32 t6050_ops_block(struct apple_sleep *s, u32 b)
 {
 	struct apple_sleep_region_state *r = s->region;
 	struct device_node *np = s->dev->of_node;
 	struct resource res;
 
 	if (b >= T6050_RBLK_COUNT)
-		return false;
+		return 0;
 	if (r->rblk[b])
-		return true;
+		return r->rblk_size[b];
 	if (b >= T6050_RBLK_SPMI && b < T6050_RBLK_SPMI + ARRAY_SIZE(r->spmi_bus)) {
 		struct device_node *bus = of_parse_phandle(np, "apple,spmi-buses", b - T6050_RBLK_SPMI);
 
@@ -1020,82 +1005,18 @@ static bool t6050_ops_block(struct apple_sleep *s, u32 b)
 		r->rblk[b] = of_iomap(np, b - T6050_RBLK_NODE);
 		r->rblk_size[b] = r->rblk[b] ? resource_size(&res) : 0;
 	}
-	return r->rblk[b];
+	return r->rblk[b] ? r->rblk_size[b] : 0;
 }
 
-static int t6050_ops_get(struct apple_sleep *s, const char *name, struct t6050_ops *ops)
+static int t6050_ops_get(struct apple_sleep *s, const char *name, struct sleep_seq *ops)
 {
-	struct apple_sleep_region_state *r = s->region;
-	int len = of_property_count_u32_elems(s->dev->of_node, name);
-	unsigned int i;
-	u32 *op;
-
-	ops->n = 0;
-	if (len <= 0)
-		return 0;
-	if (len % 4)
-		return dev_err_probe(s->dev, -EINVAL, "%s: not in fours\n", name);
-	op = devm_kcalloc(s->dev, len, sizeof(*op), GFP_KERNEL);
-	if (!op)
-		return -ENOMEM;
-	if (of_property_read_u32_array(s->dev->of_node, name, op, len))
-		return -EINVAL;
-	/* A sequence naming a block this DT doesn't map is left out, not run in part. */
-	for (i = 0; i < len; i += 4)
-		if (FIELD_GET(T6050_OP_KIND, op[i]) >= T6050_OP_KINDS ||
-		    !t6050_ops_block(s, op[i + 1]) || op[i + 2] % 2 ||
-		    op[i + 2] + 4 > r->rblk_size[op[i + 1]]) {
-			dev_warn(s->dev, "%s: entry %u outside its block, not used\n", name, i / 4);
-			devm_kfree(s->dev, op);
-			return 0;
-		}
-	ops->op = op;
-	ops->n = len / 4;
-	return 0;
+	return sleep_seq_get(s, name, ops, t6050_ops_block);
 }
 
 /* The number of waits that timed out, other than the optional ones */
-static unsigned int t6050_ops_run(struct apple_sleep *s, const struct t6050_ops *ops)
+static unsigned int t6050_ops_run(struct apple_sleep *s, const struct sleep_seq *ops)
 {
-	unsigned int i, timeouts = 0;
-	u32 v;
-
-	for (i = 0; i < ops->n; i++) {
-		const u32 *op = &ops->op[4 * i];
-		void __iomem *reg = s->region->rblk[op[1]] + op[2];
-		u32 ms = FIELD_GET(T6050_OP_TIMEOUT, op[0]) ?: 10;
-		int ret = 0;
-
-		switch (FIELD_GET(T6050_OP_KIND, op[0])) {
-		case T6050_OP_WRITE:
-			writel(op[3], reg);
-			break;
-		case T6050_OP_READ:
-			readl(reg);
-			break;
-		case T6050_OP_SET:
-			writel(readl(reg) | op[3], reg);
-			break;
-		case T6050_OP_CLEAR:
-			writel(readl(reg) & ~op[3], reg);
-			break;
-		case T6050_OP_REWRITE:
-			writel(readl(reg), reg);
-			break;
-		case T6050_OP_WAIT_SET:
-			ret = readl_poll_timeout_atomic(reg, v, (v & op[3]) == op[3], 1, ms * 1000);
-			break;
-		case T6050_OP_WAIT_CLEAR:
-			ret = readl_poll_timeout_atomic(reg, v, !(v & op[3]), 1, ms * 1000);
-			break;
-		case T6050_OP_WRITE16:
-			writew(op[3], reg);
-			break;
-		}
-		if (ret && !(op[0] & T6050_OP_OPTIONAL))
-			timeouts++;
-	}
-	return timeouts;
+	return sleep_seq_run(s->region->rblk, ops);
 }
 
 /* The shared PHY's blocks, then every sequence the DT gives */

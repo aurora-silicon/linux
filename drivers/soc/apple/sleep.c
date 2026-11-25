@@ -7688,6 +7688,108 @@ static void apple_sleep_put_node(void *np)
 	of_node_put(np);
 }
 
+/*
+ * A register sequence the device tree supplies, as <kind block offset value> each, run in
+ * order. Bits 7:0 of kind: write the value, read, set the value's bits, clear them, write back
+ * what is read, wait for the value's bits to be set, wait for them to be clear, a 16-bit write.
+ * Bits 31:16: a wait's timeout in ms (0: 10 ms); bit 8: its timeout is not an error. What a
+ * block number names is the profile's own.
+ */
+enum {
+	SLEEP_OP_WRITE, SLEEP_OP_READ, SLEEP_OP_SET, SLEEP_OP_CLEAR, SLEEP_OP_REWRITE,
+	SLEEP_OP_WAIT_SET, SLEEP_OP_WAIT_CLEAR, SLEEP_OP_WRITE16, SLEEP_OP_KINDS,
+};
+
+#define SLEEP_OP_KIND		GENMASK(7, 0)
+#define SLEEP_OP_OPTIONAL	BIT(8)
+#define SLEEP_OP_TIMEOUT	GENMASK(31, 16)
+
+struct sleep_seq {
+	const u32 *op;
+	unsigned int n;
+};
+
+/*
+ * The DT property @name as a sequence. @block_size gives the size of block @b, mapping it if
+ * needed, or 0 where the profile has no such block. A sequence that names a block the DT
+ * doesn't map, or an offset outside it, is left out, not run in part. 0 also without one.
+ */
+static int sleep_seq_get(struct apple_sleep *s, const char *name, struct sleep_seq *seq,
+			 u32 (*block_size)(struct apple_sleep *s, u32 b))
+{
+	int len = of_property_count_u32_elems(s->dev->of_node, name);
+	unsigned int i;
+	u32 *op, size;
+
+	seq->n = 0;
+	if (len <= 0)
+		return 0;
+	if (len % 4)
+		return dev_err_probe(s->dev, -EINVAL, "%s: not in fours\n", name);
+	op = devm_kcalloc(s->dev, len, sizeof(*op), GFP_KERNEL);
+	if (!op)
+		return -ENOMEM;
+	if (of_property_read_u32_array(s->dev->of_node, name, op, len))
+		return -EINVAL;
+	for (i = 0; i < len; i += 4) {
+		size = 0;
+		if (FIELD_GET(SLEEP_OP_KIND, op[i]) < SLEEP_OP_KINDS)
+			size = block_size(s, op[i + 1]);
+		if (!size || op[i + 2] % 2 || op[i + 2] + 4 > size) {
+			dev_warn(s->dev, "%s: entry %u outside its block, not used\n", name, i / 4);
+			devm_kfree(s->dev, op);
+			return 0;
+		}
+	}
+	seq->op = op;
+	seq->n = len / 4;
+	return 0;
+}
+
+/* @seq on the blocks @blk names: the number of waits that timed out, other than optional ones */
+static unsigned int sleep_seq_run(void __iomem *const *blk, const struct sleep_seq *seq)
+{
+	unsigned int i, timeouts = 0;
+	u32 v;
+
+	for (i = 0; i < seq->n; i++) {
+		const u32 *op = &seq->op[4 * i];
+		void __iomem *reg = blk[op[1]] + op[2];
+		u32 ms = FIELD_GET(SLEEP_OP_TIMEOUT, op[0]) ?: 10;
+		int ret = 0;
+
+		switch (FIELD_GET(SLEEP_OP_KIND, op[0])) {
+		case SLEEP_OP_WRITE:
+			writel(op[3], reg);
+			break;
+		case SLEEP_OP_READ:
+			readl(reg);
+			break;
+		case SLEEP_OP_SET:
+			writel(readl(reg) | op[3], reg);
+			break;
+		case SLEEP_OP_CLEAR:
+			writel(readl(reg) & ~op[3], reg);
+			break;
+		case SLEEP_OP_REWRITE:
+			writel(readl(reg), reg);
+			break;
+		case SLEEP_OP_WAIT_SET:
+			ret = readl_poll_timeout_atomic(reg, v, (v & op[3]) == op[3], 1, ms * 1000);
+			break;
+		case SLEEP_OP_WAIT_CLEAR:
+			ret = readl_poll_timeout_atomic(reg, v, !(v & op[3]), 1, ms * 1000);
+			break;
+		case SLEEP_OP_WRITE16:
+			writew(op[3], reg);
+			break;
+		}
+		if (ret && !(op[0] & SLEEP_OP_OPTIONAL))
+			timeouts++;
+	}
+	return timeouts;
+}
+
 #include "sleep-t6050.h"
 
 /* ANS's sleep owner on T6050: registered at its .suspend, its final stop in the last steps. */
