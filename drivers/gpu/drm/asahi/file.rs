@@ -1887,12 +1887,22 @@ impl File {
         } else {
             None
         };
+        let cumulative_sync = gpu.as_any().is::<crate::g17::Gpu>() || {
+            #[cfg(CONFIG_DRM_ASAHI_G16)]
+            {
+                gpu.as_any().is::<crate::g16::Gpu>()
+            }
+            #[cfg(not(CONFIG_DRM_ASAHI_G16))]
+            {
+                false
+            }
+        };
         let syncs = match SyncItem::parse_array(
             file,
             data.syncs,
             data.in_sync_count,
             data.out_sync_count,
-            gpu.as_any().is::<crate::g17::Gpu>() || gpu.as_any().is::<crate::g16::Gpu>(),
+            cumulative_sync,
         ) {
             Ok(syncs) => syncs,
             Err(e) => {
