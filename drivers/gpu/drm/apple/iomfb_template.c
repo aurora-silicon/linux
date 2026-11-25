@@ -2907,9 +2907,22 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 	 * its panel. An external pipe stops like the H17G one: otherwise
 	 * DPMS off leaves it scanning out the last frame.
 	 */
-	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
-	    dcp_has_panel(dcp))
-		return;
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
+		if (dcp_has_panel(dcp))
+			return;
+		/*
+		 * The firmware withdrew the mode (it is describing the display
+		 * again after a hotplug, see dcp_mode_withdraw()): no scanout of
+		 * ours is left to stop, and while it republishes the display it
+		 * answers neither the clear swap nor setPowerState(0). Both then
+		 * time out and leave the pipe unable to power on again.
+		 */
+		if (!READ_ONCE(dcp->mode_state.valid)) {
+			dev_dbg(dcp->dev, "%s: no valid mode, pipe left to the firmware\n",
+				__func__);
+			return;
+		}
+	}
 #endif
 
 #if DCP_FW_DESKTOP_26(DCP_FW_VER)
