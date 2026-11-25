@@ -694,22 +694,51 @@ allOf:
                     interrupts:
                       maxItems: 3
                 else:
-                  properties:
-                    reg:
-                      maxItems: 10
-                    reg-names:
-                      minItems: 3
-                      items:
-                        - const: config
-                        - const: rc
-                        - const: port0
-                        - const: port1
-                        - const: port2
-                        - const: port3
-                        - const: phy0
-                        - const: phy1
-                        - const: phy2
-                        - const: phy3
+                  if:
+                    properties:
+                      compatible:
+                        contains:
+                          const: apple,t6041-pcie
+                  then:
+                    properties:
+                      reg:
+                        minItems: 10
+                        maxItems: 15
+                      reg-names:
+                        minItems: 10
+                        items:
+                          - const: config
+                          - const: rc
+                          - const: port0
+                          - const: port1
+                          - const: port2
+                          - const: port3
+                          - const: phy0
+                          - const: phy1
+                          - const: phy2
+                          - const: phy3
+                          - const: axi2af
+                          - const: cio3pll
+                          - const: clkgen
+                          - const: phy-block
+                          - const: phy-ip
+                  else:
+                    properties:
+                      reg:
+                        maxItems: 10
+                      reg-names:
+                        minItems: 3
+                        items:
+                          - const: config
+                          - const: rc
+                          - const: port0
+                          - const: port1
+                          - const: port2
+                          - const: port3
+                          - const: phy0
+                          - const: phy1
+                          - const: phy2
+                          - const: phy3
       patternProperties:
         "^pci@":
           properties:

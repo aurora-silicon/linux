@@ -3581,25 +3581,38 @@ static int cd321x_remove(struct tps6598x *tps)
 }
 
 /*
- * Boards whose inherited boot connection must be renegotiated. The port
- * controller key is the reversed target identifier.
+ * An SN201202x takes "DISC" unlocked with the key its DT gives it (apple,debug-lock-key, the board
+ * number reversed).
+ */
+static int tipd_replug_key(struct tps6598x *tps, u8 key[4])
+{
+	const char *s;
+
+	if (!device_is_compatible(tps->dev, "apple,sn201202x") ||
+	    device_property_read_string(tps->dev, "apple,debug-lock-key", &s) || strlen(s) != 4)
+		return -EOPNOTSUPP;
+	memcpy(key, s, 4);
+	return 0;
+}
+
+/*
+ * A connection that was up before Linux keeps state from the boot chain: a USB2 repeater
+ * connection on the J716c boot port, or on the J575c a Type-C retimer set up before the host PHY
+ * ran, so SuperSpeed stays in RxDetect until the partner is replugged. The controller reports
+ * nothing that tells such a connection apart from one that trains, so every one is renegotiated.
  *
- * J716c: the boot port keeps a USB2 repeater connection.
- * J575c: a connection that was up before Linux keeps its Type-C retimer set up
- * from before the host PHY ran, so SuperSpeed stays in RxDetect until the
- * partner is replugged. Every such connection is renegotiated: the controller
- * reports nothing that tells it apart from one whose SuperSpeed side trains.
- * A failure leaves the port as it was (USB2 only) instead of failing the probe.
+ * The renegotiation's DISC takes the controller unlocked with the board's LOCK key, the board
+ * number reversed. A port whose DT gives it (apple,debug-lock-key) is left as it was if the
+ * renegotiation fails. The J716c's DT does not give it yet: its key is here, and a failure there
+ * fails the probe.
  */
 struct cd321x_inherited_board {
 	const char *compatible;
 	u8 key[4];
-	bool best_effort;
 };
 
 static const struct cd321x_inherited_board cd321x_inherited_boards[] = {
 	{ .compatible = "apple,j716c", .key = { '6', '1', '7', 'J' } },
-	{ .compatible = "apple,j575c", .key = { '5', '7', '5', 'J' }, .best_effort = true },
 };
 
 static const struct cd321x_inherited_board *cd321x_inherited_board(void)
@@ -3612,8 +3625,7 @@ static const struct cd321x_inherited_board *cd321x_inherited_board(void)
 	return NULL;
 }
 
-static int __cd321x_reset_inherited_connection(struct tps6598x *tps,
-						const struct cd321x_inherited_board *board,
+static int __cd321x_reset_inherited_connection(struct tps6598x *tps, const u8 key[4],
 						u32 *status)
 {
 	static const u8 locked[4];
@@ -3626,8 +3638,7 @@ static int __cd321x_reset_inherited_connection(struct tps6598x *tps,
 		return 0;
 
 	/* All suppliers are available, but no USB or router session has started. */
-	ret = tps6598x_exec_cmd(tps, "LOCK", sizeof(board->key), board->key, sizeof(result),
-				&result);
+	ret = tps6598x_exec_cmd(tps, "LOCK", 4, key, sizeof(result), &result);
 	if (ret)
 		return ret;
 	if (result) {
@@ -3670,6 +3681,8 @@ relock:
 static int cd321x_reset_inherited_connection(struct tps6598x *tps, u32 *status)
 {
 	const struct cd321x_inherited_board *board;
+	bool best_effort = true;
+	u8 key[4];
 	int ret;
 
 	if (!device_property_read_bool(tps->dev, "apple,reset-inherited-usb2-connection") ||
@@ -3677,12 +3690,19 @@ static int cd321x_reset_inherited_connection(struct tps6598x *tps, u32 *status)
 	    tps->dbma_at_probe || !(*status & TPS_STATUS_PLUG_PRESENT) ||
 	    !TPS_STATUS_TO_TYPEC_DATAROLE(*status))
 		return 0;
-	board = cd321x_inherited_board();
-	if (!board)
-		return 0;
+	if (tipd_replug_key(tps, key)) {
+		board = cd321x_inherited_board();
+		if (!board) {
+			dev_warn(tps->dev,
+				 "inherited connection not reinitialized: no apple,debug-lock-key\n");
+			return 0;
+		}
+		memcpy(key, board->key, sizeof(key));
+		best_effort = false;
+	}
 
-	ret = __cd321x_reset_inherited_connection(tps, board, status);
-	if (!ret || !board->best_effort)
+	ret = __cd321x_reset_inherited_connection(tps, key, status);
+	if (!ret || !best_effort)
 		return ret;
 
 	dev_warn(tps->dev, "inherited connection not reinitialized: %d\n", ret);
@@ -3717,21 +3737,6 @@ static void tipd_port_list_del(struct tps6598x *tps)
 	list_del_init(&tps->port_node);
 	mutex_unlock(&tipd_ports_lock);
 	cancel_work_sync(&tps->replug_work);
-}
-
-/*
- * An SN201202x takes "DISC" unlocked with the key its DT gives it (apple,debug-lock-key, the board
- * number reversed).
- */
-static int tipd_replug_key(struct tps6598x *tps, u8 key[4])
-{
-	const char *s;
-
-	if (!device_is_compatible(tps->dev, "apple,sn201202x") ||
-	    device_property_read_string(tps->dev, "apple,debug-lock-key", &s) || strlen(s) != 4)
-		return -EOPNOTSUPP;
-	memcpy(key, s, 4);
-	return 0;
 }
 
 bool tipd_replug_supported(struct tps6598x *tps)

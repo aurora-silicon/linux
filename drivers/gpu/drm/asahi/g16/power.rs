@@ -41,6 +41,7 @@ extern "C" {
     fn asahi_g16_clpc_gpu_put(gpu: *mut c_void);
     fn asahi_g16_cooling_register(dev: *mut c_void) -> *mut c_void;
     fn asahi_g16_cooling_unregister(cooling: *mut c_void);
+    fn asahi_g16_cooling_has_pmp(cooling: *const c_void) -> bool;
     fn asahi_g16_cooling_sample(
         cooling: *mut c_void,
         now: u64,
@@ -49,13 +50,20 @@ extern "C" {
         governor: *mut u32,
         power: *mut u32,
         backstop: *mut u32,
+        zone_seq: *mut u64,
+        release_mc: *mut core::ffi::c_long,
+        hot_mc: *mut core::ffi::c_long,
+        critical_mc: *mut core::ffi::c_long,
+        limits_valid: *mut bool,
     ) -> i32;
 }
 
-/// Owns the cooling-device registration and PMP consumer. The C helpers only
-/// bridge the PMP provider and shared cooling policy, with atomic governor requests.
+/// Owns the cooling-device registration and thermal telemetry consumer (PMP when `apple,pmp`
+/// is present, or SoC die thermal zones otherwise). The C helpers only bridge the provider and
+/// atomic governor requests.
 struct Cooling {
     inner: NonNull<c_void>,
+    is_pmp: bool,
     _dev: ARef<device::Device>,
 }
 
@@ -72,14 +80,23 @@ impl Cooling {
         let inner = kernel::error::from_err_ptr(unsafe {
             asahi_g16_cooling_register(dev.as_raw().cast())
         })?;
+        let inner = NonNull::new(inner).ok_or(ENOMEM)?;
+        // SAFETY: `inner` is the live cooling object returned above.
+        let is_pmp = unsafe { asahi_g16_cooling_has_pmp(inner.as_ptr()) };
         Ok(Self {
-            inner: NonNull::new(inner).ok_or(ENOMEM)?,
+            inner,
+            is_pmp,
             _dev: dev.into(),
         })
     }
 
     fn sample(&mut self, now: u64, idle: bool, power: &mut Sample) -> Result {
         let mut mc: core::ffi::c_long = 0;
+        let mut seq: u64 = 0;
+        let mut release_mc: core::ffi::c_long = 0;
+        let mut hot_mc: core::ffi::c_long = 0;
+        let mut critical_mc: core::ffi::c_long = 0;
+        let mut limits_valid = false;
         // SAFETY: The C allocation and PMP phandle outlive this call, all output
         // pointers are valid, and the caller holds the GPU device mutex.
         let ret = unsafe {
@@ -91,9 +108,20 @@ impl Cooling {
                 &mut power.governor,
                 &mut power.budget,
                 &mut power.backstop,
+                &mut seq,
+                &mut release_mc,
+                &mut hot_mc,
+                &mut critical_mc,
+                &mut limits_valid,
             )
         };
         power.temperature_mc = mc as i64;
+        power.zone_seq = seq;
+        power.zone_limits = limits_valid.then_some(policy::ZoneLimits {
+            release_mc: release_mc as i64,
+            hot_mc: hot_mc as i64,
+            critical_mc: critical_mc as i64,
+        });
         kernel::error::to_result(ret)
     }
 }
@@ -112,6 +140,8 @@ struct Sample {
     governor: u32,
     budget: u32,
     backstop: u32,
+    zone_seq: u64,
+    zone_limits: Option<policy::ZoneLimits>,
 }
 
 /// DT-selected memory-demand provider (`apple,clpc`), or none. Its
@@ -158,6 +188,8 @@ pub(crate) struct Power {
     /// Work-in-flight state and 2 ms idle-hold hysteresis reported to `clpc`.
     clpc_hold: policy::ClpcHold,
     cooling: Cooling,
+    /// Fail-closed thermal-zone backstop used when the GPU DT node has no `apple,pmp`.
+    zone_backstop: policy::ZoneBackstop,
     sample: Sample,
     last_sample_ns: Option<u64>,
     /// The board's top state: S9 on the ten-row tables, S10 on the J773g table.
@@ -178,18 +210,25 @@ pub(crate) struct Power {
 
 impl Power {
     /// The Main image initializes every active state of the board's table. Initdata publishes
-    /// startup S1 before INIT; this object starts with that same effective state.
+    /// startup S1 before INIT; this object starts with that same effective state until live
+    /// thermal telemetry confirms a safe ceiling.
     pub(crate) fn new(dev: &device::Device) -> Result<Self> {
+        // First: a CLPC that has not probed yet defers before the PMP vote.
+        let clpc = Demand::new(dev)?;
+        let cooling = Cooling::new(dev)?;
+        let pmp_initial = if cooling.is_pmp { COOLING_MAX } else { 0 };
         Ok(Self {
-            // First: a CLPC that has not probed yet defers before the PMP vote.
-            clpc: Demand::new(dev)?,
+            clpc,
             clpc_hold: policy::ClpcHold::new(),
-            cooling: Cooling::new(dev)?,
+            cooling,
+            zone_backstop: policy::ZoneBackstop::new(),
             sample: Sample {
                 temperature_mc: 0,
-                governor: COOLING_MAX,
-                budget: COOLING_MAX,
+                governor: pmp_initial,
+                budget: pmp_initial,
                 backstop: COOLING_MAX,
+                zone_seq: 0,
+                zone_limits: None,
             },
             last_sample_ns: None,
             top: TOP_DEFAULT,
@@ -197,8 +236,8 @@ impl Power {
             user: TOP_DEFAULT,
             effective: 1,
             temperature_mc: 0,
-            governor: COOLING_MAX,
-            budget: COOLING_MAX,
+            governor: pmp_initial,
+            budget: pmp_initial,
             sensor_error: None,
             updates: 0,
             sensor_errors: 0,
@@ -253,6 +292,17 @@ impl Power {
             self.sensor_error = self.cooling.sample(now, idle, &mut self.sample).err();
             if self.sensor_error.is_some() {
                 self.sensor_errors += 1;
+            }
+            if !self.cooling.is_pmp {
+                self.zone_backstop.sample(
+                    now,
+                    self.sample.zone_seq,
+                    self.sample.temperature_mc,
+                    self.sample.zone_limits,
+                    self.sensor_error.is_some(),
+                );
+                self.zone_backstop.observe(now, self.sample.governor);
+                self.sample.backstop = self.zone_backstop.level();
             }
             self.temperature_mc = self.sample.temperature_mc;
             self.governor = self.sample.governor;
@@ -314,7 +364,7 @@ impl Firmware {
             return Ok(());
         }
         let globals = self.init.globals.as_ref().ok_or(ENODEV)?;
-        for offset in self.init.abi.initdata().pstate_selectors {
+        for offset in self.init.layout.pstate_selectors {
             globals.w32(offset, target * 100)?;
         }
         wmb();

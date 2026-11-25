@@ -1140,6 +1140,44 @@ static int radio_start(struct centauri_t6050_wifi *wifi)
 #define SCAN_ACTIVE_MIN_MS 40
 #define SCAN_LISTEN_MS 110
 
+static bool scan_transport_stopped(struct centauri_t6050_wifi *wifi)
+{
+	return READ_ONCE(wifi->stopping) || wifi->command_failed ||
+	       wifi->host_sleep_sent || readl(wifi->a.bar + 8) != 2;
+}
+
+static int scan_stop_chunk(struct centauri_t6050_wifi *wifi, u32 done)
+{
+	unsigned long deadline;
+	int ret;
+
+	lockdep_assert_held(&wifi->lock);
+	if (scan_transport_stopped(wifi))
+		return -EIO;
+	ret = command(wifi, 65537, NULL, 0);
+	if (wifi->scans_done != done)
+		return 0;
+	if (ret == -EREMOTEIO && wifi->reply_status == 342)
+		return 0;
+	if (ret)
+		return ret;
+	deadline = jiffies + msecs_to_jiffies(1000);
+	do {
+		if (scan_transport_stopped(wifi))
+			return -EIO;
+		drain(wifi);
+		if (wifi->scans_done != done)
+			return 0;
+		mutex_unlock(&wifi->lock);
+		usleep_range(1000, 2000);
+		mutex_lock(&wifi->lock);
+	} while (time_before(jiffies, deadline));
+	if (scan_transport_stopped(wifi))
+		return -EIO;
+	drain(wifi);
+	return wifi->scans_done != done ? 0 : -ETIMEDOUT;
+}
+
 static int scan_profile27(struct centauri_t6050_wifi *wifi)
 {
 	struct cfg80211_scan_request *request = wifi->scan_request;
@@ -1156,8 +1194,9 @@ static int scan_profile27(struct centauri_t6050_wifi *wifi)
 		size_t size = 14;
 		unsigned long deadline;
 		int ret;
-		bool abort_sent = false;
 
+		if (scan_transport_stopped(wifi))
+			return -EIO;
 		if (READ_ONCE(wifi->scan_abort))
 			return -ECANCELED;
 		memset(scan, 0, sizeof(scan));
@@ -1228,28 +1267,32 @@ static int scan_profile27(struct centauri_t6050_wifi *wifi)
 		deadline = jiffies +
 			   msecs_to_jiffies(max(8000U, count * 220 + 2000));
 		do {
-			drain(wifi);
-			if (READ_ONCE(wifi->stopping) ||
-			    readl(wifi->a.bar + 8) != 2)
+			if (scan_transport_stopped(wifi))
 				return -EIO;
+			drain(wifi);
 			if (wifi->scans_done != done)
 				break;
-			if (READ_ONCE(wifi->scan_abort) && !abort_sent) {
-				ret = command(wifi, 65537, NULL, 0);
-				if (ret)
-					return ret;
-				abort_sent = true;
+			if (READ_ONCE(wifi->scan_abort)) {
+				ret = scan_stop_chunk(wifi, done);
+				return ret == -EIO ? -EIO : -ECANCELED;
 			}
+			mutex_unlock(&wifi->lock);
 			usleep_range(1000, 2000);
+			mutex_lock(&wifi->lock);
 		} while (time_before(jiffies, deadline));
+		if (wifi->scans_done == done) {
+			if (scan_transport_stopped(wifi))
+				return -EIO;
+			drain(wifi);
+		}
 		if (wifi->scans_done == done) {
 			dev_warn(&wifi->control->pdev->dev,
 				 "Wi-Fi scan of %u channels: no completion event\n",
 				 count);
-			command(wifi, 65537, NULL, 0);
-			return -ETIMEDOUT;
+			ret = scan_stop_chunk(wifi, done);
+			return ret == -EIO ? -EIO : -ETIMEDOUT;
 		}
-		if (wifi->scan_status && !abort_sent)
+		if (wifi->scan_status)
 			dev_warn(&wifi->control->pdev->dev,
 				 "Wi-Fi scan of %u channels ended with firmware status %u\n",
 				 count, wifi->scan_status);
@@ -1894,6 +1937,9 @@ static void connect_worker(struct work_struct *work)
 		return;
 	}
 	host_setup_commands(wifi);
+	drain(wifi);
+	wifi->connect_event = false;
+	wifi->disconnect_event = false;
 	slot = wifi->command_head;
 	ret = command(wifi, 131072, wifi->connect_payload, wifi->connect_size);
 	memzero_explicit(wifi->connect_payload, sizeof(wifi->connect_payload));
@@ -2515,7 +2561,8 @@ static void fill_station(struct centauri_t6050_wifi *wifi, struct station_info *
 {
 	const struct net_device_stats *stats = &wifi->netdev->stats;
 
-	if (time_after_eq(jiffies, wifi->station_signal_at + HZ)) {
+	if (!wifi->scan_request &&
+	    time_after_eq(jiffies, wifi->station_signal_at + HZ)) {
 		wifi->station_signal_valid = false;
 		wifi->station_signal_at = jiffies;
 		query_link_status(wifi);

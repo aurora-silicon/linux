@@ -91,6 +91,8 @@ ASAHI_TESTS = {
     'dcp-v27-dptx-layout-tests.py': [([], PASS)] + mutations(
         '--mutation', ['ignore-advertisement', 'ignore-pinned', 'ignore-dcpext',
                        'ignore-typec-routes'], []),
+    'dptx-set-active-lane-count-tests.py': [([], PASS)] + mutations(
+        '--mutation', ['drop-fixed-phy', 'skip-all-unexpected'], []),
     'dcpext26-wire-tests.py': [([], PASS)],
     'pmp-native26-tests.py': [([], PASS)],
 
@@ -194,6 +196,7 @@ ASAHI_TESTS = {
     'brcmfmac-sleep-lifetime-tests.py': [([], PASS)],
     'cio-native-tests.py': [(out('--output'), PASS)],
     'centauri-wifi-pm-tests.py': [(out(), PASS), (out() + ['--negative-controls'], PASS)],
+    'centauri-scan-tests.py': [(out(), PASS), (out() + ['--negative-controls'], PASS)],
     'centauri-bt-arena-tests.py': [(out(), PASS), (out() + ['--negative-controls'], PASS)],
     'centauri-recovery-tests.py': [(out(), PASS), (out() + ['--negative-controls'], PASS)],
     'centauri-physical-recovery-tests.py': [(out(), PASS)]
@@ -274,6 +277,9 @@ ASAHI_TESTS = {
     'g17-kill-route-tests.py': [([], PASS)]
         + mutations('--mutation', ('no-executed-route', 'no-executed-input', 'kill-twice', 'executed-on-m5',
                                    'unsafe-wait', 'owed-blocks-kill', 'open-owed-skipped'), []),
+    'g17-m5-direct-compute-tests.py': [([], PASS)]
+        + mutations('--mutation', ('no-pre-recovery-drain', 'direct-debits-published',
+                                   'scope-allows-reserve'), []),
     'g17-m5-effort-tests.py': [([], PASS)]
         + mutations('--mutation', ('m5-ignores-bound',), []),
     'g17-firmware-selection-tests.py': [([], PASS)],
@@ -288,6 +294,9 @@ ASAHI_TESTS = {
     'g17-quarantine-drain-tests.py': [([], PASS)]
         + mutations('--mutation', ('no-drain-release', 'without-witness', 'ignore-leases', 'no-last-lease',
                                    'witness-covers-later-failure', 'unquarantined-drain'), []),
+    'g17-render-direct-recovery-tests.py': [([], PASS)]
+        + mutations('--mutation', ('recovery-state-eio', 'drop-generation-check',
+                                   'wrong-j813-pipe'), []),
     'g17-resource-tests.py': [([], PASS)],
     'g17-shared-pool-tests.py': [([], PASS)],
     'g17-t6041-initdata-tests.py': [([], PASS)],
@@ -346,6 +355,9 @@ ASAHI_TESTS = {
     'rtkit-crashlog-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('buffer-header', 'section-header', 'section-size', 'footer-room',
                                    'mailbox-minimum', 'version-string', 'message-string'), out()),
+    # cacf35543b4d steps from an unaligned crash log buffer by the page size and maps it cacheable, unchecked.
+    'rtkit-crashlog-map-tests.py': [(out(), PASS),
+                                    (out() + ['--old-ref', 'cacf35543b4d534fccef3033bd2ddbb415a325b2'], PASS)],
     'rtkit-oslog-tests.py': [(out(), PASS)]
         + mutations('--mutate', ('admission', 'channel', 'counter', 'reset', 'buffer'), out()),
     'rtkit-adopted-session-tests.py': [(out(), PASS)]

@@ -656,6 +656,7 @@ static const struct sio_hw_data sio_hw_t6030 = {
  * the 5 of the host's mailbox call timeout is not part of the record.
  */
 static const struct sio_hw_data sio_hw_t6041 = {
+	.stop_at_commit = true,
 	.protocol = 10,
 	.fifo_threshold = 0x600,
 	.cfg_word4 = 0x800,

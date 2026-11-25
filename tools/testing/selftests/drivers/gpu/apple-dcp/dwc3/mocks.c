@@ -405,6 +405,12 @@ static int dwc3_host_init(struct dwc3 *d)
 	}
 	return host_init_error;
 }
+
+/* The xHCI start and its USB3 routing; atc-t8132-usb3 models them. */
+static int dwc3_apple_host_start(struct dwc3_apple *a)
+{
+	return dwc3_host_init(&a->dwc);
+}
 static int dwc3_gadget_init(struct dwc3 *d)
 {
 	(void)d;
