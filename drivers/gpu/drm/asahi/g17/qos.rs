@@ -6,13 +6,23 @@
 //! precedes submitted counters; retiring a final owner clears only its two row
 //! bytes. Cancellation balances host references without rewinding shared counts.
 
-use super::fw::{qos as fw, queue::Policy};
+use super::fw::{
+    qos as fw,
+    queue::{DataMaster, Policy},
+};
 use crate::hw::t8140::qos as cfg;
 use core::{
     mem::offset_of,
     sync::atomic::{fence, AtomicU32, AtomicU64, AtomicU8, Ordering},
 };
 use kernel::prelude::*;
+
+const _: () = {
+    assert!(fw::QUEUES <= 128);
+    assert!(DataMaster::Tiling as usize == crate::usage::Engine::Vertex as usize);
+    assert!(DataMaster::Fragment as usize == crate::usage::Engine::Fragment as usize);
+    assert!(DataMaster::Compute as usize == crate::usage::Engine::Compute as usize);
+};
 
 /// Atomic views retain the allocation borrow and never borrow firmware words
 /// as ordinary mutable memory. The arrays are disjoint apart from the explicit
@@ -87,6 +97,11 @@ pub(crate) struct Accounting {
     in_flight: [u32; fw::QUEUES],
     dm_in_flight: [u64; fw::DATA_MASTERS],
     dm_by_qid: [u8; fw::QUEUES],
+    /// Bitmask of QIDs with `in_flight[qid] > 0`.
+    active_qids: u128,
+    /// Monotonic start timestamp (ns) of each active QID's oldest unretired command,
+    /// advanced when a command completes with more work still in flight on that QID.
+    qid_since_ns: [u64; fw::QUEUES],
     /// The table's rows and counts as last stored, indexed as in [`View`]. Only the host
     /// writes them, so a publication counts on from these instead of reading them back.
     rows: [[u8; 8]; fw::QUEUES],
@@ -101,6 +116,8 @@ impl Accounting {
             in_flight: [0; fw::QUEUES],
             dm_in_flight: [0; fw::DATA_MASTERS],
             dm_by_qid: [0; fw::QUEUES],
+            active_qids: 0,
+            qid_since_ns: [0; fw::QUEUES],
             rows: [[0; 8]; fw::QUEUES],
             queue_submitted: [0; fw::QUEUES],
             owner_submitted: [0; fw::QUEUES],
@@ -119,8 +136,9 @@ impl Accounting {
         scheduler: u64,
         policy: Policy,
         clock: impl FnOnce() -> (u64, u64),
+        now_ns: u64,
     ) -> Result<Publication> {
-        let [publication] = self.publish_owners(view, [owner], scheduler, policy, clock)?;
+        let [publication] = self.publish_owners(view, [owner], scheduler, policy, clock, now_ns)?;
         Ok(publication)
     }
 
@@ -136,6 +154,7 @@ impl Accounting {
         scheduler: u64,
         policy: Policy,
         clock: impl FnOnce() -> (u64, u64),
+        now_ns: u64,
     ) -> Result<[Publication; N]> {
         if scheduler == 0 {
             return Err(EINVAL);
@@ -219,6 +238,10 @@ impl Accounting {
             let mut record = rows[index];
             record[0] = owner.qos;
             record[1] = class;
+            if self.in_flight[qid] == 0 {
+                self.qid_since_ns[qid] = now_ns.max(1);
+                self.active_qids |= 1u128 << qid;
+            }
             self.in_flight[qid] += 1;
             self.dm_in_flight[dm] += 1;
             self.dm_by_qid[qid] = owner.data_master;
@@ -243,7 +266,7 @@ impl Accounting {
         {
             return Err(EIO);
         }
-        self.complete(view, &[ticket.owner])
+        self.complete_inner(view, &[ticket.owner], 0, true)
     }
 
     /// Clears the scheduler and share rows of the QoS IDs in `ids`, which no context holds: a
@@ -271,7 +294,17 @@ impl Accounting {
 
     /// Preflights the entire set before clearing any final row. QID membership,
     /// scheduler mappings and monotonically increasing counts remain intact.
-    pub(crate) fn complete(&mut self, view: &View<'_>, owners: &[Owner]) -> Result {
+    pub(crate) fn complete(&mut self, view: &View<'_>, owners: &[Owner], now_ns: u64) -> Result {
+        self.complete_inner(view, owners, now_ns, false)
+    }
+
+    fn complete_inner(
+        &mut self,
+        view: &View<'_>,
+        owners: &[Owner],
+        now_ns: u64,
+        cancelled: bool,
+    ) -> Result {
         let mut completed = [0u64; fw::DATA_MASTERS];
         for (index, owner) in owners.iter().copied().enumerate() {
             let (qid, _, dm) = owner.indices()?;
@@ -300,13 +333,46 @@ impl Accounting {
             }
         }
         for owner in owners {
-            self.in_flight[usize::from(owner.qid)] -= 1;
+            let qid = usize::from(owner.qid);
+            self.in_flight[qid] -= 1;
+            if self.in_flight[qid] == 0 {
+                self.qid_since_ns[qid] = 0;
+                self.active_qids &= !(1u128 << qid);
+            } else if !cancelled {
+                self.qid_since_ns[qid] = now_ns.max(1);
+            }
         }
         for (dm, count) in completed.iter().enumerate() {
             self.dm_in_flight[dm] -= count;
         }
         fence(Ordering::SeqCst);
         Ok(())
+    }
+
+    /// Oldest unretired command timestamp (monotonic ns) per engine
+    /// (vertex, fragment, compute), or 0 when that engine has none in flight.
+    pub(crate) fn oldest_in_flight(&self) -> [u64; crate::usage::NUM_ENGINES] {
+        let mut oldest = [0u64; crate::usage::NUM_ENGINES];
+        let mut mask = self.active_qids;
+        while mask != 0 {
+            let qid = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            let dm = usize::from(self.dm_by_qid[qid]);
+            let since = self.qid_since_ns[qid];
+            if dm < oldest.len() && since != 0 && (oldest[dm] == 0 || since < oldest[dm]) {
+                oldest[dm] = since;
+            }
+        }
+        oldest
+    }
+
+    /// Oldest unretired command timestamp across all engines, or 0 if idle.
+    pub(crate) fn oldest_in_flight_any(&self) -> u64 {
+        self.oldest_in_flight()
+            .into_iter()
+            .filter(|&since| since != 0)
+            .min()
+            .unwrap_or(0)
     }
 }
 

@@ -314,18 +314,29 @@ static struct device_node *__init t8132_find_gfx(void)
 static int __init t8132_platform_handoff(void)
 {
 	const void *data = __dtb_t8132_platform_data_begin;
-	struct device_node *soc, *pmp = NULL, *gpu = NULL, *gfx = NULL;
+	struct device_node *soc = NULL, *pmp = NULL, *gpu = NULL, *gfx = NULL;
 	struct of_changeset *cs;
 	unsigned int added = 0, changed = 0;
 	int root, node, ret;
 
-	if (!apple_t8132_firmware_path())
+	/*
+	 * Key the handoff on the PMP node's own compatible rather than the root
+	 * SoC compatible or OS firmware version. The copy only adds nodes the
+	 * loader's tree lacks, and the PMP path they depend on runs on every
+	 * firmware whose image header names its data segment.
+	 */
+	pmp = of_find_compatible_node(NULL, NULL, "apple,t8132-pmp-v2");
+	if (!pmp)
 		return 0;
-	if (fdt_check_header(data))
-		return -EINVAL;
+	if (fdt_check_header(data)) {
+		ret = -EINVAL;
+		goto out;
+	}
 	soc = of_find_node_by_path("/soc");
-	if (!soc)
-		return -ENODEV;
+	if (!soc) {
+		ret = -ENODEV;
+		goto out;
+	}
 	cs = kzalloc_obj(*cs);
 	if (!cs) {
 		ret = -ENOMEM;
@@ -336,7 +347,6 @@ static int __init t8132_platform_handoff(void)
 	if (ret)
 		goto destroy;
 
-	pmp = of_find_compatible_node(NULL, NULL, "apple,t8132-pmp-v2");
 	gpu = of_find_compatible_node(NULL, NULL, "apple,agx-t8132");
 	gfx = gpu ? of_parse_phandle(gpu, "power-domains", 0) : NULL;
 	if (!gfx)

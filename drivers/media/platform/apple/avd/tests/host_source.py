@@ -4,7 +4,8 @@ import re
 
 
 def function(source, name):
-    match = re.search(r"^[A-Za-z_][\w *]*\b" + re.escape(name) +
+    # The return type may sit on the line before the name.
+    match = re.search(r"^(?:[A-Za-z_][\w *]*\n)?(?:[A-Za-z_][\w *]*\b)?" + re.escape(name) +
                       r"\([^;{}]*?\)\n\{", source, re.M)
     if not match:
         raise ValueError(name)
