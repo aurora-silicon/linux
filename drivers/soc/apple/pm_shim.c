@@ -217,29 +217,29 @@ static struct {
 	u64 stop, wake;
 	bool stopped;	/* this attempt's stop is set */
 	bool slept;	/* stop and wake bound a sleep no wake message has counted */
-} sep_pm_sleep;
+} sep_pm_timebase;
 
-static void sep_pm_sleep_stop(void)
+static void sep_pm_timebase_stop(void)
 {
-	sep_pm_sleep.stop = arch_timer_read_counter();
-	sep_pm_sleep.stopped = true;
+	sep_pm_timebase.stop = arch_timer_read_counter();
+	sep_pm_timebase.stopped = true;
 }
 
 /* The last step before the platform's: every attempt that reaches it. */
 static int sep_pm_syscore_suspend(void *data)
 {
-	sep_pm_sleep_stop();
+	sep_pm_timebase_stop();
 	return 0;
 }
 
 /* The first step after the platform's, before any device resumes. */
 static void sep_pm_syscore_resume(void *data)
 {
-	if (sep_pm_sleep.stopped && pm_resume_via_firmware()) {
-		sep_pm_sleep.wake = arch_timer_read_counter();
-		sep_pm_sleep.slept = true;
+	if (sep_pm_timebase.stopped && pm_resume_via_firmware()) {
+		sep_pm_timebase.wake = arch_timer_read_counter();
+		sep_pm_timebase.slept = true;
 	}
-	sep_pm_sleep.stopped = false;
+	sep_pm_timebase.stopped = false;
 }
 
 static const struct syscore_ops sep_pm_syscore_ops = {
@@ -257,11 +257,11 @@ static struct syscore sep_pm_syscore = {
  */
 bool sep_pm_last_sleep(u64 *stop, u64 *wake, u32 *hz)
 {
-	if (!sep_pm_sleep.slept)
+	if (!sep_pm_timebase.slept)
 		return false;
-	sep_pm_sleep.slept = false;
-	*stop = sep_pm_sleep.stop;
-	*wake = sep_pm_sleep.wake;
+	sep_pm_timebase.slept = false;
+	*stop = sep_pm_timebase.stop;
+	*wake = sep_pm_timebase.wake;
 	*hz = arch_timer_get_cntfrq();
 	return true;
 }
@@ -412,7 +412,7 @@ out:
 	if (c->gate_ret)
 		panic("SEP SLEEP did not gate after send: %d state %#x", c->gate_ret, c->state);
 	/* Later than syscore suspend: the enclave read the time until it gated. */
-	sep_pm_sleep_stop();
+	sep_pm_timebase_stop();
 
 	return 0;
 }
