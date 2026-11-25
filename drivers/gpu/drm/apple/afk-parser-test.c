@@ -287,6 +287,57 @@ static void afk_compact_siblings_kept_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, first->enabled);
 }
 
+/* Named entries (exact or cut) beat "*", regardless of table order. */
+static void afk_compact_cut_before_wildcard_test(struct kunit *test)
+{
+	static const struct apple_epic_service_ops ops[] = {
+		{ .name = "dcpav-service-epic" },
+		{
+			.name = "dcpav-audio-interface-epic",
+			.compact_full = "dcpav-audio-interface-epic:0",
+		},
+		{ .name = "*" },
+		{},
+	};
+	static const struct apple_epic_service_ops wildcard_first_ops[] = {
+		{ .name = "*" },
+		{ .name = "dcpav-service-epic" },
+		{
+			.name = "dcpav-audio-interface-epic",
+			.compact_full = "dcpav-audio-interface-epic:0",
+		},
+		{},
+	};
+	struct apple_dcp_afkep *ep = test->priv;
+
+	ep->ops = ops;
+	/* "dispext0:dcpav-audio-interface-epic:0", cut to its 31 characters */
+	KUNIT_EXPECT_PTR_EQ(test, afk_compact_match_service(ep, "dispext0:dcpav-audio-interface-"),
+			    &ops[1]);
+	KUNIT_EXPECT_PTR_EQ(test, afk_compact_match_service(ep, "x:dcpav-audio-interface-epic:0"),
+			    &ops[1]);
+	KUNIT_EXPECT_PTR_EQ(test, afk_compact_match_service(ep, "dispext0:dcpav-service-epic:0"),
+			    &ops[0]);
+	/* Anything else, cut or not, is the wildcard's. */
+	KUNIT_EXPECT_PTR_EQ(test, afk_compact_match_service(ep, "ext:dcpav-cec-interface-epic:0"),
+			    &ops[2]);
+	KUNIT_EXPECT_PTR_EQ(test, afk_compact_match_service(ep, "dispext0:dcpav-video-interface-"),
+			    &ops[2]);
+
+	/* Listing "*" first still lets named entries win, exact or cut. */
+	ep->ops = wildcard_first_ops;
+	KUNIT_EXPECT_PTR_EQ(test, afk_compact_match_service(ep, "dispext0:dcpav-service-epic:0"),
+			    &wildcard_first_ops[1]);
+	KUNIT_EXPECT_PTR_EQ(test, afk_compact_match_service(ep, "x:dcpav-audio-interface-epic:0"),
+			    &wildcard_first_ops[2]);
+	KUNIT_EXPECT_PTR_EQ(test, afk_compact_match_service(ep, "dispext0:dcpav-audio-interface-"),
+			    &wildcard_first_ops[2]);
+	KUNIT_EXPECT_PTR_EQ(test, afk_compact_match_service(ep, "ext:dcpav-cec-interface-epic:0"),
+			    &wildcard_first_ops[0]);
+	KUNIT_EXPECT_PTR_EQ(test, afk_compact_match_service(ep, "dispext0:dcpav-video-interface-"),
+			    &wildcard_first_ops[0]);
+}
+
 static struct kunit_case afk_parser_cases[] = {
 	KUNIT_CASE(afk_serialized_report_test),
 	KUNIT_CASE(afk_compact_service_call_report_test),
@@ -297,6 +348,7 @@ static struct kunit_case afk_parser_cases[] = {
 	KUNIT_CASE(afk_compact_singleton_replaces_test),
 	KUNIT_CASE(afk_compact_singleton_no_leak_test),
 	KUNIT_CASE(afk_compact_siblings_kept_test),
+	KUNIT_CASE(afk_compact_cut_before_wildcard_test),
 	{}
 };
 

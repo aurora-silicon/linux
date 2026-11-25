@@ -30,6 +30,11 @@ impl StateFrequencies {
         Some(Self { mhz: table, states })
     }
 
+    /// Highest valid performance state index in this table (`0` when empty or off-only).
+    pub(crate) fn max_pstate(&self) -> u32 {
+        self.states.saturating_sub(1) as u32
+    }
+
     /// The frequency of `pstate` in Hz; `None` beyond the table or where it is unknown (0).
     fn hz(&self, pstate: u32) -> Option<u64> {
         let mhz = *self.mhz[..self.states].get(pstate as usize)?;
@@ -72,10 +77,10 @@ impl Reader {
     }
 
     fn read_firmware(&self) -> Readout {
-        let m5 = self.0.variant.m5_commands;
+        let protocol = self.0.variant.telemetry_protocol;
         let mut state = self.0.state.lock();
         let Some(firmware) = state.as_deref_mut() else {
-            return qualify(self.0.variant.graph, m5, Readout::default());
+            return qualify(protocol, Readout::default());
         };
         if self.0.crashed.load(Ordering::Acquire) || firmware.recovery.pending() {
             firmware.rings.invalidate_statistics();
@@ -94,11 +99,7 @@ impl Reader {
             // export samples across an observed boundary.
             firmware.observe_statistics_power();
         }
-        qualify(
-            self.0.variant.graph,
-            m5,
-            firmware.rings.read_statistics(super::now_ns()),
-        )
+        qualify(protocol, firmware.rings.read_statistics(super::now_ns()))
     }
 
     pub(crate) fn suspend(&self, suspended: bool) {
@@ -118,33 +119,23 @@ pub(super) const fn max_age_ns(graph: InitGraph) -> u64 {
     }
 }
 
-/// The records `graph`'s firmware sends beyond utilisation; `m5`: it runs the M5 protocol,
-/// with M5's performance states.
-pub(super) const fn protocol(graph: InitGraph, m5: bool) -> super::telemetry::Protocol {
-    match graph {
-        InitGraph::G17P if m5 => super::telemetry::Protocol::M5,
-        InitGraph::G17P => super::telemetry::Protocol::A18_PRO,
-        InitGraph::V25G83 => super::telemetry::Protocol::NONE,
-    }
-}
-
 /// Whether the firmware reports its performance state. V25G83 and V26A428 accept
-/// the logical pstate record (tag 0x10) but never emit it. V26A428, on the A18 Pro
-/// as on M5, reports the state in its own records instead (tags 0x19 and 0x1b,
-/// [`protocol`]); V25G83 sends no record carrying it, so it is unsupported there.
-/// A firmware that reports it reads valid or stale.
-pub(super) const fn reports_pstate(graph: InitGraph, m5: bool) -> bool {
-    protocol(graph, m5).reports_pstate()
+/// the logical pstate record (tag 0x10) but never emit it. V26A428 (A18 Pro and
+/// M5) and T6041's 25G83 report the state in tags 0x19 and 0x1b instead
+/// (`Variant::telemetry_protocol`); T6040's 25G83 is left on `Protocol::NONE`
+/// because it has not been measured yet, so it is unsupported there. A firmware
+/// that reports it reads valid or stale.
+pub(super) const fn reports_pstate(protocol: super::telemetry::Protocol) -> bool {
+    protocol.reports_pstate()
 }
 
 /// Apply the firmware's static capabilities to a decoded readout. The decoder
 /// and the debugfs diagnostic still keep any tag 0x10 that does arrive.
 pub(super) fn qualify(
-    graph: InitGraph,
-    m5: bool,
+    protocol: super::telemetry::Protocol,
     mut view: super::telemetry::Readout,
 ) -> super::telemetry::Readout {
-    if !reports_pstate(graph, m5) {
+    if !reports_pstate(protocol) {
         view.pstate_status = super::telemetry::UNSUPPORTED;
         view.pstate = 0;
         view.pstate_host_ns = 0;

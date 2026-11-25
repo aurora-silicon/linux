@@ -152,6 +152,7 @@ static struct av14_test *av14_setup(struct kunit *test, bool native)
 	t->dcp->external_native = native;
 	mutex_init(&t->dcp->hpd_mutex);
 	mutex_init(&t->dcp->dcpavserv.lock);
+	spin_lock_init(&t->dcp->hdr.lock);
 	INIT_WORK(&t->dcp->dcpavserv.close_wq, dcpavserv_close_work);
 	/* Queued work runs here, in test context: av14_run_close_work() */
 	disable_work(&t->dcp->dcpavserv.close_wq);
