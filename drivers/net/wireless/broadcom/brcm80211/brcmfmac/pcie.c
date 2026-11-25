@@ -1286,6 +1286,7 @@ static int brcmf_pcie_request_irq(struct brcmf_pciedev_info *devinfo)
 
 	brcmf_pcie_intr_disable(devinfo);
 	bus->wowl_wake = pci_pme_capable(pdev, PCI_D3hot);
+	bus->wowl_s2idle_only = false;
 
 	brcmf_dbg(PCIE, "Enter\n");
 
@@ -1320,6 +1321,7 @@ static int brcmf_pcie_request_irq(struct brcmf_pciedev_info *devinfo)
 		}
 		devinfo->wowl_irq = true;
 		bus->wowl_wake = true;
+		bus->wowl_s2idle_only = true;
 	}
 	devinfo->irq_allocated = true;
 	return 0;
@@ -1351,6 +1353,7 @@ static void brcmf_pcie_release_irq(struct brcmf_pciedev_info *devinfo)
 		devinfo->wakeup_created = false;
 	}
 	devinfo->wowl_irq = false;
+	bus->wowl_s2idle_only = false;
 	brcmf_pcie_intr_disable(devinfo);
 	free_irq(pdev->irq, devinfo);
 	pci_disable_msi(pdev);
@@ -3102,22 +3105,6 @@ brcmf_pcie_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	}
 
 	brcmf_dbg(PCIE, "Enter %x:%x\n", pdev->vendor, pdev->device);
-
-	/*
-	 * T8132's BCM4388 IOVA aperture starts above 1 TiB and the message-buffer
-	 * ABI carries full 64-bit host addresses, so do not retain PCI's
-	 * conservative 32-bit default DMA mask on this platform.
-	 */
-	if (pdev->device == BRCM_PCIE_4388_DEVICE_ID &&
-	    of_machine_is_compatible("apple,t8132")) {
-		ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(42));
-		if (ret) {
-			pci_err(pdev, "failed to enable 42-bit DMA: %d\n", ret);
-			return ret;
-		}
-		pci_info(pdev, "using 42-bit DMA addresses\n");
-	}
-
 
 	ret = -ENOMEM;
 	devinfo = kzalloc_obj(*devinfo);

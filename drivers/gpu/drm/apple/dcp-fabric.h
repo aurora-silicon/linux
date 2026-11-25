@@ -131,6 +131,7 @@ bool dcp_is_t8132_ext(const struct apple_dcp *dcp);
 
 /* DCP probe, resume and endpoint teardown hooks. */
 int dcp_register_typec_routes(struct apple_dcp *dcp);
+void dcp_sleep_hold_phys(struct apple_dcp *dcp);
 void dcp_typec_route_park(struct apple_dcp *dcp);
 void dcp_typec_route_unpark(struct apple_dcp *dcp);
 int dcp_fabric_sleep_release(struct apple_dcp *dcp, s64 ms[2]);

@@ -144,6 +144,15 @@ jobs:
             --make_options LLVM=1 \
             --kunitconfig=drivers/soc/apple/sep.kunitconfig \
             --jobs="$(nproc)" --timeout=900 'apple_sep*'
+      - name: Run the Apple AOP KUnit suites on arm64 QEMU
+        env:
+          LIBCLANG_PATH: /usr/lib/llvm-18/lib
+        run: |
+          ./tools/testing/kunit/kunit.py run --arch=arm64 \
+            --build_dir=.kunit-aop \
+            --make_options LLVM=1 \
+            --kunitconfig=drivers/soc/apple/aop.kunitconfig \
+            --jobs="$(nproc)" --timeout=900 'apple_aop*'
 
   dwc3-atc-compile:
     name: DWC3/ATC ${{ matrix.profile }}

@@ -3959,8 +3959,19 @@ static int __maybe_unused ane_rtclient_sleep_pm_resume(struct device *dev)
 	return ane_t6021_pm_resume(ane_rtclient_get_sleep_pm(dev));
 }
 
+static int __maybe_unused ane_rtclient_runtime_suspend(struct device *dev)
+{
+	return ane_rtclient_is_platform(dev) ? ane_fw_platform_runtime_suspend(dev) : 0;
+}
+
+static int __maybe_unused ane_rtclient_runtime_resume(struct device *dev)
+{
+	return ane_rtclient_is_platform(dev) ? ane_fw_platform_runtime_resume(dev) : 0;
+}
+
 static const struct dev_pm_ops __maybe_unused ane_rtclient_sleep_pm = {
 	SYSTEM_SLEEP_PM_OPS(ane_rtclient_sleep_pm_suspend, ane_rtclient_sleep_pm_resume)
+	RUNTIME_PM_OPS(ane_rtclient_runtime_suspend, ane_rtclient_runtime_resume, NULL)
 };
 
 static int ane_rtclient_probe_inner(struct platform_device *pdev,
@@ -4504,6 +4515,10 @@ static void ane_rtclient_remove(struct platform_device *pdev)
 			 "remove HELD: no teardown — reboot reclaims\n");
 }
 
+static const struct ane_t602x_soc ane_t8122_soc = {
+	.platform = &ane_t8122_platform,
+};
+
 static const struct ane_t602x_soc ane_h16_soc = {
 	.platform = &ane_h16_platform,
 };
@@ -4529,6 +4544,7 @@ static const struct of_device_id ane_rtclient_of_match[] = {
 	{ .compatible = "apple,t6021-ane", .data = &ane_t6021_soc },
 	{ .compatible = "apple,t6022-ane", .data = &ane_t6022_soc },
 	{ .compatible = "apple,t8112-ane", .data = &ane_t8112_soc },
+	{ .compatible = "apple,t8122-ane", .data = &ane_t8122_soc },
 	{ .compatible = "apple,t6041-ane", .data = &ane_h16_soc },
 	{ .compatible = "apple,t8132-ane", .data = &ane_t8132_soc },
 	{ .compatible = "apple,t8140-ane", .data = &ane_h17_soc },
@@ -4618,7 +4634,7 @@ static struct platform_driver ane_rtclient_driver = {
 		.name = "ane_t6021",
 		.of_match_table = ane_rtclient_of_match,
 		.dev_groups = ane_t6021_stats_groups,
-		.pm = pm_sleep_ptr(&ane_rtclient_sleep_pm),
+		.pm = pm_ptr(&ane_rtclient_sleep_pm),
 		.suppress_bind_attrs = true,
 	},
 	.probe = ane_rtclient_probe,
