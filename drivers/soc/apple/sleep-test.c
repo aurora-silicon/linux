@@ -494,7 +494,41 @@ static void apple_sleep_test_wdt_handoff(struct kunit *test)
 	apple_sleep_wdt_unregister(&st->dev2);
 }
 
+/* A DT register sequence's entry: its access whole in its block, at an offset of its width */
+static void apple_sleep_test_seq_fits(struct kunit *test)
+{
+	const struct {
+		u32 op[4];
+		u32 size;
+		bool fits;
+	} cases[] = {
+		{ { SLEEP_OP_WRITE, 0, 0x0, 0 }, 0x4, true },
+		{ { SLEEP_OP_CLEAR, 0, 0xffc, 1 }, 0x1000, true },
+		{ { SLEEP_OP_CLEAR, 0, 0x1000, 1 }, 0x1000, false },
+		{ { SLEEP_OP_SET, 0, 0xffe, 1 }, 0x1000, false },
+		{ { SLEEP_OP_READ, 0, 0x2, 0 }, 0x1000, false },
+		{ { SLEEP_OP_WRITE16, 0, 0xffe, 0 }, 0x1000, true },
+		{ { SLEEP_OP_WRITE16, 0, 0x1, 0 }, 0x1000, false },
+		/* An offset near the top wraps if added to its width */
+		{ { SLEEP_OP_WRITE, 0, 0xfffffffc, 0 }, 0x1000, false },
+		{ { SLEEP_OP_WRITE16, 0, 0xfffffffe, 0 }, 0x1000, false },
+		{ { SLEEP_OP_WAIT_SET | SLEEP_OP_OPTIONAL, 0, 0x8, 1 }, 0x10, true },
+		/* A block smaller than the access, or none */
+		{ { SLEEP_OP_WRITE, 0, 0x0, 0 }, 0x2, false },
+		{ { SLEEP_OP_WRITE, 0, 0x0, 0 }, 0, false },
+		/* No such kind */
+		{ { SLEEP_OP_KINDS, 0, 0x0, 0 }, 0x1000, false },
+		{ { 0xff, 0, 0x0, 0 }, 0x1000, false },
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(cases); i++)
+		KUNIT_EXPECT_EQ_MSG(test, sleep_op_fits(cases[i].op, cases[i].size), cases[i].fits,
+				    "case %u", i);
+}
+
 static struct kunit_case apple_sleep_test_cases[] = {
+	KUNIT_CASE(apple_sleep_test_seq_fits),
 	KUNIT_CASE(apple_sleep_test_layout),
 	KUNIT_CASE(apple_sleep_test_t6050),
 	KUNIT_CASE(apple_sleep_test_j716c_inventory),

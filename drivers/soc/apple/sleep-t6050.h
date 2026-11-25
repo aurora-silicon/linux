@@ -1008,9 +1008,12 @@ static u32 t6050_ops_block(struct apple_sleep *s, u32 b)
 	return r->rblk[b] ? r->rblk_size[b] : 0;
 }
 
+/* A sequence with an entry that doesn't fit is left out, not run in part: the others still are */
 static int t6050_ops_get(struct apple_sleep *s, const char *name, struct sleep_seq *ops)
 {
-	return sleep_seq_get(s, name, ops, t6050_ops_block);
+	int ret = sleep_seq_get(s, name, ops, t6050_ops_block);
+
+	return ret == -ERANGE ? 0 : ret;
 }
 
 /* The number of waits that timed out, other than the optional ones */

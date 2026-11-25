@@ -7709,17 +7709,39 @@ struct sleep_seq {
 	unsigned int n;
 };
 
+/* The bytes an op of @kind accesses, or 0 for a kind there is none of */
+static unsigned int sleep_op_width(u32 kind)
+{
+	switch (kind) {
+	case SLEEP_OP_WRITE16:
+		return 2;
+	case SLEEP_OP_WRITE ... SLEEP_OP_WAIT_CLEAR:
+		return 4;
+	default:
+		return 0;
+	}
+}
+
+/* Whether @op's access is aligned to its width and lies whole in a block of @size bytes */
+static bool sleep_op_fits(const u32 *op, u32 size)
+{
+	unsigned int width = sleep_op_width(FIELD_GET(SLEEP_OP_KIND, op[0]));
+
+	return width && size >= width && op[2] <= size - width && !(op[2] % width);
+}
+
 /*
  * The DT property @name as a sequence. @block_size gives the size of block @b, mapping it if
- * needed, or 0 where the profile has no such block. A sequence that names a block the DT
- * doesn't map, or an offset outside it, is left out, not run in part. 0 also without one.
+ * needed, or 0 where the profile has no such block. 0 with an empty sequence without the
+ * property. -ERANGE, and nothing of it to run, where an entry is of no known kind, names a
+ * block the DT doesn't map, or an offset its access doesn't fit at or isn't aligned to.
  */
 static int sleep_seq_get(struct apple_sleep *s, const char *name, struct sleep_seq *seq,
 			 u32 (*block_size)(struct apple_sleep *s, u32 b))
 {
 	int len = of_property_count_u32_elems(s->dev->of_node, name);
 	unsigned int i;
-	u32 *op, size;
+	u32 *op;
 
 	seq->n = 0;
 	if (len <= 0)
@@ -7732,13 +7754,14 @@ static int sleep_seq_get(struct apple_sleep *s, const char *name, struct sleep_s
 	if (of_property_read_u32_array(s->dev->of_node, name, op, len))
 		return -EINVAL;
 	for (i = 0; i < len; i += 4) {
-		size = 0;
-		if (FIELD_GET(SLEEP_OP_KIND, op[i]) < SLEEP_OP_KINDS)
-			size = block_size(s, op[i + 1]);
-		if (!size || op[i + 2] % 2 || op[i + 2] + 4 > size) {
-			dev_warn(s->dev, "%s: entry %u outside its block, not used\n", name, i / 4);
+		u32 size = sleep_op_width(FIELD_GET(SLEEP_OP_KIND, op[i])) ?
+			   block_size(s, op[i + 1]) : 0;
+
+		if (!sleep_op_fits(&op[i], size)) {
+			dev_warn(s->dev, "%s: entry %u is outside its block or misaligned\n", name,
+				 i / 4);
 			devm_kfree(s->dev, op);
-			return 0;
+			return -ERANGE;
 		}
 	}
 	seq->op = op;
