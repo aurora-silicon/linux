@@ -124,7 +124,7 @@ mod uapi { include!("FULL_UAPI"); }
 mod file { pub const MAX_COMMANDS_PER_SUBMISSION: u32 = 64; }
 mod hw {
     pub const USER_RANGE: core::ops::Range<u64> = 0x4000..((1u64 << 42) - 0x8000);
-    pub mod sizes { pub const MAX_ATTACHMENTS: usize = 16; pub const TA_LIGHT_TILEMAP_BYTES: u64 = 64 * 1024; }
+    pub mod sizes { pub const MAX_ATTACHMENTS: usize = 16; }
     pub mod client { pub const PB_HEAP_SIZE:u64=0x10000000; CAPACITIES }
 }
 mod fw {
