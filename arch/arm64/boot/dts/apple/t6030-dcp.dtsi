@@ -89,6 +89,7 @@
 		clocks = <&clk_disp0>;
 		/* Display bandwidth request slot in the disp-5 window. */
 		apple,bw-scratch = <&pmgr_dcp 0 5 0x988>;
+		apple,display-power = <&dcp_power>;
 		#address-cells = <2>;
 		#size-cells = <2>;
 		ranges;
@@ -103,6 +104,19 @@
 		reg = <0x3 0x503d0000 0x0 0x4000>;
 		reg-names = "dcp-fw-pmgr";
 		#apple,bw-scratch-cells = <3>;
+	};
+
+	/*
+	 * The internal display's power words for the DCP's stop around a system
+	 * sleep: /arm-io/pmgr's power gates (DISP_CPU's retention words) and power
+	 * states (DISP_CPU, DISP_FE and DISP_SYS), as macOS 27.2 writes them on
+	 * J516s. No driver binds it.
+	 */
+	dcp_power: display-power@350724000 {
+		compatible = "apple,t6030-display-power";
+		reg = <0x3 0x50724000 0x0 0x1000>,
+		      <0x3 0x50700000 0x0 0x14000>;
+		reg-names = "pwrgate", "ps";
 	};
 
 	dcpext_dart: iommu@2d130c000 {
