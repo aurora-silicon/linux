@@ -7,15 +7,6 @@ use core::ops::Range;
 use kernel::{addr::PhysicalAddr, prelude::*, sync::Arc};
 
 impl UatPageTable {
-    pub(super) fn visit_runs(
-        &self,
-        range: Range<u64>,
-        visit: impl FnMut(u64, u64, u8) -> Result,
-    ) -> Result<bool> {
-        let _ = (range, visit);
-        Err(EOPNOTSUPP)
-    }
-
     /// Fill `range` from a sparse tile: its first (zeroed) page repeats across
     /// the range, as a SINGLE_PAGE bind repeats its GEM's first page.
     pub(super) fn map_tiled(&mut self, range: Range<u64>, tile: &Arc<SparseTile>, prot: Prot) -> Result {

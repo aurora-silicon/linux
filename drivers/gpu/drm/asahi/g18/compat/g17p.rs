@@ -11,7 +11,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use core::ptr::NonNull;
 #[cfg(CONFIG_DEV_COREDUMP)]
 use kernel::{bindings, ffi::c_void};
-use kernel::{addr::PhysicalAddr, prelude::*};
+use kernel::{addr::PhysicalAddr, c_str, device, prelude::*};
 use crate::pgtable::{UAT_PGMSK, UAT_PGSZ};
 // diagnostic_accounting_clocks names the probe as `pgtable::LiveFirmwareU64Probe`.
 use crate::g18::compat::g17p as pgtable;
@@ -25,12 +25,52 @@ const G17P_GFX_LINK_DATA_BASE: u64 = 0xffff_fc00_0004_c000;
 
 const G17P_GFX_LINK_DATA_END: u64 = 0xffff_fc00_0018_0000;
 
-const G17P_GFX_PHYSICAL_DATA_BASE: u64 = 0x0000_0100_01d7_c000;
+/// Physical base of the bound G17P GPU's GFX DATA segment, 0 while none is
+/// bound. The module parameters that read firmware DATA exist on every Mac.
+static G17P_GFX_PHYSICAL_DATA_BASE: AtomicU64 = AtomicU64::new(0);
+
+/// The `fw-data` region's start, if it holds the whole GFX DATA segment. The
+/// region holds the data segments of both firmware roles, GFX (ADT sgx
+/// gfx-data) first.
+fn g17p_fw_data_start(dev: &device::Device) -> Option<u64> {
+    let resource = dev
+        .of_node()?
+        .reserved_mem_region_to_resource_byname(c_str!("fw-data"))
+        .ok()?;
+    let start = resource.start();
+    if start == 0
+        || start & (UAT_PGMSK as u64) != 0
+        || resource.size() < G17P_GFX_LINK_DATA_END - G17P_GFX_LINK_DATA_BASE
+    {
+        return None;
+    }
+    Some(start)
+}
+
+/// Publish the GFX DATA base of a probed G17P GPU from its `fw-data` region.
+/// Without a usable region nothing is published and the diagnostics that read
+/// firmware DATA report none.
+pub(crate) fn g17p_publish_gfx_data(dev: &device::Device) {
+    let base = g17p_fw_data_start(dev).unwrap_or(0);
+    G17P_GFX_PHYSICAL_DATA_BASE.store(base, Ordering::Release);
+}
+
+/// Withdraw the published GFX DATA base when the G17P GPU is unbound.
+pub(crate) fn g17p_unpublish_gfx_data() {
+    G17P_GFX_PHYSICAL_DATA_BASE.store(0, Ordering::Release);
+}
 
 /// Translate a GFX firmware LINK address into the physical address the host
-/// can map. Same arithmetic the render status-page probes use.
-pub(crate) fn g17p_gfx_link_to_physical(link: u64) -> u64 {
-    G17P_GFX_PHYSICAL_DATA_BASE + (link - G17P_GFX_LINK_DATA_BASE)
+/// can map. Same arithmetic the render status-page probes use. None while no
+/// G17P GPU is bound or for a LINK address outside the DATA segment.
+pub(crate) fn g17p_gfx_link_to_physical(link: u64) -> Option<u64> {
+    if !(G17P_GFX_LINK_DATA_BASE..G17P_GFX_LINK_DATA_END).contains(&link) {
+        return None;
+    }
+    match G17P_GFX_PHYSICAL_DATA_BASE.load(Ordering::Acquire) {
+        0 => None,
+        base => Some(base + (link - G17P_GFX_LINK_DATA_BASE)),
+    }
 }
 
 fn g17p_binding_row_address(base: u64, id: u32, stride: u64) -> Option<u64> {
@@ -55,7 +95,7 @@ pub(crate) fn diagnostic_accounting_clocks() -> Result<[u64; 8]> {
     let read = |index: usize| -> Result<u64> {
         let link = 0xffff_fc00_0000_0000u64.checked_add(OFFSETS[index]).ok_or(EOVERFLOW)?;
         let start = g17p_binding_row_address(link, 0, 8).ok_or(EINVAL)?;
-        pgtable::LiveFirmwareU64Probe::new(g17p_gfx_link_to_physical(start))
+        pgtable::LiveFirmwareU64Probe::new(g17p_gfx_link_to_physical(start).ok_or(ENODEV)?)
             .and_then(|probe| probe.observe_mask(u64::MAX, 1))
             .map(|sample| sample.first)
     };

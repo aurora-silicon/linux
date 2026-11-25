@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! M4 25G83 HAL200 work-image and microsequence encoders.
+//! M4 HAL200 work-image and microsequence encoders (25G83 and 26B123 work layouts).
 //!
 //! Pure byte builders over retained firmware/client addresses. Allocation,
 //! address-range admission, owner leases, cache visibility and publication are
@@ -8,7 +8,7 @@
 
 use kernel::{prelude::*, uapi};
 
-use super::fw::graph::manager;
+use super::fw::graph::{manager, pools};
 use super::fw::work::{self, barrier, compute, fs, initbm, scene, ta, REG_RECORD};
 use super::hw;
 
@@ -69,9 +69,12 @@ pub(crate) const fn compact(gva: u64) -> u64 {
 
 #[path = "encode/compute.rs"]
 mod compute_encoder;
+use compute_encoder::put_generation;
 #[allow(unused_imports)] // Pure encoder utilities are exercised by the host ABI harness.
 pub(crate) use compute_encoder::{
-    encode_compute, init_compute_pool, preserve_compute_descriptor, ComputeEncodeError, ComputeRefs,
+    encode_compute, encode_compute_for, encode_compute_rt, init_compute_pool,
+    preserve_compute_descriptor, ComputeEncodeError, ComputeRefs, ComputeRt,
+    COMPUTE_SCS_DRIVER_WORD,
 };
 
 /// Tiling geometry and register words of a render (accelerator count 2).
@@ -172,7 +175,9 @@ impl Geometry {
         ) as u32
             | log2s << 17;
         g.tile_mode = 0x280 | u32::from(l > 1) | if empty { 1 << 16 } else { 0 };
-        g.isp_control = 0xc000 | (u.flags & (1 << 18));
+        let few_primitives =
+            u.flags & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_FEW_PRIMITIVES != 0;
+        g.isp_control = 0xc000 | (u.flags & (1 << 18)) | u32::from(few_primitives);
         g.native_tiles = 0x3717fu64
             | u64::from(l > 1) << 32
             | u64::from(g.tx.wrapping_sub(1)) << 44
@@ -277,6 +282,7 @@ pub(crate) fn barrier(
 mod render_encoder;
 #[allow(unused_imports)] // Includes private-tail variants rejected by the shared Mesa UAPI.
 pub(crate) use render_encoder::{
-    append_fs_timestamp_copies, encode_fs, encode_ta, fill_scene, initbm, render_attachments,
-    scene, scene_render, PassRefs, RenderRefs,
+    append_fs_timestamp_copies, encode_fs, encode_fs_for, encode_fs_rt, encode_ta, encode_ta_for,
+    encode_ta_rt, fill_scene, initbm, render_attachments, scene, scene_prefix, scene_render,
+    PassRefs, RenderRefs, StageRt, RENDER_SCS_ENABLE,
 };

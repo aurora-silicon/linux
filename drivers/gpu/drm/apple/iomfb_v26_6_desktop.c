@@ -40,6 +40,7 @@ static const struct dcp_method_entry dcp_methods[dcpep_num_methods] = {
 	IOMFB_METHOD("A414", dcpep_pipe_cfg_414),
 	IOMFB_METHOD("A423", iomfbep_set_matrix),
 	IOMFB_METHOD("A427", iomfbep_get_color_remap_mode),
+	IOMFB_METHOD("A428", iomfbep_set_brightness_correction),
 	IOMFB_METHOD("A442", dcpep_set_parameter_dcp),
 	IOMFB_METHOD("A446", dcpep_create_default_fb),
 	IOMFB_METHOD("A450", dcpep_enable_disable_video_power_savings),
@@ -353,7 +354,7 @@ void DCP_FW_NAME(iomfb_start)(struct apple_dcp *dcp)
 {
 	dcp->cb_handlers = cb_handlers;
 
-	dcp_start_signal(dcp, false, dcp_started, NULL);
+	iomfb_template_start(dcp);
 }
 
 #undef DCP_FW_VER

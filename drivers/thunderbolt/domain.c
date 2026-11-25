@@ -15,6 +15,7 @@
 #include <linux/random.h>
 #include <crypto/sha2.h>
 #include <crypto/utils.h>
+#include <kunit/visibility.h>
 
 #include "tb.h"
 
@@ -334,8 +335,8 @@ const struct device_type tb_domain_type = {
 	.release = tb_domain_release,
 };
 
-static bool tb_domain_event_cb(void *data, enum tb_cfg_pkg_type type,
-			       const void *buf, size_t size)
+VISIBLE_IF_KUNIT bool tb_domain_event_cb(void *data, enum tb_cfg_pkg_type type,
+					 const void *buf, size_t size)
 {
 	struct tb *tb = data;
 
@@ -533,7 +534,7 @@ void tb_domain_remove(struct tb *tb)
 }
 EXPORT_SYMBOL_FOR_MODULES(tb_domain_remove, "thunderbolt_apple");
 
-static bool tb_domain_retain_noirq_control(struct tb *tb)
+VISIBLE_IF_KUNIT bool tb_domain_retain_noirq_control(struct tb *tb)
 {
 	struct tb_port *port;
 	bool xdomain = false;
