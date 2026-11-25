@@ -205,6 +205,17 @@ static inline int apple_pmp_gated_hold_sample(struct apple_pmp_gated_hold *h,
 	return ret;
 }
 
+/*
+ * A light load runs its cluster for only part of each slow period, and a load
+ * with a matching period can keep every slow sample in the gated part until the
+ * hold expires. Look for a real reading at the fast cadence while the sensors
+ * are dark (@ret is the raw sample's) and the CPUs have work.
+ */
+static inline bool apple_pmp_dark_fast(int ret, bool idle)
+{
+	return ret == -ENODATA && !idle;
+}
+
 enum apple_pmp_zone_action {
 	APPLE_PMP_ZONE_NONE,
 	APPLE_PMP_ZONE_UPDATE,
