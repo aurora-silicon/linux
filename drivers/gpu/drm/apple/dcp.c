@@ -6585,6 +6585,30 @@ static u8 dcp_dart_dma_bits(struct device_node *np)
 	return clamp_t(u8, fls64(end), 32, 48);
 }
 
+static void dcp_apply_dt_profile(struct apple_dcp *dcp)
+{
+	struct device_node *np = dcp->dev->of_node;
+	u32 running;
+
+	if (of_property_present(np, "apple,rtkit-handoff"))
+		dcp->hw.adopt_live_session = true;
+
+	if (dcp->fw_compat != DCP_FIRMWARE_V_27_0)
+		return;
+
+	/* iBoot can leave the ASC running without negotiating RTKit. */
+	if (dcp->hw.iboot_handoff &&
+	    of_property_read_variable_u32_array(np, dcp->hw.iboot_handoff,
+						&running, 1, 1) == 1 &&
+	    running == 1)
+		dcp->hw.adopt_live_session = true;
+
+	if (!dcp->hw.firmware_dma_bits)
+		dcp->hw.firmware_dma_bits = dcp_dart_dma_bits(np);
+	if (dcp_is_internal_panel_only(dcp))
+		dcp->hw.num_dptx_ports = 0;
+}
+
 /*
  * The provider clocks firmware 27 asks for by index (getClockFrequency):
  * apple,clock-ids, published by the boot loader from the ADT.
@@ -8091,9 +8115,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 	dcp->hw = *(struct apple_dcp_hw_data *)of_device_get_match_data(dev);
-	/* A boot stage handed this DCP over running: keep its session. */
-	if (of_property_present(dev->of_node, "apple,rtkit-handoff"))
-		dcp->hw.adopt_live_session = true;
+	dcp_apply_dt_profile(dcp);
 	/* The link report: on the board it has run on (dcp_j714s_ext()). */
 	if (!dcp_j714s_ext(dev))
 		dcp->hw.link_report = false;
@@ -8104,38 +8126,6 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	if (fw_compat == DCP_FIRMWARE_V_27_0 &&
 	    of_device_is_compatible(dev->of_node, "apple,t8142-dcp"))
 		dcp->hw.iomfb_method_profile = DCP_IOMFB_METHODS_DEFAULT;
-	/*
-	 * Every processor on firmware 27 inherits the live session the boot
-	 * loader handed over. Its match data keeps the per-SoC port count,
-	 * tunnel-flow flag and DART resources; only the session adoption follows
-	 * the firmware. The per-SoC firmware-27 profiles below come after it and
-	 * may override it: the T8122 dcpext, which the loader leaves unpowered,
-	 * does not adopt. (The T8140 dcpext, whose match data does not adopt, is
-	 * refused above on anything but 26.6.2.)
-	 */
-	if (fw_compat == DCP_FIRMWARE_V_27_0) {
-		dcp->hw.adopt_live_session = true;
-		/*
-		 * Derive firmware DMA width from the DCP DART aperture when
-		 * match data does not already pin a hardware profile width.
-		 */
-		if (!dcp->hw.firmware_dma_bits) {
-			u8 dma_bits = dcp_dart_dma_bits(dev->of_node);
-
-			if (dma_bits)
-				dcp->hw.firmware_dma_bits = dma_bits;
-		}
-	}
-	/*
-	 * Internal laptop panels on firmware 27 (an internal DCP with a panel
-	 * child and no external DPTX/Type-C routes): the boot loader hands the
-	 * panel over running and it has no DP port.
-	 */
-	if (fw_compat == DCP_FIRMWARE_V_27_0 &&
-	    dcp_is_internal_panel_only(dcp)) {
-		dcp->hw.num_dptx_ports = 0;
-		dcp->hw.adopt_live_session = true;
-	}
 	/*
 	 * The T8122 external processor on firmware 27: the boot loader leaves
 	 * it unpowered (its DISPEXT domains are off at handoff), so Linux
@@ -10981,15 +10971,18 @@ static const struct apple_dcp_hw_data apple_dcp_hw_dcp = {
 };
 
 static const struct apple_dcp_hw_data apple_dcp_hw_t6030 = {
+	.iboot_handoff = "apple,t6030-handoff",
 	.num_dptx_ports = 1,
 };
 
 static const struct apple_dcp_hw_data apple_dcp_hw_t8122 = {
+	.iboot_handoff = "apple,t8122-handoff",
 	.num_dptx_ports = 2,
 };
 
 /* The internal panel only, through the 14.x IOMFB, as on T6030. */
 static const struct apple_dcp_hw_data apple_dcp_hw_t6031 = {
+	.iboot_handoff = "apple,t6031-handoff",
 	.num_dptx_ports = 1,
 };
 
@@ -11022,6 +11015,7 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8132_dcpext = {
 
 /* T6041 (M4 Pro/Max), desktop 26.6 firmware */
 static const struct apple_dcp_hw_data apple_dcp_hw_t6041 = {
+	.iboot_handoff = "apple,t6041-handoff",
 	.num_dptx_ports = 2,
 };
 

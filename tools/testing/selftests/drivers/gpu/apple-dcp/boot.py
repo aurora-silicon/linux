@@ -353,6 +353,98 @@ static bool dcp_ext26_admitted(struct device_node *np) { return ext26; }
 ''' + helper + '\n' + methods_decl + '\n' + v27_tables + '\n' + selector + '\n'
 
 
+def v27_panel_handoff(root):
+    source = (root / 'drivers/gpu/drm/apple/dcp.c').read_text()
+    profiles = ('t6030', 't8122', 't6031', 't6041')
+    match = '\n'.join(block(source, f'static const struct apple_dcp_hw_data apple_dcp_hw_{soc} =')
+                      + ';' for soc in profiles)
+    profile = block(source, 'static void dcp_apply_dt_profile(')
+    return r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <string.h>
+typedef uint8_t u8;
+typedef uint32_t u32;
+enum { DCP_FIRMWARE_V_27_0 = 27 };
+struct device_node {
+    bool rtkit_handoff;
+    const char *marker;
+    u32 value;
+};
+struct device { struct device_node *of_node; };
+struct apple_dcp_hw_data {
+    bool adopt_live_session;
+    const char *iboot_handoff;
+    unsigned num_dptx_ports;
+    u8 firmware_dma_bits;
+};
+struct apple_dcp {
+    struct device *dev;
+    struct apple_dcp_hw_data hw;
+    int fw_compat;
+};
+static bool of_property_present(struct device_node *np, const char *name)
+{
+    assert(!strcmp(name, "apple,rtkit-handoff"));
+    return np->rtkit_handoff;
+}
+static int of_property_read_variable_u32_array(struct device_node *np, const char *name,
+                                               u32 *value, int min, int max)
+{
+    assert(min == 1 && max == 1);
+    if (!np->marker || strcmp(name, np->marker))
+        return -1;
+    *value = np->value;
+    return 1;
+}
+/* All probes see the same DART aperture and panel-only topology. */
+static u8 dcp_dart_dma_bits(struct device_node *np) { return 41; }
+static bool dcp_is_internal_panel_only(struct apple_dcp *dcp) { return true; }
+''' + match + '\n' + profile + r'''
+static void check(struct apple_dcp_hw_data hw, struct device_node node, bool live)
+{
+    struct device dev = { .of_node = &node };
+    struct apple_dcp dcp = { .dev = &dev, .hw = hw, .fw_compat = DCP_FIRMWARE_V_27_0 };
+
+    dcp_apply_dt_profile(&dcp);
+    assert(dcp.hw.adopt_live_session == live);
+    assert(dcp.hw.firmware_dma_bits == 41);
+    assert(dcp.hw.num_dptx_ports == 0);
+}
+
+int main(void)
+{
+    const struct {
+        const struct apple_dcp_hw_data *hw;
+        const char *marker;
+    } panels[] = {
+        { &apple_dcp_hw_t6030, "apple,t6030-handoff" },
+        { &apple_dcp_hw_t8122, "apple,t8122-handoff" },
+        { &apple_dcp_hw_t6031, "apple,t6031-handoff" },
+        { &apple_dcp_hw_t6041, "apple,t6041-handoff" },
+    };
+
+    for (unsigned i = 0; i < sizeof(panels) / sizeof(panels[0]); i++) {
+        struct apple_dcp_hw_data hw = *panels[i].hw;
+        struct device_node node = {};
+
+        check(hw, node, false);
+        node.rtkit_handoff = true;
+        check(hw, node, true);
+        node.rtkit_handoff = false;
+        node.marker = panels[i].marker;
+        check(hw, node, false);
+        node.value = 1;
+        check(hw, node, true);
+        node.marker = panels[i ? 0 : 1].marker;
+        check(hw, node, false);
+    }
+    return 0;
+}
+'''
+
+
 def t6041_v27_admission(root):
     return _v27_prelude(root) + r'''
 static struct device_node node;
