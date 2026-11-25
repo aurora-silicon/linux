@@ -6945,19 +6945,6 @@ static u32 apple_dart_sleep_value(struct apple_dart *dart, u32 off, u32 val)
 	return val;
 }
 
-/* A sleep list, with its config words as the DART had them before the sleep. */
-static void apple_dart_sleep_write_kept(struct apple_dart *dart,
-					const struct apple_dart_sleep_list *list)
-{
-	unsigned int i;
-
-	for (i = 0; i < list->count; i++)
-		apple_dart_writel(dart,
-				  apple_dart_sleep_value(dart, list->pairs[2 * i],
-							 list->pairs[2 * i + 1]),
-				  list->pairs[2 * i]);
-}
-
 static int apple_dart_sleep_wait_tlb(struct apple_dart *dart)
 {
 	u32 status;
@@ -6968,6 +6955,31 @@ static int apple_dart_sleep_wait_tlb(struct apple_dart *dart)
 					DART_T8110_FLUSH_BUSY_TIMEOUT);
 	if (ret)
 		dev_err(dart->dev, "TLB command still busy around a sleep: %#x\n", status);
+	return ret;
+}
+
+/*
+ * A sleep list, with its config words as the DART had them before the sleep. A TLB command in
+ * it finishes before the next write, as macOS's wake waits for its flush. Returns 0, or
+ * -ETIMEDOUT if one didn't.
+ */
+static int apple_dart_sleep_write_kept(struct apple_dart *dart,
+				       const struct apple_dart_sleep_list *list)
+{
+	unsigned int i;
+	int ret = 0, err;
+
+	for (i = 0; i < list->count; i++) {
+		u32 off = list->pairs[2 * i];
+
+		apple_dart_writel(dart, apple_dart_sleep_value(dart, off, list->pairs[2 * i + 1]),
+				  off);
+		if (dart->hw->type != DART_T8110 || off != DART_T8110_TLB_CMD)
+			continue;
+		err = apple_dart_sleep_wait_tlb(dart);
+		if (!ret)
+			ret = err;
+	}
 	return ret;
 }
 
@@ -7045,12 +7057,13 @@ int apple_dart_sleep_prepare(struct device *dev)
 EXPORT_SYMBOL_GPL(apple_dart_sleep_prepare);
 
 /*
- * Whether every stream the snapshot holds reads back as saved: one whose write did not take
- * would have its firmware started on translations that aren't Linux's.
+ * Whether every stream the snapshot holds reads back as saved, and every stream it had
+ * enabled reads enabled: one whose write did not take would have its firmware started on
+ * translations that aren't Linux's, or on none.
  */
 static int apple_dart_sleep_check(struct apple_dart *dart)
 {
-	unsigned int sid, idx;
+	unsigned int sid, idx, i;
 	u32 val;
 
 	for (sid = 0; sid < dart->num_streams; sid++) {
@@ -7072,21 +7085,29 @@ static int apple_dart_sleep_check(struct apple_dart *dart)
 			}
 		}
 	}
+	for (i = 0; i < BITS_TO_U32(dart->num_streams); i++) {
+		val = apple_dart_readl(dart, dart->hw->enable_streams + 4 * i);
+		if ((val & dart->sleep_enable[i]) != dart->sleep_enable[i]) {
+			dev_err(dart->dev, "SID%u+ stream enables read %#x after the sleep, saved %#x\n",
+				32 * i, val, dart->sleep_enable[i]);
+			return -EIO;
+		}
+	}
 	return 0;
 }
 
 /*
- * Under the lock, with a snapshot. Returns 0, or -ETIMEDOUT if the TLB command it waits for
+ * Under the lock, with a snapshot. Returns 0, or -ETIMEDOUT if a TLB command it waits for
  * didn't finish.
  */
 static int apple_dart_sleep_put_back(struct apple_dart *dart, bool lost)
 {
 	unsigned int sid, idx, i;
-	int ret = 0;
+	int ret = 0, err;
 
 	dart->sleep_saved = false;
 	if (lost) {
-		apple_dart_sleep_write_kept(dart, &dart->sleep_restore);
+		ret = apple_dart_sleep_write_kept(dart, &dart->sleep_restore);
 		for (sid = 0; sid < dart->num_streams; sid++) {
 			if (!dart->save_tcr[sid] && !dart->save_ttbr[sid][0])
 				continue;
@@ -7097,11 +7118,15 @@ static int apple_dart_sleep_put_back(struct apple_dart *dart, bool lost)
 		}
 	}
 	if (lost || dart->sleep_gated) {
-		apple_dart_sleep_write_kept(dart, &dart->sleep_restore_late);
+		err = apple_dart_sleep_write_kept(dart, &dart->sleep_restore_late);
+		if (!ret)
+			ret = err;
 		for (i = 0; i < BITS_TO_U32(dart->num_streams); i++)
 			apple_dart_writel(dart, dart->sleep_enable[i],
 					  dart->hw->enable_streams + 4 * i);
-		ret = apple_dart_sleep_wait_tlb(dart);
+		err = apple_dart_sleep_wait_tlb(dart);
+		if (!ret)
+			ret = err;
 	}
 	if (dart->sleep_gated) {
 		dart->sleep_gated = false;
