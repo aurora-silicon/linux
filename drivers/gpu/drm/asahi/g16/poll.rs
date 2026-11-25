@@ -36,7 +36,7 @@ use super::engine::{complete, now_ns, rmb, Flight, Lap};
 use super::fw::graph::{notifier, notifier_page, qstate};
 use super::fw::work::compute;
 use super::job::{self, Completions, Job};
-use super::recovery::logic::Retirement;
+use super::recovery::logic::{Retirement, ABORT_GRACE_NS};
 use super::regs::EngineState;
 use super::{params, Firmware, Shared, FAST_POLL_WORK, POLL_WORK, SCRUB_WORK};
 use crate::module_parameters;
@@ -602,12 +602,13 @@ impl Firmware {
             }
         }
         // If a terminal EP 0x20 event arrived with flights outstanding and nothing retired within
-        // the trailing polls, repoll at `repoll_us` instead of sleeping `resnap_us`.
-        self.engine.short_repoll = evented
-            && had_flights
-            && !retired_any
+        // the trailing polls, or a ready same-VM pending job is blocked on slot/flight/work-ring
+        // headroom, repoll at `repoll_us` instead of sleeping `resnap_us`.
+        self.engine.short_repoll = !self.engine.flights.is_empty()
+            && !self.engine.frozen
             && !non_terminal_only
-            && !self.engine.flights.is_empty();
+            && ((evented && had_flights && !retired_any)
+                || (!self.engine.pending.is_empty() && self.engine.slot_wait));
         Ok(!self.engine.flights.is_empty()
             || self.engine.chan_wait
             || self.recovery.needs_repoll()
@@ -765,7 +766,7 @@ impl Firmware {
         unit: &super::slots::ComputeSlot,
     ) -> Result<(u64, u64)> {
         let (start, end) = (unit.its.r64(0)?, unit.its.r64(8)?);
-        if start != 0 && end > start {
+        if start != 0 && end >= start {
             return Ok((start, end));
         }
         let Some((start_off, end_off)) = work_ticks else {
@@ -966,6 +967,7 @@ impl Firmware {
                 {
                     return Ok(Retirement::Pending);
                 }
+                rmb();
                 let stamp = g.notifier.r32(notifier_page::COMPUTE_STAMP)?;
                 full &= stamp_reached(stamp, f.target, e.target)
                     && (stamp != f.target
@@ -976,6 +978,7 @@ impl Firmware {
                 {
                     return Ok(Retirement::Pending);
                 }
+                rmb();
                 full &= g.notifier.r32(notifier_page::COMPUTE_STAMP)? == f.target
                     && g.notifier.r32(notifier_page::COMPUTE_CONTEXT)? == f.job.vm.slot;
             }
@@ -995,7 +998,7 @@ impl Firmware {
                         break;
                     }
                     let (start, end) = self.compute_ticks(unit)?;
-                    if start == 0 || end <= start {
+                    if start == 0 || end < start {
                         full = false;
                         break;
                     }
@@ -1025,6 +1028,7 @@ impl Firmware {
                 {
                     return Ok(Retirement::Pending);
                 }
+                rmb();
                 let fs_stamp = g.notifier.r32(notifier_page::FS_STAMP)?;
                 let ta_stamp = g.notifier.r32(notifier_page::TA_STAMP)?;
                 full &= stamp_reached(fs_stamp, f.fs_target, e.fs_target)
@@ -1059,6 +1063,7 @@ impl Firmware {
                 {
                     return Ok(Retirement::Pending);
                 }
+                rmb();
                 full &= g.notifier.r32(notifier_page::FS_STAMP)? == f.fs_target
                     && g.notifier.r32(notifier_page::TA_STAMP)? == f.ta_target
                     && g.notifier.r32(notifier::CONTEXT)? == f.job.vm.slot
@@ -1080,9 +1085,9 @@ impl Firmware {
                         ticks = [ta_start, ta_end, fs_start, fs_end];
                     }
                     full &= ta_start != 0
-                        && ta_end > ta_start
+                        && ta_end >= ta_start
                         && fs_start != 0
-                        && fs_end > fs_start;
+                        && fs_end >= fs_start;
                     if !full {
                         break;
                     }
@@ -1093,13 +1098,27 @@ impl Firmware {
             self.engine.retired_ticks = ticks;
             return Ok(Retirement::Full);
         }
-        if f.recovery_suspect && now_ns().saturating_sub(f.recovery_started_ns) >= 20_000_000 {
-            // Queues, pipes and every participating stage passed the retained command.
-            // The firmware recovered it without normal completion: fail and quarantine.
-            if let Some(f) = self.engine.flights.get_mut(index) {
-                f.doomed = true;
+        if f.recovery_suspect {
+            // Queues, pipes and every participating stage passed the retained command, yet normal
+            // receipts have not settled. Measure the abort grace from this first gate-passed poll
+            // and require a second unsettled poll so an innocent suspect flight finishing > 20 ms
+            // after recovery cannot race a transient WC/notifier write into a false abort.
+            let now = now_ns();
+            let aborted = if let Some(f) = self.engine.flights.get_mut(index) {
+                let first = *f.gate_passed_ns.get_or_insert(now);
+                f.unsettled_polls = f.unsettled_polls.saturating_add(1);
+                if f.unsettled_polls >= 2 && now.saturating_sub(first) >= ABORT_GRACE_NS {
+                    f.doomed = true;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if aborted {
+                return Ok(Retirement::Aborted);
             }
-            return Ok(Retirement::Aborted);
         }
         Ok(Retirement::Pending)
     }
@@ -1539,7 +1558,7 @@ impl Firmware {
                 f.job
                     .queue
                     .usage
-                    .add(engine, start, end, super::hw::COMMAND_TIMESTAMP_HZ as u32);
+                    .add_union(engine, start, end, super::hw::COMMAND_TIMESTAMP_HZ as u32);
                 *sum = sum.saturating_add(end - start);
                 lo = lo.min(start);
                 hi = hi.max(end);

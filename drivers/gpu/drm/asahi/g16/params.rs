@@ -48,11 +48,18 @@ pub(crate) fn compute_flights() -> usize {
     32usize.clamp(1, hw::sizes::FLIGHTS)
 }
 
-/// Render commands in flight at most (`RENDER_SLOTS - 1` so one slot holds displacement).
+/// Render commands in flight at most: bounded by both retained pass slots
+/// (`RENDER_SLOTS - 1`, leaving one slot for displacement) and firmware TA/FS work-ring
+/// capacity (`(QUEUE_CAP - 1) / MAX_RENDER_RING_ENTRIES`, worst case 4 ring entries per pass).
+/// Decoupled from `hw::sizes::FLIGHTS` because multi-pass render batches pack multiple passes
+/// into one `Flight`.
 pub(crate) fn render_flights() -> usize {
+    let ring_cap =
+        (hw::sizes::QUEUE_CAP as usize).saturating_sub(1) / hw::sizes::MAX_RENDER_RING_ENTRIES;
     hw::sizes::RENDER_SLOTS
         .saturating_sub(1)
-        .clamp(1, hw::sizes::FLIGHTS)
+        .min(ring_cap)
+        .max(1)
 }
 
 /// Repoll while a ready prefix waits for record consumption, us.

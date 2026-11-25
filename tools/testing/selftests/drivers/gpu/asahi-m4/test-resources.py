@@ -573,8 +573,8 @@ pub mod g16 {
         assert_eq!(p0.heap.fills.lock().unwrap().last(),Some(&(0,0x4000)));
     }
 
-    #[test]fn thirty_two_render_passes_and_eighteen_compute_units_are_disjoint_in_mesa_hole(){
-        assert_eq!(g16::hw::sizes::RENDER_SLOTS, 32);
+    #[test]fn forty_eight_render_passes_and_eighteen_compute_units_are_disjoint_in_mesa_hole(){
+        assert_eq!(g16::hw::sizes::RENDER_SLOTS, 48);
         assert_eq!(g16::hw::sizes::COMPUTE_UNITS, 18);
         let mut o=Objects::new();
         let pools=PoolSet::new(&mut o).unwrap();
@@ -586,12 +586,25 @@ pub mod g16 {
             g16::slots::ComputeSlot::new(&mut o,k).unwrap();
         }
         let mut scene_lists=Vec::new();
+        let count_client=|objs:&Objects|objs.objects.iter().filter(|a|a.gva.is_some()).count();
         for k in 0..g16::hw::sizes::RENDER_SLOTS as u64 {
             let pass=g16::slots::PassSlot::new(&mut o,k,1).unwrap();
             let va=pass.refs().scene_list;
             assert_ne!(va,0);
             assert!(!scene_lists.contains(&va),"each pass slot must own a distinct scene_list");
             scene_lists.push(va);
+        }
+        // Every demand-grown extension tier stays strictly within MAX_CLIENT (512) per batch.
+        for &(start, end) in &g16::resources::EXT_RENDER_TIERS {
+            let mut ot = Objects::new();
+            for k in start..end {
+                g16::slots::PassSlot::new(&mut ot, k as u64, 1).unwrap();
+            }
+            let tier_maps = count_client(&ot);
+            assert!(
+                tier_maps <= g16::hw::sizes::MAX_CLIENT,
+                "tier {start}..{end} client maps {tier_maps} > MAX_CLIENT"
+            );
         }
         let mut aliases=Vec::new();
         for a in &o.objects {
@@ -805,7 +818,7 @@ pub mod g16 {
         assert_eq!(arena.render.passes[0].scene.fills.lock().unwrap().len(),2);
     }
 
-    #[test]fn pipelined_render_pass_slots_keep_thirty_one_in_flight(){
+    #[test]fn pipelined_render_pass_slots_keep_forty_seven_in_flight(){
         let mut o=Objects::new();let mut s=Slots::new().unwrap();
         let mut passes=KVec::new();
         for k in 0..g16::hw::sizes::RENDER_SLOTS as u64 {
@@ -827,30 +840,31 @@ pub mod g16 {
         let a=vm(1);
         let b=vm(2);
         let mut live:Vec<Claims>=Vec::new();
-        // Publish 31 concurrent passes in flight (slots 0..31), exercising bit 31 on the last slot.
-        for k in 0..31usize {
+        // Publish 47 concurrent passes in flight (slots 0..47), covering 4x11-pass and 6x7-pass
+        // multi-pass bursts and exercising 64-bit pass_mask bits above bit 31.
+        for k in 0..47usize {
             let mut c=Claims::new();
-            c.pass[0]=k as u32;c.pass_mask=1u32<<k;
+            c.pass[0]=k as u32;c.pass_mask=1u64<<k;
             s.claim_pass_for(&arena,k,Some(a.id)).unwrap();
             assert!(s.render_needs_full_work(k));
             s.hold_vm(&c,&a).unwrap();
             s.publish(&mut c).unwrap();
             live.push(c);
         }
-        assert_eq!(s.render_published(),31);
-        assert!(s.pass_available(32)); // slot 31 is still fresh
-        assert!(!s.pass_available(31));
-        // Retire 0 and 1 -> slot 0 is displaced and reusable while 29 others remain in flight.
+        assert_eq!(s.render_published(),47);
+        assert!(s.pass_available(48)); // slot 47 is still fresh
+        assert!(!s.pass_available(47));
+        // Retire 0 and 1 -> slot 0 is displaced and reusable while 45 others remain in flight.
         s.retire(&mut live[0]).unwrap();
-        assert!(!s.pass_available(31)); // slot 0 not displaced yet
+        assert!(!s.pass_available(47)); // slot 0 not displaced yet
         s.retire(&mut live[1]).unwrap();
-        assert!(s.pass_available(31)); // slot 0 displaced by slot 1!
-        // Claim and publish bit 31 (slot 31) explicitly to prove zero 32-bit mask overflow.
-        let mut c31=Claims::new();
-        c31.pass[0]=31;c31.pass_count=1;c31.pass_mask=1u32<<31;
-        s.claim_pass_for(&arena,31,Some(a.id)).unwrap();
-        s.hold_vm(&c31,&a).unwrap();
-        s.publish(&mut c31).unwrap();
+        assert!(s.pass_available(47)); // slot 0 displaced by slot 1!
+        // Claim and publish bit 47 (slot 47) explicitly to prove zero 64-bit mask overflow.
+        let mut c47=Claims::new();
+        c47.pass[0]=47;c47.pass_count=1;c47.pass_mask=1u64<<47;
+        s.claim_pass_for(&arena,47,Some(a.id)).unwrap();
+        s.hold_vm(&c47,&a).unwrap();
+        s.publish(&mut c47).unwrap();
         // Clean same-VM reuse of displaced slot 0 does not need full work write.
         s.claim_pass_for(&arena,0,Some(a.id)).unwrap();
         assert!(!s.render_needs_full_work(0));
@@ -863,7 +877,7 @@ pub mod g16 {
         for c in live.iter_mut().skip(2) {
             s.retire(c).unwrap();
         }
-        s.retire(&mut c31).unwrap();
+        s.retire(&mut c47).unwrap();
         assert_eq!(s.render_published(),0);
     }
 
@@ -1051,23 +1065,23 @@ pub mod g16 {
         },0).unwrap();
         let prep=g16::resources::Prepared{compute:arena.compute.compute,render:Some(render)};
         let a=vm(1);
-        // Wrapped submission order [30, 31, 0]: retiring in order leaves slot 0 as last_retired
-        // while slots 30 and 31 are displaced and reusable immediately.
-        let order=[30usize,31,0];
+        // Wrapped submission order [46, 47, 0]: retiring in order leaves slot 0 as last_retired
+        // while high slots 46 and 47 (bits above 31) are displaced and reusable immediately.
+        let order=[46usize,47,0];
         let mut c=Claims::new();
         for (i,&k) in order.iter().enumerate() {
             s.claim_pass_in(&prep,k,Some(a.id),0x1000).unwrap();
             c.pass[i]=k as u32;
             c.pass_count+=1;
-            c.pass_mask|=1u32<<k;
-            s.pass_busy|=1u32<<k;
+            c.pass_mask|=1u64<<k;
+            s.pass_busy|=1u64<<k;
         }
         // Mismatched pass_mask or duplicate slot is rejected by hold_vm.
         let mut bad=c;
-        bad.pass_mask^=1<<1;
+        bad.pass_mask^=1u64<<1;
         assert_eq!(s.hold_vm(&bad,&a),Err(EINVAL));
         let mut dup=c;
-        dup.pass[2]=30;
+        dup.pass[2]=46;
         assert_eq!(s.hold_vm(&dup,&a),Err(EINVAL));
 
         s.hold_vm(&c,&a).unwrap();
@@ -1079,19 +1093,19 @@ pub mod g16 {
         assert_eq!(c.pass_count,0);
         assert_eq!(c.pass_mask,0);
         assert_eq!(s.pass_busy,0);
-        // Slots 30 and 31 were displaced by slot 0 (newest), so 30 & 31 are claimable while 0 is held.
+        // Slots 46 and 47 were displaced by slot 0 (newest), so 46 & 47 are claimable while 0 is held.
         assert_eq!(s.claim_pass_in(&prep,0,Some(a.id),0x1000),Err(EBUSY));
-        s.claim_pass_in(&prep,30,Some(a.id),0x1000).unwrap();
-        s.claim_pass_in(&prep,31,Some(a.id),0x1000).unwrap();
+        s.claim_pass_in(&prep,46,Some(a.id),0x1000).unwrap();
+        s.claim_pass_in(&prep,47,Some(a.id),0x1000).unwrap();
         let mut cancel=Claims::new();
-        cancel.pass[0]=30;cancel.pass[1]=31;cancel.pass_count=2;cancel.pass_mask=(1u32<<30)|(1u32<<31);
+        cancel.pass[0]=46;cancel.pass[1]=47;cancel.pass_count=2;cancel.pass_mask=(1u64<<46)|(1u64<<47);
         s.pass_busy|=cancel.pass_mask;
         s.release(&mut cancel);
         assert_eq!(cancel.pass_count,0);
         assert_eq!(s.pass_busy,0);
-        s.claim_pass_in(&prep,30,Some(a.id),0x1000).unwrap();
+        s.claim_pass_in(&prep,46,Some(a.id),0x1000).unwrap();
         let mut cancel2=Claims::new();
-        cancel2.pass[0]=30;cancel2.pass_count=1;cancel2.pass_mask=1u32<<30;
+        cancel2.pass[0]=46;cancel2.pass_count=1;cancel2.pass_mask=1u64<<46;
         s.release(&mut cancel2);
 
         // PoolSet::publish_batch advances submitted by 2 * renders and rejects invalid deltas.
@@ -1108,8 +1122,9 @@ pub mod g16 {
         use crate::g16::resources::{BASE_RENDER_SLOTS, EXT_RENDER_TIERS, target_render_slots};
         let tier0_end = EXT_RENDER_TIERS[0].1;
         let tier1_end = EXT_RENDER_TIERS[1].1;
-        let full_end = EXT_RENDER_TIERS[2].1;
-        assert_eq!((BASE_RENDER_SLOTS, tier0_end, tier1_end, full_end), (2, 8, 18, 32));
+        let tier2_end = EXT_RENDER_TIERS[2].1;
+        let full_end = EXT_RENDER_TIERS[3].1;
+        assert_eq!((BASE_RENDER_SLOTS, tier0_end, tier1_end, tier2_end, full_end), (2, 8, 18, 32, 48));
 
         // Steady 60 fps (16.67 ms) and 120 fps (8.33 ms) single-pass depth-1 clients
         // finish each frame before the next arrives (active_passes == 0) and stay on
@@ -1156,7 +1171,11 @@ pub mod g16 {
         backed = target_render_slots(&mut last, &mut burst, 55_800_000, 1, 16, false, backed);
         assert_eq!(backed, tier1_end); // 16 + 1 + 1 == 18 fits in Tier 1
         backed = target_render_slots(&mut last, &mut burst, 72_400_000, 1, 17, false, backed);
-        assert_eq!(backed, full_end); // 17 + 1 + 1 == 19 grows to Tier 2 (32 slots)
+        assert_eq!(backed, tier2_end); // 17 + 1 + 1 == 19 grows to Tier 2 (32 slots)
+        backed = target_render_slots(&mut last, &mut burst, 89_000_000, 1, 30, false, backed);
+        assert_eq!(backed, tier2_end); // 30 + 1 + 1 == 32 fits in Tier 2
+        backed = target_render_slots(&mut last, &mut burst, 105_600_000, 1, 31, false, backed);
+        assert_eq!(backed, full_end); // 31 + 1 + 1 == 33 grows to Tier 3 (48 slots)
 
         // Sub-2 ms back-to-back single-pass bursts grow only to Tier 0 after 3 consecutive gaps.
         let mut last = 0u64;
@@ -1168,11 +1187,25 @@ pub mod g16 {
         assert_eq!(burst, 3);
         assert_eq!(target_render_slots(&mut last, &mut burst, 5_000_000, 1, 0, false, tier0_end), tier0_end);
 
-        // A single large multi-pass SUBMIT jumps directly to the tier covering render_count + 1.
+        // Multi-pass pipelined workloads stop at Tier 2 (32 slots) for 20-31 pass demand and
+        // grow into Tier 3 (48 slots) only when live demand exceeds 32 slots:
+        // 11-pass render.postfx: depth 2 (23) -> Tier 2, depth 3 (34) -> Tier 3;
+        // 7-pass compress.bw array: depth 3 (22) -> Tier 2, depth 5 (36) -> Tier 3;
+        // 4-pass render.shadow: depth 5 (21) -> Tier 2, depth 8 (33) -> Tier 3.
         let mut last = 0u64;
         let mut burst = 0u32;
-        assert_eq!(target_render_slots(&mut last, &mut burst, 10_000_000, 8, 0, false, BASE_RENDER_SLOTS), tier1_end);
-        assert_eq!(target_render_slots(&mut last, &mut burst, 20_000_000, 20, 0, false, BASE_RENDER_SLOTS), full_end);
+        assert_eq!(target_render_slots(&mut last, &mut burst, 10_000_000, 11, 0, false, BASE_RENDER_SLOTS), tier1_end);
+        assert_eq!(target_render_slots(&mut last, &mut burst, 15_000_000, 11, 11, false, tier1_end), tier2_end);
+        assert_eq!(target_render_slots(&mut last, &mut burst, 18_000_000, 11, 22, false, tier2_end), full_end);
+        assert_eq!(target_render_slots(&mut last, &mut burst, 20_000_000, 7, 7, false, tier1_end), tier1_end);
+        assert_eq!(target_render_slots(&mut last, &mut burst, 25_000_000, 7, 14, false, tier1_end), tier2_end);
+        assert_eq!(target_render_slots(&mut last, &mut burst, 28_000_000, 7, 28, false, tier2_end), full_end);
+        assert_eq!(target_render_slots(&mut last, &mut burst, 30_000_000, 4, 12, false, tier1_end), tier1_end);
+        assert_eq!(target_render_slots(&mut last, &mut burst, 35_000_000, 4, 16, false, tier1_end), tier2_end);
+        assert_eq!(target_render_slots(&mut last, &mut burst, 38_000_000, 4, 28, false, tier2_end), full_end);
+        assert_eq!(target_render_slots(&mut last, &mut burst, 40_000_000, 8, 0, false, BASE_RENDER_SLOTS), tier1_end);
+        assert_eq!(target_render_slots(&mut last, &mut burst, 50_000_000, 20, 0, false, BASE_RENDER_SLOTS), tier2_end);
+        assert_eq!(target_render_slots(&mut last, &mut burst, 60_000_000, 32, 0, false, BASE_RENDER_SLOTS), full_end);
 
         // Verify exact per-slot mapped backing bytes for Base vs Ext slots.
         let mut o_base = Objects::new();
@@ -1183,10 +1216,13 @@ pub mod g16 {
         g16::slots::PassSlot::new(&mut o_ext, 2, 1).unwrap();
         let ext_slot_bytes: usize = o_ext.objects.iter().map(|obj| obj.mapped).sum();
         assert_eq!(ext_slot_bytes, (2 * 1024 + 1024 + 608) * 1024);
-        // Tier 0 (6 ext slots) is 21.5625 MiB vs 107.8125 MiB for all 30 ext slots.
+        // Cumulative extension backing across the 4 demand-grown tiers:
+        // Tier 0 (6 ext): 21.5625 MiB, Tier 1 (16 ext): 57.50 MiB,
+        // Tier 2 (30 ext): 107.8125 MiB, Tier 3 (46 ext): 165.3125 MiB.
         assert_eq!((tier0_end - BASE_RENDER_SLOTS) * ext_slot_bytes, 22_080 * 1024);
         assert_eq!((tier1_end - BASE_RENDER_SLOTS) * ext_slot_bytes, 58_880 * 1024);
-        assert_eq!((full_end - BASE_RENDER_SLOTS) * ext_slot_bytes, 110_400 * 1024);
+        assert_eq!((tier2_end - BASE_RENDER_SLOTS) * ext_slot_bytes, 110_400 * 1024);
+        assert_eq!((full_end - BASE_RENDER_SLOTS) * ext_slot_bytes, 169_280 * 1024);
     }
 
     #[test]fn base_compute_quarantine_expands_fresh_vm_and_recovers_displacement(){

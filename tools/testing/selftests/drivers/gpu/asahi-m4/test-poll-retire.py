@@ -6,6 +6,7 @@ import json
 import subprocess
 
 production = kernel_root() / 'drivers/gpu/drm/asahi/g16/poll.rs'
+queue_source = (kernel_root() / 'drivers/gpu/drm/asahi/g16/queue.rs').read_text()
 event_source = (kernel_root() / 'drivers/gpu/drm/asahi/g16/event.rs').read_text()
 mod_source = (kernel_root() / 'drivers/gpu/drm/asahi/g16/mod.rs').read_text()
 source = production.read_text()
@@ -15,6 +16,12 @@ assert 'const EVENT_RETIRE_POLLS: u32 = 11;' in source, 'EVENT_RETIRE_POLLS expe
 assert (
     'OwnedQueue::new_percpu_reclaim(c_str!("aurora_g16_events"), true)' in mod_source
 ), 'aurora_g16_events must use new_percpu_reclaim(..., true)'
+assert (
+    'pub(crate) usage: Arc<crate::usage::Client>' in queue_source
+), 'QueueState::usage must reference the per-file usage::Client'
+assert (
+    '.add_union(engine, start, end, super::hw::COMMAND_TIMESTAMP_HZ as u32)' in source
+), 'G16 poll retirement must deduplicate per-file intervals via Client::add_union'
 
 
 def item(declaration, text=source):
@@ -125,6 +132,7 @@ struct Engine {
     target: u32,
     fs_target: u32,
     chan_wait: bool,
+    slot_wait: bool,
     short_repoll: bool,
     frozen: bool,
     stats: Stats,
@@ -179,6 +187,7 @@ struct Shared {
     evented: AtomicBool,
     publish_wake: AtomicBool,
     rearmed: Cell<u32>,
+    idle_power_polls: Cell<u32>,
 }
 impl Shared {
     fn new() -> Arc<Self> {
@@ -187,12 +196,15 @@ impl Shared {
             evented: AtomicBool::new(false),
             publish_wake: AtomicBool::new(false),
             rearmed: Cell::new(0),
+            idle_power_polls: Cell::new(0),
         })
     }
     fn rearm(&self, _soon: bool) {
         self.rearmed.set(self.rearmed.get() + 1);
     }
-    fn arm_idle_power_poll(&self, _firmware: &Firmware) {}
+    fn arm_idle_power_poll(&self, _firmware: &Firmware) {
+        self.idle_power_polls.set(self.idle_power_polls.get() + 1);
+    }
     fn fail_stop(&self, _e: Error) {}
     __SUBMIT_LOCKED__
 }
@@ -200,12 +212,17 @@ impl Shared {
 #[derive(Default)]
 struct Power {
     ramp: bool,
+    idle_reports: u32,
 }
 impl Power {
     fn needs_ramp(&self, _now: u64) -> bool {
         self.ramp
     }
-    fn report_work(&mut self, _in_flight: bool) {}
+    fn report_work(&mut self, in_flight: bool) {
+        if !in_flight {
+            self.idle_reports += 1;
+        }
+    }
 }
 
 #[derive(Default)]
@@ -261,6 +278,7 @@ impl Firmware {
                 target: 0,
                 fs_target: 0,
                 chan_wait: false,
+                slot_wait: false,
                 short_repoll: false,
                 frozen: false,
                 stats: Stats::default(),
@@ -578,6 +596,60 @@ fn poll_step_skips_publish_when_pending_blocked_and_nothing_retired() {
         .poll_step(true, EVENT_RETIRE_POLLS, &mut retry_tail, &mut deferred, &mut done)
         .unwrap());
     assert_eq!(fw.publish_checked_calls, 5);
+}
+
+#[test]
+fn pending_slot_wait_arms_short_repoll_without_breaking_ta_only_or_frozen() {
+    CLOCK.with(|c| c.set(100_000));
+    let mut fw = Firmware::new();
+    fw.engine.flights.push(Flight {
+        computes: 0,
+        renders: 11,
+        target: 0,
+        fs_target: 0x100,
+    });
+    fw.engine.fs_target = 0x100;
+    let mut retry_tail = false;
+    let mut deferred = false;
+    let mut done = vec![];
+
+    // No pending work on a timer poll -> keep normal resnap_us interval.
+    assert!(fw
+        .poll_step(false, 0, &mut retry_tail, &mut deferred, &mut done)
+        .unwrap());
+    assert!(!fw.engine.short_repoll);
+
+    // Pending job NOT blocked on slot headroom (e.g. external fence / cross-VM / InitBM) ->
+    // keep normal resnap_us interval without arming short_repoll.
+    fw.engine.pending.push(Arc::new(Job { id: 2 }));
+    fw.engine.slot_wait = false;
+    assert!(fw
+        .poll_step(false, 0, &mut retry_tail, &mut deferred, &mut done)
+        .unwrap());
+    assert!(!fw.engine.short_repoll);
+
+    // Pending job waiting on slot headroom on a non-event poll -> arm short_repoll.
+    fw.engine.slot_wait = true;
+    assert!(fw
+        .poll_step(false, 0, &mut retry_tail, &mut deferred, &mut done)
+        .unwrap());
+    assert!(fw.engine.short_repoll);
+
+    // TA-only EP 0x20 event still suppresses short_repoll.
+    fw.drain_stage_delta = 1;
+    fw.drain_fs_delta = 0;
+    assert!(fw
+        .poll_step(true, EVENT_RETIRE_POLLS, &mut retry_tail, &mut deferred, &mut done)
+        .unwrap());
+    assert!(!fw.engine.short_repoll);
+    fw.drain_stage_delta = 0;
+
+    // Frozen engine suppresses short_repoll even with pending work.
+    fw.engine.frozen = true;
+    assert!(fw
+        .poll_step(false, 0, &mut retry_tail, &mut deferred, &mut done)
+        .unwrap());
+    assert!(!fw.engine.short_repoll);
 }
 
 mod boot {
@@ -938,7 +1010,36 @@ mod resnap_sync_test {
         }
     }
 }
+
+#[path = "__USAGE_PATH__"]
+mod usage;
+
+#[test]
+fn per_file_usage_union_deduplicates_pipelined_and_dual_pipe_siblings() {
+    let client = Arc::new(usage::Client::new());
+    const HZ: u32 = 24_000_000;
+    // Two pipelined renders whose TA and FS intervals overlap across flights.
+    client.add_union(usage::Engine::Vertex, 24_000, 48_000, HZ);
+    client.add_union(usage::Engine::Fragment, 40_000, 88_000, HZ);
+    client.add_union(usage::Engine::Vertex, 36_000, 72_000, HZ);
+    client.add_union(usage::Engine::Fragment, 64_000, 120_000, HZ);
+    // Two sibling queues on the same DRM file overlapping across dual CDM pipes.
+    client.add_union(usage::Engine::Compute, 100_000, 124_000, HZ);
+    client.add_union(usage::Engine::Compute, 106_000, 130_000, HZ);
+    let [v_ns, f_ns, c_ns] = client.snapshot();
+    // Vertex union: [24k, 72k] = 48k ticks = 2_000_000 ns (not 60k ticks = 2.5 ms).
+    assert_eq!(v_ns, 2_000_000);
+    // Fragment union: [40k, 120k] = 80k ticks = 3_333_333 ns (distinct from Vertex).
+    assert_eq!(f_ns, 3_333_333);
+    assert_ne!(v_ns, f_ns);
+    // Compute union: [100k, 130k] = 30k ticks = 1_250_000 ns (not 48k ticks = 2.0 ms).
+    assert_eq!(c_ns, 1_250_000);
+}
 '''
+
+harness = harness.replace(
+    '__USAGE_PATH__', str(kernel_root() / 'drivers/gpu/drm/asahi/usage.rs')
+)
 
 for token, decl in {
     '__SUBMIT_LOCKED__': 'fn submit_locked(',

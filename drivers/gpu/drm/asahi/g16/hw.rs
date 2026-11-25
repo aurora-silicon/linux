@@ -646,8 +646,8 @@ pub(crate) mod client {
     // - Base slots `0..BASE_RENDER_SLOTS` keep 32 MiB intervals with full 16 MiB TPC / 8 MiB
     //   tilemap capacity for worst-case geometries.
     // - Extension slots `BASE_RENDER_SLOTS..RENDER_SLOTS` pack into 8 MiB intervals starting at
-    //   `EXT_PASS_BASE` (`0x7024000000`) with 2 MiB TPC / 1 MiB tilemap capacity, fitting 32
-    //   total pass slots (`0x7020000000..0x7033000000`, leaving 208 MiB free below 0x7040000000).
+    //   `EXT_PASS_BASE` (`0x7024000000`) with 2 MiB TPC / 1 MiB tilemap capacity, fitting 48
+    //   total pass slots (`0x7020000000..0x703b000000`, leaving 80 MiB free below 0x7040000000).
     pub(crate) const FS_WORK_PAGE: u64 = 0x7020000000;
     pub(crate) const FS_WORK_OFF: u64 = 0;
     pub(crate) const TA_WORK_PAGE: u64 = 0x7020004000;
@@ -735,13 +735,13 @@ pub(crate) mod sizes {
     /// retired (displacing it), so `n` slots keep up to `n - 1` renders in flight.
     ///
     /// Sized inside both the host client-VA window (`0x7020000000..0x7040000000`) and firmware
-    /// queue/recovery capacities: `31` in-flight passes consume at most `31 * 4 = 124` entries of
-    /// each 256-entry TA/FS work ring (`QUEUE_CAP = 256`, 255 usable), share hardware UMA slot
-    /// `RENDER_UMA_SLOT` (33) via the active PB/UMA descriptor, post at most `FLIGHTS = 32`
-    /// `SubmitRecord`s (vs `AHEAD_RECORDS = 128` / `RING_SLOTS = 256`), and stay far below the
-    /// firmware recovery `snapshot_entries = 448` limit.
-    pub(crate) const RENDER_SLOTS: usize = 32;
-    const _: () = assert!(RENDER_SLOTS >= BASE_RENDER_SLOTS && RENDER_SLOTS <= 32);
+    /// queue/recovery capacities: `47` in-flight passes consume at most `47 * 4 = 188` entries of
+    /// each 256-entry TA/FS work ring (`QUEUE_CAP = 256`, 255 usable, ring cap `63`), share
+    /// hardware UMA slot `RENDER_UMA_SLOT` (33) via the active PB/UMA descriptor, post at most
+    /// `FLIGHTS = 32` `SubmitRecord`s (vs `AHEAD_RECORDS = 128` / `RING_SLOTS = 256`), and stay
+    /// far below the firmware recovery `snapshot_entries = 448` limit.
+    pub(crate) const RENDER_SLOTS: usize = 48;
+    const _: () = assert!(RENDER_SLOTS >= BASE_RENDER_SLOTS && RENDER_SLOTS <= 64);
     const _: () = assert!((RENDER_SLOTS - 1) * MAX_RENDER_RING_ENTRIES < QUEUE_CAP as usize);
     const _: () = assert!(super::client::AUX + 0x20000 <= super::client::SCENE_LIST);
     const _: () = assert!(super::client::SCENE_LIST + 0x4000 <= super::client::TPC);
