@@ -66,6 +66,10 @@ properties:
     $ref: /schemas/types.yaml#/definitions/string
     description: Machine family used for the sound card identity.
 
+  apple,no-beamforming:
+    type: boolean
+    description: Disable microphone array beamforming on boards without it.
+
 required:
   - compatible
   - dmas
