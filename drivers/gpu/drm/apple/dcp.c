@@ -6264,34 +6264,9 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 	int ret;
 
 	/*
-	 * T8142 (J813) on macOS 27.0: the H17P interface written for its 26.x
-	 * firmware makes the 27.0 DCP firmware panic right after the first
-	 * hotplug ("ap_link: callback failed with: 0x5"). It runs the T6050's
-	 * firmware-27 generation, and so does 27.2, with the 27.2 method table.
+	 * T6050 and T8142 dcpext were introduced on firmware 27 and have no
+	 * older interface.
 	 */
-	if (of_device_is_compatible(dev->of_node, "apple,t8142-dcp")) {
-		ret = dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
-		if (ret >= 0 && (!strcmp(compat_str, "27.0.0") ||
-				 !strcmp(compat_str, "27.2.0")))
-			return DCP_FIRMWARE_V_27_0;
-	}
-
-	/*
-	 * The T8122 (M3 MacBook Air) internal DCP on the 27.2 (26B123) image
-	 * runs the firmware-27 backend with the 27.2 table, as the T6041's
-	 * 27.2 internal DCP does. Its 14.x image keeps the native 14.7 path
-	 * and the 25G83 profile its own, below.
-	 */
-	if (apple_t8122_dcp_v27_2(dev->of_node)) {
-		/* Checked by apple_t8122_dcp_v27_2(). */
-		dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
-		return dcp_v27_method_table(dev, compat_str);
-	}
-
-	if (dcp_firmware_27(dev, &version))
-		return version;
-
-	/* The T6050 was introduced on firmware 27 and has no older interface. */
 	if (hw->firmware_compat == DCP_FIRMWARE_V_27_0) {
 		ret = dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
 		if (ret < 0) {
@@ -6302,8 +6277,20 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 	}
 
 	/*
-	 * SoCs introduced with H17-generation firmware pin its interface; the
-	 * loader may not recognise their boot firmware version.
+	 * T8142 (J813) on firmware 27 or later: the H17P interface written for
+	 * its 26.x firmware makes 27.x firmware panic right after the first
+	 * hotplug ("ap_link: callback failed with: 0x5"). Keep ahead of its
+	 * H17P match-data pin so known 27.x builds take the common firmware-27
+	 * backend and unknown 27.x builds are terminally refused.
+	 */
+	if (of_device_is_compatible(dev->of_node, "apple,t8142-dcp") &&
+	    dcp_firmware_27(dev, &version))
+		return version;
+
+	/*
+	 * SoCs introduced with M4 or H17-generation firmware pin their
+	 * interface; keep explicit match-data pins ahead of the generic
+	 * firmware-27 rule below so T8132/T8140 stay on their pinned backend.
 	 */
 	if (hw->firmware_compat != DCP_FIRMWARE_UNKNOWN)
 		return hw->firmware_compat;
@@ -6315,7 +6302,8 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 	 * T6041 (M4 Pro/Max) uses its desktop IOMFB instance on 26.5.2 and
 	 * 26.6.2 firmware, where boot firmware and compatibility versions must
 	 * match. The pinned 27.2 (26B123) T6041 DCP image uses the firmware-27
-	 * backend on internal and external display processors.
+	 * backend on internal and external display processors. Keep ahead of
+	 * dcp_firmware_27() so the T6041 image UUID pin remains enforced.
 	 */
 	if (of_device_is_compatible(dev->of_node, "apple,t6041-dcp") ||
 	    of_device_is_compatible(dev->of_node, "apple,t6041-dcpext")) {
@@ -6333,6 +6321,25 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 			compat_ret >= 0 ? compat_str : "missing");
 		return DCP_FIRMWARE_UNKNOWN;
 	}
+
+	/*
+	 * T8122 (M3 MacBook Air) internal and external DCPs pin the 27.2
+	 * (26B123) image UUID on firmware 27.x: any wrong or missing UUID on a
+	 * firmware 27+ build is terminally refused rather than falling through
+	 * to generic firmware-27 or legacy 14.x selection.
+	 */
+	if ((of_device_is_compatible(dev->of_node, "apple,t8122-dcp") ||
+	     of_device_is_compatible(dev->of_node, "apple,t8122-dcpext")) &&
+	    dcp_firmware_27(dev, &version)) {
+		if (apple_t8122_dcp_v27_2(dev->of_node) ||
+		    apple_t8122_dcpext_v27_2(dev->of_node))
+			return version;
+		dev_err(dev, "T8122 display not started: unpinned 27.x DCP firmware UUID\n");
+		return DCP_FIRMWARE_UNKNOWN;
+	}
+
+	if (dcp_firmware_27(dev, &version))
+		return version;
 
 	ret = dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
 	if (ret < 0) {
@@ -6528,6 +6535,56 @@ VISIBLE_IF_KUNIT void dcp_enable_typec_work(struct apple_dcp *dcp)
 	}
 }
 
+static bool dcp_has_available_typec_routes(struct device_node *np)
+{
+	struct device_node *routes, *child;
+	bool avail = false;
+
+	routes = of_get_child_by_name(np, "typec-routes");
+	if (!routes)
+		return false;
+	if (of_device_is_available(routes)) {
+		for_each_available_child_of_node(routes, child) {
+			of_node_put(child);
+			avail = true;
+			break;
+		}
+	}
+	of_node_put(routes);
+	return avail;
+}
+
+static bool dcp_is_internal_panel_only(const struct apple_dcp *dcp)
+{
+	struct device_node *np = dcp->dev->of_node;
+
+	return dcp->panel_identity && !dcp->dcpext &&
+	       !of_property_present(np, "phys") &&
+	       !dcp_has_available_typec_routes(np);
+}
+
+static u8 dcp_dart_dma_bits(struct device_node *np)
+{
+	struct of_phandle_args args;
+	u32 range[4];
+	u64 base, size, end;
+	int ret;
+
+	ret = of_parse_phandle_with_args(np, "iommus", "#iommu-cells", 0, &args);
+	if (ret)
+		return 0;
+	ret = of_property_read_u32_array(args.np, "apple,dma-range", range, 4);
+	of_node_put(args.np);
+	if (ret)
+		return 0;
+	base = ((u64)range[0] << 32) | range[1];
+	size = ((u64)range[2] << 32) | range[3];
+	if (!size || base + size < base)
+		return 0;
+	end = base + size - 1;
+	return clamp_t(u8, fls64(end), 32, 48);
+}
+
 /*
  * The provider clocks firmware 27 asks for by index (getClockFrequency):
  * apple,clock-ids, published by the boot loader from the ADT.
@@ -6538,24 +6595,20 @@ static int dcp_firmware_clocks_v27(struct apple_dcp *dcp)
 	int clocks, index, ret;
 
 	/*
-	 * T6041 device trees carry the single 712 MHz disp0 clock unless the
-	 * boot loader publishes the two /arm-io/disp0 provider clocks
-	 * (376 at 712 MHz and 460 at 0 Hz). Expose the same two-entry table
-	 * when apple,clock-ids is absent so getClockFrequency(0/1) matches.
-	 */
-	/*
-	 * The T8122 /arm-io/disp0 names the same pair (345 at 712 MHz, the
-	 * device tree's disp0 clock, and 416 at 0 Hz).
+	 * Internal panels whose device tree carries only the single unnamed
+	 * disp0 clock without apple,clock-ids (T6041, T8122, T6030, T6031,
+	 * T8112): expose the two-entry [disp0, 0 Hz] table so
+	 * getClockFrequency(0/1) matches /arm-io/disp0. Non-panel paths or
+	 * nodes without a single unnamed clock still require apple,clock-ids.
 	 */
 	if (!of_property_present(dev->of_node, "apple,clock-ids") &&
-	    (of_device_is_compatible(dev->of_node, "apple,t6041-dcp") ||
-	     of_device_is_compatible(dev->of_node, "apple,t8122-dcp"))) {
-		struct clk *clk = devm_clk_get_optional(dev, NULL);
+	    dcp_is_internal_panel_only(dcp) &&
+	    !of_property_present(dev->of_node, "clock-names") &&
+	    of_count_phandle_with_args(dev->of_node, "clocks", "#clock-cells") == 1) {
+		struct clk *clk = devm_clk_get(dev, NULL);
 
 		if (IS_ERR(clk))
 			return PTR_ERR(clk);
-		if (!clk)
-			return 0;
 		dcp->firmware_clocks = devm_kcalloc(dev, 2,
 						    sizeof(*dcp->firmware_clocks),
 						    GFP_KERNEL);
@@ -7924,6 +7977,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	 */
 	if (fw_compat != DCP_FIRMWARE_V_14_7 &&
 	    fw_compat != DCP_FIRMWARE_V_26_6 &&
+	    fw_compat != DCP_FIRMWARE_V_27_0 &&
 	    fw_compat != DCP_FIRMWARE_M4 &&
 	    !of_property_present(dev->of_node, "apple,bw-scratch") &&
 	    !hw->firmware_clock)
@@ -8059,27 +8113,26 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	 * does not adopt. (The T8140 dcpext, whose match data does not adopt, is
 	 * refused above on anything but 26.6.2.)
 	 */
-	if (fw_compat == DCP_FIRMWARE_V_27_0)
+	if (fw_compat == DCP_FIRMWARE_V_27_0) {
 		dcp->hw.adopt_live_session = true;
-	/*
-	 * T6041 internal panel on firmware 27 adopts the running DCP session
-	 * with 41-bit firmware DMA addressing and no DPTX port services,
-	 * matching the H17-generation internal-panel profile.
-	 */
-	if (fw_compat == DCP_FIRMWARE_V_27_0 &&
-	    of_device_is_compatible(dev->of_node, "apple,t6041-dcp")) {
-		dcp->hw.firmware_dma_bits = 41;
-		dcp->hw.num_dptx_ports = 0;
-		dcp->hw.adopt_live_session = true;
+		/*
+		 * Derive firmware DMA width from the DCP DART aperture when
+		 * match data does not already pin a hardware profile width.
+		 */
+		if (!dcp->hw.firmware_dma_bits) {
+			u8 dma_bits = dcp_dart_dma_bits(dev->of_node);
+
+			if (dma_bits)
+				dcp->hw.firmware_dma_bits = dma_bits;
+		}
 	}
 	/*
-	 * The same for the T8122 internal panel on firmware 27: its DART
-	 * window is 0x100_0000_0000 + 64 GiB, and dcpext drives the external
-	 * ports.
+	 * Internal laptop panels on firmware 27 (an internal DCP with a panel
+	 * child and no external DPTX/Type-C routes): the boot loader hands the
+	 * panel over running and it has no DP port.
 	 */
 	if (fw_compat == DCP_FIRMWARE_V_27_0 &&
-	    of_device_is_compatible(dev->of_node, "apple,t8122-dcp")) {
-		dcp->hw.firmware_dma_bits = 41;
+	    dcp_is_internal_panel_only(dcp)) {
 		dcp->hw.num_dptx_ports = 0;
 		dcp->hw.adopt_live_session = true;
 	}
@@ -8093,14 +8146,16 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	 */
 	if (fw_compat == DCP_FIRMWARE_V_27_0 &&
 	    of_device_is_compatible(dev->of_node, "apple,t8122-dcpext")) {
-		dcp->hw.firmware_dma_bits = 41;
+		if (!dcp->hw.firmware_dma_bits)
+			dcp->hw.firmware_dma_bits = 41;
 		dcp->hw.num_dptx_ports = 2;
 		dcp->hw.fw_14_7_endpoints = false;
 		dcp->hw.adopt_live_session = false;
 	}
 	if (fw_compat == DCP_FIRMWARE_V_27_0 &&
 	    of_device_is_compatible(dev->of_node, "apple,t6041-dcpext")) {
-		dcp->hw.firmware_dma_bits = 41;
+		if (!dcp->hw.firmware_dma_bits)
+			dcp->hw.firmware_dma_bits = 41;
 		dcp->hw.num_dptx_ports = 2;
 		dcp->hw.adopt_live_session = true;
 		dcp->hw.sink_metadata_edid = true;
