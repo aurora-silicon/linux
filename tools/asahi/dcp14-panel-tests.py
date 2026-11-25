@@ -80,7 +80,12 @@ with tempfile.TemporaryDirectory(prefix='dcp14-panels-') as directory:
     #ifdef OLD
      assert(IS_ERR(b));puts("old J615 board selection rejects: PASS");return 0;
     #else
-     assert(!IS_ERR(b) && b && b->panel_width==2880 && b->panel_height==1864);
+     assert(IS_ERR(b));
+     panel.compatible="apple,panel-j615";
+     b=iomfb_v14_7_board(&dev);
+     assert(!IS_ERR(b) && b && b->panel_width==2880 && b->panel_height==1864 && b->panel_nits);
+     machine="apple,other";assert(iomfb_v14_7_board(&dev)==b);
+     panel.compatible=NULL;
      assert(!strcmp(b->firmware_uuid,"90F849E1-B422-367E-B389-50246F8DEC47"));
      assert(!strcmp(b->handoff,"apple,t8122-handoff") && !b->promotion);
      image_uuid=b->firmware_uuid;assert(probe_gate(&dev,b)==0);
@@ -110,7 +115,7 @@ with tempfile.TemporaryDirectory(prefix='dcp14-panels-') as directory:
       assert(dcp_v14_geometry(&q)==0&&q.panel_height==1964&&q.notch_rows==74);
       height=1964;notch=0;assert(dcp_v14_geometry(&q)==0&&q.panel_height==1964);
       width=2560;height=1600;stride=width*4;notch=64;assert(dcp_v14_geometry(&q)==-EINVAL);}
-     /* The Airs keep their machine records whatever the panel node says. */
+     /* J613 keeps its machine record; J615 and J504 match the panel. */
      machine="apple,j613";assert(iomfb_v14_7_board(&dev)==j);
      /* Other T8122 Macs (J433/J434 iMacs, no J504 panel) have no record. */
      panel.compatible=NULL;
