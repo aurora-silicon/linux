@@ -63,7 +63,8 @@ static void apple_sleep_test_known_profiles(struct kunit *test)
 			const struct apple_sleep_soc *soc = id->data;
 
 			KUNIT_ASSERT_NOT_NULL(test, soc);
-			KUNIT_EXPECT_TRUE(test, soc->untested);
+			KUNIT_EXPECT_TRUE(test, soc->derived);
+			KUNIT_EXPECT_FALSE(test, soc->untested);
 		}
 	}
 	KUNIT_EXPECT_EQ(test, n, ARRAY_SIZE(apple_sleep_test_profiles));
@@ -95,8 +96,8 @@ static void apple_sleep_test_words(struct kunit *test)
 		for (i = 0; i < ARRAY_SIZE(named); i++)
 			if (named[i])
 				apple_sleep_test_in(test, c, "named", all, named[i]);
-		/* An untested SoC only reads its debug switch, outside the lists. */
-		if (!soc->untested)
+		/* A SoC with derived data only reads its debug switch, outside the lists. */
+		if (!soc->derived)
 			apple_sleep_test_in(test, c, "debug switch", aon, soc->ps_aon_debug_switch);
 		apple_sleep_test_list_in(test, c, "ps_macos_on", all, &soc->ps_macos_on);
 		apple_sleep_test_list_in(test, c, "ps_macos_off", all, &soc->ps_macos_off);
