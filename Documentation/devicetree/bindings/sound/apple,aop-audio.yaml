@@ -20,17 +20,27 @@ select:
       contains:
         enum:
           - apple,t6020-aop-audio
+          - apple,t6030-aop-audio
+          - apple,t6031-aop-audio
           - apple,t8112-aop-audio
+          - apple,t8122-aop-audio
   required:
     - compatible
 
 properties:
   compatible:
-    items:
-      - enum:
-          - apple,t6020-aop-audio
-          - apple,t8112-aop-audio
-      - const: apple,aop-audio
+    oneOf:
+      - items:
+          - enum:
+              - apple,t6020-aop-audio
+              - apple,t8112-aop-audio
+          - const: apple,aop-audio
+      - const: apple,t6030-aop-audio
+      - items:
+          - enum:
+              - apple,t6031-aop-audio
+              - apple,t8122-aop-audio
+          - const: apple,t6030-aop-audio
 
   dmas:
     maxItems: 1
