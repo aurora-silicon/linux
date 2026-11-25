@@ -362,7 +362,6 @@
 };
 
 &dwc3_0 {
-	dr_mode = "host";
 	maximum-speed = "super-speed";
 	phys = <&atcphy0 PHY_TYPE_USB2>, <&atcphy0 PHY_TYPE_USB3>;
 	phy-names = "usb2-phy", "usb3-phy";
@@ -416,7 +415,6 @@
 };
 
 &dwc3_1 {
-	dr_mode = "host";
 	maximum-speed = "super-speed";
 	phys = <&atcphy1 PHY_TYPE_USB2>, <&atcphy1 PHY_TYPE_USB3>;
 	phy-names = "usb2-phy", "usb3-phy";
@@ -443,6 +441,15 @@
 &dart_apcie0 {
 	apple,managed-sids = <1 2>;
 	apple,dma-range = <0x100 0x00100000 0x0 0x3fe00000>;
+	/*
+	 * Limit the static SID16 stream to this SoC MMIO page instead of
+	 * keeping it in bypass. 0x381204000 sits 0x38000 bytes past aic's
+	 * core window (0x381000000 + 0x1cc000) and below DRAM; no DT node
+	 * claims it, so its owning SoC block is not identified in the DT yet.
+	 * Blocking SID16 on J713 faulted on writes to this page within
+	 * seconds, and J715 uses the same page with 0 faults.
+	 */
+	apple,sid16-page = /bits/ 64 <0x381204000>;
 	status = "okay";
 };
 
@@ -470,5 +477,6 @@
 		reg = <0x10000 0x0 0x0 0x0 0x0>;
 		local-mac-address = [00 00 00 00 00 00];
 		apple,antenna-sku = "XX";
+		brcm,ccode-map-trivial;
 	};
 };

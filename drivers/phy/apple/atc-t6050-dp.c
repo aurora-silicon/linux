@@ -28,6 +28,7 @@
 #include <linux/usb/typec_dp.h>
 #include <linux/usb/typec_altmode.h>
 #include <linux/usb/typec_tbt.h>
+#include <linux/workqueue.h>
 
 enum atc_operation { ATC_MASK, ATC_TUNABLE, ATC_DELAY, ATC_POLL, ATC_POWER, ATC_FIRMWARE };
 struct atc_op {
@@ -135,6 +136,11 @@ struct t6050_dp {
 	enum combo_mode sleep_mode;	/* the mode the sleep's stop took down */
 	bool sleep_stopped;		/* stopped for a sleep that has not been accounted for yet */
 	bool aon_syscore;		/* the always-on domain is held out of this system transition */
+	struct work_struct s2idle_clock_work;
+	u8 s2idle_clock_stops;
+	bool s2idle_frozen;		/* serialize mode and gate changes with system sleep */
+	u8 s2idle_domain_syscore;	/* active domains held out of s2idle genpd suspend */
+	u8 s2idle_gate_syscore;		/* active DP tunnel gates held out of s2idle genpd suspend */
 	bool aon_kept;			/* the stop left the always-on domain's reference in place */
 	/* A USB4 router's sleep in place: its host stops and restarts the port, see the end. */
 	bool cio_sleep;			/* asked for: the PHY's own stop for the sleep is skipped */
@@ -618,6 +624,8 @@ static void atc_dp_tunnels_stop(struct t6050_dp *dp)
 	bool running = memchr_inv(dp->tunnel_rate, 0, sizeof(dp->tunnel_rate));
 
 	memset(dp->tunnel_rate, 0, sizeof(dp->tunnel_rate));
+	/* Every clock is stopped here: no stop deferred across s2idle is left. */
+	dp->s2idle_clock_stops = 0;
 	if (running) {
 		atc_dp_tunnels_apply(dp, 0, NULL);
 		return;
@@ -634,6 +642,8 @@ static int t6050_dp_set_mode(struct phy *phy, enum phy_mode mode, int submode)
 	struct t6050_dp *dp = phy_get_drvdata(phy);
 
 	guard(mutex)(&dp->lock);
+	if (dp->s2idle_frozen)
+		return -EBUSY;
 	if (mode == PHY_MODE_DP)
 		return dp->typec ? (dp->enabled ? 0 : -ENOLINK) : atc_start(dp);
 	if (mode == PHY_MODE_INVALID)
@@ -681,6 +691,8 @@ static int t6050_dp_configure(struct phy *phy, union phy_configure_opts *opts)
 	if (cfg->set_voltages && cfg->set_rate && rate < 0 && cfg->lanes)
 		return -EINVAL;
 	guard(mutex)(&dp->lock);
+	if (dp->s2idle_frozen)
+		return -EBUSY;
 	if (dp->faulted)
 		return -EIO;
 	if (!dp->enabled)
@@ -741,26 +753,14 @@ EXPORT_SYMBOL_GPL(apple_dp_phy_link_config);
  * never given another rate in place. Every change applies all four clocks in
  * order (atc_dp_tunnels_apply()).
  */
-int apple_t6050_dp_tunnel_clock(struct phy *phy, unsigned int clock, u8 rate)
+static int atc_dp_tunnel_clock_locked(struct t6050_dp *dp, unsigned int clock,
+				      u8 rate, int src)
 {
-	struct t6050_dp *dp;
 	unsigned int i = clock - 1;
-	int src = 0, ret;
 	u32 v = 0;
+	int ret;
 
-	if (!phy || phy->ops != &t6050_dp_ops)
-		return -EOPNOTSUPP;
-	if (clock < 1 || clock > ATC_DP_TUNNELS)
-		return -EINVAL;
-	if (rate) {
-		src = atc_dp_source(rate);
-		if (src < 0)
-			return src;
-	}
-	dp = phy_get_drvdata(phy);
-	guard(mutex)(&dp->lock);
-	if (!dp->combo || !dp->dp_clk_src)
-		return -EOPNOTSUPP;
+	lockdep_assert_held(&dp->lock);
 	if (dp->tunnel_rate[i] == rate) {
 		/* A failed start or gate suspend can leave a held domain at rate zero. */
 		if (!rate && dp->dp_gates)
@@ -803,6 +803,91 @@ int apple_t6050_dp_tunnel_clock(struct phy *phy, unsigned int clock, u8 rate)
 	dev_info(dp->dev, "DP tunnel clock %u: link rate 0x%02x, source %d, switch status %08x\n",
 		 clock, rate, src, v);
 	return 0;
+}
+
+static int atc_s2idle_clock_stop(struct t6050_dp *dp, unsigned int i)
+{
+	int ret;
+
+	lockdep_assert_held(&dp->lock);
+	dp->tunnel_rate[i] = 0;
+	/*
+	 * The switches are written only in USB4 mode. If the PHY left it (or
+	 * faulted) since the stop was deferred, the clock no longer runs: only
+	 * its gate can still be held.
+	 */
+	if (dp->faulted || dp->combo_mode != COMBO_CIO) {
+		ret = dp->dp_gates ? atc_domain_set(&dp->dp_gate[i], false) : 0;
+	} else {
+		ret = atc_dp_tunnels_apply(dp, i + 1, NULL);
+	}
+	if (!ret)
+		dp->s2idle_clock_stops &= ~BIT(i);
+	return ret;
+}
+
+static void atc_s2idle_clock_work(struct work_struct *work)
+{
+	struct t6050_dp *dp = container_of(work, struct t6050_dp, s2idle_clock_work);
+	unsigned int i;
+	int ret;
+
+	guard(mutex)(&dp->lock);
+	if (dp->s2idle_frozen)
+		return;
+	for (i = 0; i < ATC_DP_TUNNELS; i++) {
+		if (!(dp->s2idle_clock_stops & BIT(i)))
+			continue;
+		ret = atc_s2idle_clock_stop(dp, i);
+		if (ret)
+			dev_warn(dp->dev, "Deferred DP tunnel clock %u stop failed: %d\n",
+				 i + 1, ret);
+	}
+}
+
+static void atc_s2idle_clock_cancel(void *data)
+{
+	struct t6050_dp *dp = data;
+
+	cancel_work_sync(&dp->s2idle_clock_work);
+}
+
+int apple_t6050_dp_tunnel_clock(struct phy *phy, unsigned int clock, u8 rate)
+{
+	struct t6050_dp *dp;
+	unsigned int stop;
+	int src = 0, ret;
+
+	if (!phy || phy->ops != &t6050_dp_ops)
+		return -EOPNOTSUPP;
+	if (clock < 1 || clock > ATC_DP_TUNNELS)
+		return -EINVAL;
+	if (rate) {
+		src = atc_dp_source(rate);
+		if (src < 0)
+			return src;
+	}
+	dp = phy_get_drvdata(phy);
+	guard(mutex)(&dp->lock);
+	if (!dp->combo || !dp->dp_clk_src)
+		return -EOPNOTSUPP;
+
+	stop = BIT(clock - 1);
+	if (dp->s2idle_frozen) {
+		if (rate) {
+			dev_dbg(dp->dev, "DP tunnel clock %u start refused across s2idle\n", clock);
+			return -EBUSY;
+		}
+		/* DCP may discard the route once it asks us to stop this clock. */
+		dp->s2idle_clock_stops |= stop;
+		return 0;
+	}
+	if (dp->s2idle_clock_stops & stop) {
+		ret = atc_s2idle_clock_stop(dp, clock - 1);
+		if (ret || !rate)
+			return ret;
+	}
+	return atc_dp_tunnel_clock_locked(dp, clock, rate, src);
 }
 EXPORT_SYMBOL_GPL(apple_t6050_dp_tunnel_clock);
 
@@ -893,6 +978,8 @@ static int t6050_typec_register(struct t6050_dp *dp)
 	struct typec_mux_desc mux_desc = {
 		.fwnode = dev_fwnode(dp->dev), .drvdata = dp,
 		.set = t6050_typec_mode,
+		/* USB 3 starts with the lanes as pin D has them: combo_dp2_join_usb() */
+		.dp_joins_usb = dp->combo,
 	};
 	struct typec_switch_dev *sw;
 	struct typec_mux_dev *mux;
@@ -1066,6 +1153,9 @@ static int t6050_dp_probe(struct platform_device *pdev)
 	}
 	if (ndomains != 3 && !(dp->combo && ndomains == 4))
 		return -EINVAL;
+	BUILD_BUG_ON(ATC_DP_TUNNELS > BITS_PER_TYPE(dp->s2idle_gate_syscore));
+	if (ndomains > BITS_PER_TYPE(dp->s2idle_domain_syscore))
+		return -EINVAL;
 	dp->ndomains = ndomains;
 	for (unsigned int i = 0; i < dp->ndomains; i++) {
 		dp->domain[i].dev = dev_pm_domain_attach_by_name(dev, domains[i]);
@@ -1120,6 +1210,10 @@ static int t6050_dp_probe(struct platform_device *pdev)
 		return PTR_ERR(phy);
 	phy_set_drvdata(phy, dp);
 	dp->combo_phy[2] = phy;
+	INIT_WORK(&dp->s2idle_clock_work, atc_s2idle_clock_work);
+	ret = devm_add_action_or_reset(dev, atc_s2idle_clock_cancel, dp);
+	if (ret)
+		return ret;
 	provider = devm_of_phy_provider_register(dev, dp->combo ? combo_xlate : of_phy_simple_xlate);
 	if (IS_ERR(provider))
 		return PTR_ERR(provider);
@@ -1139,7 +1233,13 @@ static int t6050_dp_suspend_late(struct device *dev)
 {
 	struct t6050_dp *dp = dev_get_drvdata(dev);
 
-	if (!dp->combo || !pm_suspend_via_firmware())
+	if (!dp->combo)
+		return 0;
+	if (pm_suspend_no_platform()) {
+		combo_s2idle_hold(dp);
+		return 0;
+	}
+	if (!pm_suspend_via_firmware())
 		return 0;
 	/* A router sleeping in place still uses the link: its host stops the PHY after it. */
 	scoped_guard(mutex, &dp->lock) {
@@ -1150,6 +1250,15 @@ static int t6050_dp_suspend_late(struct device *dev)
 		}
 	}
 	return combo_suspend_late(dp);
+}
+
+static int t6050_dp_resume_early(struct device *dev)
+{
+	struct t6050_dp *dp = dev_get_drvdata(dev);
+
+	if (dp->combo)
+		combo_s2idle_release(dp);
+	return 0;
 }
 
 static int t6050_dp_resume_noirq(struct device *dev)
@@ -1193,6 +1302,8 @@ int apple_t6050_phy_cio_prepare(struct device *dev)
 	if (!dp || !dp->combo)
 		return -EOPNOTSUPP;
 	guard(mutex)(&dp->lock);
+	if (dp->s2idle_frozen)
+		return -EBUSY;
 	if (dp->cio_sleep || dp->faulted || dp->combo_mode != COMBO_CIO || !dp->cio_prepared)
 		return -EBUSY;
 	dp->cio_sleep = true;
@@ -1210,6 +1321,8 @@ int apple_t6050_phy_cio_off(struct device *dev)
 	if (!dp)
 		return -EOPNOTSUPP;
 	guard(mutex)(&dp->lock);
+	if (dp->s2idle_frozen)
+		return -EBUSY;
 	if (!dp->cio_sleep || dp->cio_sleep_off || dp->faulted || dp->combo_mode != COMBO_CIO)
 		return -EBUSY;
 	atc_dp_tunnels_stop(dp);
@@ -1245,6 +1358,8 @@ int apple_t6050_phy_cio_on(struct device *dev)
 	if (!dp)
 		return -EOPNOTSUPP;
 	guard(mutex)(&dp->lock);
+	if (dp->s2idle_frozen)
+		return -EBUSY;
 	if (!dp->cio_sleep)
 		return -EINVAL;
 	if (!dp->cio_sleep_off)
@@ -1259,6 +1374,14 @@ int apple_t6050_phy_cio_on(struct device *dev)
 }
 EXPORT_SYMBOL_GPL(apple_t6050_phy_cio_on);
 
+/*
+ * Not fenced by s2idle_frozen, unlike the CIO calls above: this and
+ * apple_t6050_phy_cio_lost() write no PHY register and change no mode,
+ * clock or domain. They only update the sleep-in-place bookkeeping, under
+ * dp->lock. Their only caller, the Thunderbolt host's CIO sleep in
+ * drivers/thunderbolt/apple-cio-sleep.c, runs them only for a
+ * suspend-to-RAM it prepared (PM_SUSPEND_MEM), never across s2idle.
+ */
 int apple_t6050_phy_cio_finish(struct device *dev)
 {
 	struct t6050_dp *dp = t6050_dp_from_dev(dev);
@@ -1319,6 +1442,8 @@ int apple_t6050_phy_cio_usb(struct device *dev, enum apple_t6050_cio_usb step)
 	if (!dp || !dp->combo)
 		return -EOPNOTSUPP;
 	guard(mutex)(&dp->lock);
+	if (dp->s2idle_frozen)
+		return -EBUSY;
 	/* TEST (sv6t11): the PIPE handler, the controller's bank, read while it holds its domain. */
 	if (step == APPLE_T6050_CIO_USB_PARK && dp->cio_usb_kept && !dp->cio_usb_parked) {
 		mux = readl(dp->banks[44] + 0xc);
@@ -1380,6 +1505,7 @@ EXPORT_SYMBOL_GPL(apple_t6050_phy_cio_usb);
 static const struct dev_pm_ops t6050_dp_pm_ops = {
 	.suspend_late = pm_sleep_ptr(t6050_dp_suspend_late),
 	.resume_noirq = pm_sleep_ptr(t6050_dp_resume_noirq),
+	.resume_early = pm_sleep_ptr(t6050_dp_resume_early),
 	.resume = pm_sleep_ptr(t6050_dp_resume),
 };
 
