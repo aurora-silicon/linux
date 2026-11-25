@@ -1905,8 +1905,8 @@ static bool apple_nvme_sleep_wait_on(struct apple_nvme *anv);
 /*
  * Pre-M4, at the first reset after a real sleep, right before the run bit: the SART entries
  * noirq resume wrote back have to read as before the sleep, or ANS's firmware runs without its
- * own memory. One the reset took is written back. One that doesn't hold fails the reset, before
- * any DMA. A SART with nothing to check against (before SARTv3) is left as it was.
+ * own memory. One the reset took is written back. One that doesn't hold, or a snapshot that
+ * isn't there, stops the reset before any DMA. A SART before SARTv3 is left as it was.
  */
 static int apple_nvme_sleep_sart(struct apple_nvme *anv)
 {
@@ -1916,12 +1916,7 @@ static int apple_nvme_sleep_sart(struct apple_nvme *anv)
 		return 0;
 	anv->sleep_sart = false;
 	ret = apple_sart_restore_owned(anv->sart);
-	if (ret == -EOPNOTSUPP)
-		return 0;
-	if (ret)
-		dev_err(anv->dev, "ANS's SART entries did not come back after the sleep: %d\n",
-			ret);
-	return ret;
+	return ret == -EOPNOTSUPP ? 0 : ret;
 }
 
 static void apple_nvme_reset_work_impl(struct work_struct *work)
@@ -2087,8 +2082,18 @@ static void apple_nvme_reset_work_impl(struct work_struct *work)
 			goto out;
 
 		ret = apple_nvme_sleep_sart(anv);
-		if (ret)
-			goto out;
+		if (ret) {
+			/*
+			 * Hold every request rather than fail it, as after a failed wake: the
+			 * queues stay frozen from the suspend, and the run bit stays clear.
+			 */
+			WRITE_ONCE(anv->sleep_failed, true);
+			dev_crit(anv->dev, "holding all I/O: ANS's SART did not come back after the sleep (%d), reboot to recover\n",
+				 ret);
+			if (phase_locked)
+				mutex_unlock(&anv->disable_lock);
+			return;
+		}
 
 		writel(APPLE_ANS_COPROC_CPU_CONTROL_RUN,
 		       anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
