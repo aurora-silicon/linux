@@ -146,10 +146,41 @@ pub(crate) fn encode_compute_timestamps(cmd: &mut [u8], cmd_va: u64, timestamps:
     user_timestamp_pointer(cmd_va + COMPUTE_USER_TIMESTAMPS as u64, timestamps)
 }
 
+/// The command buffer a pool slot uses: each slot owns two, `2 * slot` and `2 * slot + 1`,
+/// and alternates between them. The firmware may still read a retired command's JobMeta for
+/// stamp stores it queued after it unlinked the slot, so a slot's next command must not
+/// overwrite it.
+pub(crate) fn pool_command(slot: usize, second: bool) -> usize {
+    2 * slot + usize::from(second)
+}
+
 #[cfg_attr(not(test), kunit_tests(asahi_g14_fw_queues))]
 #[cfg_attr(test, allow(dead_code))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_slot_never_rewrites_the_command_it_used_last() {
+        const SLOTS: usize = 48;
+        let mut owner = [usize::MAX; 2 * SLOTS];
+        let mut alternate = 0u64;
+        let mut last = [usize::MAX; SLOTS];
+        for round in 0..5 {
+            for slot in 0..SLOTS {
+                alternate ^= 1 << slot;
+                let c = pool_command(slot, alternate & (1 << slot) != 0);
+                assert!(c < 2 * SLOTS);
+                // Two buffers per slot, never shared with another slot.
+                assert!(owner[c] == usize::MAX || owner[c] == slot);
+                owner[c] = slot;
+                // Consecutive uses of a slot take different buffers.
+                if round > 0 {
+                    assert_ne!(c, last[slot]);
+                }
+                last[slot] = c;
+            }
+        }
+    }
 
     #[test]
     fn head_wraps_and_keeps_one_entry_free() {
