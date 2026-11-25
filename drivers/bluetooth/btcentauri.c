@@ -1170,7 +1170,13 @@ static int cen_suspend(struct device *dev)
 	bt->transport_paused = true;
 	mutex_unlock(&bt->lock);
 	cancel_delayed_work_sync(&bt->poll);
-	if (of_machine_is_compatible("apple,j813") && bt->ipc_requested) {
+	/*
+	 * Tell Beta's firmware the host is going to sleep on every N1 board, as
+	 * Alpha does. Only a running firmware can take the request; one that
+	 * isn't running has nothing to quiesce.
+	 */
+	if (bt->ipc_requested && readl(bt->bar + 0x18) == 2 &&
+	    readl(bt->bar) == 2) {
 		bt->transport_sleep_sent = true;
 		ret = cen_transport_state(bt, true);
 		if (ret)

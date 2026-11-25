@@ -81,14 +81,14 @@ static inline int apple_qspi_mx_status_allows_write(unsigned int sr,
 #define APPLE_QSPI_MFR_GIGADEVICE	0xc8
 
 /*
- * GigaDevice GD25UF16E. SR1 holds WIP, WEL, five block-protect bits BP[4:0]
- * at bits 6:2 and SRP0. SR2 holds SRP1, QE, SUS2 at bit 2, LB[3:1], CMP and
- * SUS1 at bit 7. SR3 holds output drive, dummy-cycle and low-power settings
- * and has no write-protect selection. BUSY and WEL, both suspend bits and
- * CMP are always refused. BP[2:0] sit where they do on Winbond parts and
- * are tolerated only where bp_ok allows them; BP3 and BP4 move or shrink
- * the protected range and are refused unless bp_ok names them. SRP0, SRP1,
- * QE and LB stay unchanged.
+ * GigaDevice GD25UF16E and GD25UF64E. SR1 holds WIP, WEL, five block-protect
+ * bits BP[4:0] at bits 6:2 and SRP0. SR2 holds SRP1, QE, SUS2 at bit 2,
+ * LB[3:1], CMP and SUS1 at bit 7. SR3 holds output drive, dummy-cycle and
+ * low-power settings and has no write-protect selection. BUSY and WEL, both
+ * suspend bits and CMP are always refused. BP[2:0] sit where they do on
+ * Winbond parts and are tolerated only where bp_ok allows them; BP3 and BP4
+ * move or shrink the protected range and are refused unless bp_ok names them.
+ * SRP0, SRP1, QE and LB stay unchanged.
  */
 static inline int apple_qspi_gd_status_allows_write(unsigned int sr1,
 						    unsigned int sr2,
@@ -171,6 +171,7 @@ struct apple_qspi_part {
 #define APPLE_QSPI_JEDEC_W25Q16		{ 0xef, 0x65, 0x15 }
 #define APPLE_QSPI_JEDEC_MX_2B27	{ 0xc2, 0x2b, 0x27 }
 #define APPLE_QSPI_JEDEC_GD25UF16E	{ 0xc8, 0x83, 0x15 }
+#define APPLE_QSPI_JEDEC_GD25UF64E	{ 0xc8, 0x83, 0x17 }
 
 static const struct apple_qspi_part apple_qspi_parts[] = {
 	/* J613, J713, J813; also on the bus of some J616s */
@@ -181,6 +182,8 @@ static const struct apple_qspi_part apple_qspi_parts[] = {
 	{ APPLE_QSPI_JEDEC_W25Q16, 0x200000, 0x1c },
 	/* Some J700s; BP0 covers the same range */
 	{ APPLE_QSPI_JEDEC_GD25UF16E, 0x200000, 0x1c },
+	/* J775D (M5 Ultra): no block protection left set, SR1 0x00 */
+	{ APPLE_QSPI_JEDEC_GD25UF64E, 0x800000, 0 },
 };
 
 static inline const struct apple_qspi_part *

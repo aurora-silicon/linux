@@ -59,14 +59,14 @@ def build_c_harness(mutation=None):
     collect_leaf = item(c_src, 'static int collect_leaf(')
     if mutation == 'no-chain-dedup':
         collect_leaf = collect_leaf.replace(
-            'if (status == 0 && leaf->context != 0) {',
-            'if (0) {',
+            'if (coalesce_contexts && status == 0 && leaf->context != 0 &&',
+            'if (coalesce_contexts && 0 &&',
             1,
         )
     elif mutation == 'coalesce-failed-leaf':
         collect_leaf = collect_leaf.replace(
-            'if (out[i].status != 0 ||\n\t\t\t    out[i].fence->context != leaf->context)',
-            'if (out[i].fence->context != leaf->context)',
+            'status == 0 && leaf->context != 0 &&\n\t\t    out[i].status == 0 && ',
+            'leaf->context != 0 &&\n\t\t    ',
             1,
         )
 
@@ -135,7 +135,7 @@ int main(void)
 	struct asahi_g17_fence_leaf out[16];
 	size_t count = 0;
 	for (int i = 0; i < 8; ++i) {{
-		assert(collect_leaf(&chain[i], out, 16, &count) == 0);
+		assert(collect_leaf(&chain[i], out, 16, &count, true) == 0);
 	}}
 	assert(count == 1);
 	assert(out[0].fence->context == 10);
@@ -149,8 +149,8 @@ int main(void)
 	struct dma_fence failed = {{ .context = 10, .seqno = 2, .status = -EIO, .refs = 1 }};
 	struct dma_fence healthy = {{ .context = 10, .seqno = 9, .status = 0, .refs = 1 }};
 	count = 0;
-	assert(collect_leaf(&failed, out, 16, &count) == 0);
-	assert(collect_leaf(&healthy, out, 16, &count) == 0);
+	assert(collect_leaf(&failed, out, 16, &count, true) == 0);
+	assert(collect_leaf(&healthy, out, 16, &count, true) == 0);
 	assert(count == 2);
 	assert(out[0].status == -EIO && out[0].fence->seqno == 2);
 	assert(out[1].status == 0 && out[1].fence->seqno == 9);
@@ -169,9 +169,9 @@ int main(void)
 	}};
 	count = 0;
 	for (int i = 0; i < 3; ++i)
-		assert(collect_leaf(&q0[i], out, 16, &count) == 0);
+		assert(collect_leaf(&q0[i], out, 16, &count, true) == 0);
 	for (int i = 0; i < 2; ++i)
-		assert(collect_leaf(&q1[i], out, 16, &count) == 0);
+		assert(collect_leaf(&q1[i], out, 16, &count, true) == 0);
 	assert(count == 2);
 	assert(out[0].fence->context == 11 && out[0].fence->seqno == 4);
 	assert(out[1].fence->context == 22 && out[1].fence->seqno == 12);
@@ -181,8 +181,8 @@ int main(void)
 	struct dma_fence z0 = {{ .context = 0, .seqno = 1, .status = 0, .refs = 1 }};
 	struct dma_fence z1 = {{ .context = 0, .seqno = 2, .status = 0, .refs = 1 }};
 	count = 0;
-	assert(collect_leaf(&z0, out, 16, &count) == 0);
-	assert(collect_leaf(&z1, out, 16, &count) == 0);
+	assert(collect_leaf(&z0, out, 16, &count, true) == 0);
+	assert(collect_leaf(&z1, out, 16, &count, true) == 0);
 	assert(count == 2);
 	release_all(out, count);
 	return 0;

@@ -557,12 +557,13 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
                 return Err(EIO);
             }
             let (mut pending, guards) = self.prepare_submission(bytes, objects)?;
-            if pending
+            let has_render = pending
                 .iter()
-                .any(|(command, _, _)| matches!(command, Validated::Render { .. }))
-            {
+                .any(|(command, _, _)| matches!(command, Validated::Render { .. }));
+            if has_render {
                 self.context.note_render();
             }
+            let compute_only = !has_render && !pending.is_empty();
             if super::timeout::select_submission(pending.iter().map(|(cmd, _, _)| cmd.long_job())) {
                 for (command, _, _) in pending.iter_mut() {
                     command.allow_long_job();
@@ -577,7 +578,7 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
                     if *visible_completion || !visible_required)
                 && !pending[0].2.has_outputs()
                 && !self.has_pending_publication(&pending[0].1);
-            let aggregate = outputs.publish(self.context.clone(), firmware_source)?;
+            let aggregate = outputs.publish(self.context.clone(), firmware_source, compute_only)?;
             let output_fence = aggregate.fence();
             super::trace::submit(
                 1,

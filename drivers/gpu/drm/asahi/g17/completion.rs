@@ -879,14 +879,17 @@ impl Completion {
         if let Some(sources) = &self.sources {
             sources.release();
         }
-        drop(self.render.lock().take());
+        if !self.is_compute {
+            drop(self.render.lock().take());
+        }
         drop(self.vm_job.lock().take());
     }
 
     /// Exact retirement permits the physical lease and VM pin to be released
     /// before waking userspace. A failure fence alone never establishes this.
+    /// Returns true if this call claimed signalling and released healthy pins.
     #[track_caller]
-    pub(crate) fn complete(&self, result: Result<[u64; 4]>) {
+    pub(crate) fn complete(&self, result: Result<[u64; 4]>) -> bool {
         // M5 compute feeds the refill detector only from its exact execution record
         // (RetiredCompute); M5 compute is the compute without pooled timestamps.
         let execution = if self.is_compute && self.compute.is_none() {
@@ -894,20 +897,24 @@ impl Completion {
         } else {
             result.as_ref().ok().map(|ticks| [ticks[0], ticks[1]])
         };
-        self.complete_with_compute(result, execution);
+        self.complete_with_compute(result, execution)
     }
 
     /// Compute feedback is separate from public timestamps, which may contain
     /// a synthesized retirement envelope when the execution record is absent.
     #[track_caller]
-    fn complete_with_compute(&self, mut result: Result<[u64; 4]>, compute: Option<[u64; 2]>) {
+    fn complete_with_compute(
+        &self,
+        mut result: Result<[u64; 4]>,
+        compute: Option<[u64; 2]>,
+    ) -> bool {
         if result.is_ok() {
             if let Err(error) = self.check_source_inputs() {
                 result = Err(error);
             }
         }
         if self.signalled.swap(true, Ordering::AcqRel) {
-            return;
+            return false;
         }
         if result.is_ok() && self.interrupted() {
             result = Err(ECANCELED);
@@ -922,6 +929,15 @@ impl Completion {
                 self.usage.add(Engine::Fragment, ticks[2], ticks[3], hz);
             }
         }
+        if let Err(error) = result {
+            // Spared work cancelled after another VM's recovery is not this client's device loss.
+            self.report(error);
+        }
+        self.release_healthy();
+        self.signal_terminal(result);
+        self.output.finish(result);
+        // Feed detector and busy-run tracking are internal host heuristics: update them
+        // after signalling the fence so their spinlocks stay off the wakeup critical path.
         if let (Some(feed), Ok(ticks)) = (&self.feed, &result) {
             // Compute reports its dispatch envelope in the first pair, a
             // render its fragment pass in the second.
@@ -937,13 +953,7 @@ impl Completion {
                 feed.note_work(self.context_id, start.unwrap_or(0), ticks[1].max(ticks[3]));
             }
         }
-        if let Err(error) = result {
-            // Spared work cancelled after another VM's recovery is not this client's device loss.
-            self.report(error);
-        }
-        self.release_healthy();
-        self.signal_terminal(result);
-        self.output.finish(result);
+        true
     }
 
     /// A rejected, never-published command cannot poison the VM for contention.
@@ -1007,18 +1017,20 @@ impl Deferred {
     pub(crate) fn finish(self) {
         match self {
             Self::RetiredCompute(completion, ticks, execution) => {
-                completion.complete_with_compute(Ok(ticks), execution);
-                completion.release_after_retirement();
+                if !completion.complete_with_compute(Ok(ticks), execution) {
+                    completion.release_after_retirement();
+                }
             }
             Self::Retired(completion, result) => {
-                completion.complete(result);
                 // An earlier failure may already have signalled this fence while
                 // retaining the pin. Retirement is a separate release witness.
-                completion.release_after_retirement();
+                if !completion.complete(result) {
+                    completion.release_after_retirement();
+                }
             }
             Self::Drained(completion, result) => {
                 completion.release_after_retirement();
-                completion.complete(result);
+                let _ = completion.complete(result);
             }
             Self::FailedOwned(completion, error) => completion.fail_while_owned(error),
             Self::Unpublished(completion, error) => completion.fail_unpublished(error),

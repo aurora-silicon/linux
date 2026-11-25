@@ -1035,12 +1035,15 @@ impl Port {
     }
 
     pub(super) fn note_gpu_activity(&self) {
-        let now_ns = super::now_ns();
-        // Firmware gates the cores only after its idle-off delay, so back-to-back submissions
-        // within that window cannot follow a core gating; skip the uncached power register read.
+        let now = super::now_ns();
+        // The firmware gates the cores only after they idled for its idle-off delay, which
+        // follows the last job, so a publication within that delay of the previous one cannot
+        // follow a gating: skip the power register read (a few hundred ns) on back-to-back work.
+        // A direct publisher notes itself before it may fall back to its scheduler; a fallback
+        // published past the delay can then miss a gating, costing one statistics sample.
         let idle_off_ns = u64::from(super::power::FIRMWARE_IDLE_OFF_MS) * 1_000_000;
         let previous = self.last_submission_ns.load(Ordering::Relaxed);
-        let recent = previous != 0 && now_ns.saturating_sub(previous) < idle_off_ns;
+        let recent = now.saturating_sub(previous) < idle_off_ns;
         // Otherwise observe gating before activity can wake the cores. A lockless
         // publisher cannot clear the decoder under the device mutex; this
         // epoch makes both the next drain and the next reader discard it.
@@ -1052,9 +1055,9 @@ impl Port {
         {
             self.statistics_epoch.fetch_add(1, Ordering::Release);
         }
-        self.last_submission_ns.store(now_ns, Ordering::Relaxed);
+        self.last_submission_ns.store(now, Ordering::Relaxed);
         self.demand.set_active(true);
-        self.report_busy(now_ns);
+        self.report_busy(now);
     }
 
     pub(super) fn write_power(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {

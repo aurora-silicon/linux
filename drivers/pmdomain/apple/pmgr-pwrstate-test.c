@@ -752,6 +752,80 @@ static void pmgr_ps_reset_busy_no_idle_wait_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, r->val & (APPLE_PMGR_DEV_DISABLE | APPLE_PMGR_RESET));
 }
 
+/* Forced-on auto-managed words write target 0xf, wait for actual 0xf, then AUTO_ENABLE. */
+static void pmgr_ps_auto_enable_test(struct kunit *test)
+{
+	static const u32 seq[][2] = {
+		{ 0, 0x0f0000ff },
+		{ 0, 0x1f0000ff },
+	};
+	struct pmgr_ps_test_bank *b;
+	struct pmgr_ps_test_reg *r;
+	struct apple_pmgr_ps *ps;
+
+	ps = pmgr_ps_test_consumer(test, 0x0f0003ff, &b);
+	KUNIT_EXPECT_EQ(test, apple_pmgr_ps_auto_enable(ps->regmap, 0), 1);
+	pmgr_ps_test_expect_log(test, b, seq, ARRAY_SIZE(seq));
+	KUNIT_EXPECT_TRUE(test, b->word[0] & APPLE_PMGR_AUTO_ENABLE);
+
+	/* Delayed actual-state ACK completes before AUTO_ENABLE is written. */
+	ps = pmgr_ps_test_domain(test, APPLE_PMGR_PS_CLKGATE, false, &r);
+	r->val = FIELD_PREP(APPLE_PMGR_PS_TARGET, APPLE_PMGR_PS_ACTIVE) |
+		 FIELD_PREP(APPLE_PMGR_PS_ACTUAL, APPLE_PMGR_PS_CLKGATE) |
+		 APPLE_PMGR_FLAGS;
+	r->active_reads = 3;
+	KUNIT_EXPECT_EQ(test, apple_pmgr_ps_auto_enable(ps->regmap, 0), 1);
+	KUNIT_EXPECT_EQ(test, r->active_reads, 0U);
+	KUNIT_EXPECT_EQ(test, FIELD_GET(APPLE_PMGR_PS_ACTUAL, r->val), APPLE_PMGR_PS_ACTIVE);
+	KUNIT_EXPECT_TRUE(test, r->val & APPLE_PMGR_AUTO_ENABLE);
+	KUNIT_EXPECT_EQ(test, r->auto_writes, 1U);
+	KUNIT_EXPECT_EQ(test, r->busy_writes, 0U);
+}
+
+/* Fused-off, already-AUTO, and reset/disabled words are left completely untouched. */
+static void pmgr_ps_auto_enable_skip_test(struct kunit *test)
+{
+	static const u32 skipped[] = {
+		0x0f000300,					/* fused off (J616c dcs_24-31) */
+		0x1f0000ff,					/* already on AUTO_ENABLE */
+		0x0f0000ff | APPLE_PMGR_RESET,			/* held in reset */
+		0x0f0000ff | APPLE_PMGR_PS_RESET,		/* PS reset set */
+		0x0f0000ff | APPLE_PMGR_DEV_DISABLE,		/* device disabled */
+	};
+	struct pmgr_ps_test_bank *b;
+	struct apple_pmgr_ps *ps;
+
+	for (unsigned int i = 0; i < ARRAY_SIZE(skipped); i++) {
+		ps = pmgr_ps_test_consumer(test, skipped[i], &b);
+		KUNIT_EXPECT_EQ_MSG(test, apple_pmgr_ps_auto_enable(ps->regmap, 0), 0,
+				    "word %#x", skipped[i]);
+		KUNIT_EXPECT_EQ_MSG(test, b->nr_log, 0U, "word %#x", skipped[i]);
+		KUNIT_EXPECT_EQ_MSG(test, b->word[0], skipped[i], "word %#x", skipped[i]);
+	}
+}
+
+/* Stuck actual state times out without setting AUTO_ENABLE; read errors propagate. */
+static void pmgr_ps_auto_enable_fail_test(struct kunit *test)
+{
+	struct pmgr_ps_test_reg *r;
+	struct apple_pmgr_ps *ps;
+
+	ps = pmgr_ps_test_named_domain(test, "apple-pmgr-ps-auto-stuck",
+				       APPLE_PMGR_PS_CLKGATE, false, &r);
+	r->val = FIELD_PREP(APPLE_PMGR_PS_TARGET, APPLE_PMGR_PS_ACTIVE) |
+		 FIELD_PREP(APPLE_PMGR_PS_ACTUAL, APPLE_PMGR_PS_CLKGATE);
+	r->stuck = true;
+	KUNIT_EXPECT_EQ(test, apple_pmgr_ps_auto_enable(ps->regmap, 0), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, r->auto_writes, 0U);
+	KUNIT_EXPECT_FALSE(test, r->val & APPLE_PMGR_AUTO_ENABLE);
+
+	ps = pmgr_ps_test_named_domain(test, "apple-pmgr-ps-auto-err",
+				       APPLE_PMGR_PS_ACTIVE, false, &r);
+	r->parent_read_error = true;
+	KUNIT_EXPECT_EQ(test, apple_pmgr_ps_auto_enable(ps->regmap, 0), -EIO);
+	KUNIT_EXPECT_EQ(test, r->auto_writes, 0U);
+}
+
 static struct kunit_case pmgr_ps_test_cases[] = {
 	KUNIT_CASE(pmgr_ps_power_on_test),
 	KUNIT_CASE(pmgr_ps_power_off_undo_test),
@@ -776,6 +850,9 @@ static struct kunit_case pmgr_ps_test_cases[] = {
 	KUNIT_CASE(pmgr_ps_reset_refused_test),
 	KUNIT_CASE(pmgr_ps_reset_idle_wait_test),
 	KUNIT_CASE(pmgr_ps_reset_busy_no_idle_wait_test),
+	KUNIT_CASE(pmgr_ps_auto_enable_test),
+	KUNIT_CASE(pmgr_ps_auto_enable_skip_test),
+	KUNIT_CASE(pmgr_ps_auto_enable_fail_test),
 	{}
 };
 
