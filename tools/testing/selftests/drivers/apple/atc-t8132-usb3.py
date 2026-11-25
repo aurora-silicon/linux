@@ -737,6 +737,7 @@ static int dwc3_core_probe(struct dwc3_probe_data *d) {
 static void mutex_init(int *p) { *p=0; }
 static bool dwc3_apple_has_fixed_hub(struct device *d,unsigned *port) { (void)d;(void)port;return false; }
 static bool dwc3_apple_host_only(struct device *d) { (void)d;return false; }
+static bool dwc3_apple_idle_rpm(const char *np) { (void)np;return false; }
 static bool device_property_read_bool(struct device *d,const char *name) { (void)d;(void)name;return false; }
 static void spin_lock_init(int *p) { *p=0; }
 static void publish_owner(struct platform_device *pdev,struct dwc3_apple *appledwc)
