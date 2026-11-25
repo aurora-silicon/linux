@@ -243,6 +243,14 @@ patternProperties:
       apple,tunable-post:
         $ref: /schemas/types.yaml#/definitions/uint32-matrix
         description: As the node's apple,tunable-post, for this port's PHY.
+      phys:
+        maxItems: 1
+        description:
+          The port's ATC PHY in DisplayPort use (PHY_TYPE_DP). A DCP powers
+          it while it drives the PHY, from before its cold start until its
+          power-down, and keeps it powered for a display the bootloader
+          started; the PHY driver powers the PHY's domains meanwhile and
+          keeps it out of USB4. The PHY refuses this while it runs USB4.
       mode-switch:
         type: boolean
         description:
@@ -315,6 +323,7 @@ examples:
                 <0x3 0x03a13a00 0x0 0xc0>;
           reg-names = "atc", "atc-ps", "atc-psd";
           apple,dfp-endpoint = <3>;
+          phys = <&atc3_phy 6>;
           mode-switch;
 
           port {

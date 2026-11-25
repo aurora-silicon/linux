@@ -258,18 +258,24 @@ static void dcp_secure_port_start(struct apple_dcp *dcp)
 }
 
 /* Between the main mailbox's AP idle and its IOP idle. */
-static void dcp_secure_port_idle(void *data)
+static int dcp_secure_port_idle_strict(void *data)
 {
 	struct apple_dcp *dcp = data;
 	int ret;
 
 	if (!dcp->secure_rtk || !dcp->secure_answered)
-		return;
+		return 0;
 
 	dcp_secure_poll_stop(dcp);
 	ret = apple_rtkit_port_idle(dcp->secure_rtk, DCP_SECURE_TIMEOUT_MS);
 	if (ret)
 		dev_warn(dcp->dev, "secure port AP idle not acknowledged: %d\n", ret);
+	return ret;
+}
+
+static void dcp_secure_port_idle(void *data)
+{
+	dcp_secure_port_idle_strict(data);
 }
 
 static void dcp_release_secure_rtkit(void *data)
@@ -286,10 +292,18 @@ static int dcp_secure_port_init(struct apple_dcp *dcp)
 {
 	struct device *dev = dcp->dev;
 
-	if (of_property_match_string(dev->of_node, "mbox-names", "secure") < 0)
+	/*
+	 * The secure mailbox is the second of mboxes, or named by apple,secure-mbox where the
+	 * boot loader wants mboxes to hold the one ASC mailbox (it refuses the display handoff
+	 * otherwise).
+	 */
+	if (of_property_match_string(dev->of_node, "mbox-names", "secure") >= 0)
+		dcp->secure_rtk = apple_rtkit_init(dev, dcp, "secure", 0, &dcp_secure_rtkit_ops);
+	else if (of_property_present(dev->of_node, "apple,secure-mbox"))
+		dcp->secure_rtk = apple_rtkit_init_mbox_prop(dev, dcp, "apple,secure-mbox",
+							     &dcp_secure_rtkit_ops);
+	else
 		return 0;
-
-	dcp->secure_rtk = apple_rtkit_init(dev, dcp, "secure", 0, &dcp_secure_rtkit_ops);
 	if (IS_ERR(dcp->secure_rtk)) {
 		int ret = PTR_ERR(dcp->secure_rtk);
 
@@ -315,7 +329,8 @@ static void dcp_s2r_check_dt(struct apple_dcp *dcp)
 	struct device_node *np = dcp->dev->of_node;
 	bool power = of_property_present(np, "apple,display-power");
 	bool secure = dcp->hw.s2r_no_secure_port ||
-		      of_property_match_string(np, "mbox-names", "secure") >= 0;
+		      of_property_match_string(np, "mbox-names", "secure") >= 0 ||
+		      of_property_present(np, "apple,secure-mbox");
 
 	if (dcp->hw.s2r && (!power || !secure)) {
 		dev_info(dcp->dev, "no %s in the device tree, the firmware keeps running\n",
@@ -481,12 +496,13 @@ MODULE_PARM_DESC(t6050_ext_sleep,
 /*
  * What a T6050 external display processor gained outside the firmware 27 sleep itself (the
  * Type-C reconnect skipped for a crashed one, a crashed one refusing a deep sleep before
- * anything is stopped, the link line) is in force on the board it has run on, the J714s.
- * Elsewhere, other boards with the same SoC included, these are as before.
+ * anything is stopped, the link line) is in force where the sleep's description has the
+ * display coprocessors sleep by their method table (apple,display-method-sleep). Elsewhere,
+ * other boards with the same SoC included, these are as before.
  */
 static bool dcp_j714s_ext(struct device *dev)
 {
-	return of_machine_is_compatible("apple,j714s") &&
+	return apple_t6050_sleep_property("apple,display-method-sleep") &&
 	       of_device_is_compatible(dev->of_node, "apple,t6050-dcpext");
 }
 
@@ -1307,14 +1323,19 @@ static void dcp_panel_read_adt(struct apple_dcp *dcp)
 	if (dcp->panel_identity)
 		dcp->panel_identity->adt = panel.identity;
 	dcp->panel.color_target = ret ? NULL : dcp_panel_gamut_color_space(panel.gamut);
-	if (desktop || dcp->fw_compat == DCP_FIRMWARE_V_27_0)
-		dcp->panel.edr_ceiling = dcp_edr_ceiling(panel.edr_potential_headroom);
+	/*
+	 * Whether the panel has EDR headroom at all is the machine's to say: an
+	 * XDR panel's backlight node carries EDRPotentialHeadroom above 1.0, an
+	 * SDR panel none.  Without it the panel gets no peak, so it shows no PQ
+	 * content as EDR and offers userspace no HDR (dcp_panel_edr()).
+	 */
+	dcp->panel.edr_ceiling = dcp_edr_ceiling(panel.edr_potential_headroom);
 	/*
 	 * Firmware 27 reports no peak (desktop 26.x: res_max_panel_brightness()).
 	 * The ADT's LmaxProduct gives it (1600 nits on the M5 Pro).  Only a peak
 	 * above the SDR range gives headroom.
 	 */
-	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
+	if (dcp->panel.edr_ceiling && dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
 		u32 peak = panel.lmax_product >> 16;
 
 		if (peak > dcp->brightness.maximum && peak <= 10000) {
@@ -4354,13 +4375,18 @@ bool dcp_fw_compat_is_desktop(struct platform_device *pdev)
 	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP;
 }
 
-/* Firmware whose panel shows PQ content as EDR (dcp_panel_edr_supported()). */
-bool dcp_fw_compat_panel_edr(struct platform_device *pdev)
+/*
+ * Whether @pdev's internal panel can show PQ content as EDR: the panel has
+ * EDR headroom (the ADT's EDRPotentialHeadroom, see dcp_panel_read_adt()),
+ * and the firmware interface is one whose swaps carry EDR, which the driver
+ * implements for desktop 26.x and firmware 27 (dcp_panel_edr_supported()).
+ */
+bool dcp_panel_edr(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
-	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
-	       dcp->fw_compat == DCP_FIRMWARE_V_27_0;
+	return dcp_fw_swap_has_edr(dcp) && dcp_has_panel(dcp) &&
+	       dcp->panel.edr_ceiling;
 }
 
 /* External connectors driven by iomfb_template support full colour selection. */
@@ -6445,54 +6471,15 @@ VISIBLE_IF_KUNIT void dcp_enable_typec_work(struct apple_dcp *dcp)
 	}
 }
 
-static int dcp_firmware_metadata_v27(struct apple_dcp *dcp)
+/*
+ * The provider clocks firmware 27 asks for by index (getClockFrequency):
+ * apple,clock-ids, published by the boot loader from the ADT.
+ */
+static int dcp_firmware_clocks_v27(struct apple_dcp *dcp)
 {
 	struct device *dev = dcp->dev;
-	struct device_node *fb;
-	struct resource resource;
 	int clocks, index, ret;
 
-	/*
-	 * The framebuffer region is the one the boot loader scanned out of; it
-	 * backs the firmware's default framebuffer.  An external processor the
-	 * boot loader drove no display from (T6050's dcpext4, the HDMI port's)
-	 * has none: it binds without one, and its default-framebuffer requests
-	 * are refused (dfb_region_size 0).
-	 */
-	index = of_property_match_string(dev->of_node, "memory-region-names",
-					 "framebuffer");
-	if (index == -ENODATA || index == -EINVAL) {
-		dcp->dfb_region_size = 0;
-		dev_info(dev, "no boot framebuffer\n");
-		goto clocks;
-	}
-	if (index < 0)
-		return index;
-	fb = of_parse_phandle(dev->of_node, "memory-region", index);
-	if (!fb)
-		return -EINVAL;
-	ret = of_address_to_resource(fb, 0, &resource);
-	of_node_put(fb);
-	if (ret)
-		return ret;
-	dcp->dfb_region_size = resource_size(&resource);
-	if (!dcp->dfb_region_size)
-		return -EINVAL;
-	/*
-	 * The boot surface is on screen until a displayed swap of ours
-	 * replaces it. Reserve its retirement record before any present.
-	 * Without the record the display still takes over, and a cache
-	 * controller waiting on it keeps allocation off.
-	 */
-	ret = apple_mcc_boot_scanout_reserve(dev->of_node);
-	if (ret == -ENOMEM)
-		dev_warn(dev, "no boot scanout record: system cache allocation stays off\n");
-	else if (ret)
-		return ret;
-	dcp->boot_scanout_reserved = !ret;
-	WRITE_ONCE(dcp->boot_surface_pending, true);
-
-clocks:
 	/*
 	 * T6041 device trees carry the single 712 MHz disp0 clock unless the
 	 * boot loader publishes the two /arm-io/disp0 provider clocks
@@ -6533,6 +6520,15 @@ clocks:
 	if (clocks < 0 || clocks > 64)
 		return -EINVAL;
 	/*
+	 * An explicitly empty table: the firmware takes no provider clocks
+	 * (every T602x display processor on 27.2). A display clock the node
+	 * lists is the DCP's own clock, not a provider clock.
+	 */
+	if (!clocks) {
+		dcp->num_firmware_clocks = 0;
+		return 0;
+	}
+	/*
 	 * A DCP that also boots earlier firmware (T8142) lists the clock those
 	 * use first and names the provider clocks "firmware-<index>". Take only
 	 * the named ones here.
@@ -6563,6 +6559,56 @@ clocks:
 		return -EINVAL;
 	dcp->num_firmware_clocks = clocks;
 	return 0;
+}
+
+static int dcp_firmware_metadata_v27(struct apple_dcp *dcp)
+{
+	struct device *dev = dcp->dev;
+	struct device_node *fb;
+	struct resource resource;
+	int index, ret;
+
+	/*
+	 * The framebuffer region is the one the boot loader scanned out of; it
+	 * backs the firmware's default framebuffer.  An external processor the
+	 * boot loader drove no display from (T6050's dcpext4, the HDMI port's)
+	 * has none: it binds without one, and its default-framebuffer requests
+	 * are refused (dfb_region_size 0).
+	 */
+	index = of_property_match_string(dev->of_node, "memory-region-names",
+					 "framebuffer");
+	if (index == -ENODATA || index == -EINVAL) {
+		dcp->dfb_region_size = 0;
+		dev_info(dev, "no boot framebuffer\n");
+		return dcp_firmware_clocks_v27(dcp);
+	}
+	if (index < 0)
+		return index;
+	fb = of_parse_phandle(dev->of_node, "memory-region", index);
+	if (!fb)
+		return -EINVAL;
+	ret = of_address_to_resource(fb, 0, &resource);
+	of_node_put(fb);
+	if (ret)
+		return ret;
+	dcp->dfb_region_size = resource_size(&resource);
+	if (!dcp->dfb_region_size)
+		return -EINVAL;
+	/*
+	 * The boot surface is on screen until a displayed swap of ours
+	 * replaces it. Reserve its retirement record before any present.
+	 * Without the record the display still takes over, and a cache
+	 * controller waiting on it keeps allocation off.
+	 */
+	ret = apple_mcc_boot_scanout_reserve(dev->of_node);
+	if (ret == -ENOMEM)
+		dev_warn(dev, "no boot scanout record: system cache allocation stays off\n");
+	else if (ret)
+		return ret;
+	dcp->boot_scanout_reserved = !ret;
+	WRITE_ONCE(dcp->boot_surface_pending, true);
+
+	return dcp_firmware_clocks_v27(dcp);
 }
 
 static bool dcp_external_is_idle(struct apple_dcp *dcp)
@@ -7495,6 +7541,8 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 
 	INIT_LIST_HEAD(&dcp->swapped_out_fbs);
 	mutex_init(&dcp->swapped_out_fbs_lock);
+	init_completion(&dcp->v27_wake_video);
+	init_completion(&dcp->v27_wake_hotplug);
 	ret = dcp_backlight_init(dcp, dev);
 	if (ret)
 		return ret;
@@ -7502,7 +7550,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 
 	dcp->fw_compat = fw_compat;
 	dcp->v27_j714s = fw_compat == DCP_FIRMWARE_V_27_0 &&
-			 of_machine_is_compatible("apple,j714s");
+			 apple_t6050_sleep_property("apple,display-method-sleep");
 	/*
 	 * Probe-lifetime like the desktop state: component bind opens a devres
 	 * group on this device and releases it on failure or unbind.

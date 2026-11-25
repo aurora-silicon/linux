@@ -462,7 +462,7 @@ impl Rtkit {
 /// The result of admission: everything probe-time checks established, nothing written.
 pub(crate) struct Admitted {
     pub(crate) regs: regs::Regs,
-    pub(crate) adt: GpuAdt,
+    pub(crate) adt: KBox<GpuAdt>,
 }
 
 /// The running firmware session: RTKit, MMIO and the adopted UAT. (The
@@ -472,7 +472,7 @@ pub(crate) struct Session {
     pub(crate) shared: Arc<Shared>,
     pub(crate) rtkit: Rtkit,
     pub(crate) regs: regs::Regs,
-    pub(crate) adt: GpuAdt,
+    pub(crate) adt: KBox<GpuAdt>,
     uat: Arc<mmu::Uat>,
     /// The PPL handoff page, mapped here only to read the firmware's powered flag
     /// ([`hw::FwLayout::powered`]); `None` when the firmware keeps the GPU powered.
@@ -533,9 +533,9 @@ impl Session {
         self.while_powered(regs::Regs::engine_state)
     }
 
-    /// The first engine fault bank holding a fault, for a firmware halted for recovery, or
-    /// `None` while the GPU is powered down.
-    pub(crate) fn fault_scan(&self) -> Result<Option<regs::EngineState>> {
+    /// All eight engine fault banks, for a firmware halted for recovery, or `None` while the GPU
+    /// is powered down.
+    pub(crate) fn fault_scan(&self) -> Result<Option<regs::FaultScan>> {
         self.while_powered(regs::Regs::fault_scan)
     }
 
@@ -602,7 +602,7 @@ pub(crate) fn admit(
     _dev: &AsahiDrmDevice,
     cfg: &'static Config,
     res: shared_regs::G16Resources,
-) -> Result<Admitted> {
+) -> Result<KBox<Admitted>> {
     let dev = pdev.as_ref();
     // The board check guards the PMP AGX vote, which only the 25G83 start sends. A firmware
     // whose handoff names the start without the vote (26B123) rests on the firmware identity
@@ -677,7 +677,7 @@ pub(crate) fn admit(
         return Err(Error::from_errno(-(bindings::EHOSTDOWN as i32)));
     }
     dev_info!(dev, "T8132 G16G admitted, ASC={:#x}\n", regs.asc_control()?);
-    Ok(Admitted { regs, adt })
+    Ok(KBox::init(init!(Admitted { regs, adt }), GFP_KERNEL)?)
 }
 
 /// Posts one device control with only the opcode and waits for it.
@@ -758,6 +758,7 @@ fn publish_loader_table(session: &Session, init: &InitData, offset: u64) -> Resu
 }
 
 /// Wake the sole firmware instance, publish its loader table, then qualify NOP and policy.
+#[inline(never)]
 fn run(
     session: &mut Session,
     events: &mut Events,
@@ -900,15 +901,54 @@ fn run(
     Ok(())
 }
 
+/// Retains a failed firmware start out-of-line so [`start`] never reserves an [`Orphan`] slot on
+/// its normal stack frame.
+#[cold]
+#[inline(never)]
+fn retain_start_failure(
+    shared: &Shared,
+    session: Session,
+    objects: Objects,
+    built: Option<(InitData, Channels, u32)>,
+    events: Events,
+) {
+    let (init, channels) = match built {
+        Some((init, channels, _)) => (Some(init), Some(channels)),
+        None => (None, None),
+    };
+    match KBox::<Orphan>::new_uninit(GFP_KERNEL) {
+        Ok(slot) => {
+            let orphan = slot
+                .write_init(init!(Orphan {
+                    session,
+                    _objects: objects,
+                    channels,
+                    _init: init,
+                    events,
+                }))
+                .unwrap_or_else(|e| match e {});
+            shared.retain_failed(super::Retained::Orphan(orphan));
+        }
+        Err(_) => {
+            dev_err!(
+                shared.dev.as_ref(),
+                "G16: cannot keep the failed session; leaked\n"
+            );
+            // Without memory for the box, leak the firmware-reachable parts.
+            core::mem::forget((session, objects, channels, init, events));
+        }
+    }
+}
+
 /// Brings the firmware to READY.
 #[inline(never)]
 pub(crate) fn start(
-    admitted: Admitted,
+    admitted: KBox<Admitted>,
     dev: &AsahiDrmDevice,
     cfg: &'static Config,
     shared: &Arc<Shared>,
-) -> Result<Booted> {
-    let Admitted { regs, adt } = admitted;
+) -> Result<KBox<Booted>> {
+    let Admitted { regs, adt } = KBox::into_inner(admitted);
     let d: ARef<device::Device> = shared.dev.clone();
     // Cold ownership must hold before the PMP vote as well as immediately before RUN.
     if regs.asc_control()? & regs::ASC_RUN != 0 {
@@ -1005,6 +1045,13 @@ pub(crate) fn start(
             return Err(e);
         }
     };
+    let booted_slot = match KBox::<Booted>::new_uninit(GFP_KERNEL) {
+        Ok(slot) => slot,
+        Err(e) => {
+            core::mem::forget(objects);
+            return Err(e.into());
+        }
+    };
     let mut session = Session {
         dev: d.clone(),
         shared: shared.clone(),
@@ -1074,27 +1121,19 @@ pub(crate) fn start(
             "G16 start failed: {:?}; session retained until reboot\n",
             e
         );
-        let (init, channels) = match built {
-            Some((init, channels, _)) => (Some(init), Some(channels)),
-            None => (None, None),
-        };
-        shared.orphan(Orphan {
-            session,
-            _objects: objects,
-            channels,
-            _init: init,
-            events,
-        });
+        retain_start_failure(shared, session, objects, built, events);
         return Err(e);
     }
     let (init, channels, max_frequency_khz) = built.ok_or(EINVAL)?;
-    Ok(Booted {
-        session,
-        init,
-        objects,
-        channels,
-        events,
-        id,
-        max_frequency_khz,
-    })
+    Ok(booted_slot
+        .write_init(init!(Booted {
+            session,
+            init,
+            objects,
+            channels,
+            events,
+            id,
+            max_frequency_khz,
+        }))
+        .unwrap_or_else(|e| match e {}))
 }

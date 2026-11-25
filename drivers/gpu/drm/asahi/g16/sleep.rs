@@ -54,6 +54,7 @@ impl Firmware {
         Ok(self.engine.flights.is_empty()
             && self.engine.pending.is_empty()
             && !self.engine.frozen
+            && !self.slots.scrubbing_active()
             && self.recovery_idle()?)
     }
 
@@ -102,7 +103,7 @@ impl Shared {
     /// With the sleeping flag set, joins whatever may be reading the firmware's registers.
     fn join_workers(self: &Arc<Self>) {
         // Dropping the handle cancels an expiry that's still pending.
-        drop(self.resnap_handle.lock().take());
+        self.cancel_resnap();
         // SAFETY: An initialized, pinned delayed work of this Shared. A pending callback owned
         // one Arc that it can no longer reclaim. Later enqueues run into the sleeping check.
         let cancelled = unsafe {
@@ -114,6 +115,22 @@ impl Shared {
             // SAFETY: See above.
             drop(unsafe { Arc::from_raw(Arc::as_ptr(self)) });
         }
+        self.events.drain();
+        self.events_unbound.drain();
+        // `sleeping` is already set, so draining queued scrubs under `scrub_queue`
+        // guarantees no concurrent `enqueue_scrubs()` can still queue onto `scrub_wq`
+        // while `scrub_wq.drain()` runs. Drop each drained item outside the spinlock.
+        loop {
+            let item = self.scrub_queue.lock().pop();
+            let Some(item) = item else {
+                break;
+            };
+            drop(item);
+        }
+        self.scrub_wq.drain();
+        self.feed.pause();
+        self.feed_wq.drain();
+        self.feed.release_floor();
     }
 
     /// Waits for what's been published to retire. The poll work keeps running meanwhile.
@@ -199,6 +216,8 @@ impl Shared {
                     .and_then(|quiet| if quiet { Ok(()) } else { Err(EBUSY) })
                     .and_then(|_| {
                         if self.leave_for_commit(firmware) {
+                            firmware.power.release_clpc_now();
+                            self.active_flights.store(0, Ordering::Release);
                             Ok(())
                         } else {
                             Err(EBUSY)
@@ -210,6 +229,7 @@ impl Shared {
         match left {
             Ok(()) => Ok(()),
             Err(error) => {
+                self.feed.resume();
                 self.sleeping.store(false, Ordering::Release);
                 self.poll_now();
                 Err(error)
@@ -250,6 +270,7 @@ impl Shared {
                     "GPU firmware back in {} us\n",
                     now_ns().saturating_sub(started) / 1000
                 );
+                self.feed.resume();
                 self.poll_now();
                 Ok(())
             }
@@ -284,6 +305,7 @@ impl Gpu {
                 self.shared.dev.as_ref(),
                 "sleep refused before the commit: GPU firmware never stopped\n"
             );
+            self.shared.feed.resume();
             self.shared.sleeping.store(false, Ordering::Release);
             self.shared.poll_now();
             return;

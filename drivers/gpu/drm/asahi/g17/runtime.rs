@@ -1693,11 +1693,18 @@ impl compute::Host for ComputeHost<'_> {
         self.shared.note_gpu_activity();
         self.effort.submit();
         self.effort.note_waiters(now, super::fence::waiters());
+        self.effort.note_compute_waiters(now, super::fence::compute_waiters());
         self.effort.note_bound(self.shared.feed.busy_run());
         if self.effort.bound() {
             self.port.lift_busy_if_below_top(now);
         }
-        super::Firmware::apply_shared_effort(self.init, self.effort, self.port, super::power::FULL_EFFORT)
+        super::Firmware::apply_shared_effort(
+            self.shared,
+            self.init,
+            self.effort,
+            self.port,
+            super::power::FULL_EFFORT,
+        )
     }
     fn submit_m5(&mut self, submission: &super::fw::m5::queue::HardwareSubmission) -> Result {
         // Compute only (publication and installation); render pairs submit through
@@ -2158,6 +2165,7 @@ impl Backend {
         if !port.note_submission() {
             return None;
         }
+        self.shared.note_submitter();
         self.shared.note_gpu_activity();
         match packet.completion.work_state().ok()?.acquire(crate::g17::job::Engine::Compute) {
             Ok(_) => {}

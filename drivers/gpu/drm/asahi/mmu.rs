@@ -512,11 +512,14 @@ fn lock_vm(
 }
 
 #[cfg(any(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_G16))]
-pub(crate) struct VmReadGuard(VmExecGuard);
+pub(crate) struct VmReadGuard<'a>(gpuvm::GpuVmInnerGuard<'a, VmInner>);
 
 #[cfg(any(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_G16))]
-impl VmReadGuard {
-    #[cfg(CONFIG_DRM_ASAHI_G15)]
+impl VmReadGuard<'_> {
+    pub(crate) fn epoch(&self) -> Option<u64> {
+        self.0.epoch
+    }
+
     pub(crate) fn covers_range(&mut self, address: u64, size: u64, read: bool, write: bool) -> bool {
         Vm::covers_range_locked(&mut self.0, address, size, read, write)
     }
@@ -2461,7 +2464,7 @@ impl Vm {
             GFP_KERNEL,
         )?;
 
-        let mapping_epoch = if uat_inner.firmware != UatFirmware::Handoff {
+        let mapping_epoch = if uat_inner.firmware != UatFirmware::Handoff || uat_inner.m4_adopted {
             Some(Arc::new(MappingEpoch::new(), GFP_KERNEL)?)
         } else {
             None
@@ -2480,7 +2483,7 @@ impl Vm {
                 page_table,
                 mapping_epoch: mapping_epoch.clone(),
                 bind_sequence: bind_sequence.clone(),
-                epoch: Some(0),
+                epoch: mapping_epoch.is_some().then_some(0),
                 mm,
                 uat_inner,
                 binding: binding.clone(),
@@ -2567,15 +2570,18 @@ impl Vm {
     /// Every page must be mapped GPU-readable and be RAM; otherwise EFAULT. The lines are cleaned
     /// and invalidated to the point of coherency first (never only invalidated: CPU-written lines
     /// may be dirty), so the copy sees what the GPU or a write-combined CPU view stored. The
-    /// mappings cannot change during the copy (GPUVM exec lock).
+    /// mappings cannot change during the copy (VM reservation lock).
     #[cfg(any(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_G16))]
     pub(crate) fn read_user(&self, va: u64, buf: &mut [u8]) -> Result {
         self.read_lock()?.read_user(va, buf)
     }
 
     #[cfg(any(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_G16))]
-    pub(crate) fn read_lock(&self) -> Result<VmReadGuard> {
-        Ok(VmReadGuard(lock_vm(&self.gpuvm, None, false)?))
+    pub(crate) fn read_lock(&self) -> Result<VmReadGuard<'_>> {
+        // Every mapping change holds the VM reservation, so read-only page-table walks and
+        // user-memory copies need only that reservation. The full exec lock would allocate a
+        // `drm_gpuvm_exec` context and lock every external BO, making each submit O(external BOs).
+        Ok(VmReadGuard(self.gpuvm.lock_inner()))
     }
 
     #[cfg(any(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_G16))]
@@ -2595,7 +2601,7 @@ impl Vm {
             }
             let phys = inner.page_table.translate_iova(page).map_err(|_| EFAULT)?;
             // SAFETY: `phys` is checked to be a RAM page; it stays mapped (and its backing pinned)
-            // while the exec lock is held, and is only read here.
+            // while the VM reservation lock is held, and is only read here.
             let ram = unsafe { kernel::page::Page::borrow_phys(&phys) }.ok_or(EFAULT)?;
             let target = &mut buf[done..done + count];
             ram.with_pointer_into_page(within, count, |p| {
@@ -3683,7 +3689,20 @@ impl Uat {
     /// Links the kernel lower root's tables for each range, with no mappings. A published-roots
     /// firmware samples that root's top-level entries only when it starts.
     pub(crate) fn prepare_lower_tables(&self, ranges: &[Range<u64>]) -> Result {
-        let mut inner = lock_vm(&self.kernel_lower_vm.gpuvm, None, false)?;
+        Self::prepare_tables(&self.kernel_lower_vm, ranges)
+    }
+
+    /// Links the kernel window's tables for each range, with no mappings, for a firmware that
+    /// copies the window's second-level entries only when it starts
+    /// ([`FirmwareWindow::mirror`]). Page tables are only freed with their VM, so the leaf
+    /// tables stay where that copy names them.
+    #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+    pub(crate) fn prepare_kernel_tables(&self, ranges: &[Range<u64>]) -> Result {
+        Self::prepare_tables(&self.kernel_vm, ranges)
+    }
+
+    fn prepare_tables(vm: &Vm, ranges: &[Range<u64>]) -> Result {
+        let mut inner = lock_vm(&vm.gpuvm, None, false)?;
         for range in ranges {
             inner.page_table.alloc_pages(range.clone())?;
         }

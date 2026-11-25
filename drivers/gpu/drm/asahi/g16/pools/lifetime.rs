@@ -27,6 +27,7 @@ struct Unit {
     state: State,
     previous: State,
     generation: u8,
+    pipe: u8,
     publication: u64,
 }
 
@@ -53,6 +54,7 @@ impl<const N: usize> Lifetime<N> {
             state: State::Fresh,
             previous: State::Fresh,
             generation: 0,
+            pipe: 0,
             publication: 0,
         };
         Self {
@@ -92,10 +94,13 @@ impl<const N: usize> Lifetime<N> {
         };
         match u.state {
             State::Fresh => true,
-            // A later publication retired: it started only after this owner finished, and
-            // its load displaced this owner from the hardware slot.
+            // A later publication on the same hardware pipe retired: it started only after this
+            // owner finished on that pipe, and its load displaced this owner from the slot.
             State::Retired => self.units.iter().enumerate().any(|(b, other)| {
-                b != k && other.state == State::Retired && other.publication > u.publication
+                b != k
+                    && other.state == State::Retired
+                    && other.pipe == u.pipe
+                    && other.publication > u.publication
             }),
             _ => false,
         }
@@ -112,6 +117,41 @@ impl<const N: usize> Lifetime<N> {
                 .units
                 .iter()
                 .any(|u| matches!(u.state, State::Preparing | State::Published))
+    }
+    /// [`Self::exhausted`] restricted to owners selected by `mask` (bit `k` -> owner `k`).
+    pub(crate) fn exhausted_in_mask(&self, mask: u32) -> bool {
+        let mut rem = mask;
+        while rem != 0 {
+            let k = rem.trailing_zeros() as usize;
+            rem &= rem - 1;
+            if k < N && self.available(k) {
+                return false;
+            }
+        }
+        !self
+            .units
+            .iter()
+            .any(|u| matches!(u.state, State::Preparing | State::Published))
+    }
+    /// Bitmask of permanently quarantined owners in `0..N.min(32)`.
+    pub(crate) fn quarantined_mask(&self) -> u32 {
+        let mut mask = 0u32;
+        for k in 0..N.min(32) {
+            if self.units[k].state == State::Quarantined {
+                mask |= 1u32 << k;
+            }
+        }
+        mask
+    }
+    /// Whether any owner in `0..n` is permanently quarantined.
+    pub(crate) fn any_quarantined_within(&self, n: usize) -> bool {
+        (0..n.min(N)).any(|k| self.units[k].state == State::Quarantined)
+    }
+    /// Whether owner `k` is permanently quarantined.
+    pub(crate) fn is_quarantined(&self, k: usize) -> bool {
+        self.units
+            .get(k)
+            .is_some_and(|u| u.state == State::Quarantined)
     }
     pub(crate) fn claim(&mut self, k: usize) -> bool {
         if !self.available(k) {
@@ -133,29 +173,42 @@ impl<const N: usize> Lifetime<N> {
         }
     }
     pub(crate) fn publish(&mut self, k: usize) -> bool {
+        self.publish_on(k, 0)
+    }
+    /// Publishes unit `k` onto hardware queue `pipe` (`0` for single-pipe engines, or the CDM
+    /// pipe index for dual-pipe compute). Each pipe enforces FIFO retirement and same-pipe
+    /// displacement independently while sharing a monotonic publication sequence.
+    pub(crate) fn publish_on(&mut self, k: usize, pipe: u8) -> bool {
         if k >= N || self.units[k].state != State::Preparing || self.sequence == u64::MAX {
             return false;
         }
-        // Without pipelining, publication is serialized against every owner of the slot.
-        if !self.pipelined && self.units.iter().any(|u| u.state == State::Published) {
+        // Without pipelining, publication is serialized against every owner on the same pipe.
+        if !self.pipelined
+            && self
+                .units
+                .iter()
+                .any(|u| u.state == State::Published && u.pipe == pipe)
+        {
             return false;
         }
         self.sequence += 1;
+        self.units[k].pipe = pipe;
         self.units[k].publication = self.sequence;
         self.units[k].state = State::Published;
         true
     }
     /// Called only after the caller has established complete, exact wire retirement. Owners
-    /// retire in publication order: `k` must be the oldest published owner.
+    /// retire in publication order per pipe: `k` must be the oldest published owner on its pipe.
     pub(crate) fn retire(&mut self, k: usize) -> bool {
         if k >= N || self.units[k].state != State::Published {
             return false;
         }
         let publication = self.units[k].publication;
+        let pipe = self.units[k].pipe;
         if self
             .units
             .iter()
-            .any(|u| u.state == State::Published && u.publication < publication)
+            .any(|u| u.state == State::Published && u.pipe == pipe && u.publication < publication)
         {
             return false;
         }
@@ -298,5 +351,28 @@ mod tests {
         // 2 still proves 0 displaced although 1 is being prepared again.
         assert!(l.available(0));
         assert!(!l.available(2));
+    }
+    #[test]
+    fn two_pipes_retire_out_of_order_and_displace_independently() {
+        let mut l = Lifetime::<4>::new(true);
+        // Publish unit 0 on pipe 0, then unit 2 on pipe 1.
+        assert!(l.claim(0) && l.publish_on(0, 0));
+        assert!(l.claim(2) && l.publish_on(2, 1));
+        // Pipe 1 finishes ahead of pipe 0: out-of-order retirement across pipes must succeed.
+        assert!(l.retire(2));
+        // Pipe 1's second publication (unit 3) retires and displaces unit 2 on pipe 1.
+        assert!(l.claim(3) && l.publish_on(3, 1));
+        assert!(l.retire(3));
+        assert!(l.available(2));
+        assert!(!l.available(3));
+        // Pipe 0's unit 0 now retires: unit 3 (pipe 1, higher publication) must NOT displace it.
+        assert!(l.retire(0));
+        assert!(!l.available(0));
+        // Pipe 0's next publication (unit 1) retires and displaces unit 0 on pipe 0.
+        assert!(l.claim(1) && l.publish_on(1, 0));
+        assert!(l.retire(1));
+        assert!(l.available(0));
+        assert!(!l.available(1));
+        assert!(!l.available(3));
     }
 }

@@ -287,6 +287,7 @@ impl fmt::Display for Identity {
 /// Identifies the firmware build loaded at `text` (DATA `data_size` bytes) among `builds`,
 /// before any firmware-visible write.
 #[cfg_attr(not(CONFIG_DRM_ASAHI_G16), allow(dead_code))]
+#[inline(never)]
 pub(crate) fn identify(
     dev: &device::Device,
     text: Range<u64>,
