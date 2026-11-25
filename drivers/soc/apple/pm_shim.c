@@ -375,7 +375,7 @@ int sep_pm_commit_prepare(void *ptr, void *mbox, u64 msg0, u32 msg1, u64 reply, 
 	of_node_put(np);
 	if (ret)
 		return ret;
-	if (offset + 4 > resource_size(&res))
+	if (resource_size(&res) < sizeof(u32) || offset > resource_size(&res) - sizeof(u32))
 		return -EINVAL;
 
 	c->dart = sep_pm_dart(dev);
@@ -383,7 +383,11 @@ int sep_pm_commit_prepare(void *ptr, void *mbox, u64 msg0, u32 msg1, u64 reply, 
 		ret = -ENODEV;
 		goto err;
 	}
-	c->ps = ioremap(res.start + offset, 4);
+	/* Read only, but mapped as its bus asks, as every other mapping of that page. */
+	if (res.flags & IORESOURCE_MEM_NONPOSTED)
+		c->ps = ioremap_np(res.start + offset, sizeof(u32));
+	else
+		c->ps = ioremap(res.start + offset, sizeof(u32));
 	if (!c->ps) {
 		ret = -ENOMEM;
 		goto err;
