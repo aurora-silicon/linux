@@ -353,11 +353,14 @@ $defs:
       a 64-bit read written back with the value's bits of its low word
       cleared, 10 the same with them set, 11 a 64-bit read, 12 and 13 a
       32-bit and a 64-bit write of what the register held when read before
-      the commit, whose value is unused. Kinds 0 to 6 are 32-bit accesses.
-      Bits 31:16 are a wait's timeout in ms (0 for 10 ms); bit 8 a wait
-      whose timeout is not an error, or a kind 12 or 13 entry whose register
-      wasn't read. The block is this node's reg entry by index, and the offset is
-      aligned to the access's width, which fits in the block.
+      the commit, whose value is 0, 14 and 15 the next entries, as many as
+      bits 31:16 say, run only if the 32-bit or 64-bit register, as read
+      before the commit, had one of the value's bits set. Kinds 0 to 6 are
+      32-bit accesses. A wait's bits 31:16 are its timeout in ms (0 for 10
+      ms), and bit 8 makes its timeout no error; no other kind takes either,
+      and bits 15:9 are 0. Kinds 12 to 15 are only for apple,seq-wake-early
+      and apple,seq-wake. The block is this node's reg entry by index, and
+      the offset is aligned to the access's width, which fits in the block.
     items:
       items:
         - description: Kind
