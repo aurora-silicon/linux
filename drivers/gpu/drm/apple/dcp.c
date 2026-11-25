@@ -10743,6 +10743,7 @@ static int dcp_platform_suspend(struct device *dev)
 
 void dcp_hdmi_disconnect(struct apple_dcp *dcp)
 {
+	WRITE_ONCE(dcp->hdmi_crtc_off, false);
 	disconnected_hpd_event(dcp->connector);
 	dcp_dptx_disconnect(dcp, 0);
 }
@@ -10801,13 +10802,6 @@ static int dcp_platform_resume(struct device *dev)
 	/* Observe future edges before sampling any edges lost in sleep. */
 	if (dcp->hdmi_hpd_irq)
 		dcp_fabric_run_resume(&dcp_resume_ops, dcp);
-	/* A display kept connected through the sleep, unplugged during it. */
-	if (dcp->hdmi_hpd_irq && !dcp->active_typec_route &&
-	    READ_ONCE(dcp->hdmi_crtc_off) &&
-	    !gpiod_get_value_cansleep(dcp->hdmi_hpd)) {
-		WRITE_ONCE(dcp->hdmi_crtc_off, false);
-		disconnected_hpd_event(dcp->connector);
-	}
 	if (dcp->external_native)
 		enable_work(&dcp->external_audio_work);
 
