@@ -7168,7 +7168,7 @@ static const struct platform_suspend_ops apple_sleep_ops = {
 
 /* For a SoC with early_context: the same, with the scopes its entry needs held */
 static const struct platform_suspend_ops apple_sleep_early_ops = {
-	.valid = suspend_valid_only_mem,
+	.valid = apple_sleep_valid,
 	.begin = apple_sleep_begin,
 	.prepare = apple_sleep_prepare,
 	.prepare_late = apple_sleep_late_scope_begin,
