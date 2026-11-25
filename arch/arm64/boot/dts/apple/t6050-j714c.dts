@@ -311,6 +311,8 @@
 
 #include "t6050-max-atc2.dtsi"
 
+#include "t6050-magsafe.dtsi"
+
 /* The I2C power states have no described parent (SIO), as for i2c1 and i2c2 */
 &ps_i2c3 {
 	/delete-property/ power-domains;

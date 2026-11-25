@@ -110,14 +110,12 @@
 	};
 };
 
-/* MagSafe's controller is separate from all three USB-C data ports. */
-&nub_spmi_a0 {
-	hpm5: usb-pd@8 {
-		compatible = "apple,sn201202x";
-		reg = <0x8 SPMI_USID>;
-		apple,no-liquid-detection;
-		status = "disabled";
-	};
+/*
+ * MagSafe's PD controller (t6050-magsafe.dtsi) is separate from all three USB-C data ports.
+ * It stays off until t6050-j716c-sleep-devices.dtsi enables it with the sleep.
+ */
+&hpm5 {
+	status = "disabled";
 };
 
 /* Split the two ASC mailboxes from their coprocessor banks for later use. */

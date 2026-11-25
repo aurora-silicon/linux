@@ -387,18 +387,9 @@
 			};
 		};
 	};
-
-	/*
-	 * The MagSafe 3 port's PD controller (ADT hpm5, port-type 0x11). It has no USB data
-	 * path, so it gets no connector node; tipd registers a Type-C port and a power supply
-	 * for it. Its ADT features-supported is <3>, "Power In" only: no liquid detection.
-	 */
-	hpm5: usb-pd@8 {
-		compatible = "apple,sn201202x";
-		reg = <0x8 SPMI_USID>;
-		apple,no-liquid-detection;
-	};
 };
+
+#include "t6050-magsafe.dtsi"
 
 &atc1_phy_mbox {
 	status = "okay";

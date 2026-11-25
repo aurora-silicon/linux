@@ -273,7 +273,7 @@
  *   ATC0 usb-drd0 left-back  hpm0 nub-spmi-a0 0x0c (the debug port, not described)
  *   ATC1 usb-drd1 left-front hpm1 nub-spmi-a0 0x0a
  *   ATC2 usb-drd2 right      hpm2 nub-spmi-a1 0x0c
- *   MagSafe                  hpm5 nub-spmi-a0 0x08 (not a USB-C connector)
+ *   MagSafe                  hpm5 nub-spmi-a0 0x08 (t6050-magsafe.dtsi, no connector node)
  * There is no usb-drd3 and no nub-spmi-a2, so ATC3's USB chain and that bus
  * stay off.
  */
@@ -338,6 +338,8 @@
 		};
 	};
 };
+
+#include "t6050-magsafe.dtsi"
 
 &usb_drd1 {
 	port {
