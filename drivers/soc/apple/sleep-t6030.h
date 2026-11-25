@@ -31,8 +31,8 @@
  * stop unless apple_sleep.untested_commit=1. With the SMC policy macsmc sends nothing past
  * its warning, pmVC and wake type before that point: no slpa on a dry run.
  *
- * The wake puts back what the entry changed and the cluster words. macOS's wake on T6030 is not
- * traced yet, so nothing else is written there.
+ * The wake writes the cluster words, then every power word back as Linux had it before the entry,
+ * in the order macOS 27.2's wake writes them on J516s (aura's wake record), then the notify masks.
  */
 
 /* Power words in "ps", from the J516s ADT's pmgr devices */
@@ -364,31 +364,37 @@ static void t6030_sleep_pre_commit(struct apple_sleep *s)
 		cpu_relax();
 }
 
-/* Back on the boot core: the cluster words, SIO's AUTO_ENABLE, the lowered words in reverse */
+/* The commit's record of @offset, which the rewake puts back, as it was before the entry */
+static void t6030_sleep_unstage(struct apple_sleep *s, u32 offset, u32 before)
+{
+	const struct apple_sleep_words *all = &s->soc->ps_all;
+	int i = sleep_ps_find(all->offset, all->count, offset);
+
+	if (i >= 0)
+		s->ps_commit[i] = before;
+}
+
+/*
+ * Back on the boot core, in macOS's order: the cluster words, then every power word as Linux had
+ * it, macOS's wake order first (sleep_ps_rewake()), the words the entry lowered or took
+ * AUTO_ENABLE from as they were before it, then the notify masks.
+ */
 static void t6030_sleep_wake(struct apple_sleep *s)
 {
-	const struct apple_sleep_words *all = &s->soc->ps_all, *aon = &s->soc->ps_aon_all;
 	struct t6030_sleep *t = t6030_state(s);
 	unsigned int i;
 
-	/* As the wake found them, before anything here writes one: the report compares them */
-	for (i = 0; i < all->count; i++)
-		s->ps_woke[i] = readl(s->ps + all->offset[i]);
-	for (i = 0; i < aon->count; i++)
-		s->ps_aon_woke[i] = readl(s->ps_aon + aon->offset[i]);
 	writel(CLUSTER_ON, s->cluster + T6030_CLUSTER_E);
 	writel(CLUSTER_ON, s->cluster + T6030_CLUSTER_P);
-	if (t->auto_staged) {
+	/* SIO_CPU is in both lists: its value before the lowering is the one before the entry */
+	if (t->auto_staged)
 		for (i = 0; i < ARRAY_SIZE(t6030_auto_off); i++)
-			writel(t->auto_saved[i], s->ps + t6030_auto_off[i]);
-		t->auto_staged = false;
-	}
-	while (t->nlowered) {
-		i = --t->nlowered;
-		if (sleep_ps_restore(s->ps + t6030_lowered[i], t->lowered_saved[i]))
-			dev_warn(s->dev, "power word %#x not back after the wake\n",
-				 t6030_lowered[i]);
-	}
+			t6030_sleep_unstage(s, t6030_auto_off[i], t->auto_saved[i]);
+	for (i = 0; i < t->nlowered; i++)
+		t6030_sleep_unstage(s, t6030_lowered[i], t->lowered_saved[i]);
+	t->auto_staged = false;
+	t->nlowered = 0;
+	sleep_ps_rewake(s);
 	t6030_sleep_undo_regs(s);
 }
 
@@ -414,6 +420,24 @@ static const u32 t6030_ps_all[] = {
 	0x588, 0x590, 0x598, 0x5a0, 0x5a8, 0x5b0, 0x5b8, 0xc00, 0x4000, 0x4008,
 	0x4010, 0x4018, 0x4020, 0x4028, 0x8000, 0x8008, 0x8010, 0x8018, 0x8020, 0xc000,
 	0xc008, 0xc010, 0xc018, 0x10000,
+};
+
+/*
+ * macOS 27.2's wake on J516s writes these power words, in this order, from the first guest trap
+ * after the reset (aura's wake record, run t2e): "ps", then "ps-aon".
+ */
+static const u32 t6030_ps_wake_order[] = {
+	0x110, 0x118, 0x120, 0x170, 0x1b8, 0x1f0, 0x210, 0x228, 0x230, 0x238, 0x240, 0x248,
+	0x260, 0x2a0, 0x2a8, 0x2b0, 0x2b8, 0x2c0, 0x2c8, 0x2d0, 0x2e0, 0x408, 0x500, 0x510,
+	0x558, 0x568, 0x5b0, 0x5b8, 0x4e0, 0x4c8, 0x398, 0x390, 0x388, 0x308, 0x300, 0x2f8,
+	0x2f0, 0x2e8, 0x2d8, 0x298, 0x290, 0x288, 0x280, 0x278, 0x270, 0x268, 0x250, 0x220,
+	0x218, 0x208, 0x200, 0x1f8, 0x1e8, 0x1e0, 0x1d8, 0x1d0, 0x190, 0x180, 0x178, 0x168,
+	0x160, 0x158, 0x150, 0x148, 0x140, 0x138, 0x4d0, 0x3c0, 0x3f0, 0x3f8, 0x3b8, 0x3d8,
+	0x3e0, 0x1c0, 0x258, 0x10000,
+};
+
+static const u32 t6030_ps_aon_wake_order[] = {
+	0x98, 0xc0, 0xb8,
 };
 
 /* And in "ps-aon" */
@@ -511,4 +535,6 @@ static const struct apple_sleep_soc t6030_sleep_soc = {
 	/* The wake block's layout isn't traced on T6030: no source is armed or read back. */
 	.ps_all = SLEEP_WORDS(t6030_ps_all),
 	.ps_aon_all = SLEEP_WORDS(t6030_ps_aon_all),
+	.ps_wake_order = SLEEP_WORDS(t6030_ps_wake_order),
+	.ps_aon_wake_order = SLEEP_WORDS(t6030_ps_aon_wake_order),
 };
