@@ -628,6 +628,8 @@ struct apple_sleep_ops {
 	int (*check)(struct apple_sleep *s);
 	/* Optional traffic strictly after timer, before AIC/release/DEEP. */
 	void (*post_timer)(struct apple_sleep *s);
+	/* Optional: the boot core's last WFI came back, before it takes the next one */
+	void (*wfi_again)(struct apple_sleep *s);
 	/* The dry run's list: does macOS have this ps word off at its commit? */
 	bool (*macos_off_at_commit)(u32 offset);
 };
@@ -5861,6 +5863,8 @@ static void __noreturn sleep_boot_wfi(struct apple_sleep *s)
 			WRITE_ONCE(t8142_obs_wfi_back, READ_ONCE(t8142_obs_wfi_back) + 1);
 		else if (t8142)
 			t8142_wfi_returned(s, t0, &noted);
+		if (s->soc->ops->wfi_again)
+			s->soc->ops->wfi_again(s);
 		s->soc->ops->aic_ack();
 		write_sysreg_s(IPI_SR_PENDING, SYS_APL_IPI_SR_EL1);
 	}
@@ -6227,6 +6231,8 @@ static void apple_sleep_return(struct apple_sleep *s)
 {
 	int i;
 
+	/* The first thing back in Linux, for a wake that hangs before its report */
+	sleep_note(s, 0x6f);
 	/*
 	 * The reset leaves the timer control at its EL2 default, without the event stream
 	 * or EL0's counter. The timer driver's CPU PM exit puts it back too, later.

@@ -104,6 +104,9 @@ struct t6030_sleep {
 	unsigned int nlowered;
 	u32 auto_saved[ARRAY_SIZE(t6030_auto_off)];
 	bool auto_staged;
+	/* The PMU's RTC alarm as the entry found it, for the rearm after the commit word */
+	u8 alarm_compare[4];
+	bool alarm_valid;
 };
 
 static struct apple_sleep_smc_policy t6030_smc_policy;
@@ -278,6 +281,152 @@ static void t6030_sleep_check_stops(void)
 }
 
 /*
+ * A PMU command on gen-1 nub-spmi0 by hand, as macOS 27.2 sends it after the commit word on
+ * J516s (t5): status, the notify mask, the command and its data, the done bit polled and
+ * acked, then the reply's header and one data word at a time, each only once the status says
+ * the FIFO holds one.
+ */
+#define T6030_SPMI_RX_EMPTY		BIT(24)
+#define T6030_SPMI_DONE			BIT(0)
+#define T6030_SPMI_POLL_US		1000
+
+static int t6030_pmu_xfer(struct apple_sleep *s, u32 mask, u8 opcode, u16 address,
+			  const u8 *wr, u8 *rd, unsigned int len)
+{
+	u8 command = opcode | (len - 1), usid = s->soc->pmu_usid;
+	unsigned int i, n;
+	u32 value, data;
+	int ret = 0;
+
+	if (!len || len > 8 || !!wr == !!rd)
+		return -EINVAL;
+	readl(s->spmi + SPMI_STATUS);
+	writel(mask, s->spmi + SPMI_NOTIFY_ENABLE);
+	writel((u32)address << 16 | SPMI_CMD_ACTIVE | (u32)usid << 8 | command,
+	       s->spmi + SPMI_CMD);
+	for (i = 0; wr && i < len; i += 4) {
+		data = 0;
+		for (n = 0; n < min(4U, len - i); n++)
+			data |= (u32)wr[i + n] << (8 * n);
+		writel(data, s->spmi + SPMI_CMD);
+	}
+	if (!readl_poll_timeout_atomic(s->spmi + SPMI_NOTIFY_ACK, value,
+				       value & T6030_SPMI_DONE, 1, T6030_SPMI_POLL_US))
+		writel(T6030_SPMI_DONE, s->spmi + SPMI_NOTIFY_ACK);
+	if (readl_poll_timeout_atomic(s->spmi + SPMI_STATUS, value,
+				      !(value & T6030_SPMI_RX_EMPTY), 1, T6030_SPMI_POLL_US))
+		return -ETIMEDOUT;
+	value = readl(s->spmi + SPMI_REPLY);
+	if ((value & 0xff) != command || ((value >> 8) & 0x7f) != usid ||
+	    (wr && !(value & SPMI_CMD_ACTIVE)))
+		ret = -EIO;
+	for (i = 0; !ret && rd && i < len; i += 4) {
+		if (readl(s->spmi + SPMI_STATUS) & T6030_SPMI_RX_EMPTY) {
+			ret = -EIO;
+			break;
+		}
+		data = readl(s->spmi + SPMI_REPLY);
+		for (n = 0; n < min(4U, len - i); n++)
+			rd[i + n] = data >> (8 * n);
+	}
+	/* Nothing left behind for the SPMI driver: the FIFO read empty, at most its 16 entries */
+	for (i = 0; i < SPMI_DRAIN_MAX && !(readl(s->spmi + SPMI_STATUS) & T6030_SPMI_RX_EMPTY);
+	     i++)
+		readl(s->spmi + SPMI_REPLY);
+	return ret;
+}
+
+/*
+ * The RTC alarm the OS armed (rtcwake), read before anything of the entry touches the PMU:
+ * the control, the mask, the 4-byte compare and the seconds counter. Only an armed, unmasked
+ * alarm still ahead of the counter is rearmed after the commit word.
+ */
+static void t6030_alarm_snapshot(struct apple_sleep *s, u32 runtime_mask)
+{
+	struct t6030_sleep *t = t6030_state(s);
+	u32 mask = runtime_mask & ~T6030_SPMI_DONE;
+	u8 ctl = 0, rmask = 0, ticks[6] = {};
+	u32 compare, now;
+
+	t->alarm_valid = false;
+	if (t6030_pmu_xfer(s, mask, T6050_SPMI_EXT_READL, T6050_RTC_CTL, NULL, &ctl, 1) ||
+	    t6030_pmu_xfer(s, mask, T6050_SPMI_EXT_READL, T6050_RTC_MASK, NULL, &rmask, 1) ||
+	    t6030_pmu_xfer(s, mask, T6050_SPMI_EXT_READL, T6050_RTC_COMPARE, NULL,
+			   t->alarm_compare, 4) ||
+	    t6030_pmu_xfer(s, mask, T6050_SPMI_EXT_READL, T6050_RTC_COUNTER, NULL, ticks, 6))
+		goto out;
+	compare = get_unaligned_le32(t->alarm_compare);
+	/* The counter's 48 bits are 1/65536 s: its top 32 are the compare's seconds */
+	now = get_unaligned_le32(ticks + 2);
+	t->alarm_valid = (ctl & T6050_RTC_CTL_ARMED) && !(rmask & BIT(0)) &&
+			 (s32)(compare - now) > 0;
+out:
+	writel(runtime_mask, s->spmi + SPMI_NOTIFY_ENABLE);
+}
+
+/* The sleep's CLLT word: macOS writes it back before each commit word (0x1c17 on J516s) */
+#define T6030_CLLT_SLEEP		0x24
+
+/* PMU scratch +3, +4 after the commit word: the RTC control the rearm read, and how it went */
+#define T6030_NOTE_POST_TIMER_OK	0x04
+#define T6030_NOTE_POST_NO_ALARM	0xd0
+#define T6030_NOTE_POST_FAILED		0xe0
+
+/*
+ * After the commit word, every line masked, as macOS 27.2 on J516s (t5): the PMU's RTC alarm
+ * rearmed (its control reads 0x01 there, the alarm no longer armed: the entry's PMU and SMC
+ * steps disarm it), each command under the sleep's notify mask without its done bit, then the
+ * CLLT word and the commit word once more.
+ */
+static void t6030_sleep_post_timer(struct apple_sleep *s)
+{
+	struct t6030_sleep *t = t6030_state(s);
+	u32 mask = s->soc->spmi_notify_sleep & ~T6030_SPMI_DONE;
+	u8 ctl = 0, v, step = 0;
+	int ret;
+
+	if (!t->alarm_valid) {
+		sleep_note_at(s, 4, T6030_NOTE_POST_NO_ALARM);
+		goto recommit;
+	}
+	ret = t6030_pmu_xfer(s, mask, T6050_SPMI_EXT_READL, T6050_RTC_CTL, NULL, &ctl, 1);
+	if (!ret && (ctl & T6050_RTC_CTL_FIRED)) {
+		step = 1;
+		v = 0x43;
+		ret = t6030_pmu_xfer(s, mask, T6050_SPMI_EXT_WRITEL, T6050_RTC_CTL, &v, NULL, 1);
+	}
+	if (!ret) {
+		step = 2;
+		ret = t6030_pmu_xfer(s, mask, T6050_SPMI_EXT_WRITEL, T6050_RTC_COMPARE,
+				     t->alarm_compare, NULL, 4);
+	}
+	if (!ret) {
+		step = 3;
+		v = 0;
+		ret = t6030_pmu_xfer(s, mask, T6050_SPMI_EXT_WRITEL, T6050_RTC_MASK, &v, NULL, 1);
+	}
+	if (!ret) {
+		step = 4;
+		v = 0x41;
+		ret = t6030_pmu_xfer(s, mask, T6050_SPMI_EXT_WRITEL, T6050_RTC_CTL, &v, NULL, 1);
+	}
+	sleep_note_at(s, 3, ctl);
+	sleep_note_at(s, 4, ret ? T6030_NOTE_POST_FAILED | step : T6030_NOTE_POST_TIMER_OK);
+	/* The notes put the done bit back in the mask: macOS's is without it from here on */
+	writel(mask, s->spmi + SPMI_NOTIFY_ENABLE);
+recommit:
+	writel(readl(s->cllt + T6030_CLLT_SLEEP), s->cllt + T6030_CLLT_SLEEP);
+	writel(1, s->commit);
+}
+
+/* The boot core's WFI came back: the CLLT word and the commit word again, as macOS's loop */
+static void t6030_sleep_wfi_again(struct apple_sleep *s)
+{
+	writel(readl(s->cllt + T6030_CLLT_SLEEP), s->cllt + T6030_CLLT_SLEEP);
+	writel(1, s->commit);
+}
+
+/*
  * After the enclave, before the coprocessors stop: the PMU's stage, the notify masks, then the
  * votes. macOS's nub-spmi-a0 word comes before the first vote in every run.
  */
@@ -285,6 +434,7 @@ static void t6030_sleep_prepare_regs(struct apple_sleep *s)
 {
 	struct t6030_sleep *t = t6030_state(s);
 
+	t6030_alarm_snapshot(s, readl(s->spmi + SPMI_NOTIFY_ENABLE));
 	sleep_pmu_write(s, s->soc->pmu_sleep_reg, s->soc->pmu_sleep_val);
 	t->notify_saved[0] = readl(s->spmi_a0 + SPMI_NOTIFY_ENABLE);
 	t->notify_saved[1] = readl(s->spmi + SPMI_NOTIFY_ENABLE);
@@ -513,7 +663,9 @@ static void t6030_sleep_wake(struct apple_sleep *s)
 	struct t6030_sleep *t = t6030_state(s);
 	unsigned int i;
 
+	sleep_note(s, 0x70);
 	t6030_sleep_wake_seq(s, &t->wake_early, "apple,seq-wake-early");
+	sleep_note(s, 0x71);
 	/* SIO_CPU is in both lists: its value before the lowering is the one before the entry */
 	if (t->auto_staged)
 		for (i = 0; i < ARRAY_SIZE(t6030_auto_off); i++)
@@ -527,12 +679,16 @@ static void t6030_sleep_wake(struct apple_sleep *s)
 	/* None of the memory side's registers before every early word is on */
 	sleep_ps_rewake_settle(s);
 	t6030_sleep_wake_check_ps(s, "before the memory side");
+	sleep_note(s, 0x72);
 	t6030_sleep_wake_seq(s, &t->wake, "apple,seq-wake");
+	sleep_note(s, 0x73);
 	sleep_ps_rewake_words(s, &t6030_wake_mid_words, false);
 	t6030_sleep_undo_regs(s);
+	sleep_note(s, 0x74);
 	sleep_ps_rewake_words(s, &t6030_wake_late_words, false);
 	sleep_ps_rewake_rest(s);
 	t6030_sleep_wake_check_ps(s, "at the end");
+	sleep_note(s, 0x75);
 }
 
 static void t6030_deep_wfi_arm(void)
@@ -602,6 +758,8 @@ static const struct apple_sleep_ops t6030_sleep_ops = {
 	.commit_notice = t6030_sleep_commit_notice,
 	.commit_regs = t6030_sleep_commit_regs,
 	.pre_commit = t6030_sleep_pre_commit,
+	.post_timer = t6030_sleep_post_timer,
+	.wfi_again = t6030_sleep_wfi_again,
 	.wake = t6030_sleep_wake,
 	.cpu_prepare = t6030_sleep_cpu_prepare,
 	.cpu_restore = t6030_sleep_cpu_restore,
