@@ -913,6 +913,34 @@ static size_t build_scan(struct centauri_wifi *wifi, unsigned int chunk, u8 *buf
 	return size;
 }
 
+static int scan_stop_chunk(struct centauri_wifi *wifi, u32 done)
+{
+	unsigned long deadline;
+	int ret;
+
+	ret = command(wifi, 65537, NULL, 0);
+	if (wifi->scans_done != done)
+		return 0;
+	if (ret == -EREMOTEIO && wifi->reply_status == 342)
+		return 0;
+	if (ret)
+		return ret;
+	deadline = jiffies + msecs_to_jiffies(1000);
+	do {
+		if (READ_ONCE(wifi->stopping) ||
+		    READ_ONCE(wifi->transport_paused) ||
+		    readl(wifi->a.bar + 8) != 2)
+			return -EIO;
+		drain(wifi);
+		if (wifi->scans_done != done)
+			return 0;
+		mutex_unlock(&wifi->lock);
+		usleep_range(1000, 2000);
+		mutex_lock(&wifi->lock);
+	} while (time_before(jiffies, deadline));
+	return -ETIMEDOUT;
+}
+
 static void scan_worker(struct work_struct *work)
 {
 	struct centauri_wifi *wifi = container_of(work, struct centauri_wifi, scan_work);
@@ -953,16 +981,18 @@ static void scan_worker(struct work_struct *work)
 			   msecs_to_jiffies(max(8000U, count * 2 * SCAN_PASSIVE_DWELL_MS + 2000));
 		progress = jiffies;
 		do {
-			drain(wifi);
-			if (readl(wifi->a.bar + 8) != 2) {
+			if (READ_ONCE(wifi->stopping) ||
+			    READ_ONCE(wifi->transport_paused) ||
+			    readl(wifi->a.bar + 8) != 2) {
 				ret = -EIO;
 				break;
 			}
+			drain(wifi);
 			if (wifi->scans_done != done)
 				break;
 			if (READ_ONCE(wifi->scan_abort)) {
 				if (!stopped)
-					command(wifi, 65537, NULL, 0);
+					scan_stop_chunk(wifi, done);
 				ret = -ECANCELED;
 				break;
 			}
@@ -989,7 +1019,9 @@ static void scan_worker(struct work_struct *work)
 				/* The stop's own scan event ends the wait. */
 				deadline = jiffies + msecs_to_jiffies(1000);
 			}
+			mutex_unlock(&wifi->lock);
 			usleep_range(1000, 2000);
+			mutex_lock(&wifi->lock);
 		} while (time_before(jiffies, deadline));
 		if (!ret && !refused && wifi->scans_done == done) {
 			dev_warn(&wifi->control->pdev->dev,
@@ -997,7 +1029,7 @@ static void scan_worker(struct work_struct *work)
 				 wifi->channels_seen - channels, count,
 				 stopped ? " after the stop" : "");
 			if (!stopped)
-				command(wifi, 65537, NULL, 0);
+				scan_stop_chunk(wifi, done);
 		}
 	}
 	info.aborted = !!ret;
@@ -1246,6 +1278,9 @@ static void connect_worker(struct work_struct *work)
 		}
 	}
 	host_setup_commands(wifi);
+	drain(wifi);
+	wifi->connect_event = false;
+	wifi->disconnect_event = false;
 	slot = wifi->command_head;
 	ret = command(wifi, 131072, wifi->connect_payload, wifi->connect_size);
 	command_status = wifi->reply_status;
