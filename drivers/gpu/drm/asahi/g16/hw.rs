@@ -42,7 +42,6 @@ pub(crate) struct Config {
     pub(crate) hw_ids: &'static [HwId],
     /// Compatible of the original ADT SGX node.
     pub(crate) adt_compatible: &'static [u8],
-    pub(crate) source_layout: super::board::data::SourceLayout,
     /// Qualified boot-loader handoffs.
     pub(crate) layouts: &'static [&'static FwLayout],
     /// Qualified firmware builds.
@@ -92,7 +91,6 @@ pub(crate) mod t8132 {
             counts: 0x0011010a,
         }],
         adt_compatible: b"gpu,t8132",
-        source_layout: super::super::board::data::SourceLayout::T8132,
         layouts: &[&FW_25G83, &FW_26B123],
         firmware: &[
             FirmwareBuild {
@@ -303,7 +301,7 @@ pub(crate) mod t8132 {
 
 /// T6030 (G15S), qualified with the b000 image loaded on J516s.
 pub(crate) mod t6030 {
-    use super::super::{board::data::SourceLayout, fw::initdata};
+    use super::super::fw::initdata;
     use super::{Config, FirmwareBuild, FwLayout, HwId, Scratch, FW_26B123, HOST_BLOCK, UPPER};
 
     pub(crate) const CONFIG: Config = Config {
@@ -321,7 +319,6 @@ pub(crate) mod t6030 {
             counts: 0x00110209,
         }],
         adt_compatible: b"gpu,t6030",
-        source_layout: SourceLayout::T6030,
         layouts: &[&LAYOUT],
         firmware: &[FirmwareBuild {
             name: "Apple GFX 26B123 G15S (build b000, iBoot-filled ranges zeroed)",

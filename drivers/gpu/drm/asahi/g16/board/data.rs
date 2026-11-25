@@ -1,18 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! Qualified selections of the original ADT's sixteen performance states for 25G83.
+//! Select firmware DVFS rows from this machine's ADT performance states.
 //!
-//! The firmware takes ten or eleven rows, each a main and an auxiliary frequency at one voltage.
-//! Every qualified layout maps the sixteen ADT states onto those rows by index; the values are
-//! always this machine's own, never frequencies or voltages copied from a reference machine.
-
-pub(crate) const SOURCE_STATES: usize = 16;
-
-#[derive(Clone, Copy)]
-pub(crate) enum SourceLayout {
-    T8132,
-    T6030,
-}
+//! Each row pairs a main and an auxiliary frequency at a shared voltage.
 
 /// One qualified mapping of the ADT states onto the first `rows` firmware rows.
 pub(crate) struct Layout {
@@ -45,9 +35,9 @@ pub(crate) const LAYOUTS: [Layout; 2] = [
     },
 ];
 
-// Three low states, then five equal-voltage pairs. The equal frequency at source
+// Four low states, then five equal-voltage pairs. The equal frequency at source
 // states 9 and 10 belongs to two voltage bins and is kept in both rows.
-const T6030_LAYOUT: Layout = Layout {
+const NINE_ROW_LAYOUT: Layout = Layout {
     name: "9-row",
     rows: 9,
     main: [0, 1, 2, 3, 5, 7, 9, 11, 13, 0, 0],
@@ -67,22 +57,13 @@ pub(crate) fn select(
 pub(crate) fn select_named(
     source: &super::super::adt::perf::Source,
 ) -> core::result::Result<(Performance, &'static str), super::super::adt::perf::Error> {
-    select_for(source, SourceLayout::T8132)
-}
-
-/// Selects firmware rows using the qualified layout for this SoC.
-pub(crate) fn select_for(
-    source: &super::super::adt::perf::Source,
-    layout: SourceLayout,
-) -> core::result::Result<(Performance, &'static str), super::super::adt::perf::Error> {
     use super::super::adt::perf::Error;
-    let (count, layouts) = match layout {
-        SourceLayout::T8132 => (SOURCE_STATES, LAYOUTS.as_slice()),
-        SourceLayout::T6030 => (14, core::slice::from_ref(&T6030_LAYOUT)),
+
+    let layouts = match source.count {
+        14 => core::slice::from_ref(&NINE_ROW_LAYOUT),
+        16 => LAYOUTS.as_slice(),
+        _ => return Err(Error::Shape),
     };
-    if source.count != count {
-        return Err(Error::Shape);
-    }
     for layout in layouts {
         match select_layout(source, layout) {
             Err(Error::Shape) => continue,

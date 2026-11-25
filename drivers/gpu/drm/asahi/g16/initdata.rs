@@ -107,7 +107,7 @@ pub(crate) fn build(
 ) -> Result<(InitData, Channels, u32)> {
     let abi = adt.layout.abi;
     let layout = adt.layout.initdata;
-    let performance = board::qualify(dev, adt, cfg.source_layout)?;
+    let performance = board::qualify(dev, adt)?;
     // The top row of the qualified table, excluding the off state.
     let ceiling = performance.count as u32 - 1;
     let rows = performance.count as u32;

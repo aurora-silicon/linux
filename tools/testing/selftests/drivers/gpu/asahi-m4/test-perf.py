@@ -159,12 +159,14 @@ fn j773g(core: [u32; 16], sram: [u32; 16]) -> perf::Source {
 }
 #[test]
 fn g15s_power_config_uses_the_encoded_ceiling_and_machine_adt_limiter() {
-    let mut performance = tables();
-    performance.count = 9;
-    performance.frequency[9..].fill(0);
-    performance.auxiliary[9..].fill(0);
-    performance.voltage[9..].fill(0);
-    performance.sram[9..].fill(0);
+    let mut sgx = source();
+    sgx.count = 14;
+    let (performance, shape) = data::select_named(&sgx).unwrap();
+    assert_eq!((performance.count, shape), (9, "9-row"));
+    assert_eq!(performance.frequency[8], sgx.frequency_mhz[13]);
+    assert_eq!(performance.auxiliary[8], sgx.frequency_mhz[12]);
+    sgx.core_mv[12] += 1;
+    assert_eq!(data::select(&sgx), Err(perf::Error::Shape));
 
     let layout = &wire::G15S_26B123;
     let mut input = input(performance);
