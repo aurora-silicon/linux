@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! Classic GPU support for T8132 G16G (25G83 and 26B123) and T6030 G15S (26B123).
+//! Classic GPU support for T8132 G16G (25G83 and 26B123), T6030 G15S (26B123) and T8122 G15G
+//! (26B123).
 //!
 //! Classic firmware uses one ring per engine (TA, FS, compute) and expresses ordering through
 //! in-ring barrier records that wait on another queue's stamp, unlike the G17 kick-ring/QID
@@ -14,9 +15,10 @@
 //!
 //! # Plugging into the shared driver
 //!
-//! - [`Driver`] matches `apple,agx-t8132` and `apple,agx-t6030`. T6030 selects this backend
-//!   through the boot loader's handoff marker. Probe links a handed-over native display and, on
-//!   T8132, the PMP supplier before booting firmware. It calls
+//! - [`Driver`] matches `apple,agx-t8132`, `apple,agx-t6030` and `apple,agx-t8122`. T6030 and
+//!   T8122 select this backend through the boot loader's handoff (marker, layout and, on
+//!   T8122, `apple,firmware-compat` 27.2; see [`adt::claims`]). Probe links a handed-over
+//!   native display and, on T8132, the PMP supplier before booting firmware. It calls
 //!   [`crate::driver::AsahiPlatformDriver::probe_g16`].
 //! - [`Gpu`] implements [`crate::gpu::Gpu`]: GET_PARAMS identity, VM creation (`new_vm`),
 //!   queues (`new_queue`, see [`queue`]) and timestamp buffers.
@@ -101,7 +103,7 @@ pub(crate) const DRIVER_NAME: &CStr = c_str!("aurora-g16");
 pub(crate) use hw::Config;
 
 /// OF match table of the G16 platform driver.
-const OF_TABLE: kernel::device_id::IdArray<of::DeviceId, &'static Config, 2> =
+const OF_TABLE: kernel::device_id::IdArray<of::DeviceId, &'static Config, 3> =
     kernel::device_id::IdArray::new([
         (
             of::DeviceId::new(c_str!("apple,agx-t8132")),
@@ -110,6 +112,10 @@ const OF_TABLE: kernel::device_id::IdArray<of::DeviceId, &'static Config, 2> =
         (
             of::DeviceId::new(c_str!("apple,agx-t6030")),
             &&hw::t6030::CONFIG,
+        ),
+        (
+            of::DeviceId::new(c_str!("apple,agx-t8122")),
+            &&hw::t8122::CONFIG,
         ),
     ]);
 
@@ -121,8 +127,15 @@ kernel::of_device_table!(
     [
         of::DeviceId::new(c_str!("apple,agx-t8132")),
         of::DeviceId::new(c_str!("apple,agx-t6030")),
+        of::DeviceId::new(c_str!("apple,agx-t8122")),
     ]
 );
+
+/// Whether this backend owns `dev` under the configuration of its compatible, so that another
+/// backend serving the same compatible steps aside.
+pub(crate) fn claims(dev: &device::Device, cfg: &Config) -> bool {
+    adt::claims(dev, cfg)
+}
 
 /// The G16 platform driver: the shared [`AsahiPlatformDriver`] probed through
 /// [`AsahiPlatformDriver::probe_g16`].
@@ -151,7 +164,7 @@ impl platform::Driver for Driver {
         info: Option<&'bound Self::IdInfo>,
     ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
         let cfg = *info.ok_or(ENODEV)?;
-        if cfg.needs_handoff_marker && !adt::has_handoff(pdev.as_ref()) {
+        if cfg.needs_handoff_marker && !adt::claims(pdev.as_ref(), cfg) {
             return Err(ENODEV);
         }
         dev_info!(pdev.as_ref(), "G16: probing\n");
