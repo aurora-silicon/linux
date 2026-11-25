@@ -2,6 +2,8 @@
 #ifndef _LINUX_SOC_APPLE_DISPLAY_H_
 #define _LINUX_SOC_APPLE_DISPLAY_H_
 
+#include <linux/errno.h>
+#include <linux/kconfig.h>
 #include <linux/of.h>
 #include <linux/string.h>
 #include <linux/types.h>
@@ -76,6 +78,32 @@ static inline bool apple_t6041_dcp_v27_2(const struct device_node *np)
 static inline bool apple_t6041_dcpext_v27_2(const struct device_node *np)
 {
 	return apple_t6041_dcp_any_v27_2(np, "apple,t6041-dcpext");
+}
+
+/*
+ * Software camera indicator (interim, not the secure indicator): a
+ * kernel-owned overlay on the internal panel, requested best-effort by the
+ * camera driver. set(true) returns 0 once the request is committed, without
+ * waiting for the present; a square no present carries within 1 s is
+ * withdrawn with a warning. The camera streams regardless of the answer.
+ */
+#if IS_ENABLED(CONFIG_DRM_APPLE)
+int apple_dcp_camera_indicator_set(struct device *dcp, bool on);
+#else
+static inline int apple_dcp_camera_indicator_set(struct device *dcp, bool on)
+{
+	return -ENODEV;
+}
+#endif
+
+/* T8122 internal DCP image shipped with macOS 27.2 (26B123). */
+#define APPLE_T8122_DCP_26B123_UUID "93FA4B31-BB97-3B2A-8673-49EA489EE9C1"
+
+/* The T8122 internal display processor, handed over on the 27.2 image. */
+static inline bool apple_t8122_dcp_v27_2(const struct device_node *np)
+{
+	return apple_dcp_image_v27_2(np, "apple,t8122-dcp",
+				     APPLE_T8122_DCP_26B123_UUID);
 }
 
 #endif

@@ -7,6 +7,11 @@ def oslog(root):
     source = (root / 'drivers/soc/apple/rtkit.c').read_text()
     constants = '\n'.join(line for line in source.splitlines()
                           if line.startswith('#define APPLE_RTKIT_OSLOG_'))
+    # The echo's predicate, where the receiver is built on one.
+    helpers = ''.join(block(source, marker) + '\n'
+                      for marker in ('static bool apple_rtkit_oslog_unanswered(',
+                                     'static bool apple_rtkit_oslog_echoed(')
+                      if marker in source)
     return r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -37,7 +42,7 @@ static int __attribute__((unused)) apple_rtkit_send_message(struct apple_rtkit *
 { (void)rtk; assert(ep==8 && !completion && !atomic); acks++; observed=msg; return 0; }
 static void apple_rtkit_common_rx_get_buffer(struct apple_rtkit *rtk, struct buffer *b, u8 ep, u64 msg)
 { assert(b==&rtk->oslog_buffer && ep==8); requests++; observed=msg; }
-''' + constants + '\n' + block(source, 'static void apple_rtkit_oslog_rx(') + r'''
+''' + constants + '\n' + helpers + block(source, 'static void apple_rtkit_oslog_rx(') + r'''
 static void reset(void) { warnings=notifications=requests=acks=errors=0; observed=0; }
 int main(void)
 {
@@ -97,9 +102,10 @@ def syslog(root):
     dcp = (root / 'drivers/gpu/drm/apple/dcp.c').read_text()
     header = (root / 'drivers/gpu/drm/apple/dcp-syslog.h').read_text()
     helper = header[header.index('static inline bool'):header.index('\n#endif')]
-    # The policy belongs only to the external H17P transport. Other RTKit
-    # clients, including the panel and older DCP firmware, keep info logging.
-    assert '.syslog_is_debug' not in block(dcp, 'static struct apple_rtkit_ops rtkit_ops =')
+    # The policy covers both DCP transports, the internal panel's and the
+    # external H17P one. It demotes only the known records it matches, so other
+    # records, other firmware and other RTKit clients keep info logging.
+    assert '.syslog_is_debug = dcp_rtk_syslog_is_debug' in block(dcp, 'static struct apple_rtkit_ops rtkit_ops =')
     assert '.syslog_is_debug = dcp_rtk_syslog_is_debug' in block(dcp, 'static const struct apple_rtkit_ops external_h17p_rtkit_ops =')
     return r'''
 #include <assert.h>
@@ -191,8 +197,16 @@ int main(void)
 
 def t6041_v27_admission(root):
     display_h = (root / 'include/linux/soc/apple/display.h').read_text()
-    helper = display_h[display_h.index('#define APPLE_T6041_DCP_26B123_UUID'):
-                       display_h.index('\n#endif')]
+    uuid_defines = [line for line in display_h.splitlines()
+                    if line.startswith(('#define APPLE_T6041_DCP_26B123_UUID ',
+                                        '#define APPLE_T8122_DCP_26B123_UUID ',
+                                        '#define APPLE_T8132_DCP_26B123_UUID '))]
+    assert len(uuid_defines) == 3
+    helper = '\n'.join((*uuid_defines, *(
+        block(display_h, 'static inline bool ' + name + '(') for name in (
+            'apple_dcp_image_v27_2', 'apple_t8132_dcp_v27_2',
+            'apple_t6041_dcp_any_v27_2', 'apple_t6041_dcp_v27_2',
+            'apple_t6041_dcpext_v27_2', 'apple_t8122_dcp_v27_2'))))
     iomfb_h = (root / 'drivers/gpu/drm/apple/iomfb.h').read_text()
     methods_decl = iomfb_h[iomfb_h.index('enum dcpep_method {'):
                            iomfb_h.index('#define IOMFB_MAX_CB')]
@@ -200,16 +214,21 @@ def t6041_v27_admission(root):
     v27_tables = v27_c[v27_c.index('static const struct dcp_method_entry dcp_methods_27_0'):
                        v27_c.index('/* The template\'s calls resolve through')]
     dcp_c = (root / 'drivers/gpu/drm/apple/dcp.c').read_text()
+    method_table = block(dcp_c, 'static enum dcp_firmware_version dcp_v27_method_table(')
     selector_full = block(dcp_c, 'static enum dcp_firmware_version dcp_check_firmware_version(')
     cutoff = '\n\tret = dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);\n\tif (ret < 0)'
     selector = selector_full[:selector_full.index(cutoff)] + '\n\t(void)v14_board;\n\treturn DCP_FIRMWARE_UNKNOWN;\n}\n'
-    method_table = block(dcp_c, 'static enum dcp_firmware_version dcp_v27_method_table(')
     # The T8132 dcpext admission keys on the processor and its image alone: no
     # of_machine_is_compatible() exists in this translation unit, so neither it nor
     # the T6041 helpers can depend on the machine.
     t8132_h = (root / 'include/linux/soc/apple/t8132.h').read_text()
     t8132_admission = block(t8132_h, 'static inline bool apple_t8132_dcpext_v27_2(')
     assert 'of_machine_is_compatible' not in t8132_admission
+    # Which processors join the DRM device: the T8132 internal DCP on the 27.2 image joins
+    # off the M4 backend's firmware path too, decided by the same handoff, not the board.
+    drv_c = (root / 'drivers/gpu/drm/apple/apple_drv.c').read_text()
+    usable = block(drv_c, 'static bool apple_dcp_usable(')
+    assert 'of_machine_is_compatible' not in usable
     return r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -243,6 +262,17 @@ static int of_device_is_compatible(const struct device_node *np, const char *s)
 {
     return np && np->compatible && !strcmp(np->compatible, s);
 }
+static bool of_device_is_available(const struct device_node *np)
+{
+    return np != NULL;
+}
+/* apple_dcp_usable()'s other processors: never reached by a T8132 node. */
+static bool dcp_t6030_ext_native(struct device_node *np)
+{ (void)np; assert(!"T6030 dcpext in a T8132 scenario"); return false; }
+static bool dcp_h17p_external_supported(struct device_node *np)
+{ (void)np; assert(!"T8140 dcpext in a T8132 scenario"); return false; }
+static bool dcp_t6041_ext_enabled(void)
+{ assert(!"T6041 dcpext in a T8132 scenario"); return false; }
 static bool of_property_present(const struct device_node *np, const char *name)
 {
     assert(!strcmp(name, "apple,clock-ids"));
@@ -319,7 +349,7 @@ static int dcp_read_fw_version(struct device *dev, const char *name, char *out)
     snprintf(out, DCP_FW_VERSION_STR_LEN, "%u.%u.%u", v[0], v[1], v[2]);
     return 3;
 }
-''' + helper + '\n' + methods_decl + '\n' + v27_tables + '\n' + t8132_admission + '\n' + method_table + '\n' + selector + r'''
+''' + helper + '\n' + methods_decl + '\n' + v27_tables + '\n' + t8132_admission + '\n' + method_table + '\n' + selector + '\n' + usable + r'''
 static struct device_node node;
 static struct apple_dcp_hw_data hw_t6041;
 static struct device dev = { .of_node = &node, .hw = &hw_t6041 };
@@ -396,6 +426,40 @@ int main(void)
         }
     }
     /*
+     * The M3 Air's (T8122) internal DCP handed over with its 27.2 image runs
+     * the 27.2 table, on any T8122 board; its dcpext, another image, its
+     * 14.x image and other releases do not.
+     */
+    static struct apple_dcp_hw_data hw_t8122;
+    dev.hw = &hw_t8122;
+    reset_t6041_26b123(false);
+    node.compatible = "apple,t8122-dcp";
+    node.uuid = APPLE_T8122_DCP_26B123_UUID;
+    assert(apple_t8122_dcp_v27_2(&node));
+    assert(!apple_t6041_dcp_v27_2(&node));
+    assert(dcp_check_firmware_version(&dev) == DCP_FIRMWARE_V_27_0);
+    node.compatible = "apple,t8122-dcpext";
+    assert(!apple_t8122_dcp_v27_2(&node));
+    assert(dcp_check_firmware_version(&dev) == DCP_FIRMWARE_UNKNOWN);
+    node.compatible = "apple,t8122-dcp";
+    node.uuid = APPLE_T6041_DCP_26B123_UUID;
+    assert(!apple_t8122_dcp_v27_2(&node));
+    assert(dcp_check_firmware_version(&dev) == DCP_FIRMWARE_UNKNOWN);
+    node.uuid = APPLE_T8122_DCP_26B123_UUID;
+    node.uuid_count = 0; assert(!apple_t8122_dcp_v27_2(&node));
+    node.uuid_count = 2; assert(!apple_t8122_dcp_v27_2(&node));
+    node.uuid_count = 1;
+    node.fw[0] = 14; node.fw[1] = 7; node.fw[2] = 0;
+    node.compat[0] = 14; node.compat[1] = 7; node.compat[2] = 0;
+    assert(!apple_t8122_dcp_v27_2(&node));
+    assert(dcp_check_firmware_version(&dev) == DCP_FIRMWARE_UNKNOWN);
+    node.fw[0] = 27; node.fw[1] = 2; node.fw[2] = 1;
+    node.compat[0] = 27; node.compat[1] = 2; node.compat[2] = 1;
+    assert(!apple_t8122_dcp_v27_2(&node));
+    node.fw[2] = 0; node.compat[2] = 0;
+    assert(apple_t8122_dcp_v27_2(&node));
+
+    /*
      * A T8132 processor of the M4 backend keeps it on the M4 firmware path
      * only; off it (a Mac mini booted from 27.2) nobody adopts or touches it.
      */
@@ -460,9 +524,11 @@ int main(void)
         assert(!apple_t8132_dcpext_v27_2(&node));
         assert(!apple_t6041_dcp_v27_2(&node));
         assert(dcp_check_firmware_version(&dev) == DCP_FIRMWARE_V_27_0);
+        assert(apple_dcp_usable(&node));
         node.clock_ids = false;
         assert(!apple_t8132_dcp_v27_2(&node));
         assert(dcp_check_firmware_version(&dev) == (path ? DCP_FIRMWARE_M4 : DCP_FIRMWARE_UNKNOWN));
+        assert(apple_dcp_usable(&node) == path);
         node.clock_ids = true;
     }
     t8132_firmware_path = true;
@@ -478,11 +544,26 @@ int main(void)
     assert(dcp_check_firmware_version(&dev) == DCP_FIRMWARE_M4);
     node.compat[1] = 2; assert(apple_t8132_dcp_v27_2(&node));
     t8132_firmware_path = false;
+    /* Off the M4 path another release keeps the internal DCP out of the DRM device. */
+    node.compat[1] = 0; assert(!apple_dcp_usable(&node));
+    node.compat[1] = 2; assert(apple_dcp_usable(&node));
+    /* A T8132 dcpext joins only on the 27.2 image, on either path. */
+    node.compatible = "apple,t8132-dcpext";
+    for (unsigned path = 0; path < 2; path++) {
+        t8132_firmware_path = path;
+        assert(apple_dcp_usable(&node));
+        node.uuid = APPLE_T6041_DCP_26B123_UUID;
+        assert(!apple_dcp_usable(&node));
+        node.uuid = APPLE_T8132_DCP_26B123_UUID;
+    }
+    t8132_firmware_path = false;
 
     dev.hw = &hw_t6041;
     puts("PASS T6041 26B123 v27.2 internal/external admission, refusal controls, and desktop 26.x preservation");
-    puts("PASS T8132 M4 backend only on its firmware path; the J773g dcpext on 27.2 alone runs the 27.2 table");
+    puts("PASS T8122 internal DCP on its 27.2 image alone runs the 27.2 table");
+    puts("PASS T8132 M4 backend only on its firmware path; a T8132 dcpext on the 27.2 image runs the 27.2 table on any board");
     puts("PASS T8132 internal DCP with the 27.2 image and its firmware-27 clocks runs the 27.2 table; without them nothing changes");
+    puts("PASS T8132 internal DCP on the 27.2 image joins the DRM device on any board; off the M4 path nothing else does");
     return 0;
 }
 '''

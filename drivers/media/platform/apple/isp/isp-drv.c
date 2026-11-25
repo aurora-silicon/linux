@@ -11,6 +11,7 @@
 #include <linux/of_address.h>
 #include <linux/of_device.h>
 #include <linux/of_reserved_mem.h>
+#include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
@@ -823,6 +824,19 @@ static int apple_isp_pm_notify(struct notifier_block *nb, unsigned long event,
 	return NOTIFY_DONE;
 }
 
+/*
+ * The node of the DCP presenting the software camera indicator
+ * (apple,camera-indicator), best-effort: the camera probes and streams without
+ * it. Not looked up without the DRM driver, which has nothing to ask. The DCP
+ * device is found when a stream starts, because it may probe after the ISP.
+ */
+static struct device_node *apple_isp_indicator_node(struct device *dev)
+{
+	if (!IS_ENABLED(CONFIG_DRM_APPLE))
+		return NULL;
+	return of_parse_phandle(dev->of_node, "apple,camera-indicator", 0);
+}
+
 static int apple_isp_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -844,6 +858,7 @@ static int apple_isp_probe(struct platform_device *pdev)
 
 	isp->dev = dev;
 	isp->hw = of_device_get_match_data(dev);
+	isp->dcp_np = apple_isp_indicator_node(dev);
 	platform_set_drvdata(pdev, isp);
 	dev_set_drvdata(dev, isp);
 
@@ -1035,6 +1050,8 @@ destroy_wq:
 detach_genpd:
 	apple_isp_detach_genpd(isp);
 free_isp:
+	put_device(isp->dcp);
+	of_node_put(isp->dcp_np);
 	kfree(isp->sensor_configs);
 	/* Nothing else can reach it before the video device is registered. */
 	kfree(isp);
@@ -1058,6 +1075,8 @@ static void apple_isp_remove(struct platform_device *pdev)
 	apple_isp_free_iommu(isp);
 	destroy_workqueue(isp->wq);
 	apple_isp_detach_genpd(isp);
+	put_device(isp->dcp);
+	of_node_put(isp->dcp_np);
 	/* Freed now, or when the last open file is closed. */
 	v4l2_device_put(&isp->v4l2_dev);
 }

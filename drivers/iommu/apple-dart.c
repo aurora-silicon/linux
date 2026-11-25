@@ -427,12 +427,6 @@ struct apple_dart {
 	/* Locked roots may hold firmware slots that mirror Linux mappings. */
 	u32 fw_mirror : 1;
 	/*
-	 * A firmware-27 display DART with locked roots (fw_mirror): the J713's
-	 * internal display DARTs and a J773g dcpext's, on the 27.2 image. Its
-	 * re-exported firmware segments take the live leaves' protection.
-	 */
-	u32 fw_live_prot : 1;
-	/*
 	 * fw_mirror's four-level locked roots hold firmware's own subtrees, which
 	 * are recorded and reserved (apple_dart_snapshot_fw_tree()). Set only for
 	 * apple,t6050-dart, where it was tested (the DCP's log and crash log). Before
@@ -902,6 +896,19 @@ MODULE_PARM_DESC(j713_dcp, "Enable explicit J713 DCP DART probe after arming wat
 static bool apple_dart_frontend_enabled;
 module_param_named(j713_display, apple_dart_frontend_enabled, bool, 0600);
 MODULE_PARM_DESC(j713_display, "Enable explicit J713 display DART admission after arming watchdog");
+
+/* The machine's first compatible string, for log lines that name the board. */
+static const char *apple_dart_board(void)
+{
+	struct device_node *root = of_find_node_by_path("/");
+	const char *board = NULL;
+
+	if (root) {
+		of_property_read_string(root, "compatible", &board);
+		of_node_put(root);
+	}
+	return board ?: "unknown board";
+}
 
 static int apple_dart_dcp_invalidate_tlb(struct apple_dart_stream_map *stream_map);
 
@@ -4556,32 +4563,35 @@ static void apple_dart_get_fw_resv_regions(struct device *dev,
 }
 
 /*
- * A firmware-27 display DART with locked roots (fw_live_prot: the J713's
- * internal display DARTs, a J773g dcpext's, on the 27.2 image): the boot loader
- * re-exports the firmware's own segments as iommu-addresses, which the core
- * maps read-write, and uncached for this non-coherent DCP. The firmware's
- * leaves say what those pages are: its text read-only, all of it cacheable.
- * A Linux table in a slot the firmware holds must mirror its leaves exactly
- * (apple_dart_fw_slot_mirrors()), so give each such region the protection the
+ * A fw_mirror DART (locked, no reserved-table handoff, not borrowed) on a
+ * three-level root: a boot loader may re-export the firmware's own segments
+ * as iommu-addresses, which the core maps read-write, and uncached for a
+ * non-coherent client such as a DCP. The firmware's leaves say what those
+ * pages are: its text read-only, all of it cacheable. A Linux table in a slot
+ * the firmware holds must mirror its leaves exactly (apple_dart_fw_slot_mirrors(),
+ * apple_dart_check_fw_map()), so give each such region the protection the
  * live leaves give every one of its pages. A region whose pages are not mapped
  * there, map elsewhere or disagree keeps its protection, and the attach then
- * refuses it as before.
+ * refuses it as before. A region whose protection already matches is left
+ * alone, so this changes only a mapping the attach would otherwise refuse.
  */
-static void __apple_dart_fw_live_prot(struct apple_dart_master_cfg *cfg, struct device *dev,
-					  struct list_head *head)
+static void __apple_dart_fw_mirror_prot(struct apple_dart_master_cfg *cfg,
+					struct device *dev, struct list_head *head)
 {
 	const int mask = IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE;
 	struct iommu_resv_region *region;
 	struct apple_dart *dart;
+	phys_addr_t table;
+	u64 *root, span, base;
 	size_t entries;
-	u64 *root;
-	u32 ttbr;
+	u32 ttbr, tcr = 0;
 	int sid;
 
 	if (!cfg || !cfg->stream_maps[0].dart || cfg->stream_maps[1].dart)
 		return;
 	dart = cfg->stream_maps[0].dart;
-	if (!dart->fw_live_prot || !dart->locked || dart->hw->fmt != APPLE_DART2)
+	if (!dart->fw_mirror || dart->fw_handoff || !dart->locked ||
+	    dart->hw->fmt != APPLE_DART2)
 		return;
 	entries = dart->pgsize / sizeof(u64);
 	sid = find_first_bit(cfg->stream_maps[0].sidmap, dart->num_streams);
@@ -4590,18 +4600,26 @@ static void __apple_dart_fw_live_prot(struct apple_dart_master_cfg *cfg, struct 
 		return;
 	if (pm_runtime_resume_and_get(dart->dev) < 0)
 		return;
+	/* Read both registers while the DART is held powered. */
 	ttbr = apple_dart_readl(dart, DART_TTBR(dart, sid, 0));
+	if (dart->hw->tcr_4level)
+		tcr = apple_dart_readl(dart, DART_TCR(dart, sid));
 	pm_runtime_put(dart->dev);
-	if (!(ttbr & dart->hw->ttbr_valid) ||
-	    (dart->hw->tcr_4level &&
-	     (apple_dart_readl(dart, DART_TCR(dart, sid)) & dart->hw->tcr_4level)))
+	if (!(ttbr & dart->hw->ttbr_valid) || (tcr & dart->hw->tcr_4level))
 		return;
 	ttbr &= ~dart->hw->ttbr_valid;
 	if (dart->hw->ttbr_addr_field_shift)
 		ttbr >>= dart->hw->ttbr_addr_field_shift;
-	root = memremap(((phys_addr_t)ttbr) << dart->hw->ttbr_shift, dart->pgsize, MEMREMAP_WB);
+	table = ((phys_addr_t)ttbr) << dart->hw->ttbr_shift;
+	/* Only a firmware table in reserved RAM is mapped write-back, as elsewhere. */
+	if (!apple_dart_fw_table_ram(dart, table))
+		return;
+	root = memremap(table, dart->pgsize, MEMREMAP_WB);
 	if (!root)
 		return;
+	/* A three-level root walks one span of the stream's window (DVA bits 14..35). */
+	span = BIT_ULL(ilog2(dart->pgsize) + 2 * ilog2(entries));
+	base = READ_ONCE(dart->locked_window[sid]) & ~(span - 1);
 
 	list_for_each_entry(region, head, list) {
 		u64 *leaf = NULL;
@@ -4610,6 +4628,10 @@ static void __apple_dart_fw_live_prot(struct apple_dart_master_cfg *cfg, struct 
 
 		if (region->type != IOMMU_RESV_TRANSLATED || !region->length ||
 		    !IS_ALIGNED(region->dva | region->start | region->length, dart->pgsize))
+			continue;
+		/* Outside the window the slot bits would alias another region's leaves. */
+		if (region->dva < base || region->length > span ||
+		    region->dva - base > span - region->length)
 			continue;
 		for (u64 off = 0; off < region->length; off += dart->pgsize) {
 			u64 dva = region->dva + off;	/* bits 14..35: the 1 TiB base drops out */
@@ -4622,9 +4644,8 @@ static void __apple_dart_fw_live_prot(struct apple_dart_master_cfg *cfg, struct 
 			if (slot != mapped_slot) {
 				if (leaf)
 					memunmap(leaf);
-				leaf = (entry & APPLE_DART_PTE_VALID) ?
-				       memremap(apple_dart_pte_to_paddr(dart, entry), dart->pgsize,
-						MEMREMAP_WB) : NULL;
+				leaf = apple_dart_fw_table_decode(dart, entry, &table) ?
+				       memremap(table, dart->pgsize, MEMREMAP_WB) : NULL;
 				mapped_slot = slot;
 			}
 			if (!leaf ||
@@ -4646,9 +4667,9 @@ static void __apple_dart_fw_live_prot(struct apple_dart_master_cfg *cfg, struct 
 	memunmap(root);
 }
 
-static void apple_dart_fw_live_prot(struct device *dev, struct list_head *head)
+static void apple_dart_fw_mirror_prot(struct device *dev, struct list_head *head)
 {
-	__apple_dart_fw_live_prot(dev_iommu_priv_get(dev), dev, head);
+	__apple_dart_fw_mirror_prot(dev_iommu_priv_get(dev), dev, head);
 }
 
 static void apple_dart_get_resv_regions(struct device *dev,
@@ -4680,7 +4701,7 @@ static void apple_dart_get_resv_regions(struct device *dev,
 
 	/* Keep the translated-domain requirement and inherited translations. */
 	iommu_dma_get_resv_regions(dev, head);
-	apple_dart_fw_live_prot(dev, head);
+	apple_dart_fw_mirror_prot(dev, head);
 	apple_dart_get_fw_resv_regions(dev, head);
 }
 
@@ -5457,17 +5478,27 @@ static bool apple_dart_np_is_iommu_of(const struct device_node *consumer,
 }
 
 /*
- * Whether @dart_np serves an available T8132 external display processor the
- * boot loader handed over with the 27.2 image (apple_t8132_dcpext_v27_2()):
- * its firmware DART (the processor's iommus) or its display DART (its PIODMA's).
+ * Whether @dart_np serves an available T8132 display processor compatible
+ * with @compat (the internal apple,t8132-dcp or an external
+ * apple,t8132-dcpext) that the boot loader handed over with its firmware
+ * clocks (apple,clock-ids: the ADT's /arm-io/disp0 ones on dcp, its pipe's on
+ * a dcpext): its firmware DART (the processor's iommus) or its display DART
+ * (its PIODMA's). Those clocks are what the firmware-27 backend needs and what
+ * tells its handoff from the M4 26.6.2 one, whose DARTs are borrowed. The
+ * DART is keyed on what uses it, not on its address, the board or the
+ * firmware build: a PMP DART is never named here, an idle main DCP (a Mac
+ * mini's) is not handed over, and a dcpext left to the 26.6.2 firmware-ready
+ * path gets no clocks.
  */
-static bool apple_dart_serves_t8132_dcpext_v27(const struct device_node *dart_np)
+static bool apple_dart_serves_t8132_dcp(const struct device_node *dart_np,
+					const char *compat)
 {
 	struct device_node *np, *child;
 	bool serves = false;
 
-	for_each_compatible_node(np, NULL, "apple,t8132-dcpext") {
-		if (serves || !of_device_is_available(np) || !apple_t8132_dcpext_v27_2(np))
+	for_each_compatible_node(np, NULL, compat) {
+		if (serves || !of_device_is_available(np) ||
+		    !of_property_present(np, "apple,clock-ids"))
 			continue;
 		serves = apple_dart_np_is_iommu_of(np, dart_np);
 		for_each_child_of_node(np, child)
@@ -5475,6 +5506,28 @@ static bool apple_dart_serves_t8132_dcpext_v27(const struct device_node *dart_np
 				serves = true;
 	}
 	return serves;
+}
+
+/*
+ * Whether a locked DART keeps its firmware's roots and mirrors Linux mappings
+ * into them (fw_mirror): it is locked, its boot loader handed over no reserved
+ * tables (fw_handoff), and no display driver borrows its live roots
+ * (preserve_display). That is the DART's own state; which DARTs take it is the
+ * SoC's (T6041, T6050, T8140, T8142: every one) or, on T8132, the DARTs of its
+ * handed-over internal or external display processors (@t8132_dcp). Other
+ * locked T8132 DARTs, the PMP's among them, keep the retained-root path they
+ * always had.
+ */
+static bool apple_dart_selects_fw_mirror(const struct apple_dart *dart,
+					 const struct device_node *np, bool t8132_dcp)
+{
+	if (!dart->locked || dart->fw_handoff || dart->preserve_display)
+		return false;
+	return of_device_is_compatible(np, "apple,t6041-dart") ||
+	       of_device_is_compatible(np, "apple,t6050-dart") ||
+	       of_device_is_compatible(np, "apple,t8140-dart") ||
+	       of_device_is_compatible(np, "apple,t8142-dart") ||
+	       t8132_dcp;
 }
 
 static int apple_dart_probe(struct platform_device *pdev)
@@ -5489,8 +5542,8 @@ static int apple_dart_probe(struct platform_device *pdev)
 	bool tunneled = dev->of_node->parent &&
 			 of_node_name_prefix(dev->of_node->parent,
 					     "usb4-pcie-tunnel-");
-	bool j713_display, j713_dcpext, j713_dispext, j713_radio, j713_display_v27 = false;
-	bool t8132_dcpext_v27, j713_dcpext_v27 = false;
+	bool j713_display, j713_dcpext, j713_dispext, j713_radio, t8132_dcp = false;
+	bool t8132_dcpext = false;
 
 	/*
 	 * The M4 internal display DARTs are live: DCP firmware (SID23)
@@ -5502,46 +5555,38 @@ static int apple_dart_probe(struct platform_device *pdev)
 		of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
 		(res->start == 0x30a300000ULL || res->start == 0x30a340000ULL);
 	/*
-	 * The internal DCP handed over with the 27.2 image runs the firmware-27
-	 * backend, which DMAs through ordinary domains (RTKit and IOMFB shared
-	 * memory, PIODMA maps) as on T6041. Its two display DARTs are then not
-	 * borrowed: they keep their firmware's locked roots the way T6041's do
-	 * (fw_mirror below). The borrowed path admits only the 26.6.2 layout
-	 * and reserves its whole SID23 window from generic DMA.
+	 * An internal DCP handed over with its firmware clocks runs the
+	 * firmware-27 backend, which DMAs through ordinary domains (RTKit and
+	 * IOMFB shared memory, PIODMA maps) as on T6041. Its two display DARTs
+	 * are then not borrowed: they keep their firmware's locked roots the way
+	 * T6041's do (fw_mirror below). The borrowed path admits only the 26.6.2
+	 * layout and reserves its whole SID23 window from generic DMA.
 	 */
-	if (j713_display && apple_t8132_internal_dcp_v27_2()) {
+	t8132_dcp = res && !tunneled &&
+		of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
+		apple_dart_serves_t8132_dcp(dev->of_node, "apple,t8132-dcp");
+	if (t8132_dcp)
 		j713_display = false;
-		j713_display_v27 = true;
-	}
-	/* The external DCP firmware DARTs (SID23) of dcpext0 and dcpext1. */
-	j713_dcpext = res && !tunneled && apple_t8132_firmware_path() &&
+	/*
+	 * An external display processor handed over the same way (the J773g's
+	 * HDMI dcpext0, an Air's USB-C dcpext0 and dcpext1) runs the same
+	 * backend on its own firmware and display DARTs, through ordinary
+	 * domains: they keep their firmware's locked roots the same way
+	 * (fw_mirror below) and must be locked. Decided first, by the handoff
+	 * of the processor that names the DART, on any board and either
+	 * firmware path: such a DART is never a borrowed 26.6.2 one.
+	 */
+	t8132_dcpext = res && !tunneled &&
+		of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
+		apple_dart_serves_t8132_dcp(dev->of_node, "apple,t8132-dcpext");
+	/* The borrowed 26.6.2 external DCP firmware DARTs (SID23) of dcpext0 and dcpext1. */
+	j713_dcpext = res && !tunneled && !t8132_dcpext && apple_t8132_firmware_path() &&
 		of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
 		(res->start == 0x286340000ULL || res->start == 0x48a340000ULL);
-	/* The external display DARTs (SID0/SID16) of dispext0 and dispext1. */
-	j713_dispext = res && !tunneled && apple_t8132_firmware_path() &&
+	/* The borrowed 26.6.2 external display DARTs (SID0/SID16) of dispext0 and dispext1. */
+	j713_dispext = res && !tunneled && !t8132_dcpext && apple_t8132_firmware_path() &&
 		of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
 		(res->start == 0x286300000ULL || res->start == 0x48a300000ULL);
-	/*
-	 * An Air's dcpext handed over with the 27.2 image runs the firmware-27
-	 * backend as the J773g's does, through ordinary domains: its firmware
-	 * and display DARTs are then not borrowed either, as the internal ones
-	 * are not (j713_display_v27). They must be locked.
-	 */
-	if ((j713_dcpext || j713_dispext) && apple_dart_serves_t8132_dcpext_v27(dev->of_node)) {
-		j713_dcpext = false;
-		j713_dispext = false;
-		j713_dcpext_v27 = true;
-	}
-	/*
-	 * A T8132 external display processor handed over with the 27.2 image
-	 * (the J773g's dcpext0, an Air's dcpext0 and dcpext1) runs the same firmware-27 backend on its own
-	 * firmware and display DARTs: when the boot loader left them locked,
-	 * they keep their firmware's roots the same way (fw_mirror below). Never
-	 * an Air's borrowed external DARTs.
-	 */
-	t8132_dcpext_v27 = res && !tunneled && !j713_dcpext && !j713_dispext &&
-		of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
-		apple_dart_serves_t8132_dcpext_v27(dev->of_node);
 	/* The radio DART's fault interrupt is not described by the loader. */
 	j713_radio = res && !tunneled && apple_t8132_managed_radio() &&
 		of_machine_is_compatible("apple,t8132") &&
@@ -5549,9 +5594,10 @@ static int apple_dart_probe(struct platform_device *pdev)
 		res->start == 0x490000000ULL;
 	/*
 	 * Off the qualified firmware nothing hands the internal display DARTs
-	 * over, but the running DCP still uses them: never reset them.
+	 * over, but the running DCP still uses them: never reset them. A DART
+	 * whose processor was handed over with its firmware clocks is handed over.
 	 */
-	if (res && !tunneled && !apple_t8132_firmware_path() &&
+	if (res && !tunneled && !t8132_dcp && !apple_t8132_firmware_path() &&
 	    of_machine_is_compatible("apple,t8132") &&
 	    of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
 	    (res->start == 0x30a300000ULL || res->start == 0x30a340000ULL)) {
@@ -6008,9 +6054,12 @@ params_done:
 			ret = -EINVAL;
 			goto err_clk_disable;
 		}
-		if (stream && (!of_machine_is_compatible("apple,j613") ||
-		    !of_device_is_compatible(dev->of_node, "apple,t8122-dart") ||
-		    res->start != 0x2fa808000ULL || !dart->supports_bypass ||
+		/*
+		 * Inherit the stream only if this DART can bypass and the boot
+		 * stage really left that stream in bypass: the TCR read back is
+		 * the hardware's own statement of the handoff, on any board.
+		 */
+		if (stream && (!dart->supports_bypass ||
 		    stream != 1 || stream >= dart->num_streams ||
 		    apple_dart_readl(dart, DART_TCR(dart, stream)) != dart->hw->tcr_bypass)) {
 			ret = -EINVAL;
@@ -6044,21 +6093,25 @@ params_done:
 	 * T6050's boot loader leaves every display DART locked on four-level
 	 * roots of its own (dart-dcpextN SID 23, dart-dispextN SIDs 0 and 16).
 	 */
-	dart->fw_mirror = dart->locked && !dart->fw_handoff &&
-		(of_device_is_compatible(dev->of_node, "apple,t6041-dart") ||
-		 of_device_is_compatible(dev->of_node, "apple,t6050-dart") ||
-		 of_device_is_compatible(dev->of_node, "apple,t8140-dart") ||
-		 of_device_is_compatible(dev->of_node, "apple,t8142-dart") ||
-		 j713_display_v27 || t8132_dcpext_v27);
-	if (j713_display_v27)
-		dev_info(dev, "J713 internal display DART on the 27.2 image: locked roots kept (%s)\n",
-			 dart->fw_mirror ? "mirror" : "NOT locked: refusing");
-	if (t8132_dcpext_v27)
-		dev_info(dev, "T8132 external display DART on the 27.2 image: %s\n",
-			 dart->fw_mirror ? "locked roots kept (mirror)" :
-			 j713_dcpext_v27 ? "NOT locked: refusing" : "not locked");
-	dart->fw_live_prot = j713_display_v27 || (t8132_dcpext_v27 && dart->fw_mirror);
-	if ((j713_display_v27 || j713_dcpext_v27) && !dart->fw_mirror) {
+	dart->fw_mirror = apple_dart_selects_fw_mirror(dart, dev->of_node,
+						       t8132_dcp || t8132_dcpext);
+	/*
+	 * The firmware-27 backend runs on the locked roots alone: a DART that
+	 * is not locked, or whose boot loader also handed over reserved tables,
+	 * is not the handoff it was written for. Refuse either, saying which.
+	 */
+	if (t8132_dcp || t8132_dcpext) {
+		const char *what = t8132_dcp ? "internal" : "external";
+
+		if (dart->fw_mirror)
+			dev_info(dev, "T8132 %s display DART: locked roots kept (mirror)\n", what);
+		else if (!dart->locked)
+			dev_err(dev, "T8132 %s display DART: NOT locked: refusing\n", what);
+		else
+			dev_err(dev, "T8132 %s display DART: locked with a reserved-table handoff: refusing\n",
+				what);
+	}
+	if ((t8132_dcp || t8132_dcpext) && !dart->fw_mirror) {
 		ret = -EINVAL;
 		goto err_clk_disable;
 	}
@@ -6125,8 +6178,8 @@ params_done:
 			ret = -EINVAL;
 			goto err_clk_disable;
 		}
-		dev_info(dev, "J713 display DART version %04x, locked %d\n",
-			 dart->version, dart->locked);
+		dev_info(dev, "%s display DART version %04x, locked %d\n",
+			 apple_dart_board(), dart->version, dart->locked);
 		ret = res->start == 0x30a340000ULL || j713_dcpext ?
 			apple_dart_dcp_prepare(dart) :
 			dart->dispext ? apple_dart_dispext_prepare(dart) :
@@ -6848,13 +6901,17 @@ static __maybe_unused int apple_dart_suspend(struct device *dev)
  * controller in host mode, holds the domain on. Such a consumer may still be
  * doing DMA, so the DART must not be reset under it.
  */
-static bool apple_dart_state_retained(struct apple_dart *dart)
+static bool apple_dart_state_retained_except(struct apple_dart *dart, u64 skip)
 {
 	bool live = false;
 	unsigned int sid, idx;
 
 	for (sid = 0; sid < dart->num_streams; sid++) {
-		u32 tcr = apple_dart_readl(dart, DART_TCR(dart, sid));
+		u32 tcr;
+
+		if (sid < 64 && (skip & BIT_ULL(sid)))
+			continue;
+		tcr = apple_dart_readl(dart, DART_TCR(dart, sid));
 
 		if (tcr != dart->save_tcr[sid]) {
 			if (dart->host_off_slept)
@@ -6870,6 +6927,9 @@ static bool apple_dart_state_retained(struct apple_dart *dart)
 			u32 ttbr = apple_dart_readl(dart, DART_TTBR(dart, sid, idx));
 
 			if (ttbr != dart->save_ttbr[sid][idx]) {
+				/* Without its valid bit a TTBR translates nothing: not a loss. */
+				if (!((ttbr | dart->save_ttbr[sid][idx]) & dart->hw->ttbr_valid))
+					continue;
 				if (dart->host_off_slept)
 					dev_info(dart->dev, "SID%u TTBR%u %08x, had %08x\n",
 						 sid, idx, ttbr, dart->save_ttbr[sid][idx]);
@@ -6885,6 +6945,98 @@ static bool apple_dart_state_retained(struct apple_dart *dart)
 	 * none has a valid page table.
 	 */
 	return live;
+}
+
+static bool apple_dart_state_retained(struct apple_dart *dart)
+{
+	return apple_dart_state_retained_except(dart, 0);
+}
+
+/*
+ * Before the state check of a power-up after a real sleep. The wake rebuilds a
+ * DCP's DART as iBoot set it up, not as this kernel left it at power-down: on
+ * the J604 the internal display DART comes back with SID6 TTBR0 0x01000000,
+ * 0x01200000 or 0x03200000 where its power-down state had 0, while SID6 keeps
+ * the TCR iBoot gave it (TRANSLATE_ENABLE) and stays off.
+ *
+ * Only a stream with a valid page table of this kernel's at power-down holds
+ * state that can be lost: the tables live in memory and the retained DCP
+ * session maps through them. Such a stream gets its saved TCR and TTBRs written
+ * back and stays in the check, so it fails if the DART does not take them. Any
+ * other stream is put back as it was and left out of the check. A stream the
+ * wake turned on that was off at power-down goes off again, so the stream
+ * enable at power-up reads back as saved.
+ *
+ * A DART whose TTBRs and TCRs were protected and locked at power-down (the
+ * J604's internal display DART, adopted from iBoot with no writes) is not
+ * written: its streams without a table of ours are iBoot's and stay as the wake
+ * handed them over, as iBoot's boot did, unless such a stream was on at
+ * power-down and now has a valid table: power-up would enable it through a
+ * table this kernel does not know, so it stays in the check.
+ */
+static __maybe_unused u64 apple_dart_slept_restore(struct apple_dart *dart)
+{
+	unsigned int sid, idx, n = min_t(unsigned int, dart->num_streams, 32);
+	u32 enabled = readl(dart->regs + DART_T8110_ENABLE_STREAMS);
+	u32 extra = enabled & ~dart->off_streams;
+	bool locked = dart->off_protect & dart->off_lock & DART_T8110_PROTECT_TTBR_TCR;
+	u64 skip = 0;
+
+	if (n < 32)
+		extra &= GENMASK(n - 1, 0);
+	for (sid = 0; sid < dart->num_streams; sid++) {
+		u32 tcr = apple_dart_readl(dart, DART_TCR(dart, sid));
+		u32 ttbr0 = apple_dart_readl(dart, DART_TTBR(dart, sid, 0));
+		bool ours = false, live = false, held = tcr == dart->save_tcr[sid];
+		bool was_on = sid < 32 && (dart->off_streams & BIT(sid));
+
+		for (idx = 0; idx < dart->hw->ttbr_count; idx++) {
+			u32 ttbr = apple_dart_readl(dart, DART_TTBR(dart, sid, idx));
+
+			ours |= !!(dart->save_ttbr[sid][idx] & dart->hw->ttbr_valid);
+			live |= !!(ttbr & dart->hw->ttbr_valid);
+			held &= ttbr == dart->save_ttbr[sid][idx];
+		}
+		if (held && !(sid < 32 && (extra & BIT(sid))))
+			continue;
+
+		if (!locked && !held) {
+			/* A TCR the wake changed: translation off, the tables, then the TCR. */
+			if (tcr != dart->save_tcr[sid])
+				apple_dart_writel(dart, dart->hw->tcr_disabled,
+						  DART_TCR(dart, sid));
+			for (idx = 0; idx < dart->hw->ttbr_count; idx++)
+				apple_dart_writel(dart, dart->save_ttbr[sid][idx],
+						  DART_TTBR(dart, sid, idx));
+			if (tcr != dart->save_tcr[sid])
+				apple_dart_writel(dart, dart->save_tcr[sid], DART_TCR(dart, sid));
+			held = apple_dart_readl(dart, DART_TCR(dart, sid)) == dart->save_tcr[sid];
+			for (idx = 0; idx < dart->hw->ttbr_count; idx++)
+				held &= apple_dart_readl(dart, DART_TTBR(dart, sid, idx)) ==
+					dart->save_ttbr[sid][idx];
+		}
+		dev_dbg(dart->dev,
+			"SID%u after the wake: on %d (had %d), TCR %08x (had %08x), TTBR0 %08x (had %08x): %s\n",
+			sid, sid < 32 && (enabled & BIT(sid)), was_on,
+			tcr, dart->save_tcr[sid], ttbr0, dart->save_ttbr[sid][0],
+			ours ? (held ? "ours, as saved" : locked ? "ours, locked, not written" :
+				"ours, write not taken") :
+			locked ? (was_on && live ?
+				  "not ours, locked, on with a valid table: checked" :
+				  "not ours, locked: left as the wake set it") :
+			held ? "not ours, put back" : "not ours, write not taken");
+		if (ours || sid >= 64)
+			continue;
+		if (locked ? !(was_on && live) :
+		    held || apple_dart_readl(dart, DART_TCR(dart, sid)) == dart->hw->tcr_disabled)
+			skip |= BIT_ULL(sid);
+	}
+	if (extra) {
+		dev_dbg(dart->dev, "streams %08x turned on by the wake, off at power-down: turned off\n",
+			extra);
+		apple_dart_writel(dart, extra, DART_T8110_DISABLE_STREAMS);
+	}
+	return skip;
 }
 
 /*
@@ -7545,7 +7697,8 @@ static int apple_dart_host_power_on(struct apple_dart *dart)
 	if ((!dart->host_off_slept && readl(dart->regs + DART_T8110_ENABLE_STREAMS)) ||
 	    readl(dart->regs + DART_T8110_PROTECT) != dart->off_protect ||
 	    readl(dart->regs + DART_T8110_PROTECT_LOCK) != dart->off_lock ||
-	    !apple_dart_state_retained(dart))
+	    !apple_dart_state_retained_except(dart, dart->host_off_slept ?
+					      apple_dart_slept_restore(dart) : 0))
 		goto fail;
 	dart->host_off_slept = false;
 	why = "commands";
@@ -7829,6 +7982,29 @@ int apple_dart_display_streams(struct device *dev, u32 streams, bool on, bool fl
 	return 0;
 }
 EXPORT_SYMBOL_GPL(apple_dart_display_streams);
+
+/*
+ * The streams a T8110 display DART has enabled, read while its domain is up: what a DCP
+ * whose device tree names no streams stops and enables again around its power cycle. The
+ * mask holds streams 0 to 31; a DART with any stream above them enabled can't be described
+ * by it and reads 0, which its caller takes as no streams to stop.
+ */
+u32 apple_dart_enabled_streams(struct device *dev)
+{
+	struct apple_dart *dart = dev_get_drvdata(dev);
+	unsigned int i;
+
+	if (!dart || dart->hw->type != DART_T8110)
+		return 0;
+	for (i = 1; i < DIV_ROUND_UP(dart->num_streams, 32); i++) {
+		if (readl(dart->regs + DART_T8110_ENABLE_STREAMS + 4 * i)) {
+			dev_warn_once(dart->dev, "streams above 31 enabled: not reported\n");
+			return 0;
+		}
+	}
+	return readl(dart->regs + DART_T8110_ENABLE_STREAMS);
+}
+EXPORT_SYMBOL_GPL(apple_dart_enabled_streams);
 
 /*
  * A DART whose domain goes off with its consumer's, at runtime, while other users still map
