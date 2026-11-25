@@ -815,6 +815,11 @@ struct apple_sleep_soc {
 	 * the commit (apple_sleep.early_wfi): XNU's order (T8142, J813 ten-core trace).
 	 */
 	bool early_cpu_wfi;
+	/*
+	 * macOS writes none of WD2's registers going to sleep here: no suspend watchdog is set,
+	 * and none is left running into the sleep.
+	 */
+	bool no_wd2;
 };
 
 struct apple_sleep {
@@ -6688,7 +6693,7 @@ static int apple_sleep_begin(suspend_state_t state)
 		apple_sleep->smc_woke_alone = false;
 		sleep_pins_save(apple_sleep);
 	}
-	{
+	if (!apple_sleep->soc->no_wd2) {
 		unsigned long flags;
 
 		spin_lock_irqsave(&apple_sleep_wdt_lock, flags);
@@ -6712,7 +6717,7 @@ static void apple_sleep_end(void)
 	/* Nothing left by now after a wake; the platform wake takes it */
 	if (pm_suspend_via_firmware() && apple_sleep->soc->ops->pmu_wake)
 		apple_sleep->soc->ops->pmu_wake(apple_sleep);
-	if (pm_suspend_via_firmware())
+	if (pm_suspend_via_firmware() && !apple_sleep->soc->no_wd2)
 		apple_sleep_wdt_end(apple_sleep->wdt);
 }
 
