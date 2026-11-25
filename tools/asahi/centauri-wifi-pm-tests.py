@@ -64,6 +64,7 @@ struct centauri_t6050 { struct pci_dev *pdev; struct centauri_t6050_wifi *wifi; 
 struct wiphy { struct centauri_t6050_wifi *wifi; };
 struct net_device { int unused; };
 struct cfg80211_wowlan { bool any; };
+struct regulatory_request { char alpha2[3]; };
 '''
 
 STUBS = r'''
@@ -75,6 +76,11 @@ struct centauri_t6050_wifi {
     bool reply_valid, pm_prepared, pm_wowlan_armed;
     bool data_tx_busy[DATA_TX_SLOTS];
     bool host_events_fallback_logged;
+    bool configured, tx_paused, transport_paused, host_sleep_sent, transport_sleep_sent;
+    bool regulatory_deferred, station_signal_valid, disconnect_event;
+    u8 country_deferred[3], hw_channels[4];
+    int hw_channels_blob, data_rings_open;
+    struct net_device *netdev;
     u16 command_head, sequence, reply_capture, reply_sequence, reply_status;
     u32 reply_command;
     u8 *reply_buffer;
@@ -83,6 +89,9 @@ struct centauri_t6050_wifi {
 };
 static const u16 ring_size[5] = {0, 64};
 static unsigned int doorbells, drains, notifications, consumer, tx_drain_rounds, info_logs;
+static unsigned int reads, index_reads, reports, applies;
+static bool rtnl_held, fail_firmware_report;
+#define ASSERT_RTNL() assert(rtnl_held)
 static void dev_info(const void *dev, const char *fmt, ...)
 { (void)dev; (void)fmt; info_logs++; }
 static u16 firmware_status, last_cmd6_tlv280_len, mock_fw_transient_status;
@@ -98,10 +107,11 @@ static void mutex_unlock(int *lock) { assert(*lock); *lock = 0; }
 static void *wiphy_priv(struct wiphy *wiphy)
 { assert(!private_access_forbidden); return &wiphy->wifi; }
 static void usleep_range(int a, int b) { (void)a; (void)b; jiffies += 100; }
-static unsigned int readl(void *address) { (void)address; return transport_mode == LOST ? 0 : 2; }
+static unsigned int readl(void *address)
+{ (void)address; reads++; return transport_mode == LOST ? 0 : 2; }
 static void writel(unsigned int value, void *address) { (void)value; (void)address; doorbells++; }
 static u16 index_read(struct centauri_t6050_wifi *wifi, int array, int index)
-{ assert(wifi->lock); (void)array; (void)index; return consumer; }
+{ assert(wifi->lock); (void)array; (void)index; index_reads++; return consumer; }
 static void index_write(struct centauri_t6050_wifi *wifi, int array, int index, u16 value)
 { assert(wifi->lock); (void)array; (void)index; (void)value;
   if (submission_probe) assert(*submission_probe); }
@@ -142,7 +152,12 @@ static void drain(struct centauri_t6050_wifi *wifi)
     if (!wifi->reply_valid) {
         wifi->reply_valid = true;
         wifi->reply_sequence = wifi->reply_capture + wrong_reply;
-        wifi->reply_command = mock_reply_command | (async_reply ? BIT(30) : 0);
+        const u8 *packet = wifi->a.window + TX_BUFFER +
+                           ((wifi->command_head + ring_size[1] - 1) % ring_size[1]) * BUFFER_SIZE;
+        u32 command_id;
+        memcpy(&command_id, packet + 0x14, sizeof(command_id));
+        wifi->reply_command = (mock_reply_command ? mock_reply_command : command_id) |
+                              (async_reply ? BIT(30) : 0);
         if (mock_reply_command == 6 && mock_fw_transient_status) {
             wifi->reply_status = mock_fw_transient_status;
             mock_fw_transient_status = 0;
@@ -166,6 +181,21 @@ static void skb_queue_purge(int *queue) { (void)queue; }
 static void cfg80211_disconnected(struct net_device *netdev, u16 reason, void *ie,
                                   int size, bool local, int flags)
 { (void)netdev; (void)reason; (void)ie; (void)size; (void)local; (void)flags; notifications++; }
+static int alpha_transport_state(struct centauri_t6050_wifi *wifi, bool asleep)
+{ assert(wifi->lock && !asleep); return 0; }
+static bool netif_running(struct net_device *netdev) { (void)netdev; return false; }
+static void netif_wake_queue(struct net_device *netdev) { (void)netdev; }
+static void schedule_work(int *work) { (void)work; }
+static void firmware_report(struct centauri_t6050_wifi *wifi, u32 id, u8 *buffer, int *blob)
+{
+    assert(wifi->lock && rtnl_held && id == 19);
+    assert(buffer == wifi->hw_channels && blob == &wifi->hw_channels_blob);
+    reports++;
+    if (fail_firmware_report)
+        command_fault(wifi);
+}
+static void channels_apply(struct centauri_t6050_wifi *wifi)
+{ assert(wifi->lock && rtnl_held); applies++; }
 '''
 
 TESTS = r'''
@@ -186,6 +216,8 @@ static void reset(void)
     wifi.connected = true;
     wiphy.wifi = &wifi;
     doorbells = drains = notifications = consumer = tx_drain_rounds = info_logs = 0;
+    reads = index_reads = reports = applies = 0;
+    rtnl_held = fail_firmware_report = false;
     firmware_status = last_cmd6_tlv280_len = mock_fw_transient_status = 0;
     mock_reply_command = 131073;
     mock_fw_max_events = last_cmd6_tlv280_count = 0;
@@ -229,9 +261,79 @@ static void test_registered_pm_contract(void)
     }
 }
 
+static void test_host_sleep_gate(void)
+{
+    bool published = true;
+
+    reset();
+    wifi.host_sleep_sent = true;
+    mutex_lock(&wifi.lock);
+    assert(command_reply(&wifi, 9, NULL, 0, NULL, NULL, &published) == -EHOSTDOWN);
+    mutex_unlock(&wifi.lock);
+    assert(!published && !index_reads && !doorbells && !drains && !reads);
+    assert(!wifi.sequence && !wifi.command_failed);
+}
+
+static void test_deferred_regulatory(void)
+{
+    struct regulatory_request us = { .alpha2 = "US" };
+    struct regulatory_request ca = { .alpha2 = "CA" };
+    struct regulatory_request world = { .alpha2 = "00" };
+
+    reset();
+    wifi.configured = true;
+    wifi.host_sleep_sent = wifi.transport_sleep_sent = true;
+    mock_reply_command = 0;
+    rtnl_held = true;
+    wifi_regulatory(&wiphy, &world);
+    wifi_regulatory(&wiphy, &ca);
+    wifi_regulatory(&wiphy, &us);
+    wifi_regulatory(&wiphy, &world);
+    assert(!index_reads && !doorbells && !drains && !reads && !reports && !applies && !wifi.lock);
+    assert(wifi.regulatory_deferred && !memcmp(wifi.country_deferred, "US\1", 3));
+
+    mutex_lock(&wifi.lock);
+    firmware_status = 1;
+    assert(alpha_resume_locked(&wifi) == -EREMOTEIO);
+    assert(wifi.host_sleep_sent && wifi.regulatory_deferred && !reports && !applies);
+    doorbells = 0;
+    firmware_status = 0;
+    assert(alpha_resume_locked(&wifi) == 0);
+    assert(!wifi.host_sleep_sent && !wifi.regulatory_deferred && !wifi.country_deferred[0]);
+    assert(doorbells == 2 && reports == 1 && applies == 1);
+    assert(!memcmp(wifi.a.window + TX_BUFFER + (wifi.command_head - 1) * BUFFER_SIZE + 24,
+                   "US\1", 3));
+    assert(alpha_resume_locked(&wifi) == 0);
+    assert(doorbells == 2 && reports == 1 && applies == 1);
+    mutex_unlock(&wifi.lock);
+
+    wifi_regulatory(&wiphy, &ca);
+    assert(doorbells == 3 && reports == 2 && applies == 2);
+    wifi_regulatory(&wiphy, &world);
+    assert(doorbells == 3 && reports == 2 && applies == 3);
+
+    wifi.host_sleep_sent = true;
+    wifi_regulatory(&wiphy, &world);
+    assert(wifi.regulatory_deferred && !wifi.country_deferred[0]);
+    mutex_lock(&wifi.lock);
+    assert(alpha_resume_locked(&wifi) == 0);
+    mutex_unlock(&wifi.lock);
+    assert(doorbells == 4 && reports == 2 && applies == 4);
+
+    wifi.host_sleep_sent = wifi.transport_paused = wifi.tx_paused = true;
+    wifi_regulatory(&wiphy, &us);
+    fail_firmware_report = true;
+    mutex_lock(&wifi.lock);
+    assert(alpha_resume_locked(&wifi) == -EIO);
+    mutex_unlock(&wifi.lock);
+    assert(wifi.command_failed && wifi.transport_paused && wifi.tx_paused);
+}
+
 int main(void)
 {
     test_registered_pm_contract();
+    test_host_sleep_gate();
+    test_deferred_regulatory();
     prepare();
     assert(!wifi.pm_disconnect.seen);
     expect_error(0); /* Missing transaction remains missing. */
@@ -443,7 +545,8 @@ def main():
              "centauri_t6050_wifi_pm_prepare", "centauri_t6050_wifi_pm_error",
              "centauri_t6050_wifi_pm_disconnected", "centauri_t6050_wifi_wowlan_armed",
              "centauri_t6050_wifi_mark_failed", "centauri_t6050_wifi_pm_complete",
-             "alpha_host_power_send", "alpha_host_power", "wifi_suspend"]
+             "alpha_host_power_send", "alpha_host_power", "country_set",
+             "alpha_resume_locked", "wifi_regulatory", "wifi_suspend"]
     has_resume = bool(re.search(r"^static int wifi_resume\(", source, re.M))
     if has_resume:
         names.append("wifi_resume")
@@ -503,6 +606,12 @@ static int call_registered_resume(struct wiphy *wiphy)
         ("silent-fallback-log",
          "if (!ret && !wifi->host_events_fallback_logged)",
          "if (false && !ret && !wifi->host_events_fallback_logged)"),
+        ("host-sleep-command", "\tif (wifi->host_sleep_sent)\n\t\treturn -EHOSTDOWN;\n", ""),
+        ("regulatory-in-sleep", "if (wifi->host_sleep_sent) {\n\t\t/* Keep the last",
+         "if (false) {\n\t\t/* Keep the last"),
+        ("lost-deferred-country", "country_set(wifi, wifi->country_deferred);", "(void)wifi;"),
+        ("ignored-regulatory-transport-loss",
+         "if (wifi->command_failed)\n\t\t\treturn -EIO;", "if (false)\n\t\t\treturn -EIO;"),
     ]
     failures = {
         'lost-suspend-error': 'centauri_t6050_wifi_pm_error(&control) == expected',
@@ -511,6 +620,10 @@ static int call_registered_resume(struct wiphy *wiphy)
         'wowlan-ignores-trigger': 'call_registered_suspend(&wiphy, &wowlan) == 1',
         'sleep-uses-full-len': 'alpha_host_power(&wifi, true) == 0',
         'silent-fallback-log': 'info_logs == 1',
+        'host-sleep-command': 'command_reply(&wifi, 9, NULL, 0, NULL, NULL, &published) == -EHOSTDOWN',
+        'regulatory-in-sleep': '!index_reads && !doorbells && !drains && !reads && !reports && !applies',
+        'lost-deferred-country': 'doorbells == 2 && reports == 1 && applies == 1',
+        'ignored-regulatory-transport-loss': 'alpha_resume_locked(&wifi) == -EIO',
     }
     for name, before, after in negative_controls if args.negative_controls else []:
         if before not in production:
