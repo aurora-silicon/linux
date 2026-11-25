@@ -249,7 +249,7 @@ impl gpu::Gpu for G18DrmGpu {
     /// at screen creation and enables timer queries only if this works. G18
     /// publishes timestamps from the CPU after retirement, so the buffer needs
     /// no firmware mapping.
-    fn map_timestamp_buffer(&self, bo: gem::ObjectRef, range: Range<usize>)
+    fn map_timestamp_buffer(&self, bo: gem::ObjectRef, range: Range<usize>, _window: crate::timestamp::WindowPermit)
         -> Result<timestamp::Buffer> {
         if self.is_crashed() { return Err(ENODEV); }
         if range.is_empty() { return Err(EINVAL); }

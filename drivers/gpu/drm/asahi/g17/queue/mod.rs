@@ -203,7 +203,7 @@ impl<B: Backend> Queue<B> {
         self.frontiers.iter().enumerate().any(|(index, frontier)| {
             frontier.iter().any(|(sequence, fences)| {
                 Order::contains(order.wait_through[index], *sequence)
-                    && fences.publication.is_some()
+                    && fences.publication.as_ref().is_some_and(|p| p.is_pending())
                     && fences.status() <= 0
             })
         })
@@ -265,7 +265,8 @@ impl<B: Backend> Queue<B> {
             })
             && self.frontiers[1].iter().all(|(sequence, fences)| {
                 !Order::contains(order.wait_through[1], *sequence)
-                    || (fences.ready.raw() != fences.completed.raw() && fences.publication.is_none())
+                    || (fences.ready.raw() != fences.completed.raw()
+                        && !fences.publication.as_ref().is_some_and(|p| p.is_pending()))
                     || fences.status() > 0
             })
             && self.failures.iter_mut().enumerate().all(|(index, failure)| {
@@ -294,7 +295,6 @@ impl<B: Backend> Queue<B> {
                 order,
                 engine,
                 host_waits,
-                has_outputs,
                 query_access,
             )?;
             let completion = Completion::new(
@@ -635,52 +635,51 @@ impl<B: Backend> Drop for Queue<B> {
 
 /// Whether a cross-engine consumer must wait on the host for a covered
 /// producer's completion fence before scheduling.
+///
+/// Only query-accessing compute commands can read or reset timestamp words on
+/// the GPU. Timestamp-writing renders (whose firmware timestamp window is
+/// disabled whenever chained behind predecessors) and `NO_QUERY_ACCESS` compute
+/// commands write all timestamps on the host inside ordered
+/// [`Publication::publish`], so they overlap in firmware and chain publication
+/// instead of draining the GPU.
 const fn cross_engine_wait_completed(
     host_waits: bool,
-    has_outputs: bool,
     engine: Engine,
     query_access: bool,
-    has_publication: bool,
+    has_pending_publication: bool,
 ) -> bool {
     if host_waits {
         return true;
     }
-    if !has_publication {
-        return false;
-    }
-    has_outputs || (matches!(engine, Engine::Compute) && query_access)
+    has_pending_publication && matches!(engine, Engine::Compute) && query_access
 }
 
 /// Whether a cross-engine consumer overlaps execution with a producer that has
-/// ordered host publication and therefore chains its completion behind it.
+/// pending ordered host publication and therefore chains its completion behind it.
 const fn cross_engine_chain_publication(
     host_waits: bool,
-    has_outputs: bool,
     engine: Engine,
     query_access: bool,
 ) -> bool {
-    !host_waits && !has_outputs && !(matches!(engine, Engine::Compute) && query_access)
+    !host_waits && !(matches!(engine, Engine::Compute) && query_access)
 }
 
 /// Whether a same-engine consumer must wait on the host for covered same-engine
-/// predecessors that have ordered host publication: query-accessing compute may
-/// read or write, on the GPU, query words whose host publication is still
-/// pending, and timestamp-writing renders can write their fragment-end
-/// timestamp window on the GPU before a transitive cross-engine producer
-/// finishes its deferred host write or error publication.
-const fn same_engine_wait_completed(
-    engine: Engine,
-    has_outputs: bool,
-    query_access: bool,
-) -> bool {
-    (matches!(engine, Engine::Compute) && query_access)
-        || (matches!(engine, Engine::Render) && has_outputs)
+/// predecessors with pending ordered host publication: query-accessing compute
+/// may read or reset query words on the GPU whose host publication is still
+/// pending. Timestamp-writing renders disable their firmware timestamp window
+/// when chained behind predecessors and write on the host in publication order.
+const fn same_engine_wait_completed(engine: Engine, query_access: bool) -> bool {
+    matches!(engine, Engine::Compute) && query_access
 }
 
 trait FrontierEntry {
     fn status(&self) -> i32;
     fn ready_is_completed(&self) -> bool;
     fn publication(&self) -> Option<&Arc<Publication>>;
+    fn pending_publication(&self) -> Option<&Arc<Publication>> {
+        self.publication().filter(|publication| publication.is_pending())
+    }
     fn completed(&self) -> &Fence;
     fn scheduled(&self) -> &Fence;
 }
@@ -720,7 +719,6 @@ impl<'a> EnqueueOrdering<'a> {
         order: Order,
         engine: Engine,
         host_waits: bool,
-        has_outputs: bool,
         query_access: bool,
     ) -> Result<Self> {
         let index = engine.index();
@@ -744,22 +742,28 @@ impl<'a> EnqueueOrdering<'a> {
             &[]
         };
 
-        let same_wait = same_engine_wait_completed(engine, has_outputs, query_access);
+        let same_wait = same_engine_wait_completed(engine, query_access);
         let same_chain = !same_wait;
-        let cross_chain =
-            cross_engine_chain_publication(host_waits, has_outputs, engine, query_access);
+        let cross_chain = cross_engine_chain_publication(host_waits, engine, query_access);
 
-        // Retain covered failed publications (`status() <= 0`, not only `== 0`)
-        // that survived `prune_frontier()`: if a predecessor's deferred error
-        // published between pruning and link selection, `add_successor()` still
-        // delivers that failure immediately instead of letting the successor
-        // signal success.
+        // Retain covered pending or failed publications (`status() <= 0`, not
+        // only `== 0`) that survived `prune_frontier()`: if a predecessor's
+        // deferred error published between pruning and link selection,
+        // `add_successor()` still delivers that failure immediately instead of
+        // letting the successor signal success.
         let mut predecessors = KVec::new();
+        let mut host = KVec::new();
+        let mut firmware = KVec::new();
         if same_chain {
             for (_, entry) in same_covered {
-                if entry.status() <= 0 {
-                    if let Some(publication) = entry.publication() {
+                let status = entry.status();
+                if status <= 0 {
+                    if let Some(publication) = entry.pending_publication() {
                         predecessors.push(publication, GFP_KERNEL)?;
+                    } else if status < 0 {
+                        // Failed after `prune_frontier()` without an active
+                        // publication: keep its already-signalled error fence.
+                        host.push(entry.completed().clone(), GFP_KERNEL)?;
                     }
                 }
             }
@@ -767,19 +771,19 @@ impl<'a> EnqueueOrdering<'a> {
         if cross_chain {
             for (_, entry) in other_covered {
                 if entry.status() <= 0 {
-                    if let Some(publication) = entry.publication() {
+                    if let Some(publication) = entry.pending_publication() {
                         predecessors.push(publication, GFP_KERNEL)?;
                     }
                 }
             }
         }
 
-        let mut host = KVec::new();
-        let mut firmware = KVec::new();
         if same_wait {
             for (_, entry) in same_covered {
-                if entry.status() <= 0
-                    && (entry.ready_is_completed() || entry.publication().is_some())
+                let status = entry.status();
+                if status < 0
+                    || (status == 0
+                        && (entry.ready_is_completed() || entry.pending_publication().is_some()))
                 {
                     host.push(entry.completed().clone(), GFP_KERNEL)?;
                 }
@@ -795,10 +799,9 @@ impl<'a> EnqueueOrdering<'a> {
             }
             if cross_engine_wait_completed(
                 host_waits,
-                has_outputs,
                 engine,
                 query_access,
-                entry.publication().is_some(),
+                entry.pending_publication().is_some(),
             ) {
                 host.push(entry.completed().clone(), GFP_KERNEL)?;
             } else {
@@ -856,12 +859,13 @@ mod tests {
     fn test_entry(
         contexts: &FenceContexts,
         status: &Arc<VmStatus>,
-        with_pub: bool,
+        pub_outputs: Option<bool>,
     ) -> (TestEntry, Option<Arc<Publication>>) {
         let ready = Fence::from_fence(&independent(contexts).unwrap());
         let scheduled = Fence::from_fence(&independent(contexts).unwrap());
-        if with_pub {
-            let (publication, completed) = Publication::test_pair(contexts, status).unwrap();
+        if let Some(has_outputs) = pub_outputs {
+            let (publication, completed) =
+                Publication::test_pair(contexts, status, has_outputs).unwrap();
             (
                 TestEntry {
                     ready,
@@ -886,12 +890,12 @@ mod tests {
     }
 
     #[test]
-    fn transitive_render_window_waits_for_intermediate_completion() {
+    fn transitive_render_chains_publication_without_host_wait() {
         let contexts = FenceContexts::new(1, c_str!("asahi_q_ts_test"), TEST_KEY).unwrap();
         let status = Arc::pin_init(VmStatus::new(), GFP_KERNEL).unwrap();
 
-        // Compute A writes a timestamp (has ordered host publication).
-        let (comp_a, pub_a) = test_entry(&contexts, &status, true);
+        // Compute A writes a timestamp (has pending ordered host publication).
+        let (comp_a, pub_a) = test_entry(&contexts, &status, Some(true));
         let pub_a = pub_a.unwrap();
         PreparedPublication::new(pub_a.clone(), core::iter::empty())
             .unwrap()
@@ -911,7 +915,6 @@ mod tests {
             order_b,
             Engine::Render,
             false,
-            false,
             true,
         )
         .unwrap();
@@ -919,17 +922,17 @@ mod tests {
         assert_eq!(plan_b.firmware_waits.len(), 1);
         assert_eq!(plan_b.predecessors.len(), 1);
 
-        let (rend_b, pub_b) = test_entry(&contexts, &status, true);
+        let (rend_b, pub_b) = test_entry(&contexts, &status, Some(false));
         let pub_b = pub_b.unwrap();
-        let rend_b_completed = rend_b.completed.raw();
         PreparedPublication::new(pub_b.clone(), plan_b.predecessors.iter().copied())
             .unwrap()
             .activate();
         let render_frontier = [(1u64, rend_b)];
 
-        // Render C writes a timestamp (may use fragment-end window) and covers
-        // only Render B: must host-wait on B's completion fence so C cannot
-        // write the slot or bypass A's error before A publishes through B.
+        // Render C writes a timestamp and covers only Render B: chains its
+        // publication behind B (disabling its firmware window in Completion::new)
+        // instead of stalling on the host, so C still cannot publish or write
+        // timestamps before A publishes through B.
         let order_c = Order {
             sequence: 2,
             wait_through: [Some(1), None],
@@ -942,16 +945,23 @@ mod tests {
             Engine::Render,
             false,
             true,
-            true,
         )
         .unwrap();
-        assert_eq!(plan_c.host_waits.len(), 1);
-        assert_eq!(plan_c.host_waits[0].raw(), rend_b_completed);
+        assert!(plan_c.host_waits.is_empty());
         assert!(plan_c.firmware_waits.is_empty());
-        assert!(plan_c.predecessors.is_empty());
+        assert_eq!(plan_c.predecessors.len(), 1);
 
-        pub_a.finish(Ok([1, 2, 0, 0]));
+        let (pub_c, fence_c) = Publication::test_pair(&contexts, &status, true).unwrap();
+        PreparedPublication::new(pub_c.clone(), plan_c.predecessors.iter().copied())
+            .unwrap()
+            .activate();
+
         pub_b.finish(Ok([3, 4, 0, 0]));
+        pub_c.finish(Ok([5, 6, 0, 0]));
+        assert_eq!(fence_status(&fence_c), 0);
+
+        pub_a.finish(Err(EIO));
+        assert!(fence_status(&fence_c) < 0);
     }
 
     #[test]
@@ -959,13 +969,13 @@ mod tests {
         let contexts = FenceContexts::new(1, c_str!("asahi_q_fail_test"), TEST_KEY).unwrap();
         let status = Arc::pin_init(VmStatus::new(), GFP_KERNEL).unwrap();
 
-        let (comp_a, pub_a) = test_entry(&contexts, &status, true);
+        let (comp_a, pub_a) = test_entry(&contexts, &status, Some(true));
         let pub_a = pub_a.unwrap();
         PreparedPublication::new(pub_a.clone(), core::iter::empty())
             .unwrap()
             .activate();
 
-        let (rend_b, pub_b) = test_entry(&contexts, &status, true);
+        let (rend_b, pub_b) = test_entry(&contexts, &status, Some(false));
         let pub_b = pub_b.unwrap();
         PreparedPublication::new(pub_b.clone(), core::iter::once(&pub_a))
             .unwrap()
@@ -994,13 +1004,12 @@ mod tests {
             order_c,
             Engine::Render,
             false,
-            false,
             true,
         )
         .unwrap();
         assert_eq!(plan_c.predecessors.len(), 1);
 
-        let (pub_c, fence_c) = Publication::test_pair(&contexts, &status).unwrap();
+        let (pub_c, fence_c) = Publication::test_pair(&contexts, &status, false).unwrap();
         PreparedPublication::new(pub_c.clone(), plan_c.predecessors.iter().copied())
             .unwrap()
             .activate();
@@ -1009,19 +1018,21 @@ mod tests {
     }
 
     #[test]
-    fn shared_timestamp_slot_keeps_host_wait_in_both_directions() {
+    fn query_access_waits_while_timestamped_overlap_chains_in_both_directions() {
         let contexts = FenceContexts::new(1, c_str!("asahi_q_dir_test"), TEST_KEY).unwrap();
         let status = Arc::pin_init(VmStatus::new(), GFP_KERNEL).unwrap();
 
-        let (rend_a, pub_ra) = test_entry(&contexts, &status, true);
+        let (rend_a, pub_ra) = test_entry(&contexts, &status, Some(true));
         let pub_ra = pub_ra.unwrap();
         PreparedPublication::new(pub_ra.clone(), core::iter::empty())
             .unwrap()
             .activate();
+        let rend_a_scheduled = rend_a.scheduled.raw();
         let rend_a_completed = rend_a.completed.raw();
         let render_frontier = [(1u64, rend_a)];
 
-        // Render(ts) -> NO_QUERY_ACCESS Compute writing timestamps.
+        // Render(ts) -> NO_QUERY_ACCESS Compute: overlaps in firmware and chains
+        // ordered host publication instead of stalling on the host.
         let plan_rc = EnqueueOrdering::build(
             &[] as &[(u64, TestEntry)],
             &render_frontier,
@@ -1032,23 +1043,43 @@ mod tests {
             },
             Engine::Compute,
             false,
-            true,
             false,
         )
         .unwrap();
-        assert_eq!(plan_rc.host_waits.len(), 1);
-        assert_eq!(plan_rc.host_waits[0].raw(), rend_a_completed);
-        assert!(plan_rc.firmware_waits.is_empty());
+        assert!(plan_rc.host_waits.is_empty());
+        assert_eq!(plan_rc.firmware_waits.len(), 1);
+        assert_eq!(plan_rc.firmware_waits[0].0.raw(), rend_a_scheduled);
+        assert_eq!(plan_rc.firmware_waits[0].1.raw(), rend_a_completed);
+        assert_eq!(plan_rc.predecessors.len(), 1);
 
-        let (comp_a, pub_ca) = test_entry(&contexts, &status, true);
+        // Render(ts) -> query-accessing Compute: must host-wait until A publishes.
+        let plan_rc_query = EnqueueOrdering::build(
+            &[] as &[(u64, TestEntry)],
+            &render_frontier,
+            Order {
+                sequence: 1,
+                wait_through: [Some(1), None],
+                tiling_wait_through: [None, None],
+            },
+            Engine::Compute,
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(plan_rc_query.host_waits.len(), 1);
+        assert_eq!(plan_rc_query.host_waits[0].raw(), rend_a_completed);
+        assert!(plan_rc_query.firmware_waits.is_empty());
+
+        let (comp_a, pub_ca) = test_entry(&contexts, &status, Some(true));
         let pub_ca = pub_ca.unwrap();
         PreparedPublication::new(pub_ca.clone(), core::iter::empty())
             .unwrap()
             .activate();
+        let comp_a_scheduled = comp_a.scheduled.raw();
         let comp_a_completed = comp_a.completed.raw();
         let compute_frontier = [(1u64, comp_a)];
 
-        // Compute(ts) -> Render writing timestamps (including fragment-end window).
+        // Compute(ts) -> Render: overlaps in firmware and chains publication.
         let plan_cr = EnqueueOrdering::build(
             &[] as &[(u64, TestEntry)],
             &compute_frontier,
@@ -1060,15 +1091,141 @@ mod tests {
             Engine::Render,
             false,
             true,
-            true,
         )
         .unwrap();
-        assert_eq!(plan_cr.host_waits.len(), 1);
-        assert_eq!(plan_cr.host_waits[0].raw(), comp_a_completed);
-        assert!(plan_cr.firmware_waits.is_empty());
+        assert!(plan_cr.host_waits.is_empty());
+        assert_eq!(plan_cr.firmware_waits.len(), 1);
+        assert_eq!(plan_cr.firmware_waits[0].0.raw(), comp_a_scheduled);
+        assert_eq!(plan_cr.firmware_waits[0].1.raw(), comp_a_completed);
+        assert_eq!(plan_cr.predecessors.len(), 1);
 
         pub_ra.finish(Ok([1, 2, 0, 0]));
         pub_ca.finish(Ok([3, 4, 0, 0]));
+    }
+
+    #[test]
+    fn settled_timestamp_free_publication_drops_contagion_and_host_waits() {
+        let contexts = FenceContexts::new(1, c_str!("asahi_q_settle"), TEST_KEY).unwrap();
+        let status = Arc::pin_init(VmStatus::new(), GFP_KERNEL).unwrap();
+
+        let (rend_a, pub_a) = test_entry(&contexts, &status, Some(true));
+        let pub_a = pub_a.unwrap();
+        PreparedPublication::new(pub_a.clone(), core::iter::empty())
+            .unwrap()
+            .activate();
+
+        let (comp_b, pub_b) = test_entry(&contexts, &status, Some(false));
+        let pub_b = pub_b.unwrap();
+        PreparedPublication::new(pub_b.clone(), core::iter::once(&pub_a))
+            .unwrap()
+            .activate();
+
+        // While Render A is still pending, query-accessing Compute C must host-wait on B.
+        let comp_b_completed = comp_b.completed.raw();
+        let compute_frontier = [(1u64, comp_b)];
+        let plan_before = EnqueueOrdering::build(
+            &compute_frontier,
+            &[] as &[(u64, TestEntry)],
+            Order {
+                sequence: 2,
+                wait_through: [None, Some(1)],
+                tiling_wait_through: [None, None],
+            },
+            Engine::Compute,
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(plan_before.host_waits.len(), 1);
+        assert_eq!(plan_before.host_waits[0].raw(), comp_b_completed);
+
+        // Once Render A finishes cleanly, Compute B settles while still in flight:
+        // neither a query-accessing Compute nor a cross-engine Render waits or
+        // chains behind B.
+        pub_a.finish(Ok([1, 2, 0, 0]));
+        assert_eq!(rend_a.status(), 1);
+        assert_eq!(compute_frontier[0].1.status(), 0);
+        assert!(!pub_b.is_pending());
+
+        let plan_query = EnqueueOrdering::build(
+            &compute_frontier,
+            &[] as &[(u64, TestEntry)],
+            Order {
+                sequence: 2,
+                wait_through: [None, Some(1)],
+                tiling_wait_through: [None, None],
+            },
+            Engine::Compute,
+            false,
+            true,
+        )
+        .unwrap();
+        assert!(plan_query.host_waits.is_empty());
+        assert!(plan_query.predecessors.is_empty());
+
+        let plan_render = EnqueueOrdering::build(
+            &[] as &[(u64, TestEntry)],
+            &compute_frontier,
+            Order {
+                sequence: 2,
+                wait_through: [None, Some(1)],
+                tiling_wait_through: [None, None],
+            },
+            Engine::Render,
+            false,
+            true,
+        )
+        .unwrap();
+        assert!(plan_render.host_waits.is_empty());
+        assert_eq!(plan_render.firmware_waits.len(), 1);
+        assert!(plan_render.predecessors.is_empty());
+
+        pub_b.finish(Ok([3, 4, 0, 0]));
+    }
+
+    #[test]
+    fn failed_settled_same_engine_entry_adds_host_wait() {
+        let contexts = FenceContexts::new(1, c_str!("asahi_q_settled_err"), TEST_KEY).unwrap();
+        let status = Arc::pin_init(VmStatus::new(), GFP_KERNEL).unwrap();
+
+        let (rend_a, pub_a) = test_entry(&contexts, &status, Some(true));
+        let pub_a = pub_a.unwrap();
+        PreparedPublication::new(pub_a.clone(), core::iter::empty())
+            .unwrap()
+            .activate();
+
+        let (rend_b, pub_b) = test_entry(&contexts, &status, Some(false));
+        let pub_b = pub_b.unwrap();
+        let rend_b_completed = rend_b.completed.raw();
+        PreparedPublication::new(pub_b.clone(), core::iter::once(&pub_a))
+            .unwrap()
+            .activate();
+
+        // Render A completes cleanly, settling Render B; then Render B fails in
+        // hardware after frontier pruning.
+        pub_a.finish(Ok([1, 2, 0, 0]));
+        assert!(!pub_b.is_pending());
+        pub_b.finish(Err(EIO));
+        assert!(rend_b.status() < 0);
+        assert_eq!(rend_a.status(), 1);
+
+        let render_frontier = [(1u64, rend_b)];
+        let plan_c = EnqueueOrdering::build(
+            &render_frontier,
+            &[] as &[(u64, TestEntry)],
+            Order {
+                sequence: 2,
+                wait_through: [Some(1), None],
+                tiling_wait_through: [None, None],
+            },
+            Engine::Render,
+            false,
+            true,
+        )
+        .unwrap();
+        assert!(plan_c.predecessors.is_empty());
+        assert_eq!(plan_c.host_waits.len(), 1);
+        assert_eq!(plan_c.host_waits[0].raw(), rend_b_completed);
     }
 
     #[test]
@@ -1086,7 +1243,6 @@ mod tests {
             },
             Engine::Compute,
             false,
-            true,
             false,
         )
         .unwrap();
@@ -1122,7 +1278,7 @@ mod tests {
         let contexts = FenceContexts::new(1, c_str!("asahi_q_comp_chain"), TEST_KEY).unwrap();
         let status = Arc::pin_init(VmStatus::new(), GFP_KERNEL).unwrap();
 
-        let (rend_a, pub_a) = test_entry(&contexts, &status, true);
+        let (rend_a, pub_a) = test_entry(&contexts, &status, Some(true));
         let pub_a = pub_a.unwrap();
         PreparedPublication::new(pub_a.clone(), core::iter::empty())
             .unwrap()
@@ -1142,7 +1298,6 @@ mod tests {
                 tiling_wait_through: [None, None],
             },
             Engine::Compute,
-            false,
             false,
             false,
         )

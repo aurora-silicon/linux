@@ -2573,6 +2573,7 @@ void DCP_FW_NAME(iomfb_poweron)(struct apple_dcp *dcp)
 	u32 handle;
 #endif
 	dev_info(dcp->dev, "dcp_poweron() starting\n");
+	WRITE_ONCE(dcp->pipe_off, false);
 #if DCP_FW_H17(DCP_FW_VER)
 	if (dcp_is_ext26(dcp))
 		return; /* Native26 publishes A473 only after a successful A413. */
@@ -2902,9 +2903,27 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 #endif
 
 #if DCP_FW_H17(DCP_FW_VER)
-	/* H17P has no known safe pipe-off or surface-free transition. */
-	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
-		return;
+	/*
+	 * H17P has no known safe pipe-off or surface-free transition for
+	 * its panel. An external pipe stops like the H17G one: otherwise
+	 * DPMS off leaves it scanning out the last frame.
+	 */
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
+		if (dcp_has_panel(dcp))
+			return;
+		/*
+		 * The firmware withdrew the mode (it is describing the display
+		 * again after a hotplug, see dcp_mode_withdraw()): no scanout of
+		 * ours is left to stop, and while it republishes the display it
+		 * answers neither the clear swap nor setPowerState(0). Both then
+		 * time out and leave the pipe unable to power on again.
+		 */
+		if (!READ_ONCE(dcp->mode_state.valid)) {
+			dev_dbg(dcp->dev, "%s: no valid mode, pipe left to the firmware\n",
+				__func__);
+			return;
+		}
+	}
 #endif
 
 #if DCP_FW_DESKTOP_26(DCP_FW_VER)
@@ -2925,7 +2944,8 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 	kref_get(&cookie->refcount);
 
 #if DCP_FW_H17(DCP_FW_VER)
-	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G)
+	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G ||
+	    !dcp_has_panel(dcp))
 		dcp_prepare_clear_swap(dcp, swap);
 #else
 #if DCP_FW_DESKTOP_26(DCP_FW_VER)
@@ -3004,10 +3024,12 @@ close_client:
 		dev_dbg(dcp->dev,
 			"setPowerState(0) finished with %d ms to spare",
 			jiffies_to_msecs(ret));
-		if (dcp_power_stop_confirmed(poff_cookie))
+		if (dcp_power_stop_confirmed(poff_cookie)) {
 			dcp_release_all_retained_framebuffers(dcp);
-		else
+			WRITE_ONCE(dcp->pipe_off, true);
+		} else {
 			dev_warn(dcp->dev, "scanout stop was not confirmed\n");
+		}
 	}
 
 	kref_put(&poff_cookie->refcount, release_wait_cookie);

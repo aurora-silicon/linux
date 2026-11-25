@@ -7140,9 +7140,18 @@ static int apple_pcie_suspend_noirq(struct device *dev)
 		return ret;
 	}
 	if (!pcie->hw->tunneled) {
-		if (apple_pcie_s2r_reinit(pcie) && pm_suspend_via_firmware())
+		bool s2r_reinit = apple_pcie_s2r_reinit(pcie) && pm_suspend_via_firmware();
+
+		if (s2r_reinit)
 			apple_pcie_hib_save(pcie);
-		if (pm_suspend_no_platform() && pcie->num_pds)
+		/*
+		 * Keep the host's power domains on across genpd noirq suspend
+		 * for s2idle and firmware sleeps: on an abandoned or dry-run
+		 * firmware sleep the commit never runs, so gating the domain
+		 * here would leave the controller unprogrammed with no wake
+		 * sequence to reinitialize it. A real commit powers it down.
+		 */
+		if ((pm_suspend_no_platform() || s2r_reinit) && pcie->num_pds)
 			return apple_pcie_hold_domains(pcie);
 		return 0;
 	}
@@ -7918,6 +7927,12 @@ static int apple_pcie_resume(struct device *dev)
 		port = apple_pcie_get_port(fn->pdev);
 		if (!port || !port->hib_cold)
 			continue;
+		/*
+		 * The PCI core's noirq power-up ran with the link down and left the function
+		 * marked D3: the reset brought it up in D0, so record that before the
+		 * restore, or its driver's resume can't enable MSI again (-EINVAL).
+		 */
+		pci_set_power_state(fn->pdev, PCI_D0);
 		if (pci_load_saved_state(fn->pdev, fn->state))
 			pci_warn(fn->pdev, "S2R: saved configuration not taken back\n");
 		else

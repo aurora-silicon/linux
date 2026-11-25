@@ -42,9 +42,38 @@ const TRACE_RECORDS: u32 = 512;
 const RING_RECORDS: u32 = 256;
 /// Queue capacity at position block +0x50 (16 x the 0x50 channels).
 const QUEUE_CAPACITY: u32 = 0x500;
-/// Upper performance-state cap, in hundredths, at globals +0x98: the first state above idle.
-/// Only this cap has run on hardware.
-const STATE_CAP: u32 = 100;
+/// Globals offsets of the 13.5 shared power tables (HwDataShared1 and HwDataShared2): the 27.2
+/// Globals carries them at these places, laid out field for field as in the 13.5 InitData.
+const GLOBALS_SHARED1: usize = 0xec;
+const GLOBALS_SHARED2: usize = 0x1b4;
+const SHARED1_BYTES: usize = 0xa8;
+const SHARED2_BYTES: usize = 0x510;
+/// Power-record offset of the 13.5 HwDataShared3 (0x50 bytes).
+const POWER_SHARED3: usize = 0x4f0;
+const _: () = {
+    assert!(core::mem::size_of::<fw::initdata::raw::HwDataShared1>() == SHARED1_BYTES);
+    assert!(core::mem::size_of::<fw::initdata::raw::HwDataShared2>() == SHARED2_BYTES);
+    assert!(GLOBALS_SHARED1 + SHARED1_BYTES <= GLOBALS_SHARED2);
+    assert!(GLOBALS_SHARED2 + SHARED2_BYTES <= g14_v27_2_abi::GLOBALS_BYTES);
+    // The offsets put_shared1/put_shared2/put_curve write.
+    use core::mem::offset_of;
+    use fw::initdata::raw::{HwDataShared1 as S1, HwDataShared2 as S2, HwDataShared2Curve as C,
+                            HwDataShared2G14 as G};
+    assert!(offset_of!(S1, unk_44) == 0x40 && offset_of!(S1, unk_a4) == 0xa0 && offset_of!(S1, unk_a8) == 0xa4);
+    assert!(offset_of!(S2, unk_28) == 0x28 && offset_of!(S2, g14) == 0x38 && offset_of!(S2, unk_500) == 0x500);
+    assert!(offset_of!(G, unk_14) == 0x14 && offset_of!(G, unk_18) == 0x18);
+    assert!(offset_of!(G, curve1) == 0x38 && offset_of!(G, curve2) == 0x280);
+    assert!(offset_of!(C, t1) == 8 && offset_of!(C, t2) == 0x28 && offset_of!(C, t3) == 0x48);
+    assert!(core::mem::size_of::<C>() == 0x248);
+    // The 13.5 HwDataB words copied at the chip id's distance land where the 27.2 block has
+    // them (power sample period +0xff4, fragment count +0x10a4).
+    use fw::initdata::raw::{HwDataBG14V13_5 as B13, HwDataBG14V27_2 as B27};
+    assert!(offset_of!(B13, power_sample_period) + offset_of!(B27, chip_id) - offset_of!(B13, chip_id) == 0xff4);
+    assert!(offset_of!(B13, num_frags) + offset_of!(B27, chip_id) - offset_of!(B13, chip_id) == 0x10a4);
+    use fw::initdata::raw::HwDataShared3 as S3;
+    assert!(core::mem::size_of::<S3>() == 0x50 && offset_of!(S3, table) == 0xc && offset_of!(S3, unk_4c) == 0x4c);
+    assert!(POWER_SHARED3 + 0x50 <= 0x6a0);
+};
 
 /// Board facts the root needs, read from the device tree at probe.
 pub(crate) struct BoardV27_2 {
@@ -87,6 +116,64 @@ pub(crate) struct ComputeJob {
 
 fn put32(b: &mut [u8], at: usize, v: u32) {
     b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+}
+
+/// The 13.5 HwDataShared1, field for field.
+fn put_shared1(b: &mut [u8], at: usize, s: &fw::initdata::raw::HwDataShared1) {
+    for (i, v) in s.table.iter().enumerate() {
+        put32(b, at + 4 * i, *v as u32);
+    }
+    b[at + 0x40..at + 0xa0].copy_from_slice(&(*s.unk_44)[..]);
+    put32(b, at + 0xa0, s.unk_a4);
+    put32(b, at + 0xa4, s.unk_a8);
+}
+
+/// The 13.5 HwDataShared2 curve, field for field.
+fn put_curve(b: &mut [u8], at: usize, c: &fw::initdata::raw::HwDataShared2Curve) {
+    put32(b, at, c.unk_0);
+    put32(b, at + 4, c.unk_4);
+    for (i, v) in c.t1.iter().enumerate() {
+        b[at + 8 + 2 * i..at + 10 + 2 * i].copy_from_slice(&v.to_le_bytes());
+    }
+    for (i, v) in c.t2.iter().enumerate() {
+        b[at + 0x28 + 2 * i..at + 0x2a + 2 * i].copy_from_slice(&v.to_le_bytes());
+    }
+    for (row, values) in c.t3.iter().enumerate() {
+        for (i, v) in values.iter().enumerate() {
+            put32(b, at + 0x48 + 0x40 * row + 4 * i, *v as u32);
+        }
+    }
+}
+
+/// The 13.5 HwDataShared3, field for field.
+fn put_shared3(b: &mut [u8], at: usize, s: &fw::initdata::raw::HwDataShared3) {
+    for (i, v) in [s.unk_0, s.unk_4, s.unk_8].into_iter().enumerate() {
+        put32(b, at + 4 * i, v);
+    }
+    for (i, v) in s.table.iter().enumerate() {
+        put32(b, at + 0xc + 4 * i, *v);
+    }
+    put32(b, at + 0x4c, s.unk_4c);
+}
+
+/// The 13.5 HwDataShared2, field for field (G14 curves included).
+fn put_shared2(b: &mut [u8], at: usize, s: &fw::initdata::raw::HwDataShared2) {
+    for (i, v) in s.table.iter().enumerate() {
+        put32(b, at + 4 * i, *v as u32);
+    }
+    b[at + 0x28..at + 0x38].copy_from_slice(&(*s.unk_28)[..]);
+    for (i, v) in s.g14.unk_0.iter().enumerate() {
+        put32(b, at + 0x38 + 4 * i, *v);
+    }
+    put32(b, at + 0x4c, s.g14.unk_14);
+    for (i, v) in s.g14.unk_18.iter().enumerate() {
+        put32(b, at + 0x50 + 4 * i, *v);
+    }
+    put_curve(b, at + 0x70, &s.g14.curve1);
+    put_curve(b, at + 0x2b8, &s.g14.curve2);
+    for (i, v) in [s.unk_500, s.unk_504, s.unk_508, s.unk_50c].into_iter().enumerate() {
+        put32(b, at + 0x500 + 4 * i, v);
+    }
 }
 
 fn put64(b: &mut [u8], at: usize, v: u64) {
@@ -965,6 +1052,23 @@ impl RootV27_2 {
             for (i, word) in [old.chip_id, old.unk_454, old.unk_458, old.unk_45c].into_iter().enumerate() {
                 put32(hw, chip + 4 * i, word);
             }
+            // From the power sample period to the fragment count, the 27.2 block keeps the 13.5
+            // HwDataB words in order, at the chip id's distance: the firmware's power sampling
+            // period, the cache-flush and feature enables and the fragment count.
+            use core::mem::offset_of;
+            type Old = fw::initdata::raw::HwDataBG14V13_5;
+            let shift = chip - offset_of!(Old, chip_id);
+            for (at, value) in [
+                (offset_of!(Old, power_sample_period), old.power_sample_period),
+                (offset_of!(Old, unk_49c), old.unk_49c), (offset_of!(Old, unk_4a0), old.unk_4a0),
+                (offset_of!(Old, unk_4a4), old.unk_4a4), (offset_of!(Old, unk_4c0), old.unk_4c0),
+                (offset_of!(Old, unk_4f0), old.unk_4f0), (offset_of!(Old, unk_4f4), old.unk_4f4),
+                (offset_of!(Old, unk_504), old.unk_504), (offset_of!(Old, unk_524), old.unk_524),
+                (offset_of!(Old, unk_534), old.unk_534), (offset_of!(Old, num_frags), old.num_frags),
+            ] {
+                put32(hw, at + shift, value);
+            }
+            put64(hw, offset_of!(Old, unk_4e0) + shift, old.unk_4e0.0);
         });
         // Inline words the stock host producer fixes for a gpu,t8112 node without model-slow.
         for (offset, value) in [(0xfc8u32, 0u32), (0xfd8, 1), (0xfec, 24000), (0xff0, 1),
@@ -987,8 +1091,10 @@ impl RootV27_2 {
         }
         put64(hw, 0x267c, u64::from(*core_mask));
         put32(hw, 0x2684, id.total_active_cores);
-        // Operating points: power above the lowest state, and frequency above the base state,
-        // as percentages; MHz and the per-lane core and SRAM voltages.
+        // Operating points, in the 13.5 HwDataB order the 27.2 block keeps: power above the
+        // lowest state and frequency above the base state as f32 percentages, MHz, the per-lane
+        // core and SRAM voltages, the chip's SRAM power coefficient per state and the identity
+        // state index map.
         let top = states.len() - 1;
         if old_max_pstate(base)? as usize != top { return Err(EINVAL); }
         let baseline = states[0].pwr_mw;
@@ -1012,14 +1118,16 @@ impl RootV27_2 {
                 return Err(EINVAL);
             }
             let mhz = state.freq_hz / 1_000_000;
-            for series in [abi::COMMON26_HW_PERF_FREQUENCY, 0x1924] {
-                put32(hw, series + i * 4, mhz);
-            }
+            put32(hw, abi::COMMON26_HW_PERF_FREQUENCY + i * 4, mhz);
+            put32(hw, abi::COMMON26_HW_PERF_SCALE + i * 4, cfg.sram_k.to_bits());
             for lane in 0..abi::COMMON26_HW_PERF_LANES {
                 let row = i * abi::COMMON26_HW_PERF_ROW_STRIDE + lane * 4;
                 put32(hw, abi::COMMON26_HW_PERF_CORE_VOLTAGE + row, *mv);
                 put32(hw, abi::COMMON26_HW_PERF_SRAM_VOLTAGE + row, sram_mv);
             }
+        }
+        for index in 0..abi::COMMON26_HW_PERF_ROWS {
+            put32(hw, abi::COMMON26_HW_PERF_INDEX_MAP + index * 4, index as u32);
         }
         crate::pgtable::clean_poc(hw.as_ptr(), hw.len());
         put64(bytes, 0, hardware.gpu_va().get());
@@ -1083,9 +1191,16 @@ impl RootV27_2 {
                 data[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
             }
             let ceiling = pwr.perf_max_pstate * 100;
-            for (at, value) in [(0x84, pwr.max_power_mw), (0x88, ceiling), (0x8c, ceiling), (0x98, STATE_CAP)] {
+            for (at, value) in [(0x84, pwr.max_power_mw), (0x88, ceiling), (0x8c, ceiling), (0x98, ceiling)] {
                 put32(data, at, value);
             }
+            // The shared power tables the 13.5 InitData built from the chip configuration and
+            // the DT operating points (the G14 curves scale with each state's frequency and
+            // voltage). Left zero, the firmware runs the upper states without them.
+            base.hwdata_a.with(|a, _| {
+                put_shared1(data, GLOBALS_SHARED1, &a.hws1);
+                put_shared2(data, GLOBALS_SHARED2, &a.hws2);
+            });
             put32(data, 0x6e, 1);
             // The firmware's progress checks and compute watchdog, as M3 and M4 27.2 set them.
             for (at, value) in g14_v27_2_abi::GLOBALS_PROGRESS {
@@ -1117,6 +1232,18 @@ impl RootV27_2 {
             for (at, value) in [(0x12c, pwr.max_power_mw), (0x130, gains.0), (0x134, gains.1)] {
                 put32(data, at, value);
             }
+            // The average-power filter and the third shared power table, as the 13.5 Globals
+            // carries them (built from the DT power values and the chip configuration).
+            graph.initdata.globals.with(|g, _| {
+                for (at, value) in [
+                    (0x10, g.avg_power_filter_tc_periods), (0x14, g.avg_power_ki_dt.to_bits()),
+                    (0x18, g.avg_power_kp.to_bits()), (0x1c, g.avg_power_min_duty_cycle),
+                    (0x20, g.avg_power_target_filter_tc),
+                ] {
+                    put32(data, at, value);
+                }
+                put_shared3(data, POWER_SHARED3, &g.hws3);
+            });
             let initial = controller.as_slice();
             for (dst, src) in [(0xc8, 0x22d4), (0xcc, 0x2280), (0xd0, 0x2284),
                                (0xd4, 0x22cc), (0xd8, 0x22b4), (0xdc, 0x22a4)] {

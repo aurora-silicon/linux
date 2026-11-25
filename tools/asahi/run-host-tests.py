@@ -89,6 +89,8 @@ ASAHI_TESTS = {
     'dcp-v27-dptx-layout-tests.py': [([], PASS)] + mutations(
         '--mutation', ['ignore-advertisement', 'ignore-pinned', 'ignore-dcpext',
                        'ignore-typec-routes'], []),
+    'dptx-set-active-lane-count-tests.py': [([], PASS)] + mutations(
+        '--mutation', ['drop-fixed-phy', 'skip-all-unexpected'], []),
     'dcpext26-wire-tests.py': [([], PASS)],
     'pmp-native26-tests.py': [([], PASS)],
 
@@ -285,6 +287,20 @@ ASAHI_TESTS = {
         + mutations('--mutation', ('unlocked-claim-outer', 'raw-compute-scope',
                                    'raw-render-scope', 'unlocked-scope-drop',
                                    'drop-direct-claim-on-fallback', 'pin-single-die'), []),
+    'g17-m5-idle-housekeeping-tests.py': [([], PASS)]
+        + mutations('--mutation', ('idle-forces-housekeeping', 'no-deferred-timer',
+                                   'hardcode-in-flight-true', 'skip-cadence-expiry'), []),
+    'g17-m5-event-placement-tests.py': [([], PASS)]
+        + mutations('--mutation', ('percpu-always', 'unbound-always', 'aim-local',
+                                   'record-never', 'not-reclaim', 'split-flag'), []),
+    'g17-m5-render-fast-done-tests.py': [([], PASS)]
+        + mutations('--mutation', ('hold-m5-outer-across-doorbell',
+                                   'hold-render-lock-across-doorbell',
+                                   'skip-pending-error-fallback',
+                                   'single-slot-bailout',
+                                   'skip-epoch-check',
+                                   'unconditional-changed-notify',
+                                   'skip-generation-bump'), []),
     'g17-m5-cross-qid-direct-tests.py': [([], PASS)]
         + mutations('--mutation', ('no-chain-dedup',
                                    'coalesce-failed-leaf',
@@ -333,6 +349,12 @@ ASAHI_TESTS = {
     'g17-quarantine-drain-tests.py': [([], PASS)]
         + mutations('--mutation', ('no-drain-release', 'without-witness', 'ignore-leases', 'no-last-lease',
                                    'witness-covers-later-failure', 'unquarantined-drain'), []),
+    'g17-render-return-observe-tests.py': [([], PASS)]
+        + mutations('--mutation', ('rescan-owed', 'observe-all-slots', 'observe-ignores-gate',
+                                   'rescan-in-loop-bail', 'rescan-is-fallback', 'missed-dropped',
+                                   'observe-in-recovery', 'collector-blocks', 'finish-under-mutex',
+                                   'no-pass-requested', 'rescan-no-poll', 'worker-rescan-slow-path',
+                                   'owed-slow-path'), []),
     'g17-render-direct-recovery-tests.py': [([], PASS)]
         + mutations('--mutation', ('recovery-state-eio', 'drop-generation-check',
                                    'wrong-j813-pipe'), []),
@@ -432,6 +454,7 @@ ASAHI_SHELL = ['g17-ray-query-timeout-tests.sh', 'g17-traversal-admission-tests.
 # Production G17 decoder vectors also build directly with rustc --test.
 ASAHI_RUST += ['g17-telemetry-tests.rs', 'legacy-frequency-tests.rs']
 ASAHI_RUST.append('m3-firmware-tests.rs')
+ASAHI_RUST.append('pmp-alloc-tests.rs')
 
 # Python that runs on the host but imports its neighbours, so it keeps the
 # script directory on sys.path (-E -s instead of -I).

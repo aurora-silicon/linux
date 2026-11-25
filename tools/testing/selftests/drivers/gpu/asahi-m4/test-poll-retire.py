@@ -68,7 +68,7 @@ mod hw {
         pub const TA_WAVE_PASSES: usize = 4;
         pub const TA_WAVE_PASSES_LIGHT: usize = 8;
         pub const TA_WAVE_REFILL_HEADROOM: usize = 2;
-        pub const COMPUTE_PIPES: usize = 2;
+        pub const COMPUTE_PIPES: usize = 8;
         pub const COALESCE_WINDOW_US: u32 = 18;
     }
 }
@@ -129,7 +129,7 @@ struct RenderGraph {
     fw_stamp: [Cell32; 2],
 }
 struct Graph {
-    compute: [ComputeGraph; 2],
+    compute: [ComputeGraph; hw::sizes::COMPUTE_PIPES],
     render: RenderGraph,
 }
 
@@ -157,7 +157,7 @@ struct Engine {
     shared: Option<Arc<Shared>>,
     flights: Vec<Flight>,
     pending: Vec<Arc<Job>>,
-    target: [u32; 2],
+    target: [u32; hw::sizes::COMPUTE_PIPES],
     fs_target: u32,
     chan_wait: bool,
     slot_wait: bool,
@@ -349,14 +349,9 @@ impl Firmware {
             session: Session,
             objects: Objects,
             graph: Graph {
-                compute: [
-                    ComputeGraph {
-                        fw_stamp: Cell32::new(0),
-                    },
-                    ComputeGraph {
-                        fw_stamp: Cell32::new(0),
-                    },
-                ],
+                compute: core::array::from_fn(|_| ComputeGraph {
+                    fw_stamp: Cell32::new(0),
+                }),
                 render: RenderGraph {
                     fw_stamp: [Cell32::new(0), Cell32::new(0)],
                 },
@@ -365,7 +360,7 @@ impl Firmware {
                 shared: None,
                 flights: vec![],
                 pending: vec![],
-                target: [0; 2],
+                target: [0; hw::sizes::COMPUTE_PIPES],
                 fs_target: 0,
                 chan_wait: false,
                 slot_wait: false,
@@ -894,7 +889,8 @@ fn concurrent_compute_completion_behind_pending_render_wakes_submit_retire() {
         target: 0x100,
         fs_target: 0,
     });
-    fw2.engine.target = [0x200, 0x100];
+    fw2.engine.target[0] = 0x200;
+    fw2.engine.target[1] = 0x100;
     fw2.graph.compute[0].fw_stamp.set(0x100);
     fw2.graph.compute[1].fw_stamp.set(0x100);
     assert!(fw2.oldest_stamp_reached());
@@ -1282,7 +1278,12 @@ mod event_drain_test {
     const STATE_WRITE: usize = 0x40;
     const RING_SLOTS: u32 = 128;
     const RECORD_WORDS: usize = 18;
-    const STAGE_EVENTS: [u32; 4] = [0x70, 0x71, 15, 16];
+    const COMPUTE_PIPES: usize = 8;
+    const STAGE_COUNT: usize = 2 + COMPUTE_PIPES;
+    mod compute {
+        pub const EVENT: u32 = 15;
+    }
+    const COMPUTE_EVENT_MASK: u32 = ((1u32 << COMPUTE_PIPES) - 1) << compute::EVENT;
     mod rings {
         pub const EVENT_RECORD: usize = 0x48;
     }
@@ -1370,7 +1371,7 @@ mod event_drain_test {
         ta_events: u32,
         fs_events: u32,
         compute_events: u32,
-        event_ns: [u64; 4],
+        event_ns: [u64; STAGE_COUNT],
         errors: u32,
         channel_errors: u32,
         recovery_started_ns: Option<u64>,
@@ -1404,8 +1405,9 @@ mod event_drain_test {
     #[test]
     fn event_drain_batches_state_read_and_minimizes_wc_reads() {
         let ring = Ring::new();
-        // 4 consecutive type-1 stage events: TA (0x70 -> word 4 bit 16), FS (0x71 -> word 4 bit 17),
-        // Compute pipe 0 (15 -> word 1 bit 15), Compute pipe 1 (16 -> word 1 bit 16).
+        // 5 consecutive type-1 stage events: TA (0x70 -> word 4 bit 16), FS (0x71 -> word 4 bit 17),
+        // Compute pipe 0 (15 -> word 1 bit 15), Compute pipe 1 (16 -> word 1 bit 16),
+        // and Compute pipe 7 (22 -> word 1 bit 22, event_ns[9]).
         let mut r0 = [0u32; RECORD_WORDS];
         r0[0] = 1;
         r0[4] = 1 << 16;
@@ -1418,25 +1420,31 @@ mod event_drain_test {
         let mut r3 = [0u32; RECORD_WORDS];
         r3[0] = 1;
         r3[1] = 1 << 16;
+        let mut r4 = [0u32; RECORD_WORDS];
+        r4[0] = 1;
+        r4[1] = 1 << 22;
         ring.put_record(0, &r0);
         ring.put_record(1, &r1);
         ring.put_record(2, &r2);
         ring.put_record(3, &r3);
-        ring.set_indices(0, 4);
+        ring.put_record(4, &r4);
+        ring.set_indices(0, 5);
 
         let mut ev = Events::default();
         ev.drain(&device::Device, &ring).unwrap();
         assert_eq!(ev.event_ns[0], 12345);
+        assert_eq!(ev.event_ns[1], 12345);
         assert_eq!(ev.event_ns[2], 12345);
         assert_eq!(ev.event_ns[3], 12345);
+        assert_eq!(ev.event_ns[9], 12345);
         assert_eq!(ev.fs_events, 1);
-        assert_eq!(ev.compute_events, 2);
-        assert_eq!(ev.stage_events, 4);
-        assert_eq!(ring.read_idx(), 4);
-        // Exactly ONE STATE_READ write for all 4 records!
+        assert_eq!(ev.compute_events, 3);
+        assert_eq!(ev.stage_events, 5);
+        assert_eq!(ring.read_idx(), 5);
+        // Exactly ONE STATE_READ write for all 5 records!
         assert_eq!(ring.state.writes.get(), 1);
-        // Exactly 3 WC reads per type-1 record (kind, word 1, word 4) = 12 reads (not 72)!
-        assert_eq!(ring.ring.reads.get(), 12);
+        // Exactly 3 WC reads per type-1 record (kind, word 1, word 4) = 15 reads (not 90)!
+        assert_eq!(ring.ring.reads.get(), 15);
     }
 
     #[test]
