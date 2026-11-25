@@ -22,6 +22,8 @@ pub(crate) const SIZE: usize = 0x48000;
 pub(crate) const METRICS_STRIDE: usize = SCENES * size_of::<u32>();
 pub(crate) const METRICS_SLOTS: usize = cfg::METRICS_SIZE as usize / METRICS_STRIDE;
 pub(crate) const NORMAL_MAX_BLOCKS: usize = 0x45e;
+/// The normal maximum of a four-cluster G17P heap: every slot of the block table.
+pub(crate) const NORMAL_MAX_BLOCKS_FOUR_CLUSTERS: usize = cfg::TVB_MAX_BLOCKS;
 pub(crate) const GROW_BLOCKS: usize = 10;
 
 /// Firmware's active parameter-buffer state. Pointers at +0x44, +0x4c,
@@ -136,7 +138,8 @@ pub(crate) struct GraphArgs<'a> {
     pub(crate) discard: u64,
     pub(crate) buffer_id: u32,
     pub(crate) generation: u64,
-    /// The heap's normal maximum in blocks (`BM+0x80`).
+    /// The heap's normal maximum in blocks (`BM+0x80`): `Variant::tvb_normal_blocks`, raised by
+    /// memory on NEO heaps.
     pub(crate) normal_blocks: usize,
 }
 

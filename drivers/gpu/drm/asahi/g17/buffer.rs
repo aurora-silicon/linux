@@ -774,6 +774,9 @@ pub(crate) struct ManagerArgs {
     pub(crate) buffer_id: u8,
     pub(crate) generation: u64,
     pub(crate) first_ordinal: u64,
+    /// The firmware variant's normal maximum in blocks (`Variant::tvb_normal_blocks`): on NEO
+    /// heaps a floor that memory may raise; unused on others.
+    pub(crate) normal_blocks: usize,
 }
 
 /// A retained parameter-buffer graph and all of its sparse backing. Client
@@ -783,6 +786,8 @@ pub(crate) struct Manager {
     _page_list: mmu::KernelMapping,
     graph: KernelObject,
     layout: layout::Layout,
+    /// The firmware variant's normal maximum (`ManagerArgs::normal_blocks`), before memory raises it.
+    variant_normal_blocks: usize,
     tvb: Tvb,
     metrics: MetricsLease,
     /// Boxed: the per-scene owner table would otherwise make every `Manager` value large, and
@@ -863,11 +868,19 @@ impl Manager {
     ) -> Result<Self> {
         let geometry = tvb.geometry;
         let neo = geometry == BlockGeometry::NEO;
-        let layout = if neo {
+        let mut layout = if neo {
             layout::Layout::neo(crate::memacct::total_ram_bytes())
         } else {
             layout::Layout::m5(geometry)?
         };
+        if neo {
+            if args.normal_blocks == 0 || args.normal_blocks > geometry.max_blocks() {
+                return Err(EINVAL);
+            }
+            // The firmware variant's maximum is a floor (the full table where all four
+            // clusters tile); more memory may raise it, never lower it.
+            layout.normal_blocks = layout.normal_blocks.max(args.normal_blocks);
+        }
         if metrics.scene_stride != layout.metric_stride {
             return Err(EINVAL);
         }
@@ -916,6 +929,7 @@ impl Manager {
             _page_list: page_list,
             graph,
             layout,
+            variant_normal_blocks: args.normal_blocks,
             tvb,
             metrics,
             scenes,
@@ -954,12 +968,13 @@ impl Manager {
         self.tvb.geometry.max_blocks()
     }
     /// The blocks an A18 Pro heap holds ahead of a render with mesh shading
-    /// (`aurora.g17_mesh_tvb_floor`): 1,118 blocks, the normal maximum of the 8 GiB A18 Pro
-    /// (the size its automatic growth reaches). None on other heaps, or with the switch off.
+    /// (`aurora.g17_mesh_tvb_floor`): the firmware variant's normal maximum, 1,118 blocks on the
+    /// 8 GiB A18 Pro (the size its automatic growth reaches), not raised by memory. None on other
+    /// heaps, or with the switch off.
     pub(crate) fn mesh_floor(&self) -> Option<usize> {
         // SAFETY: Reads a module parameter; no other effect.
         let enabled = unsafe { asahi_g17_mesh_tvb_floor() } != 0;
-        (enabled && self.tvb.geometry == BlockGeometry::NEO).then_some(fw::NORMAL_MAX_BLOCKS)
+        (enabled && self.tvb.geometry == BlockGeometry::NEO).then_some(self.variant_normal_blocks)
     }
     /// Read-only diagnostic while firmware is halted. In particular this
     /// does not reset the high-water counter as automatic_target() does.

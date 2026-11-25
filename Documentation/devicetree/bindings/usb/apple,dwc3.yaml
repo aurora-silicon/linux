@@ -13,6 +13,12 @@ description:
   Apple Silicon SoCs use a Synopsys DesignWare DWC3 based controller for each of
   their Type-C ports.
 
+  On T8152 the bootloader can hand a controller over already running, powered
+  and with the USB2 side of its ATC PHY set up for host mode. Such a controller
+  is described by its DWC3 core region, as a host. Its PHY reset and power
+  domain, and on a Type-C port its USB role switch, exist but are left to the
+  bootloader, so they are optional.
+
 allOf:
   - $ref: snps,dwc3-common.yaml#
   - if:
@@ -20,11 +26,37 @@ allOf:
         compatible:
           not:
             contains:
-              const: apple,t8132-dwc3
+              enum:
+                - apple,t8132-dwc3
+                - apple,t8152-dwc3
     then:
       required:
         - power-domains
   - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8152-dwc3
+    then:
+      properties:
+        dr_mode:
+          const: host
+      required:
+        - dr_mode
+    else:
+      properties:
+        reg:
+          minItems: 2
+        reg-names:
+          minItems: 2
+      required:
+        - reg-names
+  - if:
+      properties:
+        compatible:
+          not:
+            contains:
+              const: apple,t8152-dwc3
       not:
         properties:
           status:
@@ -85,9 +117,10 @@ properties:
           - const: apple,t8103-dwc3
       - const: apple,t8103-dwc3
       - const: apple,t8132-dwc3
+      - const: apple,t8152-dwc3
 
   reg:
-    minItems: 2
+    minItems: 1
     items:
       - description: Core DWC3 region
       - description: Apple-specific DWC3 region
@@ -96,7 +129,7 @@ properties:
       - description: AUSBC debug block (T6050)
 
   reg-names:
-    minItems: 2
+    minItems: 1
     items:
       - const: dwc3-core
       - const: dwc3-apple
@@ -160,7 +193,6 @@ properties:
 required:
   - compatible
   - reg
-  - reg-names
   - interrupts
   - iommus
 
@@ -182,4 +214,19 @@ examples:
       resets = <&atcphy0>;
 
       usb-role-switch;
+    };
+
+  - |
+    #include <dt-bindings/interrupt-controller/apple-aic.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    usb@82430000 {
+      compatible = "apple,t8152-dwc3";
+      reg = <0x82430000 0xcd00>;
+      interrupts = <AIC_IRQ 1763 IRQ_TYPE_LEVEL_HIGH>;
+      iommus = <&dwc3_2_dart_0 0>, <&dwc3_2_dart_1 1>;
+      dr_mode = "host";
+      maximum-speed = "high-speed";
+      snps,dis_u2_susphy_quirk;
+      snps,dis_u3_susphy_quirk;
     };

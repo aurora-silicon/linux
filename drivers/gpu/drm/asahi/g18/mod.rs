@@ -12,6 +12,7 @@ pub(crate) mod address_map;
 pub(crate) mod boot;
 pub(crate) mod buffer;
 pub(crate) mod compat;
+pub(crate) mod demand;
 #[allow(dead_code)]
 pub(crate) mod drm;
 pub(crate) mod fixture;

@@ -170,11 +170,16 @@ static void apple_pmc_test_release_restores_ap_vote(struct kunit *test)
 static void apple_pmc_test_pending_floor(struct kunit *test)
 {
 	struct apple_pmc *pmc = apple_pmc_test_alloc(test);
-	struct device dev = {};
+	struct device dev = { .driver = &apple_pmc_driver.driver };
+	struct device foreign = {};
+	int dummy = 0x1234;
 	void __iomem *reg;
 
 	pmc->hw = &apple_pmc_hw_t8132;
 	dev_set_drvdata(&dev, pmc);
+	dev_set_drvdata(&foreign, &dummy);
+	KUNIT_EXPECT_EQ(test, apple_pmc_rail_count(&foreign), 0U);
+	KUNIT_EXPECT_EQ(test, apple_pmc_rail_count(&dev), pmc->hw->rails);
 	reg = pmc->voters + pmc->hw->ap_agent * pmc->hw->agent_stride;
 	writel(0xa500, reg);
 	writel(BIT(pmc->hw->ap_agent), reg + 4);

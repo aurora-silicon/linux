@@ -143,9 +143,9 @@ impl KernelObject {
             } else { error })
     }
 
-    /// Reuses only a complete alias of this exact retained backing. Permanent
-    /// queue aliases stay owned by the client VM after a physical pair moves;
-    /// returning to that VM must not replace or duplicate those mappings.
+    /// Reuses only a complete alias of this exact retained backing. A render pair keeps its
+    /// views of its kick rings while it moves between contexts of one VM; preparing the view
+    /// for that VM again must not replace or duplicate them.
     pub(crate) fn prepare_alias(
         &self,
         vm: &mmu::Vm,

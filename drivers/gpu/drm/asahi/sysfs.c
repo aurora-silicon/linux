@@ -94,8 +94,10 @@ static ssize_t agx_qualified_stats_show(struct asahi_stats_attribute *stats, cha
 				   "util_device_percent unsupported\n");
 	}
 	/*
-	 * unsupported comes from the firmware match data (g17::stats): V25G83
-	 * never emits a pstate record, so it is not a transient state.
+	 * unsupported comes from the firmware match data (g17::stats): builds
+	 * without a pstate telemetry protocol (such as T6040 25G83, left on
+	 * Protocol::NONE pending measurement) have no qualified pstate support,
+	 * so it is not a transient state.
 	 * unavailable keeps meaning "no qualified sample yet".
 	 */
 	n += sysfs_emit_at(buf, n, "pstate_status %s\n",
@@ -107,8 +109,9 @@ static ssize_t agx_qualified_stats_show(struct asahi_stats_attribute *stats, cha
 	/* No host frequency request, measured power or temperature. */
 	n += sysfs_emit_at(buf, n, "requested_frequency_hz unsupported\n");
 	/*
-	 * V26A428 reports the state the GPU runs at: its frequency is the
-	 * achieved one. State 0 is off (gated cores) and runs at 0 Hz.
+	 * Firmwares with a pstate protocol (V26A428, T6041 25G83) report
+	 * the state the GPU runs at: its frequency is the achieved one. State 0
+	 * is off (gated cores) and runs at 0 Hz.
 	 */
 	if (snap.pstate_status == 1 && (snap.achieved_frequency_hz || !snap.pstate))
 		n += sysfs_emit_at(buf, n, "achieved_frequency_hz %llu\n",

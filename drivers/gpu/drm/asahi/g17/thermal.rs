@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! GPU power budget governor for M5 (J714).
+//! GPU thermal management for M5: opt-in host power budget governor (J714) and
+//! DT-configured hotspot fan assistance.
 //!
 //! The firmware limits the GPU to the host power budget word in Region C within about a second
 //! (the calibrated maximum is written there at initialization). Left at that maximum under
@@ -23,7 +24,7 @@
 //! and at shutdown. Below the engage temperature nothing is written.
 
 use core::ffi::{c_char, c_int, c_uint, c_void, CStr};
-use core::sync::atomic::{AtomicI32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use kernel::{bindings, prelude::*};
 
 // fans.c: the SMC hwmon cell's fan requests and thermal zone reads, which have stubs where
@@ -31,6 +32,15 @@ use kernel::{bindings, prelude::*};
 extern "C" {
     fn asahi_zone_temp(name: *const c_char, temp: *mut c_int) -> c_int;
     fn asahi_fans_request(dev: *mut c_void, permille: c_uint, min_step_rpm: c_uint) -> c_int;
+    fn asahi_fans_hotspot_described() -> bool;
+    fn asahi_fans_hotspot_policy(
+        dev: *mut c_void,
+        trigger_mc: *mut c_int,
+        release_mc: *mut c_int,
+        hold_ms: *mut c_uint,
+    ) -> c_int;
+    fn asahi_fans_request_described(dev: *mut c_void, permille: c_uint, min_step_rpm: c_uint)
+        -> c_int;
 }
 
 /// SoC hotspot temperature computed by the SMC (registered as a thermal zone by the SMC driver):
@@ -109,8 +119,23 @@ const GPU_SLACK_PERCENT: i64 = 70;
 const CPU_HEAT_MARGIN_MC: i32 = 2000;
 const CPU_HEAT_FLOOR_SLACK_MW: i64 = 1000;
 
-fn enabled() -> bool {
+pub(super) fn enabled() -> bool {
     crate::module_parameters::m5_thermal_governor.value() & 1 != 0
+}
+
+/// Whether an available SMC hwmon node in the device tree describes hotspot fan assistance
+/// (a single SoC die key, active trip thresholds and hold duration, and at least one settable
+/// fan with apple,fan-manual-control, checked in macsmc-hwmon). Read at probe so a board
+/// without a machine-supplied policy never arms the governor.
+static HOTSPOT_FANS_DESCRIBED: AtomicBool = AtomicBool::new(false);
+
+/// Fan-only assistance: on wherever the SMC's device tree node describes fans a policy may set
+/// and the hotspot, and the host power budget controller (m5_thermal_governor bit 0) is not
+/// enabled. Whenever that controller is enabled it owns the fans with its own curve, so the
+/// assistance never runs beside it; otherwise it leaves the firmware's power budget and CPU
+/// policy in control.
+pub(super) fn hotspot_fans_only() -> bool {
+    !enabled() && HOTSPOT_FANS_DESCRIBED.load(Ordering::Relaxed)
 }
 fn cpu_balance_enabled() -> bool {
     crate::module_parameters::m5_thermal_governor.value() & 4 != 0
@@ -122,8 +147,10 @@ fn fan_boost_enabled() -> bool {
 fn fan_curve_enabled() -> bool {
     crate::module_parameters::m5_thermal_governor.value() & 16 == 0
 }
+/// Whether the governor work runs for a busy GPU: for the budget controller or the fan
+/// assistance.
 pub(super) fn requested() -> bool {
-    enabled()
+    enabled() || hotspot_fans_only()
 }
 fn target_mc() -> i32 {
     let parameter = crate::module_parameters::m5_thermal_target_mc.value();
@@ -194,6 +221,11 @@ fn zone_temperature_mc(_provider: &SensorProvider, name: &CStr) -> Option<i32> {
 /// lookups and sensor reads may sleep.
 pub(crate) fn hotspot_temperature_mc() -> Option<i32> {
     let provider = SensorProvider::acquire()?;
+    if hotspot_fans_only() {
+        // The assistance reads only the input that selected it: the SoC die zone, whose one key
+        // is the hotspot. Without it the fans go back to the SMC.
+        return zone_temperature_mc(&provider, SOC_DIE_ZONE);
+    }
     zone_temperature_mc(&provider, J714_HOTSPOT_ZONE)
         .or_else(|| zone_temperature_mc(&provider, SOC_DIE_ZONE))
         .or_else(|| {
@@ -224,6 +256,8 @@ const FAN_CURVE_STEP_RPM: u32 = 150;
 /// Selects the board's thermal settings at probe; J714's until then.
 pub(crate) fn select_board(board: &super::fw::m5::initdata::Board) {
     FAN_CURVE_START_MC.store(board.fan_curve_start_mc, Ordering::Relaxed);
+    // SAFETY: a device tree lookup without arguments; called from probe, which may sleep.
+    HOTSPOT_FANS_DESCRIBED.store(unsafe { asahi_fans_hotspot_described() }, Ordering::Relaxed);
 }
 
 /// The permille of the fan range the curve asks for at hotspot `temp_mc`.
@@ -247,9 +281,57 @@ fn fan_curve_permille(temp_mc: i32, target_mc: i32) -> i32 {
 /// serializes with its unbinding). A fan whose target is within `min_step_rpm` of the new one
 /// keeps it. Returns the first fan's target rpm, 0 once handed back.
 fn request_fans(permille: u32, min_step_rpm: u32) -> Option<u32> {
-    let provider = SensorProvider::acquire()?;
+    let Some(provider) = SensorProvider::acquire() else {
+        // Unbinding restores the provider's fans.
+        return (permille == 0).then_some(0);
+    };
     // SAFETY: the provider lock keeps the device bound, as the request requires.
     let rpm = unsafe { asahi_fans_request(provider.0.cast(), permille, min_step_rpm) };
+    u32::try_from(rpm).ok()
+}
+
+/// Machine-supplied hotspot fan-assistance thresholds read from the bound
+/// macsmc-hwmon provider (`macsmc_soc_die` active trip temperature, release
+/// temperature from its hysteresis, and minimum hold duration).
+struct HotspotPolicy {
+    trigger_mc: i32,
+    release_mc: i32,
+    hold_ns: u64,
+}
+
+fn hotspot_assist_policy() -> Option<HotspotPolicy> {
+    let provider = SensorProvider::acquire()?;
+    let (mut trigger_mc, mut release_mc, mut hold_ms): (c_int, c_int, c_uint) = (0, 0, 0);
+    // SAFETY: the provider lock keeps the device bound, and all output pointers are valid.
+    let ret = unsafe {
+        asahi_fans_hotspot_policy(
+            provider.0.cast(),
+            &mut trigger_mc,
+            &mut release_mc,
+            &mut hold_ms,
+        )
+    };
+    if ret != 0 || trigger_mc <= release_mc || hold_ms == 0 {
+        return None;
+    }
+    Some(HotspotPolicy {
+        trigger_mc,
+        release_mc,
+        hold_ns: u64::from(hold_ms) * 1_000_000,
+    })
+}
+
+/// [`request_fans`] for hotspot fan assistance: verifies the bound provider's
+/// policy under its device lock and only drives fans marked with
+/// `apple,fan-manual-control` in `macsmc-hwmon`.
+fn request_fans_described(permille: u32, min_step_rpm: u32) -> Option<u32> {
+    let Some(provider) = SensorProvider::acquire() else {
+        // Unbinding restores the provider's fans.
+        return (permille == 0).then_some(0);
+    };
+    // SAFETY: the provider lock keeps the device and its node bound, as the request requires.
+    let rpm =
+        unsafe { asahi_fans_request_described(provider.0.cast(), permille, min_step_rpm) };
     u32::try_from(rpm).ok()
 }
 
@@ -258,7 +340,12 @@ fn request_fans(permille: u32, min_step_rpm: u32) -> Option<u32> {
 /// target.
 /// Released (automatic mode) when the governor releases or the GPU goes idle, after a hold.
 pub(crate) struct FanBoost {
-    boosted: bool,
+    /// Budget-governor full boost (`request_fans`), active or retrying release.
+    budget_boosted: bool,
+    budget_release_pending: bool,
+    /// Hotspot-assistance boost (`request_fans_described`), active or retrying release.
+    hotspot_boosted: bool,
+    hotspot_release_pending: bool,
     since_ns: u64,
     /// The fan target the curve last wrote (rpm), 0 while the fans are automatic.
     curve_rpm: u32,
@@ -266,7 +353,14 @@ pub(crate) struct FanBoost {
 
 impl FanBoost {
     const fn new() -> Self {
-        Self { boosted: false, since_ns: 0, curve_rpm: 0 }
+        Self {
+            budget_boosted: false,
+            budget_release_pending: false,
+            hotspot_boosted: false,
+            hotspot_release_pending: false,
+            since_ns: 0,
+            curve_rpm: 0,
+        }
     }
 
     /// Puts every fan in manual mode at `permille` of its minimum-to-maximum range, or back in
@@ -283,6 +377,11 @@ impl FanBoost {
             // The target rpm moves with the range only when it moved enough.
             if let Some(rpm) = self.set_curve_if_moved(permille) {
                 self.curve_rpm = rpm;
+                self.budget_release_pending = false;
+            } else if self.curve_rpm == 0 {
+                // Drop any partial first curve request and keep release pending
+                // until unrestricted cleanup succeeds.
+                self.budget_release_pending = !self.set_budget(false);
             }
         } else if self.curve_rpm != 0
             && (!busy || temp_mc.is_none_or(|t| t < FAN_CURVE_RELEASE_MC))
@@ -299,46 +398,150 @@ impl FanBoost {
         request_fans(permille.clamp(1, 1000) as u32, step)
     }
 
-    fn set(&mut self, boost: bool) -> bool {
+    fn set_budget(&self, boost: bool) -> bool {
         request_fans(if boost { 1000 } else { 0 }, 0).is_some()
+    }
+
+    fn set_hotspot(&self, boost: bool, step: u32) -> bool {
+        request_fans_described(if boost { 1000 } else { 0 }, step).is_some()
+    }
+
+    fn release_budget(&mut self) -> bool {
+        if self.budget_boosted || self.budget_release_pending || self.curve_rpm != 0 {
+            let released = self.set_budget(false);
+            self.budget_release_pending = !released;
+            self.budget_boosted = false;
+            if released {
+                self.curve_rpm = 0;
+            }
+        }
+        !self.budget_boosted && !self.budget_release_pending && self.curve_rpm == 0
+    }
+
+    fn release_hotspot(&mut self) -> bool {
+        if self.hotspot_boosted || self.hotspot_release_pending {
+            self.hotspot_release_pending = !self.set_hotspot(false, 0);
+            self.hotspot_boosted = false;
+        }
+        !self.hotspot_boosted && !self.hotspot_release_pending
     }
 
     /// Applies one governor step's request. Called from the governor work without driver locks:
     /// SMC accesses sleep.
     fn apply(&mut self, want: bool, temp_mc: Option<i32>, now_ns: u64) {
+        if !enabled() {
+            // Explicit handoff: finish releasing any unrestricted budget-governor
+            // request before running or releasing manual-only hotspot assistance.
+            let had_budget =
+                self.budget_boosted || self.budget_release_pending || self.curve_rpm != 0;
+            if !self.release_budget() {
+                if !hotspot_fans_only() {
+                    let _ = self.release_hotspot();
+                }
+                return;
+            }
+            if had_budget {
+                self.since_ns = 0;
+            }
+            if !hotspot_fans_only() {
+                // The device tree describes no fans for it.
+                let _ = self.release_hotspot();
+                return;
+            }
+            // Only ever request the SMC's rated maximum or release manual-control fans.
+            // Thresholds and hold duration come strictly from the bound
+            // macsmc-hwmon provider's device tree; without them assistance stays off.
+            if self.hotspot_release_pending {
+                let _ = self.release_hotspot();
+                return;
+            }
+            let Some(policy) = hotspot_assist_policy() else {
+                let _ = self.release_hotspot();
+                return;
+            };
+            let threshold = if self.hotspot_boosted {
+                policy.release_mc
+            } else {
+                policy.trigger_mc
+            };
+            if want && temp_mc.is_some_and(|temp| temp >= threshold) {
+                self.since_ns = now_ns;
+                // Requested on every busy, hot step, not only the first: a fan already at its
+                // rated speed for this policy is left alone, and one the SMC took back (the
+                // hwmon cell was unbound and bound again between two such steps, which restores
+                // automatic mode) is set again. Steps in the hold do not request.
+                let step = if self.hotspot_boosted { FAN_CURVE_STEP_RPM } else { 0 };
+                self.hotspot_boosted = self.set_hotspot(true, step);
+                if !self.hotspot_boosted {
+                    // No provider, or a later fan refused after an earlier one accepted.
+                    // Drop any partial manual-only request before retrying on the next tick.
+                    self.hotspot_release_pending = !self.set_hotspot(false, 0);
+                }
+            } else if self.hotspot_boosted
+                && (temp_mc.is_none()
+                    || now_ns.saturating_sub(self.since_ns) >= policy.hold_ns)
+            {
+                // A lost hotspot reading ends the boost at once rather than after the hold:
+                // without the input that started it, the SMC's own policy owns the fans. A step
+                // that finds no provider (an unbound hwmon cell) reads no hotspot either, so a
+                // provider gap ends the boost the same way, and a new one starts at
+                // policy.trigger_mc.
+                let _ = self.release_hotspot();
+            }
+            return;
+        }
+        // Explicit handoff: release any manual-only hotspot request before the
+        // budget governor takes unrestricted fan ownership.
+        let had_hotspot = self.hotspot_boosted || self.hotspot_release_pending;
+        if !self.release_hotspot() {
+            return;
+        }
+        if had_hotspot {
+            self.since_ns = 0;
+        }
+        if self.budget_release_pending && !(want && fan_boost_enabled()) && !self.release_budget() {
+            return;
+        }
         if !fan_boost_enabled() {
             if fan_curve_enabled() {
                 self.apply_curve(want, temp_mc, target_mc(), now_ns);
-            } else if self.curve_rpm != 0 && self.set_curve(None).is_some() {
-                self.curve_rpm = 0;
+            } else if self.curve_rpm != 0 {
+                let _ = self.release_budget();
             }
         }
         let want = want && fan_boost_enabled();
         if want {
             self.since_ns = now_ns;
         }
-        if want && !self.boosted {
-            self.boosted = self.set(true);
-        } else if !want && self.boosted
-            && (!fan_boost_enabled() || now_ns.saturating_sub(self.since_ns) >= FAN_HOLD_NS)
-        {
-            if self.set(false) {
-                self.boosted = false;
+        if want && !self.budget_boosted {
+            self.budget_boosted = self.set_budget(true);
+            if self.budget_boosted {
+                self.budget_release_pending = false;
+            } else {
+                // Drop any partial unrestricted request and keep release pending
+                // until unrestricted cleanup succeeds.
+                self.budget_release_pending = !self.set_budget(false);
             }
+        } else if !want
+            && self.budget_boosted
+            && (!fan_boost_enabled() || now_ns.saturating_sub(self.since_ns) >= FAN_HOLD_NS)
+            && self.set_budget(false)
+        {
+            self.budget_boosted = false;
         }
     }
 
     pub(crate) fn release(&mut self) {
-        if self.boosted && self.set(false) {
-            self.boosted = false;
-        }
-        if self.curve_rpm != 0 && self.set_curve(None).is_some() {
-            self.curve_rpm = 0;
-        }
+        let _ = self.release_budget();
+        let _ = self.release_hotspot();
     }
 
     pub(crate) fn boosted(&self) -> bool {
-        self.boosted || self.curve_rpm != 0
+        self.budget_boosted
+            || self.budget_release_pending
+            || self.hotspot_boosted
+            || self.hotspot_release_pending
+            || self.curve_rpm != 0
     }
 }
 
@@ -679,10 +882,13 @@ impl Governor {
         }
     }
 
+    pub(super) fn recent_activity(&self, now_ns: u64) -> bool {
+        self.last_activity_ns != 0 && now_ns.saturating_sub(self.last_activity_ns) < IDLE_RESTORE_NS
+    }
+
     /// Whether the fans should be boosted: while the controller governs a busy GPU.
     pub(crate) fn fans_wanted(&self, now_ns: u64) -> bool {
-        self.maximum_mw != 0 && self.active
-            && now_ns.saturating_sub(self.last_activity_ns) < IDLE_RESTORE_NS
+        self.maximum_mw != 0 && self.active && self.recent_activity(now_ns)
     }
 
     /// One control step with the hotspot temperature, the GPU's current draw (mW) and whether the

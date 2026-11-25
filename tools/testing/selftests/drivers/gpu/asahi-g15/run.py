@@ -114,7 +114,7 @@ pub mod mmu {
     pub const UAT_PGSZ: usize = 0x4000;
     pub const UAT_PGMSK: usize = UAT_PGSZ - 1;
     pub struct Vm(pub Vec<u8>);
-    pub type VmReadGuard = Vm;
+    pub type VmReadGuard<'a> = Vm;
     impl Vm {
         pub fn read_user(&self, va: u64, out: &mut [u8]) -> Result {
             let start = usize::try_from(va).map_err(|_| EFAULT)?;
@@ -134,7 +134,7 @@ mod command {
         /// cover() calls: the page checks the walk made.
         pub static COVERS: Cell<u32> = Cell::new(0);
     }
-    pub fn cover(vm: &mut mmu::VmReadGuard, start: u64, end: u64, _: bool, _: bool) -> Result {
+    pub fn cover(vm: &mut mmu::VmReadGuard<'_>, start: u64, end: u64, _: bool, _: bool) -> Result {
         COVERS.with(|c| c.set(c.get() + 1));
         if start >= SYNTHETIC {
             return Ok(());
