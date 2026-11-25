@@ -82,8 +82,35 @@ For kernel patches, also follow the existing
 
 ## Pull request rules
 
-Aurora Silicon's rules for pull requests, including how to disclose an LLM's
-help and what commits carry, are in
-[aurora-silicon/agent-guidelines](https://github.com/aurora-silicon/agent-guidelines).
-Run its [pre-PR checklist](https://github.com/aurora-silicon/agent-guidelines/blob/main/pre-pr-checklist.md)
-before opening one.
+See [Aurora Silicon's pull request rules](https://github.com/aurora-silicon/agent-guidelines)
+and run the [pre-PR checklist](https://github.com/aurora-silicon/agent-guidelines/blob/main/pre-pr-checklist.md)
+before opening a pull request.
+
+## Contributing code
+
+`main` is the only branch work lands in. Open every pull request against
+`main` from a short-lived branch:
+
+- `feat/<topic>` for new work, `fix/<topic>` for fixes.
+- `wip/<topic>` for work you park without a pull request. It is not merged
+  from directly; open a `feat/` or `fix/` pull request when it is ready.
+- `archive/<name>` holds old branches kept for their history. Do not push to them.
+- `feat/<area>-<name>` can also be a topic branch for a large feature that
+  takes several pull requests: the parts are reviewed as pull requests into
+  the topic branch, the whole is regression-tested there and lands on `main`
+  as one pull request, and the topic branch is then deleted.
+- `rebase/v<version>` is the single branch for an upstream version upgrade,
+  and `hotfix/v<X.Y.Z>` a short-lived branch for a stable hotfix (see
+  [RELEASES.md](RELEASES.md)).
+
+There are no long-lived release or per-platform branches. The full rules are in
+[branching-and-releases](https://github.com/aurora-silicon/agent-guidelines/blob/main/policy/branching-and-releases.md).
+
+`main` takes changes only through pull requests. The branch rules prevent
+direct pushes, force pushes and deletion. Start new work from a fresh branch
+off `main`. Retarget any stacked pull requests before their base is merged
+and its branch is deleted.
+
+Releases are cut from `main` on a fixed cadence and never wait for unfinished
+work. How the edge, nightly and stable channels are built is in
+[RELEASES.md](RELEASES.md).

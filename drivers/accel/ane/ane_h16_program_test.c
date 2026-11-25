@@ -80,6 +80,9 @@ struct prog_fw {
 	/* ops->hung calls and the error of the last one. */
 	unsigned int hung;
 	int hung_error;
+	/* ops->wake calls and replayed programs during runtime-PM unpark tests. */
+	unsigned int wakes;
+	unsigned int wake_replayed;
 	/*
 	 * Bytes mapped and not unmapped, ops->unmap calls, the most bytes a
 	 * nonzero window lets be mapped at once (-ENOSPC beyond), and the
@@ -3565,6 +3568,158 @@ static void program_recover_gate_test(struct kunit *test)
 	ane_h16_session_put(&f->s, p);
 }
 
+static void fw_cold_boot(struct prog_fw *f);
+
+static int fw_rpm_wake(void *ctx)
+{
+	struct prog_fw *f = ctx;
+	u64 first = 0;
+	int ret;
+
+	if (!READ_ONCE(f->s.parked))
+		return 0;
+	if (READ_ONCE(f->s.wake_blocked))
+		return -EAGAIN;
+	f->wakes++;
+	fw_cold_boot(f);
+	ane_h16_session_restart(&f->s);
+	ret = ane_h16_session_replay(&f->s, &f->wake_replayed, &first);
+	WRITE_ONCE(f->s.parked, false);
+	ane_h16_session_sleep(&f->s, false);
+	return ret;
+}
+
+static const struct ane_h16_session_ops fw_session_ops_rpm = {
+	.map = fw_map,
+	.unmap = fw_unmap,
+	.log = fw_log,
+	.busy = fw_busy,
+	.sync = fw_sync,
+	.wake = fw_rpm_wake,
+	.hung = fw_hung,
+};
+
+/*
+ * H16 runtime-PM idle park + wake/replay across repeat add128 runs:
+ * closing a program while parked defers teardown without unmapping, waking
+ * cold-boots and replays still-open programs behind their handles, releases
+ * deferred closes once back up, and runs repeat EXECUTEs with zero faults.
+ */
+static void program_rpm_park_wake_replay_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test);
+	struct ane_h16_program *a = NULL, *b = NULL;
+	struct mutex *lock = kunit_kzalloc(test, sizeof(*lock), GFP_KERNEL);
+	u8 *exec = kunit_kzalloc(test, sizeof(f->exec), GFP_KERNEL);
+	size_t exec_length;
+	unsigned int round;
+	u32 prog_id;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, lock);
+	KUNIT_ASSERT_NOT_NULL(test, exec);
+	mutex_init(lock);
+	f->s.lock = lock;
+	f->s.ops = &fw_session_ops_rpm;
+	f->strict = true;
+
+	KUNIT_ASSERT_EQ(test, ane_h16_session_enter(&f->s, false), 0);
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &a), 0);
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &b), 0);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, a), 0);
+	mutex_unlock(lock);
+	memcpy(exec, f->exec, sizeof(f->exec));
+	exec_length = f->exec_length;
+	KUNIT_EXPECT_EQ(test, f->busy_on, 1U);
+	KUNIT_EXPECT_EQ(test, f->busy_off, 1U);
+	KUNIT_EXPECT_EQ(test, f->busy_depth, 0);
+
+	/* First park: close b while parked (deferred, no unmap while parked). */
+	ane_h16_session_sleep(&f->s, true);
+	WRITE_ONCE(f->s.parked, true);
+	mutex_lock(lock);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, b), -EINPROGRESS);
+	mutex_unlock(lock);
+	KUNIT_EXPECT_EQ(test, f->unmaps, 0U);
+
+	/* Two park/wake cycles running the same add128 handle cleanly. */
+	for (round = 1; round <= 2; round++) {
+		prog_id = a->key.program;
+		KUNIT_ASSERT_EQ(test, ane_h16_session_enter(&f->s, false), 0);
+		KUNIT_EXPECT_EQ(test, f->wakes, round);
+		KUNIT_EXPECT_EQ(test, f->wake_replayed, 1U);
+		KUNIT_EXPECT_FALSE(test, f->s.parked);
+		KUNIT_EXPECT_EQ(test, a->key.program, prog_id + 0x10);
+		KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, a), 0);
+		mutex_unlock(lock);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x30),
+				ANE_H16_EXECUTE_FLAG_QUEUED);
+		KUNIT_EXPECT_EQ(test, f->exec_length, exec_length);
+		KUNIT_EXPECT_EQ(test, memcmp(f->exec + 0x34, exec + 0x34,
+					     exec_length - 0x34), 0);
+		KUNIT_EXPECT_FALSE(test, f->s.quarantined);
+		if (round == 1) {
+			ane_h16_session_sleep(&f->s, true);
+			WRITE_ONCE(f->s.parked, true);
+		}
+	}
+
+	KUNIT_EXPECT_EQ(test, f->busy_on, 3U);
+	KUNIT_EXPECT_EQ(test, f->busy_off, 3U);
+	mutex_lock(lock);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, a), 0);
+	mutex_unlock(lock);
+	ane_h16_session_put(&f->s, a);
+	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
+}
+
+/*
+ * System sleep while already parked blocks ops->wake (-EAGAIN) without
+ * booting; after PM_POST_SUSPEND unblocks it, the next request wakes and
+ * replays the open program cleanly.
+ */
+static void program_rpm_s2r_while_parked_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test);
+	struct ane_h16_program *p = NULL;
+	struct mutex *lock = kunit_kzalloc(test, sizeof(*lock), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, lock);
+	mutex_init(lock);
+	f->s.lock = lock;
+	f->s.ops = &fw_session_ops_rpm;
+	f->strict = true;
+
+	KUNIT_ASSERT_EQ(test, ane_h16_session_enter(&f->s, false), 0);
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+	mutex_unlock(lock);
+
+	/* Idle park, then S2R starts while parked. */
+	ane_h16_session_sleep(&f->s, true);
+	WRITE_ONCE(f->s.parked, true);
+	WRITE_ONCE(f->s.wake_blocked, true);
+
+	/* O_NONBLOCK sees -EAGAIN and never wakes the engine during sleep. */
+	KUNIT_EXPECT_EQ(test, ane_h16_session_enter(&f->s, true), -EAGAIN);
+	KUNIT_EXPECT_EQ(test, f->wakes, 0U);
+	KUNIT_EXPECT_TRUE(test, f->s.parked);
+	KUNIT_EXPECT_TRUE(test, f->s.asleep);
+
+	/* PM_POST_SUSPEND unblocks wake; next request wakes and replays p. */
+	WRITE_ONCE(f->s.wake_blocked, false);
+	wake_up_all(&f->s.wake);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_enter(&f->s, false), 0);
+	KUNIT_EXPECT_EQ(test, f->wakes, 1U);
+	KUNIT_EXPECT_EQ(test, f->wake_replayed, 1U);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), 0);
+	mutex_unlock(lock);
+	ane_h16_session_put(&f->s, p);
+	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
+}
+
 static struct kunit_case program_cases[] = {
 	KUNIT_CASE_SLOW(program_pool_rewind_test),
 	KUNIT_CASE_SLOW(program_pool_resident_test),
@@ -3595,6 +3750,8 @@ static struct kunit_case program_cases[] = {
 	KUNIT_CASE(program_sleep_gate_test),
 	KUNIT_CASE(program_sleep_gate_quarantine_test),
 	KUNIT_CASE(program_recover_gate_test),
+	KUNIT_CASE(program_rpm_park_wake_replay_test),
+	KUNIT_CASE(program_rpm_s2r_while_parked_test),
 	KUNIT_CASE(program_sleep_keeps_program_test),
 	KUNIT_CASE(program_sleep_restart_test),
 	KUNIT_CASE(program_sleep_restart_deferred_test),

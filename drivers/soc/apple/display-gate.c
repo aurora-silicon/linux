@@ -161,6 +161,14 @@ static struct device_node *gate_pmp_values __initdata;
  */
 static const char gate_pmp_uuid[] __initconst = "2F4EB4C4-001B-3ACF-A9A0-68D8E42FC3A7";
 
+/*
+ * The T6030 PMP image of the 27.2 (26B123) system firmware, as the J516S ADT
+ * names it. Its soc-device records are those of the J516S overlay, and the PMP
+ * report driver checks the running image against the values the boot loader
+ * passes, so the same PMP support takes either image.
+ */
+static const char gate_t6030_pmp_uuid_27_2[] __initconst = "5D66805B-E4AD-335E-BDC3-26828C682AAC";
+
 /* The T8122 PMP image of the 14.x system firmware. */
 static const char gate_t8122_pmp_uuid[] __initconst = "3B18C886-4C70-349B-B1C4-70F35DE2C5CD";
 
@@ -255,6 +263,7 @@ static const struct gate_soc gate_t6030 __initconst = {
 	.dcp_full_name = "dcp@28ec00000",
 	.pmp_values = "/chosen/asahi,t6030-pmp",
 	.pmp_uuid = gate_pmp_uuid,
+	.pmp_uuid_alt = gate_t6030_pmp_uuid_27_2,
 	.report_compat = "apple,t6030-pmp-v2-report",
 	.disp_entry = "report@7",
 	.pmp_dtbo = __dtbo_t6030_pmp_begin,

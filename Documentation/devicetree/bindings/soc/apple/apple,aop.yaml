@@ -20,7 +20,10 @@ select:
       items:
         - enum:
             - apple,t6020-aop
+            - apple,t6030-aop
+            - apple,t6031-aop
             - apple,t8112-aop
+            - apple,t8122-aop
   required:
     - compatible
 
@@ -31,7 +34,10 @@ properties:
           - apple,t6020-aop
           - apple,t8112-aop
       - items:
-          - const: apple,t8122-aop
+          - enum:
+              - apple,t6030-aop
+              - apple,t6031-aop
+              - apple,t8122-aop
           - const: apple,t6020-aop
 
   reg:
@@ -53,8 +59,8 @@ properties:
     maxItems: 8
     description:
       The firmware's external code, data and log segments in DRAM, reserved
-      by the bootloader with their IOVAs in iommu-addresses (T6040, T8122 and
-      T8132). Absent when the bootloader did not reserve them.
+      by the bootloader with their IOVAs in iommu-addresses. Absent when
+      the bootloader did not reserve them.
 
   audio:
     $ref: /schemas/sound/apple,aop-audio.yaml#

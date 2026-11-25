@@ -196,25 +196,41 @@ int main(void)
 '''
 
 
-def _v27_prelude(root, helpers):
-    """Host stand-ins for the OF and DCP calls, then the production display.h
-    helpers named in @helpers, the firmware-27 method tables and
-    dcp_v27_method_table()."""
+def _v27_prelude(root):
+    """Host stand-ins for OF and legacy board checks, then the live selector."""
     display_h = (root / 'include/linux/soc/apple/display.h').read_text()
     uuid_defines = [line for line in display_h.splitlines()
                     if line.startswith(('#define APPLE_T6041_DCP_26B123_UUID ',
                                         '#define APPLE_T8122_DCP_26B123_UUID '))]
     assert len(uuid_defines) == 2
-    helper = '\n'.join((*uuid_defines, *(
-        block(display_h, 'static inline bool ' + name + '(') for name in helpers)))
+    helpers = ('static inline bool apple_dcp_image_v27_2(',
+               'static inline bool apple_t6041_dcp_any_v27_2(',
+               'static inline bool apple_t6041_dcp_v27_2(',
+               'static inline bool apple_t6041_dcpext_v27_2(',
+               'static inline bool apple_t8122_dcp_v27_2(',
+               'static inline bool\napple_t8122_dcpext_v27_2_for_internal(',
+               'static inline bool apple_t8122_dcpext_v27_2(')
+    helper = '\n'.join((*uuid_defines, *(block(display_h, marker) for marker in helpers)))
     iomfb_h = (root / 'drivers/gpu/drm/apple/iomfb.h').read_text()
     methods_decl = iomfb_h[iomfb_h.index('enum dcpep_method {'):
                            iomfb_h.index('#define IOMFB_MAX_CB')]
     v27_c = (root / 'drivers/gpu/drm/apple/iomfb_v27.c').read_text()
     v27_tables = v27_c[v27_c.index('static const struct dcp_method_entry dcp_methods_27_0'):
                        v27_c.index('/* The template\'s calls resolve through')]
-    dcp_c = (root / 'drivers/gpu/drm/apple/dcp.c').read_text()
-    method_table = block(dcp_c, 'static enum dcp_firmware_version dcp_v27_method_table(')
+    apple = root / 'drivers/gpu/drm/apple'
+    dcp_c = (apple / 'dcp.c').read_text()
+    version_defs = '\n'.join(line for line in dcp_c.splitlines()
+                             if line.startswith('#define DCP_FW_VERSION_'))
+    version_enum = block((apple / 'version_utils.h').read_text(),
+                         'enum dcp_firmware_version {') + ';'
+    admission_enum = block((apple / 'dcp.h').read_text(), 'enum dcp_v27_admission {') + ';'
+    selector = '\n'.join(block(dcp_c, marker) for marker in (
+        'static int dcp_read_fw_version(',
+        'static enum dcp_firmware_version dcp_v27_method_table(',
+        'enum dcp_v27_admission dcp_v27_admission(',
+        'static bool dcp_firmware_27(',
+        'static enum dcp_firmware_version dcp_check_firmware_version(',
+    ))
     return r'''
 #include <assert.h>
 #include <errno.h>
@@ -224,20 +240,16 @@ def _v27_prelude(root, helpers):
 #include <string.h>
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 typedef uint32_t u32;
-enum dcp_firmware_version {
-    DCP_FIRMWARE_UNKNOWN,
-    DCP_FIRMWARE_V_26_6_DESKTOP,
-    DCP_FIRMWARE_V_27_0,
-};
+''' + version_defs + '\n' + version_enum + '\n' + admission_enum + r'''
 struct dcp_v14_board;
 struct apple_dcp_hw_data { enum dcp_firmware_version firmware_compat; };
 struct device_node {
     const char *compatible;
     const char *uuid;
     int uuid_count;
-    u32 fw[3];
+    u32 fw[DCP_FW_VERSION_MAX_LEN];
     int fw_cells;
-    u32 compat[3];
+    u32 compat[DCP_FW_VERSION_MAX_LEN];
     int compat_cells;
 };
 struct device {
@@ -248,11 +260,11 @@ static int of_device_is_compatible(const struct device_node *np, const char *s)
 {
     return np && np->compatible && !strcmp(np->compatible, s);
 }
-/* The tree's display processors, for of_find_compatible_node(); unused by some units. */
+/* The tree's display processors, for of_find_compatible_node(). */
 static struct device_node *of_nodes[2];
 static int of_node_refs;
-__attribute__((unused)) static struct device_node *of_find_compatible_node(struct device_node *from,
-                                                                         const char *type, const char *s)
+static struct device_node *of_find_compatible_node(struct device_node *from,
+                                                    const char *type, const char *s)
 {
     assert(!from && !type);
     for (unsigned i = 0; i < 2; i++)
@@ -262,7 +274,7 @@ __attribute__((unused)) static struct device_node *of_find_compatible_node(struc
         }
     return NULL;
 }
-__attribute__((unused)) static void of_node_put(struct device_node *np)
+static void of_node_put(struct device_node *np)
 {
     if (np)
         assert(of_node_refs-- > 0);
@@ -290,29 +302,30 @@ static int of_property_count_u32_elems(const struct device_node *np, const char 
         return np->compat_cells;
     return -1;
 }
-static int of_property_read_u32_array(const struct device_node *np, const char *name, u32 *out, size_t n)
+static int of_property_read_variable_u32_array(const struct device_node *np, const char *name,
+                                               u32 *out, int min, int max)
 {
+    int cells = of_property_count_u32_elems(np, name);
     const u32 *src;
-    int cells;
-    if (!np || n != 3)
-        return -1;
-    if (!strcmp(name, "apple,firmware-version")) {
-        src = np->fw;
-        cells = np->fw_cells;
-    } else if (!strcmp(name, "apple,firmware-compat")) {
-        src = np->compat;
-        cells = np->compat_cells;
-    } else {
-        return -1;
-    }
-    if (cells != 3)
-        return -1;
-    memcpy(out, src, 3 * sizeof(u32));
-    return 0;
+
+    if (cells < min || cells > max)
+        return -EINVAL;
+    src = !strcmp(name, "apple,firmware-version") ? np->fw : np->compat;
+    memcpy(out, src, cells * sizeof(*out));
+    return cells;
 }
-#define DCP_FW_VERSION_STR_LEN 32
+static int of_property_read_u32_array(const struct device_node *np, const char *name, u32 *out, int n)
+{
+    int ret = of_property_read_variable_u32_array(np, name, out, n, n);
+
+    return ret < 0 ? ret : 0;
+}
+#define scnprintf snprintf
+#define strscpy(dst, src, size) snprintf((dst), (size), "%s", (src))
 #define GFP_KERNEL 0
-#define dev_err(...) ((void)0)
+#define dev_warn(...) ((void)0)
+#define IS_ERR(ptr) false
+static void dev_err(struct device *dev, const char *format, ...) {}
 static void *devm_kmemdup(struct device *dev, const void *src, size_t len, unsigned int gfp)
 {
     (void)dev; (void)src; (void)len; (void)gfp;
@@ -322,29 +335,121 @@ static const struct apple_dcp_hw_data *of_device_get_match_data(struct device *d
 {
     return dev->hw;
 }
-static int dcp_read_fw_version(struct device *dev, const char *name, char *out)
+/* No internal board profile is present in these fixtures. */
+static bool of_property_present(struct device_node *np, const char *name)
 {
-    u32 v[3];
-    if (of_property_count_u32_elems(dev->of_node, name) != 3 ||
-        of_property_read_u32_array(dev->of_node, name, v, 3))
-        return -1;
-    snprintf(out, DCP_FW_VERSION_STR_LEN, "%u.%u.%u", v[0], v[1], v[2]);
-    return 3;
+    assert(!strcmp(name, "apple,j613-25g83-profile"));
+    return false;
 }
-''' + helper + '\n' + methods_decl + '\n' + v27_tables + '\n' + method_table + '\n'
+static bool apple_t8122_25g83_board(void) { return false; }
+static int of_property_read_u32(struct device_node *np, const char *name, u32 *out)
+{
+    return -ENOENT;
+}
+static const struct dcp_v14_board *iomfb_v14_7_board(struct device *dev) { return NULL; }
+static const char *iomfb_v14_7_board_name(const struct dcp_v14_board *board) { return ""; }
+static bool ext26;
+static bool dcp_ext26_admitted(struct device_node *np) { return ext26; }
+''' + helper + '\n' + methods_decl + '\n' + v27_tables + '\n' + selector + '\n'
+
+
+def v27_panel_handoff(root):
+    source = (root / 'drivers/gpu/drm/apple/dcp.c').read_text()
+    profiles = ('t6030', 't8122', 't6031', 't6041')
+    match = '\n'.join(block(source, f'static const struct apple_dcp_hw_data apple_dcp_hw_{soc} =')
+                      + ';' for soc in profiles)
+    profile = block(source, 'static void dcp_apply_dt_profile(')
+    return r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <string.h>
+typedef uint8_t u8;
+typedef uint32_t u32;
+enum { DCP_FIRMWARE_V_27_0 = 27 };
+struct device_node {
+    bool rtkit_handoff;
+    const char *marker;
+    u32 value;
+};
+struct device { struct device_node *of_node; };
+struct apple_dcp_hw_data {
+    bool adopt_live_session;
+    const char *iboot_handoff;
+    unsigned num_dptx_ports;
+    u8 firmware_dma_bits;
+};
+struct apple_dcp {
+    struct device *dev;
+    struct apple_dcp_hw_data hw;
+    int fw_compat;
+};
+static bool of_property_present(struct device_node *np, const char *name)
+{
+    assert(!strcmp(name, "apple,rtkit-handoff"));
+    return np->rtkit_handoff;
+}
+static int of_property_read_variable_u32_array(struct device_node *np, const char *name,
+                                               u32 *value, int min, int max)
+{
+    assert(min == 1 && max == 1);
+    if (!np->marker || strcmp(name, np->marker))
+        return -1;
+    *value = np->value;
+    return 1;
+}
+/* All probes see the same DART aperture and panel-only topology. */
+static u8 dcp_dart_dma_bits(struct device_node *np) { return 41; }
+static bool dcp_is_internal_panel_only(struct apple_dcp *dcp) { return true; }
+''' + match + '\n' + profile + r'''
+static void check(struct apple_dcp_hw_data hw, struct device_node node, bool live)
+{
+    struct device dev = { .of_node = &node };
+    struct apple_dcp dcp = { .dev = &dev, .hw = hw, .fw_compat = DCP_FIRMWARE_V_27_0 };
+
+    dcp_apply_dt_profile(&dcp);
+    assert(dcp.hw.adopt_live_session == live);
+    assert(dcp.hw.firmware_dma_bits == 41);
+    assert(dcp.hw.num_dptx_ports == 0);
+}
+
+int main(void)
+{
+    const struct {
+        const struct apple_dcp_hw_data *hw;
+        const char *marker;
+    } panels[] = {
+        { &apple_dcp_hw_t6030, "apple,t6030-handoff" },
+        { &apple_dcp_hw_t8122, "apple,t8122-handoff" },
+        { &apple_dcp_hw_t6031, "apple,t6031-handoff" },
+        { &apple_dcp_hw_t6041, "apple,t6041-handoff" },
+    };
+
+    for (unsigned i = 0; i < sizeof(panels) / sizeof(panels[0]); i++) {
+        struct apple_dcp_hw_data hw = *panels[i].hw;
+        struct device_node node = {};
+
+        check(hw, node, false);
+        node.rtkit_handoff = true;
+        check(hw, node, true);
+        node.rtkit_handoff = false;
+        node.marker = panels[i].marker;
+        check(hw, node, false);
+        node.value = 1;
+        check(hw, node, true);
+        node.marker = panels[i ? 0 : 1].marker;
+        check(hw, node, false);
+    }
+    return 0;
+}
+'''
 
 
 def t6041_v27_admission(root):
-    dcp_c = (root / 'drivers/gpu/drm/apple/dcp.c').read_text()
-    selector_full = block(dcp_c, 'static enum dcp_firmware_version dcp_check_firmware_version(')
-    cutoff = '\n\tret = dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);\n\tif (ret < 0)'
-    selector = selector_full[:selector_full.index(cutoff)] + '\n\t(void)v14_board;\n\treturn DCP_FIRMWARE_UNKNOWN;\n}\n'
-    return _v27_prelude(root, ('apple_dcp_image_v27_2',
-                               'apple_t6041_dcp_any_v27_2', 'apple_t6041_dcp_v27_2',
-                               'apple_t6041_dcpext_v27_2', 'apple_t8122_dcp_v27_2')) + selector + r'''
+    return _v27_prelude(root) + r'''
 static struct device_node node;
-static struct apple_dcp_hw_data hw_t6041;
-static struct device dev = { .of_node = &node, .hw = &hw_t6041 };
+static const struct apple_dcp_hw_data hw;
+static struct device dev = { .of_node = &node, .hw = &hw };
 
 static void reset_t6041_26b123(bool ext)
 {
@@ -387,10 +492,14 @@ int main(void)
     assert(apple_t6041_dcpext_v27_2(&node));
     assert(dcp_check_firmware_version(&dev) == DCP_FIRMWARE_V_27_0);
 
-    for (unsigned ext = 0; ext < 2; ext++) {
-        /* Reject non-T6041 DCP compatibles. */
-        reset_t6041_26b123(ext); node.compatible = "apple,t6031-dcp"; expect_rejected();
+    /* A different SoC follows generic admission, without the T6041 UUID pin. */
+    node.compatible = "apple,t6031-dcp";
+    node.uuid_count = 0;
+    assert(!apple_t6041_dcp_v27_2(&node));
+    assert(!apple_t6041_dcpext_v27_2(&node));
+    assert(dcp_check_firmware_version(&dev) == DCP_FIRMWARE_V_27_0);
 
+    for (unsigned ext = 0; ext < 2; ext++) {
         /* Reject missing, multi-string, or non-26B123 firmware UUIDs (including 26B131). */
         reset_t6041_26b123(ext); node.uuid_count = 0; expect_rejected();
         reset_t6041_26b123(ext); node.uuid_count = 2; expect_rejected();
@@ -419,11 +528,9 @@ int main(void)
     }
     /*
      * The M3 Air's (T8122) internal DCP handed over with its 27.2 image runs
-     * the 27.2 table, on any T8122 board; its dcpext, another image, its
-     * 14.x image and other releases do not.
+     * the 27.2 table. The external processor needs the internal handoff,
+     * other firmware-27 images are refused and 14.7 stays on a legacy ABI.
      */
-    static struct apple_dcp_hw_data hw_t8122;
-    dev.hw = &hw_t8122;
     reset_t6041_26b123(false);
     node.compatible = "apple,t8122-dcp";
     node.uuid = APPLE_T8122_DCP_26B123_UUID;
@@ -439,53 +546,33 @@ int main(void)
     assert(dcp_check_firmware_version(&dev) == DCP_FIRMWARE_UNKNOWN);
     node.uuid = APPLE_T8122_DCP_26B123_UUID;
     node.uuid_count = 0; assert(!apple_t8122_dcp_v27_2(&node));
+    assert(dcp_check_firmware_version(&dev) == DCP_FIRMWARE_UNKNOWN);
     node.uuid_count = 2; assert(!apple_t8122_dcp_v27_2(&node));
+    assert(dcp_check_firmware_version(&dev) == DCP_FIRMWARE_UNKNOWN);
     node.uuid_count = 1;
     node.fw[0] = 14; node.fw[1] = 7; node.fw[2] = 0;
     node.compat[0] = 14; node.compat[1] = 7; node.compat[2] = 0;
     assert(!apple_t8122_dcp_v27_2(&node));
-    assert(dcp_check_firmware_version(&dev) == DCP_FIRMWARE_UNKNOWN);
+    assert(dcp_check_firmware_version(&dev) == DCP_FIRMWARE_V_14_7_TEMPLATE);
     node.fw[0] = 27; node.fw[1] = 2; node.fw[2] = 1;
     node.compat[0] = 27; node.compat[1] = 2; node.compat[2] = 1;
     assert(!apple_t8122_dcp_v27_2(&node));
+    assert(dcp_check_firmware_version(&dev) == DCP_FIRMWARE_UNKNOWN);
     node.fw[2] = 0; node.compat[2] = 0;
     assert(apple_t8122_dcp_v27_2(&node));
 
-    dev.hw = &hw_t6041;
     puts("PASS T6041 26B123 v27.2 internal/external admission, refusal controls, and desktop 26.x preservation");
-    puts("PASS T8122 internal DCP on its 27.2 image alone runs the 27.2 table");
+    puts("PASS T8122 internal DCP needs its 27.2 image for the 27.2 table");
     return 0;
 }
 '''
 
 
 def t8122_dcpext_v27_admission(root):
-    """apple_t8122_dcpext_v27_2() and the apple,t8122-dcpext arm of
-    dcp_check_firmware_version(), both as the tree has them."""
-    dcp_c = (root / 'drivers/gpu/drm/apple/dcp.c').read_text()
-    selector = block(dcp_c, 'static enum dcp_firmware_version dcp_check_firmware_version(')
-    arm = block(selector, selector.index(
-        'if (of_device_is_compatible(dev->of_node, "apple,t8122-dcpext")) {'))
-    unit = _v27_prelude(root, ('apple_dcp_image_v27_2', 'apple_t8122_dcp_v27_2',
-                               'apple_t8122_dcpext_v27_2'))
-    # The arm runs with the firmware-compat the selector read before it.
-    return r'''
-#define DCP_FIRMWARE_H17P 0x17
-#define DCP_FIRMWARE_V_14_7_TEMPLATE 0x147
-''' + unit + r'''
-static bool ext26;
-static bool dcp_ext26_admitted(struct device_node *np) { (void)np; return ext26; }
-static enum dcp_firmware_version t8122_dcpext_arm(struct device *dev)
-{
-    char compat_str[DCP_FW_VERSION_STR_LEN] = "";
-
-    dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
-    ''' + arm + r'''
-    return DCP_FIRMWARE_UNKNOWN;
-}
-
+    return _v27_prelude(root) + r'''
 static struct device_node dcp, dcpext;
-static struct device dev = { .of_node = &dcpext };
+static const struct apple_dcp_hw_data hw;
+static struct device dev = { .of_node = &dcpext, .hw = &hw };
 
 static void set(u32 *v, u32 a, u32 b, u32 c) { v[0] = a; v[1] = b; v[2] = c; }
 
@@ -509,7 +596,7 @@ static void reset(void)
 static void expect(bool v27_2, enum dcp_firmware_version want)
 {
     assert(apple_t8122_dcpext_v27_2(&dcpext) == v27_2);
-    assert(t8122_dcpext_arm(&dev) == want);
+    assert(dcp_check_firmware_version(&dev) == want);
     assert(!of_node_refs);
 }
 
@@ -546,14 +633,16 @@ int main(void)
     expect(false, DCP_FIRMWARE_UNKNOWN);
     reset(); dcpext.fw_cells = 0; expect(false, DCP_FIRMWARE_UNKNOWN);
     reset(); dcpext.compat_cells = 4; expect(false, DCP_FIRMWARE_UNKNOWN);
+    /* A 27.x refusal is terminal even if the legacy gate would admit it. */
+    reset(); ext26 = true; dcp.uuid_count = 0; expect(false, DCP_FIRMWARE_UNKNOWN);
     puts("PASS T8122 dcpext 27.2 refuses other or malformed versions");
 
     /* The 14.7 template and the native 26.x path are as before. */
     reset(); set(dcpext.fw, 14, 7, 0); set(dcpext.compat, 14, 7, 0);
     expect(false, DCP_FIRMWARE_V_14_7_TEMPLATE);
-    reset(); ext26 = true; expect(true, DCP_FIRMWARE_H17P);
     reset(); set(dcpext.fw, 26, 6, 2); set(dcpext.compat, 26, 6, 2);
     expect(false, DCP_FIRMWARE_UNKNOWN);
+    ext26 = true; expect(false, DCP_FIRMWARE_H17P);
     puts("PASS T8122 dcpext 14.7.0 keeps the template, native 26.x keeps H17P");
     return 0;
 }

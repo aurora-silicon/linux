@@ -47,9 +47,9 @@ const CONFIG: usize = 0;
 const ANNOUNCE: usize = 0x800;
 const PREDECESSOR: usize = 0x400;
 const POINTERS: usize = 0x100;
-/// Producer/consumer words live on their own uncached page after the graph,
-/// which the firmware reads through a cached mapping (queue record, job-list
-/// head and item ring), as native does.
+/// Producer/consumer words live on their own page after the graph. The whole
+/// graph stays uncached because both the firmware and host write the queue
+/// record (on owner rebinds) and item ring.
 const CURSORS: usize = GRAPH_SIZE;
 const ITEMS: usize = 0x4000;
 const STAMP: usize = 0x300;
@@ -106,18 +106,20 @@ pub(crate) struct DescriptorRing {
 }
 
 impl DescriptorRing {
-    /// Firmware reads every descriptor through a cached kernel mapping, as it
-    /// does for render. The pool keeps that mapping until processor stop; the
-    /// hardware reads the same pages through an uncached canonical low alias.
-    /// On M5 the kernel mapping, in the upper half every execution context
-    /// includes, is firmware-only.
+    /// Keep compute descriptors uncached while retaining their VA and fence in
+    /// the pool: M5 common firmware clears the descriptor's accounting counter
+    /// at `+0xfac`, and the host rewrites each slot every 32 kicks, so a
+    /// firmware-cached mapping carries the same dirty-line writeback hazard.
+    /// The hardware reads the same pages through an uncached canonical low
+    /// alias; on M5 the kernel mapping, in the upper half every execution
+    /// context includes, is firmware-only.
     pub(crate) fn new(alloc: &Allocator<'_>, objects: &Arc<Pool>) -> Result<Self> {
         let size = DESCRIPTORS * COMPUTE_DESCRIPTOR_SIZE;
         let object = objects.allocate(
             alloc,
             Family::Descriptor,
             size,
-            size,
+            0,
             if alloc.uat.is_m5() { mmu::PROT_FW_SHARED_RW } else { mmu::PROT_GPU_FW_SHARED_RW },
             CpuMap::WriteCombined,
         )?;
@@ -141,7 +143,7 @@ struct Graph {
     operand: KernelObject,
     support: KernelObject,
     m5_timestamps: Option<Arc<KernelObject>>,
-    graph: PooledObject,
+    graph: KernelObject,
     context_low: Option<KernelObject>,
     context_high: Option<KernelObject>,
     /// Announcements, which stay uncached for the firmware.
@@ -191,14 +193,14 @@ impl Graph {
             support.write(0x110, 0x50u32)?;
             support.write(mmu::UAT_PGSZ + 4, 1u32)?;
         }
-        let mut graph = objects.allocate(
-            alloc,
-            Family::QueueState,
-            GRAPH_SIZE + mmu::UAT_PGSZ,
-            GRAPH_SIZE,
-            prot,
-            cpu,
-        )?;
+        // Keep the compute graph uncached: the firmware writes runtime state
+        // into the queue record while the host rewrites its owner fields on
+        // rebind (`Graph::set_owner`) and wraps the item ring. Firmware-cached
+        // G17 mappings are non-coherent with host writes and cannot be flushed,
+        // so dirty firmware lines would revert host updates. An installed
+        // compute graph lives until firmware stop and does not need the reuse
+        // pool.
+        let mut graph = alloc.kernel(GRAPH_SIZE + mmu::UAT_PGSZ, page, prot, cpu)?;
         let graph_va = graph.gpu_va();
         graph.initialize::<GraphLayout>(0, |view| {
             view.pointers = PointerBlock::new(&pointers)?;
@@ -308,8 +310,16 @@ impl Graph {
                 .cast::<crate::g17::fw::m5::queue::QueueRecord>();
             // SAFETY: The checked packed record stays mapped. The device mutex
             // and idle witness exclude access by another owner during this update.
-            return unsafe { (*pointer).set_compute_owner(context.work_head_va(),
-                context.scheduler_va(), context.owner_pid(), context.policy()) };
+            unsafe {
+                (*pointer).set_compute_owner(
+                    context.work_head_va(),
+                    context.scheduler_va(),
+                    context.owner_pid(),
+                    context.policy(),
+                )
+            }?;
+            fence(Ordering::Release);
+            return Ok(());
         }
         let pointer = self
             .graph
@@ -325,6 +335,7 @@ impl Graph {
                 context.policy(),
             )
         };
+        fence(Ordering::Release);
         Ok(())
     }
 
@@ -1044,6 +1055,18 @@ impl Queue {
         self.retired_by_teardown
             || self.retire_pending
             || masks.is_none_or(|m| m[self.qid() as usize / 64] & (1 << (self.qid() % 64)) != 0)
+    }
+
+    pub(crate) fn needs_scan_retire(&self, masks: Option<[u64; 2]>) -> bool {
+        self.configuration.is_some() || (!self.quarantined && self.selected(masks))
+    }
+
+    pub(crate) fn has_terminal(&self) -> bool {
+        self.terminal.is_some()
+    }
+
+    pub(crate) fn awaiting_witness(&self) -> bool {
+        self.awaiting_witness
     }
     /// Stage every unlatched exact identity before the device's single shared-ring scan,
     /// whichever queues the scan's batch retires.
@@ -2532,7 +2555,7 @@ impl Graph {
             (object, record_start(slot, offset, window, stride)?)
         } else {
             let start = record_start(0, offset, window, GRAPH_SIZE - 0x6800)?;
-            (&mut *self.graph, 0x6800 + start)
+            (&mut self.graph, 0x6800 + start)
         };
         if core::mem::size_of::<T>() > window {
             return Err(EINVAL);

@@ -37,6 +37,7 @@
 #include <drm/drm_print.h>
 #include <drm/drm_vblank.h>
 
+#include "av.h"
 #include "cec.h"
 #include "dcp.h"
 #include "dcp-hdr-metadata.h"
@@ -2974,6 +2975,11 @@ int dcp_get_modes(struct drm_connector *connector)
 	}
 
 edid_done:
+	/*
+	 * The connector's ELD follows its EDID: a card connected before this
+	 * EDID was published (a Type-C route's service opens first) takes it now.
+	 */
+	av_audio_sink_changed(dcp);
 	/* Discovery can replace the catalogue while the OOB read waits. */
 	if (dcp_is_ext26(dcp)) {
 		if (READ_ONCE(dcp->crashed) || READ_ONCE(dcp->ext26_blocked))
