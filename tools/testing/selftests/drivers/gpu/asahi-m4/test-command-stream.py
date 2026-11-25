@@ -87,7 +87,7 @@ render_admission = (
 g17 = (ROOT / 'drivers/gpu/drm/asahi/g17/command.rs').read_text()
 # The stage-prefix offset and the render payload reader precede the parser.
 g17_parser = g17[g17.index('/// Where a render command\'s stage-prefix fields start'):g17.index('#[derive(Clone, Copy, PartialEq, Eq)]')]
-g17_constants = '\n'.join(re.findall(r'const (?:RENDER_BASE_SIZE|COMPUTE_BASE_SIZE): usize = .*?;|const (?:RENDER_TIMESTAMP_COPIES|COMPUTE_TIMESTAMP_COPIES): Range<usize> = .*?;', g17, re.S))
+g17_constants = '\n'.join(re.findall(r'const (?:RENDER_BASE_SIZE|COMPUTE_BASE_SIZE|ATTACHMENT_KINDS): usize = .*?;|const (?:RENDER_TIMESTAMP_COPIES|COMPUTE_TIMESTAMP_COPIES): Range<usize> = .*?;', g17, re.S))
 reader = (ROOT / 'drivers/gpu/drm/asahi/util.rs').read_text()
 reader = reader[reader.index('pub(crate) unsafe trait AnyBitPattern:'):]
 harness = r'''
@@ -124,7 +124,7 @@ mod uapi { include!("FULL_UAPI"); }
 mod file { pub const MAX_COMMANDS_PER_SUBMISSION: u32 = 64; }
 mod hw {
     pub const USER_RANGE: core::ops::Range<u64> = 0x4000..((1u64 << 42) - 0x8000);
-    pub mod sizes { pub const MAX_ATTACHMENTS: usize = 16; }
+    pub mod sizes { pub const MAX_ATTACHMENTS: usize = 16; pub const TA_LIGHT_TILEMAP_BYTES: u64 = 64 * 1024; }
     pub mod client { pub const PB_HEAP_SIZE:u64=0x10000000; CAPACITIES }
 }
 mod fw {

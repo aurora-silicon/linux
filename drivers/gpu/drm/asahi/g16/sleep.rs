@@ -60,6 +60,8 @@ impl Firmware {
 
     /// The run bit and the RTKit handshake, with the firmware's state as it was left.
     fn sleep_restart(&mut self) -> Result {
+        // Start the next render on each pass slot fresh after the firmware restarts.
+        self.pools.invalidate();
         self.session.rtkit.warm_restart()?;
         let control = self.session.regs.asc_control()?;
         self.session.regs.set_asc_control(control | ASC_RUN)?;
@@ -284,6 +286,9 @@ impl Shared {
 impl Gpu {
     /// Called before any device suspends. Only a sleep that powers the SoC down gets here.
     fn sleep_prepare(&self) -> Result {
+        if !self.cfg.deep_sleep {
+            return Err(EBUSY);
+        }
         let result = self.shared.sleep_down();
         if let Err(error) = result {
             dev_warn!(self.shared.dev.as_ref(), "GPU refused sleep: {:?}\n", error);

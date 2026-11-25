@@ -77,6 +77,8 @@ pub(crate) struct PbStats {
     /// render counts again when it is retried).
     pub(crate) reused: u64,
     pub(crate) fresh: u64,
+    /// Retirements that replaced an open VM's owner epoch still kept as that VM's last epoch.
+    pub(crate) kept: u64,
 }
 
 pub(crate) struct PoolSet {
@@ -487,7 +489,8 @@ pub(crate) struct Pools {
     pending_arenas: [Option<super::resources::PbOwnerArena>; sizes::PB_SLOTS],
     pending_uma: [Option<Arc<FwLease>>; sizes::PB_SLOTS],
     /// Per allocator slot, a binding count, bumped by each fresh epoch (its InitBM rebinds the
-    /// slot) and by a firmware recovery. It identifies a binding without holding the epoch.
+    /// slot) and by a firmware recovery or sleep restart. It identifies a binding without
+    /// holding the epoch.
     binds: [u64; sizes::PB_SLOTS],
     /// Per allocator slot: `owners[k]` may serve the next render of its VM without InitBM.
     keep: [bool; sizes::PB_SLOTS],
@@ -501,7 +504,17 @@ pub(crate) struct Pools {
     quarantined: [bool; sizes::PB_SLOTS],
     /// Fresh PB epoch retained when an aborted render had not yet replaced `owners[k]`.
     quarantined_epochs: [Option<Arc<PbEpoch>>; sizes::PB_SLOTS],
+    /// Per TTBAT slot, the epoch of the last render its VM retired, kept until a newer render
+    /// of the same VM retires. The parameter manager writes back to the page list of the
+    /// manager a context used last, through that context, when the context's next InitBM
+    /// runs, also after another VM's epoch replaced `owners[k]` on the old slot. An entry
+    /// holds its VM and so the TTBAT slot that indexes it.
+    vm_last: [Option<Arc<PbEpoch>>; VM_LAST_ENTRIES],
+    /// A closed VM's [`Self::vm_last`] entry was recorded since the last reclaim pass.
+    closed_vm_last: bool,
 }
+/// Entries of [`Pools::vm_last`]: one per TTBAT user slot (ASIDs `1..=MAX_VMS`).
+const VM_LAST_ENTRIES: usize = sizes::MAX_VMS as usize + 1;
 impl Pools {
     #[allow(dead_code)]
     pub(crate) fn new(dev: &AsahiDrmDevice) -> Self {
@@ -523,6 +536,8 @@ impl Pools {
             inflight: [0; sizes::PB_SLOTS],
             quarantined: [false; sizes::PB_SLOTS],
             quarantined_epochs: [const { None }; sizes::PB_SLOTS],
+            vm_last: [const { None }; VM_LAST_ENTRIES],
+            closed_vm_last: false,
         }
     }
     /// Allocates [`Pools`] directly on the heap so probe/backend bring-up does not stage the
@@ -549,6 +564,8 @@ impl Pools {
                 inflight: [0; sizes::PB_SLOTS],
                 quarantined: [false; sizes::PB_SLOTS],
                 quarantined_epochs: [const { None }; sizes::PB_SLOTS],
+                vm_last: [const { None }; VM_LAST_ENTRIES],
+                closed_vm_last: false,
             }),
             GFP_KERNEL,
         )?)
@@ -962,6 +979,14 @@ impl Pools {
         if self.quarantined[k] {
             return Ok(());
         }
+        if self.owners[k].as_ref().is_some_and(|old| {
+            !Arc::ptr_eq(&old._vm, &epoch._vm) && !old._vm.vm.is_closed() && self.is_vm_last(old)
+        }) {
+            self.stats.kept += 1;
+        }
+        if completed {
+            self.note_vm_last(epoch);
+        }
         self.owners[k] = Some(epoch.clone());
         self.retained_pb[k] = Some(epoch.records_lease());
         if let Some(vm) = self.pending_vms[k].take() {
@@ -976,6 +1001,33 @@ impl Pools {
         self.last_clean_retired = Some(k);
         self.retire_epoch(k, binding, completed);
         Ok(())
+    }
+    /// Whether `epoch` is the last retired epoch of its VM ([`Self::vm_last`]).
+    fn is_vm_last(&self, epoch: &Arc<PbEpoch>) -> bool {
+        self.vm_last
+            .get(epoch._vm.slot as usize)
+            .and_then(Option::as_ref)
+            .is_some_and(|last| Arc::ptr_eq(last, epoch))
+    }
+    /// A render of `epoch` retired normally: its VM's context has run that render's InitBM (or
+    /// reused the epoch), so the VM's earlier epoch is no longer written and may go. A closed
+    /// VM keeps an entry only until [`Self::reclaim_closed`] finds nothing of it pending.
+    fn note_vm_last(&mut self, epoch: &Arc<PbEpoch>) {
+        let vm = &epoch._vm;
+        let closed = vm.vm.is_closed();
+        let Some(entry) = self.vm_last.get_mut(vm.slot as usize) else {
+            return;
+        };
+        if entry.as_ref().is_some_and(|last| Arc::ptr_eq(last, epoch)) {
+            return;
+        }
+        *entry = Some(epoch.clone());
+        self.closed_vm_last |= closed;
+    }
+    /// Whether a closed VM's entry was recorded since the last call: [`Self::reclaim_closed`]
+    /// must run again to release it.
+    pub(crate) fn take_closed_vm_last(&mut self) -> bool {
+        core::mem::take(&mut self.closed_vm_last)
     }
     /// Quarantines allocator slot `k` permanently after a passed abort, retaining all leases
     /// including any fresh epoch published on the aborted flight alongside `owners[k]`.
@@ -1011,7 +1063,8 @@ impl Pools {
         *binds
     }
     /// A render on slot `k` with `binding` retired, after its `retire_binding`. If no other
-    /// epoch was bound and no recovery started since, the next render of the same VM may reuse
+    /// epoch was bound and no recovery or sleep restart happened since, the next render of the
+    /// same VM may reuse
     /// its epoch after a `completed` render; after a failed one it starts fresh.
     pub(crate) fn retire_epoch(&mut self, k: usize, binding: u64, completed: bool) {
         if self.binds.get(k) == Some(&binding) {
@@ -1042,6 +1095,7 @@ impl Pools {
     /// The owner epoch itself stays until a newer epoch retires on its slot
     /// ([`Self::retire_flight`]): `pb_mgr_table[k]` keeps naming its manager, and the parameter
     /// manager can still write that manager's page list through the context of the epoch's VM.
+    /// Also releases a closed VM's [`Self::vm_last`] entry once nothing of that VM is pending.
     pub(crate) fn reclaim_closed(&mut self) -> bool {
         let mut remaining = false;
         for k in 0..sizes::PB_SLOTS {
@@ -1076,6 +1130,26 @@ impl Pools {
                 remaining = true;
             }
         }
+        // A closed VM accepts no new render. Once none it accepted waits for publication or
+        // retirement, its context runs no further InitBM and its last epoch may go. A render
+        // left on a quarantined slot keeps its VM there anyway.
+        for i in 0..VM_LAST_ENTRIES {
+            let Some(vm) = self.vm_last[i].as_ref().map(|last| &last._vm) else {
+                continue;
+            };
+            if !vm.vm.is_closed() {
+                continue;
+            }
+            let pending = (0..sizes::PB_SLOTS).any(|k| {
+                !self.quarantined[k]
+                    && self.pending_vms[k].as_ref().is_some_and(|p| Arc::ptr_eq(p, vm))
+            });
+            if pending || vm.renders_unpublished() {
+                remaining = true;
+            } else {
+                self.vm_last[i] = None;
+            }
+        }
         remaining
     }
     #[allow(dead_code)]
@@ -1087,12 +1161,13 @@ impl Pools {
     pub(crate) fn write_stats(&self, f: &mut impl fmt::Write) -> fmt::Result {
         writeln!(
             f,
-            "pb: M4 private allocators blocks {} requests {} bad {} reused {} fresh {}",
+            "pb: M4 private allocators blocks {} requests {} bad {} reused {} fresh {} kept {}",
             buffer::MAX_BLOCKS,
             self.stats.requests,
             self.stats.bad,
             self.stats.reused,
-            self.stats.fresh
+            self.stats.fresh,
+            self.stats.kept
         )
     }
 }
@@ -1180,8 +1255,22 @@ impl PbEpoch {
 
     /// Like [`Self::prepare`], recording whether this epoch is bound to the VM's SCS-capable
     /// render allocators (`scs == true`) or its base allocators (`scs == false`).
+    #[allow(dead_code)]
     pub(crate) fn prepare_with_scs(
         &self,
+        k: usize,
+        heap: u64,
+        heap_blocks: u32,
+        scs: bool,
+    ) -> Result {
+        self.prepare_with_scs_for(&buffer::pb_manager::V25G83, k, heap, heap_blocks, scs)
+    }
+
+    /// Like [`Self::prepare_with_scs`], encoding the PB manager with `layout` for the active
+    /// firmware ABI.
+    pub(crate) fn prepare_with_scs_for(
+        &self,
+        layout: &buffer::pb_manager::Layout,
         k: usize,
         heap: u64,
         heap_blocks: u32,
@@ -1215,7 +1304,8 @@ impl PbEpoch {
         self.counter.w64(0, 1)?;
         self.manager.write(
             0,
-            &buffer::pb_manager_image(
+            &buffer::pb_manager_image_for(
+                layout,
                 k as u32,
                 self.pages.va,
                 gva(&self.pages)?,

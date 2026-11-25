@@ -1138,12 +1138,15 @@ impl Slots {
     pub(crate) fn note_render_retired(&mut self) {
         self.render.scrub_pending = true;
     }
-    /// Stages any newly displaced, cleanly retired render pass slots for off-lock pre-scrubbing.
-    /// Never touches `Published` or undisplaced `Retired` slots.
+    /// Stages any newly displaced, cleanly retired render pass slots for off-lock pre-scrubbing,
+    /// scanning cursor-ordered from `pass_cursor` so the slots `pick_pass_in_for` will reach next
+    /// are scrubbed first. Never touches `Published` or undisplaced `Retired` slots.
     pub(crate) fn stage_displaced_pass_scrubs(&mut self) {
         self.render.scrub_pending = false;
         self.fold_scrub_stats();
-        for k in 0..sizes::RENDER_SLOTS {
+        let start = self.pass_cursor as usize % sizes::RENDER_SLOTS;
+        for i in 0..sizes::RENDER_SLOTS {
+            let k = (start + i) % sizes::RENDER_SLOTS;
             let bit = 1u64 << k;
             if self.pass_busy & bit != 0
                 || !self.render.lifetime.available(k)

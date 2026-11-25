@@ -459,6 +459,11 @@ mod tests {
                 0xb5, 0xcd, 0xfb, 0xd6, 0xd7, 0xcb, 0xc7, 0xf1, 0xba, 0xa2, 0xcc, 0x8b, 0x37, 0xee,
                 0x5d, 0x6e, 0x5e, 0x98,
             ],
+            [
+                0x19, 0xd9, 0x97, 0x49, 0x3e, 0x00, 0x76, 0x3d, 0xe3, 0x1f, 0x40, 0x0a, 0x59, 0x2d,
+                0x8a, 0xea, 0xe6, 0xbd, 0x11, 0x72, 0xc5, 0x85, 0x96, 0x61, 0x78, 0x1b, 0x42, 0x15,
+                0xde, 0xbc, 0x87, 0x0b,
+            ],
         ];
         for (i, digest) in digests.into_iter().enumerate() {
             let found = measured(build.images, 0x138000, &[[0x59839, 0x5991c]], digest).unwrap();
@@ -626,6 +631,28 @@ mod tests {
                 panic!("an M5 board on bare metal must identify its loaded firmware");
             };
             t6050_admits_only(builds);
+        }
+    }
+
+    #[test]
+    fn m5_builds_name_their_layouts() {
+        use crate::g17::fw::variant::{Firmware, M5Layouts};
+        for cfg in [&crate::hw::t6050::CONFIG, &crate::hw::t6050::CONFIG_MAX] {
+            let Firmware::Identified(builds) = cfg.firmware else {
+                panic!("the M5 Pro and Max must identify their loaded firmware");
+            };
+            for (i, build) in builds.iter().enumerate() {
+                // 27.2 (26B123) moved the InitData layouts.
+                let layouts = if build.os_version >= [27, 2, 0] {
+                    M5Layouts::V26B123
+                } else {
+                    M5Layouts::V26A428
+                };
+                assert_eq!(build.variant.m5_layouts, Some(layouts));
+                for other in &builds[i + 1..] {
+                    assert_ne!(build.images[0].text_sha256, other.images[0].text_sha256);
+                }
+            }
         }
     }
 

@@ -773,6 +773,10 @@ int tb_consumed_dp_bandwidth(struct tb *tb, struct tb_port *src_port,
 			     int *consumed_up, int *consumed_down);
 u32 tb_dp_host_rate_limit(struct tb *tb);
 void tb_dp_host_tunnel_gone(struct tb *tb, unsigned int before);
+bool tb_domain_event_cb(void *data, enum tb_cfg_pkg_type type,
+			const void *buf, size_t size);
+bool tb_domain_retain_noirq_control(struct tb *tb);
+bool tb_xdp_noirq_request(enum tb_xdp_type type);
 #endif
 #if IS_ENABLED(CONFIG_USB4_KUNIT_TEST)
 size_t tb_test_cm_size(void);
@@ -806,6 +810,7 @@ int tb_cio_sleep_prepare(struct tb *tb);
 int tb_cio_sleep(struct tb *tb);
 int tb_cio_wake(struct tb *tb, bool *host_pci_lost);
 void tb_cio_sleep_complete(struct tb *tb);
+void tb_cio_sleep_refused(struct tb *tb);
 int tb_domain_freeze_noirq(struct tb *tb);
 int tb_domain_thaw_noirq(struct tb *tb);
 void tb_domain_complete(struct tb *tb);

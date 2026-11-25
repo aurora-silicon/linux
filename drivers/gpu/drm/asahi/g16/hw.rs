@@ -4,13 +4,13 @@
     reason = "Firmware layout catalog also describes fields used by host wire regressions."
 )]
 
-//! T8132 (G16G) hardware and firmware-ABI constants (layout values are shared by several
+//! Classic GPU hardware and firmware-ABI constants (layout values are shared by several
 //! modules; change one only together with its users). The tuned policy values are in
 //! [`tuning`].
 
 use core::ops::Range;
 
-/// Identification register values of a qualified G16G.
+/// Identification register values of a qualified GPU.
 pub(crate) struct HwId {
     /// SGX identity word (`sgx + 0xd04000`).
     pub(crate) version: u32,
@@ -20,13 +20,70 @@ pub(crate) struct HwId {
 
 pub(crate) use crate::fwid::FirmwareBuild;
 
+/// Static configuration of a SoC supported by this backend.
+pub(crate) struct Config {
+    /// SoC identifier reported to userspace.
+    pub(crate) chip_id: u32,
+    /// GPU generation reported to userspace.
+    pub(crate) gpu_generation: u32,
+    pub(crate) gpu_hal_generation: u32,
+    /// GPU variant reported to userspace.
+    pub(crate) gpu_variant: crate::hw::GpuVariant,
+    /// GPU revision reported to userspace.
+    pub(crate) gpu_revision: u32,
+    /// Input address bits translated by each UAT root.
+    pub(crate) uat_ias: u32,
+    /// Output (physical) address bits of the UAT.
+    pub(crate) uat_oas: u32,
+    /// Clusters and cores per cluster.
+    pub(crate) num_clusters: u32,
+    pub(crate) num_cores_per_cluster: u32,
+    /// Qualified identification register values.
+    pub(crate) hw_ids: &'static [HwId],
+    /// Compatible of the original ADT SGX node.
+    pub(crate) adt_compatible: &'static [u8],
+    /// NUL-terminated compatible of the native display subsystem supplier.
+    pub(crate) display_compatible: &'static [u8],
+    /// Qualified boot-loader handoffs.
+    pub(crate) layouts: &'static [&'static FwLayout],
+    /// Qualified firmware builds.
+    pub(crate) firmware: &'static [FirmwareBuild],
+    /// Whether this compatible also has a legacy driver.
+    pub(crate) needs_handoff_marker: bool,
+    /// T8132 retains the PMP bridge even on firmware that does not send an AGX vote.
+    pub(crate) prepare_pmp: bool,
+    /// PMGR register offset of the GFX domain.
+    pub(crate) power_offset: u32,
+    /// Number of valid fault-bank selectors in the SGX status window.
+    pub(crate) fault_banks: usize,
+    /// GFXCAXI2AF needs host enable writes before the 27.2 firmware starts.
+    pub(crate) axi2af: bool,
+    /// Offsets to zero, in order, in the host block before InitData on 27.2.
+    pub(crate) host_block_zero_order: &'static [usize],
+    /// Whether the host probes scratch and raises the ready word after zeroing.
+    pub(crate) host_block_ready: bool,
+    /// Whether the TVM gate and firmware warm restart are supported.
+    pub(crate) deep_sleep: bool,
+    /// Whether render work accepts scratch for ray queries.
+    pub(crate) supports_render_scs: bool,
+    /// Whether FS->compute cross-engine barriers require `BarrierType::Hold` (type 1), as on G15.
+    pub(crate) cross_engine_hold: bool,
+}
+
+impl Config {
+    pub(crate) const fn core_slots(&self) -> u32 {
+        self.num_clusters * self.num_cores_per_cluster
+    }
+}
+
 /// The J713/J773g T8132 configuration. Hardware admission also checks the exact TEXT image.
 pub(crate) mod t8132 {
-    use super::super::Config;
-    use super::{FirmwareBuild, HwId};
+    use super::{Config, FirmwareBuild, HwId, FW_25G83, FW_26B123};
 
     pub(crate) const CONFIG: Config = Config {
         chip_id: 0x8132,
+        gpu_generation: 16,
+        gpu_hal_generation: kernel::uapi::drm_asahi_gpu_hal_generation_DRM_ASAHI_GPU_HAL_200,
         gpu_variant: crate::hw::GpuVariant::G,
         gpu_revision: 0x10,
         uat_ias: 42,
@@ -37,6 +94,9 @@ pub(crate) mod t8132 {
             version: 0x0a021100,
             counts: 0x0011010a,
         }],
+        adt_compatible: b"gpu,t8132",
+        display_compatible: b"apple,t8132-display-subsystem\0",
+        layouts: &[&FW_25G83, &FW_26B123],
         firmware: &[
             FirmwareBuild {
                 name: "Apple GFX 25G83 (normalized loaded image)",
@@ -126,6 +186,16 @@ pub(crate) mod t8132 {
                 ],
             },
         ],
+        needs_handoff_marker: false,
+        prepare_pmp: true,
+        power_offset: 0x250,
+        fault_banks: 8,
+        axi2af: true,
+        host_block_zero_order: &super::start_27_2::HOST_BLOCK_ZERO_ORDER,
+        host_block_ready: true,
+        deep_sleep: true,
+        supports_render_scs: true,
+        cross_engine_hold: false,
     };
 
     /// What iBoot writes into the 25G83 build b000 TEXT it loads, in TEXT order:
@@ -235,6 +305,127 @@ pub(crate) mod t8132 {
     ];
 }
 
+/// T6030 (G15S), qualified with the b000 image loaded on J516s.
+pub(crate) mod t6030 {
+    use super::super::fw::initdata;
+    use super::{Config, FirmwareBuild, FwLayout, HwId, Scratch, FW_26B123, HOST_BLOCK, UPPER};
+
+    pub(crate) const CONFIG: Config = Config {
+        chip_id: 0x6030,
+        gpu_generation: 15,
+        gpu_hal_generation: kernel::uapi::drm_asahi_gpu_hal_generation_DRM_ASAHI_GPU_HAL_LEGACY,
+        gpu_variant: crate::hw::GpuVariant::S,
+        gpu_revision: 0x11,
+        uat_ias: 42,
+        uat_oas: 42,
+        num_clusters: 2,
+        num_cores_per_cluster: 10,
+        hw_ids: &[HwId {
+            version: 0x07031100,
+            counts: 0x00110209,
+        }],
+        adt_compatible: b"gpu,t6030",
+        display_compatible: b"apple,t6030-display-subsystem\0",
+        layouts: &[&LAYOUT],
+        firmware: &[FirmwareBuild {
+            name: "Apple GFX 26B123 G15S (build b000, iBoot-filled ranges zeroed)",
+            text_size: LAYOUT.text_size,
+            data_size: LAYOUT.data_size,
+            entropy: &[[0x5be64, 0x5bf47]],
+            boot_filled: BOOT_FILLED_B000,
+            text_sha256: [
+                0x31, 0xc7, 0xc7, 0x7a, 0x24, 0x85, 0x88, 0x7b, 0x66, 0x2e, 0xa2, 0x2d, 0xe6, 0xcc,
+                0xc5, 0xf9, 0xf6, 0x87, 0xa2, 0x4b, 0x07, 0xbd, 0xbd, 0xdf, 0x95, 0x21, 0x1a, 0x06,
+                0xcd, 0x5f, 0x57, 0x3b,
+            ],
+        }],
+        needs_handoff_marker: true,
+        prepare_pmp: false,
+        power_offset: 0x110,
+        fault_banks: 2,
+        axi2af: false,
+        // Host-block control words zeroed read-before-write at cold 26B123 startup:
+        // +0x0000 is the host device-control generation word; +0x1808 and +0x3010 are the
+        // per-pipe host-block control words cleared before endpoints 0x20/0x21 start.
+        host_block_zero_order: &[0, 0x1808, 0x3010],
+        host_block_ready: false,
+        deep_sleep: false,
+        supports_render_scs: false,
+        cross_engine_hold: true,
+    };
+
+    const LAYOUT: FwLayout = FwLayout {
+        name: "26B123 G15S",
+        segment_vas: &[UPPER, UPPER + 0x60000, UPPER + 0x18c000],
+        text_size: 0x60000,
+        data_size: 0x134000,
+        abi: super::FwAbi::V26B123G15S,
+        initdata: &initdata::G15S_26B123,
+        scratch: Scratch {
+            register: HOST_BLOCK,
+            // The G15S scratch window leaves an unmapped guard page at VA +0x14000 while the
+            // physical host-register window stays contiguous across the split (+0x14000..+0x20000).
+            spans: &[(0, 0, 0x14000), (0x18000, 0x14000, 0xc000)],
+            pointer: 0x12068,
+        },
+        // Offset on the PPL handoff page where the G15S 26B123 firmware records
+        // whether the GPU is powered during idle power-gating.
+        powered: Some(0x638),
+        ..FW_26B123
+    };
+
+    /// Fixed normalization ranges of the qualified G15S b000 image. Only the
+    /// values of iBoot's records, the two header fields and the tunable contents
+    /// are ignored. The digest still covers the tags, lengths and table headers.
+    const BOOT_FILLED_B000: &[(u32, u32)] = &[
+        (0x224, 4),
+        (0x23c, 8),
+        (0x5be6c, 8),
+        (0x5be7c, 8),
+        (0x5be8c, 8),
+        (0x5be9c, 8),
+        (0x5beac, 8),
+        (0x5bebc, 8),
+        (0x5becc, 8),
+        (0x5bedc, 4),
+        (0x5bee8, 1),
+        (0x5bef1, 8),
+        (0x5bf01, 8),
+        (0x5bf11, 4),
+        (0x5bf1d, 8),
+        (0x5bf2d, 1),
+        (0x5bf36, 1),
+        (0x5bf3f, 8),
+        (0x5bf4f, 8),
+        (0x5bf5f, 8),
+        (0x5bf6f, 8),
+        (0x5bf7f, 8),
+        (0x5bf8f, 8),
+        (0x5bf9f, 8),
+        (0x5bfaf, 8),
+        (0x5bfbf, 8),
+        (0x5bfcf, 8),
+        (0x5bfdf, 8),
+        (0x5bfef, 1),
+        (0x5bff8, 8),
+        (0x5c008, 4),
+        (0x5c014, 8),
+        (0x5c024, 4),
+        (0x5c030, 4),
+        (0x5c03c, 4),
+        (0x5c048, 8),
+        (0x5c058, 8),
+        (0x5c068, 1),
+        (0x5c071, 8),
+        (0x5c081, 8),
+        (0x5c091, 4),
+        (0x5c098, 1),
+        (0x5c099, 0x2d4),
+        (0x5c370, 1),
+        (0x5c371, 0x2d4),
+    ];
+}
+
 /// Which part of the loaded image a firmware page-table leaf maps.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Segment {
@@ -257,6 +448,18 @@ pub(crate) struct Leaves {
 pub(crate) enum FwAbi {
     V25G83,
     V26B123,
+    V26B123G15S,
+}
+
+impl FwAbi {
+    /// Offset of the table installed in root[1] after startup, and the
+    /// descriptor attributes the firmware uses for it and the shared L2.
+    pub(crate) const fn live_root_table(self) -> (u64, u64) {
+        match self {
+            Self::V25G83 | Self::V26B123 => (4 * PAGE, 0x00200000000004cb),
+            Self::V26B123G15S => (3 * PAGE, 0x403),
+        }
+    }
 }
 
 /// How the firmware's MMIO register table in loaded DATA is filled.
@@ -281,6 +484,9 @@ pub(crate) enum Start {
     /// 26B123 start sequence: see [`start_27_2`].
     MacOs27_2,
 }
+
+/// Host-owned SGX register block.
+pub(crate) const HOST_BLOCK: u64 = 0xd60000;
 
 /// The 26B123 start sequence up to the InitData doorbell:
 /// 1. before RUN, bit 0 of GFXCAXI2AF `+0x104` and `+0x108` is set (read, then written);
@@ -325,6 +531,20 @@ pub(crate) struct PplMagic {
     pub(crate) answers: bool,
 }
 
+/// Firmware-visible alias of host registers, with the pointer InitData passes into it.
+pub(crate) struct Scratch {
+    pub(crate) register: u64,
+    /// `(va_offset, pa_offset, bytes)` spans in ascending VA order.
+    pub(crate) spans: &'static [(u64, u64, u64)],
+    pub(crate) pointer: u64,
+}
+
+const T8132_SCRATCH: Scratch = Scratch {
+    register: HOST_BLOCK,
+    spans: &[(0, 0, 0x8000)],
+    pointer: 0,
+};
+
 /// The loaded-image layout of one firmware ABI: the boot loader's handoff for it, the regions
 /// it reserves, the leaves it builds in the firmware page tables, and where the boot path writes.
 pub(crate) struct FwLayout {
@@ -339,6 +559,9 @@ pub(crate) struct FwLayout {
     pub(crate) data_size: u64,
     /// The firmware ABI of the builds this layout holds.
     pub(crate) abi: FwAbi,
+    /// InitData wire layout, including the version word of this firmware image.
+    pub(crate) initdata: &'static super::fw::initdata::Layout,
+    pub(crate) scratch: Scratch,
     /// Every leaf the boot loader builds in the firmware's own page tables, in VA order, and
     /// the only leaves cold admission accepts (none: the firmware builds its own tree at
     /// start); `None` until known, which refuses the firmware.
@@ -391,6 +614,8 @@ pub(crate) const FW_25G83: FwLayout = FwLayout {
     text_size: 0x60000,
     data_size: 0x13c000,
     abi: FwAbi::V25G83,
+    initdata: &super::fw::initdata::V25G83,
+    scratch: T8132_SCRATCH,
     leaves: Some(&[
         Leaves {
             range: 0..0x50000,
@@ -452,6 +677,8 @@ pub(crate) const FW_26B123: FwLayout = FwLayout {
     text_size: 0x64000,
     data_size: 0xd8000,
     abi: FwAbi::V26B123,
+    initdata: &super::fw::initdata::V26B123,
+    scratch: T8132_SCRATCH,
     // The firmware builds its own tree at start; admit only an empty tree.
     leaves: Some(&[]),
     ppl_magic: Some(PplMagic {
@@ -466,9 +693,6 @@ pub(crate) const FW_26B123: FwLayout = FwLayout {
     // and to 0 after each power-down.
     powered: Some(0x648),
 };
-
-/// The firmware layouts this backend knows, newest last.
-pub(crate) const FW_LAYOUTS: &[&FwLayout] = &[&FW_25G83, &FW_26B123];
 
 /// User VA range reported as `vm_start..vm_end`: 42 bits with the final two pages excluded.
 pub(crate) const USER_RANGE: Range<u64> = 0x4000..0x3ffffff8000;
@@ -542,6 +766,9 @@ pub(crate) mod rings {
     pub(crate) const LOG_RINGS: usize = 9;
     pub(crate) const LOG_STATE_SIZE: usize = 0x1b0;
     pub(crate) const LOG_RING_SIZE: usize = 0x28800;
+    pub(crate) const LOG_PAYLOAD_SIZE: usize = 0xd8;
+    pub(crate) const LOG_PAYLOAD_TEXT_OFFSET: usize = 0x10;
+    pub(crate) const LOG_PAYLOAD_TEXT_SIZE: usize = 0xc8;
     pub(crate) const TRACE_RING_SIZE: usize = 0x9000;
     pub(crate) const STATS_RING_SIZE: usize = 0x4800;
     pub(crate) const FWCTL_RING_SIZE: usize = 0x4000;
@@ -782,13 +1009,19 @@ pub(crate) mod sizes {
     /// Worst-case firmware work-ring entries per compute command (`fs2c` barrier + cross-pipe
     /// `c2c` barrier + `work`).
     pub(crate) const MAX_COMPUTE_RING_ENTRIES: usize = 3;
-    /// Maximum unfinished TA passes kept in flight at once so multi-pass render bursts stay
-    /// inside M4 firmware's `<= 4`-pass TA/scene pipeline without throttling single-pass
-    /// pipelining (where TA finishes well ahead of FS).
+    /// Maximum unfinished TA passes kept in flight at once for heavy multi-layer or large-tilemap
+    /// renders so heavy bursts stay inside M4 firmware's `<= 4`-pass TA/scene pipeline.
     pub(crate) const TA_WAVE_PASSES: usize = 4;
-    /// Unfinished TA pass count at or below which a TA-wave-paused render queue wakes to
+    /// Maximum unfinished TA passes kept in flight at once for light single-layer renders
+    /// (`tilemap_bytes <= TA_LIGHT_TILEMAP_BYTES`), doubling the wave window for light render
+    /// bursts and deeper micro-coalesced batches.
+    pub(crate) const TA_WAVE_PASSES_LIGHT: usize = 8;
+    /// Tilemap byte threshold at or below which a single-layer render qualifies for
+    /// `TA_WAVE_PASSES_LIGHT`.
+    pub(crate) const TA_LIGHT_TILEMAP_BYTES: u64 = 64 * 1024;
+    /// Headroom below the active TA wave cap at which a TA-wave-paused render queue wakes to
     /// launch the next wave, avoiding 1-pass stub drips.
-    pub(crate) const TA_WAVE_REFILL: usize = TA_WAVE_PASSES / 2;
+    pub(crate) const TA_WAVE_REFILL_HEADROOM: usize = 2;
     /// Base render pass slots allocated on first render (full TPC/tilemap capacity).
     pub(crate) const BASE_RENDER_SLOTS: usize = 2;
     /// Retained render pass slots per VM at most. A slot is reused only after a later render
@@ -825,8 +1058,9 @@ pub(crate) mod sizes {
     pub(crate) const PB_BLOCKS: u32 = 2048;
     pub(crate) const PB_LIST_RECORDS: u32 = 4096;
     pub(crate) const PB_GROW_STEP: u32 = 10;
-    /// Published prefixes at most. Warm compute and render commands may pipeline across VMs
-    /// on disjoint hardware UMA slots while cold `InitBM` renders and recovery paths drain.
+    /// Published prefixes at most. Warm render commands may pipeline across VMs on disjoint
+    /// hardware UMA slots, compute only behind its own VM's work, while cold `InitBM` renders
+    /// and recovery paths drain.
     pub(crate) const FLIGHTS: usize = 32;
     /// Retained compute units per VM at most; each unit owns its own hardware UMA slot
     /// (`COMPUTE_UMA_SLOT + index`, fitting in `1..RENDER_UMA_SLOT = 33`). A unit is reused
@@ -896,10 +1130,22 @@ pub(crate) mod sizes {
     );
     /// Maximum jobs folded into one barrier-free compute horizon prefix.
     pub(crate) const HORIZON_JOBS: u32 = COMPUTE_UNITS as u32;
-    /// Jobs admitted to the engine per logical queue: enough to keep a queue's commands
-    /// in flight back to back without scheduler backpressure stalls; exact prior-command
+    /// Maximum commands accumulated in a busy-state horizon micro-coalescing batch before
+    /// immediate publication, and maximum hold window (18 us) while a queue already has >= 2
+    /// active commands in flight.
+    pub(crate) const COALESCE_MAX_CMDS: usize = 6;
+    pub(crate) const COALESCE_WINDOW_US: u32 = 18;
+    pub(crate) const COALESCE_WINDOW_NS: u64 = (COALESCE_WINDOW_US as u64) * 1000;
+    /// Per-queue retired CDM execution EWMA threshold (microseconds) at or above which
+    /// barrier-free compute fans out across both CDM pipes instead of staying 1-pipe affine.
+    pub(crate) const COMPUTE_HEAVY_EMA_US: u32 = 200;
+    /// Elapsed wall-clock time (nanoseconds) on a sole active single-command compute flight
+    /// that immediately classifies the queue as heavy before its first retirement updates EWMA.
+    pub(crate) const COMPUTE_HEAVY_INFLIGHT_NS: u64 = 180_000;
+    /// Jobs admitted to the engine per logical queue: enough to keep deep queues (`d=64`)
+    /// queued back to back without scheduler backpressure stalls; exact prior-command
     /// dependencies still gate each one.
-    pub(crate) const SCHEDULER_CREDITS: u32 = 32;
+    pub(crate) const SCHEDULER_CREDITS: u32 = 64;
     /// Unconsumed records per 256-entry channel ring a prefix may be posted behind.
     pub(crate) const AHEAD_RECORDS: u32 = 128;
     /// Policy bound on logical queues reported in QUEUE_LIMITS (not a firmware limit).
@@ -911,7 +1157,10 @@ pub(crate) mod sizes {
 /// Firmware channels, doorbells, seeds and identifiers.
 pub(crate) mod engine {
     pub(crate) const DOORBELL: u64 = 0x0083000000000000;
+    pub(crate) const DEVCTL_INIT_DOORBELL: u64 = DOORBELL | 0x11;
     pub(crate) const DEVCTL_DOORBELL: u64 = 0x0084000000000011;
+    pub(crate) const RECEIVE_DOORBELL: u64 = DOORBELL | 0x10;
+    pub(crate) const G15S_RECEIVE_DOORBELL: u64 = 0x0087000000000010;
     pub(crate) const EVENT_SLOT: u32 = 2;
     pub(crate) const COMPUTE_UMA_SLOT: u32 = 1;
     pub(crate) const RENDER_UMA_SLOT: u32 = 33;

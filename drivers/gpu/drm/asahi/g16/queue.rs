@@ -76,6 +76,9 @@ pub(crate) struct QueueState {
     /// engine when a job arrives.
     pub(crate) owned: [AtomicU32; 32],
     pub(crate) owned_index: AtomicU32,
+    /// EWMA of retired per-command CDM GPU execution duration (microseconds) for adaptive
+    /// 1-pipe affinity vs 2-pipe heavy compute fanout.
+    pub(crate) compute_ewma_us: AtomicU32,
 }
 
 impl QueueState {
@@ -124,6 +127,20 @@ impl QueueState {
         let shift = seq.wrapping_sub(completed).wrapping_sub(2);
         shift < 64 && (self.compute_ooo.load(Ordering::Acquire) & (1u64 << shift)) != 0
     }
+
+    /// Updates the lock-free EWMA of recent retired per-command CDM GPU execution duration
+    /// (microseconds) for this queue using a symmetric 50% step so transitions between light
+    /// and heavy compute streams adapt within 2-3 completions.
+    pub(crate) fn note_compute_us(&self, us: u32) {
+        let us = us.clamp(1, 100_000);
+        let prev = self.compute_ewma_us.load(Ordering::Relaxed);
+        let next = if prev == 0 {
+            us
+        } else {
+            prev.saturating_add(us) / 2
+        };
+        self.compute_ewma_us.store(next, Ordering::Relaxed);
+    }
 }
 
 /// One per-file logical-queue credit, released after the queue scheduler drains.
@@ -162,6 +179,8 @@ pub(crate) struct Queue {
     timeline: Arc<Timeline>,
     /// Enabled GPU cores, which SCS memory is sized for.
     active_cores: u32,
+    /// Hardware capabilities for stream admission and scratch reservations.
+    cfg: &'static hw::Config,
     /// Reserved render scratch pages per stage (`render_scs_layout`).
     render_scs: [u16; 2],
     // Last field: all preceding fields (especially scheduler) drop before capacity returns.
@@ -212,6 +231,7 @@ impl Queue {
                 published: [const { AtomicU64::new(0) }; 2],
                 owned: [const { AtomicU32::new(0) }; 32],
                 owned_index: AtomicU32::new(0),
+                compute_ewma_us: AtomicU32::new(0),
             },
             GFP_KERNEL,
         )?;
@@ -225,6 +245,7 @@ impl Queue {
             shared: gpu.shared.clone(),
             timeline,
             active_cores: gpu.id.core_masks.iter().map(|mask| mask.count_ones()).sum(),
+            cfg: gpu.cfg,
             render_scs: [0; 2],
             _credit: credit,
         })
@@ -242,7 +263,16 @@ impl Queue {
         if sync_count > command::MAX_SYNCS {
             return Err(EINVAL);
         }
-        let parsed = command::parse_stream(bytes, params::early_tiling())?;
+        let parsed = if self.cfg.gpu_generation < 16 {
+            command::parse_stream_for(
+                bytes,
+                params::early_tiling(),
+                self.cfg.num_clusters,
+                self.cfg.gpu_generation,
+            )?
+        } else {
+            command::parse_stream(bytes, params::early_tiling())?
+        };
         if self.shared.crashed.load(Ordering::Acquire) {
             return Err(EIO);
         }
@@ -338,6 +368,12 @@ impl crate::queue::Queue for Queue {
     /// A render's UMA pool serves both stages of one render at a time, so their extra pages add
     /// up ([`super::rt::required_seeds`]).
     fn reserve_render_scs(&mut self, layouts: [u64; 2]) -> Result {
+        if !self.cfg.supports_render_scs {
+            if layouts == [0; 2] {
+                return Ok(());
+            }
+            return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
+        }
         if self.accepted != [0; 2] {
             return Err(EBUSY);
         }

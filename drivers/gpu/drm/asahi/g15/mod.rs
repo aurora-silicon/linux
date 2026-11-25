@@ -202,10 +202,21 @@ impl platform::Driver for Driver<'_> {
         // after probe_g15 started firmware would return an unbound device.
         try_pin_init!(Driver {
             _driver: {
+                // Not EPROBE_DEFER: a deferred device stays listed in devices_deferred until the
+                // deferred-probe work runs, even after activate()'s probe fails for good. Activation
+                // reprobes every unbound device; a device added later sees MODULE_READY set.
                 if !MODULE_READY.load(Ordering::Acquire) {
-                    return Err(EPROBE_DEFER);
+                    return Err(ENODEV);
                 }
                 let cfg = *info.ok_or(ENODEV)?;
+                if pdev.as_ref().of_node().is_some_and(|node| {
+                    !matches!(
+                        node.get_opt_property::<u32>(c_str!("apple,g16-handoff-version")),
+                        Ok(None)
+                    )
+                }) {
+                    return Err(ENODEV);
+                }
                 dev_info!(pdev.as_ref(), "G15: probing ({})\n", cfg.name);
                 match crate::driver::AsahiPlatformDriver::probe_g15(pdev, cfg) {
                     Ok(driver) => Some(driver),

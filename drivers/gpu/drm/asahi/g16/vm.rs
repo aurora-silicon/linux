@@ -138,6 +138,15 @@ pub(crate) struct VmStateInner {
     pub(crate) live: Arc<LiveToken>,
 }
 
+impl VmStateInner {
+    /// Whether renders this VM's SUBMITs accepted are not yet published.
+    pub(crate) fn renders_unpublished(&self) -> bool {
+        self.resources
+            .as_ref()
+            .is_some_and(|cache| cache.renders_unpublished())
+    }
+}
+
 impl Drop for VmStateInner {
     fn drop(&mut self) {
         mod_pr_debug!("G16: VM {} releases context {}\n", self.id, self.slot);
@@ -341,6 +350,15 @@ impl Registry {
             .ok_or(ENOENT)
     }
 
+    /// The VM id of a live VM currently bound to TTBAT `slot`, if any.
+    pub(crate) fn find_by_slot(&self, slot: u32) -> Option<u64> {
+        self.vms
+            .lock()
+            .iter()
+            .find(|state| state.slot == slot)
+            .map(|state| state.id)
+    }
+
     /// Latches `error` on every VM whose client handle is open. The fail-stop path calls it under
     /// the device lock.
     pub(crate) fn fail_all(&self, error: Error) {
@@ -406,6 +424,7 @@ pub(crate) fn new_vm(gpu: &Gpu, kernel_range: Range<u64>, file_id: u64) -> Resul
         factory,
         live.bind.as_ref().ok_or(EIO)?.clone(),
         live.clone(),
+        gpu.shared.clone(),
     )?;
     let inner = VmStateInner {
         id,

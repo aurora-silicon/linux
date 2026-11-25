@@ -131,7 +131,8 @@ fn program(
 /// VDM admission for a batch of root streams under an already-held VM read lock.
 /// Each root stream opens with the G16 barrier, with or without the USC cache invalidate.
 /// Reads only the 4-byte root word for a single pass to minimize PoC cache maintenance,
-/// and caches up to 256 intra-page bytes across multi-pass batches.
+/// and caches up to 256 intra-page bytes across multi-pass batches. Each normal root stream
+/// opens with the G16 barrier, with or without the USC cache invalidate.
 pub(crate) fn vdm_batch_locked(guard: &mut mmu::VmReadGuard<'_>, vas: &[u64]) -> Result {
     if vas.is_empty() || !params::stream_gate() {
         return Ok(());
