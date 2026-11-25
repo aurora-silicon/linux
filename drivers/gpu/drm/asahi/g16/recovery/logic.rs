@@ -19,6 +19,9 @@ pub(crate) const fn stamp_reached(obs: u32, own: u32, tail: u32) -> bool {
 /// `CONFIG_RUST_OVERFLOW_CHECKS`).
 #[allow(dead_code)]
 pub(crate) const fn ring_passed(c: u32, b: u32, h: u32, t: u32, m: u32) -> bool {
+    if m == 0 || c >= m || b >= m || h >= m || t >= m {
+        return false;
+    }
     let dc = c.wrapping_add(m).wrapping_sub(b) % m;
     let dh = h.wrapping_add(m).wrapping_sub(b) % m;
     let dt = t.wrapping_add(m).wrapping_sub(b) % m;
@@ -155,28 +158,41 @@ impl SnapshotEntry {
 
 /// Bounded per-stage history of recently retired firmware stamps.
 pub(crate) const RETIRED_STAMPS_CAP: usize = 64;
+/// Number of compute pipes tracked by [`RetiredStamps`] (matches `hw::sizes::COMPUTE_PIPES`).
+pub(crate) const RETIRED_COMPUTE_PIPES: usize = 8;
+/// Total retired-stamp stages: compute pipes `0..RETIRED_COMPUTE_PIPES`, TA, FS.
+pub(crate) const RETIRED_STAGES: usize = RETIRED_COMPUTE_PIPES + 2;
 
-/// Bounded per-stage ring of recently retired compute pipe 0/1 and TA/FS firmware stamps
+/// Bounded per-stage ring of recently retired compute pipe and TA/FS firmware stamps
 /// so a late recovery snapshot arriving after pipelined retirement resolves any recently
 /// retired member, not only the single newest flight.
 #[derive(Clone, Debug)]
 pub(crate) struct RetiredStamps {
-    stamps: [[u32; RETIRED_STAMPS_CAP]; 4],
-    len: [u8; 4],
-    next: [u8; 4],
+    stamps: [[u32; RETIRED_STAMPS_CAP]; RETIRED_STAGES],
+    len: [u8; RETIRED_STAGES],
+    next: [u8; RETIRED_STAGES],
 }
 
 impl RetiredStamps {
     pub(crate) const fn new() -> Self {
         Self {
-            stamps: [[0; RETIRED_STAMPS_CAP]; 4],
-            len: [0; 4],
-            next: [0; 4],
+            stamps: [[0; RETIRED_STAMPS_CAP]; RETIRED_STAGES],
+            len: [0; RETIRED_STAGES],
+            next: [0; RETIRED_STAGES],
         }
     }
 
+    /// Initializes an uninitialized heap slot to the empty zero state without materializing a
+    /// multi-kilobyte temporary on the caller's stack.
+    #[allow(dead_code)]
+    pub(crate) fn init_zero(slot: &mut core::mem::MaybeUninit<Self>) {
+        // SAFETY: All fields of `RetiredStamps` are integer arrays for which all-zeroes is valid
+        // and identical to `RetiredStamps::new()`.
+        unsafe { core::ptr::write_bytes(slot.as_mut_ptr(), 0, 1) };
+    }
+
     pub(crate) fn push(&mut self, stage: usize, target: u32) {
-        if stage >= 4 {
+        if stage >= RETIRED_STAGES {
             return;
         }
         let idx = self.next[stage] as usize;
@@ -189,10 +205,9 @@ impl RetiredStamps {
 
     pub(crate) fn contains(&self, event: u32, target: u32) -> bool {
         let stage = match event {
-            15 => 0,
-            16 => 1,
-            0x70 => 2,
-            0x71 => 3,
+            e if (15..15 + RETIRED_COMPUTE_PIPES as u32).contains(&e) => (e - 15) as usize,
+            0x70 => RETIRED_COMPUTE_PIPES,
+            0x71 => RETIRED_COMPUTE_PIPES + 1,
             _ => return false,
         };
         let len = self.len[stage] as usize;
@@ -307,9 +322,16 @@ mod tests {
         assert!(!retired.contains(0x70, 0));
         retired.push(0, 0x100);
         retired.push(1, 0x300);
-        retired.push(2, 0);
-        retired.push(3, 0x200);
-        for (event, target) in [(15, 0x100), (16, 0x300), (0x70, 0), (0x71, 0x200)] {
+        retired.push(RETIRED_COMPUTE_PIPES - 1, 0x700);
+        retired.push(RETIRED_COMPUTE_PIPES, 0);
+        retired.push(RETIRED_COMPUTE_PIPES + 1, 0x200);
+        for (event, target) in [
+            (15, 0x100),
+            (16, 0x300),
+            (15 + RETIRED_COMPUTE_PIPES as u32 - 1, 0x700),
+            (0x70, 0),
+            (0x71, 0x200),
+        ] {
             assert!(retired.contains(event, target));
             assert!(!retired.contains(event, target.wrapping_add(0x100)));
         }
@@ -472,6 +494,8 @@ mod tests {
         assert!(stamp_reached(0x100, 0xffff_ff00, 0x200));
         assert!(ring_passed(2, 0xfe, 1, 5, 256));
         assert!(!ring_passed(0xff, 0xfe, 1, 5, 256));
+        assert!(!ring_passed(256, 0, 1, 2, 256));
+        assert!(!ring_passed(257, 0, 1, 2, 256));
         assert!(!ring_passed(u32::MAX, 0, 1, 5, 256));
     }
 }
