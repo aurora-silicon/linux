@@ -10,6 +10,7 @@ config APPLE_CENTAURI
 	tristate "Apple N1 Centauri experimental J813 Wi-Fi"
 	depends on ARCH_APPLE || COMPILE_TEST
 	depends on PCI && CFG80211 && DEBUG_FS
+	depends on MFD_MACSMC
 	select FW_LOADER
 	help
 	  Experimental Apple N1 PCIe and ACIPC Wi-Fi support for the J813
