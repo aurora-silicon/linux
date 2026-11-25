@@ -6661,6 +6661,24 @@ static int dcp_ext26_start_resident(struct apple_dcp *dcp)
 	return ret;
 }
 
+/*
+ * The notch rows are a fact of the panel; whether they are drawn on is the
+ * boot loader's choice first, then the user's, at run time (see dcp-notch.h).
+ */
+static void dcp_read_notch(struct apple_dcp *dcp)
+{
+	of_property_read_u32(dcp->dev->of_node, "apple,notch-height", &dcp->notch_rows);
+	dcp->notch_rows = min_t(u32, dcp->notch_rows, MAX_NOTCH_HEIGHT);
+	dcp->notch_policy = boot_show_notch() ? DCP_NOTCH_SHOWN : DCP_NOTCH_HIDDEN;
+	if (!dcp_notch_dynamic(dcp) && dcp->notch_policy == DCP_NOTCH_HIDDEN)
+		dcp->notch_height = dcp->notch_rows;
+	if (dcp->notch_rows)
+		dev_info(dcp->dev, "Detected display with notch of %u pixel (%s%s)\n",
+			 dcp->notch_rows,
+			 dcp->notch_policy == DCP_NOTCH_SHOWN ? "shown" : "hidden",
+			 dcp_notch_dynamic(dcp) ? "" : " for this boot");
+}
+
 static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *data)
 {
 	struct device_node *panel_np;
@@ -6686,6 +6704,7 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 		ret = dcp_pin_live_session(dcp);
 		if (ret)
 			return ret;
+		dcp_read_notch(dcp);
 		ret = iomfb_m4_start(dcp, main);
 		if (!ret)
 			WRITE_ONCE(dcp->active, true);
@@ -6757,21 +6776,7 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 		dev_info(dev, "DCP index:%u dptx target phy: %u dptx die: %u\n",
 			 dcp->index, dcp->dptx_phy, dcp->dptx_die);
 
-	/*
-	 * The notch rows are a fact of the panel; whether they are drawn on is
-	 * the boot loader's choice first, then the user's, at run time (see
-	 * dcp-notch.h).
-	 */
-	of_property_read_u32(dev->of_node, "apple,notch-height", &dcp->notch_rows);
-	dcp->notch_rows = min_t(u32, dcp->notch_rows, MAX_NOTCH_HEIGHT);
-	dcp->notch_policy = boot_show_notch() ? DCP_NOTCH_SHOWN : DCP_NOTCH_HIDDEN;
-	if (!dcp_notch_dynamic(dcp) && dcp->notch_policy == DCP_NOTCH_HIDDEN)
-		dcp->notch_height = dcp->notch_rows;
-	if (dcp->notch_rows)
-		dev_info(dev, "Detected display with notch of %u pixel (%s%s)\n",
-			 dcp->notch_rows,
-			 dcp->notch_policy == DCP_NOTCH_SHOWN ? "shown" : "hidden",
-			 dcp_notch_dynamic(dcp) ? "" : " for this boot");
+	dcp_read_notch(dcp);
 
 	/* initialize brightness scale to a sensible default to avoid divide by 0*/
 	dcp->brightness.scale = 65536;
