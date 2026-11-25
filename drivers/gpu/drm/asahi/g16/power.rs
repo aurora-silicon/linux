@@ -50,6 +50,11 @@ extern "C" {
         governor: *mut u32,
         power: *mut u32,
         backstop: *mut u32,
+        zone_seq: *mut u64,
+        release_mc: *mut core::ffi::c_long,
+        hot_mc: *mut core::ffi::c_long,
+        critical_mc: *mut core::ffi::c_long,
+        limits_valid: *mut bool,
     ) -> i32;
 }
 
@@ -87,6 +92,11 @@ impl Cooling {
 
     fn sample(&mut self, now: u64, idle: bool, power: &mut Sample) -> Result {
         let mut mc: core::ffi::c_long = 0;
+        let mut seq: u64 = 0;
+        let mut release_mc: core::ffi::c_long = 0;
+        let mut hot_mc: core::ffi::c_long = 0;
+        let mut critical_mc: core::ffi::c_long = 0;
+        let mut limits_valid = false;
         // SAFETY: The C allocation and PMP phandle outlive this call, all output
         // pointers are valid, and the caller holds the GPU device mutex.
         let ret = unsafe {
@@ -98,9 +108,20 @@ impl Cooling {
                 &mut power.governor,
                 &mut power.budget,
                 &mut power.backstop,
+                &mut seq,
+                &mut release_mc,
+                &mut hot_mc,
+                &mut critical_mc,
+                &mut limits_valid,
             )
         };
         power.temperature_mc = mc as i64;
+        power.zone_seq = seq;
+        power.zone_limits = limits_valid.then_some(policy::ZoneLimits {
+            release_mc: release_mc as i64,
+            hot_mc: hot_mc as i64,
+            critical_mc: critical_mc as i64,
+        });
         kernel::error::to_result(ret)
     }
 }
@@ -119,6 +140,8 @@ struct Sample {
     governor: u32,
     budget: u32,
     backstop: u32,
+    zone_seq: u64,
+    zone_limits: Option<policy::ZoneLimits>,
 }
 
 /// DT-selected memory-demand provider (`apple,clpc`), or none. Its
@@ -204,6 +227,8 @@ impl Power {
                 governor: pmp_initial,
                 budget: pmp_initial,
                 backstop: COOLING_MAX,
+                zone_seq: 0,
+                zone_limits: None,
             },
             last_sample_ns: None,
             top: TOP_DEFAULT,
@@ -271,7 +296,9 @@ impl Power {
             if !self.cooling.is_pmp {
                 self.zone_backstop.sample(
                     now,
+                    self.sample.zone_seq,
                     self.sample.temperature_mc,
+                    self.sample.zone_limits,
                     self.sensor_error.is_some(),
                 );
                 self.zone_backstop.observe(now, self.sample.governor);

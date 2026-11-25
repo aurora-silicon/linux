@@ -340,6 +340,9 @@ pub(crate) mod t6030 {
         power_offset: 0x110,
         fault_banks: 2,
         axi2af: false,
+        // Host-block control words zeroed read-before-write at cold 26B123 startup:
+        // +0x0000 is the host device-control generation word; +0x1808 and +0x3010 are the
+        // per-pipe host-block control words cleared before endpoints 0x20/0x21 start.
         host_block_zero_order: &[0, 0x1808, 0x3010],
         host_block_ready: false,
         deep_sleep: false,

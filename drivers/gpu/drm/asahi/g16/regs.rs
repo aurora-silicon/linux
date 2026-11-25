@@ -319,12 +319,13 @@ impl Regs {
         Ok(())
     }
 
-    /// 26B123 after AP power-on and before the GPU endpoints start: zeroes the host block,
-    /// and on G16G reads the scratch word and raises the ready word.
+    /// 26B123 after AP power-on and before the GPU endpoints start: reads then zeroes each
+    /// host-block control word, and on G16G reads the scratch word and raises the ready word.
     pub(crate) fn publish_host_block(&self, cfg: &super::Config) -> Result<Option<u32>> {
         use super::hw::start_27_2 as s;
         let g = self.generation.io();
         for &offset in cfg.host_block_zero_order {
+            let _ = g.try_read32(offset)?;
             g.try_write32(0, offset)?;
         }
         let probe = if cfg.host_block_ready {
