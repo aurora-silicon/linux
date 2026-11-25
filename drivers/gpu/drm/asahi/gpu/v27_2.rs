@@ -854,10 +854,13 @@ impl RootV27_2 {
     /// Drain the telemetry rings. The event ring is consumed separately after servicing each event.
     pub(crate) fn drain(&self) -> Result {
         let consume = |state: &fw::types::GpuArray<u8>, base: usize, records: u32| -> Result {
+            crate::pgtable::clean_invalidate_poc(state.as_slice()[base..].as_ptr(), 0x30);
+            crate::pgtable::poc_barrier();
             let write = Self::word(state, base + 0x20)?;
             let read = state.shared_index(base)?;
             if write < records && read.load(Ordering::Acquire) != write {
                 read.store(write, Ordering::Release);
+                crate::pgtable::clean_poc(state.as_slice()[base..].as_ptr(), 4);
                 crate::pgtable::poc_barrier();
             }
             Ok(())
@@ -877,6 +880,8 @@ impl RootV27_2 {
 
     /// Shared status +0x10: nonzero while the firmware reports itself running.
     pub(crate) fn firmware_running(&self) -> Result<u32> {
+        crate::pgtable::clean_invalidate_poc(self.status.as_slice().as_ptr(), 0x20);
+        crate::pgtable::poc_barrier();
         Self::word(&self.status, 0x10)
     }
 
@@ -1044,6 +1049,8 @@ impl RootV27_2 {
             }
             register_mappings.push(page, GFP_KERNEL)?;
         }
+        const _: () = assert!(core::mem::offset_of!(Hw, coredump_copy_buffer_size) + 8 <= 0xfc0);
+        const _: () = assert!(core::mem::offset_of!(Hw, chip_id) + 16 <= 0xfc0);
         let dump = core::mem::offset_of!(Hw, coredump_copy_buffer_size);
         put64(hw, dump, u64::from(board.copy_bytes));
         base.hwdata_b.with(|old, _| {
@@ -1087,10 +1094,11 @@ impl RootV27_2 {
             // Inline words for G13G (T8103) firmware 27.2.1 (26B131): derived from the 13.5
             // configuration and the chip's register capabilities (no CRE on T8103).
             for (at, v) in [
-                (0xfc0, 1u32), (0xfe4, 1), (0xff4, pwr.power_sample_period), (0x1000, 1), (0x1004, 1),
+                // Sleep/wake handler and RTKit power callback enables matching G14.
+                (0xfc0, 1u32), (0xfc4, 1), (0xfd8, 1), (0xfdc, 1), (0xfe4, 1), (0xfec, 24000),
+                (0xff0, 1), (0xff4, pwr.power_sample_period), (0xffc, 1), (0x1000, 1), (0x1004, 1),
                 (0x1020, 0x1f), (0x1050, 1), (0x1054, 1), (0x1068, 0x31), (0x1088, 1),
                 (0x10a4, id.num_frags * id.num_clusters), (0x10a8, 1),
-                (0x10cc, 0), (0x10d0, 0),
                 (0x2664, cfg.max_num_gps), (0x2668, 3), (0x266c, 7), (0x2670, 7),
                 (0x267c, 0), (0x2680, 0), (0x2684, id.total_active_cores),
                 (0x268c, 1), (0x26a8, 0xe_0000),
@@ -1466,8 +1474,15 @@ impl RootV27_2 {
         for (word, value) in policy[0x62b8..0x62f8].chunks_exact_mut(4).zip(cfg.shared3_tab) {
             word.copy_from_slice(&value.to_le_bytes());
         }
-        // Cold-wake operand: the board's base operating point.
-        put32(policy, 0xa4, pwr.perf_base_pstate);
+        // Warm-restart operands: base operating point and wake flags.
+        for (at, value) in [
+            (0x9c, 1),
+            (0xa0, 1),
+            (0xa4, pwr.perf_base_pstate),
+            (0xa8, 1),
+        ] {
+            put32(policy, at, value);
+        }
         for (source, bits) in [
             (4, pwr.pwr_sample_period_aic_clks),
             (8, pwr.pwr_sample_period_aic_clks),

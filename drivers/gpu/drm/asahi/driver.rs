@@ -273,16 +273,11 @@ unsafe fn sleep_data<'a>(dev: *mut bindings::device) -> &'a AsahiPlatformDriverD
 unsafe extern "C" fn sleep_prepare(dev: *mut bindings::device) -> core::ffi::c_int {
     // SAFETY: Called by the PM core.
     let data = unsafe { sleep_data(dev) };
-    // G14 on firmware 27.2: the firmware keeps running through suspend-to-idle, with nothing in
-    // flight; a sleep that powers the SoC down would lose it, and it has no cold restart, so that
-    // is refused.
     #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
     if let Some(backend) = data.g14_v27_2.as_ref() {
         // SAFETY: Reads a global flag word.
-        if unsafe { bindings::pm_suspend_via_firmware() } {
-            return EBUSY.to_errno();
-        }
-        return kernel::error::from_result(|| backend.sleep_prepare().map(|_| 0));
+        let deep = unsafe { bindings::pm_suspend_via_firmware() };
+        return kernel::error::from_result(|| backend.sleep_prepare(deep).map(|_| 0));
     }
     // SAFETY: Reads a global flag word.
     if !unsafe { bindings::pm_suspend_via_firmware() } {
