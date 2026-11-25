@@ -272,6 +272,30 @@ impl FwObject {
             // SAFETY: ptr() bounds this naturally aligned 64-bit volatile receipt.
             return Ok(u64::from_le(unsafe { (p as *const u64).read_volatile() }));
         }
+        if p as usize % 4 == 0 {
+            // Packed 64-bit firmware fields such as compute::DESCRIPTOR_COUNTER (0xe4c) and
+            // DESCRIPTOR_COMPLETED (0xe54) are 4-byte aligned. Read aligned 32-bit word pairs
+            // rather than falling through to 16 single-byte WC loads in self.read().
+            let pair = |words: *const u32| -> (u32, u32) {
+                rmb();
+                // SAFETY: ptr() bounds 8 bytes and `words` is 4-byte aligned.
+                let lo = u32::from_le(unsafe { words.read_volatile() });
+                // SAFETY: `words.add(1)` stays within the 8-byte range and is 4-byte aligned.
+                let hi = u32::from_le(unsafe { words.add(1).read_volatile() });
+                (lo, hi)
+            };
+            let words = p.cast::<u32>();
+            let mut first = pair(words);
+            for _ in 0..3 {
+                let next = pair(words);
+                if first == next {
+                    rmb();
+                    return Ok(u64::from(next.0) | (u64::from(next.1) << 32));
+                }
+                first = next;
+            }
+            return Err(EAGAIN);
+        }
         let mut first = [0u8; 8];
         let mut next = [0u8; 8];
         self.read(offset, &mut first)?;
@@ -352,6 +376,7 @@ pub(crate) struct Factory {
     window: Arc<Mutex<uat::Window>>,
     firmware: core::ops::Range<u64>,
     render_cmds: Arc<super::resources::RenderCmds>,
+    compute_cmds: Arc<super::resources::ComputeCmds>,
 }
 
 impl Factory {
@@ -367,6 +392,7 @@ impl Factory {
             }),
             sealed: false,
             persistent: false,
+            probe: false,
             fw_next: self.firmware.start,
             retained: KVec::new(),
             clients: KVec::new(),
@@ -389,6 +415,7 @@ impl Factory {
             }),
             sealed: false,
             persistent: false,
+            probe: false,
             fw_next: self.firmware.start,
             retained: KVec::new(),
             clients: KVec::new(),
@@ -413,6 +440,7 @@ impl Factory {
             }),
             sealed: false,
             persistent: true,
+            probe: false,
             fw_next: self.firmware.start,
             retained: KVec::new(),
             clients: KVec::new(),
@@ -422,10 +450,25 @@ impl Factory {
         }
     }
 
+    /// Probe-time variant of [`Self::persistent_objects`], called only from
+    /// [`super::graph::Graphs::finish`] during platform `probe()` before `drm_dev_register()`
+    /// makes `registration_guard()` available.
+    pub(crate) fn persistent_objects_probe(&self) -> Objects {
+        let mut objects = self.persistent_objects();
+        objects.probe = true;
+        objects
+    }
+
     /// The device-lifetime render command records of pass slot `k`, shared by every VM's
     /// [`super::slots::PassSlot`] `k`.
     pub(crate) fn pass_cmds(&self, k: usize) -> Result<super::slots::PassCmds> {
         self.render_cmds.get(self, k)
+    }
+
+    /// The device-lifetime compute command records of hardware compute unit `k`, shared by every
+    /// VM's [`super::slots::ComputeSlot`] bound to hardware unit `k`.
+    pub(crate) fn compute_cmds(&self, k: usize) -> Result<super::slots::UnitCmds> {
+        self.compute_cmds.get(self, k)
     }
 }
 
@@ -439,6 +482,8 @@ pub(crate) struct Objects {
     sealed: bool,
     /// A device-lifetime allocator that may map [`Class::FwCoherent`] records.
     persistent: bool,
+    /// Runs during platform `probe()` before `drm_dev_register()` provides `registration_guard()`.
+    probe: bool,
     /// Next free VA of the firmware allocator window.
     fw_next: u64,
     /// Every object owned by this session or private arena.
@@ -468,6 +513,7 @@ impl Objects {
             private: None,
             sealed: false,
             persistent: false,
+            probe: false,
             fw_next: hw::va::FW_ALLOC.start,
             retained: KVec::new(),
             clients: KVec::new(),
@@ -481,6 +527,7 @@ impl Objects {
     pub(crate) fn private_factory(
         &mut self,
         render_cmds: Arc<super::resources::RenderCmds>,
+        compute_cmds: Arc<super::resources::ComputeCmds>,
     ) -> Factory {
         self.sealed = true;
         Factory {
@@ -489,6 +536,7 @@ impl Objects {
             window: self.window.clone(),
             firmware: self.fw_next..hw::va::FW_ALLOC.end,
             render_cmds,
+            compute_cmds,
         }
     }
 
@@ -546,9 +594,17 @@ impl Objects {
         } else {
             gem::new_kernel_object_wc(&self.dev, bytes)?
         };
-        let registered = self.dev.registration_guard().ok_or(ENODEV)?;
-        let parent: &kernel::platform::Device<kernel::device::Bound> = registered.as_ref();
-        gem::prepare_new_object(&backing.gem, parent.as_ref())?;
+        if self.probe {
+            // SAFETY: `Factory::persistent_objects_probe()` is called only from
+            // `Graphs::finish()` during platform `probe()`, while the platform device is
+            // bound and before `drm_dev_register()` makes `registration_guard()` available.
+            let bound = unsafe { self.dev.as_ref().as_ref().as_bound() };
+            gem::prepare_new_object(&backing.gem, bound)?;
+        } else {
+            let registered = self.dev.registration_guard().ok_or(ENODEV)?;
+            let parent: &kernel::platform::Device<kernel::device::Bound> = registered.as_ref();
+            gem::prepare_new_object(&backing.gem, parent.as_ref())?;
+        }
         let clean = req.class == Class::FwCoherent && req.lower.is_some();
         let cpu = if req.cpu {
             let vmap = backing.vmap()?;

@@ -9,7 +9,7 @@ use super::{
     command::Command,
     object::{Factory, Objects},
     pools::{PbEpoch, PoolSet},
-    slots::{ComputeSlot, PassCmds, PassSlot, Placement},
+    slots::{ComputeSlot, PassCmds, PassSlot, Placement, UnitCmds},
     vm::VmState,
 };
 use crate::mmu;
@@ -75,6 +75,60 @@ impl RenderCmds {
     }
 }
 
+/// One hardware compute unit's device-lifetime command records and the allocator that maps
+/// them. The allocator is never dropped for the same reason as [`PersistentPassCmds`].
+struct PersistentUnitCmds {
+    objects: core::mem::ManuallyDrop<Objects>,
+    cmds: Option<UnitCmds>,
+}
+
+/// The firmware-cached compute command records (microsequence and barrier records) of every
+/// hardware compute unit (`0..COMPUTE_UNITS`), created on first use and kept until reboot. A
+/// hardware compute unit is device-global and claimed by one flight at a time, so every VM's
+/// [`ComputeSlot`] bound to hardware unit `k` shares its records, and closing a VM drops no
+/// firmware-cached mapping.
+#[pin_data]
+pub(crate) struct ComputeCmds {
+    #[pin]
+    sets: Mutex<[Option<KBox<PersistentUnitCmds>>; super::hw::sizes::COMPUTE_UNITS]>,
+}
+
+impl ComputeCmds {
+    pub(crate) fn new() -> Result<Arc<Self>> {
+        Arc::pin_init(
+            pin_init!(Self {
+                sets <- new_mutex!(
+                    [const { None }; super::hw::sizes::COMPUTE_UNITS],
+                    "g16::compute_cmds"
+                ),
+            }),
+            GFP_KERNEL,
+        )
+    }
+
+    /// The records of hardware compute unit `k`, allocated from `factory` on first use.
+    pub(crate) fn get(&self, factory: &Factory, k: usize) -> Result<UnitCmds> {
+        let mut sets = self.sets.lock();
+        let entry = sets.get_mut(k).ok_or(EINVAL)?;
+        if let Some(cmds) = entry.as_ref().and_then(|set| set.cmds.as_ref()) {
+            return Ok(cmds.clone());
+        }
+        let mut set = KBox::new(
+            PersistentUnitCmds {
+                objects: core::mem::ManuallyDrop::new(factory.persistent_objects()),
+                cmds: None,
+            },
+            GFP_KERNEL,
+        )?;
+        // From here on a failure leaks the allocator with whatever it mapped.
+        let cmds = UnitCmds::new(&mut set.objects)?;
+        set.objects.finish_private()?;
+        set.cmds = Some(cmds.clone());
+        *entry = Some(set);
+        Ok(cmds)
+    }
+}
+
 /// Never-exposed PB epochs an open VM keeps on standby after bursts drain.
 ///
 /// With PB epoch reuse most renders never expose a fresh epoch; keeping a
@@ -114,18 +168,21 @@ impl ComputeArena {
     pub(crate) fn seeds(&self) -> u32 {
         self.unit.seeds
     }
-    /// Allocates one self-contained compute unit `k` (its index and `placement` fix its client
-    /// addresses; the index fixes its hardware UMA slot).
+    /// Allocates one self-contained compute unit at local VA index `local` bound to device-wide
+    /// hardware ledger slot `hw_slot` (`local` and `placement` fix its client addresses; `hw_slot`
+    /// selects its shared device-lifetime command records).
     fn new(
         factory: &Factory,
         bind: &mmu::VmBind,
         vm: &mmu::Vm,
         live: &Arc<super::vm::LiveToken>,
-        k: usize,
+        local: usize,
+        hw_slot: usize,
         placement: Placement,
     ) -> Result<Arc<Self>> {
+        let cmds = factory.compute_cmds(hw_slot)?;
         let mut objects = factory.objects(vm);
-        let unit = ComputeSlot::new_in(&mut objects, factory, k as u64, placement)?;
+        let unit = ComputeSlot::new_in(&mut objects, factory, local as u64, placement, &cmds)?;
         objects.finish_private()?;
         Ok(Arc::new(
             Self(crate::cleanup::Deferred::new(ComputeInner {
@@ -164,7 +221,7 @@ impl ComputeUnitSet {
         let mut units = KVec::with_capacity(range.len(), GFP_KERNEL)?;
         for k in range {
             units.push(
-                ComputeArena::new(factory, bind, vm, live, k, placement)?,
+                ComputeArena::new(factory, bind, vm, live, k, k, placement)?,
                 GFP_KERNEL,
             )?;
         }
@@ -187,9 +244,17 @@ impl ComputeUnitSet {
         seeds: u32,
     ) -> Result<Arc<Self>> {
         let mut units = KVec::with_capacity(super::hw::sizes::SCS_COMPUTE_UNITS, GFP_KERNEL)?;
-        for local in 0..super::hw::sizes::SCS_COMPUTE_UNITS {
+        for (local, &hw_slot) in hw_slots.iter().enumerate() {
             units.push(
-                ComputeArena::new(factory, bind, vm, live, local, Placement::Scs { seeds })?,
+                ComputeArena::new(
+                    factory,
+                    bind,
+                    vm,
+                    live,
+                    local,
+                    hw_slot,
+                    Placement::Scs { seeds },
+                )?,
                 GFP_KERNEL,
             )?;
         }

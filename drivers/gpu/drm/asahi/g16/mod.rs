@@ -749,16 +749,19 @@ impl Firmware {
         );
         power.set_table(booted.init.rows);
         let backend = (|| -> Result<_> {
-            let graph = graph::Graphs::new(dev, &mut booted.objects)?;
+            let graph_session = graph::Graphs::prepare(&mut booted.objects)?;
             let slots = slots::Slots::new()?;
             let pools = pools::Pools::new_boxed(dev)?;
             let vms = vm::Registry::new()?;
             let engine = engine::Engine::new()?;
             let render_cmds = resources::RenderCmds::new()?;
+            let compute_cmds = resources::ComputeCmds::new()?;
+            let private_factory = booted.objects.private_factory(render_cmds, compute_cmds);
+            let graph = graph::Graphs::finish(dev, graph_session, &private_factory)?;
             let slot = KBox::<Firmware>::new_uninit(GFP_KERNEL)?;
-            Ok((graph, slots, pools, vms, engine, render_cmds, slot))
+            Ok((graph, private_factory, slots, pools, vms, engine, slot))
         })();
-        let (graph, slots, pools, vms, engine, render_cmds, slot) = match backend {
+        let (graph, private_factory, slots, pools, vms, engine, slot) = match backend {
             Ok(backend) => backend,
             Err(error) => {
                 dev_err!(
@@ -773,12 +776,11 @@ impl Firmware {
         let boot::Booted {
             session,
             init,
-            mut objects,
+            objects,
             channels,
             events,
             ..
         } = KBox::into_inner(booted);
-        let private_factory = objects.private_factory(render_cmds);
         let mut firmware = slot
             .write_init(init!(Firmware {
                 session,

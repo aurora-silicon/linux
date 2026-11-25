@@ -917,8 +917,9 @@ impl Firmware {
     }
 
     /// A compute unit's GPU start and end ticks. 25G83 writes them into the unit's ITS pair;
-    /// ABIs with `work_ticks` leave ITS 0/0 and write them into the work object. The ITS pair
-    /// is used whenever it holds an interval.
+    /// ABIs with `work_ticks` leave ITS 0/0 and write them into the work object. Check
+    /// `work_ticks` first when the ABI defines them so 26B123 skips two always-zero WC reads
+    /// per command, falling back to ITS if `work_ticks` holds no interval.
     fn compute_ticks(&self, unit: &super::slots::ComputeSlot) -> Result<(u64, u64)> {
         Self::compute_ticks_with(self.init.abi.compute().work_ticks, unit)
     }
@@ -927,27 +928,26 @@ impl Firmware {
         work_ticks: Option<(usize, usize)>,
         unit: &super::slots::ComputeSlot,
     ) -> Result<(u64, u64)> {
-        let (start, end) = (unit.its.r64(0)?, unit.its.r64(8)?);
-        if start != 0 && end >= start {
-            return Ok((start, end));
-        }
-        let Some((start_off, end_off)) = work_ticks else {
-            return Ok((start, end));
-        };
-        let w = &unit.work;
-        // Work tick offsets are 4-byte aligned (not 8-byte), so read hi/lo/hi to avoid tearing.
-        let at = |o: usize| -> Result<u64> {
-            for _ in 0..4 {
-                let hi1 = w.r32(o + 4)?;
-                let lo = w.r32(o)?;
-                let hi2 = w.r32(o + 4)?;
-                if hi1 == hi2 {
-                    return Ok(u64::from(lo) | (u64::from(hi1) << 32));
+        if let Some((start_off, end_off)) = work_ticks {
+            let w = &unit.work;
+            // Work tick offsets are 4-byte aligned (not 8-byte), so read hi/lo/hi to avoid tearing.
+            let at = |o: usize| -> Result<u64> {
+                for _ in 0..4 {
+                    let hi1 = w.r32(o + 4)?;
+                    let lo = w.r32(o)?;
+                    let hi2 = w.r32(o + 4)?;
+                    if hi1 == hi2 {
+                        return Ok(u64::from(lo) | (u64::from(hi1) << 32));
+                    }
                 }
+                Err(EIO)
+            };
+            let (start, end) = (at(start_off)?, at(end_off)?);
+            if start != 0 && end >= start {
+                return Ok((start, end));
             }
-            Err(EIO)
-        };
-        Ok((at(start_off)?, at(end_off)?))
+        }
+        Ok((unit.its.r64(0)?, unit.its.r64(8)?))
     }
 
     /// Exact queue-ring proof for one serialized publication on its workqueue pipe.
