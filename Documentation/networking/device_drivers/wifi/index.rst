@@ -8,6 +8,7 @@ Contents:
 .. toctree::
    :maxdepth: 2
 
+   apple/centauri
    intel/ipw2100
    intel/ipw2200
    mt7932-neo
