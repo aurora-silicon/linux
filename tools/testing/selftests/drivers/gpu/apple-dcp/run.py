@@ -93,7 +93,7 @@ def main():
         ('boot', 'oslog-events', boot.oslog, ((),), ()),
         ('boot', 'syslog-policy', boot.syslog, ((),), ()),
         ('boot', 't6041-v27-admission', boot.t6041_v27_admission, ((),), ()),
-        ('boot', 't8122-dcpext-v27-admission', boot.t8122_dcpext_v27_admission, ((),), ('-Wno-unused-function',)),
+        ('boot', 't8122-dcpext-v27-admission', boot.t8122_dcpext_v27_admission, ((),), ()),
         ('boot', 'v27-tag-translation', boot.v27_tag_translation, ((),), ()),
         ('edid', 'dpavserv-start', edid.startup, ((),), ()),
         ('edid', 'service-rebind', edid.rebind, ((),), ()),
