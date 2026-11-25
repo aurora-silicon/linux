@@ -780,6 +780,7 @@ static void brcmf_pcie_reset_device(struct brcmf_pciedev_info *devinfo)
 		BRCMF_PCIE_CFGREG_REG_BAR3_CONFIG
 	};
 	bool fn_reset = false;
+	bool saved = false;
 	u32 i;
 	u32 val;
 	u32 lsc;
@@ -793,8 +794,21 @@ static void brcmf_pcie_reset_device(struct brcmf_pciedev_info *devinfo)
 	 * chip defaults: e.g. the resizable BAR 2 drops from the size the PCI
 	 * core assigned to 8 MiB. Save what the PCI core programmed, before
 	 * ASPM is turned off for the reset, so it can be put back afterwards.
+	 * Older chips keep their config space, so save nothing there: a saved
+	 * state left behind would stand in for the live one at the next
+	 * suspend.
 	 */
-	pci_save_state(devinfo->pdev);
+	core = brcmf_chip_get_chipcommon(devinfo->ci);
+	if (core->rev >= 65) {
+		int err = pci_save_state(devinfo->pdev);
+
+		if (err) {
+			pci_err(devinfo->pdev, "failed to save PCI state: %d\n", err);
+			devinfo->pdev->state_saved = false;
+		} else {
+			saved = true;
+		}
+	}
 
 	/* Disable ASPM */
 	brcmf_pcie_select_core(devinfo, BCMA_CORE_PCIE2);
@@ -843,9 +857,9 @@ static void brcmf_pcie_reset_device(struct brcmf_pciedev_info *devinfo)
 	 * with the reset defaults while the core still holds the assigned
 	 * values, and the next pci_restore_state() (system resume) rewrites
 	 * them on a live, bus-mastering function: BAR 2 changes size under
-	 * running firmware.
+	 * running firmware. Only a state saved above is put back.
 	 */
-	if (fn_reset)
+	if (fn_reset && saved)
 		pci_restore_state(devinfo->pdev);
 
 	core = brcmf_chip_get_core(devinfo->ci, BCMA_CORE_PCIE2);
