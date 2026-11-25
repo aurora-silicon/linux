@@ -19,16 +19,17 @@ description: |
 properties:
   compatible:
     enum:
+      - apple,t6030-sleep
       - apple,t8132-sleep
       - apple,t8140-sleep
       - apple,t8142-sleep
 
   reg:
-    minItems: 25
+    minItems: 18
     maxItems: 41
 
   reg-names:
-    minItems: 25
+    minItems: 18
     maxItems: 41
 
   apple,wake-enable:
@@ -98,6 +99,34 @@ properties:
       The DCP and the external DCPs, which must be off before a commit, in that
       order.
 
+  apple,smc-sleep-policy:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 6
+    maxItems: 6
+    description: |
+      The SMC's sleep messages: the pmVC value, then the least spacings in us
+      from the warning to pmVC, from the last pmVC to SLPA, SLPA to the AP
+      idle, the idle to the commit, and the wake to pmVC. 0 is no least
+      spacing.
+
+  apple,seq-prepare:
+    $ref: "#/$defs/register-sequence"
+    description:
+      Run after the enclave stops and the sleep's SPMI notify words are
+      written, before the other coprocessors stop.
+
+  apple,seq-notice:
+    $ref: "#/$defs/register-sequence"
+    description:
+      Run once the coprocessors that stop first (SIO) have stopped and their
+      power words are off, before the others stop.
+
+  apple,seq-commit:
+    $ref: "#/$defs/register-sequence"
+    description:
+      Run once the other cores have stopped, the last steps before the
+      commit word.
+
 required:
   - compatible
   - reg
@@ -147,6 +176,48 @@ allOf:
             - const: ptd
             - const: clk-perf
             - const: cluster-dcs
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t6030-sleep
+    then:
+      required:
+        - apple,wake-enable
+        - apple,smc-sleep-policy
+        - apple,seq-prepare
+        - apple,seq-notice
+        - apple,seq-commit
+      properties:
+        reg:
+          minItems: 18
+          maxItems: 18
+        reg-names:
+          items:
+            - const: ps
+            - const: pwrgate
+            - const: cpu-start
+            - const: cllt
+            - const: cluster
+            - const: commit
+            - const: wdt
+            - const: wake
+            - const: spmi
+            - const: ps-aon
+            - const: spmi-a0
+            - const: clk-mux
+            - const: clk-perf
+            - const: ps-gpu
+            - const: amcc0
+            - const: amcc1
+            - const: dcs0
+            - const: ptd
+    else:
+      properties:
+        apple,smc-sleep-policy: false
+        apple,seq-prepare: false
+        apple,seq-notice: false
+        apple,seq-commit: false
   - if:
       properties:
         compatible:
@@ -254,3 +325,23 @@ allOf:
         apple,radio-perst: false
 
 additionalProperties: false
+
+$defs:
+  register-sequence:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    description: |
+      Run in order. Kind bits 7:0 are 0 write the value, 1 read, 2 set the
+      value's bits, 3 clear them, 4 write back what is read, 5 wait for the
+      value's bits to be set, 6 wait for them to be clear, 7 a 16-bit write,
+      8 a 64-bit write of the value as the high word and 0 as the low one, 9
+      a 64-bit read written back with the value's bits of its low word
+      cleared. Kinds 0 to 6 are 32-bit accesses. Bits 31:16 are a wait's
+      timeout in ms (0 for 10 ms); bit 8 a wait whose timeout is not an
+      error. The block is this node's reg entry by index, and the offset is
+      aligned to the access's width, which fits in the block.
+    items:
+      items:
+        - description: Kind
+        - description: Block
+        - description: Offset
+        - description: Value
