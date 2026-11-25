@@ -1,8 +1,18 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! Pure G16G/25G83 compute encoding. Publication and lifetime proofs belong to the engine.
+//! Pure G16G compute encoding (25G83 and 26B123 work layouts). Publication and lifetime proofs
+//! belong to the engine.
 
 use super::{compute, manager, put16, put32, put64, put8, uapi};
+
+/// Stores the binding generation `v` as a little-endian integer of `bytes` (1 or 8) bytes.
+pub(super) fn put_generation(b: &mut [u8], off: usize, bytes: usize, v: u8) {
+    if bytes == 1 {
+        put8(b, off, v);
+    } else {
+        put64(b, off, u64::from(v));
+    }
+}
 
 /// A rejected detached image is never publishable; all validation precedes writes.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -134,14 +144,21 @@ pub(crate) fn preserve_compute_descriptor(
     Ok(submitted_before + 1)
 }
 
-fn timestamp(q: &mut [u8], off: usize, end: bool, r: &ComputeRefs, requested: bool) {
+fn timestamp(
+    q: &mut [u8],
+    off: usize,
+    end: bool,
+    r: &ComputeRefs,
+    requested: bool,
+    auxiliary: usize,
+) {
     put32(q, off, if end { 3 } else { 0x80000003 });
     put64(q, off + 4, r.work + 0x82c);
     put64(q, off + 0xc, r.work + 0x834);
     put64(q, off + 0x14, r.work + if end { 0x83c } else { 0x834 });
     put64(q, off + 0x1c, r.qinfo);
     put64(q, off + 0x24, if requested { r.work + 0x844 } else { 0 });
-    put64(q, off + 0x2c, r.work + 0x89c);
+    put64(q, off + 0x2c, r.work + auxiliary as u64);
     put64(q, off + 0x34, r.work + 0x7dc);
     put64(q, off + 0x44, 1);
 }
@@ -150,8 +167,25 @@ fn timestamp(q: &mut [u8], off: usize, end: bool, r: &ComputeRefs, requested: bo
 /// `r` is authoritative; `n` is only the shared engine's software ordinal. The zeroed sequence
 /// is mirrored at work+0x900; its live pointer is `r.seq`, which may name that embedded copy or
 /// a separate retained object. Absolute references into the sequence use `r.seq` in both cases.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, dead_code)]
 pub(crate) fn encode_compute(
+    r: &ComputeRefs,
+    c: &uapi::drm_asahi_cmd_compute,
+    att: &[uapi::drm_asahi_attachment],
+    ts_va: &[u64; 2],
+    ctx: u32,
+    n: u64,
+    fault_mask: u32,
+    w: &mut [u8; compute::WORK_SIZE],
+    q: &mut [u8; compute::SEQ_SIZE],
+) -> Result<(), ComputeEncodeError> {
+    encode_compute_for(&compute::V25G83, r, c, att, ts_va, ctx, n, fault_mask, w, q)
+}
+
+/// [`encode_compute`] for the work layout of another firmware ABI.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_compute_for(
+    layout: &compute::Layout,
     r: &ComputeRefs,
     c: &uapi::drm_asahi_cmd_compute,
     att: &[uapi::drm_asahi_attachment],
@@ -307,7 +341,12 @@ pub(crate) fn encode_compute(
     put64(w, 0x873, 0x1588000);
     put64(w, 0x87b, 0xef8000);
     put64(w, 0x883, r.auxiliary_fw);
-    put8(w, 0x88b, r.binding_generation);
+    put_generation(
+        w,
+        compute::GENERATION,
+        layout.generation_bytes,
+        r.binding_generation,
+    );
 
     put32(q, 0, 0xb);
     put64(q, 0x14, r.work + 0x20);
@@ -335,12 +374,12 @@ pub(crate) fn encode_compute(
     put64(q, 0x190, r.context_store_gva + 0xf400);
     put64(q, 0x198, r.context_store_gva + 0x1e800);
     put64(q, 0x1a0, r.context_store_gva + 0x1f000);
-    put64(q, 0x1a8, r.work + 0x8ac);
+    put64(q, 0x1a8, r.work + layout.target as u64);
     put32(q, 0x1b8, compute::EVENT);
     let requested = ts_va[0] != 0 || ts_va[1] != 0;
-    timestamp(q, compute::TS_START, false, r, requested);
+    timestamp(q, compute::TS_START, false, r, requested, layout.auxiliary);
     put32(q, 0x208, 1);
-    timestamp(q, compute::TS_END, true, r, requested);
+    timestamp(q, compute::TS_END, true, r, requested, layout.auxiliary);
     let f = compute::FINALIZE;
     put32(q, f, 0xc);
     put64(q, f + 4, r.stats_fw);
@@ -353,8 +392,8 @@ pub(crate) fn encode_compute(
     put64(q, f + 0x5c, r.seq + 0x160);
     put32(q, f + 0x64, 0u32.wrapping_sub(f as u32));
     put8(q, f + 0x68, u8::from(!att.is_empty()));
-    put64(q, f + 0x69, r.work + 0x8ac);
-    put64(q, f + 0x71, r.work + 0x88c);
+    put64(q, f + 0x69, r.work + layout.target as u64);
+    put64(q, f + 0x71, r.work + layout.completion as u64);
     put32(q, compute::END, 0x40000002);
     w[compute::SEQ_EMBEDDED..compute::SEQ_EMBEDDED + compute::SEQ_SIZE].copy_from_slice(q);
 

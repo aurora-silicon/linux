@@ -123,6 +123,8 @@ struct apple_smc {
 	const struct apple_sleep_smc_policy *sleep_policy;
 	u64 sleep_warn_ack;
 	bool sleep_pmvc_info;
+	/* WKTP (1-byte writable) supported: notify SMC on full wake. */
+	bool has_wktp;
 	/* The saved scope's pmVC after ANS, and when it was answered. */
 	bool saved_pmvc_sent;
 	u64 saved_pmvc_at;
@@ -331,15 +333,45 @@ APPLE_SMC_TYPE_OPS(s8)
 struct device;
 
 /*
+ * Hotspot fan-assistance thresholds read from the machine's SMC hwmon device
+ * tree node (macsmc_soc_die active trip temperature, hysteresis-derived
+ * release temperature, and minimum hold time).
+ */
+struct macsmc_hwmon_fan_assist {
+	int trigger_mc;
+	int release_mc;
+	unsigned int hold_ms;
+};
+
+/*
  * The SMC hwmon cell's fan control for a kernel thermal policy (a GPU
  * governor): see drivers/hwmon/macsmc-hwmon.c.
  */
 #if IS_REACHABLE(CONFIG_SENSORS_MACSMC_HWMON)
 int macsmc_hwmon_fans_request(struct device *dev, unsigned int permille,
 			      unsigned int min_step_rpm);
+int macsmc_hwmon_fans_request_manual(struct device *dev, unsigned int permille,
+				     unsigned int min_step_rpm);
+bool macsmc_hwmon_hotspot_assist_available(void);
+int macsmc_hwmon_hotspot_assist_policy(struct device *dev,
+				       struct macsmc_hwmon_fan_assist *policy);
 #else
 static inline int macsmc_hwmon_fans_request(struct device *dev, unsigned int permille,
 					    unsigned int min_step_rpm)
+{
+	return -ENODEV;
+}
+static inline int macsmc_hwmon_fans_request_manual(struct device *dev, unsigned int permille,
+						   unsigned int min_step_rpm)
+{
+	return -ENODEV;
+}
+static inline bool macsmc_hwmon_hotspot_assist_available(void)
+{
+	return false;
+}
+static inline int macsmc_hwmon_hotspot_assist_policy(struct device *dev,
+						     struct macsmc_hwmon_fan_assist *policy)
 {
 	return -ENODEV;
 }

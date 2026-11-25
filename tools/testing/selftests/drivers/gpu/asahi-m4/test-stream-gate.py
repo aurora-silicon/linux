@@ -240,7 +240,9 @@ fn pending_signal_interrupts_walk() {
 }
 #[test]
 fn vdm_m4_root_barrier() {
-    assert!(g16::gate::vdm(&vm_for(&[0x21000960]), BASE).is_ok());
+    for word in [0x21000960, 0x21000968] {
+        assert!(g16::gate::vdm(&vm_for(&[word]), BASE).is_ok());
+    }
     for word in [0, 0x21000964, 0x40000000] {
         assert!(g16::gate::vdm(&vm_for(&[word]), BASE).is_err());
     }

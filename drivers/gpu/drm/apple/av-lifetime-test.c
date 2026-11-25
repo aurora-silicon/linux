@@ -160,6 +160,7 @@ static struct av_life_test *av_life_setup(struct kunit *test, work_func_t owner_
 	init_waitqueue_head(&t->asrv->gen_wq);
 #endif
 	INIT_WORK(&t->asrv->start_av_service_wq, owner_fn);
+	INIT_DELAYED_WORK(&t->asrv->open_check_wq, owner_fn);
 	INIT_WORK(&t->asrv->terminate_wq, owner_fn);
 	INIT_WORK(&t->dcp->external_audio_work, av_life_owner_fn);
 	t->asrv->works_live = true;
