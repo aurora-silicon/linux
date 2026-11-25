@@ -829,6 +829,85 @@ static void hwx_h17_zin_test(struct kunit *test)
 #undef AS_H16
 }
 
+/*
+ * H15 (M3, subtype 6): 0x890 linear / 0x8b0 mixed program descriptor (no fp32
+ * trailer record, trailer_bar 5), 8-word task header, prologue 0 or 1.
+ */
+static void hwx_h15_test(struct kunit *test)
+{
+	unsigned int form;
+
+	for (form = 0; form < 2; form++) {
+		struct hwx_fixture *f = fixture_create(test, form, false);
+		struct ane_h16_hwx info = {};
+		u32 prog_len = form ? 0x8b0 : 0x890;
+		u32 old_len = form ? 0x8c0 : 0x8a0;
+		u8 *c, *text, *section;
+
+		KUNIT_ASSERT_NOT_NULL(test, f);
+		/* Shrink the program descriptor command by 16 bytes (drop key=7 record). */
+		c = f->bytes + f->program;
+		put_unaligned_le32(ANE_HWX_SUBTYPE_H15, f->bytes + 8);
+		put_unaligned_le32(prog_len, c + 4);
+		put_unaligned_le32(form ? 0x226 : 0x21e, c + 0xc);
+		put_unaligned_le32(form ? 0x8a8 : 0x888, c + 0x848);
+		put_unaligned_le32(5, c + 0x868);
+		put_unaligned_le32(form ? 3 : 1, c + 0x870);
+		if (form) {
+			/* Mixed 0x8b0: keep key=2 and key=3, move key=9 to +0x898. */
+			put_unaligned_le32(9, c + 0x898);
+			put_unaligned_le32(8, c + 0x89c);
+			put_unaligned_le32(0, c + 0x8a0);
+			put_unaligned_le32(0, c + 0x8a4);
+			memcpy(c + 0x8a8, "main", 5);
+		} else {
+			/* Linear 0x890: single key=9 record at +0x878. */
+			put_unaligned_le32(9, c + 0x878);
+			put_unaligned_le32(8, c + 0x87c);
+			put_unaligned_le32(0, c + 0x880);
+			put_unaligned_le32(0, c + 0x884);
+			memcpy(c + 0x888, "main", 5);
+		}
+		/* Shift remaining load commands + symtab/strings back by 16 bytes. */
+		memmove(c + prog_len, c + old_len, f->reloc + 8 - (f->program + old_len));
+		f->cursor -= 16;
+		f->symtab -= 16;
+		f->symbols -= 16;
+		f->strings -= 16;
+		put_unaligned_le32(f->cursor - 32, f->bytes + 20);
+		put_unaligned_le32(f->symbols, f->bytes + f->symtab + 8);
+		put_unaligned_le32(f->strings, f->bytes + f->symtab + 16);
+
+		/* H15 task stream: 8-word header + 2-word record (40 B) + 16 B prologue. */
+		text = f->bytes + SZ_16K;
+		section = f->bytes + f->text_command + 72;
+		memset(text, 0, 64);
+		put_unaligned_le32(0, text);
+		put_unaligned_le32(10 << 16, text + 16);
+		put_unaligned_le32(0x4100 / 4, text + 48);
+		put_unaligned_le64(56, section + 40);
+		put_unaligned_le32(14, c + 0x824);
+
+		KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
+		KUNIT_EXPECT_EQ(test, info.subtype, ANE_HWX_SUBTYPE_H15);
+		KUNIT_EXPECT_EQ(test, info.tasks, 1U);
+		/* Prologue 1 is accepted too. */
+		put_unaligned_le32(1, text);
+		KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
+		/* H16 rejects an H15 layout. */
+		put_unaligned_le32(ANE_HWX_SUBTYPE_H16, f->bytes + 8);
+		KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+		put_unaligned_le32(ANE_HWX_SUBTYPE_H15, f->bytes + 8);
+		/* A 9-word H16 task header fails H15 validation. */
+		put_unaligned_le32(11 << 16, text + 16);
+		put_unaligned_le32(0, text + 48);
+		put_unaligned_le32(0x4100 / 4, text + 52);
+		put_unaligned_le64(60, section + 40);
+		put_unaligned_le32(15, c + 0x824);
+		KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	}
+}
+
 static struct kunit_case hwx_cases[] = {
 	KUNIT_CASE(hwx_forms_test),
 	KUNIT_CASE(hwx_header_test),
@@ -849,6 +928,7 @@ static struct kunit_case hwx_cases[] = {
 	KUNIT_CASE(hwx_load_resources_test),
 	KUNIT_CASE(hwx_import_bounds_test),
 	KUNIT_CASE(hwx_h17_zin_test),
+	KUNIT_CASE(hwx_h15_test),
 	{}
 };
 

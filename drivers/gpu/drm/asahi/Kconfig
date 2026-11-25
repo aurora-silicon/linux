@@ -96,6 +96,18 @@ config DRM_ASAHI_M3_T8122
 	  boards and firmware do not gain automatic admission. Other GPUs
 	  are not affected.
 
+config DRM_ASAHI_G14_V27_2
+	bool "Apple G14G on GPU firmware 27.2"
+	depends on DRM_ASAHI
+	# The firmware's UAT is adopted through the G15 backend's handoff helpers.
+	depends on DRM_ASAHI_G15
+	default y
+	help
+	  Start an M2 GPU (G14G) whose boot loader reports GPU firmware
+	  27.2, and register a DRM device on it. Clients use
+	  the shared submission interface for compute and rendering.
+	  Other GPUs and firmware versions are not affected.
+
 config DRM_ASAHI_G15
 	bool "Apple M3 Pro/Max (G15) support"
 	depends on DRM_ASAHI

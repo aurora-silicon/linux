@@ -132,3 +132,40 @@
 &apr0 {
 	status = "okay";
 };
+
+/* Both MSR scalers/CSCs (scaler0, scaler1) and their DARTs. */
+&ps_fab5_soc {
+	status = "okay";
+};
+
+&ps_msr0 {
+	status = "okay";
+};
+
+&ps_msr0_ase_core {
+	status = "okay";
+};
+
+&scaler0_dart {
+	status = "okay";
+};
+
+&scaler0 {
+	status = "okay";
+};
+
+&ps_msr1 {
+	status = "okay";
+};
+
+&ps_msr1_ase_core {
+	status = "okay";
+};
+
+&scaler1_dart {
+	status = "okay";
+};
+
+&scaler1 {
+	status = "okay";
+};

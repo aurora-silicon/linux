@@ -314,10 +314,17 @@ static const struct apple_soc_cpufreq_info soc_t8142_info = {
 	.ps1_shift = APPLE_DVFS_CMD_PS1_SHIFT,
 };
 
-/* T8152 ACC uses state 2 as the first OPP and shares P/M requests. */
+/*
+ * T8152 ACC uses state 2 as the first OPP and shares P/M requests. It has no
+ * PMP fast die-temperature loop, so states above 3 are held back until the
+ * board's thermal policy takes ownership, see
+ * apple_soc_cpufreq_set_thermal_owner(): the SMC thermal zones once they
+ * throttle the cluster (macsmc-hwmon). This bootstrap ceiling is a Linux
+ * restriction, not a firmware thermal or safety limit.
+ */
 static const struct apple_soc_cpufreq_info soc_t8152_info = {
 	.verify_transition = true,
-	.needs_thermal_policy = true,
+	.needs_thermal_owner = true,
 	.transition_timeout_us = 2000,
 	.max_unmanaged_pstate = 3,
 	.min_pstate = 2,

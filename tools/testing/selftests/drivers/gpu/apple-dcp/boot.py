@@ -36,6 +36,7 @@ static u64 observed;
 static bool neo, m5;
 #define of_machine_is_compatible(s) ((!strcmp(s,"apple,t8140") && neo) || (!strcmp(s,"apple,t8142") && m5))
 #define dev_warn(dev,fmt,msg) do { (void)(dev); (void)(fmt); warnings++; observed=(msg); } while (0)
+#define dev_warn_ratelimited(dev,fmt,msg) dev_warn(dev,fmt,msg)
 #define dev_dbg(dev,fmt,msg) do { (void)(dev); (void)(fmt); notifications++; observed=(msg); } while (0)
 #define dev_err(dev,fmt,msg) do { (void)(dev); (void)(fmt); (void)(msg); errors++; } while (0)
 static int __attribute__((unused)) apple_rtkit_send_message(struct apple_rtkit *rtk, u8 ep, u64 msg, void *completion, bool atomic)
@@ -216,10 +217,12 @@ def _v27_prelude(root, helpers):
     method_table = block(dcp_c, 'static enum dcp_firmware_version dcp_v27_method_table(')
     return r'''
 #include <assert.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 typedef uint32_t u32;
 enum dcp_firmware_version {
     DCP_FIRMWARE_UNKNOWN,
@@ -552,6 +555,197 @@ int main(void)
     reset(); set(dcpext.fw, 26, 6, 2); set(dcpext.compat, 26, 6, 2);
     expect(false, DCP_FIRMWARE_UNKNOWN);
     puts("PASS T8122 dcpext 14.7.0 keeps the template, native 26.x keeps H17P");
+    return 0;
+}
+'''
+
+
+def v27_tag_translation(root):
+    iomfb_h = (root / 'drivers/gpu/drm/apple/iomfb.h').read_text()
+    methods_decl = iomfb_h[iomfb_h.index('enum dcpep_method {'):
+                           iomfb_h.index('#define IOMFB_MAX_CB')]
+    v27_c = (root / 'drivers/gpu/drm/apple/iomfb_v27.c').read_text()
+    v27_tables = v27_c[v27_c.index('static const struct dcp_method_entry dcp_methods_27_0'):
+                       v27_c.index('/* The template\'s calls resolve through')]
+    dcp_c = (root / 'drivers/gpu/drm/apple/dcp.c').read_text()
+    transport = block(dcp_c, 'static bool dcp_v27_sleep_transport_supported(')
+    return r'''
+#include <assert.h>
+#include <errno.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#define CONFIG_APPLE_SOC_SLEEP 1
+#define IS_ENABLED(option) (option)
+#define GFP_KERNEL 0
+enum dcp_firmware_version {
+    DCP_FIRMWARE_UNKNOWN,
+    DCP_FIRMWARE_V_27_0,
+};
+enum dcp_iomfb_method_profile {
+    DCP_IOMFB_METHODS_DEFAULT,
+    DCP_IOMFB_METHODS_H17G,
+};
+struct device_node { const char *compatible; };
+struct device { struct device_node *of_node; };
+struct apple_dcp_hw_data {
+    bool adopt_live_session;
+    enum dcp_iomfb_method_profile iomfb_method_profile;
+};
+struct apple_dcp {
+    struct device *dev;
+    struct apple_dcp_hw_data hw;
+    enum dcp_firmware_version fw_compat;
+    const struct dcp_method_entry *v27_methods;
+};
+static int of_device_is_compatible(const struct device_node *np, const char *s)
+{
+    return np && np->compatible && !strcmp(np->compatible, s);
+}
+static void *devm_kmemdup(struct device *dev, const void *src, size_t len, unsigned int gfp)
+{
+    void *copy = malloc(len);
+    (void)dev; (void)gfp;
+    if (copy)
+        memcpy(copy, src, len);
+    return copy;
+}
+''' + methods_decl + '\n' + v27_tables + '\n' + transport + r'''
+static void expect_tag(const struct dcp_method_entry *methods, const char *in, const char *want)
+{
+    char out[4] = { 'X', 'X', 'X', 'X' };
+    assert(iomfb_v27_tag(methods, in, out) == 0);
+    assert(memcmp(out, want, 4) == 0);
+}
+
+static void expect_tag_fail(const struct dcp_method_entry *methods, const char *in)
+{
+    char out[4] = { 'X', 'X', 'X', 'X' };
+    assert(iomfb_v27_tag(methods, in, out) == -EOPNOTSUPP);
+    assert(memcmp(out, "XXXX", 4) == 0);
+}
+
+int main(void)
+{
+    struct device_node node = { .compatible = "apple,t6050-dcp" };
+    struct device dev = { .of_node = &node };
+    const struct dcp_method_entry *m27_0 = iomfb_v27_methods("27.0.0");
+    const struct dcp_method_entry *m27_2 = iomfb_v27_methods("27.2.0");
+    const struct dcp_method_entry *m27_3 = iomfb_v27_methods("27.3.0");
+    const struct dcp_method_entry *j714s = iomfb_v27_methods_j714s(&dev, m27_0);
+    struct dcp_method_entry partial_27_2[dcpep_num_methods];
+    unsigned int missing_count;
+
+    assert(m27_0 && m27_2 && m27_3 && j714s);
+    assert(!iomfb_v27_methods_renumbered(NULL));
+    assert(!iomfb_v27_methods_renumbered(m27_0));
+    assert(!iomfb_v27_methods_renumbered(j714s));
+    assert(iomfb_v27_methods_renumbered(m27_2));
+    assert(iomfb_v27_methods_renumbered(m27_3));
+
+    /* NULL table fails closed. */
+    expect_tag_fail(NULL, "A411");
+    assert(!iomfb_v27_sleep_methods_complete(NULL));
+
+    /* 27.0 and J714s copy keep 27.0 IDs unchanged. */
+    expect_tag(m27_0, "A411", "A411");
+    expect_tag(m27_0, "A484", "A484");
+    expect_tag(m27_0, "A500", "A500");
+    expect_tag(m27_0, "A442", "A442");
+    expect_tag(m27_0, "A449", "A449");
+    expect_tag(m27_0, "A115", "A115");
+    expect_tag(m27_0, "A364", "A364");
+    expect_tag(j714s, "A411", "A411");
+    expect_tag(j714s, "A408", "A408");
+    expect_tag(j714s, "A500", "A500");
+    assert(iomfb_v27_sleep_methods_complete(m27_0));
+    assert(iomfb_v27_sleep_methods_complete(j714s));
+    assert(!iomfb_v27_missing_method(m27_0, &missing_count) && missing_count == 0);
+
+    /* 27.2 translates every recorded shifted and unchanged paired/sleep tag. */
+    const struct { const char *in, *out; } map_27_2[] = {
+        { "A406", "A456" }, { "A408", "A458" }, { "A411", "A461" }, { "A412", "A462" },
+        { "A413", "A463" }, { "A414", "A464" }, { "A423", "A473" }, { "A428", "A478" },
+        { "A442", "A492" }, { "A449", "A499" }, { "A450", "A500" }, { "A453", "A503" },
+        { "A484", "A534" }, { "A487", "A537" }, { "A489", "A539" }, { "A500", "A550" },
+        { "A115", "A115" },
+        { "A360", "A360" }, { "A361", "A361" }, { "A362", "A362" }, { "A364", "A364" },
+        { "A365", "A365" }, { "A366", "A366" }, { "A367", "A367" }, { "A368", "A368" },
+        { "A369", "A369" }, { "A370", "A370" }, { "A371", "A371" }, { "A372", "A372" },
+        { "A373", "A373" },
+    };
+    for (unsigned int i = 0; i < ARRAY_SIZE(map_27_2); i++)
+        expect_tag(m27_2, map_27_2[i].in, map_27_2[i].out);
+    assert(iomfb_v27_sleep_methods_complete(m27_2));
+    assert(!iomfb_v27_missing_method(m27_2, &missing_count) && missing_count == 0);
+
+    /* Unrecorded tags on 27.2 fail closed (no +50 arithmetic, no 27.0 fallback). */
+    expect_tag_fail(m27_2, "A495");
+    expect_tag_fail(m27_2, "A499");
+    expect_tag_fail(m27_2, "A375");
+    expect_tag_fail(m27_2, "A999");
+
+    /* Incomplete renumbered table (27.3) translates recorded entries and fails closed on missing ones. */
+    expect_tag(m27_3, "A453", "A503");
+    const char *missing_27_3[] = {
+        "A411", "A413", "A484", "A500", "A442", "A449", "A115", "A364", "A367",
+    };
+    for (unsigned int i = 0; i < ARRAY_SIZE(missing_27_3); i++)
+        expect_tag_fail(m27_3, missing_27_3[i]);
+    assert(!iomfb_v27_sleep_methods_complete(m27_3));
+    assert(iomfb_v27_missing_method(m27_3, &missing_count) && missing_count > 0);
+
+    /* Dropping an optional sleep/paired entry does not block basic boot admission,
+     * but does mark sleep incomplete when a sleep entry is missing, and any table
+     * other than 27.0 or the J714s copy fails closed as renumbered. */
+    memcpy(partial_27_2, m27_2, sizeof(partial_27_2));
+    partial_27_2[dcpep_v27_wake_a442].tag[0] = '\0';
+    assert(iomfb_v27_methods_renumbered(partial_27_2));
+    expect_tag_fail(partial_27_2, "A442");
+    assert(!iomfb_v27_missing_method(partial_27_2, &missing_count) && missing_count == 0);
+    assert(!iomfb_v27_sleep_methods_complete(partial_27_2));
+
+    struct dcp_method_entry future_27_x[dcpep_num_methods];
+    memcpy(future_27_x, m27_0, sizeof(future_27_x));
+    memcpy(future_27_x[dcpep_start_signal].tag, "A501", 4);
+    future_27_x[dcpep_v27_wake_a442].tag[0] = '\0';
+    assert(iomfb_v27_methods_renumbered(future_27_x));
+    expect_tag_fail(future_27_x, "A442");
+
+    /*
+     * Sleep transport admission keys on T6050 DCP/DCPEXT and table completeness.
+     * No of_machine_is_compatible() stub exists in this translation unit, enforcing
+     * at compile time that admission does not gate on a board model.
+     */
+    struct apple_dcp dcp = {
+        .dev = &dev,
+        .hw = { .adopt_live_session = true, .iomfb_method_profile = DCP_IOMFB_METHODS_DEFAULT },
+        .fw_compat = DCP_FIRMWARE_V_27_0,
+    };
+    const char *t6050_compats[] = { "apple,t6050-dcp", "apple,t6050-dcpext" };
+    for (unsigned int i = 0; i < ARRAY_SIZE(t6050_compats); i++) {
+        node.compatible = t6050_compats[i];
+        dcp.v27_methods = m27_0; assert(dcp_v27_sleep_transport_supported(&dcp));
+        dcp.v27_methods = j714s; assert(dcp_v27_sleep_transport_supported(&dcp));
+        dcp.v27_methods = m27_2; assert(dcp_v27_sleep_transport_supported(&dcp));
+        dcp.v27_methods = m27_3; assert(!dcp_v27_sleep_transport_supported(&dcp));
+        dcp.v27_methods = partial_27_2; assert(!dcp_v27_sleep_transport_supported(&dcp));
+        dcp.v27_methods = NULL; assert(!dcp_v27_sleep_transport_supported(&dcp));
+    }
+    dcp.v27_methods = m27_2;
+    node.compatible = "apple,t6041-dcp"; assert(!dcp_v27_sleep_transport_supported(&dcp));
+    node.compatible = "apple,t6050-dcp";
+    dcp.hw.adopt_live_session = false; assert(!dcp_v27_sleep_transport_supported(&dcp));
+    dcp.hw.adopt_live_session = true;
+    dcp.hw.iomfb_method_profile = DCP_IOMFB_METHODS_H17G; assert(!dcp_v27_sleep_transport_supported(&dcp));
+    dcp.hw.iomfb_method_profile = DCP_IOMFB_METHODS_DEFAULT;
+    dcp.fw_compat = DCP_FIRMWARE_UNKNOWN; assert(!dcp_v27_sleep_transport_supported(&dcp));
+
+    free((void *)j714s);
+    puts("PASS v27 tag translation fail-closed and table-driven sleep transport admission");
     return 0;
 }
 '''

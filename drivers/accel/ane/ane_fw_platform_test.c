@@ -89,6 +89,32 @@ static void ane_platform_staged_bind_test(struct kunit *test)
 }
 
 #if IS_BUILTIN(CONFIG_DRM_ACCEL_ANE) && IS_BUILTIN(CONFIG_DRM_ACCEL_ANE_FW_KUNIT_TEST)
+/* M3 (T8122) H15: three reg windows, five DAPF records at DART0 + 0x4000, cold sleep. */
+static void ane_t8122_platform_test(struct kunit *test)
+{
+	struct platform_device *pdev = platform_device_alloc("ane-t8122", -1);
+	u64 phys[] = { 0x100000000, 0x200000000 };
+
+	KUNIT_ASSERT_NOT_NULL(test, pdev);
+	KUNIT_EXPECT_EQ(test, ane_t8122_platform.soc, 0x8122U);
+	KUNIT_EXPECT_EQ(test, ane_t8122_platform.chip_family, 15U);
+	KUNIT_EXPECT_EQ(test, ane_t8122_platform.ane_type, 0xb0U);
+	KUNIT_EXPECT_EQ(test, ane_t8122_platform.hwx_subtype, 6U);
+	KUNIT_EXPECT_EQ(test, ane_t8122_platform.reg_count, 3U);
+	KUNIT_EXPECT_STREQ(test, ane_t8122_platform.reg_names[2], "aux-0");
+	KUNIT_EXPECT_FALSE(test, ane_t8122_platform.has_xl);
+	KUNIT_EXPECT_EQ(test, ane_t8122_platform.dapf_dart, 0U);
+	KUNIT_EXPECT_EQ(test, ane_t8122_platform.dapf_offset, 0x4000U);
+	KUNIT_EXPECT_EQ(test, ane_t8122_platform.dapf_count, 5);
+	KUNIT_EXPECT_EQ(test, ane_t8122_platform.power_words[0], 0x438U);
+	KUNIT_EXPECT_TRUE(test, ane_t8122_platform.sleep_cold);
+	KUNIT_EXPECT_TRUE(test, ane_fw_preload_ranges_valid(&ane_t8122_platform, phys,
+							    ane_t8122_platform.preload_size,
+							    ane_t8122_platform.preload_dva));
+	KUNIT_EXPECT_EQ(test, ane_fw_platform_preflight(pdev, &ane_t8122_platform), -EINVAL);
+	platform_device_put(pdev);
+}
+
 /* One engine: no aux-3, five DAPF records; a node without DT is refused. */
 static void ane_t8132_platform_test(struct kunit *test)
 {
@@ -221,6 +247,7 @@ static void ane_t8142_bridge_ops_test(struct kunit *test)
 
 static struct kunit_case ane_fw_platform_cases[] = {
 #if IS_BUILTIN(CONFIG_DRM_ACCEL_ANE) && IS_BUILTIN(CONFIG_DRM_ACCEL_ANE_FW_KUNIT_TEST)
+	KUNIT_CASE(ane_t8122_platform_test),
 	KUNIT_CASE(ane_t8132_platform_test),
 	KUNIT_CASE(ane_t8132_builds_test),
 	KUNIT_CASE(ane_t6050_builds_test),
