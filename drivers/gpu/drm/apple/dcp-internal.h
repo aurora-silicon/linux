@@ -4,6 +4,7 @@
 #ifndef __APPLE_DCP_INTERNAL_H__
 #define __APPLE_DCP_INTERNAL_H__
 
+#include "dcp-indicator.h"
 #include <drm/drm_mode.h>
 #include <linux/atomic.h>
 #include <linux/backlight.h>
@@ -207,6 +208,12 @@ struct dcp_brightness {
 	u32 fade_from;
 	u32 fade_to;
 	bool fading;
+	/*
+	 * Without the present-coupled policy: the level the last present set
+	 * (struct dcp_bl_presented), while nits is the firmware's report.
+	 * Under the backlight lock.
+	 */
+	struct dcp_bl_presented presented;
 };
 
 struct audiosrv_data;
@@ -243,6 +250,13 @@ struct dcp_s2r_layout {
 	u32 disp_streams;
 	/* "pmc-dcp" counts the powered DCPs: T8132 and T8140 only */
 	bool pmc_dcp;
+	/*
+	 * From the device tree (dcp_s2r_layout_from_dt()): only the @*_mask bits of a
+	 * retention word are written, @*_off while off and the value read at probe back on.
+	 * Zero masks: the whole words, as above.
+	 */
+	u32 ret_ff_mask, ret_ff_off, ret_ff_on;
+	u32 ret_mem_mask, ret_mem_off, ret_mem_on;
 };
 
 /*
@@ -433,6 +447,7 @@ struct dcp_desktop_state {
 /* TODO: move IOMFB members to its own struct */
 struct dcpext_scanout;
 struct dcp_hdmi;
+struct dcp_cec;
 
 bool dcp_desktop_present_complete(struct apple_dcp *dcp, u32 id);
 void dcp_panel_metadata_replace(struct apple_dcp *dcp,
@@ -444,7 +459,23 @@ bool dcp_panel_metadata_current(struct apple_dcp *dcp, u64 generation);
 
 void dcp_s2r_dart_power(struct apple_dcp *dcp, u32 on);
 
+/* Kernel-owned software camera indicator; see dcp-indicator.c. */
+struct dcp_camera_indicator {
+	struct dcp_indicator state;
+	spinlock_t lock;
+	struct mutex ctl;
+	struct delayed_work watch;
+	struct work_struct resume;
+	struct work_struct retry;
+	unsigned long deadline;
+	struct drm_plane *plane;
+	struct drm_framebuffer *fb;
+	u32 surf;
+	bool has_surf;
+};
+
 struct apple_dcp {
+	struct dcp_camera_indicator camera_ind;
 	/* Generation-specific wire/transaction state, sharing the common KMS owner. */
 	struct iomfb_m4 *v26_6;
 	/* An adopted session has no confirmed firmware DMA stop boundary. */
@@ -868,6 +899,9 @@ struct apple_dcp {
 	struct completion s2r_dart_done;
 	struct device *s2r_disp_dart;
 	struct device *s2r_dcp_dart;
+	/* hw.s2r without a layout in its hw data: the device tree's, see dcp_s2r_layout_from_dt() */
+	struct dcp_s2r_layout s2r_dt_layout;
+	bool s2r_dt_layout_ok;
 
 	/* eDP display without DP-HDMI conversion */
 	bool main_display;
@@ -986,6 +1020,11 @@ struct apple_dcp {
 	 * Activate/Deactivate belong to it until its answer is in.
 	 */
 	bool t8132_release_late;
+	/*
+	 * T8132 dcpext: its display was released and its route parked for a
+	 * deep sleep (dcp_t8132_sleep_release()), to be connected again after it.
+	 */
+	bool t8132_sleep_released;
 	/* DPTX feeds a Thunderbolt DP IN adapter, not the Type-C PHY lanes */
 	bool dptx_tunnel;
 	/* DFP port in the DPTX target: 0 = dpphy, 1 = dpin0, 2 = dpin1 */
@@ -1157,6 +1196,7 @@ struct apple_dcp {
 	struct dcp_desktop_state *desktop;
 	/* Internal panel identity; NULL without an internal panel. */
 	struct dcp_panel_identity *panel_identity;
+	struct dcp_cec *cec;
 };
 
 /* T8132 firmware uses its own wire codec, with the common DRM/KMS owner. */
@@ -1195,6 +1235,7 @@ bool dcp_firmware_metadata_current(struct apple_dcp *dcp, u64 generation);
 const struct drm_edid *dcp_firmware_edid(struct apple_dcp *dcp, u64 *generation,
 					 u32 *defaults);
 
+void iomfb_prepare_indicator_h17p(struct apple_dcp *dcp);
 void iomfb_scanout_complete_h17p(struct apple_dcp *dcp);
 void iomfb_present_backlight_h17p(struct apple_dcp *dcp);
 void iomfb_present_matrix_h17p(struct apple_dcp *dcp);
@@ -1390,5 +1431,13 @@ void dcp_trace_panel_property(struct apple_dcp *dcp, int tag, const char *key,
 			      size_t key_len, const void *blob, size_t len);
 
 void dcp_panel_edid_receive(struct apple_dcp *dcp, const void *blob, size_t len);
+
+int dcp_indicator_probe(struct apple_dcp *dcp);
+void dcp_indicator_release(struct apple_dcp *dcp);
+int dcp_indicator_attach_plane(struct apple_dcp *dcp, struct drm_device *drm,
+			       struct drm_plane *plane);
+void dcp_indicator_swap_done(struct apple_dcp *dcp, struct drm_framebuffer *slot_fb);
+void dcp_indicator_display_resumed(struct apple_dcp *dcp);
+extern const struct drm_framebuffer_funcs dcp_indicator_fb_funcs;
 
 #endif /* __APPLE_DCP_INTERNAL_H__ */

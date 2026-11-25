@@ -1154,17 +1154,22 @@ static int apple_probe_per_dcp(struct device *dev,
 				      (zpos <= 1 || surf != top_surf);
 
 			/*
-			 * The T8142 runs macOS 27.0's DCP firmware as firmware
-			 * 27, outside the H17G profile, and blends XRGB's X
-			 * byte as alpha all the same (GPU-rendered alacritty
-			 * showed wrong colours on the panel).
+			 * T8142 and T6041 run firmware 27 outside the H17G
+			 * profile and blend XRGB's fourth byte as straight
+			 * alpha all the same (on AGX, B8G8R8X8 leaves PBE
+			 * Swizzle A at channel 0, storing X = R and turning
+			 * R = 0 blues and cyans black on the panel).
 			 */
 			bool xrgb_is_alpha =
 				dcp_data->hw.iomfb_method_profile ==
 					DCP_IOMFB_METHODS_H17G ||
 				(dcp_data->fw_compat == DCP_FIRMWARE_V_27_0 &&
-				 of_device_is_compatible(dcp_data->dev->of_node,
-							 "apple,t8142-dcp"));
+				 (of_device_is_compatible(dcp_data->dev->of_node,
+							  "apple,t8142-dcp") ||
+				  of_device_is_compatible(dcp_data->dev->of_node,
+							  "apple,t6041-dcp") ||
+				  of_device_is_compatible(dcp_data->dev->of_node,
+							  "apple,t6041-dcpext")));
 
 			planes[zpos] = apple_plane_init(drm, 1U << num, surf,
 							supports_l10r,
@@ -1181,6 +1186,27 @@ static int apple_probe_per_dcp(struct device *dev,
 			return ret;
 
 		zpos++;
+	}
+
+	if (dcp_data->camera_ind.has_surf) {
+		struct drm_plane *ind_plane;
+
+		ind_plane = apple_plane_init(drm, 1U << num, dcp_data->camera_ind.surf,
+					     supports_l10r, supports_xrgb2101010,
+					     dcp_data->hw.iomfb_method_profile ==
+						     DCP_IOMFB_METHODS_H17G,
+					     DRM_PLANE_TYPE_OVERLAY, false,
+					     supports_premultiplied,
+					     dcp_is_ext26(dcp_data));
+		if (IS_ERR(ind_plane))
+			return PTR_ERR(ind_plane);
+		ret = drm_plane_create_zpos_immutable_property(ind_plane, zpos++);
+		if (ret)
+			return ret;
+		/* Without its buffer the plane stays reserved and no indicator is shown. */
+		ret = dcp_indicator_attach_plane(dcp_data, drm, ind_plane);
+		if (ret)
+			dev_err(dev, "camera indicator unavailable: %d\n", ret);
 	}
 
 	/*
@@ -2040,6 +2066,7 @@ static bool apple_drm_hold_resume_events(struct apple_drm_private *apple, u32 cr
 
 static void apple_drm_resume_outputs(struct apple_drm_private *apple)
 {
+	struct drm_crtc *crtc;
 	u32 dropped = 0;
 
 	apple->dark_held = false;
@@ -2049,6 +2076,11 @@ static void apple_drm_resume_outputs(struct apple_drm_private *apple)
 	if (dropped && apple_drm_hold_resume_events(apple, dropped))
 		dropped = 0;
 	drm_mode_config_helper_resume(&apple->drm);
+	drm_for_each_crtc(crtc, &apple->drm) {
+		if (t8132_ext_crtc(crtc))
+			continue;
+		dcp_indicator_display_resumed(platform_get_drvdata(to_apple_crtc(crtc)->dcp));
+	}
 	if (dropped)
 		drm_kms_helper_hotplug_event(&apple->drm);
 }
