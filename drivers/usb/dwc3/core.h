@@ -1004,11 +1004,14 @@ struct dwc3_scratchpad_array {
  * @pre_run_stop: Notify run stop enable/disable information to glue
  * @pre_host_resume: Before xHCI touches the core at a system resume; an error keeps it away,
  *		     and a positive value says the core lost its state and was set up again
+ * @post_usb3_host_start: After xHCI's SuperSpeed root hub has configured the USB3 PHY,
+ *			  before xhci_run() starts the host controller
  */
 struct dwc3_glue_ops {
 	void	(*pre_set_role)(struct dwc3 *dwc, enum usb_role role);
 	void	(*pre_run_stop)(struct dwc3 *dwc, bool is_on);
 	int	(*pre_host_resume)(struct dwc3 *dwc);
+	void	(*post_usb3_host_start)(struct dwc3 *dwc);
 };
 
 /**

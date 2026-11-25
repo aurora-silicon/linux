@@ -367,6 +367,7 @@ int main(void)
         role_program = r'''
 #include <assert.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
@@ -378,50 +379,89 @@ int main(void)
 #define USB_DR_MODE_PERIPHERAL 2
 #define DWC3_GCTL_PRTCAP_HOST 1
 #define DWC3_GCTL_PRTCAP_DEVICE 2
-enum phy_mode { PHY_MODE_USB_HOST, PHY_MODE_USB_DEVICE };
+#define container_of(ptr, type, member) ((type *)((char *)(ptr) - offsetof(type, member)))
+enum phy_mode { PHY_MODE_INVALID, PHY_MODE_USB_HOST, PHY_MODE_USB_DEVICE };
 struct device { const char *of_node; };
 struct dwc3 { int dr_mode, current_dr_role; bool dis_u3_susphy_quirk; };
 struct dwc3_apple { struct dwc3 dwc; struct device *dev; void *usb2_phy, *usb3_phy; int lock, state;
     bool dt_dis_u3_susphy, host_only, sleep_ddr; };
-static int phy_error, host_calls, gadget_calls, stops, syscore;
+#define to_dwc3_apple(d) container_of((d), struct dwc3_apple, dwc)
+static int phy_error, phy_calls, pre_host_phy_calls, host_calls, gadget_calls, stops, syscore, pipe_resets;
+static bool susphy_on;
 static bool of_device_is_compatible(const char *node, const char *name) { return !strcmp(node,name); }
-static int phy_set_mode(void *phy, int mode) { (void)phy; (void)mode; return phy_error; }
+static int phy_set_mode(void *phy, int mode) {
+    (void)phy; (void)mode;
+    assert(susphy_on);
+    phy_calls++;
+    return phy_error;
+}
 static void dwc3_apple_set_ptrcap(struct dwc3_apple *a, int cap) { (void)a; (void)cap; }
-static void dwc3_enable_susphy(struct dwc3 *d, bool on) { (void)d; assert(on); }
-static int dwc3_host_init(struct dwc3 *d) { (void)d; host_calls++; return 0; }
+static void dwc3_enable_susphy(struct dwc3 *d, bool on) { susphy_on = on && !d->dis_u3_susphy_quirk; }
 static int dwc3_gadget_init(struct dwc3 *d) { (void)d; gadget_calls++; return 0; }
 static int phy_reset(void *phy) { (void)phy; return 0; }
 static void dwc3_host_exit(struct dwc3 *d) { (void)d; assert(0); }
 static void apple_sleep_usb_slp_ddr(bool on) { (void)on; assert(0); }
-static void dwc3_apple_usb3_pipe_reset(struct dwc3_apple *a) { (void)a; assert(0); }
-''' + enum(states, "dwc3_apple_state") + r'''
+static void dwc3_apple_usb3_pipe_reset(struct dwc3_apple *a) { (void)a; pipe_resets++; }
+''' + enum(states, "dwc3_apple_state") + function(states, "dwc3_apple_usb3_mode_before_start") + r'''
 static int dwc3_apple_core_start(struct dwc3_apple *a, enum dwc3_apple_state s) { (void)a; (void)s; return 0; }
 static int dwc3_apple_core_stop(struct dwc3_apple *a) { (void)a; stops++; return 0; }
 static void dwc3_apple_syscore(struct dwc3_apple *a, bool on) { (void)a; assert(on); syscore++; }
+''' + function(dwc, "dwc3_apple_post_usb3_host_start") + r'''
+/* Model xhci_plat_probe(): HCRST on dummy PIPE, primary plat_start enables SUSPHY, shared HCD routes USB3. */
+static int dwc3_host_init(struct dwc3 *d)
+{
+    struct dwc3_apple *a = to_dwc3_apple(d);
+    int ret;
+
+    pre_host_phy_calls = phy_calls;
+    host_calls++;
+    if (!of_device_is_compatible(a->dev->of_node, "apple,t6040-dwc3")) {
+        assert(!susphy_on);
+        assert(!phy_calls);
+    }
+    dwc3_enable_susphy(d, true);
+    if (a->usb3_phy && !phy_calls) {
+        ret = phy_set_mode(a->usb3_phy, PHY_MODE_USB_HOST);
+        if (ret)
+            return ret;
+    }
+    dwc3_apple_post_usb3_host_start(d);
+    return 0;
+}
 ''' + function(dwc, "dwc3_apple_set_role") + function(dwc, "dwc3_apple_init") + r'''
 int main(void)
 {
     struct device dev = { "apple,t8132-dwc3" };
     struct dwc3_apple a = { .dev=&dev, .usb3_phy=&dev, .state=DWC3_APPLE_NO_CABLE };
-    phy_error=-ETIMEDOUT;
+    phy_error=-ETIMEDOUT; phy_calls=0;
     assert(dwc3_apple_init(&a,DWC3_APPLE_HOST)==-ETIMEDOUT);
-    assert(!host_calls && !gadget_calls && stops==1 && a.state==DWC3_APPLE_NO_CABLE);
-    phy_error=-EOPNOTSUPP;
+    assert(host_calls==1 && !pre_host_phy_calls && phy_calls==1 && !gadget_calls && stops==1 && a.state==DWC3_APPLE_NO_CABLE);
+    phy_error=-EOPNOTSUPP; phy_calls=0;
     assert(dwc3_apple_init(&a,DWC3_APPLE_DEVICE)==-EOPNOTSUPP);
-    assert(!gadget_calls && stops==2);
-    phy_error=0;
+    assert(!gadget_calls && stops==2 && phy_calls==1);
+    phy_error=0; phy_calls=0;
     assert(!dwc3_apple_init(&a,DWC3_APPLE_HOST));
-    assert(host_calls==1 && a.state==DWC3_APPLE_HOST && syscore==1);
-    /* A T8132 host keeps its USB3 PHY out of P3. */
-    assert(a.dwc.dis_u3_susphy_quirk);
-    dev.of_node="apple,t8103-dwc3"; phy_error=-ETIMEDOUT;
-    assert(!dwc3_apple_init(&a,DWC3_APPLE_HOST) && host_calls==2 && syscore==2);
+    assert(host_calls==2 && !pre_host_phy_calls && phy_calls==1 && a.state==DWC3_APPLE_HOST && syscore==1);
+    /* A T8132 host keeps its USB3 PHY out of P3 once shared HCD routing completes. */
+    assert(a.dwc.dis_u3_susphy_quirk && !susphy_on);
+    dev.of_node="apple,t6050-dwc3"; phy_error=0; phy_calls=0;
+    assert(!dwc3_apple_init(&a,DWC3_APPLE_HOST) && host_calls==3 && !pre_host_phy_calls && phy_calls==1 && syscore==2);
+    assert(!a.dwc.dis_u3_susphy_quirk && susphy_on);
+    dev.of_node="apple,t6040-dwc3"; phy_error=0; phy_calls=0;
+    assert(!dwc3_apple_init(&a,DWC3_APPLE_HOST) && host_calls==4 && pre_host_phy_calls==1 && pipe_resets==1 && syscore==3);
+    dev.of_node="apple,t8103-dwc3"; phy_error=-ETIMEDOUT; phy_calls=0;
+    assert(!dwc3_apple_init(&a,DWC3_APPLE_DEVICE) && gadget_calls==1 && syscore==4);
     assert(!a.dwc.dis_u3_susphy_quirk);
-    puts("ok 7 - T8132 PHY failures stop before xHCI, older fallback preserved");
+    puts("ok 7 - USB3 host routing deferred past HCRST, T8132/T6050/T6040/device policies preserved");
     return 0;
 }
 '''
         run(Path(directory), "dwc3-t8132", role_program)
+        early_usb3 = role_program.replace(
+            "*mode = pipe_reset_before_host ? PHY_MODE_USB_HOST : PHY_MODE_INVALID;",
+            "*mode = PHY_MODE_USB_HOST;", 1)
+        assert early_usb3 != role_program
+        run(Path(directory), "dwc3-usb3-before-host-negative-control", early_usb3, expect_failure=True)
         permissive = program.replace(
             "(!atcphy->host_active || pm_suspend_target_state != PM_SUSPEND_TO_IDLE)", "false", 1)
         assert permissive != program

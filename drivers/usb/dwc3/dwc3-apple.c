@@ -651,8 +651,28 @@ static int dwc3_apple_pre_host_resume(struct dwc3 *dwc)
 	return ret;
 }
 
+static void dwc3_apple_post_usb3_host_start(struct dwc3 *dwc)
+{
+	struct dwc3_apple *appledwc = to_dwc3_apple(dwc);
+
+	if (!appledwc->usb3_phy)
+		return;
+
+	/*
+	 * These PHYs do not bring a SuperSpeed link back from U3 once
+	 * the core has suspended them: keep them out of P3 from here on,
+	 * once xHCI's shared HCD has finished routing the USB3 PIPE.
+	 */
+	if (of_device_is_compatible(appledwc->dev->of_node, "apple,t8132-dwc3") ||
+	    of_device_is_compatible(appledwc->dev->of_node, "apple,t8142-dwc3")) {
+		dwc->dis_u3_susphy_quirk = true;
+		dwc3_enable_susphy(dwc, true);
+	}
+}
+
 static const struct dwc3_glue_ops dwc3_apple_glue_ops = {
 	.pre_host_resume = dwc3_apple_pre_host_resume,
+	.post_usb3_host_start = dwc3_apple_post_usb3_host_start,
 };
 
 static bool dwc3_apple_host_before_core_init(struct dwc3_apple *appledwc,
@@ -945,30 +965,50 @@ static void dwc3_apple_usb3_pipe_reset(struct dwc3_apple *appledwc)
 	msleep(100);
 }
 
-/* Select the role in the core and route the USB3 PHY, before xhci or the gadget is started */
+/*
+ * Select the role in the core and route the USB3 PHY when it is not left to
+ * xHCI's shared SuperSpeed root hub.
+ */
 static int dwc3_apple_set_role(struct dwc3_apple *appledwc, enum dwc3_apple_state state)
 {
 	bool host = state == DWC3_APPLE_HOST;
+	bool pipe_reset = host && appledwc->usb3_phy &&
+			  of_device_is_compatible(appledwc->dev->of_node, "apple,t6040-dwc3");
+	enum phy_mode mode;
 	int ret;
 
 	lockdep_assert_held(&appledwc->lock);
 
+	ret = dwc3_apple_usb3_mode_before_start(state, pipe_reset, &mode);
+	if (ret)
+		return ret;
+
 	appledwc->dwc.dr_mode = host ? USB_DR_MODE_HOST : USB_DR_MODE_PERIPHERAL;
 	dwc3_apple_set_ptrcap(appledwc, host ? DWC3_GCTL_PRTCAP_HOST : DWC3_GCTL_PRTCAP_DEVICE);
-	/*
-	 * This platform requires SUSPHY to be enabled here already in order to properly
-	 * configure the PHY and switch dwc3's PIPE interface to USB3 PHY. The USB2 PHY's
-	 * device mode and the T8132 host role were selected in dwc3_apple_core_start();
-	 * other host roles are selected by the xHCI root hub as it starts.
-	 */
 	appledwc->dwc.dis_u3_susphy_quirk = appledwc->dt_dis_u3_susphy;
+	if (mode == PHY_MODE_INVALID) {
+		/*
+		 * Keep SUSPHY clear through xHCI's HCRST on the dummy PIPE;
+		 * dwc3_xhci_plat_start() enables SUSPHY after HCRST completes,
+		 * before the shared HCD routes the USB3 PHY.
+		 */
+		dwc3_enable_susphy(&appledwc->dwc, false);
+		return 0;
+	}
+
+	/*
+	 * Device mode and T6040 (which pulses PHYSOFTRST before xHCI starts)
+	 * need SUSPHY enabled here so the PHY can lock and switch the PIPE
+	 * handler before starting the gadget or host.
+	 */
 	dwc3_enable_susphy(&appledwc->dwc, true);
-	ret = phy_set_mode(appledwc->usb3_phy, host ? PHY_MODE_USB_HOST : PHY_MODE_USB_DEVICE);
+	ret = phy_set_mode(appledwc->usb3_phy, mode);
 	if (ret) {
 		/*
-		 * A failed T8132 BIST or PIPE handoff must not start xHCI. Neither must a failed
-		 * T6050 one: that PHY reports a port left on USB2 (four DisplayPort lanes) as
-		 * success, and its errors leave the PIPE without a known producer.
+		 * A failed T8132 BIST or PIPE handoff must not start gadget mode.
+		 * Neither must a failed T6050 one: that PHY reports a port left on
+		 * USB2 (four DisplayPort lanes) as success, and its errors leave
+		 * the PIPE without a known producer.
 		 */
 		if (of_device_is_compatible(appledwc->dev->of_node, "apple,t8132-dwc3") ||
 		    of_device_is_compatible(appledwc->dev->of_node, "apple,t6050-dwc3")) {
@@ -976,17 +1016,7 @@ static int dwc3_apple_set_role(struct dwc3_apple *appledwc, enum dwc3_apple_stat
 			return ret;
 		}
 		dev_warn(appledwc->dev, "USB3 PHY setup failed, USB2 only, err=%d\n", ret);
-	} else if (host && appledwc->usb3_phy &&
-		   (of_device_is_compatible(appledwc->dev->of_node, "apple,t8132-dwc3") ||
-		    of_device_is_compatible(appledwc->dev->of_node, "apple,t8142-dwc3"))) {
-		/*
-		 * These PHYs do not bring a SuperSpeed link back from U3 once
-		 * the core has suspended them: keep them out of P3 from here on.
-		 */
-		appledwc->dwc.dis_u3_susphy_quirk = true;
-		dwc3_enable_susphy(&appledwc->dwc, true);
-	} else if (appledwc->usb3_phy &&
-		   of_device_is_compatible(appledwc->dev->of_node, "apple,t6040-dwc3")) {
+	} else if (pipe_reset) {
 		dwc3_apple_usb3_pipe_reset(appledwc);
 	}
 	return 0;

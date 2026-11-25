@@ -67,14 +67,14 @@ static void dwc3_power_off_all_roothub_ports(struct dwc3 *dwc)
 
 static void dwc3_xhci_plat_start(struct usb_hcd *hcd)
 {
-	struct platform_device *pdev;
-	struct dwc3 *dwc;
+	struct platform_device *pdev = to_platform_device(hcd->self.controller);
+	struct dwc3 *dwc = dev_get_drvdata(pdev->dev.parent);
 
-	if (!usb_hcd_is_primary_hcd(hcd))
+	if (!usb_hcd_is_primary_hcd(hcd)) {
+		if (dwc->glue_ops && dwc->glue_ops->post_usb3_host_start)
+			dwc->glue_ops->post_usb3_host_start(dwc);
 		return;
-
-	pdev = to_platform_device(hcd->self.controller);
-	dwc = dev_get_drvdata(pdev->dev.parent);
+	}
 
 	dwc3_enable_susphy(dwc, true);
 }
