@@ -107,7 +107,7 @@ struct apple_atcphy {
     bool t8132_ss, t8132_common_owned, t8132_suspended, t8132_failed, host_active;
     bool ss_tunables, mode_dirty, pipe_pending, swap_lanes;
     bool cio_tunables, t8132_dp_alt, fixed_usb2, hibernated, pd_was_off, idle_rpm;
-    bool t8103_dummy_pending, t8103_usb3_workaround, fixed_usb3;
+    bool t8103_dummy_pending, t8103_usb3_workaround, fixed_usb3, cio_only;
     unsigned tunnel_users;
     struct { bool prepared, changed, restored; } cio_sleep;
     int mode, pipe_state, lock;

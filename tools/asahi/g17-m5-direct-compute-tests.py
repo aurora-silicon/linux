@@ -14,7 +14,7 @@ from `drivers/gpu/drm/asahi/g17/initdata/outer_credit.rs` on the host and tests:
 4. Structural verification of `runtime_event_turn()` in `runtime/events.rs`:
    completions signal (`batch.finish()`) before report drains, recovery drains
    reports before `service_runtime_recovery()` regardless of `HOUSEKEEPING_NS`,
-   and steady-state passes throttle report drains without double-draining on recovery.
+   and only M5 steady-state passes throttle report drains.
 """
 import argparse
 import os
@@ -55,25 +55,25 @@ def build_harness(mutation=None):
     outer_src = (G17 / 'initdata/outer_credit.rs').read_text()
     events_src = (G17 / 'runtime/events.rs').read_text()
 
-    turn = item(events_src, 'fn runtime_event_turn(')
+    turn = re.sub(r'//[^\n]*', '', item(events_src, 'fn runtime_event_turn('))
+    turn = ' '.join(turn.split())
     if mutation == 'no-pre-recovery-drain':
         turn = turn.replace(
-            'firmware.drain_post_signal_reports();\n                reports_drained = true;\n'
-            '                firmware.service_runtime_recovery(batch)?;',
-            'firmware.service_runtime_recovery(batch)?;',
+            'let reports_drained = recover || !firmware.init.is_m5();',
+            'let reports_drained = !firmware.init.is_m5();',
             1,
         )
 
     # Verify report-drain ordering contract in production runtime_event_turn().
     ordering_ok = ordered_ok(
         turn,
-        'if let Some(batch) = deferred.as_mut() {\n            batch.finish();\n        }',
-        'let mut reports_drained = false;',
-        'firmware.drain_post_signal_reports();\n                reports_drained = true;',
+        'if let Some(batch) = deferred.as_mut() { batch.finish(); }',
+        'let reports_drained = recover || !firmware.init.is_m5();',
+        'if reports_drained { firmware.drain_reports(); }',
         'firmware.service_runtime_recovery(batch)?;',
         'if housekeeping {',
-        'if !reports_drained {',
-    )
+        'if !reports_drained { firmware.drain_reports(); }',
+    ) and turn.count('firmware.drain_reports();') == 2
 
     # Strip kernel imports, inner doc comments, and kunit module from outer_credit.rs for host compilation.
     kunit_idx = outer_src.index('#[kernel::macros::kunit_tests(')
