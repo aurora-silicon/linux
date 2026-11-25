@@ -86,12 +86,15 @@ static const struct mfd_cell apple_smc_described_devs[] = {
 
 /*
  * T6050's reboot/power-off and RTC, for a kernel that owns the machine (J775D, booted bare
- * metal). Registered only where the device tree describes them, so a T6050 device tree without
- * them registers what it did before.
+ * metal), and the gP GPIO bank, which carries the J716s's N1 power line (gP13, the pwren-gpios
+ * of its Wi-Fi/Bluetooth port). Registered only where the device tree describes them, so a T6050
+ * device tree without them registers what it did before. The gP bank has a cell name of its own:
+ * "macsmc-gpio" is the PCIO bank's, and the driver binds both by compatible.
  */
 static const struct mfd_cell apple_smc_t6050_described_devs[] = {
 	MFD_CELL_OF("macsmc-reboot", NULL, NULL, 0, 0, "apple,smc-reboot"),
 	MFD_CELL_OF("macsmc-rtc", NULL, NULL, 0, 0, "apple,smc-rtc"),
+	MFD_CELL_OF("macsmc-gp-gpio", NULL, NULL, 0, 0, "apple,smc-gpio"),
 };
 
 static int apple_smc_add_described_devices(struct apple_smc *smc, const struct mfd_cell *cells,
@@ -686,6 +689,20 @@ static void apple_smc_probe_wktp(struct apple_smc *smc)
 	apple_smc_write_full_wake(smc);
 }
 
+/* pmVC as the boot left it, next to what apple,sleep-pmvc has the sleep commit write. */
+static void apple_smc_sleep_pmvc_report(struct apple_smc *smc)
+{
+	u32 cur;
+	int ret = apple_smc_read_u32(smc, SMC_KEY(pmVC), &cur);
+
+	if (ret)
+		dev_dbg(smc->dev, "pmVC unreadable (%d); the sleep commit writes %#x\n", ret,
+			smc->sleep_pmvc);
+	else
+		dev_dbg(smc->dev, "pmVC %#x at boot; the sleep commit writes %#x\n", cur,
+			smc->sleep_pmvc);
+}
+
 static int apple_smc_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -703,6 +720,9 @@ static int apple_smc_probe(struct platform_device *pdev)
 	if (!smc->wake_reasons)
 		smc->wake_reasons = of_device_is_compatible(dev->of_node, "apple,t8132-smc") ?
 				    apple_smc_t8132_wake_reasons : apple_smc_t8140_wake_reasons;
+	smc->sleep_wake_type = of_property_read_bool(dev->of_node, "apple,sleep-wake-type");
+	smc->sleep_pmvc_set = !of_property_read_u32(dev->of_node, "apple,sleep-pmvc",
+						    &smc->sleep_pmvc);
 
 	mutex_init(&smc->mutex);
 	spin_lock_init(&smc->lock);
@@ -769,6 +789,9 @@ static int apple_smc_probe(struct platform_device *pdev)
 	if (ret < 0)
 		return dev_err_probe(smc->dev, ret, "Failed to get key count");
 	smc->key_count = be32_to_cpu(count);
+
+	if (smc->sleep_pmvc_set)
+		apple_smc_sleep_pmvc_report(smc);
 
 	/* T8152: key reads and writes are qualified; notifications and GPIO are not. */
 	if (of_device_is_compatible(dev->of_node, "apple,t8152-smc"))
@@ -932,10 +955,56 @@ static int apple_smc_notice_idle(struct apple_smc *smc)
 	return ret;
 }
 
+/*
+ * WKTP, one byte: 2 at the sleep commit, 0 again once a wake is a full one. With the
+ * key left at 2 the SMC treats all the time awake as a power nap: it keeps its own fan
+ * policy against a fan request (the write times out and the fans stay at its idle
+ * speed), and under thermal load it requests a sleep once a second. #1910 does the same
+ * on the M4 Pro.
+ */
+#define SMC_WKTP_SLEEP		2
+#define SMC_WKTP_AWAKE		0
+
+/* WKTP back to 0 after a full wake, or after a sleep that ended in a refusal. */
+static void apple_smc_wake_full(struct apple_smc *smc)
+{
+	int ret;
+
+	if (!smc->wake_silent)
+		return;
+	smc->wake_silent = false;
+	ret = apple_smc_write_u8(smc, SMC_KEY(WKTP), SMC_WKTP_AWAKE);
+	if (ret)
+		dev_err(smc->dev, "Failed to write WKTP = %u: %d\n", SMC_WKTP_AWAKE, ret);
+}
+
 static int apple_smc_sleep_commit(struct apple_smc *smc)
 {
 	int ret;
 
+	/*
+	 * apple,sleep-wake-type and apple,sleep-pmvc (T6041): macOS writes WKTP = 2, going to
+	 * sleep, and pmVC, the VDD_CIO rail mask (bit 8 set, bit n keeping port n's CIO rail
+	 * powered across sleep so rails the sleep engine polls active remain up), before its
+	 * sleep notice. Either failing refuses the sleep before slpa; .complete then tells the
+	 * SMC the sleep is off and writes WKTP back.
+	 */
+	if (smc->sleep_wake_type) {
+		/* Whatever came of the write, the SMC may run silent until it is told. */
+		smc->wake_silent = true;
+		ret = apple_smc_write_u8(smc, SMC_KEY(WKTP), SMC_WKTP_SLEEP);
+		if (ret) {
+			dev_err(smc->dev, "Failed to write WKTP = %u: %d\n", SMC_WKTP_SLEEP, ret);
+			return ret;
+		}
+	}
+	if (smc->sleep_pmvc_set) {
+		ret = apple_smc_write_u32(smc, SMC_KEY(pmVC), smc->sleep_pmvc);
+		if (ret) {
+			dev_err(smc->dev, "Failed to write pmVC = %#x: %d\n", smc->sleep_pmvc, ret);
+			return ret;
+		}
+	}
 	apple_smc_write_mbse(smc, SMC_KEY(slpa));
 	/* Device interrupts are off here. */
 	mdelay(SMC_SLEEP_ARM_MS);
@@ -1188,6 +1257,9 @@ static void apple_smc_sleep_wake(struct apple_smc *smc, bool woken)
 	}
 	if (apple_smc_port_reasons_only(smc, smc->wake_record))
 		apple_sleep_debug_link_cut_wake();
+	/* A dark wake sleeps again, and its commit writes the key anyway. */
+	if (!pm_dark_wake())
+		apple_smc_wake_full(smc);
 	/* A dark wake isn't one: with wakeup_count in use, it would abort the sleep after it. */
 	if (smc->wake_record && !pm_dark_wake())
 		pm_wakeup_event(smc->dev, 0);
@@ -1780,9 +1852,12 @@ static void apple_smc_complete(struct device *dev)
 		smc->sleep_warned = false;
 	}
 	smc->sleep_policy = NULL;
-
-	if (smc->has_wktp && !pm_dark_wake())
+	if (smc->has_wktp && !pm_dark_wake()) {
+		smc->wake_silent = false;
 		apple_smc_write_full_wake(smc);
+	}
+	/* A commit the SMC refused, or dark wakes that ended in a refusal. */
+	apple_smc_wake_full(smc);
 }
 
 /*
@@ -1836,6 +1911,9 @@ static int apple_smc_suspend_noirq(struct device *dev)
 	struct apple_smc *smc = dev_get_drvdata(dev);
 	int ret;
 
+	if (!pm_suspend_via_firmware())
+		return 0;
+
 	/* For the time asleep a dark wake logs: boot time counts the sleep, monotonic doesn't. */
 	smc->sleep_entry_boot = ktime_get_boottime();
 	smc->sleep_entry_mono = ktime_get();
@@ -1854,7 +1932,12 @@ static int apple_smc_suspend_noirq(struct device *dev)
 static int apple_smc_resume_noirq(struct device *dev)
 {
 	struct apple_smc *smc = dev_get_drvdata(dev);
-	bool woken = smc->woken_done;
+	bool woken;
+
+	if (!pm_suspend_via_firmware())
+		return 0;
+
+	woken = smc->woken_done;
 
 	/* This wake's own: never left for another attempt's resume */
 	smc->woken_done = false;

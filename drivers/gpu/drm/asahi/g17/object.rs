@@ -700,15 +700,18 @@ impl Pool {
         )
     }
 
-    /// Allocates or reuses a matching object. Capacity pressure leaves a fresh
-    /// mapping uncached, preserving allocation and submission concurrency.
+    /// Allocates or reuses a matching object. A non-zero `prefix` maps `[0..prefix)`
+    /// firmware-cached; `prefix == 0` keeps the whole mapping uncached (for objects
+    /// that both firmware and host write) while still retaining and fencing the VA
+    /// in the pool. Capacity pressure leaves a fresh mapping unpooled and uncached,
+    /// preserving allocation and submission concurrency.
     ///
     /// The firmware may still follow a previous owner's pointers into a returned object
     /// until it has processed that owner's release. Reuse takes the matching object
     /// returned longest ago once its fence is met (see `return_object`); a younger one is
-    /// reused only when the family has no room for a fresh cached object, because an
-    /// uncached one is unmapped as soon as its owner drops it. On the A18 Pro a work state is
-    /// never reused before its fence: with no room, a fresh one stays uncached instead.
+    /// reused only when the family has no room for a fresh pooled object, because an
+    /// unpooled one is unmapped as soon as its owner drops it. On the A18 Pro a work state is
+    /// never reused before its fence: with no room, a fresh one stays unpooled instead.
     pub(crate) fn allocate(
         self: &kernel::sync::Arc<Self>,
         alloc: &Allocator<'_>,
@@ -806,6 +809,9 @@ impl Pool {
             keep: None,
         };
         if !reserved {
+            return Ok(result);
+        }
+        if prefix == 0 {
             return Ok(result);
         }
         let (proof, mutated) = match result.mapping.as_ref() {

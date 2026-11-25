@@ -10,11 +10,15 @@ use kernel::{bindings, device, prelude::*};
 
 use super::channel::Ring;
 use super::fw::channels::{RING_SLOTS, STATE_READ, STATE_WRITE};
-use super::hw::rings;
+use super::fw::work::compute;
+use super::hw::{rings, sizes};
 use super::regs::{mb, rmb, wmb};
 
 pub(crate) const RECORD_WORDS: usize = 18;
-pub(crate) const STAGE_EVENTS: [u32; 4] = [0x70, 0x71, 15, 16];
+pub(crate) const STAGE_COUNT: usize = 2 + sizes::COMPUTE_PIPES;
+const COMPUTE_EVENT_MASK: u32 = ((1u32 << sizes::COMPUTE_PIPES) - 1) << compute::EVENT;
+const _: () = assert!(compute::EVENTS.len() == sizes::COMPUTE_PIPES);
+const _: () = assert!(compute::EVENT as usize + sizes::COMPUTE_PIPES <= 32);
 /// Retained only for the allocator's pending-growth container. M4 does not
 /// interpret a G15 type-7 record as an allocator request.
 pub(crate) const GROW_QUEUE: usize = 8;
@@ -45,7 +49,7 @@ pub(crate) struct Events {
     /// First notification of the pending recovery, for its absolute deadline.
     pub(crate) recovery_started_ns: Option<u64>,
     pub(crate) channel_errors: u32,
-    pub(crate) event_ns: [u64; 4],
+    pub(crate) event_ns: [u64; STAGE_COUNT],
     pub(crate) grow: KVec<[u32; 14]>,
     #[allow(dead_code)]
     pub(crate) grow_lost: u32,
@@ -63,7 +67,7 @@ impl Events {
             last_statistics: None,
             recovery_started_ns: None,
             channel_errors: 0,
-            event_ns: [0; 4],
+            event_ns: [0; STAGE_COUNT],
             grow: KVec::new(),
             grow_lost: 0,
         }
@@ -124,8 +128,8 @@ impl Events {
             };
             match kind {
                 1 => {
-                    // Type 1 carries 128 completion bits across words 1..=4; STAGE_EVENTS
-                    // ([0x70, 0x71, 15, 16]) inspects word 1 (compute 15/16) and word 4 (TA/FS).
+                    // Type 1 carries 128 completion bits across words 1..=4; compute pipe events
+                    // (15..15+COMPUTE_PIPES) live in word 1 and TA/FS (0x70/0x71) live in word 4.
                     let (w1, w4) = match ring.ring.r32(base + 4).and_then(|w1| {
                         Ok((w1, ring.ring.r32(base + 16)?))
                     }) {
@@ -137,22 +141,23 @@ impl Events {
                             return Err(err);
                         }
                     };
-                    for (stage, event) in STAGE_EVENTS.iter().enumerate() {
-                        let bits = match 1 + *event as usize / 32 {
-                            1 => w1,
-                            4 => w4,
-                            _ => continue,
-                        };
-                        if bits & (1u32 << (*event % 32)) == 0 {
-                            continue;
-                        }
-                        self.event_ns[stage] = now;
+                    if w4 & (1u32 << (0x70 % 32)) != 0 {
+                        self.event_ns[0] = now;
                         self.stage_events = self.stage_events.wrapping_add(1);
-                        if stage == 1 {
-                            self.fs_events = self.fs_events.wrapping_add(1);
-                        } else if stage >= 2 {
-                            self.compute_events = self.compute_events.wrapping_add(1);
-                        }
+                    }
+                    if w4 & (1u32 << (0x71 % 32)) != 0 {
+                        self.event_ns[1] = now;
+                        self.stage_events = self.stage_events.wrapping_add(1);
+                        self.fs_events = self.fs_events.wrapping_add(1);
+                    }
+                    let mut cbits = w1 & COMPUTE_EVENT_MASK;
+                    while cbits != 0 {
+                        let bit = cbits.trailing_zeros();
+                        cbits &= cbits - 1;
+                        let pipe = (bit - compute::EVENT) as usize;
+                        self.event_ns[2 + pipe] = now;
+                        self.stage_events = self.stage_events.wrapping_add(1);
+                        self.compute_events = self.compute_events.wrapping_add(1);
                     }
                 }
                 4 => {

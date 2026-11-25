@@ -387,7 +387,14 @@ impl platform::Driver for AsahiPlatformDriver {
             }
             ProbeConfig::G17M5 => return AsahiPlatformDriver::probe_g17_m5(pdev),
             #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
-            ProbeConfig::M3(crate::m3::Chip::T8122) => return AsahiPlatformDriver::probe_t8122(pdev),
+            ProbeConfig::M3(crate::m3::Chip::T8122) => {
+                // The shared G16 backend owns the handoffs its T8122 row describes (27.2).
+                #[cfg(CONFIG_DRM_ASAHI_G16)]
+                if crate::g16::claims(pdev.as_ref(), &crate::g16::hw::t8122::CONFIG) {
+                    return Err(ENODEV);
+                }
+                return AsahiPlatformDriver::probe_t8122(pdev);
+            }
             ProbeConfig::M3(chip) => return Err(crate::m3::refuse_probe(pdev, *chip)),
             #[cfg(CONFIG_DRM_ASAHI_M5)]
             ProbeConfig::M5 => return AsahiPlatformDriver::probe_m5(pdev),

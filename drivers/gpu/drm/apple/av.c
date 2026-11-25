@@ -1081,6 +1081,19 @@ static const struct apple_epic_service_ops avep_ops[] = {
 	{}
 };
 
+void av_audio_sink_changed(struct apple_dcp *dcp)
+{
+	struct audiosrv_data *asrv = dcp->audiosrv;
+
+	/* A CEC-only endpoint has no audio owner (av_service_connect()). */
+	if (!asrv)
+		return;
+	scoped_guard(mutex, &asrv->plug_lock) {
+		if (asrv->audio_dev)
+			dcpaud_refresh_eld(asrv->audio_dev);
+	}
+}
+
 /* Whether @service is the published instance; plug_lock held, then srv_rwsem */
 static bool av_audiosrv_published(struct audiosrv_data *asrv,
 				  struct apple_epic_service *service)

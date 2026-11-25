@@ -322,6 +322,7 @@
 			/* ADT /amfm reg_on gP13 */
 			pwren-gpios = <&smc_gpio 0x13 GPIO_ACTIVE_HIGH>;
 			reset-gpios = <&pinctrl 4 GPIO_ACTIVE_LOW>;
+			supports-clkreq;
 			device_type = "pci";
 
 			bluetooth0: bluetooth@0,1 {

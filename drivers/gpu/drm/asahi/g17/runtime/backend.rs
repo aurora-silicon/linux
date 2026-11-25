@@ -134,7 +134,7 @@ impl Backend {
 
 impl job::Backend for Backend {
     fn creator_cluster_scheduling(&self) -> bool {
-        true
+        self.shared.pin_scheduler_cluster()
     }
     fn host_producer_waits(&self) -> bool {
         self.shared.m5_board.is_some_and(|board| !board.g17d_forms() && !board.completion_inputs())

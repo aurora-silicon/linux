@@ -855,6 +855,11 @@ impl Drop for Firmware {
 }
 
 impl Firmware {
+    /// The firmware's fixed timestamp window, on the older firmware graph; `None` on M5's graph.
+    fn timestamp_window(&self) -> Option<Range<u64>> {
+        (!self.uat.is_m5()).then_some(hw::t8140::dynamic::TIMESTAMP_WINDOW)
+    }
+
     /// The firmware instances this GPU runs.
     fn roles(&self) -> &'static [Role] {
         if self.secondary.is_some() {
@@ -1195,6 +1200,39 @@ const RECLAIM_WORK: u64 = 4;
 const FEED_WORK: u64 = 5;
 const GOVERNOR_WORK: u64 = 6;
 
+/// `CondVar` wrapper that tracks active waiters so `notify_all()` skips the waitqueue lock
+/// in the common zero-waiter steady state.
+#[pin_data]
+struct TrackedCondVar {
+    #[pin]
+    condvar: CondVar,
+    waiters: AtomicU32,
+}
+
+impl TrackedCondVar {
+    fn wait_timeout<T: ?Sized>(
+        &self,
+        guard: &mut kernel::sync::MutexGuard<'_, T>,
+        timeout: kernel::time::Jiffies,
+    ) -> kernel::sync::CondVarTimeoutResult {
+        struct Waiter<'a>(&'a AtomicU32);
+        impl Drop for Waiter<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::Release);
+            }
+        }
+        self.waiters.fetch_add(1, Ordering::SeqCst);
+        let _waiter = Waiter(&self.waiters);
+        self.condvar.wait_timeout(guard, timeout)
+    }
+
+    fn notify_all(&self) {
+        if self.waiters.load(Ordering::SeqCst) != 0 {
+            self.condvar.notify_all();
+        }
+    }
+}
+
 /// Device state shared with the coprocessor callbacks and the event worker.
 #[pin_data]
 struct Shared {
@@ -1286,6 +1324,13 @@ struct Shared {
     /// wherever the completion IRQ thread first ran (see `queue_event_records`). On M5 it is
     /// unbound, so a worker of that CPU's affinity pod (its L2) runs it; elsewhere it is per-CPU.
     events: Arc<workqueue::OwnedQueue>,
+    /// Preallocated completion collector owned exclusively by `run_runtime_events`.
+    #[pin]
+    worker_deferred: Mutex<Option<runtime::DeferredBatch>>,
+    /// Restrict each scheduler's ordered submit queue to the creating CPU's cluster, beside the
+    /// event work. Single-die M5 parts leave schedulers unrestricted so queues created on one
+    /// thread do not contend on a single cluster under multi-queue load.
+    pin_scheduler_cluster: bool,
     /// The CPU of the last publication, `u32::MAX` before the first.
     submitter: AtomicU32,
     #[pin]
@@ -1307,7 +1352,7 @@ struct Shared {
     #[pin]
     actuators: Mutex<thermal::Actuators>,
     #[pin]
-    changed: CondVar,
+    changed: TrackedCondVar,
     /// The port of the session in `state`; null before boot and once detachment begins.
     port: core::sync::atomic::AtomicPtr<port::Port>,
 }
@@ -1640,6 +1685,12 @@ impl Shared {
         self.events.clone()
     }
 
+    /// Whether each scheduler's submit queue should be restricted to the creating CPU's cluster
+    /// (all but single-die M5).
+    pub(super) fn pin_scheduler_cluster(&self) -> bool {
+        self.pin_scheduler_cluster
+    }
+
     /// Records the publishing CPU for the event work's placement.
     fn note_submitter(&self) {
         let cpu = kernel::cpu::CpuId::current().as_u32();
@@ -1949,6 +2000,7 @@ impl Gpu {
         let max_pstate = frequencies
             .as_ref()
             .map_or(0, stats::StateFrequencies::max_pstate);
+        let worker_deferred = runtime::DeferredBatch::worker()?;
         let shared = Arc::pin_init(
             pin_init!(Shared {
                 drm <- new_mutex!(Some(dev.into()), "g17::Shared::drm"),
@@ -1992,6 +2044,11 @@ impl Gpu {
                 governor_armed: AtomicBool::new(false),
                 governor_activity_ns: AtomicU64::new(0),
                 events,
+                worker_deferred <- new_mutex!(
+                    Some(worker_deferred),
+                    "g17::Shared::worker_deferred"
+                ),
+                pin_scheduler_cluster: !m5 || id.num_dies > 1,
                 submitter: AtomicU32::new(u32::MAX),
                 grow <- new_work!("g17::Shared::grow"),
                 reclaim_work <- new_work!("g17::Shared::reclaim_work"),
@@ -1999,7 +2056,10 @@ impl Gpu {
                 stop <- new_mutex!((), "g17::Shared::stop"),
                 state <- new_mutex!(None, "g17::Shared::state"),
                 actuators <- new_mutex!(thermal::Actuators::new(), "g17::Shared::actuators"),
-                changed <- new_condvar!("g17::Shared::changed"),
+                changed <- pin_init!(TrackedCondVar {
+                    condvar <- new_condvar!("g17::Shared::changed"),
+                    waiters: AtomicU32::new(0),
+                }),
                 port: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
             }),
             GFP_KERNEL,
@@ -2952,48 +3012,50 @@ impl gpu::Gpu for Gpu {
         Ok(KBox::new(frontend, GFP_KERNEL)?)
     }
 
+    fn timestamp_window_size(&self) -> u64 {
+        let state = self.shared.state.lock();
+        (*state)
+            .as_ref()
+            .and_then(|firmware| firmware.timestamp_window())
+            .map_or(0, |window| window.end - window.start)
+    }
+
     fn map_timestamp_buffer(
         &self,
         mut bo: gem::ObjectRef,
         range: Range<usize>,
+        window: crate::timestamp::WindowPermit,
     ) -> Result<crate::timestamp::Buffer> {
-        let (mapping, window) = {
+        let windowed = {
             let state = self.shared.state.lock();
             let firmware = (*state).as_ref().ok_or(ENODEV)?;
-            // The timestamp window is part of the older firmware graph, not M5's graph.
-            let windowed = if firmware.uat.is_m5() {
-                None
-            } else {
-                bo.map_range_into_range(
-                    firmware.uat.kernel_vm(),
-                    range.clone(),
-                    hw::t8140::dynamic::TIMESTAMP_WINDOW,
-                    mmu::UAT_PGSZ as u64,
-                    mmu::PROT_FW_SHARED_RW,
-                    false,
-                )
-                .ok()
-            };
-            match windowed {
-                Some(mapping) => (mapping, true),
-                // A full window: this buffer's stamps are all host-written.
-                None => (
+            // A file whose share of the window is used up gets a host-written buffer, as when
+            // the window is full.
+            if window.is_allowed() {
+                firmware.timestamp_window().and_then(|window| {
                     bo.map_range_into_range(
                         firmware.uat.kernel_vm(),
-                        range,
-                        firmware.uat.kernel_dynamic_range(),
+                        range.clone(),
+                        window,
                         mmu::UAT_PGSZ as u64,
                         mmu::PROT_FW_SHARED_RW,
                         false,
-                    )?,
-                    false,
-                ),
+                    )
+                    .ok()
+                })
+            } else {
+                None
             }
         };
         // The buffer's CPU mapping takes the reservation lock: not under the device mutex.
-        match window {
-            true => crate::timestamp::Buffer::firmware_window(mapping),
-            false => crate::timestamp::Buffer::firmware(mapping),
+        match windowed {
+            Some(mapping) => {
+                crate::timestamp::Buffer::firmware_window(mapping, window.into_share())
+            }
+            // Outside the window the host writes every stamp, and the firmware never sees the
+            // buffer: give it no firmware alias, which would take kernel address space shared
+            // with every firmware object (queues, rings, pools) for as long as it is bound.
+            None => crate::timestamp::Buffer::host(&bo, range),
         }
     }
 }

@@ -96,6 +96,17 @@ int apple_sleep_coproc_register(struct device *dev, void __iomem *asc, bool pcie
 				int (*last_stop)(void *data), void *data);
 
 /*
+ * For a SoC sleep driver of its own (T6041): advertise commit-time stop
+ * support and run the refusal checks, enclave stop, and coprocessor stops
+ * with interrupts off.
+ */
+void apple_sleep_set_commit_stops_coprocs(bool enable);
+int apple_sleep_coprocs_check_all(void);
+int apple_sleep_enclave_stop_all(void);
+int apple_sleep_coprocs_stop_all(void);
+bool apple_sleep_coprocs_ans_stopped(void);
+
+/*
  * The same with no ASC to clear: @last_stop clears its own run bits and lowers its own power
  * domain, and runs before every other coprocessor's. The refusal checks leave that domain on.
  */
@@ -138,6 +149,9 @@ bool apple_sleep_coproc_stopped(struct device *dev);
  * registered refuses the sleep: stopped any earlier, a later refusal would strand it.
  */
 bool apple_sleep_commit_stops_coprocs(void);
+
+/* This firmware sleep stops before its commit: a driver must stop nothing it can't restart. */
+bool apple_sleep_dry_run(void);
 
 /*
  * Untested SoCs: a coprocessor's last stop notes its own step in PMU scratch (kept across a
@@ -362,7 +376,36 @@ static inline bool apple_sleep_coproc_stopped(struct device *dev)
 
 static inline void apple_sleep_note_sub(u8 step) {}
 
+static inline void apple_sleep_set_commit_stops_coprocs(bool enable)
+{
+}
+
+static inline int apple_sleep_coprocs_check_all(void)
+{
+	return 0;
+}
+
+static inline int apple_sleep_enclave_stop_all(void)
+{
+	return 0;
+}
+
+static inline int apple_sleep_coprocs_stop_all(void)
+{
+	return 0;
+}
+
+static inline bool apple_sleep_coprocs_ans_stopped(void)
+{
+	return false;
+}
+
 static inline bool apple_sleep_commit_stops_coprocs(void)
+{
+	return false;
+}
+
+static inline bool apple_sleep_dry_run(void)
 {
 	return false;
 }

@@ -166,9 +166,9 @@ impl WorkStorage {
     }
 }
 
-/// A context's scheduler page. The M5 firmware caches its mapping, so on M5 it
-/// comes from the retention pool and stays mapped until firmware stop; elsewhere
-/// it is an ordinary allocation.
+/// A context's scheduler page. On M5 it comes from the retention pool so its
+/// VA stays mapped and fenced across releases (uncached, because both firmware
+/// and host write it on reuse); elsewhere it is an ordinary allocation.
 pub(crate) enum SchedulerStorage {
     Ordinary(KernelObject),
     Retained(PooledObject),
@@ -290,7 +290,7 @@ impl Context {
                 alloc,
                 Family::Scheduler,
                 UAT_PGSZ,
-                UAT_PGSZ,
+                0,
                 kernel_prot,
                 CpuMap::WriteCombined,
             )?)
@@ -309,11 +309,14 @@ impl Context {
         fence(Ordering::SeqCst);
         let scheduler_generation = super::ids::OBJECTS.object()?;
         let scheduler = Arc::new(scheduler, GFP_KERNEL)?;
+        // Both firmware and host write work nodes (reused every 63 submissions
+        // and zeroed on pool reuse). Keep the whole work-state object uncached
+        // while retaining its VA and return mark in the pool.
         let mut object = pool.allocate(
             alloc,
             Family::WorkState,
             2 * UAT_PGSZ,
-            UAT_PGSZ,
+            0,
             kernel_prot,
             CpuMap::WriteCombined,
         )?;

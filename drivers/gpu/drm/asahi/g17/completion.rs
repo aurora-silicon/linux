@@ -35,7 +35,7 @@ pub(crate) use publication::{Prepared as PreparedPublication, Publication};
 
 struct Destination {
     // The buffer keeps its GPU alias and its CPU mapping alive.
-    buffer: Arc<crate::timestamp::Buffer>,
+    buffer: Arc<crate::timestamp::Bound>,
     offset: usize,
     /// The destination's address in the firmware timestamp window, if its buffer is mapped there.
     window_va: Option<u64>,
@@ -128,9 +128,12 @@ const fn window_slot(index: usize) -> bool {
 /// one releases only a buffer reference; the buffer defers its own mapping release.
 pub(crate) struct Destinations {
     stamps: [Option<Destination>; 4],
-    /// A render: the firmware gets its fragment end destination through the window. A compute
-    /// command's only stamp pair stays kernel-private (recovery trusts it).
-    render: bool,
+    /// A render whose fragment end destination may be written directly by
+    /// firmware through the timestamp window. Cleared when ordered behind
+    /// pending host timestamp predecessors so firmware cannot race with their
+    /// deferred host writes or bypass an inherited error. A compute command's
+    /// only stamp pair stays kernel-private (recovery trusts it).
+    allow_window: bool,
     /// The firmware was handed window destinations ([`Self::window_vas`]).
     handed: AtomicBool,
 }
@@ -150,15 +153,19 @@ impl Destinations {
         }
         Ok(Self {
             stamps: destinations,
-            render: timestamps.len() == 2,
+            allow_window: timestamps.len() == 2,
             handed: AtomicBool::new(false),
         })
+    }
+
+    pub(crate) fn disable_window(&mut self) {
+        self.allow_window = false;
     }
 
     /// Window addresses for a render's vertex and fragment start/end destinations: the fragment
     /// end's if it is mapped in the window, 0 for the others.
     fn window_vas(&self) -> [u64; 4] {
-        if !self.render || WINDOW_MISSES.load(Ordering::Relaxed) >= WINDOW_GIVE_UP {
+        if !self.allow_window || WINDOW_MISSES.load(Ordering::Relaxed) >= WINDOW_GIVE_UP {
             return [0; 4];
         }
         let vas: [u64; 4] = core::array::from_fn(|i| {
@@ -179,9 +186,14 @@ impl Destinations {
     pub(super) fn empty() -> Self {
         Self {
             stamps: core::array::from_fn(|_| None),
-            render: false,
+            allow_window: false,
             handed: AtomicBool::new(false),
         }
+    }
+
+    #[cfg(CONFIG_KUNIT = "y")]
+    pub(super) fn allows_window(&self) -> bool {
+        self.allow_window
     }
 
     fn iter(&self) -> core::slice::Iter<'_, Option<Destination>> {
@@ -243,7 +255,7 @@ impl HostOutput {
     ) -> Result<Self> {
         if host_predecessors || has_outputs {
             Ok(Self(HostOutputKind::Ordered(Publication::new(
-                output, status,
+                output, status, has_outputs,
             )?)))
         } else {
             Ok(Self(HostOutputKind::Immediate(output)))
@@ -476,7 +488,7 @@ impl Completion {
         context: &Arc<Context>,
         member: Member,
         vm_job: mmu::VmJobGuard,
-        destinations: Destinations,
+        mut destinations: Destinations,
         compute: bool,
         host_predecessors: bool,
         feed: Option<Arc<super::feed::Feed>>,
@@ -485,6 +497,9 @@ impl Completion {
     ) -> Result<Arc<Self>> {
         let fence = fence::independent(contexts)?;
         let has_outputs = destinations.has_outputs();
+        if host_predecessors {
+            destinations.disable_window();
+        }
         let terminal = if host_predecessors {
             Some(fence::independent(contexts)?)
         } else {
@@ -1045,5 +1060,19 @@ mod window_tests {
         assert_eq!(ticks_to_ns(24_000_000), 1_000_000_000);
         assert_eq!(ticks_to_ns(24), 1_000);
         assert_eq!(ticks_to_ns(24_000_025), 1_000_001_041);
+    }
+
+    #[test]
+    fn disable_window_clears_allow_window_and_leaves_handed_false() {
+        let mut dest = Destinations {
+            stamps: core::array::from_fn(|_| None),
+            allow_window: true,
+            handed: AtomicBool::new(false),
+        };
+        assert!(dest.allows_window());
+        dest.disable_window();
+        assert!(!dest.allows_window());
+        assert_eq!(dest.window_vas(), [0; 4]);
+        assert!(!dest.handed.load(Ordering::Acquire));
     }
 }

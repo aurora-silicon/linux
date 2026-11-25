@@ -2573,6 +2573,7 @@ void DCP_FW_NAME(iomfb_poweron)(struct apple_dcp *dcp)
 	u32 handle;
 #endif
 	dev_info(dcp->dev, "dcp_poweron() starting\n");
+	WRITE_ONCE(dcp->pipe_off, false);
 #if DCP_FW_H17(DCP_FW_VER)
 	if (dcp_is_ext26(dcp))
 		return; /* Native26 publishes A473 only after a successful A413. */
@@ -2785,6 +2786,40 @@ int DCP_FW_NAME(iomfb_s2r_power)(struct apple_dcp *dcp, bool on, bool named_call
 }
 #endif
 
+#if DCP_FW_DESKTOP_26(DCP_FW_VER)
+DCP_THUNK_IN(dcp_unnamed_500, dcpep_unnamed_500, u32);
+
+static void dcp_s2r_500_done(struct apple_dcp *dcp, void *out, void *cookie)
+{
+	struct dcp_wait_cookie *wait = cookie;
+
+	complete(&wait->done);
+	kref_put(&wait->refcount, release_wait_cookie);
+}
+
+/* Sleep test: H17P's A500, same number and bytes as this firmware's neighbours. */
+int DCP_FW_NAME(iomfb_s2r_500)(struct apple_dcp *dcp)
+{
+	struct dcp_wait_cookie *cookie;
+	unsigned long left;
+	u32 val = 0xaaaa0000;
+
+	cookie = kzalloc_obj(*cookie);
+	if (!cookie)
+		return -ENOMEM;
+	init_completion(&cookie->done);
+	kref_init(&cookie->refcount);
+	kref_get(&cookie->refcount);
+
+	dcp_unnamed_500(dcp, false, &val, dcp_s2r_500_done, cookie);
+
+	left = wait_for_completion_timeout(&cookie->done, msecs_to_jiffies(1000));
+	kref_put(&cookie->refcount, release_wait_cookie);
+
+	return left ? 0 : -ETIMEDOUT;
+}
+#endif
+
 static bool dcp_power_stop_confirmed(struct dcp_wait_cookie *cookie)
 {
 	/* H17P does not confirm that scanout has stopped. */
@@ -2868,9 +2903,27 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 #endif
 
 #if DCP_FW_H17(DCP_FW_VER)
-	/* H17P has no known safe pipe-off or surface-free transition. */
-	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
-		return;
+	/*
+	 * H17P has no known safe pipe-off or surface-free transition for
+	 * its panel. An external pipe stops like the H17G one: otherwise
+	 * DPMS off leaves it scanning out the last frame.
+	 */
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
+		if (dcp_has_panel(dcp))
+			return;
+		/*
+		 * The firmware withdrew the mode (it is describing the display
+		 * again after a hotplug, see dcp_mode_withdraw()): no scanout of
+		 * ours is left to stop, and while it republishes the display it
+		 * answers neither the clear swap nor setPowerState(0). Both then
+		 * time out and leave the pipe unable to power on again.
+		 */
+		if (!READ_ONCE(dcp->mode_state.valid)) {
+			dev_dbg(dcp->dev, "%s: no valid mode, pipe left to the firmware\n",
+				__func__);
+			return;
+		}
+	}
 #endif
 
 #if DCP_FW_DESKTOP_26(DCP_FW_VER)
@@ -2891,7 +2944,8 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 	kref_get(&cookie->refcount);
 
 #if DCP_FW_H17(DCP_FW_VER)
-	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G)
+	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G ||
+	    !dcp_has_panel(dcp))
 		dcp_prepare_clear_swap(dcp, swap);
 #else
 #if DCP_FW_DESKTOP_26(DCP_FW_VER)
@@ -2970,10 +3024,12 @@ close_client:
 		dev_dbg(dcp->dev,
 			"setPowerState(0) finished with %d ms to spare",
 			jiffies_to_msecs(ret));
-		if (dcp_power_stop_confirmed(poff_cookie))
+		if (dcp_power_stop_confirmed(poff_cookie)) {
 			dcp_release_all_retained_framebuffers(dcp);
-		else
+			WRITE_ONCE(dcp->pipe_off, true);
+		} else {
 			dev_warn(dcp->dev, "scanout stop was not confirmed\n");
+		}
 	}
 
 	kref_put(&poff_cookie->refcount, release_wait_cookie);
@@ -3224,6 +3280,12 @@ dcpep_cb_hotplug_v26_6(struct apple_dcp *dcp, struct dcp_hotplug_req_v26_6 *req)
 	/* The firmware shuts an external pipe down with its display. */
 	if (!dcp->main_display && !connected)
 		dcp->desktop->ext_pipe_off = true;
+
+	/* Signal T6041 S2R resume before dcpep_cb_hotplug() skips main_display. */
+	if (connected) {
+		dev_dbg(dcp->dev, "D575 hotplug connected=1\n");
+		complete(&dcp->s2r_hpd_done);
+	}
 
 	dcpep_cb_hotplug(dcp, &connected);
 
