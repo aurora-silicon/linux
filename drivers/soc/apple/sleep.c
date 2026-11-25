@@ -5920,8 +5920,14 @@ static int apple_sleep_commit(unsigned long unused)
 		udelay(SLEEP_EARLY_WFI_SETTLE_US);
 
 	if (s->soc->ops->commit_regs) {
-		/* A SoC whose irreversible steps share nothing with the ones below. */
+		/*
+		 * A SoC whose irreversible steps share nothing with the ones below. It has no
+		 * wd2 here: +4 says how far a sleep that never came back got (1: the cores
+		 * stopped, 2: its registers done; its .pre_commit notes the last).
+		 */
+		sleep_note_at(s, 4, 1);
 		s->soc->ops->commit_regs(s);
+		sleep_note_at(s, 4, 2);
 	} else {
 		s->soc->ops->lower_io(s);
 		apple_sleep_arm_wd2(s);

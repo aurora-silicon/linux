@@ -419,6 +419,8 @@ static void t6030_sleep_pre_commit(struct apple_sleep *s)
 	t6030_sleep_clean(s);
 	while (__arch_counter_get_cntpct() < at)
 		cpu_relax();
+	/* The last PMU note before the commit word: past it, the engine has the sleep */
+	sleep_note_at(s, 4, 3);
 }
 
 /* The commit's record of @offset, which the rewake puts back, as it was before the entry */
