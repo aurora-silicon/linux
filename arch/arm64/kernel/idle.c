@@ -8,6 +8,7 @@
 #include <linux/irqflags.h>
 
 #include <asm/apple-idle.h>
+#include <asm/apple_m1_pmu.h>
 #include <asm/barrier.h>
 #include <asm/cpuidle.h>
 #include <asm/cpufeature.h>
@@ -53,8 +54,9 @@ static bool apple_wfi_loses_regs __ro_after_init;
 static bool apple_keep_idle_nop __initdata;
 
 /*
- * The boot loader appends idle=nop after the user's arguments, so it cannot
- * be overridden on the command line. This flag keeps it anyway.
+ * Older boot loaders append idle=nop after the user's arguments on these
+ * cores, so it cannot be overridden on the command line, and it is ignored
+ * below. This flag keeps it anyway, for comparisons.
  */
 static int __init setup_apple_keep_idle_nop(char *arg)
 {
@@ -65,22 +67,20 @@ early_param("apple_keep_idle_nop", setup_apple_keep_idle_nop);
 
 void __init apple_wfi_quirk_init(void)
 {
-	u32 model = read_cpuid_id() & MIDR_CPU_MODEL_MASK;
+	if (!midr_is_apple_m4_or_later(read_cpuid_id()))
+		return;
 
-	if (midr_is_apple_m4_or_later(read_cpuid_id())) {
-		apple_wfi_loses_regs = true;
-		pr_info("Apple: preserving registers across WFI\n");
-	}
+	apple_wfi_loses_regs = true;
+	pr_info("Apple: preserving registers across WFI\n");
+
 	/*
-	 * aura (J813) and m1n1 (T6050) pass idle=nop on M4 and later for
-	 * kernels without this quirk. Spinning idle keeps every core busy
-	 * (cpuidle's WFI states spin too): on T8142 the SoC sits near 90 C
-	 * and throttles, on T6050 the system draws about 10 W more at idle.
-	 * WFI is safe here.
+	 * aura and m1n1 used to pass idle=nop on M4 and later for kernels
+	 * without this path. Spinning idle keeps every core busy (cpuidle's
+	 * WFI states spin too): on T8142 the SoC sits near 90 C and
+	 * throttles, on T6050 the system draws about 10 W more at idle, on
+	 * T8140 the die idles at 85-92 C instead of 43 C. WFI is safe here.
 	 */
-	if (idle == ARM64_IDLE_NOP && !apple_keep_idle_nop &&
-	    (model == MIDR_APPLE_T8142_E || model == MIDR_APPLE_T8142_P ||
-	     model == MIDR_APPLE_T6050_064 || model == MIDR_APPLE_T6050_065)) {
+	if (idle == ARM64_IDLE_NOP && !apple_keep_idle_nop) {
 		idle = ARM64_IDLE_WFI;
 		pr_info("Apple: idling in WFI, ignoring idle=nop\n");
 	}
@@ -90,11 +90,41 @@ static __always_inline bool apple_wfi_needs_save(void)
 {
 	return unlikely(READ_ONCE(apple_wfi_loses_regs));
 }
+
+DEFINE_PER_CPU(bool, apple_pmu_wfi_freeze);
+EXPORT_PER_CPU_SYMBOL_GPL(apple_pmu_wfi_freeze);
+
+/*
+ * On M4 and later Apple cores some cycle counters keep counting in WFI
+ * (for example, M5 Max Sawtooth cores at about 1.5 GHz), which inflates
+ * CPU-wide perf counts with idle time. Freeze the counters and their
+ * interrupt across WFI whenever perf events are active on this CPU.
+ */
+static __always_inline void apple_wfi(void)
+{
+	/* Idle runs with preemption disabled: the raw accessor is enough. */
+	if (unlikely(__this_cpu_read(apple_pmu_wfi_freeze))) {
+		u64 pmcr0 = read_sysreg_s(SYS_IMP_APL_PMCR0_EL1);
+
+		write_sysreg_s(pmcr0 & ~(PMCR0_CNT_ENABLE_0_7 |
+					 PMCR0_CNT_ENABLE_8_9 |
+					 PMCR0_IMODE),
+			       SYS_IMP_APL_PMCR0_EL1);
+		isb();
+		apple_cpu_wfi();
+		write_sysreg_s(pmcr0, SYS_IMP_APL_PMCR0_EL1);
+		isb();
+	} else {
+		apple_cpu_wfi();
+	}
+}
 #else
 static __always_inline bool apple_wfi_needs_save(void)
 {
 	return false;
 }
+
+static __always_inline void apple_wfi(void) { }
 #endif
 
 /*
@@ -120,7 +150,7 @@ void __cpuidle cpu_do_idle(void)
 			 * them, even when the same task resumes on this CPU.
 			 */
 			fpsimd_save_and_flush_cpu_state();
-			apple_cpu_wfi();
+			apple_wfi();
 		} else {
 			dsb(sy);
 			wfi();

@@ -722,6 +722,16 @@
 		status = "disabled";
 	};
 
+	/*
+	 * Disabled here on every board by design. The SEP is already
+	 * running when Linux starts (warm attach: one shared-memory
+	 * registration, no cold boot), so apple_sep enables this node
+	 * and sep_dart with a changeset at module load, once it has
+	 * picked this SoC's profile and before the DART probes. A
+	 * board with the enclave only needs the sep alias, which the
+	 * boot loader uses to add the sepfw region and the boot
+	 * manifests.
+	 */
 	sep: sep@396400000 {
 		compatible = "apple,sep";
 		reg = <0x3 0x96400000 0x0 0x6C000>;

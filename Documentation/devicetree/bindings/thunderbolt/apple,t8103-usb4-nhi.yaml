@@ -22,6 +22,7 @@ properties:
     oneOf:
       - const: apple,t8103-usb4-nhi
       - const: apple,t8142-usb4-nhi
+      - const: apple,t8152-usb4-nhi
       - const: apple,t6040-usb4-nhi
       - const: apple,t6050-usb4-nhi
       - items:
@@ -131,6 +132,7 @@ allOf:
           contains:
             enum:
               - apple,t8142-usb4-nhi
+              - apple,t8152-usb4-nhi
               - apple,t6040-usb4-nhi
               - apple,t6050-usb4-nhi
     then:
@@ -155,6 +157,7 @@ allOf:
               - apple,t8122-usb4-nhi
               - apple,t8132-usb4-nhi
               - apple,t8142-usb4-nhi
+              - apple,t8152-usb4-nhi
               - apple,t6040-usb4-nhi
               - apple,t6050-usb4-nhi
     then:

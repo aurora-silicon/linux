@@ -2,7 +2,7 @@
 
 //! Host-only ordering of timestamp writes, independent of scheduler credits.
 //!
-//! Links point from earlier logical render ordinals to later ones. They retain
+//! Links point from earlier logical ordinals to later ones. They retain
 //! only public output state, never a packet, physical render lease or VM job pin.
 //! All link storage is allocated before acceptance. Completion neither allocates
 //! nor waits for another command; the last prerequisite publishes a ready result.
@@ -78,7 +78,7 @@ impl Publication {
     }
 
     /// One terminal result, offered separately from its physical-retirement proof.
-    pub(super) fn finish(&self, result: Result<[u64; 4]>) {
+    pub(crate) fn finish(&self, result: Result<[u64; 4]>) {
         let ready = {
             let mut state = self.state.lock();
             if state.claimed || state.result.is_some() {
@@ -205,5 +205,75 @@ impl Prepared {
             predecessor.add_successor(link);
         }
         Publication::drain(self.target.predecessor_done(Ok(())));
+    }
+}
+
+#[cfg(CONFIG_KUNIT = "y")]
+impl Publication {
+    pub(crate) fn test_pair(
+        contexts: &kernel::dma_fence::FenceContexts,
+        status: &Arc<VmStatus>,
+    ) -> Result<(Arc<Self>, kernel::dma_fence::Fence)> {
+        let fence = crate::g17::fence::independent(contexts)?;
+        let handle = kernel::dma_fence::Fence::from_fence(&fence);
+        let output = Output {
+            fence,
+            member: crate::g17::fence::Aggregate::test_member(contexts)?,
+            destinations: super::Destinations::empty(),
+        };
+        Ok((Self::new(output, status.clone())?, handle))
+    }
+}
+
+#[kunit_tests(asahi_g17_publication_order)]
+mod tests {
+    use super::*;
+    use crate::g17::{
+        completion::Destinations,
+        fence::{independent, Aggregate},
+        job::fence_status,
+    };
+    use kernel::{c_str, dma_fence::{Fence, FenceContexts}, sync::LockClassKey};
+
+    static KEY: Pin<&LockClassKey> = kernel::static_lock_class!();
+
+    fn make_pub(
+        contexts: &FenceContexts,
+        status: &Arc<VmStatus>,
+    ) -> (Arc<Publication>, Fence) {
+        let fence = independent(contexts).unwrap();
+        let handle = Fence::from_fence(&fence);
+        let output = Output {
+            fence,
+            member: Aggregate::test_member(contexts).unwrap(),
+            destinations: Destinations::empty(),
+        };
+        (Publication::new(output, status.clone()).unwrap(), handle)
+    }
+
+    #[test]
+    fn consumer_retiring_before_delayed_producer_failure_inherits_error() {
+        let contexts = FenceContexts::new(1, c_str!("asahi_pub_test"), KEY).unwrap();
+        let status = Arc::pin_init(VmStatus::new(), GFP_KERNEL).unwrap();
+        let (producer, prod_fence) = make_pub(&contexts, &status);
+        let (consumer, cons_fence) = make_pub(&contexts, &status);
+        let (downstream, down_fence) = make_pub(&contexts, &status);
+
+        Prepared::new(producer.clone(), core::iter::empty()).unwrap().activate();
+        Prepared::new(consumer.clone(), core::iter::once(&producer)).unwrap().activate();
+        Prepared::new(downstream.clone(), core::iter::once(&consumer)).unwrap().activate();
+
+        // Consumer and its transitive successor retire before the producer's
+        // deferred failure runs: neither may signal success early.
+        consumer.finish(Ok([1, 2, 0, 0]));
+        downstream.finish(Ok([3, 4, 0, 0]));
+        assert_eq!(fence_status(&prod_fence), 0);
+        assert_eq!(fence_status(&cons_fence), 0);
+        assert_eq!(fence_status(&down_fence), 0);
+
+        producer.finish(Err(EIO));
+        assert_eq!(fence_status(&prod_fence), EIO.to_errno());
+        assert_eq!(fence_status(&cons_fence), PRODUCER_FAILED.to_errno());
+        assert_eq!(fence_status(&down_fence), PRODUCER_FAILED.to_errno());
     }
 }

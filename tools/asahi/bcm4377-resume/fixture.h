@@ -63,6 +63,8 @@ struct bcm4377_data {
 	pthread_mutex_t resume_lock;
 	uint64_t resume_epoch, resume_pending;
 	bool resume_armed, resume_blocked, resume_powered;
+	/* T6041 S2R: zero, so a real sleep's power loss rebinds (not modelled: see below). */
+	uint64_t dma_window_base;
 	bool resume_guarded, resume_recovering;
 	struct work_struct resume_work;
  struct ring acl_d2h_ring,acl_h2d_ring,sco_d2h_ring,sco_h2d_ring,hci_d2h_ring,hci_h2d_ring,sco_event_ring,sco_ack_ring,hci_acl_event_ring,hci_acl_ack_ring;
@@ -107,6 +109,14 @@ static pthread_t producer_thread;
 static void hci_cmd_timeout(struct work_struct *work);
 static struct bcm4377_data *active;
 static bool hdev_is_powered(struct hci_dev *h) {return (h->flags&HCI_UP) && !(h->flags&HCI_AUTO_OFF);}
+/* The controls model resumes after s2idle; a real sleep's rebind path is not taken. */
+static bool pm_resume_via_firmware(void) { return false; }
+struct bcm4377_data;
+static void bcm4377_queue_rebind(struct bcm4377_data *b, const char *why)
+{
+	(void)b; (void)why;
+	assert(0);
+}
 static bool of_machine_is_compatible(const char *s) {assert(!strcmp(s,"apple,j493"));return board_j493;}
 static void *kmalloc(size_t n,int flags) {return allocation_error?NULL:malloc(n);}
 static void kfree(void *p) {free(p);}
