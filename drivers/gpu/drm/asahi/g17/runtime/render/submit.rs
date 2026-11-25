@@ -841,7 +841,7 @@ impl crate::g17::Firmware {
         if packet.is_published() {
             self.queues.render.entry_mut(slot)?.published = true;
         } else if result.is_err() {
-            self.queues.render.pools.rollback(preparation);
+            let rollback = self.rollback_render_pool(preparation);
             self.queues.buffers.release(buffer_id)?;
             self.queues
                 .render
@@ -850,6 +850,7 @@ impl crate::g17::Firmware {
                 .as_mut()
                 .ok_or(EIO)?
                 .discard_prepared(packet)?;
+            rollback?;
         }
         result
     }

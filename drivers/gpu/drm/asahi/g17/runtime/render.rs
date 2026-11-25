@@ -1184,6 +1184,29 @@ impl crate::g17::Firmware {
         })
     }
 
+    /// Undoes an unpublished pool preparation and flushes any final release
+    /// exposed when sibling renders completed while the preparation was lent.
+    fn rollback_render_pool(&mut self, preparation: pools::Preparation) -> Result {
+        let pending = match self.queues.render.pools.rollback(preparation) {
+            Ok(pending) => pending,
+            Err(error) => {
+                self.primary.state.shared.lose_device_quietly();
+                return Err(error);
+            }
+        };
+        if pending {
+            match self.release_render_lists() {
+                Ok(()) => {}
+                Err(error) if error == EAGAIN => self.primary.state.shared.queue_events(),
+                Err(error) => {
+                    self.primary.state.shared.lose_device_quietly();
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Events have already been consumed by the caller. Each healthy completion
     /// services its final pool release before examining the next retained job.
     fn retire_render_slot(
