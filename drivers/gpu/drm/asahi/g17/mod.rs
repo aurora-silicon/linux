@@ -900,8 +900,9 @@ impl Firmware {
     }
 
     /// Both outer slots and their capacity are checked before any host-port
-    /// write. An EAGAIN retry drops the old views and revalidates them under a
-    /// power hold. After a successful transaction, publication is infallible.
+    /// write. The host command port needs no core power, and its transaction
+    /// fails only once the register mapping is gone; the error propagates.
+    /// After a successful transaction, publication is infallible.
     fn submit_m5_render_pair(
         &mut self,
         priority: u8,
@@ -912,26 +913,12 @@ impl Firmware {
         deferred: bool,
         cursors: Option<[u32; 3]>,
     ) -> Result<[u32; 2]> {
-        let mut commit_accounting = Some(commit_accounting);
-        let mut publish_inner = Some(publish_inner);
-        let mut cursors = cursors;
-        for attempt in 0..2 {
-            let pair = self.init.m5_work_pair(priority, &records[0], &records[1], cursors.take())?;
-            pair.prepare();
-            if let Some(commit) = commit_accounting.take() { commit()?; }
-            match self.bridge.regs.submit_m5_work(submission) {
-                Err(error) if error == EAGAIN && attempt == 0 => {
-                    drop(pair);
-                    self.acquire_registration_power()?;
-                }
-                Err(error) => return Err(error),
-                Ok(()) => {
-                    if let Some(publish) = publish_inner.take() { publish(); }
-                    return Ok(if deferred { pair.next() } else { pair.publish() });
-                }
-            }
-        }
-        Err(EAGAIN)
+        let pair = self.init.m5_work_pair(priority, &records[0], &records[1], cursors)?;
+        pair.prepare();
+        commit_accounting()?;
+        self.bridge.regs.submit_m5_work(submission)?;
+        publish_inner();
+        Ok(if deferred { pair.next() } else { pair.publish() })
     }
 
     /// Called at actual submission publication, not while a queued job is merely being built.
@@ -1188,6 +1175,42 @@ const GROW_WORK: u64 = 3;
 const RECLAIM_WORK: u64 = 4;
 const FEED_WORK: u64 = 5;
 const GOVERNOR_WORK: u64 = 6;
+/// Deferred housekeeping deadline when a completion drained the last in-flight work within
+/// `HOUSEKEEPING_NS`.
+const HOUSEKEEPING_WORK: u64 = 7;
+
+/// `CondVar` wrapper that tracks active waiters so `notify_all()` skips the waitqueue lock
+/// in the common zero-waiter steady state.
+#[pin_data]
+struct TrackedCondVar {
+    #[pin]
+    condvar: CondVar,
+    waiters: AtomicU32,
+}
+
+impl TrackedCondVar {
+    fn wait_timeout<T: ?Sized>(
+        &self,
+        guard: &mut kernel::sync::MutexGuard<'_, T>,
+        timeout: kernel::time::Jiffies,
+    ) -> kernel::sync::CondVarTimeoutResult {
+        struct Waiter<'a>(&'a AtomicU32);
+        impl Drop for Waiter<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::Release);
+            }
+        }
+        self.waiters.fetch_add(1, Ordering::SeqCst);
+        let _waiter = Waiter(&self.waiters);
+        self.condvar.wait_timeout(guard, timeout)
+    }
+
+    fn notify_all(&self) {
+        if self.waiters.load(Ordering::SeqCst) != 0 {
+            self.condvar.notify_all();
+        }
+    }
+}
 
 /// Device state shared with the coprocessor callbacks and the event worker.
 #[pin_data]
@@ -1261,6 +1284,8 @@ struct Shared {
     poll: DelayedWork<Shared, POLL_WORK>,
     #[pin]
     idle: DelayedWork<Shared, IDLE_WORK>,
+    #[pin]
+    housekeeping_timer: DelayedWork<Shared, HOUSEKEEPING_WORK>,
     /// M5: the thermal governor runs (the firmware has the host power budget word).
     governs: bool,
     #[pin]
@@ -1270,20 +1295,25 @@ struct Shared {
     /// step). Publishers without the device mutex set it too.
     governor_activity_ns: AtomicU64,
     /// The queue of all work that signals job fences: the event work, and every scheduler's
-    /// timeout work. Memory reclaim may wait on those fences, so it is reclaim-safe and per-CPU
-    /// high priority, as `system_highpri_wq`. On M5, `enqueue_on(submitter)` places completion
-    /// processing directly on the submitting CPU (keeping it in the submitter's L2 and die).
+    /// timeout work. Memory reclaim may wait on those fences, so it is reclaim-safe, and it is
+    /// high priority, as `system_highpri_wq`. [`Self::new_events_queue`] says where the event
+    /// work runs.
     events: Arc<workqueue::OwnedQueue>,
     /// Preallocated completion collector owned exclusively by `run_runtime_events`.
     #[pin]
     worker_deferred: Mutex<Option<runtime::DeferredBatch>>,
-    /// M5: the event work follows the submitting CPU.
-    follows_submitter: bool,
-    /// Multi-die M5: restrict each scheduler's ordered submit queue to the creating CPU's
-    /// cluster to avoid cross-die migration. Single-die M5 parts leave schedulers unpinned so
-    /// queues created on one thread do not contend on a single cluster under multi-queue load.
+    /// Collector, as large as the event worker's, for the observation a render borrower owes the
+    /// pair it puts back (`Backend::render_direct`). Taken only with `try_lock`, so no borrower
+    /// waits for another, and finished after the device mutex is released.
+    #[pin]
+    render_collector: Mutex<runtime::DeferredBatch>,
+    /// Always aim event work at the publishing CPU on M5, including within a cluster.
+    aim_events_at_submitter: bool,
+    /// Restrict each scheduler's ordered submit queue to the creating CPU's cluster.
+    /// Single-die M5 leaves schedulers unpinned so queues created on one thread can
+    /// spread among clusters under multi-queue load.
     pin_scheduler_cluster: bool,
-    /// M5: the CPU of the last publication, `u32::MAX` before the first.
+    /// The CPU of the last publication, `u32::MAX` before the first.
     submitter: AtomicU32,
     #[pin]
     grow: Work<Shared, GROW_WORK>,
@@ -1304,7 +1334,7 @@ struct Shared {
     #[pin]
     actuators: Mutex<thermal::Actuators>,
     #[pin]
-    changed: CondVar,
+    changed: TrackedCondVar,
     /// The port of the session in `state`; null before boot and once detachment begins.
     port: core::sync::atomic::AtomicPtr<port::Port>,
 }
@@ -1318,6 +1348,9 @@ impl_has_delayed_work! {
 }
 impl_has_delayed_work! {
     impl HasDelayedWork<Shared, IDLE_WORK> for Shared { self.idle }
+}
+impl_has_delayed_work! {
+    impl HasDelayedWork<Shared, HOUSEKEEPING_WORK> for Shared { self.housekeeping_timer }
 }
 impl_has_delayed_work! {
     impl HasDelayedWork<Shared, GOVERNOR_WORK> for Shared { self.governor }
@@ -1406,6 +1439,15 @@ impl WorkItem<IDLE_WORK> for Shared {
         this.queue_events();
     }
 }
+impl WorkItem<HOUSEKEEPING_WORK> for Shared {
+    type Pointer = Arc<Shared>;
+    fn run(this: Arc<Shared>) {
+        if this.sleeping() {
+            return;
+        }
+        this.queue_events();
+    }
+}
 
 impl WorkItem<EVENT_WORK> for Shared {
     type Pointer = Arc<Shared>;
@@ -1461,10 +1503,17 @@ impl Shared {
         if !self.submission_enabled {
             return;
         }
+        // Outside M5, use the queuing CPU when it is already in the submitter's cluster.
         // Already queued if this fails, which is just as good.
+        let here = kernel::cpu::CpuId::current();
         let _ = match self.submitter() {
-            Some(cpu) => self.events.enqueue_on::<Arc<Shared>, EVENT_WORK>(cpu, self.clone()),
-            None => self.events.enqueue::<Arc<Shared>, EVENT_WORK>(self.clone()),
+            Some(cpu)
+                if self.aim_events_at_submitter
+                    || !kernel::cpumask::Cpumask::cluster_of(here).test(cpu) =>
+            {
+                self.events.enqueue_on::<Arc<Shared>, EVENT_WORK>(cpu, self.clone())
+            }
+            _ => self.events.enqueue::<Arc<Shared>, EVENT_WORK>(self.clone()),
         };
     }
 
@@ -1473,16 +1522,39 @@ impl Shared {
         self.events.clone()
     }
 
-    /// Whether each scheduler's submit queue should be restricted to the creating CPU's cluster
-    /// (multi-die M5 only).
+    /// The queue of [`Self::events`].
+    ///
+    /// On M5 the event work is aimed at the publishing CPU by
+    /// [`Self::queue_event_records`]. Its queue is unbound, so that CPU only selects the affinity
+    /// pod, the CPUs sharing its L2, and the scheduler wakes the worker on an idle CPU of the pod:
+    /// beside the submitter and on its die, wherever the completion interrupt was taken. On a
+    /// per-CPU queue the worker would run on the submitting CPU itself and, with the higher
+    /// priority, preempt the submitter for every completion, often in the middle of a publication
+    /// holding the locks the event work takes next. As their owner would not be running, the
+    /// worker could not spin on them: it would sleep until the submitter unlocks and then preempt
+    /// it again, two context switches of the submitter per completion.
+    ///
+    /// On other G17 parts the queue is per-CPU. The worker runs on the CPU that queues it when
+    /// it already shares the submitter's cluster, or on the publishing CPU otherwise.
+    fn new_events_queue(aim_events_at_submitter: bool) -> Result<workqueue::OwnedQueue> {
+        if aim_events_at_submitter {
+            workqueue::OwnedQueue::new_unbound_reclaim(c"aurora_g17_events", true)
+        } else {
+            workqueue::OwnedQueue::new_percpu_reclaim(c"aurora_g17_events", true)
+        }
+    }
+
+    /// Whether to restrict each scheduler's submit queue to the creating CPU's cluster.
     pub(super) fn pin_scheduler_cluster(&self) -> bool {
         self.pin_scheduler_cluster
     }
 
-    /// Records the publishing CPU for the event work's placement (M5).
+    /// Records the publishing CPU for the event work's placement.
     fn note_submitter(&self) {
-        if self.follows_submitter {
-            self.submitter.store(kernel::cpu::CpuId::current().as_u32(), Ordering::Relaxed);
+        let cpu = kernel::cpu::CpuId::current().as_u32();
+        // The completion side reads this line; write it only when the submitter moves.
+        if self.submitter.load(Ordering::Relaxed) != cpu {
+            self.submitter.store(cpu, Ordering::Relaxed);
         }
     }
 
@@ -1560,6 +1632,16 @@ impl Shared {
         let delay_ms = delay_ns.div_ceil(1_000_000).min(u64::from(u32::MAX)) as u32;
         let _ = workqueue::system_highpri()
             .enqueue_delayed::<Arc<Self>, IDLE_WORK>(self.clone(), msecs_to_jiffies(delay_ms));
+    }
+
+    fn queue_housekeeping(self: &Arc<Self>, delay_ns: u64) {
+        let delay_ms = delay_ns
+            .div_ceil(1_000_000)
+            .clamp(1, u64::from(u32::MAX)) as u32;
+        let _ = workqueue::system_highpri().enqueue_delayed::<Arc<Self>, HOUSEKEEPING_WORK>(
+            self.clone(),
+            msecs_to_jiffies(delay_ms),
+        );
     }
 
     fn disable_timer<const ID: u64>(self: &Arc<Self>, timer: &DelayedWork<Self, ID>) {
@@ -1774,15 +1856,15 @@ impl Gpu {
         let render_policy = if m5 { Some(render_resources::M5Policy::new(&id)?) } else { None };
         // The bare-metal M5 boot runs both engines; other M5 profiles take no submission.
         let submits = !m5 || cfg.profile == FirmwareProfile::M5PublishedRoots;
-        let events = Arc::new(
-            workqueue::OwnedQueue::new_percpu_reclaim(c"aurora_g17_events", true)?,
-            GFP_KERNEL,
-        )?;
+        // Target the publishing CPU's affinity pod on M5, even from within the same cluster.
+        let aim_events_at_submitter = m5;
+        let events = Arc::new(Shared::new_events_queue(aim_events_at_submitter)?, GFP_KERNEL)?;
         let frequencies = Self::state_frequencies(dev, cfg, variant, id.num_clusters)?;
         let max_pstate = frequencies
             .as_ref()
             .map_or(0, stats::StateFrequencies::max_pstate);
         let worker_deferred = runtime::DeferredBatch::worker()?;
+        let render_collector = runtime::DeferredBatch::worker()?;
         let shared = Arc::pin_init(
             pin_init!(Shared {
                 drm <- new_mutex!(Some(dev.into()), "g17::Shared::drm"),
@@ -1819,6 +1901,7 @@ impl Gpu {
                 housekeeping_ns: AtomicU64::new(0),
                 poll <- new_delayed_work!("g17::Shared::poll"),
                 idle <- new_delayed_work!("g17::Shared::idle"),
+                housekeeping_timer <- new_delayed_work!("g17::Shared::housekeeping_timer"),
                 governs: m5,
                 governor <- new_delayed_work!("g17::Shared::governor"),
                 governor_armed: AtomicBool::new(false),
@@ -1828,8 +1911,9 @@ impl Gpu {
                     Some(worker_deferred),
                     "g17::Shared::worker_deferred"
                 ),
-                follows_submitter: m5,
-                pin_scheduler_cluster: m5 && id.num_dies > 1,
+                render_collector <- new_mutex!(render_collector, "g17::Shared::render_collector"),
+                aim_events_at_submitter,
+                pin_scheduler_cluster: !m5 || id.num_dies > 1,
                 submitter: AtomicU32::new(u32::MAX),
                 grow <- new_work!("g17::Shared::grow"),
                 reclaim_work <- new_work!("g17::Shared::reclaim_work"),
@@ -1837,7 +1921,10 @@ impl Gpu {
                 stop <- new_mutex!((), "g17::Shared::stop"),
                 state <- new_mutex!(None, "g17::Shared::state"),
                 actuators <- new_mutex!(thermal::Actuators::new(), "g17::Shared::actuators"),
-                changed <- new_condvar!("g17::Shared::changed"),
+                changed <- pin_init!(TrackedCondVar {
+                    condvar <- new_condvar!("g17::Shared::changed"),
+                    waiters: AtomicU32::new(0),
+                }),
                 port: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
             }),
             GFP_KERNEL,
@@ -2529,6 +2616,7 @@ impl Gpu {
         self.shared.stop_queues();
         self.shared.disable_timer(&self.shared.poll);
         self.shared.disable_timer(&self.shared.idle);
+        self.shared.disable_timer(&self.shared.housekeeping_timer);
         self.shared.disable_timer(&self.shared.governor);
         if let Some(firmware) = (*self.shared.state.lock()).as_deref_mut() {
             firmware.governor_restore();

@@ -1130,8 +1130,10 @@ static int apple_connector_attach_pq_reference(struct drm_connector *connector)
  * External displays expose the colour properties backed by DCP's per-timing
  * ColorModes catalogue (Colorspace, HDR_OUTPUT_METADATA, Broadcast RGB,
  * color format, max bpc); dcp_crtc_atomic_check() validates each request
- * against the active timing's catalogue.  Internal panels with EDR expose
- * Colorspace (BT2020_RGB), HDR_OUTPUT_METADATA and PQ_REFERENCE_LUMINANCE.
+ * against the active timing's catalogue.  An internal panel with EDR
+ * headroom (dcp_panel_edr()) exposes Colorspace (BT2020_RGB),
+ * HDR_OUTPUT_METADATA and PQ_REFERENCE_LUMINANCE; an SDR panel offers no
+ * HDR at all.
  */
 static int apple_connector_attach_hdr(struct drm_connector *connector,
 				      bool panel_edr, bool ext_color_props)
@@ -1251,8 +1253,7 @@ static int apple_connector_create(struct drm_device *drm,
 	ret = drm_connector_attach_vrr_capable_property(&connector->base);
 	if (ret)
 		goto err_cleanup;
-	ret = apple_connector_attach_hdr(&connector->base,
-					 dcp_fw_compat_panel_edr(dcp),
+	ret = apple_connector_attach_hdr(&connector->base, dcp_panel_edr(dcp),
 					 dcp_ext_color_props_supported(dcp));
 	if (ret)
 		goto err_cleanup;

@@ -605,8 +605,6 @@ static int avd_querycap(struct file *file, void *priv,
 
 	strscpy(cap->driver, avd->dev->driver->name, sizeof(cap->driver));
 	strscpy(cap->card, vdev->name, sizeof(cap->card));
-	snprintf(cap->bus_info, sizeof(cap->bus_info), "platform:%s",
-		 avd->dev->driver->name);
 	return 0;
 }
 
