@@ -1871,10 +1871,23 @@
 				<0x5 0x9e020000 0x0 0x4000>,	/* phy0 */
 				<0x5 0x9e024000 0x0 0x4000>,	/* phy1 */
 				<0x5 0x9e028000 0x0 0x4000>,	/* phy2 */
-				<0x5 0x9e02c000 0x0 0x4000>;	/* phy3 */
+				<0x5 0x9e02c000 0x0 0x4000>,	/* phy3 */
+				/*
+				 * What a deep sleep takes and its wake sets up again, as
+				 * the J516s ADT's /arm-io/apcie reg[4], [5], [6],
+				 * [2] + 0x4000, [2] + 0x8000 and [3]
+				 */
+				<0x5 0x9c000000 0x0 0x8000>,	/* axi2af */
+				<0x5 0x9e08a200 0x0 0x4000>,	/* cio3pll */
+				<0x5 0x9e088000 0x0 0x4000>,	/* clkgen */
+				<0x5 0x9e008000 0x0 0x4000>,	/* phy-common */
+				<0x5 0x9e00c000 0x0 0x4000>,	/* phy-shared */
+				<0x5 0x9e040000 0x0 0x40000>;	/* phy-ip */
 			reg-names = "config", "rc",
 				    "port0", "port1", "port2", "port3",
-				    "phy0", "phy1", "phy2", "phy3";
+				    "phy0", "phy1", "phy2", "phy3",
+				    "axi2af", "cio3pll", "clkgen",
+				    "phy-common", "phy-shared", "phy-ip";
 
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 1038 IRQ_TYPE_LEVEL_HIGH>,
