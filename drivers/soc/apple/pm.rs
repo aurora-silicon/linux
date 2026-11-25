@@ -49,7 +49,7 @@ extern "C" {
         reply: u64,
         mask: u64,
     ) -> c_int;
-    fn sep_pm_commit_finish(dev: *mut c_void) -> c_int;
+    fn sep_pm_commit_finish(dev: *mut c_void, dart_ret: *mut c_int) -> c_int;
     fn sep_pm_last_sleep(stop: *mut u64, wake: *mut u64, hz: *mut u32) -> bool;
     pub(crate) static sep_pm_ops: kernel::bindings::dev_pm_ops;
 }
@@ -120,14 +120,20 @@ pub(crate) fn leave_for_commit(
 }
 
 /// Finishes a staged request. A sent request requires a real firmware return;
-/// the C boundary terminates an impossible sent-without-sleep unwind. `None` if unstaged.
-pub(crate) fn commit_finish(dev: &kernel::device::Device) -> Option<bool> {
-    // SAFETY: `dev` is the bound SEP device.
-    let rc = unsafe { sep_pm_commit_finish(dev.as_raw().cast()) };
+/// the C boundary terminates an impossible sent-without-sleep unwind. `None` if unstaged;
+/// whether it was sent, or the error of a refused one's DART that did not come back.
+pub(crate) fn commit_finish(dev: &kernel::device::Device) -> Option<Result<bool>> {
+    let mut dart_ret: c_int = 0;
+    // SAFETY: `dev` is the bound SEP device; the shim writes only `dart_ret` through the pointer.
+    let rc = unsafe { sep_pm_commit_finish(dev.as_raw().cast(), &mut dart_ret) };
     if rc < 0 {
         None
+    } else if rc > 0 {
+        Some(Ok(true))
+    } else if dart_ret != 0 {
+        Some(Err(Error::from_errno(dart_ret)))
     } else {
-        Some(rc > 0)
+        Some(Ok(false))
     }
 }
 

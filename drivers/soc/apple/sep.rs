@@ -1875,10 +1875,19 @@ impl SepData {
         if self.sleep_at_suspend.load(Relaxed) {
             return self.sleep_exit_at_suspend();
         }
-        // Staged only: an unsent refusal releases RX without a restart.
+        // Staged only: an unsent refusal releases RX without a restart, once its DART is back.
         match pm::commit_finish(&self.dev) {
-            Some(true) => self.set_sleep_gate(pm::SleepGate::Told),
-            Some(false) => self.sleep_release_rx(),
+            Some(Ok(true)) => self.set_sleep_gate(pm::SleepGate::Told),
+            Some(Ok(false)) => self.sleep_release_rx(),
+            Some(Err(e)) => {
+                dev_err_ratelimited!(
+                    self.dev,
+                    "the enclave's DART did not come back from the refused sleep ({:?}); it stays unused until a reboot\n",
+                    e
+                );
+                self.set_sleep_gate(pm::SleepGate::Lost);
+                return false;
+            }
             None => {}
         }
         let gate = self.sleep_gate();

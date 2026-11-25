@@ -287,6 +287,8 @@ static struct sep_pm_commit {
 	u8 reply_result;
 	unsigned int answer_us;
 	int gate_ret;
+	/* An unsent attempt's DART, put back: nonzero if it did not come back */
+	int dart_ret;
 	u32 state;
 } sep_pm_commit;
 
@@ -336,6 +338,7 @@ static int sep_pm_commit_stop(void *data)
 	c->reply_result = 0xff;
 	c->gate_ret = -EINVAL;
 	c->gate_valid = false;
+	c->dart_ret = 0;
 	c->state = 0;
 
 	sep_pm_commit_take_rx(c, true);
@@ -383,8 +386,9 @@ out:
 	/* Callback ownership is RAM only; RX remains held until a real wake. */
 	sep_pm_commit_take_rx(c, false);
 	if (!c->sent) {
+		/* Kept for the resume, which keeps the enclave unused over a DART not back. */
 		if (prepared)
-			apple_dart_sleep_restore(c->dart);
+			c->dart_ret = apple_dart_sleep_restore(c->dart);
 		return ret;
 	}
 	/* Preserve the failure reason without another hardware query. */
@@ -482,6 +486,7 @@ int sep_pm_commit_prepare(void *ptr, void *mbox, u64 msg0, u32 msg1, u64 reply, 
 	c->reply_result = 0xff;
 	c->gate_ret = -EINVAL;
 	c->gate_valid = false;
+	c->dart_ret = 0;
 	c->state = 0;
 	ret = apple_sleep_enclave_register(dev, sep_pm_commit_stop, c);
 	if (ret)
@@ -500,8 +505,11 @@ err:
 	return ret;
 }
 
-/* After the sleep, refused or not: 1 if the request went out, 0 if not, <0 if none was left. */
-int sep_pm_commit_finish(void *ptr)
+/*
+ * After the sleep, refused or not: 1 if the request went out, 0 if not, <0 if none was left.
+ * For one not sent, @dart_ret is nonzero if its DART did not come back.
+ */
+int sep_pm_commit_finish(void *ptr, int *dart_ret)
 {
 	struct sep_pm_commit *c = &sep_pm_commit;
 
@@ -511,10 +519,11 @@ int sep_pm_commit_finish(void *ptr)
 		panic("SEP SLEEP was sent without a physical sleep/wake");
 	apple_sleep_enclave_unregister(c->dev);
 	c->registered = false;
+	*dart_ret = c->sent ? 0 : c->dart_ret;
 	dev_dbg(c->dev,
-		"sleep commit finished: sent=%d reply_valid=%d result=%#x answer_us=%u gate_valid=%d gate_ret=%d state=%#x\n",
+		"sleep commit finished: sent=%d reply_valid=%d result=%#x answer_us=%u gate_valid=%d gate_ret=%d dart_ret=%d state=%#x\n",
 		c->sent, c->answered, c->reply_result, c->answer_us,
-		c->gate_valid, c->gate_ret, c->state);
+		c->gate_valid, c->gate_ret, c->dart_ret, c->state);
 	iounmap(c->ps);
 	c->ps = NULL;
 	put_device(c->dart);
