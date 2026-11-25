@@ -384,6 +384,24 @@ static void avd_pm_test_exit(struct kunit *test)
 		cancel_delayed_work_sync(&fixture->avd.queue_work);
 }
 
+/* Daisy's 47 values land under their masks; neighbour bits are kept. */
+static void avd_pm_daisy_tunables_test(struct kunit *test)
+{
+	void __iomem *base = (__force void __iomem *)kunit_kzalloc(test, 0x4020, GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, (__force void *)base);
+	writel(0x7f00ff00, base + 0x8);
+	writel(0xffffffff, base + 0x400c);
+	writel(0x0000ffff, base + 0x108);
+	KUNIT_EXPECT_EQ(test, avd_pm_write_daisy_tunables(base), AVD_DAISY_TUNABLES);
+	KUNIT_EXPECT_EQ(test, readl(base + 0x8), 0xff26ff05U);
+	KUNIT_EXPECT_EQ(test, readl(base + 0x20), 0x80260003U);
+	KUNIT_EXPECT_EQ(test, readl(base + 0x400c), 0xffffffffU);
+	KUNIT_EXPECT_EQ(test, readl(base + 0x108), 0x0010fff9U);
+	KUNIT_EXPECT_EQ(test, readl(base + 0x848), 0x01400080U);
+	KUNIT_EXPECT_EQ(test, readl(base + 0x4008), 0U);
+}
+
 static struct kunit_case avd_pm_test_cases[] = {
 	KUNIT_CASE(avd_pm_suspend_gate_test),
 	KUNIT_CASE(avd_pm_resume_order_test),
@@ -396,6 +414,7 @@ static struct kunit_case avd_pm_test_cases[] = {
 	KUNIT_CASE(avd_pm_recovery_dart_gate_test),
 	KUNIT_CASE(avd_pm_recovery_boot_test),
 	KUNIT_CASE(avd_pm_parked_resume_test),
+	KUNIT_CASE(avd_pm_daisy_tunables_test),
 	{}
 };
 

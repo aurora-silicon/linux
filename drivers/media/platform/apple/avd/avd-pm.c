@@ -4,6 +4,7 @@
 #include <linux/io.h>
 #include <linux/limits.h>
 #include <linux/of.h>
+#include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/reset.h>
 #include <linux/slab.h>
@@ -233,6 +234,222 @@ void avd_pm_prepare_piodma(struct avd_dev *avd)
 	if (avd->pm.piodma)
 		writel((u32)(avd->pm.sram_phys >> 4),
 		       avd->pm.piodma + AVD_PIODMA_SRAM_BASE);
+}
+
+/*
+ * T8132's decoder is macOS's Daisy generation. Its AXI-to-fabric bridge
+ * (AXI2AF) sits 0x1100000 below the decoder's control window and returns
+ * to its reset credits at every power-down. macOS's CAvdApCommDaisy
+ * loadTunables programs it at each power-up, in this order: upstream and
+ * downstream flow control without read-back, then the decoder entries our
+ * CM3 firmware already applies, then the AXI2AF table with read-back, then
+ * a check of both flow-control groups.
+ */
+#define AVD_AXI2AF_CTRL_OFFSET	0x1100000
+#define AVD_AXI2AF_SIZE		0x4020
+
+struct avd_tunable {
+	u16 off;
+	u32 mask;
+	u32 val;
+};
+
+/*
+ * Bit 31 of each flow-control entry loads the count written beside it and
+ * reads back as 0 (the count fields hold the written values), so the
+ * read-back check leaves it out.
+ */
+#define AVD_DAISY_FLOW_LOAD	BIT(31)
+
+static const struct avd_tunable avd_daisy_flow_up[] = {
+	{ 0x0000, 0x800000ff, 0x80000026 }, /* UP_CMD_CREDIT_GS_ALLOC */
+	{ 0x0004, 0x80ff00ff, 0x80260003 }, /* UP_CMD_CREDIT_BULKRD_REQ0_ALLOC */
+	{ 0x0008, 0x80ff00ff, 0x80260005 }, /* UP_CMD_CREDIT_BULKWR_REQ0_ALLOC */
+	{ 0x000c, 0x80ff00ff, 0x80260005 }, /* UP_CMD_CREDIT_LLT_REQ0_ALLOC */
+	{ 0x0010, 0x80ff00ff, 0x80260003 }, /* UP_CMD_CREDIT_VCP_REQ1_ALLOC */
+	{ 0x0014, 0x80ff00ff, 0x80260003 }, /* UP_CMD_CREDIT_VCP_CPL_ALLOC */
+	{ 0x0018, 0x800000ff, 0x8000001f }, /* UP_CMD_TOKEN_ALLOC */
+	{ 0x001c, 0x800000ff, 0x80000026 }, /* UP_DATA_CREDIT_GS_ALLOC */
+	{ 0x0020, 0x80ff00ff, 0x80260003 }, /* UP_DATA_CREDIT_BULKWR_REQ0_ALLOC */
+	{ 0x0024, 0x80ff00ff, 0x801d0007 }, /* UP_DATA_CREDIT_LLT_REQ0_ALLOC */
+	{ 0x0028, 0x80ff00ff, 0x80260003 }, /* UP_DATA_CREDIT_VCP_REQ1_ALLOC */
+	{ 0x002c, 0x80ff00ff, 0x80260003 }, /* UP_DATA_CREDIT_VCP_CPL_ALLOC */
+	{ 0x0030, 0x800000ff, 0x8000001f }, /* UP_DATA_TOKEN_ALLOC */
+};
+
+static const struct avd_tunable avd_daisy_flow_dn[] = {
+	{ 0x0034, 0x800000ff, 0x8000001f }, /* DN_CMD_FLOW_TOKEN_ALLOC */
+	{ 0x0038, 0x800000ff, 0x8000001f }, /* DN_PULL_TOKEN_ALLOC */
+};
+
+static const struct avd_tunable avd_daisy_axi2af[] = {
+	{ 0x0100, 0x000000ff, 0x000000ff }, /* LINK_MGMT_CPG_CG_ENA */
+	{ 0x0108, 0xffff0006, 0x00100000 }, /* LINK_MGMT_CPG_LINK_TEARDOWN */
+	{ 0x0304, 0x3f3f0000, 0x02020000 }, /* AIU_UP_ARB_RESOURCE_THRESHOLD_A */
+	{ 0x0308, 0x000fffff, 0x00001681 }, /* AIU_UP_ARB_GC_SATURATION */
+	{ 0x030c, 0x000fffff, 0x00001680 }, /* AIU_UP_ARB_GC_SATURATION_ADJ */
+	{ 0x0310, 0x70000fff, 0x000001e0 }, /* AIU_UP_ARB_M_LLT_AR_WEIGHT */
+	{ 0x0314, 0xf0000fff, 0x800001e0 }, /* AIU_UP_ARB_M_LLT_AW_WEIGHT */
+	{ 0x0318, 0x70000fff, 0x000005a0 }, /* AIU_UP_ARB_M_BULK_AR_WEIGHT */
+	{ 0x031c, 0xf0000fff, 0x800005a0 }, /* AIU_UP_ARB_M_BULK_AW_WEIGHT */
+	{ 0x0320, 0x70000fff, 0x000005a0 }, /* AIU_UP_ARB_S_R_WEIGHT */
+	{ 0x0324, 0x70000fff, 0x000005a0 }, /* AIU_UP_ARB_S_B_WEIGHT */
+	{ 0x0328, 0x70000fff, 0x000005a0 }, /* AIU_UP_ARB_PIO_CPL_WEIGHT */
+	{ 0x0330, 0xffffffff, 0x0000ffff }, /* AIU_UP_ARB_SHARED_TLIMIT0 */
+	{ 0x0334, 0xffffffff, 0x0000ffff }, /* AIU_UP_ARB_SHARED_TLIMIT1 */
+	{ 0x0408, 0xffff0020, 0x00220020 }, /* AIU_DN_ARB_PULL_CFG */
+	{ 0x040c, 0x000fffff, 0x00001681 }, /* AIU_DN_ARB_PULL_GC_SATURATION */
+	{ 0x0410, 0x000fffff, 0x00001680 }, /* AIU_DN_ARB_PULL_GC_SATURATION_ADJ */
+	{ 0x0414, 0x70000fff, 0x000001e0 }, /* AIU_DN_ARB_PULL_M_LLT_R_WEIGHT */
+	{ 0x0418, 0x70000fff, 0x000001e0 }, /* AIU_DN_ARB_PULL_M_LLT_B_WEIGHT */
+	{ 0x041c, 0x70000fff, 0x000005a0 }, /* AIU_DN_ARB_PULL_M_BULK_R_WEIGHT */
+	{ 0x0420, 0x70000fff, 0x000005a0 }, /* AIU_DN_ARB_PULL_M_BULK_B_WEIGHT */
+	{ 0x0424, 0x70000fff, 0x000005a0 }, /* AIU_DN_ARB_PULL_S_AR_WEIGHT */
+	{ 0x0428, 0x70000fff, 0x000005a0 }, /* AIU_DN_ARB_PULL_S_AW_WEIGHT */
+	{ 0x042c, 0x70000fff, 0x000005a0 }, /* AIU_DN_ARB_PULL_PIO_NP_WEIGHT */
+	{ 0x0748, 0x07ff07ff, 0x00300000 }, /* AXI_M_LLT_TLIMIT */
+	{ 0x0848, 0x07ff07ff, 0x01400080 }, /* AXI_M_BULK_TLIMIT */
+	{ 0x0a00, 0xffffffff, 0x7fffffff }, /* DEBUG_CG_ENA */
+	{ 0x4008, 0x00000001, 0x00000000 }, /* KEEP_ALIVE_AGENT_FLOOR_ENA */
+	{ 0x400c, 0x00000001, 0x00000001 }, /* KEEP_ALIVE_AF_LINK_FLOOR_ENA */
+	{ 0x4014, 0x00000001, 0x00000000 }, /* KEEP_ALIVE_AGENT_PERF_POWER_ENA */
+	{ 0x4018, 0x00000001, 0x00000000 }, /* KEEP_ALIVE_AGENT_OUTSTANDING_ENA */
+	{ 0x401c, 0x00000001, 0x00000001 }, /* KEEP_ALIVE_AXI2AF_OUTSTANDING_ENA */
+};
+
+static unsigned int avd_pm_write_tunables(void __iomem *base,
+					  const struct avd_tunable *table,
+					  unsigned int count)
+{
+	unsigned int ok = 0;
+
+	for (unsigned int i = 0; i < count; i++) {
+		const struct avd_tunable *t = &table[i];
+		u32 v = readl(base + t->off);
+
+		writel((v & ~t->mask) | (t->val & t->mask), base + t->off);
+		if ((readl(base + t->off) & t->mask) == (t->val & t->mask))
+			ok++;
+	}
+	return ok;
+}
+
+static void avd_pm_daisy_write(void __iomem *base, const struct avd_tunable *t,
+			       unsigned int n)
+{
+	for (unsigned int i = 0; i < n; i++) {
+		u32 v = readl(base + t[i].off);
+
+		writel((v & ~t[i].mask) | (t[i].val & t[i].mask), base + t[i].off);
+	}
+}
+
+static unsigned int avd_pm_daisy_check(void __iomem *base,
+				       const struct avd_tunable *t,
+				       unsigned int n)
+{
+	unsigned int ok = 0;
+
+	for (unsigned int i = 0; i < n; i++) {
+		u32 m = t[i].mask & ~AVD_DAISY_FLOW_LOAD;
+
+		if ((readl(base + t[i].off) & m) == (t[i].val & m))
+			ok++;
+	}
+	return ok;
+}
+
+/* Exposed for KUnit: program @base in macOS's order, return entries that read back. */
+unsigned int avd_pm_write_daisy_tunables(void __iomem *base)
+{
+	unsigned int ok;
+
+	avd_pm_daisy_write(base, avd_daisy_flow_up, ARRAY_SIZE(avd_daisy_flow_up));
+	avd_pm_daisy_write(base, avd_daisy_flow_dn, ARRAY_SIZE(avd_daisy_flow_dn));
+	ok = avd_pm_write_tunables(base, avd_daisy_axi2af,
+				   ARRAY_SIZE(avd_daisy_axi2af));
+	ok += avd_pm_daisy_check(base, avd_daisy_flow_up,
+				 ARRAY_SIZE(avd_daisy_flow_up));
+	ok += avd_pm_daisy_check(base, avd_daisy_flow_dn,
+				 ARRAY_SIZE(avd_daisy_flow_dn));
+	return ok;
+}
+
+/*
+ * Name each entry whose read-back differs, with the value it held before
+ * the write, at debug level. Done on the first two power-ups that miss,
+ * then quiet.
+ */
+static unsigned int daisy_reports;
+
+static void avd_pm_daisy_snap(void __iomem *base, const struct avd_tunable *t,
+			      unsigned int n, u32 *before)
+{
+	for (unsigned int i = 0; i < n; i++)
+		before[i] = readl(base + t[i].off);
+}
+
+static void avd_pm_daisy_report(struct avd_dev *avd, const char *what,
+				const struct avd_tunable *t, unsigned int n,
+				const u32 *before)
+{
+	void __iomem *base = avd->pm.axi2af;
+
+	for (unsigned int i = 0; i < n; i++) {
+		u32 v = readl(base + t[i].off);
+		u32 m = t[i].mask & ~AVD_DAISY_FLOW_LOAD;
+
+		if ((v & m) == (t[i].val & m))
+			continue;
+		if (before)
+			dev_dbg(avd->dev, "AXI2AF %s +0x%04x mask 0x%08x wrote 0x%08x reads 0x%08x was 0x%08x\n",
+				what, t[i].off, t[i].mask, t[i].val, v, before[i]);
+		else
+			dev_dbg(avd->dev, "AXI2AF %s +0x%04x mask 0x%08x wrote 0x%08x reads 0x%08x\n",
+				what, t[i].off, t[i].mask, t[i].val, v);
+	}
+}
+
+/* At every power-up, before the decoder CPU starts. */
+void avd_pm_apply_axi_daisy(struct avd_dev *avd)
+{
+	u32 before[ARRAY_SIZE(avd_daisy_flow_up) + ARRAY_SIZE(avd_daisy_flow_dn)];
+	unsigned int ok;
+
+	if (!avd->pm.axi2af)
+		return;
+	avd_pm_daisy_snap(avd->pm.axi2af, avd_daisy_flow_up,
+			  ARRAY_SIZE(avd_daisy_flow_up), before);
+	avd_pm_daisy_snap(avd->pm.axi2af, avd_daisy_flow_dn,
+			  ARRAY_SIZE(avd_daisy_flow_dn),
+			  before + ARRAY_SIZE(avd_daisy_flow_up));
+	ok = avd_pm_write_daisy_tunables(avd->pm.axi2af);
+	if (ok == AVD_DAISY_TUNABLES || daisy_reports >= 2)
+		return;
+	daisy_reports++;
+	dev_warn(avd->dev, "AXI2AF bridge: %u of %u entries read back\n",
+		 ok, AVD_DAISY_TUNABLES);
+	avd_pm_daisy_report(avd, "up", avd_daisy_flow_up,
+			    ARRAY_SIZE(avd_daisy_flow_up), before);
+	avd_pm_daisy_report(avd, "dn", avd_daisy_flow_dn,
+			    ARRAY_SIZE(avd_daisy_flow_dn),
+			    before + ARRAY_SIZE(avd_daisy_flow_up));
+	avd_pm_daisy_report(avd, "axi2af", avd_daisy_axi2af,
+			    ARRAY_SIZE(avd_daisy_axi2af), NULL);
+}
+
+int avd_pm_map_axi2af(struct avd_dev *avd)
+{
+	struct resource *ctrl;
+
+	if (!of_device_is_compatible(avd->dev->of_node, "apple,t8132-avd"))
+		return 0;
+	ctrl = platform_get_resource_byname(avd->pdev, IORESOURCE_MEM, "ctrl");
+	if (!ctrl || ctrl->start < AVD_AXI2AF_CTRL_OFFSET)
+		return 0;
+	avd->pm.axi2af = devm_ioremap(avd->dev, ctrl->start - AVD_AXI2AF_CTRL_OFFSET,
+				      AVD_AXI2AF_SIZE);
+	return avd->pm.axi2af ? 0 : -ENOMEM;
 }
 
 void avd_pm_disable(struct avd_dev *avd)

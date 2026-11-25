@@ -727,6 +727,9 @@ static int avd_probe(struct platform_device *pdev)
 	ret = avd_pm_map_piodma(avd);
 	if (ret)
 		return ret;
+	ret = avd_pm_map_axi2af(avd);
+	if (ret)
+		return ret;
 
 	avd->domain = iommu_get_domain_for_dev(avd->dev);
 
