@@ -7293,9 +7293,13 @@ static int apple_sleep_read_wake_sources(struct apple_sleep *s)
 	return 0;
 }
 
+static void apple_sleep_iounmap(void *base);
+static void apple_sleep_put_node(void *np);
+
+/* Held for the driver's lifetime, and released if a later step fails the probe. */
 static int apple_sleep_map_displays(struct apple_sleep *s)
 {
-	int i;
+	int i, ret;
 
 	for (i = 0; i < s->soc->ndisp; i++) {
 		struct device_node *np;
@@ -7308,6 +7312,9 @@ static int apple_sleep_map_displays(struct apple_sleep *s)
 		}
 		if (!np)
 			return dev_err_probe(s->dev, -ENODEV, "no display coprocessor %d\n", i);
+		ret = devm_add_action_or_reset(s->dev, apple_sleep_put_node, np);
+		if (ret)
+			return ret;
 		s->display[i].np = np;
 
 		index = of_property_match_string(np, "reg-names", "coproc");
@@ -7316,6 +7323,12 @@ static int apple_sleep_map_displays(struct apple_sleep *s)
 		s->display[i].asc = of_iomap(np, index);
 		if (!s->display[i].asc)
 			return dev_err_probe(s->dev, -ENOMEM, "cannot map %pOF\n", np);
+		ret = devm_add_action_or_reset(s->dev, apple_sleep_iounmap,
+					       (void __force *)s->display[i].asc);
+		if (ret) {
+			s->display[i].asc = NULL;
+			return ret;
+		}
 	}
 
 	return 0;

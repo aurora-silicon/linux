@@ -123,8 +123,13 @@ static u32 t6030_block(struct apple_sleep *s, u32 b)
 		return 0;
 	if (t->blk[b])
 		return t->blk_size[b];
-	/* An entry's alignment is checked against the block: the block's own must hold too */
-	if (of_address_to_resource(s->dev->of_node, b, &res) || !IS_ALIGNED(res.start, sizeof(u64)))
+	/*
+	 * An entry's alignment is checked against the block: the block's own must hold too.
+	 * Its size bounds every entry's offset, as a u32.
+	 */
+	if (of_address_to_resource(s->dev->of_node, b, &res) ||
+	    !IS_ALIGNED(res.start, sizeof(u64)) || !resource_size(&res) ||
+	    resource_size(&res) > U32_MAX)
 		return 0;
 	/* Shared with the drivers of those blocks: not claimed */
 	t->blk[b] = apple_sleep_ioremap(s->dev, &res);
