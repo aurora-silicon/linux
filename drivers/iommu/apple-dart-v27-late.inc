@@ -537,14 +537,38 @@ static bool apple_dart_v27_cycle_same(struct apple_dart_v27_cycle *c, unsigned i
 	return true;
 }
 
-/* Back to usable: ungated, then lit, which runs the invalidations it held. */
-static void apple_dart_v27_cycle_release(struct apple_dart_v27_cycle *c)
+/* The whole TLB, under the lock its other commands take */
+static int apple_dart_v27_cycle_flush(struct apple_dart *d)
+{
+	unsigned long flags;
+	u32 val;
+	int ret;
+
+	spin_lock_irqsave(&d->lock, flags);
+	writel(FIELD_PREP(DART_T8110_TLB_CMD_OP, DART_T8110_TLB_CMD_OP_FLUSH_ALL),
+	       d->regs + DART_T8110_TLB_CMD);
+	ret = readl_poll_timeout_atomic(d->regs + DART_T8110_TLB_CMD, val,
+					!(val & DART_T8110_TLB_CMD_BUSY), 1,
+					DART_T8110_FLUSH_BUSY_TIMEOUT);
+	spin_unlock_irqrestore(&d->lock, flags);
+	return ret;
+}
+
+/*
+ * Back to usable: ungated, then lit, so that maps from now on flush as they go. A map that
+ * still found it dark left its invalidation for later: the flush after the store covers it,
+ * whether or not it has marked the TLB stale yet.
+ */
+static int apple_dart_v27_cycle_release(struct apple_dart_v27_cycle *c)
 {
 	struct apple_dart *d = c->dart;
 
 	scoped_guard(spinlock_irqsave, &d->lock)
 		WRITE_ONCE(d->commands_gated, false);
-	apple_dart_power_dark(d->dev, false);
+	WRITE_ONCE(d->display_dark, false);
+	smp_mb();
+	WRITE_ONCE(d->display_tlb_stale, false);
+	return apple_dart_v27_cycle_flush(d);
 }
 
 int apple_dart_v27_cycle_off(struct device *dev, struct device *owner,
@@ -581,9 +605,9 @@ int apple_dart_v27_cycle_off(struct device *dev, struct device *owner,
 	ret = ret ?: idle;
 	if (ret) {
 		dev_info(owner, "V27 DART cycle: %s not idle: %d\n", dev_name(dev), ret);
-		apple_dart_v27_cycle_release(c);
+		idle = apple_dart_v27_cycle_release(c);
 		kfree(c);
-		return ret;
+		return idle ?: ret;
 	}
 	for (sid = 0; sid < d->num_streams; sid++) {
 		c->tcr[sid] = readl(d->regs + DART_TCR(d, sid));
@@ -608,8 +632,9 @@ int apple_dart_v27_cycle_off(struct device *dev, struct device *owner,
 EXPORT_SYMBOL_GPL(apple_dart_v27_cycle_off);
 
 /*
- * The domains are on again. A DART that lost what it held stays dark and gated: nothing may
- * translate through tables it no longer has.
+ * The domains are on again. A DART that lost what it held, or whose streams or TLB don't come
+ * back as they were, stays dark and gated: nothing may translate through tables it no longer
+ * has. Either way the hold is over: the cycle is freed.
  */
 int apple_dart_v27_cycle_on(struct apple_dart_v27_cycle *c)
 {
@@ -639,17 +664,32 @@ int apple_dart_v27_cycle_on(struct apple_dart_v27_cycle *c)
 	}
 	writel(c->diag_lock, d->regs + DART_T8110_DIAG_LOCK);
 	writel(c->error_mask, d->regs + DART_T8110_ERROR_MASK);
+	/* Exactly the streams it had: one enabled since, with no client of ours, goes off. */
 	for (word = 0; word < BITS_TO_U32(d->num_streams); word++) {
-		writel(c->enabled[word], d->regs + DART_T8110_ENABLE_STREAMS + 4 * word);
-		now = readl(d->regs + DART_T8110_ENABLE_STREAMS + 4 * word);
-		if ((now & c->enabled[word]) != c->enabled[word]) {
+		void __iomem *enable = d->regs + DART_T8110_ENABLE_STREAMS + 4 * word;
+
+		writel(c->enabled[word], enable);
+		now = readl(enable);
+		if (now & ~c->enabled[word]) {
+			writel(now & ~c->enabled[word],
+			       d->regs + DART_T8110_DISABLE_STREAMS + 4 * word);
+			now = readl(enable);
+		}
+		if (now != c->enabled[word]) {
 			dev_err(c->owner, "V27 DART cycle: %s streams %#x, had %#x (word %u)\n",
 				dev_name(d->dev), now, c->enabled[word], word);
 			ret = -EIO;
 			goto out;
 		}
 	}
-	apple_dart_v27_cycle_release(c);
+	ret = apple_dart_v27_cycle_release(c);
+	if (ret) {
+		/* Not known to be clean: dark and gated again, as one that lost its state. */
+		dev_err(c->owner, "V27 DART cycle: %s flush once lit: %d\n", dev_name(d->dev),
+			ret);
+		apple_dart_power_dark(d->dev, true);
+		apple_dart_quiesce_commands(d->dev);
+	}
 out:
 	put_device(d->dev);
 	kfree(c);
