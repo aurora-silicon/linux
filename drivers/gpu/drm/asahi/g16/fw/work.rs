@@ -5,6 +5,11 @@
 //! Render records use 66 TA and 82 FS register records, 0x4c-byte
 //! timestamp commands and 0x40-byte dependencies. Each register is an
 //! unaligned little-endian `(u32 selector, u64 value)` pair.
+//!
+//! Each work type's `Layout` holds what moves between firmware ABIs: 26B123 widens the
+//! per-work binding generation from 1 to 8 bytes at the same offset, shifting later fixed
+//! fields by 7 bytes and leaving the 16-byte span between the completion target and the
+//! auxiliary target zeroed by the host.
 
 /// Microsequence opcodes.
 pub(crate) mod op {
@@ -60,6 +65,11 @@ pub(crate) mod compute;
 /// TA work image and microsequence.
 pub(crate) mod ta {
     pub(crate) const WORK_SIZE: usize = 0x940;
+    /// Active non-zero head (`0..HEAD_ACTIVE_SIZE`) and tail (`TAIL_ACTIVE_START..WORK_SIZE`)
+    /// spans of a TA work image (including two optional SCS register records). The intervening
+    /// zero gap is cleared on full scrubs and skipped on clean same-VM reuse.
+    pub(crate) const HEAD_ACTIVE_SIZE: usize = 0x370;
+    pub(crate) const TAIL_ACTIVE_START: usize = 0x740;
     pub(crate) const SEQ_SIZE: usize = 0x300;
     pub(crate) const SEQ_OBJECT: usize = 0x1000;
     pub(crate) const REGS: usize = 0x40;
@@ -70,6 +80,44 @@ pub(crate) mod ta {
     pub(crate) const TS_END: usize = 0x21c;
     pub(crate) const FINALIZE: usize = 0x268;
     pub(crate) const END: usize = 0x2fc;
+    /// u32 of the StartTA command: nonzero when the stage's register list enables SCS
+    /// (`compute::START_SCS`).
+    pub(crate) const START_SCS: usize = 0x60;
+    /// The binding generation.
+    pub(crate) const GENERATION: usize = 0x917;
+
+    /// TA work fields that move between firmware ABIs.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) struct Layout {
+        /// Width of the binding generation at [`GENERATION`].
+        pub(crate) generation_bytes: usize,
+        /// Target of the finalize record's +0x85 pointer.
+        pub(crate) completion: usize,
+        /// Target of the timestamp records' +0x2c ("auxiliary") pointer.
+        pub(crate) auxiliary: usize,
+    }
+
+    pub(crate) const V25G83: Layout = Layout {
+        generation_bytes: 1,
+        completion: 0x918,
+        auxiliary: 0x928,
+    };
+
+    pub(crate) const V26B123: Layout = Layout {
+        generation_bytes: 8,
+        completion: 0x91f,
+        auxiliary: 0x92f,
+    };
+
+    const fn valid(l: &Layout) -> bool {
+        l.completion == GENERATION + l.generation_bytes
+            && l.auxiliary == l.completion + 0x10
+            && l.auxiliary + 8 <= WORK_SIZE
+    }
+    const _: () = assert!(valid(&V25G83) && valid(&V26B123));
+    const _: () = assert!(REGS + (SEL.len() + 2) * super::REG_RECORD <= HEAD_ACTIVE_SIZE);
+    const _: () = assert!(HEAD_ACTIVE_SIZE <= TAIL_ACTIVE_START);
+    const _: () = assert!(TAIL_ACTIVE_START <= WORK_SIZE);
     pub(crate) const SEL: [u32; 66] = [
         0x1748, 0x10141, 0x1c039, 0x1c9c8, 0x1c0a1, 0x1c031, 0x1c9c0, 0x1c051, 0x1c061, 0x10149,
         0x10139, 0x10111, 0x1c9b0, 0x10119, 0x1c9b8, 0x1c958, 0x1c950, 0x1c930, 0x1c880, 0x1c079,
@@ -84,6 +132,11 @@ pub(crate) mod ta {
 /// FS work image and microsequence.
 pub(crate) mod fs {
     pub(crate) const WORK_SIZE: usize = 0xca0;
+    /// Active non-zero head (`0..HEAD_ACTIVE_SIZE`) and tail (`TAIL_ACTIVE_START..WORK_SIZE`)
+    /// spans of an FS work image (including two optional SCS register records). The intervening
+    /// zero gap is cleared on full scrubs and skipped on clean same-VM reuse.
+    pub(crate) const HEAD_ACTIVE_SIZE: usize = 0x470;
+    pub(crate) const TAIL_ACTIVE_START: usize = 0x780;
     pub(crate) const SEQ_SIZE: usize = 0x380;
     pub(crate) const SEQ_OBJECT: usize = 0x1000;
     pub(crate) const REGS: usize = 0x80;
@@ -92,6 +145,49 @@ pub(crate) mod fs {
     pub(crate) const TS_END: usize = 0x23c;
     pub(crate) const FINALIZE: usize = 0x288;
     pub(crate) const END: usize = 0x344;
+    /// u32 of the StartFS command: nonzero when the stage's register list enables SCS
+    /// (`compute::START_SCS`).
+    pub(crate) const START_SCS: usize = 0x78;
+    /// The binding generation.
+    pub(crate) const GENERATION: usize = 0xc5f;
+
+    /// FS work fields that move between firmware ABIs.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) struct Layout {
+        /// Width of the binding generation at [`GENERATION`].
+        pub(crate) generation_bytes: usize,
+        /// Target of the finalize record's +0xa5 pointer.
+        pub(crate) completion: usize,
+        /// Target of the timestamp records' +0x2c ("auxiliary") pointer.
+        pub(crate) auxiliary: usize,
+        /// u8 flag the host sets to 1.
+        pub(crate) flag: usize,
+    }
+
+    pub(crate) const V25G83: Layout = Layout {
+        generation_bytes: 1,
+        completion: 0xc60,
+        auxiliary: 0xc70,
+        flag: 0xc84,
+    };
+
+    pub(crate) const V26B123: Layout = Layout {
+        generation_bytes: 8,
+        completion: 0xc67,
+        auxiliary: 0xc77,
+        flag: 0xc8b,
+    };
+
+    const fn valid(l: &Layout) -> bool {
+        l.completion == GENERATION + l.generation_bytes
+            && l.auxiliary == l.completion + 0x10
+            && l.flag == l.completion + 0x24
+            && l.flag < WORK_SIZE
+    }
+    const _: () = assert!(valid(&V25G83) && valid(&V26B123));
+    const _: () = assert!(REGS + (SEL.len() + 2) * super::REG_RECORD <= HEAD_ACTIVE_SIZE);
+    const _: () = assert!(HEAD_ACTIVE_SIZE <= TAIL_ACTIVE_START);
+    const _: () = assert!(TAIL_ACTIVE_START <= WORK_SIZE);
     pub(crate) const SEL: [u32; 82] = [
         0x1739, 0x10009, 0x15379, 0x15381, 0x15369, 0x15371, 0x15131, 0x15139, 0x100a1, 0x15069,
         0x15071, 0x16058, 0x10019, 0x100b1, 0x16030, 0x100d9, 0xa301, 0x10791, 0x16098, 0x15109,
@@ -137,4 +233,8 @@ pub(crate) mod initbm {
 /// Per-pass scene including UMA results and embedded prefix records.
 pub(crate) mod scene {
     pub(crate) const SIZE: usize = 0x4000;
+    /// Active prefix of a render scene touched by the host or firmware (`0x000..0x780`,
+    /// rounded up to 2 KiB). Full pass scrubs zero the entire `SIZE`; clean same-VM reuse only
+    /// rewrites `0..ACTIVE_SIZE`.
+    pub(crate) const ACTIVE_SIZE: usize = 0x800;
 }

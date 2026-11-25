@@ -1053,6 +1053,8 @@ struct G18RoleSlot {
 struct G18Session {
     roles: [G18RoleSlot; 2],
     states: [Arc<G18RoleState>; 2],
+    /// The CLPC's GPU input: memory and fabric floor while jobs run.
+    demand: crate::g18::demand::G18Demand,
     memory: Option<KBox<G18FirmwareMemory>>,
     queue_probe: Option<G18QueueProbe>,
     render_job: Option<KBox<crate::g18::runtime::graphics_job::G18GraphicsJob>>,
@@ -2055,9 +2057,11 @@ fn prepare_firmware_session(pdev: &platform::Device<Core<'_>>, probe: T8152Probe
     if roles[0].role != G18Role::Gfx || roles[1].role != G18Role::Gfx1 {
         return Err(EINVAL);
     }
+    let demand = probe.demand;
     let session = KBox::new(G18Session {
         roles,
         states,
+        demand,
         memory: None,
         queue_probe: None,
         render_job: None,

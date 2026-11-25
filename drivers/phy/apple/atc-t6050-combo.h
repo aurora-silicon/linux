@@ -122,13 +122,13 @@ static void combo_pipe_fault(struct t6050_dp *dp, const char *what, int ret)
 /*
  * What the combo PHY gained for a deep sleep outside its sleep callbacks (a wrapper domain
  * still held at a stop is released, a safe state with a domain still held is stopped again,
- * the always-on domain's hold over the sleep) is in force on the boards with a T6050 sleep,
- * the J714s and the J716c. On another T6050 board the stop, the safe state and the probe are
+ * the always-on domain's hold over the sleep) is in force on the boards whose device tree
+ * describes a T6050 sleep. On another T6050 board the stop, the safe state and the probe are
  * as before.
  */
 static bool combo_sleep_board(void)
 {
-	return of_machine_is_compatible("apple,j714s") || of_machine_is_compatible("apple,j716c");
+	return apple_t6050_sleep_described();
 }
 
 static bool combo_domains_held(struct t6050_dp *dp)
@@ -241,6 +241,8 @@ static int combo_orientation(struct t6050_dp *dp, enum typec_orientation orienta
 	int ret;
 
 	guard(mutex)(&dp->lock);
+	if (dp->s2idle_frozen)
+		return -EBUSY;
 	if (dp->faulted)
 		return -EIO;
 	if (orientation != TYPEC_ORIENTATION_NONE && orientation != TYPEC_ORIENTATION_NORMAL &&
@@ -308,6 +310,8 @@ static int combo_mux(struct t6050_dp *dp, struct typec_mux_state *state)
 		return -EOPNOTSUPP;
 	}
 	guard(mutex)(&dp->lock);
+	if (dp->s2idle_frozen)
+		return -EBUSY;
 	if (dp->faulted)
 		return -EIO;
 	/* SAFE with a domain still held: a sleep kept it, and nothing came back on the port. */
@@ -401,6 +405,61 @@ static void combo_resume(struct t6050_dp *dp)
 			 dp->sleep_mode, ret);
 	else
 		dev_info(dp->dev, "mode %d back: the sleep did not happen\n", dp->sleep_mode);
+}
+
+/*
+ * Suspend-to-idle leaves an active combo PHY running: t6050_dp_suspend_late()
+ * only quiesces for firmware sleep. Hold the active virtual genpd devices out
+ * of genpd_suspend_noirq() so phymxwrap (and common/usb/dp gates) are not
+ * powered off under the running PHY CPU. Close PHY mode and clock changes
+ * under the same mutex as the late snapshot, including work that can still
+ * run after the freezer. Reopen after noirq on resume or suspend unwind.
+ */
+static void combo_s2idle_hold(struct t6050_dp *dp)
+{
+	guard(mutex)(&dp->lock);
+	dp->s2idle_frozen = true;
+	if (dp->faulted || dp->combo_mode == COMBO_SAFE)
+		return;
+	for (unsigned int i = 0; i < dp->ndomains; i++) {
+		if (dp->domain[i].active &&
+		    !(i == 0 && dp->aon_syscore) &&
+		    !(dp->s2idle_domain_syscore & BIT(i))) {
+			dev_pm_syscore_device(dp->domain[i].dev, true);
+			dp->s2idle_domain_syscore |= BIT(i);
+		}
+	}
+	if (dp->dp_gates) {
+		for (unsigned int i = 0; i < ATC_DP_TUNNELS; i++) {
+			if (dp->dp_gate[i].active &&
+			    !(dp->s2idle_gate_syscore & BIT(i))) {
+				dev_pm_syscore_device(dp->dp_gate[i].dev, true);
+				dp->s2idle_gate_syscore |= BIT(i);
+			}
+		}
+	}
+}
+
+static void combo_s2idle_release(struct t6050_dp *dp)
+{
+	guard(mutex)(&dp->lock);
+	if (dp->s2idle_domain_syscore) {
+		for (unsigned int i = 0; i < dp->ndomains; i++) {
+			if (dp->s2idle_domain_syscore & BIT(i))
+				dev_pm_syscore_device(dp->domain[i].dev, false);
+		}
+		dp->s2idle_domain_syscore = 0;
+	}
+	if (dp->s2idle_gate_syscore) {
+		for (unsigned int i = 0; i < ATC_DP_TUNNELS; i++) {
+			if (dp->s2idle_gate_syscore & BIT(i))
+				dev_pm_syscore_device(dp->dp_gate[i].dev, false);
+		}
+		dp->s2idle_gate_syscore = 0;
+	}
+	dp->s2idle_frozen = false;
+	if (dp->s2idle_clock_stops)
+		queue_work(system_freezable_wq, &dp->s2idle_clock_work);
 }
 
 /*
@@ -741,7 +800,11 @@ static int combo_setup(struct platform_device *pdev, struct t6050_dp *dp)
 			return PTR_ERR(dp->combo_phy[i]);
 		phy_set_drvdata(dp->combo_phy[i], dp);
 	}
-	/* A deep sleep's hold of the always-on domain: see combo_sleep_board(). */
+	/*
+	 * Deep-sleep hold of the always-on domain (board gate left for the
+	 * deep-sleep pass); s2idle hold runs for all T6050 combo PHYs in
+	 * t6050_dp_suspend_late() / t6050_dp_resume_early().
+	 */
 	if (!combo_sleep_board())
 		return 0;
 	dp->pm_nb.notifier_call = combo_pm_notify;

@@ -46,6 +46,20 @@ impl Registry {
         })
     }
 
+    /// See `recovery::Queues::fault_culprit`.
+    pub(in crate::g17::runtime) fn fault_culprit(&self, slots: u64) -> Option<u128> {
+        crate::g17::recovery::fault_qids(slots, |visit| {
+            for pair in self.render.entries.iter().flatten().filter_map(|entry| entry.pair.as_ref()) {
+                let qids = pair.qids().into_iter().fold(0, |mask, qid| mask | 1u128 << qid);
+                pair.visit_contexts(&mut |context| visit(qids, context));
+            }
+            for queue in self.compute.iter().flatten().filter_map(|entry| entry.queue.as_deref()) {
+                let qid = 1u128 << queue.qid();
+                queue.visit_contexts(&mut |context| visit(qid, context));
+            }
+        })
+    }
+
     pub(in crate::g17::runtime) fn publish_render_recovery_targets(&self) -> Option<Error> {
         let mut failure = None;
         for pair in self.render.entries.iter().flatten()

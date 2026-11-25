@@ -142,6 +142,12 @@ pub(crate) fn encode(
         }
         _ => return Err(Error::Address),
     };
+    write_record(output, physical, va, bytes, requested, register, mode)
+}
+
+/// Common 0x28-byte record used by the single-role G14G and G15G interfaces.
+pub(crate) fn write_record(output: &mut [u8], physical: u64, va: u64, bytes: u32,
+                           requested: u32, register: u64, mode: u64) -> Result<(), Error> {
     let bytes_out = output.get_mut(..RECORD_BYTES).ok_or(Error::Size)?;
     bytes_out.fill(0);
     bytes_out[0..8].copy_from_slice(&physical.to_le_bytes());
