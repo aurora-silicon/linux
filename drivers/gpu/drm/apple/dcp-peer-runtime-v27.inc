@@ -159,13 +159,35 @@ int dcp_peer_modeset_v27(struct apple_dcp *dcp, u32 timing, u32 color, u32 min_v
 	 * pair installed when its timing and color are still current. If
 	 * either engine refuses the update, rebuild both with the new rate.
 	 */
-	if (vrr_only && !dcp_peer_param_v27(dcp, peer, 15, 3, min_vrr)) {
-		guard(mutex)(&dcp_peer_lock);
-		if (dcp_peer_vrr_only_v27(&dcp->peer_frames, timing, color,
-					  min_vrr, dcp->output_hdr)) {
-			dcp->peer_frames.min_vrr = min_vrr;
-			dev_dbg(dcp->dev, "paired adaptive sync minimum %#x\n", min_vrr);
-			ret = 0;
+	if (vrr_only) {
+		bool still_owned, updated = false;
+
+		ret = dcp_peer_param_v27(dcp, peer, 15, 3, min_vrr);
+		scoped_guard(mutex, &dcp_peer_lock) {
+			still_owned = dcp->peer_reserved == peer &&
+				      peer->peer_owner == dcp;
+			limited = still_owned &&
+				  dcp_peer_limited_pair_locked(dcp, &prepared);
+			if (!ret && !limited && still_owned &&
+			    dcp->peer_tiling.modeset_complete &&
+			    peer->peer_tiling.modeset_complete &&
+			    dcp_peer_vrr_only_v27(&dcp->peer_frames, timing,
+						  color, min_vrr,
+						  dcp->output_hdr)) {
+				dcp->peer_frames.min_vrr = min_vrr;
+				dev_dbg(dcp->dev, "paired adaptive sync minimum %#x\n", min_vrr);
+				updated = true;
+			}
+		}
+		if (updated)
+			goto peer_unlock;
+		if (!still_owned) {
+			ret = -EBUSY;
+			goto peer_unlock;
+		}
+		if (limited) {
+			ret = prepared ? dcp_peer_limited_stop_v27(dcp, peer)
+				       : -EOPNOTSUPP;
 			goto peer_unlock;
 		}
 	}
