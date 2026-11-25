@@ -13,7 +13,7 @@ b = s.index('\nvoid dcp_handle_hotplug_actions', a)
 body = s[a:b]
 if '--negative-control' in sys.argv:
     a = body.index('\t} else if (dcp_is_ext26(dcp) && crtc && crtc->state &&')
-    b = body.index('\t} else if (dcp_t604x_relinks() && crtc && crtc->state &&', a)
+    b = body.index('\t} else if (dcp_t6040_relinks() && crtc && crtc->state &&', a)
     body = body[:a] + body[b:]
 
 pre = r'''
@@ -46,7 +46,7 @@ static void acquire(void) {
 #define DRM_MODESET_LOCK_ALL_END(dev, ctx, ret) } while (0)
 static bool dcp_is_ext26(struct apple_dcp *d) { return d->native; }
 static bool dcp_has_mode(struct apple_dcp *d, const struct mode *m) { return d->admitted && m->id == 1; }
-static bool dcp_t604x_relinks(void) { return t604x; }
+static bool dcp_t6040_relinks(void) { return t604x; }
 static bool dcp_mode_settable(struct apple_dcp *d, const struct mode *m) { return !unlisted; }
 static bool dcp_typec_follows_crtc(struct apple_dcp *d) { return follows; }
 static bool dcp_crtc_lost_route(struct drm_crtc *c, struct apple_connector *p) { return lost; }
