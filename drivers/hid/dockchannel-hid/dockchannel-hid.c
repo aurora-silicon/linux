@@ -185,6 +185,12 @@ struct dchid_iface {
 	bool gpio_announced;
 
 	struct mutex out_mutex;
+	/*
+	 * Protects the pending command (out_flags, out_report, retcode,
+	 * resp_buf, resp_size, tx_seq) against the receive path, which
+	 * completes it without out_mutex.
+	 */
+	spinlock_t resp_lock;
 	u32 out_flags;
 	int out_report;
 	u32 retcode;
@@ -194,6 +200,7 @@ struct dchid_iface {
 
 	u32 keyboard_layout_id;
 	u32 power_method;
+	bool pm_explicit;
 	bool firmware_managed_reset;
 };
 
@@ -251,6 +258,7 @@ static struct dchid_iface *
 dchid_get_interface(struct dockchannel_hid *dchid, int index, const char *name)
 {
 	u32 power_method = DCHID_POWER_METHOD_1;
+	bool pm_explicit = false;
 	bool firmware_managed_reset = false;
 	struct device_node *of_node = NULL;
 	struct dchid_iface *iface;
@@ -279,7 +287,8 @@ dchid_get_interface(struct dockchannel_hid *dchid, int index, const char *name)
 			return NULL;
 		}
 
-		of_property_read_u32(of_node, "apple,power-method", &power_method);
+		pm_explicit = !of_property_read_u32(of_node, "apple,power-method",
+						    &power_method);
 		firmware_managed_reset =
 			of_property_read_bool(of_node, "apple,firmware-managed-reset");
 		if (firmware_managed_reset &&
@@ -313,11 +322,13 @@ dchid_get_interface(struct dockchannel_hid *dchid, int index, const char *name)
 	iface->dchid = dchid;
 	iface->of_node = of_node;
 	iface->power_method = power_method;
+	iface->pm_explicit = pm_explicit;
 	iface->firmware_managed_reset = firmware_managed_reset;
 	iface->out_report = -1;
 	init_completion(&iface->out_complete);
 	init_completion(&iface->ready);
 	mutex_init(&iface->out_mutex);
+	spin_lock_init(&iface->resp_lock);
 	iface->wq = alloc_ordered_workqueue("dchid-%s", WQ_MEM_RECLAIM, iface->name);
 	if (!iface->wq)
 		goto err_put_node;
@@ -424,20 +435,25 @@ static int dchid_send(struct dchid_iface *iface, u32 flags, void *msg, size_t si
 	return ret;
 }
 
-static int dchid_cmd(struct dchid_iface *iface, u32 type, u32 req,
-		     void *data, size_t size, void *resp_buf, size_t resp_size)
+static int dchid_cmd_retcode(struct dchid_iface *iface, u32 type, u32 req,
+			     void *data, size_t size, void *resp_buf,
+			     size_t resp_size, u32 *retcode_out)
 {
 	int ret;
-	int report_id = *(u8*)data;
+	int report_id = *(u8 *)data;
+	u32 fw_retcode = 0;
 
 	mutex_lock(&iface->out_mutex);
 
+	spin_lock(&iface->resp_lock);
 	WARN_ON(iface->out_report != -1);
 	iface->out_report = report_id;
 	iface->out_flags = FIELD_PREP(FLAGS_GROUP, type) | FIELD_PREP(FLAGS_REQ, req);
 	iface->resp_buf = resp_buf;
 	iface->resp_size = resp_size;
+	iface->retcode = 0;
 	reinit_completion(&iface->out_complete);
+	spin_unlock(&iface->resp_lock);
 
 	ret = dchid_send(iface, iface->out_flags, data, size);
 	if (ret < 0)
@@ -451,26 +467,50 @@ static int dchid_cmd(struct dchid_iface *iface, u32 type, u32 req,
 	}
 
 	ret = iface->resp_size;
-	if (iface->retcode) {
+	fw_retcode = iface->retcode;
+	if (fw_retcode) {
 		dev_err(iface->dchid->dev,
 			"output report 0x%x to iface %d (%s) failed with err 0x%x\n",
-			report_id, iface->index, iface->name, iface->retcode);
+			report_id, iface->index, iface->name, fw_retcode);
 		ret = -EIO;
 	}
 
 done:
+	/*
+	 * Retire the command before the caller's buffer goes away: an
+	 * acknowledgment that arrives from now on no longer matches it.
+	 */
+	spin_lock(&iface->resp_lock);
 	iface->tx_seq++;
 	iface->out_report = -1;
 	iface->out_flags = 0;
 	iface->resp_buf = NULL;
 	iface->resp_size = 0;
+	spin_unlock(&iface->resp_lock);
 	mutex_unlock(&iface->out_mutex);
+	if (retcode_out)
+		*retcode_out = fw_retcode;
 	return ret;
+}
+
+static int dchid_cmd(struct dchid_iface *iface, u32 type, u32 req,
+		     void *data, size_t size, void *resp_buf, size_t resp_size)
+{
+	return dchid_cmd_retcode(iface, type, req, data, size, resp_buf,
+				 resp_size, NULL);
+}
+
+static int dchid_comm_cmd_retcode(struct dockchannel_hid *dchid, void *cmd,
+				  size_t size, u32 *retcode_out)
+{
+	return dchid_cmd_retcode(dchid->comm, HID_FEATURE_REPORT,
+				 REQ_SET_REPORT, cmd, size, NULL, 0,
+				 retcode_out);
 }
 
 static int dchid_comm_cmd(struct dockchannel_hid *dchid, void *cmd, size_t size)
 {
-	return dchid_cmd(dchid->comm, HID_FEATURE_REPORT, REQ_SET_REPORT, cmd, size, NULL, 0);
+	return dchid_comm_cmd_retcode(dchid, cmd, size, NULL);
 }
 
 static int dchid_host_state(struct dockchannel_hid *dchid, u8 state)
@@ -488,15 +528,20 @@ static int dchid_enable_interface(struct dchid_iface *iface)
 	return dchid_comm_cmd(iface->dchid, msg, sizeof(msg));
 }
 
-static int dchid_reset_interface(struct dchid_iface *iface, int state)
+static int dchid_reset_interface_retcode(struct dchid_iface *iface, int state,
+					 u32 *retcode_out)
 {
 	u8 msg[DCHID_PM1_CMD_SIZE];
 	u8 msg2[DCHID_PM2_CMD_SIZE];
 	int ret;
 
+	if (retcode_out)
+		*retcode_out = 0;
+
 	if (!iface->dchid->use_ring) {
 		dchid_pm1_command(iface->index, state, msg);
-		return dchid_comm_cmd(iface->dchid, msg, sizeof(msg));
+		return dchid_comm_cmd_retcode(iface->dchid, msg, sizeof(msg),
+					      retcode_out);
 	}
 
 	/*
@@ -531,7 +576,13 @@ static int dchid_reset_interface(struct dchid_iface *iface, int state)
 	}
 #endif
 	dchid_pm2_command(iface->index, state, true, msg2);
-	return dchid_comm_cmd(iface->dchid, msg2, sizeof(msg2));
+	return dchid_comm_cmd_retcode(iface->dchid, msg2, sizeof(msg2),
+				      retcode_out);
+}
+
+static int dchid_reset_interface(struct dchid_iface *iface, int state)
+{
+	return dchid_reset_interface_retcode(iface, state, NULL);
 }
 
 static int dchid_register_ring(struct dockchannel_hid *dchid)
@@ -595,7 +646,7 @@ static int dchid_pm2_set_power(struct dchid_iface *iface, u8 state)
 	} else {
 		bool off = state == DCHID_POWER_STATE_OFF;
 
-		ret = gpiod_set_value_cansleep(dchid->afe_reset, off);
+		ret = gpiod_direction_output(dchid->afe_reset, off);
 		if (ret < 0) {
 			dev_err(dchid->dev, "%s: failed to %s the AFE reset: %d\n",
 				iface->name, off ? "assert" : "release", ret);
@@ -721,9 +772,14 @@ static int dchid_request_gpio(struct dchid_iface *iface)
 	dev_dbg(iface->dchid->dev, "Requesting GPIO %s#%d: %s\n",
 		iface->name, iface->gpio_id, iface->gpio_name);
 
-	/* A power method 2 interface holds its reset line from probe on. */
-	if (iface->power_method == DCHID_POWER_METHOD_2 &&
+	/* Reuse the AFE reset line held from probe on. */
+	if (iface->dchid->afe_reset &&
 	    !strcmp(iface->gpio_name, "afe-reset")) {
+		if (iface->power_method == DCHID_POWER_METHOD_1) {
+			ret = gpiod_direction_output(iface->dchid->afe_reset, 0);
+			if (ret < 0)
+				return ret;
+		}
 		iface->gpio = iface->dchid->afe_reset;
 		return 0;
 	}
@@ -785,7 +841,7 @@ static int dchid_start_interface(struct dchid_iface *iface)
 				ret = -EINVAL;
 				goto err;
 			}
-			ret = gpiod_set_value_cansleep(iface->dchid->afe_reset, 1);
+			ret = gpiod_direction_output(iface->dchid->afe_reset, 1);
 			if (ret < 0)
 				goto err;
 			fsleep(50 * USEC_PER_MSEC);
@@ -809,10 +865,44 @@ static int dchid_start_interface(struct dchid_iface *iface)
 			if (ret < 0)
 				goto err;
 		} else {
-			ret = dchid_reset_interface(iface, DCHID_POWER_STATE_OFF);
-			/* After a failed AFE power-off the trackpad stays off: no retry. */
-			if (ret >= 0 || !iface->dchid->afe_smc || iface->index != 1)
+			u32 fw_retcode = 0;
+
+			ret = dchid_reset_interface_retcode(iface,
+							    DCHID_POWER_STATE_OFF,
+							    &fw_retcode);
+			if (dchid_pm1_needs_pm2_fallback(ret, fw_retcode,
+							 iface->pm_explicit,
+							 iface->dchid->use_ring,
+							 !!iface->dchid->afe_reset)) {
+				dev_info(iface->dchid->dev,
+					 "%s: power method 1 rejected (0x%x); retrying with power method 2\n",
+					 iface->name, fw_retcode);
+				iface->power_method = DCHID_POWER_METHOD_2;
+				if (iface->dchid->inherited_mtp) {
+					ret = gpiod_direction_output(iface->dchid->afe_reset, 1);
+					if (ret < 0)
+						goto err;
+					fsleep(50 * USEC_PER_MSEC);
+					ret = dchid_send_firmware(iface, fw, size);
+					if (ret < 0) {
+						dev_err(iface->dchid->dev,
+							"Failed to resend %s firmware\n",
+							iface->name);
+						goto err;
+					}
+				} else {
+					ret = dchid_pm2_set_power(iface,
+								  DCHID_POWER_STATE_OFF);
+					if (ret < 0)
+						goto err;
+				}
+				ret = dchid_pm2_set_power(iface, DCHID_POWER_STATE_ON);
+				if (ret < 0)
+					goto err;
+			} else if (ret >= 0 || !iface->dchid->afe_smc || iface->index != 1) {
+				/* After a failed AFE power-off the trackpad stays off: no retry. */
 				dchid_reset_interface(iface, DCHID_POWER_STATE_ON);
+			}
 		}
 	}
 
@@ -1051,16 +1141,26 @@ static int dchid_create_interface(struct dchid_iface *iface)
 
 static void dchid_handle_descriptor(struct dchid_iface *iface, void *hid_desc, size_t desc_len)
 {
-	if (iface->hid) {
+	void *desc;
+
+	/*
+	 * Once the interface is queued for creation the HID core may be
+	 * parsing its descriptor, which must then stay as it is.
+	 */
+	if (iface->hid || iface->creating) {
 		dev_warn(iface->dchid->dev, "Tried to initialize already started interface %s!\n",
 			 iface->name);
 		return;
 	}
 
-	iface->hid_desc = devm_kmemdup(iface->dchid->dev, hid_desc, desc_len, GFP_KERNEL);
-	if (!iface->hid_desc)
+	desc = devm_kmemdup(iface->dchid->dev, hid_desc, desc_len, GFP_KERNEL);
+	if (!desc)
 		return;
 
+	/* An interface has one descriptor: a repeated one replaces it. */
+	if (iface->hid_desc)
+		devm_kfree(iface->dchid->dev, iface->hid_desc);
+	iface->hid_desc = desc;
 	iface->hid_desc_len = desc_len;
 }
 
@@ -1362,26 +1462,29 @@ static void dchid_handle_ack(struct dchid_iface *iface, struct dchid_hdr *hdr, v
 			shdr->length, hdr->length - sizeof(*shdr));
 		return;
 	}
+
+	/* The command must not be retired between the checks and the copy. */
+	spin_lock(&iface->resp_lock);
 	if (shdr->flags != iface->out_flags) {
 		dev_err(iface->dchid->dev,
 			"Received unexpected flags 0x%x on ACK channel (expected 0x%x)\n",
 			shdr->flags, iface->out_flags);
-		return;
+		goto out;
 	}
 
 	if (shdr->length < 1) {
 		dev_err(iface->dchid->dev, "Received length 0 output report ack\n");
-		return;
+		goto out;
 	}
 	if (iface->tx_seq != hdr->seq) {
 		dev_err(iface->dchid->dev, "Received ACK with bad seq (expected %d, got %d)\n",
 			iface->tx_seq, hdr->seq);
-		return;
+		goto out;
 	}
 	if (iface->out_report != payload[0]) {
 		dev_err(iface->dchid->dev, "Received ACK with bad report (expected %d, got %d\n",
 			iface->out_report, payload[0]);
-		return;
+		goto out;
 	}
 
 	/*
@@ -1402,6 +1505,8 @@ static void dchid_handle_ack(struct dchid_iface *iface, struct dchid_hdr *hdr, v
 	iface->out_report = -1;
 	iface->retcode = shdr->retcode;
 	complete(&iface->out_complete);
+out:
+	spin_unlock(&iface->resp_lock);
 }
 
 /*
@@ -1729,6 +1834,12 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 		if (power_method == DCHID_POWER_METHOD_2 && !firmware_managed_reset) {
 			dchid->afe_reset = devm_gpiod_get(dev, "apple,afe-reset",
 							  GPIOD_ASIS);
+			if (IS_ERR(dchid->afe_reset))
+				return dev_err_probe(dev, PTR_ERR(dchid->afe_reset),
+						     "Failed to request the AFE reset line\n");
+		} else if (!firmware_managed_reset && !dchid->use_ring) {
+			dchid->afe_reset = devm_gpiod_get_optional(dev, "apple,afe-reset",
+								   GPIOD_ASIS);
 			if (IS_ERR(dchid->afe_reset))
 				return dev_err_probe(dev, PTR_ERR(dchid->afe_reset),
 						     "Failed to request the AFE reset line\n");

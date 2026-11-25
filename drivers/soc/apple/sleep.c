@@ -1653,9 +1653,18 @@ bool apple_sleep_coproc_stopped(struct device *dev)
 }
 EXPORT_SYMBOL_GPL(apple_sleep_coproc_stopped);
 
+static bool apple_sleep_external_commit;
+
+void apple_sleep_set_commit_stops_coprocs(bool enable)
+{
+	WRITE_ONCE(apple_sleep_external_commit, enable);
+}
+EXPORT_SYMBOL_GPL(apple_sleep_set_commit_stops_coprocs);
+
 bool apple_sleep_commit_stops_coprocs(void)
 {
-	return READ_ONCE(apple_sleep) && pm_suspend_via_firmware();
+	return (READ_ONCE(apple_sleep) || READ_ONCE(apple_sleep_external_commit)) &&
+	       pm_suspend_via_firmware();
 }
 EXPORT_SYMBOL_GPL(apple_sleep_commit_stops_coprocs);
 
@@ -1673,7 +1682,8 @@ static void apple_sleep_coproc_run_off(struct apple_sleep_coproc *c)
 		c->stopped = true;
 		return;
 	}
-	if (!apple_sleep->soc->regions)
+	/* T6041's own sleep driver runs this without the sleep core. */
+	if (!apple_sleep || !apple_sleep->soc->regions)
 		c->status = readl(c->asc + ASC_CPU_STATUS);
 	writel(readl(c->asc + ASC_CPU_CONTROL) & ~ASC_CPU_CONTROL_RUN, c->asc + ASC_CPU_CONTROL);
 	writel(readl(c->asc + ASC_CPU_CONTROL) & ~ASC_CPU_CONTROL_RUN, c->asc + ASC_CPU_CONTROL);
@@ -1790,6 +1800,87 @@ static void apple_sleep_coprocs_stop(struct apple_sleep *s, bool first)
 		}
 	}
 	dsb(sy);
+}
+
+/*
+ * For a SoC whose sleep has its own driver at EL2 (T6041): last refusal checks
+ * before any irreversible enclave or coprocessor stop.
+ */
+int apple_sleep_coprocs_check_all(void)
+{
+	int i, ret;
+
+	for (i = 0; i < SLEEP_COPROCS; i++) {
+		struct apple_sleep_coproc *c = &apple_sleep_coprocs[i];
+
+		if (!c->dev || !c->ready || c->stopped || !c->last_check)
+			continue;
+		ret = c->last_check(c->data);
+		if (ret) {
+			dev_err(c->dev, "refused at sleep commit: %d\n", ret);
+			return ret;
+		}
+	}
+
+	return 0;
+}
+
+/*
+ * For a SoC whose sleep has its own driver at EL2 (T6041): run the enclave's
+ * irreversible sleep request with interrupts off. A nonzero return guarantees
+ * no SLEEP request was sent.
+ */
+int apple_sleep_enclave_stop_all(void)
+{
+	int ret;
+
+	if (!apple_sleep_enclave.stop)
+		return 0;
+	ret = apple_sleep_enclave.stop(apple_sleep_enclave.data);
+	if (ret && apple_sleep_enclave.dev)
+		dev_err(apple_sleep_enclave.dev,
+			"refused before SEP SLEEP was sent: %d\n", ret);
+
+	return ret;
+}
+
+/*
+ * For a SoC whose sleep has its own driver at EL2 (T6041): both passes of the stop above,
+ * the coprocessors registered first, then the rest. Past the refusal boundary every ready
+ * coprocessor is still halted even if one @last_stop reports a negative error.
+ */
+int apple_sleep_coprocs_stop_all(void)
+{
+	int pass, i, ret, first_err = 0;
+
+	for (pass = 1; pass >= 0; pass--) {
+		for (i = 0; i < SLEEP_COPROCS; i++) {
+			struct apple_sleep_coproc *c = &apple_sleep_coprocs[i];
+
+			if (!c->dev || !c->ready || c->first != pass || c->stopped)
+				continue;
+			if (c->last_stop) {
+				ret = c->last_stop(c->data);
+				if (ret < 0 && !first_err)
+					first_err = ret;
+			}
+			apple_sleep_coproc_run_off(c);
+		}
+	}
+	dsb(sy);
+	return first_err;
+}
+
+/* For T6041: whether the coprocessor behind the storage PCIe link (ANS) was stopped. */
+bool apple_sleep_coprocs_ans_stopped(void)
+{
+	int i;
+
+	for (i = 0; i < SLEEP_COPROCS; i++)
+		if (apple_sleep_coprocs[i].dev && apple_sleep_coprocs[i].pcie_ans &&
+		    apple_sleep_coprocs[i].stopped)
+			return true;
+	return false;
 }
 
 const struct apple_sleep_smc_policy *apple_sleep_smc_policy(void)

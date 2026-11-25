@@ -790,6 +790,17 @@ static void __init gate_t6030_other_pmp_image(struct kunit *test)
 	gt_expect_untouched(test);
 }
 
+/* The 27.2 (26B123) T6030 PMP image is taken as well. */
+static void __init gate_t6030_pmp_image_27_2(struct kunit *test)
+{
+	struct gate_test *t = test->priv;
+
+	t->pmp_uuid = "5D66805B-E4AD-335E-BDC3-26828C682AAC";
+	gt_set_string(test, gt_t6030.values, "apple,tunable-uuid", t->pmp_uuid);
+	gt_run(test);
+	gt_expect_enabled(test);
+}
+
 static void __init gate_t6030_enabled_again(struct kunit *test)
 {
 	gt_run(test);
@@ -1185,6 +1196,7 @@ static struct kunit_case gate_t6030_cases[] __refdata = {
 	KUNIT_CASE(gate_t6030_no_marker),
 	KUNIT_CASE(gate_t6030_t6031_power_layout),
 	KUNIT_CASE(gate_t6030_other_pmp_image),
+	KUNIT_CASE(gate_t6030_pmp_image_27_2),
 	KUNIT_CASE(gate_t6030_enabled_again),
 	{}
 };
