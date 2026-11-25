@@ -3276,6 +3276,91 @@ int apple_dart_fw_remote(struct device *dev, dma_addr_t iova, bool write,
 }
 EXPORT_SYMBOL_GPL(apple_dart_fw_remote);
 
+/*
+ * Memory a co-processor's firmware may share with the host for a CPU mapping: DRAM,
+ * at or above the first System RAM (Apple SoCs place every device's registers below
+ * it), that isn't System RAM. That leaves the firmware's own carveouts, which the
+ * kernel doesn't use or map, and refuses memory the kernel allocates from, which its
+ * linear map also covers with other attributes.
+ */
+static bool apple_dart_fw_phys_shareable(phys_addr_t pa, size_t size)
+{
+	phys_addr_t page_start, page_end, end;
+
+	if (!pa || !size || check_add_overflow(pa, (phys_addr_t)size, &end) ||
+	    end > (phys_addr_t)~(PAGE_SIZE - 1))
+		return false;
+	page_start = ALIGN_DOWN(pa, PAGE_SIZE);
+	page_end = ALIGN(end, PAGE_SIZE);
+	return region_intersects(0, page_end, IORESOURCE_SYSTEM_RAM,
+				 IORES_DESC_NONE) != REGION_DISJOINT &&
+	       region_intersects(page_start, page_end - page_start,
+				 IORESOURCE_SYSTEM_RAM,
+				 IORES_DESC_NONE) == REGION_DISJOINT;
+}
+
+static phys_addr_t apple_dart_fw_range_page(struct device *dev,
+					    struct iommu_domain *domain,
+					    dma_addr_t iova, unsigned int flags)
+{
+	phys_addr_t phys = 0;
+
+	/*
+	 * On an identity domain iommu_iova_to_phys() returns iova verbatim: skip
+	 * APPLE_DART_FW_LINUX there so an unmapped DVA is never treated as a
+	 * translation and APPLE_DART_FW_RETAINED is still consulted.
+	 */
+	if ((flags & APPLE_DART_FW_LINUX) && (domain->type & __IOMMU_DOMAIN_PAGING))
+		phys = iommu_iova_to_phys(domain, iova);
+	if (!phys && (flags & APPLE_DART_FW_RETAINED) &&
+	    apple_dart_fw_remote(dev, iova, false, &phys))
+		phys = 0;
+	return phys;
+}
+
+/*
+ * The physical range behind a buffer a co-processor's firmware names by its DVA, for
+ * a CPU mapping. @flags chooses what resolves a DVA: APPLE_DART_FW_LINUX, the
+ * mappings Linux made (on a paging domain), and APPLE_DART_FW_RETAINED, those the
+ * firmware kept from the boot loader (apple_dart_fw_remote()). Every IOMMU page the
+ * buffer touches is resolved, at the domain's smallest page and from page boundary
+ * to page boundary, as the buffer need not start on one. *@phys is set only when
+ * they translate to one contiguous range whose CPU-page-rounded span
+ * apple_dart_fw_phys_shareable() accepts. -EINVAL for an empty, wrapping or
+ * flagless request, -ENODEV without an IOMMU domain, -ENOENT when its first byte
+ * doesn't translate, -ERANGE when a later page lies elsewhere or doesn't translate,
+ * -EACCES when the range isn't such memory.
+ */
+int apple_dart_fw_range(struct device *dev, dma_addr_t iova, size_t size,
+			unsigned int flags, phys_addr_t *phys)
+{
+	struct iommu_domain *domain = iommu_get_domain_for_dev(dev);
+	unsigned long pgsize;
+	dma_addr_t addr, last;
+	phys_addr_t start, phys_last;
+
+	if (!size || !(flags & (APPLE_DART_FW_LINUX | APPLE_DART_FW_RETAINED)) ||
+	    check_add_overflow(iova, (dma_addr_t)size - 1, &last))
+		return -EINVAL;
+	if (!domain)
+		return -ENODEV;
+	start = apple_dart_fw_range_page(dev, domain, iova, flags);
+	if (!start)
+		return -ENOENT;
+	if (check_add_overflow(start, (phys_addr_t)size - 1, &phys_last))
+		return -ERANGE;
+	pgsize = domain->pgsize_bitmap ? 1UL << __ffs(domain->pgsize_bitmap) : PAGE_SIZE;
+	for (addr = ALIGN_DOWN(iova, pgsize) + pgsize; addr && addr <= last; addr += pgsize)
+		if (apple_dart_fw_range_page(dev, domain, addr, flags) !=
+		    start + (addr - iova))
+			return -ERANGE;
+	if (!apple_dart_fw_phys_shareable(start, size))
+		return -EACCES;
+	*phys = start;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_dart_fw_range);
+
 static phys_addr_t apple_dart_iova_to_phys(struct iommu_domain *domain,
 					   dma_addr_t iova)
 {
