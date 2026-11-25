@@ -673,6 +673,12 @@ struct apple_sleep_soc {
 	bool own_wake;
 	bool strict_gate_inventory;
 	/*
+	 * Fail closed on the gate list: an entry not in the tree refuses, and an unbound one that
+	 * must stop refuses unless it is seen stopped, its domain off or, at full power, its run
+	 * bit clear. Not seeing is no answer.
+	 */
+	bool gate_fail_closed;
+	/*
 	 * No PMP runs and its report is disabled: the PTD entries the commit drops have no
 	 * report driver to take them from. A board whose report is enabled still takes them.
 	 */
@@ -3268,9 +3274,9 @@ static void apple_sleep_gate_prepare(struct apple_sleep *s)
 		if (!c) {
 			dev_warn(s->dev, "%s isn't in this tree\n",
 				 coprocs[i].path ?: coprocs[i].compatible);
-			if (s->soc->strict_gate_inventory) {
+			if (s->soc->strict_gate_inventory || s->soc->gate_fail_closed) {
 				g = &s->gate[s->gate_count++];
-				g->name = coprocs[i].compatible;
+				g->name = coprocs[i].compatible ?: coprocs[i].path;
 				g->bound = false;
 				g->strict_unbound = true;
 			}
@@ -3350,6 +3356,12 @@ static bool apple_sleep_gate_failed(struct apple_sleep *s)
 				dev_err(s->dev, "%s runs unbound: control %#x status %#x\n", g->name,
 					readl(g->asc + ASC_CPU_CONTROL),
 					readl(g->asc + ASC_CPU_STATUS));
+				running++;
+			} else if (g->must_stop && s->soc->gate_fail_closed &&
+				   !(g->ps && !sleep_ps_on(s, g->ps)) &&
+				   !(g->ps && g->asc && sleep_ps_full(s, g->ps))) {
+				dev_err(s->dev, "%s is unbound and its run state can't be read\n",
+					g->name);
 				running++;
 			}
 			if (g->strict_unbound)
