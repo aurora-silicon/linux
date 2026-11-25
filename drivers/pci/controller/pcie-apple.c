@@ -659,6 +659,7 @@ struct apple_pcie {
 	unsigned long		*bitmap;
 	struct list_head	ports;
 	struct list_head	hib_fns;
+	bool			hib_saved;
 	struct completion	event;
 	struct irq_fwspec	fwspec;
 	struct irq_domain	*msi_domain;
@@ -7674,8 +7675,16 @@ static int apple_pcie_resume_noirq(struct device *dev)
 		return ret;
 	}
 	if (!pcie->hw->tunneled) {
-		if (apple_pcie_s2r_reinit(pcie) && pm_resume_via_firmware())
-			apple_pcie_hib_restore_noirq(pcie, "S2R");
+		if (pcie->hib_saved) {
+			if (pm_resume_via_firmware()) {
+				apple_pcie_hib_restore_noirq(pcie, "S2R");
+			} else {
+				/* Refused before commit: registers are intact. */
+				pcie->hib_saved = false;
+				list_for_each_entry(port, &pcie->ports, entry)
+					apple_pcie_port_enable_irq(port);
+			}
+		}
 		return 0;
 	}
 	if (pcie->resume_failed)
@@ -7770,6 +7779,13 @@ static void apple_pcie_hib_save(struct apple_pcie *pcie)
 
 	mutex_lock(&pcie->lock);
 	list_for_each_entry(port, &pcie->ports, entry) {
+		/*
+		 * A chained port interrupt stays unmasked across suspend_device_irqs().
+		 * Mask and gate it before firmware sleep so a complex whose boot-time
+		 * reinit leaves PORT_INTMSK clear cannot storm at AIC resume before
+		 * apple_pcie_resume() masks and restores the port.
+		 */
+		apple_pcie_port_disable_irq(port);
 		port->hib_link_up = apple_pcie_port_readl(port, PORT_LINKSTS) & PORT_LINKSTS_UP;
 		port->hib_cold = false;
 		port->saved_intmask = apple_pcie_port_readl(port, PORT_INTMSK);
@@ -7777,6 +7793,7 @@ static void apple_pcie_hib_save(struct apple_pcie *pcie)
 			port->saved_rid2sid[i] =
 				apple_pcie_port_readl(port, port_rid2sid_offset(port, i));
 	}
+	pcie->hib_saved = true;
 	mutex_unlock(&pcie->lock);
 }
 
@@ -7895,22 +7912,37 @@ static int apple_pcie_resume(struct device *dev)
 	struct apple_pcie_hib_fn *fn;
 	int ret;
 
-	if (!apple_pcie_s2r_reinit(pcie) || !pm_resume_via_firmware())
+	if (!pcie->hib_saved)
 		return 0;
+	pcie->hib_saved = false;
+	if (!apple_pcie_s2r_reinit(pcie) || !pm_resume_via_firmware()) {
+		list_for_each_entry(port, &pcie->ports, entry)
+			apple_pcie_port_enable_irq(port);
+		return 0;
+	}
 	list_for_each_entry(port, &pcie->ports, entry) {
-		if (!port->hib_link_up)
+		if (!port->hib_link_up) {
+			apple_pcie_port_writel(port, ~0, PORT_INTMSK);
+			apple_pcie_port_writel(port, ~0, PORT_INTSTAT);
+			apple_pcie_port_enable_irq(port);
 			continue;
+		}
 		if (!port->hib_cold) {
 			apple_pcie_hib_rid2sid(pcie, port);
+			apple_pcie_port_enable_irq(port);
 			continue;
 		}
 		ret = apple_pcie_hib_port_up(pcie, port);
 		if (ret) {
 			dev_err(dev, "S2R: %pOF link not back (%d), its functions stay unreachable\n",
 				port->np, ret);
+			apple_pcie_port_writel(port, ~0, PORT_INTMSK);
+			apple_pcie_port_writel(port, ~0, PORT_INTSTAT);
 			port->hib_cold = false;
+			apple_pcie_port_enable_irq(port);
 			continue;
 		}
+		apple_pcie_port_enable_irq(port);
 		dev_info(dev, "S2R: %pOF link back, PWREN and PERST# cycled as at probe\n",
 			 port->np);
 	}
