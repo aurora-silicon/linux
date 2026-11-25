@@ -656,6 +656,7 @@ static const struct sio_hw_data sio_hw_t6030 = {
  * the 5 of the host's mailbox call timeout is not part of the record.
  */
 static const struct sio_hw_data sio_hw_t6041 = {
+	.stop_at_commit = true,
 	.protocol = 10,
 	.fifo_threshold = 0x600,
 	.cfg_word4 = 0x800,
@@ -699,12 +700,13 @@ static const struct sio_hw_data sio_hw_t6050 = {
 };
 
 /*
- * The T6050 description is in force on the board it has run on. On another T6050 board the
- * node is taken as before: by its generic compatible.
+ * The T6050 description, with its stop at the sleep's commit, is in force on the boards
+ * that describe the sleep. On another T6050 board the node is taken as before: by its
+ * generic compatible.
  */
 static bool sio_t6050_board(void)
 {
-	return of_machine_is_compatible("apple,j714s");
+	return apple_t6050_sleep_described();
 }
 
 static const struct of_device_id sio_of_match[] = {

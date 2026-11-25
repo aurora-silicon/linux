@@ -138,6 +138,10 @@ pub(crate) mod manager {
     pub(crate) const COMPLETED: usize = 0x54;
     /// ASC compute-exclusion bookkeeping. AP initializes once; never a command serial.
     pub(crate) const COMPUTE_EXCLUSION: usize = 0x5c;
+    /// Eight per valid pool-table row ([`super::pools::row_words`]): macOS 27.2 on the J773g
+    /// writes 8 x rows on every pool (20, 24 and 108 rows seen) and counts a pool's growth
+    /// in the same unit. A 16-row base pool has 128.
+    pub(crate) const ROW_WORDS: usize = 0x48;
 }
 
 /// A private 32 MiB UMA pool: 8192 4 KiB freelist entries and sixteen 2 MiB rows.
@@ -151,6 +155,13 @@ pub(crate) mod pools {
     pub(crate) const STATE_BYTES: usize = 0x20000;
     pub(crate) const TABLE_BYTES: usize = 0x4000;
     pub(crate) const SEEDS: usize = 8192;
+    /// [`super::manager::ROW_WORDS`] of a pool of `seeds` entries in whole rows: the u64 words
+    /// of its valid pool-table rows, eight per 0x40-byte row.
+    pub(crate) const fn row_words(seeds: u32) -> u32 {
+        let rows = seeds as u64 * SEED_BYTES / ROW_BYTES;
+        (rows * (TABLE_STRIDE / core::mem::size_of::<u64>()) as u64) as u32
+    }
+    const _: () = assert!(row_words(SEEDS as u32) == 128);
 }
 
 /// The nonzero 25G83 queue header; the rest of the fresh 0x24c0 object remains zero. Keeping

@@ -63,6 +63,14 @@ fn main() {
                 expected[at..at+4].copy_from_slice(&value.to_le_bytes());
             }
         }}
+        // Substitute calibrated DM2 compute watchdogs (40 -> 750, 50 -> 800) in the frozen C
+        // golden.
+        let globals: usize = initdata::OBJECT_SIZE[..initdata::id::GLOBALS].iter().sum();
+        for (offset, old, new) in [(0x9c8usize, 40u32, 750u32), (0x9ccusize, 50u32, 800u32)] {
+            let wd = globals + offset;
+            assert_eq!(u32::from_le_bytes(expected[wd..wd+4].try_into().unwrap()), old);
+            expected[wd..wd+4].copy_from_slice(&new.to_le_bytes());
+        }
         if let Some(offset) = got.iter().zip(&expected).position(|(a, b)| a != b) {
             panic!("initdata variant {variant} differs at {offset:#x}: C={:#x}, Rust={:#x}", expected[offset], got[offset]);
         }

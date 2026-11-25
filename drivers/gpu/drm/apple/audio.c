@@ -67,6 +67,9 @@
 #define DCPAUD_HELD_PERIOD_MAX_US	50000
 
 struct dcp_audio {
+	/* The display output the processor drives, from its device tree node */
+	const char *port_name;
+	const char *port_id;
 	struct device *dev;
 	struct device *dcp_dev;
 	struct device *dma_dev;
@@ -1780,13 +1783,32 @@ static int dcpaud_create_jack(struct dcp_audio *dcpaud)
 			    &dcpaud->jack, true, false);
 }
 
+/*
+ * Names the card after the output its processor drives, as the device tree
+ * describes it, so that each display's card is told apart: "Apple HDMI"
+ * (card id HDMI), "Apple USB-C DisplayPort" (USBC), "Apple DisplayPort".
+ * ALSA makes a repeated id unique.
+ */
+static void dcpaud_port_names(struct dcp_audio *dcpaud, struct device_node *dcp_node)
+{
+	dcpaud->port_name = "DisplayPort";
+	dcpaud->port_id = "DisplayPort";
+	if (of_property_match_string(dcp_node, "apple,connector-type", "HDMI-A") >= 0) {
+		dcpaud->port_name = "HDMI";
+		dcpaud->port_id = "HDMI";
+	} else if (of_property_match_string(dcp_node, "apple,connector-type", "USB-C") >= 0) {
+		dcpaud->port_name = "USB-C DisplayPort";
+		dcpaud->port_id = "USBC";
+	}
+}
+
 static void dcpaud_set_card_names(struct dcp_audio *dcpaud)
 {
 	struct snd_card *card = dcpaud->card;
 
 	strscpy(card->driver, "apple_dcp", sizeof(card->driver));
-	strscpy(card->longname, "Apple DisplayPort", sizeof(card->longname));
-	strscpy(card->shortname, "Apple DisplayPort", sizeof(card->shortname));
+	snprintf(card->shortname, sizeof(card->shortname), "Apple %s", dcpaud->port_name);
+	snprintf(card->longname, sizeof(card->longname), "Apple %s audio", dcpaud->port_name);
 }
 
 #ifdef CONFIG_SND_DEBUG
@@ -1824,7 +1846,7 @@ static int dcpaud_init_snd_card(struct dcp_audio *dcpaud)
 		return -ENODEV;
 
 
-	ret = snd_card_new(dcpaud->dev, DCPAUD_CARD_SLOTS, SNDRV_DEFAULT_STR1,
+	ret = snd_card_new(dcpaud->dev, DCPAUD_CARD_SLOTS, dcpaud->port_id,
 			   THIS_MODULE, 0, &dcpaud->card);
 	if (ret)
 		return ret;
@@ -1874,6 +1896,53 @@ void dcpaud_connect(struct platform_device *pdev, bool connected)
 	dcpaud_report_hotplug(dcpaud, connected, eld);
 }
 
+/*
+ * The connected sink's ELD, built again from the connector's EDID. The ELD is
+ * built as the audio service connects, which on a Type-C processor can come
+ * before its route is up and the display's EDID is read (at boot, and as the
+ * service is published again after a sleep): the card would keep the basic
+ * fallback without the monitor's name. A card that is not connected stays so.
+ * Returns whether the stored ELD changed.
+ */
+static bool dcpaud_eld_update(struct dcp_audio *dcpaud, const u8 *eld)
+{
+	bool changed;
+
+	mutex_lock(&dcpaud->data_lock);
+	changed = dcpaud->connected && memcmp(dcpaud->eld, eld, DCPAUD_ELD_SIZE);
+	if (changed)
+		memcpy(dcpaud->eld, eld, DCPAUD_ELD_SIZE);
+	mutex_unlock(&dcpaud->data_lock);
+	return changed;
+}
+
+/*
+ * Only an ELD built from an EDID replaces the stored one. The EDID code also
+ * ends here after clearing a stale EDID (an old route or service) or while a
+ * read is still to be retried; the card then keeps what it has rather than
+ * falling back to basic stereo without the monitor's name.
+ */
+static bool dcpaud_refresh_eld_from_edid(struct dcp_audio *dcpaud)
+{
+	u8 eld[DCPAUD_ELD_SIZE];
+
+	if (dcp_audio_sink_eld(dcpaud->dcp_dev, eld, DCPAUD_ELD_SIZE) ||
+	    !eld[DRM_ELD_VER])
+		return false;
+	dcpaud_build_eld(dcpaud, eld);
+	return dcpaud_eld_update(dcpaud, eld);
+}
+
+void dcpaud_refresh_eld(struct platform_device *pdev)
+{
+	struct dcp_audio *dcpaud = platform_get_drvdata(pdev);
+
+	if (!dcpaud || !dcpaud->dcp_dev || !dcpaud->card)
+		return;
+	if (dcpaud_refresh_eld_from_edid(dcpaud))
+		snd_ctl_notify(dcpaud->card, SNDRV_CTL_EVENT_MASK_VALUE, &dcpaud->eld_ctl->id);
+}
+
 void dcpaud_disconnect(struct platform_device *pdev)
 {
 	struct dcp_audio *dcpaud;
@@ -1918,6 +1987,7 @@ static int dcpaud_comp_bind(struct device *dev, struct device *main, void *data)
 		dev_info(dev, "No audio support\n");
 		goto rpm_put;
 	}
+	dcpaud_port_names(dcpaud, dcp_node);
 
 	index = of_property_match_string(dev->of_node, "dma-names", "tx");
 	if (index < 0) {

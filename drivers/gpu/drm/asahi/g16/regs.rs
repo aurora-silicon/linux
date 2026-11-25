@@ -153,7 +153,7 @@ pub(crate) struct Identity {
 }
 
 /// Fault-bank selector values (`+0xd800`) that name a fault bank.
-const FAULT_BANKS: u64 = 8;
+pub(crate) const FAULT_BANKS: usize = 8;
 
 /// Engine receipts: busy bit and one fault bank.
 #[derive(Copy, Clone, Default)]
@@ -174,6 +174,24 @@ impl EngineState {
     #[allow(dead_code)]
     pub(crate) fn fault(&self) -> u64 {
         self.status
+    }
+}
+
+/// Full eight-bank fault-register snapshot taken while firmware is halted for recovery.
+#[derive(Copy, Clone, Default)]
+pub(crate) struct FaultScan {
+    /// Bit 0 of `+0xc020 | +0xc120`.
+    pub(crate) busy: u64,
+    /// Selector (`+0xd800`) observed before scanning banks 0..7 and restored afterwards.
+    pub(crate) saved_bank: u64,
+    /// Raw status (`+0xd8c0`) and address (`+0xd8c8 << 6`) of each fault bank 0..7.
+    pub(crate) banks: [EngineState; FAULT_BANKS],
+}
+
+impl FaultScan {
+    /// First bank whose latched fault bit (bit 0) is set.
+    pub(crate) fn first_latched(&self) -> Option<&EngineState> {
+        self.banks.iter().find(|entry| entry.status & 1 != 0)
     }
 }
 
@@ -313,29 +331,37 @@ impl Regs {
         })
     }
 
-    /// Engine receipts for a firmware halted for recovery and waiting on the host: the first
-    /// fault bank, selectors 0 to 7 in order, whose status has bit 0 set, with the saved
-    /// selector restored. Without a fault, the status is zero and the bank the saved selector.
-    pub(crate) fn fault_scan(&self) -> Result<EngineState> {
+    /// Engine receipts for a firmware halted for recovery and waiting on the host: reads all
+    /// eight fault banks (selectors 0 to 7 in order), capturing status and address for every
+    /// non-zero bank, and restores the saved selector.
+    #[inline(never)]
+    pub(crate) fn fault_scan(&self) -> Result<FaultScan> {
         let r = self.status.io();
         let saved = r.try_read64(0x1800)?;
-        let mut state = EngineState {
-            busy: (r.try_read64(0x20)? | r.try_read64(0x120)?) & 1,
-            bank: saved,
-            ..Default::default()
+        let busy = (r.try_read64(0x20)? | r.try_read64(0x120)?) & 1;
+        let mut scan = FaultScan {
+            busy,
+            saved_bank: saved,
+            banks: [EngineState::default(); FAULT_BANKS],
         };
-        for bank in 0..FAULT_BANKS {
+        for (idx, entry) in scan.banks.iter_mut().enumerate() {
+            let bank = idx as u64;
             r.try_write64(bank, 0x1800)?;
             let status = r.try_read64(0x18c0)?;
-            if status & 1 != 0 {
-                state.bank = bank;
-                state.status = status;
-                state.address = r.try_read64(0x18c8)? << 6;
-                break;
-            }
+            let address = if status != 0 {
+                r.try_read64(0x18c8)? << 6
+            } else {
+                0
+            };
+            *entry = EngineState {
+                busy,
+                bank,
+                status,
+                address,
+            };
         }
         r.try_write64(saved, 0x1800)?;
-        Ok(state)
+        Ok(scan)
     }
 }
 
