@@ -271,6 +271,10 @@ ASAHI_TESTS = {
                                    'count-owed-twice'), []),
     'g17-compute-deadline-tests.py': [([], PASS)],
     'g17-compute-growth-deadline-tests.py': [([], PASS)],
+    'g17-compute-retired-tests.py': [([], PASS)]
+        + mutations('--mutation', ('queue-under-lock', 'binding-under-lock', 'drain-under-lock',
+                                   'drain-local-on-eagain', 'finish-stops-at-error',
+                                   'early-return-skips-finish', 'overwrite-full'), []),
     'g17-kill-route-tests.py': [([], PASS)]
         + mutations('--mutation', ('no-executed-route', 'no-executed-input', 'kill-twice', 'executed-on-m5',
                                    'unsafe-wait', 'owed-blocks-kill', 'open-owed-skipped'), []),

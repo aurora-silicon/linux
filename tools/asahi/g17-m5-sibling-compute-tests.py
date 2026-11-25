@@ -92,7 +92,8 @@ def build_harness(mutation=None):
     release_fn = item(runtime_src, 'pub(super) fn release_compute(')
     ack_exit_fn = item(exit_src, 'pub(super) fn acknowledge_compute_exit(')
     pub_exit_fn = item(exit_src, 'fn publish_compute_exit(')
-    rollback_fn = item(backend_src, 'fn rollback_unpublished_compute(')
+    rollback_fn = item(runtime_src, 'fn rollback_unpublished_compute(\n')
+    backend_rollback_fn = item(backend_src, 'fn rollback_unpublished_compute(&self)')
     grow_fn = item(runtime_src, 'fn grow_compute(')
     drain_sib_fn = item(runtime_src, 'fn drain_compute_siblings(')
     direct_fn = item(runtime_src, 'fn compute_direct(')
@@ -203,7 +204,12 @@ def build_harness(mutation=None):
         rollback_fn,
         'for primary_pass in [false, true]',
         'queue.is_primary() == primary_pass',
-        '.rollback_unpublished(self.owner, &self.context)?',
+        '.rollback_unpublished(owner, context)?',
+    ) and ordered_ok(
+        backend_rollback_fn,
+        'firmware.queues.rollback_unpublished_compute(',
+        'drop(state);',
+        'self.finish_retired_compute(&mut retired)',
     )
     grow_releases_siblings_ok = (
         ordered_ok(
@@ -216,10 +222,9 @@ def build_harness(mutation=None):
         )
         and ordered_ok(
             grow_fn,
-            'retired_siblings = firmware.queues.drain_compute_siblings(self.owner)?;',
+            'firmware.queues.drain_compute_siblings(self.owner, &mut retired_siblings)?;',
             'firmware.queues.compute_primary(self.owner)',
-            'for item in retired_siblings {',
-            'self.finish_uninstalled_compute(Some(item))?;',
+            'self.finish_retired_compute(&mut retired_siblings)?;',
         )
     )
     exit_propagates_ok = ordered_ok(

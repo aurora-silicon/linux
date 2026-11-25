@@ -72,6 +72,16 @@ struct ComputeEntry {
     queue: ComputeSlot,
 }
 
+/// A compute queue taken out of the registry under the device mutex. Its empty entry keeps the
+/// reservation's QID until [`Backend::finish_uninstalled_compute`] drops the queue (and its
+/// aliases) after that mutex is released and then cancels the reservation.
+type Uninstalled = (ComputeReservation, KBox<compute::Queue>);
+
+/// One place per compute channel of an owner. An owner holds at most `COMPUTE_CHANNELS_MAX`
+/// channels, so what its channels give up under the device mutex is kept here without
+/// allocating there, and is dropped or finished only after that mutex is released.
+type PerChannel<T> = [Option<T>; super::pairs::COMPUTE_CHANNELS_MAX];
+
 /// A physical compute queue behind its own lock. Publication into a bound queue takes only
 /// this lock; device-mutex holders take it to observe or change the queue (device mutex ->
 /// cell). A logical queue may keep the cell after the registry gave the queue up: the cell is
@@ -341,10 +351,6 @@ impl Registry {
             .flatten()
             .filter_map(|entry| entry.queue.as_deref())
             .find(|queue| queue.owner() == Some(owner) && queue.is_primary())
-    }
-
-    pub(super) fn compute_mut(&mut self, owner: u64) -> Option<QueueGuard<'_>> {
-        self.compute(owner)
     }
 
     pub(super) fn compute_for_packet(
@@ -1144,13 +1150,15 @@ impl Registry {
     }
 
     /// Releases idle sibling channels of `owner` before primary pool growth. Returns `Err(EAGAIN)`
-    /// while any sibling still has active, replaying or configuring work, and returns any
-    /// unpublished sibling queues for off-lock alias drop and QID cancellation.
+    /// while any sibling still has active, replaying or configuring work. Each unpublished
+    /// sibling queue goes to `retired`, which starts empty, for off-lock alias drop and QID
+    /// cancellation; on failure it still holds every queue taken before it.
     fn drain_compute_siblings(
         &mut self,
         owner: u64,
-    ) -> Result<KVec<(ComputeReservation, KBox<compute::Queue>)>> {
-        let mut retired = KVec::new();
+        retired: &mut PerChannel<Uninstalled>,
+    ) -> Result {
+        let mut channel = 0;
         for slot in 0..self.compute.len() {
             let is_sibling = self.compute[slot]
                 .as_ref()
@@ -1168,15 +1176,58 @@ impl Registry {
             if busy {
                 return Err(EAGAIN);
             }
+            // Refuse before releasing a channel whose queue would have no place in `retired`.
+            let place = retired.get_mut(channel).filter(|place| place.is_none()).ok_or(EIO)?;
+            channel += 1;
             let entry = self.compute[slot].as_mut().ok_or(EIO)?;
             let unpublished = entry.queue.as_deref_mut().ok_or(EIO)?.release_owner()?;
             if unpublished {
-                if let Some(queue) = entry.queue.take() {
-                    retired.push((entry.reservation, queue), GFP_KERNEL)?;
+                *place = entry.queue.take().map(|queue| (entry.reservation, queue));
+            }
+        }
+        Ok(())
+    }
+
+    /// Rolls back `owner`'s unpublished bindings to `context` on every channel, siblings before
+    /// the primary for deterministic teardown. Each displaced binding goes to `bindings` and each
+    /// cancelled queue to `retired`, both starting empty, for the caller to drop (and finish)
+    /// after releasing the device mutex; on failure they still hold everything taken before it.
+    fn rollback_unpublished_compute(
+        &mut self,
+        owner: u64,
+        context: &Arc<Context>,
+        retired: &mut PerChannel<Uninstalled>,
+        bindings: &mut PerChannel<compute::Binding>,
+    ) -> Result {
+        let mut channel = 0;
+        for primary_pass in [false, true] {
+            for slot in 0..self.compute.len() {
+                let matches = self.compute[slot]
+                    .as_ref()
+                    .and_then(|entry| entry.queue.as_deref())
+                    .is_some_and(|queue| {
+                        queue.owner() == Some(owner) && queue.is_primary() == primary_pass
+                    });
+                if !matches {
+                    continue;
+                }
+                // Refuse before rolling back a channel whose binding or queue would have no place.
+                let binding = bindings.get_mut(channel).filter(|place| place.is_none()).ok_or(EIO)?;
+                let place = retired.get_mut(channel).filter(|place| place.is_none()).ok_or(EIO)?;
+                channel += 1;
+                let entry = self.compute[slot].as_mut().ok_or(EIO)?;
+                let (cancel, replaced) = entry
+                    .queue
+                    .as_deref_mut()
+                    .ok_or(EIO)?
+                    .rollback_unpublished(owner, context)?;
+                *binding = replaced;
+                if cancel {
+                    *place = entry.queue.take().map(|queue| (entry.reservation, queue));
                 }
             }
         }
-        Ok(retired)
+        Ok(())
     }
 
     pub(super) fn release_compute(&mut self, owner: u64) -> Result {
@@ -1663,6 +1714,15 @@ impl Backend {
         Ok(())
     }
 
+    /// Finishes every queue in `retired` as [`Self::finish_uninstalled_compute`] finishes one,
+    /// going on past a failure so no other reservation stays behind; returns the first failure.
+    fn finish_retired_compute(&self, retired: &mut PerChannel<Uninstalled>) -> Result {
+        retired.iter_mut().fold(Ok(()), |result, item| {
+            let finished = self.finish_uninstalled_compute(item.take());
+            result.and(finished)
+        })
+    }
+
     fn grow_compute(&self, required: super::freelist::ComputeCapacity, admission: &Admission<'_>) -> Result {
         admission.check()?;
         {
@@ -1694,7 +1754,7 @@ impl Backend {
             // Growth waits for this queue's retirement and for firmware to consume the pool
             // release; both are progress the event worker reports.
             let observed = self.shared.progress.observe();
-            let mut retired_siblings = KVec::new();
+            let mut retired_siblings: PerChannel<Uninstalled> = Default::default();
             let result = (|| {
                 let mut state = self.shared.state.lock();
                 admission.check()?;
@@ -1704,7 +1764,7 @@ impl Backend {
                 firmware.scan_compute(None, &mut deferred)?;
                 // Release sibling channels before growing the primary channel so undersized
                 // sibling pools are detached and later re-acquired at the grown capacity.
-                retired_siblings = firmware.queues.drain_compute_siblings(self.owner)?;
+                firmware.queues.drain_compute_siblings(self.owner, &mut retired_siblings)?;
                 let mut queue = firmware.queues.compute_primary(self.owner).ok_or(EAGAIN)?;
                 if queue.pool_fits(required) { return Ok(None); }
                 if growth.is_none() {
@@ -1719,9 +1779,7 @@ impl Backend {
                 }
                 queue.finish_growth(&firmware.init, &mut pages, &mut alias).map(Some)
             })();
-            for item in retired_siblings {
-                self.finish_uninstalled_compute(Some(item))?;
-            }
+            self.finish_retired_compute(&mut retired_siblings)?;
             deferred.finish();
             match result {
                 Ok(old) => { drop(old); return Ok(()); }
