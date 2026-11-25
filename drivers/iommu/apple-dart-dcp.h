@@ -139,7 +139,7 @@ static inline void apple_dart_pm_invalidate(struct apple_dart *dart, bool suspen
  * register used; its power-up flushes every translation, with these locks
  * held, before it enables the streams again.
  */
-static void apple_dart_host_lock(struct apple_dart *dart, unsigned long *flags)
+static void __maybe_unused apple_dart_host_lock(struct apple_dart *dart, unsigned long *flags)
 {
 	struct apple_dart_dcp *streams[] = { dart->dcp, dart->frontend[0], dart->frontend[1] };
 	unsigned int held = 0;
@@ -150,7 +150,7 @@ static void apple_dart_host_lock(struct apple_dart *dart, unsigned long *flags)
 			spin_lock_nested(&streams[i]->lock, held++);
 }
 
-static void apple_dart_host_unlock(struct apple_dart *dart, unsigned long flags)
+static void __maybe_unused apple_dart_host_unlock(struct apple_dart *dart, unsigned long flags)
 {
 	struct apple_dart_dcp *streams[] = { dart->frontend[1], dart->frontend[0], dart->dcp };
 
