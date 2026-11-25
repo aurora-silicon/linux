@@ -65,9 +65,6 @@ const AUX_DRAIN_NS: u64 = 10_000_000;
 const EVENT_RETIRE_POLLS: u32 = 11;
 mod hw {
     pub mod sizes {
-        pub const TA_WAVE_PASSES: usize = 4;
-        pub const TA_WAVE_PASSES_LIGHT: usize = 8;
-        pub const TA_WAVE_REFILL_HEADROOM: usize = 2;
         pub const COMPUTE_PIPES: usize = 8;
         pub const COALESCE_WINDOW_US: u32 = 18;
     }
@@ -161,7 +158,6 @@ struct Engine {
     fs_target: u32,
     chan_wait: bool,
     slot_wait: bool,
-    ta_wave_wait: bool,
     short_repoll: bool,
     housekeeping_owed: bool,
     held_wait: bool,
@@ -330,10 +326,8 @@ struct Firmware {
     drain_stage_delta: u32,
     drain_fs_delta: u32,
     drain_compute_delta: u32,
-    ta_pending: usize,
-    ta_wave_cap: usize,
     coalesce_us: Option<u32>,
-    publish_waits: Option<(bool, bool, bool)>,
+    publish_waits: Option<(bool, bool)>,
     retire_calls: u32,
     publish_full_calls: u32,
     publish_checked_calls: u32,
@@ -364,7 +358,6 @@ impl Firmware {
                 fs_target: 0,
                 chan_wait: false,
                 slot_wait: false,
-                ta_wave_wait: false,
                 short_repoll: false,
                 housekeeping_owed: false,
                 held_wait: false,
@@ -385,8 +378,6 @@ impl Firmware {
             drain_stage_delta: 0,
             drain_fs_delta: 0,
             drain_compute_delta: 0,
-            ta_pending: 0,
-            ta_wave_cap: hw::sizes::TA_WAVE_PASSES,
             coalesce_us: None,
             publish_waits: None,
             retire_calls: 0,
@@ -456,9 +447,8 @@ impl Firmware {
     }
     fn publish_checked(&mut self, _done: &mut Completions) -> Result {
         self.engine.coalesce_deadline_ns = 0;
-        if let Some((slot_wait, ta_wave_wait, held_wait)) = self.publish_waits {
+        if let Some((slot_wait, held_wait)) = self.publish_waits {
             self.engine.slot_wait = slot_wait;
-            self.engine.ta_wave_wait = ta_wave_wait;
             self.engine.held_wait = held_wait;
         }
         self.publish_checked_calls += 1;
@@ -467,17 +457,10 @@ impl Firmware {
     fn defer_busy_coalesce(&mut self, _now: u64) -> Option<u32> {
         self.coalesce_us
     }
-    fn ta_pending_passes(&self) -> usize {
-        self.ta_pending
-    }
-    fn active_ta_wave_cap(&self) -> usize {
-        self.ta_wave_cap
-    }
 
     __RECLAIM_CLOSED_VM_SLOTS__
     __POLL_STEP__
     __OLDEST_TERMINAL_EVENTS__
-    __TA_WAVE_READY__
     __OLDEST_STAMP_REACHED__
 }
 
@@ -1104,7 +1087,9 @@ fn held_wait_spins_stage_events_and_repolls_soon_until_a_retirement() {
 }
 
 #[test]
-fn ta_only_irq_wakes_ta_wave_wait_with_hysteresis_and_short_repoll() {
+fn ta_only_irq_stays_non_terminal_without_a_held_job() {
+    // A TA-only (0x70) EP 0x20 interrupt while FS is still running neither spins the receipt
+    // tail nor arms the short repoll, and publishes nothing: no render waits on TA progress.
     CLOCK.with(|c| c.set(100_000));
     let mut fw = Firmware::new();
     fw.engine.flights.push(Flight {
@@ -1116,75 +1101,30 @@ fn ta_only_irq_wakes_ta_wave_wait_with_hysteresis_and_short_repoll() {
     });
     fw.engine.fs_target = 0x400;
     fw.engine.pending.push(Arc::new(Job { id: 2 }));
-    fw.engine.ta_wave_wait = true;
-    fw.ta_pending = 4;
     fw.drain_stage_delta = 1;
     fw.drain_fs_delta = 0;
 
     let mut retry_tail = false;
     let mut deferred = false;
     let mut done = vec![];
-    // TA still full (4 > TA_WAVE_REFILL=2): no publish_checked wakeup yet, but ta_wave_wait
-    // keeps non_terminal_only false so a 0x70 IRQ retries tail.
     assert!(fw
         .poll_step(true, EVENT_RETIRE_POLLS, &mut retry_tail, &mut deferred, &mut done)
         .unwrap());
     assert_eq!(fw.publish_checked_calls, 0);
-    assert!(retry_tail);
-
-    // TA drops to 3 (> TA_WAVE_REFILL=2): hysteresis avoids 1-pass stub drip, while
-    // tail == 0 arms short_repoll because ta_wave_wait is active.
-    fw.ta_pending = 3;
-    retry_tail = false;
-    assert!(fw
-        .poll_step(true, 0, &mut retry_tail, &mut deferred, &mut done)
-        .unwrap());
-    assert_eq!(fw.publish_checked_calls, 0);
-    assert!(!retry_tail);
-    assert!(fw.engine.short_repoll);
-
-    // TA drains to 2 (<= cap - TA_WAVE_REFILL_HEADROOM): immediately wakes publish_checked().
-    fw.ta_pending = 2;
-    assert!(fw
-        .poll_step(true, 0, &mut retry_tail, &mut deferred, &mut done)
-        .unwrap());
-    assert_eq!(fw.publish_checked_calls, 1);
-    assert!(fw.engine.short_repoll);
-
-    // Light TA wave cap (8): stays paused at 7 (> 8 - 2), wakes at 6 (<= 6).
-    fw.ta_wave_cap = hw::sizes::TA_WAVE_PASSES_LIGHT;
-    fw.ta_pending = 7;
-    assert!(fw
-        .poll_step(true, 0, &mut retry_tail, &mut deferred, &mut done)
-        .unwrap());
-    assert_eq!(fw.publish_checked_calls, 1);
-    fw.ta_pending = 6;
-    assert!(fw
-        .poll_step(true, 0, &mut retry_tail, &mut deferred, &mut done)
-        .unwrap());
-    assert_eq!(fw.publish_checked_calls, 2);
-
-    // Once ta_wave_wait clears, a TA-only 0x70 IRQ stays non_terminal_only (no spin/short_repoll).
-    fw.engine.ta_wave_wait = false;
-    retry_tail = false;
-    assert!(fw
-        .poll_step(true, EVENT_RETIRE_POLLS, &mut retry_tail, &mut deferred, &mut done)
-        .unwrap());
     assert!(!retry_tail);
     assert!(!fw.engine.short_repoll);
 }
 
 #[test]
 fn submit_locked_repolls_soon_when_its_publication_leaves_a_paced_job() {
-    // publish_checked() leaves a ready job on TA wave or slot headroom: SUBMIT arms the same
-    // short repoll poll_step() arms for it, unless the engine is frozen.
+    // publish_checked() leaves a ready job on slot headroom or behind its own VM's flights:
+    // SUBMIT arms the same short repoll poll_step() arms for it, unless the engine is frozen.
     CLOCK.with(|c| c.set(100_000));
-    for (slot_wait, ta_wave_wait, held_wait, frozen, soon) in [
-        (false, false, false, false, 0),
-        (true, false, false, false, 1),
-        (false, true, false, false, 1),
-        (false, false, true, false, 1),
-        (false, true, false, true, 0),
+    for (slot_wait, held_wait, frozen, soon) in [
+        (false, false, false, 0),
+        (true, false, false, 1),
+        (false, true, false, 1),
+        (true, false, true, 0),
     ] {
         let shared = Shared::new();
         let mut fw = Firmware::new();
@@ -1198,7 +1138,7 @@ fn submit_locked_repolls_soon_when_its_publication_leaves_a_paced_job() {
         });
         fw.engine.fs_target = 0x100;
         fw.engine.frozen = frozen;
-        fw.publish_waits = Some((slot_wait, ta_wave_wait, held_wait));
+        fw.publish_waits = Some((slot_wait, held_wait));
         let mut done = vec![];
         shared
             .submit_locked(&mut fw, Arc::new(Job { id: 2 }), &mut done)
@@ -1841,7 +1781,6 @@ for token, decl in {
     '__POLL_STEP__': 'pub(crate) fn poll_step(',
     '__RUN_HOUSEKEEPING__': 'pub(crate) fn run_housekeeping(',
     '__OLDEST_TERMINAL_EVENTS__': 'fn oldest_terminal_events(',
-    '__TA_WAVE_READY__': 'fn ta_wave_ready(',
     '__OLDEST_STAMP_REACHED__': 'fn oldest_stamp_reached(',
     '__CANCEL_RESNAP__': 'pub(crate) fn cancel_resnap(',
     '__IDLE_RESNAP__': 'pub(crate) fn idle_resnap(',
