@@ -5,7 +5,7 @@
 use super::types::*;
 use crate::{
     default_zeroed,
-    mmu,
+    timestamp,
     trivial_gpustruct, //
 };
 use kernel::prelude::Result;
@@ -128,7 +128,7 @@ trivial_gpustruct!(RenderTimestamps);
 
 #[derive(Debug)]
 pub(crate) struct UserTimestamp {
-    pub(crate) mapping: Arc<mmu::KernelMapping>,
+    pub(crate) mapping: Arc<timestamp::Bound>,
     pub(crate) offset: usize,
 }
 
@@ -144,12 +144,12 @@ impl UserTimestamps {
             start_addr: self
                 .start
                 .as_ref()
-                .map(|a| GpuPointer::from_mapping(&a.mapping, a.offset))
+                .map(|a| GpuPointer::from_mapping(a.mapping.firmware_mapping()?, a.offset))
                 .transpose()?,
             end_addr: self
                 .end
                 .as_ref()
-                .map(|a| GpuPointer::from_mapping(&a.mapping, a.offset))
+                .map(|a| GpuPointer::from_mapping(a.mapping.firmware_mapping()?, a.offset))
                 .transpose()?,
         })
     }

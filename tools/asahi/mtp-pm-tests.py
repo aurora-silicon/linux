@@ -30,6 +30,7 @@ PREFIX = r'''
 #include <errno.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <string.h>
 #define MAX_INTERFACES 16
 #define PMSG_SUSPEND 1
 #define HID_HAPTIC_MODE_DEVICE 0
@@ -66,6 +67,7 @@ struct effect_job { int effect_type, lock; struct work_struct work;
 struct ff_effect { int id; struct { struct { u16 hid_usage, intensity; } haptic; } u; };
 struct magicmouse_sc { struct hid_haptic_device *haptics; bool haptic_button_down, haptic_deep_down, haptic_suspended;
     int haptic_lock;
+    struct { bool read; u8 len, body[63]; } fw_click[2];
     struct work_struct haptic_press_work, haptic_release_work, haptic_deep_work, haptic_deep_release_work;
     struct effect_job *haptic_effects; struct hid_device *hdev;
     struct delayed_work work; bool work_held; };
@@ -109,8 +111,6 @@ static int apple_taptic_switch_modes(struct hid_device *a, u32 mode) {
     switches++; switched_to = mode; return switch_error;
 }
 static bool magicmouse_effect_is_deep(struct ff_effect *e) { return e->u.haptic.hid_usage == APPLE_HP_WAVEFORMDEEPCLICK; }
-static u8 magicmouse_haptic_strength(struct hid_device *h, bool deep) { (void)h; (void)deep; return 100; }
-static u8 magicmouse_haptic_softness(struct hid_device *h, bool deep) { (void)h; (void)deep; return 100; }
 static int hid_driver_suspend(struct hid_device *h, int state) {
     assert(state == PMSG_SUSPEND && !transport->suspended);
     suspends[h->id]++;
@@ -118,6 +118,18 @@ static int hid_driver_suspend(struct hid_device *h, int state) {
         magicmouse_suspend(h, state);
     return h->id == suspend_error_at ? -EBUSY : 0;
 }
+'''
+WAVEFORM = r'''
+static void magicmouse_haptic_waveform(struct magicmouse_sc *m, struct hid_device *a,
+                                       u16 usage, u8 *strength, u8 *softness) {
+    assert(!transport->suspended);
+    *strength = *softness = 100;
+}
+'''
+# Older sources used by --old-mouse predate the firmware waveform helper.
+LEGACY_WAVEFORM = r'''
+static u8 magicmouse_haptic_strength(struct hid_device *h, bool deep) { (void)h; (void)deep; return 100; }
+static u8 magicmouse_haptic_softness(struct hid_device *h, bool deep) { (void)h; (void)deep; return 100; }
 '''
 MIDDLE = r'''
 static int hid_driver_resume(struct hid_device *h) {
@@ -237,7 +249,8 @@ def main():
             'magicmouse_haptic_effects_loaded', 'magicmouse_haptic_click',
             'magicmouse_haptic_suspend', 'magicmouse_haptic_resume', 'magicmouse_switch_mode',
             'apple_upload_effects', 'apple_taptic_playback', 'apple_taptic_erase')) + '\n'
-        c.write_text(PREFIX.replace('static int hid_driver_suspend', haptics + function(mouse, 'magicmouse_suspend') +
+        waveform = WAVEFORM if 'static void magicmouse_haptic_waveform(' in mouse else LEGACY_WAVEFORM
+        c.write_text(PREFIX.replace('static int hid_driver_suspend', waveform + haptics + function(mouse, 'magicmouse_suspend') +
                                     '\nstatic int hid_driver_suspend', 1) +
                      function(mouse, 'magicmouse_resume') + function(mouse, 'magicmouse_reset_resume') + MIDDLE +
                      function(source, 'dockchannel_hid_suspend') + '\n' +

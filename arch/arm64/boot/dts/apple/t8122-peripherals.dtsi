@@ -49,7 +49,7 @@
 		interrupts = <AIC_IRQ 698 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
 		power-domains = <&ps_venc_sys>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	dart_ave1: iommu@315040000 {
@@ -59,7 +59,7 @@
 		interrupts = <AIC_IRQ 698 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
 		power-domains = <&ps_venc_sys>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	dart_ave2: iommu@315020000 {
@@ -141,9 +141,66 @@
 		status = "disabled";
 	};
 
+	ane_dart0: iommu@311800000 {
+		compatible = "apple,t8122-dart", "apple,t8110-dart";
+		reg = <0x3 0x11800000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 525 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		power-domains = <&ps_ane_sys>;
+		apple,dma-range = <0x0 0x0 0x400 0x0>;
+		status = "disabled";
+	};
+
 	dart_ane_companion3: filter@311804000 {
 		compatible = "apple,t8122-dapf", "apple,dapf";
 		reg = <0x3 0x11804000 0x0 0x4000>;
+		status = "disabled";
+	};
+
+	ane_dart1: iommu@311810000 {
+		compatible = "apple,t8122-dart", "apple,t8110-dart";
+		reg = <0x3 0x11810000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 525 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		power-domains = <&ps_ane_sys>;
+		apple,dma-range = <0x0 0x0 0x400 0x0>;
+		status = "disabled";
+	};
+
+	ane_dart2: iommu@311820000 {
+		compatible = "apple,t8122-dart", "apple,t8110-dart";
+		reg = <0x3 0x11820000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 525 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		power-domains = <&ps_ane_sys>;
+		apple,dma-range = <0x0 0x0 0x400 0x0>;
+		status = "disabled";
+	};
+
+	ane: ane@310000000 {
+		compatible = "apple,t8122-ane";
+		reg = <0x3 0x10000000 0x0 0x2000000>,
+		      <0x2 0xd0700000 0x0 0x18000>,
+		      <0x2 0xd0724000 0x0 0x4000>;
+		reg-names = "engine", "pmgr", "aux-0";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 524 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&ane_dart0 0>, <&ane_dart1 0>, <&ane_dart2 0>;
+		power-domains = <&ps_ane_sys>, <&ps_ane_cpu>, <&ps_ane_mpm>,
+				<&ps_ane_td>, <&ps_ane_base>;
+		apple,ane-type = <0xb0>;
+		apple,firmware-preloaded;
+		/* ADT dapf-instance-0: inclusive CPU addresses, in record order. */
+		apple,dapf-ranges = /bits/ 64 <0x2a5468000 0x2a5468003>,
+				    /bits/ 64 <0x2d0700438 0x2d070043b>,
+				    /bits/ 64 <0x2d070c000 0x2d070c01b>,
+				    /bits/ 64 <0x2d072682c 0x2d072682f>,
+				    /bits/ 64 <0x292468000 0x292468003>;
+		/* Default layout; the loader supplies per-boot physical reservations. */
+		apple,firmware-iovas = /bits/ 64 <0x10000000000 0x100000c8000>;
 		status = "disabled";
 	};
 
@@ -225,12 +282,9 @@
 		status = "disabled";
 	};
 
-	mcc: memory-controller@2d03c0000 {
+	mcc: memory-controller@220000000 {
 		compatible = "apple,t8122-mcc", "apple,mcc";
-		reg = <0x2 0xd03c0000 0x0 0x20000>,
-		      <0x2 0xd0478000 0x0 0x149c>,
-		      <0x2 0xd0780000 0x0 0x4000>,
-		      <0x2 0x20000000 0x0 0x2000000>,
+		reg = <0x2 0x20000000 0x0 0x2000000>,
 		      <0x2 0x22000000 0x0 0x2000000>;
 		status = "disabled";
 	};
@@ -419,19 +473,22 @@
 	ave: video-encoder@315100000 {
 		compatible = "apple,t8122-ave", "apple,ave";
 		reg = <0x3 0x15100000 0x0 0x45c000>,
-		      <0x3 0x15800000 0x0 0x800000>,
 		      <0x3 0x15050000 0x0 0x4000>,
+		      <0x3 0x15800000 0x0 0x800000>,
 		      <0x2 0xd0708000 0x0 0x4000>,
 		      <0x3 0x14000000 0x0 0x1000000>;
+		reg-names = "codec", "mailbox", "coproc", "pmgr", "pio";
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 701 IRQ_TYPE_LEVEL_HIGH>,
-		             <AIC_IRQ 695 IRQ_TYPE_LEVEL_HIGH>,
-		             <AIC_IRQ 694 IRQ_TYPE_LEVEL_HIGH>,
-		             <AIC_IRQ 697 IRQ_TYPE_LEVEL_HIGH>,
-		             <AIC_IRQ 696 IRQ_TYPE_LEVEL_HIGH>;
-		power-domains = <&ps_venc_sys>, <&ps_venc_pipe4>, <&ps_venc_pipe5>, <&ps_venc_me0>, <&ps_venc_me1>, <&ps_venc_dma>;
+			     <AIC_IRQ 695 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 694 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 697 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 696 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_venc_dma>, <&ps_venc_pipe4>,
+				<&ps_venc_pipe5>, <&ps_venc_me0>, <&ps_venc_me1>;
+		power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1";
 		iommus = <&dart_ave0 0>, <&dart_ave1 0>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	apr: video-codec@321000000 {
@@ -439,10 +496,12 @@
 		reg = <0x3 0x21000000 0x0 0x4000>,
 		      <0x3 0x20000000 0x0 0x8000>,
 		      <0x3 0x21078000 0x0 0x4000>;
+		reg-names = "core", "wrapper", "aux";
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 857 IRQ_TYPE_LEVEL_HIGH>,
 		             <AIC_IRQ 894 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_scodec>;
+		resets = <&ps_scodec>;
 		iommus = <&dart_apr0 1>, <&dart_apr1 1>;
 		status = "disabled";
 	};
