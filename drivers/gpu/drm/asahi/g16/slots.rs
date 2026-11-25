@@ -68,7 +68,15 @@ impl ComputeSlot {
             )?,
             work: alloc_work(o, 0x2000, client::WORK_PAGE + k * client::CWORK_STRIDE, 0)?,
             seq: alloc(o, 0x300, cmd_fw(), None, 0, false)?,
-            barrier: alloc(o, barrier::SIZE, cmd_fw(), None, 0, false)?,
+            // Holds fs2c (+0x00) and cross-pipe c2c (+0x40) barriers within one page.
+            barrier: alloc(
+                o,
+                barrier::SIZE * sizes::COMPUTE_PIPES,
+                cmd_fw(),
+                None,
+                0,
+                false,
+            )?,
             pool: o.alloc(super::object::Request {
                 size: 0x2000000,
                 class: sh,
@@ -263,8 +271,22 @@ impl PassSlot {
             prev_barrier: alloc(o, barrier::SIZE, cmd_fw(), None, 0, false)?,
             ta_fs_barrier: alloc(o, barrier::SIZE, cmd_fw(), None, 0, false)?,
             fs_dep: alloc(o, barrier::SIZE, cmd_fw(), None, 0, false)?,
-            compute_barrier: alloc(o, barrier::SIZE, cmd_fw(), None, 0, false)?,
-            fs_compute_barrier: alloc(o, barrier::SIZE, cmd_fw(), None, 0, false)?,
+            compute_barrier: alloc(
+                o,
+                barrier::SIZE * sizes::COMPUTE_PIPES,
+                cmd_fw(),
+                None,
+                0,
+                false,
+            )?,
+            fs_compute_barrier: alloc(
+                o,
+                barrier::SIZE * sizes::COMPUTE_PIPES,
+                cmd_fw(),
+                None,
+                0,
+                false,
+            )?,
         })
     }
 
@@ -272,35 +294,42 @@ impl PassSlot {
     /// dirty spans are passed in.
     ///
     /// Clean same-VM reuse skips the work/sequence images (immediately overwritten by
-    /// `prefix_render`), unused scratch objects (`ta_scratch`, `fs_scratch`), bulk scratch
-    /// (`aux`, `scene_user`), and `tpc` (overwritten by TA hardware), zeroing only the stage
-    /// timestamp cells, active `heap` header (`0x1000`), `tilemap_dirty`, and active
-    /// preemption record headers. First use, cross-VM switch, cancelled preparation, or
-    /// post-recovery/error reuse runs the full scrub including `tpc_dirty`.
+    /// `prefix_render`), unused scratch objects (`ta_scratch`, `fs_scratch`, `its`), bulk
+    /// scratch (`aux`, `scene_user`), preemption save areas (`pre[0..2]`), and `tpc`
+    /// (overwritten by TA hardware), zeroing only the active `tilemap` delta span and the
+    /// active `heap` metadata header (`0x200` single-layer, `0x1000` multi-layer). First use,
+    /// cross-VM switch, cancelled preparation, or post-recovery/error reuse runs the full
+    /// scrub including `tpc_dirty`, `its`, `scene`, `pre[0..2]`, and full `heap`.
     /// Clean same-VM reset of the active per-pass WC spans (used both synchronously on fallback
     /// and off-lock after displacement).
-    pub(crate) fn scrub_clean(&self, pre_records: u32, tilemap_dirty: u64) -> Result {
-        let r = pre_records as usize;
-        self.its.fill(0, 0, 32)?;
-        self.tilemap.fill(0, 0, tilemap_dirty as usize)?;
-        self.heap.fill(0, 0, 0x1000)?;
-        self.pre[0].fill(0, 0, r * 0x540)?;
-        self.pre[1].fill(0, 0, r * 0x280)?;
-        self.pre[2].fill(0, 0, r * 0x40)?;
+    pub(crate) fn scrub_clean(
+        &self,
+        tilemap_start: u64,
+        tilemap_len: u64,
+        heap_dirty: u64,
+    ) -> Result {
+        if tilemap_len != 0 {
+            self.tilemap
+                .fill(tilemap_start as usize, 0, tilemap_len as usize)?;
+        }
+        if heap_dirty != 0 {
+            self.heap.fill(0, 0, heap_dirty as usize)?;
+        }
         Ok(())
     }
 
     fn scrub(
         &self,
-        pre_records: u32,
         tpc_dirty: u64,
-        tilemap_dirty: u64,
+        tilemap_start: u64,
+        tilemap_len: u64,
+        heap_dirty: u64,
         full: bool,
         stats: &mut SlotStats,
     ) -> Result {
         if !full {
-            self.scrub_clean(pre_records, tilemap_dirty)?;
-            stats.tilemap_clear_bytes = stats.tilemap_clear_bytes.saturating_add(tilemap_dirty);
+            self.scrub_clean(tilemap_start, tilemap_len, heap_dirty)?;
+            stats.tilemap_clear_bytes = stats.tilemap_clear_bytes.saturating_add(tilemap_len);
             stats.pass_scrubs = stats.pass_scrubs.saturating_add(1);
             return Ok(());
         }
@@ -314,8 +343,8 @@ impl PassSlot {
         self.its.fill(0, 0, 32)?;
         self.tpc.fill(0, 0, tpc_dirty as usize)?;
         stats.tpc_clear_bytes = stats.tpc_clear_bytes.saturating_add(tpc_dirty);
-        self.tilemap.fill(0, 0, tilemap_dirty as usize)?;
-        stats.tilemap_clear_bytes = stats.tilemap_clear_bytes.saturating_add(tilemap_dirty);
+        self.tilemap.fill(0, 0, tilemap_len as usize)?;
+        stats.tilemap_clear_bytes = stats.tilemap_clear_bytes.saturating_add(tilemap_len);
         self.aux.fill(0, 0, 0x20000)?;
         self.heap.fill(0, 0, 0x4000)?;
         self.scene.fill(0, 0, super::fw::work::scene::SIZE)?;
@@ -364,6 +393,7 @@ impl PassSlot {
 pub(crate) struct Claims {
     pub(crate) slot: [u32; sizes::COMPUTE_SLOTS],
     pub(crate) slot_count: u32,
+    pub(crate) compute_pipe: u8,
     pub(crate) pass: [u32; sizes::RENDER_SLOTS],
     pub(crate) pass_count: u32,
     pub(crate) pass_mask: u64,
@@ -381,6 +411,7 @@ impl Claims {
         Self {
             slot: [0; sizes::COMPUTE_SLOTS],
             slot_count: 0,
+            compute_pipe: 0,
             pass: [0; sizes::RENDER_SLOTS],
             pass_count: 0,
             pass_mask: 0,
@@ -509,17 +540,28 @@ impl PendingScrub {
         let bit = 1u64 << self.slot;
         let ok = if self.state.generation.load(Ordering::Acquire) != self.generation {
             false
-        } else if let Some((pass, tilemap_dirty)) = self.arena.pass_and_tilemap_dirty(self.slot) {
-            let dirty = tilemap_dirty.load(Ordering::Acquire);
-            match pass.scrub_clean(1, dirty) {
+        } else if let Some((pass, d)) = self.arena.pass_and_dirty(self.slot) {
+            let dirty = d.tilemap.load(Ordering::Acquire);
+            let last = d.tilemap_last.load(Ordering::Acquire);
+            let already = d.tilemap_clean.load(Ordering::Acquire);
+            let heap = d.heap.load(Ordering::Acquire);
+            let target = if last != 0 { dirty.min(last) } else { dirty };
+            let len = target.saturating_sub(already);
+            match pass.scrub_clean(already, len, heap) {
                 Ok(()) => {
                     // Order scrubbed WC bytes before clearing dirty / publishing clean_mask.
                     super::engine::wmb();
-                    tilemap_dirty.store(0, Ordering::Release);
+                    d.heap.store(0, Ordering::Release);
+                    if target >= dirty {
+                        d.tilemap.store(0, Ordering::Release);
+                        d.tilemap_clean.store(0, Ordering::Release);
+                    } else {
+                        d.tilemap_clean.store(target, Ordering::Release);
+                    }
                     self.state.pass_scrubs.fetch_add(1, Ordering::Relaxed);
                     self.state
                         .tilemap_clear_bytes
-                        .fetch_add(dirty, Ordering::Relaxed);
+                        .fetch_add(len, Ordering::Relaxed);
                     true
                 }
                 Err(_) => false,
@@ -747,6 +789,18 @@ impl Slots {
     pub(crate) fn compute_available(&self, n: usize) -> bool {
         (0..n.min(sizes::COMPUTE_UNITS)).any(|k| self.compute.lifetime.available(k))
     }
+    /// Whether one of the first `n` compute units eligible for `pipe` can be claimed now.
+    /// Pipe 0 may claim `0..n`; secondary pipes stay in `BASE_COMPUTE_UNITS..n` so a 2-unit
+    /// base-only VM can never see both base units undisplaced across two pipes.
+    pub(crate) fn compute_available_for_pipe(&self, n: usize, pipe: usize) -> bool {
+        let limit = n.min(sizes::COMPUTE_UNITS);
+        let start = if pipe == 0 {
+            0
+        } else {
+            super::resources::BASE_COMPUTE_UNITS.min(limit)
+        };
+        (start..limit).any(|k| self.compute.lifetime.available(k))
+    }
     /// Whether one of the first `n` render pass slots can be claimed now.
     #[allow(dead_code)]
     pub(crate) fn pass_available(&self, n: usize) -> bool {
@@ -865,7 +919,17 @@ impl Slots {
     }
     /// Available compute units within the first `n` units (a VM's prepared count).
     pub(crate) fn free_compute_in(&self, n: usize) -> u32 {
-        (0..n.min(sizes::COMPUTE_UNITS))
+        self.free_compute_in_for_pipe(n, 0)
+    }
+    /// Available compute units within the first `n` units eligible for `pipe`.
+    pub(crate) fn free_compute_in_for_pipe(&self, n: usize, pipe: usize) -> u32 {
+        let limit = n.min(sizes::COMPUTE_UNITS);
+        let start = if pipe == 0 {
+            0
+        } else {
+            super::resources::BASE_COMPUTE_UNITS.min(limit)
+        };
+        (start..limit)
             .filter(|&k| self.compute.lifetime.available(k))
             .count() as u32
     }
@@ -887,11 +951,12 @@ impl Slots {
                 *dirty = true;
             }
         }
-        for k in 0..sizes::RENDER_SLOTS {
-            if f.pass_mask & (1 << k) != 0 {
-                self.render.scrub_full[k] = true;
-                self.scrub.clear_clean(k);
-            }
+        let mut mask = f.pass_mask & PASS_MASK;
+        while mask != 0 {
+            let k = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            self.render.scrub_full[k] = true;
+            self.scrub.clear_clean(k);
         }
     }
 
@@ -912,20 +977,42 @@ impl Slots {
         self.compute.last_full.get(k).copied().unwrap_or(true)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn claim_compute_for(
         &mut self,
         units: &super::resources::Prepared,
         f: &mut Claims,
         vm_id: Option<u64>,
     ) -> Result<Option<usize>> {
+        self.claim_compute_for_pipe(units, f, vm_id, 0)
+    }
+
+    pub(crate) fn claim_compute_for_pipe(
+        &mut self,
+        units: &super::resources::Prepared,
+        f: &mut Claims,
+        vm_id: Option<u64>,
+        pipe: usize,
+    ) -> Result<Option<usize>> {
         if f.slot_count as usize >= f.slot.len() {
             return Ok(None);
         }
-        // Round robin over this VM's units: the next one in publication order is the
-        // oldest, the first to be displaced by a later retired publication.
+        // Round robin over this VM's units eligible for `pipe`: pipe 0 spans `0..n`, while
+        // secondary pipes stay in `BASE_COMPUTE_UNITS..n` so base units `0..2` only ever hold
+        // pipe-0 leases and a 2-unit VM can never hit `compute_exhausted_within(2)`.
         let n = units.compute_units()?.min(sizes::COMPUTE_UNITS);
-        for i in 0..n {
-            let k = (self.cursor as usize + i) % n;
+        let start = if pipe == 0 {
+            0
+        } else {
+            super::resources::BASE_COMPUTE_UNITS
+        };
+        if start >= n {
+            return Ok(None);
+        }
+        let span = n - start;
+        let base_cursor = (self.cursor as usize).saturating_sub(start) % span;
+        for i in 0..span {
+            let k = start + (base_cursor + i) % span;
             if self.compute.lifetime.claim(k) {
                 let full = self.compute.scrub_full[k]
                     || vm_id.is_none_or(|id| {
@@ -940,6 +1027,7 @@ impl Slots {
                 self.compute.last_full[k] = full;
                 f.slot[f.slot_count as usize] = k as u32;
                 f.slot_count += 1;
+                f.compute_pipe = pipe as u8;
                 self.cursor = ((k + 1) % n) as u32;
                 return Ok(Some(k));
             }
@@ -1002,6 +1090,7 @@ impl Slots {
         picked: u64,
     ) -> Option<usize> {
         let n = resources.render_passes().ok()?.min(sizes::RENDER_SLOTS);
+        let mut clean_partial = None;
         let mut fallback = None;
         let mut saw_scrubbing = false;
         for i in 0..n {
@@ -1019,13 +1108,22 @@ impl Slots {
                     continue;
                 }
                 if self.scrub.is_clean(k) {
-                    return Some(k);
+                    if let Ok(d) = resources.render_pass_dirty(k) {
+                        let need = d.tilemap.load(Ordering::Acquire).min(geo.tilemap_bytes);
+                        if need <= d.tilemap_clean.load(Ordering::Acquire)
+                            && d.heap.load(Ordering::Acquire) == 0
+                        {
+                            return Some(k);
+                        }
+                    }
+                    clean_partial.get_or_insert(k);
+                    continue;
                 }
                 fallback.get_or_insert(k);
             }
         }
-        if fallback.is_some() {
-            return fallback;
+        if let Some(k) = clean_partial.or(fallback) {
+            return Some(k);
         }
         if saw_scrubbing {
             self.scrub.waiter.store(true, Ordering::SeqCst);
@@ -1078,22 +1176,33 @@ impl Slots {
                     .is_none_or(|prev| prev.id != id)
             });
         let pre_cleaned = self.scrub.take_clean(k);
-        if full || !pre_cleaned {
-            let p = &arena.passes[k];
-            if let Err(e) = p.scrub(
-                1,
-                arena.tpc_dirty[k].load(Ordering::Relaxed),
-                arena.tilemap_dirty[k].load(Ordering::Relaxed),
-                full,
-                &mut self.stats,
-            ) {
+        let p = &arena.passes[k];
+        if full {
+            let prev_tpc = arena.tpc_dirty[k].load(Ordering::Acquire);
+            let prev_tilemap = arena.tilemap_dirty[k].load(Ordering::Acquire);
+            if let Err(e) = p.scrub(prev_tpc, 0, prev_tilemap, 0x4000, true, &mut self.stats) {
                 self.render.lifetime.cancel(k);
                 return Err(e);
             }
-            if full {
-                arena.tpc_dirty[k].store(0, Ordering::Relaxed);
-            }
+            arena.tpc_dirty[k].store(0, Ordering::Relaxed);
             arena.tilemap_dirty[k].store(0, Ordering::Relaxed);
+            arena.tilemap_last[k].store(0, Ordering::Relaxed);
+            arena.tilemap_clean[k].store(0, Ordering::Relaxed);
+            arena.heap_dirty[k].store(0, Ordering::Relaxed);
+        } else {
+            let prev_dirty = arena.tilemap_dirty[k].load(Ordering::Acquire);
+            let already = arena.tilemap_clean[k].load(Ordering::Acquire);
+            let heap = arena.heap_dirty[k].load(Ordering::Acquire);
+            let delta = prev_dirty.saturating_sub(already);
+            if !(pre_cleaned && delta == 0 && heap == 0) {
+                if let Err(e) = p.scrub(0, already, delta, heap, false, &mut self.stats) {
+                    self.render.lifetime.cancel(k);
+                    return Err(e);
+                }
+                arena.heap_dirty[k].store(0, Ordering::Relaxed);
+                arena.tilemap_dirty[k].store(0, Ordering::Relaxed);
+                arena.tilemap_clean[k].store(0, Ordering::Relaxed);
+            }
         }
         self.render.last_full[k] = full;
         self.pass_cursor = ((k + 1) % n) as u32;
@@ -1120,31 +1229,41 @@ impl Slots {
                     .is_none_or(|prev| prev.id != id)
             });
         let pre_cleaned = self.scrub.take_clean(k);
-        if full || !pre_cleaned {
-            let p = resources.render_pass(k)?;
-            let (tpc_dirty, tilemap_dirty) = resources.render_pass_dirty(k)?;
-            // On clean same-VM reuse, zero only the overlap with the current pass's tilemap so a
-            // small render never scrubs leftover bytes from an earlier large render; preserve the
-            // high-water mark in `tilemap_dirty` for cross-VM or recovery full scrubs.
-            let prev_tilemap = tilemap_dirty.load(Ordering::Relaxed);
-            let clear_tilemap = if full {
-                prev_tilemap
-            } else {
-                prev_tilemap.min(tilemap_bytes)
-            };
-            if let Err(e) = p.scrub(
-                1,
-                tpc_dirty.load(Ordering::Relaxed),
-                clear_tilemap,
-                full,
-                &mut self.stats,
-            ) {
+        let p = resources.render_pass(k)?;
+        let d = resources.render_pass_dirty(k)?;
+        if full {
+            let prev_tpc = d.tpc.load(Ordering::Acquire);
+            let prev_tilemap = d.tilemap.load(Ordering::Acquire);
+            if let Err(e) = p.scrub(prev_tpc, 0, prev_tilemap, 0x4000, true, &mut self.stats) {
                 self.render.lifetime.cancel(k);
                 return Err(e);
             }
-            if full {
-                tpc_dirty.store(0, Ordering::Relaxed);
-                tilemap_dirty.store(0, Ordering::Relaxed);
+            d.tpc.store(0, Ordering::Relaxed);
+            d.tilemap.store(0, Ordering::Relaxed);
+            d.tilemap_last.store(0, Ordering::Relaxed);
+            d.tilemap_clean.store(0, Ordering::Relaxed);
+            d.heap.store(0, Ordering::Relaxed);
+        } else {
+            // On clean same-VM reuse, zero only the uncleaned overlap with the current pass's
+            // tilemap (`already..need`) and the active heap span; preserve the high-water mark
+            // in `d.tilemap` for cross-VM or recovery full scrubs.
+            let prev_dirty = d.tilemap.load(Ordering::Acquire);
+            let already = d.tilemap_clean.load(Ordering::Acquire);
+            let heap = d.heap.load(Ordering::Acquire);
+            let need = prev_dirty.min(tilemap_bytes);
+            let delta = need.saturating_sub(already);
+            if !(pre_cleaned && delta == 0 && heap == 0) {
+                if let Err(e) = p.scrub(0, already, delta, heap, false, &mut self.stats) {
+                    self.render.lifetime.cancel(k);
+                    return Err(e);
+                }
+                d.heap.store(0, Ordering::Relaxed);
+                if prev_dirty != 0 && need >= prev_dirty {
+                    d.tilemap.store(0, Ordering::Relaxed);
+                    d.tilemap_clean.store(0, Ordering::Relaxed);
+                } else if delta != 0 {
+                    d.tilemap_clean.store(need, Ordering::Relaxed);
+                }
             }
         }
         self.render.last_full[k] = full;
@@ -1181,19 +1300,101 @@ impl Slots {
                 self.stats.last_retarget[0] = proof;
             }
         }
-        for k in 0..sizes::RENDER_SLOTS {
-            if f.pass_mask & (1 << k) != 0 {
-                if let Some(proof) = self.render.pending_retarget[k].take() {
-                    self.stats.cross_vm_retargets[1] =
-                        self.stats.cross_vm_retargets[1].saturating_add(1);
-                    self.stats.last_retarget[1] = proof;
-                }
+        let mut mask = f.pass_mask & PASS_MASK;
+        while mask != 0 {
+            let k = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            if let Some(proof) = self.render.pending_retarget[k].take() {
+                self.stats.cross_vm_retargets[1] =
+                    self.stats.cross_vm_retargets[1].saturating_add(1);
+                self.stats.last_retarget[1] = proof;
             }
         }
     }
 
+    /// Retains one newly claimed compute unit's VM/ASID lease and owner arena in O(1).
+    pub(crate) fn hold_compute_slot(
+        &mut self,
+        k: usize,
+        vm: &Arc<super::vm::VmState>,
+        resources: &super::resources::Prepared,
+    ) -> Result {
+        if k >= sizes::COMPUTE_UNITS {
+            return Err(EINVAL);
+        }
+        self.compute.pending_retarget[k] = self.compute.owner[k]
+            .as_ref()
+            .and_then(|old| Self::vm_retarget(k, old, vm));
+        self.compute.pending_owner[k] = Some(vm.clone());
+        self.compute.pending_arena[k] = resources.compute_arena(k);
+        Ok(())
+    }
+
+    /// Retains one newly claimed render pass slot's VM/ASID lease and owner arena in O(1).
+    pub(crate) fn hold_render_pass(
+        &mut self,
+        k: usize,
+        vm: &Arc<super::vm::VmState>,
+        resources: &super::resources::Prepared,
+    ) -> Result {
+        if k >= sizes::RENDER_SLOTS {
+            return Err(EINVAL);
+        }
+        self.render.pending_retarget[k] = self.render.owner[k]
+            .as_ref()
+            .and_then(|old| Self::vm_retarget(k, old, vm));
+        self.render.pending_owner[k] = Some(vm.clone());
+        self.render.pending_arena[k] = resources.pass_owner_arena(k);
+        Ok(())
+    }
+
+    /// Validates claim bounds/masks and confirms every claimed slot already holds a pending
+    /// VM lease without re-cloning `Arc` leases at publication time.
+    pub(crate) fn verify_held(&self, f: &Claims) -> Result {
+        if f.slot_count as usize > f.slot.len()
+            || f.pass_count as usize > f.pass.len()
+            || f.pass_mask & !PASS_MASK != 0
+        {
+            return Err(EINVAL);
+        }
+        for &k in &f.slot[..f.slot_count as usize] {
+            let k = k as usize;
+            if k >= sizes::COMPUTE_UNITS || self.compute.pending_owner[k].is_none() {
+                return Err(EINVAL);
+            }
+        }
+        if f.pass_count != 0 {
+            let mut mask = 0u64;
+            for &k in &f.pass[..f.pass_count as usize] {
+                let k = k as usize;
+                if k >= sizes::RENDER_SLOTS || self.render.pending_owner[k].is_none() {
+                    return Err(EINVAL);
+                }
+                let bit = 1u64 << k;
+                if mask & bit != 0 {
+                    return Err(EINVAL);
+                }
+                mask |= bit;
+            }
+            if mask != f.pass_mask {
+                return Err(EINVAL);
+            }
+        } else {
+            let mut mask = f.pass_mask;
+            while mask != 0 {
+                let k = mask.trailing_zeros() as usize;
+                mask &= mask - 1;
+                if self.render.pending_owner[k].is_none() {
+                    return Err(EINVAL);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Retains each actual owner's VM/ASID binding through the firmware's last-owner era.
     /// A previous lease is replaced only after the new publication fully retires.
+    #[allow(dead_code)]
     pub(crate) fn hold_vm(&mut self, f: &Claims, vm: &Arc<super::vm::VmState>) -> Result {
         if f.slot_count as usize > f.slot.len()
             || f.slot[..f.slot_count as usize]
@@ -1227,29 +1428,32 @@ impl Slots {
                 .and_then(|old| Self::vm_retarget(k, old, vm));
             self.compute.pending_owner[k] = Some(vm.clone());
         }
-        for k in 0..sizes::RENDER_SLOTS {
-            if f.pass_mask & (1 << k) != 0 {
-                self.render.pending_retarget[k] = self.render.owner[k]
-                    .as_ref()
-                    .and_then(|old| Self::vm_retarget(k, old, vm));
-                self.render.pending_owner[k] = Some(vm.clone());
-            }
+        let mut mask = f.pass_mask;
+        while mask != 0 {
+            let k = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            self.render.pending_retarget[k] = self.render.owner[k]
+                .as_ref()
+                .and_then(|old| Self::vm_retarget(k, old, vm));
+            self.render.pending_owner[k] = Some(vm.clone());
         }
         Ok(())
     }
 
     /// With [`Self::hold_vm`]: the claimed units' arenas, held with their VM leases. The VM's
     /// own cache lets go of its arenas when its client closes.
+    #[allow(dead_code)]
     pub(crate) fn hold_arenas(&mut self, f: &Claims, resources: &super::resources::Prepared) {
         for &k in &f.slot[..(f.slot_count as usize).min(f.slot.len())] {
             if let Some(cell) = self.compute.pending_arena.get_mut(k as usize) {
                 *cell = resources.compute_arena(k as usize);
             }
         }
-        for k in 0..sizes::RENDER_SLOTS {
-            if f.pass_mask & (1 << k) != 0 {
-                self.render.pending_arena[k] = resources.pass_owner_arena(k);
-            }
+        let mut mask = f.pass_mask & PASS_MASK;
+        while mask != 0 {
+            let k = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            self.render.pending_arena[k] = resources.pass_owner_arena(k);
         }
     }
 
@@ -1259,7 +1463,7 @@ impl Slots {
         let mut c = self.compute.lifetime.clone();
         let mut p = self.render.lifetime.clone();
         for &k in &f.slot[..f.slot_count as usize] {
-            if !c.publish(k as usize) {
+            if !c.publish_on(k as usize, f.compute_pipe) {
                 return Err(EBUSY);
             }
         }
@@ -1273,8 +1477,11 @@ impl Slots {
                 }
             }
         } else {
-            for k in 0..sizes::RENDER_SLOTS {
-                if f.pass_mask & (1 << k) != 0 && !p.publish(k) {
+            let mut mask = f.pass_mask & PASS_MASK;
+            while mask != 0 {
+                let k = mask.trailing_zeros() as usize;
+                mask &= mask - 1;
+                if !p.publish(k) {
                     return Err(EBUSY);
                 }
             }
@@ -1304,8 +1511,11 @@ impl Slots {
                 }
             }
         } else {
-            for k in 0..sizes::RENDER_SLOTS {
-                if f.pass_mask & (1 << k) != 0 && !p.retire(k) {
+            let mut mask = f.pass_mask & PASS_MASK;
+            while mask != 0 {
+                let k = mask.trailing_zeros() as usize;
+                mask &= mask - 1;
+                if !p.retire(k) {
                     return Err(EINVAL);
                 }
             }
@@ -1320,17 +1530,19 @@ impl Slots {
                 self.compute.scrub_full[k as usize] = false;
             }
         }
-        for k in 0..sizes::RENDER_SLOTS {
-            if f.pass_mask & (1 << k) != 0 {
-                self.render.owner[k] = self.render.pending_owner[k].take();
-                self.render.arena[k] = self.render.pending_arena[k].take();
-                if clean_scrub {
-                    self.render.scrub_full[k] = false;
-                }
+        let mut mask = f.pass_mask & PASS_MASK;
+        while mask != 0 {
+            let k = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            self.render.owner[k] = self.render.pending_owner[k].take();
+            self.render.arena[k] = self.render.pending_arena[k].take();
+            if clean_scrub {
+                self.render.scrub_full[k] = false;
             }
         }
         self.pass_busy &= !f.pass_mask;
         f.slot_count = 0;
+        f.compute_pipe = 0;
         f.pass_count = 0;
         f.pass_mask = 0;
         f.ct_count = 0;
@@ -1342,16 +1554,18 @@ impl Slots {
             self.compute.pending_retarget[k as usize] = None;
             self.compute.scrub_full[k as usize] = true;
         }
-        for k in 0..sizes::RENDER_SLOTS {
-            if f.pass_mask & (1 << k) != 0 {
-                self.render.lifetime.quarantine(k);
-                self.render.pending_retarget[k] = None;
-                self.render.scrub_full[k] = true;
-                self.scrub.clear_clean(k);
-            }
+        let mut mask = f.pass_mask & PASS_MASK;
+        while mask != 0 {
+            let k = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            self.render.lifetime.quarantine(k);
+            self.render.pending_retarget[k] = None;
+            self.render.scrub_full[k] = true;
+            self.scrub.clear_clean(k);
         }
         self.pass_busy &= !f.pass_mask;
         f.slot_count = 0;
+        f.compute_pipe = 0;
         f.pass_count = 0;
         f.pass_mask = 0;
         f.ct_count = 0;
@@ -1365,18 +1579,20 @@ impl Slots {
             self.compute.pending_arena[k as usize] = None;
             self.compute.scrub_full[k as usize] = true;
         }
-        for k in 0..sizes::RENDER_SLOTS {
-            if f.pass_mask & (1 << k) != 0 {
-                self.render.lifetime.cancel(k);
-                self.render.pending_retarget[k] = None;
-                self.render.pending_owner[k] = None;
-                self.render.pending_arena[k] = None;
-                self.render.scrub_full[k] = true;
-                self.scrub.clear_clean(k);
-            }
+        let mut mask = f.pass_mask & PASS_MASK;
+        while mask != 0 {
+            let k = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            self.render.lifetime.cancel(k);
+            self.render.pending_retarget[k] = None;
+            self.render.pending_owner[k] = None;
+            self.render.pending_arena[k] = None;
+            self.render.scrub_full[k] = true;
+            self.scrub.clear_clean(k);
         }
         self.pass_busy &= !f.pass_mask;
         f.slot_count = 0;
+        f.compute_pipe = 0;
         f.pass_count = 0;
         f.pass_mask = 0;
         f.ct_count = 0;

@@ -171,18 +171,26 @@ struct RenderBarrierPlan {
     ta_prev_wait: bool,
     ta_fs_wait: Option<u32>,
     fs_render_wait: Option<u32>,
-    ta_compute_wait: Option<u32>,
-    fs_compute_wait: Option<u32>,
+    ta_compute_wait: [Option<u32>; sizes::COMPUTE_PIPES],
+    fs_compute_wait: [Option<u32>; sizes::COMPUTE_PIPES],
 }
 
 /// Computes TA/FS hardware ring barriers for a render command from its flags, prior render
-/// FS stamp, resolved render waits (`fs_wait_render`, `ta_wait_fs`), and resolved `[ta, fs]`
-/// compute wait stamps.
+/// FS stamp, resolved render waits (`fs_wait_render`, `ta_wait_fs`), resolved `[ta, fs]`
+/// per-pipe compute wait stamps, and whether the immediately preceding in-flight render belongs
+/// to a different VM (`cross_vm_prev`).
 ///
-/// Pipelined renders share one parameter-buffer / UMA epoch (`RENDER_UMA_SLOT`), so TA(N)
-/// must still wait on TA(N-1) (`ta_prev_wait`, matching G15's `prev_barrier`) whenever
+/// Same-VM pipelined renders share one parameter-buffer / UMA slot, and cross-VM pipelined
+/// renders use distinct UMA slots (`RENDER_UMA_SLOT + slot`) on the shared TA/FS pipes: TA(N)
+/// always waits on TA(N-1) (`ta_prev_wait`, matching G15's `prev_barrier`) whenever
 /// `ta_fs_wait` does not already wait on `prev_fs` (which dominates `prev_ta` via
-/// `own_barrier`). Independent FS passes still omit `fs_dep`.
+/// `own_barrier`). Same-VM independent FS passes omit `fs_dep`, while `cross_vm_prev` forces
+/// `fs_render_wait = Some(prev_fs)` (whenever `ta_fs_wait != Some(prev_fs)`) so cross-VM TA
+/// overlaps the previous VM's FS without ever overlapping two VMs' FS/PB teardowns.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Pure barrier-plan helper mirrors the exact render barrier inputs."
+)]
 fn plan_render_barriers(
     flags: u32,
     class_behind: bool,
@@ -190,7 +198,8 @@ fn plan_render_barriers(
     prev_fs: u32,
     fs_wait_render: Option<u32>,
     ta_wait_fs: Option<u32>,
-    compute_waits: [Option<u32>; 2],
+    compute_waits: [[Option<u32>; sizes::COMPUTE_PIPES]; 2],
+    cross_vm_prev: bool,
 ) -> RenderBarrierPlan {
     let staged =
         flags & kernel::uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_STAGE_PREFIXES != 0;
@@ -220,17 +229,26 @@ fn plan_render_barriers(
         None
     };
     let ta_prev_wait = class_behind && ta_fs_wait != Some(prev_fs);
-    let fs_render_wait = if class_behind && early && fs_wait_render != ta_fs_wait {
+    let effective_fs_wait = if cross_vm_prev && class_behind {
+        Some(prev_fs)
+    } else {
         fs_wait_render
+    };
+    let fs_render_wait = if class_behind
+        && (early || (cross_vm_prev && ta_fs_wait != Some(prev_fs)))
+        && effective_fs_wait != ta_fs_wait
+    {
+        effective_fs_wait
     } else {
         None
     };
     let [ta_compute_wait, fs_wait] = compute_waits;
-    let fs_compute_wait = if fs_wait != ta_compute_wait {
-        fs_wait
-    } else {
-        None
-    };
+    let mut fs_compute_wait = [None; sizes::COMPUTE_PIPES];
+    for p in 0..sizes::COMPUTE_PIPES {
+        if fs_wait[p] != ta_compute_wait[p] {
+            fs_compute_wait[p] = fs_wait[p];
+        }
+    }
     RenderBarrierPlan {
         early,
         ta_prev_wait,
@@ -262,11 +280,13 @@ pub(crate) struct Flight {
     pub(crate) count: usize,
     pub(crate) computes: u32,
     pub(crate) renders: u32,
+    /// Compute pipe (`0..COMPUTE_PIPES`) this flight was published to.
+    pub(crate) compute_pipe: u8,
     /// Compute: final FW stamp, ring end (exclusive) and ring position before the prefix.
     pub(crate) target: u32,
     pub(crate) head: u32,
     pub(crate) c_start: u32,
-    /// Render: final TA/FS stamps, ring ends and ring positions before the prefix.
+    /// Render: final TA/FS stamps, ring ends and ring positions.
     pub(crate) ta_target: u32,
     pub(crate) fs_target: u32,
     pub(crate) ta_head: u32,
@@ -321,6 +341,7 @@ impl Flight {
             count: 0,
             computes: 0,
             renders: 0,
+            compute_pipe: 0,
             target: 0,
             head: 0,
             c_start: 0,
@@ -361,14 +382,16 @@ impl Flight {
 struct Prefix {
     computes: u32,
     renders: u32,
+    compute_pipe: usize,
     prev: Prev,
     /// This prefix (re)initializes the PB with InitBM.
     initbm: bool,
     c_head: u32,
     ta_head: u32,
     fs_head: u32,
-    /// Last compute ordinal / last draw ordinal.
+    /// Last total compute ordinal, per-pipe compute ordinal, and draw ordinal.
     n: u64,
+    pipe_n: u64,
     draw: u64,
     last_ct: u32,
     last_ta: u32,
@@ -536,12 +559,13 @@ pub(crate) struct Engine {
     /// flight (`[start, end, 0, 0]` for compute; `[ta_start, ta_end, fs_start, fs_end]` for
     /// render), reused by accounting without re-reading WC cells.
     pub(crate) retired_ticks: [u64; 4],
-    /// Host compute ordinal and draw ordinal of the last publication.
+    /// Host compute ordinal, per-pipe compute ordinals, and draw ordinal of the last publication.
     pub(crate) ordinal: u64,
+    pub(crate) pipe_ordinal: [u64; sizes::COMPUTE_PIPES],
     pub(crate) draw: u64,
     /// Newest published receipts, the tail.
-    pub(crate) target: u32,
-    pub(crate) head: u32,
+    pub(crate) target: [u32; sizes::COMPUTE_PIPES],
+    pub(crate) head: [u32; sizes::COMPUTE_PIPES],
     pub(crate) ta_target: u32,
     pub(crate) fs_target: u32,
     pub(crate) ta_head: u32,
@@ -549,8 +573,9 @@ pub(crate) struct Engine {
     /// Event counts at the tail's publication.
     pub(crate) events: u32,
     pub(crate) stage_seen: u32,
-    /// The compute queue / render queues were registered by a first record (`new_queue`).
-    pub(crate) queue_registered: bool,
+    /// The compute pipes / render queues were registered by a first record (`new_queue`).
+    pub(crate) queue_registered: [bool; sizes::COMPUTE_PIPES],
+    pub(crate) next_compute_pipe: u8,
     pub(crate) render_registered: bool,
     pub(crate) ta_registered: bool,
     /// A ready prefix waits only for a record's consumption: repoll sooner.
@@ -559,11 +584,13 @@ pub(crate) struct Engine {
     /// headroom (not cross-VM/InitBM drain, external fences, or CPU timestamp waits): repoll
     /// sooner to refill freed slots promptly.
     pub(crate) slot_wait: bool,
+    /// A ready same-VM render job is paused by `TA_WAVE_PASSES` pacing until TA advances.
+    pub(crate) ta_wave_wait: bool,
     /// An EP 0x20 event arrived with a flight still settling its final receipt: repoll sooner.
     pub(crate) short_repoll: bool,
-    /// Progress tracking of the oldest compute and render flights.
-    pub(crate) progress_flight: [u64; 2],
-    pub(crate) progress: [Option<u32>; 3],
+    /// Progress tracking of the oldest compute pipe 0/1 and render flights.
+    pub(crate) progress_flight: [u64; 3],
+    pub(crate) progress: [Option<u32>; 4],
     /// Boxed with [`Self::prof`]: `Firmware` is built on the probe's stack.
     pub(crate) stats: KBox<Stats>,
     /// Phase timers (debug_flags bit 49).
@@ -586,23 +613,26 @@ impl Engine {
             shared: None,
             retired_ticks: [0; 4],
             ordinal: 0,
+            pipe_ordinal: [0; sizes::COMPUTE_PIPES],
             draw: 0,
-            target: 0,
-            head: 0,
+            target: [0; sizes::COMPUTE_PIPES],
+            head: [0; sizes::COMPUTE_PIPES],
             ta_target: 0,
             fs_target: 0,
             ta_head: 0,
             fs_head: 0,
             events: 0,
             stage_seen: 0,
-            queue_registered: false,
+            queue_registered: [false; sizes::COMPUTE_PIPES],
+            next_compute_pipe: 0,
             render_registered: false,
             ta_registered: false,
             chan_wait: false,
             slot_wait: false,
+            ta_wave_wait: false,
             short_repoll: false,
-            progress_flight: [0; 2],
-            progress: [None; 3],
+            progress_flight: [0; 3],
+            progress: [None; 4],
             stats: KBox::new(Stats::default(), GFP_KERNEL)?,
             prof: KBox::new(Prof::default(), GFP_KERNEL)?,
             debugfs: None,
@@ -758,11 +788,12 @@ impl Firmware {
 
     /// The single in-order Finalize frontier for each held M4 event. These cells are never
     /// reset after first publication, including across client VM switches and recovery.
-    pub(crate) fn recovery_snapshot(&self) -> Result<[u32; 3]> {
+    pub(crate) fn recovery_snapshot(&self) -> Result<[u32; 4]> {
         Ok([
             self.graph.render.fw_stamp[0].r32(0)?,
             self.graph.render.fw_stamp[1].r32(0)?,
-            self.graph.compute.fw_stamp.r32(0)?,
+            self.graph.compute[0].fw_stamp.r32(0)?,
+            self.graph.compute[1].fw_stamp.r32(0)?,
         ])
     }
 
@@ -773,7 +804,7 @@ impl Firmware {
         flags: u32,
         event: u32,
         target: u32,
-        stage: [u32; 3],
+        stage: [u32; 4],
     ) -> Result {
         if flags & 1 != 0 && self.recovery.last_retired.contains(event, target) {
             // A notification may follow the full receipt. It names the retained old
@@ -788,6 +819,12 @@ impl Firmware {
             .find(|f| match event {
                 15 => {
                     f.computes != 0
+                        && f.compute_pipe == 0
+                        && f.cstamp[..(f.computes as usize).min(f.cstamp.len())].contains(&target)
+                }
+                16 => {
+                    f.computes != 0
+                        && f.compute_pipe == 1
                         && f.cstamp[..(f.computes as usize).min(f.cstamp.len())].contains(&target)
                 }
                 0x70 => {
@@ -838,7 +875,7 @@ impl Firmware {
     /// in the snapshot. Keep it until either its full receipt or its passed-abort proof.
     pub(crate) fn recovery_prepare_suspects(
         &mut self,
-        stage: [u32; 3],
+        stage: [u32; 4],
         _event: u32,
         fault_asid: Option<u32>,
     ) -> Result {
@@ -848,9 +885,10 @@ impl Firmware {
             self.engine.ta_target,
             self.engine.fs_target,
         );
-        // Every unfinished flight, including compute queued behind the oldest.
+        // Every unfinished flight, including compute queued behind the oldest on either pipe.
         for f in self.engine.flights.iter_mut() {
-            let unfinished = (f.computes != 0 && !reached(stage[2], f.target, target))
+            let pipe = (f.compute_pipe as usize).min(sizes::COMPUTE_PIPES - 1);
+            let unfinished = (f.computes != 0 && !reached(stage[2 + pipe], f.target, target[pipe]))
                 || (f.renders != 0
                     && (!reached(stage[0], f.ta_target, ta_target)
                         || !reached(stage[1], f.fs_target, fs_target)));
@@ -939,6 +977,7 @@ impl Firmware {
 
         self.engine.chan_wait = false;
         self.engine.slot_wait = false;
+        self.engine.ta_wave_wait = false;
         while self.recovery.failed().is_none()
             && !self.engine.frozen
             && !self.engine.pending.is_empty()
@@ -948,20 +987,49 @@ impl Firmware {
             };
             let mut job = self.engine.pending[index].clone();
             // Even a failed job may have an earlier command in flight. An aggregate
-            // error fence must not race that command's access to user buffers: only
-            // healthy same-VM non-InitBM commands queue behind active flights; when the
-            // head queue cannot queue behind (e.g. its class hit its flight cap), still
-            // allow another ready queue of the other class to run concurrently, unless
-            // the head job itself requires `flights` to drain to empty first (cross-VM
-            // switch, unprimed InitBM render, failed VM, or recovery/InitBM in flight).
+            // error fence must not race that command's access to user buffers: healthy
+            // non-InitBM commands (compute or warm-PB render of any VM) queue behind
+            // active flights; when the head queue cannot queue behind (e.g. its class
+            // hit its flight cap), still allow another ready queue to run concurrently
+            // while preserving per-queue FIFO, unless the head job itself requires
+            // `flights` to drain to empty first (unprimed cold InitBM render, failed
+            // VM, or recovery/InitBM in flight).
             if !self.engine.flights.is_empty() && !self.can_queue_behind(&job) {
                 if self.needs_engine_drain(&job) {
                     self.engine.stats.hold[0] += 1;
                     break;
                 }
+                let ta_wave_paused = self.ta_pending_passes() >= super::hw::sizes::TA_WAVE_PASSES;
                 let mut alt: Option<usize> = None;
                 for (i, cand) in self.engine.pending.iter().enumerate() {
                     if i == index || !self.can_queue_behind(cand) {
+                        continue;
+                    }
+                    // Preserve per-queue FIFO: never jump a later job of a queue ahead
+                    // of an earlier pending job of the same queue, except when TA wave
+                    // pacing pauses earlier ready renders and an independent non-query
+                    // compute (such as pre-gfx culling) has all dependencies published
+                    // (`can_queue_behind` already checked `check_command_dependencies`).
+                    let same_queue_blocked = self.engine.pending[..i].iter().any(|earlier| {
+                        if !Arc::ptr_eq(&earlier.queue, &cand.queue) {
+                            return false;
+                        }
+                        let allow_pre_gfx = ta_wave_paused
+                            && matches!(
+                                command(cand, cand.progress.sent()),
+                                Some(Command::Compute(c)) if !c.query_access
+                            )
+                            && matches!(
+                                command(earlier, earlier.progress.sent()),
+                                Some(Command::Render(_))
+                            )
+                            && !self.needs_engine_drain(earlier)
+                            && earlier
+                                .check_command_dependencies(earlier.progress.sent())
+                                .is_ok();
+                        !allow_pre_gfx
+                    });
+                    if same_queue_blocked {
                         continue;
                     }
                     let better = match alt {
@@ -986,6 +1054,17 @@ impl Firmware {
                             .pending
                             .iter()
                             .any(|cand| self.blocked_on_slot_headroom(cand));
+                        self.engine.ta_wave_wait = self.ta_pending_passes()
+                            >= super::hw::sizes::TA_WAVE_PASSES
+                            && self.engine.pending.iter().any(|cand| {
+                                matches!(
+                                    command(cand, cand.progress.sent()),
+                                    Some(Command::Render(_))
+                                ) && !self.needs_engine_drain(cand)
+                                    && cand
+                                        .check_command_dependencies(cand.progress.sent())
+                                        .is_ok()
+                            });
                         self.engine.stats.hold[0] += 1;
                         break;
                     }
@@ -1082,6 +1161,24 @@ impl Firmware {
                     if job.progress.sent() == job.progress.count() {
                         self.engine.unpend(&job); // fully published
                     }
+                    // Ring TA/FS immediately once a render wave fills TA_WAVE_PASSES so the GPU
+                    // starts tiling right away instead of waiting behind another loop iteration
+                    // or an alt-class compute publication.
+                    if pending_rings & ((1u8 << (Channel::Fs as u8)) | (1u8 << (Channel::Ta as u8)))
+                        != 0
+                        && self.ta_pending_passes() >= super::hw::sizes::TA_WAVE_PASSES
+                    {
+                        if let Err(e) = self.flush_doorbells(&mut pending_rings) {
+                            dev_err!(
+                                self.graph.dev.as_ref(),
+                                "G16: render wave doorbell ring failed after visibility began ({:?})\n",
+                                e
+                            );
+                            self.fail_stop(EIO, done);
+                            result = Err(EIO);
+                            break;
+                        }
+                    }
                     continue;
                 }
                 Err(PublicationError::Unpublished(e))
@@ -1172,11 +1269,12 @@ impl Firmware {
         result
     }
 
-    /// Rings each submit channel touched during a publication batch once, preserving
+    /// Rings each submit channel touched during a publication batch once, waking Compute
+    /// first so pre-gfx compute starts immediately ahead of TA barriers while preserving
     /// FS-before-TA doorbell order for render batches.
     fn flush_doorbells(&mut self, pending_rings: &mut u8) -> Result {
         let mask = core::mem::take(pending_rings);
-        for channel in [Channel::Fs, Channel::Ta, Channel::Compute] {
+        for channel in [Channel::Compute, Channel::Fs, Channel::Ta] {
             if mask & (1u8 << (channel as u8)) != 0 {
                 self.session.ring(channel)?;
             }
@@ -1187,20 +1285,30 @@ impl Firmware {
     /// Whether `job` requires `self.engine.flights` to drain to empty before it can
     /// publish (so `alt`-class bypass must not keep refilling the engine ahead of it).
     fn needs_engine_drain(&self, job: &Arc<Job>) -> bool {
+        let cmd = command(job, job.progress.sent());
+        let is_render = matches!(cmd, Some(Command::Render(_)));
+        let is_compute = matches!(cmd, Some(Command::Compute(_)));
         job.vm.status.get() != 0
             || self.engine.flights.iter().any(|f| {
-                f.doomed || f.recovery_suspect || f.initbm || !Arc::ptr_eq(&f.job.vm, &job.vm)
+                f.doomed
+                    || f.recovery_suspect
+                    || f.initbm
+                    || (((is_compute && f.renders != 0) || (is_render && f.computes != 0))
+                        && !Arc::ptr_eq(&f.job.vm, &job.vm))
             })
-            || (matches!(command(job, job.progress.sent()), Some(Command::Render(_)))
+            || (is_render
                 && !job
                     .resources
                     .pb_slots()
-                    .is_ok_and(|n| self.pools.can_pipeline_within(&job.vm, n)))
+                    .and_then(|n| Ok((n, job.resources.pb_heap_blocks()?)))
+                    .is_ok_and(|(n, blocks)| {
+                        self.pools.can_pipeline_within_blocks(&job.vm, n, blocks)
+                    }))
     }
 
-    /// Whether `job` is ready to run on the same VM but currently blocked solely on
-    /// flight-depth or pass/compute-slot headroom (not on cross-VM/InitBM/recovery drain,
-    /// external sync dependencies, or CPU timestamp-publish waits).
+    /// Whether `job` is ready to run without an engine drain but currently blocked solely on
+    /// flight-depth or pass/compute-slot headroom (not on InitBM/recovery drain, external sync
+    /// dependencies, or CPU timestamp-publish waits).
     fn blocked_on_slot_headroom(&self, job: &Arc<Job>) -> bool {
         let e = &self.engine;
         if e.flights.is_empty() || self.needs_engine_drain(job) {
@@ -1239,31 +1347,63 @@ impl Firmware {
         }
     }
 
+    /// Unfinished TA passes across active render flights. Returns immediately without reading
+    /// WC memory when total active render passes are already below `TA_WAVE_PASSES`.
+    pub(crate) fn ta_pending_passes(&self) -> usize {
+        let active_renders: usize = self
+            .engine
+            .flights
+            .iter()
+            .map(|f| f.renders as usize)
+            .sum();
+        if active_renders < super::hw::sizes::TA_WAVE_PASSES {
+            return active_renders;
+        }
+        let Ok(obs) = self.graph.render.fw_stamp[0].r32(0) else {
+            return active_renders;
+        };
+        let tail = self.engine.ta_target;
+        let mut pending = 0usize;
+        for f in &self.engine.flights {
+            for &stamp in &f.r_ta_stamp[..(f.renders as usize).min(f.r_ta_stamp.len())] {
+                if !super::recovery::logic::stamp_reached(obs, stamp, tail) {
+                    pending += 1;
+                }
+            }
+        }
+        pending
+    }
+
     /// Whether `job`'s next command may be published behind the flights in flight:
     ///
-    /// - Compute queues behind healthy same-VM non-InitBM compute and/or render flights (up to
-    ///   [`params::compute_flights`] active computes), each in its own `ComputeSlot`
-    ///   (`its`/`work`), unless `query_access` is set and a same-queue predecessor in its
-    ///   compute or render barrier prefix has CPU-published timestamp outputs that have not
-    ///   retired yet (`DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS` clears `query_access`).
-    /// - Render queues behind healthy same-VM non-InitBM render and/or compute flights (up to
-    ///   [`params::render_flights`] active renders), rotating `PassSlot` (`0..RENDER_SLOTS`)
-    ///   while sharing the active exposed PB/UMA allocator slot (`Pools::can_pipeline`).
-    ///   Hardware barriers on the CDM/TA/FS rings preserve exact same-engine and cross-engine
-    ///   ordering while barrier-free or independent-queue compute and render run concurrently.
-    /// - Cross-VM switches, InitBM priming renders, and every failure or recovery path still
-    ///   drain the engine first.
+    /// - Compute queues behind healthy non-InitBM compute flights of any VM or same-VM
+    ///   render flights (up to [`params::compute_flights`] active computes), each in its own
+    ///   `ComputeSlot` and hardware UMA slot (`COMPUTE_UMA_SLOT + index`), unless `query_access`
+    ///   is set and a same-queue predecessor in its compute or render barrier prefix has
+    ///   CPU-published timestamp outputs that have not retired yet
+    ///   (`DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS` clears `query_access`).
+    /// - Render queues behind healthy non-InitBM render flights of any VM or same-VM compute
+    ///   flights (up to [`params::render_flights`] active renders), rotating `PassSlot`
+    ///   (`0..RENDER_SLOTS`) while reusing that VM's warm PB/UMA allocator slot
+    ///   (`Pools::can_pipeline_within`, each owning its own hardware UMA slot
+    ///   `RENDER_UMA_SLOT + slot`). Hardware barriers on the CDM/TA/FS rings preserve exact
+    ///   same-engine, cross-engine, and cross-VM FS ordering while allowing cross-VM TA to
+    ///   overlap the preceding VM's FS.
+    /// - Cross-VM compute/render overlap is disallowed in both directions so a long compute
+    ///   dispatch from one client cannot starve another client's fragment shading into a
+    ///   firmware DM1 timeout. Cold InitBM priming renders and every failure or recovery path
+    ///   still drain the engine first.
     fn can_queue_behind(&self, job: &Arc<Job>) -> bool {
         let e = &self.engine;
+        let sent = job.progress.sent();
         if job.vm.status.get() != 0
             || e.flights.len() >= super::hw::sizes::FLIGHTS
-            || e.flights.iter().any(|f| {
-                f.doomed || f.recovery_suspect || f.initbm || !Arc::ptr_eq(&f.job.vm, &job.vm)
-            })
+            || e.flights
+                .iter()
+                .any(|f| f.doomed || f.recovery_suspect || f.initbm)
         {
             return false;
         }
-        let sent = job.progress.sent();
         if job.check_command_dependencies(sent).is_err() {
             return false;
         }
@@ -1293,8 +1433,13 @@ impl Firmware {
                         };
                         waits_class(super::command::COMPUTE) || waits_class(super::command::RENDER)
                     });
+                let cross_vm_render = e
+                    .flights
+                    .iter()
+                    .any(|f| f.renders != 0 && !Arc::ptr_eq(&f.job.vm, &job.vm));
                 let compute_count: usize = e.flights.iter().map(|f| f.computes as usize).sum();
-                !waits_for_timestamps
+                !cross_vm_render
+                    && !waits_for_timestamps
                     && compute_count < params::compute_flights()
                     && !self.slots.compute_exhausted()
                     && super::recovery::logic::next_ordinal(e.ordinal).is_some()
@@ -1304,15 +1449,24 @@ impl Firmware {
                         .is_ok_and(|units| self.slots.compute_available(units))
             }
             Some(Command::Render(_)) => {
+                let cross_vm_compute = e
+                    .flights
+                    .iter()
+                    .any(|f| f.computes != 0 && !Arc::ptr_eq(&f.job.vm, &job.vm));
                 let render_count: usize = e.flights.iter().map(|f| f.renders as usize).sum();
-                render_count < params::render_flights()
+                !cross_vm_compute
+                    && render_count < params::render_flights()
+                    && self.ta_pending_passes() < super::hw::sizes::TA_WAVE_PASSES
                     && !self.slots.render_exhausted()
                     && !self.pools.exhausted()
                     && super::recovery::logic::next_ordinal(e.draw).is_some()
                     && job
                         .resources
                         .pb_slots()
-                        .is_ok_and(|n| self.pools.can_pipeline_within(&job.vm, n))
+                        .and_then(|n| Ok((n, job.resources.pb_heap_blocks()?)))
+                        .is_ok_and(|(n, blocks)| {
+                            self.pools.can_pipeline_within_blocks(&job.vm, n, blocks)
+                        })
                     && job
                         .resources
                         .render_passes()
@@ -1376,18 +1530,38 @@ impl Firmware {
             if flight.renders == 0 || !Arc::ptr_eq(&flight.job.queue, &job.queue) {
                 return None;
             }
-            let count = (flight.renders as usize).min(flight.r_fs_stamp.len());
-            for member in 0..count {
-                let k = (flight.first + member) as u32;
+            let max_members = (flight.renders as usize).min(flight.r_fs_stamp.len());
+            let mut member = 0usize;
+            for k in flight.first..flight.first + flight.count {
+                if member >= max_members {
+                    return None;
+                }
                 if flight
                     .job
-                    .command_order(k)
+                    .command_order(k as u32)
                     .is_some_and(|fo| fo.engine == super::command::RENDER && fo.sequence == last)
                 {
                     return Some(WaitTarget {
                         stamp: flight.r_fs_stamp[member],
                         initbm: flight.initbm,
                     });
+                }
+                member += 1;
+            }
+            for j2 in flight.group.iter() {
+                for k in 0..j2.progress.count() {
+                    if member >= max_members {
+                        return None;
+                    }
+                    if j2.command_order(k).is_some_and(|fo| {
+                        fo.engine == super::command::RENDER && fo.sequence == last
+                    }) {
+                        return Some(WaitTarget {
+                            stamp: flight.r_fs_stamp[member],
+                            initbm: flight.initbm,
+                        });
+                    }
+                    member += 1;
                 }
             }
             None
@@ -1429,6 +1603,118 @@ impl Firmware {
         self.wait_stamp_for(job, other, target_seq)
     }
 
+    /// Resolves the newest in-flight same-queue compute producer on each compute pipe with
+    /// ordinal `<= target_seq`. Returns `Ok([None; COMPUTE_PIPES])` when no barrier was
+    /// requested or the entire prefix through `target_seq` has already retired, and `Err(EAGAIN)`
+    /// if `target_seq` is neither in flight nor retired.
+    fn wait_compute_stamps_for(
+        &self,
+        job: &Arc<Job>,
+        target_seq: Option<u64>,
+    ) -> Result<[Option<WaitTarget>; sizes::COMPUTE_PIPES]> {
+        let Some(last) = target_seq else {
+            return Ok([None; sizes::COMPUTE_PIPES]);
+        };
+        if job.queue.completed[super::command::COMPUTE].load(Ordering::Acquire) >= last {
+            return Ok([None; sizes::COMPUTE_PIPES]);
+        }
+        let mut waits = [None; sizes::COMPUTE_PIPES];
+        let mut best_seq = [0u64; sizes::COMPUTE_PIPES];
+        let mut found_last = false;
+        for flight in &self.engine.flights {
+            if flight.computes == 0 || !Arc::ptr_eq(&flight.job.queue, &job.queue) {
+                continue;
+            }
+            let pipe = flight.compute_pipe as usize;
+            if pipe >= sizes::COMPUTE_PIPES {
+                return Err(EIO);
+            }
+            let mut member = 0usize;
+            for k in flight.first..flight.first + flight.count {
+                if let Some(fo) = flight.job.command_order(k as u32) {
+                    if fo.engine == super::command::COMPUTE && fo.sequence <= last {
+                        if fo.sequence == last {
+                            found_last = true;
+                        }
+                        if fo.sequence >= best_seq[pipe] {
+                            best_seq[pipe] = fo.sequence;
+                            waits[pipe] = Some(WaitTarget {
+                                stamp: *flight.cstamp.get(member).ok_or(EAGAIN)?,
+                                initbm: flight.initbm,
+                            });
+                        }
+                    }
+                }
+                member += 1;
+            }
+            for j2 in flight.group.iter() {
+                for k in 0..j2.progress.count() {
+                    if let Some(fo) = j2.command_order(k) {
+                        if fo.engine == super::command::COMPUTE && fo.sequence <= last {
+                            if fo.sequence == last {
+                                found_last = true;
+                            }
+                            if fo.sequence >= best_seq[pipe] {
+                                best_seq[pipe] = fo.sequence;
+                                waits[pipe] = Some(WaitTarget {
+                                    stamp: *flight.cstamp.get(member).ok_or(EAGAIN)?,
+                                    initbm: flight.initbm,
+                                });
+                            }
+                        }
+                    }
+                    member += 1;
+                }
+            }
+        }
+        if !found_last && !job.queue.is_compute_retired(last) {
+            return Err(EAGAIN);
+        }
+        Ok(waits)
+    }
+
+    /// Chooses which compute pipe (`0..COMPUTE_PIPES`) executes the next compute command:
+    /// - Base-only VMs (`units <= BASE_COMPUTE_UNITS`) or states where pipe 1 has no available
+    ///   extension unit stay on pipe 0 so base units `0..2` never split across two pipes.
+    /// - If the command waits only on one pipe, reuse that pipe (in-order ring, zero `c2c`
+    ///   barrier).
+    /// - If barrier-free (`[None, None]`) or waiting on both pipes (`[Some, Some]`), pick the
+    ///   pipe with fewer active compute commands, breaking ties by `next_compute_pipe`.
+    fn choose_compute_pipe(
+        &self,
+        waits: [Option<WaitTarget>; sizes::COMPUTE_PIPES],
+        units: usize,
+    ) -> usize {
+        if units <= super::resources::BASE_COMPUTE_UNITS
+            || !self.slots.compute_available_for_pipe(units, 1)
+        {
+            return 0;
+        }
+        match waits {
+            [Some(_), None] => 0,
+            [None, Some(_)] => 1,
+            _ => {
+                if !self.slots.compute_available_for_pipe(units, 0) {
+                    return 1;
+                }
+                let mut active = [0usize; sizes::COMPUTE_PIPES];
+                for fl in &self.engine.flights {
+                    if fl.computes != 0 {
+                        let p = (fl.compute_pipe as usize).min(sizes::COMPUTE_PIPES - 1);
+                        active[p] += fl.computes as usize;
+                    }
+                }
+                if active[0] < active[1] {
+                    0
+                } else if active[1] < active[0] {
+                    1
+                } else {
+                    (self.engine.next_compute_pipe as usize) % sizes::COMPUTE_PIPES
+                }
+            }
+        }
+    }
+
     /// Whether some of `job`'s commands were published: such a job is retained after a
     /// fail-stop.
     pub(crate) fn job_partly_published(&self, job: &Job) -> bool {
@@ -1448,8 +1734,14 @@ impl Firmware {
         let mut a = job
             .resources
             .prepare_pb_in_flight(alloc_slot, draw, render_pipelined)?;
-        // Reuse this VM's retired epoch of the allocator slot when still bound (no reseed/InitBM).
-        let (epoch, reused) = match self.pools.reusable(alloc_slot, &job.vm) {
+        let pb_slots = job.resources.pb_slots()?;
+        let heap_blocks = job.resources.pb_heap_blocks()?;
+        // Reuse this VM's retired epoch of the allocator slot when still bound and sized for the
+        // VM's current PB heap (no reseed/InitBM); if the PB heap grew, rotate onto a fresh epoch.
+        let (epoch, reused) = match self
+            .pools
+            .reusable_for_within(alloc_slot, &job.vm, pb_slots, heap_blocks)
+        {
             Some(e) => {
                 self.pools.stats.reused += 1;
                 a.init_buffer = false;
@@ -1463,7 +1755,7 @@ impl Firmware {
                 if let Err(err) = e.prepare(
                     alloc_slot,
                     job.resources.pb_heap_gva(alloc_slot)?,
-                    job.resources.pb_heap_blocks()?,
+                    heap_blocks,
                 ) {
                     job.resources.return_pb(e);
                     return Err(err);
@@ -1629,6 +1921,23 @@ impl Firmware {
         } else {
             &[Channel::Compute]
         };
+        let (compute_pipe, c_waits) = if render {
+            (0usize, [None; sizes::COMPUTE_PIPES])
+        } else {
+            let units = job.resources.compute_units()?;
+            let waits = self.wait_compute_stamps_for(
+                job,
+                job.command_order(index)
+                    .and_then(|o| o.wait_through[super::command::COMPUTE]),
+            )?;
+            (self.choose_compute_pipe(waits, units), waits)
+        };
+        let pipe_behind = !render
+            && self
+                .engine
+                .flights
+                .iter()
+                .any(|fl| fl.computes != 0 && fl.compute_pipe as usize == compute_pipe);
         for &channel in channels {
             let pipe = self.channels.channel(channel);
             let producer = self.channels.producer(channel);
@@ -1657,10 +1966,20 @@ impl Firmware {
                 self.graph.render.qstate[1].r32(qstate::WRITE)?,
             )
         } else {
-            (self.graph.compute.qstate.r32(qstate::WRITE)?, 0, 0)
+            (
+                self.graph.compute[compute_pipe].qstate.r32(qstate::WRITE)?,
+                0,
+                0,
+            )
         };
         let mut prefix = Prefix {
+            compute_pipe,
             n: self.engine.ordinal,
+            pipe_n: if render {
+                0
+            } else {
+                self.engine.pipe_ordinal[compute_pipe]
+            },
             draw: self.engine.draw,
             c_head,
             ta_head,
@@ -1673,34 +1992,31 @@ impl Firmware {
         let mut c_read = prefix.c_head;
         let mut ta_read = prefix.ta_head;
         let mut fs_read = prefix.fs_head;
-        if class_behind {
-            if render {
-                // Room for up to 4 TA entries (prev_barrier, ta_fs_barrier, compute_barrier,
-                // ta_work) and 4 FS entries (fs_dep, fs_compute_barrier, own_barrier, fs_work).
-                ta_read = self.graph.render.qstate[0].r32(qstate::READ)?;
-                fs_read = self.graph.render.qstate[1].r32(qstate::READ)?;
-                if ta_read >= 256
-                    || fs_read >= 256
-                    || prefix.ta_head.wrapping_sub(ta_read) % sizes::QUEUE_CAP
-                        >= sizes::QUEUE_CAP - 5
-                    || prefix.fs_head.wrapping_sub(fs_read) % sizes::QUEUE_CAP
-                        >= sizes::QUEUE_CAP - 5
-                {
-                    self.engine.slot_wait = true;
-                    return Err(EAGAIN);
-                }
-            } else {
-                // Room for an optional cross-engine barrier plus compute work entry.
-                c_read = self.graph.compute.qstate.r32(qstate::READ)?;
-                if c_read >= 256
-                    || prefix.c_head.wrapping_sub(c_read) % sizes::QUEUE_CAP >= sizes::QUEUE_CAP - 3
-                {
-                    self.engine.slot_wait = true;
-                    return Err(EAGAIN);
-                }
+        if render && class_behind {
+            // Room for up to 5 TA entries (prev_barrier, ta_fs_barrier, 2x compute_barrier,
+            // ta_work) and 5 FS entries (fs_dep, 2x fs_compute_barrier, own_barrier, fs_work).
+            ta_read = self.graph.render.qstate[0].r32(qstate::READ)?;
+            fs_read = self.graph.render.qstate[1].r32(qstate::READ)?;
+            if ta_read >= 256
+                || fs_read >= 256
+                || prefix.ta_head.wrapping_sub(ta_read) % sizes::QUEUE_CAP >= sizes::QUEUE_CAP - 6
+                || prefix.fs_head.wrapping_sub(fs_read) % sizes::QUEUE_CAP >= sizes::QUEUE_CAP - 6
+            {
+                self.engine.slot_wait = true;
+                return Err(EAGAIN);
+            }
+        } else if !render && pipe_behind {
+            // Room for optional fs2c + cross-pipe c2c barriers plus compute work entry.
+            c_read = self.graph.compute[compute_pipe].qstate.r32(qstate::READ)?;
+            if c_read >= 256
+                || prefix.c_head.wrapping_sub(c_read) % sizes::QUEUE_CAP >= sizes::QUEUE_CAP - 4
+            {
+                self.engine.slot_wait = true;
+                return Err(EAGAIN);
             }
         }
         f.first = index as usize;
+        f.compute_pipe = compute_pipe as u8;
         f.c_start = prefix.c_head;
         f.ta_start = prefix.ta_head;
         f.fs_start = prefix.fs_head;
@@ -1708,18 +2024,41 @@ impl Firmware {
         let mut hz_stop: Option<usize> = None;
         match cmd {
             Command::Compute(c) => {
-                self.prefix_compute(job, &job.resources, index, c, &mut prefix, f, false)?;
+                self.prefix_compute(
+                    job,
+                    &job.resources,
+                    index,
+                    c,
+                    c_waits,
+                    &mut prefix,
+                    f,
+                    false,
+                )?;
                 let mut last_seq = job.command_order(index).map(|o| o.sequence);
                 let vm_units = job.resources.compute_units()?.min(sizes::COMPUTE_UNITS);
-                let free_c = self.slots.free_compute_in(vm_units) as usize;
-                let active_computes: usize =
-                    self.engine.flights.iter().map(|fl| fl.computes as usize).sum();
+                let free_c = self
+                    .slots
+                    .free_compute_in_for_pipe(vm_units, compute_pipe) as usize;
+                let mut active_pipe = [0usize; sizes::COMPUTE_PIPES];
+                for fl in &self.engine.flights {
+                    if fl.computes != 0 {
+                        let p = (fl.compute_pipe as usize).min(sizes::COMPUTE_PIPES - 1);
+                        active_pipe[p] += fl.computes as usize;
+                    }
+                }
+                let active_computes = active_pipe[0] + active_pipe[1];
+                // Keep barrier-free work balanced across both compute pipes: fold extra commands
+                // into this pipe only when the alternate pipe already has deeper queued work, so
+                // independent submits distribute across pipes 0 and 1 in the same doorbell batch.
+                let pipe_fold_cap =
+                    active_pipe[1 - compute_pipe].saturating_sub(active_pipe[compute_pipe] + 1);
                 let used = prefix.c_head.wrapping_sub(c_read) % sizes::QUEUE_CAP;
-                let ring_more = (sizes::QUEUE_CAP.saturating_sub(3)).saturating_sub(used) as usize;
+                let ring_more = (sizes::QUEUE_CAP.saturating_sub(4)).saturating_sub(used) as usize;
                 let mut more_slots = free_c
                     .min(params::compute_flights().saturating_sub(active_computes + 1))
                     .min(sizes::COMPUTE_SLOTS.saturating_sub(1))
-                    .min(ring_more);
+                    .min(ring_more)
+                    .min(pipe_fold_cap);
                 // Fold trailing barrier-free compute commands of the base job first.
                 while more_slots > 0 && end < job.progress.count() {
                     let Some(next_seq) = last_seq.and_then(|s| s.checked_add(1)) else {
@@ -1733,7 +2072,16 @@ impl Firmware {
                     let Some(Command::Compute(c2)) = command(job, end) else {
                         break;
                     };
-                    self.prefix_compute(job, &job.resources, end, c2, &mut prefix, f, false)?;
+                    self.prefix_compute(
+                        job,
+                        &job.resources,
+                        end,
+                        c2,
+                        [None; sizes::COMPUTE_PIPES],
+                        &mut prefix,
+                        f,
+                        false,
+                    )?;
                     last_seq = Some(next_seq);
                     end += 1;
                     more_slots -= 1;
@@ -1799,6 +2147,7 @@ impl Firmware {
                                         &job.resources,
                                         k,
                                         c2,
+                                        [None; sizes::COMPUTE_PIPES],
                                         &mut prefix,
                                         f,
                                         false,
@@ -1834,10 +2183,23 @@ impl Firmware {
                 f.claims.pass_count = 1;
                 f.claims.pass_mask = 1u64 << k;
                 self.slots.pass_busy |= 1u64 << k;
-                self.prefix_render(job, r, geometry, &mut prefix, f, behind, class_behind)?;
+                self.prefix_render(
+                    job,
+                    &job.resources,
+                    index,
+                    r,
+                    geometry,
+                    &mut prefix,
+                    f,
+                    behind,
+                    class_behind,
+                )?;
+                f.count = 1;
                 // Batch consecutive ready non-InitBM render passes of the same SUBMIT into
                 // one TA/FS producer advance, one UMA submitted update, and one SubmitRecord.
                 if !f.initbm {
+                    let stage_prefix =
+                        kernel::uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_STAGE_PREFIXES;
                     let mut last_seq = job.command_order(index).map(|o| o.sequence);
                     let active_renders: usize = self
                         .engine
@@ -1847,7 +2209,8 @@ impl Firmware {
                         .sum();
                     let mut more_renders = params::render_flights()
                         .saturating_sub(active_renders + 1)
-                        .min(sizes::RENDER_SLOTS.saturating_sub(1));
+                        .min(sizes::RENDER_SLOTS.saturating_sub(1))
+                        .min(sizes::TA_WAVE_PASSES.saturating_sub(self.ta_pending_passes() + 1));
                     while more_renders > 0 && end < job.progress.count() {
                         let Some(next_seq) = last_seq.and_then(|s| s.checked_add(1)) else {
                             break;
@@ -1865,7 +2228,7 @@ impl Firmware {
                         };
                         let ta_used = prefix.ta_head.wrapping_sub(ta_read) % sizes::QUEUE_CAP;
                         let fs_used = prefix.fs_head.wrapping_sub(fs_read) % sizes::QUEUE_CAP;
-                        if ta_used >= sizes::QUEUE_CAP - 5 || fs_used >= sizes::QUEUE_CAP - 5 {
+                        if ta_used >= sizes::QUEUE_CAP - 6 || fs_used >= sizes::QUEUE_CAP - 6 {
                             break;
                         }
                         let geo2 = Geometry::new(&r2.cmd, 0);
@@ -1880,19 +2243,15 @@ impl Firmware {
                             & kernel::uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_STAGE_PREFIXES
                             != 0;
                         if self
-                            .wait_stamp_for_with(
+                            .wait_compute_stamps_for(
                                 job,
-                                super::command::COMPUTE,
                                 o2.ta_wait_through[super::command::COMPUTE],
-                                None,
                             )
                             .is_err()
                             || self
-                                .wait_stamp_for_with(
+                                .wait_compute_stamps_for(
                                     job,
-                                    super::command::COMPUTE,
                                     o2.wait_through[super::command::COMPUTE],
-                                    None,
                                 )
                                 .is_err()
                             || self
@@ -1923,6 +2282,8 @@ impl Firmware {
                         self.slots.pass_busy |= 1u64 << k2;
                         self.prefix_render(
                             job,
+                            &job.resources,
+                            end,
                             r2,
                             geo2,
                             &mut prefix,
@@ -1932,7 +2293,154 @@ impl Firmware {
                         )?;
                         last_seq = Some(next_seq);
                         end += 1;
+                        f.count = (end - index) as usize;
                         more_renders -= 1;
+                    }
+                    // Cross-job render horizon: fold subsequent ready render-only jobs of
+                    // the same queue and VM into the same <= TA_WAVE_PASSES flight, sharing
+                    // one TA/FS producer advance, one UMA submitted update, and one doorbell.
+                    // Any non-qualifying job of this queue ends the scan so no later job
+                    // overtakes it.
+                    if end == job.progress.count() && more_renders > 0 {
+                        let mut idx = 0;
+                        while more_renders > 0 && idx < self.engine.pending.len() {
+                            let j2 = self.engine.pending[idx].clone();
+                            idx += 1;
+                            if Arc::ptr_eq(&j2, job) || !Arc::ptr_eq(&j2.queue, &job.queue) {
+                                continue;
+                            }
+                            if 1 + f.group.len() >= sizes::HORIZON_JOBS as usize {
+                                break;
+                            }
+                            let n2 = j2.progress.count();
+                            let n2_usize = n2 as usize;
+                            let Some(first_seq) = last_seq.and_then(|s| s.checked_add(1)) else {
+                                break;
+                            };
+                            if !Arc::ptr_eq(&j2.vm, &job.vm)
+                                || n2 == 0
+                                || n2_usize > more_renders
+                                || !j2.can_fold_render_horizon_job(first_seq)
+                            {
+                                break;
+                            }
+                            let mut test_draw = prefix.draw;
+                            let mut ord_ok = true;
+                            for _ in 0..n2 {
+                                match super::recovery::logic::next_ordinal(test_draw) {
+                                    Some(next) => test_draw = next,
+                                    None => {
+                                        ord_ok = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if !ord_ok {
+                                break;
+                            }
+                            let ta_used =
+                                (prefix.ta_head.wrapping_sub(ta_read) % sizes::QUEUE_CAP) as usize;
+                            let fs_used =
+                                (prefix.fs_head.wrapping_sub(fs_read) % sizes::QUEUE_CAP) as usize;
+                            let need_ring = n2_usize * (sizes::MAX_RENDER_RING_ENTRIES + 1);
+                            if ta_used + need_ring >= sizes::QUEUE_CAP as usize
+                                || fs_used + need_ring >= sizes::QUEUE_CAP as usize
+                            {
+                                break;
+                            }
+                            let mut picked = [0usize; sizes::TA_WAVE_PASSES];
+                            let mut picked_mask = f.claims.pass_mask;
+                            let mut precheck_ok = true;
+                            for k in 0..n2 {
+                                let Some(Command::Render(r2)) = command(&j2, k) else {
+                                    precheck_ok = false;
+                                    break;
+                                };
+                                let Some(o2) = j2.command_order(k) else {
+                                    precheck_ok = false;
+                                    break;
+                                };
+                                let geo2 = Geometry::new(&r2.cmd, 0);
+                                let Some(slot) = self.slots.pick_pass_in(
+                                    &job.resources,
+                                    &geo2,
+                                    picked_mask,
+                                ) else {
+                                    precheck_ok = false;
+                                    break;
+                                };
+                                let staged2 = r2.cmd.flags & stage_prefix != 0;
+                                let render_wait_ok = |target: Option<u64>| -> bool {
+                                    match target {
+                                        None => true,
+                                        Some(seq) if seq >= first_seq => {
+                                            seq < first_seq + u64::from(k)
+                                        }
+                                        Some(seq) => self
+                                            .wait_stamp_for_with(
+                                                &j2,
+                                                super::command::RENDER,
+                                                Some(seq),
+                                                Some(f),
+                                            )
+                                            .is_ok(),
+                                    }
+                                };
+                                if self
+                                    .wait_compute_stamps_for(
+                                        &j2,
+                                        o2.ta_wait_through[super::command::COMPUTE],
+                                    )
+                                    .is_err()
+                                    || self
+                                        .wait_compute_stamps_for(
+                                            &j2,
+                                            o2.wait_through[super::command::COMPUTE],
+                                        )
+                                        .is_err()
+                                    || !render_wait_ok(o2.wait_through[super::command::RENDER])
+                                    || (staged2
+                                        && params::early_tiling()
+                                        && !render_wait_ok(
+                                            o2.ta_wait_through[super::command::RENDER],
+                                        ))
+                                {
+                                    precheck_ok = false;
+                                    break;
+                                }
+                                picked[k as usize] = slot;
+                                picked_mask |= 1u64 << slot;
+                            }
+                            if !precheck_ok || f.group.reserve(1, GFP_NOWAIT).is_err() {
+                                break;
+                            }
+                            let _ = f.group.push_within_capacity(j2.clone());
+                            for k in 0..n2 {
+                                let Some(Command::Render(r2)) = command(&j2, k) else {
+                                    return Err(EINVAL);
+                                };
+                                let geo2 = Geometry::new(&r2.cmd, 0);
+                                let slot = picked[k as usize];
+                                let member = prefix.renders as usize;
+                                f.claims.pass[member] = slot as u32;
+                                f.claims.pass_count += 1;
+                                f.claims.pass_mask |= 1u64 << slot;
+                                self.slots.pass_busy |= 1u64 << slot;
+                                self.prefix_render(
+                                    &j2,
+                                    &job.resources,
+                                    k,
+                                    r2,
+                                    geo2,
+                                    &mut prefix,
+                                    f,
+                                    behind,
+                                    class_behind,
+                                )?;
+                            }
+                            last_seq = Some(first_seq + u64::from(n2 - 1));
+                            more_renders -= n2_usize;
+                        }
                     }
                 }
             }
@@ -1962,8 +2470,7 @@ impl Firmware {
         }
         // Reserve lifetime ownership before any counter or producer becomes reachable.
         job.vm.vm.mark_binding_published()?;
-        self.slots.hold_vm(&f.claims, &job.vm)?;
-        self.slots.hold_arenas(&f.claims, &job.resources);
+        self.slots.verify_held(&f.claims)?;
         self.slots.publish(&mut f.claims)?;
         // Even a failed first store may have become visible. From this boundary preserve
         // every owner and return explicit uncertainty rather than guessing from errno.
@@ -1972,12 +2479,17 @@ impl Firmware {
             if render {
                 let a = f.pb_slot as usize;
                 f.pb.as_ref().ok_or(EINVAL)?.expose();
-                job.resources.commit_render(f.renders);
+                job.resources.commit_render(f.count as u32);
+                for j2 in f.group.iter() {
+                    j2.resources.commit_render(j2.progress.count());
+                }
                 job.resources
                     .publish_pb_batch(a, f.uma_submitted, f.renders)?;
                 self.pools.publish_flight(a);
                 // Notifier service dereferences u32 counters; the host ordering ledger
-                // remains u64. Eight-byte spacing is retained allocation padding.
+                // remains u64. Eight-byte spacing is retained allocation padding. Always
+                // advance both TA and FS thresholds to the newest published draw ordinal
+                // so firmware never skips updating `TA_STAMP` on fast tail flights.
                 self.graph.render.threshold.w32(0, prefix.draw as u32)?;
                 self.graph.render.threshold.w32(8, prefix.draw as u32)?;
             } else {
@@ -1988,7 +2500,9 @@ impl Firmware {
                         .counter
                         .w64(0, f.csubmitted[m])?;
                 }
-                self.graph.compute.threshold.w32(0, prefix.n as u32)?;
+                self.graph.compute[compute_pipe]
+                    .threshold
+                    .w32(0, prefix.pipe_n as u32)?;
             }
             wmb();
             if render {
@@ -2000,7 +2514,7 @@ impl Firmware {
                 self.graph.render.qstate[1].w32(qstate::WRITE, prefix.fs_head)?;
             } else {
                 publish_producer(
-                    &self.graph.compute.qstate,
+                    &self.graph.compute[compute_pipe].qstate,
                     prefix.c_head,
                     &mut self.engine.stats.publications[0],
                 )?;
@@ -2011,10 +2525,10 @@ impl Firmware {
             for &channel in channels {
                 let (qinfo, head, event, fresh) = match channel {
                     Channel::Compute => (
-                        self.graph.compute.qinfo.va,
+                        self.graph.compute[compute_pipe].qinfo.va,
                         prefix.c_head,
-                        15,
-                        !self.engine.queue_registered,
+                        work::compute::EVENTS[compute_pipe] as u8,
+                        !self.engine.queue_registered[compute_pipe],
                     ),
                     Channel::Ta => (
                         self.graph.render.qinfo[0].va,
@@ -2066,9 +2580,11 @@ impl Firmware {
             self.engine.ta_registered = true;
             self.engine.render_registered = true;
         } else {
-            self.engine.target = f.target;
-            self.engine.head = f.head;
-            self.engine.queue_registered = true;
+            self.engine.pipe_ordinal[compute_pipe] = prefix.pipe_n;
+            self.engine.target[compute_pipe] = f.target;
+            self.engine.head[compute_pipe] = f.head;
+            self.engine.queue_registered[compute_pipe] = true;
+            self.engine.next_compute_pipe = (compute_pipe as u8) ^ 1;
         }
         self.engine.events = self.events.compute_events;
         self.engine.stage_seen = self.events.stage_events;
@@ -2110,6 +2626,9 @@ impl Firmware {
                 s.hz_behind += 1;
             }
             s.grouped = s.grouped.saturating_add(f.group.len() as u64);
+        } else if !f.group.is_empty() {
+            let s = &mut self.engine.stats;
+            s.grouped = s.grouped.saturating_add(f.group.len() as u64);
         }
         let mut flight = Flight::new(job.clone());
         core::mem::swap(&mut flight, f);
@@ -2138,6 +2657,7 @@ impl Firmware {
         resources: &super::resources::Prepared,
         cmd_index: u32,
         cmd: &ComputeCommand,
+        c_waits: [Option<WaitTarget>; sizes::COMPUTE_PIPES],
         pf: &mut Prefix,
         f: &mut Flight,
         _later_render: bool,
@@ -2146,17 +2666,19 @@ impl Firmware {
         if member >= sizes::COMPUTE_SLOTS {
             return Err(EAGAIN);
         }
+        let pipe = pf.compute_pipe;
+        let other = 1 - pipe;
         let n = super::recovery::logic::next_ordinal(pf.n).ok_or(EOVERFLOW)?;
-        let target = encode::stamp(n);
+        let pipe_n = super::recovery::logic::next_ordinal(pf.pipe_n).ok_or(EOVERFLOW)?;
+        let target = encode::stamp(pipe_n);
         let index = self
             .slots
-            .claim_compute_for(resources, &mut f.claims, Some(job.vm.id))?
+            .claim_compute_for_pipe(resources, &mut f.claims, Some(job.vm.id), pipe)?
             .ok_or(EAGAIN)?;
         let generation = job.vm.generation;
-        self.slots.hold_vm(&f.claims, &job.vm)?;
-        self.slots.hold_arenas(&f.claims, resources);
+        self.slots.hold_compute_slot(index, &job.vm, resources)?;
         let s = resources.compute_unit(index)?;
-        let g = &self.graph.compute;
+        let g = &self.graph.compute[pipe];
         let before = s.counter.r64(0)?;
         let submitted = before.checked_add(1).ok_or(EOVERFLOW)?;
         let refs = ComputeRefs {
@@ -2183,6 +2705,7 @@ impl Firmware {
             // Each unit owns its UMA slot: the firmware starts a queued command while the
             // one before it still runs, and two owners of one slot then corrupt each other.
             uma_slot: engine_ids::COMPUTE_UMA_SLOT + index as u32,
+            event: work::compute::EVENTS[pipe],
             // Preserve the already qualified packet bytes while expressing the native
             // fields separately. This compatibility identifier is not proof of native
             // global command-ID allocation or uniqueness after compute-index wrap.
@@ -2209,27 +2732,33 @@ impl Firmware {
             image(&mut scratch.cq)?,
         )
         .map_err(|_| EINVAL)?;
-        if before != 0 {
-            // Slots::claim_compute proved a different fully retired unit displaced this
-            // descriptor in the same hardware slot. Keep every firmware-mutated byte.
-            let mut descriptor = [0u8; work::compute::DESCRIPTOR_SIZE];
-            s.work.read(work::compute::DESCRIPTOR, &mut descriptor)?;
-            if encode::preserve_compute_descriptor(&refs, &descriptor, before, w).is_err() {
-                // This is retained allocator identity/completion corruption, not a client
-                // refusal. Keep the unit and its previous VM lease mapped forever; cancelling
-                // preparation would make the corrupt descriptor available to another job.
-                self.slots.quarantine(&mut f.claims);
-                self.sync_quarantine_hints();
-                return Err(EIO);
+        let full_work = self.slots.compute_needs_full_work(index) || before == 0;
+        if full_work {
+            if before != 0 {
+                // Slots::claim_compute proved a different fully retired unit displaced this
+                // descriptor in the same hardware slot. Keep every firmware-mutated byte.
+                let mut descriptor = [0u8; work::compute::DESCRIPTOR_SIZE];
+                s.work.read(work::compute::DESCRIPTOR, &mut descriptor)?;
+                if encode::preserve_compute_descriptor(&refs, &descriptor, before, w).is_err() {
+                    // This is retained allocator identity/completion corruption, not a client
+                    // refusal. Keep the unit and its previous VM lease mapped forever; cancelling
+                    // preparation would make the corrupt descriptor available to another job.
+                    self.slots.quarantine(&mut f.claims);
+                    self.sync_quarantine_hints();
+                    return Err(EIO);
+                }
             }
-        }
-        if self.slots.compute_needs_full_work(index) {
             s.work.write(0, w)?;
         } else {
+            // Clean same-VM reuse: DESCRIPTOR (0xe00..0xea0) was already authenticated on
+            // retirement for this exact unit and VM, and static NOTIFIER (0xc00..0xd18) and
+            // tail (0xee0..0xf08) remain intact in place. Skip the 160-byte WC read-back and
+            // write only the active head and encoded body through the microsequence end.
+            let body_end = work::compute::SEQ_EMBEDDED + work::compute::SEQ_SIZE;
             s.work.write(0, &w[..work::compute::HEAD_ACTIVE_SIZE])?;
             s.work.write(
                 work::compute::BODY_ACTIVE_START,
-                &w[work::compute::BODY_ACTIVE_START..work::compute::BODY_ACTIVE_END],
+                &w[work::compute::BODY_ACTIVE_START..body_end],
             )?;
         }
         let wait_render = self.cross_engine_wait(job, cmd_index, super::command::RENDER)?;
@@ -2253,6 +2782,22 @@ impl Firmware {
         } else {
             None
         };
+        let c2c_bar = if let Some(wait_c) = c_waits[other] {
+            let producer_initbm = wait_c.initbm || self.engine.flights.iter().any(|fl| fl.initbm);
+            let bar_type = cross_engine_barrier_type(producer_initbm, false);
+            let bar = encode::barrier(
+                self.graph.compute[other].fw_stamp.va,
+                wait_c.stamp,
+                work::compute::EVENTS[other],
+                target,
+                0,
+                bar_type,
+            );
+            s.barrier.write(work::barrier::SIZE, &bar)?;
+            true
+        } else {
+            false
+        };
         f.uma_submitted = submitted;
         f.csubmitted[member] = submitted;
         f.has_timestamps |= !cmd.timestamp_outputs.is_empty();
@@ -2267,11 +2812,19 @@ impl Firmware {
         } else {
             f.cwait[member] = 0;
         }
+        if c2c_bar {
+            g.ring.w64(
+                8 * pf.c_head as usize,
+                s.barrier.va + work::barrier::SIZE as u64,
+            )?;
+            pf.c_head = (pf.c_head + 1) % sizes::QUEUE_CAP;
+        }
         g.ring.w64(8 * pf.c_head as usize, s.work.va)?;
         pf.c_head = (pf.c_head + 1) % sizes::QUEUE_CAP;
         f.cstamp[member] = target;
         pf.computes += 1;
         pf.n = n;
+        pf.pipe_n = pipe_n;
         pf.last_ct = target;
         pf.prev = Prev::Compute;
         Ok(())
@@ -2279,9 +2832,15 @@ impl Firmware {
 
     /// Encodes paired TA/FS work and the fragment's explicit TA dependency in one retained
     /// pass unit.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Encodes one render member into a shared flight and prefix state."
+    )]
     fn prefix_render(
         &mut self,
         job: &Arc<Job>,
+        resources: &super::resources::Prepared,
+        cmd_index: u32,
         cmd: &RenderCommand,
         mut geometry: Geometry,
         pf: &mut Prefix,
@@ -2293,7 +2852,6 @@ impl Firmware {
         if member >= sizes::RENDER_SLOTS {
             return Err(EAGAIN);
         }
-        let cmd_index = (f.first + member) as u32;
         let k = f.claims.pass[member] as usize;
         let draw = super::recovery::logic::next_ordinal(pf.draw).ok_or(EOVERFLOW)?;
         let target = encode::stamp(draw);
@@ -2312,17 +2870,13 @@ impl Firmware {
         let staged = cmd.cmd.flags
             & kernel::uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_STAGE_PREFIXES
             != 0;
-        let ta_wait_compute = self.wait_stamp_for_with(
+        let ta_wait_compute = self.wait_compute_stamps_for(
             job,
-            super::command::COMPUTE,
             order.and_then(|o| o.ta_wait_through[super::command::COMPUTE]),
-            None,
         )?;
-        let fs_wait_compute = self.wait_stamp_for_with(
+        let fs_wait_compute = self.wait_compute_stamps_for(
             job,
-            super::command::COMPUTE,
             order.and_then(|o| o.wait_through[super::command::COMPUTE]),
-            None,
         )?;
         let fs_wait_render = if has_prior_render {
             match order {
@@ -2350,6 +2904,15 @@ impl Firmware {
         } else {
             None
         };
+        let cross_vm_prev = member == 0
+            && class_behind
+            && self
+                .engine
+                .flights
+                .iter()
+                .rev()
+                .find(|fl| fl.renders != 0)
+                .is_some_and(|fl| !Arc::ptr_eq(&fl.job.vm, &job.vm));
         let plan = plan_render_barriers(
             cmd.cmd.flags,
             has_prior_render,
@@ -2358,23 +2921,25 @@ impl Firmware {
             fs_wait_render.map(|w| w.stamp),
             ta_wait_fs.map(|w| w.stamp),
             [
-                ta_wait_compute.map(|w| w.stamp),
-                fs_wait_compute.map(|w| w.stamp),
+                ta_wait_compute.map(|w| w.map(|t| t.stamp)),
+                fs_wait_compute.map(|w| w.map(|t| t.stamp)),
             ],
+            cross_vm_prev,
         );
         // Claim performs only a qualified per-use scrub, never allocator/list reset.
         self.slots
-            .claim_pass_in(&job.resources, k, Some(job.vm.id), geometry.tilemap_bytes)?;
-        self.slots.hold_vm(&f.claims, &job.vm)?;
-        self.slots.hold_arenas(&f.claims, &job.resources);
+            .claim_pass_in(resources, k, Some(job.vm.id), geometry.tilemap_bytes)?;
+        self.slots.hold_render_pass(k, &job.vm, resources)?;
         let (refs, init_buffer) = if member == 0 {
-            let pb_slots = job.resources.pb_slots()?;
+            let pb_slots = resources.pb_slots()?;
+            let heap_blocks = resources.pb_heap_blocks()?;
             let alloc_slot = self
                 .pools
-                .pick_slot_within(&job.vm, behind, pb_slots)
+                .pick_slot_within_blocks(&job.vm, behind, pb_slots, heap_blocks)
                 .ok_or(EAGAIN)?;
+            let slot_pipelined = self.pools.slot_inflight(alloc_slot) > 0;
             let (refs, init_buffer, epoch, binding) =
-                self.render_refs(alloc_slot, job, draw, class_behind, behind)?;
+                self.render_refs(alloc_slot, job, draw, slot_pipelined, behind)?;
             f.pb = Some(epoch);
             f.pb_slot = alloc_slot as u32;
             f.pb_binding = binding;
@@ -2387,7 +2952,7 @@ impl Firmware {
             let epoch = f.pb.as_ref().ok_or(EINVAL)?;
             let refs = self.render_refs_batched(
                 f.pb_slot as usize,
-                job,
+                &f.job,
                 draw,
                 epoch,
                 f.uma_submitted,
@@ -2395,12 +2960,12 @@ impl Firmware {
             (refs, false)
         };
         f.has_timestamps |= !cmd.timestamp_outputs.is_empty();
-        let p = job.resources.render_pass(k)?;
+        let p = resources.render_pass(k)?;
         let pass = p.refs();
+        let heap_bytes = if cmd.cmd.layers > 1 { 0x1000 } else { 0x200 };
         geometry.layer_metadata = pass.heap_gva + if cmd.cmd.layers > 1 { 0x200 } else { 0 };
         geometry.validate_capacity(p.tpc.size as u64, p.tilemap.size as u64)?;
-        job.resources
-            .set_pass_dirty(k, geometry.tpc_bytes, geometry.tilemap_bytes)?;
+        resources.set_pass_dirty(k, geometry.tpc_bytes, geometry.tilemap_bytes, heap_bytes)?;
         let scratch = self.engine.scratch.as_deref_mut().ok_or(ENOMEM)?;
         encode::encode_ta_for(
             self.init.abi.ta(),
@@ -2431,17 +2996,18 @@ impl Firmware {
         );
         encode::render_attachments(&mut scratch.tas[..], 0, &cmd.vertex_attachments);
         encode::render_attachments(&mut scratch.fss[..], 1, &cmd.fragment_attachments);
-        encode::fill_scene(&refs, &pass, &mut scratch.scene[..]);
-        encode::scene_render(
-            &refs,
-            &pass,
-            &[0; 4],
-            job.vm.slot,
-            target,
-            init_buffer,
-            &mut scratch.scene[..],
-        );
-        if self.slots.render_needs_full_work(k) {
+        let full_work = self.slots.render_needs_full_work(k);
+        if full_work {
+            encode::fill_scene(&refs, &pass, &mut scratch.scene[..]);
+            encode::scene_render(
+                &refs,
+                &pass,
+                &[0; 4],
+                job.vm.slot,
+                target,
+                init_buffer,
+                &mut scratch.scene[..],
+            );
             p.ta_work.write(0, &scratch.ta[..])?;
             p.fs_work.write(0, &scratch.fs[..])?;
         } else {
@@ -2460,7 +3026,19 @@ impl Firmware {
         }
         p.ta_seq.write(0, &scratch.tas[..])?;
         p.fs_seq.write(0, &scratch.fss[..])?;
-        p.scene.write(0, &scratch.scene[..])?;
+        if full_work {
+            p.scene.write(0, &scratch.scene[..])?;
+        } else {
+            let hdr = encode::scene(&refs, &pass, 0);
+            let pfx = encode::scene_prefix(&refs, job.vm.slot, target, init_buffer);
+            p.scene.write(0, &hdr)?;
+            p.scene.fill(0x80, 0, 0x280)?;
+            p.scene.write(0x300, &pfx)?;
+            p.scene.w64(0x500, refs.uma_submitted)?;
+            // Zero TA/FS internal timestamp cells and targets so recovery FS execution
+            // proof and timestamp queries can never observe stale ticks from a prior pass.
+            p.scene.fill(0x600, 0, 0x40)?;
+        }
         // One retained descriptor is shared by TA and FS; its private submitted counter
         // advances by two per pass. Reused descriptors and their pool/list bytes remain intact.
         f.uma_submitted = refs.uma_submitted;
@@ -2474,23 +3052,23 @@ impl Firmware {
             r.ring[0].w64(8 * pf.ta_head as usize, epoch.initbm.va)?;
             pf.ta_head = (pf.ta_head + 1) % cap;
         }
-        // Pipelined same-VM render->render and cross-engine (CDM->TA, CDM->FS) barriers use
+        // Pipelined render->render and cross-engine (CDM->TA, CDM->FS) barriers use
         // `BarrierType::Stamp` (type 0) only when neither producer, any live flight, nor this
         // consumer carries `InitBM`: G16 `FINALIZE` flushes producer caches before advancing
         // `fw_stamp` (unlike G15's `CROSS_ENGINE_HOLD`; see `cross_engine_barrier_type`).
-        // Cross-VM transitions and recovery paths drain completely before publishing.
+        // Cold `InitBM` transitions and recovery paths drain completely before publishing.
         let producer_initbm = pf.initbm
             || self.engine.flights.iter().any(|fl| fl.initbm)
-            || ta_wait_compute.is_some_and(|w| w.initbm)
-            || fs_wait_compute.is_some_and(|w| w.initbm)
+            || ta_wait_compute.iter().flatten().any(|w| w.initbm)
+            || fs_wait_compute.iter().flatten().any(|w| w.initbm)
             || fs_wait_render.is_some_and(|w| w.initbm)
             || ta_wait_fs.is_some_and(|w| w.initbm);
         let render_bar = cross_engine_barrier_type(producer_initbm, init_buffer);
-        // Pipelined renders share one parameter-buffer / UMA epoch (`RENDER_UMA_SLOT`), so keep
+        // Pipelined renders share TA/FS pipes across same-VM and cross-VM flights, so keep
         // the TA(N-1)->TA(N) `prev_barrier` (matching G15) whenever `plan.ta_fs_wait` does not
         // already serialize behind `prev_fs`. Emit `ta_fs_barrier` only when `plan.ta_fs_wait`
-        // names an in-flight FS stamp, and `fs_dep` only when `plan.fs_render_wait` names an
-        // in-flight FS dependency not already dominated by TA.
+        // names an in-flight FS stamp, and `fs_dep` when `plan.fs_render_wait` names an
+        // in-flight FS dependency (or cross-VM `prev_fs`) not already dominated by TA.
         if plan.ta_prev_wait {
             let prev = encode::barrier(
                 r.fw_stamp[0].va,
@@ -2533,36 +3111,39 @@ impl Firmware {
         if plan.early {
             self.engine.stats.early += 1;
         }
-        if let Some(wait_c) = plan.ta_compute_wait {
-            let cbar = encode::barrier(
-                self.graph.compute.fw_stamp.va,
-                wait_c,
-                15,
-                target,
-                work::barrier::RENDER_WAIT_UUID,
-                render_bar,
-            );
-            p.compute_barrier.write(0, &cbar)?;
-            r.ring[0].w64(8 * pf.ta_head as usize, p.compute_barrier.va)?;
-            pf.ta_head = (pf.ta_head + 1) % cap;
-            if render_bar == BarrierType::Stamp {
-                self.engine.stats.c2ta0 += 1;
+        for p_idx in 0..sizes::COMPUTE_PIPES {
+            let off = p_idx * work::barrier::SIZE;
+            if let Some(wait_c) = plan.ta_compute_wait[p_idx] {
+                let cbar = encode::barrier(
+                    self.graph.compute[p_idx].fw_stamp.va,
+                    wait_c,
+                    work::compute::EVENTS[p_idx],
+                    target,
+                    work::barrier::RENDER_WAIT_UUID,
+                    render_bar,
+                );
+                p.compute_barrier.write(off, &cbar)?;
+                r.ring[0].w64(8 * pf.ta_head as usize, p.compute_barrier.va + off as u64)?;
+                pf.ta_head = (pf.ta_head + 1) % cap;
+                if render_bar == BarrierType::Stamp {
+                    self.engine.stats.c2ta0 += 1;
+                }
             }
-        }
-        if let Some(wait_c) = plan.fs_compute_wait {
-            let fcbar = encode::barrier(
-                self.graph.compute.fw_stamp.va,
-                wait_c,
-                15,
-                target,
-                work::barrier::RENDER_WAIT_UUID,
-                render_bar,
-            );
-            p.fs_compute_barrier.write(0, &fcbar)?;
-            r.ring[1].w64(8 * pf.fs_head as usize, p.fs_compute_barrier.va)?;
-            pf.fs_head = (pf.fs_head + 1) % cap;
-            if render_bar == BarrierType::Stamp {
-                self.engine.stats.c2ta0 += 1;
+            if let Some(wait_c) = plan.fs_compute_wait[p_idx] {
+                let fcbar = encode::barrier(
+                    self.graph.compute[p_idx].fw_stamp.va,
+                    wait_c,
+                    work::compute::EVENTS[p_idx],
+                    target,
+                    work::barrier::RENDER_WAIT_UUID,
+                    render_bar,
+                );
+                p.fs_compute_barrier.write(off, &fcbar)?;
+                r.ring[1].w64(8 * pf.fs_head as usize, p.fs_compute_barrier.va + off as u64)?;
+                pf.fs_head = (pf.fs_head + 1) % cap;
+                if render_bar == BarrierType::Stamp {
+                    self.engine.stats.c2ta0 += 1;
+                }
             }
         }
         // The paired fragment always requires the native explicit TA dependency.

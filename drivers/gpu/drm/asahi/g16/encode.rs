@@ -174,7 +174,9 @@ impl Geometry {
         ) as u32
             | log2s << 17;
         g.tile_mode = 0x280 | u32::from(l > 1) | if empty { 1 << 16 } else { 0 };
-        g.isp_control = 0xc000 | (u.flags & (1 << 18));
+        let few_primitives =
+            u.flags & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_FEW_PRIMITIVES != 0;
+        g.isp_control = 0xc000 | (u.flags & (1 << 18)) | u32::from(few_primitives);
         g.native_tiles = 0x3717fu64
             | u64::from(l > 1) << 32
             | u64::from(g.tx.wrapping_sub(1)) << 44
@@ -280,5 +282,5 @@ mod render_encoder;
 #[allow(unused_imports)] // Includes private-tail variants rejected by the shared Mesa UAPI.
 pub(crate) use render_encoder::{
     append_fs_timestamp_copies, encode_fs, encode_fs_for, encode_ta, encode_ta_for, fill_scene,
-    initbm, render_attachments, scene, scene_render, PassRefs, RenderRefs,
+    initbm, render_attachments, scene, scene_prefix, scene_render, PassRefs, RenderRefs,
 };

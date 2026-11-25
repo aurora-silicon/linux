@@ -408,9 +408,9 @@ static int apple_pmp_sample(void)
 	if (!ret) {
 		pmp_thermal.valid_ns = snapshot.finished_ns;
 		pmp_thermal.valid_mc = value;
-	} else if (ret == -ENODATA && pmp_thermal.valid_ns &&
-		   snapshot.finished_ns - pmp_thermal.valid_ns < APPLE_PMP_GATED_HOLD_NS &&
-		   pmp_thermal.valid_mc < APPLE_PMP_GATED_HOLD_MC) {
+	} else if (ret == -ENODATA &&
+		   apple_pmp_hold_nodata(pmp_thermal.valid_ns, pmp_thermal.valid_mc,
+					 snapshot.finished_ns, false)) {
 		value = pmp_thermal.valid_mc;
 		ret = 0;
 	}

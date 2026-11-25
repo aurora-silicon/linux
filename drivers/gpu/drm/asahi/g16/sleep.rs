@@ -114,6 +114,7 @@ impl Shared {
             drop(unsafe { Arc::from_raw(Arc::as_ptr(self)) });
         }
         self.events.drain();
+        self.events_unbound.drain();
         // `sleeping` is already set, so taking the queued scrubs under `scrub_queue`
         // guarantees no concurrent `enqueue_scrubs()` can still queue onto `scrub_wq`
         // while `scrub_wq.drain()` runs. Drop the drained batch outside the spinlock.
@@ -123,6 +124,9 @@ impl Shared {
         };
         drop(pending_scrubs);
         self.scrub_wq.drain();
+        self.feed.pause();
+        self.feed_wq.drain();
+        self.feed.release_floor();
     }
 
     /// Waits for what's been published to retire. The poll work keeps running meanwhile.
@@ -209,6 +213,7 @@ impl Shared {
                     .and_then(|_| {
                         if self.leave_for_commit(firmware) {
                             firmware.power.release_clpc_now();
+                            self.active_flights.store(0, Ordering::Release);
                             Ok(())
                         } else {
                             Err(EBUSY)
@@ -220,6 +225,7 @@ impl Shared {
         match left {
             Ok(()) => Ok(()),
             Err(error) => {
+                self.feed.resume();
                 self.sleeping.store(false, Ordering::Release);
                 self.poll_now();
                 Err(error)
@@ -260,6 +266,7 @@ impl Shared {
                     "GPU firmware back in {} us\n",
                     now_ns().saturating_sub(started) / 1000
                 );
+                self.feed.resume();
                 self.poll_now();
                 Ok(())
             }
@@ -294,6 +301,7 @@ impl Gpu {
                 self.shared.dev.as_ref(),
                 "sleep refused before the commit: GPU firmware never stopped\n"
             );
+            self.shared.feed.resume();
             self.shared.sleeping.store(false, Ordering::Release);
             self.shared.poll_now();
             return;

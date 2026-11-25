@@ -126,27 +126,27 @@ impl SnapshotEntry {
 /// Bounded per-stage history of recently retired firmware stamps.
 pub(crate) const RETIRED_STAMPS_CAP: usize = 64;
 
-/// Bounded per-stage ring of recently retired compute/TA/FS firmware stamps so a late
-/// recovery snapshot arriving after pipelined retirement resolves any recently retired
-/// member, not only the single newest flight.
+/// Bounded per-stage ring of recently retired compute pipe 0/1 and TA/FS firmware stamps
+/// so a late recovery snapshot arriving after pipelined retirement resolves any recently
+/// retired member, not only the single newest flight.
 #[derive(Clone, Debug)]
 pub(crate) struct RetiredStamps {
-    stamps: [[u32; RETIRED_STAMPS_CAP]; 3],
-    len: [u8; 3],
-    next: [u8; 3],
+    stamps: [[u32; RETIRED_STAMPS_CAP]; 4],
+    len: [u8; 4],
+    next: [u8; 4],
 }
 
 impl RetiredStamps {
     pub(crate) const fn new() -> Self {
         Self {
-            stamps: [[0; RETIRED_STAMPS_CAP]; 3],
-            len: [0; 3],
-            next: [0; 3],
+            stamps: [[0; RETIRED_STAMPS_CAP]; 4],
+            len: [0; 4],
+            next: [0; 4],
         }
     }
 
     pub(crate) fn push(&mut self, stage: usize, target: u32) {
-        if stage >= 3 {
+        if stage >= 4 {
             return;
         }
         let idx = self.next[stage] as usize;
@@ -160,8 +160,9 @@ impl RetiredStamps {
     pub(crate) fn contains(&self, event: u32, target: u32) -> bool {
         let stage = match event {
             15 => 0,
-            0x70 => 1,
-            0x71 => 2,
+            16 => 1,
+            0x70 => 2,
+            0x71 => 3,
             _ => return false,
         };
         let len = self.len[stage] as usize;
@@ -214,9 +215,10 @@ mod tests {
         let mut retired = RetiredStamps::new();
         assert!(!retired.contains(0x70, 0));
         retired.push(0, 0x100);
-        retired.push(1, 0);
-        retired.push(2, 0x200);
-        for (event, target) in [(15, 0x100), (0x70, 0), (0x71, 0x200)] {
+        retired.push(1, 0x300);
+        retired.push(2, 0);
+        retired.push(3, 0x200);
+        for (event, target) in [(15, 0x100), (16, 0x300), (0x70, 0), (0x71, 0x200)] {
             assert!(retired.contains(event, target));
             assert!(!retired.contains(event, target.wrapping_add(0x100)));
         }

@@ -18,6 +18,15 @@ use super::object::{Class, FwObject, Objects, Placement, Request};
 use super::Firmware;
 use crate::driver::AsahiDrmDevice;
 
+/// Firmware-owned queue graph records initialized once before `register_context()`.
+/// Firmware reads and writes them through the ASC-cached mapping after initialization;
+/// host receipt checks authenticate on NC `qstate::READ` and submit-pipe cursors.
+pub(crate) const fn graph_fw() -> Class {
+    Class::FwCached
+}
+pub(crate) const fn qinfo_cached() -> bool {
+    matches!(graph_fw(), Class::FwCached)
+}
 pub(crate) const fn cmd_fw() -> Class {
     if tuning::FW_CACHED {
         Class::FwCached
@@ -42,7 +51,7 @@ pub(crate) const fn manager_class(class: Class) -> Class {
 }
 #[allow(dead_code)]
 pub(crate) const fn queue_scratch() -> Class {
-    cmd_fw()
+    graph_fw()
 }
 
 /// A private client alias uses the working M4 driver's AttrIndex-2 NC policy.
@@ -127,7 +136,7 @@ struct QueueObjects {
 impl QueueObjects {
     fn new(o: &mut Objects) -> Result<Self> {
         Ok(Self {
-            qinfo: alloc(o, qinfo::SIZE, cmd_fw(), None, 0, false)?,
+            qinfo: alloc(o, qinfo::SIZE, graph_fw(), None, 0, false)?,
             qstate: alloc(o, qstate::SIZE, Class::Fw, None, 0, false)?,
             ring: alloc(o, sizes::QUEUE_CAP as usize * 8, cmd_fw(), None, 0, false)?,
             user_stamp: alloc(o, 8, Class::Shared, None, 0, false)?,
@@ -165,13 +174,13 @@ fn init_notifier(page: &FwObject, threshold: &FwObject) -> Result {
 }
 
 impl ComputeGraph {
-    fn new(o: &mut Objects) -> Result<Self> {
+    fn new(o: &mut Objects, sched_ctx: Arc<FwObject>) -> Result<Self> {
         let q = QueueObjects::new(o)?;
         Ok(Self {
-            sched_ctx: alloc(o, sched_ctx::SIZE, cmd_fw(), None, 0, false)?,
+            sched_ctx,
             notifier: alloc(o, 0x1000, Class::Fw, None, 0, false)?,
             threshold: alloc(o, 24, Class::Fw, None, 0, false)?,
-            job_list: alloc(o, job_list::SIZE, cmd_fw(), None, 0, false)?,
+            job_list: alloc(o, job_list::SIZE, graph_fw(), None, 0, false)?,
             qscratch: q.qinfo.clone(),
             qinfo: q.qinfo,
             qstate: q.qstate,
@@ -180,8 +189,10 @@ impl ComputeGraph {
             fw_stamp: q.fw_stamp,
         })
     }
-    fn init(&self, abi: FwAbi) -> Result {
-        self.sched_ctx.write(0, &graph::context_image())?;
+    fn init(&self, abi: FwAbi, init_ctx: bool) -> Result {
+        if init_ctx {
+            self.sched_ctx.write(0, &graph::context_image())?;
+        }
         init_notifier(&self.notifier, &self.threshold)?;
         self.notifier
             .w64(notifier_page::COMPUTE_RECORD, self.threshold.va)?;
@@ -229,8 +240,8 @@ impl RenderGraph {
             notifier: alloc(o, 0x1000, Class::Fw, None, 0, false)?,
             threshold: alloc(o, 24, Class::Fw, None, 0, false)?,
             job_list: [
-                alloc(o, job_list::SIZE, cmd_fw(), None, 0, false)?,
-                alloc(o, job_list::SIZE, cmd_fw(), None, 0, false)?,
+                alloc(o, job_list::SIZE, graph_fw(), None, 0, false)?,
+                alloc(o, job_list::SIZE, graph_fw(), None, 0, false)?,
             ],
             legacy_empty: alloc(o, 0x40, Class::Shared, None, 0, false)?,
             registration_barrier: alloc(
@@ -263,13 +274,19 @@ impl RenderGraph {
 
 pub(crate) struct Graphs {
     pub(crate) dev: ARef<device::Device>,
-    pub(crate) compute: ComputeGraph,
+    pub(crate) compute: [ComputeGraph; sizes::COMPUTE_PIPES],
     pub(crate) render: RenderGraph,
 }
 impl Graphs {
     pub(crate) fn new(dev: &AsahiDrmDevice, o: &mut Objects) -> Result<Self> {
-        let compute = ComputeGraph::new(o)?;
-        let render = RenderGraph::new(o, compute.sched_ctx.clone())?;
+        // Host polls sched_ctx from WC during register_context(); keep uncached and share one
+        // scheduling context across all compute pipes and the render graph.
+        let sched_ctx = alloc(o, sched_ctx::SIZE, Class::Fw, None, 0, false)?;
+        let compute = [
+            ComputeGraph::new(o, sched_ctx.clone())?,
+            ComputeGraph::new(o, sched_ctx.clone())?,
+        ];
+        let render = RenderGraph::new(o, sched_ctx)?;
         Ok(Self {
             dev: dev.as_ref().as_ref().into(),
             compute,
@@ -284,7 +301,9 @@ impl Firmware {
                 return Err(Error::from_errno(-(kernel::bindings::EPROTO as i32)));
             }
         }
-        self.graph.compute.init(self.init.abi)?;
+        for (pipe, compute) in self.graph.compute.iter().enumerate() {
+            compute.init(self.init.abi, pipe == 0)?;
+        }
         self.graph.render.init(self.init.abi)?;
         self.slots.init()?;
         self.init_render_pools(false)?;

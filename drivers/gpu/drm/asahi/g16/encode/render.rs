@@ -609,13 +609,38 @@ pub(crate) fn fill_scene(r: &RenderRefs, p: &PassRefs, out: &mut [u8]) {
 }
 
 /// Small scene header for direct writes into a zeroed retained firmware object.
-#[allow(dead_code)]
 pub(crate) fn scene(r: &RenderRefs, p: &PassRefs, _n: u64) -> [u8; 0x80] {
     let mut out = [0u8; 0x80];
     put64(&mut out, 0, p.scene_user_gva);
     put64(&mut out, 8, p.scratch_fw);
     put64(&mut out, 0x28, compact(scene_list_va(r, p)));
     put64(&mut out, 0x40, p.scene + 0x200);
+    out
+}
+
+/// Active scene prefix block (`0x300..0x380`: optional InitBM record + own-TA wait barrier)
+/// for direct clean same-VM writes without zeroing dead gaps in the 2 KiB scene scratch image.
+pub(crate) fn scene_prefix(r: &RenderRefs, ctx: u32, target: u32, init: bool) -> [u8; 0x80] {
+    let mut out = [0u8; 0x80];
+    if init {
+        put(
+            &mut out,
+            0,
+            &initbm(ctx, r.parameter_id, r.pb_mgr, target),
+        );
+    }
+    put(
+        &mut out,
+        0x40,
+        &barrier(
+            r.fw_stamp[0],
+            target,
+            0x70,
+            target,
+            0,
+            work::BarrierType::Stamp,
+        ),
+    );
     out
 }
 

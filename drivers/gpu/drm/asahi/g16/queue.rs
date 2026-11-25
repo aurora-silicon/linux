@@ -30,7 +30,7 @@
 //! ordinal, or depending on its failed prefix, cannot execute. The VM remains usable.
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use kernel::{dma_fence::Fence, prelude::*, sync::Arc, uapi, xarray};
+use kernel::{prelude::*, sync::Arc, uapi, xarray};
 
 use super::{
     command::{self, USC_WINDOW},
@@ -60,9 +60,13 @@ pub(crate) struct QueueState {
     /// Exact successful firmware receipts, independently for render and compute. These
     /// survive aggregate-fence publication and never advance on aborted/failed commands.
     pub(crate) completed: [AtomicU64; 2],
-    /// Published command frontier per engine. The firmware runs the compute queue in
+    /// Out-of-order full compute receipts strictly above `completed[COMPUTE] + 1` (bit `k`
+    /// records ordinal `completed[COMPUTE] + 2 + k`), enabling concurrent 2-pipe completion.
+    pub(crate) compute_ooo: AtomicU64,
+    /// Published command frontier per engine. The firmware runs each queue pipe in
     /// publication order, each command to its Finalize, so a compute command may follow its
-    /// published (not yet retired) compute predecessors.
+    /// published (not yet retired) compute predecessors (on the same pipe or via a cross-pipe
+    /// barrier).
     pub(crate) published: [AtomicU64; 2],
     /// Owned-job counts at the queue's last 32 arrivals (compute horizon ahead), recorded by the
     /// engine when a job arrives.
@@ -96,6 +100,17 @@ impl QueueState {
         }
         Ok(())
     }
+
+    /// Whether compute ordinal `seq` already has a full successful firmware receipt, either
+    /// at or below the contiguous `completed[COMPUTE]` frontier or recorded in `compute_ooo`.
+    pub(crate) fn is_compute_retired(&self, seq: u64) -> bool {
+        let completed = self.completed[command::COMPUTE].load(Ordering::Acquire);
+        if seq <= completed {
+            return true;
+        }
+        let shift = seq.wrapping_sub(completed).wrapping_sub(2);
+        shift < 64 && (self.compute_ooo.load(Ordering::Acquire) & (1u64 << shift)) != 0
+    }
 }
 
 /// One per-file logical-queue credit, released after the queue scheduler drains.
@@ -127,6 +142,8 @@ pub(crate) struct Queue {
     pub(crate) state: Arc<QueueState>,
     /// Commands accepted per engine (render, compute) since creation (checked for accounting overflow).
     pub(crate) accepted: [u64; 2],
+    /// Epoch-validated GPUVM span cache reused across submits on this logical queue.
+    proof: KBox<command::SpanProof>,
     vm: Arc<VmState>,
     shared: Arc<Shared>,
     timeline: Arc<Timeline>,
@@ -174,16 +191,19 @@ impl Queue {
                 cancelled_at: [const { AtomicU64::new(0) }; 2],
                 turn: AtomicU64::new(0),
                 completed: [const { AtomicU64::new(0) }; 2],
+                compute_ooo: AtomicU64::new(0),
                 published: [const { AtomicU64::new(0) }; 2],
                 owned: [const { AtomicU32::new(0) }; 32],
                 owned_index: AtomicU32::new(0),
             },
             GFP_KERNEL,
         )?;
+        let proof = KBox::new(command::SpanProof::new(), GFP_KERNEL)?;
         Ok(Self {
             scheduler,
             state,
             accepted: [0; 2],
+            proof,
             vm: vm_state,
             shared: gpu.shared.clone(),
             timeline,
@@ -191,15 +211,15 @@ impl Queue {
         })
     }
 
-    /// Validates a SUBMIT and pushes its job; returns the job's fence.
+    /// Validates a SUBMIT, publishes its output syncs, and pushes its job.
     fn submit_job(
         &mut self,
         id: u64,
-        syncs: &Syncs,
+        syncs: &mut Syncs,
         sync_count: usize,
         bytes: &[u8],
         objects: Pin<&xarray::XArray<KBox<file::Object>>>,
-    ) -> Result<Fence> {
+    ) -> Result {
         if sync_count > command::MAX_SYNCS {
             return Err(EINVAL);
         }
@@ -213,10 +233,13 @@ impl Queue {
         let prepared = parsed.prepare(self.accepted, objects)?;
         // The job reference first, so that the mappings checked below stay retained.
         let guard = self.vm.vm.retain_first_job()?;
-        let submission = prepared.validate(&command::Context {
-            vm: &self.vm.vm,
-            usc_base: self.state.usc_base,
-        })?;
+        let submission = prepared.validate(
+            &command::Context {
+                vm: &self.vm.vm,
+                usc_base: self.state.usc_base,
+            },
+            &mut self.proof,
+        )?;
         // Refused jobs add no accepted ordinals; check every prepared dependency before
         // publishing a fence or extending the queue's accepted frontier.
         for order in submission.orders.iter() {
@@ -254,11 +277,15 @@ impl Queue {
             inputs,
         )?;
         let published = job.fence.fence();
+        // Publish output syncs (including fallible cumulative scope allocation) before pushing
+        // to the scheduler so ENOMEM refuses cleanly without leaving an accepted job behind.
+        // If `scheduler.push` later fails, dropping `job` signals `published` with ECANCELED.
+        syncs.publish(&published)?;
         self.scheduler.push(job, self.shared.clone())?;
         // Accepted: retain bounded per-engine accounting for later submissions.
         self.accepted[command::RENDER] += submission.counts[command::RENDER];
         self.accepted[command::COMPUTE] += submission.counts[command::COMPUTE];
-        Ok(published)
+        Ok(())
     }
 }
 
@@ -273,12 +300,9 @@ impl crate::queue::Queue for Queue {
         objects: Pin<&xarray::XArray<KBox<file::Object>>>,
     ) -> Result {
         let sync_count = syncs.len();
-        let syncs = Syncs::new(syncs, in_sync_count);
-        match self.submit_job(id, &syncs, sync_count, cmdbuf_raw, objects) {
-            Ok(fence) => {
-                syncs.accept(&fence);
-                Ok(())
-            }
+        let mut syncs = Syncs::new(syncs, in_sync_count);
+        match self.submit_job(id, &mut syncs, sync_count, cmdbuf_raw, objects) {
+            Ok(()) => Ok(()),
             Err(error) => {
                 // A refused submission leaves the VM usable unless the device is lost.
                 self.vm.status.record_if_device_loss(error);

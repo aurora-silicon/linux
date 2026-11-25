@@ -57,7 +57,7 @@ pub(crate) struct Recovery {
     warning_deadline_ns: [u64; 2],
     pub(crate) long_commands: u64,
     pub(crate) publication_wait_deadline: Option<u64>,
-    /// Recently retired compute/TA/FS stamps, for late recovery snapshots.
+    /// Recently retired compute pipe 0/1 and TA/FS stamps, for late recovery snapshots.
     pub(crate) last_retired: logic::RetiredStamps,
     /// Queue engine order: render, compute. A quarantined/exhausted class stays offline.
     pub(crate) unavailable: [Option<Error>; 2],
@@ -387,7 +387,7 @@ impl Firmware {
 
     /// Resolve the snapshot while the firmware is stopped. A missing retained
     /// owner prevents acknowledgement: its failure cannot safely be attributed.
-    fn mark_recovery(&mut self, stage: [u32; 3], event: u32, asid: Option<u32>) -> Result {
+    fn mark_recovery(&mut self, stage: [u32; 4], event: u32, asid: Option<u32>) -> Result {
         let data = self.init.firmware_data();
         for i in 0..data.snapshot_entries {
             let offset = data.snapshot + i * 8;

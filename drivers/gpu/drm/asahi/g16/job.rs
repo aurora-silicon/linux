@@ -405,6 +405,55 @@ impl Job {
         order.ready(completed, published)
     }
 
+    /// Whether every command of this job is a ready render command continuing a render
+    /// horizon sequentially from `first_expected` (treating earlier passes in the in-progress
+    /// render flight as already published).
+    pub(crate) fn can_fold_render_horizon_job(&self, first_expected: u64) -> bool {
+        let count = self.progress.count();
+        if count == 0
+            || self.progress.sent() != 0
+            || self.terminal_retired.load(Ordering::Acquire)
+            || self.vm.status.get() != 0
+            || super::fence::check_dependencies(&self.inputs).is_err()
+        {
+            return false;
+        }
+        let completed = self
+            .queue
+            .completed
+            .each_ref()
+            .map(|value| value.load(Ordering::Acquire));
+        let base_published = self
+            .queue
+            .published
+            .each_ref()
+            .map(|value| value.load(Ordering::Acquire));
+        for k in 0..count {
+            let Some(expected) = first_expected.checked_add(u64::from(k)) else {
+                return false;
+            };
+            let Some(Command::Render(_)) = self.commands.get(k as usize) else {
+                return false;
+            };
+            let Some(order) = self.orders.get(k as usize) else {
+                return false;
+            };
+            if order.engine != super::command::RENDER
+                || order.sequence != expected
+                || self.queue.check(order).is_err()
+            {
+                return false;
+            }
+            let mut published = base_published;
+            published[super::command::RENDER] =
+                published[super::command::RENDER].max(expected.saturating_sub(1));
+            if !order.ready(completed, published) {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Checks the retained dependency set for each command immediately before publication.
     /// Never waits or signals fences under the device lock. The scheduler and start() have
     /// already waited; a pending fence asks the engine to defer rather than publish early.
@@ -452,14 +501,51 @@ impl Job {
     pub(crate) fn command_retired(&self, index: u32) -> Result {
         let order = self.orders.get(index as usize).ok_or(EINVAL)?;
         let previous = order.sequence.checked_sub(1).ok_or(EINVAL)?;
-        self.queue.completed[order.engine]
-            .compare_exchange(
-                previous,
-                order.sequence,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .map_err(|_| EIO)?;
+        if order.engine != super::command::COMPUTE {
+            self.queue.completed[order.engine]
+                .compare_exchange(
+                    previous,
+                    order.sequence,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .map_err(|_| EIO)?;
+            return Ok(());
+        }
+        // Concurrent 2-pipe compute commands on the same logical queue may retire out of
+        // sequence order. Record published out-of-order full receipts above `completed + 1`
+        // in `compute_ooo` and advance `completed[COMPUTE]` across contiguous retired runs.
+        let completed = self.queue.completed[super::command::COMPUTE].load(Ordering::Acquire);
+        if order.sequence <= completed {
+            return Err(EIO);
+        }
+        if order.sequence == completed + 1 {
+            let mut next = order.sequence;
+            let mut ooo = self.queue.compute_ooo.load(Ordering::Acquire);
+            while ooo & 1 != 0 {
+                next += 1;
+                ooo >>= 1;
+            }
+            // Re-anchor remaining OOO bits above `next + 1` (since `next` advanced by at least 1
+            // and bit 0 of `ooo` is now `next + 1`, which is 0).
+            ooo >>= 1;
+            self.queue.compute_ooo.store(ooo, Ordering::Release);
+            self.queue.completed[super::command::COMPUTE]
+                .compare_exchange(completed, next, Ordering::AcqRel, Ordering::Acquire)
+                .map_err(|_| EIO)?;
+            return Ok(());
+        }
+        let published = self.queue.published[super::command::COMPUTE].load(Ordering::Acquire);
+        let shift = order.sequence - completed - 2;
+        if order.sequence > published || shift >= 64 {
+            return Err(EIO);
+        }
+        let bit = 1u64 << shift;
+        let ooo = self.queue.compute_ooo.load(Ordering::Acquire);
+        if ooo & bit != 0 {
+            return Err(EIO);
+        }
+        self.queue.compute_ooo.store(ooo | bit, Ordering::Release);
         Ok(())
     }
 

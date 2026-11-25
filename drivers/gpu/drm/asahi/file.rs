@@ -1892,7 +1892,7 @@ impl File {
             data.syncs,
             data.in_sync_count,
             data.out_sync_count,
-            gpu.as_any().is::<crate::g17::Gpu>(),
+            gpu.as_any().is::<crate::g17::Gpu>() || gpu.as_any().is::<crate::g16::Gpu>(),
         ) {
             Ok(syncs) => syncs,
             Err(e) => {

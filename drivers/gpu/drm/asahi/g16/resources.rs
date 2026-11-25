@@ -107,6 +107,18 @@ const _: () = assert!(EXT_RENDER_TIERS[2].1 == EXT_RENDER_TIERS[3].0);
 const _: () = assert!(EXT_RENDER_TIERS[3].1 == super::hw::sizes::RENDER_SLOTS);
 const BASE_PB_SLOTS: usize = super::hw::sizes::BASE_PB_SLOTS;
 const EXT_PB_SLOTS: usize = super::hw::sizes::PB_SLOTS - BASE_PB_SLOTS;
+/// Demand-grown contiguous PB heap extensions within the 256 MiB
+/// [`super::hw::client::PB_HEAP_SIZE`] window so steady 60/120 Hz single-pass clients stay on
+/// the 64 MiB base heap while multi-pass and heavy 3D workloads expand to 128 MiB (Tier 0) and
+/// 256 MiB (Tier 1) without TVB partial-render spills.
+pub(crate) const PB_HEAP_EXT_TIERS: [(u32, u32); 2] =
+    [(512, 1024), (1024, super::fw::buffer::MAX_BLOCKS)];
+const _: () = assert!(PB_HEAP_EXT_TIERS[0].1 == PB_HEAP_EXT_TIERS[1].0);
+const _: () = assert!(PB_HEAP_EXT_TIERS[1].1 == super::fw::buffer::MAX_BLOCKS);
+const _: () = assert!(
+    (PB_HEAP_EXT_TIERS[1].1 as u64) * super::fw::buffer::BLOCK_BYTES
+        <= super::hw::client::PB_HEAP_SIZE
+);
 /// Single-submission render command count that expands Tier 0 extension slots immediately:
 /// `BASE_RENDER_SLOTS` holds only one active render once displacement occupies a slot.
 const RENDER_BURST_COMMANDS: usize = BASE_RENDER_SLOTS;
@@ -209,9 +221,21 @@ pub(crate) struct RenderInner {
     pub(crate) pools: PoolSet,
     pub(crate) tpc_dirty: [AtomicU64; BASE_RENDER_SLOTS],
     pub(crate) tilemap_dirty: [AtomicU64; BASE_RENDER_SLOTS],
+    pub(crate) tilemap_last: [AtomicU64; BASE_RENDER_SLOTS],
+    pub(crate) tilemap_clean: [AtomicU64; BASE_RENDER_SLOTS],
+    pub(crate) heap_dirty: [AtomicU64; BASE_RENDER_SLOTS],
     _objects: Objects,
     _bind: mmu::VmBind,
     _live: Arc<super::vm::LiveToken>,
+}
+/// Per-pass dirty and pre-cleaned WC byte spans for one render pass slot.
+#[derive(Copy, Clone)]
+pub(crate) struct PassDirty<'a> {
+    pub(crate) tpc: &'a AtomicU64,
+    pub(crate) tilemap: &'a AtomicU64,
+    pub(crate) tilemap_last: &'a AtomicU64,
+    pub(crate) tilemap_clean: &'a AtomicU64,
+    pub(crate) heap: &'a AtomicU64,
 }
 impl RenderArena {
     fn new(
@@ -233,6 +257,9 @@ impl RenderArena {
                 pools,
                 tpc_dirty: [const { AtomicU64::new(0) }; BASE_RENDER_SLOTS],
                 tilemap_dirty: [const { AtomicU64::new(0) }; BASE_RENDER_SLOTS],
+                tilemap_last: [const { AtomicU64::new(0) }; BASE_RENDER_SLOTS],
+                tilemap_clean: [const { AtomicU64::new(0) }; BASE_RENDER_SLOTS],
+                heap_dirty: [const { AtomicU64::new(0) }; BASE_RENDER_SLOTS],
                 _objects: objects,
                 _bind: bind.clone(),
                 _live: live.clone(),
@@ -247,6 +274,9 @@ impl RenderArena {
         }
         self.tpc_dirty[k].fetch_max(tpc, Ordering::Relaxed);
         self.tilemap_dirty[k].fetch_max(tilemap, Ordering::Relaxed);
+        self.tilemap_last[k].store(tilemap, Ordering::Relaxed);
+        self.tilemap_clean[k].store(0, Ordering::Relaxed);
+        self.heap_dirty[k].fetch_max(0x200, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -265,6 +295,9 @@ pub(crate) struct RenderExtInner {
     pub(crate) passes: KVec<PassSlot>,
     pub(crate) tpc_dirty: KVec<AtomicU64>,
     pub(crate) tilemap_dirty: KVec<AtomicU64>,
+    pub(crate) tilemap_last: KVec<AtomicU64>,
+    pub(crate) tilemap_clean: KVec<AtomicU64>,
+    pub(crate) heap_dirty: KVec<AtomicU64>,
     _objects: Objects,
     _bind: mmu::VmBind,
     _live: Arc<super::vm::LiveToken>,
@@ -282,10 +315,16 @@ impl RenderExtArena {
         let mut passes = KVec::with_capacity(count, GFP_KERNEL)?;
         let mut tpc_dirty = KVec::with_capacity(count, GFP_KERNEL)?;
         let mut tilemap_dirty = KVec::with_capacity(count, GFP_KERNEL)?;
+        let mut tilemap_last = KVec::with_capacity(count, GFP_KERNEL)?;
+        let mut tilemap_clean = KVec::with_capacity(count, GFP_KERNEL)?;
+        let mut heap_dirty = KVec::with_capacity(count, GFP_KERNEL)?;
         for k in slots.clone() {
             passes.push(PassSlot::new(&mut objects, k as u64, 1)?, GFP_KERNEL)?;
             tpc_dirty.push(AtomicU64::new(0), GFP_KERNEL)?;
             tilemap_dirty.push(AtomicU64::new(0), GFP_KERNEL)?;
+            tilemap_last.push(AtomicU64::new(0), GFP_KERNEL)?;
+            tilemap_clean.push(AtomicU64::new(0), GFP_KERNEL)?;
+            heap_dirty.push(AtomicU64::new(0), GFP_KERNEL)?;
         }
         objects.finish_private()?;
         Ok(Arc::new(
@@ -294,6 +333,9 @@ impl RenderExtArena {
                 passes,
                 tpc_dirty,
                 tilemap_dirty,
+                tilemap_last,
+                tilemap_clean,
+                heap_dirty,
                 _objects: objects,
                 _bind: bind.clone(),
                 _live: live.clone(),
@@ -342,13 +384,62 @@ impl PoolExtArena {
     }
 }
 
-/// Keeps the arena owning a retained PB/UMA allocator slot alive through displacement.
-/// The wrapped `Arc`s are held solely for their `Drop` lifetime and never read back.
+/// One demand-grown contiguous PB heap chunk extending the VM's base [`PoolSet`] heap within the
+/// 256 MiB `PB_HEAP_SIZE` GPU VA window without unmapping any in-flight lower range.
+pub(crate) struct PbHeapExtArena(crate::cleanup::Deferred<PbHeapExtInner>);
+impl core::ops::Deref for PbHeapExtArena {
+    type Target = PbHeapExtInner;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+pub(crate) struct PbHeapExtInner {
+    pub(crate) blocks: u32,
+    _heap: Arc<super::object::FwObject>,
+    _objects: Objects,
+    _bind: mmu::VmBind,
+    _live: Arc<super::vm::LiveToken>,
+}
+impl PbHeapExtArena {
+    fn new(
+        factory: &Factory,
+        bind: &mmu::VmBind,
+        vm: &mmu::Vm,
+        live: &Arc<super::vm::LiveToken>,
+        start_block: u32,
+        blocks: u32,
+    ) -> Result<Arc<Self>> {
+        let mut objects = factory.objects(vm);
+        let heap = super::pools::alloc_pb_heap_chunk(&mut objects, start_block, blocks)?;
+        objects.finish_private()?;
+        Ok(Arc::new(
+            Self(crate::cleanup::Deferred::new(PbHeapExtInner {
+                blocks,
+                _heap: heap,
+                _objects: objects,
+                _bind: bind.clone(),
+                _live: live.clone(),
+            })?),
+            GFP_KERNEL,
+        )?)
+    }
+}
+
+/// Keeps the arenas owning a retained PB/UMA allocator slot and its backed PB heap tiers alive
+/// through displacement. The wrapped `Arc`s are held solely for their `Drop` lifetime and never
+/// read back.
 #[derive(Clone)]
 #[allow(dead_code)]
 pub(crate) enum PbOwnerArena {
-    Base(Arc<RenderArena>),
-    Ext(Arc<RenderArena>, Arc<PoolExtArena>),
+    Base(
+        Arc<RenderArena>,
+        [Option<Arc<PbHeapExtArena>>; PB_HEAP_EXT_TIERS.len()],
+    ),
+    Ext(
+        Arc<RenderArena>,
+        Arc<PoolExtArena>,
+        [Option<Arc<PbHeapExtArena>>; PB_HEAP_EXT_TIERS.len()],
+    ),
 }
 
 /// Keeps the arena owning a retained pass slot alive through displacement.
@@ -359,13 +450,31 @@ pub(crate) enum PassOwnerArena {
 }
 
 impl PassOwnerArena {
-    /// Returns the pass slot and its tilemap dirty high-water mark for global slot `k`.
-    pub(crate) fn pass_and_tilemap_dirty(&self, k: usize) -> Option<(&PassSlot, &AtomicU64)> {
+    /// Returns the pass slot and its dirty/clean WC span trackers for global slot `k`.
+    pub(crate) fn pass_and_dirty(&self, k: usize) -> Option<(&PassSlot, PassDirty<'_>)> {
         match self {
-            Self::Base(arena) => Some((arena.passes.get(k)?, arena.tilemap_dirty.get(k)?)),
+            Self::Base(arena) => Some((
+                arena.passes.get(k)?,
+                PassDirty {
+                    tpc: arena.tpc_dirty.get(k)?,
+                    tilemap: arena.tilemap_dirty.get(k)?,
+                    tilemap_last: arena.tilemap_last.get(k)?,
+                    tilemap_clean: arena.tilemap_clean.get(k)?,
+                    heap: arena.heap_dirty.get(k)?,
+                },
+            )),
             Self::Ext(arena) => {
                 let idx = k.checked_sub(arena.start)?;
-                Some((arena.passes.get(idx)?, arena.tilemap_dirty.get(idx)?))
+                Some((
+                    arena.passes.get(idx)?,
+                    PassDirty {
+                        tpc: arena.tpc_dirty.get(idx)?,
+                        tilemap: arena.tilemap_dirty.get(idx)?,
+                        tilemap_last: arena.tilemap_last.get(idx)?,
+                        tilemap_clean: arena.tilemap_clean.get(idx)?,
+                        heap: arena.heap_dirty.get(idx)?,
+                    },
+                ))
             }
         }
     }
@@ -379,6 +488,8 @@ struct Ready {
     render: Option<Arc<RenderArena>>,
     /// Demand-grown extension render pass tiers (`EXT_RENDER_TIERS`).
     render_ext: [Option<Arc<RenderExtArena>>; EXT_RENDER_TIERS.len()],
+    /// Demand-grown contiguous PB heap extension tiers (`PB_HEAP_EXT_TIERS`).
+    pb_heap_ext: [Option<Arc<PbHeapExtArena>>; PB_HEAP_EXT_TIERS.len()],
     /// Recovery PB/UMA allocator slots (`BASE_PB_SLOTS..PB_SLOTS`), allocated lazily after hangs.
     pb_ext: [Option<Arc<PoolExtArena>>; EXT_PB_SLOTS],
     /// Last compute submission and the back-to-back run it continues.
@@ -556,6 +667,7 @@ impl Cache {
                 ready.compute_ext.take(),
                 ready.render.take(),
                 core::mem::take(&mut ready.render_ext),
+                core::mem::take(&mut ready.pb_heap_ext),
                 core::mem::take(&mut ready.pb_ext),
             )
         };
@@ -579,7 +691,7 @@ impl Cache {
             .count()
             .try_into()?;
         let render = render_count != 0;
-        let (compute, compute_ext, render_arena, render_ext, pb_ext) = {
+        let (compute, compute_ext, render_arena, render_ext, pb_heap_ext, pb_ext) = {
             // Never held by publication, completion, recovery, fence signalling or
             // standby waits, so Cache::close() and same-VM compute SUBMITs never block.
             let mut ready = self.ready.lock();
@@ -695,11 +807,43 @@ impl Cache {
                         }
                     }
                 }
+                if let Some(base) = ready.render.as_ref() {
+                    let base_blocks = base.pools.heap_blocks();
+                    for (idx, &(start, end)) in PB_HEAP_EXT_TIERS.iter().enumerate() {
+                        if ready.render_ext[idx].is_none() {
+                            break;
+                        }
+                        if base_blocks >= end {
+                            continue;
+                        }
+                        if ready.pb_heap_ext[idx].is_none() {
+                            let chunk_start = start.max(base_blocks);
+                            // Best effort: stop on failure so the backed PB VA stays contiguous.
+                            ready.pb_heap_ext[idx] = PbHeapExtArena::new(
+                                &self.factory,
+                                &self.bind,
+                                &vm.vm,
+                                &self.live,
+                                chunk_start,
+                                end - chunk_start,
+                            )
+                            .ok();
+                            if ready.pb_heap_ext[idx].is_none() {
+                                break;
+                            }
+                        }
+                    }
+                }
             }
             let render_ext = if render {
                 core::array::from_fn(|idx| ready.render_ext[idx].clone())
             } else {
                 [const { None }; EXT_RENDER_TIERS.len()]
+            };
+            let pb_heap_ext = if render {
+                core::array::from_fn(|idx| ready.pb_heap_ext[idx].clone())
+            } else {
+                [const { None }; PB_HEAP_EXT_TIERS.len()]
             };
             let pb_ext = if render {
                 core::array::from_fn(|idx| ready.pb_ext[idx].clone())
@@ -711,6 +855,7 @@ impl Cache {
                 if compute { ready.compute_ext.clone() } else { None },
                 if render { ready.render.clone() } else { None },
                 render_ext,
+                pb_heap_ext,
                 pb_ext,
             )
         };
@@ -810,6 +955,7 @@ impl Cache {
             compute_ext,
             render: render_arena,
             render_ext,
+            pb_heap_ext,
             pb_ext,
             total_renders: render_count,
             unpublished_renders: AtomicU32::new(render_count),
@@ -826,6 +972,8 @@ pub(crate) struct Prepared {
     pub(crate) render: Option<Arc<RenderArena>>,
     /// The VM's demand-grown extension render pass tiers when the job was prepared.
     pub(crate) render_ext: [Option<Arc<RenderExtArena>>; EXT_RENDER_TIERS.len()],
+    /// The VM's demand-grown contiguous PB heap extension tiers when the job was prepared.
+    pub(crate) pb_heap_ext: [Option<Arc<PbHeapExtArena>>; PB_HEAP_EXT_TIERS.len()],
     /// The VM's lazily allocated recovery PB/UMA allocator slots when the job was prepared.
     pub(crate) pb_ext: [Option<Arc<PoolExtArena>>; EXT_PB_SLOTS],
     /// Total render commands accounted against `Cache::active_render_passes`.
@@ -909,18 +1057,27 @@ impl Prepared {
         self.pb_allocator(k)?.heap_gva()
     }
     pub(crate) fn pb_heap_blocks(&self) -> Result<u32> {
-        Ok(self.render()?.pools.heap_blocks())
+        let base = self.render()?.pools.heap_blocks();
+        let ext: u32 = self
+            .pb_heap_ext
+            .iter()
+            .take_while(|tier| tier.is_some())
+            .flatten()
+            .map(|tier| tier.blocks)
+            .sum();
+        Ok(base.saturating_add(ext).min(super::fw::buffer::MAX_BLOCKS))
     }
-    /// The arena owning PB/UMA allocator slot `k`.
+    /// The arenas owning PB/UMA allocator slot `k` and its backed PB heap tiers.
     pub(crate) fn pb_owner_arena(&self, k: usize) -> Option<PbOwnerArena> {
         let base = self.render.as_ref()?;
+        let heap_ext = core::array::from_fn(|idx| self.pb_heap_ext[idx].clone());
         if k < BASE_PB_SLOTS {
-            Some(PbOwnerArena::Base(base.clone()))
+            Some(PbOwnerArena::Base(base.clone(), heap_ext))
         } else {
             self.pb_ext
                 .get(k - BASE_PB_SLOTS)
                 .and_then(|slot| slot.as_ref())
-                .map(|ext| PbOwnerArena::Ext(base.clone(), ext.clone()))
+                .map(|ext| PbOwnerArena::Ext(base.clone(), ext.clone(), heap_ext))
         }
     }
     fn render_ext_for(&self, k: usize) -> Option<(&Arc<RenderExtArena>, usize)> {
@@ -955,25 +1112,43 @@ impl Prepared {
                 .ok_or(EINVAL),
         }
     }
-    /// The dirty high-water marks (`tpc_dirty`, `tilemap_dirty`) for pass slot `k`.
-    pub(crate) fn render_pass_dirty(&self, k: usize) -> Result<(&AtomicU64, &AtomicU64)> {
+    /// The dirty high-water marks and clean prefix trackers for pass slot `k`.
+    pub(crate) fn render_pass_dirty(&self, k: usize) -> Result<PassDirty<'_>> {
         let base = self.render()?;
         if k < base.passes.len() {
-            Ok((&base.tpc_dirty[k], &base.tilemap_dirty[k]))
+            Ok(PassDirty {
+                tpc: &base.tpc_dirty[k],
+                tilemap: &base.tilemap_dirty[k],
+                tilemap_last: &base.tilemap_last[k],
+                tilemap_clean: &base.tilemap_clean[k],
+                heap: &base.heap_dirty[k],
+            })
         } else {
             let (tier, idx) = self.render_ext_for(k).ok_or(EINVAL)?;
-            Ok((&tier.tpc_dirty[idx], &tier.tilemap_dirty[idx]))
+            Ok(PassDirty {
+                tpc: &tier.tpc_dirty[idx],
+                tilemap: &tier.tilemap_dirty[idx],
+                tilemap_last: &tier.tilemap_last[idx],
+                tilemap_clean: &tier.tilemap_clean[idx],
+                heap: &tier.heap_dirty[idx],
+            })
         }
     }
-    /// Updates dirty high-water marks for pass slot `k` (base or extension).
-    pub(crate) fn set_pass_dirty(&self, k: usize, tpc: u64, tilemap: u64) -> Result {
+    /// Updates dirty high-water marks and last-used spans for pass slot `k` (base or extension).
+    pub(crate) fn set_pass_dirty(&self, k: usize, tpc: u64, tilemap: u64, heap: u64) -> Result {
         let pass = self.render_pass(k)?;
-        if tpc > pass.tpc.size as u64 || tilemap > pass.tilemap.size as u64 {
+        if tpc > pass.tpc.size as u64
+            || tilemap > pass.tilemap.size as u64
+            || heap > pass.heap.size as u64
+        {
             return Err(E2BIG);
         }
-        let (tpc_dirty, tilemap_dirty) = self.render_pass_dirty(k)?;
-        tpc_dirty.fetch_max(tpc, Ordering::Relaxed);
-        tilemap_dirty.fetch_max(tilemap, Ordering::Relaxed);
+        let dirty = self.render_pass_dirty(k)?;
+        dirty.tpc.fetch_max(tpc, Ordering::Relaxed);
+        dirty.tilemap.fetch_max(tilemap, Ordering::Relaxed);
+        dirty.tilemap_last.store(tilemap, Ordering::Relaxed);
+        dirty.tilemap_clean.store(0, Ordering::Relaxed);
+        dirty.heap.fetch_max(heap, Ordering::Relaxed);
         Ok(())
     }
     /// The arena owning render pass slot `k`.

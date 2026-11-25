@@ -32,7 +32,7 @@ def function_from(text, marker_text):
 def function(text, name):
     return function_from(text, 'fn ' + name + '(')
 
-queue_methods = '\n'.join(function(queue_source, name) for name in ['cancel', 'check'])
+queue_methods = '\n'.join(function(queue_source, name) for name in ['cancel', 'check', 'is_compute_retired'])
 methods = '\n'.join(function(source, name) for name in ['latch_failure', 'complete', 'finish', 'is_started', 'try_start_inline', 'start', 'check_command_dependencies', 'command_retired', 'note_full_retirement', 'mark_terminal_retired'])
 push_method = function_from(source, 'pub(crate) fn push(&mut self, job: Arc<Job>')
 fence_methods = '\n'.join(function(fence_source, name) for name in ['dependency_status', 'check_dependencies', 'wait_dependencies'])
@@ -99,8 +99,8 @@ impl Fence {
         self.signals.lock().unwrap().push((result,status));
     }
 }
-mod command { pub(crate) use super::Order; }
-struct QueueState { completed:[AtomicU64;2],published:[AtomicU64;2],cancelled_at:[AtomicU64;2] }
+mod command { pub(crate) use super::{Order, COMPUTE}; }
+struct QueueState { completed:[AtomicU64;2],published:[AtomicU64;2],cancelled_at:[AtomicU64;2],compute_ooo:AtomicU64 }
 impl QueueState { QUEUE_METHODS }
 struct Job { id:u64,vm:Vm,_guard:Guard,progress:Progress,started:AtomicBool,accepted:AtomicBool,fence:Fence,commands:Vec<()>,inputs:Vec<InputFence>,orders:Vec<Order>,queue:Arc<QueueState>,full_retired:AtomicU64,terminal_retired:AtomicBool }
 struct Shared { crashed:AtomicBool,sleeping:AtomicBool,recovering:AtomicBool,contended:AtomicBool,submitted:Mutex<Vec<u64>>,submit_result:Result }
@@ -180,7 +180,7 @@ fn job(id:u64,status:Arc<Status>)->Arc<Job> {
 }
 fn job_with_inputs(id:u64,status:Arc<Status>,inputs:Vec<InputFence>)->Arc<Job> {
     let orders=vec![Order::new([0,0],[0,0],[NONE;2],[0;2],1).unwrap(),Order::new([0,0],[0,1],[NONE;2],[0;2],1).unwrap()];
-    job_with_orders(id,status,inputs,orders,Arc::new(QueueState{completed:[const{AtomicU64::new(0)};2],published:[const{AtomicU64::new(0)};2],cancelled_at:[const{AtomicU64::new(0)};2]}))
+    job_with_orders(id,status,inputs,orders,Arc::new(QueueState{completed:[const{AtomicU64::new(0)};2],published:[const{AtomicU64::new(0)};2],cancelled_at:[const{AtomicU64::new(0)};2],compute_ooo:AtomicU64::new(0)}))
 }
 fn job_with_orders(id:u64,status:Arc<Status>,inputs:Vec<InputFence>,orders:Vec<Order>,queue:Arc<QueueState>)->Arc<Job> {
     Arc::new(Job{id,vm:Vm{status:status.clone()},_guard:Guard(AtomicBool::new(false)),
@@ -342,7 +342,7 @@ fn younger_failed_input_does_not_cancel_older_multi_command_job() {
 }
 #[test]
 fn cancellation_checks_both_command_ordinal_and_cross_engine_failed_prefix() {
-    let queue=Arc::new(QueueState{completed:[const{AtomicU64::new(0)};2],published:[const{AtomicU64::new(0)};2],cancelled_at:[const{AtomicU64::new(0)};2]});
+    let queue=Arc::new(QueueState{completed:[const{AtomicU64::new(0)};2],published:[const{AtomicU64::new(0)};2],cancelled_at:[const{AtomicU64::new(0)};2],compute_ooo:AtomicU64::new(0)});
     let cutoff=Order::new([0,2],[0,0],[NONE;2],[0;2],1).unwrap();queue.cancel(&[cutoff],0);
     let earlier=Order::new([0,1],[0,0],[NONE;2],[0;2],1).unwrap();
     let independent_render=Order::new([0,3],[0,0],[NONE;2],[0;2],0).unwrap();
@@ -356,7 +356,7 @@ fn cancellation_checks_both_command_ordinal_and_cross_engine_failed_prefix() {
 }
 #[test]
 fn exact_prefix_does_not_wait_for_the_aggregate_or_next_ordinal() {
-    let queue=Arc::new(QueueState{completed:[const{AtomicU64::new(0)};2],published:[const{AtomicU64::new(0)};2],cancelled_at:[const{AtomicU64::new(0)};2]});
+    let queue=Arc::new(QueueState{completed:[const{AtomicU64::new(0)};2],published:[const{AtomicU64::new(0)};2],cancelled_at:[const{AtomicU64::new(0)};2],compute_ooo:AtomicU64::new(0)});
     let status=Arc::new(Status::new());
     let old=job_with_orders(1,status.clone(),vec![],vec![
         Order::new([0,0],[0,0],[NONE;2],[0;2],1).unwrap(),
@@ -544,7 +544,44 @@ fn scheduler_push_bypasses_drm_sched_on_inline_start_and_rolls_back_on_fallback_
     assert!(w3.upgrade().is_none(), "drm_sched job must not be retained by Scheduler after run");
     assert!(w4.upgrade().is_none(), "queued job must not be retained by Scheduler after run");
 }
-'''.replace('QUEUE_METHODS', queue_methods).replace('ORDER_SOURCE', order_source).replace('FENCE_METHODS', fence_methods).replace('METHODS', methods.replace('super::fence::','fence::')).replace('PUSH_METHOD', push_method)
+#[test]
+fn compute_ooo_retirement_tracks_gaps_and_rejects_unpublished_or_duplicate() {
+    let queue=Arc::new(QueueState{completed:[const{AtomicU64::new(0)};2],published:[AtomicU64::new(0),AtomicU64::new(4)],cancelled_at:[const{AtomicU64::new(0)};2],compute_ooo:AtomicU64::new(0)});
+    let orders=vec![
+        Order::new([0,0],[0,0],[NONE;2],[0;2],1).unwrap(),
+        Order::new([0,0],[0,1],[NONE;2],[0;2],1).unwrap(),
+        Order::new([0,0],[0,2],[NONE;2],[0;2],1).unwrap(),
+        Order::new([0,0],[0,3],[NONE;2],[0;2],1).unwrap(),
+        Order::new([0,0],[0,4],[NONE;2],[0;2],1).unwrap(),
+    ];
+    let qjob=job_with_orders(1,Arc::new(Status::new()),vec![],orders,queue.clone());
+    // Unpublished sequence 5 cannot retire OOO.
+    assert_eq!(qjob.command_retired(4),Err(EIO));
+    // Sequences 2 and 4 retire OOO before 1 and 3.
+    qjob.command_retired(1).unwrap();
+    qjob.command_retired(3).unwrap();
+    assert_eq!(queue.completed[COMPUTE].load(Ordering::Acquire),0);
+    assert!(!queue.is_compute_retired(1));
+    assert!(queue.is_compute_retired(2));
+    assert!(!queue.is_compute_retired(3));
+    assert!(queue.is_compute_retired(4));
+    // Duplicate OOO retirement is rejected.
+    assert_eq!(qjob.command_retired(1),Err(EIO));
+    assert_eq!(qjob.command_retired(3),Err(EIO));
+    // Retiring 1 advances contiguous frontier to 2 and re-anchors bit 0 to seq 4!
+    qjob.command_retired(0).unwrap();
+    assert_eq!(queue.completed[COMPUTE].load(Ordering::Acquire),2);
+    assert!(queue.is_compute_retired(1));
+    assert!(queue.is_compute_retired(2));
+    assert!(!queue.is_compute_retired(3));
+    assert!(queue.is_compute_retired(4));
+    assert_eq!(qjob.command_retired(3),Err(EIO));
+    // Retiring 3 drains seq 4 as well, advancing contiguous frontier to 4 with clean bitmap.
+    qjob.command_retired(2).unwrap();
+    assert_eq!(queue.completed[COMPUTE].load(Ordering::Acquire),4);
+    assert_eq!(queue.compute_ooo.load(Ordering::Acquire),0);
+}
+'''.replace('QUEUE_METHODS', queue_methods).replace('ORDER_SOURCE', order_source).replace('FENCE_METHODS', fence_methods).replace('METHODS', methods.replace('super::fence::','fence::').replace('super::command::','command::')).replace('PUSH_METHOD', push_method)
 
 with tempfile.TemporaryDirectory(prefix='m4-rust-job-') as directory:
     directory=pathlib.Path(directory); test=directory/'test.rs'; test.write_text(harness)

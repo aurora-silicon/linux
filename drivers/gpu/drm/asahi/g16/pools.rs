@@ -160,7 +160,7 @@ impl Allocator {
             0,
             &buffer::uma_manager_image(
                 descriptor.va,
-                engine::RENDER_UMA_SLOT,
+                engine::RENDER_UMA_SLOT + k as u32,
                 gva(&state)?,
                 gva(&list)?,
                 submitted.va,
@@ -207,7 +207,7 @@ impl Allocator {
         }
         // Descriptor pointer/counter and slot must still identify this exact retained unit.
         if read64(&self.descriptor, 0)? != self.descriptor.va
-            || self.descriptor.r32(8)? != engine::RENDER_UMA_SLOT
+            || self.descriptor.r32(8)? != engine::RENDER_UMA_SLOT + self.id
             || read64(&self.descriptor, 0x4c)? != self.submitted.va
         {
             return Err(EINVAL);
@@ -243,6 +243,32 @@ impl Allocator {
         gva(&self.heap)
     }
 }
+/// Maps one contiguous PB heap extension chunk (`start_block..start_block + blocks`) inside the
+/// VM's 256 MiB [`client::PB_HEAP_SIZE`] window so demand-grown heaps extend seamlessly after the
+/// base [`PoolSet`] allocation without unmapping any in-flight base range.
+#[allow(dead_code)]
+pub(crate) fn alloc_pb_heap_chunk(
+    o: &mut Objects,
+    start_block: u32,
+    blocks: u32,
+) -> Result<Arc<FwObject>> {
+    if blocks == 0
+        || start_block
+            .checked_add(blocks)
+            .is_none_or(|end| end > buffer::MAX_BLOCKS)
+    {
+        return Err(EINVAL);
+    }
+    let gva = client::pb_heap(0) + u64::from(start_block) * buffer::BLOCK_BYTES;
+    alloc(
+        o,
+        blocks as usize * buffer::BLOCK_BYTES as usize,
+        Class::Shared,
+        Some((gva, pte::LEAF_NC)),
+        false,
+    )
+}
+
 impl PoolSet {
     pub(crate) fn new(o: &mut Objects) -> Result<Self> {
         // The firmware copes with a full PB without the host (its overflow counters move and
@@ -381,12 +407,23 @@ impl Pools {
             .saturating_add(quarantined)
             .min(sizes::PB_SLOTS)
     }
-    /// Whether slot `k` is healthy, not active, and either fresh or displaced by a clean
+    /// Number of in-flight render prefixes currently active on allocator slot `k`.
+    #[allow(dead_code)]
+    pub(crate) fn slot_inflight(&self, k: usize) -> u32 {
+        self.inflight.get(k).copied().unwrap_or(0)
+    }
+    /// Whether slot `k` is healthy, idle, not active, and either fresh or displaced by a clean
     /// retirement of some other slot.
     fn slot_displaced(&self, k: usize) -> bool {
         !self.quarantined[k]
+            && self.inflight[k] == 0
             && self.active != Some(k)
             && (self.owners[k].is_none() || self.last_clean_retired.is_some_and(|r| r != k))
+    }
+    /// Whether at least one displaced physical PB allocator slot exists in `0..limit`.
+    fn has_displaced_slot_within(&self, limit: usize) -> bool {
+        let n = limit.min(sizes::PB_SLOTS);
+        (0..n).any(|k| self.slot_displaced(k))
     }
     /// Allocator slot `k`'s owner epoch, if its render retired normally while the slot was still
     /// bound to it, it belongs to `vm` and was exposed (its InitBM ran). InitBM binds the
@@ -401,45 +438,91 @@ impl Pools {
         (Arc::ptr_eq(&owner._vm, vm) && owner.exposed.load(Ordering::Acquire))
             .then(|| owner.clone())
     }
-    /// Selects a physical PB/UMA allocator slot within `0..limit` for `vm`.
+    /// Like [`Self::reusable`], but forces a fresh `InitBM` epoch when the VM's PB heap grew
+    /// past the retired epoch's `heap_blocks` and a displaced slot within `0..limit` is available
+    /// to rotate onto safely.
+    #[allow(dead_code)]
+    pub(crate) fn reusable_for_within(
+        &self,
+        k: usize,
+        vm: &Arc<super::vm::VmState>,
+        limit: usize,
+        min_blocks: u32,
+    ) -> Option<Arc<PbEpoch>> {
+        let owner = self.reusable(k, vm)?;
+        if owner.heap_blocks() >= min_blocks || !self.has_displaced_slot_within(limit) {
+            Some(owner)
+        } else {
+            None
+        }
+    }
+    /// Selects a physical PB/UMA allocator slot within `0..limit` for `vm`, requiring any reused
+    /// epoch to cover at least `min_blocks` when a displaced slot is available for rotation.
     ///
-    /// When `behind` is true (pipelining behind in-flight same-VM renders), the active slot must
-    /// be within `0..limit`, healthy, and reusable for `vm`. When `behind` is false (engine
-    /// drained), a same-VM render stays on its reusable active slot if within `0..limit`;
-    /// otherwise it switches to an already-used displaced slot first (preserving the 2-slot
-    /// working set) or claims the lowest fresh slot.
-    pub(crate) fn pick_slot_within(
+    /// When `behind` is true (pipelining behind active flights), only a healthy warm reusable
+    /// slot already bound to `vm` (preferring `self.active`, then any other slot in `0..limit`)
+    /// is eligible; cold VMs or VMs whose PB heap expanded return `None` so the engine drains
+    /// once before rotating onto a fresh `InitBM` epoch.
+    /// When `behind` is false (engine drained), a qualifying warm reusable slot for `vm` is
+    /// preferred; otherwise an already-used displaced slot is chosen first (preserving the 2-slot
+    /// working set) or the lowest fresh slot is claimed.
+    pub(crate) fn pick_slot_within_blocks(
         &self,
         vm: &Arc<super::vm::VmState>,
         behind: bool,
         limit: usize,
+        min_blocks: u32,
     ) -> Option<usize> {
         let n = limit.min(sizes::PB_SLOTS);
-        if behind {
-            let a = self.active?;
-            return (a < n && !self.quarantined[a] && self.reusable(a, vm).is_some()).then_some(a);
-        }
         if let Some(a) = self.active {
-            if a < n && !self.quarantined[a] && self.reusable(a, vm).is_some() {
+            if a < n && self.reusable_for_within(a, vm, n, min_blocks).is_some() {
                 return Some(a);
             }
+        }
+        if let Some(k) = (0..n).find(|&k| self.reusable_for_within(k, vm, n, min_blocks).is_some())
+        {
+            return Some(k);
+        }
+        if behind {
+            return None;
         }
         // Prefer reusing a displaced slot over claiming a fresh recovery slot.
         (0..n)
             .find(|&k| self.slot_displaced(k) && self.owners[k].is_some())
             .or_else(|| (0..n).find(|&k| self.slot_displaced(k)))
     }
+    /// Selects a physical PB/UMA allocator slot within `0..limit` for `vm`.
+    pub(crate) fn pick_slot_within(
+        &self,
+        vm: &Arc<super::vm::VmState>,
+        behind: bool,
+        limit: usize,
+    ) -> Option<usize> {
+        self.pick_slot_within_blocks(vm, behind, limit, 0)
+    }
     /// Selects a physical PB/UMA allocator slot across all `0..PB_SLOTS` for `vm`.
     #[allow(dead_code)]
     pub(crate) fn pick_slot(&self, vm: &Arc<super::vm::VmState>, behind: bool) -> Option<usize> {
         self.pick_slot_within(vm, behind, sizes::PB_SLOTS)
     }
-    /// Whether `vm` can pipeline another render behind active same-VM renders within `0..limit`.
+    /// Whether `vm` has a warm reusable PB slot within `0..limit` covering `min_blocks` and can
+    /// pipeline without InitBM.
+    #[allow(dead_code)]
+    pub(crate) fn can_pipeline_within_blocks(
+        &self,
+        vm: &Arc<super::vm::VmState>,
+        limit: usize,
+        min_blocks: u32,
+    ) -> bool {
+        self.pick_slot_within_blocks(vm, true, limit, min_blocks)
+            .is_some()
+    }
+    /// Whether `vm` has a warm reusable PB slot within `0..limit` and can pipeline without InitBM.
     #[allow(dead_code)]
     pub(crate) fn can_pipeline_within(&self, vm: &Arc<super::vm::VmState>, limit: usize) -> bool {
-        self.pick_slot_within(vm, true, limit).is_some()
+        self.can_pipeline_within_blocks(vm, limit, 0)
     }
-    /// Whether `vm` can pipeline another render behind the currently active same-VM renders.
+    /// Whether `vm` has a warm reusable PB slot and can pipeline without InitBM.
     #[allow(dead_code)]
     pub(crate) fn can_pipeline(&self, vm: &Arc<super::vm::VmState>) -> bool {
         self.can_pipeline_within(vm, sizes::PB_SLOTS)
@@ -450,15 +533,14 @@ impl Pools {
         if self.inflight.iter().any(|&c| c != 0) {
             return false;
         }
-        if let Some(a) = self.active {
-            let can_reuse_active = !self.quarantined[a]
-                && self.keep[a]
-                && self.owners[a]
+        if (0..sizes::PB_SLOTS).any(|k| {
+            !self.quarantined[k]
+                && self.keep[k]
+                && self.owners[k]
                     .as_ref()
-                    .is_some_and(|o| o.exposed.load(Ordering::Acquire));
-            if can_reuse_active {
-                return false;
-            }
+                    .is_some_and(|o| o.exposed.load(Ordering::Acquire))
+        }) {
+            return false;
         }
         !(0..sizes::PB_SLOTS).any(|k| self.slot_displaced(k))
     }
@@ -630,6 +712,7 @@ pub(crate) struct PbEpochInner {
     pub(crate) misc: Arc<FwObject>,
     pub(crate) initbm: Arc<FwObject>,
     assigned: AtomicU32,
+    heap_blocks: AtomicU32,
     exposed: AtomicBool,
     // Unmap private records before releasing the VM's aliases and ASID.
     _objects: Objects,
@@ -654,6 +737,7 @@ impl PbEpoch {
             misc: FwObject::view(&records, 0x300, 0x40)?,
             initbm: FwObject::view(&records, 0x400, 0x20)?,
             assigned: AtomicU32::new(u32::MAX),
+            heap_blocks: AtomicU32::new(0),
             exposed: AtomicBool::new(false),
             _objects: o,
             _vm: vm.clone(),
@@ -703,7 +787,11 @@ impl PbEpoch {
             ),
         )?;
         self.assigned.store(k as u32, Ordering::Release);
+        self.heap_blocks.store(heap_blocks, Ordering::Release);
         Ok(())
+    }
+    pub(crate) fn heap_blocks(&self) -> u32 {
+        self.heap_blocks.load(Ordering::Acquire)
     }
     pub(crate) fn check_assignment(&self, k: usize) -> Result {
         if self.assigned.load(Ordering::Acquire) != k as u32 {

@@ -12,7 +12,7 @@
 //! to [`EVENT_RETIRE_POLLS`] trailing 5 us waits run with `Shared::state` dropped so concurrent
 //! submissions are not blocked, stopping as soon as any flight retires. Wakeups: the EP 0x20
 //! event kick, then an hrtimer re-poll every `g16_resnap_us` (100) while anything is
-//! published, or `g16_repoll_us` (15) while a ready prefix waits for record consumption or a
+//! published, or `g16_repoll_us` (8) while a ready prefix waits for record consumption or a
 //! post-event receipt tail did not settle, with a 1-jiffy delayed-work backup.
 
 use core::sync::atomic::Ordering;
@@ -38,13 +38,21 @@ use super::fw::work::compute;
 use super::job::{self, Completions, Job};
 use super::recovery::logic::{Retirement, ABORT_GRACE_NS};
 use super::regs::EngineState;
-use super::{params, Firmware, Shared, FAST_POLL_WORK, POLL_WORK, SCRUB_WORK};
+use super::{params, Firmware, Shared, FAST_POLL_WORK, POLL_WORK, SCRUB_WORK, UNBOUND_POLL_WORK};
 use crate::module_parameters;
 
-/// Cadence of periodic housekeeping (power governor, window health, administrative hang check).
+/// Cadence of periodic housekeeping when idle or entering recovery (1 ms).
 const HOUSEKEEPING_NS: u64 = 1_000_000;
+/// Cadence of periodic housekeeping while flights are active (5 ms, aligned with
+/// `power::policy::SAMPLE_NS` and far below the 100 ms minimum hang deadline).
+const ACTIVE_HOUSEKEEPING_NS: u64 = 5_000_000;
+/// Minimum interval between auxiliary log/ktrace/stats ring drains while flights are active.
+const AUX_DRAIN_NS: u64 = 10_000_000;
 /// Maximum trailing receipt polls after an EP 0x20 event (stepped 1/2/3/4/5 us, 45 us total).
 const EVENT_RETIRE_POLLS: u32 = 11;
+/// Maximum consecutive in-place EP 0x20 rechecks in `run_poll()` before yielding back to
+/// the workqueue so short bursts avoid extra worker round-trips without starving housekeeping.
+const MAX_EVENT_RECHECKS: u32 = 8;
 /// Minimum interval between 1-jiffy delayed-work safety backup rearms (2 ms).
 const BACKUP_REARM_NS: u64 = 2_000_000;
 
@@ -103,6 +111,7 @@ impl Shared {
         let mut tail = 0u32;
         let mut housekeeping_deferred = false;
         let mut step = 0u32;
+        let mut rechecks = 0u32;
 
         loop {
             if self.sleeping.load(Ordering::Acquire) {
@@ -111,6 +120,7 @@ impl Shared {
             let mut done = Completions::new();
             let mut scrubs = super::slots::ScrubBatch::new();
             let mut retry_tail = false;
+            let mut poll_ok = true;
             if let Some(firmware) = self.state.lock().as_deref_mut() {
                 if self.sleeping.load(Ordering::Acquire) {
                     return;
@@ -137,9 +147,14 @@ impl Shared {
                     // floor hold is still pending so both expire cleanly to idle power.
                     Ok(false) => {
                         self.arm_idle_power_poll(firmware);
-                        self.cancel_resnap();
+                        if firmware.recovery.failed().is_some() {
+                            self.cancel_resnap();
+                        } else {
+                            self.idle_resnap();
+                        }
                     }
                     Err(error) => {
+                        poll_ok = false;
                         self.cancel_resnap();
                         firmware.fail_stop(error, &mut done);
                         self.fail_stop(error);
@@ -149,10 +164,26 @@ impl Shared {
                     && !firmware.engine.frozen
                     && !self.sleeping.load(Ordering::Acquire);
                 scrubs = firmware.slots.stage_and_take_scrubs(allow_stage);
+                self.sync_active_flights(firmware);
             }
             job::complete_all(done);
             self.enqueue_scrubs(scrubs);
+            self.queue_feed();
             if !retry_tail {
+                if poll_ok
+                    && !self.sleeping.load(Ordering::Acquire)
+                    && !self.crashed.load(Ordering::Acquire)
+                    && self.evented.load(Ordering::Acquire)
+                {
+                    if rechecks < MAX_EVENT_RECHECKS {
+                        rechecks += 1;
+                        step = 0;
+                        evented = false;
+                        tail = 0;
+                        continue;
+                    }
+                    self.poll_now();
+                }
                 break;
             }
             let delay_us = match step {
@@ -180,6 +211,7 @@ impl Shared {
                     } else if firmware.engine.flights.is_empty() {
                         self.arm_idle_power_poll(firmware);
                     }
+                    self.sync_active_flights(firmware);
                 }
             }
             job::complete_all(done);
@@ -200,22 +232,26 @@ impl Shared {
         let accepted = firmware.enqueue(job);
         if accepted.is_ok() && !self.sleeping.load(Ordering::Acquire) {
             let now = now_ns();
-            let housekeeping_due =
-                now.wrapping_sub(firmware.last_housekeeping_ns) >= HOUSEKEEPING_NS;
             let had_flights = !firmware.engine.flights.is_empty();
+            let housekeeping_interval = if had_flights {
+                ACTIVE_HOUSEKEEPING_NS
+            } else {
+                HOUSEKEEPING_NS
+            };
+            let housekeeping_due =
+                now.wrapping_sub(firmware.last_housekeeping_ns) >= housekeeping_interval;
             let was_evented = had_flights && self.evented.swap(false, Ordering::AcqRel);
             let recovery_pending = firmware.recovery_pending().unwrap_or(true);
+            let mut retired_any = false;
+            let mut restored_event = false;
             let mut pub_res = Ok(());
             if had_flights
-                && (was_evented
-                    || housekeeping_due
-                    || recovery_pending
-                    || firmware.oldest_stamp_reached())
+                && (was_evented || recovery_pending || firmware.oldest_stamp_reached())
             {
                 let stage_before = firmware.events.stage_events;
                 let term_before = firmware.oldest_terminal_events();
                 pub_res = firmware.session.transport().and_then(|()| {
-                    let retired_any = firmware.retire_once(done)?;
+                    retired_any = firmware.retire_once(done)?;
                     firmware.answer_growth()?;
                     if firmware.recovery.receipt_fault || recovery_pending {
                         firmware.check_hangs(done)?;
@@ -229,16 +265,18 @@ impl Shared {
                             && !recovery_pending;
                         if !non_terminal_only {
                             self.evented.store(true, Ordering::Release);
+                            restored_event = true;
                         }
                     }
                     Ok(())
                 });
             }
             if pub_res.is_ok() {
-                pub_res = if housekeeping_due || recovery_pending {
+                pub_res = if recovery_pending {
                     let r = firmware.publish(done);
                     if r.is_ok() {
                         firmware.last_housekeeping_ns = now;
+                        firmware.last_aux_drain_ns = now;
                     }
                     r
                 } else {
@@ -256,10 +294,22 @@ impl Shared {
                 self.fail_stop(error);
             }
             if !firmware.engine.flights.is_empty() || firmware.engine.chan_wait {
-                self.rearm(firmware.engine.chan_wait);
+                // If an EP 0x20 event retired an older flight while later flights remain active,
+                // or arrived before the oldest receipt became visible, arm a short repoll so
+                // trailing completions never fall back to `resnap_us`.
+                self.rearm(
+                    firmware.engine.chan_wait
+                        || restored_event
+                        || (was_evented && retired_any && !firmware.engine.flights.is_empty()),
+                );
             } else {
                 firmware.power.report_work(false);
                 self.arm_idle_power_poll(firmware);
+            }
+            if pub_res.is_ok()
+                && (restored_event || (housekeeping_due && !recovery_pending))
+            {
+                self.poll_now();
             }
         }
         accepted
@@ -278,10 +328,12 @@ impl Shared {
             let allow_stage = firmware.recovery.failed().is_none()
                 && !firmware.engine.frozen
                 && !self.sleeping.load(Ordering::Acquire);
+            self.sync_active_flights(firmware);
             (res, firmware.slots.stage_and_take_scrubs(allow_stage))
         };
         job::complete_all(done);
         self.enqueue_scrubs(scrubs);
+        self.queue_feed();
         drop(signalling);
         self.notify_wedged();
         accepted
@@ -310,6 +362,7 @@ impl Shared {
                         && !firmware.engine.frozen
                         && !self.sleeping.load(Ordering::Acquire);
                     scrubs = firmware.slots.stage_and_take_scrubs(allow_stage);
+                    self.sync_active_flights(firmware);
                     res
                 }
                 None => Err(ENODEV),
@@ -317,6 +370,7 @@ impl Shared {
         };
         job::complete_all(done);
         self.enqueue_scrubs(scrubs);
+        self.queue_feed();
         drop(signalling);
         self.notify_wedged();
         Some(accepted)
@@ -373,8 +427,22 @@ impl Shared {
         }
     }
 
-    /// Queues the fast poll work immediately on the submitting CPU. Callable from any context.
+    /// Publishes the active flight depth for lock-free completion worker placement.
+    fn sync_active_flights(&self, firmware: &Firmware) {
+        self.active_flights
+            .store(firmware.engine.flights.len() as u32, Ordering::Release);
+    }
+
+    /// Queues fast completion polling: pinned to the submitting CPU for single-flight (`d=1`)
+    /// wakeups so the sleeping waiter stays cache-hot, and unbound when pipelined (`d>=2`) so
+    /// completion polling does not preempt an actively recording submitter.
     pub(crate) fn poll_now(self: &Arc<Self>) {
+        if self.active_flights.load(Ordering::Acquire) >= 2 {
+            let _ = self
+                .events_unbound
+                .enqueue::<Arc<Shared>, UNBOUND_POLL_WORK>(self.clone());
+            return;
+        }
         let _ = match self.submitter_cpu() {
             Some(cpu) => self
                 .events
@@ -397,6 +465,23 @@ impl Shared {
         drop(handle.take());
     }
 
+    /// Relaxes the completion hrtimer on healthy idle transitions without cancelling a
+    /// short (`<= resnap_us`) already-armed timer so back-to-back `d=1` bursts avoid
+    /// per-job cancel/restart mutex and hrtimer-rbtree churn. System sleep and fail-stop
+    /// paths still call [`Self::cancel_resnap`] unconditionally.
+    pub(crate) fn idle_resnap(&self) {
+        let armed_ns = self.resnap_deadline_ns.load(Ordering::Acquire);
+        if armed_ns == 0 {
+            return;
+        }
+        let now = now_ns();
+        let keep_ns = u64::from(params::resnap_us()).saturating_mul(1000);
+        if armed_ns > now && armed_ns.saturating_sub(now) <= keep_ns {
+            return;
+        }
+        self.cancel_resnap();
+    }
+
     /// Queues the backup poll on `system_highpri_wq` after `delay` jiffies, or moves an already
     /// pending one to that expiry.
     fn mod_poll(self: &Arc<Self>, delay: Jiffies) {
@@ -416,16 +501,33 @@ impl Shared {
         };
     }
 
+    /// Computes the hrtimer repoll delay in microseconds: `repoll_us` when `soon`, otherwise
+    /// adapts down to `clamp(ewma_flight_us / 2, repoll_us, resnap_us)` on sub-`2 * resnap_us`
+    /// bursts while respecting `g16_repoll_us == 0` as a full disable of shortened repolls.
+    pub(crate) fn rearm_us(&self, soon: bool) -> u32 {
+        let resnap = params::resnap_us();
+        if module_parameters::g16_repoll_us.value() == 0 {
+            return resnap;
+        }
+        let repoll = params::repoll_us();
+        if soon {
+            return repoll;
+        }
+        let ewma = self.ewma_flight_us.load(Ordering::Relaxed);
+        if ewma != 0 && ewma < resnap.saturating_mul(2) {
+            (ewma / 2).clamp(repoll, resnap)
+        } else {
+            resnap
+        }
+    }
+
     /// Re-checks a published command soon: hrtimer, with a throttled 1-jiffy backup; sooner while
     /// a ready prefix waits for record consumption or a post-event receipt tail is settling.
     pub(crate) fn rearm(self: &Arc<Self>, soon: bool) {
         if self.sleeping.load(Ordering::Acquire) {
             return;
         }
-        let mut us = params::resnap_us();
-        if soon && module_parameters::g16_repoll_us.value() != 0 {
-            us = params::repoll_us();
-        }
+        let us = self.rearm_us(soon);
         let now = now_ns();
         let target_ns = now.saturating_add(u64::from(us) * 1000);
         let armed_ns = self.resnap_deadline_ns.load(Ordering::Acquire);
@@ -497,8 +599,14 @@ impl Firmware {
         self.engine.short_repoll = false;
         self.session.transport()?;
         let now = now_ns();
-        let housekeeping_due = now.wrapping_sub(self.last_housekeeping_ns) >= HOUSEKEEPING_NS;
         let had_flights = !self.engine.flights.is_empty();
+        let housekeeping_interval = if had_flights {
+            ACTIVE_HOUSEKEEPING_NS
+        } else {
+            HOUSEKEEPING_NS
+        };
+        let housekeeping_due =
+            now.wrapping_sub(self.last_housekeeping_ns) >= housekeeping_interval;
         let mut ran_housekeeping = false;
         // With nothing published only a pending firmware recovery notification needs this
         // pass: one that arrived after its prefix's receipts is answered
@@ -511,6 +619,7 @@ impl Firmware {
             self.objects.health()?;
             self.service_power()?;
             self.last_housekeeping_ns = now;
+            self.last_aux_drain_ns = now;
             ran_housekeeping = true;
             self.drain_rings()?;
             if self.recovery_idle()? && self.engine.pending.is_empty() {
@@ -540,7 +649,8 @@ impl Firmware {
         // unblocked `engine.pending`. `Prepared::drop` releases standby PB epochs only for
         // `Cache::prepare` waiters (`standby_available`, which enter `submit_locked()` directly),
         // while `publish_woke` covers external state changes (VM close, unstarted queue
-        // cancellation) so pending jobs never wait on the 1 ms housekeeping tick.
+        // cancellation) and `ta_wave_ready()` wakes TA-wave-paced renders when a `0x70` TA
+        // pass finishes while FS is still running.
         let should_publish = !self.engine.pending.is_empty()
             && (retired_any
                 || !had_flights
@@ -549,6 +659,7 @@ impl Firmware {
                 || unfrozen
                 || scrub_woke
                 || publish_woke
+                || self.ta_wave_ready()
                 || housekeeping_due);
         let published = if should_publish {
             self.publish_checked(done)
@@ -570,14 +681,16 @@ impl Firmware {
         }
         published?;
         // A TA-only (0x70) EP 0x20 interrupt while FS is still running does not signal flight
-        // retirement: avoid burning the receipt-tail spin or arming a short repoll storm for it.
+        // retirement: avoid burning the receipt-tail spin or arming a short repoll storm for it,
+        // unless a render queue is actively waiting on TA wave headroom (`ta_wave_wait`).
         let non_terminal_only = !retired_any
             && term_before.is_some()
             && self.events.stage_events != stage_before
             && self.oldest_terminal_events() == term_before
             && !self.oldest_stamp_reached()
             && !self.recovery.receipt_fault
-            && !recovery_pending;
+            && !recovery_pending
+            && !self.engine.ta_wave_wait;
         // After an EP 0x20 event, retry up to `EVENT_RETIRE_POLLS` times (outside the device
         // lock) only while no flight has retired yet and flights remain in flight. Once any
         // flight retires, stop spinning so deeper queues do not burn tail waits per interrupt.
@@ -595,7 +708,7 @@ impl Firmware {
             return Ok(true);
         }
         if !ran_housekeeping && housekeeping_due {
-            if !done.is_empty() {
+            if !done.is_empty() || !self.engine.flights.is_empty() {
                 *housekeeping_deferred = true;
             } else {
                 self.run_housekeeping(done)?;
@@ -603,12 +716,13 @@ impl Firmware {
         }
         // If a terminal EP 0x20 event arrived with flights outstanding and nothing retired within
         // the trailing polls, or a ready same-VM pending job is blocked on slot/flight/work-ring
-        // headroom, repoll at `repoll_us` instead of sleeping `resnap_us`.
+        // or TA-wave headroom, repoll at `repoll_us` instead of sleeping `resnap_us`.
         self.engine.short_repoll = !self.engine.flights.is_empty()
             && !self.engine.frozen
             && !non_terminal_only
             && ((evented && had_flights && !retired_any)
-                || (!self.engine.pending.is_empty() && self.engine.slot_wait));
+                || (!self.engine.pending.is_empty()
+                    && (self.engine.slot_wait || self.engine.ta_wave_wait)));
         Ok(!self.engine.flights.is_empty()
             || self.engine.chan_wait
             || self.recovery.needs_repoll()
@@ -626,12 +740,17 @@ impl Firmware {
         self.session.check()?;
         self.objects.health()?;
         self.service_power()?;
-        self.drain_auxiliary_rings()?;
-        self.last_housekeeping_ns = now_ns();
-        if !self.engine.flights.is_empty()
-            || self.recovery.receipt_fault
-            || self.recovery_pending()?
+        let now = now_ns();
+        let recovery_pending = self.recovery.receipt_fault || self.recovery_pending()?;
+        if self.engine.flights.is_empty()
+            || recovery_pending
+            || now.wrapping_sub(self.last_aux_drain_ns) >= AUX_DRAIN_NS
         {
+            self.drain_auxiliary_rings()?;
+            self.last_aux_drain_ns = now;
+        }
+        self.last_housekeeping_ns = now;
+        if !self.engine.flights.is_empty() || recovery_pending {
             self.check_hangs(done)?;
         }
         Ok(())
@@ -664,23 +783,31 @@ impl Firmware {
         Some((compute, render))
     }
 
-    /// Cheap single-stage stamp check for the oldest compute and oldest render flights' terminal
-    /// stages so `submit_locked()` can eagerly retire finished work without scanning all rings
-    /// when nothing has completed.
+    /// Whether a render job paused by `TA_WAVE_PASSES` pacing has enough TA headroom to publish
+    /// the next wave without dribbling 1-pass stub flights.
+    fn ta_wave_ready(&self) -> bool {
+        self.engine.ta_wave_wait && self.ta_pending_passes() <= super::hw::sizes::TA_WAVE_REFILL
+    }
+
+    /// Cheap single-stage stamp check for the oldest compute pipe 0/1 and oldest render flights'
+    /// terminal stages so `submit_locked()` can eagerly retire finished work without scanning
+    /// all rings when nothing has completed.
     fn oldest_stamp_reached(&self) -> bool {
         if self.engine.flights.is_empty() {
             return false;
         }
-        let mut oldest_compute: Option<&Flight> = None;
-        let mut compute_behind = false;
+        let mut oldest_compute: [Option<&Flight>; super::hw::sizes::COMPUTE_PIPES] =
+            [None; super::hw::sizes::COMPUTE_PIPES];
+        let mut compute_behind = [false; super::hw::sizes::COMPUTE_PIPES];
         let mut oldest_render: Option<&Flight> = None;
         let mut render_behind = false;
         for f in self.engine.flights.iter() {
             if f.computes != 0 {
-                if oldest_compute.is_none() {
-                    oldest_compute = Some(f);
+                let p = (f.compute_pipe as usize).min(super::hw::sizes::COMPUTE_PIPES - 1);
+                if oldest_compute[p].is_none() {
+                    oldest_compute[p] = Some(f);
                 } else {
-                    compute_behind = true;
+                    compute_behind[p] = true;
                 }
             }
             if f.renders != 0 {
@@ -690,20 +817,22 @@ impl Firmware {
                     render_behind = true;
                 }
             }
-            if compute_behind && render_behind {
+            if compute_behind[0] && compute_behind[1] && render_behind {
                 break;
             }
         }
         rmb();
-        if let Some(f) = oldest_compute {
-            if let Ok(obs) = self.graph.compute.fw_stamp.r32(0) {
-                let reached = if compute_behind {
-                    stamp_reached(obs, f.target, self.engine.target)
-                } else {
-                    obs == f.target
-                };
-                if reached {
-                    return true;
+        for p in 0..super::hw::sizes::COMPUTE_PIPES {
+            if let Some(f) = oldest_compute[p] {
+                if let Ok(obs) = self.graph.compute[p].fw_stamp.r32(0) {
+                    let reached = if compute_behind[p] {
+                        stamp_reached(obs, f.target, self.engine.target[p])
+                    } else {
+                        obs == f.target
+                    };
+                    if reached {
+                        return true;
+                    }
                 }
             }
         }
@@ -737,7 +866,7 @@ impl Firmware {
             return Ok(false);
         }
         let mut retired_any = false;
-        let (mut check_compute, mut check_render) = (true, true);
+        let (mut check_compute, mut check_render) = ([true; super::hw::sizes::COMPUTE_PIPES], true);
         let mut ret = self.retired_flight_classes(&mut check_compute, &mut check_render);
         while let Ok(Some((index, receipt))) = ret {
             let outcome = self.retire_outcome_at(index, receipt);
@@ -788,17 +917,14 @@ impl Firmware {
         Ok((at(start_off)?, at(end_off)?))
     }
 
-    /// Exact M4 queue and submit-pipe proof for one serialized publication. Event
-    /// notifications are wakeups; neither an event nor elapsed time releases an owner.
-    pub(crate) fn queue_receipt(
+    /// Exact queue-ring proof for one serialized publication on its workqueue pipe.
+    fn queue_ring_receipt(
         &self,
-        channel: Channel,
         state: &super::object::FwObject,
         info: &super::object::FwObject,
         head: u32,
-        record: u32,
     ) -> Result<bool> {
-        if head >= 256 || record >= 256 {
+        if head >= 256 {
             return Err(EINVAL);
         }
         // M4's qualified NC cursors are READ and WRITE. Offset zero is not an M4
@@ -808,7 +934,7 @@ impl Firmware {
                 return Ok(false);
             }
         }
-        if !super::hw::tuning::FW_CACHED {
+        if !super::hw::tuning::FW_CACHED && !super::graph::qinfo_cached() {
             for offset in [0x20, 0x24, 0x28] {
                 if info.r32(offset)? != head {
                     return Ok(false);
@@ -820,11 +946,72 @@ impl Firmware {
         }
         // With ASC-cached QI, its three consumers and busy flag can remain stale until
         // terminal CIVAC. The working M4 protocol substitutes the NC READ cursor above.
-        let pipe = self.channels.channel(channel);
-        if pipe.read()? != record || pipe.completion()? != record || pipe.write()? != record {
+        Ok(true)
+    }
+
+    /// Passed queue-ring proof when later flights are queued behind `f` on the same pipe.
+    fn queue_ring_passed(
+        &self,
+        channel: Channel,
+        state: &super::object::FwObject,
+        info: &super::object::FwObject,
+        f: &Flight,
+    ) -> Result<bool> {
+        let cap = super::hw::sizes::QUEUE_CAP;
+        let (start, head, tail) = match channel {
+            Channel::Compute => {
+                let p = (f.compute_pipe as usize).min(super::hw::sizes::COMPUTE_PIPES - 1);
+                (f.c_start, f.head, self.engine.head[p])
+            }
+            Channel::Ta => (f.ta_start, f.ta_head, self.engine.ta_head),
+            Channel::Fs => (f.fs_start, f.fs_head, self.engine.fs_head),
+        };
+        if head >= cap || start >= cap || tail >= cap {
+            return Err(EINVAL);
+        }
+        if !ring_passed(state.r32(qstate::READ)?, start, head, tail, cap) {
             return Ok(false);
         }
+        if !super::hw::tuning::FW_CACHED && !super::graph::qinfo_cached() {
+            for offset in [0x20, 0x24, 0x28] {
+                if !ring_passed(info.r32(offset)?, start, head, tail, cap) {
+                    return Ok(false);
+                }
+            }
+        }
         Ok(true)
+    }
+
+    /// Submit-channel proof for `record`: exact when no later record exists on `channel`,
+    /// otherwise passed within the current channel producer frontier.
+    fn channel_receipt(&self, channel: Channel, record: u32, passed: bool) -> Result<bool> {
+        let slots = super::fw::channels::RING_SLOTS;
+        if record >= slots {
+            return Err(EINVAL);
+        }
+        let pipe = self.channels.channel(channel);
+        if passed {
+            let first = (record + slots - 1) % slots;
+            let producer = self.channels.producer(channel);
+            Ok(ring_passed(pipe.read()?, first, record, producer, slots)
+                && ring_passed(pipe.completion()?, first, record, producer, slots))
+        } else {
+            Ok(pipe.read()? == record && pipe.completion()? == record && pipe.write()? == record)
+        }
+    }
+
+    /// Exact M4 queue and submit-pipe proof for one serialized publication. Event
+    /// notifications are wakeups; neither an event nor elapsed time releases an owner.
+    pub(crate) fn queue_receipt(
+        &self,
+        channel: Channel,
+        state: &super::object::FwObject,
+        info: &super::object::FwObject,
+        head: u32,
+        record: u32,
+    ) -> Result<bool> {
+        Ok(self.queue_ring_receipt(state, info, head)?
+            && self.channel_receipt(channel, record, false)?)
     }
 
     /// In-order receipt of flight `f` with later flights queued behind it: the NC READ cursor
@@ -837,31 +1024,13 @@ impl Firmware {
         info: &super::object::FwObject,
         f: &Flight,
     ) -> Result<bool> {
-        let cap = super::hw::sizes::QUEUE_CAP;
-        let (start, head, tail, record) = match channel {
-            Channel::Compute => (f.c_start, f.head, self.engine.head, f.rec[2]),
-            Channel::Ta => (f.ta_start, f.ta_head, self.engine.ta_head, f.rec[0]),
-            Channel::Fs => (f.fs_start, f.fs_head, self.engine.fs_head, f.rec[1]),
+        let record = match channel {
+            Channel::Compute => f.rec[2],
+            Channel::Ta => f.rec[0],
+            Channel::Fs => f.rec[1],
         };
-        if head >= cap || start >= cap || tail >= cap {
-            return Err(EINVAL);
-        }
-        if !ring_passed(state.r32(qstate::READ)?, start, head, tail, cap) {
-            return Ok(false);
-        }
-        if !super::hw::tuning::FW_CACHED {
-            for offset in [0x20, 0x24, 0x28] {
-                if !ring_passed(info.r32(offset)?, start, head, tail, cap) {
-                    return Ok(false);
-                }
-            }
-        }
-        let slots = super::fw::channels::RING_SLOTS;
-        let first = (record + slots - 1) % slots;
-        let producer = self.channels.producer(channel);
-        let pipe = self.channels.channel(channel);
-        Ok(ring_passed(pipe.read()?, first, record, producer, slots)
-            && ring_passed(pipe.completion()?, first, record, producer, slots))
+        Ok(self.queue_ring_passed(channel, state, info, f)?
+            && self.channel_receipt(channel, record, true)?)
     }
 
     /// A full receipt includes stage and notifier stamps, every physical consumer,
@@ -880,51 +1049,60 @@ impl Firmware {
         }
     }
 
-    /// Inspects the oldest compute flight and oldest render flight independently so either
-    /// class can retire as soon as its hardware receipt settles without waiting on the other.
+    /// Inspects the oldest compute flight per pipe and oldest render flight independently so any
+    /// pipe/class can retire as soon as its hardware receipt settles without waiting on another.
     pub(crate) fn retired_flight(&mut self) -> Result<Option<(usize, Retirement)>> {
-        let (mut check_compute, mut check_render) = (true, true);
+        let (mut check_compute, mut check_render) = ([true; super::hw::sizes::COMPUTE_PIPES], true);
         self.retired_flight_classes(&mut check_compute, &mut check_render)
     }
 
-    /// Like [`Self::retired_flight`], skipping classes that are inactive or already known
+    /// Like [`Self::retired_flight`], skipping pipes/classes that are inactive or already known
     /// pending in the current [`Self::retire_once`] pass and never polling a mixed flight twice.
     fn retired_flight_classes(
         &mut self,
-        check_compute: &mut bool,
+        check_compute: &mut [bool; super::hw::sizes::COMPUTE_PIPES],
         check_render: &mut bool,
     ) -> Result<Option<(usize, Retirement)>> {
-        let (mut compute_idx, mut render_idx) = (None, None);
-        if *check_compute || *check_render {
+        let mut compute_idx = [None; super::hw::sizes::COMPUTE_PIPES];
+        let mut render_idx = None;
+        if check_compute[0] || check_compute[1] || *check_render {
             for (i, f) in self.engine.flights.iter().enumerate() {
-                if *check_compute && compute_idx.is_none() && f.computes != 0 {
-                    compute_idx = Some(i);
+                if f.computes != 0 {
+                    let p = (f.compute_pipe as usize).min(super::hw::sizes::COMPUTE_PIPES - 1);
+                    if check_compute[p] && compute_idx[p].is_none() {
+                        compute_idx[p] = Some(i);
+                    }
                 }
                 if *check_render && render_idx.is_none() && f.renders != 0 {
                     render_idx = Some(i);
                 }
-                if (!*check_compute || compute_idx.is_some())
+                if (!check_compute[0] || compute_idx[0].is_some())
+                    && (!check_compute[1] || compute_idx[1].is_some())
                     && (!*check_render || render_idx.is_some())
                 {
                     break;
                 }
             }
         }
-        if compute_idx.is_none() {
-            *check_compute = false;
+        for p in 0..super::hw::sizes::COMPUTE_PIPES {
+            if compute_idx[p].is_none() {
+                check_compute[p] = false;
+            }
         }
         if render_idx.is_none() {
             *check_render = false;
         }
-        if let Some(index) = compute_idx {
-            let receipt = self.retired_at(index)?;
-            if receipt.complete() {
-                return Ok(Some((index, receipt)));
-            }
-            *check_compute = false;
-            if render_idx == Some(index) {
-                *check_render = false;
-                render_idx = None;
+        for p in 0..super::hw::sizes::COMPUTE_PIPES {
+            if let Some(index) = compute_idx[p] {
+                let receipt = self.retired_at(index)?;
+                if receipt.complete() {
+                    return Ok(Some((index, receipt)));
+                }
+                check_compute[p] = false;
+                if render_idx == Some(index) {
+                    *check_render = false;
+                    render_idx = None;
+                }
             }
         }
         if let Some(index) = render_idx {
@@ -948,33 +1126,45 @@ impl Firmware {
         rmb();
         let mut full = true;
         let mut ticks = [0u64; 4];
-        // Later flights of the same engine class queued behind this one: that class's queue,
-        // pipe and stamp cells already moved on, so its receipt is "passed", in order; the
-        // newest flight of a class keeps the exact receipt.
+        // Later flights of the same pipe/class queued behind this one: that pipe's queue and
+        // stamp cells already moved on, so its receipt is "passed", in order; the newest flight
+        // of a pipe keeps its exact queue receipt while Channel::Compute is checked independently
+        // against the shared submit-channel producer frontier.
         if f.computes != 0 {
-            let compute_behind = self
+            let pipe = (f.compute_pipe as usize).min(super::hw::sizes::COMPUTE_PIPES - 1);
+            let pipe_behind = self
+                .engine
+                .flights
+                .iter()
+                .filter(|o| o.computes != 0 && o.compute_pipe == f.compute_pipe)
+                .nth(1)
+                .is_some();
+            let chan_behind = self
                 .engine
                 .flights
                 .iter()
                 .filter(|o| o.computes != 0)
                 .nth(1)
-                .is_some();
-            let g = &self.graph.compute;
-            if compute_behind {
-                let e = &self.engine;
-                if !stamp_reached(g.fw_stamp.r32(0)?, f.target, e.target)
-                    || !self.queue_passed(Channel::Compute, &g.qstate, &g.qinfo, f)?
+                .is_some()
+                || f.rec[2] != self.channels.producer(Channel::Compute);
+            let g = &self.graph.compute[pipe];
+            if pipe_behind {
+                let tail = self.engine.target[pipe];
+                if !stamp_reached(g.fw_stamp.r32(0)?, f.target, tail)
+                    || !self.queue_ring_passed(Channel::Compute, &g.qstate, &g.qinfo, f)?
+                    || !self.channel_receipt(Channel::Compute, f.rec[2], chan_behind)?
                 {
                     return Ok(Retirement::Pending);
                 }
                 rmb();
                 let stamp = g.notifier.r32(notifier_page::COMPUTE_STAMP)?;
-                full &= stamp_reached(stamp, f.target, e.target)
+                full &= stamp_reached(stamp, f.target, tail)
                     && (stamp != f.target
                         || g.notifier.r32(notifier_page::COMPUTE_CONTEXT)? == f.job.vm.slot);
             } else {
                 if g.fw_stamp.r32(0)? != f.target
-                    || !self.queue_receipt(Channel::Compute, &g.qstate, &g.qinfo, f.head, f.rec[2])?
+                    || !self.queue_ring_receipt(&g.qstate, &g.qinfo, f.head)?
+                    || !self.channel_receipt(Channel::Compute, f.rec[2], chan_behind)?
                 {
                     return Ok(Retirement::Pending);
                 }
@@ -1186,6 +1376,14 @@ impl Firmware {
         self.engine.retired_ticks = [0; 4];
         if result.is_ok() {
             self.stat_retire(&f, retired_ticks);
+            if let Some(shared) = &self.engine.shared {
+                let now = now_ns();
+                shared.feed.note_flight(f.published_ns, now);
+                if f.published_ns != 0 && now > f.published_ns {
+                    let dur_us = ((now - f.published_ns) / 1000).clamp(1, 10_000) as u32;
+                    shared.note_flight_us(dur_us);
+                }
+            }
         }
         if receipt.owner_retired() {
             if let Err(error) = self.slots.retire(&mut f.claims) {
@@ -1201,13 +1399,16 @@ impl Firmware {
                 core::mem::forget(f);
                 return;
             }
-            for &stamp in &f.cstamp[..(f.computes as usize).min(f.cstamp.len())] {
-                self.recovery.last_retired.push(0, stamp);
+            if f.computes != 0 {
+                let p = (f.compute_pipe as usize).min(super::hw::sizes::COMPUTE_PIPES - 1);
+                for &stamp in &f.cstamp[..(f.computes as usize).min(f.cstamp.len())] {
+                    self.recovery.last_retired.push(p, stamp);
+                }
             }
             if f.renders != 0 {
                 for m in 0..(f.renders as usize).min(f.r_ta_stamp.len()) {
-                    self.recovery.last_retired.push(1, f.r_ta_stamp[m]);
-                    self.recovery.last_retired.push(2, f.r_fs_stamp[m]);
+                    self.recovery.last_retired.push(2, f.r_ta_stamp[m]);
+                    self.recovery.last_retired.push(3, f.r_fs_stamp[m]);
                 }
                 let committed = f.pb.as_ref().ok_or(EINVAL).and_then(|epoch| {
                     self.pools.retire_flight(
@@ -1220,6 +1421,10 @@ impl Firmware {
                 if let Err(error) = committed {
                     self.retain(&f.job);
                     complete(done, &f.job, Err(error));
+                    for j2 in f.group.iter() {
+                        self.retain(j2);
+                        complete(done, j2, Err(error));
+                    }
                     self.fail_stop(error, done);
                     core::mem::forget(f);
                     return;
@@ -1381,8 +1586,8 @@ impl Firmware {
             }
             complete(done, &job, Ok(()));
         }
-        // Complete folded compute-horizon jobs unconditionally (even if an earlier render
-        // command of `job` is still in flight; `Timeline` preserves queue fence order).
+        // Complete folded horizon jobs unconditionally (even if an earlier command of `job`
+        // is still in flight; `Timeline` preserves queue fence order).
         for j2 in f.group.iter() {
             let p2 = &j2.progress;
             p2.next.store(p2.count(), Ordering::Relaxed);
@@ -1415,24 +1620,29 @@ impl Firmware {
         }
     }
 
-    /// Progress of the oldest compute and oldest render flights: a FW stamp of an engine on
+    /// Progress of the oldest compute pipe 0/1 and oldest render flights: a FW stamp of a pipe on
     /// which its oldest flight still has unreached work moved since the last poll. Renews the
-    /// deadline; the first call for a flight pair only records its position.
+    /// deadline; the first call for a flight only records its position.
     /// [`Self::check_hangs`] calls it while no firmware recovery notification is pending.
     pub(crate) fn progress(&mut self) {
         if self.engine.flights.is_empty() {
             return;
         }
         let (g, r, e) = (&self.graph.compute, &self.graph.render, &self.engine);
-        let (mut fc, mut fr) = (None, None);
+        let mut fc: [Option<&Flight>; super::hw::sizes::COMPUTE_PIPES] =
+            [None; super::hw::sizes::COMPUTE_PIPES];
+        let mut fr = None;
         for f in e.flights.iter() {
-            if fc.is_none() && f.computes != 0 {
-                fc = Some(f);
+            if f.computes != 0 {
+                let p = (f.compute_pipe as usize).min(super::hw::sizes::COMPUTE_PIPES - 1);
+                if fc[p].is_none() {
+                    fc[p] = Some(f);
+                }
             }
             if fr.is_none() && f.renders != 0 {
                 fr = Some(f);
             }
-            if fc.is_some() && fr.is_some() {
+            if fc[0].is_some() && fc[1].is_some() && fr.is_some() {
                 break;
             }
         }
@@ -1440,22 +1650,26 @@ impl Firmware {
         // immediately after native wrap and must remain distinguishable from completion.
         let pending =
             |observed, own, tail| (!stamp_reached(observed, own, tail)).then_some(observed);
-        let (mut c, mut ta, mut fs) = (None, None, None);
-        let mut published = [0u64; 2];
-        if let Some(fc) = fc {
-            c = pending(g.fw_stamp.r32(0).unwrap_or(0), fc.target, e.target);
-            published[0] = fc.published_ns;
+        let mut c = [None; super::hw::sizes::COMPUTE_PIPES];
+        let (mut ta, mut fs) = (None, None);
+        let mut published = [0u64; 3];
+        for p in 0..super::hw::sizes::COMPUTE_PIPES {
+            if let Some(f) = fc[p] {
+                c[p] = pending(g[p].fw_stamp.r32(0).unwrap_or(0), f.target, e.target[p]);
+                published[p] = f.published_ns;
+            }
         }
         if let Some(fr) = fr {
             ta = pending(r.fw_stamp[0].r32(0).unwrap_or(0), fr.ta_target, e.ta_target);
             fs = pending(r.fw_stamp[1].r32(0).unwrap_or(0), fr.fs_target, e.fs_target);
-            published[1] = fr.published_ns;
+            published[2] = fr.published_ns;
         }
-        let compute_moved =
-            fc.is_some() && e.progress_flight[0] == published[0] && c != e.progress[0];
+        let compute_moved = (0..super::hw::sizes::COMPUTE_PIPES).any(|p| {
+            fc[p].is_some() && e.progress_flight[p] == published[p] && c[p] != e.progress[p]
+        });
         let render_moved = fr.is_some()
-            && e.progress_flight[1] == published[1]
-            && [ta, fs] != [e.progress[1], e.progress[2]];
+            && e.progress_flight[2] == published[2]
+            && [ta, fs] != [e.progress[2], e.progress[3]];
         if compute_moved {
             self.renew_compute_deadline();
         }
@@ -1463,7 +1677,7 @@ impl Firmware {
             self.renew_render_deadline();
         }
         self.engine.progress_flight = published;
-        self.engine.progress = [c, ta, fs];
+        self.engine.progress = [c[0], c[1], ta, fs];
     }
 
     /// The device mutex still excludes slot reuse after owner-ledger retirement. Read the
@@ -1526,7 +1740,22 @@ impl Firmware {
                         }
                         compute += 1;
                     }
-                    super::command::Command::Render(_) => return Err(EINVAL),
+                    super::command::Command::Render(command) => {
+                        let index = *passes.get(render).ok_or(EINVAL)? as usize;
+                        if !command.timestamp_outputs.is_empty() {
+                            let pass = flight.job.resources.render_pass(index)?;
+                            let ticks = [
+                                pass.scene.r64(0x600)?,
+                                pass.scene.r64(0x608)?,
+                                pass.scene.r64(0x620)?,
+                                pass.scene.r64(0x628)?,
+                            ];
+                            command
+                                .timestamp_outputs
+                                .publish(ticks, super::hw::COMMAND_TIMESTAMP_HZ);
+                        }
+                        render += 1;
+                    }
                 }
             }
         }
@@ -1627,12 +1856,12 @@ impl Firmware {
         if hi > lo {
             s.span_ticks = s.span_ticks.saturating_add(hi - lo);
         }
-        for b in 0..3 {
+        for b in 0..4 {
             let t = self.events.event_ns[b];
-            let skip = if b == 2 {
-                f.computes == 0
-            } else {
-                f.renders == 0
+            let skip = match b {
+                2 => f.computes == 0 || f.compute_pipe != 0,
+                3 => f.computes == 0 || f.compute_pipe != 1,
+                _ => f.renders == 0,
             };
             if skip {
                 continue;
@@ -1658,7 +1887,7 @@ impl Firmware {
     /// readiness and Flags words).
     #[allow(dead_code)]
     pub(crate) fn report(&self, what: &str) {
-        let (g, r, e) = (&self.graph.compute, &self.graph.render, &self.engine);
+        let (r, e) = (&self.graph.render, &self.engine);
         let ch = &self.channels;
         let rd = |o: &super::object::FwObject, off| o.r32(off).unwrap_or(0xdeadbeef);
         let state = self
@@ -1668,22 +1897,33 @@ impl Firmware {
             .flatten()
             .unwrap_or_default();
         let f = e.oldest();
+        let pipe = f
+            .map_or(0, |f| {
+                if f.computes != 0 {
+                    f.compute_pipe as usize
+                } else {
+                    0
+                }
+            })
+            .min(super::hw::sizes::COMPUTE_PIPES - 1);
+        let g = &self.graph.compute[pipe];
         let ms = f.map_or(0, |f| now_ns().wrapping_sub(f.published_ns) / 1_000_000);
 
         dev_info!(
             self.graph.dev.as_ref(),
-            "G16: {}: ctx={} prefixes={} n={} target={:#x} user={:#x} fw={:#x} done={} read={} write={} head={} ch={}/{} events={}/{} errors={} busy={} fault={:#x} {}ms\n",
+            "G16: {}: ctx={} prefixes={} n={} pipe={} target={:#x} user={:#x} fw={:#x} done={} read={} write={} head={} ch={}/{} events={}/{} errors={} busy={} fault={:#x} {}ms\n",
             what,
             f.map_or(0, |f| f.job.vm.slot),
             e.flights.len(),
             e.ordinal,
-            e.target,
+            pipe,
+            e.target[pipe],
             rd(&g.user_stamp, 0),
             rd(&g.fw_stamp, 0),
             rd(&g.qstate, qstate::DONE),
             rd(&g.qstate, qstate::READ),
             rd(&g.qstate, qstate::WRITE),
-            e.head,
+            e.head[pipe],
             ch.read(Channel::Compute).unwrap_or(0xdeadbeef),
             ch.write_cell(Channel::Compute).unwrap_or(0xdeadbeef),
             self.events.compute_events,

@@ -118,11 +118,20 @@ pub mod g16 {
     }
     pub mod graph {
         use crate::*;use crate::sync::Arc;use super::object::*;
-        use super::hw::{pte,tuning};
+        use super::fw::graph::{self, job_list, notifier_page, qinfo, qstate, sched_ctx};
+        use super::hw::{pte, sizes, tuning};
+        #[derive(Copy, Clone)]
+        pub(crate) struct FwAbi;
+        impl FwAbi {
+            pub(crate) fn qinfo(self) -> &'static graph::qinfo::Layout {
+                &graph::qinfo::V25G83
+            }
+        }
         __CLIENT__
         __CMD_CLASSES__
         __ALLOC__
         __ALLOC_WORK__
+        __GRAPH_TYPES__
     }
     pub mod encode {
         pub struct Geometry{pub tpc_bytes:u64,pub tilemap_bytes:u64}
@@ -146,6 +155,7 @@ pub mod g16 {
     }
     pub mod resources {
         use core::sync::atomic::{AtomicU64,Ordering};use crate::*;
+        pub struct PassDirty<'a>{pub tpc:&'a AtomicU64,pub tilemap:&'a AtomicU64,pub tilemap_last:&'a AtomicU64,pub tilemap_clean:&'a AtomicU64,pub heap:&'a AtomicU64}
         pub struct ComputeArena{pub compute:KVec<super::slots::ComputeSlot>,pub render:Option<crate::sync::Arc<RenderArena>>}
         // A job's compute units; here one arena.
         pub type Prepared=ComputeArena;
@@ -155,8 +165,8 @@ pub mod g16 {
         #[derive(Clone)]
         pub enum PbOwnerArena{Base(crate::sync::Arc<RenderArena>),Ext(crate::sync::Arc<RenderArena>,crate::sync::Arc<PoolExtArena>)}
         impl PassOwnerArena{
-            pub fn pass_and_tilemap_dirty(&self,k:usize)->Option<(&super::slots::PassSlot,&AtomicU64)>{
-                match self{Self::Base(a)=>Some((a.passes.get(k)?,a.tilemap_dirty.get(k)?))}
+            pub fn pass_and_dirty(&self,k:usize)->Option<(&super::slots::PassSlot,PassDirty<'_>)>{
+                match self{Self::Base(a)=>Some((a.passes.get(k)?,PassDirty{tpc:a.tpc_dirty.get(k)?,tilemap:a.tilemap_dirty.get(k)?,tilemap_last:a.tilemap_last.get(k)?,tilemap_clean:a.tilemap_clean.get(k)?,heap:a.heap_dirty.get(k)?}))}
             }
         }
         impl ComputeArena{
@@ -166,10 +176,11 @@ pub mod g16 {
             pub fn render_arena(&self)->Option<crate::sync::Arc<RenderArena>>{self.render.clone()}
             pub fn render_passes(&self)->Result<usize>{self.render.as_deref().map(|r|r.passes.len()).ok_or(EINVAL)}
             pub fn render_pass(&self,k:usize)->Result<&super::slots::PassSlot>{self.render.as_deref().and_then(|r|r.passes.get(k)).ok_or(EINVAL)}
-            pub fn render_pass_dirty(&self,k:usize)->Result<(&AtomicU64,&AtomicU64)>{let r=self.render.as_deref().ok_or(EINVAL)?;if k>=r.passes.len(){return Err(EINVAL);}Ok((&r.tpc_dirty[k],&r.tilemap_dirty[k]))}
+            pub fn render_pass_dirty(&self,k:usize)->Result<PassDirty<'_>>{let r=self.render.as_deref().ok_or(EINVAL)?;if k>=r.passes.len(){return Err(EINVAL);}Ok(PassDirty{tpc:&r.tpc_dirty[k],tilemap:&r.tilemap_dirty[k],tilemap_last:&r.tilemap_last[k],tilemap_clean:&r.tilemap_clean[k],heap:&r.heap_dirty[k]})}
+            pub fn set_pass_dirty(&self,k:usize,tpc:u64,tilemap:u64,heap:u64)->Result{let p=self.render_pass(k)?;if tpc>p.tpc.size as u64||tilemap>p.tilemap.size as u64||heap>p.heap.size as u64{return Err(E2BIG);}let d=self.render_pass_dirty(k)?;d.tpc.fetch_max(tpc,Ordering::Relaxed);d.tilemap.fetch_max(tilemap,Ordering::Relaxed);d.tilemap_last.store(tilemap,Ordering::Relaxed);d.tilemap_clean.store(0,Ordering::Relaxed);d.heap.fetch_max(heap,Ordering::Relaxed);Ok(())}
             pub fn pass_owner_arena(&self,_k:usize)->Option<PassOwnerArena>{self.render.as_ref().map(|r|PassOwnerArena::Base(r.clone()))}
         }
-        pub struct RenderArena{pub passes:KVec<super::slots::PassSlot>,pub tpc_dirty:[AtomicU64;super::hw::sizes::RENDER_SLOTS],pub tilemap_dirty:[AtomicU64;super::hw::sizes::RENDER_SLOTS]}
+        pub struct RenderArena{pub passes:KVec<super::slots::PassSlot>,pub tpc_dirty:[AtomicU64;super::hw::sizes::RENDER_SLOTS],pub tilemap_dirty:[AtomicU64;super::hw::sizes::RENDER_SLOTS],pub tilemap_last:[AtomicU64;super::hw::sizes::RENDER_SLOTS],pub tilemap_clean:[AtomicU64;super::hw::sizes::RENDER_SLOTS],pub heap_dirty:[AtomicU64;super::hw::sizes::RENDER_SLOTS]}
         impl RenderArena{ __SET_DIRTY__ }
         pub(crate) const BASE_COMPUTE_UNITS: usize = 2;
         pub(crate) const BASE_RENDER_SLOTS: usize = super::hw::sizes::BASE_RENDER_SLOTS;
@@ -195,10 +206,20 @@ pub mod g16 {
 #[cfg(test)]mod resources {
     use super::*;use g16::{object::Objects,slots::{Slots,Claims},pools::PoolSet};
     struct Arenas{compute:g16::resources::ComputeArena,render:g16::resources::RenderArena}
+    fn render_arena(passes:KVec<g16::slots::PassSlot>)->g16::resources::RenderArena{
+        g16::resources::RenderArena{
+            passes,
+            tpc_dirty:[const{std::sync::atomic::AtomicU64::new(0)};g16::hw::sizes::RENDER_SLOTS],
+            tilemap_dirty:[const{std::sync::atomic::AtomicU64::new(0)};g16::hw::sizes::RENDER_SLOTS],
+            tilemap_last:[const{std::sync::atomic::AtomicU64::new(0)};g16::hw::sizes::RENDER_SLOTS],
+            tilemap_clean:[const{std::sync::atomic::AtomicU64::new(0)};g16::hw::sizes::RENDER_SLOTS],
+            heap_dirty:[const{std::sync::atomic::AtomicU64::new(0)};g16::hw::sizes::RENDER_SLOTS],
+        }
+    }
     fn arenas(o:&mut Objects)->Arenas{
         let mut compute=KVec::new();let mut passes=KVec::new();
         for k in 0..2{compute.push(g16::slots::ComputeSlot::new(o,k).unwrap(),0).unwrap();passes.push(g16::slots::PassSlot::new(o,k,1).unwrap(),0).unwrap();}
-        Arenas{compute:g16::resources::ComputeArena{compute,render:None},render:g16::resources::RenderArena{passes,tpc_dirty:[const{std::sync::atomic::AtomicU64::new(0)};g16::hw::sizes::RENDER_SLOTS],tilemap_dirty:[const{std::sync::atomic::AtomicU64::new(0)};g16::hw::sizes::RENDER_SLOTS]}}
+        Arenas{compute:g16::resources::ComputeArena{compute,render:None},render:render_arena(passes)}
     }
     fn retire_render(s:&mut Slots,k:usize){let mut c=Claims::new();c.pass[0]=k as u32;c.pass_mask=1<<k;s.publish(&mut c).unwrap();s.retire(&mut c).unwrap();}
     fn drain_scrubs(batch:g16::slots::ScrubBatch)->bool{let mut q=g16::slots::ScrubQueue::new();q.push_batch(batch);let mut wake=false;while let Some(mut item)=q.pop(){wake|=item.run_one();}wake}
@@ -547,7 +568,7 @@ pub mod g16 {
         assert_eq!(p0.aux.fills.lock().unwrap().len(),1);
         assert_eq!(p0.scene.fills.lock().unwrap().last(),Some(&(0,0x4000)));
         assert_eq!(p0.tpc.fills.lock().unwrap().len(),1);
-        // Same-VM clean reuse of slot 0: clears tilemap/its/heap(0x1000)/pre headers only; skips aux/tpc/scratch/scene.
+        // Same-VM clean reuse of slot 0: clears tilemap and active heap(0x200) only; skips aux/tpc/scratch/scene/its/pre.
         s.claim_pass_for(&arena.render,0,Some(a.id)).unwrap();
         assert_eq!(p0.aux.fills.lock().unwrap().len(),1);
         assert_eq!(p0.scene.fills.lock().unwrap().len(),1);
@@ -556,9 +577,12 @@ pub mod g16 {
         assert_eq!(p0.scene_user.fills.lock().unwrap().len(),1);
         assert_eq!(p0.scene_list.fills.lock().unwrap().len(),1);
         assert_eq!(p0.tpc.fills.lock().unwrap().len(),1);
+        assert_eq!(p0.its.fills.lock().unwrap().len(),1);
+        assert_eq!(p0.pre[0].fills.lock().unwrap().len(),1);
+        assert_eq!(p0.pre[1].fills.lock().unwrap().len(),1);
+        assert_eq!(p0.pre[2].fills.lock().unwrap().len(),1);
         assert_eq!(p0.tilemap.fills.lock().unwrap().last(),Some(&(0,0x4000)));
-        assert_eq!(p0.heap.fills.lock().unwrap().last(),Some(&(0,0x1000)));
-        assert_eq!(p0.pre[0].fills.lock().unwrap().last(),Some(&(0,0x540)));
+        assert_eq!(p0.heap.fills.lock().unwrap().last(),Some(&(0,0x200)));
         // Preserved tpc_dirty high-water mark is still cleared on cross-VM switch.
         arena.render.set_dirty(0,0x2000,0x1000).unwrap();
         retire(&mut s,0,&a);
@@ -568,14 +592,16 @@ pub mod g16 {
         assert_eq!(p0.aux.fills.lock().unwrap().len(),2);
         assert_eq!(p0.scene.fills.lock().unwrap().len(),2);
         assert_eq!(p0.scene_list.fills.lock().unwrap().len(),2);
+        assert_eq!(p0.its.fills.lock().unwrap().len(),2);
+        assert_eq!(p0.pre[0].fills.lock().unwrap().len(),2);
         assert_eq!(p0.tpc.fills.lock().unwrap().last(),Some(&(0,0x8000)));
         assert_eq!(p0.tilemap.fills.lock().unwrap().last(),Some(&(0,0x1000)));
         assert_eq!(p0.heap.fills.lock().unwrap().last(),Some(&(0,0x4000)));
     }
 
-    #[test]fn forty_eight_render_passes_and_eighteen_compute_units_are_disjoint_in_mesa_hole(){
+    #[test]fn forty_eight_render_passes_and_twenty_four_compute_units_are_disjoint_in_mesa_hole(){
         assert_eq!(g16::hw::sizes::RENDER_SLOTS, 48);
-        assert_eq!(g16::hw::sizes::COMPUTE_UNITS, 18);
+        assert_eq!(g16::hw::sizes::COMPUTE_UNITS, 24);
         let mut o=Objects::new();
         let pools=PoolSet::new(&mut o).unwrap();
         for k in g16::hw::sizes::BASE_PB_SLOTS as u64..g16::hw::sizes::PB_SLOTS as u64 {
@@ -673,6 +699,74 @@ pub mod g16 {
         assert_eq!(p.pick_slot(&vm1,false),Some(0));
     }
 
+    #[test]fn render_allocators_use_distinct_uma_slots_within_firmware_window(){
+        let mut o=Objects::new();
+        let pools=PoolSet::new(&mut o).unwrap();
+        let mut uma_slots=Vec::new();
+        for k in 0..g16::hw::sizes::PB_SLOTS {
+            let alloc=g16::pools::Allocator::new(&mut o,k as u64,pools.heap()).unwrap();
+            let refs=alloc.prepare_in_flight(1,false).unwrap();
+            assert_eq!(refs.parameter_id,k as u32);
+            let desc=o.objects.iter().find(|obj|obj.va==refs.uma_mgr[0]).unwrap();
+            let slot_id=desc.r32(8).unwrap();
+            let expected=g16::hw::engine::RENDER_UMA_SLOT+k as u32;
+            assert_eq!(slot_id,expected);
+            assert!(slot_id>=33 && slot_id<=64);
+            assert!(!uma_slots.contains(&slot_id));
+            uma_slots.push(slot_id);
+            // Tampering with the descriptor UMA slot ID is rejected before publication.
+            desc.write(8,&(expected+1).to_le_bytes()).unwrap();
+            assert_eq!(alloc.prepare_in_flight(1,false).err(),Some(EINVAL));
+        }
+    }
+
+    #[test]fn multi_active_pools_allow_warm_cross_vm_reuse_and_gate_cold_initbm(){
+        let vm1=vm(1);let vm2=vm(2);let vm3=vm(3);
+        let factory=g16::object::Factory;let budget=g16::budget::Budget::new().unwrap();
+        let mk_epoch=|owner:&sync::Arc<g16::vm::VmState>,slot:usize|{
+            let e=g16::pools::PbEpoch::new(&factory,owner,g16::budget::Budget::reserve(&budget,1).unwrap().take().unwrap()).unwrap();
+            e.prepare(slot,0x70c0000000,2048).unwrap();e.check_assignment(slot).unwrap();e.expose();
+            e
+        };
+        let mut p=g16::pools::Pools::new(&driver::AsahiDrmDevice(device::Device));
+        // Prime VM1 on slot 0 and VM2 on slot 1 (drained InitBM).
+        let e1=mk_epoch(&vm1,0);
+        assert_eq!(p.pick_slot_within(&vm1,false,2),Some(0));
+        let b1=p.bind(0,false);p.publish_flight(0);p.retire_flight(0,&e1,b1,true).unwrap();
+        let e2=mk_epoch(&vm2,1);
+        assert_eq!(p.pick_slot_within(&vm2,false,2),Some(1));
+        let b2=p.bind(1,false);p.publish_flight(1);p.retire_flight(1,&e2,b2,true).unwrap();
+        // VM1 starts a render on warm slot 0 (no InitBM).
+        assert_eq!(p.pick_slot_within(&vm1,false,2),Some(0));
+        assert!(p.reusable(0,&vm1).is_some());
+        let b1=p.bind(0,true);p.publish_flight(0);
+        assert_eq!(p.slot_inflight(0),1);
+        assert_eq!(p.slot_inflight(1),0);
+        // While VM1 is live on slot 0 (behind=true):
+        // - Warm VM2 pipelines onto its own slot 1 without InitBM or drain.
+        // - Cold VM3 has no warm slot and returns None so the engine drains before InitBM.
+        assert!(p.can_pipeline_within(&vm2,2));
+        assert_eq!(p.pick_slot_within(&vm2,true,2),Some(1));
+        assert!(!p.can_pipeline_within(&vm3,2));
+        assert_eq!(p.pick_slot_within(&vm3,true,2),None);
+        // VM2 publishes on slot 1 concurrently with VM1 on slot 0.
+        let b2=p.bind(1,true);p.publish_flight(1);
+        assert_eq!(p.slot_inflight(0),1);
+        assert_eq!(p.slot_inflight(1),1);
+        // Neither in-flight slot is displaced while live.
+        assert!(!p.exhausted());
+        // Both retire cleanly in order.
+        p.retire_flight(0,&e1,b1,true).unwrap();
+        assert_eq!(p.slot_inflight(0),0);
+        assert_eq!(p.slot_inflight(1),1);
+        p.retire_flight(1,&e2,b2,true).unwrap();
+        assert_eq!(p.slot_inflight(1),0);
+        // Recovery invalidation clears warm reuse for BOTH slots so both VMs drain for InitBM.
+        p.invalidate();
+        assert!(!p.can_pipeline_within(&vm1,2));
+        assert!(!p.can_pipeline_within(&vm2,2));
+    }
+
     #[test]fn render_hang_after_cross_vm_use_recovers_via_lazy_pb_slot_and_displaces_survivor(){
         let vm1=vm(1);let vm2=vm(2);let vm3=vm(3);let vm4=vm(4);
         let factory=g16::object::Factory;let budget=g16::budget::Budget::new().unwrap();
@@ -756,7 +850,13 @@ pub mod g16 {
         // 5th hang quarantines slot 4: only slot 5 survives (reuse-only for VM2; other VMs exhausted).
         p.publish_flight(4);
         p.quarantine_flight(4,None);
-        // Slot 5 was the last_clean_retired slot (undisplaced) and slot 4 is quarantined -> exhausted.
+        assert!(!p.exhausted());
+        assert!(!p.exhausted_for(&vm2));
+        assert_eq!(p.pick_slot(&vm2,false),Some(5));
+        assert!(p.exhausted_for(&vm1));
+        assert!(p.exhausted_for(&vm3));
+        // Recovery invalidation clears slot 5's warm epoch -> global pool exhaustion.
+        p.invalidate();
         assert!(p.exhausted());
 
         // Quarantine 5 fresh slots leaving slot 5 fresh: VM2 claims and reuses slot 5 while
@@ -832,11 +932,7 @@ pub mod g16 {
             }
             passes.push(pass,0).unwrap();
         }
-        let arena=g16::resources::RenderArena{
-            passes,
-            tpc_dirty:[const{std::sync::atomic::AtomicU64::new(0)};g16::hw::sizes::RENDER_SLOTS],
-            tilemap_dirty:[const{std::sync::atomic::AtomicU64::new(0)};g16::hw::sizes::RENDER_SLOTS],
-        };
+        let arena=render_arena(passes);
         let a=vm(1);
         let b=vm(2);
         let mut live:Vec<Claims>=Vec::new();
@@ -893,7 +989,9 @@ pub mod g16 {
         s.hold_vm(&c0,&a).unwrap();s.hold_arenas(&c0,&prep);s.publish(&mut c0).unwrap();
         render.set_dirty(0,0x2000,0x4000).unwrap();
         render.passes[0].tilemap.fill(0,0xab,0x4000).unwrap();
-        render.passes[0].its.fill(0,0xcd,32).unwrap();
+        render.passes[0].heap.fill(0,0xcd,0x200).unwrap();
+        let its_before=render.passes[0].its.fills.lock().unwrap().len();
+        let pre0_before=render.passes[0].pre[0].fills.lock().unwrap().len();
         s.retire(&mut c0).unwrap();
         s.stage_displaced_pass_scrubs();
         assert!(!s.scrubbing_active());
@@ -913,16 +1011,21 @@ pub mod g16 {
         assert!(drain_scrubs(batch));
         assert!(!s.scrubbing_active());
         assert!(render.passes[0].tilemap.snapshot()[..0x4000].iter().all(|&b|b==0));
-        assert!(render.passes[0].its.snapshot()[..32].iter().all(|&b|b==0));
+        assert!(render.passes[0].heap.snapshot()[..0x200].iter().all(|&b|b==0));
+        assert_eq!(render.passes[0].its.fills.lock().unwrap().len(),its_before);
+        assert_eq!(render.passes[0].pre[0].fills.lock().unwrap().len(),pre0_before);
         assert_eq!(render.tilemap_dirty[0].load(std::sync::atomic::Ordering::Acquire),0);
+        assert_eq!(render.heap_dirty[0].load(std::sync::atomic::Ordering::Acquire),0);
         // Next same-VM claim picks pre-cleaned slot 0 and performs zero WC fills under lock.
         let fills_before=render.passes[0].tilemap.fills.lock().unwrap().len();
-        let its_before=render.passes[0].its.fills.lock().unwrap().len();
+        let heap_before=render.passes[0].heap.fills.lock().unwrap().len();
         assert_eq!(s.pick_pass_in(&prep,&geo,0),Some(0));
         s.claim_pass_in(&prep,0,Some(a.id),0x4000).unwrap();
         assert!(!s.render_needs_full_work(0));
         assert_eq!(render.passes[0].tilemap.fills.lock().unwrap().len(),fills_before);
+        assert_eq!(render.passes[0].heap.fills.lock().unwrap().len(),heap_before);
         assert_eq!(render.passes[0].its.fills.lock().unwrap().len(),its_before);
+        assert_eq!(render.passes[0].pre[0].fills.lock().unwrap().len(),pre0_before);
     }
 
     #[test]fn offlock_scrub_falls_back_on_error_drop_recovery_and_cross_vm(){
@@ -1058,11 +1161,7 @@ pub mod g16 {
         for k in 0..g16::hw::sizes::RENDER_SLOTS as u64 {
             passes.push(g16::slots::PassSlot::new(&mut o,k,1).unwrap(),0).unwrap();
         }
-        let render=sync::Arc::new(g16::resources::RenderArena{
-            passes,
-            tpc_dirty:[const{std::sync::atomic::AtomicU64::new(0)};g16::hw::sizes::RENDER_SLOTS],
-            tilemap_dirty:[const{std::sync::atomic::AtomicU64::new(0)};g16::hw::sizes::RENDER_SLOTS],
-        },0).unwrap();
+        let render=sync::Arc::new(render_arena(passes),0).unwrap();
         let prep=g16::resources::Prepared{compute:arena.compute.compute,render:Some(render)};
         let a=vm(1);
         // Wrapped submission order [46, 47, 0]: retiring in order leaves slot 0 as last_retired
@@ -1116,6 +1215,65 @@ pub mod g16 {
         assert_eq!(pools.publish_batch(0,10,3),Err(EINVAL));
         assert_eq!(pools.publish_batch(0,12,3),Ok(()));
         assert!(!pools.retired_at(0,6).unwrap());
+    }
+
+    #[test]fn per_unit_hold_and_verify_held_match_batch_and_reject_unheld_slots(){
+        let mut o=Objects::new();let mut s=Slots::new().unwrap();let arena=arenas(&mut o);
+        let mut passes=KVec::new();
+        for k in 0..g16::hw::sizes::RENDER_SLOTS as u64 {
+            passes.push(g16::slots::PassSlot::new(&mut o,k,1).unwrap(),0).unwrap();
+        }
+        let render=sync::Arc::new(render_arena(passes),0).unwrap();
+        let prep=g16::resources::Prepared{compute:arena.compute.compute,render:Some(render)};
+        let a=vm(1);let b=vm(2);
+
+        // Per-unit compute hold_compute_slot + verify_held + note_published.
+        let mut cc=Claims::new();
+        let k0=s.claim_compute_for(&prep,&mut cc,Some(a.id)).unwrap().unwrap();
+        assert_eq!(s.verify_held(&cc),Err(EINVAL));
+        assert_eq!(s.hold_compute_slot(g16::hw::sizes::COMPUTE_UNITS,&a,&prep),Err(EINVAL));
+        s.hold_compute_slot(k0,&a,&prep).unwrap();
+        s.verify_held(&cc).unwrap();
+        s.publish(&mut cc).unwrap();
+        s.note_published(&cc);
+        s.retire(&mut cc).unwrap();
+
+        // High render pass slots (46, 47) held individually via hold_render_pass.
+        let mut cr=Claims::new();
+        for (i,&k) in [46usize,47].iter().enumerate() {
+            s.claim_pass_in(&prep,k,Some(a.id),0x1000).unwrap();
+            cr.pass[i]=k as u32;
+            cr.pass_count+=1;
+            cr.pass_mask|=1u64<<k;
+            s.pass_busy|=1u64<<k;
+            assert_eq!(s.verify_held(&cr),Err(EINVAL));
+            s.hold_render_pass(k,&a,&prep).unwrap();
+            s.verify_held(&cr).unwrap();
+        }
+        assert_eq!(s.hold_render_pass(g16::hw::sizes::RENDER_SLOTS,&a,&prep),Err(EINVAL));
+        let mut bad=cr;
+        bad.pass_mask^=1u64<<1;
+        assert_eq!(s.verify_held(&bad),Err(EINVAL));
+        let mut dup=cr;
+        dup.pass[1]=46;
+        assert_eq!(s.verify_held(&dup),Err(EINVAL));
+        s.publish(&mut cr).unwrap();
+        s.note_published(&cr);
+        s.retire(&mut cr).unwrap();
+
+        // Cross-VM reuse of displaced slot 46 records retarget via bit-set note_published.
+        let mut cr2=Claims::new();
+        s.claim_pass_in(&prep,46,Some(b.id),0x1000).unwrap();
+        cr2.pass[0]=46;cr2.pass_count=1;cr2.pass_mask=1u64<<46;s.pass_busy|=1u64<<46;
+        s.hold_render_pass(46,&b,&prep).unwrap();
+        s.verify_held(&cr2).unwrap();
+        s.publish(&mut cr2).unwrap();
+        s.note_published(&cr2);
+        assert_eq!(s.stats.cross_vm_retargets[1],1);
+        assert_eq!(s.stats.last_retarget[1].unit,46);
+        assert_eq!(s.stats.last_retarget[1].old_vm,1);
+        assert_eq!(s.stats.last_retarget[1].new_vm,2);
+        s.retire(&mut cr2).unwrap();
     }
 
     #[test]fn render_ext_tiers_grow_on_demand_and_keep_shallow_clients_bounded(){
@@ -1264,6 +1422,58 @@ pub mod g16 {
         s.release(&mut c);
     }
 
+    #[test]fn two_pipe_compute_out_of_order_retire_and_base_unit_isolation(){
+        let mut o=Objects::new();let mut s=Slots::new().unwrap();
+        let mut units=KVec::new();
+        for k in 0..4u64 {
+            units.push(g16::slots::ComputeSlot::new(&mut o,k).unwrap(),0).unwrap();
+        }
+        let prep=g16::resources::ComputeArena{compute:units,render:None};
+        let a=vm(1);let b=vm(2);
+        // Pipe 0 claims unit 0; pipe 1 stays out of base units 0..2 and claims unit 2.
+        let mut c0=Claims::new();
+        let mut c1=Claims::new();
+        assert_eq!(s.claim_compute_for_pipe(&prep,&mut c0,Some(a.id),0).unwrap(),Some(0));
+        assert_eq!(c0.compute_pipe,0);
+        s.hold_vm(&c0,&a).unwrap();s.publish(&mut c0).unwrap();
+        assert_eq!(s.claim_compute_for_pipe(&prep,&mut c1,Some(a.id),1).unwrap(),Some(2));
+        assert_eq!(c1.compute_pipe,1);
+        s.hold_vm(&c1,&a).unwrap();s.publish(&mut c1).unwrap();
+        // Pipe 1 finishes ahead of still-running pipe 0: retire must succeed (no EINVAL).
+        assert_eq!(s.retire(&mut c1),Ok(()));
+        // Second pipe-1 flight claims unit 3 and retires, displacing unit 2 on pipe 1.
+        let mut c1b=Claims::new();
+        assert_eq!(s.claim_compute_for_pipe(&prep,&mut c1b,Some(a.id),1).unwrap(),Some(3));
+        s.hold_vm(&c1b,&a).unwrap();s.publish(&mut c1b).unwrap();
+        assert_eq!(s.retire(&mut c1b),Ok(()));
+        assert!(s.compute_available_for_pipe(4,1));
+        // Now pipe 0's unit 0 retires: pipe 1's newer unit 3 must NOT mark unit 0 reusable,
+        // while base unit 1 remains fresh so a 2-unit base-only VM is never exhausted!
+        assert_eq!(s.retire(&mut c0),Ok(()));
+        assert!(!s.compute_exhausted_within(2));
+        assert!(s.compute_available(2));
+        // Pipe 0 claims base unit 1 (not undisplaced unit 0), publishes, and retires -> unit 0 displaced!
+        let mut c0b=Claims::new();
+        assert_eq!(s.claim_compute_for_pipe(&prep,&mut c0b,Some(b.id),0).unwrap(),Some(1));
+        s.hold_vm(&c0b,&b).unwrap();s.publish(&mut c0b).unwrap();
+        assert_eq!(s.retire(&mut c0b),Ok(()));
+        assert!(!s.compute_exhausted_within(2));
+        assert!(s.compute_available(2));
+        // A 2-unit base-only VM can claim displaced base unit 0 on pipe 0, while pipe 1
+        // reclaims displaced extension unit 2 on the 4-unit VM without touching base units 0..2.
+        let mut base_units=KVec::new();
+        for k in 0..2u64 {
+            base_units.push(g16::slots::ComputeSlot::new(&mut o,k).unwrap(),0).unwrap();
+        }
+        let prep_base=g16::resources::ComputeArena{compute:base_units,render:None};
+        let mut c0c=Claims::new();
+        assert_eq!(s.claim_compute_for_pipe(&prep_base,&mut c0c,Some(b.id),0).unwrap(),Some(0));
+        let mut c1c=Claims::new();
+        assert_eq!(s.claim_compute_for_pipe(&prep,&mut c1c,Some(b.id),1).unwrap(),Some(2));
+        s.release(&mut c0c);
+        s.release(&mut c1c);
+    }
+
     #[test]fn base_render_quarantine_expands_fresh_vm_and_recovers_displacement(){
         use crate::g16::resources::{BASE_RENDER_SLOTS, EXT_RENDER_TIERS, target_render_slots};
         let mut o=Objects::new();let mut s=Slots::new().unwrap();
@@ -1271,11 +1481,7 @@ pub mod g16 {
         for k in 0..4u64 {
             passes.push(g16::slots::PassSlot::new(&mut o,k,1).unwrap(),0).unwrap();
         }
-        let render=sync::Arc::new(g16::resources::RenderArena{
-            passes,
-            tpc_dirty:[const{std::sync::atomic::AtomicU64::new(0)};g16::hw::sizes::RENDER_SLOTS],
-            tilemap_dirty:[const{std::sync::atomic::AtomicU64::new(0)};g16::hw::sizes::RENDER_SLOTS],
-        },0).unwrap();
+        let render=sync::Arc::new(render_arena(passes),0).unwrap();
         let prep=g16::resources::Prepared{compute:KVec::new(),render:Some(render)};
         let a=vm(1);let b=vm(2);
         let geo=g16::encode::Geometry{tpc_bytes:0x1000,tilemap_bytes:0x1000};
@@ -1362,6 +1568,192 @@ pub mod g16 {
         assert!(s.render_needs_full_work(0));
     }
 
+    #[test]fn lazy_tilemap_prefix_scrub_and_classed_slot_selection_avoid_overscrub(){
+        let mut o=Objects::new();let mut s=Slots::new().unwrap();
+        let mut passes=KVec::new();
+        for k in 0..3u64 {
+            passes.push(g16::slots::PassSlot::new(&mut o,k,1).unwrap(),0).unwrap();
+        }
+        let render=sync::Arc::new(render_arena(passes),0).unwrap();
+        let prep=g16::resources::Prepared{compute:KVec::new(),render:Some(render.clone())};
+        let a=vm(1);let b=vm(2);
+        let pub_retire=|s:&mut Slots,k:usize,vm:&sync::Arc<g16::vm::VmState>|{
+            let mut c=Claims::new();c.pass[0]=k as u32;c.pass_mask=1u64<<k;
+            s.hold_vm(&c,vm).unwrap();s.hold_arenas(&c,&prep);s.publish(&mut c).unwrap();s.retire(&mut c).unwrap();
+        };
+        // Slot 0 runs a large pass (0x10000), then a small pass (0x2000) -> dirty=0x10000, last=0x2000.
+        s.claim_pass_in(&prep,0,Some(a.id),0x10000).unwrap();
+        prep.set_pass_dirty(0,0x2000,0x10000,0x200).unwrap();
+        render.passes[0].tilemap.fill(0,0x55,0x10000).unwrap();
+        pub_retire(&mut s,0,&a);
+        s.claim_pass_in(&prep,1,Some(a.id),0x2000).unwrap();
+        prep.set_pass_dirty(1,0x1000,0x2000,0x200).unwrap();
+        pub_retire(&mut s,1,&a);
+        // Synchronous small claim on slot 0 only zeroes 0..0x2000 and leaves 0x2000..0x10000 dirty.
+        s.claim_pass_in(&prep,0,Some(a.id),0x2000).unwrap();
+        assert_eq!(render.passes[0].tilemap.fills.lock().unwrap().last(),Some(&(0,0x2000)));
+        assert_eq!(render.passes[0].tilemap.snapshot()[0x2000],0x55);
+        prep.set_pass_dirty(0,0x1000,0x2000,0x1000).unwrap(); // multi-layer heap=0x1000
+        render.passes[0].tilemap.fill(0,0x66,0x2000).unwrap();
+        render.passes[0].heap.fill(0,0x77,0x1000).unwrap();
+        pub_retire(&mut s,0,&a);
+        // Slot 2 retires to displace slot 0; both slot 0 (partial) and slot 1 (fully clean) scrub off-lock.
+        s.claim_pass_in(&prep,2,Some(a.id),0x2000).unwrap();
+        prep.set_pass_dirty(2,0x1000,0x2000,0x200).unwrap();
+        pub_retire(&mut s,2,&a);
+        s.stage_displaced_pass_scrubs();
+        let _=drain_scrubs(s.take_staged_scrubs());
+        // Slot 0 off-lock scrubbed ONLY 0..0x2000 tilemap and 0..0x1000 heap; high-water 0x10000 preserved!
+        assert_eq!(render.tilemap_dirty[0].load(std::sync::atomic::Ordering::Acquire),0x10000);
+        assert_eq!(render.tilemap_clean[0].load(std::sync::atomic::Ordering::Acquire),0x2000);
+        assert_eq!(render.heap_dirty[0].load(std::sync::atomic::Ordering::Acquire),0);
+        assert!(render.passes[0].tilemap.snapshot()[..0x2000].iter().all(|&x|x==0));
+        assert_eq!(render.passes[0].tilemap.snapshot()[0x2000],0x55);
+        assert!(render.passes[0].heap.snapshot()[..0x1000].iter().all(|&x|x==0));
+        // Slot 1 off-lock scrubbed fully (dirty=0, clean=0).
+        assert_eq!(render.tilemap_dirty[1].load(std::sync::atomic::Ordering::Acquire),0);
+        assert_eq!(render.tilemap_clean[1].load(std::sync::atomic::Ordering::Acquire),0);
+        // Cursor starts at 0 (after slot 2): small pass (0x2000) picks slot 0 (exact clean prefix),
+        // while large pass (0x8000) prefers slot 1 (zero sync delta) over partial-clean slot 0!
+        let small=g16::encode::Geometry{tpc_bytes:0x1000,tilemap_bytes:0x2000};
+        let large=g16::encode::Geometry{tpc_bytes:0x1000,tilemap_bytes:0x8000};
+        assert_eq!(s.pick_pass_in(&prep,&small,0),Some(0));
+        assert_eq!(s.pick_pass_in(&prep,&large,0),Some(1));
+        // Claiming partial-clean slot 0 for a medium pass (0x6000) zeroes ONLY tail delta (0x2000, 0x4000)
+        // and performs zero heap fills.
+        let heap_before=render.passes[0].heap.fills.lock().unwrap().len();
+        s.claim_pass_in(&prep,0,Some(a.id),0x6000).unwrap();
+        assert_eq!(render.passes[0].tilemap.fills.lock().unwrap().last(),Some(&(0x2000,0x4000)));
+        assert_eq!(render.passes[0].heap.fills.lock().unwrap().len(),heap_before);
+        assert!(render.passes[0].tilemap.snapshot()[..0x6000].iter().all(|&x|x==0));
+        assert_eq!(render.passes[0].tilemap.snapshot()[0x6000],0x55);
+        pub_retire(&mut s,0,&a);
+        // Cross-VM switch on slot 0 still full-scrubs the preserved high-water mark (0x10000) + full heap (0x4000).
+        s.claim_pass_in(&prep,1,Some(a.id),0x2000).unwrap();
+        pub_retire(&mut s,1,&a);
+        s.claim_pass_in(&prep,0,Some(b.id),0x2000).unwrap();
+        assert_eq!(render.passes[0].tilemap.fills.lock().unwrap().last(),Some(&(0,0x10000)));
+        assert_eq!(render.passes[0].heap.fills.lock().unwrap().last(),Some(&(0,0x4000)));
+        assert!(render.passes[0].tilemap.snapshot()[..0x10000].iter().all(|&x|x==0));
+    }
+    #[test]fn queue_graph_objects_cache_only_firmware_owned_records(){
+        use g16::object::Class;
+        use g16::graph::{ComputeGraph, FwAbi, RenderGraph, cmd_fw, cmd_shared, graph_fw, qinfo_cached};
+        assert_eq!(graph_fw(), Class::FwCached);
+        assert!(qinfo_cached());
+        assert_eq!(cmd_fw(), Class::Fw);
+        assert_eq!(cmd_shared(), Class::Shared);
+        let mut o = Objects::new();
+        let ctx = o.alloc(g16::object::Request {
+            size: 0x40,
+            class: Class::Fw,
+            placement: g16::object::Placement::Anywhere,
+            offset: 0,
+            client: None,
+            lower: None,
+            cpu: true,
+        }).unwrap();
+        let c = ComputeGraph::new(&mut o, ctx.clone()).unwrap();
+        let c1 = ComputeGraph::new(&mut o, ctx.clone()).unwrap();
+        let r = RenderGraph::new(&mut o, ctx).unwrap();
+        c.init(FwAbi, true).unwrap();
+        c1.init(FwAbi, false).unwrap();
+        r.init(FwAbi).unwrap();
+        assert_eq!(c.sched_ctx.va, c1.sched_ctx.va);
+        assert_ne!(c.qinfo.va, c1.qinfo.va);
+        assert_ne!(c.fw_stamp.va, c1.fw_stamp.va);
+        assert_eq!(c1.qinfo.class, Class::FwCached);
+        assert_eq!(c1.qstate.class, Class::Fw);
+        assert_eq!(c1.fw_stamp.class, Class::Shared);
+        assert_eq!(c.qinfo.class, Class::FwCached);
+        assert_eq!(c.qscratch.class, Class::FwCached);
+        assert_eq!(c.job_list.class, Class::FwCached);
+        assert_eq!(c.sched_ctx.class, Class::Fw);
+        assert_eq!(c.qstate.class, Class::Fw);
+        assert_eq!(c.notifier.class, Class::Fw);
+        assert_eq!(c.threshold.class, Class::Fw);
+        assert_eq!(c.ring.class, Class::Fw);
+        assert_eq!(c.user_stamp.class, Class::Shared);
+        assert_eq!(c.fw_stamp.class, Class::Shared);
+        for stage in 0..2 {
+            assert_eq!(r.qinfo[stage].class, Class::FwCached);
+            assert_eq!(r.qscratch[stage].class, Class::FwCached);
+            assert_eq!(r.job_list[stage].class, Class::FwCached);
+            assert_eq!(r.qstate[stage].class, Class::Fw);
+            assert_eq!(r.ring[stage].class, Class::Fw);
+            assert_eq!(r.user_stamp[stage].class, Class::Shared);
+            assert_eq!(r.fw_stamp[stage].class, Class::Shared);
+        }
+        assert_eq!(r.sched_ctx.class, Class::Fw);
+        assert_eq!(r.notifier.class, Class::Fw);
+        assert_eq!(r.threshold.class, Class::Fw);
+        assert_eq!(r.legacy_empty.class, Class::Shared);
+        assert_eq!(r.registration_barrier.class, Class::Fw);
+    }
+
+    #[test]fn pb_heap_growth_rotates_to_expanded_epoch_and_falls_back_under_quarantine(){
+        use g16::fw::buffer;
+        use g16::hw::client;
+        use g16::pools::{PbEpoch, Pools, alloc_pb_heap_chunk};
+
+        // Demand-grown PB heap chunks map contiguously right after the 64 MiB base heap
+        // inside PB_HEAP_SIZE (256 MiB) and reject out-of-range or zero-sized chunks.
+        let mut o = Objects::new();
+        let tier0 = alloc_pb_heap_chunk(&mut o, 512, 512).unwrap();
+        let tier1 = alloc_pb_heap_chunk(&mut o, 1024, 1024).unwrap();
+        assert_eq!(tier0.gva, Some(client::pb_heap(0) + 512 * buffer::BLOCK_BYTES));
+        assert_eq!(tier0.size, 512 * buffer::BLOCK_BYTES as usize);
+        assert_eq!(tier1.gva, Some(client::pb_heap(0) + 1024 * buffer::BLOCK_BYTES));
+        assert_eq!(tier1.size, 1024 * buffer::BLOCK_BYTES as usize);
+        assert!(alloc_pb_heap_chunk(&mut o, 512, 0).is_err());
+        assert!(alloc_pb_heap_chunk(&mut o, 1024, 1025).is_err());
+
+        // Start VM1 with a 512-block (64 MiB) warm epoch on slot 0.
+        let factory = g16::object::Factory;
+        let budget = g16::budget::Budget::new().unwrap();
+        let vm1 = vm(1);
+        let mut p = g16::pools::Pools::new(&driver::AsahiDrmDevice(device::Device));
+        let e512 = PbEpoch::new(&factory, &vm1, g16::budget::Budget::reserve(&budget, 1).unwrap().take().unwrap()).unwrap();
+        e512.prepare(0, client::pb_heap(0), 512).unwrap();
+        assert_eq!(e512.heap_blocks(), 512);
+        e512.expose();
+        let b0 = p.bind(0, false);
+        p.publish_flight(0);
+        p.retire_flight(0, &e512, b0, true).unwrap();
+
+        // At 512 blocks VM1 pipelines cleanly on slot 0.
+        assert!(p.can_pipeline_within_blocks(&vm1, 2, 512));
+        assert_eq!(p.pick_slot_within_blocks(&vm1, true, 2, 512), Some(0));
+
+        // Once VM1 expands its PB heap to 1024 blocks (128 MiB), slot 0's 512-block epoch
+        // refuses pipelining so the engine drains once and rotates onto displaced slot 1.
+        assert!(!p.can_pipeline_within_blocks(&vm1, 2, 1024));
+        assert_eq!(p.pick_slot_within_blocks(&vm1, true, 2, 1024), None);
+        assert_eq!(p.pick_slot_within_blocks(&vm1, false, 2, 1024), Some(1));
+        assert!(p.reusable_for_within(0, &vm1, 2, 1024).is_none());
+
+        let e1024 = PbEpoch::new(&factory, &vm1, g16::budget::Budget::reserve(&budget, 1).unwrap().take().unwrap()).unwrap();
+        e1024.prepare(1, client::pb_heap(0), 1024).unwrap();
+        assert_eq!(e1024.heap_blocks(), 1024);
+        e1024.expose();
+        let b1 = p.bind(1, false);
+        p.publish_flight(1);
+        p.retire_flight(1, &e1024, b1, true).unwrap();
+
+        // Slot 1 now pipelines at 1024 blocks; expanding to 2048 rotates cleanly back to displaced slot 0.
+        assert!(p.can_pipeline_within_blocks(&vm1, 2, 1024));
+        assert_eq!(p.pick_slot_within_blocks(&vm1, true, 2, 1024), Some(1));
+        assert!(!p.can_pipeline_within_blocks(&vm1, 2, 2048));
+        assert_eq!(p.pick_slot_within_blocks(&vm1, false, 2, 2048), Some(0));
+
+        // Quarantine edge case: if slot 0 is quarantined so no displaced slot remains in 0..2,
+        // VM1 safely falls back to reusing its warm 1024-block slot 1 instead of deadlocking.
+        p.quarantine_flight(0, None);
+        assert!(p.can_pipeline_within_blocks(&vm1, 2, 2048));
+        assert_eq!(p.pick_slot_within_blocks(&vm1, true, 2, 2048), Some(1));
+        assert!(p.reusable_for_within(1, &vm1, 2, 2048).is_some());
+    }
+
 }
 '''
 poll_source = (production/'poll.rs').read_text()
@@ -1372,6 +1764,12 @@ assert 'while let Some(mut item) = self.scrub_queue.lock().pop()' not in poll_so
 assert 'self.enqueue_scrubs(scrubs)' in poll_source, 'poll.rs must enqueue scrubs asynchronously'
 assert 'OwnedQueue::new_unbound_reclaim(c_str!("aurora_g16_scrub"), false)' in mod_source
 assert 'self.scrub_wq.drain();' in sleep_source, 'sleep.rs::join_workers must drain scrub_wq'
+lifetime_source = (production.parent / 'mmu' / 'lifetime.rs').read_text()
+is_closed_fn = item(lifetime_source, 'pub(crate) fn is_closed(')
+assert '.lock()' not in is_closed_fn, 'Vm::is_closed() must be lock-free'
+assert 'lifetime.closed.load(Ordering::Acquire)' in is_closed_fn
+unmap_fn = item(lifetime_source, 'pub(crate) fn unmap_user_ranges(')
+assert 'lifetime.closed.store(true, Ordering::Release)' in unmap_fn
 budget=(production/'budget.rs').read_text()
 budget=budget.replace('new_condvar, new_mutex,','').replace('#[pin_data]','').replace('    #[pin]\n','')
 constructor=item(budget,'pub(crate) fn new()')
@@ -1410,7 +1808,21 @@ render_burst_lines = (
     + '\npub(crate) ' + item(resources_source, 'fn should_expand_compute_ext(')
     + '\npub(crate) ' + item(resources_source, 'fn target_render_slots(')
 )
-source = source.replace('__CMD_CLASSES__',item(graph_source,'pub(crate) const fn cmd_fw(')+'\n'+item(graph_source,'pub(crate) const fn cmd_shared(')).replace('__SET_DIRTY__',item(resources_source,'pub(crate) fn set_dirty(')).replace('__RENDER_BURST__', render_burst_lines)
+source = source.replace('__CMD_CLASSES__', '\n'.join(item(graph_source, decl) for decl in ('pub(crate) const fn graph_fw(', 'pub(crate) const fn qinfo_cached(', 'pub(crate) const fn cmd_fw(', 'pub(crate) const fn cmd_shared('))).replace('__SET_DIRTY__',item(resources_source,'pub(crate) fn set_dirty(')).replace('__RENDER_BURST__', render_burst_lines)
+graph_types = '\n'.join(
+    item(graph_source, decl)
+    for decl in (
+        'pub(crate) struct ComputeGraph {',
+        'struct QueueObjects {',
+        'impl QueueObjects {',
+        'fn init_queue(',
+        'fn init_notifier(',
+        'impl ComputeGraph {',
+        'pub(crate) struct RenderGraph {',
+        'impl RenderGraph {',
+    )
+).replace('fn new(', 'pub(crate) fn new(').replace('fn init(', 'pub(crate) fn init(')
+source = source.replace('__GRAPH_TYPES__', graph_types)
 source = source.replace('__ALLOC__',item(graph_source,'pub(crate) fn alloc(')).replace('__ALLOC_WORK__',item(graph_source,'pub(crate) fn alloc_work('))
 source = source.replace('__HW__','\n'.join(module(hw,n) for n in ('client','sizes','engine','tuning','pte'))).replace('__ROOT__',str(production)).replace('__PRIVATE_RW__',hex(private_rw)+'u64').replace('__CLIENT__', '#[derive(Copy,Clone)]\n'+item(graph_source, 'pub(crate) struct Client {')+'\n'+item(graph_source, 'impl Client {'))
 (out/'check-resources.rs').write_text(source)
@@ -1427,7 +1839,7 @@ for command in [
         raise SystemExit(result.returncode)
 files = ['graph.rs', 'slots.rs', 'pools.rs', 'pools/lifetime.rs', 'fw/buffer.rs', 'fw/graph.rs', 'fw/work.rs', 'hw.rs', 'resources.rs', 'budget.rs']
 (out/'resource-host.json').write_text(json.dumps({
-    'result': 'pass', 'tests': 33,
+    'result': 'pass', 'tests': 35,
     'scope': 'Actual production allocation, initialization and lifetime code against a CPU-only backing recorder; no hardware qualification.',
     'private_rw_pte': hex(private_rw),
     'private_rw_reference': 'Qualified J713 NC read/write leaf attributes',

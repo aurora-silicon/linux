@@ -4,9 +4,10 @@
 //!
 //! With the shared `file.rs` additions (VM_STATUS and VM_STATUS_MIRROR from `supports_vm_status`,
 //! SOFT_FAULTS suppressed by `soft_faults`, VDM_USC_INVALIDATE, and `INDEPENDENT_QUEUES` from
-//! `queue_limits`), G16 advertises per-command input readiness/errors, exact queue-local
-//! historical prefixes, fragment-only and staged render barriers (`RENDER_STAGE_PREFIXES_V2`),
-//! independent logical queues, and `COMPUTE_NO_QUERY_ACCESS`. Ray queries are not advertised.
+//! `queue_limits`), G16 advertises per-command input readiness/errors, exact queue-local historical
+//! prefixes, fragment-only and staged render barriers (`RENDER_STAGE_PREFIXES_V2`), independent
+//! logical queues, `FEW_PRIMITIVES`, and `COMPUTE_NO_QUERY_ACCESS`. Ray queries are not
+//! advertised.
 
 use kernel::{prelude::*, uapi};
 
@@ -50,7 +51,7 @@ pub(crate) fn compute_flights() -> usize {
 
 /// Render commands in flight at most: bounded by both retained pass slots
 /// (`RENDER_SLOTS - 1`, leaving one slot for displacement) and firmware TA/FS work-ring
-/// capacity (`(QUEUE_CAP - 1) / MAX_RENDER_RING_ENTRIES`, worst case 4 ring entries per pass).
+/// capacity (`(QUEUE_CAP - 1) / MAX_RENDER_RING_ENTRIES`, worst case 5 ring entries per pass).
 /// Decoupled from `hw::sizes::FLIGHTS` because multi-pass render batches pack multiple passes
 /// into one `Flight`.
 pub(crate) fn render_flights() -> usize {
@@ -98,6 +99,8 @@ pub(crate) fn fill(gpu: &Gpu, params: &mut uapi::drm_asahi_params_global) -> Res
         | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS)
         | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS)
         | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS)
+        | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FEW_PRIMITIVES)
+        | crate::g17::sync_output::FEATURE_CUMULATIVE_SIGNALS
         | crate::file::DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2;
     params.gpu_generation = GPU_GENERATION;
     params.gpu_variant = gpu.cfg.gpu_variant as u32;

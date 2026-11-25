@@ -571,16 +571,17 @@ pub(crate) mod client {
     pub(crate) const CLIENT_APERTURE: Range<u64> = 0x7000000000..0x7100000000;
     pub(crate) const COMPACT_WINDOW: Range<u64> = 0x1000000000..0x9000000000;
 
-    // Persistent compute units, each in its own 64 MiB interval and reused across
-    // application queues. Units 0 and 1 keep their original placement below the render
-    // allocators; further units (up to [`super::sizes::COMPUTE_UNITS`]) live from
-    // 0x7080000000 up to the PB heap (0x70c0000000), clear of the dynamic PB page-list
-    // range 0x7040000000..0x7080000000. Every alias is inside Mesa's reserved driver hole.
+    // Persistent compute units reused across application queues. Units 0 and 1 keep their
+    // original 64 MiB placement below the render allocators; extension units (2..COMPUTE_UNITS)
+    // pack at a 40 MiB stride from 0x7080000000 up to the PB heap (0x70c0000000), clear of the
+    // dynamic PB page-list range 0x7040000000..0x7080000000 and leaving 7.25 MiB guard above
+    // each unit's 32.75 MiB footprint (`0x20c0000`). Every alias is inside Mesa's reserved hole.
+    pub(crate) const EXT_COMPUTE_STRIDE: u64 = 0x02800000;
     pub(crate) const fn compute_base(k: u64) -> u64 {
         if k < 2 {
             0x7001000000 + k * 0x04000000
         } else {
-            0x7080000000 + (k - 2) * 0x04000000
+            0x7080000000 + (k - 2) * EXT_COMPUTE_STRIDE
         }
     }
     pub(crate) const fn compute_pool(k: u64) -> u64 {
@@ -707,6 +708,8 @@ pub(crate) mod sizes {
     pub(crate) const POOL_SIZE: u64 = 0x200000;
     pub(crate) const FREELIST_SEED: u32 = 8192;
     pub(crate) const QUEUE_CAP: u32 = 256;
+    /// Independent firmware compute workqueue pipes sharing `Channel::Compute` and `sched_ctx`.
+    pub(crate) const COMPUTE_PIPES: usize = 2;
     /// Compute units claimable in one batched compute prefix (matches `COMPUTE_UNITS`).
     pub(crate) const COMPUTE_SLOTS: usize = COMPUTE_UNITS;
     /// Base physical PB/UMA allocator slots allocated per VM on first render.
@@ -723,12 +726,21 @@ pub(crate) mod sizes {
     const _: () =
         assert!(super::client::render_descriptor(5) + 0x4000 <= super::client::render_base(0));
     /// Worst-case firmware work-ring entries consumed per pipelined render pass on TA
-    /// (`prev_barrier`, `ta_fs_barrier`, `compute_barrier`, `ta_work`) and FS (`fs_dep`,
-    /// `fs_compute_barrier`, `own_barrier`, `fs_work`). `InitBM` runs only on an idle engine
-    /// (`initbm` + `ta_work` = 2 entries).
-    pub(crate) const MAX_RENDER_RING_ENTRIES: usize = 4;
-    /// Worst-case firmware work-ring entries per compute command (`fs2c` barrier + `work`).
-    pub(crate) const MAX_COMPUTE_RING_ENTRIES: usize = 2;
+    /// (`prev_barrier`, `ta_fs_barrier`, up to `COMPUTE_PIPES` `compute_barrier` entries,
+    /// `ta_work`) and FS (`fs_dep`, up to `COMPUTE_PIPES` `fs_compute_barrier` entries,
+    /// `own_barrier`, `fs_work`). `InitBM` runs only on an idle engine (`initbm` + `ta_work` = 2
+    /// entries).
+    pub(crate) const MAX_RENDER_RING_ENTRIES: usize = 5;
+    /// Worst-case firmware work-ring entries per compute command (`fs2c` barrier + cross-pipe
+    /// `c2c` barrier + `work`).
+    pub(crate) const MAX_COMPUTE_RING_ENTRIES: usize = 3;
+    /// Maximum unfinished TA passes kept in flight at once so multi-pass render bursts stay
+    /// inside M4 firmware's `<= 4`-pass TA/scene pipeline without throttling single-pass
+    /// pipelining (where TA finishes well ahead of FS).
+    pub(crate) const TA_WAVE_PASSES: usize = 4;
+    /// Unfinished TA pass count at or below which a TA-wave-paused render queue wakes to
+    /// launch the next wave, avoiding 1-pass stub drips.
+    pub(crate) const TA_WAVE_REFILL: usize = TA_WAVE_PASSES / 2;
     /// Base render pass slots allocated on first render (full TPC/tilemap capacity).
     pub(crate) const BASE_RENDER_SLOTS: usize = 2;
     /// Retained render pass slots per VM at most. A slot is reused only after a later render
@@ -736,12 +748,14 @@ pub(crate) mod sizes {
     ///
     /// Sized inside both the host client-VA window (`0x7020000000..0x7040000000`) and firmware
     /// queue/recovery capacities: `47` in-flight passes consume at most `47 * 4 = 188` entries of
-    /// each 256-entry TA/FS work ring (`QUEUE_CAP = 256`, 255 usable, ring cap `63`), share
-    /// hardware UMA slot `RENDER_UMA_SLOT` (33) via the active PB/UMA descriptor, post at most
-    /// `FLIGHTS = 32` `SubmitRecord`s (vs `AHEAD_RECORDS = 128` / `RING_SLOTS = 256`), and stay
-    /// far below the firmware recovery `snapshot_entries = 448` limit.
+    /// each 256-entry TA/FS work ring (`QUEUE_CAP = 256`, 255 usable, ring cap `63`), use
+    /// per-allocator hardware UMA slots `RENDER_UMA_SLOT + slot` (`33..38`, strictly inside the
+    /// firmware render slot range `33..64`), post at most `FLIGHTS = 32` `SubmitRecord`s (vs
+    /// `AHEAD_RECORDS = 128` / `RING_SLOTS = 256`), and stay far below the firmware recovery
+    /// `snapshot_entries = 448` limit.
     pub(crate) const RENDER_SLOTS: usize = 48;
     const _: () = assert!(RENDER_SLOTS >= BASE_RENDER_SLOTS && RENDER_SLOTS <= 64);
+    const _: () = assert!(super::engine::RENDER_UMA_SLOT + (PB_SLOTS as u32) <= 65);
     const _: () = assert!((RENDER_SLOTS - 1) * MAX_RENDER_RING_ENTRIES < QUEUE_CAP as usize);
     const _: () = assert!(super::client::AUX + 0x20000 <= super::client::SCENE_LIST);
     const _: () = assert!(super::client::SCENE_LIST + 0x4000 <= super::client::TPC);
@@ -763,19 +777,24 @@ pub(crate) mod sizes {
     pub(crate) const PB_BLOCKS: u32 = 2048;
     pub(crate) const PB_LIST_RECORDS: u32 = 4096;
     pub(crate) const PB_GROW_STEP: u32 = 10;
-    /// Published prefixes at most. Same-VM compute or render commands may pipeline behind
-    /// each other on their engine rings while cross-VM and cross-engine transitions drain.
+    /// Published prefixes at most. Warm compute and render commands may pipeline across VMs
+    /// on disjoint hardware UMA slots while cold `InitBM` renders and recovery paths drain.
     pub(crate) const FLIGHTS: usize = 32;
     /// Retained compute units per VM at most; each unit owns its own hardware UMA slot
     /// (`COMPUTE_UMA_SLOT + index`, fitting in `1..RENDER_UMA_SLOT = 33`). A unit is reused
     /// only after a later publication retired (it displaced the unit), so `n` units keep up to
-    /// `n - 1` compute commands in flight (`17 * 2 = 34` entries of the 256-entry compute work
+    /// `n - 1` compute commands in flight (`23 * 2 = 46` entries of the 256-entry compute work
     /// ring `QUEUE_CAP`, well inside `AHEAD_RECORDS = 128`, `RING_SLOTS = 256`, and recovery
     /// `snapshot_entries = 448`).
-    pub(crate) const COMPUTE_UNITS: usize = 18;
+    pub(crate) const COMPUTE_UNITS: usize = 24;
     const _: () = assert!(COMPUTE_UNITS >= 2);
     const _: () = assert!((COMPUTE_UNITS - 1) * MAX_COMPUTE_RING_ENTRIES < QUEUE_CAP as usize);
-    const _: () = assert!(super::client::compute_base(COMPUTE_UNITS as u64) <= super::client::PB_HEAP);
+    const _: () = assert!(
+        super::client::compute_context(2) + 0x40000 <= super::client::compute_base(3)
+    );
+    const _: () = assert!(
+        super::client::compute_base(COMPUTE_UNITS as u64) <= super::client::PB_HEAP
+    );
     const _: () = assert!(
         super::engine::COMPUTE_UMA_SLOT + (COMPUTE_UNITS as u32)
             <= super::engine::RENDER_UMA_SLOT

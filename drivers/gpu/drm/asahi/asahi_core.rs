@@ -270,7 +270,7 @@ module! {
             description: "G16: compute completion-stamp deadline, ms (0 permits unbounded compute; firmware recovery stays active)",
         },
         g16_repoll_us: u32 {
-            default: 15,
+            default: 8,
             description: "G16: repoll interval while publication waits for record consumption, us",
         },
         g16_resnap_us: u32 {

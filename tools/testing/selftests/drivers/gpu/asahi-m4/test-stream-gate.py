@@ -48,12 +48,16 @@ mod mmu {
     #[derive(Default)]
     pub struct Vm {
         pub regions: Vec<Region>,
+        pub epoch: std::cell::Cell<Option<u64>>,
         pub lock_calls: std::cell::Cell<usize>,
         pub read_calls: std::cell::Cell<usize>,
         pub last_read_len: std::cell::Cell<usize>,
     }
     pub struct VmReadGuard<'a>(&'a Vm);
     impl VmReadGuard<'_> {
+        pub fn epoch(&self) -> Option<u64> {
+            self.0.epoch.get()
+        }
         pub fn covers_range(&mut self, address: u64, size: u64, _read: bool, _write: bool) -> bool {
             address
                 .checked_add(size)
@@ -96,6 +100,36 @@ mod g16 {
         use crate::{mmu, kernel::prelude::*};
         use std::cell::Cell;
         pub const USC_WINDOW: u64 = 1 << 32;
+        #[derive(Default)]
+        pub struct SpanProof {
+            epoch: Option<u64>,
+            ranges: Vec<(u64, u64, u8)>,
+        }
+        impl SpanProof {
+            pub fn new() -> Self { Self::default() }
+            pub fn covers_aligned(&self, epoch: Option<u64>, first: u64, size: u64, access: u8) -> bool {
+                self.epoch.is_some()
+                    && self.epoch == epoch
+                    && self.ranges.iter().any(|&(s, l, a)| {
+                        (a & access) == access && first >= s && first + size <= s + l
+                    })
+            }
+            pub fn record_one(&mut self, epoch: Option<u64>, first: u64, size: u64, access: u8) {
+                if epoch.is_none() {
+                    self.invalidate();
+                    return;
+                }
+                if self.epoch != epoch {
+                    self.epoch = epoch;
+                    self.ranges.clear();
+                }
+                self.ranges.push((first, size, access));
+            }
+            pub fn invalidate(&mut self) {
+                self.epoch = None;
+                self.ranges.clear();
+            }
+        }
         std::thread_local! {
             static COVER_CALLS: Cell<usize> = const { Cell::new(0) };
         }
@@ -103,20 +137,39 @@ mod g16 {
         pub fn cover_calls() -> usize { COVER_CALLS.with(Cell::get) }
         pub fn cover_locked(
             guard: &mut mmu::VmReadGuard<'_>,
+            epoch: Option<u64>,
+            mut proof: Option<&mut SpanProof>,
             start: u64,
             end: u64,
             read: bool,
             write: bool,
         ) -> Result {
-            COVER_CALLS.with(|c| c.set(c.get() + 1));
             if end <= start || start < 0x4000 || end > (1u64 << 42) - 0x8000 {
                 return Err(EINVAL);
             }
+            let first = start & !(mmu::UAT_PGMSK as u64);
+            let last = (end + mmu::UAT_PGMSK as u64) & !(mmu::UAT_PGMSK as u64);
+            let size = last - first;
+            let access = u8::from(read) | (u8::from(write) << 1);
             if start < 0x7100000000 && end > 0x7000000000
                 || start < 0x1000010000 && end > 0x1000000000 {
                 return Err(EACCES);
             }
-            if guard.covers_range(start, end - start, read, write) { Ok(()) } else { Err(EFAULT) }
+            if proof.as_deref().is_some_and(|p| p.covers_aligned(epoch, first, size, access)) {
+                return Ok(());
+            }
+            COVER_CALLS.with(|c| c.set(c.get() + 1));
+            if guard.covers_range(start, end - start, read, write) {
+                if let Some(p) = proof.as_deref_mut() {
+                    p.record_one(epoch, first, size, access);
+                }
+                Ok(())
+            } else {
+                if let Some(p) = proof.as_deref_mut() {
+                    p.invalidate();
+                }
+                Err(EFAULT)
+            }
         }
     }
     #[path = "PRODUCTION_SOURCE"] pub mod gate;
@@ -142,8 +195,13 @@ fn vm_for(words: &[u32]) -> mmu::Vm {
     vm.region(BASE, stream); vm.region(USC, vec![0; 0x4000]);
     vm.region(0x400000000, vec![0; 0x4000]); vm
 }
+fn cdm(vm: &mmu::Vm, usc: u64, base: u64, end: u64) -> kernel::prelude::Result {
+    let mut guard = None;
+    let mut epoch = None;
+    g16::gate::cdm_locked(vm, &mut guard, &mut epoch, usc, base, end, None)
+}
 fn run(words: &[u32]) -> bool {
-    g16::gate::cdm(&vm_for(words), USC, BASE, BASE + words.len() as u64 * 4).is_ok()
+    cdm(&vm_for(words), USC, BASE, BASE + words.len() as u64 * 4).is_ok()
 }
 #[test]
 fn direct_modes_and_program_split() {
@@ -155,7 +213,7 @@ fn direct_modes_and_program_split() {
     for usc in [0x3f00000000u64, 0x4000000000, 0x8100000000, 0x30000000000] {
         let mut words = launch(0, usc + 0x80, 0); words.push(0x40000000);
         let mut vm = vm_for(&words); vm.region(usc, vec![0; 0x4000]);
-        assert!(g16::gate::cdm(&vm, usc, BASE, BASE + words.len() as u64 * 4).is_ok());
+        assert!(cdm(&vm, usc, BASE, BASE + words.len() as u64 * 4).is_ok());
     }
 }
 #[test]
@@ -180,7 +238,7 @@ fn barriers_padding_and_links() {
     let mut vm = vm_for(&words);
     let mut linked = bytes(&[0x60000160, 0x40000000]); linked.resize(0x4000, 0);
     vm.region(target, linked);
-    assert!(g16::gate::cdm(&vm, USC, BASE, BASE + 8).is_ok());
+    assert!(cdm(&vm, USC, BASE, BASE + 8).is_ok());
     assert!(!run(&[0x30000006, 0])); // Call/return form is not qualified.
 }
 #[test]
@@ -209,11 +267,11 @@ fn programs_permissions_and_sizes() {
     assert!(!run(&words));
     let mut words = launch(0, USC, 0); words.push(0x40000000);
     let mut vm = vm_for(&words); vm.regions[1].readable = false;
-    assert!(g16::gate::cdm(&vm, USC, BASE, BASE + 44).is_err());
+    assert!(cdm(&vm, USC, BASE, BASE + 44).is_err());
     let target = 0x7000000000u64;
     let words = [0x20000000 | (target >> 32) as u32, target as u32];
     let mut vm = vm_for(&words); vm.region(target, vec![0; 0x4000]);
-    assert!(g16::gate::cdm(&vm, USC, BASE, BASE + 8).is_err());
+    assert!(cdm(&vm, USC, BASE, BASE + 8).is_err());
 }
 #[test]
 fn cycles_are_rejected() {
@@ -221,7 +279,7 @@ fn cycles_are_rejected() {
     let words = [0x20000000 | (b >> 32) as u32, b as u32];
     let mut vm = vm_for(&words);
     vm.regions[0].bytes[0x100..0x108].copy_from_slice(&bytes(&[0x20000000 | (a >> 32) as u32, a as u32]));
-    assert!(g16::gate::cdm(&vm, USC, BASE, BASE + 8).is_err());
+    assert!(cdm(&vm, USC, BASE, BASE + 8).is_err());
     assert!(!run(&[0x20000000 | (a >> 32) as u32, a as u32]));
     // A loop beyond the old record budget must also be detected.
     let mut words = vec![0x60000160; 20000];
@@ -258,10 +316,10 @@ fn long_link_chains_and_cycles() {
         let mut data = bytes(&words); data.resize(0x4000, 0);
         vm.region(address, data);
     }
-    assert!(g16::gate::cdm(&vm, USC, BASE, BASE + 8).is_ok());
+    assert!(cdm(&vm, USC, BASE, BASE + 8).is_ok());
     let tail = vm.regions.last_mut().unwrap();
     tail.bytes[..8].copy_from_slice(&bytes(&root));
-    assert!(g16::gate::cdm(&vm, USC, BASE, BASE + 8).is_err());
+    assert!(cdm(&vm, USC, BASE, BASE + 8).is_err());
 }
 #[test]
 fn cached_window_reuses_page_coverage_without_rechecking_every_record() {
@@ -281,10 +339,10 @@ fn pending_signal_interrupts_walk() {
     let words = [0x60000160, 0x40000000];
     let vm = vm_for(&words);
     kernel::task::pending(true);
-    let result = g16::gate::cdm(&vm, USC, BASE, BASE + 8);
+    let result = cdm(&vm, USC, BASE, BASE + 8);
     kernel::task::pending(false);
     assert_eq!(result, Err(kernel::prelude::ERESTARTSYS));
-    assert!(g16::gate::cdm(&vm, USC, BASE, BASE + 8).is_ok());
+    assert!(cdm(&vm, USC, BASE, BASE + 8).is_ok());
 }
 fn vdm_check(vm: &mmu::Vm, vas: &[u64]) -> kernel::prelude::Result {
     let mut guard = vm.read_lock()?;
@@ -354,7 +412,7 @@ fn cdm_batches_vm_read_lock_and_releases_on_resched() {
     vm.region(USC + 0x4000, vec![0; 0x4000]);
 
     // Multi-launch mode 0/1/2 + linked segment acquires the VM read lock only once.
-    assert!(g16::gate::cdm(&vm, USC, BASE, BASE + root.len() as u64 * 4).is_ok());
+    assert!(cdm(&vm, USC, BASE, BASE + root.len() as u64 * 4).is_ok());
     assert_eq!(vm.lock_calls.get(), 1);
 
     // Streams longer than CDM_RESCHED_RECORDS (1024) drop and re-acquire the lock on each resched.
@@ -362,7 +420,7 @@ fn cdm_batches_vm_read_lock_and_releases_on_resched() {
     long.push(0x40000000);
     let long_vm = vm_for(&long);
     let sched_before = kernel::task::scheduled();
-    assert!(g16::gate::cdm(&long_vm, USC, BASE, BASE + long.len() as u64 * 4).is_ok());
+    assert!(cdm(&long_vm, USC, BASE, BASE + long.len() as u64 * 4).is_ok());
     let sched_delta = kernel::task::scheduled() - sched_before;
     assert_eq!(sched_delta, 3);
     assert_eq!(long_vm.lock_calls.get(), sched_delta);
@@ -378,10 +436,67 @@ fn single_vdm_and_short_cdm_root_minimize_poc_read_len() {
     let mut words = launch(0, USC, 0);
     words.push(0x40000000);
     let cdm_vm = vm_for(&words);
-    assert!(g16::gate::cdm(&cdm_vm, USC, BASE, BASE + words.len() as u64 * 4).is_ok());
+    assert!(cdm(&cdm_vm, USC, BASE, BASE + words.len() as u64 * 4).is_ok());
     assert_eq!(cdm_vm.lock_calls.get(), 1);
     assert_eq!(cdm_vm.read_calls.get(), 1);
     assert_eq!(cdm_vm.last_read_len.get(), words.len() * 4);
+}
+#[test]
+fn cdm_locked_shares_held_guard_and_hits_span_proof() {
+    let mut words = launch(1, USC + 0x80, 0x400000000);
+    words.push(0x40000000);
+    let vm = vm_for(&words);
+    vm.epoch.set(Some(7));
+    let mut proof = g16::command::SpanProof::new();
+
+    // Caller holds one VmReadGuard across two cdm_locked walks; first pass populates proof,
+    // second pass hits proof with zero additional cover_locked walks and still 1 lock_calls.
+    let mut guard = Some(vm.read_lock().unwrap());
+    let mut epoch = guard.as_ref().and_then(|g| g.epoch());
+    g16::command::reset_cover_calls();
+    assert!(g16::gate::cdm_locked(
+        &vm,
+        &mut guard,
+        &mut epoch,
+        USC,
+        BASE,
+        BASE + words.len() as u64 * 4,
+        Some(&mut proof),
+    )
+    .is_ok());
+    assert_eq!(vm.lock_calls.get(), 1);
+    assert_eq!(g16::command::cover_calls(), 3);
+
+    assert!(g16::gate::cdm_locked(
+        &vm,
+        &mut guard,
+        &mut epoch,
+        USC,
+        BASE,
+        BASE + words.len() as u64 * 4,
+        Some(&mut proof),
+    )
+    .is_ok());
+    drop(guard);
+    assert_eq!(vm.lock_calls.get(), 1);
+    assert_eq!(g16::command::cover_calls(), 3);
+
+    // Epoch bump invalidates the cached proof and forces cover_locked to re-verify spans.
+    vm.epoch.set(Some(8));
+    let mut guard = Some(vm.read_lock().unwrap());
+    let mut epoch = guard.as_ref().and_then(|g| g.epoch());
+    assert!(g16::gate::cdm_locked(
+        &vm,
+        &mut guard,
+        &mut epoch,
+        USC,
+        BASE,
+        BASE + words.len() as u64 * 4,
+        Some(&mut proof),
+    )
+    .is_ok());
+    assert_eq!(vm.lock_calls.get(), 2);
+    assert_eq!(g16::command::cover_calls(), 6);
 }
 '''
 

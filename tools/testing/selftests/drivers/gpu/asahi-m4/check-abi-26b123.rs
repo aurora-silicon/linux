@@ -139,6 +139,14 @@ fn render(out: &std::path::Path) {
         aux_gva: g + 0xb00000, ..Default::default()
     };
     let geo = encode::Geometry::new(&u, p.heap_gva);
+    assert_eq!(geo.isp_control, 0xc000);
+    let mut u_few = u;
+    u_few.flags |= uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_FEW_PRIMITIVES;
+    let geo_few = encode::Geometry::new(&u_few, p.heap_gva);
+    assert_eq!(geo_few.isp_control, 0xc001);
+    let mut u_few_dbias = u_few;
+    u_few_dbias.flags |= uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_DBIAS_IS_INT;
+    assert_eq!(encode::Geometry::new(&u_few_dbias, p.heap_gva).isp_control, 0x4c001);
     let ts = [f + 0xffc000100, 0, 0, f + 0xffc000118];
     let mut images = Vec::new();
     for (ta_layout, fs_layout) in [(&ta::V25G83, &fs::V25G83), (&ta::V26B123, &fs::V26B123)] {
@@ -146,6 +154,15 @@ fn render(out: &std::path::Path) {
         let mut fw_ = [0xa5; fs::WORK_SIZE]; let mut fq = [0xa5; fs::SEQ_SIZE];
         encode::encode_ta_for(ta_layout, &r, &p, &u, &ts, 7, 0x300, &geo, None, &mut tw, &mut tq);
         encode::encode_fs_for(fs_layout, &r, &p, &u, &ts, 7, 1 << 40, 1, 0x300, &geo, &mut fw_, &mut fq);
+        // Verify FEW_PRIMITIVES sets bit 0 of ISP register 0x15021 (fs::SEL[21]).
+        let mut fw_few = [0xa5; fs::WORK_SIZE];
+        let mut fq_few = [0xa5; fs::SEQ_SIZE];
+        encode::encode_fs_for(
+            fs_layout, &r, &p, &u_few, &ts, 7, 1 << 40, 1, 0x300, &geo_few,
+            &mut fw_few, &mut fq_few,
+        );
+        assert_eq!(r32(&fw_few, fs::REGS + 21 * 12), 0x15021);
+        assert_eq!(r64(&fw_few, fs::REGS + 21 * 12 + 4), 0xc001);
         images.push((tw, tq, fw_, fq));
     }
     // The 25G83 entry points are the 25G83 layouts.
@@ -232,7 +249,7 @@ fn compute_work(out: &std::path::Path) {
         context_store_gva: g + 0x500000, counter_fw: f + 0x500000,
         pool_state_gva: g + 0x600000, page_list_gva: g + 0x700000, usc_base: 1 << 40,
         record_fw: f + 0x700000, binding_generation: 200, uma_slot: 3, command_id: 9,
-        compute_index: 8, work_818: 0, target_stamp: 0x900, submitted: 5,
+        compute_index: 8, work_818: 0, target_stamp: 0x900, submitted: 5, event: compute::EVENT,
     };
     let c = uapi::drm_asahi_cmd_compute {
         cdm_ctrl_stream_base: g + 0x300000, cdm_ctrl_stream_end: g + 0x300200,

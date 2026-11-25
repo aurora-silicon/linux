@@ -52,6 +52,7 @@ mod command;
 mod encode;
 mod engine;
 mod event;
+mod feed;
 mod fence;
 pub(crate) mod fw;
 mod gate;
@@ -194,6 +195,10 @@ const POLL_WORK: u64 = 0;
 const FAST_POLL_WORK: u64 = 1;
 /// Work item ID of the asynchronous displaced pass-slot scrub work.
 const SCRUB_WORK: u64 = 2;
+/// Work item ID of the asynchronous CPU feed-boost work.
+const FEED_WORK: u64 = 3;
+/// Work item ID of the unbound fast event poll work used when pipelined (`active_flights >= 2`).
+const UNBOUND_POLL_WORK: u64 = 4;
 /// Capacity hint for `drm_syncobj_wait` during active submit bursts (mirroring G17's wait hint).
 const WAIT_UTIL_MIN: u32 = 512;
 const WAIT_HINT_MS: u32 = 8;
@@ -220,6 +225,16 @@ pub(crate) struct Shared {
     pub(crate) publish_wake: AtomicBool,
     /// CPU that last submitted work, for placing the per-CPU completion worker.
     pub(crate) submitter: AtomicU32,
+    /// CPU whose cluster currently restricts `events_unbound` (`u32::MAX` before first pin).
+    unbound_cluster_cpu: AtomicU32,
+    /// Serializes best-effort `events_unbound.restrict()` updates without blocking concurrent
+    /// submitters on `wq_pool_mutex`.
+    unbound_pinning: AtomicBool,
+    /// Number of flights currently active under `Shared::state`, for poll worker placement.
+    pub(crate) active_flights: AtomicU32,
+    /// Smoothed recent flight duration in microseconds (0 before first retirement), used to
+    /// shorten the fallback hrtimer interval on sub-100 us workloads.
+    pub(crate) ewma_flight_us: AtomicU32,
     /// Monotonic timestamp (ns) of the previous submit, for active-burst wait hints.
     pub(crate) last_submit_ns: AtomicU64,
     /// Consecutive back-to-back submits within [`WAIT_HINT_GAP_NS`].
@@ -258,8 +273,14 @@ pub(crate) struct Shared {
     sleep_commit: AtomicPtr<core::ffi::c_void>,
     /// Dedicated high-priority per-CPU workqueue for immediate completion polling.
     pub(crate) events: OwnedQueue,
+    /// Dedicated high-priority unbound workqueue for pipelined (`active_flights >= 2`) polling.
+    pub(crate) events_unbound: OwnedQueue,
     /// Dedicated unbound workqueue for asynchronous off-lock pass-slot WC scrubbing.
     pub(crate) scrub_wq: OwnedQueue,
+    /// Host-refill CPU frequency floor actuator (mirroring G17's feed worker).
+    pub(crate) feed: Arc<feed::Feed>,
+    /// Dedicated unbound workqueue for cpufreq `FREQ_QOS_MIN` updates outside `Shared::state`.
+    pub(crate) feed_wq: OwnedQueue,
     #[pin]
     pub(crate) orphan: Mutex<Option<KBox<boot::Orphan>>>,
     #[pin]
@@ -267,9 +288,13 @@ pub(crate) struct Shared {
     #[pin]
     pub(crate) fast_poll: Work<Shared, FAST_POLL_WORK>,
     #[pin]
+    pub(crate) fast_poll_unbound: Work<Shared, UNBOUND_POLL_WORK>,
+    #[pin]
     pub(crate) scrub_queue: SpinLock<slots::ScrubQueue>,
     #[pin]
     pub(crate) scrub_work: Work<Shared, SCRUB_WORK>,
+    #[pin]
+    pub(crate) feed_work: Work<Shared, FEED_WORK>,
     // --- The completion/repoll hrtimer and the handle of its current expiry (dropping it
     // cancels the expiry; see `Shared::rearm`). ---
     #[pin]
@@ -291,6 +316,14 @@ impl_has_work! {
 
 impl_has_work! {
     impl HasWork<Shared, SCRUB_WORK> for Shared { self.scrub_work }
+}
+
+impl_has_work! {
+    impl HasWork<Shared, FEED_WORK> for Shared { self.feed_work }
+}
+
+impl_has_work! {
+    impl HasWork<Shared, UNBOUND_POLL_WORK> for Shared { self.fast_poll_unbound }
 }
 
 impl WorkItem<POLL_WORK> for Shared {
@@ -322,11 +355,51 @@ impl WorkItem<SCRUB_WORK> for Shared {
     }
 }
 
+impl WorkItem<FEED_WORK> for Shared {
+    type Pointer = Arc<Shared>;
+    fn run(this: Arc<Shared>) {
+        this.feed.run();
+    }
+}
+
+impl WorkItem<UNBOUND_POLL_WORK> for Shared {
+    type Pointer = Arc<Shared>;
+    fn run(this: Arc<Shared>) {
+        if this.orphaned.load(Ordering::Acquire) {
+            this.drain_orphan();
+            return;
+        }
+        this.run_poll();
+    }
+}
+
 impl Shared {
     /// Records the submitting CPU and burst cadence for completion placement and wait hints.
+    /// Runs in process context during SUBMIT; keeps `events_unbound` pinned to the submitter's
+    /// CPU cluster so pipelined completion polls stay on the same cluster (avoiding E-core
+    /// wake bounces while still sparing the submitter CPU itself).
     pub(crate) fn note_submitter(&self) {
-        self.submitter
-            .store(kernel::cpu::CpuId::current().as_u32(), Ordering::Relaxed);
+        let cpu = kernel::cpu::CpuId::current();
+        self.submitter.store(cpu.as_u32(), Ordering::Relaxed);
+        let pinned = self.unbound_cluster_cpu.load(Ordering::Acquire);
+        if pinned != cpu.as_u32()
+            && !kernel::cpu::CpuId::from_u32(pinned)
+                .is_some_and(|p| kernel::cpumask::Cpumask::cluster_of(p).test(cpu))
+            && self
+                .unbound_pinning
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+        {
+            if self
+                .events_unbound
+                .restrict(kernel::cpumask::Cpumask::cluster_of(cpu))
+                .is_ok()
+            {
+                self.unbound_cluster_cpu
+                    .store(cpu.as_u32(), Ordering::Release);
+            }
+            self.unbound_pinning.store(false, Ordering::Release);
+        }
         let now = engine::now_ns();
         let prev = self.last_submit_ns.swap(now, Ordering::Relaxed);
         if prev != 0 && now.wrapping_sub(prev) <= WAIT_HINT_GAP_NS {
@@ -343,13 +416,37 @@ impl Shared {
         }
     }
 
+    /// Updates the lock-free EWMA of recent retired flight durations (microseconds).
+    /// Decays faster downward than upward so transitions from heavy flights into short
+    /// bursts tighten the adaptive repoll window within a few completions.
+    pub(crate) fn note_flight_us(&self, us: u32) {
+        let prev = self.ewma_flight_us.load(Ordering::Relaxed);
+        let next = if prev == 0 {
+            us
+        } else if us < prev {
+            prev.saturating_add(us) / 2
+        } else {
+            (prev.saturating_mul(3).saturating_add(us)) / 4
+        };
+        self.ewma_flight_us.store(next, Ordering::Relaxed);
+    }
+
     /// Temporary `drm_syncobj_wait` capacity hint while a client is submitting back to back.
     pub(crate) fn syncobj_wait_hint(&self) -> Option<(u32, u32)> {
-        let until = self.wait_hint_until_ns.load(Ordering::Relaxed);
-        if cfg!(CONFIG_UCLAMP_TASK) && until != 0 && engine::now_ns() <= until {
-            Some((WAIT_UTIL_MIN, WAIT_HINT_MS))
-        } else {
-            None
+        self.feed.wait_hint().or_else(|| {
+            let until = self.wait_hint_until_ns.load(Ordering::Relaxed);
+            if cfg!(CONFIG_UCLAMP_TASK) && until != 0 && engine::now_ns() <= until {
+                Some((WAIT_UTIL_MIN, WAIT_HINT_MS))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Wakes the CPU feed-boost worker outside `Shared::state` when refill gaps cross threshold.
+    pub(crate) fn queue_feed(self: &Arc<Self>) {
+        if !self.sleeping.load(Ordering::Acquire) && self.feed.take_pending() {
+            let _ = self.feed_wq.enqueue::<Arc<Shared>, FEED_WORK>(self.clone());
         }
     }
 
@@ -375,6 +472,7 @@ impl Shared {
 
     /// Latches the fail-stop state.
     pub(crate) fn fail_stop(&self, error: Error) {
+        self.feed.begin_shutdown();
         let _ =
             self.error
                 .compare_exchange(0, error.to_errno(), Ordering::AcqRel, Ordering::Acquire);
@@ -469,6 +567,8 @@ pub(crate) struct Firmware {
     pub(crate) vms: Arc<vm::Registry>,
     /// Monotonic timestamp (ns) of the last full housekeeping pass (power, health, hang poll).
     pub(crate) last_housekeeping_ns: u64,
+    /// Monotonic timestamp (ns) of the last auxiliary (log/ktrace/stats) ring drain.
+    pub(crate) last_aux_drain_ns: u64,
 }
 
 /// A G16 GPU.
@@ -505,7 +605,11 @@ impl Gpu {
         // the platform-device field. Retain the typed DRM device before that point.
         let drm_device: ARef<AsahiDrmDevice> = dev.into();
         let events = OwnedQueue::new_percpu_reclaim(c_str!("aurora_g16_events"), true)?;
+        let events_unbound =
+            OwnedQueue::new_unbound_reclaim(c_str!("aurora_g16_events_unbound"), true)?;
         let scrub_wq = OwnedQueue::new_unbound_reclaim(c_str!("aurora_g16_scrub"), false)?;
+        let feed = feed::Feed::new()?;
+        let feed_wq = OwnedQueue::new_unbound_reclaim(c_str!("aurora_g16_feed"), false)?;
         let shared = Arc::pin_init(
             pin_init!(Shared {
                 dev: dev.as_ref().as_ref().into(),
@@ -516,6 +620,10 @@ impl Gpu {
                 evented: AtomicBool::new(false),
                 publish_wake: AtomicBool::new(false),
                 submitter: AtomicU32::new(u32::MAX),
+                unbound_cluster_cpu: AtomicU32::new(u32::MAX),
+                unbound_pinning: AtomicBool::new(false),
+                active_flights: AtomicU32::new(0),
+                ewma_flight_us: AtomicU32::new(0),
                 last_submit_ns: AtomicU64::new(0),
                 wait_hint_streak: AtomicU32::new(0),
                 wait_hint_until_ns: AtomicU64::new(0),
@@ -534,12 +642,17 @@ impl Gpu {
                 sleep_ps: AtomicU32::new(0),
                 sleep_commit: AtomicPtr::new(core::ptr::null_mut()),
                 events,
+                events_unbound,
                 scrub_wq,
+                feed,
+                feed_wq,
                 orphan <- new_mutex!(None, "g16::Shared::orphan"),
                 poll <- new_delayed_work!("g16::Shared::poll"),
                 fast_poll <- new_work!("g16::Shared::fast_poll"),
+                fast_poll_unbound <- new_work!("g16::Shared::fast_poll_unbound"),
                 scrub_queue <- new_spinlock!(slots::ScrubQueue::new(), "g16::Shared::scrub_queue"),
                 scrub_work <- new_work!("g16::Shared::scrub_work"),
+                feed_work <- new_work!("g16::Shared::feed_work"),
                 resnap <- HrTimer::new(),
                 resnap_handle <- new_mutex!(None, "g16::Shared::resnap_handle"),
                 state <- new_mutex!(None, "g16::Shared::state"),
@@ -660,6 +773,7 @@ impl Firmware {
                 pools,
                 vms,
                 last_housekeeping_ns: 0,
+                last_aux_drain_ns: 0,
             },
         );
         if let Err(e) = firmware.init_graphs() {
