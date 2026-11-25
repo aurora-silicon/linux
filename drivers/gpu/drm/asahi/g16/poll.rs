@@ -100,6 +100,18 @@ impl Shared {
         self.mod_poll(kernel::time::msecs_to_jiffies((delay_ns / 1_000_000) as u32).max(1));
     }
 
+    /// Queues the backup poll for idle housekeeping that a pass skipped inside its cadence, at
+    /// the end of that cadence. It may replace a later idle power poll: that pass runs the
+    /// housekeeping, including `service_power()`, and arms the power poll again.
+    fn queue_owed_housekeeping(self: &Arc<Self>, firmware: &Firmware) {
+        if !firmware.engine.housekeeping_owed || firmware.recovery.failed().is_some() {
+            return;
+        }
+        let elapsed = now_ns().wrapping_sub(firmware.last_housekeeping_ns);
+        let ms = HOUSEKEEPING_NS.saturating_sub(elapsed).div_ceil(1_000_000) as u32;
+        self.mod_poll(kernel::time::msecs_to_jiffies(ms).max(1));
+    }
+
     /// One poll pass (the poll work item).
     pub(crate) fn run_poll(self: Arc<Self>) {
         // The domain may be off. The sleep's end queues a pass.
@@ -158,6 +170,7 @@ impl Shared {
                     // floor hold is still pending so both expire cleanly to idle power.
                     Ok(false) => {
                         self.arm_idle_power_poll(firmware);
+                        self.queue_owed_housekeeping(firmware);
                         if firmware.recovery.failed().is_some() {
                             self.cancel_resnap();
                         } else {
@@ -316,13 +329,21 @@ impl Shared {
             if !firmware.engine.flights.is_empty() || firmware.engine.chan_wait {
                 // If an EP 0x20 event retired an older flight while later flights remain active,
                 // or arrived before the oldest receipt became visible, arm a short repoll so
-                // trailing completions never fall back to `resnap_us`.
+                // trailing completions never fall back to `resnap_us`. A ready job this
+                // publication left waiting on TA wave or slot headroom repolls as soon as
+                // `poll_step()` would rearm it, not a full `resnap_us` later.
                 if let Some(us) = coalesce_us {
                     self.rearm_after(us.min(self.rearm_us(false)));
                 } else {
+                    let paced = !firmware.engine.frozen
+                        && !firmware.engine.pending.is_empty()
+                        && (firmware.engine.slot_wait
+                            || firmware.engine.ta_wave_wait
+                            || firmware.engine.held_wait);
                     self.rearm(
                         firmware.engine.chan_wait
                             || restored_event
+                            || paced
                             || (was_evented && retired_any && !firmware.engine.flights.is_empty()),
                     );
                 }
@@ -664,14 +685,29 @@ impl Firmware {
         // failure of the next prefix. Drain the receive rings before deciding, published or
         // not, so the error count is current and idle log/trace/stats traffic is consumed. With
         // prefixes published the retirement loop below drains first.
+        //
+        // Inside the housekeeping cadence, with no recovery pending, an idle pass drains only
+        // the event and statistics rings, which carry completion and recovery notifications.
+        // The session, object, power and auxiliary ring checks then wait for the cadence, so
+        // back-to-back shallow submissions do not repeat them, under the device lock, between
+        // one completion and the next SUBMIT. `run_poll()` queues a backup poll for them.
         if !had_flights {
-            self.session.check()?;
-            self.objects.health()?;
-            self.service_power()?;
-            self.last_housekeeping_ns = now;
-            self.last_aux_drain_ns = now;
-            ran_housekeeping = true;
-            self.drain_rings()?;
+            let full = housekeeping_due || self.recovery.receipt_fault || {
+                self.drain_events_and_stats()?;
+                self.recovery_pending()?
+            };
+            if full {
+                self.session.check()?;
+                self.objects.health()?;
+                self.service_power()?;
+                self.last_housekeeping_ns = now;
+                self.last_aux_drain_ns = now;
+                ran_housekeeping = true;
+                self.engine.housekeeping_owed = false;
+                self.drain_rings()?;
+            } else {
+                self.engine.housekeeping_owed = true;
+            }
             self.reclaim_closed_vm_slots();
             if self.recovery_idle()? && self.engine.pending.is_empty() {
                 let _ = self.slots.take_scrub_woke();
@@ -743,7 +779,8 @@ impl Firmware {
         published?;
         // A TA-only (0x70) EP 0x20 interrupt while FS is still running does not signal flight
         // retirement: avoid burning the receipt-tail spin or arming a short repoll storm for it,
-        // unless a render queue is actively waiting on TA wave headroom (`ta_wave_wait`).
+        // unless a render queue is actively waiting on TA wave headroom (`ta_wave_wait`) or a
+        // ready job waits behind its own VM's flights (`held_wait`).
         let non_terminal_only = !retired_any
             && term_before.is_some()
             && self.events.stage_events != stage_before
@@ -751,7 +788,8 @@ impl Firmware {
             && !self.oldest_stamp_reached()
             && !self.recovery.receipt_fault
             && !recovery_pending
-            && !self.engine.ta_wave_wait;
+            && !self.engine.ta_wave_wait
+            && !self.engine.held_wait;
         // After an EP 0x20 event, retry up to `EVENT_RETIRE_POLLS` times (outside the device
         // lock) only while no flight has retired yet and flights remain in flight. Once any
         // flight retires, stop spinning so deeper queues do not burn tail waits per interrupt.
@@ -777,13 +815,16 @@ impl Firmware {
         }
         // If a terminal EP 0x20 event arrived with flights outstanding and nothing retired within
         // the trailing polls, or a ready same-VM pending job is blocked on slot/flight/work-ring
-        // or TA-wave headroom, repoll at `repoll_us` instead of sleeping `resnap_us`.
+        // or TA-wave headroom, or held behind its own VM's flights, repoll at `repoll_us`
+        // instead of sleeping `resnap_us`.
         self.engine.short_repoll = !self.engine.flights.is_empty()
             && !self.engine.frozen
             && !non_terminal_only
             && ((evented && had_flights && !retired_any)
                 || (!self.engine.pending.is_empty()
-                    && (self.engine.slot_wait || self.engine.ta_wave_wait)));
+                    && (self.engine.slot_wait
+                        || self.engine.ta_wave_wait
+                        || self.engine.held_wait)));
         Ok(!self.engine.flights.is_empty()
             || self.engine.chan_wait
             || self.recovery.needs_repoll()
@@ -811,6 +852,7 @@ impl Firmware {
             self.last_aux_drain_ns = now;
         }
         self.last_housekeeping_ns = now;
+        self.engine.housekeeping_owed = false;
         self.reclaim_closed_vm_slots();
         if !self.engine.flights.is_empty() || recovery_pending {
             self.check_hangs(done)?;
@@ -2226,6 +2268,11 @@ impl Firmware {
                 s.hold[1],
                 s.hold[2]
             )?;
+            write!(f, "hold_causes:")?;
+            for (name, n) in super::engine::HoldCause::NAMES.iter().zip(s.hold_causes) {
+                write!(f, " {} {}", name, n)?;
+            }
+            writeln!(f)?;
         }
         let p = &self.engine.prof;
         writeln!(

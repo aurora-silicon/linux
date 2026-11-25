@@ -163,6 +163,8 @@ struct Engine {
     slot_wait: bool,
     ta_wave_wait: bool,
     short_repoll: bool,
+    housekeeping_owed: bool,
+    held_wait: bool,
     coalesce_deadline_ns: u64,
     frozen: bool,
     stats: Stats,
@@ -327,12 +329,14 @@ struct Firmware {
     ta_pending: usize,
     ta_wave_cap: usize,
     coalesce_us: Option<u32>,
+    publish_waits: Option<(bool, bool, bool)>,
     retire_calls: u32,
     publish_full_calls: u32,
     publish_checked_calls: u32,
     housekeeping_calls: u32,
     aux_drain_calls: u32,
     power_calls: u32,
+    hot_drain_calls: u32,
 }
 
 impl Firmware {
@@ -363,6 +367,8 @@ impl Firmware {
                 slot_wait: false,
                 ta_wave_wait: false,
                 short_repoll: false,
+                housekeeping_owed: false,
+                held_wait: false,
                 coalesce_deadline_ns: 0,
                 frozen: false,
                 stats: Stats::default(),
@@ -383,12 +389,14 @@ impl Firmware {
             ta_pending: 0,
             ta_wave_cap: hw::sizes::TA_WAVE_PASSES,
             coalesce_us: None,
+            publish_waits: None,
             retire_calls: 0,
             publish_full_calls: 0,
             publish_checked_calls: 0,
             housekeeping_calls: 0,
             aux_drain_calls: 0,
             power_calls: 0,
+            hot_drain_calls: 0,
         }
     }
 
@@ -407,6 +415,10 @@ impl Firmware {
         Ok(())
     }
     fn drain_rings(&mut self) -> Result {
+        Ok(())
+    }
+    fn drain_events_and_stats(&mut self) -> Result {
+        self.hot_drain_calls += 1;
         Ok(())
     }
     fn drain_auxiliary_rings(&mut self) -> Result {
@@ -445,6 +457,11 @@ impl Firmware {
     }
     fn publish_checked(&mut self, _done: &mut Completions) -> Result {
         self.engine.coalesce_deadline_ns = 0;
+        if let Some((slot_wait, ta_wave_wait, held_wait)) = self.publish_waits {
+            self.engine.slot_wait = slot_wait;
+            self.engine.ta_wave_wait = ta_wave_wait;
+            self.engine.held_wait = held_wait;
+        }
         self.publish_checked_calls += 1;
         Ok(())
     }
@@ -463,6 +480,52 @@ impl Firmware {
     __OLDEST_TERMINAL_EVENTS__
     __TA_WAVE_READY__
     __OLDEST_STAMP_REACHED__
+}
+
+#[test]
+fn idle_poll_step_runs_full_housekeeping_only_on_its_cadence() {
+    let mut fw = Firmware::new();
+    let (mut retry_tail, mut hk_deferred, mut done) = (false, false, vec![]);
+    let mut idle_pass = |fw: &mut Firmware, now: u64| {
+        CLOCK.with(|c| c.set(now));
+        fw.poll_step(false, 0, &mut retry_tail, &mut hk_deferred, &mut done)
+            .unwrap()
+    };
+    // Due: the full idle housekeeping runs and owes nothing.
+    assert!(!idle_pass(&mut fw, 2_000_000));
+    assert_eq!((fw.power_calls, fw.hot_drain_calls), (1, 0));
+    assert_eq!(fw.last_housekeeping_ns, 2_000_000);
+    assert!(!fw.engine.housekeeping_owed);
+    // Inside the cadence: only the event and statistics rings drain; the rest is owed.
+    assert!(!idle_pass(&mut fw, 2_300_000));
+    assert_eq!((fw.power_calls, fw.hot_drain_calls), (1, 1));
+    assert_eq!(fw.last_housekeeping_ns, 2_000_000);
+    assert!(fw.engine.housekeeping_owed);
+    // A recovery found by that drain runs the full pass inside the cadence.
+    fw.recovery.pending = true;
+    assert!(idle_pass(&mut fw, 2_400_000));
+    assert_eq!((fw.power_calls, fw.hot_drain_calls), (2, 2));
+    assert_eq!(fw.last_housekeeping_ns, 2_400_000);
+    assert!(!fw.engine.housekeeping_owed);
+    fw.recovery.pending = false;
+    // So does a receipt fault, without a hot drain first.
+    fw.recovery.receipt_fault = true;
+    assert!(!idle_pass(&mut fw, 2_500_000));
+    assert_eq!((fw.power_calls, fw.hot_drain_calls), (3, 2));
+    fw.recovery.receipt_fault = false;
+    assert!(!idle_pass(&mut fw, 2_600_000));
+    assert_eq!((fw.power_calls, fw.hot_drain_calls), (3, 3));
+    assert!(fw.engine.housekeeping_owed);
+    // Once the cadence elapses the owed housekeeping runs.
+    assert!(!idle_pass(&mut fw, 3_500_000));
+    assert_eq!((fw.power_calls, fw.hot_drain_calls), (4, 3));
+    assert!(!fw.engine.housekeeping_owed);
+    // Periodic housekeeping also settles what an idle pass owed.
+    assert!(!idle_pass(&mut fw, 3_600_000));
+    assert!(fw.engine.housekeeping_owed);
+    CLOCK.with(|c| c.set(4_600_000));
+    fw.run_housekeeping(&mut done).unwrap();
+    assert!(!fw.engine.housekeeping_owed);
 }
 
 #[test]
@@ -985,6 +1048,49 @@ fn pending_slot_wait_arms_short_repoll_without_breaking_ta_only_or_frozen() {
 }
 
 #[test]
+fn held_wait_spins_stage_events_and_repolls_soon_until_a_retirement() {
+    CLOCK.with(|c| c.set(100_000));
+    let mut fw = Firmware::new();
+    fw.engine.flights.push(Flight {
+        computes: 0,
+        compute_pipe: 0,
+        renders: 2,
+        target: 0,
+        fs_target: 0x200,
+    });
+    fw.engine.fs_target = 0x200;
+    fw.engine.pending.push(Arc::new(Job { id: 2 }));
+    fw.drain_stage_delta = 1;
+    let (mut retry_tail, mut deferred, mut done) = (false, false, vec![]);
+    // Nothing held: a stage-only event is non-terminal, with no tail spin and no short repoll.
+    assert!(fw
+        .poll_step(true, EVENT_RETIRE_POLLS, &mut retry_tail, &mut deferred, &mut done)
+        .unwrap());
+    assert!(!retry_tail);
+    assert!(!fw.engine.short_repoll);
+    // A ready job held behind its own VM's flights spins the receipt tail on the same event...
+    fw.engine.held_wait = true;
+    assert!(fw
+        .poll_step(true, EVENT_RETIRE_POLLS, &mut retry_tail, &mut deferred, &mut done)
+        .unwrap());
+    assert!(retry_tail);
+    // ...and a timer pass repolls at repoll_us while the hold lasts, without publishing.
+    retry_tail = false;
+    fw.drain_stage_delta = 0;
+    assert!(fw
+        .poll_step(false, 0, &mut retry_tail, &mut deferred, &mut done)
+        .unwrap());
+    assert!(fw.engine.short_repoll);
+    assert_eq!(fw.publish_checked_calls, 0);
+    // The retirement that can release it reaches publish_checked().
+    fw.retire_on_call = true;
+    let _ = fw
+        .poll_step(false, 0, &mut retry_tail, &mut deferred, &mut done)
+        .unwrap();
+    assert_eq!(fw.publish_checked_calls, 1);
+}
+
+#[test]
 fn ta_only_irq_wakes_ta_wave_wait_with_hysteresis_and_short_repoll() {
     CLOCK.with(|c| c.set(100_000));
     let mut fw = Firmware::new();
@@ -1053,6 +1159,43 @@ fn ta_only_irq_wakes_ta_wave_wait_with_hysteresis_and_short_repoll() {
         .unwrap());
     assert!(!retry_tail);
     assert!(!fw.engine.short_repoll);
+}
+
+#[test]
+fn submit_locked_repolls_soon_when_its_publication_leaves_a_paced_job() {
+    // publish_checked() leaves a ready job on TA wave or slot headroom: SUBMIT arms the same
+    // short repoll poll_step() arms for it, unless the engine is frozen.
+    CLOCK.with(|c| c.set(100_000));
+    for (slot_wait, ta_wave_wait, held_wait, frozen, soon) in [
+        (false, false, false, false, 0),
+        (true, false, false, false, 1),
+        (false, true, false, false, 1),
+        (false, false, true, false, 1),
+        (false, true, false, true, 0),
+    ] {
+        let shared = Shared::new();
+        let mut fw = Firmware::new();
+        fw.last_housekeeping_ns = 100_000;
+        fw.engine.flights.push(Flight {
+            computes: 0,
+            compute_pipe: 0,
+            renders: 1,
+            target: 0,
+            fs_target: 0x100,
+        });
+        fw.engine.fs_target = 0x100;
+        fw.engine.frozen = frozen;
+        fw.publish_waits = Some((slot_wait, ta_wave_wait, held_wait));
+        let mut done = vec![];
+        shared
+            .submit_locked(&mut fw, Arc::new(Job { id: 2 }), &mut done)
+            .unwrap();
+        assert_eq!(fw.retire_calls, 0);
+        assert_eq!(fw.publish_checked_calls, 1);
+        assert_eq!(shared.rearmed.get(), 1);
+        assert_eq!(shared.rearm_soon.get(), soon);
+        assert_eq!(shared.poll_now_calls.get(), 0);
+    }
 }
 
 #[test]
@@ -1707,7 +1850,7 @@ for command in [
     json.dumps(
         {
             'passed': True,
-            'tests': 22,
+            'tests': 25,
             'cpu_only': True,
             'hardware_execution': False,
             'scope': 'Verbatim production submit_locked inline retirement and poll_step TA-only non-spin logic.',
