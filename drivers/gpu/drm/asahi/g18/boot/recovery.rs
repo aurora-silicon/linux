@@ -395,6 +395,9 @@ impl G18Session {
         let mut since = Instant::<Monotonic>::now();
         let mut reported = 0u32;
         self.growth_refused = false;
+        // The job is running: the CLPC holds the memory and fabric floor
+        // until it ends, on every path out of here, and 16 ms past the last.
+        let _job = self.demand.job();
         loop {
             if let Some(serviced) = self.poll_faults(label)? {
                 if recovery.is_none() {
