@@ -104,7 +104,9 @@ jobs:
           esac
           if [ "$channel" = nightly ]; then
             sha=$(gh api "repos/$REPO/git/ref/heads/main" -q .object.sha)
-            last=$(gh api "repos/$REPO/git/ref/tags/aurora-nightly" -q .object.sha 2>/dev/null || true)
+            # On a missing tag (the first nightly) gh api exits non-zero and
+            # prints the 404 body on stdout, so keep only a commit id.
+            last=$(gh api "repos/$REPO/git/ref/tags/aurora-nightly" -q .object.sha 2>/dev/null | grep -xE '[0-9a-f]{40}' || true)
             if [ "$EVENT" = schedule ] && [ "$last" = "$sha" ]; then
               echo "main is still at the last nightly ($sha); nothing to build"
               build=false
@@ -324,7 +326,11 @@ jobs:
           # Channel tags are always addressed as refs/tags/<name>, never by the
           # bare name, which may also be a branch. They only move forward: the
           # new commit must contain the tagged one (a rewritten main stops here).
-          old=$(gh api "repos/$GH_REPO/git/ref/tags/$tag" -q .object.sha 2>/dev/null || true)
+          # On a missing tag (a channel's first release) gh api exits non-zero
+          # and prints the 404 body on stdout, so keep only a commit id. Any
+          # other API error also leaves old empty; the lease below then expects
+          # no tag, so the push fails rather than moving an existing one.
+          old=$(gh api "repos/$GH_REPO/git/ref/tags/$tag" -q .object.sha 2>/dev/null | grep -xE '[0-9a-f]{40}' || true)
           if [ -n "$old" ]; then
             status=$(gh api "repos/$GH_REPO/compare/$old...$SHA" -q .status)
             case "$status" in
