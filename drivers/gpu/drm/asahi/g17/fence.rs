@@ -63,8 +63,11 @@ pub(crate) fn allocation_failure(contexts: &FenceContexts) -> Result<Fence> {
 pub(crate) struct ExportFence {
     source: Option<Arc<Submission>>,
     scoped: bool,
+    compute_only: bool,
     /// A waiter enabled signalling on this ioctl output fence before it signalled ([`waiters`]).
     waited: AtomicBool,
+    /// A host waiter enabled signalling on this unscoped pure-compute output fence.
+    compute_waited: AtomicBool,
 }
 static EXPORT_OPS: AtomicUsize = AtomicUsize::new(0);
 
@@ -72,11 +75,40 @@ static EXPORT_OPS: AtomicUsize = AtomicUsize::new(0);
 static WAITERS: AtomicU32 = AtomicU32::new(0);
 /// Waits begun on output fences, ever.
 static WAITS: AtomicU64 = AtomicU64::new(0);
+/// Pure-compute output fences a host waiter is blocked on now.
+static COMPUTE_WAITERS: AtomicU32 = AtomicU32::new(0);
+/// Host waits begun on pure-compute output fences, ever.
+static COMPUTE_WAITS: AtomicU64 = AtomicU64::new(0);
 
 /// The output fences a waiter is blocked on now, and the waits begun so far: the work a host
 /// thread waits for, which the M5 performance effort follows ([`super::power::Effort`]).
 pub(crate) fn waiters() -> (u32, u64) {
     (WAITERS.load(Ordering::Acquire), WAITS.load(Ordering::Acquire))
+}
+
+/// Pure-compute output fences a host thread is blocked on now, and total waits begun.
+/// Scoped cumulative outputs count waits on their exported scope (excluding internal scope
+/// chaining); unscoped outputs count waits directly on `ExportFence`.
+pub(crate) fn compute_waiters() -> (u32, u64) {
+    (
+        COMPUTE_WAITERS.load(Ordering::Acquire),
+        COMPUTE_WAITS.load(Ordering::Acquire),
+    )
+}
+
+/// Called from fence `enable_signaling` (atomic, under `dma_fence->lock` with IRQs off) when a
+/// host thread begins waiting on a pure-compute output fence.
+#[no_mangle]
+pub(super) extern "C" fn asahi_g17_note_compute_waiter() {
+    COMPUTE_WAITERS.fetch_add(1, Ordering::AcqRel);
+    COMPUTE_WAITS.fetch_add(1, Ordering::AcqRel);
+    super::wake_for_compute_waiter();
+}
+
+/// Called once a previously waited pure-compute output fence signals or is released.
+#[no_mangle]
+pub(super) extern "C" fn asahi_g17_unnote_compute_waiter() {
+    COMPUTE_WAITERS.fetch_sub(1, Ordering::AcqRel);
 }
 
 /// The first waiter on an unsignalled output fence (the fence core calls this once, under the
@@ -95,9 +127,22 @@ fn unwaited(flag: &AtomicBool) {
     }
 }
 
+fn compute_waited(flag: &AtomicBool) {
+    if !flag.swap(true, Ordering::AcqRel) {
+        asahi_g17_note_compute_waiter();
+    }
+}
+
+fn compute_unwaited(flag: &AtomicBool) {
+    if flag.swap(false, Ordering::AcqRel) {
+        asahi_g17_unnote_compute_waiter();
+    }
+}
+
 impl Drop for ExportFence {
     fn drop(&mut self) {
         unwaited(&self.waited);
+        compute_unwaited(&self.compute_waited);
     }
 }
 
@@ -111,6 +156,9 @@ impl FenceOps for ExportFence {
     }
     fn enable_signaling(self: &FenceObject<Self>) -> bool {
         waited(&self.waited);
+        if self.compute_only && !self.scoped {
+            compute_waited(&self.compute_waited);
+        }
         true
     }
 }
@@ -122,7 +170,9 @@ fn export_fallback(contexts: &FenceContexts) -> Result<UniqueFence<ExportFence>>
         ExportFence {
             source: None,
             scoped: false,
+            compute_only: false,
             waited: AtomicBool::new(false),
+            compute_waited: AtomicBool::new(false),
         },
     )?;
     // SAFETY: Unique, initialized and still private. Only this constructor
@@ -280,6 +330,7 @@ impl Submission {
                 fence.signal();
             }
             unwaited(&fence.waited);
+            compute_unwaited(&fence.compute_waited);
         }
     }
 }
@@ -313,6 +364,15 @@ impl Aggregate {
         }
         self.source().member_done(&self.0, result);
         self.source().owner_done();
+    }
+    #[cfg(CONFIG_KUNIT = "y")]
+    pub(super) fn test_member(contexts: &FenceContexts) -> Result<Member> {
+        let mut fence = export_fallback(contexts)?;
+        fence.source = Some(Submission::with_work(None, false)?);
+        let aggregate = Self(fence.into());
+        let member = aggregate.member();
+        aggregate.finish_enqueue(Ok(()));
+        Ok(member)
     }
 }
 
@@ -517,15 +577,17 @@ impl Outputs {
         &mut self,
         context: Arc<Context>,
         firmware_source: bool,
+        compute_only: bool,
     ) -> Result<Aggregate> {
         let source = Submission::new(context, firmware_source)?;
         let mut fence = self.fallback.take().ok_or(EINVAL)?;
         fence.source = Some(source);
         fence.scoped = self.cumulative.is_some();
+        fence.compute_only = compute_only;
         let submission = Aggregate(fence.into());
         self.submission = Some(submission.clone());
         if let Some(bundle) = &mut self.cumulative {
-            bundle.publish(&submission.fence())?;
+            bundle.publish(&submission.fence(), compute_only)?;
             self.syncs.truncate(self.input_count);
         } else {
             install(self.syncs.drain(self.input_count..), &submission.fence());
@@ -564,6 +626,7 @@ impl Drop for Outputs {
             );
             fallback.signal();
             unwaited(&fallback.waited);
+            compute_unwaited(&fallback.compute_waited);
         }
     }
 }

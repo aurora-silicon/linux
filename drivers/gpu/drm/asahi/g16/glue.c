@@ -4,6 +4,7 @@
  * and macros. The module pin is retain.c's. Built only with CONFIG_DRM_ASAHI_G16.
  */
 #include <linux/device.h>
+#include <asm/arch_timer.h>
 #include <linux/atomic.h>
 #include <linux/dma-map-ops.h>
 #include <linux/io.h>
@@ -24,6 +25,8 @@
 #include <linux/soc/apple/pmp-cooling.h>
 #include <linux/soc/apple/pmp-telemetry.h>
 #include <linux/thermal.h>
+
+#include "glue.h"
 
 bool asahi_g16_board(void);
 int asahi_g16_display_prepare(struct device *dev);
@@ -149,12 +152,12 @@ int asahi_g16_cooling_sample(struct asahi_g16_cooling *cooling, u64 now, bool id
 	if (!ret) {
 		cooling->valid_ns = now;
 		cooling->valid_mc = *temperature;
-	} else if (ret == -ENODATA && cooling->valid_ns &&
-		   (idle || now - cooling->valid_ns < APPLE_PMP_GATED_HOLD_NS) &&
-		   cooling->valid_mc < APPLE_PMP_GATED_HOLD_MC) {
+	} else if (ret == -ENODATA &&
+		   apple_pmp_hold_nodata(cooling->valid_ns, cooling->valid_mc,
+					 now, idle)) {
 		*temperature = cooling->valid_mc;
 		/* Idle makes no heat: the 2 s with work in flight start with the work. */
-		if (idle)
+		if (idle && cooling->valid_mc < APPLE_PMP_GATED_HOLD_MC)
 			cooling->valid_ns = now;
 		ret = 0;
 	}
@@ -200,10 +203,19 @@ int asahi_g16_tvm_enable(struct device *dev)
 	return ret;
 }
 
-/* Whether this is a qualified J713/T8132 board. */
+/* Whether this T8132 board's retained PMP carries the GPU's AGX vote. */
 bool asahi_g16_board(void)
 {
-	return apple_pmp_j713_board();
+	return apple_pmp_t8132_retained_board();
+}
+
+/*
+ * The system counter frequency the boot loader programmed, in Hz: the clock the
+ * ADT counts GPU power sample periods in.
+ */
+u32 asahi_g16_timebase_hz(void)
+{
+	return arch_timer_get_cntfrq();
 }
 
 /*

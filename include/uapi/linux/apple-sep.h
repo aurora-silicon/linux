@@ -207,9 +207,14 @@ struct sep_bio_lockout {
 #define SEP_BIO_LOCKOUT_STATE _IOR(SEP_BIO_IOC_MAGIC, 0x0e, struct sep_bio_lockout)
 /*
  * Ends a lockout. Call it only once the user's password has been verified:
- * the password is used once to unwrap the Linux-owned FV re-arm record and is
- * wiped after the request. Needs CAP_SYS_ADMIN. Without a lockout it clears
- * the failed attempts (see SEP_BIO_LOCKOUT_FLAG_EVERY_PASSWORD).
+ * the kernel does not check the password. 'secret' is copied in and wiped
+ * after the request without being used; the enclave's lockout is ended with
+ * the stored secret of the configured user's key bag. The failed attempts,
+ * the lockout and the wait for the first password since boot
+ * (SEP_BIO_REQUIRE_PASSWORD) are kept once for the whole machine, not per
+ * account, and one call clears them for every enrolled finger. Needs
+ * CAP_SYS_ADMIN. Without a lockout it clears the failed attempts (see
+ * SEP_BIO_LOCKOUT_FLAG_EVERY_PASSWORD).
  */
 #define SEP_BIO_REARM_SECRET_MAX 1024
 struct sep_bio_rearm {

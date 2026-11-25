@@ -141,6 +141,15 @@
 
 	stm {
 	};
+
+	/*
+	 * Force Touch: the trackpad's haptic engine, ADT
+	 * /arm-io/dockchannel-mtp/mtp-transport/actuator on every M4 laptop.
+	 * Without it the click stays firmware-driven and there is no Force
+	 * Touch stage.
+	 */
+	actuator {
+	};
 };
 
 /* Mesa fingerprint sensor: power on nub GPIO 28, data-ready on AP GPIO 199. */

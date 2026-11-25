@@ -496,13 +496,13 @@ static void apple_plane_atomic_update(struct drm_plane *plane,
 	}
 
 	/*
-	 * DCP doesn't support XBGR8 / XRGB8 / XBGR2101010 natively. Blending as
+	 * DCP doesn't support XBGR8 / XRGB8 / XRGB2101010 natively. Blending as
 	 * pre-multiplied alpha with a black background can be used as
 	 * workaround for the bottommost plane.
 	 */
 	if (fmt->format == DRM_FORMAT_XRGB8888 ||
 	    fmt->format == DRM_FORMAT_XBGR8888 ||
-	    fmt->format == DRM_FORMAT_XBGR2101010 ||
+	    fmt->format == DRM_FORMAT_XRGB2101010 ||
 	    base->pixel_blend_mode == DRM_MODE_BLEND_PREMULTI)
 		is_premultiplied = true;
 
@@ -655,7 +655,7 @@ static const struct drm_plane_helper_funcs apple_plane_helper_funcs = {
 // Duplicate drm_atomic_helper_plane_reset but allocate struct apple_plane_state
 static void apple_plane_reset(struct drm_plane *plane)
 {
-        struct apple_plane_state *state = to_apple_plane_state(plane->state);
+	struct apple_plane_state *state = to_apple_plane_state(plane->state);
 	if (state) {
 		apple_plane_cleanup_fb(plane, &state->base);
 		__drm_atomic_helper_plane_destroy_state(&state->base);
@@ -671,17 +671,17 @@ static void apple_plane_reset(struct drm_plane *plane)
 static struct drm_plane_state *
 apple_plane_duplicate_state(struct drm_plane *plane)
 {
-        struct apple_plane_state *apple_plane_state, *old_apple_plane_state;
+	struct apple_plane_state *apple_plane_state, *old_apple_plane_state;
 
 	if (!plane->state)
 		return NULL;
 
-        old_apple_plane_state = to_apple_plane_state(plane->state);
-        apple_plane_state = kzalloc(sizeof(*apple_plane_state), GFP_KERNEL);
-        if (!apple_plane_state)
-                return NULL;
+	old_apple_plane_state = to_apple_plane_state(plane->state);
+	apple_plane_state = kzalloc(sizeof(*apple_plane_state), GFP_KERNEL);
+	if (!apple_plane_state)
+		return NULL;
 
-        __drm_atomic_helper_plane_duplicate_state(plane, &apple_plane_state->base);
+	__drm_atomic_helper_plane_duplicate_state(plane, &apple_plane_state->base);
 
 	apple_plane_state->surf = old_apple_plane_state->surf;
 	apple_plane_state->src_rect = old_apple_plane_state->src_rect;
