@@ -31,23 +31,6 @@ impl event::Transport for Service<'_> {
     fn roles(&self) -> &'static [Role] {
         self.firmware.roles()
     }
-    fn reports_after_signal(&self) -> bool {
-        self.firmware.init.is_m5()
-    }
-    fn trace(&mut self, role: Role) {
-        let firmware = &mut *self.firmware;
-        firmware
-            .rings
-            .drain_trace(&firmware.primary.state.shared.dev, &firmware.init, role);
-    }
-    fn statistics(&mut self, role: Role) {
-        let firmware = &mut *self.firmware;
-        firmware.observe_statistics_power();
-        firmware
-            .rings
-            .drain_statistics(&firmware.primary.state.shared.dev, &firmware.init, role);
-        firmware.observe_statistics_power();
-    }
     fn drain(
         &mut self,
         role: Role,
@@ -339,9 +322,8 @@ impl Firmware {
         Ok(())
     }
 
-    /// Drains every role's trace ring, then their statistics rings. On M5 the event worker calls
-    /// this after it has signalled the completions of its pass: the reports are not scheduling
-    /// inputs.
+    /// Drains every role's trace ring, then their statistics rings. The event worker calls this
+    /// after it has signalled the completions of its pass: the reports are not scheduling inputs.
     fn drain_reports(&mut self) {
         let dev = &self.primary.state.shared.dev;
         for &role in self.roles() {
@@ -353,14 +335,6 @@ impl Firmware {
         for &role in self.roles() {
             self.rings.drain_statistics(&self.primary.state.shared.dev, &self.init, role);
             self.observe_statistics_power();
-        }
-    }
-
-    /// Drains post-signal trace and statistics reports on firmware families that defer them past
-    /// completion signalling.
-    fn drain_post_signal_reports(&mut self) {
-        if self.init.is_m5() {
-            self.drain_reports();
         }
     }
 
@@ -562,8 +536,10 @@ impl crate::g17::Shared {
             // Steady-state pure-compute completions with work still in flight, no render work
             // to observe, no replays, no waiters and housekeeping not yet due finish in this
             // single device-mutex hold; fences are signalled right after unlocking.
+            // Only M5 may skip the post-signal report drain on an ordinary pass.
             let mut fast_done = false;
-            if !recover
+            if firmware.init.is_m5()
+                && !recover
                 && !requested
                 && !self.crashed.load(core::sync::atomic::Ordering::Acquire)
                 && masks == [0; 2]
@@ -620,12 +596,13 @@ impl crate::g17::Shared {
         if self.crashed.load(core::sync::atomic::Ordering::Acquire) {
             return Err(EIO);
         }
-        // Capture pre-recovery trace/statistics reports before firmware restart resets the
-        // report rings, matching the non-throttled post-signal ordering.
-        let mut reports_drained = false;
+        // Completions have signalled. Drain reports now unless M5 can defer them to
+        // housekeeping. Recovery must capture reports before restart resets their rings.
+        let reports_drained = recover || !firmware.init.is_m5();
+        if reports_drained {
+            firmware.drain_reports();
+        }
         if recover {
-            firmware.drain_post_signal_reports();
-            reports_drained = true;
             firmware.service_runtime_recovery(deferred)?;
             if !firmware.recovery.pending()
                 && !self.sleep_gate.load(core::sync::atomic::Ordering::Acquire)
@@ -694,7 +671,7 @@ impl crate::g17::Shared {
             if !reports_drained {
                 // The completions above are signalled; reports are throttled to the
                 // housekeeping cadence while work stays in flight.
-                firmware.drain_post_signal_reports();
+                firmware.drain_reports();
             }
             if !firmware.recovery.pending() {
                 lingers = firmware.expire_render_lingers(now)?;

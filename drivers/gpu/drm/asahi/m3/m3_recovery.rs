@@ -37,15 +37,21 @@ pub(crate) struct RecoveryOffsets {
     pub(crate) control_bytes: usize,
 }
 
+/// 26.6.2 extended FirmwareData recovery offsets and affected-work snapshot geometry.
+const EXTENDED_SNAPSHOT: usize = 0x40b8;
+const EXTENDED_SNAPSHOT_ENTRIES: usize = 448;
+const EXTENDED_GENERATION: usize = 0x4fa0;
+const EXTENDED_PHASE: usize = 0x4fb0;
+
 impl RecoveryOffsets {
     /// Extended control region offsets shifted by the profile's `m3_init_26`
     /// control-table delta (`0` on 26.6.2 / `0xeaf0`, `0x1e0` on 27.2 / `0xedd0`).
     pub(crate) const fn extended(shift: usize, control_bytes: usize) -> Self {
         Self {
-            snapshot: logic::SNAPSHOT + shift,
-            snapshot_entries: logic::SNAPSHOT_ENTRIES,
-            generation: logic::GENERATION + shift,
-            phase: logic::PHASE + shift,
+            snapshot: EXTENDED_SNAPSHOT + shift,
+            snapshot_entries: EXTENDED_SNAPSHOT_ENTRIES,
+            generation: EXTENDED_GENERATION + shift,
+            phase: EXTENDED_PHASE + shift,
             control_bytes,
         }
     }

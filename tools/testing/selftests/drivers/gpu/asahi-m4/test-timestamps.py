@@ -161,7 +161,7 @@ mod backend {
     pub struct Scrub{pub compute:Vec<Compute>,pub passes:Vec<Pass>}
     pub struct Slots{pub scrub:Scrub}pub struct Firmware{pub slots:Slots}
     pub struct Resources{pub compute:Vec<Compute>,pub passes:Vec<Pass>}
-    impl Resources{pub fn compute(&self)->Result<&Self>{Ok(self)}pub fn render(&self)->Result<&Self>{Ok(self)}}
+    impl Resources{pub fn compute(&self)->Result<&Self>{Ok(self)}pub fn render(&self)->Result<&Self>{Ok(self)}pub fn compute_unit(&self,k:usize)->Result<&Compute>{self.compute.get(k).ok_or(super::EINVAL)}}
     pub struct Job{pub commands:Vec<command::Command>,pub resources:Resources}
     pub struct Flight{pub job:Job,pub first:usize,pub count:usize,pub renders:u32}
     pub mod poll{use super::*;impl Firmware{ __RETIRE__ }}
