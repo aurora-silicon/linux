@@ -453,18 +453,28 @@ static int apple_rtkit_helper_dart_live(struct apple_rtkit_helper *helper, bool 
 
 static int apple_rtkit_helper_check_live(struct apple_rtkit_helper *helper);
 
+/*
+ * Whether a failed AP power notice went out and got no answer in time: RTKit's -ETIME. The
+ * mailbox's errors, -ETIMEDOUT among them for a send FIFO that stayed full, come before
+ * anything is sent, and no answer can come to a notice that never left.
+ */
+static bool apple_rtkit_helper_unanswered(int ret)
+{
+	return ret == -ETIME;
+}
+
 static int apple_rtkit_helper_ap_power(struct apple_rtkit_helper *helper, bool on)
 {
 	int ret = apple_rtkit_helper_send_ap_power(helper, on);
 
 	if (ret)
-		dev_err(helper->dev, "AP power notice (%s) not answered: %d\n",
-			on ? "on" : "idle", ret);
+		dev_err(helper->dev, "AP power notice (%s) %s: %d\n", on ? "on" : "idle",
+			apple_rtkit_helper_unanswered(ret) ? "not answered" : "failed", ret);
 	/*
 	 * Nothing is sent to undo an unanswered idle notice, which macOS never does:
 	 * the end of the sleep looks whether a late answer came, and only then sends AP on.
 	 */
-	if (ret && !on)
+	if (!on && apple_rtkit_helper_unanswered(ret))
 		helper->idle_unanswered = true;
 	return ret;
 }
@@ -479,8 +489,8 @@ static int apple_rtkit_helper_send_on(struct apple_rtkit_helper *helper)
 
 	if (!ret) {
 		ret = apple_rtkit_helper_ap_power(helper, true);
-		/* Sent: its answer may still come, and RTKit then reads the AP on again. */
-		helper->on_unanswered = ret != 0;
+		/* Sent and unanswered: its answer may come, and RTKit then reads the AP on. */
+		helper->on_unanswered = apple_rtkit_helper_unanswered(ret);
 	}
 	helper->wake_ret = ret;
 	return ret;

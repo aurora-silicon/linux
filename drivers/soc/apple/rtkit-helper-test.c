@@ -23,6 +23,11 @@
 #define RTKH_TEST_PWR_IDLE	0x201
 #define RTKH_TEST_PWR_ON	0x20
 
+/* What RTKit returns for a notice sent whose answer did not come in time */
+#define RTKH_TEST_UNANSWERED	(-ETIME)
+/* ... and for one the mailbox never took, its send FIFO full */
+#define RTKH_TEST_NOT_SENT	(-ETIMEDOUT)
+
 /* An SRAM region well inside the 44 bit DMA mask. */
 #define RTKH_TEST_SRAM_START	0x210000000ULL
 #define RTKH_TEST_SRAM_SIZE	0x10000
@@ -668,8 +673,8 @@ static void rtkh_pm_unanswered_still_running(struct kunit *test)
 	static const bool want[] = { false };
 
 	pm_set_suspend_via_firmware();
-	ctx->ret[0] = -ETIMEDOUT;
-	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_prepare(dev), -ETIMEDOUT);
+	ctx->ret[0] = RTKH_TEST_UNANSWERED;
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_prepare(dev), RTKH_TEST_UNANSWERED);
 	KUNIT_EXPECT_TRUE(test, ctx->helper.idle_unanswered);
 	KUNIT_EXPECT_FALSE(test, ctx->helper.ap_idle);
 
@@ -692,8 +697,8 @@ static void rtkh_pm_unanswered_late_answer(struct kunit *test)
 	static const bool want[] = { false, true, false };
 
 	pm_set_suspend_via_firmware();
-	ctx->ret[0] = -ETIMEDOUT;
-	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_prepare(dev), -ETIMEDOUT);
+	ctx->ret[0] = RTKH_TEST_UNANSWERED;
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_prepare(dev), RTKH_TEST_UNANSWERED);
 	ctx->rtk.ap_power_state = RTKH_TEST_PWR_IDLE;
 
 	apple_rtkit_helper_pm_notify(&ctx->helper.pm_nb, PM_POST_SUSPEND, NULL);
@@ -714,9 +719,9 @@ static void rtkh_pm_unanswered_crashed(struct kunit *test)
 	struct device *dev = ctx->dev;
 
 	pm_set_suspend_via_firmware();
-	ctx->ret[0] = -ETIMEDOUT;
+	ctx->ret[0] = RTKH_TEST_UNANSWERED;
 	ctx->ret[1] = -ENODEV;
-	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_prepare(dev), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_prepare(dev), RTKH_TEST_UNANSWERED);
 	ctx->rtk.crashed = true;
 	apple_rtkit_helper_complete(dev);
 	KUNIT_EXPECT_FALSE(test, ctx->helper.idle_pending);
@@ -735,8 +740,8 @@ static void rtkh_pm_pending_answered_later(struct kunit *test)
 	static const bool want[] = { false, true, false, true };
 
 	pm_set_suspend_via_firmware();
-	ctx->ret[0] = -ETIMEDOUT;
-	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_prepare(dev), -ETIMEDOUT);
+	ctx->ret[0] = RTKH_TEST_UNANSWERED;
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_prepare(dev), RTKH_TEST_UNANSWERED);
 	apple_rtkit_helper_pm_notify(&ctx->helper.pm_nb, PM_POST_SUSPEND, NULL);
 	KUNIT_ASSERT_TRUE(test, ctx->helper.idle_pending);
 
@@ -760,9 +765,9 @@ static void rtkh_pm_pending_ap_on_fails(struct kunit *test)
 	static const bool want[] = { false, true, false };
 
 	pm_set_suspend_via_firmware();
-	ctx->ret[0] = -ETIMEDOUT;
-	ctx->ret[1] = -EIO;
-	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_prepare(dev), -ETIMEDOUT);
+	ctx->ret[0] = RTKH_TEST_UNANSWERED;
+	ctx->ret[1] = RTKH_TEST_UNANSWERED;
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_prepare(dev), RTKH_TEST_UNANSWERED);
 	apple_rtkit_helper_pm_notify(&ctx->helper.pm_nb, PM_POST_SUSPEND, NULL);
 	ctx->rtk.ap_power_state = RTKH_TEST_PWR_IDLE;
 
@@ -771,10 +776,10 @@ static void rtkh_pm_pending_ap_on_fails(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, ctx->helper.on_unanswered);
 	KUNIT_EXPECT_FALSE(test, ctx->helper.ap_idle);
 	/* Kept, as every AP on's result is. */
-	KUNIT_EXPECT_EQ(test, ctx->helper.wake_ret, -EIO);
+	KUNIT_EXPECT_EQ(test, ctx->helper.wake_ret, RTKH_TEST_UNANSWERED);
 
 	/* Before its answer: the consumer's ask and the next sleep send nothing. */
-	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_ap_wake(dev), -EIO);
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_ap_wake(dev), RTKH_TEST_UNANSWERED);
 	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_prepare(dev), -EBUSY);
 
 	/* After it: the consumer may go on, and the next sleep idles. */
@@ -797,8 +802,8 @@ static void rtkh_pm_ap_wake_unanswered(struct kunit *test)
 
 	ctx->helper.idle_late = true;
 	pm_set_suspend_via_firmware();
-	ctx->ret[0] = -ETIMEDOUT;
-	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_suspend_late(dev), -ETIMEDOUT);
+	ctx->ret[0] = RTKH_TEST_UNANSWERED;
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_suspend_late(dev), RTKH_TEST_UNANSWERED);
 	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_resume(dev), 0);
 	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_ap_wake(dev), -EBUSY);
 	KUNIT_EXPECT_FALSE(test, ctx->helper.idle_unanswered);
@@ -817,8 +822,8 @@ static void rtkh_pm_ap_wake_late_answer(struct kunit *test)
 
 	ctx->helper.idle_late = true;
 	pm_set_suspend_via_firmware();
-	ctx->ret[0] = -ETIMEDOUT;
-	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_suspend_late(dev), -ETIMEDOUT);
+	ctx->ret[0] = RTKH_TEST_UNANSWERED;
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_suspend_late(dev), RTKH_TEST_UNANSWERED);
 	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_resume(dev), 0);
 	ctx->rtk.ap_power_state = RTKH_TEST_PWR_IDLE;
 	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_ap_wake(dev), 0);
@@ -839,9 +844,9 @@ static void rtkh_pm_ap_wake_pending(struct kunit *test)
 	static const bool want[] = { false, true };
 
 	pm_set_suspend_via_firmware();
-	ctx->ret[0] = -ETIMEDOUT;
+	ctx->ret[0] = RTKH_TEST_UNANSWERED;
 	ctx->ret[1] = -EIO;
-	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_prepare(dev), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_prepare(dev), RTKH_TEST_UNANSWERED);
 	apple_rtkit_helper_pm_notify(&ctx->helper.pm_nb, PM_POST_SUSPEND, NULL);
 	KUNIT_ASSERT_TRUE(test, ctx->helper.idle_pending);
 	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_ap_wake(dev), -EBUSY);
@@ -850,6 +855,50 @@ static void rtkh_pm_ap_wake_pending(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_ap_wake(dev), -EIO);
 	KUNIT_EXPECT_FALSE(test, ctx->helper.idle_pending);
 	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_ap_wake(dev), -EIO);
+	rtkh_expect_calls(test, want, ARRAY_SIZE(want));
+}
+
+/*
+ * An idle notice the mailbox never took: nothing waits for an answer. The sleep is refused,
+ * the input consumer goes on at once, and the next sleep sends one again.
+ */
+static void rtkh_pm_idle_not_sent(struct kunit *test)
+{
+	struct rtkh_test *ctx = test->priv;
+	struct device *dev = ctx->dev;
+	static const bool want[] = { false, false };
+
+	ctx->helper.idle_late = true;
+	pm_set_suspend_via_firmware();
+	ctx->ret[0] = RTKH_TEST_NOT_SENT;
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_suspend_late(dev), RTKH_TEST_NOT_SENT);
+	KUNIT_EXPECT_FALSE(test, ctx->helper.idle_unanswered);
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_resume(dev), 0);
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_ap_wake(dev), 0);
+	apple_rtkit_helper_complete(dev);
+	KUNIT_EXPECT_FALSE(test, ctx->helper.idle_pending);
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_suspend_late(dev), 0);
+	rtkh_expect_calls(test, want, ARRAY_SIZE(want));
+}
+
+/*
+ * An AP on the mailbox never took: no answer can come, so nothing waits for one. Its result
+ * stands for the input consumer, and the next sleep idles as usual.
+ */
+static void rtkh_pm_ap_on_not_sent(struct kunit *test)
+{
+	struct rtkh_test *ctx = test->priv;
+	struct device *dev = ctx->dev;
+	static const bool want[] = { false, true, false };
+
+	pm_set_suspend_via_firmware();
+	ctx->ret[1] = RTKH_TEST_NOT_SENT;
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_prepare(dev), 0);
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_resume(dev), RTKH_TEST_NOT_SENT);
+	KUNIT_EXPECT_FALSE(test, ctx->helper.on_unanswered);
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_ap_wake(dev), RTKH_TEST_NOT_SENT);
+	apple_rtkit_helper_complete(dev);
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_prepare(dev), 0);
 	rtkh_expect_calls(test, want, ARRAY_SIZE(want));
 }
 
@@ -862,9 +911,9 @@ static void rtkh_pm_complete_then_notify(struct kunit *test)
 
 	ctx->helper.idle_late = true;
 	pm_set_suspend_via_firmware();
-	ctx->ret[0] = -ETIMEDOUT;
+	ctx->ret[0] = RTKH_TEST_UNANSWERED;
 	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_prepare(dev), 0);
-	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_suspend_late(dev), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_suspend_late(dev), RTKH_TEST_UNANSWERED);
 	ctx->rtk.ap_power_state = RTKH_TEST_PWR_IDLE;
 	apple_rtkit_helper_complete(dev);
 	apple_rtkit_helper_pm_notify(&ctx->helper.pm_nb, PM_POST_SUSPEND, NULL);
@@ -899,11 +948,11 @@ static void rtkh_pm_ap_on_fails(struct kunit *test)
 	static const bool want[] = { false, true, false };
 
 	pm_set_suspend_via_firmware();
-	ctx->ret[1] = -ETIMEDOUT;
+	ctx->ret[1] = RTKH_TEST_UNANSWERED;
 	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_prepare(dev), 0);
 	/* Returned, not swallowed, and kept for the input consumer that asks later. */
-	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_resume(dev), -ETIMEDOUT);
-	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_ap_wake(dev), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_resume(dev), RTKH_TEST_UNANSWERED);
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_ap_wake(dev), RTKH_TEST_UNANSWERED);
 	KUNIT_EXPECT_FALSE(test, ctx->helper.ap_idle);
 	KUNIT_EXPECT_FALSE(test, ctx->helper.idle_unanswered);
 	KUNIT_EXPECT_TRUE(test, ctx->helper.on_unanswered);
@@ -1008,8 +1057,8 @@ static void rtkh_pm_adopted_late_answer_checked(struct kunit *test)
 	ctx->helper.dart_required = true;
 	pm_set_suspend_via_firmware();
 	rtkh_set_run(ctx, true);
-	ctx->ret[0] = -ETIMEDOUT;
-	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_prepare(dev), -ETIMEDOUT);
+	ctx->ret[0] = RTKH_TEST_UNANSWERED;
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_prepare(dev), RTKH_TEST_UNANSWERED);
 	apple_rtkit_helper_pm_notify(&ctx->helper.pm_nb, PM_POST_SUSPEND, NULL);
 	KUNIT_ASSERT_TRUE(test, ctx->helper.idle_pending);
 
@@ -1119,6 +1168,8 @@ static struct kunit_case apple_rtkit_helper_test_cases[] = {
 	KUNIT_CASE(rtkh_pm_ap_wake_unanswered),
 	KUNIT_CASE(rtkh_pm_ap_wake_late_answer),
 	KUNIT_CASE(rtkh_pm_ap_wake_pending),
+	KUNIT_CASE(rtkh_pm_idle_not_sent),
+	KUNIT_CASE(rtkh_pm_ap_on_not_sent),
 	KUNIT_CASE(rtkh_pm_complete_then_notify),
 	KUNIT_CASE(rtkh_pm_notify_other_events),
 	KUNIT_CASE(rtkh_pm_ap_on_fails),
