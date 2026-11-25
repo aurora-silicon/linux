@@ -643,7 +643,12 @@ static const struct sio_hw_data sio_hw_generic = {
 	.cfg_word4 = 0x800,
 };
 
+/*
+ * macOS 27.2 on J516s idles this firmware (AP, then IOP) in the sleep's last steps, about 22 ms
+ * before the commit, as on T6041.
+ */
 static const struct sio_hw_data sio_hw_t6030 = {
+	.stop_at_commit = true,
 	.fifo_threshold = 0x600,
 	.cfg_word4 = 0x800,
 	.clear_period_desc = true,
@@ -2182,6 +2187,9 @@ rpm_put:
 	if (!err && hw->stop_at_commit)
 		sio->commit_registered = !apple_sleep_coproc_register(&pdev->dev, sio->base, false,
 								      sio_commit_stop, sio);
+	/* Where the sleep orders its stops (T6050, T6030), SIO's comes before the PMP's */
+	if (sio->commit_registered)
+		apple_sleep_coproc_set_early(&pdev->dev);
 	/*
 	 * One stopped by the sleep's commit runs until then: a runtime suspend would let its domain
 	 * go off under the firmware.
