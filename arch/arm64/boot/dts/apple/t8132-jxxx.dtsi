@@ -39,6 +39,7 @@
 
 		stdout-path = "serial0";
 
+		linux-enablement-mac,disk-boot;
 		linux-enablement-mac,dapf-handoff = "/arm-io/aop", "/arm-io/pmp";
 		linux-enablement-mac,dapf-power-on-handoff = "/arm-io/pmp";
 
