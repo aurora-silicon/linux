@@ -90,6 +90,24 @@ static const u32 t6030_lowered[] = {
 
 enum { T6030_LOWER_SIO_CPU, T6030_LOWER_PMP, T6030_LOWER_PHY = 3 };
 
+/*
+ * On under Linux at the commit, off at macOS's (PLAN §4, runs/t1c-stop/linux-diff.tsv): every
+ * USB-C port's PHY common, then debug port's fabric (on under the HV only because aura holds
+ * it), then the words macOS leaves to their auto state (0x200; the ADT calls them critical).
+ * T8122 (#2746) found its SoC powers down only with the port words off. Lowered by
+ * .commit_regs, each back as it was at the wake.
+ */
+static const u32 t6030_macos_down[] = {
+	0x4e0, 0x4e8, 0x4f0, 0x4f8,		/* ATC0-3_COMMON */
+	0x4d8, 0x4c0, 0x4b8, 0x4b0,		/* LW31, LW30, LS3, IOA3 */
+	0x108, 0x2e8, 0x2f0, 0x2f8, 0x300,	/* MSG, DPA1-4 */
+	0x1e0, 0x1e8, 0x138, 0x140, 0x148, 0x150, 0x158, /* FPWM1/2, PMS_FPWM0-4 */
+	0x190, 0x218, 0x178,			/* AFT0, I2C5, PMGR_SOC_OCLA */
+};
+
+/* And in "ps-aon": NUB_SPI0 and NUB_OCLA (0x200 at macOS's commit) */
+static const u32 t6030_macos_down_aon[] = { 0x88, 0x90 };
+
 /* SIO's and its CPU's words: apple,seq-commit clears their AUTO_ENABLE, the wake puts them back */
 static const u32 t6030_auto_off[] = { T6030_PS_SIO, T6030_PS_SIO_CPU };
 
@@ -104,6 +122,10 @@ struct t6030_sleep {
 	unsigned int nlowered;
 	u32 auto_saved[ARRAY_SIZE(t6030_auto_off)];
 	bool auto_staged;
+	u32 down_saved[ARRAY_SIZE(t6030_macos_down)];
+	u32 down_aon_saved[ARRAY_SIZE(t6030_macos_down_aon)];
+	bool down_staged;
+	u8 down_stuck;
 	/* The PMU's RTC alarm as the entry found it, for the rearm after the commit word */
 	u8 alarm_compare[4];
 	bool alarm_valid;
@@ -225,6 +247,43 @@ static int t6030_sleep_map_regs(struct apple_sleep *s)
 	return apple_sleep_read_wake_sources(s);
 }
 
+static bool t6030_macos_off_at_commit(u32 offset);
+
+/*
+ * Read-only, at a dry run's end (every device suspended): each "ps" word on (offset=value; * =
+ * macOS has it off at its commit), and each "ps-aon" word on without AUTO_ENABLE
+ */
+static void t6030_dry_ps_on(struct apple_sleep *s)
+{
+	const struct apple_sleep_words *all = &s->soc->ps_all, *aon = &s->soc->ps_aon_all;
+	/* Interrupts are off here: no allocation. */
+	static char line[512];
+	int i, n = 0, on = 0;
+	u32 v;
+
+	line[0] = 0;
+	for (i = 0; i < all->count; i++) {
+		v = readl(s->ps + all->offset[i]);
+		if (!FIELD_GET(PS_ACTUAL, v))
+			continue;
+		on++;
+		n += scnprintf(line + n, sizeof(line) - n, " %x=%x%s", all->offset[i], v,
+			       t6030_macos_off_at_commit(all->offset[i]) ? "*" : "");
+		if (n > 400) {
+			dev_info(s->dev, "dry run: ps on (* = off at macOS's commit):%s\n", line);
+			n = 0;
+			line[0] = 0;
+		}
+	}
+	dev_info(s->dev, "dry run: ps on (* = off at macOS's commit):%s; %d on\n", line, on);
+	for (i = 0, n = 0, line[0] = 0; i < aon->count; i++) {
+		v = readl(s->ps_aon + aon->offset[i]);
+		if (FIELD_GET(PS_ACTUAL, v))
+			n += scnprintf(line + n, sizeof(line) - n, " %x=%x", aon->offset[i], v);
+	}
+	dev_info(s->dev, "dry run: ps-aon on:%s\n", line);
+}
+
 /*
  * The last returning check: the SMC's, with its scope held. An untested profile's dry run
  * ends here, before the enclave or any coprocessor stops, and notes so in PMU scratch.
@@ -244,6 +303,7 @@ static int t6030_sleep_final_check(struct apple_sleep *s)
 	}
 	if (s->soc->untested && !READ_ONCE(sleep_untested_commit)) {
 		sleep_note(s, T6030_NOTE_DRY_RUN);
+		t6030_dry_ps_on(s);
 		return -EAGAIN;
 	}
 	return 0;
@@ -580,6 +640,76 @@ static int t6030_sleep_commit_notice(struct apple_sleep *s)
 }
 
 /*
+ * t6030_macos_down[] and _aon[] off, each saved first; one that doesn't go off is counted
+ * (t->down_stuck), not fatal: macOS has them off long before its commit, with no order of its
+ * own in the window.
+ */
+static void t6030_sleep_unstage(struct apple_sleep *s, u32 offset, u32 before);
+
+static void t6030_sleep_down(struct apple_sleep *s)
+{
+	struct t6030_sleep *t = t6030_state(s);
+	unsigned int i;
+	u32 v, now;
+
+	t->down_stuck = 0;
+	for (i = 0; i < ARRAY_SIZE(t6030_macos_down); i++) {
+		t->down_saved[i] = readl(s->ps + t6030_macos_down[i]);
+		if (!FIELD_GET(PS_ACTUAL, t->down_saved[i]))
+			continue;
+		sleep_ps_lower(s, t6030_macos_down[i]);
+		if (sleep_ps_wait_off(s, t6030_macos_down[i]))
+			t->down_stuck++;
+	}
+	for (i = 0; i < ARRAY_SIZE(t6030_macos_down_aon); i++) {
+		void __iomem *reg = s->ps_aon + t6030_macos_down_aon[i];
+
+		v = readl(reg);
+		t->down_aon_saved[i] = v;
+		if (!FIELD_GET(PS_ACTUAL, v))
+			continue;
+		writel(v & ~(PS_AUTO_ENABLE | PS_FLAGS), reg);
+		writel((v & ~(PS_AUTO_ENABLE | PS_FLAGS | PS_TARGET)) | PS_FLAGS, reg);
+		if (readl_poll_timeout_atomic(reg, now, !FIELD_GET(PS_ACTUAL, now), 1,
+					      PS_OFF_TIMEOUT_US))
+			t->down_stuck++;
+	}
+	t->down_staged = true;
+}
+
+/* At the wake: the "ps" words back through the rewake (as before the entry), the aon ones here */
+static void t6030_sleep_down_unstage(struct apple_sleep *s)
+{
+	struct t6030_sleep *t = t6030_state(s);
+	unsigned int i;
+
+	if (!t->down_staged)
+		return;
+	for (i = 0; i < ARRAY_SIZE(t6030_macos_down); i++)
+		t6030_sleep_unstage(s, t6030_macos_down[i], t->down_saved[i]);
+}
+
+static void t6030_sleep_down_aon_back(struct apple_sleep *s)
+{
+	struct t6030_sleep *t = t6030_state(s);
+	unsigned int i;
+	u32 now;
+
+	if (!t->down_staged)
+		return;
+	t->down_staged = false;
+	for (i = 0; i < ARRAY_SIZE(t6030_macos_down_aon); i++) {
+		void __iomem *reg = s->ps_aon + t6030_macos_down_aon[i];
+		u32 v = t->down_aon_saved[i];
+
+		if (!FIELD_GET(PS_ACTUAL, v))
+			continue;
+		writel(v & ~PS_FLAGS, reg);
+		readl_poll_timeout_atomic(reg, now, FIELD_GET(PS_ACTUAL, now), 1, PS_OFF_TIMEOUT_US);
+	}
+}
+
+/*
  * The other cores stopped: the storage PHY's word, then what the wake sequences write back,
  * read before the DT's sequence to the commit word changes any of it
  */
@@ -596,6 +726,7 @@ static void t6030_sleep_commit_regs(struct apple_sleep *s)
 	for (i = 0; i < ARRAY_SIZE(t6030_auto_off); i++)
 		t->auto_saved[i] = readl(s->ps + t6030_auto_off[i]);
 	t->auto_staged = true;
+	t6030_sleep_down(s);
 	sleep_seq_save(t->blk, &t->wake_early);
 	sleep_seq_save(t->blk, &t->wake);
 	if (sleep_seq_run_strict(t->blk, &t->commit))
@@ -746,6 +877,7 @@ static void t6030_sleep_wake(struct apple_sleep *s)
 			t6030_sleep_unstage(s, t6030_auto_off[i], t->auto_saved[i]);
 	for (i = 0; i < t->nlowered; i++)
 		t6030_sleep_unstage(s, t6030_lowered[i], t->lowered_saved[i]);
+	t6030_sleep_down_unstage(s);
 	t->auto_staged = false;
 	t->nlowered = 0;
 	sleep_ps_rewake_begin(s);
@@ -761,6 +893,7 @@ static void t6030_sleep_wake(struct apple_sleep *s)
 	sleep_note(s, 0x74);
 	sleep_ps_rewake_words(s, &t6030_wake_late_words, false);
 	sleep_ps_rewake_rest(s);
+	t6030_sleep_down_aon_back(s);
 	t6030_sleep_wake_check_ps(s, "at the end");
 	sleep_note(s, 0x75);
 }
