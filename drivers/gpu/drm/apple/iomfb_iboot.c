@@ -646,7 +646,7 @@ static int dcp_iboot_start(struct dcp_iboot *ib)
 				 &t8152_dptx_port_ops, 2);
 	if (ret)
 		return dev_err_probe(dev, ret, "no DPTX port service\n");
-	if (disp->pd) {
+	if (disp->usbc) {
 		ret = t8152_dptx_disconnect(disp, 0);
 		if (ret)
 			return dev_err_probe(dev, ret, "cannot release inherited DP link\n");
@@ -656,7 +656,7 @@ static int dcp_iboot_start(struct dcp_iboot *ib)
 	 * USB-C negotiation can outlive probe or fail while a monitor sleeps.
 	 * Register the connector first; the hotplug path owns all USB-C links.
 	 */
-	if (disp->pd)
+	if (disp->usbc)
 		sink = false;
 	if (sink) {
 		ret = t8152_dptx_connect(disp, 0);
@@ -719,9 +719,9 @@ register_kms:
 	if (ret)
 		return ret;
 	WRITE_ONCE(ib->ready, true);
-	if (disp->hpd_gpio || disp->pd)
+	if (disp->hpd_gpio || disp->usbc)
 		drmm_kms_helper_poll_init(&ib->drm);
-	if (disp->pd)
+	if (disp->usbc)
 		queue_delayed_work(system_freezable_wq, &ib->hpd_work,
 				   msecs_to_jiffies(250));
 	drm_client_setup(&ib->drm, NULL);
@@ -844,6 +844,9 @@ int dcp_iboot_probe(struct apple_dcp *dcp)
 		dev_warn(dev, "live session not recorded; its DMA stays allocated\n");
 		WRITE_ONCE(dcp->retain_dma, true);
 	}
+	/* The device stays bound from here on: follow the USB-C ports. */
+	if (t8152_typec_init(disp))
+		dev_err(dev, "USB-C ports not followed, no USB-C display\n");
 	if (ret)
 		dev_err(dev, "cannot adopt the DCP: %d\n", ret);
 	else

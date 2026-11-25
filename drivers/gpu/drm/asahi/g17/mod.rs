@@ -34,7 +34,7 @@ mod completion;
 pub(crate) mod context;
 mod data_segment;
 mod dependency;
-mod sync_input;
+pub(crate) mod sync_input;
 pub(crate) mod exec_share;
 pub(crate) mod sync_output;
 mod trace;
@@ -846,6 +846,7 @@ impl Drop for Firmware {
         }
         self.primary.stop();
         self.port.set_effort_full(false);
+        self.primary.state.shared.set_full_effort_published(false);
         self.pool.stop_after_firmware();
         // RTKit destruction releases the mailbox power references. Clear the bridge while
         // those references still keep the register block powered.
@@ -900,8 +901,9 @@ impl Firmware {
     }
 
     /// Both outer slots and their capacity are checked before any host-port
-    /// write. An EAGAIN retry drops the old views and revalidates them under a
-    /// power hold. After a successful transaction, publication is infallible.
+    /// write. The host command port needs no core power, and its transaction
+    /// fails only once the register mapping is gone; the error propagates.
+    /// After a successful transaction, publication is infallible.
     fn submit_m5_render_pair(
         &mut self,
         priority: u8,
@@ -912,26 +914,12 @@ impl Firmware {
         deferred: bool,
         cursors: Option<[u32; 3]>,
     ) -> Result<[u32; 2]> {
-        let mut commit_accounting = Some(commit_accounting);
-        let mut publish_inner = Some(publish_inner);
-        let mut cursors = cursors;
-        for attempt in 0..2 {
-            let pair = self.init.m5_work_pair(priority, &records[0], &records[1], cursors.take())?;
-            pair.prepare();
-            if let Some(commit) = commit_accounting.take() { commit()?; }
-            match self.bridge.regs.submit_m5_work(submission) {
-                Err(error) if error == EAGAIN && attempt == 0 => {
-                    drop(pair);
-                    self.acquire_registration_power()?;
-                }
-                Err(error) => return Err(error),
-                Ok(()) => {
-                    if let Some(publish) = publish_inner.take() { publish(); }
-                    return Ok(if deferred { pair.next() } else { pair.publish() });
-                }
-            }
-        }
-        Err(EAGAIN)
+        let pair = self.init.m5_work_pair(priority, &records[0], &records[1], cursors)?;
+        pair.prepare();
+        commit_accounting()?;
+        self.bridge.regs.submit_m5_work(submission)?;
+        publish_inner();
+        Ok(if deferred { pair.next() } else { pair.publish() })
     }
 
     /// Called at actual submission publication, not while a queued job is merely being built.
@@ -942,6 +930,7 @@ impl Firmware {
         self.primary.state.shared.note_gpu_activity();
         self.effort.submit();
         self.effort.note_waiters(now, fence::waiters());
+        self.effort.note_compute_waiters(now, fence::compute_waiters());
         self.effort.note_bound(self.primary.state.shared.feed.busy_run());
         if self.effort.bound() {
             self.port.lift_busy_if_below_top(now);
@@ -996,10 +985,17 @@ impl Firmware {
     }
 
     fn apply_effort(&mut self, effort: u32) -> Result {
-        Self::apply_shared_effort(&self.init, &mut self.effort, &self.port, effort)
+        Self::apply_shared_effort(
+            &self.primary.state.shared,
+            &self.init,
+            &mut self.effort,
+            &self.port,
+            effort,
+        )
     }
 
     fn apply_shared_effort(
+        shared: &Shared,
         init: &initdata::InitData,
         state: &mut power::Effort,
         port: &port::Port,
@@ -1007,8 +1003,14 @@ impl Firmware {
     ) -> Result {
         // The performance-controller demand follows the requested effort; the firmware is
         // given, and the state records, the published value (InitData::submission_effort).
-        let published = init.submission_effort(effort, state.waited(), state.bound());
+        let published = init.submission_effort(
+            effort,
+            state.waited(),
+            state.bound(),
+            state.compute_waited(),
+        );
         port.set_effort_full(effort == power::FULL_EFFORT);
+        shared.set_full_effort_published(published == power::FULL_EFFORT);
         if state.applied() == published {
             // M5 maps region C read-only to the firmware: once confirmed, the word holds
             // `applied` without reading it back.
@@ -1049,14 +1051,18 @@ impl Firmware {
             self.effort.submit();
         }
         // A waiter or a busy run that began or ended since the last note moves the effort while
-        // work streams.
+        // work streams. Skip a redundant Region C drop right before Effort::idle clears it to 0.
         if self.effort.streaming() {
             let waiters = self.effort.note_waiters(now_ns, fence::waiters());
+            let compute_waiters = self
+                .effort
+                .note_compute_waiters(now_ns, fence::compute_waiters());
             let bound = self.effort.note_bound(self.primary.state.shared.feed.busy_run());
             if self.effort.bound() {
                 self.port.lift_busy_if_below_top(now_ns);
             }
-            if waiters || bound {
+            let active = in_flight || submitted;
+            if (waiters || compute_waiters || bound) && !self.effort.will_clear(now_ns, active) {
                 self.apply_effort(power::FULL_EFFORT)?;
             }
         }
@@ -1296,6 +1302,11 @@ struct Shared {
     idle: DelayedWork<Shared, IDLE_WORK>,
     /// M5: the thermal governor runs (the firmware has the host power budget word).
     governs: bool,
+    /// Non-M5 submission-capable device registered for compute-waiter effort wakeups.
+    tracks_effort_wake: bool,
+    /// Region C currently holds FULL_EFFORT; mirrored with `BELOW_FULL_COUNT` under
+    /// `EFFORT_TARGETS` so steady-state compute waits take no lock.
+    full_effort_published: AtomicBool,
     #[pin]
     governor: DelayedWork<Shared, GOVERNOR_WORK>,
     governor_armed: AtomicBool,
@@ -1304,8 +1315,9 @@ struct Shared {
     governor_activity_ns: AtomicU64,
     /// The queue of all work that signals job fences: the event work, and every scheduler's
     /// timeout work. Memory reclaim may wait on those fences, so it is reclaim-safe, and it is
-    /// high priority, as `system_highpri_wq`. [`Self::new_events_queue`] says where the event
-    /// work runs.
+    /// high priority, as `system_highpri_wq`. The event work runs in the cluster of the CPU that
+    /// last published work (see `queue_event_records`); [`Self::new_events_queue`] says where in
+    /// it.
     events: Arc<workqueue::OwnedQueue>,
     /// Preallocated completion collector owned exclusively by `run_runtime_events`.
     #[pin]
@@ -1315,13 +1327,11 @@ struct Shared {
     /// waits for another, and finished after the device mutex is released.
     #[pin]
     render_collector: Mutex<runtime::DeferredBatch>,
-    /// M5: the event work runs beside the CPU that last published work, in its affinity pod.
-    follows_submitter: bool,
-    /// Multi-die M5: restrict each scheduler's ordered submit queue to the creating CPU's
-    /// cluster to avoid cross-die migration. Single-die M5 parts leave schedulers unpinned so
-    /// queues created on one thread do not contend on a single cluster under multi-queue load.
+    /// Restrict each scheduler's ordered submit queue to the creating CPU's cluster, beside the
+    /// event work. Single-die M5 parts leave schedulers unrestricted so queues created on one
+    /// thread do not contend on a single cluster under multi-queue load.
     pin_scheduler_cluster: bool,
-    /// M5: the CPU of the last publication, `u32::MAX` before the first.
+    /// The CPU of the last publication, `u32::MAX` before the first.
     submitter: AtomicU32,
     #[pin]
     grow: Work<Shared, GROW_WORK>,
@@ -1453,7 +1463,167 @@ impl WorkItem<EVENT_WORK> for Shared {
     }
 }
 
+/// Non-M5 G17 devices registered for immediate full-effort wakeups when a host thread begins
+/// waiting on a pure-compute submission while Region C is below `FULL_EFFORT`.
+///
+/// Lock order: `Shared::state` -> `EFFORT_TARGETS`; `dma_fence->lock` -> `EFFORT_TARGETS` ->
+/// workqueue pool lock. Always acquired with `spin_lock_irqsave` so it nests safely inside C
+/// `dma_fence->lock` (`spin_lock_irqsave`) without altering caller IRQ state.
+const MAX_EFFORT_TARGETS: usize = 4;
+
+struct EffortTargets {
+    lock: Opaque<kernel::bindings::spinlock_t>,
+    slots: core::cell::UnsafeCell<[Option<Arc<Shared>>; MAX_EFFORT_TARGETS]>,
+}
+
+// SAFETY: Every access to `slots` holds `lock` with hardware IRQ save/restore.
+unsafe impl Sync for EffortTargets {}
+
+struct EffortTargetsGuard<'a> {
+    targets: &'a EffortTargets,
+    flags: kernel::ffi::c_ulong,
+}
+
+impl core::ops::Deref for EffortTargetsGuard<'_> {
+    type Target = [Option<Arc<Shared>>; MAX_EFFORT_TARGETS];
+
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: The guard holds `targets.lock` exclusively.
+        unsafe { &*self.targets.slots.get() }
+    }
+}
+
+impl core::ops::DerefMut for EffortTargetsGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        // SAFETY: The guard holds `targets.lock` exclusively.
+        unsafe { &mut *self.targets.slots.get() }
+    }
+}
+
+impl Drop for EffortTargetsGuard<'_> {
+    fn drop(&mut self) {
+        // SAFETY: `self.flags` came from `spin_lock_irqsave` on `self.targets.lock`.
+        unsafe { kernel::bindings::spin_unlock_irqrestore(self.targets.lock.get(), self.flags) };
+    }
+}
+
+impl EffortTargets {
+    const fn new() -> Self {
+        Self {
+            lock: Opaque::uninit(),
+            slots: core::cell::UnsafeCell::new([const { None }; MAX_EFFORT_TARGETS]),
+        }
+    }
+
+    unsafe fn init(&self) {
+        // SAFETY: Called once during module init before any GPU adapter probes.
+        unsafe {
+            kernel::bindings::__spin_lock_init(
+                self.lock.get(),
+                c_str!("g17::EFFORT_TARGETS").as_char_ptr(),
+                kernel::static_lock_class!().as_ptr(),
+            );
+        }
+    }
+
+    fn lock(&self) -> EffortTargetsGuard<'_> {
+        // SAFETY: `self.lock` was initialized once in `g17::init` before any probe.
+        let flags = unsafe { kernel::bindings::spin_lock_irqsave(self.lock.get()) };
+        EffortTargetsGuard {
+            targets: self,
+            flags,
+        }
+    }
+}
+
+static EFFORT_TARGETS: EffortTargets = EffortTargets::new();
+/// Registered non-M5 devices whose Region C effort is currently below `FULL_EFFORT`.
+static BELOW_FULL_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// # Safety
+///
+/// Called exactly once per module instance, before any platform adapter is registered.
+pub(crate) unsafe fn init() {
+    // SAFETY: Single-call module initialization invariant upheld by caller.
+    unsafe { EFFORT_TARGETS.init() };
+}
+
+fn register_effort_target(shared: &Arc<Shared>) {
+    if !shared.tracks_effort_wake {
+        return;
+    }
+    let mut targets = EFFORT_TARGETS.lock();
+    if let Some(slot) = targets.iter_mut().find(|slot| slot.is_none()) {
+        *slot = Some(shared.clone());
+        if !shared.full_effort_published.load(Ordering::Acquire) {
+            BELOW_FULL_COUNT.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+}
+
+fn unregister_effort_target(shared: &Arc<Shared>) {
+    if !shared.tracks_effort_wake {
+        return;
+    }
+    let removed = {
+        let mut targets = EFFORT_TARGETS.lock();
+        let mut found = None;
+        for slot in targets.iter_mut() {
+            if slot
+                .as_ref()
+                .is_some_and(|entry| Arc::ptr_eq(entry, shared))
+            {
+                found = slot.take();
+                if !shared.full_effort_published.load(Ordering::Acquire) {
+                    BELOW_FULL_COUNT.fetch_sub(1, Ordering::AcqRel);
+                }
+                break;
+            }
+        }
+        found
+    };
+    // Drop outside the spinlock; caller also retains `shared`.
+    drop(removed);
+}
+
+/// Wakes any non-M5 device still below `FULL_EFFORT` so a newly waited pure-compute dispatch
+/// lifts Region C effort to `FULL_EFFORT` immediately instead of waiting 16 ms.
+/// Safe in atomic `dma_fence->lock` context: lock-free once already at `FULL_EFFORT`, and
+/// `EFFORT_TARGETS` keeps every `Arc<Shared>` refcount >= 2 across `queue_event_records()`.
+pub(super) fn wake_for_compute_waiter() {
+    if BELOW_FULL_COUNT.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let targets = EFFORT_TARGETS.lock();
+    for shared in targets.iter().flatten() {
+        if !shared.full_effort_published.load(Ordering::Acquire)
+            && !shared.sleeping()
+            && !shared.crashed.load(Ordering::Acquire)
+        {
+            shared.queue_event_records();
+        }
+    }
+}
+
 impl Shared {
+    fn set_full_effort_published(&self, full: bool) {
+        if !self.tracks_effort_wake || self.full_effort_published.load(Ordering::Relaxed) == full {
+            return;
+        }
+        let targets = EFFORT_TARGETS.lock();
+        let registered = targets
+            .iter()
+            .flatten()
+            .any(|entry| core::ptr::eq(Arc::as_ptr(entry), self));
+        if registered && self.full_effort_published.swap(full, Ordering::AcqRel) != full {
+            if full {
+                BELOW_FULL_COUNT.fetch_sub(1, Ordering::AcqRel);
+            } else {
+                BELOW_FULL_COUNT.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+    }
+
     fn drm(&self) -> Result<AsahiDevRef> {
         self.drm.lock().as_ref().cloned().ok_or(ENODEV)
     }
@@ -1499,10 +1669,14 @@ impl Shared {
         if !self.submission_enabled {
             return;
         }
-        // Already queued if this fails, which is just as good.
+        // Here when the submitter shares this CPU's cluster: waking a worker elsewhere would only
+        // add a wakeup to every completion. Already queued if this fails, which is just as good.
+        let here = kernel::cpu::CpuId::current();
         let _ = match self.submitter() {
-            Some(cpu) => self.events.enqueue_on::<Arc<Shared>, EVENT_WORK>(cpu, self.clone()),
-            None => self.events.enqueue::<Arc<Shared>, EVENT_WORK>(self.clone()),
+            Some(cpu) if !kernel::cpumask::Cpumask::cluster_of(here).test(cpu) => {
+                self.events.enqueue_on::<Arc<Shared>, EVENT_WORK>(cpu, self.clone())
+            }
+            _ => self.events.enqueue::<Arc<Shared>, EVENT_WORK>(self.clone()),
         };
     }
 
@@ -1513,20 +1687,22 @@ impl Shared {
 
     /// The queue of [`Self::events`].
     ///
-    /// Event work that follows the submitter is aimed at the publishing CPU by
-    /// [`Self::queue_event_records`]. Its queue is unbound, so that CPU only selects the affinity
-    /// pod, the CPUs sharing its L2, and the scheduler wakes the worker on an idle CPU of the pod:
+    /// On M5 the queue is unbound. [`Self::queue_event_records`] queues the event work where the
+    /// completion is taken when that is in the cluster of the CPU that last published work, and
+    /// aims it at that CPU otherwise. On an unbound queue either only selects the affinity pod,
+    /// the CPUs sharing that L2, and the scheduler wakes the worker on an idle CPU of the pod:
     /// beside the submitter and on its die, wherever the completion interrupt was taken. On a
-    /// per-CPU queue the worker would run on the submitting CPU itself and, with the higher
-    /// priority, preempt the submitter for every completion, often in the middle of a publication
-    /// holding the locks the event work takes next. As their owner would not be running, the
-    /// worker could not spin on them: it would sleep until the submitter unlocks and then preempt
-    /// it again, two context switches of the submitter per completion.
+    /// per-CPU queue the worker would run on the submitting CPU itself whenever the interrupt is
+    /// taken there and, with the higher priority, preempt the submitter for every completion,
+    /// often in the middle of a publication holding the locks the event work takes next. As
+    /// their owner would not be running, the worker could not spin on them: it would sleep until
+    /// the submitter unlocks and then preempt it again, two context switches of the submitter per
+    /// completion.
     ///
-    /// Otherwise the queue is per-CPU and the event work runs on the CPU that queues it, as on
+    /// Otherwise the queue is per-CPU and the event work runs on the CPU it is queued on, as on
     /// `system_highpri_wq`.
-    fn new_events_queue(follows_submitter: bool) -> Result<workqueue::OwnedQueue> {
-        if follows_submitter {
+    fn new_events_queue(m5: bool) -> Result<workqueue::OwnedQueue> {
+        if m5 {
             workqueue::OwnedQueue::new_unbound_reclaim(c"aurora_g17_events", true)
         } else {
             workqueue::OwnedQueue::new_percpu_reclaim(c"aurora_g17_events", true)
@@ -1534,15 +1710,17 @@ impl Shared {
     }
 
     /// Whether each scheduler's submit queue should be restricted to the creating CPU's cluster
-    /// (multi-die M5 only).
+    /// (all but single-die M5).
     pub(super) fn pin_scheduler_cluster(&self) -> bool {
         self.pin_scheduler_cluster
     }
 
-    /// Records the publishing CPU for the event work's placement (M5).
+    /// Records the publishing CPU for the event work's placement.
     fn note_submitter(&self) {
-        if self.follows_submitter {
-            self.submitter.store(kernel::cpu::CpuId::current().as_u32(), Ordering::Relaxed);
+        let cpu = kernel::cpu::CpuId::current().as_u32();
+        // The completion side reads this line; write it only when the submitter moves.
+        if self.submitter.load(Ordering::Relaxed) != cpu {
+            self.submitter.store(cpu, Ordering::Relaxed);
         }
     }
 
@@ -1834,9 +2012,7 @@ impl Gpu {
         let render_policy = if m5 { Some(render_resources::M5Policy::new(&id)?) } else { None };
         // The bare-metal M5 boot runs both engines; other M5 profiles take no submission.
         let submits = !m5 || cfg.profile == FirmwareProfile::M5PublishedRoots;
-        // The event work follows the submitter on M5, which decides its queue's kind.
-        let follows_submitter = m5;
-        let events = Arc::new(Shared::new_events_queue(follows_submitter)?, GFP_KERNEL)?;
+        let events = Arc::new(Shared::new_events_queue(m5)?, GFP_KERNEL)?;
         let frequencies = Self::state_frequencies(dev, cfg, variant, id.num_clusters)?;
         let max_pstate = frequencies
             .as_ref()
@@ -1880,6 +2056,8 @@ impl Gpu {
                 poll <- new_delayed_work!("g17::Shared::poll"),
                 idle <- new_delayed_work!("g17::Shared::idle"),
                 governs: m5,
+                tracks_effort_wake: !m5 && submits,
+                full_effort_published: AtomicBool::new(false),
                 governor <- new_delayed_work!("g17::Shared::governor"),
                 governor_armed: AtomicBool::new(false),
                 governor_activity_ns: AtomicU64::new(0),
@@ -1889,8 +2067,7 @@ impl Gpu {
                     "g17::Shared::worker_deferred"
                 ),
                 render_collector <- new_mutex!(render_collector, "g17::Shared::render_collector"),
-                follows_submitter,
-                pin_scheduler_cluster: m5 && id.num_dies > 1,
+                pin_scheduler_cluster: !m5 || id.num_dies > 1,
                 submitter: AtomicU32::new(u32::MAX),
                 grow <- new_work!("g17::Shared::grow"),
                 reclaim_work <- new_work!("g17::Shared::reclaim_work"),
@@ -1957,6 +2134,7 @@ impl Gpu {
             .port
             .store(Arc::as_ptr(&firmware.port).cast_mut(), Ordering::Release);
         *gpu.shared.state.lock() = Some(firmware);
+        register_effort_target(&gpu.shared);
         gpu.shared.queue_events();
         Ok(gpu)
     }
@@ -2588,6 +2766,7 @@ impl Gpu {
 
     /// Stops the firmware and releases everything it used.
     pub(crate) fn shutdown(&self) {
+        unregister_effort_target(&self.shared);
         self.shared.feed.begin_shutdown();
         self.shared.preparations.remove();
         self.shared.stop_queues();
@@ -2665,6 +2844,7 @@ impl gpu::Gpu for Gpu {
             u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS)
                 | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS)
                 | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS)
+                | uapi::DRM_ASAHI_FEATURE_ORDERED_FRAGMENT_BARRIERS as u64
                 | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS)
                 | sync_output::FEATURE_CUMULATIVE_SIGNALS
                 | crate::file::DRM_ASAHI_FEATURE_COMPUTE_TIMEOUT;

@@ -56,7 +56,7 @@ config TYPEC_TIPD_KUNIT_TEST
 	  Also test that interrupt events which could not be read or cleared
 	  are still acknowledged, however long that keeps failing, so that the
 	  controller keeps raising its interrupt.
-	  Also test that a USB4/Thunderbolt router which never registers its
+	  Also test that a USB4/Thunderbolt router which has not registered its
 	  switch does not keep the port from probing.
 	  Also test that a Type-C state which a mux provider with transient
 	  timeouts holds up is applied again until it goes through, for up to

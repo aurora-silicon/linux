@@ -122,41 +122,67 @@ static bool v14_bl_ctx_machine_is(const void *ctx, const char *compat)
 	return !strcmp(((const char *const *)ctx)[1], compat);
 }
 
-/* Only admitted T6030, J516C and J613 internal panels carry levels. */
+/* The DCP's panel node compatible; NULL: no panel node. */
+static bool v14_bl_ctx_panel_is(const void *ctx, const char *compat)
+{
+	const char *panel = ((const char *const *)ctx)[2];
+
+	return panel && !strcmp(panel, compat);
+}
+
+/* Only admitted T6030, J516C and J613 internal panels and the J504 panel carry levels. */
 static void v14_bl_boards(struct kunit *test)
 {
-	static const char *const t6030_j516s[] = { "apple,t6030-dcp", "apple,j516s" };
-	static const char *const t6030_j514s[] = { "apple,t6030-dcp", "apple,j514s" };
-	static const char *const j613[] = { "apple,t8122-dcp", "apple,j613" };
-	static const char *const j615[] = { "apple,t8122-dcp", "apple,j615" };
-	static const char *const j516c[] = { "apple,t6031-dcp", "apple,j516c" };
-	static const char *const other_t6030[] = { "apple,t6030-dcp", "apple,other" };
+	static const char *const t6030_j516s[] = { "apple,t6030-dcp", "apple,j516s", NULL };
+	static const char *const t6030_j514s[] = { "apple,t6030-dcp", "apple,j514s", NULL };
+	static const char *const j613[] = { "apple,t8122-dcp", "apple,j613", NULL };
+	static const char *const j615[] = { "apple,t8122-dcp", "apple,j615", NULL };
+	static const char *const j504[] = { "apple,t8122-dcp", "apple,j504", "apple,panel-j504" };
+	static const char *const j504_no_panel[] = { "apple,t8122-dcp", "apple,j504", NULL };
+	static const char *const j516c[] = { "apple,t6031-dcp", "apple,j516c", NULL };
+	static const char *const other_t6030[] = { "apple,t6030-dcp", "apple,other", NULL };
 	const struct dcp_v14_board *board;
 	bool known;
 
-	board = dcp_v14_board_select(v14_bl_ctx_dcp_is, v14_bl_ctx_machine_is, t6030_j516s, &known);
+	board = dcp_v14_board_select(v14_bl_ctx_dcp_is, v14_bl_ctx_machine_is, v14_bl_ctx_panel_is,
+				     t6030_j516s, &known);
 	KUNIT_ASSERT_NOT_NULL(test, board);
 	KUNIT_EXPECT_TRUE(test, board->panel_nits);
 	KUNIT_EXPECT_TRUE(test, dcp_v14_panel_nits_admit(board, v14_bl_ctx_machine_is,
 							 t6030_j516s));
-	board = dcp_v14_board_select(v14_bl_ctx_dcp_is, v14_bl_ctx_machine_is, t6030_j514s, &known);
+	board = dcp_v14_board_select(v14_bl_ctx_dcp_is, v14_bl_ctx_machine_is, v14_bl_ctx_panel_is,
+				     t6030_j514s, &known);
 	KUNIT_ASSERT_NOT_NULL(test, board);
 	KUNIT_EXPECT_TRUE(test, board->panel_nits);
 	KUNIT_EXPECT_TRUE(test, dcp_v14_panel_nits_admit(board, v14_bl_ctx_machine_is,
 							 t6030_j514s));
-	board = dcp_v14_board_select(v14_bl_ctx_dcp_is, v14_bl_ctx_machine_is, other_t6030, &known);
+	board = dcp_v14_board_select(v14_bl_ctx_dcp_is, v14_bl_ctx_machine_is, v14_bl_ctx_panel_is,
+				     other_t6030, &known);
 	KUNIT_ASSERT_NOT_NULL(test, board);
 	KUNIT_EXPECT_FALSE(test, dcp_v14_panel_nits_admit(board, v14_bl_ctx_machine_is,
 							  other_t6030));
-	board = dcp_v14_board_select(v14_bl_ctx_dcp_is, v14_bl_ctx_machine_is, j613, &known);
+	board = dcp_v14_board_select(v14_bl_ctx_dcp_is, v14_bl_ctx_machine_is, v14_bl_ctx_panel_is,
+				     j613, &known);
 	KUNIT_ASSERT_NOT_NULL(test, board);
 	KUNIT_EXPECT_TRUE(test, board->panel_nits);
 	KUNIT_EXPECT_TRUE(test, dcp_v14_panel_nits_admit(board, v14_bl_ctx_machine_is, j613));
 	KUNIT_EXPECT_FALSE(test, dcp_v14_panel_nits_admit(board, v14_bl_ctx_machine_is, j615));
-	board = dcp_v14_board_select(v14_bl_ctx_dcp_is, v14_bl_ctx_machine_is, j615, &known);
+	board = dcp_v14_board_select(v14_bl_ctx_dcp_is, v14_bl_ctx_machine_is, v14_bl_ctx_panel_is,
+				     j615, &known);
 	KUNIT_ASSERT_NOT_NULL(test, board);
 	KUNIT_EXPECT_FALSE(test, board->panel_nits);
-	board = dcp_v14_board_select(v14_bl_ctx_dcp_is, v14_bl_ctx_machine_is, j516c, &known);
+	board = dcp_v14_board_select(v14_bl_ctx_dcp_is, v14_bl_ctx_machine_is, v14_bl_ctx_panel_is,
+				     j504, &known);
+	KUNIT_ASSERT_NOT_NULL(test, board);
+	KUNIT_EXPECT_TRUE(test, board->panel_nits);
+	KUNIT_EXPECT_TRUE(test, dcp_v14_panel_nits_admit(board, v14_bl_ctx_machine_is, j504));
+	/* The J504 record follows its panel node: without it the machine gets none. */
+	board = dcp_v14_board_select(v14_bl_ctx_dcp_is, v14_bl_ctx_machine_is, v14_bl_ctx_panel_is,
+				     j504_no_panel, &known);
+	KUNIT_EXPECT_NULL(test, board);
+	KUNIT_EXPECT_TRUE(test, known);
+	board = dcp_v14_board_select(v14_bl_ctx_dcp_is, v14_bl_ctx_machine_is, v14_bl_ctx_panel_is,
+				     j516c, &known);
 	KUNIT_ASSERT_NOT_NULL(test, board);
 	KUNIT_EXPECT_TRUE(test, board->panel_nits);
 	KUNIT_EXPECT_TRUE(test, dcp_v14_panel_nits_admit(board, v14_bl_ctx_machine_is, j516c));
