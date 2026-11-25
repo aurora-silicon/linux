@@ -216,6 +216,19 @@ int main(int argc, char **argv)
 		withdraw(&d30);
 		CHECK(d30.refs == 0 && link30(&g30) == -EPROBE_DEFER);
 		CHECK(link30(&g31) == -ENODEV);
+	} else if (!strcmp(scenario, "g16-t6030")) {
+		machine("apple,t6030", "apple,j516s");
+		disp30.available = false;
+		CHECK(prepare16(&g30) == 0 && links_made == 0);
+		nodes[2] = NULL;
+		CHECK(prepare16(&g30) == 0 && links_made == 0);
+		nodes[2] = &disp30;
+		disp30.available = true;
+		CHECK(prepare16(&g30) == -EPROBE_DEFER && links_made == 0);
+		CHECK(publish(&d30) == 0);
+		CHECK(prepare16(&g30) == 0 && links_made == 1 && last_link.supplier == &d30);
+		withdraw(&d30);
+		CHECK(prepare16(&g30) == -EPROBE_DEFER);
 	} else if (!strcmp(scenario, "t8132")) {
 		/* No handed-over display: G16 starts on the boot framebuffer, said once. */
 		machine("apple,t8132", "apple,j713");
@@ -247,7 +260,7 @@ int main(int argc, char **argv)
 }
 '''
 
-C_SCENARIOS = ["disabled", "absent", "pending", "ready", "isolation", "foreign", "t6030", "t8132"]
+C_SCENARIOS = ["disabled", "absent", "pending", "ready", "isolation", "foreign", "t6030", "g16-t6030", "t8132"]
 
 C_MUTANTS = {
     "unpublished-succeeds": ("if (!*display)\n\t\treturn -EPROBE_DEFER;", "if (!*display)\n\t\treturn 0;"),
@@ -258,8 +271,8 @@ C_MUTANTS = {
     "t8132-reads-t6031-slot": ("&apple_t8132_display);", "&apple_t6031_display);"),
     "t8132-published-as-t6031": ("return &apple_t8132_display;", "return &apple_t6031_display;"),
     "g16-ignores-handed-over-display": ("handed_over = np && of_device_is_available(np);", "handed_over = false;"),
-    "g16-waits-without-display": ("\t\treturn 0;\n\t}\n\tret = apple_drm_t8132_link_device(dev);",
-                                  "\t\treturn -EPROBE_DEFER;\n\t}\n\tret = apple_drm_t8132_link_device(dev);"),
+    "g16-waits-without-display": ("\t\treturn 0;\n\t}\n\tret = t6030 ? apple_drm_t6030_link_device(dev) : apple_drm_t8132_link_device(dev);",
+                                  "\t\treturn -EPROBE_DEFER;\n\t}\n\tret = t6030 ? apple_drm_t6030_link_device(dev) : apple_drm_t8132_link_device(dev);"),
     "no-machine-check": ("!of_machine_is_compatible(machine) ||", ""),
     "withdraw-keeps-display": ("*slot = NULL;", ";"),
     "publish-without-reference": ("*slot = get_device(dev);", "*slot = dev;"),

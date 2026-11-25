@@ -10,6 +10,8 @@
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/ioport.h>
+#include <linux/jiffies.h>
+#include <linux/ktime.h>
 #include <linux/mm.h>
 #include <linux/mfd/syscon.h>
 #include <linux/regmap.h>
@@ -19,12 +21,14 @@
 #include <linux/of_reserved_mem.h>
 #include <linux/pm_runtime.h>
 #include <linux/slab.h>
+#include <linux/spinlock.h>
 #include <linux/soc/apple/clpc.h>
 #include <linux/soc/apple/display.h>
 #include <linux/soc/apple/pmp-display.h>
 #include <linux/soc/apple/pmp-cooling.h>
 #include <linux/soc/apple/pmp-telemetry.h>
 #include <linux/thermal.h>
+#include <linux/workqueue.h>
 
 #include "glue.h"
 
@@ -36,9 +40,20 @@ void __iomem *asahi_g16_ioremap_wc(u64 start, size_t size);
 bool asahi_g16_dma_unsupported(struct device *dev);
 
 /* Thermal-framework callbacks only publish requests. The Rust GPU owner
- * samples the PMP provider and shared cooling policy under its device mutex;
- * thermal callbacks never enter the GPU lock.
+ * samples the PMP provider (when apple,pmp is present) or cached SoC die
+ * thermal-zone readings (otherwise) under its device mutex; thermal callbacks
+ * never enter the GPU lock and SMC/zone polling runs outside it.
  */
+#define ASAHI_G16_ZONE_POLL_FAST_MS	250
+#define ASAHI_G16_ZONE_POLL_IDLE_MS	1000
+#define ASAHI_G16_ZONE_HOT_POLL_MC	75000
+#define ASAHI_G16_ZONE_STALE_NS		3000000000ULL
+
+static const char * const asahi_g16_die_zones[] = {
+	"macsmc_soc_die",
+	"apple_pmp_hotspot",
+};
+
 struct asahi_g16_cooling {
 	atomic_t state;
 	struct apple_pmp_gpu *pmp;
@@ -48,6 +63,14 @@ struct asahi_g16_cooling {
 	/* The last reading from a sensor that was valid, and when. */
 	u64 valid_ns;
 	long valid_mc;
+	/* Cached thermal-zone telemetry when no apple,pmp node is present. */
+	spinlock_t zone_lock;
+	struct delayed_work zone_poll;
+	atomic_t zone_active;
+	atomic_t stopping;
+	u64 zone_ns;
+	long zone_mc;
+	int zone_err;
 };
 
 struct asahi_g16_cooling *asahi_g16_cooling_register(struct device *dev);
@@ -92,6 +115,55 @@ static const struct thermal_cooling_device_ops asahi_g16_cooling_ops = {
 	.set_cur_state = asahi_g16_cooling_set,
 };
 
+static void asahi_g16_zone_poll_fn(struct work_struct *work)
+{
+	struct asahi_g16_cooling *cooling =
+		container_of(to_delayed_work(work), struct asahi_g16_cooling,
+			     zone_poll);
+	long hottest = 0;
+	bool found = false;
+	int ret = -ENODEV;
+	unsigned int i;
+	unsigned int delay_ms;
+
+	if (atomic_read(&cooling->stopping))
+		return;
+
+	for (i = 0; i < ARRAY_SIZE(asahi_g16_die_zones); i++) {
+		int temp = 0;
+		int err = thermal_zone_get_temp_by_name(asahi_g16_die_zones[i],
+							&temp);
+
+		if (!err) {
+			if (!found || temp > hottest)
+				hottest = temp;
+			found = true;
+		} else if (err != -ENODEV) {
+			ret = err;
+			found = false;
+			break;
+		}
+	}
+	if (found)
+		ret = 0;
+
+	spin_lock(&cooling->zone_lock);
+	cooling->zone_ns = ktime_get_ns();
+	cooling->zone_mc = found ? hottest : 0;
+	cooling->zone_err = ret;
+	spin_unlock(&cooling->zone_lock);
+
+	if (atomic_read(&cooling->stopping))
+		return;
+
+	delay_ms = (ret || atomic_read(&cooling->zone_active) ||
+		    hottest >= ASAHI_G16_ZONE_HOT_POLL_MC) ?
+			   ASAHI_G16_ZONE_POLL_FAST_MS :
+			   ASAHI_G16_ZONE_POLL_IDLE_MS;
+	queue_delayed_work(system_freezable_wq, &cooling->zone_poll,
+			   msecs_to_jiffies(delay_ms));
+}
+
 struct asahi_g16_cooling *asahi_g16_cooling_register(struct device *dev)
 {
 	struct asahi_g16_cooling *cooling;
@@ -100,46 +172,67 @@ struct asahi_g16_cooling *asahi_g16_cooling_register(struct device *dev)
 	cooling = kzalloc_obj(*cooling);
 	if (!cooling)
 		return ERR_PTR(-ENOMEM);
-	atomic_set(&cooling->state, 8);
 	apple_pmp_cooling_init(&cooling->policy);
+	spin_lock_init(&cooling->zone_lock);
+	INIT_DELAYED_WORK(&cooling->zone_poll, asahi_g16_zone_poll_fn);
+	cooling->zone_err = -ENODATA;
 	cooling->pmp_node = of_parse_phandle(dev->of_node, "apple,pmp", 0);
-	if (!cooling->pmp_node) {
-		ret = -EINVAL;
-		goto free;
-	}
-	cooling->pmp = apple_pmp_gpu_get(dev);
-	if (IS_ERR(cooling->pmp)) {
-		ret = PTR_ERR(cooling->pmp);
-		goto put_node;
+	if (cooling->pmp_node) {
+		atomic_set(&cooling->state, 8);
+		cooling->pmp = apple_pmp_gpu_get(dev);
+		if (IS_ERR(cooling->pmp)) {
+			ret = PTR_ERR(cooling->pmp);
+			goto put_node;
+		}
+	} else {
+		/*
+		 * Without an apple,pmp supplier, thermal-zone telemetry drives
+		 * the fail-closed backstop (starting at maximum cooling) while
+		 * the cooling device remains available to thermal policy.
+		 */
+		atomic_set(&cooling->state, 0);
 	}
 	cooling->cdev = thermal_of_cooling_device_register(dev->of_node, 0,
 							  "aurora-g16g", cooling,
 							  &asahi_g16_cooling_ops);
 	if (IS_ERR(cooling->cdev)) {
 		ret = PTR_ERR(cooling->cdev);
-		apple_pmp_gpu_put(cooling->pmp);
+		if (cooling->pmp)
+			apple_pmp_gpu_put(cooling->pmp);
 		goto put_node;
 	}
+	if (!cooling->pmp_node)
+		queue_delayed_work(system_freezable_wq, &cooling->zone_poll, 0);
 	return cooling;
 put_node:
 	of_node_put(cooling->pmp_node);
-free:
 	kfree(cooling);
 	return ERR_PTR(ret);
 }
 
 void asahi_g16_cooling_unregister(struct asahi_g16_cooling *cooling)
 {
+	atomic_set(&cooling->stopping, 1);
+	if (!cooling->pmp_node)
+		cancel_delayed_work_sync(&cooling->zone_poll);
 	thermal_cooling_device_unregister(cooling->cdev);
-	apple_pmp_gpu_put(cooling->pmp);
+	if (cooling->pmp)
+		apple_pmp_gpu_put(cooling->pmp);
 	of_node_put(cooling->pmp_node);
 	kfree(cooling);
+}
+
+bool asahi_g16_cooling_has_pmp(const struct asahi_g16_cooling *cooling)
+{
+	return cooling->pmp_node != NULL;
 }
 
 /* Serialized by the GPU owner. Provider lifetime and MMIO access stay with
  * PMP: this consumer owns no SRAM mapping and cannot restart its firmware.
  * An idle GPU samples about twice a second and makes no heat, so with nothing
  * in flight the last cool reading stands for as long as the sensors stay dark.
+ * Without apple,pmp, return the latest cached SoC die thermal-zone reading and
+ * fail closed whenever no fresh reading is available.
  */
 int asahi_g16_cooling_sample(struct asahi_g16_cooling *cooling, u64 now, bool idle,
 			    long *temperature, u32 *governor, u32 *power,
@@ -148,6 +241,34 @@ int asahi_g16_cooling_sample(struct asahi_g16_cooling *cooling, u64 now, bool id
 	int ret;
 
 	*temperature = 0;
+	if (!cooling->pmp_node) {
+		u64 zone_ns;
+		long zone_mc;
+		int zone_err;
+
+		atomic_set(&cooling->zone_active, !idle);
+		spin_lock(&cooling->zone_lock);
+		zone_ns = cooling->zone_ns;
+		zone_mc = cooling->zone_mc;
+		zone_err = cooling->zone_err;
+		spin_unlock(&cooling->zone_lock);
+
+		if (!zone_ns)
+			ret = -ENODATA;
+		else if (zone_err)
+			ret = zone_err;
+		else if (now > zone_ns && now - zone_ns > ASAHI_G16_ZONE_STALE_NS)
+			ret = -ETIMEDOUT;
+		else {
+			*temperature = zone_mc;
+			ret = 0;
+		}
+		*governor = atomic_read(&cooling->state);
+		*power = 0;
+		*backstop = 8;
+		return ret;
+	}
+
 	ret = apple_pmp_telemetry_get_hotspot(cooling->pmp_node, temperature);
 	if (!ret) {
 		cooling->valid_ns = now;
@@ -226,20 +347,24 @@ u32 asahi_g16_timebase_hz(void)
  */
 int asahi_g16_display_prepare(struct device *dev)
 {
+	bool t6030 = of_device_is_compatible(dev->of_node, "apple,agx-t6030");
 	struct device_node *np;
 	bool handed_over;
 	int ret;
 
-	np = of_find_compatible_node(NULL, NULL, "apple,t8132-display-subsystem");
+	np = of_find_compatible_node(NULL, NULL,
+				     t6030 ? "apple,t6030-display-subsystem" :
+					     "apple,t8132-display-subsystem");
 	handed_over = np && of_device_is_available(np);
 	of_node_put(np);
 	if (!handed_over) {
 		dev_info_once(dev, "G16: no native display this boot; starting on the boot framebuffer\n");
 		return 0;
 	}
-	ret = apple_drm_t8132_link_device(dev);
+	ret = t6030 ? apple_drm_t6030_link_device(dev) : apple_drm_t8132_link_device(dev);
 	if (ret == -EPROBE_DEFER)
-		dev_info_once(dev, "G16: waiting for the T8132 native display to register\n");
+		dev_info_once(dev, "G16: waiting for the %s native display to register\n",
+			      t6030 ? "T6030" : "T8132");
 	return ret;
 }
 

@@ -74,6 +74,7 @@ fn input(performance: wire::Performance) -> wire::Input {
         loader_va: core::array::from_fn(|i| if wire::LOADERS[i].length==0 {0} else {HOST+0x5000000+i as u64*0x100000+(wire::LOADERS[i].pa&0x3fff)}),
         scratch: HOST+0xa000000, lower_uma: wire::BOOTSTRAP_START,
         lower_parameter: wire::BOOTSTRAP_START+0x8000, ktrace_mask:0, progress_recovery:1,
+        enabled_cores: 10,
         power_sample_clks:200_000, power_sample_us:8333, power_sample_period_ms:8,
         timebase_khz:24_000, avg_power_filter_tc_ms:248, lowpeak_limiter_tc_ms:16,
         lowpeak_limiter_ki_q16:134_217, lowpeak_limiter_kp_q16:33_554, coredump_copy_size:0x8000,
@@ -155,6 +156,69 @@ fn j773g(core: [u32; 16], sram: [u32; 16]) -> perf::Source {
     // Rows past the count must stay zero, and the count must match the rows.
     let mut p=tables(); p.frequency[10]=1500; assert!(!p.valid());
     let mut p=tables(); p.count=11; assert!(!p.valid());
+}
+#[test]
+fn g15s_power_config_uses_the_encoded_ceiling_and_machine_adt_limiter() {
+    let mut performance = tables();
+    performance.count = 9;
+    performance.frequency[9..].fill(0);
+    performance.auxiliary[9..].fill(0);
+    performance.voltage[9..].fill(0);
+    performance.sram[9..].fill(0);
+
+    let layout = &wire::G15S_26B123;
+    let mut input = input(performance);
+    input.enabled_cores = 18;
+    // T6030 ADT /arm-io/pmgr/clpc & /arm-io/sgx limiter properties (24 MHz timebase).
+    input.avg_power_filter_tc_ms = 300;
+    input.lowpeak_limiter_tc_ms = 30;
+    input.lowpeak_limiter_ki_q16 = 171_128;
+    input.lowpeak_limiter_kp_q16 = 11_073;
+    for (i, loader) in layout.loaders.iter().enumerate() {
+        input.loader_va[i] = if loader.length != 0 && layout.slot(i).is_some() {
+            wire::HOST_START + 0x5000000 + i as u64 * 0x100000 + (loader.pa & 0x3fff)
+        } else {
+            0
+        };
+    }
+    let mut buffers = layout.object_size.map(|size| vec![0; size]);
+    wire::encode_for(layout, &mut buffers.each_mut().map(|b| b.as_mut_slice()), &input, 8).unwrap();
+    let power = &buffers[wire::id::POWER_PERFORMANCE];
+    assert_eq!(get32(power, 0x04), 200_000);
+    assert_eq!(get32(power, 0x08), 200_000);
+    assert_eq!(get32(power, 0xb90), 800);
+    assert_eq!(get32(power, 0x2c), 8);
+    assert_eq!(get32(power, 0x30), 8);
+    // Average-power filter: (300 * 1000) / 8333 = 36 samples -> 144, 35/36, 1/36.
+    assert_eq!(get32(power, 0x29e4), 36 * 4);
+    assert_eq!(get32(power, 0x29f0), wire::f32_bits(35, 36));
+    assert_eq!(get32(power, 0x29f8), wire::f32_bits(1, 36));
+    // Low-peak limiter: 30 / 8 = 3 periods -> 12, 2/3, 1/3, ki*dt, kp, 30 ms, 576000 clks.
+    assert_eq!(get32(power, 0xa80), 3 * 4);
+    assert_eq!(get32(power, 0xa8c), wire::f32_bits(2, 3));
+    assert_eq!(get32(power, 0xa94), wire::f32_bits(1, 3));
+    assert_eq!(get32(power, 0xa9c), wire::f32_bits(171_128 * 8, 65536 * 1000));
+    assert_eq!(get32(power, 0xaac), wire::f32_bits(11_073, 65536));
+    assert_eq!(get32(power, 0xad8), 30);
+    assert_eq!(get32(power, 0xae0), 3 * 8 * 24_000);
+
+    // Missing ADT power limiter / sampling inputs must fail closed on G15S as well.
+    for bad in 0..5 {
+        let mut bad_input = wire::Input {
+            performance: input.performance.clone(),
+            ..input
+        };
+        match bad {
+            0 => bad_input.avg_power_filter_tc_ms = 0,
+            1 => bad_input.lowpeak_limiter_tc_ms = 0,
+            2 => bad_input.lowpeak_limiter_ki_q16 = 0,
+            3 => bad_input.lowpeak_limiter_kp_q16 = 0,
+            _ => bad_input.power_sample_period_ms = 0,
+        }
+        let mut out_bufs = layout.object_size.map(|size| vec![0xa5; size]);
+        assert!(wire::encode_for(layout, &mut out_bufs.each_mut().map(|b| b.as_mut_slice()), &bad_input, 8).is_err());
+        assert!(out_bufs.iter().all(|b| b.iter().all(|&x| x == 0xa5)));
+    }
 }
 #[test] fn different_real_bin_values_reach_all_firmware_lanes() {
     let mut raw=MEASURED.to_vec();
@@ -294,7 +358,7 @@ run = subprocess.run([str(binary), '--test-threads=1'], text=True, capture_outpu
 print(run.stdout, end='')
 print(run.stderr, end='')
 run.check_returncode()
-report = {'passed': True, 'test_groups': 10, 'hardware_validated': False,
+report = {'passed': True, 'test_groups': 12, 'hardware_validated': False,
           'fixture_sha256': sha(fixture), 'original_adt_sha256': metadata['provenance']['source_sha256'],
           'production_sha256': {str(p.relative_to(root)): sha(p) for p in
               [backend / 'adt.rs', backend / 'adt/perf.rs', backend / 'board.rs', backend / 'board/data.rs', backend / 'initdata.rs', backend / 'fw/initdata.rs']}}

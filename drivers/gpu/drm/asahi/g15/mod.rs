@@ -202,10 +202,20 @@ impl platform::Driver for Driver<'_> {
         // after probe_g15 started firmware would return an unbound device.
         try_pin_init!(Driver {
             _driver: {
+                let cfg = *info.ok_or(ENODEV)?;
+                if cfg.chip_id == 0x6030
+                    && pdev.as_ref().of_node().is_some_and(|node| {
+                        !matches!(
+                            node.get_opt_property::<u32>(c_str!("apple,g16-handoff-version")),
+                            Ok(None)
+                        )
+                    })
+                {
+                    return Err(ENODEV);
+                }
                 if !MODULE_READY.load(Ordering::Acquire) {
                     return Err(EPROBE_DEFER);
                 }
-                let cfg = *info.ok_or(ENODEV)?;
                 dev_info!(pdev.as_ref(), "G15: probing ({})\n", cfg.name);
                 match crate::driver::AsahiPlatformDriver::probe_g15(pdev, cfg) {
                     Ok(driver) => Some(driver),

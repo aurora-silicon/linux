@@ -533,8 +533,8 @@ impl Session {
         self.while_powered(regs::Regs::engine_state)
     }
 
-    /// All eight engine fault banks, for a firmware halted for recovery, or `None` while the GPU
-    /// is powered down.
+    /// All supported engine fault banks while firmware is halted for recovery,
+    /// or `None` while the GPU is powered down.
     pub(crate) fn fault_scan(&self) -> Result<Option<regs::FaultScan>> {
         self.while_powered(regs::Regs::fault_scan)
     }
@@ -543,6 +543,11 @@ impl Session {
     /// boot has completed and the firmware may idle-power-off the GPU, the access is guarded by
     /// [`Self::while_powered`], returning `EAGAIN` if the GPU is currently powered down.
     pub(crate) fn set_generation(&self, value: u32) -> Result {
+        // On G15S this word belongs to submit channel 0. The device-control
+        // producer is supplied by its separate InitData pointer.
+        if self.adt.layout.initdata.tx == super::fw::initdata::TxLayout::RingHeader {
+            return Ok(());
+        }
         if !self.booted {
             return self.regs.set_generation(value);
         }
@@ -675,13 +680,18 @@ pub(crate) fn admit(
     if power_offset != cfg.power_offset || (power_state >> 4) & 0xf != 0xf {
         dev_err!(
             dev,
-            "M4 GFX domain not admitted: register{:#x} state{:#x}\n",
+            "GFX domain not admitted: register{:#x} state{:#x}\n",
             power_offset,
             power_state
         );
         return Err(Error::from_errno(-(bindings::EHOSTDOWN as i32)));
     }
-    dev_info!(dev, "T8132 G16G admitted, ASC={:#x}\n", regs.asc_control()?);
+    dev_info!(
+        dev,
+        "T{:x} GPU admitted, ASC={:#x}\n",
+        cfg.chip_id,
+        regs.asc_control()?
+    );
     Ok(KBox::init(init!(Admitted { regs, adt }), GFP_KERNEL)?)
 }
 
@@ -768,6 +778,7 @@ fn run(
     session: &mut Session,
     events: &mut Events,
     built: &mut (InitData, Channels, u32),
+    cfg: &Config,
     log_buffer: Option<(u64, usize)>,
 ) -> Result {
     let dev = session.dev.clone();
@@ -816,12 +827,13 @@ fn run(
         return Err(eproto());
     }
     if kind == hw::Start::MacOs27_2 {
-        let probe = session.regs.publish_host_block()?;
-        dev_info!(
-            dev,
-            "G16: 27.2 host block published, scratch {:#x}\n",
-            probe
-        );
+        if let Some(probe) = session.regs.publish_host_block(cfg)? {
+            dev_info!(
+                dev,
+                "G16: 27.2 host block published, scratch {:#x}\n",
+                probe
+            );
+        }
     }
     session.rtkit.start_endpoint(hw::ep::FIRMWARE)?;
     session.rtkit.start_endpoint(hw::ep::DOORBELL)?;
@@ -847,7 +859,13 @@ fn run(
         hw::ep::FIRMWARE,
         hw::ep::INITDATA | (root & hw::ep::INITDATA_ADDR_MASK),
     )?;
-    session.send(hw::ep::DOORBELL, 0x0083000000000011)?;
+    let g15s_channels = init.layout.tx == super::fw::initdata::TxLayout::RingHeader;
+    let init_kick = if g15s_channels {
+        hw::engine::DEVCTL_DOORBELL
+    } else {
+        hw::engine::DEVCTL_INIT_DOORBELL
+    };
+    session.send(hw::ep::DOORBELL, init_kick)?;
     wait_boot_control(session, channels, events, init, 1, 5000)?;
     let base = 1;
     let scheduler = init.control.as_ref().ok_or(EINVAL)?;
@@ -880,7 +898,12 @@ fn run(
     regs::wmb();
     devctl_op(session, channels, events, init, devctl.start)?;
     wait_boot_control(session, channels, events, init, base + 2, 2000)?;
-    session.send(hw::ep::DOORBELL, 0x0083000000000010)?;
+    let receive_kick = if g15s_channels {
+        hw::engine::G15S_RECEIVE_DOORBELL
+    } else {
+        hw::engine::RECEIVE_DOORBELL
+    };
+    session.send(hw::ep::DOORBELL, receive_kick)?;
     for _ in 0..10 {
         fsleep(Delta::from_millis(10));
         channels.drain_rings(&dev, events)?;
@@ -976,7 +999,8 @@ pub(crate) fn start(
     let id = regs.identity()?;
     dev_info!(
         d,
-        "M4 G16G: power acknowledged, version={:#x} counts={:#x} core-mask={:#x}\n",
+        "T{:x}: power acknowledged, version={:#x} counts={:#x} core-mask={:#x}\n",
+        cfg.chip_id,
         id.version,
         id.counts,
         id.cores
@@ -988,21 +1012,21 @@ pub(crate) fn start(
     {
         dev_err!(
             d,
-            "unsupported G16G hardware: version {:#x} counts {:#x}\n",
+            "unsupported GPU hardware: version {:#x} counts {:#x}\n",
             id.version,
             id.counts
         );
         return Err(eproto());
     }
-    if id.cores >> cfg.core_slots() != 0
-        || id.core_masks[..cfg.num_clusters as usize].contains(&0)
+    if id.cores >> cfg.core_slots() != 0 || id.core_masks[..cfg.num_clusters as usize].contains(&0)
     {
-        dev_err!(d, "implausible G16G core mask {:#x}\n", id.cores);
+        dev_err!(d, "implausible GPU core mask {:#x}\n", id.cores);
         return Err(eproto());
     }
     dev_info!(
         d,
-        "M4 G16G: {} cores enabled\n",
+        "T{:x}: {} cores enabled\n",
+        cfg.chip_id,
         id.cores.count_ones()
     );
     if regs.pstate()? > regs.top() {
@@ -1073,18 +1097,21 @@ pub(crate) fn start(
     let result = (|| {
         events.reserve()?;
         // Every host object and every context-0 alias is prepared before RUN is set.
-        built = Some(initdata::build(&d, &session.adt, &session.regs, &mut objects)?);
+        built = Some(initdata::build(
+            &d,
+            &session.adt,
+            cfg,
+            &session.regs,
+            id.cores.count_ones(),
+            &mut objects,
+        )?);
         if let Some((init, _, _)) = built.as_ref() {
             // The running firmware may report any state of the board's table, up to S10 on J773g.
             session.regs.set_table(init.rows);
         }
         let log_buffer = match kind {
             hw::Start::MacOs27_2 => {
-                let log_size = session
-                    .adt
-                    .performance
-                    .coredump_copy_size
-                    .ok_or(EINVAL)? as usize;
+                let log_size = session.adt.performance.coredump_copy_size.ok_or(EINVAL)? as usize;
                 let va = objects
                     .alloc(Request {
                         size: log_size,
@@ -1116,6 +1143,7 @@ pub(crate) fn start(
             &mut session,
             &mut events,
             built.as_mut().ok_or(EINVAL)?,
+            cfg,
             log_buffer,
         )?;
         session.booted = true;

@@ -108,7 +108,7 @@ pub(crate) fn fill(gpu: &Gpu, params: &mut uapi::drm_asahi_params_global) -> Res
     params.num_cores_per_cluster = gpu.cfg.num_cores_per_cluster;
     params.max_frequency_khz = gpu.max_frequency_khz;
     params.usc_generation = 3;
-    params.gpu_hal_generation = uapi::drm_asahi_gpu_hal_generation_DRM_ASAHI_GPU_HAL_200;
+    params.gpu_hal_generation = gpu.cfg.gpu_hal_generation;
     params.max_commands_per_submission = super::command::MAX_COMMANDS;
     params.max_attachments = hw::sizes::MAX_ATTACHMENTS as u32;
     for (i, mask) in gpu.id.core_masks.iter().enumerate() {

@@ -7,13 +7,21 @@ extern crate self as kernel;
 pub mod prelude { pub type Result<T=()> = core::result::Result<T,i32>; pub const E2BIG:i32=7; }
 mod uapi {include!("public-uapi.rs");}
 mod hw {
-    pub enum GpuVariant {G}
+    pub enum GpuVariant {G, S}
     pub mod engine {pub const COMPUTE_SEED:u32=0x100;}
     pub mod client {pub const PB_HEAP_SIZE:u64=0x10000000;}
     pub(crate) use super::backend_hw::FwAbi;
 }
 mod fwid {
 @FWID_BUILD@
+}
+mod adt {
+    #[path = "@KERNEL@/drivers/gpu/drm/asahi/g16/adt/perf.rs"]
+    pub mod perf;
+}
+mod board {
+    #[path = "@KERNEL@/drivers/gpu/drm/asahi/g16/board/data.rs"]
+    pub mod data;
 }
 #[path = "@KERNEL@/drivers/gpu/drm/asahi/g16/hw.rs"]
 mod backend_hw;
@@ -60,6 +68,7 @@ fn input() -> wire::Input {
         lower_parameter: wire::BOOTSTRAP_START + 0x240000,
         ktrace_mask: 0x12345678,
         progress_recovery: 1,
+        enabled_cores: 10,
         // T8132 ADT sgx and pmgr/clpc power-sampling and low-peak limiter parameters (24 MHz).
         power_sample_clks: 200_000,
         power_sample_us: 8333,
@@ -316,7 +325,7 @@ fn catalog() {
     assert_eq!((a.import_globals, a.start, a.nop, a.grow_reply), (0x34, 0x0a, 0x1a, 7));
     assert_eq!((b.import_globals, b.start, b.nop, b.grow_reply), (0x35, 0x0a, 0x19, 7));
     // FirmwareData, selectors, register map.
-    let (v25, v26) = (FwAbi::V25G83.initdata(), FwAbi::V26B123.initdata());
+    let (v25, v26) = (FW_25G83.initdata, FW_26B123.initdata);
     let (d25, d26) = (&v25.firmware_data, &v26.firmware_data);
     assert_eq!((d25.fwctl, d25.generation, d25.phase, d25.scheduler, d25.snapshot), (0x4f88, 0x4fa0, 0x4fb0, 0x4fd4, 0x40b8));
     assert_eq!((d26.fwctl, d26.generation, d26.phase, d26.scheduler, d26.snapshot), (0x5168, 0x5180, 0x5190, 0x51b4, 0x4298));

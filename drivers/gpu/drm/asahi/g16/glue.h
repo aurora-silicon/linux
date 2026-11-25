@@ -2,6 +2,9 @@
 #ifndef _ASAHI_G16_GLUE_H
 #define _ASAHI_G16_GLUE_H
 
+struct asahi_g16_cooling;
+
 u32 asahi_g16_timebase_hz(void);
+bool asahi_g16_cooling_has_pmp(const struct asahi_g16_cooling *cooling);
 
 #endif /* _ASAHI_G16_GLUE_H */

@@ -16,15 +16,20 @@ use kernel::{device, prelude::*};
 /// The firmware DVFS row count is derived directly from the preserved ADT table shape rather
 /// than from a board compatible check; differently shaped tables or inconsistent voltage pairs
 /// fail before publication.
-pub(crate) fn qualify(dev: &device::Device, adt: &GpuAdt) -> Result<Performance> {
-    let (performance, layout) = data::select_named(&adt.performance).map_err(|error| {
-        dev_err!(
-            dev,
-            "M4 original ADT performance layout rejected: {:?}\n",
-            error
-        );
-        EINVAL
-    })?;
+pub(crate) fn qualify(
+    dev: &device::Device,
+    adt: &GpuAdt,
+    source_layout: data::SourceLayout,
+) -> Result<Performance> {
+    let (performance, layout) =
+        data::select_for(&adt.performance, source_layout).map_err(|error| {
+            dev_err!(
+                dev,
+                "M4 original ADT performance layout rejected: {:?}\n",
+                error
+            );
+            EINVAL
+        })?;
     dev_info!(
         dev,
         "M4 ADT DVFS: {} source states -> {} firmware rows ({} layout), top {} MHz\n",

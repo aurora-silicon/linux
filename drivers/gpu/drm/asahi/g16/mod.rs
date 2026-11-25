@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! G16 GPU support (T8132, M4: J713 and J773g; the qualified 25G83 firmware, and the 26B123
-//! firmware's ABI, whose start is refused until its remaining unknowns are known).
+//! Classic GPU support for T8132 G16G (25G83 and 26B123) and T6030 G15S (26B123).
 //!
-//! G16 firmware is *classic*: one ring per engine (TA, FS, compute) and ordering expressed by
+//! Classic firmware uses one ring per engine (TA, FS, compute) and expresses ordering through
 //! in-ring barrier records that wait on another queue's stamp, unlike the G17 kick-ring/QID
 //! model. The boot loader leaves the firmware loaded; this driver identifies the exact build,
-//! adopts the inherited UAT handoff and builds the M4 initdata graph
+//! adopts the inherited UAT handoff and builds the InitData graph
 //! and brings the firmware to READY. All logical queues and VMs share one persistent compute
 //! graph and one render graph; the commands of a submission are encoded into compute and pass
 //! slots and published as *prefixes* on the firmware's queues, then retired on their stamps.
@@ -15,8 +14,9 @@
 //!
 //! # Plugging into the shared driver
 //!
-//! - [`Driver`] is a separate platform driver for `apple,agx-t8132` with a module alias. Its
-//!   probe waits for the PMP supplier and the native display before booting firmware. It calls
+//! - [`Driver`] matches `apple,agx-t8132` and `apple,agx-t6030`. T6030 selects this backend
+//!   through the boot loader's handoff marker. Probe links a handed-over native display and, on
+//!   T8132, the PMP supplier before booting firmware. It calls
 //!   [`crate::driver::AsahiPlatformDriver::probe_g16`].
 //! - [`Gpu`] implements [`crate::gpu::Gpu`]: GET_PARAMS identity, VM creation (`new_vm`),
 //!   queues (`new_queue`, see [`queue`]) and timestamp buffers.
@@ -101,18 +101,27 @@ pub(crate) const DRIVER_NAME: &CStr = c_str!("aurora-g16");
 pub(crate) use hw::Config;
 
 /// OF match table of the G16 platform driver.
-const OF_TABLE: kernel::device_id::IdArray<of::DeviceId, &'static Config, 1> =
-    kernel::device_id::IdArray::new([(
-        of::DeviceId::new(c_str!("apple,agx-t8132")),
-        &&hw::t8132::CONFIG,
-    )]);
+const OF_TABLE: kernel::device_id::IdArray<of::DeviceId, &'static Config, 2> =
+    kernel::device_id::IdArray::new([
+        (
+            of::DeviceId::new(c_str!("apple,agx-t8132")),
+            &&hw::t8132::CONFIG,
+        ),
+        (
+            of::DeviceId::new(c_str!("apple,agx-t6030")),
+            &&hw::t6030::CONFIG,
+        ),
+    ]);
 
 // Probe admission waits for the PMP supplier and the native display before
 // firmware starts, so the module may be loaded at device creation.
 kernel::of_device_table!(
     AUTOLOAD_OF_TABLE,
     @none,
-    [of::DeviceId::new(c_str!("apple,agx-t8132"))]
+    [
+        of::DeviceId::new(c_str!("apple,agx-t8132")),
+        of::DeviceId::new(c_str!("apple,agx-t6030")),
+    ]
 );
 
 /// The G16 platform driver: the shared [`AsahiPlatformDriver`] probed through
@@ -142,6 +151,9 @@ impl platform::Driver for Driver {
         info: Option<&'bound Self::IdInfo>,
     ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
         let cfg = *info.ok_or(ENODEV)?;
+        if cfg.needs_handoff_marker && !adt::has_handoff(pdev.as_ref()) {
+            return Err(ENODEV);
+        }
         dev_info!(pdev.as_ref(), "G16: probing\n");
         match AsahiPlatformDriver::probe_g16(pdev, cfg) {
             Ok(driver) => Ok(Some(driver)),

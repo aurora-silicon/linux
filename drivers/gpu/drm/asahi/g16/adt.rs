@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! J713's explicit boot-loader GPU handoff.
+//! Explicit boot-loader GPU handoff.
 //!
-//! Unlike the synthesized T6030 node, J713 supplies six named no-map reservations and an
-//! explicit segment/handoff ABI. Admit those reservations before mapping anything. The
-//! performance-state source is the machine's original ADT, preserved by m1n1 in the named
-//! phram reservation. It is copied and parsed before any firmware-visible write.
+//! The boot loader supplies six named no-map reservations and an explicit
+//! segment/handoff ABI. Admission checks the reservations before mapping.
+//! The boot loader preserves the original ADT in the named phram reservation.
+//! The driver copies and parses it before any firmware-visible write.
 
 #[path = "adt/perf.rs"]
 pub(crate) mod perf;
@@ -120,6 +120,17 @@ fn performance_source(regions: &[Range<u64>]) -> Result<(KVVec<u8>, u64)> {
     Ok((copy?, start))
 }
 
+/// Whether the boot loader selected this backend. Presence is enough to route probe;
+/// admission independently validates the property and the complete handoff.
+pub(super) fn has_handoff(dev: &device::Device) -> bool {
+    dev.of_node().is_some_and(|node| {
+        !matches!(
+            node.get_opt_property::<u32>(c_str!("apple,g16-handoff-version")),
+            Ok(None)
+        )
+    })
+}
+
 /// The boot loader's handoff for the loaded firmware: its version, segment VAs and flags.
 fn handoff(dev: &device::Device) -> Result<(u32, KVec<u64>, KVec<u32>)> {
     let node = dev.of_node().ok_or(EINVAL)?;
@@ -145,7 +156,8 @@ pub(crate) fn read(dev: &device::Device, cfg: &Config) -> Result<KBox<GpuAdt>> {
     let (version, vas, flags) = handoff(dev)?;
     let names: KVec<u8> = node.get_property(c_str!("memory-region-names"))?;
     let phandles: KVec<u32> = node.get_property(c_str!("memory-region"))?;
-    let layout = cfg.layouts
+    let layout = cfg
+        .layouts
         .iter()
         .copied()
         .find(|layout| layout.matches(version, &vas, &flags));

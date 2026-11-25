@@ -304,6 +304,116 @@ impl Governor {
     }
 }
 
+/// Plausible SoC die temperature range (millidegrees Celsius) for thermal-zone cooling.
+pub(crate) const ZONE_PLAUSIBLE_MIN_MC: i64 = 10_000;
+pub(crate) const ZONE_PLAUSIBLE_MAX_MC: i64 = 125_000;
+/// Thermal-zone cooling thresholds (millidegrees Celsius) for SoCs without an `apple,pmp`
+/// telemetry bridge. Kept conservative relative to the GPU die target because SMC die
+/// sensors can read cooler than the hottest GPU spot.
+pub(crate) const ZONE_RELEASE_MC: i64 = 75_000;
+pub(crate) const ZONE_HOT_MC: i64 = 80_000;
+pub(crate) const ZONE_STEP_MC: i64 = 2_000;
+pub(crate) const ZONE_FULL_COOLING_MC: i64 = ZONE_HOT_MC + (COOLING_MAX as i64 - 1) * ZONE_STEP_MC;
+/// Startup/fault confirmation cadence (20 ms x 10 = 200 ms) and gradual release step.
+pub(crate) const ZONE_CONFIRM_NS: u64 = 20_000_000;
+pub(crate) const ZONE_CONFIRM_READS: u32 = 10;
+pub(crate) const ZONE_RELEASE_NS: u64 = 200_000_000;
+
+/// Cooling level for a measured thermal-zone die temperature: 0 below 80 C, 1..=7 from
+/// 80..94 C in 2 C steps, and [`COOLING_MAX`] at or above 94 C.
+pub(crate) fn zone_heat_level(mc: i64) -> u32 {
+    if mc < ZONE_HOT_MC {
+        0
+    } else if mc >= ZONE_FULL_COOLING_MC {
+        COOLING_MAX
+    } else {
+        (((mc - ZONE_HOT_MC) / ZONE_STEP_MC) as u32 + 1).min(COOLING_MAX)
+    }
+}
+
+/// Fail-closed thermal backstop driven by kernel SoC die thermal zones when a GPU DT node
+/// has no `apple,pmp` telemetry bridge. Starts at [`COOLING_MAX`] (S1), requires 200 ms of
+/// valid cool readings before stepping down gradually, and immediately clamps back to
+/// [`COOLING_MAX`] on missing, stale, implausible, or critical readings.
+pub(crate) struct ZoneBackstop {
+    level: u32,
+    hard: bool,
+    good_reads: u32,
+    good_ns: u64,
+    release_ns: u64,
+}
+
+impl ZoneBackstop {
+    pub(crate) const fn new() -> Self {
+        Self {
+            level: COOLING_MAX,
+            hard: true,
+            good_reads: 0,
+            good_ns: 0,
+            release_ns: 0,
+        }
+    }
+
+    pub(crate) const fn level(&self) -> u32 {
+        self.level
+    }
+
+    /// Incorporates one sampled temperature (millidegrees Celsius) or sensor error at `now`.
+    pub(crate) fn sample(&mut self, now: u64, mc: i64, error: bool) -> u32 {
+        if error
+            || !(ZONE_PLAUSIBLE_MIN_MC..=ZONE_PLAUSIBLE_MAX_MC).contains(&mc)
+            || mc >= ZONE_FULL_COOLING_MC
+        {
+            self.level = COOLING_MAX;
+            self.hard = true;
+            self.good_reads = 0;
+            self.good_ns = now;
+            self.release_ns = now;
+            return self.level;
+        }
+
+        if self.hard {
+            if mc < ZONE_HOT_MC {
+                if self.good_reads == 0 || now.wrapping_sub(self.good_ns) >= ZONE_CONFIRM_NS {
+                    self.good_ns = now;
+                    self.good_reads = self.good_reads.saturating_add(1).min(ZONE_CONFIRM_READS);
+                }
+                if self.good_reads >= ZONE_CONFIRM_READS {
+                    self.hard = false;
+                }
+            } else {
+                self.good_reads = 0;
+                self.good_ns = now;
+            }
+            self.release_ns = now;
+            if self.hard {
+                return self.level;
+            }
+        }
+
+        let target = zone_heat_level(mc);
+        if target > self.level {
+            self.level = target;
+            self.release_ns = now;
+        } else if mc < ZONE_RELEASE_MC && now.wrapping_sub(self.release_ns) >= ZONE_RELEASE_NS {
+            self.level = self.level.saturating_sub(1);
+            self.release_ns = now;
+        } else if mc >= ZONE_RELEASE_MC {
+            self.release_ns = now;
+        }
+        self.level
+    }
+
+    /// Retains a cooling-device governor restriction inside the gradual release envelope.
+    pub(crate) fn observe(&mut self, now: u64, governor: u32) {
+        let clamped = governor.min(COOLING_MAX);
+        if clamped > self.level {
+            self.level = clamped;
+            self.release_ns = now;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -665,5 +775,72 @@ mod tests {
             assert!(g.govern(now, PSTATE_MAX, false) <= FLOOR + 1);
         }
         assert_eq!(g.demand, FLOOR);
+    }
+
+    #[test]
+    fn zone_backstop_starts_fail_closed_releases_gradually_and_clamps_on_heat_or_fault() {
+        let mut z = ZoneBackstop::new();
+        assert_eq!(z.level(), COOLING_MAX);
+        assert_eq!(cooling_ceiling(8, z.level()), 1);
+
+        // Missing or implausible sensors keep the GPU clamped at S1 forever.
+        for i in 0..20u64 {
+            assert_eq!(z.sample(T + i * ZONE_CONFIRM_NS, 0, true), COOLING_MAX);
+        }
+        assert_eq!(z.sample(T + 1_000_000_000, 9_999, false), COOLING_MAX);
+        assert_eq!(z.sample(T + 1_020_000_000, 125_001, false), COOLING_MAX);
+
+        // Repeated calls at the same timestamp cannot accelerate startup confirmation.
+        let base = T + 2_000_000_000;
+        for _ in 0..100 {
+            assert_eq!(z.sample(base, 55_000, false), COOLING_MAX);
+        }
+        for step in 1..ZONE_CONFIRM_READS as u64 {
+            assert_eq!(
+                z.sample(base + step * ZONE_CONFIRM_NS, 55_000, false),
+                COOLING_MAX
+            );
+        }
+        // Gradual release: one cooling level every 200 ms below 75 C.
+        let confirmed = base + (ZONE_CONFIRM_READS as u64 - 1) * ZONE_CONFIRM_NS;
+        assert_eq!(
+            z.sample(confirmed + ZONE_RELEASE_NS - 1, 55_000, false),
+            COOLING_MAX
+        );
+        for step in 1..=COOLING_MAX as u64 {
+            assert_eq!(
+                z.sample(confirmed + step * ZONE_RELEASE_NS, 55_000, false),
+                COOLING_MAX - step as u32
+            );
+        }
+        assert_eq!(z.level(), 0);
+        assert_eq!(cooling_ceiling(8, z.level()), 8);
+
+        // Progressive heat throttling from 80 C..94 C, immediate hard clamp at >= 94 C.
+        let hot_t = confirmed + 10 * ZONE_RELEASE_NS;
+        assert_eq!(z.sample(hot_t, 79_999, false), 0);
+        assert_eq!(z.sample(hot_t + 10_000_000, 80_000, false), 1);
+        assert_eq!(z.sample(hot_t + 20_000_000, 86_000, false), 4);
+        // Holding between 75 C and 80 C does not release cooling.
+        assert_eq!(z.sample(hot_t + 500_000_000, 75_000, false), 4);
+        assert_eq!(z.sample(hot_t + 1_000_000_000, 79_000, false), 4);
+        // Critical heat immediately returns to hard COOLING_MAX (S1).
+        assert_eq!(z.sample(hot_t + 1_010_000_000, ZONE_FULL_COOLING_MC, false), COOLING_MAX);
+        assert_eq!(cooling_ceiling(8, z.level()), 1);
+
+        // Governor observation is retained in the release envelope.
+        let mut z2 = ZoneBackstop::new();
+        for step in 0..ZONE_CONFIRM_READS as u64 {
+            z2.sample(base + step * ZONE_CONFIRM_NS, 50_000, false);
+        }
+        let c2 = base + (ZONE_CONFIRM_READS as u64 - 1) * ZONE_CONFIRM_NS;
+        for step in 1..=COOLING_MAX as u64 {
+            z2.sample(c2 + step * ZONE_RELEASE_NS, 50_000, false);
+        }
+        assert_eq!(z2.level(), 0);
+        z2.observe(c2 + 9 * ZONE_RELEASE_NS, 5);
+        assert_eq!(z2.level(), 5);
+        assert_eq!(z2.sample(c2 + 9 * ZONE_RELEASE_NS + 1, 50_000, false), 5);
+        assert_eq!(z2.sample(c2 + 10 * ZONE_RELEASE_NS, 50_000, false), 4);
     }
 }

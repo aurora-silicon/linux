@@ -23,14 +23,6 @@ pub(crate) mod work;
 use super::hw::FwAbi;
 
 impl FwAbi {
-    /// The InitData objects.
-    pub(crate) const fn initdata(self) -> &'static initdata::Layout {
-        match self {
-            FwAbi::V25G83 => &initdata::V25G83,
-            FwAbi::V26B123 => &initdata::V26B123,
-        }
-    }
-
     /// The device-control opcodes the host sends.
     pub(crate) const fn devctl(self) -> &'static channels::devctl::Opcodes {
         match self {

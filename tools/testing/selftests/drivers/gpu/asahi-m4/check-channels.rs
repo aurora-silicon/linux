@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
-#![allow(dead_code)]
+#![allow(dead_code, non_camel_case_types, non_snake_case, non_upper_case_globals)]
+extern crate self as kernel;
+mod uapi { include!("public-uapi.rs"); }
 mod fw {
     #[path = "@KERNEL@/drivers/gpu/drm/asahi/g16/fw/initdata.rs"]
     pub mod initdata;
@@ -11,7 +13,15 @@ mod graph;
 mod fwid {
 @FWID_BUILD@
 }
-mod hw {pub enum GpuVariant {G}}
+mod hw {pub enum GpuVariant {G, S}}
+mod adt {
+    #[path = "@KERNEL@/drivers/gpu/drm/asahi/g16/adt/perf.rs"]
+    pub mod perf;
+}
+mod board {
+    #[path = "@KERNEL@/drivers/gpu/drm/asahi/g16/board/data.rs"]
+    pub mod data;
+}
 #[path = "@KERNEL@/drivers/gpu/drm/asahi/g16/hw.rs"]
 mod backend_hw;
 fn main() {
