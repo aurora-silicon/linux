@@ -821,6 +821,11 @@ struct apple_sleep_soc {
 	bool radio_retrain;
 	/* A core restarted after the commit takes the deep WFI in the holding pen. */
 	bool pen_deep;
+	/*
+	 * Every core takes its last WFI at EL1 with the MMU off (t8142_el1_wfi()), the pen's
+	 * included, whatever apple_sleep.el1_wfi says: T8122's, which sleeps and wakes so.
+	 */
+	bool el1_wfi;
 	/* apple_sleep.observer_ms works here too (T8142's E core 0 observer) */
 	bool observer;
 	/*
@@ -5920,6 +5925,15 @@ static void apple_sleep_wait_still_on(struct apple_sleep *s)
  *  - The RTC alarm: macOS arms it after the commit. rtcwake has armed it long
  *    before this, with no SPMI traffic near the engine.
  */
+/* Whether a core the sequencer restarts takes the pen's last WFI at EL1 */
+static bool sleep_pen_el1(const struct apple_sleep *s)
+{
+	if (!is_kernel_in_hyp_mode())
+		return false;
+	return s->soc->el1_wfi ||
+	       (s->soc->ops->deep_wfi_arm == t8142_deep_wfi_arm && READ_ONCE(sleep_el1_wfi) >= 2);
+}
+
 static bool sleep_v27_selected_for(struct apple_sleep *s);
 static void t8142_last_mile(struct apple_sleep *s);
 static void t8142_post_commit_probe(struct apple_sleep *s, unsigned int ms);
@@ -5944,8 +5958,7 @@ static int apple_sleep_commit(unsigned long unused)
 	early = s->soc->early_cpu_wfi && READ_ONCE(sleep_early_wfi);
 	if (early) {
 		/* Released before the stop: each core goes from its stop bit to its deep WFI. */
-		spin_table_pen_deep_el1(s->soc->ops->deep_wfi_arm == t8142_deep_wfi_arm &&
-					is_kernel_in_hyp_mode() && READ_ONCE(sleep_el1_wfi) >= 2);
+		spin_table_pen_deep_el1(sleep_pen_el1(s));
 		spin_table_release_stopped();
 	}
 	s->cpus_stop_ret = spin_table_stop_parked();
@@ -5993,8 +6006,7 @@ static int apple_sleep_commit(unsigned long unused)
 
 	/* Each core's deep WFI comes after the commit, this one last. No SPMI from here on. */
 	if (!early) {
-		spin_table_pen_deep_el1(s->soc->ops->deep_wfi_arm == t8142_deep_wfi_arm &&
-					is_kernel_in_hyp_mode() && READ_ONCE(sleep_el1_wfi) >= 2);
+		spin_table_pen_deep_el1(sleep_pen_el1(s));
 		spin_table_release_stopped();
 	}
 	if (s->soc->boot_wfi_delay_ms)

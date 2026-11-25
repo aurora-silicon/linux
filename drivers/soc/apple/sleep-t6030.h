@@ -95,6 +95,121 @@
 /* Aff2: the P cores are 0x101xx */
 #define T6030_MPIDR_PCORE		BIT_ULL(16)
 
+/* This core's cache maintenance unblocked; returns its HID4 or EHID4 as it was */
+static __always_inline u64 t6030_dc_unblock(void)
+{
+	u64 old;
+
+	if (read_cpuid_mpidr() & T6030_MPIDR_PCORE) {
+		old = read_sysreg_s(T6030_HID4);
+		write_sysreg_s(old & ~T6030_HID4_DC_MASK, T6030_HID4);
+	} else {
+		old = read_sysreg_s(T6030_EHID4);
+		write_sysreg_s(old & ~T6030_HID4_DC_MASK, T6030_EHID4);
+	}
+	isb();
+	return old;
+}
+
+static __always_inline void t6030_dc_reblock(u64 old)
+{
+	dsb(sy);
+	if (read_cpuid_mpidr() & T6030_MPIDR_PCORE)
+		write_sysreg_s(old, T6030_HID4);
+	else
+		write_sysreg_s(old, T6030_EHID4);
+	isb();
+}
+
+/* [start, end) cleaned past L2 by VA: dc cvadp (FEAT_DPB2), dc cvap, or dc civac. Unblocked. */
+static void t6030_clean_range(unsigned long start, unsigned long end)
+{
+	unsigned long line = 4UL << ((read_cpuid_cachetype() >> CTR_EL0_DminLine_SHIFT) & 0xf);
+	unsigned int dpb = cpuid_feature_extract_unsigned_field(read_sysreg(id_aa64isar1_el1),
+								 ID_AA64ISAR1_EL1_DPB_SHIFT);
+	unsigned long addr = start & ~(line - 1);
+
+	if (dpb >= 2) {
+		for (; addr < end; addr += line)
+			asm volatile("sys #3, c7, c13, #1, %0" : : "r"(addr) : "memory");
+	} else if (dpb >= 1) {
+		for (; addr < end; addr += line)
+			asm volatile("sys #3, c7, c12, #1, %0" : : "r"(addr) : "memory");
+	} else {
+		for (; addr < end; addr += line)
+			asm volatile("dc civac, %0" : : "r"(addr) : "memory");
+	}
+	dsb(sy);
+}
+
+/*
+ * Every data or unified cache level this core sees (L1 and its cluster's L2), cleaned by set
+ * and way, in registers only: no store between the first dc csw and the last dsb. Unblocked.
+ */
+static __always_inline void t6030_clean_all_levels(void)
+{
+	u64 clidr, ccidx, lvl, ctype, ccsidr, lshift, way, mset, wshift, set, tmp;
+
+	asm volatile(
+		"dsb sy\n\t"
+		"mrs %[clidr], clidr_el1\n\t"
+		"mrs %[ccidx], id_aa64mmfr2_el1\n\t"
+		"ubfx %[ccidx], %[ccidx], #20, #4\n\t"
+		"mov %[lvl], #0\n\t"
+		"1:\n\t"
+		"cmp %[lvl], #7\n\t"
+		"b.hs 5f\n\t"
+		"add %[tmp], %[lvl], %[lvl], lsl #1\n\t"
+		"lsr %[ctype], %[clidr], %[tmp]\n\t"
+		"and %[ctype], %[ctype], #7\n\t"
+		"cbz %[ctype], 5f\n\t"
+		"cmp %[ctype], #2\n\t"
+		"b.lo 4f\n\t"
+		"cmp %[ctype], #4\n\t"
+		"b.hi 4f\n\t"
+		"lsl %[tmp], %[lvl], #1\n\t"
+		"msr csselr_el1, %[tmp]\n\t"
+		"isb\n\t"
+		"mrs %[ccsidr], ccsidr_el1\n\t"
+		"and %[lshift], %[ccsidr], #7\n\t"
+		"add %[lshift], %[lshift], #4\n\t"
+		"cbnz %[ccidx], 20f\n\t"
+		"ubfx %[way], %[ccsidr], #3, #10\n\t"
+		"ubfx %[mset], %[ccsidr], #13, #15\n\t"
+		"b 21f\n\t"
+		"20:\n\t"
+		"ubfx %[way], %[ccsidr], #3, #21\n\t"
+		"ubfx %[mset], %[ccsidr], #32, #24\n\t"
+		"21:\n\t"
+		"clz %w[wshift], %w[way]\n\t"
+		"2:\n\t"
+		"mov %[set], %[mset]\n\t"
+		"lsl %[ctype], %[way], %[wshift]\n\t"
+		"orr %[ctype], %[ctype], %[lvl], lsl #1\n\t"
+		"3:\n\t"
+		"lsl %[tmp], %[set], %[lshift]\n\t"
+		"orr %[tmp], %[ctype], %[tmp]\n\t"
+		"dc csw, %[tmp]\n\t"
+		"subs %[set], %[set], #1\n\t"
+		"b.ge 3b\n\t"
+		"subs %[way], %[way], #1\n\t"
+		"b.ge 2b\n\t"
+		"dsb sy\n\t"
+		"4:\n\t"
+		"add %[lvl], %[lvl], #1\n\t"
+		"b 1b\n\t"
+		"5:\n\t"
+		"msr csselr_el1, xzr\n\t"
+		"dsb sy\n\t"
+		"isb\n\t"
+		: [clidr] "=&r"(clidr), [ccidx] "=&r"(ccidx), [lvl] "=&r"(lvl),
+		  [ctype] "=&r"(ctype), [ccsidr] "=&r"(ccsidr), [lshift] "=&r"(lshift),
+		  [way] "=&r"(way), [mset] "=&r"(mset), [wshift] "=&r"(wshift),
+		  [set] "=&r"(set), [tmp] "=&r"(tmp)
+		:
+		: "cc", "memory");
+}
+
 /*
  * Lowered in this order, and raised again in reverse at the wake: SIO's CPU by .after_early,
  * the PMP and its SRAM by .commit_notice, the storage PHY by .commit_regs.
@@ -264,6 +379,7 @@ static int t6030_sleep_map_regs(struct apple_sleep *s)
 	struct t6030_sleep *t;
 	u32 v[6];
 	unsigned int i;
+	u64 hid4;
 	int ret;
 
 	t = devm_kzalloc(s->dev, sizeof(*t), GFP_KERNEL);
@@ -307,6 +423,12 @@ static int t6030_sleep_map_regs(struct apple_sleep *s)
 		return ret;
 
 	t6030_gp_map(s);
+
+	/* The EL1 WFI's stub runs with the MMU off: in memory, not only in a cache */
+	hid4 = t6030_dc_unblock();
+	t6030_clean_range((unsigned long)t8142_el1_wfi_stub, (unsigned long)t8142_el1_wfi_stub_end);
+	t6030_dc_reblock(hid4);
+
 	return apple_sleep_read_wake_sources(s);
 }
 
@@ -904,121 +1026,6 @@ static void t6030_sleep_commit_regs(struct apple_sleep *s)
 	sleep_ps_save(s);
 }
 
-/* This core's cache maintenance unblocked; returns its HID4 or EHID4 as it was */
-static __always_inline u64 t6030_dc_unblock(void)
-{
-	u64 old;
-
-	if (read_cpuid_mpidr() & T6030_MPIDR_PCORE) {
-		old = read_sysreg_s(T6030_HID4);
-		write_sysreg_s(old & ~T6030_HID4_DC_MASK, T6030_HID4);
-	} else {
-		old = read_sysreg_s(T6030_EHID4);
-		write_sysreg_s(old & ~T6030_HID4_DC_MASK, T6030_EHID4);
-	}
-	isb();
-	return old;
-}
-
-static __always_inline void t6030_dc_reblock(u64 old)
-{
-	dsb(sy);
-	if (read_cpuid_mpidr() & T6030_MPIDR_PCORE)
-		write_sysreg_s(old, T6030_HID4);
-	else
-		write_sysreg_s(old, T6030_EHID4);
-	isb();
-}
-
-/* [start, end) cleaned past L2 by VA: dc cvadp (FEAT_DPB2), dc cvap, or dc civac. Unblocked. */
-static void t6030_clean_range(unsigned long start, unsigned long end)
-{
-	unsigned long line = 4UL << ((read_cpuid_cachetype() >> CTR_EL0_DminLine_SHIFT) & 0xf);
-	unsigned int dpb = cpuid_feature_extract_unsigned_field(read_sysreg(id_aa64isar1_el1),
-								 ID_AA64ISAR1_EL1_DPB_SHIFT);
-	unsigned long addr = start & ~(line - 1);
-
-	if (dpb >= 2) {
-		for (; addr < end; addr += line)
-			asm volatile("sys #3, c7, c13, #1, %0" : : "r"(addr) : "memory");
-	} else if (dpb >= 1) {
-		for (; addr < end; addr += line)
-			asm volatile("sys #3, c7, c12, #1, %0" : : "r"(addr) : "memory");
-	} else {
-		for (; addr < end; addr += line)
-			asm volatile("dc civac, %0" : : "r"(addr) : "memory");
-	}
-	dsb(sy);
-}
-
-/*
- * Every data or unified cache level this core sees (L1 and its cluster's L2), cleaned by set
- * and way, in registers only: no store between the first dc csw and the last dsb. Unblocked.
- */
-static __always_inline void t6030_clean_all_levels(void)
-{
-	u64 clidr, ccidx, lvl, ctype, ccsidr, lshift, way, mset, wshift, set, tmp;
-
-	asm volatile(
-		"dsb sy\n\t"
-		"mrs %[clidr], clidr_el1\n\t"
-		"mrs %[ccidx], id_aa64mmfr2_el1\n\t"
-		"ubfx %[ccidx], %[ccidx], #20, #4\n\t"
-		"mov %[lvl], #0\n\t"
-		"1:\n\t"
-		"cmp %[lvl], #7\n\t"
-		"b.hs 5f\n\t"
-		"add %[tmp], %[lvl], %[lvl], lsl #1\n\t"
-		"lsr %[ctype], %[clidr], %[tmp]\n\t"
-		"and %[ctype], %[ctype], #7\n\t"
-		"cbz %[ctype], 5f\n\t"
-		"cmp %[ctype], #2\n\t"
-		"b.lo 4f\n\t"
-		"cmp %[ctype], #4\n\t"
-		"b.hi 4f\n\t"
-		"lsl %[tmp], %[lvl], #1\n\t"
-		"msr csselr_el1, %[tmp]\n\t"
-		"isb\n\t"
-		"mrs %[ccsidr], ccsidr_el1\n\t"
-		"and %[lshift], %[ccsidr], #7\n\t"
-		"add %[lshift], %[lshift], #4\n\t"
-		"cbnz %[ccidx], 20f\n\t"
-		"ubfx %[way], %[ccsidr], #3, #10\n\t"
-		"ubfx %[mset], %[ccsidr], #13, #15\n\t"
-		"b 21f\n\t"
-		"20:\n\t"
-		"ubfx %[way], %[ccsidr], #3, #21\n\t"
-		"ubfx %[mset], %[ccsidr], #32, #24\n\t"
-		"21:\n\t"
-		"clz %w[wshift], %w[way]\n\t"
-		"2:\n\t"
-		"mov %[set], %[mset]\n\t"
-		"lsl %[ctype], %[way], %[wshift]\n\t"
-		"orr %[ctype], %[ctype], %[lvl], lsl #1\n\t"
-		"3:\n\t"
-		"lsl %[tmp], %[set], %[lshift]\n\t"
-		"orr %[tmp], %[ctype], %[tmp]\n\t"
-		"dc csw, %[tmp]\n\t"
-		"subs %[set], %[set], #1\n\t"
-		"b.ge 3b\n\t"
-		"subs %[way], %[way], #1\n\t"
-		"b.ge 2b\n\t"
-		"dsb sy\n\t"
-		"4:\n\t"
-		"add %[lvl], %[lvl], #1\n\t"
-		"b 1b\n\t"
-		"5:\n\t"
-		"msr csselr_el1, xzr\n\t"
-		"dsb sy\n\t"
-		"isb\n\t"
-		: [clidr] "=&r"(clidr), [ccidx] "=&r"(ccidx), [lvl] "=&r"(lvl),
-		  [ctype] "=&r"(ctype), [ccsidr] "=&r"(ccsidr), [lshift] "=&r"(lshift),
-		  [way] "=&r"(way), [mset] "=&r"(mset), [wshift] "=&r"(wshift),
-		  [set] "=&r"(set), [tmp] "=&r"(tmp)
-		:
-		: "cc", "memory");
-}
-
 /* Whether the kernel's tables map @addr: KFENCE's guard pages, for one, are left out */
 static bool t6030_va_mapped(unsigned long addr)
 {
@@ -1355,6 +1362,11 @@ static void t6030_deep_wfi_arm(void)
 			   FIELD_PREP(T6030_CYC_OVRD_WFI_MODE, 3) | T6030_CYC_OVRD_DISABLE_WFI_RET);
 	sysreg_clear_set_s(SYS_APL_DEEP_SLEEP, 0, DEEP_SLEEP_ENABLE);
 	isb();
+	/* .el1_wfi: the WFI at EL1, MMU off, as T8122's; nothing comes back but a reset */
+	if (is_kernel_in_hyp_mode()) {
+		dsb(sy);
+		t8142_el1_wfi();
+	}
 }
 
 /* Every power word in "ps" that the J516s ADT's pmgr devices name */
@@ -1456,6 +1468,8 @@ static const struct apple_sleep_soc t6030_sleep_soc = {
 	 * A7-M3 power-down controls (aura's reset path puts CYC_OVRD back in retention)
 	 */
 	.pen_deep = true,
+	/* t6030_deep_wfi_arm() drops to EL1 for every core's last WFI */
+	.el1_wfi = true,
 	.observer = true,
 	/* No write to WD2's registers in any of macOS's entries */
 	.no_wd2 = true,
