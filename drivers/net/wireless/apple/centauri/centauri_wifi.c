@@ -3097,6 +3097,29 @@ static int query_beacon_stats(struct centauri_wifi *wifi)
 	return ret;
 }
 
+/* A PHY dump that gave nothing: the reply's TLV layout, for the test logs */
+static void phy_dump_report_failure(struct centauri_wifi *wifi, int ret, size_t size,
+				    int fw_band)
+{
+	size_t n = min(size, sizeof(wifi->stats_reply)), pos = 0;
+	char tags[128];
+	int len = 0, i;
+
+	tags[0] = 0;
+	for (i = 0; i < 8 && pos + 4 <= n; i++) {
+		u16 tag = get_unaligned_le16(wifi->stats_reply + pos);
+		u16 length = get_unaligned_le16(wifi->stats_reply + pos + 2);
+
+		len += scnprintf(tags + len, sizeof(tags) - len, " %#x/%u", tag, length);
+		if (length > n - pos - 4)
+			break;
+		pos += 4 + length;
+	}
+	dev_dbg(&wifi->control->pdev->dev,
+		"PHY dump gave no chains: ret %d, %zu bytes, band %d, TLVs:%s\n",
+		ret, size, fw_band, tags);
+}
+
 static int query_phy_dump(struct centauri_wifi *wifi,
 			  const struct ieee80211_channel *chan)
 {
@@ -3128,6 +3151,9 @@ static int query_phy_dump(struct centauri_wifi *wifi,
 				  min(size, sizeof(wifi->stats_reply)),
 				  fw_band, chain_rssi, &chains,
 				  &noise, &noise_valid)) {
+		dev_dbg(&wifi->control->pdev->dev,
+			"PHY dump: band %d, chains %#x (%d/%d dBm), noise %d (valid %d)\n",
+			fw_band, chains, chain_rssi[0], chain_rssi[1], noise, noise_valid);
 		wifi->station_chain_signal[0] = chain_rssi[0];
 		wifi->station_chain_signal[1] = chain_rssi[1];
 		wifi->station_chains = chains;
@@ -3135,6 +3161,8 @@ static int query_phy_dump(struct centauri_wifi *wifi,
 			wifi->station_phy_noise = noise;
 			wifi->station_phy_noise_valid = true;
 		}
+	} else {
+		phy_dump_report_failure(wifi, ret, size, fw_band);
 	}
 	return ret;
 }
