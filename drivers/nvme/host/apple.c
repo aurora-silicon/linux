@@ -371,8 +371,8 @@ MODULE_PARM_DESC(flush_interval,
 		 "Grace period in msecs between flushes (ignored on post-M4 ANS)");
 
 /*
- * Stop ANS for a deep sleep on a controller whose sleep path was never run (T8142). Off by
- * default: the root disk stays up through a sleep the SoC refuses.
+ * Stop ANS for a deep sleep on a controller whose sleep path was never run. Off by default:
+ * the root disk stays up through a sleep the SoC refuses.
  */
 static bool sleep_untested;
 module_param(sleep_untested, bool, 0444);
@@ -3462,9 +3462,8 @@ static const struct apple_nvme_hw apple_nvme_t8142_hw = {
 	.has_separate_nvmmu = true,
 	.needs_ioq_registers = true,
 	.max_queue_depth = 64,
-	/* T8140's values, as T8132 runs them: never run on T8142. */
+	/* T8140's values, as T8132 runs them; through deep sleeps on J813 and J815. */
 	.sleep_traced = true,
-	.sleep_untested = true,
 	.sleep_epmap_last_mask = BIT(0),
 	.sleep_flush_max_nsid = 1,
 	.sleep_shn = NVME_CC_SHN_MASK,
