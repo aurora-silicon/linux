@@ -3635,6 +3635,8 @@ impl Firmware {
             work_gva: s.work.lower_gva.ok_or(EINVAL)?,
             // Separate device-lifetime firmware-cached microsequence record for this unit index.
             seq: s.seq.va,
+            // Separate per-VM uncached UMA manager descriptor inside `s.uma_lease`.
+            descriptor_fw: s.descriptor.va,
             preempt_gva: s.preempt.gva.ok_or(EINVAL)?,
             its: s.its.va,
             stats_fw: self.init.compute_activity.va,
@@ -3685,10 +3687,10 @@ impl Firmware {
         if full_work {
             if before != 0 {
                 // Slots::claim_compute proved a different fully retired unit displaced this
-                // descriptor in the same hardware slot. Keep every firmware-mutated byte.
+                // descriptor in the same hardware slot. Validate the retained descriptor in place.
                 let mut descriptor = [0u8; work::compute::DESCRIPTOR_SIZE];
-                s.work.read(work::compute::DESCRIPTOR, &mut descriptor)?;
-                if encode::preserve_compute_descriptor(&refs, &descriptor, before, w).is_err() {
+                s.descriptor.read(0, &mut descriptor)?;
+                if encode::validate_compute_descriptor(&refs, &descriptor, before).is_err() {
                     // This is retained allocator identity/completion corruption, not a client
                     // refusal. Keep the unit and its previous VM lease mapped forever; cancelling
                     // preparation would make the corrupt descriptor available to another job.
@@ -3697,13 +3699,12 @@ impl Firmware {
                     return Err(EIO);
                 }
             }
-            s.work.write(0, w)?;
+            s.work.write(0, &w[..work::compute::BODY_ACTIVE_END])?;
         } else {
-            // Clean same-VM reuse: DESCRIPTOR (0xe00..0xea0) was already authenticated on
+            // Clean same-VM reuse: `s.descriptor` stays intact in place and was authenticated on
             // retirement for this exact unit and VM, static NOTIFIER (0xc00..0xd18) and tail
             // (0xee0..0xf08) remain intact in place, and the live microsequence lives in
-            // firmware-cached `s.seq`. Skip the 160-byte WC read-back and embedded sequence copy,
-            // writing only the active head and body before `SEQ_EMBEDDED`.
+            // firmware-cached `s.seq`. Write only the active head and body before `SEQ_EMBEDDED`.
             s.work.write(0, &w[..work::compute::HEAD_ACTIVE_SIZE])?;
             s.work.write(
                 work::compute::BODY_ACTIVE_START,

@@ -185,7 +185,7 @@ mod encode {
     pub struct ComputeRefs{pub invalid:bool}
     // Fault injection replaces the descriptor reader, while the actual production
     // containment branch below decides whether the unit becomes claimable again.
-    pub fn preserve_compute_descriptor(refs:&ComputeRefs,_old:&[u8;160],_before:u64,_work:&mut[u8;8192])->Result<(),()>{if refs.invalid{Err(())}else{Ok(())}}
+    pub fn validate_compute_descriptor(refs:&ComputeRefs,_old:&[u8;160],_before:u64)->Result<(),()>{if refs.invalid{Err(())}else{Ok(())}}
 }
 mod hw { pub mod sizes { pub const FLIGHTS:usize=32; pub const TA_WAVE_PASSES:usize=4; pub const TA_WAVE_PASSES_LIGHT:usize=8; pub const TA_LIGHT_TILEMAP_BYTES:u64=64*1024; pub const TA_WAVE_REFILL_HEADROOM:usize=2; pub const COMPUTE_PIPES:usize=8; pub const MAX_VM_COMPUTE_PIPES:usize=2; pub const COMPUTE_UNITS:usize=24; pub const PIPE1_COMPUTE_START:usize=6; pub const COMPUTE_SLOTS:usize=24; pub const RENDER_SLOTS:usize=48; pub const COALESCE_MAX_CMDS:usize=6; pub const COALESCE_WINDOW_US:u32=18; pub const COALESCE_WINDOW_NS:u64=18_000; pub const COMPUTE_HEAVY_EMA_US:u32=200; pub const COMPUTE_HEAVY_INFLIGHT_NS:u64=180_000; } }
 mod command {pub const RENDER:usize=0;pub const COMPUTE:usize=1;}
@@ -3032,7 +3032,7 @@ for token, declaration in {
     '__HOLD_CAUSE_FN__': 'fn hold_cause(',
     '__NOTE_HOLD__': 'fn note_hold(',
     '__BLOCKED_ON_SLOT_HEADROOM__': 'fn blocked_on_slot_headroom(',
-    '__DESCRIPTOR_CONTAINMENT__': 'if encode::preserve_compute_descriptor(',
+    '__DESCRIPTOR_CONTAINMENT__': 'if encode::validate_compute_descriptor(',
     '__PUBLISH_PRODUCER__': 'fn publish_producer(',
     '__TA_PENDING_PASSES__': 'pub(crate) fn ta_pending_passes(',
     '__TA_WAVE_CAP_FOR__': 'fn ta_wave_cap_for(',

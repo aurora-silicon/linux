@@ -244,7 +244,7 @@ fn compute_work(out: &std::path::Path) {
     let r = encode::ComputeRefs {
         notifier: f + 0x600400, qinfo: f + 0x200000, user_stamp: f + 0x600648,
         fw_stamp: f + 0x600640, work: f + 0x100000, work_gva: g + 0x100000, seq: f + 0x100900,
-        preempt_gva: g + 0x200000, its: f + 0x500040, stats_fw: f + 0x300000,
+        descriptor_fw: 0, preempt_gva: g + 0x200000, its: f + 0x500040, stats_fw: f + 0x300000,
         auxiliary_fw: f + 0x400000, auxiliary_gva: g + 0x400000,
         context_store_gva: g + 0x500000, counter_fw: f + 0x500000,
         pool_state_gva: g + 0x600000, page_list_gva: g + 0x700000, usc_base: 1 << 40,
@@ -277,6 +277,31 @@ fn compute_work(out: &std::path::Path) {
     assert!(w[0x89b..0x8ab].iter().all(|&b| b == 0));
     assert!(w[0x8e0..compute::SEQ_EMBEDDED].iter().all(|&b| b == 0), "beyond the cached prefix");
     assert_eq!(&w[compute::SEQ_EMBEDDED..compute::SEQ_EMBEDDED + compute::SEQ_SIZE], &q[..]);
+    // Separate uncached descriptor_fw: work+0x86a and seq+0x160 point to descriptor_fw,
+    // compute_uma_manager_image matches the embedded descriptor layout, and displaced-reuse
+    // validation checks manager::INDEX against r.uma_slot.
+    let r_sep = encode::ComputeRefs { descriptor_fw: f + 0x580000, ..r };
+    let (mut w_sep, mut q_sep) = ([0xa5; compute::WORK_SIZE], [0xa5; compute::SEQ_SIZE]);
+    encode::encode_compute_for(
+        &compute::V26B123, &r_sep, &c, &att, &ts, 1, 1, 1, &mut w_sep, &mut q_sep,
+    ).unwrap();
+    assert_eq!(r64(&w_sep, 0x86a), r_sep.descriptor_fw, "work descriptor pointer at +0x86a");
+    assert_eq!(r64(&q_sep, 0x160), r_sep.descriptor_fw, "seq descriptor pointer at +0x160");
+    let mut desc = fw::buffer::compute_uma_manager_image(
+        r_sep.work, r_sep.uma_slot, r_sep.pool_state_gva, r_sep.page_list_gva,
+        r_sep.counter_fw, 8192, fw::graph::manager::UNK_1C_VALUE,
+    );
+    assert_eq!(&desc[..], &w[compute::DESCRIPTOR..compute::DESCRIPTOR + compute::DESCRIPTOR_SIZE]);
+    desc[fw::graph::manager::COMPLETED..fw::graph::manager::COMPLETED + 8]
+        .copy_from_slice(&(r_sep.submitted - 1).to_le_bytes());
+    assert_eq!(
+        encode::validate_compute_descriptor(&r_sep, &desc, r_sep.submitted - 1),
+        Ok(r_sep.submitted),
+    );
+    let mut bad_idx = desc;
+    bad_idx[fw::graph::manager::INDEX..fw::graph::manager::INDEX + 4]
+        .copy_from_slice(&(r_sep.uma_slot + 1).to_le_bytes());
+    assert!(encode::validate_compute_descriptor(&r_sep, &bad_idx, r_sep.submitted - 1).is_err());
     for (name, (w, q)) in ["25g83", "26b123"].iter().zip(&images) {
         let mut all = w.to_vec(); all.extend(q);
         std::fs::write(out.join(format!("compute-{name}.bin")), all).unwrap();

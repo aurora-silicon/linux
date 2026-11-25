@@ -40,7 +40,7 @@ impl Object {
 #[derive(Clone,Copy)]enum Channel{Compute,Ta,Fs}
 mod notifier_page {pub const COMPUTE_STAMP:usize=0;pub const COMPUTE_CONTEXT:usize=4;pub const TA_STAMP:usize=8;pub const FS_STAMP:usize=12;pub const FS_RECORD:usize=32;}
 mod notifier {pub const CONTEXT:usize=16;}
-mod compute {pub const DESCRIPTOR_COMPLETED:usize=0;pub const DESCRIPTOR_COUNTER:usize=8;}
+mod manager {pub const COUNTER:usize=0x4c;pub const COMPLETED:usize=0x54;}
 #[derive(Default)]struct CGraph{fw_stamp:Object,qstate:Object,qinfo:Object,notifier:Object}
 struct RGraph{fw_stamp:[Object;2],qstate:[Object;2],qinfo:[Object;2],notifier:Object}
 struct Graph{compute:[CGraph;hw::sizes::COMPUTE_PIPES],render:RGraph}
@@ -52,7 +52,7 @@ struct Flight{computes:u32,renders:u32,compute_pipe:u8,target:u32,ta_target:u32,
 struct Engine{flights:Vec<Flight>,target:[u32;hw::sizes::COMPUTE_PIPES],ta_target:u32,fs_target:u32,retired_ticks:[u64;4]}
 fn stamp_reached(observed:u32,own:u32,tail:u32)->bool{logic::stamp_reached(observed,own,tail)}
 impl Engine{fn oldest(&self)->Option<&Flight>{self.flights.first()}}
-struct CUnit{counter:Object,its:Object,work:Object}
+struct CUnit{counter:Object,descriptor:Object,its:Object,work:Object}
 struct RUnit{scene:Object}
 struct Scrub{compute:Vec<CUnit>,passes:Vec<RUnit>}
 struct Slots{scrub:Scrub}
@@ -84,8 +84,8 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     let mut f=Firmware{
         graph:Graph{compute:core::array::from_fn(|_|CGraph::default()),
             render:RGraph{fw_stamp:Default::default(),qstate:Default::default(),qinfo:Default::default(),notifier:Object::default()}},
-        engine:Engine{flights:vec![Flight{computes:u32::from(!render),renders:u32::from(render),compute_pipe:0,target,ta_target:target,fs_target:target,job:Job{vm:Vm{slot:2},resources:Resources{compute:vec![CUnit{counter:Object::default(),its:Object::default(),work:Object::default()}],passes:vec![RUnit{scene:Object::default()}],pools:Pools{full:true,completed:2}}},claims:Claims{slot:[0;16],slot_count:u32::from(!render),pass:[0;4]},head:1,ta_head:1,fs_head:1,rec:[1;3],chan_settled:false,pb_slot:0,uma_submitted:2,csubmitted:{let mut a=[0u64;16];if !render{a[0]=ordinal;}a},recovery_suspect:false,recovery_started_ns:0,gate_passed_ns:None,unsettled_polls:0,doomed:false}],target:target_arr,ta_target:target,fs_target:target,retired_ticks:[0;4]},
-        slots:Slots{scrub:Scrub{compute:vec![CUnit{counter:Object::default(),its:Object::default(),work:Object::default()}],passes:vec![RUnit{scene:Object::default()}]}},
+        engine:Engine{flights:vec![Flight{computes:u32::from(!render),renders:u32::from(render),compute_pipe:0,target,ta_target:target,fs_target:target,job:Job{vm:Vm{slot:2},resources:Resources{compute:vec![CUnit{counter:Object::default(),descriptor:Object::default(),its:Object::default(),work:Object::default()}],passes:vec![RUnit{scene:Object::default()}],pools:Pools{full:true,completed:2}}},claims:Claims{slot:[0;16],slot_count:u32::from(!render),pass:[0;4]},head:1,ta_head:1,fs_head:1,rec:[1;3],chan_settled:false,pb_slot:0,uma_submitted:2,csubmitted:{let mut a=[0u64;16];if !render{a[0]=ordinal;}a},recovery_suspect:false,recovery_started_ns:0,gate_passed_ns:None,unsettled_polls:0,doomed:false}],target:target_arr,ta_target:target,fs_target:target,retired_ticks:[0;4]},
+        slots:Slots{scrub:Scrub{compute:vec![CUnit{counter:Object::default(),descriptor:Object::default(),its:Object::default(),work:Object::default()}],passes:vec![RUnit{scene:Object::default()}]}},
         pools:Pools{full:true,completed:2},channels:TopChannels{compute_producer:1},queue_passed:true,last_chan_passed:Cell::new(None),
     };
     f.graph.compute[0].fw_stamp.set(0,u64::from(target));
@@ -93,8 +93,8 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     f.graph.compute[0].notifier.set(notifier_page::COMPUTE_CONTEXT,2);
     f.engine.flights[0].job.resources.compute[0].counter.set(0,ordinal);
     f.engine.flights[0].job.resources.compute[0].its.set(0,100);f.engine.flights[0].job.resources.compute[0].its.set(8,101);
-    f.engine.flights[0].job.resources.compute[0].work.set(compute::DESCRIPTOR_COMPLETED,ordinal);
-    f.engine.flights[0].job.resources.compute[0].work.set(compute::DESCRIPTOR_COUNTER,0x1234);
+    f.engine.flights[0].job.resources.compute[0].descriptor.set(manager::COMPLETED,ordinal);
+    f.engine.flights[0].job.resources.compute[0].descriptor.set(manager::COUNTER,0x1234);
     for stage in 0..2{f.graph.render.fw_stamp[stage].set(0,u64::from(target));}
     f.graph.render.notifier.set(notifier_page::TA_STAMP,u64::from(target));
     f.graph.render.notifier.set(notifier_page::FS_STAMP,u64::from(target));
@@ -146,7 +146,7 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
         f.graph.compute[0].fw_stamp.set(0,u64::from(encode::stamp(n)));
         assert_eq!(f.retired(),Ok(Retirement::Full));
         f.queue_passed=false;assert_eq!(f.retired(),Ok(Retirement::Pending));
-        f.queue_passed=true;f.engine.flights[0].job.resources.compute[0].work.set(compute::DESCRIPTOR_COMPLETED,n-1);
+        f.queue_passed=true;f.engine.flights[0].job.resources.compute[0].descriptor.set(manager::COMPLETED,n-1);
         assert_eq!(f.retired(),Ok(Retirement::Pending));
     }
 }
@@ -224,11 +224,11 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
 #[test]fn multi_compute_horizon_requires_every_claimed_unit_receipt(){
     let mut f=firmware(false,12);
     let mk_unit=|sub:u64,start:u64,end:u64|{
-        let mut u=CUnit{counter:Object::default(),its:Object::default(),work:Object::default()};
+        let mut u=CUnit{counter:Object::default(),descriptor:Object::default(),its:Object::default(),work:Object::default()};
         u.counter.set(0,sub);
         u.its.set(0,start);u.its.set(8,end);
-        u.work.set(compute::DESCRIPTOR_COMPLETED,sub);
-        u.work.set(compute::DESCRIPTOR_COUNTER,0x1234);
+        u.descriptor.set(manager::COMPLETED,sub);
+        u.descriptor.set(manager::COUNTER,0x1234);
         u
     };
     let fl=&mut f.engine.flights[0];
@@ -239,9 +239,9 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     fl.job.resources.compute=vec![mk_unit(10,100,110),mk_unit(11,110,120),mk_unit(12,120,130)];
     assert_eq!(f.retired(),Ok(Retirement::Full));
     // Missing interior unit completion keeps the whole batched flight pending.
-    f.engine.flights[0].job.resources.compute[1].work.set(compute::DESCRIPTOR_COMPLETED,10);
+    f.engine.flights[0].job.resources.compute[1].descriptor.set(manager::COMPLETED,10);
     assert_eq!(f.retired(),Ok(Retirement::Pending));
-    f.engine.flights[0].job.resources.compute[1].work.set(compute::DESCRIPTOR_COMPLETED,11);
+    f.engine.flights[0].job.resources.compute[1].descriptor.set(manager::COMPLETED,11);
     // Missing tail unit ticks keeps the whole batched flight pending.
     f.engine.flights[0].job.resources.compute[2].its.set(8,0);
     assert_eq!(f.retired(),Ok(Retirement::Pending));

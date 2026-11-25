@@ -7,7 +7,7 @@
 
 use super::{
     command::Command,
-    object::{Factory, Objects},
+    object::{Factory, FwObject, Objects},
     pools::{PbEpoch, PoolSet},
     slots::{ComputeSlot, PassCmds, PassSlot, Placement, UnitCmds},
     vm::VmState,
@@ -77,16 +77,20 @@ impl RenderCmds {
 }
 
 /// One hardware compute unit's device-lifetime command records and the allocator that maps
-/// them. The allocator is never dropped for the same reason as [`PersistentPassCmds`].
+/// them. The allocator is never dropped for the same reason as [`PersistentPassCmds`]; partial
+/// allocations are retained in place so a retry finishes without leaking or duplicating pages.
 struct PersistentUnitCmds {
     objects: core::mem::ManuallyDrop<Objects>,
-    cmds: Option<UnitCmds>,
+    work: Option<Arc<FwObject>>,
+    seq: Option<Arc<FwObject>>,
+    barrier: Option<Arc<FwObject>>,
+    finished: bool,
 }
 
-/// The firmware-cached compute command records (microsequence and barrier records) of every
-/// hardware compute unit (`0..COMPUTE_UNITS`), created on first use and kept until reboot. A
-/// hardware compute unit is device-global and claimed by one flight at a time, so every VM's
-/// [`ComputeSlot`] bound to hardware unit `k` shares its records, and closing a VM drops no
+/// The firmware-cached compute command records (work image, microsequence, and barrier records)
+/// of every hardware compute unit (`0..COMPUTE_UNITS`), created on first use and kept until
+/// reboot. A hardware compute unit is device-global and claimed by one flight at a time, so every
+/// VM's [`ComputeSlot`] bound to hardware unit `k` shares its records, and closing a VM drops no
 /// firmware-cached mapping.
 #[pin_data]
 pub(crate) struct ComputeCmds {
@@ -111,21 +115,38 @@ impl ComputeCmds {
     pub(crate) fn get(&self, factory: &Factory, k: usize) -> Result<UnitCmds> {
         let mut sets = self.sets.lock();
         let entry = sets.get_mut(k).ok_or(EINVAL)?;
-        if let Some(cmds) = entry.as_ref().and_then(|set| set.cmds.as_ref()) {
-            return Ok(cmds.clone());
+        if entry.is_none() {
+            let slot = KBox::<PersistentUnitCmds>::new_uninit(GFP_KERNEL)?;
+            *entry = Some(KBox::write(
+                slot,
+                PersistentUnitCmds {
+                    objects: core::mem::ManuallyDrop::new(factory.persistent_objects()),
+                    work: None,
+                    seq: None,
+                    barrier: None,
+                    finished: false,
+                },
+            ));
         }
-        let mut set = KBox::new(
-            PersistentUnitCmds {
-                objects: core::mem::ManuallyDrop::new(factory.persistent_objects()),
-                cmds: None,
-            },
-            GFP_KERNEL,
+        let set: &mut PersistentUnitCmds = &mut **entry.as_mut().ok_or(EINVAL)?;
+        if set.finished {
+            if let (Some(work), Some(seq), Some(barrier)) = (&set.work, &set.seq, &set.barrier) {
+                return Ok(UnitCmds {
+                    work: work.clone(),
+                    seq: seq.clone(),
+                    barrier: barrier.clone(),
+                });
+            }
+        }
+        let cmds = UnitCmds::init_into(
+            &mut set.objects,
+            k as u64,
+            &mut set.work,
+            &mut set.seq,
+            &mut set.barrier,
         )?;
-        // From here on a failure leaks the allocator with whatever it mapped.
-        let cmds = UnitCmds::new(&mut set.objects)?;
         set.objects.finish_private()?;
-        set.cmds = Some(cmds.clone());
-        *entry = Some(set);
+        set.finished = true;
         Ok(cmds)
     }
 }
@@ -183,7 +204,14 @@ impl ComputeArena {
     ) -> Result<Arc<Self>> {
         let cmds = factory.compute_cmds(hw_slot)?;
         let mut objects = factory.objects(vm);
-        let unit = ComputeSlot::new_in(&mut objects, factory, local as u64, placement, &cmds)?;
+        let unit = ComputeSlot::new_in(
+            &mut objects,
+            factory,
+            local as u64,
+            hw_slot as u32,
+            placement,
+            &cmds,
+        )?;
         objects.finish_private()?;
         Ok(Arc::new(
             Self(crate::cleanup::Deferred::new(ComputeInner {

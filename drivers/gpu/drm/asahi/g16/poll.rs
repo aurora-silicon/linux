@@ -33,8 +33,7 @@ use kernel::{
 
 use super::channel::Channel;
 use super::engine::{complete, now_ns, rmb, Flight, Lap};
-use super::fw::graph::{notifier, notifier_page, qstate};
-use super::fw::work::compute;
+use super::fw::graph::{manager, notifier, notifier_page, qstate};
 use super::job::{self, Completions, Job};
 use super::recovery::logic::{Retirement, ABORT_GRACE_NS};
 use super::regs::EngineState;
@@ -988,7 +987,8 @@ impl Firmware {
     /// A compute unit's GPU start and end ticks. 25G83 writes them into the unit's ITS pair;
     /// ABIs with `work_ticks` leave ITS 0/0 and write them into the work object. Check
     /// `work_ticks` first when the ABI defines them so 26B123 skips two always-zero WC reads
-    /// per command, falling back to ITS if `work_ticks` holds no interval.
+    /// per command, invalidating the cacheable `FwCoherent` work lines to PoC before reading
+    /// (`sync_for_cpu`), and falling back to ITS if `work_ticks` holds no interval.
     fn compute_ticks(&self, unit: &super::slots::ComputeSlot) -> Result<(u64, u64)> {
         Self::compute_ticks_with(self.init.abi.compute().work_ticks, unit)
     }
@@ -999,6 +999,9 @@ impl Firmware {
     ) -> Result<(u64, u64)> {
         if let Some((start_off, end_off)) = work_ticks {
             let w = &unit.work;
+            let lo = start_off.min(end_off);
+            let hi = start_off.max(end_off).checked_add(8).ok_or(EINVAL)?;
+            w.sync_for_cpu(lo, hi - lo)?;
             // Work tick offsets are 4-byte aligned (not 8-byte), so read hi/lo/hi to avoid tearing.
             let at = |o: usize| -> Result<u64> {
                 for _ in 0..4 {
@@ -1322,8 +1325,8 @@ impl Firmware {
                     let submitted = f.csubmitted[m];
                     if submitted == 0
                         || unit.counter.r64(0)? != submitted
-                        || unit.work.r64(compute::DESCRIPTOR_COMPLETED)? != submitted
-                        || unit.work.r64(compute::DESCRIPTOR_COUNTER)? != unit.counter.va
+                        || unit.descriptor.r64(manager::COMPLETED)? != submitted
+                        || unit.descriptor.r64(manager::COUNTER)? != unit.counter.va
                     {
                         full = false;
                         break;

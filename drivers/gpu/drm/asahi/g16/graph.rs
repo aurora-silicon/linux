@@ -92,6 +92,7 @@ pub(crate) fn alloc(
 /// Work lists belong to the kernel GPU task. Firmware prepares them through the upper
 /// mapping and hardware reads the existing lower address; applications get no alias.
 /// Preserve the established cache classes and wire addresses while separating ownership.
+#[allow(dead_code)]
 pub(crate) fn alloc_work(
     objects: &mut Objects,
     size: usize,

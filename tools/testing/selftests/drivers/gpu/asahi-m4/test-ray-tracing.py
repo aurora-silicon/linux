@@ -191,7 +191,7 @@ fn compute_refs() -> encode::ComputeRefs {
     let f = 0xfffffc2000000000u64; let g = 0x1000000000u64;
     encode::ComputeRefs {
         notifier: f + 0x600400, qinfo: f + 0x200000, user_stamp: f + 0x600648, fw_stamp: f + 0x600640,
-        work: f + 0x100000, work_gva: g + 0x100000, seq: f + 0x100900, preempt_gva: g + 0x200000,
+        work: f + 0x100000, work_gva: g + 0x100000, seq: f + 0x100900, descriptor_fw: 0, preempt_gva: g + 0x200000,
         its: f + 0x1008c0, stats_fw: f + 0x300000, auxiliary_fw: f + 0x400000, auxiliary_gva: g + 0x400000,
         context_store_gva: g + 0x500000, counter_fw: f + 0x500000, pool_state_gva: g + 0x600000,
         page_list_gva: g + 0x700000, usc_base: 1 << 40, record_fw: f + 0x700000, binding_generation: 1,
