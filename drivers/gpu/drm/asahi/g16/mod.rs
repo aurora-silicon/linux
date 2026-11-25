@@ -883,8 +883,10 @@ impl gpu::Gpu for Gpu {
         true
     }
 
+    /// G16 programs no fault mode into the firmware: an unmapped shader access behaves as the
+    /// firmware's default fault mode makes it. `fault_control` (default 0xb) stays the opt-out.
     fn soft_faults(&self) -> bool {
-        false
+        true
     }
 
     fn prepare_new_objects(&self) -> bool {
