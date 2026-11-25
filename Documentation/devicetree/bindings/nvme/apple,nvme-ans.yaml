@@ -19,6 +19,7 @@ properties:
           - enum:
               - apple,t6020-nvme-ans2
               - apple,t6030-nvme-ans2
+              - apple,t6030-nvme-ans3
               - apple,t6031-nvme-ans2
               - apple,t8122-nvme-ans2
           - const: apple,t8103-nvme-ans2
