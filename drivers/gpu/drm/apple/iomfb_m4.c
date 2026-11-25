@@ -3952,8 +3952,9 @@ static_assert(sizeof(struct dcp_m4_mode_info_req) == 0x7c);
  * The colour element of a timing: RGB with the SDR gamma EOTF, not virtual,
  * not unsafe for the timing, at 8 bpc if the timing lists it as needing DSC;
  * the lowest depth offered (8 bpc if there is one); at that depth one that
- * needs no DSC over one that does, then sRGB/BT.709 colorimetry and full
- * range over others, then the higher score. Never PQ or HLG.
+ * needs no DSC over one that does, then Default RGB colorimetry (the sink's
+ * native gamut) over sRGB/BT.709 over others, then full range, then the higher
+ * score. Never PQ or HLG.
  */
 struct dcp_m4_ext_pick {
 	struct dcp_color_element best;
@@ -3962,9 +3963,14 @@ struct dcp_m4_ext_pick {
 
 static unsigned int dcp_m4_ext_color_rank(const struct dcp_color_element *e)
 {
-	return (e->colorimetry == DCP_COLORIMETRY_SRGB ||
-		e->colorimetry == DCP_COLORIMETRY_BT709 ? 2 : 0) +
-	       (e->range == DCP_COLOR_YCBCR_RANGE_FULL ? 1 : 0);
+	unsigned int space = 0;
+
+	if (e->colorimetry == DCP_COLORIMETRY_RGB)
+		space = 4;
+	else if (e->colorimetry == DCP_COLORIMETRY_SRGB ||
+		 e->colorimetry == DCP_COLORIMETRY_BT709)
+		space = 2;
+	return space + (e->range == DCP_COLOR_YCBCR_RANGE_FULL ? 1 : 0);
 }
 
 static void dcp_m4_ext_pick_color(void *data, const struct dcp_color_element *e)
