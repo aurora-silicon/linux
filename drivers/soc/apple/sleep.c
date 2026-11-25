@@ -6157,8 +6157,7 @@ static int apple_sleep_enter_prepare(struct apple_sleep *s)
 	if (s->soc->ops->check) {
 		ret = s->soc->ops->check(s);
 		if (ret) {
-			if (s->soc->regions)
-				dev_info(s->dev, "refused at .enter: %s: %d\n", step, ret);
+			dev_info(s->dev, "refused at .enter: %s: %d\n", step, ret);
 			return ret;
 		}
 	}
@@ -6193,7 +6192,7 @@ static int apple_sleep_enter_prepare(struct apple_sleep *s)
 		step = "wakeup pending";
 		ret = -EBUSY;
 	}
-	if (ret && s->soc->regions)
+	if (ret)
 		dev_info(s->dev, "refused at .enter: %s: %d\n", step, ret);
 	if (!ret && s->soc->ops->display_stop) {
 		apple_sleep_display_then_gpu(s);
@@ -6979,7 +6978,7 @@ static int apple_sleep_late_scope_begin(void)
 		step = "ANS reservation";
 		ret = sleep_ans_late_reserve();
 	}
-	if (ret && apple_sleep->soc->regions)
+	if (ret)
 		dev_info(apple_sleep->dev, "refused at .prepare_late: %s: %d\n", step, ret);
 	if (ret) {
 		apple_sleep_smc_scope_end();
