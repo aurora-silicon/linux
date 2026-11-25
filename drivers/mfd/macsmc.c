@@ -86,12 +86,15 @@ static const struct mfd_cell apple_smc_described_devs[] = {
 
 /*
  * T6050's reboot/power-off and RTC, for a kernel that owns the machine (J775D, booted bare
- * metal). Registered only where the device tree describes them, so a T6050 device tree without
- * them registers what it did before.
+ * metal), and the gP GPIO bank, which carries the J716s's N1 power line (gP13, the pwren-gpios
+ * of its Wi-Fi/Bluetooth port). Registered only where the device tree describes them, so a T6050
+ * device tree without them registers what it did before. The gP bank has a cell name of its own:
+ * "macsmc-gpio" is the PCIO bank's, and the driver binds both by compatible.
  */
 static const struct mfd_cell apple_smc_t6050_described_devs[] = {
 	MFD_CELL_OF("macsmc-reboot", NULL, NULL, 0, 0, "apple,smc-reboot"),
 	MFD_CELL_OF("macsmc-rtc", NULL, NULL, 0, 0, "apple,smc-rtc"),
+	MFD_CELL_OF("macsmc-gp-gpio", NULL, NULL, 0, 0, "apple,smc-gpio"),
 };
 
 static int apple_smc_add_described_devices(struct apple_smc *smc, const struct mfd_cell *cells,
