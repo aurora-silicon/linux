@@ -137,9 +137,9 @@ fn main() {
         OWNER_CALLS.set(0); let bytes = fixture(kind);
         assert!(parse(&dev, &Adt { data: &bytes }).is_err()); assert_eq!(OWNER_CALLS.get(), 0);
     }
-    assert_eq!(BUILDS.len(), 3, "maintained B0 firmware row must not require an absent profile symbol");
-    for (row, machine) in [(1, &b"apple,j516s"[..]), (2, &b"apple,j514s"[..])] {
-        assert_eq!(BUILDS[row].machine.unwrap().to_bytes(), machine);
+    assert_eq!(BUILDS.len(), 2, "maintained B0 firmware row must not require an absent profile symbol");
+    for row in [1] {
+        assert!(BUILDS[row].machine.is_none(), "the B0 build is the same on every T6030 board");
         assert_eq!((BUILDS[row].text_size, BUILDS[row].data_size, BUILDS[row].marker), (0x5c000, 0x114000, 0x58e88));
         assert_eq!(BUILDS[row].text_sha256, [0xda,0x26,0xec,0xca,0xb1,0xf8,0x59,0x8d,0xa8,0x0c,0x85,0x5e,0xca,0x91,0x65,0x20,0x40,0x6d,0x1d,0x06,0x70,0xf1,0xd4,0x70,0xe7,0x9b,0xb9,0xb0,0x22,0x09,0xdb,0x53]);
     }
@@ -173,7 +173,7 @@ def main():
         variants['skip-owner-check']=source.replace('if !glue::reserved_uat(i as u32, r.start, r.end - r.start) {','if false {')
         variants['skip-fourth-owner']=source.replace('region[..4].iter().enumerate()', 'region[..3].iter().enumerate()')
         variants['drop-reserved-ram']=source.replace('Some(dram_base..dram_base + dram_size), true)?;', 'Some(dram_base..dram_base + dram_size), false)?;')
-        variants['require-obsolete-b0-profile']=source.replace('          FirmwareBuild {\n            name: "J516S B0', '          #[cfg(CONFIG_SILICONFOREST_NATIVE_GPU)]\n          FirmwareBuild {\n            name: "J516S B0')
+        variants['require-obsolete-b0-profile']=source.replace('          FirmwareBuild {\n            name: "T6030 B0', '          #[cfg(CONFIG_SILICONFOREST_NATIVE_GPU)]\n          FirmwareBuild {\n            name: "T6030 B0')
         variants['named-mailbox']=source.replace('cookie, core::ptr::null(), 0, &RTKIT_OPS', 'cookie, c"mbox".as_ptr(), 0, &RTKIT_OPS')
     receipt={'scope':__doc__,'sources':{p:hashlib.sha256(t.encode()).hexdigest() for p,t in [('adt.rs',adt),('boot.rs',boot),('hw.rs',hw),('board/record.rs',record)]},'variants':{}}
     for name,text in variants.items():

@@ -280,10 +280,10 @@ const EPROBE_DEFER: Error = Error(-517);
 macro_rules! dev_err { ($($args:tt)*) => {{}}; }
 macro_rules! dev_info { ($($args:tt)*) => {{}}; }
 macro_rules! dev_warn { ($($args:tt)*) => {{ warned(); }}; }
-struct State { board: bool, machine: bool, pmp: i32, display: i32, sleep_hold: bool, asc_fail: bool }
+struct State { machine: bool, pmp: i32, display: i32, sleep_hold: bool, asc_fail: bool }
 thread_local! {
     static CALLS: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
-    static STATE: RefCell<State> = const { RefCell::new(State { board: true, machine: true, pmp: 0, display: 0, sleep_hold: true, asc_fail: false }) };
+    static STATE: RefCell<State> = const { RefCell::new(State { machine: true, pmp: 0, display: 0, sleep_hold: true, asc_fail: false }) };
     static HOLD: RefCell<Option<bool>> = const { RefCell::new(None) };
     static WARNINGS: RefCell<u32> = const { RefCell::new(0) };
 }
@@ -330,7 +330,6 @@ mod regs {
 }
 mod glue {
     use super::{call, STATE};
-    pub fn board() -> bool { call("board"); STATE.with(|s| s.borrow().board) }
     pub fn machine(_: &str) -> bool { call("machine"); STATE.with(|s| s.borrow().machine) }
     pub unsafe fn asahi_g15_pmp_prepare(_: *mut core::ffi::c_void) -> core::ffi::c_int { call("pmp"); STATE.with(|s| s.borrow().pmp) }
     pub unsafe fn asahi_g15_display_prepare(_: *mut core::ffi::c_void) -> core::ffi::c_int { call("display"); STATE.with(|s| s.borrow().display) }
@@ -346,7 +345,7 @@ static T6030: Config = Config { platform: hw::Platform::AdtWithPmp, machine: "ap
 const TAIL: [&str; 6] = ["adt", "identity", "coherent", "board_images", "regs", "hold"];
 fn run(cfg: &'static Config, machine: bool, pmp: i32, display: i32) -> (Result<()>, Vec<&'static str>) {
     CALLS.with(|c| c.borrow_mut().clear());
-    STATE.with(|s| *s.borrow_mut() = State { board: true, machine, pmp, display, sleep_hold: true, asc_fail: false });
+    STATE.with(|s| *s.borrow_mut() = State { machine, pmp, display, sleep_hold: true, asc_fail: false });
     HOLD.with(|h| *h.borrow_mut() = None);
     WARNINGS.with(|w| *w.borrow_mut() = 0);
     let pdev = platform::Device(device::Device, Core(PhantomData));
@@ -360,8 +359,9 @@ fn main() {
     assert_eq!(run(&T6031, true, 0, -19), (Err(ENODEV), vec!["machine", "display"]), "T6031 refusal stops admission");
     assert_eq!(run(&T6031, true, 0, 0), (Ok(()), with_tail(&["machine", "display"])), "T6031 admitted after its display");
     assert_eq!(run(&T6031, false, 0, 0), (Err(ENODEV), vec!["machine"]), "the machine check comes first");
-    assert_eq!(run(&T6030, true, 0, -517), (Ok(()), with_tail(&["board", "pmp"])), "T6030 path unchanged");
-    assert_eq!(run(&T6030, true, -517, 0), (Err(EPROBE_DEFER), vec!["board", "pmp"]), "T6030 still defers on its PMP link");
+    assert_eq!(run(&T6030, true, 0, -517), (Ok(()), with_tail(&["machine", "pmp"])), "T6030 is admitted by its SoC and PMP link, not its display");
+    assert_eq!(run(&T6030, true, -517, 0), (Err(EPROBE_DEFER), vec!["machine", "pmp"]), "T6030 still defers on its PMP link");
+    assert_eq!(run(&T6030, false, 0, 0), (Err(ENODEV), vec!["machine"]), "T6030: another SoC is refused before any PMP vote");
 @SLEEP_HOLD_CHECKS@
 }
 '''
@@ -372,7 +372,7 @@ HOLD_SLEEP = ('    pub fn hold_power(_: &super::device::Device, sleep_hold: bool
 SLEEP_HOLD_RUN = r'''
 fn run_hold(cfg: &'static Config, sleep_hold: bool, asc_fail: bool) -> (Result<()>, Vec<&'static str>, Option<bool>, u32) {
     CALLS.with(|c| c.borrow_mut().clear());
-    STATE.with(|s| *s.borrow_mut() = State { board: true, machine: true, pmp: 0, display: 0, sleep_hold, asc_fail });
+    STATE.with(|s| *s.borrow_mut() = State { machine: true, pmp: 0, display: 0, sleep_hold, asc_fail });
     HOLD.with(|h| *h.borrow_mut() = None);
     WARNINGS.with(|w| *w.borrow_mut() = 0);
     let pdev = platform::Device(device::Device, Core(PhantomData));
@@ -385,10 +385,10 @@ SLEEP_HOLD_CHECKS = r'''
     // The system-sleep hold: T6031 only, and only while g15_sleep_hold is on; off is warned about.
     assert_eq!(run_hold(&T6031, true, false), (Ok(()), with_tail(&["machine", "display"]), Some(true), 0), "T6031 holds gfx through sleep");
     assert_eq!(run_hold(&T6031, false, false), (Ok(()), with_tail(&["machine", "display"]), Some(false), 1), "g15_sleep_hold=0: no sleep hold, one warning");
-    assert_eq!(run_hold(&T6030, true, false), (Ok(()), with_tail(&["board", "pmp"]), Some(false), 0), "T6030 never holds through sleep");
+    assert_eq!(run_hold(&T6030, true, false), (Ok(()), with_tail(&["machine", "pmp"]), Some(false), 0), "T6030 never holds through sleep");
     // The ASC read comes before the hold: a failure there leaves no hold behind.
     assert_eq!(run_hold(&T6031, true, true), (Err(EIO), before_hold(&["machine", "display"]), None, 0), "T6031: ASC failure takes no hold");
-    assert_eq!(run_hold(&T6030, true, true), (Err(EIO), before_hold(&["board", "pmp"]), None, 0), "T6030: ASC failure takes no hold");
+    assert_eq!(run_hold(&T6030, true, true), (Err(EIO), before_hold(&["machine", "pmp"]), None, 0), "T6030: ASC failure takes no hold");
 '''
 SLEEP_HOLD_MUTANTS = {
     "sleep-hold-any-platform": ("let sleep_hold = t6031 && params::sleep_hold();", "let sleep_hold = params::sleep_hold();"),
@@ -402,6 +402,11 @@ RS_MUTANTS = {
     "display-refusal-ignored": ("dev_err!(dev, \"native display not admitted: {:?}\\n\", err);\n            }\n            return Err(err);",
                                 "dev_err!(dev, \"native display not admitted: {:?}\\n\", err);\n            }"),
     "display-order-skipped": ("let ret = unsafe { glue::asahi_g15_display_prepare(dev.as_raw().cast()) };", "let ret = 0;"),
+    # The machine check moved behind the PMP vote (or the display wait).
+    "machine-check-after-vote": (re.compile(r"(    if !glue::machine\(cfg\.machine\) \{.*?\n    \}\n)(    if pmp \{.*?\n    \}\n)", re.S),
+                                 r"\2\1"),
+    # Only the board-pinned T6031 checks its machine, as before the T6030 board list went.
+    "t6030-machine-unchecked": ("if !glue::machine(cfg.machine) {", "if !pmp && !glue::machine(cfg.machine) {"),
 }
 
 
