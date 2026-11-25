@@ -23,14 +23,29 @@
 /*
  * The firmware publishes a die sensor only while its cluster has power, so an idle
  * machine can have none valid for a moment (0.46 s the longest measured). Go on from the
- * last reading for this long, if it was this cool. Longer or hotter is a failed sensor.
+ * last reading for this long, if it was this cool. Longer or hotter is a failed sensor,
+ * except for a single transient PMP SRAM refresh glitch below passive throttling.
  */
 #define APPLE_PMP_GATED_HOLD_NS 2000000000ULL
-#define APPLE_PMP_GATED_HOLD_MC 90000
+#define APPLE_PMP_GATED_HOLD_MC 100000
+#define APPLE_PMP_TRANSIENT_HOLD_NS 100000000ULL
 /* Below this hotspot, with no fault, recovery or cooling in force, nothing
  * acts until prediction starts at 105 C, so the slow cadence is enough.
  */
 #define APPLE_PMP_FAST_POLL_MC 95000
+
+static inline bool apple_pmp_hold_nodata(unsigned long long valid_ns,
+					 long valid_mc,
+					 unsigned long long now, bool idle)
+{
+	if (!valid_ns || now < valid_ns)
+		return false;
+	if (valid_mc < APPLE_PMP_GATED_HOLD_MC &&
+	    (idle || now - valid_ns < APPLE_PMP_GATED_HOLD_NS))
+		return true;
+	return valid_mc < APPLE_PMP_PASSIVE_MC &&
+	       now - valid_ns <= APPLE_PMP_TRANSIENT_HOLD_NS;
+}
 
 struct apple_pmp_cooling {
 	unsigned long long last_ns, good_ns, anchor_ns, release_ns;

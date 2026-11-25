@@ -9,7 +9,6 @@
  * Copyright The Aurora Silicon Contributors
  */
 #include <kunit/test.h>
-#include <linux/module.h>
 #include <linux/errno.h>
 #include <linux/string.h>
 #include <linux/unaligned.h>
@@ -439,6 +438,3 @@ static struct kunit_suite ave_mctf_suite = {
 	.test_cases = ave_mctf_cases,
 };
 kunit_test_suite(ave_mctf_suite);
-
-MODULE_DESCRIPTION("Apple AVE MCTF command image tests");
-MODULE_LICENSE("GPL");

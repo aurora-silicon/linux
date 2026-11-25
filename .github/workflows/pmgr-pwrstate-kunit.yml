@@ -1,0 +1,46 @@
+name: PMGR power state KUnit
+
+# The apple-pmgr-pwrstate KUnit suite (power transitions, apple,no-auto-pm,
+# consumers, reset controller) on arm64 QEMU. It runs on an emulated
+# register, so it needs no PMGR.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'drivers/pmdomain/apple/**'
+      - 'include/linux/soc/apple/**'
+      - '.github/workflows/pmgr-pwrstate-kunit.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pmgr-pwrstate-kunit-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  kunit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Install kernel build and QEMU dependencies
+        run: |
+          # As sep-source.yml: avoid the hosted runner's Azure mirror.
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            printf '%s\n' 'https://archive.ubuntu.com/ubuntu/' 'https://security.ubuntu.com/ubuntu/' | \
+              sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+          fi
+          sudo apt-get update -o APT::Update::Error-Mode=any
+          sudo apt-get install -y clang lld llvm libelf-dev libssl-dev \
+            flex bison bc pkg-config make perl qemu-system-arm
+      - name: Run the PMGR power state KUnit suite on arm64 QEMU
+        run: |
+          ./tools/testing/kunit/kunit.py run --arch=arm64 \
+            --make_options LLVM=1 \
+            --kunitconfig=drivers/pmdomain/apple/.kunitconfig.pmgr-pwrstate \
+            --jobs="$(nproc)" --timeout=900

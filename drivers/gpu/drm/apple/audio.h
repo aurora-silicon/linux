@@ -17,6 +17,7 @@ int dcp_audio_sink_eld(struct device *dev, u8 *eld, size_t size);
 
 void dcpaud_connect(struct platform_device *pdev, bool connected);
 void dcpaud_disconnect(struct platform_device *pdev);
+void dcpaud_refresh_eld(struct platform_device *pdev);
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
 /* Native link methods for 14.7 and desktop 26.x external roles. */
@@ -47,6 +48,9 @@ struct dcp_audio_link_format {
 bool dcp_audiosrv_link_by_format(struct device *dev);
 
 bool dcp_audiosrv_native_link(struct device *dev);
+/* The published audio service instance; whether it was replaced since @gen */
+u64 dcp_audiosrv_instance(struct device *dev);
+bool dcp_audiosrv_replaced(struct device *dev, u64 gen);
 int dcp_audiosrv_open(struct device *dev);
 void dcp_audiosrv_close(struct device *dev);
 int dcp_audiosrv_link(struct device *dev, enum dcp_audio_link op,
