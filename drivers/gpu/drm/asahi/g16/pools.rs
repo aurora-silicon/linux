@@ -489,7 +489,8 @@ pub(crate) struct Pools {
     pending_arenas: [Option<super::resources::PbOwnerArena>; sizes::PB_SLOTS],
     pending_uma: [Option<Arc<FwLease>>; sizes::PB_SLOTS],
     /// Per allocator slot, a binding count, bumped by each fresh epoch (its InitBM rebinds the
-    /// slot) and by a firmware recovery. It identifies a binding without holding the epoch.
+    /// slot) and by a firmware recovery or sleep restart. It identifies a binding without
+    /// holding the epoch.
     binds: [u64; sizes::PB_SLOTS],
     /// Per allocator slot: `owners[k]` may serve the next render of its VM without InitBM.
     keep: [bool; sizes::PB_SLOTS],
@@ -1062,7 +1063,8 @@ impl Pools {
         *binds
     }
     /// A render on slot `k` with `binding` retired, after its `retire_binding`. If no other
-    /// epoch was bound and no recovery started since, the next render of the same VM may reuse
+    /// epoch was bound and no recovery or sleep restart happened since, the next render of the
+    /// same VM may reuse
     /// its epoch after a `completed` render; after a failed one it starts fresh.
     pub(crate) fn retire_epoch(&mut self, k: usize, binding: u64, completed: bool) {
         if self.binds.get(k) == Some(&binding) {

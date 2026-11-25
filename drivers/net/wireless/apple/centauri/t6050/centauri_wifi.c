@@ -89,6 +89,8 @@ struct centauri_t6050_wifi {
 	size_t reply_capacity, reply_size;
 	bool stopping, command_failed;
 	bool tx_paused, transport_paused, host_sleep_sent, transport_sleep_sent;
+	bool regulatory_deferred;
+	u8 country_deferred[3];
 	bool host_events_fallback_logged;
 	bool scan_abort, connect_abort;
 	u8 scan_sequence;
@@ -763,7 +765,7 @@ static int command_reply(struct centauri_t6050_wifi *wifi, u32 id,
 			 const void *payload, size_t size, void *reply,
 			 size_t *reply_size, bool *submitted)
 {
-	u16 slot = wifi->command_head, sequence = ++wifi->sequence;
+	u16 slot = wifi->command_head, sequence;
 	int ret;
 	u32 stage;
 	u8 *packet, *descriptor;
@@ -771,6 +773,10 @@ static int command_reply(struct centauri_t6050_wifi *wifi, u32 id,
 
 	if (submitted)
 		*submitted = false;
+	/* The PCI link can go down after the host-sleep command. */
+	if (wifi->host_sleep_sent)
+		return -EHOSTDOWN;
+	sequence = ++wifi->sequence;
 	if (wifi->command_failed)
 		return -EIO;
 	if (size > BUFFER_SIZE - 24)
@@ -973,6 +979,18 @@ static void channels_apply(struct centauri_t6050_wifi *wifi)
 		 counted[0], counted[1], counted[2], list[0]);
 }
 
+static void country_set(struct centauri_t6050_wifi *wifi, const u8 country[3])
+{
+	int ret = command(wifi, 9, country, 3);
+
+	if (ret)
+		dev_err(&wifi->control->pdev->dev,
+			"firmware country update failed: %d\n", ret);
+	else
+		firmware_report(wifi, 19, wifi->hw_channels,
+				&wifi->hw_channels_blob);
+}
+
 /*
  * 6 GHz needs HE: the station's HE capabilities element as the firmware
  * reports it (capabilities TLV 0xff), with the 6 GHz band capabilities taken
@@ -1122,6 +1140,44 @@ static int radio_start(struct centauri_t6050_wifi *wifi)
 #define SCAN_ACTIVE_MIN_MS 40
 #define SCAN_LISTEN_MS 110
 
+static bool scan_transport_stopped(struct centauri_t6050_wifi *wifi)
+{
+	return READ_ONCE(wifi->stopping) || wifi->command_failed ||
+	       wifi->host_sleep_sent || readl(wifi->a.bar + 8) != 2;
+}
+
+static int scan_stop_chunk(struct centauri_t6050_wifi *wifi, u32 done)
+{
+	unsigned long deadline;
+	int ret;
+
+	lockdep_assert_held(&wifi->lock);
+	if (scan_transport_stopped(wifi))
+		return -EIO;
+	ret = command(wifi, 65537, NULL, 0);
+	if (wifi->scans_done != done)
+		return 0;
+	if (ret == -EREMOTEIO && wifi->reply_status == 342)
+		return 0;
+	if (ret)
+		return ret;
+	deadline = jiffies + msecs_to_jiffies(1000);
+	do {
+		if (scan_transport_stopped(wifi))
+			return -EIO;
+		drain(wifi);
+		if (wifi->scans_done != done)
+			return 0;
+		mutex_unlock(&wifi->lock);
+		usleep_range(1000, 2000);
+		mutex_lock(&wifi->lock);
+	} while (time_before(jiffies, deadline));
+	if (scan_transport_stopped(wifi))
+		return -EIO;
+	drain(wifi);
+	return wifi->scans_done != done ? 0 : -ETIMEDOUT;
+}
+
 static int scan_profile27(struct centauri_t6050_wifi *wifi)
 {
 	struct cfg80211_scan_request *request = wifi->scan_request;
@@ -1138,8 +1194,9 @@ static int scan_profile27(struct centauri_t6050_wifi *wifi)
 		size_t size = 14;
 		unsigned long deadline;
 		int ret;
-		bool abort_sent = false;
 
+		if (scan_transport_stopped(wifi))
+			return -EIO;
 		if (READ_ONCE(wifi->scan_abort))
 			return -ECANCELED;
 		memset(scan, 0, sizeof(scan));
@@ -1210,28 +1267,32 @@ static int scan_profile27(struct centauri_t6050_wifi *wifi)
 		deadline = jiffies +
 			   msecs_to_jiffies(max(8000U, count * 220 + 2000));
 		do {
-			drain(wifi);
-			if (READ_ONCE(wifi->stopping) ||
-			    readl(wifi->a.bar + 8) != 2)
+			if (scan_transport_stopped(wifi))
 				return -EIO;
+			drain(wifi);
 			if (wifi->scans_done != done)
 				break;
-			if (READ_ONCE(wifi->scan_abort) && !abort_sent) {
-				ret = command(wifi, 65537, NULL, 0);
-				if (ret)
-					return ret;
-				abort_sent = true;
+			if (READ_ONCE(wifi->scan_abort)) {
+				ret = scan_stop_chunk(wifi, done);
+				return ret == -EIO ? -EIO : -ECANCELED;
 			}
+			mutex_unlock(&wifi->lock);
 			usleep_range(1000, 2000);
+			mutex_lock(&wifi->lock);
 		} while (time_before(jiffies, deadline));
+		if (wifi->scans_done == done) {
+			if (scan_transport_stopped(wifi))
+				return -EIO;
+			drain(wifi);
+		}
 		if (wifi->scans_done == done) {
 			dev_warn(&wifi->control->pdev->dev,
 				 "Wi-Fi scan of %u channels: no completion event\n",
 				 count);
-			command(wifi, 65537, NULL, 0);
-			return -ETIMEDOUT;
+			ret = scan_stop_chunk(wifi, done);
+			return ret == -EIO ? -EIO : -ETIMEDOUT;
 		}
-		if (wifi->scan_status && !abort_sent)
+		if (wifi->scan_status)
 			dev_warn(&wifi->control->pdev->dev,
 				 "Wi-Fi scan of %u channels ended with firmware status %u\n",
 				 count, wifi->scan_status);
@@ -1876,6 +1937,9 @@ static void connect_worker(struct work_struct *work)
 		return;
 	}
 	host_setup_commands(wifi);
+	drain(wifi);
+	wifi->connect_event = false;
+	wifi->disconnect_event = false;
 	slot = wifi->command_head;
 	ret = command(wifi, 131072, wifi->connect_payload, wifi->connect_size);
 	memzero_explicit(wifi->connect_payload, sizeof(wifi->connect_payload));
@@ -2293,6 +2357,7 @@ static int alpha_resume_locked(struct centauri_t6050_wifi *wifi)
 {
 	int ret;
 
+	ASSERT_RTNL();
 	lockdep_assert_held(&wifi->lock);
 	if (wifi->transport_sleep_sent) {
 		ret = alpha_transport_state(wifi, false);
@@ -2301,10 +2366,22 @@ static int alpha_resume_locked(struct centauri_t6050_wifi *wifi)
 		wifi->transport_sleep_sent = false;
 	}
 	if (wifi->host_sleep_sent) {
-		ret = alpha_host_power(wifi, false);
-		if (ret)
-			return ret;
+		/* Under the mutex, only the wake command can pass the gate. */
 		wifi->host_sleep_sent = false;
+		ret = alpha_host_power(wifi, false);
+		if (ret) {
+			wifi->host_sleep_sent = true;
+			return ret;
+		}
+	}
+	if (wifi->regulatory_deferred) {
+		if (wifi->configured && wifi->country_deferred[0])
+			country_set(wifi, wifi->country_deferred);
+		memset(wifi->country_deferred, 0, sizeof(wifi->country_deferred));
+		wifi->regulatory_deferred = false;
+		channels_apply(wifi);
+		if (wifi->command_failed)
+			return -EIO;
 	}
 	WRITE_ONCE(wifi->transport_paused, false);
 	WRITE_ONCE(wifi->tx_paused, false);
@@ -2366,11 +2443,14 @@ int centauri_t6050_wifi_suspend(struct centauri_t6050 *c)
 		synchronize_irq(pci_irq_vector(c->alpha_irqs.pdev, i));
 	cancel_work_sync(&wifi->link_work);
 
+	/* Match the regulatory notifier's lock order for suspend unwind. */
+	rtnl_lock();
 	mutex_lock(&wifi->lock);
 	ret = alpha_transport_state(wifi, true);
 	if (!ret) {
 		wifi->transport_sleep_sent = true;
 		mutex_unlock(&wifi->lock);
+		rtnl_unlock();
 		return 0;
 	}
 	if (alpha_resume_locked(wifi)) {
@@ -2380,6 +2460,7 @@ int centauri_t6050_wifi_suspend(struct centauri_t6050 *c)
 		wifi->command_failed = true;
 	}
 	mutex_unlock(&wifi->lock);
+	rtnl_unlock();
 	return ret;
 
 out_unpause:
@@ -2399,9 +2480,11 @@ int centauri_t6050_wifi_resume(struct centauri_t6050 *c)
 
 	if (!wifi)
 		return 0;
+	rtnl_lock();
 	mutex_lock(&wifi->lock);
 	ret = alpha_resume_locked(wifi);
 	mutex_unlock(&wifi->lock);
+	rtnl_unlock();
 	return ret;
 }
 
@@ -2458,20 +2541,19 @@ static void wifi_regulatory(struct wiphy *wiphy,
 	u8 country[3] = { request->alpha2[0], request->alpha2[1], 1 };
 	bool named = country[0] >= 'A' && country[0] <= 'Z' &&
 		     country[1] >= 'A' && country[1] <= 'Z';
-	int ret;
 
 	mutex_lock(&wifi->lock);
-	if (wifi->configured && named) {
-		ret = command(wifi, 9, country, sizeof(country));
-		if (ret)
-			dev_err(&wifi->control->pdev->dev,
-				"firmware country update failed: %d\n", ret);
-		else
-			firmware_report(wifi, 19, wifi->hw_channels,
-					&wifi->hw_channels_blob);
+	if (wifi->host_sleep_sent) {
+		/* Keep the last named country across cfg80211's world updates. */
+		if (named)
+			memcpy(wifi->country_deferred, country, sizeof(country));
+		wifi->regulatory_deferred = true;
+	} else {
+		if (wifi->configured && named)
+			country_set(wifi, country);
+		/* cfg80211 has just recomputed the channel flags. */
+		channels_apply(wifi);
 	}
-	/* cfg80211 has just recomputed the channel flags from its own rules. */
-	channels_apply(wifi);
 	mutex_unlock(&wifi->lock);
 }
 
@@ -2479,7 +2561,8 @@ static void fill_station(struct centauri_t6050_wifi *wifi, struct station_info *
 {
 	const struct net_device_stats *stats = &wifi->netdev->stats;
 
-	if (time_after_eq(jiffies, wifi->station_signal_at + HZ)) {
+	if (!wifi->scan_request &&
+	    time_after_eq(jiffies, wifi->station_signal_at + HZ)) {
 		wifi->station_signal_valid = false;
 		wifi->station_signal_at = jiffies;
 		query_link_status(wifi);

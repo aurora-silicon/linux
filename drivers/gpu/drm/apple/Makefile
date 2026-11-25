@@ -23,6 +23,7 @@ appledrm-$(CONFIG_DRM_APPLE_DCP_T8152) += t8152_hdmi.o t8152_typec.o
 appledrm-$(CONFIG_DRM_APPLE_DCP_T8152) += iomfb_iboot.o iboot_drm.o
 appledrm-y += iomfb_h17p.o
 appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += iomfb_h17p_test.o parser_test.o
+appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += iomfb_v27_test.o
 appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += iomfb_external_hdr_hints_test.o
 appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += apple_resume_test.o
 appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += apple_boot_display_test.o

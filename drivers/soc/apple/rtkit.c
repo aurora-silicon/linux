@@ -193,6 +193,21 @@ static bool apple_rtkit_firmware_owns_crashlog(struct apple_rtkit *rtk)
 	return rtk->ops->flags & APPLE_RTKIT_FIRMWARE_OWNED_CRASHLOG;
 }
 
+/*
+ * Whether RTKit maps a crash log the firmware placed at its own address: one rule for
+ * the buffer request on an endpoint the firmware announced and for the crash report on
+ * one it left out of its map. Not when the client says the firmware owns that buffer
+ * (taken unmapped) or sets placed buffers up itself (shmem_setup); otherwise it is
+ * mapped if apple_dart_fw_range() accepts it (apple_rtkit_crashlog_map()).
+ */
+static bool apple_rtkit_maps_placed_crashlog(struct apple_rtkit *rtk)
+{
+	return !apple_rtkit_firmware_owns_crashlog(rtk) &&
+	       !rtk->ops->shmem_setup && !rtk->ops->shmem_setup_ep;
+}
+
+static int apple_rtkit_crashlog_map(struct apple_rtkit *rtk, u64 msg);
+
 /* The crashlog endpoint is started while the endpoint map is handled. */
 static bool apple_rtkit_early_crashlog(struct apple_rtkit *rtk)
 {
@@ -651,6 +666,14 @@ static int apple_rtkit_common_rx_get_buffer(struct apple_rtkit *rtk,
 		return apple_rtkit_send_message(rtk, ep, msg, NULL, false);
 	}
 
+	if (ep == APPLE_RTKIT_EP_CRASHLOG && request.iova &&
+	    apple_rtkit_maps_placed_crashlog(rtk)) {
+		err = apple_rtkit_crashlog_map(rtk, msg);
+		if (err)
+			goto error;
+		return 0;
+	}
+
 	if ((rtk->ops->flags & APPLE_RTKIT_FIRMWARE_OWNED_LOGS) && request.iova &&
 	    (ep == APPLE_RTKIT_EP_SYSLOG || ep == APPLE_RTKIT_EP_OSLOG)) {
 		*buffer = request;
@@ -953,51 +976,31 @@ static void apple_rtkit_memcpy(struct apple_rtkit *rtk, void *dst,
 }
 
 /*
- * Where a DVA of the crash buffer lands: in a mapping Linux made, or else in one the
- * firmware kept from the bootloader in a root its DART inherited (the T8140 AOP's own
- * slot). 0 when neither translates it.
- */
-static phys_addr_t apple_rtkit_crashlog_phys(struct apple_rtkit *rtk,
-					     struct iommu_domain *domain, dma_addr_t iova)
-{
-	phys_addr_t phys = iommu_iova_to_phys(domain, iova);
-
-	if (!phys && IS_REACHABLE(CONFIG_APPLE_DART) &&
-	    apple_dart_fw_remote(rtk->dev, iova, false, &phys))
-		phys = 0;
-
-	return phys;
-}
-
-/*
  * The buffer a crashing firmware placed at its own address, mapped if its IOMMU
- * translates every page of it to one contiguous range, and acknowledged as a placed
+ * translates every page of it, through Linux's mappings or those the firmware kept
+ * from the boot loader (the T8140 AOP's own slot), to one contiguous range of DRAM
+ * that nothing else claims (apple_dart_fw_range()), and acknowledged as a placed
  * buffer is. The firmware doesn't run again until a reboot.
+ *
+ * Write-combined, not cacheable: the co-processor isn't coherent with the CPU's
+ * caches, and apple_rtkit_crashlog_late() polls the buffer for a log written after
+ * the request, with no cache maintenance for a placed buffer, so a cacheable
+ * mapping could keep returning the header it read first.
  */
 static int apple_rtkit_crashlog_map(struct apple_rtkit *rtk, u64 msg)
 {
 	struct apple_rtkit_shmem *bfr = &rtk->crashlog_buffer;
-	struct iommu_domain *domain = iommu_get_domain_for_dev(rtk->dev);
 	dma_addr_t iova = FIELD_GET(APPLE_RTKIT_BUFFER_REQUEST_IOVA, msg);
 	size_t size = FIELD_GET(APPLE_RTKIT_BUFFER_REQUEST_SIZE, msg) << 12;
-	phys_addr_t phys, page;
-	size_t off;
+	phys_addr_t phys;
 	void *va;
+	int ret;
 
-	if (!domain || !iova || !size)
-		return -ENODEV;
-	phys = apple_rtkit_crashlog_phys(rtk, domain, iova);
-	for (off = 0; phys && off < size; off += PAGE_SIZE) {
-		page = apple_rtkit_crashlog_phys(rtk, domain, iova + off);
-		if (page != phys + off) {
-			dev_err(rtk->dev, "RTKit: crash log at %pad isn't contiguous at +%#zx\n",
-				&iova, off);
-			return -EINVAL;
-		}
-	}
-	if (!phys)
-		return -ENOENT;
-	va = memremap(phys, size, MEMREMAP_WB);
+	ret = apple_dart_fw_range(rtk->dev, iova, size,
+				  APPLE_DART_FW_LINUX | APPLE_DART_FW_RETAINED, &phys);
+	if (ret)
+		return ret;
+	va = memremap(phys, size, MEMREMAP_WC);
 	if (!va)
 		return -ENOMEM;
 	bfr->buffer = va;
@@ -1096,10 +1099,11 @@ static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
 	 * A firmware that never announced this endpoint asks for its buffer only when
 	 * it crashes, so there's no handshake to take the request for. Report the
 	 * crash now, as the log may never come. A client that sets such a buffer up
-	 * itself takes the path below, which also reads a log written later.
+	 * itself, or whose firmware owns it, takes the path below, which also reads a
+	 * log written later (apple_rtkit_maps_placed_crashlog()).
 	 */
 	if (!rtk->crashlog_buffer.size && !test_bit(APPLE_RTKIT_EP_CRASHLOG, rtk->endpoints) &&
-	    !rtk->ops->shmem_setup && !rtk->ops->shmem_setup_ep) {
+	    apple_rtkit_maps_placed_crashlog(rtk)) {
 		int ret = apple_rtkit_crashlog_map(rtk, msg);
 
 		dev_err(rtk->dev, "RTKit: co-processor has crashed: crash log buffer at %#llx %s (%d)\n",

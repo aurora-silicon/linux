@@ -537,7 +537,7 @@ struct apple_cio {
 	unsigned int start_gen; /* protected by lock: bumped by every start */
 	unsigned int link_lost_gen; /* start_gen when the peer went away */
 	unsigned int link_lost_cycles; /* protected by lock */
-	u64 link_lost_cycle_activity; /* remote activity at the last cycle */
+	u64 link_lost_cycle_activity; /* remote activity of this domain at the last cycle */
 	bool link_lost_restart; /* protected by lock: cycle requested */
 	struct notifier_block pm_notifier;
 	struct notifier_block reboot_notifier;
@@ -2799,6 +2799,13 @@ static int apple_nhi_probe(struct platform_device *pdev)
 		acio->pcie_pm_prepared = false;
 		acio->pcie_resume_expected = false;
 	}
+	/*
+	 * A port restart rebuilds the domain, whose remote activity count starts
+	 * again at zero. Compare the next link loss against that, not against
+	 * the count of the domain that went away: any discovery on this domain
+	 * then marks the restart as having worked.
+	 */
+	WRITE_ONCE(acio->link_lost_cycle_activity, 0);
 	ret = tb_domain_add(anhi->tb, false);
 	if (ret) {
 		dev_err_probe(anhi->dev, ret, "failed to add TB domain\n");
