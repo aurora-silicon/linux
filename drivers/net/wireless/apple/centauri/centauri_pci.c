@@ -375,7 +375,8 @@ static ssize_t centauri_boot_write(struct file *file, const char __user *buffer,
 		}
 	}
 	mutex_unlock(&c->boot_lock);
-	if (value == 3 && !ret) {
+	/* A restart (4) ends with the IPC started (3): Bluetooth comes back the same way */
+	if ((value == 3 || value == 4) && !ret) {
 		int attached = centauri_attach_beta(c);
 
 		if (attached == 1)
