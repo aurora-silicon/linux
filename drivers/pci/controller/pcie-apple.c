@@ -732,6 +732,9 @@ struct apple_pcie_port {
 	/* GP host: closed, what is below the port, and with gp_rp_closed its root port too */
 	bool			gp_closed;
 	bool			gp_rp_closed;
+	/* GP host: its DART not back after a refused sleep: taken down in the normal resume */
+	bool			gp_failed;
+	int			gp_dart_ret;
 	/* GP host: the root port's lists (apple,tunable-rc*), and its link registers as saved */
 	struct apple_tunable	*gp_rc_tunable[3];
 	bool			gp_dbi_saved;
@@ -2996,15 +2999,9 @@ out:
 	return ret;
 }
 
-/*
- * With @held, it runs once the port is clocked and the endpoint powered, PERST# still
- * asserted, before the lane's reference clock: what has to be in place before the
- * endpoint leaves reset.
- */
-static int apple_pcie_setup_link_held(struct apple_pcie *pcie,
-				      struct apple_pcie_port *port,
-				      struct device_node *np,
-				      int (*held)(struct apple_pcie_port *port))
+static int apple_pcie_setup_link(struct apple_pcie *pcie,
+				 struct apple_pcie_port *port,
+				 struct device_node *np)
 {
 #define MAX_AUX_PERST 3
 	struct gpio_desc *aux_reset[MAX_AUX_PERST] = { NULL };
@@ -3091,12 +3088,6 @@ have_gpios:
 	if (ret)
 		return ret;
 
-	if (held) {
-		ret = held(port);
-		if (ret)
-			return ret;
-	}
-
 	if (!pcie->hw->retain_clocks) {
 		ret = apple_pcie_setup_refclk(pcie, port);
 		if (ret < 0)
@@ -3142,13 +3133,6 @@ have_gpios:
 	}
 
 	return 0;
-}
-
-static int apple_pcie_setup_link(struct apple_pcie *pcie,
-				 struct apple_pcie_port *port,
-				 struct device_node *np)
-{
-	return apple_pcie_setup_link_held(pcie, port, np, NULL);
 }
 
 /* DesignWare port logic, in the root port's configuration space. */
@@ -8020,64 +8004,77 @@ struct apple_pcie_gp {
 	struct apple_tunable *auspma_tunable;
 };
 
+/* A loader's list for @res: there, every entry inside it, and with something in it */
+static struct apple_tunable *apple_pcie_gp_list(struct device *dev, struct device_node *np,
+						const char *prop, struct resource *res)
+{
+	struct apple_tunable *tunable;
+
+	if (!res)
+		return NULL;
+	tunable = devm_apple_tunable_parse(dev, np, prop, res);
+	return IS_ERR(tunable) || !tunable->sz ? NULL : tunable;
+}
+
 /*
  * What setting the host up from power-off takes, from the boot loader: T6030's windows (the
  * shared PHY's, its clock generator's and its AXI bridge's) and the Apple device tree's lists
- * for them, and each port's own lists. Without any of it the host only comes back from a
- * refused sleep.
+ * for them, and each port's own lists, its root port's bounded by that root port's config
+ * space; and each port's PERST# line, held from the wake on. Without any of it the host only
+ * comes back from a refused sleep.
  */
 static bool apple_pcie_gp_cold_probe(struct platform_device *pdev, struct apple_pcie *pcie)
 {
 	static const char *const rc_lists[] = {
 		"apple,tunable-rc", "apple,tunable-rc-gen3", "apple,tunable-rc-gen4",
 	};
+	struct resource *axi2af, *cio3pll, *clkgen, *phy_common, *phy, *phy_ip, *cfg, *res;
 	struct apple_pcie_gp *gp = pcie->gp;
 	struct device *dev = &pdev->dev;
+	struct device_node *np = dev->of_node;
 	struct apple_pcie_port *port;
-	struct resource *res, *cfg;
 	char name[16];
 	int i;
 
-	if (apple_pcie_neo_get(pdev, "axi2af", "apple,tunable-axi2af", &gp->axi2af,
-			       &gp->axi2af_tunable) ||
-	    apple_pcie_neo_get(pdev, "cio3pll", "apple,tunable-cio3pll", &gp->cio3pll,
-			       &gp->cio3pll_tunable) ||
-	    apple_pcie_neo_get(pdev, "clkgen", "apple,tunable-clkgen", &gp->clkgen,
-			       &gp->clkgen_tunable) ||
-	    apple_pcie_neo_get(pdev, "phy-shared", "apple,tunable-phy", &gp->phy,
-			       &gp->phy_tunable) ||
-	    apple_pcie_neo_get(pdev, "phy-ip", "apple,tunable-phy-ip-pll", &gp->phy_ip,
-			       &gp->pll_tunable))
+	gp->axi2af = apple_pcie_neo_map(pdev, "axi2af", &axi2af);
+	gp->cio3pll = apple_pcie_neo_map(pdev, "cio3pll", &cio3pll);
+	gp->clkgen = apple_pcie_neo_map(pdev, "clkgen", &clkgen);
+	gp->phy_common = apple_pcie_neo_map(pdev, "phy-common", &phy_common);
+	gp->phy = apple_pcie_neo_map(pdev, "phy-shared", &phy);
+	gp->phy_ip = apple_pcie_neo_map(pdev, "phy-ip", &phy_ip);
+	if (IS_ERR(gp->axi2af) || IS_ERR(gp->cio3pll) || IS_ERR(gp->clkgen) ||
+	    IS_ERR(gp->phy_common) || IS_ERR(gp->phy) || IS_ERR(gp->phy_ip))
 		return false;
-	gp->phy_common = apple_pcie_neo_map(pdev, "phy-common", &res);
-	if (IS_ERR(gp->phy_common))
-		return false;
-	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "phy-ip");
-	gp->auspma_tunable = devm_apple_tunable_parse(dev, dev->of_node,
-						      "apple,tunable-phy-ip-auspma", res);
-	if (IS_ERR(gp->auspma_tunable))
+	gp->axi2af_tunable = apple_pcie_gp_list(dev, np, "apple,tunable-axi2af", axi2af);
+	gp->cio3pll_tunable = apple_pcie_gp_list(dev, np, "apple,tunable-cio3pll", cio3pll);
+	gp->clkgen_tunable = apple_pcie_gp_list(dev, np, "apple,tunable-clkgen", clkgen);
+	gp->phy_tunable = apple_pcie_gp_list(dev, np, "apple,tunable-phy", phy);
+	gp->pll_tunable = apple_pcie_gp_list(dev, np, "apple,tunable-phy-ip-pll", phy_ip);
+	gp->auspma_tunable = apple_pcie_gp_list(dev, np, "apple,tunable-phy-ip-auspma", phy_ip);
+	if (!gp->axi2af_tunable || !gp->cio3pll_tunable || !gp->clkgen_tunable ||
+	    !gp->phy_tunable || !gp->pll_tunable || !gp->auspma_tunable)
 		return false;
 
 	cfg = platform_get_resource_byname(pdev, IORESOURCE_MEM, "config");
 	if (!cfg)
 		return false;
 	list_for_each_entry(port, &pcie->ports, entry) {
+		struct resource dbi = DEFINE_RES_MEM(cfg->start +
+						     ((resource_size_t)port->idx << 15),
+						     PCI_CFG_SPACE_EXP_SIZE);
+
+		if (!port->perst_gpio)
+			return false;
 		snprintf(name, sizeof(name), "port%d", port->idx);
 		res = platform_get_resource_byname(pdev, IORESOURCE_MEM, name);
-		if (!res)
+		port->tunable = apple_pcie_gp_list(dev, port->np, "apple,tunable", res);
+		if (!port->tunable)
 			return false;
-		port->tunable = devm_apple_tunable_parse(dev, port->np, "apple,tunable", res);
-		if (IS_ERR(port->tunable)) {
-			port->tunable = NULL;
-			return false;
-		}
 		for (i = 0; i < ARRAY_SIZE(rc_lists); i++) {
-			struct apple_tunable *rc;
-
-			rc = devm_apple_tunable_parse(dev, port->np, rc_lists[i], cfg);
-			if (IS_ERR(rc))
+			port->gp_rc_tunable[i] = apple_pcie_gp_list(dev, port->np, rc_lists[i],
+								    &dbi);
+			if (!port->gp_rc_tunable[i])
 				return false;
-			port->gp_rc_tunable[i] = rc;
 		}
 	}
 	return true;
@@ -8280,9 +8277,13 @@ static struct device *apple_pcie_gp_dart(struct apple_pcie_port *port)
 	of_node_put(iommu.np);
 	if (!pdev)
 		return NULL;
-	ret = apple_dart_set_host_resumes(&pdev->dev);
-	if (!ret && !device_link_add(pcie->dev, &pdev->dev, DL_FLAG_STATELESS))
+	if (!device_link_add(pcie->dev, &pdev->dev, DL_FLAG_STATELESS)) {
 		ret = -EINVAL;
+	} else {
+		ret = apple_dart_set_host_resumes(&pdev->dev);
+		if (ret)
+			device_link_remove(pcie->dev, &pdev->dev);
+	}
 	if (ret) {
 		dev_warn(pcie->dev, "port %d: its DART can't wait for the port (%d): no deep sleep\n",
 			 port->idx, ret);
@@ -8329,10 +8330,11 @@ static void apple_pcie_gp_probe(struct platform_device *pdev, struct apple_pcie 
 
 	if (!apple_pcie_s2r_reinit(pcie) || apple_sleep_pcie_host_register(&pdev->dev))
 		return;
-	/* Registered and never reported, the host refuses every deep sleep */
 	gp = devm_kzalloc(&pdev->dev, sizeof(*gp), GFP_KERNEL);
-	if (!gp)
+	if (!gp) {
+		apple_sleep_pcie_host_unregister(&pdev->dev);
 		return;
+	}
 	list_for_each_entry(port, &pcie->ports, entry) {
 		apple_pcie_gp_lines(pcie, port);
 		port->gp_dart = apple_pcie_gp_dart(port);
@@ -8374,14 +8376,27 @@ static bool apple_pcie_gp_own_dart(struct apple_pcie *pcie, struct apple_pcie_po
 	return true;
 }
 
-/* A route of @rid among the port's occupied RID2SID slots, as saved */
-static bool apple_pcie_gp_routed(struct apple_pcie_port *port, u32 rid)
+/*
+ * @rid's route as the host's iommu-map has it: on the port's own DART, and an occupied
+ * RID2SID slot of the port, as saved, holding exactly that RID and its stream (on J516s
+ * 0100 and 0101 to DART 0's stream 1, 0200 to DART 1's)
+ */
+static bool apple_pcie_gp_routed(struct apple_pcie *pcie, struct apple_pcie_port *port, u32 rid)
 {
+	struct of_phandle_args iommu = {};
+	bool own;
+	u32 want;
 	int i;
 
+	if (of_map_iommu_id(pcie->dev->of_node, rid, &iommu) || !iommu.np)
+		return false;
+	own = port->gp_dart && iommu.np == port->gp_dart->of_node && iommu.args_count == 1;
+	of_node_put(iommu.np);
+	if (!own)
+		return false;
+	want = PORT_RID2SID_VALID | (iommu.args[0] << PORT_RID2SID_SID_SHIFT) | rid;
 	for_each_set_bit(i, port->sid_map, port->sid_map_sz)
-		if ((port->saved_rid2sid[i] & PORT_RID2SID_VALID) &&
-		    (port->saved_rid2sid[i] & 0xffff) == rid)
+		if (port->saved_rid2sid[i] == want)
 			return true;
 	return false;
 }
@@ -8414,10 +8429,14 @@ static int apple_pcie_gp_save_fn(struct pci_dev *pdev, void *data)
 	if (!port)
 		return 0;
 	if (!pci_is_root_bus(pdev->bus)) {
-		if (!apple_pcie_gp_quiesced(pdev)) {
+		/* Nothing is read behind a link that is down */
+		if (!port->gp_live) {
+			pci_err(pdev, "deep sleep: its port's link is down\n");
+			walk->err = -ENOLINK;
+		} else if (!apple_pcie_gp_quiesced(pdev)) {
 			pci_err(pdev, "deep sleep: in D0 with bus mastering on\n");
 			walk->err = -EBUSY;
-		} else if (!apple_pcie_gp_routed(port, pci_dev_id(pdev))) {
+		} else if (!apple_pcie_gp_routed(pcie, port, pci_dev_id(pdev))) {
 			pci_err(pdev, "deep sleep: no route of its RID to its DART\n");
 			walk->err = -ENOENT;
 		}
@@ -8505,6 +8524,19 @@ static unsigned int apple_pcie_gp_ready(struct apple_pcie *pcie)
 	       (apple_pcie_gp_can_cold(pcie) ? APPLE_SLEEP_PCIE_HOST_COLD : 0);
 }
 
+/* Down since a wake that left the host or one of its ports closed: nothing of it is read */
+static bool apple_pcie_gp_down(struct apple_pcie *pcie)
+{
+	struct apple_pcie_port *port;
+
+	if (READ_ONCE(pcie->gp_closed))
+		return true;
+	list_for_each_entry(port, &pcie->ports, entry)
+		if (READ_ONCE(port->gp_closed) || READ_ONCE(port->gp_rp_closed))
+			return true;
+	return false;
+}
+
 /*
  * A firmware sleep of the GP host. Its domain is held on, so that a refused sleep finds the
  * host as it left it: power, PERST#, the LTSSMs and the links untouched. Once what that needs
@@ -8525,6 +8557,10 @@ static int apple_pcie_gp_suspend_noirq(struct apple_pcie *pcie)
 		dev_err(pcie->dev, "deep sleep: power domain not held (%d)\n", ret);
 		return ret;
 	}
+	if (apple_pcie_gp_down(pcie)) {
+		dev_err(pcie->dev, "deep sleep: host down since the last wake, the sleep is refused\n");
+		return 0;
+	}
 	ret = apple_pcie_gp_save(pcie);
 	if (ret) {
 		apple_pcie_hib_free_fns(pcie);
@@ -8540,116 +8576,6 @@ static int apple_pcie_gp_suspend_noirq(struct apple_pcie *pcie)
 	gp->armed = true;
 	apple_sleep_pcie_host_set_ready(pcie->dev, apple_pcie_gp_ready(pcie));
 	return 0;
-}
-
-/*
- * A refused sleep with the host still up: each live port's DART ungated, its interrupts back.
- * A port whose link went down meanwhile is set up again in the normal resume, what is below
- * it closed until then; the others' functions resume as they are.
- */
-static int apple_pcie_gp_reopen(struct apple_pcie *pcie)
-{
-	struct apple_pcie_port *port;
-
-	list_for_each_entry(port, &pcie->ports, entry) {
-		if (port->gp_live &&
-		    !(apple_pcie_port_readl(port, PORT_LINKSTS) & PORT_LINKSTS_UP)) {
-			port->gp_cold = true;
-			WRITE_ONCE(port->gp_closed, true);
-			dev_warn(pcie->dev, "port %d: link lost in the refused sleep, set up again\n",
-				 port->idx);
-			continue;
-		}
-		if (port->gp_live && apple_pcie_gp_own_dart(pcie, port))
-			apple_dart_host_resume(port->gp_dart);
-		apple_pcie_port_enable_irq(port);
-	}
-	return 0;
-}
-
-/* Each domain the host is in reads on to genpd, which the sleep's wake checked */
-static bool apple_pcie_gp_powered(struct apple_pcie *pcie)
-{
-	unsigned int i;
-
-	for (i = 0; i < pcie->num_pds; i++)
-		if (!dev_pm_genpd_is_on(pcie->pds[i].dev))
-			return false;
-	return pcie->num_pds > 0;
-}
-
-/*
- * After a real sleep, or a refused one that took the root complex down: nothing of the host
- * answers until it is set up again. With its power on, PERST# goes back asserted on every port
- * first, the endpoints out of reset since the pins reset; then the shared PHY and the root
- * complex come up. The ports, whose endpoints the SMC powers, follow in the normal resume, and
- * their root ports and what is below them stay closed until then.
- */
-static int apple_pcie_gp_wake_noirq(struct apple_pcie *pcie)
-{
-	struct apple_pcie_port *port;
-	int ret;
-
-	WRITE_ONCE(pcie->gp_closed, true);
-	list_for_each_entry(port, &pcie->ports, entry) {
-		port->gp_cold = true;
-		WRITE_ONCE(port->gp_rp_closed, true);
-		WRITE_ONCE(port->gp_closed, true);
-	}
-	if (!apple_pcie_gp_can_cold(pcie)) {
-		dev_err(pcie->dev, "deep sleep: lost its power, and nothing here sets it up again\n");
-		return 0;
-	}
-	if (!apple_pcie_gp_powered(pcie)) {
-		dev_err(pcie->dev, "deep sleep: its power domain isn't on at the wake\n");
-		return 0;
-	}
-	list_for_each_entry(port, &pcie->ports, entry) {
-		if (!port->perst_gpio)
-			continue;
-		ret = gpiod_direction_input(port->perst_gpio) ?:
-		      gpiod_direction_output(port->perst_gpio, 1);
-		if (ret)
-			dev_warn(pcie->dev, "port %d: PERST# not held at the wake (%d)\n",
-				 port->idx, ret);
-	}
-	ret = apple_pcie_t6030_common_up(pcie);
-	if (ret) {
-		dev_err(pcie->dev, "deep sleep: shared PHY and root complex not back (%d), the host stays down\n",
-			ret);
-		return 0;
-	}
-	WRITE_ONCE(pcie->gp_closed, false);
-	return 0;
-}
-
-static bool apple_pcie_gp_rc_running(struct apple_pcie *pcie)
-{
-	return (readl(pcie->base + CORE_RC_CTL) & CORE_RC_CTL_RUN) &&
-	       (readl(pcie->base + CORE_RC_STAT) & CORE_RC_STAT_READY);
-}
-
-/* Every resume takes the report back. Only an armed sleep changed anything. */
-static int apple_pcie_gp_resume_noirq(struct apple_pcie *pcie)
-{
-	struct apple_pcie_gp *gp = pcie->gp;
-	bool armed = gp->armed;
-
-	apple_sleep_pcie_host_set_ready(pcie->dev, 0);
-	gp->armed = false;
-	gp->cold = false;
-	if (!armed) {
-		/* A real sleep with nothing saved: nothing of the host is reached again */
-		if (pm_resume_via_firmware()) {
-			WRITE_ONCE(pcie->gp_closed, true);
-			dev_err(pcie->dev, "deep sleep: lost its power with nothing saved\n");
-		}
-		return 0;
-	}
-	if (!pm_resume_via_firmware() && apple_pcie_gp_rc_running(pcie))
-		return apple_pcie_gp_reopen(pcie);
-	gp->cold = true;
-	return apple_pcie_gp_wake_noirq(pcie);
 }
 
 /* With the port clocked and PERST# still held: its routes, MSIs and DART back */
@@ -8675,6 +8601,46 @@ static int apple_pcie_gp_port_held(struct apple_pcie_port *port)
 		return 0;
 	return pcie->gp->cold ? apple_dart_host_restart(port->gp_dart) :
 				apple_dart_host_resume(port->gp_dart);
+}
+
+/*
+ * The port from its PERST# up, in macOS's order (the t5 trace): its clock, PERST# held as it
+ * has been since the wake, the endpoint powered with @power (an SMC line, which only the normal
+ * resume can write), the root port out of its own reset, its routes, MSIs and DART, the lane's
+ * reference clock, then PERST# released.
+ */
+static int apple_pcie_gp_port_link(struct apple_pcie *pcie, struct apple_pcie_port *port,
+				   bool power)
+{
+	bool raise = power && port->pwren_gpio;
+	u32 stat;
+	int ret;
+
+	rmw_set(PORT_APPCLK_EN, port->base + PORT_APPCLK);
+	ret = gpiod_set_value_cansleep(port->perst_gpio, 1);
+	if (!ret && raise)
+		ret = gpiod_set_value_cansleep(port->pwren_gpio, 1);
+	if (ret)
+		return ret;
+	ret = apple_pcie_gp_port_held(port);
+	if (ret)
+		return ret;
+	ret = apple_pcie_setup_refclk(pcie, port);
+	if (ret)
+		return ret;
+	/* Tpvperl after the endpoint's power-up, Tperst-clk otherwise (PCIe CEM r5.0, 2.9.2) */
+	if (raise)
+		msleep(pcie->hw->pwren_on_ms ?: 100);
+	else
+		usleep_range(100, 200);
+	rmw_set(PORT_PERST_OFF, port->base + pcie->hw->port_perst);
+	ret = gpiod_set_value_cansleep(port->perst_gpio, 0);
+	if (ret)
+		return ret;
+	/* 100 ms after PERST# deassertion (PCIe r5.0, 6.6.1) */
+	msleep(100);
+	return readl_relaxed_poll_timeout(port->base + PORT_STATUS, stat,
+					  stat & PORT_STATUS_READY, 100, 250000);
 }
 
 /* The LTSSM and the link, with probe's fresh fundamental resets for one that doesn't train */
@@ -8708,42 +8674,22 @@ static int apple_pcie_gp_train(struct apple_pcie *pcie, struct apple_pcie_port *
 }
 
 /*
- * The state saved at the suspend, back once the port is: its root port's (@rp) or that of the
- * functions below it. The noirq resume found their config space closed and left them marked
- * D3: out of reset they are in D0, so that is recorded before the restore.
+ * A port set up again and its link trained; its root port then answers, and what is below it
+ * once the link is up. With @power its endpoint's power goes up first.
  */
-static void apple_pcie_gp_restore(struct apple_pcie *pcie, struct apple_pcie_port *port, bool rp)
+static int apple_pcie_gp_port_up(struct apple_pcie *pcie, struct apple_pcie_port *port,
+				 bool power)
 {
-	struct apple_pcie_hib_fn *fn;
-
-	list_for_each_entry(fn, &pcie->hib_fns, entry) {
-		if (pci_is_root_bus(fn->pdev->bus) != rp ||
-		    apple_pcie_gp_port(pcie, fn->pdev) != port)
-			continue;
-		pci_set_power_state(fn->pdev, PCI_D0);
-		if (pci_load_saved_state(fn->pdev, fn->state))
-			pci_warn(fn->pdev, "deep sleep: saved configuration not taken back\n");
-		else
-			pci_restore_state(fn->pdev);
-	}
-}
-
-/*
- * A port set up again, with its PERST# pin, endpoint power, lane clocks, routes, MSIs and DART,
- * then its endpoint out of reset and its link trained; its root port's and functions' state
- * back once each answers.
- */
-static int apple_pcie_gp_port_up(struct apple_pcie *pcie, struct apple_pcie_port *port)
-{
-	bool rp_closed = READ_ONCE(port->gp_rp_closed);
 	bool cold = pcie->gp->cold;
 	int ret;
 
+	if (!port->perst_gpio)
+		return -ENODEV;
 	if (cold)
 		apple_pcie_t6030_port_regs_up(port);
 	/* A link lost while the port kept its state may still be training */
 	apple_pcie_port_rmw_clear(port, PORT_LTSSMCTL_START, PORT_LTSSMCTL);
-	ret = apple_pcie_setup_link_held(pcie, port, port->np, apple_pcie_gp_port_held);
+	ret = apple_pcie_gp_port_link(pcie, port, power);
 	if (ret)
 		return ret;
 	if (cold)
@@ -8755,10 +8701,7 @@ static int apple_pcie_gp_port_up(struct apple_pcie *pcie, struct apple_pcie_port
 			rmw_set(PHY_LANE_CFG_REFCLKCGEN, port->phy + PHY_LANE_CFG);
 		rmw_clear(PORT_APPCLK_CGDIS, port->base + PORT_APPCLK);
 	}
-	if (rp_closed) {
-		WRITE_ONCE(port->gp_rp_closed, false);
-		apple_pcie_gp_restore(pcie, port, true);
-	}
+	WRITE_ONCE(port->gp_rp_closed, false);
 	if (port->gp_live) {
 		ret = apple_pcie_gp_train(pcie, port);
 		if (ret)
@@ -8767,10 +8710,214 @@ static int apple_pcie_gp_port_up(struct apple_pcie *pcie, struct apple_pcie_port
 		apple_pcie_port_writel(port, port->saved_intmask, PORT_INTMSK);
 	}
 	apple_pcie_port_enable_irq(port);
-	if (!port->gp_live)
+	if (port->gp_live)
+		WRITE_ONCE(port->gp_closed, false);
+	return 0;
+}
+
+/*
+ * A port to try again in the normal resume: its endpoint held in reset and what is below it
+ * closed. Its root port answers if the port runs, so that what the PCI core's noirq resume of
+ * its functions still writes to their BARs (their MSI-X tables) ends at the port, as after an
+ * unplug, rather than nowhere.
+ */
+static void apple_pcie_gp_port_park(struct apple_pcie *pcie, struct apple_pcie_port *port)
+{
+	WRITE_ONCE(port->gp_closed, true);
+	gpiod_set_value_cansleep(port->perst_gpio, 1);
+	if (apple_pcie_port_readl(port, PORT_STATUS) & PORT_STATUS_READY)
+		WRITE_ONCE(port->gp_rp_closed, false);
+}
+
+/*
+ * The ports to set up again, back in the noirq resume, before the PCI core resumes what is
+ * below them: their endpoints keep the power the SMC gave them, which nothing can change
+ * before the normal resume, where a port that doesn't come back here is tried again with its
+ * endpoint's power raised.
+ */
+static void apple_pcie_gp_ports_noirq(struct apple_pcie *pcie)
+{
+	struct apple_pcie_port *port;
+	int ret;
+
+	list_for_each_entry(port, &pcie->ports, entry) {
+		if (!port->gp_cold || port->gp_failed)
+			continue;
+		ret = apple_pcie_gp_port_up(pcie, port, false);
+		if (!ret) {
+			port->gp_cold = false;
+			dev_info(pcie->dev, "deep sleep: port %d back\n", port->idx);
+			continue;
+		}
+		dev_info(pcie->dev, "deep sleep: port %d not back yet (%d), tried again with its endpoint powered\n",
+			 port->idx, ret);
+		apple_pcie_gp_port_park(pcie, port);
+	}
+}
+
+/* The first live port with @port's DART, which restores it for every port that shares it */
+static struct apple_pcie_port *apple_pcie_gp_dart_owner(struct apple_pcie *pcie,
+							struct apple_pcie_port *port)
+{
+	struct apple_pcie_port *other;
+
+	list_for_each_entry(other, &pcie->ports, entry)
+		if (other->gp_live && other->gp_dart == port->gp_dart)
+			return other;
+	return port;
+}
+
+/*
+ * A refused sleep with the host still up, undone in reverse: each live port's DART ungated,
+ * then its interrupts. A port whose DART doesn't come back keeps its interrupts masked and
+ * what is below it closed, its functions as the sleep left them, and is taken down in the
+ * normal resume. A port whose link went down in the refusal is set up again here.
+ */
+static void apple_pcie_gp_reopen(struct apple_pcie *pcie)
+{
+	struct apple_pcie_port *port, *owner;
+
+	list_for_each_entry(port, &pcie->ports, entry) {
+		port->gp_dart_ret = 0;
+		if (!port->gp_live) {
+			apple_pcie_port_enable_irq(port);
+			continue;
+		}
+		owner = apple_pcie_gp_dart_owner(pcie, port);
+		port->gp_dart_ret = owner == port ? apple_dart_host_resume(port->gp_dart) :
+						    owner->gp_dart_ret;
+		if (port->gp_dart_ret) {
+			dev_err(pcie->dev, "deep sleep: port %d: DART not back after the refused sleep (%d), its functions stay stopped\n",
+				port->idx, port->gp_dart_ret);
+			WRITE_ONCE(port->gp_closed, true);
+			port->gp_failed = true;
+			continue;
+		}
+		if (!(apple_pcie_port_readl(port, PORT_LINKSTS) & PORT_LINKSTS_UP)) {
+			dev_warn(pcie->dev, "port %d: link lost in the refused sleep, set up again\n",
+				 port->idx);
+			WRITE_ONCE(port->gp_closed, true);
+			port->gp_cold = true;
+			continue;
+		}
+		apple_pcie_port_enable_irq(port);
+	}
+	apple_pcie_gp_ports_noirq(pcie);
+}
+
+/* Each domain the host is in reads on to genpd, which the sleep's wake checked */
+static bool apple_pcie_gp_powered(struct apple_pcie *pcie)
+{
+	unsigned int i;
+
+	for (i = 0; i < pcie->num_pds; i++)
+		if (!dev_pm_genpd_is_on(pcie->pds[i].dev))
+			return false;
+	return pcie->num_pds > 0;
+}
+
+/*
+ * After a real sleep, or a refused one that took the root complex down: nothing of the host
+ * answers until it is set up again. With its power on, PERST# goes back asserted on every port
+ * first: the sleep reset the pins, so an input is what they are already, and the output
+ * reaches them even from a pin controller that answers from its cache. A pin that can't be
+ * held keeps the host down. Then the shared PHY and the root complex, then the ports.
+ */
+static void apple_pcie_gp_wake_noirq(struct apple_pcie *pcie)
+{
+	struct apple_pcie_port *port;
+	int ret;
+
+	WRITE_ONCE(pcie->gp_closed, true);
+	list_for_each_entry(port, &pcie->ports, entry) {
+		port->gp_cold = true;
+		WRITE_ONCE(port->gp_rp_closed, true);
+		WRITE_ONCE(port->gp_closed, true);
+	}
+	if (!apple_pcie_gp_can_cold(pcie)) {
+		dev_err(pcie->dev, "deep sleep: lost its power, and nothing here sets it up again\n");
+		return;
+	}
+	if (!apple_pcie_gp_powered(pcie)) {
+		dev_err(pcie->dev, "deep sleep: its power domain isn't on at the wake\n");
+		return;
+	}
+	list_for_each_entry(port, &pcie->ports, entry) {
+		ret = gpiod_direction_input(port->perst_gpio) ?:
+		      gpiod_direction_output(port->perst_gpio, 1);
+		if (ret) {
+			dev_err(pcie->dev, "deep sleep: port %d: PERST# not held at the wake (%d), the host stays down\n",
+				port->idx, ret);
+			return;
+		}
+	}
+	ret = apple_pcie_t6030_common_up(pcie);
+	if (ret) {
+		dev_err(pcie->dev, "deep sleep: shared PHY and root complex not back (%d), the host stays down\n",
+			ret);
+		return;
+	}
+	WRITE_ONCE(pcie->gp_closed, false);
+	apple_pcie_gp_ports_noirq(pcie);
+}
+
+static bool apple_pcie_gp_rc_running(struct apple_pcie *pcie)
+{
+	return (readl(pcie->base + CORE_RC_CTL) & CORE_RC_CTL_RUN) &&
+	       (readl(pcie->base + CORE_RC_STAT) & CORE_RC_STAT_READY);
+}
+
+/* Every resume takes the report back. Only an armed sleep changed anything. */
+static int apple_pcie_gp_resume_noirq(struct apple_pcie *pcie)
+{
+	struct apple_pcie_gp *gp = pcie->gp;
+	bool armed = gp->armed;
+
+	apple_sleep_pcie_host_set_ready(pcie->dev, 0);
+	gp->armed = false;
+	gp->cold = false;
+	if (!armed) {
+		/* A real sleep with nothing saved: nothing of the host is reached again */
+		if (pm_resume_via_firmware()) {
+			WRITE_ONCE(pcie->gp_closed, true);
+			dev_err(pcie->dev, "deep sleep: lost its power with nothing saved\n");
+		}
 		return 0;
-	WRITE_ONCE(port->gp_closed, false);
-	apple_pcie_gp_restore(pcie, port, false);
+	}
+	if (!pm_resume_via_firmware() && apple_pcie_gp_rc_running(pcie)) {
+		apple_pcie_gp_reopen(pcie);
+		return 0;
+	}
+	gp->cold = true;
+	apple_pcie_gp_wake_noirq(pcie);
+	return 0;
+}
+
+/*
+ * The state saved at the suspend, back once the port is, for what the PCI core's noirq resume
+ * found closed: the root port's (@rp) or that of the functions below it, out of reset in D0.
+ */
+static int apple_pcie_gp_restore(struct apple_pcie *pcie, struct apple_pcie_port *port, bool rp)
+{
+	struct apple_pcie_hib_fn *fn;
+	int ret;
+
+	list_for_each_entry(fn, &pcie->hib_fns, entry) {
+		if (pci_is_root_bus(fn->pdev->bus) != rp ||
+		    apple_pcie_gp_port(pcie, fn->pdev) != port)
+			continue;
+		ret = pci_set_power_state(fn->pdev, PCI_D0);
+		if (ret) {
+			pci_err(fn->pdev, "deep sleep: not in D0 with its port back (%d)\n", ret);
+			return ret;
+		}
+		ret = pci_load_saved_state(fn->pdev, fn->state);
+		if (ret) {
+			pci_err(fn->pdev, "deep sleep: saved state not taken back (%d)\n", ret);
+			return ret;
+		}
+		pci_restore_state(fn->pdev);
+	}
 	return 0;
 }
 
@@ -8781,27 +8928,45 @@ static void apple_pcie_gp_port_down(struct apple_pcie *pcie, struct apple_pcie_p
 	struct pci_dev *rp;
 
 	WRITE_ONCE(port->gp_closed, true);
-	if (port->perst_gpio)
-		gpiod_set_value_cansleep(port->perst_gpio, 1);
+	gpiod_set_value_cansleep(port->perst_gpio, 1);
 	if (port->gp_live && port->gp_dart)
 		apple_dart_quiesce_commands(port->gp_dart);
+	/* Its root port answers if the port runs, so that what still reaches below ends there */
+	if (READ_ONCE(port->gp_rp_closed) && !READ_ONCE(pcie->gp_closed) &&
+	    (apple_pcie_port_readl(port, PORT_STATUS) & PORT_STATUS_READY)) {
+		WRITE_ONCE(port->gp_rp_closed, false);
+		apple_pcie_gp_restore(pcie, port, true);
+	}
 	rp = bridge->bus ? pci_get_slot(bridge->bus, PCI_DEVFN(port->idx, 0)) : NULL;
 	if (rp && rp->subordinate)
 		pci_walk_bus(rp->subordinate, pci_dev_set_disconnected, NULL);
 	pci_dev_put(rp);
 }
 
-/* The normal phase, after the SMC, which powers the endpoints, and before the functions */
+/*
+ * The normal phase, after the SMC and before the functions: the ports the noirq resume didn't
+ * bring back, tried again with their endpoints' power raised, then their root ports' state as
+ * the suspend saved it (the set-up rewrote some of it) and that of the functions below them,
+ * which the PCI core found closed.
+ */
 static int apple_pcie_gp_resume(struct apple_pcie *pcie)
 {
 	struct apple_pcie_port *port;
 	int ret;
 
 	list_for_each_entry(port, &pcie->ports, entry) {
-		if (!port->gp_cold)
+		if (!port->gp_cold && !port->gp_failed)
 			continue;
+		if (port->gp_failed || READ_ONCE(pcie->gp_closed))
+			ret = -ENODEV;
+		else
+			ret = apple_pcie_gp_port_up(pcie, port, true);
+		if (!ret)
+			ret = apple_pcie_gp_restore(pcie, port, true);
+		if (!ret && port->gp_live)
+			ret = apple_pcie_gp_restore(pcie, port, false);
 		port->gp_cold = false;
-		ret = READ_ONCE(pcie->gp_closed) ? -ENODEV : apple_pcie_gp_port_up(pcie, port);
+		port->gp_failed = false;
 		if (!ret) {
 			dev_info(pcie->dev, "deep sleep: port %d back\n", port->idx);
 			continue;
