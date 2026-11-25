@@ -203,7 +203,7 @@ static inline int apple_dart_fw_range(struct device *dev, dma_addr_t iova, size_
 #if IS_REACHABLE(CONFIG_APPLE_DART)
 bool apple_dart_sleep_listed(struct device *dev);
 int apple_dart_sleep_prepare(struct device *dev);
-void apple_dart_sleep_restore(struct device *dev);
+int apple_dart_sleep_restore(struct device *dev);
 /* A display DART's streams around a display power cycle, see the DART driver. */
 int apple_dart_display_streams(struct device *dev, u32 streams, bool on, bool flush);
 /* A locked display DART's TCR and TTBR words kept across a real sleep (T6041). */
@@ -234,8 +234,9 @@ static inline int apple_dart_sleep_prepare(struct device *dev)
 	return -ENODEV;
 }
 
-static inline void apple_dart_sleep_restore(struct device *dev)
+static inline int apple_dart_sleep_restore(struct device *dev)
 {
+	return -ENODEV;
 }
 
 static inline int apple_dart_display_streams(struct device *dev, u32 streams, bool on,

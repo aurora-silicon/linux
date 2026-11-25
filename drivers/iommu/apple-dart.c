@@ -6958,14 +6958,17 @@ static void apple_dart_sleep_write_kept(struct apple_dart *dart,
 				  list->pairs[2 * i]);
 }
 
-static void apple_dart_sleep_wait_tlb(struct apple_dart *dart)
+static int apple_dart_sleep_wait_tlb(struct apple_dart *dart)
 {
 	u32 status;
+	int ret;
 
-	if (readl_poll_timeout_atomic(dart->regs + DART_T8110_TLB_CMD, status,
-				      !(status & DART_T8110_TLB_CMD_BUSY), 1,
-				      DART_T8110_FLUSH_BUSY_TIMEOUT))
+	ret = readl_poll_timeout_atomic(dart->regs + DART_T8110_TLB_CMD, status,
+					!(status & DART_T8110_TLB_CMD_BUSY), 1,
+					DART_T8110_FLUSH_BUSY_TIMEOUT);
+	if (ret)
 		dev_err(dart->dev, "TLB command still busy around a sleep: %#x\n", status);
+	return ret;
 }
 
 /* Whether a sleep list stops streams, which the restore then has to start again. */
@@ -7041,24 +7044,46 @@ int apple_dart_sleep_prepare(struct device *dev)
 }
 EXPORT_SYMBOL_GPL(apple_dart_sleep_prepare);
 
-/**
- * apple_dart_sleep_restore_lost() - Put back a DART saved by apple_dart_sleep_prepare()
- * @dev: the DART
- * @lost: its power went off since, so its registers are at their reset values
- *
- * A DART that kept its registers only gets back what its prepare list stopped: the late
- * list and the streams.
+/*
+ * Whether every stream the snapshot holds reads back as saved: one whose write did not take
+ * would have its firmware started on translations that aren't Linux's.
  */
-void apple_dart_sleep_restore_lost(struct device *dev, bool lost)
+static int apple_dart_sleep_check(struct apple_dart *dart)
 {
-	struct apple_dart *dart = dev_get_drvdata(dev);
+	unsigned int sid, idx;
+	u32 val;
+
+	for (sid = 0; sid < dart->num_streams; sid++) {
+		if (!dart->save_tcr[sid] && !dart->save_ttbr[sid][0])
+			continue;
+		val = apple_dart_readl(dart, DART_TCR(dart, sid));
+		if (val != dart->save_tcr[sid]) {
+			dev_err(dart->dev, "SID%u TCR reads %#x after the sleep, saved %#x\n",
+				sid, val, dart->save_tcr[sid]);
+			return -EIO;
+		}
+		for (idx = 0; idx < dart->hw->ttbr_count; idx++) {
+			val = apple_dart_readl(dart, DART_TTBR(dart, sid, idx));
+			if (val != dart->save_ttbr[sid][idx]) {
+				dev_err(dart->dev,
+					"SID%u TTBR%u reads %#x after the sleep, saved %#x\n",
+					sid, idx, val, dart->save_ttbr[sid][idx]);
+				return -EIO;
+			}
+		}
+	}
+	return 0;
+}
+
+/*
+ * Under the lock, with a snapshot. Returns 0, or -ETIMEDOUT if the TLB command it waits for
+ * didn't finish.
+ */
+static int apple_dart_sleep_put_back(struct apple_dart *dart, bool lost)
+{
 	unsigned int sid, idx, i;
-	unsigned long flags;
+	int ret = 0;
 
-	if (!dart || !dart->sleep_saved)
-		return;
-
-	spin_lock_irqsave(&dart->lock, flags);
 	dart->sleep_saved = false;
 	if (lost) {
 		apple_dart_sleep_write_kept(dart, &dart->sleep_restore);
@@ -7076,26 +7101,69 @@ void apple_dart_sleep_restore_lost(struct device *dev, bool lost)
 		for (i = 0; i < BITS_TO_U32(dart->num_streams); i++)
 			apple_dart_writel(dart, dart->sleep_enable[i],
 					  dart->hw->enable_streams + 4 * i);
-		apple_dart_sleep_wait_tlb(dart);
+		ret = apple_dart_sleep_wait_tlb(dart);
 	}
 	if (dart->sleep_gated) {
 		dart->sleep_gated = false;
 		WRITE_ONCE(dart->commands_gated, false);
 	}
+	return ret;
+}
+
+/**
+ * apple_dart_sleep_restore_lost() - Put back a DART saved by apple_dart_sleep_prepare()
+ * @dev: the DART
+ * @lost: its power went off since, so its registers are at their reset values
+ *
+ * A DART that kept its registers only gets back what its prepare list stopped: the late
+ * list and the streams.
+ */
+void apple_dart_sleep_restore_lost(struct device *dev, bool lost)
+{
+	struct apple_dart *dart = dev_get_drvdata(dev);
+	unsigned long flags;
+
+	if (!dart || !dart->sleep_saved)
+		return;
+
+	spin_lock_irqsave(&dart->lock, flags);
+	apple_dart_sleep_put_back(dart, lost);
 	spin_unlock_irqrestore(&dart->lock, flags);
 }
 EXPORT_SYMBOL_GPL(apple_dart_sleep_restore_lost);
 
 /**
  * apple_dart_sleep_restore() - The same, for a consumer whose DART loses its registers
- * only in a real sleep
+ * only in a real sleep, and which starts its firmware only if this succeeds
  * @dev: the DART
  *
- * A suspend that was refused lost nothing, so nothing is written then.
+ * A suspend that was refused lost nothing, so nothing is written then. Either way the
+ * streams the snapshot holds are read back.
+ *
+ * Return: 0; -ENODEV if the DART driver isn't bound, -ENODATA if nothing was saved,
+ * -ETIMEDOUT if the restore's TLB command didn't finish, or -EIO if a stream doesn't read
+ * back what was saved.
  */
-void apple_dart_sleep_restore(struct device *dev)
+int apple_dart_sleep_restore(struct device *dev)
 {
-	apple_dart_sleep_restore_lost(dev, pm_resume_via_firmware());
+	struct apple_dart *dart = dev_get_drvdata(dev);
+	unsigned long flags;
+	int ret;
+
+	if (!dart)
+		return -ENODEV;
+	if (!dart->sleep_saved) {
+		dev_err(dart->dev, "nothing saved to put back after the sleep\n");
+		return -ENODATA;
+	}
+
+	spin_lock_irqsave(&dart->lock, flags);
+	ret = apple_dart_sleep_put_back(dart, pm_resume_via_firmware());
+	if (!ret)
+		ret = apple_dart_sleep_check(dart);
+	spin_unlock_irqrestore(&dart->lock, flags);
+
+	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_dart_sleep_restore);
 
