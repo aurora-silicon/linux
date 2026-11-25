@@ -34,12 +34,13 @@
  *
  * The wake is macOS 27.2's on J516s, as aura's wake record has it, step for step:
  *  - the DT's apple,seq-wake-early: each complex's word, waited on, then two CPU power gates;
- *  - the power words macOS writes before its memory side, in its order, as Linux had them;
+ *  - the power words macOS turns on before its memory side, in its order, as Linux had them,
+ *    each on before the memory side starts;
  *  - the DT's apple,seq-wake: the other two gates, then the AMCCs' ways and planes and the DCS,
  *    the reverse of the commit's, only where a bit was on at the entry, each after its words
  *    as read then;
- *  - MCA3 and PMS_SRAM, the notify masks, the display complexes and I2C1, any other word the
- *    wake left otherwise.
+ *  - the words macOS turns on after its memory side (APCIE_PHY_SW to SIO_CPU), the notify
+ *    masks, the display complexes, I2C and SPI, then any other word the wake left otherwise.
  * Past the commit nothing goes back: a wake sequence without its snapshot or with an entry that
  * fails, or a power word not on in the end, ends the wake in a panic that names it. What the
  * wake reads first is cleaned to the point of coherency before the commit.
@@ -429,27 +430,29 @@ static void t6030_sleep_unstage(struct apple_sleep *s, u32 offset, u32 before)
 #define T6030_AON(offset)		(SLEEP_PS_WAKE_AON | (offset))
 
 /*
- * The power words macOS 27.2's wake on J516s writes, in the order it first writes them (aura's
- * whole wake record), in three steps around the rest of its wake:
- *  - before the second pair of CPU power gates and the memory side, by 3.4 ms;
+ * The power words macOS 27.2's wake on J516s turns on, in the order it first raises their
+ * target (aura's whole wake record), in three steps around the rest of its wake. Words it
+ * writes earlier with the target off, or never raises during its wake, are left to the end.
+ *  - before the second pair of CPU power gates and the memory side, by 2.4 ms;
  */
 static const u32 t6030_ps_wake_early[] = {
 	0xc00, T6030_AON(0x98), 0x110, 0x118, 0x120, 0x170, 0x1b8, 0x1f0, 0x210, 0x228, 0x230,
 	0x238, 0x240, 0x248, 0x260, 0x2a0, 0x2a8, 0x2b0, 0x2b8, 0x2c0, 0x2c8, 0x2d0, 0x2e0,
-	0x408, 0x500, 0x510, 0x558, 0x568, 0x5b0, 0x5b8, 0x4e0, 0x4c8, 0x390, 0x388, 0x308,
-	0x300, 0x2f8, 0x2f0, 0x2e8, 0x2d8, 0x298, 0x290, 0x288, 0x280, 0x278, 0x270, 0x268,
-	0x250, 0x220, 0x218, 0x208, 0x200, 0x1e0, 0x1d8, 0x1d0, 0x190, 0x180, 0x178, 0x168,
-	0x160, 0x158, 0x150, 0x148, 0x140, 0x138, 0x108, T6030_AON(0xc0), T6030_AON(0xb8),
+	0x408, 0x500, 0x510, 0x558, 0x568, 0x5b0,
 };
 
-/*  - after the memory side, before the notify masks: MCA3, PMS_SRAM (30, 34 ms); */
+/*
+ *  - after the memory side, before the notify masks: APCIE_PHY_SW, SIO_ADMA, MCA0-3, PMS_SRAM,
+ *    PMP, SIO_CPU (12 to 41 ms);
+ */
 static const u32 t6030_ps_wake_mid[] = {
-	0x398, 0x4d0,
+	0x5b8, 0x2d8, 0x308, 0x388, 0x390, 0x398, 0x4d0, 0x4c8, 0x1d0,
 };
 
-/*  - after the notify masks: the display complexes, then I2C1 (57-59 ms). */
+/*  - after the notify masks: the display complexes, then I2C1-3 and SPI2 (57 to 70 ms). */
 static const u32 t6030_ps_wake_late[] = {
-	0x3b8, 0x3d8, 0x3e0, 0x3c0, 0x3f0, 0x3f8, 0x1c0, 0x258, 0x10000, 0x1f8,
+	0x3b8, 0x3d8, 0x3e0, 0x3c0, 0x3f0, 0x3f8, 0x1c0, 0x258, 0x10000, 0x1f8, 0x208, 0x200,
+	0x270,
 };
 
 static const struct apple_sleep_words t6030_wake_early_words = SLEEP_WORDS(t6030_ps_wake_early);
@@ -471,31 +474,32 @@ static void t6030_sleep_wake_seq(struct apple_sleep *s, struct sleep_seq *seq, c
 		panic("T6030 wake: %s failed: %d", name, ret);
 }
 
-/* Each power word on again by now, or the wake ends here, naming the first that isn't */
-static void t6030_sleep_wake_check_ps(struct apple_sleep *s)
+/*
+ * Each power word written so far on again, after the retries, or the wake ends here, naming
+ * the first that isn't, before anything that needs it runs
+ */
+static void t6030_sleep_wake_check_ps(struct apple_sleep *s, const char *step)
 {
-	const struct apple_sleep_soc *soc = s->soc;
+	const u32 *all = s->soc->ps_all.offset, *aon = s->soc->ps_aon_all.offset;
 	int i;
 
-	if (!s->ps_rewake_timeouts)
-		return;
-	for (i = 0; i < soc->ps_all.count; i++)
+	for (i = 0; i < s->soc->ps_all.count; i++)
 		if (s->ps_late[i])
-			panic("T6030 wake: power word %#x not on: %#x", soc->ps_all.offset[i],
-			      readl(s->ps + soc->ps_all.offset[i]));
-	for (i = 0; i < soc->ps_aon_all.count; i++)
+			panic("T6030 wake, %s: power word %#x not on: %#x", step, all[i],
+			      readl(s->ps + all[i]));
+	for (i = 0; i < s->soc->ps_aon_all.count; i++)
 		if (s->ps_aon_late[i])
-			panic("T6030 wake: ps-aon word %#x not on: %#x", soc->ps_aon_all.offset[i],
-			      readl(s->ps_aon + soc->ps_aon_all.offset[i]));
+			panic("T6030 wake, %s: ps-aon word %#x not on: %#x", step, aon[i],
+			      readl(s->ps_aon + aon[i]));
 }
 
 /*
  * Back on the boot core, in macOS's order: the DT's apple,seq-wake-early (each complex's word,
- * waited on, then two CPU power gates); the power words written before the memory side, as
- * Linux had them; apple,seq-wake (the other two gates, then the memory side, only what Linux
- * had on); MCA3 and PMS_SRAM; the notify masks; the display complexes and I2C1; any other
- * word the wake left otherwise. The words the entry lowered or took AUTO_ENABLE from go back
- * as they were before it.
+ * waited on, then two CPU power gates); the power words macOS turns on before its memory side,
+ * as Linux had them, all on before going further; apple,seq-wake (the other two gates, then the
+ * memory side, only what Linux had on); the words macOS turns on next; the notify masks; the
+ * display complexes, I2C and SPI; any other word the wake left otherwise. The words the entry
+ * lowered or took AUTO_ENABLE from go back as they were before it.
  */
 static void t6030_sleep_wake(struct apple_sleep *s)
 {
@@ -513,12 +517,15 @@ static void t6030_sleep_wake(struct apple_sleep *s)
 	t->nlowered = 0;
 	sleep_ps_rewake_begin(s);
 	sleep_ps_rewake_words(s, &t6030_wake_early_words, false);
+	/* None of the memory side's registers before every early word is on */
+	sleep_ps_rewake_settle(s);
+	t6030_sleep_wake_check_ps(s, "before the memory side");
 	t6030_sleep_wake_seq(s, &t->wake, "apple,seq-wake");
 	sleep_ps_rewake_words(s, &t6030_wake_mid_words, false);
 	t6030_sleep_undo_regs(s);
 	sleep_ps_rewake_words(s, &t6030_wake_late_words, false);
 	sleep_ps_rewake_rest(s);
-	t6030_sleep_wake_check_ps(s);
+	t6030_sleep_wake_check_ps(s, "at the end");
 }
 
 static void t6030_deep_wfi_arm(void)

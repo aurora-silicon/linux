@@ -4876,6 +4876,24 @@ static void sleep_ps_rewake_words(struct apple_sleep *s, const struct apple_slee
 	}
 }
 
+/* Each word written so far that wasn't on in time, written again, up to twice more */
+static void sleep_ps_rewake_settle(struct apple_sleep *s)
+{
+	const u32 *all = s->soc->ps_all.offset, *aon = s->soc->ps_aon_all.offset;
+	int i, pass;
+
+	for (pass = 0; pass < PS_REWAKE_PASSES; pass++) {
+		for (i = 0; i < s->soc->ps_all.count; i++)
+			if (s->ps_late[i])
+				s->ps_late[i] = sleep_ps_restore(sleep_power_reg(s, all[i]),
+								 s->ps_commit[i]);
+		for (i = 0; i < s->soc->ps_aon_all.count; i++)
+			if (s->ps_aon_late[i])
+				s->ps_aon_late[i] = sleep_ps_restore(s->ps_aon + aon[i],
+								     s->ps_aon_commit[i]);
+	}
+}
+
 /*
  * Any other domain the wake left otherwise, then every word not yet on again, a second time
  * for one whose parent came later. Counts what is still not on.
