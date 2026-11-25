@@ -169,21 +169,3 @@
 &scaler1 {
 	status = "okay";
 };
-
-/* The port controllers take system power state S3 for a firmware suspend, as macOS sends it. */
-&hpm0 {
-	apple,sleep-ssps;
-};
-
-&hpm1 {
-	apple,sleep-ssps;
-};
-
-&hpm2 {
-	apple,sleep-ssps;
-};
-
-/* MagSafe's controller follows the sleep too. */
-&hpm5 {
-	apple,sleep-ssps;
-};
