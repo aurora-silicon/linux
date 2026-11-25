@@ -464,6 +464,20 @@ static int apple_rtkit_helper_ap_power(struct apple_rtkit_helper *helper, bool o
 	return ret;
 }
 
+/*
+ * Every AP on after a sleep: checked first, and its result kept for the input consumer, which
+ * asks after this device's own callbacks.
+ */
+static int apple_rtkit_helper_send_on(struct apple_rtkit_helper *helper)
+{
+	int ret = apple_rtkit_helper_check_live(helper);
+
+	if (!ret)
+		ret = apple_rtkit_helper_ap_power(helper, true);
+	helper->wake_ret = ret;
+	return ret;
+}
+
 static int apple_rtkit_helper_ap_idle(struct apple_rtkit_helper *helper)
 {
 	int ret;
@@ -485,11 +499,11 @@ static int apple_rtkit_helper_ap_idle(struct apple_rtkit_helper *helper)
 		}
 		helper->idle_pending = false;
 		dev_info(helper->dev, "the last AP idle notice was answered late, sending AP on first\n");
-		/* Checked first, as every AP on after a sleep is. */
-		ret = apple_rtkit_helper_check_live(helper);
-		if (ret)
+		ret = apple_rtkit_helper_send_on(helper);
+		/* A lost session hears nothing more. */
+		if (ret && READ_ONCE(helper->lost))
 			return ret;
-		if (apple_rtkit_helper_send_ap_power(helper, true)) {
+		if (ret) {
 			dev_err(helper->dev, "AP on after the late answer not answered: no sleep\n");
 			helper->idle_pending = true;
 			return -EBUSY;
@@ -548,21 +562,39 @@ static int apple_rtkit_helper_ap_on(struct apple_rtkit_helper *helper)
 	if (!helper->ap_idle)
 		return helper->wake_ret;
 	helper->ap_idle = false;
-	ret = apple_rtkit_helper_check_live(helper);
-	if (!ret)
-		ret = apple_rtkit_helper_ap_power(helper, true);
+	ret = apple_rtkit_helper_send_on(helper);
 	if (!ret)
 		dev_dbg(helper->dev, "AP on notice answered after a sleep\n");
-	/* Kept for the input consumer, which asks after this device's own callbacks. */
-	helper->wake_ret = ret;
 	return ret;
+}
+
+/*
+ * An idle notice that went unanswered, at the end of its sleep: whether the answer has come
+ * since. If it has, AP on is to go out, as after any idle notice. If not, nothing is sent.
+ */
+static void apple_rtkit_helper_idle_settle(struct apple_rtkit_helper *helper)
+{
+	bool late;
+
+	if (!helper->idle_unanswered)
+		return;
+	late = !apple_rtkit_is_running(helper->rtk);
+	helper->idle_unanswered = false;
+	dev_info(helper->dev, "after the unanswered idle notice: %s\n",
+		 late ? "its answer came late, sending AP on" :
+			"still no answer, nothing sent");
+	helper->ap_idle = late;
+	/* Its answer may still come: the next sleep looks again before sending another. */
+	helper->idle_pending = !late;
 }
 
 /*
  * The AP on notice that ends a firmware-driven sleep, sent now unless it went already. The
  * input consumer calls this before it tells the firmware the host is awake: also after a
  * sleep refused between the consumer's .suspend and this device's, when the PM core calls no
- * .resume here and .complete comes only after the consumer's .resume.
+ * .resume here and .complete comes only after the consumer's .resume. An idle notice without
+ * an answer is settled first, as .complete would: one answered since gets its AP on now, and
+ * one still unanswered returns -EBUSY, so that the consumer sends nothing over it.
  */
 int apple_rtkit_helper_ap_wake(struct device *dev)
 {
@@ -572,6 +604,14 @@ int apple_rtkit_helper_ap_wake(struct device *dev)
 		return -ENODEV;
 	if (READ_ONCE(helper->lost))
 		return -EHOSTDOWN;
+	apple_rtkit_helper_idle_settle(helper);
+	if (helper->idle_pending) {
+		if (apple_rtkit_is_running(helper->rtk))
+			return -EBUSY;
+		dev_info(helper->dev, "the last AP idle notice was answered late, sending AP on\n");
+		helper->idle_pending = false;
+		helper->ap_idle = true;
+	}
 	return apple_rtkit_helper_ap_on(helper);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_helper_ap_wake);
@@ -600,17 +640,7 @@ static int __maybe_unused apple_rtkit_helper_suspend_late(struct device *dev)
 
 static void apple_rtkit_helper_sleep_end(struct apple_rtkit_helper *helper)
 {
-	if (helper->idle_unanswered) {
-		bool late = !apple_rtkit_is_running(helper->rtk);
-
-		helper->idle_unanswered = false;
-		dev_info(helper->dev, "after the unanswered idle notice: %s\n",
-			 late ? "its answer came late, sending AP on" :
-				"still no answer, nothing sent");
-		helper->ap_idle = late;
-		/* Its answer may still come: the next sleep looks again before sending another. */
-		helper->idle_pending = !late;
-	}
+	apple_rtkit_helper_idle_settle(helper);
 	apple_rtkit_helper_ap_on(helper);
 }
 

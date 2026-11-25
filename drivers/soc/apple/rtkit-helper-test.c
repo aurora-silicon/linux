@@ -764,6 +764,76 @@ static void rtkh_pm_pending_ap_on_fails(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_prepare(dev), -EBUSY);
 	KUNIT_EXPECT_TRUE(test, ctx->helper.idle_pending);
 	KUNIT_EXPECT_FALSE(test, ctx->helper.ap_idle);
+	/* Kept, as every AP on's result is. */
+	KUNIT_EXPECT_EQ(test, ctx->helper.wake_ret, -EIO);
+	rtkh_expect_calls(test, want, ARRAY_SIZE(want));
+}
+
+/*
+ * The input consumer asks before .complete, after an idle notice that went unanswered. Still no
+ * answer: it gets -EBUSY and nothing is sent, then or at .complete.
+ */
+static void rtkh_pm_ap_wake_unanswered(struct kunit *test)
+{
+	struct rtkh_test *ctx = test->priv;
+	struct device *dev = ctx->dev;
+	static const bool want[] = { false };
+
+	ctx->helper.idle_late = true;
+	pm_set_suspend_via_firmware();
+	ctx->ret[0] = -ETIMEDOUT;
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_suspend_late(dev), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_resume(dev), 0);
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_ap_wake(dev), -EBUSY);
+	KUNIT_EXPECT_FALSE(test, ctx->helper.idle_unanswered);
+	KUNIT_EXPECT_TRUE(test, ctx->helper.idle_pending);
+	apple_rtkit_helper_complete(dev);
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_ap_wake(dev), -EBUSY);
+	rtkh_expect_calls(test, want, ARRAY_SIZE(want));
+}
+
+/* The answer came before the consumer asks: its AP on goes first, and only once. */
+static void rtkh_pm_ap_wake_late_answer(struct kunit *test)
+{
+	struct rtkh_test *ctx = test->priv;
+	struct device *dev = ctx->dev;
+	static const bool want[] = { false, true };
+
+	ctx->helper.idle_late = true;
+	pm_set_suspend_via_firmware();
+	ctx->ret[0] = -ETIMEDOUT;
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_suspend_late(dev), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_resume(dev), 0);
+	ctx->rtk.ap_power_state = RTKH_TEST_PWR_IDLE;
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_ap_wake(dev), 0);
+	KUNIT_EXPECT_FALSE(test, ctx->helper.idle_pending);
+	apple_rtkit_helper_complete(dev);
+	apple_rtkit_helper_pm_notify(&ctx->helper.pm_nb, PM_POST_SUSPEND, NULL);
+	rtkh_expect_calls(test, want, ARRAY_SIZE(want));
+}
+
+/*
+ * An earlier sleep's notice: the consumer waits until it is answered, then its ask sends the
+ * AP on. That one's failure stands for the next ask.
+ */
+static void rtkh_pm_ap_wake_pending(struct kunit *test)
+{
+	struct rtkh_test *ctx = test->priv;
+	struct device *dev = ctx->dev;
+	static const bool want[] = { false, true };
+
+	pm_set_suspend_via_firmware();
+	ctx->ret[0] = -ETIMEDOUT;
+	ctx->ret[1] = -EIO;
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_prepare(dev), -ETIMEDOUT);
+	apple_rtkit_helper_pm_notify(&ctx->helper.pm_nb, PM_POST_SUSPEND, NULL);
+	KUNIT_ASSERT_TRUE(test, ctx->helper.idle_pending);
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_ap_wake(dev), -EBUSY);
+
+	ctx->rtk.ap_power_state = RTKH_TEST_PWR_IDLE;
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_ap_wake(dev), -EIO);
+	KUNIT_EXPECT_FALSE(test, ctx->helper.idle_pending);
+	KUNIT_EXPECT_EQ(test, apple_rtkit_helper_ap_wake(dev), -EIO);
 	rtkh_expect_calls(test, want, ARRAY_SIZE(want));
 }
 
@@ -1024,6 +1094,9 @@ static struct kunit_case apple_rtkit_helper_test_cases[] = {
 	KUNIT_CASE(rtkh_pm_unanswered_crashed),
 	KUNIT_CASE(rtkh_pm_pending_answered_later),
 	KUNIT_CASE(rtkh_pm_pending_ap_on_fails),
+	KUNIT_CASE(rtkh_pm_ap_wake_unanswered),
+	KUNIT_CASE(rtkh_pm_ap_wake_late_answer),
+	KUNIT_CASE(rtkh_pm_ap_wake_pending),
 	KUNIT_CASE(rtkh_pm_complete_then_notify),
 	KUNIT_CASE(rtkh_pm_notify_other_events),
 	KUNIT_CASE(rtkh_pm_ap_on_fails),
