@@ -211,13 +211,14 @@ static int apple_drm_fbdev_probe(struct drm_fb_helper *helper,
 		 * firmware 27 on the T8142, 14.7), or the plane cannot scan
 		 * out XRGB at all.
 		 *
-		 * H17P keeps an explicit case: its planes still advertise
-		 * XRGB8888 because the opaque-X property makes it usable
-		 * for compositors, but fbcon does not set that property and
-		 * needs the alpha surface instead.
+		 * H17P and firmware 27 also need ARGB for fbcon when the
+		 * primary advertises XRGB8888. On those paths the stored
+		 * X byte can be blended as alpha, and fbcon does not set
+		 * the opaque-X property.
 		 */
 		if (!apple_primary_supports_xrgb8888(crtc->primary) ||
-		    dcp->fw_compat == DCP_FIRMWARE_H17P) {
+		    dcp->fw_compat == DCP_FIRMWARE_H17P ||
+		    dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
 			sizes->surface_bpp = 32;
 			sizes->surface_depth = 32;
 			break;
