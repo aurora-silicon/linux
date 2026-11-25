@@ -8877,16 +8877,18 @@ static void t8142_lower_io(struct apple_sleep *s)
  * read RTC_CTL, 0x43 if it had fired, the 4-byte compare at 0x2008, 0x200e <- 0, RTC_CTL <-
  * 0x41. T6050's post-timer step at the same addresses (apple,pmu-alarm-rearm 0x43 0x41). The
  * opcode carries the byte count (his follow-up fix). The compare and the counter are read here,
- * before the cores' window, with the notes; the compare is now + apple_sleep.t8142_wake_s
- * (0 keeps the PMU's own), which is also a wake source: J815 has no RTC device under Linux.
+ * before the cores' window, with the notes. The compare stays the PMU's own unless
+ * apple_sleep.t8142_wake_s asks for a timed wake that many seconds after the commit (a test
+ * knob: J815 has no RTC device under Linux, so nothing else arms one). By default a sleep
+ * lasts until a key, the trackpad, the lid or the power button wakes it.
  * J813 still resets with it (PMU took all four commands), so this is parity, not the fix.
  */
 static bool sleep_pmu_alarm = true;
 module_param_named(pmu_alarm, sleep_pmu_alarm, bool, 0644);
 MODULE_PARM_DESC(pmu_alarm, "T8142: send the PMU's RTC alarm after the S2R timer, as macOS does (default Y)");
-static unsigned int t8142_wake_s = 30;
+static unsigned int t8142_wake_s;
 module_param(t8142_wake_s, uint, 0644);
-MODULE_PARM_DESC(t8142_wake_s, "T8142: the PMU RTC alarm this many s after the commit (0: keep the PMU's)");
+MODULE_PARM_DESC(t8142_wake_s, "T8142 test: wake this many s after the commit (default 0: no timed wake, the PMU's compare stays)");
 static u8 t8142_alarm[4];
 static bool t8142_alarm_ok;
 static int t8142_post_ret = -ENODATA;
