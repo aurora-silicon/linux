@@ -141,6 +141,7 @@ struct aura_s2r_mailbox {
 #define WDT_WD2_COUNT		0x20
 #define WDT_WD2_ALARM		0x28
 #define WDT_WD2_CTL		0x2c
+#define WDT_WD2_CTL_IRQ_STATUS	BIT(1)
 #define WDT_TICKS_PER_S		24000000
 /* The sleep's own safety net: ADT /arm-io/wdt simple-reconfig-wdog-icc-time. */
 #define WDT_SLEEP_SECS		5
@@ -149,9 +150,10 @@ struct aura_s2r_mailbox {
 
 #define AON_AP_DEADLINE		0x08
 /*
- * T8142: a word of the watchdog's second page (/arm-io/wdt + 0x802c). macOS's entry
- * read-modify-writes it from 0 to 0x20 right before WD0's control and WD2 (26B131 trace,
- * 11.1 ms before the S2R timer); XNU writes 0x10 there during boot. Meaning unknown.
+ * Simple-reconfig WD2 routing word (bits 5:4: 01 = run-time cold reset, 10 = sleep-commit
+ * routing). Lives at wdt-aux + 0x2c on T6050 and aon-misc + 0x2c (/arm-io/wdt + 0x802c) on
+ * T8142; sleep saves it before commit (T6050 DT sequence writes 0x20, T8142 ORs 0x20) and
+ * restores the saved value on wake.
  */
 #define AON_WDT_SLEEP		0x2c
 
@@ -1860,6 +1862,125 @@ void apple_sleep_smc_unregister(struct device *dev)
 	}
 }
 EXPORT_SYMBOL_GPL(apple_sleep_smc_unregister);
+
+static const struct of_device_id apple_sleep_of_match[];
+
+static DEFINE_SPINLOCK(apple_sleep_wdt_lock);
+static struct device *apple_sleep_wdt_dev;
+static void (*apple_sleep_wdt_restore)(void *data);
+static void *apple_sleep_wdt_data;
+static bool apple_sleep_wd2_owned;
+
+static bool apple_sleep_wdt_same_block(const struct resource *sleep_wdt,
+				       const struct resource *wdt)
+{
+	if (!sleep_wdt || !wdt)
+		return false;
+	return sleep_wdt->start == wdt->start;
+}
+
+static bool apple_sleep_dt_owns_wdt(const struct resource *wdt)
+{
+	struct device_node *np = NULL;
+	bool found = false;
+
+	if (!wdt)
+		return false;
+
+	for_each_matching_node(np, apple_sleep_of_match) {
+		struct resource res;
+		int idx;
+
+		if (!of_device_is_available(np))
+			continue;
+		idx = of_property_match_string(np, "reg-names", "wdt");
+		if (idx < 0 || of_address_to_resource(np, idx, &res))
+			continue;
+		if (apple_sleep_wdt_same_block(&res, wdt)) {
+			found = true;
+			of_node_put(np);
+			break;
+		}
+	}
+
+	return found;
+}
+
+static int apple_sleep_wdt_register_matched(struct device *dev, bool matched,
+					    void (*restore)(void *data), void *data)
+{
+	unsigned long flags;
+
+	if (!dev || !restore)
+		return -EINVAL;
+	if (!matched)
+		return 0;
+
+	spin_lock_irqsave(&apple_sleep_wdt_lock, flags);
+	if (apple_sleep_wdt_dev && apple_sleep_wdt_dev != dev) {
+		spin_unlock_irqrestore(&apple_sleep_wdt_lock, flags);
+		return -EBUSY;
+	}
+	apple_sleep_wdt_dev = dev;
+	apple_sleep_wdt_restore = restore;
+	apple_sleep_wdt_data = data;
+	spin_unlock_irqrestore(&apple_sleep_wdt_lock, flags);
+
+	return 0;
+}
+
+int apple_sleep_wdt_register(struct device *dev, const struct resource *wdt,
+			     void (*restore)(void *data), void *data)
+{
+	if (!dev || !wdt || !restore)
+		return -EINVAL;
+
+	return apple_sleep_wdt_register_matched(dev, apple_sleep_dt_owns_wdt(wdt),
+						restore, data);
+}
+EXPORT_SYMBOL_GPL(apple_sleep_wdt_register);
+
+void apple_sleep_wdt_unregister(struct device *dev)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&apple_sleep_wdt_lock, flags);
+	if (apple_sleep_wdt_dev == dev) {
+		apple_sleep_wdt_dev = NULL;
+		apple_sleep_wdt_restore = NULL;
+		apple_sleep_wdt_data = NULL;
+	}
+	spin_unlock_irqrestore(&apple_sleep_wdt_lock, flags);
+}
+EXPORT_SYMBOL_GPL(apple_sleep_wdt_unregister);
+
+bool apple_sleep_wdt_active(struct device *dev)
+{
+	unsigned long flags;
+	bool active;
+
+	if (!dev)
+		return false;
+
+	spin_lock_irqsave(&apple_sleep_wdt_lock, flags);
+	active = apple_sleep_wd2_owned && apple_sleep_wdt_dev == dev;
+	spin_unlock_irqrestore(&apple_sleep_wdt_lock, flags);
+
+	return active;
+}
+EXPORT_SYMBOL_GPL(apple_sleep_wdt_active);
+
+static void apple_sleep_wdt_end(void __iomem *wdt)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&apple_sleep_wdt_lock, flags);
+	writel(0, wdt + WDT_WD2_CTL);
+	if (apple_sleep_wdt_restore)
+		apple_sleep_wdt_restore(apple_sleep_wdt_data);
+	apple_sleep_wd2_owned = false;
+	spin_unlock_irqrestore(&apple_sleep_wdt_lock, flags);
+}
 
 void apple_sleep_display_quiesced(struct device *dev, bool quiesced)
 {
@@ -6470,7 +6591,14 @@ static int apple_sleep_begin(suspend_state_t state)
 		apple_sleep->smc_woke_alone = false;
 		sleep_pins_save(apple_sleep);
 	}
-	apple_sleep_set_wd2(apple_sleep, WDT_SUSPEND_SECS);
+	{
+		unsigned long flags;
+
+		spin_lock_irqsave(&apple_sleep_wdt_lock, flags);
+		apple_sleep_wd2_owned = true;
+		apple_sleep_set_wd2(apple_sleep, WDT_SUSPEND_SECS);
+		spin_unlock_irqrestore(&apple_sleep_wdt_lock, flags);
+	}
 	pm_set_suspend_via_firmware();
 	sleep_ans_late_open();
 
@@ -6488,7 +6616,7 @@ static void apple_sleep_end(void)
 	if (pm_suspend_via_firmware() && apple_sleep->soc->ops->pmu_wake)
 		apple_sleep->soc->ops->pmu_wake(apple_sleep);
 	if (pm_suspend_via_firmware())
-		writel(0, apple_sleep->wdt + WDT_WD2_CTL);
+		apple_sleep_wdt_end(apple_sleep->wdt);
 }
 
 /*
