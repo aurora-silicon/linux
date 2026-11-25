@@ -1418,6 +1418,7 @@ static int apple_smc_sleep_saved_begin(void *data)
 	}
 	smc->saved_scope = true;
 	smc->saved_committed = false;
+	smc->saved_pmvc_asked = false;
 	smc->saved_pmvc_sent = false;
 	/* Drain only a bounded prefix before reserving any ID. An old reply
 	 * cannot satisfy a fresh command or a stale AP completion a new post.
@@ -1560,6 +1561,9 @@ static int apple_smc_sleep_late_notice(void *data, u64 *sent, u64 *ack)
 		return -EINVAL;
 	if (smc->saved_pmvc_sent) {
 		answered = smc->saved_pmvc_at;
+	} else if (!smc->saved_pmvc_asked) {
+		/* A profile that sends no pmVC of its own (T6030): the policy's is the last. */
+		answered = smc->sleep_pmvc_at;
 	} else {
 		ret = apple_smc_saved_write_u32(smc, SMC_KEY(pmVC), p->pmvc);
 		answered = __arch_counter_get_cntpct();
@@ -1630,6 +1634,7 @@ static int apple_smc_sleep_saved_pmvc(void *data)
 	if (!smc->sleep_policy || !smc->saved_scope || smc->saved_committed ||
 	    !irqs_disabled() || !smc->sleep_warned || smc->ap_notified)
 		return -EINVAL;
+	smc->saved_pmvc_asked = true;
 	ret = apple_smc_saved_write_u32(smc, SMC_KEY(pmVC), smc->sleep_policy->pmvc);
 	if (ret)
 		return ret;
@@ -1711,6 +1716,7 @@ static int apple_smc_prepare_policy(struct apple_smc *smc)
 	ret = apple_smc_write_u32(smc, SMC_KEY(pmVC), p->pmvc);
 	if (ret)
 		return ret;
+	smc->sleep_pmvc_at = __arch_counter_get_cntpct();
 	return apple_sleep_smc_register_saved(smc->dev, &apple_smc_saved_ops, smc);
 }
 
