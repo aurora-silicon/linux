@@ -4,14 +4,67 @@
 # and fail when HEAD has a warning BASE does not. Also runs dt_binding_check on every binding HEAD
 # changes. Phandle values in the messages are masked, so renumbering is not a new warning, and so
 # is the pattern list of a "does not match any of the regexes" message, which grows with every
-# vendor prefix the bindings add. A firmware-profile variant (a .dts that includes another board's
-# .dts, such as t8122-j613-25g83) is reported under its base board's name, so the base's existing
-# warnings are not new warnings of the variant; anything the variant adds still is.
-# Needs dtschema (dt-validate), clang/lld (LLVM=1), flex, bison. Prints a summary.
+# vendor prefix the bindings add. Upstream dtschema's chosen.yaml sets additionalProperties: false,
+# so properties documented in in-tree bindings/chosen/*.yaml are subtracted from "chosen: ...
+# do(es) not match any of the regexes:" lines while preserving warnings for any undocumented
+# properties and all schema type/value checks. A firmware-profile variant (a .dts that includes
+# another board's .dts, such as t8122-j613-25g83) is reported under its base board's name, so the
+# base's existing warnings are not new warnings of the variant; anything the variant adds still is.
+# Needs dtschema (dt-validate), clang/lld (LLVM=1), flex, bison, python3. Prints a summary.
 set -u
 BASE=$1 HEAD=$2 W=$3
 export ARCH=arm64 LLVM=1
 mkdir -p "$W"
+filter_documented_chosen() { # chosen_bindings_dir
+	python3 -c '
+import glob, os, re, sys
+
+def load_yaml(path):
+	try:
+		import yaml
+		with open(path, encoding="utf-8") as f:
+			return yaml.safe_load(f)
+	except ImportError:
+		from ruamel.yaml import YAML
+		with open(path, encoding="utf-8") as f:
+			return YAML(typ="safe").load(f)
+
+chosen_dir = sys.argv[1]
+documented = set()
+for path in sorted(glob.glob(os.path.join(chosen_dir, "*.yaml"))):
+	doc = load_yaml(path)
+	if not isinstance(doc, dict):
+		continue
+	props = doc.get("properties")
+	if not isinstance(props, dict):
+		continue
+	for key, val in props.items():
+		if isinstance(key, str) and not key.startswith("$") and val is not False:
+			documented.add(key)
+
+pat = re.compile(
+	r"^(?P<prefix>[^\n]*\.dtb: chosen: )"
+	r"(?P<props>\x27[^\x27]+\x27(?:, \x27[^\x27]+\x27)*)"
+	r" (?:does|do) not match any of the regexes:(?P<tail>.*)$"
+)
+
+for raw in sys.stdin:
+	line = raw.rstrip("\n")
+	m = pat.match(line)
+	if not m:
+		sys.stdout.write(raw)
+		continue
+	props = re.findall(r"\x27([^\x27]+)\x27", m.group("props"))
+	remaining = [p for p in props if p not in documented]
+	if not remaining:
+		continue
+	verb = "does" if len(remaining) == 1 else "do"
+	joined = ", ".join(f"\x27{p}\x27" for p in remaining)
+	prefix = m.group("prefix")
+	tail = m.group("tail")
+	sys.stdout.write(f"{prefix}{joined} {verb} not match any of the regexes:{tail}\n")
+' "$1"
+}
 warnings() { # rev tag
 	local t=$W/src-$2 o=$W/out-$2
 	rm -f "$W/$2.warn"
@@ -28,6 +81,7 @@ warnings() { # rev tag
 		sed -E "s#$t/##g; s#$o/##g" |
 		sed -E "s#arch/arm64/boot/dts/##; $variants" | sed -E 's#^apple/#arch/arm64/boot/dts/apple/#' |
 		perl -pe 's{(\[\[[^:]*?\]\])}{(my $x = $1) =~ s/\d+/N/g; $x}ge; s{b\x27(?:\\.|[^\x27])*\x27}{b\x27N\x27}g; s{( not match any of the regexes): .*}{$1: ...}' |
+		filter_documented_chosen "$t/Documentation/devicetree/bindings/chosen" |
 		sort -u > "$W/$2.warn"
 	echo "$2: make rc=$rc, $(wc -l < "$W/$2.warn") warning lines, $(echo $dtbs | wc -w) DTBs"
 	return $rc
