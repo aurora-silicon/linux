@@ -3,6 +3,15 @@
 //! J713/G16G 25G83 compute packet layout. All offsets are bytes.
 
 pub(crate) const WORK_SIZE: usize = 0x2000;
+/// Active head span of a compute work image: header (`0x00..0x18`) plus up to 25 register
+/// records (`0x20..0x14c`), rounded up to 16-byte alignment. Bytes between
+/// `HEAD_ACTIVE_SIZE` and `BODY_ACTIVE_START` remain zeroed after a full write.
+pub(crate) const HEAD_ACTIVE_SIZE: usize = 0x150;
+/// First active body byte of a compute work image (`work_gva + 0x20` pointer at `0x720`).
+pub(crate) const BODY_ACTIVE_START: usize = 0x720;
+/// Exclusive end of the active body span of a compute work image (`0xf00..0xf08` tail).
+/// Bytes `BODY_ACTIVE_END..WORK_SIZE` remain zeroed after a full write.
+pub(crate) const BODY_ACTIVE_END: usize = 0xf08;
 pub(crate) const SEQ_SIZE: usize = 0x300;
 pub(crate) const SEQ_OBJECT: usize = 0x1000;
 pub(crate) const REGS: usize = 0x20;
@@ -75,7 +84,16 @@ const fn valid(l: &Layout) -> bool {
         && l.cached <= SEQ_EMBEDDED
         && SEQ_EMBEDDED + SEQ_SIZE <= NOTIFIER
 }
-const _: () = assert!(valid(&V25G83) && valid(&V26B123));
+const _: () = assert!(
+    valid(&V25G83)
+        && valid(&V26B123)
+        && REGS + 25 * 12 <= HEAD_ACTIVE_SIZE
+        && HEAD_ACTIVE_SIZE <= BODY_ACTIVE_START
+        && BODY_ACTIVE_START <= GENERATION
+        && DESCRIPTOR + DESCRIPTOR_SIZE <= BODY_ACTIVE_END
+        && 0xf08 <= BODY_ACTIVE_END
+        && BODY_ACTIVE_END <= WORK_SIZE
+);
 
 pub(crate) const SEL: [u32; 24] = [
     0x1a510, 0x1a420, 0x1a4d0, 0x1a4d8, 0x1a4e0, 0x1a4e8, 0x1a440, 0x1a458, 0x101d9, 0x1a089,

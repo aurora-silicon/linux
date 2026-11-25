@@ -211,4 +211,8 @@ pub(crate) mod initbm {
 /// Per-pass scene including UMA results and embedded prefix records.
 pub(crate) mod scene {
     pub(crate) const SIZE: usize = 0x4000;
+    /// Active prefix of a render scene touched by the host or firmware (`0x000..0x780`,
+    /// rounded up to 2 KiB). Full pass scrubs zero the entire `SIZE`; clean same-VM reuse only
+    /// rewrites `0..ACTIVE_SIZE`.
+    pub(crate) const ACTIVE_SIZE: usize = 0x800;
 }

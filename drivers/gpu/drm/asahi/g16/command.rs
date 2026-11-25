@@ -37,6 +37,8 @@ const PROCESS_EMPTY_TILES: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_P
 const RSRC_SPEC_HI: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_RSRC_SPEC_HI;
 const DBIAS_IS_INT: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_DBIAS_IS_INT;
 const FRAGMENT_BARRIERS: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_FRAGMENT_BARRIERS;
+const COMPUTE_NO_QUERY_ACCESS: u32 =
+    uapi::drm_asahi_compute_flags_DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS as u32;
 
 const CMD_RENDER: u32 = uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_RENDER;
 const CMD_COMPUTE: u32 = uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_COMPUTE;
@@ -113,13 +115,12 @@ impl Order {
     /// Cross-engine historical dependencies end at the named prefix, even while later
     /// commands in that older submission remain pending.
     pub(crate) fn ready(&self, completed: [u64; 2], published: [u64; 2]) -> bool {
-        // Same-engine compute order and barriers are kept by the firmware compute queue,
-        // which finishes each command before it starts the next: its published frontier
-        // suffices. Renders, and every cross-engine dependency, need the completed one.
+        // Same-engine order and barriers are kept by the firmware engine rings (in-order
+        // CDM execution for compute, explicit TA/FS barriers for pipelined renders): the
+        // same-engine published frontier suffices. Every cross-engine dependency still waits
+        // for the other engine's completed frontier.
         let mut frontier = completed;
-        if self.engine == COMPUTE {
-            frontier[COMPUTE] = published[COMPUTE].max(completed[COMPUTE]);
-        }
+        frontier[self.engine] = published[self.engine].max(completed[self.engine]);
         frontier[self.engine].checked_add(1) == Some(self.sequence)
             && self
                 .wait_through
@@ -147,6 +148,8 @@ pub(crate) struct ComputeCommand {
     pub(crate) attachments: KVec<uapi::drm_asahi_attachment>,
     /// Retained timestamp destinations, published after full command retirement.
     pub(crate) timestamp_outputs: crate::timestamp::Destinations,
+    /// False when userspace asserts this dispatch neither copies nor resets timestamp queries.
+    pub(crate) query_access: bool,
 }
 
 /// A validated command.
@@ -361,7 +364,7 @@ pub(crate) fn check_stream(bytes: &[u8], early_tiling: bool) -> Result {
             CMD_COMPUTE => {
                 let packet: uapi::drm_asahi_cmd_compute = payload(entry.payload)?;
                 let cmd = &packet;
-                if cmd.flags != 0
+                if cmd.flags & !COMPUTE_NO_QUERY_ACCESS != 0
                     || cmd.cdm_ctrl_stream_end <= cmd.cdm_ctrl_stream_base
                     || !inside(
                         cmd.cdm_ctrl_stream_base,
@@ -627,7 +630,7 @@ fn check_compute(
 ) -> Result {
     let vm = context.vm;
     let (base, end) = (cmd.cdm_ctrl_stream_base, cmd.cdm_ctrl_stream_end);
-    if cmd.flags != 0
+    if cmd.flags & !COMPUTE_NO_QUERY_ACCESS != 0
         || cmd.sampler_count != 0
         || cmd.sampler_heap != 0
         || !helper_is_empty(&cmd.helper)
@@ -756,6 +759,7 @@ impl Prepared<'_> {
                                 cmd: *cmd,
                                 attachments: copy_list(&[&compute])?,
                                 timestamp_outputs: outputs,
+                                query_access: cmd.flags & COMPUTE_NO_QUERY_ACCESS == 0,
                             },
                             GFP_KERNEL,
                         )?),

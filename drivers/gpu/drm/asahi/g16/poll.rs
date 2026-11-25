@@ -4,14 +4,16 @@
 //!
 //! Order of one pass, under the device lock: drain the receive rings; authenticate recovery;
 //! retire flights using stage stamps, NC queue READ/WRITE and submit-pipe frontiers, normal
-//! notifier/UMA receipts and internal timestamps; renew the progress deadline. Up to four
-//! trailing 5 us polls follow an EP 0x20 event. Then answer PB
-//! growth ([`Firmware::answer_growth`]); check hangs and recover ([`Firmware::check_hangs`],
-//! which calls [`Firmware::progress`]); publish ([`Firmware::publish`]). Then drop the lock
-//! and complete the retired jobs ([`super::job::complete_all`]). Wakeups: the EP 0x20 event
-//! kick, then an hrtimer re-poll every `g16_resnap_us` (100) while anything is published, or
-//! `g16_repoll_us` (15) while a ready prefix waits for record consumption, with a 1-jiffy
-//! delayed-work backup.
+//! notifier/UMA receipts and internal timestamps; renew the progress deadline; answer PB
+//! growth ([`Firmware::answer_growth`]); publish ([`Firmware::publish_checked`]). Then drop
+//! the lock and complete retired jobs ([`super::job::complete_all`]) before periodic 1 ms
+//! housekeeping (`session.check`, `objects.health`, `service_power`, administrative hang
+//! checks). If an EP 0x20 event arrived with flights outstanding and nothing retired yet, up
+//! to [`EVENT_RETIRE_POLLS`] trailing 5 us waits run with `Shared::state` dropped so concurrent
+//! submissions are not blocked, stopping as soon as any flight retires. Wakeups: the EP 0x20
+//! event kick, then an hrtimer re-poll every `g16_resnap_us` (100) while anything is
+//! published, or `g16_repoll_us` (15) while a ready prefix waits for record consumption or a
+//! post-event receipt tail did not settle, with a 1-jiffy delayed-work backup.
 
 use core::sync::atomic::Ordering;
 
@@ -36,8 +38,15 @@ use super::fw::work::compute;
 use super::job::{self, Completions, Job};
 use super::recovery::logic::Retirement;
 use super::regs::EngineState;
-use super::{params, Firmware, Shared, POLL_WORK};
+use super::{params, Firmware, Shared, FAST_POLL_WORK, POLL_WORK};
 use crate::module_parameters;
+
+/// Cadence of periodic housekeeping (power governor, window health, administrative hang check).
+const HOUSEKEEPING_NS: u64 = 1_000_000;
+/// Maximum trailing 5 us receipt polls after an EP 0x20 event (50 us covers firmware WC tails).
+const EVENT_RETIRE_POLLS: u32 = 10;
+/// Minimum interval between 1-jiffy delayed-work safety backup rearms (2 ms).
+const BACKUP_REARM_NS: u64 = 2_000_000;
 
 impl_has_hr_timer! {
     impl HasHrTimer<Self> for Shared {
@@ -51,6 +60,7 @@ impl HrTimerCallback for Shared {
     /// Runs the poll now.
     fn run(this: ArcBorrow<'_, Self>, _ctx: HrTimerCallbackContext<'_, Self>) -> HrTimerRestart {
         let this: Arc<Self> = this.into();
+        this.resnap_deadline_ns.store(0, Ordering::Release);
         this.poll_now();
         HrTimerRestart::NoRestart
     }
@@ -73,16 +83,39 @@ impl Shared {
             return;
         }
         let signalling = kernel::dma_fence::SignallingGuard::new();
-        let mut done = Completions::new();
-        {
-            let mut state = self.state.lock();
-            if let Some(firmware) = state.as_deref_mut() {
+        let mut evented = false;
+        let mut tail = 0u32;
+        let mut housekeeping_deferred = false;
+        let mut step = 0u32;
+
+        loop {
+            if self.sleeping.load(Ordering::Acquire) {
+                break;
+            }
+            let mut done = Completions::new();
+            let mut retry_tail = false;
+            if let Some(firmware) = self.state.lock().as_deref_mut() {
+                if self.sleeping.load(Ordering::Acquire) {
+                    return;
+                }
                 if firmware.engine.shared.is_none() {
                     firmware.engine.shared = Some(self.clone());
                 }
-                let evented = self.evented.swap(false, Ordering::AcqRel);
-                match firmware.poll(evented, &mut done) {
-                    Ok(true) => self.rearm(firmware.engine.chan_wait),
+                if step == 0 {
+                    evented = self.evented.swap(false, Ordering::AcqRel);
+                    tail = if evented { EVENT_RETIRE_POLLS } else { 0 };
+                }
+                match firmware.poll_step(
+                    evented,
+                    tail,
+                    &mut retry_tail,
+                    &mut housekeeping_deferred,
+                    &mut done,
+                ) {
+                    Ok(true) if retry_tail => {}
+                    Ok(true) => {
+                        self.rearm(firmware.engine.chan_wait || firmware.engine.short_repoll)
+                    }
                     // Idle: one more pass after a window gives the state back. A failed
                     // engine's poll no longer services power, so it has nothing to give back.
                     Ok(false)
@@ -91,19 +124,81 @@ impl Shared {
                     {
                         self.mod_poll(kernel::time::msecs_to_jiffies(
                             (super::power::policy::WINDOW_NS / 1_000_000) as u32,
-                        ))
+                        ));
+                        self.cancel_resnap();
                     }
-                    Ok(false) => {}
+                    Ok(false) => self.cancel_resnap(),
                     Err(error) => {
+                        self.cancel_resnap();
                         firmware.fail_stop(error, &mut done);
                         self.fail_stop(error);
                     }
                 }
             }
+            job::complete_all(done);
+            if !retry_tail {
+                break;
+            }
+            tail -= 1;
+            step += 1;
+            delay::udelay(Delta::from_micros(5));
         }
-        job::complete_all(done);
+
+        if housekeeping_deferred && !self.sleeping.load(Ordering::Acquire) {
+            let mut done = Completions::new();
+            if let Some(firmware) = self.state.lock().as_deref_mut() {
+                if !self.sleeping.load(Ordering::Acquire) {
+                    if let Err(error) = firmware.run_housekeeping(&mut done) {
+                        self.cancel_resnap();
+                        firmware.fail_stop(error, &mut done);
+                        self.fail_stop(error);
+                    } else if firmware.recovery.needs_repoll() || firmware.engine.frozen {
+                        self.rearm(false);
+                    }
+                }
+            }
+            job::complete_all(done);
+        }
         drop(signalling);
         self.notify_wedged();
+    }
+
+    fn submit_locked(
+        self: &Arc<Self>,
+        firmware: &mut Firmware,
+        job: Arc<Job>,
+        done: &mut Completions,
+    ) -> Result {
+        if firmware.engine.shared.is_none() {
+            firmware.engine.shared = Some(self.clone());
+        }
+        let accepted = firmware.enqueue(job);
+        if accepted.is_ok() && !self.sleeping.load(Ordering::Acquire) {
+            let now = now_ns();
+            let full = now.wrapping_sub(firmware.last_housekeeping_ns) >= HOUSEKEEPING_NS
+                || self.evented.load(Ordering::Acquire)
+                || firmware.recovery_pending().unwrap_or(true);
+            let pub_res = if full {
+                let r = firmware.publish(done);
+                if r.is_ok() {
+                    firmware.last_housekeeping_ns = now;
+                }
+                r
+            } else {
+                firmware
+                    .session
+                    .transport()
+                    .and_then(|()| firmware.publish_checked(done))
+            };
+            if let Err(error) = pub_res {
+                firmware.fail_stop(error, done);
+                self.fail_stop(error);
+            }
+            if !firmware.engine.flights.is_empty() || firmware.engine.chan_wait {
+                self.rearm(firmware.engine.chan_wait);
+            }
+        }
+        accepted
     }
 
     /// Hands a job to the engine and publishes what can be published. Err: the job was not
@@ -115,29 +210,33 @@ impl Shared {
         let accepted = {
             let mut state = self.state.lock();
             let firmware = state.as_deref_mut().ok_or(ENODEV)?;
-            if firmware.engine.shared.is_none() {
-                firmware.engine.shared = Some(self.clone());
-            }
-            let accepted = firmware.enqueue(job);
-            // Nothing is published while a render is in flight: the poll pass after its
-            // retirement publishes this job. Skipping the pass here keeps queued submissions
-            // from holding the device lock (ring drains, health checks) on that path.
-            let render_busy = firmware.engine.flights.iter().any(|f| f.renders != 0);
-            if accepted.is_ok() && !render_busy {
-                if let Err(error) = firmware.publish(&mut done) {
-                    firmware.fail_stop(error, &mut done);
-                    self.fail_stop(error);
-                }
-                if !firmware.engine.flights.is_empty() || firmware.engine.chan_wait {
-                    self.rearm(firmware.engine.chan_wait);
-                }
-            }
-            accepted
+            self.submit_locked(firmware, job, &mut done)
         };
         job::complete_all(done);
         drop(signalling);
         self.notify_wedged();
         accepted
+    }
+
+    /// Non-blocking variant of [`Self::submit`] for inline SUBMIT ioctl publication: returns
+    /// `None` without sleeping when `Shared::state` is contended so `drm_sched` publishes instead.
+    pub(crate) fn try_submit_inline(self: &Arc<Self>, job: Arc<Job>) -> Option<Result> {
+        let signalling = kernel::dma_fence::SignallingGuard::new();
+        let mut done = Completions::new();
+        let accepted = {
+            let mut state = self.state.try_lock()?;
+            if self.sleeping.load(Ordering::Acquire) {
+                return None;
+            }
+            match state.as_deref_mut() {
+                Some(firmware) => self.submit_locked(firmware, job, &mut done),
+                None => Err(ENODEV),
+            }
+        };
+        job::complete_all(done);
+        drop(signalling);
+        self.notify_wedged();
+        Some(accepted)
     }
 
     /// Deliver userspace notification outside the device mutex and fence completion path.
@@ -154,12 +253,25 @@ impl Shared {
         }
     }
 
-    /// Queues the poll work now, or brings a pending one forward. Callable from any context.
+    /// Queues the fast poll work immediately on the submitting CPU. Callable from any context.
     pub(crate) fn poll_now(self: &Arc<Self>) {
-        self.mod_poll(0);
+        let _ = match self.submitter_cpu() {
+            Some(cpu) => self
+                .events
+                .enqueue_on::<Arc<Shared>, FAST_POLL_WORK>(cpu, self.clone()),
+            None => self
+                .events
+                .enqueue::<Arc<Shared>, FAST_POLL_WORK>(self.clone()),
+        };
     }
 
-    /// Queues the poll on `system_highpri_wq` after `delay` jiffies, or moves an already
+    /// Disarms the completion hrtimer when idle or entering system sleep.
+    pub(crate) fn cancel_resnap(&self) {
+        self.resnap_deadline_ns.store(0, Ordering::Release);
+        drop(self.resnap_handle.lock().take());
+    }
+
+    /// Queues the backup poll on `system_highpri_wq` after `delay` jiffies, or moves an already
     /// pending one to that expiry.
     fn mod_poll(self: &Arc<Self>, delay: Jiffies) {
         // SAFETY: The closure returns false only when `mod_delayed_work_on` found the work
@@ -178,21 +290,28 @@ impl Shared {
         };
     }
 
-    /// Re-checks a published command soon: hrtimer, with a one-jiffy backup; sooner while a
-    /// ready prefix waits for a channel record's consumption.
-    pub(crate) fn rearm(self: &Arc<Self>, chan_wait: bool) {
+    /// Re-checks a published command soon: hrtimer, with a throttled 1-jiffy backup; sooner while
+    /// a ready prefix waits for record consumption or a post-event receipt tail is settling.
+    pub(crate) fn rearm(self: &Arc<Self>, soon: bool) {
         let mut us = params::resnap_us();
-        if chan_wait && module_parameters::g16_repoll_us.value() != 0 {
+        if soon && module_parameters::g16_repoll_us.value() != 0 {
             us = params::repoll_us();
         }
-        {
+        let now = now_ns();
+        let target_ns = now.saturating_add(u64::from(us) * 1000);
+        let armed_ns = self.resnap_deadline_ns.load(Ordering::Acquire);
+        if armed_ns == 0 || armed_ns <= now || target_ns.saturating_add(5_000) < armed_ns {
             let mut handle = self.resnap_handle.lock();
-            // Dropping the previous handle cancels a still pending expiry before the timer
-            // is started again.
             drop(handle.take());
+            self.resnap_deadline_ns.store(target_ns, Ordering::Release);
             *handle = Some(self.clone().start(Delta::from_micros(i64::from(us))));
         }
-        self.mod_poll(1);
+        let backup_ns = self.backup_deadline_ns.load(Ordering::Acquire);
+        if now >= backup_ns {
+            self.backup_deadline_ns
+                .store(now.saturating_add(BACKUP_REARM_NS), Ordering::Release);
+            self.mod_poll(1);
+        }
     }
 
     /// Starts what the engine needs besides the firmware state: the `aurora-g16/stats` file.
@@ -223,21 +342,41 @@ pub(crate) fn ring_passed(c: u32, b: u32, h: u32, t: u32, m: u32) -> bool {
 }
 
 impl Firmware {
-    /// One poll pass under the device lock. Returns whether to re-arm the poll timers.
-    pub(crate) fn poll(&mut self, evented: bool, done: &mut Completions) -> Result<bool> {
+    /// One non-sleeping poll step under the device lock.
+    ///
+    /// Retires finished flights and publishes ready work before periodic 1 ms housekeeping so
+    /// completion fences wake userspace promptly. When an EP 0x20 event arrived with flights
+    /// outstanding and nothing retired yet, sets `*retry_tail` so [`Shared::run_poll`] drops
+    /// `Shared::state` across the 5 us receipt-tail delay instead of holding the device lock.
+    pub(crate) fn poll_step(
+        &mut self,
+        evented: bool,
+        tail: u32,
+        retry_tail: &mut bool,
+        housekeeping_deferred: &mut bool,
+        done: &mut Completions,
+    ) -> Result<bool> {
         if self.recovery.failed().is_some() {
             return Ok(false);
         }
-        self.session.check()?;
-        self.objects.health()?;
-        self.service_power()?;
+        self.engine.short_repoll = false;
+        self.session.transport()?;
+        let now = now_ns();
+        let housekeeping_due = now.wrapping_sub(self.last_housekeeping_ns) >= HOUSEKEEPING_NS;
+        let had_flights = !self.engine.flights.is_empty();
+        let mut ran_housekeeping = false;
         // With nothing published only a pending firmware recovery notification needs this
         // pass: one that arrived after its prefix's receipts is answered
         // here (the firmware halted and waits for the resume) instead of being taken for a
         // failure of the next prefix. Drain the receive rings before deciding, published or
         // not, so the error count is current and idle log/trace/stats traffic is consumed. With
         // prefixes published the retirement loop below drains first.
-        if self.engine.flights.is_empty() {
+        if !had_flights {
+            self.session.check()?;
+            self.objects.health()?;
+            self.service_power()?;
+            self.last_housekeeping_ns = now;
+            ran_housekeeping = true;
             self.drain_rings()?;
             if self.recovery_idle()? && self.engine.pending.is_empty() {
                 return Ok(false);
@@ -245,13 +384,20 @@ impl Firmware {
         }
         let mut lap = Lap::start();
         let start = lap.on().then(now_ns);
-        self.retire(evented, done)?;
+        let retired_any = self.retire_once(done)?;
         lap.lap(&mut self.engine.prof.retire_ns);
         self.answer_growth()?;
-        self.check_hangs(done)?;
-        let published = self
-            .service_power()
-            .and_then(|()| self.publish_checked(done));
+        if self.recovery.receipt_fault || self.recovery_pending()? {
+            self.check_hangs(done)?;
+        }
+        let published = if self.engine.pending.is_empty() {
+            Ok(())
+        } else {
+            self.publish_checked(done)
+        };
+        if self.engine.flights.is_empty() {
+            self.power.report_work(false);
+        }
         let s = &mut self.engine.stats;
         if self.engine.flights.is_empty() && s.idle_from_ns != 0 {
             // Idle with nothing ready is not a gap: the clients are late.
@@ -263,43 +409,82 @@ impl Firmware {
             self.engine.prof.poll_ns += now_ns().wrapping_sub(start);
         }
         published?;
+        // After an EP 0x20 event, retry up to `EVENT_RETIRE_POLLS` times (outside the device
+        // lock) only while no flight has retired yet and flights remain in flight. Once any
+        // flight retires, stop spinning so deeper queues do not burn 50 us per interrupt.
+        if evented
+            && had_flights
+            && !retired_any
+            && tail != 0
+            && !self.engine.flights.is_empty()
+            && !self.recovery.receipt_fault
+            && !self.engine.frozen
+            && self.recovery.failed().is_none()
+        {
+            *retry_tail = true;
+            return Ok(true);
+        }
+        if !ran_housekeeping && housekeeping_due {
+            if !done.is_empty() {
+                *housekeeping_deferred = true;
+            } else {
+                self.run_housekeeping(done)?;
+            }
+        }
+        // If an EP 0x20 event arrived with flights outstanding and nothing retired within the
+        // trailing polls, repoll at `repoll_us` instead of sleeping `resnap_us`.
+        self.engine.short_repoll =
+            evented && had_flights && !retired_any && !self.engine.flights.is_empty();
         Ok(!self.engine.flights.is_empty()
             || self.engine.chan_wait
             || self.recovery.needs_repoll()
             || self.engine.frozen)
     }
 
-    /// Drains the rings and retires finished flights, with up to four trailing 5 us polls
-    /// after an event. A receipt fault is left in `Recovery::receipt_fault` for the hang
-    /// checks.
-    pub(crate) fn retire(&mut self, evented: bool, done: &mut Completions) -> Result {
-        // After an event, a few short trailing polls catch the final receipts.
-        let mut tail = if evented { 4 } else { 0 };
-        let mut ret;
-
-        loop {
-            let mut lap = Lap::start();
-            self.drain_rings()?;
-            lap.lap(&mut self.engine.prof.drain_ns);
-            // Recovery may force stage progress: authenticate it before any receipt.
+    /// Periodic 1 ms housekeeping (session/object health, power governor, administrative hang
+    /// checks), run after retired completion fences have been signalled when work retired.
+    pub(crate) fn run_housekeeping(&mut self, done: &mut Completions) -> Result {
+        if self.recovery.failed().is_some() {
+            return Ok(());
+        }
+        self.session.transport()?;
+        self.session.check()?;
+        self.objects.health()?;
+        self.service_power()?;
+        self.last_housekeeping_ns = now_ns();
+        if !self.engine.flights.is_empty()
+            || self.recovery.receipt_fault
+            || self.recovery_pending()?
+        {
             self.check_hangs(done)?;
-            ret = self.retired();
-            while let Ok(receipt) = ret {
-                if !receipt.complete() {
-                    break;
-                }
-                let outcome = self.retire_outcome(receipt);
-                self.retire_oldest(receipt, outcome, done);
-                ret = self.retired();
-            }
-            if ret.is_err() || tail == 0 || self.engine.flights.is_empty() {
+        }
+        Ok(())
+    }
+
+    /// Drains the rings and retires all currently complete flights without sleeping. Returns
+    /// whether at least one flight retired. A receipt fault is left in
+    /// `Recovery::receipt_fault` for the hang checks.
+    pub(crate) fn retire_once(&mut self, done: &mut Completions) -> Result<bool> {
+        let mut lap = Lap::start();
+        self.drain_rings()?;
+        lap.lap(&mut self.engine.prof.drain_ns);
+        // Recovery may force stage progress: authenticate it before any receipt.
+        if self.recovery.receipt_fault || self.recovery_pending()? {
+            self.check_hangs(done)?;
+        }
+        let mut retired_any = false;
+        let mut ret = self.retired();
+        while let Ok(receipt) = ret {
+            if !receipt.complete() {
                 break;
             }
-            tail -= 1;
-            delay::udelay(Delta::from_micros(5));
+            let outcome = self.retire_outcome(receipt);
+            self.retire_oldest(receipt, outcome, done);
+            retired_any = true;
+            ret = self.retired();
         }
         self.recovery.receipt_fault = ret.is_err();
-        Ok(())
+        Ok(retired_any)
     }
 
     #[allow(dead_code)]
@@ -373,9 +558,9 @@ impl Firmware {
         Ok(true)
     }
 
-    /// In-order receipt of compute flight `f` with later flights queued behind it: the NC
-    /// READ cursor (and with uncached queue info its consumers) passed its ring entries,
-    /// and the submit pipe's read and completion cursors passed its record.
+    /// In-order receipt of flight `f` with later flights queued behind it: the NC READ cursor
+    /// (and with uncached queue info its consumers) passed its ring entries, and the submit
+    /// pipe's read and completion cursors passed its record.
     fn queue_passed(
         &self,
         channel: Channel,
@@ -384,22 +569,25 @@ impl Firmware {
         f: &Flight,
     ) -> Result<bool> {
         let cap = super::hw::sizes::QUEUE_CAP;
-        let tail = self.engine.head;
-        if f.head >= cap || f.c_start >= cap || tail >= cap {
+        let (start, head, tail, record) = match channel {
+            Channel::Compute => (f.c_start, f.head, self.engine.head, f.rec[2]),
+            Channel::Ta => (f.ta_start, f.ta_head, self.engine.ta_head, f.rec[0]),
+            Channel::Fs => (f.fs_start, f.fs_head, self.engine.fs_head, f.rec[1]),
+        };
+        if head >= cap || start >= cap || tail >= cap {
             return Err(EINVAL);
         }
-        if !ring_passed(state.r32(qstate::READ)?, f.c_start, f.head, tail, cap) {
+        if !ring_passed(state.r32(qstate::READ)?, start, head, tail, cap) {
             return Ok(false);
         }
         if !super::hw::tuning::FW_CACHED {
             for offset in [0x20, 0x24, 0x28] {
-                if !ring_passed(info.r32(offset)?, f.c_start, f.head, tail, cap) {
+                if !ring_passed(info.r32(offset)?, start, head, tail, cap) {
                     return Ok(false);
                 }
             }
         }
         let slots = super::fw::channels::RING_SLOTS;
-        let record = f.rec[2];
         let first = (record + slots - 1) % slots;
         let producer = self.channels.producer(channel);
         let pipe = self.channels.channel(channel);
@@ -469,7 +657,43 @@ impl Firmware {
                 && start != 0
                 && end > start;
         }
-        if f.renders != 0 {
+        if f.renders != 0 && behind {
+            let g = &self.graph.render;
+            let e = &self.engine;
+            if !stamp_reached(g.fw_stamp[0].r32(0)?, f.ta_target, e.ta_target)
+                || !stamp_reached(g.fw_stamp[1].r32(0)?, f.fs_target, e.fs_target)
+                || !self.queue_passed(Channel::Ta, &g.qstate[0], &g.qinfo[0], f)?
+                || !self.queue_passed(Channel::Fs, &g.qstate[1], &g.qinfo[1], f)?
+            {
+                return Ok(Retirement::Pending);
+            }
+            let k = f.claims.pass[0] as usize;
+            let a = f.pb_slot as usize;
+            let unit = f.job.resources.render_pass(k)?;
+            let ta_start = unit.scene.r64(0x600)?;
+            let ta_end = unit.scene.r64(0x608)?;
+            let fs_start = unit.scene.r64(0x620)?;
+            let fs_end = unit.scene.r64(0x628)?;
+            let ta_stamp = g.notifier.r32(notifier_page::TA_STAMP)?;
+            let fs_stamp = g.notifier.r32(notifier_page::FS_STAMP)?;
+            full &= stamp_reached(ta_stamp, f.ta_target, e.ta_target)
+                && (ta_stamp != f.ta_target
+                    || g.notifier.r32(notifier::CONTEXT)? == f.job.vm.slot)
+                && stamp_reached(fs_stamp, f.fs_target, e.fs_target)
+                && (fs_stamp != f.fs_target
+                    || g.notifier
+                        .r32(notifier_page::FS_RECORD + notifier::CONTEXT)?
+                        == f.job.vm.slot)
+                && f.job
+                    .resources
+                    .render()?
+                    .pools
+                    .retired_at(a, f.uma_submitted)?
+                && ta_start != 0
+                && ta_end > ta_start
+                && fs_start != 0
+                && fs_end > fs_start;
+        } else if f.renders != 0 {
             let g = &self.graph.render;
             if g.fw_stamp[0].r32(0)? != f.ta_target
                 || g.fw_stamp[1].r32(0)? != f.fs_target
@@ -491,7 +715,8 @@ impl Firmware {
                 return Ok(Retirement::Pending);
             }
             let k = f.claims.pass[0] as usize;
-            let unit = f.job.resources.render()?.passes.get(k).ok_or(EINVAL)?;
+            let a = f.pb_slot as usize;
+            let unit = f.job.resources.render_pass(k)?;
             let ta_start = unit.scene.r64(0x600)?;
             let ta_end = unit.scene.r64(0x608)?;
             let fs_start = unit.scene.r64(0x620)?;
@@ -502,7 +727,7 @@ impl Firmware {
                 && g.notifier
                     .r32(notifier_page::FS_RECORD + notifier::CONTEXT)?
                     == f.job.vm.slot
-                && f.job.resources.render()?.pools.retired(k)?
+                && f.job.resources.render()?.pools.retired(a)?
                 && ta_start != 0
                 && ta_end > ta_start
                 && fs_start != 0
@@ -573,6 +798,7 @@ impl Firmware {
                 self.retain(&f.job);
                 complete(done, &f.job, Err(error));
                 self.fail_stop(error, done);
+                core::mem::forget(f);
                 return;
             }
             if f.computes != 0 {
@@ -582,15 +808,18 @@ impl Firmware {
                 self.recovery.last_retired[1] = Some(f.ta_target);
                 self.recovery.last_retired[2] = Some(f.fs_target);
                 let committed = f.pb.as_ref().ok_or(EINVAL).and_then(|epoch| {
-                    let k = timestamp_claims.pass[0] as usize;
-                    self.pools.retire_binding(k, epoch)?;
-                    self.pools.retire_epoch(k, f.pb_binding, result.is_ok());
-                    Ok(())
+                    self.pools.retire_flight(
+                        f.pb_slot as usize,
+                        epoch,
+                        f.pb_binding,
+                        result.is_ok(),
+                    )
                 });
                 if let Err(error) = committed {
                     self.retain(&f.job);
                     complete(done, &f.job, Err(error));
                     self.fail_stop(error, done);
+                    core::mem::forget(f);
                     return;
                 }
             }
@@ -598,9 +827,11 @@ impl Firmware {
                 self.retain(&f.job);
                 complete(done, &f.job, Err(error));
                 self.fail_stop(error, done);
+                core::mem::forget(f);
                 return;
             }
             if result.is_err() {
+                self.slots.mark_dirty(&timestamp_claims);
                 self.recovery.affected_full_receipts =
                     self.recovery.affected_full_receipts.saturating_add(1);
             }
@@ -608,8 +839,9 @@ impl Firmware {
             // Only an actual passed abort lacks the full owner receipt. An affected job
             // with a full normal receipt fails its fence without poisoning healthy storage.
             if f.renders != 0 {
-                // The quarantined slot is not picked again, but keep no epoch of it for reuse.
-                self.pools.forget(timestamp_claims.pass[0] as usize);
+                // Quarantine the aborted allocator slot permanently and retain the aborted
+                // flight's epoch alongside the prior slot owner.
+                self.pools.quarantine_flight(f.pb_slot as usize, f.pb.take());
             }
             self.slots.quarantine(&mut f.claims);
             self.retain(&f.job);
@@ -618,7 +850,7 @@ impl Firmware {
         if self.slots.compute_exhausted() {
             self.mark_class_unavailable(super::command::COMPUTE, EIO);
         }
-        if self.slots.render_exhausted() {
+        if self.slots.render_exhausted() || self.pools.exhausted() {
             self.mark_class_unavailable(super::command::RENDER, EIO);
         }
         if result.is_ok() {
@@ -626,6 +858,7 @@ impl Firmware {
                 self.retain(&f.job);
                 complete(done, &f.job, Err(error));
                 self.fail_stop(error, done);
+                core::mem::forget(f);
                 return;
             }
             // Publish queue-local EXACT_PRIOR frontiers only after every normal hardware
@@ -635,6 +868,7 @@ impl Firmware {
                     self.retain(&f.job);
                     complete(done, &f.job, Err(error));
                     self.fail_stop(error, done);
+                    core::mem::forget(f);
                     return;
                 }
             }
@@ -678,6 +912,7 @@ impl Firmware {
                     self.retain(&job);
                     complete(done, &job, Err(proof_error));
                     self.fail_stop(proof_error, done);
+                    core::mem::forget(f);
                     return;
                 }
             }
@@ -765,13 +1000,7 @@ impl Firmware {
                 }
                 super::command::Command::Render(command) => {
                     let index = *passes.get(render).ok_or(EINVAL)? as usize;
-                    let pass = flight
-                        .job
-                        .resources
-                        .render()?
-                        .passes
-                        .get(index)
-                        .ok_or(EINVAL)?;
+                    let pass = flight.job.resources.render_pass(index)?;
                     let ticks = [
                         pass.scene.r64(0x600)?,
                         pass.scene.r64(0x608)?,
@@ -828,10 +1057,9 @@ impl Firmware {
             hi = hi.max(end);
         };
         for k in 0..f.renders as usize {
-            let Some(arena) = f.job.resources.render.as_ref() else {
+            let Ok(p) = f.job.resources.render_pass(f.claims.pass[k] as usize) else {
                 return;
             };
-            let p = &arena.passes[f.claims.pass[k] as usize];
             stage(
                 &p.scene,
                 0x600,

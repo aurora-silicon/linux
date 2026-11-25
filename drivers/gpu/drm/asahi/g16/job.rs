@@ -31,12 +31,16 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use kernel::{
-    c_str, device,
+    c_str,
+    cpu::CpuId,
+    cpumask::Cpumask,
+    device,
     dma_fence::Fence,
     drm::sched,
     new_mutex,
     prelude::*,
     sync::{Arc, Mutex},
+    workqueue,
 };
 
 use super::{
@@ -232,10 +236,45 @@ impl Job {
         self.fence.signal(result);
     }
 
+    /// Whether this job has already been handed to the engine (inline or by drm_sched).
+    pub(crate) fn is_started(&self) -> bool {
+        self.started.load(Ordering::Acquire)
+    }
+
+    /// Attempts to submit a ready job directly from SUBMIT ioctl context without waiting for
+    /// the drm_sched worker wakeup. Only runs when all input fences are already signalled,
+    /// the device and VM are healthy, and `Shared::state` is uncontended (`try_lock`); on
+    /// contention or pending dependencies it returns without setting `started` so drm_sched
+    /// runs the job in queue order.
+    pub(crate) fn try_start_inline(self: &Arc<Self>, shared: &Arc<Shared>) {
+        if shared.crashed.load(Ordering::Acquire)
+            || shared.sleeping.load(Ordering::Acquire)
+            || self.vm.status.get() != 0
+        {
+            return;
+        }
+        if let Some(order) = self.orders.first() {
+            if self.queue.check(order).is_err() {
+                return;
+            }
+        }
+        if super::fence::check_dependencies(&self.inputs).is_err() {
+            return;
+        }
+        if let Some(result) = shared.try_submit_inline(self.clone()) {
+            self.started.store(true, Ordering::Release);
+            if let Err(error) = result {
+                self.finish(Err(if error == ENODEV { EIO } else { error }), false);
+            }
+        }
+    }
+
     /// Hands the job to the engine, or refuses a failed GPU or VM. A queued
     /// job may have been accepted before another command made its VM sticky.
     fn start(self: &Arc<Self>, shared: &Arc<Shared>) {
-        self.started.store(true, Ordering::Release);
+        if self.started.swap(true, Ordering::AcqRel) {
+            return;
+        }
         if shared.crashed.load(Ordering::Acquire) {
             self.finish(Err(EIO), false);
             return;
@@ -266,6 +305,11 @@ impl Job {
             // An engine that refuses work is a device failure for the job's VM.
             self.finish(Err(if error == ENODEV { EIO } else { error }), false);
         }
+    }
+
+    /// Returns the immutable dependency order for command `index`.
+    pub(crate) fn command_order(&self, index: u32) -> Option<Order> {
+        self.orders.get(index as usize).copied()
     }
 
     /// Checks the retained dependency set for each command immediately before publication.
@@ -389,6 +433,10 @@ impl Completions {
         }
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        self.head.is_none()
+    }
+
     /// Queues the first completion of `job`; subsequent attempts have no effect.
     pub(crate) fn push(&mut self, job: &Arc<Job>, result: Result) {
         {
@@ -435,6 +483,9 @@ pub(crate) fn complete_all(mut done: Completions) {
 struct SchedJob {
     job: Arc<Job>,
     shared: Arc<Shared>,
+    /// Signalled once `run()`, `cancel()`, or `drop()` finishes handing off `job`.
+    /// Preserves queue-local inline-submit ordering without retaining `Arc<Job>`.
+    scheduled: Arc<AtomicBool>,
 }
 
 impl sched::JobImpl for SchedJob {
@@ -448,6 +499,7 @@ impl sched::JobImpl for SchedJob {
     fn run(job: &mut Self) -> Result<Option<Fence>> {
         let fence = job.job.fence.fence();
         job.job.start(&job.shared);
+        job.scheduled.store(true, Ordering::Release);
         Ok(Some(fence))
     }
 
@@ -458,6 +510,7 @@ impl sched::JobImpl for SchedJob {
 
     fn cancel(job: &mut Self) {
         job.job.cancel_unstarted();
+        job.scheduled.store(true, Ordering::Release);
     }
 }
 
@@ -465,6 +518,7 @@ impl Drop for SchedJob {
     fn drop(&mut self) {
         // Entity teardown frees jobs it never ran without calling `cancel`.
         self.job.cancel_unstarted();
+        self.scheduled.store(true, Ordering::Release);
     }
 }
 
@@ -474,36 +528,74 @@ pub(crate) struct Scheduler {
     // drains), and only then the scheduler is finalized.
     entity: sched::Entity<SchedJob>,
     _scheduler: sched::Scheduler<SchedJob>,
+    /// Completion flag of the most recently queued (non-inline) job of this queue; an inline
+    /// submit is permitted only once this predecessor has started or been cancelled, without
+    /// retaining the predecessor `Arc<Job>` (and its `VmJobGuard` or prepared arenas).
+    last_scheduled: Option<Arc<AtomicBool>>,
 }
 
 impl Scheduler {
     pub(crate) fn new(dev: &device::Device) -> Result<Self> {
-        let scheduler = sched::Scheduler::new(
+        // Keep drm_sched run/free work in the creating CPU's cluster (matching g17/job.rs).
+        // Completion work still follows the per-submit submitter_cpu, not queue creation, and
+        // an unbound workqueue restricted via apply_workqueue_attrs() falls back to
+        // wq_unbound_cpumask if the cluster goes offline (failing soft if restrict() errors).
+        let submit = workqueue::OwnedQueue::new_ordered_reclaim(c_str!("aurora_g16"))?;
+        let _ = submit.restrict(Cpumask::cluster_of(CpuId::current()));
+        let scheduler = sched::Scheduler::new_with_queues(
             dev,
             1,
             hw::sizes::SCHEDULER_CREDITS,
             0,
             hw::tuning::SCHED_TIMEOUT_MS,
             c_str!("aurora_g16"),
+            Some(submit),
+            None,
         )?;
         // With one run queue, only the kernel priority is valid.
         let entity = sched::Entity::new(&scheduler, sched::Priority::Kernel)?;
         Ok(Self {
             entity,
             _scheduler: scheduler,
+            last_scheduled: None,
         })
     }
 
     /// Pushes a job that waits for its retained inputs. On failure the job is cancelled (not counted as
     /// submitted work of its VM) and the error is returned.
     pub(crate) fn push(&mut self, job: Arc<Job>, shared: Arc<Shared>) -> Result {
+        shared.note_submitter();
+        let prev_started = match &self.last_scheduled {
+            Some(done) if done.load(Ordering::Acquire) => {
+                self.last_scheduled = None;
+                true
+            }
+            Some(_) => false,
+            None => true,
+        };
         let handle = job.clone();
-        let mut pending = self.entity.new_job(1, SchedJob { job, shared })?;
+        let scheduled = Arc::new(AtomicBool::new(false), GFP_KERNEL)?;
+        let mut pending = self.entity.new_job(
+            1,
+            SchedJob {
+                job,
+                shared: shared.clone(),
+                scheduled: scheduled.clone(),
+            },
+        )?;
         for fence in handle.inputs.iter() {
             pending.add_dependency(fence.clone())?;
         }
         let armed = pending.arm();
         handle.accepted.store(true, Ordering::Release);
+        if prev_started {
+            handle.try_start_inline(&shared);
+        }
+        if handle.is_started() {
+            scheduled.store(true, Ordering::Release);
+        } else {
+            self.last_scheduled = Some(scheduled);
+        }
         armed.push();
         Ok(())
     }

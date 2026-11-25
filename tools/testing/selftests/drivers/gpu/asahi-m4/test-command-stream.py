@@ -41,6 +41,7 @@ pub const drm_asahi_cmd_type_DRM_ASAHI_SET_RENDER_RESOURCES: drm_asahi_cmd_type 
 pub const drm_asahi_cmd_type_DRM_ASAHI_SET_COMPUTE_RESOURCES: drm_asahi_cmd_type = 6;
 pub const drm_asahi_cmd_type_DRM_ASAHI_SET_RENDER_RESOURCES_V2: drm_asahi_cmd_type = 7;
 pub const drm_asahi_render_flags_DRM_ASAHI_RENDER_STAGE_PREFIXES: drm_asahi_render_flags = 8388608;
+pub const drm_asahi_compute_flags_DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS: drm_asahi_compute_flags = 131072;
 '''
 BINDINGS = OUT / 'm5-uapi.rs'
 BINDINGS.write_text('include!(' + json.dumps(str(FLAT)) + ');\n' + M5_UAPI)
@@ -311,6 +312,13 @@ fn unsupported_flags_and_compute_fields() {
         assert!(check_stream(&entry(CMD_RENDER,&data(&r)[..256],[NONE;2]),false).is_err());
     }
     let mut c=compute();
+    c.flags=COMPUTE_NO_QUERY_ACCESS;
+    assert!(check_stream(&entry(CMD_COMPUTE,&data(&c),[NONE;2]),false).is_ok());
+    for bad in [1u32, 1<<16, 1<<18, COMPUTE_NO_QUERY_ACCESS | 1] {
+        c.flags=bad;
+        assert!(check_stream(&entry(CMD_COMPUTE,&data(&c),[NONE;2]),false).is_err());
+    }
+    let mut c=compute();
     c.scs_layout=1;
     assert!(check_stream(&entry(CMD_COMPUTE,&data(&c),[NONE;2]),false).is_err());
     c.scs_layout=0; c.cdm_auxiliary_allocation=8;
@@ -358,14 +366,17 @@ fn historical_priors_enforce_entry_bounds() {
     assert_eq!(order.wait_through,[Some(5),Some(7)]);
     assert!(!order.ready([6,6],[6,6]));
     assert!(order.ready([6,7],[6,7]));
-    // A compute command may follow published compute predecessors (the firmware compute
-    // queue runs them in order); every cross-engine dependency still needs completion.
+    // Same-engine commands may follow published predecessors (ordered on the hardware
+    // engine rings); every cross-engine dependency still needs completion.
     let compute=Order::new([0,2],[0,0],[NONE,NONE],[0,2],COMPUTE).unwrap();
     assert!(!compute.ready([0,1],[0,1]));
     assert!(compute.ready([0,1],[0,2]));
     let render=Order::new([0,2],[0,0],[NONE,NONE],[0,2],RENDER).unwrap();
     assert!(!render.ready([0,1],[0,2]));
     assert!(render.ready([0,2],[0,2]));
+    let render_next=Order::new([2,0],[0,0],[NONE,NONE],[2,0],RENDER).unwrap();
+    assert!(!render_next.ready([1,0],[1,0]));
+    assert!(render_next.ready([1,0],[2,0]));
 }
 #[test]
 fn geometry_capacity_boundary_uses_the_real_encoder() {

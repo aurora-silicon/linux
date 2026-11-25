@@ -30,7 +30,7 @@ def function(text, name):
     return text[start:at]
 
 queue_methods = '\n'.join(function(queue_source, name) for name in ['cancel', 'check'])
-methods = '\n'.join(function(source, name) for name in ['latch_failure', 'complete', 'finish', 'start', 'check_command_dependencies', 'command_retired', 'note_full_retirement', 'mark_terminal_retired'])
+methods = '\n'.join(function(source, name) for name in ['latch_failure', 'complete', 'finish', 'is_started', 'try_start_inline', 'start', 'check_command_dependencies', 'command_retired', 'note_full_retirement', 'mark_terminal_retired'])
 fence_methods = '\n'.join(function(fence_source, name) for name in ['dependency_status', 'check_dependencies', 'wait_dependencies'])
 harness = r'''
 #![allow(dead_code)]
@@ -99,13 +99,17 @@ mod command { pub(crate) use super::Order; }
 struct QueueState { completed:[AtomicU64;2],published:[AtomicU64;2],cancelled_at:[AtomicU64;2] }
 impl QueueState { QUEUE_METHODS }
 struct Job { id:u64,vm:Vm,_guard:Guard,progress:Progress,started:AtomicBool,accepted:AtomicBool,fence:Fence,commands:Vec<()>,inputs:Vec<InputFence>,orders:Vec<Order>,queue:Arc<QueueState>,full_retired:AtomicU32,terminal_retired:AtomicBool }
-struct Shared { crashed:AtomicBool,submitted:Mutex<Vec<u64>>,submit_result:Result }
+struct Shared { crashed:AtomicBool,sleeping:AtomicBool,contended:AtomicBool,submitted:Mutex<Vec<u64>>,submit_result:Result }
 impl Shared {
     fn new()->Arc<Self> {
-        Arc::new(Self{crashed:AtomicBool::new(false),submitted:Mutex::new(vec![]),submit_result:Ok(())})
+        Arc::new(Self{crashed:AtomicBool::new(false),sleeping:AtomicBool::new(false),contended:AtomicBool::new(false),submitted:Mutex::new(vec![]),submit_result:Ok(())})
     }
     fn submit(&self,job:Arc<Job>)->Result {
         self.submitted.lock().unwrap().push(job.id); self.submit_result
+    }
+    fn try_submit_inline(&self,job:Arc<Job>)->Option<Result> {
+        if self.contended.load(Ordering::Acquire) { return None; }
+        Some(self.submit(job))
     }
 }
 impl Job {
@@ -370,7 +374,7 @@ fn never_published_refusal_needs_no_mapping_quarantine() {
 #[test]
 fn never_published_capacity_failure_closes_only_its_queue() {
     let status=Arc::new(Status::new());let failed=job(1,status.clone());
-    let shared=Arc::new(Shared{crashed:AtomicBool::new(false),submitted:Mutex::new(vec![]),submit_result:Err(ENOMEM)});
+    let shared=Arc::new(Shared{crashed:AtomicBool::new(false),sleeping:AtomicBool::new(false),contended:AtomicBool::new(false),submitted:Mutex::new(vec![]),submit_result:Err(ENOMEM)});
     failed.start(&shared);
     assert_eq!(failed.fence.signals.lock().unwrap()[0],(Err(ENOMEM),-12));
     assert_eq!(failed.queue.check(&failed.orders[0]),Err(ECANCELED));assert_eq!(status.get(),0);
@@ -390,6 +394,33 @@ fn full_receipts_are_consecutive_bounded_and_once() {
     assert_eq!(queued.note_full_retirement(1,2),Err(EINVAL));
     assert_eq!(queued.note_full_retirement(u32::MAX,1),Err(EOVERFLOW));
     queued.note_full_retirement(1,1).unwrap();
+}
+#[test]
+fn inline_start_submits_once_and_falls_back_on_pending_input_or_contention() {
+    let status=Arc::new(Status::new());
+    let shared=Shared::new();
+    // Ready job with signalled input submits inline; subsequent drm_sched start() is a no-op.
+    let ready=job_with_inputs(10,status.clone(),vec![InputFence::new(1)]);
+    ready.try_start_inline(&shared);
+    assert!(ready.is_started());
+    assert_eq!(*shared.submitted.lock().unwrap(),vec![10]);
+    ready.start(&shared);
+    assert_eq!(*shared.submitted.lock().unwrap(),vec![10]);
+    // Unsignalled input defers to drm_sched without marking started.
+    let pending=job_with_inputs(11,status.clone(),vec![InputFence::new(0)]);
+    pending.try_start_inline(&shared);
+    assert!(!pending.is_started());
+    assert_eq!(*shared.submitted.lock().unwrap(),vec![10]);
+    // Contended device mutex defers to drm_sched without blocking or marking started.
+    shared.contended.store(true,Ordering::Release);
+    let contended=job(12,status.clone());
+    contended.try_start_inline(&shared);
+    assert!(!contended.is_started());
+    assert_eq!(*shared.submitted.lock().unwrap(),vec![10]);
+    shared.contended.store(false,Ordering::Release);
+    contended.start(&shared);
+    assert!(contended.is_started());
+    assert_eq!(*shared.submitted.lock().unwrap(),vec![10,12]);
 }
 '''.replace('QUEUE_METHODS', queue_methods).replace('ORDER_SOURCE', order_source).replace('FENCE_METHODS', fence_methods).replace('METHODS', methods.replace('super::fence::','fence::'))
 

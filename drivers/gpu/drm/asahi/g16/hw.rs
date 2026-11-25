@@ -573,14 +573,14 @@ pub(crate) mod client {
 
     // Persistent compute units, each in its own 64 MiB interval and reused across
     // application queues. Units 0 and 1 keep their original placement below the render
-    // allocators; further units (up to [`super::sizes::COMPUTE_UNITS`]) live between the
-    // unused CT window and the PB heap, clear of the dynamic PB page-list range
-    // 0x7040000000..0x7080000000. Every alias is inside Mesa's reserved driver hole.
+    // allocators; further units (up to [`super::sizes::COMPUTE_UNITS`]) live from
+    // 0x7080000000 up to the PB heap (0x70c0000000), clear of the dynamic PB page-list
+    // range 0x7040000000..0x7080000000. Every alias is inside Mesa's reserved driver hole.
     pub(crate) const fn compute_base(k: u64) -> u64 {
         if k < 2 {
             0x7001000000 + k * 0x04000000
         } else {
-            0x7090000000 + (k - 2) * 0x04000000
+            0x7080000000 + (k - 2) * 0x04000000
         }
     }
     pub(crate) const fn compute_pool(k: u64) -> u64 {
@@ -633,12 +633,12 @@ pub(crate) mod client {
     pub(crate) const PB_PAGE_LIST: u64 = 0x7012040000;
     pub(crate) const PB_PAGE_LIST_SIZE: u64 = 0x8000;
 
-    // Render pass resources, each in a distinct 256 MiB interval.
+    // Render pass resources, each in a distinct 64 MiB interval within 0x7020000000..0x7040000000.
     pub(crate) const FS_WORK_PAGE: u64 = 0x7020000000;
     pub(crate) const FS_WORK_OFF: u64 = 0;
     pub(crate) const TA_WORK_PAGE: u64 = 0x7020004000;
     pub(crate) const TA_WORK_OFF: u64 = 0;
-    pub(crate) const WORK_STRIDE: u64 = 0x10000000;
+    pub(crate) const WORK_STRIDE: u64 = 0x04000000;
     pub(crate) const PASS_STRIDE: u64 = WORK_STRIDE;
     pub(crate) const PRE0_PAGE: u64 = 0x7020080000;
     pub(crate) const PRE1_PAGE: u64 = 0x70200a0000;
@@ -648,9 +648,10 @@ pub(crate) mod client {
     pub(crate) const FS_SCRATCH: u64 = 0x7020140000;
     pub(crate) const AUX: u64 = 0x7020160000;
     pub(crate) const AUX_STRIDE: u64 = WORK_STRIDE;
-    pub(crate) const TPC: u64 = 0x7024000000;
+    pub(crate) const SCENE_LIST: u64 = 0x7020180000;
+    pub(crate) const TPC: u64 = 0x7020400000;
     pub(crate) const TPC_SIZE: u64 = 0x1000000;
-    pub(crate) const TILEMAP: u64 = 0x7026000000;
+    pub(crate) const TILEMAP: u64 = 0x7021400000;
     pub(crate) const TILEMAP_SIZE: u64 = 0x800000;
     pub(crate) const TPC_SLOT_SIZE: u64 = TPC_SIZE;
     pub(crate) const TILEMAP_SLOT_SIZE: u64 = TILEMAP_SIZE;
@@ -667,7 +668,20 @@ pub(crate) mod sizes {
     pub(crate) const FREELIST_SEED: u32 = 8192;
     pub(crate) const QUEUE_CAP: u32 = 256;
     pub(crate) const COMPUTE_SLOTS: usize = 2;
-    pub(crate) const RENDER_SLOTS: usize = 2;
+    /// Retained render pass slots per VM at most. A slot is reused only after a later render
+    /// retired (displacing it), so `n` slots keep up to `n - 1` renders in flight.
+    pub(crate) const RENDER_SLOTS: usize = 8;
+    const _: () = assert!(super::client::AUX + 0x20000 <= super::client::SCENE_LIST);
+    const _: () = assert!(super::client::SCENE_LIST + 0x4000 <= super::client::TPC);
+    const _: () = assert!(super::client::TPC + super::client::TPC_SIZE <= super::client::TILEMAP);
+    const _: () = assert!(
+        super::client::TILEMAP + super::client::TILEMAP_SIZE
+            <= super::client::FS_WORK_PAGE + super::client::PASS_STRIDE
+    );
+    const _: () = assert!(
+        super::client::FS_WORK_PAGE + (RENDER_SLOTS as u64) * super::client::PASS_STRIDE
+            <= 0x7040000000
+    );
     pub(crate) const CT_BUFS: usize = 0;
     pub(crate) const CLUSTER_PB_PAGES: u32 = 0x3c;
     pub(crate) const MAX_ATTACHMENTS: usize = 16;
@@ -676,22 +690,22 @@ pub(crate) mod sizes {
     pub(crate) const PB_BLOCKS: u32 = 2048;
     pub(crate) const PB_LIST_RECORDS: u32 = 4096;
     pub(crate) const PB_GROW_STEP: u32 = 10;
-    /// Published prefixes at most. A render is published only with nothing else in flight;
-    /// compute commands may queue behind each other on the one firmware compute queue, each
-    /// in its own retained unit ([`COMPUTE_UNITS`]).
-    pub(crate) const FLIGHTS: usize = 16;
+    /// Published prefixes at most. Same-VM compute or render commands may pipeline behind
+    /// each other on their engine rings while cross-VM and cross-engine transitions drain.
+    pub(crate) const FLIGHTS: usize = 32;
     /// Retained compute units per VM at most; each unit owns its own hardware UMA slot
     /// (`COMPUTE_UMA_SLOT + index`). A unit is reused only after a later publication retired
     /// (it displaced the unit), so `n` units keep up to `n - 1` compute commands in flight.
-    pub(crate) const COMPUTE_UNITS: usize = 8;
+    pub(crate) const COMPUTE_UNITS: usize = 16;
     const _: () = assert!(super::client::compute_base(COMPUTE_UNITS as u64) <= super::client::PB_HEAP);
     /// Inherited diagnostic histogram width; M4 does not fold jobs into a compute horizon.
     pub(crate) const HORIZON_JOBS: u32 = 1;
-    /// Jobs admitted to the engine per logical queue: enough to keep a queue's compute
-    /// commands in flight back to back; exact prior-command dependencies still gate each one.
-    pub(crate) const SCHEDULER_CREDITS: u32 = 16;
+    /// Jobs admitted to the engine per logical queue: enough to keep a queue's commands
+    /// in flight back to back without scheduler backpressure stalls; exact prior-command
+    /// dependencies still gate each one.
+    pub(crate) const SCHEDULER_CREDITS: u32 = 32;
     /// Unconsumed records per 256-entry channel ring a prefix may be posted behind.
-    pub(crate) const AHEAD_RECORDS: u32 = 64;
+    pub(crate) const AHEAD_RECORDS: u32 = 128;
     /// Policy bound on logical queues reported in QUEUE_LIMITS (not a firmware limit).
     pub(crate) const MAX_QUEUES: u32 = 58;
     /// TTBAT user slots: user VMs hold one each for their lifetime (ASIDs 1..63).

@@ -100,7 +100,7 @@ impl Shared {
     /// With the sleeping flag set, joins whatever may be reading the firmware's registers.
     fn join_workers(self: &Arc<Self>) {
         // Dropping the handle cancels an expiry that's still pending.
-        drop(self.resnap_handle.lock().take());
+        self.cancel_resnap();
         // SAFETY: An initialized, pinned delayed work of this Shared. A pending callback owned
         // one Arc that it can no longer reclaim. Later enqueues run into the sleeping check.
         let cancelled = unsafe {
@@ -112,6 +112,7 @@ impl Shared {
             // SAFETY: See above.
             drop(unsafe { Arc::from_raw(Arc::as_ptr(self)) });
         }
+        self.events.drain();
     }
 
     /// Waits for what's been published to retire. The poll work keeps running meanwhile.

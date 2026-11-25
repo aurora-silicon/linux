@@ -214,9 +214,23 @@ impl FwObject {
     pub(crate) fn read(&self, offset: usize, out: &mut [u8]) -> Result {
         let p = self.ptr(offset, out.len())?;
         rmb();
-        for (index, byte) in out.iter_mut().enumerate() {
+        let mut index = 0;
+        let len = out.len();
+        while index < len && (p as usize + index) % 8 != 0 {
             // SAFETY: ptr() bounds the complete range; WC memory permits byte accesses.
-            *byte = unsafe { p.add(index).read_volatile() };
+            out[index] = unsafe { p.add(index).read_volatile() };
+            index += 1;
+        }
+        while index + 8 <= len {
+            // SAFETY: ptr() bounds the range and `p.add(index)` is 8-byte aligned.
+            let word = unsafe { p.add(index).cast::<u64>().read_volatile() };
+            out[index..index + 8].copy_from_slice(&word.to_ne_bytes());
+            index += 8;
+        }
+        while index < len {
+            // SAFETY: ptr() bounds the complete range; WC memory permits byte accesses.
+            out[index] = unsafe { p.add(index).read_volatile() };
+            index += 1;
         }
         rmb();
         Ok(())

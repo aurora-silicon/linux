@@ -3,10 +3,10 @@
 //! Module parameters and the GET_PARAMS identity.
 //!
 //! With the shared `file.rs` additions (VM_STATUS and VM_STATUS_MIRROR from `supports_vm_status`,
-//! SOFT_FAULTS suppressed by `soft_faults`, VDM_USC_INVALIDATE), the feature word is 0x1c02 plus
-//! bit 40: per-command input readiness/errors and exact queue-local historical prefixes use
-//! explicit retained inputs and successful command receipt frontiers. No independent hardware
-//! queue reservation, fragment barriers or ray queries are advertised.
+//! SOFT_FAULTS suppressed by `soft_faults`, VDM_USC_INVALIDATE), G16 advertises per-command
+//! input readiness/errors, exact queue-local historical prefixes, fragment-only render barriers,
+//! and `COMPUTE_NO_QUERY_ACCESS`. No independent hardware queue reservation or ray queries are
+//! advertised.
 
 use kernel::{prelude::*, uapi};
 
@@ -40,12 +40,19 @@ pub(crate) fn pb_posted_blocks(heap_blocks: u32) -> u32 {
 
 /// Compute units of a VM that submits compute back to back.
 pub(crate) fn compute_units() -> usize {
-    6usize.clamp(2, hw::sizes::COMPUTE_UNITS)
+    16usize.clamp(2, hw::sizes::COMPUTE_UNITS)
 }
 
 /// Compute commands in flight at most.
 pub(crate) fn compute_flights() -> usize {
-    16usize.clamp(1, hw::sizes::FLIGHTS)
+    32usize.clamp(1, hw::sizes::FLIGHTS)
+}
+
+/// Render commands in flight at most (`RENDER_SLOTS - 1` so one slot holds displacement).
+pub(crate) fn render_flights() -> usize {
+    hw::sizes::RENDER_SLOTS
+        .saturating_sub(1)
+        .clamp(1, hw::sizes::FLIGHTS)
 }
 
 /// Repoll while a ready prefix waits for record consumption, us.
@@ -68,9 +75,9 @@ pub(crate) fn stream_gate() -> bool {
     module_parameters::g16_stream_gate.value() != 0
 }
 
-/// Fragment-only dependency publication has not been qualified on this backend.
+/// Fragment-only render barriers overlap a pipelined render's TA with the prior render's FS.
 pub(crate) fn early_tiling() -> bool {
-    false
+    true
 }
 
 /// Fills the generation part of GET_PARAMS group 0.
@@ -81,7 +88,9 @@ pub(crate) fn fill(gpu: &Gpu, params: &mut uapi::drm_asahi_params_global) -> Res
         return Err(ENODEV);
     }
     params.features |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS)
-        | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS);
+        | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS)
+        | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS)
+        | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS);
     params.gpu_generation = GPU_GENERATION;
     params.gpu_variant = gpu.cfg.gpu_variant as u32;
     params.gpu_revision = gpu.cfg.gpu_revision;
