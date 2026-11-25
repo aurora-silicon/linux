@@ -43,7 +43,7 @@ enum DirectTarget {
 /// graph that needs no growth.
 struct DirectHost<'a> {
     port: &'a Port,
-    render: &'a MutexGuard<'a, ()>,
+    render: Option<MutexGuard<'a, ()>>,
     m5_outer: Option<MutexGuard<'a, Option<(u32, u64, u64)>>>,
     m5_claim: Option<&'a mut crate::g17::initdata::OuterClaim>,
     target: DirectTarget,
@@ -95,8 +95,9 @@ impl crate::g17::queue::render::Host for DirectHost<'_> {
                 if priority != room.priority() {
                     return Err(EINVAL);
                 }
+                let render = self.render.as_ref().ok_or(EIO)?;
                 self.port.write_render_pair(
-                    self.render,
+                    render,
                     room,
                     fragment,
                     tiling,
@@ -108,9 +109,10 @@ impl crate::g17::queue::render::Host for DirectHost<'_> {
                 if priority != room.priority() {
                     return Err(EINVAL);
                 }
+                let render = self.render.as_ref().ok_or(EIO)?;
                 let m5_outer = self.m5_outer.as_ref().ok_or(EIO)?;
                 self.port.write_m5_render_pair(
-                    self.render,
+                    render,
                     m5_outer,
                     room,
                     fragment,
@@ -149,16 +151,18 @@ impl crate::g17::queue::render::Host for DirectHost<'_> {
                 if priority != room.priority() {
                     return Err(EINVAL);
                 }
-                self.port.expose_render_pair(self.render, room, next)
+                let render = self.render.as_ref().ok_or(EIO)?;
+                self.port.expose_render_pair(render, room, next)
             }
             DirectTarget::M5(room) => {
                 if priority != room.priority() {
                     return Err(EINVAL);
                 }
+                let render = self.render.as_ref().ok_or(EIO)?;
                 let m5_outer = self.m5_outer.as_ref().ok_or(EIO)?;
                 let claim = self.m5_claim.as_deref_mut().ok_or(EIO)?;
                 self.port
-                    .expose_m5_render_pair(self.render, m5_outer, room, claim, next)
+                    .expose_m5_render_pair(render, m5_outer, room, claim, next)
             }
         }
     }
@@ -170,7 +174,13 @@ impl crate::g17::queue::render::Host for DirectHost<'_> {
             if let Err(error) = self.port.note_m5_submission_history_locked(geometry, 2) {
                 pr_warn!("asahi: M5 submission history skipped: {:?}\n", error);
             }
+            // Drop `m5_outer` before ringing the mailbox doorbell so competing M5 submitters
+            // do not wait behind mailbox I/O.
+            self.m5_outer = None;
         }
+        // Outer ring producers, credits, and hazard order are committed; drop the render
+        // publication lock before mailbox I/O as well.
+        self.render = None;
         self.port.notify(super::render_doorbell_message(m5, priority))
     }
     fn note_submission(&mut self) -> Result {
@@ -427,7 +437,7 @@ impl Backend {
             }
             let mut host = DirectHost {
                 port,
-                render: &render,
+                render: Some(render),
                 m5_outer,
                 m5_claim: m5_claim.as_mut(),
                 target,

@@ -282,6 +282,14 @@ ASAHI_TESTS = {
         + mutations('--mutation', ('unlocked-claim-outer', 'raw-compute-scope',
                                    'raw-render-scope', 'unlocked-scope-drop',
                                    'drop-direct-claim-on-fallback', 'pin-single-die'), []),
+    'g17-m5-render-fast-done-tests.py': [([], PASS)]
+        + mutations('--mutation', ('hold-m5-outer-across-doorbell',
+                                   'hold-render-lock-across-doorbell',
+                                   'skip-pending-error-fallback',
+                                   'single-slot-bailout',
+                                   'skip-epoch-check',
+                                   'unconditional-changed-notify',
+                                   'skip-generation-bump'), []),
     'g17-m5-effort-tests.py': [([], PASS)]
         + mutations('--mutation', ('m5-ignores-bound',), []),
     'g17-firmware-selection-tests.py': [([], PASS)],

@@ -1200,6 +1200,39 @@ const RECLAIM_WORK: u64 = 4;
 const FEED_WORK: u64 = 5;
 const GOVERNOR_WORK: u64 = 6;
 
+/// `CondVar` wrapper that tracks active waiters so `notify_all()` skips the waitqueue lock
+/// in the common zero-waiter steady state.
+#[pin_data]
+struct TrackedCondVar {
+    #[pin]
+    condvar: CondVar,
+    waiters: AtomicU32,
+}
+
+impl TrackedCondVar {
+    fn wait_timeout<T: ?Sized>(
+        &self,
+        guard: &mut kernel::sync::MutexGuard<'_, T>,
+        timeout: kernel::time::Jiffies,
+    ) -> kernel::sync::CondVarTimeoutResult {
+        struct Waiter<'a>(&'a AtomicU32);
+        impl Drop for Waiter<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::Release);
+            }
+        }
+        self.waiters.fetch_add(1, Ordering::SeqCst);
+        let _waiter = Waiter(&self.waiters);
+        self.condvar.wait_timeout(guard, timeout)
+    }
+
+    fn notify_all(&self) {
+        if self.waiters.load(Ordering::SeqCst) != 0 {
+            self.condvar.notify_all();
+        }
+    }
+}
+
 /// Device state shared with the coprocessor callbacks and the event worker.
 #[pin_data]
 struct Shared {
@@ -1319,7 +1352,7 @@ struct Shared {
     #[pin]
     actuators: Mutex<thermal::Actuators>,
     #[pin]
-    changed: CondVar,
+    changed: TrackedCondVar,
     /// The port of the session in `state`; null before boot and once detachment begins.
     port: core::sync::atomic::AtomicPtr<port::Port>,
 }
@@ -2023,7 +2056,10 @@ impl Gpu {
                 stop <- new_mutex!((), "g17::Shared::stop"),
                 state <- new_mutex!(None, "g17::Shared::state"),
                 actuators <- new_mutex!(thermal::Actuators::new(), "g17::Shared::actuators"),
-                changed <- new_condvar!("g17::Shared::changed"),
+                changed <- pin_init!(TrackedCondVar {
+                    condvar <- new_condvar!("g17::Shared::changed"),
+                    waiters: AtomicU32::new(0),
+                }),
                 port: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
             }),
             GFP_KERNEL,
