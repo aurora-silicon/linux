@@ -124,131 +124,162 @@ static void dcp_firmware_27_pin_precedence(struct kunit *test)
 	__be32 compat_27_1[] = { cpu_to_be32(27), cpu_to_be32(1), 0 };
 	__be32 compat_27_2[] = { cpu_to_be32(27), cpu_to_be32(2), 0 };
 	__be32 compat_27_3[] = { cpu_to_be32(27), cpu_to_be32(3), 0 };
-	struct property props[] = {
-		{ .name = "apple,firmware-compat", .length = sizeof(compat_27_2),
-		  .value = compat_27_2, .next = &props[1] },
-		{ .name = "apple,firmware-version", .length = sizeof(compat_27_2),
-		  .value = compat_27_2, .next = &props[2] },
-		{ .name = "apple,firmware-uuid", .length = sizeof(bad_uuid),
-		  .value = (void *)bad_uuid, .next = &props[3] },
-		{ .name = "compatible", .length = sizeof(t6030),
-		  .value = (void *)t6030 },
-	};
-	struct property ext_props[] = {
-		{ .name = "apple,firmware-compat", .length = sizeof(compat_27_2),
-		  .value = compat_27_2, .next = &ext_props[1] },
-		{ .name = "apple,firmware-version", .length = sizeof(compat_27_2),
-		  .value = compat_27_2, .next = &ext_props[2] },
-		{ .name = "compatible", .length = sizeof(t8122_ext),
-		  .value = (void *)t8122_ext },
-	};
-	struct device_node node = { .properties = props };
-	struct device_node ext_node = { .properties = ext_props };
-	struct device dev = {
-		.init_name = "dcp-firmware-test",
-		.of_node = &node,
-		.driver = &apple_platform_driver.driver,
-	};
+	struct dcp_pin_precedence_fixture {
+		struct property props[4];
+		struct property ext_props[3];
+		struct device_node node;
+		struct device_node ext_node;
+		struct device dev;
+	} *fx;
 
-	KUNIT_EXPECT_EQ(test, dcp_check_firmware_version(&dev),
+	fx = kunit_kzalloc(test, sizeof(*fx), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, fx);
+
+	fx->props[0] = (struct property) {
+		.name = "apple,firmware-compat",
+		.length = sizeof(compat_27_2),
+		.value = compat_27_2,
+		.next = &fx->props[1],
+	};
+	fx->props[1] = (struct property) {
+		.name = "apple,firmware-version",
+		.length = sizeof(compat_27_2),
+		.value = compat_27_2,
+		.next = &fx->props[2],
+	};
+	fx->props[2] = (struct property) {
+		.name = "apple,firmware-uuid",
+		.length = sizeof(bad_uuid),
+		.value = (void *)bad_uuid,
+		.next = &fx->props[3],
+	};
+	fx->props[3] = (struct property) {
+		.name = "compatible",
+		.length = sizeof(t6030),
+		.value = (void *)t6030,
+	};
+	fx->ext_props[0] = (struct property) {
+		.name = "apple,firmware-compat",
+		.length = sizeof(compat_27_2),
+		.value = compat_27_2,
+		.next = &fx->ext_props[1],
+	};
+	fx->ext_props[1] = (struct property) {
+		.name = "apple,firmware-version",
+		.length = sizeof(compat_27_2),
+		.value = compat_27_2,
+		.next = &fx->ext_props[2],
+	};
+	fx->ext_props[2] = (struct property) {
+		.name = "compatible",
+		.length = sizeof(t8122_ext),
+		.value = (void *)t8122_ext,
+	};
+	fx->node.properties = fx->props;
+	fx->ext_node.properties = fx->ext_props;
+	fx->dev.init_name = "dcp-firmware-test";
+	fx->dev.of_node = &fx->node;
+	fx->dev.driver = &apple_platform_driver.driver;
+
+	KUNIT_EXPECT_EQ(test, dcp_check_firmware_version(&fx->dev),
 			DCP_FIRMWARE_V_27_0);
 
-	props[0].value = compat_27_3;
-	KUNIT_EXPECT_EQ(test, dcp_check_firmware_version(&dev),
+	fx->props[0].value = compat_27_3;
+	KUNIT_EXPECT_EQ(test, dcp_check_firmware_version(&fx->dev),
 			DCP_FIRMWARE_UNKNOWN);
-	props[0].value = compat_27_2;
+	fx->props[0].value = compat_27_2;
 
 	/* T6041 internal and external UUID pins remain enforced on 27.2. */
-	props[3].length = sizeof(t6041);
-	props[3].value = (void *)t6041;
-	KUNIT_EXPECT_EQ(test, dcp_check_firmware_version(&dev),
+	fx->props[3].length = sizeof(t6041);
+	fx->props[3].value = (void *)t6041;
+	KUNIT_EXPECT_EQ(test, dcp_check_firmware_version(&fx->dev),
 			DCP_FIRMWARE_UNKNOWN);
 
-	props[2].length = sizeof(APPLE_T6041_DCP_26B123_UUID);
-	props[2].value = (void *)APPLE_T6041_DCP_26B123_UUID;
-	KUNIT_EXPECT_EQ(test, dcp_check_firmware_version(&dev),
+	fx->props[2].length = sizeof(APPLE_T6041_DCP_26B123_UUID);
+	fx->props[2].value = (void *)APPLE_T6041_DCP_26B123_UUID;
+	KUNIT_EXPECT_EQ(test, dcp_check_firmware_version(&fx->dev),
 			DCP_FIRMWARE_V_27_0);
 
-	props[3].length = sizeof(t6041_ext);
-	props[3].value = (void *)t6041_ext;
-	props[2].length = sizeof(bad_uuid);
-	props[2].value = (void *)bad_uuid;
-	KUNIT_EXPECT_EQ(test, dcp_check_firmware_version(&dev),
+	fx->props[3].length = sizeof(t6041_ext);
+	fx->props[3].value = (void *)t6041_ext;
+	fx->props[2].length = sizeof(bad_uuid);
+	fx->props[2].value = (void *)bad_uuid;
+	KUNIT_EXPECT_EQ(test, dcp_check_firmware_version(&fx->dev),
 			DCP_FIRMWARE_UNKNOWN);
 
-	props[2].name = "apple,unrelated";
-	KUNIT_EXPECT_EQ(test, dcp_check_firmware_version(&dev),
+	fx->props[2].name = "apple,unrelated";
+	KUNIT_EXPECT_EQ(test, dcp_check_firmware_version(&fx->dev),
 			DCP_FIRMWARE_UNKNOWN);
 
-	props[2].name = "apple,firmware-uuid";
-	props[2].length = sizeof(APPLE_T6041_DCP_26B123_UUID);
-	props[2].value = (void *)APPLE_T6041_DCP_26B123_UUID;
-	KUNIT_EXPECT_EQ(test, dcp_check_firmware_version(&dev),
+	fx->props[2].name = "apple,firmware-uuid";
+	fx->props[2].length = sizeof(APPLE_T6041_DCP_26B123_UUID);
+	fx->props[2].value = (void *)APPLE_T6041_DCP_26B123_UUID;
+	KUNIT_EXPECT_EQ(test, dcp_check_firmware_version(&fx->dev),
 			DCP_FIRMWARE_V_27_0);
 
 	/* T8122 wrong or missing 27.2 UUID is terminally refused (never takes generic v27). */
-	props[3].length = sizeof(t8122);
-	props[3].value = (void *)t8122;
-	props[2].name = "apple,firmware-uuid";
-	props[2].length = sizeof(bad_uuid);
-	props[2].value = (void *)bad_uuid;
-	KUNIT_EXPECT_EQ(test, dcp_check_firmware_version(&dev),
+	fx->props[3].length = sizeof(t8122);
+	fx->props[3].value = (void *)t8122;
+	fx->props[2].name = "apple,firmware-uuid";
+	fx->props[2].length = sizeof(bad_uuid);
+	fx->props[2].value = (void *)bad_uuid;
+	KUNIT_EXPECT_EQ(test, dcp_check_firmware_version(&fx->dev),
 			DCP_FIRMWARE_UNKNOWN);
 	KUNIT_EXPECT_FALSE(test,
-			   apple_t8122_dcpext_v27_2_for_internal(&ext_node, &node));
+			   apple_t8122_dcpext_v27_2_for_internal(&fx->ext_node, &fx->node));
 
-	props[2].name = "apple,unrelated";
-	KUNIT_EXPECT_EQ(test, dcp_check_firmware_version(&dev),
+	fx->props[2].name = "apple,unrelated";
+	KUNIT_EXPECT_EQ(test, dcp_check_firmware_version(&fx->dev),
 			DCP_FIRMWARE_UNKNOWN);
 	KUNIT_EXPECT_FALSE(test,
-			   apple_t8122_dcpext_v27_2_for_internal(&ext_node, &node));
+			   apple_t8122_dcpext_v27_2_for_internal(&fx->ext_node, &fx->node));
 
-	props[2].name = "apple,firmware-uuid";
-	props[2].length = sizeof(APPLE_T8122_DCP_26B123_UUID);
-	props[2].value = (void *)APPLE_T8122_DCP_26B123_UUID;
-	KUNIT_EXPECT_EQ(test, dcp_check_firmware_version(&dev),
+	fx->props[2].name = "apple,firmware-uuid";
+	fx->props[2].length = sizeof(APPLE_T8122_DCP_26B123_UUID);
+	fx->props[2].value = (void *)APPLE_T8122_DCP_26B123_UUID;
+	KUNIT_EXPECT_EQ(test, dcp_check_firmware_version(&fx->dev),
 			DCP_FIRMWARE_V_27_0);
 	KUNIT_EXPECT_TRUE(test,
-			  apple_t8122_dcpext_v27_2_for_internal(&ext_node, &node));
+			  apple_t8122_dcpext_v27_2_for_internal(&fx->ext_node, &fx->node));
 
 	/* T8122 external with mismatched version is terminally refused regardless of live tree. */
-	ext_props[1].value = compat_27_0;
+	fx->ext_props[1].value = compat_27_0;
 	KUNIT_EXPECT_FALSE(test,
-			   apple_t8122_dcpext_v27_2_for_internal(&ext_node, &node));
-	dev.of_node = &ext_node;
-	KUNIT_EXPECT_EQ(test, dcp_check_firmware_version(&dev),
+			   apple_t8122_dcpext_v27_2_for_internal(&fx->ext_node, &fx->node));
+	fx->dev.of_node = &fx->ext_node;
+	KUNIT_EXPECT_EQ(test, dcp_check_firmware_version(&fx->dev),
 			DCP_FIRMWARE_UNKNOWN);
-	ext_props[1].value = compat_27_2;
-	KUNIT_EXPECT_EQ(test, dcp_check_firmware_version(&dev),
-			apple_t8122_dcpext_v27_2(&ext_node) ?
+	fx->ext_props[1].value = compat_27_2;
+	KUNIT_EXPECT_EQ(test, dcp_check_firmware_version(&fx->dev),
+			apple_t8122_dcpext_v27_2(&fx->ext_node) ?
 			DCP_FIRMWARE_V_27_0 : DCP_FIRMWARE_UNKNOWN);
-	dev.of_node = &node;
+	fx->dev.of_node = &fx->node;
 
 	/* Internal T8142: known 27.x takes v27, unknown 27.x is refused (never takes H17P). */
-	props[3].length = sizeof(t8142);
-	props[3].value = (void *)t8142;
-	props[0].value = compat_27_0;
-	KUNIT_EXPECT_EQ(test, dcp_check_firmware_version(&dev),
+	fx->props[3].length = sizeof(t8142);
+	fx->props[3].value = (void *)t8142;
+	fx->props[0].value = compat_27_0;
+	KUNIT_EXPECT_EQ(test, dcp_check_firmware_version(&fx->dev),
 			DCP_FIRMWARE_V_27_0);
-	props[0].value = compat_27_2;
-	KUNIT_EXPECT_EQ(test, dcp_check_firmware_version(&dev),
+	fx->props[0].value = compat_27_2;
+	KUNIT_EXPECT_EQ(test, dcp_check_firmware_version(&fx->dev),
 			DCP_FIRMWARE_V_27_0);
-	props[0].value = compat_27_1;
-	KUNIT_EXPECT_EQ(test, dcp_check_firmware_version(&dev),
+	fx->props[0].value = compat_27_1;
+	KUNIT_EXPECT_EQ(test, dcp_check_firmware_version(&fx->dev),
 			DCP_FIRMWARE_UNKNOWN);
-	props[0].value = compat_27_3;
-	KUNIT_EXPECT_EQ(test, dcp_check_firmware_version(&dev),
+	fx->props[0].value = compat_27_3;
+	KUNIT_EXPECT_EQ(test, dcp_check_firmware_version(&fx->dev),
 			DCP_FIRMWARE_UNKNOWN);
-	props[0].value = compat_26_6;
-	KUNIT_EXPECT_EQ(test, dcp_check_firmware_version(&dev),
+	fx->props[0].value = compat_26_6;
+	KUNIT_EXPECT_EQ(test, dcp_check_firmware_version(&fx->dev),
 			DCP_FIRMWARE_H17P);
-	props[0].value = compat_27_2;
+	fx->props[0].value = compat_27_2;
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8132)
 	/* T8132 keeps its M4 match-data pin on 27.2. */
-	props[3].length = sizeof(t8132);
-	props[3].value = (void *)t8132;
-	KUNIT_EXPECT_EQ(test, dcp_check_firmware_version(&dev),
+	fx->props[3].length = sizeof(t8132);
+	fx->props[3].value = (void *)t8132;
+	KUNIT_EXPECT_EQ(test, dcp_check_firmware_version(&fx->dev),
 			DCP_FIRMWARE_M4);
 #endif
 }
