@@ -37,10 +37,10 @@ impl UnitCmds {
         let coherent = Class::FwCoherent;
         Ok(Self {
             seq: alloc(o, compute::SEQ_SIZE, coherent, None, 0, false)?,
-            // Holds fs2c (+0x00) and cross-pipe c2c (+0x40) barriers within one page.
+            // Holds fs2c (+0x00) and per-pipe c2c (+(1 + pipe) * barrier::SIZE) barriers in 1 page.
             barrier: alloc(
                 o,
-                barrier::SIZE * sizes::COMPUTE_PIPES,
+                barrier::SIZE * (1 + sizes::COMPUTE_PIPES),
                 coherent,
                 None,
                 0,
@@ -49,6 +49,8 @@ impl UnitCmds {
         })
     }
 }
+
+const _: () = assert!(barrier::SIZE * (1 + sizes::COMPUTE_PIPES) <= super::hw::PAGE as usize);
 
 /// One immutable allocation set. Mutable firmware pool cursors survive successful reuse.
 pub(crate) struct ComputeSlot {
@@ -1392,40 +1394,51 @@ impl Slots {
         }
         let n = sizes::COMPUTE_UNITS;
         let base_cursor = (self.cursor as usize) % n;
+        let p0_mask = (1u32 << sizes::PIPE1_COMPUTE_START) - 1;
+        // On pipe 0, prefer pipe-0-exclusive units (`0..PIPE1_COMPUTE_START`) before spilling
+        // into secondary-pipe units (`PIPE1_COMPUTE_START..COMPUTE_UNITS`) so concurrent
+        // secondary pipes keep maximum unit headroom.
+        let tiers: [u32; 2] = if pipe == 0 {
+            [allowed & p0_mask, allowed & !p0_mask]
+        } else {
+            [allowed, 0]
+        };
         let mut chosen = None;
         if let Some(id) = vm_id {
-            for i in 0..n {
-                let k = (base_cursor + i) % n;
-                if (allowed & (1u32 << k)) != 0
-                    && !self.compute.scrub_full[k]
-                    && self.compute.owner[k]
-                        .as_ref()
-                        .is_some_and(|prev| prev.id == id)
-                    && self.compute.lifetime.claim(k)
-                {
-                    chosen = Some(k);
-                    break;
+            // 1. Reuse a warm unit already owned by `vm_id` (preferring pipe-0-exclusive units).
+            'warm: for tier in tiers {
+                if tier == 0 {
+                    continue;
                 }
-            }
-            if chosen.is_none() {
                 for i in 0..n {
                     let k = (base_cursor + i) % n;
-                    if (allowed & (1u32 << k)) != 0
+                    if (tier & (1u32 << k)) != 0
+                        && !self.compute.scrub_full[k]
+                        && self.compute.owner[k]
+                            .as_ref()
+                            .is_some_and(|prev| prev.id == id)
+                        && self.compute.lifetime.claim(k)
+                    {
+                        chosen = Some(k);
+                        break 'search;
+                    }
+                }
+                for i in 0..n {
+                    let k = (base_cursor + i) % n;
+                    if (tier & (1u32 << k)) != 0
                         && self.compute.owner[k].is_none()
                         && self.compute.lifetime.claim(k)
                     {
                         chosen = Some(k);
-                        break;
+                        break 'search;
                     }
                 }
             }
-        }
-        if chosen.is_none() {
             for i in 0..n {
                 let k = (base_cursor + i) % n;
-                if (allowed & (1u32 << k)) != 0 && self.compute.lifetime.claim(k) {
+                if (tier & (1u32 << k)) != 0 && self.compute.lifetime.claim(k) {
                     chosen = Some(k);
-                    break;
+                    break 'search;
                 }
             }
         }

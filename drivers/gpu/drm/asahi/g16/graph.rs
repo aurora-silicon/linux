@@ -360,13 +360,13 @@ impl RenderGraph {
 /// the firmware-cached work rings from a probe-time device-lifetime
 /// [`Factory::persistent_objects_probe`] pool.
 pub(crate) struct GraphSession {
-    compute: [ComputeGraphSession; sizes::COMPUTE_PIPES],
+    compute: KVec<ComputeGraphSession>,
     render: RenderGraphSession,
 }
 
 pub(crate) struct Graphs {
     pub(crate) dev: ARef<device::Device>,
-    pub(crate) compute: [ComputeGraph; sizes::COMPUTE_PIPES],
+    pub(crate) compute: KVec<ComputeGraph>,
     pub(crate) render: RenderGraph,
     /// Owns the firmware-cached work rings for the device lifetime (never dropped).
     _ring_objects: core::mem::ManuallyDrop<Objects>,
@@ -377,10 +377,10 @@ impl Graphs {
         // Host polls sched_ctx from WC during register_context(); keep uncached and share one
         // scheduling context across all compute pipes and the render graph.
         let sched_ctx = alloc(o, sched_ctx::SIZE, Class::Fw, None, 0, false)?;
-        let compute = [
-            ComputeGraphSession::new(o, sched_ctx.clone())?,
-            ComputeGraphSession::new(o, sched_ctx.clone())?,
-        ];
+        let mut compute = KVec::with_capacity(sizes::COMPUTE_PIPES, GFP_KERNEL)?;
+        for _ in 0..sizes::COMPUTE_PIPES {
+            compute.push(ComputeGraphSession::new(o, sched_ctx.clone())?, GFP_KERNEL)?;
+        }
         let render = RenderGraphSession::new(o, sched_ctx)?;
         Ok(GraphSession { compute, render })
     }
@@ -393,8 +393,10 @@ impl Graphs {
     ) -> Result<Self> {
         // Never dropped even on partial failure: ASC-cached mappings have no qualified teardown.
         let mut ring_objects = core::mem::ManuallyDrop::new(factory.persistent_objects_probe());
-        let [c0, c1] = session.compute;
-        let compute = [c0.finish(&mut ring_objects)?, c1.finish(&mut ring_objects)?];
+        let mut compute = KVec::with_capacity(sizes::COMPUTE_PIPES, GFP_KERNEL)?;
+        for c in session.compute {
+            compute.push(c.finish(&mut ring_objects)?, GFP_KERNEL)?;
+        }
         let render = session.render.finish(&mut ring_objects)?;
         ring_objects.finish_private()?;
         Ok(Self {

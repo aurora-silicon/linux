@@ -307,6 +307,9 @@ pub(crate) struct Flight {
     pub(crate) fs_start: u32,
     /// Channel producers (TA, FS, compute) after the prefix's records.
     pub(crate) rec: [u32; 3],
+    /// Whether `Channel::Compute` read and completion cursors already passed `rec[2]` before
+    /// the shared submit ring could wrap past this flight.
+    pub(crate) chan_settled: bool,
     /// Compute member j's FW stamp target, the FS target it waits on directly (0: none), and
     /// its private UMA counter value after publication.
     pub(crate) cstamp: [u32; sizes::COMPUTE_SLOTS],
@@ -368,6 +371,7 @@ impl Flight {
             ta_start: 0,
             fs_start: 0,
             rec: [0; 3],
+            chan_settled: false,
             cstamp: [0; sizes::COMPUTE_SLOTS],
             cwait: [0; sizes::COMPUTE_SLOTS],
             csubmitted: [0; sizes::COMPUTE_SLOTS],
@@ -434,7 +438,7 @@ pub(crate) enum HoldCause {
     DrainFailed,
     /// A cold `InitBM` render is in flight.
     DrainInitbm,
-    /// Compute behind any flight of another VM, render behind compute of another VM, or an
+    /// Compute behind render of another VM, render behind compute of another VM, or an
     /// SCS compute conflict.
     DrainCross,
     /// No warm PB/UMA allocator slot of the VM can take the render behind active flights.
@@ -640,6 +644,14 @@ pub(crate) struct Engine {
     /// The compute pipes / render queues were registered by a first record (`new_queue`).
     pub(crate) queue_registered: [bool; sizes::COMPUTE_PIPES],
     pub(crate) next_compute_pipe: u8,
+    /// Last VM id that published onto each compute pipe (warm per-VM `qinfo` affinity).
+    pub(crate) pipe_last_vm: [Option<u64>; sizes::COMPUTE_PIPES],
+    /// Monotonic last-use counter per compute pipe for LRU idle-pipe selection.
+    pub(crate) pipe_last_used: [u64; sizes::COMPUTE_PIPES],
+    pub(crate) pipe_use_seq: u64,
+    /// Transient bitmask of compute pipes being drained for handoff to a waiting job that has
+    /// no eligible pipe (e.g. a base-only VM limited to pipe 0).
+    pub(crate) handoff_avoid_pipes: u32,
     pub(crate) render_registered: bool,
     pub(crate) ta_registered: bool,
     /// A ready prefix waits only for a record's consumption: repoll sooner.
@@ -662,9 +674,9 @@ pub(crate) struct Engine {
     /// Absolute deadline (`ktime_get_ns`) for busy-state same-queue horizon micro-coalescing
     /// (0 when no batch is held).
     pub(crate) coalesce_deadline_ns: u64,
-    /// Progress tracking of the oldest compute pipe 0/1 and render flights.
-    pub(crate) progress_flight: [u64; 3],
-    pub(crate) progress: [Option<u32>; 4],
+    /// Progress tracking of the oldest compute pipes `0..COMPUTE_PIPES` and render flights.
+    pub(crate) progress_flight: [u64; sizes::COMPUTE_PIPES + 1],
+    pub(crate) progress: [Option<u32>; sizes::COMPUTE_PIPES + 2],
     /// Boxed with [`Self::prof`]: `Firmware` is built on the probe's stack.
     pub(crate) stats: KBox<Stats>,
     /// Phase timers (debug_flags bit 49).
@@ -700,6 +712,10 @@ impl Engine {
             stage_seen: 0,
             queue_registered: [false; sizes::COMPUTE_PIPES],
             next_compute_pipe: 0,
+            pipe_last_vm: [None; sizes::COMPUTE_PIPES],
+            pipe_last_used: [0; sizes::COMPUTE_PIPES],
+            pipe_use_seq: 0,
+            handoff_avoid_pipes: 0,
             render_registered: false,
             ta_registered: false,
             chan_wait: false,
@@ -709,8 +725,8 @@ impl Engine {
             housekeeping_owed: false,
             held_wait: false,
             coalesce_deadline_ns: 0,
-            progress_flight: [0; 3],
-            progress: [None; 4],
+            progress_flight: [0; sizes::COMPUTE_PIPES + 1],
+            progress: [None; sizes::COMPUTE_PIPES + 2],
             stats: KBox::zeroed(GFP_KERNEL)?,
             prof: KBox::zeroed(GFP_KERNEL)?,
             debugfs: None,
@@ -866,13 +882,14 @@ impl Firmware {
 
     /// The single in-order Finalize frontier for each held M4 event. These cells are never
     /// reset after first publication, including across client VM switches and recovery.
-    pub(crate) fn recovery_snapshot(&self) -> Result<[u32; 4]> {
-        Ok([
-            self.graph.render.fw_stamp[0].r32(0)?,
-            self.graph.render.fw_stamp[1].r32(0)?,
-            self.graph.compute[0].fw_stamp.r32(0)?,
-            self.graph.compute[1].fw_stamp.r32(0)?,
-        ])
+    pub(crate) fn recovery_snapshot(&self) -> Result<[u32; 2 + sizes::COMPUTE_PIPES]> {
+        let mut stage = [0u32; 2 + sizes::COMPUTE_PIPES];
+        stage[0] = self.graph.render.fw_stamp[0].r32(0)?;
+        stage[1] = self.graph.render.fw_stamp[1].r32(0)?;
+        for (p, compute) in self.graph.compute.iter().enumerate() {
+            stage[2 + p] = compute.fw_stamp.r32(0)?;
+        }
+        Ok(stage)
     }
 
     /// Authenticate one firmware affected-work snapshot entry against its retained owner.
@@ -882,7 +899,7 @@ impl Firmware {
         flags: u32,
         event: u32,
         target: u32,
-        stage: [u32; 4],
+        stage: [u32; 2 + sizes::COMPUTE_PIPES],
     ) -> Result {
         if flags & 1 != 0 && self.recovery.last_retired.contains(event, target) {
             // A notification may follow the full receipt. It names the retained old
@@ -890,21 +907,12 @@ impl Firmware {
             return Ok(());
         }
         // The named owner: the oldest flight, or with compute/render queued behind it a later one.
+        let compute_pipe = work::compute::pipe_of_event(event);
         let f = self
             .engine
             .flights
             .iter_mut()
             .find(|f| match event {
-                15 => {
-                    f.computes != 0
-                        && f.compute_pipe == 0
-                        && f.cstamp[..(f.computes as usize).min(f.cstamp.len())].contains(&target)
-                }
-                16 => {
-                    f.computes != 0
-                        && f.compute_pipe == 1
-                        && f.cstamp[..(f.computes as usize).min(f.cstamp.len())].contains(&target)
-                }
                 0x70 => {
                     f.renders != 0
                         && f.r_ta_stamp[..(f.renders as usize).min(f.r_ta_stamp.len())]
@@ -915,7 +923,11 @@ impl Firmware {
                         && f.r_fs_stamp[..(f.renders as usize).min(f.r_fs_stamp.len())]
                             .contains(&target)
                 }
-                _ => false,
+                _ => compute_pipe.is_some_and(|pipe| {
+                    f.computes != 0
+                        && f.compute_pipe as usize == pipe
+                        && f.cstamp[..(f.computes as usize).min(f.cstamp.len())].contains(&target)
+                }),
             })
             .ok_or(ENOENT)?;
         if flags & 1 == 0 {
@@ -953,7 +965,7 @@ impl Firmware {
     /// in the snapshot. Keep it until either its full receipt or its passed-abort proof.
     pub(crate) fn recovery_prepare_suspects(
         &mut self,
-        stage: [u32; 4],
+        stage: [u32; 2 + sizes::COMPUTE_PIPES],
         _event: u32,
         fault_asid: Option<u32>,
     ) -> Result {
@@ -1058,11 +1070,13 @@ impl Firmware {
         self.engine.slot_wait = false;
         self.engine.ta_wave_wait = false;
         self.engine.held_wait = false;
+        self.engine.handoff_avoid_pipes = 0;
         self.engine.coalesce_deadline_ns = 0;
         while self.recovery.failed().is_none()
             && !self.engine.frozen
             && !self.engine.pending.is_empty()
         {
+            self.engine.handoff_avoid_pipes = 0;
             let Some(index) = self.engine.pick() else {
                 break;
             };
@@ -1083,6 +1097,13 @@ impl Firmware {
                     self.note_hold(&job, true, 0);
                     break;
                 }
+                // If the selected head waiter has no eligible compute pipe (e.g. a base-only
+                // VM limited to pipe 0 while an incumbent refills pipe 0, or a 9th VM when all
+                // pipes are occupied), let one compatible pipe drain for handoff while other
+                // pipes continue dispatching.
+                self.engine.handoff_avoid_pipes = self
+                    .compute_handoff_pipe(&job)
+                    .map_or(0, |pipe| 1u32 << pipe);
                 let ta_val = *ta_pending.get_or_insert_with(|| self.ta_pending_passes());
                 let ta_wave_paused = ta_val >= self.active_ta_wave_cap();
                 let mut alt: Option<usize> = None;
@@ -1152,6 +1173,7 @@ impl Firmware {
                 match alt {
                     Some(i) => job = self.engine.pending[i].clone(),
                     None => {
+                        self.engine.handoff_avoid_pipes = 0;
                         self.engine.slot_wait = self
                             .engine
                             .pending
@@ -1249,7 +1271,10 @@ impl Firmware {
             }
             match job.check_command_dependencies(job.progress.sent()) {
                 Ok(()) => {}
-                Err(e) if e == EAGAIN => break,
+                Err(e) if e == EAGAIN => {
+                    self.engine.handoff_avoid_pipes = 0;
+                    break;
+                }
                 Err(e) => {
                     self.engine.unpend(&job);
                     let _ = job.mark_terminal_retired();
@@ -1257,7 +1282,9 @@ impl Firmware {
                     continue;
                 }
             }
-            match self.publish_prefix(&job, done, &mut pending_rings) {
+            let pub_res = self.publish_prefix(&job, done, &mut pending_rings);
+            self.engine.handoff_avoid_pipes = 0;
+            match pub_res {
                 Ok(()) => {
                     self.engine.turn += 1;
                     job.queue.turn.store(self.engine.turn, Ordering::Relaxed);
@@ -1402,7 +1429,7 @@ impl Firmware {
                     || f.recovery_suspect
                     || f.initbm
                     || (is_compute && scs_compute_conflict(f, &job.vm, is_rt_compute))
-                    || ((is_compute || (is_render && f.computes != 0))
+                    || (((is_compute && f.renders != 0) || (is_render && f.computes != 0))
                         && !Arc::ptr_eq(&f.job.vm, &job.vm))
             })
             || (is_render && !self.render_can_pipeline(job))
@@ -1497,15 +1524,16 @@ impl Firmware {
             return true;
         }
         match command(job, sent) {
-            Some(Command::Compute(_)) => {
+            Some(Command::Compute(c)) => {
                 let compute_count: usize = e.flights.iter().map(|f| f.computes as usize).sum();
+                let scs = job.resources.compute_scs() || c.is_rt();
                 compute_count > 0
                     && !self.slots.compute_exhausted()
                     && (compute_count >= params::compute_flights()
                         || job
                             .resources
                             .compute_slot_mask()
-                            .is_ok_and(|mask| !self.slots.compute_available_in_mask(mask)))
+                            .is_ok_and(|mask| !self.has_compute_pipe_for_vm(&job.vm, mask, scs)))
             }
             Some(Command::Render(_)) => {
                 let render_count: usize = e.flights.iter().map(|f| f.renders as usize).sum();
@@ -1607,10 +1635,10 @@ impl Firmware {
     ///   dispatch from one client cannot starve another client's fragment shading into a
     ///   firmware DM1 timeout. Cold InitBM priming renders and every failure or recovery path
     ///   still drain the engine first.
-    /// - Compute never runs beside compute of another VM, on either pipe: with several clients
-    ///   dispatching barrier-free compute, the overlapped dispatches occasionally lost their
-    ///   results without a fault (loads read zero, readbacks came back empty or partial),
-    ///   which one client alone never does. G15 runs one VM at a time for the same reason.
+    /// - Cross-VM non-SCS compute runs concurrently across disjoint per-VM firmware workqueues
+    ///   (`graph.compute[0..COMPUTE_PIPES]`): two different VMs/ASIDs are never queued into the
+    ///   same in-flight `qinfo`, avoiding cross-VM engine drains without sharing an active
+    ///   workqueue ring. SCS/RT compute still drains against non-SCS or other-VM compute.
     fn can_queue_behind(&self, job: &Arc<Job>) -> bool {
         let mut ta_pending = None;
         self.can_queue_behind_with_ta(job, &mut ta_pending)
@@ -1677,14 +1705,17 @@ impl Firmware {
                             })
                         })
                     }));
-                let cross_vm = e.flights.iter().any(|f| !Arc::ptr_eq(&f.job.vm, &job.vm));
+                let cross_vm_render = e
+                    .flights
+                    .iter()
+                    .any(|f| f.renders != 0 && !Arc::ptr_eq(&f.job.vm, &job.vm));
                 let scs = job.resources.compute_scs() || c.is_rt();
                 let scs_conflict = e
                     .flights
                     .iter()
                     .any(|f| scs_compute_conflict(f, &job.vm, scs));
                 let compute_count: usize = e.flights.iter().map(|f| f.computes as usize).sum();
-                !cross_vm
+                !cross_vm_render
                     && !scs_conflict
                     && !waits_for_timestamps
                     && compute_count < params::compute_flights()
@@ -1693,7 +1724,7 @@ impl Firmware {
                     && job
                         .resources
                         .compute_slot_mask()
-                        .is_ok_and(|mask| self.slots.compute_available_in_mask(mask))
+                        .is_ok_and(|mask| self.has_compute_pipe_for_vm(&job.vm, mask, scs))
             }
             Some(Command::Render(r)) => {
                 let cross_vm_compute = e
@@ -1822,8 +1853,16 @@ impl Firmware {
                 let Ok(slot_mask) = head.resources.compute_slot_mask() else {
                     return false;
                 };
-                let pipe =
-                    self.choose_compute_pipe(&head.queue, [None, None], slot_mask, false, false);
+                let Some(pipe) = self.choose_compute_pipe(
+                    &head.queue,
+                    &head.vm,
+                    [None; sizes::COMPUTE_PIPES],
+                    slot_mask,
+                    false,
+                    false,
+                ) else {
+                    return false;
+                };
                 let free_c = self.slots.free_compute_in_mask_for_pipe(slot_mask, pipe) as usize;
                 let cap = super::hw::sizes::COALESCE_MAX_CMDS
                     .min(free_c)
@@ -2219,79 +2258,306 @@ impl Firmware {
         })
     }
 
-    /// Chooses which compute pipe (`0..COMPUTE_PIPES`) executes the next compute command:
-    /// - Base-only/SCS VMs (bits strictly in `0..PIPE1_COMPUTE_START`) or states where pipe 1
-    ///   has no available unit in `slot_mask` stay on pipe 0 so `0..PIPE1_COMPUTE_START` never
-    ///   split across two pipes.
-    /// - If the command waits only on one pipe, reuse that pipe (in-order ring, zero `c2c`
-    ///   barrier).
-    /// - If barrier-free (`[None, None]`), `!heavy_compute`, and `queue` already has an active
+    /// When a ready compute job cannot queue behind active flights because every compatible
+    /// compute pipe is currently occupied by another VM (for example a base-only VM limited to
+    /// pipe 0, or a 9th VM when all 8 pipes are occupied), pick one compatible occupied pipe to
+    /// drain for handoff while other pipes continue dispatching.
+    fn compute_handoff_pipe(&self, job: &Arc<Job>) -> Option<usize> {
+        let sent = job.progress.sent();
+        let Some(Command::Compute(c)) = command(job, sent) else {
+            return None;
+        };
+        if job.vm.status.get() != 0
+            || self.slots.compute_exhausted()
+            || job.check_command_dependencies(sent).is_err()
+        {
+            return None;
+        }
+        let Ok(slot_mask) = job.resources.compute_slot_mask() else {
+            return None;
+        };
+        let scs = job.resources.compute_scs() || c.is_rt();
+        if self.has_compute_pipe_for_vm(&job.vm, slot_mask, scs) {
+            return None;
+        }
+        let mut other_load = [0usize; sizes::COMPUTE_PIPES];
+        for fl in &self.engine.flights {
+            if fl.computes != 0 && !Arc::ptr_eq(&fl.job.vm, &job.vm) {
+                let p = (fl.compute_pipe as usize).min(sizes::COMPUTE_PIPES - 1);
+                other_load[p] += fl.computes as usize;
+            }
+        }
+        let limit = if scs { 1 } else { sizes::COMPUTE_PIPES };
+        let mut best: Option<(usize, usize)> = None;
+        for (p, &load) in other_load.iter().enumerate().take(limit) {
+            if load == 0 {
+                continue;
+            }
+            let allowed = if p == 0 {
+                slot_mask
+            } else {
+                slot_mask & !((1u32 << sizes::PIPE1_COMPUTE_START) - 1)
+            };
+            if allowed == 0 || self.slots.compute_exhausted_in_mask(allowed) {
+                continue;
+            }
+            if best.is_none_or(|(_, prev)| load < prev) {
+                best = Some((p, load));
+            }
+        }
+        best.map(|(p, _)| p)
+    }
+
+    /// Whether `vm` can acquire a compute pipe (`0..COMPUTE_PIPES`) without sharing an active
+    /// `qinfo` with another VM, exceeding `MAX_VM_COMPUTE_PIPES`, using a pipe draining for
+    /// handoff, or lacking an available unit in `slot_mask`.
+    fn has_compute_pipe_for_vm(
+        &self,
+        vm: &Arc<super::vm::VmState>,
+        slot_mask: u32,
+        rt_compute: bool,
+    ) -> bool {
+        let avoid = self.engine.handoff_avoid_pipes;
+        let mut active_same = [false; sizes::COMPUTE_PIPES];
+        let mut active_other = [false; sizes::COMPUTE_PIPES];
+        let mut any_rt = rt_compute;
+        for fl in &self.engine.flights {
+            if fl.computes != 0 {
+                let p = (fl.compute_pipe as usize).min(sizes::COMPUTE_PIPES - 1);
+                if Arc::ptr_eq(&fl.job.vm, vm) {
+                    active_same[p] = true;
+                } else {
+                    active_other[p] = true;
+                }
+                any_rt |= fl.rt_compute;
+            }
+        }
+        if any_rt {
+            return (avoid & 1) == 0
+                && !active_other[0]
+                && self.slots.compute_available_in_mask_for_pipe(slot_mask, 0);
+        }
+        let vm_active_pipes = active_same.iter().filter(|&&a| a).count();
+        for p in 0..sizes::COMPUTE_PIPES {
+            if (avoid & (1u32 << p)) != 0 || active_other[p] {
+                continue;
+            }
+            if !active_same[p] && vm_active_pipes >= sizes::MAX_VM_COMPUTE_PIPES {
+                continue;
+            }
+            if self.slots.compute_available_in_mask_for_pipe(slot_mask, p) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Minimum active compute count on another pipe eligible for `vm` besides `pipe`, used to
+    /// balance heavy barrier-free compute across up to `MAX_VM_COMPUTE_PIPES` pipes of `vm`.
+    fn other_vm_compute_pipe_load(
+        &self,
+        vm: &Arc<super::vm::VmState>,
+        pipe: usize,
+        slot_mask: u32,
+    ) -> Option<usize> {
+        let mut active_same = [0usize; sizes::COMPUTE_PIPES];
+        let mut active_other = [false; sizes::COMPUTE_PIPES];
+        for fl in &self.engine.flights {
+            if fl.computes != 0 {
+                let p = (fl.compute_pipe as usize).min(sizes::COMPUTE_PIPES - 1);
+                if Arc::ptr_eq(&fl.job.vm, vm) {
+                    active_same[p] += fl.computes as usize;
+                } else {
+                    active_other[p] = true;
+                }
+            }
+        }
+        let vm_active_pipes = active_same.iter().filter(|&&n| n != 0).count();
+        let mut best: Option<usize> = None;
+        for p in 0..sizes::COMPUTE_PIPES {
+            if p == pipe || active_other[p] {
+                continue;
+            }
+            if active_same[p] == 0 && vm_active_pipes >= sizes::MAX_VM_COMPUTE_PIPES {
+                continue;
+            }
+            if !self.slots.compute_available_in_mask_for_pipe(slot_mask, p) {
+                continue;
+            }
+            best = Some(match best {
+                Some(prev) => prev.min(active_same[p]),
+                None => active_same[p],
+            });
+        }
+        best
+    }
+
+    /// Chooses which compute pipe (`0..COMPUTE_PIPES`) executes the next compute command
+    /// without ever mixing two different VMs/ASIDs inside one active `qinfo`:
+    /// - RT/SCS compute (or any flight while RT/SCS compute is active) stays on pipe 0.
+    /// - If the command waits only on one pipe of its own VM, reuse that pipe (in-order ring,
+    ///   zero `c2c` barrier).
+    /// - If barrier-free (`waits` all `None`), `!heavy_compute`, and `queue` already has an active
     ///   compute flight on a single pipe with free units, keep that light queue pipe-affine so
     ///   consecutive horizon submits fold onto one workqueue without splitting across pipes.
-    /// - Otherwise (heavy compute streams, other queues, cross-VM compute, or waiting on both
-    ///   pipes `[Some, Some]`), pick the pipe with fewer active compute commands, breaking ties
-    ///   by `next_compute_pipe`.
+    /// - Otherwise, lease an idle pipe (preferring `vm`'s warm-affine `pipe_last_vm`, then never-
+    ///   used, then LRU, preferring secondary pipes `1..COMPUTE_PIPES` for fresh/LRU picks so
+    ///   pipe 0 stays free for base-only/SCS VMs) up to `MAX_VM_COMPUTE_PIPES` active pipes per
+    ///   VM, or pick `vm`'s active eligible pipe with fewest commands in flight.
+    /// - Returns `None` when every eligible pipe is currently active for another VM or has no
+    ///   available compute unit.
     fn choose_compute_pipe(
         &self,
         queue: &Arc<super::queue::QueueState>,
+        vm: &Arc<super::vm::VmState>,
         waits: [Option<WaitTarget>; sizes::COMPUTE_PIPES],
         slot_mask: u32,
         rt_compute: bool,
         heavy_compute: bool,
-    ) -> usize {
-        if rt_compute
-            || self
-                .engine
-                .flights
-                .iter()
-                .any(|fl| fl.computes != 0 && fl.rt_compute)
-            || !self.slots.compute_available_in_mask_for_pipe(slot_mask, 1)
-        {
-            return 0;
-        }
-        match waits {
-            [Some(_), None] => return 0,
-            [None, Some(_)] => return 1,
-            [None, None] if !heavy_compute => {
-                let mut q_pipe: Option<usize> = None;
-                for fl in &self.engine.flights {
-                    if fl.computes != 0 && Arc::ptr_eq(&fl.job.queue, queue) {
-                        let p = (fl.compute_pipe as usize).min(sizes::COMPUTE_PIPES - 1);
-                        match q_pipe {
-                            None => q_pipe = Some(p),
-                            Some(prev) if prev == p => {}
-                            Some(_) => {
-                                q_pipe = None;
-                                break;
-                            }
-                        }
-                    }
-                }
-                if let Some(p) = q_pipe {
-                    if self.slots.compute_available_in_mask_for_pipe(slot_mask, p) {
-                        return p;
-                    }
-                }
-            }
-            [None, None] | [Some(_), Some(_)] => {}
-        }
-        if !self.slots.compute_available_in_mask_for_pipe(slot_mask, 0) {
-            return 1;
-        }
-        let mut active = [0usize; sizes::COMPUTE_PIPES];
+    ) -> Option<usize> {
+        let mut active_same = [0usize; sizes::COMPUTE_PIPES];
+        let mut active_other = [false; sizes::COMPUTE_PIPES];
+        let mut any_rt = rt_compute;
         for fl in &self.engine.flights {
             if fl.computes != 0 {
                 let p = (fl.compute_pipe as usize).min(sizes::COMPUTE_PIPES - 1);
-                active[p] += fl.computes as usize;
+                if Arc::ptr_eq(&fl.job.vm, vm) {
+                    active_same[p] += fl.computes as usize;
+                } else {
+                    active_other[p] = true;
+                }
+                any_rt |= fl.rt_compute;
             }
         }
-        if active[0] < active[1] {
-            0
-        } else if active[1] < active[0] {
-            1
-        } else {
-            (self.engine.next_compute_pipe as usize) % sizes::COMPUTE_PIPES
+        let avoid = self.engine.handoff_avoid_pipes;
+        let vm_active_pipes = active_same.iter().filter(|&&n| n != 0).count();
+        let pipe_ok = |p: usize| -> bool {
+            (avoid & (1u32 << p)) == 0
+                && !active_other[p]
+                && (active_same[p] != 0 || vm_active_pipes < sizes::MAX_VM_COMPUTE_PIPES)
+                && self.slots.compute_available_in_mask_for_pipe(slot_mask, p)
+        };
+        if any_rt {
+            return pipe_ok(0).then_some(0);
         }
+        let mut wait_pipe: Option<usize> = None;
+        let mut wait_count = 0usize;
+        for (p, w) in waits.iter().enumerate() {
+            if w.is_some() {
+                wait_pipe = Some(p);
+                wait_count += 1;
+            }
+        }
+        if wait_count == 1 {
+            if let Some(p) = wait_pipe {
+                if pipe_ok(p) {
+                    return Some(p);
+                }
+            }
+        }
+        if wait_count == 0 && !heavy_compute {
+            let mut q_pipe: Option<usize> = None;
+            for fl in &self.engine.flights {
+                if fl.computes != 0 && Arc::ptr_eq(&fl.job.queue, queue) {
+                    let p = (fl.compute_pipe as usize).min(sizes::COMPUTE_PIPES - 1);
+                    match q_pipe {
+                        None => q_pipe = Some(p),
+                        Some(prev) if prev == p => {}
+                        Some(_) => {
+                            q_pipe = None;
+                            break;
+                        }
+                    }
+                }
+            }
+            if let Some(p) = q_pipe {
+                if pipe_ok(p) {
+                    return Some(p);
+                }
+            }
+        }
+        let pick_idle = |prefer_secondary: bool| -> Option<usize> {
+            // 1. Warm VM-affine idle pipe (keeps the same VM on the same `qinfo`).
+            for p in 0..sizes::COMPUTE_PIPES {
+                if active_same[p] == 0
+                    && pipe_ok(p)
+                    && self.engine.pipe_last_vm[p] == Some(vm.id)
+                {
+                    return Some(p);
+                }
+            }
+            // 2. Never-used idle pipe, preferring secondary pipes for extension-capable VMs so
+            //    pipe 0 remains immediately available to base-only and SCS VMs.
+            let mut order = [0usize; sizes::COMPUTE_PIPES];
+            if prefer_secondary {
+                for i in 0..(sizes::COMPUTE_PIPES - 1) {
+                    order[i] = i + 1;
+                }
+                order[sizes::COMPUTE_PIPES - 1] = 0;
+            } else {
+                for (i, slot) in order.iter_mut().enumerate() {
+                    *slot = i;
+                }
+            }
+            for &p in &order {
+                if active_same[p] == 0 && pipe_ok(p) && self.engine.pipe_last_vm[p].is_none() {
+                    return Some(p);
+                }
+            }
+            // 3. Least-recently-used idle pipe, preferring secondary pipes when `prefer_secondary`
+            //    is set so pipe 0 remains available to base-only and SCS VMs.
+            if prefer_secondary {
+                let mut best_sec: Option<(usize, u64)> = None;
+                for p in 1..sizes::COMPUTE_PIPES {
+                    if active_same[p] == 0 && pipe_ok(p) {
+                        let used = self.engine.pipe_last_used[p];
+                        if best_sec.is_none_or(|(_, prev)| used < prev) {
+                            best_sec = Some((p, used));
+                        }
+                    }
+                }
+                if let Some((p, _)) = best_sec {
+                    return Some(p);
+                }
+                if active_same[0] == 0 && pipe_ok(0) {
+                    return Some(0);
+                }
+            } else {
+                let mut best: Option<(usize, u64)> = None;
+                for p in 0..sizes::COMPUTE_PIPES {
+                    if active_same[p] == 0 && pipe_ok(p) {
+                        let used = self.engine.pipe_last_used[p];
+                        if best.is_none_or(|(_, prev)| used < prev) {
+                            best = Some((p, used));
+                        }
+                    }
+                }
+                if let Some((p, _)) = best {
+                    return Some(p);
+                }
+            }
+            None
+        };
+        let has_secondary = (slot_mask & !((1u32 << sizes::PIPE1_COMPUTE_START) - 1)) != 0;
+        let prefer_secondary = has_secondary && active_other.iter().any(|&a| a);
+        if vm_active_pipes < sizes::MAX_VM_COMPUTE_PIPES {
+            if let Some(p) = pick_idle(prefer_secondary) {
+                return Some(p);
+            }
+        }
+        // Reuse this VM's least-loaded eligible active pipe, breaking ties by `next_compute_pipe`.
+        let start = (self.engine.next_compute_pipe as usize) % sizes::COMPUTE_PIPES;
+        let mut best: Option<(usize, usize)> = None;
+        for i in 0..sizes::COMPUTE_PIPES {
+            let p = (start + i) % sizes::COMPUTE_PIPES;
+            if active_same[p] != 0 && pipe_ok(p) {
+                let load = active_same[p];
+                if best.is_none_or(|(_, prev)| load < prev) {
+                    best = Some((p, load));
+                }
+            }
+        }
+        best.map(|(p, _)| p)
     }
 
     /// Whether some of `job`'s commands were published: such a job is retained after a
@@ -2518,11 +2784,18 @@ impl Firmware {
                     .and_then(|o| o.wait_through[super::command::COMPUTE]),
             )?;
             let heavy = self.compute_queue_is_heavy(&job.queue, now_ns());
-            (
-                self.choose_compute_pipe(&job.queue, waits, slot_mask, rt_compute, heavy),
+            let Some(pipe) = self.choose_compute_pipe(
+                &job.queue,
+                &job.vm,
                 waits,
+                slot_mask,
+                rt_compute,
                 heavy,
-            )
+            ) else {
+                self.engine.slot_wait = true;
+                return Err(EAGAIN);
+            };
+            (pipe, waits, heavy)
         };
         let pipe_behind = !render
             && self
@@ -2530,13 +2803,27 @@ impl Firmware {
                 .flights
                 .iter()
                 .any(|fl| fl.computes != 0 && fl.compute_pipe as usize == compute_pipe);
+        if !render && class_behind {
+            self.latch_compute_channel_receipts()?;
+        }
         for &channel in channels {
             let pipe = self.channels.channel(channel);
             let producer = self.channels.producer(channel);
             let busy = if class_behind {
-                // Behind in-flight commands on this class: post after their unconsumed records.
+                // Behind in-flight commands on this class: post after their unconsumed records
+                // and never lap an unsettled compute flight's shared submit-channel record.
+                let wrap_bound = channel == Channel::Compute
+                    && self.engine.flights.iter().any(|fl| {
+                        fl.computes != 0
+                            && !fl.chan_settled
+                            && producer
+                                .wrapping_sub((fl.rec[2] + RING_SLOTS - 1) % RING_SLOTS)
+                                % RING_SLOTS
+                                >= RING_SLOTS - 2
+                    });
                 pipe.write()? != producer
                     || producer.wrapping_sub(pipe.read()?) % RING_SLOTS >= sizes::AHEAD_RECORDS
+                    || wrap_bound
             } else {
                 pipe.read()? != producer
                     || pipe.completion()? != producer
@@ -2598,10 +2885,12 @@ impl Firmware {
                 return Err(EAGAIN);
             }
         } else if !render && pipe_behind {
-            // Room for optional fs2c + cross-pipe c2c barriers plus compute work entry.
+            // Room for optional fs2c + up to COMPUTE_PIPES-1 cross-pipe barriers + compute work.
+            let min_free = 2 + sizes::COMPUTE_PIPES as u32;
             c_read = self.graph.compute[compute_pipe].qstate.r32(qstate::READ)?;
             if c_read >= 256
-                || prefix.c_head.wrapping_sub(c_read) % sizes::QUEUE_CAP >= sizes::QUEUE_CAP - 4
+                || prefix.c_head.wrapping_sub(c_read) % sizes::QUEUE_CAP
+                    >= sizes::QUEUE_CAP - min_free
             {
                 self.engine.slot_wait = true;
                 return Err(EAGAIN);
@@ -2639,16 +2928,22 @@ impl Firmware {
                         active_pipe[p] += fl.computes as usize;
                     }
                 }
-                let active_computes = active_pipe[0] + active_pipe[1];
-                // Keep heavy barrier-free compute balanced across both CDM pipes while light
+                let active_computes: usize = active_pipe.iter().sum();
+                // Keep heavy barrier-free compute balanced across this VM's CDM pipes while light
                 // single-queue compute streams stay pipe-affine and fold freely into one batch.
                 let pipe_fold_cap = if heavy_compute && c_waits == [None; sizes::COMPUTE_PIPES] {
-                    active_pipe[1 - compute_pipe].saturating_sub(active_pipe[compute_pipe] + 1)
+                    match self.other_vm_compute_pipe_load(&job.vm, compute_pipe, slot_mask) {
+                        Some(other_load) => {
+                            other_load.saturating_sub(active_pipe[compute_pipe] + 1)
+                        }
+                        None => usize::MAX,
+                    }
                 } else {
                     usize::MAX
                 };
                 let used = prefix.c_head.wrapping_sub(c_read) % sizes::QUEUE_CAP;
-                let ring_more = (sizes::QUEUE_CAP.saturating_sub(4)).saturating_sub(used) as usize;
+                let ring_more = (sizes::QUEUE_CAP.saturating_sub(2 + sizes::COMPUTE_PIPES as u32))
+                    .saturating_sub(used) as usize;
                 let mut more_slots = free_c
                     .min(params::compute_flights().saturating_sub(active_computes + 1))
                     .min(sizes::COMPUTE_SLOTS.saturating_sub(1))
@@ -3232,20 +3527,23 @@ impl Firmware {
             self.engine.target[compute_pipe] = f.target;
             self.engine.head[compute_pipe] = f.head;
             self.engine.queue_registered[compute_pipe] = true;
-            self.engine.next_compute_pipe = (compute_pipe as u8) ^ 1;
+            self.engine.pipe_use_seq = self.engine.pipe_use_seq.wrapping_add(1);
+            self.engine.pipe_last_vm[compute_pipe] = Some(job.vm.id);
+            self.engine.pipe_last_used[compute_pipe] = self.engine.pipe_use_seq;
+            self.engine.next_compute_pipe = ((compute_pipe + 1) % sizes::COMPUTE_PIPES) as u8;
         }
         self.engine.events = self.events.compute_events;
         self.engine.stage_seen = self.events.stage_events;
         f.behind = behind;
         self.stat_publish(f);
-        if !class_behind {
-            // First in-flight command on this class starts about now; commands queued behind
-            // their own class keep that class's oldest deadline without renewing the other.
-            if render {
+        // First in-flight command on this render class or compute pipe starts about now;
+        // commands queued behind the same class/pipe keep its oldest deadline.
+        if render {
+            if !class_behind {
                 self.renew_render_deadline();
-            } else {
-                self.renew_compute_deadline();
             }
+        } else if !pipe_behind {
+            self.renew_compute_pipe_deadline(compute_pipe);
         }
         job.progress.set_sent(end);
         for k in index..end {
@@ -3315,7 +3613,6 @@ impl Firmware {
             return Err(EAGAIN);
         }
         let pipe = pf.compute_pipe;
-        let other = 1 - pipe;
         let n = super::recovery::logic::next_ordinal(pf.n).ok_or(EOVERFLOW)?;
         let pipe_n = super::recovery::logic::next_ordinal(pf.pipe_n).ok_or(EOVERFLOW)?;
         let target = encode::stamp(pipe_n);
@@ -3434,22 +3731,28 @@ impl Firmware {
         } else {
             None
         };
-        let c2c_bar = if let Some(wait_c) = c_waits[other] {
-            let producer_initbm = wait_c.initbm || self.engine.flights.iter().any(|fl| fl.initbm);
-            let bar_type = cross_engine_barrier_type(producer_initbm, false);
-            let bar = encode::barrier(
-                self.graph.compute[other].fw_stamp.va,
-                wait_c.stamp,
-                work::compute::EVENTS[other],
-                target,
-                0,
-                bar_type,
-            );
-            s.barrier.write(work::barrier::SIZE, &bar)?;
-            true
-        } else {
-            false
-        };
+        let mut c2c_mask = 0u32;
+        for (p_idx, wait_opt) in c_waits.iter().enumerate() {
+            if p_idx == pipe {
+                continue;
+            }
+            if let Some(wait_c) = *wait_opt {
+                let producer_initbm =
+                    wait_c.initbm || self.engine.flights.iter().any(|fl| fl.initbm);
+                let bar_type = cross_engine_barrier_type(producer_initbm, false);
+                let bar = encode::barrier(
+                    self.graph.compute[p_idx].fw_stamp.va,
+                    wait_c.stamp,
+                    work::compute::EVENTS[p_idx],
+                    target,
+                    0,
+                    bar_type,
+                );
+                let off = (1 + p_idx) * work::barrier::SIZE;
+                s.barrier.write(off, &bar)?;
+                c2c_mask |= 1u32 << p_idx;
+            }
+        }
         f.uma_submitted = submitted;
         f.csubmitted[member] = submitted;
         f.has_timestamps |= !cmd.timestamp_outputs.is_empty();
@@ -3465,10 +3768,13 @@ impl Firmware {
         } else {
             f.cwait[member] = 0;
         }
-        if c2c_bar {
+        let mut rem = c2c_mask;
+        while rem != 0 {
+            let p_idx = rem.trailing_zeros() as usize;
+            rem &= rem - 1;
             g.ring.w64(
                 8 * pf.c_head as usize,
-                s.barrier.va + work::barrier::SIZE as u64,
+                s.barrier.va + ((1 + p_idx) * work::barrier::SIZE) as u64,
             )?;
             pf.c_head = (pf.c_head + 1) % sizes::QUEUE_CAP;
         }

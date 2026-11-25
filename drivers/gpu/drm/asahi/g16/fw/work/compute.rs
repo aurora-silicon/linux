@@ -43,7 +43,17 @@ pub(crate) const PAGE_LIST_SIZE: usize = 0x4000;
 pub(crate) const START_SCS: usize = 0x40;
 pub(crate) const EVENT: u32 = 15;
 /// Firmware completion events for concurrent compute pipes `0..COMPUTE_PIPES`.
-pub(crate) const EVENTS: [u32; 2] = [EVENT, 16];
+/// All events reside in type-1 event word 1 (`15..32`) so event draining reads only words 1 and 4.
+pub(crate) const EVENTS: [u32; 8] = [EVENT, 16, 17, 18, 19, 20, 21, 22];
+
+/// Resolves a firmware compute completion event back to its compute pipe index (`0..EVENTS.len()`).
+pub(crate) const fn pipe_of_event(event: u32) -> Option<usize> {
+    if event >= EVENT && (event - EVENT) < EVENTS.len() as u32 {
+        Some((event - EVENT) as usize)
+    } else {
+        None
+    }
+}
 /// The binding generation.
 pub(crate) const GENERATION: usize = 0x88b;
 

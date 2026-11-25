@@ -748,7 +748,19 @@ pub(crate) mod sizes {
     pub(crate) const FREELIST_SEED: u32 = 8192;
     pub(crate) const QUEUE_CAP: u32 = 256;
     /// Independent firmware compute workqueue pipes sharing `Channel::Compute` and `sched_ctx`.
-    pub(crate) const COMPUTE_PIPES: usize = 2;
+    /// Each pipe owns a disjoint `ComputeGraph` (`qinfo`, work ring, `qstate`, `fw_stamp`,
+    /// `notifier`, `threshold`, `job_list`) and completion event (`work::compute::EVENTS`) so
+    /// concurrent compute VMs lease disjoint workqueues instead of mixing ASIDs in one active
+    /// `qinfo`. Pipe 0 exclusively owns `0..PIPE1_COMPUTE_START` for base-only and SCS VMs;
+    /// secondary pipes `1..COMPUTE_PIPES` share `PIPE1_COMPUTE_START..COMPUTE_UNITS` (18 units
+    /// for 7 secondary pipes, leaving 11 active units beyond the 7 undisplaced retired leases).
+    pub(crate) const COMPUTE_PIPES: usize = 8;
+    /// Maximum concurrent compute pipes one VM may occupy at once, preserving the render
+    /// ring-entry bound (`MAX_RENDER_RING_ENTRIES = 5`) since cross-VM render/compute drains.
+    pub(crate) const MAX_VM_COMPUTE_PIPES: usize = 2;
+    const _: () = assert!(COMPUTE_PIPES >= 2 && COMPUTE_PIPES <= 16);
+    const _: () = assert!(MAX_VM_COMPUTE_PIPES >= 2 && MAX_VM_COMPUTE_PIPES <= COMPUTE_PIPES);
+    const _: () = assert!(COMPUTE_UNITS - PIPE1_COMPUTE_START >= (COMPUTE_PIPES - 1) * 2);
     /// Compute units claimable in one batched compute prefix (matches `COMPUTE_UNITS`).
     pub(crate) const COMPUTE_SLOTS: usize = COMPUTE_UNITS;
     /// Base physical PB/UMA allocator slots allocated per VM on first render.
