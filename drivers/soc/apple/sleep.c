@@ -1097,6 +1097,8 @@ struct apple_sleep {
 	unsigned int perf_dcs_from;
 	/* With radio_retrain: the radio's PCIe host, and its port's blocks and tables */
 	struct device_node *radio_host_np;
+	/* apple,pcie-host: the general-purpose PCIe host, under gp_host_apart */
+	struct device_node *gp_host_np;
 	void __iomem *radio_port;
 	void __iomem *radio_lane;
 	void __iomem *radio_cfg;
@@ -3492,6 +3494,21 @@ static bool apple_sleep_refuse_ans_gp(struct apple_sleep *s, bool idled)
 	if (sleep_ps_on(s, d->apcie_sys_gp)) {
 		dev_err(s->dev, "refused: the PCIe host on APCIE_SYS_GP is on with no driver to stop it\n");
 		refused = true;
+	}
+	/*
+	 * Bound, it refuses whatever its domain reads at this moment: the host comes back cold
+	 * after a real sleep (the t5 trace), and no driver of it restores that yet.
+	 */
+	if (s->gp_host_np) {
+		struct platform_device *host = of_find_device_by_node(s->gp_host_np);
+
+		if (host && READ_ONCE(host->dev.driver)) {
+			dev_err(s->dev, "refused: %s is bound to the PCIe host on APCIE_SYS_GP, with no qualified stop\n",
+				dev_name(&host->dev));
+			refused = true;
+		}
+		if (host)
+			put_device(&host->dev);
 	}
 	return refused;
 }
@@ -8574,6 +8591,12 @@ static int apple_sleep_probe(struct platform_device *pdev)
 		s->radio_host_np = of_parse_phandle(dev->of_node, "apple,radio-host", 0);
 		if (s->radio_host_np &&
 		    devm_add_action_or_reset(dev, apple_sleep_put_node, s->radio_host_np))
+			return -ENOMEM;
+	}
+	if (s->soc->gp_host_apart) {
+		s->gp_host_np = of_parse_phandle(dev->of_node, "apple,pcie-host", 0);
+		if (s->gp_host_np &&
+		    devm_add_action_or_reset(dev, apple_sleep_put_node, s->gp_host_np))
 			return -ENOMEM;
 	}
 	apple_sleep_map_pins(s);
