@@ -131,6 +131,19 @@ properties:
               whose connector already has as many mode-switch providers as
               the Type-C class allows can still offer another tunnel
               pipeline.
+          apple,connector-group:
+            $ref: /schemas/types.yaml#/definitions/uint32
+            minimum: 0
+            maximum: 3
+            default: 0
+            description: |
+              The order group of the route's display connector.
+              Connectors are created group by group, and in a group the
+              tunnel-only routes' after the others on SoCs that give every
+              port/pipeline pair a connector of its own (T6050). A port
+              added to a board gets the next group, so the connectors that
+              already exist keep their names. All routes to one port
+              should have the same group.
           port:
             $ref: /schemas/graph.yaml#/properties/port
         required:
@@ -168,8 +181,18 @@ examples:
   - |
     #include <dt-bindings/phy/phy.h>
 
-    dcp {
+    dcp@8dc00000 {
         compatible = "apple,t6020-dcpext", "apple,dcpext";
+        reg = <0x8dc00000 0x4000>,
+              <0x8c000000 0x4000000>,
+              <0x8d320000 0x4000>,
+              <0x8d344000 0x4000>,
+              <0x8d800000 0x800000>;
+        reg-names = "coproc", "disp-0", "disp-1", "disp-2", "disp-3";
+        mboxes = <&dcpext_mbox>;
+        mbox-names = "mbox";
+        iommus = <&dcpext_dart 5>;
+        apple,bw-scratch = <&pmgr_dcp 0 4 0x1220>;
         phys = <&atcphy0 PHY_TYPE_DP>;
         phy-names = "typec0";
         mux-controls = <&atcphy0_xbar 0>, <&atcphy0_xbar 1>,

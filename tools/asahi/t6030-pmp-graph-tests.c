@@ -471,17 +471,6 @@ static bool of_machine_is_compatible(const char *s)
 {
 	return !strcmp(s, "apple,t6030");
 }
-/* As in <linux/soc/apple/t8132.h>. */
-static inline bool apple_t8132_air(void)
-{
-	return of_machine_is_compatible("apple,j713") ||
-	       of_machine_is_compatible("apple,j715");
-}
-/* The qualified-firmware term: these harnesses model no /chosen. */
-static inline bool apple_t8132_firmware_path(void)
-{
-	return apple_t8132_air();
-}
 static bool of_property_read_bool(const struct device_node *n, const char *p)
 {
 	if (!strcmp(p, "apple,always-on"))
@@ -763,8 +752,8 @@ static int apple_pmp_native_records(struct apple_pmp_report *rep)
  * never matches, and the call does nothing. */
 static const struct apple_pmp_report_offsets apple_pmp_offsets_t600x;
 static void apple_pmp_agx_activity_resume(void) {}
-/* Floor admission is covered independently by the J613 fixture. */
-static int j613_floor_probe(struct apple_pmp_report *rep)
+/* Floor admission is covered independently by the pmp-floor fixture. */
+static int pmp_floor_probe(struct apple_pmp_report *rep)
 {
 	(void)rep;
 	return 0;
