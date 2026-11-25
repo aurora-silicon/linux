@@ -377,7 +377,7 @@ struct apple_dcp_hw_data {
 	bool v27_sleep_recovery;
 	/* Required with @s2r */
 	const struct dcp_s2r_layout *s2r_layout;
-	/* @s2r with derived power words: off unless appledrm.s2r_untested is set */
+	/* @s2r with derived power words: firmware 27.0 only, off with appledrm.s2r_untested=0 */
 	bool s2r_untested;
 	/*
 	 * @s2r without a secure mailbox: the SoC's ADT has no dcp-exclave-mailbox (T8142, on
