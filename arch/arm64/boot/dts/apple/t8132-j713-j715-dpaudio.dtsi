@@ -80,3 +80,12 @@
 		};
 	};
 };
+
+/* t8132-j713-pmgr.dtsi disables both; the parent, ps_dpa_p, is on for the SIO. */
+&ps_dpa1 {
+	status = "okay";
+};
+
+&ps_dpa2 {
+	status = "okay";
+};
