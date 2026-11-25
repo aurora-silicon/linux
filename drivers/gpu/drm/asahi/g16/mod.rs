@@ -206,6 +206,33 @@ const WAIT_HINT_GAP_NS: u64 = 4_000_000;
 const WAIT_HINT_STREAK_ON: u32 = 8;
 const WAIT_HINT_LINGER_NS: u64 = 8_000_000;
 
+/// A firmware session retained until reboot after a failed boot or backend start.
+pub(crate) enum Retained {
+    Orphan(KBox<boot::Orphan>),
+    Booted(KBox<boot::Booted>),
+    Firmware(KBox<Firmware>),
+}
+
+impl Retained {
+    fn drain(&mut self) -> Result {
+        match self {
+            Self::Orphan(orphan) => orphan.drain(),
+            Self::Booted(booted) => {
+                let booted = &mut **booted;
+                booted
+                    .channels
+                    .drain_rings(&booted.session.dev, &mut booted.events)
+            }
+            Self::Firmware(firmware) => {
+                let firmware = &mut **firmware;
+                firmware
+                    .channels
+                    .drain_rings(&firmware.session.dev, &mut firmware.events)
+            }
+        }
+    }
+}
+
 /// Device state shared with the RTKit callbacks and the poll work.
 #[pin_data]
 pub(crate) struct Shared {
@@ -223,6 +250,9 @@ pub(crate) struct Shared {
     /// Set by external state changes (VM teardown, unstarted queue cancellation) so the next
     /// `poll_step()` re-evaluates `publish_checked()` even while unrelated flights are active.
     pub(crate) publish_wake: AtomicBool,
+    /// Set on VM close (and re-armed while any non-quarantined slot still holds a closed VM)
+    /// so displaced closed-VM slot leases are reclaimed without scanning on the hot path.
+    pub(crate) closed_vm_reclaim: AtomicBool,
     /// CPU that last submitted work, for placing the per-CPU completion worker.
     pub(crate) submitter: AtomicU32,
     /// CPU whose cluster currently restricts `events_unbound` (`u32::MAX` before first pin).
@@ -265,8 +295,12 @@ pub(crate) struct Shared {
     pub(crate) base_compute_quarantined: AtomicBool,
     /// Whether any base render pass slot (`0..BASE_RENDER_SLOTS`) has been quarantined.
     pub(crate) base_render_quarantined: AtomicBool,
-    /// Contiguous PB/UMA allocator slots (`BASE_PB_SLOTS..=PB_SLOTS`) needed across quarantines.
-    pub(crate) needed_pb_slots: AtomicU32,
+    /// Bitmask of permanently quarantined device-wide PB/UMA allocator slots (`0..PB_SLOTS`).
+    pub(crate) quarantined_pb_mask: AtomicU32,
+    /// Round-robin cursor assigning each rendering VM a `[home, alt]` pair in `0..WARM_PB_SLOTS`.
+    pub(crate) next_pb_slot: AtomicU32,
+    /// Live open VMs that own a `RenderArena`, used to size multi-VM pass-slot headroom.
+    pub(crate) active_render_vms: Arc<AtomicU32>,
     /// The GFX power state word from before a system sleep.
     sleep_ps: AtomicU32,
     /// The stop left to a system sleep's commit, until `.complete` finishes it.
@@ -282,7 +316,7 @@ pub(crate) struct Shared {
     /// Dedicated unbound workqueue for cpufreq `FREQ_QOS_MIN` updates outside `Shared::state`.
     pub(crate) feed_wq: OwnedQueue,
     #[pin]
-    pub(crate) orphan: Mutex<Option<KBox<boot::Orphan>>>,
+    pub(crate) orphan: Mutex<Option<Retained>>,
     #[pin]
     pub(crate) poll: DelayedWork<Shared, POLL_WORK>,
     #[pin]
@@ -290,7 +324,7 @@ pub(crate) struct Shared {
     #[pin]
     pub(crate) fast_poll_unbound: Work<Shared, UNBOUND_POLL_WORK>,
     #[pin]
-    pub(crate) scrub_queue: SpinLock<slots::ScrubQueue>,
+    pub(crate) scrub_queue: SpinLock<KBox<slots::ScrubQueue>>,
     #[pin]
     pub(crate) scrub_work: Work<Shared, SCRUB_WORK>,
     #[pin]
@@ -499,36 +533,26 @@ impl Shared {
 
     /// Keeps a firmware session that did not complete until reboot; its receive rings stay
     /// drained by the poll work.
-    pub(crate) fn orphan(&self, orphan: boot::Orphan) {
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn retain_failed(&self, retained: Retained) {
         let mut slot = self.orphan.lock();
         if slot.is_some() {
             // Never replace and drop an already firmware-reachable session.
-            core::mem::forget(orphan);
+            core::mem::forget(retained);
             dev_err!(
                 self.dev.as_ref(),
                 "G16: additional failed session retained without drain\n"
             );
             return;
         }
-        match KBox::<boot::Orphan>::new_uninit(GFP_KERNEL) {
-            Ok(storage) => {
-                *slot = Some(KBox::write(storage, orphan));
-                self.orphaned.store(true, Ordering::Release);
-            }
-            // Without memory for the box, leak the parts as they are.
-            Err(_) => {
-                core::mem::forget(orphan);
-                dev_err!(
-                    self.dev.as_ref(),
-                    "G16: cannot keep the failed session; leaked\n"
-                );
-            }
-        }
+        *slot = Some(retained);
+        self.orphaned.store(true, Ordering::Release);
     }
 
     /// Drains the receive rings of an orphaned session.
     fn drain_orphan(&self) {
-        if let Some(orphan) = self.orphan.lock().as_deref_mut() {
+        if let Some(orphan) = &mut *self.orphan.lock() {
             let _ = orphan.drain();
         }
     }
@@ -562,7 +586,7 @@ pub(crate) struct Firmware {
     /// PMP thermal vote and firmware DVFS ceiling state.
     pub(crate) power: power::Power,
     /// Render UMA/PB allocators, their spare set and parameter-buffer growth.
-    pub(crate) pools: pools::Pools,
+    pub(crate) pools: KBox<pools::Pools>,
     /// Live VMs and their exclusive TTBAT slots, and the client aliases of every user VM.
     pub(crate) vms: Arc<vm::Registry>,
     /// Monotonic timestamp (ns) of the last full housekeeping pass (power, health, hang poll).
@@ -591,6 +615,7 @@ impl Gpu {
     /// Admits and boots a G16 GPU: identity checks, PMP AGX vote, RTKit, UAT handoff, initdata,
     /// READY, then the compute and render graphs. On success the module is pinned: the
     /// firmware session lasts until reboot.
+    #[inline(never)]
     pub(crate) fn new(
         pdev: &platform::Device<Core<'_>>,
         dev: &AsahiDrmDevice,
@@ -610,6 +635,8 @@ impl Gpu {
         let scrub_wq = OwnedQueue::new_unbound_reclaim(c_str!("aurora_g16_scrub"), false)?;
         let feed = feed::Feed::new()?;
         let feed_wq = OwnedQueue::new_unbound_reclaim(c_str!("aurora_g16_feed"), false)?;
+        let scrub_queue = slots::ScrubQueue::new_boxed()?;
+        let active_render_vms = Arc::new(AtomicU32::new(0), GFP_KERNEL)?;
         let shared = Arc::pin_init(
             pin_init!(Shared {
                 dev: dev.as_ref().as_ref().into(),
@@ -619,6 +646,7 @@ impl Gpu {
                 crashed: AtomicBool::new(false),
                 evented: AtomicBool::new(false),
                 publish_wake: AtomicBool::new(false),
+                closed_vm_reclaim: AtomicBool::new(false),
                 submitter: AtomicU32::new(u32::MAX),
                 unbound_cluster_cpu: AtomicU32::new(u32::MAX),
                 unbound_pinning: AtomicBool::new(false),
@@ -638,7 +666,9 @@ impl Gpu {
                 recovering: AtomicBool::new(false),
                 base_compute_quarantined: AtomicBool::new(false),
                 base_render_quarantined: AtomicBool::new(false),
-                needed_pb_slots: AtomicU32::new(hw::sizes::BASE_PB_SLOTS as u32),
+                quarantined_pb_mask: AtomicU32::new(0),
+                next_pb_slot: AtomicU32::new(0),
+                active_render_vms,
                 sleep_ps: AtomicU32::new(0),
                 sleep_commit: AtomicPtr::new(core::ptr::null_mut()),
                 events,
@@ -650,7 +680,7 @@ impl Gpu {
                 poll <- new_delayed_work!("g16::Shared::poll"),
                 fast_poll <- new_work!("g16::Shared::fast_poll"),
                 fast_poll_unbound <- new_work!("g16::Shared::fast_poll_unbound"),
-                scrub_queue <- new_spinlock!(slots::ScrubQueue::new(), "g16::Shared::scrub_queue"),
+                scrub_queue <- new_spinlock!(scrub_queue, "g16::Shared::scrub_queue"),
                 scrub_work <- new_work!("g16::Shared::scrub_work"),
                 feed_work <- new_work!("g16::Shared::feed_work"),
                 resnap <- HrTimer::new(),
@@ -705,48 +735,19 @@ impl Firmware {
     #[inline(never)]
     fn start_backend(
         dev: &AsahiDrmDevice,
-        booted: boot::Booted,
+        mut booted: KBox<boot::Booted>,
         shared: &Arc<Shared>,
         mut power: power::Power,
     ) -> Result<KBox<Firmware>> {
-        let boot::Booted {
-            session,
-            init,
-            mut objects,
-            channels,
-            events,
-            ..
-        } = booted;
         dev_info!(
             dev.as_ref(),
             "G16: firmware at READY, starting the backend\n"
         );
-        power.set_table(init.rows);
-        let orphan = |session: boot::Session,
-                      objects: object::Objects,
-                      channels: channel::Channels,
-                      init: initdata::InitData,
-                      events: event::Events,
-                      error: Error|
-         -> Error {
-            dev_err!(
-                dev.as_ref(),
-                "G16: backend start failed ({:?}); firmware retained at READY until reboot\n",
-                error
-            );
-            shared.orphan(boot::Orphan {
-                session,
-                _objects: objects,
-                channels: Some(channels),
-                _init: Some(init),
-                events,
-            });
-            error
-        };
+        power.set_table(booted.init.rows);
         let backend = (|| -> Result<_> {
-            let graph = graph::Graphs::new(dev, &mut objects)?;
+            let graph = graph::Graphs::new(dev, &mut booted.objects)?;
             let slots = slots::Slots::new()?;
-            let pools = pools::Pools::new(dev);
+            let pools = pools::Pools::new_boxed(dev)?;
             let vms = vm::Registry::new()?;
             let engine = engine::Engine::new()?;
             let slot = KBox::<Firmware>::new_uninit(GFP_KERNEL)?;
@@ -754,14 +755,30 @@ impl Firmware {
         })();
         let (graph, slots, pools, vms, engine, slot) = match backend {
             Ok(backend) => backend,
-            Err(e) => return Err(orphan(session, objects, channels, init, events, e)),
+            Err(error) => {
+                dev_err!(
+                    dev.as_ref(),
+                    "G16: backend start failed ({:?}); firmware retained at READY until reboot\n",
+                    error
+                );
+                shared.retain_failed(Retained::Booted(booted));
+                return Err(error);
+            }
         };
-        let mut firmware = KBox::write(
-            slot,
-            Firmware {
+        let boot::Booted {
+            session,
+            init,
+            mut objects,
+            channels,
+            events,
+            ..
+        } = KBox::into_inner(booted);
+        let private_factory = objects.private_factory();
+        let mut firmware = slot
+            .write_init(init!(Firmware {
                 session,
                 init,
-                private_factory: objects.private_factory(),
+                private_factory,
                 objects,
                 channels,
                 events,
@@ -774,18 +791,16 @@ impl Firmware {
                 vms,
                 last_housekeeping_ns: 0,
                 last_aux_drain_ns: 0,
-            },
-        );
-        if let Err(e) = firmware.init_graphs() {
-            let Firmware {
-                session,
-                init,
-                objects,
-                channels,
-                events,
-                ..
-            } = KBox::into_inner(firmware);
-            return Err(orphan(session, objects, channels, init, events, e));
+            }))
+            .unwrap_or_else(|e| match e {});
+        if let Err(error) = firmware.init_graphs() {
+            dev_err!(
+                dev.as_ref(),
+                "G16: backend start failed ({:?}); firmware retained at READY until reboot\n",
+                error
+            );
+            shared.retain_failed(Retained::Firmware(firmware));
+            return Err(error);
         }
         Ok(firmware)
     }
@@ -882,6 +897,7 @@ impl gpu::Gpu for Gpu {
     }
     fn vm_closed(&self, vm: &mmu::Vm) {
         self.vms.close(vm.id());
+        self.shared.closed_vm_reclaim.store(true, Ordering::Release);
         self.shared.wake_publish();
     }
 

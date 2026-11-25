@@ -101,6 +101,15 @@ impl QueueState {
         Ok(())
     }
 
+    /// Whether any accepted ordinal of `engine` at or before `seq` was cancelled.
+    pub(crate) fn cancelled_through(&self, engine: usize, seq: u64) -> Result {
+        let first = self.cancelled_at[engine].load(Ordering::Acquire);
+        if first != 0 && first <= seq {
+            return Err(ECANCELED);
+        }
+        Ok(())
+    }
+
     /// Whether compute ordinal `seq` already has a full successful firmware receipt, either
     /// at or below the contiguous `completed[COMPUTE]` frontier or recorded in `compute_ooo`.
     pub(crate) fn is_compute_retired(&self, seq: u64) -> bool {
@@ -198,7 +207,7 @@ impl Queue {
             },
             GFP_KERNEL,
         )?;
-        let proof = KBox::new(command::SpanProof::new(), GFP_KERNEL)?;
+        let proof = command::SpanProof::new_boxed()?;
         Ok(Self {
             scheduler,
             state,
@@ -256,7 +265,9 @@ impl Queue {
         let hints = super::resources::PrepareHints {
             expand_compute_ext: self.shared.base_compute_quarantined.load(Ordering::Acquire),
             expand_render_ext: self.shared.base_render_quarantined.load(Ordering::Acquire),
-            pb_slots: self.shared.needed_pb_slots.load(Ordering::Acquire) as usize,
+            quarantined_pb_mask: self.shared.quarantined_pb_mask.load(Ordering::Acquire),
+            next_pb_slot: &self.shared.next_pb_slot,
+            active_render_vms: &self.shared.active_render_vms,
         };
         let resources = self
             .vm
@@ -264,7 +275,25 @@ impl Queue {
             .as_ref()
             .ok_or(EIO)?
             .prepare(&self.vm, &submission.commands, hints)?;
-        let fence = self.timeline.next()?;
+        let gpu_id = Arc::as_ptr(&self.shared) as usize;
+        // Record cumulative queue ordinals across both engines so coalescing multiple
+        // same-queue fences in a timeline semaphore chain to the latest fence preserves
+        // any earlier unretired render or compute command on that queue.
+        let total_render = self.accepted[command::RENDER] + submission.counts[command::RENDER];
+        let total_compute = self.accepted[command::COMPUTE] + submission.counts[command::COMPUTE];
+        let last_ordinal = [
+            (total_render != 0).then_some(total_render),
+            (total_compute != 0).then_some(total_compute),
+        ];
+        let origin = Arc::new(
+            super::fence::FenceOrigin::new(gpu_id, self.vm.id, self.state.clone(), last_ordinal),
+            GFP_KERNEL,
+        )?;
+        let (inputs, fw_waits) = match super::fence::resolve_fw_waits(&inputs, gpu_id, self.vm.id) {
+            Some(waits) => (InputFences::new(), waits),
+            None => (inputs, super::fence::FwWaits::Empty),
+        };
+        let fence = self.timeline.next(origin.clone())?;
         let job = Job::new(
             id,
             self.state.clone(),
@@ -275,6 +304,8 @@ impl Queue {
             fence,
             guard,
             inputs,
+            origin,
+            fw_waits,
         )?;
         let published = job.fence.fence();
         // Publish output syncs (including fallible cumulative scope allocation) before pushing

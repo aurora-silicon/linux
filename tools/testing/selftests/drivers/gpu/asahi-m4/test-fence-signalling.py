@@ -3,7 +3,9 @@
 """Exercise production DMA-fence lockdep guard and Timeline off-pending signalling."""
 from common import kernel_root, output_dir, rustc, sha
 import json
+import os
 import pathlib
+import shlex
 import subprocess
 import tempfile
 
@@ -91,6 +93,10 @@ timeline_complete_fn = extract_function(fence_source, 'complete')
 input_fences_src = fence_source[
     fence_source.index('/// Inline storage for the common 0-2 input fences'):
     fence_source.index('/// Reads a retained dependency')
+]
+fw_waits_src = fence_source[
+    fence_source.index('/// Maximum distinct cross-queue firmware waits'):
+    fence_source.index('/// Fence operations of G16 job fences.')
 ]
 syncs_src = fence_source[
     fence_source.index('/// The syncs of one SUBMIT.'):
@@ -417,9 +423,92 @@ mod cumulative_syncs_test {
         assert_eq!(log2.borrow().failed, vec![Fence(ENOMEM.0)]);
     }
 }
+
+mod fw_waits_test {
+    use super::{Error, Result, GFP_KERNEL};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    const E2BIG: Error = Error(-7);
+
+    pub(crate) struct QueueState(u32);
+
+    pub(crate) struct KVec<T>(Vec<T>);
+    impl<T> KVec<T> {
+        fn with_capacity(cap: usize, _flags: u32) -> Result<Self> {
+            Ok(Self(Vec::with_capacity(cap)))
+        }
+        fn push(&mut self, v: T, _flags: u32) -> Result {
+            self.0.push(v);
+            Ok(())
+        }
+        fn push_within_capacity(&mut self, v: T) -> std::result::Result<(), T> {
+            self.0.push(v);
+            Ok(())
+        }
+    }
+    impl<T> core::ops::Deref for KVec<T> {
+        type Target = [T];
+        fn deref(&self) -> &[T] { &self.0 }
+    }
+    impl<T> core::ops::DerefMut for KVec<T> {
+        fn deref_mut(&mut self) -> &mut [T] { &mut self.0 }
+    }
+
+    FW_WAITS_SRC
+
+    #[test]
+    fn fw_waits_coalesces_deep_two_queue_timeline_chain_and_merges_engines() {
+        let q0 = Arc::new(QueueState(0));
+        let q1 = Arc::new(QueueState(1));
+        let mut waits = FwWaits::Empty;
+        // 64 alternating timeline hops across 2 queues coalesce to 2 per-queue entries.
+        for hop in 1..=64u64 {
+            let (q, r, c) = if hop % 2 == 1 {
+                (q0.clone(), Some((hop + 1) / 2), Some(hop))
+            } else {
+                (q1.clone(), None, Some(hop / 2))
+            };
+            let origin = Arc::new(FenceOrigin::new(1, 7, q, [r, c]));
+            waits.push_unique(origin).unwrap();
+        }
+        assert_eq!(waits.len(), 2);
+        let w0 = waits.iter().find(|w| Arc::ptr_eq(&w.queue, &q0)).unwrap();
+        let w1 = waits.iter().find(|w| Arc::ptr_eq(&w.queue, &q1)).unwrap();
+        assert_eq!(w0.last_ordinal, [Some(32), Some(63)]);
+        assert_eq!(w1.last_ordinal, [None, Some(32)]);
+
+        // Merging an earlier render-only origin with a later compute-only origin on q1 keeps both.
+        waits
+            .push_unique(Arc::new(FenceOrigin::new(1, 7, q1.clone(), [Some(5), None])))
+            .unwrap();
+        let w1 = waits.iter().find(|w| Arc::ptr_eq(&w.queue, &q1)).unwrap();
+        assert_eq!(w1.last_ordinal, [Some(5), Some(32)]);
+    }
+
+    #[test]
+    fn fw_waits_caps_distinct_queues_at_max_fw_waits() {
+        let mut waits = FwWaits::Empty;
+        for idx in 0..MAX_FW_WAITS {
+            let q = Arc::new(QueueState(idx as u32));
+            let origin = Arc::new(FenceOrigin::new(1, 7, q, [None, Some(1)]));
+            waits.push_unique(origin).unwrap();
+        }
+        assert_eq!(waits.len(), MAX_FW_WAITS);
+        let extra = Arc::new(FenceOrigin::new(
+            1,
+            7,
+            Arc::new(QueueState(99)),
+            [None, Some(1)],
+        ));
+        assert_eq!(waits.push_unique(extra), Err(E2BIG));
+    }
+}
 '''.replace('SIGNAL_BATCH_LINE', signal_batch_line).replace(
     'TIMELINE_COMPLETE_FN', timeline_complete_fn
 ).replace('INPUT_FENCES_SRC', input_fences_src).replace(
+    'FW_WAITS_SRC', fw_waits_src
+).replace(
     'SYNCS_SRC', syncs_src.replace('crate::g17::', 'g17::')
 )
 
@@ -439,9 +528,247 @@ with tempfile.TemporaryDirectory(prefix='m4-rust-timeline-') as directory:
         if result.returncode:
             raise SystemExit(result.returncode)
 
+# Exercise the actual production g17/sync_input.c collector against lightweight C dma_fence
+# and dma_fence_chain shims to prove deep 2-queue timeline chains coalesce without -ENOSPC,
+# skip signalled leaves, and preserve error leaves.
+sync_input_c = root / 'drivers/gpu/drm/asahi/g17/sync_input.c'
+sync_input_dir = sync_input_c.parent
+c_harness = r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef uint64_t u64;
+#define ASAHI_G17_SYNC_SCOPE_H 1
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#define GFP_KERNEL 0
+
+struct dma_fence {
+	uint64_t context;
+	uint64_t seqno;
+	int status;
+	int refcount;
+	bool is_chain;
+	bool is_container;
+	struct dma_fence *chain_next;
+	struct dma_fence *chain_fence;
+};
+
+struct dma_fence_unwrap {
+	struct dma_fence *chain;
+	struct dma_fence *array;
+	unsigned int index;
+};
+
+static inline struct dma_fence *dma_fence_get(struct dma_fence *f)
+{
+	if (f)
+		++f->refcount;
+	return f;
+}
+
+static inline void dma_fence_put(struct dma_fence *f)
+{
+	if (f) {
+		assert(f->refcount > 0);
+		--f->refcount;
+	}
+}
+
+static inline int dma_fence_get_status(struct dma_fence *f)
+{
+	return f ? f->status : 1;
+}
+
+static inline bool dma_fence_is_later(struct dma_fence *f1, struct dma_fence *f2)
+{
+	return f1->seqno > f2->seqno;
+}
+
+static inline bool dma_fence_is_container(struct dma_fence *f)
+{
+	return f && (f->is_chain || f->is_container);
+}
+
+static inline struct dma_fence *dma_fence_unwrap_first(struct dma_fence *head,
+						       struct dma_fence_unwrap *cursor)
+{
+	cursor->chain = NULL;
+	cursor->array = NULL;
+	cursor->index = 0;
+	if (!head)
+		return NULL;
+	if (head->is_chain) {
+		cursor->chain = dma_fence_get(head);
+		return head->chain_fence;
+	}
+	return head;
+}
+
+static inline struct dma_fence *dma_fence_unwrap_next(struct dma_fence_unwrap *cursor)
+{
+	struct dma_fence *next;
+
+	if (!cursor->chain)
+		return NULL;
+	next = cursor->chain->chain_next;
+	dma_fence_put(cursor->chain);
+	if (!next) {
+		cursor->chain = NULL;
+		return NULL;
+	}
+	cursor->chain = dma_fence_get(next);
+	return next->chain_fence;
+}
+
+#define dma_fence_unwrap_for_each(fence, cursor, head) \
+	for ((fence) = dma_fence_unwrap_first((head), (cursor)); (fence); \
+	     (fence) = dma_fence_unwrap_next((cursor)))
+
+static inline void *kmalloc_array(size_t n, size_t size, int flags)
+{
+	(void)flags;
+	return calloc(n, size);
+}
+
+static inline void kfree(void *p)
+{
+	free(p);
+}
+
+static inline struct dma_fence *__dma_fence_unwrap_merge(unsigned int n,
+							 struct dma_fence **f,
+							 struct dma_fence_unwrap *c)
+{
+	(void)n;
+	(void)f;
+	(void)c;
+	return NULL;
+}
+
+static inline bool asahi_g17_is_scope(struct dma_fence *f)
+{
+	(void)f;
+	return false;
+}
+
+static inline unsigned int asahi_g17_scope_children(struct dma_fence *f,
+						    struct dma_fence *out[2])
+{
+	(void)f;
+	(void)out;
+	return 0;
+}
+
+#include "sync_input.h"
+#include "sync_input.c"
+
+int main(void)
+{
+	enum { HOPS = 256 };
+	struct dma_fence leaves[HOPS];
+	struct dma_fence chains[HOPS];
+	struct asahi_g17_fence_leaf out[4];
+	int n, i;
+
+	/* 256 alternating unsignalled hops across 2 contexts (10 and 20). */
+	memset(leaves, 0, sizeof(leaves));
+	memset(chains, 0, sizeof(chains));
+	for (i = 0; i < HOPS; ++i) {
+		leaves[i].context = (i % 2 == 0) ? 10 : 20;
+		leaves[i].seqno = (uint64_t)(i / 2 + 1);
+		leaves[i].status = 0;
+		leaves[i].refcount = 1;
+
+		chains[i].is_chain = true;
+		chains[i].refcount = 1;
+		chains[i].chain_fence = &leaves[i];
+		chains[i].chain_next = (i > 0) ? &chains[i - 1] : NULL;
+	}
+
+	/* Coalesced collector fits a 256-hop 2-queue timeline chain into capacity=4 with 2 leaves. */
+	n = asahi_g17_collect_fences_coalesced(&chains[HOPS - 1], out, 4);
+	assert(n == 2);
+	assert((out[0].fence == &leaves[HOPS - 1] && out[1].fence == &leaves[HOPS - 2]) ||
+	       (out[1].fence == &leaves[HOPS - 1] && out[0].fence == &leaves[HOPS - 2]));
+	for (i = 0; i < n; ++i) {
+		assert(out[i].status == 0);
+		asahi_g17_put_fence(out[i].fence);
+	}
+
+	/* Non-coalesced collector still sees distinct unsignalled leaves and hits -ENOSPC at cap=4. */
+	n = asahi_g17_collect_fences(&chains[HOPS - 1], out, 4);
+	assert(n == -ENOSPC);
+
+	/* Already-signalled leaves (status > 0) are skipped by both collectors. */
+	for (i = 0; i < HOPS; ++i)
+		leaves[i].status = 1;
+	n = asahi_g17_collect_fences_coalesced(&chains[HOPS - 1], out, 4);
+	assert(n == 0);
+	n = asahi_g17_collect_fences(&chains[HOPS - 1], out, 4);
+	assert(n == 0);
+
+	/* Error leaf (status < 0) is preserved even when a later same-context leaf is unsignalled. */
+	leaves[5].status = -5;
+	leaves[HOPS - 1].status = 0;
+	leaves[HOPS - 2].status = 0;
+	n = asahi_g17_collect_fences_coalesced(&chains[HOPS - 1], out, 4);
+	assert(n == 3);
+	{
+		bool saw_err = false, saw_ctx10 = false, saw_ctx20 = false;
+		for (i = 0; i < n; ++i) {
+			if (out[i].fence == &leaves[5] && out[i].status == -5)
+				saw_err = true;
+			else if (out[i].fence == &leaves[HOPS - 2] && out[i].status == 0)
+				saw_ctx10 = true;
+			else if (out[i].fence == &leaves[HOPS - 1] && out[i].status == 0)
+				saw_ctx20 = true;
+			asahi_g17_put_fence(out[i].fence);
+		}
+		assert(saw_err && saw_ctx10 && saw_ctx20);
+	}
+
+	/* Every refcount returns cleanly to 1 (no leaks or double puts). */
+	for (i = 0; i < HOPS; ++i) {
+		assert(leaves[i].refcount == 1);
+		assert(chains[i].refcount == 1);
+	}
+	printf("sync_input C coalescing tests passed (256-hop chain -> 2 leaves, error preserved)\n");
+	return 0;
+}
+'''
+
+with tempfile.TemporaryDirectory(prefix='m4-c-sync-input-') as directory:
+    directory = pathlib.Path(directory)
+    (directory / 'linux').mkdir()
+    for hdr in ('dma-fence.h', 'dma-fence-unwrap.h', 'slab.h', 'types.h'):
+        (directory / 'linux' / hdr).write_text('/* host shim */\n')
+    (directory / 'linux' / 'errno.h').write_text('#define ENOSPC 28\n#define EOPNOTSUPP 95\n')
+    (directory / 'sync_scope.h').write_text('/* host shim */\n')
+    c_unit = directory / 'test_sync_input.c'
+    c_unit.write_text(c_harness)
+    c_bin = directory / 'test_sync_input'
+    cc = shlex.split(os.environ.get('CC', 'cc'))
+    for command in [
+        cc + ['-Wall', '-Wextra', '-Werror', '-I', str(directory), '-I', str(sync_input_dir),
+              str(c_unit), '-o', str(c_bin)],
+        [str(c_bin)],
+    ]:
+        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        logs += result.stdout
+        print(result.stdout, end='')
+        (out / 'fence-signalling.log').write_text(logs)
+        if result.returncode:
+            raise SystemExit(result.returncode)
+
 (out / 'fence-signalling.json').write_text(json.dumps({
-    'passed': True, 'tests': 8, 'negative_compile_checks': 1, 'cpu_only': True,
-    'scope': 'Production RAII annotation compiled in both CONFIG_LOCKDEP variants and g16 Timeline::complete() off-pending FIFO batch signalling.',
+    'passed': True, 'tests': 11, 'negative_compile_checks': 1, 'cpu_only': True,
+    'scope': 'Production RAII annotation compiled in both CONFIG_LOCKDEP variants, g16 Timeline::complete() off-pending FIFO batch signalling, FwWaits per-queue coalescing, and g17/sync_input.c chain coalescing.',
     'source_sha256': sha(production),
     'timeline_source_sha256': sha(fence_source_path),
+    'sync_input_source_sha256': sha(sync_input_c),
 }, indent=2) + '\n')

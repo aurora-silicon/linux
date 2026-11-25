@@ -139,7 +139,8 @@ pub(crate) fn layout(dev: &device::Device) -> Option<&'static hw::FwLayout> {
 }
 
 /// Validates the FDT contract and returns the reserved physical regions, read-only.
-pub(crate) fn read(dev: &device::Device) -> Result<GpuAdt> {
+#[inline(never)]
+pub(crate) fn read(dev: &device::Device) -> Result<KBox<GpuAdt>> {
     let node = dev.of_node().ok_or(EINVAL)?;
     let (version, vas, flags) = handoff(dev)?;
     let names: KVec<u8> = node.get_property(c_str!("memory-region-names"))?;
@@ -223,14 +224,17 @@ pub(crate) fn read(dev: &device::Device) -> Result<GpuAdt> {
         performance.count
     );
     let [ttbs, tables, handoff, shared_l2, text, data] = regions;
-    Ok(GpuAdt {
-        ttbs,
-        tables,
-        handoff,
-        shared_l2,
-        text,
-        data,
-        performance,
-        layout,
-    })
+    Ok(KBox::init(
+        init!(GpuAdt {
+            ttbs,
+            tables,
+            handoff,
+            shared_l2,
+            text,
+            data,
+            performance,
+            layout,
+        }),
+        GFP_KERNEL,
+    )?)
 }

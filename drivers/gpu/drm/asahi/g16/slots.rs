@@ -15,7 +15,7 @@ use super::encode::{Geometry, PassRefs};
 use super::fw::work::{barrier, fs, ta};
 use super::graph::{alloc, alloc_work, cmd_fw, Client};
 use super::hw::{client, sizes};
-use super::object::{Class, FwObject, Objects};
+use super::object::{Class, Factory, FwLease, FwObject, Objects};
 use super::pools::lifetime::Lifetime;
 
 /// One immutable allocation set. Mutable firmware pool cursors survive successful reuse.
@@ -32,6 +32,10 @@ pub(crate) struct ComputeSlot {
     pub(crate) counter: Arc<FwObject>,
     pub(crate) context_store: Arc<FwObject>,
     pub(crate) aux: Arc<FwObject>,
+    /// VM-free firmware lease keeping `work` (containing the compute UMA manager at `+0xe00`)
+    /// and `counter` mapped in context-0 UAT until a later compute retirement overwrites
+    /// firmware `uma_mgr_table[1 + k]`.
+    uma_lease: Arc<FwLease>,
 }
 
 /// Initializes the private pool exactly once, before it is exposed. Never called on reuse.
@@ -54,8 +58,12 @@ pub(crate) fn init_uma_pool(state: &FwObject, list: &FwObject, pool: u64) -> Res
 }
 
 impl ComputeSlot {
-    pub(crate) fn new(o: &mut Objects, k: u64) -> Result<Self> {
+    pub(crate) fn new(o: &mut Objects, fw_factory: &Factory, k: u64) -> Result<Self> {
         let sh = Class::Shared;
+        let mut fw = fw_factory.fw_objects();
+        let work = alloc_work(&mut fw, 0x2000, client::WORK_PAGE + k * client::CWORK_STRIDE, 0)?;
+        let counter = alloc(&mut fw, 0x80, sh, None, 0, false)?;
+        let uma_lease = FwLease::new(fw)?;
         let unit = Self {
             its: alloc(o, 16, sh, None, 0, false)?,
             preempt: alloc(
@@ -66,7 +74,7 @@ impl ComputeSlot {
                 0,
                 false,
             )?,
-            work: alloc_work(o, 0x2000, client::WORK_PAGE + k * client::CWORK_STRIDE, 0)?,
+            work,
             seq: alloc(o, 0x300, cmd_fw(), None, 0, false)?,
             // Holds fs2c (+0x00) and cross-pipe c2c (+0x40) barriers within one page.
             barrier: alloc(
@@ -95,7 +103,7 @@ impl ComputeSlot {
                 false,
             )?,
             page_list: alloc(o, 0x4000, sh, Client::nc(client::compute_list(k)), 0, false)?,
-            counter: alloc(o, 0x80, sh, None, 0, false)?,
+            counter,
             context_store: alloc(
                 o,
                 0x40000,
@@ -105,6 +113,7 @@ impl ComputeSlot {
                 false,
             )?,
             aux: alloc(o, 0x4000, sh, Client::nc(client::compute_aux(k)), 0, false)?,
+            uma_lease,
         };
         init_uma_pool(
             &unit.pool_state,
@@ -112,6 +121,10 @@ impl ComputeSlot {
             unit.pool.gva.ok_or(EINVAL)?,
         )?;
         Ok(unit)
+    }
+    /// VM-free firmware lease keeping this unit's `work` and `counter` mapped in context-0 UAT.
+    pub(crate) fn uma_lease(&self) -> Arc<FwLease> {
+        self.uma_lease.clone()
     }
     /// Resets command-local state before reuse. Pool/list/counter/descriptor state is preserved.
     ///
@@ -461,6 +474,11 @@ pub(crate) struct ComputeOwners {
     /// descriptor when a later owner displaces it, after its VM's client closed.
     arena: [Option<Arc<super::resources::ComputeArena>>; sizes::COMPUTE_UNITS],
     pending_arena: [Option<Arc<super::resources::ComputeArena>>; sizes::COMPUTE_UNITS],
+    /// VM-free firmware leases keeping each hardware slot's `work` + `counter` mapped in
+    /// context-0 UAT across closed-VM reclaim until a later compute retirement overwrites
+    /// firmware `uma_mgr_table[1 + k]`.
+    retained_uma: [Option<Arc<FwLease>>; sizes::COMPUTE_UNITS],
+    pending_uma: [Option<Arc<FwLease>>; sizes::COMPUTE_UNITS],
     /// Force a full scrub on next claim (first use, cancel, error, or firmware recovery).
     scrub_full: [bool; sizes::COMPUTE_UNITS],
     /// Whether the most recent claim of each compute unit required a full scrub/work write.
@@ -594,16 +612,21 @@ impl Drop for PendingScrub {
     }
 }
 
+/// Maximum displaced render pass slots staged in one stack-resident [`ScrubBatch`].
+/// Keeping the batch bounded avoids multi-kilobyte stack frames in poll/submit paths while
+/// any additional displaced slots remain flagged for the next pass.
+const MAX_SCRUB_BATCH: usize = 8;
+
 /// Zero-allocation batch of displaced render pass slots to scrub after dropping `Shared::state`.
 pub(crate) struct ScrubBatch {
-    items: [Option<PendingScrub>; sizes::RENDER_SLOTS],
+    items: [Option<PendingScrub>; MAX_SCRUB_BATCH],
     len: usize,
 }
 
 impl ScrubBatch {
     pub(crate) const fn new() -> Self {
         Self {
-            items: [const { None }; sizes::RENDER_SLOTS],
+            items: [const { None }; MAX_SCRUB_BATCH],
             len: 0,
         }
     }
@@ -612,8 +635,12 @@ impl ScrubBatch {
         self.len == 0
     }
 
+    fn is_full(&self) -> bool {
+        self.len >= MAX_SCRUB_BATCH
+    }
+
     fn push(&mut self, item: PendingScrub) -> bool {
-        if self.len >= sizes::RENDER_SLOTS {
+        if self.len >= MAX_SCRUB_BATCH {
             return false;
         }
         self.items[self.len] = Some(item);
@@ -635,6 +662,19 @@ impl ScrubQueue {
         Self {
             slots: [const { None }; sizes::RENDER_SLOTS],
         }
+    }
+
+    /// Allocates an empty [`ScrubQueue`] directly on the heap to keep `Shared` setup off the
+    /// probe stack.
+    #[allow(dead_code)]
+    #[inline(never)]
+    pub(crate) fn new_boxed() -> Result<KBox<Self>> {
+        Ok(KBox::init(
+            init!(Self {
+                slots: [const { None }; sizes::RENDER_SLOTS],
+            }),
+            GFP_KERNEL,
+        )?)
     }
 
     /// Moves every staged scrub from `batch` into the queue. Returns `true` if any was queued.
@@ -698,6 +738,7 @@ pub(crate) struct Slots {
     render: KBox<RenderOwners>,
 }
 impl Slots {
+    #[inline(never)]
     pub(crate) fn new() -> Result<Self> {
         Ok(Self {
             cursor: 0,
@@ -706,21 +747,23 @@ impl Slots {
             scrub_gen: 0,
             stats: SlotStats::default(),
             scrub: Arc::new(ScrubState::new(), GFP_KERNEL)?,
-            compute: KBox::new(
-                ComputeOwners {
+            compute: KBox::init(
+                init!(ComputeOwners {
                     lifetime: Lifetime::new(true),
                     owner: [const { None }; sizes::COMPUTE_UNITS],
                     pending_retarget: [None; sizes::COMPUTE_UNITS],
                     pending_owner: [const { None }; sizes::COMPUTE_UNITS],
                     arena: [const { None }; sizes::COMPUTE_UNITS],
                     pending_arena: [const { None }; sizes::COMPUTE_UNITS],
+                    retained_uma: [const { None }; sizes::COMPUTE_UNITS],
+                    pending_uma: [const { None }; sizes::COMPUTE_UNITS],
                     scrub_full: [true; sizes::COMPUTE_UNITS],
                     last_full: [true; sizes::COMPUTE_UNITS],
-                },
+                }),
                 GFP_KERNEL,
             )?,
-            render: KBox::new(
-                RenderOwners {
+            render: KBox::init(
+                init!(RenderOwners {
                     lifetime: Lifetime::new(true),
                     owner: [const { None }; sizes::RENDER_SLOTS],
                     pending_retarget: [None; sizes::RENDER_SLOTS],
@@ -731,7 +774,7 @@ impl Slots {
                     last_full: [true; sizes::RENDER_SLOTS],
                     staged: ScrubBatch::new(),
                     scrub_pending: false,
-                },
+                }),
                 GFP_KERNEL,
             )?,
         })
@@ -870,12 +913,19 @@ impl Slots {
                 || self.render.scrub_full[k]
                 || self.scrub.is_scrubbing(k)
                 || self.scrub.is_clean(k)
+                || self.render.owner[k]
+                    .as_ref()
+                    .is_none_or(|vm| vm.vm.is_closed())
             {
                 continue;
             }
             let Some(arena) = self.render.arena[k].clone() else {
                 continue;
             };
+            if self.render.staged.is_full() {
+                self.render.scrub_pending = true;
+                break;
+            }
             self.scrub.scrubbing.fetch_or(bit, Ordering::SeqCst);
             let generation = self.scrub.generation.load(Ordering::Acquire);
             let item = PendingScrub {
@@ -886,6 +936,7 @@ impl Slots {
                 done: false,
             };
             if !self.render.staged.push(item) {
+                self.render.scrub_pending = true;
                 break;
             }
         }
@@ -903,6 +954,78 @@ impl Slots {
             self.render.scrub_pending = false;
         }
         self.take_staged_scrubs()
+    }
+    /// Releases displaced compute-unit and render-pass leases owned by closed VMs while
+    /// preserving active, in-flight, undisplaced, scrubbing, and quarantined slots.
+    ///
+    /// Returns `true` if any non-quarantined slot still holds a closed-VM lease awaiting
+    /// retirement, displacement, or an in-progress off-lock pass scrub.
+    pub(crate) fn reclaim_closed(&mut self) -> bool {
+        let mut remaining = false;
+        for k in 0..sizes::COMPUTE_UNITS {
+            if self.compute.lifetime.is_quarantined(k) {
+                continue;
+            }
+            let owner_closed = self.compute.owner[k]
+                .as_ref()
+                .is_some_and(|vm| vm.vm.is_closed());
+            let pending_closed = self.compute.pending_owner[k]
+                .as_ref()
+                .is_some_and(|vm| vm.vm.is_closed());
+            if !owner_closed && !pending_closed {
+                continue;
+            }
+            if owner_closed
+                && self.compute.lifetime.available(k)
+                && self.compute.pending_owner[k].is_none()
+                && self.compute.pending_arena[k].is_none()
+                && self.compute.pending_uma[k].is_none()
+            {
+                self.compute.owner[k] = None;
+                self.compute.arena[k] = None;
+                self.compute.scrub_full[k] = true;
+                self.compute.last_full[k] = true;
+            } else {
+                remaining = true;
+            }
+        }
+        for k in 0..sizes::RENDER_SLOTS {
+            if self.render.lifetime.is_quarantined(k) {
+                continue;
+            }
+            let owner_closed = self.render.owner[k]
+                .as_ref()
+                .is_some_and(|vm| vm.vm.is_closed());
+            let pending_closed = self.render.pending_owner[k]
+                .as_ref()
+                .is_some_and(|vm| vm.vm.is_closed());
+            if !owner_closed && !pending_closed {
+                continue;
+            }
+            let bit = 1u64 << k;
+            if owner_closed
+                && self.pass_busy & bit == 0
+                && self.render.lifetime.available(k)
+                && self.render.pending_owner[k].is_none()
+                && self.render.pending_arena[k].is_none()
+            {
+                if self.scrub.is_scrubbing(k) {
+                    self.scrub.waiter.store(true, Ordering::SeqCst);
+                }
+                if !self.scrub.is_scrubbing(k) {
+                    self.render.owner[k] = None;
+                    self.render.arena[k] = None;
+                    self.render.scrub_full[k] = true;
+                    self.render.last_full[k] = true;
+                    self.scrub.clear_clean(k);
+                } else {
+                    remaining = true;
+                }
+            } else {
+                remaining = true;
+            }
+        }
+        remaining
     }
     /// Compute units published and not yet retired.
     pub(crate) fn compute_published(&self) -> u32 {
@@ -997,7 +1120,8 @@ impl Slots {
         if f.slot_count as usize >= f.slot.len() {
             return Ok(None);
         }
-        // Round robin over this VM's units eligible for `pipe`: pipe 0 spans `0..n`, while
+        // Prefer a warm unit already owned by `vm_id` (`!scrub_full`), then an unowned unit,
+        // before falling back to round-robin over `start..n`: pipe 0 spans `0..n`, while
         // secondary pipes stay in `BASE_COMPUTE_UNITS..n` so base units `0..2` only ever hold
         // pipe-0 leases and a 2-unit VM can never hit `compute_exhausted_within(2)`.
         let n = units.compute_units()?.min(sizes::COMPUTE_UNITS);
@@ -1011,28 +1135,58 @@ impl Slots {
         }
         let span = n - start;
         let base_cursor = (self.cursor as usize).saturating_sub(start) % span;
-        for i in 0..span {
-            let k = start + (base_cursor + i) % span;
-            if self.compute.lifetime.claim(k) {
-                let full = self.compute.scrub_full[k]
-                    || vm_id.is_none_or(|id| {
-                        self.compute.owner[k]
-                            .as_ref()
-                            .is_none_or(|prev| prev.id != id)
-                    });
-                if let Err(e) = units.compute_unit(k).and_then(|unit| unit.scrub(full)) {
-                    self.compute.lifetime.cancel(k);
-                    return Err(e);
+        let mut chosen = None;
+        if let Some(id) = vm_id {
+            for i in 0..span {
+                let k = start + (base_cursor + i) % span;
+                if !self.compute.scrub_full[k]
+                    && self.compute.owner[k]
+                        .as_ref()
+                        .is_some_and(|prev| prev.id == id)
+                    && self.compute.lifetime.claim(k)
+                {
+                    chosen = Some(k);
+                    break;
                 }
-                self.compute.last_full[k] = full;
-                f.slot[f.slot_count as usize] = k as u32;
-                f.slot_count += 1;
-                f.compute_pipe = pipe as u8;
-                self.cursor = ((k + 1) % n) as u32;
-                return Ok(Some(k));
+            }
+            if chosen.is_none() {
+                for i in 0..span {
+                    let k = start + (base_cursor + i) % span;
+                    if self.compute.owner[k].is_none() && self.compute.lifetime.claim(k) {
+                        chosen = Some(k);
+                        break;
+                    }
+                }
             }
         }
-        Ok(None)
+        if chosen.is_none() {
+            for i in 0..span {
+                let k = start + (base_cursor + i) % span;
+                if self.compute.lifetime.claim(k) {
+                    chosen = Some(k);
+                    break;
+                }
+            }
+        }
+        let Some(k) = chosen else {
+            return Ok(None);
+        };
+        let full = self.compute.scrub_full[k]
+            || vm_id.is_none_or(|id| {
+                self.compute.owner[k]
+                    .as_ref()
+                    .is_none_or(|prev| prev.id != id)
+            });
+        if let Err(e) = units.compute_unit(k).and_then(|unit| unit.scrub(full)) {
+            self.compute.lifetime.cancel(k);
+            return Err(e);
+        }
+        self.compute.last_full[k] = full;
+        f.slot[f.slot_count as usize] = k as u32;
+        f.slot_count += 1;
+        f.compute_pipe = pipe as u8;
+        self.cursor = ((k + 1) % n) as u32;
+        Ok(Some(k))
     }
     #[allow(dead_code)]
     pub(crate) fn pick_pass(
@@ -1089,9 +1243,26 @@ impl Slots {
         geo: &Geometry,
         picked: u64,
     ) -> Option<usize> {
+        self.pick_pass_in_for(resources, geo, picked, None)
+    }
+    /// Selects a render pass slot in `resources` with capacity for `geo`, preferring slots
+    /// already owned by `vm_id` (clean before dirty) and unowned slots before retargeting
+    /// another VM's warm pass slot.
+    pub(crate) fn pick_pass_in_for(
+        &self,
+        resources: &super::resources::Prepared,
+        geo: &Geometry,
+        picked: u64,
+        vm_id: Option<u64>,
+    ) -> Option<usize> {
         let n = resources.render_passes().ok()?.min(sizes::RENDER_SLOTS);
-        let mut clean_partial = None;
-        let mut fallback = None;
+        let mut same_clean_partial = None;
+        let mut same_dirty = None;
+        let mut unowned_clean = None;
+        let mut unowned_dirty = None;
+        let mut other_full_clean = None;
+        let mut other_clean_partial = None;
+        let mut other_dirty = None;
         let mut saw_scrubbing = false;
         for i in 0..n {
             let k = (self.pass_cursor as usize + i) % n;
@@ -1107,22 +1278,55 @@ impl Slots {
                     saw_scrubbing = true;
                     continue;
                 }
-                if self.scrub.is_clean(k) {
-                    if let Ok(d) = resources.render_pass_dirty(k) {
+                let clean = self.scrub.is_clean(k);
+                let full_clean = clean
+                    && resources.render_pass_dirty(k).is_ok_and(|d| {
                         let need = d.tilemap.load(Ordering::Acquire).min(geo.tilemap_bytes);
-                        if need <= d.tilemap_clean.load(Ordering::Acquire)
+                        need <= d.tilemap_clean.load(Ordering::Acquire)
                             && d.heap.load(Ordering::Acquire) == 0
-                        {
+                    });
+                if let Some(id) = vm_id {
+                    let same_vm = !self.render.scrub_full[k]
+                        && self.render.owner[k].as_ref().is_some_and(|o| o.id == id);
+                    if same_vm {
+                        if full_clean {
                             return Some(k);
                         }
+                        if clean {
+                            same_clean_partial.get_or_insert(k);
+                        } else {
+                            same_dirty.get_or_insert(k);
+                        }
+                    } else if self.render.owner[k].is_none() {
+                        if full_clean {
+                            unowned_clean.get_or_insert(k);
+                        } else {
+                            unowned_dirty.get_or_insert(k);
+                        }
+                    } else if full_clean {
+                        other_full_clean.get_or_insert(k);
+                    } else if clean {
+                        other_clean_partial.get_or_insert(k);
+                    } else {
+                        other_dirty.get_or_insert(k);
                     }
-                    clean_partial.get_or_insert(k);
-                    continue;
+                } else if full_clean {
+                    return Some(k);
+                } else if clean {
+                    other_clean_partial.get_or_insert(k);
+                } else {
+                    other_dirty.get_or_insert(k);
                 }
-                fallback.get_or_insert(k);
             }
         }
-        if let Some(k) = clean_partial.or(fallback) {
+        if let Some(k) = same_clean_partial
+            .or(same_dirty)
+            .or(unowned_clean)
+            .or(unowned_dirty)
+            .or(other_full_clean)
+            .or(other_clean_partial)
+            .or(other_dirty)
+        {
             return Some(k);
         }
         if saw_scrubbing {
@@ -1327,6 +1531,7 @@ impl Slots {
             .and_then(|old| Self::vm_retarget(k, old, vm));
         self.compute.pending_owner[k] = Some(vm.clone());
         self.compute.pending_arena[k] = resources.compute_arena(k);
+        self.compute.pending_uma[k] = resources.compute_unit(k).ok().map(ComputeSlot::uma_lease);
         Ok(())
     }
 
@@ -1448,6 +1653,12 @@ impl Slots {
             if let Some(cell) = self.compute.pending_arena.get_mut(k as usize) {
                 *cell = resources.compute_arena(k as usize);
             }
+            if let Some(cell) = self.compute.pending_uma.get_mut(k as usize) {
+                *cell = resources
+                    .compute_unit(k as usize)
+                    .ok()
+                    .map(ComputeSlot::uma_lease);
+            }
         }
         let mut mask = f.pass_mask & PASS_MASK;
         while mask != 0 {
@@ -1526,6 +1737,9 @@ impl Slots {
         for &k in &f.slot[..f.slot_count as usize] {
             self.compute.owner[k as usize] = self.compute.pending_owner[k as usize].take();
             self.compute.arena[k as usize] = self.compute.pending_arena[k as usize].take();
+            if let Some(lease) = self.compute.pending_uma[k as usize].take() {
+                self.compute.retained_uma[k as usize] = Some(lease);
+            }
             if clean_scrub {
                 self.compute.scrub_full[k as usize] = false;
             }
@@ -1577,6 +1791,7 @@ impl Slots {
             self.compute.pending_retarget[k as usize] = None;
             self.compute.pending_owner[k as usize] = None;
             self.compute.pending_arena[k as usize] = None;
+            self.compute.pending_uma[k as usize] = None;
             self.compute.scrub_full[k as usize] = true;
         }
         let mut mask = f.pass_mask & PASS_MASK;

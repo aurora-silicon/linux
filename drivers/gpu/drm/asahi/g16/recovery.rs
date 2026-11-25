@@ -172,6 +172,7 @@ impl Firmware {
     /// Protocol errors and transport loss always retain uncertain owners.
     /// A deadline without a firmware recovery notification is not permission
     /// to manipulate undocumented preemption controls.
+    #[inline(never)]
     pub(crate) fn check_hangs(&mut self, done: &mut Completions) -> Result {
         if let Some(error) = self.recovery.failed {
             return Err(error);

@@ -45,7 +45,7 @@ use kernel::{
 
 use super::{
     command::{Command, Commands, Order, Orders},
-    fence::{InputFences, JobFence},
+    fence::{FenceOrigin, FwWaits, InputFences, JobFence},
     hw,
     queue::QueueState,
     vm::VmState,
@@ -107,6 +107,10 @@ pub(crate) struct Job {
     pub(crate) progress: super::engine::Progress,
     /// Inputs and resolved historical-prefix dependencies, held through every command.
     inputs: InputFences,
+    /// Exported fence identity for same-GPU, same-VM cross-queue firmware handoff.
+    pub(crate) origin: Arc<FenceOrigin>,
+    /// Same-GPU, same-VM cross-queue waits resolved into firmware ring barriers.
+    pub(crate) fw_waits: FwWaits,
     /// Bitmask of commands (`0..MAX_COMMANDS`) with full owner-retirement proof; an aborted
     /// receipt never sets its bit. Tracks per-command bits so concurrent compute/render
     /// commands within one job may retire in either hardware completion order.
@@ -141,6 +145,8 @@ impl Job {
         fence: JobFence,
         guard: mmu::VmJobGuard,
         inputs: InputFences,
+        origin: Arc<FenceOrigin>,
+        fw_waits: FwWaits,
     ) -> Result<Arc<Self>> {
         if commands.len() != orders.len() {
             return Err(EINVAL);
@@ -161,6 +167,8 @@ impl Job {
                 fence,
                 progress,
                 inputs,
+                origin,
+                fw_waits,
                 full_retired: AtomicU64::new(0),
                 terminal_retired: AtomicBool::new(false),
                 // Scheduler free can race the final off-lock completion reference.
@@ -178,6 +186,7 @@ impl Job {
     /// Latches a hardware/publication failure before any later work can be published.
     /// Called under the device lock; it deliberately does not signal the fence.
     pub(crate) fn latch_failure(&self, error: Error) {
+        self.origin.mark_failed();
         if error == ECANCELED
             || (self.terminal_retired.load(Ordering::Acquire)
                 && error != EIO
@@ -217,6 +226,7 @@ impl Job {
             return;
         }
         if let Err(error) = result {
+            self.origin.mark_failed();
             if error == ECANCELED
                 || ((!engine || self.terminal_retired.load(Ordering::Acquire))
                     && error != EIO
@@ -321,7 +331,10 @@ impl Job {
     /// Whether command `index` is a ready, barrier-free compute command continuing a compute
     /// horizon at queue-local compute ordinal `expected`.
     pub(crate) fn can_fold_horizon_cmd(&self, index: u32, expected: u64) -> bool {
-        if self.terminal_retired.load(Ordering::Acquire) || self.vm.status.get() != 0 {
+        if !self.fw_waits.is_empty()
+            || self.terminal_retired.load(Ordering::Acquire)
+            || self.vm.status.get() != 0
+        {
             return false;
         }
         let Some(Command::Compute(_)) = self.commands.get(index as usize) else {
@@ -342,6 +355,7 @@ impl Job {
     pub(crate) fn can_fold_horizon_job(&self, first_expected: u64) -> bool {
         let count = self.progress.count();
         if count == 0
+            || !self.fw_waits.is_empty()
             || self.progress.sent() != 0
             || self.terminal_retired.load(Ordering::Acquire)
             || self.vm.status.get() != 0
@@ -374,7 +388,10 @@ impl Job {
     /// at queue-local render ordinal `expected` (treating `expected - 1` as already published
     /// within the in-progress render flight).
     pub(crate) fn can_fold_render_cmd(&self, index: u32, expected: u64) -> bool {
-        if self.terminal_retired.load(Ordering::Acquire) || self.vm.status.get() != 0 {
+        if !self.fw_waits.is_empty()
+            || self.terminal_retired.load(Ordering::Acquire)
+            || self.vm.status.get() != 0
+        {
             return false;
         }
         let Some(Command::Render(_)) = self.commands.get(index as usize) else {
@@ -411,6 +428,7 @@ impl Job {
     pub(crate) fn can_fold_render_horizon_job(&self, first_expected: u64) -> bool {
         let count = self.progress.count();
         if count == 0
+            || !self.fw_waits.is_empty()
             || self.progress.sent() != 0
             || self.terminal_retired.load(Ordering::Acquire)
             || self.vm.status.get() != 0
@@ -471,6 +489,19 @@ impl Job {
         let order = self.orders.get(index as usize).ok_or(EINVAL)?;
         self.queue.check(order)?;
         super::fence::check_dependencies(&self.inputs)?;
+        for wait in self.fw_waits.iter() {
+            if wait.is_failed() {
+                return Err(ECANCELED);
+            }
+            for engine in 0..2 {
+                if let Some(seq) = wait.last_ordinal[engine] {
+                    wait.queue.cancelled_through(engine, seq)?;
+                    if wait.queue.published[engine].load(Ordering::Acquire) < seq {
+                        return Err(EAGAIN);
+                    }
+                }
+            }
+        }
         let completed = self
             .queue
             .completed
@@ -599,6 +630,11 @@ impl Job {
         Ok(())
     }
 
+    /// Whether this job holds a cross-queue firmware wait on `queue`.
+    pub(crate) fn waits_on_queue(&self, queue: &Arc<QueueState>) -> bool {
+        self.fw_waits.iter().any(|w| Arc::ptr_eq(&w.queue, queue))
+    }
+
     /// Cancels a job the scheduler never ran (queue teardown, or a failed submission).
     fn cancel_unstarted(&self) {
         if self.started.swap(true, Ordering::AcqRel) {
@@ -608,6 +644,7 @@ impl Job {
             self.finish(Err(ECANCELED), false);
         } else if !self.progress.signaled.swap(true, Ordering::AcqRel) {
             // A refused submission's job: its fence orders nothing and was never published.
+            self.origin.mark_failed();
             self.fence.signal(Err(ECANCELED));
         }
     }

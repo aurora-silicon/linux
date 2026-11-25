@@ -272,6 +272,9 @@ impl Shared {
                 });
             }
             if pub_res.is_ok() {
+                if retired_any || !had_flights {
+                    firmware.reclaim_closed_vm_slots();
+                }
                 pub_res = if recovery_pending {
                     let r = firmware.publish(done);
                     if r.is_ok() {
@@ -579,6 +582,27 @@ pub(crate) fn ring_passed(c: u32, b: u32, h: u32, t: u32, m: u32) -> bool {
 }
 
 impl Firmware {
+    /// Reclaims displaced slot leases belonging to closed VMs so dead processes do not keep
+    /// multi-hundred-MiB render/compute arenas and TTBAT ASIDs pinned while idle.
+    ///
+    /// Respects all hardware displacement contracts (active, in-flight, undisplaced, scrubbing,
+    /// and quarantined slots are preserved) and re-arms `Shared::closed_vm_reclaim` whenever a
+    /// non-quarantined slot still holds a closed VM awaiting retirement, displacement, or scrub.
+    pub(crate) fn reclaim_closed_vm_slots(&mut self) {
+        let Some(shared) = self.engine.shared.as_ref() else {
+            return;
+        };
+        if !shared.closed_vm_reclaim.load(Ordering::Acquire)
+            || !shared.closed_vm_reclaim.swap(false, Ordering::AcqRel)
+        {
+            return;
+        }
+        let remaining = self.pools.reclaim_closed() | self.slots.reclaim_closed();
+        if remaining {
+            shared.closed_vm_reclaim.store(true, Ordering::Release);
+        }
+    }
+
     /// One non-sleeping poll step under the device lock.
     ///
     /// Retires finished flights and publishes ready work before periodic 1 ms housekeeping so
@@ -622,7 +646,12 @@ impl Firmware {
             self.last_aux_drain_ns = now;
             ran_housekeeping = true;
             self.drain_rings()?;
+            self.reclaim_closed_vm_slots();
             if self.recovery_idle()? && self.engine.pending.is_empty() {
+                let _ = self.slots.take_scrub_woke();
+                if let Some(shared) = self.engine.shared.as_ref() {
+                    shared.publish_wake.store(false, Ordering::Release);
+                }
                 return Ok(false);
             }
         }
@@ -645,6 +674,9 @@ impl Firmware {
             .shared
             .as_ref()
             .is_some_and(|shared| shared.publish_wake.swap(false, Ordering::AcqRel));
+        if retired_any || publish_woke || scrub_woke || housekeeping_due {
+            self.reclaim_closed_vm_slots();
+        }
         // Skip redundant `publish_checked()` walks on busy polls where nothing could have
         // unblocked `engine.pending`. `Prepared::drop` releases standby PB epochs only for
         // `Cache::prepare` waiters (`standby_available`, which enter `submit_locked()` directly),
@@ -750,6 +782,7 @@ impl Firmware {
             self.last_aux_drain_ns = now;
         }
         self.last_housekeeping_ns = now;
+        self.reclaim_closed_vm_slots();
         if !self.engine.flights.is_empty() || recovery_pending {
             self.check_hangs(done)?;
         }
@@ -1350,14 +1383,15 @@ impl Firmware {
                 .base_render_quarantined
                 .store(self.slots.base_render_quarantined(), Ordering::Release);
             shared
-                .needed_pb_slots
-                .store(self.pools.needed_slots() as u32, Ordering::Release);
+                .quarantined_pb_mask
+                .store(self.pools.quarantined_mask(), Ordering::Release);
         }
     }
 
     /// Retire the flight at `index` (the oldest of its engine class). Only a full normal receipt
     /// retires its storage; a passed abort quarantines it. Job failure independently drops
     /// remaining unpublished commands even when the storage fully retired.
+    #[inline(never)]
     pub(crate) fn retire_oldest(
         &mut self,
         index: usize,
@@ -1538,11 +1572,34 @@ impl Firmware {
         let p = &job.progress;
         p.next.store(p.next() + f.count as u32, Ordering::Relaxed);
         if result.is_err() {
-            // Its queue's later commands queued behind it fail with it, as unpublished ones
-            // are cancelled: they never report a successful receipt after this hole.
+            // Later commands of this queue, and any cross-queue flights transitively waiting
+            // on it via firmware handoff, fail with it so no dependent command reports success
+            // after an upstream failure.
+            let mut changed = false;
             for later in self.engine.flights.iter_mut() {
-                if Arc::ptr_eq(&later.job.queue, &job.queue) {
+                if !later.doomed
+                    && (Arc::ptr_eq(&later.job.queue, &job.queue)
+                        || later.job.waits_on_queue(&job.queue))
+                {
                     later.doomed = true;
+                    changed = true;
+                }
+            }
+            while changed {
+                changed = false;
+                for i in 0..self.engine.flights.len() {
+                    if self.engine.flights[i].doomed {
+                        continue;
+                    }
+                    let dep_doomed = self.engine.flights.iter().any(|other| {
+                        other.doomed
+                            && (Arc::ptr_eq(&other.job.queue, &self.engine.flights[i].job.queue)
+                                || self.engine.flights[i].job.waits_on_queue(&other.job.queue))
+                    });
+                    if dep_doomed {
+                        self.engine.flights[i].doomed = true;
+                        changed = true;
+                    }
                 }
             }
         }

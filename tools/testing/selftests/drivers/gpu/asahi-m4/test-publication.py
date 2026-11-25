@@ -117,7 +117,7 @@ impl Progress {
     fn count(&self)->u32{self.count}
     fn set_pending(&self,v:bool){self.pending.store(v,Ordering::Relaxed)}
 }
-struct Resources;impl Resources{fn compute_units(&self)->Result<usize>{Ok(2)}fn render_passes(&self)->Result<usize>{Ok(8)}fn pb_slots(&self)->Result<usize>{Ok(2)}fn pb_heap_blocks(&self)->Result<u32>{Ok(512)}}
+struct Resources;impl Resources{fn compute_units(&self)->Result<usize>{Ok(2)}fn render_passes(&self)->Result<usize>{Ok(8)}fn pb_slots(&self)->Result<usize>{Ok(2)}fn pb_slot_mask(&self)->Result<(u32,usize)>{Ok((0b11,0))}fn pb_heap_blocks(&self)->Result<u32>{Ok(512)}}
 struct Job { id:u32,vm:Arc<Vm>,queue:Arc<Queue>,progress:Progress,commands:Vec<Command>,dependency:Result,terminal_marked:AtomicBool,resources:Resources }
 impl Job {
     fn check_command_dependencies(&self,_index:u32)->Result{self.dependency}
@@ -162,9 +162,11 @@ impl Pools{
     fn exhausted(&self)->bool{self.exhausted}
     fn exhausted_for(&self,vm:&Vm)->bool{self.exhausted_vm==Some(vm.slot)}
     fn exhausted_for_within(&self,vm:&Vm,_limit:usize)->bool{self.exhausted_for(vm)}
+    fn exhausted_for_mask(&self,vm:&Vm,_mask:u32,_home:usize)->bool{self.exhausted_for(vm)}
     fn can_pipeline(&self,vm:&Arc<Vm>)->bool{self.block_pipeline_vm!=Some(vm.slot)}
     fn can_pipeline_within(&self,vm:&Arc<Vm>,_limit:usize)->bool{self.can_pipeline(vm)}
     fn can_pipeline_within_blocks(&self,vm:&Arc<Vm>,limit:usize,_min_blocks:u32)->bool{self.can_pipeline_within(vm,limit)}
+    fn can_pipeline_in_mask_blocks(&self,vm:&Arc<Vm>,_mask:u32,_home:usize,_min_blocks:u32)->bool{self.can_pipeline(vm)}
 }
 mod encode {
     pub struct ComputeRefs{pub invalid:bool}
@@ -698,8 +700,15 @@ fn firmware(jobs:Vec<Arc<Job>>,stages:Vec<(Result,bool)>)->Firmware{
     }
 
 }
+mod fence {
+    pub const MAX_FW_WAITS: usize = 8;
+    pub struct FwWait {
+        pub queue: std::sync::Arc<crate::Queue>,
+        pub last_ordinal: [Option<u64>; 2],
+    }
+}
 #[derive(Copy,Clone)]struct Order{engine:usize,sequence:u64,wait_through:[Option<u64>;2]}
-struct QueueBehindJob{id:u32,vm:Arc<Vm>,queue:Arc<Queue>,progress:Progress,commands:Vec<Command>,order:Order,extra_orders:Vec<Order>,dependency:Result,resources:Resources}
+struct QueueBehindJob{id:u32,vm:Arc<Vm>,queue:Arc<Queue>,progress:Progress,commands:Vec<Command>,order:Order,extra_orders:Vec<Order>,dependency:Result,resources:Resources,fw_waits:Vec<fence::FwWait>}
 impl QueueBehindJob{
     fn check_command_dependencies(&self,_index:u32)->Result{self.dependency}
     fn command_order(&self,index:u32)->Option<Order>{
@@ -737,6 +746,7 @@ impl QueueBehindPools{
     fn can_pipeline(&self,vm:&Arc<Vm>)->bool{self.can_pipeline&&self.block_pipeline_vm!=Some(vm.slot)}
     fn can_pipeline_within(&self,vm:&Arc<Vm>,_limit:usize)->bool{self.can_pipeline(vm)}
     fn can_pipeline_within_blocks(&self,vm:&Arc<Vm>,limit:usize,_min_blocks:u32)->bool{self.can_pipeline_within(vm,limit)}
+    fn can_pipeline_in_mask_blocks(&self,vm:&Arc<Vm>,_mask:u32,_home:usize,_min_blocks:u32)->bool{self.can_pipeline(vm)}
 }
 struct QueueBehindHost{graph:QueueBehindGraph,engine:QueueBehindEngine,slots:QueueBehindSlots,pools:QueueBehindPools}
 mod queue_behind_scope {
@@ -788,7 +798,7 @@ mod queue_behind_scope {
             id,vm,queue,progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
             commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access:true})}],
             order:Order{engine:if render{command::RENDER}else{command::COMPUTE},sequence:u64::from(id),wait_through:[None,None]},
-            extra_orders:vec![],dependency:Ok(()),resources:Resources,
+            extra_orders:vec![],dependency:Ok(()),resources:Resources,fw_waits:vec![],
         });
         let j1=mk(1,vm1.clone(),q1.clone(),false);
         let j2=mk(2,vm1.clone(),q1.clone(),false);
@@ -833,7 +843,7 @@ mod queue_behind_scope {
             progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
             commands:vec![Command::Compute(ComputeCommand{query_access})],
             order:Order{engine:command::COMPUTE,sequence:u64::from(id),wait_through:[wait_vdm,wait_cdm]},
-            extra_orders:vec![],dependency:Ok(()),resources:Resources,
+            extra_orders:vec![],dependency:Ok(()),resources:Resources,fw_waits:vec![],
         });
         let timed=mk(1,q1.clone(),true,None,None);
         let query_copy=mk(2,q1.clone(),true,None,Some(1));
@@ -856,7 +866,7 @@ mod queue_behind_scope {
             progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
             commands:vec![Command::Render(())],
             order:Order{engine:command::RENDER,sequence:1,wait_through:[None,None]},
-            extra_orders:vec![],dependency:Ok(()),resources:Resources,
+            extra_orders:vec![],dependency:Ok(()),resources:Resources,fw_waits:vec![],
         });
         let pr=QueueBehindHost{
             graph:QueueBehindGraph::new(),
@@ -876,7 +886,7 @@ mod queue_behind_scope {
             id,vm,queue:q1.clone(),progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
             commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access:true})}],
             order:Order{engine:if render{command::RENDER}else{command::COMPUTE},sequence:u64::from(id),wait_through:[None,None]},
-            extra_orders:vec![],dependency:Ok(()),resources:Resources,
+            extra_orders:vec![],dependency:Ok(()),resources:Resources,fw_waits:vec![],
         });
         let r1=mk(1,vm1.clone(),true);
         let r2=mk(2,vm1.clone(),true);
@@ -921,7 +931,7 @@ mod queue_behind_scope {
             id,vm,queue,progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
             commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access:false})}],
             order:Order{engine:if render{command::RENDER}else{command::COMPUTE},sequence:u64::from(id),wait_through:[None,None]},
-            extra_orders:vec![],dependency:Ok(()),resources:Resources,
+            extra_orders:vec![],dependency:Ok(()),resources:Resources,fw_waits:vec![],
         });
         let vm1_r=mk(1,vm1.clone(),q1.clone(),true);
         let vm1_c=mk(2,vm1.clone(),q1.clone(),false);
@@ -963,7 +973,7 @@ mod queue_behind_scope {
             progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
             commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access:false})}],
             order:Order{engine:if render{command::RENDER}else{command::COMPUTE},sequence:seq,wait_through:wait},
-            extra_orders:vec![],dependency:Ok(()),resources:Resources,
+            extra_orders:vec![],dependency:Ok(()),resources:Resources,fw_waits:vec![],
         });
         let r1=mk(1,q1.clone(),true,1,[None,None]);
         let c1=mk(2,q1.clone(),false,1,[Some(1),None]);
@@ -1000,7 +1010,7 @@ mod queue_behind_scope {
                 Order{engine:command::COMPUTE,sequence:2,wait_through:[None,None]},
                 Order{engine:command::COMPUTE,sequence:3,wait_through:[None,None]},
             ],
-            dependency:Ok(()),resources:Resources,
+            dependency:Ok(()),resources:Resources,fw_waits:vec![],
         });
         let r_wait_c2=mk(7,q1.clone(),true,3,[None,Some(2)]);
         let r_wait_c3=mk(8,q1.clone(),true,4,[None,Some(3)]);
@@ -1035,7 +1045,7 @@ mod queue_behind_scope {
             progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
             commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access:false})}],
             order:Order{engine:if render{command::RENDER}else{command::COMPUTE},sequence:seq,wait_through:wait},
-            extra_orders:vec![],dependency:Ok(()),resources:Resources,
+            extra_orders:vec![],dependency:Ok(()),resources:Resources,fw_waits:vec![],
         });
         let r_initbm=mk(1,true,1,[None,None]);
         let c_after_r=mk(2,false,1,[Some(1),None]);
@@ -1077,14 +1087,14 @@ mod queue_behind_scope {
             progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
             commands:vec![Command::Compute(ComputeCommand{query_access:false})],
             order:Order{engine:command::COMPUTE,sequence:1,wait_through:[None,None]},
-            extra_orders:vec![],dependency:Ok(()),resources:Resources,
+            extra_orders:vec![],dependency:Ok(()),resources:Resources,fw_waits:vec![],
         });
         let r_job=Arc::new(QueueBehindJob{
             id:2,vm:vm1.clone(),queue:q_rend.clone(),
             progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
             commands:vec![Command::Render(())],
             order:Order{engine:command::RENDER,sequence:1,wait_through:[None,None]},
-            extra_orders:vec![],dependency:Ok(()),resources:Resources,
+            extra_orders:vec![],dependency:Ok(()),resources:Resources,fw_waits:vec![],
         });
         let mut p=QueueBehindHost{
             graph:QueueBehindGraph::new(),
@@ -1114,7 +1124,7 @@ mod queue_behind_scope {
             progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
             commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access:false})}],
             order:Order{engine:if render{command::RENDER}else{command::COMPUTE},sequence:seq,wait_through:wait},
-            extra_orders:vec![],dependency:Ok(()),resources:Resources,
+            extra_orders:vec![],dependency:Ok(()),resources:Resources,fw_waits:vec![],
         });
         let c1=mk(1,false,1,[None,None]);
         let c2=mk(2,false,2,[None,None]);
@@ -1153,14 +1163,14 @@ mod queue_behind_scope {
                 Order{engine:command::RENDER,sequence:2,wait_through:[Some(1),None]},
                 Order{engine:command::RENDER,sequence:3,wait_through:[Some(2),None]},
             ],
-            dependency:Ok(()),resources:Resources,
+            dependency:Ok(()),resources:Resources,fw_waits:vec![],
         });
         let next_r=Arc::new(QueueBehindJob{
             id:2,vm:vm1.clone(),queue:q1.clone(),
             progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
             commands:vec![Command::Render(())],
             order:Order{engine:command::RENDER,sequence:4,wait_through:[Some(3),None]},
-            extra_orders:vec![],dependency:Ok(()),resources:Resources,
+            extra_orders:vec![],dependency:Ok(()),resources:Resources,fw_waits:vec![],
         });
         let mut r_fs=[0u32;16];
         r_fs[0]=0x100;r_fs[1]=0x200;r_fs[2]=0x300;
@@ -1192,14 +1202,14 @@ mod queue_behind_scope {
             progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
             commands:vec![Command::Render(())],
             order:Order{engine:command::RENDER,sequence:5,wait_through:[Some(4),None]},
-            extra_orders:vec![],dependency:Ok(()),resources:Resources,
+            extra_orders:vec![],dependency:Ok(()),resources:Resources,fw_waits:vec![],
         });
         let r_fold_b=Arc::new(QueueBehindJob{
             id:11,vm:vm1.clone(),queue:q1.clone(),
             progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
             commands:vec![Command::Render(())],
             order:Order{engine:command::RENDER,sequence:6,wait_through:[Some(5),None]},
-            extra_orders:vec![],dependency:Ok(()),resources:Resources,
+            extra_orders:vec![],dependency:Ok(()),resources:Resources,fw_waits:vec![],
         });
         let mut grp_fs=[0u32;16];
         grp_fs[0]=0x400;grp_fs[1]=0x500;grp_fs[2]=0x600;
@@ -1226,7 +1236,7 @@ mod queue_behind_scope {
             progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
             commands:vec![Command::Render(())],
             order:Order{engine:command::RENDER,sequence:u64::from(id),wait_through:[None,None]},
-            extra_orders:vec![],dependency:Ok(()),resources:Resources,
+            extra_orders:vec![],dependency:Ok(()),resources:Resources,fw_waits:vec![],
         });
         let r_live=mk(1);
         let next_r=mk(2);
@@ -1272,7 +1282,7 @@ mod queue_behind_scope {
             progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
             commands:vec![if render{Command::Render(())}else{Command::Compute(ComputeCommand{query_access})}],
             order:Order{engine:if render{command::RENDER}else{command::COMPUTE},sequence:u64::from(id),wait_through:wait},
-            extra_orders:vec![],dependency:dep,resources:Resources,
+            extra_orders:vec![],dependency:dep,resources:Resources,fw_waits:vec![],
         });
         let r_live=mk(1,vm1.clone(),true,Ok(()),false,[None,None]);
         let r_same=mk(2,vm1.clone(),true,Ok(()),false,[None,None]);
@@ -1616,7 +1626,7 @@ mod queue_behind_scope {
             progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
             commands:vec![Command::Compute(ComputeCommand{query_access:false})],
             order:Order{engine:command::COMPUTE,sequence:seq,wait_through:[None,None]},
-            extra_orders:vec![],dependency:Ok(()),resources:Resources,
+            extra_orders:vec![],dependency:Ok(()),resources:Resources,fw_waits:vec![],
         });
         let c1=mk(1,vm1.clone(),q1.clone(),1);
         let c2=mk(2,vm1.clone(),q1.clone(),2);
@@ -1661,7 +1671,7 @@ mod queue_behind_scope {
             progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
             commands:vec![Command::Compute(ComputeCommand{query_access:false})],
             order:Order{engine:command::COMPUTE,sequence:seq,wait_through:[None,wait_c]},
-            extra_orders:vec![],dependency:Ok(()),resources:Resources,
+            extra_orders:vec![],dependency:Ok(()),resources:Resources,fw_waits:vec![],
         });
         let c1=mk(1,1,None);
         let c2=mk(2,2,None);
@@ -1711,6 +1721,73 @@ mod queue_behind_scope {
         q1.completed[command::COMPUTE].store(2, Ordering::Release);
         q1.compute_ooo.store(0, Ordering::Release);
         assert_eq!(host.wait_compute_stamps_for(&c4, Some(2)), Ok([None, None]));
+    }
+    #[test]fn cross_queue_fw_waits_resolve_stamps_reuse_compute_pipe_and_guard_timestamps(){
+        let vm1=Arc::new(Vm{status:Status(AtomicU32::new(0)),slot:1});
+        let q1=Queue::new(0,2);
+        let q2=Queue::new(0,2);
+        let c1=Arc::new(QueueBehindJob{
+            id:1,vm:vm1.clone(),queue:q1.clone(),
+            progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
+            commands:vec![Command::Compute(ComputeCommand{query_access:false})],
+            order:Order{engine:command::COMPUTE,sequence:1,wait_through:[None,None]},
+            extra_orders:vec![],dependency:Ok(()),resources:Resources,fw_waits:vec![],
+        });
+        let r1=Arc::new(QueueBehindJob{
+            id:2,vm:vm1.clone(),queue:q1.clone(),
+            progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
+            commands:vec![Command::Render(())],
+            order:Order{engine:command::RENDER,sequence:1,wait_through:[None,None]},
+            extra_orders:vec![],dependency:Ok(()),resources:Resources,fw_waits:vec![],
+        });
+        let c2_wait_q1=Arc::new(QueueBehindJob{
+            id:3,vm:vm1.clone(),queue:q2.clone(),
+            progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
+            commands:vec![Command::Compute(ComputeCommand{query_access:false})],
+            order:Order{engine:command::COMPUTE,sequence:1,wait_through:[None,None]},
+            extra_orders:vec![],dependency:Ok(()),resources:Resources,
+            fw_waits:vec![fence::FwWait{queue:q1.clone(),last_ordinal:[Some(1),Some(1)]}],
+        });
+        let c2_query_wait_q1=Arc::new(QueueBehindJob{
+            id:4,vm:vm1.clone(),queue:q2.clone(),
+            progress:Progress{sent:AtomicU32::new(0),count:1,pending:AtomicBool::new(true)},
+            commands:vec![Command::Compute(ComputeCommand{query_access:true})],
+            order:Order{engine:command::COMPUTE,sequence:2,wait_through:[None,None]},
+            extra_orders:vec![],dependency:Ok(()),resources:Resources,
+            fw_waits:vec![fence::FwWait{queue:q1.clone(),last_ordinal:[None,Some(1)]}],
+        });
+        let host=QueueBehindHost{
+            graph:QueueBehindGraph::new(),
+            engine:QueueBehindEngine{ordinal:1,draw:1,ta_target:0,next_compute_pipe:0,flights:vec![
+                QueueBehindFlight{
+                    job:c1,group:vec![],first:0,count:1,computes:1,renders:0,compute_pipe:0,target:0x100,
+                    cstamp:{let mut a=[0;16];a[0]=0x100;a},r_ta_stamp:[0;16],r_fs_stamp:[0;16],fs_target:0,
+                    initbm:false,has_timestamps:true,doomed:false,recovery_suspect:false,
+                },
+                QueueBehindFlight{
+                    job:r1,group:vec![],first:0,count:1,computes:0,renders:1,compute_pipe:0,target:0,
+                    cstamp:[0;16],r_ta_stamp:[0;16],r_fs_stamp:{let mut a=[0;16];a[0]=0x200;a},fs_target:0x200,
+                    initbm:false,has_timestamps:false,doomed:false,recovery_suspect:false,
+                },
+            ]},
+            slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
+            pools:QueueBehindPools{exhausted:false,can_pipeline:true,block_pipeline_vm:None},
+        };
+        // Cross-queue compute wait resolves pipe 0 stamp 0x100 and keeps q2 on pipe 0 (zero c2c).
+        let cw=host.wait_compute_stamps_for(&c2_wait_q1,None).unwrap();
+        assert_eq!(cw,[Some(WaitTarget{stamp:0x100,initbm:false}),None]);
+        assert_eq!(host.choose_compute_pipe(cw,24),0);
+        // Cross-queue render wait resolves q1's FS stamp 0x200.
+        assert_eq!(host.wait_stamp_for(&c2_wait_q1,command::RENDER,None),Ok(Some(WaitTarget{stamp:0x200,initbm:false})));
+        // query_access compute waiting via fw_waits on a timestamped q1 flight must wait to retire;
+        // non-query compute queues directly behind q1 in firmware.
+        assert!(!host.can_queue_behind(&c2_query_wait_q1));
+        assert!(host.can_queue_behind(&c2_wait_q1));
+        // Once q1 retires, fw_waits resolves to no barriers.
+        q1.completed[command::COMPUTE].store(1,Ordering::Release);
+        q1.completed[command::RENDER].store(1,Ordering::Release);
+        assert_eq!(host.wait_compute_stamps_for(&c2_wait_q1,None),Ok([None,None]));
+        assert_eq!(host.wait_stamp_for(&c2_wait_q1,command::RENDER,None),Ok(None));
     }
 }
 #[allow(non_camel_case_types, deprecated)]
@@ -1844,6 +1921,7 @@ mod compute_horizon_scope {
         commands: Vec<Command>,
         orders: Vec<Order>,
         inputs: Vec<bool>,
+        fw_waits: Vec<()>,
         terminal_retired: AtomicBool,
     }
     impl Job {
@@ -1865,6 +1943,7 @@ mod compute_horizon_scope {
             commands: cmds,
             orders,
             inputs,
+            fw_waits: vec![],
             terminal_retired: AtomicBool::new(false),
         };
         let ok_job = mk(
@@ -1925,6 +2004,15 @@ mod compute_horizon_scope {
             2,
         );
         assert!(!cancelled.can_fold_horizon_job(2));
+        let mut with_fw_wait = mk(
+            vec![Command::Compute(())],
+            vec![Order { engine: command::COMPUTE, sequence: 2, wait_through: [None, None] }],
+            vec![],
+            0,
+        );
+        with_fw_wait.fw_waits.push(());
+        assert!(!with_fw_wait.can_fold_horizon_cmd(0, 2));
+        assert!(!with_fw_wait.can_fold_horizon_job(2));
     }
 
     #[test]
@@ -1940,6 +2028,7 @@ mod compute_horizon_scope {
             commands: cmds,
             orders,
             inputs,
+            fw_waits: vec![],
             terminal_retired: AtomicBool::new(false),
         };
         let multi = mk(
@@ -1986,6 +2075,7 @@ mod compute_horizon_scope {
             commands: cmds,
             orders,
             inputs,
+            fw_waits: vec![],
             terminal_retired: AtomicBool::new(false),
         };
         // Two-pass render job waiting on primary flight pass 1 and its own pass 2.
@@ -2417,7 +2507,7 @@ for token, declaration in {
     '__RENDER_BARRIER_PLAN__': 'struct RenderBarrierPlan {',
     '__PLAN_RENDER_BARRIERS__': 'fn plan_render_barriers(',
 }.items():
-    harness = harness.replace(token, item(declaration).replace("super::command::", "crate::command::").replace("super::recovery::", "crate::recovery::").replace("super::hw::", "crate::hw::").replace("super::resources::", "crate::resources::"))
+    harness = harness.replace(token, item(declaration).replace("super::command::", "crate::command::").replace("super::recovery::", "crate::recovery::").replace("super::hw::", "crate::hw::").replace("super::resources::", "crate::resources::").replace("super::queue::QueueState", "crate::Queue").replace("super::fence::", "crate::fence::"))
 unit = output / 'publication.rs'
 unit.write_text(harness)
 log = ''

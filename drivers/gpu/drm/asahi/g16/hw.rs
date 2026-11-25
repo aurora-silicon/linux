@@ -607,9 +607,9 @@ pub(crate) mod client {
     pub(crate) const CWORK_STRIDE: u64 = 0x4000;
 
     // Render allocator units contain one 32 MiB UMA pool and its persistent lists in a
-    // 64 MiB stride. Slots 0..4 live in 0x7010000000..0x7020000000; slots 4..PB_SLOTS
-    // live in 0x7008000000..0x7010000000, above base compute units 0..2 (ending at
-    // 0x70070c0000) and below the render pass slot window (0x7020000000..0x7040000000).
+    // 64 MiB stride. Per-VM local slots 0..4 live in 0x7010000000..0x7020000000; local slots
+    // 4..MAX_VM_PB_SLOTS live in 0x7008000000..0x7010000000, above base compute units 0..2
+    // (ending at 0x70070c0000) and below the render pass slot window (0x7020000000..0x7040000000).
     pub(crate) const fn render_base(k: u64) -> u64 {
         if k < 4 {
             0x7010000000 + k * 0x04000000
@@ -714,11 +714,23 @@ pub(crate) mod sizes {
     pub(crate) const COMPUTE_SLOTS: usize = COMPUTE_UNITS;
     /// Base physical PB/UMA allocator slots allocated per VM on first render.
     pub(crate) const BASE_PB_SLOTS: usize = 2;
-    /// Physical PB/UMA allocator slots (`parameter_id` `0..PB_SLOTS`, hardware UMA slot 33).
-    /// Base slots `0..BASE_PB_SLOTS` serve normal cross-VM switching; extra slots are allocated
-    /// lazily per VM only after a render hang permanently quarantines an allocator slot.
-    pub(crate) const PB_SLOTS: usize = 6;
-    const _: () = assert!(PB_SLOTS >= BASE_PB_SLOTS && PB_SLOTS <= 6);
+    /// Device-wide warm physical PB/UMA allocator slots (`parameter_id` `0..WARM_PB_SLOTS`,
+    /// hardware UMA slots `33..33 + WARM_PB_SLOTS`). Each VM maps two base units (`local_idx`
+    /// `0..BASE_PB_SLOTS`) bound to a rotating `[home, alt]` pair in this pool so up to
+    /// `WARM_PB_SLOTS` concurrent render VMs stay warm without extra per-VM memory.
+    pub(crate) const WARM_PB_SLOTS: usize = 16;
+    /// Lazily allocated recovery PB/UMA allocator slots (`WARM_PB_SLOTS..PB_SLOTS`, mapped at
+    /// per-VM local VA indices `BASE_PB_SLOTS..MAX_VM_PB_SLOTS`) claimed only after a render
+    /// hang permanently quarantines an allocator slot.
+    pub(crate) const EXT_PB_SLOTS: usize = 4;
+    /// Maximum PB/UMA allocator slots mapped in one VM's client VA space (`render_base(0..6)`).
+    pub(crate) const MAX_VM_PB_SLOTS: usize = BASE_PB_SLOTS + EXT_PB_SLOTS;
+    /// Total device-wide physical PB/UMA allocator slots (`parameter_id` `0..PB_SLOTS`, hardware
+    /// UMA slots `RENDER_UMA_SLOT..RENDER_UMA_SLOT + PB_SLOTS`).
+    pub(crate) const PB_SLOTS: usize = WARM_PB_SLOTS + EXT_PB_SLOTS;
+    const _: () = assert!(WARM_PB_SLOTS >= BASE_PB_SLOTS);
+    const _: () = assert!(MAX_VM_PB_SLOTS >= BASE_PB_SLOTS && MAX_VM_PB_SLOTS <= 6);
+    const _: () = assert!(PB_SLOTS <= 32);
     const _: () =
         assert!(super::client::compute_context(1) + 0x40000 <= super::client::render_base(4));
     const _: () =

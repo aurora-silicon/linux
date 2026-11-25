@@ -697,6 +697,7 @@ mod render_admission_tests {
         pub(crate) vm: &'a mmu::Vm,
         pub(crate) usc_base: u64,
     }
+    use super::MAX_COMMANDS;
     RENDER_ADMISSION
 
     fn check_render_one(

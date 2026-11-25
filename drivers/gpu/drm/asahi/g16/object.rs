@@ -296,9 +296,26 @@ pub(crate) struct Request {
 
 /// Private allocation coordinates. Only normal non-cacheable objects may be reclaimed.
 struct Private {
-    vm: mmu::Vm,
+    vm: Option<mmu::Vm>,
     firmware: core::ops::Range<u64>,
     pending: Option<core::ops::Range<u64>>,
+}
+
+/// VM-independent firmware-object lease whose backing and firmware/lower mappings stay alive
+/// until a later command overwrites the same hardware table slot in firmware RAM.
+///
+/// Dropping an `Arc<FwLease>` offloads unmap to `cleanup::Deferred`, so replacing a lease under
+/// `Shared::state` never sleeps or blocks fence producers.
+pub(crate) struct FwLease(crate::cleanup::Deferred<Objects>);
+
+impl FwLease {
+    pub(crate) fn new(mut objects: Objects) -> Result<Arc<Self>> {
+        objects.finish_private()?;
+        Ok(Arc::new(
+            Self(crate::cleanup::Deferred::new(objects)?),
+            GFP_KERNEL,
+        )?)
+    }
 }
 
 /// Immutable factory shared by ioctl-side private arena construction.
@@ -317,7 +334,28 @@ impl Factory {
             uat: self.uat.clone(),
             window: self.window.clone(),
             private: Some(Private {
-                vm: vm.clone(),
+                vm: Some(vm.clone()),
+                firmware: self.firmware.clone(),
+                pending: None,
+            }),
+            sealed: false,
+            fw_next: self.firmware.start,
+            retained: KVec::new(),
+            clients: KVec::new(),
+            mappings: KVec::new(),
+            error: None,
+            pages: 0,
+        }
+    }
+
+    /// Allocates firmware-only and context-0 lower-alias objects with no client VM binding.
+    pub(crate) fn fw_objects(&self) -> Objects {
+        Objects {
+            dev: self.dev.clone(),
+            uat: self.uat.clone(),
+            window: self.window.clone(),
+            private: Some(Private {
+                vm: None,
                 firmware: self.firmware.clone(),
                 pending: None,
             }),
@@ -473,7 +511,8 @@ impl Objects {
             None
         };
         let client_gva = if let Some(range) = client_range {
-            let mapping = private.vm.map_in_range(
+            let vm = private.vm.as_ref().ok_or(EINVAL)?;
+            let mapping = vm.map_in_range(
                 &backing.gem,
                 0..bytes,
                 hw::PAGE,
@@ -485,6 +524,7 @@ impl Objects {
             self.mappings.push(mapping, GFP_KERNEL)?;
             Some(address)
         } else if let Some((gva, leaf)) = req.client {
+            let vm = private.vm.as_ref().ok_or(EINVAL)?;
             let end = gva.checked_add(bytes as u64).ok_or(EOVERFLOW)?;
             if gva < hw::client::CLIENT_APERTURE.start
                 || end > hw::client::CLIENT_APERTURE.end
@@ -494,9 +534,7 @@ impl Objects {
                 return Err(EINVAL);
             }
             self.mappings.push(
-                private
-                    .vm
-                    .map_at(gva, bytes, &backing.gem, mmu::Prot::from_pte(leaf), false)?,
+                vm.map_at(gva, bytes, &backing.gem, mmu::Prot::from_pte(leaf), false)?,
                 GFP_KERNEL,
             )?;
             Some(gva)

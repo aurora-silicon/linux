@@ -407,7 +407,7 @@ enum PublicationError {
 }
 
 /// Engine statistics, printed by `aurora-g16/stats`.
-#[derive(Default)]
+#[derive(Default, Zeroable)]
 pub(crate) struct Stats {
     pub(crate) pub_ns: u64,
     pub(crate) idle_from_ns: u64,
@@ -465,7 +465,7 @@ pub(crate) struct Stats {
 /// Host-side phase timers of publication and polling, on with `debug_flags` bit 49
 /// (`Debug1`); printed as the `prof:` line of `aurora-g16/stats`. A measurement aid: nothing is
 /// timed while the flag is off.
-#[derive(Default)]
+#[derive(Default, Zeroable)]
 pub(crate) struct Prof {
     /// Published prefixes timed.
     pub(crate) prefixes: u64,
@@ -520,17 +520,21 @@ struct Scratch {
 }
 
 impl Scratch {
-    fn new() -> Result<Self> {
+    #[inline(never)]
+    fn new_boxed() -> Result<KBox<Self>> {
         let z = |n| KVec::from_elem(0u8, n, GFP_KERNEL);
-        Ok(Self {
-            cw: z(work::compute::WORK_SIZE)?,
-            cq: z(work::compute::SEQ_SIZE)?,
-            ta: z(work::ta::WORK_SIZE)?,
-            tas: z(work::ta::SEQ_SIZE)?,
-            fs: z(work::fs::WORK_SIZE)?,
-            fss: z(work::fs::SEQ_SIZE)?,
-            scene: z(work::scene::ACTIVE_SIZE)?,
-        })
+        KBox::try_init(
+            try_init!(Self {
+                cw: z(work::compute::WORK_SIZE)?,
+                cq: z(work::compute::SEQ_SIZE)?,
+                ta: z(work::ta::WORK_SIZE)?,
+                tas: z(work::ta::SEQ_SIZE)?,
+                fs: z(work::fs::WORK_SIZE)?,
+                fss: z(work::fs::SEQ_SIZE)?,
+                scene: z(work::scene::ACTIVE_SIZE)?,
+            }),
+            GFP_KERNEL,
+        )
     }
 }
 
@@ -601,6 +605,7 @@ pub(crate) struct Engine {
 }
 
 impl Engine {
+    #[inline(never)]
     pub(crate) fn new() -> Result<Self> {
         // Wrapped native stamps are safe only while pending references fit within the
         // signed half-window: at most FLIGHTS commands are published at once, far inside it.
@@ -633,12 +638,12 @@ impl Engine {
             short_repoll: false,
             progress_flight: [0; 3],
             progress: [None; 4],
-            stats: KBox::new(Stats::default(), GFP_KERNEL)?,
-            prof: KBox::new(Prof::default(), GFP_KERNEL)?,
+            stats: KBox::zeroed(GFP_KERNEL)?,
+            prof: KBox::zeroed(GFP_KERNEL)?,
             debugfs: None,
             // Allocate host encoder buffers before any submitted fence can depend on
             // the device mutex. Publication must never enter direct reclaim here.
-            scratch: Some(KBox::new(Scratch::new()?, GFP_KERNEL)?),
+            scratch: Some(Scratch::new_boxed()?),
         })
     }
 
@@ -924,6 +929,7 @@ impl Firmware {
         }
         self.engine.pending.push(job.clone(), GFP_NOWAIT)?;
         job.progress.set_pending(true);
+        job.origin.mark_enqueued();
         let q = &job.queue;
         let owned = self.engine.queue_published(&job)
             + self
@@ -1121,8 +1127,8 @@ impl Firmware {
                 && matches!(command(&job, job.progress.sent()), Some(Command::Render(_)))
                 && (job
                     .resources
-                    .pb_slots()
-                    .is_ok_and(|n| self.pools.exhausted_for_within(&job.vm, n))
+                    .pb_slot_mask()
+                    .is_ok_and(|(mask, home)| self.pools.exhausted_for_mask(&job.vm, mask, home))
                     || job
                         .resources
                         .render_passes()
@@ -1299,10 +1305,11 @@ impl Firmware {
             || (is_render
                 && !job
                     .resources
-                    .pb_slots()
-                    .and_then(|n| Ok((n, job.resources.pb_heap_blocks()?)))
-                    .is_ok_and(|(n, blocks)| {
-                        self.pools.can_pipeline_within_blocks(&job.vm, n, blocks)
+                    .pb_slot_mask()
+                    .and_then(|(mask, home)| Ok((mask, home, job.resources.pb_heap_blocks()?)))
+                    .is_ok_and(|(mask, home, blocks)| {
+                        self.pools
+                            .can_pipeline_in_mask_blocks(&job.vm, mask, home, blocks)
                     }))
     }
 
@@ -1413,7 +1420,7 @@ impl Firmware {
                 // retirement, so dispatches without DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS must wait
                 // for prior timestamped flights in their dependency prefix to retire first.
                 let waits_for_timestamps = c.query_access
-                    && job.command_order(sent).is_some_and(|o| {
+                    && (job.command_order(sent).is_some_and(|o| {
                         let waits_class = |class: usize| {
                             o.wait_through[class].is_some_and(|last| {
                                 e.flights.iter().any(|f| {
@@ -1432,7 +1439,25 @@ impl Firmware {
                             })
                         };
                         waits_class(super::command::COMPUTE) || waits_class(super::command::RENDER)
-                    });
+                    }) || job.fw_waits.iter().any(|w| {
+                        (0..2).any(|class| {
+                            w.last_ordinal[class].is_some_and(|last| {
+                                e.flights.iter().any(|f| {
+                                    let matches_class = if class == super::command::RENDER {
+                                        f.renders != 0
+                                    } else {
+                                        f.computes != 0
+                                    };
+                                    matches_class
+                                        && f.has_timestamps
+                                        && Arc::ptr_eq(&f.job.queue, &w.queue)
+                                        && f.job
+                                            .command_order(f.first as u32)
+                                            .is_none_or(|fo| fo.sequence <= last)
+                                })
+                            })
+                        })
+                    }));
                 let cross_vm_render = e
                     .flights
                     .iter()
@@ -1462,10 +1487,11 @@ impl Firmware {
                     && super::recovery::logic::next_ordinal(e.draw).is_some()
                     && job
                         .resources
-                        .pb_slots()
-                        .and_then(|n| Ok((n, job.resources.pb_heap_blocks()?)))
-                        .is_ok_and(|(n, blocks)| {
-                            self.pools.can_pipeline_within_blocks(&job.vm, n, blocks)
+                        .pb_slot_mask()
+                        .and_then(|(mask, home)| Ok((mask, home, job.resources.pb_heap_blocks()?)))
+                        .is_ok_and(|(mask, home, blocks)| {
+                            self.pools
+                                .can_pipeline_in_mask_blocks(&job.vm, mask, home, blocks)
                         })
                     && job
                         .resources
@@ -1476,10 +1502,10 @@ impl Firmware {
         }
     }
 
-    /// Resolves a same-queue target stamp and producer `InitBM` state for `class` (`RENDER` ->
-    /// `r_fs_stamp`, `COMPUTE` -> `cstamp`) when `target_seq` names an in-flight command of
-    /// `job.queue` or an earlier member of an in-progress render batch `current`. Returns
-    /// `Ok(None)` when no barrier was requested or the waited prefix has already retired.
+    /// Resolves the newest in-flight target stamp and producer `InitBM` state for `class`
+    /// (`RENDER` -> `r_fs_stamp`, `COMPUTE` -> `cstamp`) across `job`'s same-queue `target_seq`
+    /// and any cross-queue `job.fw_waits` (plus an earlier member of an in-progress render batch
+    /// `current`). Returns `Ok(None)` when no barrier is needed or every waited prefix retired.
     fn wait_stamp_for_with(
         &self,
         job: &Arc<Job>,
@@ -1487,97 +1513,128 @@ impl Firmware {
         target_seq: Option<u64>,
         current: Option<&Flight>,
     ) -> Result<Option<WaitTarget>> {
-        let Some(last) = target_seq else {
-            return Ok(None);
-        };
-        if job.queue.completed[class].load(Ordering::Acquire) >= last {
+        let mut targets: [Option<(&Arc<super::queue::QueueState>, u64, bool)>;
+            1 + super::fence::MAX_FW_WAITS] = [None; 1 + super::fence::MAX_FW_WAITS];
+        let mut count = 0usize;
+        if let Some(last) = target_seq {
+            if job.queue.completed[class].load(Ordering::Acquire) < last {
+                targets[count] = Some((&job.queue, last, false));
+                count += 1;
+            }
+        }
+        for wait in job.fw_waits.iter() {
+            let Some(last) = wait.last_ordinal[class] else {
+                continue;
+            };
+            if wait.queue.completed[class].load(Ordering::Acquire) >= last {
+                continue;
+            }
+            if let Some(slot) = targets[..count]
+                .iter_mut()
+                .flatten()
+                .find(|(q, _, _)| Arc::ptr_eq(q, &wait.queue))
+            {
+                slot.1 = slot.1.max(last);
+            } else if count < targets.len() {
+                targets[count] = Some((&wait.queue, last, false));
+                count += 1;
+            } else {
+                return Err(EAGAIN);
+            }
+        }
+        if count == 0 {
             return Ok(None);
         }
-        if class == super::command::COMPUTE {
-            for flight in &self.engine.flights {
-                if flight.computes == 0 || !Arc::ptr_eq(&flight.job.queue, &job.queue) {
-                    continue;
+        let mut newest: Option<WaitTarget> = None;
+        let scan_flight = |flight: &Flight,
+                           targets: &mut [Option<(&Arc<super::queue::QueueState>, u64, bool)>],
+                           newest: &mut Option<WaitTarget>|
+         -> Result {
+            if class == super::command::COMPUTE {
+                if flight.computes == 0 {
+                    return Ok(());
                 }
-                let mut member = 0usize;
-                for k in flight.first..flight.first + flight.count {
-                    if flight.job.command_order(k as u32).is_some_and(|fo| {
-                        fo.engine == super::command::COMPUTE && fo.sequence == last
-                    }) {
-                        return Ok(Some(WaitTarget {
-                            stamp: *flight.cstamp.get(member).ok_or(EAGAIN)?,
-                            initbm: flight.initbm,
-                        }));
-                    }
-                    member += 1;
-                }
-                for j2 in flight.group.iter() {
-                    for k in 0..j2.progress.count() {
-                        if j2.command_order(k).is_some_and(|fo| {
-                            fo.engine == super::command::COMPUTE && fo.sequence == last
-                        }) {
-                            return Ok(Some(WaitTarget {
-                                stamp: *flight.cstamp.get(member).ok_or(EAGAIN)?,
-                                initbm: flight.initbm,
-                            }));
-                        }
-                        member += 1;
-                    }
-                }
+            } else if flight.renders == 0 {
+                return Ok(());
             }
-            return Err(EAGAIN);
-        }
-        let find_render = |flight: &Flight| -> Option<WaitTarget> {
-            if flight.renders == 0 || !Arc::ptr_eq(&flight.job.queue, &job.queue) {
-                return None;
+            if !targets
+                .iter()
+                .flatten()
+                .any(|(q, _, _)| Arc::ptr_eq(&flight.job.queue, q))
+            {
+                return Ok(());
             }
-            let max_members = (flight.renders as usize).min(flight.r_fs_stamp.len());
+            let max_members = if class == super::command::COMPUTE {
+                (flight.computes as usize).min(flight.cstamp.len())
+            } else {
+                (flight.renders as usize).min(flight.r_fs_stamp.len())
+            };
             let mut member = 0usize;
             for k in flight.first..flight.first + flight.count {
                 if member >= max_members {
-                    return None;
+                    break;
                 }
-                if flight
-                    .job
-                    .command_order(k as u32)
-                    .is_some_and(|fo| fo.engine == super::command::RENDER && fo.sequence == last)
-                {
-                    return Some(WaitTarget {
-                        stamp: flight.r_fs_stamp[member],
-                        initbm: flight.initbm,
-                    });
+                if let Some(fo) = flight.job.command_order(k as u32) {
+                    if fo.engine == class {
+                        for (q, last, found) in targets.iter_mut().flatten() {
+                            if Arc::ptr_eq(&flight.job.queue, q) && fo.sequence == *last {
+                                *found = true;
+                                let stamp = if class == super::command::COMPUTE {
+                                    flight.cstamp[member]
+                                } else {
+                                    flight.r_fs_stamp[member]
+                                };
+                                *newest = Some(WaitTarget {
+                                    stamp,
+                                    initbm: flight.initbm,
+                                });
+                            }
+                        }
+                    }
                 }
                 member += 1;
             }
             for j2 in flight.group.iter() {
                 for k in 0..j2.progress.count() {
                     if member >= max_members {
-                        return None;
+                        break;
                     }
-                    if j2.command_order(k).is_some_and(|fo| {
-                        fo.engine == super::command::RENDER && fo.sequence == last
-                    }) {
-                        return Some(WaitTarget {
-                            stamp: flight.r_fs_stamp[member],
-                            initbm: flight.initbm,
-                        });
+                    if let Some(fo) = j2.command_order(k) {
+                        if fo.engine == class {
+                            for (q, last, found) in targets.iter_mut().flatten() {
+                                if Arc::ptr_eq(&flight.job.queue, q) && fo.sequence == *last {
+                                    *found = true;
+                                    let stamp = if class == super::command::COMPUTE {
+                                        flight.cstamp[member]
+                                    } else {
+                                        flight.r_fs_stamp[member]
+                                    };
+                                    *newest = Some(WaitTarget {
+                                        stamp,
+                                        initbm: flight.initbm,
+                                    });
+                                }
+                            }
+                        }
                     }
                     member += 1;
                 }
             }
-            None
+            Ok(())
         };
-        if let Some(target) = current.and_then(find_render) {
-            return Ok(Some(target));
-        }
         for flight in &self.engine.flights {
-            if let Some(target) = find_render(flight) {
-                return Ok(Some(target));
-            }
+            scan_flight(flight, &mut targets[..count], &mut newest)?;
         }
-        Err(EAGAIN)
+        if let Some(cur) = current {
+            scan_flight(cur, &mut targets[..count], &mut newest)?;
+        }
+        if targets[..count].iter().flatten().any(|(_, _, found)| !*found) {
+            return Err(EAGAIN);
+        }
+        Ok(newest)
     }
 
-    /// Resolves a same-queue target stamp for `class` across published in-flight flights.
+    /// Resolves a same-queue or cross-queue target stamp for `class` across published flights.
     fn wait_stamp_for(
         &self,
         job: &Arc<Job>,
@@ -1587,10 +1644,9 @@ impl Firmware {
         self.wait_stamp_for_with(job, class, target_seq, None)
     }
 
-    /// Resolves a same-queue cross-engine barrier target when `job`'s command `index` waits on
-    /// an in-flight command of `other` engine (`RENDER` -> `r_fs_stamp`, `COMPUTE` -> `cstamp`).
-    /// Returns `Ok(None)` when no cross-engine barrier was requested or the waited prefix has
-    /// already retired.
+    /// Resolves a cross-engine barrier target when `job`'s command `index` waits on an in-flight
+    /// command of `other` engine (`RENDER` -> `r_fs_stamp`, `COMPUTE` -> `cstamp`), including
+    /// cross-queue `fw_waits`. Returns `Ok(None)` when no barrier is needed or retired.
     fn cross_engine_wait(
         &self,
         job: &Arc<Job>,
@@ -1603,26 +1659,55 @@ impl Firmware {
         self.wait_stamp_for(job, other, target_seq)
     }
 
-    /// Resolves the newest in-flight same-queue compute producer on each compute pipe with
-    /// ordinal `<= target_seq`. Returns `Ok([None; COMPUTE_PIPES])` when no barrier was
-    /// requested or the entire prefix through `target_seq` has already retired, and `Err(EAGAIN)`
-    /// if `target_seq` is neither in flight nor retired.
+    /// Resolves the newest in-flight compute producer on each compute pipe across `job`'s
+    /// same-queue `target_seq` and any cross-queue `job.fw_waits`. Returns
+    /// `Ok([None; COMPUTE_PIPES])` when no barrier is needed or every waited prefix retired,
+    /// and `Err(EAGAIN)` if any unretired target ordinal is missing from `flights`.
     fn wait_compute_stamps_for(
         &self,
         job: &Arc<Job>,
         target_seq: Option<u64>,
     ) -> Result<[Option<WaitTarget>; sizes::COMPUTE_PIPES]> {
-        let Some(last) = target_seq else {
-            return Ok([None; sizes::COMPUTE_PIPES]);
-        };
-        if job.queue.completed[super::command::COMPUTE].load(Ordering::Acquire) >= last {
+        let mut targets: [Option<(&Arc<super::queue::QueueState>, u64, bool)>;
+            1 + super::fence::MAX_FW_WAITS] = [None; 1 + super::fence::MAX_FW_WAITS];
+        let mut count = 0usize;
+        if let Some(last) = target_seq {
+            if job.queue.completed[super::command::COMPUTE].load(Ordering::Acquire) < last {
+                targets[count] = Some((&job.queue, last, false));
+                count += 1;
+            }
+        }
+        for wait in job.fw_waits.iter() {
+            let Some(last) = wait.last_ordinal[super::command::COMPUTE] else {
+                continue;
+            };
+            if wait.queue.completed[super::command::COMPUTE].load(Ordering::Acquire) >= last {
+                continue;
+            }
+            if let Some(slot) = targets[..count]
+                .iter_mut()
+                .flatten()
+                .find(|(q, _, _)| Arc::ptr_eq(q, &wait.queue))
+            {
+                slot.1 = slot.1.max(last);
+            } else if count < targets.len() {
+                targets[count] = Some((&wait.queue, last, false));
+                count += 1;
+            } else {
+                return Err(EAGAIN);
+            }
+        }
+        if count == 0 {
             return Ok([None; sizes::COMPUTE_PIPES]);
         }
         let mut waits = [None; sizes::COMPUTE_PIPES];
-        let mut best_seq = [0u64; sizes::COMPUTE_PIPES];
-        let mut found_last = false;
         for flight in &self.engine.flights {
-            if flight.computes == 0 || !Arc::ptr_eq(&flight.job.queue, &job.queue) {
+            if flight.computes == 0
+                || !targets[..count]
+                    .iter()
+                    .flatten()
+                    .any(|(q, _, _)| Arc::ptr_eq(&flight.job.queue, q))
+            {
                 continue;
             }
             let pipe = flight.compute_pipe as usize;
@@ -1632,12 +1717,17 @@ impl Firmware {
             let mut member = 0usize;
             for k in flight.first..flight.first + flight.count {
                 if let Some(fo) = flight.job.command_order(k as u32) {
-                    if fo.engine == super::command::COMPUTE && fo.sequence <= last {
-                        if fo.sequence == last {
-                            found_last = true;
+                    if fo.engine == super::command::COMPUTE {
+                        let mut matched = false;
+                        for (q, last, found) in targets[..count].iter_mut().flatten() {
+                            if Arc::ptr_eq(&flight.job.queue, q) && fo.sequence <= *last {
+                                if fo.sequence == *last {
+                                    *found = true;
+                                }
+                                matched = true;
+                            }
                         }
-                        if fo.sequence >= best_seq[pipe] {
-                            best_seq[pipe] = fo.sequence;
+                        if matched {
                             waits[pipe] = Some(WaitTarget {
                                 stamp: *flight.cstamp.get(member).ok_or(EAGAIN)?,
                                 initbm: flight.initbm,
@@ -1650,12 +1740,17 @@ impl Firmware {
             for j2 in flight.group.iter() {
                 for k in 0..j2.progress.count() {
                     if let Some(fo) = j2.command_order(k) {
-                        if fo.engine == super::command::COMPUTE && fo.sequence <= last {
-                            if fo.sequence == last {
-                                found_last = true;
+                        if fo.engine == super::command::COMPUTE {
+                            let mut matched = false;
+                            for (q, last, found) in targets[..count].iter_mut().flatten() {
+                                if Arc::ptr_eq(&flight.job.queue, q) && fo.sequence <= *last {
+                                    if fo.sequence == *last {
+                                        *found = true;
+                                    }
+                                    matched = true;
+                                }
                             }
-                            if fo.sequence >= best_seq[pipe] {
-                                best_seq[pipe] = fo.sequence;
+                            if matched {
                                 waits[pipe] = Some(WaitTarget {
                                     stamp: *flight.cstamp.get(member).ok_or(EAGAIN)?,
                                     initbm: flight.initbm,
@@ -1667,8 +1762,10 @@ impl Firmware {
                 }
             }
         }
-        if !found_last && !job.queue.is_compute_retired(last) {
-            return Err(EAGAIN);
+        for (q, last, found) in targets[..count].iter().flatten() {
+            if !*found && !q.is_compute_retired(*last) {
+                return Err(EAGAIN);
+            }
         }
         Ok(waits)
     }
@@ -1734,13 +1831,13 @@ impl Firmware {
         let mut a = job
             .resources
             .prepare_pb_in_flight(alloc_slot, draw, render_pipelined)?;
-        let pb_slots = job.resources.pb_slots()?;
+        let (pb_mask, _) = job.resources.pb_slot_mask()?;
         let heap_blocks = job.resources.pb_heap_blocks()?;
         // Reuse this VM's retired epoch of the allocator slot when still bound and sized for the
         // VM's current PB heap (no reseed/InitBM); if the PB heap grew, rotate onto a fresh epoch.
         let (epoch, reused) = match self
             .pools
-            .reusable_for_within(alloc_slot, &job.vm, pb_slots, heap_blocks)
+            .reusable_for_mask(alloc_slot, &job.vm, pb_mask, heap_blocks)
         {
             Some(e) => {
                 self.pools.stats.reused += 1;
@@ -1844,6 +1941,7 @@ impl Firmware {
     /// producer writes and queue kicks. EAGAIN defers while storage/channel state is held;
     /// The error records whether firmware may see a counter/producer update, independently
     /// of errno; unpublished EIO is still an ordinary job failure.
+    #[inline(never)]
     fn publish_prefix(
         &mut self,
         job: &Arc<Job>,
@@ -2175,7 +2273,10 @@ impl Firmware {
                 }) {
                     return Err(E2BIG);
                 }
-                let Some(k) = self.slots.pick_pass_in(&job.resources, &geometry, 0) else {
+                let Some(k) =
+                    self.slots
+                        .pick_pass_in_for(&job.resources, &geometry, 0, Some(job.vm.id))
+                else {
                     self.engine.slot_wait = true;
                     return Err(EAGAIN);
                 };
@@ -2232,10 +2333,11 @@ impl Firmware {
                             break;
                         }
                         let geo2 = Geometry::new(&r2.cmd, 0);
-                        let Some(k2) = self.slots.pick_pass_in(
+                        let Some(k2) = self.slots.pick_pass_in_for(
                             &job.resources,
                             &geo2,
                             f.claims.pass_mask,
+                            Some(job.vm.id),
                         ) else {
                             break;
                         };
@@ -2361,10 +2463,11 @@ impl Firmware {
                                     break;
                                 };
                                 let geo2 = Geometry::new(&r2.cmd, 0);
-                                let Some(slot) = self.slots.pick_pass_in(
+                                let Some(slot) = self.slots.pick_pass_in_for(
                                     &job.resources,
                                     &geo2,
                                     picked_mask,
+                                    Some(job.vm.id),
                                 ) else {
                                     precheck_ok = false;
                                     break;
@@ -2466,6 +2569,7 @@ impl Firmware {
                 f.pb_slot as usize,
                 &job.vm,
                 job.resources.pb_owner_arena(f.pb_slot as usize),
+                job.resources.pb_uma_lease(f.pb_slot as usize),
             )?;
         }
         // Reserve lifetime ownership before any counter or producer becomes reachable.
@@ -2913,8 +3017,20 @@ impl Firmware {
                 .rev()
                 .find(|fl| fl.renders != 0)
                 .is_some_and(|fl| !Arc::ptr_eq(&fl.job.vm, &job.vm));
+        let plan_flags = if !staged
+            && job.fw_waits.iter().any(|w| {
+                w.last_ordinal[super::command::RENDER].is_some_and(|last| {
+                    w.queue.completed[super::command::RENDER].load(Ordering::Acquire) < last
+                })
+            })
+        {
+            cmd.cmd.flags
+                & !kernel::uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_FRAGMENT_BARRIERS
+        } else {
+            cmd.cmd.flags
+        };
         let plan = plan_render_barriers(
-            cmd.cmd.flags,
+            plan_flags,
             has_prior_render,
             params::early_tiling(),
             prev_fs,
@@ -2931,11 +3047,11 @@ impl Firmware {
             .claim_pass_in(resources, k, Some(job.vm.id), geometry.tilemap_bytes)?;
         self.slots.hold_render_pass(k, &job.vm, resources)?;
         let (refs, init_buffer) = if member == 0 {
-            let pb_slots = resources.pb_slots()?;
+            let (pb_mask, pb_home) = resources.pb_slot_mask()?;
             let heap_blocks = resources.pb_heap_blocks()?;
             let alloc_slot = self
                 .pools
-                .pick_slot_within_blocks(&job.vm, behind, pb_slots, heap_blocks)
+                .pick_slot_in_mask_blocks(&job.vm, behind, pb_mask, pb_home, heap_blocks)
                 .ok_or(EAGAIN)?;
             let slot_pipelined = self.pools.slot_inflight(alloc_slot) > 0;
             let (refs, init_buffer, epoch, binding) =

@@ -213,6 +213,7 @@ struct Shared {
     sleeping: AtomicBool,
     evented: AtomicBool,
     publish_wake: AtomicBool,
+    closed_vm_reclaim: AtomicBool,
     rearmed: Cell<u32>,
     idle_power_polls: Cell<u32>,
     rearm_soon: Cell<u32>,
@@ -224,6 +225,7 @@ impl Shared {
             sleeping: AtomicBool::new(false),
             evented: AtomicBool::new(false),
             publish_wake: AtomicBool::new(false),
+            closed_vm_reclaim: AtomicBool::new(false),
             rearmed: Cell::new(0),
             idle_power_polls: Cell::new(0),
             rearm_soon: Cell::new(0),
@@ -263,12 +265,30 @@ impl Power {
 }
 
 #[derive(Default)]
+struct Pools {
+    reclaim_calls: u32,
+    reclaim_remaining: bool,
+}
+impl Pools {
+    fn reclaim_closed(&mut self) -> bool {
+        self.reclaim_calls += 1;
+        self.reclaim_remaining
+    }
+}
+
+#[derive(Default)]
 struct Slots {
     scrub_woke: AtomicBool,
+    reclaim_calls: u32,
+    reclaim_remaining: bool,
 }
 impl Slots {
     fn take_scrub_woke(&self) -> bool {
         self.scrub_woke.swap(false, Ordering::AcqRel)
+    }
+    fn reclaim_closed(&mut self) -> bool {
+        self.reclaim_calls += 1;
+        self.reclaim_remaining
     }
 }
 
@@ -280,6 +300,7 @@ struct Firmware {
     events: Events,
     recovery: Recovery,
     power: Power,
+    pools: Pools,
     slots: Slots,
     last_housekeeping_ns: u64,
     last_aux_drain_ns: u64,
@@ -333,6 +354,7 @@ impl Firmware {
             events: Events::default(),
             recovery: Recovery::default(),
             power: Power::default(),
+            pools: Pools::default(),
             slots: Slots::default(),
             last_housekeeping_ns: 0,
             last_aux_drain_ns: 0,
@@ -410,10 +432,55 @@ impl Firmware {
         self.ta_pending
     }
 
+    __RECLAIM_CLOSED_VM_SLOTS__
     __POLL_STEP__
     __OLDEST_TERMINAL_EVENTS__
     __TA_WAVE_READY__
     __OLDEST_STAMP_REACHED__
+}
+
+#[test]
+fn idle_poll_step_reclaims_closed_vm_slots_and_rearms_while_remaining() {
+    CLOCK.with(|c| c.set(1_000_000));
+    let shared = Shared::new();
+    let mut fw = Firmware::new();
+    fw.engine.shared = Some(shared.clone());
+    shared.closed_vm_reclaim.store(true, Ordering::Release);
+    shared.publish_wake.store(true, Ordering::Release);
+    fw.pools.reclaim_remaining = true;
+
+    let (mut retry_tail, mut hk_deferred, mut done) = (false, false, vec![]);
+    let busy = fw
+        .poll_step(false, 0, &mut retry_tail, &mut hk_deferred, &mut done)
+        .unwrap();
+    assert!(!busy);
+    assert_eq!((fw.pools.reclaim_calls, fw.slots.reclaim_calls), (1, 1));
+    assert!(!shared.publish_wake.load(Ordering::Acquire));
+    assert!(
+        shared.closed_vm_reclaim.load(Ordering::Acquire),
+        "remaining undisplaced closed VM keeps reclaim armed"
+    );
+
+    // Once remaining clears, idle poll clears closed_vm_reclaim and later polls skip scans.
+    fw.pools.reclaim_remaining = false;
+    let _ = fw
+        .poll_step(false, 0, &mut retry_tail, &mut hk_deferred, &mut done)
+        .unwrap();
+    assert_eq!((fw.pools.reclaim_calls, fw.slots.reclaim_calls), (2, 2));
+    assert!(!shared.closed_vm_reclaim.load(Ordering::Acquire));
+
+    let _ = fw
+        .poll_step(false, 0, &mut retry_tail, &mut hk_deferred, &mut done)
+        .unwrap();
+    assert_eq!((fw.pools.reclaim_calls, fw.slots.reclaim_calls), (2, 2));
+
+    // Idle submit_locked also reclaims before publish_checked when armed.
+    shared.closed_vm_reclaim.store(true, Ordering::Release);
+    shared
+        .submit_locked(&mut fw, Arc::new(Job { id: 9 }), &mut done)
+        .unwrap();
+    assert_eq!((fw.pools.reclaim_calls, fw.slots.reclaim_calls), (3, 3));
+    assert!(!shared.closed_vm_reclaim.load(Ordering::Acquire));
 }
 
 #[test]
@@ -1501,6 +1568,7 @@ harness = harness.replace(
 
 for token, decl in {
     '__SUBMIT_LOCKED__': 'fn submit_locked(',
+    '__RECLAIM_CLOSED_VM_SLOTS__': 'pub(crate) fn reclaim_closed_vm_slots(',
     '__POLL_STEP__': 'pub(crate) fn poll_step(',
     '__RUN_HOUSEKEEPING__': 'pub(crate) fn run_housekeeping(',
     '__OLDEST_TERMINAL_EVENTS__': 'fn oldest_terminal_events(',
@@ -1537,7 +1605,7 @@ for command in [
     json.dumps(
         {
             'passed': True,
-            'tests': 21,
+            'tests': 22,
             'cpu_only': True,
             'hardware_execution': False,
             'scope': 'Verbatim production submit_locked inline retirement and poll_step TA-only non-spin logic.',

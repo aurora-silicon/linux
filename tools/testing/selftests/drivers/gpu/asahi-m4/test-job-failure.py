@@ -32,8 +32,8 @@ def function_from(text, marker_text):
 def function(text, name):
     return function_from(text, 'fn ' + name + '(')
 
-queue_methods = '\n'.join(function(queue_source, name) for name in ['cancel', 'check', 'is_compute_retired'])
-methods = '\n'.join(function(source, name) for name in ['latch_failure', 'complete', 'finish', 'is_started', 'try_start_inline', 'start', 'check_command_dependencies', 'command_retired', 'note_full_retirement', 'mark_terminal_retired'])
+queue_methods = '\n'.join(function(queue_source, name) for name in ['cancel', 'check', 'cancelled_through', 'is_compute_retired'])
+methods = '\n'.join(function(source, name) for name in ['latch_failure', 'complete', 'finish', 'is_started', 'try_start_inline', 'start', 'check_command_dependencies', 'command_retired', 'note_full_retirement', 'mark_terminal_retired', 'waits_on_queue'])
 push_method = function_from(source, 'pub(crate) fn push(&mut self, job: Arc<Job>')
 fence_methods = '\n'.join(function(fence_source, name) for name in ['dependency_status', 'check_dependencies', 'wait_dependencies'])
 harness = r'''
@@ -102,7 +102,13 @@ impl Fence {
 mod command { pub(crate) use super::{Order, COMPUTE}; }
 struct QueueState { completed:[AtomicU64;2],published:[AtomicU64;2],cancelled_at:[AtomicU64;2],compute_ooo:AtomicU64 }
 impl QueueState { QUEUE_METHODS }
-struct Job { id:u64,vm:Vm,_guard:Guard,progress:Progress,started:AtomicBool,accepted:AtomicBool,fence:Fence,commands:Vec<()>,inputs:Vec<InputFence>,orders:Vec<Order>,queue:Arc<QueueState>,full_retired:AtomicU64,terminal_retired:AtomicBool }
+struct FenceOrigin { queue:Arc<QueueState>, last_ordinal:[Option<u64>;2], failed:AtomicBool }
+impl FenceOrigin {
+    fn new(queue:Arc<QueueState>, last_ordinal:[Option<u64>;2])->Arc<Self> { Arc::new(Self{queue,last_ordinal,failed:AtomicBool::new(false)}) }
+    fn mark_failed(&self) { self.failed.store(true,Ordering::Release); }
+    fn is_failed(&self)->bool { self.failed.load(Ordering::Acquire) }
+}
+struct Job { id:u64,vm:Vm,_guard:Guard,progress:Progress,started:AtomicBool,accepted:AtomicBool,fence:Fence,commands:Vec<()>,inputs:Vec<InputFence>,origin:Arc<FenceOrigin>,fw_waits:Vec<Arc<FenceOrigin>>,orders:Vec<Order>,queue:Arc<QueueState>,full_retired:AtomicU64,terminal_retired:AtomicBool }
 struct Shared { crashed:AtomicBool,sleeping:AtomicBool,recovering:AtomicBool,contended:AtomicBool,submitted:Mutex<Vec<u64>>,submit_result:Result }
 impl Shared {
     fn new()->Arc<Self> {
@@ -183,9 +189,10 @@ fn job_with_inputs(id:u64,status:Arc<Status>,inputs:Vec<InputFence>)->Arc<Job> {
     job_with_orders(id,status,inputs,orders,Arc::new(QueueState{completed:[const{AtomicU64::new(0)};2],published:[const{AtomicU64::new(0)};2],cancelled_at:[const{AtomicU64::new(0)};2],compute_ooo:AtomicU64::new(0)}))
 }
 fn job_with_orders(id:u64,status:Arc<Status>,inputs:Vec<InputFence>,orders:Vec<Order>,queue:Arc<QueueState>)->Arc<Job> {
+    let origin=FenceOrigin::new(queue.clone(),[None,Some(orders.len() as u64)]);
     Arc::new(Job{id,vm:Vm{status:status.clone()},_guard:Guard(AtomicBool::new(false)),
         progress:Progress{signaled:AtomicBool::new(false),sent:AtomicU32::new(0),next:AtomicU32::new(0),pending:AtomicBool::new(false)},started:AtomicBool::new(false),accepted:AtomicBool::new(true),
-        fence:Fence{vm:status,signals:Mutex::new(vec![])},commands:vec![();orders.len()],inputs,orders,queue,
+        fence:Fence{vm:status,signals:Mutex::new(vec![])},commands:vec![();orders.len()],inputs,origin,fw_waits:vec![],orders,queue,
         full_retired:AtomicU64::new(0),terminal_retired:AtomicBool::new(false)})
 }
 #[test]
@@ -581,6 +588,56 @@ fn compute_ooo_retirement_tracks_gaps_and_rejects_unpublished_or_duplicate() {
     assert_eq!(queue.completed[COMPUTE].load(Ordering::Acquire),4);
     assert_eq!(queue.compute_ooo.load(Ordering::Acquire),0);
 }
+#[test]
+fn fw_wait_defers_until_producer_queue_publishes_and_propagates_failure() {
+    let q1=Arc::new(QueueState{completed:[const{AtomicU64::new(0)};2],published:[const{AtomicU64::new(0)};2],cancelled_at:[const{AtomicU64::new(0)};2],compute_ooo:AtomicU64::new(0)});
+    let q2=Arc::new(QueueState{completed:[const{AtomicU64::new(0)};2],published:[const{AtomicU64::new(0)};2],cancelled_at:[const{AtomicU64::new(0)};2],compute_ooo:AtomicU64::new(0)});
+    let status=Arc::new(Status::new());
+    let p_orders=vec![Order::new([0,0],[0,0],[NONE;2],[0;2],1).unwrap()];
+    let c_orders=vec![Order::new([0,0],[0,0],[NONE;2],[0;2],1).unwrap()];
+    let prod=job_with_orders(1,status.clone(),vec![],p_orders,q1.clone());
+    let cons=Arc::new(Job{
+        id:2,vm:Vm{status:status.clone()},_guard:Guard(AtomicBool::new(false)),
+        progress:Progress{signaled:AtomicBool::new(false),sent:AtomicU32::new(0),next:AtomicU32::new(0),pending:AtomicBool::new(false)},
+        started:AtomicBool::new(false),accepted:AtomicBool::new(true),
+        fence:Fence{vm:status,signals:Mutex::new(vec![])},commands:vec![()],inputs:vec![],
+        origin:FenceOrigin::new(q2.clone(),[None,Some(1)]),
+        fw_waits:vec![prod.origin.clone()],orders:c_orders,queue:q2.clone(),
+        full_retired:AtomicU64::new(0),terminal_retired:AtomicBool::new(false),
+    });
+    assert!(cons.waits_on_queue(&q1));
+    assert!(!cons.waits_on_queue(&q2));
+    // Producer not yet published -> consumer defers with EAGAIN.
+    assert_eq!(cons.check_command_dependencies(0),Err(EAGAIN));
+    // Once producer publishes ordinal 1, consumer is ready for firmware handoff.
+    q1.published[COMPUTE].store(1,Ordering::Release);
+    assert_eq!(cons.check_command_dependencies(0),Ok(()));
+    // Producer failure marks origin failed and cancels consumer with ECANCELED.
+    prod.latch_failure(ECANCELED);
+    assert!(prod.origin.is_failed());
+    assert_eq!(cons.check_command_dependencies(0),Err(ECANCELED));
+}
+#[test]
+fn fw_wait_cancels_when_producer_queue_cancels_ordinal() {
+    let q1=Arc::new(QueueState{completed:[const{AtomicU64::new(0)};2],published:[AtomicU64::new(0),AtomicU64::new(1)],cancelled_at:[const{AtomicU64::new(0)};2],compute_ooo:AtomicU64::new(0)});
+    let q2=Arc::new(QueueState{completed:[const{AtomicU64::new(0)};2],published:[const{AtomicU64::new(0)};2],cancelled_at:[const{AtomicU64::new(0)};2],compute_ooo:AtomicU64::new(0)});
+    let status=Arc::new(Status::new());
+    let p_orders=vec![Order::new([0,0],[0,0],[NONE;2],[0;2],1).unwrap()];
+    let c_orders=vec![Order::new([0,0],[0,0],[NONE;2],[0;2],1).unwrap()];
+    let prod=job_with_orders(1,status.clone(),vec![],p_orders.clone(),q1.clone());
+    let cons=Arc::new(Job{
+        id:2,vm:Vm{status:status.clone()},_guard:Guard(AtomicBool::new(false)),
+        progress:Progress{signaled:AtomicBool::new(false),sent:AtomicU32::new(0),next:AtomicU32::new(0),pending:AtomicBool::new(false)},
+        started:AtomicBool::new(false),accepted:AtomicBool::new(true),
+        fence:Fence{vm:status,signals:Mutex::new(vec![])},commands:vec![()],inputs:vec![],
+        origin:FenceOrigin::new(q2.clone(),[None,Some(1)]),
+        fw_waits:vec![prod.origin.clone()],orders:c_orders,queue:q2,
+        full_retired:AtomicU64::new(0),terminal_retired:AtomicBool::new(false),
+    });
+    assert_eq!(cons.check_command_dependencies(0),Ok(()));
+    q1.cancel(&p_orders,0);
+    assert_eq!(cons.check_command_dependencies(0),Err(ECANCELED));
+}
 '''.replace('QUEUE_METHODS', queue_methods).replace('ORDER_SOURCE', order_source).replace('FENCE_METHODS', fence_methods).replace('METHODS', methods.replace('super::fence::','fence::').replace('super::command::','command::')).replace('PUSH_METHOD', push_method)
 
 with tempfile.TemporaryDirectory(prefix='m4-rust-job-') as directory:
@@ -592,6 +649,6 @@ with tempfile.TemporaryDirectory(prefix='m4-rust-job-') as directory:
     (OUT/'job-failure-host.log').write_text(result.stdout+result.stderr)
     (OUT/'job-failure-host.json').write_text(json.dumps({
         'source':str(SOURCE),'sha256':hashlib.sha256(SOURCE.read_bytes()).hexdigest(),
-        'result':'pass','test_groups':23,
+        'result':'pass','test_groups':25,
         'limitations':'Production Job methods with host VM/fence mocks; actual DRM scheduler and firmware publication gates require kernel and execution integration validation.'
     },indent=2)+'\n')
