@@ -12,7 +12,17 @@ static const char *const apple_sleep_test_profiles[] = {
 	"apple,t8142-sleep",
 	"apple,t6050-sleep",
 	"apple,t6050-j716c-sleep",
+	"apple,t6030-sleep",
 };
+
+/*
+ * A profile with its own irreversible steps and wake (T6030): the shared path's wake block,
+ * memory and clock fields are not its own, so their layout is not checked.
+ */
+static bool apple_sleep_test_own_path(const struct apple_sleep_soc *soc)
+{
+	return soc->ops->commit_regs && soc->own_wake;
+}
 
 static bool apple_sleep_test_has(const struct apple_sleep_words *all, u32 offset)
 {
@@ -176,7 +186,7 @@ static void apple_sleep_test_wake_names(struct kunit *test)
 		const struct apple_sleep_soc *soc = id->data;
 		int i, j;
 
-		if (soc->regions)
+		if (soc->regions || apple_sleep_test_own_path(soc))
 			continue;
 		KUNIT_EXPECT_NE(test, soc->wake_last_word, 0);
 		for (i = 0; i < soc->nwake_names; i++) {
@@ -208,6 +218,9 @@ static void apple_sleep_test_layout(struct kunit *test)
 		KUNIT_EXPECT_GT(test, soc->cpu_start_stride, 0);
 		KUNIT_EXPECT_LE(test, soc->nclk_mux_parked, SLEEP_CLK_MUX_MAX);
 		KUNIT_EXPECT_LE(test, soc->ncllt, SLEEP_CLLT_MAX);
+		KUNIT_EXPECT_LT(test, soc->pmu_usid, 16);
+		if (apple_sleep_test_own_path(soc))
+			continue;
 		/* Every SoC steps its memory controller down (T8142: from the J813 trace). */
 		KUNIT_EXPECT_GE(test, soc->nmcc, 1);
 		KUNIT_EXPECT_LE(test, soc->nmcc, MCC_CHANNELS);
@@ -220,7 +233,6 @@ static void apple_sleep_test_layout(struct kunit *test)
 		KUNIT_EXPECT_GE(test, soc->wake_words, 1);
 		KUNIT_EXPECT_LE(test, soc->wake_words, WAKE_WORDS);
 		KUNIT_EXPECT_GE(test, soc->wake_status, soc->wake_mask + soc->wake_words * 4);
-		KUNIT_EXPECT_LT(test, soc->pmu_usid, 16);
 		/* PS write-disable words: in "ps" (0x18000 on T8142), aligned, one bit each */
 		KUNIT_EXPECT_LE(test, soc->nps_wr_dis, SLEEP_PS_WR_DIS_MAX);
 		for (int i = 0; i < soc->nps_wr_dis; i++) {

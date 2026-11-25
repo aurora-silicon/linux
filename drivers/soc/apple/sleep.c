@@ -832,6 +832,8 @@ struct apple_sleep {
 	struct device *dev;
 	const struct apple_sleep_soc *soc;
 	struct apple_sleep_region_state *region;
+	/* A profile's own state, from its .map_regs (T6030) */
+	void *soc_state;
 	void __iomem *ps;
 	void __iomem *pwrgate;
 	void __iomem *cpu_start;
@@ -1788,6 +1790,20 @@ static void apple_sleep_coproc_stop(struct apple_sleep *s, struct apple_sleep_co
 	if (s->soc->regions && c->pcie_ans && c->stop_ret)
 		s->ans_m5_wake_error = -EIO;
 	apple_sleep_coproc_run_off(c);
+}
+
+/* After the commit-time stops: a coprocessor whose last stop failed in this sleep, or NULL */
+static struct apple_sleep_coproc *apple_sleep_coprocs_stop_failed(void)
+{
+	int i;
+
+	for (i = 0; i < SLEEP_COPROCS; i++) {
+		struct apple_sleep_coproc *c = &apple_sleep_coprocs[i];
+
+		if (c->dev && c->ready && c->stopped && c->stop_ret)
+			return c;
+	}
+	return NULL;
 }
 
 static void apple_sleep_coprocs_stop(struct apple_sleep *s, bool first)
@@ -7849,6 +7865,7 @@ static unsigned int sleep_seq_run(void __iomem *const *blk, const struct sleep_s
 }
 
 #include "sleep-t6050.h"
+#include "sleep-t6030.h"
 
 /* ANS's sleep owner on T6050: registered at its .suspend, its final stop in the last steps. */
 int apple_sleep_ans_m5_register(struct device *dev, void __iomem *asc,
@@ -10020,6 +10037,7 @@ static const struct of_device_id apple_sleep_of_match[] = {
 	{ .compatible = "apple,t8142-sleep", .data = &t8142_sleep_soc },
 	{ .compatible = "apple,t6050-sleep", .data = &t6050_sleep_soc },
 	{ .compatible = "apple,t6050-j716c-sleep", .data = &t6050_j716c_sleep_soc },
+	{ .compatible = "apple,t6030-sleep", .data = &t6030_sleep_soc },
 	{ }
 };
 

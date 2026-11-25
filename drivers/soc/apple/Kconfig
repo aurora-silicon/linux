@@ -166,6 +166,12 @@ config APPLE_SOC_SLEEP
 	  to an "apple,t6041-sleep" node and uses this driver's coprocessor
 	  stop.
 
+	  T6030 (M3 Pro) has an untested profile, from macOS 27.2's sleep
+	  traced on J516s. Deep sleep is offered there only with
+	  apple_sleep.deep=1. Unless apple_sleep.untested_commit=1, a sleep is
+	  refused at its final check, before the enclave or any coprocessor
+	  stops and before the SMC is told to sleep.
+
 config APPLE_SOC_SLEEP_KUNIT_TEST
 	bool "KUnit tests for the Apple SoC sleep match data" if !KUNIT_ALL_TESTS
 	depends on APPLE_SOC_SLEEP && KUNIT=y
