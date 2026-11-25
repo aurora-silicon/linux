@@ -106,12 +106,15 @@ static_assert!(0x0000_0000_0001_0800 & SLEEP_REPLY_MASK == SLEEP_REPLY);
 /// How long the enclave gets to answer the sleep request.
 pub(crate) const SLEEP_TIMEOUT_MS: u32 = 5000;
 
-/// The first message macOS sends a gated enclave after a sleep. The contents
-/// vary from sleep to sleep, so it is taken to be a doorbell. This is one of them.
-pub(crate) const WAKE_KICK: Message = Message {
-    msg0: 0xffff_ffff_a482_9303,
-    msg1: 0,
-};
+/// The first message macOS sends a gated enclave after a sleep: the AP's absolute-time
+/// offset, in timebase ticks as two's complement. macOS's absolute time stops while the AP
+/// sleeps, so the offset is minus the time every sleep since boot took.
+pub(crate) fn wake_kick(abstime_offset: u64) -> Message {
+    Message {
+        msg0: abstime_offset,
+        msg1: 0,
+    }
+}
 
 /// The control messages a woken enclave sends without being asked, in order.
 pub(crate) const WAKE_TYPES: [u8; 2] = [0x0d, 0x10];
@@ -339,6 +342,20 @@ mod tests {
         assert_eq!(f.ep, EP_CONTROL);
         assert_eq!(f.ty, CONTROL_REPLY_TYPE);
         assert_eq!(f.tag, TAG_SLEEP);
+    }
+
+    #[test]
+    fn the_wake_kick_matches_the_trace() {
+        // J516s, macOS 27.2: two wakes from sleeps on a 60 s wake timer, in 24 MHz ticks
+        // (-59.83 s and -59.87 s).
+        for (ticks, raw) in [
+            (-1_435_875_799i64, 0xffff_ffff_aa6a_4629u64),
+            (-1_436_860_971i64, 0xffff_ffff_aa5b_3dd5u64),
+        ] {
+            let msg = wake_kick(ticks as u64);
+            assert_eq!(msg.msg0, raw);
+            assert_eq!(msg.msg1, 0);
+        }
     }
 
     #[test]

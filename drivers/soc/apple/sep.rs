@@ -1928,7 +1928,7 @@ impl SepData {
         match self.mbox.lock().as_ref() {
             Some(mbox) => {
                 mbox.set_recv_enabled(true);
-                Self::ring(mbox, proto::WAKE_KICK)?;
+                Self::ring(mbox, proto::wake_kick(pm::abstime_offset()))?;
             }
             None => return Err(ENODEV),
         }

@@ -27,6 +27,9 @@
 #include <linux/soc/apple/mailbox.h>
 #include <linux/soc/apple/sleep.h>
 #include <linux/suspend.h>
+#include <linux/syscore_ops.h>
+
+#include <clocksource/arm_arch_timer.h>
 
 #include <asm/virt.h>
 
@@ -202,6 +205,57 @@ int sep_pm_dart_restore(void *ptr)
 	return ret;
 }
 
+/*
+ * The enclave's first message after its wake is the AP's absolute-time offset, as macOS
+ * sends it. macOS's absolute time is the counter plus that offset, which starts at zero at
+ * boot, and it stops while the AP sleeps: each sleep lowers the offset by the counter ticks
+ * it took. A sleep counts here from the enclave's gate, after which it reads no time, to the
+ * early wake. Seen from the enclave, absolute time then never goes back.
+ */
+static struct {
+	u64 offset;
+	u64 at_gate;	/* absolute time when the enclave gated */
+	bool asleep;	/* at_gate is set, and the wake not yet counted */
+} sep_pm_abstime;
+
+/* The enclave gated itself: absolute time stops here. */
+static void sep_pm_abstime_stop(void)
+{
+	sep_pm_abstime.at_gate = arch_timer_read_counter() + sep_pm_abstime.offset;
+	sep_pm_abstime.asleep = true;
+}
+
+/* Absolute time runs again from the counter's value now. */
+static void sep_pm_abstime_start(void)
+{
+	if (!sep_pm_abstime.asleep)
+		return;
+	sep_pm_abstime.offset = sep_pm_abstime.at_gate - arch_timer_read_counter();
+	sep_pm_abstime.asleep = false;
+}
+
+/* The early wake, before any device resumes: only a sleep the platform returned from. */
+static void sep_pm_syscore_resume(void *data)
+{
+	if (pm_resume_via_firmware())
+		sep_pm_abstime_start();
+}
+
+static const struct syscore_ops sep_pm_syscore_ops = {
+	.resume = sep_pm_syscore_resume,
+};
+
+static struct syscore sep_pm_syscore = {
+	.ops = &sep_pm_syscore_ops,
+};
+
+/* The wake message's payload, as two's complement. */
+u64 sep_pm_abstime_offset(void)
+{
+	sep_pm_abstime_start();
+	return sep_pm_abstime.offset;
+}
+
 #define SEP_PM_POLL_US		20
 #define SEP_PM_TIMEOUT_US	(5000 * USEC_PER_MSEC)
 
@@ -343,6 +397,7 @@ out:
 	c->gate_valid = true;
 	if (c->gate_ret)
 		panic("SEP SLEEP did not gate after send: %d state %#x", c->gate_ret, c->state);
+	sep_pm_abstime_stop();
 
 	return 0;
 }
@@ -490,6 +545,9 @@ static int __maybe_unused sep_pm_suspend_noirq(struct device *dev)
 	ret = sep_pm_wait_gated(dev, 5000);
 	if (ret > 0)
 		ret = -ETIMEDOUT;
+	/* Asleep from here: gated, or with no domain to see it by. */
+	if (!ret || ret == -ENOENT)
+		sep_pm_abstime_stop();
 	if (ret == -ENOENT)
 		return 0;
 	if (ret) {
@@ -539,6 +597,7 @@ int sep_pm_register(void *ptr, void (*event)(bool entering), int (*sleep)(void),
 		WRITE_ONCE(sep_pm_told, NULL);
 		return ret;
 	}
+	register_syscore(&sep_pm_syscore);
 
 	return 0;
 }
@@ -546,6 +605,7 @@ int sep_pm_register(void *ptr, void (*event)(bool entering), int (*sleep)(void),
 /* Returns only once no notifier call is still running. */
 void sep_pm_unregister(void)
 {
+	unregister_syscore(&sep_pm_syscore);
 	unregister_pm_notifier(&sep_pm_nb);
 	WRITE_ONCE(sep_pm_event, NULL);
 	WRITE_ONCE(sep_pm_sleep, NULL);

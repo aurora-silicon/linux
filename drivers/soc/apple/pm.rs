@@ -50,6 +50,7 @@ extern "C" {
         mask: u64,
     ) -> c_int;
     fn sep_pm_commit_finish(dev: *mut c_void) -> c_int;
+    fn sep_pm_abstime_offset() -> u64;
     pub(crate) static sep_pm_ops: kernel::bindings::dev_pm_ops;
 }
 
@@ -128,6 +129,13 @@ pub(crate) fn commit_finish(dev: &kernel::device::Device) -> Option<bool> {
     } else {
         Some(rc > 0)
     }
+}
+
+/// The AP's absolute-time offset, which the enclave's wake message carries: kept across
+/// sleeps, and lowered by each one the enclave slept through.
+pub(crate) fn abstime_offset() -> u64 {
+    // SAFETY: no preconditions; the shim reads the counter and its own state.
+    unsafe { sep_pm_abstime_offset() }
 }
 
 /// How long the enclave gets to gate its domain once it has answered (told at suspend).
