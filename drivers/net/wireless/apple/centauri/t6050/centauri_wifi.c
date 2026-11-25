@@ -1140,12 +1140,20 @@ static int radio_start(struct centauri_t6050_wifi *wifi)
 #define SCAN_ACTIVE_MIN_MS 40
 #define SCAN_LISTEN_MS 110
 
+static bool scan_transport_stopped(struct centauri_t6050_wifi *wifi)
+{
+	return READ_ONCE(wifi->stopping) || wifi->command_failed ||
+	       wifi->host_sleep_sent || readl(wifi->a.bar + 8) != 2;
+}
+
 static int scan_stop_chunk(struct centauri_t6050_wifi *wifi, u32 done)
 {
 	unsigned long deadline;
 	int ret;
 
 	lockdep_assert_held(&wifi->lock);
+	if (scan_transport_stopped(wifi))
+		return -EIO;
 	ret = command(wifi, 65537, NULL, 0);
 	if (wifi->scans_done != done)
 		return 0;
@@ -1155,8 +1163,7 @@ static int scan_stop_chunk(struct centauri_t6050_wifi *wifi, u32 done)
 		return ret;
 	deadline = jiffies + msecs_to_jiffies(1000);
 	do {
-		if (READ_ONCE(wifi->stopping) || wifi->command_failed ||
-		    wifi->host_sleep_sent || readl(wifi->a.bar + 8) != 2)
+		if (scan_transport_stopped(wifi))
 			return -EIO;
 		drain(wifi);
 		if (wifi->scans_done != done)
@@ -1165,7 +1172,10 @@ static int scan_stop_chunk(struct centauri_t6050_wifi *wifi, u32 done)
 		usleep_range(1000, 2000);
 		mutex_lock(&wifi->lock);
 	} while (time_before(jiffies, deadline));
-	return -ETIMEDOUT;
+	if (scan_transport_stopped(wifi))
+		return -EIO;
+	drain(wifi);
+	return wifi->scans_done != done ? 0 : -ETIMEDOUT;
 }
 
 static int scan_profile27(struct centauri_t6050_wifi *wifi)
@@ -1185,6 +1195,8 @@ static int scan_profile27(struct centauri_t6050_wifi *wifi)
 		unsigned long deadline;
 		int ret;
 
+		if (scan_transport_stopped(wifi))
+			return -EIO;
 		if (READ_ONCE(wifi->scan_abort))
 			return -ECANCELED;
 		memset(scan, 0, sizeof(scan));
@@ -1255,9 +1267,7 @@ static int scan_profile27(struct centauri_t6050_wifi *wifi)
 		deadline = jiffies +
 			   msecs_to_jiffies(max(8000U, count * 220 + 2000));
 		do {
-			if (READ_ONCE(wifi->stopping) || wifi->command_failed ||
-			    wifi->host_sleep_sent ||
-			    readl(wifi->a.bar + 8) != 2)
+			if (scan_transport_stopped(wifi))
 				return -EIO;
 			drain(wifi);
 			if (wifi->scans_done != done)
@@ -1271,11 +1281,16 @@ static int scan_profile27(struct centauri_t6050_wifi *wifi)
 			mutex_lock(&wifi->lock);
 		} while (time_before(jiffies, deadline));
 		if (wifi->scans_done == done) {
+			if (scan_transport_stopped(wifi))
+				return -EIO;
+			drain(wifi);
+		}
+		if (wifi->scans_done == done) {
 			dev_warn(&wifi->control->pdev->dev,
 				 "Wi-Fi scan of %u channels: no completion event\n",
 				 count);
-			scan_stop_chunk(wifi, done);
-			return -ETIMEDOUT;
+			ret = scan_stop_chunk(wifi, done);
+			return ret == -EIO ? -EIO : -ETIMEDOUT;
 		}
 		if (wifi->scan_status)
 			dev_warn(&wifi->control->pdev->dev,

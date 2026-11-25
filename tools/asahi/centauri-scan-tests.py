@@ -111,8 +111,11 @@ struct centauri_t6050_wifi {
 static unsigned long jiffies;
 static unsigned int bar_reads, sleep_calls, link_queries, stop_commands;
 static unsigned int stop_event_delay, complete_after_drains, drains_seen;
+static unsigned int sleep_step_ms, sleep_sets_host_sleep_at;
+static unsigned int sleep_completes_on_drain_at;
 static bool stop_refuse_342, stop_refuse_other, sleep_sets_abort;
 static bool sleep_sets_host_sleep, sleep_checks_station, station_ran_in_sleep;
+static u32 bar_state;
 static u8 fake_bar[32];
 static struct centauri_t6050_wifi *g_wifi;
 
@@ -122,7 +125,7 @@ static void fill_station(struct centauri_t6050_wifi *wifi,
 static void mutex_lock(int *l) { assert(!*l); *l = 1; }
 static void mutex_unlock(int *l) { assert(*l); *l = 0; }
 static void put_unaligned_le16(u16 v, void *p) { memcpy(p, &v, 2); }
-static u32 readl(void *addr) { (void)addr; bar_reads++; return 2; }
+static u32 readl(void *addr) { (void)addr; bar_reads++; return bar_state; }
 static int firmware_band(int band) { return band; }
 static int ieee80211_frequency_to_channel(u32 freq)
 {
@@ -179,7 +182,7 @@ static void usleep_range(unsigned long a, unsigned long b)
 {
 	(void)a; (void)b;
 	sleep_calls++;
-	jiffies += 250;
+	jiffies += sleep_step_ms ? sleep_step_ms : 250;
 	/* Must not hold wifi->lock across scan wait sleeps. */
 	assert(!g_wifi->lock);
 	if (sleep_checks_station && !station_ran_in_sleep) {
@@ -201,6 +204,11 @@ static void usleep_range(unsigned long a, unsigned long b)
 		g_wifi->host_sleep_sent = true;
 		sleep_sets_host_sleep = false;
 	}
+	if (sleep_sets_host_sleep_at && sleep_calls == sleep_sets_host_sleep_at)
+		g_wifi->host_sleep_sent = true;
+	if (sleep_completes_on_drain_at &&
+	    sleep_calls == sleep_completes_on_drain_at)
+		complete_after_drains = drains_seen + 1;
 }
 '''
 
@@ -228,8 +236,11 @@ static void reset_wifi(void)
 	wifi.station_signal_at = 0;
 	g_wifi = &wifi;
 	jiffies = 2000;
+	bar_state = 2;
 	bar_reads = sleep_calls = link_queries = stop_commands = 0;
 	stop_event_delay = complete_after_drains = drains_seen = 0;
+	sleep_step_ms = sleep_sets_host_sleep_at = 0;
+	sleep_completes_on_drain_at = 0;
 	stop_refuse_342 = stop_refuse_other = false;
 	sleep_sets_abort = sleep_sets_host_sleep = false;
 	sleep_checks_station = station_ran_in_sleep = false;
@@ -283,15 +294,229 @@ int main(void)
 	mutex_unlock(&wifi.lock);
 	assert(stop_commands == 1 && wifi.scans_done == 1);
 
-	/* 5. Host sleep entered while unlocked aborts without BAR read. */
+	/* 5. Host sleep entered while unlocked aborts without BAR read or stop cmd. */
 	reset_wifi();
 	sleep_sets_host_sleep = true;
 	mutex_lock(&wifi.lock);
 	assert(scan_profile27(&wifi) == -EIO);
 	mutex_unlock(&wifi.lock);
-	assert(bar_reads == 1);
+	assert(bar_reads == 2 && stop_commands == 0);
 
-	puts("PASS: Centauri Wi-Fi scan lock-release and stop synchronization");
+	/* 6. scan_stop_chunk() entry guard refuses to ring doorbell when stopped. */
+	reset_wifi();
+	wifi.host_sleep_sent = true;
+	mutex_lock(&wifi.lock);
+	assert(scan_stop_chunk(&wifi, 0) == -EIO);
+	mutex_unlock(&wifi.lock);
+	assert(stop_commands == 0 && bar_reads == 0);
+
+	/* 7. Host sleep set during the final sleep as deadline expires skips 65537. */
+	reset_wifi();
+	sleep_step_ms = 9000;
+	sleep_sets_host_sleep_at = 1;
+	mutex_lock(&wifi.lock);
+	assert(scan_profile27(&wifi) == -EIO);
+	mutex_unlock(&wifi.lock);
+	assert(sleep_calls == 1 && stop_commands == 0);
+
+	/* 8. Completion arriving during final sleep as deadline expires succeeds cleanly. */
+	reset_wifi();
+	sleep_step_ms = 9000;
+	sleep_completes_on_drain_at = 1;
+	mutex_lock(&wifi.lock);
+	assert(scan_profile27(&wifi) == 0);
+	mutex_unlock(&wifi.lock);
+	assert(sleep_calls == 1 && stop_commands == 0 && wifi.scans_done == 1);
+
+	puts("PASS: Centauri T6050 Wi-Fi scan lock-release and stop synchronization");
+	return 0;
+}
+'''
+
+SHARED_WIFI_PRELUDE = r'''
+#include <assert.h>
+#include <errno.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+typedef uint8_t u8;
+typedef uint16_t u16;
+typedef uint32_t u32;
+
+#define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
+#define DIV_ROUND_UP(n, d) (((n) + (d) - 1) / (d))
+#define READ_ONCE(x) (x)
+#define WRITE_ONCE(x, v) ((x) = (v))
+#define SCAN_PASSIVE_DWELL_MS 110
+#define msecs_to_jiffies(x) ((unsigned long)(x))
+#define time_before(a, b) ((long)((a) - (b)) < 0)
+#define time_after(a, b) time_before(b, a)
+#define max(a, b) ((a) > (b) ? (a) : (b))
+#define min_t(type, x, y) ((type)(x) < (type)(y) ? (type)(x) : (type)(y))
+#define container_of(ptr, type, member) \
+	((type *)((char *)(ptr) - __builtin_offsetof(type, member)))
+static void dev_warn(void *d, const char *fmt, ...) { (void)d; (void)fmt; }
+static void dev_info(void *d, const char *fmt, ...) { (void)d; (void)fmt; }
+static void dev_dbg(void *d, const char *fmt, ...) { (void)d; (void)fmt; }
+
+static const u8 five_ghz[25] = { 0 };
+
+struct device { int dummy; };
+struct pci_dev { struct device dev; };
+struct centauri { struct pci_dev *pdev; };
+struct work_struct { int dummy; };
+struct cfg80211_scan_request { int dummy; };
+struct cfg80211_scan_info { bool aborted; };
+struct centauri_wifi {
+	struct centauri *control;
+	struct { u8 *bar; } a;
+	struct work_struct scan_work;
+	struct cfg80211_scan_request *scan_request;
+	bool scan_abort;
+	int lock;
+	u16 reply_status;
+	u32 channels_seen, scans_done, beacons_seen;
+	bool stopping, transport_paused;
+};
+
+static unsigned long jiffies;
+static unsigned int scan_commands, stop_commands, sleep_calls, drains_seen;
+static unsigned int sleep_step_ms, sleep_sets_paused_at, sleep_sets_abort_at;
+static unsigned int complete_on_stop_drain, channels_per_drain;
+static bool stop_never_completes, last_scan_aborted, scan_done_called;
+static bool pause_between_chunks;
+static u32 bar_state;
+static u8 fake_bar[32];
+static struct centauri_wifi *g_swifi;
+
+static void mutex_lock(int *l) { assert(!*l); *l = 1; }
+static void mutex_unlock(int *l) { assert(*l); *l = 0; }
+static u32 readl(void *addr) { (void)addr; return bar_state; }
+static size_t build_scan(struct centauri_wifi *w, unsigned int c, u8 *b)
+{
+	(void)w; (void)c; (void)b;
+	return 14;
+}
+static void cfg80211_scan_done(struct cfg80211_scan_request *r,
+			       struct cfg80211_scan_info *info)
+{
+	(void)r;
+	scan_done_called = true;
+	last_scan_aborted = info->aborted;
+}
+static int command(struct centauri_wifi *wifi, u32 id,
+		   const void *payload, size_t size)
+{
+	(void)payload; (void)size;
+	assert(wifi->lock);
+	if (id == 65551) {
+		scan_commands++;
+		return 0;
+	}
+	if (id == 65537) {
+		stop_commands++;
+		wifi->reply_status = 0;
+		return 0;
+	}
+	return 0;
+}
+static void drain(struct centauri_wifi *wifi)
+{
+	assert(wifi->lock);
+	drains_seen++;
+	if (channels_per_drain)
+		wifi->channels_seen += channels_per_drain;
+	if (stop_commands && !stop_never_completes && complete_on_stop_drain) {
+		complete_on_stop_drain--;
+		if (!complete_on_stop_drain) {
+			wifi->scans_done++;
+			if (pause_between_chunks)
+				wifi->transport_paused = true;
+		}
+	}
+}
+static void usleep_range(unsigned long a, unsigned long b)
+{
+	(void)a; (void)b;
+	sleep_calls++;
+	jiffies += sleep_step_ms ? sleep_step_ms : 250;
+	assert(!g_swifi->lock);
+	if (sleep_sets_paused_at && sleep_calls == sleep_sets_paused_at)
+		g_swifi->transport_paused = true;
+	if (sleep_sets_abort_at && sleep_calls == sleep_sets_abort_at)
+		g_swifi->scan_abort = true;
+}
+'''
+
+SHARED_WIFI_TESTS = r'''
+static struct pci_dev spdev;
+static struct centauri sctrl = { .pdev = &spdev };
+static struct cfg80211_scan_request sreq;
+static struct centauri_wifi swifi;
+
+static void reset_swifi(void)
+{
+	memset(&swifi, 0, sizeof(swifi));
+	swifi.control = &sctrl;
+	swifi.a.bar = fake_bar;
+	swifi.scan_request = &sreq;
+	g_swifi = &swifi;
+	jiffies = 2000;
+	bar_state = 2;
+	scan_commands = stop_commands = sleep_calls = drains_seen = 0;
+	sleep_step_ms = sleep_sets_paused_at = sleep_sets_abort_at = 0;
+	complete_on_stop_drain = channels_per_drain = 0;
+	stop_never_completes = last_scan_aborted = scan_done_called = false;
+	pause_between_chunks = false;
+}
+
+int main(void)
+{
+	/* 1. Entry guard in scan_stop_chunk() skips command(65537) when paused. */
+	reset_swifi();
+	swifi.transport_paused = true;
+	mutex_lock(&swifi.lock);
+	assert(scan_stop_chunk(&swifi, 0) == -EIO);
+	mutex_unlock(&swifi.lock);
+	assert(stop_commands == 0);
+
+	/* 2. Transport paused during final sleep at deadline skips 65537 and next chunk. */
+	reset_swifi();
+	sleep_step_ms = 9000;
+	sleep_sets_paused_at = 1;
+	scan_worker(&swifi.scan_work);
+	assert(scan_done_called && last_scan_aborted);
+	assert(scan_commands == 1 && stop_commands == 0);
+
+	/* 3. Timeout whose stop times out propagates error and does NOT start chunk 1. */
+	reset_swifi();
+	sleep_step_ms = 9000;
+	stop_never_completes = true;
+	scan_worker(&swifi.scan_work);
+	assert(scan_commands == 1 && stop_commands == 1);
+	assert(scan_done_called && last_scan_aborted);
+
+	/* 4. Transport paused between chunks stops before starting chunk 1. */
+	reset_swifi();
+	sleep_step_ms = 9000;
+	complete_on_stop_drain = 1;
+	pause_between_chunks = true;
+	scan_worker(&swifi.scan_work);
+	assert(scan_done_called && last_scan_aborted);
+	assert(scan_commands == 1 && stop_commands == 1);
+
+	/* 5. Abort arriving after 65537 already sent (stopped=true) still waits for 0x05. */
+	reset_swifi();
+	channels_per_drain = 13;
+	sleep_sets_abort_at = 1;
+	complete_on_stop_drain = 3;
+	scan_worker(&swifi.scan_work);
+	assert(scan_done_called && last_scan_aborted);
+	assert(scan_commands == 1 && stop_commands == 1 && swifi.scans_done == 1);
+
+	puts("PASS: Centauri shared Wi-Fi scan stop/abort/chunk state checks");
 	return 0;
 }
 '''
@@ -496,11 +721,28 @@ def main():
     wifi_src = (
         root / "drivers/net/wireless/apple/centauri/t6050/centauri_wifi.c"
     ).read_text()
+    shared_src = (
+        root / "drivers/net/wireless/apple/centauri/centauri_wifi.c"
+    ).read_text()
     bt_src = (root / "drivers/bluetooth/btcentauri_t6050.c").read_text()
 
     wifi_prod = "\n\n".join(
         extract_fn(wifi_src, name)
-        for name in ("scan_stop_chunk", "scan_profile27", "fill_station")
+        for name in (
+            "scan_transport_stopped",
+            "scan_stop_chunk",
+            "scan_profile27",
+            "fill_station",
+        )
+    )
+    shared_prod = "\n\n".join(
+        extract_fn(shared_src, name)
+        for name in (
+            "scan_transport_stopped",
+            "scan_wait_stop",
+            "scan_stop_chunk",
+            "scan_worker",
+        )
     )
     bt_prod = "\n\n".join(
         extract_fn(bt_src, name)
@@ -508,6 +750,9 @@ def main():
     )
 
     wifi_variants = [("wifi-production", WIFI_PRELUDE + wifi_prod + WIFI_TESTS, 0, None)]
+    shared_variants = [
+        ("shared-wifi-production", SHARED_WIFI_PRELUDE + shared_prod + SHARED_WIFI_TESTS, 0, None)
+    ]
     bt_variants = [("bt-production", BT_PRELUDE + bt_prod + BT_TESTS, 0, None)]
 
     if args.negative_controls:
@@ -526,7 +771,7 @@ def main():
             ),
             (
                 "timeout-skips-stop-wait",
-                "\t\t\tscan_stop_chunk(wifi, done);\n\t\t\treturn -ETIMEDOUT;",
+                "\t\t\tret = scan_stop_chunk(wifi, done);\n\t\t\treturn ret == -EIO ? -EIO : -ETIMEDOUT;",
                 "\t\t\tcommand(wifi, 65537, NULL, 0);\n\t\t\treturn -ETIMEDOUT;",
                 "wifi.scans_done == 1",
             ),
@@ -536,12 +781,40 @@ def main():
                 "if (false && ret == -EREMOTEIO && wifi->reply_status == 342)\n\t\treturn 0;",
                 "scan_stop_chunk(&wifi, 0) == 0",
             ),
+            (
+                "t6050-stop-skips-entry-guard",
+                "\tlockdep_assert_held(&wifi->lock);\n\tif (scan_transport_stopped(wifi))\n\t\treturn -EIO;",
+                "\tlockdep_assert_held(&wifi->lock);",
+                "stop_commands == 0",
+            ),
         ]
         for name, old, new, expected_msg in wifi_controls:
             if old not in wifi_prod:
                 raise RuntimeError(f"missing pattern for {name}")
             wifi_variants.append(
                 (name, WIFI_PRELUDE + wifi_prod.replace(old, new, 1) + WIFI_TESTS,
+                 -signal.SIGABRT, expected_msg)
+            )
+
+        shared_controls = [
+            (
+                "shared-timeout-drops-stop-ret",
+                "\t\t\t\t\tret = stopped ? -ETIMEDOUT :\n\t\t\t\t\t      scan_stop_chunk(wifi, done);",
+                "\t\t\t\t\tif (!stopped)\n\t\t\t\t\t\tscan_stop_chunk(wifi, done);",
+                "scan_commands == 1",
+            ),
+            (
+                "shared-abort-skips-inflight-stop-wait",
+                "\t\t\t\tint stop_ret = stopped ? scan_wait_stop(wifi, done) :\n\t\t\t\t\t       scan_stop_chunk(wifi, done);",
+                "\t\t\t\tint stop_ret = stopped ? 0 :\n\t\t\t\t\t       scan_stop_chunk(wifi, done);",
+                "swifi.scans_done == 1",
+            ),
+        ]
+        for name, old, new, expected_msg in shared_controls:
+            if old not in shared_prod:
+                raise RuntimeError(f"missing pattern for {name}")
+            shared_variants.append(
+                (name, SHARED_WIFI_PRELUDE + shared_prod.replace(old, new, 1) + SHARED_WIFI_TESTS,
                  -signal.SIGABRT, expected_msg)
             )
 
@@ -572,7 +845,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="centauri-scan-test-") as directory:
         out = args.out or Path(directory)
         out.mkdir(parents=True, exist_ok=True)
-        for name, code, expected, msg in wifi_variants + bt_variants:
+        for name, code, expected, msg in wifi_variants + shared_variants + bt_variants:
             harness, binary = out / (name + ".c"), out / name
             harness.write_text(code)
             subprocess.run(
