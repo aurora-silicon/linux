@@ -179,6 +179,15 @@ static bool apple_rtkit_needs_coreanalytics(struct apple_rtkit *rtk)
 	return rtk->ops->flags & APPLE_RTKIT_NEEDS_COREANALYTICS;
 }
 
+/*
+ * Endpoint 7 carries CoreAnalytics, or the auxiliary buffer of registry-v2 PMP
+ * firmware. The endpoint map starts it, and the dispatcher serves it, only then.
+ */
+static bool apple_rtkit_ep7_served(struct apple_rtkit *rtk)
+{
+	return rtk->pmp_registry_v2 || apple_rtkit_needs_coreanalytics(rtk);
+}
+
 static bool apple_rtkit_firmware_owns_crashlog(struct apple_rtkit *rtk)
 {
 	return rtk->ops->flags & APPLE_RTKIT_FIRMWARE_OWNED_CRASHLOG;
@@ -426,7 +435,7 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 			break;
 
 		case APPLE_RTKIT_EP_COREANALYTICS:
-			if (!rtk->pmp_registry_v2 && !apple_rtkit_needs_coreanalytics(rtk))
+			if (!apple_rtkit_ep7_served(rtk))
 				break;
 			fallthrough;
 
@@ -551,7 +560,7 @@ static void apple_rtkit_management_rx(struct apple_rtkit *rtk, u64 msg)
 		dev_dbg(rtk->dev, "RTKit: co-processor idle: 0x%llx\n", msg);
 		break;
 	default:
-		dev_warn(
+		dev_warn_ratelimited(
 			rtk->dev,
 			"RTKit: unknown management message: 0x%llx (type: 0x%02x)\n",
 			msg, type);
@@ -911,7 +920,7 @@ static void apple_rtkit_coreanalytics_rx(struct apple_rtkit *rtk, u64 msg)
 					       reply, NULL, false);
 		break;
 	default:
-		dev_warn(rtk->dev, "RTKit: Unknown CoreAnalytics message: %llx\n", msg);
+		dev_warn_ratelimited(rtk->dev, "RTKit: Unknown CoreAnalytics message: %llx\n", msg);
 		return;
 	}
 	if (ret)
@@ -1071,8 +1080,8 @@ static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
 	bool await_log = false;
 
 	if (type != APPLE_RTKIT_CRASHLOG_CRASH) {
-		dev_warn(rtk->dev, "RTKit: Unknown crashlog message: %llx\n",
-			 msg);
+		dev_warn_ratelimited(rtk->dev, "RTKit: Unknown crashlog message: %llx\n",
+				     msg);
 		return;
 	}
 
@@ -1223,8 +1232,8 @@ static void apple_rtkit_ioreport_rx(struct apple_rtkit *rtk, u64 msg)
 					 NULL, false);
 		break;
 	default:
-		dev_warn(rtk->dev, "RTKit: Unknown ioreport message: %llx\n",
-			 msg);
+		dev_warn_ratelimited(rtk->dev, "RTKit: Unknown ioreport message: %llx\n",
+				     msg);
 	}
 }
 
@@ -1345,8 +1354,8 @@ static void apple_rtkit_syslog_rx(struct apple_rtkit *rtk, u64 msg)
 		apple_rtkit_syslog_rx_log(rtk, msg);
 		break;
 	default:
-		dev_warn(rtk->dev, "RTKit: Unknown syslog message: %llx\n",
-			 msg);
+		dev_warn_ratelimited(rtk->dev, "RTKit: Unknown syslog message: %llx\n",
+				     msg);
 	}
 }
 
@@ -1397,7 +1406,8 @@ static void apple_rtkit_oslog_rx(struct apple_rtkit *rtk, u64 msg)
 		if (apple_rtkit_oslog_unanswered(rtk))
 			dev_dbg(rtk->dev, "RTKit: oslog notification: %016llx\n", msg);
 		else
-			dev_warn(rtk->dev, "RTKit: invalid oslog notification: %llx\n", msg);
+			dev_warn_ratelimited(rtk->dev, "RTKit: invalid oslog notification: %llx\n",
+					     msg);
 		return;
 	}
 
@@ -1429,8 +1439,8 @@ static void apple_rtkit_oslog_rx(struct apple_rtkit *rtk, u64 msg)
 		dev_dbg(rtk->dev, "RTKit: oslog notification: %016llx\n", msg);
 		break;
 	default:
-		dev_warn(rtk->dev, "RTKit: Unknown oslog message: %llx\n",
-			 msg);
+		dev_warn_ratelimited(rtk->dev, "RTKit: Unknown oslog message: %llx\n",
+				     msg);
 	}
 }
 
@@ -1462,11 +1472,24 @@ static void apple_rtkit_pmp_aux_rx(struct apple_rtkit *rtk, u64 msg)
 	    msg != (FIELD_PREP(APPLE_RTKIT_SYSLOG_TYPE,
 			       APPLE_RTKIT_BUFFER_REQUEST) |
 		    FIELD_PREP(APPLE_RTKIT_BUFFER_REQUEST_SIZE, 2))) {
-		dev_err(rtk->dev, "RTKit: refused auxiliary buffer request\n");
+		dev_err_ratelimited(rtk->dev, "RTKit: refused auxiliary buffer request\n");
 		return;
 	}
 	apple_rtkit_common_rx_get_buffer(rtk, &rtk->pmp_aux_buffer,
 					 APPLE_RTKIT_EP_PMP_AUX, msg);
+}
+
+/*
+ * A message to an endpoint this client doesn't serve. How often one arrives is
+ * up to the firmware, which may send its events periodically, so the warning
+ * is rate-limited, as every warning the receive path prints for a firmware
+ * message is.
+ */
+static void apple_rtkit_unserved_ep_msg(struct apple_rtkit *rtk, u8 ep, u64 msg)
+{
+	dev_warn_ratelimited(rtk->dev,
+			     "RTKit: message to unknown endpoint %02x: %llx\n",
+			     ep, msg);
 }
 
 static void apple_rtkit_rx_dispatch(struct apple_rtkit *rtk, u8 ep, u64 msg,
@@ -1498,12 +1521,12 @@ static void apple_rtkit_rx_dispatch(struct apple_rtkit *rtk, u8 ep, u64 msg,
 		if (rtk->sync_syslog_ack)
 			apple_rtkit_kdebug_rx(rtk, msg);
 		else
-			dev_warn(rtk->dev,
-				 "RTKit: message to unknown endpoint %02x: %llx\n",
-				 ep, msg);
+			apple_rtkit_unserved_ep_msg(rtk, ep, msg);
 		break;
 	case APPLE_RTKIT_EP_COREANALYTICS:
-		if (rtk->pmp_registry_v2)
+		if (!apple_rtkit_ep7_served(rtk))
+			apple_rtkit_unserved_ep_msg(rtk, ep, msg);
+		else if (rtk->pmp_registry_v2)
 			apple_rtkit_pmp_aux_rx(rtk, msg);
 		else
 			apple_rtkit_coreanalytics_rx(rtk, msg);
@@ -1520,15 +1543,13 @@ static void apple_rtkit_rx_dispatch(struct apple_rtkit *rtk, u8 ep, u64 msg,
 		else if (rtk->ops->recv_message_timed)
 			rtk->ops->recv_message_timed(rtk->cookie, ep, msg, 0);
 		else
-			dev_warn(
+			dev_warn_ratelimited(
 				rtk->dev,
 				"Received unexpected message to EP%02d: %llx\n",
 				ep, msg);
 		break;
 	default:
-		dev_warn(rtk->dev,
-			 "RTKit: message to unknown endpoint %02x: %llx\n",
-			 ep, msg);
+		apple_rtkit_unserved_ep_msg(rtk, ep, msg);
 	}
 }
 
@@ -1698,9 +1719,9 @@ static void apple_rtkit_rx(struct apple_mbox *mbox, struct apple_mbox_msg msg,
 	 * Warning about it here too reads as if the AP sent the message.
 	 */
 	if (!test_bit(ep, rtk->endpoints) && ep != APPLE_RTKIT_EP_CRASHLOG)
-		dev_warn(rtk->dev,
-			 "RTKit: Message from undiscovered endpoint 0x%02x\n",
-			 ep);
+		dev_warn_ratelimited(rtk->dev,
+				     "RTKit: Message from undiscovered endpoint 0x%02x\n",
+				     ep);
 
 	if (ep >= APPLE_RTKIT_APP_ENDPOINT_START &&
 	    rtk->ops->recv_message_early &&
