@@ -1322,6 +1322,14 @@ static int cen_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (fixup_adv_phy)
 		hci_set_quirk(hdev, HCI_QUIRK_FIXUP_LE_EXT_ADV_REPORT_PHY);
 	hci_set_quirk(hdev, HCI_QUIRK_WIDEBAND_SPEECH_SUPPORTED);
+	/*
+	 * The N1 lists Enhanced Setup Synchronous Connection in its supported
+	 * commands but answers it with Unsupported Feature or Parameter Value
+	 * (0x11), so no SCO/eSCO link comes up and a headset's microphone stays
+	 * silent. Use Setup Synchronous Connection instead, with the air mode
+	 * (transparent for mSBC) in the voice setting.
+	 */
+	hci_set_quirk(hdev, HCI_QUIRK_BROKEN_ENHANCED_SETUP_SYNC_CONN);
 	SET_HCIDEV_DEV(hdev, &pdev->dev);
 	hci_set_drvdata(hdev, bt);
 	pci_set_drvdata(pdev, bt);
