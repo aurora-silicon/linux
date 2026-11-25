@@ -62,6 +62,7 @@
 #include <linux/syscore_ops.h>
 #include <linux/irqchip/irq-apple-aic.h>
 #include <asm/apple_m1_pmu.h>
+#include <asm/cacheflush.h>
 #include <asm/cputype.h>
 #include <asm/exception.h>
 #include <asm/sysreg.h>
@@ -461,6 +462,8 @@ static void aic_ic_write(struct aic_irq_chip *ic, u32 reg, u32 val)
 /*
  * A sleep that a firmware engine finishes waits for the CPUs to stop, and a raised
  * line ends WFI even with interrupts off. Every line is masked for that last step.
+ * aic_sleep_restore() reads the saved masks back after a wake that lost the caches:
+ * they are cleaned to the point of coherency before the CPU goes down.
  */
 void aic_sleep_mask_all(void)
 {
@@ -476,6 +479,7 @@ void aic_sleep_mask_all(void)
 			aic_ic_write(ic, reg, U32_MAX);
 		}
 	}
+	dcache_clean_poc((unsigned long)ic->sleep_masks, (unsigned long)saved);
 }
 
 void aic_sleep_restore(void)
