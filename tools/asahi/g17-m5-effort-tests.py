@@ -75,14 +75,16 @@ fn main() {{
     let g17p = MockInitData {{ m5: false, active_effort: 0x5555 }};
 
     // Direct policy matrix on M5 vs non-M5.
-    assert_eq!(m5.submission_effort(FULL_EFFORT, false, false), 0);
-    assert_eq!(m5.submission_effort(FULL_EFFORT, true, false), FULL_EFFORT);
-    assert_eq!(m5.submission_effort(FULL_EFFORT, false, true), FULL_EFFORT);
-    assert_eq!(m5.submission_effort(FULL_EFFORT, true, true), FULL_EFFORT);
-    assert_eq!(m5.submission_effort(0, true, true), 0);
+    assert_eq!(m5.submission_effort(FULL_EFFORT, false, false, false), 0);
+    assert_eq!(m5.submission_effort(FULL_EFFORT, false, false, true), 0);
+    assert_eq!(m5.submission_effort(FULL_EFFORT, true, false, false), FULL_EFFORT);
+    assert_eq!(m5.submission_effort(FULL_EFFORT, false, true, false), FULL_EFFORT);
+    assert_eq!(m5.submission_effort(FULL_EFFORT, true, true, false), FULL_EFFORT);
+    assert_eq!(m5.submission_effort(0, true, true, true), 0);
 
-    assert_eq!(g17p.submission_effort(FULL_EFFORT, false, false), 0x5555);
-    assert_eq!(g17p.submission_effort(FULL_EFFORT, false, true), FULL_EFFORT);
+    assert_eq!(g17p.submission_effort(FULL_EFFORT, false, false, false), 0x5555);
+    assert_eq!(g17p.submission_effort(FULL_EFFORT, false, true, false), FULL_EFFORT);
+    assert_eq!(g17p.submission_effort(FULL_EFFORT, false, false, true), FULL_EFFORT);
 
     // End-to-end pipelined compute loop on M5 without host waiters:
     // 24 MHz clock -> idle_ticks = 2 ms = 48_000 ticks, hold_ticks = 16 ms = 384_000 ticks.
@@ -102,7 +104,12 @@ fn main() {{
     let changed = effort.note_bound(true);
     assert!(changed);
     assert_eq!(
-        m5.submission_effort(FULL_EFFORT, effort.waited(), effort.bound()),
+        m5.submission_effort(
+            FULL_EFFORT,
+            effort.waited(),
+            effort.bound(),
+            effort.compute_waited(),
+        ),
         FULL_EFFORT,
         "M5 must publish FULL_EFFORT when BusyRuns::bound is true even without a waiter",
     );
@@ -113,7 +120,10 @@ fn main() {{
     runs.end();
     assert!(!effort.bound());
     assert!(!runs.bound(tick, hold_ticks, idle_ticks));
-    assert_eq!(m5.submission_effort(0, effort.waited(), effort.bound()), 0);
+    assert_eq!(
+        m5.submission_effort(0, effort.waited(), effort.bound(), effort.compute_waited()),
+        0,
+    );
 
     // Paced work with 5 ms idle gaps stays unbound and publishes 0 on M5.
     let mut paced = 1_000_000u64;
@@ -122,7 +132,7 @@ fn main() {{
         paced += 120_000; // 5 ms > 2 ms idle_ticks
     }}
     assert!(!runs.bound(paced, hold_ticks, idle_ticks));
-    assert_eq!(m5.submission_effort(FULL_EFFORT, false, false), 0);
+    assert_eq!(m5.submission_effort(FULL_EFFORT, false, false, false), 0);
 
     println!("PASS g17-m5-effort-tests");
 }}
