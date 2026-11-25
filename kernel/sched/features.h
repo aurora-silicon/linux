@@ -106,7 +106,7 @@ SCHED_FEAT(WAKE_SHORT_LOCAL, true)
  * cache with the task creating it, before looking further. See
  * fork_local_idle_cpu().
  */
-SCHED_FEAT(FORK_LOCAL, false)
+SCHED_FEAT(FORK_LOCAL, true)
 
 /*
  * Issue a WARN when we do multiple update_rq_clock() calls
