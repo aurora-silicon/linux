@@ -683,6 +683,8 @@ static void t6030_domains_note(struct apple_sleep *s, u8 at)
 
 /* The sleep's CLLT word: macOS writes it back before each commit word (0x1c17 on J516s) */
 #define T6030_CLLT_SLEEP		0x24
+/* t5: the commit word's second and third writes, +764.6 and +922.0 us after the first */
+#define T6030_RECOMMIT_US		157
 
 /* PMU scratch +3, +4 after the commit word: the RTC control the rearm read, and how it went */
 #define T6030_NOTE_POST_NO_ALARM	0xd0
@@ -734,6 +736,10 @@ static void t6030_sleep_post_timer(struct apple_sleep *s)
 	/* The notes put the done bit back in the mask: macOS's is without it from here on */
 	writel(mask, s->spmi + SPMI_NOTIFY_ENABLE);
 recommit:
+	writel(readl(s->cllt + T6030_CLLT_SLEEP), s->cllt + T6030_CLLT_SLEEP);
+	writel(1, s->commit);
+	/* t5: the CLLT word and the commit word a third time, 157 us after the second */
+	udelay(T6030_RECOMMIT_US);
 	writel(readl(s->cllt + T6030_CLLT_SLEEP), s->cllt + T6030_CLLT_SLEEP);
 	writel(1, s->commit);
 }
@@ -1443,6 +1449,27 @@ static void t6030_sleep_wake_check_ps(struct apple_sleep *s, const char *step)
  * display complexes, I2C and SPI; any other word the wake left otherwise. The words the entry
  * lowered or took AUTO_ENABLE from go back as they were before it.
  */
+/*
+ * macOS 27.2's wake on J516s, 12.97-13.13 ms (ref/t6030-macos-wake-full.tsv), after the memory
+ * side and before the cores' starts: on nub-spmi0 (gen-1 layout: mask words from +0x20, acks
+ * from +0x60) the latched RTC alarm, source 2, acked and the first mask word set to 0x1000; on
+ * nub-spmi-a0 bit 25 of its third ack word acked and its third mask word set to 0x80000000.
+ */
+#define T6030_SPMI_MASK(n)		(0x20 + 4 * (n))
+#define T6030_SPMI_ACK(n)		(0x60 + 4 * (n))
+#define T6030_SPMI_WAKE_ACK0		BIT(2)
+#define T6030_SPMI_WAKE_MASK0		BIT(12)
+#define T6030_SPMI_A0_WAKE_ACK2		BIT(25)
+#define T6030_SPMI_A0_WAKE_MASK2	BIT(31)
+
+static void t6030_spmi_wake_irqs(struct apple_sleep *s)
+{
+	writel(T6030_SPMI_WAKE_ACK0, s->spmi + T6030_SPMI_ACK(0));
+	writel(T6030_SPMI_WAKE_MASK0, s->spmi + T6030_SPMI_MASK(0));
+	writel(T6030_SPMI_A0_WAKE_ACK2, s->spmi_a0 + T6030_SPMI_ACK(2));
+	writel(T6030_SPMI_A0_WAKE_MASK2, s->spmi_a0 + T6030_SPMI_MASK(2));
+}
+
 static void t6030_sleep_wake(struct apple_sleep *s)
 {
 	struct t6030_sleep *t = t6030_state(s);
@@ -1471,6 +1498,7 @@ static void t6030_sleep_wake(struct apple_sleep *s)
 	t6030_sleep_wake_seq(s, &t->wake, "apple,seq-wake");
 	sleep_note(s, 0x73);
 	sleep_ps_rewake_words(s, &t6030_wake_mid_words, false);
+	t6030_spmi_wake_irqs(s);
 	t6030_sleep_undo_regs(s);
 	sleep_note(s, 0x74);
 	sleep_ps_rewake_words(s, &t6030_wake_late_words, false);
