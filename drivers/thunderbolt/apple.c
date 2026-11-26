@@ -961,6 +961,23 @@ bool apple_dp_tunnel_binding_live(void *data)
 }
 EXPORT_SYMBOL_GPL(apple_dp_tunnel_binding_live);
 
+/*
+ * The binding's revocation (apple_dpin_release_binding()) takes the same
+ * lock, so it comes before @call, which then does not run, or after it.
+ */
+int apple_dp_tunnel_binding_call(void *data, int (*call)(void *arg), void *arg)
+{
+	const struct apple_dpin_binding *binding = data;
+	struct apple_dpin_ctx *c = binding->ctx;
+
+	guard(mutex)(&c->lock);
+	if (!c->state.alive ||
+	    !apple_dpin_token_access(&c->tokens, binding->generation))
+		return -ESTALE;
+	return call(arg);
+}
+EXPORT_SYMBOL_GPL(apple_dp_tunnel_binding_call);
+
 static bool apple_dpin_provider_get(void *data)
 {
 	struct apple_dpin_binding *binding = data;
