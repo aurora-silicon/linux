@@ -30,11 +30,8 @@ const CONTEXT_SIZE: usize = 0x20000;
 const REGION_A_SIZE: usize = core::mem::size_of::<abi::RegionA>();
 const REGION_C_SIZE: usize = 0x1000;
 
-const COMPUTE_BLOCKS_MAPPED: usize = 22;
-const COMPUTE_BLOCKS_POPULATED: usize = 21;
 const COMPUTE_CONTROL_BLOCKS: u32 = 25;
 const COMPUTE_CONTROL_CURSOR: u32 = 0x18;
-const COMPUTE_RUN_ADDRESS_MASK: u64 = 0x0000_ffff_ffff_f000;
 
 /// A borrowed completion slot. Read the identity before requesting its timestamps;
 /// unrelated QIDs need only the control word. Each access is an aligned live load.
@@ -80,34 +77,22 @@ impl ComputeCompletion<'_> {
     }
 }
 
-/// Unpublished device-wide compute backing, prepared without the device mutex. The cache
-/// identity belongs to this allocation, not to any one physical queue or client VM.
+/// The device-wide compute pool's installation, prepared without the device mutex. Its identity
+/// tells which client VMs were readied for it; it belongs to this installation, not to any one
+/// physical queue or client VM.
+///
+/// The pool's control names a page list, a run list and blocks at fixed lower addresses. Only
+/// client VMs ever mapped them, read-write in every VM that ran compute, so one client could
+/// rewrite what every compute queue allocates from. On the A18 Pro neither the firmware nor the
+/// GPU used them there: the control's counters never moved. Nothing maps or backs them now.
 pub(super) struct ComputeShared {
     id: u64,
-    pages: KernelObject,
-    runs: KernelObject,
-    blocks: KVec<KernelObject>,
 }
 
 impl ComputeShared {
-    pub(super) fn new(alloc: &super::object::Allocator<'_>) -> Result<Self> {
-        let pages =
-            KernelObject::backing(alloc.dev, low::RENDER_PAGE_LIST_SIZE, CpuMap::WriteCombined)?;
-        let runs =
-            KernelObject::backing(alloc.dev, low::RENDER_RUN_LIST_SIZE, CpuMap::WriteCombined)?;
-        let mut blocks = KVec::with_capacity(COMPUTE_BLOCKS_MAPPED, GFP_KERNEL)?;
-        for _ in 0..COMPUTE_BLOCKS_MAPPED {
-            blocks.push(
-                KernelObject::backing(alloc.dev, abi::FREE_LIST_BLOCK_SIZE, CpuMap::WriteCombined)?,
-                GFP_KERNEL,
-            )?;
-        }
-        let id = u64::from(super::ids::OBJECTS.object()?);
+    pub(super) fn new() -> Result<Self> {
         Ok(Self {
-            id,
-            pages,
-            runs,
-            blocks,
+            id: u64::from(super::ids::OBJECTS.object()?),
         })
     }
 }
@@ -532,9 +517,9 @@ impl InitData {
         self.compute_shared.is_some()
     }
 
-    /// Install a prepared aperture once while holding the device mutex. A competing preparer
-    /// may have installed its allocation first; the redundant unpublished backing then drops.
-    pub(super) fn install_compute_shared(&mut self, mut shared: ComputeShared) -> Result {
+    /// Install a prepared pool once while holding the device mutex. A competing preparer may
+    /// have installed its own first; the redundant one then drops.
+    pub(super) fn install_compute_shared(&mut self, shared: ComputeShared) -> Result {
         if self.compute_shared.is_some() {
             return Ok(());
         }
@@ -553,27 +538,13 @@ impl InitData {
         self.object_mut(boot_control)?.bytes_mut().fill(0);
         self.object_mut(boot_control)?.write(0, control)?;
         self.object_mut(boot_state)?.bytes_mut().fill(0);
-        shared
-            .pages
-            .initialize::<[u64; low::RENDER_PAGE_LIST_SIZE / 8]>(0, |pages| {
-                abi::fill_page_list(pages, (0..COMPUTE_BLOCKS_POPULATED).map(low::compute_block))
-            })?;
-        shared
-            .runs
-            .initialize::<[u64; low::RENDER_RUN_LIST_SIZE / 8]>(0, |runs| {
-                for (index, run) in runs.iter_mut().take(COMPUTE_BLOCKS_POPULATED).enumerate() {
-                    *run = (low::compute_block(index) & COMPUTE_RUN_ADDRESS_MASK)
-                        | (u64::from(abi::FREE_LIST_BLOCK_PAGES) << 52);
-                }
-                Ok(())
-            })?;
         fence(Ordering::SeqCst);
         self.compute_shared = Some(shared);
         Ok(())
     }
 
-    /// Whether `vm` has the shared compute aperture mapped. M5 has no shared
-    /// aperture: its compute queues need only their own pools, so every VM is ready.
+    /// Whether `vm` was readied for the installed compute pool. M5 has no shared
+    /// pool: its compute queues need only their own pools, so every VM is ready.
     pub(super) fn compute_vm_cached(&self, vm: &mmu::Vm) -> bool {
         self.m5
             || self
@@ -582,42 +553,17 @@ impl InitData {
                 .is_some_and(|shared| vm.compute_pool_mappings_match(shared.id))
     }
 
+    /// Readies `vm` for the installed compute pool. Nothing of the pool is mapped into it, and
+    /// neither are the completion rings: the host retires every client's compute work on the
+    /// rings' records, so no client may write them. The firmware fills them through its own
+    /// aliases; on the A18 Pro every compute command still retired on its record.
     pub(super) fn cache_compute_vm(&self, vm: &mmu::Vm) -> Result {
         let shared = self.compute_shared.as_ref().ok_or(EIO)?;
         if vm.compute_pool_mappings_match(shared.id) {
             return Ok(());
         }
         vm.clear_compute_pool_mappings();
-        let mut mappings = KVec::with_capacity(26, GFP_KERNEL)?;
-        mappings.push(
-            shared
-                .pages
-                .map_alias(vm, low::COMPUTE_POOL_PAGE_LIST, mmu::PROT_GPU_SHARED_RW)?,
-            GFP_KERNEL,
-        )?;
-        mappings.push(
-            shared
-                .runs
-                .map_alias(vm, low::COMPUTE_POOL_RUN_LIST, mmu::PROT_GPU_SHARED_RW)?,
-            GFP_KERNEL,
-        )?;
-        for (index, block) in shared.blocks.iter().take(COMPUTE_BLOCKS_MAPPED).enumerate() {
-            mappings.push(
-                block.map_alias(vm, low::compute_block(index), mmu::PROT_GPU_SHARED_RW)?,
-                GFP_KERNEL,
-            )?;
-        }
-        for slot in 0..2 {
-            mappings.push(
-                self.object(self.completion_rings[slot].ok_or(EINVAL)?)?.map_alias(
-                    vm,
-                    low::COMPLETION_RINGS[slot],
-                    mmu::PROT_GPU_SHARED_RW,
-                )?,
-                GFP_KERNEL,
-            )?;
-        }
-        vm.install_compute_pool_mappings(shared.id, mappings)
+        vm.install_compute_pool_mappings(shared.id, KVec::new())
     }
 
     /// The descriptor-table views remain immutable for the firmware session.
