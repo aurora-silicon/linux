@@ -867,6 +867,11 @@ static int dcp_backlight_dpms(struct apple_dcp *d, bool on)
 static void av_service_disconnect(struct apple_dcp *d)
 { (void)d; av_disconnects++; }
 static bool dcp_is_typec_output(struct apple_dcp *d) { return d->typec_output; }
+/* A present the firmware took and has not completed: its watchdog is kept. */
+static bool present_in_flight;
+static int watchdog_keeps;
+static bool iomfb_present_in_flight(struct apple_dcp *d) { (void)d; return present_in_flight; }
+static void dcp_swap_watchdog_keep(struct apple_dcp *d) { d->swap_watchdog_wq.pending = true; watchdog_keeps++; }
 static void _dcp_poweroff(struct apple_dcp *d) { (void)d; poweroffs++; }
 static void reinit_completion(struct completion *c) { c->done = 0; }
 static bool dptx_service_available(struct dptx_port *p) { return p->available; }
@@ -893,6 +898,7 @@ static void init(u64 released, u64 claimed)
  dcp.typec_reconnect_wq.pending = true;
  connector.connected = true;
  poweroffs = hpd_drops = disconnects = retries = av_disconnects = 0;
+ present_in_flight = false; watchdog_keeps = 0;
 }
 int main(void)
 {
@@ -912,6 +918,12 @@ int main(void)
  /* A successful replacement modeset refreshes the token before later DPMS. */
  init(5, 4); dcp.crtc_unplugs = dcp.typec_unplugs; dcp_poweroff(&pdev);
  assert(poweroffs == 1 && hpd_drops == 1 && disconnects == 1);
+ assert(!dcp.swap_watchdog_wq.pending && !watchdog_keeps);
+
+ /* The display went with a present in flight: power-off keeps its watchdog. */
+ init(4, 3); dcp.swap_watchdog_wq.pending = true; present_in_flight = true;
+ dcp_poweroff(&pdev);
+ assert(poweroffs == 1 && watchdog_keeps == 1 && dcp.swap_watchdog_wq.pending);
  puts("stale CRTC power-off ownership passed");
  return 0;
 }

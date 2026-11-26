@@ -1853,14 +1853,49 @@ VISIBLE_IF_KUNIT void dcp_swap_watchdog(struct work_struct *work)
 		dcp_queue_hotplug(dcp->connector);
 }
 
+/*
+ * The pipelines whose swaps the watchdog follows: a Type-C output, and a
+ * pipeline with Type-C displays only (no fixed output) also while none is
+ * routed to it. The display of such a pipeline goes with its route, which
+ * is released when the cable or dock goes, before the desktop hears of it:
+ * the desktop's next present then reaches a pipe with no display, which the
+ * firmware accepts and drops. Not watched, it holds the IOMFB queue until
+ * its timeout declares the processor crashed, and the pipeline never
+ * lights a display again. Desktop 26.x also watches some of its own.
+ */
+bool dcp_swap_watched(struct apple_dcp *dcp)
+{
+	return dcp_is_typec_output(dcp) ||
+	       (dcp->nr_typec_routes && !dcp->fixed_connector) ||
+	       dcp_desktop_swap_watched(dcp);
+}
+
 void dcp_swap_watchdog_arm(struct apple_dcp *dcp)
 {
-	if (dcp_is_typec_output(dcp) || dcp_desktop_swap_watched(dcp)) {
+	if (dcp_swap_watched(dcp)) {
 		dcp->swap_watchdog_deadline = jiffies +
 			msecs_to_jiffies(DCP_SWAP_WATCHDOG_MS);
 		mod_delayed_work(system_dfl_wq, &dcp->swap_watchdog_wq,
 				 msecs_to_jiffies(DCP_SWAP_WATCHDOG_MS));
 	}
+}
+
+/*
+ * The display of @dcp goes, or its CRTC is turned off, with a present the
+ * firmware accepted still in flight: it may never complete, so the watchdog
+ * stays armed for it (armed again if something stopped it), as from its
+ * submission, and retires it if it does not complete. Firmware without the
+ * IOMFB queue keeps what it had.
+ */
+void dcp_swap_watchdog_keep(struct apple_dcp *dcp)
+{
+	if (!iomfb_present_in_flight(dcp) || delayed_work_pending(&dcp->swap_watchdog_wq))
+		return;
+	dev_info(dcp->dev, "swap %u in flight as its display goes: retired if it does not complete\n",
+		 READ_ONCE(dcp->present_state_h17p.swap_id));
+	dcp->swap_watchdog_deadline = jiffies + msecs_to_jiffies(DCP_SWAP_WATCHDOG_MS);
+	mod_delayed_work(system_dfl_wq, &dcp->swap_watchdog_wq,
+			 msecs_to_jiffies(DCP_SWAP_WATCHDOG_MS));
 }
 
 void dcp_swap_watchdog_complete(struct apple_dcp *dcp)
@@ -4155,6 +4190,8 @@ int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port)
 		reinit_completion(&dcp->typec_iomfb_hpd_ready);
 		cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
 		cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
+		/* A present the firmware took for the display that goes. */
+		dcp_swap_watchdog_keep(dcp);
 	}
 
 	/*
@@ -5466,7 +5503,15 @@ void dcp_poweroff(struct platform_device *pdev)
 		return;
 	}
 
-	cancel_delayed_work(&dcp->swap_watchdog_wq);
+	/*
+	 * Not while a present is in flight on the queue's firmware: the
+	 * power-off waits behind it, and only its watchdog retires it if the
+	 * display that would have shown it is gone.
+	 */
+	if (iomfb_present_in_flight(dcp))
+		dcp_swap_watchdog_keep(dcp);
+	else
+		cancel_delayed_work(&dcp->swap_watchdog_wq);
 
 	/*
 	 * Internal H17P DPMS is a brightness present, never a pipe stop. With hw.s2r the

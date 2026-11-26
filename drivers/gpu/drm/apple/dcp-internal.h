@@ -78,7 +78,9 @@ struct iomfb_transaction {
 struct apple_dcp_typec_port;
 
 void dcp_swap_watchdog_arm(struct apple_dcp *dcp);
+void dcp_swap_watchdog_keep(struct apple_dcp *dcp);
 void dcp_swap_watchdog_complete(struct apple_dcp *dcp);
+bool dcp_swap_watched(struct apple_dcp *dcp);
 bool dcp_swap_lost(struct apple_dcp *dcp, u32 swap_id);
 void dcp_retry_placeholder_edid(struct apple_dcp *dcp,
 				const struct drm_edid *drm_edid);
@@ -1245,6 +1247,7 @@ bool iomfb_present_brightness_only_h17p(struct apple_dcp *dcp);
 bool iomfb_present_complete_h17p(struct apple_dcp *dcp);
 void iomfb_present_failed_h17p(struct apple_dcp *dcp);
 bool iomfb_retire_dropped_present_h17p(struct apple_dcp *dcp);
+bool iomfb_present_in_flight(struct apple_dcp *dcp);
 bool iomfb_present_has_surface_h17p(const struct dcp_swap_submit_req_h17p *request);
 bool iomfb_apply_backlight_h17p(struct apple_dcp *dcp,
 				const struct dcp_swap_submit_req_h17p *request,

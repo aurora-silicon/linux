@@ -4075,6 +4075,18 @@ bool iomfb_retire_dropped_present_h17p(struct apple_dcp *dcp)
 	return true;
 }
 
+/*
+ * A present the firmware accepted and has not completed yet, on firmware
+ * with the IOMFB queue: only its completion or the swap watchdog
+ * (iomfb_retire_dropped_present_h17p()) lets the queue go on. A snapshot,
+ * read without the queue's lock.
+ */
+bool iomfb_present_in_flight(struct apple_dcp *dcp)
+{
+	return iomfb_uses_queue(dcp) && READ_ONCE(dcp->present_state_h17p.pending) &&
+	       READ_ONCE(dcp->present_state_h17p.accepted);
+}
+
 /* Release a present's scanout unless it is displayed or was dropped. */
 VISIBLE_IF_KUNIT void iomfb_scanout_put_h17p(struct apple_dcp *dcp,
 					     struct iomfb_scanout_h17p *scanout)

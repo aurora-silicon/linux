@@ -446,6 +446,7 @@ def watchdog(root):
     production='\n'.join(block(source, marker) for marker in (
         'bool dcp_desktop_present_complete(',
         'VISIBLE_IF_KUNIT void dcp_swap_watchdog(',
+        'bool dcp_swap_watched(',
         'void dcp_swap_watchdog_arm(',
         'void dcp_swap_watchdog_complete('))
     internal=(root/'drivers/gpu/drm/apple/dcp-internal.h').read_text()
@@ -476,6 +477,7 @@ struct work_struct {unsigned unused;};
 struct delayed_work {struct work_struct work;};
 struct apple_dcp {
     int fw_compat;bool vrr_enabled,typec;
+    u32 nr_typec_routes;void *fixed_connector;
     struct {u32 present_id;bool present_pending,vrr_failed,takeover_adopted,mode_live;} *desktop;
     struct {bool valid;} mode_state;
     struct delayed_work swap_watchdog_wq;
@@ -524,6 +526,12 @@ int main(void) {
     d.fw_compat=1;d.typec=true;dcp_swap_watchdog_arm(&d);assert(scheduled==before+1);
     allow_retire=false;d.mode_state.valid=true;
     dcp_swap_watchdog(&d.swap_watchdog_wq.work);assert(d.mode_state.valid && hotplugs==1);
+    /* A pipeline with Type-C displays only stays watched once its route is released;
+     * one with a fixed output, or without Type-C routes, does not. */
+    d.typec=false;d.nr_typec_routes=2;before=scheduled;
+    dcp_swap_watchdog_arm(&d);assert(scheduled==before+1);
+    d.fixed_connector=(void *)1;dcp_swap_watchdog_arm(&d);assert(scheduled==before+1);
+    d.fixed_connector=NULL;d.nr_typec_routes=0;dcp_swap_watchdog_arm(&d);assert(scheduled==before+1);
     /* A takeover that adopted the loader's mode is watched until a swap
      * completes; with none, the mode is set through the hotplug worker. */
     allow_retire=true;d.fw_compat=5;d.typec=false;d.vrr_enabled=false;
