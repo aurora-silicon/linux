@@ -1087,6 +1087,8 @@ struct apple_dcp {
 	struct delayed_work typec_reconnect_wq;
 	u32 typec_reconnect_tries;
 	struct dcp_fabric_session typec_reconnect_session; /* hpd_mutex */
+	/* The queued connect must not wake a CRTC turned off (hpd_mutex). */
+	bool typec_reconnect_recovery;
 	/* hpd_mutex: what DRM reports for the external display, and when */
 	struct dcp_announce announce;
 	struct delayed_work announce_wq;

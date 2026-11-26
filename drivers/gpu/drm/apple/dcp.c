@@ -2461,6 +2461,22 @@ static bool dcp_tb_tunnel_withdrawn(struct apple_dcp *dcp, u32 port)
 }
 
 /*
+ * As dcp_connect_session_valid_locked(), before a DPTX call of the connect:
+ * a Thunderbolt tunnel's provider revokes its binding before the fabric
+ * retires the session (the detach that follows waits for this connect), and
+ * no call is made for a revoked one. Only the binding the session holds is
+ * checked: the session's cookie is the current binding's.
+ */
+static bool dcp_connect_admitted_locked(struct apple_dcp *dcp,
+					const struct dcp_fabric_session *session,
+					bool cable, bool recovery)
+{
+	if (!dcp_connect_session_valid_locked(dcp, session, cable, recovery))
+		return false;
+	return !session || !session->cookie || !dcp_tb_tunnel_withdrawn(dcp, 0);
+}
+
+/*
  * Only T6050 is known to need the tunnel watched: a Thunderbolt 5 dock
  * there withdraws a fresh tunnel right after DCP starts on it. Elsewhere
  * the wait stays as it was until the watch is tested there.
@@ -2577,7 +2593,7 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 	mutex_lock(&dcp->hpd_mutex);
 	compact = dptx_service_available(&dcp->dptxport[port]) &&
 		  READ_ONCE(dcp->dptxport[port].service->ep->compact);
-	if (!dcp_connect_session_valid_locked(dcp, session, cable, recovery)) {
+	if (!dcp_connect_admitted_locked(dcp, session, cable, recovery)) {
 		ret = -ESTALE;
 		goto out_unlock;
 	}
@@ -2629,7 +2645,7 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 		}
 	}
 
-	if (!dcp_connect_session_valid_locked(dcp, session, cable, recovery)) {
+	if (!dcp_connect_admitted_locked(dcp, session, cable, recovery)) {
 		ret = -ESTALE;
 		goto out_unlock;
 	}
@@ -2644,7 +2660,7 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 		goto out_unlock;
 	}
 
-	if (!dcp_connect_session_valid_locked(dcp, session, cable, recovery)) {
+	if (!dcp_connect_admitted_locked(dcp, session, cable, recovery)) {
 		ret = -ESTALE;
 		goto out_unlock;
 	}
@@ -2655,7 +2671,7 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 			ret);
 		goto out_release;
 	}
-	if (!dcp_connect_session_valid_locked(dcp, session, cable, recovery)) {
+	if (!dcp_connect_admitted_locked(dcp, session, cable, recovery)) {
 		ret = -ESTALE;
 		goto out_release;
 	}
@@ -3707,6 +3723,7 @@ static void dcp_typec_reconnect_work(struct work_struct *work)
 		container_of(to_delayed_work(work), struct apple_dcp,
 			     typec_reconnect_wq);
 	struct dcp_fabric_session session;
+	bool recovery;
 	int ret;
 
 	/*
@@ -3730,15 +3747,15 @@ static void dcp_typec_reconnect_work(struct work_struct *work)
 		/* Only the session this work was queued for may connect. */
 		scoped_guard(mutex, &dcp->hpd_mutex) {
 			session = dcp->typec_reconnect_session;
+			recovery = dcp->typec_reconnect_recovery;
 			if (!dcp_session_valid_locked(dcp, session, true))
 				return;
 		}
-		ret = dcp_dptx_connect_raw(dcp, 0, NULL, &session, true, false);
+		ret = dcp_dptx_connect_raw(dcp, 0, NULL, &session, true, recovery);
 		if (!ret)
 			ret = dcp_dptx_connect_tile(dcp);
 		if (dcp_t8132_ext_hw(dcp) && ret && ret != -ESTALE)
-			dev_warn(dcp->dev, "DPTX connect for the DP tunnel failed (try %u): %d\n",
-				 dcp->typec_reconnect_tries + 1, ret);
+			dev_warn(dcp->dev, "DPTX connect for the DP tunnel failed: %d\n", ret);
 		scoped_guard(mutex, &dcp->hpd_mutex) {
 			if (!dcp_session_valid_locked(dcp, session, true))
 				return;
@@ -3752,9 +3769,14 @@ static void dcp_typec_reconnect_work(struct work_struct *work)
 	if (READ_ONCE(dcp->external_error))
 		dcp_announce_kick(dcp);
 
-	/* A T8132 dcpext connects once per tunnel. */
+	/*
+	 * A T8132 dcpext connects once per tunnel, on either firmware: what
+	 * fails it (a binding replaced or revoked, a link that did not come,
+	 * an earlier release still unanswered) is not changed by trying again.
+	 * The tunnel's next request, or the CRTC's power-on, connects again.
+	 */
 	if (++dcp->typec_reconnect_tries <
-	    (dcp_uses_t6020_tunnel_flow(dcp) || dcp_is_t8132_ext(dcp) ?
+	    (dcp_uses_t6020_tunnel_flow(dcp) || dcp_t8132_ext_hw(dcp) ?
 	     1 : DPTX_RECONNECT_RETRIES)) {
 		mod_delayed_work(system_freezable_wq, &dcp->typec_reconnect_wq,
 				 DPTX_RECONNECT_DELAY);
@@ -3810,6 +3832,7 @@ static void dcp_typec_attach_locked(struct apple_dcp *dcp)
 	WRITE_ONCE(dcp->typec_cable_connected, true);
 	dcp_firmware_metadata_connection(dcp, dcp->typec_generation, true);
 	dcp->typec_reconnect_tries = 0;
+	dcp->typec_reconnect_recovery = false;
 	dcp->placeholder_retried = false;
 	cancel_delayed_work(&dcp->typec_reconnect_wq);
 	/* A newly attached display gets its own retries. */
@@ -4204,7 +4227,12 @@ void dcp_typec_attach_deferred(struct apple_dcp *dcp)
 	dcp_typec_attach_locked(dcp);
 	scoped_guard(spinlock_irqsave, &dcp->relink_lock)
 		dcp_relink_attach(&dcp->relink, dcp->typec_generation);
-	/* The session started here is the one the work connects. */
+	/*
+	 * The session started here is the one the work connects, unless the
+	 * CRTC is turned off before (dcp_poweroff()): dcp_poweron() connects
+	 * it then.
+	 */
+	dcp->typec_reconnect_recovery = true;
 	dcp_queue_typec_reconnect_locked(dcp, 0);
 }
 
@@ -4238,10 +4266,13 @@ int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port)
 		WRITE_ONCE(dcp->typec_crtc_off, false);
 		reinit_completion(&dcp->typec_iomfb_hpd_ready);
 		/*
-		 * A connect of the revoked session in the reconnect work that
-		 * waits for an earlier release's answers ends that wait at
-		 * once, and finds its session revoked.
+		 * A connect of the revoked session in the reconnect work ends
+		 * its waits at once: the link wait (on a tunnel, whose link
+		 * comes from nothing else) and the wait for an earlier
+		 * release's answers. Each finds its session revoked.
 		 */
+		if (dcp->dptx_tunnel)
+			complete(&dcp->dptxport[0].linkcfg_completion);
 		if (dcp->dptxep)
 			afk_late_replies_wake(dcp->dptxep);
 		cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
@@ -5638,8 +5669,15 @@ void dcp_poweroff(struct platform_device *pdev)
 	 */
 	if (dcp_is_typec_output(dcp)) {
 		reinit_completion(&dcp->typec_iomfb_hpd_ready);
-		if (READ_ONCE(dcp->typec_cable_connected))
-			WRITE_ONCE(dcp->typec_crtc_off, true);
+		/*
+		 * Under hpd_mutex: a connect of the reconnect work that must not
+		 * wake the CRTC checks it there before each DPTX call, and one
+		 * that raised HPD already is released below.
+		 */
+		scoped_guard(mutex, &dcp->hpd_mutex) {
+			if (dcp->typec_cable_connected)
+				WRITE_ONCE(dcp->typec_crtc_off, true);
+		}
 		/* dcp_poweron() reconnects the link on DPMS wake. */
 		cancel_delayed_work(&dcp->typec_reconnect_wq);
 	}

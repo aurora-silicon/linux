@@ -796,6 +796,9 @@ int main(void)
                      'static bool dcp_tb_tunnel_withdrawn(struct apple_dcp *d, u32 port)\n'
                      '{ (void)d; (void)port; assert(!"tunnel watch in an H17P scenario"); return false; }\n' +
                      apple_function(root, 'dcp_dptx_wait_linkcfg'))
+    if 'dcp_connect_admitted_locked(' in raw:
+        # The session checks before each DPTX call; no tunnel binding here.
+        firmware += apple_function(root, 'dcp_connect_admitted_locked')
     # unless the update work already needed the clock
     clock = 'static unsigned jiffies_to_msecs(unsigned long t) { return t; }\n'
     if clock in unit:
