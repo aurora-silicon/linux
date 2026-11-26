@@ -529,6 +529,9 @@ struct cd321x {
 	bool macos_usbw_due;
 	/* ... and the controller is in macOS's no-partner state 0x02 since a detach */
 	bool macos_detached;
+	/* A poll asked for a read for a plug state not applied, and which state */
+	bool poll_revalidated;
+	bool poll_revalidated_plug;
 
 	struct cd321x_status update_status;
 	struct delayed_work update_work;

@@ -55,7 +55,10 @@ config TYPEC_TIPD_KUNIT_TEST
 	  shared with the driver, including aborted and repeated sleep cycles.
 	  Also test that interrupt events which could not be read or cleared
 	  are still acknowledged, however long that keeps failing, so that the
-	  controller keeps raising its interrupt.
+	  controller keeps raising its interrupt. Also test that a polled
+	  controller whose plug changed without an event, or whose plug was
+	  never applied, has its port state read again, once for each plug
+	  state.
 	  Also test that a USB4/Thunderbolt router which has not registered its
 	  switch does not keep the port from probing.
 	  Also test that a Type-C state which a mux provider with transient

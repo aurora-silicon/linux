@@ -2296,6 +2296,55 @@ int cd321x_wake_events(struct tps6598x *tps, u8 event[CD321X_WAKE_EVENT_LEN], u3
 }
 EXPORT_SYMBOL_GPL(cd321x_wake_events);
 
+/*
+ * The plug event is an edge: one that never reaches the driver, or that is
+ * acknowledged while the cable state behind it is not applied, leaves the
+ * port without a partner (or with a stale one) until the next replug. A
+ * polled controller has no interrupt line to latch it, so on every poll
+ * without an event compare the plug state, masked as cd321x_connect() masks
+ * it, with both the last snapshot and whether a partner is registered: the
+ * snapshot is taken before the update applies it, and an update that gave
+ * up leaves the two apart. If either differs, read the whole state again.
+ *
+ * Not while a revalidation or an update is already under way: its read
+ * settles the state, and requeueing it every poll would keep pushing it
+ * back. And only once for each plug state not applied: a revalidation that
+ * gives up again waits for the next event or plug change, as before, rather
+ * than being restarted every 500 ms.
+ *
+ * Context: tps->lock held.
+ */
+static void cd321x_poll_plug_level(struct cd321x *cd321x)
+{
+	struct tps6598x *tps = &cd321x->tps;
+	bool plug;
+	u32 status;
+
+	lockdep_assert_held(&tps->lock);
+	if ((cd321x->pm.phase != CD321X_PM_RUNNING &&
+	     cd321x->pm.phase != CD321X_PM_STALE) ||
+	    delayed_work_pending(&cd321x->update_work))
+		return;
+	/* A failed read here is only a missed comparison; the next poll tries again. */
+	if (tps6598x_read32(tps, TPS_REG_STATUS, &status))
+		return;
+	if (tps->contaminant_ops && tps->contaminant != TYPEC_CONTAMINANT_NONE)
+		status &= ~TPS_STATUS_PLUG_PRESENT;
+	plug = status & TPS_STATUS_PLUG_PRESENT;
+	if (plug == !!(tps->status & TPS_STATUS_PLUG_PRESENT) && plug == !!tps->partner) {
+		cd321x->poll_revalidated = false;
+		return;
+	}
+	if (cd321x->poll_revalidated && cd321x->poll_revalidated_plug == plug)
+		return;
+
+	cd321x->poll_revalidated = true;
+	cd321x->poll_revalidated_plug = plug;
+	dev_info_ratelimited(tps->dev, "plug %s without an event, reading the port again\n",
+			     plug ? "present" : "gone");
+	cd321x_event_lost(cd321x);
+}
+
 static irqreturn_t cd321x_interrupt(int irq, void *data)
 {
 	struct tps6598x *tps = data;
@@ -2316,8 +2365,11 @@ static irqreturn_t cd321x_interrupt(int irq, void *data)
 	}
 	trace_cd321x_irq(event);
 
-	if (!event)
+	if (!event) {
+		if (!irq)
+			cd321x_poll_plug_level(cd321x);
 		goto err_unlock;
+	}
 	/* A cable came or went: a wake's first read is no longer a quiet one, see cd321x_connect() */
 	if (event & APPLE_CD_REG_INT_PLUG_EVENT)
 		cd321x->wake_apply = false;
