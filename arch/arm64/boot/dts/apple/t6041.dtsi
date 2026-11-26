@@ -18,6 +18,8 @@
 			<&ps_venc0_pipe5>, <&ps_venc0_me0>, <&ps_venc0_me1>,
 			<&pmc_soc_max>;
 	power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1", "perf";
+	iommus = <&ave0_dart0 0>, <&ave0_dart0 12>,
+		 <&ave0_dart1 0>, <&ave0_dart1 12>;
 };
 
 /* The loader supplies the ANE firmware and reservations. */
@@ -937,7 +939,8 @@
 				<&ps_venc1_pipe5>, <&ps_venc1_me0>, <&ps_venc1_me1>,
 				<&pmc_soc_max>;
 		power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1", "perf";
-		iommus = <&ave1_dart0 0>, <&ave1_dart1 0>;
+		iommus = <&ave1_dart0 0>, <&ave1_dart0 12>,
+			 <&ave1_dart1 0>, <&ave1_dart1 12>;
 		status = "okay";
 	};
 };
