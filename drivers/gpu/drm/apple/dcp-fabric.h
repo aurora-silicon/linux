@@ -122,11 +122,19 @@ int dcp_tunnel_dpin_activate(struct apple_dcp *dcp, u32 unit, bool active);
 
 /*
  * A T8132 dcpext adopted through the M4 26.6.2 backend (iomfb_m4.c,
- * t8132_ext_drm.c). A J773g dcpext on firmware 27.2 is an ordinary
- * firmware-27 pipe instead and is neither of these.
+ * t8132_ext_drm.c): its probe, teardown, sleep and DRM paths, and the
+ * firmware protocol they follow. A T8132 dcpext on firmware 27.2 is an
+ * ordinary firmware-27 pipe instead and is neither of these.
  */
 bool dcp_t8132_ext_m4_node(const struct device_node *np);
 bool dcp_is_t8132_ext(const struct apple_dcp *dcp);
+
+/*
+ * Any T8132 dcpext, whatever firmware backend drives it: its display
+ * crossbar, the DP IN tunnel pixel clocks it sources (2 or 4), the PHYs
+ * behind its Type-C routes and its Thunderbolt tunnel flow are hardware.
+ */
+bool dcp_t8132_ext_hw(const struct apple_dcp *dcp);
 
 /* DCP probe, resume and endpoint teardown hooks. */
 int dcp_register_typec_routes(struct apple_dcp *dcp);

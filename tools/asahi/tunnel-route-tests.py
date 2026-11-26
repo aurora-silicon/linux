@@ -21,6 +21,8 @@ FUNCTIONS = {
 # Each must make the fixture fail.
 MUTATIONS = {
     'clock-ignored': ('& BIT(dpin)))', '& 0))'),
+    'clock-m4-only': ('if (dcp_t8132_ext_hw(route->dcp))\n\t\treturn (apple_dp_tunnel_t8132_pclk',
+                      'if (dcp_is_t8132_ext(route->dcp))\n\t\treturn (apple_dp_tunnel_t8132_pclk'),
     'snapshot-ignores-yield': ('port->dp_wanted && !port->typec_yielded;', 'port->dp_wanted;'),
     'snapshot-two-slots': ('i < ARRAY_SIZE(port->slots); i++)\n\t\tport->core.owner[i]',
                            'i < 2; i++)\n\t\tport->core.owner[i]'),

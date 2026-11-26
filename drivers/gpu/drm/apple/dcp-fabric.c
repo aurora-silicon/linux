@@ -239,15 +239,20 @@ bool dcp_is_t8132_ext(const struct apple_dcp *dcp)
 	return dcp_t8132_ext_m4_node(dcp->dev->of_node);
 }
 
+bool dcp_t8132_ext_hw(const struct apple_dcp *dcp)
+{
+	return of_device_is_compatible(dcp->dev->of_node, "apple,t8132-dcpext");
+}
+
 /*
- * A route of an adopted T8132 dcpext whose PHY has no DP alt mode: the
+ * A route of a T8132 dcpext whose PHY has no DP alt mode: the
  * crossbar's DP PHY output has nothing behind it. The board marks the PHYs
  * wired for DP alt mode (apple,dp-alt-mode). Either way the dcpext is no
  * apple_crtc pipeline: its DRM objects are its own (t8132_ext_drm.c).
  */
 static bool dcp_typec_route_no_dp_alt(const struct apple_dcp_typec_route *route)
 {
-	if (!dcp_is_t8132_ext(route->dcp))
+	if (!dcp_t8132_ext_hw(route->dcp))
 		return false;
 	return IS_ERR_OR_NULL(route->phy) ||
 	       !of_property_read_bool(route->phy->dev.of_node, "apple,dp-alt-mode");
@@ -259,7 +264,7 @@ static bool dcp_typec_route_no_dp_alt(const struct apple_dcp_typec_route *route)
  */
 static u8 dcp_route_tunnel_clock_blocked(const struct apple_dcp_typec_route *route)
 {
-	if (dcp_is_t8132_ext(route->dcp))
+	if (dcp_t8132_ext_hw(route->dcp))
 		return (apple_dp_tunnel_t8132_pclk(route->mux_index, 0) < 0 ? BIT(0) : 0) |
 		       (apple_dp_tunnel_t8132_pclk(route->mux_index, 1) < 0 ? BIT(1) : 0);
 	return dcp_fabric_tunnel_clock_blocked(of_machine_is_compatible("apple,t6030"),
@@ -469,7 +474,7 @@ bool dcp_is_typec_only(struct platform_device *pdev)
 static int dcp_route_clock_rate(struct apple_dcp_typec_route *route,
 				struct phy *phy, unsigned int dpin, u8 rate)
 {
-	bool t8132 = dcp_is_t8132_ext(route->dcp);
+	bool t8132 = dcp_t8132_ext_hw(route->dcp);
 	int ret;
 
 	/*
@@ -2483,7 +2488,7 @@ int dcp_tunnel_crossbar_up(struct apple_dcp *dcp, u32 unit)
 	int ret;
 
 	guard(mutex)(&dcp->tb_lock);
-	if (dcp_is_t8132_ext(dcp))
+	if (dcp_t8132_ext_hw(dcp))
 		return dcp_t8132_crossbar_up_locked(dcp, unit);
 	if (unit)
 		return dcp_tunnel_split_up_locked(dcp);
@@ -2535,7 +2540,7 @@ int dcp_tunnel_crossbar_down(struct apple_dcp *dcp, u32 unit)
 
 	guard(mutex)(&dcp->tb_lock);
 	/* A T8132 dcpext has no second tile. */
-	if (dcp_is_t8132_ext(dcp) &&
+	if (dcp_t8132_ext_hw(dcp) &&
 	    (unit || dcp_t8132_late_release(dcp, "WillChangeLinkConfiguration")))
 		return 0;
 	if (unit) {
@@ -2550,7 +2555,7 @@ int dcp_tunnel_crossbar_down(struct apple_dcp *dcp, u32 unit)
 		return 0;
 	if (!dcp_fabric_callback_valid(route->tunnel_generation, dcp->tb_generation))
 		return -ESTALE;
-	if (dcp_is_t8132_ext(dcp))
+	if (dcp_t8132_ext_hw(dcp))
 		return dcp_t8132_crossbar_down_locked(dcp, route, "WillChangeLinkConfiguration");
 	dcp_tunnel_dpin_locked(dcp, false);
 	ret = dcp_dpxbar_link(route->active_xbar, false);
@@ -2678,7 +2683,7 @@ int dcp_direct_crossbar_link(struct apple_dcp *dcp, bool up)
 	 */
 	if (!on_link && !of_machine_is_compatible("apple,t6030") &&
 	    !dcp_t6041_ext_v27(dcp) &&
-	    !dcp_is_t8132_ext(dcp) && !dcp_is_ext26(dcp))
+	    !dcp_t8132_ext_hw(dcp) && !dcp_is_ext26(dcp))
 		return 0;
 	guard(mutex)(&dcp->tb_lock);
 	route = dcp->active_typec_route;
@@ -2725,7 +2730,7 @@ int dcp_tunnel_set_rate(struct apple_dcp *dcp, struct phy *phy, u32 unit,
 	 * T8132: the clock of the route's own DP IN, from its own source; no
 	 * second tile. Rate 0 takes the crossbar link down first.
 	 */
-	if (dcp_is_t8132_ext(dcp)) {
+	if (dcp_t8132_ext_hw(dcp)) {
 		if (dcp_t8132_late_release(dcp, "SetLinkRate"))
 			return -EBUSY;
 		if (unit || dcp->dptx_dfp_port != 1 + route->tunnel_dpin ||
@@ -2745,13 +2750,16 @@ int dcp_tunnel_set_rate(struct apple_dcp *dcp, struct phy *phy, u32 unit,
 		 * The firmware is told the rate is set, as on every path but
 		 * T6030 14.7: the crossbar link then stays down, and the output
 		 * reads as unusable until a nonzero rate is taken again. Its
-		 * connector hears of real changes only.
+		 * connector hears of real changes only: the M4 backend's
+		 * (t8132_ext_drm.c); a firmware-27 pipe's DRM connector
+		 * follows the firmware's own hotplug.
 		 */
 		refused = dcp_fabric_clock_refused(READ_ONCE(dcp->tb_clock_refused),
 						   link_rate, ret);
 		if (refused != READ_ONCE(dcp->tb_clock_refused)) {
 			WRITE_ONCE(dcp->tb_clock_refused, refused);
-			t8132_ext_drm_hotplug(dcp->dev);
+			if (dcp_is_t8132_ext(dcp))
+				t8132_ext_drm_hotplug(dcp->dev);
 		}
 		return ret;
 	}
@@ -2817,7 +2825,7 @@ static int dcp_t8132_tunnel_route_xbar(struct apple_dcp *dcp,
 int dcp_tunnel_dpin_activate(struct apple_dcp *dcp, u32 unit, bool active)
 {
 	struct apple_dcp_typec_route *route;
-	bool t8132 = dcp_is_t8132_ext(dcp);
+	bool t8132 = dcp_t8132_ext_hw(dcp);
 	int ret;
 
 	guard(mutex)(&dcp->tb_lock);
@@ -3277,7 +3285,7 @@ static bool dcp_typec_port_untileable(struct apple_dcp_typec_port *port)
 	/* No tiles on a T8132 dcpext. */
 	list_for_each_entry(route, &port->routes, port_link)
 		if (!route->dcp->external &&
-		    !dcp_is_t8132_ext(route->dcp) &&
+		    !dcp_t8132_ext_hw(route->dcp) &&
 		    route->dcp->fw_compat != DCP_FIRMWARE_V_27_0)
 			return false;
 	return !list_empty(&port->routes);

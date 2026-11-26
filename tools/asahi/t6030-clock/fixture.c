@@ -146,6 +146,11 @@ static bool dcp_is_t8132_ext(const struct apple_dcp *dcp)
 {
 	return false;
 }
+/* Production: any apple,t8132-dcpext, whatever its firmware. None here either. */
+static bool dcp_t8132_ext_hw(const struct apple_dcp *dcp)
+{
+	return false;
+}
 static bool dcp_t8132_late_release(struct apple_dcp *dcp, const char *what)
 {
 	abort();
