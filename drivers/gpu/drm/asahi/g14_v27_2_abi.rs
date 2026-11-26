@@ -138,6 +138,34 @@ pub(crate) fn encode_compute_helper(cmd: &mut [u8], binary: u32, data: u64, conf
     put32(cmd, COMPUTE_JOB_PARAMETERS1 + 0x50, config);
 }
 
+/// Where the 27.2 compute command keeps its sampler heap (u64), sampler count and sampler bound:
+/// the 13.5 EncoderParams sampler words, 0x10 bytes further on as in the 27.2 fragment command
+/// (13.5 0x8ac, 27.2 0x8bc). The firmware loads the same three words of every command type
+/// into the data master's sampler state (TA 0x558/0x560/0x564, 3D 0x8bc/0x8c4/0x8c8, compute
+/// here), the count and the bound as 11-bit fields.
+pub(crate) const COMPUTE_SAMPLER_HEAP: usize = 0x284;
+pub(crate) const COMPUTE_SAMPLER_COUNT: usize = 0x28c;
+pub(crate) const COMPUTE_SAMPLER_MAX: usize = 0x290;
+
+/// The sampler bound the 13.5 compute command stores next to the count: the count plus one,
+/// or zero without samplers.
+pub(crate) fn compute_sampler_max(count: u32) -> u32 {
+    if count == 0 {
+        0
+    } else {
+        count + 1
+    }
+}
+
+/// Writes the sampler heap of a zeroed 27.2 compute command. A command without samplers
+/// (heap and count zero) keeps the words zero. The caller has validated the heap: at most
+/// 1024 samplers, both fields set or both zero.
+pub(crate) fn encode_compute_samplers(cmd: &mut [u8], heap: u64, count: u32) {
+    put64(cmd, COMPUTE_SAMPLER_HEAP, heap);
+    put32(cmd, COMPUTE_SAMPLER_COUNT, count);
+    put32(cmd, COMPUTE_SAMPLER_MAX, compute_sampler_max(count));
+}
+
 /// Writes the user timestamp pair of a zeroed 27.2 compute command at `cmd_va` and returns the
 /// Timestamp operations' user word ([`user_timestamp_pointer`]).
 pub(crate) fn encode_compute_timestamps(cmd: &mut [u8], cmd_va: u64, timestamps: [u64; 2]) -> u64 {
@@ -270,6 +298,30 @@ mod tests {
         for (at, len) in [(0xa8, 4), (0xb0, 8), (0xb8, 4)] {
             assert!(free(at, len));
         }
+    }
+
+    #[test]
+    fn the_compute_samplers_sit_between_the_encoder_mask_and_the_job_meta() {
+        let mut cmd = [0u8; COMPUTE_COMMAND_BYTES];
+        encode_compute_samplers(&mut cmd, 0x2d_fff4_4000, 1024);
+        let read64 = |at: usize| u64::from_le_bytes(cmd[at..at + 8].try_into().unwrap());
+        let read32 = |at: usize| u32::from_le_bytes(cmd[at..at + 4].try_into().unwrap());
+        assert_eq!(
+            (read64(0x284), read32(0x28c), read32(0x290)),
+            (0x2d_fff4_4000, 1024, 1025)
+        );
+        // After the encoder mask (+0x270) and before the JobMeta stamps (+0x298), in no other
+        // word the compute encoder writes.
+        for (at, len) in [(0x284, 8), (0x28c, 4), (0x290, 4)] {
+            assert!(free(at, len));
+            assert!(0x270 + 4 <= at && at + len <= 0x298);
+        }
+        // The firmware takes the count and the bound as 11-bit fields.
+        assert!(compute_sampler_max(1024) < 1 << 11);
+
+        let mut none = [0u8; COMPUTE_COMMAND_BYTES];
+        encode_compute_samplers(&mut none, 0, 0);
+        assert!(none.iter().all(|&b| b == 0));
     }
 
     #[test]
