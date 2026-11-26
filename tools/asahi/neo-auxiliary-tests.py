@@ -20,6 +20,7 @@ impl<T> KBox<T>{fn new(v:T,_g:u32)->Result<Self>{Ok(Self(Box::new(v)))}}
 impl<T> Deref for KBox<T>{type Target=T;fn deref(&self)->&T{&self.0}}
 mod mmu {
  pub const UAT_PGSZ:usize=0x4000;
+ pub const PROT_FW_SHARED_RW:u32=1;
  pub const PROT_GPU_FW_SHARED_RW:u32=3;
  pub const PROT_GPU_SHARED_RW:u32=2;
  pub struct Vm;
@@ -35,7 +36,7 @@ impl KernelObject{
  fn map_range(&self,_v:&mmu::Vm,_r:Range<usize>,_a:Range<u64>,_align:u64,_p:u32,_g:u32)->Result<mmu::KernelMapping>{Err(-28)}
 }
 struct Allocator<'a>{_p:std::marker::PhantomData<&'a ()>}
-impl Allocator<'_>{fn kernel(&self,size:usize,align:u64,p:u32,_c:CpuMap)->Result<KernelObject>{assert_eq!(size,mmu::UAT_PGSZ);assert_eq!(align,0x4000);assert_eq!(p,3);Ok(KernelObject{va:0x40000000,size})}}
+impl Allocator<'_>{fn kernel(&self,size:usize,align:u64,p:u32,_c:CpuMap)->Result<KernelObject>{assert_eq!(size,mmu::UAT_PGSZ);assert_eq!(align,0x4000);assert_eq!(p,mmu::PROT_FW_SHARED_RW,"the fragment status page's kernel mapping is firmware-only");Ok(KernelObject{va:0x40000000,size})}}
 mod buffer{
  use super::*;
  pub fn compact_alias(o:&KernelObject,_v:&mmu::Vm,r:Range<usize>,align:u64,p:u32,guard:usize)->Result<mmu::KernelMapping>{assert!(r.end<=o.size);assert_eq!(align,0x4000);assert_eq!(guard,0x4000);assert!(p==2||p==3);Ok(mmu::KernelMapping{va:o.va+r.start as u64})}
