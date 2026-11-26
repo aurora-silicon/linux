@@ -83,7 +83,6 @@ static void glue_declined_open_forgets_slot(struct kunit *test)
 	INIT_WORK(&g->h.teardown_work, dcp_hdcp_teardown_work);
 	INIT_WORK(&g->h.prop_work, dcp_hdcp_prop_work);
 	INIT_DELAYED_WORK(&g->h.kick_work, dcp_hdcp_kick_work);
-	INIT_DELAYED_WORK(&g->h.check_work, dcp_hdcp_check_work);
 	g->h.session = &g->service;
 
 	/* Nothing asks for protection here: the open is declined. */
