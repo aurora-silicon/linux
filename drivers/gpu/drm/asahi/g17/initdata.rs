@@ -113,7 +113,9 @@ impl ComputeShared {
 }
 
 /// A device-global scheduler, retained independently of whichever physical queue first
-/// needed it. Its generation reservation precedes later graph allocation failures.
+/// needed it. Its generation reservation precedes later graph allocation failures. Only the
+/// firmware reads and writes it, and it sits in the upper half every execution context
+/// includes, so it is firmware-only.
 pub(super) struct ComputeScheduler {
     object: KernelObject,
 }
@@ -123,7 +125,7 @@ impl ComputeScheduler {
         let mut object = alloc.kernel(
             mmu::UAT_PGSZ,
             mmu::UAT_PGSZ as u64,
-            mmu::PROT_GPU_FW_SHARED_RW,
+            mmu::PROT_FW_SHARED_RW,
             CpuMap::WriteCombined,
         )?;
         object.initialize::<super::fw::context::Scheduler>(0, |state| {

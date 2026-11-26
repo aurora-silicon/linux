@@ -111,8 +111,8 @@ impl DescriptorRing {
     /// at `+0xfac`, and the host rewrites each slot every 32 kicks, so a
     /// firmware-cached mapping carries the same dirty-line writeback hazard.
     /// The hardware reads the same pages through an uncached canonical low
-    /// alias; on M5 the kernel mapping, in the upper half every execution
-    /// context includes, is firmware-only.
+    /// alias; the kernel mapping, in the upper half every execution context
+    /// includes, is firmware-only.
     pub(crate) fn new(alloc: &Allocator<'_>, objects: &Arc<Pool>) -> Result<Self> {
         let size = DESCRIPTORS * COMPUTE_DESCRIPTOR_SIZE;
         let object = objects.allocate(
@@ -120,7 +120,7 @@ impl DescriptorRing {
             Family::Descriptor,
             size,
             0,
-            if alloc.uat.is_m5() { mmu::PROT_FW_SHARED_RW } else { mmu::PROT_GPU_FW_SHARED_RW },
+            mmu::PROT_FW_SHARED_RW,
             CpuMap::WriteCombined,
         )?;
         let low = object.alias_in(
@@ -178,10 +178,14 @@ impl Graph {
     ) -> Result<Self> {
         let page = mmu::UAT_PGSZ as u64;
         let prot = mmu::PROT_GPU_FW_SHARED_RW;
+        // The kernel's own mappings of the queue's records sit in the upper half, which every
+        // execution context includes: only the firmware reaches them there. The GPU reaches the
+        // preemption buffer and usage page through the aliases a binding maps into its VM.
+        let firmware = mmu::PROT_FW_SHARED_RW;
         let cpu = CpuMap::WriteCombined;
         let ring = DescriptorRing::new(alloc, objects)?;
-        let preempt = alloc.kernel(0x4000, page, prot, cpu)?;
-        let usage = alloc.kernel(mmu::UAT_PGSZ, page, prot, cpu)?;
+        let preempt = alloc.kernel(0x4000, page, firmware, cpu)?;
+        let usage = alloc.kernel(mmu::UAT_PGSZ, page, firmware, cpu)?;
         let operand = alloc.lower(operand_state.size, page, prot, cpu)?;
         // The M5 support page is firmware-only; the GPU has no access to it.
         let support_prot = if m5 { mmu::PROT_FW_SHARED_RW } else { prot };
@@ -200,7 +204,7 @@ impl Graph {
         // so dirty firmware lines would revert host updates. An installed
         // compute graph lives until firmware stop and does not need the reuse
         // pool.
-        let mut graph = alloc.kernel(GRAPH_SIZE + mmu::UAT_PGSZ, page, prot, cpu)?;
+        let mut graph = alloc.kernel(GRAPH_SIZE + mmu::UAT_PGSZ, page, firmware, cpu)?;
         let graph_va = graph.gpu_va();
         graph.initialize::<GraphLayout>(0, |view| {
             view.pointers = PointerBlock::new(&pointers)?;
@@ -228,9 +232,9 @@ impl Graph {
         }
         let (context_low, context_high) = if m5 { (None, None) } else {
             (Some(alloc.lower(CONTEXT_SIZE, page, prot, cpu)?),
-             Some(alloc.kernel(CONTEXT_SIZE, page, prot, cpu)?))
+             Some(alloc.kernel(CONTEXT_SIZE, page, firmware, cpu)?))
         };
-        let records = alloc.kernel(RECORD_SLOTS * RECORD_STRIDE, page, prot, cpu)?;
+        let records = alloc.kernel(RECORD_SLOTS * RECORD_STRIDE, page, firmware, cpu)?;
         let m5_timestamps = if m5 {
             Some(Arc::new(alloc.kernel(RECORD_SLOTS * 16, page, prot, cpu)?, GFP_KERNEL)?)
         } else { None };
@@ -239,7 +243,7 @@ impl Graph {
             Family::QueueConfig,
             RECORD_SLOTS * CACHED_RECORD_STRIDE,
             RECORD_SLOTS * CACHED_RECORD_STRIDE,
-            prot,
+            firmware,
             cpu,
         )?;
         Ok(Self {
