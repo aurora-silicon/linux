@@ -344,6 +344,10 @@ ASAHI_TESTS = {
                                    'max-channels', 'multi-channel-max'), []),
     'g17-m5-effort-tests.py': [([], PASS)]
         + mutations('--mutation', ('m5-ignores-bound',), []),
+    'g17-feed-tests.py': [([], PASS)]
+        + mutations('--mutation', ('half-floor', 'global-last-end', 'decay-subsumed',
+                                   'drop-turnaround', 'no-hold-hysteresis', 'drop-busy-cap',
+                                   'unconditional-ctx-prev'), []),
     'g17-firmware-selection-tests.py': [([], PASS)],
     'g17-freelist-lease-direct-tests.py': [([], PASS)]
         + mutations('--mutation', ('reject-preparing-complete', 'snapshot-rollback',
