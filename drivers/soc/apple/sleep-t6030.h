@@ -1438,6 +1438,38 @@ module_param_named(reset_test_stop, sleep_reset_test_stop, bool, 0644);
 MODULE_PARM_DESC(reset_test_stop, "T6030 DIAGNOSTIC: reset_test's core writes its cpu-start stop bit before it powers off (default Y)");
 
 /*
+ * apple_sleep.reset_test_irq=1: the core powers down with CYC_OVRD's IRQ and FIQ wake left as
+ * they are, and once it reads off a fast IPI is sent to it, before the cpu-start writes. In XNU
+ * a core that powered down at idle comes back through reset on an interrupt (its
+ * cpu_reset_handler is resume_idle_cpu, start.s). The fast IPI registers and fields are the AIC
+ * driver's (irq-apple-aic.c): CPU = MPIDR Aff0, cluster = Aff1; the local register within the
+ * sender's cluster.
+ */
+static bool t6030_reset_test_irq;
+module_param_named(reset_test_irq, t6030_reset_test_irq, bool, 0644);
+MODULE_PARM_DESC(reset_test_irq, "T6030 DIAGNOSTIC: reset_test's core keeps IRQ/FIQ wake, and a fast IPI wakes it from its power-down");
+#define T6030_IPI_RR_LOCAL		sys_reg(3, 5, 15, 0, 0)
+#define T6030_IPI_RR_GLOBAL		sys_reg(3, 5, 15, 0, 1)
+#define T6030_IPI_RR_CPU		GENMASK_ULL(7, 0)
+#define T6030_IPI_RR_CLUSTER		GENMASK_ULL(23, 16)
+/* Times the test core came back out of its WFI without a reset */
+static u32 t6030_reset_test_wakes;
+
+static void t6030_reset_test_ipi(u64 mpidr)
+{
+	u64 cluster = MPIDR_AFFINITY_LEVEL(mpidr, 1);
+	u64 rr = FIELD_PREP(T6030_IPI_RR_CPU, MPIDR_AFFINITY_LEVEL(mpidr, 0));
+
+	preempt_disable();
+	if (MPIDR_AFFINITY_LEVEL(read_cpuid_mpidr(), 1) == cluster)
+		write_sysreg_s(rr, T6030_IPI_RR_LOCAL);
+	else
+		write_sysreg_s(rr | FIELD_PREP(T6030_IPI_RR_CLUSTER, cluster), T6030_IPI_RR_GLOBAL);
+	isb();
+	preempt_enable();
+}
+
+/*
  * XNU's power-down of one core outside a system sleep, on H15 (cpu_sleep() off the quiescing
  * path: arm64_prepare_for_sleep(false)). CYC_OVRD's IRQ and FIQ go disabled, against a
  * spurious wake, then ok2pwrdn_force_down and disWfiRetn, then dsb, isb, wfi. ACC_OVRD is
@@ -1452,16 +1484,22 @@ static void __noreturn t6030_reset_test_off(void)
 	t6030_dc_reblock(hid4);
 	write_sysreg(ARCH_TIMER_CTRL_IT_MASK, cntp_ctl_el0);
 	write_sysreg(ARCH_TIMER_CTRL_IT_MASK, cntv_ctl_el0);
-	sysreg_clear_set_s(T6030_CYC_OVRD, T6030_CYC_OVRD_IRQ_MODE | T6030_CYC_OVRD_FIQ_MODE,
-			   FIELD_PREP(T6030_CYC_OVRD_IRQ_MODE, 2) |
-			   FIELD_PREP(T6030_CYC_OVRD_FIQ_MODE, 2));
-	isb();
+	if (!READ_ONCE(t6030_reset_test_irq)) {
+		sysreg_clear_set_s(T6030_CYC_OVRD,
+				   T6030_CYC_OVRD_IRQ_MODE | T6030_CYC_OVRD_FIQ_MODE,
+				   FIELD_PREP(T6030_CYC_OVRD_IRQ_MODE, 2) |
+				   FIELD_PREP(T6030_CYC_OVRD_FIQ_MODE, 2));
+		isb();
+	}
 	sysreg_clear_set_s(T6030_CYC_OVRD, T6030_CYC_OVRD_WFI_MODE,
 			   FIELD_PREP(T6030_CYC_OVRD_WFI_MODE, 3) | T6030_CYC_OVRD_DISABLE_WFI_RET);
 	while (true) {
 		dsb(sy);
 		isb();
 		wfi();
+		/* Back without a reset: count it, take the IPI and go down again */
+		WRITE_ONCE(t6030_reset_test_wakes, READ_ONCE(t6030_reset_test_wakes) + 1);
+		write_sysreg_s(IPI_SR_PENDING, SYS_APL_IPI_SR_EL1);
 	}
 }
 
@@ -1494,7 +1532,11 @@ static int t6030_reset_test(unsigned int cpu)
 	bool veneer = READ_ONCE(t6030_reset_test_veneer);
 	u64 mpidr, boot, rv0, rv1, brv, flag0, flag1, t0, t1;
 	void __iomem *rv = NULL, *boot_rv = NULL, *slot;
-	u32 vw[4] = {}, ps0, ps1 = 0, ps2, w0[4], w1[4], w2[4];
+	u32 vw[4] = {}, ps0, ps1 = 0, ps2, ps3 = 0, ps4 = 0, w0[4], w1[4], w2[4];
+	u32 wakes0, wakes1 = 0;
+	bool irq = READ_ONCE(t6030_reset_test_irq);
+	u64 flag_irq = 0;
+	unsigned int us_irq = 0;
 	unsigned int c, k, us, sleep_flags;
 	int ret, held, stopped, up;
 	void *vp;
@@ -1559,6 +1601,23 @@ static int t6030_reset_test(unsigned int cpu)
 	t6030_reset_test_resume_pa(s, __pa_symbol(t8142_el1_wfi_stub));
 	flag0 = t6030_reset_test_flag(slot);
 	sleep_cpu_start_words(s, w1);
+	wakes0 = READ_ONCE(t6030_reset_test_wakes);
+	if (irq) {
+		/* The IPI first: does the interrupt alone bring it back, through reset or not */
+		t6030_reset_test_ipi(mpidr);
+		t0 = ktime_get_ns();
+		do {
+			ps3 = readl(s->ps + T6030_PS_CPU(c, k));
+			if (FIELD_GET(PS_ACTUAL, ps3))
+				break;
+			udelay(5);
+		} while (ktime_get_ns() - t0 < 20 * NSEC_PER_MSEC);
+		us_irq = div_u64(ktime_get_ns() - t0, NSEC_PER_USEC);
+		mdelay(20);
+		ps4 = readl(s->ps + T6030_PS_CPU(c, k));
+		flag_irq = t6030_reset_test_flag(slot);
+		wakes1 = READ_ONCE(t6030_reset_test_wakes);
+	}
 	spin_table_stop_finished();
 	WRITE_ONCE(sleep_reset_test_mpidr, ~0ULL);
 	t0 = ktime_get_ns();
@@ -1576,6 +1635,10 @@ static int t6030_reset_test(unsigned int cpu)
 		ps0, ps1, us, FIELD_GET(PS_ACTUAL, ps1) ? "STILL ON" : "off", ps2, held, stopped,
 		rv0, rv1, brv, vw[0], vw[1], vw[3], vw[2], readq(rv), flag0, flag1, up,
 		div_u64(t1 - t0, NSEC_PER_USEC));
+	if (irq)
+		pr_info("apple-sleep: reset test: cpu%u fast IPI: ps %#x after %u us (%s), then %#x; aura slot flag %llu -> %llu; WFI returns without reset %u -> %u\n",
+			cpu, ps3, us_irq, FIELD_GET(PS_ACTUAL, ps3) ? "ON" : "still off", ps4,
+			flag0, flag_irq, wakes0, wakes1);
 	pr_info("apple-sleep: reset test: cpu%u cpu-start stop/sys/e/p %x/%x/%x/%x offline, %x/%x/%x/%x off, %x/%x/%x/%x after the start\n",
 		cpu, w0[0], w0[1], w0[2], w0[3], w1[0], w1[1], w1[2], w1[3], w2[0], w2[1], w2[2],
 		w2[3]);
