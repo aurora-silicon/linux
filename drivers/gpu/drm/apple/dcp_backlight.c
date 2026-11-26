@@ -912,9 +912,9 @@ static int dcp_set_brightness(struct backlight_device *bd)
 		old = state->target;
 		ret = dcp_bl_request(state, bd->props.brightness,
 				     backlight_is_blank(bd), suspended);
-		/* Read back the level the panel's floor made of the request. */
+		/* Keep sysfs in sync with the accepted target. */
 		if (!ret)
-			bd->props.brightness = dcp_bl_floor(state, bd->props.brightness);
+			bd->props.brightness = state->target;
 		/* A new level restarts the fade from the level presented last. */
 		fade = !ret && state->fading && state->target != old;
 		if (fade)
