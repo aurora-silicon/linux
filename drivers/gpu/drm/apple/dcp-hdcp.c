@@ -31,7 +31,6 @@
 #include <linux/wait.h>
 #include <linux/workqueue.h>
 
-#include <drm/display/drm_dp.h>
 #include <drm/display/drm_hdcp_helper.h>
 #include <drm/drm_atomic.h>
 #include <drm/drm_connector.h>
@@ -150,11 +149,6 @@ static int dcp_hdcp_reg_read(void *ctx, u32 addr, void *buf, size_t len)
 		ret = dcp_hdcp_reg_read_check(body, received, addr, len);
 	if (!ret)
 		memcpy(buf, body + DCP_HDCP_REG_ARGS_LEN, len);
-	/* LAB DIAGNOSTIC: public fields only (Receiver ID, RxCaps). */
-	dev_dbg(h->dcp->dev, "HDCP: read %#x len %zu -> %d (received %zu) %*ph\n",
-		addr, len, ret, received,
-		(addr == DP_HDCP_2_2_REG_CERT_RX_OFFSET || addr == DP_HDCP_2_2_REG_RX_CAPS_OFFSET) && !ret ?
-		(int)min_t(size_t, len, 5) : 0, buf);
 	kfree_sensitive(body);
 	afk_service_put(service);
 	return ret;
@@ -183,8 +177,6 @@ static int dcp_hdcp_reg_write(void *ctx, u32 addr, const void *buf, size_t len)
 					   0, DCP_HDCP_CALL_MS, &received);
 	if (!ret)
 		ret = dcp_hdcp_reg_write_check(body, received, addr, len);
-	dev_dbg(h->dcp->dev, "HDCP: write %#x len %zu -> %d (received %zu)\n",
-		addr, len, ret, received);
 	kfree_sensitive(body);
 	afk_service_put(service);
 	return ret;
@@ -675,10 +667,6 @@ static int dcp_hdcp_session_call(struct apple_epic_service *service, u16 group,
 	unsigned long flags;
 	bool accept = false, ours;
 	int ret;
-
-	if (h)
-		dev_dbg(h->dcp->dev, "HDCP: session %u call %u:%#x size %zu\n",
-			service->channel, group, command, size);
 
 	if (h && !group && command == DCP_HDCP_AUTH_OPEN) {
 		mutex_lock(&h->lock);
