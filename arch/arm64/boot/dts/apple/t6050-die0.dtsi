@@ -227,9 +227,8 @@
 	};
 
 	/*
-	 * /arm-io/nub-spmi0: reg[0] 0x8a014000 +0x4000, generation 4. ADT interrupts[1] is 726, the line the
-	 * peripheral sources arrive on (validated on J714s and J775D: the macsmc-rtc alarm wakes s2idle,
-	 * IRQ counts increment per cycle, 0 failures).
+	 * /arm-io/nub-spmi0: reg[0] 0x8a014000 +0x4000, generation 4.
+	 * ADT interrupts[1] is 726, the line the peripheral sources arrive on.
 	 * No power-domains: NUB_SPMI0 is critical and on (Aura talks to the PMU here every boot), and
 	 * binding the pwrstate driver would write the PS register at probe.
 	 */

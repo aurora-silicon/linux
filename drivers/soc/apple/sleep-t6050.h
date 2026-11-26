@@ -2381,17 +2381,25 @@ static int t6050_sleep_entry_lower(struct apple_sleep *s)
  * reads 0x12051c00 through every macOS sleep.
  *
  * Acknowledge enabled latched sources and the DT's PMU sources at entry and at wake. On
- * wake, keep an armed RTC interrupt pending for the Linux SPMI IRQ domain. Record the
- * sources before clearing them so the wake log also includes the deferred RTC IRQ.
- * An event after the entry's clear still wakes the sleep.
+ * wake, leave nub-spmi0 sources armed by the Linux SPMI IRQ domain pending for its
+ * dispatcher. Record the candidates before filtering W1C so the wake log includes
+ * deferred IRQs. An event after the entry's clear still wakes the sleep.
  */
 #define T6050_SPMI_SRC_EN	0x400
-#define T6050_SPMI_RTC_SRC	2
 
-static u32 t6050_spmi_ack_mask(u32 sources, unsigned int bus, unsigned int word, bool keep_rtc)
+static u32 t6050_spmi_ack_mask(u32 sources, unsigned int word, struct device *wake_bus,
+			      bool (*wake_armed)(struct device *dev, unsigned int hwirq))
 {
-	if (keep_rtc && !bus && !word)
-		return sources & ~BIT(T6050_SPMI_RTC_SRC);
+	unsigned long pending = sources;
+	unsigned int bit;
+
+	if (!wake_bus)
+		return sources;
+
+	for_each_set_bit(bit, &pending, 32)
+		if (wake_armed(wake_bus, 32 * word + bit))
+			sources &= ~BIT(bit);
+
 	return sources;
 }
 
@@ -2399,7 +2407,6 @@ static void t6050_spmi_src_ack(struct apple_sleep *s, bool resume)
 {
 	struct apple_sleep_region_state *r = s->region;
 	unsigned int b, i, pmu_word = (r->spmi_pmu_status - M5_SPMI_SRC_STATUS) / 4;
-	bool keep_rtc = resume && apple_spmi_irq_wake_armed(r->pmu_bus, T6050_SPMI_RTC_SRC);
 	void __iomem *bus;
 	u32 ack;
 
@@ -2417,7 +2424,9 @@ static void t6050_spmi_src_ack(struct apple_sleep *s, bool resume)
 			if (!b && r->spmi_pmu_bits && i == pmu_word)
 				ack |= r->spmi_src_latched[b][i] & r->spmi_pmu_bits;
 			r->spmi_src_events[b][i] = ack;
-			ack = t6050_spmi_ack_mask(ack, b, i, keep_rtc);
+			if (resume && bus == s->spmi)
+				ack = t6050_spmi_ack_mask(ack, i, r->pmu_bus,
+							 apple_spmi_irq_wake_armed);
 			if (ack)
 				writel(ack, bus + M5_SPMI_SRC_STATUS + 4 * i);
 		}
