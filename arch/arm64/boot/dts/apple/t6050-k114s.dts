@@ -24,4 +24,5 @@
 &panel {
 	width-mm = <302>;
 	height-mm = <199>;
+	apple,min-brightness = <10>;
 };
