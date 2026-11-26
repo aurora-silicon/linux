@@ -2277,6 +2277,7 @@ impl Pair {
             front.flist_completed = true;
         }
         crate::g17::recovery::note_retired();
+        self.memory.graph.diag_check("retire");
         crate::g17::trace::complete(
             crate::g17::trace::RENDER,
             qids[1],

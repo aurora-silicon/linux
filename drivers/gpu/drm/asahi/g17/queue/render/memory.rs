@@ -105,8 +105,58 @@ pub(super) struct Graph {
     /// Host words of the pointer blocks in this firmware build.
     pub(super) pointers: fw::variant::PointerLayout,
     m5: bool,
+    /// LAB DIAG (not for merge): host shadow of the G17P queue records.
+    pub(super) diag: Option<RecDiag>,
 }
+
+/// LAB DIAG (not for merge): which queue-record words the firmware writes.
+pub(super) struct RecDiag {
+    qids: [u8; 2],
+    shadow: [[core::sync::atomic::AtomicU32; DIAG_WORDS]; 2],
+}
+const DIAG_WORDS: usize = 0xc0 / 4;
+static DIAG_BUDGET: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(800);
+static DIAG_CHECKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static DIAG_CHANGES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 impl Graph {
+    fn diag_read(&self, qid: u8, word: usize) -> u32 {
+        self.queues
+            .word(usize::from(qid) * size_of::<queue::QueueRecord>() + word * 4)
+            .map_or(0, |w| w.load(Ordering::Relaxed))
+    }
+    /// The host wrote these record words: take them into the shadow.
+    pub(super) fn diag_host(&self, offsets: &[usize]) {
+        let Some(d) = &self.diag else { return };
+        for s in 0..2 {
+            for &off in offsets {
+                d.shadow[s][off / 4].store(self.diag_read(d.qids[s], off / 4), Ordering::Relaxed);
+            }
+        }
+    }
+    /// Logs every record word that differs from the host's last write.
+    pub(super) fn diag_check(&self, tag: &str) {
+        let Some(d) = &self.diag else { return };
+        let n = DIAG_CHECKS.fetch_add(1, Ordering::Relaxed) + 1;
+        for s in 0..2 {
+            for w in 0..DIAG_WORDS {
+                let mem = self.diag_read(d.qids[s], w);
+                let host = d.shadow[s][w].load(Ordering::Relaxed);
+                if mem != host {
+                    let total = DIAG_CHANGES.fetch_add(1, Ordering::Relaxed) + 1;
+                    d.shadow[s][w].store(mem, Ordering::Relaxed);
+                    if DIAG_BUDGET.fetch_sub(1, Ordering::Relaxed) > 0 {
+                        pr_info!("g17diag {} qid {} +{:#04x}: {:#010x} -> {:#010x} (check {}, change {})\n",
+                            tag, d.qids[s], w * 4, host, mem, n, total);
+                    }
+                }
+            }
+        }
+        if n % 20000 == 0 {
+            pr_info!("g17diag summary: checks {} firmware-changed words {}\n", n,
+                DIAG_CHANGES.load(Ordering::Relaxed));
+        }
+    }
     pub(super) fn is_m5(&self) -> bool { self.m5 }
 
     /// Out of line: inlined, its temporaries stay reserved in `Memory::new`'s frame while the
@@ -195,6 +245,18 @@ impl Graph {
             })?;
         }
         queues.write(JOB_LIST, queue::JobListHead::new(address + JOB_LIST as u64))?;
+        let diag = if m5 { None } else {
+            let d = RecDiag { qids, shadow: core::array::from_fn(|_| core::array::from_fn(|_|
+                core::sync::atomic::AtomicU32::new(0))) };
+            for st in 0..2 {
+                for w in 0..DIAG_WORDS {
+                    let v = queues.word(usize::from(qids[st]) * size_of::<queue::QueueRecord>() + w * 4)
+                        .map_or(0, |x| x.load(Ordering::Relaxed));
+                    d.shadow[st][w].store(v, Ordering::Relaxed);
+                }
+            }
+            Some(d)
+        };
         Ok(Self {
             aliases: [Some(ta), fragment],
             descriptors,
@@ -204,6 +266,7 @@ impl Graph {
             owners: [None; RECORDS],
             pointers,
             m5,
+            diag,
         })
     }
     pub(super) fn queue_offset(&self, qid: u8) -> usize {
@@ -1010,9 +1073,11 @@ impl Memory {
             .descriptors
             .pointer(self.graph.offset(1, ordinal), size_of::<abi::FragmentSlot>())?
             .cast::<abi::FragmentSlot>();
+        self.graph.diag_check("bind");
         for word in queues {
             word.store(slot, Ordering::Relaxed);
         }
+        self.graph.diag_host(&[0x38]);
         // SAFETY: The generation owns these prepared, unpublished POD views.
         // Packed fields are assigned by value without an unaligned reference.
         unsafe {
@@ -1061,6 +1126,7 @@ impl Memory {
             core::sync::atomic::fence(Ordering::Release);
             return Ok(());
         }
+        self.graph.diag_check("owner");
         let offsets = qids.map(|qid| usize::from(qid) * size_of::<queue::QueueRecord>());
         let base = self.graph.queues.pointer(0, GRAPH_SIZE)?;
         // Check every field before the first update, retaining the required
@@ -1104,6 +1170,7 @@ impl Memory {
             }
         }
         core::sync::atomic::fence(Ordering::Release);
+        self.graph.diag_host(&[0x10, 0x14, 0x28, 0x2c, 0x40, 0x48, 0x9c, 0xa0]);
         Ok(())
     }
 }
