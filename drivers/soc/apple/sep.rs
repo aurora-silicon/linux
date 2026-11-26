@@ -48,6 +48,7 @@ mod transfer;
 mod trusted;
 mod userbag;
 mod xarm;
+mod xars;
 mod xart_apfs;
 mod xart_guard;
 mod xart_store;
@@ -841,6 +842,21 @@ struct SepData {
     pnon_layout: Atomic<u32>,
     pnon_done: Atomic<bool>,
 
+    // The xART control endpoint (see `xars`): lazily registered buffers,
+    // shutdown barrier state, single in-flight exchange and discovery facts.
+    #[pin]
+    ool_xars: Mutex<Option<OolPair>>,
+    #[pin]
+    xars_barrier_lock: Mutex<xars::BarrierState>,
+    xars_barrier_state: Atomic<u32>,
+    #[pin]
+    xars_rx: Mutex<xars::Exchange>,
+    #[pin]
+    xars_wq: CondVar,
+    xars_named: Atomic<bool>,
+    xars_layout: Atomic<u32>,
+    xars_shutdown_writes: Atomic<u32>,
+
     // What discovery said about the endpoints the driver checks and sends
     // nothing to (see `sse`, `hibe`, `skdl`).
     sse_named: Atomic<bool>,
@@ -1089,6 +1105,12 @@ impl SepData {
         )?;
         // Sized from the endpoint's layout before it is registered.
         let ool_pnon = Self::alloc_ool(dev, pnon::EP_PNON, pnon::OOL_SIZE_PNON, (0, 0))?;
+        let ool_xars = Self::alloc_ool(
+            dev,
+            xars::EP_XARS,
+            xars::OOL_SIZE_XARS,
+            (xars::OOL_SIZE_XARS, xars::OOL_SIZE_XARS),
+        )?;
         let dma_ring = dma::Coherent::<u8>::zeroed_slice(dev, DMA_RING_SIZE, GFP_KERNEL)?;
 
         let keystore_only = attach::requested();
@@ -1257,6 +1279,14 @@ impl SepData {
                 pnon_named: Atomic::new(false),
                 pnon_layout: Atomic::new(0),
                 pnon_done: Atomic::new(false),
+                ool_xars <- new_mutex!(Some(ool_xars)),
+                xars_barrier_lock <- new_mutex!(xars::BarrierState::Idle),
+                xars_barrier_state: Atomic::new(xars::BarrierState::Idle as u32),
+                xars_rx <- new_mutex!(xars::Exchange::new()),
+                xars_wq <- new_condvar!("SepData::xars_wq"),
+                xars_named: Atomic::new(false),
+                xars_layout: Atomic::new(0),
+                xars_shutdown_writes: Atomic::new(0),
                 sse_named: Atomic::new(false),
                 sse_layout: Atomic::new(0),
                 hibe_named: Atomic::new(false),
@@ -2457,6 +2487,13 @@ impl SepData {
             );
         }
 
+        if done.reply.status == xarm::STATUS_OK
+            && xarm::is_write(req.opcode)
+            && self.xars_is_closing()
+        {
+            self.xars_shutdown_writes.fetch_add(1, Relaxed);
+        }
+
         if done.reply_bytes > 0 {
             if self
                 .ool_write(&self.ool_xarm, 0, &staging[..done.reply_bytes])
@@ -3227,6 +3264,8 @@ impl SepData {
         Self::queue_stac_online(this.clone());
         // The enclave's account of the LocalPolicy that admitted this boot.
         Self::queue_pnon_digest(this.clone());
+        // Record xars availability; OOL is registered lazily at shutdown.
+        this.xars_attach();
         // As macOS does at boot, these are checked and sent nothing.
         this.sse_attach();
         this.hibe_attach();
@@ -3285,6 +3324,7 @@ impl SepData {
                 // diag/xart must not keep reading "enabled" (keystore_only=2
                 // without a guard opened the store writable at probe).
                 diag::xart_state(false, None);
+                self.xars_attach();
                 return Err(e);
             }
         };
@@ -3295,6 +3335,7 @@ impl SepData {
         *self.host_store.lock() = Some(host);
         *self.bio_index.lock() = index;
         diag::xart_state(writable, guard);
+        self.xars_attach();
         self.keystore_only.store(false, Relaxed);
         *cached = None;
         drop(cached);
@@ -3357,6 +3398,8 @@ impl SepData {
             proto::EP_CONTROL => self.on_control(msg, f),
 
             xarm::EP_XARM => self.on_xarm(msg),
+
+            xars::EP_XARS => self.on_xars(msg),
 
             proto::EP_SBIO => self.on_sbio(msg),
 
@@ -3421,6 +3464,7 @@ impl SepData {
                 let _ = table.slot(f.param);
                 self.stac_discovered(&f);
                 self.pnon_discovered(&f);
+                self.xars_discovered(&f);
                 self.sse_discovered(&f);
                 self.hibe_discovered(&f);
                 self.skdl_discovered(&f);
@@ -3458,6 +3502,7 @@ impl SepData {
         self.sbio_wq.notify_all();
         self.sks_wq.notify_all();
         self.scrd_wq.notify_all();
+        self.xars_wq.notify_all();
         pm::unregister();
         // Release any capture start still held for a resume that will not be
         // reported now.
@@ -3479,6 +3524,7 @@ impl SepData {
         self.scrd_wq.notify_all();
         self.stac_wq.notify_all();
         self.pnon_wq.notify_all();
+        self.xars_wq.notify_all();
         if let Some(mut handle) = self.rng.lock().take() {
             handle.unregister();
         }
@@ -3511,6 +3557,7 @@ impl SepData {
 
         for slot in [
             &self.ool_xarm,
+            &self.ool_xars,
             &self.ool_sbio,
             &self.ool_sks,
             &self.ool_scrd,

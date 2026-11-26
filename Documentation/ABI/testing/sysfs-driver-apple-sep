@@ -536,6 +536,35 @@ Description:
 		lowercase hex digits once pnon reads "read", and
 		"unavailable" before then.
 
+What:		/sys/bus/platform/devices/<unit>.sep/diag/xars
+Date:		November 2026
+KernelVersion:	7.3
+Contact:	Ryan Murray <ryan@aurorasilicon.org>
+Description:
+		(RO) The enclave's xART control service (endpoint xars).
+		The driver sends nothing on xars at boot, idle or system
+		sleep, and registers its out-of-line buffers lazily. On an
+		orderly reboot, halt or power-off, a blocking reboot notifier
+		sends the storage-volume unmount notification followed by a
+		non-forced cached-state flush while xarm continues servicing
+		enclave-initiated writes, then closes the host xART store.
+
+		========	=============================================
+		pending		Bring-up has not ended yet.
+		ready		The endpoint is offered with its known layout
+				and the xART store is writable; the shutdown
+				barrier is armed.
+		readonly	The endpoint is offered, but the xART store
+				is read-only (for example, during initrd
+				keystore_only attach); the barrier will not
+				run until writes are enabled.
+		absent		The endpoint was not offered or advertised an
+				unknown layout; left alone.
+		flushed		The shutdown barrier completed cleanly.
+		failed		The shutdown barrier failed or ended
+				indeterminate; the kernel log says why.
+		========	=============================================
+
 What:		/sys/bus/platform/devices/<unit>.sep/diag/sse
 What:		/sys/bus/platform/devices/<unit>.sep/diag/hibe
 What:		/sys/bus/platform/devices/<unit>.sep/diag/skdl

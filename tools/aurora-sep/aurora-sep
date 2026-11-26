@@ -161,6 +161,8 @@ def status(live=True):
             served["stac"] = "accessory power state"
         if d("pnon") is not None:
             served["pnon"] = "LocalPolicy nonce digest"
+        if d("xars") is not None:
+            served["xars"] = "xART shutdown barrier"
         for ep in ("sse", "hibe", "skdl"):
             if d(ep) is not None:
                 served[ep] = "checked at boot, nothing sent"
@@ -272,6 +274,22 @@ def status(live=True):
             r.add(INFO, "pnon", pnon, "the digest read has not finished yet")
         else:
             r.add(WARN, "pnon", pnon, "the LocalPolicy nonce digest read has not succeeded "
+                  "(the kernel log says why)")
+
+    xars = d("xars")
+    if xars is not None:
+        if xars in ("ready", "flushed"):
+            r.add(PASS, "xars", xars, "xART shutdown unmount and flush barrier is armed")
+        elif xars == "absent":
+            r.add(INFO, "xars", xars, "this enclave does not offer the xART control endpoint "
+                  "as the driver knows it")
+        elif xars == "pending":
+            r.add(INFO, "xars", xars, "the bring-up has not ended yet")
+        elif xars == "readonly":
+            r.add(WARN, "xars", xars, "xART store is read-only; shutdown barrier will not run "
+                  "until writes are enabled")
+        else:
+            r.add(WARN, "xars", xars, "the xART shutdown barrier failed or ended indeterminate "
                   "(the kernel log says why)")
 
     for ep, what in (("sse", "secure-element sharing"), ("hibe", "hibernation"),

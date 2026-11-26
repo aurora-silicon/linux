@@ -112,6 +112,7 @@ static struct {
 	atomic_t stac;
 	atomic_t stac_onlines;
 	atomic_t pnon;
+	atomic_t xars;
 	atomic_t sse;
 	atomic_t sse_events;
 	atomic_t hibe;
@@ -645,6 +646,35 @@ static ssize_t local_policy_digest_show(struct device *dev,
 }
 static DEVICE_ATTR_ADMIN_RO(local_policy_digest);
 
+static ssize_t xars_show(struct device *dev, struct device_attribute *attr,
+			 char *buf)
+{
+	const char *state;
+
+	switch (atomic_read(&sep_diag.xars)) {
+	case SEP_DIAG_XARS_READY:
+		state = "ready";
+		break;
+	case SEP_DIAG_XARS_READONLY:
+		state = "readonly";
+		break;
+	case SEP_DIAG_XARS_ABSENT:
+		state = "absent";
+		break;
+	case SEP_DIAG_XARS_FLUSHED:
+		state = "flushed";
+		break;
+	case SEP_DIAG_XARS_FAILED:
+		state = "failed";
+		break;
+	default:
+		state = "pending";
+		break;
+	}
+	return sysfs_emit(buf, "%s\n", state);
+}
+static DEVICE_ATTR_RO(xars);
+
 static ssize_t sep_diag_offer_emit(char *buf, atomic_t *state)
 {
 	switch (atomic_read(state)) {
@@ -745,6 +775,7 @@ static struct attribute *sep_diag_attrs[] = {
 	&dev_attr_stac_onlines.attr,
 	&dev_attr_pnon.attr,
 	&dev_attr_local_policy_digest.attr,
+	&dev_attr_xars.attr,
 	&dev_attr_sse.attr,
 	&dev_attr_sse_events.attr,
 	&dev_attr_hibe.attr,
@@ -849,6 +880,11 @@ void sep_diag_set_pnon(int state, const u8 *digest, size_t len)
 		smp_wmb();
 	}
 	atomic_set(&sep_diag.pnon, state);
+}
+
+void sep_diag_set_xars(int state)
+{
+	atomic_set(&sep_diag.xars, state);
 }
 
 unsigned int sep_diag_xarm_failed(void)

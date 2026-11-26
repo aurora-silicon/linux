@@ -33,6 +33,7 @@ extern "C" {
         sleep: unsafe extern "C" fn() -> c_int,
         wake: unsafe extern "C" fn(),
         told: unsafe extern "C" fn() -> bool,
+        shutdown: unsafe extern "C" fn(),
     ) -> c_int;
     fn sep_pm_unregister();
     fn sep_pm_keep_domains(dev: *mut c_void) -> c_int;
@@ -278,6 +279,12 @@ unsafe extern "C" fn pm_told() -> bool {
     with_sep(false, |sep| sep.sleep_gate() == SleepGate::Told)
 }
 
+/// # Safety
+/// Called by `pm_shim.c` from the blocking reboot notifier chain, in process context.
+unsafe extern "C" fn pm_shutdown() {
+    with_sep((), |sep| sep.xars_shutdown_barrier());
+}
+
 pub(crate) fn register(sep: Arc<SepData>) -> Result<()> {
     let dev: *mut c_void = sep.dev.as_raw().cast();
     let ptr = sep.into_foreign();
@@ -296,9 +303,9 @@ pub(crate) fn register(sep: Arc<SepData>) -> Result<()> {
         return Err(EBUSY);
     }
 
-    // SAFETY: the shim stores the callback and registers a notifier block
-    // that lives for the module's lifetime.
-    let rc = unsafe { sep_pm_register(dev, pm_event, pm_sleep, pm_wake, pm_told) };
+    // SAFETY: the shim stores the callbacks and registers notifier blocks
+    // that live for the module's lifetime.
+    let rc = unsafe { sep_pm_register(dev, pm_event, pm_sleep, pm_wake, pm_told, pm_shutdown) };
     if rc != 0 {
         let raw = SEP.swap(core::ptr::null_mut(), Ordering::AcqRel);
         if !raw.is_null() {

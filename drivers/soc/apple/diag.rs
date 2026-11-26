@@ -58,6 +58,7 @@ extern "C" {
     fn sep_diag_set_hwrng(registered: bool);
     fn sep_diag_set_stac(state: c_int);
     fn sep_diag_set_pnon(state: c_int, digest: *const u8, len: usize);
+    fn sep_diag_set_xars(state: c_int);
     fn sep_diag_set_offer(endpoint: u8, state: c_int);
     fn sep_diag_sse_event() -> c_uint;
     fn sep_diag_xarm_failed() -> c_uint;
@@ -347,6 +348,27 @@ pub(crate) fn pnon(state: Pnon, digest: Option<&[u8; crate::pnon::DIGEST_LEN]>) 
     // SAFETY: `ptr` is null or points at `len` readable bytes for the call;
     // the shim copies them.
     unsafe { sep_diag_set_pnon(state as c_int, ptr, len) };
+}
+
+/// The xART control endpoint (`xars`), as `SEP_DIAG_XARS_*` in `shim.h` spells it.
+#[derive(Clone, Copy)]
+pub(crate) enum Xars {
+    /// Endpoint offered with known layout and xART writable; shutdown barrier armed.
+    Ready = 1,
+    /// Endpoint offered with known layout, but xART is read-only.
+    ReadOnly = 2,
+    /// Endpoint absent or advertises an unknown layout.
+    Absent = 3,
+    /// Shutdown unmount and non-forced flush barrier completed.
+    Flushed = 4,
+    /// Shutdown barrier failed or ended indeterminate.
+    Failed = 5,
+}
+
+/// Reports the `xars` endpoint / shutdown-barrier state.
+pub(crate) fn xars(state: Xars) {
+    // SAFETY: no preconditions; updates one word.
+    unsafe { sep_diag_set_xars(state as c_int) };
 }
 
 /// An endpoint the driver checks at bring-up and sends nothing to, as
