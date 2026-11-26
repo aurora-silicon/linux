@@ -5924,11 +5924,7 @@ static bool apple_dart_selects_fw_mirror(const struct apple_dart *dart,
 {
 	if (!dart->locked || dart->fw_handoff || dart->preserve_display)
 		return false;
-	return of_device_is_compatible(np, "apple,t6041-dart") ||
-	       of_device_is_compatible(np, "apple,t6050-dart") ||
-	       of_device_is_compatible(np, "apple,t8140-dart") ||
-	       of_device_is_compatible(np, "apple,t8142-dart") ||
-	       t8132_dcp;
+	return apple_dart_keeps_locked_roots(np) || t8132_dcp;
 }
 
 static int apple_dart_probe(struct platform_device *pdev)

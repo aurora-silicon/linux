@@ -6,10 +6,25 @@
 #include <linux/kconfig.h>
 #include <linux/errno.h>
 #include <linux/err.h>
+#include <linux/of.h>
 #include <linux/types.h>
 
 struct device;
 struct device_node;
+
+/*
+ * Whether apple-dart keeps the firmware's root slots of a DART of @np's kind
+ * that the boot loader leaves locked (fw_mirror). Only then can a coprocessor
+ * the boot loader leaves running behind such a DART be adopted: on the plain
+ * locked path its firmware loses the mappings it runs on.
+ */
+static inline bool apple_dart_keeps_locked_roots(const struct device_node *np)
+{
+	return of_device_is_compatible(np, "apple,t6041-dart") ||
+	       of_device_is_compatible(np, "apple,t6050-dart") ||
+	       of_device_is_compatible(np, "apple,t8140-dart") ||
+	       of_device_is_compatible(np, "apple,t8142-dart");
+}
 
 /* Retained internal-display ownership is qualified only with a built-in
  * DART provider. Other consumers, including modular DART, keep the APIs below.
