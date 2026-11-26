@@ -342,6 +342,18 @@ jobs:
             esac
           fi
           [ "$old" = "$SHA" ] && { echo "$tag already at $SHA"; exit 0; }
+          # The package version (pkgrel) is the commit's committer time in
+          # Unix seconds (kernel-release-build.sh); pacman only upgrades to a
+          # higher one, so a commit that is not strictly later than the tagged
+          # one (same second, or a skewed clock) is not published.
+          if [ -n "$old" ]; then
+            ct() { date -d "$(gh api "repos/$GH_REPO/commits/$1" -q .commit.committer.date)" +%s; }
+            old_ct=$(ct "$old"); new_ct=$(ct "$SHA")
+            if [ "$new_ct" -le "$old_ct" ]; then
+              echo "::error::$SHA (committer time $new_ct) is not later than $tag at $old ($old_ct); its packages would not upgrade the published ones"
+              exit 1
+            fi
+          fi
           # The aurora-* tags are protected by a ruleset that only the release
           # deploy key may bypass; GITHUB_TOKEN cannot move them.
           if [ -z "$DEPLOY_KEY" ]; then
