@@ -594,6 +594,20 @@
 #include "t6050-peripherals.dtsi"
 
 /*
+ * Left-front port (ATC1): the USB4/Thunderbolt router and its PCIe tunnel. The J716sAP ADT's
+ * /arm-io/acio1, acio-cpu1, dart-acio1, apciec1 and dart-apciec1 have the J714s's addresses,
+ * interrupts, LSTX pin (AOP 79) and tunables, and the same host DROM (UID 1), so the J714s's
+ * description is taken as it is. Only the PHY's CIO80 RX_TOP tunables differ: this board's
+ * atc-phy1 tunable_LN0/LN1_RX_TOP_CIO_DFLT leave the field at 0, as ATC2's do.
+ */
+#include "t6050-j714s-left-usb4.dtsi"
+
+&atc1_phy {
+	apple,tunable-lane0-rx-top-cio = <0x35c 0xe00 0x0>;
+	apple,tunable-lane1-rx-top-cio = <0x35c 0xe00 0x0>;
+};
+
+/*
  * The SEP (ADT sep, dart-sep): the same hand-off as the J716c's and the J714s's. The boot
  * loader reserves its firmware and adds its manifests through the "sep" alias; its mailbox
  * and power domain are on, with the two fabric parents left to the firmware.
