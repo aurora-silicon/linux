@@ -2393,32 +2393,46 @@ void dcp_queue_typec_reconnect(struct apple_dcp *dcp, unsigned long delay)
 }
 
 /*
- * Before a T8132 dcpext connects, wait for the late answers of an
- * earlier teardown's timed-out calls, in short slices so that a cable that
- * goes meanwhile ends the wait: its release drains this connect under the
- * fabric lock. Answers still missing after DCP_T8132_ORPHAN_WAIT are given up.
+ * Before a T8132 dcpext connects, wait for the late answers of an earlier
+ * teardown's timed-out calls (see dcp_dptx_release_locked()). The answers
+ * wake the wait, and so does the session's revocation: a tunnel that goes
+ * meanwhile ends it (dcp_dptx_disconnect_oob()), and so does the CRTC's
+ * power-off for a connect that must not wake it (@recovery). After
+ * DCP_T8132_ORPHAN_WAIT the M4 backend gives up on the answers of its
+ * compact calls, as before; the firmware-27 transport keeps the slot of an
+ * unanswered call until the firmware answers, so the port stays unavailable
+ * and this connect fails.
  */
 static int dcp_t8132_wait_teardown_answers(struct apple_dcp *dcp, u32 port,
 					   const struct dcp_fabric_session *session,
 					   bool cable, bool recovery)
 {
-	unsigned long deadline = jiffies + DCP_T8132_ORPHAN_WAIT;
+	struct apple_dcp_afkep *ep = dcp->dptxep;
+	u64 generation = READ_ONCE(dcp->typec_generation);
 
+	if (session)
+		generation = session->generation;
 	dev_dbg(dcp->dev, "DPTX port %u connect waits for late teardown answers\n", port);
-	while (!afk_compact_orphans_wait(dcp->dptxep, msecs_to_jiffies(50))) {
-		/* A revoked session's release drains this work under the fabric lock. */
-		if (!READ_ONCE(dcp->typec_cable_connected) ||
-		    !dcp_connect_session_valid(dcp, session, cable, recovery)) {
-			dev_dbg(dcp->dev, "DPTX port %u connect abandoned: the tunnel went\n",
-				port);
-			return -ESTALE;
-		}
-		if (time_after_eq(jiffies, deadline)) {
-			afk_compact_orphans_drop(dcp->dptxep);
-			return 0;
-		}
+	wait_event_timeout(ep->compact_orphan_wq,
+			   !afk_late_replies_pending(ep) ||
+			   READ_ONCE(dcp->typec_generation) != generation ||
+			   !READ_ONCE(dcp->typec_cable_connected) ||
+			   (recovery && READ_ONCE(dcp->typec_crtc_off)),
+			   DCP_T8132_ORPHAN_WAIT);
+	if (!READ_ONCE(dcp->typec_cable_connected) ||
+	    !dcp_connect_session_valid(dcp, session, cable, recovery)) {
+		dev_dbg(dcp->dev, "DPTX port %u connect abandoned: the tunnel went\n", port);
+		return -ESTALE;
 	}
-	return 0;
+	if (!afk_late_replies_pending(ep))
+		return 0;
+	if (dcp_is_t8132_ext(dcp)) {
+		afk_compact_orphans_drop(ep);
+		return 0;
+	}
+	dev_warn(dcp->dev, "DPTX port %u: an earlier release is still unanswered after %u ms: not connected\n",
+		 port, jiffies_to_msecs(DCP_T8132_ORPHAN_WAIT));
+	return -EBUSY;
 }
 
 /*
@@ -2538,8 +2552,10 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 	 * the calls of an earlier teardown that timed out, so that none of its
 	 * late callbacks lands in this connection.
 	 */
-	if (t8132 && dcp->dptxep) {
-		if (afk_compact_orphans_pending(dcp->dptxep)) {
+	if (dcp_t8132_ext_hw(dcp) && dcp->dptxep) {
+		/* Firmware 27: only a release taken as done waits. */
+		if (t8132 ? afk_compact_orphans_pending(dcp->dptxep) :
+			    READ_ONCE(dcp->t8132_release_late)) {
 			ret = dcp_t8132_wait_teardown_answers(dcp, port, session, cable,
 							      recovery);
 			if (ret)
@@ -4017,9 +4033,19 @@ static void dcp_t8132_hpd_low(struct apple_dcp *dcp, u32 port)
 		WRITE_ONCE(dcp->t8132_release_late, true);
 }
 
+/*
+ * The display of a T8132 dcpext on firmware 27 whose Thunderbolt DP tunnel
+ * is gone: its provider has revoked the binding (dcp_tb_tunnel_withdrawn())
+ * and the fabric is retiring the route.
+ */
+static bool dcp_t8132_tunnel_gone(struct apple_dcp *dcp, u32 port)
+{
+	return dcp_t8132_ext_hw(dcp) && !dcp_is_t8132_ext(dcp) && dcp->dptx_tunnel &&
+	       dcp_tb_tunnel_withdrawn(dcp, port);
+}
+
 static int dcp_dptx_release_locked(struct apple_dcp *dcp, u32 port)
 {
-	bool t8132 = dcp_t8132_ext_hw(dcp);
 	int ret;
 
 	lockdep_assert_held(&dcp->hpd_mutex);
@@ -4037,15 +4063,14 @@ static int dcp_dptx_release_locked(struct apple_dcp *dcp, u32 port)
 		ret = dptxport_release_display(dcp->dptxport[port].service);
 		/*
 		 * A T8132 dcpext's display is released even if the
-		 * firmware refuses or has not answered in time, on either
-		 * firmware: the route of a tunnel that is gone must not stay
-		 * owned, or the next tunnel's setup fails on the same release.
-		 * On the M4 backend a timed-out call stays as an orphan until
-		 * the firmware answers it; until then the firmware's
-		 * Activate/Deactivate are not acted on, and the next connect
-		 * waits for it (afk_compact_orphans_wait()).
+		 * firmware refuses or has not answered in time: the route of a
+		 * tunnel that is gone must not stay owned, or the next tunnel's
+		 * setup fails on the same release. A timed-out call stays as an
+		 * orphan until the firmware answers it; until then the
+		 * firmware's Activate/Deactivate are not acted on, and the next
+		 * connect waits for it (dcp_t8132_wait_teardown_answers()).
 		 */
-		if (t8132) {
+		if (dcp_is_t8132_ext(dcp)) {
 			dcp_t8132_dptx_teardown_log(dcp, port, "release_display", ret);
 			if (ret == -ETIMEDOUT)
 				WRITE_ONCE(dcp->t8132_release_late, true);
@@ -4055,8 +4080,28 @@ static int dcp_dptx_release_locked(struct apple_dcp *dcp, u32 port)
 					 "the firmware answers late" : "release failed", ret);
 			ret = 0;
 			/* Its next sink starts from scratch. */
-			if (dcp_is_t8132_ext(dcp))
-				iomfb_m4_external_link_gone(dcp);
+			iomfb_m4_external_link_gone(dcp);
+		} else if (ret == -ETIMEDOUT && dcp_t8132_tunnel_gone(dcp, port)) {
+			/*
+			 * Firmware 27: the firmware has the release of a
+			 * display whose tunnel is gone and has not answered it
+			 * in time. The host's side ends here, so that the route
+			 * goes back to the fabric and the next tunnel is not
+			 * refused on it, but the DPTX port is not reused until
+			 * the firmware answers: its transport keeps the call's
+			 * slot for that answer, the link callbacks the firmware
+			 * makes for the release meanwhile are not acted on
+			 * (dcp_t8132_late_release()), and the next connect
+			 * waits for it (dcp_t8132_wait_teardown_answers()).
+			 * Any other failure, a release not sent or refused, or
+			 * one on a live link, is returned as on every other
+			 * path.
+			 */
+			dcp_t8132_dptx_teardown_log(dcp, port, "release_display", ret);
+			WRITE_ONCE(dcp->t8132_release_late, true);
+			dev_info(dcp->dev, "DPTX port %u: its tunnel went, the release is answered late: port held until then\n",
+				 port);
+			ret = 0;
 		}
 		if (ret)
 			return ret;
@@ -4192,6 +4237,13 @@ int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port)
 		}
 		WRITE_ONCE(dcp->typec_crtc_off, false);
 		reinit_completion(&dcp->typec_iomfb_hpd_ready);
+		/*
+		 * A connect of the revoked session in the reconnect work that
+		 * waits for an earlier release's answers ends that wait at
+		 * once, and finds its session revoked.
+		 */
+		if (dcp->dptxep)
+			afk_late_replies_wake(dcp->dptxep);
 		cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
 		cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
 		/* A present the firmware took for the display that goes. */
@@ -4218,19 +4270,24 @@ int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port)
 
 	/*
 	 * A T8132 dcpext, as desktop 26.x compact DPTX does, still releases the
-	 * display when the firmware refuses its HPD low or does not answer it,
-	 * on either firmware: a refusal must not keep a released tunnel's route.
-	 * The M4 backend lowers only the HPD its connect raised.
+	 * display when the firmware refuses its HPD low: a refusal must not keep
+	 * a released tunnel's route. It lowers only the HPD its connect raised.
 	 */
 	if (dcp_is_t8132_ext(dcp)) {
 		dcp_t8132_hpd_low(dcp, port);
 	} else if (dptx_service_available(&dcp->dptxport[port])) {
 		ret = dptxport_set_hpd(dcp->dptxport[port].service, false);
-		/* A firmware-27 T8132 dcpext goes on to release the display. */
-		if (ret && dcp_t8132_ext_hw(dcp))
+		/*
+		 * Firmware 27: an HPD low unanswered for a display whose tunnel
+		 * is gone goes on to the release, which says what is still
+		 * outstanding (dcp_dptx_release_locked()).
+		 */
+		if (ret == -ETIMEDOUT && dcp_t8132_tunnel_gone(dcp, port)) {
 			dcp_t8132_dptx_teardown_log(dcp, port, "set_hpd(0)", ret);
-		else if (ret)
+			WRITE_ONCE(dcp->t8132_release_late, true);
+		} else if (ret) {
 			return ret;
+		}
 	}
 
 	ret = dcp_dptx_disconnect(dcp, port);

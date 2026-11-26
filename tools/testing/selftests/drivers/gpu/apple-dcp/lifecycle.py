@@ -777,6 +777,7 @@ int main(void)
              ' struct { bool active; } split;\n struct apple_dcp_afkep *dptxep; bool t8132_release_late;')
         firmware += ('struct apple_dcp_afkep;\nstruct dcp_fabric_session;\n'
                      'static bool dcp_is_t8132_ext(const struct apple_dcp *d) { (void)d; return false; }\n'
+                     'static bool dcp_t8132_ext_hw(const struct apple_dcp *d) { (void)d; return false; }\n'
                      'static bool afk_compact_orphans_pending(struct apple_dcp_afkep *ep)\n'
                      '{ (void)ep; assert(!"T8132 dcpext teardown in an H17P scenario"); return false; }\n'
                      'static int dcp_t8132_wait_teardown_answers(struct apple_dcp *d, u32 port,\n'

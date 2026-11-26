@@ -55,6 +55,9 @@ prefix = r'''
 #define dev_warn(...) do {} while(0)
 #define dev_err(...) do {} while(0)
 #define complete(p) (*(p)=1)
+/* A late reply wakes the waiters for it (afk_late_replies_pending()). */
+static unsigned int late_wakes;
+#define wake_up_all(q) ((void)(q),late_wakes++)
 #define EPIC_TYPE_COMMAND 3
 #define EPIC_CAT_COMMAND 0x30
 #define DECLARE_COMPLETION_ONSTACK(n) int n=0
@@ -73,6 +76,7 @@ struct dcp { void *dev; bool quiescing,external,crashed,ext26; void *rtk; };
 static bool dcp_is_ext26(const struct dcp *dcp) { return dcp->ext26; }
 struct afk_ringbuffer { bool ready; };
 struct apple_dcp_afkep { struct dcp *dcp; bool wire_v2,inline_v2,compact; int endpoint,lock;u8 *command_tags;
+ int compact_orphan_wq;
  struct afk_ringbuffer txbfr,rxbfr; size_t ext26_command_bytes; unsigned int ext26_command_count; };
 struct ops { const char *name; };
 struct apple_epic_service {
@@ -222,9 +226,11 @@ int main(void)
  struct epic_cmd reply={.retcode=0};
  s.enabled=false;s.torndown=true; /* Retired service still owns the pending slot. */
  afk_recv_handle_reply(&ep,4,retained_tag^0x10,&reply,sizeof(reply));
- assert(frees==before_late && s.cmd_map[0] && !s.cmds[0].done && s.users==1);
+ assert(frees==before_late && s.cmd_map[0] && !s.cmds[0].done && s.users==1 && !late_wakes);
  afk_recv_handle_reply(&ep,4,retained_tag,&reply,sizeof(reply));
  assert(frees==before_late+2 && !s.cmd_map[0] && s.cmds[0].done && s.users==1);
+ /* Only the late reply of the timed-out command wakes its waiters. */
+ assert(late_wakes==1);
  afk_recv_handle_reply(&ep,4,retained_tag,&reply,sizeof(reply));
  assert(frees==before_late+2);
  s.enabled=true;s.torndown=false;timeout=0;

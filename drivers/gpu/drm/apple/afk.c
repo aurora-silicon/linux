@@ -515,17 +515,6 @@ static void afk_fail_commands_locked(struct apple_dcp_afkep *ep, int error)
 	wake_up_all(&ep->compact_orphan_wq);
 }
 
-/*
- * Wait up to @timeout for the late replies of every compact command
- * that timed out on @ep (see compact_keep_orphans). False if some are still
- * unanswered.
- */
-bool afk_compact_orphans_wait(struct apple_dcp_afkep *ep, unsigned long timeout)
-{
-	return wait_event_timeout(ep->compact_orphan_wq, !READ_ONCE(ep->compact_orphans),
-				  timeout);
-}
-
 /* Give up on the late replies of @ep's timed-out compact commands. */
 unsigned int afk_compact_orphans_drop(struct apple_dcp_afkep *ep)
 {
@@ -555,6 +544,41 @@ unsigned int afk_compact_orphans_drop(struct apple_dcp_afkep *ep)
 bool afk_compact_orphans_pending(struct apple_dcp_afkep *ep)
 {
 	return READ_ONCE(ep->compact_orphans);
+}
+
+/*
+ * Whether a command of @ep that timed out still waits for its late reply:
+ * a compact orphan, or a V2 command whose slot is kept for its reply (it is
+ * freed when the reply comes, see afk_recv_handle_reply()). Until then the
+ * firmware may still be working on it. The replies wake compact_orphan_wq.
+ */
+bool afk_late_replies_pending(struct apple_dcp_afkep *ep)
+{
+	unsigned long flags;
+	bool pending = false;
+	u32 i, idx;
+
+	if (afk_compact_orphans_pending(ep))
+		return true;
+	for (i = 0; i < AFK_MAX_CHANNEL && !pending; i++) {
+		struct apple_epic_service *service = &ep->services[i];
+
+		spin_lock_irqsave(&service->lock, flags);
+		for_each_set_bit(idx, service->cmd_map, MAX_PENDING_CMDS) {
+			if (!service->cmds[idx].done && !service->cmds[idx].completion) {
+				pending = true;
+				break;
+			}
+		}
+		spin_unlock_irqrestore(&service->lock, flags);
+	}
+	return pending;
+}
+
+/* Wake the waiters for @ep's late replies, to check what else they wait for. */
+void afk_late_replies_wake(struct apple_dcp_afkep *ep)
+{
+	wake_up_all(&ep->compact_orphan_wq);
 }
 
 void afk_cancel_commands(struct apple_dcp_afkep *ep)
@@ -1947,6 +1971,7 @@ static void afk_recv_handle_reply(struct apple_dcp_afkep *ep, u32 channel,
 	void *rxbuf, *txbuf;
 	dma_addr_t rxbuf_dma, txbuf_dma;
 	size_t rxlen, txlen;
+	bool late;
 
 	service = afk_epic_find_service(ep, channel);
 	if (!service) {
@@ -1990,7 +2015,8 @@ static void afk_recv_handle_reply(struct apple_dcp_afkep *ep, u32 channel,
 	service->cmds[idx].retcode = le32_to_cpu(cmd->retcode);
 	service->cmds[idx].reply_len = le32_to_cpu(cmd->rxlen);
 	service->cmds[idx].reply_len_valid = true;
-	if (service->cmds[idx].free_on_ack) {
+	late = service->cmds[idx].free_on_ack;
+	if (late) {
 		/* defer freeing until we're no longer in atomic context */
 		rxbuf = service->cmds[idx].rxbuf;
 		txbuf = service->cmds[idx].txbuf;
@@ -2012,6 +2038,9 @@ static void afk_recv_handle_reply(struct apple_dcp_afkep *ep, u32 channel,
 		dma_free_coherent(ep->dcp->dev, rxlen, rxbuf, rxbuf_dma);
 	if (txbuf && txlen)
 		dma_free_coherent(ep->dcp->dev, txlen, txbuf, txbuf_dma);
+	/* The late reply of a timed-out command: see afk_late_replies_pending(). */
+	if (late)
+		wake_up_all(&ep->compact_orphan_wq);
 }
 
 /* A call from DCP: one word ahead of the call header AP sends. */

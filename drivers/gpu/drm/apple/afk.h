@@ -625,9 +625,10 @@ void afk_cancel_commands(struct apple_dcp_afkep *ep);
 /* A sampled host boundary, never a remote-producer or DMA fence. */
 bool afk_host_idle(struct apple_dcp_afkep *ep);
 
-bool afk_compact_orphans_wait(struct apple_dcp_afkep *ep, unsigned long timeout);
 unsigned int afk_compact_orphans_drop(struct apple_dcp_afkep *ep);
 bool afk_compact_orphans_pending(struct apple_dcp_afkep *ep);
+bool afk_late_replies_pending(struct apple_dcp_afkep *ep);
+void afk_late_replies_wake(struct apple_dcp_afkep *ep);
 void afk_shutdown(struct apple_dcp_afkep *ep);
 void afk_quiesce(struct apple_dcp_afkep *ep);
 int afk_receive_message(struct apple_dcp_afkep *ep, u64 message);

@@ -2402,16 +2402,23 @@ static int dcp_t8132_tunnel_route_xbar(struct apple_dcp *dcp,
 /*
  * A T8132 dcpext with a timed-out teardown call outstanding: link callbacks
  * now are the late ones of the released display, not this tunnel's, see
- * dcp_dptx_release_locked().
+ * dcp_dptx_release_locked(). The firmware makes them before it answers the
+ * call, and the next connect waits for that answer.
  */
 static bool dcp_t8132_late_release(struct apple_dcp *dcp, const char *what)
 {
 	if (!READ_ONCE(dcp->t8132_release_late) || !dcp->dptxep ||
-	    !afk_compact_orphans_pending(dcp->dptxep))
+	    !afk_late_replies_pending(dcp->dptxep))
 		return false;
 	dev_dbg(dcp->dev, "firmware %s belongs to an earlier release: not acted on\n",
 		what);
 	return true;
+}
+
+/* As dcp_t8132_late_release(), for the DPTX link reports (dptxep.c). */
+bool dcp_t8132_link_report_late(struct apple_dcp *dcp, const char *what)
+{
+	return dcp_t8132_ext_hw(dcp) && dcp_t8132_late_release(dcp, what);
 }
 
 /*

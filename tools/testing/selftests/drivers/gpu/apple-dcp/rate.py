@@ -1281,6 +1281,8 @@ u32 lane_count, link_rate;''')
 /* Not a T8132 dcpext: its DRM outputs never follow this link. */
 static bool dcp_is_t8132_ext(const struct apple_dcp *d) { (void)d; return false; }
 static bool dcp_t8132_ext_hw(const struct apple_dcp *d) { (void)d; return false; }
+/* No T8132 dcpext release is outstanding on these links. */
+static bool dcp_t8132_link_report_late(struct apple_dcp *d, const char *what) { (void)d; (void)what; return false; }
 /* The J700 lane policy keys on the external H17P profile, not the AFK v2 codec. */
 static bool dcp_is_external_h17p(struct apple_dcp *d) { return d->hw.iomfb_method_profile==2; }
 struct device;

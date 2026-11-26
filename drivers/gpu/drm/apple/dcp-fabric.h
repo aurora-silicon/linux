@@ -138,6 +138,9 @@ bool dcp_is_t8132_ext(const struct apple_dcp *dcp);
  */
 bool dcp_t8132_ext_hw(const struct apple_dcp *dcp);
 
+/* A DPTX link report that belongs to an unanswered earlier release. */
+bool dcp_t8132_link_report_late(struct apple_dcp *dcp, const char *what);
+
 /* DCP probe, resume and endpoint teardown hooks. */
 int dcp_register_typec_routes(struct apple_dcp *dcp);
 void dcp_typec_route_park(struct apple_dcp *dcp);

@@ -478,6 +478,13 @@ static int dptxport_call_set_active_lane_count(struct apple_epic_service *servic
 
 	u64 lane_count = le64_to_cpu(request->lane_count);
 
+	/* The released display's, not the next connect's (see dcp_dptx_release_locked()). */
+	if (dcp_t8132_link_report_late(dcp, "SetActiveLaneCount")) {
+		reply->retcode = cpu_to_le32(0);
+		reply->lane_count = request->lane_count;
+		return 0;
+	}
+
 	if (dcp_is_external_h17p(dcp)) {
 		ret = dptx_j700_validate_lanes(dptx, lane_count);
 		if (ret)
@@ -1067,7 +1074,8 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 						reply, reply_size);
 	case DPTX_APCALL_FORCE_HOTPLUG_DETECT:
 		dev_dbg(service->ep->dcp->dev, "DPTXPort: FORCE_HOTPLUG_DETECT\n");
-		complete(&dptx->linkcfg_completion);
+		if (!dcp_t8132_link_report_late(service->ep->dcp, "ForceHotplugDetect"))
+			complete(&dptx->linkcfg_completion);
 		memcpy(reply, data, min(reply_size, data_size));
 		if (reply_size >= 4)
 			memset(reply, 0, 4);
