@@ -149,6 +149,19 @@ config POWER_RESET_MACSMC
 
 	  Say Y here if you have an Apple Silicon Mac.
 
+config POWER_RESET_MACSMC_KUNIT_TEST
+	bool "KUnit tests for the Apple SMC reboot driver" if !KUNIT_ALL_TESTS
+	depends on POWER_RESET_MACSMC=y && KUNIT=y
+	depends on MFD_MACSMC_KUNIT_TEST && NVMEM
+	default KUNIT_ALL_TESTS
+	help
+	  Build tests for the Apple SMC reboot driver: the MBSE key and the
+	  boot_stage and shutdown_flag writes before a restart or power off,
+	  the clearing of the boot error and panic counters, and the
+	  ac_power_mode attribute's read-modify-write of the power-on policy
+	  byte. A static stub replaces SMC writes and a RAM-backed NVMEM
+	  device holds the PMU cells, so the tests need no Apple hardware.
+
 config POWER_RESET_MSM
 	bool "Qualcomm MSM power-off driver"
 	depends on ARCH_QCOM

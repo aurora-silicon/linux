@@ -4667,6 +4667,7 @@ MODULE_LICENSE("GPL");
 #include "macaudio-protection-test.h"
 #include "macaudio-hpf-test.h"
 #include "macaudio-pm-volumes-test.h"
+#include "macaudio-vlimit-test.h"
 #include "macaudio-iface-test.h"
 #if IS_ENABLED(CONFIG_OF_OVERLAY)
 #include "macaudio-amp-level-test.h"
