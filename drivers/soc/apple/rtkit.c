@@ -3538,6 +3538,10 @@ int apple_rtkit_sleep_return(struct apple_rtkit *rtk, void __iomem *cpu_control)
 	ret = apple_rtkit_warm_restart(rtk);
 	if (ret)
 		return ret;
+	/* apple_mbox_start() skips a started mailbox: write the enables a sleep may have reset. */
+	ret = apple_rtkit_mbox_restore(rtk);
+	if (ret)
+		return ret;
 
 	writel(readl(cpu_control) | APPLE_ASC_CPU_CONTROL_RUN, cpu_control);
 
