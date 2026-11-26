@@ -1931,16 +1931,6 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 		goto free;
 	}
 
-	for (ch_idx = 0; ch_idx < ep->num_channels; ch_idx++) {
-		struct apple_epic_service *old = &ep->services[ch_idx];
-
-		if (afk_service_supersede(old, ops, channel)) {
-			dev_info(ep->dcp->dev,
-				 "AFK[ep:%02x]: %s on channel %u supersedes channel %u\n",
-				 ep->endpoint, service_name, channel, old->channel);
-			afk_remove_service_debugfs(old);
-		}
-	}
 	for (ch_idx = 0; ch_idx < AFK_MAX_CHANNEL; ch_idx++) {
 		struct apple_epic_service *candidate = &ep->services[ch_idx];
 
@@ -2003,6 +1993,21 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 			dev_err(ep->dcp->dev, "AFKV2 interface %u OPEN failed: %d\n",
 				channel, ret);
 			goto free;
+		}
+	}
+	/*
+	 * Only an admitted, opened successor retires the instance it
+	 * replaces: a replacement rejected above (no slot, admission or OPEN
+	 * failure) leaves the previous instance usable by its owner.
+	 */
+	for (ch_idx = 0; ch_idx < ep->num_channels; ch_idx++) {
+		struct apple_epic_service *old = &ep->services[ch_idx];
+
+		if (old != service && afk_service_supersede(old, ops, channel)) {
+			dev_info(ep->dcp->dev,
+				 "AFK[ep:%02x]: %s on channel %u supersedes channel %u\n",
+				 ep->endpoint, service_name, channel, old->channel);
+			afk_remove_service_debugfs(old);
 		}
 	}
 	if (ops->prepare)
