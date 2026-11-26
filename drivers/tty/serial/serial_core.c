@@ -1944,11 +1944,23 @@ static int uart_install(struct tty_driver *driver, struct tty_struct *tty)
 static int uart_open(struct tty_struct *tty, struct file *filp)
 {
 	struct uart_state *state = tty->driver_data;
+	struct tty_port *port = &state->port;
+	bool was_initialized = tty_port_initialized(port);
 	int retval;
 
-	retval = tty_port_open(&state->port, tty, filp);
+	retval = tty_port_open(port, tty, filp);
 	if (retval > 0)
 		retval = 0;
+	if (!retval && was_initialized && port->console) {
+		struct uart_port *uport;
+		unsigned long flags;
+
+		uport = uart_port_ref_lock(state, &flags);
+		if (uport && uport->type != PORT_UNKNOWN && !uport->irq &&
+		    !uport->suspended && uport->ops->start_rx)
+			uport->ops->start_rx(uport);
+		uart_port_unlock_deref(uport, flags);
+	}
 
 	return retval;
 }
@@ -2352,7 +2364,7 @@ int uart_suspend_port(struct uart_driver *drv, struct uart_port *uport)
 	guard(mutex)(&port->mutex);
 
 	tty_dev = device_find_child(&uport->port_dev->dev, &match, serial_match_port);
-	if (tty_dev && device_may_wakeup(tty_dev)) {
+	if (uport->irq && tty_dev && device_may_wakeup(tty_dev)) {
 		enable_irq_wake(uport->irq);
 		put_device(tty_dev);
 		return 0;
@@ -2430,8 +2442,10 @@ int uart_resume_port(struct uart_driver *drv, struct uart_port *uport)
 	guard(mutex)(&port->mutex);
 
 	tty_dev = device_find_child(&uport->port_dev->dev, &match, serial_match_port);
-	if (!uport->suspended && device_may_wakeup(tty_dev)) {
-		if (irqd_is_wakeup_set(irq_get_irq_data((uport->irq))))
+	if (!uport->suspended && uport->irq && tty_dev && device_may_wakeup(tty_dev)) {
+		struct irq_data *irqd = irq_get_irq_data(uport->irq);
+
+		if (irqd && irqd_is_wakeup_set(irqd))
 			disable_irq_wake(uport->irq);
 		put_device(tty_dev);
 		return 0;
