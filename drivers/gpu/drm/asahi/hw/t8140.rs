@@ -353,10 +353,12 @@ pub(crate) mod resources {
         ]
     }
 
-    /// Compact allocations search these shared client arenas in this order.
+    /// Compact allocations search these shared client arenas in this order. Each growth arena
+    /// holds one heap at `TVB_MAX_BLOCKS`, so they come last: a compact object there would cut
+    /// a heap short of its normal maximum.
     pub(crate) fn compact_ranges() -> [Range<u64>; 4] {
         let [first, second] = tvb_growth_ranges();
-        [RENDER_ALIASES, first, second, TARGETS]
+        [RENDER_ALIASES, TARGETS, first, second]
     }
 
     /// All driver-owned windows reserved before the first userspace bind.

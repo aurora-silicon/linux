@@ -141,4 +141,10 @@ mod tests {
         assert_eq!(neo_normal_blocks(46 * GIB), cfg::TVB_MAX_BLOCKS);
         assert_eq!(neo_normal_blocks(u64::MAX), cfg::TVB_MAX_BLOCKS);
     }
+
+    #[test]
+    fn compact_objects_reach_the_growth_arenas_last() {
+        let [first, second] = cfg::tvb_growth_ranges();
+        assert!(cfg::compact_ranges().ends_with(&[first, second]));
+    }
 }
