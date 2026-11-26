@@ -2,6 +2,7 @@
 #ifndef _LINUX_DMA_APPLE_SIO_H
 #define _LINUX_DMA_APPLE_SIO_H
 
+#include <linux/dmaengine.h>
 #include <linux/types.h>
 
 /**
@@ -23,8 +24,10 @@
  * dmaengine_synchronize() returns once the descriptors of a terminated
  * transfer have completed. If they do not in time, it stops the channel and
  * waits for them first; the idle transfer then starts again, after a gap.
- * Only an acknowledged TERMINATE counts as stopped. If the channel cannot be
- * confirmed stopped, dmaengine_synchronize() warns, as it cannot fail.
+ * Only an acknowledged TERMINATE counts as stopped (or a crashed firmware). If
+ * the channel cannot be confirmed stopped, dmaengine_synchronize() tries again
+ * until it is, as its caller may free the buffers next: see
+ * apple_sio_synchronize_bounded() for a caller that keeps them.
  * Removing the idle transfer stops the channel if nothing else runs, and
  * returns 0 once its descriptors completed. If the channel cannot be
  * confirmed stopped, it returns an error and the buffer is still in use.
@@ -40,5 +43,31 @@ struct apple_sio_idle {
 	size_t len;
 	size_t period_len;
 };
+
+/**
+ * apple_sio_synchronize_bounded() - synchronize, for a caller that keeps the buffers
+ * @chan: the channel
+ *
+ * As dmaengine_synchronize(), for a caller that does not free the buffers of
+ * the terminated transfers next, such as one that holds a lock a display
+ * unplug takes: if the firmware does not stop the channel in a bounded time,
+ * the transfers it may still read stay with the channel, which stays busy (a
+ * system sleep is refused), and the next dmaengine_synchronize() waits for
+ * them. dmaengine_synchronize() is bounded so itself during a system sleep.
+ * A channel of another DMA controller is synchronized by
+ * dmaengine_synchronize().
+ *
+ * Return: 0, or -EBUSY if the channel still holds transfers the firmware may
+ * read.
+ */
+#if IS_ENABLED(CONFIG_APPLE_SIO)
+int apple_sio_synchronize_bounded(struct dma_chan *chan);
+#else
+static inline int apple_sio_synchronize_bounded(struct dma_chan *chan)
+{
+	dmaengine_synchronize(chan);
+	return 0;
+}
+#endif
 
 #endif

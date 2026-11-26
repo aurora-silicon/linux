@@ -15,6 +15,7 @@
 #include <linux/init.h>
 #include <linux/interrupt.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/of_address.h>
 #include <linux/of_device.h>
 #include <linux/of_dma.h>
@@ -136,6 +137,13 @@ struct sio_chan {
 	struct sio_tx *idle;
 	struct list_head retired;
 	wait_queue_head_t drained;
+	/*
+	 * Serializes synchronizing and setting or removing the idle transfer,
+	 * which may run concurrently: a synchronize that waits until the
+	 * channel stops runs without its client's locks (sio_sync_lock()).
+	 */
+	struct mutex sync_lock;
+	wait_queue_head_t sync_wait;
 	struct sio_tx *issued[SIO_MAX_NINFLIGHT];
 	unsigned int issued_head;
 	unsigned int nissued;
@@ -161,6 +169,12 @@ struct sio_chan {
 #define SIO_DRAIN_TIMEOUT_MS	500
 /* Rounds between the reports of a channel still not stopped */
 #define SIO_HELD_REPORT_ROUNDS	30
+/*
+ * The longest a synchronize of a channel that stops takes: the terminate
+ * work's TERMINATE and drain wait, the retired transfers' drain wait, and a
+ * TERMINATE with a wait for its reports.
+ */
+#define SIO_SYNC_LOCK_TIMEOUT_MS	(3 * SIO_DRAIN_TIMEOUT_MS + 2 * SIO_CALL_TIMEOUT_MS)
 
 #define SIO_NTAGS		16
 /* Tag 0 is never handed out. */
@@ -208,6 +222,9 @@ struct sio_data {
 	struct apple_rtkit *rtk;
 	/* The firmware is stopped for a system sleep. */
 	bool asleep;
+	/* A system sleep is under way: sio_synchronize() is bounded (sio_pm_notify()). */
+	bool sleeping;
+	struct notifier_block pm_nb;
 	bool firmware_only;
 	/* Protocol 10 firmware given the earlier boot tables: no DMA, which would crash it */
 	bool tables_mismatch;
@@ -1437,11 +1454,14 @@ static void sio_end_tx(struct sio_chan *siochan, struct sio_tx *tx,
 }
 
 /*
- * The client frees the buffer of a held transfer once sio_synchronize()
- * returns, and the firmware may still read it: until the firmware stopped the
- * channel, TERMINATE is sent again and this does not return.
+ * Whether the channel holds no transfer, after freeing a held one once the
+ * firmware stopped it. A client that frees the buffer next relies on that:
+ * until then TERMINATE is sent again, and this does not return. Bounded, for a
+ * client that keeps its buffer, the channel is stopped once more at most, and
+ * a transfer still not stopped stays held.
  */
-static void sio_stop_held(struct sio_chan *siochan, int (*terminate)(struct sio_chan *))
+static bool sio_stop_held(struct sio_chan *siochan, int (*terminate)(struct sio_chan *),
+			  bool bounded)
 {
 	unsigned long flags;
 	unsigned int round;
@@ -1451,19 +1471,22 @@ static void sio_stop_held(struct sio_chan *siochan, int (*terminate)(struct sio_
 	tx = siochan->quarantined ? siochan->current_tx : NULL;
 	spin_unlock_irqrestore(&siochan->vc.lock, flags);
 	if (!tx)
-		return;
+		return true;
 
 	for (round = 0; ; round++) {
 		bool report = !(round % SIO_HELD_REPORT_ROUNDS);
 
 		if (sio_stop_tx(siochan, tx, terminate, report))
 			break;
+		if (bounded)
+			return false;
 		if (report)
 			dev_err(siochan->host->dev,
 				"chan %d: still not stopped, its buffer is kept until it is\n",
 				siochan->no);
 	}
 	sio_release_tx(siochan, tx);
+	return true;
 }
 
 static void sio_terminate_work(struct work_struct *wq)
@@ -1594,14 +1617,17 @@ static void sio_free_dead(struct sio_chan *siochan)
 }
 
 /*
- * The ring accounting: the client frees the buffers of the transfers retired
- * on return, and the firmware may still read them. Until their descriptors
- * completed or the channel is stopped, TERMINATE is sent again and this does
- * not return.
+ * The ring accounting: whether the transfers retired completed their
+ * descriptors, or the channel was stopped. A client that frees their buffers
+ * next relies on that: until then TERMINATE is sent again, and this does not
+ * return. Bounded, the channel is stopped once at most, and the transfers that
+ * did not complete stay retired.
  */
-static void sio_wait_retired(struct sio_chan *siochan, int (*terminate)(struct sio_chan *))
+static bool sio_wait_retired(struct sio_chan *siochan, int (*terminate)(struct sio_chan *),
+			     bool bounded)
 {
 	unsigned long timeout = msecs_to_jiffies(SIO_DRAIN_TIMEOUT_MS);
+	bool drained = true;
 	unsigned int round;
 
 	for (round = 0; !wait_event_timeout(siochan->drained, sio_drained(siochan), timeout);
@@ -1610,6 +1636,10 @@ static void sio_wait_retired(struct sio_chan *siochan, int (*terminate)(struct s
 
 		if (!sio_stop_quiet(siochan, terminate, report))
 			break;
+		if (bounded) {
+			drained = false;
+			break;
+		}
 		if (report)
 			dev_err(siochan->host->dev,
 				"chan %d: still not stopped, its ended transfers' buffers are kept until it is\n",
@@ -1617,17 +1647,99 @@ static void sio_wait_retired(struct sio_chan *siochan, int (*terminate)(struct s
 	}
 	/* No callback of an ended transfer runs after this. */
 	tasklet_kill(&siochan->vc.task);
+	return drained;
 }
 
+/*
+ * Takes the channel's sync_lock. Bounded, it waits as long as a synchronize of
+ * a channel that stops takes, and fails if the lock is still held: by a
+ * synchronize waiting for a channel that does not stop.
+ */
+static bool sio_sync_lock(struct sio_chan *siochan, bool bounded)
+{
+	if (!bounded) {
+		mutex_lock(&siochan->sync_lock);
+		return true;
+	}
+	return wait_event_timeout(siochan->sync_wait, mutex_trylock(&siochan->sync_lock),
+				  msecs_to_jiffies(SIO_SYNC_LOCK_TIMEOUT_MS));
+}
+
+static void sio_sync_unlock(struct sio_chan *siochan)
+{
+	mutex_unlock(&siochan->sync_lock);
+	wake_up(&siochan->sync_wait);
+}
+
+/*
+ * Frees the transfers the channel ended once the firmware no longer reads
+ * their buffers: 0, or bounded, -EBUSY with some still held. The channel then
+ * stays busy, and a system sleep is refused (sio_suspend_late()).
+ */
+static int sio_sync(struct sio_chan *siochan, int (*terminate)(struct sio_chan *), bool bounded)
+{
+	int ret = 0;
+
+	if (!sio_sync_lock(siochan, bounded))
+		return -EBUSY;
+	flush_work(&siochan->terminate_wq);
+	if (!sio_stop_held(siochan, terminate, bounded))
+		ret = -EBUSY;
+	if (READ_ONCE(siochan->ring) && !sio_wait_retired(siochan, terminate, bounded))
+		ret = -EBUSY;
+	sio_free_dead(siochan);
+	sio_sync_unlock(siochan);
+
+	return ret;
+}
+
+/*
+ * The client may free its buffers on return, except while a system sleep is
+ * under way: that waits for nothing unbounded, and is refused instead.
+ */
 static void sio_synchronize(struct dma_chan *chan)
 {
 	struct sio_chan *siochan = to_sio_chan(chan);
 
-	flush_work(&siochan->terminate_wq);
-	sio_stop_held(siochan, sio_call_terminate);
-	if (READ_ONCE(siochan->ring))
-		sio_wait_retired(siochan, sio_call_terminate);
-	sio_free_dead(siochan);
+	sio_sync(siochan, sio_call_terminate, READ_ONCE(siochan->host->sleeping));
+}
+
+/* See include/linux/dma/apple-sio.h */
+int apple_sio_synchronize_bounded(struct dma_chan *chan)
+{
+	if (chan->device->device_synchronize != sio_synchronize) {
+		dmaengine_synchronize(chan);
+		return 0;
+	}
+	return sio_sync(to_sio_chan(chan), sio_call_terminate, true);
+}
+EXPORT_SYMBOL_GPL(apple_sio_synchronize_bounded);
+
+/* From the sleep's prepare to its end, as the PM core notifies them */
+static int sio_pm_notify(struct notifier_block *nb, unsigned long action, void *data)
+{
+	struct sio_data *sio = container_of(nb, struct sio_data, pm_nb);
+
+	switch (action) {
+	case PM_SUSPEND_PREPARE:
+	case PM_HIBERNATION_PREPARE:
+	case PM_RESTORE_PREPARE:
+		WRITE_ONCE(sio->sleeping, true);
+		break;
+	case PM_POST_SUSPEND:
+	case PM_POST_HIBERNATION:
+	case PM_POST_RESTORE:
+		WRITE_ONCE(sio->sleeping, false);
+		break;
+	}
+	return NOTIFY_DONE;
+}
+
+static void sio_pm_notifier_remove(void *data)
+{
+	struct sio_data *sio = data;
+
+	unregister_pm_notifier(&sio->pm_nb);
 }
 
 /*
@@ -1711,10 +1823,14 @@ static int sio_set_idle(struct sio_chan *siochan, const struct apple_sio_idle *c
 
 static void sio_free_chan_resources(struct dma_chan *chan)
 {
+	struct sio_chan *siochan = to_sio_chan(chan);
+
 	sio_terminate_all(chan);
 	sio_synchronize(chan);
-	sio_clear_idle(to_sio_chan(chan));
-	vchan_free_chan_resources(&to_sio_chan(chan)->vc);
+	sio_sync_lock(siochan, false);
+	sio_clear_idle(siochan);
+	sio_sync_unlock(siochan);
+	vchan_free_chan_resources(&siochan->vc);
 }
 
 static struct dma_chan *sio_dma_of_xlate(struct of_phandle_args *dma_spec,
@@ -2035,7 +2151,12 @@ static int sio_device_config(struct dma_chan *chan,
 	if (config->peripheral_config) {
 		if (config->peripheral_size != sizeof(struct apple_sio_idle))
 			return -EINVAL;
-		return sio_set_idle(siochan, config->peripheral_config);
+		/* Its client may hold a lock a display's unplug takes: bounded */
+		if (!sio_sync_lock(siochan, true))
+			return -EBUSY;
+		ret = sio_set_idle(siochan, config->peripheral_config);
+		sio_sync_unlock(siochan);
+		return ret;
 	}
 
 	switch (is_tx ? config->dst_addr_width : config->src_addr_width) {
@@ -2465,6 +2586,8 @@ static int sio_probe(struct platform_device *pdev)
 		INIT_LIST_HEAD(&siochan->retired);
 		INIT_LIST_HEAD(&siochan->dead);
 		init_waitqueue_head(&siochan->drained);
+		mutex_init(&siochan->sync_lock);
+		init_waitqueue_head(&siochan->sync_wait);
 		vchan_init(&siochan->vc, dma);
 	}
 
@@ -2512,6 +2635,13 @@ static int sio_probe(struct platform_device *pdev)
 			return dev_err_probe(&pdev->dev, err, "registering the sleep's stop\n");
 		apple_sleep_coproc_set_early(&pdev->dev);
 	}
+
+	sio->pm_nb.notifier_call = sio_pm_notify;
+	err = register_pm_notifier(&sio->pm_nb);
+	if (!err)
+		err = devm_add_action_or_reset(&pdev->dev, sio_pm_notifier_remove, sio);
+	if (err)
+		return dev_err_probe(&pdev->dev, err, "registering the sleep notifier\n");
 
 	err = dma_async_device_register(&sio->dma);
 	if (err)

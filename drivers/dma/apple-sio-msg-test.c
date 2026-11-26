@@ -95,6 +95,9 @@ static struct sio_data *sio_test_alloc(struct kunit *test, int nchannels)
 		INIT_LIST_HEAD(&chan->retired);
 		INIT_LIST_HEAD(&chan->dead);
 		init_waitqueue_head(&chan->drained);
+		mutex_init(&chan->sync_lock);
+		init_waitqueue_head(&chan->sync_wait);
+		INIT_WORK(&chan->terminate_wq, sio_terminate_work);
 	}
 	return sio;
 }
@@ -552,7 +555,7 @@ static void sio_terminate_unconfirmed_test(struct kunit *test)
 
 	/* Refused three times, over two rounds, then acknowledged */
 	t = (struct sio_test_terminate){ .nacks = 3, .ret = 1 };
-	sio_stop_held(chan, sio_test_terminate);
+	sio_stop_held(chan, sio_test_terminate, false);
 	KUNIT_EXPECT_EQ(test, t.calls, 4U);
 	KUNIT_EXPECT_FALSE(test, chan->quarantined);
 	KUNIT_EXPECT_NULL(test, chan->current_tx);
@@ -581,7 +584,7 @@ static void sio_terminate_held_stopped_test(struct kunit *test)
 	slot = sio_test_slot(sio, tx, 0);
 	chan->quarantined = true;
 	t = (struct sio_test_terminate){ .ret = 0, .report_at = 2, .reports = 2 };
-	sio_stop_held(chan, sio_test_terminate);
+	sio_stop_held(chan, sio_test_terminate, false);
 	KUNIT_EXPECT_EQ(test, t.calls, 2U);
 	KUNIT_EXPECT_NULL(test, chan->current_tx);
 	KUNIT_EXPECT_FALSE(test, chan->quarantined);
@@ -590,14 +593,14 @@ static void sio_terminate_held_stopped_test(struct kunit *test)
 	tx = sio_test_ended_tx(test, chan, 2);
 	chan->quarantined = true;
 	t = (struct sio_test_terminate){ .ret = -ESHUTDOWN };
-	sio_stop_held(chan, sio_test_terminate);
+	sio_stop_held(chan, sio_test_terminate, false);
 	KUNIT_EXPECT_EQ(test, t.calls, 1U);
 	KUNIT_EXPECT_NULL(test, chan->current_tx);
 	KUNIT_EXPECT_FALSE(test, chan->quarantined);
 
 	/* Not held: nothing to stop */
 	t = (struct sio_test_terminate){ .ret = 0 };
-	sio_stop_held(chan, sio_test_terminate);
+	sio_stop_held(chan, sio_test_terminate, false);
 	KUNIT_EXPECT_EQ(test, t.calls, 0U);
 
 	if (!tainted)
@@ -629,7 +632,7 @@ static void sio_terminate_ring_retired_test(struct kunit *test)
 	tx->retired = true;
 	list_add_tail(&tx->vd.node, &chan->retired);
 
-	sio_wait_retired(chan, sio_test_terminate);
+	sio_wait_retired(chan, sio_test_terminate, false);
 	KUNIT_EXPECT_EQ(test, t.calls, 3U);
 	KUNIT_EXPECT_TRUE(test, list_empty(&chan->retired));
 	KUNIT_EXPECT_EQ(test, chan->nissued, 0U);
@@ -709,12 +712,128 @@ static void sio_terminate_late_issue_test(struct kunit *test)
 		KUNIT_EXPECT_FALSE(test, test_taint(TAINT_WARN));
 }
 
+/* A held transfer whose ring the firmware also holds: two descriptors issued */
+static struct sio_tx *sio_test_held_tx(struct kunit *test, struct sio_chan *chan)
+{
+	struct sio_tx *tx = sio_test_ended_tx(test, chan, 2);
+
+	chan->quarantined = true;
+	return tx;
+}
+
+/*
+ * Bounded, for a caller that keeps the buffers (a display's unplug, a system
+ * sleep): a channel the firmware does not stop is tried once, and its held
+ * or retired transfers stay, the channel busy. Unbounded, it is freed once
+ * the firmware stops it.
+ */
+static void sio_sync_bounded_test(struct kunit *test)
+{
+	bool tainted = test_taint(TAINT_WARN);
+	struct sio_data *sio = sio_test_alloc_dma(test, 1);
+	struct sio_chan *chan = &sio->channels[0];
+	/* Acknowledged once the bounded tries are over: only an unbounded one gets there */
+	struct sio_test_terminate t = { .nacks = SIO_TERMINATE_TRIES, .ret = 1 };
+	struct sio_tx *tx;
+
+	test->priv = &t;
+	tx = sio_test_held_tx(test, chan);
+	KUNIT_EXPECT_EQ(test, sio_sync(chan, sio_test_terminate, true), -EBUSY);
+	KUNIT_EXPECT_EQ(test, t.calls, SIO_TERMINATE_TRIES);
+	KUNIT_EXPECT_PTR_EQ(test, chan->current_tx, tx);
+	KUNIT_EXPECT_TRUE(test, chan->quarantined);
+	KUNIT_EXPECT_TRUE(test, sio_chan_busy(chan));
+
+	t = (struct sio_test_terminate){ .ret = 1 };
+	KUNIT_EXPECT_EQ(test, sio_sync(chan, sio_test_terminate, false), 0);
+	KUNIT_EXPECT_NULL(test, chan->current_tx);
+	KUNIT_EXPECT_FALSE(test, sio_chan_busy(chan));
+
+	/* The ring accounting: a retired transfer stays retired. */
+	tx = sio_test_ended_tx(test, chan, 2);
+	chan->current_tx = NULL;
+	chan->ring = true;
+	chan->issued[0] = tx;
+	chan->issued[1] = tx;
+	chan->nissued = 2;
+	tx->retired = true;
+	list_add_tail(&tx->vd.node, &chan->retired);
+	t = (struct sio_test_terminate){ .nacks = 1, .ret = 1 };
+	KUNIT_EXPECT_EQ(test, sio_sync(chan, sio_test_terminate, true), -EBUSY);
+	KUNIT_EXPECT_EQ(test, t.calls, 1U);
+	KUNIT_EXPECT_FALSE(test, list_empty(&chan->retired));
+	KUNIT_EXPECT_EQ(test, chan->nissued, 2U);
+
+	t = (struct sio_test_terminate){ .ret = 1 };
+	KUNIT_EXPECT_EQ(test, sio_sync(chan, sio_test_terminate, false), 0);
+	KUNIT_EXPECT_TRUE(test, list_empty(&chan->retired));
+
+	if (!tainted)
+		KUNIT_EXPECT_FALSE(test, test_taint(TAINT_WARN));
+}
+
+/*
+ * While a synchronize waits for a channel that does not stop, a bounded one
+ * fails after the time a channel that stops takes, leaving the channel as it
+ * is: the caller does not wait on the firmware with its own locks held.
+ */
+static void sio_sync_lock_bounded_test(struct kunit *test)
+{
+	bool tainted = test_taint(TAINT_WARN);
+	struct sio_data *sio = sio_test_alloc_dma(test, 1);
+	struct sio_chan *chan = &sio->channels[0];
+	struct sio_test_terminate t = { .ret = 1 };
+	unsigned long start;
+	struct sio_tx *tx;
+
+	test->priv = &t;
+	tx = sio_test_held_tx(test, chan);
+	mutex_lock(&chan->sync_lock);
+	start = jiffies;
+	KUNIT_EXPECT_EQ(test, sio_sync(chan, sio_test_terminate, true), -EBUSY);
+	KUNIT_EXPECT_GE(test, jiffies - start, msecs_to_jiffies(SIO_SYNC_LOCK_TIMEOUT_MS));
+	KUNIT_EXPECT_EQ(test, t.calls, 0U);
+	KUNIT_EXPECT_PTR_EQ(test, chan->current_tx, tx);
+	sio_sync_unlock(chan);
+
+	KUNIT_EXPECT_EQ(test, sio_sync(chan, sio_test_terminate, true), 0);
+	KUNIT_EXPECT_EQ(test, t.calls, 1U);
+	KUNIT_EXPECT_NULL(test, chan->current_tx);
+
+	if (!tainted)
+		KUNIT_EXPECT_FALSE(test, test_taint(TAINT_WARN));
+}
+
+/* sio_synchronize() is bounded from a system sleep's prepare to its end. */
+static void sio_sleep_notifier_test(struct kunit *test)
+{
+	struct sio_data *sio = sio_test_alloc_dma(test, 1);
+	static const unsigned long prepare[] = {
+		PM_SUSPEND_PREPARE, PM_HIBERNATION_PREPARE, PM_RESTORE_PREPARE,
+	};
+	static const unsigned long post[] = {
+		PM_POST_SUSPEND, PM_POST_HIBERNATION, PM_POST_RESTORE,
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(prepare); i++) {
+		KUNIT_EXPECT_FALSE(test, READ_ONCE(sio->sleeping));
+		sio_pm_notify(&sio->pm_nb, prepare[i], NULL);
+		KUNIT_EXPECT_TRUE(test, READ_ONCE(sio->sleeping));
+		sio_pm_notify(&sio->pm_nb, post[i], NULL);
+		KUNIT_EXPECT_FALSE(test, READ_ONCE(sio->sleeping));
+	}
+}
+
 static struct kunit_case sio_terminate_test_cases[] = {
 	KUNIT_CASE_SLOW(sio_terminate_unconfirmed_test),
 	KUNIT_CASE_SLOW(sio_terminate_held_stopped_test),
 	KUNIT_CASE_SLOW(sio_terminate_ring_retired_test),
 	KUNIT_CASE(sio_terminate_drained_test),
 	KUNIT_CASE(sio_terminate_late_issue_test),
+	KUNIT_CASE_SLOW(sio_sync_bounded_test),
+	KUNIT_CASE_SLOW(sio_sync_lock_bounded_test),
+	KUNIT_CASE(sio_sleep_notifier_test),
 	{}
 };
 
