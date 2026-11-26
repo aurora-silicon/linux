@@ -239,6 +239,64 @@ int main(int argc,char **argv) {
   assert(p->bank[0].busy&&p->bank[1].busy);
   avd_vp9_done(&ctx,&src,&dst[0].base.vb,VB2_BUF_STATE_DONE);avd_vp9_done(&ctx,&src,&dst[1].base.vb,VB2_BUF_STATE_DONE);
  }
+ /* After a frame size change the temporal-MV input is not the prior bank. */
+ params=(struct v4l2_ctrl_vp9_frame){.flags=V4L2_VP9_FRAME_FLAG_SHOW_FRAME,
+  .frame_width_minus_1=1919,.frame_height_minus_1=1087,.bit_depth=8};
+ current_dst=&dst[0].base.vb;frame.idx=0;assert(!avd_vp9_run(&ctx));
+ struct avd_vp9_bank *shown=p->b;
+ params.frame_width_minus_1=1899;params.frame_height_minus_1=1079;
+ current_dst=&dst[1].base.vb;frame.idx=1;assert(!avd_vp9_run(&ctx));
+ assert(p->b!=shown&&p->last.width==1900&&p->last.height==1080);
+ {bool prior_color=false;u32 *words=program.cpu;
+  for(size_t j=0;j<frame.prog_words;j++)if(words[j]==(shown->bufs.color.addr>>8))prior_color=true;
+  assert(!prior_color);}
+ avd_vp9_done(&ctx,&src,&dst[0].base.vb,VB2_BUF_STATE_DONE);avd_vp9_done(&ctx,&src,&dst[1].base.vb,VB2_BUF_STATE_DONE);
+ /* A 1440x1088 reference of a 1920x1088 frame: vertical scale high, horizontal low. */
+ params.frame_width_minus_1=1919;params.frame_height_minus_1=1087;reference.vp9.width=1440;
+ current_dst=&dst[0].base.vb;frame.idx=0;assert(!avd_vp9_run(&ctx));
+ {bool scale=false;u32 *words=program.cpu;
+  for(size_t j=0;j<frame.prog_words;j++){assert(words[j]!=0x30004000);if(words[j]==0x40003000)scale=true;}
+  assert(scale);}
+ reference.vp9.width=1920;avd_vp9_done(&ctx,&src,&dst[0].base.vb,VB2_BUF_STATE_DONE);
+ /* Only a frame size change clears the segmentation state in the seg buffers: each bank's
+  * when it is next taken (a busy one belongs to the hardware), and VP9_SEG_RESET goes to the
+  * first frame that uses segmentation after the change. */
+ for(unsigned int i=0;i<p->nbanks;i++)memset(p->bank[i].bufs.seg.cpu,0xa5,p->bank[i].bufs.seg.size);
+ /* Frame A writes a map, so no reset is owed from the earlier size changes. */
+ params.seg.flags=V4L2_VP9_SEGMENTATION_FLAG_ENABLED|V4L2_VP9_SEGMENTATION_FLAG_UPDATE_MAP;
+ current_dst=&dst[0].base.vb;frame.idx=0;assert(!avd_vp9_run(&ctx));
+ assert(p->b==&p->bank[0]&&((u8 *)p->bank[0].bufs.seg.cpu)[0]==0xa5&&!p->seg_reset);
+ /* Bank 0 stays busy; the next frame is smaller and has no segmentation. */
+ params.seg.flags=0;params.frame_width_minus_1=1899;params.frame_height_minus_1=1079;
+ current_dst=&dst[1].base.vb;frame.idx=1;assert(!avd_vp9_run(&ctx));
+ assert(p->b==&p->bank[1]&&p->seg_reset&&p->bank[0].seg_clear&&!p->bank[1].seg_clear);
+ {u8 *seg=p->bank[1].bufs.seg.cpu;for(size_t j=0;j<p->bank[1].bufs.seg.size;j++)assert(!seg[j]);}
+ assert(((u8 *)p->bank[0].bufs.seg.cpu)[0]==0xa5);
+ avd_vp9_done(&ctx,&src,&dst[0].base.vb,VB2_BUF_STATE_DONE);
+ avd_vp9_done(&ctx,&src,&dst[1].base.vb,VB2_BUF_STATE_DONE);
+ /* Same size again, segmentation on without a map update: the reset is still owed, and it stays
+  * owed after that frame, as the decoder would read the old map again. */
+ params.seg.flags=V4L2_VP9_SEGMENTATION_FLAG_ENABLED;current_dst=&dst[0].base.vb;
+ {struct avd_vp9_run r={.decode_params=&params};r.base.bufs.dst=current_dst;
+  assert(make_flags1(&ctx,&r)&VP9_SEG_RESET(1));}
+ frame.idx=0;assert(!avd_vp9_run(&ctx));
+ assert(p->b==&p->bank[0]&&!p->bank[0].seg_clear&&p->seg_reset);
+ {u8 *seg=p->bank[0].bufs.seg.cpu;for(size_t j=0;j<p->bank[0].bufs.seg.size;j++)assert(!seg[j]);}
+ avd_vp9_done(&ctx,&src,&dst[0].base.vb,VB2_BUF_STATE_DONE);
+ /* The next frame updates the map: it still gets the reset, and after it the reset is gone. */
+ params.seg.flags=V4L2_VP9_SEGMENTATION_FLAG_ENABLED|V4L2_VP9_SEGMENTATION_FLAG_UPDATE_MAP;
+ current_dst=&dst[1].base.vb;
+ {struct avd_vp9_run r={.decode_params=&params};r.base.bufs.dst=current_dst;
+  assert(make_flags1(&ctx,&r)&VP9_SEG_RESET(1));}
+ frame.idx=1;assert(!avd_vp9_run(&ctx));assert(!p->seg_reset);
+ {struct avd_vp9_run r={.decode_params=&params};r.base.bufs.dst=current_dst;
+  assert(!(make_flags1(&ctx,&r)&VP9_SEG_RESET(1)));}
+ avd_vp9_done(&ctx,&src,&dst[1].base.vb,VB2_BUF_STATE_DONE);params.seg.flags=0;
+ /* The firmware transport still needs the format's size: smaller and larger frames are refused. */
+ params.frame_width_minus_1=959;params.frame_height_minus_1=539;
+ current_dst=&dst[0].base.vb;frame.idx=0;assert(avd_vp9_run(&ctx)==-EINVAL);
+ params.frame_width_minus_1=1983;params.frame_height_minus_1=1087;
+ current_dst=&dst[1].base.vb;frame.idx=1;assert(avd_vp9_run(&ctx)==-EINVAL);
  /* The firmware transport keeps the 64-pixel floor. */
  ctx.decoded_fmt.fmt.pix_mp.width=64;ctx.decoded_fmt.fmt.pix_mp.height=64;
  ctx.decoded_fmt.fmt.pix_mp.plane_fmt[0].bytesperline=64;
@@ -258,6 +316,18 @@ int main(int argc,char **argv) {
  /* A frame larger than the CAPTURE format is still refused. */
  params.frame_width_minus_1=1919;params.frame_height_minus_1=1087;
  assert(avd_vp9_run(&ctx)==-EINVAL);
+ avd_vp9_stop(&ctx);
+ /* On the legacy transport a frame smaller than the capture format runs in it, a larger one is refused. */
+ ctx.decoded_fmt.fmt.pix_mp.width=1920;ctx.decoded_fmt.fmt.pix_mp.height=1088;
+ ctx.decoded_fmt.fmt.pix_mp.plane_fmt[0].bytesperline=1920;
+ dev.queued=false;vp_feature=false;assert(!avd_vp9_start(&ctx));p=ctx.priv;
+ params=(struct v4l2_ctrl_vp9_frame){.flags=V4L2_VP9_FRAME_FLAG_KEY_FRAME|V4L2_VP9_FRAME_FLAG_SHOW_FRAME,
+  .frame_width_minus_1=959,.frame_height_minus_1=539,.bit_depth=8};
+ current_dst=&dst[0].base.vb;frame.idx=0;assert(!avd_vp9_run(&ctx));
+ assert(dst[0].vp9.width==960&&dst[0].vp9.height==540);
+ avd_vp9_done(&ctx,&src,&dst[0].base.vb,VB2_BUF_STATE_DONE);
+ params.frame_width_minus_1=1983;params.frame_height_minus_1=1087;
+ current_dst=&dst[0].base.vb;frame.idx=0;assert(avd_vp9_run(&ctx)==-EINVAL);
  avd_vp9_stop(&ctx);
  dev.queued=true;vp_feature=true;fail_alloc_after=13;allocating_ctx=&ctx;
  assert(avd_vp9_start(&ctx)==-ENOMEM);allocating_ctx=NULL;

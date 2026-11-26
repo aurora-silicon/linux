@@ -511,12 +511,17 @@ fn lock_vm(
     Ok(VmExecGuard(unsafe { gpuvm.exec_lock(obj, interruptible)? }))
 }
 
-#[cfg(any(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_G16))]
-pub(crate) struct VmReadGuard(VmExecGuard);
+#[cfg(any(CONFIG_DRM_ASAHI_UAT_ADOPTION, CONFIG_DRM_ASAHI_G16))]
+pub(crate) struct VmReadGuard<'a>(gpuvm::GpuVmInnerGuard<'a, VmInner>);
 
-#[cfg(any(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_G16))]
-impl VmReadGuard {
-    #[cfg(CONFIG_DRM_ASAHI_G15)]
+#[cfg(any(CONFIG_DRM_ASAHI_UAT_ADOPTION, CONFIG_DRM_ASAHI_G16))]
+impl VmReadGuard<'_> {
+    #[cfg(CONFIG_DRM_ASAHI_G16)]
+    pub(crate) fn epoch(&self) -> Option<u64> {
+        self.0.epoch
+    }
+
+    #[cfg(any(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_G16))]
     pub(crate) fn covers_range(&mut self, address: u64, size: u64, read: bool, write: bool) -> bool {
         Vm::covers_range_locked(&mut self.0, address, size, read, write)
     }
@@ -671,9 +676,8 @@ impl gpuvm::DriverGpuVm for VmInner {
         ).map_err(|_| EOVERFLOW)? + 1;
         let _mutation = self.mapping_addition();
         let (map_addr, map_length) = (op.addr(), op.length() as usize);
-        let mut iova = op.addr();
         let mut left = op.length() as usize;
-        let mut offset = op.gem_offset() as usize;
+        let offset = op.gem_offset() as usize;
 
         let one_page = op.flags().contains(gpuvm::GpuVaFlag::REPEAT);
 
@@ -696,7 +700,7 @@ impl gpuvm::DriverGpuVm for VmInner {
         if is_sparse_tile(op.flags()) {
             // Kernel tile fill: the GEM only anchors the GPUVA.
             let result = if one_page {
-                self.map_sparse_tile(iova..iova + left as u64, ctx.prot)
+                self.map_sparse_tile(map_addr..map_addr + left as u64, ctx.prot)
             } else {
                 Err(EINVAL)
             };
@@ -710,53 +714,25 @@ impl gpuvm::DriverGpuVm for VmInner {
         // Never acquire the object reservation from inside the GPUVM map callback.
         let segments = op.vm_bo().data().segments.lock();
         let sgt = segments.as_ref().ok_or(EFAULT)?;
-        for &(dma_address, dma_len) in sgt.iter() {
-            let mut addr = dma_address as usize;
-            let mut len = dma_len as usize;
-
-            if left == 0 {
-                break;
-            }
-
-            if offset > 0 {
-                let skip = len.min(offset);
-                addr += skip;
-                len -= skip;
-                offset -= skip;
-            }
-            if len == 0 {
-                continue;
-            }
-
-            assert!(offset == 0);
-
-            if one_page {
-                len = left;
-            } else {
-                len = len.min(left);
-            }
-
+        if left > 0 {
             mod_dev_dbg!(
                 self.dev,
-                "MMU: map: {:#x}:{:#x} -> {:#x} [OP={}]\n",
-                addr,
-                len,
-                iova,
+                "MMU: map_segments: {:#x}+{:#x} [OP={}]\n",
+                map_addr,
+                left,
                 one_page
             );
-
-            if let Err(error) = self.page_table.map_pages(
-                iova..(iova + len as u64),
-                addr as PhysicalAddr,
+            if let Err(error) = self.page_table.map_segments(
+                map_addr..(map_addr + left as u64),
+                sgt.iter()
+                    .map(|&(dma_address, dma_len)| (dma_address as PhysicalAddr, dma_len as usize)),
+                offset,
                 ctx.prot,
                 one_page,
             ) {
                 self.rollback_failed_map(map_addr, map_length as u64);
                 return Err(error);
             }
-
-            left -= len;
-            iova += len as u64;
         }
 
         drop(segments);
@@ -1140,7 +1116,7 @@ impl VmInner {
 
     /// Install only into the empty range reserved by `map_node`.
     fn map_node_prepared(&mut self, node: &mm::Node<(), KernelMappingInner>, prot: Prot) -> Result {
-        let mut iova = node.start();
+        let iova = node.start();
         let segments = node
             .bo
             .as_ref()
@@ -1149,60 +1125,24 @@ impl VmInner {
             .data()
             .segments
             .lock();
-        let mut offset = node.offset;
-        let mut left = node.mapped_size;
 
         if let Some(segments) = &*segments {
-            for (dma_address, dma_len) in segments.iter() {
-                if left == 0 {
-                    break;
-                }
-
-                // TODO: proper DMA address/length handling
-                let mut addr = *dma_address as usize;
-                let mut len: usize = *dma_len as usize;
-
-                if (offset | addr | len | iova as usize) & UAT_PGMSK != 0 {
-                    dev_err!(
-                        self.dev.as_ref(),
-                        "MMU: KernelMapping {:#x}:{:#x} -> {:#x} is not page-aligned\n",
-                        addr,
-                        len,
-                        iova
-                    );
-                    return Err(EINVAL);
-                }
-
-                if offset > 0 {
-                    let skip = len.min(offset);
-                    addr += skip;
-                    len -= skip;
-                    offset -= skip;
-                }
-
-                len = len.min(left);
-
-                if len == 0 {
-                    continue;
-                }
-
+            if node.mapped_size > 0 {
                 mod_dev_dbg!(
                     self.dev,
-                    "MMU: map: {:#x}:{:#x} -> {:#x}\n",
-                    addr,
-                    len,
-                    iova
+                    "MMU: map_node_prepared: {:#x}+{:#x}\n",
+                    iova,
+                    node.mapped_size
                 );
-
-                self.page_table.map_pages(
-                    iova..(iova + len as u64),
-                    addr as PhysicalAddr,
+                self.page_table.map_segments(
+                    iova..(iova + node.mapped_size as u64),
+                    segments
+                        .iter()
+                        .map(|&(dma_address, dma_len)| (dma_address as PhysicalAddr, dma_len as usize)),
+                    node.offset,
                     prot,
                     false,
                 )?;
-
-                iova += len as u64;
-                left -= len;
             }
         }
 
@@ -2526,7 +2466,7 @@ impl Vm {
             GFP_KERNEL,
         )?;
 
-        let mapping_epoch = if uat_inner.firmware != UatFirmware::Handoff {
+        let mapping_epoch = if uat_inner.firmware != UatFirmware::Handoff || uat_inner.m4_adopted {
             Some(Arc::new(MappingEpoch::new(), GFP_KERNEL)?)
         } else {
             None
@@ -2545,7 +2485,7 @@ impl Vm {
                 page_table,
                 mapping_epoch: mapping_epoch.clone(),
                 bind_sequence: bind_sequence.clone(),
-                epoch: Some(0),
+                epoch: mapping_epoch.is_some().then_some(0),
                 mm,
                 uat_inner,
                 binding: binding.clone(),
@@ -2605,7 +2545,7 @@ impl Vm {
     /// Attach a status and job lifetime tracking before sharing a newly created user VM with
     /// queues, without the G17 canonical context views, shared-object footprints and idle
     /// residency reclaim of [`Self::with_status`]. Used by G15, whose user objects stay pinned.
-    #[cfg(any(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_G16))]
+    #[cfg(any(CONFIG_DRM_ASAHI_UAT_ADOPTION, CONFIG_DRM_ASAHI_G16))]
     pub(crate) fn with_tracked_status(mut self) -> Result<Self> {
         self.status = Some(Arc::pin_init(
             crate::g17::status::VmStatus::new(),
@@ -2632,18 +2572,21 @@ impl Vm {
     /// Every page must be mapped GPU-readable and be RAM; otherwise EFAULT. The lines are cleaned
     /// and invalidated to the point of coherency first (never only invalidated: CPU-written lines
     /// may be dirty), so the copy sees what the GPU or a write-combined CPU view stored. The
-    /// mappings cannot change during the copy (GPUVM exec lock).
-    #[cfg(any(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_G16))]
+    /// mappings cannot change during the copy (VM reservation lock).
+    #[cfg(any(CONFIG_DRM_ASAHI_UAT_ADOPTION, CONFIG_DRM_ASAHI_G16))]
     pub(crate) fn read_user(&self, va: u64, buf: &mut [u8]) -> Result {
         self.read_lock()?.read_user(va, buf)
     }
 
-    #[cfg(any(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_G16))]
-    pub(crate) fn read_lock(&self) -> Result<VmReadGuard> {
-        Ok(VmReadGuard(lock_vm(&self.gpuvm, None, false)?))
+    #[cfg(any(CONFIG_DRM_ASAHI_UAT_ADOPTION, CONFIG_DRM_ASAHI_G16))]
+    pub(crate) fn read_lock(&self) -> Result<VmReadGuard<'_>> {
+        // Every mapping change holds the VM reservation, so read-only page-table walks and
+        // user-memory copies need only that reservation. The full exec lock would allocate a
+        // `drm_gpuvm_exec` context and lock every external BO, making each submit O(external BOs).
+        Ok(VmReadGuard(self.gpuvm.lock_inner()))
     }
 
-    #[cfg(any(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_G16))]
+    #[cfg(any(CONFIG_DRM_ASAHI_UAT_ADOPTION, CONFIG_DRM_ASAHI_G16))]
     fn read_user_locked(inner: &mut VmInner, va: u64, buf: &mut [u8]) -> Result {
         let mut done = 0usize;
         while done < buf.len() {
@@ -2660,7 +2603,7 @@ impl Vm {
             }
             let phys = inner.page_table.translate_iova(page).map_err(|_| EFAULT)?;
             // SAFETY: `phys` is checked to be a RAM page; it stays mapped (and its backing pinned)
-            // while the exec lock is held, and is only read here.
+            // while the VM reservation lock is held, and is only read here.
             let ram = unsafe { kernel::page::Page::borrow_phys(&phys) }.ok_or(EFAULT)?;
             let target = &mut buf[done..done + count];
             ram.with_pointer_into_page(within, count, |p| {
@@ -3486,7 +3429,7 @@ impl Drop for VmInner {
 
 /// Physical regions of a UAT whose handoff the generation has already established itself
 /// ([`Uat::new_adopted`]). None of them needs to be in the kernel linear map.
-#[cfg(any(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_G16))]
+#[cfg(any(CONFIG_DRM_ASAHI_UAT_ADOPTION, CONFIG_DRM_ASAHI_G16))]
 pub(crate) struct AdoptedRegions {
     /// The handoff region (PPL magic, lock and flush requests).
     pub(crate) handoff: Range<PhysicalAddr>,
@@ -3509,7 +3452,7 @@ impl Uat {
         })
     }
 
-    #[cfg(any(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_G16))]
+    #[cfg(any(CONFIG_DRM_ASAHI_UAT_ADOPTION, CONFIG_DRM_ASAHI_G16))]
     /// Map a region given by its physical range, write-combined.
     fn map_physical(
         range: &Range<PhysicalAddr>,
@@ -3530,7 +3473,7 @@ impl Uat {
         let res: io::resource::Resource =
             unsafe { core::mem::transmute(kernel::types::Opaque::new(raw)) };
         let flags = io::mem::MemFlag::WC;
-        #[cfg(CONFIG_DRM_ASAHI_G15)]
+        #[cfg(CONFIG_DRM_ASAHI_UAT_ADOPTION)]
         let flags = if reserved_ram {
             // G15 admits only whole reserved RAM pages or wholly non-RAM carveouts.
             if crate::g15::memory_mode(range.start, size as u64)?
@@ -3543,7 +3486,7 @@ impl Uat {
         } else {
             flags
         };
-        #[cfg(not(CONFIG_DRM_ASAHI_G15))]
+        #[cfg(not(CONFIG_DRM_ASAHI_UAT_ADOPTION))]
         let _ = reserved_ram;
         // SAFETY: The UAT regions are only accessed through this mapping by the CPU;
         // the GPU reaches them through its own translation.
@@ -3554,7 +3497,7 @@ impl Uat {
         })
     }
 
-    #[cfg(any(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_G16))]
+    #[cfg(any(CONFIG_DRM_ASAHI_UAT_ADOPTION, CONFIG_DRM_ASAHI_G16))]
     /// Creates a `Uat` for a handoff that the caller establishes itself (G15).
     ///
     /// This only maps the handoff and the TTBAT (write-combined); neither is written here. The
@@ -3580,7 +3523,7 @@ impl Uat {
     /// Creates the same owned-RAM adopted UAT, choosing whether application contexts also
     /// name the firmware upper root. M4 qualifies only context 0 for firmware-upper access;
     /// its application TTBAT upper words stay zero. G15 preserves its existing shared upper.
-    #[cfg(any(CONFIG_DRM_ASAHI_G16, CONFIG_DRM_ASAHI_M3_T8122))]
+    #[cfg(CONFIG_DRM_ASAHI_G16)]
     pub(crate) fn new_adopted_with_user_upper(
         dev: &driver::AsahiDrmDevice,
         geometry: UatGeometry,
@@ -3590,7 +3533,21 @@ impl Uat {
         Self::new_adopted_inner(dev, geometry, regions, map_kernel_to_user, false)
     }
 
-    #[cfg(any(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_G16))]
+    /// As [`Self::new_adopted_with_user_upper`], for regions that may be reserved System RAM:
+    /// each is mapped write-back when it is RAM and write-combined when it is a carveout, as
+    /// [`Self::new_adopted`] does. The M3 boot loaders leave the handoff and TTBAT regions in
+    /// the kernel's memory map as reserved RAM, which a write-combined mapping is refused for.
+    #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+    pub(crate) fn new_adopted_ram_with_user_upper(
+        dev: &driver::AsahiDrmDevice,
+        geometry: UatGeometry,
+        regions: &AdoptedRegions,
+        map_kernel_to_user: bool,
+    ) -> Result<Self> {
+        Self::new_adopted_inner(dev, geometry, regions, map_kernel_to_user, true)
+    }
+
+    #[cfg(any(CONFIG_DRM_ASAHI_UAT_ADOPTION, CONFIG_DRM_ASAHI_G16))]
     fn new_adopted_inner(
         dev: &driver::AsahiDrmDevice,
         geometry: UatGeometry,
@@ -3682,13 +3639,13 @@ impl Uat {
         })
     }
 
-    #[cfg(any(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_G16))]
+    #[cfg(any(CONFIG_DRM_ASAHI_UAT_ADOPTION, CONFIG_DRM_ASAHI_G16))]
     /// Root of the kernel lower `Vm`, for TTBAT context 0 of an adopted handoff.
     pub(crate) fn kernel_lower_root(&self) -> PhysicalAddr {
         self.kernel_lower_vm.ttb()
     }
 
-    #[cfg(any(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_G16))]
+    #[cfg(any(CONFIG_DRM_ASAHI_UAT_ADOPTION, CONFIG_DRM_ASAHI_G16))]
     /// Root whose driver-window entry names the second-level table of [`Self::kernel_vm`]'s
     /// driver window. With [`Self::new_adopted`] this is the shadow root that no context names.
     pub(crate) fn kernel_window_root(&self) -> PhysicalAddr {
@@ -3748,7 +3705,20 @@ impl Uat {
     /// Links the kernel lower root's tables for each range, with no mappings. A published-roots
     /// firmware samples that root's top-level entries only when it starts.
     pub(crate) fn prepare_lower_tables(&self, ranges: &[Range<u64>]) -> Result {
-        let mut inner = lock_vm(&self.kernel_lower_vm.gpuvm, None, false)?;
+        Self::prepare_tables(&self.kernel_lower_vm, ranges)
+    }
+
+    /// Links the kernel window's tables for each range, with no mappings, for a firmware that
+    /// copies the window's second-level entries only when it starts
+    /// ([`FirmwareWindow::mirror`]). Page tables are only freed with their VM, so the leaf
+    /// tables stay where that copy names them.
+    #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+    pub(crate) fn prepare_kernel_tables(&self, ranges: &[Range<u64>]) -> Result {
+        Self::prepare_tables(&self.kernel_vm, ranges)
+    }
+
+    fn prepare_tables(vm: &Vm, ranges: &[Range<u64>]) -> Result {
+        let mut inner = lock_vm(&vm.gpuvm, None, false)?;
         for range in ranges {
             inner.page_table.alloc_pages(range.clone())?;
         }

@@ -2419,8 +2419,9 @@ static int parse_chan_layout_element(struct dcp_parse_ctx *handle,
 			return ret;
 	}
 
+	/* A count no u32 holds is no channel count: U32_MAX matches nothing */
 	if (nchans_out)
-		*nchans_out = nchans;
+		*nchans_out = nchans >= 0 && nchans <= U32_MAX ? nchans : U32_MAX;
 
 	return 0;
 }
@@ -2437,12 +2438,14 @@ static int parse_nchans_mask(struct dcp_parse_ctx *handle, unsigned int *mask)
 		return ret;
 
 	for (; it.idx < it.len; ++it.idx) {
-		int nchans;
+		unsigned int nchans;
 
 		ret = parse_chan_layout_element(it.handle, &nchans, NULL);
 		if (ret)
 			return ret;
-		*mask |= 1 << nchans;
+		/* The firmware's count: one the mask has no bit for matches no sieve */
+		if (nchans < BITS_PER_TYPE(*mask))
+			*mask |= BIT(nchans);
 	}
 
 	return 0;
@@ -2505,7 +2508,7 @@ static int parse_mode_in_avep_element(struct dcp_parse_ctx *handle,
 	for (; it.idx < it.len; ++it.idx) {
 		if (consume_string(it.handle, "AudioChannelLayoutElements")) {
 			struct iterator inner_it;
-			int nchans;
+			unsigned int nchans;
 
 			ret = iterator_begin(it.handle, &inner_it, false);
 			if (ret)

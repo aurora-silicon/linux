@@ -38,11 +38,28 @@ shutdown and removal release only fans taken over by such a request; resume
 does not reapply it. A new target write is required after resume.
 
 A kernel thermal policy (the M5 GPU governor) sets the fans through
-macsmc_hwmon_fans_request(), as a share of each fan's range, on every fan
-whose node names its mode, target, minimum and maximum keys, with or without
-apple,fan-manual-control. It uses the same manual mode, leaves fans userspace
-holds alone, and its fans return to the SMC at suspend, shutdown and removal
-like userspace's.
+macsmc_hwmon_fans_request() (every fan whose node names its mode, target,
+minimum and maximum keys, with or without apple,fan-manual-control) or
+macsmc_hwmon_fans_request_manual() (only fans with apple,fan-manual-control),
+as a share of each fan's range. Both use the same manual mode, leave fans
+userspace holds alone, and return their fans to the SMC at suspend, shutdown
+and removal like userspace's.
+
+When a board's Devicetree also gives ``apple,soc-die-fan-trip-millicelsius``,
+``apple,soc-die-fan-hysteresis-millicelsius`` and ``apple,soc-die-fan-hold-ms``
+beside a single key in ``apple,soc-die-keys``, ``macsmc_soc_die`` is registered
+with that active trip and ``macsmc_hwmon_hotspot_assist_policy()`` exposes the
+thresholds and hold time to hotspot fan assistance. Without those properties
+from the Devicetree, hotspot fan assistance stays off.
+
+When the Devicetree gives ``apple,soc-die-passive-millicelsius`` and
+``apple,soc-die-hot-millicelsius``, ``macsmc_soc_die`` also carries a passive
+trip and a hot trip at those temperatures. They describe the machine's SoC die
+limits for in-kernel power consumers that read the zone's trips (the GPU
+thermal backstop sheds performance from the passive trip and holds its lowest
+state at the hot one). The hot trip only reports: the zone has no hot callback
+and no critical trip, so it never shuts the machine down. Without both
+properties the zone carries no passive or hot trip.
 
 SoC die temperatures are described by the ``apple,soc-die-keys`` string list
 on the hwmon device node. The driver appends these temperature channels after

@@ -94,6 +94,21 @@ properties:
       - const: mbox
       - const: secure
 
+  apple,secure-mbox:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      The coprocessor's secure RTBuddy port, on a machine whose boot loader
+      hands the display over only to a node with a single mailbox in mboxes.
+      The driver takes it as the "secure" mailbox. Elsewhere the port is the
+      second entry of mboxes.
+
+  apple,merged-mode-limit:
+    type: boolean
+    description:
+      The platform's limit on merged modes applies to this external display
+      coprocessor. A display takes a second coprocessor as its pair only
+      while one is left for every external display that is present.
+
   iommus:
     maxItems: 1
 
@@ -158,9 +173,10 @@ properties:
   apple,display-power:
     $ref: /schemas/types.yaml#/definitions/phandle
     description:
-      A node whose ps, pwrgate and pmc-dcp registers hold the display power
-      words this coprocessor's driver writes around a firmware restart, such
-      as an apple,t8140-display-power node.
+      A node describing the display power-state words (or PMGR power-domain
+      chains), power-gate retention words and pmc-dcp counter that this
+      coprocessor's driver writes around a firmware restart, such as an
+      apple,t8140-display-power or apple,t6041-display-power node.
 
   apple,bw-scratch:
     $ref: /schemas/types.yaml#/definitions/phandle-array
@@ -344,8 +360,13 @@ properties:
 
   apple,t8122-dcpext-firmware-ready:
     $ref: /schemas/types.yaml#/definitions/uint32
-    const: 1
-    description: All external firmware reservations were committed by the loader.
+    enum: [1, 2]
+    description:
+      Set by the boot loader on a T8122 external coprocessor whose firmware
+      it has reserved. 2 is the boot loader's default. 1 is set only when
+      the owner asked for the coprocessor in the boot loader configuration,
+      because kernels that share the display DART unconditionally accept 1
+      and nothing else.
 
   apple,pmp:
     $ref: /schemas/types.yaml#/definitions/phandle
@@ -365,6 +386,14 @@ properties:
   apple,dcp-index:
     $ref: /schemas/types.yaml#/definitions/uint32
     description: Display coprocessor index on multi-DCP systems.
+
+  apple,sleep-host-stop:
+    type: boolean
+    description:
+      The SoC's suspend-to-RAM needs this display coprocessor and the external
+      ones stopped, and their power domains lowered, by the operating system
+      before the sleep commit, and the internal one restarted after the wake.
+      The firmware doesn't take the display down for the sleep itself.
 
   apple,typec-hybrid-first:
     type: boolean
@@ -532,6 +561,32 @@ properties:
         description: The loader validated the inherited J713 SID16 PIODMA mapping.
     required:
       - iommus
+    additionalProperties: false
+
+  apple,no-shared-display-dart:
+    type: boolean
+    description:
+      The external coprocessor's display DART must stay out of the display
+      subsystem's IOMMU domain. Framebuffers are mirrored through the fbdma
+      child instead, which must be present.
+
+  fbdma:
+    type: object
+    description:
+      The display DART stream an external coprocessor scans framebuffers
+      through, with the display subsystem's DVA window.
+    properties:
+      iommus:
+        maxItems: 1
+      apple,dma-range:
+        $ref: /schemas/types.yaml#/definitions/uint64-array
+        description:
+          Base and size of the display subsystem's DVA window on this stream.
+        minItems: 2
+        maxItems: 2
+    required:
+      - iommus
+      - apple,dma-range
     additionalProperties: false
 
   panel:
@@ -767,6 +822,26 @@ allOf:
     then:
       properties:
         resets: false
+  - if:
+      required:
+        - typec-routes
+      properties:
+        typec-routes:
+          not:
+            anyOf:
+              - required: [route@0]
+              - required: [route@1]
+              - required: [route@2]
+              - required: [route@3]
+    then:
+      properties:
+        phys: false
+        phy-names: false
+        mux-controls: false
+        mux-control-names: false
+        apple,typec-mux-indices: false
+        apple,typec-dptx-phys: false
+        apple,dptx-die: false
 
 unevaluatedProperties: false
 

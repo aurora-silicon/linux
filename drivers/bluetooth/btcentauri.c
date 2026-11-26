@@ -49,9 +49,13 @@ static bool arm_le_data_rings = true;
 module_param(arm_le_data_rings, bool, 0444);
 MODULE_PARM_DESC(arm_le_data_rings, "Arm native Beta LE rings for radio bring-up");
 
-static bool arm_auxiliary_rings;
+static bool arm_auxiliary_rings = true;
 module_param(arm_auxiliary_rings, bool, 0444);
-MODULE_PARM_DESC(arm_auxiliary_rings, "Diagnostic: arm remaining native Beta resources and capture received frames privately");
+MODULE_PARM_DESC(arm_auxiliary_rings, "Arm Beta's ACL data rings");
+
+static bool diagnostic_capture;
+module_param(diagnostic_capture, bool, 0444);
+MODULE_PARM_DESC(diagnostic_capture, "Diagnostic: arm every auxiliary ring and capture received frames privately; requires the auxiliary rings");
 
 static bool native_startup;
 module_param(native_startup, bool, 0444);
@@ -73,7 +77,7 @@ static bool accept_list;
 module_param(accept_list, bool, 0444);
 MODULE_PARM_DESC(accept_list, "Let the controller filter LE scans by its accept list (off: report its size as 0, the host filters)");
 
-static bool enable_acl;
+static bool enable_acl = true;
 module_param(enable_acl, bool, 0444);
 MODULE_PARM_DESC(enable_acl, "Experimental ACL data delivery; requires LE and auxiliary rings");
 
@@ -90,8 +94,8 @@ struct cen_aux_spec {
 	bool receive;
 };
 
-/* Host native Beta inventory; each resource is opt-in until target-qualified.
- * HCI and LE rings remain in their existing, separately qualified arenas.
+/* Beta's auxiliary rings. Only the ACL rings (2 and 8) are armed by default; the
+ * others only with diagnostic_capture. HCI and LE rings have their own arenas.
  */
 static const struct cen_aux_spec cen_aux_specs[] = {
 	{ 2, 9, 2592, false }, /* ACL TX */
@@ -110,6 +114,7 @@ static const struct cen_aux_spec cen_aux_specs[] = {
 struct cen_aux_state {
 	u32 offset, packets;
 	u16 head, post;
+	bool opened;
 };
 
 struct cen_bt {
@@ -318,11 +323,14 @@ static int cen_aux_start(struct cen_bt *bt)
 			return -ENOSPC;
 		state->offset = offset;
 		offset = ALIGN(offset + length, SZ_4K);
+		if (!diagnostic_capture && spec->id != 2 && spec->id != 8)
+			continue;
 		ret = cen_open_ring(bt, spec->id, spec->slots, state->offset, spec->footer);
 		if (ret) {
 			dev_err(&bt->pdev->dev, "Auxiliary ring %u open failed: %d\n", spec->id, ret);
 			return ret;
 		}
+		state->opened = true;
 		if (!spec->receive)
 			continue;
 		for (slot = 0; slot < spec->slots - 1; slot++)
@@ -343,7 +351,7 @@ static int cen_aux_drain(struct cen_bt *bt, bool repost)
 		u16 tail;
 		int budget = spec->slots;
 
-		if (!spec->receive)
+		if (!state->opened || !spec->receive)
 			continue;
 		tail = cen_tail(bt, spec->id);
 		if (tail >= spec->slots)
@@ -951,7 +959,7 @@ static int cen_status_show(struct seq_file *s, void *unused)
 		   bt->capture_used, bt->capture_records, bt->capture_dropped);
 	if (arm_auxiliary_rings)
 		for (i = 0; i < ARRAY_SIZE(cen_aux_specs); i++)
-			if (cen_aux_specs[i].receive)
+			if (cen_aux_specs[i].receive && bt->aux[i].opened)
 				seq_printf(s, "aux_rx ring=%u packets=%u consumed=%u device_tail=%u\n",
 					   cen_aux_specs[i].id, bt->aux[i].packets,
 					   bt->aux[i].head, cen_tail(bt, cen_aux_specs[i].id));
@@ -1028,6 +1036,8 @@ static int cen_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	skb_queue_head_init(&bt->le_txq);
 	if (enable_acl && (!arm_le_data_rings || !arm_auxiliary_rings))
 		return -EINVAL;
+	if (diagnostic_capture && !arm_auxiliary_rings)
+		return -EINVAL;
 	if (native_hrb && (!native_startup || !enable_acl))
 		return -EINVAL;
 	INIT_DELAYED_WORK(&bt->poll, cen_poll);
@@ -1040,10 +1050,15 @@ static int cen_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (ret)
 		return ret;
 	bt->bar = pcim_iomap_table(pdev)[0];
-	if (readl(bt->bar + 0x18) != 2 || readl(bt->bar) != 0)
-		return dev_err_probe(&pdev->dev, -EBUSY,
-				     "Beta requires running firmware and unowned IPC (exec=%u ipc=%u)\n",
-				     readl(bt->bar + 0x18), readl(bt->bar));
+	/*
+	 * The function appears with the N1's IPC start, before Beta's firmware runs.
+	 * apple_centauri attaches it again once that firmware is up.
+	 */
+	if (readl(bt->bar + 0x18) != 2 || readl(bt->bar) != 0) {
+		dev_info(&pdev->dev, "waiting for Beta's firmware (exec=%u ipc=%u)\n",
+			 readl(bt->bar + 0x18), readl(bt->bar));
+		return -ENXIO;
+	}
 	ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(40));
 	if (ret)
 		return ret;
@@ -1051,7 +1066,7 @@ static int cen_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (!bt->arena)
 		return -ENOMEM;
 	memset(bt->arena, 0, CEN_ARENA_SIZE);
-	if (arm_auxiliary_rings) {
+	if (diagnostic_capture) {
 		bt->capture = kvzalloc(CEN_CAPTURE_SIZE, GFP_KERNEL);
 		if (!bt->capture) {
 			ret = -ENOMEM;
@@ -1170,7 +1185,13 @@ static int cen_suspend(struct device *dev)
 	bt->transport_paused = true;
 	mutex_unlock(&bt->lock);
 	cancel_delayed_work_sync(&bt->poll);
-	if (of_machine_is_compatible("apple,j813") && bt->ipc_requested) {
+	/*
+	 * Tell Beta's firmware the host is going to sleep on every N1 board, as
+	 * Alpha does. Only a running firmware can take the request; one that
+	 * isn't running has nothing to quiesce.
+	 */
+	if (bt->ipc_requested && readl(bt->bar + 0x18) == 2 &&
+	    readl(bt->bar) == 2) {
 		bt->transport_sleep_sent = true;
 		ret = cen_transport_state(bt, true);
 		if (ret)

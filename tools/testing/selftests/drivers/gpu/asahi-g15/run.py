@@ -114,7 +114,7 @@ pub mod mmu {
     pub const UAT_PGSZ: usize = 0x4000;
     pub const UAT_PGMSK: usize = UAT_PGSZ - 1;
     pub struct Vm(pub Vec<u8>);
-    pub type VmReadGuard = Vm;
+    pub type VmReadGuard<'a> = Vm;
     impl Vm {
         pub fn read_user(&self, va: u64, out: &mut [u8]) -> Result {
             let start = usize::try_from(va).map_err(|_| EFAULT)?;
@@ -134,7 +134,7 @@ mod command {
         /// cover() calls: the page checks the walk made.
         pub static COVERS: Cell<u32> = Cell::new(0);
     }
-    pub fn cover(vm: &mut mmu::VmReadGuard, start: u64, end: u64, _: bool, _: bool) -> Result {
+    pub fn cover(vm: &mut mmu::VmReadGuard<'_>, start: u64, end: u64, _: bool, _: bool) -> Result {
         COVERS.with(|c| c.set(c.get() + 1));
         if start >= SYNTHETIC {
             return Ok(());
@@ -260,13 +260,15 @@ def main():
     with tempfile.TemporaryDirectory(prefix="asahi-g15-host-") as temp:
         temp = Path(temp)
         glue = (G15 / "glue.c").read_text()
+        # The UAT adoption's helpers, shared with the T8122 runtime.
+        uat_glue = (G15 / "uat_glue.c").read_text()
         functions = []
         for signature in ["bool asahi_g15_ram_disjoint", "bool asahi_g15_ram_within",
                           "unsigned int asahi_g15_memory_mode"]:
             marker = signature + "(u64 start, u64 size)\n{"
-            start = glue.index(marker)
-            end = glue.index("\n}", start) + 2
-            functions.append(glue[start:end])
+            start = uat_glue.index(marker)
+            end = uat_glue.index("\n}", start) + 2
+            functions.append(uat_glue[start:end])
         c_source = temp / "memory.c"
         c_source.write_text(MEMORY_PREFIX + "\n".join(functions) + MEMORY_CASES)
         subprocess.run([os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-Wall", "-Wextra",

@@ -109,7 +109,8 @@ impl<T> Fifo<T> {
 mod qos { pub type Owner = u64; }
 enum Deferred { Retired(Arc<Completion>, Result<[u64; 4]>), Release(Arc<Completion>) }
 struct Queue {
-    owner: Option<u64>, installed: bool, active: Fifo<Active>, quarantined: bool,
+    owner: Option<u64>, channel_index: u8, binding_noted: bool,
+    installed: bool, active: Fifo<Active>, quarantined: bool,
     previous: Option<Previous>, unpublished_binding: bool, released: bool, graph: Graph, binding: Option<Binding>,
     retirement_ready: bool, released_at: u64, growing: bool, pool_phase: PoolPhase,
     needs_fresh_backing: bool, exit: Option<Exit>, replays: Fifo<Arc<Packet>>,
@@ -126,11 +127,24 @@ impl Queue {
     fn valid_ticket(&self, _: &Active, _: &Ticket) -> Result { Ok(()) }
     fn qos_owner(&self) -> u64 { 1 }
     fn context(&self) -> Option<&Arc<Context>> { self.binding.as_ref().map(|binding| &binding.context) }
+    fn clear_binding_note(&mut self) {
+        if self.binding_noted {
+            if let Some(binding) = &self.binding { binding.context.note_compute_binding(false); }
+            self.binding_noted = false;
+        }
+    }
+    fn clear_owner(&mut self, stamp_released_at: bool) {
+        self.clear_binding_note();
+        self.owner = None;
+        self.channel_index = 0;
+        if stamp_released_at { self.released_at = now_ns(); }
+    }
 ''' + methods + r'''
 }
 fn idle(live: &Arc<AtomicUsize>) -> Queue {
     Queue {
-        owner: Some(2), installed: true, active: Fifo::new(), quarantined: false,
+        owner: Some(2), channel_index: 0, binding_noted: false,
+        installed: true, active: Fifo::new(), quarantined: false,
         previous: None, unpublished_binding: false, released: false,
         graph: Graph { cursors: Cursors { count: 1280, producer: 4, consumer: 4 }, stamp: 7 << 8, fail: false, resets: 0, owner: 2, m5: false },
         binding: Some(Binding { context: Context::new(2, live) }), retirement_ready: false,

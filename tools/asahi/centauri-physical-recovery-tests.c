@@ -35,7 +35,7 @@ struct pci_dev {
  struct pci_bus *bus, *subordinate;
  void *drvdata;
  int devfn, refs, command, reads, writes;
- bool visible, pending;
+	bool visible, pending, state_saved;
 };
 struct work_struct { int unused; };
 struct kref { int count; };
@@ -110,6 +110,8 @@ static void *pci_get_drvdata(struct pci_dev *p) { return p->drvdata; }
 static bool can_config(struct pci_dev *p) { return link_active && p->visible; }
 static void pci_clear_master(struct pci_dev *p)
 { p->reads++; p->writes++; if (can_config(p)) p->command &= ~PCI_COMMAND_MASTER; }
+static int pci_save_state(struct pci_dev *p)
+{ p->reads++; if (!can_config(p)) return -EIO; p->state_saved = true; return 0; }
 static int pci_read_config_word(struct pci_dev *p, int where, u16 *v)
 { (void)where; p->reads++; *v = can_config(p) ? p->command : 0xffff; return 0; }
 static int pcibios_err_to_errno(int x) { return x ? -EIO : 0; }

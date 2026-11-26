@@ -104,8 +104,9 @@ static int mux_control_deselect(struct mux_control *m) { (void)m;event('C');xbar
     static int dcp_dptx_connect_oob(void *dev,unsigned n) { (void)dev;(void)n;connect_calls++;display.external_cable=true;display.dptxport[0].connected=true;display.typec_cable_connected=true;connector.connected=true;return 0; }
     static void dcp_retrain_oob(struct connector *c) { (void)c; }
     static bool dcp_typec_sink_relink(struct apple_dcp *d) { (void)d;return false; }
-    /* An M1/M2 crossbar is not the T8142 layout, and an M1/M2 port has no fixed-CRTC connectors. */
+    /* An M1/M2 crossbar is not the T8142 or T6041 layout, and an M1/M2 port has no fixed-CRTC connectors. */
     static bool dcp_xbar_t8142(struct mux_control *m) { (void)m;return false; }
+    static bool dcp_xbar_t6041(struct mux_control *m) { (void)m;return false; }
     static bool dcp_typec_fixed_crtcs(void) { return false; }
     /* Deactivation retires queued DP IN events and drains their work. */
     static int tb_event_cancels;
