@@ -117,6 +117,7 @@
 #include <linux/printk.h>
 #include <linux/slab.h>
 #include <linux/sizes.h>
+#include <linux/soc/apple/dart.h>
 #include <linux/soc/apple/display.h>
 #include <linux/soc/apple/t8132.h>
 #include <linux/string.h>
@@ -3943,7 +3944,84 @@ static bool __init gate_t8132_fixed_dp_ready(struct device_node *nodes[T8132_HDM
 			return false;
 		}
 	}
+	/*
+	 * The processor runs on through the handover, behind DARTs the boot
+	 * loader leaves locked: adopting it needs apple-dart to keep their
+	 * firmware roots. Off that, the firmware DART's probe fails (-EBUSY on
+	 * the J773g), the processor and its PHY never probe, and the display
+	 * subsystem never binds.
+	 */
+	if (!apple_dart_keeps_locked_roots(nodes[T8132_HDMI_FW_DART]) ||
+	    !apple_dart_keeps_locked_roots(nodes[T8132_HDMI_DISP_DART])) {
+		staged_info("%pOF: the firmware roots of %pOF and %pOF are not kept, HDMI left off\n",
+			    nodes[T8132_HDMI_DCP], nodes[T8132_HDMI_FW_DART],
+			    nodes[T8132_HDMI_DISP_DART]);
+		return false;
+	}
 	return true;
+}
+
+/*
+ * A headless T8132 (no internal display processor handed over on 27.2) whose
+ * HDMI chain stays off: the display subsystem the boot loader enabled for it
+ * has no processor left to bind, since the main DCP is the M4 backend's on its
+ * firmware path only (apple_dcp_usable()). Left enabled it never registers,
+ * and the GPU, whose first start follows a handed-over display, waits for it
+ * for good. Disable it, as when the boot loader hands over no display: the
+ * boot framebuffer stays, and the GPU starts on it. Its DART (disp0's), which
+ * the boot loader enabled with it, goes too unless the main DCP, whose piodma
+ * also maps through it, is enabled.
+ */
+static void __init gate_t8132_display_off(void)
+{
+	struct device_node *display, *internal;
+	struct of_phandle_args args;
+	struct of_changeset *cs;
+	bool panel, internal_on;
+	int i, ret;
+
+	display = of_find_node_by_path("disp0");
+	if (!display)
+		display = of_find_compatible_node(NULL, NULL, gate_soc->display_compat);
+	if (!display || !of_device_is_compatible(display, gate_soc->display_compat) ||
+	    !of_device_is_available(display)) {
+		of_node_put(display);
+		return;
+	}
+	internal = of_find_node_by_path("dcp");
+	if (!internal)
+		internal = of_find_compatible_node(NULL, NULL, gate_soc->dcp_compat);
+	panel = gate_t8132_dcp_v27_2(internal);
+	internal_on = of_device_is_available(internal);
+	of_node_put(internal);
+	if (panel) {
+		of_node_put(display);
+		return;
+	}
+
+	cs = gate_cs_alloc();
+	if (!cs) {
+		staged_err("%pOF: could not allocate changeset\n", display);
+		of_node_put(display);
+		return;
+	}
+	ret = of_changeset_update_prop_string(cs, display, "status", "disabled");
+	for (i = 0; !ret && !internal_on &&
+	     !of_parse_phandle_with_args(display, "iommus", "#iommu-cells", i, &args); i++) {
+		if (of_device_is_available(args.np))
+			ret = of_changeset_update_prop_string(cs, args.np, "status", "disabled");
+		of_node_put(args.np);
+	}
+	if (!ret)
+		ret = of_changeset_apply(cs);
+	if (ret) {
+		gate_cs_free(cs);
+		staged_err("%pOF: could not disable it without HDMI: %d\n", display, ret);
+	} else {
+		staged_info("no HDMI chain and no internal display: %pOF disabled, boot framebuffer kept\n",
+			    display);
+	}
+	of_node_put(display);
 }
 
 /*
@@ -3960,6 +4038,9 @@ static bool __init gate_t8132_fixed_dp_ready(struct device_node *nodes[T8132_HDM
  * is not handed over (a headless Mac mini), disp0's DART is left unprobed by
  * apple-dart and would hold the display subsystem's probe forever, so iommus
  * is replaced with dispext's DART instead.
+ *
+ * With no chain enabled (no handover, a refused one, or nomodeset), a headless
+ * T8132 boots as without this gate: see gate_t8132_display_off().
  */
 static void __init gate_t8132_run(void)
 {
@@ -3967,12 +4048,15 @@ static void __init gate_t8132_run(void)
 	struct device_node *nodes[T8132_HDMI_NR];
 	bool append_dart = false;
 	bool display_checked = false;
+	bool enabled = false;
 	unsigned int i;
 	int phy_idx, ret;
 
-	if (IS_ENABLED(CONFIG_VIDEO) && video_firmware_drivers_only())
-		return;
 	staged_prefix = gate_soc->prefix;
+	if (IS_ENABLED(CONFIG_VIDEO) && video_firmware_drivers_only()) {
+		gate_t8132_display_off();
+		return;
+	}
 
 	for_each_compatible_node(dcp, NULL, "apple,t8132-dcpext") {
 		struct of_changeset *cs;
@@ -4045,10 +4129,13 @@ static void __init gate_t8132_run(void)
 				    append_dart ? "appended" : "on",
 				    nodes[T8132_HDMI_DISP_DART]);
 			append_dart = true;
+			enabled = true;
 		}
 		gate_t8132_put_nodes(nodes);
 	}
 	of_node_put(display);
+	if (!enabled)
+		gate_t8132_display_off();
 }
 
 static void __init apple_display_gate_soc(void)
