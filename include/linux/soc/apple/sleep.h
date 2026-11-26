@@ -144,6 +144,9 @@ void apple_sleep_coproc_set_early(struct device *dev);
 /* Whether the last step stopped it: after a refused sleep, false means it still runs. */
 bool apple_sleep_coproc_stopped(struct device *dev);
 
+/* Platform wake error for a stopped coprocessor (0 if its power domain and fabric restored). */
+int apple_sleep_coproc_wake_error(struct device *dev);
+
 /*
  * Whether this sleep's commit stops the registered coprocessors. Then one that can't be
  * registered refuses the sleep: stopped any earlier, a later refusal would strand it.
@@ -372,6 +375,11 @@ static inline void apple_sleep_coproc_set_ready(struct device *dev, bool ready)
 static inline bool apple_sleep_coproc_stopped(struct device *dev)
 {
 	return false;
+}
+
+static inline int apple_sleep_coproc_wake_error(struct device *dev)
+{
+	return -ENODEV;
 }
 
 static inline void apple_sleep_note_sub(u8 step) {}
