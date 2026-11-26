@@ -181,7 +181,7 @@ impl gpu::Gpu for M5DrmGpu {
         };
         Ok(KBox::new(queue, GFP_KERNEL)?)
     }
-    fn map_timestamp_buffer(&self, _bo: gem::ObjectRef, _range: Range<usize>)
+    fn map_timestamp_buffer(&self, _bo: gem::ObjectRef, _range: Range<usize>, _window: crate::timestamp::WindowPermit)
         -> Result<crate::timestamp::Buffer> { Err(ENOTSUPP) }
 }
 

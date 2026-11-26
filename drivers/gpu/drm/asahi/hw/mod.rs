@@ -472,6 +472,8 @@ pub(crate) struct PwrConfig {
     pub(crate) ppm_ki: F32,
     /// PPM (?) filter PID proportional gain.
     pub(crate) ppm_kp: F32,
+    /// Whether the board's DT/ADT explicitly supplied all four power-controller parameters.
+    pub(crate) pwr_controller_from_dt: bool,
     /// Power consumption filter time constant (periods?)
     pub(crate) pwr_filter_time_constant: u32,
     /// Power consumption filter PID integral gain.
@@ -618,6 +620,34 @@ impl PwrConfig {
         };
 
         let power_sample_period: u32 = prop!("apple,power-sample-period");
+        let pwr_filter_tc_opt: Option<u32> = node
+            .get_opt_property(c_str!("apple,pwr-filter-time-constant"))
+            .map_err(|e| {
+                dev_err!(dev, "Error reading property apple,pwr-filter-time-constant: {:?}\n", e);
+                e
+            })?;
+        let pwr_ki_opt: Option<F32> = node
+            .get_opt_property(c_str!("apple,pwr-integral-gain"))
+            .map_err(|e| {
+                dev_err!(dev, "Error reading property apple,pwr-integral-gain: {:?}\n", e);
+                e
+            })?;
+        let pwr_clamp_opt: Option<u32> = node
+            .get_opt_property(c_str!("apple,pwr-integral-min-clamp"))
+            .map_err(|e| {
+                dev_err!(dev, "Error reading property apple,pwr-integral-min-clamp: {:?}\n", e);
+                e
+            })?;
+        let pwr_kp_opt: Option<F32> = node
+            .get_opt_property(c_str!("apple,pwr-proportional-gain"))
+            .map_err(|e| {
+                dev_err!(dev, "Error reading property apple,pwr-proportional-gain: {:?}\n", e);
+                e
+            })?;
+        let pwr_controller_from_dt = pwr_filter_tc_opt.is_some()
+            && pwr_ki_opt.is_some()
+            && pwr_clamp_opt.is_some()
+            && pwr_kp_opt.is_some();
 
         Ok(PwrConfig {
             core_leak_coef,
@@ -662,11 +692,12 @@ impl PwrConfig {
             ppm_filter_time_constant_ms: prop!("apple,ppm-filter-time-constant-ms"),
             ppm_ki: prop!("apple,ppm-ki"),
             ppm_kp: prop!("apple,ppm-kp"),
-            pwr_filter_time_constant: prop!("apple,pwr-filter-time-constant", 313),
-            pwr_integral_gain: prop!("apple,pwr-integral-gain", f32!(0.0202129)),
-            pwr_integral_min_clamp: prop!("apple,pwr-integral-min-clamp", 0),
+            pwr_controller_from_dt,
+            pwr_filter_time_constant: pwr_filter_tc_opt.unwrap_or(313),
+            pwr_integral_gain: pwr_ki_opt.unwrap_or(f32!(0.0202129)),
+            pwr_integral_min_clamp: pwr_clamp_opt.unwrap_or(0),
             pwr_min_duty_cycle: prop!("apple,pwr-min-duty-cycle"),
-            pwr_proportional_gain: prop!("apple,pwr-proportional-gain", f32!(5.2831855)),
+            pwr_proportional_gain: pwr_kp_opt.unwrap_or(f32!(5.2831855)),
             pwr_sample_period_aic_clks: prop!(
                 "apple,pwr-sample-period-aic-clks",
                 cfg.base_clock_hz / 1000 * power_sample_period

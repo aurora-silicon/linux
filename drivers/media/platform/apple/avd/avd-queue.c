@@ -106,7 +106,12 @@ static void avd_retire(struct avd_dev *avd)
 			f->dst = NULL;
 			f->state = AVD_FRAME_FREE;
 			avd->inflight--;
-			spin_unlock_irqrestore(&avd->queue_lock, flags);
+			if (!avd->inflight) {
+				spin_unlock_irqrestore(&avd->queue_lock, flags);
+				avd_pm_perf_idle(avd);
+			} else {
+				spin_unlock_irqrestore(&avd->queue_lock, flags);
+			}
 			avd_pm_queue_changed(avd);
 			pm_runtime_mark_last_busy(avd->dev);
 			pm_runtime_put_autosuspend(avd->dev);
@@ -352,6 +357,30 @@ int avd_queue_ready(void *priv)
 	return ready;
 }
 
+static void avd_active_stream_stats(struct avd_dev *avd, unsigned int *inflight,
+				    unsigned int *streams)
+{
+	struct avd_ctx *seen[AVD_MAX_FRAMES];
+	unsigned int i, j, count = 0;
+	unsigned long flags;
+
+	spin_lock_irqsave(&avd->queue_lock, flags);
+	*inflight = avd->inflight;
+	for (i = 0; i < AVD_MAX_FRAMES; i++) {
+		struct avd_ctx *ctx = avd->frames[i].ctx;
+
+		if (avd->frames[i].state == AVD_FRAME_FREE || !ctx)
+			continue;
+		for (j = 0; j < count; j++)
+			if (seen[j] == ctx)
+				break;
+		if (j == count)
+			seen[count++] = ctx;
+	}
+	spin_unlock_irqrestore(&avd->queue_lock, flags);
+	*streams = count;
+}
+
 static void avd_queue_submit_work(struct work_struct *work)
 {
 	struct avd_ctx *ctx = container_of(work, struct avd_ctx, submit_work);
@@ -359,7 +388,7 @@ static void avd_queue_submit_work(struct work_struct *work)
 	const struct avd_codec_frame_ops *ops = ctx->coded_fmt_desc->frame_ops;
 	struct avd_frame *f = NULL;
 	unsigned long flags;
-	unsigned int i;
+	unsigned int i, inflight, streams;
 	int ret;
 
 	mutex_lock(&avd->queue_mutex);
@@ -491,7 +520,12 @@ static void avd_queue_submit_work(struct work_struct *work)
 		f->state = AVD_FRAME_FREE;
 		f->ctx = NULL;
 		avd->inflight--;
-		spin_unlock_irqrestore(&avd->queue_lock, flags);
+		if (!avd->inflight) {
+			spin_unlock_irqrestore(&avd->queue_lock, flags);
+			avd_pm_perf_idle(avd);
+		} else {
+			spin_unlock_irqrestore(&avd->queue_lock, flags);
+		}
 		avd_pm_queue_changed(avd);
 		pm_runtime_mark_last_busy(avd->dev);
 		pm_runtime_put_autosuspend(avd->dev);
@@ -500,6 +534,11 @@ static void avd_queue_submit_work(struct work_struct *work)
 		goto unlock;
 	}
 	v4l2_m2m_buf_copy_metadata(f->src, f->dst);
+	if (READ_ONCE(avd->pm.perf_ops)) {
+		avd_active_stream_stats(avd, &inflight, &streams);
+		avd_pm_perf_frame_start(avd, ctx, fmt_width(ctx),
+					fmt_height(ctx), inflight, streams);
+	}
 	ret = avd_send_frame(avd, f);
 	if (ret && ret != -EBUSY) {
 		spin_lock_irqsave(&avd->queue_lock, flags);

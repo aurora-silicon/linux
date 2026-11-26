@@ -706,13 +706,17 @@ int ane_fw_platform_resume(struct device *dev)
 	return ane_h16_backend_resume(dev);
 }
 
-/* Runtime PM callbacks: only the bound H17 device parks; H16 has none. */
+/* Runtime PM callbacks of the bound H16 or H17 device. */
 int ane_fw_platform_runtime_suspend(struct device *dev)
 {
-	return ane_fw_staged_bound(dev) ? ane_fw_staged_runtime_suspend(dev) : 0;
+	if (ane_fw_staged_bound(dev))
+		return ane_fw_staged_runtime_suspend(dev);
+	return ane_h16_backend_runtime_suspend(dev);
 }
 
 int ane_fw_platform_runtime_resume(struct device *dev)
 {
-	return ane_fw_staged_bound(dev) ? ane_fw_staged_runtime_resume(dev) : 0;
+	if (ane_fw_staged_bound(dev))
+		return ane_fw_staged_runtime_resume(dev);
+	return ane_h16_backend_runtime_resume(dev);
 }

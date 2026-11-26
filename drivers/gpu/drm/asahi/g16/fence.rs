@@ -588,7 +588,8 @@ impl Syncs {
     pub(crate) fn publish(&mut self, fence: &Fence) -> Result {
         let first = self.input_count.min(self.syncs.len());
         if let Some(bundle) = &mut self.cumulative {
-            bundle.publish(fence)?;
+            // G16 has its own power/DVFS path; never poke G17's non-M5 compute-waiter hook.
+            bundle.publish(fence, false)?;
             self.cumulative = None;
             self.syncs.truncate(first);
             return Ok(());

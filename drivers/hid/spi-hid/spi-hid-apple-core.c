@@ -785,7 +785,8 @@ static bool spihid_process_iface_hid_report_desc(struct spihid_apple *spihid,
 {
 	struct spihid_interface *iface = spihid_get_iface(spihid, num);
 
-	if (!iface)
+	/* Only interfaces registered as HID devices have a descriptor buffer. */
+	if (!iface || !iface->hid_desc)
 		return false;
 
 	if (iface->hid_desc_len == 0) {
@@ -926,7 +927,11 @@ static void spihid_assemble_message(struct spihid_apple *spihid,
 	remain = le16_to_cpu(pkt->remain);
 	offset = le16_to_cpu(pkt->offset);
 
-	if (offset + length + remain > U16_MAX) {
+	/* The complete message has to fit the reassembly buffer. */
+	if (offset + length + remain > SPIHID_MAX_INPUT_REPORT_SIZE) {
+		dev_warn_ratelimited(dev,
+				     "dropping oversized report off:%zu len:%zu remain:%zu\n",
+				     offset, length, remain);
 		return;
 	}
 
