@@ -197,7 +197,7 @@ macro_rules! asahi_of_device_table {
                 ),
                 (
                     of::DeviceId::new(c"apple,agx-t8103"),
-                    ProbeConfig::Legacy(&hw::t8103::HWCONFIG)
+                    ProbeConfig::LegacyWithG14Handoff(&hw::t8103::HWCONFIG)
                 ),
                 (
                     of::DeviceId::new(c"apple,agx-t8112"),
@@ -273,16 +273,11 @@ unsafe fn sleep_data<'a>(dev: *mut bindings::device) -> &'a AsahiPlatformDriverD
 unsafe extern "C" fn sleep_prepare(dev: *mut bindings::device) -> core::ffi::c_int {
     // SAFETY: Called by the PM core.
     let data = unsafe { sleep_data(dev) };
-    // G14 on firmware 27.2: the firmware keeps running through suspend-to-idle, with nothing in
-    // flight; a sleep that powers the SoC down would lose it, and it has no cold restart, so that
-    // is refused.
     #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
     if let Some(backend) = data.g14_v27_2.as_ref() {
         // SAFETY: Reads a global flag word.
-        if unsafe { bindings::pm_suspend_via_firmware() } {
-            return EBUSY.to_errno();
-        }
-        return kernel::error::from_result(|| backend.sleep_prepare().map(|_| 0));
+        let deep = unsafe { bindings::pm_suspend_via_firmware() };
+        return kernel::error::from_result(|| backend.sleep_prepare(deep).map(|_| 0));
     }
     // SAFETY: Reads a global flag word.
     if !unsafe { bindings::pm_suspend_via_firmware() } {
@@ -292,6 +287,34 @@ unsafe extern "C" fn sleep_prepare(dev: *mut bindings::device) -> core::ffi::c_i
         Some(gpu) => kernel::error::from_result(|| gpu.sleep_prepare().map(|_| 0)),
         None => EBUSY.to_errno(),
     }
+}
+
+extern "C" {
+    fn asahi_sleep_pd_init(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
+    fn asahi_sleep_pd_suspend_noirq(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
+    fn asahi_sleep_pd_resume_noirq(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
+}
+
+/// Allocates per-device suspend-to-idle power-domain hold state tied to `dev`'s binding.
+fn sleep_pd_init(dev: &kernel::device::Device<Core<'_>>) -> Result {
+    // SAFETY: `dev` is being probed, so attaching devres state to its raw device is valid.
+    kernel::error::to_result(unsafe { asahi_sleep_pd_init(dev.as_raw().cast()) })
+}
+
+/// Holds the GPU's attached power domain across suspend-to-idle while its firmware stays live.
+pub(crate) unsafe extern "C" fn sleep_suspend_noirq(
+    dev: *mut bindings::device,
+) -> core::ffi::c_int {
+    // SAFETY: Called by the PM core with a bound GPU device.
+    unsafe { asahi_sleep_pd_suspend_noirq(dev.cast()) }
+}
+
+/// Releases any suspend-to-idle power-domain hold taken by [`sleep_suspend_noirq`].
+pub(crate) unsafe extern "C" fn sleep_resume_noirq(
+    dev: *mut bindings::device,
+) -> core::ffi::c_int {
+    // SAFETY: Called by the PM core with a bound GPU device.
+    unsafe { asahi_sleep_pd_resume_noirq(dev.cast()) }
 }
 
 /// Runs after every device resumed. Does nothing unless [`sleep_prepare`] stopped the firmware.
@@ -310,6 +333,8 @@ unsafe extern "C" fn sleep_complete(dev: *mut bindings::device) {
 static SLEEP_OPS: SleepOps = SleepOps(bindings::dev_pm_ops {
     prepare: Some(sleep_prepare),
     complete: Some(sleep_complete),
+    suspend_noirq: Some(sleep_suspend_noirq),
+    resume_noirq: Some(sleep_resume_noirq),
     // SAFETY: All-zero is the absence of every other callback.
     ..unsafe { core::mem::zeroed() }
 });
@@ -326,6 +351,8 @@ unsafe extern "C" fn sleep_refuse(_dev: *mut bindings::device) -> core::ffi::c_i
 
 static SLEEP_REFUSE_OPS: SleepOps = SleepOps(bindings::dev_pm_ops {
     prepare: Some(sleep_refuse),
+    suspend_noirq: Some(sleep_suspend_noirq),
+    resume_noirq: Some(sleep_resume_noirq),
     // SAFETY: All-zero is the absence of every other callback.
     ..unsafe { core::mem::zeroed() }
 });
@@ -379,7 +406,10 @@ impl platform::Driver for AsahiPlatformDriver {
 
         dev_info!(pdev.as_ref(), "Probing...\n");
 
-        let (cfg, has_g14_handoff) = match info.ok_or(ENODEV)? {
+        let info = info.ok_or(ENODEV)?;
+        sleep_pd_init(pdev.as_ref())?;
+
+        let (cfg, has_g14_handoff) = match info {
             ProbeConfig::Legacy(cfg) => (*cfg, false),
             ProbeConfig::LegacyWithG14Handoff(cfg) => (*cfg, true),
             ProbeConfig::G17(cfg) => {
@@ -387,7 +417,14 @@ impl platform::Driver for AsahiPlatformDriver {
             }
             ProbeConfig::G17M5 => return AsahiPlatformDriver::probe_g17_m5(pdev),
             #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
-            ProbeConfig::M3(crate::m3::Chip::T8122) => return AsahiPlatformDriver::probe_t8122(pdev),
+            ProbeConfig::M3(crate::m3::Chip::T8122) => {
+                // The shared G16 backend owns the handoffs its T8122 row describes (27.2).
+                #[cfg(CONFIG_DRM_ASAHI_G16)]
+                if crate::g16::claims(pdev.as_ref(), &crate::g16::hw::t8122::CONFIG) {
+                    return Err(ENODEV);
+                }
+                return AsahiPlatformDriver::probe_t8122(pdev);
+            }
             ProbeConfig::M3(chip) => return Err(crate::m3::refuse_probe(pdev, *chip)),
             #[cfg(CONFIG_DRM_ASAHI_M5)]
             ProbeConfig::M5 => return AsahiPlatformDriver::probe_m5(pdev),
@@ -403,9 +440,14 @@ impl platform::Driver for AsahiPlatformDriver {
         // The loader advertises the supported wire layout independently of the image version.
         if has_g14_handoff && compat.as_slice() == [27, 2, 0] {
             #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
-            return AsahiPlatformDriver::probe_g14_v27_2(
-                pdev, cfg, hw::t8112::REGISTERS_V27_2, hw::t8112::WRITABLE_V27_2,
-            );
+            {
+                let (registers, writable) = match cfg.gpu_gen {
+                    hw::GpuGen::G13 => (hw::t8103::REGISTERS_V27_2, hw::t8103::WRITABLE_V27_2),
+                    hw::GpuGen::G14 => (hw::t8112::REGISTERS_V27_2, hw::t8112::WRITABLE_V27_2),
+                    _ => return Err(ENODEV),
+                };
+                return AsahiPlatformDriver::probe_g14_v27_2(pdev, cfg, registers, writable);
+            }
             #[cfg(not(CONFIG_DRM_ASAHI_G14_V27_2))]
             return Err(ENODEV);
         }
@@ -521,7 +563,11 @@ impl AsahiPlatformDriver {
                 return Err(error);
             }
         };
-        dev_info!(pdev.as_ref(), "G14 firmware 27.2 running; DRM device registered\n");
+        dev_info!(
+            pdev.as_ref(),
+            "{:?} firmware 27.2 running; DRM device registered\n",
+            cfg.gpu_gen
+        );
         Ok(AsahiPlatformDriverData {
             binding,
             _device: reg.device().into(),
@@ -542,6 +588,7 @@ impl AsahiPlatformDriver {
         pdev: &'bound platform::Device<Core<'_>>,
         cfg: &'static crate::g15::Config,
     ) -> Result<AsahiPlatformDriverData<'bound>> {
+        sleep_pd_init(pdev.as_ref())?;
         // SAFETY: Admission checks the SoC and the UAT output width before DMA starts.
         unsafe { pdev.dma_set_mask_and_coherent(DmaMask::try_new(cfg.uat_oas)?)? };
         let resources = regs::Resources::new(pdev)?;
@@ -756,6 +803,7 @@ impl AsahiPlatformDriver {
         pdev: &'bound platform::Device<Core<'_>>,
         cfg: &'static crate::g16::Config,
     ) -> Result<AsahiPlatformDriverData<'bound>> {
+        sleep_pd_init(pdev.as_ref())?;
         // SAFETY: the qualified UAT output width constrains this device's DMA.
         unsafe { pdev.dma_set_mask_and_coherent(DmaMask::try_new(cfg.uat_oas)?)? };
         let resources = regs::Resources::new(pdev)?;

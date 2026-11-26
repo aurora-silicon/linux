@@ -371,6 +371,23 @@
 	brcm,board-type = "apple,sakhalin";
 };
 
+/*
+ * This Mac hands its radio DART over unconfigured: every stream translates
+ * with no valid root and none is enabled. The managed radio contract only
+ * admits a SID16 left in its static bypass or disabled, so the DART would
+ * refuse the handover (-EBUSY) and port 0 would never probe. Linux owns the
+ * radio DART and trains port 0 itself instead.
+ */
+&dart_apcie0 {
+	/delete-property/ apple,managed-sids;
+	/delete-property/ apple,sid16-page;
+	/delete-property/ apple,dma-range;
+};
+
+&pcie0 {
+	/delete-property/ apple,managed-sids;
+};
+
 #include "hwmon-common.dtsi"
 #include "hwmon-mini.dtsi"
 

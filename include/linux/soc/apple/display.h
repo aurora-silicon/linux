@@ -11,6 +11,8 @@
 struct device;
 
 /* Initial native display admission, before starting retained GPU firmware. */
+int apple_drm_link_device(struct device *consumer,
+			  const struct device_node *display_node);
 int apple_drm_t6030_link_device(struct device *consumer);
 int apple_drm_t6031_link_device(struct device *consumer);
 int apple_drm_t8132_link_device(struct device *consumer);
@@ -99,11 +101,11 @@ static inline bool apple_t8122_dcp_v27_2(const struct device_node *np)
  * DCP's region). So it qualifies when both of its own are 27.2.0 and the
  * internal DCP was handed over on the 27.2 image.
  */
-static inline bool apple_t8122_dcpext_v27_2(const struct device_node *np)
+static inline bool
+apple_t8122_dcpext_v27_2_for_internal(const struct device_node *np,
+				      const struct device_node *internal_dcp)
 {
-	struct device_node *dcp;
 	u32 fw[3], compat[3];
-	bool internal;
 
 	if (!np || !of_device_is_compatible(np, "apple,t8122-dcpext") ||
 	    of_property_count_u32_elems(np, "apple,firmware-version") != 3 ||
@@ -114,8 +116,19 @@ static inline bool apple_t8122_dcpext_v27_2(const struct device_node *np)
 	    compat[0] != 27 || compat[1] != 2 || compat[2] != 0)
 		return false;
 
+	return apple_t8122_dcp_v27_2(internal_dcp);
+}
+
+static inline bool apple_t8122_dcpext_v27_2(const struct device_node *np)
+{
+	struct device_node *dcp;
+	bool internal;
+
+	if (!np || !of_device_is_compatible(np, "apple,t8122-dcpext"))
+		return false;
+
 	dcp = of_find_compatible_node(NULL, NULL, "apple,t8122-dcp");
-	internal = apple_t8122_dcp_v27_2(dcp);
+	internal = apple_t8122_dcpext_v27_2_for_internal(np, dcp);
 	of_node_put(dcp);
 	return internal;
 }

@@ -4,9 +4,11 @@
 
 #include <linux/interrupt.h>
 #include <linux/list.h>
+#include <linux/of.h>
 #include <linux/types.h>
 
 #include "dcp-fabric-core.h"
+#include "dcp-fabric-effects.h"
 
 struct apple_connector;
 struct apple_crtc;
@@ -135,6 +137,12 @@ bool dcp_t8132_ext_m4_node(const struct device_node *np);
 bool dcp_is_t8132_ext(const struct apple_dcp *dcp);
 
 /* DCP probe, resume and endpoint teardown hooks. */
+static inline bool dcp_typec_routes_available(const struct device_node *routes)
+{
+	return dcp_fabric_has_available_routes(!!routes,
+					       routes ? of_get_available_child_count(routes) : 0);
+}
+
 int dcp_register_typec_routes(struct apple_dcp *dcp);
 void dcp_sleep_hold_phys(struct apple_dcp *dcp);
 void dcp_typec_route_park(struct apple_dcp *dcp);

@@ -28,6 +28,7 @@
 #include "dptxep.h"
 #include "dcp_backlight.h"
 #include "dcp-announce.h"
+#include "dcp-color.h"
 #include "dcp-display-metadata.h"
 #include "dcp-metadata-epoch.h"
 #include "dcp-180hz.h"
@@ -226,9 +227,9 @@ struct dcp_panel {
 	int height_mm;
 	/// panel has a mini-LED backlight
 	bool has_mini_led;
-	/// peak panel luminance in nits, for EDR (desktop 26.x; 0 if unknown)
+	/// peak panel luminance in nits, for EDR (0 if unknown or no EDR headroom)
 	u32 peak_nits;
-	/// EDR headroom ceiling x1000 from the ADT (desktop 26.x; 0 if none)
+	/// EDR headroom ceiling x1000 from the ADT (0: the panel has no EDR headroom)
 	u32 edr_ceiling;
 	/// calibrated colour target from the raw ADT; NULL if not given
 	const struct dcp_color_space *color_target;
@@ -250,6 +251,43 @@ struct dcp_s2r_layout {
 	u32 disp_streams;
 	/* "pmc-dcp" counts the powered DCPs: T8132 and T8140 only */
 	bool pmc_dcp;
+};
+
+/*
+ * One display power chain parsed from a child node of
+ * apple,t6041-display-power. domains[] is ordered sys, fe, cpu, then child
+ * sub-domains (parent-before-child; powered off in reverse).
+ */
+struct dcp_t6041_chain {
+	const char *name;
+	u32 reg;
+	bool is_main;
+	void __iomem *gapf;
+	void __iomem *pg_a;
+	void __iomem *pg_b;
+	void __iomem *fabric;
+	void __iomem **domains;
+	u32 *child_saved;
+	unsigned int num_domains;
+};
+
+/*
+ * Mapped register windows and display power chains from apple,display-power
+ * (apple,t6041-display-power) for host-driven T6041 suspend-to-RAM; mapped
+ * once at probe.
+ */
+struct dcp_t6041_power {
+	void __iomem *pmc_dcp;
+	void __iomem *pwrgate;
+	void __iomem *pwrgate_aux;
+	void __iomem *gapf;
+	void __iomem *axi2af;
+	struct dcp_t6041_chain *chains;
+	unsigned int num_chains;
+	struct dcp_t6041_chain *main_chain;
+	bool child_valid;
+	u32 boot_ps[3];
+	bool boot_ps_valid;
 };
 
 /*
@@ -284,6 +322,8 @@ struct apple_dcp_hw_data {
 	 * standard RTKit wake instead of starting or restarting the ASC.
 	 */
 	bool adopt_live_session;
+	/* Bootloader property marking this DCP as running under iBoot. */
+	const char *iboot_handoff;
 	enum dcp_firmware_version firmware_compat;
 	/* Firmware-visible clock aperture, independent of the AP PMGR window. */
 	const struct resource *firmware_clock;
@@ -369,6 +409,16 @@ struct apple_dcp_hw_data {
 	 * for one second.
 	 */
 	unsigned int afk_timeout_ms;
+	/*
+	 * Firmware 27 reaches its register windows through its DART here, so map_reg maps
+	 * them there (T8103: its power-down faults on an unmapped window otherwise).
+	 */
+	bool map_reg_dart;
+	/*
+	 * The display DART goes off and on with the coprocessor's own stop and start: no
+	 * D572 turns it off first, and the stop's power-down resets it (T8103).
+	 */
+	bool s2r_disp_dart_with_dcp;
 };
 
 enum dcp_test_point {
@@ -411,18 +461,6 @@ struct dcp_desktop_state {
 	u32 vrr_min_on, vrr_min_off, vrr_min_sent;
 	/* The frame's colour matrix, sent after an adaptive sync update. */
 	struct iomfb_set_matrix_req matrix;
-	/*
-	 * HDR10 static metadata (external processors): the pinned
-	 * dcpav-service-epic service, the Type 1 body last sent on this link
-	 * (taken or refused), if any, and whether the firmware took one, so
-	 * that the link carries a Dynamic Range and Mastering InfoFrame.
-	 * hdr_lock protects all of them.
-	 */
-	spinlock_t hdr_lock;
-	struct apple_epic_service *av_service;
-	u8 hdr_sent[24];
-	bool hdr_sent_valid;
-	bool hdr_infoframe;
 	u32 present_id;
 	bool present_pending;
 	/*
@@ -621,6 +659,8 @@ struct apple_dcp {
 	 */
 	bool ext_failsafe;
 	bool ext_dead;
+	/* T6041 S2R: this external DCP's firmware stop ran in a sleep of this boot */
+	bool t6041_ext_seen;
 	/*
 	 * A T6030 external processor in the main DRM device: the kernel starts
 	 * its firmware on first use, its modes come from the attached display.
@@ -743,6 +783,8 @@ struct apple_dcp {
 
 	/* Display registers mappable to the DCP */
 	struct resource *disp_registers[MAX_DISP_REGISTERS];
+	/* Their DART mappings with hw.map_reg_dart, made at the firmware's first map_reg */
+	dma_addr_t map_reg_dva[MAX_DISP_REGISTERS];
 	unsigned int nr_disp_registers;
 
 	struct resource disp_bw_scratch_res;
@@ -762,6 +804,8 @@ struct apple_dcp {
 
 	struct dcp_channel ch_cmd, ch_oobcmd;
 	struct dcp_channel ch_cb, ch_oobcb, ch_async, ch_oobasync;
+	/* In-flight dcp_ack() mailbox sends not yet queued to RTKit. */
+	atomic_t pending_acks;
 
 	/* iomfb EP callback handlers */
 	const iomfb_cb_handler *cb_handlers;
@@ -829,13 +873,28 @@ struct apple_dcp {
 	bool typec_hpd_held;
 	bool use_timestamps;
 	bool vrr_enabled;
+	struct {
+		/* Pins the AV service and tracks HDR10 metadata for its link. */
+		spinlock_t lock;
+		struct apple_epic_service *service;
+		u64 generation;
+		u8 sent[24];
+		bool sent_valid;
+		bool infoframe;
+	} hdr;
+	/* The selected IOMFB backend programs catalogue colour IDs and PQ surfaces. */
+	bool iomfb_template_pq;
 	/*
 	 * The mode set asks for a PQ signal; output_pq: the one set carries it;
-	 * output_edr: a panel shows the PQ content as EDR, edr_sent: swaps
-	 * still carry EDR state the firmware must be told to drop.
+	 * output_hdr: any non-SDR EOTF (PQ/HLG/HDR-gamma); output_edr: a panel
+	 * shows the PQ content as EDR, edr_sent: swaps still carry EDR state
+	 * the firmware must be told to drop.
 	 */
+	struct dcp_color_request color_req;
+	struct dcp_color_mode active_color;
 	bool pq_requested;
 	bool output_pq;
+	bool output_hdr;
 	bool output_edr;
 	bool edr_sent;
 	/*
@@ -887,6 +946,11 @@ struct apple_dcp {
 	bool s2r_stopped;
 	/* DPMS off stopped the firmware and lowered the domains; DPMS on brings them back. */
 	bool dpms_powered_off;
+	/*
+	 * The firmware confirmed the scanout stop of a set_power_state(0) and no power-on has
+	 * started since: its D572(0) has come and gone, and a second set_power_state(0) gets none.
+	 */
+	bool pipe_off;
 	/* Refused its idle with the display off: the firmware still runs, the display is dark. */
 	bool s2r_refused_off;
 	/* The firmware's secure mailbox, where it has one. */
@@ -900,6 +964,8 @@ struct apple_dcp {
 	struct delayed_work secure_poll_wq;
 	/* Stopped and not restarted, which outlives a suspend that gets refused. */
 	bool s2r_fw_down;
+	/* Stopped cold for firmware-driven sleep, with no restart until reboot. */
+	bool sleep_cold_stopped;
 	/*
 	 * Its last system suspend left the firmware running and its domains on
 	 * (wakeup path), see dcp_sleep_keeps_firmware(). Cleared by the next
@@ -931,6 +997,9 @@ struct apple_dcp {
 	bool s2r_power_oob;
 	u8 s2r_step;
 	struct completion s2r_dart_done;
+	struct completion s2r_hpd_done;
+	bool sleep_host_stop;
+	struct dcp_t6041_power t6041_power;
 	struct device *s2r_disp_dart;
 	struct device *s2r_dcp_dart;
 
@@ -939,6 +1008,8 @@ struct apple_dcp {
 
 	/* clear all surfaces on init */
 	bool surfaces_cleared;
+	bool boot_surface_pending;
+	bool boot_scanout_reserved;
 
 	/* enable CRC calculation */
 	bool crc_enabled;
@@ -1020,6 +1091,10 @@ struct apple_dcp {
 
 	/* V27 sleep: the panel's next mode set is the mode it already has */
 	bool v27_keep_mode;
+	/* Since the V27 wake: the panel's video interface opened, firmware reported the panel */
+	struct completion v27_wake_video, v27_wake_hotplug;
+#define V27_WAKE_VIDEO_MS	1500
+#define V27_WAKE_HOTPLUG_MS	250
 	/* V27 sleep: the output area of the call being pushed holds this (an in/out word) */
 	const void *push_out_prefill;
 
@@ -1372,6 +1447,18 @@ static inline void dcp_takeover_adopt_proven(struct apple_dcp *dcp)
 		WRITE_ONCE(dcp->desktop->takeover_adopted, false);
 }
 
+/*
+ * Firmware interfaces whose swaps carry EDR, i.e. that the driver's EDR path
+ * implements (dcp_edr_prepare()): desktop 26.x and firmware 27.  This is the
+ * interface ABI, not the panel: whether a panel has EDR headroom comes from
+ * its ADT (dcp_panel_edr()).
+ */
+static inline bool dcp_fw_swap_has_edr(struct apple_dcp *dcp)
+{
+	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
+	       dcp->fw_compat == DCP_FIRMWARE_V_27_0;
+}
+
 static inline bool dcp_vrr_live(struct apple_dcp *dcp)
 {
 	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && dcp->main_display &&
@@ -1410,12 +1497,20 @@ static inline bool dcp_is_v14_7_external(const struct apple_dcp *dcp)
 }
 
 /*
- * Firmware 27's external processors (the T6050 DCPEXTs): their DP/HDMI
- * audio service is the desktop one, on endpoint 0x2b (see av.c).
+ * Firmware 27's external processors with its own DPTX endpoint layout (the
+ * T6050 and firmware-27 T6041 DCPEXTs, ports on DPTX_ENDPOINT_V2): their
+ * DP/HDMI audio service is the desktop one, on endpoint 0x2b (see av.c).
+ *
+ * A firmware-27 DCP on the classic layout (the T8112 DCPs, whose 27.2
+ * firmware advertises its ports on DPTX_ENDPOINT, dcp_v27_dptx_layout())
+ * has the classic audio service on AV_ENDPOINT: there 0x2b is HDCP only.
+ * The layout is read as set at probe, so that the DP audio driver, which
+ * binds before the DCP starts, sees the same role as the DCP.
  */
 static inline bool dcp_is_v27_external(const struct apple_dcp *dcp)
 {
-	return dcp->fw_compat == DCP_FIRMWARE_V_27_0 && dcp->hw.num_dptx_ports;
+	return dcp->fw_compat == DCP_FIRMWARE_V_27_0 && dcp->hw.num_dptx_ports &&
+	       dcp->hw.dptx_endpoint == DPTX_ENDPOINT_V2;
 }
 
 /* The 14.7 internal panel (J514S/J516S), presented through DCPLink. */

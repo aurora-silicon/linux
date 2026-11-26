@@ -93,6 +93,34 @@ struct phy_configure_opts_dp {
 	 *
 	 */
 	u8 set_voltages : 1;
+
+	/**
+	 * @set_tunnel_rate:
+	 *
+	 * Flag indicating, whether or not to start or stop the pixel clock
+	 * of a DisplayPort tunnel, for a PHY in USB4 mode whose own PLL
+	 * clocks the DP IN adapters of its USB4 router. Used alone: the
+	 * other set_* flags must be clear.
+	 *
+	 */
+	u8 set_tunnel_rate : 1;
+
+	/**
+	 * @tunnel_dpin:
+	 *
+	 * DP IN adapter of the router whose pixel clock @set_tunnel_rate
+	 * starts or stops, as the display controller numbers them.
+	 */
+	unsigned int tunnel_dpin;
+
+	/**
+	 * @tunnel_rate:
+	 *
+	 * DP link rate code (DPCD LINK_BW_SET: 0x06 RBR, 0x0a HBR, 0x14 HBR2,
+	 * 0x1e HBR3) of the stream tunnelled through @tunnel_dpin, or 0 to
+	 * stop its pixel clock.
+	 */
+	u8 tunnel_rate;
 };
 
 #endif /* __PHY_DP_H_ */
