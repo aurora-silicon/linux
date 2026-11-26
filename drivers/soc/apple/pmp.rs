@@ -463,7 +463,15 @@ impl PmpData {
             } else {
                 // Not every boot loader provides every tunable the firmware
                 // asks for, and the firmware starts without them.
-                dev_dbg!(self.dev, "unknown property {:?}", name_str);
+                if !self.register_ack_index {
+                    // DIAGNOSTIC (T6030): which ones Linux can't answer, by name.
+                    dev_info!(self.dev, "PMP asked for {:?}: not in the DT\n", name_str);
+                } else {
+                    dev_dbg!(self.dev, "unknown property {:?}", name_str);
+                }
+            }
+            if !self.register_ack_index && size != 0 {
+                dev_info!(self.dev, "PMP asked for {:?}: {} bytes\n", name_str, size);
             }
         }
         state.ioreg_entries.push(size, GFP_KERNEL)?;
@@ -477,12 +485,18 @@ impl PmpData {
         Ok(msg)
     }
     fn set_ioreg(&self, index: u64) -> Result<u64> {
-        let len = *self
-            .state
-            .lock()
-            .ioreg_entries
-            .get(index as usize)
-            .ok_or(EIO)? as u64;
+        let state = self.state.lock();
+        if !self.register_ack_index {
+            // DIAGNOSTIC (T6030): macOS 27.2 makes 454 registrations and 60 SET_IOREG.
+            dev_info!(
+                self.dev,
+                "PMP: {} registry entries so far, {} empty\n",
+                state.ioreg_entries.len(),
+                state.ioreg_entries.iter().filter(|&&l| l == 0).count()
+            );
+        }
+        let len = *state.ioreg_entries.get(index as usize).ok_or(EIO)? as u64;
+        drop(state);
         let msg = (OPC_SET_IOREG | OPC_ACK_MASK) << OPC_SHIFT | len;
         Ok(msg)
     }
