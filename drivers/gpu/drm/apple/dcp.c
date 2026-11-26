@@ -53,6 +53,7 @@
 #include <drm/drm_edid.h>
 #include <drm/drm_fb_dma_helper.h>
 #include <drm/drm_file.h>
+#include <drm/drm_gem_dma_helper.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_framebuffer.h>
@@ -5180,20 +5181,43 @@ static const struct dcp_fabric_resume_ops dcp_resume_ops = {
 	.sample = dcp_resume_sample,
 };
 
+/*
+ * Sample fixed-HDMI HPD and reconnect DPTX port 0 (or power off / report
+ * unplug when no sink is present). Shared by initial bring-up and deep sleep
+ * recovery.
+ */
+static void dcp_fixed_hdmi_reconnect(struct apple_dcp *dcp, bool poweroff_unplugged)
+{
+	bool connected;
+	int ret;
+
+	if (dcp_is_typec_output(dcp) || !dcp->hdmi_hpd ||
+	    READ_ONCE(dcp->active_typec_route))
+		return;
+
+	/* Check HPD before enabling the edge-triggered IRQ. */
+	connected = gpiod_get_value_cansleep(dcp->hdmi_hpd);
+	dev_info(dcp->dev, "%s: DP2HDMI HPD connected:%d\n", __func__, connected);
+
+	if (connected && !READ_ONCE(dcp->hdmi_yielded)) {
+		ret = dcp_dptx_connect(dcp, 0);
+		if (ret)
+			dev_warn(dcp->dev, "HDMI DPTX connect failed: %d\n", ret);
+	} else if (!connected) {
+		if (poweroff_unplugged)
+			_dcp_poweroff(dcp);
+		else if (dcp->connector)
+			disconnected_hpd_event(dcp->connector);
+	}
+}
+
 static int dcp_enable_dp2hdmi_hpd(struct apple_dcp *dcp)
 {
 	if (dcp_is_typec_output(dcp)) {
 		if (READ_ONCE(dcp->typec_cable_connected))
 			dcp_dptx_connect(dcp, 0);
-	} else if (dcp->hdmi_hpd) {
-		/* Check HPD before enabling the edge-triggered IRQ. */
-		bool connected = gpiod_get_value_cansleep(dcp->hdmi_hpd);
-		dev_info(dcp->dev, "%s: DP2HDMI HPD connected:%d\n", __func__, connected);
-
-		if (connected && !READ_ONCE(dcp->hdmi_yielded))
-			dcp_dptx_connect(dcp, 0);
-		else if (!connected)
-			_dcp_poweroff(dcp);
+	} else {
+		dcp_fixed_hdmi_reconnect(dcp, true);
 	}
 
 	if (dcp->hdmi_hpd_irq)
@@ -5710,12 +5734,35 @@ static void dcp_work_backlight_fallback(struct work_struct *work)
 		dev_warn(dcp->dev, "backlight registration failed: %d\n", ret);
 }
 
+/* Drop every framebuffer mirror before the fbdma domain goes away. */
+static void dcp_fb_unmirror_all(struct apple_dcp *dcp)
+{
+	unsigned long index;
+	void *entry;
+
+	guard(mutex)(&dcp->fb_mirror_lock);
+	if (dcp->fb_dom) {
+		xa_for_each(&dcp->fb_mirrors, index, entry) {
+			/* An object stays in fb_mirrors only while it is alive. */
+			struct drm_gem_dma_object *obj = (void *)index;
+
+			iommu_unmap(dcp->fb_dom, obj->dma_addr, xa_to_value(entry));
+		}
+	}
+	xa_destroy(&dcp->fb_mirrors);
+	WRITE_ONCE(dcp->fb_dom, NULL);
+}
+
 static void dcp_release_piodma_iommu_dev(struct apple_dcp *dcp)
 {
 	if (dcp->retain_dma) {
 		WRITE_ONCE(dcp->quiescing, true);
 		return;
 	}
+	dcp_fb_unmirror_all(dcp);
+	if (dcp->fbdma)
+		of_platform_device_destroy(&dcp->fbdma->dev, NULL);
+	dcp->fbdma = NULL;
 	if (dcp->piodma) {
 		if (dcp->piodma_created)
 			of_platform_device_destroy(&dcp->piodma->dev, NULL);
@@ -5726,6 +5773,151 @@ static void dcp_release_piodma_iommu_dev(struct apple_dcp *dcp)
 	dcp->iommu_dom = NULL;
 	dcp->piodma_created = false;
 }
+
+/*
+ * J615 dcpext: the external pipe reads framebuffers through its
+ * own display DART, not the internal one the display subsystem's domain
+ * covers. An "fbdma" child, on that DART's stream 0 with the display
+ * subsystem's DVA window, gets a domain the framebuffers are mirrored into.
+ * Without the node nothing changes. The display gate disables the node when
+ * it shares that DART with the display subsystem instead, whose domain then
+ * already maps every framebuffer there.
+ */
+static int dcp_create_fbdma_dev(struct apple_dcp *dcp)
+{
+	struct device_node *node __free(device_node) = NULL;
+	struct iommu_domain *dom;
+	int ret;
+
+	if (!dcp->ext_failsafe || dcp->fbdma)
+		return 0;
+	node = of_get_available_child_by_name(dcp->dev->of_node, "fbdma");
+	if (!node)
+		return 0;
+	dcp->fbdma = of_platform_device_create(node, NULL, dcp->dev);
+	if (!dcp->fbdma)
+		return dev_err_probe(dcp->dev, -ENODEV, "fbdma: could not create %pOF\n", node);
+	ret = dma_set_mask_and_coherent(&dcp->fbdma->dev, DMA_BIT_MASK(42));
+	if (!ret)
+		ret = of_dma_configure(&dcp->fbdma->dev, node, true);
+	dom = ret ? NULL : iommu_get_domain_for_dev(&dcp->fbdma->dev);
+	if (IS_ERR_OR_NULL(dom)) {
+		ret = ret ?: PTR_ERR_OR_ZERO(dom) ?: -ENODEV;
+		of_platform_device_destroy(&dcp->fbdma->dev, NULL);
+		dcp->fbdma = NULL;
+		return dev_err_probe(dcp->dev, ret, "fbdma: no IOMMU domain\n");
+	}
+	scoped_guard(mutex, &dcp->fb_mirror_lock)
+		WRITE_ONCE(dcp->fb_dom, dom);
+	dev_info(dcp->dev, "fbdma: framebuffers mirrored through %pOF\n", node);
+	return 0;
+}
+
+/*
+ * Map the pages behind [@iova, @iova + @size) of @src into the fbdma domain
+ * at the same addresses, read-only. The pages are taken from @src's own
+ * translations, so this needs no scatterlist: an imported buffer's belongs
+ * to its exporter. Each step looks up one of @src's smallest pages, so a hole
+ * cannot hide inside a step; that needs both domains to share that page size.
+ * Returns 0, or a negative errno with nothing left mapped.
+ */
+static int dcp_fb_mirror_range(struct apple_dcp *dcp, struct iommu_domain *src,
+			       dma_addr_t iova, size_t size)
+{
+	unsigned long pgsize;
+	phys_addr_t phys, run_phys = 0;
+	size_t off, run_len = 0, mapped = 0;
+	int ret = 0;
+
+	if (!src->pgsize_bitmap || !dcp->fb_dom->pgsize_bitmap)
+		return -EINVAL;
+	pgsize = 1UL << __ffs(src->pgsize_bitmap);
+	if (pgsize != 1UL << __ffs(dcp->fb_dom->pgsize_bitmap) ||
+	    !IS_ALIGNED(iova | size, pgsize))
+		return -EINVAL;
+	for (off = 0; off <= size && !ret; off += pgsize) {
+		phys = off < size ? iommu_iova_to_phys(src, iova + off) : 0;
+		if (run_len && phys && phys == run_phys + run_len) {
+			run_len += pgsize;
+			continue;
+		}
+		/* The run of physically contiguous pages ends here. */
+		if (run_len) {
+			ret = iommu_map(dcp->fb_dom, iova + mapped, run_phys, run_len,
+					IOMMU_READ, GFP_KERNEL);
+			if (!ret)
+				mapped += run_len;
+		}
+		if (!ret && off < size && !phys)
+			ret = -EFAULT;
+		run_phys = phys;
+		run_len = pgsize;
+	}
+	if (ret && mapped)
+		iommu_unmap(dcp->fb_dom, iova, mapped);
+	return ret;
+}
+
+/*
+ * Map @fb's GEM objects into the fbdma domain at their display DVAs. A
+ * mapping lasts as long as its object and its DVA do: dcp_fb_unmirror()
+ * removes it when the object is freed.
+ */
+int dcp_fb_mirror(struct apple_dcp *dcp, struct drm_framebuffer *fb)
+{
+	struct iommu_domain *src;
+	unsigned int i;
+
+	if (!READ_ONCE(dcp->fb_dom))
+		return 0;
+	src = iommu_get_domain_for_dev(drm_dev_dma_dev(fb->dev));
+	guard(mutex)(&dcp->fb_mirror_lock);
+	if (!dcp->fb_dom || IS_ERR_OR_NULL(src))
+		return -ENODEV;
+	for (i = 0; i < fb->format->num_planes; i++) {
+		struct drm_gem_dma_object *obj = drm_fb_dma_get_gem_obj(fb, i);
+		unsigned long index = (unsigned long)obj;
+		int ret;
+
+		if (!obj)
+			return -EINVAL;
+		if (xa_load(&dcp->fb_mirrors, index))
+			continue;
+		ret = dcp_fb_mirror_range(dcp, src, obj->dma_addr, obj->base.size);
+		if (!ret) {
+			ret = xa_err(xa_store(&dcp->fb_mirrors, index,
+					      xa_mk_value(obj->base.size), GFP_KERNEL));
+			if (ret)
+				iommu_unmap(dcp->fb_dom, obj->dma_addr, obj->base.size);
+		}
+		if (ret) {
+			dev_warn_ratelimited(dcp->dev,
+				"fbdma: %pad (%zu bytes, %s) not mirrored: %d\n",
+				&obj->dma_addr, obj->base.size,
+				obj->sgt ? "imported" : "native", ret);
+			return ret;
+		}
+	}
+	return 0;
+}
+
+/* @obj is being freed: the external pipe must not read its pages any more. */
+void dcp_fb_unmirror(struct platform_device *pdev, struct drm_gem_dma_object *obj)
+{
+	struct apple_dcp *dcp;
+	void *entry;
+
+	if (!pdev)
+		return;
+	dcp = platform_get_drvdata(pdev);
+	if (!dcp || !READ_ONCE(dcp->fb_dom))
+		return;
+	guard(mutex)(&dcp->fb_mirror_lock);
+	entry = xa_erase(&dcp->fb_mirrors, (unsigned long)obj);
+	if (entry && dcp->fb_dom)
+		iommu_unmap(dcp->fb_dom, obj->dma_addr, xa_to_value(entry));
+}
+EXPORT_SYMBOL_GPL(dcp_fb_unmirror);
 
 void dcp_retain_framebuffer(struct platform_device *pdev,
 			    struct dcp_fb_reference *entry)
@@ -7053,6 +7245,9 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 	if (ret)
 		return dev_err_probe(dev, ret,
 				     "Failed to create PIODMA iommu child device\n");
+	ret = dcp_create_fbdma_dev(dcp);
+	if (ret)
+		goto err_piodma;
 	if (!dcp->iommu_dom) {
 		ret = dev_err_probe(dev, -EPROBE_DEFER,
 				    "PIODMA iommu domain is unavailable\n");
@@ -8022,6 +8217,8 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 
 	INIT_LIST_HEAD(&dcp->swapped_out_fbs);
 	mutex_init(&dcp->swapped_out_fbs_lock);
+	xa_init(&dcp->fb_mirrors);
+	mutex_init(&dcp->fb_mirror_lock);
 	init_completion(&dcp->v27_wake_video);
 	init_completion(&dcp->v27_wake_hotplug);
 	ret = dcp_backlight_init(dcp, dev);
@@ -9593,11 +9790,28 @@ static int dcp_s2r_stop_crashed(struct apple_dcp *dcp)
 	return 0;
 }
 
+static void dcp_s2r_hdmi_irq_disable(struct apple_dcp *dcp)
+{
+	if (dcp->hdmi_hpd_irq && !dcp->s2r_hdmi_irq_disabled) {
+		disable_irq(dcp->hdmi_hpd_irq);
+		dcp->s2r_hdmi_irq_disabled = true;
+	}
+}
+
+static void dcp_s2r_hdmi_irq_enable(struct apple_dcp *dcp)
+{
+	if (dcp->hdmi_hpd_irq && dcp->s2r_hdmi_irq_disabled) {
+		dcp->s2r_hdmi_irq_disabled = false;
+		dcp_fabric_run_resume(&dcp_resume_ops, dcp);
+	}
+}
+
 static int dcp_s2r_ext_suspend(struct apple_dcp *dcp)
 {
 	int ret;
 
 	if (READ_ONCE(dcp->s2r_fw_down)) {
+		dcp_s2r_hdmi_irq_disable(dcp);
 		dcp_s2r_stop_failed_start(dcp);
 		dcp_s2r_find_darts(dcp);
 		dcp->s2r_stopped = true;
@@ -9612,9 +9826,15 @@ static int dcp_s2r_ext_suspend(struct apple_dcp *dcp)
 		return 0;
 	}
 
-	/* No A500 and no disconnect: the link and its crossbar output just go down. */
+	/*
+	 * No A500 and no disconnect: the link and its crossbar output just go down.
+	 * If dcp_s2r_stop_crashed() fails, it calls dcp_s2r_restart_failed_stop(),
+	 * which re-enables hdmi_hpd_irq on a clean restart or leaves it disabled
+	 * while the firmware stays crashed.
+	 */
 	if (dcp_s2r_stops_crashed(dcp)) {
 		dcp_disable_typec_work(dcp, false);
+		dcp_s2r_hdmi_irq_disable(dcp);
 		dcp_typec_route_park(dcp);
 		return dcp_s2r_stop_crashed(dcp);
 	}
@@ -9625,9 +9845,11 @@ static int dcp_s2r_ext_suspend(struct apple_dcp *dcp)
 		dev_dbg(dcp->dev, "a display is attached: released for the sleep, connected again after it\n");
 
 	dcp_disable_typec_work(dcp, false);
+	dcp_s2r_hdmi_irq_disable(dcp);
 	ret = dcp_external_disconnect(dcp, false);
 	if (ret) {
 		dcp_enable_typec_work(dcp);
+		dcp_s2r_hdmi_irq_enable(dcp);
 		return ret;
 	}
 
@@ -9637,6 +9859,7 @@ static int dcp_s2r_ext_suspend(struct apple_dcp *dcp)
 	if (iomfb_queue_settle(dcp, msecs_to_jiffies(500))) {
 		iomfb_pause_presentation(dcp, false);
 		dcp_enable_typec_work(dcp);
+		dcp_s2r_hdmi_irq_enable(dcp);
 		dev_err(dcp->dev, "display updates still pending, refusing sleep\n");
 		return -EBUSY;
 	}
@@ -9649,6 +9872,7 @@ static int dcp_s2r_ext_suspend(struct apple_dcp *dcp)
 		dev_err(dcp->dev, "no reply to A500: %d\n", ret);
 		WRITE_ONCE(dcp->crashed, true);
 		dcp_typec_route_unpark(dcp);
+		/* Keep typec work and hdmi_hpd_irq disabled while firmware is crashed. */
 		return ret == -ETIMEDOUT ? -EBUSY : ret;
 	}
 	usleep_range(4000, 5000);
@@ -9660,6 +9884,7 @@ static int dcp_s2r_ext_suspend(struct apple_dcp *dcp)
 			readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS));
 		WRITE_ONCE(dcp->crashed, true);
 		dcp_typec_route_unpark(dcp);
+		/* Keep typec work and hdmi_hpd_irq disabled while firmware is crashed. */
 		return ret == -ETIMEDOUT ? -EBUSY : ret;
 	}
 
@@ -10214,6 +10439,7 @@ static void dcp_s2r_restart_done(struct apple_dcp *dcp, int ret)
 		dcp_typec_route_unpark(dcp);
 	if (ret) {
 		WRITE_ONCE(dcp->crashed, true);
+		/* Firmware stays stopped/crashed, so hdmi_hpd_irq intentionally stays disabled. */
 		dev_warn(dcp->dev, "firmware stopped for sleep, display stays off until reboot\n");
 		return;
 	}
@@ -10223,6 +10449,20 @@ static void dcp_s2r_restart_done(struct apple_dcp *dcp, int ret)
 	iomfb_pause_presentation(dcp, false);
 	if (ext && !READ_ONCE(dcp->typec_work_enabled))
 		dcp_enable_typec_work(dcp);
+	if (ext && !dcp_is_typec_output(dcp) && dcp->hdmi_hpd &&
+	    !READ_ONCE(dcp->active_typec_route)) {
+		if (dcp->external_native) {
+			dcp_fabric_hdmi_reinit(dcp, "after deep sleep");
+		} else {
+			if (dcp->hdmi_pwren)
+				gpiod_set_value_cansleep(dcp->hdmi_pwren, 1);
+			if (dcp->dp2hdmi_pwren)
+				gpiod_set_value_cansleep(dcp->dp2hdmi_pwren, 1);
+		}
+		dcp_fixed_hdmi_reconnect(dcp, false);
+	}
+	if (ext)
+		dcp_s2r_hdmi_irq_enable(dcp);
 }
 
 /*

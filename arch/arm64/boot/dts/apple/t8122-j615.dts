@@ -220,3 +220,19 @@
 &port00 {
 	supports-clkreq;
 };
+
+/*
+ * The dcpext wiring is shared with the J613 (t8122-j613-j615.dtsi). fbdma is
+ * the display DART stream the dcpext scans framebuffers through, with the
+ * display subsystem's DVA window: on the J615 the gate must not add
+ * dispext0_dart to the display subsystem (apple,no-shared-display-dart), so
+ * appledrm mirrors framebuffers there instead.
+ */
+&dcpext {
+	apple,no-shared-display-dart;
+
+	fbdma {
+		iommus = <&dispext0_dart 0>;
+		apple,dma-range = /bits/ 64 <0x10000000000 0x1000000000>;
+	};
+};
