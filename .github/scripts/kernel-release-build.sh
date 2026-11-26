@@ -26,6 +26,13 @@ JOBS=${JOBS:-$(nproc)}
 export ARCH=arm64 LLVM=1
 export KBUILD_BUILD_USER=${KBUILD_BUILD_USER:-aurora} KBUILD_BUILD_HOST=${KBUILD_BUILD_HOST:-github}
 export KBUILD_BUILD_TIMESTAMP=${KBUILD_BUILD_TIMESTAMP:-$(git -C "$S" log -1 --format=%cD HEAD)}
+# Build number (uname -v '#N') and Arch pkgrel: the source commit's
+# committer time in Unix seconds, so every new main commit gets a higher
+# package version than the last one (pacman never upgrades between equal
+# versions) and a rebuild of the same commit gets the same one. Ten digits
+# keep UTS_VERSION within its 64 bytes.
+REVISION=${KBUILD_BUILD_VERSION:-$(git -C "$S" log -1 --format=%ct HEAD)}
+export KBUILD_BUILD_VERSION=$REVISION
 
 mk() { make -C "$S" O="$O" LOCALVERSION="$LV" -j"$JOBS" "$@"; }
 
@@ -81,6 +88,9 @@ ARCH_RUNTIME=
 echo "::group::pacman-pkg"
 if command -v makepkg >/dev/null; then
 	rm -f "$O"/*.pkg.tar.*
+	# make pacman-pkg takes pkgrel from scripts/build-version, which
+	# prints .version + 1.
+	echo $((REVISION - 1)) > "$O/.version"
 	# Debian/Ubuntu's makepkg.conf defaults to .pkg.tar.gz.
 	if PKGEXT=.pkg.tar.zst mk PACMAN_PKGBASE="$PKGBASE" PACMAN_EXTRAPACKAGES=headers \
 		MAKEPKGOPTS="--nodeps --noconfirm" pacman-pkg; then
