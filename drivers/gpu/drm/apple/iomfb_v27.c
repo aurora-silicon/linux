@@ -458,7 +458,7 @@ MODULE_PARM_DESC(v27_clock_request_entry, "DIAGNOSTIC (T6030): PTD entry for the
 /*
  * DIAGNOSTIC (T6030 sleep bring-up): macOS 27.2's D003 reply on J516S (lane A, three boots) also
  * carries a u32 at +0x14: the bandwidth scratch slot's offset in the DCP's PTD window (0x988 for
- * dcp0; 0x10990 and 0x10998 for dcpext0/1). Linux leaves it 0, and the DCP's request write at its
+ * dcp0; 0x10990 and 0x10998 for dcpext0/1), and the slot's size, 8, at +0x1c. Linux leaves both 0, and the DCP's request write at its
  * M3 power-down then lands on PTD entry 0, which the PMP traps.
  */
 static bool v27_rt_bw_request;
@@ -466,6 +466,7 @@ module_param(v27_rt_bw_request, bool, 0444);
 MODULE_PARM_DESC(v27_rt_bw_request, "DIAGNOSTIC (T6030): D003 reply +0x14 = the bandwidth scratch's offset in its window, as macOS");
 
 #define V27_RT_BW_REQUEST_OFF	0x14
+#define V27_RT_BW_REQUEST_SIZE	0x1c
 
 static bool trampoline_rt_bandwidth_h17p(struct apple_dcp *dcp, int tag,
 					 void *out, void *in)
@@ -485,6 +486,9 @@ static bool trampoline_rt_bandwidth_h17p(struct apple_dcp *dcp, int tag,
 		 header->out_len >= V27_RT_BW_REQUEST_OFF + sizeof(u32)) {
 		request_off = dcp->disp_bw_scratch_offset;
 		put_unaligned_le32(request_off, out + V27_RT_BW_REQUEST_OFF);
+		/* and the slot's size, 8, at +0x1c */
+		if (header->out_len >= V27_RT_BW_REQUEST_SIZE + sizeof(u32))
+			put_unaligned_le32(sizeof(u64), out + V27_RT_BW_REQUEST_SIZE);
 	}
 	dev_info(dcp->dev, "D003: in %u out %u, scratch %#llx, clock request %#llx, +0x14 %#x\n",
 		 header->in_len, header->out_len, scratch, clock_request, request_off);
