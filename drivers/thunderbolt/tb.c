@@ -82,7 +82,21 @@ MODULE_PARM_DESC(asym_threshold,
  * @dp_relink_delay: The debounce before that (ms), longer while it flaps
  * @dp_relinked_at: When the last such re-link was made
  * @dp_host_hold_shared: The next host DP tunnels are set up at HBR2 at
- *			 most: one re-linked at a higher rate did not come up
+ *			 most: one re-linked at a higher rate did not come up.
+ *			 Kept until a pairing pass may set them up
+ * @dp_relink_held: Pairing that needs a host DP tunnel's re-link waits for the
+ *		    display of that tunnel to read its DPRX (TB_DP_RELINK_HOLD);
+ *		    woken by tb_dp_relink_unhold(). Whether the re-link is
+ *		    still wanted is decided from the tunnels and adapters
+ *		    (tb_dp_relink_wanted()), not from this.
+ * @dp_relink_up_held: As @dp_relink_held, for the re-link of the one left
+ *		       alone at a higher rate
+ * @dp_relink_pairing: Pairing sets up what a re-link made room for, or
+ *		       what it tore down and did not set up again: it is
+ *		       part of that re-link and runs admitted
+ *		       (tb_dp_relink_enter())
+ * @dp_relink_admitted: Nesting of tb_dp_relink_enter() holding the system
+ *			sleep admission for a re-link (domain lock held)
  * @groups: Bandwidth groups used in this domain.
  */
 struct tb_cm {
@@ -107,6 +121,10 @@ struct tb_cm {
 	unsigned int dp_relink_delay;
 	unsigned long dp_relinked_at;
 	bool dp_host_hold_shared;
+	bool dp_relink_held;
+	bool dp_relink_up_held;
+	bool dp_relink_pairing;
+	unsigned int dp_relink_admitted;
 	struct tb_bandwidth_group groups[MAX_GROUPS];
 };
 
@@ -131,7 +149,17 @@ static void tb_dp_resource_unavailable(struct tb *tb, struct tb_port *port,
 static void tb_queue_dp_bandwidth_request(struct tb *tb, u64 route, u8 port,
 					  int retry, unsigned long delay);
 static void tb_dp_tunnel_active(struct tb_tunnel *tunnel, void *data);
+static void tb_dp_tunnel_awaits(struct tb_tunnel *tunnel, void *data);
 static void tb_queue_dp_tunnels(struct tb *tb);
+static void tb_dp_relink_unhold(struct tb *tb);
+static void tb_dp_relink_pair_again(struct tb *tb);
+static bool tb_dp_relink_wanted(struct tb_tunnel *tunnel);
+static bool tb_dp_relink_held_on(struct tb_tunnel *tunnel);
+static void tb_dp_relink_replay(struct tb *tb);
+static bool tb_dp_relink_enter(struct tb *tb);
+static void tb_dp_relink_exit(struct tb *tb);
+static struct tb_tunnel *tb_dp_host_relink(struct tb *tb, struct tb_tunnel *tunnel,
+					   u32 rate_limit, const char *why);
 
 static void tb_queue_hotplug(struct tb *tb, u64 route, u8 port, bool unplug)
 {
@@ -454,6 +482,8 @@ static void tb_switch_discover_tunnels(struct tb_switch *sw,
 		case TB_TYPE_DP_HDMI_IN:
 			tunnel = tb_tunnel_discover_dp(tb, port, alloc_hopids,
 						       tb_dp_tunnel_active, tb);
+			if (tunnel)
+				tunnel->await_callback = tb_dp_tunnel_awaits;
 			tb_increase_tmu_accuracy(tunnel);
 			break;
 
@@ -2052,12 +2082,39 @@ static struct tb_port *tb_find_dp_out(struct tb *tb, struct tb_port *in)
 	return NULL;
 }
 
+/*
+ * @tunnel failed to establish and no re-link of it is wanted. This means
+ * DPRX negotiation most likely did not complete which happens either
+ * because there is no graphics driver loaded or not all DP cables where
+ * connected to the discrete router. One set up at a higher rate when it
+ * was left alone is set up at HBR2 again, once, between the same adapters
+ * (tb_dp_host_relink(): kept by tb_dp_tunnel_active(), released and
+ * entered by tb_dp_relink_kept()); if that fails too, the next host DP
+ * tunnels are set up at HBR2 at most. Any other is torn down and its DP IN
+ * dropped. Domain lock held.
+ */
+static void tb_dp_tunnel_inactive(struct tb *tb, struct tb_tunnel *tunnel)
+{
+	struct tb_cm *tcm = tb_priv(tb);
+
+	if (tb_dp_relink_activation(tunnel->host_relinked_up, false) ==
+	    TB_DP_RELINK_NOW) {
+		tb_tunnel_warn(tunnel, "not active at the higher rate, setting it up again at up to %u Mb/s per lane\n",
+			       TB_DP_HOST_RATE_SHARED);
+		if (!tb_dp_host_relink(tb, tunnel, TB_DP_HOST_RATE_SHARED,
+				       "not active at the higher rate"))
+			tcm->dp_host_hold_shared = true;
+		return;
+	}
+	tb_tunnel_warn(tunnel, "not active, tearing down\n");
+	tb_dp_resource_unavailable(tb, tunnel->src_port, "DPRX negotiation failed");
+}
+
 static void tb_dp_tunnel_active(struct tb_tunnel *tunnel, void *data)
 {
 	struct tb_port *in = tunnel->src_port;
 	struct tb_port *out = tunnel->dst_port;
 	struct tb *tb = data;
-	struct tb_cm *tcm = tb_priv(tb);
 
 	mutex_lock(&tb->lock);
 
@@ -2068,6 +2125,7 @@ static void tb_dp_tunnel_active(struct tb_tunnel *tunnel, void *data)
 	 */
 	if (tunnel->dprx_canceled) {
 		tb_tunnel_dbg(tunnel, "DPRX read canceled, not activating\n");
+		tb_dp_relink_unhold(tb);
 		mutex_unlock(&tb->lock);
 		return;
 	}
@@ -2104,37 +2162,44 @@ static void tb_dp_tunnel_active(struct tb_tunnel *tunnel, void *data)
 			 */
 			tb_increase_tmu_accuracy(tunnel);
 		}
-	} else {
-		struct tb_port *in = tunnel->src_port;
-
+	} else if (tb_dp_relink_wanted(tunnel) || tunnel->host_relinked_up) {
 		/*
-		 * This tunnel failed to establish. This means DPRX
-		 * negotiation most likely did not complete which
-		 * happens either because there is no graphics driver
-		 * loaded or not all DP cables where connected to the
-		 * discrete router.
+		 * A re-link of it waited for this DPRX read (held, or
+		 * deferred for system sleep), or it was set up at a higher
+		 * rate and is to be set up at HBR2 again. It is kept,
+		 * listed, for pairing and the re-link work to make that
+		 * re-link, as for any other tunnel, once they have run on
+		 * the domain queue behind this DPRX work: then nothing but
+		 * the tunnel list holds its paths (tb_dp_relink_kept()),
+		 * and only once the re-link is entered (tb_dp_relink_enter()).
+		 * A wanted re-link comes first: a tunnel set up at a higher
+		 * rate that another display came for while its DPRX read
+		 * ran is re-linked to HBR2 on its own pair, before the
+		 * other display is paired.
 		 */
-		if (tb_dp_relink_activation(tunnel->host_relinked_up, false) ==
-		    TB_DP_RELINK_NOW) {
-			/*
-			 * Set up at a higher rate when it was left alone: set
-			 * it up at HBR2 again, once, from the domain queue
-			 * once this DPRX work has released its paths. The
-			 * adapters stay listed.
-			 */
-			tb_tunnel_warn(tunnel, "not active at the higher rate, setting it up again at up to %u Mb/s per lane\n",
-				       TB_DP_HOST_RATE_SHARED);
-			tb_deactivate_and_free_tunnel(tunnel);
-			tcm->dp_host_hold_shared = true;
-			tb_recalc_estimated_bandwidth(tb);
-			tb_queue_dp_tunnels(tb);
-		} else {
-			tb_tunnel_warn(tunnel, "not active, tearing down\n");
-			tb_dp_resource_unavailable(tb, in,
-						   "DPRX negotiation failed");
-		}
+		tb_tunnel_warn(tunnel, "not active, kept for its re-link\n");
+		tunnel->host_relink_kept = true;
+		tb_dp_relink_pair_again(tb);
+		tb_dp_relink_replay(tb);
+	} else {
+		tb_dp_tunnel_inactive(tb, tunnel);
 	}
+	/* A re-link held for this tunnel's display may go ahead now. */
+	tb_dp_relink_unhold(tb);
 	mutex_unlock(&tb->lock);
+}
+
+/*
+ * The DPRX work of @tunnel found the host waiting for a display pipeline for
+ * it. A re-link held for its display is decided again once the host has no
+ * attempt to hand it to a display under way either: then no display reads
+ * its DPRX. While one is, the attempt's result (a display reading the DPRX,
+ * or the next refusal) is awaited, with the DPRX deadline renewed.
+ */
+static void tb_dp_tunnel_awaits(struct tb_tunnel *tunnel, void *data)
+{
+	if (tb_dp_relink_held_on(tunnel) && tb_dp_tunnel_retirable(tunnel))
+		tb_dp_relink_unhold(data);
 }
 
 /*
@@ -2206,6 +2271,7 @@ static struct tb_tunnel *tb_tunnel_one_dp(struct tb *tb, struct tb_port *in,
 		goto err_reclaim_usb;
 	}
 	tunnel->host_rate_limit = rate_limit;
+	tunnel->await_callback = tb_dp_tunnel_awaits;
 
 	list_add_tail(&tunnel->list, &tcm->tunnel_list);
 
@@ -2469,6 +2535,39 @@ enum tb_dp_relink tb_dp_relink_activation(bool relinked_up, bool active)
 }
 
 /*
+ * A re-link @action decided for a host DP tunnel that a display may be
+ * reading its DPRX through (@dprx_pending, !tb_dp_tunnel_release_display()):
+ * HOLD instead of NOW. The display has been handed the tunnel's DP IN
+ * adapter, or is being handed it, and wakes it from its firmware's Activate
+ * call; a re-link replaces that adapter's tunnel under the call, which then
+ * finds the adapter taken back and the display's link never comes up. Held,
+ * the re-link is decided again once the tunnel's activation is over (DPRX
+ * done, timed out or given up) or the host waits for a display pipeline for
+ * it again (tb_dp_relink_unhold()), and the display sees a plain unplug and
+ * plug. Other actions are kept.
+ */
+enum tb_dp_relink tb_dp_relink_settle(enum tb_dp_relink action, bool dprx_pending)
+{
+	return action == TB_DP_RELINK_NOW && dprx_pending ? TB_DP_RELINK_HOLD : action;
+}
+
+/*
+ * tb_dp_relink_settle() for @tunnel. NOW for a tunnel whose host waits for a
+ * display pipeline has its display handoff retired already
+ * (tb_dp_tunnel_release_display()): the caller re-links it at once.
+ */
+static enum tb_dp_relink tb_dp_relink_settle_tunnel(struct tb_tunnel *tunnel,
+						    enum tb_dp_relink action)
+{
+	if (action != TB_DP_RELINK_NOW)
+		return action;
+	/* Kept at its DPRX timeout, not released: its DPRX work may hold it. */
+	if (tunnel->host_relink_kept && tb_dp_tunnel_dprx_pending(tunnel))
+		return TB_DP_RELINK_HOLD;
+	return tb_dp_relink_settle(action, !tb_dp_tunnel_release_display(tunnel));
+}
+
+/*
  * TB_HOST_DP_SHARED_RATE: another host DP tunnel is wanted while @tunnel,
  * marked by tb_dp_host_tunnel_gone(), waits for its re-link at a higher
  * rate. The re-link is dropped and @tunnel stays capped at HBR2, the rate
@@ -2536,6 +2635,81 @@ static unsigned int tb_dp_host_free_pairs(struct tb *tb)
 	return min(ins, outs);
 }
 
+/*
+ * TB_HOST_DP_SHARED_RATE: a re-link of @tunnel, a host DP tunnel, is wanted
+ * and has not been made: to HBR2 for another host DP tunnel that can be
+ * paired now (tb_dp_relink_down()), or, the one left alone and marked by
+ * tb_dp_host_tunnel_gone(), to a higher rate with the debounce over
+ * (tb_dp_relink_up()). Held for its DPRX read, deferred for system sleep,
+ * or a pass still queued. Decided from the tunnels and adapters as they
+ * are, as pairing and the re-link work decide it. Domain lock held.
+ */
+static bool tb_dp_relink_wanted(struct tb_tunnel *tunnel)
+{
+	struct tb *tb = tunnel->tb;
+	struct tb_cm *tcm = tb_priv(tb);
+	unsigned int up, pairs;
+
+	if (!tb_dp_host_shares_rate(tb) || !tb_tunnel_is_host_dp(tunnel))
+		return false;
+	up = tb_dp_host_tunnels(tb, NULL);
+	pairs = tb_dp_host_free_pairs(tb);
+	return tb_dp_relink_down(tunnel->host_rate, up + pairs, false) != TB_DP_RELINK_NONE ||
+	       tb_dp_relink_up(tunnel->host_relink, up, tunnel->host_rate,
+			       tunnel->host_max_rate, pairs > 0, false, jiffies,
+			       tcm->dp_relink_due) == TB_DP_RELINK_NOW;
+}
+
+/*
+ * TB_HOST_DP_SHARED_RATE: the host DP tunnels kept by tb_dp_tunnel_active()
+ * when their DPRX read timed out while a re-link of them was wanted. Until
+ * the pairing or re-link work releases one (@release), from the domain
+ * queue and so behind its DPRX work, that work may still hold the tunnel
+ * and its paths, and its re-link is held (tb_dp_relink_settle_tunnel()).
+ * Released, its DPRX read is ended, and pairing and the re-link work make
+ * the re-link as for any tunnel whose DPRX read is over, under the same
+ * admission. One released whose re-link is not wanted any more is handled
+ * as any tunnel whose DPRX read timed out (tb_dp_tunnel_inactive()): set up
+ * at HBR2 again after a re-link up, torn down otherwise. That is a re-link
+ * too, entered here; during a system sleep transition the tunnel stays
+ * kept, listed with its adapters, until the re-link work does it. A
+ * teardown has its DP OUT paired again by a pass that is part of it
+ * (@dp_relink_pairing). Domain lock held.
+ */
+static void tb_dp_relink_kept(struct tb *tb, bool release)
+{
+	struct tb_cm *tcm = tb_priv(tb);
+	struct tb_tunnel *tunnel, *n;
+
+	list_for_each_entry_safe(tunnel, n, &tcm->tunnel_list, list) {
+		if (!tunnel->host_relink_kept)
+			continue;
+		if (release)
+			tb_dp_tunnel_cancel_dprx(tunnel);
+		else if (tb_dp_tunnel_dprx_pending(tunnel))
+			continue;
+		if (tb_dp_relink_wanted(tunnel))
+			continue;
+		if (!tb_dp_relink_enter(tb))
+			continue;
+		if (!tunnel->host_relinked_up)
+			tcm->dp_relink_pairing = true;
+		tb_dp_tunnel_inactive(tb, tunnel);
+		tb_dp_relink_exit(tb);
+	}
+}
+
+/* A re-link of @tunnel is held for its display (TB_DP_RELINK_HOLD). */
+static bool tb_dp_relink_held_on(struct tb_tunnel *tunnel)
+{
+	struct tb_cm *tcm = tb_priv(tunnel->tb);
+
+	if (!tb_tunnel_is_host_dp(tunnel))
+		return false;
+	return (tcm->dp_relink_held && tunnel->host_rate > TB_DP_HOST_RATE_SHARED) ||
+	       (tcm->dp_relink_up_held && tunnel->host_relink);
+}
+
 /* A new DP tunnel comes: none is re-linked to a higher rate any more. */
 static void tb_dp_host_clear_relink(struct tb *tb)
 {
@@ -2593,12 +2767,58 @@ static void tb_dp_relink_arm(struct tb *tb, unsigned int delay_ms)
 }
 
 /*
+ * TB_HOST_DP_SHARED_RATE: the one way into a re-link. Every DP tunnel the
+ * re-link machinery tears down and every one it sets up goes through here
+ * first, and is torn down or set up only between this returning true and
+ * tb_dp_relink_exit():
+ *  - the re-link to HBR2 for another tunnel (tb_dp_host_rate_limit());
+ *  - the re-link of the one left alone to a higher rate
+ *    (tb_dp_host_relink_up());
+ *  - a tunnel kept at its DPRX timeout whose re-link is not wanted any
+ *    more: the HBR2 fallback of a re-link up, or its teardown
+ *    (tb_dp_relink_kept());
+ *  - the pairing pass that sets up what one of those made room for, or
+ *    tore down and could not set up again (@dp_relink_pairing,
+ *    tb_dp_host_rate_limit() for tb_tunnel_dp()).
+ * True: no system sleep transition is in progress, and none starts until
+ * tb_dp_relink_exit() (tb_dp_relink_admit()). False: one is; nothing is
+ * torn down or set up, and the work stays recorded where it is (pairing
+ * deferred, @dp_relink_pairing, a kept tunnel, a re-link up mark). The
+ * re-link work, armed here, waits for the transition to end and does that
+ * work from the domain queue then (tb_dp_relink_run()); thaw, resume and
+ * complete arm it again (tb_dp_relink_replay()). Nests. Domain lock held.
+ */
+static bool tb_dp_relink_enter(struct tb *tb)
+{
+	struct tb_cm *tcm = tb_priv(tb);
+
+	lockdep_assert_held(&tb->lock);
+	if (!tcm->dp_relink_admitted && !tb_dp_relink_admit()) {
+		tb_dp_relink_arm(tb, 0);
+		return false;
+	}
+	tcm->dp_relink_admitted++;
+	return true;
+}
+
+static void tb_dp_relink_exit(struct tb *tb)
+{
+	struct tb_cm *tcm = tb_priv(tb);
+
+	lockdep_assert_held(&tb->lock);
+	if (!--tcm->dp_relink_admitted)
+		tb_dp_relink_done();
+}
+
+/*
  * Tear @tunnel down and set it up again between the same adapters, at
  * @rate_limit (Mb/s per lane) at most, because of @why. Its display sees an
  * unplug and a plug. Only on the domain queue, so that the DPRX work of
  * @tunnel is not running (the queue is ordered) and releases its paths when
- * canceled; with the domain lock held and the re-link admitted
- * (tb_dp_relink_admit()). The new tunnel, NULL if there is none.
+ * canceled; with the domain lock held and the re-link entered
+ * (tb_dp_relink_enter()). If it is not set up again, the pairing pass that
+ * tries again is part of the re-link (@dp_relink_pairing). The new tunnel,
+ * NULL if there is none.
  */
 static struct tb_tunnel *tb_dp_host_relink(struct tb *tb, struct tb_tunnel *tunnel,
 					   u32 rate_limit, const char *why)
@@ -2608,6 +2828,8 @@ static struct tb_tunnel *tb_dp_host_relink(struct tb *tb, struct tb_tunnel *tunn
 	struct tb_port *in = tunnel->src_port;
 	struct tb_port *out = tunnel->dst_port;
 
+	if (WARN_ON(!tcm->dp_relink_admitted))
+		return NULL;
 	tb_tunnel_info(tunnel, "%s: re-linking at up to %u Mb/s per lane (was %u)\n",
 		       why, rate_limit, tunnel->host_rate);
 	tb_deactivate_and_free_tunnel(tunnel);
@@ -2627,6 +2849,7 @@ static struct tb_tunnel *tb_dp_host_relink(struct tb *tb, struct tb_tunnel *tunn
 	}
 	/* The adapters stay listed: pairing tries again, at the next event too. */
 	tb_port_warn(in, "DP tunnel not set up again, pairing again\n");
+	tcm->dp_relink_pairing = true;
 	tb_queue_dp_tunnels(tb);
 	return NULL;
 }
@@ -2639,19 +2862,29 @@ static struct tb_tunnel *tb_dp_host_relink(struct tb *tb, struct tb_tunnel *tunn
  * the same adapters, so that the streams of the PHY share one rate. Not
  * while system sleep is in progress: then 0, and the host router's DP IN
  * adapters are paired once it is over (dp_relink_work), or at the next
- * resume or thaw. 0 without the policy. Domain lock held.
+ * resume or thaw. 0 without the policy. A pass that pairs what a re-link
+ * made room for or could not set up again is part of that re-link
+ * (@dp_relink_pairing): it is entered here, and @relinking set for the
+ * caller to exit it (tb_dp_relink_exit()) after its last setup; or, during
+ * a transition, it is 0 too, and the HBR2 cap (@dp_host_hold_shared) is
+ * kept for the pass that pairs them then. Domain lock held.
  */
-VISIBLE_IF_KUNIT u32 tb_dp_host_rate_limit(struct tb *tb)
+VISIBLE_IF_KUNIT u32 tb_dp_host_rate_limit(struct tb *tb, bool *relinking)
 {
 	struct tb_cm *tcm = tb_priv(tb);
 	struct tb_tunnel *tunnel, *above;
-	bool admitted, recovering = false;
+	bool admitted, held, recovering = false;
 	enum tb_dp_relink action;
 	unsigned int up, want;
 	unsigned long calm;
 
+	*relinking = false;
 	if (!tb_dp_host_shares_rate(tb))
 		return 0;
+	/* Decided again now: held below only if still needed. */
+	held = tcm->dp_relink_held;
+	tcm->dp_relink_held = false;
+	tb_dp_relink_kept(tb, false);
 	up = tb_dp_host_tunnels(tb, NULL);
 	want = up + tb_dp_host_free_pairs(tb);
 	/*
@@ -2661,7 +2894,6 @@ VISIBLE_IF_KUNIT u32 tb_dp_host_rate_limit(struct tb *tb)
 	if (want > up) {
 		tb_dp_host_cancel_relink_up(tb);
 		recovering = tcm->dp_host_hold_shared;
-		tcm->dp_host_hold_shared = false;
 	}
 
 	/* Each round sets one tunnel up again at HBR2 at most. */
@@ -2677,8 +2909,18 @@ VISIBLE_IF_KUNIT u32 tb_dp_host_rate_limit(struct tb *tb)
 		if (!above)
 			break;
 
-		admitted = tb_dp_relink_admit();
-		action = tb_dp_relink_down(above->host_rate, want, !admitted);
+		/*
+		 * Not while system sleep is in progress: then WAIT. Not
+		 * wanted any more: pairing deferred for it, if any, is over
+		 * once no transition is in progress.
+		 */
+		action = tb_dp_relink_down(above->host_rate, want, false);
+		admitted = action == TB_DP_RELINK_NOW && tb_dp_relink_enter(tb);
+		if (action == TB_DP_RELINK_NOW && !admitted)
+			action = TB_DP_RELINK_WAIT;
+		else if (action == TB_DP_RELINK_NONE && tb_dp_pm_open())
+			tcm->dp_relink_deferred = false;
+		action = tb_dp_relink_settle_tunnel(above, action);
 		if (action == TB_DP_RELINK_NOW) {
 			/* Soon after a re-link up: back off the next one. */
 			calm = tcm->dp_relinked_at + msecs_to_jiffies(TB_DP_RELINK_CALM_MS);
@@ -2686,24 +2928,45 @@ VISIBLE_IF_KUNIT u32 tb_dp_host_rate_limit(struct tb *tb)
 								    time_before(jiffies, calm));
 			tb_dp_host_relink(tb, above, TB_DP_HOST_RATE_SHARED,
 					  "another DP tunnel is wanted");
+			/* Pairing what it made room for is part of it. */
+			tcm->dp_relink_pairing = true;
 		}
 		if (admitted) {
-			tb_dp_relink_done();
+			tb_dp_relink_exit(tb);
 			tcm->dp_relink_deferred = false;
 		}
 		if (action == TB_DP_RELINK_NONE)
 			break;
+		if (action == TB_DP_RELINK_HOLD) {
+			if (!held)
+				tb_tunnel_info(above, "another DP tunnel is wanted: re-linking once its display has read its DPRX\n");
+			/* Decided again from tb_dp_relink_unhold(). */
+			tcm->dp_relink_held = true;
+			return 0;
+		}
 		if (action == TB_DP_RELINK_WAIT) {
 			if (!tcm->dp_relink_deferred)
 				tb_tunnel_info(above, "another DP tunnel is wanted during system sleep, re-linking after it\n");
 			/* Replayed by dp_relink_work, and at resume or thaw. */
 			tcm->dp_relink_deferred = true;
 			tcm->dp_tunnel_pending = true;
-			tcm->dp_host_hold_shared |= recovering;
 			tb_dp_relink_arm(tb, 0);
 			return 0;
 		}
 	}
+	/*
+	 * This pass pairs what a re-link made room for or could not set up
+	 * again: entered through its last setup, or not at all, the HBR2 cap
+	 * kept for the pass that pairs them once the re-link work runs.
+	 */
+	if (tcm->dp_relink_pairing) {
+		if (!tb_dp_relink_enter(tb))
+			return 0;
+		tcm->dp_relink_pairing = false;
+		*relinking = true;
+	}
+	if (recovering)
+		tcm->dp_host_hold_shared = false;
 	return tb_dp_host_rate_after(want, recovering);
 }
 
@@ -2763,14 +3026,20 @@ static void tb_dp_host_relink_up(struct tb *tb)
 	bool admitted;
 	long left;
 
+	/* Decided again now: held below only if still needed. */
+	tcm->dp_relink_up_held = false;
 	if (!tb_dp_host_relink_marked(tb))
 		return;
 	up = tb_dp_host_tunnels(tb, &tunnel);
 
-	admitted = tb_dp_relink_admit();
 	action = tb_dp_relink_up(tunnel->host_relink, up, tunnel->host_rate,
 				 tunnel->host_max_rate, tb_dp_host_free_pairs(tb) > 0,
-				 !admitted, jiffies, tcm->dp_relink_due);
+				 false, jiffies, tcm->dp_relink_due);
+	/* Not while system sleep is in progress: then WAIT. */
+	admitted = action == TB_DP_RELINK_NOW && tb_dp_relink_enter(tb);
+	if (action == TB_DP_RELINK_NOW && !admitted)
+		action = TB_DP_RELINK_WAIT;
+	action = tb_dp_relink_settle_tunnel(tunnel, action);
 	switch (action) {
 	case TB_DP_RELINK_NONE:
 		tb_dbg(tb, "DP tunnel re-link to a higher rate not needed any more\n");
@@ -2789,25 +3058,86 @@ static void tb_dp_host_relink_up(struct tb *tb)
 		if (relinked && relinked->host_rate_limit > TB_DP_HOST_RATE_SHARED)
 			relinked->host_relinked_up = true;
 		break;
+	case TB_DP_RELINK_HOLD:
+		/* Decided again from tb_dp_relink_unhold(), the debounce kept. */
+		tb_tunnel_dbg(tunnel, "re-link to a higher rate once its display has read its DPRX\n");
+		tcm->dp_relink_up_held = true;
+		break;
 	}
 	if (admitted)
-		tb_dp_relink_done();
+		tb_dp_relink_exit(tb);
 }
 
-/* Replays a re-link that waited, at resume and runtime resume. Domain lock held. */
+/* A host DP tunnel is kept for its re-link (tb_dp_relink_kept()). */
+static bool tb_dp_host_relink_kept(struct tb *tb)
+{
+	struct tb_cm *tcm = tb_priv(tb);
+	struct tb_tunnel *tunnel;
+
+	list_for_each_entry(tunnel, &tcm->tunnel_list, list)
+		if (tunnel->host_relink_kept)
+			return true;
+	return false;
+}
+
+/*
+ * Replays a re-link that waited (any work tb_dp_relink_enter() left
+ * recorded), at resume and runtime resume. Domain lock held.
+ */
 static void tb_dp_relink_replay(struct tb *tb)
 {
 	struct tb_cm *tcm = tb_priv(tb);
 
-	if (tcm->dp_relink_deferred || tb_dp_host_relink_marked(tb))
+	if (tcm->dp_relink_deferred || tcm->dp_relink_pairing ||
+	    tb_dp_host_relink_marked(tb) || tb_dp_host_relink_kept(tb))
 		tb_dp_relink_arm(tb, 0);
+}
+
+/*
+ * Pairing runs again from the domain queue, behind the DPRX work that asks
+ * for it, so that a tunnel torn down there has released its paths. The
+ * request is recorded even while hotplug is stopped for system sleep
+ * (tb_freeze_noirq()), for thaw, resume and complete to replay; not once
+ * the domain is stopping. Domain lock held.
+ */
+static void tb_dp_relink_pair_again(struct tb *tb)
+{
+	struct tb_cm *tcm = tb_priv(tb);
+
+	lockdep_assert_held(&tb->lock);
+	if (!tcm->stopping)
+		tcm->dp_tunnel_pending = true;
+	tb_queue_dp_tunnels(tb);
+}
+
+/*
+ * A host DP tunnel's activation is over (its DPRX read done, timed out or
+ * given up), or the host waits for a display pipeline for it with no
+ * attempt to hand it to a display under way: no display reads its DPRX.
+ * The re-links held for one (TB_DP_RELINK_HOLD) are decided again, by
+ * pairing (tb_dp_relink_pair_again()) and by the re-link work. Domain lock
+ * held.
+ */
+static void tb_dp_relink_unhold(struct tb *tb)
+{
+	struct tb_cm *tcm = tb_priv(tb);
+
+	lockdep_assert_held(&tb->lock);
+	if (tcm->dp_relink_held) {
+		tcm->dp_relink_held = false;
+		tb_dp_relink_pair_again(tb);
+	}
+	if (tcm->dp_relink_up_held) {
+		tcm->dp_relink_up_held = false;
+		tb_dp_relink_replay(tb);
+	}
 }
 
 static void tb_tunnel_dp(struct tb *tb)
 {
 	struct tb_cm *tcm = tb_priv(tb);
 	struct tb_port *port, *in, *out;
-	bool host_waits;
+	bool host_waits, relinking;
 	u32 rate_limit;
 
 	if (!tb_acpi_may_tunnel_dp()) {
@@ -2815,8 +3145,12 @@ static void tb_tunnel_dp(struct tb *tb)
 		return;
 	}
 
-	/* Under TB_HOST_DP_SHARED_RATE: may set a tunnel up again first. */
-	rate_limit = tb_dp_host_rate_limit(tb);
+	/*
+	 * Under TB_HOST_DP_SHARED_RATE: may set a tunnel up again first. A
+	 * pass that is part of a re-link (@relinking) holds its admission
+	 * through its last setup.
+	 */
+	rate_limit = tb_dp_host_rate_limit(tb, &relinking);
 	host_waits = tb_dp_host_shares_rate(tb) && !rate_limit;
 
 	/*
@@ -2840,7 +3174,7 @@ static void tb_tunnel_dp(struct tb *tb)
 		tb_port_dbg(in, "DP IN available\n");
 
 		if (host_waits && tb_port_is_apple_host_dpin(in)) {
-			tb_port_dbg(in, "waiting for system sleep to end\n");
+			tb_port_dbg(in, "waiting for a DP tunnel re-link\n");
 			continue;
 		}
 
@@ -2853,6 +3187,8 @@ static void tb_tunnel_dp(struct tb *tb)
 
 	if (!in)
 		tb_dbg(tb, "no suitable DP IN adapter available, not tunneling\n");
+	if (relinking)
+		tb_dp_relink_exit(tb);
 }
 
 static void tb_enter_redrive(struct tb_port *port)
@@ -2953,6 +3289,7 @@ static void tb_dp_tunnel_work(struct work_struct *work)
 	mutex_lock(&tb->lock);
 	if (tcm->hotplug_active && tb->root_switch) {
 		tcm->dp_tunnel_pending = false;
+		tb_dp_relink_kept(tb, true);
 		tb_tunnel_dp(tb);
 	}
 	mutex_unlock(&tb->lock);
@@ -3018,7 +3355,9 @@ static void tb_dp_relink_run(struct work_struct *work)
 		goto unlock;
 	}
 	tcm->dp_relink_tries = 0;
-	if (tcm->hotplug_active && tcm->dp_relink_deferred) {
+	if (tcm->hotplug_active)
+		tb_dp_relink_kept(tb, true);
+	if (tcm->hotplug_active && (tcm->dp_relink_deferred || tcm->dp_relink_pairing)) {
 		tb_dbg(tb, "system sleep over, pairing DP resources\n");
 		tcm->dp_tunnel_pending = false;
 		/* Checks the gate again, and defers again if it is closed. */
@@ -4561,6 +4900,43 @@ void tb_test_cm_set_relink_deferred(struct tb *tb, bool deferred)
 	struct tb_cm *tcm = tb_priv(tb);
 
 	tcm->dp_relink_deferred = deferred;
+}
+
+/* Pairing waits for a display to read its DPRX (TB_DP_RELINK_HOLD). */
+bool tb_test_cm_relink_held(struct tb *tb)
+{
+	struct tb_cm *tcm = tb_priv(tb);
+
+	return tcm->dp_relink_held;
+}
+
+/* A pairing request is recorded for the next pass, thaw or resume. */
+bool tb_test_cm_dp_pending(struct tb *tb)
+{
+	struct tb_cm *tcm = tb_priv(tb);
+
+	return tcm->dp_tunnel_pending;
+}
+
+/*
+ * Hotplug handling running (@active), or the domain stopping (@stopping),
+ * with no pairing request recorded.
+ */
+void tb_test_cm_set_state(struct tb *tb, bool active, bool stopping)
+{
+	struct tb_cm *tcm = tb_priv(tb);
+
+	tcm->hotplug_active = active;
+	tcm->stopping = stopping;
+	tcm->dp_tunnel_pending = false;
+}
+
+/* The connection manager's DPRX callbacks for a DP tunnel the test set up. */
+void tb_test_cm_dp_callbacks(struct tb_tunnel *tunnel)
+{
+	tunnel->callback = tb_dp_tunnel_active;
+	tunnel->await_callback = tb_dp_tunnel_awaits;
+	tunnel->callback_data = tunnel->tb;
 }
 
 /* The re-link work's timer is armed. */
