@@ -736,6 +736,8 @@ static inline int tb_port_write(struct tb_port *port, const void *buffer,
 #define tb_err(tb, fmt, arg...) dev_err((tb)->nhi->dev, fmt, ## arg)
 #define tb_WARN(tb, fmt, arg...) dev_WARN((tb)->nhi->dev, fmt, ## arg)
 #define tb_warn(tb, fmt, arg...) dev_warn((tb)->nhi->dev, fmt, ## arg)
+#define tb_warn_ratelimited(tb, fmt, arg...) \
+	dev_warn_ratelimited((tb)->nhi->dev, fmt, ## arg)
 #define tb_info(tb, fmt, arg...) dev_info((tb)->nhi->dev, fmt, ## arg)
 #define tb_dbg(tb, fmt, arg...) dev_dbg((tb)->nhi->dev, fmt, ## arg)
 
@@ -760,6 +762,8 @@ static inline int tb_port_write(struct tb_port *port, const void *buffer,
 	__TB_PORT_PRINT(tb_WARN, port, fmt, ##arg)
 #define tb_port_warn(port, fmt, arg...) \
 	__TB_PORT_PRINT(tb_warn, port, fmt, ##arg)
+#define tb_port_warn_ratelimited(port, fmt, arg...) \
+	__TB_PORT_PRINT(tb_warn_ratelimited, port, fmt, ##arg)
 #define tb_port_info(port, fmt, arg...) \
 	__TB_PORT_PRINT(tb_info, port, fmt, ##arg)
 #define tb_port_dbg(port, fmt, arg...) \

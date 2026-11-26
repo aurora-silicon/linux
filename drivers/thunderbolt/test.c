@@ -4920,6 +4920,104 @@ static void tb_test_xdp_properties_progress(struct kunit *test)
 	kfree(block);
 }
 
+/* A router whose hop entries all go out of the adapters listed, one per read. */
+struct tb_test_hops {
+	unsigned int reads;
+	u8 out_port[2];
+};
+
+static int tb_test_hops_cfg_read(struct tb_ctl *ctl, void *buffer, u64 route, u32 port,
+				 enum tb_cfg_space space, u32 offset, u32 length)
+{
+	struct tb_test_hops *hops = kunit_get_current_test()->priv;
+	struct tb_regs_hop hop = { .enable = true, .next_hop = 8 };
+	unsigned int n = min_t(unsigned int, hops->reads++, ARRAY_SIZE(hops->out_port) - 1);
+
+	if (space != TB_CFG_HOPS || length * 4 > sizeof(hop))
+		return -EIO;
+	hop.out_port = hops->out_port[n];
+	memcpy(buffer, &hop, length * 4);
+	return 0;
+}
+
+static struct tb_test_hops *tb_test_hops_alloc(struct kunit *test, struct tb_switch **host)
+{
+	struct tb_test_hops *hops;
+	struct tb_nhi *nhi;
+	struct tb *tb;
+
+	hops = kunit_kzalloc(test, sizeof(*hops), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, hops);
+	nhi = kunit_kzalloc(test, sizeof(*nhi), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, nhi);
+	tb = kunit_kzalloc(test, sizeof(*tb), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, tb);
+	*host = alloc_host(test);
+	KUNIT_ASSERT_NOT_NULL(test, *host);
+	tb->nhi = nhi;
+	(*host)->tb = tb;
+
+	test->priv = hops;
+	kunit_activate_static_stub(test, tb_cfg_read, tb_test_hops_cfg_read);
+	return hops;
+}
+
+static void tb_test_hops_set(struct tb_test_hops *hops, u8 first, u8 again)
+{
+	hops->reads = 0;
+	hops->out_port[0] = first;
+	hops->out_port[1] = again;
+}
+
+/*
+ * Path discovery follows the adapters the routers report in their hop
+ * entries, and stops at one the router does not have.
+ */
+static void tb_test_path_discover_out_port(struct kunit *test)
+{
+	struct tb_switch *host;
+	struct tb_test_hops *hops = tb_test_hops_alloc(test, &host);
+	struct tb_port *in = &host->ports[5], *lane = &host->ports[1];
+	u8 last_port = host->config.max_port_number;
+	struct tb_port *last = NULL;
+	struct tb_path *path;
+
+	/* DP IN HopID 8 out of lane adapter 1, where the path ends */
+	tb_test_hops_set(hops, 1, 1);
+	path = tb_path_discover(in, 8, NULL, -1, &last, "Video", true);
+	KUNIT_ASSERT_NOT_NULL(test, path);
+	KUNIT_EXPECT_EQ(test, path->path_length, 1);
+	KUNIT_EXPECT_PTR_EQ(test, path->hops[0].out_port, lane);
+	KUNIT_EXPECT_PTR_EQ(test, last, lane);
+	tb_path_free(path);
+
+	/* An adapter past the router's last one, and the largest the entry holds */
+	tb_test_hops_set(hops, last_port + 1, last_port + 1);
+	KUNIT_EXPECT_NULL(test, tb_path_discover(in, 8, NULL, -1, NULL, "Video", true));
+	tb_test_hops_set(hops, 63, 63);
+	KUNIT_EXPECT_NULL(test, tb_path_discover(in, 8, NULL, -1, NULL, "Video", true));
+
+	/* Valid while the hops are counted, not when they are read again */
+	tb_test_hops_set(hops, 1, last_port + 1);
+	KUNIT_EXPECT_NULL(test, tb_path_discover(in, 8, NULL, -1, NULL, "Video", true));
+	KUNIT_EXPECT_EQ(test, hops->reads, 2U);
+
+	/* Looking for the source HopID of a path that ends on the lane adapter */
+	tb_test_hops_set(hops, last_port + 1, last_port + 1);
+	KUNIT_EXPECT_NULL(test, tb_path_discover(in, -1, lane, 8, NULL, "Video", false));
+	tb_test_hops_set(hops, 1, 1);
+	path = tb_path_discover(in, -1, lane, 8, NULL, "Video", false);
+	KUNIT_ASSERT_NOT_NULL(test, path);
+	KUNIT_EXPECT_EQ(test, path->hops[0].in_hop_index, 8);
+	tb_path_free(path);
+
+	/* No HopID is left allocated by the refused paths */
+	KUNIT_EXPECT_EQ(test, tb_port_alloc_in_hopid(in, 8, 8), 8);
+	tb_port_release_in_hopid(in, 8);
+	KUNIT_EXPECT_EQ(test, tb_port_alloc_out_hopid(lane, 8, 8), 8);
+	tb_port_release_out_hopid(lane, 8);
+}
+
 static struct kunit_case tb_test_cases[] = {
 	KUNIT_CASE(tb_test_apple_right_dpin_wiring),
 	KUNIT_CASE(tb_test_dp_reduce_bandwidth_shared),
@@ -4999,6 +5097,7 @@ static struct kunit_case tb_test_cases[] = {
 	KUNIT_CASE(tb_test_drom_header_size),
 	KUNIT_CASE(tb_test_dp_bandwidth_request_port),
 	KUNIT_CASE(tb_test_xdp_properties_progress),
+	KUNIT_CASE(tb_test_path_discover_out_port),
 	{ }
 };
 
