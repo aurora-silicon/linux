@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* Copyright 2026 Ryan Murray */
 
+#include <linux/bitops.h>
 #include <linux/errno.h>
 #include <linux/unaligned.h>
 #include <drm/display/drm_dp.h>
@@ -59,6 +60,16 @@ static int tx_revocation(struct dcp_hdcp_tx *tx, u8 *ids, unsigned int count)
 	return ret;
 }
 
+/* Twenty ones and twenty zeros, as every HDCP Receiver ID. */
+static bool dcp_hdcp_receiver_id_valid(const u8 *id)
+{
+	unsigned int i, ones = 0;
+
+	for (i = 0; i < HDCP_2_2_RECEIVER_ID_LEN; i++)
+		ones += hweight8(id[i]);
+	return ones == 20;
+}
+
 int dcp_hdcp_capable(struct dcp_hdcp_tx *tx)
 {
 	int ret = TX_READ(tx, DP_HDCP_2_2_REG_RX_CAPS_OFFSET, tx->rxcaps,
@@ -94,9 +105,16 @@ static int tx_ake(struct dcp_hdcp_tx *tx, bool *stored)
 	if (ret)
 		return ret;
 
-	/* AKE_Send_Cert */
+	/* AKE_Send_Cert: the receiver has 100 ms to make it readable. */
+	tx->step = "wait for AKE_Send_Cert";
+	tx->ops->sleep(tx->ctx, HDCP_2_2_CERT_TIMEOUT_MS);
 	ret = TX_READ(tx, DP_HDCP_2_2_REG_CERT_RX_OFFSET, &tx->cert,
 		      sizeof(tx->cert));
+	/* A Receiver ID has twenty ones and twenty zeros; anything else is a bad read. */
+	if (!ret && !dcp_hdcp_receiver_id_valid(tx->cert.receiver_id)) {
+		tx->step = "check Receiver ID";
+		ret = -EPROTO;
+	}
 	if (!ret)
 		ret = TX_READ(tx, DP_HDCP_2_2_REG_RRX_OFFSET, tx->rrx,
 			      sizeof(tx->rrx));

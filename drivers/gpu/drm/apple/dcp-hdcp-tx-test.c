@@ -314,8 +314,9 @@ static void tx_stored_km_type0(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, reported(f, DCP_HDCP_PROGRESS_H_VERIFIED));
 	KUNIT_EXPECT_EQ(test, f->reports[f->nreports - 1],
 			DCP_HDCP_PROGRESS_ENCRYPTED);
-	/* L' after 16 ms, encryption 200 ms after the keys. */
-	KUNIT_EXPECT_EQ(test, f->slept_ms, HDCP_2_2_DP_LPRIME_TIMEOUT_MS +
+	/* The cert after 100 ms, L' after 16 ms, encryption 200 ms after the keys. */
+	KUNIT_EXPECT_EQ(test, f->slept_ms, HDCP_2_2_CERT_TIMEOUT_MS +
+			HDCP_2_2_DP_LPRIME_TIMEOUT_MS +
 			HDCP_2_2_DELAY_BEFORE_ENCRYPTION_EN);
 	KUNIT_EXPECT_TRUE(test, f->encryption);
 	KUNIT_EXPECT_FALSE(test, tx.repeater);
@@ -417,6 +418,18 @@ static void tx_topology_exceeded(struct kunit *test)
 	f = fake_new(test, &tx, true, 0);
 	reg(f, DP_HDCP_2_2_REG_SEQ_NUM_V_OFFSET)[2] = 1;
 	KUNIT_EXPECT_EQ(test, dcp_hdcp_authenticate(&tx), -EPROTO);
+	KUNIT_EXPECT_FALSE(test, f->encryption);
+}
+
+/* A certificate read too early or garbled never reaches the SEP. */
+static void tx_bad_receiver_id(struct kunit *test)
+{
+	struct dcp_hdcp_tx tx;
+	struct fake *f = fake_new(test, &tx, false, 0);
+
+	memset(reg(f, DP_HDCP_2_2_REG_CERT_RX_OFFSET), 0xff, HDCP_2_2_RECEIVER_ID_LEN);
+	KUNIT_EXPECT_EQ(test, dcp_hdcp_authenticate(&tx), -EPROTO);
+	KUNIT_EXPECT_STREQ(test, tx.step, "check Receiver ID");
 	KUNIT_EXPECT_FALSE(test, f->encryption);
 }
 
@@ -547,6 +560,7 @@ static struct kunit_case dcp_hdcp_tx_cases[] = {
 	KUNIT_CASE(tx_type1_refused_downstream_legacy),
 	KUNIT_CASE(tx_topology_exceeded),
 	KUNIT_CASE(tx_revoked),
+	KUNIT_CASE(tx_bad_receiver_id),
 	KUNIT_CASE(tx_timeout_and_rxstatus),
 	KUNIT_CASE(tx_close_mid_auth),
 	KUNIT_CASE(tx_m_prime_retry),
