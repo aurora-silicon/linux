@@ -3632,6 +3632,7 @@ static int __cd321x_reset_inherited_connection(struct tps6598x *tps, const u8 ke
 	u8 delay = 5, result;
 	unsigned long timeout;
 	int ret, lock_ret, mode;
+	u32 fresh;
 
 	mode = tps6598x_check_mode(tps);
 	if (mode != TPS_MODE_APP && mode != TPS_MODE_APP1)
@@ -3671,9 +3672,11 @@ relock:
 				       5000, 0);
 	if (ret || lock_ret)
 		return ret ?: lock_ret;
-	if (!tps6598x_read_status(tps, status))
+	/* Into a copy: a failed read must not replace the status read before. */
+	if (!tps6598x_read_status(tps, &fresh))
 		return -EIO;
-	tps->status = *status;
+	*status = fresh;
+	tps->status = fresh;
 	dev_info(tps->dev, "reinitialized inherited connection\n");
 	return 0;
 }
@@ -3682,6 +3685,7 @@ static int cd321x_reset_inherited_connection(struct tps6598x *tps, u32 *status)
 {
 	const struct cd321x_inherited_board *board;
 	bool best_effort = true;
+	u32 fresh;
 	u8 key[4];
 	int ret;
 
@@ -3706,9 +3710,37 @@ static int cd321x_reset_inherited_connection(struct tps6598x *tps, u32 *status)
 		return ret;
 
 	dev_warn(tps->dev, "inherited connection not reinitialized: %d\n", ret);
-	if (!tps6598x_read_status(tps, status))
-		return -EIO;
-	tps->status = *status;
+	/*
+	 * Keep the status read before on a bus error: the port's ->ready()
+	 * reads the cable state again anyway, and best effort must not turn
+	 * one failed read into a failed probe. Read into a copy: the Apple
+	 * SPMI controller stores a frame before it checks its parity, so a
+	 * failed read leaves garbage in its buffer.
+	 */
+	if (tps6598x_read_status(tps, &fresh)) {
+		*status = fresh;
+		tps->status = fresh;
+	}
+	return 0;
+}
+
+/*
+ * The power and data status of a plug present at probe. A transient bus error
+ * (on SPMI, a frame that fails its parity check) is retried a few times.
+ */
+#define TIPD_PROBE_READ_TRIES		3
+#define TIPD_PROBE_READ_RETRY_MS	20
+
+static int tipd_read_plug_state(struct tps6598x *tps)
+{
+	unsigned int tries = TIPD_PROBE_READ_TRIES;
+
+	while (!tps->data->read_power_status(tps) ||
+	       !tps->data->read_data_status(tps)) {
+		if (!--tries)
+			return -EIO;
+		msleep(TIPD_PROBE_READ_RETRY_MS);
+	}
 	return 0;
 }
 
@@ -4162,15 +4194,34 @@ int tipd_init(struct tps6598x *tps)
 		goto err_disconnect;
 
 	if (status & TPS_STATUS_PLUG_PRESENT) {
-		ret = -EINVAL;
-		if (!tps->data->read_power_status(tps))
+		ret = tipd_read_plug_state(tps);
+		if (ret && tps->data->ready) {
+			/*
+			 * ->ready() reads the whole cable state again and applies
+			 * it, with its own retries, so this read only delays the
+			 * partner. Failing the probe for it left the port without
+			 * a driver until the next boot: on a J716s, one SPMI parity
+			 * error with a hub plugged in at boot.
+			 */
+			dev_warn(tps->dev,
+				 "port state unreadable at probe: %d, reading it again once ready\n",
+				 ret);
+			/*
+			 * Not applied: if that revalidation gives up too, a
+			 * later read still finds the plug new.
+			 */
+			tps->status &= ~TPS_STATUS_PLUG_PRESENT;
+			/* Not a probe error: the polled path below keeps ret */
+			ret = 0;
+		} else if (ret) {
+			ret = -EINVAL;
 			goto err_disconnect;
-		if (!tps->data->read_data_status(tps))
-			goto err_disconnect;
-		ret = tps->data->connect(tps, status);
-		if (ret) {
-			dev_err(tps->dev, "failed to register partner\n");
-			goto err_disconnect;
+		} else {
+			ret = tps->data->connect(tps, status);
+			if (ret) {
+				dev_err(tps->dev, "failed to register partner\n");
+				goto err_disconnect;
+			}
 		}
 	}
 
