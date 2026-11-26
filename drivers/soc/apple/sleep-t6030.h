@@ -861,11 +861,29 @@ static void t6030_wake_masks_restore(struct apple_sleep *s)
 /* The value macOS writes to ERROR after reading it, in every run (an acknowledgment) */
 #define T6030_DART_ERROR_MACOS		0x10100000
 
+/*
+ * DIAGNOSTIC (T6030 sleep bring-up): macOS 27.2's PTD request word on J516S's way down (s2r runs,
+ * the perf word follows it): 0x10040 at pmVC, then 0x10000 1.05 s before the commit word. The
+ * report's own sleep step (apple_pmp_report_sleep()) comes later, at the PMP's stop.
+ */
+#define T6030_PTD_UPDATE_PA		0x3503d0000ULL
+#define T6030_PTD_REQUEST		0x8c0
+#define T6030_MASK_AT_PMVC		0x10040
+#define T6030_MASK_LATE			0x10000
+/* 1.05 s before the commit word, which comes 13.4 ms after slpa */
+#define T6030_MASK_LATE_TO_SLPA_US	1036600
+
+static bool t6030_diag_mask_steps;
+module_param_named(diag_mask_steps, t6030_diag_mask_steps, bool, 0644);
+MODULE_PARM_DESC(diag_mask_steps, "T6030 DIAGNOSTIC: macOS's PTD request steps on the way down (0x10040 at pmVC, 0x10000 1.05 s before the commit)");
+static void __iomem *t6030_ptd_update;
+
 static void t6030_late_map(struct apple_sleep *s)
 {
 	struct t6030_sleep *t = t6030_state(s);
 	struct device_node *np = of_find_node_by_path("/soc/iommu@37a808000");
 
+	t6030_ptd_update = ioremap_np(T6030_PTD_UPDATE_PA, 0x1000);
 	t->pmp_mbox = ioremap_np(T6030_PMP_MBOX_PA, 0x1000);
 	if (np && of_device_is_compatible(np, "apple,t6030-dart"))
 		t->mtp_dart = of_iomap(np, 0);
@@ -1430,6 +1448,11 @@ static void t6030_sleep_after_ans(struct apple_sleep *s)
 {
 	struct t6030_sleep *t = t6030_state(s);
 
+	if (READ_ONCE(t6030_diag_mask_steps) && t6030_ptd_update) {
+		writeq(T6030_MASK_AT_PMVC, t6030_ptd_update + T6030_PTD_REQUEST);
+		apple_sleep_smc_until_before_slpa(s, T6030_MASK_LATE_TO_SLPA_US);
+		writeq(T6030_MASK_LATE, t6030_ptd_update + T6030_PTD_REQUEST);
+	}
 	apple_sleep_smc_until_before_slpa(s, T6030_LATE_TO_SLPA_US);
 	if (sleep_seq_run_strict(t->blk, &t->prepare))
 		t6030_sleep_failed("apple,seq-prepare");
