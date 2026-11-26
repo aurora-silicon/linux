@@ -22,6 +22,7 @@ description: |
 properties:
   compatible:
     enum:
+      - apple,t8103-pmgr-misc
       - apple,t6000-pmgr-misc
       - apple,t6020-pmgr-misc
 
@@ -56,7 +57,9 @@ allOf:
   - if:
       properties:
         compatible:
-          const: apple,t6020-pmgr-misc
+          enum:
+            - apple,t8103-pmgr-misc
+            - apple,t6020-pmgr-misc
     then:
       properties:
         operating-points-v2: false
