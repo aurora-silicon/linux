@@ -445,53 +445,45 @@ const char *iomfb_v27_missing_method(const struct dcp_method_entry *methods,
 
 #include "iomfb_template.c"
 
-/*
- * DIAGNOSTIC (T6030 sleep bring-up): the PTD entry D003 gives the firmware for its clock request,
- * in the same window as the bandwidth scratch (entry N at window + 8 * N). 0 keeps the request
- * address 0, which the J516S DCP writes as PTD entry 0 at its M3 power-down; the PMP traps that
- * write ("PTD abort (0x0)").
- */
-static unsigned int v27_clock_request_entry;
-module_param(v27_clock_request_entry, uint, 0444);
-MODULE_PARM_DESC(v27_clock_request_entry, "DIAGNOSTIC (T6030): PTD entry for the DCP's D003 clock request (0: address 0)");
+struct dcp_v27_rt_bw_extended_reply {
+	struct apple_dcp_h17p_rt_bw_config config;
+	u32 unknown_10;
+	__le32 scratch_offset;
+	u32 unknown_18;
+	__le32 scratch_size;
+	u32 unknown_20[2];
+	__le32 status;
+} __packed;
 
-/*
- * DIAGNOSTIC (T6030 sleep bring-up): macOS 27.2's D003 reply on J516S (lane A, three boots) also
- * carries a u32 at +0x14: the bandwidth scratch slot's offset in the DCP's PTD window (0x988 for
- * dcp0; 0x10990 and 0x10998 for dcpext0/1), and the slot's size, 8, at +0x1c. Linux leaves both 0, and the DCP's request write at its
- * M3 power-down then lands on PTD entry 0, which the PMP traps.
- */
-static bool v27_rt_bw_request;
-module_param(v27_rt_bw_request, bool, 0444);
-MODULE_PARM_DESC(v27_rt_bw_request, "DIAGNOSTIC (T6030): D003 reply +0x14 = the bandwidth scratch's offset in its window, as macOS");
-
-#define V27_RT_BW_REQUEST_OFF	0x14
-#define V27_RT_BW_REQUEST_SIZE	0x1c
+static_assert(sizeof(struct dcp_v27_rt_bw_extended_reply) == 0x2c);
 
 static bool trampoline_rt_bandwidth_h17p(struct apple_dcp *dcp, int tag,
 					 void *out, void *in)
 {
 	const struct dcp_packet_header *header = in - sizeof(*header);
-	u64 base = dcp->disp_firmware_base[dcp->disp_bw_scratch_index];
-	u64 scratch = base + dcp->disp_bw_scratch_offset;
-	u64 clock_request = 0;
-	u32 request_off = 0;
+	const struct apple_dcp_h17p_rt_bw_request *request = in;
+	struct dcp_v27_rt_bw_extended_reply *reply = out;
+	u32 offset = dcp->disp_bw_scratch_offset;
+	u64 scratch = dcp->disp_firmware_base[dcp->disp_bw_scratch_index] +
+		      offset;
 
-	if (v27_clock_request_entry)
-		clock_request = base + 8ULL * v27_clock_request_entry;
 	trace_iomfb_callback(dcp, tag, __func__);
-	if (apple_dcp_h17p_rt_bw_encode_reply(in, out, scratch, clock_request))
-		dev_warn(dcp->dev, "D003 bandwidth request is malformed\n");
-	else if (v27_rt_bw_request &&
-		 header->out_len >= V27_RT_BW_REQUEST_OFF + sizeof(u32)) {
-		request_off = dcp->disp_bw_scratch_offset;
-		put_unaligned_le32(request_off, out + V27_RT_BW_REQUEST_OFF);
-		/* and the slot's size, 8, at +0x1c */
-		if (header->out_len >= V27_RT_BW_REQUEST_SIZE + sizeof(u32))
-			put_unaligned_le32(sizeof(u64), out + V27_RT_BW_REQUEST_SIZE);
+	if (header->out_len != sizeof(*reply)) {
+		if (apple_dcp_h17p_rt_bw_encode_reply(request, out, scratch, 0))
+			dev_warn(dcp->dev, "D003 bandwidth request is malformed\n");
+		return true;
 	}
-	dev_info(dcp->dev, "D003: in %u out %u, scratch %#llx, clock request %#llx, +0x14 %#x\n",
-		 header->in_len, header->out_len, scratch, clock_request, request_off);
+
+	if (le32_to_cpu(request->config_null) & 1) {
+		dev_warn(dcp->dev, "D003 bandwidth request is malformed\n");
+		return true;
+	}
+
+	/* The extended reply also locates the 8-byte slot relative to its window. */
+	apple_dcp_h17p_rt_bw_encode(&reply->config, scratch, 0);
+	reply->scratch_offset = cpu_to_le32(offset);
+	reply->scratch_size = cpu_to_le32(sizeof(u64));
+	reply->status = cpu_to_le32(0);
 	return true;
 }
 
