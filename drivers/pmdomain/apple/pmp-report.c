@@ -1665,6 +1665,40 @@ static void apple_pmp_start_drain(void *data)
 }
 
 /*
+ * DIAGNOSTIC (T6030 sleep bring-up): the three enable steps macOS 27.2's AP writes to the PMP's
+ * page at 0x3503d8000 just before (mac-watch-stop-3) or around (s2r-full-boot-2) the J516S PMP's
+ * start: +0x4a8 read then 0xd000000 and +0x228 = 0x80000; +0x4a8 read then 0xd000c00 and
+ * +0x228 = 0x20000; +0x4ac read then 0xa000000 and +0x228 = 0x8000000. Linux wrote none of them,
+ * its PMP never switches its DCS/fabric states (the perf word stays 0x1222), and it crashes when
+ * the DCP releases its realtime bandwidth. Boot parameter, off by default.
+ */
+#define PMP_DIAG_PMC_PA		0x3503d8000ULL
+static bool pmp_diag_pmc;
+module_param_named(diag_pmc, pmp_diag_pmc, bool, 0444);
+MODULE_PARM_DESC(diag_pmc, "DIAGNOSTIC (T6030): macOS's enable writes to the PMP page at 0x3503d8000 before the PMP starts");
+
+static void apple_pmp_diag_pmc(struct device *dev)
+{
+	void __iomem *pg = ioremap_np(PMP_DIAG_PMC_PA, 0x1000);
+	u32 a0, a1, b0;
+
+	if (!pg)
+		return;
+	a0 = readl(pg + 0x4a8);
+	writel(0xd000000, pg + 0x4a8);
+	writel(0x80000, pg + 0x228);
+	a1 = readl(pg + 0x4a8);
+	writel(a1 | 0xc00, pg + 0x4a8);
+	writel(0x20000, pg + 0x228);
+	b0 = readl(pg + 0x4ac);
+	writel(0xa000000, pg + 0x4ac);
+	writel(0x8000000, pg + 0x228);
+	dev_info(dev, "DIAGNOSTIC: macOS's PMP enables written: +0x4a8 %#x -> %#x -> %#x, +0x4ac %#x -> %#x\n",
+		 a0, a1, readl(pg + 0x4a8), b0, readl(pg + 0x4ac));
+	iounmap(pg);
+}
+
+/*
  * A report whose PMP a display gate handed over: apple,pmp names a disabled
  * PMP node that carries this Mac's values. Any other report is left exactly
  * as it was.
@@ -1710,6 +1744,8 @@ static int apple_pmp_start_init(struct apple_pmp_report *rep)
 	if (st->result)
 		return 0;
 	if (rep->offsets->start_at_probe) {
+		if (READ_ONCE(pmp_diag_pmc))
+			apple_pmp_diag_pmc(dev);
 		scoped_guard(mutex, &apple_pmp_start_mutex) {
 			st->queued = true;
 			queue_work(system_dfl_wq, &st->work);
