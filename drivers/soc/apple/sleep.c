@@ -845,6 +845,13 @@ struct apple_sleep_soc {
 	bool wdt_wd1;
 	/* The SMC gets pmVC and WKTP before slpa (gen 1, as t6000 has them) */
 	bool smc_gen1_keys;
+	/*
+	 * SEP's sleep request first, right after the other cores are held: on T6000 the
+	 * display's lowering waits for SEP's power gate. ops->before_enclave runs before it.
+	 */
+	bool enclave_first;
+	/* ops->commit_regs stops the parked cores itself, in place of the stop ahead of it. */
+	bool commit_stops_cpus;
 };
 
 struct apple_sleep {
@@ -5809,7 +5816,8 @@ static int apple_sleep_commit(unsigned long unused)
 					(s->soc->el1_wfi || READ_ONCE(sleep_el1_wfi) >= 2));
 		spin_table_release_stopped();
 	}
-	s->cpus_stop_ret = spin_table_stop_parked();
+	if (!s->soc->commit_stops_cpus)
+		s->cpus_stop_ret = spin_table_stop_parked();
 	if (early)
 		udelay(SLEEP_EARLY_WFI_SETTLE_US);
 
@@ -6372,6 +6380,12 @@ static int apple_sleep_enter_prepare(struct apple_sleep *s)
 	if (apple_sleep_dry(s))
 		return apple_sleep_enter_dry(s);
 	ret = apple_sleep_cpus_hold(s);
+	if (!ret && s->soc->enclave_first) {
+		step = "enclave stop";
+		if (s->soc->ops->before_enclave)
+			s->soc->ops->before_enclave(s);
+		ret = apple_sleep_enclave_stop(s);
+	}
 	if (!ret) {
 		step = "display prepare";
 		if (s->soc->regions)
@@ -6414,7 +6428,7 @@ static int apple_sleep_enter_prepare(struct apple_sleep *s)
 		ret = apple_sleep_enclave_stop(s);
 		if (ret)
 			panic("Apple SEP refused after the always-on GPU stop: %d", ret);
-	} else if (!ret) {
+	} else if (!ret && !s->soc->enclave_first) {
 		ret = apple_sleep_enclave_stop(s);
 	}
 	if (ret) {
