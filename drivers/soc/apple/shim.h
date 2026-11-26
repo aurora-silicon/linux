@@ -123,6 +123,34 @@ struct sep_fv_ops {
 int sep_fv_register_v2(void *context, const struct sep_fv_ops *ops);
 void sep_fv_unregister_v2(void *context);
 
+/* -- hdcp_shim.c ------------------------------------------------------ */
+
+/* The steps of hdcp.rs (enum Step); flat inputs and outputs, see there. */
+enum sep_hdcp_step {
+	SEP_HDCP_STEP_OPEN = 0,
+	SEP_HDCP_STEP_AKE_CERT = 1,
+	SEP_HDCP_STEP_H_PRIME = 2,
+	SEP_HDCP_STEP_PAIRING = 3,
+	SEP_HDCP_STEP_LC_INIT = 4,
+	SEP_HDCP_STEP_L_PRIME = 5,
+	SEP_HDCP_STEP_SKE = 6,
+	SEP_HDCP_STEP_RECEIVER_LIST = 7,
+	SEP_HDCP_STEP_STREAM = 8,
+	SEP_HDCP_STEP_FINISH = 9,
+	SEP_HDCP_STEP_ENCRYPTION_ON = 10,
+	SEP_HDCP_STEP_ENCRYPTION_OFF = 11,
+};
+
+struct sep_hdcp_ops {
+	bool (*available)(void *context);
+	int (*step)(void *context, u32 channel, u32 step, const u8 *in,
+		    size_t in_len, u8 *out, size_t out_len);
+	void (*close)(void *context, u32 channel);
+};
+
+int sep_hdcp_register(void *context, const struct sep_hdcp_ops *ops);
+void sep_hdcp_unregister(void *context);
+
 /* -- p256_shim.c ------------------------------------------------------- */
 
 /*
