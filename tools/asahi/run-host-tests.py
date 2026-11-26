@@ -309,6 +309,7 @@ ASAHI_TESTS = {
     't8132-display-gate-tests.py': [([], PASS)],
     't8132-usb4-policy-tests.py': [(out('--output') + ['--dtc', '{dtc}'], PASS)],
     't8132-v27-tunnel-tests.py': [([], PASS)],
+    'dock-display-replug-tests.py': [([], PASS)],
     'tb-cio-sleep-tests.py': [(out('--output'), PASS)],
     'tb-dock-pm-tests.py': [(out('--output'), PASS)],
     'tb-dp-repair-tests.py': [(out('--output'), PASS), (out('--output') + ['--mutations'], PASS)],
