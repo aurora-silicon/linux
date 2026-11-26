@@ -580,13 +580,13 @@ bool centauri_stop_dma(struct pci_dev *pdev)
 }
 
 /*
- * Returns false, with every IPC buffer kept, if a function's DMA could not be
- * stopped. A later call (a retried restart, or removal) tries again.
+ * Stop the IPC's interrupts and every function's DMA. Returns false if a
+ * function's DMA could not be stopped; a later call (a retried restart, or
+ * removal) tries again.
  */
-bool centauri_free_ipc(struct centauri *c)
+bool centauri_stop_ipc(struct centauri *c)
 {
 	struct centauri_ipc *ipc = c->ipc;
-	struct cen_buffer *buffer, *next;
 	bool stopped = true;
 	int i, cap;
 	u16 control;
@@ -611,8 +611,18 @@ bool centauri_free_ipc(struct centauri *c)
 	for (i = 0; i < 3; i++)
 		if (ipc->function[i] && !centauri_stop_dma(ipc->function[i]))
 			stopped = false;
-	if (!stopped)
-		return false;
+	return stopped;
+}
+
+/* Only after centauri_stop_ipc() and the boot DMA's stop both succeeded. */
+void centauri_free_ipc(struct centauri *c)
+{
+	struct centauri_ipc *ipc = c->ipc;
+	struct cen_buffer *buffer, *next;
+	int i;
+
+	if (!ipc)
+		return;
 	list_for_each_entry_safe(buffer, next, &ipc->buffers, list) {
 		dma_free_coherent(buffer->dev, buffer->size, buffer->cpu, buffer->dma);
 		list_del(&buffer->list);
@@ -625,7 +635,6 @@ bool centauri_free_ipc(struct centauri *c)
 	}
 	kfree(ipc);
 	c->ipc = NULL;
-	return true;
 }
 
 int centauri_alpha_resources(struct centauri *c, struct cen_alpha_resources *resources)
@@ -648,7 +657,7 @@ int centauri_alpha_resources(struct centauri *c, struct cen_alpha_resources *res
 }
 
 /* Called once under the Wi-Fi lock. Published logging memory stays owned by
- * IPC until every function has bus mastering disabled in centauri_free_ipc.
+ * IPC until every function's DMA has stopped in centauri_stop_ipc.
  */
 int centauri_alpha_log_buffer(struct centauri *c, void **cpu, dma_addr_t *dma, size_t *size)
 {

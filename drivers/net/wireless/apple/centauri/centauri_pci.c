@@ -50,23 +50,22 @@ DEFINE_SHOW_ATTRIBUTE(centauri_status);
 static bool centauri_free_boot(struct centauri *c)
 {
 	struct device *dev = &c->pdev->dev;
+	bool stopped;
 
 	if (!c->link_ready && c->boot_attempted) {
 		dev_warn(dev, "retaining DMA buffers after failed link transition; reboot required\n");
 		return false;
 	}
-	/* Stop device writes before any DMA storage is released. */
-	if (!centauri_free_ipc(c)) {
-		dev_err(dev, "retaining DMA buffers: a function's DMA did not stop\n");
-		return false;
-	}
+	/* Stop all device writes before any DMA storage is released. */
+	stopped = centauri_stop_ipc(c);
 	if (c->msi_cap)
 		pci_write_config_word(c->pdev, c->msi_cap + PCI_MSI_FLAGS,
 				      c->msi_original & ~PCI_MSI_FLAGS_ENABLE);
-	if (!centauri_stop_dma(c->pdev)) {
-		dev_err(dev, "retaining DMA buffers: the boot DMA did not stop\n");
+	if (!centauri_stop_dma(c->pdev) || !stopped) {
+		dev_err(dev, "retaining DMA buffers: the N1's DMA did not stop\n");
 		return false;
 	}
+	centauri_free_ipc(c);
 	if (c->firmware)
 		dma_free_coherent(dev, c->firmware_size, c->firmware, c->firmware_dma);
 	if (c->descriptor)
