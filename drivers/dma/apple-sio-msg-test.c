@@ -484,23 +484,32 @@ static int sio_test_slot(struct sio_data *sio, struct sio_tx *tx, int i)
 	return tx->siodesc[i] - sio->shmem_desc_base;
 }
 
+/* The firmware's answers to TERMINATE */
 struct sio_test_terminate {
-	int ret;
+	unsigned int nacks;	/* refused first */
+	int ret;		/* then answered so */
 	unsigned int calls;
+	unsigned int report_at;	/* at this call, the firmware reports ... */
+	unsigned int reports;	/* ... so many descriptors */
 };
 
 static int sio_test_terminate(struct sio_chan *chan)
 {
 	struct sio_test_terminate *t = kunit_get_current_test()->priv;
+	unsigned int i;
 
 	t->calls++;
-	return t->ret;
+	if (t->calls == t->report_at)
+		for (i = 0; i < t->reports; i++)
+			sio_process_report(chan);
+	return t->calls <= t->nacks ? 0 : t->ret;
 }
 
 /*
- * A TERMINATE refused, or not answered, while descriptors are in flight does
- * not free the transfer: it keeps its descriptors, the channel starts no other
- * transfer, and it is tried again until an acknowledged TERMINATE frees it.
+ * A TERMINATE not answered while descriptors are in flight does not free the
+ * transfer: it keeps its descriptors and the channel starts no other transfer.
+ * sio_synchronize() does not return until the firmware stopped it: it sends
+ * TERMINATE again through refusals until one is acknowledged.
  */
 static void sio_terminate_unconfirmed_test(struct kunit *test)
 {
@@ -541,23 +550,92 @@ static void sio_terminate_unconfirmed_test(struct kunit *test)
 	spin_unlock_irqrestore(&chan->vc.lock, flags);
 	vchan_dma_desc_free_list(&chan->vc, &to_free);
 
-	t.calls = 0;
-	t.ret = 0;
-	sio_end_tx(chan, tx, sio_test_terminate);
-	KUNIT_EXPECT_EQ(test, t.calls, SIO_TERMINATE_TRIES);
-	KUNIT_EXPECT_TRUE(test, chan->quarantined);
-	KUNIT_EXPECT_PTR_EQ(test, chan->current_tx, tx);
-	KUNIT_EXPECT_TRUE(test, test_bit(slot, sio->desc_allocated));
-
-	/* sio_synchronize() tries again: an acknowledged TERMINATE frees it. */
-	t.calls = 0;
-	t.ret = 1;
-	sio_end_tx(chan, tx, sio_test_terminate);
-	KUNIT_EXPECT_EQ(test, t.calls, 1U);
+	/* Refused three times, over two rounds, then acknowledged */
+	t = (struct sio_test_terminate){ .nacks = 3, .ret = 1 };
+	sio_stop_held(chan, sio_test_terminate);
+	KUNIT_EXPECT_EQ(test, t.calls, 4U);
 	KUNIT_EXPECT_FALSE(test, chan->quarantined);
 	KUNIT_EXPECT_NULL(test, chan->current_tx);
 	for (i = 0; i < 4; i++)
 		KUNIT_EXPECT_FALSE(test, test_bit(slot + i, sio->desc_allocated));
+
+	if (!tainted)
+		KUNIT_EXPECT_FALSE(test, test_taint(TAINT_WARN));
+}
+
+/*
+ * A held transfer is also freed once the firmware reported its descriptors,
+ * though it refuses TERMINATE, or once it crashed and issues nothing more.
+ */
+static void sio_terminate_held_stopped_test(struct kunit *test)
+{
+	bool tainted = test_taint(TAINT_WARN);
+	struct sio_data *sio = sio_test_alloc_dma(test, 1);
+	struct sio_chan *chan = &sio->channels[0];
+	struct sio_test_terminate t = {};
+	struct sio_tx *tx;
+	int slot;
+
+	test->priv = &t;
+	tx = sio_test_ended_tx(test, chan, 2);
+	slot = sio_test_slot(sio, tx, 0);
+	chan->quarantined = true;
+	t = (struct sio_test_terminate){ .ret = 0, .report_at = 2, .reports = 2 };
+	sio_stop_held(chan, sio_test_terminate);
+	KUNIT_EXPECT_EQ(test, t.calls, 2U);
+	KUNIT_EXPECT_NULL(test, chan->current_tx);
+	KUNIT_EXPECT_FALSE(test, chan->quarantined);
+	KUNIT_EXPECT_FALSE(test, test_bit(slot, sio->desc_allocated));
+
+	tx = sio_test_ended_tx(test, chan, 2);
+	chan->quarantined = true;
+	t = (struct sio_test_terminate){ .ret = -ESHUTDOWN };
+	sio_stop_held(chan, sio_test_terminate);
+	KUNIT_EXPECT_EQ(test, t.calls, 1U);
+	KUNIT_EXPECT_NULL(test, chan->current_tx);
+	KUNIT_EXPECT_FALSE(test, chan->quarantined);
+
+	/* Not held: nothing to stop */
+	t = (struct sio_test_terminate){ .ret = 0 };
+	sio_stop_held(chan, sio_test_terminate);
+	KUNIT_EXPECT_EQ(test, t.calls, 0U);
+
+	if (!tainted)
+		KUNIT_EXPECT_FALSE(test, test_taint(TAINT_WARN));
+}
+
+/*
+ * The ring accounting: sio_synchronize() keeps the transfers retired with
+ * descriptors in flight until the channel is stopped, sending TERMINATE again
+ * through refusals, and frees them after.
+ */
+static void sio_terminate_ring_retired_test(struct kunit *test)
+{
+	bool tainted = test_taint(TAINT_WARN);
+	struct sio_data *sio = sio_test_alloc_dma(test, 1);
+	struct sio_chan *chan = &sio->channels[0];
+	struct sio_test_terminate t = { .nacks = 2, .ret = 1 };
+	struct sio_tx *tx;
+	int slot;
+
+	test->priv = &t;
+	tx = sio_test_ended_tx(test, chan, 2);
+	slot = sio_test_slot(sio, tx, 0);
+	chan->current_tx = NULL;
+	chan->ring = true;
+	chan->issued[0] = tx;
+	chan->issued[1] = tx;
+	chan->nissued = 2;
+	tx->retired = true;
+	list_add_tail(&tx->vd.node, &chan->retired);
+
+	sio_wait_retired(chan, sio_test_terminate);
+	KUNIT_EXPECT_EQ(test, t.calls, 3U);
+	KUNIT_EXPECT_TRUE(test, list_empty(&chan->retired));
+	KUNIT_EXPECT_EQ(test, chan->nissued, 0U);
+	KUNIT_EXPECT_TRUE(test, test_bit(slot, sio->desc_allocated));
+	sio_free_dead(chan);
+	KUNIT_EXPECT_FALSE(test, test_bit(slot, sio->desc_allocated));
 
 	if (!tainted)
 		KUNIT_EXPECT_FALSE(test, test_taint(TAINT_WARN));
@@ -633,6 +711,8 @@ static void sio_terminate_late_issue_test(struct kunit *test)
 
 static struct kunit_case sio_terminate_test_cases[] = {
 	KUNIT_CASE_SLOW(sio_terminate_unconfirmed_test),
+	KUNIT_CASE_SLOW(sio_terminate_held_stopped_test),
+	KUNIT_CASE_SLOW(sio_terminate_ring_retired_test),
 	KUNIT_CASE(sio_terminate_drained_test),
 	KUNIT_CASE(sio_terminate_late_issue_test),
 	{}

@@ -150,8 +150,8 @@ struct sio_chan {
 	/*
 	 * The current transfer ended, but the firmware neither acknowledged a
 	 * TERMINATE nor reported its descriptors (sio_end_tx()): it keeps its
-	 * descriptors, nothing else is issued on the channel, and each
-	 * sio_synchronize() tries to stop it again.
+	 * descriptors, nothing else is issued on the channel, and
+	 * sio_synchronize() does not return until the firmware stopped it.
 	 */
 	bool quarantined;
 };
@@ -159,6 +159,8 @@ struct sio_chan {
 /* TERMINATEs sent to end a transfer, each followed by a wait for its descriptors */
 #define SIO_TERMINATE_TRIES	2
 #define SIO_DRAIN_TIMEOUT_MS	500
+/* Rounds between the reports of a channel still not stopped */
+#define SIO_HELD_REPORT_ROUNDS	30
 
 #define SIO_NTAGS		16
 /* Tag 0 is never handed out. */
@@ -1336,22 +1338,34 @@ static bool sio_tx_drained(struct sio_chan *siochan, struct sio_tx *tx)
 	return drained;
 }
 
-/* 1 on ACK, 0 on NACK, negative without an answer */
+/*
+ * 1 on ACK, 0 on NACK, -ESHUTDOWN if the firmware crashed, other negative
+ * values without an answer
+ */
 static int sio_call_terminate(struct sio_chan *siochan)
 {
-	return sio_call(siochan->host, FIELD_PREP(SIOMSG_EP, siochan->no) |
-				       FIELD_PREP(SIOMSG_TYPE, MSG_TERMINATE));
+	struct sio_data *sio = siochan->host;
+
+	if (apple_rtkit_is_crashed(sio->rtk))
+		return -ESHUTDOWN;
+	return sio_call(sio, FIELD_PREP(SIOMSG_EP, siochan->no) |
+			     FIELD_PREP(SIOMSG_TYPE, MSG_TERMINATE));
 }
 
 /*
  * Whether the firmware no longer reads the descriptors of tx, the channel's
- * current transfer, ended: it acknowledged a TERMINATE, after which nothing it
- * holds is played (as in sio_stop_quiet()), or it reported all of them. A
- * TERMINATE refused or not answered is sent again once the descriptors had
- * SIO_DRAIN_TIMEOUT_MS to drain, SIO_TERMINATE_TRIES times in all.
+ * current transfer, ended:
+ * - it acknowledged a TERMINATE, after which nothing it holds is played (as
+ *   in sio_stop_quiet());
+ * - it reported all of them;
+ * - or it crashed, and issues nothing more: the DMA it had started is done
+ *   once the descriptors had SIO_DRAIN_TIMEOUT_MS to drain.
+ * A TERMINATE refused or not answered is sent again once the descriptors had
+ * SIO_DRAIN_TIMEOUT_MS to drain, SIO_TERMINATE_TRIES times in all. Failures
+ * are logged if report.
  */
 static bool sio_stop_tx(struct sio_chan *siochan, struct sio_tx *tx,
-			int (*terminate)(struct sio_chan *))
+			int (*terminate)(struct sio_chan *), bool report)
 {
 	struct device *dev = siochan->host->dev;
 	unsigned long timeout = msecs_to_jiffies(SIO_DRAIN_TIMEOUT_MS);
@@ -1364,12 +1378,17 @@ static bool sio_stop_tx(struct sio_chan *siochan, struct sio_tx *tx,
 				dev_err(dev, "terminate descriptor wait timed out\n");
 			return true;
 		}
-		if (ret < 0)
+		if (ret == -ESHUTDOWN) {
+			wait_event_timeout(siochan->drained, sio_tx_drained(siochan, tx), timeout);
+			return true;
+		}
+		if (report && ret < 0)
 			dev_err(dev, "terminate call on chan %d failed: %d\n", siochan->no, ret);
 		if (wait_event_timeout(siochan->drained, sio_tx_drained(siochan, tx), timeout))
 			return true;
-		dev_err(dev, "chan %d: TERMINATE %s and descriptors still in flight\n",
-			siochan->no, ret ? "not answered" : "refused");
+		if (report)
+			dev_err(dev, "chan %d: TERMINATE %s and descriptors still in flight\n",
+				siochan->no, ret ? "not answered" : "refused");
 	}
 	return false;
 }
@@ -1394,31 +1413,57 @@ static void sio_release_tx(struct sio_chan *siochan, struct sio_tx *tx)
 }
 
 /*
- * Ends tx, the channel's current transfer: freed once stopped, else
- * quarantined. Its client may free the buffer on return either way, but the
- * descriptors that still point at it are not handed to another transfer.
+ * Ends tx, the channel's current transfer: freed once stopped, else held, its
+ * descriptors and the channel kept, for sio_synchronize() to stop.
  */
 static void sio_end_tx(struct sio_chan *siochan, struct sio_tx *tx,
 		       int (*terminate)(struct sio_chan *))
 {
 	unsigned long flags;
-	bool first;
 
-	if (sio_stop_tx(siochan, tx, terminate)) {
+	if (sio_stop_tx(siochan, tx, terminate, true)) {
 		sio_release_tx(siochan, tx);
 		return;
 	}
 
 	spin_lock_irqsave(&siochan->vc.lock, flags);
-	first = !siochan->quarantined;
 	siochan->quarantined = true;
 	spin_unlock_irqrestore(&siochan->vc.lock, flags);
-	if (first)
-		dev_err(siochan->host->dev,
-			"chan %d: not stopped, its transfer keeps its descriptors and the channel is held\n",
-			siochan->no);
+	dev_err(siochan->host->dev,
+		"chan %d: not stopped, its transfer keeps its descriptors and the channel is held\n",
+		siochan->no);
 	/* No callback of the ended transfer runs after this. */
 	tasklet_kill(&siochan->vc.task);
+}
+
+/*
+ * The client frees the buffer of a held transfer once sio_synchronize()
+ * returns, and the firmware may still read it: until the firmware stopped the
+ * channel, TERMINATE is sent again and this does not return.
+ */
+static void sio_stop_held(struct sio_chan *siochan, int (*terminate)(struct sio_chan *))
+{
+	unsigned long flags;
+	unsigned int round;
+	struct sio_tx *tx;
+
+	spin_lock_irqsave(&siochan->vc.lock, flags);
+	tx = siochan->quarantined ? siochan->current_tx : NULL;
+	spin_unlock_irqrestore(&siochan->vc.lock, flags);
+	if (!tx)
+		return;
+
+	for (round = 0; ; round++) {
+		bool report = !(round % SIO_HELD_REPORT_ROUNDS);
+
+		if (sio_stop_tx(siochan, tx, terminate, report))
+			break;
+		if (report)
+			dev_err(siochan->host->dev,
+				"chan %d: still not stopped, its buffer is kept until it is\n",
+				siochan->no);
+	}
+	sio_release_tx(siochan, tx);
 }
 
 static void sio_terminate_work(struct work_struct *wq)
@@ -1468,37 +1513,42 @@ static bool sio_ring_empty(struct sio_chan *siochan)
  * that acknowledged TERMINATE and still reports nothing is resynced: its ring
  * is emptied, as nothing it holds is played any more. A channel that refused
  * TERMINATE or did not answer cannot be known to have stopped: -EIO, and its
- * transfers stay as they are. Then the current or idle transfer is issued
- * again.
+ * transfers stay as they are. A crashed firmware issues nothing more, and is
+ * taken as stopped once the ring had SIO_DRAIN_TIMEOUT_MS to drain (as in
+ * sio_stop_tx()). Then the current or idle transfer is issued again. Failures
+ * are logged if report.
  */
-static int sio_stop_quiet(struct sio_chan *siochan)
+static int sio_stop_quiet(struct sio_chan *siochan, int (*terminate)(struct sio_chan *),
+			  bool report)
 {
 	struct device *dev = siochan->host->dev;
 	unsigned long flags;
 	struct sio_tx *tx;
 	unsigned int i;
+	bool stopped;
 	int ret;
 
-	dev_err(dev, "chan %d: issued descriptors did not complete, stopping it\n", siochan->no);
+	if (report)
+		dev_err(dev, "chan %d: issued descriptors did not complete, stopping it\n",
+			siochan->no);
 	spin_lock_irqsave(&siochan->vc.lock, flags);
 	siochan->stopping = true;
 	spin_unlock_irqrestore(&siochan->vc.lock, flags);
 
-	/* 1 on ACK, 0 on NACK, negative without an answer */
-	ret = sio_call(siochan->host, FIELD_PREP(SIOMSG_EP, siochan->no) |
-				      FIELD_PREP(SIOMSG_TYPE, MSG_TERMINATE));
-	if (ret == 1)
+	ret = terminate(siochan);
+	stopped = ret == 1 || ret == -ESHUTDOWN;
+	if (stopped)
 		wait_event_timeout(siochan->drained, sio_ring_empty(siochan),
-				   msecs_to_jiffies(500));
-	else if (!ret)
+				   msecs_to_jiffies(SIO_DRAIN_TIMEOUT_MS));
+	else if (report && !ret)
 		dev_err(dev, "chan %d: TERMINATE refused, its buffers may still be read\n",
 			siochan->no);
-	else
+	else if (report)
 		dev_err(dev, "chan %d: not stopped (%d), its buffers may still be read\n",
 			siochan->no, ret);
 
 	spin_lock_irqsave(&siochan->vc.lock, flags);
-	if (ret == 1 && (siochan->nissued || siochan->issuing)) {
+	if (stopped && (siochan->nissued || siochan->issuing)) {
 		dev_err(dev, "chan %d: stopped with %u descriptors unreported, ring reset\n",
 			siochan->no, siochan->nissued);
 		for (i = 0; i < siochan->nissued; i++) {
@@ -1510,7 +1560,7 @@ static int sio_stop_quiet(struct sio_chan *siochan)
 		siochan->issuing = false;
 		siochan->issued_head = 0;
 	}
-	if (ret == 1) {
+	if (stopped) {
 		list_splice_tail_init(&siochan->retired, &siochan->dead);
 		if (siochan->idle && siochan->idle->terminated)
 			complete(&siochan->idle->done);
@@ -1519,7 +1569,7 @@ static int sio_stop_quiet(struct sio_chan *siochan)
 	sio_fill_in_locked(siochan);
 	spin_unlock_irqrestore(&siochan->vc.lock, flags);
 
-	return ret == 1 ? 0 : -EIO;
+	return stopped ? 0 : -EIO;
 }
 
 /* Frees the ended transfers once no completion callback can still use them. */
@@ -1543,30 +1593,40 @@ static void sio_free_dead(struct sio_chan *siochan)
 	}
 }
 
+/*
+ * The ring accounting: the client frees the buffers of the transfers retired
+ * on return, and the firmware may still read them. Until their descriptors
+ * completed or the channel is stopped, TERMINATE is sent again and this does
+ * not return.
+ */
+static void sio_wait_retired(struct sio_chan *siochan, int (*terminate)(struct sio_chan *))
+{
+	unsigned long timeout = msecs_to_jiffies(SIO_DRAIN_TIMEOUT_MS);
+	unsigned int round;
+
+	for (round = 0; !wait_event_timeout(siochan->drained, sio_drained(siochan), timeout);
+	     round++) {
+		bool report = !(round % SIO_HELD_REPORT_ROUNDS);
+
+		if (!sio_stop_quiet(siochan, terminate, report))
+			break;
+		if (report)
+			dev_err(siochan->host->dev,
+				"chan %d: still not stopped, its ended transfers' buffers are kept until it is\n",
+				siochan->no);
+	}
+	/* No callback of an ended transfer runs after this. */
+	tasklet_kill(&siochan->vc.task);
+}
+
 static void sio_synchronize(struct dma_chan *chan)
 {
 	struct sio_chan *siochan = to_sio_chan(chan);
-	struct sio_tx *quarantined;
-	unsigned long flags;
 
 	flush_work(&siochan->terminate_wq);
-	spin_lock_irqsave(&siochan->vc.lock, flags);
-	quarantined = siochan->quarantined ? siochan->current_tx : NULL;
-	spin_unlock_irqrestore(&siochan->vc.lock, flags);
-	if (quarantined)
-		sio_end_tx(siochan, quarantined, sio_call_terminate);
-
-	if (READ_ONCE(siochan->ring)) {
-		/* The caller frees the buffer on return; nothing can stop that. */
-		if (!wait_event_timeout(siochan->drained, sio_drained(siochan),
-					msecs_to_jiffies(500)) &&
-		    sio_stop_quiet(siochan))
-			dev_WARN_ONCE(siochan->host->dev, 1,
-				      "chan %d: synchronized without being stopped\n",
-				      siochan->no);
-		/* No callback of an ended transfer runs after this. */
-		tasklet_kill(&siochan->vc.task);
-	}
+	sio_stop_held(siochan, sio_call_terminate);
+	if (READ_ONCE(siochan->ring))
+		sio_wait_retired(siochan, sio_call_terminate);
 	sio_free_dead(siochan);
 }
 
@@ -1601,7 +1661,7 @@ static int sio_clear_idle(struct sio_chan *siochan)
 				siochan->no, ret);
 	}
 	if (!quiet && !wait_for_completion_timeout(&idle->done, msecs_to_jiffies(500))) {
-		ret = sio_stop_quiet(siochan);
+		ret = sio_stop_quiet(siochan, sio_call_terminate, true);
 		if (ret)
 			return ret;
 	}
