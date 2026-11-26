@@ -52,6 +52,7 @@ extern "C" {
     fn sep_diag_set_restore(state: c_int);
     fn sep_diag_set_xart_guard(level: c_uint, list_loaded: bool, matching: c_int);
     fn sep_diag_xart_guard_refused(matching: c_int);
+    fn sep_diag_set_trusted(state: c_int, status: c_int);
     fn sep_diag_bringup_ended();
     fn sep_diag_set_endpoint(id: u8, name: u32);
     fn sep_diag_set_os_identity(source: c_int);
@@ -285,6 +286,27 @@ pub(crate) fn xart_guard_refused() {
     REFUSALS.fetch_add(1, Relaxed);
     // SAFETY: no preconditions; updates two words.
     unsafe { sep_diag_xart_guard_refused(matching() as c_int) };
+}
+
+/// What the next trusted-key seal or unseal can expect, as
+/// `SEP_DIAG_TRUSTED_*` in `shim.h` spells it.
+#[derive(Clone, Copy)]
+pub(crate) enum Trusted {
+    /// A trusted-key unseal, on its own or as a seal's round trip, worked.
+    Ready,
+    /// The enclave answered the identity key-bag unlock that every seal and
+    /// unseal needs with this status.
+    Refused(i8),
+}
+
+/// The latest trusted-key outcome; it replaces the one before.
+pub(crate) fn trusted(state: Trusted) {
+    let (state, status) = match state {
+        Trusted::Ready => (1, 0),
+        Trusted::Refused(status) => (2, status),
+    };
+    // SAFETY: no preconditions; stores one word.
+    unsafe { sep_diag_set_trusted(state, c_int::from(status)) };
 }
 
 /// The boot-time bring-up is over, however far it got.

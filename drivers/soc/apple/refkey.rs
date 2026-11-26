@@ -102,6 +102,9 @@ impl SepData {
                 "sks: ref-key identity unlock refused (status {})\n",
                 out.reply.status
             );
+            // An answer, not a lost reply: the enclave decided on this bag.
+            // diag/trusted lets readers stop on it instead of asking again.
+            crate::diag::trusted(crate::diag::Trusted::Refused(out.reply.status));
             return false;
         }
         let Some(body) = self.sks_report_response(c"DEVICE_STATE_TRANSITION", &out) else {
@@ -342,6 +345,8 @@ impl SepData {
             drop(crate::Secret(recovered));
             return Err(EIO); // trusted.rs maps every unseal rejection to EBADMSG.
         }
+        // A seal's round trip ends here too.
+        crate::diag::trusted(crate::diag::Trusted::Ready);
         Ok(recovered)
     }
 
