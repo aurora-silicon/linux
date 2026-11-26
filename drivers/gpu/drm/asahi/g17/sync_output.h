@@ -17,7 +17,7 @@ asahi_g17_signals_new(const struct asahi_g17_signal_spec *specs,
 		     size_t count, size_t anchor, int *error);
 void asahi_g17_signals_free(struct asahi_g17_signal_bundle *bundle);
 int asahi_g17_signals_publish(struct asahi_g17_signal_bundle *bundle,
-			      struct dma_fence *submitted);
+			      struct dma_fence *submitted, bool compute_only);
 void asahi_g17_signals_fail(struct asahi_g17_signal_bundle *bundle,
 			    struct dma_fence *failure);
 #endif

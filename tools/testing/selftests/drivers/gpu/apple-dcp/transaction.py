@@ -104,8 +104,9 @@ static int mux_control_deselect(struct mux_control *m) { (void)m;event('C');xbar
     static int dcp_dptx_connect_oob(void *dev,unsigned n) { (void)dev;(void)n;connect_calls++;display.external_cable=true;display.dptxport[0].connected=true;display.typec_cable_connected=true;connector.connected=true;return 0; }
     static void dcp_retrain_oob(struct connector *c) { (void)c; }
     static bool dcp_typec_sink_relink(struct apple_dcp *d) { (void)d;return false; }
-    /* An M1/M2 crossbar is not the T8142 layout, and an M1/M2 port has no fixed-CRTC connectors. */
+    /* An M1/M2 crossbar is not the T8142 or T6041 layout, and an M1/M2 port has no fixed-CRTC connectors. */
     static bool dcp_xbar_t8142(struct mux_control *m) { (void)m;return false; }
+    static bool dcp_xbar_t6041(struct mux_control *m) { (void)m;return false; }
     static bool dcp_typec_fixed_crtcs(void) { return false; }
     /* Deactivation retires queued DP IN events and drains their work. */
     static int tb_event_cancels;
@@ -430,6 +431,9 @@ static int register_port(struct tps6598x *t,struct fwnode_handle *f) { (void)t;(
 static bool read_data_status(struct tps6598x *t) { (void)t;return true; }
 static int connect(struct tps6598x *t,u32 status) { (void)t;(void)status;return connect_error; }
 static int cd321x_reset_inherited_connection(struct tps6598x *t,u32 *s) { (void)t;(void)s;return 0; }
+/* J714s only: this fixture's controller never keeps its boot power state. */
+static bool __attribute__((unused)) tipd_boot_power_kept(struct tps6598x *t) { (void)t;return false; }
+static int __attribute__((unused)) tipd_boot_power_on(struct tps6598x *t,u32 *s) { (void)t;(void)s;return 0; }
 """
     helpers += '\n#define of_machine_is_compatible(name) (!strcmp((name), \"apple,t8140\"))\n#define BIT_ULL(n) (1ULL << (n))\n#define SN201202X_INT_DP_SID_UPDATE BIT_ULL(37)\n'
     helpers += block(core, 'static bool cd321x_uses_dp_sid(') + '\n' + block(core, 'static u64 cd321x_irq_mask(') + '\n'

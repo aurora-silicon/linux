@@ -353,18 +353,15 @@ static int tps6598x_disconnect(struct tps6598x *tps, u32 status)
 }
 
 /*
- * The sleep's rules for the port controllers' system power state command (the controller is
+ * The sleep's rules for a port controller's system power state command (the controller is
  * woken first, the command's end is read at intervals, a failed S3 refuses the sleep, the
- * command's limit and its lines) apply on the J714s, J716c, J813 and J815.
- * These boards send the command (apple,sleep-ssps) during firmware-driven
- * sleep. Other boards retain the original command behavior.
+ * command's limit and its lines), for a controller whose DT asks for them
+ * (apple,sleep-ssps-rules: the J714s's, J716c's, J813's and J815's). Others keep the original
+ * command behaviour.
  */
-static bool tipd_sleep_ssps_rules(void)
+static bool tipd_sleep_ssps_rules(struct tps6598x *tps)
 {
-	return of_machine_is_compatible("apple,j714s") ||
-	       of_machine_is_compatible("apple,j716c") ||
-	       of_machine_is_compatible("apple,j813") ||
-	       of_machine_is_compatible("apple,j815");
+	return device_property_read_bool(tps->dev, "apple,sleep-ssps-rules");
 }
 
 /*
@@ -420,11 +417,11 @@ static int tps6598x_exec_cmd_gap(struct tps6598x *tps, const char *cmd,
 		 * its last read was made at. Elsewhere a read made past the limit is a timeout,
 		 * as before.
 		 */
-		if ((val || !tipd_sleep_ssps_rules()) && time_is_before_jiffies(timeout))
+		if ((val || !tipd_sleep_ssps_rules(tps)) && time_is_before_jiffies(timeout))
 			return -ETIMEDOUT;
 		/* A command with a long limit is not waited for in silence: a line each second */
 		if (val && cmd_timeout_ms > 1000 && time_is_before_jiffies(note) &&
-		    tipd_sleep_ssps_rules()) {
+		    tipd_sleep_ssps_rules(tps)) {
 			dev_info(tps->dev, "command %.4s not done after %u ms (limit %u ms)\n", cmd,
 				 jiffies_to_msecs(jiffies - (timeout - msecs_to_jiffies(cmd_timeout_ms))),
 				 cmd_timeout_ms);
@@ -1070,6 +1067,13 @@ static int cd321x_dp_release_first(struct cd321x *cd321x, bool *held)
 	return ret;
 }
 
+/* The boot order's first update has completed, or will not come: see tipd_boot_power_on(). */
+static void tipd_boot_order_done(struct tps6598x *tps)
+{
+	tps->boot_no_debounce = false;
+	tps->boot_usbw_due = false;
+}
+
 static void cd321x_retry_revalidation(struct cd321x *cd321x, bool reconnect)
 {
 	lockdep_assert_held(&cd321x->tps.lock);
@@ -1081,12 +1085,14 @@ static void cd321x_retry_revalidation(struct cd321x *cd321x, bool reconnect)
 	/* Keep a later physical event retryable if the automatic budget expires. */
 	cd321x->state_valid = false;
 	cd321x->wake_apply = false;
-	if (cd321x_pm_retry(&cd321x->pm, reconnect))
+	if (cd321x_pm_retry(&cd321x->pm, reconnect)) {
 		mod_delayed_work(system_freezable_wq, &cd321x->resume_work,
 				 msecs_to_jiffies(CD321X_DEBOUNCE_DELAY_MS));
-	else
+	} else {
 		dev_err(cd321x->tps.dev, "cable revalidation failed after %u attempts\n",
 			CD321X_RESUME_ATTEMPTS);
+		tipd_boot_order_done(&cd321x->tps);
+	}
 }
 
 static void cd321x_retry_held_mux(struct cd321x *cd321x)
@@ -1113,6 +1119,7 @@ static void cd321x_retry_held_mux(struct cd321x *cd321x)
 
 static void cd321x_update_done(struct cd321x *cd321x)
 {
+	tipd_boot_order_done(&cd321x->tps);
 	if (cd321x_pm_mux_done(&cd321x->pm))
 		dev_info(cd321x->tps.dev, "Type-C mux change went through after retrying\n");
 	cd321x_pm_complete(&cd321x->pm);
@@ -1137,6 +1144,28 @@ static bool cd321x_identity_known(const struct usb_pd_identity *id)
 }
 
 static void cd321x_macos_usbw(struct cd321x *cd321x);
+static void tipd_boot_host_started(struct tps6598x *tps, enum usb_role role);
+
+/*
+ * DisplayPort pin D comes to a connection whose USB 3 already runs: the partner entered the
+ * mode after the port's first update had set it up for USB. A lane provider that adds pin D
+ * beside a running USB 3 link (typec_mux_dp_joins_usb()) gets the change with the USB role
+ * kept, as macOS keeps the port's host running there and only adds the display. Every other
+ * mode change stops the role first.
+ */
+static bool cd321x_dp_joins_usb(struct cd321x *cd321x, const struct cd321x_status *st)
+{
+	u32 ds = st->data_status;
+
+	return cd321x->state_valid && !cd321x->state.alt &&
+	       cd321x->state.mode == TYPEC_STATE_USB &&
+	       (ds & TPS_DATA_STATUS_DATA_CONNECTION) &&
+	       (ds & TPS_DATA_STATUS_DP_CONNECTION) &&
+	       TPS_DATA_STATUS_DP_SPEC_PIN_ASSIGNMENT(ds) ==
+		       TPS_DATA_STATUS_DP_SPEC_PIN_ASSIGNMENT_D &&
+	       !(st->data_status_changed & TPS_DATA_STATUS_USB3_CONNECTION) &&
+	       typec_mux_dp_joins_usb(cd321x->mux);
+}
 
 static void cd321x_update_work(struct work_struct *work)
 {
@@ -1240,6 +1269,10 @@ static void cd321x_update_work(struct work_struct *work)
 	if (!new_connected)
 		reset |= CD321X_DP_RESET_UNPLUG;
 
+	/* DisplayPort pin D joining the running USB 3 link keeps the role. */
+	bool dp_joins = dp_mode_changed && !was_disconnected && new_role == old_role &&
+			cd321x_dp_joins_usb(cd321x, &st);
+
 	/* A new DP connection: its DP status counts once one is signalled. */
 	if (!new_connected || was_disconnected || !dp_connected || dp_mode_changed)
 		cd321x->dp_sid_valid = false;
@@ -1290,7 +1323,7 @@ static void cd321x_update_work(struct work_struct *work)
 
 	/* If we are switching from an active role, transition to USB_ROLE_NONE. */
 	if (old_role != USB_ROLE_NONE &&
-	    (new_role != old_role || was_disconnected || dp_mode_changed)) {
+	    (new_role != old_role || was_disconnected || (dp_mode_changed && !dp_joins))) {
 		ret = usb_role_switch_set_role(tps->role_sw, USB_ROLE_NONE);
 		if (ret)
 			goto retry;
@@ -1407,6 +1440,16 @@ static void cd321x_update_work(struct work_struct *work)
 			goto retry;
 	}
 	ret = cd321x_typec_update_mode(tps, &st, &display_busy, &held);
+	/*
+	 * A provider failed the change with the role kept: stop the role and set the mode
+	 * again, as for any other mode change.
+	 */
+	if (ret && dp_joins && !display_busy && !held) {
+		ret = usb_role_switch_set_role(tps->role_sw, USB_ROLE_NONE);
+		if (ret)
+			goto retry;
+		ret = cd321x_typec_update_mode(tps, &st, &display_busy, &held);
+	}
 	if (ret && !display_busy)
 		goto retry;
 	/* A shared display route can be busy while the dock's USB path is usable. */
@@ -1417,6 +1460,7 @@ static void cd321x_update_work(struct work_struct *work)
 	ret = usb_role_switch_set_role(tps->role_sw, new_role);
 	if (ret)
 		goto retry;
+	tipd_boot_host_started(tps, new_role);
 
 	/* A new USB4 route can disturb another port on the shared fabric. */
 	if (IS_REACHABLE(CONFIG_DRM) && cd321x->connector_fwnode &&
@@ -1485,6 +1529,7 @@ retry:
 		cd321x->pm.provider_busy = false;
 		cd321x->state_valid = false;
 		dev_err(tps->dev, "Type-C provider shut down; automatic retries stopped\n");
+		tipd_boot_order_done(tps);
 		return;
 	}
 	/* A held mux must not consume a coalesced partner edge. */
@@ -1529,8 +1574,9 @@ static int cd321x_switch_power_state(struct tps6598x *tps, u8 target_state);
  * the attach: the events and status read, then DATA1 = 0x00 and SSPS; ~530 ms later
  * SYS_PWR_STATE read twice, DATA1 = 0x00 and USBw. Linux sent neither outside a sleep, so after a
  * cable change the controller was left as the change left it. Here: SSPS 0x02 at a detach, SSPS
- * 0x00 at an attach and USBw 0x00 at the update after the attach's debounce (500 ms), on every
- * SN201202x of the J714s, only while running (not in a sleep's phases).
+ * 0x00 at an attach and USBw 0x00 at the update after the attach's debounce (500 ms), for an
+ * SN201202x whose DT asks for it (apple,cable-change-ssps, the traced J714s's USB-C ports), only
+ * while running (not in a sleep's phases).
  */
 #define TIPD_SSPS_MACOS_DETACHED	0x02
 /*
@@ -1540,14 +1586,20 @@ static int cd321x_switch_power_state(struct tps6598x *tps, u8 target_state);
  */
 #define TIPD_REG_MACOS_DETACH		0x50
 
-/* Only the USB-C ports' controllers, as traced: MagSafe's has no connector */
+/*
+ * An SN201202x whose DT asks for macOS's cable-change sequence (apple,cable-change-ssps), and only
+ * a USB-C port's, as traced: MagSafe's has no connector. Not a controller in a debug route, from
+ * before Linux or opened through debugfs: that route is its owner's, and gets no power state
+ * commands.
+ */
 static bool cd321x_macos_cable_port(struct cd321x *cd321x)
 {
-	struct device *dev = cd321x->tps.dev;
+	struct tps6598x *tps = &cd321x->tps;
+	struct device *dev = tps->dev;
 	struct fwnode_handle *con;
 
-	if (!device_is_compatible(dev, "apple,sn201202x") ||
-	    !of_machine_is_compatible("apple,j714s"))
+	if (!device_is_compatible(dev, "apple,sn201202x") || tps->dbma_at_probe ||
+	    tipd_debugfs_dbma_held(tps) || !device_property_read_bool(dev, "apple,cable-change-ssps"))
 		return false;
 	con = device_get_named_child_node(dev, "connector");
 	fwnode_handle_put(con);
@@ -1649,6 +1701,16 @@ static int cd321x_connect(struct tps6598x *tps, u32 status)
 				 msecs_to_jiffies(CD321X_DEBOUNCE_DELAY_MS));
 	if (!cd321x_pm_can_update(&cd321x->pm))
 		return 0;
+	/*
+	 * The first update after the probe left the boot power state (queued by the ready
+	 * revalidation: the probe's own connect queues none) runs without the debounce, see
+	 * tipd_boot_power_on().
+	 */
+	if (tps->boot_no_debounce) {
+		tps->boot_no_debounce = false;
+		if (status & TPS_STATUS_PLUG_PRESENT)
+			delay = 0;
+	}
 
 	/*
 	 * Requeue even when the previous update is already running.  A separate
@@ -1790,6 +1852,7 @@ static int cd321x_prepare(struct tps6598x *tps)
 
 	scoped_guard(mutex, &tps->lock) {
 		cd321x_pm_prepare(&cd321x->pm);
+		tipd_boot_order_done(tps);
 		cd321x->state_valid = false;
 		cd321x->wake_apply = false;
 		cd321x->sleep_plug = tps->status & TPS_STATUS_PLUG_PRESENT;
@@ -1806,9 +1869,9 @@ static int cd321x_prepare(struct tps6598x *tps)
 		guard(mutex)(&tps->lock);
 		ret = tps->data->switch_power_state(tps, TPS_SYSTEM_POWER_STATE_S3);
 		/* Without the rules: the lines and their levels as they were */
-		if (!tipd_sleep_ssps_rules() && ret)
+		if (!tipd_sleep_ssps_rules(tps) && ret)
 			dev_warn(tps->dev, "didn't take system power state S3: %d\n", ret);
-		else if (!tipd_sleep_ssps_rules())
+		else if (!tipd_sleep_ssps_rules(tps))
 			dev_dbg(tps->dev, "system power state S3\n");
 		else if (ret)
 			dev_warn(tps->dev, "didn't take system power state S3: %d after %lld ms: sleep refused\n",
@@ -1824,7 +1887,7 @@ static int cd321x_prepare(struct tps6598x *tps)
 	 * instead of a sleep. Refused here, nothing has been stopped yet and the controller is set
 	 * up again.
 	 */
-	if (ret && tipd_sleep_ssps_rules())
+	if (ret && tipd_sleep_ssps_rules(tps))
 		return -EBUSY;
 	return 0;
 }
@@ -2008,7 +2071,7 @@ static void cd321x_complete(struct tps6598x *tps)
 		int ret = tps->data->switch_power_state(tps, TPS_SYSTEM_POWER_STATE_S0);
 
 		/* After a sleep or a refused one: never waited for in silence, and never longer */
-		if (!tipd_sleep_ssps_rules())
+		if (!tipd_sleep_ssps_rules(tps))
 			ret = 0;
 		else if (ret)
 			dev_warn(tps->dev, "didn't take system power state S0: %d after %lld ms; set up again by its next event\n",
@@ -2532,7 +2595,7 @@ static int cd321x_switch_power_state(struct tps6598x *tps, u8 target_state)
 	 * Under the sleep's rules the command goes to a controller that has just been sent its
 	 * bus's wake command and has answered it, whatever it was doing: woken, read, commanded.
 	 */
-	if (tps->wake && tipd_sleep_ssps_rules()) {
+	if (tps->wake && tipd_sleep_ssps_rules(tps)) {
 		ret = tps->wake(tps);
 		if (ret)
 			return ret;
@@ -2550,13 +2613,13 @@ static int cd321x_switch_power_state(struct tps6598x *tps, u8 target_state)
 	 * the sleep's rules. Under them S0 and S3 have the sleep's own limit and are read with
 	 * gaps.
 	 */
-	if ((target_state == TPS_SYSTEM_POWER_STATE_S0 || tipd_sleep_ssps_rules()) &&
+	if ((target_state == TPS_SYSTEM_POWER_STATE_S0 || tipd_sleep_ssps_rules(tps)) &&
 	    device_is_compatible(tps->dev, "apple,sn201202x"))
 		ret = tps6598x_exec_cmd_gap(tps, "SSPS", sizeof(target_state),
 					  &target_state, 0, NULL,
-					  tipd_sleep_ssps_rules() ?
+					  tipd_sleep_ssps_rules(tps) ?
 					  CD321X_SLEEP_SSPS_LIMIT_MS : 5000, 0,
-					  tipd_sleep_ssps_rules() ? CD321X_SSPS_READ_GAP_US : 0);
+					  tipd_sleep_ssps_rules(tps) ? CD321X_SSPS_READ_GAP_US : 0);
 	else
 		ret = tps6598x_exec_cmd(tps, "SSPS", sizeof(target_state),
 				      &target_state, 0, NULL);
@@ -2783,21 +2846,13 @@ VISIBLE_IF_KUNIT int cd321x_reboot_notify(struct notifier_block *nb,
 }
 EXPORT_SYMBOL_IF_KUNIT(cd321x_reboot_notify);
 
-/* Separate so that the KUnit tests can choose the driver core's answer. */
-VISIBLE_IF_KUNIT bool cd321x_tbt_switch_keep_waiting(struct device *dev)
-{
-	KUNIT_STATIC_STUB_REDIRECT(cd321x_tbt_switch_keep_waiting, dev);
-
-	return driver_deferred_probe_check_state(dev) == -EPROBE_DEFER;
-}
-EXPORT_SYMBOL_IF_KUNIT(cd321x_tbt_switch_keep_waiting);
-
 /*
  * The USB4/Thunderbolt router is only needed once a USB4 or Thunderbolt link
  * comes up. If its driver is not built or has not bound yet, do not leave power
- * delivery, USB and DisplayPort on this port without a driver as well: stop
- * waiting for the router when the driver core stops waiting for missing
- * dependencies. The router can still bind later, so set @late to take it then.
+ * delivery, USB and DisplayPort on this port without a driver as well. The port
+ * takes the router whenever it binds (set @late), so it does not wait for it:
+ * waiting for the driver core to give up on a router that is not built delays
+ * every port by the deferred probe timeout.
  */
 VISIBLE_IF_KUNIT struct typec_thunderbolt_switch *
 cd321x_tbt_switch_get(struct device *dev, struct fwnode_handle *fwnode,
@@ -2807,7 +2862,7 @@ cd321x_tbt_switch_get(struct device *dev, struct fwnode_handle *fwnode,
 
 	*late = false;
 	sw = fwnode_typec_thunderbolt_switch_get(fwnode);
-	if (sw != ERR_PTR(-EPROBE_DEFER) || cd321x_tbt_switch_keep_waiting(dev))
+	if (sw != ERR_PTR(-EPROBE_DEFER))
 		return sw;
 
 	dev_info(dev, "USB4/Thunderbolt router unavailable, continuing without it until it binds\n");
@@ -2817,9 +2872,9 @@ cd321x_tbt_switch_get(struct device *dev, struct fwnode_handle *fwnode,
 EXPORT_SYMBOL_IF_KUNIT(cd321x_tbt_switch_get);
 
 /*
- * Take a router that bound after the port gave up on it, or that unbound and
- * bound again. An attached cable raises no new event, so reapply it through
- * the router as after system sleep.
+ * Take a router that bound after the port probed without it, or that unbound
+ * and bound again. An attached cable raises no new event, so reapply it
+ * through the router as after system sleep.
  */
 static void cd321x_tbt_attach_work(struct work_struct *work)
 {
@@ -3526,33 +3581,38 @@ static int cd321x_remove(struct tps6598x *tps)
 }
 
 /*
- * Boards whose inherited boot connection must be renegotiated. The port
- * controller key is the reversed target identifier.
- *
- * J716c: the boot port keeps a USB2 repeater connection.
- * J575c: a connection that was up before Linux keeps its Type-C retimer set up
- * from before the host PHY ran, so SuperSpeed stays in RxDetect until the
- * partner is replugged. Byte 7 of register 0x7e has bit 3 set once the
- * controller has completed an attach with the OS running (after a replug, and
- * under macOS) and bit 2 in the inherited state; renegotiate only without
- * bit 3. A failure leaves the port as it was (USB2 only) instead of failing
- * the probe.
+ * An SN201202x takes "DISC" unlocked with the key its DT gives it (apple,debug-lock-key, the board
+ * number reversed).
  */
-#define CD321X_ATTACH_STATE_REG		0x7e
-#define CD321X_ATTACH_STATE_BYTE	7
-#define CD321X_ATTACH_STATE_DONE	BIT(3)
+static int tipd_replug_key(struct tps6598x *tps, u8 key[4])
+{
+	const char *s;
 
+	if (!device_is_compatible(tps->dev, "apple,sn201202x") ||
+	    device_property_read_string(tps->dev, "apple,debug-lock-key", &s) || strlen(s) != 4)
+		return -EOPNOTSUPP;
+	memcpy(key, s, 4);
+	return 0;
+}
+
+/*
+ * A connection that was up before Linux keeps state from the boot chain: a USB2 repeater
+ * connection on the J716c boot port, or on the J575c a Type-C retimer set up before the host PHY
+ * ran, so SuperSpeed stays in RxDetect until the partner is replugged. The controller reports
+ * nothing that tells such a connection apart from one that trains, so every one is renegotiated.
+ *
+ * The renegotiation's DISC takes the controller unlocked with the board's LOCK key, the board
+ * number reversed. A port whose DT gives it (apple,debug-lock-key) is left as it was if the
+ * renegotiation fails. The J716c's DT does not give it yet: its key is here, and a failure there
+ * fails the probe.
+ */
 struct cd321x_inherited_board {
 	const char *compatible;
 	u8 key[4];
-	bool check_attach_state;
-	bool best_effort;
 };
 
 static const struct cd321x_inherited_board cd321x_inherited_boards[] = {
 	{ .compatible = "apple,j716c", .key = { '6', '1', '7', 'J' } },
-	{ .compatible = "apple,j575c", .key = { '5', '7', '5', 'J' },
-	  .check_attach_state = true, .best_effort = true },
 };
 
 static const struct cd321x_inherited_board *cd321x_inherited_board(void)
@@ -3565,21 +3625,7 @@ static const struct cd321x_inherited_board *cd321x_inherited_board(void)
 	return NULL;
 }
 
-static int cd321x_attach_state_done(struct tps6598x *tps)
-{
-	u8 state[CD321X_ATTACH_STATE_BYTE + 1];
-	int ret;
-
-	ret = tps6598x_block_read(tps, CD321X_ATTACH_STATE_REG, state, sizeof(state));
-	if (ret)
-		return ret;
-	dev_dbg(tps->dev, "inherited connection, attach state 0x%02x\n",
-		state[CD321X_ATTACH_STATE_BYTE]);
-	return !!(state[CD321X_ATTACH_STATE_BYTE] & CD321X_ATTACH_STATE_DONE);
-}
-
-static int __cd321x_reset_inherited_connection(struct tps6598x *tps,
-						const struct cd321x_inherited_board *board,
+static int __cd321x_reset_inherited_connection(struct tps6598x *tps, const u8 key[4],
 						u32 *status)
 {
 	static const u8 locked[4];
@@ -3590,15 +3636,9 @@ static int __cd321x_reset_inherited_connection(struct tps6598x *tps,
 	mode = tps6598x_check_mode(tps);
 	if (mode != TPS_MODE_APP && mode != TPS_MODE_APP1)
 		return 0;
-	if (board->check_attach_state) {
-		ret = cd321x_attach_state_done(tps);
-		if (ret)
-			return ret < 0 ? ret : 0;
-	}
 
 	/* All suppliers are available, but no USB or router session has started. */
-	ret = tps6598x_exec_cmd(tps, "LOCK", sizeof(board->key), board->key, sizeof(result),
-				&result);
+	ret = tps6598x_exec_cmd(tps, "LOCK", 4, key, sizeof(result), &result);
 	if (ret)
 		return ret;
 	if (result) {
@@ -3641,6 +3681,8 @@ relock:
 static int cd321x_reset_inherited_connection(struct tps6598x *tps, u32 *status)
 {
 	const struct cd321x_inherited_board *board;
+	bool best_effort = true;
+	u8 key[4];
 	int ret;
 
 	if (!device_property_read_bool(tps->dev, "apple,reset-inherited-usb2-connection") ||
@@ -3648,12 +3690,19 @@ static int cd321x_reset_inherited_connection(struct tps6598x *tps, u32 *status)
 	    tps->dbma_at_probe || !(*status & TPS_STATUS_PLUG_PRESENT) ||
 	    !TPS_STATUS_TO_TYPEC_DATAROLE(*status))
 		return 0;
-	board = cd321x_inherited_board();
-	if (!board)
-		return 0;
+	if (tipd_replug_key(tps, key)) {
+		board = cd321x_inherited_board();
+		if (!board) {
+			dev_warn(tps->dev,
+				 "inherited connection not reinitialized: no apple,debug-lock-key\n");
+			return 0;
+		}
+		memcpy(key, board->key, sizeof(key));
+		best_effort = false;
+	}
 
-	ret = __cd321x_reset_inherited_connection(tps, board, status);
-	if (!ret || !board->best_effort)
+	ret = __cd321x_reset_inherited_connection(tps, key, status);
+	if (!ret || !best_effort)
 		return ret;
 
 	dev_warn(tps->dev, "inherited connection not reinitialized: %d\n", ret);
@@ -3690,13 +3739,11 @@ static void tipd_port_list_del(struct tps6598x *tps)
 	cancel_work_sync(&tps->replug_work);
 }
 
-/* The J714s's port controllers take "DISC" unlocked with this key, the reversed target identifier. */
-static const u8 tipd_replug_key_j714s[4] = { '4', '1', '7', 'J' };
-
 bool tipd_replug_supported(struct tps6598x *tps)
 {
-	return of_machine_is_compatible("apple,j714s") &&
-	       device_is_compatible(tps->dev, "apple,sn201202x");
+	u8 key[4];
+
+	return !tipd_replug_key(tps, key);
 }
 
 /*
@@ -3716,10 +3763,13 @@ static void tipd_replug_work(struct work_struct *work)
 	unsigned long timeout;
 	int ret, lock_ret, mode = -1;
 	unsigned int tries;
+	u8 key[4];
 
 	mutex_lock(&tps->lock);
-	ret = tps6598x_exec_cmd_gap(tps, "LOCK", sizeof(tipd_replug_key_j714s), tipd_replug_key_j714s,
-				    sizeof(result), &result, 1000, 0, CD321X_SSPS_READ_GAP_US);
+	ret = tipd_replug_key(tps, key);
+	if (!ret)
+		ret = tps6598x_exec_cmd_gap(tps, "LOCK", sizeof(key), key, sizeof(result), &result,
+					    1000, 0, CD321X_SSPS_READ_GAP_US);
 	if (!ret && result)
 		ret = -EIO;
 	if (!ret)
@@ -3788,7 +3838,8 @@ static int tipd_replug_queue(struct tps6598x *tps, u8 seconds)
  * DP alt mode hub whose SuperSpeed side does not come back after some wakes (dwc3-apple). A
  * display on the port goes dark meanwhile. The replug runs on the port's own work, after this
  * returns: 0 when it is queued, -EBUSY if one already is, -EOPNOTSUPP on a controller that is
- * not known to take it (the J714s's SN201202x only), -ENODEV if no port drives @sw.
+ * not known to take it (an SN201202x whose DT gives apple,debug-lock-key), -ENODEV if no port
+ * drives @sw.
  */
 int tipd_port_replug(struct usb_role_switch *sw, u8 seconds)
 {
@@ -3821,6 +3872,167 @@ int tipd_replug_request(struct tps6598x *tps, u8 seconds)
 	return tipd_replug_queue(tps, seconds);
 }
 
+/*
+ * SN201202x: a port controller found outside S0 at the probe (in its boot power state) leaves it as
+ * macOS has it do, at the port's host start. The macOS-HV trace of XNU's boot (11-20, a J714s with
+ * the Dell S2725QC on its Left Front port) has XNU find each of the machine's SN201202x in its boot
+ * power state (SYS_PWR_STATE 0x07) and read its
+ * status there, send it HChk (64 bytes of 0xfe) and then SSPS 0x00, have the port's xHCI running
+ * 86 ms after that SSPS and its SuperSpeed port powered at 113 ms, and send USBw 0x00 right after
+ * the xHCI runs. Only at 143 ms does the controller enter the partner's alternate mode (DP, pin
+ * assignment D). The Dell's USB3 hub resets its links when the mode comes up and again at HPD,
+ * and each time comes back about 1.2 s later onto a host that is already there, SuperSpeed first.
+ *
+ * Linux used to send SSPS 0x00 at the very start of the probe, 2.5 to 3 s before the port's host
+ * (the LDCM command, the rest of the probe, the attach debounce, the PHY's start). The hub then
+ * came back to no host: its SuperSpeed side gave up and came up only after the USB2 hub's
+ * enumeration resets (96 of 108 boots), or not at all (5 of 108: lost until a replug).
+ *
+ * So the probe keeps the boot power state until its end, the decision taken from the state the
+ * controller reports, whatever the machine. There, as XNU: HChk, then SSPS 0x00, before anything
+ * that needs S0 (an inherited connection's renegotiation). The
+ * PHY takes the pin assignment when it starts, so the mode the controller enters is waited for
+ * (at most 1.5 s, 143 ms in the trace), and the first update runs without the attach debounce;
+ * once it has set the host role, USBw 0x00.
+ */
+#define TIPD_BOOT_MODE_WAIT_MS		1500
+#define TIPD_BOOT_MODE_POLL_MS		20
+#define TIPD_BOOT_CMD1_WAIT_MS		5000
+#define TIPD_BOOT_HCHK_FILL		0xfe
+
+/* Whether the probe keeps the controller's boot power state until its end. */
+static bool tipd_boot_power_kept(struct tps6598x *tps)
+{
+	u8 state;
+
+	tps->boot_s0_deferred = false;
+	if (!device_is_compatible(tps->dev, "apple,sn201202x") ||
+	    tps6598x_read8(tps, TPS_REG_SYSTEM_POWER_STATE, &state) ||
+	    state == TPS_SYSTEM_POWER_STATE_S0)
+		return false;
+	dev_dbg(tps->dev, "boot power state %#x kept until the end of the probe\n", state);
+	tps->boot_s0_deferred = true;
+	return true;
+}
+
+/* A command still running from the probe (LDCM can take seconds) ends before HChk and SSPS. */
+static int tipd_boot_cmd1_idle(struct tps6598x *tps)
+{
+	ktime_t start = ktime_get();
+	u32 val;
+	int ret;
+
+	do {
+		ret = tps6598x_read32(tps, TPS_REG_CMD1, &val);
+		if (ret)
+			return ret;
+		if (!val || INVALID_CMD(val))
+			return 0;
+		usleep_range(CD321X_SSPS_READ_GAP_US, CD321X_SSPS_READ_GAP_US + 1000);
+	} while (ktime_ms_delta(ktime_get(), start) < TIPD_BOOT_CMD1_WAIT_MS);
+	return -ETIMEDOUT;
+}
+
+/* The probe's last step before the partner is registered, if it kept the boot power state. */
+static int tipd_boot_power_on(struct tps6598x *tps, u32 *status)
+{
+	u8 hchk[TPS_MAX_LEN], reply[TPS_MAX_LEN] = {};
+	ktime_t start;
+	u32 data = 0;
+	bool debug_port;
+	u64 mask;
+	int ret;
+
+	if (!tps->boot_s0_deferred)
+		return 0;
+	tps->boot_s0_deferred = false;
+	/*
+	 * A debug port (the boot loader's debug link: in DBMa, or described with its lock key)
+	 * gets only the SSPS, as before: no HChk, and no USBw, which moves the USB2 pair that
+	 * the debug link's route may use.
+	 */
+	debug_port = tps->dbma_at_probe ||
+		     device_property_present(tps->dev, "apple,debug-lock-key");
+	ret = tipd_boot_cmd1_idle(tps);
+	if (ret)
+		dev_dbg(tps->dev, "command still running before HChk: %d\n", ret);
+	if (!debug_port) {
+		memset(hchk, TIPD_BOOT_HCHK_FILL, sizeof(hchk));
+		ret = tps6598x_exec_cmd_gap(tps, "HChk", sizeof(hchk), hchk, sizeof(reply), reply,
+					    1000, 0, CD321X_SSPS_READ_GAP_US);
+		dev_dbg(tps->dev, "HChk: %d, %16ph\n", ret, reply);
+		if (ret)
+			tipd_boot_cmd1_idle(tps);
+	}
+
+	/* -EBUSY: a command the probe left running past both waits, see sn201202x_init() */
+	ret = tps->data->switch_power_state(tps, TPS_SYSTEM_POWER_STATE_S0);
+	if (ret)
+		return ret;
+	start = ktime_get();
+	/* XNU writes the mask in the boot power state too; it is read back once in S0. */
+	if (tps6598x_read64(tps, TPS_REG_INT_MASK1, &mask) || mask != cd321x_irq_mask(tps)) {
+		ret = tps6598x_write64(tps, TPS_REG_INT_MASK1, cd321x_irq_mask(tps));
+		if (ret)
+			return ret;
+	}
+	if (!tps6598x_read_status(tps, status))
+		return -EIO;
+	tps->status = *status;
+	/*
+	 * A port without USB data (MagSafe) has no mode to wait for, and a port whose inherited
+	 * connection is renegotiated next (cd321x_reset_inherited_connection()) attaches again
+	 * through the debounce, as before.
+	 */
+	if (!(*status & TPS_STATUS_PLUG_PRESENT) || !tps->role_sw ||
+	    device_property_read_bool(tps->dev, "apple,reset-inherited-usb2-connection"))
+		goto contaminant;
+
+	do {
+		if (!tps6598x_read32(tps, TPS_REG_DATA_STATUS, &data) &&
+		    data & (TPS_DATA_STATUS_DP_CONNECTION | TPS_DATA_STATUS_TBT_CONNECTION |
+			    CD321X_DATA_STATUS_USB4_CONNECTION))
+			break;
+		msleep(TIPD_BOOT_MODE_POLL_MS);
+	} while (ktime_ms_delta(ktime_get(), start) < TIPD_BOOT_MODE_WAIT_MS);
+	dev_dbg(tps->dev, "S0 at the end of the probe, data status %#x after %lld ms\n", data,
+		ktime_ms_delta(ktime_get(), start));
+
+	if (!tps6598x_read_status(tps, status))
+		return -EIO;
+	tps->status = *status;
+	tps->boot_no_debounce = true;
+	tps->boot_usbw_due = !debug_port;
+contaminant:
+	/* A connector state read in the boot power state is read again in S0. */
+	if (tps->contaminant_ops && tps->contaminant != TYPEC_CONTAMINANT_NONE)
+		tps->contaminant_ops->update(tps);
+	return 0;
+}
+
+/*
+ * From the port lock's holder, the update that set @role: after the first host role following the
+ * boot power state, USBw 0x00 (tipd_usbw_locked(), with the sleep's SSPS read gaps).
+ */
+static void tipd_boot_host_started(struct tps6598x *tps, enum usb_role role)
+{
+	u8 mode = 0x00;	/* USBw off, as XNU sends it */
+	int ret;
+
+	lockdep_assert_held(&tps->lock);
+	if (!tps->boot_usbw_due)
+		return;
+	tps->boot_usbw_due = false;
+	if (role != USB_ROLE_HOST)
+		return;
+	ret = tipd_usbw_locked(tps, mode);
+	/* -EINVAL is a firmware without the command ("!CMD"): nothing to do there. */
+	if (ret == -EINVAL)
+		dev_dbg(tps->dev, "USBw %#x not known to the firmware\n", mode);
+	else if (ret)
+		dev_warn(tps->dev, "USBw %#x after the boot's host start failed: %d\n", mode, ret);
+}
+
 int tipd_init(struct tps6598x *tps)
 {
 	struct fwnode_handle *fwnode;
@@ -3851,7 +4063,8 @@ int tipd_init(struct tps6598x *tps)
 		}
 	}
 
-	if (tps->data->switch_power_state) {
+	/* An SN201202x in its boot power state leaves it at the end: tipd_boot_power_on(). */
+	if (tps->data->switch_power_state && !tipd_boot_power_kept(tps)) {
 		ret = tps->data->switch_power_state(tps, TPS_SYSTEM_POWER_STATE_S0);
 		if (ret)
 			return ret;
@@ -3871,9 +4084,10 @@ int tipd_init(struct tps6598x *tps)
 
 	/*
 	 * A controller found in "DBMa" is used as it is. Nothing below issues a
-	 * mode-changing 4CC command (the S0 power state switch above only does
-	 * if the controller is not in S0 already), so probing neither leaves the
-	 * debug mode nor disturbs a Debug USB or serial route set up before
+	 * mode-changing 4CC command (the S0 power state switch, above or at the end
+	 * of the probe for an SN201202x in its boot power state, only does if the
+	 * controller is not in S0 already, and HChk is skipped), so probing neither
+	 * leaves the debug mode nor disturbs a Debug USB or serial route set up before
 	 * Linux. The LDCM safety command below does not change controller mode.
 	 * Remember it, so that the debugfs interface never tears that mode down.
 	 */
@@ -3937,6 +4151,11 @@ int tipd_init(struct tps6598x *tps)
 			ret = 0;
 		}
 	}
+
+	/* Before the inherited connection's renegotiation, which runs in S0. */
+	ret = tipd_boot_power_on(tps, &status);
+	if (ret)
+		goto err_disconnect;
 
 	ret = cd321x_reset_inherited_connection(tps, &status);
 	if (ret)

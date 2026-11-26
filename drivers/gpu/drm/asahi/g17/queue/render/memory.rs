@@ -145,11 +145,14 @@ impl Graph {
             context.vm(),
             TA_BYTES..TA_BYTES + FRAGMENT_BYTES,
         )?) };
+        // Both firmware and host write queue records (in-place retargeting and
+        // work-slot binding on G17P, and zeroing on pool reuse everywhere). Keep
+        // the whole queue-state object uncached while retaining it in the pool.
         let mut queues = pool.allocate(
             alloc,
             Family::QueueState,
             GRAPH_SIZE,
-            0x8000,
+            0,
             prot,
             CpuMap::WriteCombined,
         )?;
@@ -603,6 +606,7 @@ impl Memory {
                 buffer_id: buffer_id.0,
                 generation: pm_generation,
                 first_ordinal: ordinal,
+                normal_blocks: variant.tvb_normal_blocks,
             },
         )?;
         let predecessor = crate::g17::ids::OBJECTS.object()?;
@@ -1061,6 +1065,7 @@ impl Memory {
                     pointer.write_unaligned(value);
                 }
             }
+            core::sync::atomic::fence(Ordering::Release);
             return Ok(());
         }
         let offsets = qids.map(|qid| usize::from(qid) * size_of::<queue::QueueRecord>());
@@ -1105,6 +1110,7 @@ impl Memory {
                 }
             }
         }
+        core::sync::atomic::fence(Ordering::Release);
         Ok(())
     }
 }
