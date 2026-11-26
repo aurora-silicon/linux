@@ -22,7 +22,7 @@ use crate::g17::{
     freelist::RenderPool,
     fw::{
         channels::WorkSlot,
-        kick::{KickDependency, KickTimestamp, McacheTable, RenderRegistration},
+        kick::{KickDependency, KickTimestamp, McacheTable, RenderRegistration, WriteRange},
         queue::DataMaster,
         render as abi,
     },
@@ -517,7 +517,6 @@ impl Pair {
         }
         let Validated::Render {
             pass,
-            attachments,
             ray_query,
             resources: programs,
             plan,
@@ -628,11 +627,15 @@ impl Pair {
             deflake: deflake_layout,
         };
         self.memory.graph.claim(ordinal)?;
-        // Without an MCache table kick-entry bit 58 stays clear.
-        let attachments = match self.variant.mcache {
-            true => attachments[1].as_slice(),
-            false => &[][..],
-        };
+        // Fragment kicks name no MCache ranges; the attachments still order
+        // overlapping renders through their footprints (`Job::footprint`).
+        // On the A18 Pro, naming a pass's attachments made a 2048x2048 RGBA8
+        // upload rewritten back to back cost 335 us per pass instead of 237 us,
+        // about 6 us per named MiB, while render rows that blend, resolve or
+        // sample their targets did not move. Compute kicks keep naming their
+        // write ranges (`ComputeDescriptor::write_mcache`), which speeds up
+        // fills. Without an MCache table kick-entry bit 58 stays clear.
+        let attachments: &[WriteRange] = &[];
         let result = if self.memory.graph.is_m5() {
             self.memory
                 .write_m5_commands(
