@@ -4,9 +4,11 @@
 
 #include <linux/interrupt.h>
 #include <linux/list.h>
+#include <linux/of.h>
 #include <linux/types.h>
 
 #include "dcp-fabric-core.h"
+#include "dcp-fabric-effects.h"
 
 struct apple_connector;
 struct apple_crtc;
@@ -80,6 +82,12 @@ struct device_node *dcp_typec_port_of_node(unsigned int idx);
 bool dcp_typec_port_has_candidate(unsigned int idx, struct platform_device *pdev);
 bool dcp_typec_port_carries_stream(unsigned int idx, struct platform_device *pdev,
 				   unsigned int slot);
+#if IS_ENABLED(CONFIG_KUNIT)
+/* apple_drv.c: whether a native26 pipeline can drive Type-C port @port_idx */
+bool apple_typec_port_rgb8_only(struct platform_device **dcp, int num_dcp,
+				struct platform_device *pipeline,
+				unsigned int port_idx);
+#endif
 /* Connectors by apple,connector-group; T6050's tunnel-only pairs after the others in each */
 #define DCP_TYPEC_CONNECTOR_GROUPS 4
 unsigned int dcp_typec_nr_passes(void);
@@ -142,7 +150,14 @@ bool dcp_t8132_ext_hw(const struct apple_dcp *dcp);
 bool dcp_t8132_link_report_late(struct apple_dcp *dcp, const char *what);
 
 /* DCP probe, resume and endpoint teardown hooks. */
+static inline bool dcp_typec_routes_available(const struct device_node *routes)
+{
+	return dcp_fabric_has_available_routes(!!routes,
+					       routes ? of_get_available_child_count(routes) : 0);
+}
+
 int dcp_register_typec_routes(struct apple_dcp *dcp);
+void dcp_sleep_hold_phys(struct apple_dcp *dcp);
 void dcp_typec_route_park(struct apple_dcp *dcp);
 void dcp_typec_route_unpark(struct apple_dcp *dcp);
 int dcp_fabric_sleep_release(struct apple_dcp *dcp, s64 ms[2]);

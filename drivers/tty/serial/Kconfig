@@ -121,6 +121,22 @@ config SERIAL_APPLE_DOCKCHANNEL
 	  whose firmware has configured this transport, including T8140.
 	  It can take over from the DockChannel early console during boot.
 
+config SERIAL_APPLE_DOCKCHANNEL_KUNIT_TEST
+	bool "KUnit tests for the Apple DockChannel UART" if !KUNIT_ALL_TESTS
+	depends on SERIAL_APPLE_DOCKCHANNEL && KUNIT=y
+	select IRQ_SIM
+	default KUNIT_ALL_TESTS
+	help
+	  Drive the DockChannel UART port through a FIFO that the test models
+	  behind static stubs: RX draining with the per-pass FIFO size clamp,
+	  TX limited by the room in the FIFO and dropped when no reader comes,
+	  the interrupt mask bits of other channels, startup and shutdown,
+	  termios, and the console output helpers. The UART interrupt is a
+	  simulated interrupt and the other registers are kernel memory. The
+	  tests touch no hardware and register no port.
+
+	  If unsure, say N.
+
 config SERIAL_SB1250_DUART
 	tristate "BCM1xxx on-chip DUART serial support"
 	depends on SIBYTE_SB1xxx_SOC=y

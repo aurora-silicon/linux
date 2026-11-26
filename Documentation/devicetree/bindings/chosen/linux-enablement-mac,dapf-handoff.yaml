@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: (GPL-2.0 OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/chosen/linux-enablement-mac,dapf-handoff.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple T8132 DAPF consumer hand-off
+
+maintainers:
+  - Diljit Singh <hey@djdev.me>
+
+description:
+  Board device trees on Apple T8132 Macs describe which ADT consumers need
+  their DART access protection filters (DAPFs) programmed by the bootloader
+  before handing control to Linux, and whether a consumer must be powered on
+  or programmed as halted prior to hand-off.
+
+select:
+  properties:
+    $nodename:
+      const: chosen
+  required:
+    - $nodename
+
+properties:
+  $nodename:
+    const: chosen
+
+  linux-enablement-mac,dapf-handoff:
+    $ref: /schemas/types.yaml#/definitions/string-array
+    description:
+      ADT paths of consumers (for example "/arm-io/aop", "/arm-io/mtp",
+      "/arm-io/pmp") whose DART access protection filters the bootloader
+      programs for hand-off to Linux.
+
+  linux-enablement-mac,dapf-power-on-handoff:
+    $ref: /schemas/types.yaml#/definitions/string-array
+    description:
+      Subset of consumers listed in linux-enablement-mac,dapf-handoff that
+      the bootloader powers on before programming their DAPFs and leaves
+      powered across hand-off.
+
+  linux-enablement-mac,dapf-halted-handoff:
+    $ref: /schemas/types.yaml#/definitions/string-array
+    description:
+      Subset of consumers listed in linux-enablement-mac,dapf-handoff that
+      boot firmware leaves halted and unpowered, whose DAPFs the bootloader
+      programs for a halted consumer so Linux can cold-start them.
+
+additionalProperties: true
+...

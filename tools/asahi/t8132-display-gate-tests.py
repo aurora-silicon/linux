@@ -35,6 +35,7 @@ def main():
     gate_src = (ROOT / 'drivers/soc/apple/display-gate.c').read_text()
     disp_hdr = (ROOT / 'include/linux/soc/apple/display.h').read_text()
     t8132_hdr = (ROOT / 'include/linux/soc/apple/t8132.h').read_text()
+    dart_hdr = (ROOT / 'include/linux/soc/apple/dart.h').read_text()
 
     # Enforce at source level that T8132 fixed-DP gate matches the SoC, not a board name,
     # and carries no hard-coded board node paths.
@@ -51,6 +52,7 @@ def main():
         uuid_lines,
         extract_block(disp_hdr, r'^static inline bool apple_dcp_image_v27_2\('),
         extract_block(t8132_hdr, r'^static inline bool apple_t8132_dcpext_v27_2\('),
+        extract_block(dart_hdr, r'^static inline bool apple_dart_keeps_locked_roots\('),
         extract_block(gate_src, r'^static int gate_iommus_append\('),
         extract_block(gate_src, r'^static struct of_changeset \*__init gate_cs_alloc\('),
         extract_block(gate_src, r'^static void __init gate_cs_free\('),
@@ -61,6 +63,7 @@ def main():
         extract_block(gate_src, r'^static void __init gate_t8132_put_nodes\('),
         extract_block(gate_src, r'^static int __init gate_t8132_resolve_fixed_dp\('),
         extract_block(gate_src, r'^static bool __init gate_t8132_fixed_dp_ready\('),
+        extract_block(gate_src, r'^static void __init gate_t8132_display_off\('),
         extract_block(gate_src, r'^static void __init gate_t8132_run\('),
     ])
 
@@ -474,6 +477,13 @@ static int of_changeset_apply(struct of_changeset *cs)
 	return 0;
 }
 ''' + helpers + r'''
+/*
+ * A DART kind whose locked firmware roots apple-dart keeps
+ * (apple_dart_keeps_locked_roots()). The J773g's own, apple,t8132-dart, is not
+ * one in this tree: see j773g_darts().
+ */
+#define KEPT_DART "apple,t6041-dart"
+
 struct fixture {
 	struct device_node display, disp0_dart, main_dcp;
 	struct device_node phy, fw_dart, disp_dart, mbox, piodma, dcpext0;
@@ -545,10 +555,12 @@ static void init_fixture(struct fixture *f)
 		.path = "/soc/phy@999700000", .phandle = 20, .available = false,
 	};
 	f->fw_dart = (struct device_node){
-		.path = "/soc/iommu@999340000", .phandle = 21, .available = false,
+		.path = "/soc/iommu@999340000", .compatible = KEPT_DART,
+		.phandle = 21, .available = false,
 	};
 	f->disp_dart = (struct device_node){
-		.path = "/soc/iommu@999300000", .phandle = 22, .available = false,
+		.path = "/soc/iommu@999300000", .compatible = KEPT_DART,
+		.phandle = 22, .available = false,
 	};
 	f->mbox = (struct device_node){
 		.path = "/soc/mailbox@999e08000", .phandle = 23, .available = false,
@@ -606,6 +618,67 @@ static void init_fixture(struct fixture *f)
 	register_node(&f->dcpext1);
 }
 
+/* The J773g's dcpext0 DARTs, which this tree's apple-dart does not keep the locked roots of. */
+static void j773g_darts(struct fixture *f)
+{
+	f->fw_dart.compatible = "apple,t8132-dart";
+	f->disp_dart.compatible = "apple,t8132-dart";
+}
+
+/* Stage 2 published nothing for the dcpexts: no image, placeholders, no display. */
+static void no_handover(struct fixture *f)
+{
+	struct device_node *dcps[] = { &f->dcpext0, &f->dcpext1 };
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(dcps); i++) {
+		dcps[i]->fw_uuid = NULL;
+		dcps[i]->fw_uuid_count = 0;
+		dcps[i]->fw_ver_cells = 0;
+		dcps[i]->fw_compat_cells = 0;
+	}
+	f->mem_text.available = f->mem_data.available = f->mem_heap.available = false;
+	f->display.available = false;
+}
+
+struct snapshot {
+	bool available[MAX_NODES];
+	int display_iommus;
+	struct device_node *display_iommu[4];
+};
+
+static void take_snapshot(struct fixture *f, struct snapshot *snap)
+{
+	unsigned int i;
+
+	for (i = 0; i < nr_nodes; i++)
+		snap->available[i] = all_nodes[i]->available;
+	snap->display_iommus = f->display.iommu_count;
+	memcpy(snap->display_iommu, f->display.iommus, sizeof(snap->display_iommu));
+}
+
+static void expect_unchanged(struct fixture *f, const struct snapshot *snap)
+{
+	unsigned int i;
+
+	for (i = 0; i < nr_nodes; i++)
+		assert(all_nodes[i]->available == snap->available[i]);
+	assert(f->display.iommu_count == snap->display_iommus);
+	assert(!memcmp(f->display.iommus, snap->display_iommu, sizeof(snap->display_iommu)));
+	assert(nr_applied_cs == 0);
+}
+
+/*
+ * What the GPU sees (asahi_g16_display_prepare()): with the display subsystem
+ * disabled it starts on the boot framebuffer instead of waiting for it.
+ */
+static void expect_gpu_on_boot_framebuffer(struct fixture *f)
+{
+	assert(!of_device_is_available(&f->display));
+	assert(!f->disp0_dart.available);
+	assert(f->display.iommu_count == 1 && f->display.iommus[0] == &f->disp0_dart);
+}
+
 static void expect_chain(struct fixture *f, bool enabled)
 {
 	assert(f->phy.available == enabled);
@@ -619,6 +692,7 @@ static void expect_chain(struct fixture *f, bool enabled)
 
 int main(void)
 {
+	struct snapshot snap;
 	struct fixture f;
 
 	/* 1. Headless T8132 (J773g-like): phandle-derived chain enabled; disp0 iommus replaced. */
@@ -649,38 +723,47 @@ int main(void)
 	assert(f.display.iommu_count == 1 && f.display.iommus[0] == &f.disp_dart);
 	check_refs_zero();
 
+	/*
+	 * 4-7: a refused chain on a headless T8132 leaves the display subsystem the
+	 * boot loader enabled, and its DART, disabled: the GPU starts on the boot
+	 * framebuffer.
+	 */
 	/* 4. Unapproved firmware UUID on dcpext0 -> chain stays disabled, disp0 unchanged. */
 	init_fixture(&f);
+	f.disp0_dart.available = true;
 	f.dcpext0.fw_uuid = "00000000-0000-0000-0000-000000000000";
 	gate_t8132_run();
 	expect_chain(&f, false);
-	assert(f.display.iommu_count == 1 && f.display.iommus[0] == &f.disp0_dart);
+	expect_gpu_on_boot_framebuffer(&f);
 	check_refs_zero();
 
 	/* 5. Placeholder (disabled) memory-region -> refused whole. */
 	init_fixture(&f);
+	f.disp0_dart.available = true;
 	f.mem_heap.available = false;
 	gate_t8132_run();
 	expect_chain(&f, false);
-	assert(f.display.iommu_count == 1 && f.display.iommus[0] == &f.disp0_dart);
+	expect_gpu_on_boot_framebuffer(&f);
 	check_refs_zero();
 
 	/* 6. Missing phandle (e.g. no piodma child) -> refused whole. */
 	init_fixture(&f);
+	f.disp0_dart.available = true;
 	f.dcpext0.piodma_child = NULL;
 	gate_t8132_run();
 	expect_chain(&f, false);
-	assert(f.display.iommu_count == 1 && f.display.iommus[0] == &f.disp0_dart);
+	expect_gpu_on_boot_framebuffer(&f);
 	check_refs_zero();
 
 	/* 7. Any chain node already enabled -> refused whole, DART not modified. */
 	init_fixture(&f);
+	f.disp0_dart.available = true;
 	f.phy.available = true;
 	gate_t8132_run();
 	assert(f.phy.available);
 	assert(!f.fw_dart.available && !f.disp_dart.available && !f.mbox.available &&
 	       !f.piodma.available && !f.dcpext0.available);
-	assert(f.display.iommu_count == 1 && f.display.iommus[0] == &f.disp0_dart);
+	expect_gpu_on_boot_framebuffer(&f);
 	check_refs_zero();
 
 	/* 8. Disabled display subsystem -> chain stays disabled. */
@@ -691,23 +774,108 @@ int main(void)
 	assert(f.display.iommu_count == 1 && f.display.iommus[0] == &f.disp0_dart);
 	check_refs_zero();
 
-	/* 9. Tree with no fixed dp-phy on any dcpext -> quiet no-op. */
+	/*
+	 * 9. No fixed dp-phy on any dcpext -> no chain, no error; the display
+	 * subsystem has nothing to bind and goes.
+	 */
 	init_fixture(&f);
+	f.disp0_dart.available = true;
 	f.dcpext0.phy_names[0] = "typec1";
 	gate_t8132_run();
 	expect_chain(&f, false);
-	assert(err_count == 0 && info_count == 0);
+	expect_gpu_on_boot_framebuffer(&f);
+	assert(err_count == 0 && info_count == 1);
 	check_refs_zero();
 
-	/* 10. nomodeset -> no-op. */
+	/* 10. nomodeset -> no chain; drm/apple does not register, so neither does the display. */
 	init_fixture(&f);
+	f.disp0_dart.available = true;
 	nomodeset = true;
 	gate_t8132_run();
 	expect_chain(&f, false);
+	expect_gpu_on_boot_framebuffer(&f);
+	check_refs_zero();
+
+	/*
+	 * 11. No handover (Stage 2 published nothing for the dcpexts): no change
+	 * from a tree without this gate. Nothing is enabled or disabled, disp0's
+	 * iommus stay, and nothing is logged.
+	 */
+	init_fixture(&f);
+	no_handover(&f);
+	take_snapshot(&f, &snap);
+	gate_t8132_run();
+	expect_unchanged(&f, &snap);
+	assert(err_count == 0 && info_count == 0);
+	check_refs_zero();
+
+	/* 11b. The same with the J773g's DARTs, and under nomodeset. */
+	init_fixture(&f);
+	no_handover(&f);
+	j773g_darts(&f);
+	take_snapshot(&f, &snap);
+	gate_t8132_run();
+	expect_unchanged(&f, &snap);
+	nomodeset = true;
+	gate_t8132_run();
+	expect_unchanged(&f, &snap);
+	check_refs_zero();
+
+	/*
+	 * 12. The J773g on 27.2 with this tree: Stage 2 handed dcpext0 over and
+	 * enabled the display subsystem and disp0's DART, but apple-dart keeps no
+	 * locked roots of a T8132 DART. The chain stays off and the display goes,
+	 * so the GPU starts on the boot framebuffer as without the handover.
+	 */
+	init_fixture(&f);
+	j773g_darts(&f);
+	f.disp0_dart.available = true;
+	gate_t8132_run();
+	expect_chain(&f, false);
+	expect_gpu_on_boot_framebuffer(&f);
+	assert(err_count == 0);
+	check_refs_zero();
+
+	/* 13. Either DART of the chain alone not kept -> the same. */
+	init_fixture(&f);
+	f.disp0_dart.available = true;
+	f.fw_dart.compatible = "apple,t8132-dart";
+	gate_t8132_run();
+	expect_chain(&f, false);
+	expect_gpu_on_boot_framebuffer(&f);
+	init_fixture(&f);
+	f.disp0_dart.available = true;
+	f.disp_dart.compatible = "apple,t8132-dart";
+	gate_t8132_run();
+	expect_chain(&f, false);
+	expect_gpu_on_boot_framebuffer(&f);
+	check_refs_zero();
+
+	/* 14. Laptop: main DCP handed over on 27.2 -> its display subsystem and DART stay. */
+	init_fixture(&f);
+	j773g_darts(&f);
+	set_v27_2(&f.main_dcp);
+	f.main_dcp.has_clock_ids = true;
+	f.main_dcp.available = true;
+	f.disp0_dart.available = true;
+	take_snapshot(&f, &snap);
+	gate_t8132_run();
+	expect_unchanged(&f, &snap);
+	check_refs_zero();
+
+	/* 15. Headless, but the main DCP enabled: the display goes, disp0's DART (its piodma's) stays. */
+	init_fixture(&f);
+	j773g_darts(&f);
+	f.main_dcp.available = true;
+	f.disp0_dart.available = true;
+	gate_t8132_run();
+	expect_chain(&f, false);
+	assert(!f.display.available && f.disp0_dart.available);
 	check_refs_zero();
 
 	cleanup_applied();
 	puts("PASS T8132 fixed-DP display gate: phandle chain, replace vs append disp0 iommus, fail-closed controls");
+	puts("PASS T8132 display gate: no handover or no kept DART roots boots as without the gate, GPU on the boot framebuffer");
 	return 0;
 }
 '''

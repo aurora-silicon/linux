@@ -2,7 +2,8 @@
 /*
  * KUnit tests of the SN012776 amp levels: each amp's level is the second byte
  * of its apple,speaker-config, which the boot loader copies from the Mac's
- * ADT, and the speakers stay off when any amp lacks it.
+ * ADT, and the speakers stay off when any amp lacks it, or under a fixed
+ * ceiling when any amp has another level than the ceiling was computed for.
  */
 #include <kunit/of.h>
 #include <kunit/test.h>
@@ -14,6 +15,14 @@ static struct device_node *macaudio_level_test_node(struct kunit *test, const ch
 	KUNIT_ASSERT_NOT_NULL(test, np);
 	of_node_put_kunit(test, np);
 	return np;
+}
+
+/* Whether the speakers of the codec node @name would run under @cfg */
+static bool macaudio_level_test_present(struct kunit *test, struct device *dev,
+					const struct macaudio_platform_cfg *cfg,
+					const char *name)
+{
+	return macaudio_sn012776_levels_present(dev, cfg, macaudio_level_test_node(test, name));
 }
 
 /* The level is the row's second byte, its low five bits */
@@ -41,13 +50,41 @@ static void macaudio_levels_every_amp(struct kunit *test)
 {
 	struct device *dev = kunit_kzalloc(test, sizeof(*dev), GFP_KERNEL);
 
+	const struct macaudio_platform_cfg *cfg = &macaudio_j316_cfg;
+
 	KUNIT_ASSERT_NOT_NULL(test, dev);
-	KUNIT_EXPECT_TRUE(test, macaudio_sn012776_levels_present(dev,
-		macaudio_level_test_node(test, "macaudio-kunit-codec-good")));
-	KUNIT_EXPECT_FALSE(test, macaudio_sn012776_levels_present(dev,
-		macaudio_level_test_node(test, "macaudio-kunit-codec-one-missing")));
-	KUNIT_EXPECT_FALSE(test, macaudio_sn012776_levels_present(dev,
-		macaudio_level_test_node(test, "macaudio-kunit-codec-one-high")));
+	KUNIT_EXPECT_TRUE(test, macaudio_level_test_present(test, dev, cfg,
+							    "macaudio-kunit-codec-good"));
+	KUNIT_EXPECT_FALSE(test, macaudio_level_test_present(test, dev, cfg,
+							     "macaudio-kunit-codec-one-missing"));
+	KUNIT_EXPECT_FALSE(test, macaudio_level_test_present(test, dev, cfg,
+							     "macaudio-kunit-codec-one-high"));
+}
+
+/* A fixed ceiling, here computed at level 15, holds only at that level */
+static const struct macaudio_platform_cfg macaudio_level_ceiling_cfg = {
+	.amp = AMP_SN012776,
+	.spk_fixed_ceiling = true,
+	.spk_ceiling_level = 15,
+};
+
+static void macaudio_levels_fixed_ceiling(struct kunit *test)
+{
+	struct device *dev = kunit_kzalloc(test, sizeof(*dev), GFP_KERNEL);
+
+	const struct macaudio_platform_cfg *cfg = &macaudio_level_ceiling_cfg;
+
+	KUNIT_ASSERT_NOT_NULL(test, dev);
+	/* One amp at 0x0f */
+	KUNIT_EXPECT_TRUE(test, macaudio_level_test_present(test, dev, cfg,
+							    "macaudio-kunit-codec-level-15"));
+	/* 0x0f and 0x07: the second amp's level is not the ceiling's */
+	KUNIT_EXPECT_FALSE(test, macaudio_level_test_present(test, dev, cfg,
+							     "macaudio-kunit-codec-good"));
+	KUNIT_EXPECT_FALSE(test, macaudio_level_test_present(test, dev, cfg,
+							     "macaudio-kunit-codec-one-missing"));
+	KUNIT_EXPECT_FALSE(test, macaudio_sn012776_level_allowed(cfg, 14));
+	KUNIT_EXPECT_FALSE(test, macaudio_sn012776_level_allowed(cfg, 16));
 }
 
 /* No board table carries an SN012776 gain any more */
@@ -59,7 +96,7 @@ static void macaudio_level_no_table(struct kunit *test)
 		&macaudio_j493_cfg, &macaudio_j575c_j773_cfg, &macaudio_j604_cfg,
 		&macaudio_j614_cfg, &macaudio_j616_cfg, &macaudio_j713_cfg,
 		&macaudio_j714_cfg, &macaudio_j715_cfg, &macaudio_j813_cfg,
-		&macaudio_j775_cfg, &macaudio_j873_cfg,
+		&macaudio_j775_cfg, &macaudio_j873_cfg, &macaudio_k114_cfg,
 	};
 	unsigned int i;
 
@@ -78,6 +115,7 @@ static struct kunit_case macaudio_level_cases[] = {
 	KUNIT_CASE(macaudio_level_from_row),
 	KUNIT_CASE(macaudio_level_rejects),
 	KUNIT_CASE(macaudio_levels_every_amp),
+	KUNIT_CASE(macaudio_levels_fixed_ceiling),
 	KUNIT_CASE(macaudio_level_no_table),
 	{}
 };

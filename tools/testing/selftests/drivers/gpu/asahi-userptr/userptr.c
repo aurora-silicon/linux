@@ -3,9 +3,7 @@
  * DRM_IOCTL_ASAHI_GEM_USERPTR on the GPU's render node: what it accepts and
  * refuses, and the accounting (VmPin in /proc/self/status, the client's
  * drm-total-system in its fdinfo). No GPU work is submitted. Skipped where
- * the render node is not this driver's or lacks the feature, and where the
- * caller has neither CAP_IPC_LOCK nor a RLIMIT_MEMLOCK hard limit with room
- * for the four pages a test pins.
+ * the render node is not this driver's or lacks the feature.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -147,37 +145,8 @@ static int drop_cap_ipc_lock(void)
 	return syscall(SYS_capset, &header, data) ? -errno : 0;
 }
 
-/* The largest range a test binds, and the most one pins outside memlock_limit. */
+/* The largest range a test binds. */
 #define BIND_MAX (4 * PAGE)
-
-/*
- * Whether this process may pin BIND_MAX more: it has CAP_IPC_LOCK, or
- * RLIMIT_MEMLOCK has room for it, after raising the soft limit to the hard
- * one if that takes it.
- */
-static int memlock_room(void)
-{
-	struct __user_cap_header_struct header = {
-		.version = _LINUX_CAPABILITY_VERSION_3,
-	};
-	struct __user_cap_data_struct data[_LINUX_CAPABILITY_U32S_3];
-	long pin = vm_pin_kb();
-	uint64_t need = (pin > 0 ? (uint64_t)pin << 10 : 0) + BIND_MAX;
-	struct rlimit lim;
-
-	if (!syscall(SYS_capget, &header, data) &&
-	    (data[CAP_TO_INDEX(CAP_IPC_LOCK)].effective &
-	     CAP_TO_MASK(CAP_IPC_LOCK)))
-		return 1;
-	if (getrlimit(RLIMIT_MEMLOCK, &lim))
-		return 0;
-	if (lim.rlim_cur == RLIM_INFINITY || lim.rlim_cur >= need)
-		return 1;
-	if (lim.rlim_max != RLIM_INFINITY && lim.rlim_max < need)
-		return 0;
-	lim.rlim_cur = lim.rlim_max;
-	return !setrlimit(RLIMIT_MEMLOCK, &lim);
-}
 
 /*
  * A GPU address at which BIND_MAX bytes can be bound. The driver keeps
@@ -221,9 +190,6 @@ FIXTURE_SETUP(asahi)
 	ASSERT_EQ(0, ioc(self->fd, DRM_IOCTL_ASAHI_GET_PARAMS, &get));
 	if (!(self->params.features & DRM_ASAHI_FEATURE_USERPTR))
 		SKIP(return, "no DRM_ASAHI_FEATURE_USERPTR");
-	if (!memlock_room())
-		SKIP(return, "RLIMIT_MEMLOCK has no room for the %lu bytes a test pins",
-		     BIND_MAX);
 
 	uint64_t kernel = self->params.vm_kernel_min_size > (32ULL << 30) ?
 			  self->params.vm_kernel_min_size : 32ULL << 30;
@@ -360,48 +326,36 @@ TEST_F(asahi, read_only_file_pages)
 }
 
 /*
- * RLIMIT_MEMLOCK bounds the pages of a caller without CAP_IPC_LOCK. The test
- * gives the capability up first (the harness runs each test in a process of
- * its own), so a request above the limit has to fail whoever runs it. It
- * lowers the soft limit to what the process has pinned already plus 16 pages,
- * or as many as the hard limit has room for, and is skipped where that is
- * less than two.
+ * RLIMIT_MEMLOCK does not bound the pages: the GPU memory limits do, as for
+ * GEM_CREATE objects. The test gives CAP_IPC_LOCK up first (the harness runs
+ * each test in a process of its own) and lowers the soft limit to 0, so a
+ * memlock check would refuse whoever runs it. The pages still show in VmPin.
  */
-TEST_F(asahi, memlock_limit)
+TEST_F(asahi, memlock_does_not_bound)
 {
+	const uint64_t size = 64 * PAGE;
 	struct rlimit old, lim;
 	long pin0 = vm_pin_kb();
-	uint64_t pinned = pin0 > 0 ? (uint64_t)pin0 << 10 : 0;
-	uint64_t pages = 16, size;
+	long long total0 = client_total(self->fd);
 	uint32_t h = 0;
 	void *mem;
 
+	/* The kernel says so, for userspace that checks before it imports. */
+	EXPECT_TRUE(self->params.features & DRM_ASAHI_FEATURE_USERPTR_NO_MEMLOCK);
 	ASSERT_EQ(0, drop_cap_ipc_lock());
 	ASSERT_EQ(0, getrlimit(RLIMIT_MEMLOCK, &old));
-	if (old.rlim_max != RLIM_INFINITY) {
-		uint64_t room = old.rlim_max > pinned ?
-				(old.rlim_max - pinned) / PAGE : 0;
-
-		if (room < pages)
-			pages = room;
-	}
-	if (pages < 2)
-		SKIP(return, "no room for two pages in the RLIMIT_MEMLOCK hard limit of %llu bytes",
-		     (unsigned long long)old.rlim_max);
-	size = 4 * pages * PAGE;
 	mem = mmap(NULL, size, PROT_READ | PROT_WRITE,
 		   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	ASSERT_NE(MAP_FAILED, mem);
-	lim.rlim_cur = pinned + pages * PAGE;
+	lim.rlim_cur = 0;
 	lim.rlim_max = old.rlim_max;
 	ASSERT_EQ(0, setrlimit(RLIMIT_MEMLOCK, &lim));
-	ASSERT_EQ(-ENOMEM, userptr(self->fd, mem, size, 0, 0, &h));
-	EXPECT_EQ(pin0, vm_pin_kb());
-	EXPECT_EQ(0, userptr(self->fd, mem, pages / 2 * PAGE, 0, 0, &h));
-	/* The pages already pinned count against the limit too. */
-	EXPECT_EQ(-ENOMEM, userptr(self->fd, (char *)mem + pages / 2 * PAGE,
-				   pages * PAGE, 0, 0, &h));
+	ASSERT_EQ(0, userptr(self->fd, mem, size, 0, 0, &h));
+	EXPECT_EQ(pin0 + (long)(size >> 10), vm_pin_kb());
+	EXPECT_EQ(total0 + (long long)size, client_total(self->fd));
 	close_handle(self->fd, h);
+	EXPECT_EQ(pin0, vm_pin_kb());
+	EXPECT_EQ(total0, client_total(self->fd));
 	setrlimit(RLIMIT_MEMLOCK, &old);
 	munmap(mem, size);
 }
