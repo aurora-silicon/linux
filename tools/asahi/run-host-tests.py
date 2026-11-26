@@ -64,6 +64,7 @@ ASAHI_TESTS = {
                                  (['--ignore-nomodeset'], KILL), (['--drop-failed-completion'], KILL),
                                  (['--ignore-external-node'], KILL), (['--drop-board-scope'], KILL)],
     'display-sleep-merge-tests.py': [(out(), PASS)],
+    'dual-stream-pairing-tests.py': [(out(), PASS)],
     'dcpext26-slot-unregister-tests.py': [(out(), PASS)],
     'dcpext26-budget-tests.py': [([], PASS)],
     'dcpext26-queue-tests.py': [([], PASS), (['--drop-v27-close'], KILL)],

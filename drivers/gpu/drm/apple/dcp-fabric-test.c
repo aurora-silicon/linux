@@ -1949,17 +1949,25 @@ static void fabric_t6030_dual_policy_test(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, fabric_tunnel(&f.f, 0, 1), 0);
 	KUNIT_EXPECT_PTR_EQ(test, f.f.port[0].owner[1], &f.f.route[0][0]);
 	/* Both encoders expose candidates, then narrow to the actual owner. */
-	mask = dcp_fabric_port_crtc_mask(true, false, false, 0, BIT(1));
-	mask = dcp_fabric_port_crtc_mask(true, false, true, mask, BIT(2));
+	mask = dcp_fabric_port_crtc_mask(true, false, BIT(1) | BIT(2), BIT(2));
 	KUNIT_EXPECT_EQ(test, mask, (u32)(BIT(1) | BIT(2)));
 	KUNIT_EXPECT_EQ(test, dcp_fabric_connector_mask(false, true, true, 1, mask), (u32)BIT(1));
 	KUNIT_EXPECT_EQ(test, dcp_fabric_connector_mask(false, true, true, 2, mask), (u32)BIT(2));
 	/* Ordered M2 secondary connectors retain the Type-C-only processor. */
-	mask = dcp_fabric_port_crtc_mask(true, true, false, 0, BIT(1));
-	mask = dcp_fabric_port_crtc_mask(true, true, true, mask, BIT(2));
+	mask = dcp_fabric_port_crtc_mask(true, true, BIT(1) | BIT(2), BIT(2));
 	KUNIT_EXPECT_EQ(test, mask, (u32)BIT(2));
-	mask = dcp_fabric_port_crtc_mask(false, true, false, mask, BIT(1));
+	mask = dcp_fabric_port_crtc_mask(true, true, BIT(1) | BIT(2) | BIT(3),
+					 BIT(2) | BIT(3));
+	KUNIT_EXPECT_EQ(test, mask, (u32)BIT(2));
+	mask = dcp_fabric_port_crtc_mask(false, true, BIT(1) | BIT(2), BIT(2));
 	KUNIT_EXPECT_EQ(test, mask, (u32)(BIT(1) | BIT(2)));
+	/* Without a hybrid in front, the secondary takes the second pipeline. */
+	mask = dcp_fabric_port_crtc_mask(true, true, BIT(1) | BIT(2), BIT(1) | BIT(2));
+	KUNIT_EXPECT_EQ(test, mask, (u32)BIT(2));
+	/* A lone Type-C-only pipeline stays the secondary's; none leaves it none. */
+	KUNIT_EXPECT_EQ(test, dcp_fabric_port_crtc_mask(true, true, BIT(1), BIT(1)),
+			(u32)BIT(1));
+	KUNIT_EXPECT_EQ(test, dcp_fabric_port_crtc_mask(true, true, BIT(1), 0), 0U);
 }
 
 static void fabric_t6030_clock_header_parity_test(struct kunit *test)

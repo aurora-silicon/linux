@@ -1319,17 +1319,21 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 			if (!mask)
 				continue;
 		} else {
+			u32 typec_only = 0;
+
 			if (dcp_typec_port_pass(port_idx, NULL) != pass)
 				continue;
 			for (i = 0; i < num_dcp; i++) {
 				if (!dcp_typec_port_has_candidate(port_idx, dcp[i]))
 					continue;
-				/* Ordered dual-stream docks reserve the Type-C-only pipe. */
-				mask = dcp_fabric_port_crtc_mask(secondary,
-								 dcp_typec_ordered_dual_stream(),
-							       dcp_is_typec_only(dcp[i]),
-							       mask, crtc_mask[i]);
+				mask |= crtc_mask[i];
+				if (dcp_is_typec_only(dcp[i]))
+					typec_only |= crtc_mask[i];
 			}
+			/* Ordered dual-stream docks reserve a Type-C-only pipe. */
+			mask = dcp_fabric_port_crtc_mask(secondary,
+							 dcp_typec_ordered_dual_stream(),
+							 mask, typec_only);
 			if (!mask) {
 				drm_warn(drm, "Type-C port %u has no display pipeline\n",
 					 port_idx);

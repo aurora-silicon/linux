@@ -559,12 +559,33 @@ u32 dcp_fabric_connector_mask(bool dual_stream, bool bound, bool routed,
 }
 EXPORT_SYMBOL_GPL(dcp_fabric_connector_mask);
 
-u32 dcp_fabric_port_crtc_mask(bool secondary, bool ordered_dual, bool typec_only,
-			    u32 mask, u32 candidate)
+/*
+ * The CRTCs a port's connector is offered, from the CRTCs of every pipeline
+ * that can drive the port (@candidates) and of those among them that drive
+ * Type-C only (@typec_only). A primary connector, or any connector without
+ * the ordered dual-stream policy, is offered them all. An ordered secondary
+ * connector, a dock's second stream, is fixed to one Type-C-only pipeline:
+ * compositors read possible_crtcs once and would otherwise pair it with a
+ * pipeline its stream can never be routed to. The pairing order gives the
+ * primary stream the port's lowest candidate, so the secondary takes the
+ * lowest Type-C-only pipeline above it. Where a hybrid comes first, that is
+ * the lowest Type-C-only one; where every candidate drives Type-C only (no
+ * HDMI pipeline in front), it is the second, or the second stream could
+ * never have a pipeline while the first has one. A port with a single
+ * Type-C-only pipeline keeps it for the secondary.
+ */
+u32 dcp_fabric_port_crtc_mask(bool secondary, bool ordered_dual, u32 candidates,
+			      u32 typec_only)
 {
-	if (secondary && ordered_dual)
-		return typec_only && (!mask || candidate < mask) ? candidate : mask;
-	return mask | candidate;
+	u32 spare;
+
+	if (!secondary || !ordered_dual)
+		return candidates;
+	typec_only &= candidates;
+	spare = typec_only & ~(candidates & -candidates);
+	if (!spare)
+		spare = typec_only;
+	return spare & -spare;
 }
 EXPORT_SYMBOL_GPL(dcp_fabric_port_crtc_mask);
 
