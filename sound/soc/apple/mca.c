@@ -1078,6 +1078,23 @@ static int mca_close(struct snd_soc_component *component,
 }
 
 /*
+ * The STOP trigger only asks the DMA to stop: it may still write the burst in
+ * flight. ALSA calls this after a stop or a suspend, before it frees or
+ * reallocates the buffer (hw_free, hw_params) or prepares the stream again.
+ * Wait here until the DMA no longer touches the buffer.
+ */
+static int mca_sync_stop(struct snd_soc_component *component,
+			 struct snd_pcm_substream *substream)
+{
+	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
+
+	if (rtd->dai_link->no_pcm)
+		return 0;
+
+	return snd_dmaengine_pcm_sync_stop(substream);
+}
+
+/*
  * The capture buffers are cacheable (SNDRV_DMA_TYPE_NONCOHERENT): reading
  * them through an uncached mapping costs the reader several times the
  * copy itself. The CPU's view of what the DMA wrote is made current here,
@@ -1304,6 +1321,7 @@ static const struct snd_soc_component_driver mca_component = {
 	.close = mca_close,
 	.hw_params = mca_hw_params,
 	.trigger = mca_trigger,
+	.sync_stop = mca_sync_stop,
 	.pointer = mca_pointer,
 	.pcm_new = mca_pcm_new,
 	.pcm_free = mca_pcm_free,
