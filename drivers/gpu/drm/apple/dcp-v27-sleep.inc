@@ -1263,7 +1263,8 @@ static int dcp_v27_reopen_live(struct apple_dcp *dcp)
 					return ret;
 				s->soft_off = false;
 			}
-			WRITE_ONCE(dcp->v27_keep_mode, true);
+			if (!READ_ONCE(dcp->v27_dpms_was_soft_off))
+				WRITE_ONCE(dcp->v27_keep_mode, true);
 		} else if (s->ext_wake) {
 			ret = dcp_v27_ext_wake_calls(s);
 			if (ret)
@@ -1289,7 +1290,7 @@ static int dcp_v27_reopen_live(struct apple_dcp *dcp)
 	mutex_unlock(&dcp->iomfb.lock);
 	if (s->paused)
 		iomfb_pause_presentation(dcp, false);
-	if (READ_ONCE(dcp->v27_keep_mode))
+	if (READ_ONCE(dcp->v27_keep_mode) && !READ_ONCE(dcp->v27_dpms_was_soft_off))
 		iomfb_v27_wake_present(dcp);
 	if (s->workers_disabled) {
 		if (dcp->rate_retry_initialized)
@@ -1830,10 +1831,152 @@ static void dcp_v27_dark_replug_owed(struct apple_dcp *dcp)
 		 dcp_v27_ext_nr(dcp));
 	dcp_v27_ext_replug(dcp, true);
 }
+
+/*
+ * Firmware-27 internal panel soft power-off on DPMS off: selected by hardware
+ * and DT display-power properties (not the board system-sleep profile).
+ * Runs the display stage + plain A484(0) off while SYSTEM_RUNNING outside
+ * system PM transitions, and restores power on DPMS on (with wake presentation)
+ * or before deep sleep / teardown (without lighting a blanked screen).
+ */
+static bool dcp_v27_dpms_capable(struct apple_dcp *dcp)
+{
+	return dcp && !dcp->external && !dcp_v27_external(dcp) &&
+	       dcp_has_panel(dcp) && dcp->hw.adopt_live_session &&
+	       dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+	       dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_DEFAULT &&
+	       dcp->v27_methods && iomfb_v27_display_described(dcp);
+}
+
+static void dcp_v27_dpms_off_locked(struct apple_dcp *dcp)
+{
+	int ret;
+
+	lockdep_assert_held(&dcp->s2r_prewarm_lock);
+	if (system_state != SYSTEM_RUNNING ||
+	    dcp->v27_dpms_pm_suspend || !dcp_v27_dpms_capable(dcp) ||
+	    dcp->v27_dpms_soft_off || !READ_ONCE(dcp->pipe_enabled_h17p) ||
+	    READ_ONCE(dcp->crashed))
+		return;
+
+	iomfb_pause_presentation(dcp, true);
+	ret = iomfb_queue_settle(dcp, msecs_to_jiffies(500));
+	if (ret) {
+		iomfb_pause_presentation(dcp, false);
+		dev_warn(dcp->dev, "V27 DPMS off: queue settle failed: %d\n", ret);
+		return;
+	}
+	dcp_v27_display_stage(dcp, false, false, false);
+	ret = iomfb_v27_sleep_plain(dcp, false);
+	if (ret == -ETIMEDOUT) {
+		/*
+		 * A timed-out A484(0) may still complete asynchronously in
+		 * firmware. Keep presentation paused and mark the panel off
+		 * so the next enable or PM handoff reconciles via A484(1).
+		 */
+		dev_warn(dcp->dev, "V27 DPMS off: plain A484(0) timed out; deferring recovery to wake\n");
+		WRITE_ONCE(dcp->v27_dpms_soft_off, true);
+		WRITE_ONCE(dcp->v27_dpms_uncertain, true);
+		return;
+	}
+	if (ret) {
+		dev_warn(dcp->dev, "V27 DPMS off: plain A484(0) failed: %d\n", ret);
+		iomfb_pause_presentation(dcp, false);
+		return;
+	}
+	WRITE_ONCE(dcp->v27_keep_mode, false);
+	WRITE_ONCE(dcp->v27_dpms_soft_off, true);
+	WRITE_ONCE(dcp->v27_dpms_uncertain, false);
+	dev_dbg(dcp->dev, "V27 DPMS: panel soft-powered off\n");
+}
+
+static int dcp_v27_dpms_on_locked(struct apple_dcp *dcp, bool present)
+{
+	int ret;
+
+	lockdep_assert_held(&dcp->s2r_prewarm_lock);
+	if (!dcp->v27_dpms_soft_off)
+		return 0;
+
+	dcp_v27_display_stage(dcp, false, false, false);
+	dcp_v27_wake_expect(dcp);
+	ret = iomfb_v27_sleep_plain(dcp, true);
+	if (!ret)
+		ret = iomfb_queue_settle(dcp, msecs_to_jiffies(1000));
+	if (ret) {
+		WRITE_ONCE(dcp->crashed, true);
+		dev_err(dcp->dev, "V27 DPMS on: plain A484(1) recovery failed, keeping presentation paused: %d\n",
+			ret);
+		return ret;
+	}
+	if (present)
+		WRITE_ONCE(dcp->v27_keep_mode, true);
+	WRITE_ONCE(dcp->v27_dpms_soft_off, false);
+	WRITE_ONCE(dcp->v27_dpms_uncertain, false);
+	iomfb_pause_presentation(dcp, false);
+	if (present) {
+		iomfb_v27_wake_present(dcp);
+		dcp->brightness.update = true;
+	}
+	dev_dbg(dcp->dev, "V27 DPMS: panel soft-powered on (present=%d)\n", present);
+	return 0;
+}
+
+static int dcp_v27_dpms_prepare(struct apple_dcp *dcp, bool deep_sleep)
+{
+	int ret = 0;
+
+	if (!dcp_v27_dpms_capable(dcp))
+		return 0;
+
+	guard(mutex)(&dcp->s2r_prewarm_lock);
+	dcp->v27_dpms_pm_suspend = true;
+	/*
+	 * Firmware-driven deep sleep requires pipe_enabled_h17p == 1 before
+	 * taking over the panel; restore power state without replaying a lit
+	 * frame so a blanked panel stays dark. For s2idle, leave an already
+	 * soft-powered-off panel off unless its state is uncertain.
+	 */
+	if (dcp->v27_dpms_soft_off && (deep_sleep || dcp->v27_dpms_uncertain)) {
+		ret = dcp_v27_dpms_on_locked(dcp, false);
+		if (ret) {
+			dcp->v27_dpms_pm_suspend = false;
+			return ret;
+		}
+		WRITE_ONCE(dcp->v27_dpms_was_soft_off, true);
+	}
+	return 0;
+}
+
+static void dcp_v27_dpms_complete(struct apple_dcp *dcp)
+{
+	if (!dcp_v27_dpms_capable(dcp))
+		return;
+
+	guard(mutex)(&dcp->s2r_prewarm_lock);
+	dcp->v27_dpms_pm_suspend = false;
+	if (dcp->v27_dpms_was_soft_off) {
+		WRITE_ONCE(dcp->v27_dpms_was_soft_off, false);
+		dcp_v27_dpms_off_locked(dcp);
+	}
+}
+
+static void dcp_v27_dpms_handoff(struct apple_dcp *dcp)
+{
+	if (!dcp || !READ_ONCE(dcp->v27_dpms_soft_off))
+		return;
+	guard(mutex)(&dcp->s2r_prewarm_lock);
+	dcp_v27_dpms_on_locked(dcp, false);
+}
 #else
 static void dcp_v27_dark_replug_owed(struct apple_dcp *dcp) { }
 static bool dcp_v27_sleep_selected(struct apple_dcp *dcp) { return false; }
 static void dcp_v27_sleep_invalidate(struct apple_dcp *dcp) { }
 static int dcp_v27_sleep_suspend(struct apple_dcp *dcp) { return -EOPNOTSUPP; }
 static int dcp_v27_sleep_resume(struct apple_dcp *dcp) { return -EOPNOTSUPP; }
+static int dcp_v27_dpms_prepare(struct apple_dcp *dcp, bool deep_sleep) { return 0; }
+static void dcp_v27_dpms_complete(struct apple_dcp *dcp) { }
+static void dcp_v27_dpms_handoff(struct apple_dcp *dcp) { }
+static void dcp_v27_dpms_off_locked(struct apple_dcp *dcp) { }
+static int dcp_v27_dpms_on_locked(struct apple_dcp *dcp, bool present) { return 0; }
 #endif
