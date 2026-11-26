@@ -72,4 +72,11 @@ int apple_sart_replay(struct apple_sart *sart);
 /* ANS's read-only last check, after supplier suspend_late. No ownership transfer. */
 int apple_sart_sleep_validate(struct apple_sart *sart);
 
+/*
+ * apple_sart_restore_entry - write back a SART entry that a boot stage passed on
+ * (apple,sart-entries) after it powered the coprocessor off, and protect it.
+ */
+int apple_sart_restore_entry(struct apple_sart *sart, int index, u8 flags,
+			     phys_addr_t paddr, size_t size);
+
 #endif /* _LINUX_SOC_APPLE_SART_H_ */
