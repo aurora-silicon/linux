@@ -959,6 +959,34 @@ out:
 	return ret;
 }
 
+/*
+ * The T6030 GPU's own PMP request (AGX, report@4), for a GPU linked to the PMP above: the GPU
+ * driver holds it while its firmware runs and withdraws it before GFX goes off, as macOS does.
+ */
+static int __init gate_gpu_agx_entry(struct of_changeset *cs, struct device_node *report)
+{
+	struct device_node *gpu, *child, *agx = NULL;
+	int ret = 0;
+	u32 id;
+
+	if (!IS_ENABLED(CONFIG_APPLE_T6030_GPU_PMP_LINK) || gate_soc != &gate_t6030 || !report)
+		return 0;
+	for_each_child_of_node(report, child) {
+		if (of_node_name_eq(child, "report") && !of_property_read_u32(child, "reg", &id) &&
+		    id == 4) {
+			agx = child;
+			break;
+		}
+	}
+	gpu = gate_find_one("apple,agx-t6030");
+	if (gpu && of_device_is_available(gpu) && agx && agx->phandle &&
+	    !of_property_present(gpu, "apple,pmp-report-entry"))
+		ret = of_changeset_add_prop_u32(cs, gpu, "apple,pmp-report-entry", agx->phandle);
+	of_node_put(agx);
+	of_node_put(gpu);
+	return ret;
+}
+
 /* Adds the boolean @name to @np unless it is there already. */
 static int __init gate_add_bool(struct of_changeset *cs, struct device_node *np,
 				const char *name)
@@ -1071,6 +1099,8 @@ static int __init gate_pmp_apply(struct device_node *dcp, struct device_node **p
 	/* T8122 and an opted-in T6030 GPU need this Mac's PMP AGX vote. */
 	if (!ret)
 		ret = gate_gpu_pmp_link(&gate_pmp_cs, pmp);
+	if (!ret)
+		ret = gate_gpu_agx_entry(&gate_pmp_cs, report);
 	/* The DART and mailbox interrupt parent lives in the base tree. */
 	if (!ret)
 		ret = of_changeset_add_prop_u32(&gate_pmp_cs, dart, "interrupt-parent",
