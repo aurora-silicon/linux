@@ -1736,7 +1736,16 @@ VISIBLE_IF_KUNIT void dcp_swap_watchdog(struct work_struct *work)
 
 void dcp_swap_watchdog_arm(struct apple_dcp *dcp)
 {
-	if (dcp_is_typec_output(dcp) || dcp_desktop_swap_watched(dcp)) {
+	/*
+	 * Every external pipe can lose its sink under an accepted swap, not
+	 * only a Type-C route: an HDMI display on a fixed port also drops HPD,
+	 * for instance while it wakes from standby after DPMS on.  Unwatched,
+	 * the dropped present holds the IOMFB queue until its ten second
+	 * timeout, which declares the coprocessor crashed, and the mode set
+	 * that would bring the display back waits behind it.
+	 */
+	if (dcp_is_typec_output(dcp) || !dcp_has_panel(dcp) ||
+	    dcp_desktop_swap_watched(dcp)) {
 		dcp->swap_watchdog_deadline = jiffies +
 			msecs_to_jiffies(DCP_SWAP_WATCHDOG_MS);
 		mod_delayed_work(system_dfl_wq, &dcp->swap_watchdog_wq,
