@@ -213,6 +213,13 @@ struct apple_nvme_iod {
 	unsigned int dma_len; /* length of single DMA segment mapping */
 	struct scatterlist *sg;
 	bool irq_counted;
+	/*
+	 * The NVMMU reported that this request's TCB was not invalidated: the
+	 * TCB may still authorize DMA to its buffers and PRP lists. The request
+	 * is held until a controller stop completes after tcb_stale_stops.
+	 */
+	bool tcb_stale;
+	unsigned int tcb_stale_stops;
 };
 
 struct apple_nvme_hw {
@@ -324,6 +331,8 @@ struct apple_nvme {
 	spinlock_t lock;
 	/* Non-polled (admin + interrupt I/O) requests submitted to hardware. */
 	unsigned int irq_inflight;
+	/* Controller stops that completed: a cleared CC.EN the controller acknowledged. */
+	atomic_t stops;
 	/* A poller consumed completions the CQ interrupt was raised for. */
 	bool polled_cqes;
 
@@ -694,14 +703,32 @@ static const struct apple_rtkit_ops apple_nvme_rtkit_ops = {
 	.shmem_destroy = apple_nvme_sart_dma_destroy,
 };
 
-static void apple_nvmmu_inval(struct apple_nvme_queue *q, unsigned int tag)
+/* Returns -EIO if the NVMMU reports that the TCB was not invalidated. */
+static int apple_nvmmu_inval(struct apple_nvme_queue *q, unsigned int tag)
 {
 	struct apple_nvme *anv = queue_to_apple_nvme(q);
 
 	writel(tag, anv->mmio_nvmmu + APPLE_NVMMU_TCB_INVAL);
 	if (readl(anv->mmio_nvmmu + APPLE_NVMMU_TCB_STAT))
-		dev_warn_ratelimited(anv->dev,
-				     "NVMMU TCB invalidation failed\n");
+		return -EIO;
+	return 0;
+}
+
+static void apple_nvme_count_stop(struct apple_nvme *anv)
+{
+	atomic_inc(&anv->stops);
+}
+
+/*
+ * A request whose TCB failed to invalidate is released only once a controller
+ * stop has completed since the failure. Until then its buffers, PRP lists and
+ * tag stay with it.
+ */
+static bool apple_nvme_tcb_stale_held(struct apple_nvme *anv,
+				      struct apple_nvme_iod *iod)
+{
+	return iod->tcb_stale &&
+	       (unsigned int)atomic_read(&anv->stops) == iod->tcb_stale_stops;
 }
 
 static void apple_nvme_submit_cmd_t8015(struct apple_nvme_queue *q,
@@ -1030,6 +1057,16 @@ static __always_inline void apple_nvme_unmap_rq(struct request *req)
 
 static void apple_nvme_complete_rq(struct request *req)
 {
+	struct apple_nvme_iod *iod = blk_mq_rq_to_pdu(req);
+	struct apple_nvme *anv = queue_to_apple_nvme(iod->q);
+
+	if (unlikely(apple_nvme_tcb_stale_held(anv, iod))) {
+		/* As a quarantined controller does: kept until platform reset. */
+		dev_crit_ratelimited(anv->dev,
+				     "retaining tag %d: its NVMMU TCB was not invalidated and the controller has not stopped since\n",
+				     req->tag);
+		return;
+	}
 	apple_nvme_unmap_rq(req);
 	nvme_complete_rq(req);
 }
@@ -1078,10 +1115,11 @@ static inline void apple_nvme_handle_cqe(struct apple_nvme_queue *q,
 	struct apple_nvme *anv = queue_to_apple_nvme(q);
 	struct nvme_completion *cqe = &q->cqes[idx];
 	__u16 command_id = READ_ONCE(cqe->command_id);
+	bool inval_failed = false;
 	struct request *req;
 
 	if (anv->hw->has_lsq_nvmmu)
-		apple_nvmmu_inval(q, command_id);
+		inval_failed = apple_nvmmu_inval(q, command_id);
 
 	req = nvme_find_rq(apple_nvme_queue_tagset(anv, q), command_id);
 	if (unlikely(!req)) {
@@ -1090,6 +1128,24 @@ static inline void apple_nvme_handle_cqe(struct apple_nvme_queue *q,
 	}
 
 	apple_nvme_account_irq_done(anv, req);
+
+	if (unlikely(inval_failed)) {
+		struct apple_nvme_iod *iod = blk_mq_rq_to_pdu(req);
+
+		/*
+		 * The TCB may still authorize DMA to this request's buffers:
+		 * leave the request in flight, with its mappings and tag, and
+		 * let the timeout handler stop and reset the controller now.
+		 * The request is released only after that stop completes.
+		 */
+		dev_err_ratelimited(anv->dev,
+				    "NVMMU TCB invalidation failed for tag %d; holding it until the controller stops\n",
+				    req->tag);
+		iod->tcb_stale = true;
+		iod->tcb_stale_stops = atomic_read(&anv->stops);
+		blk_abort_request(req);
+		return;
+	}
 
 	if (!nvme_try_complete_req(req, cqe->status, cqe->result) &&
 	    !blk_mq_add_to_batch(req, iob,
@@ -1333,6 +1389,7 @@ static blk_status_t apple_nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
 	iod->npages = -1;
 	iod->nents = 0;
 	iod->irq_counted = false;
+	iod->tcb_stale = false;
 
 	/*
 	 * We should not need to do this, but we're still using this to
@@ -1463,7 +1520,8 @@ static void apple_nvme_disable_legacy(struct apple_nvme *anv, bool shutdown)
 		 */
 		if (shutdown)
 			nvme_disable_ctrl(&anv->ctrl, shutdown);
-		nvme_disable_ctrl(&anv->ctrl, false);
+		if (!nvme_disable_ctrl(&anv->ctrl, false))
+			apple_nvme_count_stop(anv);
 	}
 
 	apple_nvme_disable_queue(&anv->ioq);
@@ -1571,6 +1629,7 @@ static int apple_nvme_disable_locked(struct apple_nvme *anv, bool shutdown)
 		apple_nvme_quarantine(anv, ret);
 		return ret;
 	}
+	apple_nvme_count_stop(anv);
 
 	apple_nvme_handle_cq(&anv->ioq, true);
 	apple_nvme_handle_cq(&anv->adminq, true);
@@ -1756,6 +1815,12 @@ static enum blk_eh_timer_return apple_nvme_timeout(struct request *req)
 		    !blk_mq_request_completed(req)) {
 			unsigned long flags;
 
+			/*
+			 * A request with a stale TCB is released only after a
+			 * stop: try one, else completion keeps the request.
+			 */
+			if (iod->tcb_stale && !nvme_disable_ctrl(&anv->ctrl, false))
+				apple_nvme_count_stop(anv);
 			spin_lock_irqsave(&anv->lock, flags);
 			apple_nvme_account_irq_done(anv, req);
 			spin_unlock_irqrestore(&anv->lock, flags);
