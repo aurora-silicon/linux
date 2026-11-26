@@ -483,7 +483,7 @@ static int dptxport_call_set_active_lane_count(struct apple_epic_service *servic
 		if (ret)
 			return ret;
 	} else if (dptx->lane_count < lane_count &&
-		   !(dcp_is_t8132_ext(dcp) && dcp_is_usb4_output(dcp))) {
+		   !(dcp_t8132_ext_hw(dcp) && dcp_is_usb4_output(dcp))) {
 		/*
 		 * A T8132 tunnel has no PHY lanes to check: its lane count
 		 * is the tunnel's, and lane_count holds the previous active one.

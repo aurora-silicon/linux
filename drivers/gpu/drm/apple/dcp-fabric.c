@@ -245,10 +245,9 @@ bool dcp_t8132_ext_hw(const struct apple_dcp *dcp)
 }
 
 /*
- * A route of a T8132 dcpext whose PHY has no DP alt mode: the
- * crossbar's DP PHY output has nothing behind it. The board marks the PHYs
- * wired for DP alt mode (apple,dp-alt-mode). Either way the dcpext is no
- * apple_crtc pipeline: its DRM objects are its own (t8132_ext_drm.c).
+ * A route of a T8132 dcpext whose PHY has no DP alt mode, whichever firmware
+ * backend drives the dcpext: the crossbar's DP PHY output has nothing behind
+ * it. The board marks the PHYs wired for DP alt mode (apple,dp-alt-mode).
  */
 static bool dcp_typec_route_no_dp_alt(const struct apple_dcp_typec_route *route)
 {
@@ -2467,7 +2466,14 @@ static int dcp_t8132_crossbar_up_locked(struct apple_dcp *dcp, u32 unit)
 			 route->tunnel_dpin, route->mux_index, ret);
 		return ret;
 	}
-	/* As the crossbar's link-up is followed elsewhere: let it settle. */
+	/*
+	 * The T602X-map crossbar reports no link state to wait for
+	 * (apple_dpxbar_link_up() only sets its enables). As after the
+	 * T8142-layout crossbar's link-up (dcp_tunnel_crossbar_up()), the
+	 * DP IN is set active again 5-6 ms later: the interval the T8132
+	 * tunnel has run with on both firmware backends. A shorter one has
+	 * not been measured.
+	 */
 	usleep_range(5000, 6000);
 	ret = dcp_tunnel_dpin_locked(dcp, true);
 	if (ret)
