@@ -577,6 +577,8 @@ static const struct cen_aux_spec cen_aux_specs[] = {
 struct cen_aux_state { u32 offset; u16 head, post; bool opened; };
 struct work_struct { int dummy; };
 struct sk_buff_head { unsigned int len; };
+#define HCI_EV_DISCONN_COMPLETE 0x05
+struct hci_ev_disconn_complete { u8 raw[4]; };
 struct sk_buff { u8 data[64]; u32 len; u8 pkt_type; };
 struct pci_dev { int dev; };
 struct hci_dev { struct { u32 byte_rx, err_rx; } stat; };
@@ -594,6 +596,7 @@ struct cen_bt {
 	struct cen_aux_state aux[ARRAY_SIZE(cen_aux_specs)];
 	bool running, transport_paused;
 	bool connection_command_supported, connection_status_pending;
+	u16 sync_pending_wire, sync_pending_orig;
 };
 
 static u16 mock_tail[16];
@@ -615,6 +618,8 @@ static int cen_receive_acl(struct cen_bt *bt, const u8 *d, u32 l) { (void)bt; (v
 static void cen_le_rx_buffer(struct cen_bt *bt, u16 slot) { (void)bt; (void)slot; }
 static void cen_rx_buffer(struct cen_bt *bt, u16 slot) { (void)bt; (void)slot; }
 static void cen_fixup_scan_response(u8 *e, size_t l) { (void)e; (void)l; }
+static void cen_hrb_track_add(struct cen_bt *bt, u16 h, const u8 a[6]) { (void)bt; (void)h; (void)a; }
+static void cen_hrb_track_del(struct cen_bt *bt, u16 h) { (void)bt; (void)h; }
 static struct sk_buff *bt_skb_alloc(u32 len, int flags)
 {
 	(void)flags;

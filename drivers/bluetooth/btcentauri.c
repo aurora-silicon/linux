@@ -85,8 +85,20 @@ MODULE_PARM_DESC(native_hrb, "Translate BR/EDR Create Connection to the firmware
 
 #define CEN_OP_READ_PROP_FEATURES 0xffa3
 #define CEN_OP_HRB_CREATE_CONN 0xff7b
+#define CEN_OP_HRB_SETUP_SYNC_CONN 0xfdc7
+#define CEN_OP_HRB_ACCEPT_SYNC_CONN 0xfdf8
+#define CEN_OP_WRITE_VOICE_CONFIG 0xfe10
 #define CEN_OP_FLUSH_DUPLICATES 0xff3f
 #define CEN_PROP_HRB_CREATE BIT(9)
+#define CEN_VOICE_TRANSPARENT 0x0003
+#define CEN_VOICE_TRANSPARENT_16BIT 0x0063
+#define CEN_MAX_HRB_CONNS 16
+
+struct cen_hrb_conn {
+	bool valid;
+	u16 handle;
+	u8 bdaddr[6];
+};
 
 struct cen_aux_spec {
 	u16 id, slots, footer;
@@ -137,7 +149,11 @@ struct cen_bt {
 	bool ipc_requested, running;
 	u8 native_startup_steps;
 	bool hrb_supported, hrb_status_pending;
+	u16 hrb_sync_pending_wire, hrb_sync_pending_orig;
+	bool voice_hci_routed;
+	struct cen_hrb_conn hrb_conns[CEN_MAX_HRB_CONNS];
 	u32 proprietary_features, hrb_commands, hrb_status_events;
+	u32 hrb_sync_commands, hrb_sync_status_events;
 	u32 hrb_connection_events;
 	u8 hrb_last_link_type;
 	u32 scan_dup_rewritten, accept_list_hidden;
@@ -555,6 +571,69 @@ static int cen_start(struct cen_bt *bt)
 	return 0;
 }
 
+static void cen_hrb_clear(struct cen_bt *bt)
+{
+	memset(bt->hrb_conns, 0, sizeof(bt->hrb_conns));
+	bt->hrb_status_pending = false;
+	bt->hrb_sync_pending_wire = 0;
+	bt->hrb_sync_pending_orig = 0;
+}
+
+static void cen_hrb_track_add(struct cen_bt *bt, u16 handle, const u8 bdaddr[6])
+{
+	unsigned int i, free_slot = CEN_MAX_HRB_CONNS;
+
+	handle &= 0x0fff;
+	for (i = 0; i < CEN_MAX_HRB_CONNS; i++) {
+		if (bt->hrb_conns[i].valid && bt->hrb_conns[i].handle == handle) {
+			memcpy(bt->hrb_conns[i].bdaddr, bdaddr, 6);
+			return;
+		}
+		if (!bt->hrb_conns[i].valid && free_slot == CEN_MAX_HRB_CONNS)
+			free_slot = i;
+	}
+	if (free_slot < CEN_MAX_HRB_CONNS) {
+		bt->hrb_conns[free_slot].valid = true;
+		bt->hrb_conns[free_slot].handle = handle;
+		memcpy(bt->hrb_conns[free_slot].bdaddr, bdaddr, 6);
+	}
+}
+
+static void cen_hrb_track_del(struct cen_bt *bt, u16 handle)
+{
+	unsigned int i;
+
+	handle &= 0x0fff;
+	for (i = 0; i < CEN_MAX_HRB_CONNS; i++) {
+		if (bt->hrb_conns[i].valid && bt->hrb_conns[i].handle == handle)
+			bt->hrb_conns[i].valid = false;
+	}
+}
+
+static bool cen_hrb_has_handle(const struct cen_bt *bt, u16 handle)
+{
+	unsigned int i;
+
+	handle &= 0x0fff;
+	for (i = 0; i < CEN_MAX_HRB_CONNS; i++) {
+		if (bt->hrb_conns[i].valid && bt->hrb_conns[i].handle == handle)
+			return true;
+	}
+	return false;
+}
+
+static bool cen_hrb_has_bdaddr(const struct cen_bt *bt, const u8 bdaddr[6])
+{
+	unsigned int i;
+
+	for (i = 0; i < CEN_MAX_HRB_CONNS; i++) {
+		if (bt->hrb_conns[i].valid &&
+		    !memcmp(bt->hrb_conns[i].bdaddr, bdaddr, 6))
+			return true;
+	}
+	return false;
+}
+
 static int cen_transmit(struct cen_bt *bt, struct sk_buff_head *queue,
 			u16 ring, u16 slots, u32 offset, u16 footer, u16 *head)
 {
@@ -586,7 +665,7 @@ static int cen_transmit(struct cen_bt *bt, struct sk_buff_head *queue,
 			wire_length = skb->len;
 		}
 		if (ring == 1 && get_unaligned_le16(skb->data) == HCI_OP_RESET)
-			bt->hrb_status_pending = false;
+			cen_hrb_clear(bt);
 		if (ring == 1 && READ_ONCE(bt->hrb_supported) &&
 		    get_unaligned_le16(skb->data) == HCI_OP_CREATE_CONN) {
 			u8 *command = descriptor + 16;
@@ -603,6 +682,56 @@ static int cen_transmit(struct cen_bt *bt, struct sk_buff_head *queue,
 			bt->hrb_status_pending = true;
 			bt->hrb_commands++;
 			cen_capture_frame(bt, 1, command, wire_length);
+		}
+		if (ring == 1 &&
+		    get_unaligned_le16(skb->data) == HCI_OP_SETUP_SYNC_CONN &&
+		    skb->len == HCI_COMMAND_HDR_SIZE + sizeof(struct hci_cp_setup_sync_conn)) {
+			u8 *command = descriptor + 16;
+			u16 handle = get_unaligned_le16(command + HCI_COMMAND_HDR_SIZE);
+
+			/* Firmware requires 16-bit 2's complement input format
+			 * alongside transparent air coding (0x0063 vs 0x0003).
+			 */
+			if (get_unaligned_le16(command + HCI_COMMAND_HDR_SIZE + 12) ==
+			    CEN_VOICE_TRANSPARENT)
+				put_unaligned_le16(CEN_VOICE_TRANSPARENT_16BIT,
+						   command + HCI_COMMAND_HDR_SIZE + 12);
+			/* Extended links (0xf0/0xf1) require the 18-byte
+			 * extended synchronous setup command with 24-bit
+			 * packet type mask.
+			 */
+			if (READ_ONCE(bt->hrb_supported) &&
+			    cen_hrb_has_handle(bt, handle)) {
+				put_unaligned_le16(CEN_OP_HRB_SETUP_SYNC_CONN, command);
+				command[2] = 18;
+				command[HCI_COMMAND_HDR_SIZE + 17] = 0;
+				wire_length = HCI_COMMAND_HDR_SIZE + 18;
+				bt->hrb_sync_pending_wire = CEN_OP_HRB_SETUP_SYNC_CONN;
+				bt->hrb_sync_pending_orig = HCI_OP_SETUP_SYNC_CONN;
+				bt->hrb_sync_commands++;
+				cen_capture_frame(bt, 1, command, wire_length);
+			}
+		}
+		if (ring == 1 &&
+		    get_unaligned_le16(skb->data) == HCI_OP_ACCEPT_SYNC_CONN_REQ &&
+		    skb->len == HCI_COMMAND_HDR_SIZE + sizeof(struct hci_cp_accept_sync_conn_req)) {
+			u8 *command = descriptor + 16;
+
+			if (get_unaligned_le16(command + HCI_COMMAND_HDR_SIZE + 16) ==
+			    CEN_VOICE_TRANSPARENT)
+				put_unaligned_le16(CEN_VOICE_TRANSPARENT_16BIT,
+						   command + HCI_COMMAND_HDR_SIZE + 16);
+			if (READ_ONCE(bt->hrb_supported) &&
+			    cen_hrb_has_bdaddr(bt, command + HCI_COMMAND_HDR_SIZE)) {
+				put_unaligned_le16(CEN_OP_HRB_ACCEPT_SYNC_CONN, command);
+				command[2] = 22;
+				command[HCI_COMMAND_HDR_SIZE + 21] = 0;
+				wire_length = HCI_COMMAND_HDR_SIZE + 22;
+				bt->hrb_sync_pending_wire = CEN_OP_HRB_ACCEPT_SYNC_CONN;
+				bt->hrb_sync_pending_orig = HCI_OP_ACCEPT_SYNC_CONN_REQ;
+				bt->hrb_sync_commands++;
+				cen_capture_frame(bt, 1, command, wire_length);
+			}
 		}
 		put_unaligned_le32(1 | (wire_length << 8), descriptor);
 		*head = next;
@@ -734,8 +863,19 @@ static void cen_poll(struct work_struct *work)
 				bt->hrb_status_pending = false;
 				bt->hrb_status_events++;
 			}
+			if (bt->hrb_sync_pending_wire && length == 6 &&
+			    skb->data[0] == HCI_EV_CMD_STATUS &&
+			    get_unaligned_le16(skb->data + 4) == bt->hrb_sync_pending_wire) {
+				cen_capture_frame(bt, 7, skb->data, length);
+				put_unaligned_le16(bt->hrb_sync_pending_orig, skb->data + 4);
+				bt->hrb_sync_pending_wire = 0;
+				bt->hrb_sync_pending_orig = 0;
+				bt->hrb_sync_status_events++;
+			}
 			/* Normalize vendor 0xf0/0xf1 Connection Complete link types
-			 * to standard ACL_LINK so HCI matches the pending connection.
+			 * to standard ACL_LINK so HCI matches the pending connection,
+			 * and record the handle so subsequent SCO setup uses the
+			 * extended synchronous command.
 			 */
 			if (READ_ONCE(bt->hrb_supported) &&
 			    length == HCI_EVENT_HDR_SIZE + sizeof(struct hci_ev_conn_complete) &&
@@ -743,9 +883,17 @@ static void cen_poll(struct work_struct *work)
 			    (skb->data[11] & 0xfe) == 0xf0) {
 				cen_capture_frame(bt, 7, skb->data, length);
 				bt->hrb_last_link_type = skb->data[11];
+				if (!skb->data[2])
+					cen_hrb_track_add(bt,
+							  get_unaligned_le16(skb->data + 3),
+							  skb->data + 5);
 				skb->data[11] = ACL_LINK;
 				bt->hrb_connection_events++;
 			}
+			if (length == HCI_EVENT_HDR_SIZE + sizeof(struct hci_ev_disconn_complete) &&
+			    skb->data[0] == HCI_EV_DISCONN_COMPLETE &&
+			    !skb->data[2])
+				cen_hrb_track_del(bt, get_unaligned_le16(skb->data + 3));
 			cen_normalize_ext_adv(skb);
 			cen_fixup_event(bt, skb);
 			hci_skb_pkt_type(skb) = HCI_EVENT_PKT;
@@ -813,7 +961,7 @@ static int cen_hci_close(struct hci_dev *hdev)
 
 	mutex_lock(&bt->lock);
 	bt->running = false;
-	bt->hrb_status_pending = false;
+	cen_hrb_clear(bt);
 	mutex_unlock(&bt->lock);
 	cancel_delayed_work_sync(&bt->poll);
 	skb_queue_purge(&bt->txq);
@@ -832,6 +980,8 @@ static void cen_hci_reset(struct hci_dev *hdev)
 
 	mutex_lock(&bt->lock);
 	bt->hrb_status_pending = false;
+	bt->hrb_sync_pending_wire = 0;
+	bt->hrb_sync_pending_orig = 0;
 	paused = READ_ONCE(bt->transport_paused);
 	if (!paused && bt->bar && bt->arena) {
 		exec = readl(bt->bar + 0x18);
@@ -886,9 +1036,20 @@ static int cen_hci_reset_dup_filter(struct hci_dev *hdev)
 static int cen_hci_post_init(struct hci_dev *hdev)
 {
 	struct cen_bt *bt = hci_get_drvdata(hdev);
+	static const u8 voice_hci[6] = { 0x01, 0x00, 0xff, 0xff, 0xff, 0xff };
 	struct sk_buff *skb;
 	u32 features;
 	int ret;
+
+	/* Route synchronous voice audio over the HCI SCO rings (3/9). */
+	ret = cen_vendor_command(hdev, CEN_OP_WRITE_VOICE_CONFIG,
+				 voice_hci, sizeof(voice_hci));
+	if (ret) {
+		bt_dev_dbg(hdev, "Voice HCI routing command returned %d", ret);
+		WRITE_ONCE(bt->voice_hci_routed, false);
+	} else {
+		WRITE_ONCE(bt->voice_hci_routed, true);
+	}
 
 	if (!native_hrb)
 		return 0;
@@ -1073,12 +1234,24 @@ static int cen_hci_send(struct hci_dev *hdev, struct sk_buff *skb)
 		u16 opcode = get_unaligned_le16(skb->data);
 
 		/* Do not mix unmanaged native commands with translated requests. */
-		if (opcode == CEN_OP_HRB_CREATE_CONN) {
+		if (opcode == CEN_OP_HRB_CREATE_CONN ||
+		    opcode == CEN_OP_HRB_SETUP_SYNC_CONN ||
+		    opcode == CEN_OP_HRB_ACCEPT_SYNC_CONN) {
 			ret = -EOPNOTSUPP;
 			goto out;
 		}
 		if (opcode == HCI_OP_CREATE_CONN &&
 		    skb->len != HCI_COMMAND_HDR_SIZE + sizeof(struct hci_cp_create_conn)) {
+			ret = -EMSGSIZE;
+			goto out;
+		}
+		if (opcode == HCI_OP_SETUP_SYNC_CONN &&
+		    skb->len != HCI_COMMAND_HDR_SIZE + sizeof(struct hci_cp_setup_sync_conn)) {
+			ret = -EMSGSIZE;
+			goto out;
+		}
+		if (opcode == HCI_OP_ACCEPT_SYNC_CONN_REQ &&
+		    skb->len != HCI_COMMAND_HDR_SIZE + sizeof(struct hci_cp_accept_sync_conn_req)) {
 			ret = -EMSGSIZE;
 			goto out;
 		}
@@ -1159,8 +1332,10 @@ static int cen_status_show(struct seq_file *s, void *unused)
 		   native_hrb, READ_ONCE(bt->hrb_supported),
 		   READ_ONCE(bt->proprietary_features), bt->hrb_commands,
 		   bt->hrb_status_events, bt->hrb_status_pending);
-	seq_printf(s, "hrb_connection_events=%u hrb_last_link_type=0x%02x\n",
-		   bt->hrb_connection_events, bt->hrb_last_link_type);
+	seq_printf(s, "hrb_connection_events=%u hrb_last_link_type=0x%02x hrb_sync_commands=%u hrb_sync_status_events=%u voice_hci_routed=%u\n",
+		   bt->hrb_connection_events, bt->hrb_last_link_type,
+		   bt->hrb_sync_commands, bt->hrb_sync_status_events,
+		   READ_ONCE(bt->voice_hci_routed));
 	seq_printf(s, "accept_list=%u accept_list_hidden=%u\n", accept_list,
 		   bt->accept_list_hidden);
 	seq_printf(s, "scan_dup_filter=%u scan_dup_rewritten=%u\n", scan_dup_filter,

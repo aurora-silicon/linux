@@ -40,8 +40,20 @@
 
 #define CEN_OP_READ_PROP_FEATURES 0xffa3
 #define CEN_OP_CREATE_CONN 0xff7b
+#define CEN_OP_HRB_SETUP_SYNC_CONN 0xfdc7
+#define CEN_OP_HRB_ACCEPT_SYNC_CONN 0xfdf8
+#define CEN_OP_WRITE_VOICE_CONFIG 0xfe10
 #define CEN_OP_FLUSH_DUPLICATES 0xff3f
 #define CEN_PROP_CREATE_CONN BIT(9)
+#define CEN_VOICE_TRANSPARENT 0x0003
+#define CEN_VOICE_TRANSPARENT_16BIT 0x0063
+#define CEN_MAX_HRB_CONNS 16
+
+struct cen_hrb_conn {
+	bool valid;
+	u16 handle;
+	u8 bdaddr[6];
+};
 
 struct cen_aux_spec {
 	u16 id, slots, footer;
@@ -86,6 +98,8 @@ struct cen_bt {
 	int suspend_error;
 	u8 native_startup_steps;
 	bool connection_command_supported, connection_status_pending;
+	u16 sync_pending_wire, sync_pending_orig;
+	struct cen_hrb_conn hrb_conns[CEN_MAX_HRB_CONNS];
 };
 
 static u16 cen_tail(struct cen_bt *bt, u16 ring)
@@ -483,6 +497,72 @@ static int cen_start(struct cen_bt *bt)
 	return cen_aux_start(bt);
 }
 
+static void cen_hrb_clear(struct cen_bt *bt)
+{
+	memset(bt->hrb_conns, 0, sizeof(bt->hrb_conns));
+	bt->connection_status_pending = false;
+	bt->sync_pending_wire = 0;
+	bt->sync_pending_orig = 0;
+}
+
+static void cen_hrb_track_add(struct cen_bt *bt, u16 handle, const u8 bdaddr[6])
+{
+	unsigned int i, free_slot = CEN_MAX_HRB_CONNS;
+
+	handle &= 0x0fff;
+	for (i = 0; i < CEN_MAX_HRB_CONNS; i++) {
+		if (bt->hrb_conns[i].valid &&
+		    bt->hrb_conns[i].handle == handle) {
+			memcpy(bt->hrb_conns[i].bdaddr, bdaddr, 6);
+			return;
+		}
+		if (!bt->hrb_conns[i].valid && free_slot == CEN_MAX_HRB_CONNS)
+			free_slot = i;
+	}
+	if (free_slot < CEN_MAX_HRB_CONNS) {
+		bt->hrb_conns[free_slot].valid = true;
+		bt->hrb_conns[free_slot].handle = handle;
+		memcpy(bt->hrb_conns[free_slot].bdaddr, bdaddr, 6);
+	}
+}
+
+static void cen_hrb_track_del(struct cen_bt *bt, u16 handle)
+{
+	unsigned int i;
+
+	handle &= 0x0fff;
+	for (i = 0; i < CEN_MAX_HRB_CONNS; i++) {
+		if (bt->hrb_conns[i].valid &&
+		    bt->hrb_conns[i].handle == handle)
+			bt->hrb_conns[i].valid = false;
+	}
+}
+
+static bool cen_hrb_has_handle(const struct cen_bt *bt, u16 handle)
+{
+	unsigned int i;
+
+	handle &= 0x0fff;
+	for (i = 0; i < CEN_MAX_HRB_CONNS; i++) {
+		if (bt->hrb_conns[i].valid &&
+		    bt->hrb_conns[i].handle == handle)
+			return true;
+	}
+	return false;
+}
+
+static bool cen_hrb_has_bdaddr(const struct cen_bt *bt, const u8 bdaddr[6])
+{
+	unsigned int i;
+
+	for (i = 0; i < CEN_MAX_HRB_CONNS; i++) {
+		if (bt->hrb_conns[i].valid &&
+		    !memcmp(bt->hrb_conns[i].bdaddr, bdaddr, 6))
+			return true;
+	}
+	return false;
+}
+
 static int cen_transmit(struct cen_bt *bt, struct sk_buff_head *queue, u16 ring,
 			u16 slots, u32 offset, u16 footer, u16 *head)
 {
@@ -514,7 +594,7 @@ static int cen_transmit(struct cen_bt *bt, struct sk_buff_head *queue, u16 ring,
 			wire_length = skb->len;
 		}
 		if (ring == 1 && get_unaligned_le16(skb->data) == HCI_OP_RESET)
-			bt->connection_status_pending = false;
+			cen_hrb_clear(bt);
 		if (ring == 1 && READ_ONCE(bt->connection_command_supported) &&
 		    get_unaligned_le16(skb->data) == HCI_OP_CREATE_CONN) {
 			u8 *command = descriptor + 16;
@@ -525,6 +605,58 @@ static int cen_transmit(struct cen_bt *bt, struct sk_buff_head *queue, u16 ring,
 			command[HCI_COMMAND_HDR_SIZE + 12] = 0;
 			wire_length = HCI_COMMAND_HDR_SIZE + 15;
 			bt->connection_status_pending = true;
+		}
+		if (ring == 1 &&
+		    get_unaligned_le16(skb->data) == HCI_OP_SETUP_SYNC_CONN &&
+		    skb->len == HCI_COMMAND_HDR_SIZE +
+					sizeof(struct hci_cp_setup_sync_conn)) {
+			u8 *command = descriptor + 16;
+			u16 handle = get_unaligned_le16(command +
+							HCI_COMMAND_HDR_SIZE);
+
+			if (get_unaligned_le16(command + HCI_COMMAND_HDR_SIZE +
+					       12) == CEN_VOICE_TRANSPARENT)
+				put_unaligned_le16(CEN_VOICE_TRANSPARENT_16BIT,
+						   command +
+						   HCI_COMMAND_HDR_SIZE + 12);
+			if (READ_ONCE(bt->connection_command_supported) &&
+			    cen_hrb_has_handle(bt, handle)) {
+				put_unaligned_le16(CEN_OP_HRB_SETUP_SYNC_CONN,
+						   command);
+				command[2] = 18;
+				command[HCI_COMMAND_HDR_SIZE + 17] = 0;
+				wire_length = HCI_COMMAND_HDR_SIZE + 18;
+				bt->sync_pending_wire =
+					CEN_OP_HRB_SETUP_SYNC_CONN;
+				bt->sync_pending_orig = HCI_OP_SETUP_SYNC_CONN;
+			}
+		}
+		if (ring == 1 &&
+		    get_unaligned_le16(skb->data) ==
+			    HCI_OP_ACCEPT_SYNC_CONN_REQ &&
+		    skb->len ==
+			    HCI_COMMAND_HDR_SIZE +
+				    sizeof(struct hci_cp_accept_sync_conn_req)) {
+			u8 *command = descriptor + 16;
+
+			if (get_unaligned_le16(command + HCI_COMMAND_HDR_SIZE +
+					       16) == CEN_VOICE_TRANSPARENT)
+				put_unaligned_le16(CEN_VOICE_TRANSPARENT_16BIT,
+						   command +
+						   HCI_COMMAND_HDR_SIZE + 16);
+			if (READ_ONCE(bt->connection_command_supported) &&
+			    cen_hrb_has_bdaddr(bt,
+					       command + HCI_COMMAND_HDR_SIZE)) {
+				put_unaligned_le16(CEN_OP_HRB_ACCEPT_SYNC_CONN,
+						   command);
+				command[2] = 22;
+				command[HCI_COMMAND_HDR_SIZE + 21] = 0;
+				wire_length = HCI_COMMAND_HDR_SIZE + 22;
+				bt->sync_pending_wire =
+					CEN_OP_HRB_ACCEPT_SYNC_CONN;
+				bt->sync_pending_orig =
+					HCI_OP_ACCEPT_SYNC_CONN_REQ;
+			}
 		}
 		put_unaligned_le32(1 | (wire_length << 8), descriptor);
 		*head = next;
@@ -652,6 +784,15 @@ static void cen_io_work(struct work_struct *work)
 						   skb->data + 4);
 				bt->connection_status_pending = false;
 			}
+			if (bt->sync_pending_wire && length == 6 &&
+			    skb->data[0] == HCI_EV_CMD_STATUS &&
+			    get_unaligned_le16(skb->data + 4) ==
+				    bt->sync_pending_wire) {
+				put_unaligned_le16(bt->sync_pending_orig,
+						   skb->data + 4);
+				bt->sync_pending_wire = 0;
+				bt->sync_pending_orig = 0;
+			}
 
 			if (READ_ONCE(bt->connection_command_supported) &&
 			    length ==
@@ -659,8 +800,19 @@ static void cen_io_work(struct work_struct *work)
 					    sizeof(struct hci_ev_conn_complete) &&
 			    skb->data[0] == HCI_EV_CONN_COMPLETE &&
 			    (skb->data[11] & 0xfe) == 0xf0) {
+				if (!skb->data[2])
+					cen_hrb_track_add(bt,
+							  get_unaligned_le16(skb->data + 3),
+							  skb->data + 5);
 				skb->data[11] = ACL_LINK;
 			}
+			if (length ==
+				    HCI_EVENT_HDR_SIZE +
+					    sizeof(struct hci_ev_disconn_complete) &&
+			    skb->data[0] == HCI_EV_DISCONN_COMPLETE &&
+			    !skb->data[2])
+				cen_hrb_track_del(bt,
+						  get_unaligned_le16(skb->data + 3));
 			hci_skb_pkt_type(skb) = HCI_EVENT_PKT;
 			hdev->stat.byte_rx += length;
 			hci_recv_frame(hdev, skb);
@@ -734,7 +886,7 @@ static int cen_hci_close(struct hci_dev *hdev)
 
 	mutex_lock(&bt->lock);
 	bt->running = false;
-	bt->connection_status_pending = false;
+	cen_hrb_clear(bt);
 	mutex_unlock(&bt->lock);
 	cancel_work_sync(&bt->io_work);
 	skb_queue_purge(&bt->txq);
@@ -753,6 +905,8 @@ static void cen_hci_reset(struct hci_dev *hdev)
 
 	mutex_lock(&bt->lock);
 	bt->connection_status_pending = false;
+	bt->sync_pending_wire = 0;
+	bt->sync_pending_orig = 0;
 	paused = READ_ONCE(bt->transport_paused);
 	if (!paused && bt->bar && bt->arena) {
 		exec = readl(bt->bar + 0x18);
@@ -802,9 +956,15 @@ static int cen_hci_reset_dup_filter(struct hci_dev *hdev)
 static int cen_hci_post_init(struct hci_dev *hdev)
 {
 	struct cen_bt *bt = hci_get_drvdata(hdev);
+	static const u8 voice_hci[6] = { 0x01, 0x00, 0xff, 0xff, 0xff, 0xff };
 	struct sk_buff *skb;
 	u32 features;
 	int ret;
+
+	ret = cen_vendor_command(hdev, CEN_OP_WRITE_VOICE_CONFIG,
+				 voice_hci, sizeof(voice_hci));
+	if (ret)
+		bt_dev_dbg(hdev, "Voice HCI routing command returned %d", ret);
 
 	WRITE_ONCE(bt->connection_command_supported, false);
 	skb = __hci_cmd_sync(hdev, CEN_OP_READ_PROP_FEATURES, 0, NULL,
@@ -976,13 +1136,27 @@ static int cen_hci_send(struct hci_dev *hdev, struct sk_buff *skb)
 	if (hci_skb_pkt_type(skb) == HCI_COMMAND_PKT) {
 		u16 opcode = get_unaligned_le16(skb->data);
 
-		if (opcode == CEN_OP_CREATE_CONN) {
+		if (opcode == CEN_OP_CREATE_CONN ||
+		    opcode == CEN_OP_HRB_SETUP_SYNC_CONN ||
+		    opcode == CEN_OP_HRB_ACCEPT_SYNC_CONN) {
 			ret = -EOPNOTSUPP;
 			goto out;
 		}
 		if (opcode == HCI_OP_CREATE_CONN &&
 		    skb->len != HCI_COMMAND_HDR_SIZE +
 					sizeof(struct hci_cp_create_conn)) {
+			ret = -EMSGSIZE;
+			goto out;
+		}
+		if (opcode == HCI_OP_SETUP_SYNC_CONN &&
+		    skb->len != HCI_COMMAND_HDR_SIZE +
+					sizeof(struct hci_cp_setup_sync_conn)) {
+			ret = -EMSGSIZE;
+			goto out;
+		}
+		if (opcode == HCI_OP_ACCEPT_SYNC_CONN_REQ &&
+		    skb->len != HCI_COMMAND_HDR_SIZE +
+					sizeof(struct hci_cp_accept_sync_conn_req)) {
 			ret = -EMSGSIZE;
 			goto out;
 		}
