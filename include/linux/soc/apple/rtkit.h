@@ -335,6 +335,7 @@ void apple_rtkit_mailbox_off(struct apple_rtkit *rtk);
  * back from idle without losing power, so that its idle has to follow every refusal.
  * @us is about how long the two acknowledgements took. Only
  * apple_rtkit_warm_restart() follows this, once the sleep has reached the hardware.
+ * With @cpu_control NULL, nothing is waited on after the second acknowledgment.
  */
 int apple_rtkit_sleep_idle_polled(struct apple_rtkit *rtk, void __iomem *cpu_control,
 				  unsigned int *us);

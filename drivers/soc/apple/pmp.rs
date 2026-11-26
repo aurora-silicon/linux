@@ -199,6 +199,8 @@ struct PmpData {
     confirm_ioreg_len: bool,
     /// See [`PmpHwConfig::register_ack_index`].
     register_ack_index: bool,
+    /// See [`PmpHwConfig::commit_cpu_down`].
+    commit_cpu_down: bool,
 }
 
 impl PmpData {
@@ -237,6 +239,7 @@ impl PmpData {
                     self_ack_start: cfg.self_ack_start,
                     confirm_ioreg_len: cfg.confirm_ioreg_len,
                     register_ack_index: cfg.register_ack_index,
+                    commit_cpu_down: cfg.commit_cpu_down,
                 }
             ),
             GFP_KERNEL,
@@ -595,7 +598,11 @@ impl PmpData {
         let pmp_mmio = self.pmp_mmio.access(bound_dev)?.as_view();
         let mut copy = self.sram_alloc(&pmp_mmio)?;
         stop.rtk = self.rtkit_handle()?;
-        stop.control = self.asc_cpu_control()?;
+        stop.control = if self.commit_cpu_down {
+            self.asc_cpu_control()?
+        } else {
+            core::ptr::null_mut()
+        };
         stop.sram = core::ptr::null_mut();
         stop.words = core::ptr::null_mut();
         stop.count = 0;
@@ -955,6 +962,10 @@ struct PmpHwConfig {
     /// Put the entry's count in bits 47:32 of the REGISTER_IOREG acknowledgment. macOS 27.2
     /// leaves them 0 on T6030.
     register_ack_index: bool,
+    /// At the commit, wait for the CPU status to show the firmware's CPU down after the idle
+    /// pair. On T6030 macOS waits for nothing there: after the IOP's acknowledgment it turns
+    /// the mailbox's receive off and reads the mailbox's first word once.
+    commit_cpu_down: bool,
 }
 
 /// Whether a PMP firmware needs endpoint 7 to finish its RTKit boot.
@@ -977,6 +988,7 @@ const HW_CFG_DEFAULT: PmpHwConfig = PmpHwConfig {
     self_ack_start: false,
     confirm_ioreg_len: false,
     register_ack_index: true,
+    commit_cpu_down: true,
 };
 
 /// T8140: the DART translates 42 bits and its DMA window starts at 1 TiB.
@@ -989,6 +1001,7 @@ const HW_CFG_T8140: PmpHwConfig = PmpHwConfig {
     self_ack_start: false,
     confirm_ioreg_len: false,
     register_ack_index: true,
+    commit_cpu_down: true,
 };
 
 /// T6041: the DART window starts at 1 TiB; the boot argument header is
@@ -1005,6 +1018,7 @@ const HW_CFG_T6041: PmpHwConfig = PmpHwConfig {
     self_ack_start: false,
     confirm_ioreg_len: false,
     register_ack_index: true,
+    commit_cpu_down: true,
 };
 
 /// T8142: the DART window starts at 1 TiB as on T8140. Its registry-v2
@@ -1019,6 +1033,7 @@ const HW_CFG_T8142: PmpHwConfig = PmpHwConfig {
     self_ack_start: false,
     confirm_ioreg_len: false,
     register_ack_index: true,
+    commit_cpu_down: true,
 };
 
 /// T6050: the DART window starts at 1 TiB (ADT dart-pmp0 vm-base) and spans
@@ -1033,6 +1048,7 @@ const HW_CFG_T6050: PmpHwConfig = PmpHwConfig {
     self_ack_start: false,
     confirm_ioreg_len: false,
     register_ack_index: true,
+    commit_cpu_down: true,
 };
 
 /// T8132: over a sleep only the ADT's second segment (0x68000 bytes, starting at 0x3c000 on
@@ -1048,6 +1064,7 @@ const HW_CFG_T8132: PmpHwConfig = PmpHwConfig {
     self_ack_start: true,
     confirm_ioreg_len: true,
     register_ack_index: true,
+    commit_cpu_down: true,
 };
 
 /// T6030 (J516S, macOS 27.2 image 5D66805B): the DART window starts at 1 TiB (ADT dart-pmp
@@ -1055,7 +1072,8 @@ const HW_CFG_T8132: PmpHwConfig = PmpHwConfig {
 /// sends no SET_IOP_PWR_STATE at the start: the firmware acknowledges IOP power on by itself. It
 /// answers UPDATE_IOREG with 8, the registered entry's length, and REGISTER_IOREG with the length
 /// alone. The image has endpoints 1 to 4 and 0x20, no endpoint 7. macOS's sleep never touches the
-/// PMP SRAM, so none is kept.
+/// PMP SRAM, so none is kept. At the commit macOS sends the idle pair, turns the mailbox's receive
+/// off and goes on (`ref/t6030-macos-s2r-entry-full-{1,2,3}`, -25 ms): no wait on the CPU status.
 const HW_CFG_T6030: PmpHwConfig = PmpHwConfig {
     dma_mask: Some(DmaMask::new::<42>()),
     check_bootargs_uuid: false,
@@ -1065,6 +1083,7 @@ const HW_CFG_T6030: PmpHwConfig = PmpHwConfig {
     self_ack_start: true,
     confirm_ioreg_len: true,
     register_ack_index: false,
+    commit_cpu_down: false,
 };
 
 impl Drop for PmpDriver {

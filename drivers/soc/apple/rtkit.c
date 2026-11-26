@@ -3444,7 +3444,7 @@ int apple_rtkit_sleep_idle_polled(struct apple_rtkit *rtk, void __iomem *cpu_con
 			dev_err(rtk->dev, "RTKit: idle status %#x after the idle pair\n", status);
 			ret = -ETIMEDOUT;
 		}
-	} else if (!ret) {
+	} else if (!ret && cpu_control) {
 		ret = readl_poll_timeout_atomic(cpu_control + APPLE_ASC_CPU_STATUS, status,
 						(status & APPLE_ASC_CPU_STATUS_DOWN) ==
 						APPLE_ASC_CPU_STATUS_DOWN,
