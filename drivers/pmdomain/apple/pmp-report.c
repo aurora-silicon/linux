@@ -1284,14 +1284,17 @@ static int apple_pmp_start_describe(struct apple_pmp_report *rep,
  *  - diag_hold: request bits held set (macOS holds AGX, bit 4, while its GPU driver runs);
  *  - diag_toggle: request bits set 5.1 s and cleared 1.07 s in turn (macOS's ISP, bit 6);
  *  - diag_feed: +0x10b68 and +0x10b70 every 100 ms and +0x10c20 every second, with macOS's last
- *    values before its sleep, after its two one-time +0x10b40..+0x10b60 writes.
+ *    values before its sleep, after its two one-time +0x10b40..+0x10b60 writes;
+ *  - diag_dvfs: the CPU clients' DVFS requests +0x10900, +0x10908 and +0x10918 (bit 61 and a
+ *    level, levels from bytes 0, 1 and 2), every 100 ms. macOS writes them thousands of times
+ *    from before its PMP starts; Linux, never before the commit.
  */
 #define PMP_DIAG_TICK_MS	100
 #define PMP_DIAG_TOGGLE_ON	51
 #define PMP_DIAG_TOGGLE_PERIOD	62
 #define PMP_DIAG_SECOND		10
 
-static unsigned long pmp_diag_hold, pmp_diag_toggle;
+static unsigned long pmp_diag_hold, pmp_diag_toggle, pmp_diag_dvfs;
 static bool pmp_diag_feed;
 static struct apple_pmp_report *pmp_diag_rep;
 static unsigned int pmp_diag_tick;
@@ -1318,6 +1321,7 @@ static void pmp_diag_work_fn(struct work_struct *work)
 	unsigned long hold = READ_ONCE(pmp_diag_hold);
 	unsigned long toggle = READ_ONCE(pmp_diag_toggle);
 	bool feed = READ_ONCE(pmp_diag_feed);
+	unsigned long dvfs = READ_ONCE(pmp_diag_dvfs);
 	unsigned long flags;
 	u64 cur, want;
 
@@ -1333,6 +1337,11 @@ static void pmp_diag_work_fn(struct work_struct *work)
 		if (!(pmp_diag_tick % PMP_DIAG_SECOND))
 			writeq(6, rep->base + 0x10c20);
 	}
+	if (dvfs) {
+		writeq(BIT_ULL(61) | (dvfs & 0xff), rep->base + 0x10900);
+		writeq(BIT_ULL(61) | ((dvfs >> 8) & 0xff), rep->base + 0x10908);
+		writeq(BIT_ULL(61) | ((dvfs >> 16) & 0xff), rep->base + 0x10918);
+	}
 	if (hold || toggle) {
 		spin_lock_irqsave(&rep->lock, flags);
 		cur = readq(rep->base + rep->offsets->tgt_read);
@@ -1346,7 +1355,7 @@ static void pmp_diag_work_fn(struct work_struct *work)
 		spin_unlock_irqrestore(&rep->lock, flags);
 	}
 	pmp_diag_tick++;
-	if (feed || hold || toggle)
+	if (feed || hold || toggle || dvfs)
 		schedule_delayed_work(&pmp_diag_work, msecs_to_jiffies(PMP_DIAG_TICK_MS));
 }
 
@@ -1389,6 +1398,8 @@ MODULE_PARM_DESC(diag_hold, "DIAGNOSTIC (T6030): PTD request bits held set while
 module_param_cb(diag_toggle, &pmp_diag_ulong_ops, &pmp_diag_toggle, 0644);
 MODULE_PARM_DESC(diag_toggle, "DIAGNOSTIC (T6030): PTD request bits set 5.1 s, cleared 1.07 s, in turn");
 module_param_cb(diag_feed, &pmp_diag_bool_ops, &pmp_diag_feed, 0644);
+module_param_cb(diag_dvfs, &pmp_diag_ulong_ops, &pmp_diag_dvfs, 0644);
+MODULE_PARM_DESC(diag_dvfs, "DIAGNOSTIC (T6030): CPU DVFS request levels for +0x10900/+0x10908/+0x10918 in bytes 0/1/2, every 100 ms");
 MODULE_PARM_DESC(diag_feed, "DIAGNOSTIC (T6030): macOS's periodic PTD words +0x10b68/+0x10b70 (100 ms) and +0x10c20 (1 s)");
 
 static void apple_pmp_start_finish(struct apple_pmp_start *st, int result)
