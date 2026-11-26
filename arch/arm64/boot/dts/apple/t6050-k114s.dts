@@ -28,6 +28,8 @@
 	aliases {
 		/* asahi-bless and the boot loader find the NVRAM partition by this alias */
 		nvram = &nvram;
+		/* The boot loader reserves SEP firmware and adds its manifests. */
+		sep = &sep;
 	};
 };
 
@@ -58,5 +60,72 @@
 				read-only;
 			};
 		};
+	};
+};
+
+/*
+ * Expose AP GPIO 138 for Touch ID data ready. Keep all other AP pins
+ * reserved (reading pin 112 takes an SError).
+ */
+&pinctrl_ap {
+	gpio-reserved-ranges = <0 138>, <139 82>;
+};
+
+/*
+ * Enable the SEP mailbox and power domain. Leave both fabric parents
+ * under firmware control, so genpd can vote on them without turning them
+ * off. apple_sep enables SEP and its DART when the mailbox is available.
+ */
+&sep_mbox {
+	status = "okay";
+};
+
+&ps_sep {
+	status = "okay";
+};
+
+&ps_fab8_soc {
+	apple,firmware-owned;
+	status = "okay";
+};
+
+&ps_fab0_piogw {
+	apple,firmware-owned;
+	status = "okay";
+};
+
+/*
+ * Touch ID (ADT spi2/mesa): the Mesa sensor on spi2 at 8 MHz, chip select 0,
+ * powered by NUB GPIO 21 (function-mesa_pwr), data ready on AP GPIO 138, as
+ * on the J714s and K116s. spi2 runs from the 24 MHz reference (ADT clock-ids 451).
+ */
+&ps_nub_gpio {
+	status = "okay";
+};
+
+&nub_gpio0 {
+	status = "okay";
+};
+
+&ps_spi2 {
+	status = "okay";
+};
+
+&spi2 {
+	clocks = <&clkref>;
+	status = "okay";
+
+	mesa: fingerprint@0 {
+		compatible = "apple,mesa-fingerprint";
+		reg = <0>;
+		spi-max-frequency = <8000000>;
+		spi-cpol;
+		spi-cs-setup-delay-ns = <20>;
+		spi-cs-hold-delay-ns = <20>;
+		enable-gpios = <&nub_gpio0 21 GPIO_ACTIVE_HIGH>;
+		interrupt-parent = <&pinctrl_ap>;
+		interrupts = <138 IRQ_TYPE_EDGE_RISING>;
+		/* Per-device factory data from this Mac's own iBoot system container */
+		firmware-name = "apple/mesacal-k114s.bin", "apple/msrk-k114s.bin";
 	};
 };
