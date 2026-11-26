@@ -2870,6 +2870,8 @@ static int atcphy_auspll_apb_command(struct apple_atcphy *atcphy, u32 command)
 	return ret;
 }
 
+static void atcphy_restore_after_pd_off(struct apple_atcphy *atcphy);
+
 static int atcphy_dp_configure(struct apple_atcphy *atcphy, enum atcphy_dp_link_rate lr)
 {
 	const struct atcphy_dp_link_rate_configuration *cfg;
@@ -2884,6 +2886,7 @@ static int atcphy_dp_configure(struct apple_atcphy *atcphy, enum atcphy_dp_link_
 	/* the AUSPLL is in use as the Thunderbolt DP tunnel pixel clock */
 	if (atcphy->tunnel_clock_on || atcphy->tunnel_saved)
 		return -EBUSY;
+	atcphy_restore_after_pd_off(atcphy);
 	mode_cfg = atcphy_get_mode_config(atcphy, atcphy->mode);
 	cfg = &dp_lr_config[lr];
 
@@ -5394,7 +5397,13 @@ static int atcphy_dpphy_configure(struct phy *phy, union phy_configure_opts *opt
 			return -EINVAL;
 		}
 
-		return atcphy_dp_configure(atcphy, link_rate);
+		int ret = atcphy_rpm_get(atcphy);
+
+		if (ret < 0)
+			return ret;
+		ret = atcphy_dp_configure(atcphy, link_rate);
+		atcphy_rpm_put(atcphy);
+		return ret;
 	}
 
 	return 0;
@@ -5545,6 +5554,15 @@ int apple_atc_dp_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate)
 			return ret;
 	}
 	guard(mutex)(&atcphy->lock);
+	if (atcphy->idle_rpm &&
+	    atcphy->mode != APPLE_ATCPHY_MODE_USB4 &&
+	    atcphy->mode != APPLE_ATCPHY_MODE_TBT) {
+		if (!rate) {
+			atcphy->tunnel_users &= ~BIT(dpin);
+			return 0;
+		}
+		return -EBUSY;
+	}
 	if (!rate) {
 		if (apple_atc_tunnel_is_t8103_style()) {
 			/*
@@ -8210,7 +8228,8 @@ static int atcphy_suspend_noirq(struct device *dev)
 static void atcphy_sleep_lost_common(struct apple_atcphy *atcphy)
 {
 	if ((!atcphy->hw->has_t8140_dp &&
-	     !of_device_is_compatible(atcphy->np, "apple,t8142-atcphy")) ||
+	     !of_device_is_compatible(atcphy->np, "apple,t8142-atcphy") &&
+	     !atcphy->hw->idle_power_off) ||
 	    !atcphy->hw->restore_after_pd_off || !pm_resume_via_firmware())
 		return;
 	WRITE_ONCE(atcphy->pd_was_off, true);
@@ -8739,6 +8758,23 @@ static const struct atcphy_hw atcphy_hw_t8103 = {
 	.pipe_mux_data = PIPEHANDLER_MUX_CTRL_DATA_T8103,
 	.has_usb4 = true,
 	.park_pipe_unlocked = true,
+	.restore_after_pd_off = true,
+	.idle_power_off = true,
+};
+
+/*
+ * T8112/T600x/T602x list apple,t8103-atcphy as a fallback compatible; keep
+ * them on the pre-existing non-idle-power-off behavior until validated there.
+ */
+static const struct atcphy_hw atcphy_hw_t8103_always_on = {
+	.gen = ATCPHY_GENERATION_T8103,
+	.aciophy_lane_mode = ACIOPHY_LANE_MODE_T8103,
+	.aciophy_crossbar = ACIOPHY_CROSSBAR_T8103,
+	.configure_post_tunable = atcphy_configure_post_tunable_t8103,
+	.pipe_mux_clk = PIPEHANDLER_MUX_CTRL_CLK_T8103,
+	.pipe_mux_data = PIPEHANDLER_MUX_CTRL_DATA_T8103,
+	.has_usb4 = true,
+	.park_pipe_unlocked = true,
 };
 
 static const struct atcphy_hw atcphy_hw_t8122 = {
@@ -8834,6 +8870,9 @@ static const struct atcphy_hw atcphy_hw_t8152 = {
 };
 
 static const struct of_device_id atcphy_match[] = {
+	{ .compatible = "apple,t8112-atcphy", .data = &atcphy_hw_t8103_always_on },
+	{ .compatible = "apple,t6000-atcphy", .data = &atcphy_hw_t8103_always_on },
+	{ .compatible = "apple,t6020-atcphy", .data = &atcphy_hw_t8103_always_on },
 	{ .compatible = "apple,t8103-atcphy", .data = &atcphy_hw_t8103 },
 	{ .compatible = "apple,t8122-atcphy", .data = &atcphy_hw_t8122 },
 	{ .compatible = "apple,t8132-atcphy", .data = &atcphy_hw_t8132 },
