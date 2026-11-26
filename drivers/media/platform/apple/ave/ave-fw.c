@@ -218,6 +218,9 @@ static int ave_fw_text_id(struct ave_dev *ave, const struct ave_fw_build *build,
 	ret = ave_fw_text_id_crc(va, ave->text.size,
 				 ave->variant->text_link_cell, ave->data.iova,
 				 crc);
+	/* The cell is in bounds once the identity accepted it. */
+	if (!ret)
+		ave->data_alias = get_unaligned_le64(va + ave->variant->text_link_cell);
 	memunmap(va);
 	return ret;
 }
@@ -546,6 +549,88 @@ static u64 ave_fw_code_base(struct ave_dev *ave)
 						  ave->text.phys : ave->text.iova);
 }
 
+/*
+ * Whether one programmed entry of the filter admits all of [first, last].
+ * An entry the loader never wrote reads zero. A deep sleep clears the low
+ * control bits and keeps the range: the J313 reads 0x11 and 0x33 after boot,
+ * 0x10 and 0x30 after a wake, and a coprocessor started then reset the SoC.
+ * The low two bits of an end may not read back as written, so the end is
+ * compared with them set.
+ */
+bool ave_dapf_admits(const struct ave_dapf_entry *e, unsigned int n, u64 first,
+		     u64 last)
+{
+	if (last < first)
+		return false;
+	for (unsigned int i = 0; i < n; i++)
+		if ((e[i].ctrl & AVE_DAPF_CTRL_ENABLE) && e[i].start <= first &&
+		    (e[i].end | 3) >= last)
+			return true;
+	return false;
+}
+
+static void ave_fw_read_dapf(struct ave_dev *ave, struct ave_dapf_entry *e)
+{
+	for (unsigned int i = 0; i < AVE_DAPF_ENTRIES; i++) {
+		void __iomem *r = ave->dapf + i * AVE_DAPF_STRIDE;
+
+		e[i].ctrl = readl(r + AVE_DAPF_CTRL);
+		e[i].start = readq(r + AVE_DAPF_START);
+		e[i].end = readq(r + AVE_DAPF_END);
+	}
+}
+
+/* The firmware range the filter leaves out, with its bounds, or NULL. */
+static const char *ave_fw_filter_gap(struct ave_dev *ave,
+				     const struct ave_dapf_entry *e, u64 *first,
+				     u64 *last)
+{
+	if (ave->variant->vcbar_text_phys) {
+		*first = ave->text.phys;
+		*last = ave->text.phys + ave->text.size - 1;
+		if (!ave_dapf_admits(e, AVE_DAPF_ENTRIES, *first, *last))
+			return "TEXT";
+	}
+	if (ave->data_alias) {
+		*first = ave->data_alias;
+		*last = ave->data_alias + ave->data.size - 1;
+		if (!ave_dapf_admits(e, AVE_DAPF_ENTRIES, *first, *last))
+			return "DATA";
+	}
+	return NULL;
+}
+
+/*
+ * The coprocessor's CPU reaches memory through its DART's address filter:
+ * on the M1 the loader points the code base at TEXT's physical address, and
+ * the firmware's own alias of DATA is in the window the filter passes on to
+ * the DART. Only the bootloader programs that filter, from the ADT. A core
+ * started behind a filter that does not admit its code cannot fetch its
+ * first instruction. Check the filter, read-only, before anything is
+ * written to start the coprocessor.
+ */
+static int ave_fw_check_filter(struct ave_dev *ave)
+{
+	struct ave_dapf_entry e[AVE_DAPF_ENTRIES];
+	const char *missing;
+	u64 first = 0, last = 0;
+
+	if (!ave->dapf)
+		return 0;
+	ave_fw_read_dapf(ave, e);
+	missing = ave_fw_filter_gap(ave, e, &first, &last);
+	if (!missing)
+		return 0;
+	dev_err(ave->dev,
+		"CPU DART filter at %pa does not admit the firmware's %s (%#llx-%#llx); not starting the coprocessor\n",
+		&ave->dapf_phys, missing, first, last);
+	for (unsigned int i = 0; i < AVE_DAPF_ENTRIES; i++)
+		if (e[i].ctrl || e[i].start || e[i].end)
+			dev_err(ave->dev, "  filter %2u: ctrl %#x %#llx-%#llx\n",
+				i, e[i].ctrl, e[i].start, e[i].end);
+	return -ENODEV;
+}
+
 static bool ave_fw_idle(struct ave_dev *ave)
 {
 	if (readq(ave->coproc + ave->variant->regs->vcbar) !=
@@ -721,6 +806,24 @@ void ave_dart_dump(struct ave_dev *ave, struct seq_file *m)
 	seq_printf(m, "coprocessor ctrl %#x boot_arg %#x fw_state %d\n",
 		   readl(ave->coproc + ave->variant->regs->ctrl),
 		   readl(ave->coproc + ave->variant->regs->boot_arg), ave->fw_state);
+	if (ave->dapf) {
+		struct ave_dapf_entry e[AVE_DAPF_ENTRIES];
+		const char *missing;
+		u64 first = 0, last = 0;
+
+		ave_fw_read_dapf(ave, e);
+		missing = ave_fw_filter_gap(ave, e, &first, &last);
+		if (missing)
+			seq_printf(m, "CPU DART filter %pa: does NOT admit the firmware's %s (%#llx-%#llx)\n",
+				   &ave->dapf_phys, missing, first, last);
+		else
+			seq_printf(m, "CPU DART filter %pa: admits the firmware\n",
+				   &ave->dapf_phys);
+		for (unsigned int i = 0; i < AVE_DAPF_ENTRIES; i++)
+			if (e[i].ctrl || e[i].start || e[i].end)
+				seq_printf(m, "  filter %2u: ctrl %#x %#llx-%#llx\n",
+					   i, e[i].ctrl, e[i].start, e[i].end);
+	}
 	for (unsigned int d = 0; d < ave->n_darts; d++) {
 		void __iomem *r = ave->dart_regs[d];
 		u32 own = ave->dart_sid[d];
@@ -780,6 +883,11 @@ static int ave_fw_boot(struct ave_dev *ave)
 		dev_err(ave->dev, "firmware segments are no longer mapped\n");
 		return -EIO;
 	}
+
+	/* Before any coprocessor or mailbox write. */
+	ret = ave_fw_check_filter(ave);
+	if (ret)
+		return ret;
 
 	ret = ave_fw_prepare_restart(ave);
 	if (ret)

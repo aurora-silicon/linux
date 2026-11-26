@@ -538,10 +538,37 @@ static const char *const ave_pd_names[] = { "dma", "pipe4", "pipe5", "me0",
 					    "me1", "perf" };
 
 /*
- * Map the encoder's T8110-layout DARTs for the read-only stream audit
- * (ave_dart_audit()). The DART driver owns them; nothing here writes.
+ * Map the address filter a DART of the encoder names ("dapf"), read-only,
+ * for ave_fw_check_filter(). The loader programs it; the DART driver leaves
+ * a filter it has no ranges for untouched.
  */
-static void ave_map_darts(struct ave_dev *ave)
+static int ave_map_dapf(struct ave_dev *ave, struct device_node *dart)
+{
+	int idx = of_property_match_string(dart, "reg-names", "dapf");
+	struct resource res;
+
+	if (idx < 0)
+		return 0;
+	if (ave->dapf) {
+		dev_warn(ave->dev, "%pOF: a second DART filter; keeping the first\n", dart);
+		return 0;
+	}
+	if (of_address_to_resource(dart, idx, &res) ||
+	    resource_size(&res) < AVE_DAPF_ENTRIES * AVE_DAPF_STRIDE)
+		return dev_err_probe(ave->dev, -EINVAL, "%pOF: bad DART filter window\n", dart);
+	ave->dapf = devm_ioremap(ave->dev, res.start, resource_size(&res));
+	if (!ave->dapf)
+		return -ENOMEM;
+	ave->dapf_phys = res.start;
+	return 0;
+}
+
+/*
+ * Map the encoder's T8110-layout DARTs for the read-only stream audit
+ * (ave_dart_audit()), and the address filter of any of its DARTs that has
+ * one. The DART driver owns them; nothing here writes.
+ */
+static int ave_map_darts(struct ave_dev *ave)
 {
 	struct device_node *np = ave->dev->of_node;
 	int n = of_count_phandle_with_args(np, "iommus", "#iommu-cells");
@@ -551,9 +578,15 @@ static void ave_map_darts(struct ave_dev *ave)
 		struct resource res;
 		void __iomem *r;
 		unsigned int d;
+		int ret;
 
 		if (of_parse_phandle_with_args(np, "iommus", "#iommu-cells", i, &args))
 			break;
+		ret = ave_map_dapf(ave, args.np);
+		if (ret) {
+			of_node_put(args.np);
+			return ret;
+		}
 		if (!of_device_is_compatible(args.np, "apple,t8110-dart") ||
 		    args.args_count != 1 || args.args[0] >= 32 ||
 		    of_address_to_resource(args.np, 0, &res)) {
@@ -581,6 +614,7 @@ static void ave_map_darts(struct ave_dev *ave)
 		ave->n_darts++;
 	}
 	dev_dbg(ave->dev, "%u DARTs for the stream audit\n", ave->n_darts);
+	return 0;
 }
 
 static int ave_probe(struct platform_device *pdev)
@@ -619,7 +653,9 @@ static int ave_probe(struct platform_device *pdev)
 	ave->domain = iommu_get_domain_for_dev(dev);
 	if (!ave->domain || !(ave->domain->type & __IOMMU_DOMAIN_PAGING))
 		return dev_err_probe(dev, -ENODEV, "needs a translating IOMMU\n");
-	ave_map_darts(ave);
+	ret = ave_map_darts(ave);
+	if (ret)
+		return ret;
 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(42));
 	if (ret)
 		return ret;

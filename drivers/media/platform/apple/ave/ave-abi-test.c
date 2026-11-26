@@ -1710,6 +1710,51 @@ static void ave_t8103_26b123_build(struct kunit *test)
 	}
 }
 
+/*
+ * The J313's encoder CPU DART filter as its ADT describes it: TEXT at its
+ * physical address, and the window the firmware reaches DART space through.
+ * The driver starts the coprocessor only when the filter admits TEXT and
+ * the firmware's DATA alias (the link cell); an unprogrammed filter reads
+ * zero and admits nothing.
+ */
+static void ave_t8103_cpu_dart_filter(struct kunit *test)
+{
+	const u64 text = 0x800a20000ULL, text_last = text + 0x114000 - 1;
+	const u64 alias = 0xf00114000ULL, alias_last = alias + 0x128000 - 1;
+	struct ave_dapf_entry e[AVE_DAPF_ENTRIES] = {
+		{ .ctrl = 0x11, .start = text, .end = text_last },
+		{ .ctrl = 0x33, .start = 0xf00000000ULL, .end = 0xfffffffffULL },
+	};
+	struct ave_dapf_entry none[AVE_DAPF_ENTRIES] = {};
+
+	KUNIT_EXPECT_TRUE(test, ave_dapf_admits(e, AVE_DAPF_ENTRIES, text, text_last));
+	KUNIT_EXPECT_TRUE(test, ave_dapf_admits(e, AVE_DAPF_ENTRIES, alias, alias_last));
+	/* A filter nothing programmed reads zero. */
+	KUNIT_EXPECT_FALSE(test, ave_dapf_admits(none, AVE_DAPF_ENTRIES, text, text_last));
+	KUNIT_EXPECT_FALSE(test, ave_dapf_admits(none, AVE_DAPF_ENTRIES, alias, alias_last));
+	/* The raw DART address is outside both entries. */
+	KUNIT_EXPECT_FALSE(test, ave_dapf_admits(e, AVE_DAPF_ENTRIES, 0x114000, 0x23bfff));
+	/* One byte past an entry, or a range across two, is not admitted. */
+	KUNIT_EXPECT_FALSE(test, ave_dapf_admits(e, AVE_DAPF_ENTRIES, text, text_last + 1));
+	KUNIT_EXPECT_FALSE(test, ave_dapf_admits(e, AVE_DAPF_ENTRIES, text - SZ_16K, text_last));
+	KUNIT_EXPECT_FALSE(test, ave_dapf_admits(e, AVE_DAPF_ENTRIES, text_last, 0xf00000000ULL));
+	/* An end whose low two bits do not read back still covers its range. */
+	e[0].end = text_last & ~3ULL;
+	KUNIT_EXPECT_TRUE(test, ave_dapf_admits(e, AVE_DAPF_ENTRIES, text, text_last));
+	/* After a deep sleep the range stays but the enable bits are clear. */
+	e[0].ctrl = 0x10;
+	e[1].ctrl = 0x30;
+	KUNIT_EXPECT_FALSE(test, ave_dapf_admits(e, AVE_DAPF_ENTRIES, text, text_last));
+	KUNIT_EXPECT_FALSE(test, ave_dapf_admits(e, AVE_DAPF_ENTRIES, alias, alias_last));
+	e[1].ctrl = 0x33;
+	/* A range with no control word is not programmed. */
+	e[0].ctrl = 0;
+	KUNIT_EXPECT_FALSE(test, ave_dapf_admits(e, AVE_DAPF_ENTRIES, text, text_last));
+	KUNIT_EXPECT_FALSE(test, ave_dapf_admits(e, AVE_DAPF_ENTRIES, text_last, text));
+	/* Only the entries counted are looked at. */
+	KUNIT_EXPECT_FALSE(test, ave_dapf_admits(e, 1, alias, alias_last));
+}
+
 static void ave_t6041_text_boot_word(struct kunit *test)
 {
 	const struct ave_fw_build *m4 = ave_t6041.builds;
@@ -1802,6 +1847,7 @@ static struct kunit_case ave_abi_cases[] = {
 	KUNIT_CASE(ave_t8112_26b123_build),
 	KUNIT_CASE(ave_hevc_bframe_extra_bits),
 	KUNIT_CASE(ave_t8103_26b123_build),
+	KUNIT_CASE(ave_t8103_cpu_dart_filter),
 	{}
 };
 

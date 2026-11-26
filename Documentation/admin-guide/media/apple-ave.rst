@@ -77,6 +77,15 @@ T8112 ones. TEXT starts the encoder's DART window at address 0, as on every
 M1-family encoder. The encoder and both of its DARTs are enabled in the T8103
 device tree; without the firmware handoff the driver declines to bind.
 
+The M1 bootloader points the coprocessor's code base at TEXT's physical
+address, and the firmware reaches DATA through its own alias, the address in
+the TEXT link cell. Both pass through the address filter of the encoder's CPU
+DART, which the device tree names as that DART's ``dapf`` window and which only
+the bootloader programs, from the ADT. Before every start the driver reads the
+filter and refuses to start the coprocessor, with the filter's entries in the
+log, unless it admits TEXT and the DATA alias. The ``dart_audit`` debugfs file
+shows the filter and that verdict without starting anything.
+
 T8122 (M3) with the macOS 27.2 firmware (TEXT 0x134000, DATA 0x128000, TEXT
 CRC ``918d70d3``) encodes H.264 and HEVC: the firmware boots on the boot
 configuration handshake as device 17 with handshake type 17 and speaks the

@@ -112,6 +112,13 @@ struct ave_fw_segment {
 	size_t size;
 };
 
+/* One entry of the CPU DART's address filter, as read back */
+struct ave_dapf_entry {
+	u32 ctrl;
+	u64 start;
+	u64 end; /* inclusive */
+};
+
 struct ave_ring {
 	char name[16];
 	u32 mode;
@@ -301,6 +308,11 @@ struct ave_dev {
 
 	struct ave_fw_segment text;
 	struct ave_fw_segment data;
+	/*
+	 * The firmware's own address of DATA, from the TEXT link cell the
+	 * loader filled; 0 where there is no cell or it was left zero.
+	 */
+	u64 data_alias;
 	u32 text_crc;
 	u32 data_crc;
 	void *data_pristine;
@@ -382,6 +394,12 @@ struct ave_dev {
 	/* every stream the device tree attaches on that DART, bit per SID */
 	u32 dart_sid_mask[2];
 	unsigned int n_darts;
+	/*
+	 * The address filter of the DART the coprocessor's CPU goes through,
+	 * where the device tree names one ("dapf"); read-only, NULL otherwise.
+	 */
+	void __iomem *dapf;
+	phys_addr_t dapf_phys;
 	bool witness_unusable;
 	/* Times the MCTF pool CRC changed while no session held it */
 	u32 mctf_pool_changed;
@@ -601,6 +619,8 @@ int ave_fw_text_id_crc(const void *text, size_t size, u32 cell_off,
 		       u64 data_iova, u32 *crc);
 int ave_fw_text_boot_crc(const void *text, size_t size, u32 word_off,
 			 u32 *crc);
+bool ave_dapf_admits(const struct ave_dapf_entry *e, unsigned int n, u64 first,
+		     u64 last);
 void ave_fw_remove(struct ave_dev *ave);
 int ave_fw_ensure_running(struct ave_dev *ave);
 int ave_dart_audit(struct ave_dev *ave, const char *when);

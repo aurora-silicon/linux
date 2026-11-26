@@ -39,6 +39,19 @@
 #define AVE_COPROC_BOOT_ARG_VALUE	0x10000
 #define AVE_COPROC_KEEP_MAPPINGS	0x600808
 
+/*
+ * Address filter of the encoder's CPU DART (its "dapf" register window):
+ * entries 0x40 apart, each a control word and an inclusive address range.
+ * The driver only reads it.
+ */
+#define AVE_DAPF_ENTRIES		16
+#define AVE_DAPF_STRIDE			0x40
+#define AVE_DAPF_CTRL			0x00
+/* The control bits a deep sleep clears; an entry without them admits nothing. */
+#define AVE_DAPF_CTRL_ENABLE		GENMASK(3, 0)
+#define AVE_DAPF_START			0x08
+#define AVE_DAPF_END			0x10
+
 /* Boot request and the configuration block it points at */
 #define AVE_BOOT_MAGIC			0x08042006
 #define AVE_BOOT_CFG_BYTES		0x40
