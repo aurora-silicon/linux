@@ -1204,9 +1204,9 @@ pub(crate) mod sizes {
     pub(crate) const PB_BLOCKS: u32 = 2048;
     pub(crate) const PB_LIST_RECORDS: u32 = 4096;
     pub(crate) const PB_GROW_STEP: u32 = 10;
-    /// Published prefixes at most. Warm render commands may pipeline across VMs on disjoint
-    /// hardware UMA slots, compute only behind its own VM's work, while cold `InitBM` renders
-    /// and recovery paths drain.
+    /// Published prefixes at most. Renders pipeline only behind their own VM's work, compute
+    /// also behind other VMs' compute on disjoint workqueues, while cold `InitBM` renders and
+    /// recovery paths drain.
     pub(crate) const FLIGHTS: usize = 32;
     /// Retained compute units per VM at most; each unit owns its own hardware UMA slot
     /// (`COMPUTE_UMA_SLOT + index`, fitting in `1..RENDER_UMA_SLOT = 33`). A unit is reused

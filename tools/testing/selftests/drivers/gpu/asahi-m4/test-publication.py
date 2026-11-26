@@ -550,12 +550,13 @@ fn firmware(jobs:Vec<Arc<Job>>,stages:Vec<(Result,bool)>)->Firmware{
         run(r(1,&vm1,Ok(())),1,false,false,r(2,&vm1,Err(ECANCELED)),false,None,false,HoldCause::Dependency,false);
         // Any other refusal.
         run(r(1,&vm1,Ok(())),1,false,false,r(2,&vm1,Ok(())),false,None,false,HoldCause::Other,true);
-        // Behind another VM's render (warm cross-VM renders overlap): counted, but no short repoll.
-        run(r(1,&vm2,Ok(())),1,false,false,r(2,&vm1,Ok(())),false,None,false,HoldCause::Other,false);
+        // Another VM's render in flight: a render drains on a VM switch (linux#3201), no short
+        // repoll.
+        run(r(1,&vm2,Ok(())),1,false,false,r(2,&vm1,Ok(())),false,None,false,HoldCause::DrainCross,false);
         assert_eq!(HoldCause::NAMES.len(),HoldCause::COUNT);
         assert_eq!(HoldCause::Other as usize,HoldCause::COUNT-1);
     }
-    #[test]fn alt_bypass_does_not_starve_cold_cross_vm_initbm_while_warm_overlaps(){
+    #[test]fn alt_bypass_does_not_starve_cold_cross_vm_initbm_and_warm_cross_vm_render_drains(){
         let vm1=mk_vm(1);
         let vm2=mk_vm(2);
         let vm1_active=job_on_vm(1,vm1.clone(),false,0,Ok(()));
@@ -578,7 +579,8 @@ fn firmware(jobs:Vec<Arc<Job>>,stages:Vec<(Result,bool)>)->Firmware{
         assert_eq!(f.attempted,[2]);
         assert_eq!(f.engine.pending.len(),1);
 
-        // Warm cross-VM render queues directly behind another VM's active render with zero hold[0].
+        // A warm render of another VM never queues behind an active render (linux#3201): it
+        // waits for the engine to drain, then publishes.
         let vm1_r=job_on_vm(10,vm1.clone(),true,0,Ok(()));
         let vm2_warm_r=job_on_vm(11,vm2.clone(),true,0,Ok(()));
         let mut fw=firmware(vec![vm2_warm_r],vec![(Ok(()),true)]);
@@ -587,8 +589,11 @@ fn firmware(jobs:Vec<Arc<Job>>,stages:Vec<(Result,bool)>)->Firmware{
         fw.engine.flights.push(fl);
         fw.allow_behind=true;
         assert_eq!(fw.publish_checked(&mut done),Ok(()));
+        assert!(fw.attempted.is_empty());
+        assert_eq!(fw.engine.stats.hold[0],1);
+        fw.engine.flights.clear();
+        assert_eq!(fw.publish_checked(&mut done),Ok(()));
         assert_eq!(fw.attempted,[11]);
-        assert_eq!(fw.engine.stats.hold[0],0);
 
         // Cross-VM non-SCS compute queues behind another VM's active compute on a disjoint pipe.
         let vm1_c=job_on_vm(12,vm1.clone(),false,0,Ok(()));
@@ -1089,8 +1094,9 @@ mod queue_behind_scope {
             pools:QueueBehindPools{exhausted:false,can_pipeline:true,block_pipeline_vm:None},
         };
         assert!(p.can_queue_behind(&r2));
-        // Warm cross-VM render queues behind healthy non-InitBM render; cold InitBM VM drains.
-        assert!(p.can_queue_behind(&r_other_vm));
+        // A render of another VM never queues behind a render (linux#3201), warm or cold.
+        assert!(!p.can_queue_behind(&r_other_vm));
+        assert!(p.needs_engine_drain(&r_other_vm));
         p.pools.block_pipeline_vm=Some(vm2.slot);
         assert!(!p.can_queue_behind(&r_other_vm));
         assert!(p.needs_engine_drain(&r_other_vm));
@@ -1138,10 +1144,11 @@ mod queue_behind_scope {
             slots:QueueBehindSlots{compute_exhausted:false,render_exhausted:false,compute_available:true,pass_available:true},
             pools:QueueBehindPools{exhausted:false,can_pipeline:true,block_pipeline_vm:None},
         };
-        // Active VM1 Render: same-VM R & C allowed; cross-VM R allowed; cross-VM C blocked + drains.
+        // Active VM1 Render: same-VM R & C allowed; cross-VM R and C blocked + drain
+        // (linux#3201 for R).
         assert!(p.can_queue_behind(&vm1_r) && !p.needs_engine_drain(&vm1_r));
         assert!(p.can_queue_behind(&vm1_c) && !p.needs_engine_drain(&vm1_c));
-        assert!(p.can_queue_behind(&vm2_r) && !p.needs_engine_drain(&vm2_r));
+        assert!(!p.can_queue_behind(&vm2_r) && p.needs_engine_drain(&vm2_r));
         assert!(!p.can_queue_behind(&vm2_c) && p.needs_engine_drain(&vm2_c));
         // Active VM1 Compute: same-VM R & C allowed; cross-VM non-SCS C allowed on a disjoint
         // pipe; cross-VM R blocked + drains.
@@ -1507,11 +1514,12 @@ mod queue_behind_scope {
         // Waiting on CPU timestamp publish (query_access) is NOT a slot-headroom block.
         assert!(!p.can_queue_behind(&c_ts_wait));
         assert!(!p.blocked_on_slot_headroom(&c_ts_wait));
-        // Render pass slot exhaustion IS a slot-headroom block for ready same-VM and warm cross-VM renders...
+        // Render pass slot exhaustion IS a slot-headroom block for a ready same-VM render...
         p.slots.pass_available=false;
         assert!(p.blocked_on_slot_headroom(&r_same));
-        assert!(p.blocked_on_slot_headroom(&r_cross_vm));
-        // ...but NOT for cold InitBM cross-VM, external-fence, or live-InitBM jobs.
+        // ...but NOT for a render of another VM (it drains, linux#3201), warm or cold InitBM,
+        // nor for external-fence or live-InitBM jobs.
+        assert!(!p.blocked_on_slot_headroom(&r_cross_vm));
         p.pools.block_pipeline_vm=Some(vm2.slot);
         assert!(!p.blocked_on_slot_headroom(&r_cross_vm));
         p.pools.block_pipeline_vm=None;
@@ -1560,7 +1568,7 @@ mod queue_behind_scope {
         // 1. Cold InitBM / empty render pipe (`class_behind = false`): zero render barriers,
         //    compute->FS-only wait routes directly to fs_compute_barrier.
         assert_eq!(
-            plan_render_barriers(STAGED, false, true, 0, None, None, [NO_C1, c8(Some(0x700), None)], false),
+            plan_render_barriers(STAGED, false, true, 0, None, None, [NO_C1, c8(Some(0x700), None)]),
             RenderBarrierPlan {
                 early: false,
                 ta_prev_wait: false,
@@ -1576,7 +1584,7 @@ mod queue_behind_scope {
         //    ZERO FS->FS barriers (only own_barrier on FS).
         for flags in [0u32, FRAG, STAGED] {
             assert_eq!(
-                plan_render_barriers(flags, true, true, 0x200, None, None, NO_C, false),
+                plan_render_barriers(flags, true, true, 0x200, None, None, NO_C),
                 RenderBarrierPlan {
                     early: true,
                     ta_prev_wait: true,
@@ -1598,7 +1606,6 @@ mod queue_behind_scope {
                 Some(0x200),
                 None,
                 [c8(Some(0x700), None), c8(Some(0x700), None)],
-                false,
             ),
             RenderBarrierPlan {
                 early: true,
@@ -1620,7 +1627,6 @@ mod queue_behind_scope {
                 None,
                 None,
                 [c8(Some(0x600), None), c8(Some(0x700), None)],
-                false,
             ),
             RenderBarrierPlan {
                 early: true,
@@ -1642,7 +1648,6 @@ mod queue_behind_scope {
                 None,
                 None,
                 [c8(Some(0x600), None), c8(Some(0x600), Some(0x700))],
-                false,
             ),
             RenderBarrierPlan {
                 early: true,
@@ -1664,7 +1669,6 @@ mod queue_behind_scope {
                 Some(0x200),
                 Some(0x100),
                 NO_C,
-                false,
             ),
             RenderBarrierPlan {
                 early: true,
@@ -1687,7 +1691,6 @@ mod queue_behind_scope {
                 Some(0x100),
                 Some(0x100),
                 NO_C,
-                false,
             ),
             RenderBarrierPlan {
                 early: true,
@@ -1710,7 +1713,6 @@ mod queue_behind_scope {
                 Some(0x200),
                 Some(0x200),
                 NO_C,
-                false,
             ),
             RenderBarrierPlan {
                 early: false,
@@ -1732,7 +1734,6 @@ mod queue_behind_scope {
                 Some(0x200),
                 None,
                 [c8(Some(0x700), None), c8(Some(0x700), None)],
-                false,
             ),
             RenderBarrierPlan {
                 early: true,
@@ -1746,7 +1747,7 @@ mod queue_behind_scope {
         // 9. Legacy dependent render (flags = 0, fs_wait_render = Some(0x200)):
         //    TA waits on 0x200 (FS->TA, dominating prev_ta); prev_barrier and fs_dep omitted.
         assert_eq!(
-            plan_render_barriers(0, true, true, 0x200, Some(0x200), None, NO_C, false),
+            plan_render_barriers(0, true, true, 0x200, Some(0x200), None, NO_C),
             RenderBarrierPlan {
                 early: false,
                 ta_prev_wait: false,
@@ -1759,7 +1760,7 @@ mod queue_behind_scope {
         // 10. Legacy dependent render waiting on an older FS (0x100 != prev_fs 0x200):
         //     TA still needs prev_barrier on the shared PB in addition to ta_fs_wait(0x100).
         assert_eq!(
-            plan_render_barriers(0, true, true, 0x200, Some(0x100), None, NO_C, false),
+            plan_render_barriers(0, true, true, 0x200, Some(0x100), None, NO_C),
             RenderBarrierPlan {
                 early: false,
                 ta_prev_wait: true,
@@ -1772,50 +1773,7 @@ mod queue_behind_scope {
         // 11. Conservative `early_tiling = false` serializes TA behind prev_fs even when
         //     fs_wait_render is None, dominating prev_ta and omitting fs_dep.
         assert_eq!(
-            plan_render_barriers(FRAG, true, false, 0x200, None, None, NO_C, false),
-            RenderBarrierPlan {
-                early: false,
-                ta_prev_wait: false,
-                ta_fs_wait: Some(0x200),
-                fs_render_wait: None,
-                ta_compute_wait: NO_C1,
-                fs_compute_wait: NO_C1,
-            }
-        );
-        // 12. Cross-VM warm render behind another VM's render (`cross_vm_prev = true`, no
-        //     own-queue render barrier): TA runs early behind prev_ta (overlapping VM A's FS)
-        //     for all flag styles (legacy/FRAG/STAGED) while FS ALWAYS waits on prev_fs (0x200).
-        for flags in [0u32, FRAG, STAGED] {
-            assert_eq!(
-                plan_render_barriers(flags, true, true, 0x200, None, None, NO_C, true),
-                RenderBarrierPlan {
-                    early: true,
-                    ta_prev_wait: true,
-                    ta_fs_wait: None,
-                    fs_render_wait: Some(0x200),
-                    ta_compute_wait: NO_C1,
-                    fs_compute_wait: NO_C1,
-                }
-            );
-        }
-        // 13. Cross-VM legacy render that also has an own-queue barrier on an older FS (0x100):
-        //     TA waits on own older FS (0x100) and prev_ta, while FS still waits on cross-VM
-        //     prev_fs (0x200) so two VMs' FS/PB teardowns never overlap.
-        assert_eq!(
-            plan_render_barriers(0, true, true, 0x200, Some(0x100), None, NO_C, true),
-            RenderBarrierPlan {
-                early: false,
-                ta_prev_wait: true,
-                ta_fs_wait: Some(0x100),
-                fs_render_wait: Some(0x200),
-                ta_compute_wait: NO_C1,
-                fs_compute_wait: NO_C1,
-            }
-        );
-        // 14. Cross-VM with `early_tiling = false`: TA already waits on prev_fs, so fs_dep
-        //     is dominated and omitted.
-        assert_eq!(
-            plan_render_barriers(STAGED, true, false, 0x200, None, None, NO_C, true),
+            plan_render_barriers(FRAG, true, false, 0x200, None, None, NO_C),
             RenderBarrierPlan {
                 early: false,
                 ta_prev_wait: false,
