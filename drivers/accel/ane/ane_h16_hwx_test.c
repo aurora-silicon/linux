@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 #include <kunit/test.h>
+#include <linux/mman.h>
 #include <linux/module.h>
+#include <linux/uaccess.h>
 
 #include "ane_h16_hwx.h"
 #include "ane_h16_tasks.h"
@@ -681,6 +683,36 @@ static void hwx_import_bounds_test(struct kunit *test)
 }
 
 /*
+ * An import from user memory holds the original bytes, validated and hashed.
+ * A copy that faults part way keeps nothing.
+ */
+static void hwx_import_user_test(struct kunit *test)
+{
+	struct ane_h16_hwx_snapshot snapshot = {};
+	struct hwx_fixture *f = fixture_create(test, false, false);
+	unsigned long user, pages;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	pages = DIV_ROUND_UP(f->size, PAGE_SIZE);
+	user = kunit_vm_mmap(test, NULL, 0, (pages + 1) * PAGE_SIZE, PROT_READ | PROT_WRITE,
+			     MAP_ANONYMOUS | MAP_PRIVATE, 0);
+	KUNIT_ASSERT_TRUE(test, user && !IS_ERR_VALUE(user));
+	KUNIT_ASSERT_EQ(test, copy_to_user((void __user *)user, f->bytes, f->size), 0);
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_snapshot_from_user((const void __user *)user, f->size,
+							     &snapshot), 0);
+	KUNIT_EXPECT_EQ(test, snapshot.size, f->size);
+	KUNIT_EXPECT_MEMEQ(test, snapshot.bytes, f->bytes, f->size);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_snapshot_check(&snapshot), 0);
+	ane_h16_hwx_snapshot_destroy(&snapshot);
+
+	KUNIT_ASSERT_EQ(test, vm_munmap(user + pages * PAGE_SIZE, PAGE_SIZE), 0);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_snapshot_from_user((const void __user *)user,
+							     pages * PAGE_SIZE + 64, &snapshot),
+			-EFAULT);
+	KUNIT_EXPECT_PTR_EQ(test, snapshot.bytes, NULL);
+}
+
+/*
  * Open a gap of @len bytes at @at in a fixture's link-edit data (symbols, strings, relocations
  * after the load commands), moving every file offset that points at or past it.
  */
@@ -927,6 +959,7 @@ static struct kunit_case hwx_cases[] = {
 	KUNIT_CASE(hwx_load_original_test),
 	KUNIT_CASE(hwx_load_resources_test),
 	KUNIT_CASE(hwx_import_bounds_test),
+	KUNIT_CASE(hwx_import_user_test),
 	KUNIT_CASE(hwx_h17_zin_test),
 	KUNIT_CASE(hwx_h15_test),
 	{}
