@@ -76,7 +76,9 @@ static void apple_sleep_test_known_profiles(struct kunit *test)
 
 			KUNIT_ASSERT_NOT_NULL(test, soc);
 			KUNIT_EXPECT_TRUE(test, soc->derived);
-			KUNIT_EXPECT_FALSE(test, soc->untested);
+			/* T8142 has run full deep sleeps and wakes; T8122 has not yet. */
+			KUNIT_EXPECT_EQ(test, (int)soc->untested,
+					!strcmp(id->compatible, "apple,t8122-sleep"));
 		}
 	}
 	KUNIT_EXPECT_EQ(test, n, ARRAY_SIZE(apple_sleep_test_profiles));
