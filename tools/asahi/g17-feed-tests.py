@@ -61,6 +61,7 @@ def build_harness(mutation=None):
         'TURNAROUND_ENTER_DIV',
         'TURNAROUND_HOLD_DIV',
         'CONTEXT_TRACKS',
+        'OVERLAP_CONCURRENT_DIV',
         'FLOOR_PERCENT',
     ):
         m = re.search(rf'^const {name}:[^;]+;', feed_src, re.MULTILINE)
@@ -96,6 +97,10 @@ def build_harness(mutation=None):
         old = 'busy_sum <= TURNAROUND_BUSY_SUM_TICKS'
         assert old in code
         code = code.replace(old, 'true', 1)
+    elif mutation == 'unconditional-ctx-prev':
+        old = 'let prev = if start < global_prev && now < self.overlap_until.load(Ordering::Acquire) {\n            ctx_prev\n        } else {\n            global_prev\n        };'
+        assert old in code
+        code = code.replace(old, 'let prev = ctx_prev;', 1)
 
     return f'''
 use std::sync::atomic::{{AtomicBool, AtomicU32, AtomicU64, Ordering}};
@@ -266,6 +271,72 @@ fn main() {{
         assert!(!detector.wanted(now));
     }}
 
+    // 9. Alternating multi-queue back-to-back passes on a saturated GPU (and
+    //    serial turn-taking with minor 10% tail drain overlap, plus concurrent
+    //    falling back to serial) must remain GPU-bound and never raise the floor.
+    {{
+        for &(contexts, pass_us) in &[
+            (1u32, 1000u64),
+            (2, 1000),
+            (2, 400),
+            (3, 500),
+            (2, 1900),
+            (2, 2100),
+        ] {{
+            let detector = Detector::new();
+            let pass = CLOCK_HZ * pass_us / 1_000_000;
+            let (mut start, mut now) = (1000u64, 1_000_000u64);
+            for _ in 0..32 {{
+                for c in 0..contexts {{
+                    detector.note(c + 1, start, start + pass, now);
+                    start += pass;
+                    now += pass_us * 1000;
+                }}
+            }}
+            assert!(detector.bound(now), "expected bound for {{}}x{{}}us", contexts, pass_us);
+            assert!(!detector.wanted(now), "expected !wanted for {{}}x{{}}us", contexts, pass_us);
+        }}
+        // Serial turn-taking with 10% hardware drain overlap stays GPU-bound.
+        let detector = Detector::new();
+        let pass = CLOCK_HZ * 1000 / 1_000_000;
+        let step = CLOCK_HZ * 900 / 1_000_000;
+        let (mut start, mut now) = (1000u64, 1_000_000u64);
+        for _ in 0..32 {{
+            for c in 0..2u32 {{
+                detector.note(c + 1, start, start + pass, now);
+                start += step;
+                now += 900_000;
+            }}
+        }}
+        assert!(detector.bound(now));
+        assert!(!detector.wanted(now));
+        // Concurrent staggered queues transitioning to serial back-to-back drop the floor.
+        let detector = Detector::new();
+        let busy = CLOCK_HZ * 2280 / 1_000_000;
+        let gap = CLOCK_HZ * 165 / 1_000_000;
+        let stagger = CLOCK_HZ * 180 / 1_000_000;
+        let (mut s0, mut s1, mut now) = (1000u64, 1000u64 + stagger, 1_000_000u64);
+        for _ in 0..12 {{
+            detector.note(3, s0, s0 + busy, now);
+            detector.note(4, s1, s1 + busy, now + 180_000);
+            s0 += busy + gap;
+            s1 += busy + gap;
+            now += 2_450_000;
+        }}
+        assert!(detector.wanted(now));
+        let mut start = s1 + busy;
+        let serial_pass = CLOCK_HZ * 1000 / 1_000_000;
+        for _ in 0..32 {{
+            for c in [3u32, 4u32] {{
+                detector.note(c, start, start + serial_pass, now);
+                start += serial_pass;
+                now += 1_000_000;
+            }}
+        }}
+        assert!(detector.bound(now));
+        assert!(!detector.wanted(now));
+    }}
+
     println!("PASS g17-feed-tests");
 }}
 '''
@@ -282,6 +353,7 @@ def main():
             'drop-turnaround',
             'no-hold-hysteresis',
             'drop-busy-cap',
+            'unconditional-ctx-prev',
         ],
     )
     args = parser.parse_args()

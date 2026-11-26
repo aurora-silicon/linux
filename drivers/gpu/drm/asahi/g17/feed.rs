@@ -56,8 +56,11 @@ const TURNAROUND_ENTER_DIV: u64 = 16;
 const TURNAROUND_HOLD_DIV: u64 = TURNAROUND_ENTER_DIV * 3;
 /// Per-context completion timestamps so staggered concurrent depth-1 queues
 /// still report each queue's own host refill gap instead of masking it behind
-/// a sibling queue's overlapping pass.
+/// a sibling queue's overlapping pass. Only engaged while passes from distinct
+/// contexts actually overlap by at least 1/OVERLAP_CONCURRENT_DIV of a pass so
+/// serial multi-queue streams taking turns on a saturated GPU stay GPU-bound.
 const CONTEXT_TRACKS: usize = 16;
+const OVERLAP_CONCURRENT_DIV: u64 = 4;
 const POLL_MS: i64 = 2;
 #[cfg(CONFIG_CPU_FREQ)]
 const FLOOR_PERCENT: u64 = 100;
@@ -69,6 +72,7 @@ const MAX_POLICIES: usize = 8;
 struct Detector {
     last_end: AtomicU64,
     context_end: [AtomicU64; CONTEXT_TRACKS],
+    overlap_until: AtomicU64,
     idle: AtomicU64,
     busy: AtomicU64,
     streak: AtomicU32,
@@ -85,6 +89,7 @@ impl Detector {
         Self {
             last_end: AtomicU64::new(0),
             context_end: [const { AtomicU64::new(0) }; CONTEXT_TRACKS],
+            overlap_until: AtomicU64::new(0),
             idle: AtomicU64::new(0),
             busy: AtomicU64::new(0),
             streak: AtomicU32::new(0),
@@ -114,17 +119,31 @@ impl Detector {
             .fetch_max(end, Ordering::AcqRel);
         let paced = global_prev == 0
             || (start >= global_prev && start - global_prev >= MAX_REFILL_TICKS);
-        let (idle, busy) = if ctx_prev == 0 {
-            (0, end - start)
-        } else if start >= ctx_prev {
-            let gap = start - ctx_prev;
+        let pass = end - start;
+        let overlap = if global_prev > ctx_prev && start < global_prev {
+            end.min(global_prev) - start
+        } else {
+            0
+        };
+        if overlap.saturating_mul(OVERLAP_CONCURRENT_DIV) >= pass {
+            self.overlap_until.store(now + LINGER_NS, Ordering::Release);
+        }
+        let prev = if start < global_prev && now < self.overlap_until.load(Ordering::Acquire) {
+            ctx_prev
+        } else {
+            global_prev
+        };
+        let (idle, busy) = if prev == 0 {
+            (0, pass)
+        } else if start >= prev {
+            let gap = start - prev;
             if gap < MAX_REFILL_TICKS {
-                (gap, end - start)
+                (gap, pass)
             } else {
-                (0, end - start)
+                (0, pass)
             }
-        } else if end > ctx_prev {
-            (0, end - ctx_prev)
+        } else if end > prev {
+            (0, end - prev)
         } else {
             (0, 0)
         };
@@ -770,5 +789,29 @@ mod detector_tests {
         }
         assert!(detector.bound(now));
         assert!(!detector.wanted(now));
+    }
+
+    #[test]
+    fn alternating_multi_queue_back_to_back_stays_gpu_bound() {
+        for &(contexts, pass_us) in &[
+            (2u32, 1000u64),
+            (2, 400),
+            (3, 500),
+            (2, 1900),
+            (2, 2100),
+        ] {
+            let detector = Detector::new();
+            let pass = CLOCK_HZ * pass_us / 1_000_000;
+            let (mut start, mut now) = (1000u64, 1_000_000u64);
+            for _ in 0..32 {
+                for c in 0..contexts {
+                    detector.note(c + 1, start, start + pass, now);
+                    start += pass;
+                    now += pass_us * 1000;
+                }
+            }
+            assert!(detector.bound(now));
+            assert!(!detector.wanted(now));
+        }
     }
 }
