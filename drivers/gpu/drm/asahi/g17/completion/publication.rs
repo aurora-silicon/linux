@@ -93,6 +93,11 @@ impl Publication {
         &self.output
     }
 
+    /// Whether this command itself writes host timestamps.
+    pub(crate) fn has_outputs(&self) -> bool {
+        self.has_outputs
+    }
+
     /// Whether this publication still has an unpublished host timestamp write
     /// or an unresolved or failed predecessor chain.
     pub(crate) fn is_pending(&self) -> bool {

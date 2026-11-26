@@ -289,7 +289,13 @@ impl<B: Backend> Queue<B> {
         // since the prune above without a publication is not among them, so prune again: any
         // failure now visible makes it a full scan, and the failure record below has it.
         self.prune_frontier(index);
-        let (completion, publication, ordering_host_waits, ordering_firmware_waits) = {
+        let (
+            completion,
+            publication,
+            ordering_host_waits,
+            ordering_firmware_waits,
+            inherited_timestamp_waits,
+        ) = {
             let ordering = EnqueueOrdering::build(
                 &self.publishers[index],
                 &self.frontiers[other],
@@ -315,11 +321,18 @@ impl<B: Backend> Queue<B> {
                 .publication()
                 .map(|target| PreparedPublication::new(target, ordering.predecessors.iter().copied()))
                 .transpose()?;
+            let inherited_timestamp_waits =
+                if has_outputs || ordering.inherited_timestamp_waits.is_empty() {
+                    None
+                } else {
+                    Some(Arc::new(ordering.inherited_timestamp_waits, GFP_KERNEL)?)
+                };
             (
                 completion,
                 publication,
                 ordering.host_waits,
                 ordering.firmware_waits,
+                inherited_timestamp_waits,
             )
         };
         let mut failures: [Option<Fence>; 2] = [None, None];
@@ -405,11 +418,12 @@ impl<B: Backend> Queue<B> {
             Engine::Render => &mut self.render,
             Engine::Compute => &mut self.compute,
         };
-        let fences =
+        let mut fences =
             scheduler
                 .as_mut()
                 .ok_or(ENODEV)?
                 .enqueue(packet, dependencies, early, publication)?;
+        fences.timestamp_waits = inherited_timestamp_waits;
         self.sequence[index] = order.sequence;
         if fences.publishes() {
             self.publishers[index].push_within_capacity(order.sequence, fences.clone())?;
@@ -698,6 +712,9 @@ trait FrontierEntry: outstanding::Status {
     fn pending_publication(&self) -> Option<&Arc<Publication>> {
         self.publication().filter(|publication| publication.is_pending())
     }
+    fn timestamp_waits(&self) -> &[Fence] {
+        &[]
+    }
     fn completed(&self) -> &Fence;
     fn scheduled(&self) -> &Fence;
 }
@@ -711,6 +728,10 @@ impl FrontierEntry for Fences {
         self.publication.as_ref()
     }
 
+    fn timestamp_waits(&self) -> &[Fence] {
+        self.timestamp_waits.as_deref().map_or(&[], |v| v.as_slice())
+    }
+
     fn completed(&self) -> &Fence {
         &self.completed
     }
@@ -720,10 +741,37 @@ impl FrontierEntry for Fences {
     }
 }
 
+fn push_unique_fence(out: &mut KVec<Fence>, fence: &Fence) -> Result {
+    if !out.iter().any(|existing| existing.raw() == fence.raw()) {
+        out.push(fence.clone(), GFP_KERNEL)?;
+    }
+    Ok(())
+}
+
+/// Collect the actual pending host-timestamp writer fences represented by `entry`:
+/// its own `completed` fence when it writes host timestamps, otherwise its still-pending
+/// inherited timestamp-writer fences.
+fn collect_timestamp_waits<E: FrontierEntry>(entry: &E, out: &mut KVec<Fence>) -> Result {
+    let Some(pub_ref) = entry.pending_publication() else {
+        return Ok(());
+    };
+    if pub_ref.has_outputs() {
+        push_unique_fence(out, entry.completed())?;
+    } else {
+        for fence in entry.timestamp_waits() {
+            if job::fence_status(fence) <= 0 {
+                push_unique_fence(out, fence)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 struct EnqueueOrdering<'a> {
     predecessors: KVec<&'a Arc<Publication>>,
     host_waits: KVec<Fence>,
     firmware_waits: KVec<(Fence, Fence)>,
+    inherited_timestamp_waits: KVec<Fence>,
 }
 
 impl<'a> EnqueueOrdering<'a> {
@@ -754,16 +802,18 @@ impl<'a> EnqueueOrdering<'a> {
         let mut predecessors = KVec::new();
         let mut host = KVec::new();
         let mut firmware = KVec::new();
+        let mut inherited_timestamp_waits = KVec::new();
         if same_chain {
             for (_, entry) in same_covered.clone() {
                 let status = entry.status();
                 if status <= 0 {
                     if let Some(publication) = entry.pending_publication() {
                         predecessors.push(publication, GFP_KERNEL)?;
+                        collect_timestamp_waits(entry, &mut inherited_timestamp_waits)?;
                     } else if status < 0 {
                         // Failed after `prune_frontier()` without an active
                         // publication: keep its already-signalled error fence.
-                        host.push(entry.completed().clone(), GFP_KERNEL)?;
+                        push_unique_fence(&mut host, entry.completed())?;
                     }
                 }
             }
@@ -773,6 +823,7 @@ impl<'a> EnqueueOrdering<'a> {
                 if entry.status() <= 0 {
                     if let Some(publication) = entry.pending_publication() {
                         predecessors.push(publication, GFP_KERNEL)?;
+                        collect_timestamp_waits(entry, &mut inherited_timestamp_waits)?;
                     }
                 }
             }
@@ -781,11 +832,13 @@ impl<'a> EnqueueOrdering<'a> {
         if same_wait {
             for (_, entry) in same_covered {
                 let status = entry.status();
-                if status < 0
-                    || (status == 0
-                        && (entry.ready_is_completed() || entry.pending_publication().is_some()))
-                {
-                    host.push(entry.completed().clone(), GFP_KERNEL)?;
+                if status < 0 || (status == 0 && entry.ready_is_completed()) {
+                    push_unique_fence(&mut host, entry.completed())?;
+                } else if status == 0 && entry.pending_publication().is_some() {
+                    // Only wait on the host for actual pending timestamp writers, not
+                    // intermediate timestamp-free commands that merely inherited a
+                    // publication chain.
+                    collect_timestamp_waits(entry, &mut host)?;
                 }
             }
         }
@@ -797,13 +850,33 @@ impl<'a> EnqueueOrdering<'a> {
             if entry.status() > 0 {
                 continue;
             }
+            if entry.status() < 0 {
+                push_unique_fence(&mut host, entry.completed())?;
+                continue;
+            }
             if cross_engine_wait_completed(
                 host_waits,
                 engine,
                 query_access,
                 entry.pending_publication().is_some(),
             ) {
-                host.push(entry.completed().clone(), GFP_KERNEL)?;
+                if host_waits
+                    || entry
+                        .pending_publication()
+                        .is_some_and(|publication| publication.has_outputs())
+                {
+                    push_unique_fence(&mut host, entry.completed())?;
+                } else {
+                    // A timestamp-free producer chained behind an earlier timestamp
+                    // writer does not write host timestamps itself: wait on the host
+                    // only for the actual pending timestamp writer(s) and order behind
+                    // this producer in firmware so the GPU pipeline does not drain.
+                    collect_timestamp_waits(entry, &mut host)?;
+                    firmware.push(
+                        (entry.scheduled().clone(), entry.completed().clone()),
+                        GFP_KERNEL,
+                    )?;
+                }
             } else {
                 firmware.push(
                     (entry.scheduled().clone(), entry.completed().clone()),
@@ -816,6 +889,7 @@ impl<'a> EnqueueOrdering<'a> {
             predecessors,
             host_waits: host,
             firmware_waits: firmware,
+            inherited_timestamp_waits,
         })
     }
 }
@@ -833,6 +907,7 @@ mod tests {
         scheduled: Fence,
         completed: Fence,
         publication: Option<Arc<Publication>>,
+        timestamp_waits: KVec<Fence>,
     }
 
     impl outstanding::Status for TestEntry {
@@ -848,6 +923,10 @@ mod tests {
 
         fn publication(&self) -> Option<&Arc<Publication>> {
             self.publication.as_ref()
+        }
+
+        fn timestamp_waits(&self) -> &[Fence] {
+            self.timestamp_waits.as_slice()
         }
 
         fn completed(&self) -> &Fence {
@@ -884,6 +963,7 @@ mod tests {
                     scheduled,
                     completed,
                     publication: Some(publication.clone()),
+                    timestamp_waits: KVec::new(),
                 },
                 Some(publication),
             )
@@ -895,6 +975,7 @@ mod tests {
                     scheduled,
                     completed,
                     publication: None,
+                    timestamp_waits: KVec::new(),
                 },
                 None,
             )
@@ -1125,18 +1206,20 @@ mod tests {
 
         let (rend_a, pub_a) = test_entry(&contexts, &status, Some(true));
         let pub_a = pub_a.unwrap();
+        let rend_a_completed = rend_a.completed.raw();
         PreparedPublication::new(pub_a.clone(), core::iter::empty())
             .unwrap()
             .activate();
 
-        let (comp_b, pub_b) = test_entry(&contexts, &status, Some(false));
+        let (mut comp_b, pub_b) = test_entry(&contexts, &status, Some(false));
         let pub_b = pub_b.unwrap();
+        comp_b.timestamp_waits.push(rend_a.completed.clone(), GFP_KERNEL).unwrap();
         PreparedPublication::new(pub_b.clone(), core::iter::once(&pub_a))
             .unwrap()
             .activate();
 
-        // While Render A is still pending, query-accessing Compute C must host-wait on B.
-        let comp_b_completed = comp_b.completed.raw();
+        // While Render A is still pending, query-accessing Compute C host-waits
+        // only on Render A's timestamp completion, not timestamp-free Compute B.
         let compute_frontier = frontier([(1, comp_b)]);
         let plan_before = EnqueueOrdering::build(
             &compute_frontier,
@@ -1152,7 +1235,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plan_before.host_waits.len(), 1);
-        assert_eq!(plan_before.host_waits[0].raw(), comp_b_completed);
+        assert_eq!(plan_before.host_waits[0].raw(), rend_a_completed);
 
         // Once Render A finishes cleanly, Compute B settles while still in flight:
         // neither a query-accessing Compute nor a cross-engine Render waits or
@@ -1346,5 +1429,56 @@ mod tests {
 
         pub_a.finish(Ok([1, 2, 0, 0]));
         assert!(fence_status(&comp_b_completed) > 0);
+    }
+
+    #[test]
+    fn query_access_waits_only_on_timestamp_writer_not_timestamp_free_chain() {
+        let none = frontier([]);
+        let contexts = FenceContexts::new(1, c_str!("asahi_q_nots_chain"), TEST_KEY).unwrap();
+        let status = Arc::pin_init(VmStatus::new(), GFP_KERNEL).unwrap();
+
+        // Render A writes a timestamp; Render B has no timestamps and chains behind A.
+        let (rend_a, pub_a) = test_entry(&contexts, &status, Some(true));
+        let pub_a = pub_a.unwrap();
+        let rend_a_completed = rend_a.completed.raw();
+        PreparedPublication::new(pub_a.clone(), core::iter::empty())
+            .unwrap()
+            .activate();
+
+        let (mut rend_b, pub_b) = test_entry(&contexts, &status, Some(false));
+        let pub_b = pub_b.unwrap();
+        let rend_b_scheduled = rend_b.scheduled.raw();
+        let rend_b_completed = rend_b.completed.raw();
+        rend_b.timestamp_waits.push(rend_a.completed.clone(), GFP_KERNEL).unwrap();
+        PreparedPublication::new(pub_b.clone(), core::iter::once(&pub_a))
+            .unwrap()
+            .activate();
+
+        let render_frontier = frontier([(1, rend_a), (2, rend_b)]);
+
+        // Query-accessing Compute C covers both A and B while both are pending:
+        // C must host-wait ONLY on A (the timestamp writer), and order behind B
+        // in firmware so the GPU pipeline does not drain at B.
+        let plan_c = EnqueueOrdering::build(
+            &none,
+            &render_frontier,
+            Order {
+                sequence: 1,
+                wait_through: [Some(2), None],
+                tiling_wait_through: [None, None],
+            },
+            Engine::Compute,
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(plan_c.host_waits.len(), 1);
+        assert_eq!(plan_c.host_waits[0].raw(), rend_a_completed);
+        assert_eq!(plan_c.firmware_waits.len(), 1);
+        assert_eq!(plan_c.firmware_waits[0].0.raw(), rend_b_scheduled);
+        assert_eq!(plan_c.firmware_waits[0].1.raw(), rend_b_completed);
+
+        pub_a.finish(Ok([1, 2, 0, 0]));
+        pub_b.finish(Ok([3, 4, 0, 0]));
     }
 }
