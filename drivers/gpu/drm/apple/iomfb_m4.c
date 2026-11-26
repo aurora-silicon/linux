@@ -4862,7 +4862,7 @@ static int dcp_m4_ext_win_get(struct dcp_m4_runtime *r, const struct iomfb_m4_ex
 
 		if (r->ext_win[i].dva)
 			continue;
-		ret = apple_dart_dcp_dispext_window_claim(piodma, &dva);
+		ret = apple_dart_dcp_dispext_window_claim(piodma, SZ_32M, &dva);
 		/* Not confirmed since sleep: the frame waits (no window, no copy). */
 		if (ret == -EAGAIN)
 			return ret;
