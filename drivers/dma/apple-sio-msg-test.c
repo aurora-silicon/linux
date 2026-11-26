@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
  * Included by apple-sio.c: the checks sio_recv_msg() applies to the tag and
- * the channel a firmware message names.
+ * the channel a firmware message names, and when an ended transfer is freed.
  */
 #include <kunit/device.h>
+#include <kunit/test-bug.h>
 #include <kunit/test.h>
 
 static u64 sio_test_msg(u8 type, u8 tag, u8 sioep)
@@ -443,4 +444,203 @@ static struct kunit_suite sio_msg_test_suite = {
 	.test_cases = sio_msg_test_cases,
 };
 
-kunit_test_suite(sio_msg_test_suite);
+/* A channel with descriptor slots, as the probe sets them up */
+static struct sio_data *sio_test_alloc_dma(struct kunit *test, int nchannels)
+{
+	struct sio_data *sio = sio_test_alloc(test, nchannels);
+	int i;
+
+	sio->hw = &sio_hw_generic;
+	sio->shmem = kunit_kzalloc(test, 56 + SIO_NO_DESC_SLOTS * sizeof(struct sio_coproc_desc),
+				   GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, sio->shmem);
+	sio->shmem_desc_base = sio->shmem + 56;
+	sio->desc_allocated = kunit_kcalloc(test, BITS_TO_LONGS(SIO_NO_DESC_SLOTS),
+					    sizeof(unsigned long), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, sio->desc_allocated);
+	INIT_LIST_HEAD(&sio->dma.channels);
+	for (i = 0; i < nchannels; i++) {
+		sio->channels[i].vc.desc_free = sio_tx_free;
+		vchan_init(&sio->channels[i].vc, &sio->dma);
+	}
+	return sio;
+}
+
+/* The channel's current transfer, ended by sio_terminate_all() with n descriptors in flight */
+static struct sio_tx *sio_test_ended_tx(struct kunit *test, struct sio_chan *chan, int n)
+{
+	struct sio_tx *tx = sio_alloc_tx(chan, 0x10000, 4 * 0x400, 0x400, GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, tx);
+	tx->vd.tx.cookie = 2;
+	tx->ninflight = n;
+	tx->terminated = true;
+	chan->current_tx = tx;
+	return tx;
+}
+
+static int sio_test_slot(struct sio_data *sio, struct sio_tx *tx, int i)
+{
+	return tx->siodesc[i] - sio->shmem_desc_base;
+}
+
+struct sio_test_terminate {
+	int ret;
+	unsigned int calls;
+};
+
+static int sio_test_terminate(struct sio_chan *chan)
+{
+	struct sio_test_terminate *t = kunit_get_current_test()->priv;
+
+	t->calls++;
+	return t->ret;
+}
+
+/*
+ * A TERMINATE refused, or not answered, while descriptors are in flight does
+ * not free the transfer: it keeps its descriptors, the channel starts no other
+ * transfer, and it is tried again until an acknowledged TERMINATE frees it.
+ */
+static void sio_terminate_unconfirmed_test(struct kunit *test)
+{
+	bool tainted = test_taint(TAINT_WARN);
+	struct sio_data *sio = sio_test_alloc_dma(test, 1);
+	struct sio_chan *chan = &sio->channels[0];
+	struct sio_test_terminate t = {};
+	struct dma_async_tx_descriptor *next_desc;
+	struct sio_tx *tx, *next;
+	unsigned long flags;
+	LIST_HEAD(to_free);
+	int slot, i;
+
+	test->priv = &t;
+	tx = sio_test_ended_tx(test, chan, 2);
+	slot = sio_test_slot(sio, tx, 0);
+
+	t.ret = -ETIME;
+	sio_end_tx(chan, tx, sio_test_terminate);
+	KUNIT_EXPECT_EQ(test, t.calls, SIO_TERMINATE_TRIES);
+	KUNIT_EXPECT_TRUE(test, chan->quarantined);
+	KUNIT_EXPECT_PTR_EQ(test, chan->current_tx, tx);
+	for (i = 0; i < tx->nperiods; i++)
+		KUNIT_EXPECT_TRUE(test, test_bit(sio_test_slot(sio, tx, i), sio->desc_allocated));
+
+	/* The slots are not handed out again, and a queued transfer does not start. */
+	next = sio_alloc_tx(chan, 0x20000, 4 * 0x400, 0x400, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, next);
+	for (i = 0; i < next->nperiods; i++)
+		KUNIT_EXPECT_GE(test, sio_test_slot(sio, next, i), slot + tx->nperiods);
+	next_desc = vchan_tx_prep(&chan->vc, &next->vd, 0);
+	dmaengine_submit(next_desc);
+	sio_issue_pending(&chan->vc.chan);
+	KUNIT_EXPECT_PTR_EQ(test, chan->current_tx, tx);
+	/* As sio_terminate_all() drops it */
+	spin_lock_irqsave(&chan->vc.lock, flags);
+	vchan_get_all_descriptors(&chan->vc, &to_free);
+	spin_unlock_irqrestore(&chan->vc.lock, flags);
+	vchan_dma_desc_free_list(&chan->vc, &to_free);
+
+	t.calls = 0;
+	t.ret = 0;
+	sio_end_tx(chan, tx, sio_test_terminate);
+	KUNIT_EXPECT_EQ(test, t.calls, SIO_TERMINATE_TRIES);
+	KUNIT_EXPECT_TRUE(test, chan->quarantined);
+	KUNIT_EXPECT_PTR_EQ(test, chan->current_tx, tx);
+	KUNIT_EXPECT_TRUE(test, test_bit(slot, sio->desc_allocated));
+
+	/* sio_synchronize() tries again: an acknowledged TERMINATE frees it. */
+	t.calls = 0;
+	t.ret = 1;
+	sio_end_tx(chan, tx, sio_test_terminate);
+	KUNIT_EXPECT_EQ(test, t.calls, 1U);
+	KUNIT_EXPECT_FALSE(test, chan->quarantined);
+	KUNIT_EXPECT_NULL(test, chan->current_tx);
+	for (i = 0; i < 4; i++)
+		KUNIT_EXPECT_FALSE(test, test_bit(slot + i, sio->desc_allocated));
+
+	if (!tainted)
+		KUNIT_EXPECT_FALSE(test, test_taint(TAINT_WARN));
+}
+
+/* With nothing in flight, a TERMINATE refused or not answered still frees the transfer. */
+static void sio_terminate_drained_test(struct kunit *test)
+{
+	bool tainted = test_taint(TAINT_WARN);
+	struct sio_data *sio = sio_test_alloc_dma(test, 1);
+	struct sio_chan *chan = &sio->channels[0];
+	struct sio_test_terminate t = { .ret = 0 };
+	struct sio_tx *tx;
+	int slot;
+
+	test->priv = &t;
+	tx = sio_test_ended_tx(test, chan, 0);
+	slot = sio_test_slot(sio, tx, 0);
+	sio_end_tx(chan, tx, sio_test_terminate);
+	KUNIT_EXPECT_EQ(test, t.calls, 1U);
+	KUNIT_EXPECT_FALSE(test, chan->quarantined);
+	KUNIT_EXPECT_NULL(test, chan->current_tx);
+	KUNIT_EXPECT_FALSE(test, test_bit(slot, sio->desc_allocated));
+
+	t.calls = 0;
+	t.ret = -ETIME;
+	tx = sio_test_ended_tx(test, chan, 0);
+	sio_end_tx(chan, tx, sio_test_terminate);
+	KUNIT_EXPECT_EQ(test, t.calls, 1U);
+	KUNIT_EXPECT_NULL(test, chan->current_tx);
+
+	if (!tainted)
+		KUNIT_EXPECT_FALSE(test, test_taint(TAINT_WARN));
+}
+
+/*
+ * The old accounting: an ISSUE acknowledged after the transfer ended is in
+ * flight until its report, and an ended transfer's client is not called back.
+ */
+static void sio_terminate_late_issue_test(struct kunit *test)
+{
+	bool tainted = test_taint(TAINT_WARN);
+	struct sio_data *sio = sio_test_alloc_dma(test, 1);
+	struct sio_chan *chan = &sio->channels[0];
+	struct sio_tx *tx;
+
+	tx = sio_test_ended_tx(test, chan, 1);
+	chan->pending = 1;
+	KUNIT_EXPECT_FALSE(test, sio_tx_drained(chan, tx));
+
+	sio_process_report(chan);
+	KUNIT_EXPECT_EQ(test, tx->ninflight, 0);
+	KUNIT_EXPECT_NULL(test, chan->vc.cyclic);
+	KUNIT_EXPECT_FALSE(test, sio_tx_drained(chan, tx));
+
+	sio_handle_issue_ack(chan, (void *)(uintptr_t)tx->vd.tx.cookie, true);
+	KUNIT_EXPECT_EQ(test, chan->pending, 0U);
+	KUNIT_EXPECT_EQ(test, tx->nlate, 1);
+	KUNIT_EXPECT_EQ(test, tx->ninflight, 0);
+	KUNIT_EXPECT_FALSE(test, sio_tx_drained(chan, tx));
+
+	sio_process_report(chan);
+	KUNIT_EXPECT_EQ(test, tx->nlate, 0);
+	KUNIT_EXPECT_NULL(test, chan->vc.cyclic);
+	KUNIT_EXPECT_TRUE(test, sio_tx_drained(chan, tx));
+
+	chan->current_tx = NULL;
+	sio_tx_free(&tx->vd);
+
+	if (!tainted)
+		KUNIT_EXPECT_FALSE(test, test_taint(TAINT_WARN));
+}
+
+static struct kunit_case sio_terminate_test_cases[] = {
+	KUNIT_CASE_SLOW(sio_terminate_unconfirmed_test),
+	KUNIT_CASE(sio_terminate_drained_test),
+	KUNIT_CASE(sio_terminate_late_issue_test),
+	{}
+};
+
+static struct kunit_suite sio_terminate_test_suite = {
+	.name = "apple-sio-terminate",
+	.test_cases = sio_terminate_test_cases,
+};
+
+kunit_test_suites(&sio_msg_test_suite, &sio_terminate_test_suite);

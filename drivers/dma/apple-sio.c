@@ -147,7 +147,18 @@ struct sio_chan {
 	 * callback can still be running (sio_free_dead()).
 	 */
 	struct list_head dead;
+	/*
+	 * The current transfer ended, but the firmware neither acknowledged a
+	 * TERMINATE nor reported its descriptors (sio_end_tx()): it keeps its
+	 * descriptors, nothing else is issued on the channel, and each
+	 * sio_synchronize() tries to stop it again.
+	 */
+	bool quarantined;
 };
+
+/* TERMINATEs sent to end a transfer, each followed by a wait for its descriptors */
+#define SIO_TERMINATE_TRIES	2
+#define SIO_DRAIN_TIMEOUT_MS	500
 
 #define SIO_NTAGS		16
 /* Tag 0 is never handed out. */
@@ -253,6 +264,11 @@ struct sio_tx {
 	size_t period_len;
 	int nperiods;
 	int ninflight;
+	/*
+	 * The old accounting: descriptors whose ISSUE was acknowledged after the
+	 * transfer ended, in flight after the others.
+	 */
+	int nlate;
 	int next;
 
 	struct sio_coproc_desc *siodesc[];
@@ -1095,8 +1111,9 @@ static void sio_settle_locked(struct sio_chan *siochan, struct sio_tx *tx)
 		wake_up(&siochan->drained);
 		return;
 	}
-	/* sio_terminate_work() or sio_clear_idle() */
+	/* sio_stop_tx() or sio_clear_idle() */
 	complete(&tx->done);
+	wake_up(&siochan->drained);
 }
 
 /*
@@ -1111,14 +1128,19 @@ static void sio_old_issue_ack_locked(struct sio_chan *siochan, dma_cookie_t tx_c
 		siochan->pending--;
 	if (!ok) {
 		dev_err(siochan->host->dev, "nacked issue on chan %d\n", siochan->no);
-		return;
+	} else if (tx && tx_cookie == tx->vd.tx.cookie) {
+		/* An ended transfer's descriptor is in flight all the same. */
+		if (tx->terminated) {
+			tx->nlate++;
+		} else {
+			tx->next = (tx->next + 1) % tx->nperiods;
+			tx->ninflight++;
+			sio_fill_in_locked(siochan);
+		}
 	}
-	if (!tx || tx_cookie != tx->vd.tx.cookie || tx->terminated)
-		return;
-
-	tx->next = (tx->next + 1) % tx->nperiods;
-	tx->ninflight++;
-	sio_fill_in_locked(siochan);
+	/* sio_stop_tx() */
+	if (tx && tx->terminated)
+		wake_up(&siochan->drained);
 }
 
 /* The ring accounting: an ACK is the last issued descriptor's. */
@@ -1294,12 +1316,116 @@ static int sio_terminate_all(struct dma_chan *chan)
 	return 0;
 }
 
+/* No descriptor of tx, ended, is in flight or waits for its ISSUE's ACK. */
+static bool sio_tx_drained_locked(struct sio_chan *siochan, struct sio_tx *tx)
+{
+	if (siochan->ring)
+		return sio_tx_quiet_locked(siochan, tx);
+	return !tx->ninflight && !tx->nlate && !siochan->pending;
+}
+
+static bool sio_tx_drained(struct sio_chan *siochan, struct sio_tx *tx)
+{
+	unsigned long flags;
+	bool drained;
+
+	spin_lock_irqsave(&siochan->vc.lock, flags);
+	drained = sio_tx_drained_locked(siochan, tx);
+	spin_unlock_irqrestore(&siochan->vc.lock, flags);
+
+	return drained;
+}
+
+/* 1 on ACK, 0 on NACK, negative without an answer */
+static int sio_call_terminate(struct sio_chan *siochan)
+{
+	return sio_call(siochan->host, FIELD_PREP(SIOMSG_EP, siochan->no) |
+				       FIELD_PREP(SIOMSG_TYPE, MSG_TERMINATE));
+}
+
+/*
+ * Whether the firmware no longer reads the descriptors of tx, the channel's
+ * current transfer, ended: it acknowledged a TERMINATE, after which nothing it
+ * holds is played (as in sio_stop_quiet()), or it reported all of them. A
+ * TERMINATE refused or not answered is sent again once the descriptors had
+ * SIO_DRAIN_TIMEOUT_MS to drain, SIO_TERMINATE_TRIES times in all.
+ */
+static bool sio_stop_tx(struct sio_chan *siochan, struct sio_tx *tx,
+			int (*terminate)(struct sio_chan *))
+{
+	struct device *dev = siochan->host->dev;
+	unsigned long timeout = msecs_to_jiffies(SIO_DRAIN_TIMEOUT_MS);
+	int i, ret;
+
+	for (i = 0; i < SIO_TERMINATE_TRIES; i++) {
+		ret = terminate(siochan);
+		if (ret == 1) {
+			if (!wait_for_completion_timeout(&tx->done, timeout))
+				dev_err(dev, "terminate descriptor wait timed out\n");
+			return true;
+		}
+		if (ret < 0)
+			dev_err(dev, "terminate call on chan %d failed: %d\n", siochan->no, ret);
+		if (wait_event_timeout(siochan->drained, sio_tx_drained(siochan, tx), timeout))
+			return true;
+		dev_err(dev, "chan %d: TERMINATE %s and descriptors still in flight\n",
+			siochan->no, ret ? "not answered" : "refused");
+	}
+	return false;
+}
+
+/* Frees tx, ended, once the firmware no longer reads it, and starts the next transfer. */
+static void sio_release_tx(struct sio_chan *siochan, struct sio_tx *tx)
+{
+	unsigned long flags;
+
+	tasklet_kill(&siochan->vc.task);
+
+	spin_lock_irqsave(&siochan->vc.lock, flags);
+	WARN_ON(siochan->current_tx != tx);
+	siochan->current_tx = NULL;
+	siochan->quarantined = false;
+	sio_scrub_locked(siochan, tx);
+	sio_update_current_tx_locked(siochan);
+	sio_ring_leave_locked(siochan);
+	spin_unlock_irqrestore(&siochan->vc.lock, flags);
+
+	sio_tx_free(&tx->vd);
+}
+
+/*
+ * Ends tx, the channel's current transfer: freed once stopped, else
+ * quarantined. Its client may free the buffer on return either way, but the
+ * descriptors that still point at it are not handed to another transfer.
+ */
+static void sio_end_tx(struct sio_chan *siochan, struct sio_tx *tx,
+		       int (*terminate)(struct sio_chan *))
+{
+	unsigned long flags;
+	bool first;
+
+	if (sio_stop_tx(siochan, tx, terminate)) {
+		sio_release_tx(siochan, tx);
+		return;
+	}
+
+	spin_lock_irqsave(&siochan->vc.lock, flags);
+	first = !siochan->quarantined;
+	siochan->quarantined = true;
+	spin_unlock_irqrestore(&siochan->vc.lock, flags);
+	if (first)
+		dev_err(siochan->host->dev,
+			"chan %d: not stopped, its transfer keeps its descriptors and the channel is held\n",
+			siochan->no);
+	/* No callback of the ended transfer runs after this. */
+	tasklet_kill(&siochan->vc.task);
+}
+
 static void sio_terminate_work(struct work_struct *wq)
 {
 	struct sio_chan *siochan = container_of(wq, struct sio_chan, terminate_wq);
 	struct sio_tx *tx;
 	unsigned long flags;
-	int ret;
 
 	spin_lock_irqsave(&siochan->vc.lock, flags);
 	tx = siochan->current_tx;
@@ -1308,27 +1434,7 @@ static void sio_terminate_work(struct work_struct *wq)
 	if (WARN_ON(!tx))
 		return;
 
-	ret = sio_call(siochan->host, FIELD_PREP(SIOMSG_EP, siochan->no) |
-				      FIELD_PREP(SIOMSG_TYPE, MSG_TERMINATE));
-	if (ret < 0)
-		dev_err(siochan->host->dev, "terminate call on chan %d failed: %d\n",
-			siochan->no, ret);
-
-	ret = wait_for_completion_timeout(&tx->done, msecs_to_jiffies(500));
-	if (!ret)
-		dev_err(siochan->host->dev, "terminate descriptor wait timed out\n");
-
-	tasklet_kill(&siochan->vc.task);
-
-	spin_lock_irqsave(&siochan->vc.lock, flags);
-	WARN_ON(siochan->current_tx != tx);
-	siochan->current_tx = NULL;
-	sio_scrub_locked(siochan, tx);
-	sio_update_current_tx_locked(siochan);
-	sio_ring_leave_locked(siochan);
-	spin_unlock_irqrestore(&siochan->vc.lock, flags);
-
-	sio_tx_free(&tx->vd);
+	sio_end_tx(siochan, tx, sio_call_terminate);
 }
 
 static bool sio_drained(struct sio_chan *siochan)
@@ -1440,8 +1546,16 @@ static void sio_free_dead(struct sio_chan *siochan)
 static void sio_synchronize(struct dma_chan *chan)
 {
 	struct sio_chan *siochan = to_sio_chan(chan);
+	struct sio_tx *quarantined;
+	unsigned long flags;
 
 	flush_work(&siochan->terminate_wq);
+	spin_lock_irqsave(&siochan->vc.lock, flags);
+	quarantined = siochan->quarantined ? siochan->current_tx : NULL;
+	spin_unlock_irqrestore(&siochan->vc.lock, flags);
+	if (quarantined)
+		sio_end_tx(siochan, quarantined, sio_call_terminate);
+
 	if (READ_ONCE(siochan->ring)) {
 		/* The caller frees the buffer on return; nothing can stop that. */
 		if (!wait_event_timeout(siochan->drained, sio_drained(siochan),
@@ -1571,9 +1685,16 @@ static void sio_old_report_locked(struct sio_chan *siochan)
 		return;
 	if (tx->ninflight)
 		tx->ninflight--;
-	vchan_cyclic_callback(&tx->vd);
+	else if (tx->nlate)
+		tx->nlate--;
+	/* An ended transfer's client is not called back, as in the ring accounting. */
+	if (!tx->terminated)
+		vchan_cyclic_callback(&tx->vd);
 	if (!sio_fill_in_locked(siochan) && !tx->ninflight)
 		complete(&tx->done);
+	/* sio_stop_tx() */
+	if (tx->terminated)
+		wake_up(&siochan->drained);
 }
 
 /* The ring accounting: the oldest issued descriptor completed. */

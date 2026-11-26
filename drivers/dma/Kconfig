@@ -133,7 +133,8 @@ config APPLE_SIO_KUNIT_TEST
 	  out for, on that request's endpoint and of its reply type; and
 	  that a call that timed out keeps its tag until its late reply,
 	  which answers nothing else, with calls refused while half the
-	  tags are kept so.
+	  tags are kept so. Also check that a transfer whose TERMINATE was
+	  refused or not answered keeps its descriptors until it is stopped.
 
 config APPLE_SIO_T6030_KUNIT_TEST
 	bool "KUnit tests for the T6030 SIO boot-table check" if !KUNIT_ALL_TESTS
