@@ -73,7 +73,8 @@ struct dcp_hdcp_tx {
 	unsigned int device_count;
 	unsigned int depth;
 
-	/* Session state. */
+	/* Session state; @step names the last step tried. */
+	const char *step;
 	bool sep_open;
 	bool encrypting;
 	u32 seq_num_m;
