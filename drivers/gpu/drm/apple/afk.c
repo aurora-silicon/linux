@@ -547,44 +547,13 @@ bool afk_compact_orphans_pending(struct apple_dcp_afkep *ep)
 }
 
 /*
- * Whether a command of @ep that timed out still waits for its late reply:
- * a compact orphan, or a V2 command whose slot is kept for its reply (it is
- * freed when the reply comes, see afk_recv_handle_reply()). Until then the
- * firmware may still be working on it. The replies wake compact_orphan_wq.
+ * Record @state for the command in @cmd in the ticket following it, if it
+ * still follows that command (struct afk_ticket). Under the service's lock.
  */
-bool afk_late_replies_pending(struct apple_dcp_afkep *ep)
+static void afk_ticket_set(struct epic_cmd_info *cmd, enum afk_ticket_state state)
 {
-	unsigned long flags;
-	bool pending = false;
-	u32 i, idx;
-
-	if (afk_compact_orphans_pending(ep))
-		return true;
-	for (i = 0; i < AFK_MAX_CHANNEL && !pending; i++) {
-		struct apple_epic_service *service = &ep->services[i];
-
-		spin_lock_irqsave(&service->lock, flags);
-		for_each_set_bit(idx, service->cmd_map, MAX_PENDING_CMDS) {
-			if (!service->cmds[idx].done && !service->cmds[idx].completion) {
-				pending = true;
-				break;
-			}
-		}
-		spin_unlock_irqrestore(&service->lock, flags);
-	}
-	return pending;
-}
-
-/*
- * How many late replies of @ep's timed-out V2 commands refused them (a
- * nonzero return code). A count rather than a flag: whoever waits for a
- * timed-out call reads it before sending the call, and the call was refused
- * if the count moved once its slot is free (afk_late_replies_pending()). An
- * empty slot map alone does not tell, as an error reply frees the slot too.
- */
-u64 afk_late_refusals(struct apple_dcp_afkep *ep)
-{
-	return READ_ONCE(ep->late_refusals);
+	if (cmd->ticket && cmd->ticket->seq == cmd->ticket_seq)
+		WRITE_ONCE(cmd->ticket->state, state);
 }
 
 /* Wake the waiters for @ep's late replies, to check what else they wait for. */
@@ -2043,9 +2012,11 @@ static void afk_recv_handle_reply(struct apple_dcp_afkep *ep, u32 channel,
 	}
 	if (service->cmds[idx].completion)
 		complete(service->cmds[idx].completion);
-	/* A late reply that refuses the call: see afk_late_refusals(). */
-	if (late && service->cmds[idx].retcode)
-		WRITE_ONCE(ep->late_refusals, ep->late_refusals + 1);
+	/* What its sender follows: see struct afk_ticket. */
+	if (late)
+		afk_ticket_set(&service->cmds[idx], service->cmds[idx].retcode ?
+			       AFK_TICKET_REFUSED : AFK_TICKET_DONE);
+	service->cmds[idx].ticket = NULL;
 
 	spin_unlock_irqrestore(&service->lock, flags);
 
@@ -2053,7 +2024,7 @@ static void afk_recv_handle_reply(struct apple_dcp_afkep *ep, u32 channel,
 		dma_free_coherent(ep->dcp->dev, rxlen, rxbuf, rxbuf_dma);
 	if (txbuf && txlen)
 		dma_free_coherent(ep->dcp->dev, txlen, txbuf, txbuf_dma);
-	/* The late reply of a timed-out command: see afk_late_replies_pending(). */
+	/* The late reply of a timed-out command, which its sender may wait for. */
 	if (late) {
 		wake_up_all(&ep->compact_orphan_wq);
 		if (ep->late_reply_work)
@@ -3207,7 +3178,7 @@ static int afk_send_command_common(struct apple_epic_service *service, u8 type,
 				   const void *payload, size_t payload_len,
 				   void *output, size_t output_len, u32 *retcode,
 				   unsigned int timeout_ms, size_t *received,
-				   size_t *reply_len);
+				   size_t *reply_len, struct afk_ticket *ticket);
 
 static int afk_send_command_timeout_len(struct apple_epic_service *service, u8 type,
 					const void *payload, size_t payload_len,
@@ -3216,7 +3187,19 @@ static int afk_send_command_timeout_len(struct apple_epic_service *service, u8 t
 {
 	return afk_send_command_common(service, type, payload, payload_len,
 				       output, output_len, retcode, timeout_ms,
-				       received, NULL);
+				       received, NULL, NULL);
+}
+
+/* As afk_send_command_timeout_len(), followed by @ticket (struct afk_ticket). */
+static int afk_send_command_ticket(struct apple_epic_service *service, u8 type,
+				   const void *payload, size_t payload_len,
+				   void *output, size_t output_len, u32 *retcode,
+				   unsigned int timeout_ms, size_t *received,
+				   struct afk_ticket *ticket)
+{
+	return afk_send_command_common(service, type, payload, payload_len,
+				       output, output_len, retcode, timeout_ms,
+				       received, NULL, ticket);
 }
 
 int afk_send_command_timeout(struct apple_epic_service *service, u8 type,
@@ -3243,6 +3226,8 @@ struct afk_command_send {
 	void *rxbuf, *txbuf;
 	dma_addr_t rxbuf_dma, txbuf_dma;
 	struct completion *completion;
+	/* follows the command if set (struct afk_ticket) */
+	struct afk_ticket *ticket;
 	/* the slot taken, and its tag */
 	int idx;
 	u16 tag;
@@ -3290,6 +3275,11 @@ static int afk_command_enqueue(void *data)
 	service->cmds[idx].free_on_ack = false;
 	service->cmds[idx].done = false;
 	service->cmds[idx].completion = c->completion;
+	service->cmds[idx].ticket = c->ticket;
+	if (c->ticket) {
+		service->cmds[idx].ticket_seq = ++c->ticket->seq;
+		WRITE_ONCE(c->ticket->state, AFK_TICKET_SENT);
+	}
 	init_completion(c->completion);
 
 	if (ep->inline_v2) {
@@ -3307,6 +3297,7 @@ static int afk_command_enqueue(void *data)
 	}
 	if (ret) {
 		service->cmds[idx].completion = NULL;
+		service->cmds[idx].ticket = NULL;
 		bitmap_release_region(service->cmd_map, idx, 0);
 	} else {
 		c->idx = idx;
@@ -3321,7 +3312,7 @@ static int afk_send_command_common(struct apple_epic_service *service, u8 type,
 				   const void *payload, size_t payload_len,
 				   void *output, size_t output_len, u32 *retcode,
 				   unsigned int timeout_ms, size_t *received,
-				   size_t *reply_len)
+				   size_t *reply_len, struct afk_ticket *ticket)
 {
 	struct epic_cmd cmd;
 	struct afk_command_send send;
@@ -3439,7 +3430,7 @@ static int afk_send_command_common(struct apple_epic_service *service, u8 type,
 		.inline_command = inline_command, .cmd = &cmd,
 		.rxbuf = rxbuf, .txbuf = txbuf,
 		.rxbuf_dma = rxbuf_dma, .txbuf_dma = txbuf_dma,
-		.completion = &completion,
+		.completion = &completion, .ticket = ticket,
 	};
 	ret = dcp_dptx_send_gated(ep, afk_command_enqueue, &send);
 	kfree(inline_command);
@@ -3461,6 +3452,8 @@ static int afk_send_command_common(struct apple_epic_service *service, u8 type,
 		if (!service->cmds[idx].done) {
 			service->cmds[idx].completion = NULL;
 			service->cmds[idx].free_on_ack = !dcp_is_ext26(ep->dcp);
+			if (service->cmds[idx].free_on_ack)
+				afk_ticket_set(&service->cmds[idx], AFK_TICKET_LATE);
 			if (dcp_is_ext26(ep->dcp))
 				WRITE_ONCE(ep->dcp->crashed, true);
 			spin_unlock_irqrestore(&service->lock, flags);
@@ -3521,6 +3514,7 @@ static int afk_send_command_common(struct apple_epic_service *service, u8 type,
 err_free_cmd:
 	spin_lock_irqsave(&service->lock, flags);
 	service->cmds[idx].completion = NULL;
+	service->cmds[idx].ticket = NULL;
 	bitmap_release_region(service->cmd_map, idx, 0);
 	spin_unlock_irqrestore(&service->lock, flags);
 err_free_txbuf:
@@ -3570,6 +3564,17 @@ int afk_service_call_timeout_len(struct apple_epic_service *service, u16 group,
 				 size_t output_pad, unsigned int timeout_ms,
 				 size_t *received)
 {
+	return afk_service_call_ticket(service, group, command, data, data_len,
+				       data_pad, output, output_len, output_pad,
+				       timeout_ms, received, NULL);
+}
+
+int afk_service_call_ticket(struct apple_epic_service *service, u16 group,
+			    u32 command, const void *data, size_t data_len,
+			    size_t data_pad, void *output, size_t output_len,
+			    size_t output_pad, unsigned int timeout_ms,
+			    size_t *received, struct afk_ticket *ticket)
+{
 	struct epic_service_call *call;
 	size_t wire_received = 0, result_size;
 	void *bfr;
@@ -3600,10 +3605,10 @@ int afk_service_call_timeout_len(struct apple_epic_service *service, u16 group,
 	memcpy(bfr + sizeof(*call), data, data_len);
 
 	/* Inline carries only the request; its response capacity is independent. */
-	ret = afk_send_command_timeout_len(service, EPIC_SUBTYPE_STD_SERVICE, bfr,
-					   service->ep->inline_v2 ? sizeof(*call) + data_len :
-					   bfr_len, bfr, bfr_len, &retcode, timeout_ms,
-					   received ? &wire_received : NULL);
+	ret = afk_send_command_ticket(service, EPIC_SUBTYPE_STD_SERVICE, bfr,
+				      service->ep->inline_v2 ? sizeof(*call) + data_len :
+				      bfr_len, bfr, bfr_len, &retcode, timeout_ms,
+				      received ? &wire_received : NULL, ticket);
 	if (ret) {
 		dev_warn(service->ep->dcp->dev,
 			 "AFK[ep:%02x]: %s (chan:%u) service call group %u cmd %u failed to complete: %d\n",
@@ -3666,7 +3671,7 @@ int afk_send_command_with_reply_len(struct apple_epic_service *service, u8 type,
 		return -EINVAL;
 	return afk_send_command_common(service, type, payload, payload_len,
 				       output, output_len, retcode, MSEC_PER_SEC,
-				       NULL, reply_len);
+				       NULL, reply_len, NULL);
 }
 
 int afk_service_call_with_reply_len(struct apple_epic_service *service,
@@ -3708,7 +3713,7 @@ int afk_service_call_with_reply_len(struct apple_epic_service *service,
 
 	ret = afk_send_command_common(service, EPIC_SUBTYPE_STD_SERVICE, bfr,
 				      bfr_len, bfr, bfr_len, &retcode,
-				      MSEC_PER_SEC, NULL, &received);
+				      MSEC_PER_SEC, NULL, &received, NULL);
 	if (ret)
 		goto out;
 	if (retcode) {

@@ -2402,12 +2402,16 @@ static int dcp_t8132_tunnel_route_xbar(struct apple_dcp *dcp,
  * A T8132 dcpext with a timed-out teardown call outstanding: link callbacks
  * now are the late ones of the released display, not this tunnel's, see
  * dcp_dptx_release_locked(). The firmware makes them before it answers the
- * call, and the next connect waits for that answer.
+ * call. On the M4 backend, until its compact calls are answered, and the
+ * next connect waits for that; on firmware 27, while the port is held for
+ * the answer, which only that answer ends (dcp_t8132_settle_locked()).
  */
 static bool dcp_t8132_late_release(struct apple_dcp *dcp, const char *what)
 {
-	if (!READ_ONCE(dcp->t8132_release_late) || !dcp->dptxep ||
-	    !afk_late_replies_pending(dcp->dptxep))
+	if (!READ_ONCE(dcp->t8132_release_late))
+		return false;
+	if (dcp_is_t8132_ext(dcp) &&
+	    (!dcp->dptxep || !afk_compact_orphans_pending(dcp->dptxep)))
 		return false;
 	dev_dbg(dcp->dev, "firmware %s belongs to an earlier release: not acted on\n",
 		what);

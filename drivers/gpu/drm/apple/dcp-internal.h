@@ -21,6 +21,7 @@
 #include <linux/scatterlist.h>
 #include <linux/usb/typec_mux.h>
 
+#include "afk-ticket.h"
 #include "dcp-fabric.h"
 #include "dcp-peer-v26_6.h"
 #include "dcp-fabric-session.h"
@@ -1025,8 +1026,8 @@ struct apple_dcp {
 	 * set and cleared under hpd_mutex.
 	 */
 	bool t8132_release_late;
-	/* afk_late_refusals() before the held teardown call was sent */
-	u64 t8132_release_refusals;
+	/* Firmware 27: what became of the display's release (dcp_t8132_settle_locked()) */
+	struct afk_ticket t8132_release;
 	/* Frees a held port on the firmware's answer, then resumes its display. */
 	struct work_struct t8132_port_work;
 	/*

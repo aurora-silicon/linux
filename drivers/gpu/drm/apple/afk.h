@@ -17,6 +17,7 @@
 #include <linux/mutex.h>
 #include <linux/types.h>
 
+#include "afk-ticket.h"
 #include "dcp.h"
 
 #define AFK_MAX_CHANNEL 16
@@ -47,6 +48,9 @@ struct epic_cmd_info {
 	bool done;
 	bool free_on_ack;
 	struct completion *completion;
+	/* The ticket following this command, and its number there (afk_ticket_set()) */
+	struct afk_ticket *ticket;
+	u32 ticket_seq;
 };
 
 struct apple_epic_service {
@@ -569,8 +573,6 @@ struct apple_dcp_afkep {
 	bool compact_keep_orphans;
 	unsigned int compact_orphans;	/* lock */
 	wait_queue_head_t compact_orphan_wq;
-	/* Late V2 replies that refused their call (afk_late_refusals()). */
-	u64 late_refusals;
 	/* Queued, if set, when a timed-out V2 command's late reply comes. */
 	struct work_struct *late_reply_work;
 	/* A message went out in part; no further sends (lock). */
@@ -631,8 +633,6 @@ bool afk_host_idle(struct apple_dcp_afkep *ep);
 
 unsigned int afk_compact_orphans_drop(struct apple_dcp_afkep *ep);
 bool afk_compact_orphans_pending(struct apple_dcp_afkep *ep);
-bool afk_late_replies_pending(struct apple_dcp_afkep *ep);
-u64 afk_late_refusals(struct apple_dcp_afkep *ep);
 /* dcp.c: queue a V2 command (@enqueue) as a tunnel connect's admission allows. */
 int dcp_dptx_send_gated(struct apple_dcp_afkep *ep, int (*enqueue)(void *arg), void *arg);
 void afk_late_replies_wake(struct apple_dcp_afkep *ep);
@@ -670,6 +670,12 @@ int afk_service_call_timeout_len(struct apple_epic_service *service, u16 group,
 				 size_t data_pad, void *output, size_t output_len,
 				 size_t output_pad, unsigned int timeout_ms,
 				 size_t *received);
+/* As afk_service_call_timeout_len(), the command followed by @ticket if set. */
+int afk_service_call_ticket(struct apple_epic_service *service, u16 group,
+			    u32 command, const void *data, size_t data_len,
+			    size_t data_pad, void *output, size_t output_len,
+			    size_t output_pad, unsigned int timeout_ms,
+			    size_t *received, struct afk_ticket *ticket);
 
 /* Strict variants return only firmware-reported bytes; legacy callers unchanged. */
 int afk_send_command_with_reply_len(struct apple_epic_service *service, u8 type,

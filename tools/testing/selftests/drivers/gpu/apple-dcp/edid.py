@@ -86,7 +86,8 @@ struct apple_dcp;struct apple_dcp_afkep;struct apple_epic_service;
 void afk_service_retry(struct apple_dcp_afkep *ep);
 /* open_later: a firmware 27 panel service that sends its own OPEN; none is here. */
 struct apple_epic_service_ops { char name[32];bool reusable,optional,open_later;void (*init)(struct apple_epic_service *,const char *,const char *,s64);int (*prepare)(struct apple_epic_service *,const char *,const char *,s64);int (*revalidate)(struct apple_epic_service *,const char *,const char *,s64);void (*init_props)(struct apple_epic_service *,s64,const void *,size_t);void (*teardown)(struct apple_epic_service *); };
-struct epic_cmd_info { u16 tag;u8 type;size_t reply_length,reply_len;bool reply_len_valid;void *rxbuf,*txbuf;dma_addr_t rxbuf_dma,txbuf_dma;size_t rxlen,txlen;u32 retcode;bool done,free_on_ack;int *completion; };
+/* AFK_TICKET */
+struct epic_cmd_info { u16 tag;u8 type;size_t reply_length,reply_len;bool reply_len_valid;void *rxbuf,*txbuf;dma_addr_t rxbuf_dma,txbuf_dma;size_t rxlen,txlen;u32 retcode;bool done,free_on_ack;int *completion;struct afk_ticket *ticket;u32 ticket_seq; };
 struct apple_epic_service {
     struct apple_dcp_afkep *ep;const struct apple_epic_service_ops *ops;
     bool lock,enabled,torndown;unsigned int users;u32 channel;u8 cmd_tag;
@@ -96,7 +97,7 @@ struct apple_epic_service {
 };
 /* v27_closed_teardown: set only by a J714s firmware 27 sleep. */
 #define wake_up_all(q) ((void)(q))
-struct apple_dcp_afkep { u8 *command_tags;bool lock,stopping;void *wq;struct work_struct service_work;int compact_orphan_wq;u64 late_refusals;unsigned int *late_reply_work;struct apple_dcp *dcp;const struct apple_epic_service_ops *ops;bool wire_v2,inline_v2,match_epic_name,v27_closed_teardown;u32 endpoint;unsigned int num_channels;struct apple_epic_service services[AFK_MAX_CHANNEL]; };
+struct apple_dcp_afkep { u8 *command_tags;bool lock,stopping;void *wq;struct work_struct service_work;int compact_orphan_wq;unsigned int *late_reply_work;struct apple_dcp *dcp;const struct apple_epic_service_ops *ops;bool wire_v2,inline_v2,match_epic_name,v27_closed_teardown;u32 endpoint;unsigned int num_channels;struct apple_epic_service services[AFK_MAX_CHANNEL]; };
 struct apple_connector { void *dcp;bool connected,edid_invalidation_pending;struct { int registration_state; } base;unsigned int hotplug_wq; };
 struct apple_dcp {
     void *dev;int fw_compat;struct apple_dcp_afkep *dcpavservep;struct apple_connector *connector;
@@ -180,7 +181,7 @@ static int skip(struct dcp_parse_ctx *h) { assert(!h->key);h->index++;h->key=tru
            function('afk.c','static void afk_discard_pending_open('),function('afk.c','static void afk_retry_service_init('),function('afk.c','static void afk_service_worker('),function('afk.c','static void afk_recv_handle_init('),
            function('epic/dpavservep.c','static int dcpdpserv_prepare('),
            function('epic/dpavservep.c','static void dcpdpserv_teardown('),function('afk.c','static void afk_recv_handle_teardown('),
-           function('afk.c','static void afk_recv_handle_reply(')]
+           function('afk.c','static void afk_ticket_set('),function('afk.c','static void afk_recv_handle_reply(')]
     # A firmware 27 panel's AV service closes as the H17P one does.
     if 'static bool afk_is_panelav(' in (base/'afk.c').read_text():
         parts.append(function('afk.c','static bool afk_is_panelav('))
@@ -554,6 +555,8 @@ int main(void)
     puts("PASS: actual dynamic 1/5/9/13 binding, forged identities, prepare/init epochs, physical retirement, reader pins, real old CLOSED/late ACK isolation and legacy unit 0");
 }
 '''
+    ticket = (base/'afk-ticket.h').read_text().replace('#include <linux/types.h>\n', '')
+    prefix = prefix.replace('/* AFK_TICKET */', ticket)
     return prefix + '\n'.join(parts) + suffix
 
 def admission(root):

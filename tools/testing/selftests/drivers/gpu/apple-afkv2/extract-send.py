@@ -69,19 +69,22 @@ static unsigned int late_wakes;
 #define wait_for_completion_timeout(p,t) ((void)(t),*(p))
 typedef u64 dma_addr_t;
 struct epic_cmd { u32 retcode; u64 rxbuf,txbuf; u32 rxlen,txlen; u8 rxcookie,txcookie; };
+/* AFK_TICKET */
 struct cmd_info {
  u16 tag; u8 type; size_t reply_length; void *rxbuf,*txbuf;
  dma_addr_t rxbuf_dma,txbuf_dma; size_t rxlen,txlen; u32 retcode;
  size_t reply_len; bool reply_len_valid;
  bool done,free_on_ack; int *completion;
+ struct afk_ticket *ticket; u32 ticket_seq;
 };
+#define epic_cmd_info cmd_info
 struct dcp { void *dev; bool quiescing,external,crashed,ext26; void *rtk; };
 static bool dcp_is_ext26(const struct dcp *dcp) { return dcp->ext26; }
 struct afk_ringbuffer { bool ready; };
 struct work_struct { int queued; };
 #define schedule_work(w) ((w)->queued++)
 struct apple_dcp_afkep { struct dcp *dcp; bool wire_v2,inline_v2,compact; int endpoint,lock;u8 *command_tags;
- int compact_orphan_wq; u64 late_refusals; struct work_struct *late_reply_work;
+ int compact_orphan_wq; struct work_struct *late_reply_work;
  struct afk_ringbuffer txbfr,rxbfr; size_t ext26_command_bytes; unsigned int ext26_command_count; };
 struct ops { const char *name; };
 struct apple_epic_service {
@@ -253,16 +256,41 @@ int main(void)
  afk_recv_handle_reply(&ep,4,retained_tag,&reply,sizeof(reply));
  assert(frees==before_late+2 && !s.cmd_map[0] && s.cmds[0].done && s.users==1);
  /* Only the late reply of the timed-out command wakes its waiters, and queues their work. */
- assert(late_wakes==1 && late_work.queued==1 && !ep.late_refusals);
+ assert(late_wakes==1 && late_work.queued==1);
  afk_recv_handle_reply(&ep,4,retained_tag,&reply,sizeof(reply));
  assert(frees==before_late+2);
  s.enabled=true;s.torndown=false;
- /* A late reply that refuses the call is counted (afk_late_refusals()). */
- assert(afk_send_command_timeout_len(&s,0xc0,request,112,output,32888,&status,1000,&received)==-ETIMEDOUT);
+ /*
+  * A command followed by a ticket (afk_send_command_ticket()): its timeout
+  * makes it LATE, its late reply DONE or REFUSED; only the command it
+  * follows now writes it.
+  */
+ struct afk_ticket ticket={0};
+ assert(afk_send_command_ticket(&s,0xc0,request,112,output,32888,&status,1000,&received,&ticket)==-ETIMEDOUT);
+ assert(ticket.state==AFK_TICKET_LATE && ticket.seq==1 && s.cmds[0].ticket==&ticket);
  reply.retcode=0xe00002bc;
  afk_recv_handle_reply(&ep,4,s.cmds[0].tag,&reply,sizeof(reply));
- assert(!s.cmd_map[0] && ep.late_refusals==1 && late_work.queued==2);
+ assert(!s.cmd_map[0] && ticket.state==AFK_TICKET_REFUSED && late_work.queued==2 && !s.cmds[0].ticket);
+ reply.retcode=0;
+ assert(afk_send_command_ticket(&s,0xc0,request,112,output,32888,&status,1000,&received,&ticket)==-ETIMEDOUT);
+ assert(ticket.state==AFK_TICKET_LATE && ticket.seq==2);
+ afk_recv_handle_reply(&ep,4,s.cmds[0].tag,&reply,sizeof(reply));
+ assert(ticket.state==AFK_TICKET_DONE && late_work.queued==3);
+ /* The late reply of a command the ticket no longer follows leaves it alone. */
+ assert(afk_send_command_ticket(&s,0xc0,request,112,output,32888,&status,1000,&received,&ticket)==-ETIMEDOUT);
+ ticket.seq++;ticket.state=AFK_TICKET_SENT;
+ reply.retcode=0xe00002bc;
+ afk_recv_handle_reply(&ep,4,s.cmds[0].tag,&reply,sizeof(reply));
+ assert(ticket.state==AFK_TICKET_SENT && !s.cmd_map[0]);
+ /* Nor does a command without one. */
+ ticket.state=AFK_TICKET_LATE;
+ assert(afk_send_command_timeout_len(&s,0xc0,request,112,output,32888,&status,1000,&received)==-ETIMEDOUT);
+ afk_recv_handle_reply(&ep,4,s.cmds[0].tag,&reply,sizeof(reply));
+ assert(ticket.state==AFK_TICKET_LATE && !s.cmd_map[0]);
  reply.retcode=0;timeout=0;
+ /* Answered in time: the call returns it, the ticket stays as sent. */
+ assert(!afk_send_command_ticket(&s,0xc0,request,112,output,32888,&status,1000,&received,&ticket));
+ assert(ticket.state==AFK_TICKET_SENT && !s.cmd_map[0] && !s.cmds[0].ticket);
  /* Gated: refused, nothing queued, no slot kept; allowed, queued under the gate. */
  unsigned int gate_sends=sends,gate_frees=frees;
  gate_mode=1;
@@ -310,12 +338,15 @@ def struct(name):
     return match.group(0) + "\n"
 
 
-bodies = [function(r"static u32 afk_compact_next_status", "compact status allocator"),
+bodies = [function(r"static void afk_ticket_set", "ticket record"),
+          function(r"static u32 afk_compact_next_status", "compact status allocator"),
           function(r"static u16 afk_command_tag", "interface tag allocator"),
           struct("afk_command_send").replace("struct completion *completion;", "int *completion;"),
           function(r"static int afk_command_enqueue", "command queueing"),
           function(r"static int afk_send_command_common", "command sender"),
           function(r"static int afk_send_command_timeout_len", "length-aware sender"),
+          function(r"static int afk_send_command_ticket", "ticketed sender"),
           function(r"int afk_send_command_with_reply_len", "legacy reply-length sender"),
           function(r"static void afk_recv_handle_reply", "reply completer")]
-pathlib.Path(sys.argv[2]).write_text(prefix + "".join(bodies) + suffix)
+ticket = re.sub(r"^#include.*\n", "", pathlib.Path(sys.argv[1]).with_name("afk-ticket.h").read_text(), flags=re.M)
+pathlib.Path(sys.argv[2]).write_text(prefix.replace("/* AFK_TICKET */", ticket) + "".join(bodies) + suffix)

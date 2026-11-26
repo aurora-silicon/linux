@@ -61,6 +61,11 @@ struct dcp { void *dev; };
 struct ops { const char *name; };
 struct ep { struct dcp *dcp; int endpoint; bool inline_v2; bool compact; };
 struct apple_epic_service { struct ep *ep; struct ops *ops; u32 channel; };
+struct afk_ticket;
+int afk_service_call_ticket(struct apple_epic_service *service, u16 group,
+ u32 command, const void *data, size_t data_len, size_t data_pad, void *output,
+ size_t output_len, size_t output_pad, unsigned int timeout_ms, size_t *received,
+ struct afk_ticket *ticket);
 int afk_service_call_timeout_len(struct apple_epic_service *service, u16 group,
  u32 command, const void *data, size_t data_len, size_t data_pad, void *output,
  size_t output_len, size_t output_pad, unsigned int timeout_ms, size_t *received);
@@ -93,10 +98,11 @@ __attribute__((unused)) static void dcp_cec_close_port(struct dcp *dcp,
  assert(dcp == expected_dcp && service != NULL);
  cec_closes++;
 }
-static int afk_send_command_timeout_len(struct apple_epic_service *s, u8 type,
+static int afk_send_command_ticket(struct apple_epic_service *s, u8 type,
  const void *payload, size_t payload_len, void *output, size_t output_len,
- u32 *retcode, unsigned int timeout_ms, size_t *received)
+ u32 *retcode, unsigned int timeout_ms, size_t *received, struct afk_ticket *ticket)
 {
+ assert(!ticket);
  struct epic_service_call *call = output;
  u8 *body = (u8 *)output + sizeof(*call);
  u32 echo;
@@ -211,7 +217,8 @@ int main(void)
  return 0;
 }
 '''
-unit = (prefix + command.group(0) + "\n" + function(afk, "afk_service_call_timeout_len") + "\n" +
+unit = (prefix + command.group(0) + "\n" + function(afk, "afk_service_call_ticket") + "\n" +
+        function(afk, "afk_service_call_timeout_len") + "\n" +
         function(afk, "afk_service_call_timeout") + "\n" +
         function(dptx, "dptxport_set_hpd_timeout") + suffix)
 pathlib.Path(sys.argv[3]).write_text(unit)
