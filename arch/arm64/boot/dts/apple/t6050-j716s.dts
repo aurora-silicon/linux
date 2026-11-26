@@ -587,3 +587,10 @@
 
 #define T6050_J716S
 #include "t6050-peripherals.dtsi"
+
+/*
+ * The SEP (ADT sep, dart-sep): the same hand-off as the J716c's and the J714s's. The boot
+ * loader reserves its firmware and adds its manifests through the "sep" alias; its mailbox
+ * and power domain are on, with the two fabric parents left to the firmware.
+ */
+#include "t6050-j716c-sep.dtsi"
