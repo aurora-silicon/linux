@@ -982,7 +982,7 @@ const struct ave_fw_layout *ave_layout_for_crc(u32 crc)
 		return &ave_layout_6070_11_1;
 	/*
 	 * The macOS 27.0 build for the M5 Pro and Max, and the M5's build of the
-	 * same firmware version (9013.45.1): one AppleAVE2 kext builds the
+	 * same firmware version (9013.45.1): one macOS driver builds the
 	 * commands for both.
 	 */
 	if (crc == AVE_FW_TEXT_CRC_T6050_26A428 ||
@@ -995,7 +995,8 @@ const struct ave_fw_layout *ave_layout_for_crc(u32 crc)
 	if (crc == AVE_FW_TEXT_CRC_T6050_26C5035)
 		return &ave_layout_26a428;
 	if (crc == AVE_FW_TEXT_CRC_T8132_26B123 ||
-	    crc == AVE_FW_TEXT_CRC_T8122_26B123)
+	    crc == AVE_FW_TEXT_CRC_T8122_26B123 ||
+	    crc == AVE_FW_TEXT_CRC_T8112_26B123)
 		return &ave_layout_26b123;
 	/*
 	 * The M5's macOS 27.2 build (9013.55.1), between 26A428 and the 27.3

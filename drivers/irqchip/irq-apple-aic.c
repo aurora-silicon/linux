@@ -48,6 +48,7 @@
 #include <linux/bits.h>
 #include <linux/bitfield.h>
 #include <linux/cpuhotplug.h>
+#include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/irqchip.h>
 #include <linux/irqchip/arm-vgic-info.h>
@@ -55,6 +56,7 @@
 #include <linux/jump_label.h>
 #include <linux/limits.h>
 #include <linux/of_address.h>
+#include <linux/soc/apple/sleep.h>
 #include <linux/slab.h>
 #include <linux/suspend.h>
 #include <linux/syscore_ops.h>
@@ -210,8 +212,8 @@
  * System interrupt configuration. AICv2 and later have no per-IRQ CPU target:
  * the controller delivers each IRQ to one of the CPUs that accept IRQs, and
  * this per-CPU field says whether a CPU does. A CPU whose field reads
- * SIQ_CFG_ROUTE_NONE never receives an AIC IRQ. Only used on SoCs where this
- * has been verified on hardware (aic_info.siq_cfg_routing).
+ * SIQ_CFG_ROUTE_NONE never receives an AIC IRQ. Read only at EL2, since a
+ * hypervisor or secure monitor may trap it.
  */
 #define SYS_IMP_APL_SIQ_CFG_EL1		sys_reg(3, 4, 15, 10, 4)
 #define SIQ_CFG_ROUTE			GENMASK(1, 0)
@@ -275,19 +277,10 @@ struct aic_info {
 	bool fast_ipi;
 	bool local_fast_ipi;
 	bool vm_timer_fiq_readonly;
-	/*
-	 * SIQ_CFG routing verified on hardware: at EL2, AICv2+ IRQs report the
-	 * CPUs that accept them as their effective affinity. The set grows as
-	 * CPUs start and IRQs keep the set they were given, which is enough
-	 * while only one CPU accepts IRQs. A SoC listed here with more than one
-	 * accepting CPU would also need those masks refreshed when such a CPU
-	 * comes online.
-	 */
-	bool siq_cfg_routing;
 	/* A firmware-driven suspend powers the controller down: aic_syscore_ops keep it. */
 	bool fw_suspend;
-	/* If set, fw_suspend holds on these boards only */
-	const char *const *fw_suspend_boards;
+	/* If set, fw_suspend holds only where this says the sleep is described */
+	bool (*fw_suspend_described)(void);
 };
 
 static const struct aic_info aic1_info __initconst = {
@@ -336,12 +329,9 @@ static const struct aic_info aic3_info __initconst = {
 
 /*
  * The M5 Pro's sleep: the last steps mask every interrupt and acknowledge events by hand. The
- * save and restore are set up on the boards with a T6050 sleep, the J714s and the J716c;
+ * save and restore are set up on the boards whose device tree describes a T6050 sleep;
  * another T6050 board is as one without them.
  */
-static const char *const aic3_t6050_sleep_boards[] __initconst = {
-	"apple,j714s", "apple,j716c", NULL
-};
 
 static const struct aic_info aic3_t6050_info __initconst = {
 	.version = 3,
@@ -349,7 +339,7 @@ static const struct aic_info aic3_t6050_info __initconst = {
 	.fast_ipi = true,
 	.local_fast_ipi = true,
 	.fw_suspend = true,
-	.fw_suspend_boards = aic3_t6050_sleep_boards,
+	.fw_suspend_described = apple_t6050_sleep_described,
 };
 
 static const struct aic_info aic3_t8140_info __initconst = {
@@ -357,7 +347,18 @@ static const struct aic_info aic3_t8140_info __initconst = {
 	.irq_cfg = AIC3_IRQ_CFG,
 	.fast_ipi = true,
 	.local_fast_ipi = true,
-	.siq_cfg_routing = true,
+	.fw_suspend = true,
+};
+
+/*
+ * T6041 (M4 Max): the AICv3 of T8122, with the state its sleep driver's firmware
+ * suspend loses saved and restored around it.
+ */
+static const struct aic_info aic3_t6041_info __initconst = {
+	.version = 3,
+	.irq_cfg = AIC3_IRQ_CFG,
+	.fast_ipi = true,
+	.local_fast_ipi = true,
 	.fw_suspend = true,
 };
 
@@ -366,6 +367,7 @@ static const struct aic_info aic3_t8132_info __initconst = {
 	.irq_cfg = AIC3_IRQ_CFG,
 	.fast_ipi = true,
 	.local_fast_ipi = true,
+	.vm_timer_fiq_readonly = true,
 	.fw_suspend = true,
 };
 
@@ -392,6 +394,10 @@ static const struct of_device_id aic_info_match[] = {
 	{
 		.compatible = "apple,t8142-aic3",
 		.data = &aic3_t8142_info,
+	},
+	{
+		.compatible = "apple,t6041-aic3",
+		.data = &aic3_t6041_info,
 	},
 	{
 		.compatible = "apple,t8103-aic",
@@ -438,7 +444,7 @@ static DEFINE_PER_CPU(uint32_t, aic_fiq_unmasked);
 
 static struct aic_irq_chip *aic_irqc;
 
-/* CPUs that accept hardware IRQs, read from SIQ_CFG where siq_cfg_routing is set */
+/* CPUs that accept hardware IRQs, read from SIQ_CFG on AICv2+ at EL2 */
 static struct cpumask aic_irq_cpus;
 
 static void aic_handle_ipi(struct pt_regs *regs);
@@ -644,7 +650,7 @@ static int aic2_routed_irq_set_affinity(struct irq_data *d,
 	return IRQ_SET_MASK_OK;
 }
 
-/* AIC2 on SoCs whose SIQ_CFG routing is read (aic_info.siq_cfg_routing, at EL2) */
+/* AICv2+ at EL2, where SIQ_CFG is read */
 static struct irq_chip aic2_routed_chip = {
 	.name = "AIC2",
 	.irq_mask = aic_irq_mask,
@@ -665,8 +671,9 @@ static unsigned long aic_fiq_get_idx(struct irq_data *d)
 }
 
 /*
- * T8142 traps writes to VM_TMR_FIQ_ENA_EL2. Mask the guest timers through
- * their architectural EL02 controls instead, leaving the older SoCs alone.
+ * T8132 and T8142 trap writes to VM_TMR_FIQ_ENA_EL2 outside a CTXR execute
+ * window. Mask the guest timers through their architectural EL02 controls
+ * instead, leaving the older SoCs alone.
  */
 static void aic_vm_timer_mask(u64 timers, bool mask)
 {
@@ -829,8 +836,7 @@ static int aic_irq_domain_map(struct irq_domain *id, unsigned int irq,
 	struct irq_chip *chip = &aic_chip;
 
 	if (ic->info.version == 2 || ic->info.version == 3)
-		chip = ic->info.siq_cfg_routing && is_kernel_in_hyp_mode() ?
-		       &aic2_routed_chip : &aic2_chip;
+		chip = is_kernel_in_hyp_mode() ? &aic2_routed_chip : &aic2_chip;
 
 	if (type == AIC_EVENT_TYPE_IRQ) {
 		irq_domain_set_info(id, irq, hw, chip, id->host_data,
@@ -1104,22 +1110,53 @@ static int aic_init_cpu(unsigned int cpu)
 		}
 	}
 
-	/*
-	 * Record whether the controller delivers IRQs to this CPU. SIQ_CFG is
-	 * read only on SoCs where its routing has been verified on hardware,
-	 * and only at EL2, since a hypervisor or secure monitor may trap it.
-	 */
-	if (aic_irqc->info.siq_cfg_routing && is_kernel_in_hyp_mode()) {
-		if (FIELD_GET(SIQ_CFG_ROUTE, read_sysreg_s(SYS_IMP_APL_SIQ_CFG_EL1)) ==
-		    SIQ_CFG_ROUTE_NONE)
-			cpumask_clear_cpu(cpu, &aic_irq_cpus);
-		else
-			cpumask_set_cpu(cpu, &aic_irq_cpus);
-	}
-
 	/* Initialize the local mask state */
 	__this_cpu_write(aic_fiq_unmasked, 0);
 
+	return 0;
+}
+
+/*
+ * Keep aic_irq_cpus to the online CPUs that accept IRQs. genirq takes an IRQ's
+ * effective affinity only when its affinity is set, so set it again on every
+ * requested IRQ when the set changes.
+ */
+static void aic_irq_cpus_update(unsigned int cpu, bool accepts)
+{
+	struct aic_irq_chip *ic = aic_irqc;
+	const struct cpumask *aff;
+	unsigned int die, i, virq;
+
+	if (accepts == cpumask_test_cpu(cpu, &aic_irq_cpus))
+		return;
+	assign_cpu(cpu, &aic_irq_cpus, accepts);
+
+	for (die = 0; die < ic->nr_die; die++) {
+		for (i = 0; i < ic->nr_irq; i++) {
+			virq = irq_find_mapping(ic->hw_domain, AIC_IRQ_HWIRQ(die, i));
+			if (!virq || !irq_has_action(virq))
+				continue;
+			aff = irq_get_affinity_mask(virq);
+			if (!aff)
+				continue;
+			/* Read under the desc lock, so a concurrent smp_affinity write is kept */
+			irq_set_affinity(virq, aff);
+		}
+	}
+}
+
+/* Runs on @cpu, which reads its own SIQ_CFG */
+static int aic_irq_cpu_online(unsigned int cpu)
+{
+	aic_irq_cpus_update(cpu, FIELD_GET(SIQ_CFG_ROUTE,
+					   read_sysreg_s(SYS_IMP_APL_SIQ_CFG_EL1)) !=
+				 SIQ_CFG_ROUTE_NONE);
+	return 0;
+}
+
+static int aic_irq_cpu_offline(unsigned int cpu)
+{
+	aic_irq_cpus_update(cpu, false);
 	return 0;
 }
 
@@ -1280,8 +1317,7 @@ static struct syscore aic_syscore = {
 static void __init aic_sleep_init(struct aic_irq_chip *irqc)
 {
 	if (!irqc->info.fw_suspend ||
-	    (irqc->info.fw_suspend_boards &&
-	     !of_machine_compatible_match(irqc->info.fw_suspend_boards)))
+	    (irqc->info.fw_suspend_described && !irqc->info.fw_suspend_described()))
 		return;
 
 	aic_sleep.irq_cfg = kcalloc(irqc->nr_die * irqc->nr_irq, sizeof(u32), GFP_KERNEL);
@@ -1324,12 +1360,13 @@ static int __init aic_of_ic_init(struct device_node *node, struct device_node *p
 	irqc->info = *(struct aic_info *)match->data;
 
 	/*
-	 * The VM_TMR_FIQ_ENA_EL2 write that traps on T8142 was seen under
-	 * SPTM. A loader that runs the OS at EL2 in a CTXR execute window
-	 * starts no SPTM and says so with this property, and there the
-	 * register takes writes. Masking through the EL02 controls instead
-	 * sets IMASK in the guest's own timer, which KVM then keeps as
-	 * guest state: the guest gets no timer interrupt again.
+	 * The VM_TMR_FIQ_ENA_EL2 write traps on T8142 under SPTM, and on T8132
+	 * booted by a stage 1 that arms no CTXR execute window. A loader that
+	 * runs the OS at EL2 in a CTXR execute window starts no SPTM and says
+	 * so with this property, and there the register takes writes.
+	 * Masking through the EL02 controls instead sets IMASK in the guest's
+	 * own timer, which KVM then keeps as guest state: the guest gets no
+	 * timer interrupt again.
 	 */
 	if (irqc->info.vm_timer_fiq_readonly && is_kernel_in_hyp_mode() &&
 	    of_property_present(of_chosen, "aurora,ctxr-exec-window"))
@@ -1448,6 +1485,12 @@ static int __init aic_of_ic_init(struct device_node *node, struct device_node *p
 	cpuhp_setup_state(CPUHP_AP_IRQ_APPLE_AIC_STARTING,
 			  "irqchip/apple-aic/ipi:starting",
 			  aic_init_cpu, NULL);
+
+	if ((irqc->info.version == 2 || irqc->info.version == 3) &&
+	    is_kernel_in_hyp_mode() &&
+	    cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, "irqchip/apple-aic:siq-cfg",
+			      aic_irq_cpu_online, aic_irq_cpu_offline) < 0)
+		pr_warn("Cannot track the CPUs that accept IRQs\n");
 
 	aic_sleep_init(irqc);
 
