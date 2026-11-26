@@ -367,6 +367,7 @@ static const struct aic_info aic3_t8132_info __initconst = {
 	.irq_cfg = AIC3_IRQ_CFG,
 	.fast_ipi = true,
 	.local_fast_ipi = true,
+	.vm_timer_fiq_readonly = true,
 	.fw_suspend = true,
 };
 
@@ -670,8 +671,9 @@ static unsigned long aic_fiq_get_idx(struct irq_data *d)
 }
 
 /*
- * T8142 traps writes to VM_TMR_FIQ_ENA_EL2. Mask the guest timers through
- * their architectural EL02 controls instead, leaving the older SoCs alone.
+ * T8132 and T8142 trap writes to VM_TMR_FIQ_ENA_EL2 outside a CTXR execute
+ * window. Mask the guest timers through their architectural EL02 controls
+ * instead, leaving the older SoCs alone.
  */
 static void aic_vm_timer_mask(u64 timers, bool mask)
 {
@@ -1358,12 +1360,13 @@ static int __init aic_of_ic_init(struct device_node *node, struct device_node *p
 	irqc->info = *(struct aic_info *)match->data;
 
 	/*
-	 * The VM_TMR_FIQ_ENA_EL2 write that traps on T8142 was seen under
-	 * SPTM. A loader that runs the OS at EL2 in a CTXR execute window
-	 * starts no SPTM and says so with this property, and there the
-	 * register takes writes. Masking through the EL02 controls instead
-	 * sets IMASK in the guest's own timer, which KVM then keeps as
-	 * guest state: the guest gets no timer interrupt again.
+	 * The VM_TMR_FIQ_ENA_EL2 write traps on T8142 under SPTM, and on T8132
+	 * booted by a stage 1 that arms no CTXR execute window. A loader that
+	 * runs the OS at EL2 in a CTXR execute window starts no SPTM and says
+	 * so with this property, and there the register takes writes.
+	 * Masking through the EL02 controls instead sets IMASK in the guest's
+	 * own timer, which KVM then keeps as guest state: the guest gets no
+	 * timer interrupt again.
 	 */
 	if (irqc->info.vm_timer_fiq_readonly && is_kernel_in_hyp_mode() &&
 	    of_property_present(of_chosen, "aurora,ctxr-exec-window"))
