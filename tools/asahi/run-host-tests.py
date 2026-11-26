@@ -353,6 +353,9 @@ ASAHI_TESTS = {
     'g17-object-fence-tests.py': [([], PASS)]
         + mutations('--mutation', ('overrun-work-states', 'unseen-strict', 'retain-not-sticky',
                                    'node-unmarked', 'no-release'), []),
+    'g17-output-fence-tests.py': [([], PASS)]
+        + mutations('--mutation', ('unlocked-member-done', 'set-error-when-signalled',
+                                   'check-outside-lock'), []),
     'g17-owner-release-order-tests.py': [([], PASS)],
     'g17-pool-release-tests.py': [([], PASS)],
     # no-drain-release is the old rule: only a lease ends a slot's quarantine.

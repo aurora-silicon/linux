@@ -20,13 +20,17 @@ use kernel::{
 pub(crate) struct CompletionFence;
 
 unsafe extern "C" {
-    fn asahi_g17_signal_fence(fence: *mut bindings::dma_fence);
+    fn asahi_g17_finish_fence(fence: *mut bindings::dma_fence, error: i32, scoped: bool) -> bool;
 }
 
-fn signal_exported(fence: &dyn RawDmaFence) {
+/// Sets `error` (if non-zero) and signals `fence` in one step under the fence's lock, unless it
+/// has already signalled: its waiters saw that result, and `dma_fence_set_error()` must neither
+/// follow nor race a signal. A scoped output drains the queue scopes it completes. Returns
+/// whether this call signalled the fence.
+fn finish_exported(fence: &dyn RawDmaFence, error: i32, scoped: bool) -> bool {
     // SAFETY: The borrowed fence remains owned throughout synchronous signaling.
     // Ready completion scopes are drained iteratively after its lock is released.
-    unsafe { asahi_g17_signal_fence(fence.raw()) };
+    unsafe { asahi_g17_finish_fence(fence.raw(), error, scoped) }
 }
 
 #[vtable]
@@ -389,17 +393,13 @@ impl Submission {
         }
         if self.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
             let error = self.error.load(Ordering::Acquire);
-            if error != 0 {
-                fence.set_error(Error::from_errno(error));
-            } else {
+            if error == 0 {
                 self.release_state();
             }
             super::trace::output(fence, error);
-            if fence.scoped {
-                signal_exported(fence);
-            } else {
-                fence.signal();
-            }
+            // An early completion path may already have signalled the fence: its waiters keep
+            // the result they saw, even when this member was cancelled afterwards.
+            finish_exported(fence, error, fence.scoped);
             unwaited(&fence.waited);
             compute_unwaited(&fence.compute_waited);
         }

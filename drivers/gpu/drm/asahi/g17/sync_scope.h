@@ -4,6 +4,11 @@
 #include <linux/types.h>
 struct dma_fence;
 void asahi_g17_signal_fence(struct dma_fence *fence);
+/* Sets @error (if non-zero) and signals @fence under its lock unless it has
+ * already signalled; @scoped drains ready queue scopes as above. Returns
+ * whether this call signalled @fence.
+ */
+bool asahi_g17_finish_fence(struct dma_fence *fence, int error, bool scoped);
 /* Only for explicitly signalled driver completion fences, with no poll op. */
 int asahi_g17_completion_fence_status(struct dma_fence *fence);
 
