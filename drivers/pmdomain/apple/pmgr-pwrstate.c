@@ -642,8 +642,26 @@ static int apple_pmgr_ps_resume_noirq(struct device *dev)
 	u32 reg;
 	int ret;
 
-	if (!pm_resume_via_firmware() || ps->firmware_owned || ps->inherited_on ||
-	    ps->auto_managed || ps->sleep_driver_owned ||
+	if (!pm_resume_via_firmware() || ps->firmware_owned)
+		return 0;
+
+	/*
+	 * The wake resets each word's minimum state with the rest, and probe is the only
+	 * place that sets apple,min-state: put it back, whoever owns the domain now. With
+	 * AUTO_ENABLE on and a minimum of 0, the hardware power-gates a domain whose
+	 * coprocessor is only waiting in WFI, as a display coprocessor's CPU does.
+	 */
+	if (ps->min_state && ps->min_state <= APPLE_PMGR_PS_ACTIVE) {
+		spin_lock_irqsave(&ps->genpd.slock, flags);
+		if (!regmap_read(ps->regmap, ps->offset, &reg) &&
+		    FIELD_GET(APPLE_PMGR_PS_MIN, reg) != ps->min_state)
+			regmap_update_bits(ps->regmap, ps->offset,
+					   APPLE_PMGR_FLAGS | APPLE_PMGR_PS_MIN,
+					   FIELD_PREP(APPLE_PMGR_PS_MIN, ps->min_state));
+		spin_unlock_irqrestore(&ps->genpd.slock, flags);
+	}
+
+	if (ps->inherited_on || ps->auto_managed || ps->sleep_driver_owned ||
 	    apple_sleep_domain_is_down(dev->of_node))
 		return 0;
 

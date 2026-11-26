@@ -84,6 +84,9 @@ impl<T: Send + 'static> WorkItem for Item<T> {
 pub(crate) struct Deferred<T: Send + 'static>(Option<Pin<KBox<Item<T>>>>);
 
 impl<T: Send + 'static> Deferred<T> {
+    /// Heap bytes one deferred value takes: the value and its release work item.
+    pub(crate) const HEAP_BYTES: usize = core::mem::size_of::<Item<T>>();
+
     pub(crate) fn new(value: T) -> Result<Self> {
         let item = KBox::pin_init(
             pin_init!(Item {

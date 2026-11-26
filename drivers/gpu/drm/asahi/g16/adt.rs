@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! J713's explicit boot-loader GPU handoff.
+//! Explicit boot-loader GPU handoff.
 //!
-//! Unlike the synthesized T6030 node, J713 supplies six named no-map reservations and an
-//! explicit segment/handoff ABI. Admit those reservations before mapping anything. The
-//! performance-state source is the machine's original ADT, preserved by m1n1 in the named
-//! phram reservation. It is copied and parsed before any firmware-visible write.
+//! The boot loader supplies six named no-map reservations and an explicit
+//! segment/handoff ABI. Admission checks the reservations before mapping.
+//! The boot loader preserves the original ADT in the named phram reservation.
+//! The driver copies and parses it before any firmware-visible write.
 
 #[path = "adt/perf.rs"]
 pub(crate) mod perf;
@@ -13,7 +13,7 @@ pub(crate) mod perf;
 use core::ops::Range;
 use kernel::{bindings, c_str, device, of, prelude::*};
 
-use super::{boot::glue, hw};
+use super::{boot::glue, hw, Config};
 
 /// Independently owned reservations; none may intersect System RAM or another reservation.
 pub(crate) struct GpuAdt {
@@ -120,19 +120,47 @@ fn performance_source(regions: &[Range<u64>]) -> Result<(KVVec<u8>, u64)> {
     Ok((copy?, start))
 }
 
+/// Whether the boot loader selected this backend. Presence is enough to route probe;
+/// admission independently validates the property and the complete handoff.
+pub(super) fn has_handoff(dev: &device::Device, cfg: &Config) -> bool {
+    dev.of_node()
+        .is_some_and(|node| !matches!(node.get_opt_property::<u32>(cfg.handoff_property), Ok(None)))
+}
+
+/// Whether this backend owns `dev` under `cfg`: the handoff marker is present and, where `cfg`
+/// names `firmware_compat` values, the handoff also describes one of its layouts and
+/// `apple,firmware-compat` is one of those values. A compatible that another backend also
+/// serves (`needs_handoff_marker`) is probed only then.
+pub(crate) fn claims(dev: &device::Device, cfg: &Config) -> bool {
+    if !has_handoff(dev, cfg) {
+        return false;
+    }
+    if cfg.firmware_compat.is_empty() {
+        return true;
+    }
+    if layout(dev, cfg).is_none() {
+        return false;
+    }
+    let Some(node) = dev.of_node() else {
+        return false;
+    };
+    let compat: Result<KVec<u32>> = node.get_property(c_str!("apple,firmware-compat"));
+    compat.is_ok_and(|compat| cfg.firmware_compat.iter().any(|c| compat.as_slice() == c))
+}
+
 /// The boot loader's handoff for the loaded firmware: its version, segment VAs and flags.
-fn handoff(dev: &device::Device) -> Result<(u32, KVec<u64>, KVec<u32>)> {
+fn handoff(dev: &device::Device, cfg: &Config) -> Result<(u32, KVec<u64>, KVec<u32>)> {
     let node = dev.of_node().ok_or(EINVAL)?;
-    let version: u32 = node.get_property(c_str!("apple,g16-handoff-version"))?;
+    let version: u32 = node.get_property(cfg.handoff_property)?;
     let vas: KVec<u64> = node.get_property(c_str!("apple,firmware-segment-vas"))?;
     let flags: KVec<u32> = node.get_property(c_str!("apple,firmware-segment-flags"))?;
     Ok((version, vas, flags))
 }
 
 /// The firmware layout the boot loader's handoff describes, if it describes a known one.
-pub(crate) fn layout(dev: &device::Device) -> Option<&'static hw::FwLayout> {
-    let (version, vas, flags) = handoff(dev).ok()?;
-    hw::FW_LAYOUTS
+pub(crate) fn layout(dev: &device::Device, cfg: &Config) -> Option<&'static hw::FwLayout> {
+    let (version, vas, flags) = handoff(dev, cfg).ok()?;
+    cfg.layouts
         .iter()
         .copied()
         .find(|layout| layout.matches(version, &vas, &flags))
@@ -140,12 +168,13 @@ pub(crate) fn layout(dev: &device::Device) -> Option<&'static hw::FwLayout> {
 
 /// Validates the FDT contract and returns the reserved physical regions, read-only.
 #[inline(never)]
-pub(crate) fn read(dev: &device::Device) -> Result<KBox<GpuAdt>> {
+pub(crate) fn read(dev: &device::Device, cfg: &Config) -> Result<KBox<GpuAdt>> {
     let node = dev.of_node().ok_or(EINVAL)?;
-    let (version, vas, flags) = handoff(dev)?;
+    let (version, vas, flags) = handoff(dev, cfg)?;
     let names: KVec<u8> = node.get_property(c_str!("memory-region-names"))?;
     let phandles: KVec<u32> = node.get_property(c_str!("memory-region"))?;
-    let layout = hw::FW_LAYOUTS
+    let layout = cfg
+        .layouts
         .iter()
         .copied()
         .find(|layout| layout.matches(version, &vas, &flags));
@@ -158,11 +187,25 @@ pub(crate) fn read(dev: &device::Device) -> Result<KBox<GpuAdt>> {
         );
         return Err(EINVAL);
     };
-    if phandles.len() != 6
-        || names.as_slice() != b"ttbs\0pagetables\0handoff\0shared-l2\0fw-text\0fw-data\0"
-    {
+    const CANONICAL: &[u8] = b"ttbs\0pagetables\0handoff\0shared-l2\0fw-text\0fw-data\0";
+    // A boot loader that also serves the older M3 runtime names the shared L2 table a second
+    // time, first, as "pagetables-l2". Accept that entry only as an alias: it must reference
+    // the very reservation "shared-l2" references. Anything else (a second or unknown
+    // reservation) keeps the contract refused. The six canonical regions are then looked up
+    // and validated by name below, exactly as without the alias.
+    const L2_ALIAS: &[u8] = b"pagetables-l2\0";
+    let canonical = phandles.len() == 6 && names.as_slice() == CANONICAL;
+    let aliased = phandles.len() == 7
+        && names.as_slice().len() == L2_ALIAS.len() + CANONICAL.len()
+        && names.as_slice().starts_with(L2_ALIAS)
+        && &names.as_slice()[L2_ALIAS.len()..] == CANONICAL
+        && phandles[0] == phandles[4];
+    if !canonical && !aliased {
         dev_err!(dev, "G16: unsupported boot-loader handoff contract\n");
         return Err(EINVAL);
+    }
+    if aliased {
+        dev_info!(dev, "G16: pagetables-l2 is an alias of shared-l2 (same reservation)\n");
     }
     let names = [
         c_str!("ttbs"),
@@ -207,7 +250,7 @@ pub(crate) fn read(dev: &device::Device) -> Result<KBox<GpuAdt>> {
         regions[index] = start..end;
     }
     let (copy, source_pa) = performance_source(&regions)?;
-    let performance = perf::parse(&copy).map_err(|error| {
+    let performance = perf::parse(&copy, cfg.adt_compatible).map_err(|error| {
         dev_err!(
             dev,
             "M4 original ADT performance data rejected: {:?}\n",
