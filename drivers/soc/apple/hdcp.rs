@@ -963,6 +963,22 @@ impl Transport for Mailbox<'_> {
             }
             other => other,
         };
+        // LAB DIAGNOSTIC (HDCP-DRIVER rows, not for the PR): the reply word
+        // carries only status and length.
+        if !matches!(
+            final_outcome,
+            Outcome::Done(_) | Outcome::NotStored | Outcome::ChannelCount(_)
+        ) {
+            dev_info_ratelimited!(
+                sep.dev,
+                "hdcp: command {:#04x} channel {}: {:?} (reply word {:#018x}, expected {} out)\n",
+                spec_of(command).id,
+                slot,
+                final_outcome,
+                reply.msg0,
+                out.len()
+            );
+        }
         sep.hdcp_scrub_buffers(input.len(), out.len());
         Ok(final_outcome)
     }
