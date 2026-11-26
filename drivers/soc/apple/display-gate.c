@@ -1944,16 +1944,30 @@ static int __init gate_t8122_dcpext_alias(struct of_changeset *cs,
 	return ret;
 }
 
+/*
+ * Does @np's display DART go into the display subsystem's domain? 1 or 0,
+ * or -ENODEV on a board that forbids it and has no @fbdma child to mirror
+ * framebuffers through: the dcpext then has no way to scan them out.
+ */
+static int __init gate_t8122_dcpext_shares_dart(struct device_node *np,
+						struct device_node *fbdma)
+{
+	if (!of_property_read_bool(np, "apple,no-shared-display-dart"))
+		return 1;
+	return fbdma ? 0 : -ENODEV;
+}
+
 static void __init gate_t8122_dcpext_one(struct device_node *np)
 {
 	struct device_node *dart = NULL, *mbox = NULL, *piodma = NULL;
 	struct device_node *disp_dart = NULL, *ps = NULL, *entry = NULL, *link;
+	struct device_node *fbdma = NULL;
 	struct device_node *xbar[GATE_T8122_XBARS] = {};
 	struct device_node *common[GATE_T8122_XBARS] = {};
 	struct of_phandle_args args;
 	struct of_changeset *cs;
 	const char *label;
-	int ret, i, nxbar = 0;
+	int share_dart, ret, i, nxbar = 0;
 	u32 ready;
 
 	if (!gate_disabled(np)) {
@@ -1961,7 +1975,7 @@ static void __init gate_t8122_dcpext_one(struct device_node *np)
 		return;
 	}
 	if (of_property_read_u32(np, "apple,t8122-dcpext-firmware-ready", &ready) ||
-	    ready != 1) {
+	    (ready != 1 && ready != 2)) {
 		gate_ext_refuse(np, "the boot loader did not reserve its firmware");
 		return;
 	}
@@ -1971,6 +1985,13 @@ static void __init gate_t8122_dcpext_one(struct device_node *np)
 	}
 	if (!of_property_present(np, "memory-region")) {
 		gate_ext_refuse(np, "it has no firmware memory");
+		goto put;
+	}
+	fbdma = of_get_available_child_by_name(np, "fbdma");
+	share_dart = gate_t8122_dcpext_shares_dart(np, fbdma);
+	if (share_dart < 0) {
+		gate_ext_refuse(np,
+				"apple,no-shared-display-dart without an fbdma child to mirror framebuffers through");
 		goto put;
 	}
 	dart = gate_target(np, "iommus", "#iommu-cells", 1, 5, "apple,t8110-dart");
@@ -2068,8 +2089,18 @@ static void __init gate_t8122_dcpext_one(struct device_node *np)
 		ret = of_changeset_update_prop_string(cs, np, "status", "okay");
 	if (!ret)
 		ret = gate_ext_routes(cs, np, "okay");
-	if (!ret)
+	if (!ret && share_dart) {
 		ret = gate_display_add_dart(cs, disp_dart);
+		/* The shared domain maps what fbdma would, at the same addresses. */
+		if (!ret && fbdma) {
+			ret = of_changeset_update_prop_string(cs, fbdma, "status", "disabled");
+			gate_warn("%pOF: display DART %pOF shared with the display subsystem; %pOF disabled\n",
+				  np, disp_dart, fbdma);
+		}
+	} else if (!ret) {
+		gate_info("%pOF: display DART %pOF kept out of the display subsystem; framebuffers are mirrored\n",
+			  np, disp_dart);
+	}
 	if (!ret)
 		ret = of_changeset_apply(cs);
 	if (ret) {
@@ -2079,13 +2110,14 @@ static void __init gate_t8122_dcpext_one(struct device_node *np)
 		goto put;
 	}
 	gate_t8122_dcpext_cs = cs;
-	gate_info("enabled %pOF with its Type-C routes, DARTs, mailbox, %d display crossbar(s) with ATC common power kept on, display DART %pOF in the display subsystem, CPU power floor and PMP DISPEXT request; started by the display driver\n",
-		  np, nxbar, disp_dart);
+	gate_info("enabled %pOF with its Type-C routes, DARTs, mailbox, %d display crossbar(s) with ATC common power kept on, display DART %pOF %s the display subsystem, CPU power floor and PMP DISPEXT request; started by the display driver\n",
+		  np, nxbar, disp_dart, share_dart ? "in" : "kept out of");
 put:
 	for (i = 0; i < GATE_T8122_XBARS; i++) {
 		of_node_put(common[i]);
 		of_node_put(xbar[i]);
 	}
+	of_node_put(fbdma);
 	of_node_put(entry);
 	of_node_put(ps);
 	of_node_put(disp_dart);

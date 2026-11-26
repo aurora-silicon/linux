@@ -281,22 +281,27 @@ static const struct apple_epic_service_ops singleton_audio_ops = {
 /*
  * The firmware announces its AV video and audio interfaces again on fresh
  * channels on every display attach and never closes the old ones. Announce
- * them as the endpoint's receive path does: supersede, then take the first
- * reclaimable slot. The superseded audio instance stays pinned by its owner
- * until the successor's init drops it.
+ * them as the endpoint's receive path does: take the first reclaimable
+ * slot, then supersede the previous instance. The superseded audio
+ * instance stays pinned by its owner until the successor's init drops it.
  */
 static struct apple_epic_service *
 afk_test_announce(struct apple_epic_service *slots, unsigned int nr,
 		  const struct apple_epic_service_ops *ops, u32 channel)
 {
+	struct apple_epic_service *admitted = NULL;
 	unsigned int i;
 
-	for (i = 0; i < nr; i++)
-		afk_service_supersede(&slots[i], ops, channel);
-	for (i = 0; i < nr; i++)
+	/* As afk_recv_handle_init(): admit first, then retire what it replaces. */
+	for (i = 0; i < nr && !admitted; i++)
 		if (afk_service_reinit(&slots[i], NULL, ops, channel))
-			return &slots[i];
-	return NULL;
+			admitted = &slots[i];
+	if (!admitted)
+		return NULL;
+	for (i = 0; i < nr; i++)
+		if (&slots[i] != admitted)
+			afk_service_supersede(&slots[i], ops, channel);
+	return admitted;
 }
 
 static void afk_service_singleton_reannounce_test(struct kunit *test)

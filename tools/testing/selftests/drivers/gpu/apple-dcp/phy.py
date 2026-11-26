@@ -236,6 +236,7 @@ typedef uint16_t u16;
 #define dev_info(...) ((void)0)
 #endif
 #define dev_warn(...) ((void)0)
+#define dev_info(...) ((void)0)
 static void report(void *dev, const char *fmt, ...) { (void)dev; (void)fmt; }
 #define dev_err report
 #define lockdep_assert_held(...) ((void)0)
@@ -2070,6 +2071,7 @@ typedef uint16_t u16;
 #define dev_info(...) ((void)0)
 #endif
 #define dev_warn(...) ((void)0)
+#define dev_info(...) ((void)0)
 #define dev_err(...) ((void)0)
 #define lockdep_assert_held(...) ((void)0)
 #define WARN_ON_ONCE(v) assert(!(v))
@@ -2499,6 +2501,7 @@ typedef uint16_t u16;
 #define dev_info(...) ((void)0)
 #endif
 #define dev_warn(...) ((void)0)
+#define dev_info(...) ((void)0)
 static void report(void *dev, const char *fmt, ...) { (void)dev; (void)fmt; }
 #define dev_err report
 #define lockdep_assert_held(...) ((void)0)

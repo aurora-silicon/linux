@@ -392,7 +392,8 @@ static int hwx_program(struct hwx_parser *p)
 	if (!memcmp(c, expected, length)) {
 		ret = ane_hx_task_stream_validate_hdr(p->bytes + info->text.offset,
 						      info->text.size, info->tasks, prologue,
-						      t->header_words, &record_limit, &final_end);
+						      info->task_header_words, &record_limit,
+						      &final_end);
 		/* This compiler hint need not equal the encoded record count. */
 		if (!ret && (!records || records > record_limit))
 			ret = -ENOEXEC;
@@ -599,31 +600,23 @@ static int hwx_symbols(struct hwx_parser *p)
 static bool hwx_relocations_in_payload(const struct hwx_parser *p, unsigned long *sites)
 {
 	const u8 *text = p->bytes + p->info.text.offset;
-	size_t pos = 16;
+	struct ane_hx_task t;
+	size_t pos = 16, record;
+	u32 count;
+	int ret;
 
 	while (pos < p->info.text.size) {
-		u32 words = (get_unaligned_le32(text + pos) >> 16) & 0x7ff;
-		size_t end, record;
-
-		if (!words) {
-			pos += 16;
+		ret = ane_hx_task_frame(text, p->info.text.size, pos,
+					p->info.task_header_words, &t);
+		if (ret < 0)
+			return false;
+		pos = t.next;
+		if (!ret)
 			continue;
+		for (record = t.rec; record < t.end; record += 4 + count * 4) {
+			count = ane_hx_record_count(get_unaligned_le32(text + record));
+			bitmap_clear(sites, record / 4 + 1, count);
 		}
-		end = pos + words * 4;
-		record = pos + p->target->header_words * 4;
-		if ((get_unaligned_le32(text + pos + (p->target->header_words - 1) * 4) & 3) == 3)
-			record += 4;
-		while (record < end) {
-			u32 header = get_unaligned_le32(text + record);
-			u32 count = header & BIT(31) ?
-				1 + hweight32((header >> 15) & 0xffff) :
-				1 + ((header >> 15) & 0x3f);
-
-			record += 4;
-			bitmap_clear(sites, record / 4, count);
-			record += count * 4;
-		}
-		pos = ALIGN(end, 16);
 	}
 	return bitmap_empty(sites, p->info.text.size / 4);
 }
@@ -659,6 +652,7 @@ int ane_h16_hwx_validate(const void *bytes, size_t size, struct ane_h16_hwx *inf
 	p->size = size;
 	p->command_end = 32 + (size_t)length;
 	p->info.subtype = target->subtype;
+	p->info.task_header_words = target->header_words;
 	for (i = 0; i < count; i++) {
 		u32 cmd, len;
 
