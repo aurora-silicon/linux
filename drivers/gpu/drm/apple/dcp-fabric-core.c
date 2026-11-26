@@ -156,10 +156,13 @@ bool dcp_fabric_keep_order(bool dual_stream, bool ready, bool frozen)
 }
 EXPORT_SYMBOL_GPL(dcp_fabric_keep_order);
 
-/* T6030 native pipelines retain their route; the encoder follows that owner. */
-bool dcp_fabric_ordered_dual_stream(bool wired, bool t6030)
+/*
+ * Pinned (T6030, T6050) native pipelines retain their route; the encoder
+ * follows that owner.
+ */
+bool dcp_fabric_ordered_dual_stream(bool wired, bool pinned)
 {
-	return wired && !t6030;
+	return wired && !pinned;
 }
 EXPORT_SYMBOL_GPL(dcp_fabric_ordered_dual_stream);
 

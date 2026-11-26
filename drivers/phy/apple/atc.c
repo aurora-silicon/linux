@@ -773,6 +773,9 @@ struct apple_atcphy;
  *                  can also drop while the system runs, see atcphy_rpm_get().
  *                  Only for PHYs without DisplayPort, whose phy ops and tunnel
  *                  calls take no runtime PM reference
+ * @t8122_tunnel_clock: The DP IN outputs are clocked from the PHY's AUSPLL
+ *                      tunnel clock, see apple_atc_tunnel_t8122_clock(): the
+ *                      T6030 and T8132 PHYs
  */
 struct atcphy_hw {
 	void (*configure_post_tunable)(struct apple_atcphy *, enum atcphy_mode);
@@ -800,6 +803,7 @@ struct atcphy_hw {
 	bool pipe_lock_unacked;
 	bool restore_after_pd_off;
 	bool idle_power_off;
+	bool t8122_tunnel_clock;
 };
 
 enum atcphy_t8132_bank {
@@ -3875,15 +3879,17 @@ static int atc_tunnel_set_t602x(struct apple_atcphy *atcphy, unsigned int dpin,
 }
 
 /*
- * T6030 (M3 Pro) uses T8122-generation PHYs for both DP IN clock outputs.
- * The T8132 (M4) PHY has the same tunnel clock: AUSPLL descriptor, APB
- * handshake, lock bit and TX_DP_CTRL0 selects are at the same offsets.
+ * The T6030 (M3 Pro) PHY (apple,t6030-atcphy, a T8122-generation PHY) clocks
+ * both DP IN outputs from its own AUSPLL tunnel clock. The T8132 (M4) PHY has
+ * the same tunnel clock: AUSPLL descriptor, APB handshake, lock bit and
+ * TX_DP_CTRL0 selects are at the same offsets. The match data of the PHY's
+ * compatible says which it is. The T8122 and T6031 PHYs share the T6030 one's
+ * generation but have their own compatibles and keep the T8103/T602X tunnel
+ * clock sequence.
  */
 static bool apple_atc_tunnel_t8122_clock(struct apple_atcphy *atcphy)
 {
-	return (of_machine_is_compatible("apple,t6030") &&
-		atcphy->hw->gen == ATCPHY_GENERATION_T8122) ||
-	       atcphy->hw->gen == ATCPHY_GENERATION_T8132;
+	return atcphy->hw->t8122_tunnel_clock;
 }
 
 /* Which pixel clock (0: PCLK1, 1: PCLK2) source @source uses for DP IN @dpin. */
@@ -4506,9 +4512,12 @@ static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 	}
 	/* Keep failed transitions retryable even when the requested mode is unchanged. */
 	atcphy->mode_dirty = true;
-	/* the mode change below may power the PHY down: stop the tunnel clock first */
-	if (of_machine_is_compatible("apple,t6030") &&
-	    atcphy->hw->gen == ATCPHY_GENERATION_T8122) {
+	/*
+	 * The mode change below may power the PHY down: stop the tunnel clock
+	 * first, by the sequence that started it. A T8132 PHY never gets here
+	 * (atcphy_configure_t8132()).
+	 */
+	if (atcphy->hw->t8122_tunnel_clock) {
 		ret = atc_t8122_tunnel_stop(atcphy);
 		if (ret)
 			return ret;
@@ -8668,6 +8677,22 @@ static const struct atcphy_hw atcphy_hw_t8122 = {
 	.restore_after_pd_off = true,
 };
 
+/* The T6030 PHY: the T8122 PHY, with the DP IN clocks on its tunnel clock. */
+static const struct atcphy_hw atcphy_hw_t6030 = {
+	.gen = ATCPHY_GENERATION_T8122,
+	.aciophy_lane_mode = ACIOPHY_LANE_MODE_T8122,
+	.aciophy_crossbar = ACIOPHY_CROSSBAR_T8122,
+	.configure_post_tunable = atcphy_configure_post_tunable_t8122,
+	.pipe_mux_clk = PIPEHANDLER_MUX_CTRL_CLK_T8103,
+	.pipe_mux_data = PIPEHANDLER_MUX_CTRL_DATA_T8103,
+	.has_usb4 = true,
+	.dp_t8122 = true,
+	.park_pipe_unlocked = true,
+	.park_dummy_phy = true,
+	.restore_after_pd_off = true,
+	.t8122_tunnel_clock = true,
+};
+
 static const struct atcphy_hw atcphy_hw_t8132 = {
 	.gen = ATCPHY_GENERATION_T8132,
 	.usb2_only = true,
@@ -8676,6 +8701,7 @@ static const struct atcphy_hw atcphy_hw_t8132 = {
 	.pipe_mux_data = PIPEHANDLER_MUX_CTRL_DATA_T8103,
 	.restore_after_pd_off = true,
 	.idle_power_off = true,
+	.t8122_tunnel_clock = true,
 };
 
 static const struct atcphy_hw atcphy_hw_t8140 = {
@@ -8748,6 +8774,7 @@ static const struct atcphy_hw atcphy_hw_t8152 = {
 
 static const struct of_device_id atcphy_match[] = {
 	{ .compatible = "apple,t8103-atcphy", .data = &atcphy_hw_t8103 },
+	{ .compatible = "apple,t6030-atcphy", .data = &atcphy_hw_t6030 },
 	{ .compatible = "apple,t8122-atcphy", .data = &atcphy_hw_t8122 },
 	{ .compatible = "apple,t8132-atcphy", .data = &atcphy_hw_t8132 },
 	{ .compatible = "apple,t8142-atcphy", .data = &atcphy_hw_t8142 },
