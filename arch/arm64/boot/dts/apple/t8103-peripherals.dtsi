@@ -632,7 +632,7 @@
 		interrupts = <AIC_IRQ 557 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_venc_sys>;
 		#iommu-cells = <1>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	ave_dart0: iommu@267040000 {
@@ -642,7 +642,7 @@
 		interrupts = <AIC_IRQ 557 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_venc_sys>;
 		#iommu-cells = <1>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	ave: video-codec@267100000 {
@@ -663,7 +663,7 @@
 		iommus = <&ave_dart0 0>, <&ave_dart1 0>;
 		reg-names = "codec", "mailbox", "coproc", "pmgr", "pio";
 		power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1";
-		status = "disabled";
+		status = "okay";
 	};
 
 	atc0_dpin0: displayport@381e50000 {
