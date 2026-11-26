@@ -174,6 +174,49 @@ class DartPdTest(unittest.TestCase):
         self.assertIn("t8112-j413 /soc/iommu@5000 dart_x apple,t8110-dart disabled: "
                       "power domain /soc/power-controller@3000 is disabled (new)", result.stdout)
 
+    ROUTER = ('acio@5000 { compatible = "apple,t8103-usb4-acio"; %s '
+              '#address-cells = <1>; #size-cells = <0>; '
+              'dart_x: iommu@a00 { compatible = "apple,t8110-dart"; #iommu-cells = <1>; }; '
+              'nhi@b00 { iommus = <&dart_x 0>; }; };')
+
+    def test_dart_inside_a_powered_device_is_exempt(self):
+        # A USB4 router's DART: its driver populates it after powering its domains.
+        router = self.ROUTER % "power-domains = <&ps_x>;"
+        self.dtb(self.head, "t8112-j413", dts("j413", "t8112", DOMAIN, GAP, router))
+        result = self.check()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("new: 0", result.stderr)
+        report = self.check("--report")
+        self.assertIn("/soc/acio@5000/iommu@a00 dart_x apple,t8110-dart okay: "
+                      "exempt (inside /soc/acio@5000)", report.stdout)
+
+    def test_dart_inside_a_device_without_domains_fails(self):
+        router = self.ROUTER % ""
+        self.dtb(self.head, "t8112-j413", dts("j413", "t8112", DOMAIN, GAP, router))
+        result = self.check()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("/soc/acio@5000/iommu@a00 dart_x apple,t8110-dart okay: "
+                      "no power-domains (new)", result.stdout)
+
+    def test_dart_inside_a_device_on_a_disabled_domain_fails(self):
+        disabled = DOMAIN.replace("{", '{ status = "disabled";')
+        router = self.ROUTER % "power-domains = <&ps_x>;"
+        self.dtb(self.head, "t8112-j413", dts("j413", "t8112", disabled, GAP, router))
+        result = self.check()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("/soc/acio@5000/iommu@a00 dart_x apple,t8110-dart okay: "
+                      "parent's power domain /soc/power-controller@3000 is disabled (new)",
+                      result.stdout)
+
+    def test_dart_inside_a_powered_bus_is_not_exempt(self):
+        # A simple-bus is populated by platform code, not by a driver.
+        bus = self.ROUTER.replace('"apple,t8103-usb4-acio"', '"simple-bus"') % \
+            "power-domains = <&ps_x>;"
+        self.dtb(self.head, "t8112-j413", dts("j413", "t8112", DOMAIN, GAP, bus))
+        result = self.check()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("no power-domains (new)", result.stdout)
+
     def test_without_baseline_every_gap_fails(self):
         result = subprocess.run([sys.executable, str(CHECKER), "--dtb-dir", str(self.head)],
                                 text=True, capture_output=True)

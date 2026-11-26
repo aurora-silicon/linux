@@ -35,7 +35,8 @@
 /*
  * The panel's potential headroom, the ADT backlight node's
  * EDRPotentialHeadroom (16.16), as a ceiling x1000.  macOS never gives the
- * panel more.  0: no ceiling, for a value that is missing or not above 1.0.
+ * panel more.  0: the panel has no EDR headroom (a value missing or not
+ * above 1.0), so it gets no peak and the EDR path never runs for it.
  */
 static inline u32 dcp_edr_ceiling(u32 fixed)
 {

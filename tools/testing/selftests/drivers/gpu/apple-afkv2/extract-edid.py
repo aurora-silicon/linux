@@ -27,6 +27,8 @@ prefix = r'''
 #include "epic/dpavserv-edid.h"
 #define GFP_KERNEL 0
 #define kzalloc(n,f) calloc(1,n)
+#define kvzalloc(n,f) calloc(1,n)
+#define kvfree(p) free(p)
 #define cpu_to_le64(x) (x)
 #define le64_to_cpu(x) (x)
 #define READ_ONCE(x) (x)

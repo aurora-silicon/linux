@@ -656,6 +656,7 @@ static const struct sio_hw_data sio_hw_t6030 = {
  * the 5 of the host's mailbox call timeout is not part of the record.
  */
 static const struct sio_hw_data sio_hw_t6041 = {
+	.stop_at_commit = true,
 	.protocol = 10,
 	.fifo_threshold = 0x600,
 	.cfg_word4 = 0x800,
@@ -699,18 +700,24 @@ static const struct sio_hw_data sio_hw_t6050 = {
 };
 
 /*
- * The T6050 description is in force on the board it has run on. On another T6050 board the
- * node is taken as before: by its generic compatible.
+ * The T6050 description, with its stop at the sleep's commit, is in force on the boards
+ * that describe the sleep. On another T6050 board the node is taken as before: by its
+ * generic compatible.
  */
 static bool sio_t6050_board(void)
 {
-	return of_machine_is_compatible("apple,j714s");
+	return apple_t6050_sleep_described();
 }
 
 static const struct of_device_id sio_of_match[] = {
 	{ .compatible = "apple,t6050-sio", .data = &sio_hw_t6050 },
 	{ .compatible = "apple,t6041-sio", .data = &sio_hw_t6041 },
 	{ .compatible = "apple,t8140-sio", .data = &sio_hw_t8140 },
+	/*
+	 * T8132 (M4): the J773g ADT describes the SIO tables as T8140's and
+	 * its DisplayPort audio channels alike ([2, 0, 0x800, 0x800, 0x800, 0]).
+	 */
+	{ .compatible = "apple,t8132-sio", .data = &sio_hw_t8140 },
 	{ .compatible = "apple,t6030-sio", .data = &sio_hw_t6030 },
 	{ .compatible = "apple,sio", .data = &sio_hw_generic },
 	{ }
@@ -1537,6 +1544,16 @@ static void sio_process_report(struct sio_chan *siochan)
 	spin_unlock_irqrestore(&siochan->vc.lock, flags);
 }
 
+/*
+ * A tag the firmware names in an ACK or NACK must be one the host handed out
+ * and has not freed: tag 0 is never allocated, and the field is wider than
+ * the table.
+ */
+static bool sio_tag_outstanding(struct sio_data *sio, u8 tag)
+{
+	return tag && tag < SIO_NTAGS && test_bit(tag, sio->tags.allocated);
+}
+
 static void sio_recv_msg(void *cookie, u8 ep, u64 msg)
 {
 	struct sio_data *sio = cookie;
@@ -1561,13 +1578,21 @@ static void sio_recv_msg(void *cookie, u8 ep, u64 msg)
 		fallthrough;
 	case MSG_ACK:
 	case MSG_NACK:
-		if (WARN_ON(tag >= SIO_NTAGS))
+		if (!sio_tag_outstanding(sio, tag)) {
+			dev_warn_ratelimited(sio->dev,
+					     "ack for tag %u, which is not outstanding\n",
+					     tag);
 			break;
+		}
 
 		if (tags->atomic[tag]) {
 			sio_ack_callback callback = tags->ack_callback[tag];
 
-			if (callback && !WARN_ON(sioep >= sio->nchannels))
+			if (callback && sioep >= sio->nchannels)
+				dev_warn_ratelimited(sio->dev,
+						     "ack for channel %u of %d\n",
+						     sioep, sio->nchannels);
+			else if (callback)
 				callback(&sio->channels[sioep],
 					 tags->cookie[tag], type == MSG_ACK);
 			if (type == MSG_NACK)
@@ -1580,8 +1605,12 @@ static void sio_recv_msg(void *cookie, u8 ep, u64 msg)
 		break;
 
 	case MSG_REPORT:
-		if (WARN_ON(sioep >= sio->nchannels))
+		if (sioep >= sio->nchannels) {
+			dev_warn_ratelimited(sio->dev,
+					     "report for channel %u of %d\n",
+					     sioep, sio->nchannels);
 			break;
+		}
 
 		sio_process_report(&sio->channels[sioep]);
 		break;
@@ -2085,7 +2114,7 @@ static int sio_probe(struct platform_device *pdev)
 		dev_err(&pdev->dev, "couldn't initialize rtkit\n");
 		goto rpm_put;
 	}
-	for (i = 1; i < SIO_NTAGS; i++)
+	for (i = 0; i < SIO_NTAGS; i++)
 		init_completion(&sio->tags.completions[i]);
 
 	dma = &sio->dma;
@@ -2392,4 +2421,5 @@ MODULE_LICENSE("Dual MIT/GPL");
 #if IS_ENABLED(CONFIG_APPLE_SIO_KUNIT_TEST)
 #include "apple-sio-probe-test.c"
 #include "apple-sio-boot-test.c"
+#include "apple-sio-msg-test.c"
 #endif

@@ -53,8 +53,10 @@ pub(crate) struct RenderDependencies {
     pub(crate) render_tiling_count: usize,
     pub(crate) tiling: [KickDependency; 2],
     pub(crate) tiling_count: usize,
-    pub(crate) compute: Option<KickDependency>,
-    pub(crate) fragment_compute: Option<KickDependency>,
+    pub(crate) compute: [KickDependency; crate::g17::pairs::COMPUTE_CHANNELS_MAX],
+    pub(crate) compute_count: usize,
+    pub(crate) fragment_compute: [KickDependency; crate::g17::pairs::COMPUTE_CHANNELS_MAX],
+    pub(crate) fragment_compute_count: usize,
     /// Fragment kicks of other pairs' overlapping same-VM renders.
     pub(crate) hazards: [KickDependency; crate::g17::hazard::PUBLICATION_BARRIERS],
     pub(crate) hazard_count: usize,
@@ -68,8 +70,10 @@ impl RenderDependencies {
         render_tiling_count: 0,
         tiling: [KickDependency::ZERO; 2],
         tiling_count: 0,
-        compute: None,
-        fragment_compute: None,
+        compute: [KickDependency::ZERO; crate::g17::pairs::COMPUTE_CHANNELS_MAX],
+        compute_count: 0,
+        fragment_compute: [KickDependency::ZERO; crate::g17::pairs::COMPUTE_CHANNELS_MAX],
+        fragment_compute_count: 0,
         hazards: [KickDependency::ZERO; crate::g17::hazard::PUBLICATION_BARRIERS],
         hazard_count: 0,
     };
@@ -347,7 +351,8 @@ impl Pair {
         if word == u32::MAX {
             return Err(EINVAL);
         }
-        let layout = m5_render_submission::layout(&first.command, clusters, variant.programs)?;
+        let layout =
+            m5_render_submission::layout(&first.command, clusters, variant.programs, board)?;
         let storage = KBox::<Self>::new_uninit(GFP_KERNEL)?;
         let (tiling, ta_alias) = kick::Queue::render(alloc, ids[0], context.vm(), rings)?;
         let (fragment, fragment_alias) = kick::Queue::render(alloc, ids[1], context.vm(), rings)?;
@@ -539,7 +544,8 @@ impl Pair {
         let node = work.node_va()?;
         let word = work.word();
         let layout =
-            m5_render_submission::layout(&packet.command, self.clusters, self.variant.programs)?;
+            m5_render_submission::layout(&packet.command, self.clusters, self.variant.programs,
+                self.board)?;
         let deflake_layout = self.deflake;
         let owners = self.memory.owners();
         self.memory
@@ -671,12 +677,14 @@ impl Pair {
 /// 1 the tiling encoder, 2 a full channel or compute completion, 3 the
 /// fragment encoder; the last class is the implicit parent's.
 struct RenderBarriers {
-    tiling: [KickDependency; 5],
+    tiling: [KickDependency; 4 + crate::g17::pairs::COMPUTE_CHANNELS_MAX],
     tiling_count: usize,
-    fragment: [KickDependency; 4 + crate::g17::hazard::PUBLICATION_BARRIERS],
+    fragment: [KickDependency;
+        3 + crate::g17::pairs::COMPUTE_CHANNELS_MAX + crate::g17::hazard::PUBLICATION_BARRIERS],
     fragment_count: usize,
-    tiling_types: [u8; 6],
-    fragment_types: [u8; 5 + crate::g17::hazard::PUBLICATION_BARRIERS],
+    tiling_types: [u8; 5 + crate::g17::pairs::COMPUTE_CHANNELS_MAX],
+    fragment_types: [u8;
+        4 + crate::g17::pairs::COMPUTE_CHANNELS_MAX + crate::g17::hazard::PUBLICATION_BARRIERS],
 }
 
 /// The last fragment kick published on any pair, and the last one of a render with an API task
@@ -743,12 +751,14 @@ fn render_barriers(
     compute_class: u8,
 ) -> RenderBarriers {
     let fragment_stage = fragment_stage || stage_prefixes;
-    let mut tiling_barriers = [KickDependency::ZERO; 5];
+    let mut tiling_barriers = [KickDependency::ZERO; 4 + crate::g17::pairs::COMPUTE_CHANNELS_MAX];
     let mut tiling_count = 0;
-    let mut fragment_barriers = [own_tiling; 4 + crate::g17::hazard::PUBLICATION_BARRIERS];
+    let mut fragment_barriers = [own_tiling;
+        3 + crate::g17::pairs::COMPUTE_CHANNELS_MAX + crate::g17::hazard::PUBLICATION_BARRIERS];
     let mut fragment_count = 1;
-    let mut tiling_types = [1; 6];
-    let mut fragment_types = [3; 5 + crate::g17::hazard::PUBLICATION_BARRIERS];
+    let mut tiling_types = [1; 5 + crate::g17::pairs::COMPUTE_CHANNELS_MAX];
+    let mut fragment_types =
+        [3; 4 + crate::g17::pairs::COMPUTE_CHANNELS_MAX + crate::g17::hazard::PUBLICATION_BARRIERS];
     fragment_types[0] = 1;
     for dependency in &dependencies.render_tiling[..dependencies.render_tiling_count] {
         tiling_barriers[tiling_count] = *dependency;
@@ -778,13 +788,13 @@ fn render_barriers(
             }
         }
     }
-    if let Some(compute) = dependencies.compute {
-        tiling_barriers[tiling_count] = compute;
+    for compute in &dependencies.compute[..dependencies.compute_count] {
+        tiling_barriers[tiling_count] = *compute;
         tiling_types[tiling_count] = compute_class;
         tiling_count += 1;
     }
-    if let Some(compute) = dependencies.fragment_compute {
-        fragment_barriers[fragment_count] = compute;
+    for compute in &dependencies.fragment_compute[..dependencies.fragment_compute_count] {
+        fragment_barriers[fragment_count] = *compute;
         fragment_types[fragment_count] = compute_class;
         fragment_count += 1;
     }
@@ -1831,7 +1841,8 @@ impl Pair {
     /// keeps its current capacity and lets firmware request growth as needed.
     pub(crate) fn host_growth_target(&mut self, packet: &Packet) -> Result<Option<HostGrowth>> {
         let mut required =
-            m5_render_submission::layout(&packet.command, self.clusters, self.variant.programs)?
+            m5_render_submission::layout(&packet.command, self.clusters, self.variant.programs,
+                self.board)?
                 .tvb_blocks;
         // A mesh workgroup whose output is in flight when the tiler heap runs out loses part of
         // it, whether the firmware then grows the heap or partial-renders, and the tile-count
@@ -2005,6 +2016,12 @@ impl Pair {
     pub(crate) fn visit_owners(&self, visit: &mut dyn FnMut(&Arc<VmStatus>)) {
         for active in self.active.iter() {
             visit(active.packet.completion.status());
+        }
+    }
+    /// The context ID (UAT slot) of every in-flight packet.
+    pub(crate) fn visit_contexts(&self, visit: &mut dyn FnMut(u32)) {
+        for active in self.active.iter() {
+            visit(active.packet.context.id());
         }
     }
     pub(crate) fn classify(&self, classify: &dyn Fn(&Arc<VmStatus>) -> recovery::Class) {
@@ -3084,6 +3101,9 @@ impl Pair {
             }
         }
     }
+    pub(crate) fn graph_started(&self) -> bool {
+        self.graph_started
+    }
     pub(crate) fn forget_registration(&mut self) {
         self.registered = None;
     }
@@ -3197,16 +3217,20 @@ impl Pair {
             .into_iter()
             .all(|c| c.done == c.read && c.read == c.write))
     }
-    pub(crate) fn reusable(&self) -> Result<bool> {
+    /// Idle, drained, and free of pending retirement or channel errors so a
+    /// live owner's sibling can be detached or a closed owner's pair reused.
+    pub(crate) fn detachable(&self) -> Result<bool> {
         let previous_ready = self
             .previous
             .as_ref()
             .is_none_or(|p| p.memory.is_none() && self.context_update && !p.ready);
         Ok(!self.channel_error
-            && self.owner.is_none()
             && self.displaced.is_none()
             && previous_ready
             && self.idle_for_context(self.context())?)
+    }
+    pub(crate) fn reusable(&self) -> Result<bool> {
+        Ok(self.owner.is_none() && self.detachable()?)
     }
     /// An M5 pool may be replaced without changing the pair's live logical
     /// owner. Commands already using the pair must drain, and an earlier
@@ -3281,7 +3305,8 @@ impl Pair {
             let buffer_id = buffer_id.ok_or(EINVAL)?;
             let pm_generation = pm_generation.ok_or(EINVAL)?;
             let layout =
-                m5_render_submission::layout(&first.command, self.clusters, self.variant.programs)?;
+                m5_render_submission::layout(&first.command, self.clusters, self.variant.programs,
+                    self.board)?;
             // A context of another VM gets the rings cleared before its VM is given its view,
             // so it cannot read the entries earlier owners' commands left, as for a parked pair.
             // The pair is bindable, hence idle: the firmware consumed every entry.
