@@ -627,6 +627,11 @@ impl Runtime {
             let slot = (state.next_slot + k) % POOL_SLOTS;
             if state.busy & (1 << slot) != 0 { continue; }
             if state.pool.registered(slot)? {
+                // The firmware can count another record for a retired slot after its cursor
+                // was advanced, and keeps the slot listed until the cursor matches again:
+                // advance it to the current count. The slot's last command stays intact in
+                // its buffer, so an early unlink is harmless.
+                state.pool.retire(slot)?;
                 state.skipped += 1;
                 continue;
             }
