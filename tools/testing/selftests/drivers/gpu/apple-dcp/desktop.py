@@ -242,7 +242,7 @@ struct device {int unused;};
 struct backlight_properties {int type,brightness,max_brightness,scale,state;};
 struct backlight_device {struct backlight_properties props;void *data;bool ops_lock;};
 struct apple_dcp {
-    int fw_compat;bool quiescing;
+    int fw_compat;bool quiescing,crashed;
     struct {int iomfb_method_profile;} hw;
     struct {u32 maximum,nits,dac;bool update;struct backlight_device *bl_dev;
         u32 level,fade_from,fade_to;bool fading;unsigned long fade_start;int fade_work;
@@ -351,6 +351,17 @@ int main(void)
     assert(dcp_get_brightness(&dac_bl)==0);
     dcp_backlight_presented(&dac,500);
     assert(dcp_get_brightness(&dac_bl)==500 && !dac.backlight.lock);
+    /*
+     * A crashed processor discards every present: no level is reported, and
+     * a new level is refused without changing the requested one.
+     */
+    struct dcp_backlight_state before=d.backlight.state;
+    d.crashed=true;registered.props.brightness=200;
+    assert(dcp_get_brightness(&registered)==-EIO);
+    assert(dcp_set_brightness(&registered)==-EIO);
+    assert(!memcmp(&before,&d.backlight.state,sizeof(before)) && !d.backlight.lock);
+    d.crashed=false;
+    assert(!dcp_set_brightness(&registered) && d.backlight.state.target==200);
     return 0;
 }
 '''
