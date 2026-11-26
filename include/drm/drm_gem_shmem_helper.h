@@ -48,6 +48,17 @@ struct drm_gem_shmem_object {
 	bool pages_bounded_reclaim;
 
 	/**
+	 * @pages_changed: Optional. Called under base.resv right after @pages
+	 * is populated (@present true) and right after it is released (false).
+	 * Every holder of @pages counts in @pages_use_count: CPU VMAs other
+	 * than revocable ones, pins (dma-buf attachments), kernel vmaps and
+	 * the device SG table. This reports the first of them and the end of
+	 * the last, so the driver can account the backing for each of them.
+	 * Set before the object is published.
+	 */
+	void (*pages_changed)(struct drm_gem_shmem_object *shmem, bool present);
+
+	/**
 	 * @cpu_pages: Pages populated one at a time by CPU faults on revocable
 	 * VMAs while no device mapping holds @pages. Sparse; under base.resv.
 	 */
