@@ -222,9 +222,11 @@ struct sio_data {
 	struct apple_rtkit *rtk;
 	/* The firmware is stopped for a system sleep. */
 	bool asleep;
-	/* A system sleep is under way: sio_synchronize() is bounded (sio_pm_notify()). */
+	/*
+	 * From a system sleep's prepare to its complete, with tasks frozen:
+	 * sio_synchronize() is bounded (sio_pm_prepare()).
+	 */
 	bool sleeping;
-	struct notifier_block pm_nb;
 	bool firmware_only;
 	/* Protocol 10 firmware given the earlier boot tables: no DMA, which would crash it */
 	bool tables_mismatch;
@@ -1694,14 +1696,19 @@ static int sio_sync(struct sio_chan *siochan, int (*terminate)(struct sio_chan *
 }
 
 /*
- * The client may free its buffers on return, except while a system sleep is
- * under way: that waits for nothing unbounded, and is refused instead.
+ * The client may free its buffers on return: this waits until the firmware
+ * stopped reading them. Only from a system sleep's prepare to its complete,
+ * with tasks frozen, where streams are suspended and nothing is freed, is it
+ * bounded, and the sleep refused instead (sio_pm_prepare()).
  */
+static int sio_synchronize_chan(struct sio_chan *siochan, int (*terminate)(struct sio_chan *))
+{
+	return sio_sync(siochan, terminate, READ_ONCE(siochan->host->sleeping));
+}
+
 static void sio_synchronize(struct dma_chan *chan)
 {
-	struct sio_chan *siochan = to_sio_chan(chan);
-
-	sio_sync(siochan, sio_call_terminate, READ_ONCE(siochan->host->sleeping));
+	sio_synchronize_chan(to_sio_chan(chan), sio_call_terminate);
 }
 
 /* See include/linux/dma/apple-sio.h */
@@ -1715,31 +1722,25 @@ int apple_sio_synchronize_bounded(struct dma_chan *chan)
 }
 EXPORT_SYMBOL_GPL(apple_sio_synchronize_bounded);
 
-/* From the sleep's prepare to its end, as the PM core notifies them */
-static int sio_pm_notify(struct notifier_block *nb, unsigned long action, void *data)
+/*
+ * A system sleep's prepare runs with tasks frozen, and the SIO's before that
+ * of its DMA clients, which its device links order after it: a client that
+ * synchronizes from its own prepare on, until the SIO's complete, suspends
+ * streams and keeps their buffers.
+ */
+static __maybe_unused int sio_pm_prepare(struct device *dev)
 {
-	struct sio_data *sio = container_of(nb, struct sio_data, pm_nb);
+	struct sio_data *sio = dev_get_drvdata(dev);
 
-	switch (action) {
-	case PM_SUSPEND_PREPARE:
-	case PM_HIBERNATION_PREPARE:
-	case PM_RESTORE_PREPARE:
-		WRITE_ONCE(sio->sleeping, true);
-		break;
-	case PM_POST_SUSPEND:
-	case PM_POST_HIBERNATION:
-	case PM_POST_RESTORE:
-		WRITE_ONCE(sio->sleeping, false);
-		break;
-	}
-	return NOTIFY_DONE;
+	WRITE_ONCE(sio->sleeping, true);
+	return 0;
 }
 
-static void sio_pm_notifier_remove(void *data)
+static __maybe_unused void sio_pm_complete(struct device *dev)
 {
-	struct sio_data *sio = data;
+	struct sio_data *sio = dev_get_drvdata(dev);
 
-	unregister_pm_notifier(&sio->pm_nb);
+	WRITE_ONCE(sio->sleeping, false);
 }
 
 /*
@@ -2636,13 +2637,6 @@ static int sio_probe(struct platform_device *pdev)
 		apple_sleep_coproc_set_early(&pdev->dev);
 	}
 
-	sio->pm_nb.notifier_call = sio_pm_notify;
-	err = register_pm_notifier(&sio->pm_nb);
-	if (!err)
-		err = devm_add_action_or_reset(&pdev->dev, sio_pm_notifier_remove, sio);
-	if (err)
-		return dev_err_probe(&pdev->dev, err, "registering the sleep notifier\n");
-
 	err = dma_async_device_register(&sio->dma);
 	if (err)
 		return dev_err_probe(&pdev->dev, err, "failed to register DMA device\n");
@@ -2839,6 +2833,8 @@ static __maybe_unused int sio_resume_early(struct device *dev)
 }
 
 static const struct dev_pm_ops sio_pm_ops = {
+	.prepare = pm_sleep_ptr(sio_pm_prepare),
+	.complete = pm_sleep_ptr(sio_pm_complete),
 	SYSTEM_SLEEP_PM_OPS(sio_system_suspend, sio_system_resume)
 	LATE_SYSTEM_SLEEP_PM_OPS(sio_suspend_late, sio_resume_early)
 	RUNTIME_PM_OPS(sio_suspend, sio_resume, NULL)

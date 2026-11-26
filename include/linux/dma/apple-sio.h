@@ -53,7 +53,8 @@ struct apple_sio_idle {
  * unplug takes: if the firmware does not stop the channel in a bounded time,
  * the transfers it may still read stay with the channel, which stays busy (a
  * system sleep is refused), and the next dmaengine_synchronize() waits for
- * them. dmaengine_synchronize() is bounded so itself during a system sleep.
+ * them. dmaengine_synchronize() is bounded so itself in a system sleep, from
+ * the SIO's prepare to its complete, while tasks are frozen.
  * A channel of another DMA controller is synchronized by
  * dmaengine_synchronize().
  *

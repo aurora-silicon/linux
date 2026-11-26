@@ -804,25 +804,46 @@ static void sio_sync_lock_bounded_test(struct kunit *test)
 		KUNIT_EXPECT_FALSE(test, test_taint(TAINT_WARN));
 }
 
-/* sio_synchronize() is bounded from a system sleep's prepare to its end. */
-static void sio_sleep_notifier_test(struct kunit *test)
+/*
+ * A client's synchronize waits until the channel stops (and a close may free
+ * the buffer after it) everywhere but between the SIO's prepare and complete
+ * of a system sleep, with tasks frozen, where it is bounded.
+ */
+static void sio_sleep_bounds_synchronize_test(struct kunit *test)
 {
+	bool tainted = test_taint(TAINT_WARN);
 	struct sio_data *sio = sio_test_alloc_dma(test, 1);
-	static const unsigned long prepare[] = {
-		PM_SUSPEND_PREPARE, PM_HIBERNATION_PREPARE, PM_RESTORE_PREPARE,
-	};
-	static const unsigned long post[] = {
-		PM_POST_SUSPEND, PM_POST_HIBERNATION, PM_POST_RESTORE,
-	};
-	unsigned int i;
+	struct sio_chan *chan = &sio->channels[0];
+	/* Acknowledged once the bounded tries are over: only an unbounded one gets there */
+	struct sio_test_terminate t = { .nacks = SIO_TERMINATE_TRIES, .ret = 1 };
+	struct sio_tx *tx;
 
-	for (i = 0; i < ARRAY_SIZE(prepare); i++) {
-		KUNIT_EXPECT_FALSE(test, READ_ONCE(sio->sleeping));
-		sio_pm_notify(&sio->pm_nb, prepare[i], NULL);
-		KUNIT_EXPECT_TRUE(test, READ_ONCE(sio->sleeping));
-		sio_pm_notify(&sio->pm_nb, post[i], NULL);
-		KUNIT_EXPECT_FALSE(test, READ_ONCE(sio->sleeping));
-	}
+	test->priv = &t;
+	dev_set_drvdata(sio->dev, sio);
+
+	/* Before the sleep: unbounded */
+	tx = sio_test_held_tx(test, chan);
+	KUNIT_EXPECT_EQ(test, sio_synchronize_chan(chan, sio_test_terminate), 0);
+	KUNIT_EXPECT_EQ(test, t.calls, SIO_TERMINATE_TRIES + 1);
+	KUNIT_EXPECT_NULL(test, chan->current_tx);
+
+	/* From the SIO's prepare: bounded, the transfer held */
+	KUNIT_EXPECT_EQ(test, sio_pm_prepare(sio->dev), 0);
+	tx = sio_test_held_tx(test, chan);
+	t = (struct sio_test_terminate){ .nacks = SIO_TERMINATE_TRIES, .ret = 1 };
+	KUNIT_EXPECT_EQ(test, sio_synchronize_chan(chan, sio_test_terminate), -EBUSY);
+	KUNIT_EXPECT_EQ(test, t.calls, SIO_TERMINATE_TRIES);
+	KUNIT_EXPECT_PTR_EQ(test, chan->current_tx, tx);
+
+	/* After its complete: unbounded again */
+	sio_pm_complete(sio->dev);
+	t = (struct sio_test_terminate){ .nacks = SIO_TERMINATE_TRIES, .ret = 1 };
+	KUNIT_EXPECT_EQ(test, sio_synchronize_chan(chan, sio_test_terminate), 0);
+	KUNIT_EXPECT_EQ(test, t.calls, SIO_TERMINATE_TRIES + 1);
+	KUNIT_EXPECT_NULL(test, chan->current_tx);
+
+	if (!tainted)
+		KUNIT_EXPECT_FALSE(test, test_taint(TAINT_WARN));
 }
 
 static struct kunit_case sio_terminate_test_cases[] = {
@@ -833,7 +854,7 @@ static struct kunit_case sio_terminate_test_cases[] = {
 	KUNIT_CASE(sio_terminate_late_issue_test),
 	KUNIT_CASE_SLOW(sio_sync_bounded_test),
 	KUNIT_CASE_SLOW(sio_sync_lock_bounded_test),
-	KUNIT_CASE(sio_sleep_notifier_test),
+	KUNIT_CASE_SLOW(sio_sleep_bounds_synchronize_test),
 	{}
 };
 
