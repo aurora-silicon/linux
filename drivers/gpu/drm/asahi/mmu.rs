@@ -463,6 +463,9 @@ struct VmInner {
     /// Per-VM sparse tiles (DRM_ASAHI_BIND_SPARSE_TILE): [read-only zero,
     /// writable sink], allocated on first use.
     sparse_tiles: [Option<Arc<sparse_tile::SparseTile>>; 2],
+    /// Firmware-visible shared L2 window mirrored dynamically on kernel mappings.
+    #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+    firmware_window: Option<FirmwareWindow>,
 }
 
 /// GPUVA filled from a kernel sparse tile instead of its GEM's first page.
@@ -1247,6 +1250,8 @@ impl VmInner {
             return Err(error);
         }
         let result = self.map_node_prepared(node, prot);
+        #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+        let result = result.and_then(|()| self.sync_firmware_window(node.start()..end));
         let discard = if result.is_err() {
             // Rollback still changes live leaves and must remain under the PPL lease.
             self.page_table.discard_partial_map(node.start()..end)
@@ -1307,6 +1312,21 @@ impl VmInner {
         }
 
         // The caller invalidates negative translations after releasing its PPL lease.
+        Ok(())
+    }
+
+    /// Mirrors any newly allocated kernel-window L2 tables covering `range` into the attached
+    /// firmware `shared_l2` page before the mapping is returned to callers.
+    #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+    fn sync_firmware_window(&mut self, range: Range<u64>) -> Result {
+        if !self.is_kernel {
+            return Ok(());
+        }
+        let shadow_root = self.page_table.ttb();
+        let kernel_range = self.va_range.clone();
+        if let Some(window) = self.firmware_window.as_mut() {
+            window.sync_range(shadow_root, kernel_range, range)?;
+        }
         Ok(())
     }
 }
@@ -2651,6 +2671,8 @@ impl Vm {
                 binding: binding.clone(),
                 id,
                 sparse_tiles: [None, None],
+                #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+                firmware_window: None,
             },
         )?;
         let gpuvm = ARef::from(&*unique_gpuvm);
@@ -3311,6 +3333,8 @@ impl Vm {
         let ret = inner
             .page_table
             .map_pages(iova..end, phys as PhysicalAddr, prot, false);
+        #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+        let ret = ret.and_then(|()| inner.sync_firmware_window(iova..end));
         let discard = if ret.is_err() {
             inner.page_table.discard_partial_map(iova..end)
         } else {
@@ -3863,19 +3887,32 @@ impl Uat {
         Self::prepare_tables(&self.kernel_lower_vm, ranges)
     }
 
-    /// Links the kernel window's tables for each range, with no mappings, for a firmware that
-    /// copies the window's second-level entries only when it starts
-    /// ([`FirmwareWindow::mirror`]). Page tables are only freed with their VM, so the leaf
-    /// tables stay where that copy names them.
+    /// Links the kernel window's tables for each range, with no mappings, so they can be
+    /// pre-populated before [`FirmwareWindow::mirror`] (and mirrored dynamically if a
+    /// [`FirmwareWindow`] is already attached). Page tables are only freed with their VM, so
+    /// linked leaf tables stay where their L2 descriptors name them.
     #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
     pub(crate) fn prepare_kernel_tables(&self, ranges: &[Range<u64>]) -> Result {
         Self::prepare_tables(&self.kernel_vm, ranges)
+    }
+
+    /// Attaches an installed [`FirmwareWindow`] to the kernel VM so every later mapping into
+    /// the kernel window mirrors newly allocated L2 tables into `shared_l2` before returning.
+    #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+    pub(crate) fn attach_firmware_window(&self, window: FirmwareWindow) {
+        let mut inner = self.kernel_vm.gpuvm.lock_inner();
+        // Retain any previously attached live window rather than unmapping firmware regions.
+        if let Some(prev) = inner.firmware_window.replace(window) {
+            core::mem::forget(prev);
+        }
     }
 
     fn prepare_tables(vm: &Vm, ranges: &[Range<u64>]) -> Result {
         let mut inner = lock_vm(&vm.gpuvm, None, false)?;
         for range in ranges {
             inner.page_table.alloc_pages(range.clone())?;
+            #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+            inner.sync_firmware_window(range.clone())?;
         }
         Ok(())
     }
@@ -4649,6 +4686,13 @@ mod execution_context_tests {
 #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
 const MAGIC_G14_V27_2: u64 = 0x4b1d000000000003;
 
+/// Address bits covered by one second-level (L2) UAT table entry (2048 * 16 KiB = 32 MiB).
+#[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+const UAT_L2_SHIFT: usize = UAT_PGBIT + (UAT_PGBIT - 3);
+#[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+const _: () =
+    assert!(UAT_L2_SHIFT == 25 && UAT_L2_SHIFT + (UAT_PGBIT - 3) == UAT_TOP_LEVEL_SHIFT);
+
 /// The loader's UAT regions as GPU firmware 27.2 on G14 uses them. The driver mirrors its
 /// kernel window into the firmware's shared second-level table and names its own trees in
 /// TTBAT context 0 before the ASC starts.
@@ -4693,9 +4737,13 @@ impl FirmwareWindow {
         unsafe { &*self.handoff.map.ptr().cast::<Handoff>() }
     }
 
-    fn shared(&self) -> &[AtomicU64; UAT_PGSZ / 8] {
+    fn shared_entries(region: &UatRegion) -> &[AtomicU64; UAT_PGSZ / 8] {
         // SAFETY: the shared-l2 reservation is one mapped 16 KiB table.
-        unsafe { &*self.shared_l2.map.ptr().cast::<[AtomicU64; UAT_PGSZ / 8]>() }
+        unsafe { &*region.map.ptr().cast::<[AtomicU64; UAT_PGSZ / 8]>() }
+    }
+
+    fn shared(&self) -> &[AtomicU64; UAT_PGSZ / 8] {
+        Self::shared_entries(&self.shared_l2)
     }
 
     fn context(&self) -> &SlotTTBS {
@@ -4719,7 +4767,8 @@ impl FirmwareWindow {
     }
 
     /// Copies the kernel window's second-level entries from `uat` and writes all of its tables
-    /// back. Call after the last allocation the firmware is to reach.
+    /// back. Call before [`Self::install`]; once attached to the kernel UAT, later kernel-window
+    /// mappings mirror new L2 tables dynamically through [`Self::sync_range`].
     pub(crate) fn mirror(&mut self, uat: &Uat) -> Result {
         let mask = self.pa_mask;
         let root = uat.kernel_window_root();
@@ -4781,6 +4830,119 @@ impl FirmwareWindow {
         root[2].load(Ordering::Acquire) & self.pa_mask == self.shared_l2.base
             && context.ttb0.load(Ordering::Acquire) == self.lower_root | TTBR_VALID
             && context.ttb1.load(Ordering::Acquire) == self.tables.base | TTBR_VALID
+    }
+
+    /// Mirrors any newly allocated L2 entries covering `range` from the shadow kernel root
+    /// `shadow_root` into `shared_l2`, and verifies that previously mirrored slots still match
+    /// `shared_l2` so cleared or replaced firmware descriptors fail closed.
+    ///
+    /// Runs under the kernel VM's exclusive GPUVM lock. Every new L3 table is cleaned to the
+    /// point of coherency and ordered with a full barrier before its descriptor is stored in
+    /// `shared_l2`; modified `shared_l2` descriptors are then cleaned, ordered and TLB-flushed
+    /// before the new mapping is returned to callers.
+    pub(crate) fn sync_range(
+        &mut self,
+        shadow_root: PhysicalAddr,
+        kernel_range: Range<u64>,
+        range: Range<u64>,
+    ) -> Result<bool> {
+        if range.is_empty() {
+            return Ok(false);
+        }
+        if range.start < kernel_range.start || range.end > kernel_range.end {
+            return Err(EINVAL);
+        }
+        let first = ((range.start - kernel_range.start) >> UAT_L2_SHIFT) as usize;
+        let last = (((range.end - 1) - kernel_range.start) >> UAT_L2_SHIFT) as usize;
+        if last >= self.entries.len() {
+            return Err(EINVAL);
+        }
+        if self.lower_root == 0 || !self.intact() {
+            return Err(EIO);
+        }
+        let mask = self.pa_mask;
+        // SAFETY: `shadow_root` is the live RAM shadow root owned by `kernel_vm` for the
+        // duration of this call (serialized by the kernel VM's GPUVM lock).
+        let upper = unsafe {
+            pgtable::with_root_entries(
+                None,
+                shadow_root,
+                IOVA_KERN_TOP_LEVEL_INDEX as usize + 1,
+                |w| w[IOVA_KERN_TOP_LEVEL_INDEX as usize].load(Ordering::Acquire),
+            )
+        }?;
+        if upper & !mask != 3 {
+            return Err(EIO);
+        }
+        let shadow_l2 = upper & mask;
+        let shared = Self::shared_entries(&self.shared_l2);
+        let entries = &mut self.entries;
+        // SAFETY: `shadow_l2` is the live RAM second-level table of `kernel_vm`, which is
+        // never freed while the VM is alive.
+        let dirty = unsafe {
+            pgtable::with_root_entries(
+                None,
+                shadow_l2,
+                last + 1,
+                |shadow| -> Result<Option<(usize, usize)>> {
+                    let mut span: Option<(usize, usize)> = None;
+                    // Phase 1: validate every covered L2 slot (including confirming
+                    // previously mirrored slots still match `shared_l2`) and clean every
+                    // new L3 page before publishing any descriptor into `shared_l2`.
+                    for idx in first..=last {
+                        let e = shadow[idx].load(Ordering::Acquire);
+                        if e & !mask != 3 {
+                            return Err(EIO);
+                        }
+                        let prev = entries[idx];
+                        let cur_shared = shared[idx].load(Ordering::Acquire);
+                        if e == prev {
+                            if cur_shared != e {
+                                return Err(EIO);
+                            }
+                            continue;
+                        }
+                        if prev != 0 || cur_shared != 0 {
+                            return Err(EIO);
+                        }
+                        crate::g15::uat::clean_page(e & mask)?;
+                        span = Some(match span {
+                            Some((lo, _)) => (lo, idx),
+                            None => (idx, idx),
+                        });
+                    }
+                    let Some((dirty_first, dirty_last)) = span else {
+                        return Ok(None);
+                    };
+                    // Complete PoC cleaning of every new L3 page before `shared_l2` names it.
+                    pgtable::poc_barrier();
+                    // Phase 2: publish the validated new L2 descriptors into `shared_l2`.
+                    for idx in dirty_first..=dirty_last {
+                        if entries[idx] == 0 {
+                            let e = shadow[idx].load(Ordering::Acquire);
+                            shared[idx].store(e, Ordering::Release);
+                            entries[idx] = e;
+                        }
+                    }
+                    Ok(Some((dirty_first, dirty_last)))
+                },
+            )
+        }??;
+        if let Some((dirty_first, dirty_last)) = dirty {
+            let count = dirty_last - dirty_first + 1;
+            pgtable::clean_poc(
+                core::ptr::from_ref(&shared[dirty_first]).cast::<u8>(),
+                count * size_of::<u64>(),
+            );
+            pgtable::poc_barrier();
+            let span_start = kernel_range.start + ((dirty_first as u64) << UAT_L2_SHIFT);
+            let span_len = count << UAT_L2_SHIFT;
+            mem::sync();
+            mem::tlbi_range(0, span_start as usize, span_len);
+            mem::sync();
+            return Ok(true);
+        }
+        Ok(false)
     }
 }
 

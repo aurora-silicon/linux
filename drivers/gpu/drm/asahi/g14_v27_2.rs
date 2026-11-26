@@ -468,8 +468,8 @@ pub(crate) fn start<'a>(
                                                 gpu::GraphProfile::G14V27_2)?;
     let root = RootV27_2::build(&graph, &board)?;
     let pool = CommandPool::new(&mut gpu::GpuManager::alloc(&*graph), cfg)?;
-    // Timestamp buffers are bound in the timestamp aperture while the firmware runs, and the
-    // window only carries the tables that exist now: link the aperture's tables first.
+    // Pre-link the timestamp aperture's tables before the initial boot-time mirror; once
+    // attached below, later kernel-window mappings mirror new L2 tables dynamically.
     graph.kernel_uat().prepare_kernel_tables(&[graph.timestamp_range()])?;
     window.mirror(graph.kernel_uat())?;
     window.install()?;
@@ -515,8 +515,10 @@ pub(crate) fn start<'a>(
         core::mem::forget(graph);
         return Err(e);
     }
-    // The firmware keeps using the window until it is stopped; it stays for the life of the boot.
-    core::mem::forget(window);
+    // Retain the firmware window on the kernel UAT so dynamic kernel-window mappings past
+    // the boot-time L2 tables mirror new L2 entries into `shared_l2` (and `Runtime::stop()`
+    // retains `graph` for the life of the boot).
+    graph.kernel_uat().attach_firmware_window(window);
     let backend = Backend::start(&drm, dev, notify, peer, root, graph, pool, asc, fault, cfg)?;
     Ok(Started { backend, drm, binding, resources })
 }
@@ -2072,7 +2074,8 @@ impl gpu::Gpu for Backend {
         range: Range<usize>,
         window: crate::timestamp::WindowPermit,
     ) -> Result<crate::timestamp::Buffer> {
-        // The aperture's tables were linked before the firmware window was mirrored (start()).
+        // Initial tables were mirrored at start(), and any newly allocated L2 tables are
+        // mirrored dynamically by the kernel UAT's attached firmware window.
         <GpuManagerG14V13_5 as gpu::Gpu>::map_timestamp_buffer(&self.graph, bo, range, window)
     }
 }
