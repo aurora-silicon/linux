@@ -8219,6 +8219,10 @@ err:
  *   over; Linux never starts its CPU.
  * - sink_metadata_edid: the display it finds at boot is its first sink,
  *   as on the T6041 dcpext.
+ * - no DPTX endpoint: its firmware advertises DPTX_CONTROLLER_ENDPOINT and
+ *   DPTX_ENDPOINT, so dcp_v27_dptx_layout() opens the controller on the
+ *   first and the ports on the second, where the 27.2 image serves them
+ *   (DPTX_ENDPOINT_V2 announces nothing).
  * No sleep support: neither a firmware-27 sleep nor a link release has run
  * on this processor.
  */
@@ -8441,8 +8445,17 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 		dcp->hw.dptx_endpoint = DPTX_ENDPOINT_V2;
 	}
 	if (fw_compat == DCP_FIRMWARE_V_27_0 &&
-	    of_device_is_compatible(dev->of_node, "apple,t8132-dcpext"))
+	    of_device_is_compatible(dev->of_node, "apple,t8132-dcpext")) {
 		dcp->hw = apple_dcp_hw_t8132_dcpext_v27;
+		/*
+		 * An external processor, though its node has no apple,dcpext: on
+		 * the M4 firmware it is adopted outside the DRM device, see
+		 * dcp_platform_probe_t8132_ext(). On firmware 27 it is an
+		 * ordinary external pipe, with its DPTX services where its
+		 * firmware advertises them (dcp_v27_dptx_layout()).
+		 */
+		dcp->dcpext = true;
+	}
 	/*
 	 * A SoC with derived power words is offered the stop only when asked for, and only on
 	 * firmware 27.0, whose calls are the ones that ran with them.
