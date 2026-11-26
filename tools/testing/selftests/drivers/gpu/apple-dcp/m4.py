@@ -236,6 +236,22 @@ static void surfaces(void)
     frame.backing_size=0x4000000;
     frame.width--; assert(dcp_m4_frame_check(&frame) == -EINVAL); frame.width++;
     assert(!dcp_m4_frame_check(&frame));
+    struct dcp_m4_frame ext = {
+        .dva=0x10000004000ULL, .backing_size=0x4000000,
+        .width=3840, .height=2160, .stride=15360, .format=DCP_M4_XRGB8888,
+    };
+    assert(!dcp_m4_frame_check_ext(&ext));
+    ext.width=5120; ext.height=2160; ext.stride=20480;
+    ext.backing_size=(u64)ext.stride*ext.height;
+    assert(!dcp_m4_frame_check_ext(&ext));
+    ext.height=2880; ext.backing_size=(u64)ext.stride*ext.height;
+    assert(!dcp_m4_frame_check_ext(&ext));
+    ext.backing_size--; assert(dcp_m4_frame_check_ext(&ext) == -EINVAL); ext.backing_size++;
+    ext.width=5121; ext.stride=20544; ext.backing_size=(u64)ext.stride*ext.height;
+    assert(dcp_m4_frame_check_ext(&ext) == -EINVAL);
+    ext.width=5120; ext.height=2881; ext.stride=20480; ext.backing_size=(u64)ext.stride*ext.height;
+    assert(dcp_m4_frame_check_ext(&ext) == -EINVAL);
+    ext.width=0; ext.height=2160; assert(dcp_m4_frame_check_ext(&ext) == -EINVAL);
     u64 start=0, length=0;
     assert(!dcp_m4_extent_add(&start, &length, DCP_M4_SCANOUT_BASE, 0x4000));
     assert(!dcp_m4_extent_add(&start, &length, DCP_M4_SCANOUT_BASE+0x4000, 0x4000));
