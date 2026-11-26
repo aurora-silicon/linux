@@ -927,7 +927,7 @@ impl super::super::Backend {
                 }
                 // A busy pair's firmware owns its page list and PB descriptor:
                 // the growth only appends blocks to the inventory.
-                Some(HostGrowth::Busy(target)) => Some((target, 0, None)),
+                Some(HostGrowth::Busy { required, target }) => Some((target, required, None)),
                 None => None,
             };
             let pair = firmware.queues.render.take_pair(slot, self.owner, packet)?;
@@ -942,7 +942,11 @@ impl super::super::Backend {
         let result = (|| {
             if let Some((target, required, descriptor)) = growth_target {
                 let vm = pair.context().vm().clone();
-                match pair.manager().prepare_growth(&dev, &vm, target, required, descriptor) {
+                let manager = pair.manager();
+                match manager.host_target(&vm, target, required).and_then(|target| {
+                    manager.prepare_growth(&dev, &vm, target, if busy { 0 } else { required },
+                        descriptor)
+                }) {
                     Ok(prepared) => growth = prepared,
                     // A busy pair keeps its heap; firmware grow requests still serve it.
                     Err(_) if busy => {

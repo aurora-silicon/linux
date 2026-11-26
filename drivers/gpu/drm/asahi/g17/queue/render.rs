@@ -197,8 +197,9 @@ pub(crate) enum HostGrowth {
     /// towards `target`, and the render fails if it stays below `required`.
     Idle { required: usize, target: usize },
     /// The pair has work in flight: blocks are only appended to the inventory,
-    /// as for a firmware grow request.
-    Busy(usize),
+    /// as for a firmware grow request. The render does not fail if the heap stays below
+    /// `required`: firmware grow requests still serve it.
+    Busy { required: usize, target: usize },
 }
 
 /// Installed kick backing remains owned even when this pair has no logical
@@ -1867,7 +1868,7 @@ impl Pair {
                 .memory
                 .manager
                 .busy_target(required, now, client.as_ref())?
-                .map(HostGrowth::Busy));
+                .map(|target| HostGrowth::Busy { required, target }));
         }
         if !self.idle_for_context(self.context())? {
             return Err(EBUSY);

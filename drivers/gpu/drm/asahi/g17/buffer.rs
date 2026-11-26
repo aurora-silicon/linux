@@ -337,6 +337,18 @@ fn automatic_target_for(used_pages: usize, current: usize, pages: usize, maximum
     )
 }
 
+/// `target` of a host growth for a render that requires `required` blocks, of a heap with
+/// `primary` blocks of primary backing in a VM whose `heaps` heaps hold `grown` blocks of growth
+/// and leave `free` block slots in the growth arenas. Beyond `required` the heap grows to at most
+/// its primary and an equal share of that room. A heap's growth or shrink only moves slots
+/// between `free` and `grown`, so the share changes only as heaps come and go or other objects
+/// take or leave arena room.
+fn growth_target(target: usize, required: usize, primary: usize, free: usize, grown: usize,
+    heaps: usize) -> usize {
+    let share = primary.saturating_add(free.saturating_add(grown) / heaps.max(1));
+    target.min(required.max(share))
+}
+
 /// Whether `bytes` more kernel memory keeps the device's GPU memory more than an
 /// eighth below the device limit, and `client`'s committed memory more than an
 /// eighth below the per-client limit (`memacct`). A busy pair's growth is only
@@ -1124,6 +1136,36 @@ impl Manager {
         }
         Ok(Some(target))
     }
+    /// `target` of a host growth for a render that requires `required` blocks, capped at this
+    /// heap's share of `vm`'s growth arenas ([`growth_target`]). The arenas hold two heaps at
+    /// their normal maximum and a VM may have any number of render pairs, so without the cap the
+    /// heaps that grow first take all of them. Required blocks are never capped. A growth the
+    /// share cuts to nothing is retried a shrink period later, as a refused one is. Called
+    /// without the device lock: it walks the arenas under the VM's.
+    pub(crate) fn host_target(
+        &mut self,
+        vm: &mmu::Vm,
+        target: usize,
+        required: usize,
+    ) -> Result<usize> {
+        if self.tvb.geometry != BlockGeometry::NEO || target <= required.max(self.blocks()) {
+            return Ok(target);
+        }
+        let mut free = 0;
+        for range in cfg::tvb_growth_ranges() {
+            let (used, _) = vm.capacity(range.clone())?;
+            let room = (range.end - range.start).saturating_sub(used);
+            free += (room / cfg::TVB_BLOCK_STRIDE) as usize;
+        }
+        // Another pair's growth mapped but not yet committed counts in neither or both: the
+        // share is off by it until the next attempt, which defers or stops short.
+        let (heaps, grown) = vm.render_pool_growth();
+        let target = growth_target(target, required, self.tvb.primary_blocks(), free, grown, heaps);
+        if target <= self.blocks() {
+            self.defer_growth(super::now_ns());
+        }
+        Ok(target)
+    }
     /// A growth was refused, failed or stopped short at `now`: grow beyond what a render
     /// requires only a shrink period later, as every attempt allocates and maps afresh.
     pub(crate) fn defer_growth(&mut self, now: u64) {
@@ -1601,5 +1643,86 @@ mod capacity_tests {
             assert!(ids.entries.iter().all(|entry| entry.free()));
             assert_eq!(ids.returned_count, BUFFER_IDS);
         }
+    }
+}
+
+#[kunit_tests(asahi_g17_tvb_share)]
+mod share_tests {
+    use super::*;
+
+    /// Primary blocks of a heap for a 3456x2234 target.
+    const PRIMARY: usize = 64;
+
+    fn arena_slots() -> usize {
+        cfg::tvb_growth_ranges()
+            .iter()
+            .map(|range| ((range.end - range.start) / cfg::TVB_BLOCK_STRIDE) as usize)
+            .sum()
+    }
+
+    /// The sizes heaps of one VM settle at, each growing in turn towards its `(target,
+    /// required)` and capped at its share, as `Manager::host_target` does. A growth with no
+    /// room for all of it keeps the whole extensions that fit, as `Tvb::prepare_growth` does.
+    fn settle<const N: usize>(wants: [(usize, usize); N]) -> [usize; N] {
+        let slots = arena_slots();
+        let mut blocks = [PRIMARY; N];
+        loop {
+            let mut changed = false;
+            for (heap, &(target, required)) in wants.iter().enumerate() {
+                let grown = blocks.iter().map(|blocks| blocks - PRIMARY).sum::<usize>();
+                let free = slots - grown;
+                let target = growth_target(target, required, PRIMARY, free, grown, N);
+                let added = target.saturating_sub(blocks[heap]);
+                let added =
+                    if added <= free { added } else { free / EXTENSION_BLOCKS * EXTENSION_BLOCKS };
+                blocks[heap] += added;
+                changed |= added != 0;
+            }
+            if !changed {
+                return blocks;
+            }
+        }
+    }
+
+    #[test]
+    fn one_heap_reaches_the_normal_maximum() {
+        assert_eq!(settle([(cfg::TVB_MAX_BLOCKS, PRIMARY)]), [cfg::TVB_MAX_BLOCKS]);
+    }
+
+    #[test]
+    fn two_heavy_heaps_both_reach_the_normal_maximum() {
+        let heavy = (cfg::TVB_MAX_BLOCKS, PRIMARY);
+        assert_eq!(settle([heavy; 2]), [cfg::TVB_MAX_BLOCKS; 2]);
+    }
+
+    #[test]
+    fn three_heavy_heaps_split_the_arenas() {
+        let heavy = (cfg::TVB_MAX_BLOCKS, PRIMARY);
+        let share = PRIMARY + arena_slots() / 3;
+        assert!(share < cfg::TVB_MAX_BLOCKS);
+        assert_eq!(settle([heavy; 3]), [share; 3]);
+    }
+
+    #[test]
+    fn required_blocks_beyond_the_share_are_not_capped() {
+        let share = PRIMARY + arena_slots() / 3;
+        let required = share + 700;
+        let [first, second, third] = settle([
+            (cfg::TVB_MAX_BLOCKS, required),
+            (cfg::TVB_MAX_BLOCKS, PRIMARY),
+            (cfg::TVB_MAX_BLOCKS, PRIMARY),
+        ]);
+        assert_eq!(first, required);
+        assert_eq!(second, share);
+        assert!(third <= share);
+    }
+
+    #[test]
+    fn a_heap_growing_or_shrinking_leaves_the_share_unchanged() {
+        let share = |free, grown, heaps| growth_target(usize::MAX, 0, PRIMARY, free, grown, heaps);
+        assert_eq!(share(4000, 2000, 3), PRIMARY + 2000);
+        assert_eq!(share(3000, 3000, 3), PRIMARY + 2000);
+        assert_eq!(share(6000, 0, 3), PRIMARY + 2000);
+        assert_eq!(share(6000, 0, 0), share(6000, 0, 1));
     }
 }
