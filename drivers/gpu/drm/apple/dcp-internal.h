@@ -250,6 +250,13 @@ struct dcp_s2r_layout {
 	u32 disp_streams;
 	/* "pmc-dcp" counts the powered DCPs: T8132 and T8140 only */
 	bool pmc_dcp;
+	/*
+	 * From the device tree (dcp_s2r_layout_from_dt()): only the @*_mask bits of a
+	 * retention word are written, @*_off while off and the value read at probe back on.
+	 * Zero masks: the whole words, as above.
+	 */
+	u32 ret_ff_mask, ret_ff_off, ret_ff_on;
+	u32 ret_mem_mask, ret_mem_off, ret_mem_on;
 };
 
 /*
@@ -889,6 +896,9 @@ struct apple_dcp {
 	struct completion s2r_dart_done;
 	struct device *s2r_disp_dart;
 	struct device *s2r_dcp_dart;
+	/* hw.s2r without a layout in its hw data: the device tree's, see dcp_s2r_layout_from_dt() */
+	struct dcp_s2r_layout s2r_dt_layout;
+	bool s2r_dt_layout_ok;
 
 	/* eDP display without DP-HDMI conversion */
 	bool main_display;
