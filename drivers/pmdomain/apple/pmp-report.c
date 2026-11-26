@@ -78,6 +78,8 @@
  * @floor_all_clients: a CPU memory floor is stored to every CPU client's
  *	entry (the E and P clusters), and no request entry is ever read
  * @floor_confirm: the first DVFS-STATE response follows a CPU memory floor
+ * @start_at_probe: with @starts_pmp, start the PMP once it is handed over,
+ *	without waiting for a consumer to ask for it
  */
 struct apple_pmp_report_offsets {
 	u32 tgt_read;
@@ -99,6 +101,7 @@ struct apple_pmp_report_offsets {
 	bool devices_ordered;
 	bool floor_all_clients;
 	bool floor_confirm;
+	bool start_at_probe;
 };
 
 struct apple_pmp_start;
@@ -1571,9 +1574,19 @@ static int apple_pmp_start_init(struct apple_pmp_report *rep)
 	if (ret)
 		return ret;
 	rep->start = st;
-	if (!st->result)
-		dev_info(dev, "%s PMP handed over: requests %#llx; it starts when a consumer asks for it\n",
+	if (st->result)
+		return 0;
+	if (rep->offsets->start_at_probe) {
+		scoped_guard(mutex, &apple_pmp_start_mutex) {
+			st->queued = true;
+			queue_work(system_dfl_wq, &st->work);
+		}
+		dev_info(dev, "%s PMP handed over: requests %#llx; starting it now\n",
 			 rep->offsets->name, st->seed);
+		return 0;
+	}
+	dev_info(dev, "%s PMP handed over: requests %#llx; it starts when a consumer asks for it\n",
+		 rep->offsets->name, st->seed);
 	return 0;
 }
 
@@ -2594,6 +2607,13 @@ static const struct apple_pmp_report_offsets apple_pmp_offsets_t6030 = {
 	.fallback = "apple_t6030_display.enable=0",
 	.pwrstate = "apple,t6030-pmgr-pwrstate",
 	.devices_ordered = true,
+	/*
+	 * macOS 27.2 starts the J516S PMP about 3 s into its boot, before
+	 * its display and GPU drivers, and the PMP runs from then on. Its
+	 * sleep entry idles that running PMP. Linux's T6030 sleep needs the
+	 * PMP running too, whether or not a display or GPU driver asks for it.
+	 */
+	.start_at_probe = true,
 };
 
 static const struct apple_pmp_report_offsets apple_pmp_offsets_t8112 = {
