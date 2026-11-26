@@ -137,6 +137,39 @@ impl Attribution {
     }
 }
 
+/// The published compute command a snapshot target names: the one, among commands the queue
+/// has not retired (`ordinal > retired`), whose completion stamp is `stamp`. `flights` yields
+/// each published command's (completion stamp, ordinal) in publication order. A command that
+/// already retired is never blamed, even before the host has taken it off its list.
+pub(crate) fn stopped_compute(
+    flights: impl IntoIterator<Item = (u32, u64)>,
+    retired: u64,
+    stamp: u32,
+) -> Option<usize> {
+    flights.into_iter().position(|(s, ordinal)| s == stamp && ordinal > retired)
+}
+
+/// What the host does when a command ran past the driver's command timeout.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TimeoutAction {
+    /// The firmware has a recovery round open (phase 1): answer it, which blames the work it
+    /// stopped by stamp and fails only that client.
+    Recover,
+    /// No round open: the firmware reported nothing and stopped nothing that the host can
+    /// answer (a silent hang), or the handshake is in a state the host does not own. Failing
+    /// all work is the last resort.
+    FailAll,
+}
+
+/// The driver's command timeout is only a backstop for the firmware's own recovery: it fails
+/// every client only when the firmware has no round open.
+pub(crate) const fn command_timeout_action(phase: u32) -> TimeoutAction {
+    match phase {
+        1 => TimeoutAction::Recover,
+        _ => TimeoutAction::FailAll,
+    }
+}
+
 /// A further recovery round while stopped work drains must carry a new generation; the same
 /// generation again means the host misread the handshake.
 pub(crate) const fn new_round(previous: Option<u64>, generation: u64) -> bool {
@@ -188,6 +221,11 @@ impl RecoveryLedger {
     /// reported a stop without entering recovery.
     pub(crate) const fn report_answered(&self) -> bool {
         self.reports <= self.answered
+    }
+
+    /// Reports read and rounds answered so far, for a log line.
+    pub(crate) const fn counts(&self) -> (u64, u64) {
+        (self.reports, self.answered)
     }
 }
 
@@ -574,6 +612,45 @@ mod tests {
         ledger.answered(3);
         ledger.report();
         assert!(ledger.report_answered());
+    }
+
+    #[test]
+    fn a_timed_out_compute_is_blamed_by_stamp_and_spares_its_neighbours() {
+        // Compute list in publication order: (owner, completion stamp, ordinal). Client A's
+        // command completed and retired, but the host has not taken it off its list yet; B's
+        // command is the one the firmware timed out (event 4); C's command was published after
+        // it and waits behind it.
+        let flights = [('A', 0x7900u32, 1u64), ('B', 0x7a00, 2), ('C', 0x7b00, 3)];
+        let retired = 1;
+        let unretired = |stamp| stopped_compute(flights.iter().map(|f| (f.1, f.2)), retired, stamp)
+            .is_some();
+        // The J473 compute snapshot: one entry {0x7, next stamp of the stopped command}.
+        let mut a = Attribution::default();
+        a.add(0x7, 0x7a00, None, unretired);
+        assert_eq!(a.result(), Some(Stopped::Compute(0x7a00)));
+        let stopped = stopped_compute(flights.iter().map(|f| (f.1, f.2)), retired, 0x7a00);
+        assert_eq!(stopped, Some(1));
+        // blame() dooms every listed command of the stopped command's packet, and only those.
+        let guilty = flights[stopped.unwrap()].0;
+        let doomed: [bool; 3] = core::array::from_fn(|i| flights[i].0 == guilty);
+        assert_eq!(doomed, [false, true, false]);
+        // A target naming the retired front is not blamed on it.
+        assert_eq!(stopped_compute(flights.iter().map(|f| (f.1, f.2)), retired, 0x7900), None);
+        let mut a = Attribution::default();
+        a.add(0x7, 0x7900, None, unretired);
+        assert_eq!(a.result(), None);
+    }
+
+    #[test]
+    fn the_command_timeout_fails_all_only_without_a_recovery_round() {
+        assert_eq!(command_timeout_action(1), TimeoutAction::Recover);
+        // Silent hang: no round open.
+        assert_eq!(command_timeout_action(0), TimeoutAction::FailAll);
+        // The host's own phases or anything else: the handshake is not the firmware's to
+        // continue, so the host does not answer it from a timeout.
+        for phase in [2, 3, 4, u32::MAX] {
+            assert_eq!(command_timeout_action(phase), TimeoutAction::FailAll);
+        }
     }
 
     #[test]

@@ -1082,16 +1082,18 @@ impl Runtime {
             }
         } else if started.elapsed() > Delta::from_millis(COMMAND_TIMEOUT_MS) {
             dev_err!(self.dev, "GPU: render timed out: TA retired={} fragment retired={}\n", ta_done, fs_done);
-            if state.root.recovery_phase()? == 1 && doomed.is_none() {
-                // The firmware stopped it and halted, but its event was not seen. Recovery
-                // marks it and waits until it left both queues: retire it now, so its fence
-                // is signalled and the queue behind it runs without waiting for another message.
+            if g14_v27_2_abi::command_timeout_action(state.root.recovery_phase()?)
+                == g14_v27_2_abi::TimeoutAction::Recover
+            {
+                // The firmware has a round open whose event was not seen. Recovery blames the
+                // work it stopped and waits until that left its queue. Then retire again, so a
+                // stopped render's fence is signalled and the queue behind it runs without
+                // waiting for another message; an innocent render got its clock restarted.
                 if self.recover(state, ETIMEDOUT, -1)? {
                     return self.retire_render(state);
                 }
             }
-            state.root.log_timeout(&self.dev);
-            state.fault.log(&self.dev);
+            self.log_silent_hang(state, "render");
             return Err(ETIMEDOUT);
         }
         Ok(())
@@ -1157,8 +1159,9 @@ impl Runtime {
                          stamps: [flight.stamps[TILER].raw(), flight.stamps[FRAGMENT].raw()] }
             }
             Stopped::Compute(stamp) => {
-                let Some(packet) = state.inflight.iter().find(|f| f.stamp.raw() == stamp)
-                    .map(|f| f.packet.clone()) else { return Err(EIO); };
+                let flights = state.inflight.iter().map(|f| (f.stamp.raw(), f.ordinal));
+                let Some(packet) = g14_v27_2_abi::stopped_compute(flights, state.retired_total, stamp)
+                    .map(|i| state.inflight[i].packet.clone()) else { return Err(EIO); };
                 self.reserve_kept(state, &packet)?;
                 let owned = |f: &&mut Inflight| Arc::ptr_eq(&f.packet, &packet);
                 for flight in state.inflight.iter_mut().filter(owned) {
@@ -1169,6 +1172,19 @@ impl Runtime {
             }
         };
         Ok(blamed)
+    }
+
+    /// The last resort of a command timeout: the firmware has no recovery round open, so it
+    /// reported nothing the host can answer. Logs what a row needs to tell a silent hang from a
+    /// missed report: queue positions and recovery words (`log_timeout`), the MMU fault status,
+    /// and the last event ring kinds with the report and round counts.
+    fn log_silent_hang(&self, state: &State, work: &str) {
+        state.root.log_timeout(&self.dev);
+        state.fault.log(&self.dev);
+        let (events, seen) = state.recent_events();
+        let (reports, answered) = state.ledger.counts();
+        dev_err!(self.dev, "GPU: {} timed out with no recovery round open: last events {:?} ({} read), {} reports, {} rounds answered (last {:?}); failing all work\n",
+                 work, &events[..seen], state.events_read, reports, answered, state.ledger.last());
     }
 
     /// Whether every command marked by `blame` has left its queue.
@@ -1265,7 +1281,8 @@ impl Runtime {
                 let retired = state.retired_total;
                 let inflight = &state.inflight;
                 attribution.add(entry.flags, entry.target, render, |stamp| {
-                    inflight.iter().any(|f| f.stamp.raw() == stamp && f.ordinal > retired)
+                    let flights = inflight.iter().map(|f| (f.stamp.raw(), f.ordinal));
+                    g14_v27_2_abi::stopped_compute(flights, retired, stamp).is_some()
                 });
                 if let Some(at) = first.get_mut(i) { *at = (entry.flags, entry.target); }
             }
@@ -1323,6 +1340,7 @@ impl Runtime {
                     // Work behind the stopped command waited out the recovery: restart its clocks.
                     let now = Instant::now();
                     for flight in state.inflight.iter_mut() { flight.started = now; }
+                    if let Some(flight) = state.rendering.as_mut() { flight.started = now; }
                     dev_err!(self.dev,
                              "GPU: recovered ({} so far): stopped work left the queue after {} ms\n",
                              state.recoveries, start.elapsed().as_millis());
@@ -1481,8 +1499,7 @@ impl Runtime {
         }
         while !state.inflight.is_empty() {
             let front = &state.inflight[0];
-            let (ordinal, started, unblamed, expected) =
-                (front.ordinal, front.started, front.doomed.is_none(), front.stamp.raw());
+            let (ordinal, started, expected) = (front.ordinal, front.started, front.stamp.raw());
             if state.retired_total >= ordinal {
                 if let Ok(done) = state.inflight.remove(0) {
                     self.retire_slot(state, done.slot);
@@ -1503,19 +1520,22 @@ impl Runtime {
             if started.elapsed() > Delta::from_millis(COMMAND_TIMEOUT_MS) {
                 dev_err!(self.dev, "GPU: compute command timed out: stamp={:#x} expected={:#x} submitted={} completed={}\n",
                          state.queue_stamp(), expected, state.submitted, state.retired);
-                if unblamed && state.root.recovery_phase().unwrap_or(0) == 1 {
-                    // The firmware stopped it and halted, but its event was not seen.
+                let phase = state.root.recovery_phase().unwrap_or(0);
+                if g14_v27_2_abi::command_timeout_action(phase) == g14_v27_2_abi::TimeoutAction::Recover {
+                    // The firmware has a round open whose event was not seen. Recovery blames
+                    // the command it names by stamp, which need not be this front one, and
+                    // fails only that client; the others' work resumes after phase 0.
                     match self.recover(state, ETIMEDOUT, -1) {
                         Ok(true) => continue,
                         Ok(false) => {}
                         Err(err) => {
+                            dev_err!(self.dev, "GPU: recovery failed ({:?}); failing all work\n", err);
                             self.fail_all(state, err);
                             return;
                         }
                     }
                 }
-                state.root.log_timeout(&self.dev);
-                state.fault.log(&self.dev);
+                self.log_silent_hang(state, "compute");
                 self.fail_all(state, ETIMEDOUT);
                 return;
             }
@@ -1573,6 +1593,16 @@ impl Runtime {
             let Some(state) = Option::as_mut(&mut *guard) else { return Ok(()); };
             if !self.healthy() { return Ok(()); }
             if !state.running() {
+                // No recovery round crosses a sleep: a round open now (the firmware stopped
+                // without anything of ours running) is answered by the service first.
+                let phase = state.root.recovery_phase().unwrap_or(0);
+                if phase != 0 {
+                    dev_err!(self.dev, "GPU: sleep refused, firmware recovery phase {}\n", phase);
+                    self.asleep.store(false, Ordering::Release);
+                    self.pump(state);
+                    self.notify.wake();
+                    return Err(EBUSY);
+                }
                 break;
             }
             if remaining == 0 {
