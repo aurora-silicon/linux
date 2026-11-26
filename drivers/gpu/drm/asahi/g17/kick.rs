@@ -690,18 +690,13 @@ impl Queue {
             }
         }
         let (vm, status) = (client.id(), client.status().cloned());
-        // The firmware's mapping sits in the upper half, which every execution context includes.
-        // On M5 it is firmware-only, as a compute ring's is; the GPU reads the ring at its lower
+        // The firmware's mapping sits in the upper half, which every execution context includes,
+        // so it is firmware-only, as a compute ring's is: the GPU reads the ring at its lower
         // address.
-        let firmware_prot = if alloc.uat.is_m5() {
-            mmu::PROT_FW_SHARED_RW
-        } else {
-            mmu::PROT_GPU_FW_SHARED_RW
-        };
         let high = alloc.kernel(
             KICK_RING_SIZE,
             mmu::UAT_PGSZ as u64,
-            firmware_prot,
+            mmu::PROT_FW_SHARED_RW,
             CpuMap::WriteCombined,
         )?;
         let mut range = alloc.uat.kernel_lower_dynamic_range();
