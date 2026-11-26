@@ -3873,6 +3873,14 @@ static void tb_stop(struct tb *tb)
 	/* tunnels are only present after everything has been initialized */
 	list_for_each_entry_safe(tunnel, n, &tcm->tunnel_list, list) {
 		/*
+		 * Tell the host glue a DP tunnel is going away before its
+		 * adapters or domain stop, even while DPRX activation is still
+		 * in progress: tb_tunnel_dp() already announced it on
+		 * -EINPROGRESS.
+		 */
+		if (tb_tunnel_is_dp(tunnel))
+			tb_dp_tunnel_notify(tunnel, false);
+		/*
 		 * DMA tunnels and DP tunnels which are not yet active require
 		 * the driver to be functional so we tear them down.
 		 * Other protocol tunnels can be left intact.
@@ -3881,10 +3889,8 @@ static void tb_stop(struct tb *tb)
 		    (tb_tunnel_is_dp(tunnel) && !tb_tunnel_is_active(tunnel)))
 			tb_tunnel_deactivate(tunnel);
 		/* the host side of a DP tunnel goes away with us */
-		else if (tb_tunnel_is_dp(tunnel)) {
-			tb_dp_tunnel_notify(tunnel, false);
+		else if (tb_tunnel_is_dp(tunnel))
 			tb_dp_tunnel_deactivate_host(tunnel);
-		}
 		tb_tunnel_put(tunnel);
 	}
 	/*
