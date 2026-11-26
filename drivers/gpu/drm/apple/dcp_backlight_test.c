@@ -128,19 +128,42 @@ static void backlight_floor_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, present.nits, 10U);
 	KUNIT_EXPECT_TRUE(test, dcp_bl_complete(&state, present.sequence, true));
 
-	/* So is a core blank, whatever level comes with it. */
+	/* A new level can be requested while blanking. */
 	KUNIT_ASSERT_EQ(test, dcp_bl_request(&state, 0, true, false), 0);
 	KUNIT_EXPECT_EQ(test, dcp_bl_effective(&state), 0U);
 	KUNIT_EXPECT_EQ(test, state.target, 10U);
 	KUNIT_ASSERT_EQ(test, dcp_bl_request(&state, 0, false, false), 0);
 	KUNIT_EXPECT_EQ(test, dcp_bl_effective(&state), 10U);
 
-	/* A loader level below the floor stays until the first request. */
+	/* A loader level below the floor stays across blank and suspend. */
 	KUNIT_ASSERT_EQ(test, dcp_bl_init(&state, 1000, true, 4, false, 0), 0);
 	KUNIT_ASSERT_EQ(test, dcp_bl_set_minimum(&state, 10), 0);
 	KUNIT_EXPECT_EQ(test, dcp_bl_effective(&state), 4U);
+	KUNIT_ASSERT_EQ(test, dcp_bl_request(&state, 4, true, false), 0);
+	KUNIT_EXPECT_EQ(test, state.target, 4U);
+	KUNIT_EXPECT_EQ(test, dcp_bl_effective(&state), 0U);
+	KUNIT_ASSERT_EQ(test, dcp_bl_request(&state, 4, false, false), 0);
+	KUNIT_EXPECT_EQ(test, state.target, 4U);
+	KUNIT_EXPECT_EQ(test, dcp_bl_effective(&state), 4U);
+	KUNIT_ASSERT_EQ(test, dcp_bl_request(&state, 4, false, true), 0);
+	KUNIT_EXPECT_EQ(test, state.target, 4U);
+	KUNIT_EXPECT_EQ(test, dcp_bl_effective(&state), 0U);
+	KUNIT_ASSERT_EQ(test, dcp_bl_request(&state, 4, false, false), 0);
+	KUNIT_EXPECT_EQ(test, state.target, 4U);
+	KUNIT_EXPECT_EQ(test, dcp_bl_effective(&state), 4U);
+
 	KUNIT_ASSERT_EQ(test, dcp_bl_request(&state, 4, false, false), 0);
 	KUNIT_EXPECT_EQ(test, state.target, 10U);
+
+	/* A same-level write while already blanked still takes the floor. */
+	KUNIT_ASSERT_EQ(test, dcp_bl_init(&state, 1000, true, 4, false, 0), 0);
+	KUNIT_ASSERT_EQ(test, dcp_bl_set_minimum(&state, 10), 0);
+	KUNIT_ASSERT_EQ(test, dcp_bl_request(&state, 4, true, false), 0);
+	KUNIT_ASSERT_EQ(test, dcp_bl_request(&state, 4, true, false), 0);
+	KUNIT_EXPECT_EQ(test, state.target, 10U);
+	KUNIT_EXPECT_EQ(test, dcp_bl_effective(&state), 0U);
+	KUNIT_ASSERT_EQ(test, dcp_bl_request(&state, 10, false, false), 0);
+	KUNIT_EXPECT_EQ(test, dcp_bl_effective(&state), 10U);
 }
 
 static void backlight_dpms_cycles_test(struct kunit *test)

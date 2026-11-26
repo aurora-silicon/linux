@@ -195,7 +195,13 @@ static inline int dcp_bl_request(struct dcp_backlight_state *state, u32 nits,
 		return -ENODATA;
 	if (nits > state->maximum)
 		return -ERANGE;
-	nits = dcp_bl_floor(state, nits);
+	/*
+	 * A blank or suspend change arrives with the level unchanged: it is not
+	 * a request, so a loader level below the floor stays.
+	 */
+	if (nits != state->target || (state->core_blank == core_blank &&
+				      state->suspended == suspended))
+		nits = dcp_bl_floor(state, nits);
 	/* Save/restore clients may echo the reporting default without a change. */
 	if (state->preserve_inherited && !state->controlled && !state->level_known &&
 	    state->target == nits) {
