@@ -295,7 +295,7 @@ struct avoid_find {
 
 /* Whether @bss is one to keep. Under cfg80211's BSS lock. */
 static bool avoid_keep_bss(const struct avoid_find *find,
-			   const struct cfg80211_bss *bss)
+			   struct cfg80211_bss *bss)
 {
 	const struct element *ssid;
 	bool same;
@@ -317,9 +317,9 @@ static bool avoid_keep_bss(const struct avoid_find *find,
  * its multiple-BSSID element, which cfg80211 unlinks together.
  */
 static bool avoid_keep_set(const struct avoid_find *find,
-			   const struct cfg80211_bss *bss)
+			   struct cfg80211_bss *bss)
 {
-	const struct cfg80211_bss *set = bss->transmitted_bss ?: bss, *member;
+	struct cfg80211_bss *set = bss->transmitted_bss ?: bss, *member;
 
 	if (avoid_keep_bss(find, set))
 		return true;
