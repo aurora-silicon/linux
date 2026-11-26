@@ -150,6 +150,13 @@ struct sio_chan {
 };
 
 #define SIO_NTAGS		16
+/* Tag 0 is never handed out. */
+#define SIO_USABLE_TAGS		(SIO_NTAGS - 1)
+/*
+ * Calls are refused while half the tags are held for late replies, so that
+ * the other half stays for the ISSUEs of the running channels.
+ */
+#define SIO_MAX_STALE		(SIO_USABLE_TAGS / 2)
 
 typedef void (*sio_ack_callback)(struct sio_chan *, void *, bool);
 
@@ -205,13 +212,29 @@ struct sio_data {
 	struct sio_coproc_desc *shmem_desc_base;
 	unsigned long *desc_allocated;
 
+	/*
+	 * A reply names only a tag, which has no generation: the tag stays with
+	 * its request until the reply comes.
+	 */
 	struct sio_tagdata {
+		/* Orders a reply against the allocation and release of its tag */
+		spinlock_t lock;
 		DECLARE_BITMAP(allocated, SIO_NTAGS);
+		/* Calls that timed out: held until their reply or a firmware reset */
+		DECLARE_BITMAP(stale, SIO_NTAGS);
+		unsigned int nstale;
 		int last_tag;
 
 		struct completion completions[SIO_NTAGS];
 		bool atomic[SIO_NTAGS];
 		bool acked[SIO_NTAGS];
+		/* The endpoint the request named, which its reply names too */
+		u8 ep[SIO_NTAGS];
+		/* A START, which STARTED answers rather than ACK */
+		bool start[SIO_NTAGS];
+		/* Which allocation holds the tag, known to the host only */
+		unsigned long generation;
+		unsigned long held_by[SIO_NTAGS];
 
 		sio_ack_callback ack_callback[SIO_NTAGS];
 		void *cookie[SIO_NTAGS];
@@ -729,19 +752,43 @@ static struct sio_tx *to_sio_tx(struct dma_async_tx_descriptor *tx)
 	return container_of(tx, struct sio_tx, vd.tx);
 }
 
-static int sio_alloc_tag(struct sio_data *sio)
+static void sio_init_tags(struct sio_data *sio)
+{
+	int i;
+
+	spin_lock_init(&sio->tags.lock);
+	for (i = 0; i < SIO_NTAGS; i++)
+		init_completion(&sio->tags.completions[i]);
+}
+
+/*
+ * Hands out the next free tag, bound to the request msg: the endpoint it
+ * names and the reply it takes, and for an atomic request what runs on that
+ * reply. A call is refused while SIO_MAX_STALE tags wait for late replies.
+ * *generation is this allocation's, for sio_cancel_tag().
+ */
+static int sio_alloc_tag(struct sio_data *sio, u64 msg, bool atomic,
+			 sio_ack_callback ack_callback, void *cookie,
+			 unsigned long *generation)
 {
 	struct sio_tagdata *tags = &sio->tags;
+	unsigned long flags;
 	int tag, i;
+
+	spin_lock_irqsave(&tags->lock, flags);
+	if (!atomic && tags->nstale >= SIO_MAX_STALE) {
+		spin_unlock_irqrestore(&tags->lock, flags);
+		dev_err_ratelimited(sio->dev, "%d calls still unanswered, refusing calls\n",
+				    SIO_MAX_STALE);
+		return -EBUSY;
+	}
 
 	/*
 	 * Because tag number 0 is special, the usable tag range
 	 * is 1...(SIO_NTAGS - 1). So, to pick the next usable tag,
 	 * we do modulo (SIO_NTAGS - 1) *then* plus one.
 	 */
-
-#define SIO_USABLE_TAGS (SIO_NTAGS - 1)
-	tag = (READ_ONCE(tags->last_tag) % SIO_USABLE_TAGS) + 1;
+	tag = (tags->last_tag % SIO_USABLE_TAGS) + 1;
 
 	for (i = 0; i < SIO_USABLE_TAGS; i++) {
 		if (!test_and_set_bit(tag, tags->allocated))
@@ -750,37 +797,71 @@ static int sio_alloc_tag(struct sio_data *sio)
 		tag = (tag % SIO_USABLE_TAGS) + 1;
 	}
 
-	WRITE_ONCE(tags->last_tag, tag);
+	tags->last_tag = tag;
 
-	if (i < SIO_USABLE_TAGS)
-		return tag;
-	else
+	if (i == SIO_USABLE_TAGS) {
+		spin_unlock_irqrestore(&tags->lock, flags);
 		return -EBUSY;
-#undef SIO_USABLE_TAGS
+	}
+
+	tags->ep[tag] = FIELD_GET(SIOMSG_EP, msg);
+	tags->start[tag] = FIELD_GET(SIOMSG_TYPE, msg) == MSG_START;
+	tags->atomic[tag] = atomic;
+	tags->ack_callback[tag] = ack_callback;
+	tags->cookie[tag] = cookie;
+	tags->held_by[tag] = *generation = ++tags->generation;
+	if (!atomic)
+		reinit_completion(&tags->completions[tag]);
+	spin_unlock_irqrestore(&tags->lock, flags);
+
+	return tag;
 }
 
-static void sio_free_tag(struct sio_data *sio, int tag)
+static void sio_free_tag_locked(struct sio_data *sio, int tag)
 {
 	struct sio_tagdata *tags = &sio->tags;
 
+	lockdep_assert_held(&tags->lock);
 	if (WARN_ON(tag >= SIO_NTAGS))
 		return;
 
 	tags->atomic[tag] = false;
 	tags->ack_callback[tag] = NULL;
+	tags->cookie[tag] = NULL;
+	tags->ep[tag] = 0;
+	tags->start[tag] = false;
+	if (test_and_clear_bit(tag, tags->stale))
+		tags->nstale--;
 
 	WARN_ON(!test_and_clear_bit(tag, tags->allocated));
 }
 
-static void sio_set_tag_atomic(struct sio_data *sio, int tag,
-			       sio_ack_callback ack_callback,
-			       void *cookie)
+/*
+ * The tag of a request that was not sent. A reply naming it may have freed it
+ * already, and it may be another request's by now: then it is not freed.
+ */
+static void sio_cancel_tag(struct sio_data *sio, int tag, unsigned long generation)
 {
 	struct sio_tagdata *tags = &sio->tags;
+	unsigned long flags;
 
-	tags->atomic[tag] = true;
-	tags->ack_callback[tag] = ack_callback;
-	tags->cookie[tag] = cookie;
+	spin_lock_irqsave(&tags->lock, flags);
+	if (test_bit(tag, tags->allocated) && tags->held_by[tag] == generation)
+		sio_free_tag_locked(sio, tag);
+	spin_unlock_irqrestore(&tags->lock, flags);
+}
+
+/* A reset firmware answers nothing it was asked before: its held tags are free again. */
+static void sio_release_stale(struct sio_data *sio)
+{
+	struct sio_tagdata *tags = &sio->tags;
+	unsigned long flags;
+	int tag;
+
+	spin_lock_irqsave(&tags->lock, flags);
+	for_each_set_bit(tag, tags->stale, SIO_NTAGS)
+		sio_free_tag_locked(sio, tag);
+	spin_unlock_irqrestore(&tags->lock, flags);
 }
 
 static struct sio_coproc_desc *sio_alloc_desc(struct sio_data *sio)
@@ -1549,10 +1630,80 @@ static bool sio_tag_outstanding(struct sio_data *sio, u8 tag)
 	return tag && tag < SIO_NTAGS && test_bit(tag, sio->tags.allocated);
 }
 
+/*
+ * A reply answers the request of its tag only if it names the request's
+ * endpoint, and is STARTED for a START, an ACK for any other request, or a
+ * NACK, which refuses any.
+ */
+static bool sio_reply_answers(struct sio_tagdata *tags, u8 tag, u8 type, u8 sioep)
+{
+	if (sioep != tags->ep[tag])
+		return false;
+	if (type == MSG_NACK)
+		return true;
+	return (type == MSG_STARTED) == tags->start[tag];
+}
+
+/*
+ * An ACK, NACK or STARTED. One that does not answer the request of its tag
+ * is dropped, and the tag stays with that request. The reply of a call that
+ * timed out frees its tag, and nothing else.
+ */
+static void sio_recv_reply(struct sio_data *sio, u8 type, u8 tag, u8 sioep, u32 data)
+{
+	struct sio_tagdata *tags = &sio->tags;
+	sio_ack_callback callback = NULL;
+	bool atomic = false, late = false;
+	void *cookie = NULL;
+	unsigned long flags;
+	u8 req_ep;
+
+	spin_lock_irqsave(&tags->lock, flags);
+	if (!sio_tag_outstanding(sio, tag)) {
+		spin_unlock_irqrestore(&tags->lock, flags);
+		dev_warn_ratelimited(sio->dev, "ack for tag %u, which is not outstanding\n", tag);
+		return;
+	}
+	if (!sio_reply_answers(tags, tag, type, sioep)) {
+		req_ep = tags->ep[tag];
+		spin_unlock_irqrestore(&tags->lock, flags);
+		dev_warn_ratelimited(sio->dev,
+				     "reply %#x for tag %u on endpoint %u does not answer its request on endpoint %u, dropped\n",
+				     type, tag, sioep, req_ep);
+		return;
+	}
+
+	if (type == MSG_STARTED)
+		sio->protocol = data;
+	if (test_bit(tag, tags->stale)) {
+		late = true;
+		sio_free_tag_locked(sio, tag);
+	} else if (tags->atomic[tag]) {
+		atomic = true;
+		callback = tags->ack_callback[tag];
+		cookie = tags->cookie[tag];
+		sio_free_tag_locked(sio, tag);
+	} else {
+		tags->acked[tag] = type != MSG_NACK;
+		complete(&tags->completions[tag]);
+	}
+	spin_unlock_irqrestore(&tags->lock, flags);
+
+	if (type == MSG_STARTED)
+		dev_info(sio->dev, "SIO protocol v%u\n", data);
+	if (late)
+		dev_warn_ratelimited(sio->dev, "reply for tag %u after its call timed out, tag freed\n",
+				     tag);
+	/* The callback may issue again, which takes a tag: it runs unlocked. */
+	if (callback)
+		callback(&sio->channels[sioep], cookie, type != MSG_NACK);
+	if (atomic && type == MSG_NACK)
+		dev_err(sio->dev, "got a NACK on channel %d\n", sioep);
+}
+
 static void sio_recv_msg(void *cookie, u8 ep, u64 msg)
 {
 	struct sio_data *sio = cookie;
-	struct sio_tagdata *tags = &sio->tags;
 	u32 data;
 	u8 type, tag, sioep;
 
@@ -1567,36 +1718,9 @@ static void sio_recv_msg(void *cookie, u8 ep, u64 msg)
 
 	switch (type) {
 	case MSG_STARTED:
-		sio->protocol = data;
-		dev_info(sio->dev, "SIO protocol v%u\n", data);
-		type = MSG_ACK; /* Pretend this is an ACK */
-		fallthrough;
 	case MSG_ACK:
 	case MSG_NACK:
-		if (!sio_tag_outstanding(sio, tag)) {
-			dev_warn_ratelimited(sio->dev,
-					     "ack for tag %u, which is not outstanding\n",
-					     tag);
-			break;
-		}
-
-		if (tags->atomic[tag]) {
-			sio_ack_callback callback = tags->ack_callback[tag];
-
-			if (callback && sioep >= sio->nchannels)
-				dev_warn_ratelimited(sio->dev,
-						     "ack for channel %u of %d\n",
-						     sioep, sio->nchannels);
-			else if (callback)
-				callback(&sio->channels[sioep],
-					 tags->cookie[tag], type == MSG_ACK);
-			if (type == MSG_NACK)
-				dev_err(sio->dev, "got a NACK on channel %d\n", sioep);
-			sio_free_tag(sio, tag);
-		} else {
-			tags->acked[tag] = (type == MSG_ACK);
-			complete(&tags->completions[tag]);
-		}
+		sio_recv_reply(sio, type, tag, sioep, data);
 		break;
 
 	case MSG_REPORT:
@@ -1623,23 +1747,19 @@ unknown:
 static int _sio_send_siomsg(struct sio_data *sio, u64 msg, bool atomic,
 			    sio_ack_callback ack_callback, void *cookie)
 {
+	unsigned long generation;
 	int tag, ret;
 
-	tag = sio_alloc_tag(sio);
+	tag = sio_alloc_tag(sio, msg, atomic, ack_callback, cookie, &generation);
 	if (tag < 0)
 		return tag;
-
-	if (atomic)
-		sio_set_tag_atomic(sio, tag, ack_callback, cookie);
-	else
-		reinit_completion(&sio->tags.completions[tag]);
 
 	msg &= ~SIOMSG_TAG;
 	msg |= FIELD_PREP(SIOMSG_TAG, tag);
 	ret = apple_rtkit_send_message(sio->rtk, EP_SIO, msg, NULL,
 				       atomic);
 	if (ret < 0) {
-		sio_free_tag(sio, tag);
+		sio_cancel_tag(sio, tag, generation);
 		return ret;
 	}
 
@@ -1658,24 +1778,47 @@ static int sio_send_siomsg_atomic(struct sio_data *sio, u64 msg,
 	return _sio_send_siomsg(sio, msg, true, ack_callback, cookie);
 }
 
+/*
+ * The answer of a call once its wait ended, answered if the wait saw the
+ * reply: 1 on ACK, 0 on NACK. A call still unanswered keeps its tag, as its
+ * reply would otherwise be taken for that of the tag's next request: -ETIME.
+ */
+static int sio_call_result(struct sio_data *sio, int tag, bool answered)
+{
+	struct sio_tagdata *tags = &sio->tags;
+	unsigned long flags;
+	int ret;
+
+	spin_lock_irqsave(&tags->lock, flags);
+	/* A reply between the timeout and the lock still answers the call. */
+	if (!answered && !try_wait_for_completion(&tags->completions[tag])) {
+		__set_bit(tag, tags->stale);
+		tags->nstale++;
+		spin_unlock_irqrestore(&tags->lock, flags);
+		return -ETIME;
+	}
+
+	ret = tags->acked[tag];
+	sio_free_tag_locked(sio, tag);
+	spin_unlock_irqrestore(&tags->lock, flags);
+
+	return ret;
+}
+
 static int sio_call(struct sio_data *sio, u64 msg)
 {
+	unsigned long left;
 	int tag, ret;
 
 	tag = sio_send_siomsg(sio, msg);
 	if (tag < 0)
 		return tag;
 
-	ret = wait_for_completion_timeout(&sio->tags.completions[tag],
-					  msecs_to_jiffies(SIO_CALL_TIMEOUT_MS));
-	if (!ret) {
-		dev_warn(sio->dev, "call %8llx timed out\n", msg);
-		sio_free_tag(sio, tag);
-		return -ETIME;
-	}
-
-	ret = sio->tags.acked[tag];
-	sio_free_tag(sio, tag);
+	left = wait_for_completion_timeout(&sio->tags.completions[tag],
+					   msecs_to_jiffies(SIO_CALL_TIMEOUT_MS));
+	ret = sio_call_result(sio, tag, left);
+	if (ret == -ETIME)
+		dev_warn(sio->dev, "call %8llx timed out, tag %d held for its reply\n", msg, tag);
 
 	return ret;
 }
@@ -2109,8 +2252,7 @@ static int sio_probe(struct platform_device *pdev)
 		dev_err(&pdev->dev, "couldn't initialize rtkit\n");
 		goto rpm_put;
 	}
-	for (i = 0; i < SIO_NTAGS; i++)
-		init_completion(&sio->tags.completions[i]);
+	sio_init_tags(sio);
 
 	dma = &sio->dma;
 	dma_cap_set(DMA_PRIVATE, dma->cap_mask);
@@ -2360,6 +2502,7 @@ static __maybe_unused int sio_resume_early(struct device *dev)
 				 ret);
 			return 0;
 		}
+		sio_release_stale(sio);
 		sio->asleep = false;
 		dev_info(dev, "sleep refused: firmware back after a reset\n");
 		return 0;
