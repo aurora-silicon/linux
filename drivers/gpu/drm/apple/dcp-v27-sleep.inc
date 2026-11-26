@@ -1984,6 +1984,35 @@ static int dcp_v27_early_services_start(struct apple_dcp *dcp)
 	return 0;
 }
 
+/*
+ * DIAGNOSTIC (T6030 with its PMP running): the DCP programs its M3 realtime bandwidth into the
+ * PMP's report ("program_M3_rt_config: Using Dashboard 3503d0988") as its IOMFB starts. On Linux
+ * that came about 1 s before the PMP reported ready, and the PMP crashed when the DCP released it
+ * at its power-down. macOS's PMP had taken all its tunables before the DCP's IOMFB started.
+ * With this on, the DCP's start waits for the PMP's acknowledgment of its display request.
+ */
+static bool v27_early_wait_pmp = true;
+module_param(v27_early_wait_pmp, bool, 0444);
+MODULE_PARM_DESC(v27_early_wait_pmp, "DIAGNOSTIC: T6030: the internal DCP's start waits for the running PMP to acknowledge its display request (default Y)");
+
+static int dcp_v27_early_pmp_wait(struct apple_dcp *dcp)
+{
+	struct device_node *entry;
+	ktime_t start = ktime_get();
+	int ret;
+
+	if (!READ_ONCE(v27_early_wait_pmp) || !dcp_v27_early_selected(dcp))
+		return 0;
+	entry = of_parse_phandle(dcp->dev->of_node, "apple,pmp-report", 0);
+	if (!entry)
+		return 0;
+	ret = apple_pmp_report_wait_ready(entry, msecs_to_jiffies(30000));
+	of_node_put(entry);
+	dev_info(dcp->dev, "V27: waited %lld ms for the PMP before the IOMFB start: %d\n",
+		 ktime_ms_delta(ktime_get(), start), ret);
+	return ret == -EPROBE_DEFER ? ret : 0;
+}
+
 /* Everything the service endpoints received, consumed: their receive work joined. */
 static void dcp_v27_early_services_flush(struct apple_dcp *dcp)
 {
@@ -2748,6 +2777,7 @@ static int dcp_v27_early_resume(struct apple_dcp *dcp)
 static bool dcp_v27_early_selected(struct apple_dcp *dcp) { return false; }
 static bool dcp_v27_early_held(struct apple_dcp *dcp) { return false; }
 static int dcp_v27_early_services_start(struct apple_dcp *dcp) { return 0; }
+static int dcp_v27_early_pmp_wait(struct apple_dcp *dcp) { return 0; }
 static int dcp_v27_early_suspend(struct apple_dcp *dcp) { return -EOPNOTSUPP; }
 static int dcp_v27_early_resume(struct apple_dcp *dcp) { return 0; }
 #endif

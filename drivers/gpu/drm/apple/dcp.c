@@ -77,6 +77,7 @@
 #include "dcp-internal.h"
 
 static int dcp_v27_early_services_start(struct apple_dcp *dcp);
+static int dcp_v27_early_pmp_wait(struct apple_dcp *dcp);
 #include "j613-25g83.h"
 #include "dcp-external-bw.h"
 #include "dptx-service.h"
@@ -4954,6 +4955,10 @@ int dcp_start(struct platform_device *pdev)
 		if (ret)
 			return dev_err_probe(dcp->dev, ret, "Failed to start remote allocator\n");
 	}
+
+	ret = dcp_v27_early_pmp_wait(dcp);
+	if (ret)
+		return ret;
 
 	/* start RTKit endpoints */
 	ret = systemep_init(dcp);
