@@ -833,6 +833,8 @@ impl Runtime {
             preempt,
             timestamps: packet.timestamp_addresses(index),
             helper: control.helper,
+            sampler_heap: control.sampler_heap,
+            sampler_count: control.sampler_count,
         };
         let command = state.pool.encode(slot, &state.queue, stamp.raw(), &job)?;
         let submission = state.root.stage_compute(command)?;

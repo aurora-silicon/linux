@@ -112,6 +112,9 @@ pub(crate) struct ComputeJob {
     pub(crate) timestamps: [u64; 2],
     /// The helper program (scratch and stack setup), or zero.
     pub(crate) helper: crate::m3::agx_uapi::UapiHelperProgram,
+    /// The sampler heap and its sampler count, or zero.
+    pub(crate) sampler_heap: u64,
+    pub(crate) sampler_count: u32,
 }
 
 fn put32(b: &mut [u8], at: usize, v: u32) {
@@ -217,6 +220,7 @@ fn encode_compute(
     put64(cmd, 0x334, timestamps + 0x20);
     let user = g14_v27_2_abi::encode_compute_timestamps(cmd, cmd_va, job.timestamps);
     g14_v27_2_abi::encode_compute_helper(cmd, job.helper.binary, job.helper.data, job.helper.config);
+    g14_v27_2_abi::encode_compute_samplers(cmd, job.sampler_heap, job.sampler_count);
 
     put32(stream, 0, 11);
     // 13.5 StartCompute.unk_28, at the same place in this layout (the 13.5 G14 path writes 1).
@@ -455,6 +459,7 @@ impl BootJob {
             context: 0, sequence: 0, cdm_base: cdm, cdm_end: cdm + 8,
             usc_base: 0x11_0000_0000, preempt: self.client_va, timestamps: [0; 2],
             helper: crate::m3::agx_uapi::UapiHelperProgram { binary: 0, config: 0, data: 0 },
+            sampler_heap: 0, sampler_count: 0,
         };
         let (cmd_va, stream_va) = (self.command.gpu_va().get(), self.stream.gpu_va().get());
         encode_compute(self.command.as_mut_slice(), cmd_va, self.stream.as_mut_slice(), stream_va,
