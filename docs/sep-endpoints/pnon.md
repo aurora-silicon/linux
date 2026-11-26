@@ -1,22 +1,36 @@
-# pnon: nonce-service hypothesis
+# pnon: BootPolicy and LocalPolicy nonce service
 
-## Purpose, client and parity
+## Purpose, client and current Linux coverage
 
-**Observed:** `sep-endpoint,pnon` is advertised in the early group on all four
-Linux profiles. No child macOS driver is visible under that nub in the captured
-AppleSEPManager subtree. Its public client identity is therefore **unknown**;
-do not fill the gap with an invented Apple driver name.
+`pnon` (`0x15`) is the enclave's BootPolicy / LocalPolicy anti-replay service.
+It manages the local, remote and recovery policy nonce domains (48-byte SHA-384
+digests; raw nonces never leave the enclave), LocalPolicy pairing verification,
+boot-mode reporting, LocalPolicy creation/update transactions, and hibernation
+preparation.
 
-**Inference:** the name suggests a nonce service. Apple documents a LocalPolicy
-nonce protected through secure storage in its
-[LocalPolicy description](https://support.apple.com/en-gb/guide/security/secc745a0845/web),
-but that does not establish pnon as its transport. The connection to boot
-personalization, attestation or another nonce domain remains unverified.
+**Current Linux coverage (`drivers/soc/apple/pnon.rs`):**
 
-Linux has no pnon client. It needs investigation for full endpoint parity.
-Whether any particular Linux boot/security feature requires this endpoint
-cannot be decided until its nonce domain and callers are identified. It is not
-an alternative entropy endpoint just because nonces may be random.
+- Implemented as a single read-only query after bring-up: `op 0x0e` (read
+  blessed LocalPolicy nonce digest) using the `"hcPB"` / `"hrPB"` 32-byte
+  envelope, exposed root-only in `diag/local_policy_digest` and `diag/pnon`.
+- Currently supports only the 5-7 page discovery layout (`0x05050707`: M2/M3/M4/
+  M4 Pro on macOS 27.x SEP firmware; verified `diag/pnon=read` on J616s, J713,
+  J615, J413, J473).
+
+**Known coverage gaps on `pnon`:**
+
+1. **2-4 page SEP layout (`0x02020404`):** M1 Pro (13.5 firmware) and MacBook
+   Neo (A18 Pro, 26.6.2 firmware) use the older `tag=1` mailbox carrier and
+   currently read `diag/pnon=absent`. Support is implemented in open PR #2810
+   (awaiting hardware rows on the 2-4 page Macs).
+2. **Additional read-only BootPolicy queries:** proposed/blessed remote and
+   recovery digests (`0x0b`-`0x0d`, `0x0f`-`0x10`), current AP boot mode
+   (`0x3e`), and LocalPolicy pairing status/verification (`0x43`/`0x44`) are
+   not yet exposed in `main`.
+3. **Mutating LocalPolicy transactions & hibernation prepare:** nonce
+   begin/commit/reset transactions, LocalPolicy create/update (`0x4e`/`0x52`,
+   `0x4f`/`0x53`), and pre-hibernation policy preparation are not yet
+   implemented. Ordinary Linux suspend does not require `pnon`.
 
 ## Messages and fields
 

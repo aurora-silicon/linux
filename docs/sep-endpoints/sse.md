@@ -38,17 +38,43 @@ Do not assign APDU fields or a generic signing command merely from `nfcd` being
 attached. Payment credentials and opaque authorization material are not debug
 payloads.
 
-## Boot, sleep/wake and use ordering
+## Boot, sleep/wake and shutdown behaviour
 
-**Observed:** late Linux discovery and macOS consumers attached by the time of
-the snapshot. User-client attachment order is not request order. No SSE boot
-initialization, sleep/wake, provisioning or transaction trace was captured.
+**Observed:**
 
-**Proposed:** discover capabilities -> authenticate the real peer if required
--> create narrowly scoped sessions -> obtain enclave-authoritative authorization
-for the verified operation -> consume or close the transaction. At sleep/teardown,
-cancel or drain requests and make token lifetime explicit. On wake, establish
-peer/session validity before reusing handles; a restored host cache is not proof.
+- **Boot:** macOS sends **nothing** on `sse` at boot (confirmed across full-boot
+  captures on J473 macOS 27.2). OOL buffers (1 page = 16 KiB each way, layout
+  `0x01010101`) are registered lazily on first userspace (`nfcd`/`passd`) call.
+- **Ordinary sleep/wake:** macOS sends no SEP-wide wake acknowledgment on
+  `sse`. Where a Secure Element / NFC daemon is present (J616s macOS 27.0),
+  `nfcd` issues a consumer-initiated sharing-state revalidation (`tag=0x01`,
+  32-byte request, 4-byte reply) after wake. On desktop Macs with no SE/NFC
+  consumer (J473), zero messages are sent.
+- **Shutdown:** the host sends nothing on `sse`. Inside the SEP, xART shutdown
+  disabling notifies `sse` internally without AP traffic on endpoint `0x0c`.
+- **Unsolicited events:** the enclave may announce asynchronous notifications
+  on `tag=0x02` (no OOL body). They are not requests and must not be answered.
+- **Impact of attach-only on Linux:** zero SEP errors, zero timeouts, zero
+  unhandled messages, and zero suspend/wake regressions across J473, J616s,
+  J713, J615, M1 Pro, M2 Air and MacBook Neo (`diag/sse=idle`,
+  `diag/sse_events=0`, `diag/unhandled_messages=0`).
+
+## Minimal behaviour and full-support assessment
+
+- **Minimal correct behaviour (implemented in `drivers/soc/apple/sse.rs`):**
+  validate discovery identity (`"sse "`) and one-page layout (`0x01010101`),
+  report `diag/sse` (`idle`/`absent`), count asynchronous `tag=0x02` events in
+  `diag/sse_events` without answering, count any other arrival (including
+  unsolicited probes `tag=0x03` and continuations `tag=0x04`) as unhandled, and
+  send nothing. Even the read-shaped protocol query (`"cESS"`, op 1) is not
+  sent because its side-effect freedom on external SE hardware is unproven and
+  no Linux consumer uses its answer.
+- **Full support (out of scope for Linux):** full `sse` support exists solely
+  to pair the Secure Enclave with an Apple Secure Element for Apple Pay /
+  Wallet payment authorization, which also requires Apple's proprietary SE
+  provisioning and payment stack. Without an open Linux Secure Element consumer
+  there is no user-facing benefit; keep `sse` attach-only unless a real
+  in-kernel SE consumer appears, and never expose a raw APDU or SEP relay.
 
 ## Linux client design
 

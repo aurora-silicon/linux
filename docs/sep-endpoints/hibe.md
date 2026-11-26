@@ -37,20 +37,57 @@ These fields are requirements to investigate, not proof that hibe transmits a
 key or uses each candidate operation. Keep offsets, widths and enum values
 unassigned until a clean source or owned trace proves them.
 
-## Boot, sleep/wake and use ordering
+## Boot, sleep/wake and shutdown behaviour
 
-**Observed:** only discovery and macOS service matching. No hibernation cycle
-or hibe command stream was captured. Normal suspend and cold image restoration
-must be documented separately; the generic Linux SEP PM notifier is not a
-hibe transaction.
+**Observed:**
 
-**Proposed:** establish the verified service/session while allocation and normal
-I/O are available -> freeze users and devices -> construct and authenticate the
-image -> durably commit the image and associated enclave state in the recovered
-order -> power off. On cold boot, select the compatible image before mounting
-saved filesystems, obtain enclave authorization, verify image integrity and
-freshness, restore devices/memory, and consume/invalidate the image according
-to the proven protocol. Abort must leave a defined bootable state.
+- **Boot:** macOS sends **nothing** on `hibe` at normal boot (confirmed across
+  full-boot captures on J473 macOS 27.2 and J616s macOS 27.0). The host checks
+  the one-page layout (`0x01010101`) and allocates buffers without registering
+  them or sending a request.
+- **Ordinary sleep/wake (`s2idle` / S2R):** zero `hibe` messages. Ordinary
+  suspend uses the control-endpoint sleep handshake (`cntl`), not `hibe`.
+- **Shutdown:** zero `hibe` messages.
+- **True hibernation only:** before image commit, macOS registers OOL buffers
+  and issues `prepare` (obtaining a 64-byte opaque wrapped image key, a 32-bit
+  boot word, and a 64-byte opaque resume authorization). On a cold hibernation
+  boot, it sends `resume` with the retained resume authorization and clears the
+  buffer after any outcome.
+- **Impact of attach-only on Linux:** zero SEP errors, zero timeouts, zero
+  unhandled messages, and zero suspend/wake regressions across J473, J616s,
+  J713, J615, M1 Pro, M2 Air and MacBook Neo (`diag/hibe=idle`,
+  `diag/unhandled_messages=0`). Calling `prepare` without a matching image and
+  resume is unsafe because secure hibernation provides anti-replay with no
+  recovered abort operation and may rotate enclave freshness state.
+
+## Minimal behaviour and full-support plan
+
+- **Minimal correct behaviour (implemented in `drivers/soc/apple/hibe.rs`):**
+  validate discovery identity (`"hibe"`) and one-page layout (`0x01010101`),
+  report `diag/hibe` (`idle`/`absent`), register no OOL buffers, send nothing,
+  count any arrival as unhandled, and keep `Prepared` reply material zeroized
+  on drop via volatile writes.
+- **Full support plan (Linux hibernation with SEP-wrapped key):**
+  1. **Platform prerequisites (outside SEP; see `tools/aurora-sep/HIBERNATION.md`):**
+     implement ARM64 CPU offlining/restart (replacing spin-table no-`cpu_die`),
+     cold post-power-loss firmware restore for DCP/GPU/coprocessors (freeze/thaw/
+     restore PM callbacks instead of retained firmware), and firmware memory-map
+     preservation across cold boot.
+  2. **Owned wire capture:** record one attended macOS true hibernation cycle
+     (`hibernatemode 25`, physical power-button wake) to confirm the exact
+     `hibe` `prepare`/`resume` mailbox words and ordering relative to `pnon`
+     hibernation preparation and disk commit.
+  3. **In-kernel PM client (`drivers/soc/apple/hibe.rs` + `pnon.rs`):** expose
+     two internal-only kernel calls — `prepare_image()` (pre-allocated OOL
+     buffers, late before image commit, returns opaque wrapped key + boot word
+     + resume auth, scrubs DMA buffers) and `authorize_resume()` (cold
+     hibernation wake only, single-use, scrubs auth buffer regardless of
+     outcome). Never export keys, auth blobs or raw selectors to userspace.
+  4. **Image pipeline & fail-closed resume:** integrate the SEP-wrapped key and
+     authenticated metadata with Linux's hibernation writer and early initramfs
+     resume path. Any enclave refusal, timeout (5 s bound), stale auth or
+     metadata mismatch must abandon resume and fall back cleanly to a normal
+     cold boot.
 
 ## Linux client design
 
