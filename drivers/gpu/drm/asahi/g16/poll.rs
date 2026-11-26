@@ -33,7 +33,7 @@ use kernel::{
 
 use super::channel::Channel;
 use super::engine::{complete, now_ns, rmb, Flight, Lap};
-use super::fw::graph::{manager, notifier, notifier_page, qstate};
+use super::fw::graph::{manager, qstate};
 use super::job::{self, Completions, Job};
 use super::recovery::logic::{Retirement, ABORT_GRACE_NS};
 use super::regs::EngineState;
@@ -1364,16 +1364,9 @@ impl Firmware {
                     return Ok(Retirement::Pending);
                 }
                 rmb();
-                let fs_stamp = g.notifier.r32(notifier_page::FS_STAMP)?;
-                let ta_stamp = g.notifier.r32(notifier_page::TA_STAMP)?;
-                full &= stamp_reached(fs_stamp, f.fs_target, e.fs_target)
-                    && (fs_stamp != f.fs_target
-                        || g.notifier
-                            .r32(notifier_page::FS_RECORD + notifier::CONTEXT)?
-                            == f.job.vm.slot)
-                    && stamp_reached(ta_stamp, f.ta_target, e.ta_target)
-                    && (ta_stamp != f.ta_target
-                        || g.notifier.r32(notifier::CONTEXT)? == f.job.vm.slot)
+                // Service stamps are device-wide draw stamps, so a stamp names one flight.
+                full &= stamp_reached(g.user_stamp[1].r32(0)?, f.fs_target, e.fs_target)
+                    && stamp_reached(g.user_stamp[0].r32(0)?, f.ta_target, e.ta_target)
                     && f.job
                         .resources
                         .pb_retired_at(a, f.uma_submitted)?;
@@ -1399,12 +1392,8 @@ impl Firmware {
                     return Ok(Retirement::Pending);
                 }
                 rmb();
-                full &= g.notifier.r32(notifier_page::FS_STAMP)? == f.fs_target
-                    && g.notifier.r32(notifier_page::TA_STAMP)? == f.ta_target
-                    && g.notifier.r32(notifier::CONTEXT)? == f.job.vm.slot
-                    && g.notifier
-                        .r32(notifier_page::FS_RECORD + notifier::CONTEXT)?
-                        == f.job.vm.slot
+                full &= g.user_stamp[1].r32(0)? == f.fs_target
+                    && g.user_stamp[0].r32(0)? == f.ta_target
                     && f.job.resources.pb_retired(a)?;
             }
             if full {
