@@ -477,7 +477,10 @@ const COMMAND_STRIDE: usize = 0x1000;
 const STREAM_STRIDE: usize = 0x400;
 
 pub(crate) struct CommandPool {
+    /// Two command buffers per slot, used in turn (`g14_v27_2_abi::pool_command`).
     commands: fw::types::GpuArray<u8>,
+    /// Which of its two command buffers each slot last published, one bit per slot.
+    published: u64,
     streams: fw::types::GpuArray<u8>,
     tracking: fw::types::GpuArray<u8>,
     cursors: fw::types::GpuArray<u8>,
@@ -487,7 +490,7 @@ pub(crate) struct CommandPool {
 
 impl CommandPool {
     pub(crate) fn new(alloc: &mut KernelAllocators, cfg: &'static hw::HwConfig) -> Result<Self> {
-        let commands = alloc.private.array_empty::<u8>(POOL_SLOTS * COMMAND_STRIDE)?;
+        let commands = alloc.private.array_empty::<u8>(2 * POOL_SLOTS * COMMAND_STRIDE)?;
         let streams = alloc.private.array_empty::<u8>(POOL_SLOTS * STREAM_STRIDE)?;
         let mut tracking = alloc.private.array_empty::<u8>(POOL_SLOTS * 0x100)?;
         // One 64-byte line per retirement cursor, so no firmware write can reach a neighbour.
@@ -498,7 +501,8 @@ impl CommandPool {
             put64(chunk, 0, base + 0x40 * i as u64);
         }
         crate::pgtable::clean_poc(tracking.as_slice().as_ptr(), tracking.as_slice().len());
-        Ok(Self { commands, streams, tracking, cursors, stamps, preempt1: cfg.compute_preempt1_size as u64 })
+        Ok(Self { commands, published: 0, streams, tracking, cursors, stamps,
+                  preempt1: cfg.compute_preempt1_size as u64 })
     }
 
     /// Builds slot `i` for `job` and returns the command's firmware VA.
@@ -516,7 +520,14 @@ impl CommandPool {
         encode: impl FnOnce(&mut [u8], &mut [u8], crate::g14_v27_2_render::Common) -> Result,
     ) -> Result<u64> {
         if i >= POOL_SLOTS { return Err(EINVAL); }
-        let cmd_va = self.commands.gpu_va().get() + (i * COMMAND_STRIDE) as u64;
+        // The firmware may read a retired command's JobMeta after it has unlinked the slot
+        // (for the stamp stores it still has queued), so the slot's next command goes to its
+        // other buffer. A buffer is rewritten only after the slot has been retired and
+        // unlinked once more, which the firmware does in a later pass. Encoding always
+        // takes the spare; `published` moves it only once the firmware can see the command,
+        // so a publication that fails leaves the last published buffer alone.
+        let c = g14_v27_2_abi::pool_command(i, g14_v27_2_abi::spare_buffer(self.published, i));
+        let cmd_va = self.commands.gpu_va().get() + (c * COMMAND_STRIDE) as u64;
         let stream_va = self.streams.gpu_va().get() + (i * STREAM_STRIDE) as u64;
         let tracking_va = self.tracking.gpu_va().get() + (i * 0x100) as u64;
         let timestamps_va = self.stamps.gpu_va().get() + (i * 0x80) as u64;
@@ -526,7 +537,7 @@ impl CommandPool {
         let stamps = &mut self.stamps.as_mut_slice()[i * 0x80..(i + 1) * 0x80];
         stamps.fill(0);
         crate::pgtable::clean_poc(stamps.as_ptr(), stamps.len());
-        let cmd = &mut self.commands.as_mut_slice()[i * COMMAND_STRIDE..(i + 1) * COMMAND_STRIDE];
+        let cmd = &mut self.commands.as_mut_slice()[c * COMMAND_STRIDE..(c + 1) * COMMAND_STRIDE];
         cmd.fill(0);
         let stream = &mut self.streams.as_mut_slice()[i * STREAM_STRIDE..(i + 1) * STREAM_STRIDE];
         stream.fill(0);
@@ -538,6 +549,12 @@ impl CommandPool {
         crate::pgtable::clean_poc(cmd.as_ptr(), cmd.len());
         crate::pgtable::poc_barrier();
         Ok(cmd_va)
+    }
+
+    /// Slot `i`'s command, encoded in its spare buffer, is now visible to the firmware: the
+    /// next encode of the slot takes the other buffer.
+    pub(crate) fn mark_published(&mut self, i: usize) {
+        if i < POOL_SLOTS { self.published ^= 1 << i; }
     }
 
     /// Retirement: advance slot `i`'s cursor to the value the firmware recorded at
@@ -558,6 +575,18 @@ impl CommandPool {
         crate::pgtable::clean_poc(self.cursors.as_slice()[i * 0x40..].as_ptr(), 0x40);
         crate::pgtable::poc_barrier();
         Ok(true)
+    }
+
+    /// Slot `i`'s record count (+0xc), its retirement cursor and whether the firmware still
+    /// holds it in the queue's tracking list (+0x94), for a stall report.
+    pub(crate) fn describe(&self, i: usize) -> Result<(u32, u32, u32)> {
+        if i >= POOL_SLOTS { return Err(EINVAL); }
+        crate::pgtable::clean_invalidate_poc(self.tracking.as_slice()[i * 0x100..].as_ptr(), 0x100);
+        crate::pgtable::clean_invalidate_poc(self.cursors.as_slice()[i * 0x40..].as_ptr(), 0x40);
+        crate::pgtable::poc_barrier();
+        Ok((self.tracking.shared_index(i * 0x100 + 0xc)?.load(Ordering::Acquire),
+            self.cursors.shared_index(i * 0x40)?.load(Ordering::Acquire),
+            self.tracking.shared_index(i * 0x100 + 0x94)?.load(Ordering::Acquire)))
     }
 
     /// Whether the firmware still holds slot `i` in the queue's tracking list (+0x94).

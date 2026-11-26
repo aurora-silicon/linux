@@ -740,6 +740,11 @@ impl Runtime {
             let slot = (state.next_slot + k) % POOL_SLOTS;
             if state.busy & (1 << slot) != 0 { continue; }
             if state.pool.registered(slot)? {
+                // The firmware can count another record for a retired slot after its cursor
+                // was advanced, and keeps the slot listed until the cursor matches again:
+                // advance it to the current count. The slot's last command stays intact in
+                // its buffer, so an early unlink is harmless.
+                state.pool.retire(slot)?;
                 state.skipped += 1;
                 continue;
             }
@@ -779,7 +784,16 @@ impl Runtime {
                 Ok(Some(slots)) => slots,
                 Ok(None) => return,
                 Err(err) => {
-                    dev_err!(self.dev, "GPU: command pool stalled: {:?}\n", err);
+                    dev_err!(self.dev, "GPU: command pool stalled: {:?} busy={:#x} unacked={:#x} inflight={} rendering={}\n",
+                             err, state.busy, state.unacked, state.inflight.len(), state.rendering.is_some());
+                    for slot in 0..POOL_SLOTS {
+                        if let Ok((count, cursor, linked)) = state.pool.describe(slot) {
+                            if linked != 0 || count != cursor {
+                                dev_err!(self.dev, "GPU: slot {}: records={} cursor={} linked={}\n",
+                                         slot, count, cursor, linked);
+                            }
+                        }
+                    }
                     self.fail_all(state, err);
                     return;
                 }
@@ -828,6 +842,7 @@ impl Runtime {
             publication_error: None, started: Instant::now(), _bind: bind }, GFP_KERNEL)?;
         packet.mark_published();
         submission.publish();
+        state.pool.mark_published(slot);
         state.last = stamp;
         state.sequence += 1;
         state.unacked &= !(1 << slot);
@@ -888,6 +903,9 @@ impl Runtime {
         // Queue the fragment dependency before kicking the tiler that satisfies it.
         fs_post.publish();
         ta_post.publish();
+        for slot in slots {
+            state.pool.mark_published(slot);
+        }
         for slot in slots {
             state.busy |= 1 << slot;
             state.unacked &= !(1 << slot);
