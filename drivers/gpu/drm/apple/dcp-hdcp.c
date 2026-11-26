@@ -90,6 +90,8 @@ struct dcp_hdcp {
 	wait_queue_head_t ev_wq;
 
 	struct apple_dcp_afkep *dpdev_ep;
+	/* The HDCP interface endpoint, when this file started it. */
+	struct apple_dcp_afkep *if_ep;
 
 	struct workqueue_struct *wq;
 	struct work_struct event_work;
@@ -917,37 +919,65 @@ dcp_hdcp_match_service(struct apple_dcp_afkep *ep, const char *service_name,
 	return NULL;
 }
 
-void dcp_hdcp_start_endpoints(struct apple_dcp *dcp)
+/*
+ * The endpoints that carry the HDCP interface services, by firmware: the
+ * first one advertised and not driven by anything else is started here.
+ */
+static const u8 dcp_hdcp_if_endpoints[] = { AV_AUDIO_ENDPOINT_DESKTOP, DPTX_HDCP_ENDPOINT };
+
+static struct apple_dcp_afkep *dcp_hdcp_start_one(struct apple_dcp *dcp, u8 endpoint,
+						  const struct apple_epic_service_ops *ops,
+						  struct apple_dcp_afkep **slot, const char *what)
 {
-	struct dcp_hdcp *h = READ_ONCE(dcp->hdcp);
 	struct apple_dcp_afkep *ep;
 	int ret;
 
-	if (!h || h->dpdev_ep || IS_ERR_OR_NULL(dcp->rtk) ||
-	    !apple_rtkit_has_endpoint(dcp->rtk, DPDEV_ENDPOINT))
-		return;
-	if (dcp->v27_sleep_transport &&
-	    READ_ONCE(dcp->sleep_v27_ep[DPDEV_ENDPOINT - 0x20]))
-		return;
-	ep = afk_init(dcp, DPDEV_ENDPOINT, dcp_hdcp_dpdev_ops);
+	if (!apple_rtkit_has_endpoint(dcp->rtk, endpoint) || dcp_endpoint_routed(dcp, endpoint))
+		return NULL;
+	ep = afk_init(dcp, endpoint, ops);
 	if (IS_ERR(ep)) {
-		dev_warn(dcp->dev, "HDCP: DP device endpoint not set up: %ld\n",
-			 PTR_ERR(ep));
-		return;
+		dev_warn(dcp->dev, "HDCP: %s endpoint %#x not set up: %ld\n", what,
+			 endpoint, PTR_ERR(ep));
+		return NULL;
 	}
-	ep->debugfs_entry = dcp->ep_debugfs[DPDEV_ENDPOINT - 0x20];
+	ep->debugfs_entry = dcp->ep_debugfs[endpoint - 0x20];
 	/* Routed before the start: afk_start() waits for the firmware's answer. */
-	WRITE_ONCE(h->dpdev_ep, ep);
+	WRITE_ONCE(*slot, ep);
 	ret = afk_start(ep);
 	if (ret)
-		dev_warn(dcp->dev, "HDCP: DP device endpoint not started: %d\n", ret);
+		dev_warn(dcp->dev, "HDCP: %s endpoint %#x not started: %d\n", what,
+			 endpoint, ret);
+	else
+		dev_info(dcp->dev, "HDCP: started the %s endpoint %#x\n", what, endpoint);
+	return ep;
+}
+
+void dcp_hdcp_start_endpoints(struct apple_dcp *dcp)
+{
+	struct dcp_hdcp *h = READ_ONCE(dcp->hdcp);
+	int i;
+
+	if (!h || IS_ERR_OR_NULL(dcp->rtk))
+		return;
+	if (!h->dpdev_ep)
+		dcp_hdcp_start_one(dcp, DPDEV_ENDPOINT, dcp_hdcp_dpdev_ops,
+				   &h->dpdev_ep, "DP device");
+	for (i = 0; i < ARRAY_SIZE(dcp_hdcp_if_endpoints) && !h->if_ep; i++)
+		dcp_hdcp_start_one(dcp, dcp_hdcp_if_endpoints[i], dcp_hdcp_service_ops,
+				   &h->if_ep, "HDCP interface");
 }
 
 struct apple_dcp_afkep *dcp_hdcp_route(struct apple_dcp *dcp, u32 endpoint)
 {
 	struct dcp_hdcp *h = READ_ONCE(dcp->hdcp);
-	struct apple_dcp_afkep *ep = h ? READ_ONCE(h->dpdev_ep) : NULL;
+	struct apple_dcp_afkep *ep;
 
+	if (!h)
+		return NULL;
+	ep = READ_ONCE(h->dpdev_ep);
+	if (ep && ep->endpoint == endpoint)
+		return ep;
+	ep = READ_ONCE(h->if_ep);
 	return ep && ep->endpoint == endpoint ? ep : NULL;
 }
 

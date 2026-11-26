@@ -1673,6 +1673,12 @@ static struct apple_dcp_afkep *dcp_afkep(struct apple_dcp *dcp, u8 endpoint)
 	}
 }
 
+/* Whether something already drives @endpoint (HDCP starts only idle ones). */
+bool dcp_endpoint_routed(struct apple_dcp *dcp, u8 endpoint)
+{
+	return !!dcp_afkep(dcp, endpoint);
+}
+
 /* RX and the watchdog may race to finish one present, never both. */
 bool dcp_desktop_present_complete(struct apple_dcp *dcp, u32 id)
 {

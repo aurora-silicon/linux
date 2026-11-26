@@ -19,11 +19,14 @@ struct platform_device;
  * (dcp-hdcp-wire.h), the transmitter (dcp-hdcp-tx.h) and the Content
  * Protection policy (dcp-hdcp.h), joined to the connector properties.
  */
+/* Whether something already drives @endpoint (dcp.c). */
+bool dcp_endpoint_routed(struct apple_dcp *dcp, u8 endpoint);
+
 #if IS_ENABLED(CONFIG_DRM_APPLE_HDCP)
 /* A display processor's HDCP state, if it has an HDCP channel; idempotent. */
 struct dcp_hdcp *dcp_hdcp_init(struct apple_dcp *dcp);
 void dcp_hdcp_fini(struct apple_dcp *dcp);
-/* Starts the DP device endpoint when no other path did. */
+/* Starts the DP device and HDCP interface endpoints when no other path did. */
 void dcp_hdcp_start_endpoints(struct apple_dcp *dcp);
 /* Routes the endpoints this file started. */
 struct apple_dcp_afkep *dcp_hdcp_route(struct apple_dcp *dcp, u32 endpoint);
