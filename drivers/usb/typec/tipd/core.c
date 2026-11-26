@@ -1755,6 +1755,26 @@ static void cd321x_event_lost(struct cd321x *cd321x)
 				 msecs_to_jiffies(CD321X_DEBOUNCE_DELAY_MS));
 }
 
+/**
+ * cd321x_revalidate - Read the cable state afresh and apply it
+ * @tps: The controller
+ *
+ * For a change that the controller signals with no event of its own, such as
+ * a new liquid-detection result read on a retry. The resume work alone does
+ * nothing while the port is running: it reads only in a revalidation.
+ *
+ * Context: tps->lock held.
+ */
+void cd321x_revalidate(struct tps6598x *tps)
+{
+	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
+
+	lockdep_assert_held(&tps->lock);
+	if (cd321x_pm_event_lost(&cd321x->pm))
+		mod_delayed_work(system_freezable_wq, &cd321x->resume_work, 0);
+}
+EXPORT_SYMBOL_GPL(cd321x_revalidate);
+
 /*
  * An attached cable need not generate an IRQ after sleep. Read a fresh
  * snapshot and reapply it with the mode cache invalidated, allowing the

@@ -689,12 +689,22 @@ enum sn201202x_ldcm_test_action {
 	LDCM_TEST_PUBLISH_UNKNOWN,
 	LDCM_TEST_PUBLISH_NONE,
 	LDCM_TEST_PUBLISH_LIQUID,
+	LDCM_TEST_OVERDUE,
+	LDCM_TEST_RERUN,
 };
 
 struct sn201202x_ldcm_test {
 	enum typec_contaminant reads[2];
 	int read_rets[2];
 	int mitigation_rets[2];
+	/* Waits overrun in a row, as the wait for a first result answers */
+	unsigned int overdue;
+	int rerun_ret;
+	/* Liquid reported since the last dry result: kept as the driver keeps it */
+	bool wet;
+	unsigned int results;
+	/* Status reads that failed in a row, as the driver counts them */
+	unsigned int read_failures;
 	enum sn201202x_ldcm_test_action actions[8];
 	unsigned int read_count;
 	unsigned int mitigation_count;
@@ -740,10 +750,54 @@ static void sn201202x_ldcm_test_publish(void *ctx,
 	}
 }
 
+static void sn201202x_ldcm_test_result(void *ctx,
+				       enum typec_contaminant contaminant)
+{
+	struct sn201202x_ldcm_test *t = ctx;
+
+	t->results++;
+	t->wet = contaminant == TYPEC_CONTAMINANT_LIQUID;
+}
+
+static bool sn201202x_ldcm_test_wet(void *ctx)
+{
+	struct sn201202x_ldcm_test *t = ctx;
+
+	return t->wet;
+}
+
+static unsigned int sn201202x_ldcm_test_overdue(void *ctx)
+{
+	struct sn201202x_ldcm_test *t = ctx;
+
+	t->actions[t->action_count++] = LDCM_TEST_OVERDUE;
+	return t->overdue;
+}
+
+static int sn201202x_ldcm_test_rerun(void *ctx)
+{
+	struct sn201202x_ldcm_test *t = ctx;
+
+	t->actions[t->action_count++] = LDCM_TEST_RERUN;
+	return t->rerun_ret;
+}
+
+static unsigned int sn201202x_ldcm_test_read_failures(void *ctx)
+{
+	struct sn201202x_ldcm_test *t = ctx;
+
+	return t->read_failures;
+}
+
 static const struct sn201202x_ldcm_ops sn201202x_ldcm_test_ops = {
 	.read = sn201202x_ldcm_test_read,
 	.set_mitigation = sn201202x_ldcm_test_mitigate,
 	.publish = sn201202x_ldcm_test_publish,
+	.result = sn201202x_ldcm_test_result,
+	.wet = sn201202x_ldcm_test_wet,
+	.overdue = sn201202x_ldcm_test_overdue,
+	.rerun = sn201202x_ldcm_test_rerun,
+	.read_failures = sn201202x_ldcm_test_read_failures,
 };
 
 static void sn201202x_ldcm_test_actions(struct kunit *test,
@@ -770,6 +824,7 @@ static void sn201202x_ldcm_liquid_order_test(struct kunit *test)
 							  &sn201202x_ldcm_test_ops,
 							  TYPEC_CONTAMINANT_UNKNOWN), 0);
 	sn201202x_ldcm_test_actions(test, &t, actions, ARRAY_SIZE(actions));
+	KUNIT_EXPECT_TRUE(test, t.wet);
 }
 
 static void sn201202x_ldcm_read_failure_order_test(struct kunit *test)
@@ -782,6 +837,8 @@ static void sn201202x_ldcm_read_failure_order_test(struct kunit *test)
 	struct sn201202x_ldcm_test t = {
 		.reads = { TYPEC_CONTAMINANT_UNKNOWN },
 		.read_rets = { -EIO },
+		/* A failed read is never taken for an overdue measurement. */
+		.overdue = 2,
 	};
 
 	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_update_state(&t,
@@ -819,12 +876,16 @@ static void sn201202x_ldcm_dry_order_test(struct kunit *test)
 	};
 	struct sn201202x_ldcm_test t = {
 		.reads = { TYPEC_CONTAMINANT_NONE, TYPEC_CONTAMINANT_NONE },
+		.wet = true,
 	};
 
+	/* A dry result ends what liquid reported before it. */
 	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_update_state(&t,
 							  &sn201202x_ldcm_test_ops,
-							  TYPEC_CONTAMINANT_UNKNOWN), 0);
+							  TYPEC_CONTAMINANT_LIQUID), 0);
 	sn201202x_ldcm_test_actions(test, &t, actions, ARRAY_SIZE(actions));
+	KUNIT_EXPECT_FALSE(test, t.wet);
+	KUNIT_EXPECT_EQ(test, t.results, 2U);
 }
 
 static void sn201202x_ldcm_dry_then_busy_test(struct kunit *test)
@@ -895,6 +956,7 @@ static void sn201202x_ldcm_dry_race_test(struct kunit *test)
 							  &sn201202x_ldcm_test_ops,
 							  TYPEC_CONTAMINANT_UNKNOWN), 0);
 	sn201202x_ldcm_test_actions(test, &t, actions, ARRAY_SIZE(actions));
+	KUNIT_EXPECT_TRUE(test, t.wet);
 }
 
 static void sn201202x_ldcm_dry_race_mitigation_failure_test(struct kunit *test)
@@ -929,10 +991,14 @@ static void sn201202x_ldcm_busy_keeps_result_test(struct kunit *test)
 	};
 	unsigned int i;
 
-	/* A running measurement neither mitigates nor republishes anything. */
+	/*
+	 * A running measurement neither mitigates nor republishes anything.
+	 * With a result, however long it runs: liquid stays mitigated.
+	 */
 	for (i = 0; i < ARRAY_SIZE(last); i++) {
 		struct sn201202x_ldcm_test t = {
 			.reads = { TYPEC_CONTAMINANT_UNKNOWN },
+			.overdue = 2,
 		};
 
 		KUNIT_EXPECT_EQ(test, sn201202x_ldcm_update_state(&t,
@@ -948,19 +1014,316 @@ static void sn201202x_ldcm_busy_without_result_test(struct kunit *test)
 {
 	const enum sn201202x_ldcm_test_action actions[] = {
 		LDCM_TEST_READ,
-		LDCM_TEST_MITIGATE_ON,
-		LDCM_TEST_PUBLISH_UNKNOWN,
+		LDCM_TEST_OVERDUE,
 	};
 	struct sn201202x_ldcm_test t = {
 		.reads = { TYPEC_CONTAMINANT_UNKNOWN },
 	};
 
-	/* Without an earlier result a measurement is handled as unknown. */
+	/*
+	 * Without an earlier result the port stays down (unknown is already
+	 * published), but mitigation is not forced on: a measurement that a
+	 * mitigation command interrupts need not finish.
+	 */
 	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_update_state(&t,
 							  &sn201202x_ldcm_test_ops,
 							  TYPEC_CONTAMINANT_UNKNOWN),
-			-EAGAIN);
+			-EINPROGRESS);
 	sn201202x_ldcm_test_actions(test, &t, actions, ARRAY_SIZE(actions));
+}
+
+static void sn201202x_ldcm_overdue_once_test(struct kunit *test)
+{
+	const enum sn201202x_ldcm_test_action actions[] = {
+		LDCM_TEST_READ,
+		LDCM_TEST_OVERDUE,
+		LDCM_TEST_RERUN,
+	};
+	struct sn201202x_ldcm_test t = {
+		.reads = { TYPEC_CONTAMINANT_UNKNOWN },
+		.overdue = 1,
+	};
+
+	/*
+	 * A first overrun makes the controller measure again, and the port
+	 * stays down meanwhile: nothing is published.
+	 */
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_update_state(&t,
+							  &sn201202x_ldcm_test_ops,
+							  TYPEC_CONTAMINANT_UNKNOWN),
+			-EINPROGRESS);
+	sn201202x_ldcm_test_actions(test, &t, actions, ARRAY_SIZE(actions));
+}
+
+static void sn201202x_ldcm_overdue_once_rerun_failure_test(struct kunit *test)
+{
+	const enum sn201202x_ldcm_test_action actions[] = {
+		LDCM_TEST_READ,
+		LDCM_TEST_OVERDUE,
+		LDCM_TEST_RERUN,
+	};
+	struct sn201202x_ldcm_test t = {
+		.reads = { TYPEC_CONTAMINANT_UNKNOWN },
+		.overdue = 1,
+		.rerun_ret = -ETIMEDOUT,
+	};
+
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_update_state(&t,
+							  &sn201202x_ldcm_test_ops,
+							  TYPEC_CONTAMINANT_UNKNOWN),
+			-ETIMEDOUT);
+	sn201202x_ldcm_test_actions(test, &t, actions, ARRAY_SIZE(actions));
+}
+
+static void sn201202x_ldcm_overdue_twice_dry_test(struct kunit *test)
+{
+	const enum sn201202x_ldcm_test_action actions[] = {
+		LDCM_TEST_READ,
+		LDCM_TEST_OVERDUE,
+		LDCM_TEST_MITIGATE_OFF,
+		LDCM_TEST_READ,
+		LDCM_TEST_PUBLISH_NONE,
+	};
+	struct sn201202x_ldcm_test t = {
+		.reads = { TYPEC_CONTAMINANT_UNKNOWN, TYPEC_CONTAMINANT_NONE },
+		.overdue = 2,
+	};
+
+	/* The measurement run again overran too: ended toward a working port. */
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_update_state(&t,
+							  &sn201202x_ldcm_test_ops,
+							  TYPEC_CONTAMINANT_UNKNOWN), 0);
+	sn201202x_ldcm_test_actions(test, &t, actions, ARRAY_SIZE(actions));
+}
+
+static void sn201202x_ldcm_overdue_still_busy_test(struct kunit *test)
+{
+	const enum sn201202x_ldcm_test_action actions[] = {
+		LDCM_TEST_READ,
+		LDCM_TEST_OVERDUE,
+		LDCM_TEST_MITIGATE_OFF,
+		LDCM_TEST_READ,
+		LDCM_TEST_PUBLISH_NONE,
+	};
+	struct sn201202x_ldcm_test t = {
+		.reads = { TYPEC_CONTAMINANT_UNKNOWN, TYPEC_CONTAMINANT_UNKNOWN },
+		.overdue = 2,
+	};
+
+	/*
+	 * Still measuring once mitigation is removed: the port is enabled
+	 * while the controller measures on, and the measurement keeps that
+	 * result until it reports a new one.
+	 */
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_update_state(&t,
+							  &sn201202x_ldcm_test_ops,
+							  TYPEC_CONTAMINANT_UNKNOWN),
+			-EINPROGRESS);
+	sn201202x_ldcm_test_actions(test, &t, actions, ARRAY_SIZE(actions));
+}
+
+static void sn201202x_ldcm_overdue_liquid_test(struct kunit *test)
+{
+	const enum sn201202x_ldcm_test_action actions[] = {
+		LDCM_TEST_READ,
+		LDCM_TEST_OVERDUE,
+		LDCM_TEST_MITIGATE_OFF,
+		LDCM_TEST_READ,
+		LDCM_TEST_MITIGATE_ON,
+		LDCM_TEST_PUBLISH_LIQUID,
+	};
+	struct sn201202x_ldcm_test t = {
+		.reads = { TYPEC_CONTAMINANT_UNKNOWN, TYPEC_CONTAMINANT_LIQUID },
+		.overdue = 2,
+	};
+
+	/* Liquid that the measurement run again reports is mitigated. */
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_update_state(&t,
+							  &sn201202x_ldcm_test_ops,
+							  TYPEC_CONTAMINANT_UNKNOWN), 0);
+	sn201202x_ldcm_test_actions(test, &t, actions, ARRAY_SIZE(actions));
+	KUNIT_EXPECT_TRUE(test, t.wet);
+}
+
+static void sn201202x_ldcm_overdue_mitigation_failure_test(struct kunit *test)
+{
+	const enum sn201202x_ldcm_test_action actions[] = {
+		LDCM_TEST_READ,
+		LDCM_TEST_OVERDUE,
+		LDCM_TEST_MITIGATE_OFF,
+		LDCM_TEST_PUBLISH_UNKNOWN,
+	};
+	struct sn201202x_ldcm_test t = {
+		.reads = { TYPEC_CONTAMINANT_UNKNOWN },
+		.mitigation_rets = { -ETIMEDOUT },
+		.overdue = 2,
+	};
+
+	/* A controller that does not take the command keeps the port down. */
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_update_state(&t,
+							  &sn201202x_ldcm_test_ops,
+							  TYPEC_CONTAMINANT_UNKNOWN),
+			-ETIMEDOUT);
+	sn201202x_ldcm_test_actions(test, &t, actions, ARRAY_SIZE(actions));
+}
+
+/*
+ * Liquid, then a mitigation command that fails: "unknown" is published, but
+ * the port is still known to be wet. The measurement that follows is never
+ * waited out toward a working port: the port is mitigated, and the liquid
+ * reported again.
+ */
+static void sn201202x_ldcm_wet_never_overdue_test(struct kunit *test)
+{
+	const enum sn201202x_ldcm_test_action first[] = {
+		LDCM_TEST_READ,
+		LDCM_TEST_MITIGATE_ON,
+		LDCM_TEST_PUBLISH_UNKNOWN,
+	};
+	const enum sn201202x_ldcm_test_action then[] = {
+		LDCM_TEST_READ,
+		LDCM_TEST_MITIGATE_ON,
+		LDCM_TEST_PUBLISH_LIQUID,
+	};
+	struct sn201202x_ldcm_test t = {
+		.reads = { TYPEC_CONTAMINANT_LIQUID },
+		.mitigation_rets = { -ETIMEDOUT },
+	};
+	struct sn201202x_ldcm_test t2 = {
+		.reads = { TYPEC_CONTAMINANT_UNKNOWN },
+		.overdue = 2,
+	};
+
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_update_state(&t,
+							  &sn201202x_ldcm_test_ops,
+							  TYPEC_CONTAMINANT_UNKNOWN),
+			-ETIMEDOUT);
+	sn201202x_ldcm_test_actions(test, &t, first, ARRAY_SIZE(first));
+	KUNIT_ASSERT_TRUE(test, t.wet);
+
+	t2.wet = t.wet;
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_update_state(&t2,
+							  &sn201202x_ldcm_test_ops,
+							  TYPEC_CONTAMINANT_UNKNOWN),
+			-EINPROGRESS);
+	sn201202x_ldcm_test_actions(test, &t2, then, ARRAY_SIZE(then));
+	KUNIT_EXPECT_TRUE(test, t2.wet);
+}
+
+static void sn201202x_ldcm_wet_mitigation_failure_test(struct kunit *test)
+{
+	const enum sn201202x_ldcm_test_action actions[] = {
+		LDCM_TEST_READ,
+		LDCM_TEST_MITIGATE_ON,
+	};
+	struct sn201202x_ldcm_test t = {
+		.reads = { TYPEC_CONTAMINANT_UNKNOWN },
+		.mitigation_rets = { -ETIMEDOUT },
+		.overdue = 2,
+		.wet = true,
+	};
+
+	/* Still wet: the port stays down, and the command is retried. */
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_update_state(&t,
+							  &sn201202x_ldcm_test_ops,
+							  TYPEC_CONTAMINANT_UNKNOWN),
+			-ETIMEDOUT);
+	sn201202x_ldcm_test_actions(test, &t, actions, ARRAY_SIZE(actions));
+}
+
+static void sn201202x_ldcm_liquid_read_failure_test(struct kunit *test)
+{
+	const enum sn201202x_ldcm_test_action actions[] = {
+		LDCM_TEST_READ,
+		LDCM_TEST_MITIGATE_ON,
+		LDCM_TEST_PUBLISH_LIQUID,
+	};
+	struct sn201202x_ldcm_test t = {
+		.reads = { TYPEC_CONTAMINANT_UNKNOWN },
+		.read_rets = { -EIO },
+		.wet = true,
+	};
+
+	/* A failed read is no result: the liquid stays reported. */
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_update_state(&t,
+							  &sn201202x_ldcm_test_ops,
+							  TYPEC_CONTAMINANT_LIQUID), -EIO);
+	sn201202x_ldcm_test_actions(test, &t, actions, ARRAY_SIZE(actions));
+	KUNIT_EXPECT_TRUE(test, t.wet);
+	KUNIT_EXPECT_EQ(test, t.results, 0U);
+}
+
+static void sn201202x_ldcm_liquid_mitigation_failure_test(struct kunit *test)
+{
+	const enum sn201202x_ldcm_test_action actions[] = {
+		LDCM_TEST_READ,
+		LDCM_TEST_MITIGATE_ON,
+		LDCM_TEST_PUBLISH_LIQUID,
+	};
+	struct sn201202x_ldcm_test t = {
+		.reads = { TYPEC_CONTAMINANT_LIQUID },
+		.mitigation_rets = { -ETIMEDOUT },
+	};
+
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_update_state(&t,
+							  &sn201202x_ldcm_test_ops,
+							  TYPEC_CONTAMINANT_LIQUID),
+			-ETIMEDOUT);
+	sn201202x_ldcm_test_actions(test, &t, actions, ARRAY_SIZE(actions));
+}
+
+static void sn201202x_ldcm_wait_test(struct kunit *test)
+{
+	unsigned long stuck = msecs_to_jiffies(SN201202X_LDCM_STUCK_MS);
+	struct sn201202x_ldcm_wait wait = {};
+	unsigned long start = -(stuck / 2);	/* across a jiffies wrap */
+
+	/* The first measurement without a result starts the wait. */
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_wait_overdue(&wait, start), 0U);
+	KUNIT_EXPECT_TRUE(test, wait.waiting);
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_retry_ms(&wait, 0), SN201202X_LDCM_RETRY_MS);
+	/* A failed read is retried slowly too. */
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_retry_ms(&wait, 1), SN201202X_LDCM_SLOW_RETRY_MS);
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_wait_overdue(&wait, start + stuck - 1), 0U);
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_wait_overdue(&wait, start + stuck), 1U);
+	/* Overrun once: retried slowly, and the measurement run again gets a whole wait. */
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_retry_ms(&wait, 0), SN201202X_LDCM_SLOW_RETRY_MS);
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_wait_overdue(&wait, start + 2 * stuck - 1), 0U);
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_wait_overdue(&wait, start + 2 * stuck), 2U);
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_wait_overdue(&wait, start + 3 * stuck), 2U);
+
+	/* A result ends the wait; the next measurement starts another. */
+	wait = (struct sn201202x_ldcm_wait){};
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_retry_ms(&wait, 0), SN201202X_LDCM_RETRY_MS);
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_wait_overdue(&wait, start + 10 * stuck), 0U);
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_wait_overdue(&wait, start + 11 * stuck - 1), 0U);
+}
+
+/* In the busy-wait of suspend-to-idle, mitigation is never removed. */
+static void sn201202x_ldcm_atomic_test(struct kunit *test)
+{
+	struct sn201202x *sn = kunit_kzalloc(test, sizeof(*sn), GFP_KERNEL);
+	struct tps6598x *tps;
+
+	KUNIT_ASSERT_NOT_NULL(test, sn);
+	tps = &sn->cd.tps;
+	sn->atomic = true;
+	sn->ldcm_mitigation_known = true;
+	sn->ldcm_mitigated = true;
+
+	/* Refused without touching the bus (there is none here) */
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_set_mitigation(tps, false), -EAGAIN);
+	KUNIT_EXPECT_TRUE(test, sn->ldcm_mitigation_known);
+	KUNIT_EXPECT_TRUE(test, sn->ldcm_mitigated);
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_set_mitigation(tps, true), 0);
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_rerun(tps), -EAGAIN);
+	KUNIT_EXPECT_TRUE(test, sn->ldcm_mitigation_known);
+
+	/* No wait runs out there: the update after the resume decides. */
+	sn->ldcm_wait.waiting = true;
+	sn->ldcm_wait.since = jiffies - msecs_to_jiffies(10 * SN201202X_LDCM_STUCK_MS);
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_overdue(tps), 0U);
+	KUNIT_EXPECT_EQ(test, sn->ldcm_wait.overdue, 0U);
 }
 
 static void sn201202x_ldcm_read_failure_with_result_test(struct kunit *test)
@@ -973,6 +1336,7 @@ static void sn201202x_ldcm_read_failure_with_result_test(struct kunit *test)
 	struct sn201202x_ldcm_test t = {
 		.reads = { TYPEC_CONTAMINANT_UNKNOWN },
 		.read_rets = { -EIO },
+		.read_failures = SN201202X_LDCM_READ_TRIES,
 	};
 
 	/* A failed read is never mistaken for a running measurement. */
@@ -981,6 +1345,84 @@ static void sn201202x_ldcm_read_failure_with_result_test(struct kunit *test)
 							  TYPEC_CONTAMINANT_NONE),
 			-EIO);
 	sn201202x_ldcm_test_actions(test, &t, actions, ARRAY_SIZE(actions));
+}
+
+/*
+ * A dry port, maybe with a dock or a display on it, is not mitigated for a
+ * failed read: only for SN201202X_LDCM_READ_TRIES failures in a row.
+ */
+static void sn201202x_ldcm_dry_read_failure_retried_test(struct kunit *test)
+{
+	const enum sn201202x_ldcm_test_action retried[] = {
+		LDCM_TEST_READ,
+	};
+	const enum sn201202x_ldcm_test_action mitigated[] = {
+		LDCM_TEST_READ,
+		LDCM_TEST_MITIGATE_ON,
+		LDCM_TEST_PUBLISH_UNKNOWN,
+	};
+	unsigned int i;
+
+	for (i = 1; i < SN201202X_LDCM_READ_TRIES; i++) {
+		struct sn201202x_ldcm_test t = {
+			.reads = { TYPEC_CONTAMINANT_UNKNOWN },
+			.read_rets = { -EIO },
+			.read_failures = i,
+			.overdue = 2,
+		};
+
+		KUNIT_EXPECT_EQ(test, sn201202x_ldcm_update_state(&t,
+								  &sn201202x_ldcm_test_ops,
+								  TYPEC_CONTAMINANT_NONE),
+				-EIO);
+		sn201202x_ldcm_test_actions(test, &t, retried, ARRAY_SIZE(retried));
+	}
+
+	for (i = SN201202X_LDCM_READ_TRIES; i <= SN201202X_LDCM_READ_TRIES + 1; i++) {
+		struct sn201202x_ldcm_test t = {
+			.reads = { TYPEC_CONTAMINANT_UNKNOWN },
+			.read_rets = { -EIO },
+			.read_failures = i,
+		};
+
+		KUNIT_EXPECT_EQ(test, sn201202x_ldcm_update_state(&t,
+								  &sn201202x_ldcm_test_ops,
+								  TYPEC_CONTAMINANT_NONE),
+				-EIO);
+		sn201202x_ldcm_test_actions(test, &t, mitigated, ARRAY_SIZE(mitigated));
+	}
+}
+
+/* Without a result, or wet, a failed read mitigates at once, as before. */
+static void sn201202x_ldcm_read_failure_not_dry_test(struct kunit *test)
+{
+	const struct {
+		enum typec_contaminant last;
+		enum sn201202x_ldcm_test_action publish;
+	} cases[] = {
+		{ TYPEC_CONTAMINANT_UNKNOWN, LDCM_TEST_PUBLISH_UNKNOWN },
+		{ TYPEC_CONTAMINANT_LIQUID, LDCM_TEST_PUBLISH_LIQUID },
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		const enum sn201202x_ldcm_test_action actions[] = {
+			LDCM_TEST_READ,
+			LDCM_TEST_MITIGATE_ON,
+			cases[i].publish,
+		};
+		struct sn201202x_ldcm_test t = {
+			.reads = { TYPEC_CONTAMINANT_UNKNOWN },
+			.read_rets = { -EIO },
+			.read_failures = 1,
+		};
+
+		KUNIT_EXPECT_EQ(test, sn201202x_ldcm_update_state(&t,
+								  &sn201202x_ldcm_test_ops,
+								  cases[i].last),
+				-EIO);
+		sn201202x_ldcm_test_actions(test, &t, actions, ARRAY_SIZE(actions));
+	}
 }
 
 struct sn201202x_ldcm_stop_test {
@@ -1052,7 +1494,21 @@ static struct kunit_case sn201202x_pm_cases[] = {
 	KUNIT_CASE(sn201202x_ldcm_dry_race_mitigation_failure_test),
 	KUNIT_CASE(sn201202x_ldcm_busy_keeps_result_test),
 	KUNIT_CASE(sn201202x_ldcm_busy_without_result_test),
+	KUNIT_CASE(sn201202x_ldcm_overdue_once_test),
+	KUNIT_CASE(sn201202x_ldcm_overdue_once_rerun_failure_test),
+	KUNIT_CASE(sn201202x_ldcm_overdue_twice_dry_test),
+	KUNIT_CASE(sn201202x_ldcm_overdue_still_busy_test),
+	KUNIT_CASE(sn201202x_ldcm_overdue_liquid_test),
+	KUNIT_CASE(sn201202x_ldcm_overdue_mitigation_failure_test),
+	KUNIT_CASE(sn201202x_ldcm_wet_never_overdue_test),
+	KUNIT_CASE(sn201202x_ldcm_wet_mitigation_failure_test),
+	KUNIT_CASE(sn201202x_ldcm_liquid_read_failure_test),
+	KUNIT_CASE(sn201202x_ldcm_liquid_mitigation_failure_test),
+	KUNIT_CASE(sn201202x_ldcm_wait_test),
+	KUNIT_CASE(sn201202x_ldcm_atomic_test),
 	KUNIT_CASE(sn201202x_ldcm_read_failure_with_result_test),
+	KUNIT_CASE(sn201202x_ldcm_dry_read_failure_retried_test),
+	KUNIT_CASE(sn201202x_ldcm_read_failure_not_dry_test),
 	KUNIT_CASE(sn201202x_ldcm_stop_requeue_test),
 	KUNIT_CASE(sn201202x_idle_sleep_test),
 	KUNIT_CASE(sn201202x_atomic_access_test),

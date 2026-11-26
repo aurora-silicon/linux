@@ -79,6 +79,11 @@ config TYPEC_SN201202X_KUNIT_TEST
 	  for system suspend. Also test which data status and status count as
 	  a link that wakes the system from suspend-to-idle. Liquid-detection
 	  coverage includes status decode and the ordering of controller
-	  mitigation, dry revalidation and connector-state reporting. These tests
-	  run on a simulated SPMI bus, without accessing a physical Type-C
-	  controller.
+	  mitigation, dry revalidation and connector-state reporting, and that
+	  a measurement without an earlier result does not force mitigation
+	  on, is made to start again after one bounded wait and enables the
+	  port only after a second one, never for a port known to be wet, and
+	  that mitigation is never removed from the suspend-to-idle busy-wait,
+	  nor put on a port reported dry for a single failed status read.
+	  These tests run on a simulated SPMI bus, without accessing a
+	  physical Type-C controller.
