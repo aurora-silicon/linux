@@ -841,7 +841,15 @@ static int ave_session_attach(struct ave_ctx *ctx)
 	 * Starting and stopping sessions next to one that stays open would
 	 * keep all of it: once as many stopped sessions wait as the encoder
 	 * runs at once, refuse another before the firmware is given anything.
+	 * Without a reset proof (witness_unusable) the reap never frees them
+	 * this boot, so then the limit holds with no session running too.
 	 */
+	if (ave->witness_unusable && ave->failed_count >= AVE_MAX_SESSIONS) {
+		dev_warn_once(ave->dev,
+			      "%u stopped sessions wait for a reset proof this firmware does not give; not starting more\n",
+			      ave->failed_count);
+		return -EBUSY;
+	}
 	if (ave_session_count(ave) && ave->failed_count >= AVE_MAX_SESSIONS) {
 		dev_err_ratelimited(ave->dev,
 				    "%u stopped sessions wait for the encoder to power off; not starting another\n",

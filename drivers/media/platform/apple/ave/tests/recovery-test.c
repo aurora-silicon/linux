@@ -651,9 +651,56 @@ static void quarantine_churn(void)
 	assert(!ave.failed_sessions && !ave.failed_count);
 }
 
+/*
+ * Without a reset proof the reap keeps every stopped session for the whole
+ * boot, so sessions started one at a time would pile up with none running
+ * beside them. There the limit holds with no session running too.
+ */
+static void quarantine_no_witness(void)
+{
+	unsigned int started = 0, refused = 0;
+	int ret;
+
+	init();
+	ave.fw_state = AVE_FW_HALTED;
+	ave.witness_unusable = true;
+	for (unsigned int i = 0; i < 8; i++) {
+		ctx[0].sess = calloc(1, sizeof(*ctx[0].sess));
+		assert(ctx[0].sess);
+		ctx[0].sess->p.slots = 2;
+		ctx[0].sess->p.codec = AVE_CODEC_H264;
+		submit_ctx = &ctx[0];
+		mutex_lock(&ave.hw_lock);
+		/* The restart's reap has no proof and keeps the list. */
+		ave_sess_reap(&ave);
+		ret = ave_session_attach(&ctx[0]);
+		if (!ret) {
+			started++;
+			ave_session_close(&ctx[0], false);	/* the last one: halt */
+		} else {
+			refused++;
+			assert(ret == -EBUSY && !ctx[0].sess->handed && !ave.sessions[0]);
+		}
+		mutex_unlock(&ave.hw_lock);
+		ave_sess_destroy(&ctx[0]);
+		assert(quarantined() <= AVE_MAX_SESSIONS && !ave_session_count(&ave));
+	}
+	assert(started == AVE_MAX_SESSIONS && refused == 8 - started);
+	assert(ave.failed_count == AVE_MAX_SESSIONS && halts == AVE_MAX_SESSIONS);
+
+	/* Test cleanup only: a proof this firmware never gives. */
+	ave.witness_unusable = false;
+	stop_seen = power_seen = true;
+	mutex_lock(&ave.hw_lock);
+	ave_sess_reap(&ave);
+	mutex_unlock(&ave.hw_lock);
+	assert(!ave.failed_sessions && !ave.failed_count);
+}
+
 int main(void)
 {
 	quarantine_churn();
+	quarantine_no_witness();
 	session_lifetime();
 	unconfirmed_close();
 	unusable_witness();
@@ -670,6 +717,6 @@ int main(void)
 	puts("ok: recovery ownership, queues, quarantine, reset proof, rate limit, "
 	     "PM rollback, DATA, IPC deadline and interrupt wait, MMAP/dma-buf release ordering, "
 	     "session and MCTF pool lifetime, canary, unconfirmed Close, unusable witness, "
-	     "bounded quarantine beside a running session");
+	     "bounded quarantine beside a running session and without a reset proof");
 	return 0;
 }
