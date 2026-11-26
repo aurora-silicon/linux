@@ -690,15 +690,16 @@ bool asahi_g17_commit_required(void)
 }
 
 /*
- * The same stop for G16: one firmware instance, whose control registers are the ASC's own, no
- * bridge and no PMP request to withdraw, as its vote stays through the sleep.
+ * What a G16 stop touches: one firmware instance, whose control registers are the ASC's own,
+ * no bridge, the GFX word, and the PMP's request for the GPU where the device tree names one
+ * (apple,pmp-report-entry). Without one the vote stays through the sleep, as on T8132.
  */
-struct asahi_g17_commit *asahi_g16_commit_prepare(struct device *dev, struct apple_rtkit *rtk)
+static struct asahi_g17_commit *asahi_g16_commit_alloc(struct device *dev,
+						       struct apple_rtkit *rtk)
 {
 	struct asahi_g17_commit *c;
 	struct device_node *np;
 	u32 offset;
-	int ret;
 
 	c = kzalloc_obj(*c);
 	if (!c)
@@ -708,16 +709,35 @@ struct asahi_g17_commit *asahi_g16_commit_prepare(struct device *dev, struct app
 	c->count = 1;
 	c->raise = asahi_g17_commit_raises(dev);
 
-	ret = -ENODEV;
 	c->cpu[0] = asahi_g17_map(dev->of_node, "asc", 0, ASC_CPU_CONTROL, 8);
 	np = of_parse_phandle(dev->of_node, "power-domains", 0);
-	if (!np)
-		goto err;
-	if (!of_property_read_u32(np, "reg", &offset) && np->parent)
+	if (np && !of_property_read_u32(np, "reg", &offset) && np->parent)
 		c->ps = asahi_g17_map(np->parent, NULL, 0, offset, 4);
 	of_node_put(np);
-	if (!c->cpu[0] || !c->ps)
-		goto err;
+	if (!c->cpu[0] || !c->ps) {
+		asahi_g17_commit_free(c);
+		return ERR_PTR(-ENODEV);
+	}
+	c->request = of_parse_phandle(dev->of_node, "apple,pmp-report-entry", 0);
+
+	return c;
+}
+
+/* The same stop for G16, made by the sleep's commit. */
+struct asahi_g17_commit *asahi_g16_commit_prepare(struct device *dev, struct apple_rtkit *rtk)
+{
+	struct asahi_g17_commit *c;
+	int ret;
+
+	c = asahi_g16_commit_alloc(dev, rtk);
+	if (IS_ERR(c))
+		return c;
+	if (c->request) {
+		ret = apple_pmp_report_entry_commit_owned(c->request, true);
+		if (ret)
+			goto err;
+		c->request_owned = true;
+	}
 
 	ret = apple_sleep_coproc_register_first(dev, asahi_g17_commit_stop, c);
 	if (ret)
@@ -729,6 +749,63 @@ struct asahi_g17_commit *asahi_g16_commit_prepare(struct device *dev, struct app
 err:
 	asahi_g17_commit_free(c);
 	return ERR_PTR(ret);
+}
+
+/*
+ * The G15S stop as macOS 27.2 makes it on J516s: in its device sleep, before any display request
+ * goes, 4.1 to 4.5 s before the commit. The same in all three full records
+ * (s2r-trace ref/t6030-macos-s2r-entry-full-{1,2,3}.tsv; run 1's times from the AP IDLE):
+ *  1. AP IDLE (0x201) on endpoint 0: echoed after 94 us;
+ *  2. IOP IDLE (0x201): acknowledged after 0.12 ms;
+ *  3. the mailbox's receive interrupt off (I2A control 0x21101 -> 0x21100) 38 us later, and
+ *     the mailbox's first word read (0x2e);
+ *  4. the PMP's AGX request (PTD request bit 4) withdrawn 20 us later;
+ *  5. 0.24 ms later the GFX word out of automatic power with its target on (0x0f0000ff), then
+ *     its target off (0x0f0003f0) 6 us after that.
+ * AFR, the GPU PMGR's +0x10000 and +0x14000 blocks stay for the sleep controller, which lowers
+ * them 2.7 to 6.6 ms before the commit.
+ *
+ * Those records don't cover the ASC's own page, so what macOS does with the run bit isn't
+ * known. The run bit goes off after the mailbox, as the commit's stop has it, so the restart
+ * boots the firmware from its vector whether or not the sleep reached the hardware.
+ *
+ * Interrupts on, in .prepare, before anything else suspends. Told to idle, the firmware can't
+ * carry on, so the stop goes on whatever it answers, and only a restart brings it back.
+ */
+struct asahi_g17_commit *asahi_g16_stop_now(struct device *dev, struct apple_rtkit *rtk)
+{
+	struct asahi_g17_commit *c;
+	u32 val;
+
+	c = asahi_g16_commit_alloc(dev, rtk);
+	if (IS_ERR(c))
+		return c;
+
+	c->ran = true;
+	c->entry = readl(c->ps);
+	/* The CPU's status is read below; macOS doesn't poll it */
+	c->idle[0] = apple_rtkit_sleep_idle_polled(c->rtk[0], NULL, &c->idle_us[0]);
+	apple_rtkit_mailbox_recv_off(c->rtk[0]);
+	c->words[0] = apple_rtkit_mailbox_status(c->rtk[0]);
+	c->request_ret = c->request ? apple_pmp_report_entry_request(c->request, false) : 0;
+	c->status[0] = readl(c->cpu[0] + ASC_CPU_STATUS);
+	writel(readl(c->cpu[0]) & ~ASC_CPU_CONTROL_RUN, c->cpu[0]);
+
+	val = readl(c->ps);
+	c->saved = val;
+	writel(val & ~(PS_AUTO_ENABLE | PS_BUSY | PS_FLAGS), c->ps);
+	val = readl(c->ps);
+	writel((val & ~(PS_AUTO_ENABLE | PS_BUSY | PS_FLAGS | PS_TARGET)) | PS_FLAGS, c->ps);
+	c->lower_ret = readl_poll_timeout(c->ps, c->lowered,
+					  !FIELD_GET(PS_ACTUAL, c->lowered) &&
+					  !(c->lowered & PS_BUSY),
+					  10, PS_TIMEOUT_US);
+
+	dev_info(dev, "GPU stopped for the sleep: idle %d in %u us, mailbox %#x, CPU status %#x, PMP request %d, GFX %#x -> %#x (%d)\n",
+		 c->idle[0], c->idle_us[0], c->words[0], c->status[0], c->request_ret,
+		 c->entry, c->lowered, c->lower_ret);
+
+	return c;
 }
 
 /*

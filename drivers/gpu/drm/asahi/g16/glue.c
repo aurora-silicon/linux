@@ -416,6 +416,9 @@ int asahi_g16_cooling_sample(struct asahi_g16_cooling *cooling, u64 now, bool id
 /*
  * genpd never turned the GFX domain's TVM gate off, so a sleep that lost it goes
  * unnoticed: the domain then doesn't come on. Enabled here if it's found clear.
+ *
+ * Only a GFX domain whose parent is such a gate has one. T6030's GFX hangs off two
+ * PMGR words instead (GPX and AFR), which the sleep controller lowers and raises.
  */
 int asahi_g16_tvm_enable(struct device *dev);
 int asahi_g16_tvm_enable(struct device *dev)
@@ -432,6 +435,10 @@ int asahi_g16_tvm_enable(struct device *dev)
 	of_node_put(gfx);
 	if (!tvm)
 		return -EINVAL;
+	if (!of_device_is_compatible(tvm, "apple,t8132-gfx-tvm")) {
+		of_node_put(tvm);
+		return 0;
+	}
 	reg = of_iomap(tvm, 0);
 	of_node_put(tvm);
 	if (!reg)
