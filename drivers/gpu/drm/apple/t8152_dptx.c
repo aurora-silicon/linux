@@ -196,7 +196,8 @@ static u32 dptx_apcall(struct t8152_display *disp, struct t8152_port *port,
 
 /*
  * The reply starts as a copy of the request and carries the call's status
- * in its first word; the transport status is always success.
+ * in its first word; the transport status is success unless the reply has
+ * no room for that word.
  */
 static int t8152_dptx_call(struct apple_epic_service *service, u16 group,
 			   u32 command, const void *data, size_t size,
@@ -209,6 +210,13 @@ static int t8152_dptx_call(struct apple_epic_service *service, u16 group,
 
 	dev_dbg(dcp->dev, "DPTX: port %d group %u command %u size %zu\n",
 		dptx ? (int)dptx->unit : -1, group, command, size);
+	/* The firmware sizes the reply; it has to hold the status word. */
+	if (room < sizeof(__le32)) {
+		dev_warn_ratelimited(dcp->dev,
+				     "DPTX: group %u command %u reply of %zu bytes has no room for its status\n",
+				     group, command, room);
+		return -EINVAL;
+	}
 	memcpy(reply, data, min(room, size));
 	if (disp)
 		status = dptx_apcall(disp, dptx ? &disp->port[dptx->unit] : NULL,
