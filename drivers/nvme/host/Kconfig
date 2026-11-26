@@ -135,3 +135,16 @@ config NVME_APPLE
 
 	  To compile this driver as a module, choose M here: the
 	  module will be called nvme-apple.
+
+config NVME_APPLE_KUNIT_TEST
+	bool "KUnit tests for the Apple ANS2 NVMe driver" if !KUNIT_ALL_TESTS
+	depends on NVME_APPLE && KUNIT=y
+	default KUNIT_ALL_TESTS
+	help
+	  Builds KUnit tests for the Apple ANS2 NVMe driver's handling of
+	  NVMMU TCB invalidation: failure reporting, the fault-injection
+	  attribute, and holding a request whose TCB was not invalidated
+	  until the controller stops. The tests use a fake NVMMU register
+	  block and need no hardware.
+
+	  If unsure, say N.

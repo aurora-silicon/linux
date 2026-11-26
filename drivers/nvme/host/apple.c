@@ -3822,6 +3822,10 @@ static void __exit apple_nvme_exit(void)
 }
 module_exit(apple_nvme_exit);
 
+#if IS_ENABLED(CONFIG_NVME_APPLE_KUNIT_TEST)
+#include "apple-kunit.c"
+#endif
+
 MODULE_AUTHOR("Sven Peter <sven@svenpeter.dev>");
 MODULE_DESCRIPTION("Apple ANS NVM Express device driver");
 MODULE_LICENSE("GPL");
