@@ -119,6 +119,15 @@ pub trait DriverObject: Sync + Send + Sized + 'static {
         unimplemented!()
     }
 
+    /// The shmem backing pages of an object were populated (`present`) or released.
+    ///
+    /// Called with the object's reservation lock held, for the first holder of the pages and
+    /// after the last one: a CPU mapping (other than a revocable one), a pin (a dma-buf
+    /// attachment), a kernel vmap or the device SG table. It must not take that lock.
+    fn pages_changed(_obj: &DriverAllocImpl<Self>, _present: bool) {
+        build_error!(crate::error::VTABLE_DEFAULT_ERROR)
+    }
+
     /// Arguments for an object that the DRM core allocates on the driver's behalf, such as a
     /// dma-buf imported from another device or a dumb buffer.
     ///
