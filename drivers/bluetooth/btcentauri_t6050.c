@@ -72,8 +72,8 @@ struct cen_bt {
 	unsigned int irq_count;
 	bool irq_vectors;
 	struct sk_buff_head txq;
-	struct sk_buff_head acl_txq, le_txq;
-	u16 acl_tx_head, le_tx_head;
+	struct sk_buff_head acl_txq, le_txq, sco_txq, iso_txq;
+	u16 acl_tx_head, le_tx_head, sco_tx_head, iso_tx_head;
 	u16 message_head, message_tag, tx_head, rx_head, rx_post;
 	u16 le_rx_head, le_rx_post;
 	struct cen_aux_state aux[ARRAY_SIZE(cen_aux_specs)];
@@ -182,27 +182,48 @@ static void cen_le_rx_buffer(struct cen_bt *bt, u16 slot)
 	put_unaligned_le16(slot + 1, descriptor + 12);
 }
 
-static int cen_receive_acl(struct cen_bt *bt, const u8 *data, u32 length)
+static void cen_skip_rx_attrs(struct cen_bt *bt, const char *kind,
+			      const u8 *data, u32 offset, u32 length)
 {
-	struct sk_buff *skb;
-	u32 packet_length, pos;
+	u32 pos;
 
-	if (length < HCI_ACL_HDR_SIZE)
-		return -EPROTO;
-	packet_length = HCI_ACL_HDR_SIZE + get_unaligned_le16(data + 2);
-	if (packet_length > length)
-		return -EPROTO;
-
-	for (pos = packet_length; pos < length;) {
+	for (pos = offset; pos < length;) {
 		if (!data[pos])
 			break;
 		if (data[pos] == 1)
 			pos++;
 		else if (data[pos] == 2 && length - pos >= 9)
 			pos += 9;
-		else
-			return -EPROTO;
+		else {
+			dev_warn_once(&bt->pdev->dev,
+				      "Ignoring unknown %s RX trailing attribute %#x (remaining=%u)\n",
+				      kind, data[pos], length - pos);
+			break;
+		}
 	}
+}
+
+static int cen_receive_acl(struct cen_bt *bt, const u8 *data, u32 length)
+{
+	struct sk_buff *skb;
+	u32 packet_length;
+
+	if (length < HCI_ACL_HDR_SIZE) {
+		bt->hdev->stat.err_rx++;
+		dev_warn_ratelimited(&bt->pdev->dev,
+				     "Dropping truncated ACL frame (len=%u)\n",
+				     length);
+		return 0;
+	}
+	packet_length = HCI_ACL_HDR_SIZE + get_unaligned_le16(data + 2);
+	if (packet_length > length) {
+		bt->hdev->stat.err_rx++;
+		dev_warn_ratelimited(&bt->pdev->dev,
+				     "Dropping malformed ACL frame (hdr_len=%u ring_len=%u)\n",
+				     packet_length, length);
+		return 0;
+	}
+	cen_skip_rx_attrs(bt, "ACL", data, packet_length, length);
 	skb = bt_skb_alloc(packet_length, GFP_KERNEL);
 	if (!skb) {
 		bt->hdev->stat.err_rx++;
@@ -213,6 +234,90 @@ static int cen_receive_acl(struct cen_bt *bt, const u8 *data, u32 length)
 	bt->hdev->stat.byte_rx += packet_length;
 	hci_recv_frame(bt->hdev, skb);
 	return 0;
+}
+
+static void cen_receive_sco(struct cen_bt *bt, const u8 *data, u32 length)
+{
+	struct sk_buff *skb;
+	u32 packet_length;
+
+	if (length < HCI_SCO_HDR_SIZE) {
+		bt->hdev->stat.err_rx++;
+		dev_warn_ratelimited(&bt->pdev->dev,
+				     "Dropping truncated SCO frame (len=%u)\n",
+				     length);
+		return;
+	}
+	packet_length = HCI_SCO_HDR_SIZE + data[2];
+	if (packet_length > length) {
+		bt->hdev->stat.err_rx++;
+		dev_warn_ratelimited(&bt->pdev->dev,
+				     "Dropping malformed SCO frame (hdr_len=%u ring_len=%u)\n",
+				     packet_length, length);
+		return;
+	}
+	cen_skip_rx_attrs(bt, "SCO", data, packet_length, length);
+	skb = bt_skb_alloc(packet_length, GFP_KERNEL);
+	if (!skb) {
+		bt->hdev->stat.err_rx++;
+		return;
+	}
+	skb_put_data(skb, data, packet_length);
+	hci_skb_pkt_type(skb) = HCI_SCODATA_PKT;
+	bt->hdev->stat.byte_rx += packet_length;
+	hci_recv_frame(bt->hdev, skb);
+}
+
+static void cen_receive_iso(struct cen_bt *bt, const u8 *data, u32 length)
+{
+	struct sk_buff *skb;
+	u32 packet_length;
+
+	if (length < 1) {
+		bt->hdev->stat.err_rx++;
+		dev_warn_ratelimited(&bt->pdev->dev,
+				     "Dropping empty ISO ring frame\n");
+		return;
+	}
+	if (data[0] == HCI_ACLDATA_PKT) {
+		cen_receive_acl(bt, data + 1, length - 1);
+		return;
+	}
+	if (data[0] != HCI_ISODATA_PKT) {
+		bt->hdev->stat.err_rx++;
+		dev_warn_ratelimited(&bt->pdev->dev,
+				     "Dropping unexpected ISO ring packet type %#x (len=%u)\n",
+				     data[0], length);
+		return;
+	}
+	data++;
+	length--;
+	if (length < HCI_ISO_HDR_SIZE) {
+		bt->hdev->stat.err_rx++;
+		dev_warn_ratelimited(&bt->pdev->dev,
+				     "Dropping truncated ISO frame (len=%u)\n",
+				     length);
+		return;
+	}
+	packet_length = HCI_ISO_HDR_SIZE +
+			(get_unaligned_le16(data + 2) & 0x3fff);
+	if (packet_length > length) {
+		bt->hdev->stat.err_rx++;
+		dev_warn_ratelimited(&bt->pdev->dev,
+				     "Dropping malformed ISO frame (hdr_len=%u ring_len=%u)\n",
+				     packet_length, length);
+		return;
+	}
+	cen_skip_rx_attrs(bt, "ISO", data, packet_length, length);
+	skb = bt_skb_alloc(packet_length, GFP_KERNEL);
+	if (!skb) {
+		bt->hdev->stat.err_rx++;
+		return;
+	}
+	skb_put_data(skb, data, packet_length);
+	hci_skb_pkt_type(skb) = HCI_ISODATA_PKT;
+	bt->hdev->stat.byte_rx += packet_length;
+	hci_recv_frame(bt->hdev, skb);
 }
 
 static void cen_aux_rx_buffer(struct cen_bt *bt, unsigned int index, u16 slot)
@@ -228,7 +333,7 @@ static void cen_aux_rx_buffer(struct cen_bt *bt, unsigned int index, u16 slot)
 
 static bool cen_aux_required(u16 id)
 {
-	return id == 2 || id == 8;
+	return id == 2 || id == 3 || id == 5 || id == 8 || id == 9 || id == 11;
 }
 
 static int cen_aux_start(struct cen_bt *bt)
@@ -291,9 +396,17 @@ static int cen_aux_drain(struct cen_bt *bt, bool repost)
 			length = get_unaligned_le32(descriptor) >> 8;
 			if (length > spec->footer)
 				return -EPROTO;
-			if (repost && spec->id == 8 &&
-			    cen_receive_acl(bt, descriptor + 16, length))
-				return -EPROTO;
+			if (repost) {
+				if (spec->id == 8)
+					cen_receive_acl(bt, descriptor + 16,
+							length);
+				else if (spec->id == 9)
+					cen_receive_sco(bt, descriptor + 16,
+							length);
+				else if (spec->id == 11)
+					cen_receive_iso(bt, descriptor + 16,
+							length);
+			}
 			state->head = (state->head + 1) % spec->slots;
 			if (repost) {
 				cen_aux_rx_buffer(bt, i, state->post);
@@ -392,8 +505,16 @@ static int cen_transmit(struct cen_bt *bt, struct sk_buff_head *queue, u16 ring,
 		descriptor = bt->arena + offset + *head * (16 + footer);
 		memset(descriptor, 0, 16 + footer);
 		put_unaligned_le16(*head + 1, descriptor + 12);
-		memcpy(descriptor + 16, skb->data, skb->len);
-		wire_length = skb->len;
+		if (ring == 5) {
+			descriptor[16] = HCI_ISODATA_PKT;
+			memcpy(descriptor + 17, skb->data, skb->len);
+			wire_length = skb->len + 1;
+		} else {
+			memcpy(descriptor + 16, skb->data, skb->len);
+			wire_length = skb->len;
+		}
+		if (ring == 1 && get_unaligned_le16(skb->data) == HCI_OP_RESET)
+			bt->connection_status_pending = false;
 		if (ring == 1 && READ_ONCE(bt->connection_command_supported) &&
 		    get_unaligned_le16(skb->data) == HCI_OP_CREATE_CONN) {
 			u8 *command = descriptor + 16;
@@ -410,8 +531,10 @@ static int cen_transmit(struct cen_bt *bt, struct sk_buff_head *queue, u16 ring,
 		cen_post(bt, ring, next);
 		if (hci_skb_pkt_type(skb) == HCI_COMMAND_PKT)
 			bt->hdev->stat.cmd_tx++;
-		else
+		else if (hci_skb_pkt_type(skb) == HCI_ACLDATA_PKT)
 			bt->hdev->stat.acl_tx++;
+		else if (hci_skb_pkt_type(skb) == HCI_SCODATA_PKT)
+			bt->hdev->stat.sco_tx++;
 		bt->hdev->stat.byte_tx += wire_length;
 		kfree_skb(skb);
 	}
@@ -557,13 +680,27 @@ static void cen_io_work(struct work_struct *work)
 			  bt->aux[0].offset, cen_aux_specs[0].footer,
 			  &bt->acl_tx_head) ||
 	     cen_transmit(bt, &bt->le_txq, 4, CEN_LE_SLOTS, CEN_LE_TX,
-			  CEN_LE_FOOTER, &bt->le_tx_head)))
+			  CEN_LE_FOOTER, &bt->le_tx_head) ||
+	     (bt->aux[1].opened &&
+	      cen_transmit(bt, &bt->sco_txq, 3, cen_aux_specs[1].slots,
+			   bt->aux[1].offset, cen_aux_specs[1].footer,
+			   &bt->sco_tx_head)) ||
+	     (bt->aux[2].opened &&
+	      cen_transmit(bt, &bt->iso_txq, 5, cen_aux_specs[2].slots,
+			   bt->aux[2].offset, cen_aux_specs[2].footer,
+			   &bt->iso_tx_head))))
 		goto protocol_error;
 	if (cen_rx_pending(bt) ||
 	    cen_tx_ready(bt, &bt->txq, 1, CEN_TX_SLOTS, bt->tx_head) ||
 	    cen_tx_ready(bt, &bt->acl_txq, 2, cen_aux_specs[0].slots,
 			 bt->acl_tx_head) ||
-	    cen_tx_ready(bt, &bt->le_txq, 4, CEN_LE_SLOTS, bt->le_tx_head))
+	    cen_tx_ready(bt, &bt->le_txq, 4, CEN_LE_SLOTS, bt->le_tx_head) ||
+	    (bt->aux[1].opened &&
+	     cen_tx_ready(bt, &bt->sco_txq, 3, cen_aux_specs[1].slots,
+			  bt->sco_tx_head)) ||
+	    (bt->aux[2].opened &&
+	     cen_tx_ready(bt, &bt->iso_txq, 5, cen_aux_specs[2].slots,
+			  bt->iso_tx_head)))
 		schedule_work(&bt->io_work);
 	goto unlock;
 protocol_error:
@@ -603,7 +740,35 @@ static int cen_hci_close(struct hci_dev *hdev)
 	skb_queue_purge(&bt->txq);
 	skb_queue_purge(&bt->acl_txq);
 	skb_queue_purge(&bt->le_txq);
+	skb_queue_purge(&bt->sco_txq);
+	skb_queue_purge(&bt->iso_txq);
 	return 0;
+}
+
+static void cen_hci_reset(struct hci_dev *hdev)
+{
+	struct cen_bt *bt = hci_get_drvdata(hdev);
+	bool paused;
+	u32 exec, ipc;
+
+	mutex_lock(&bt->lock);
+	bt->connection_status_pending = false;
+	paused = READ_ONCE(bt->transport_paused);
+	if (!paused && bt->bar && bt->arena) {
+		exec = readl(bt->bar + 0x18);
+		ipc = readl(bt->bar);
+		bt_dev_err(hdev,
+			   "HCI command timeout (exec=%u ipc=%u running=%u tx=%u/%u rx=%u/%u)",
+			   exec, ipc, bt->running, bt->tx_head, cen_tail(bt, 1),
+			   bt->rx_head, cen_tail(bt, 7));
+	} else {
+		bt_dev_err(hdev,
+			   "HCI command timeout while transport unavailable (running=%u paused=%u)",
+			   bt->running, paused);
+	}
+	if (bt->running && !paused)
+		schedule_work(&bt->io_work);
+	mutex_unlock(&bt->lock);
 }
 
 static int cen_vendor_command(struct hci_dev *hdev, u16 opcode,
@@ -683,6 +848,18 @@ static int cen_bt_address(struct device *dev, u8 address[6])
 	return device_property_read_u8_array(dev, "local-mac-address", address, 6);
 }
 
+static int cen_hci_set_bdaddr(struct hci_dev *hdev, const bdaddr_t *bdaddr)
+{
+	u8 address[6];
+	int i;
+
+	for (i = 0; i < 6; i++)
+		address[i] = bdaddr->b[5 - i];
+	if (is_zero_ether_addr(address) || is_broadcast_ether_addr(address))
+		return -EINVAL;
+	return cen_vendor_command(hdev, 0xfc06, address, sizeof(address));
+}
+
 static int cen_hci_setup(struct hci_dev *hdev)
 {
 	struct cen_bt *bt = hci_get_drvdata(hdev);
@@ -726,6 +903,8 @@ static int cen_hci_flush(struct hci_dev *hdev)
 	skb_queue_purge(&bt->txq);
 	skb_queue_purge(&bt->acl_txq);
 	skb_queue_purge(&bt->le_txq);
+	skb_queue_purge(&bt->sco_txq);
+	skb_queue_purge(&bt->iso_txq);
 	return 0;
 }
 
@@ -767,6 +946,25 @@ static int cen_hci_send(struct hci_dev *hdev, struct sk_buff *skb)
 		}
 		if (ret)
 			goto out;
+	} else if (hci_skb_pkt_type(skb) == HCI_SCODATA_PKT &&
+		   bt->aux[1].opened) {
+		if (skb->len < HCI_SCO_HDR_SIZE ||
+		    skb->len != HCI_SCO_HDR_SIZE + skb->data[2] ||
+		    skb->len > cen_aux_specs[1].footer) {
+			ret = -EMSGSIZE;
+			goto out;
+		}
+		queue = &bt->sco_txq;
+	} else if (hci_skb_pkt_type(skb) == HCI_ISODATA_PKT &&
+		   bt->aux[2].opened) {
+		if (skb->len < HCI_ISO_HDR_SIZE ||
+		    skb->len != HCI_ISO_HDR_SIZE +
+				(get_unaligned_le16(skb->data + 2) & 0x3fff) ||
+		    skb->len + 1 > cen_aux_specs[2].footer) {
+			ret = -EMSGSIZE;
+			goto out;
+		}
+		queue = &bt->iso_txq;
 	} else if (hci_skb_pkt_type(skb) != HCI_COMMAND_PKT) {
 		ret = -EOPNOTSUPP;
 		goto out;
@@ -890,6 +1088,8 @@ static int cen_quiesce(void *data)
 	skb_queue_purge(&bt->txq);
 	skb_queue_purge(&bt->acl_txq);
 	skb_queue_purge(&bt->le_txq);
+	skb_queue_purge(&bt->sco_txq);
+	skb_queue_purge(&bt->iso_txq);
 	if (bt->hdev) {
 		hci_free_dev(bt->hdev);
 		bt->hdev = NULL;
@@ -1008,6 +1208,8 @@ static int cen_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	skb_queue_head_init(&bt->txq);
 	skb_queue_head_init(&bt->acl_txq);
 	skb_queue_head_init(&bt->le_txq);
+	skb_queue_head_init(&bt->sco_txq);
+	skb_queue_head_init(&bt->iso_txq);
 	INIT_WORK(&bt->io_work, cen_io_work);
 	ret = pcim_enable_device(pdev);
 	if (ret)
@@ -1058,10 +1260,14 @@ static int cen_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	hdev->flush = cen_hci_flush;
 	hdev->send = cen_hci_send;
 	hdev->setup = cen_hci_setup;
+	hdev->set_bdaddr = cen_hci_set_bdaddr;
 	hdev->post_init = cen_hci_post_init;
+	hdev->reset = cen_hci_reset;
 	hdev->reset_dup_filter = cen_hci_reset_dup_filter;
 
 	hci_set_quirk(hdev, HCI_QUIRK_FIXUP_LE_EXT_ADV_REPORT_PHY);
+	hci_set_quirk(hdev, HCI_QUIRK_WIDEBAND_SPEECH_SUPPORTED);
+	hci_set_quirk(hdev, HCI_QUIRK_BROKEN_ENHANCED_SETUP_SYNC_CONN);
 	SET_HCIDEV_DEV(hdev, &pdev->dev);
 	hci_set_drvdata(hdev, bt);
 	ret = hci_register_dev(hdev);

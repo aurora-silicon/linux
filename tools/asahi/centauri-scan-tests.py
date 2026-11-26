@@ -571,7 +571,8 @@ typedef uint32_t u32;
 struct hci_ev_conn_complete { u8 dummy[11]; };
 struct cen_aux_spec { u16 id, slots, footer; bool receive; };
 static const struct cen_aux_spec cen_aux_specs[] = {
-	{ 2, 9, 2592, false }, { 8, 9, 2592, true },
+	{ 2, 9, 2592, false }, { 3, 9, 724, false }, { 5, 9, 260, false },
+	{ 8, 9, 2592, true },  { 9, 9, 724, true },  { 11, 9, 268, true },
 };
 struct cen_aux_state { u32 offset; u16 head, post; bool opened; };
 struct work_struct { int dummy; };
@@ -586,8 +587,8 @@ struct cen_bt {
 	u8 *arena;
 	int lock;
 	struct work_struct io_work;
-	struct sk_buff_head txq, acl_txq, le_txq;
-	u16 acl_tx_head, le_tx_head;
+	struct sk_buff_head txq, acl_txq, le_txq, sco_txq, iso_txq;
+	u16 acl_tx_head, le_tx_head, sco_tx_head, iso_tx_head;
 	u16 tx_head, rx_head, rx_post;
 	u16 le_rx_head, le_rx_post;
 	struct cen_aux_state aux[ARRAY_SIZE(cen_aux_specs)];
