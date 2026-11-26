@@ -169,7 +169,13 @@ static int secondary_init(struct centauri *c)
 	pci_write_config_dword(c->pdev, 0xf8c, upper_32_bits(c->ipc->secondary->dma));
 	pci_write_config_dword(c->pdev, 0xf90, required);
 	dev_info(&c->pdev->dev, "secondary memory: seed=%u required=%u\n", length, required);
-	debugfs_create_file("firmware_crash", 0400, c->debug, c, &firmware_crash_fops);
+	/*
+	 * Created once and kept across restarts: its reader looks up c->ipc under boot_lock,
+	 * and removing it here, under boot_lock, would wait for a reader blocked on that lock.
+	 */
+	if (!c->crash_file)
+		c->crash_file = debugfs_create_file("firmware_crash", 0400, c->debug, c,
+						    &firmware_crash_fops);
 	return 0;
 }
 
@@ -233,7 +239,7 @@ static int message(struct cen_context *ctx, void __iomem *doorbell,
 {
 	u16 head = ctx->message_head;
 	u8 *descriptor;
-	u16 tail;
+	__le16 tail;
 	int ret;
 
 	if (head >= 15 || !length || length > 512)
@@ -274,7 +280,7 @@ static int cchi_init(struct centauri *c)
 {
 	struct centauri_ipc *ipc = c->ipc;
 	u8 config[4] = {9, 0, 0xff, 0xff}, *entry;
-	u16 tail;
+	__le16 tail;
 	int i, ret;
 
 	ipc->cchi_rx = buffer_alloc(c, 0, SZ_32K);
@@ -544,6 +550,17 @@ failed:
 		ret, readl(c->bar + 0x8000));
 	/* Published DMA stays pinned until every function is stopped at removal. */
 	return ret;
+}
+
+/*
+ * Whether Beta's (Bluetooth's) firmware runs with its IPC still unowned: the state
+ * btcentauri needs to take function 2. Called with the boot lock held.
+ */
+bool centauri_beta_running(struct centauri *c)
+{
+	void __iomem *bar = c->ipc ? c->ipc->bar[2] : NULL;
+
+	return bar && readl(bar + 0x18) == 2 && !readl(bar);
 }
 
 void centauri_free_ipc(struct centauri *c)

@@ -24,6 +24,7 @@ select:
           - apple,t6041-dptx-phy
           - apple,t6050-dptx-phy
           - apple,t8122-dptx-phy
+          - apple,t8132-dptx-phy
   required:
     - compatible
 
@@ -36,7 +37,9 @@ properties:
           - const: apple,dptx-phy
       - const: apple,t6050-dptx-phy
       - items:
-          - const: apple,t6041-dptx-phy
+          - enum:
+              - apple,t6041-dptx-phy
+              - apple,t8132-dptx-phy
           - const: apple,t6050-dptx-phy
 
   reg:
@@ -63,7 +66,7 @@ properties:
       The display crossbar's upstream-facing endpoint that feeds this PHY.
 
 patternProperties:
-  '^apple,(pll-(dcocfg|dtcvreg|dtccal|dcdadj|dlfcfg)|pclkdrv-select)$':
+  '^apple,(pll-(dcocfg|dtcvreg|dtccal|dcdadj|dlfcfg|rodcoroleakcomp)|pclkdrv-select)$':
     $ref: /schemas/types.yaml#/definitions/uint32
     description:
       PLL and pixel clock driver settings the PHY is programmed with, as the
