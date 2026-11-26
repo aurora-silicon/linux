@@ -34,7 +34,7 @@ DEFINES = ('DART_T8110_TLB_CMD', 'DART_T8110_TLB_CMD_BUSY', 'DART_T8110_TLB_CMD_
            'DART_T8110_FLUSH_STALL_TIMEOUT', 'DART_T8110_FLUSH_STALL_POLL',
            'DART_T8110_TLB_CMD_STREAM', 'DART_T8110_CTC_FLUSH')
 OPTIONAL_DEFINES = {'DART_T8110_FLUSH_STALL_TIMEOUT', 'DART_T8110_FLUSH_STALL_POLL'}
-CASES = ('fast', 'stall-after', 'stall-before', 'stuck', 'not-handoff', 'not-scanout',
+CASES = ('fast', 'stall-after', 'stall-before', 'stuck', 'no-handoff', 'not-scanout',
          'not-range', 'ctc-flush', 'sleep-listed', 'superseded', 'gated', 'two-streams')
 J700 = 'arch/arm64/boot/dts/apple/t8140-j700.dts'
 # What the J700 display subsystem scans out through: disp0 and dispext0.
@@ -342,18 +342,22 @@ int main(int argc, char **argv)
 		assert(now >= DART_T8110_FLUSH_STALL_TIMEOUT);
 		assert(now <= DART_T8110_FLUSH_STALL_TIMEOUT + 2 * DART_T8110_FLUSH_BUSY_TIMEOUT + 100);
 		assert(!dart.lock);
-	} else if (!strcmp(c, "not-handoff")) {
-		/* Other DARTs keep failing after the short wait, lock held throughout. */
+	} else if (!strcmp(c, "no-handoff")) {
+		/*
+		 * The J815 display: locked by the loader without the root handoff,
+		 * the same 40 ms stall is waited out too.
+		 */
 		reset(false);
 		durations[0] = 40000;
 		ndurations = 1;
-		assert(range() == -ETIMEDOUT);
-		assert(commands == 1 && errors_logged == 1 && lock_drops == 1);
-		assert(now <= DART_T8110_FLUSH_BUSY_TIMEOUT + 10);
+		assert(!range());
+		assert(commands == 1 && !errors_logged && infos_logged == 1);
+		assert(info_us >= 38000 && info_us <= 41000);
+		check_range_command(0, 0);
 	} else if (!strcmp(c, "not-scanout")) {
 		/*
-		 * A handed-off DART no display subsystem scans out through, such as
-		 * the DCP's own: the same stall fails after the short wait, lock held.
+		 * A DART no display subsystem scans out through, such as the DCP's
+		 * own: the same stall fails after the short wait, lock held.
 		 */
 		dart.display_scanout = false;
 		durations[0] = 40000;
@@ -583,8 +587,8 @@ def main():
     parser.add_argument('--source', type=Path, help='an apple-dart.c to test (default: this tree)')
     parser.add_argument('--ref', help='test drivers/iommu/apple-dart.c of this revision instead')
     parser.add_argument('--case', action='append')
-    parser.add_argument('--mutation', choices=('every-handoff',),
-                        help='every-handoff: wait on every handed-off DART, not just the scan-out ones')
+    parser.add_argument('--mutation', choices=('every-dart',),
+                        help='every-dart: wait on every locked DART, not just the scan-out ones')
     parser.add_argument('--dtc', help="this kernel's built scripts/dtc/dtc: also check the J700 tree")
     args = parser.parse_args()
     if args.ref:
@@ -592,11 +596,11 @@ def main():
                                         args.ref + ':drivers/iommu/apple-dart.c'], text=True)
     else:
         text = (args.source or ROOT / 'drivers/iommu/apple-dart.c').read_text()
-    if args.mutation == 'every-handoff':
+    if args.mutation == 'every-dart':
         cut = ' !dart->display_scanout ||'
         if text.count(cut) != 1:
             # Not a kill: the harness counts a traceback as a broken run.
-            raise RuntimeError('every-handoff: no display_scanout check to remove')
+            raise RuntimeError('every-dart: no display_scanout check to remove')
         text = text.replace(cut, '')
 
     defines = []

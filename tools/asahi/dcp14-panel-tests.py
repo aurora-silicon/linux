@@ -32,7 +32,8 @@ with tempfile.TemporaryDirectory(prefix='dcp14-panels-') as directory:
     #define IS_ERR(p) ((uintptr_t)(p) >= (uintptr_t)-4095)
     #define dev_err(...) ((void)0)
     #define MAX_NOTCH_HEIGHT 100
-    struct device_node {const char *compatible;};
+    struct device_node {const char *compatible;struct device_node *panel;};
+    #define __free(x)
     struct device {struct device_node *of_node;};
     static const char *machine;
     static bool of_device_is_compatible(const struct device_node *n,const char *c){return !strcmp(n->compatible,c);}
@@ -40,7 +41,10 @@ with tempfile.TemporaryDirectory(prefix='dcp14-panels-') as directory:
      if (!strcmp(machine,c)) return true;
      return (!strcmp(machine,"apple,j514m") || !strcmp(machine,"apple,j516m")) && !strcmp(c,"apple,t6034");
     }
-    static struct device_node fb={"simple-framebuffer"},dcp={"apple,t8122-dcp"};
+    /* The board DT's panel node under the DCP (compatible NULL: no panel node). */
+    static struct device_node panel={NULL};
+    static struct device_node fb={"simple-framebuffer"},dcp={"apple,t8122-dcp",&panel};
+    static struct device_node *of_get_child_by_name(const struct device_node*n,const char*name){return strcmp(name,"panel")||!n->panel->compatible?NULL:n->panel;}
     static u32 width,height,stride,notch,marker_value=1;
     static const char *image_uuid;
     static int of_property_read_string(struct device_node*n,const char*k,const char**v){*v=image_uuid;return 0;}
@@ -82,7 +86,12 @@ with tempfile.TemporaryDirectory(prefix='dcp14-panels-') as directory:
     #ifdef OLD
      assert(IS_ERR(b));puts("old J615 board selection rejects: PASS");return 0;
     #else
-     assert(!IS_ERR(b) && b && b->panel_width==2880 && b->panel_height==1864);
+     assert(IS_ERR(b));
+     panel.compatible="apple,panel-j615";
+     b=iomfb_v14_7_board(&dev);
+     assert(!IS_ERR(b) && b && b->panel_width==2880 && b->panel_height==1864 && b->panel_nits);
+     machine="apple,other";assert(iomfb_v14_7_board(&dev)==b);
+     panel.compatible=NULL;
      assert(!strcmp(b->firmware_uuid,"90F849E1-B422-367E-B389-50246F8DEC47"));
      assert(!strcmp(b->handoff,"apple,t8122-handoff") && !b->promotion);
      image_uuid=b->firmware_uuid;assert(probe_gate(&dev,b)==0);
@@ -94,7 +103,10 @@ with tempfile.TemporaryDirectory(prefix='dcp14-panels-') as directory:
      assert(!IS_ERR(j)&&j->panel_width==2560 && j->panel_height==1664);
      machine="apple,j700";assert(IS_ERR(iomfb_v14_7_board(&dev)));
      /* J504 (14" M3 MacBook Pro): the J613 image, the J514 panel, 60 or 120 Hz. */
-     machine="apple,j504";const struct dcp_v14_board*p14=iomfb_v14_7_board(&dev);
+     /* Its record follows the panel node the J504 DT puts under the DCP, not the machine. */
+     machine="apple,j504";assert(IS_ERR(iomfb_v14_7_board(&dev)));
+     panel.compatible="apple,panel-j514";assert(IS_ERR(iomfb_v14_7_board(&dev)));
+     panel.compatible="apple,panel-j504";const struct dcp_v14_board*p14=iomfb_v14_7_board(&dev);
      assert(!IS_ERR(p14)&&p14&&!strcmp(p14->name,"J504")&&!strcmp(p14->debugfs,"dcp-j504"));
      assert(p14->panel_width==3024&&p14->panel_height==1964&&p14->promotion&&p14->log_bringup);
      assert(!strcmp(p14->firmware_uuid,"90F849E1-B422-367E-B389-50246F8DEC47"));
@@ -109,7 +121,10 @@ with tempfile.TemporaryDirectory(prefix='dcp14-panels-') as directory:
       assert(dcp_v14_geometry(&q)==0&&q.panel_height==1964&&q.notch_rows==74);
       height=1964;notch=0;assert(dcp_v14_geometry(&q)==0&&q.panel_height==1964);
       width=2560;height=1600;stride=width*4;notch=64;assert(dcp_v14_geometry(&q)==-EINVAL);}
-     /* Other T8122 Macs (J433/J434 iMacs) have no record. */
+     /* J613 keeps its machine record; J615 and J504 match the panel. */
+     machine="apple,j613";assert(iomfb_v14_7_board(&dev)==j);
+     /* Other T8122 Macs (J433/J434 iMacs, no J504 panel) have no record. */
+     panel.compatible=NULL;
      machine="apple,j433";assert(IS_ERR(iomfb_v14_7_board(&dev)));
      machine="apple,j434";assert(IS_ERR(iomfb_v14_7_board(&dev)));
      dcp.compatible="apple,t6030-dcp";machine="apple,j516s";assert(iomfb_v14_7_board(&dev)==&dcp_v14_board_t6030);

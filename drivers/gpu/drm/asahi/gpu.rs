@@ -106,6 +106,17 @@ const EP_DOORBELL: u8 = 0x21;
 const MSG_INIT: u64 = 0x81 << 48;
 const INIT_DATA_MASK: u64 = (1 << 44) - 1;
 
+/// The firmware-endpoint message that hands the firmware its root at `address`.
+pub(crate) const fn init_message(address: u64) -> u64 {
+    MSG_INIT | (address & INIT_DATA_MASK)
+}
+
+/// The G14 firmware-27.2 root and the records only it uses.
+#[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+mod v27_2;
+#[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+pub(crate) use v27_2::*;
+
 const RX_WORK_PENDING: u32 = 1 << 0;
 const RX_WORK_RUNNING: u32 = 1 << 1;
 
@@ -127,6 +138,10 @@ const DOORBELL_DEVCTRL: u64 = 0x11;
 // Upper kernel half VA address ranges.
 /// Private (cached) firmware structure VA range base.
 const IOVA_KERN_PRIV_RANGE: Range<u64> = 0xffffffa000000000..0xffffffa600000000;
+/// The G14 firmware-27.2 timestamp aperture, inside the private range: the private allocator
+/// stays below it in that profile.
+#[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+const IOVA_G14_V27_2_TIMESTAMP_RANGE: Range<u64> = 0xffffffa181400000..0xffffffa185400000;
 /// Private (cached) GPU-RO firmware structure VA range base.
 const IOVA_KERN_GPU_RO_RANGE: Range<u64> = 0xffffffa600000000..0xffffffa800000000;
 /// Shared (uncached) firmware structure VA range base.
@@ -168,6 +183,36 @@ const MAX_FW_ALLOC_GARBAGE_BYTES: usize = 16 * 1024 * 1024;
 /// within the safe range for kmalloc (on 16K page systems).
 const MAX_FW_ALLOC_GARBAGE_OBJECTS: usize = 2048;
 
+/// What [`GpuManager::alloc`] does with the freed firmware-private objects it holds.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum GarbageAction {
+    /// Under the collection limits: keep holding them.
+    Keep,
+    /// Over a limit: flush the firmware cache, then make them reusable.
+    Collect,
+    /// Over a limit, but this manager has no device-control channel to flush the firmware
+    /// cache with. Reusing the memory could hand the firmware stale cached lines, so it stays
+    /// held.
+    Hold,
+}
+
+/// Decide the garbage action from the (count, bytes) held by the private and GPU read-only
+/// allocators and whether this manager owns a device-control channel.
+fn garbage_action(
+    private: (usize, usize),
+    gpu_ro: (usize, usize),
+    device_control: bool,
+) -> GarbageAction {
+    let over = |(count, bytes): (usize, usize)| {
+        count > MAX_FW_ALLOC_GARBAGE_OBJECTS || bytes > MAX_FW_ALLOC_GARBAGE_BYTES
+    };
+    match (over(private) || over(gpu_ro), device_control) {
+        (false, _) => GarbageAction::Keep,
+        (true, true) => GarbageAction::Collect,
+        (true, false) => GarbageAction::Hold,
+    }
+}
+
 /// Global allocators used for kernel-half structures.
 pub(crate) struct KernelAllocators {
     pub(crate) private: alloc::DefaultAllocator,
@@ -176,6 +221,17 @@ pub(crate) struct KernelAllocators {
     #[allow(dead_code)]
     pub(crate) gpu: alloc::DefaultAllocator,
     pub(crate) gpu_ro: alloc::DefaultAllocator,
+}
+
+/// What [`GpuManager::build_graph`] builds the records for.
+#[derive(Copy, Clone)]
+pub(crate) enum GraphProfile {
+    /// The manager's own firmware: map the registers, use the whole private range.
+    Native,
+    /// The G14 firmware-27.2 root (gpu/v27_2.rs) built on these records: no register
+    /// mappings, and the private range ends below that firmware's timestamp aperture.
+    #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+    G14V27_2,
 }
 
 /// Receive (GPU->driver) ring buffer channels.
@@ -270,7 +326,11 @@ pub(crate) struct GpuManager {
     dyncfg: hw::DynConfig,
     pub(crate) initdata: fw::types::GpuObject<fw::initdata::InitData::ver>,
     uat: mmu::Uat,
+    /// The firmware's timestamp aperture in the kernel VM, where timestamp buffers are bound.
+    timestamp_range: Range<u64>,
     crashed: AtomicBool,
+    /// Set once the over-limit firmware-private garbage was reported as held.
+    garbage_held: AtomicBool,
     #[pin]
     alloc: Mutex<KernelAllocators>,
     io_mappings: KVec<mmu::KernelMapping>,
@@ -296,6 +356,9 @@ pub(crate) struct GpuManager {
     ids: SequenceIDs,
     #[pin]
     garbage_contexts: Mutex<KVec<workqueue::RetiredContext>>,
+    /// Queue structures of invalidated contexts that a running data master may still read.
+    #[pin]
+    powered_contexts: Mutex<KVec<KVec<workqueue::RetainedObject>>>,
     #[pin]
     fault_log: SpinLock<FaultLogState>,
 }
@@ -381,9 +444,13 @@ pub(crate) trait Gpu: Send + Sync {
     fn queue_limits(&self) -> Option<uapi::drm_asahi_queue_limits> {
         None
     }
+    /// GET_PARAMS feature bits that only this backend implements.
+    fn backend_feature_flags(&self) -> u64 {
+        0
+    }
     /// Shared GET_PARAMS additions, using this backend's feature-number assignments.
     fn feature_flags(&self) -> u64 {
-        let mut flags = 0;
+        let mut flags = self.backend_feature_flags();
         if self.supports_vm_status() {
             flags |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_VM_STATUS)
                 | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_VM_STATUS_MIRROR);
@@ -458,12 +525,19 @@ pub(crate) trait Gpu: Send + Sync {
         usc_exec_base: u64,
         usage: Arc<crate::usage::Client>,
     ) -> Result<KBox<dyn queue::Queue>>;
-    /// Bind a BO range as a firmware- or CPU-written timestamp buffer.
+    /// Bind a BO range as a firmware- or CPU-written timestamp buffer. With `WindowPermit::Denied`
+    /// the buffer must not be mapped in the firmware timestamp window (the file's share of it is
+    /// used up): a backend that can only alias it there fails with ENOSPC, as for a full window.
     fn map_timestamp_buffer(
         &self,
         bo: gem::ObjectRef,
         range: Range<usize>,
+        window: crate::timestamp::WindowPermit,
     ) -> Result<crate::timestamp::Buffer>;
+    /// Size of the fixed firmware range timestamp buffers are aliased in (0: none).
+    fn timestamp_window_size(&self) -> u64 {
+        0
+    }
 }
 
 /// Trait used to abstract the firmware/GPU-dependent variants of the GpuManager.
@@ -507,6 +581,9 @@ pub(crate) trait GpuManager: Send + Sync {
     fn get_dyncfg(&self) -> &hw::DynConfig;
     /// Register an unused context, with the objects it retains, for invalidation.
     fn free_context(&self, ctx: workqueue::RetiredContext);
+    /// Release the queue structures of invalidated contexts after firmware reports that all data
+    /// masters are powered off.
+    fn fw_power_off(&self);
 }
 
 /// Private generic trait for functions that don't need to escape this module.
@@ -653,13 +730,42 @@ impl GpuManager::ver {
         cfg: &'static hw::HwConfig,
     ) -> Result<Arc<GpuManager::ver>> {
         let uat = Self::make_uat(dev, cfg)?;
+        let mgr = Self::build_graph(dev, res, cfg, uat, GraphProfile::Native)?;
+        let rtkit =
+            rtkit::RtKit::<GpuManager::ver>::new(dev.as_ref().as_ref(), None, 0, mgr.clone())?;
+
+        *mgr.rtkit.lock() = Some(rtkit);
+
+        {
+            let mut rxc = mgr.rx_channels.lock();
+            rxc.event.set_manager(mgr.clone());
+            rxc.stats.set_manager(mgr.clone());
+        }
+
+        Ok(mgr)
+    }
+
+    /// Build the manager and its firmware records without attaching RTKit.
+    #[inline(never)]
+    pub(crate) fn build_graph(
+        dev: &AsahiDrmDevice,
+        res: &regs::Resources<'_>,
+        cfg: &'static hw::HwConfig,
+        uat: KBox<mmu::Uat>,
+        profile: GraphProfile,
+    ) -> Result<Arc<GpuManager::ver>> {
         let dyncfg = Self::make_dyncfg(dev, res, cfg, &uat)?;
+        let (private_end, timestamp_range) = match profile {
+            GraphProfile::Native => (IOVA_KERN_PRIV_RANGE.end, IOVA_KERN_TIMESTAMP_RANGE),
+            #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+            GraphProfile::G14V27_2 => (IOVA_G14_V27_2_TIMESTAMP_RANGE.start, IOVA_G14_V27_2_TIMESTAMP_RANGE),
+        };
 
         let mut alloc = KernelAllocators {
             private: alloc::DefaultAllocator::new(
                 dev,
                 uat.kernel_vm(),
-                IOVA_KERN_PRIV_RANGE,
+                IOVA_KERN_PRIV_RANGE.start..private_end,
                 0x80,
                 mmu::PROT_FW_PRIV_RW,
                 1024 * 1024,
@@ -731,7 +837,8 @@ impl GpuManager::ver {
                 false,
             )?);
 
-        let mut mgr = Self::make_mgr(dev, cfg, dyncfg, uat, alloc, event_manager, initdata)?;
+        let mut mgr = Self::make_mgr(dev, cfg, dyncfg, uat, alloc, event_manager, initdata,
+                                     timestamp_range)?;
 
         {
             let fwctl = mgr.fwctl_channel.lock();
@@ -802,14 +909,16 @@ impl GpuManager::ver {
                 }
             });
 
+        // The 27.2 root publishes its own register table (gpu/v27_2.rs).
+        let map_registers = matches!(profile, GraphProfile::Native);
         for (i, map) in cfg.io_mappings.iter().enumerate() {
-            if let Some(map) = map.as_ref() {
+            if let Some(map) = map.as_ref().filter(|_| map_registers) {
                 Self::iomap(&mut mgr, cfg, i, map)?;
             }
         }
 
         #[ver(V >= V13_0B4)]
-        if let Some(base) = cfg.sram_base {
+        if let Some(base) = cfg.sram_base.filter(|_| map_registers) {
             let size = cfg.sram_size.unwrap();
             let iova = mgr.as_mut().alloc_mmio_iova(size);
 
@@ -832,19 +941,7 @@ impl GpuManager::ver {
             mgr.as_mut().io_mappings_mut().push(mapping, GFP_KERNEL)?;
         }
 
-        let mgr = Arc::from(mgr);
-
-        let rtkit =
-            rtkit::RtKit::<GpuManager::ver>::new(dev.as_ref().as_ref(), None, 0, mgr.clone())?;
-
-        *mgr.rtkit.lock() = Some(rtkit);
-
-        {
-            let mut rxc = mgr.rx_channels.lock();
-            rxc.event.set_manager(mgr.clone());
-        }
-
-        Ok(mgr)
+        Ok(Arc::from(mgr))
     }
 
     /// Return a mutable reference to the initdata member
@@ -918,6 +1015,7 @@ impl GpuManager::ver {
     ///
     /// Force disable inlining to avoid blowing up the stack.
     #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
     fn make_mgr(
         dev: &AsahiDrmDevice,
         cfg: &'static hw::HwConfig,
@@ -926,6 +1024,7 @@ impl GpuManager::ver {
         mut alloc: KernelAllocators,
         event_manager: Arc<event::EventManager>,
         initdata: KBox<fw::types::GpuObject<fw::initdata::InitData::ver>>,
+        timestamp_range: Range<u64>,
     ) -> Result<Pin<UniqueArc<GpuManager::ver>>> {
         let mut pipes = PipeChannels::ver {
             vtx: KVec::new(),
@@ -1026,10 +1125,12 @@ impl GpuManager::ver {
                 dyncfg: KBox::<hw::DynConfig>::into_inner(dyncfg),
                 initdata: KBox::<fw::types::GpuObject<fw::initdata::InitData::ver>>::into_inner(initdata),
                 uat: KBox::<mmu::Uat>::into_inner(uat),
+                timestamp_range,
                 io_mappings: KVec::new(),
                 next_mmio_iova: IOVA_KERN_MMIO_RANGE.start,
                 rtkit <- new_mutex!(None, "rtkit"),
                 crashed: AtomicBool::new(false),
+                garbage_held: AtomicBool::new(false),
                 event_manager,
                 stats: stats_snap.clone(),
                 raw_stats: raw_stats_snap.clone(),
@@ -1043,6 +1144,7 @@ impl GpuManager::ver {
                 buffer_mgr,
                 ids: Default::default(),
                 garbage_contexts <- new_mutex!(KVec::new(), "garbage_contexts"),
+                powered_contexts <- new_mutex!(KVec::new(), "powered_contexts"),
                 fault_log <- new_spinlock!(FaultLogState::default(), "fault_log"),
             }),
             GFP_KERNEL,
@@ -1431,12 +1533,7 @@ impl GpuManager::ver {
         job.run(&mut pipe);
         mod_dev_dbg!(self.dev, "GPU: run_job: ring doorbell\n");
 
-        let mut guard = self.rtkit.lock();
-        let rtk = guard.as_mut().as_pin_mut().unwrap();
-        rtk.send_message(
-            EP_DOORBELL,
-            MSG_TX_DOORBELL | pipe_type as u64 | ((index as u64) << 2),
-        )?;
+        self.ring_doorbell(MSG_TX_DOORBELL | pipe_type as u64 | ((index as u64) << 2))?;
         mod_dev_dbg!(self.dev, "GPU: run_job: done\n");
 
         Ok(())
@@ -1502,15 +1599,7 @@ impl GpuManager::ver {
         mod_dev_dbg!(self.dev, "Context invalidation command: {:?}\n", &dc);
 
         let mut txch = self.tx_channels.lock();
-
-        let token = txch.device_control.send(&dc);
-
-        {
-            let mut guard = self.rtkit.lock();
-            let rtk = guard.as_mut().as_pin_mut().unwrap();
-            rtk.send_message(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_DEVCTRL)?;
-        }
-
+        let token = self.send_device_control(&mut txch, &dc)?;
         txch.device_control.wait_for(token)?;
 
         mod_dev_dbg!(
@@ -1525,6 +1614,34 @@ impl GpuManager::ver {
 
         Ok(())
     }
+
+    /// Whether this manager drives its firmware over its own RTKit transport and device-control
+    /// channel. A manager whose records serve another runtime (the G14 firmware 27.2 graph) has
+    /// none: that firmware never reads the legacy channels.
+    fn has_device_control(&self) -> bool {
+        self.rtkit.lock().is_some()
+    }
+
+    /// Ring a doorbell on this manager's RTKit transport, or fail with ENODEV without one.
+    fn ring_doorbell(&self, message: u64) -> Result {
+        let mut guard = self.rtkit.lock();
+        let rtk = guard.as_mut().as_pin_mut().ok_or(ENODEV)?;
+        rtk.send_message(EP_DOORBELL, message)
+    }
+
+    /// Queue a device-control message and ring its doorbell. Without a transport nothing is
+    /// queued, so no caller waits for a firmware that will never answer.
+    fn send_device_control(
+        &self,
+        txch: &mut TxChannels::ver,
+        msg: &fw::channels::DeviceControlMsg::ver,
+    ) -> Result<u32> {
+        let mut guard = self.rtkit.lock();
+        let rtk = guard.as_mut().as_pin_mut().ok_or(ENODEV)?;
+        let token = txch.device_control.send(msg);
+        rtk.send_message(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_DEVCTRL)?;
+        Ok(token)
+    }
 }
 
 extern "C" {
@@ -1533,6 +1650,14 @@ extern "C" {
 
 #[versions(AGX)]
 impl Gpu for GpuManager::ver {
+    /// Render commands may make only their fragment half wait for earlier
+    /// renders (DRM_ASAHI_RENDER_FRAGMENT_BARRIERS), and the fragment half
+    /// does wait for them (DRM_ASAHI_FEATURE_ORDERED_FRAGMENT_BARRIERS).
+    fn backend_feature_flags(&self) -> u64 {
+        u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS)
+            | uapi::DRM_ASAHI_FEATURE_ORDERED_FRAGMENT_BARRIERS as u64
+    }
+
     /// A light submission completes in tens of microseconds, so its submitter
     /// sleeps briefly between submissions and the CPU scheduler places and
     /// clocks it like idle work: on G13/G14 a single client then spends more
@@ -1582,13 +1707,13 @@ impl Gpu for GpuManager::ver {
 
         let initdata = self.initdata.gpu_va().get();
         let mut guard = self.rtkit.lock();
-        let mut rtk = guard.as_mut().as_pin_mut().unwrap();
+        let mut rtk = guard.as_mut().as_pin_mut().ok_or(ENODEV)?;
 
         rtk.as_mut().boot()?;
         rtk.as_mut().start_endpoint(EP_FIRMWARE)?;
         rtk.as_mut().start_endpoint(EP_DOORBELL)?;
         rtk.as_mut()
-            .send_message(EP_FIRMWARE, MSG_INIT | (initdata & INIT_DATA_MASK))?;
+            .send_message(EP_FIRMWARE, init_message(initdata))?;
         rtk.as_mut()
             .send_message(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_DEVCTRL)?;
         core::mem::drop(guard);
@@ -1669,19 +1794,30 @@ impl Gpu for GpuManager::ver {
         )?)
     }
 
+    fn timestamp_window_size(&self) -> u64 {
+        self.timestamp_range.end - self.timestamp_range.start
+    }
+
     fn map_timestamp_buffer(
         &self,
         mut bo: gem::ObjectRef,
         range: Range<usize>,
+        window: crate::timestamp::WindowPermit,
     ) -> Result<crate::timestamp::Buffer> {
-        crate::timestamp::Buffer::firmware(bo.map_range_into_range(
-            self.uat.kernel_vm(),
-            range,
-            IOVA_KERN_TIMESTAMP_RANGE,
-            mmu::UAT_PGSZ as u64,
-            mmu::PROT_FW_SHARED_RW,
-            false,
-        )?)
+        if !window.is_allowed() {
+            return Err(ENOSPC);
+        }
+        crate::timestamp::Buffer::firmware(
+            bo.map_range_into_range(
+                self.uat.kernel_vm(),
+                range,
+                self.timestamp_range.clone(),
+                mmu::UAT_PGSZ as u64,
+                mmu::PROT_FW_SHARED_RW,
+                false,
+            )?,
+            window.into_share(),
+        )
     }
 }
 
@@ -1714,34 +1850,77 @@ impl GpuManager for GpuManager::ver {
                 if debug_enabled(DebugFlags::OopsOnGpuCrash) {
                     panic!("GPU firmware timed out");
                 }
+                // The invalidation did not complete, so firmware may still use every object in
+                // the context. Leaking it is the only safe recovery from this fatal condition.
+                core::mem::forget(ctx);
+                continue;
             }
-            // The firmware no longer knows the context's queues, so their structures may go now,
-            // ahead of the context data they point to.
-            core::mem::drop(ctx.retained);
+
+            // Only the queue structures can still be read after the invalidation. The context data,
+            // with the TVB buffer it holds, goes now, so a retired context costs only its queues.
+            let workqueue::RetiredContext { data, retained } = ctx;
+            core::mem::drop(data);
+
+            // Device-control completion and statistics use separate receive rings. Drain the
+            // latter under its lock before publishing this context, so a PowerOff that was
+            // already pending before invalidation cannot release it. A concurrent later
+            // PowerOff cannot be handled until after the context has been queued here.
+            let mut rxc = self.rx_channels.lock();
+            rxc.stats.poll();
+
+            let mut powered = self.powered_contexts.lock();
+            if powered.reserve(1, GFP_KERNEL).is_err() {
+                dev_err!(
+                    self.dev.as_ref(),
+                    "Failed to reserve invalidated context, leaking it for safety.\n"
+                );
+                core::mem::forget(retained);
+                continue;
+            }
+            // This cannot fail after the successful reservation. Preserve the object even if
+            // the vector implementation ever violates that contract.
+            if let Err(err) = powered.push_within_capacity(retained) {
+                core::mem::forget(err.0);
+            }
         }
 
         let mut guard = self.alloc.lock();
         let (garbage_count, garbage_bytes) = guard.private.garbage();
         let (ro_garbage_count, ro_garbage_bytes) = guard.gpu_ro.garbage();
 
-        if garbage_bytes > MAX_FW_ALLOC_GARBAGE_BYTES
-            || ro_garbage_bytes > MAX_FW_ALLOC_GARBAGE_BYTES
-            || garbage_count > MAX_FW_ALLOC_GARBAGE_OBJECTS
-            || ro_garbage_count > MAX_FW_ALLOC_GARBAGE_OBJECTS
-        {
-            mod_dev_dbg!(
-                self.dev,
-                "Collecting kalloc garbage (private: {} objects, {} bytes, gpuro: {} objects, {} bytes)\n",
-                garbage_count,
-                garbage_bytes,
-                ro_garbage_count,
-                ro_garbage_bytes
-            );
-            if self.flush_fw_cache().is_err() {
-                dev_err!(self.dev.as_ref(), "Failed to flush FW cache\n");
-            } else {
-                guard.private.collect_garbage(garbage_count);
-                guard.gpu_ro.collect_garbage(ro_garbage_count);
+        match garbage_action(
+            (garbage_count, garbage_bytes),
+            (ro_garbage_count, ro_garbage_bytes),
+            self.has_device_control(),
+        ) {
+            GarbageAction::Keep => {}
+            GarbageAction::Hold => {
+                if !self.garbage_held.swap(true, Ordering::Relaxed) {
+                    dev_warn!(
+                        self.dev.as_ref(),
+                        "No firmware cache flush on this firmware: holding freed firmware memory (private: {} objects, {} bytes, gpuro: {} objects, {} bytes)\n",
+                        garbage_count,
+                        garbage_bytes,
+                        ro_garbage_count,
+                        ro_garbage_bytes
+                    );
+                }
+            }
+            GarbageAction::Collect => {
+                mod_dev_dbg!(
+                    self.dev,
+                    "Collecting kalloc garbage (private: {} objects, {} bytes, gpuro: {} objects, {} bytes)\n",
+                    garbage_count,
+                    garbage_bytes,
+                    ro_garbage_count,
+                    ro_garbage_bytes
+                );
+                if self.flush_fw_cache().is_err() {
+                    dev_err!(self.dev.as_ref(), "Failed to flush FW cache\n");
+                } else {
+                    guard.private.collect_garbage(garbage_count);
+                    guard.gpu_ro.collect_garbage(ro_garbage_count);
+                }
             }
         }
 
@@ -1757,11 +1936,7 @@ impl GpuManager for GpuManager::ver {
             return Err(ENODEV);
         }
 
-        let mut guard = self.rtkit.lock();
-        let rtk = guard.as_mut().as_pin_mut().unwrap();
-        rtk.send_message(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_KICKFW)?;
-
-        Ok(())
+        self.ring_doorbell(MSG_TX_DOORBELL | DOORBELL_KICKFW)
     }
 
     fn flush_fw_cache(&self) -> Result {
@@ -1795,14 +1970,7 @@ impl GpuManager for GpuManager::ver {
         };
 
         let mut txch = self.tx_channels.lock();
-
-        let token = txch.device_control.send(&dc);
-        {
-            let mut guard = self.rtkit.lock();
-            let rtk = guard.as_mut().as_pin_mut().unwrap();
-            rtk.send_message(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_DEVCTRL)?;
-        }
-
+        let token = self.send_device_control(&mut txch, &dc)?;
         txch.device_control.wait_for(token)?;
         Ok(())
     }
@@ -1932,26 +2100,16 @@ impl GpuManager for GpuManager::ver {
         mod_dev_dbg!(self.dev, "Recover Channel command: {:?}\n", &dc);
         let mut txch = self.tx_channels.lock();
 
-        let token = txch.device_control.send(&dc);
-        {
-            let mut guard = self.rtkit.lock();
-            let rtk = guard.as_mut().as_pin_mut().unwrap();
-            if rtk
-                .send_message(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_DEVCTRL)
-                .is_err()
-            {
-                dev_err!(
-                    self.dev.as_ref(),
-                    "Failed to send Recover Channel command\n"
-                );
-            }
-        }
-
-        if txch.device_control.wait_for(token).is_err() {
-            dev_err!(
+        match self.send_device_control(&mut txch, &dc) {
+            Err(_) => dev_err!(
+                self.dev.as_ref(),
+                "Failed to send Recover Channel command\n"
+            ),
+            Ok(token) if txch.device_control.wait_for(token).is_err() => dev_err!(
                 self.dev.as_ref(),
                 "Timed out waiting for Recover Channel command\n"
-            );
+            ),
+            Ok(_) => {}
         }
 
         if debug_enabled(DebugFlags::VerboseFaults) {
@@ -1979,16 +2137,8 @@ impl GpuManager for GpuManager::ver {
 
         let mut txch = self.tx_channels.lock();
 
-        txch.device_control.send(&dc);
-        {
-            let mut guard = self.rtkit.lock();
-            let rtk = guard.as_mut().as_pin_mut().unwrap();
-            if rtk
-                .send_message(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_DEVCTRL)
-                .is_err()
-            {
-                dev_err!(self.dev.as_ref(), "Failed to send TVB Grow Ack command\n");
-            }
+        if self.send_device_control(&mut txch, &dc).is_err() {
+            dev_err!(self.dev.as_ref(), "Failed to send TVB Grow Ack command\n");
         }
     }
 
@@ -1998,12 +2148,13 @@ impl GpuManager for GpuManager::ver {
         }
 
         let mut fwctl = self.fwctl_channel.lock();
-        let token = fwctl.send(&msg);
-        {
+        let token = {
             let mut guard = self.rtkit.lock();
-            let rtk = guard.as_mut().as_pin_mut().unwrap();
+            let rtk = guard.as_mut().as_pin_mut().ok_or(ENODEV)?;
+            let token = fwctl.send(&msg);
             rtk.send_message(EP_DOORBELL, MSG_FWCTL)?;
-        }
+            token
+        };
         fwctl.wait_for(token)?;
         Ok(())
     }
@@ -2019,12 +2170,28 @@ impl GpuManager for GpuManager::ver {
     fn free_context(&self, ctx: workqueue::RetiredContext) {
         let mut garbage = self.garbage_contexts.lock();
 
-        if garbage.push(ctx, GFP_KERNEL).is_err() {
+        if garbage.reserve(1, GFP_KERNEL).is_err() {
             dev_err!(
                 self.dev.as_ref(),
-                "Failed to reserve space for freed context, deadlock possible.\n"
+                "Failed to reserve freed context, leaking it for safety.\n"
             );
+            core::mem::forget(ctx);
+            return;
         }
+        if let Err(err) = garbage.push_within_capacity(ctx) {
+            core::mem::forget(err.0);
+        }
+    }
+
+    fn fw_power_off(&self) {
+        let mut released = KVec::new();
+        core::mem::swap(&mut *self.powered_contexts.lock(), &mut released);
+        mod_dev_dbg!(
+            self.dev,
+            "Releasing {} invalidated GPU contexts after firmware PowerOff\n",
+            released.len()
+        );
+        core::mem::drop(released);
     }
 }
 
@@ -2039,5 +2206,50 @@ impl GpuManagerPriv for GpuManager::ver {
         mod_dev_dbg!(self.dev, "OP end (pending: {})\n", val - 1);
         // SAFETY: Pairs with the begin call in start_op(); callable from any context.
         unsafe { kernel::bindings::apple_pmp_agx_activity_end() };
+    }
+}
+
+#[kunit_tests(asahi_gpu_garbage)]
+mod tests {
+    use super::*;
+
+    const UNDER: (usize, usize) = (MAX_FW_ALLOC_GARBAGE_OBJECTS, MAX_FW_ALLOC_GARBAGE_BYTES);
+    const OVER_COUNT: (usize, usize) = (MAX_FW_ALLOC_GARBAGE_OBJECTS + 1, 0);
+    const OVER_BYTES: (usize, usize) = (1, MAX_FW_ALLOC_GARBAGE_BYTES + 1);
+
+    #[test]
+    fn under_the_limits_keeps_holding() {
+        assert_eq!(garbage_action(UNDER, UNDER, true), GarbageAction::Keep);
+        assert_eq!(garbage_action(UNDER, UNDER, false), GarbageAction::Keep);
+    }
+
+    #[test]
+    fn over_a_limit_collects_with_device_control() {
+        assert_eq!(
+            garbage_action(OVER_COUNT, UNDER, true),
+            GarbageAction::Collect
+        );
+        assert_eq!(
+            garbage_action(UNDER, OVER_BYTES, true),
+            GarbageAction::Collect
+        );
+    }
+
+    /// The G14 firmware 27.2 graph has no device-control channel. Its scene allocations used
+    /// to reach the legacy cache flush here and panic on the missing RTKit transport.
+    #[test]
+    fn over_a_limit_holds_without_device_control() {
+        assert_eq!(
+            garbage_action(OVER_COUNT, UNDER, false),
+            GarbageAction::Hold
+        );
+        assert_eq!(
+            garbage_action(UNDER, OVER_BYTES, false),
+            GarbageAction::Hold
+        );
+        assert_eq!(
+            garbage_action(OVER_BYTES, OVER_COUNT, false),
+            GarbageAction::Hold
+        );
     }
 }

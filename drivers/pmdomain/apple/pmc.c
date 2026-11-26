@@ -85,6 +85,8 @@
  * @agent_rails: rails on which an agent is enabled; 0 for every rail
  * @ap_agent: voter agent of the application processor, which a DCS limit
  *	votes through
+ * @has_pending: true if the PMC exposes a per-agent pending word at reg + 4
+ *	after each voter floor word (BIT(agent) set while a vote is pending)
  * @bwr_enable: offset of the bandwidth request (BWR) interface enable word
  *	in the "rails" region; 0 if the PMC has none
  * @boost_enable: offset of the boost interface enable word in the "rails"
@@ -275,9 +277,13 @@ static int apple_pmc_agent_enable(struct apple_pmc *pmc, unsigned int agent,
 	return ret;
 }
 
+static struct platform_driver apple_pmc_driver;
+
 static struct apple_pmc *apple_pmc_from_dev(struct device *dev)
 {
-	return dev ? dev_get_drvdata(dev) : NULL;
+	if (!dev || dev->driver != &apple_pmc_driver.driver)
+		return NULL;
+	return dev_get_drvdata(dev);
 }
 
 /**
@@ -425,24 +431,21 @@ static unsigned int apple_pmc_ap_dcs_read(struct apple_pmc *pmc)
  * Caller holds pmc->lock. Vote through the AP's agent for what the other
  * agents ask for and the DCS floors held, capped by the limit; without a
  * limit, the vote the AP's agent had before probe or the floors, if higher.
+ * Like any other floor write, wait out a vote the PMC has not taken yet.
  */
-static void apple_pmc_dcs_vote(struct apple_pmc *pmc)
+static int apple_pmc_dcs_vote(struct apple_pmc *pmc)
 {
 	const struct apple_pmc_hw *hw = pmc->hw;
-	void __iomem *reg = pmc->voters + hw->ap_agent * hw->agent_stride;
-	u32 mask = APPLE_PMC_RAIL_MASK(hw->dcs_rail);
 	unsigned int state = max(pmc->ap_dcs_vote, pmc->dcs_floor);
-	u32 old, val;
 
 	if (pmc->dcs_state)
 		state = min_t(unsigned int,
 			      max(apple_pmc_dcs_demand(pmc), pmc->dcs_floor),
 			      hw->dcs_max - pmc->dcs_state);
 
-	old = readl(reg);
-	val = (old & ~mask) | (state << APPLE_PMC_RAIL_SHIFT(hw->dcs_rail));
-	if (val != old)
-		writel(val, reg);
+	return __apple_pmc_floor_update(pmc, hw->ap_agent,
+					APPLE_PMC_RAIL_MASK(hw->dcs_rail),
+					state << APPLE_PMC_RAIL_SHIFT(hw->dcs_rail));
 }
 
 static void apple_pmc_dcs_work(struct work_struct *work)
@@ -489,18 +492,42 @@ static int apple_pmc_dcs_get_cur_state(struct thermal_cooling_device *cdev,
 static int apple_pmc_dcs_limit(struct apple_pmc *pmc, unsigned long state)
 {
 	unsigned int rail = pmc->hw->dcs_rail;
+	unsigned long old = pmc->dcs_state;
 	int ret;
 
 	WRITE_ONCE(pmc->dcs_state, state);
 	if (state) {
-		apple_pmc_dcs_vote(pmc);
-		return apple_pmc_enable_write(pmc, rail);
+		ret = apple_pmc_dcs_vote(pmc);
+		if (ret) {
+			WRITE_ONCE(pmc->dcs_state, old);
+			return ret;
+		}
+		ret = apple_pmc_enable_write(pmc, rail);
+		if (ret) {
+			WRITE_ONCE(pmc->dcs_state, old);
+			apple_pmc_dcs_vote(pmc);
+		}
+		return ret;
 	}
 
 	ret = apple_pmc_enable_write(pmc, rail);
-	if (!ret)
-		apple_pmc_dcs_vote(pmc);
+	if (ret) {
+		WRITE_ONCE(pmc->dcs_state, old);
+		return ret;
+	}
 
+	ret = apple_pmc_dcs_vote(pmc);
+	if (ret) {
+		/*
+		 * All agents are already enabled, while the AP still holds
+		 * the old capped vote. Re-restrict rail_enable so dcs_state
+		 * stays synchronized with hardware; if that fails too, leave
+		 * dcs_state at 0 to match the uncapped rail_enable.
+		 */
+		WRITE_ONCE(pmc->dcs_state, old);
+		if (apple_pmc_enable_write(pmc, rail))
+			WRITE_ONCE(pmc->dcs_state, 0);
+	}
 	return ret;
 }
 
@@ -508,7 +535,7 @@ static int apple_pmc_dcs_set_cur_state(struct thermal_cooling_device *cdev,
 				       unsigned long state)
 {
 	struct apple_pmc *pmc = cdev->devdata;
-	unsigned long flags, old;
+	unsigned long flags;
 	bool limited;
 	int ret = 0;
 
@@ -516,17 +543,8 @@ static int apple_pmc_dcs_set_cur_state(struct thermal_cooling_device *cdev,
 		return -EINVAL;
 
 	raw_spin_lock_irqsave(&pmc->lock, flags);
-	old = pmc->dcs_state;
-	if (state != old) {
+	if (state != pmc->dcs_state)
 		ret = apple_pmc_dcs_limit(pmc, state);
-		/*
-		 * The rail enable did not change, so neither did the limit:
-		 * go back to the old state, which the next call then retries
-		 * to leave.
-		 */
-		if (ret)
-			apple_pmc_dcs_limit(pmc, old);
-	}
 	limited = pmc->dcs_state;
 	raw_spin_unlock_irqrestore(&pmc->lock, flags);
 
@@ -659,8 +677,7 @@ static int apple_pmc_floor_apply(struct apple_pmc *pmc, unsigned int rail)
 	/* The AP's DCS vote also carries the DCS limit; it combines both. */
 	if (rail == pmc->hw->dcs_rail) {
 		pmc->dcs_floor = level;
-		apple_pmc_dcs_vote(pmc);
-		return 0;
+		return apple_pmc_dcs_vote(pmc);
 	}
 
 	return __apple_pmc_floor_update(pmc, pmc->hw->ap_agent,
@@ -1552,6 +1569,14 @@ static int apple_pmc_resume_early(struct device *dev)
 			err = apple_pmc_floor_apply(pmc, rail);
 			ret = ret ?: err;
 		}
+	}
+	/*
+	 * The AP agent's word also holds its DCS vote, which a deep sleep's commit zeroes
+	 * (apple-sleep, T8132 and T8142). Cast it again: a no-op if it stayed.
+	 */
+	if (!(pmc->floor_rails & BIT(pmc->hw->dcs_rail))) {
+		err = apple_pmc_dcs_vote(pmc);
+		ret = ret ?: err;
 	}
 	raw_spin_unlock_irqrestore(&pmc->lock, flags);
 	if (ret)

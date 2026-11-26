@@ -21,6 +21,7 @@
 struct board_ctx {
 	const char *dcp;
 	const char *const *machine;	/* NULL-terminated root compatibles */
+	const char *panel;		/* the DCP's panel node compatible; NULL: none */
 };
 
 static bool board_ctx_dcp_is(const void *ctx, const char *compat)
@@ -41,12 +42,26 @@ static bool board_ctx_machine_is(const void *ctx, const char *compat)
 	return false;
 }
 
+static bool board_ctx_panel_is(const void *ctx, const char *compat)
+{
+	const struct board_ctx *c = ctx;
+
+	return c->panel && !strcmp(c->panel, compat);
+}
+
+static const struct dcp_v14_board *board_for_panel(const char *dcp, const char *const *machine,
+						   const char *panel, bool *known)
+{
+	const struct board_ctx ctx = { .dcp = dcp, .machine = machine, .panel = panel };
+
+	return dcp_v14_board_select(board_ctx_dcp_is, board_ctx_machine_is, board_ctx_panel_is,
+				    &ctx, known);
+}
+
 static const struct dcp_v14_board *board_for(const char *dcp, const char *const *machine,
 					     bool *known)
 {
-	const struct board_ctx ctx = { .dcp = dcp, .machine = machine };
-
-	return dcp_v14_board_select(board_ctx_dcp_is, board_ctx_machine_is, &ctx, known);
+	return board_for_panel(dcp, machine, NULL, known);
 }
 
 static const char *const j516c[] = { "apple,j516c", "apple,t6031", "apple,arm-platform", NULL };
@@ -314,21 +329,22 @@ static void v14_swap_timestamps_encoding(struct kunit *test)
 
 /*
  * J504 (14" M3 MacBook Pro): the J613 image on the T8122 DCP, its own 3024x1964
- * ProMotion panel, the qualified level block (brightness) and unstamped swaps. The other T8122
- * Macs (J433, J434) have no record.
+ * ProMotion panel, the qualified level block (brightness) and unstamped swaps, selected by
+ * the DCP's panel node (apple,panel-j504). The other T8122 Macs (J433, J434) have no record.
  */
 static void v14_board_j504(struct kunit *test)
 {
 	const struct dcp_v14_board *b, *air;
 	bool known;
 
-	b = board_for("apple,t8122-dcp", j504, &known);
+	b = board_for_panel("apple,t8122-dcp", j504, "apple,panel-j504", &known);
 	KUNIT_ASSERT_NOT_NULL(test, b);
 	air = board_for("apple,t8122-dcp", j613, &known);
 	KUNIT_ASSERT_NOT_NULL(test, air);
 	KUNIT_EXPECT_PTR_NE(test, b, air);
 	KUNIT_EXPECT_STREQ(test, b->name, "J504");
-	KUNIT_EXPECT_STREQ(test, b->machine, "apple,j504");
+	KUNIT_EXPECT_NULL(test, b->machine);
+	KUNIT_EXPECT_STREQ(test, b->panel, "apple,panel-j504");
 	KUNIT_EXPECT_STREQ(test, b->handoff, "apple,t8122-handoff");
 	KUNIT_EXPECT_STREQ(test, b->firmware_uuid, J613_DCP_IMAGE);
 	KUNIT_EXPECT_EQ(test, b->panel_width, 3024);
@@ -336,7 +352,6 @@ static void v14_board_j504(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, b->promotion);
 	KUNIT_EXPECT_TRUE(test, b->log_bringup);
 	KUNIT_EXPECT_TRUE(test, b->panel_nits);
-	KUNIT_EXPECT_FALSE(test, b->base_edid);
 	KUNIT_EXPECT_EQ(test, b->ctm_set, air->ctm_set);
 	KUNIT_EXPECT_EQ(test, b->ctm_get, air->ctm_get);
 	KUNIT_EXPECT_TRUE(test, dcp_v14_board_admits(b, J613_DCP_IMAGE));
@@ -346,8 +361,17 @@ static void v14_board_j504(struct kunit *test)
 
 	KUNIT_EXPECT_NULL(test, board_for("apple,t8122-dcp", j433, &known));
 	KUNIT_EXPECT_TRUE(test, known);
-	/* A J504 root with another SoC's DCP gets no J504 record. */
-	KUNIT_EXPECT_NULL(test, board_for("apple,t6031-dcp", j504, &known));
+	/* The record follows the panel node, not the machine: none without it. */
+	KUNIT_EXPECT_NULL(test, board_for("apple,t8122-dcp", j504, &known));
+	KUNIT_EXPECT_TRUE(test, known);
+	KUNIT_EXPECT_NULL(test, board_for_panel("apple,t8122-dcp", j504, "apple,panel-j514",
+						&known));
+	/* The Airs keep their machine records whatever the panel node says. */
+	KUNIT_EXPECT_PTR_EQ(test, board_for_panel("apple,t8122-dcp", j613, "apple,panel-j504",
+						  &known), air);
+	/* Another SoC's DCP with the J504 panel gets no J504 record. */
+	KUNIT_EXPECT_NULL(test, board_for_panel("apple,t6031-dcp", j504, "apple,panel-j504",
+						&known));
 }
 
 static struct kunit_case v14_board_cases[] = {

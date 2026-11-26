@@ -473,6 +473,42 @@ static void legacy_restore(void)
 	}
 	puts("PASS: M1/M2/J700 aborted shutdown blocks PIPE and restores saved lane mode");
 }
+
+/* A cancelled sleep restarts USB beside a DP link that never powered down. */
+static void retained_dp_restart(void)
+{
+	struct fixture f;
+	u32 power;
+	unsigned int before;
+
+	initial(&f, 1, false, false);
+	f.atc.mode = APPLE_ATCPHY_MODE_USB3_DP;
+	f.atc.typec_mode = APPLE_ATCPHY_MODE_USB3_DP;
+	f.atc.dp_t8122.aux = true;
+	f.atc.dp_t8122.pll = true;
+	usb2_regs[USB2PHY_USBCTL / 4] = USB2PHY_USBCTL_RUN;
+	usb2_regs[USB2PHY_SIG / 4] = USB2PHY_SIG_HOST;
+	power = core_regs[ATCPHY_POWER_CTRL / 4];
+	before = usb2_starts;
+
+	assert(exit_apple(&f) == 0);
+	assert(f.atc.mode == APPLE_ATCPHY_MODE_USB3_DP);
+	assert(!(usb2_regs[USB2PHY_USBCTL / 4] & USB2PHY_USBCTL_RUN));
+	assert(core_regs[ATCPHY_POWER_CTRL / 4] == power);
+	assert(role(&f, USB_ROLE_HOST) == 0);
+	assert(usb2_regs[USB2PHY_USBCTL / 4] == USB2PHY_USBCTL_RUN);
+	assert(usb2_starts == before + 1);
+	assert(usb2_regs[USB2PHY_SIG / 4] == USB2PHY_SIG_HOST);
+	assert(f.atc.mode == APPLE_ATCPHY_MODE_USB3_DP);
+	assert(f.atc.dp_t8122.aux && f.atc.dp_t8122.pll);
+	assert(core_regs[ATCPHY_POWER_CTRL / 4] == power);
+	assert(atcphy_usb2_init(&f.p2) == 0 && usb2_starts == before + 1);
+	assert(exit_apple(&f) == 0);
+	assert(!f.p2.init_count && !f.p2.power_count);
+	assert(!f.p3.init_count && !f.p3.power_count);
+	puts("PASS: USB2 returns beside retained DisplayPort without a mux event");
+}
+
 static void removal_and_generic(void)
 {
 	struct fixture f;
@@ -532,6 +568,7 @@ int main(int argc, char **argv)
 	partial_release();
 	init_failures();
 	legacy_restore();
+	retained_dp_restart();
 	removal_and_generic();
 	tunnel_role();
 	puts("PASS: Apple teardown actual-function qualification");

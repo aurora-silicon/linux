@@ -33,13 +33,9 @@
 		reg-names = "code", "sram", "mbox", "ctrl";
 		iommus = <&avd_dart 0>, <&avd_dart 1>, <&avd_dart 2>;
 	};
+};
 
-	avd_dart: iommu@501020000 {
-		compatible = "apple,t8142-dart", "apple,t8110-dart";
-		reg = <0x5 0x01020000 0x0 0x20000>;
-		#iommu-cells = <1>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 1084 IRQ_TYPE_LEVEL_HIGH>;
-		power-domains = <&ps_avd_sys>;
-	};
+&avd_dart {
+	power-domains = <&ps_avd_sys>;
+	status = "okay";
 };

@@ -267,6 +267,46 @@ static void dropped_present_retired_test(struct kunit *test)
 }
 
 /*
+ * The same drop on an HDMI display behind a fixed port (no panel, no Type-C
+ * route): the J473's HDMI display drops HPD while it wakes from standby after
+ * DPMS on, under an accepted swap.  The watchdog must retire that present too,
+ * instead of leaving it to the queue's ten second timeout, which declares the
+ * coprocessor crashed and refuses every later mode set.
+ */
+static void dropped_present_fixed_hdmi_test(struct kunit *test)
+{
+	struct dropped_test *t = dropped_test_external(test);
+	struct apple_dcp *dcp = &t->dcp;
+
+	dcp->fixed_connector_type = DRM_MODE_CONNECTOR_HDMIA;
+	KUNIT_ASSERT_FALSE(test, dcp_has_panel(dcp));
+
+	dropped_test_present(test, t, 0, &t->fb[1]);
+	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&dcp->swap_watchdog_wq));
+	KUNIT_EXPECT_EQ(test, iomfb_queue_settle(dcp, msecs_to_jiffies(2000)), 0);
+	KUNIT_EXPECT_FALSE(test, READ_ONCE(dcp->crashed));
+	KUNIT_EXPECT_TRUE(test, t->present[0].released);
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&dcp->iomfb.timeout));
+	KUNIT_EXPECT_TRUE(test, dcp_present_was_retired_h17p(&dcp->present_state_h17p,
+							     DROPPED_SWAP_ID));
+	flush_delayed_work(&dcp->swap_watchdog_wq);
+	KUNIT_EXPECT_FALSE(test, READ_ONCE(dcp->mode_state.valid));
+}
+
+/* A built-in panel keeps its swaps unwatched, as before. */
+static void panel_swap_unwatched_test(struct kunit *test)
+{
+	struct dropped_test *t = dropped_test_external(test);
+	struct apple_dcp *dcp = &t->dcp;
+
+	dcp->fixed_connector_type = DRM_MODE_CONNECTOR_eDP;
+	dcp->panel.width_mm = 300;
+	KUNIT_ASSERT_TRUE(test, dcp_has_panel(dcp));
+	dcp_swap_watchdog_arm(dcp);
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&dcp->swap_watchdog_wq));
+}
+
+/*
  * The firmware might still read a dropped present: its framebuffers, and the
  * one it would have replaced, stay referenced until a later present
  * completes.  A late completion of the dropped present releases nothing.
@@ -546,6 +586,8 @@ static struct kunit_case dropped_swap_cases[] = {
 	KUNIT_CASE(desktop_present_completion_test),
 	KUNIT_CASE(takeover_adopt_watched_test),
 	KUNIT_CASE(dropped_present_retired_test),
+	KUNIT_CASE(dropped_present_fixed_hdmi_test),
+	KUNIT_CASE(panel_swap_unwatched_test),
 	KUNIT_CASE(dropped_present_buffers_test),
 	KUNIT_CASE(completed_present_kept_test),
 	KUNIT_CASE(stop_deferred_test),
