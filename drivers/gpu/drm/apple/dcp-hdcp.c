@@ -80,6 +80,8 @@ struct dcp_hdcp {
 	struct apple_epic_service *relay;
 	struct apple_epic_service *iface[DCP_HDCP_IFACES];
 	struct apple_epic_service *session;
+	/* Sessions DCP announced for HDCP 1.x: declined, this is HDCP 2.2 only. */
+	struct apple_epic_service *hdcp1[DCP_HDCP_IFACES];
 	unsigned long ev_bits;
 	bool closed;
 	bool cancel;
@@ -633,6 +635,47 @@ static void dcp_hdcp_queue(struct dcp_hdcp *h, struct apple_epic_service *servic
 	queue_work(h->wq, &h->event_work);
 }
 
+/* Whether DCP announced @service as an HDCP 1.x session. */
+static bool dcp_hdcp_is_hdcp1(struct dcp_hdcp *h, struct apple_epic_service *service)
+{
+	unsigned long flags;
+	bool ret = false;
+	int i;
+
+	spin_lock_irqsave(&h->svc_lock, flags);
+	for (i = 0; i < DCP_HDCP_IFACES; i++)
+		ret |= h->hdcp1[i] == service;
+	spin_unlock_irqrestore(&h->svc_lock, flags);
+	return ret;
+}
+
+/*
+ * DCP announces one session per protocol version; the provider class says
+ * which, where the announcement carries one. A session without a class is
+ * taken for HDCP 2.2: the receiver registers it reads decide.
+ */
+static void dcp_hdcp_session_init(struct apple_epic_service *service,
+				  const char *name, const char *class, s64 unit)
+{
+	struct dcp_hdcp *h = dcp_hdcp_of(service);
+	unsigned long flags;
+	int i;
+
+	if (!h || !class || !strstr(class, "HDCP1"))
+		return;
+	spin_lock_irqsave(&h->svc_lock, flags);
+	for (i = 0; i < DCP_HDCP_IFACES; i++) {
+		if (h->hdcp1[i] == service)
+			break;
+		if (!h->hdcp1[i]) {
+			h->hdcp1[i] = service;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&h->svc_lock, flags);
+	dev_dbg(h->dcp->dev, "HDCP: HDCP 1.x session announced, declined\n");
+}
+
 static int dcp_hdcp_session_call(struct apple_epic_service *service, u16 group,
 				 u32 command, const void *data, size_t size,
 				 void *reply, size_t room)
@@ -645,7 +688,8 @@ static int dcp_hdcp_session_call(struct apple_epic_service *service, u16 group,
 	if (h && !group && command == DCP_HDCP_AUTH_OPEN) {
 		mutex_lock(&h->lock);
 		dcp_hdcp_sync_locked(h);
-		accept = dcp_hdcp_open(&h->link, h->gen, jiffies);
+		accept = !dcp_hdcp_is_hdcp1(h, service) &&
+			 dcp_hdcp_open(&h->link, h->gen, jiffies);
 		if (accept)
 			h->session_gen = h->gen;
 		mutex_unlock(&h->lock);
@@ -704,10 +748,14 @@ static void dcp_hdcp_session_teardown(struct apple_epic_service *service)
 	struct dcp_hdcp *h = dcp_hdcp_of(service);
 	unsigned long flags;
 	bool ours;
+	int i;
 
 	if (!h)
 		return;
 	spin_lock_irqsave(&h->svc_lock, flags);
+	for (i = 0; i < DCP_HDCP_IFACES; i++)
+		if (h->hdcp1[i] == service)
+			h->hdcp1[i] = NULL;
 	ours = h->session == service;
 	if (ours) {
 		h->closed = true;
@@ -830,7 +878,7 @@ static const struct apple_epic_service_ops dcp_hdcp_service_ops[] = {
 		.name = "dcpdptx-hdcp-auth-session",
 		.compact_full = "dcpdptx-hdcp-auth-session",
 		.singleton = true,
-		.init = dcp_hdcp_other_init,
+		.init = dcp_hdcp_session_init,
 		.call_v2 = dcp_hdcp_session_call,
 		.teardown = dcp_hdcp_session_teardown,
 	},
