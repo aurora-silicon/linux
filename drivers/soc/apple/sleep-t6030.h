@@ -999,7 +999,6 @@ static void t6030_sleep_late_entry(struct apple_sleep *s)
 	t->gate_dispext1_staged = true;
 	writel(T6030_PWRGATE_DISPEXT1_OFF, s->pwrgate + T6030_PWRGATE_DISPEXT1);
 	sleep_ps_lower(s, T6030_PS_SPI2);
-	t6030_sleep_down(s);
 }
 
 /*
@@ -1631,9 +1630,9 @@ static void t6030_gp_clk_off(struct apple_sleep *s)
 /*
  * Lower the 23 "ps" and 2 "ps-aon" domains that macOS already has off long before its -30 ms
  * sleep window (ATC0-3_COMMON, LW31/LW30/LS3/IOA3, MSG, DPA1-4, FPWM1/2, PMS_FPWM0-4, AFT0,
- * I2C5, PMGR_SOC_OCLA, NUB_SPI0, NUB_OCLA). Run in t6030_sleep_late_entry() seconds before the
- * -30 ms window so commit sees the same off state as macOS (25 words on instead of 48) without
- * adding writes inside the late window, and restore every word on wake.
+ * I2C5, PMGR_SOC_OCLA, NUB_SPI0, NUB_OCLA), so the commit sees the same off state as macOS (25
+ * words on instead of 48), and restore every word on wake. Run from .commit_regs, after the
+ * coprocessors' stops.
  */
 static bool t6030_lower_macos_off = true;
 module_param_named(lower_macos_off, t6030_lower_macos_off, bool, 0644);
@@ -1718,6 +1717,11 @@ static void t6030_sleep_commit_regs(struct apple_sleep *s)
 	/* A core that didn't take its stop would keep the engine waiting at the commit */
 	if (s->cpus_stop_ret)
 		t6030_sleep_failed("the other cores' stop");
+	/*
+	 * After the PMP's and SIO's stops: lowered in the late group, with the PMP still running,
+	 * these words made the PMP's commit stop time out (-ETIMEDOUT, J516S).
+	 */
+	t6030_sleep_down(s);
 	t6030_gp_phy_park(s);
 	if (t6030_sleep_lower(s, T6030_LOWER_PHY, ARRAY_SIZE(t6030_lowered)))
 		t6030_sleep_failed("storage PHY power word");
