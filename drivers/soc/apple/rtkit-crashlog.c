@@ -101,6 +101,11 @@ static_assert(sizeof(struct apple_rtkit_crashlog_regs) == 0x350);
 #define APPLE_RTKIT_CRASHLOG_UNKNOWN_DUMP 0x100
 #define APPLE_RTKIT_CRASHLOG_UNKNOWN_LINE 32
 
+/* DIAGNOSTIC: print more of each such section (T6030 PMP "PTD abort" decode). */
+static unsigned int crashlog_dump_bytes = APPLE_RTKIT_CRASHLOG_UNKNOWN_DUMP;
+module_param(crashlog_dump_bytes, uint, 0644);
+MODULE_PARM_DESC(crashlog_dump_bytes, "DIAGNOSTIC: bytes printed of each crashlog section without a decoder (default 256)");
+
 /*
  * A section this file has no decoder for: its name and the start of its
  * payload. An exception log of the PMP has no 'Cstr' to say what went wrong;
@@ -113,8 +118,8 @@ static void apple_rtkit_crashlog_dump_unknown(struct apple_rtkit *rtk, u32 fourc
 	char line[APPLE_RTKIT_CRASHLOG_UNKNOWN_LINE * 3 + 1], name[5];
 	size_t len = size, i, j, n;
 
-	if (len > APPLE_RTKIT_CRASHLOG_UNKNOWN_DUMP)
-		len = APPLE_RTKIT_CRASHLOG_UNKNOWN_DUMP;
+	if (len > READ_ONCE(crashlog_dump_bytes))
+		len = READ_ONCE(crashlog_dump_bytes);
 	for (i = 0; i < 4; i++) {
 		u8 c = fourcc >> (24 - 8 * i);
 
