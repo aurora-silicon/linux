@@ -41,6 +41,7 @@ appledrm-y += epic/dpavservep.o
 appledrm-y += epic/panelavep.o
 appledrm-y += plane.o
 appledrm-y += dcp-indicator.o
+appledrm-$(CONFIG_DRM_APPLE_HDCP) += dcp-hdcp-tx.o
 
 
 appledrm-$(CONFIG_TRACING) += trace.o
