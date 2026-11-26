@@ -601,6 +601,8 @@ struct apple_dcp_afkep {
 	bool compact_tx_desync;
 	/* Replies to firmware calls, see afk_compact_reply_worker(). */
 	struct workqueue_struct *tx_wq;
+	/* Payload bytes of the replies queued there and not yet sent (lock). */
+	size_t compact_reply_bytes;
 	/* Accepted RX and queued replies, until each worker has returned. */
 	atomic_t sleep_jobs;
 	struct mutex compact_tx_lock;
