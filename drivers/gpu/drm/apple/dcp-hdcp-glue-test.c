@@ -100,10 +100,36 @@ static void glue_declined_open_forgets_slot(struct kunit *test)
 	destroy_workqueue(g->h.wq);
 }
 
+/* Sessions announced for HDCP 1.x are recorded, never taken, and forgotten on teardown. */
+static void glue_hdcp1_session_declined(struct kunit *test)
+{
+	struct glue_fixture *g = glue_new(test, true);
+	struct apple_epic_service other = { .ep = &g->ep };
+	const struct apple_epic_service_ops *ops;
+
+	spin_lock_init(&g->h.svc_lock);
+	ops = dcp_hdcp_match_service(&g->ep, "dcpdptx-hdcp-auth-session", false);
+	KUNIT_ASSERT_NOT_NULL(test, ops);
+	/* Every announced session keeps its own handler. */
+	KUNIT_EXPECT_FALSE(test, ops->singleton);
+
+	ops->init(&g->service, "dcpdptx-hdcp-auth-session", "TxHDCP1Session", 0);
+	ops->init(&other, "dcpdptx-hdcp-auth-session", "TxHDCP2Session", 0);
+	KUNIT_EXPECT_TRUE(test, dcp_hdcp_is_hdcp1(&g->h, &g->service));
+	KUNIT_EXPECT_FALSE(test, dcp_hdcp_is_hdcp1(&g->h, &other));
+	/* No class: taken for HDCP 2.2. */
+	ops->init(&other, "dcpdptx-hdcp-auth-session", NULL, 0);
+	KUNIT_EXPECT_FALSE(test, dcp_hdcp_is_hdcp1(&g->h, &other));
+
+	dcp_hdcp_session_teardown(&g->service);
+	KUNIT_EXPECT_FALSE(test, dcp_hdcp_is_hdcp1(&g->h, &g->service));
+}
+
 static struct kunit_case dcp_hdcp_glue_cases[] = {
 	KUNIT_CASE(glue_match_by_name),
 	KUNIT_CASE(glue_session_without_hdcp_declines),
 	KUNIT_CASE(glue_declined_open_forgets_slot),
+	KUNIT_CASE(glue_hdcp1_session_declined),
 	{ }
 };
 
