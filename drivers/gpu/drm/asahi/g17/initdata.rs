@@ -582,42 +582,17 @@ impl InitData {
                 .is_some_and(|shared| vm.compute_pool_mappings_match(shared.id))
     }
 
+    /// Records that `vm` is ready for the installed compute pool. The pool's page list, run
+    /// list and blocks and the completion rings are device-wide and the firmware's: no client
+    /// VM maps them, so one client cannot rewrite what every compute queue allocates from, or
+    /// the records the host retires every client's compute work on.
     pub(super) fn cache_compute_vm(&self, vm: &mmu::Vm) -> Result {
         let shared = self.compute_shared.as_ref().ok_or(EIO)?;
         if vm.compute_pool_mappings_match(shared.id) {
             return Ok(());
         }
         vm.clear_compute_pool_mappings();
-        let mut mappings = KVec::with_capacity(26, GFP_KERNEL)?;
-        mappings.push(
-            shared
-                .pages
-                .map_alias(vm, low::COMPUTE_POOL_PAGE_LIST, mmu::PROT_GPU_SHARED_RW)?,
-            GFP_KERNEL,
-        )?;
-        mappings.push(
-            shared
-                .runs
-                .map_alias(vm, low::COMPUTE_POOL_RUN_LIST, mmu::PROT_GPU_SHARED_RW)?,
-            GFP_KERNEL,
-        )?;
-        for (index, block) in shared.blocks.iter().take(COMPUTE_BLOCKS_MAPPED).enumerate() {
-            mappings.push(
-                block.map_alias(vm, low::compute_block(index), mmu::PROT_GPU_SHARED_RW)?,
-                GFP_KERNEL,
-            )?;
-        }
-        for slot in 0..2 {
-            mappings.push(
-                self.object(self.completion_rings[slot].ok_or(EINVAL)?)?.map_alias(
-                    vm,
-                    low::COMPLETION_RINGS[slot],
-                    mmu::PROT_GPU_SHARED_RW,
-                )?,
-                GFP_KERNEL,
-            )?;
-        }
-        vm.install_compute_pool_mappings(shared.id, mappings)
+        vm.install_compute_pool_mappings(shared.id, KVec::new())
     }
 
     /// The descriptor-table views remain immutable for the firmware session.
@@ -1278,29 +1253,29 @@ impl InitData {
     }
 
     /// Render and boot free-list controls, descriptor pages and the two queue contexts.
+    ///
+    /// All of them sit in the upper half, which every execution context includes, and only the
+    /// firmware reads and writes them: they are firmware-only. The descriptor pages hold the
+    /// completion stamps the host takes as proof that a render's cache maintenance finished,
+    /// and the boot free list's control becomes the device-wide compute pool's.
     fn build_render_free_lists(&mut self, env: &BuildEnv<'_>) -> Result {
-        use mmu::{
-            PROT_FW_PRIV_RW as FP, PROT_FW_SHARED_RW as FS, PROT_GPU_FW_PRIV_RW as GFP,
-            PROT_GPU_FW_SHARED_RW as GFS,
-        };
+        use mmu::{PROT_FW_PRIV_RW as FP, PROT_FW_SHARED_RW as FS};
         use CpuMap::WriteCombined as WC;
-        for (offset, state, class, prot, initial) in [
+        for (offset, state, class, initial) in [
             (
                 high::RENDER_FREE_LIST,
                 high::RENDER_FREE_LIST_STATE,
                 abi::FreeListClass::One,
-                FP,
                 abi::FreeListState::RENDER,
             ),
             (
                 high::BOOT_FREE_LIST,
                 high::BOOT_FREE_LIST_STATE,
                 abi::FreeListClass::Two,
-                GFP,
                 abi::FreeListState::BOOT,
             ),
         ] {
-            let control = self.add(env.fixed(offset, mmu::UAT_PGSZ, prot, WC)?)?;
+            let control = self.add(env.fixed(offset, mmu::UAT_PGSZ, FP, WC)?)?;
             self.object_mut(control)?.write(
                 0,
                 abi::FreeListControl::new(&abi::FreeListArgs {
@@ -1312,20 +1287,15 @@ impl InitData {
                     state_va: env.base + state,
                 }),
             )?;
-            let state_prot = if class == abi::FreeListClass::One {
-                FS
-            } else {
-                GFS
-            };
-            let state = self.add(env.fixed(state, mmu::UAT_PGSZ, state_prot, WC)?)?;
+            let state = self.add(env.fixed(state, mmu::UAT_PGSZ, FS, WC)?)?;
             self.object_mut(state)?.write(0, initial)?;
             if class == abi::FreeListClass::Two {
                 self.boot_control = Some(control);
                 self.boot_state = Some(state);
             }
         }
-        self.stamps[0] = self.add(env.fixed(high::DESCRIPTOR_PAGE_A, mmu::UAT_PGSZ, GFS, WC)?)?;
-        self.stamps[1] = self.add(env.fixed(high::DESCRIPTOR_PAGE_B, mmu::UAT_PGSZ, GFP, WC)?)?;
+        self.stamps[0] = self.add(env.fixed(high::DESCRIPTOR_PAGE_A, mmu::UAT_PGSZ, FS, WC)?)?;
+        self.stamps[1] = self.add(env.fixed(high::DESCRIPTOR_PAGE_B, mmu::UAT_PGSZ, FP, WC)?)?;
         self.add(env.fixed(high::TA_CONTEXT, CONTEXT_SIZE, FS, WC)?)?;
         self.add(env.fixed(high::FRAGMENT_CONTEXT, CONTEXT_SIZE, FS, WC)?)?;
         Ok(())
@@ -1379,10 +1349,14 @@ impl InitData {
 
     /// Compute free-list controls and states, zero blocks, run list and the compute page
     /// list inside the render blocks.
+    ///
+    /// The controls and states sit in the upper half, which every execution context includes,
+    /// and only the firmware reads and writes them: they are firmware-only, as the render free
+    /// list's are.
     fn build_compute_pools(&mut self, env: &BuildEnv<'_>, first_block: usize) -> Result {
-        use mmu::PROT_GPU_FW_SHARED_RW as GFS;
+        use mmu::{PROT_FW_SHARED_RW as FS, PROT_GPU_FW_SHARED_RW as GFS};
         use CpuMap::{WriteBack as WB, WriteCombined as WC};
-        let compute = self.add(env.fixed(high::COMPUTE_FREE_LIST, mmu::UAT_PGSZ, GFS, WC)?)?;
+        let compute = self.add(env.fixed(high::COMPUTE_FREE_LIST, mmu::UAT_PGSZ, FS, WC)?)?;
         self.object_mut(compute)?.write(
             0,
             abi::FreeListControl::new(&abi::FreeListArgs {
@@ -1410,7 +1384,7 @@ impl InitData {
                 abi::fill_run_list(list, low::COMPUTE_FREE_LIST_BLOCKS)
             })?;
         let ready =
-            self.add(env.fixed(high::COMPUTE_READY_FREE_LIST, mmu::UAT_PGSZ, GFS, WC)?)?;
+            self.add(env.fixed(high::COMPUTE_READY_FREE_LIST, mmu::UAT_PGSZ, FS, WC)?)?;
         self.object_mut(ready)?.write(
             0,
             abi::FreeListControl::new(&abi::FreeListArgs {
@@ -1423,7 +1397,7 @@ impl InitData {
             }),
         )?;
         for state in [high::COMPUTE_READY_FREE_LIST_STATE, high::COMPUTE_STATE] {
-            let obj = self.add(env.fixed(state, mmu::UAT_PGSZ, GFS, WC)?)?;
+            let obj = self.add(env.fixed(state, mmu::UAT_PGSZ, FS, WC)?)?;
             self.object_mut(obj)?
                 .write(0, abi::FreeListState::COMPUTE)?;
         }
