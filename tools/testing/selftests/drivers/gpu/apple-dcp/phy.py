@@ -2786,3 +2786,197 @@ int main(void)
 }
 '''
     return prefix + production + suffix
+
+
+def t6050_warm_activate(root):
+    """T6050 lpdptx activation across cold boot and bootloader-locked PLL handoff."""
+    source = (root / 'drivers/phy/apple/dptx.c').read_text()
+    start = source.index('static void t6050_rmw(')
+    end = source.index('static int t6050_deactivate(', start)
+    production = source[start:end]
+    prefix = r'''
+#include <assert.h>
+#include <errno.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+typedef uint8_t u8;
+typedef uint16_t u16;
+typedef uint32_t u32;
+#define __iomem
+#define BIT(n) (1U << (n))
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof(*(a)))
+#define DPTX_MAX_LANES 4
+#define DPTX_LANE0_OFFSET 0x5000
+#define DPTX_LANE_STRIDE 0x1000
+#define dev_err(dev, ...) ((void)(dev))
+#define dev_dbg(dev, ...) ((void)(dev))
+
+enum {
+	T6050_DCOCFG,
+	T6050_DTCVREG,
+	T6050_DTCCAL,
+	T6050_DCDADJ,
+	T6050_DLFCFG,
+	T6050_RODCOROLEAKCOMP,
+	T6050_NR_CAL,
+};
+
+struct apple_dptx_phy {
+	void *dev;
+	struct {
+		unsigned char *core;
+		unsigned char *dptx;
+	} regs;
+	u32 cal[T6050_NR_CAL];
+	bool cal_set[T6050_NR_CAL];
+	u32 source_select;
+	bool pclkdrv_select;
+	bool active;
+	u32 rate;
+	u32 active_lanes;
+};
+
+static u32 core_regs[0x1000 / 4];
+static u32 dptx_regs[0x10000 / 4];
+static unsigned int pll_down_cmds, pll_up_cmds;
+static unsigned int seq, first_core_cfg_seq, last_pll_down_seq, phy_down_seq;
+static bool fail_pll_ack, stick_pll_lock;
+
+static void udelay(unsigned int us) { (void)us; }
+static void ndelay(unsigned int ns) { (void)ns; }
+static void usleep_range(unsigned int lo, unsigned int hi) { assert(lo && hi >= lo); }
+
+static u32 readl(void *addr) { return *(u32 *)addr; }
+
+static void writel(u32 val, void *addr)
+{
+	uintptr_t ptr = (uintptr_t)addr;
+
+	if (ptr >= (uintptr_t)dptx_regs &&
+	    ptr < (uintptr_t)dptx_regs + sizeof(dptx_regs)) {
+		u32 off = (u32)(ptr - (uintptr_t)dptx_regs);
+
+		seq++;
+		dptx_regs[off / 4] = val;
+		if (off == 0x4004 && (val & 1U) && !phy_down_seq)
+			phy_down_seq = seq;
+		if (off == 0x22e8 && !first_core_cfg_seq)
+			first_core_cfg_seq = seq;
+		if (off == 0x100c && (val & BIT(3))) {
+			u32 cmd = val & 7U;
+
+			dptx_regs[0x1014 / 4] = fail_pll_ack ? 0U : 1U;
+			if (!fail_pll_ack) {
+				if (cmd == 0) {
+					pll_down_cmds++;
+					last_pll_down_seq = seq;
+					if (!stick_pll_lock)
+						dptx_regs[0x1008 / 4] &= ~BIT(3);
+				} else if (cmd == 7) {
+					pll_up_cmds++;
+					dptx_regs[0x1008 / 4] |= BIT(3);
+				}
+			}
+		}
+		if (off == 0x4200 && (val & 1U)) {
+			dptx_regs[0x4204 / 4] = 1U;
+			dptx_regs[0x4210 / 4] = 0x2aU << 18;
+		}
+		return;
+	}
+	assert(ptr >= (uintptr_t)core_regs &&
+	       ptr < (uintptr_t)core_regs + sizeof(core_regs));
+	core_regs[(ptr - (uintptr_t)core_regs) / 4] = val;
+}
+
+static void mask32(void *reg, u32 mask, u32 set)
+{
+	u32 val = readl(reg);
+
+	val &= ~mask;
+	val |= set;
+	writel(val, reg);
+}
+
+static void set32(void *reg, u32 set) { mask32(reg, 0, set); }
+static void clear32(void *reg, u32 clear) { mask32(reg, clear, 0); }
+'''
+    suffix = r'''
+static void reset_phy(struct apple_dptx_phy *phy, bool pclkdrv_select)
+{
+	memset(core_regs, 0, sizeof(core_regs));
+	memset(dptx_regs, 0, sizeof(dptx_regs));
+	*phy = (struct apple_dptx_phy){
+		.regs.core = (unsigned char *)core_regs,
+		.regs.dptx = (unsigned char *)dptx_regs,
+		.source_select = 5,
+		.pclkdrv_select = pclkdrv_select,
+	};
+	pll_down_cmds = pll_up_cmds = 0;
+	seq = first_core_cfg_seq = last_pll_down_seq = phy_down_seq = 0;
+	fail_pll_ack = stick_pll_lock = false;
+}
+
+int main(void)
+{
+	struct apple_dptx_phy phy;
+
+	/* Cold boot: PLL unlocked, no PLL power-down command issued. */
+	reset_phy(&phy, false);
+	assert(t6050_activate(&phy) == 0);
+	assert(phy.active && pll_down_cmds == 0 && pll_up_cmds == 0);
+	assert(t6050_reconfigure(&phy, true, 4, true, 8100) == 0);
+	assert(phy.rate == 8100 && phy.active_lanes == 4 && pll_up_cmds == 1);
+	assert(dptx_regs[0x1008 / 4] & BIT(3));
+
+	/*
+	 * Warm boot: bootloader left PLL locked (with pclkdrv either on or off,
+	 * and with either pclkdrv_select bit). Must power down PHY and unlock
+	 * PLL before rewriting PLL core calibration/config, then train HBR3.
+	 */
+	for (unsigned int sel = 0; sel < 2; sel++) {
+		for (unsigned int pclk_on = 0; pclk_on < 2; pclk_on++) {
+			u32 pclk_bit = sel ? BIT(3) : BIT(1);
+
+			reset_phy(&phy, sel);
+			dptx_regs[0x1008 / 4] = BIT(3);
+			if (pclk_on)
+				dptx_regs[0x2200 / 4] = pclk_bit;
+			dptx_regs[0x4000 / 4] = 0x03000040;
+			dptx_regs[0x4004 / 4] = 0x8;
+
+			assert(t6050_activate(&phy) == 0);
+			assert(phy.active);
+			assert(pll_down_cmds == 1);
+			assert(phy_down_seq > 0 && phy_down_seq < last_pll_down_seq);
+			assert(last_pll_down_seq < first_core_cfg_seq);
+			assert(!(dptx_regs[0x1008 / 4] & BIT(3)));
+			assert(dptx_regs[0x2200 / 4] & pclk_bit);
+
+			assert(t6050_reconfigure(&phy, true, 4, true, 8100) == 0);
+			assert(phy.rate == 8100 && phy.active_lanes == 4);
+			assert(dptx_regs[0x1008 / 4] & BIT(3));
+		}
+	}
+
+	/* Warm boot unlock failures abort before marking active or writing cfg. */
+	reset_phy(&phy, false);
+	dptx_regs[0x1008 / 4] = BIT(3);
+	fail_pll_ack = true;
+	assert(t6050_activate(&phy) == -ETIMEDOUT);
+	assert(!phy.active && !first_core_cfg_seq);
+
+	reset_phy(&phy, false);
+	dptx_regs[0x1008 / 4] = BIT(3);
+	stick_pll_lock = true;
+	assert(t6050_activate(&phy) == -EIO);
+	assert(!phy.active && !first_core_cfg_seq);
+
+	puts("PASS: T6050 cold and bootloader-warm activation and unlock error paths");
+	return 0;
+}
+'''
+    return prefix + production + suffix

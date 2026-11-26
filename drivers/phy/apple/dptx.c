@@ -676,9 +676,27 @@ static int t6050_impedance_calibration(struct apple_dptx_phy *phy)
 	return 0;
 }
 
+static int t6050_pll_command(struct apple_dptx_phy *phy, u32 cmd);
+static void t6050_phy_power_down(struct apple_dptx_phy *phy);
+
 static int t6050_activate(struct apple_dptx_phy *phy)
 {
+	int ret;
+
 	t6050_device_power(phy, true);
+	/*
+	 * Early bootloader display bring-up leaves the PLL locked and PHY
+	 * running while the driver starts unactivated. Power both down before
+	 * rewriting PLL calibration and configuration.
+	 */
+	if (readl(phy->regs.dptx + 0x1008) & BIT(3)) {
+		t6050_phy_power_down(phy);
+		t6050_pclk(phy, false);
+		ret = t6050_pll_command(phy, 0);
+		if (ret)
+			return ret;
+		udelay(1);
+	}
 	phy->active = true;
 	t6050_pll_core_cfg(phy);	/* PLL top, PHY and AUX configuration: nothing on this board */
 	t6050_configure_pll(phy);

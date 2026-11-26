@@ -1436,7 +1436,7 @@ static int dcp_tunnel_set_rate(struct apple_dcp *d,void *phy,...) {
     bool external_physically_absent,main_display,typec_crtc_off,external_cable,external_error,external_power_attempted,external_stopped;
     bool external_hotplug_pending,external_hotplug_connected,typec_poweron_hpd;
     u64 external_stop_generation,external_rx_generation,external_crtc_generation;
-    unsigned swap_watchdog_retrains;int typec_iomfb_hpd_ready,typec_display_ready;''')
+    unsigned swap_watchdog_retrains;int typec_iomfb_hpd_ready,typec_display_ready,hdmi_disconnect_done;''')
     stubs = r'''
 #define DCP_HOTPLUG_NOTIFY 1
 static bool dcp_is_typec_output(struct apple_dcp *d) { (void)d;return true; }
