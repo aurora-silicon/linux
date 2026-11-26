@@ -566,6 +566,9 @@ struct RenderFlight {
 struct Blamed {
     owner: crate::m3::m3_submit::Owner,
     stamps: [u32; 2],
+    /// The stopped compute command's queue ordinal: the drain waits for this command only. The
+    /// packet's later commands were not stopped and retire (failed) through the normal path.
+    stopped: Option<u64>,
 }
 
 struct State {
@@ -1156,19 +1159,22 @@ impl Runtime {
                 flight.doomed = Some(error);
                 latch_guilty(&flight.packet, error);
                 Blamed { owner: flight.packet.owner,
-                         stamps: [flight.stamps[TILER].raw(), flight.stamps[FRAGMENT].raw()] }
+                         stamps: [flight.stamps[TILER].raw(), flight.stamps[FRAGMENT].raw()],
+                         stopped: None }
             }
             Stopped::Compute(stamp) => {
                 let flights = state.inflight.iter().map(|f| (f.stamp.raw(), f.ordinal));
-                let Some(packet) = g14_v27_2_abi::stopped_compute(flights, state.retired_total, stamp)
-                    .map(|i| state.inflight[i].packet.clone()) else { return Err(EIO); };
+                let Some((packet, stopped)) = g14_v27_2_abi::stopped_compute(flights, state.retired_total, stamp)
+                    .map(|i| (state.inflight[i].packet.clone(), state.inflight[i].ordinal))
+                    else { return Err(EIO); };
                 self.reserve_kept(state, &packet)?;
                 let owned = |f: &&mut Inflight| Arc::ptr_eq(&f.packet, &packet);
                 for flight in state.inflight.iter_mut().filter(owned) {
                     flight.doomed.get_or_insert(error);
                 }
                 latch_guilty(&packet, error);
-                Blamed { owner: packet.owner, stamps: [stamp, state.queue_stamp()] }
+                Blamed { owner: packet.owner, stamps: [stamp, state.queue_stamp()],
+                         stopped: Some(stopped) }
             }
         };
         Ok(blamed)
@@ -1187,16 +1193,17 @@ impl Runtime {
                  work, &events[..seen], state.events_read, reports, answered, state.ledger.last());
     }
 
-    /// Whether every command marked by `blame` has left its queue.
-    fn doomed_retired(&self, state: &mut State) -> Result<bool> {
+    /// Whether the stopped work has left its queue: the render pair, or the compute command at
+    /// `stopped` (its packet's later commands run normally and are failed as they retire).
+    fn doomed_retired(&self, state: &mut State, stopped: Option<u64>) -> Result<bool> {
         if let Some(flight) = state.rendering.as_ref() {
             if flight.doomed.is_some() {
                 return Ok(state.root.render_retired(TILER, flight.targets[TILER])?
                     && state.root.render_retired(FRAGMENT, flight.targets[FRAGMENT])?);
             }
         }
-        let Some(ordinal) =
-            state.inflight.iter().rev().find(|f| f.doomed.is_some()).map(|f| f.ordinal)
+        let Some(ordinal) = stopped.or_else(||
+            state.inflight.iter().rev().find(|f| f.doomed.is_some()).map(|f| f.ordinal))
             else { return Ok(true); };
         self.advance(state)?;
         Ok(state.retired_total >= ordinal)
@@ -1335,7 +1342,7 @@ impl Runtime {
             let start = Instant::<Monotonic>::now();
             loop {
                 let _ = state.root.drain();
-                if self.doomed_retired(state)? {
+                if self.doomed_retired(state, blamed.stopped)? {
                     state.recoveries += 1;
                     // Work behind the stopped command waited out the recovery: restart its clocks.
                     let now = Instant::now();
