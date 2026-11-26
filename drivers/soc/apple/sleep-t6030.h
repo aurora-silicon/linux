@@ -1481,8 +1481,14 @@ static const struct apple_sleep_soc t6030_sleep_soc = {
 	.smc_policy = &t6030_smc_policy,
 	.early_context = true,
 	.own_wake = true,
-	/* Each core takes its deep WFI from its stop bit, before the commit, as on macOS */
-	.early_cpu_wfi = true,
+	/*
+	 * No early_cpu_wfi. H15 has __ARM_GLOBAL_SLEEP_BIT__, so XNU's ml_arm_sleep() holds
+	 * each other core in WFE after its stop bit until the boot core clears arm64_stall_sleep.
+	 * The boot core does that in its own ml_arm_sleep(), after its quiesce actions (the PMGR's
+	 * last mile and the commit, IOCPUSleepKernel()). ACC_OVRD is one register for every core:
+	 * armed early, "a CPU [that] executes WFI outside of the deep sleep context ... will hang".
+	 * So the stopped cores wait in WFE and take their deep WFI after the commit.
+	 */
 	/*
 	 * A core the sequencer restarts after the commit takes it again in the pen, with the
 	 * A7-M3 power-down controls (aura's reset path puts CYC_OVRD back in retention)
