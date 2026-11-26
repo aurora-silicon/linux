@@ -153,3 +153,15 @@ struct dma_fence *asahi_g17_merge_fences(struct dma_fence *const *fences, size_t
 	kfree(cursors);
 	return merged;
 }
+
+/*
+ * How @a orders against @b: 1 when it signals after it on their shared
+ * context, 0 when not, -1 when they are on different contexts, which
+ * dma_fence_is_later() would warn about.
+ */
+int asahi_g17_fence_order(struct dma_fence *a, struct dma_fence *b)
+{
+	if (a->context != b->context)
+		return -1;
+	return dma_fence_is_later(a, b);
+}
