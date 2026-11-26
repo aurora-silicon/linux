@@ -127,9 +127,9 @@ void apple_mbox_set_recv_enabled(struct apple_mbox *mbox, bool enabled);
 void apple_mbox_hold_rx(struct apple_mbox *mbox);
 void apple_mbox_release_rx(struct apple_mbox *mbox);
 /*
- * Set the minimum utilization (0..1024) the G17 flood-throttle receive thread
- * runs with, or -1 to restore the scheduler's default; the thread applies it
- * when it next wakes. Only mailboxes with a threaded receive handler support it.
+ * Set the minimum utilization (0..1024) the threaded receive handler runs with,
+ * or -1 to restore the scheduler's default; the handler applies it to itself
+ * when it next runs. Only mailboxes with a threaded receive handler support it.
  */
 int apple_mbox_set_rx_util_min(struct apple_mbox *mbox, int util_min);
 int apple_mbox_send(struct apple_mbox *mbox, struct apple_mbox_msg msg,
