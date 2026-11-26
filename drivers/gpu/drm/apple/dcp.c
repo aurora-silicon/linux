@@ -75,6 +75,8 @@
 #include "dcp-syslog.h"
 #include "dcpext_scanout.h"
 #include "dcp-internal.h"
+
+static int dcp_v27_early_services_start(struct apple_dcp *dcp);
 #include "j613-25g83.h"
 #include "dcp-external-bw.h"
 #include "dptx-service.h"
@@ -1613,6 +1615,12 @@ static struct apple_dcp_afkep *dcp_afkep(struct apple_dcp *dcp, u8 endpoint)
 {
 	if (dcp->v27_sleep_transport && endpoint >= 0x20 && endpoint < 0x40) {
 		struct apple_dcp_afkep *ep = READ_ONCE(dcp->sleep_v27_ep[endpoint - 0x20]);
+
+		if (ep)
+			return ep;
+	}
+	if (endpoint >= 0x20 && endpoint < 0x40) {
+		struct apple_dcp_afkep *ep = READ_ONCE(dcp->v27_early_svc_ep[endpoint - 0x20]);
 
 		if (ep)
 			return ep;
@@ -4951,6 +4959,8 @@ int dcp_start(struct platform_device *pdev)
 	ret = systemep_init(dcp);
 	if (ret)
 		dev_warn(dcp->dev, "Failed to start system endpoint: %d\n", ret);
+	else
+		dcp_v27_early_services_start(dcp);
 
 	if (unstable_edid && !dcp_has_panel(dcp)) {
 		ret = dpavservep_init(dcp);
@@ -7340,6 +7350,8 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 		if (dcp->v27_sleep_transport)
 			for (int i = 0; i < ARRAY_SIZE(dcp->sleep_v27_ep); i++)
 				afk_quiesce(READ_ONCE(dcp->sleep_v27_ep[i]));
+		for (int i = 0; i < ARRAY_SIZE(dcp->v27_early_svc_ep); i++)
+			afk_quiesce(READ_ONCE(dcp->v27_early_svc_ep[i]));
 		cancel_delayed_work_sync(&dcp->bl_fallback_wq);
 		dcp_backlight_stop(dcp);
 		if (dcp->connector_type == DRM_MODE_CONNECTOR_eDP) {

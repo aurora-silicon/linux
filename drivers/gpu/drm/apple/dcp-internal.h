@@ -916,6 +916,8 @@ struct apple_dcp {
 
 	/* A firmware-driven suspend stops the firmware, see dcp_s2r_suspend(). */
 	struct apple_dcp_afkep *sleep_v27_ep[0x20];
+	/* T6030 internal DCP: the service endpoints macOS runs (dcp_v27_early_services_start()) */
+	struct apple_dcp_afkep *v27_early_svc_ep[0x20];
 	/* The J714s normal method table, panel services and swap profile. */
 	bool v27_j714s;
 	/* Sleep endpoint inventory and control replies; not a normal RPC profile. */

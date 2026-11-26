@@ -1912,6 +1912,106 @@ static bool dcp_v27_early_held(struct apple_dcp *dcp)
 	return dcp->v27_early && (dcp->v27_early->closed || dcp->v27_early->stopped);
 }
 
+/*
+ * The service endpoints macOS 27.2 runs on the J516S internal DCP besides IOMFB (0x37) and the
+ * system endpoint (s2r-full-boot-2): it starts them at boot, the DCP posts on 0x24, 0x27, 0x28,
+ * 0x29 and 0x2b when it powers its display off (-156,953 ms), and at the DCP's halt macOS drains
+ * each one, 0x31 then 0x2b down to 0x20 (-139,029 ms). Linux ran none of them, and with the PMP
+ * running the PMP crashed ("PTD abort") at that power-off.
+ */
+static const u8 dcp_v27_early_service_eps[] = {
+	0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x31,
+};
+
+/* DIAGNOSTIC switches for the two macOS steps below, both on by default */
+static bool v27_early_services = true;
+module_param(v27_early_services, bool, 0444);
+MODULE_PARM_DESC(v27_early_services, "DIAGNOSTIC: T6030: start the internal DCP's service endpoints at its start, as macOS (default Y)");
+static bool v27_early_disp = true;
+module_param(v27_early_disp, bool, 0644);
+MODULE_PARM_DESC(v27_early_disp, "DIAGNOSTIC: T6030: drop the PMP display request right after the DCP's RUN goes off, raise it before RUN on, as macOS (default Y)");
+
+/* Whatever the DCP announces on them is taken; its reports are consumed, its calls unanswered. */
+static int dcp_v27_early_any_report(struct apple_epic_service *service, enum epic_subtype type,
+				    const void *data, size_t data_size)
+{
+	return 0;
+}
+
+static const struct apple_epic_service_ops dcp_v27_early_any_service[] = {
+	{ .name = "*", .report = dcp_v27_early_any_report },
+	{},
+};
+
+/* From the DCP's start, once its system endpoint runs. */
+static int dcp_v27_early_services_start(struct apple_dcp *dcp)
+{
+	struct apple_dcp_afkep *ep;
+	unsigned int i, started = 0;
+	char list[64] = "";
+	size_t len = 0;
+	int ret;
+
+	if (!READ_ONCE(v27_early_services) || !dcp_v27_early_selected(dcp))
+		return 0;
+	for (i = 0; i < ARRAY_SIZE(dcp_v27_early_service_eps); i++) {
+		u8 id = dcp_v27_early_service_eps[i];
+
+		if (!apple_rtkit_has_endpoint(dcp->rtk, id) ||
+		    apple_rtkit_endpoint_started(dcp->rtk, id))
+			continue;
+		ep = afk_init(dcp, id, dcp_v27_early_any_service);
+		if (IS_ERR(ep)) {
+			dev_warn(dcp->dev, "V27: service endpoint %#x not set up: %ld\n", id,
+				 PTR_ERR(ep));
+			continue;
+		}
+		/* Routed before the first message can come (dcp_afkep()). */
+		WRITE_ONCE(dcp->v27_early_svc_ep[id - 0x20], ep);
+		ret = afk_start(ep);
+		if (ret) {
+			dev_warn(dcp->dev, "V27: service endpoint %#x not started: %d\n", id, ret);
+			continue;
+		}
+		started++;
+		if (len < sizeof(list) - 1)
+			len += scnprintf(list + len, sizeof(list) - len, " %02x", id);
+	}
+	dev_info(dcp->dev, "V27: %u service endpoints started, as macOS:%s\n", started,
+		 len ? list : " none");
+	return 0;
+}
+
+/* Everything the service endpoints received, consumed: their receive work joined. */
+static void dcp_v27_early_services_flush(struct apple_dcp *dcp)
+{
+	unsigned int i;
+
+	apple_rtkit_flush_rx(dcp->rtk);
+	for (i = 0; i < ARRAY_SIZE(dcp->v27_early_svc_ep); i++) {
+		struct apple_dcp_afkep *ep = READ_ONCE(dcp->v27_early_svc_ep[i]);
+
+		if (ep)
+			flush_workqueue(ep->wq);
+	}
+}
+
+/* The PMP's display request (apple,pmp-report), set or withdrawn and acknowledged. */
+static int dcp_v27_early_disp_request(struct apple_dcp *dcp, bool on)
+{
+	struct device_node *entry;
+	int ret;
+
+	if (!READ_ONCE(v27_early_disp))
+		return 0;
+	entry = of_parse_phandle(dcp->dev->of_node, "apple,pmp-report", 0);
+	if (!entry)
+		return 0;
+	ret = apple_pmp_report_entry_request(entry, on);
+	of_node_put(entry);
+	return ret;
+}
+
 /* Notes a step of the sleep, "name result@ms", and passes its result on. */
 static int dcp_v27_early_step(struct dcp_v27_early *e, const char *what, int ret)
 {
@@ -2395,6 +2495,8 @@ static int dcp_v27_early_stop(struct apple_dcp *dcp, struct dcp_v27_early *e)
 				 10000);
 	if (dcp_v27_early_step(e, "run-off", ret))
 		return ret;
+	/* macOS drops the display request once RUN is off, and polls for its acknowledgment. */
+	dcp_v27_early_step(e, "disp-off", dcp_v27_early_disp_request(dcp, false));
 	dev_info(dcp->dev, "V27 sleep: CPU status %#x at the idle, %#x with RUN off\n", status,
 		readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS));
 	return dcp_v27_early_power_down(dcp, e);
@@ -2417,6 +2519,13 @@ static int dcp_v27_early_restart(struct apple_dcp *dcp, struct dcp_v27_early *e)
 
 	if (e->firmware_lost || e->display_lost)
 		goto lost;
+	/* macOS makes the display request, acknowledged, before RUN goes on. */
+	if (e->stopped) {
+		step = "disp-on";
+		ret = dcp_v27_early_disp_request(dcp, true);
+		if (ret)
+			goto lost;
+	}
 	/* An idled firmware comes back only from a power cycle: the stop's, or one now. */
 	if (e->stopped && !e->powered_off) {
 		step = "power cycle";
@@ -2575,6 +2684,8 @@ static int dcp_v27_early_suspend(struct apple_dcp *dcp)
 		ret = dcp_v27_early_step(e, "endpoints", -EBUSY);
 		goto undo;
 	}
+	/* As macOS drains each service endpoint before the idle: what they got, consumed. */
+	dcp_v27_early_services_flush(dcp);
 	ret = apple_rtkit_idle(dcp->rtk);
 	if (ret) {
 		/* Answer what it still has queued, and ask once more. */
@@ -2634,6 +2745,7 @@ static int dcp_v27_early_resume(struct apple_dcp *dcp)
 #else
 static bool dcp_v27_early_selected(struct apple_dcp *dcp) { return false; }
 static bool dcp_v27_early_held(struct apple_dcp *dcp) { return false; }
+static int dcp_v27_early_services_start(struct apple_dcp *dcp) { return 0; }
 static int dcp_v27_early_suspend(struct apple_dcp *dcp) { return -EOPNOTSUPP; }
 static int dcp_v27_early_resume(struct apple_dcp *dcp) { return 0; }
 #endif
