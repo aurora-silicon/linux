@@ -2177,15 +2177,13 @@ void apple_rtkit_adopt_ep(struct apple_rtkit *rtk, u8 ep)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_adopt_ep);
 
-int apple_rtkit_start_ep(struct apple_rtkit *rtk, u8 endpoint)
+/* The start message alone, for an endpoint the firmware's endpoint map announced. */
+static int apple_rtkit_start_announced_ep(struct apple_rtkit *rtk, u8 endpoint)
 {
 	u64 msg;
 	int ret;
 
 	if (!test_bit(endpoint, rtk->endpoints))
-		return -EINVAL;
-	if (endpoint >= APPLE_RTKIT_APP_ENDPOINT_START &&
-	    !apple_rtkit_is_running(rtk))
 		return -EINVAL;
 
 	msg = FIELD_PREP(APPLE_RTKIT_MGMT_STARTEP_EP, endpoint);
@@ -2200,6 +2198,15 @@ int apple_rtkit_start_ep(struct apple_rtkit *rtk, u8 endpoint)
 	if (!ret)
 		set_bit(endpoint, rtk->started);
 	return ret;
+}
+
+int apple_rtkit_start_ep(struct apple_rtkit *rtk, u8 endpoint)
+{
+	if (endpoint >= APPLE_RTKIT_APP_ENDPOINT_START &&
+	    !apple_rtkit_is_running(rtk))
+		return -EINVAL;
+
+	return apple_rtkit_start_announced_ep(rtk, endpoint);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_start_ep);
 
