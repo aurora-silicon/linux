@@ -4100,6 +4100,30 @@ int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port)
 	return dcp_dptx_connect_attached(dcp, port);
 }
 
+/**
+ * dcp_typec_attach_deferred - start a Type-C attachment, connect from the work
+ * @dcp: a pipeline just routed to a display
+ *
+ * As dcp_dptx_connect_oob() for a Type-C output, but the link is connected
+ * by the Type-C reconnect work for the session started here: the caller
+ * holds the fabric lock, and the connect waits for the firmware's link
+ * configuration. A Thunderbolt DP tunnel's provider waits for the fabric
+ * call too, and could not act on the dock's next request for the tunnel
+ * meanwhile.
+ */
+void dcp_typec_attach_deferred(struct apple_dcp *dcp)
+{
+	/* A display again, as in dcp_dptx_connect_oob(). */
+	WRITE_ONCE(dcp->sleep_v27_torn, false);
+	cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
+	guard(mutex)(&dcp->hpd_mutex);
+	dcp_typec_attach_locked(dcp);
+	scoped_guard(spinlock_irqsave, &dcp->relink_lock)
+		dcp_relink_attach(&dcp->relink, dcp->typec_generation);
+	/* The session started here is the one the work connects. */
+	dcp_queue_typec_reconnect_locked(dcp, 0);
+}
+
 int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);

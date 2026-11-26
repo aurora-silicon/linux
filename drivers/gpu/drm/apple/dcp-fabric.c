@@ -3092,10 +3092,15 @@ static bool dcp_tb_external(void *data)
 
 	/*
 	 * A T8132 dcpext connects from the Type-C reconnect work, as the manual
-	 * T6030 external path does: it has no connector, and the connect waits
-	 * for the firmware, which must not hold the fabric lock.
+	 * T6030 external path does: the connect waits for the firmware's link
+	 * configuration, which must not hold the fabric lock, nor the tunnel's
+	 * provider, which is inside this call until it returns. The dock can
+	 * replace its DP IN request meanwhile (a new cookie): a connect run here
+	 * would see the firmware's Activate refused for the replaced binding,
+	 * and time out waiting for a link that cannot come up. The M4 backend's
+	 * dcpext also has no connector of its own.
 	 */
-	return ctx->best->dcp->external || dcp_is_t8132_ext(ctx->best->dcp);
+	return ctx->best->dcp->external || dcp_t8132_ext_hw(ctx->best->dcp);
 }
 
 static bool dcp_tb_has_connector(void *data)
@@ -3110,6 +3115,16 @@ static void dcp_tb_queue_reconnect(void *data)
 	struct dcp_tb_attach_context *ctx = data;
 	struct apple_dcp *dcp = ctx->best->dcp;
 
+	/*
+	 * A pipeline of the DRM device (a firmware-27 T8132 dcpext) starts the
+	 * attachment as an inline connect would, with its connector; without
+	 * one it connects nothing, as dcp_fabric_run_attach() does.
+	 */
+	if (!dcp->external && !dcp_is_t8132_ext(dcp)) {
+		if (dcp->typec_connector)
+			dcp_typec_attach_deferred(dcp);
+		return;
+	}
 	dcp->typec_reconnect_tries = 0;
 	dcp_queue_typec_reconnect(dcp, 0);
 }
