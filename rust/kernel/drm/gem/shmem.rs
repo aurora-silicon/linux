@@ -245,17 +245,17 @@ impl<T: DriverObject> Object<T> {
     /// [`DriverObject::pages_changed`].
     extern "C" fn pages_changed_callback(
         shmem: *mut bindings::drm_gem_shmem_object,
-        present: bool,
+        resident: usize,
     ) {
         // SAFETY: The C helpers pass a live shmem object of this driver, with its reservation lock
         // held. Every GEM object of the driver is an `Object<T>` (see `create_object_callback()`).
         let obj: &gem::DriverAllocImpl<T> =
             unsafe { IntoGEMObject::from_raw(&raw mut (*shmem).base) };
-        T::pages_changed(obj, present);
+        T::pages_changed(obj, resident);
     }
 
     /// The `pages_changed` callback to install in a new object.
-    const PAGES_CHANGED: Option<unsafe extern "C" fn(*mut bindings::drm_gem_shmem_object, bool)> =
+    const PAGES_CHANGED: Option<unsafe extern "C" fn(*mut bindings::drm_gem_shmem_object, usize)> =
         if T::HAS_PAGES_CHANGED {
             Some(Self::pages_changed_callback)
         } else {
@@ -659,6 +659,25 @@ impl<T: DriverObject> Object<T> {
     pub unsafe fn has_sg_table_locked(&self) -> bool {
         // SAFETY: Reservation ownership serializes the C table pointer.
         !unsafe { (*self.as_raw_shmem()).sgt }.is_null()
+    }
+
+    /// The shmem pages that back the object now, as [`DriverObject::pages_changed`] reports
+    /// them: all of them while its page array exists, otherwise those CPU faults populated in
+    /// revocable mappings.
+    ///
+    /// # Safety
+    ///
+    /// The caller holds the object's DMA reservation lock.
+    pub unsafe fn resident_pages_locked(&self) -> usize {
+        let shmem = self.as_raw_shmem();
+        // SAFETY: Reservation ownership serializes the page array and the CPU page count.
+        unsafe {
+            if (*shmem).pages.is_null() {
+                (*shmem).cpu_pages_count
+            } else {
+                self.size() >> crate::page::PAGE_SHIFT
+            }
+        }
     }
 
     /// Whether backing without a Rust SG lease can be reclaimed or purged.
@@ -1120,7 +1139,6 @@ mod tests {
         io::Io,
         page::PAGE_SIZE, //
     };
-    use core::sync::atomic::AtomicBool;
 
     // The bare minimum needed to create a fake drm driver for kunit
 
@@ -1130,8 +1148,8 @@ mod tests {
     struct KunitFile;
     #[pin_data]
     struct KunitObject {
-        /// Whether `pages_changed` last reported the pages present.
-        present: AtomicBool,
+        /// The resident pages `pages_changed` last reported.
+        resident: AtomicUsize,
         /// How often `pages_changed` was called.
         changes: AtomicUsize,
     }
@@ -1169,13 +1187,13 @@ mod tests {
             _args: Self::Args,
         ) -> impl PinInit<Self, Error> {
             try_pin_init!(KunitObject {
-                present: AtomicBool::new(false),
+                resident: AtomicUsize::new(0),
                 changes: AtomicUsize::new(0),
             })
         }
 
-        fn pages_changed(obj: &Object<KunitObject>, present: bool) {
-            obj.present.store(present, Ordering::Release);
+        fn pages_changed(obj: &Object<KunitObject>, resident: usize) {
+            obj.resident.store(resident, Ordering::Release);
             obj.changes.fetch_add(1, Ordering::AcqRel);
         }
     }
@@ -1273,25 +1291,34 @@ mod tests {
 
     #[test]
     fn pages_changed_spans_every_holder() -> Result {
+        const PAGES: usize = 4;
         let (dev, drm) = create_drm_dev()?;
-        let obj = Object::<KunitObject>::new(&drm, PAGE_SIZE, ObjectConfig::default(), ())?;
-        assert!(!obj.present.load(Ordering::Acquire));
+        let obj = Object::<KunitObject>::new(&drm, PAGES * PAGE_SIZE, ObjectConfig::default(), ())?;
+        let resident = |obj: &Object<KunitObject>| {
+            let _guard = DmaResvGuard::new(obj);
+            // SAFETY: The reservation is held.
+            let now = unsafe { obj.resident_pages_locked() };
+            // The callback reported what the object now has.
+            assert_eq!(obj.resident.load(Ordering::Acquire), now);
+            now
+        };
+        assert_eq!(resident(&obj), 0);
         let vmap = obj.vmap::<4>()?;
-        assert!(obj.present.load(Ordering::Acquire));
+        assert_eq!(resident(&obj), PAGES);
         let table = obj.sg_table(dev.as_ref().as_ref())?.into_lease();
         drop(vmap);
         // The device SG table still holds the pages.
-        assert!(obj.present.load(Ordering::Acquire));
+        assert_eq!(resident(&obj), PAGES);
         drop(table);
         {
             let _guard = DmaResvGuard::new(&obj);
             // SAFETY: Reservation held; no device mappings or SG leases exist in this test.
             unsafe { obj.release_idle_pages_locked()? };
         }
-        assert!(!obj.present.load(Ordering::Acquire));
+        assert_eq!(resident(&obj), 0);
         assert_eq!(obj.changes.load(Ordering::Acquire), 2);
         drop(obj.vmap::<4>()?);
-        assert!(!obj.present.load(Ordering::Acquire));
+        assert_eq!(resident(&obj), 0);
         assert_eq!(obj.changes.load(Ordering::Acquire), 4);
         Ok(())
     }

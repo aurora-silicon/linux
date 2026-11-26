@@ -463,15 +463,16 @@ impl Vm {
         // this reservation; linked aliases retain their borrowed BO and GEM.
         let _ = unsafe { inner.for_each_private_bo(|_, bo| {
             let object = bo.obj();
-            // Count retained backing on idle VMs, and purgeable contents even if idle
-            // reclaim already released the table. Never wait on the BO mutex under resv.
+            // Count retained backing on idle VMs, including pages that CPU faults populated
+            // after idle reclaim released the table, and purgeable contents even if it did.
+            // Never wait on the BO mutex under resv.
             let Some(segments) = bo.data().segments.try_lock() else { return Ok(true); };
             let advised = object.madv_locked() > 0;
+            let resident = object.resident_pages_locked();
             let releasable = if segments.is_some() {
                 object.sole_sg_lease_releasable_locked()
             } else {
-                (advised || object.has_sg_table_locked())
-                    && object.unleased_pages_releasable_locked()
+                (advised || resident != 0) && object.unleased_pages_releasable_locked()
             };
             let counted = if advised {
                 !kept
@@ -479,7 +480,11 @@ impl Vm {
                 idle && object.keep_resident() == kept
             };
             if object.idle_reclaim_candidate() && counted && releasable {
-                pages = pages.saturating_add(object.size() / kernel::page::PAGE_SIZE);
+                pages = pages.saturating_add(if advised {
+                    object.size() / kernel::page::PAGE_SIZE
+                } else {
+                    resident
+                });
             }
             Ok(true)
         }) };
@@ -621,8 +626,10 @@ impl Vm {
                         object.sole_sg_lease_releasable_locked()
                     } else {
                         // A competing lease may have made the previous release fail after we
-                        // dropped our segments. Retry that table, but do not count empty backing.
-                        object.has_sg_table_locked() && object.unleased_pages_releasable_locked()
+                        // dropped our segments: retry that table. Or CPU faults populated pages
+                        // after an earlier release: revoke them. Do not count empty backing.
+                        object.resident_pages_locked() != 0
+                            && object.unleased_pages_releasable_locked()
                     };
                     if !releasable { return Ok(true); }
                 }
@@ -647,8 +654,9 @@ impl Vm {
                 // Every private GPUVA alias was removed from the device page
                 // tables above. Kernel mappings and other SG owners are excluded;
                 // the C/Rust backing helper rechecks exclusion before release.
+                let resident = object.resident_pages_locked();
                 if object.release_idle_pages_locked().is_ok() {
-                    unpinned = unpinned.saturating_add(object.size() / kernel::page::PAGE_SIZE);
+                    unpinned = unpinned.saturating_add(resident);
                 }
                 Ok(unpinned < target)
             }) };

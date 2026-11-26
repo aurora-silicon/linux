@@ -252,6 +252,15 @@ void drm_gem_shmem_free(struct drm_gem_shmem_object *shmem)
 }
 EXPORT_SYMBOL_GPL(drm_gem_shmem_free);
 
+/* Reports the pages that back the object now (see &drm_gem_shmem_object.pages_changed). */
+static void drm_gem_shmem_pages_changed(struct drm_gem_shmem_object *shmem)
+{
+	if (shmem->pages_changed)
+		shmem->pages_changed(shmem, shmem->pages ?
+				     shmem->base.size >> PAGE_SHIFT :
+				     shmem->cpu_pages_count);
+}
+
 static int drm_gem_shmem_get_pages_locked(struct drm_gem_shmem_object *shmem)
 {
 	struct drm_gem_object *obj = &shmem->base;
@@ -283,8 +292,7 @@ static int drm_gem_shmem_get_pages_locked(struct drm_gem_shmem_object *shmem)
 
 	refcount_set(&shmem->pages_use_count, 1);
 
-	if (shmem->pages_changed)
-		shmem->pages_changed(shmem, true);
+	drm_gem_shmem_pages_changed(shmem);
 
 	return 0;
 }
@@ -314,8 +322,7 @@ void drm_gem_shmem_put_pages_locked(struct drm_gem_shmem_object *shmem)
 		shmem->pages_mark_accessed_on_put = false;
 		shmem->pages_mark_dirty_on_put = false;
 
-		if (shmem->pages_changed)
-			shmem->pages_changed(shmem, false);
+		drm_gem_shmem_pages_changed(shmem);
 	}
 }
 EXPORT_SYMBOL_GPL(drm_gem_shmem_put_pages_locked);
@@ -591,6 +598,7 @@ static struct page *drm_gem_shmem_cpu_page_locked(struct drm_gem_shmem_object *s
 		return page;
 	shmem->cpu_pages[index] = page;
 	shmem->cpu_pages_count++;
+	drm_gem_shmem_pages_changed(shmem);
 	return page;
 }
 
@@ -628,6 +636,7 @@ static void drm_gem_shmem_put_cpu_pages_locked(struct drm_gem_shmem_object *shme
 	}
 	kvfree(shmem->cpu_pages);
 	shmem->cpu_pages = NULL;
+	drm_gem_shmem_pages_changed(shmem);
 }
 
 static struct page *drm_gem_shmem_present_page(struct drm_gem_shmem_object *shmem,

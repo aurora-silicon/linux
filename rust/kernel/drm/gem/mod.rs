@@ -119,12 +119,14 @@ pub trait DriverObject: Sync + Send + Sized + 'static {
         unimplemented!()
     }
 
-    /// The shmem backing pages of an object were populated (`present`) or released.
+    /// The number of shmem pages that back an object changed to `resident`.
     ///
-    /// Called with the object's reservation lock held, for the first holder of the pages and
-    /// after the last one: a CPU mapping (other than a revocable one), a pin (a dma-buf
-    /// attachment), a kernel vmap or the device SG table. It must not take that lock.
-    fn pages_changed(_obj: &DriverAllocImpl<Self>, _present: bool) {
+    /// All of the object's pages are resident from the first holder of its page array to the
+    /// last one: a CPU mapping (other than a revocable one), a pin (a dma-buf attachment), a
+    /// kernel vmap or the device SG table. Without the array, the pages that CPU faults populated
+    /// in revocable mappings are, until the mappings are revoked or closed. Called with the
+    /// object's reservation lock held; it must not take that lock.
+    fn pages_changed(_obj: &DriverAllocImpl<Self>, _resident: usize) {
         build_error!(crate::error::VTABLE_DEFAULT_ERROR)
     }
 
