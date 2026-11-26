@@ -1228,6 +1228,18 @@ crashed:
 	}
 }
 
+/*
+ * DIAGNOSTIC (T6030 sleep bring-up), boot parameters for the J516S PMP's RTKit only. macOS 27.2
+ * starts the PMP's debug endpoint with kdebug's START and answers its GET_BUFFER with both
+ * buffers (what apple,sync-syslog-ack does here), and never answers its ioreport 0xc.
+ */
+static bool diag_t6030_pmp_kdebug;
+module_param(diag_t6030_pmp_kdebug, bool, 0444);
+MODULE_PARM_DESC(diag_t6030_pmp_kdebug, "DIAGNOSTIC: T6030 PMP: sync-syslog-ack's behaviour, kdebug on endpoint 3 included, as macOS");
+static bool diag_t6030_pmp_ioreport_quiet;
+module_param(diag_t6030_pmp_ioreport_quiet, bool, 0444);
+MODULE_PARM_DESC(diag_t6030_pmp_ioreport_quiet, "DIAGNOSTIC: T6030 PMP: leave ioreport 0xc unanswered, as macOS");
+
 static void apple_rtkit_ioreport_rx(struct apple_rtkit *rtk, u64 msg)
 {
 	u8 type = FIELD_GET(APPLE_RTKIT_SYSLOG_TYPE, msg);
@@ -1237,8 +1249,12 @@ static void apple_rtkit_ioreport_rx(struct apple_rtkit *rtk, u64 msg)
 		apple_rtkit_common_rx_get_buffer(rtk, &rtk->ioreport_buffer,
 						 APPLE_RTKIT_EP_IOREPORT, msg);
 		break;
-	case APPLE_RTKIT_IOREPORT_UNKNOWN1:
 	case APPLE_RTKIT_IOREPORT_UNKNOWN2:
+		/* macOS 27.2 leaves the J516S PMP's 0xc unanswered (diag_t6030_pmp_ioreport_quiet). */
+		if (rtk->ioreport_c_quiet)
+			break;
+		fallthrough;
+	case APPLE_RTKIT_IOREPORT_UNKNOWN1:
 		apple_rtkit_send_message(rtk, APPLE_RTKIT_EP_IOREPORT, msg,
 					 NULL, false);
 		break;
@@ -2410,7 +2426,11 @@ static struct apple_rtkit *__apple_rtkit_init(struct device *dev, void *cookie,
 	rtk->ops = ops;
 	rtk->handshake_timeout_ms = APPLE_RTKIT_HANDSHAKE_TIMEOUT_MS;
 	rtk->sync_syslog_ack =
-		of_property_read_bool(dev->of_node, "apple,sync-syslog-ack");
+		of_property_read_bool(dev->of_node, "apple,sync-syslog-ack") ||
+		(diag_t6030_pmp_kdebug &&
+		 of_device_is_compatible(dev->of_node, "apple,t6030-pmp-v2"));
+	rtk->ioreport_c_quiet = diag_t6030_pmp_ioreport_quiet &&
+		of_device_is_compatible(dev->of_node, "apple,t6030-pmp-v2");
 	/*
 	 * As macOS does; a driver whose firmware shouldn't get them turns it off. T8142 too:
 	 * its MTP left a counter unechoed after the first sleep's resume, then took no AP

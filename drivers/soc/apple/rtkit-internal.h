@@ -69,6 +69,8 @@ struct apple_rtkit {
 	 * hand out kdebug buffers, and poll the mailbox while waiting.
 	 */
 	bool sync_syslog_ack;
+	/* DIAGNOSTIC: leave ioreport 0xc unanswered (T6030 PMP, as macOS) */
+	bool ioreport_c_quiet;
 	/* Echo each OSLOG channel-0 counter, as macOS does. */
 	bool oslog_echo;
 	/* A counter queued for the receive work and not yet echoed. */
