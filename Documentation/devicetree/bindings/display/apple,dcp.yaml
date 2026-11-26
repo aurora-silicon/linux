@@ -190,6 +190,8 @@ properties:
       PMGR bandwidth scratch resource, display index and offset. On the T8132
       external DCPs it is the pipe's 8-byte realtime bandwidth request slot,
       which lies inside the display register window the index names (disp-4).
+      For the extended firmware-27 bandwidth reply, the slot is also
+      described by its offset from the named firmware display window.
 
   apple,bw-doorbell:
     $ref: /schemas/types.yaml#/definitions/phandle-array
