@@ -119,6 +119,43 @@ const struct ave_variant ave_t8112 = {
 };
 
 /*
+ * The M1 (T8103) with the macOS 27.2 stub, as on the MacBook Air (J313): the
+ * bootloader preloads TEXT 0x114000 and DATA 0x128000 and, as it does for the
+ * M1 Pro's and M2's 6070 builds, fills the 64-bit cell at TEXT 0x423c with
+ * the firmware's alias of DATA (the low 32 bits are DATA's DART address); the
+ * cell is zero in the image, and with it zeroed the TEXT CRC is b6616340. It
+ * is the M1 encoder's build of the firmware the M2 and M3 run on 27.2
+ * (9013.55.1), and it starts the way theirs do:
+ * the boot configuration handshake as device 7 with handshake type 7, the
+ * 26B123 command layout, codec clocks ungated by clearing the mailbox idle
+ * word, the bootloader's code base (marked valid) left as it is, and DATA
+ * restored from the boot snapshot before every start. The coprocessor and
+ * mailbox registers are the M2's. As on every M1-family encoder, the DART
+ * window starts at address 0: TEXT is at 0 and DATA follows it. The code base
+ * the loader sets is TEXT's physical address, its ADT remap address, with
+ * VALID and two more bits of its own. Unlike the M2's, its timebase
+ * frequency register counts in MHz, as the M1 Pro's does.
+ */
+const struct ave_variant ave_t8103 = {
+	.regs = &ave_coproc_6070,
+	.fw_text_size = 0x114000,
+	.fw_data_size = 0x128000,
+	.boot_device_id = 7,
+	.boot_arg_value = AVE_COPROC_BOOT_ARG_VALUE,
+	.timebase_multiplier = 1000000,
+	.vcbar_mask = GENMASK_ULL(41, 11),
+	.vcbar_flags = AVE_COPROC_VCBAR_VALID | AVE_COPROC_VCBAR_M1_LOADER,
+	.vcbar_text_phys = true,
+	.device_type = 7,
+	.lfs_ref_scale = 2,
+	.text_crc = AVE_FW_TEXT_CRC_T8103_26B123,
+	.text_link_cell = 0x423c,
+	.mbox_idle = 0x38,
+	.restore_data_first = true,
+	.boot_qualified = true,
+};
+
+/*
  * The M4 Pro (T6040 in the ADT, apple,t6041 in the DT) starts its encoder
  * like the A18 Pro: same coprocessor registers and boot sequence, its own
  * device ID and type. The M4 Max (J575c) runs its first encoder, ADT ave0
@@ -737,6 +774,7 @@ static const struct of_device_id ave_of_match[] = {
 	{ .compatible = "apple,t6032-ave", .data = &ave_m3 },
 	{ .compatible = "apple,t6041-ave", .data = &ave_t6041 },
 	{ .compatible = "apple,t6050-ave", .data = &ave_t6050 },
+	{ .compatible = "apple,t8103-ave", .data = &ave_t8103 },
 	{ .compatible = "apple,t8112-ave", .data = &ave_t8112 },
 	{ .compatible = "apple,t8122-ave", .data = &ave_t8122 },
 	{ .compatible = "apple,t8132-ave", .data = &ave_t8132 },

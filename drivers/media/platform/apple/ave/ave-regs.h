@@ -25,6 +25,11 @@
 /* Coprocessor window */
 #define AVE_COPROC_VCBAR		0x50000
 #define AVE_COPROC_VCBAR_VALID		BIT(0)
+/*
+ * Bits the M1's 27.2 loader sets in the code base next to VALID. The driver
+ * never writes the register; it only checks that the value is still there.
+ */
+#define AVE_COPROC_VCBAR_M1_LOADER	(BIT_ULL(56) | BIT_ULL(49))
 #define AVE_COPROC_TIMEBASE_FREQ	0x360020
 #define AVE_COPROC_TIMEBASE		0x378000
 #define AVE_COPROC_CTRL			0x600044

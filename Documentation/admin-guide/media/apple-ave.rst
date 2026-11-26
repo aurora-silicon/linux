@@ -67,6 +67,16 @@ those nodes. A probe with a valid handoff reports the verified CRCs without
 starting the coprocessor. An unknown layout refuses stream start before
 allocating session buffers or acquiring runtime power.
 
+T8103 (M1) with the macOS 27.2 firmware (TEXT 0x114000, DATA 0x128000)
+encodes H.264 and HEVC. The bootloader fills the 64-bit cell at TEXT 0x423c
+with the firmware's alias of DATA, as it does for the 6070 builds; with the cell
+zeroed the TEXT CRC is ``b6616340``. The firmware boots on the
+boot configuration handshake as device 7 with handshake type 7 and speaks the
+26B123 command layout; the coprocessor registers and their start are the
+T8112 ones. TEXT starts the encoder's DART window at address 0, as on every
+M1-family encoder. The encoder and both of its DARTs are enabled in the T8103
+device tree; without the firmware handoff the driver declines to bind.
+
 T8122 (M3) with the macOS 27.2 firmware (TEXT 0x134000, DATA 0x128000, TEXT
 CRC ``918d70d3``) encodes H.264 and HEVC: the firmware boots on the boot
 configuration handshake as device 17 with handshake type 17 and speaks the

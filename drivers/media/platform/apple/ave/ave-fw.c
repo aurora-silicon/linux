@@ -45,6 +45,7 @@ static const u32 ave_known_text_crc[] = {
 	AVE_FW_TEXT_CRC_T8142_26A428, /* encoder firmware 9013.45.1, macOS 27.0 26A428 / T8142 */
 	AVE_FW_TEXT_CRC_T8122_26B123, /* encoder firmware macOS 27.2 26B123 / T8122 */
 	AVE_FW_TEXT_CRC_T8112_26B123, /* encoder firmware macOS 27.2 26B123 / T8112 */
+	AVE_FW_TEXT_CRC_T8103_26B123, /* encoder firmware 9013.55.1, macOS 27.2 / T8103 */
 	AVE_FW_TEXT_CRC_T8132_26B123, /* encoder firmware macOS 27.2 26B123 / T8132 */
 	AVE_FW_TEXT_CRC_T8142_26B123, /* encoder firmware 9013.55.1, macOS 27.2 26B123 / T8142 */
 	0x460c7a7c, /* encoder firmware 6070.11.1 / T6000 */
@@ -538,10 +539,17 @@ u64 ave_fw_vcbar(const struct ave_variant *variant, u64 text_iova)
 	return (text_iova & variant->vcbar_mask) | variant->vcbar_flags;
 }
 
+/* The code base the loader left: TEXT's DART or, on the M1, physical address. */
+static u64 ave_fw_code_base(struct ave_dev *ave)
+{
+	return ave_fw_vcbar(ave->variant, ave->variant->vcbar_text_phys ?
+						  ave->text.phys : ave->text.iova);
+}
+
 static bool ave_fw_idle(struct ave_dev *ave)
 {
 	if (readq(ave->coproc + ave->variant->regs->vcbar) !=
-	    ave_fw_vcbar(ave->variant, ave->text.iova))
+	    ave_fw_code_base(ave))
 		return false;
 	if (readl(ave->coproc + ave->variant->regs->ctrl) ||
 	    readl(ave->mbox + AVE_MBOX_STATUS))
@@ -585,7 +593,7 @@ static int ave_fw_prepare_restart(struct ave_dev *ave)
 		return 0;
 	}
 	if (readq(ave->coproc + ave->variant->regs->vcbar) !=
-	    ave_fw_vcbar(ave->variant, ave->text.iova)) {
+	    ave_fw_code_base(ave)) {
 		dev_err(ave->dev,
 			"coprocessor lost its code base (vcbar %#llx)\n",
 			readq(ave->coproc + ave->variant->regs->vcbar));
