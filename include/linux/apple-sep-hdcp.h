@@ -24,6 +24,8 @@
 #ifndef _LINUX_APPLE_SEP_HDCP_H
 #define _LINUX_APPLE_SEP_HDCP_H
 
+#include <linux/errno.h>
+#include <linux/kconfig.h>
 #include <linux/types.h>
 
 #define APPLE_SEP_HDCP_RTX_LEN		8
@@ -51,6 +53,8 @@ struct apple_sep_hdcp_stored_km {
 	u8 ekh_km[APPLE_SEP_HDCP_EKH_KM_LEN];
 	u8 m[APPLE_SEP_HDCP_M_LEN];
 };
+
+#if IS_ENABLED(CONFIG_APPLE_SEP_HDCP_INTERFACE)
 
 /* Session start: the SEP draws r_tx for AKE_Init. */
 int apple_sep_hdcp_open(u32 channel, u8 rtx[APPLE_SEP_HDCP_RTX_LEN]);
@@ -119,5 +123,45 @@ void apple_sep_hdcp_close(u32 channel);
 
 /* True when a SEP driver with the HDCP service is bound. */
 bool apple_sep_hdcp_available(void);
+
+#else /* !CONFIG_APPLE_SEP_HDCP_INTERFACE */
+
+static inline int apple_sep_hdcp_open(u32 channel, u8 rtx[APPLE_SEP_HDCP_RTX_LEN])
+{ return -ENODEV; }
+static inline int apple_sep_hdcp_ake_cert(u32 channel,
+	const u8 cert[APPLE_SEP_HDCP_CERT_LEN], const u8 rrx[APPLE_SEP_HDCP_RRX_LEN],
+	bool *stored, struct apple_sep_hdcp_stored_km *km,
+	u8 ekpub_km[APPLE_SEP_HDCP_EKPUB_KM_LEN])
+{ return -ENODEV; }
+static inline int apple_sep_hdcp_ake_h_prime(u32 channel,
+	const u8 rxcaps[APPLE_SEP_HDCP_CAPS_LEN], const u8 txcaps[APPLE_SEP_HDCP_CAPS_LEN],
+	const u8 h_prime[APPLE_SEP_HDCP_H_PRIME_LEN])
+{ return -ENODEV; }
+static inline int apple_sep_hdcp_ake_pairing(u32 channel,
+	const u8 ekh_km[APPLE_SEP_HDCP_EKH_KM_LEN])
+{ return -ENODEV; }
+static inline int apple_sep_hdcp_lc_init(u32 channel, u8 rn[APPLE_SEP_HDCP_RN_LEN])
+{ return -ENODEV; }
+static inline int apple_sep_hdcp_lc_l_prime(u32 channel,
+	const u8 l_prime[APPLE_SEP_HDCP_L_PRIME_LEN])
+{ return -ENODEV; }
+static inline int apple_sep_hdcp_ske(u32 channel, u8 edkey_ks[APPLE_SEP_HDCP_EDKEY_KS_LEN],
+	u8 riv[APPLE_SEP_HDCP_RIV_LEN])
+{ return -ENODEV; }
+static inline int apple_sep_hdcp_repeater_list(u32 channel, const u8 *ids,
+	unsigned int count, const u8 rxinfo[APPLE_SEP_HDCP_RXINFO_LEN],
+	const u8 seq_num_v[APPLE_SEP_HDCP_SEQ_NUM_LEN],
+	const u8 v_prime[APPLE_SEP_HDCP_V_PRIME_LEN], u8 v[APPLE_SEP_HDCP_V_LEN])
+{ return -ENODEV; }
+static inline int apple_sep_hdcp_repeater_stream(u32 channel, u8 stream_id, u8 type,
+	const u8 seq_num_m[APPLE_SEP_HDCP_SEQ_NUM_LEN],
+	const u8 m_prime[APPLE_SEP_HDCP_M_PRIME_LEN])
+{ return -ENODEV; }
+static inline int apple_sep_hdcp_finish(u32 channel) { return -ENODEV; }
+static inline int apple_sep_hdcp_set_encryption(u32 channel, bool on) { return -ENODEV; }
+static inline void apple_sep_hdcp_close(u32 channel) { }
+static inline bool apple_sep_hdcp_available(void) { return false; }
+
+#endif /* CONFIG_APPLE_SEP_HDCP_INTERFACE */
 
 #endif /* _LINUX_APPLE_SEP_HDCP_H */
