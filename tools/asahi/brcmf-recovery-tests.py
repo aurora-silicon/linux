@@ -91,16 +91,16 @@ static void brcmf_bus_change_state(struct brcmf_bus *b, enum brcmf_bus_state s)
 { b->state = s; if (s == BRCMF_BUS_DOWN) state_downs++; }
 
 /* msgbuf side */
-struct brcmf_msgbuf { u32 ctl_stalls; bool ctl_completed; void *rx_pktids; u32 ioctl_resp_pktid,
- ioctl_resp_ret_len; int ioctl_resp_status; struct brcmf_pub *drvr; };
+struct brcmf_msgbuf { u32 ctl_stalls; bool ctl_completed; void *rx_pktids; struct sk_buff *ioctl_resp;
+ u32 ioctl_resp_ret_len; int ioctl_resp_status; struct brcmf_pub *drvr; };
 static int tx_error, reply;
 static u32 stall_calls, last_stalls;
 static void brcmf_bus_ctl_stall(struct brcmf_bus *b, u32 stalls) { (void)b; stall_calls++; last_stalls = stalls; }
-static int brcmf_msgbuf_tx_ioctl(struct brcmf_pub *d, int i, uint c, void *b, uint l)
-{ (void)d; (void)i; (void)c; (void)b; (void)l; return tx_error; }
-static int brcmf_msgbuf_ioctl_resp_wait(struct brcmf_msgbuf *m) { (void)m; return reply; }
 static struct sk_buff skb;
-static struct sk_buff *brcmf_msgbuf_get_pktid(void *d, void *p, u32 n) { (void)d; (void)p; (void)n; return &skb; }
+/* A request that is sent is answered with skb, as the completion hands it over. */
+static int brcmf_msgbuf_tx_ioctl(struct brcmf_pub *d, int i, uint c, void *b, uint l)
+{ (void)i; (void)c; (void)b; (void)l; if (!tx_error && reply) ((struct brcmf_msgbuf *)d->proto->pd)->ioctl_resp = &skb; return tx_error; }
+static int brcmf_msgbuf_ioctl_resp_wait(struct brcmf_msgbuf *m) { (void)m; return reply; }
 static void brcmu_pkt_buf_free_skb(struct sk_buff *s) { (void)s; }
 '''
 
