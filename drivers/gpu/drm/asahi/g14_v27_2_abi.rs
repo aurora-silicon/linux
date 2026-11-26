@@ -146,6 +146,25 @@ pub(crate) const fn new_round(previous: Option<u64>, generation: u64) -> bool {
     }
 }
 
+/// Packets with stopped work one boot may keep (`Runtime::keep`). A kept packet pins its VM,
+/// and with it one user UAT context, and a render one also pins its scene. The limit is half
+/// the user contexts, so innocent clients keep the rest.
+pub(crate) const QUARANTINE_LIMIT: usize = 31;
+
+/// Whether one more packet with stopped work fits next to the `kept` ones. When it does not,
+/// the caller fails all work, and everything published stays owned.
+pub(crate) const fn quarantine_fits(kept: usize) -> bool {
+    kept < QUARANTINE_LIMIT
+}
+
+/// Whether a packet's VM job guard may be released, so its mappings may change. That needs
+/// none of its commands in a queue (`live`) and no stopped command of it kept (`kept`). The
+/// firmware may still reach a stopped command's memory, so a kept packet stays owned for the
+/// rest of the boot, whoever asks: retirement, `withdraw` or `fail_all`.
+pub(crate) const fn guard_releasable(live: bool, kept: bool) -> bool {
+    !live && !kept
+}
+
 /// Event ring record kinds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum EventKind {
@@ -470,6 +489,28 @@ mod tests {
         assert!(new_round(Some(1), 2));
         assert!(!new_round(Some(2), 2));
         assert!(new_round(Some(u64::MAX), 0));
+    }
+
+    #[test]
+    fn a_withdrawn_stopped_packet_keeps_its_guard() {
+        // The scheduler withdraws a packet whose stopped command left the queue: it is no
+        // longer live, but it is kept, so its guard stays.
+        assert!(!guard_releasable(false, true));
+        // Still in a queue, kept or not.
+        assert!(!guard_releasable(true, false));
+        assert!(!guard_releasable(true, true));
+        // Retired innocent work.
+        assert!(guard_releasable(false, false));
+    }
+
+    #[test]
+    fn kept_packets_are_bounded_per_boot() {
+        assert!(quarantine_fits(0));
+        assert!(quarantine_fits(QUARANTINE_LIMIT - 1));
+        assert!(!quarantine_fits(QUARANTINE_LIMIT));
+        assert!(!quarantine_fits(usize::MAX));
+        // Innocent clients keep at least half of the 63 user UAT contexts.
+        assert!(2 * QUARANTINE_LIMIT <= 63);
     }
 
     #[test]

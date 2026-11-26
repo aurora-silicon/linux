@@ -533,13 +533,6 @@ fn latch_guilty(packet: &Packet, error: Error) {
     }
 }
 
-/// Keeps a command the firmware stopped, and everything it owns (packet and VM job guard, VM
-/// binding, scene), for the rest of the boot: see `Runtime::fail_doomed`. Bounded by the
-/// recovery-storm window; the same as `stop` does for everything at shutdown.
-fn quarantine<T>(flight: T) {
-    core::mem::forget(flight);
-}
-
 struct Inflight {
     packet: Arc<Packet>,
     last: bool,
@@ -564,6 +557,14 @@ struct RenderFlight {
     targets: [u32; 2],
     started: Instant<Monotonic>,
     doomed: Option<Error>,
+}
+
+/// A command the firmware stopped, kept with everything it owns (VM binding, scene) after it
+/// left its queue: see `Runtime::fail_doomed` and `Runtime::keep`. Held, never read.
+#[allow(dead_code)]
+enum Kept {
+    Compute(Inflight),
+    Render(RenderFlight),
 }
 
 struct State {
@@ -606,6 +607,12 @@ struct State {
     /// Recovery-storm window (`recovery_logic::admit`): its start and the recoveries in it.
     recovery_window: u64,
     recovery_count: u32,
+    /// Packets with a command the firmware stopped (`blame`), with their VM job guard, kept
+    /// for the rest of the boot: the firmware may still reach that memory. Allocated with
+    /// `g14_v27_2_abi::QUARANTINE_LIMIT` places at start, so keeping one never allocates.
+    kept: KVec<Arc<Packet>>,
+    /// The stopped commands of those packets, once they left their queue.
+    kept_flights: KVec<Kept>,
     /// Set when a sleep/wake failure may have left the GPU domain unpowered or stopped so
     /// teardown skips live-hardware MMIO and RTKit operations.
     hardware_unreachable: bool,
@@ -622,7 +629,9 @@ impl State {
         {
             last.publication_error = Some(err);
         } else {
-            packet.release_guard();
+            if g14_v27_2_abi::guard_releasable(false, self.kept(packet)) {
+                packet.release_guard();
+            }
             packet.finish(Err(err));
         }
     }
@@ -631,9 +640,20 @@ impl State {
         !self.inflight.is_empty() || self.rendering.is_some()
     }
 
-    fn owns(&self, packet: &Arc<Packet>) -> bool {
+    /// Whether a queue holds any of the packet's commands.
+    fn live(&self, packet: &Arc<Packet>) -> bool {
         self.inflight.iter().any(|flight| Arc::ptr_eq(&flight.packet, packet))
             || self.rendering.as_ref().is_some_and(|flight| Arc::ptr_eq(&flight.packet, packet))
+    }
+
+    /// Whether a recovery stopped a command of the packet: it stays owned for the boot.
+    fn kept(&self, packet: &Arc<Packet>) -> bool {
+        self.kept.iter().any(|kept| Arc::ptr_eq(kept, packet))
+    }
+
+    /// Whether the runtime owns the packet's VM job guard (`g14_v27_2_abi::guard_releasable`).
+    fn owns(&self, packet: &Arc<Packet>) -> bool {
+        !g14_v27_2_abi::guard_releasable(self.live(packet), self.kept(packet))
     }
 
     fn pending(&self, packet: &Arc<Packet>) -> bool {
@@ -1029,7 +1049,7 @@ impl Runtime {
             }
             if let Some(err) = flight.doomed {
                 self.fail_doomed(state, &flight.packet, err);
-                quarantine(flight);
+                self.keep(state, Kept::Render(flight));
             } else if flight.last {
                 flight.packet.retired();
             } else if !state.pending(&flight.packet) {
@@ -1058,11 +1078,12 @@ impl Runtime {
     /// A stopped command left its queue without a completion stamp: that proves queue progress,
     /// not that the GPU no longer reaches its memory (the G16 rule, `Retirement::Aborted`). So
     /// its VM job guard is not released: the error completion quarantines it (no mapping
-    /// changes), and the caller keeps the flight that owns the packet, its VM binding and
-    /// scene for the rest of the boot (`quarantine`). Pool slots are reused only after the
-    /// firmware unregisters them (`free_slots`).
+    /// changes), the packet stays in `State::kept` (`blame`), and the caller keeps the flight
+    /// with its VM binding and scene (`keep`), all for the rest of the boot. Pool slots follow
+    /// the normal rule: reused only after the firmware unregisters them (`free_slots`), and
+    /// then in the slot's other buffer, so the stopped command stays intact.
     fn fail_doomed(&self, state: &mut State, packet: &Arc<Packet>, err: Error) {
-        if state.owns(packet) { return; }
+        if state.live(packet) { return; }
         if let Some(i) = state.pending.iter().position(|(p, _)| Arc::ptr_eq(p, packet)) {
             let _ = state.pending.remove(i);
         }
@@ -1071,12 +1092,38 @@ impl Runtime {
         packet.finish(Err(err));
     }
 
+    /// Keeps a stopped command that left its queue, with its VM binding and scene, for the rest
+    /// of the boot. Its packet is already in `State::kept`, so ownership does not depend on
+    /// this allocation; if it fails, the flight is leaked instead, which keeps it as well.
+    fn keep(&self, state: &mut State, flight: Kept) {
+        if let Err(err) = state.kept_flights.push(flight, GFP_KERNEL) {
+            dev_warn!(self.dev, "GPU: no memory to track a stopped command ({:?}); leaking it\n", err);
+        }
+    }
+
+    /// Adds the packet of stopped work to `State::kept` before anything is marked, so it stays
+    /// owned from here on. Err(EIO) once `g14_v27_2_abi::QUARANTINE_LIMIT` packets are kept:
+    /// the caller then fails all work, and published work stays owned.
+    fn reserve_kept(&self, state: &mut State, packet: &Arc<Packet>) -> Result {
+        if state.kept(packet) { return Ok(()); }
+        if !g14_v27_2_abi::quarantine_fits(state.kept.len()) {
+            dev_err!(self.dev, "GPU: {} clients' stopped work kept this boot; not recovering more\n",
+                     state.kept.len());
+            return Err(EIO);
+        }
+        // Within the capacity allocated at start: never allocates.
+        state.kept.push_within_capacity(packet.clone()).map_err(|_| EIO)
+    }
+
     /// Marks the work the firmware's snapshot named (`g14_v27_2_abi::Attribution`): the
     /// published render pair, or the compute command with that completion stamp and the rest of
     /// its packet. Err(EIO) if that work is no longer tracked: the caller then fails all work.
     fn blame(&self, state: &mut State, error: Error, slot: i32, work: Stopped) -> Result {
         match work {
             Stopped::Render => {
+                let Some(packet) = state.rendering.as_ref().map(|f| f.packet.clone())
+                    else { return Err(EIO); };
+                self.reserve_kept(state, &packet)?;
                 let Some(flight) = state.rendering.as_mut() else { return Err(EIO); };
                 flight.doomed = Some(error);
                 latch_guilty(&flight.packet, error);
@@ -1087,6 +1134,7 @@ impl Runtime {
             Stopped::Compute(stamp) => {
                 let Some(packet) = state.inflight.iter().find(|f| f.stamp.raw() == stamp)
                     .map(|f| f.packet.clone()) else { return Err(EIO); };
+                self.reserve_kept(state, &packet)?;
                 let owned = |f: &&mut Inflight| Arc::ptr_eq(&f.packet, &packet);
                 for flight in state.inflight.iter_mut().filter(owned) {
                     flight.doomed.get_or_insert(error);
@@ -1385,7 +1433,7 @@ impl Runtime {
                     self.retire_slot(state, done.slot);
                     if let Some(err) = done.doomed {
                         self.fail_doomed(state, &done.packet, err);
-                        quarantine(done);
+                        self.keep(state, Kept::Compute(done));
                     } else if let Some(err) = done.publication_error {
                         done.packet.release_guard();
                         done.packet.finish(Err(err));
@@ -1804,12 +1852,13 @@ impl Backend {
             }
         };
         let (queue, last) = root.queue();
-        let checked = (|| -> Result<(u32, u32)> {
+        let checked = (|| -> Result<(u32, u32, KVec<Arc<Packet>>)> {
             let (head, retired) = root.progress()?;
             if head != retired { return Err(EBUSY); }
-            Ok((head, root.capacity()?))
+            let kept = KVec::with_capacity(g14_v27_2_abi::QUARANTINE_LIMIT, GFP_KERNEL)?;
+            Ok((head, root.capacity()?, kept))
         })();
-        let (head, capacity) = match checked {
+        let (head, capacity, kept) = match checked {
             Ok(v) => v,
             Err(e) => {
                 halt_unowned(dev, peer, root, asc, true);
@@ -1843,6 +1892,8 @@ impl Backend {
             recoveries: 0,
             recovery_window: 0,
             recovery_count: 0,
+            kept,
+            kept_flights: KVec::new(),
             hardware_unreachable: false,
             #[cfg(CONFIG_APPLE_SOC_SLEEP)]
             commit_stop: None,
