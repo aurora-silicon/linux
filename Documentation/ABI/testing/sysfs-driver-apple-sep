@@ -547,8 +547,10 @@ Description:
 		Three enclave services Linux has no consumer for: Secure
 		Enclave to Secure Element sharing (endpoint sse), secure
 		hibernation (hibe) and the CoreKDL kernel deny-list (skdl).
-		As macOS at boot, the driver checks that each is offered and
-		sends it nothing.
+		The driver checks that each is offered with its known layout
+		and sends it nothing (`sse` and `hibe` send nothing at boot on
+		macOS either; `skdl` has no Linux signed kext receipt or
+		Apple Pay/FairPlay consumer).
 		(RO) sse, hibe and skdl read "pending" until the bring-up
 		ends, then "idle" (offered with its name and the buffer layout
 		the driver knows) or "absent" (not offered, or with another

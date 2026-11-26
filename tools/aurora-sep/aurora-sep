@@ -274,19 +274,29 @@ def status(live=True):
             r.add(WARN, "pnon", pnon, "the LocalPolicy nonce digest read has not succeeded "
                   "(the kernel log says why)")
 
-    for ep, what in (("sse", "secure-element sharing"), ("hibe", "hibernation"),
-                     ("skdl", "kernel deny-list")):
+    for ep, what, reason in (
+            ("sse", "secure-element sharing",
+             "nothing is sent to it, as macOS at boot"),
+            ("hibe", "hibernation",
+             "nothing is sent to it outside a real hibernation"),
+            ("skdl", "kernel deny-list",
+             "nothing is sent to it (no Linux kext receipt or Apple Pay/FairPlay consumer)")):
         v = d(ep)
         if v is None:
             continue
         if v == "idle":
-            r.add(PASS, ep, v, "the %s endpoint is offered as the driver knows it; "
-                  "nothing is sent to it, as macOS at boot" % what)
+            r.add(PASS, ep, v, "the %s endpoint is offered as the driver knows it; %s"
+                  % (what, reason))
         elif v == "absent":
             r.add(INFO, ep, v, "this enclave does not offer the %s endpoint "
                   "as the driver knows it" % what)
         else:
             r.add(INFO, ep, v, "the bring-up has not ended yet")
+
+    sse_ev = d("sse_events")
+    if sse_ev is not None:
+        r.add(PASS if sse_ev == "0" else INFO, "sse-events", sse_ev,
+              "unsolicited secure-element sharing events (counted, not answered)")
 
     for node, why in (("/dev/sep-bio", "Touch ID"), ("/dev/sep-key", "enclave keys")):
         if os.path.exists(path(node)):

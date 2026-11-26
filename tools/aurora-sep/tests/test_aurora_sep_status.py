@@ -146,19 +146,23 @@ class StatusTest(unittest.TestCase):
 
     def test_the_endpoints_checked_at_boot_are_reported(self):
         rc, report, v = self.run_status()
-        self.assertEqual((rc, v["sse"], v["hibe"], v["skdl"]), (0, "PASS", "PASS", "PASS"))
+        self.assertEqual((rc, v["sse"], v["hibe"], v["skdl"], v["sse-events"]),
+                         (0, "PASS", "PASS", "PASS", "PASS"))
         row = [r for r in report["checks"] if r["check"] == "endpoint-clients"][0]
         for ep in ("sse=", "hibe=", "skdl="):
             self.assertIn(ep, row["value"])
         self.set("sse", "absent")
         self.set("skdl", "pending")
+        self.set("sse_events", "2")
         rc, _, v = self.run_status()
-        self.assertEqual((rc, v["sse"], v["skdl"]), (0, "INFO", "INFO"))
+        self.assertEqual((rc, v["sse"], v["skdl"], v["sse-events"]),
+                         (0, "INFO", "INFO", "INFO"))
         # A kernel without the clients lists them as unserved.
-        for ep in ("sse", "hibe", "skdl"):
+        for ep in ("sse", "hibe", "skdl", "sse_events"):
             self.set(ep, None)
         rc, report, v = self.run_status()
         self.assertNotIn("sse", v)
+        self.assertNotIn("sse-events", v)
         row = [r for r in report["checks"] if r["check"] == "endpoint-clients"][0]
         for ep in ("sse", "hibe", "skdl"):
             self.assertIn(ep, row["detail"])

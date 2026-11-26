@@ -55,6 +55,24 @@ pub(crate) struct Prepared {
     pub(crate) resume_authorization: [u8; RESUME_AUTH_LEN],
 }
 
+impl Prepared {
+    /// Scrubs the wrapped key and resume authorisation in place so sensitive
+    /// material does not outlive a hibernation attempt or abort.
+    #[allow(dead_code)]
+    pub(crate) fn wipe(&mut self) {
+        image::wipe(&mut self.wrapped_image_key);
+        // SAFETY: `boot_word` is uniquely borrowed and valid.
+        unsafe { core::ptr::write_volatile(&mut self.boot_word, 0) };
+        image::wipe(&mut self.resume_authorization);
+    }
+}
+
+impl Drop for Prepared {
+    fn drop(&mut self) {
+        self.wipe();
+    }
+}
+
 /// Splits a prepare reply at its fixed boundaries. `None` unless `bytes` is
 /// exactly one reply long: the layout has no length field to trust.
 #[allow(dead_code)]
@@ -170,5 +188,18 @@ mod tests {
         let mut long = [0u8; PREPARE_REPLY_LEN + 1];
         long[..PREPARE_REPLY_LEN].copy_from_slice(&r);
         assert!(split_prepare_reply(&long).is_none());
+    }
+
+    #[test]
+    fn prepared_material_is_wiped() {
+        let mut r = [0u8; PREPARE_REPLY_LEN];
+        r[..WRAPPED_KEY_LEN].fill(0xaa);
+        r[WRAPPED_KEY_LEN..WRAPPED_KEY_LEN + 4].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+        r[WRAPPED_KEY_LEN + 4..].fill(0x55);
+        let mut p = split_prepare_reply(&r).unwrap();
+        p.wipe();
+        assert_eq!(p.wrapped_image_key, [0u8; WRAPPED_KEY_LEN]);
+        assert_eq!(p.boot_word, 0);
+        assert_eq!(p.resume_authorization, [0u8; RESUME_AUTH_LEN]);
     }
 }

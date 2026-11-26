@@ -49,9 +49,17 @@ pub(crate) const SSE_NAME: u32 = u32::from_be_bytes(*b"sse ");
 /// each way.
 pub(crate) const SSE_LAYOUT: u32 = 0x0101_0101;
 
-/// Mailbox tags: a call and its reply, and an event the enclave announces.
+/// Mailbox tags: a call and its reply, an asynchronous enclave event, a
+/// host-initiated liveness probe, and a long-response continuation. Linux
+/// initiates neither calls nor probes, so only events are accepted without
+/// counting as unhandled; unsolicited probes and continuations classify as
+/// [`Arrival::Other`] and are never answered.
 pub(crate) const TAG_CALL: u8 = 0x01;
 pub(crate) const TAG_EVENT: u8 = 0x02;
+#[allow(dead_code)]
+pub(crate) const TAG_PROBE: u8 = 0x03;
+#[allow(dead_code)]
+pub(crate) const TAG_CONTINUE: u8 = 0x04;
 
 /// The service signature every request starts with, as it travels: the
 /// ASCII bytes "cESS" read as a little-endian word.
@@ -264,11 +272,13 @@ mod tests {
             }),
             Arrival::Event(7)
         );
-        // Another endpoint, a probe, a continuation.
+        // Another endpoint, an unsolicited probe, an unsolicited continuation.
         for w in [
             0x0000_0000_0004_0118u64,
-            0x0000_0000_0000_030c,
-            0x0000_0000_0004_040c,
+            u64::from(EP_SSE) | (u64::from(TAG_PROBE) << MSG_TAG_SHIFT),
+            u64::from(EP_SSE)
+                | (u64::from(TAG_CONTINUE) << MSG_TAG_SHIFT)
+                | (4u64 << MSG_TYPE_SHIFT),
         ] {
             assert_eq!(classify(&Message { msg0: w, msg1: 0 }), Arrival::Other);
         }
