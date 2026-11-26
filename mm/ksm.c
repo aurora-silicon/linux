@@ -821,7 +821,7 @@ static struct page *get_mergeable_page(struct ksm_rmap_item *rmap_item)
 	struct folio *folio;
 
 	/* The KSM comparison and replacement paths still require native leaves. */
-	if (mm_page_size(mm) != PAGE_SIZE)
+	if (!ksm_supports_mm(mm))
 		return NULL;
 
 	mmap_read_lock(mm);
@@ -2686,7 +2686,12 @@ next_mm:
 	vma_iter_init(&vmi, mm, ksm_scan.address);
 
 	mmap_read_lock(mm);
-	if (ksm_test_exit(mm))
+	/*
+	 * An address space with another user granule is never entered (see
+	 * ksm_supports_mm()). Should one get here, drop it like an mm without
+	 * mergeable VMAs, before any of its pages reach the merge code.
+	 */
+	if (ksm_test_exit(mm) || !ksm_supports_mm(mm))
 		goto no_vmas;
 
 	for_each_vma(vmi, vma) {
@@ -2874,7 +2879,8 @@ static bool __ksm_should_add_vma(const struct file *file, vma_flags_t vma_flags)
 
 static void __ksm_add_vma(struct vm_area_struct *vma)
 {
-	if (__ksm_should_add_vma(vma->vm_file, vma->flags))
+	if (ksm_supports_mm(vma->vm_mm) &&
+	    __ksm_should_add_vma(vma->vm_file, vma->flags))
 		vm_flags_set(vma, VM_MERGEABLE);
 }
 
@@ -2906,7 +2912,7 @@ static int __ksm_del_vma(struct vm_area_struct *vma)
 vma_flags_t ksm_vma_flags(struct mm_struct *mm, const struct file *file,
 			  vma_flags_t vma_flags)
 {
-	if (mm_flags_test(MMF_VM_MERGE_ANY, mm) &&
+	if (mm_flags_test(MMF_VM_MERGE_ANY, mm) && ksm_supports_mm(mm) &&
 	    __ksm_should_add_vma(file, vma_flags)) {
 		vma_flags_set(&vma_flags, VMA_MERGEABLE_BIT);
 		/*
@@ -2950,11 +2956,16 @@ static int ksm_del_vmas(struct mm_struct *mm)
  *
  * @mm:  Pointer to mm
  *
- * Returns 0 on success, otherwise error code
+ * Returns 0 on success, -EOPNOTSUPP for an mm with another user granule,
+ * otherwise error code
  */
 int ksm_enable_merge_any(struct mm_struct *mm)
 {
 	int err;
+
+	/* As MADV_MERGEABLE: see ksm_supports_mm(). */
+	if (!ksm_supports_mm(mm))
+		return -EOPNOTSUPP;
 
 	if (mm_flags_test(MMF_VM_MERGE_ANY, mm))
 		return 0;
@@ -3019,6 +3030,8 @@ int ksm_madvise(struct vm_area_struct *vma, unsigned long start,
 
 	switch (advice) {
 	case MADV_MERGEABLE:
+		if (!ksm_supports_mm(mm))
+			return -EOPNOTSUPP;
 		if (vma->vm_flags & VM_MERGEABLE)
 			return 0;
 		if (!vma_ksm_compatible(vma))

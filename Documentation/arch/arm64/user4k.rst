@@ -182,6 +182,11 @@ mapping into neighboring slots. Mock IOMMU/VFIO tests validate the recorded
 translations and ownership paths, not physical-device DMA on arbitrary
 hardware.
 
+KSM does not merge the memory of a process with another granule.
+``MADV_MERGEABLE`` and ``PR_SET_MEMORY_MERGE`` fail with ``EOPNOTSUPP``
+there. A ``PR_SET_MEMORY_MERGE`` setting does not carry over into an exec
+that selects another granule, and so is gone after a later native exec too.
+
 Alternative-granule THP/KSM and hugetlb support, remaining legacy pin
 consumers, larger-than-native process activation and broader device
 integration still need work. Userfaultfd feature bits and per-range ioctl

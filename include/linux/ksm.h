@@ -15,6 +15,16 @@
 #include <linux/sched.h>
 
 #ifdef CONFIG_KSM
+/*
+ * KSM hashes, compares, write-protects and replaces whole native pages. An
+ * address space with another user granule maps a native page in parts that
+ * it tracks one by one, so it stays out of KSM.
+ */
+static inline bool ksm_supports_mm(const struct mm_struct *mm)
+{
+	return mm_page_size(mm) == PAGE_SIZE;
+}
+
 int ksm_madvise(struct vm_area_struct *vma, unsigned long start,
 		unsigned long end, int advice, vm_flags_t *vm_flags);
 vma_flags_t ksm_vma_flags(struct mm_struct *mm, const struct file *file,
@@ -68,10 +78,16 @@ static inline void ksm_fork(struct mm_struct *mm, struct mm_struct *oldmm)
 
 static inline int ksm_execve(struct mm_struct *mm)
 {
-	if (mm_flags_test(MMF_VM_MERGE_ANY, mm))
-		return __ksm_enter(mm);
+	if (!mm_flags_test(MMF_VM_MERGE_ANY, mm))
+		return 0;
 
-	return 0;
+	/* The setting does not carry over into an image with another granule. */
+	if (!ksm_supports_mm(mm)) {
+		mm_flags_clear(MMF_VM_MERGE_ANY, mm);
+		return 0;
+	}
+
+	return __ksm_enter(mm);
 }
 
 static inline void ksm_exit(struct mm_struct *mm)
