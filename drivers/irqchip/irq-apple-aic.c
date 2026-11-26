@@ -102,6 +102,7 @@
 
 #define AIC_TARGET_CPU		0x3000
 
+#define AIC_CPU_BLOCK(cpu)	(0x5000 + ((cpu) << 7))
 #define AIC_CPU_IPI_SET(cpu)	(0x5008 + ((cpu) << 7))
 #define AIC_CPU_IPI_CLR(cpu)	(0x500c + ((cpu) << 7))
 #define AIC_CPU_IPI_MASK_SET(cpu) (0x5024 + ((cpu) << 7))
@@ -367,6 +368,7 @@ static const struct aic_info aic3_t8132_info __initconst = {
 	.irq_cfg = AIC3_IRQ_CFG,
 	.fast_ipi = true,
 	.local_fast_ipi = true,
+	.vm_timer_fiq_readonly = true,
 	.fw_suspend = true,
 };
 
@@ -435,6 +437,12 @@ struct aic_irq_chip {
 	int max_die;
 
 	u32 *sleep_masks;
+	/* AIC1: each line's target CPUs, which a firmware sleep's power cycle may take */
+	u32 *sleep_targets;
+	/* AIC1: the global registers the boot loader set (0x10..0x3c), lost the same way */
+	u32 sleep_globals[12];
+	/* AIC1: each CPU block's first word, the CPU number WHOAMI reports there */
+	u32 sleep_cpu_ids[32];
 
 	struct aic_info info;
 };
@@ -442,6 +450,9 @@ struct aic_irq_chip {
 static DEFINE_PER_CPU(uint32_t, aic_fiq_unmasked);
 
 static struct aic_irq_chip *aic_irqc;
+
+/* AIC1: each CPU's number as AIC knows it (WHOAMI), for line targets; the logical id until read */
+static DEFINE_PER_CPU(u32, aic_cpu_hwid);
 
 /* CPUs that accept hardware IRQs, read from SIQ_CFG on AICv2+ at EL2 */
 static struct cpumask aic_irq_cpus;
@@ -467,6 +478,7 @@ void aic_sleep_mask_all(void)
 	struct aic_irq_chip *ic = aic_irqc;
 	u32 words = ic->max_irq >> 5, off = 0, reg, i;
 	u32 *saved = ic->sleep_masks;
+	u32 *targets = ic->sleep_targets;
 	int die;
 
 	for (die = 0; die < ic->nr_die; die++, off += ic->info.die_stride) {
@@ -475,7 +487,13 @@ void aic_sleep_mask_all(void)
 			*saved++ = aic_ic_read(ic, reg);
 			aic_ic_write(ic, reg, U32_MAX);
 		}
+		for (i = 0; targets && i < ic->nr_irq; i++)
+			*targets++ = aic_ic_read(ic, ic->info.target_cpu + off + i * 4);
 	}
+	for (i = 0; ic->sleep_targets && i < ARRAY_SIZE(ic->sleep_globals); i++)
+		ic->sleep_globals[i] = aic_ic_read(ic, AIC_CONFIG + i * 4);
+	for (i = 0; ic->sleep_targets && i < min(num_possible_cpus(), 32U); i++)
+		ic->sleep_cpu_ids[i] = aic_ic_read(ic, AIC_CPU_BLOCK(i));
 }
 
 void aic_sleep_restore(void)
@@ -483,9 +501,29 @@ void aic_sleep_restore(void)
 	struct aic_irq_chip *ic = aic_irqc;
 	u32 words = ic->max_irq >> 5, off = 0, i;
 	u32 *saved = ic->sleep_masks;
+	u32 *targets = ic->sleep_targets;
 	int die;
 
+	/* Delivery as a whole first: with the configuration gone, no line reaches a CPU. */
+	for (i = 0; targets && i < ARRAY_SIZE(ic->sleep_globals); i++) {
+		if (aic_ic_read(ic, AIC_CONFIG + i * 4) != ic->sleep_globals[i])
+			aic_ic_write(ic, AIC_CONFIG + i * 4, ic->sleep_globals[i]);
+	}
+
+	/* The CPU numbers, before any CPU comes back up and reads its own */
+	for (i = 0; targets && i < min(num_possible_cpus(), 32U); i++) {
+		if (aic_ic_read(ic, AIC_CPU_BLOCK(i)) != ic->sleep_cpu_ids[i])
+			aic_ic_write(ic, AIC_CPU_BLOCK(i), ic->sleep_cpu_ids[i]);
+	}
+
 	for (die = 0; die < ic->nr_die; die++, off += ic->info.die_stride) {
+		/* Targets first: an unmasked line with none goes nowhere. */
+		for (i = 0; targets && i < ic->nr_irq; i++, targets++) {
+			u32 reg = ic->info.target_cpu + off + i * 4;
+
+			if (aic_ic_read(ic, reg) != *targets)
+				aic_ic_write(ic, reg, *targets);
+		}
 		for (i = 0; i < words; i++, saved++) {
 			aic_ic_write(ic, ic->info.mask_set + off + i * 4, *saved);
 			aic_ic_write(ic, ic->info.mask_clr + off + i * 4, ~*saved);
@@ -593,7 +631,8 @@ static int aic_irq_set_affinity(struct irq_data *d,
 	else
 		cpu = cpumask_any_and(mask_val, cpu_online_mask);
 
-	aic_ic_write(ic, ic->info.target_cpu + AIC_HWIRQ_IRQ(hwirq) * 4, BIT(cpu));
+	aic_ic_write(ic, ic->info.target_cpu + AIC_HWIRQ_IRQ(hwirq) * 4,
+		     BIT(per_cpu(aic_cpu_hwid, cpu)));
 	irq_data_update_effective_affinity(d, cpumask_of(cpu));
 
 	return IRQ_SET_MASK_OK;
@@ -670,8 +709,9 @@ static unsigned long aic_fiq_get_idx(struct irq_data *d)
 }
 
 /*
- * T8142 traps writes to VM_TMR_FIQ_ENA_EL2. Mask the guest timers through
- * their architectural EL02 controls instead, leaving the older SoCs alone.
+ * T8132 and T8142 trap writes to VM_TMR_FIQ_ENA_EL2 outside a CTXR execute
+ * window. Mask the guest timers through their architectural EL02 controls
+ * instead, leaving the older SoCs alone.
  */
 static void aic_vm_timer_mask(u64 timers, bool mask)
 {
@@ -1092,7 +1132,17 @@ static int aic_init_cpu(unsigned int cpu)
 		 * If we ever end up with a mismatch here, we will have to introduce
 		 * a mapping table similar to what other irqchip drivers do.
 		 */
-		WARN_ON(aic_ic_read(aic_irqc, AIC_WHOAMI) != smp_processor_id());
+		u32 whoami = aic_ic_read(aic_irqc, AIC_WHOAMI);
+
+		/*
+		 * The device tree's CPU order need not be AIC's (the E- and P-cores can
+		 * interleave): a line's target is AIC's number for the CPU, so keep it.
+		 */
+		if (whoami < 32)
+			per_cpu(aic_cpu_hwid, smp_processor_id()) = whoami;
+		if (whoami != smp_processor_id())
+			pr_info_once("AIC: CPU numbers differ from the device tree's order (CPU%d is AIC CPU %u)\n",
+				     smp_processor_id(), whoami);
 
 		/*
 		 * Always keep IPIs unmasked at the hardware level (except auto-masking
@@ -1332,7 +1382,7 @@ static void __init aic_sleep_init(struct aic_irq_chip *irqc)
 
 static int __init aic_of_ic_init(struct device_node *node, struct device_node *parent)
 {
-	int i, die;
+	int i, die, cpu;
 	u32 off, start_off;
 	void __iomem *regs;
 	struct aic_irq_chip *irqc;
@@ -1358,12 +1408,13 @@ static int __init aic_of_ic_init(struct device_node *node, struct device_node *p
 	irqc->info = *(struct aic_info *)match->data;
 
 	/*
-	 * The VM_TMR_FIQ_ENA_EL2 write that traps on T8142 was seen under
-	 * SPTM. A loader that runs the OS at EL2 in a CTXR execute window
-	 * starts no SPTM and says so with this property, and there the
-	 * register takes writes. Masking through the EL02 controls instead
-	 * sets IMASK in the guest's own timer, which KVM then keeps as
-	 * guest state: the guest gets no timer interrupt again.
+	 * The VM_TMR_FIQ_ENA_EL2 write traps on T8142 under SPTM, and on T8132
+	 * booted by a stage 1 that arms no CTXR execute window. A loader that
+	 * runs the OS at EL2 in a CTXR execute window starts no SPTM and says
+	 * so with this property, and there the register takes writes.
+	 * Masking through the EL02 controls instead sets IMASK in the guest's
+	 * own timer, which KVM then keeps as guest state: the guest gets no
+	 * timer interrupt again.
 	 */
 	if (irqc->info.vm_timer_fiq_readonly && is_kernel_in_hyp_mode() &&
 	    of_property_present(of_chosen, "aurora,ctxr-exec-window"))
@@ -1431,6 +1482,12 @@ static int __init aic_of_ic_init(struct device_node *node, struct device_node *p
 				    sizeof(*irqc->sleep_masks), GFP_KERNEL);
 	if (WARN_ON(!irqc->sleep_masks))
 		goto err_unmap;
+	if (irqc->info.target_cpu) {
+		irqc->sleep_targets = kcalloc(irqc->nr_die * irqc->nr_irq,
+					      sizeof(*irqc->sleep_targets), GFP_KERNEL);
+		if (WARN_ON(!irqc->sleep_targets))
+			goto err_unmap;
+	}
 
 	irqc->hw_domain = irq_domain_create_tree(of_fwnode_handle(node),
 						 &aic_irq_domain_ops, irqc);
@@ -1450,6 +1507,9 @@ static int __init aic_of_ic_init(struct device_node *node, struct device_node *p
 			build_fiq_affinity(irqc, chld);
 	}
 	of_node_put(affs);
+
+	for_each_possible_cpu(cpu)
+		per_cpu(aic_cpu_hwid, cpu) = cpu;
 
 	set_handle_irq(aic_handle_irq);
 	set_handle_fiq(aic_handle_fiq);

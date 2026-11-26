@@ -875,26 +875,31 @@ static void bcm4377_handle_completion(struct bcm4377_data *bcm4377,
 static void bcm4377_poll_completion_ring(struct bcm4377_data *bcm4377,
 					 struct bcm4377_completion_ring *ring)
 {
-	u16 tail;
 	__le16 *heads = bcm4377->ring_state->completion_ring_head;
 	__le16 *tails = bcm4377->ring_state->completion_ring_tail;
+	u16 head, tail, i;
 
 	if (!ring->enabled)
 		return;
 
+	/* Sample the producer index after the interrupt status read. */
+	dma_rmb();
+	head = le16_to_cpu(READ_ONCE(heads[ring->ring_id]));
+	if (head >= ring->n_entries) {
+		dev_warn_ratelimited(&bcm4377->pdev->dev,
+				     "invalid head %u for completion ring %u\n",
+				     head, ring->ring_id);
+		return;
+	}
+
 	tail = le16_to_cpu(tails[ring->ring_id]);
 	dev_dbg(&bcm4377->pdev->dev,
 		"completion ring #%d: head: %d, tail: %d\n", ring->ring_id,
-		le16_to_cpu(heads[ring->ring_id]), tail);
+		head, tail);
 
-	while (tail != le16_to_cpu(READ_ONCE(heads[ring->ring_id]))) {
-		/*
-		 * ensure the CPU doesn't speculate through the comparison.
-		 * otherwise it might already read the (empty) queue entry
-		 * before the updated head has been loaded and checked.
-		 */
-		dma_rmb();
-
+	/* Read the published entries after observing the device's head. */
+	dma_rmb();
+	for (i = 0; tail != head && i < ring->n_entries; i++) {
 		bcm4377_handle_completion(bcm4377, ring, tail);
 
 		tail = (tail + 1) % ring->n_entries;
@@ -1960,11 +1965,39 @@ static int bcm4377_hci_set_bdaddr(struct hci_dev *hdev, const bdaddr_t *bdaddr)
 	return 0;
 }
 
+/*
+ * The ACL transfer ring takes at most MAX_ACL_PAYLOAD_SIZE bytes per entry
+ * (HCI_MAX_ACL_SIZE of data), and bcm4377_enqueue() refuses anything larger.
+ * The core fragments ACL data to the MTUs the controller reports, so a
+ * controller that reports more than the ring takes would have every larger
+ * fragment dropped. Fragment to what the ring takes instead.
+ */
+static void bcm4377_clamp_acl_mtu(struct hci_dev *hdev)
+{
+	struct bcm4377_data *bcm4377 = hci_get_drvdata(hdev);
+
+	if (hdev->acl_mtu > HCI_MAX_ACL_SIZE) {
+		dev_info(&bcm4377->pdev->dev,
+			 "controller ACL MTU %u exceeds the ACL ring's %u, using %u\n",
+			 hdev->acl_mtu, HCI_MAX_ACL_SIZE, HCI_MAX_ACL_SIZE);
+		hdev->acl_mtu = HCI_MAX_ACL_SIZE;
+	}
+
+	if (hdev->le_mtu > HCI_MAX_ACL_SIZE) {
+		dev_info(&bcm4377->pdev->dev,
+			 "controller LE MTU %u exceeds the ACL ring's %u, using %u\n",
+			 hdev->le_mtu, HCI_MAX_ACL_SIZE, HCI_MAX_ACL_SIZE);
+		hdev->le_mtu = HCI_MAX_ACL_SIZE;
+	}
+}
+
 static int bcm4377_hci_post_init(struct hci_dev *hdev)
 {
 	struct bcm4377_data *bcm4377 = hci_get_drvdata(hdev);
 	const bdaddr_t *bda = NULL;
 	int ret;
+
+	bcm4377_clamp_acl_mtu(hdev);
 
 	if (!bcm4377->cal_needed)
 		return 0;
@@ -3222,11 +3255,16 @@ static int bcm4377_resume(struct device *dev)
 	/*
 	 * A real sleep took the function's power: the firmware is gone, and every resume command
 	 * would only time out (two times 2 s inside the system resume, then the rebind anyway).
-	 * Skip them and rebind from the work queue; probe boots the firmware from scratch.
+	 * Restore the private BAR0 windows and mark needs_reset before queueing the rebind so
+	 * neither hci_close() during device_reprobe() nor a stray frame can write BAR0 through
+	 * unconfigured reset windows. Skip the resume commands and rebind from the work queue;
+	 * probe boots the firmware from scratch.
 	 */
 	if (pm_resume_via_firmware() && !bcm4377->dma_window_base) {
 		bcm4377->quiesced = false;
 		bcm4377->resume_powered = false;
+		bcm4377->needs_reset = true;
+		bcm4377_init_cfg(bcm4377);
 		WRITE_ONCE(bcm4377->setup_retry_blocked, false);
 		bcm4377_queue_rebind(bcm4377, "power lost in the sleep");
 		return 0;

@@ -50,15 +50,22 @@ pub(crate) fn push_completion(done: &mut Completions, job: &Arc<Job>, result: Re
     done.push(job, result);
 }
 
+const _: () = assert!(logic::RETIRED_COMPUTE_PIPES == super::hw::sizes::COMPUTE_PIPES);
+
 pub(crate) struct Recovery {
-    /// Per-class host deadlines, ordinary and long-job ([`logic::Deadlines`]).
+    /// Render host deadlines, ordinary and long-job ([`logic::Deadlines`]).
     pub(crate) deadlines: logic::Deadlines,
-    /// Per-class (render, compute) long-command warning deadlines; diagnostic only.
+    /// Per-compute-pipe host deadlines, ordinary and long-job, so progress on one pipe
+    /// cannot mask a stalled flight on another compute pipe.
+    pub(crate) compute_deadlines: [logic::Deadlines; super::hw::sizes::COMPUTE_PIPES],
+    /// Render long-command warning deadline; diagnostic only.
     warning_deadline_ns: [u64; 2],
+    /// Per-compute-pipe long-command warning deadlines; diagnostic only.
+    compute_warning_deadline_ns: [u64; super::hw::sizes::COMPUTE_PIPES],
     pub(crate) long_commands: u64,
     pub(crate) publication_wait_deadline: Option<u64>,
-    /// Recently retired compute pipe 0/1 and TA/FS stamps, for late recovery snapshots.
-    pub(crate) last_retired: logic::RetiredStamps,
+    /// Recently retired compute pipe and TA/FS stamps, heap-boxed off the probe stack.
+    pub(crate) last_retired: KBox<logic::RetiredStamps>,
     /// Queue engine order: render, compute. A quarantined/exhausted class stays offline.
     pub(crate) unavailable: [Option<Error>; 2],
     pub(crate) errors_seen: u32,
@@ -78,13 +85,19 @@ pub(crate) struct Recovery {
 }
 
 impl Recovery {
-    pub(crate) fn new() -> Self {
-        Self {
+    pub(crate) fn new() -> Result<Self> {
+        let mut retired = KBox::<logic::RetiredStamps>::new_uninit(GFP_KERNEL)?;
+        logic::RetiredStamps::init_zero(&mut *retired);
+        // SAFETY: `init_zero` initialized the entire `RetiredStamps` in place.
+        let last_retired = unsafe { retired.assume_init() };
+        Ok(Self {
             deadlines: logic::Deadlines::EXPIRED,
+            compute_deadlines: [logic::Deadlines::EXPIRED; super::hw::sizes::COMPUTE_PIPES],
             warning_deadline_ns: [u64::MAX; 2],
+            compute_warning_deadline_ns: [u64::MAX; super::hw::sizes::COMPUTE_PIPES],
             long_commands: 0,
             publication_wait_deadline: None,
-            last_retired: logic::RetiredStamps::new(),
+            last_retired,
             unavailable: [None; 2],
             errors_seen: 0,
             statistics_seen: 0,
@@ -98,7 +111,7 @@ impl Recovery {
             window_count: 0,
             running: false,
             fwlog_remaining: super::channel::RECOVERY_FWLOG_CAP,
-        }
+        })
     }
 
     pub(crate) fn failed(&self) -> Option<Error> {
@@ -124,13 +137,19 @@ impl Firmware {
             now.saturating_add(5_000_000_000);
     }
 
-    pub(crate) fn renew_compute_deadline(&mut self) {
+    pub(crate) fn renew_compute_pipe_deadline(&mut self, pipe: usize) {
+        let pipe = pipe.min(super::hw::sizes::COMPUTE_PIPES - 1);
         let now = now_ns();
         let renewed = logic::Deadlines::renew(now, 0, params::compute_deadline_ms());
-        self.recovery.deadlines.compute = renewed.compute;
-        self.recovery.deadlines.long_compute = renewed.long_compute;
-        self.recovery.warning_deadline_ns[super::command::COMPUTE] =
-            now.saturating_add(5_000_000_000);
+        self.recovery.compute_deadlines[pipe].compute = renewed.compute;
+        self.recovery.compute_deadlines[pipe].long_compute = renewed.long_compute;
+        self.recovery.compute_warning_deadline_ns[pipe] = now.saturating_add(5_000_000_000);
+    }
+
+    pub(crate) fn renew_compute_deadline(&mut self) {
+        for pipe in 0..super::hw::sizes::COMPUTE_PIPES {
+            self.renew_compute_pipe_deadline(pipe);
+        }
     }
 
     pub(crate) fn renew_deadlines(&mut self) {
@@ -202,24 +221,28 @@ impl Firmware {
             return Err(EIO);
         }
         if !self.engine.flights.is_empty() {
+            const CP: usize = super::hw::sizes::COMPUTE_PIPES;
             self.progress();
             let now = now_ns();
-            let has_render = self.engine.flights.iter().any(|flight| flight.renders != 0);
-            let has_compute = self
-                .engine
-                .flights
-                .iter()
-                .any(|flight| flight.computes != 0);
-            let has_long_render = self
-                .engine
-                .flights
-                .iter()
-                .any(|flight| flight.renders != 0 && flight.job.long());
-            let has_long_compute = self
-                .engine
-                .flights
-                .iter()
-                .any(|flight| flight.computes != 0 && flight.job.long());
+            let mut has_render = false;
+            let mut has_long_render = false;
+            let mut has_compute = [false; CP];
+            let mut has_long_compute = [false; CP];
+            for flight in &self.engine.flights {
+                if flight.renders != 0 {
+                    has_render = true;
+                    if flight.job.long() {
+                        has_long_render = true;
+                    }
+                }
+                if flight.computes != 0 {
+                    let p = (flight.compute_pipe as usize).min(CP - 1);
+                    if !has_compute[p] {
+                        has_compute[p] = true;
+                        has_long_compute[p] = flight.job.long();
+                    }
+                }
+            }
             if has_render
                 && logic::expired(
                     now,
@@ -233,25 +256,29 @@ impl Firmware {
                     "M4 GPU render command has no completion-stamp progress for 5s; execution may still be active\n"
                 );
             }
-            if has_compute
-                && logic::expired(
-                    now,
-                    self.recovery.warning_deadline_ns[super::command::COMPUTE],
-                )
-            {
-                self.recovery.warning_deadline_ns[super::command::COMPUTE] = u64::MAX;
-                self.recovery.long_commands = self.recovery.long_commands.saturating_add(1);
-                dev_warn!(
-                    self.dev(),
-                    "M4 GPU compute command has no completion-stamp progress for 5s; execution may still be active\n"
-                );
+            let mut compute_expired = false;
+            for p in 0..CP {
+                if !has_compute[p] {
+                    continue;
+                }
+                if logic::expired(now, self.recovery.compute_warning_deadline_ns[p]) {
+                    self.recovery.compute_warning_deadline_ns[p] = u64::MAX;
+                    self.recovery.long_commands = self.recovery.long_commands.saturating_add(1);
+                    dev_warn!(
+                        self.dev(),
+                        "M4 GPU compute pipe {} command has no completion-stamp progress for 5s; execution may still be active\n",
+                        p
+                    );
+                }
+                let pipe_deadline = self.recovery.compute_deadlines[p]
+                    .select(true, has_long_compute[p]);
+                if logic::expired(now, pipe_deadline) {
+                    compute_expired = true;
+                }
             }
             // Ray traversal and AS builds: every flight of such a job (`Job::long`).
             let render_deadline = self.recovery.deadlines.select(false, has_long_render);
-            let compute_deadline = self.recovery.deadlines.select(true, has_long_compute);
-            if (has_render && logic::expired(now, render_deadline))
-                || (has_compute && logic::expired(now, compute_deadline))
-            {
+            if (has_render && logic::expired(now, render_deadline)) || compute_expired {
                 dev_err!(
                     self.dev(),
                     "M4 GPU administrative command deadline exceeded without firmware recovery; retaining owners and fail-stop (not proof of quiescence)\n"
@@ -312,7 +339,7 @@ impl Firmware {
     /// register is read.
     fn floor_power(&mut self, error: Error) {
         let before = self.power.effective;
-        let selectors = self.init.abi.initdata().pstate_selectors;
+        let selectors = self.init.layout.pstate_selectors;
         let mut ok = 0usize;
         let mut failed = 0usize;
         if let Some(globals) = self.init.globals.as_ref() {
@@ -406,7 +433,12 @@ impl Firmware {
 
     /// Resolve the snapshot while the firmware is stopped. A missing retained
     /// owner prevents acknowledgement: its failure cannot safely be attributed.
-    fn mark_recovery(&mut self, stage: [u32; 4], event: u32, asid: Option<u32>) -> Result {
+    fn mark_recovery(
+        &mut self,
+        stage: [u32; 2 + super::hw::sizes::COMPUTE_PIPES],
+        event: u32,
+        asid: Option<u32>,
+    ) -> Result {
         let data = self.init.firmware_data();
         for i in 0..data.snapshot_entries {
             let offset = data.snapshot + i * 8;
@@ -434,7 +466,7 @@ impl Firmware {
             return;
         };
         let mut nonzero = 0usize;
-        for entry in &scan.banks {
+        for entry in scan.banks() {
             if entry.status == 0 {
                 continue;
             }
@@ -464,7 +496,8 @@ impl Firmware {
         if nonzero == 0 {
             dev_warn!(
                 self.dev(),
-                "G16: fault_scan: all 8 banks zero (busy={}, saved_bank={}, event={:#x}, flights={})\n",
+                "G16: fault_scan: all {} banks zero (busy={}, saved_bank={}, event={:#x}, flights={})\n",
+                scan.banks().len(),
                 scan.busy,
                 scan.saved_bank,
                 event,
@@ -505,7 +538,9 @@ impl Firmware {
             if logic::expired(now, deadline) {
                 let _ = self.drain_auxiliary_rings();
                 // Which side stalled, and whether tiling or fragment work was left behind.
-                let stage = self.recovery_snapshot().unwrap_or_default();
+                let stage = self
+                    .recovery_snapshot()
+                    .unwrap_or([0; 2 + super::hw::sizes::COMPUTE_PIPES]);
                 dev_err!(
                     self.dev(),
                     "M4 GPU recovery exceeded 1000 ms: {} (phase {}, TA {:#x}/{:#x}, FS {:#x}/{:#x}, {} flights)\n",

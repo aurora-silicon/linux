@@ -14,6 +14,7 @@
 #include <linux/mm.h>
 #include <linux/mutex.h>
 #include <linux/notifier.h>
+#include <linux/xarray.h>
 #include <linux/spinlock.h>
 #include <linux/mux/consumer.h>
 #include <linux/phy/phy.h>
@@ -322,6 +323,8 @@ struct apple_dcp_hw_data {
 	 * standard RTKit wake instead of starting or restarting the ASC.
 	 */
 	bool adopt_live_session;
+	/* Bootloader property marking this DCP as running under iBoot. */
+	const char *iboot_handoff;
 	enum dcp_firmware_version firmware_compat;
 	/* Firmware-visible clock aperture, independent of the AP PMGR window. */
 	const struct resource *firmware_clock;
@@ -407,6 +410,16 @@ struct apple_dcp_hw_data {
 	 * for one second.
 	 */
 	unsigned int afk_timeout_ms;
+	/*
+	 * Firmware 27 reaches its register windows through its DART here, so map_reg maps
+	 * them there (T8103: its power-down faults on an unmapped window otherwise).
+	 */
+	bool map_reg_dart;
+	/*
+	 * The display DART goes off and on with the coprocessor's own stop and start: no
+	 * D572 turns it off first, and the stop's power-down resets it (T8103).
+	 */
+	bool s2r_disp_dart_with_dcp;
 };
 
 enum dcp_test_point {
@@ -577,6 +590,18 @@ struct apple_dcp {
 	struct platform_device *piodma;
 	bool piodma_created;
 	struct iommu_domain *iommu_dom;
+	/*
+	 * J615 dcpext: a child device on the display DART stream the external
+	 * pipe scans framebuffers through. Framebuffers are mirrored into its
+	 * domain at the display subsystem's addresses. fb_mirrors holds the
+	 * mapped length of every mirrored GEM object, indexed by the object's
+	 * address, until the object is freed; fb_mirror_lock protects it and
+	 * fb_dom.
+	 */
+	struct platform_device *fbdma;
+	struct iommu_domain *fb_dom;
+	struct xarray fb_mirrors;
+	struct mutex fb_mirror_lock;
 	/* which of the nine cumulative A031 notify-client states to send next */
 	unsigned int a031_step;
 	struct apple_rtkit *rtk;
@@ -767,6 +792,8 @@ struct apple_dcp {
 
 	/* Display registers mappable to the DCP */
 	struct resource *disp_registers[MAX_DISP_REGISTERS];
+	/* Their DART mappings with hw.map_reg_dart, made at the firmware's first map_reg */
+	dma_addr_t map_reg_dva[MAX_DISP_REGISTERS];
 	unsigned int nr_disp_registers;
 
 	struct resource disp_bw_scratch_res;
@@ -926,8 +953,14 @@ struct apple_dcp {
 	bool sleep_v27_unhandled;
 	bool s2r_active;
 	bool s2r_stopped;
+	bool s2r_hdmi_irq_disabled;
 	/* DPMS off stopped the firmware and lowered the domains; DPMS on brings them back. */
 	bool dpms_powered_off;
+	/*
+	 * The firmware confirmed the scanout stop of a set_power_state(0) and no power-on has
+	 * started since: its D572(0) has come and gone, and a second set_power_state(0) gets none.
+	 */
+	bool pipe_off;
 	/* Refused its idle with the display off: the firmware still runs, the display is dark. */
 	bool s2r_refused_off;
 	/* The firmware's secure mailbox, where it has one. */
@@ -941,6 +974,8 @@ struct apple_dcp {
 	struct delayed_work secure_poll_wq;
 	/* Stopped and not restarted, which outlives a suspend that gets refused. */
 	bool s2r_fw_down;
+	/* Stopped cold for firmware-driven sleep, with no restart until reboot. */
+	bool sleep_cold_stopped;
 	/*
 	 * Its last system suspend left the firmware running and its domains on
 	 * (wakeup path), see dcp_sleep_keeps_firmware(). Cleared by the next

@@ -37,6 +37,7 @@
 #include <drm/drm_print.h>
 #include <drm/drm_vblank.h>
 
+#include "av.h"
 #include "cec.h"
 #include "dcp.h"
 #include "dcp-hdr-metadata.h"
@@ -2089,9 +2090,12 @@ void dcp_hotplug(struct work_struct *work)
 }
 
 /*
- * J700/25G83 asks D134 after publishing its external video interface.
- * The observed async record has no input and a four-byte result. Use the
- * existing zero reply for this record only; its feature remains unsupported.
+ * The H17P external firmware (26.6.2) asks D134 after publishing its
+ * external video interface. The observed async record has no input and a
+ * four-byte result. Use the existing zero reply for this record only; its
+ * feature remains unsupported. The record belongs to the firmware ABI: the
+ * method profile is only set for that firmware, which probe has already
+ * checked against apple,firmware-version (dcp_h17p_external_supported()).
  */
 static bool dcp_external_zero_reply(struct apple_dcp *dcp, int tag,
 				    enum dcp_context_id context,
@@ -2100,9 +2104,7 @@ static bool dcp_external_zero_reply(struct apple_dcp *dcp, int tag,
 	return tag == 134 && context == DCP_CONTEXT_ASYNC &&
 	       in_len == 0 && out_len == sizeof(u32) &&
 	       dcp->hw.iomfb_method_profile ==
-	       DCP_IOMFB_METHODS_H17P_EXTERNAL &&
-	       of_machine_is_compatible("apple,j700") &&
-	       of_device_is_compatible(dcp->dev->of_node, "apple,t8140-dcpext");
+	       DCP_IOMFB_METHODS_H17P_EXTERNAL;
 }
 
 static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
@@ -2974,6 +2976,11 @@ int dcp_get_modes(struct drm_connector *connector)
 	}
 
 edid_done:
+	/*
+	 * The connector's ELD follows its EDID: a card connected before this
+	 * EDID was published (a Type-C route's service opens first) takes it now.
+	 */
+	av_audio_sink_changed(dcp);
 	/* Discovery can replace the catalogue while the OOB read waits. */
 	if (dcp_is_ext26(dcp)) {
 		if (READ_ONCE(dcp->crashed) || READ_ONCE(dcp->ext26_blocked))

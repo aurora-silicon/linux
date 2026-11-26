@@ -9,6 +9,7 @@
 use super::fw::buffer as fw;
 use crate::hw::t8140::resources as cfg;
 pub(crate) mod target;
+pub(crate) mod compact;
 mod geometry;
 pub(crate) use geometry::BlockGeometry;
 mod layout;
@@ -439,6 +440,18 @@ impl Tvb {
         }
         geometry.backing_bytes(blocks)
     }
+    /// Backing for `blocks` blocks to be mapped into `vm`. M5 blocks are mapped one by one in
+    /// the compact window, which is checked for room for all of them first, and the client's
+    /// passes and geometry size them, so they are charged to the client.
+    fn allocate(dev: &AsahiDrmDevice, vm: &mmu::Vm, geometry: BlockGeometry, blocks: usize)
+        -> Result<KernelObject> {
+        let bytes = Self::backing_bytes(geometry, blocks)?;
+        if geometry == BlockGeometry::NEO {
+            return KernelObject::backing(dev, bytes, CpuMap::WriteCombined);
+        }
+        compact::PairObject::ParameterBlock.check_room(vm, geometry.block_bytes, blocks)?;
+        KernelObject::client_backing(dev, bytes, vm.memory_client())
+    }
     /// Maps a NEO block in the first of `ranges` with room; other geometries have their own.
     fn map_block(
         object: &KernelObject,
@@ -450,9 +463,8 @@ impl Tvb {
         if geometry != BlockGeometry::NEO {
             let start = relative.checked_mul(geometry.backing_stride).ok_or(EOVERFLOW)?;
             let source = start..start.checked_add(geometry.block_bytes).ok_or(EOVERFLOW)?;
-            let guard = geometry.stride - geometry.block_bytes;
-            let mapping = object.map_range(vm, source, geometry.base..geometry.end,
-                BlockGeometry::PAGE as u64, mmu::PROT_GPU_SHARED_RW, guard)?;
+            let mapping = compact::PairObject::ParameterBlock.map(object, vm, source,
+                mmu::PROT_GPU_SHARED_RW)?;
             geometry.compact_page(mapping.iova())?;
             return Ok(mapping);
         }
@@ -486,8 +498,7 @@ impl Tvb {
         if blocks == 0 || blocks > geometry.max_blocks() {
             return Err(ERANGE);
         }
-        let backing = KernelObject::backing(dev, Self::backing_bytes(geometry, blocks)?,
-            CpuMap::WriteCombined)?;
+        let backing = Self::allocate(dev, vm, geometry, blocks)?;
         let mut mappings = KVec::with_capacity(blocks, GFP_KERNEL)?;
         let mut addresses = KVec::with_capacity(blocks, GFP_KERNEL)?;
         for index in 0..blocks {
@@ -565,6 +576,12 @@ impl Tvb {
             let (start, made) = (addresses.len(), extensions.len());
             let blocks = (added - start).min(EXTENSION_BLOCKS);
             let result = (|| {
+                // M5 blocks are mapped in the compact window: check it has room for this
+                // extension before allocating it.
+                if self.geometry != BlockGeometry::NEO {
+                    compact::PairObject::ParameterBlock.check_room(vm, self.geometry.block_bytes,
+                        blocks)?;
+                }
                 extensions.push(Self::extension(dev, vm.memory_client(),
                     Self::backing_bytes(self.geometry, blocks)?)?, GFP_KERNEL)?;
                 let backing = &extensions.last().ok_or(EIO)?.backing;
@@ -638,14 +655,17 @@ impl MetricsIds {
     /// backing each lease is taken from.
     pub(crate) fn with_stride(scene_stride: usize) -> Result<Self> {
         if scene_stride < 4 || scene_stride % 4 != 0 { return Err(EINVAL); }
-        let entry_pitch = scene_stride.checked_mul(fw::SCENES)
-            .and_then(|bytes| bytes.checked_next_multiple_of(mmu::UAT_PGSZ))
-            .ok_or(EOVERFLOW)?;
         Ok(Self {
             used: [AtomicU64::new(0), AtomicU64::new(0)],
             scene_stride,
-            entry_pitch,
+            entry_pitch: Self::entry_pitch(scene_stride)?,
         })
+    }
+    /// The pitch of entries of `scene_stride`-byte scenes: each starts its own pages.
+    pub(crate) fn entry_pitch(scene_stride: usize) -> Result<usize> {
+        scene_stride.checked_mul(fw::SCENES)
+            .and_then(|bytes| bytes.checked_next_multiple_of(mmu::UAT_PGSZ))
+            .ok_or(EOVERFLOW)
     }
     /// Backing required for every entry owned by this allocator.
     pub(crate) fn storage_bytes(&self) -> Result<usize> {
@@ -677,14 +697,14 @@ impl MetricsLease {
         // window's start (InitData::bind_m5_metrics), so place the entry where its offset puts
         // it there.
         let fixed = super::J813_FORMS.load(Ordering::Relaxed).then(|| {
-            let at = BlockGeometry::M5_COMPACT.start + offset as u64;
-            self.backing.map_range(vm, offset..offset + pitch, at..at + pitch as u64,
-                mmu::UAT_PGSZ as u64, mmu::PROT_GPU_SHARED_RW, 0).ok()
+            let at = compact::WINDOW.start + offset as u64;
+            compact::PairObject::Metrics.map_at(&self.backing, vm, offset..offset + pitch, at,
+                mmu::PROT_GPU_SHARED_RW).ok()
         }).flatten();
         let client = match fixed {
             Some(client) => client,
-            None => self.backing.map_range(vm, offset..offset + pitch, BlockGeometry::M5_COMPACT,
-                mmu::UAT_PGSZ as u64, mmu::PROT_GPU_SHARED_RW, 0)?,
+            None => compact::PairObject::Metrics.map(&self.backing, vm, offset..offset + pitch,
+                mmu::PROT_GPU_SHARED_RW)?,
         };
         self.addresses.client = client.iova();
         self.client = Some(client);
@@ -901,8 +921,7 @@ impl Manager {
                 mmu::UAT_PGSZ,
             )?
         } else {
-            graph.map_range(vm, source, geometry.base..geometry.end,
-                cfg::TVB_PAGE, mmu::PROT_GPU_FW_SHARED_RW, mmu::UAT_PGSZ)?
+            compact::PairObject::PageList.map(&graph, vm, source, mmu::PROT_GPU_FW_SHARED_RW)?
         };
         let address = graph.gpu_va();
         let graph_args = fw::GraphArgs {

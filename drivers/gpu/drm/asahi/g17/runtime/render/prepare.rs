@@ -823,8 +823,8 @@ impl super::super::Backend {
 
     pub(super) fn ensure_render(&self, packet: &Arc<Packet>, slot: u8, sleep: bool) -> Result {
         self.build_render_pair(slot, packet, false, sleep)?;
-        // An owner held to one pair has no sibling to warm.
-        if self.pairs == 1 {
+        // An owner held to one pair, or running this layout on one, has no sibling to warm.
+        if self.render_pairs(packet) == 1 {
             return Ok(());
         }
         let sibling = {
@@ -841,8 +841,15 @@ impl super::super::Backend {
             // construction and its final device-locked install have finished.
             // An optional sibling may be borrowed or waiting for recovery.
             // The selected pair is revalidated by prepare_render before publication.
+            // A sibling for which the client's window or memory limit has no room now, as the
+            // queue's other objects hold it, is not built either: this render runs on its pair.
             match self.build_render_pair(sibling.slot(), packet, true, sleep) {
-                Err(error) if error == EBUSY || error == EAGAIN || error == super::submit::FALLBACK => {}
+                Err(error)
+                    if error == EBUSY
+                        || error == EAGAIN
+                        || error == super::submit::FALLBACK
+                        || error == ENOSPC
+                        || error == ENOMEM => {}
                 result => result?,
             }
         }
@@ -994,7 +1001,7 @@ impl super::super::Backend {
             let _scope = (*held)
                 .as_mut()
                 .filter(|claim| claim.remaining() != 0)
-                .map(|claim| firmware.init.outer_scope(claim))
+                .map(|claim| firmware.port.outer_scope(&firmware.init, claim))
                 .transpose()?;
             firmware.publish_render(self.owner, slot, packet, deferred)
         })();
