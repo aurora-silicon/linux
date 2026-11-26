@@ -53,6 +53,11 @@ for example with `systemctl edit aurora-sep.service`:
 Environment=AURORA_SEP_READY_TIMEOUT=180
 ```
 
+The loader does not wait when the enclave refuses the identity key-bag unlock
+that trusted keys need: the driver's `diag/trusted` then reads
+`refused <status>`, and the loader logs it and exits at once, because asking
+again gets the same answer.
+
 SEP writes are always on: xART writes and identity-keybag provisioning have
 no switch. The driver's `xart_writes` and `provision_keybag` parameters were
 removed (aurora-silicon/linux#2591), and a stale value on the kernel command
