@@ -150,3 +150,5 @@
 	memory-region-names = "ttbs", "pagetables", "handoff", "fw-data",
 			      "l2-pagetables", "fw-text";
 };
+
+#include "t6050-g17s-gpu-opp.dtsi"

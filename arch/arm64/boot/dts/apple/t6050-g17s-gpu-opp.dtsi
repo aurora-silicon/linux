@@ -1,0 +1,254 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * M5 Pro (G17S) GPU operating points, for the boot loader to fill from the ADT: the
+ * GPU's 14 states (sgx perf-states and perf-states1, perf-states-sram and -sram1, one
+ * cell per table), the AFR and CS domains' (afr-perf-states, cs-perf-states) and their
+ * SRAM floor. The driver keeps the board's states and takes only the voltages, the
+ * part's own, when every frequency is the board's; the zeros here leave the board's
+ * tables in use.
+ */
+
+/ {
+	gpu_opp: opp-table-gpu {
+		compatible = "operating-points-v2";
+
+		opp00 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0>;
+			opp-microvolt-sram = <0 0>;
+		};
+
+		opp01 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0>;
+			opp-microvolt-sram = <0 0>;
+		};
+
+		opp02 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0>;
+			opp-microvolt-sram = <0 0>;
+		};
+
+		opp03 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0>;
+			opp-microvolt-sram = <0 0>;
+		};
+
+		opp04 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0>;
+			opp-microvolt-sram = <0 0>;
+		};
+
+		opp05 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0>;
+			opp-microvolt-sram = <0 0>;
+		};
+
+		opp06 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0>;
+			opp-microvolt-sram = <0 0>;
+		};
+
+		opp07 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0>;
+			opp-microvolt-sram = <0 0>;
+		};
+
+		opp08 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0>;
+			opp-microvolt-sram = <0 0>;
+		};
+
+		opp09 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0>;
+			opp-microvolt-sram = <0 0>;
+		};
+
+		opp10 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0>;
+			opp-microvolt-sram = <0 0>;
+		};
+
+		opp11 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0>;
+			opp-microvolt-sram = <0 0>;
+		};
+
+		opp12 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0>;
+			opp-microvolt-sram = <0 0>;
+		};
+
+		opp13 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0>;
+			opp-microvolt-sram = <0 0>;
+		};
+	};
+
+	gpu_afr_opp: opp-table-afr {
+		compatible = "operating-points-v2";
+
+		opp00 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp01 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp02 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp03 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp04 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp05 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp06 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp07 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp08 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp09 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp10 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp11 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp12 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp13 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+	};
+
+	gpu_cs_opp: opp-table-cs {
+		compatible = "operating-points-v2";
+
+		opp00 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp01 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp02 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp03 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp04 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp05 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp06 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp07 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp08 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp09 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp10 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp11 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp12 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp13 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+	};
+};
+
+&sgx {
+	operating-points-v2 = <&gpu_opp>;
+	apple,afr-opp = <&gpu_afr_opp>;
+	apple,cs-opp = <&gpu_cs_opp>;
+	apple,csafr-min-sram-microvolt = <0>;
+};
