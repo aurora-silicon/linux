@@ -395,6 +395,9 @@ static void t6030_ovrd_report(struct apple_sleep *s, const char *when)
 
 static void t6030_late_map(struct apple_sleep *s);
 
+static int t6030_mem_config_apply(struct apple_sleep *s);
+static bool t6030_mem_config_boot_on(void);
+
 static int t6030_sleep_map_regs(struct apple_sleep *s)
 {
 	static const struct {
@@ -464,6 +467,8 @@ static int t6030_sleep_map_regs(struct apple_sleep *s)
 	t6030_gp_map(s);
 	t6030_late_map(s);
 	t6030_ovrd_report(s, "probe");
+	if (t6030_mem_config_boot_on())
+		t6030_mem_config_apply(s);
 
 	return apple_sleep_read_wake_sources(s);
 }
@@ -1342,19 +1347,12 @@ static u64 t6030_mem_read(u64 pa, u8 width)
 
 static void t6030_deep_wfi_arm(void);
 
-static int t6030_mem_config_set(const char *val, const struct kernel_param *kp)
+static int t6030_mem_config_apply(struct apple_sleep *s)
 {
-	struct apple_sleep *s = apple_sleep;
-	struct t6030_sleep *t;
+	struct t6030_sleep *t = t6030_state(s);
 	u32 perf0;
-	bool on;
-	int ret = kstrtobool(val, &on);
+	int ret;
 
-	if (ret || !on)
-		return ret;
-	if (!s || s->soc->ops->deep_wfi_arm != t6030_deep_wfi_arm)
-		return -ENODEV;
-	t = t6030_state(s);
 	perf0 = readl(s->clk_perf + CLK_PERF_SOC);
 	ret = t6030_mem_config_map(t);
 	if (!ret) {
@@ -1373,6 +1371,33 @@ static int t6030_mem_config_set(const char *val, const struct kernel_param *kp)
 		 t6030_mem_read(0x222027000, 64), t6030_mem_read(0x220400018, 32),
 		 t6030_mem_read(0x222e00018, 32), perf0, readl(s->clk_perf + CLK_PERF_SOC));
 	return ret;
+}
+
+static int t6030_mem_config_set(const char *val, const struct kernel_param *kp)
+{
+	struct apple_sleep *s = apple_sleep;
+	bool on;
+	int ret = kstrtobool(val, &on);
+
+	if (ret || !on)
+		return ret;
+	if (!s || s->soc->ops->deep_wfi_arm != t6030_deep_wfi_arm)
+		return -ENODEV;
+	return t6030_mem_config_apply(s);
+}
+
+/*
+ * DIAGNOSTIC: the same at the driver's probe, before the PMP report starts the PMP, as XNU
+ * programs the AMCC ways and the DCS tables 215-216 ms into its boot (macos-boot-memside-5),
+ * long before its PMP runs. The PMP's DCS/fabric states may need them to switch at all.
+ */
+static bool t6030_mem_config_boot;
+module_param_named(mem_config_boot, t6030_mem_config_boot, bool, 0444);
+MODULE_PARM_DESC(mem_config_boot, "T6030 DIAGNOSTIC: mem_config at probe, before the PMP starts");
+
+static bool t6030_mem_config_boot_on(void)
+{
+	return READ_ONCE(t6030_mem_config_boot);
 }
 
 static const struct kernel_param_ops t6030_mem_config_ops = {
