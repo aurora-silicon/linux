@@ -68,7 +68,11 @@ def main():
         'refused-skips-rescan': ('\t\ttb_scan_switch(tb->root_switch);\n}', '\t\t(void)0;\n}'),
         'rescan-while-stopping': ('if (tcm->hotplug_active && !tcm->stopping)\n\t\ttb_scan_switch', 'if (true)\n\t\ttb_scan_switch'),
         'refused-keeps-cleanup': ('\t\t\ttcm->resume_cleanup_pending = false;\n\t\t}\n\t}\n\ttb_domain_unregister', '\t\t}\n\t}\n\ttb_domain_unregister'),
-        'keep-xdomain-port': ('\t\tif (port->xdomain == xd)\n\t\t\tport->xdomain = NULL;\n', ''),
+        'keep-xdomain-port': ('\t\tholder->xdomain = NULL;\n', ''),
+        'clear-iterated-port': ('\t\tholder->xdomain = NULL;\n',
+                                '\t\tif (port->xdomain == xd)\n\t\t\tport->xdomain = NULL;\n'),
+        'unconfigure-iterated-port': ('tb_port_unconfigure_xdomain(holder);',
+                                      'tb_port_unconfigure_xdomain(port);'),
     }
     variants = {'real': unit}
     for name, (old, new) in mutations.items():
