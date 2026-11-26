@@ -268,8 +268,14 @@ struct asahi_g16_cooling *asahi_g16_cooling_register(struct device *dev)
 	INIT_DELAYED_WORK(&cooling->zone_poll, asahi_g16_zone_poll_fn);
 	cooling->zone_err = -ENODATA;
 	cooling->pmp_node = of_parse_phandle(dev->of_node, "apple,pmp", 0);
-	/* A disabled PMP node never probes, so it provides no telemetry. */
-	if (cooling->pmp_node && !of_device_is_available(cooling->pmp_node)) {
+	/*
+	 * A disabled PMP node never probes, so it provides no telemetry. Nor does the T6030 PMP,
+	 * which runs (since the T6030 sleep bring-up starts it at boot) but has no telemetry
+	 * provider (apple_pmp_telemetry_register() takes T8132's only): its GPU keeps the
+	 * thermal-zone backstop it had with the PMP halted.
+	 */
+	if (cooling->pmp_node && (!of_device_is_available(cooling->pmp_node) ||
+				  of_device_is_compatible(cooling->pmp_node, "apple,t6030-pmp-v2"))) {
 		of_node_put(cooling->pmp_node);
 		cooling->pmp_node = NULL;
 	}
