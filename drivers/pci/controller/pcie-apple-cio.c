@@ -441,7 +441,18 @@ static int apple_pcie_cio_suspend(struct apple_pcie *pcie)
 unwind:
 	/* PM does not resume a device whose own suspend callback failed. */
 	recover = apple_pcie_cio_resume(pcie);
-	if (recover)
-		panic("Apple PCIe-C: suspend %d, recovery %d; DMA remains closed", ret, recover);
+	if (recover) {
+		/*
+		 * A dock that left during the stop does not come back for the undo
+		 * either. Retire the port as after a surprise removal before the
+		 * functions below resume: they are marked disconnected, config
+		 * space stays closed, the port is stopped when the tunnel goes,
+		 * and the sleep is refused.
+		 */
+		dev_err(pcie->dev, "CIO PCIe-C not back after the failed stop (%d, undo %d): retired as after an unplug\n",
+			ret, recover);
+		pcie->resume_failed = true;
+		apple_pcie_tunnel_hierarchy_gone(pcie->dev);
+	}
 	return ret;
 }
