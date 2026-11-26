@@ -1250,7 +1250,7 @@ impl File {
                 entry.kernel_range.clone(),
             )
         };
-        let mut batch = mmu::PreparedUserBindBatch::new(count)?;
+        let mut batch = mmu::PreparedUserBindBatch::new(&vm, count)?;
         let mut unmaps = 0;
         // A fresh reader per declared stride also skips extension bytes in longer records.
         for bytes in bytes.chunks_exact(stride) {
@@ -1318,7 +1318,6 @@ impl File {
         }
         vm.reserve_deferred_user_unmaps(unmaps)?;
         vm.commit_prepared_user_bind_batch(&mut batch)?;
-        vm.bo_deferred_cleanup();
         Ok(0)
     }
 
