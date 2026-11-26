@@ -947,7 +947,19 @@ impl super::super::Backend {
                     manager.prepare_growth(&dev, &vm, target, if busy { 0 } else { required },
                         descriptor)
                 }) {
-                    Ok(prepared) => growth = prepared,
+                    Ok(prepared) => {
+                        // The heap asked for growth and got none: it stopped short at no
+                        // block, or its arena share left none.
+                        if prepared.is_none() {
+                            let blocks = pair.manager().blocks();
+                            crate::g17::trace::heap(if busy {
+                                crate::g17::trace::HEAP_HOST_BUSY
+                            } else {
+                                crate::g17::trace::HEAP_HOST_IDLE
+                            }, false, blocks, blocks);
+                        }
+                        growth = prepared
+                    }
                     // A busy pair keeps its heap; firmware grow requests still serve it.
                     Err(_) if busy => {
                         let manager = pair.manager();
