@@ -272,15 +272,9 @@ impl Context {
         let status = execution.vm().status().ok_or(EINVAL)?.clone();
         let hold = execution.hold(super::channel::control_fence)?;
         let qos = qos.acquire()?;
-        // On M5 only the firmware reads and writes the scheduler and work-state pages; the GPU
-        // has no access to them.
-        let kernel_prot = if alloc.uat.is_m5() {
-            mmu::PROT_FW_SHARED_RW
-        } else {
-            mmu::PROT_GPU_FW_SHARED_RW
-        };
-        // The scheduler page sits in the upper half, which every execution context includes,
-        // and only the firmware reads and writes it: it is firmware-only.
+        // The scheduler and work-state pages sit in the upper half, which every execution
+        // context includes. Only the firmware reads and writes them, and the host takes a
+        // drained work-state node as evidence for retirement: they are firmware-only.
         let mut scheduler = if alloc.uat.is_m5() {
             SchedulerStorage::Retained(pool.allocate(
                 alloc,
@@ -313,7 +307,7 @@ impl Context {
             Family::WorkState,
             2 * UAT_PGSZ,
             0,
-            kernel_prot,
+            mmu::PROT_FW_SHARED_RW,
             CpuMap::WriteCombined,
         )?;
         let work_base = object.gpu_va();
