@@ -108,14 +108,14 @@ pub(crate) trait G18DrmRuntime: G18RenderJobSink {
 /// Adapter options fixed at registration.
 #[derive(Debug, Copy, Clone, Default)]
 pub(crate) struct G18DrmConfig {
-    /// Admit compute commands (module parameter `g18_admit_compute`, default 0).
+    /// Admit compute commands (module parameter `g18_admit_compute`, default 1).
     pub(crate) admit_compute: bool,
     /// Admit exactly the native 4x MSAA render set (module parameter
-    /// `g18_admit_msaa4`, default 0; msaa163). Off refuses every
+    /// `g18_admit_msaa4`, default 1; msaa163). Off refuses every
     /// multisampled render as before.
     pub(crate) admit_msaa4: bool,
     /// Admit renders carrying `DRM_ASAHI_RENDER_G18_RESOURCES` (module
-    /// parameter `g18_admit_graphics_scratch`, default 0). Off leaves the
+    /// parameter `g18_admit_graphics_scratch`, default 1). Off leaves the
     /// feature unadvertised and refuses the flag, so Mesa keeps refusing
     /// draws whose programs need a thread-private frame.
     pub(crate) admit_graphics_scratch: bool,
