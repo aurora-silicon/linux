@@ -1553,7 +1553,6 @@ typedef uint64_t u64;
 #define DRM_MODE_CONNECTOR_HDMIA 11
 #define DRM_MODE_CONNECTOR_eDP 14
 #define DRM_MODE_CONNECTOR_USB 20
-#define msleep(x) ((void)(x))
 #define component_compare_of 0
 #define apple_dcp_id_tbl 0
 static int dcp_comp_ops;
@@ -1604,7 +1603,17 @@ static struct device master = { .data = &priv };
 static struct component_match matches;
 static bool machine_supported, absent_external;
 static unsigned int references, released, node_puts, probes[2], bind_attempts, disables;
+static unsigned int start_report_flushes;
 static int preflight_error, external_probe_error, bind_result;
+static void apple_drm_flush_start_reports(struct drm_device *drm)
+{
+    assert(drm == &priv.drm);
+    start_report_flushes++;
+}
+/* The J700 readiness scenarios do not have a J713 panel. */
+#ifndef iomfb_is_m4
+static bool iomfb_is_m4(struct apple_dcp *dcp) { (void)dcp; return false; }
+#endif
 static void try_bind(void);
 static bool of_machine_is_compatible(const char *s)
 { assert(!strcmp(s,"apple,j700")); return machine_supported; }
@@ -1720,6 +1729,7 @@ static void initial(bool supported_firmware)
     }
     absent_external = false;
     references = released = node_puts = bind_attempts = disables = 0;
+    start_report_flushes = 0;
     preflight_error = external_probe_error = bind_result = 0;
 }
 static int match_providers(void)
@@ -1754,16 +1764,19 @@ int main(void)
     assert(!dcp_h17p_external_ready(&nodes[1]) && references == 0);
     try_bind();
     assert(bind_attempts == 1 && bind_result == 0 && probes[0] == 1 && !probes[1]);
+    assert(start_report_flushes == 1);
 
     /* Delayed external provider remains in the match; the master must wait. */
     initial(true);
     assert(match_providers() == 2 && matches.includes[1]);
     try_bind();
     assert(bind_attempts == 0 && !probes[0] && !probes[1]);
+    assert(start_report_flushes == 0);
     /* Last provider is prepared, but driver core bound is still false here. */
     assert(publish_provider(&devices[1], &dcps[1]) == 0);
     assert(dcps[1].external_prepared && !devices[1].bound);
     assert(bind_attempts == 1 && bind_result == 0 && probes[0] == 1 && probes[1] == 1);
+    assert(start_report_flushes == 1);
     devices[1].bound = true;
 
     /* Permanent preflight failure cannot silently drop a requested provider. */
@@ -1808,6 +1821,7 @@ int main(void)
         dcps[1].external_prepared = true;
         if (failure) start_error[0] = -EIO; else ready_error[0] = -ETIMEDOUT;
         assert(apple_drm_init_dcp(&master) == -ENODEV);
+        assert(start_report_flushes == 0);
         /* A processor that did not start is not waited for. */
         assert(starts[0] == 1 && waits[0] == (int)!failure && waits[1] == 1);
     }
@@ -1816,10 +1830,12 @@ int main(void)
     dcps[1].external_prepared = true;
     ready_error[1] = -ETIMEDOUT;
     assert(apple_drm_init_dcp(&master) == 0);
+    assert(start_report_flushes == 1);
     initial(true);
     dcps[1].external_prepared = true;
     start_error[1] = -EIO;
     assert(apple_drm_init_dcp(&master) == 0 && waits[1] == 0);
+    assert(start_report_flushes == 1);
     puts("PASS: automatic hardware/firmware matching, delayed/preflight-failed providers, synchronous publication, readiness rejection, boot framebuffer kept without the panel processor");
     return 0;
 }
