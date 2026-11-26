@@ -9,6 +9,7 @@
 #include <linux/init.h>
 #include <linux/pci.h>
 #include <linux/msi.h>
+#include <linux/of.h>
 #include <linux/of_pci.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
@@ -1735,6 +1736,20 @@ static void set_pcie_cxl(struct pci_dev *dev)
 
 }
 
+/*
+ * Every bridge and endpoint below a port that the device tree marks
+ * "external-facing" is external to the machine, as the binding defines it.
+ * Unlike an ACPI ExternalFacingPort (see arch_pci_dev_is_removable()), no
+ * built-in controller sits below such a port.
+ */
+static bool pci_dev_below_of_external_port(struct pci_dev *dev)
+{
+	struct pci_dev *parent = pci_upstream_bridge(dev);
+
+	return parent && parent->external_facing &&
+	       of_property_read_bool(parent->dev.of_node, "external-facing");
+}
+
 static void set_pcie_untrusted(struct pci_dev *dev)
 {
 	struct pci_dev *parent = pci_upstream_bridge(dev);
@@ -1750,7 +1765,7 @@ static void set_pcie_untrusted(struct pci_dev *dev)
 		return;
 	}
 
-	if (arch_pci_dev_is_removable(dev)) {
+	if (arch_pci_dev_is_removable(dev) || pci_dev_below_of_external_port(dev)) {
 		pci_dbg(dev, "marking as untrusted\n");
 		dev->untrusted = true;
 	}
@@ -1778,7 +1793,7 @@ static void pci_set_removable(struct pci_dev *dev)
 		return;
 	}
 
-	if (arch_pci_dev_is_removable(dev)) {
+	if (arch_pci_dev_is_removable(dev) || pci_dev_below_of_external_port(dev)) {
 		pci_dbg(dev, "marking as removable\n");
 		dev_set_removable(&dev->dev, DEVICE_REMOVABLE);
 	}
