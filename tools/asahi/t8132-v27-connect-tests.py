@@ -91,6 +91,7 @@ FUNCTIONS = [
     ('dcp', 'dcp_dptx_gate_arm'), ('dcp', 'dcp_dptx_gate_disarm'),
     ('dcp', 'dcp_dptx_gate_close'), ('dcp', 'dcp_dptx_send_gated'),
     ('dcp', 'dcp_watches_tunnel_withdrawal'), ('dcp', 'dcp_dptx_wait_linkcfg'),
+    ('dcp', 'dcp_assert_hpd_before_link_wait'),
     ('dcp', 'dcp_dptx_connect_raw'), ('dcp', 'dcp_typec_reconnect_work'),
     ('dcp', 'dcp_typec_attach_locked'), ('dcp', 'dcp_typec_attach_deferred'),
     ('dcp', 'dcp_t8132_tunnel_gone'), ('dcp', 'dcp_dptx_release_locked'),
@@ -364,7 +365,7 @@ static bool cancel_delayed_work_sync(struct delayed_work *w) { return cancel_del
 /* Display */
 enum { DCP_FIRMWARE_V_26_6 = 26, DCP_FIRMWARE_V_27_0 = 27, DCP_FIRMWARE_H17P = 17,
        DCP_FIRMWARE_V_26_6_DESKTOP = 260, DCP_FIRMWARE_V_12_3 = 12, DCP_FIRMWARE_V_13_5 = 13 };
-enum { DRM_MODE_CONNECTOR_DisplayPort = 10, DRM_MODE_CONNECTOR_USB = 32 };
+enum { DRM_MODE_CONNECTOR_DisplayPort = 10, DRM_MODE_CONNECTOR_HDMIA = 11, DRM_MODE_CONNECTOR_USB = 32 };
 struct device_node { const char *compatible; bool v27_2; };
 struct device { struct device_node *of_node; };
 struct platform_device { struct device dev; };
@@ -393,7 +394,9 @@ struct apple_dcp {
 	struct apple_connector *connector;
 	bool external, external_native, dptx_tunnel, typec_cable_connected, typec_crtc_off,
 	     typec_follow_retiring, typec_work_enabled, crashed, t8132_release_late,
-	     external_link_ready, external_error, placeholder_retried, main_display, hdmi_hpd;
+	     external_link_ready, external_error, placeholder_retried, main_display, rtkit_adopted;
+	int fixed_connector_type;
+	void *hdmi_hpd;
 	int connector_type, external_retries;
 	struct delayed_work external_retry_wq;
 	bool sleep_v27_torn;
@@ -651,6 +654,8 @@ static bool dcp_is_typec_output(struct apple_dcp *d) { (void)d; return true; }
 static bool dcp_is_usb4_output(struct apple_dcp *d) { return d->dptx_tunnel; }
 static bool dcp_ext_dptx_607(struct apple_dcp *d) { (void)d; return false; }
 static bool dcp_uses_t6020_tunnel_flow(struct apple_dcp *d) { (void)d; return false; }
+/* A Type-C output: dcp_assert_hpd_before_link_wait() never reads a fixed HDMI HPD here. */
+static int gpiod_get_value_cansleep(void *gpio) { (void)gpio; assert(!"fixed HDMI HPD on a Type-C output"); return 0; }
 static bool iomfb_v14_7_external_ready(struct apple_dcp *d) { (void)d; return true; }
 static int iomfb_v14_7_external_open(struct apple_dcp *d) { (void)d; return 0; }
 static bool dcpext_scanout_terminal(struct apple_dcp *d) { (void)d; return false; }

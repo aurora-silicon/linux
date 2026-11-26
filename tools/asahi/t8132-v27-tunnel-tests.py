@@ -122,6 +122,8 @@ static bool dcp_t8132_late_release(struct apple_dcp *dcp, const char *what)
     (void)dcp; (void)what; return false;
 }
 /* A T8132 crossbar is no T602X-flow tunnel route of firmware 14.7 or 27. */
+/* A T8132 route: never the T6041-layout crossbar. */
+static bool dcp_xbar_t6041(struct mux_control *mux) { (void)mux; return false; }
 static bool dcp_t602x_tunnel_route(struct apple_dcp_typec_route *route)
 {
     (void)route; return false;
