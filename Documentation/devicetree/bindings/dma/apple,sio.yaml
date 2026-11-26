@@ -75,12 +75,17 @@ allOf:
         reg:
           minItems: 2
           maxItems: 2
+        reg-names:
+          items:
+            - const: asc
+            - const: auxiliary
         clocks:
           minItems: 3
           maxItems: 3
         status:
           const: disabled
       required:
+        - reg-names
         - clocks
         - status
   - if:

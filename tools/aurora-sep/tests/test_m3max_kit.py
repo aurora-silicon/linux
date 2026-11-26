@@ -385,6 +385,7 @@ M3MAX_KIT_MESA_PACKAGE="{MESA_FILE} {self.mesa_sha}"
 M3MAX_KIT_EFIVARS='{self.efivars}'
 M3MAX_KIT_CMDLINE='{t}/proc/cmdline'
 M3MAX_KIT_LOCKS='{t}/run/boot-partition.lock {t}/run/limine-global.lock'
+M3MAX_KIT_COMPAT_LOCKS=''
 M3MAX_KIT_LIMINE_DEFAULTS='{t}/etc/limine'
 M3MAX_KIT_TTY='{self.tty}'
 M3MAX_KIT_SETTLE=0

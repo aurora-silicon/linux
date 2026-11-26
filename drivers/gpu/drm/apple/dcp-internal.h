@@ -14,6 +14,7 @@
 #include <linux/mm.h>
 #include <linux/mutex.h>
 #include <linux/notifier.h>
+#include <linux/xarray.h>
 #include <linux/spinlock.h>
 #include <linux/mux/consumer.h>
 #include <linux/phy/phy.h>
@@ -409,6 +410,16 @@ struct apple_dcp_hw_data {
 	 * for one second.
 	 */
 	unsigned int afk_timeout_ms;
+	/*
+	 * Firmware 27 reaches its register windows through its DART here, so map_reg maps
+	 * them there (T8103: its power-down faults on an unmapped window otherwise).
+	 */
+	bool map_reg_dart;
+	/*
+	 * The display DART goes off and on with the coprocessor's own stop and start: no
+	 * D572 turns it off first, and the stop's power-down resets it (T8103).
+	 */
+	bool s2r_disp_dart_with_dcp;
 };
 
 enum dcp_test_point {
@@ -579,6 +590,18 @@ struct apple_dcp {
 	struct platform_device *piodma;
 	bool piodma_created;
 	struct iommu_domain *iommu_dom;
+	/*
+	 * J615 dcpext: a child device on the display DART stream the external
+	 * pipe scans framebuffers through. Framebuffers are mirrored into its
+	 * domain at the display subsystem's addresses. fb_mirrors holds the
+	 * mapped length of every mirrored GEM object, indexed by the object's
+	 * address, until the object is freed; fb_mirror_lock protects it and
+	 * fb_dom.
+	 */
+	struct platform_device *fbdma;
+	struct iommu_domain *fb_dom;
+	struct xarray fb_mirrors;
+	struct mutex fb_mirror_lock;
 	/* which of the nine cumulative A031 notify-client states to send next */
 	unsigned int a031_step;
 	struct apple_rtkit *rtk;
@@ -769,6 +792,8 @@ struct apple_dcp {
 
 	/* Display registers mappable to the DCP */
 	struct resource *disp_registers[MAX_DISP_REGISTERS];
+	/* Their DART mappings with hw.map_reg_dart, made at the firmware's first map_reg */
+	dma_addr_t map_reg_dva[MAX_DISP_REGISTERS];
 	unsigned int nr_disp_registers;
 
 	struct resource disp_bw_scratch_res;
@@ -928,6 +953,7 @@ struct apple_dcp {
 	bool sleep_v27_unhandled;
 	bool s2r_active;
 	bool s2r_stopped;
+	bool s2r_hdmi_irq_disabled;
 	/* DPMS off stopped the firmware and lowered the domains; DPMS on brings them back. */
 	bool dpms_powered_off;
 	/*

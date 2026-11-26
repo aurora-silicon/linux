@@ -183,6 +183,104 @@ static void afk_compact_service_call_report_test(struct kunit *test)
 }
 
 /*
+ * Replies to firmware calls wait on the endpoint's transmit queue. While it
+ * makes no progress, further calls are taken only as long as their replies
+ * fit the room of one message.
+ */
+struct compact_reply_gate {
+	struct work_struct work;
+	struct completion open;
+};
+
+static void compact_reply_gate_fn(struct work_struct *work)
+{
+	struct compact_reply_gate *gate =
+		container_of(work, struct compact_reply_gate, work);
+
+	wait_for_completion(&gate->open);
+}
+
+static int compact_call_count_cb(struct apple_epic_service *service, u16 group,
+				 u32 command, const void *data, size_t size,
+				 void *reply, size_t room)
+{
+	unsigned int *count = service->cookie;
+
+	(*count)++;
+	return 0;
+}
+
+static const struct apple_epic_service_ops compact_call_count_ops = {
+	.name = "compact-call-test",
+	.call_v2 = compact_call_count_cb,
+};
+
+static void afk_compact_call_reply_budget_test(struct kunit *test)
+{
+	/* Four calls of this size take all the room; the timestamp and sub-header precede. */
+	const size_t payload_size = AFK_COMPACT_MESSAGE_MAX / 4;
+	const size_t wire_size = 16 + payload_size;
+	struct apple_dcp_afkep *ep = test->priv;
+	struct compact_reply_gate gate;
+	struct epic_compact_sub_hdr *sub;
+	struct epic_service_call *call;
+	unsigned int handled = 0, i;
+	u8 *wire;
+
+	wire = kunit_kzalloc(test, wire_size, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, wire);
+	sub = (void *)(wire + 8);
+	sub->category = 1;
+	sub->type = EPIC_SUBTYPE_STD_SERVICE;
+	call = (void *)((u8 *)(sub + 1) + sizeof(struct epic_compact_desc));
+	call->command = cpu_to_le32(4);
+	call->data_len = cpu_to_le32(payload_size - sizeof(struct epic_compact_desc) -
+				     sizeof(*call));
+	call->magic = cpu_to_le32(EPIC_SERVICE_CALL_MAGIC);
+
+	ep->services[0].ops = &compact_call_count_ops;
+	ep->services[0].cookie = &handled;
+	ep->tx_wq = alloc_ordered_workqueue("afk-parser-test-tx", 0);
+	KUNIT_ASSERT_NOT_NULL(test, ep->tx_wq);
+
+	/* The queue is ordered: nothing behind the gate runs until it opens. */
+	INIT_WORK_ONSTACK(&gate.work, compact_reply_gate_fn);
+	init_completion(&gate.open);
+	queue_work(ep->tx_wq, &gate.work);
+
+	/* A call left without a reply must hold off a coordinated sleep. */
+	ep->dcp->v27_sleep_transport = true;
+	for (i = 0; i < 4; i++)
+		afk_recv_compact_message(ep, 1, wire, wire_size);
+	KUNIT_EXPECT_FALSE(test, ep->sleep_poisoned);
+	afk_recv_compact_message(ep, 1, wire, wire_size);
+	KUNIT_EXPECT_EQ(test, handled, 4U);
+	KUNIT_EXPECT_EQ(test, atomic_read(&ep->sleep_jobs), 4);
+	KUNIT_EXPECT_TRUE(test, ep->sleep_poisoned);
+
+	/* A small call no longer fits either. */
+	call->data_len = cpu_to_le32(0);
+	afk_recv_compact_message(ep, 1, wire,
+				 16 + sizeof(struct epic_compact_desc) + sizeof(*call));
+	KUNIT_EXPECT_EQ(test, handled, 4U);
+	KUNIT_EXPECT_EQ(test, atomic_read(&ep->sleep_jobs), 4);
+
+	/* The replies fail without a transmit ring, which frees their room. */
+	complete(&gate.open);
+	flush_workqueue(ep->tx_wq);
+	KUNIT_EXPECT_EQ(test, atomic_read(&ep->sleep_jobs), 0);
+
+	afk_recv_compact_message(ep, 1, wire,
+				 16 + sizeof(struct epic_compact_desc) + sizeof(*call));
+	KUNIT_EXPECT_EQ(test, handled, 5U);
+
+	destroy_workqueue(ep->tx_wq);
+	ep->tx_wq = NULL;
+	destroy_work_on_stack(&gate.work);
+	KUNIT_EXPECT_EQ(test, atomic_read(&ep->sleep_jobs), 0);
+}
+
+/*
  * Slot reuse for re-announced compact services. The firmware re-announces a
  * service under a fresh interface on every DP relink without closing the old
  * one; afk_compact_slot() decides whether the new announcement supersedes the
@@ -341,6 +439,7 @@ static void afk_compact_cut_before_wildcard_test(struct kunit *test)
 static struct kunit_case afk_parser_cases[] = {
 	KUNIT_CASE(afk_serialized_report_test),
 	KUNIT_CASE(afk_compact_service_call_report_test),
+	KUNIT_CASE(afk_compact_call_reply_budget_test),
 	KUNIT_CASE(afk_compact_header_test),
 	KUNIT_CASE(afk_short_epic_test),
 	KUNIT_CASE(afk_short_reply_test),

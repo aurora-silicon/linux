@@ -562,6 +562,15 @@ enum drm_asahi_feature {
 #define DRM_ASAHI_FEATURE_COMPUTE_ONLY ((1ULL) << 41)
 
 /*
+ * DRM_ASAHI_FEATURE_COMPUTE_MULTI_CHANNEL: the kernel itself runs the
+ * independent compute commands of one queue on several firmware compute
+ * queues of its context, so that they overlap. Userspace needs no further
+ * queues of its own for that. A feature bit like those of enum
+ * drm_asahi_feature, defined here like bit 32.
+ */
+#define DRM_ASAHI_FEATURE_COMPUTE_MULTI_CHANNEL ((1ULL) << 42)
+
+/*
  * DRM_ASAHI_FEATURE_USERPTR_NO_MEMLOCK: DRM_IOCTL_ASAHI_GEM_USERPTR does not
  * charge its pins to the caller's RLIMIT_MEMLOCK; only the GPU memory limits
  * bound them (see struct drm_asahi_gem_userptr). Kernels that report

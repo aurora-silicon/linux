@@ -91,6 +91,7 @@ static int send_ptb(struct bcm4377_data *b,const struct firmware *f) { assert(f=
 static const struct firmware *bcm4377_request_blob(struct bcm4377_data *b,const char *suffix) { assert(!strcmp(suffix,"ptb"));return missing_blob?NULL:&fw; }
 static void release_firmware(const struct firmware *f) { assert(f==&fw); }
 static int bcm4377_check_bdaddr(struct bcm4377_data *b) { return 0; }
+static int bcm4377_init_cfg(struct bcm4377_data *b) { (void)b; return 0; }
 static int bcm4377_destroy_transfer_ring(struct bcm4377_data *b,struct ring *r) { r->enabled=false;return close_error; }
 static int bcm4377_destroy_completion_ring(struct bcm4377_data *b,struct ring *r) { r->enabled=false;return close_error; }
 static int bcm4377_hci_set_bdaddr(struct hci_dev *h,const bdaddr_t *a) { addr_count++;if(addr_error)return addr_error;h->bdaddr=*a;return 0; }

@@ -24,7 +24,8 @@ pub(crate) struct OuterClaim {
 }
 
 /// Borrows the claim only. The caller must hold the device mutex from entry
-/// through Drop: its temporarily lent credits are available to that publisher.
+/// through Drop and serialize entry and Drop under `Port::m5_outer` (via
+/// `Port::outer_scope`): its temporarily lent credits are available to that publisher.
 pub(crate) struct OuterScope<'a> {
     claim: &'a mut OuterClaim,
     before: u64,
@@ -139,6 +140,11 @@ impl OuterClaim {
     /// anywhere: only returned credits notify waiters.
     pub(crate) fn remaining(&self) -> u32 {
         self.remaining
+    }
+
+    /// Priority class of the reserved outer work ring.
+    pub(crate) fn priority(&self) -> usize {
+        self.priority
     }
 }
 

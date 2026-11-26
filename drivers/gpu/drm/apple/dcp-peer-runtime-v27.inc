@@ -120,8 +120,13 @@ int dcp_peer_modeset_v27(struct apple_dcp *dcp, u32 timing, u32 color, u32 min_v
 		return ret;
 	if (timing > U32_MAX - 10000 || color > U32_MAX - 10000)
 		return -EINVAL;
-	/* No paired call, nor wait for one, for a display the limit leaves no pair. */
+	/*
+	 * No paired call, nor wait for one, for a display without a peer or one
+	 * the limit leaves no pair. The device lock below may be the probe's.
+	 */
 	scoped_guard(mutex, &dcp_peer_lock) {
+		if (!dcp->peer_reserved)
+			return ret;
 		limited = dcp_peer_limited_pair_locked(dcp, &prepared);
 		if (limited && !prepared)
 			return ret;

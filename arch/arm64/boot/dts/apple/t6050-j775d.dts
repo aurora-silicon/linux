@@ -440,9 +440,13 @@
 					};
 				};
 
-				/* The USB4 router (usb4_3_acio), the PD driver's thunderbolt-switch */
-				port@2 {
-					reg = <2>;
+				/*
+				 * The USB4 router (usb4_3_acio), the PD driver's
+				 * thunderbolt-switch; port@2 is reserved for DisplayPort
+				 * (apple,dcp-typec-routes.yaml).
+				 */
+				port@3 {
+					reg = <3>;
 					hpm3_tbt: endpoint {
 						remote-endpoint = <&usb4_3_ep>;
 					};
@@ -661,5 +665,37 @@
 
 #define T6050_J775D
 #include "t6050-peripherals.dtsi"
+
+/*
+ * The other three die-0 external display engines (dcpext1..3). The shared
+ * properties live in t6050-peripherals.dtsi; each empty typec-routes container
+ * asks the boot loader to write the engine's USB-C display routes from the ADT.
+ */
+&dcpext1 {
+	apple,connector-type = "USB-C";
+
+	typec-routes {
+		#address-cells = <1>;
+		#size-cells = <0>;
+	};
+};
+
+&dcpext2 {
+	apple,connector-type = "USB-C";
+
+	typec-routes {
+		#address-cells = <1>;
+		#size-cells = <0>;
+	};
+};
+
+&dcpext3 {
+	apple,connector-type = "USB-C";
+
+	typec-routes {
+		#address-cells = <1>;
+		#size-cells = <0>;
+	};
+};
 
 #include "t6050-j775d-gpu.dtsi"

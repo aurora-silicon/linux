@@ -55,8 +55,10 @@ obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += afk-service-test.o
 obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp_cec_test.o
 
 obj-$(CONFIG_DRM_APPLE_PARSER_KUNIT_TEST) += afkv2-test.o
+appledrm-$(CONFIG_DRM_APPLE_PARSER_KUNIT_TEST) += parser-bounds-test.o
 
 appledrm-$(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST) += parser-test.o
 appledrm-$(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST) += hotplug-test.o
 appledrm-$(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST) += v14-board-test.o
+appledrm-$(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST) += v14-plane-test.o
 appledrm-$(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST) += audio-no-sio-test.dtbo.o

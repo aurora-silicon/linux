@@ -222,12 +222,18 @@ struct Output {
 }
 
 impl Output {
-    fn publish(&self, result: Result<[u64; 4]>) {
+    /// `status` is the command's VM status.
+    fn publish(&self, result: Result<[u64; 4]>, status: &VmStatus) {
         match result {
-            Ok(ticks) => self.destinations.write(ticks),
-            Err(error) => self.fence.set_error(error),
+            Ok(ticks) => {
+                self.destinations.write(ticks);
+                self.fence.signal();
+            }
+            Err(error) => status.signal_failure(|| {
+                self.fence.set_error(error);
+                self.fence.signal();
+            }),
         }
-        self.fence.signal();
         self.member.complete(result.map(|_| ()));
     }
 }
@@ -276,9 +282,9 @@ impl HostOutput {
         }
     }
 
-    pub(super) fn finish(&self, result: Result<[u64; 4]>) {
+    pub(super) fn finish(&self, result: Result<[u64; 4]>, status: &VmStatus) {
         match &self.0 {
-            HostOutputKind::Immediate(output) => output.publish(result),
+            HostOutputKind::Immediate(output) => output.publish(result, status),
             HostOutputKind::Ordered(publication) => publication.finish(result),
         }
     }
@@ -585,6 +591,12 @@ impl Completion {
     pub(super) fn is_input_source(&self, source: &Arc<super::fence::Submission>) -> bool {
         self.output.output().member.is_source(source)
     }
+    pub(crate) fn note_source_published(&self, published: super::fence::PublishedSource) {
+        self.output.output().member.note_published(published);
+    }
+    pub(crate) fn clear_source_published(&self) {
+        self.output.output().member.clear_published();
+    }
     pub(super) fn set_source_ready(&self, ready: Fence) {
         self.output.output().member.set_source_ready(ready);
     }
@@ -682,6 +694,7 @@ impl Completion {
             })
             .is_ok();
         if accepted {
+            self.clear_source_published();
             self.replay_timeout.store(true, Ordering::Release);
             // Callers replay only work proven not to have started; the new
             // publication runs from the beginning and reports its own result.
@@ -700,6 +713,7 @@ impl Completion {
 
     pub(crate) fn has_firmware_consumer(&self) -> bool {
         self.firmware_consumer.load(Ordering::Acquire)
+            || self.output.output().member.has_firmware_consumer()
     }
 
     pub(crate) fn take_replay_timeout(&self) -> bool {
@@ -942,7 +956,7 @@ impl Completion {
         }
         self.release_healthy();
         self.signal_terminal(result);
-        self.output.finish(result);
+        self.output.finish(result, &self.status);
         // Feed detector and busy-run tracking are internal host heuristics: update them
         // after signalling the fence so their spinlocks stay off the wakeup critical path.
         if let (Some(feed), Ok(ticks)) = (&self.feed, &result) {
@@ -977,7 +991,7 @@ impl Completion {
         }
         self.release_healthy();
         self.signal_terminal(Err(error));
-        self.output.finish(Err(error));
+        self.output.finish(Err(error), &self.status);
     }
 
     /// The physical queue must already be quarantined. Keep mappings pinned while
@@ -998,7 +1012,7 @@ impl Completion {
             self.report(error);
         }
         self.signal_terminal(Err(error));
-        self.output.finish(Err(error));
+        self.output.finish(Err(error), &self.status);
     }
 }
 
