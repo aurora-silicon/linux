@@ -122,6 +122,12 @@ static size_t seg_bytes(size_t w,size_t h){return ALIGN(ALIGN(w,128)*ALIGN(h,128
 static struct avd_dev fixture_dev;
 static struct avd_av1_stream fixture_stream;
 static void set_frame_ctx(struct avd_ctx *ctx){ctx->dev=&fixture_dev;((struct avd_av1_ctx *)ctx->priv)->stream=&fixture_stream;ctx->decoded_fmt.fmt.pix_mp.width=1920;ctx->decoded_fmt.fmt.pix_mp.height=1080;controls[0].p_cur.p=&sequence;controls[1].p_cur.p=&frame;controls[2].p_cur.p=&tile;controls[3].p_cur.p=&grain;}
+/* One tile of width_sbs x height_sbs 64x64 superblocks, and its tile-group entry. */
+static void one_tile(unsigned int width_sbs,unsigned int height_sbs){
+ frame.tile_info.tile_cols=frame.tile_info.tile_rows=1;
+ frame.tile_info.width_in_sbs_minus_1[0]=width_sbs-1;frame.tile_info.height_in_sbs_minus_1[0]=height_sbs-1;
+ controls[2].elems=1;controls[2].elem_size=sizeof(tile);
+}
 static void read_exact(const char *path,void *data,size_t n){FILE *f=fopen(path,"rb");assert(f);assert(fread(data,1,n,f)==n);assert(fgetc(f)==EOF);assert(fclose(f)==0);}
 static void inheritance(unsigned int residue,unsigned int mode,const char *neighbors,bool check_addresses){
  const size_t ref_len=6964992+residue,dst_len=7000064+(residue?((residue+79)%256):0);
@@ -135,7 +141,7 @@ static void inheritance(unsigned int residue,unsigned int mode,const char *neigh
  avd_av1_default_coeff_probs(47,&expected);avd_av1_set_default_cdfs(&expected);
  if(neighbors){unsigned char observation[9728];read_exact(neighbors,observation,sizeof(observation));assert(residue==64);memcpy(src.base.vb.vb2_buf.memory+6817344,observation,sizeof(observation));memcpy(&expected,observation+192,sizeof(expected));}
  else {expected.intra_inter_cdf[0]^=37;expected.coeff_base_cdf[0][0][0][0]^=59;memcpy(src.base.vb.vb2_buf.memory+ref_offset,&expected,sizeof(expected));}
- memset(&frame,0,sizeof(frame));frame.frame_width_minus_1=1919;frame.upscaled_width=1920;frame.frame_height_minus_1=1079;frame.quantization.base_q_idx=47;
+ memset(&frame,0,sizeof(frame));frame.frame_width_minus_1=1919;frame.upscaled_width=1920;frame.frame_height_minus_1=1079;frame.quantization.base_q_idx=47;one_tile(30,17);
  frame.frame_type=V4L2_AV1_INTER_FRAME;frame.primary_ref_frame=0;frame.ref_frame_idx[0]=0;frame.reference_frame_ts[0]=1000;
  if(mode){frame.frame_type=mode==1?V4L2_AV1_KEY_FRAME:mode==2?V4L2_AV1_INTRA_ONLY_FRAME:V4L2_AV1_INTER_FRAME;if(mode==3)frame.flags=V4L2_AV1_FRAME_FLAG_ERROR_RESILIENT_MODE;if(mode==4)frame.primary_ref_frame=7;memset(&expected,0,sizeof(expected));avd_av1_default_coeff_probs(47,&expected);avd_av1_set_default_cdfs(&expected);}
  controls[0].p_cur.p=&sequence;controls[1].p_cur.p=&frame;controls[2].p_cur.p=&tile;controls[3].p_cur.p=&grain;
@@ -165,6 +171,15 @@ static int preamble(unsigned int w,unsigned int h,unsigned char primary,signed c
  struct avd_decoded_buffer dst={0};struct avd_av1_ctx av1={0};struct avd_ctx ctx={.priv=&av1};struct avd_av1_run run={0};set_frame_ctx(&ctx);
  dst.base.vb.vb2_buf.planes[0].length=7000064;memset(&frame,0,sizeof(frame));
  frame.frame_width_minus_1=w-1;frame.upscaled_width=w;frame.frame_height_minus_1=h-1;frame.primary_ref_frame=primary;if(primary<7)frame.ref_frame_idx[primary]=idx;
+ one_tile(w==1280?20:30,h==720?12:17);
+ run.base.bufs.dst=&dst.base.vb;run.base.y_out=0x120000000UL;return avd_av1_run_preamble(&ctx,&run);
+}
+/* 1080p is 30x17 superblocks of 64: one tile must cover exactly that, and be the CDF tile. */
+static int tiles(unsigned int width_sbs,unsigned int height_sbs,unsigned char context){
+ struct avd_decoded_buffer dst={0};struct avd_av1_ctx av1={0};struct avd_ctx ctx={.priv=&av1};struct avd_av1_run run={0};set_frame_ctx(&ctx);
+ dst.base.vb.vb2_buf.planes[0].length=7000064;memset(&frame,0,sizeof(frame));
+ frame.frame_width_minus_1=1919;frame.upscaled_width=1920;frame.frame_height_minus_1=1079;frame.primary_ref_frame=7;
+ one_tile(width_sbs,height_sbs);frame.tile_info.context_update_tile_id=context;
  run.base.bufs.dst=&dst.base.vb;run.base.y_out=0x120000000UL;return avd_av1_run_preamble(&ctx,&run);
 }
 static void guards(void){
@@ -176,6 +191,11 @@ static void guards(void){
  sequence.seq_profile=1;assert(preamble(1920,1080,0,0)==-EINVAL);sequence.seq_profile=0;
  sequence.flags&=~V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_Y;assert(preamble(1920,1080,0,0)==-EINVAL);sequence.flags|=V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_Y;
  assert(preamble(1920,1080,0,0)==0);
+ assert(tiles(30,17,0)==0);
+ assert(tiles(4096,4096,0)==-EINVAL);assert(tiles(31,17,0)==-EINVAL);assert(tiles(30,18,0)==-EINVAL);
+ assert(tiles(29,17,0)==-EINVAL);assert(tiles(30,16,0)==-EINVAL);assert(tiles(0,17,0)==-EINVAL);
+ assert(tiles(30,17,1)==-EINVAL);
+ frame.tile_info.tile_cols=0;assert(avd_av1_check_tile_info(NULL,&sequence,&frame)==-EINVAL);
 }
 /* Segmentation map kept with each frame: expect 0 zeroes it, 1 copies the reference's, 2 leaves the AVD's map. */
 static void segmap(unsigned char flags,unsigned char primary,unsigned int ref_w,unsigned int ref_h,bool missing,int expect){
@@ -188,7 +208,7 @@ static void segmap(unsigned char flags,unsigned char primary,unsigned int ref_w,
  memset(dst.base.vb.vb2_buf.memory,0xa5,len);memset(src.base.vb.vb2_buf.memory,0x3c,ref_len);
  for(size_t i=0;i<ref_seg;i++)src.base.vb.vb2_buf.memory[roff+i]=(unsigned char)(i*7+1);
  reference=missing?&dst:&src;av1.bufs.no_prev_seg.addr=none;
- memset(&frame,0,sizeof(frame));frame.frame_width_minus_1=1919;frame.upscaled_width=1920;frame.frame_height_minus_1=1079;frame.frame_type=V4L2_AV1_INTER_FRAME;
+ memset(&frame,0,sizeof(frame));frame.frame_width_minus_1=1919;frame.upscaled_width=1920;frame.frame_height_minus_1=1079;frame.frame_type=V4L2_AV1_INTER_FRAME;one_tile(30,17);
  frame.primary_ref_frame=primary;frame.ref_frame_idx[0]=0;frame.reference_frame_ts[0]=1000;frame.segmentation.flags=flags;
  run.base.bufs.dst=&dst.base.vb;run.base.y_out=dst.base.vb.vb2_buf.dma;
  assert(avd_av1_run_preamble(&ctx,&run)==0);assert(run.addresses.seg==run.base.y_out+off);
@@ -235,14 +255,14 @@ def main():
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--neighbors', type=Path)
     parser.add_argument('--case', choices=['all', 'snapshot', 'snapshot-copy', 'copy', 'seed', 'aligned'], default='all')
-    parser.add_argument('--mutation', choices=['round-up', 'cpu-unaligned', 'seg-cpu-unaligned', 'seg-any-size', 'ref-index-upper', 'frame-width-unchecked'])
+    parser.add_argument('--mutation', choices=['round-up', 'cpu-unaligned', 'seg-cpu-unaligned', 'seg-any-size', 'ref-index-upper', 'frame-width-unchecked', 'tile-info-unchecked', 'tile-end-unchecked'])
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     paths = {name: args.source / DRIVER / name for name in ['avd-av1.c', 'avd-av1-entropymode.h', 'avd-av1-entropymode.c', 'avd.h']}
     text = {name: p.read_text() for name, p in paths.items()}
     src = text['avd-av1.c']
     macros = src[src.index('#define AVD_CDFS_SIZE'):src.index('struct avd_av1_run {')]
-    functions = {n: function(src, n) for n in ['avd_av1_ref_ts', 'avd_av1_set_prob', 'avd_av1_set_seg', 'avd_av1_seg_size', 'avd_color_size', 'avd_av1_check_tiles', 'avd_av1_copy_tile_group', 'avd_av1_seq_image_fmt', 'avd_av1_validate_sequence', 'avd_av1_check_frame_size', 'avd_av1_run_preamble', 'avd_av1_adjust_decoded_fmt']}
+    functions = {n: function(src, n) for n in ['avd_av1_ref_ts', 'avd_av1_set_prob', 'avd_av1_set_seg', 'avd_av1_seg_size', 'avd_color_size', 'avd_av1_check_tiles', 'avd_av1_check_tile_dim', 'avd_av1_check_tile_info', 'avd_av1_copy_tile_group', 'avd_av1_seq_image_fmt', 'avd_av1_validate_sequence', 'avd_av1_check_frame_size', 'avd_av1_run_preamble', 'avd_av1_adjust_decoded_fmt']}
     unaligned = ('\n#define UNALIGNED_CDFS_OFFSET(dst,cl) ((dst)-ALIGN(cl,AVD_ALIGN)-ALIGN(AVD_CDFS_SIZE,AVD_ALIGN))\n'
                  '#define UNALIGNED_SEG_OFFSET(dst,cl,sl) (UNALIGNED_CDFS_OFFSET(dst,cl)-(sl))\n')
     # Each mutation names the extracted text it rewrites; a stale one is refused, never run as a no-op.
@@ -254,6 +274,8 @@ def main():
         'ref-index-upper': ('avd_av1_run_preamble', 'idx < 0 || idx >= V4L2_AV1_TOTAL_REFS_PER_FRAME', 'idx < 0'),
         # The upscaled width bound also covers the frame width, so drop the frame size check as a whole.
         'frame-width-unchecked': ('avd_av1_check_frame_size', 'frame->frame_width_minus_1 >= width ||\n\t    frame->frame_height_minus_1 >= height', '0'),
+        'tile-info-unchecked': ('avd_av1_run_preamble', 'ret = avd_av1_check_tile_info(ctx->dev->dev, run->seq, run->frame);', 'ret = 0;'),
+        'tile-end-unchecked': ('avd_av1_check_tile_dim', 'return start == sbs ? 0 : -EINVAL;', 'return 0;'),
     }
     if args.mutation:
         target, old, new = mutations[args.mutation]

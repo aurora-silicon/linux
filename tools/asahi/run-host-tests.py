@@ -160,7 +160,8 @@ ASAHI_TESTS = {
     'avd-av1-tail-tests.py': [(out(), PASS)]
         + [(out() + ['--case', c], PASS) for c in ('copy', 'seed', 'aligned')]
         + mutations('--mutation', ('round-up', 'cpu-unaligned', 'seg-cpu-unaligned',
-                                   'seg-any-size', 'ref-index-upper', 'frame-width-unchecked'), out()),
+                                   'seg-any-size', 'ref-index-upper', 'frame-width-unchecked',
+                                   'tile-info-unchecked', 'tile-end-unchecked'), out()),
     'avd-codec-tail-tests.py': [(out('--output'), PASS), (out('--output') + ['--mutations'], PASS)],
     'bcm4377-completion-tests.py': [([], PASS)],
     # The old revision is the one before the J493 hardware-table ID match.
