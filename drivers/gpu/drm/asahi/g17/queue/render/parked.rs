@@ -216,12 +216,7 @@ impl ParkedPair {
             return Err(EINVAL);
         }
         alloc.uat.vm_context_mask(context.vm())?;
-        let layout = super::m5_render_submission::layout(
-            &first.command,
-            self.clusters,
-            self.variant.programs,
-            self.board,
-        )?;
+        let layout = super::m5_render_submission::carried(&first.command)?;
         let aliases = [
             kicks[0].prepare_client_alias(context.vm())?,
             kicks[1].prepare_client_alias(context.vm())?,

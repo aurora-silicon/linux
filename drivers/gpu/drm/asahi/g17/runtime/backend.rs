@@ -224,7 +224,17 @@ impl job::Backend for Backend {
 
     fn prepare_command(&self, command: &mut crate::g17::command::Validated) -> Result {
         use crate::g17::command::Validated;
-        let Some(policy) = self.shared.render_policy else { return Ok(()) };
+        let Some(policy) = self.shared.render_policy else {
+            if matches!(command, Validated::Render { .. }) {
+                let derived = crate::g17::queue::render::m5_render_submission::layout(
+                    command, self.shared.clusters, self.shared.variant.programs,
+                    self.shared.m5_board)?;
+                if let Validated::Render { layout, .. } = command {
+                    *layout = Some(derived);
+                }
+            }
+            return Ok(());
+        };
         let priority = self.context.policy().priority();
         match command {
             Validated::Render { resources, plan, .. } => {
@@ -232,12 +242,13 @@ impl job::Backend for Backend {
                 *plan = Some(policy.plan(programs, priority)?);
                 // The M5 target layout refuses the passes the M5 path cannot run. Derive it
                 // here, so that SUBMIT returns the refusal before anything is queued, and keep
-                // the window its pairs reserve for choosing their count (`render_pairs`).
-                let (_, window) =
+                // both the layout and the window its pairs reserve (`render_pairs`).
+                let (derived, window) =
                     crate::g17::queue::render::m5_render_submission::layout_and_window(
                         command, self.shared.clusters, self.shared.variant.programs,
                         self.shared.m5_board)?;
-                if let Validated::Render { pair_window, .. } = command {
+                if let Validated::Render { layout, pair_window, .. } = command {
+                    *layout = Some(derived);
                     *pair_window = window;
                 }
             }

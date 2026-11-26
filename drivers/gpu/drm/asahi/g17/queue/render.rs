@@ -15,7 +15,7 @@ pub(crate) mod retirement;
 mod warm;
 
 use crate::g17::{
-    buffer::{self, target},
+    buffer,
     command::Validated,
     completion::Deferred,
     context::Context,
@@ -351,8 +351,7 @@ impl Pair {
         if word == u32::MAX {
             return Err(EINVAL);
         }
-        let layout =
-            m5_render_submission::layout(&first.command, clusters, variant.programs, board)?;
+        let layout = m5_render_submission::carried(&first.command)?;
         let storage = KBox::<Self>::new_uninit(GFP_KERNEL)?;
         let (tiling, ta_alias) = kick::Queue::render(alloc, ids[0], context.vm(), rings)?;
         let (fragment, fragment_alias) = kick::Queue::render(alloc, ids[1], context.vm(), rings)?;
@@ -543,9 +542,7 @@ impl Pair {
         let work = packet.completion.work_state()?;
         let node = work.node_va()?;
         let word = work.word();
-        let layout =
-            m5_render_submission::layout(&packet.command, self.clusters, self.variant.programs,
-                self.board)?;
+        let layout = m5_render_submission::carried(&packet.command)?;
         let deflake_layout = self.deflake;
         let owners = self.memory.owners();
         self.memory
@@ -1636,7 +1633,7 @@ impl Pair {
             if let Validated::Render { pass, .. } = &active.packet.command {
                 pr_warn!("G17: recovery render geometry ordinal={} width={} height={} layers={} layout={:?}\n",
                     active.ticket.ordinal, pass.width, pass.height, pass.layers,
-                    target::Layout::new(pass, self.clusters, self.variant.programs));
+                    m5_render_submission::carried(&active.packet.command));
             }
             pr_warn!(
                 "G17: recovery render ordinal={} published={} ctx={} seq={} snapshot={:?}\n",
@@ -1840,10 +1837,7 @@ impl Pair {
     /// firmware grow request does (`buffer::Manager::busy_target`), and otherwise
     /// keeps its current capacity and lets firmware request growth as needed.
     pub(crate) fn host_growth_target(&mut self, packet: &Packet) -> Result<Option<HostGrowth>> {
-        let mut required =
-            m5_render_submission::layout(&packet.command, self.clusters, self.variant.programs,
-                self.board)?
-                .tvb_blocks;
+        let mut required = m5_render_submission::carried(&packet.command)?.tvb_blocks;
         // A mesh workgroup whose output is in flight when the tiler heap runs out loses part of
         // it, whether the firmware then grows the heap or partial-renders, and the tile-count
         // estimate does not see mesh output. Size the heap of a render with mesh shading ahead
@@ -3304,9 +3298,7 @@ impl Pair {
             let metrics = metrics.ok_or(EINVAL)?;
             let buffer_id = buffer_id.ok_or(EINVAL)?;
             let pm_generation = pm_generation.ok_or(EINVAL)?;
-            let layout =
-                m5_render_submission::layout(&first.command, self.clusters, self.variant.programs,
-                    self.board)?;
+            let layout = m5_render_submission::carried(&first.command)?;
             // A context of another VM gets the rings cleared before its VM is given its view,
             // so it cannot read the entries earlier owners' commands left, as for a parked pair.
             // The pair is bindable, hence idle: the firmware consumed every entry.

@@ -125,6 +125,15 @@ pub(crate) fn parameter_geometry(blocks: usize) -> Result<crate::g17::buffer::Bl
     crate::g17::buffer::BlockGeometry::m5(ram, initial as u64)
 }
 
+/// The target layout SUBMIT derived and carried in the command ([`layout`] of its pass, plan
+/// and the device's cluster count and register programs).
+pub(crate) fn carried(command: &Validated) -> Result<target::Layout> {
+    match command {
+        Validated::Render { layout: Some(layout), .. } => Ok(*layout),
+        _ => Err(EINVAL),
+    }
+}
+
 /// The target layout of a render: G17P's for a command without an M5 plan. `board` is the M5
 /// board, which an M5 plan needs.
 pub(crate) fn layout(command: &Validated, clusters: u32, programs: RegisterPrograms,

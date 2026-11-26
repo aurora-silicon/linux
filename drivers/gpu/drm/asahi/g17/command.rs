@@ -488,6 +488,9 @@ pub(crate) enum Validated {
         ray_query: [RayQueryStage; 2],
         resources: Option<Arc<Programs>>,
         plan: Option<super::render_resources::Plan>,
+        /// The target layout, derived once at SUBMIT from the pass, the plan and the device's
+        /// cluster count and register programs (the inputs every later user has).
+        layout: Option<super::buffer::target::Layout>,
         /// Bytes of the client's M5 compact window that each render pair built for this render
         /// reserves, from the layout SUBMIT derives with the plan (`None` without an M5 plan).
         pair_window: Option<usize>,
@@ -772,6 +775,7 @@ impl Payload {
                     ray_query: *ray_query,
                     resources: resources.clone(),
                     plan: None,
+                    layout: None,
                     pair_window: None,
                     attachments: *attachments,
                     timestamps: [cmd.ts_vtx, cmd.ts_frag],
