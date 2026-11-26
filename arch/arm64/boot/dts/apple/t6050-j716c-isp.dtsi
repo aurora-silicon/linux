@@ -136,7 +136,6 @@
 
 &ps_isp_sys {
 	apple,no-auto-pm;
-	apple,always-on;
 	status = "okay";
 };
 
