@@ -39,6 +39,7 @@
 #include <linux/random.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/rtkit.h>
+#include <linux/soc/apple/pmc.h>
 #include <linux/soc/apple/pmp-report.h>
 #include <linux/soc/apple/sleep.h>
 #include <linux/soc/apple/t8132.h>
@@ -9895,6 +9896,108 @@ static void dcp_s2r_hdmi_irq_enable(struct apple_dcp *dcp)
 	}
 }
 
+static bool dcp_pmc_interface_configured(struct device *dev)
+{
+	struct device_node *seen[5];
+	struct device_node *cur, *next = NULL;
+	const struct property *prop;
+	int depth, len, seen_nr = 0;
+	bool configured = false;
+
+	if (!dev->of_node)
+		return false;
+	if (of_property_present(dev->of_node, "apple,pmc-interface"))
+		return true;
+
+	cur = of_node_get(dev->of_node);
+	for (depth = 0; cur; depth++) {
+		struct of_phandle_iterator it;
+		bool on_pmgr = depth > 0;
+		int j, rc;
+
+		if (depth > 4) {
+			configured = true;
+			goto out;
+		}
+		for (j = 0; j < seen_nr; j++) {
+			if (seen[j] == cur) {
+				configured = true;
+				goto out;
+			}
+		}
+		seen[seen_nr++] = cur;
+		cur = NULL;
+		next = NULL;
+
+		prop = of_find_property(seen[depth], "power-domains", &len);
+		if (prop && (!len || (len % sizeof(__be32)))) {
+			configured = true;
+			goto out;
+		}
+		of_for_each_phandle(&it, rc, seen[depth], "power-domains",
+				    "#power-domain-cells", -1) {
+			if (!it.node)
+				continue;
+			if (on_pmgr &&
+			    (of_property_present(it.node, "apple,bwr-bit") ||
+			     of_property_present(it.node, "apple,boost-bit"))) {
+				of_node_put(it.node);
+				configured = true;
+				goto out;
+			}
+			if ((of_device_is_compatible(it.node, "apple,pmgr-pwrstate") ||
+			     of_device_is_compatible(it.node, "apple,t8103-pmgr-pwrstate")) &&
+			    of_property_read_bool(it.node, "apple,firmware-owned") &&
+			    of_property_read_bool(it.node, "apple,consumer-switched")) {
+				if (next) {
+					of_node_put(it.node);
+					configured = true;
+					goto out;
+				}
+				next = of_node_get(it.node);
+			}
+		}
+		if (rc != -ENOENT) {
+			configured = true;
+			goto out;
+		}
+		cur = next;
+		next = NULL;
+	}
+
+out:
+	of_node_put(cur);
+	of_node_put(next);
+	while (seen_nr--)
+		of_node_put(seen[seen_nr]);
+	return configured;
+}
+
+static bool dcp_pmc_interface_absent(struct device *dev, int ret)
+{
+	return ret == -ENODEV ||
+	       (ret == -EOPNOTSUPP && !dcp_pmc_interface_configured(dev));
+}
+
+/*
+ * Check PMC interface availability before stopping firmware on paths that may
+ * need dcp_s2r_domains_off() to power-cycle and recover after a refused sleep
+ * or DPMS blank.
+ */
+static int dcp_s2r_pmc_preflight(struct apple_dcp *dcp)
+{
+	int ret;
+
+	if (dcp->s2r_pmc_off)
+		return 0;
+	ret = apple_pmc_interface_consumer_check(dcp->dev);
+	if (ret && !dcp_pmc_interface_absent(dcp->dev, ret)) {
+		dev_err(dcp->dev, "PMC interface preflight failed: %d\n", ret);
+		return ret;
+	}
+	return 0;
+}
+
 static int dcp_s2r_ext_suspend(struct apple_dcp *dcp)
 {
 	int ret;
@@ -9929,6 +10032,10 @@ static int dcp_s2r_ext_suspend(struct apple_dcp *dcp)
 	}
 	if (READ_ONCE(dcp->crashed) || IS_ERR_OR_NULL(dcp->rtk))
 		return -EBUSY;
+
+	ret = dcp_s2r_pmc_preflight(dcp);
+	if (ret)
+		return ret;
 
 	if (READ_ONCE(dcp->active_typec_route) || READ_ONCE(dcp->typec_cable_connected))
 		dev_dbg(dcp->dev, "a display is attached: released for the sleep, connected again after it\n");
@@ -10027,6 +10134,10 @@ static int dcp_s2r_suspend(struct apple_dcp *dcp)
 	if (READ_ONCE(dcp->crashed) || IS_ERR_OR_NULL(dcp->rtk))
 		return -EBUSY;
 
+	ret = dcp_s2r_pmc_preflight(dcp);
+	if (ret)
+		return ret;
+
 	dcp_s2r_answer_secure_port(dcp);
 
 	dcp_drain_for_sleep(dcp);
@@ -10094,13 +10205,23 @@ static int dcp_s2r_domains_off(struct apple_dcp *dcp)
 {
 	const struct dcp_s2r_layout *l = dcp_s2r_layout(dcp);
 	void __iomem *ps, *pwrgate, *pmc;
+	bool pmc_present = false, lower_sys = true;
 	u32 val;
 	int ret;
 
-	dcp->s2r_domains_up = false;
 	ret = dcp_s2r_map_power(dcp, &ps, &pwrgate, &pmc);
 	if (ret)
 		goto out;
+
+	if (!dcp->s2r_pmc_off) {
+		ret = apple_pmc_interface_consumer_check(dcp->dev);
+		if (ret && !dcp_pmc_interface_absent(dcp->dev, ret)) {
+			dev_err(dcp->dev, "PMC interface check failed: %d\n", ret);
+			goto out;
+		}
+		pmc_present = !ret;
+	}
+	dcp->s2r_domains_up = false;
 
 	/*
 	 * The display DART goes off with these domains, and every framebuffer is mapped
@@ -10122,8 +10243,47 @@ static int dcp_s2r_domains_off(struct apple_dcp *dcp)
 	}
 	dcp_s2r_ps_lower(ps + l->disp_cpu);
 	dcp_s2r_ps_lower(ps + l->disp_fe);
+	if (pmc_present) {
+		int pmc_ret;
+
+		ret = readl_poll_timeout(ps + l->disp_fe, val,
+					 !FIELD_GET(GENMASK(7, 4), val), 100, 50000);
+		if (ret) {
+			dev_err(dcp->dev, "DISP_FE did not power off: %#x\n", val);
+			goto out;
+		}
+		pmc_ret = apple_pmc_interface_consumer_off(dcp->dev);
+		if (!pmc_ret) {
+			dcp->s2r_pmc_off = true;
+		} else {
+			/*
+			 * CPU and FE are already lowered. If PMC rolled back to on
+			 * (or restores cleanly), keep DISP_SYS and PMC on so the
+			 * CPU still finishes its power cycle and can restart safely.
+			 */
+			int chk = apple_pmc_interface_consumer_check(dcp->dev);
+
+			if (chk == -EALREADY) {
+				dcp->s2r_pmc_off = true;
+				chk = apple_pmc_interface_consumer_on(dcp->dev);
+				if (!chk)
+					dcp->s2r_pmc_off = false;
+			}
+			if (chk) {
+				dev_err(dcp->dev,
+					"PMC interface off failed (%d) and state check failed (%d)\n",
+					pmc_ret, chk);
+				ret = pmc_ret;
+				goto out;
+			}
+			dev_warn(dcp->dev,
+				 "PMC interface off failed (%d); keeping DISP_SYS and PMC on\n",
+				 pmc_ret);
+			lower_sys = false;
+		}
+	}
 	/* A layout without a system word has 0 there, a different domain's word. */
-	if (l->disp_sys)
+	if (l->disp_sys && lower_sys)
 		dcp_s2r_ps_lower(ps + l->disp_sys);
 
 	ret = readl_poll_timeout(ps + l->disp_cpu, val, !FIELD_GET(GENMASK(7, 4), val), 100,
@@ -10163,6 +10323,23 @@ static int dcp_s2r_domains_on(struct apple_dcp *dcp)
 		val = readl(ps + l->disp_sys) & ~(GENMASK(9, 8) | GENMASK(3, 0) | BIT(28));
 		writel(val | 0xf, ps + l->disp_sys);
 		writel(val | 0xf | BIT(28), ps + l->disp_sys);
+		if (dcp->s2r_pmc_off) {
+			ret = readl_poll_timeout(ps + l->disp_sys, val,
+						 FIELD_GET(GENMASK(7, 4), val) == 0xf,
+						 100, 50000);
+			if (ret) {
+				dev_err(dcp->dev, "DISP_SYS did not power on: %#x\n", val);
+				goto out;
+			}
+		}
+	}
+	if (dcp->s2r_pmc_off) {
+		ret = apple_pmc_interface_consumer_on(dcp->dev);
+		if (ret) {
+			dev_err(dcp->dev, "PMC interface on failed: %d\n", ret);
+			goto out;
+		}
+		dcp->s2r_pmc_off = false;
 	}
 	val = readl(ps + l->disp_fe) & ~(GENMASK(9, 8) | GENMASK(3, 0));
 	writel(val | 0xf, ps + l->disp_fe);

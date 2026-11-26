@@ -991,6 +991,8 @@ struct apple_dcp {
 	struct notifier_block s2r_pm_nb;
 	/* This driver raised the display domains, and nothing has lowered them since. */
 	bool s2r_domains_up;
+	/* This driver cleared the pipe's PMC interface enables in dcp_s2r_domains_off(). */
+	bool s2r_pmc_off;
 	/* Firmware started by the resume, panel still dark: DPMS on lights it. */
 	bool s2r_prewarmed;
 	struct work_struct s2r_prewarm_work;
