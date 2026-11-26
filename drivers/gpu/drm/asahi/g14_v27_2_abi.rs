@@ -146,6 +146,51 @@ pub(crate) const fn new_round(previous: Option<u64>, generation: u64) -> bool {
     }
 }
 
+/// Tells a fault or timeout report on the event ring that needs a recovery from one whose round
+/// the host already answered.
+///
+/// The firmware posts the report, then opens the round (phase 1). The host can answer a round
+/// before it reads its report: a further round opened while stopped work drains, or a round
+/// found at a command timeout. That report is then still in the ring, and the next service pass
+/// reads it after the firmware is back at phase 0. It must be consumed, not answered with a
+/// wait for a phase 1 that never comes, which would fail all work.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RecoveryLedger {
+    /// Service passes that read fault or timeout records. One pass counts once, so a fault and
+    /// a timeout posted for the same stop are one report.
+    reports: u64,
+    /// Rounds the host answered.
+    answered: u64,
+    /// Generation of the last round answered.
+    last: Option<u64>,
+}
+
+impl RecoveryLedger {
+    /// A service pass read fault or timeout records.
+    pub(crate) fn report(&mut self) {
+        self.reports = self.reports.saturating_add(1);
+    }
+
+    /// The host answered round `generation` (wrote phase 0).
+    pub(crate) fn answered(&mut self, generation: u64) {
+        self.answered = self.answered.saturating_add(1);
+        self.last = Some(generation);
+    }
+
+    /// Generation of the last round answered: a round at phase 1 must carry another one
+    /// (`new_round`).
+    pub(crate) const fn last(&self) -> Option<u64> {
+        self.last
+    }
+
+    /// With no new round open after a report: whether every report read so far has a round the
+    /// host already answered. Then the report is stale and is consumed. Otherwise the firmware
+    /// reported a stop without entering recovery.
+    pub(crate) const fn report_answered(&self) -> bool {
+        self.reports <= self.answered
+    }
+}
+
 /// Packets with stopped work one boot may keep (`Runtime::keep`). A kept packet pins its VM,
 /// and with it one user UAT context, and a render one also pins its scene. The limit is half
 /// the user contexts, so innocent clients keep the rest.
@@ -489,6 +534,46 @@ mod tests {
         assert!(new_round(Some(1), 2));
         assert!(!new_round(Some(2), 2));
         assert!(new_round(Some(u64::MAX), 0));
+    }
+
+    #[test]
+    fn a_report_read_before_its_round_is_answered_once() {
+        // Report, then its round: balanced, nothing left over.
+        let mut ledger = RecoveryLedger::default();
+        ledger.report();
+        ledger.answered(7);
+        assert!(ledger.report_answered());
+        assert_eq!(ledger.last(), Some(7));
+        // A later report with no round open is a stop without recovery: not consumed.
+        ledger.report();
+        assert!(!ledger.report_answered());
+    }
+
+    #[test]
+    fn a_stale_report_after_a_drain_round_is_consumed() {
+        // Round 7 from its report; round 8 opened while 7's work drained, answered before its
+        // report was read. Round 8's report then comes on the next pass, at phase 0.
+        let mut ledger = RecoveryLedger::default();
+        ledger.report();
+        ledger.answered(7);
+        ledger.answered(8);
+        ledger.report();
+        assert!(ledger.report_answered());
+        // Round 8 is answered: phase 1 with generation 8 again is not a new round.
+        assert!(!new_round(ledger.last(), 8));
+        assert!(new_round(ledger.last(), 9));
+        // Its credit is spent: a further report without a round is not stale.
+        ledger.report();
+        assert!(!ledger.report_answered());
+    }
+
+    #[test]
+    fn a_stale_report_after_a_timeout_round_is_consumed() {
+        // The command timeout found phase 1 and answered round 3 before the event was read.
+        let mut ledger = RecoveryLedger::default();
+        ledger.answered(3);
+        ledger.report();
+        assert!(ledger.report_answered());
     }
 
     #[test]

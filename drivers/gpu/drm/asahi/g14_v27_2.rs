@@ -607,6 +607,8 @@ struct State {
     /// Recovery-storm window (`recovery_logic::admit`): its start and the recoveries in it.
     recovery_window: u64,
     recovery_count: u32,
+    /// Reports read and rounds answered: tells a stale report from a new one.
+    ledger: g14_v27_2_abi::RecoveryLedger,
     /// Packets with a command the firmware stopped (`blame`), with their VM job guard, kept
     /// for the rest of the boot: the firmware may still reach that memory. Allocated with
     /// `g14_v27_2_abi::QUARANTINE_LIMIT` places at start, so keeping one never allocates.
@@ -1061,8 +1063,9 @@ impl Runtime {
                 // The firmware stopped it and halted, but its event was not seen. Recovery
                 // marks it and waits until it left both queues: retire it now, so its fence
                 // is signalled and the queue behind it runs without waiting for another message.
-                self.recover(state, ETIMEDOUT, -1)?;
-                return self.retire_render(state);
+                if self.recover(state, ETIMEDOUT, -1)? {
+                    return self.retire_render(state);
+                }
             }
             state.root.log_timeout(&self.dev);
             state.fault.log(&self.dev);
@@ -1193,11 +1196,13 @@ impl Runtime {
     /// stopped tiler, answers 2, waits for 3 with the same generation and answers 0. The stopped
     /// work then leaves its queue and fails only its own packet and VM; the next recoveries
     /// while it drains are answered the same way, a bounded number of times. Errors here fail
-    /// all work (the runtime is not trusted).
-    fn recover(&self, state: &mut State, error: Error, slot: i32) -> Result {
+    /// all work (the runtime is not trusted). Ok(false) if the firmware opened no round within
+    /// PHASE1_WAIT_MS: the caller decides whether its report was stale.
+    fn recover(&self, state: &mut State, error: Error, slot: i32) -> Result<bool> {
         state.root.log_timeout(&self.dev);
         let mut rounds = 0;
-        let mut previous = None;
+        // A round the host already answered must not be answered again.
+        let mut previous = state.ledger.last();
         let began = Instant::<Monotonic>::now();
         loop {
             // The state lock is held throughout: keep the whole recovery, including a last round
@@ -1207,9 +1212,9 @@ impl Runtime {
                 return Err(ETIMEDOUT);
             }
             if self.wait_recovery(state, false, 0, PHASE1_WAIT_MS)?.is_none() {
-                dev_err!(self.dev, "GPU: firmware reported {:?} (slot {}) but did not enter recovery\n",
-                         error, slot);
-                return Err(ETIMEDOUT);
+                // A further round starts at a phase 1 the drain saw: it cannot go missing.
+                if rounds > 0 { return Err(EPROTO); }
+                return Ok(false);
             }
             let now = <Monotonic as kernel::time::ClockSource>::ktime_get() as u64;
             if !recovery_logic::admit(now, &mut state.recovery_window, &mut state.recovery_count) {
@@ -1279,6 +1284,7 @@ impl Runtime {
                 return Err(ETIMEDOUT);
             }
             state.root.answer_recovery(0)?;
+            state.ledger.answered(generation);
             dev_err!(self.dev, "GPU: recovery {} answered in {} ms ({} snapshot entries)\n",
                      generation, start.elapsed().as_millis(), entries);
             let start = Instant::<Monotonic>::now();
@@ -1292,7 +1298,7 @@ impl Runtime {
                     dev_err!(self.dev,
                              "GPU: recovered ({} so far): stopped work left the queue after {} ms\n",
                              state.recoveries, start.elapsed().as_millis());
-                    return Ok(());
+                    return Ok(true);
                 }
                 if state.peer.is_crashed() { return Err(EIO); }
                 // Phase 0 = still draining; 1 = a new recovery (a new generation is checked
@@ -1342,6 +1348,8 @@ impl Runtime {
     }
 
     fn process_events(&self, state: &mut State) -> Result {
+        // A fault and a timeout read in one pass are one report (`RecoveryLedger`).
+        let mut reported = false;
         // Limit one pass to the ring capacity. Further arrivals notify the worker again.
         for _ in 0..256 {
             let Some((cursor, event)) = state.root.peek_event()? else { break; };
@@ -1373,11 +1381,13 @@ impl Runtime {
                 FirmwareEvent::Timeout { slot } => {
                     dev_err!(self.dev, "GPU firmware timed out a command (slot {})\n", slot);
                     state.firmware_error.get_or_insert((ETIMEDOUT, slot));
+                    if !core::mem::replace(&mut reported, true) { state.ledger.report(); }
                 }
                 FirmwareEvent::Fault => {
                     dev_err!(self.dev, "GPU firmware reported a GPU fault\n");
                     state.fault.log(&self.dev);
                     state.firmware_error.get_or_insert((EIO, -1));
+                    if !core::mem::replace(&mut reported, true) { state.ledger.report(); }
                 }
                 FirmwareEvent::Grow(_) | FirmwareEvent::Notification => {}
             }
@@ -1402,10 +1412,25 @@ impl Runtime {
             return;
         }
         if let Some((error, slot)) = state.firmware_error.take() {
-            if let Err(err) = self.recover(state, error, slot) {
-                dev_err!(self.dev, "GPU: recovery failed ({:?}); failing all work\n", err);
-                self.fail_all(state, err);
-                return;
+            match self.recover(state, error, slot) {
+                Ok(true) => {}
+                // The host answered this report's round before it read the report (a round
+                // opened while stopped work drained, or found at a command timeout).
+                Ok(false) if state.ledger.report_answered() => {
+                    dev_warn!(self.dev, "GPU: firmware report {:?} (slot {}) is for recovery {:?}, already answered\n",
+                              error, slot, state.ledger.last());
+                }
+                Ok(false) => {
+                    dev_err!(self.dev, "GPU: firmware reported {:?} (slot {}) but did not enter recovery\n",
+                             error, slot);
+                    self.fail_all(state, ETIMEDOUT);
+                    return;
+                }
+                Err(err) => {
+                    dev_err!(self.dev, "GPU: recovery failed ({:?}); failing all work\n", err);
+                    self.fail_all(state, err);
+                    return;
+                }
             }
         }
         if let Err(err) = self.retire_render(state) { self.fail_all(state, err); return; }
@@ -1450,11 +1475,14 @@ impl Runtime {
                          state.queue_stamp(), expected, state.submitted, state.retired);
                 if unblamed && state.root.recovery_phase().unwrap_or(0) == 1 {
                     // The firmware stopped it and halted, but its event was not seen.
-                    if let Err(err) = self.recover(state, ETIMEDOUT, -1) {
-                        self.fail_all(state, err);
-                        return;
+                    match self.recover(state, ETIMEDOUT, -1) {
+                        Ok(true) => continue,
+                        Ok(false) => {}
+                        Err(err) => {
+                            self.fail_all(state, err);
+                            return;
+                        }
                     }
-                    continue;
                 }
                 state.root.log_timeout(&self.dev);
                 state.fault.log(&self.dev);
@@ -1892,6 +1920,7 @@ impl Backend {
             recoveries: 0,
             recovery_window: 0,
             recovery_count: 0,
+            ledger: g14_v27_2_abi::RecoveryLedger::default(),
             kept,
             kept_flights: KVec::new(),
             hardware_unreachable: false,
