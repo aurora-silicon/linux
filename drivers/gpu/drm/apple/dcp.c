@@ -10173,7 +10173,7 @@ static int dcp_s2r_domains_off(struct apple_dcp *dcp)
 			goto out;
 	}
 	dcp->s2r_domains_up = false;
-	if (dcp_s2r_is_t8142_ext(dcp))
+	if (dcp->hw.s2r_ext)
 		dcp->ext_idle_domains_off = true;
 	if (pmc)
 		dcp_pmc_set(dcp, pmc, false);
@@ -10350,12 +10350,18 @@ static int dcp_s2r_ext_start(struct apple_dcp *dcp, bool cycled)
 					 true, false);
 	if (ret)
 		return ret;
+	if (dcp->hw.s2r_disp_dart_with_dcp && dcp->s2r_disp_dart) {
+		ret = apple_dart_display_streams(dcp->s2r_disp_dart,
+						 dcp_s2r_layout(dcp)->disp_streams, true, false);
+		if (ret)
+			return ret;
+	}
 	if (!cycled) {
 		dcp->ext_idle_domains_off = false;
 		return apple_rtkit_sleep_return(dcp->rtk, control);
 	}
 
-	if (dcp->s2r_disp_dart) {
+	if (dcp->s2r_disp_dart && !dcp->hw.s2r_disp_dart_with_dcp) {
 		ret = apple_dart_power_dark(dcp->s2r_disp_dart, false);
 		if (ret)
 			return ret;
@@ -10504,7 +10510,7 @@ static int dcp_s2r_warm_restart(struct apple_dcp *dcp)
 	if (ret)
 		return ret;
 	/* Powered again: the invalidations held while it was dark run now. */
-	if (dcp->s2r_disp_dart) {
+	if (dcp->s2r_disp_dart && !dcp->hw.s2r_disp_dart_with_dcp) {
 		ret = apple_dart_power_dark(dcp->s2r_disp_dart, false);
 		if (ret)
 			return ret;
