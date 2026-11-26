@@ -148,16 +148,18 @@ module_param(haptic_deep_gap_ms, byte, 0644);
 MODULE_PARM_DESC(haptic_deep_gap_ms, "milliseconds between deep-click pulses, 0 to use haptic_pulse_gap_ms (default 15)");
 
 /*
- * Linux has no key for a force click, so which one to send is the user's
- * choice; nothing is sent unless one is named. It is held down for as long as
+ * Linux has no key for a force click. KEY_INFO (XF86Info) stands for it: the
+ * desktop binds that keysym to what a force click does there (in GNOME Files,
+ * the preview of the item clicked), and nothing binds it by default, so the
+ * key does nothing where no one asks for it. It is held down for as long as
  * the deep stage lasts. The key comes from a separate input device: libinput
  * drives a touchpad with its own dispatcher, which drops every key that is not
  * a button, so a key on the trackpad's own device never reaches userspace. It
  * is read at probe because that device is set up there.
  */
-static u16 haptic_deep_keycode;
+static u16 haptic_deep_keycode = KEY_INFO;
 module_param(haptic_deep_keycode, ushort, 0444);
-MODULE_PARM_DESC(haptic_deep_keycode, "key code held during a deep click on a separate \"Force Click\" input device, 0 for none (default 0)");
+MODULE_PARM_DESC(haptic_deep_keycode, "key code held during a deep click on a separate \"Force Click\" input device, 0 for none (default KEY_INFO)");
 
 static u8 haptic_pulse_gap_ms = 25;
 module_param(haptic_pulse_gap_ms, byte, 0644);
@@ -2802,9 +2804,6 @@ static int apple_taptic_init_mtp(struct magicmouse_sc *msc,
 	INIT_WORK(&msc->haptic_deep_release_work,
 		  magicmouse_deep_release_worker);
 
-	if (haptic_deep_keycode)
-		magicmouse_setup_force_input(msc);
-
 	/* FF_HAPTIC has to be in ffbit before the FF device is created. */
 	input_set_capability(msc->input, EV_FF, FF_HAPTIC);
 
@@ -2823,6 +2822,13 @@ static int apple_taptic_init_mtp(struct magicmouse_sc *msc,
 		dev_err(&trackpad_hdev->dev, "Failed to create force-feedback device.\n");
 		return ret;
 	}
+
+	/*
+	 * Only now: if the FF device could not be created there are no
+	 * haptics, and no Force Click device must be left registered.
+	 */
+	if (haptic_deep_keycode)
+		magicmouse_setup_force_input(msc);
 
 	ff = msc->input->ff;
 	ff->private = haptic_dev;
