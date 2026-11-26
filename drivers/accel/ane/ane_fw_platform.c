@@ -33,6 +33,20 @@ static const u32 ane_t8132_reg_sizes[] = {
 	0x2000000, 0x18000, 0x4000, 0x30000, 0xff4000, 0x4000,
 };
 
+/* T8122 (M3) H15: engine, PMGR and PMGR aux-0 windows from the ADT. */
+static const char * const ane_t8122_reg_names[] = {
+	"engine", "pmgr", "aux-0",
+};
+
+static const u32 ane_t8122_reg_sizes[] = {
+	0x2000000, 0x18000, 0x4000,
+};
+
+/* The same five domains; ANE_SYS sits at +0x438 in the T8122 PMGR. */
+static const u32 ane_t8122_power_words[] = {
+	0x438, 0xc008, 0xc000, 0xc010, 0xc018,
+};
+
 /* Offsets in reg[1]; genpd, never the ANE driver, owns transitions. */
 static const u32 ane_h16_power_words[] = {
 	0x3c0, 0xc008, 0xc000, 0xc010, 0xc018,
@@ -62,6 +76,51 @@ static const u8 ane_t6050_text_pin_27_0[] = {
 	0xa9, 0x26, 0x8c, 0x5b, 0xfd, 0x94, 0xba, 0xa9,
 	0x9d, 0x8d, 0xd5, 0x9c, 0xbe, 0xc9, 0x99, 0xe2,
 	0xd1, 0xa2, 0x20, 0xd0, 0xee, 0x43, 0x8b, 0x8f,
+};
+
+/*
+ * M3 (T8122): H15 engine running the macOS 27.2 (26B123) firmware on the
+ * shared H16 AP-direct backend: ASC wrapper at +0x1400000, scratch at
+ * +0x1840050, doorbell/IPI at +0x1844000, ANE_SYS at PMGR +0x438, and five
+ * DAPF records at DART0 + 0x4000. Cold restart + program replay across sleep.
+ */
+const struct ane_fw_platform ane_t8122_platform = {
+	.h16_profiles = ane_t8122_profiles_26b123,
+	.h16_profile_count = ARRAY_SIZE(ane_t8122_profiles_26b123),
+	.h16_mmio = ane_h15_mmio_t8122,
+	.h16_mmio_count = ARRAY_SIZE(ane_h15_mmio_t8122),
+	.dart_params = 0x8,
+	.dapf_dart = 0,
+	.dapf_offset = 0x4000,
+	.dapf_size = SZ_16K,
+	.dapf_count = 5,
+	.soc = 0x8122,
+	.chip_family = 15,
+	.ane_type = 0xb0,
+	.hwx_subtype = 6,
+	.task_generation = 15,
+	.interrupt_count = 1,
+	.irq_role = ANE_FW_IRQ_UNKNOWN,
+	.owner = ANE_FW_OWNER_AP,
+	.reg_names = ane_t8122_reg_names,
+	.reg_sizes = ane_t8122_reg_sizes,
+	.reg_count = ARRAY_SIZE(ane_t8122_reg_names),
+	.wrapper = 0x1400000,
+	.mailbox = 0x1408000,
+	.scratch = 0x1840050,
+	.doorbell = 0x1844000,
+	.irq_status = 0x184c000,
+	.irq_ack = 0x1850000,
+	.power_words = ane_t8122_power_words,
+	.power_count = ARRAY_SIZE(ane_t8122_power_words),
+	.build_name = "27.2 26B123",
+	.preload_dva = { 0x10000000000, 0x100000c8000 },
+	.preload_size = { 0xc8000, 0x2a4000 },
+	.stream_mask = BIT(0),
+	.sleep_cold = true,
+	.boot_qualified = true,
+	.firmware_preloaded = true,
+	.safe_reset = false,
 };
 
 const struct ane_fw_platform ane_h16_platform = {
@@ -647,13 +706,17 @@ int ane_fw_platform_resume(struct device *dev)
 	return ane_h16_backend_resume(dev);
 }
 
-/* Runtime PM callbacks: only the bound H17 device parks; H16 has none. */
+/* Runtime PM callbacks of the bound H16 or H17 device. */
 int ane_fw_platform_runtime_suspend(struct device *dev)
 {
-	return ane_fw_staged_bound(dev) ? ane_fw_staged_runtime_suspend(dev) : 0;
+	if (ane_fw_staged_bound(dev))
+		return ane_fw_staged_runtime_suspend(dev);
+	return ane_h16_backend_runtime_suspend(dev);
 }
 
 int ane_fw_platform_runtime_resume(struct device *dev)
 {
-	return ane_fw_staged_bound(dev) ? ane_fw_staged_runtime_resume(dev) : 0;
+	if (ane_fw_staged_bound(dev))
+		return ane_fw_staged_runtime_resume(dev);
+	return ane_h16_backend_runtime_resume(dev);
 }

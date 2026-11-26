@@ -4,7 +4,7 @@
 
 use crate::debug::*;
 use crate::gem;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use kernel::{new_mutex, prelude::*, str::BStr, sync::Mutex, task::Pid};
 
 const DEBUG_CLASS: DebugFlags = DebugFlags::Errors;
@@ -33,6 +33,10 @@ pub(crate) struct VmStatus {
     /// Further restarts that may find this VM guilty and still be charged to it
     /// ([`Self::charge_restart`]), or [`UNCHARGED`] before the first.
     restarts_left: AtomicU32,
+    /// Commands whose public fence is failing ([`Self::signal_failure`]): counted before
+    /// its error is set, and again once it has signalled.
+    failures_started: AtomicU64,
+    failures_finished: AtomicU64,
     /// The process that created the VM, named in the failure report.
     tgid: Pid,
     comm: [u8; 16],
@@ -50,6 +54,14 @@ struct Mirror {
 // SAFETY: The word points into the mapping the retained owner keeps alive; it is
 // only accessed atomically through this pointer while the mutex is held.
 unsafe impl Send for Mirror {}
+
+/// [`VmStatus::signal_failure`] counts: every failure in `finished` has signalled its error,
+/// and those in `started` but not `finished` may be anywhere between.
+#[derive(Clone, Copy)]
+pub(crate) struct Failures {
+    pub(crate) started: u64,
+    pub(crate) finished: u64,
+}
 
 impl VmStatus {
     /// Called from the creating client's ioctl: the VM records who it belongs to.
@@ -69,6 +81,8 @@ impl VmStatus {
             warned: AtomicBool::new(false),
             recovery_guilty: AtomicBool::new(false),
             restarts_left: AtomicU32::new(UNCHARGED),
+            failures_started: AtomicU64::new(0),
+            failures_finished: AtomicU64::new(0),
             tgid,
             comm,
             mirror <- new_mutex!(None, "Asahi VM status mirror"),
@@ -87,6 +101,24 @@ impl VmStatus {
             .position(|&b| b == 0)
             .unwrap_or(self.comm.len());
         (BStr::from_bytes(&self.comm[..len]), self.tgid)
+    }
+
+    /// Fails a command's public fence: `signal` sets its error and signals it. The failure
+    /// counts as started before anyone can see the error and as finished after the signal, so
+    /// a frontier prune that reads the counts in between can tell that one is in flight.
+    pub(crate) fn signal_failure(&self, signal: impl FnOnce()) {
+        // Relaxed: the fence's signal, a release, publishes it together with the error.
+        self.failures_started.fetch_add(1, Ordering::Relaxed);
+        signal();
+        // Release: whoever sees this count also sees the signalled error.
+        self.failures_finished.fetch_add(1, Ordering::Release);
+    }
+
+    /// This VM's failure counts, `finished` read first so that `started` covers it.
+    pub(crate) fn failures(&self) -> Failures {
+        let finished = self.failures_finished.load(Ordering::Acquire);
+        let started = self.failures_started.load(Ordering::Acquire);
+        Failures { started, finished }
     }
 
     pub(crate) fn note_recovery_guilty(&self) {

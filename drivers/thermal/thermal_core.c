@@ -1726,9 +1726,11 @@ struct thermal_zone_device *thermal_zone_get_zone_by_name(const char *name)
 EXPORT_SYMBOL_GPL(thermal_zone_get_zone_by_name);
 
 /**
- * thermal_zone_get_temp_by_name() - sample a uniquely named registered zone
+ * thermal_zone_get_temp_and_trips() - sample a uniquely named registered zone
  * @name: thermal zone name
  * @temp: destination for the temperature in millidegrees Celsius
+ * @cb: optional callback for each trip of the sampled zone, under the zone lock
+ * @data: private data passed to @cb
  *
  * Acquire the zone device reference under the registry lock, as in
  * thermal_zone_get_by_id(). Removal waits for device references before freeing
@@ -1736,9 +1738,11 @@ EXPORT_SYMBOL_GPL(thermal_zone_get_zone_by_name);
  * No borrowed thermal-zone pointer escapes to the caller.
  *
  * Return: 0 on success, -EINVAL for invalid arguments, -ENODEV for no match,
- * -EEXIST for duplicate names, or the temperature read error.
+ * -EEXIST for duplicate names, or the error from the temperature read or trip callback.
  */
-int thermal_zone_get_temp_by_name(const char *name, int *temp)
+int thermal_zone_get_temp_and_trips(const char *name, int *temp,
+				    int (*cb)(struct thermal_trip *, void *),
+				    void *data)
 {
 	struct thermal_zone_device *pos, *zone = NULL;
 	int ret;
@@ -1762,8 +1766,16 @@ int thermal_zone_get_temp_by_name(const char *name, int *temp)
 	}
 
 	ret = thermal_zone_get_temp(zone, temp);
+	if (!ret && cb)
+		ret = thermal_zone_for_each_trip(zone, cb, data);
 	put_device(&zone->device);
 	return ret;
+}
+EXPORT_SYMBOL_GPL(thermal_zone_get_temp_and_trips);
+
+int thermal_zone_get_temp_by_name(const char *name, int *temp)
+{
+	return thermal_zone_get_temp_and_trips(name, temp, NULL, NULL);
 }
 EXPORT_SYMBOL_GPL(thermal_zone_get_temp_by_name);
 

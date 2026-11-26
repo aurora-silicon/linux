@@ -79,6 +79,21 @@ static void dwc3_xhci_plat_start(struct usb_hcd *hcd)
 	dwc3_enable_susphy(dwc, true);
 }
 
+/*
+ * The SuperSpeed root hub is set up after xhci_reset() and dwc3_xhci_plat_start() on the
+ * primary HCD, and before xhci_run() starts the controller.
+ */
+static int dwc3_xhci_plat_init_quirk(struct usb_hcd *hcd)
+{
+	struct platform_device *pdev = to_platform_device(hcd->self.controller);
+	struct dwc3 *dwc = dev_get_drvdata(pdev->dev.parent);
+
+	if (usb_hcd_is_primary_hcd(hcd) || !dwc->glue_ops || !dwc->glue_ops->usb3_host_route)
+		return 0;
+
+	return dwc->glue_ops->usb3_host_route(dwc);
+}
+
 static int dwc3_xhci_plat_resume_quirk(struct usb_hcd *hcd)
 {
 	struct platform_device *pdev = to_platform_device(hcd->self.controller);
@@ -92,6 +107,7 @@ static int dwc3_xhci_plat_resume_quirk(struct usb_hcd *hcd)
 
 static const struct xhci_plat_priv dwc3_xhci_plat_quirk = {
 	.plat_start = dwc3_xhci_plat_start,
+	.init_quirk = dwc3_xhci_plat_init_quirk,
 	.resume_quirk = dwc3_xhci_plat_resume_quirk,
 };
 
@@ -190,6 +206,7 @@ EXPORT_SYMBOL_IF_KUNIT(dwc3_host_xhci_properties);
 int dwc3_host_init(struct dwc3 *dwc)
 {
 	struct property_entry	props[DWC3_XHCI_MAX_PROPERTIES + 1];
+	struct xhci_plat_priv	priv = dwc3_xhci_plat_quirk;
 	struct platform_device	*xhci;
 	int			ret, irq;
 	int			prop_idx = 0;
@@ -231,8 +248,9 @@ int dwc3_host_init(struct dwc3 *dwc)
 		}
 	}
 
-	ret = platform_device_add_data(xhci, &dwc3_xhci_plat_quirk,
-				       sizeof(struct xhci_plat_priv));
+	/* A glue that sets up the USB3 PHY itself keeps it off the SuperSpeed root hub. */
+	priv.skip_usb3_phy_init = dwc->glue_ops && dwc->glue_ops->usb3_host_route;
+	ret = platform_device_add_data(xhci, &priv, sizeof(priv));
 	if (ret)
 		goto err;
 

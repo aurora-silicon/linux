@@ -74,6 +74,8 @@ struct State {
 pub(super) struct VmLifetime {
     #[pin]
     state: Mutex<State>,
+    /// Lock-free mirror of `state.closed`, set once in [`Vm::unmap_user_ranges`].
+    closed: AtomicBool,
     #[pin]
     changed: CondVar,
     #[pin]
@@ -99,6 +101,7 @@ impl VmLifetime {
                 state <- new_mutex!(State { active:0, commits:0, blocked:false,
                     quarantined:false, draining:false, closed:false, cleanup_failed:false, close_ranges:None,
                     unmaps:KVec::new(), objects:KVec::new() }, "VM job lifetime"),
+                closed: AtomicBool::new(false),
                 changed <- new_condvar!("VM mapping admission"),
                 driver <- new_mutex!(None, "VM driver mappings"),
             }),
@@ -199,24 +202,6 @@ impl Vm {
         }
         *pool = Some(mappings.0);
         Ok(())
-    }
-
-    /// The graph identity whose pool mappings occupy `slot` in this
-    /// VM (0 when free). A second graph cannot install there until it leaves.
-    pub(crate) fn render_pool_owner(&self, slot: u8) -> u64 {
-        self.lifetime
-            .as_ref()
-            .and_then(|lifetime| {
-                lifetime
-                    .driver
-                    .lock()
-                    .as_ref()?
-                    .render
-                    .get(usize::from(slot))?
-                    .as_ref()
-                    .map(|pool| pool.id)
-            })
-            .unwrap_or(0)
     }
 
     pub(crate) fn render_pool_tvb_blocks(&self, slot: u8, id: u64) -> Option<usize> {
@@ -393,11 +378,12 @@ impl Vm {
     }
 
     /// Whether the client's handle of this VM is gone ([`Self::unmap_user_ranges`] closed
-    /// admission for good). G15 releases its per-VM state after that.
+    /// admission for good). Lock-free so callers holding spinlocks (such as G16's standby
+    /// epoch lock) can test close state without sleeping.
     pub(crate) fn is_closed(&self) -> bool {
         self.lifetime
             .as_ref()
-            .is_some_and(|lifetime| lifetime.state.lock().closed)
+            .is_some_and(|lifetime| lifetime.closed.load(Ordering::Acquire))
     }
 
     /// Tests mappings and reservations which userspace must never replace.
@@ -666,6 +652,7 @@ impl Vm {
                 lifetime.changed.wait(&mut state);
             }
             state.closed = true;
+            lifetime.closed.store(true, Ordering::Release);
             if state.active != 0 {
                 state.close_ranges = Some((user, kernel));
                 return Ok(());
@@ -704,9 +691,7 @@ impl Drop for VmJobGuard {
         // Healthy last-job release need not close mapping/job admission when
         // there is no accepted cleanup to drain. Keep every recovery, close,
         // in-progress commit and failed-cleanup path on the existing drain.
-        // M5 only: other G17 GPUs keep the drain on every last release.
-        if self.vm.m5
-            && !state.blocked
+        if !state.blocked
             && !state.quarantined
             && !state.draining
             && !state.closed

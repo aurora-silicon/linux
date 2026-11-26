@@ -18,6 +18,10 @@
 #include <linux/of.h>
 #include <linux/of_platform.h>
 
+#if IS_ENABLED(CONFIG_APPLE_DOCKCHANNEL_KUNIT_TEST)
+#include <kunit/static_stub.h>
+#endif
+
 #define DOCKCHANNEL_MAX_IRQ	32
 
 #define DOCKCHANNEL_TX_TIMEOUT_MS 1000
@@ -68,6 +72,34 @@ struct dockchannel_common {
 	void __iomem *irq_base;
 };
 
+/*
+ * FIFO register accesses. They are functions so that the KUnit test can model
+ * the FIFO behind them.
+ */
+static u32 dockchannel_readl(void __iomem *addr)
+{
+#if IS_ENABLED(CONFIG_APPLE_DOCKCHANNEL_KUNIT_TEST)
+	KUNIT_STATIC_STUB_REDIRECT(dockchannel_readl, addr);
+#endif
+	return readl_relaxed(addr);
+}
+
+static void dockchannel_writel(u32 val, void __iomem *addr)
+{
+#if IS_ENABLED(CONFIG_APPLE_DOCKCHANNEL_KUNIT_TEST)
+	KUNIT_STATIC_STUB_REDIRECT(dockchannel_writel, val, addr);
+#endif
+	writel_relaxed(val, addr);
+}
+
+static void dockchannel_writeb(u8 val, void __iomem *addr)
+{
+#if IS_ENABLED(CONFIG_APPLE_DOCKCHANNEL_KUNIT_TEST)
+	KUNIT_STATIC_STUB_REDIRECT(dockchannel_writeb, val, addr);
+#endif
+	writeb_relaxed(val, addr);
+}
+
 /* Dockchannel FIFO functions */
 
 static irqreturn_t dockchannel_tx_irq(int irq, void *data)
@@ -97,7 +129,7 @@ static irqreturn_t dockchannel_rx_irq(int irq, void *data)
 static irqreturn_t dockchannel_rx_irq_thread(int irq, void *data)
 {
 	struct dockchannel *dockchannel = data;
-	size_t avail = readl_relaxed(dockchannel->data_base + DATA_RX_COUNT);
+	size_t avail = dockchannel_readl(dockchannel->data_base + DATA_RX_COUNT);
 
 	dockchannel->awaiting = false;
 	dockchannel->data_available(dockchannel->cookie, avail);
@@ -111,13 +143,13 @@ int dockchannel_send(struct dockchannel *dockchannel, const void *buf, size_t co
 	const u8 *p = buf;
 
 	while (left > 0) {
-		size_t avail = readl_relaxed(dockchannel->data_base + DATA_TX_FREE);
+		size_t avail = dockchannel_readl(dockchannel->data_base + DATA_TX_FREE);
 		size_t block = min(left, avail);
 
 		if (avail == 0) {
 			size_t threshold = min((size_t)(dockchannel->fifo_size / 2), left);
 
-			writel_relaxed(threshold, dockchannel->config_base + CONFIG_TX_THRESH);
+			dockchannel_writel(threshold, dockchannel->config_base + CONFIG_TX_THRESH);
 			reinit_completion(&dockchannel->tx_comp);
 			enable_irq(dockchannel->tx_irq);
 
@@ -131,13 +163,14 @@ int dockchannel_send(struct dockchannel *dockchannel, const void *buf, size_t co
 		}
 
 		while (block >= 4) {
-			writel_relaxed(get_unaligned_le32(p), dockchannel->data_base + DATA_TX32);
+			dockchannel_writel(get_unaligned_le32(p),
+					   dockchannel->data_base + DATA_TX32);
 			p += 4;
 			left -= 4;
 			block -= 4;
 		}
 		while (block > 0) {
-			writeb_relaxed(*p++, dockchannel->data_base + DATA_TX8);
+			dockchannel_writeb(*p++, dockchannel->data_base + DATA_TX8);
 			left--;
 			block--;
 		}
@@ -153,13 +186,13 @@ int dockchannel_recv(struct dockchannel *dockchannel, void *buf, size_t count)
 	u8 *p = buf;
 
 	while (left > 0) {
-		size_t avail = readl_relaxed(dockchannel->data_base + DATA_RX_COUNT);
+		size_t avail = dockchannel_readl(dockchannel->data_base + DATA_RX_COUNT);
 		size_t block = min(left, avail);
 
 		if (avail == 0) {
 			size_t threshold = min((size_t)(dockchannel->fifo_size / 2), left);
 
-			writel_relaxed(threshold, dockchannel->config_base + CONFIG_RX_THRESH);
+			dockchannel_writel(threshold, dockchannel->config_base + CONFIG_RX_THRESH);
 			reinit_completion(&dockchannel->rx_comp);
 			enable_irq(dockchannel->rx_irq);
 
@@ -173,13 +206,14 @@ int dockchannel_recv(struct dockchannel *dockchannel, void *buf, size_t count)
 		}
 
 		while (block >= 4) {
-			put_unaligned_le32(readl_relaxed(dockchannel->data_base + DATA_RX32), p);
+			put_unaligned_le32(dockchannel_readl(dockchannel->data_base + DATA_RX32),
+					   p);
 			p += 4;
 			left -= 4;
 			block -= 4;
 		}
 		while (block > 0) {
-			*p++ = readl_relaxed(dockchannel->data_base + DATA_RX8) >> 8;
+			*p++ = dockchannel_readl(dockchannel->data_base + DATA_RX8) >> 8;
 			left--;
 			block--;
 		}
@@ -204,7 +238,7 @@ int dockchannel_await(struct dockchannel *dockchannel,
 	dockchannel->data_available = callback;
 	dockchannel->cookie = cookie;
 	dockchannel->awaiting = true;
-	writel_relaxed(threshold, dockchannel->config_base + CONFIG_RX_THRESH);
+	dockchannel_writel(threshold, dockchannel->config_base + CONFIG_RX_THRESH);
 	enable_irq(dockchannel->rx_irq);
 
 	return threshold;
@@ -434,3 +468,7 @@ module_platform_driver(dockchannel_driver);
 MODULE_AUTHOR("Hector Martin <marcan@marcan.st>");
 MODULE_LICENSE("Dual MIT/GPL");
 MODULE_DESCRIPTION("Apple DockChannel driver");
+
+#if IS_ENABLED(CONFIG_APPLE_DOCKCHANNEL_KUNIT_TEST)
+#include "dockchannel-test.c"
+#endif

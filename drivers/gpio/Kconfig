@@ -1557,6 +1557,19 @@ config GPIO_MACSMC
 	  This driver can also be built as a module. If so, the module will be
 	  called gpio-macsmc.
 
+config GPIO_MACSMC_KUNIT_TEST
+	bool "KUnit tests for the Apple SMC GPIO driver" if !KUNIT_ALL_TESTS
+	depends on GPIO_MACSMC=y && KUNIT=y
+	depends on MFD_MACSMC_KUNIT_TEST
+	default KUNIT_ALL_TESTS
+	help
+	  Build tests for the Apple SMC GPIO driver: the gPxx key names of
+	  the pins, the output command words, the J700 pcIO and J713 radio
+	  lines with their remembered levels, the DT output and pcIO
+	  templates, the valid line mask and the pcIO output-command chip.
+	  A static stub replaces SMC writes, so the tests need no Apple
+	  hardware.
+
 config GPIO_MADERA
 	tristate "Cirrus Logic Madera class codecs"
 	depends on PINCTRL_MADERA

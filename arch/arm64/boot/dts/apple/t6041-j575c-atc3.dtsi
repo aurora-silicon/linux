@@ -117,6 +117,7 @@
 		apple,event-irq-in-sleep;
 		/* Retimer set up before Linux keeps SuperSpeed down until replugged. */
 		apple,reset-inherited-usb2-connection;
+		apple,debug-lock-key = "575J";
 
 		typec3: connector {
 			compatible = "usb-c-connector";

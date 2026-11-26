@@ -1274,6 +1274,46 @@ static void ane_transport_mode_stop_test(struct kunit *test)
 }
 
 /*
+ * A warm sleep publishes EXCLAVE_MODE_STOP and SUSPEND on a transport that
+ * survives the wake (ane_fw_suspend_firmware()). Once both are answered and
+ * the SUSPEND reply was read, releasing to the mark taken before them gives
+ * the arena back: the next command lands where 0x31 did, and sleep after
+ * sleep the arena does not shrink.
+ */
+static void ane_transport_sleep_release_test(struct kunit *test)
+{
+	struct ane_transport_test *f = test->priv;
+	u8 command[8] = {};
+	u32 ch = f->t.control_ch;
+	size_t mark;
+	u64 first;
+	unsigned int i;
+
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
+	mark = ane_fw_transport_mark(&f->t);
+	for (i = 0; i < 64; i++) {
+		KUNIT_ASSERT_EQ(test, ane_fw_transport_publish_mode_stop(&f->t, TEST_DEADLINE), 0);
+		if (!i)
+			first = f->t.pending[ch].dva;
+		KUNIT_ASSERT_EQ(test, f->t.pending[ch].dva, first);
+		/* Released too early: a command is still pending. */
+		KUNIT_ASSERT_EQ(test, ane_fw_transport_release(&f->t, mark), -EBUSY);
+		ane_test_reply(f, ch);
+		KUNIT_ASSERT_EQ(test, ane_fw_transport_wait(&f->t, ch), 0);
+
+		put_unaligned_le16(0x24, command + 4);	/* SUSPEND */
+		KUNIT_ASSERT_EQ(test, ane_fw_transport_publish(&f->t, ANE_FW_IO, command,
+							       sizeof(command), TEST_DEADLINE), 0);
+		KUNIT_ASSERT_GT(test, ane_fw_transport_mark(&f->t), mark);
+		ane_test_reply(f, ANE_FW_IO);
+		KUNIT_ASSERT_EQ(test, ane_fw_transport_wait(&f->t, ANE_FW_IO), 0);
+		KUNIT_ASSERT_EQ(test, ane_fw_transport_release(&f->t, mark), 0);
+		KUNIT_ASSERT_EQ(test, ane_fw_transport_mark(&f->t), mark);
+	}
+	KUNIT_EXPECT_EQ(test, f->t.error, 0);
+}
+
+/*
  * The control ring completes without clearing the result word (H17 C6):
  * DVA|1, length, and the published size still in word 2. Accepted there;
  * the same completion on IO is still a protocol error.
@@ -1588,6 +1628,7 @@ static struct kunit_case ane_transport_cases[] = {
 	KUNIT_CASE(ane_transport_wait_test),
 	KUNIT_CASE(ane_transport_wait_polls_test),
 	KUNIT_CASE(ane_transport_poll_sleep_test),
+	KUNIT_CASE(ane_transport_sleep_release_test),
 	{}
 };
 
