@@ -2,7 +2,8 @@
 /*
  * Apple Silicon JPEG encoder, V4L2 memory-to-memory.
  *
- * Takes full-range YUV in one buffer (NV12 for 4:2:0, NV16 for 4:2:2) and
+ * Takes full-range YUV in one buffer (NV12 for 4:2:0, NV16 for 4:2:2; NV24
+ * for 4:4:4 and GREY where the engine's job layout has them) and
  * produces baseline JPEG with the standard Huffman tables. One job runs at
  * a time; the engine is reset before each job and the completion interrupt
  * ends it. Register layout: see apple-jpeg-hw.h.
@@ -227,6 +228,21 @@ static void aj_watchdog(struct work_struct *work)
 	}
 }
 
+/* The raw formats, in apple_jpeg_subsampling order. */
+static const u32 aj_raw_fmts[] = {
+	V4L2_PIX_FMT_NV12, V4L2_PIX_FMT_NV16, V4L2_PIX_FMT_NV24, V4L2_PIX_FMT_GREY,
+};
+
+/* The subsampling of a raw format this engine takes; 4:2:0 for any other. */
+static enum apple_jpeg_subsampling aj_subsampling(const struct apple_jpeg *jpeg, u32 fourcc)
+{
+	for (unsigned int s = 0; s < ARRAY_SIZE(aj_raw_fmts); s++)
+		if (aj_raw_fmts[s] == fourcc &&
+		    apple_jpeg_has_subsampling(jpeg->variant->layout, s))
+			return s;
+	return AJ_SUBSAMPLING_420;
+}
+
 static void aj_device_run(void *priv)
 {
 	struct apple_jpeg_ctx *ctx = priv;
@@ -235,8 +251,8 @@ static void aj_device_run(void *priv)
 	struct apple_jpeg_layout layout;
 	struct apple_jpeg_job job;
 	unsigned long flags;
+	enum apple_jpeg_subsampling ss;
 	dma_addr_t y;
-	bool is422;
 	int n, ret;
 
 	src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
@@ -249,16 +265,17 @@ static void aj_device_run(void *priv)
 	}
 
 	y = vb2_dma_contig_plane_dma_addr(&src->vb2_buf, 0);
-	is422 = ctx->src.pixelformat == V4L2_PIX_FMT_NV16;
-	apple_jpeg_raw_layout(ctx->src.width, ctx->src.height, is422, &layout);
+	ss = aj_subsampling(jpeg, ctx->src.pixelformat);
+	apple_jpeg_raw_layout(ctx->src.width, ctx->src.height, ss, &layout);
 	job = (struct apple_jpeg_job){
 		.width = ctx->src.width,
 		.height = ctx->src.height,
-		.is422 = is422,
+		.subsampling = ss,
 		.luma_stride = layout.bytesperline,
-		.chroma_stride = layout.bytesperline,
+		.chroma_stride = layout.chroma_stride,
 		.luma = y,
-		.chroma = y + layout.chroma_offset,
+		/* GREY has no chroma plane: point plane 1 at the luma. */
+		.chroma = ss == AJ_SUBSAMPLING_GREY ? y : y + layout.chroma_offset,
 		/* The engine's single input bound: the end of the negotiated surface. */
 		.input_end = y + layout.sizeimage - 1,
 		.output = vb2_dma_contig_plane_dma_addr(&dst->vb2_buf, 0),
@@ -298,17 +315,43 @@ static const struct v4l2_m2m_ops aj_m2m_ops = {
 
 /* ---- formats ---------------------------------------------------------- */
 
-/* Raw input: Y rows then interleaved CbCr rows in one buffer, full range. */
+/*
+ * The engine encodes the samples as they arrive: it converts neither range
+ * nor matrix, so the colorimetry of the raw input is the client's to state,
+ * as for any stateful encoder, and CAPTURE reports the same. A client that
+ * gives none gets what JPEG itself carries, full-range BT.601. Refusing
+ * every other description makes clients fail: GStreamer's v4l2jpegenc
+ * passes the camera's colorimetry through and gives up when S_FMT returns
+ * another one.
+ */
+static void aj_fill_colorimetry(struct v4l2_pix_format_mplane *pix)
+{
+	if (pix->colorspace == V4L2_COLORSPACE_DEFAULT ||
+	    pix->colorspace > V4L2_COLORSPACE_DCI_P3) {
+		pix->colorspace = V4L2_COLORSPACE_SRGB;
+		pix->ycbcr_enc = V4L2_YCBCR_ENC_601;
+		pix->quantization = V4L2_QUANTIZATION_FULL_RANGE;
+		pix->xfer_func = V4L2_XFER_FUNC_SRGB;
+		return;
+	}
+	if (pix->ycbcr_enc > V4L2_YCBCR_ENC_SMPTE240M)
+		pix->ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
+	if (pix->quantization > V4L2_QUANTIZATION_LIM_RANGE)
+		pix->quantization = V4L2_QUANTIZATION_DEFAULT;
+	if (pix->xfer_func > V4L2_XFER_FUNC_SMPTE2084)
+		pix->xfer_func = V4L2_XFER_FUNC_DEFAULT;
+}
+
+/* Raw input: Y rows then interleaved CbCr rows in one buffer. */
 static void aj_fill_raw(const struct apple_jpeg *jpeg, struct v4l2_pix_format_mplane *pix)
 {
-	bool is422 = pix->pixelformat == V4L2_PIX_FMT_NV16 &&
-		     apple_jpeg_has_422(jpeg->variant->layout);
+	enum apple_jpeg_subsampling ss = aj_subsampling(jpeg, pix->pixelformat);
 	u32 w = clamp_t(u32, ALIGN(pix->width, 2), AJ_MIN_SIZE, AJ_MAX_SIZE);
 	u32 h = clamp_t(u32, pix->height, AJ_MIN_SIZE, AJ_MAX_SIZE);
 	struct apple_jpeg_layout layout;
 
-	apple_jpeg_raw_layout(w, h, is422, &layout);
-	pix->pixelformat = is422 ? V4L2_PIX_FMT_NV16 : V4L2_PIX_FMT_NV12;
+	apple_jpeg_raw_layout(w, h, ss, &layout);
+	pix->pixelformat = aj_raw_fmts[ss];
 	pix->width = w;
 	pix->height = h;
 	pix->field = V4L2_FIELD_NONE;
@@ -319,11 +362,7 @@ static void aj_fill_raw(const struct apple_jpeg *jpeg, struct v4l2_pix_format_mp
 	/* Chroma follows the visible luma rows; the tail covers the MCU rows. */
 	pix->plane_fmt[0].bytesperline = layout.bytesperline;
 	pix->plane_fmt[0].sizeimage = layout.sizeimage;
-	/* JPEG carries full-range BT.601; the engine does no range conversion. */
-	pix->colorspace = V4L2_COLORSPACE_SRGB;
-	pix->ycbcr_enc = V4L2_YCBCR_ENC_601;
-	pix->quantization = V4L2_QUANTIZATION_FULL_RANGE;
-	pix->xfer_func = V4L2_XFER_FUNC_SRGB;
+	aj_fill_colorimetry(pix);
 }
 
 /*
@@ -350,13 +389,18 @@ static int aj_querycap(struct file *file, void *priv, struct v4l2_capability *ca
 
 static int aj_enum_fmt_out(struct file *file, void *priv, struct v4l2_fmtdesc *f)
 {
-	static const u32 fmts[] = { V4L2_PIX_FMT_NV12, V4L2_PIX_FMT_NV16 };
 	const struct apple_jpeg *jpeg = aj_file_to_ctx(file)->jpeg;
+	unsigned int n = 0;
 
-	if (f->index >= (apple_jpeg_has_422(jpeg->variant->layout) ? ARRAY_SIZE(fmts) : 1))
-		return -EINVAL;
-	f->pixelformat = fmts[f->index];
-	return 0;
+	for (unsigned int s = 0; s < ARRAY_SIZE(aj_raw_fmts); s++) {
+		if (!apple_jpeg_has_subsampling(jpeg->variant->layout, s))
+			continue;
+		if (n++ == f->index) {
+			f->pixelformat = aj_raw_fmts[s];
+			return 0;
+		}
+	}
+	return -EINVAL;
 }
 
 static int aj_enum_fmt_cap(struct file *file, void *priv, struct v4l2_fmtdesc *f)
@@ -371,11 +415,10 @@ static int aj_enum_fmt_cap(struct file *file, void *priv, struct v4l2_fmtdesc *f
 static int aj_enum_framesizes(struct file *file, void *priv, struct v4l2_frmsizeenum *fs)
 {
 	const struct apple_jpeg *jpeg = aj_file_to_ctx(file)->jpeg;
-	bool nv16 = apple_jpeg_has_422(jpeg->variant->layout);
+	bool raw = aj_subsampling(jpeg, fs->pixel_format) != AJ_SUBSAMPLING_420 ||
+		   fs->pixel_format == V4L2_PIX_FMT_NV12;
 
-	if (fs->index || (fs->pixel_format != V4L2_PIX_FMT_JPEG &&
-			  fs->pixel_format != V4L2_PIX_FMT_NV12 &&
-			  (fs->pixel_format != V4L2_PIX_FMT_NV16 || !nv16)))
+	if (fs->index || (fs->pixel_format != V4L2_PIX_FMT_JPEG && !raw))
 		return -EINVAL;
 	fs->type = V4L2_FRMSIZE_TYPE_STEPWISE;
 	fs->stepwise = (struct v4l2_frmsize_stepwise){

@@ -103,6 +103,120 @@ class DartPdTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("power domain /soc/power-controller@3000 is disabled (new)", result.stdout)
 
+    def test_disabled_dart_on_disabled_domain_is_skipped(self):
+        # The DART, its domain and its user are all off: consistent, not a finding.
+        disabled = DOMAIN.replace("{", '{ status = "disabled";')
+        dart = ('dart_x: iommu@5000 { compatible = "apple,t8110-dart"; #iommu-cells = <1>; '
+                'power-domains = <&ps_x>; status = "disabled"; };')
+        user = 'engine@6000 { iommus = <&dart_x 0>; status = "disabled"; };'
+        self.dtb(self.head, "t8112-j413", dts("j413", "t8112", disabled, GAP, dart, user))
+        result = self.check("--report")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("iommu@5000", result.stdout)
+        self.assertEqual(self.check().returncode, 0)
+
+    def test_disabled_dart_under_a_disabled_user_is_skipped(self):
+        # The user is okay itself but sits under a disabled node (a DCP's piodma).
+        dart = ('dart_x: iommu@5000 { compatible = "apple,t8110-dart"; #iommu-cells = <1>; '
+                'status = "disabled"; };')
+        user = ('dcp@6000 { #address-cells = <1>; #size-cells = <0>; status = "disabled"; '
+                'piodma { iommus = <&dart_x 0>; }; };')
+        self.dtb(self.head, "t8112-j413", dts("j413", "t8112", DOMAIN, GAP, dart, user))
+        result = self.check()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("iommu@5000", result.stdout)
+
+    def test_dart_inside_a_disabled_node_is_skipped(self):
+        # A router's DART, okay itself, inside the disabled router that is its only
+        # user, on the router's disabled domain: it is never populated.
+        disabled = DOMAIN.replace("{", '{ status = "disabled";')
+        router = ('acio@5000 { #address-cells = <1>; #size-cells = <0>; status = "disabled"; '
+                  'iommus = <&dart_x 0>; dart_x: iommu@a00 { compatible = "apple,t8110-dart"; '
+                  '#iommu-cells = <1>; power-domains = <&ps_x>; }; };')
+        self.dtb(self.head, "t8112-j413", dts("j413", "t8112", disabled, GAP, router))
+        result = self.check()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("iommu@a00", result.stdout)
+
+    def test_dart_inside_an_enabled_node_on_a_disabled_domain_fails(self):
+        disabled = DOMAIN.replace("{", '{ status = "disabled";')
+        router = ('acio@5000 { #address-cells = <1>; #size-cells = <0>; '
+                  'iommus = <&dart_x 0>; dart_x: iommu@a00 { compatible = "apple,t8110-dart"; '
+                  '#iommu-cells = <1>; power-domains = <&ps_x>; }; };')
+        self.dtb(self.head, "t8112-j413", dts("j413", "t8112", disabled, GAP, router))
+        result = self.check()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("/soc/acio@5000/iommu@a00 dart_x apple,t8110-dart okay: "
+                      "power domain /soc/power-controller@3000 is disabled (new)", result.stdout)
+
+    def test_enabled_dart_on_disabled_or_missing_domain_fails(self):
+        disabled = DOMAIN.replace("{", '{ status = "disabled";')
+        on_disabled = ('iommu@5000 { compatible = "apple,t8110-dart"; '
+                       'power-domains = <&ps_x>; };')
+        self.dtb(self.head, "t8112-j413",
+                 dts("j413", "t8112", disabled, GAP, on_disabled, NEW_GAP))
+        result = self.check()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("t8112-j413 /soc/iommu@5000 - apple,t8110-dart okay: "
+                      "power domain /soc/power-controller@3000 is disabled (new)", result.stdout)
+        self.assertIn("t8112-j413 /soc/iommu@2000 - apple,t8110-dart okay: "
+                      "no power-domains (new)", result.stdout)
+
+    def test_disabled_dart_of_an_enabled_user_fails(self):
+        # The loader enables such a DART when it hands its device over.
+        disabled = DOMAIN.replace("{", '{ status = "disabled";')
+        dart = ('dart_x: iommu@5000 { compatible = "apple,t8110-dart"; #iommu-cells = <1>; '
+                'power-domains = <&ps_x>; status = "disabled"; };')
+        user = 'engine@6000 { iommus = <&dart_x 0>; };'
+        self.dtb(self.head, "t8112-j413", dts("j413", "t8112", disabled, GAP, dart, user))
+        result = self.check()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("t8112-j413 /soc/iommu@5000 dart_x apple,t8110-dart disabled: "
+                      "power domain /soc/power-controller@3000 is disabled (new)", result.stdout)
+
+    ROUTER = ('acio@5000 { compatible = "apple,t8103-usb4-acio"; %s '
+              '#address-cells = <1>; #size-cells = <0>; '
+              'dart_x: iommu@a00 { compatible = "apple,t8110-dart"; #iommu-cells = <1>; }; '
+              'nhi@b00 { iommus = <&dart_x 0>; }; };')
+
+    def test_dart_inside_a_powered_device_is_exempt(self):
+        # A USB4 router's DART: its driver populates it after powering its domains.
+        router = self.ROUTER % "power-domains = <&ps_x>;"
+        self.dtb(self.head, "t8112-j413", dts("j413", "t8112", DOMAIN, GAP, router))
+        result = self.check()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("new: 0", result.stderr)
+        report = self.check("--report")
+        self.assertIn("/soc/acio@5000/iommu@a00 dart_x apple,t8110-dart okay: "
+                      "exempt (inside /soc/acio@5000)", report.stdout)
+
+    def test_dart_inside_a_device_without_domains_fails(self):
+        router = self.ROUTER % ""
+        self.dtb(self.head, "t8112-j413", dts("j413", "t8112", DOMAIN, GAP, router))
+        result = self.check()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("/soc/acio@5000/iommu@a00 dart_x apple,t8110-dart okay: "
+                      "no power-domains (new)", result.stdout)
+
+    def test_dart_inside_a_device_on_a_disabled_domain_fails(self):
+        disabled = DOMAIN.replace("{", '{ status = "disabled";')
+        router = self.ROUTER % "power-domains = <&ps_x>;"
+        self.dtb(self.head, "t8112-j413", dts("j413", "t8112", disabled, GAP, router))
+        result = self.check()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("/soc/acio@5000/iommu@a00 dart_x apple,t8110-dart okay: "
+                      "parent's power domain /soc/power-controller@3000 is disabled (new)",
+                      result.stdout)
+
+    def test_dart_inside_a_powered_bus_is_not_exempt(self):
+        # A simple-bus is populated by platform code, not by a driver.
+        bus = self.ROUTER.replace('"apple,t8103-usb4-acio"', '"simple-bus"') % \
+            "power-domains = <&ps_x>;"
+        self.dtb(self.head, "t8112-j413", dts("j413", "t8112", DOMAIN, GAP, bus))
+        result = self.check()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("no power-domains (new)", result.stdout)
+
     def test_without_baseline_every_gap_fails(self):
         result = subprocess.run([sys.executable, str(CHECKER), "--dtb-dir", str(self.head)],
                                 text=True, capture_output=True)

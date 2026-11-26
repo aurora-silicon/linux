@@ -139,7 +139,7 @@ static inline void apple_dart_pm_invalidate(struct apple_dart *dart, bool suspen
  * register used; its power-up flushes every translation, with these locks
  * held, before it enables the streams again.
  */
-static void apple_dart_host_lock(struct apple_dart *dart, unsigned long *flags)
+static void __maybe_unused apple_dart_host_lock(struct apple_dart *dart, unsigned long *flags)
 {
 	struct apple_dart_dcp *streams[] = { dart->dcp, dart->frontend[0], dart->frontend[1] };
 	unsigned int held = 0;
@@ -150,7 +150,7 @@ static void apple_dart_host_lock(struct apple_dart *dart, unsigned long *flags)
 			spin_lock_nested(&streams[i]->lock, held++);
 }
 
-static void apple_dart_host_unlock(struct apple_dart *dart, unsigned long flags)
+static void __maybe_unused apple_dart_host_unlock(struct apple_dart *dart, unsigned long flags)
 {
 	struct apple_dart_dcp *streams[] = { dart->frontend[1], dart->frontend[0], dart->dcp };
 
@@ -517,8 +517,13 @@ static bool apple_dart_dcp_leaf_safe(const struct apple_dart_dcp *dcp, u64 leaf)
 				 IORES_DESC_NONE) == REGION_DISJOINT;
 }
 
+/*
+ * Import SID @sid, whose tables live in [@start, @end); @firmware supplies the
+ * rest of the ADT description. Passed by reference: the tables are ~0.5 KiB.
+ */
 static int apple_dart_dcp_import(struct apple_dart *dart, unsigned int sid,
-				 struct dcp_adt_tables bounds, struct apple_dart_dcp **result)
+				 const struct dcp_adt_tables *firmware, u64 start, u64 end,
+				 struct apple_dart_dcp **result)
 {
 	struct apple_dart_dcp *dcp;
 	u64 root_pa;
@@ -537,7 +542,7 @@ static int apple_dart_dcp_import(struct apple_dart *dart, unsigned int sid,
 			"DCP admission: lock=%d type=%u streams=%u page=%u IAS/OAS=%u/%u range=%pad..%pad TCR%u=%08x enabled=%08x\n",
 			dart->locked, dart->hw->type, dart->num_streams, dart->pgsize,
 			dart->ias, dart->oas, &dart->dma_min, &dart->dma_max, sid, tcr, enabled);
-	ret = apple_dart_dcp_excluded(dart, bounds.start, bounds.end);
+	ret = apple_dart_dcp_excluded(dart, start, end);
 	if (ret)
 		return dev_err_probe(dart->dev, ret, "DCP table storage is not excluded memory\n");
 	dcp = apple_dart_retained_alloc(dart, sizeof(*dcp));
@@ -545,7 +550,9 @@ static int apple_dart_dcp_import(struct apple_dart *dart, unsigned int sid,
 		return -ENOMEM;
 	dcp->dart = dart;
 	dcp->sid = sid;
-	dcp->firmware = bounds;
+	dcp->firmware = *firmware;
+	dcp->firmware.start = start;
+	dcp->firmware.end = end;
 	ret = apple_dart_dcp_excluded_regions(dcp);
 	if (ret)
 		return dev_err_probe(dart->dev, ret, "invalid reserved-memory leaf exclusions\n");
@@ -559,17 +566,17 @@ static int apple_dart_dcp_import(struct apple_dart *dart, unsigned int sid,
 	INIT_LIST_HEAD(&dcp->shared);
 	dcp->ttbr = readl(dart->regs + DART_TTBR(dart, sid, 0));
 	root_pa = ((u64)dcp->ttbr >> 2) << 14;
-	if ((dcp->ttbr & 3) != 1 || (sid != 23 && root_pa != bounds.start) ||
-	    !dcp_dart_contains(bounds.start, bounds.end, root_pa, DCP_DART_PAGE))
+	if ((dcp->ttbr & 3) != 1 || (sid != 23 && root_pa != start) ||
+	    !dcp_dart_contains(start, end, root_pa, DCP_DART_PAGE))
 		return dev_err_probe(dart->dev, -EINVAL,
 			"DCP admission: TTBR%u=%08x root=%llx outside ADT [%llx,%llx) or invalid flags\n",
-			sid, dcp->ttbr, root_pa, bounds.start, bounds.end);
-	storage = apple_dart_retained_memremap(dart, bounds.start, bounds.end - bounds.start);
+			sid, dcp->ttbr, root_pa, start, end);
+	storage = apple_dart_retained_memremap(dart, start, end - start);
 	if (IS_ERR(storage))
 		return PTR_ERR(storage);
 	if (!storage)
 		return -ENOMEM;
-	dcp->root = (u64 *)(storage + root_pa - bounds.start);
+	dcp->root = (u64 *)(storage + root_pa - start);
 	for (unsigned int i = 0; i < DCP_DART_ENTRIES; i++) {
 		u64 pte = READ_ONCE(dcp->root[i]);
 		u64 pa = dcp_dart_pte_phys(pte);
@@ -581,16 +588,16 @@ static int apple_dart_dcp_import(struct apple_dart *dart, unsigned int sid,
 		dcp->entry[i] = pte;
 		if (!pte)
 			continue;
-		if (pa == root_pa || !dcp_dart_contains(bounds.start, bounds.end, pa, DCP_DART_PAGE))
+		if (pa == root_pa || !dcp_dart_contains(start, end, pa, DCP_DART_PAGE))
 			return dev_err_probe(dart->dev, -EINVAL,
 				"DCP admission: root[%u]=%016llx child=%llx outside ADT [%llx,%llx) or aliases root\n",
-				i, pte, pa, bounds.start, bounds.end);
+				i, pte, pa, start, end);
 		for (unsigned int j = 0; j < i; j++)
 			if (dcp->entry[j] && dcp_dart_pte_phys(dcp->entry[j]) == pa)
 				return dev_err_probe(dart->dev, -EINVAL,
 					"DCP admission: roots %u and %u alias child=%llx\n",
 					j, i, pa);
-		dcp->table[i] = (u64 *)(storage + pa - bounds.start);
+		dcp->table[i] = (u64 *)(storage + pa - start);
 		set_bit(i, dcp->foreign);
 		if (sid != 23) {
 			dcp->expected[i] = apple_dart_retained_alloc(dart, DCP_DART_PAGE);
@@ -641,7 +648,7 @@ static int apple_dart_dcp_prepare(struct apple_dart *dart)
 
 	if (ret)
 		return dev_err_probe(dart->dev, ret, "cannot validate existing ADT table handoff\n");
-	return apple_dart_dcp_import(dart, 23, tables, &dart->dcp);
+	return apple_dart_dcp_import(dart, 23, &tables, tables.start, tables.end, &dart->dcp);
 }
 
 static bool apple_dart_dcp_iova(u64 iova)
@@ -863,7 +870,7 @@ put_node:
  */
 static int apple_dart_dispext_prepare(struct apple_dart *dart)
 {
-	struct dcp_adt_tables firmware, bounds;
+	struct dcp_adt_tables firmware;
 	struct dcp_adt_frontend frontend;
 	struct apple_dart_dcp *borrowed;
 	int ret;
@@ -878,10 +885,8 @@ static int apple_dart_dispext_prepare(struct apple_dart *dart)
 		return dev_err_probe(dart->dev, ret, "tables not described\n");
 	if (!(frontend.seen & 4) || frontend.end[1] <= frontend.start[1])
 		return dev_err_probe(dart->dev, -ENODEV, "no SID16 table region\n");
-	bounds = firmware;
-	bounds.start = frontend.start[1];
-	bounds.end = frontend.end[1];
-	ret = apple_dart_dcp_import(dart, 16, bounds, &borrowed);
+	ret = apple_dart_dcp_import(dart, 16, &firmware, frontend.start[1], frontend.end[1],
+				    &borrowed);
 	if (ret)
 		return ret;
 	if (!apple_dart_dcp_registers(borrowed))
@@ -902,10 +907,8 @@ static int apple_dart_dispext_prepare(struct apple_dart *dart)
 		dev_info(dart->dev, "no SID0 table region: SID0 left alone\n");
 		return 0;
 	}
-	bounds = firmware;
-	bounds.start = frontend.start[0];
-	bounds.end = frontend.end[0];
-	ret = apple_dart_dcp_import(dart, 0, bounds, &borrowed);
+	ret = apple_dart_dcp_import(dart, 0, &firmware, frontend.start[0], frontend.end[0],
+				    &borrowed);
 	if (ret || !apple_dart_dcp_registers(borrowed)) {
 		dev_warn(dart->dev, "SID0 not adopted (%d); SID16 is\n", ret);
 		return 0;
@@ -981,12 +984,10 @@ static int apple_dart_frontend_prepare(struct apple_dart *dart)
 	if (ret)
 		return ret;
 	for (unsigned int i = 0; i < 2; i++) {
-		struct dcp_adt_tables bounds = firmware;
 		struct device_node *node;
 
-		bounds.start = frontend.start[i];
-		bounds.end = frontend.end[i];
-		ret = apple_dart_dcp_import(dart, i ? 16 : 0, bounds, &borrowed[i]);
+		ret = apple_dart_dcp_import(dart, i ? 16 : 0, &firmware, frontend.start[i],
+					    frontend.end[i], &borrowed[i]);
 		if (ret)
 			return ret;
 		node = of_find_node_by_path(i ? "disp0_piodma" : "disp0");

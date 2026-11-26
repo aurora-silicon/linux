@@ -779,12 +779,36 @@ static void brcmf_pcie_reset_device(struct brcmf_pciedev_info *devinfo)
 		BRCMF_PCIE_CFGREG_REG_BAR2_CONFIG,
 		BRCMF_PCIE_CFGREG_REG_BAR3_CONFIG
 	};
+	bool fn_reset = false;
+	bool saved = false;
 	u32 i;
 	u32 val;
 	u32 lsc;
 
 	if (!devinfo->ci)
 		return;
+
+	/*
+	 * On chipcommon rev >= 65 the watchdog below also resets PCIe function
+	 * 0 (CC_WD_SSRESET_PCIE_F0_EN), which puts its config space back to the
+	 * chip defaults: e.g. the resizable BAR 2 drops from the size the PCI
+	 * core assigned to 8 MiB. Save what the PCI core programmed, before
+	 * ASPM is turned off for the reset, so it can be put back afterwards.
+	 * Older chips keep their config space, so save nothing there: a saved
+	 * state left behind would stand in for the live one at the next
+	 * suspend.
+	 */
+	core = brcmf_chip_get_chipcommon(devinfo->ci);
+	if (core->rev >= 65) {
+		int err = pci_save_state(devinfo->pdev);
+
+		if (err) {
+			pci_err(devinfo->pdev, "failed to save PCI state: %d\n", err);
+			devinfo->pdev->state_saved = false;
+		} else {
+			saved = true;
+		}
+	}
 
 	/* Disable ASPM */
 	brcmf_pcie_select_core(devinfo, BCMA_CORE_PCIE2);
@@ -800,6 +824,8 @@ static void brcmf_pcie_reset_device(struct brcmf_pciedev_info *devinfo)
 
 	if (core->rev >= 65) {
 		u32 mask = CC_WD_SSRESET_PCIE_F0_EN;
+
+		fn_reset = true;
 
 		core = brcmf_chip_get_core(devinfo->ci, BCMA_CORE_PCIE2);
 		if (core->rev < 66)
@@ -825,6 +851,16 @@ static void brcmf_pcie_reset_device(struct brcmf_pciedev_info *devinfo)
 	brcmf_pcie_select_core(devinfo, BCMA_CORE_PCIE2);
 	pci_write_config_dword(devinfo->pdev, BRCMF_PCIE_REG_LINK_STATUS_CTRL,
 			       lsc);
+
+	/*
+	 * Put the PCI core's configuration back. Otherwise the function runs
+	 * with the reset defaults while the core still holds the assigned
+	 * values, and the next pci_restore_state() (system resume) rewrites
+	 * them on a live, bus-mastering function: BAR 2 changes size under
+	 * running firmware. Only a state saved above is put back.
+	 */
+	if (fn_reset && saved)
+		pci_restore_state(devinfo->pdev);
 
 	core = brcmf_chip_get_core(devinfo->ci, BCMA_CORE_PCIE2);
 	if (core->rev <= 13) {
@@ -1286,6 +1322,7 @@ static int brcmf_pcie_request_irq(struct brcmf_pciedev_info *devinfo)
 
 	brcmf_pcie_intr_disable(devinfo);
 	bus->wowl_wake = pci_pme_capable(pdev, PCI_D3hot);
+	bus->wowl_s2idle_only = false;
 
 	brcmf_dbg(PCIE, "Enter\n");
 
@@ -1320,6 +1357,7 @@ static int brcmf_pcie_request_irq(struct brcmf_pciedev_info *devinfo)
 		}
 		devinfo->wowl_irq = true;
 		bus->wowl_wake = true;
+		bus->wowl_s2idle_only = true;
 	}
 	devinfo->irq_allocated = true;
 	return 0;
@@ -1351,6 +1389,7 @@ static void brcmf_pcie_release_irq(struct brcmf_pciedev_info *devinfo)
 		devinfo->wakeup_created = false;
 	}
 	devinfo->wowl_irq = false;
+	bus->wowl_s2idle_only = false;
 	brcmf_pcie_intr_disable(devinfo);
 	free_irq(pdev->irq, devinfo);
 	pci_disable_msi(pdev);
@@ -3102,22 +3141,6 @@ brcmf_pcie_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	}
 
 	brcmf_dbg(PCIE, "Enter %x:%x\n", pdev->vendor, pdev->device);
-
-	/*
-	 * T8132's BCM4388 IOVA aperture starts above 1 TiB and the message-buffer
-	 * ABI carries full 64-bit host addresses, so do not retain PCI's
-	 * conservative 32-bit default DMA mask on this platform.
-	 */
-	if (pdev->device == BRCM_PCIE_4388_DEVICE_ID &&
-	    of_machine_is_compatible("apple,t8132")) {
-		ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(42));
-		if (ret) {
-			pci_err(pdev, "failed to enable 42-bit DMA: %d\n", ret);
-			return ret;
-		}
-		pci_info(pdev, "using 42-bit DMA addresses\n");
-	}
-
 
 	ret = -ENOMEM;
 	devinfo = kzalloc_obj(*devinfo);

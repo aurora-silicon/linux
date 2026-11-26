@@ -10,7 +10,9 @@ compiled against mock firmware state. A watchdog that finds its command
 finished retires it on its record instead of failing its client; the commands
 behind it then retire past it; every retired command keeps its place and its
 descriptor until a stamp covers it; work that cannot retire that way is failed
-as before. --mutation removes one part of that and must fail.
+as before. Every retired kick with an exact execution record, and only those,
+feeds its channel's run of heavy kicks once (g17/pairs.rs), which gates sibling
+compute fan-out on M5 Pro. --mutation removes one part of that and must fail.
 """
 from pathlib import Path
 import argparse
@@ -79,6 +81,14 @@ def fixture():
         'pub(crate) fn owns_packet(', 'pub(crate) fn retired_held(',
         'pub(crate) fn expire_stamp_wait(', 'pub(crate) fn timeout(',
         'pub(crate) fn can_classify_timeout('])
+    pairs = (G17 / 'pairs.rs').read_text()
+    hz = re.search(r'pub\(crate\) const COMMAND_TIMESTAMP_HZ: u64 = ([0-9_]+);',
+                   (ROOT / 'hw/t8140.rs').read_text()).group(1)
+    gate = '\n'.join([f'pub(crate) const COMMAND_TIMESTAMP_HZ: u64 = {hz};'] + [
+        re.search(r'(?:pub\(crate\) )?const ' + name + r': [^=]+= [^;]+;', pairs).group(0)
+        for name in ['SIBLING_EXECUTION_NS', 'SIBLING_EXECUTION_TICKS', 'SIBLING_SUSTAINED_KICKS']] + [
+        item(pairs, 'pub(crate) fn heavy_run('), item(pairs, 'pub(crate) fn sustained(')]
+    ).replace('crate::hw::t8140::resources::', '')
     backend = '\n'.join([
         item(control, 'pub(super) fn defer_compute_timeout(').replace('pub(super) ', '', 1),
         item(control, 'fn retire_on_record('),
@@ -126,6 +136,9 @@ mod g17 {
     }
     pub(crate) mod job {
         pub(crate) trait Backend { fn fail_vm(&self, error: crate::Error); }
+    }
+    pub(crate) mod pairs {
+''' + gate + r'''
     }
 }
 mod module_parameters {
@@ -235,6 +248,7 @@ pub struct Queue {
     released: bool,
     owner: Option<u64>,
     released_at: u64,
+    heavy_run: u8,
     terminal: Option<(Arc<VmStatus>, Error)>,
     fault_stamp: Option<u32>,
     timed_out_at: u64,
@@ -246,6 +260,10 @@ impl Queue {
     fn valid_ticket(&self, _: &Active, _: &Ticket) -> Result { Ok(()) }
     fn qos_owner(&self) -> qos::Owner { qos::Owner }
     fn classify(&self, _: &dyn Fn(&Arc<VmStatus>) -> recovery::Class) {}
+    fn clear_owner(&mut self, stamp_released_at: bool) {
+        self.owner = None;
+        if stamp_released_at { self.released_at = now_ns(); }
+    }
 ''' + queue + r'''
 }
 
@@ -259,6 +277,13 @@ impl Queues {
             .find(|queue| queue.owner() == Some(owner))
     }
     fn compute_mut(&mut self, owner: u64) -> Option<RefMut<'_, Queue>> { self.compute(owner) }
+    fn compute_for_packet(&self, owner: u64, packet: &Arc<Packet>) -> Option<RefMut<'_, Queue>> {
+        self.compute.iter().flatten().filter_map(|entry| entry.queue.as_deref())
+            .find(|queue| queue.owner() == Some(owner) && queue.owns_packet(packet))
+    }
+    fn compute_for_packet_mut(&mut self, owner: u64, packet: &Arc<Packet>) -> Option<RefMut<'_, Queue>> {
+        self.compute_for_packet(owner, packet)
+    }
     /// Other VMs' heads, as render pairs and other queues give them.
     fn render_timeout_heads(&self) -> impl Iterator<Item = g17::timeout::Head> + '_ {
         self.render.iter().copied()
@@ -308,7 +333,7 @@ mod owed {
             retirement_proved: false, retired_by_teardown: false, spared_quarantine: false,
             spared_deferred: false, awaiting_witness: false, retire_pending: false, last_end: 0,
             previous: None, submitted: 0, retirement_ready: true, released: false, owner: Some(OWNER),
-            released_at: 0, terminal: None, fault_stamp: None, timed_out_at: 0,
+            released_at: 0, heavy_run: 0, terminal: None, fault_stamp: None, timed_out_at: 0,
         }
     }
 
@@ -372,6 +397,60 @@ mod owed {
 
     fn class(packet: &Arc<Packet>) -> Option<recovery::Class> {
         packet.completion.class.get()
+    }
+
+    /// Execution record ticks of a kick lasting `us` microseconds.
+    fn ticks(us: u64) -> u64 { us * g17::pairs::COMMAND_TIMESTAMP_HZ / 1_000_000 }
+
+    #[test]
+    fn only_exact_execution_records_feed_the_heavy_run() {
+        let heavy = ticks(g17::pairs::SIBLING_EXECUTION_NS / 1_000);
+        let mut q = queue(true);
+        let p1 = publish(&mut q, 0x10, true);
+        let p2 = publish(&mut q, 0x11, true);
+        let p3 = publish(&mut q, 0x12, true);
+        record(&mut q, &p1, [1_000, 1_000 + heavy]);
+        record(&mut q, &p2, [1_000 + heavy, 1_000 + 3 * heavy]);
+        // p3 retires without a record: its synthesized envelope measures nothing.
+        q.graph.stamp.set(stamp_of(0x12));
+        let b = backend(q, vec![]);
+        scan(&b);
+        assert!(result(&p3).is_some_and(|result| result.is_ok()));
+        with_queue(&b, |q| {
+            assert_eq!(q.active.len, 0);
+            assert_eq!(q.heavy_run, 2, "two exact heavy records, nothing from the recordless kick");
+            assert!(g17::pairs::sustained(q.heavy_run));
+        });
+        // One short record ends the run.
+        let p4 = with_queue(&b, |q| {
+            let p4 = publish(q, 0x13, true);
+            record(q, &p4, [9_000, 9_000 + ticks(3)]);
+            q.graph.stamp.set(stamp_of(0x13));
+            p4
+        });
+        scan(&b);
+        assert!(result(&p4).is_some());
+        with_queue(&b, |q| assert_eq!(q.heavy_run, 0, "a short kick closes the gate"));
+    }
+
+    #[test]
+    fn a_kick_held_for_its_stamp_is_measured_once() {
+        let heavy = ticks(g17::pairs::SIBLING_EXECUTION_NS / 1_000);
+        let mut q = queue(false);
+        let p1 = publish(&mut q, 0x10, true);
+        let p2 = publish(&mut q, 0x11, true);
+        record(&mut q, &p1, [100, 100 + heavy]);
+        record(&mut q, &p2, [100 + heavy, 100 + 2 * heavy]);
+        let b = backend(q, vec![]);
+        // Late stamps: both retire on their records and stay held for their stamps.
+        advance(60 * MS);
+        scan(&b);
+        assert!(result(&p1).is_some() && result(&p2).is_some());
+        with_queue(&b, |q| assert_eq!((q.active.len, q.heavy_run), (2, 2)));
+        with_queue(&b, |q| q.graph.stamp.set(stamp_of(0x11)));
+        scan(&b);
+        with_queue(&b, |q| assert_eq!((q.active.len, q.heavy_run), (0, 2),
+            "releasing a held descriptor measures nothing again"));
     }
 
     #[test]
@@ -654,7 +733,8 @@ mod owed {
 MUTATIONS = {
     'own-finished': [('_ if own.finished => Decision::Retire,', '_ if own.finished => Decision::Own,')],
     'no-retire-glue': [('verdict.decision = self.retire_on_record(firmware, packet, &mut deferred)?;', '')],
-    'retire-unchecked': [('if !firmware.queues.compute(self.owner).is_some_and(|queue| queue.retired_held(packet)) {',
+    'retire-unchecked': [('if !firmware\n            .queues\n            .compute_for_packet(self.owner, packet)\n'
+                          '            .is_some_and(|queue| queue.retired_held(packet))\n        {',
                           'if false {')],
     'no-expiry': [('if observed_at == Some(STAMP_WAIT_EXPIRED) {', 'if false {')],
     'no-step-past': [('Ok(Some(_)) | Err(EAGAIN) if owed => at += 1,', 'Ok(Some(_)) | Err(EAGAIN) if owed => break,'),
@@ -673,6 +753,13 @@ MUTATIONS = {
                                'if !queue.owns_packet(packet) {')],
     'no-owed-poll': [('        if at != 0 {\n            // Owed stamps come without a completion event',
                       '        if false {\n            // Owed stamps come without a completion event')],
+    # A recordless retirement's synthesized envelope counts as an execution.
+    'count-recordless': [('let execution = front.observed.map(|record| record.timestamps);',
+                          'let execution = Some(timestamps);')],
+    # Releasing a held descriptor measures the kick again.
+    'count-owed-twice': [('                    // The stamp now covers the held command: release its descriptor.\n',
+                          '                    // The stamp now covers the held command: release its descriptor.\n'
+                          '                    self.heavy_run = crate::g17::pairs::heavy_run(self.heavy_run, 0, u64::MAX);\n')],
 }
 
 
