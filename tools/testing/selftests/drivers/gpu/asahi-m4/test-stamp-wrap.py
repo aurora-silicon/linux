@@ -23,6 +23,7 @@ harness = r'''
 #![allow(dead_code)]
 use std::cell::Cell;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 struct Arc;
 impl Arc { fn ptr_eq(a:&Vm,b:&Vm)->bool{a.slot==b.slot} }
 #[derive(Copy,Clone,Debug,PartialEq,Eq)]struct Error(i32);
@@ -42,19 +43,31 @@ impl Object {
 #[derive(Clone,Copy)]enum Channel{Compute,Ta,Fs}
 mod notifier_page {pub const COMPUTE_STAMP:usize=0;pub const COMPUTE_CONTEXT:usize=4;pub const TA_STAMP:usize=8;pub const FS_STAMP:usize=12;pub const FS_RECORD:usize=32;}
 mod notifier {pub const CONTEXT:usize=16;}
-mod manager {pub const COUNTER:usize=0x4c;pub const COMPLETED:usize=0x54;}
+pub mod manager {pub const COUNTER:usize=0x4c;pub const COMPLETED:usize=0x54;}
+mod fw { pub mod graph { pub use crate::manager; } }
 #[derive(Default)]struct CGraph{fw_stamp:Object,qstate:Object,qinfo:Object,notifier:Object}
 struct RGraph{fw_stamp:[Object;2],qstate:[Object;2],qinfo:[Object;2],notifier:Object}
 struct Graph{compute:[CGraph;hw::sizes::COMPUTE_PIPES],render:RGraph}
 struct Vm{slot:u32}struct Job{vm:Vm,resources:Resources}
-struct Resources{compute:Vec<CUnit>,passes:Vec<RUnit>,pools:Pools,shared_uma:bool,shared_retired:u64}
-impl Resources{fn compute(&self)->Result<&Self>{Ok(self)}fn render(&self)->Result<&Self>{Ok(self)}fn compute_unit(&self,k:usize)->Result<&CUnit>{self.compute.get(k).ok_or(EINVAL)}fn render_pass(&self,k:usize)->Result<&RUnit>{self.passes.get(k).ok_or(EINVAL)}fn pb_retired(&self,k:usize)->Result<bool>{self.pools.retired(k)}fn pb_retired_at(&self,k:usize,target:u64)->Result<bool>{self.pools.retired_at(k,target)}fn has_shared_compute_uma(&self)->bool{self.shared_uma}fn compute_uma_retired(&self,count:u32,last_vm_flight:bool)->Result<bool>{let u=self.compute.first().ok_or(EINVAL)?;let needed=self.shared_retired.saturating_add(u64::from(count));let ctr=u.counter.r64(0)?;let comp=u.descriptor.r64(manager::COMPLETED)?;Ok(ctr>=needed&&comp>=needed&&(!last_vm_flight||comp==ctr)&&u.descriptor.r64(manager::COUNTER)?==u.counter.va)}}
+struct SharedComputeUma{retired:AtomicU64,counter:Object,descriptor:Object}
+struct Resources{compute:Vec<CUnit>,passes:Vec<RUnit>,pools:Pools,compute_uma:Option<SharedComputeUma>}
+impl Resources{
+    fn compute(&self)->Result<&Self>{Ok(self)}
+    fn render(&self)->Result<&Self>{Ok(self)}
+    fn compute_unit(&self,k:usize)->Result<&CUnit>{self.compute.get(k).ok_or(EINVAL)}
+    fn render_pass(&self,k:usize)->Result<&RUnit>{self.passes.get(k).ok_or(EINVAL)}
+    fn pb_retired(&self,k:usize)->Result<bool>{self.pools.retired(k)}
+    fn pb_retired_at(&self,k:usize,target:u64)->Result<bool>{self.pools.retired_at(k,target)}
+    fn has_shared_compute_uma(&self)->bool{self.compute_uma.is_some()}
+    __COMPUTE_UMA_RETIRED__
+}
 struct Claims{slot:[u32;16],slot_count:u32,pass:[u32;4]}
 struct Flight{computes:u32,renders:u32,compute_pipe:u8,target:u32,ta_target:u32,fs_target:u32,job:Job,claims:Claims,head:u32,ta_head:u32,fs_head:u32,rec:[u32;3],chan_settled:bool,pb_slot:u32,uma_submitted:u64,csubmitted:[u64;16],recovery_suspect:bool,recovery_started_ns:u64,gate_passed_ns:Option<u64>,unsettled_polls:u32,doomed:bool}
 struct Engine{flights:Vec<Flight>,target:[u32;hw::sizes::COMPUTE_PIPES],ta_target:u32,fs_target:u32,retired_ticks:[u64;4]}
 fn stamp_reached(observed:u32,own:u32,tail:u32)->bool{logic::stamp_reached(observed,own,tail)}
 impl Engine{fn oldest(&self)->Option<&Flight>{self.flights.first()}}
 struct CUnit{counter:Object,descriptor:Object,its:Object,work:Object}
+impl CUnit{fn private_uma(&self)->Result<&Self>{Ok(self)}}
 struct RUnit{scene:Object}
 struct Scrub{compute:Vec<CUnit>,passes:Vec<RUnit>}
 struct Slots{scrub:Scrub}
@@ -86,7 +99,7 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     let mut f=Firmware{
         graph:Graph{compute:core::array::from_fn(|_|CGraph::default()),
             render:RGraph{fw_stamp:Default::default(),qstate:Default::default(),qinfo:Default::default(),notifier:Object::default()}},
-        engine:Engine{flights:vec![Flight{computes:u32::from(!render),renders:u32::from(render),compute_pipe:0,target,ta_target:target,fs_target:target,job:Job{vm:Vm{slot:2},resources:Resources{compute:vec![CUnit{counter:Object::default(),descriptor:Object::default(),its:Object::default(),work:Object::default()}],passes:vec![RUnit{scene:Object::default()}],pools:Pools{full:true,completed:2},shared_uma:false,shared_retired:0}},claims:Claims{slot:[0;16],slot_count:u32::from(!render),pass:[0;4]},head:1,ta_head:1,fs_head:1,rec:[1;3],chan_settled:false,pb_slot:0,uma_submitted:2,csubmitted:{let mut a=[0u64;16];if !render{a[0]=ordinal;}a},recovery_suspect:false,recovery_started_ns:0,gate_passed_ns:None,unsettled_polls:0,doomed:false}],target:target_arr,ta_target:target,fs_target:target,retired_ticks:[0;4]},
+        engine:Engine{flights:vec![Flight{computes:u32::from(!render),renders:u32::from(render),compute_pipe:0,target,ta_target:target,fs_target:target,job:Job{vm:Vm{slot:2},resources:Resources{compute:vec![CUnit{counter:Object::default(),descriptor:Object::default(),its:Object::default(),work:Object::default()}],passes:vec![RUnit{scene:Object::default()}],pools:Pools{full:true,completed:2},compute_uma:None}},claims:Claims{slot:[0;16],slot_count:u32::from(!render),pass:[0;4]},head:1,ta_head:1,fs_head:1,rec:[1;3],chan_settled:false,pb_slot:0,uma_submitted:2,csubmitted:{let mut a=[0u64;16];if !render{a[0]=ordinal;}a},recovery_suspect:false,recovery_started_ns:0,gate_passed_ns:None,unsettled_polls:0,doomed:false}],target:target_arr,ta_target:target,fs_target:target,retired_ticks:[0;4]},
         slots:Slots{scrub:Scrub{compute:vec![CUnit{counter:Object::default(),descriptor:Object::default(),its:Object::default(),work:Object::default()}],passes:vec![RUnit{scene:Object::default()}]}},
         pools:Pools{full:true,completed:2},channels:TopChannels{compute_producer:1},queue_passed:true,last_chan_passed:Cell::new(None),
     };
@@ -677,39 +690,52 @@ mod queue_proof {
 }
 
 #[test]fn shared_compute_uma_retires_out_of_order_and_checks_idle_conservation(){
+    // Exercise production `Prepared::compute_uma_retired()` extracted from resources.rs.
+    let mk_uma=|retired:u64,ctr:u64,comp:u64|{
+        let mut counter=Object::default();
+        counter.set(0,ctr);
+        let mut descriptor=Object::default();
+        descriptor.set(manager::COMPLETED,comp);
+        descriptor.set(manager::COUNTER,counter.va);
+        SharedComputeUma{retired:AtomicU64::new(retired),counter,descriptor}
+    };
     // Two flights of the same VM share one UMA descriptor across pipe 0 and pipe 1:
     // counter == 2, COMPLETED == 1. Flight 1 (pipe 1) retires immediately while flight 0
-    // is still active (`last_vm_flight == false`), then the final remaining flight requires
-    // exact conservation (`COMPLETED == counter`).
+    // is still active (`last_vm_flight == false`).
     let mut f=firmware(false,1);
-    f.engine.flights[0].job.resources.shared_uma=true;
-    f.engine.flights[0].job.resources.compute[0].counter.set(0,2);
-    f.engine.flights[0].job.resources.compute[0].descriptor.set(manager::COMPLETED,1);
+    f.engine.flights[0].job.resources.compute_uma=Some(mk_uma(0,2,1));
     let mut second=firmware(false,2).engine.flights.pop().unwrap();
     second.compute_pipe=1;
-    second.job.resources.shared_uma=true;
-    second.job.resources.compute[0].counter.set(0,2);
-    second.job.resources.compute[0].descriptor.set(manager::COMPLETED,1);
+    second.job.resources.compute_uma=Some(mk_uma(0,2,1));
     f.graph.compute[1].fw_stamp.set(0,u64::from(second.target));
     f.graph.compute[1].notifier.set(notifier_page::COMPUTE_STAMP,u64::from(second.target));
     f.graph.compute[1].notifier.set(notifier_page::COMPUTE_CONTEXT,2);
     f.engine.target[1]=second.target;
     f.engine.flights.push(second);
     assert_eq!(f.retired_at(1),Ok(Retirement::Full));
-    // Removing flight 1 leaves flight 0 as the last VM flight with retired == 1:
-    // COMPLETED == 1 < needed (2) must stay Pending; COMPLETED == 2 == counter retires Full.
+    // With only flight 0 left (`last_vm_flight == true`), even when `needed == 1 <= COMPLETED`
+    // (retired == 0, count == 1, counter == 2, COMPLETED == 1), idle conservation MUST reject
+    // `COMPLETED != counter` so an unretired earlier command cannot be missed.
     f.engine.flights.pop();
-    f.engine.flights[0].job.resources.shared_retired=1;
     assert_eq!(f.retired_at(0),Ok(Retirement::Pending));
-    f.engine.flights[0].job.resources.compute[0].descriptor.set(manager::COMPLETED,2);
+    // Advancing `retired == 1` (`needed == 2 > COMPLETED == 1`) also stays Pending.
+    f.engine.flights[0].job.resources.compute_uma.as_ref().unwrap().retired.store(1,Ordering::Release);
+    assert_eq!(f.retired_at(0),Ok(Retirement::Pending));
+    // Matching `COMPLETED == counter == 2` retires Full.
+    f.engine.flights[0].job.resources.compute_uma.as_mut().unwrap().descriptor.set(manager::COMPLETED,2);
     assert_eq!(f.retired_at(0),Ok(Retirement::Full));
+    // Mismatched descriptor COUNTER pointer stays Pending.
+    f.engine.flights[0].job.resources.compute_uma.as_mut().unwrap().descriptor.set(manager::COUNTER,0x9999);
+    assert_eq!(f.retired_at(0),Ok(Retirement::Pending));
 }
 
 '''.replace('__LOGIC__', str(backend/'recovery/logic.rs'))
-for token, path, name in [('__STAMP_SEED__','encode.rs','stamp_seed'),('__STAMP__','encode.rs','stamp'),('__RETIRED__','poll.rs','retired'),('__RETIRED_AT__','poll.rs','retired_at'),('__RETIRED_FLIGHT__','poll.rs','retired_flight'),('__RETIRED_FLIGHT_CLASSES__','poll.rs','retired_flight_classes'),('__RETIRED_SNAPSHOT__','poll.rs','retired_snapshot'),('__RETIRED_SNAPSHOT_AT__','poll.rs','retired_snapshot_at'),('__QUEUE_RING_RECEIPT__','poll.rs','queue_ring_receipt'),('__QUEUE_RING_PASSED__','poll.rs','queue_ring_passed'),('__CHANNEL_RECEIPT__','poll.rs','channel_receipt'),('__LATCH_COMPUTE_CHANNEL_RECEIPTS__','poll.rs','latch_compute_channel_receipts'),('__QUEUE_RECEIPT__','poll.rs','queue_receipt'),('__QUEUE_PASSED__','poll.rs','queue_passed'),('__GRAPH_FW__','graph.rs','graph_fw'),('__QINFO_CACHED__','graph.rs','qinfo_cached')]:
+for token, path, name in [('__STAMP_SEED__','encode.rs','stamp_seed'),('__STAMP__','encode.rs','stamp'),('__RETIRED__','poll.rs','retired'),('__RETIRED_AT__','poll.rs','retired_at'),('__RETIRED_FLIGHT__','poll.rs','retired_flight'),('__RETIRED_FLIGHT_CLASSES__','poll.rs','retired_flight_classes'),('__RETIRED_SNAPSHOT__','poll.rs','retired_snapshot'),('__RETIRED_SNAPSHOT_AT__','poll.rs','retired_snapshot_at'),('__QUEUE_RING_RECEIPT__','poll.rs','queue_ring_receipt'),('__QUEUE_RING_PASSED__','poll.rs','queue_ring_passed'),('__CHANNEL_RECEIPT__','poll.rs','channel_receipt'),('__LATCH_COMPUTE_CHANNEL_RECEIPTS__','poll.rs','latch_compute_channel_receipts'),('__QUEUE_RECEIPT__','poll.rs','queue_receipt'),('__QUEUE_PASSED__','poll.rs','queue_passed'),('__GRAPH_FW__','graph.rs','graph_fw'),('__QINFO_CACHED__','graph.rs','qinfo_cached'),('__COMPUTE_UMA_RETIRED__','resources.rs','compute_uma_retired')]:
     body = function((backend/path).read_text(),name)
     if token in ('__RETIRED_FLIGHT__', '__RETIRED_FLIGHT_CLASSES__', '__RETIRED_SNAPSHOT_AT__'):
         body = body.replace('super::hw::', 'hw::')
+    if token == '__COMPUTE_UMA_RETIRED__':
+        body = body.replace('super::fw::', 'fw::')
     harness=harness.replace(token, body)
 hw_text=(backend/'hw.rs').read_text()
 def mod_block(text, name):

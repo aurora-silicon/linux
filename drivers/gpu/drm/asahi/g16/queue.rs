@@ -312,6 +312,7 @@ impl Queue {
                 .quarantined_compute_uma_mask
                 .load(Ordering::Acquire),
             next_compute_uma_slot: &self.shared.next_compute_uma_slot,
+            compute_uma_slot_users: &self.shared.compute_uma_slot_users,
             expand_render_ext: self.shared.base_render_quarantined.load(Ordering::Acquire),
             quarantined_pb_mask: self.shared.quarantined_pb_mask.load(Ordering::Acquire),
             next_pb_slot: &self.shared.next_pb_slot,

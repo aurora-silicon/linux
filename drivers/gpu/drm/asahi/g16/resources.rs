@@ -195,10 +195,17 @@ impl SharedComputeUma {
         vm: &mmu::Vm,
         live: &Arc<super::vm::LiveToken>,
         uma_slot_idx: usize,
+        pool_va_idx: usize,
     ) -> Result<Arc<Self>> {
+        if uma_slot_idx >= super::hw::sizes::COMPUTE_UMA_SLOTS
+            || pool_va_idx >= super::hw::sizes::COMPUTE_UNITS
+        {
+            return Err(EIO);
+        }
         let placement = Placement::Base;
         let sh = super::object::Class::Shared;
-        let state = placement.state(0);
+        let va_idx = pool_va_idx as u64;
+        let state = placement.state(va_idx);
         let seeds = placement.seeds();
         let uma_slot = super::hw::engine::COMPUTE_UMA_SLOT + uma_slot_idx as u32;
         let mut fw = factory.fw_objects();
@@ -213,7 +220,7 @@ impl SharedComputeUma {
             class: sh,
             placement: super::object::Placement::Anywhere,
             offset: 0,
-            client: Some((placement.pool(0), super::hw::pte::LEAF_NC)),
+            client: Some((placement.pool(va_idx), super::hw::pte::LEAF_NC)),
             lower: None,
             cpu: false,
         })?;
@@ -221,7 +228,7 @@ impl SharedComputeUma {
             &mut objects,
             placement.freelist_bytes(),
             sh,
-            super::graph::Client::nc(placement.freelist(0)),
+            super::graph::Client::nc(placement.freelist(va_idx)),
             0,
             false,
         )?;
@@ -280,7 +287,6 @@ impl core::ops::Deref for ComputeArena {
 }
 pub(crate) struct ComputeInner {
     pub(crate) unit: ComputeSlot,
-    _shared_uma: Option<Arc<SharedComputeUma>>,
     _objects: Objects,
     // Mappings must disappear while their root still owns its ASID.
     _bind: mmu::VmBind,
@@ -300,14 +306,17 @@ const BURST_COMMANDS: usize = 3;
 impl ComputeArena {
     /// Freelist entries of the unit's UMA pool.
     pub(crate) fn seeds(&self) -> u32 {
-        self.unit.seeds
+        self.unit
+            .private_uma
+            .as_ref()
+            .map_or(Placement::Base.seeds(), |u| u.seeds)
     }
     /// Allocates one self-contained compute unit at local VA index `local` bound to device-wide
     /// hardware ledger slot `hw_slot` (`local` and `placement` fix its client addresses; `hw_slot`
     /// selects its shared device-lifetime command records).
     #[expect(
         clippy::too_many_arguments,
-        reason = "Constructs one per-unit compute arena with optional VM-shared UMA backing."
+        reason = "Constructs one per-unit compute arena with optional VM-shared UMA mode."
     )]
     fn new(
         factory: &Factory,
@@ -317,24 +326,12 @@ impl ComputeArena {
         local: usize,
         hw_slot: usize,
         placement: Placement,
-        shared_uma: Option<&Arc<SharedComputeUma>>,
+        shared_uma: bool,
     ) -> Result<Arc<Self>> {
         let cmds = factory.compute_cmds(hw_slot)?;
         let mut objects = factory.objects(vm);
-        let unit = if let Some(u) = shared_uma {
-            ComputeSlot::new_shared_in(
-                &mut objects,
-                local as u64,
-                u.uma_slot,
-                u.descriptor.clone(),
-                u.pool.clone(),
-                u.pool_state.clone(),
-                u.page_list.clone(),
-                u.counter.clone(),
-                u.uma_lease.clone(),
-                u.seeds,
-                &cmds,
-            )?
+        let unit = if shared_uma {
+            ComputeSlot::new_shared_in(&mut objects, local as u64, &cmds)?
         } else {
             ComputeSlot::new_in(
                 &mut objects,
@@ -349,7 +346,6 @@ impl ComputeArena {
         Ok(Arc::new(
             Self(crate::cleanup::Deferred::new(ComputeInner {
                 unit,
-                _shared_uma: shared_uma.cloned(),
                 _objects: objects,
                 _bind: bind.clone(),
                 _live: live.clone(),
@@ -371,7 +367,7 @@ pub(crate) struct ComputeUnitSet {
     hw_slots: Option<[usize; super::hw::sizes::SCS_COMPUTE_UNITS]>,
 }
 impl ComputeUnitSet {
-    /// Units `range` sharing `shared_uma` (when `Some`) or owning per-unit UMA pools.
+    /// Units `range` in shared-UMA mode (`shared_uma == true`) or owning per-unit UMA pools.
     fn new(
         factory: &Factory,
         bind: &mmu::VmBind,
@@ -379,7 +375,7 @@ impl ComputeUnitSet {
         live: &Arc<super::vm::LiveToken>,
         range: core::ops::Range<usize>,
         placement: Placement,
-        shared_uma: Option<&Arc<SharedComputeUma>>,
+        shared_uma: bool,
     ) -> Result<Arc<Self>> {
         let mut units = KVec::with_capacity(range.len(), GFP_KERNEL)?;
         for k in range {
@@ -417,7 +413,7 @@ impl ComputeUnitSet {
                     local,
                     hw_slot,
                     Placement::Scs { seeds },
-                    None,
+                    false,
                 )?,
                 GFP_KERNEL,
             )?;
@@ -501,6 +497,8 @@ pub(crate) struct PrepareHints<'a> {
     pub(crate) quarantined_compute_uma_mask: u32,
     /// Round-robin cursor assigning a VM's shared compute UMA slot in `0..COMPUTE_UMA_SLOTS`.
     pub(crate) next_compute_uma_slot: &'a AtomicU32,
+    /// Live open VMs currently holding each hardware compute UMA slot (`0..COMPUTE_UMA_SLOTS`).
+    pub(crate) compute_uma_slot_users: &'a Arc<[AtomicU32; super::hw::sizes::COMPUTE_UMA_SLOTS]>,
     /// A base render pass slot (`0..BASE_RENDER_SLOTS`) is quarantined: allocate extension slots.
     pub(crate) expand_render_ext: bool,
     /// Bitmask of permanently quarantined device-wide PB/UMA allocator slots (`0..PB_SLOTS`).
@@ -511,17 +509,59 @@ pub(crate) struct PrepareHints<'a> {
     pub(crate) active_render_vms: &'a Arc<AtomicU32>,
 }
 
-/// Picks one non-quarantined hardware compute UMA slot in `0..COMPUTE_UMA_SLOTS`, rotating from
-/// `start` so up to 32 concurrent non-SCS compute VMs occupy disjoint hardware UMA slots.
-fn pick_compute_uma_slot(start: usize, quarantined_mask: u32) -> Result<usize> {
-    let n = super::hw::sizes::COMPUTE_UMA_SLOTS;
-    for offset in 0..n {
-        let slot = (start + offset) % n;
-        if (quarantined_mask & (1u32 << slot)) == 0 {
-            return Ok(slot);
+/// Live-VM occupancy lease on one hardware compute UMA slot (`0..COMPUTE_UMA_SLOTS`).
+///
+/// Held only by an open VM's [`Ready`] cache and released immediately on [`Cache::close`],
+/// [`Ready::drop`], or quarantine migration so closed or migrated VMs never pin slot occupancy.
+struct ComputeUmaOccupancy {
+    users: Arc<[AtomicU32; super::hw::sizes::COMPUTE_UMA_SLOTS]>,
+    slot_idx: usize,
+}
+impl ComputeUmaOccupancy {
+    fn acquire(
+        users: &Arc<[AtomicU32; super::hw::sizes::COMPUTE_UMA_SLOTS]>,
+        slot_idx: usize,
+    ) -> Self {
+        users[slot_idx].fetch_add(1, Ordering::AcqRel);
+        Self {
+            users: users.clone(),
+            slot_idx,
         }
     }
-    Err(EIO)
+}
+impl Drop for ComputeUmaOccupancy {
+    fn drop(&mut self) {
+        let prev = self.users[self.slot_idx].fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(prev != 0);
+    }
+}
+
+/// Picks one non-quarantined hardware compute UMA slot in `0..COMPUTE_UMA_SLOTS`, rotating from
+/// `start`. Prefers an unoccupied healthy slot (`slot_users[slot] == 0`) so live compute VMs never
+/// share a hardware UMA slot while any healthy slot is free; when more than
+/// `COMPUTE_UMA_SLOTS - quarantined` live compute VMs are open concurrently, selects the
+/// least-loaded healthy slot.
+fn pick_compute_uma_slot(
+    start: usize,
+    quarantined_mask: u32,
+    slot_users: &[AtomicU32; super::hw::sizes::COMPUTE_UMA_SLOTS],
+) -> Result<usize> {
+    let n = super::hw::sizes::COMPUTE_UMA_SLOTS;
+    let mut best: Option<(usize, u32)> = None;
+    for offset in 0..n {
+        let slot = (start + offset) % n;
+        if (quarantined_mask & (1u32 << slot)) != 0 {
+            continue;
+        }
+        let users = slot_users[slot].load(Ordering::Acquire);
+        if users == 0 {
+            return Ok(slot);
+        }
+        if best.is_none_or(|(_, prev)| users < prev) {
+            best = Some((slot, users));
+        }
+    }
+    best.map(|(slot, _)| slot).ok_or(EIO)
 }
 
 /// Selects `SCS_COMPUTE_UNITS` distinct hardware compute ledger indices for a VM's SCS compute
@@ -1046,6 +1086,10 @@ struct Ready {
     compute_ext: Option<Arc<ComputeUnitSet>>,
     /// Single VM-shared compute UMA descriptor, counter, and 32 MiB pool for non-SCS compute.
     compute_uma: Option<Arc<SharedComputeUma>>,
+    /// Live-VM occupancy lease for `compute_uma`; released on close, drop, or quarantine migration.
+    compute_uma_occ: Option<ComputeUmaOccupancy>,
+    /// Next per-VM client VA window index (`0..COMPUTE_UNITS`) for `SharedComputeUma` allocation.
+    compute_uma_va_idx: usize,
     /// SCS-capable units, for jobs with compute scratch.
     compute_scs: Option<Arc<ComputeUnitSet>>,
     render: Option<Arc<RenderArena>>,
@@ -1262,6 +1306,7 @@ impl Cache {
                 ready.compute.take(),
                 ready.compute_ext.take(),
                 ready.compute_uma.take(),
+                ready.compute_uma_occ.take(),
                 ready.compute_scs.take(),
                 ready.render.take(),
                 core::mem::take(&mut ready.render_ext),
@@ -1312,30 +1357,46 @@ impl Cache {
             if vm.status.get() != 0 || vm.vm.is_closed() || self.closed.load(Ordering::Acquire) {
                 return Err(EIO);
             }
-            if compute && !compute_scs && ready.compute.is_none() {
-                if ready.compute_uma.is_none() {
+            if compute && !compute_scs {
+                let needs_uma = ready.compute_uma.as_ref().is_none_or(|u| {
+                    (hints.quarantined_compute_uma_mask & (1u32 << u.uma_slot_idx)) != 0
+                });
+                if needs_uma {
+                    let pool_va_idx = ready.compute_uma_va_idx;
+                    if pool_va_idx >= super::hw::sizes::COMPUTE_UNITS {
+                        return Err(EIO);
+                    }
                     let start =
                         hints.next_compute_uma_slot.fetch_add(1, Ordering::Relaxed) as usize;
-                    let slot_idx =
-                        pick_compute_uma_slot(start, hints.quarantined_compute_uma_mask)?;
-                    ready.compute_uma = Some(SharedComputeUma::new(
+                    let slot_idx = pick_compute_uma_slot(
+                        start,
+                        hints.quarantined_compute_uma_mask,
+                        hints.compute_uma_slot_users,
+                    )?;
+                    let fresh = SharedComputeUma::new(
                         &self.factory,
                         &self.bind,
                         &vm.vm,
                         &self.live,
                         slot_idx,
+                        pool_va_idx,
+                    )?;
+                    let occ = ComputeUmaOccupancy::acquire(hints.compute_uma_slot_users, slot_idx);
+                    ready.compute_uma_va_idx = pool_va_idx + 1;
+                    ready.compute_uma = Some(fresh);
+                    ready.compute_uma_occ = Some(occ);
+                }
+                if ready.compute.is_none() {
+                    ready.compute = Some(ComputeUnitSet::new(
+                        &self.factory,
+                        &self.bind,
+                        &vm.vm,
+                        &self.live,
+                        0..BASE_COMPUTE_UNITS,
+                        Placement::Base,
+                        true,
                     )?);
                 }
-                let shared_uma = ready.compute_uma.clone();
-                ready.compute = Some(ComputeUnitSet::new(
-                    &self.factory,
-                    &self.bind,
-                    &vm.vm,
-                    &self.live,
-                    0..BASE_COMPUTE_UNITS,
-                    Placement::Base,
-                    shared_uma.as_ref(),
-                )?);
             }
             if compute_scs {
                 match ready.compute_scs.as_ref().map(|set| set.seeds()) {
@@ -1379,7 +1440,7 @@ impl Cache {
                             &self.live,
                             BASE_COMPUTE_UNITS..units,
                             Placement::Base,
-                            state.compute_uma.as_ref(),
+                            true,
                         )
                         .ok();
                     }
@@ -1776,6 +1837,17 @@ impl Prepared {
     /// Whether this compute job uses the VM's shared compute UMA descriptor.
     pub(crate) fn has_shared_compute_uma(&self) -> bool {
         self.compute_uma.is_some()
+    }
+    /// Hardware compute UMA slot index (`0..COMPUTE_UMA_SLOTS`) bound to compute unit `k`.
+    pub(crate) fn compute_uma_slot_for(&self, k: usize) -> Option<usize> {
+        if let Some(uma) = &self.compute_uma {
+            Some(uma.uma_slot_idx)
+        } else {
+            self.compute_unit(k)
+                .ok()
+                .and_then(|u| u.private_uma.as_ref())
+                .map(super::slots::PrivateComputeUma::uma_slot_idx)
+        }
     }
     /// Hardware compute UMA slot bitmask (`0..COMPUTE_UMA_SLOTS`) used by this job's compute work.
     pub(crate) fn compute_uma_mask(&self) -> u32 {

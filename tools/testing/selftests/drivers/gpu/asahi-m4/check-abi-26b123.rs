@@ -316,11 +316,16 @@ fn compute_work(out: &std::path::Path) {
         encode::validate_shared_compute_descriptor(&r_sep, &shared_desc, r_sep.submitted - 1),
         Ok(r_sep.submitted),
     );
-    assert!(encode::validate_shared_compute_descriptor(&r_sep, &desc, r_sep.submitted - 1).is_err());
+    assert!(
+        encode::validate_shared_compute_descriptor(&r_sep, &desc, r_sep.submitted - 1).is_err()
+    );
     let mut bad_shared = shared_desc;
     bad_shared[fw::graph::manager::INDEX..fw::graph::manager::INDEX + 4]
         .copy_from_slice(&(r_sep.uma_slot + 1).to_le_bytes());
-    assert!(encode::validate_shared_compute_descriptor(&r_sep, &bad_shared, r_sep.submitted - 1).is_err());
+    assert!(
+        encode::validate_shared_compute_descriptor(&r_sep, &bad_shared, r_sep.submitted - 1)
+            .is_err()
+    );
     for (name, (w, q)) in ["25g83", "26b123"].iter().zip(&images) {
         let mut all = w.to_vec(); all.extend(q);
         std::fs::write(out.join(format!("compute-{name}.bin")), all).unwrap();

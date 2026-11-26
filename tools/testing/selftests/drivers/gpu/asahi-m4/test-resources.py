@@ -93,6 +93,8 @@ pub mod sync {
     pub mod aref {pub struct ARef<T>(T);impl From<&crate::device::Device>for ARef<crate::device::Device>{fn from(v:&crate::device::Device)->Self{Self(v.clone())}}}
 }
 pub mod mmu {
+    pub type Vm = crate::g16::vm::MockVm;
+    #[derive(Clone)]
     pub struct VmBind{pub live:std::sync::Arc<std::sync::atomic::AtomicU32>,pub released:std::sync::Arc<std::sync::atomic::AtomicBool>}
     impl Drop for VmBind{fn drop(&mut self){use std::sync::atomic::Ordering;assert_eq!(self.live.load(Ordering::Acquire),1);self.released.store(true,Ordering::Release);}}
 }
@@ -250,9 +252,17 @@ pub mod g16 {
                     || self.vm.cache.as_ref().is_some_and(|cache| cache.renders_unpublished())
             }
         }
-        struct Registry{live:std::sync::Arc<std::sync::atomic::AtomicU32>}impl Registry{fn release(&self,_file:u64){self.live.fetch_sub(1,Ordering::AcqRel);}}
+        pub struct Registry{pub live:std::sync::Arc<std::sync::atomic::AtomicU32>}impl Registry{fn release(&self,_file:u64){self.live.fetch_sub(1,Ordering::AcqRel);}}
         __LIVE_TOKEN__
         __LIVE_DROP__
+        pub fn test_live_token() -> (mmu::VmBind, Arc<LiveToken>, std::sync::Arc<AtomicBool>) {
+            let live = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1));
+            let released = std::sync::Arc::new(AtomicBool::new(false));
+            let registry = Arc::new(Registry { live: live.clone() }, 0).unwrap();
+            let bind = mmu::VmBind { live, released: released.clone() };
+            let token = Arc::new(LiveToken { registry, bind: Some(bind.clone()), file_id: 0 }, 0).unwrap();
+            (bind, token, released)
+        }
         #[test]fn accounting_outlives_deferred_arenas_and_releases_binding_first(){
             use std::sync::atomic::{AtomicU32,AtomicBool};
             let count=std::sync::Arc::new(AtomicU32::new(1));let released=std::sync::Arc::new(AtomicBool::new(false));
@@ -264,9 +274,14 @@ pub mod g16 {
         }
     }
     pub mod resources {
-        use core::sync::atomic::{AtomicU64,Ordering};use crate::*;
+        use core::sync::atomic::{AtomicU32,AtomicU64,Ordering};use crate::*;
+        use crate::sync::Arc;
+        use super::object::{Factory,FwObject,Objects};
+        use super::slots::Placement;
+        __SHARED_COMPUTE_UMA__
+        __COMPUTE_UMA_OCCUPANCY__
         pub struct PassDirty<'a>{pub tpc:&'a AtomicU64,pub tilemap:&'a AtomicU64,pub tilemap_last:&'a AtomicU64,pub tilemap_clean:&'a AtomicU64,pub heap:&'a AtomicU64}
-        pub struct ComputeArena{pub compute:KVec<super::slots::ComputeSlot>,pub render:Option<crate::sync::Arc<RenderArena>>,pub hw_slots:Option<[usize;super::hw::sizes::SCS_COMPUTE_UNITS]>}
+        pub struct ComputeArena{pub compute:KVec<super::slots::ComputeSlot>,pub render:Option<crate::sync::Arc<RenderArena>>,pub hw_slots:Option<[usize;super::hw::sizes::SCS_COMPUTE_UNITS]>,pub shared_uma:Option<crate::sync::Arc<SharedComputeUma>>}
         // A job's compute units; here one arena.
         pub type Prepared=ComputeArena;
         #[derive(Clone)]
@@ -312,6 +327,19 @@ pub mod g16 {
                 COMPUTE_OWNER_ARENAS
                     .with(|a|a.borrow().as_ref().and_then(|v|v.get(idx).cloned()))
                     .or_else(||COMPUTE_OWNER_ARENA.with(|a|a.borrow().clone()))
+            }
+            pub fn shared_compute_uma(&self)->Option<&crate::sync::Arc<SharedComputeUma>>{
+                self.shared_uma.as_ref()
+            }
+            pub fn compute_uma_slot_for(&self,k:usize)->Option<usize>{
+                if let Some(u)=&self.shared_uma {
+                    Some(u.uma_slot_idx)
+                } else {
+                    self.compute_unit(k)
+                        .ok()
+                        .and_then(|u|u.private_uma.as_ref())
+                        .map(|u|u.uma_slot_idx())
+                }
             }
             pub fn render_arena(&self)->Option<crate::sync::Arc<RenderArena>>{self.render.clone()}
             pub fn render_passes(&self)->Result<usize>{self.render.as_deref().map(|r|r.passes.len()).ok_or(EINVAL)}
@@ -558,7 +586,7 @@ pub mod g16 {
         let mut compute=KVec::new();let mut passes=KVec::new();
         let f=g16::object::Factory;
         for k in 0..2{compute.push(g16::slots::ComputeSlot::new(o,&f,k,&crate::g16::object::test_unit_cmds(k)).unwrap(),0).unwrap();passes.push(g16::slots::PassSlot::new(o, k, 1, &crate::g16::object::test_cmds((k) as u64)).unwrap(),0).unwrap();}
-        Arenas{compute:g16::resources::ComputeArena{compute,render:None,hw_slots:None},render:render_arena(passes)}
+        Arenas{compute:g16::resources::ComputeArena{compute,render:None,hw_slots:None,shared_uma:None},render:render_arena(passes)}
     }
     fn retire_render(s:&mut Slots,k:usize){let mut c=Claims::new();c.pass[0]=k as u32;c.pass_mask=1<<k;s.publish(&mut c).unwrap();s.retire(&mut c).unwrap();}
     fn drain_scrubs(batch:g16::slots::ScrubBatch)->bool{let mut q=g16::slots::ScrubQueue::new();q.push_batch(batch);let mut wake=false;while let Some(mut item)=q.pop(){wake|=item.run_one();}wake}
@@ -611,7 +639,7 @@ pub mod g16 {
         for a in &o.objects{if let Some(g)=a.gva{assert_eq!(a.client_leaf,Some(__PRIVATE_RW__),"private GPU alias must match qualified J713 NC RW PTE");let base=g-a.offset as u64;assert_eq!(base&0x3fff,0);assert_eq!(a.mapped&0x3fff,0);assert!(base>=0x7000000000);assert!(base+a.mapped as u64<=0x7100000000);aliases.push((base,base+a.mapped as u64));}}
         aliases.push((0x1000000000,0x1000010000)); // Per-VM context store.
         aliases.sort();for a in aliases.windows(2){assert!(a[0].1<=a[1].0,"overlap {:x?} {:x?}",a[0],a[1]);}
-        for (k,s) in arena.compute.compute.iter().enumerate(){assert_eq!(s.work.lower_gva.unwrap()&0x3fff,0);assert_eq!(s.work.size,0x2000);assert_eq!(s.pool.size,0x2000000);assert_eq!(s.pool_state.size,0x20000);assert_eq!(s.page_list.size,0x4000);assert_eq!(s.context_store.size,0x40000);assert_eq!(s.pool_state.r32(0).unwrap()as u64 |((s.pool_state.r32(4).unwrap()as u64)<<32),s.pool.gva.unwrap());assert_eq!(pools.allocator_refs_for(k).unwrap().parameter_id,k as u32);}
+        for (k,s) in arena.compute.compute.iter().enumerate(){let u=s.private_uma().unwrap();assert_eq!(s.work.lower_gva.unwrap()&0x3fff,0);assert_eq!(s.work.size,0x2000);assert_eq!(u.pool.size,0x2000000);assert_eq!(u.pool_state.size,0x20000);assert_eq!(u.page_list.size,0x4000);assert_eq!(s.context_store.size,0x40000);assert_eq!(u.pool_state.r32(0).unwrap()as u64 |((u.pool_state.r32(4).unwrap()as u64)<<32),u.pool.gva.unwrap());assert_eq!(pools.allocator_refs_for(k).unwrap().parameter_id,k as u32);}
         // One PB heap per VM, shared by both render allocators.
         assert_eq!(aliases.len(),42);
     }
@@ -702,9 +730,9 @@ pub mod g16 {
         }
         assert_ne!(ca.work.va, ca.seq.va);
         assert_ne!(ca.seq.va, ca.barrier.va);
-        assert_eq!(ca.descriptor.class, Class::Fw);
-        assert_eq!(cb.descriptor.class, Class::Fw);
-        assert_ne!(ca.descriptor.va, cb.descriptor.va);
+        assert_eq!(ca.private_uma().unwrap().descriptor.class, Class::Fw);
+        assert_eq!(cb.private_uma().unwrap().descriptor.class, Class::Fw);
+        assert_ne!(ca.private_uma().unwrap().descriptor.va, cb.private_uma().unwrap().descriptor.va);
         assert!(vm_a.objects.iter().chain(vm_b.objects.iter()).all(|o| o.class != Class::FwCoherent));
         assert!(vm_a
             .objects
@@ -791,7 +819,8 @@ pub mod g16 {
             }
         }
         for s in arena.compute.compute.iter() {
-            for object in [&s.preempt,&s.pool,&s.pool_state,&s.page_list,&s.context_store,&s.aux] {
+            let u = s.private_uma().unwrap();
+            for object in [&s.preempt,&u.pool,&u.pool_state,&u.page_list,&s.context_store,&s.aux] {
                 assert_eq!(object.client_leaf,Some(0x00c0000000000c8b));
                 assert!(object.gva.is_some());
             }
@@ -851,14 +880,15 @@ pub mod g16 {
     }
     #[test]fn reuse_preserves_pool_lists_counter_and_requires_full_displacement(){
         let mut o=Objects::new();let mut s=Slots::new().unwrap();let arena=arenas(&mut o);
-        arena.compute.compute[0].pool_state.w64(8,0xdeadbeef).unwrap();
-        arena.compute.compute[0].page_list.w64(0x1000,0xaabbccdd).unwrap();
-        let a=arena.compute.compute[0].pool_state.snapshot();let b=arena.compute.compute[0].page_list.snapshot();
+        let u0=arena.compute.compute[0].private_uma().unwrap();
+        u0.pool_state.w64(8,0xdeadbeef).unwrap();
+        u0.page_list.w64(0x1000,0xaabbccdd).unwrap();
+        let a=u0.pool_state.snapshot();let b=u0.page_list.snapshot();
         let mut c=Claims::new();assert_eq!(s.claim_compute(&arena.compute,&mut c,0).unwrap(),Some(0));s.publish(&mut c).unwrap();s.retire(&mut c).unwrap();
         assert_eq!(s.free_compute(),1);assert_eq!(s.claim_compute(&arena.compute,&mut c,0).unwrap(),Some(1));s.publish(&mut c).unwrap();s.retire(&mut c).unwrap();
-        arena.compute.compute[0].counter.w64(0,91).unwrap();
+        u0.counter.w64(0,91).unwrap();
         assert_eq!(s.claim_compute(&arena.compute,&mut c,0).unwrap(),Some(0));
-        assert_eq!(a,arena.compute.compute[0].pool_state.snapshot());assert_eq!(b,arena.compute.compute[0].page_list.snapshot());assert_eq!(arena.compute.compute[0].counter.r32(0).unwrap(),91);
+        assert_eq!(a,u0.pool_state.snapshot());assert_eq!(b,u0.page_list.snapshot());assert_eq!(u0.counter.r32(0).unwrap(),91);
         s.publish(&mut c).unwrap();s.quarantine(&mut c);assert!(s.compute_exhausted());
     }
     #[test]fn production_render_descriptors_preserve_firmware_bytes_and_exact_counter(){
@@ -1521,7 +1551,7 @@ pub mod g16 {
     #[test]fn offlock_scrub_cleans_displaced_slot_and_skips_sync_scrub_on_same_vm_claim(){
         let mut o=Objects::new();let mut s=Slots::new().unwrap();let arena=arenas(&mut o);
         let render=sync::Arc::new(arena.render,0).unwrap();
-        let prep=g16::resources::Prepared{compute:arena.compute.compute,render:Some(render.clone()),hw_slots:None};
+        let prep=g16::resources::Prepared{compute:arena.compute.compute,render:Some(render.clone()),hw_slots:None,shared_uma:None};
         let a=vm(1);
         let geo=g16::encode::Geometry{tpc_bytes:0x2000,tilemap_bytes:0x4000};
         // Publish and retire slot 0: not displaced yet, so nothing is staged.
@@ -1576,7 +1606,7 @@ pub mod g16 {
             passes.push(g16::slots::PassSlot::new(&mut o, k as u64, 1, &crate::g16::object::test_cmds((k as u64) as u64)).unwrap(), 0).unwrap();
         }
         let render=sync::Arc::new(render_arena(passes), 0).unwrap();
-        let prep=g16::resources::Prepared{compute:KVec::new(),render:Some(render.clone()),hw_slots:None};
+        let prep=g16::resources::Prepared{compute:KVec::new(),render:Some(render.clone()),hw_slots:None,shared_uma:None};
         let a=vm(1);
         // Publish and retire slots 0..20 in order so slots 0..19 are displaced dirty and
         // slot 19 is the undisplaced newest retired slot.
@@ -1614,7 +1644,7 @@ pub mod g16 {
     #[test]fn offlock_scrub_falls_back_on_error_drop_recovery_and_cross_vm(){
         let mut o=Objects::new();let mut s=Slots::new().unwrap();let arena=arenas(&mut o);
         let render=sync::Arc::new(arena.render,0).unwrap();
-        let prep=g16::resources::Prepared{compute:arena.compute.compute,render:Some(render.clone()),hw_slots:None};
+        let prep=g16::resources::Prepared{compute:arena.compute.compute,render:Some(render.clone()),hw_slots:None,shared_uma:None};
         let a=vm(1);let b=vm(2);
         // Prime and displace slot 0.
         let mut c0=Claims::new();c0.pass[0]=0;c0.pass_mask=1;
@@ -1665,7 +1695,7 @@ pub mod g16 {
     #[test]fn post_publish_scrub_staging_does_not_block_immediate_slot_reuse(){
         let mut o=Objects::new();let mut s=Slots::new().unwrap();let arena=arenas(&mut o);
         let render=sync::Arc::new(arena.render,0).unwrap();
-        let prep=g16::resources::Prepared{compute:arena.compute.compute,render:Some(render.clone()),hw_slots:None};
+        let prep=g16::resources::Prepared{compute:arena.compute.compute,render:Some(render.clone()),hw_slots:None,shared_uma:None};
         let a=vm(1);
         let geo=g16::encode::Geometry{tpc_bytes:0x1000,tilemap_bytes:0x2000};
         // Prime slot 0, then displace it by retiring slot 1; record retirement without staging yet.
@@ -1707,7 +1737,7 @@ pub mod g16 {
         for k in 0..hw::sizes::COMPUTE_UNITS {
             units.push(ComputeSlot::new(&mut o,&g16::object::Factory,k as u64,&crate::g16::object::test_unit_cmds(k as u64)).unwrap(),0).unwrap();
         }
-        let prep=ComputeArena{compute:units,render:None,hw_slots:None};
+        let prep=ComputeArena{compute:units,render:None,hw_slots:None,shared_uma:None};
         let a=Arc::new(
             vm::VmState{id:1,slot:1,generation:1,vm:vm::MockVm::new()},0,
         ).unwrap();
@@ -1747,7 +1777,7 @@ pub mod g16 {
             passes.push(g16::slots::PassSlot::new(&mut o, k, 1, &crate::g16::object::test_cmds((k) as u64)).unwrap(),0).unwrap();
         }
         let render=sync::Arc::new(render_arena(passes),0).unwrap();
-        let prep=g16::resources::Prepared{compute:arena.compute.compute,render:Some(render),hw_slots:None};
+        let prep=g16::resources::Prepared{compute:arena.compute.compute,render:Some(render),hw_slots:None,shared_uma:None};
         let a=vm(1);
         // Wrapped submission order [46, 47, 0]: retiring in order leaves slot 0 as last_retired
         // while high slots 46 and 47 (bits above 31) are displaced and reusable immediately.
@@ -1809,7 +1839,7 @@ pub mod g16 {
             passes.push(g16::slots::PassSlot::new(&mut o, k, 1, &crate::g16::object::test_cmds((k) as u64)).unwrap(),0).unwrap();
         }
         let render=sync::Arc::new(render_arena(passes),0).unwrap();
-        let prep=g16::resources::Prepared{compute:arena.compute.compute,render:Some(render),hw_slots:None};
+        let prep=g16::resources::Prepared{compute:arena.compute.compute,render:Some(render),hw_slots:None,shared_uma:None};
         let a=vm(1);let b=vm(2);
 
         // Per-unit compute hold_compute_slot + verify_held + note_published.
@@ -1982,7 +2012,7 @@ pub mod g16 {
         for k in 0..4u64 {
             units.push(g16::slots::ComputeSlot::new(&mut o,&g16::object::Factory,k,&crate::g16::object::test_unit_cmds(k)).unwrap(),0).unwrap();
         }
-        let prep_full=g16::resources::ComputeArena{compute:units,render:None,hw_slots:None};
+        let prep_full=g16::resources::ComputeArena{compute:units,render:None,hw_slots:None,shared_uma:None};
         let a=vm(1);let b=vm(2);
         // Retire base unit 0, then hang and quarantine base unit 1 (or vice versa):
         // unit 0 is now retired-undisplaced and unit 1 is quarantined -> base [0..2] exhausted.
@@ -2009,7 +2039,7 @@ pub mod g16 {
         for k in 0..2u64 {
             base_units.push(g16::slots::ComputeSlot::new(&mut o,&g16::object::Factory,k,&crate::g16::object::test_unit_cmds(k)).unwrap(),0).unwrap();
         }
-        let prep_base=g16::resources::ComputeArena{compute:base_units,render:None,hw_slots:None};
+        let prep_base=g16::resources::ComputeArena{compute:base_units,render:None,hw_slots:None,shared_uma:None};
         assert_eq!(s.claim_compute_for(&prep_base,&mut c,Some(b.id)).unwrap(),Some(0));
         s.release(&mut c);
     }
@@ -2021,7 +2051,7 @@ pub mod g16 {
         for k in 0..(p1_start + 2) as u64 {
             units.push(g16::slots::ComputeSlot::new(&mut o,&g16::object::Factory,k,&crate::g16::object::test_unit_cmds(k)).unwrap(),0).unwrap();
         }
-        let prep=g16::resources::ComputeArena{compute:units,render:None,hw_slots:None};
+        let prep=g16::resources::ComputeArena{compute:units,render:None,hw_slots:None,shared_uma:None};
         let a=vm(1);let b=vm(2);
         // Pipe 0 claims unit 0; pipe 1 stays out of 0..PIPE1_COMPUTE_START and claims PIPE1_COMPUTE_START.
         let mut c0=Claims::new();
@@ -2058,7 +2088,7 @@ pub mod g16 {
         for k in 0..2u64 {
             base_units.push(g16::slots::ComputeSlot::new(&mut o,&g16::object::Factory,k,&crate::g16::object::test_unit_cmds(k)).unwrap(),0).unwrap();
         }
-        let prep_base=g16::resources::ComputeArena{compute:base_units,render:None,hw_slots:None};
+        let prep_base=g16::resources::ComputeArena{compute:base_units,render:None,hw_slots:None,shared_uma:None};
         let mut c0c=Claims::new();
         assert_eq!(s.claim_compute_for_pipe(&prep_base,&mut c0c,Some(b.id),0).unwrap(),Some(0));
         let mut c1c=Claims::new();
@@ -2075,7 +2105,7 @@ pub mod g16 {
         for k in 0..g16::hw::sizes::COMPUTE_UNITS as u64 {
             full_units.push(g16::slots::ComputeSlot::new(&mut o,&g16::object::Factory,k,&crate::g16::object::test_unit_cmds(k)).unwrap(),0).unwrap();
         }
-        let prep_full=g16::resources::ComputeArena{compute:full_units,render:None,hw_slots:None};
+        let prep_full=g16::resources::ComputeArena{compute:full_units,render:None,hw_slots:None,shared_uma:None};
         let bad=vm(1);let fresh=vm(2);let other=vm(3);
         // Exact dcp102b sequence: a prior process hangs and permanently quarantines compute unit 0.
         let mut c=Claims::new();
@@ -2093,7 +2123,7 @@ pub mod g16 {
         for (local, &hw_slot) in scs_slots.iter().enumerate() {
             scs_units.push(g16::slots::ComputeSlot::new(&mut o,&g16::object::Factory,local as u64,&crate::g16::object::test_unit_cmds(hw_slot as u64)).unwrap(),0).unwrap();
         }
-        let prep_scs=g16::resources::ComputeArena{compute:scs_units,render:None,hw_slots:Some(scs_slots)};
+        let prep_scs=g16::resources::ComputeArena{compute:scs_units,render:None,hw_slots:Some(scs_slots),shared_uma:None};
         let scs_mask = prep_scs.compute_slot_mask().unwrap();
         assert_eq!(scs_mask, (1u32 << 1) | (1u32 << 2));
         // Execute two back-to-back SCS compute commands (e.g. rt.scene p_rt + p_comp) repeatedly:
@@ -2170,7 +2200,7 @@ pub mod g16 {
             passes.push(g16::slots::PassSlot::new(&mut o, k, 1, &crate::g16::object::test_cmds((k) as u64)).unwrap(),0).unwrap();
         }
         let render=sync::Arc::new(render_arena(passes),0).unwrap();
-        let prep=g16::resources::Prepared{compute:KVec::new(),render:Some(render),hw_slots:None};
+        let prep=g16::resources::Prepared{compute:KVec::new(),render:Some(render),hw_slots:None,shared_uma:None};
         let a=vm(1);let b=vm(2);
         let geo=g16::encode::Geometry{tpc_bytes:0x1000,tilemap_bytes:0x1000};
         // Retire base pass slot 0, then hang and quarantine base pass slot 1 -> base [0..2] exhausted.
@@ -2202,7 +2232,7 @@ pub mod g16 {
         use crate::g16::slots::ScrubQueue;
         let mut o=Objects::new();let mut s=Slots::new().unwrap();let arena=arenas(&mut o);
         let render=sync::Arc::new(arena.render,0).unwrap();
-        let prep=g16::resources::Prepared{compute:arena.compute.compute,render:Some(render.clone()),hw_slots:None};
+        let prep=g16::resources::Prepared{compute:arena.compute.compute,render:Some(render.clone()),hw_slots:None,shared_uma:None};
         let a=vm(1);
         let geo=g16::encode::Geometry{tpc_bytes:0x1000,tilemap_bytes:0x2000};
         // Prime and displace slot 0.
@@ -2263,7 +2293,7 @@ pub mod g16 {
             passes.push(g16::slots::PassSlot::new(&mut o, k, 1, &crate::g16::object::test_cmds((k) as u64)).unwrap(),0).unwrap();
         }
         let render=sync::Arc::new(render_arena(passes),0).unwrap();
-        let prep=g16::resources::Prepared{compute:KVec::new(),render:Some(render.clone()),hw_slots:None};
+        let prep=g16::resources::Prepared{compute:KVec::new(),render:Some(render.clone()),hw_slots:None,shared_uma:None};
         let a=vm(1);let b=vm(2);
         let pub_retire=|s:&mut Slots,k:usize,vm:&sync::Arc<g16::vm::VmState>|{
             let mut c=Claims::new();c.pass[0]=k as u32;c.pass_mask=1u64<<k;
@@ -2451,7 +2481,7 @@ pub mod g16 {
         for k in 0..g16::hw::sizes::COMPUTE_UNITS as u64 {
             units.push(g16::slots::ComputeSlot::new(&mut o, &g16::object::Factory, k, &crate::g16::object::test_unit_cmds(k)).unwrap(), 0).unwrap();
         }
-        let prep = g16::resources::ComputeArena { compute: units, render: None, hw_slots: None };
+        let prep = g16::resources::ComputeArena { compute: units, render: None, hw_slots: None, shared_uma: None };
         let vms = [vm(1), vm(2), vm(3), vm(4)];
         // Round 0 warms one unit per VM (4 units out of 24); VM2's retirement displaces VM1's
         // unit immediately so from round 1 onward every sequential interleaved claim is warm.
@@ -2614,6 +2644,7 @@ pub mod g16 {
             compute: KVec::new(),
             render: Some(render),
             hw_slots: None,
+            shared_uma: None,
         };
         let geo = g16::encode::Geometry { tpc_bytes: 0x1000, tilemap_bytes: 0x2000 };
         let vms: Vec<_> = (0..16u64).map(|i| vm(200 + i)).collect();
@@ -2703,7 +2734,7 @@ pub mod g16 {
         for k in 0..18 {
             passes.push(PassSlot::new(&mut o, k as u64, 1, &crate::g16::object::test_cmds((k as u64) as u64)).unwrap(), 0).unwrap();
         }
-        let shared_prep_compute = ComputeArena { compute: compute_slots, render: None, hw_slots: None };
+        let shared_prep_compute = ComputeArena { compute: compute_slots, render: None, hw_slots: None, shared_uma: None };
         let geo = g16::encode::Geometry { tpc_bytes: 0x1000, tilemap_bytes: 0x2000 };
 
         let mut vms = Vec::new();
@@ -2721,9 +2752,9 @@ pub mod g16 {
                 r_passes.push(PassSlot::new(&mut o, k as u64, 1, &crate::g16::object::test_cmds((k as u64) as u64)).unwrap(), 0).unwrap();
             }
             let r_arena = sync::Arc::new(render_arena(r_passes), 0).unwrap();
-            let r_prep = ComputeArena { compute: KVec::new(), render: Some(r_arena.clone()), hw_slots: None };
+            let r_prep = ComputeArena { compute: KVec::new(), render: Some(r_arena.clone()), hw_slots: None, shared_uma: None };
             let c_arena = sync::Arc::new(
-                ComputeArena { compute: KVec::new(), render: None, hw_slots: None }, 0,
+                ComputeArena { compute: KVec::new(), render: None, hw_slots: None, shared_uma: None }, 0,
             ).unwrap();
 
             // 1) PB warm slot i
@@ -2812,7 +2843,7 @@ pub mod g16 {
         // Live VM 17 runs 1 render + 1 compute, displacing slot 15 everywhere.
         let live = vm(500);
         let live_r_arena = sync::Arc::new(render_arena(passes), 0).unwrap();
-        let live_r_prep = ComputeArena { compute: KVec::new(), render: Some(live_r_arena.clone()), hw_slots: None };
+        let live_r_prep = ComputeArena { compute: KVec::new(), render: Some(live_r_arena.clone()), hw_slots: None, shared_uma: None };
         let live_slot = p
             .pick_slot_in_mask_blocks_mode(&live, false, 0b11, 0, 512, false)
             .unwrap();
@@ -2888,7 +2919,7 @@ pub mod g16 {
             sc_passes.push(PassSlot::new(&mut o, k as u64, 1, &crate::g16::object::test_cmds((k as u64) as u64)).unwrap(), 0).unwrap();
         }
         let sc_arena = sync::Arc::new(render_arena(sc_passes), 0).unwrap();
-        let sc_prep = ComputeArena { compute: KVec::new(), render: Some(sc_arena.clone()), hw_slots: None };
+        let sc_prep = ComputeArena { compute: KVec::new(), render: Some(sc_arena.clone()), hw_slots: None, shared_uma: None };
         let va = vm(600);
         let vb = vm(601);
         for (k, owner) in [(0usize, &va), (1usize, &vb)] {
@@ -2948,7 +2979,7 @@ pub mod g16 {
         for k in 0..COMPUTE_UNITS {
             compute_slots.push(ComputeSlot::new(&mut o, &g16::object::Factory, k as u64, &crate::g16::object::test_unit_cmds(k as u64)).unwrap(), 0).unwrap();
         }
-        let prep = ComputeArena { compute: compute_slots, render: None, hw_slots: None };
+        let prep = ComputeArena { compute: compute_slots, render: None, hw_slots: None, shared_uma: None };
 
         // Simulate 8 compute VMs, each owning 24 independent per-unit ComputeArenas
         // (matching production ComputeUnitSet), running across BOTH CDM pipes (0 and 1).
@@ -2960,7 +2991,7 @@ pub mod g16 {
             for _ in 0..COMPUTE_UNITS {
                 per_unit.push(
                     sync::Arc::new(
-                        ComputeArena { compute: KVec::new(), render: None, hw_slots: None },
+                        ComputeArena { compute: KVec::new(), render: None, hw_slots: None, shared_uma: None },
                         0,
                     )
                     .unwrap(),
@@ -3078,10 +3109,10 @@ pub mod g16 {
         for k in 0..COMPUTE_UNITS {
             units1.push(ComputeSlot::new(&mut o, &factory, k as u64, &crate::g16::object::test_unit_cmds(k as u64)).unwrap(), 0).unwrap();
         }
-        let c_uma1 = units1[0].uma_lease();
-        let prep1 = ComputeArena { compute: units1, render: None, hw_slots: None };
+        let c_uma1 = units1[0].private_uma().unwrap().uma_lease();
+        let prep1 = ComputeArena { compute: units1, render: None, hw_slots: None, shared_uma: None };
         let c_arena1 = sync::Arc::new(
-            ComputeArena { compute: KVec::new(), render: None, hw_slots: None },
+            ComputeArena { compute: KVec::new(), render: None, hw_slots: None, shared_uma: None },
             0,
         )
         .unwrap();
@@ -3097,7 +3128,7 @@ pub mod g16 {
         for k in 0..COMPUTE_UNITS {
             units2.push(ComputeSlot::new(&mut o, &factory, k as u64, &crate::g16::object::test_unit_cmds(k as u64)).unwrap(), 0).unwrap();
         }
-        let prep2 = ComputeArena { compute: units2, render: None, hw_slots: None };
+        let prep2 = ComputeArena { compute: units2, render: None, hw_slots: None, shared_uma: None };
         let mut cc2 = Claims::new();
         assert_eq!(s.claim_compute_for(&prep2, &mut cc2, Some(vm2.id)).unwrap(), Some(1));
         s.hold_compute_slot(1, &vm2, &prep2).unwrap();
@@ -3106,8 +3137,8 @@ pub mod g16 {
 
         let mut units3 = KVec::new();
         units3.push(ComputeSlot::new(&mut o, &factory, 0, &crate::g16::object::test_unit_cmds(0)).unwrap(), 0).unwrap();
-        let c_uma3 = units3[0].uma_lease();
-        let prep3 = ComputeArena { compute: units3, render: None, hw_slots: None };
+        let c_uma3 = units3[0].private_uma().unwrap().uma_lease();
+        let prep3 = ComputeArena { compute: units3, render: None, hw_slots: None, shared_uma: None };
 
         // Drop local arena/epoch/pool handles for VM1 and close VM1.
         drop(e1);
@@ -3439,6 +3470,231 @@ pub mod g16 {
         }
     }
 
+    #[test]
+    fn compute_uma_slot_occupancy_avoids_live_collisions_and_shares_above_capacity() {
+        use core::sync::atomic::{AtomicU32, Ordering};
+        use g16::hw::sizes::COMPUTE_UMA_SLOTS;
+        use g16::resources::{pick_compute_uma_slot, ComputeUmaOccupancy};
+
+        let users = sync::Arc::new(
+            [const { AtomicU32::new(0) }; COMPUTE_UMA_SLOTS],
+            0,
+        )
+        .unwrap();
+        let next = AtomicU32::new(0);
+
+        // Long-lived VM #0 (e.g. compositor) acquires slot 0.
+        let s0 = pick_compute_uma_slot(
+            next.fetch_add(1, Ordering::Relaxed) as usize,
+            0,
+            &users,
+        )
+        .unwrap();
+        assert_eq!(s0, 0);
+        let vm0_occ = ComputeUmaOccupancy::acquire(&users, s0);
+
+        // Churn 2 * COMPUTE_UMA_SLOTS short-lived VMs: none may collide with live VM #0
+        // because free unquarantined slots are always preferred over occupied slots.
+        for _ in 0..(2 * COMPUTE_UMA_SLOTS) {
+            let start = next.fetch_add(1, Ordering::Relaxed) as usize;
+            let slot = pick_compute_uma_slot(start, 0, &users).unwrap();
+            assert_ne!(slot, s0, "short-lived VM must not share with live VM #0");
+            let occ = ComputeUmaOccupancy::acquire(&users, slot);
+            assert_eq!(users[slot].load(Ordering::Acquire), 1);
+            drop(occ);
+            assert_eq!(users[slot].load(Ordering::Acquire), 0);
+        }
+
+        // Open COMPUTE_UMA_SLOTS - 1 more live VMs concurrently so all slots are held once.
+        let mut live_occs = vec![vm0_occ];
+        for _ in 1..COMPUTE_UMA_SLOTS {
+            let start = next.fetch_add(1, Ordering::Relaxed) as usize;
+            let slot = pick_compute_uma_slot(start, 0, &users).unwrap();
+            assert_eq!(users[slot].load(Ordering::Acquire), 0);
+            live_occs.push(ComputeUmaOccupancy::acquire(&users, slot));
+        }
+        assert!(users.iter().all(|u| u.load(Ordering::Acquire) == 1));
+
+        // 33rd and 34th concurrent live VMs share least-loaded healthy slots evenly (1 -> 2),
+        // never piling onto a slot with 2 users while any slot still has 1.
+        let s33 = pick_compute_uma_slot(
+            next.fetch_add(1, Ordering::Relaxed) as usize,
+            0,
+            &users,
+        )
+        .unwrap();
+        let occ33 = ComputeUmaOccupancy::acquire(&users, s33);
+        assert_eq!(users[s33].load(Ordering::Acquire), 2);
+        let s34 = pick_compute_uma_slot(s33, 0, &users).unwrap();
+        assert_ne!(s34, s33, "34th VM must pick a 1-user slot instead of 2-user slot");
+        let occ34 = ComputeUmaOccupancy::acquire(&users, s34);
+        assert_eq!(users[s34].load(Ordering::Acquire), 2);
+
+        // Quarantining all COMPUTE_UMA_SLOTS returns EIO.
+        let all_mask = u32::MAX >> (32 - COMPUTE_UMA_SLOTS);
+        assert_eq!(pick_compute_uma_slot(0, all_mask, &users), Err(EIO));
+
+        drop(occ34);
+        drop(occ33);
+        drop(live_occs);
+        assert!(users.iter().all(|u| u.load(Ordering::Acquire) == 0));
+    }
+
+    #[test]
+    fn shared_compute_uma_quarantine_pins_aborted_pool_and_migrates_sharing_vms() {
+        use core::sync::atomic::{AtomicU32, Ordering};
+        use g16::hw::sizes::{COMPUTE_UMA_SLOTS, COMPUTE_UNITS};
+        use g16::resources::{
+            pick_compute_uma_slot, ComputeArena, ComputeUmaOccupancy, SharedComputeUma,
+        };
+        use g16::slots::ComputeSlot;
+
+        let factory = g16::object::Factory;
+        let users = sync::Arc::new(
+            [const { AtomicU32::new(0) }; COMPUTE_UMA_SLOTS],
+            0,
+        )
+        .unwrap();
+        let mut s = Slots::new().unwrap();
+
+        // Simulate 33+ concurrent VMs: VM A (slot 0) and innocent VM B both hold slot 0.
+        let vm_a = vm(2001);
+        let vm_b = vm(2002);
+        let (bind_a, live_a, _) = g16::vm::test_live_token();
+        let (bind_b, live_b, _) = g16::vm::test_live_token();
+        let occ_a = ComputeUmaOccupancy::acquire(&users, 0);
+        let occ_b = ComputeUmaOccupancy::acquire(&users, 0);
+        assert_eq!(users[0].load(Ordering::Acquire), 2);
+
+        let uma_a = SharedComputeUma::new(&factory, &bind_a, &vm_a.vm, &live_a, 0, 0).unwrap();
+        let uma_b0 = SharedComputeUma::new(&factory, &bind_b, &vm_b.vm, &live_b, 0, 0).unwrap();
+        let lease_a = uma_a.uma_lease.clone();
+        drop(bind_a);
+
+        let mut oa = Objects::new();
+        let mut units_a = KVec::new();
+        for k in 0..COMPUTE_UNITS {
+            units_a
+                .push(
+                    ComputeSlot::new_shared_in(
+                        &mut oa,
+                        k as u64,
+                        &g16::object::test_unit_cmds(k as u64),
+                    )
+                    .unwrap(),
+                    0,
+                )
+                .unwrap();
+        }
+        let prep_a = ComputeArena {
+            compute: units_a,
+            render: None,
+            hw_slots: None,
+            shared_uma: Some(uma_a.clone()),
+        };
+
+        let mut ob = Objects::new();
+        let mut units_b = KVec::new();
+        for k in 0..COMPUTE_UNITS {
+            units_b
+                .push(
+                    ComputeSlot::new_shared_in(
+                        &mut ob,
+                        k as u64,
+                        &g16::object::test_unit_cmds(k as u64),
+                    )
+                    .unwrap(),
+                    0,
+                )
+                .unwrap();
+        }
+        let mut prep_b = ComputeArena {
+            compute: units_b,
+            render: None,
+            hw_slots: None,
+            shared_uma: Some(uma_b0.clone()),
+        };
+
+        // Innocent VM B runs and retires cleanly on unit 1 using slot 0 first.
+        let mut cb0 = Claims::new();
+        let kb0 = s
+            .claim_compute_for(&prep_b, &mut cb0, Some(vm_b.id))
+            .unwrap()
+            .unwrap();
+        s.hold_compute_slot(kb0, &vm_b, &prep_b).unwrap();
+        s.publish(&mut cb0).unwrap();
+        s.retire(&mut cb0).unwrap();
+        // Normal retirement drops pending_shared_uma (prep_b + local uma_b0 = 2).
+        assert_eq!(sync::Arc::strong_count(&uma_b0), 2);
+
+        // VM A claims unit, publishes, and hangs -> quarantine kills slot 0.
+        let mut ca = Claims::new();
+        let ka = s
+            .claim_compute_for(&prep_a, &mut ca, Some(vm_a.id))
+            .unwrap()
+            .unwrap();
+        s.hold_compute_slot(ka, &vm_a, &prep_a).unwrap();
+        s.publish(&mut ca).unwrap();
+        s.quarantine(&mut ca);
+        let qmask = s.quarantined_compute_uma_mask();
+        assert_eq!(qmask, 1u32 << 0);
+        assert!(s.compute_uma_quarantined(1u32 << 0));
+        assert!(!s.compute_exhausted_in_mask(prep_b.compute_slot_mask().unwrap()));
+
+        // Aborted VM A closes: quarantine must pin both its SharedComputeUma pool and FwLease.
+        drop(prep_a);
+        drop(occ_a);
+        vm_a.vm.close();
+        let _ = s.reclaim_closed();
+        assert_eq!(sync::Arc::strong_count(&uma_a), 2, "quarantined pool stays mapped");
+        assert_eq!(sync::Arc::strong_count(&lease_a), 3, "quarantined FwLease stays mapped");
+
+        // Innocent VM B sees slot 0 quarantined, migrates to fresh unquarantined slot s2 at
+        // pool_va_idx = 1 (disjoint from pool_va_idx = 0 and from ComputeSlot records).
+        let s2 = pick_compute_uma_slot(0, qmask, &users).unwrap();
+        assert_ne!(s2, 0);
+        assert!(!s.compute_uma_quarantined(1u32 << s2));
+        let uma_b1 =
+            SharedComputeUma::new(&factory, &bind_b, &vm_b.vm, &live_b, s2, 1).unwrap();
+        assert_ne!(uma_b1.pool.gva, uma_b0.pool.gva);
+        assert_ne!(uma_b1.pool_state.gva, uma_b0.pool_state.gva);
+        assert_ne!(uma_b1.page_list.gva, uma_b0.page_list.gva);
+        let occ_b1 = ComputeUmaOccupancy::acquire(&users, s2);
+        drop(occ_b);
+        assert_eq!(users[0].load(Ordering::Acquire), 0);
+        assert_eq!(users[s2].load(Ordering::Acquire), 1);
+
+        // VM B swaps only its shared_uma (keeping existing ComputeSlots) and runs cleanly.
+        prep_b.shared_uma = Some(uma_b1.clone());
+        let mut cb1 = Claims::new();
+        let kb1 = s
+            .claim_compute_for(&prep_b, &mut cb1, Some(vm_b.id))
+            .unwrap()
+            .unwrap();
+        assert!(
+            s.compute_needs_full_work(kb1),
+            "migrating to a fresh UMA slot must force a full work write"
+        );
+        s.hold_compute_slot(kb1, &vm_b, &prep_b).unwrap();
+        s.publish(&mut cb1).unwrap();
+        s.retire(&mut cb1).unwrap();
+        let lease_b1 = uma_b1.uma_lease.clone();
+        // Exhausting pool_va_idx >= COMPUTE_UNITS returns EIO.
+        assert!(
+            SharedComputeUma::new(&factory, &bind_b, &vm_b.vm, &live_b, s2, COMPUTE_UNITS)
+                .is_err()
+        );
+        drop(bind_b);
+        drop(prep_b);
+        drop(uma_b1);
+        drop(uma_b0);
+        drop(occ_b1);
+        assert_eq!(users[s2].load(Ordering::Acquire), 0);
+        assert_eq!(sync::Arc::strong_count(&lease_b1), 2, "retired FwLease retained");
+        drop(s);
+        drop(uma_a);
+    }
+
 }
 '''
 poll_source = (production/'poll.rs').read_text()
@@ -3533,7 +3789,26 @@ assert 'if self.probe {' in alloc_private_in_fn and 'self.dev.registration_guard
 assert alloc_private_in_fn.index('UniqueArc::<FwObject>::new_uninit(GFP_KERNEL)?') < alloc_private_in_fn.index('self.uat.kernel_vm().map_in_range('), 'alloc_private_in must pre-allocate UniqueArc before mapping firmware aperture'
 assert alloc_private_in_fn.index('self.uat.kernel_lower_vm().map_in_range(') < alloc_private_in_fn.index('self.uat.kernel_vm().map_in_range('), 'alloc_private_in must map uncached aliases before firmware aperture'
 assert alloc_private_in_fn.index('self.uat.kernel_vm().map_in_range(') < alloc_private_in_fn.index('self.mappings.push_within_capacity(firmware)'), 'alloc_private_in must commit mappings infallibly after firmware map'
+shared_uma_code = (
+    'pub(crate) struct SharedComputeUma(crate::cleanup::Deferred<SharedComputeUmaInner>);\n'
+    + item(resources_source, 'impl core::ops::Deref for SharedComputeUma {')
+    + '\n'
+    + item(resources_source, 'pub(crate) struct SharedComputeUmaInner {')
+    + '\n'
+    + item(resources_source, 'impl SharedComputeUma {')
+    .replace('fn new(', 'pub(crate) fn new(')
+)
+occ_code = (
+    'pub(crate) ' + item(resources_source, 'struct ComputeUmaOccupancy {')
+    + '\n'
+    + item(resources_source, 'impl ComputeUmaOccupancy {')
+    .replace('fn acquire(', 'pub(crate) fn acquire(')
+    + '\n'
+    + item(resources_source, 'impl Drop for ComputeUmaOccupancy {')
+)
 source = (source
+    .replace('__SHARED_COMPUTE_UMA__', shared_uma_code)
+    .replace('__COMPUTE_UMA_OCCUPANCY__', occ_code)
     .replace('__FINISH_PRIVATE__', item(object_source, 'pub(crate) fn finish_private('))
     .replace('__PERSISTENT_UNIT_CMDS__', item(resources_source, 'struct PersistentUnitCmds {'))
     .replace('__COMPUTE_CMDS_STRUCT__', item(resources_source, 'pub(crate) struct ComputeCmds {').replace('#[pin]\n', '').replace('super::hw::', 'hw::'))
@@ -3547,6 +3822,7 @@ render_burst_lines = (
         line for line in resources_source.splitlines()
         if line.startswith(('const BURST_SUBMITS:', 'const BURST_GAP_NS:', 'const BURST_COMMANDS:', 'const RENDER_BURST_COMMANDS:'))
     )
+    + '\npub(crate) ' + item(resources_source, 'fn pick_compute_uma_slot(')
     + '\npub(crate) ' + item(resources_source, 'fn pick_scs_compute_slots(')
     + '\npub(crate) ' + item(resources_source, 'fn pick_base_pb_slots(')
     + '\npub(crate) ' + item(resources_source, 'fn should_expand_compute_ext(')

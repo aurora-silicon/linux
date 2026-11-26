@@ -3497,6 +3497,7 @@ impl Firmware {
                         let k = f.claims.slot[m] as usize;
                         job.resources
                             .compute_unit(k)?
+                            .private_uma()?
                             .counter
                             .w64(0, f.csubmitted[m])?;
                     }
@@ -3682,13 +3683,41 @@ impl Firmware {
         self.slots.hold_compute_slot(index, &job.vm, resources)?;
         let s = resources.compute_unit(index)?;
         let g = &self.graph.compute[pipe];
-        let (before, submitted) = if let Some(shared) = resources.shared_compute_uma() {
+        let (
+            before,
+            submitted,
+            descriptor_fw,
+            counter_fw,
+            pool_state_gva,
+            page_list_gva,
+            uma_slot,
+            seeds,
+        ) = if let Some(shared) = resources.shared_compute_uma() {
             let base = shared.submitted.load(Ordering::Acquire);
             pf.uma_delta = pf.uma_delta.checked_add(1).ok_or(EOVERFLOW)?;
-            (base, base.checked_add(pf.uma_delta).ok_or(EOVERFLOW)?)
+            (
+                base,
+                base.checked_add(pf.uma_delta).ok_or(EOVERFLOW)?,
+                shared.descriptor.va,
+                shared.counter.va,
+                shared.pool_state.gva.ok_or(EINVAL)?,
+                shared.page_list.gva.ok_or(EINVAL)?,
+                shared.uma_slot,
+                shared.seeds,
+            )
         } else {
-            let b = s.counter.r64(0)?;
-            (b, b.checked_add(1).ok_or(EOVERFLOW)?)
+            let u = s.private_uma()?;
+            let b = u.counter.r64(0)?;
+            (
+                b,
+                b.checked_add(1).ok_or(EOVERFLOW)?,
+                u.descriptor.va,
+                u.counter.va,
+                u.pool_state.gva.ok_or(EINVAL)?,
+                u.page_list.gva.ok_or(EINVAL)?,
+                u.uma_slot,
+                u.seeds,
+            )
         };
         let refs = ComputeRefs {
             notifier: g.notifier.va + notifier_page::COMPUTE_RECORD as u64,
@@ -3699,23 +3728,23 @@ impl Firmware {
             work_gva: s.work.lower_gva.ok_or(EINVAL)?,
             // Separate device-lifetime firmware-cached microsequence record for this unit index.
             seq: s.seq.va,
-            // Separate per-VM uncached UMA manager descriptor inside `s.uma_lease`.
-            descriptor_fw: s.descriptor.va,
+            // Separate per-VM uncached UMA manager descriptor inside `uma_lease`.
+            descriptor_fw,
             preempt_gva: s.preempt.gva.ok_or(EINVAL)?,
             its: s.its.va,
             stats_fw: self.init.compute_activity.va,
             auxiliary_fw: s.aux.va,
             auxiliary_gva: s.aux.gva.ok_or(EINVAL)?,
             context_store_gva: s.context_store.gva.ok_or(EINVAL)?,
-            counter_fw: s.counter.va,
-            pool_state_gva: s.pool_state.gva.ok_or(EINVAL)?,
-            page_list_gva: s.page_list.gva.ok_or(EINVAL)?,
+            counter_fw,
+            pool_state_gva,
+            page_list_gva,
             usc_base: job.queue.usc_base,
             record_fw: g.notifier.va + notifier_page::COMPUTE_RECORD as u64,
             binding_generation: generation,
             // Non-SCS units share one hardware UMA slot per VM (serialized across VMs by
             // `compute_uma_conflict`); SCS units retain per-unit slots.
-            uma_slot: s.uma_slot,
+            uma_slot,
             event: work::compute::EVENTS[pipe],
             // Preserve the already qualified packet bytes while expressing the native
             // fields separately. This compatibility identifier is not proof of native
@@ -3726,7 +3755,7 @@ impl Firmware {
             target_stamp: target,
             submitted,
         };
-        let rt = compute_rt(&cmd.ray, s.seeds);
+        let rt = compute_rt(&cmd.ray, seeds);
         let scratch = self.engine.scratch.as_deref_mut().ok_or(ENOMEM)?;
         let w = image(&mut scratch.cw)?;
         let q = image(&mut scratch.cq)?;
@@ -3768,7 +3797,7 @@ impl Firmware {
                     // Slots::claim_compute proved a different fully retired unit displaced this
                     // descriptor in the same hardware slot. Validate it in place.
                     let mut descriptor = [0u8; work::compute::DESCRIPTOR_SIZE];
-                    s.descriptor.read(0, &mut descriptor)?;
+                    s.private_uma()?.descriptor.read(0, &mut descriptor)?;
                     if encode::validate_compute_descriptor(&refs, &descriptor, before).is_err() {
                         // Retained allocator identity/completion corruption, not a client refusal.
                         // Keep the unit and its previous VM lease mapped forever; cancelling

@@ -303,6 +303,8 @@ pub(crate) struct Shared {
     pub(crate) quarantined_compute_uma_mask: AtomicU32,
     /// Round-robin cursor assigning each non-SCS compute VM a slot in `0..COMPUTE_UMA_SLOTS`.
     pub(crate) next_compute_uma_slot: AtomicU32,
+    /// Live open VMs currently holding each hardware compute UMA slot (`0..COMPUTE_UMA_SLOTS`).
+    pub(crate) compute_uma_slot_users: Arc<[AtomicU32; hw::sizes::COMPUTE_UMA_SLOTS]>,
     /// Whether any base render pass slot (`0..BASE_RENDER_SLOTS`) has been quarantined.
     pub(crate) base_render_quarantined: AtomicBool,
     /// Bitmask of permanently quarantined device-wide PB/UMA allocator slots (`0..PB_SLOTS`).
@@ -654,6 +656,10 @@ impl Gpu {
         let feed = feed::Feed::new()?;
         let feed_wq = OwnedQueue::new_unbound_reclaim(c_str!("aurora_g16_feed"), false)?;
         let active_render_vms = Arc::new(AtomicU32::new(0), GFP_KERNEL)?;
+        let compute_uma_slot_users = Arc::new(
+            [const { AtomicU32::new(0) }; hw::sizes::COMPUTE_UMA_SLOTS],
+            GFP_KERNEL,
+        )?;
         let scrub_queue = slots::ScrubQueue::new_boxed()?;
         let shared = Arc::pin_init(
             pin_init!(Shared {
@@ -686,6 +692,7 @@ impl Gpu {
                 quarantined_compute_mask: AtomicU32::new(0),
                 quarantined_compute_uma_mask: AtomicU32::new(0),
                 next_compute_uma_slot: AtomicU32::new(0),
+                compute_uma_slot_users,
                 base_render_quarantined: AtomicBool::new(false),
                 quarantined_pb_mask: AtomicU32::new(0),
                 next_pb_slot: AtomicU32::new(0),

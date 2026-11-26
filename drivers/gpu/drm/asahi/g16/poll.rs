@@ -1348,11 +1348,12 @@ impl Firmware {
                     for m in 0..count {
                         let k = f.claims.slot[m] as usize;
                         let unit = f.job.resources.compute_unit(k)?;
+                        let uma = unit.private_uma()?;
                         let submitted = f.csubmitted[m];
                         if submitted == 0
-                            || unit.counter.r64(0)? != submitted
-                            || unit.descriptor.r64(manager::COMPLETED)? != submitted
-                            || unit.descriptor.r64(manager::COUNTER)? != unit.counter.va
+                            || uma.counter.r64(0)? != submitted
+                            || uma.descriptor.r64(manager::COMPLETED)? != submitted
+                            || uma.descriptor.r64(manager::COUNTER)? != uma.counter.va
                         {
                             full = false;
                             break;
