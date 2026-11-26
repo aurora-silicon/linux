@@ -866,9 +866,6 @@ struct apple_dart_domain {
 	struct apple_dart_dcp *dcp;
 
 	bool finalized;
-	bool has_dma_range;
-	dma_addr_t dma_min;
-	dma_addr_t dma_max;
 	u64 mask;
 	dma_addr_t dma_offset;
 	struct mutex init_lock;
@@ -3622,8 +3619,9 @@ static int __apple_dart_finalize_domain(struct apple_dart_domain *dart_domain,
 {
 	struct apple_dart *dart = cfg->stream_maps[0].dart;
 	struct io_pgtable_cfg pgtbl_cfg;
-	dma_addr_t dma_min = dart_domain->has_dma_range ? dart_domain->dma_min : cfg->dma_min;
-	dma_addr_t dma_max = dart_domain->has_dma_range ? dart_domain->dma_max : cfg->dma_max;
+	/* of_xlate already narrowed this to any consumer apple,dma-range. */
+	dma_addr_t dma_min = cfg->dma_min;
+	dma_addr_t dma_max = cfg->dma_max;
 	u64 translated_max;
 	u32 ias;
 	int ret = 0;
@@ -4152,22 +4150,8 @@ static struct iommu_domain *apple_dart_domain_alloc_paging(struct device *dev)
 
 	if (dev) {
 		struct apple_dart_master_cfg *cfg = dev_iommu_priv_get(dev);
-		u64 window[2];
 		int ret;
 
-		if (of_property_present(dev->of_node, "apple,dma-range")) {
-			ret = of_property_read_u64_array(dev->of_node, "apple,dma-range",
-						window, 2);
-			if (!ret)
-				ret = apple_dart_dma_window(window[0], window[1],
-						    &dart_domain->dma_max);
-			if (ret) {
-				kfree(dart_domain);
-				return ERR_PTR(ret);
-			}
-			dart_domain->dma_min = window[0];
-			dart_domain->has_dma_range = true;
-		}
 		ret = apple_dart_finalize_domain(dart_domain, cfg);
 		if (ret) {
 			kfree(dart_domain);
@@ -4248,10 +4232,40 @@ static void apple_dart_domain_free(struct iommu_domain *domain)
 	kfree(dart_domain);
 }
 
+static int apple_dart_validate_dma_window(struct device *dev,
+					  const struct apple_dart *dart,
+					  dma_addr_t dma_min, dma_addr_t length,
+					  dma_addr_t *dma_max)
+{
+	if (!length)
+		return -EINVAL;
+	if (!IS_ALIGNED(dma_min, dart->pgsize) || !IS_ALIGNED(length, dart->pgsize)) {
+		dev_err(dev, "Unaligned DMA window %pad, %pad (0x%x)\n",
+			&dma_min, &length, dart->pgsize);
+		return -EINVAL;
+	}
+	if (check_add_overflow(dma_min, length - 1, dma_max)) {
+		dev_err(dev, "DMA window length (%pad) overflows range for start %pad\n",
+			&length, &dma_min);
+		return -EINVAL;
+	}
+
+	/* High bits may select an alias, but the window must fit within it. */
+	if ((dma_min ^ *dma_max) & ~DMA_BIT_MASK(dart->ias)) {
+		dev_err(dev, "Invalid DMA window for ias=%d\n", dart->ias);
+		return -EINVAL;
+	}
+	return 0;
+}
+
 /*
  * Work out the DMA window of one "iommus" specifier. One cell is the stream
  * ID alone and keeps the window of the DART node. Five cells add the 64-bit
- * start and length of the window that the device uses.
+ * start and length of the window that the device uses. A consumer's
+ * apple,dma-range narrows either window: its bits above the DART's ias pick
+ * the alias the consumer uses, and its low bits are intersected with the
+ * stream's own window, masked the same way. The DART translates only the low
+ * bits, so an address outside the stream's window must never be handed out.
  */
 static int apple_dart_parse_dma_window(struct device *dev,
 				       const struct apple_dart *dart,
@@ -4259,43 +4273,47 @@ static int apple_dart_parse_dma_window(struct device *dev,
 				       dma_addr_t *dma_min,
 				       dma_addr_t *dma_max)
 {
-	dma_addr_t length;
+	dma_addr_t length, consumer_max, low_min, low_max;
+	u64 mask = DMA_BIT_MASK(dart->ias);
+	u64 window[2];
+	int ret;
 
+	if (args->args_count != 1 && args->args_count != 5)
+		return -EINVAL;
 	*dma_min = dart->dma_min;
 	*dma_max = dart->dma_max;
 
-	if (args->args_count == 1)
+	if (args->args_count == 5) {
+		if (*dma_min != 0 || *dma_max != DMA_BIT_MASK(dart->ias))
+			dev_err(dev, "still using legacy \"apple,dma-range\" property\n");
+		*dma_min = ((dma_addr_t)args->args[1] << 32) | args->args[2];
+		length = ((dma_addr_t)args->args[3] << 32) | args->args[4];
+		ret = apple_dart_validate_dma_window(dev, dart, *dma_min, length, dma_max);
+		if (ret)
+			return ret;
+	}
+
+	/* Narrow to the consumer aperture before intersecting its DART windows. */
+	if (!of_property_present(dev->of_node, "apple,dma-range"))
 		return 0;
-	if (args->args_count != 5)
-		return -EINVAL;
+	ret = of_property_read_u64_array(dev->of_node, "apple,dma-range",
+					window, ARRAY_SIZE(window));
+	if (ret)
+		return ret;
+	ret = apple_dart_validate_dma_window(dev, dart, window[0], window[1],
+					     &consumer_max);
+	if (ret)
+		return ret;
 
-	length = ((dma_addr_t)args->args[3] << 32) | args->args[4];
-	if (!length)
-		return -EINVAL;
-
-	if (*dma_min != 0 || *dma_max != DMA_BIT_MASK(dart->ias))
-		dev_err(dev, "still using legacy \"apple,dma-range\" property\n");
-
-	*dma_min = ((dma_addr_t)args->args[1] << 32) | args->args[2];
-
-	if (!IS_ALIGNED(*dma_min, dart->pgsize) ||
-	    !IS_ALIGNED(length, dart->pgsize)) {
-		dev_err(dev, "Unaligned DMA window %pad, %pad (0x%x)\n",
-			dma_min, &length, dart->pgsize);
+	low_min = max(window[0] & mask, *dma_min & mask);
+	low_max = min(consumer_max & mask, *dma_max & mask);
+	if (low_min > low_max) {
+		dev_err(dev, "DMA window %#llx..%#llx does not overlap stream window %pad..%pad\n",
+			window[0], (u64)consumer_max, dma_min, dma_max);
 		return -EINVAL;
 	}
-	if (check_add_overflow(*dma_min, length - 1, dma_max)) {
-		dev_err(dev, "DMA window length (%pad) overflows range for start %pad\n",
-			&length, dma_min);
-		return -EINVAL;
-	}
-
-	/* Ensure that the DMA window does not exceed the DART's ias. */
-	if ((*dma_min ^ *dma_max) & ~DMA_BIT_MASK(dart->ias)) {
-		dev_err(dev, "Invalid DMA window for ias=%d\n", dart->ias);
-		return -EINVAL;
-	}
-
+	*dma_min = (window[0] & ~mask) | low_min;
+	*dma_max = (window[0] & ~mask) | low_max;
 	return 0;
 }
 

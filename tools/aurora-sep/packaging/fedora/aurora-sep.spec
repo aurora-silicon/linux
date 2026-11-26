@@ -8,7 +8,7 @@
 
 Name:           aurora-sep
 Version:        1
-Release:        14%{?dist}
+Release:        15%{?dist}
 Summary:        Loader and desktop integration for the Apple SEP fingerprint driver
 
 License:        GPL-2.0-only
@@ -197,6 +197,12 @@ fi
 %ghost %verify(not md5 size mode mtime) %{_sharedstatedir}/selinux/%{selinuxtype}/active/modules/200/%{modulename}
 
 %changelog
+* Wed Nov 25 2026 Matt <mmdisbro@gmail.com> - 1-15
+- aurora-sep-selinux 1.4.0: label the kernel's catacomb replacement files
+  (/var/lib/.apple-sep-catacomb-*.bin.new) as SEP state at creation, and let
+  the kernel set the mode of (setattr), rename and unlink state files. Install
+  it before a kernel that publishes catacombs by atomic replacement.
+
 * Sat Nov 21 2026 Ryan Murray <ryan@aurorasilicon.org> - 1-14
 - Install the logind drop-in as 05-aurora-sep.conf, so that a distribution's
   or an administrator's power key setting overrides it

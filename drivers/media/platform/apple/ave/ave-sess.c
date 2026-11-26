@@ -194,9 +194,6 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 		return -EOPNOTSUPP;
 	p->bit_depth = 8;
 	if (p->sample_bytes == 2) {
-		/* Only the 9003 layout's Main 10 fields are mapped. */
-		if (ctx->ave->layout->counted)
-			return -EOPNOTSUPP;
 		p->profile = AVE_HEVC_MAIN_10;
 		p->bit_depth = 10;
 		p->min_qp -= AVE_QP_BD_OFFSET_10;
@@ -1105,6 +1102,155 @@ static bool ave_starts_annexb(const u8 *p, size_t len)
 	       (len >= 4 && !p[0] && !p[1] && !p[2] && p[3] == 1);
 }
 
+/*
+ * Slice type of the first slice of an access unit, for the CAPTURE buffer's
+ * B/P flag: the firmware reorders B-frames itself, so the driver learns a
+ * picture's type from its bitstream. Only the first few bytes after the NAL
+ * header are read (emulation-prevention bytes removed); anything unexpected
+ * gives "not B".
+ */
+struct ave_rbsp {
+	u8 b[24];
+	unsigned int n, pos; /* bytes in b; next bit */
+};
+
+static void ave_rbsp_init(struct ave_rbsp *r, const u8 *p, size_t len)
+{
+	unsigned int zeros = 0;
+
+	r->n = 0;
+	r->pos = 0;
+	for (size_t i = 0; i < len && r->n < sizeof(r->b); i++) {
+		if (zeros >= 2 && p[i] == 3) {
+			zeros = 0;
+			continue;
+		}
+		zeros = p[i] ? 0 : zeros + 1;
+		r->b[r->n++] = p[i];
+	}
+}
+
+static int ave_rbsp_bit(struct ave_rbsp *r)
+{
+	int bit;
+
+	if (r->pos >= r->n * 8)
+		return -1;
+	bit = (r->b[r->pos / 8] >> (7 - r->pos % 8)) & 1;
+	r->pos++;
+	return bit;
+}
+
+/* ue(v), or -1 past the bytes read or above 31 leading zeros. */
+static s64 ave_rbsp_ue(struct ave_rbsp *r)
+{
+	unsigned int zeros = 0;
+	u64 v = 0;
+	int bit;
+
+	while ((bit = ave_rbsp_bit(r)) == 0)
+		if (++zeros > 31)
+			return -1;
+	if (bit < 0)
+		return -1;
+	for (unsigned int i = 0; i < zeros; i++) {
+		bit = ave_rbsp_bit(r);
+		if (bit < 0)
+			return -1;
+		v = v << 1 | bit;
+	}
+	return (s64)((1ULL << zeros) - 1 + v);
+}
+
+/* HEVC PPS: num_extra_slice_header_bits, needed to reach slice_type. */
+static int ave_hevc_pps_extra_bits(const u8 *nal, size_t len)
+{
+	struct ave_rbsp r;
+	int v = 0;
+
+	ave_rbsp_init(&r, nal + 2, len - 2);
+	if (ave_rbsp_ue(&r) < 0 || ave_rbsp_ue(&r) < 0) /* pps id, sps id */
+		return -1;
+	if (ave_rbsp_bit(&r) < 0 || ave_rbsp_bit(&r) < 0) /* dependent slices, output flag */
+		return -1;
+	for (unsigned int i = 0; i < 3; i++) {
+		int bit = ave_rbsp_bit(&r);
+
+		if (bit < 0)
+			return -1;
+		v = v << 1 | bit;
+	}
+	return v;
+}
+
+static bool ave_slice_is_b(const u8 *nal, size_t len, bool hevc, u8 extra_bits)
+{
+	u32 nal_type = (nal[0] >> 1) & 0x3f;
+	struct ave_rbsp r;
+	s64 type;
+
+	if (!hevc) {
+		ave_rbsp_init(&r, nal + 1, len - 1);
+		if (ave_rbsp_ue(&r) < 0) /* first_mb_in_slice */
+			return false;
+		type = ave_rbsp_ue(&r);
+		return type == 1 || type == 6; /* B, B (all slices) */
+	}
+
+	ave_rbsp_init(&r, nal + 2, len - 2);
+	if (ave_rbsp_bit(&r) != 1) /* first_slice_segment_in_pic_flag */
+		return false;
+	if (nal_type >= 16 && nal_type <= 23 && ave_rbsp_bit(&r) < 0)
+		return false;
+	if (ave_rbsp_ue(&r) < 0) /* slice_pic_parameter_set_id */
+		return false;
+	for (unsigned int i = 0; i < extra_bits; i++)
+		if (ave_rbsp_bit(&r) < 0)
+			return false;
+	type = ave_rbsp_ue(&r);
+	return type == 0; /* HEVC: 0 = B, 1 = P, 2 = I */
+}
+
+/* Whether the access unit's first slice is a B slice; learns the PPS bits. */
+static bool ave_au_is_b(const u8 *p, size_t len, bool hevc, u8 *extra_bits)
+{
+	for (size_t i = 0; i + 3 < len; i++) {
+		const u8 *nal;
+		size_t room;
+		u32 type;
+
+		if (p[i] || p[i + 1] || p[i + 2] != 1)
+			continue;
+		nal = p + i + 3;
+		room = len - i - 3;
+		if (room < (hevc ? 3 : 2))
+			break;
+		type = hevc ? (nal[0] >> 1) & 0x3f : nal[0] & 0x1f;
+		if (hevc && type == 34) {
+			int bits = ave_hevc_pps_extra_bits(nal, room);
+
+			if (bits >= 0)
+				*extra_bits = bits;
+		} else if (hevc ? type <= 21 : type == 1 || type == 5) {
+			return ave_slice_is_b(nal, room, hevc, *extra_bits);
+		}
+		i += 2;
+	}
+	return false;
+}
+
+/*
+ * Whether a coded access unit is a B picture. Key frames are scanned too:
+ * they carry the parameter sets, and the PPS's extra slice header bits are
+ * needed for every later B/P decision.
+ */
+bool ave_au_bframe(const u8 *p, size_t len, bool hevc, bool key, u8 *extra_bits)
+{
+	bool b = ave_au_is_b(p, len, hevc, extra_bits);
+
+	return !key && b;
+}
+
 /* NAL unit types in an Annex B buffer: key frame, parameter sets, filler? */
 static void ave_scan_nals(const u8 *p, size_t len, bool hevc, bool *key, bool *params,
 			  bool *filler)
@@ -1312,6 +1458,7 @@ int ave_sess_output(struct ave_ctx *ctx, unsigned int slot, struct vb2_v4l2_buff
 	int at, ret;
 
 	*keyframe = false;
+	s->bframe = false;
 	if (!out)
 		return -EFAULT;
 	if (s->status) {
@@ -1378,6 +1525,7 @@ int ave_sess_output(struct ave_ctx *ctx, unsigned int slot, struct vb2_v4l2_buff
 	if (!ave_starts_annexb(out, len))
 		ave_sess_dump(ctx, s, "not Annex B");
 	ave_scan_nals(out, len, hevc, keyframe, &params, &filler);
+	s->bframe = ave_au_bframe(out, len, hevc, *keyframe, &sess->hevc_extra_bits);
 	if (!ctx->dst_sequence && !params)
 		ave_sess_dump(ctx, s, "first frame has no parameter sets");
 	len = ave_sess_cbr_fill(ctx, out, len, room, filler);
