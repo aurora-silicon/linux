@@ -80,6 +80,7 @@
  * @floor_confirm: the first DVFS-STATE response follows a CPU memory floor
  * @start_at_probe: with @starts_pmp, start the PMP once it is handed over,
  *	without waiting for a consumer to ask for it
+ * @sleep_keep: request bits kept set through a system sleep commit
  */
 struct apple_pmp_report_offsets {
 	u32 tgt_read;
@@ -91,6 +92,7 @@ struct apple_pmp_report_offsets {
 	/* Update aperture of every entry (8 bytes each) and SOC-DEV-DVFS range. */
 	u32 update;
 	u32 dvfs_first, dvfs_count;
+	u64 sleep_keep;
 	bool fast_die_wide;
 	bool running_any;
 	bool defer_requests;
@@ -593,7 +595,8 @@ void apple_pmp_report_sleep(struct device *pmp, bool at_commit)
 			continue;
 		spin_lock_irqsave(&rep->lock, flags);
 		rep->sleep_request = readq(rep->base + offs->tgt_read);
-		withdrawn = rep->sleep_request & rep->known & ~(at_commit ? rep->commit_owned : 0);
+		withdrawn = rep->sleep_request & rep->known &
+			    ~((at_commit ? rep->commit_owned : 0) | offs->sleep_keep);
 		if (withdrawn)
 			writeq(rep->sleep_request & ~withdrawn, rep->base + offs->tgt_write);
 		rep->defer = true;
@@ -2900,6 +2903,8 @@ static int apple_pmp_report_suspend(struct device *dev)
 	struct apple_pmp_report *rep = dev_get_drvdata(dev);
 	struct pmp_floor *f = rep ? rep->floor : NULL;
 
+	if (rep && READ_ONCE(pmp_diag_hb_rep) == rep)
+		schedule_delayed_work(&pmp_diag_hb_work, msecs_to_jiffies(1000));
 	if (!f)
 		return 0;
 	mutex_lock(&f->lock);
@@ -2916,6 +2921,8 @@ static int apple_pmp_report_resume(struct device *dev)
 	struct apple_pmp_report *rep = dev_get_drvdata(dev);
 	struct pmp_floor *f = rep ? rep->floor : NULL;
 
+	if (rep && READ_ONCE(pmp_diag_hb_rep) == rep)
+		cancel_delayed_work_sync(&pmp_diag_hb_work);
 	if (!f)
 		return 0;
 	mutex_lock(&f->lock);
@@ -3065,6 +3072,12 @@ static const struct apple_pmp_report_offsets apple_pmp_offsets_t6030 = {
 	 * PMP running too, whether or not a display or GPU driver asks for it.
 	 */
 	.start_at_probe = true,
+	/*
+	 * macOS keeps bit 16 (storage/ANS, 0x10000) set in the request word
+	 * across the sleep commit; withdrawing it in suspend_late drops the
+	 * word to 0 before the sleep driver's entry steps run.
+	 */
+	.sleep_keep = BIT_ULL(16),
 };
 
 static const struct apple_pmp_report_offsets apple_pmp_offsets_t8112 = {

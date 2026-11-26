@@ -851,28 +851,41 @@ static void t6030_wake_masks_restore(struct apple_sleep *s)
 #define T6030_DART_ERROR_MACOS		0x10100000
 
 /*
- * DIAGNOSTIC (T6030 sleep bring-up): macOS 27.2's PTD request word on J516S's way down (s2r runs,
- * the perf word follows it): 0x10040 at pmVC, then 0x10000 1.05 s before the commit word. The
- * report's own sleep step (apple_pmp_report_sleep()) comes later, at the PMP's stop.
+ * macOS 27.2's PTD request lifecycle on J516s across sleep and wake:
+ *  - before pmVC (-4.71 s): 0x80000 to pmgr[40]+0x18328;
+ *  - at pmVC (-4.44 s): 0x10040 to 0x3503d08c0, polled on 0x3503c11c0 until acknowledged;
+ *  - 1.05 s before the commit word: 0x10000 to 0x3503d08c0 (no ack poll), kept across commit;
+ *  - on wake (+9.16 ms, before PMS_SRAM and PMP power on): read 0x3503c1180 and seed 0x10000.
  */
+#define T6030_PTD_READ_PA		0x3503c1000ULL
+#define T6030_PTD_TGT_READ		0x180
+#define T6030_PTD_ACTUAL		0x1c0
 #define T6030_PTD_UPDATE_PA		0x3503d0000ULL
 #define T6030_PTD_REQUEST		0x8c0
-#define T6030_MASK_AT_PMVC		0x10040
-#define T6030_MASK_LATE			0x10000
+#define T6030_PTD_CTRL_PA		0x3503d8000ULL
+#define T6030_PTD_SLEEP_CTRL		0x328
+#define T6030_PTD_SLEEP_CTRL_ENTRY	0x80000
+#define T6030_MASK_AT_PMVC		0x10040ULL
+#define T6030_MASK_LATE			0x10000ULL
+#define T6030_PTD_ACK_US		50000
 /* 1.05 s before the commit word, which comes 13.4 ms after slpa */
 #define T6030_MASK_LATE_TO_SLPA_US	1036600
 
-static bool t6030_diag_mask_steps;
+static bool t6030_diag_mask_steps = true;
 module_param_named(diag_mask_steps, t6030_diag_mask_steps, bool, 0644);
-MODULE_PARM_DESC(diag_mask_steps, "T6030 DIAGNOSTIC: macOS's PTD request steps on the way down (0x10040 at pmVC, 0x10000 1.05 s before the commit)");
+MODULE_PARM_DESC(diag_mask_steps, "T6030: macOS's PTD request steps across sleep and wake (default: on)");
+static void __iomem *t6030_ptd_read;
 static void __iomem *t6030_ptd_update;
+static void __iomem *t6030_ptd_ctrl;
 
 static void t6030_late_map(struct apple_sleep *s)
 {
 	struct t6030_sleep *t = t6030_state(s);
 	struct device_node *np = of_find_node_by_path("/soc/iommu@37a808000");
 
+	t6030_ptd_read = ioremap_np(T6030_PTD_READ_PA, 0x1000);
 	t6030_ptd_update = ioremap_np(T6030_PTD_UPDATE_PA, 0x1000);
+	t6030_ptd_ctrl = ioremap_np(T6030_PTD_CTRL_PA, 0x1000);
 	t->pmp_mbox = ioremap_np(T6030_PMP_MBOX_PA, 0x1000);
 	if (np && of_device_is_compatible(np, "apple,t6030-dart"))
 		t->mtp_dart = of_iomap(np, 0);
@@ -1418,6 +1431,8 @@ MODULE_PARM_DESC(mem_config, "T6030 DIAGNOSTIC: bring the AMCC, DCS and SoC perf
 
 static void t6030_sleep_prepare_regs(struct apple_sleep *s)
 {
+	if (READ_ONCE(t6030_diag_mask_steps) && t6030_ptd_ctrl)
+		writel(T6030_PTD_SLEEP_CTRL_ENTRY, t6030_ptd_ctrl + T6030_PTD_SLEEP_CTRL);
 	t6030_sleep_late_entry(s);
 	/*
 	 * The RAM walk here, seconds before the commit: the steps from .after_ans on are macOS's
@@ -1441,7 +1456,15 @@ static void t6030_sleep_after_ans(struct apple_sleep *s)
 	struct t6030_sleep *t = t6030_state(s);
 
 	if (READ_ONCE(t6030_diag_mask_steps) && t6030_ptd_update) {
+		u64 ack = 0;
+
 		writeq(T6030_MASK_AT_PMVC, t6030_ptd_update + T6030_PTD_REQUEST);
+		if (t6030_ptd_read &&
+		    readq_poll_timeout_atomic(t6030_ptd_read + T6030_PTD_ACTUAL, ack,
+					      ack == T6030_MASK_AT_PMVC, 100,
+					      T6030_PTD_ACK_US))
+			dev_warn(s->dev, "PTD request %#llx not acknowledged (ack %#llx)\n",
+				 T6030_MASK_AT_PMVC, ack);
 		apple_sleep_smc_until_before_slpa(s, T6030_MASK_LATE_TO_SLPA_US);
 		writeq(T6030_MASK_LATE, t6030_ptd_update + T6030_PTD_REQUEST);
 	}
@@ -2289,6 +2312,11 @@ static void t6030_sleep_wake(struct apple_sleep *s)
 	t6030_wake_gpu_writes(s, t6030_wake_afr, ARRAY_SIZE(t6030_wake_afr));
 	t6030_wake_lower(s);
 	t6030_wake_gpu_writes(s, t6030_wake_gpu, ARRAY_SIZE(t6030_wake_gpu));
+	if (READ_ONCE(t6030_diag_mask_steps) && t6030_ptd_update) {
+		if (t6030_ptd_read)
+			readq(t6030_ptd_read + T6030_PTD_TGT_READ);
+		writeq(T6030_MASK_LATE, t6030_ptd_update + T6030_PTD_REQUEST);
+	}
 	t6030_sleep_wake_check_ps(s, "before the memory side");
 	sleep_note(s, 0x72);
 	t6030_sleep_wake_seq(s, &t->wake, "apple,seq-wake");
