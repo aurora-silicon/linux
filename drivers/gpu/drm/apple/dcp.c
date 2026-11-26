@@ -72,6 +72,7 @@
 #include <linux/sizes.h>
 #include "dcp-fabric-effects.h"
 #include "dcp-fabric.h"
+#include "dcp-hdcp-drv.h"
 #include "dcp-hdmi.h"
 #include "dcp-syslog.h"
 #include "dcpext_scanout.h"
@@ -1650,6 +1651,9 @@ static struct apple_dcp_afkep *dcp_afkep(struct apple_dcp *dcp, u8 endpoint)
 		if (ep)
 			return ep;
 	}
+	/* The DP device endpoint HDCP started. */
+	if (dcp_hdcp_route(dcp, endpoint))
+		return dcp_hdcp_route(dcp, endpoint);
 	/* DPAV 0x2a on H17P overlaps the legacy DPTX endpoint number. */
 	if (dcp->dcpavservep && endpoint == dcp->dcpavservep->endpoint)
 		return dcp->dcpavservep;
@@ -4913,6 +4917,9 @@ int dcp_start(struct platform_device *pdev)
 	}
 
 
+	/* Before any endpoint announces its services: they are matched by name. */
+	dcp_hdcp_init(dcp);
+
 	/* Even if nothing starts, dcp_wait_ready() must find it initialised. */
 	init_completion(&dcp->start_done);
 	init_completion(&dcp->s2r_dart_done);
@@ -5064,6 +5071,7 @@ int dcp_start(struct platform_device *pdev)
 		dcp_cec_register(dcp);
 	}
 #endif
+	dcp_hdcp_start_endpoints(dcp);
 
 	return ret;
 }
@@ -5344,6 +5352,9 @@ void dcp_poweron(struct platform_device *pdev)
 	unsigned long remaining;
 	int ret;
 
+	/* A new link: DCP opens a new HDCP session once it is up. */
+	dcp_hdcp_link_changed(dcp);
+
 	/* The takeover trial powered it on before the eviction. */
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
 	    dcp->desktop->trial_powered) {
@@ -5526,6 +5537,9 @@ void dcp_poweroff(struct platform_device *pdev)
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 	bool display_gone = false;
 	int ret;
+
+	/* DPMS off ends any HDCP session; the next power-on starts another. */
+	dcp_hdcp_link_changed(dcp);
 
 	if (iomfb_is_m4(dcp)) {
 		ret = dcp_backlight_dpms(dcp, false);
@@ -7460,6 +7474,7 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 
 	if (!dcp)
 		return;
+	dcp_hdcp_fini(dcp);
 	if (IS_ENABLED(CONFIG_APPLE_SOC_SLEEP))
 		apple_sleep_v27_unregister(dev);
 	dcp_indicator_release(dcp);
@@ -9912,6 +9927,8 @@ static int dcp_s2r_suspend(struct apple_dcp *dcp)
 {
 	bool was_off;
 	int ret;
+
+	dcp_hdcp_link_changed(dcp);
 
 	/*
 	 * Not bound into the display subsystem (a component unbind released the RTKit
