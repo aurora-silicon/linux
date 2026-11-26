@@ -315,6 +315,55 @@ static void apple_pmp_test_gated_hold(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, hold.real_valid_ns, 0ULL);
 }
 
+/*
+ * A load that powers its cluster for 30 ms of every 100 ms, with the slow samples
+ * in the gated part. Slow sampling alone loses the sensors to the 2 s hold; fast
+ * sampling while dark and busy reads the cluster before that.
+ */
+static void apple_pmp_test_dark_fast(struct kunit *test)
+{
+	const u64 ms = 1000000ULL;
+	unsigned int pass;
+
+	KUNIT_EXPECT_TRUE(test, apple_pmp_dark_fast(-ENODATA, false));
+	KUNIT_EXPECT_FALSE(test, apple_pmp_dark_fast(-ENODATA, true));
+	KUNIT_EXPECT_FALSE(test, apple_pmp_dark_fast(0, false));
+	KUNIT_EXPECT_FALSE(test, apple_pmp_dark_fast(-EIO, false));
+
+	for (pass = 0; pass < 2; pass++) {
+		struct apple_pmp_gated_hold hold;
+		unsigned int faults = 0, reads = 0;
+		u64 t = 1000 * ms, worst = 0;
+		long mc = 70000;
+
+		apple_pmp_gated_hold_reset(&hold);
+		KUNIT_EXPECT_EQ(test, apple_pmp_gated_hold_sample(&hold, t, &mc, 0, false), 0);
+		t += 50 * ms;
+		while (t < 11000 * ms) {
+			u64 phase;
+			int raw;
+
+			div64_u64_rem(t, 100 * ms, &phase);
+			raw = phase < 30 * ms ? 0 : -ENODATA;
+			mc = 70000;
+			reads += !raw;
+			if (apple_pmp_gated_hold_sample(&hold, t, &mc, raw, false))
+				faults++;
+			else
+				worst = max(worst, t - hold.real_valid_ns);
+			t += pass && apple_pmp_dark_fast(raw, false) ? 5 * ms : 100 * ms;
+		}
+		if (pass) {
+			KUNIT_EXPECT_EQ(test, faults, 0U);
+			KUNIT_EXPECT_GT(test, reads, 0U);
+			KUNIT_EXPECT_LE(test, worst, 150 * ms);
+		} else {
+			KUNIT_EXPECT_GT(test, faults, 0U);
+			KUNIT_EXPECT_EQ(test, reads, 0U);
+		}
+	}
+}
+
 static void apple_pmp_test_cpu_idle_tracker(struct kunit *test)
 {
 	struct apple_pmp_idle_tracker tracker;
@@ -502,6 +551,7 @@ static struct kunit_case apple_pmp_policy_cases[] = {
 	KUNIT_CASE(apple_pmp_test_shared_power_arbitration),
 	KUNIT_CASE(apple_pmp_test_gpu_attachment),
 	KUNIT_CASE(apple_pmp_test_gated_hold),
+	KUNIT_CASE(apple_pmp_test_dark_fast),
 	KUNIT_CASE(apple_pmp_test_cpu_idle_tracker),
 	KUNIT_CASE(apple_pmp_test_zone_notify),
 	{},

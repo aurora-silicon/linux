@@ -420,7 +420,7 @@ static int apple_pmp_sample(bool cpus_idle)
 	struct apple_pmp_snapshot snapshot;
 	struct apple_pmp_cooling *cooling = &pmp_thermal.cooling;
 	long value = 0;
-	bool was_confirmed;
+	bool was_confirmed, dark_fast;
 	unsigned int old_level, level, i;
 	int old_reason, channel = -1, ret, guard_ret;
 	const char *reason;
@@ -429,6 +429,7 @@ static int apple_pmp_sample(bool cpus_idle)
 	old_level = pmp_thermal.guard_level;
 	old_reason = cooling->reason;
 	ret = apple_pmp_sample_all(&snapshot, &value);
+	dark_fast = apple_pmp_dark_fast(ret, cpus_idle);
 	ret = apple_pmp_gated_hold_sample(&pmp_thermal.hold,
 					  snapshot.finished_ns, &value, ret,
 					  cpus_idle);
@@ -449,7 +450,8 @@ static int apple_pmp_sample(bool cpus_idle)
 				DIV_ROUND_UP(state * 8, cdev->max_state));
 	}
 	level = apple_pmp_cooling_level(cooling);
-	WRITE_ONCE(pmp_thermal.fast_poll, apple_pmp_cooling_fast(cooling, value, ret));
+	WRITE_ONCE(pmp_thermal.fast_poll,
+		   apple_pmp_cooling_fast(cooling, value, ret) || dark_fast);
 	/* Never release startup/fault protection with disabled or unbound cooling. */
 	if (!pmp_thermal.enabled)
 		level = 8;
