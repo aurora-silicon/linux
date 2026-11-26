@@ -1358,6 +1358,8 @@ static void t6030_sleep_wake(struct apple_sleep *s)
 #define T6030_CYC_OVRD			sys_reg(3, 5, 15, 5, 0)
 #define T6030_CYC_OVRD_WFI_MODE		GENMASK_ULL(25, 24)
 #define T6030_CYC_OVRD_DISABLE_WFI_RET	BIT_ULL(0)
+#define T6030_CYC_OVRD_FIQ_MODE		GENMASK_ULL(21, 20)
+#define T6030_CYC_OVRD_IRQ_MODE		GENMASK_ULL(23, 22)
 #define T6030_ACC_OVRD			sys_reg(3, 5, 15, 6, 0)
 #define T6030_ACC_OVRD_PWR_DN_SRM	GENMASK_ULL(14, 13)
 #define T6030_ACC_OVRD_DIS_L2_FLUSH	GENMASK_ULL(16, 15)
@@ -1388,6 +1390,192 @@ static void t6030_deep_wfi_arm(void)
 			   FIELD_PREP(T6030_CYC_OVRD_WFI_MODE, 3) | T6030_CYC_OVRD_DISABLE_WFI_RET);
 	isb();
 }
+
+/*
+ * T6030 DIAGNOSTIC: a positive control for aura's reset witness, so that a commit without one
+ * means a core never reset. Written at run time, never during a sleep:
+ * apple_sleep.reset_test=<cpu> takes that secondary through the wake's own path. It goes
+ * offline into the kernel's park, writes its stop bit (sleep_cpu_stop()), and powers off with
+ * t6030_reset_test_off(). Its power word must then read off. sleep_cpu_on()'s cpu-start
+ * writes start it again, so it resets through RVBAR into aura and comes back online.
+ *
+ * resume_pa is set across the restart (to a WFI loop, in case the boot core ever took it).
+ * aura's C witness then notes 0x50 | n in PMU scratch +2 (0x830a), and its slot flag counts
+ * the entry. With apple_sleep.reset_test_veneer=1 the core's RVBAR (unlocked) first takes the
+ * boot core's locked one: the page a wake resets the boot core at, so the restart crosses the
+ * same veneer. RVBAR is put back once the core is up. One line says what happened.
+ *
+ * Addresses are the J516s ADT's: cpu-impl-reg 0x210050000 + 0x1000000 * cluster + 0x100000 *
+ * core, RVBAR at +0 (lock bit 0, address 47:12, aura's RVBAR_ADDR); the pmgr ps names ECPU0-5
+ * at 0x0-0x28, PCPU0-5 at 0x30-0x58.
+ */
+#define T6030_CPU_IMPL(c, k)		(0x210050000ULL + 0x1000000ULL * (c) + 0x100000ULL * (k))
+#define T6030_RVBAR_ADDR		GENMASK_ULL(47, 12)
+#define T6030_PS_CPU(c, k)		(0x30 * !!(c) + 8 * (k))
+
+static bool t6030_reset_test_veneer;
+module_param_named(reset_test_veneer, t6030_reset_test_veneer, bool, 0644);
+MODULE_PARM_DESC(reset_test_veneer, "T6030 DIAGNOSTIC: reset_test restarts the core through the boot core's RVBAR");
+
+/*
+ * XNU's power-down of one core outside a system sleep, on H15 (cpu_sleep() off the quiescing
+ * path: arm64_prepare_for_sleep(false)). CYC_OVRD's IRQ and FIQ go disabled, against a
+ * spurious wake, then ok2pwrdn_force_down and disWfiRetn, then dsb, isb, wfi. ACC_OVRD is
+ * one register for every core, the system sleep's, and stays as it is. The caches are
+ * cleaned first, as by cpu_sleep()'s CleanPoC_Dcache().
+ */
+static void __noreturn t6030_reset_test_off(void)
+{
+	u64 hid4 = t6030_dc_unblock();
+
+	t6030_clean_all_levels();
+	t6030_dc_reblock(hid4);
+	write_sysreg(ARCH_TIMER_CTRL_IT_MASK, cntp_ctl_el0);
+	write_sysreg(ARCH_TIMER_CTRL_IT_MASK, cntv_ctl_el0);
+	sysreg_clear_set_s(T6030_CYC_OVRD, T6030_CYC_OVRD_IRQ_MODE | T6030_CYC_OVRD_FIQ_MODE,
+			   FIELD_PREP(T6030_CYC_OVRD_IRQ_MODE, 2) |
+			   FIELD_PREP(T6030_CYC_OVRD_FIQ_MODE, 2));
+	isb();
+	sysreg_clear_set_s(T6030_CYC_OVRD, T6030_CYC_OVRD_WFI_MODE,
+			   FIELD_PREP(T6030_CYC_OVRD_WFI_MODE, 3) | T6030_CYC_OVRD_DISABLE_WFI_RET);
+	while (true) {
+		dsb(sy);
+		isb();
+		wfi();
+	}
+}
+
+/* The mailbox's resume_pa, to memory (aura reads it with the MMU off) */
+static void t6030_reset_test_resume_pa(struct apple_sleep *s, u64 pa)
+{
+	u64 hid4 = t6030_dc_unblock();
+
+	t6030_clean_range((unsigned long)t8142_el1_wfi_stub, (unsigned long)t8142_el1_wfi_stub_end);
+	WRITE_ONCE(s->mbox->resume_pa, pa);
+	t6030_clean_range((unsigned long)s->mbox, (unsigned long)(s->mbox + 1));
+	t6030_dc_reblock(hid4);
+}
+
+static u64 t6030_reset_test_flag(void __iomem *slot)
+{
+	u64 hid4, v;
+
+	if (!slot)
+		return ~0ULL;
+	hid4 = t6030_dc_unblock();
+	v = sleep_cpu_slot_read(slot, 8);
+	t6030_dc_reblock(hid4);
+	return v;
+}
+
+static int t6030_reset_test(unsigned int cpu)
+{
+	struct apple_sleep *s = apple_sleep;
+	bool veneer = READ_ONCE(t6030_reset_test_veneer);
+	u64 mpidr, boot, rv0, rv1, brv, flag0, flag1, t0, t1;
+	void __iomem *rv = NULL, *boot_rv = NULL, *slot;
+	u32 vw[4] = {}, ps0, ps1 = 0, ps2;
+	unsigned int c, k, us, sleep_flags;
+	int ret, held, stopped, up;
+	void *vp;
+
+	if (!s || !s->mbox || s->soc->ops->deep_wfi_arm != t6030_deep_wfi_arm)
+		return -ENODEV;
+	if (cpu >= nr_cpu_ids || !cpu || !cpu_online(cpu))
+		return -EINVAL;
+	mpidr = cpu_logical_map(cpu) & MPIDR_HWID_BITMASK;
+	boot = READ_ONCE(s->mbox->boot_mpidr);
+	if (mpidr == boot)
+		return -EINVAL;
+	c = sleep_cpu_cluster(s, mpidr);
+	k = sleep_cpu_core(mpidr);
+
+	rv = ioremap_np(T6030_CPU_IMPL(c, k), 8);
+	boot_rv = ioremap_np(T6030_CPU_IMPL(sleep_cpu_cluster(s, boot), sleep_cpu_core(boot)), 8);
+	if (!rv || !boot_rv) {
+		ret = -ENOMEM;
+		goto unmap;
+	}
+	rv0 = readq(rv);
+	brv = readq(boot_rv);
+	vp = memremap(brv & T6030_RVBAR_ADDR, sizeof(vw), MEMREMAP_WB);
+	if (vp) {
+		memcpy(vw, vp, sizeof(vw));
+		memunmap(vp);
+	}
+	slot = sleep_cpu_slot_map(cpu);
+
+	sleep_flags = lock_system_sleep();
+	ret = remove_cpu(cpu);
+	if (ret)
+		goto unlock;
+	ps0 = readl(s->ps + T6030_PS_CPU(c, k));
+	WRITE_ONCE(sleep_reset_test_mpidr, mpidr);
+	held = spin_table_hold_parked();
+	if (held) {
+		WRITE_ONCE(sleep_reset_test_mpidr, ~0ULL);
+		ret = add_cpu(cpu);
+		pr_info("apple-sleep: reset test: cpu%u %#llx not held (%d), back online %d\n",
+			cpu, mpidr, held, ret);
+		ret = held;
+		goto unlock;
+	}
+	stopped = spin_table_stop_parked();
+	spin_table_release_cpus(cpumask_of(cpu));
+	t0 = ktime_get_ns();
+	do {
+		ps1 = readl(s->ps + T6030_PS_CPU(c, k));
+		if (!FIELD_GET(PS_ACTUAL, ps1))
+			break;
+		usleep_range(10, 20);
+	} while (ktime_get_ns() - t0 < 100 * NSEC_PER_MSEC);
+	us = div_u64(ktime_get_ns() - t0, NSEC_PER_USEC);
+	/* Off, and past its last instruction */
+	mdelay(1);
+	if (veneer)
+		writeq(brv & T6030_RVBAR_ADDR, rv);
+	rv1 = readq(rv);
+	t6030_reset_test_resume_pa(s, __pa_symbol(t8142_el1_wfi_stub));
+	flag0 = t6030_reset_test_flag(slot);
+	spin_table_stop_finished();
+	WRITE_ONCE(sleep_reset_test_mpidr, ~0ULL);
+	t0 = ktime_get_ns();
+	up = add_cpu(cpu);
+	t1 = ktime_get_ns();
+	t6030_reset_test_resume_pa(s, 0);
+	flag1 = t6030_reset_test_flag(slot);
+	ps2 = readl(s->ps + T6030_PS_CPU(c, k));
+	if (veneer)
+		writeq(rv0 & T6030_RVBAR_ADDR, rv);
+
+	pr_info("apple-sleep: reset test: cpu%u %#llx (cluster %u core %u): ps %#x -> %#x after %u us (%s) -> %#x; held %d stopped %d; RVBAR %#llx -> %#llx (boot core's %#llx, veneer %08x %08x %08x%08x) -> %#llx; aura slot flag %llu -> %llu; online %d after %llu us\n",
+		cpu, mpidr, c, k, ps0, ps1, us, FIELD_GET(PS_ACTUAL, ps1) ? "STILL ON" : "off", ps2,
+		held, stopped, rv0, rv1, brv, vw[0], vw[1], vw[3], vw[2], readq(rv), flag0, flag1,
+		up, div_u64(t1 - t0, NSEC_PER_USEC));
+	ret = up;
+unlock:
+	unlock_system_sleep(sleep_flags);
+unmap:
+	if (boot_rv)
+		iounmap(boot_rv);
+	if (rv)
+		iounmap(rv);
+	return ret;
+}
+
+static int t6030_reset_test_set(const char *val, const struct kernel_param *kp)
+{
+	unsigned int cpu;
+	int ret = kstrtouint(val, 0, &cpu);
+
+	return ret ?: t6030_reset_test(cpu);
+}
+
+static const struct kernel_param_ops t6030_reset_test_ops = {
+	.set = t6030_reset_test_set,
+};
+module_param_cb(reset_test, &t6030_reset_test_ops, NULL, 0200);
+MODULE_PARM_DESC(reset_test, "T6030 DIAGNOSTIC: power this secondary off and start it again through RVBAR (reset witness control)");
 
 /* Every power word in "ps" that the J516s ADT's pmgr devices name */
 static const u32 t6030_ps_all[] = {
