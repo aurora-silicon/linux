@@ -368,6 +368,14 @@ impl<T: Operations> RtKit<T> {
         to_result(unsafe { bindings::apple_rtkit_wake(self.rtk) })
     }
 
+    /// Starts a coprocessor whose firmware may acknowledge IOP power on by itself once it has
+    /// reported in: takes that acknowledgment if it comes within `self_ack_ms`, and asks for IOP
+    /// power as [`Self::wake`] does otherwise.
+    pub fn boot_or_wake(self: Pin<&mut Self>, self_ack_ms: u32) -> Result {
+        // SAFETY: `rtk` is valid per the type invariant.
+        to_result(unsafe { bindings::apple_rtkit_boot_or_wake(self.rtk, self_ack_ms) })
+    }
+
     /// Waits for the RTKit coprocessor to finish booting.
     pub fn boot(self: Pin<&mut Self>) -> Result {
         // SAFETY: `rtk` is valid per the type invariant.

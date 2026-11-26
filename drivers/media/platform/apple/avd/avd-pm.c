@@ -2,8 +2,11 @@
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/io.h>
+#include <linux/ktime.h>
 #include <linux/limits.h>
+#include <linux/math64.h>
 #include <linux/of.h>
+#include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
 #include <linux/reset.h>
 #include <linux/slab.h>
@@ -12,6 +15,11 @@
 
 /* [C] Keep Linux's existing default until the idle-timer capture is available. */
 #define AVD_AUTOSUSPEND_MS 100
+#define AVD_PERF_AUTOSUSPEND_MS 100
+#define AVD_PERF_WINDOW_NS (AVD_PERF_WINDOW_MS * NSEC_PER_MSEC)
+#define AVD_PERF_WINDOW_ENTER_PIXELS \
+	(AVD_PERF_ENTER_PX_PER_MS * AVD_PERF_WINDOW_MS)
+#define AVD_PERF_HOLD_NS (AVD_PERF_HOLD_MS * NSEC_PER_MSEC)
 #define AVD_DRAIN_TIMEOUT_MS 5000
 #define AVD_PIODMA_SRAM_BASE 0x24
 
@@ -182,10 +190,229 @@ const struct avd_queue_pm_ops avd_pm_queue_ops = {
 	.resubmit = avd_pm_resubmit,
 };
 
+static int avd_pm_perf_get_pd(struct avd_dev *avd)
+{
+	return pm_runtime_resume_and_get(avd->pm.perf_dev);
+}
+
+static void avd_pm_perf_put_pd(struct avd_dev *avd, bool sync)
+{
+	if (sync) {
+		pm_runtime_put_sync_suspend(avd->pm.perf_dev);
+		return;
+	}
+	pm_runtime_mark_last_busy(avd->pm.perf_dev);
+	pm_runtime_put_autosuspend(avd->pm.perf_dev);
+}
+
+static void avd_pm_perf_suspend_pd(struct avd_dev *avd)
+{
+	pm_runtime_suspend(avd->pm.perf_dev);
+}
+
+static const struct avd_pm_perf_ops avd_pm_perf_runtime_ops = {
+	.get = avd_pm_perf_get_pd,
+	.put = avd_pm_perf_put_pd,
+	.suspend = avd_pm_perf_suspend_pd,
+};
+
+static u64 avd_pm_clock_ns(struct avd_dev *avd)
+{
+	return avd->pm.clock_ns ? avd->pm.clock_ns() : ktime_get_ns();
+}
+
+static void avd_pm_perf_reset_demand(struct avd_pm *pm)
+{
+	pm->perf_rate_high = false;
+	pm->perf_window_valid = false;
+	pm->perf_window_multi = false;
+	pm->perf_window_stream = NULL;
+	pm->perf_window_start_ns = 0;
+	pm->perf_window_pixels = 0;
+	pm->perf_hold_until_ns = 0;
+}
+
+static void avd_pm_detach_perf(void *data)
+{
+	struct avd_dev *avd = data;
+	struct device *perf_dev = avd->pm.perf_dev;
+
+	if (!perf_dev)
+		return;
+
+	avd_pm_perf_suspend(avd);
+	mutex_lock(&avd->pm.perf_lock);
+	WRITE_ONCE(avd->pm.perf_ops, NULL);
+	avd->pm.perf_dev = NULL;
+	mutex_unlock(&avd->pm.perf_lock);
+	pm_runtime_dont_use_autosuspend(perf_dev);
+	dev_pm_domain_detach(perf_dev, false);
+}
+
+int avd_pm_attach_perf(struct avd_dev *avd, unsigned int index)
+{
+	struct device *perf_dev;
+	int ret;
+
+	perf_dev = dev_pm_domain_attach_by_id(avd->dev, index);
+	if (IS_ERR(perf_dev))
+		return PTR_ERR(perf_dev);
+	if (!perf_dev)
+		return 0;
+
+	pm_runtime_set_autosuspend_delay(perf_dev, AVD_PERF_AUTOSUSPEND_MS);
+	pm_runtime_use_autosuspend(perf_dev);
+
+	mutex_lock(&avd->pm.perf_lock);
+	avd->pm.perf_dev = perf_dev;
+	WRITE_ONCE(avd->pm.perf_ops, &avd_pm_perf_runtime_ops);
+	mutex_unlock(&avd->pm.perf_lock);
+
+	ret = devm_add_action_or_reset(avd->dev, avd_pm_detach_perf, avd);
+	if (ret)
+		return ret;
+
+	return 0;
+}
+
+/*
+ * Engage the optional "perf" floor only when active decode demand requires it:
+ * frames larger than 1080p, multiple concurrent active streams, queue backlog,
+ * or sustained high pixel throughput with Schmitt-trigger hysteresis and a
+ * hold-down window to prevent floor thrashing.
+ */
+void avd_pm_perf_frame_start(struct avd_dev *avd, const void *stream_id,
+			     u32 width, u32 height, unsigned int inflight,
+			     unsigned int concurrent_streams)
+{
+	const struct avd_pm_perf_ops *ops;
+	struct avd_pm *pm = &avd->pm;
+	u64 frame_pixels = (u64)width * height;
+	u64 now_ns;
+	bool high_demand, need_perf;
+
+	if (!READ_ONCE(pm->perf_ops))
+		return;
+
+	mutex_lock(&pm->perf_lock);
+	ops = pm->perf_ops;
+	if (!ops)
+		goto unlock;
+
+	now_ns = avd_pm_clock_ns(avd);
+
+	if (!pm->perf_window_valid || now_ns < pm->perf_window_start_ns) {
+		pm->perf_window_valid = true;
+		pm->perf_window_start_ns = now_ns;
+		pm->perf_window_pixels = frame_pixels;
+		pm->perf_window_stream = stream_id;
+		pm->perf_window_multi = false;
+		pm->perf_rate_high = false;
+		pm->perf_hold_until_ns = 0;
+	} else {
+		u64 dt_ns = now_ns - pm->perf_window_start_ns;
+
+		if (dt_ns >= 2 * AVD_PERF_WINDOW_NS) {
+			pm->perf_rate_high = false;
+			pm->perf_window_start_ns = now_ns;
+			pm->perf_window_pixels = frame_pixels;
+			pm->perf_window_stream = stream_id;
+			pm->perf_window_multi = false;
+		} else if (dt_ns >= AVD_PERF_WINDOW_NS) {
+			u64 dt_ms = div_u64(dt_ns, NSEC_PER_MSEC);
+			u64 px_per_ms = div_u64(pm->perf_window_pixels, dt_ms);
+
+			if (px_per_ms >= AVD_PERF_ENTER_PX_PER_MS)
+				pm->perf_rate_high = true;
+			else if (px_per_ms < AVD_PERF_EXIT_PX_PER_MS)
+				pm->perf_rate_high = false;
+
+			pm->perf_window_start_ns = now_ns;
+			pm->perf_window_pixels = frame_pixels;
+			pm->perf_window_stream = stream_id;
+			pm->perf_window_multi = false;
+		} else {
+			pm->perf_window_pixels += frame_pixels;
+			if (pm->perf_window_stream && stream_id &&
+			    pm->perf_window_stream != stream_id)
+				pm->perf_window_multi = true;
+			else if (!pm->perf_window_stream)
+				pm->perf_window_stream = stream_id;
+			if (pm->perf_window_pixels >= AVD_PERF_WINDOW_ENTER_PIXELS)
+				pm->perf_rate_high = true;
+		}
+	}
+
+	high_demand = frame_pixels > AVD_PERF_FRAME_PIXELS ||
+		      concurrent_streams > 1 ||
+		      pm->perf_window_multi ||
+		      inflight >= AVD_PERF_INFLIGHT_HIGH ||
+		      pm->perf_rate_high;
+
+	if (high_demand)
+		pm->perf_hold_until_ns = now_ns + AVD_PERF_HOLD_NS;
+
+	need_perf = high_demand ||
+		    (pm->perf_hold_until_ns && now_ns < pm->perf_hold_until_ns);
+
+	if (need_perf) {
+		/* Best effort: decode still completes without the floor. */
+		if (!pm->perf_held && ops->get(avd) >= 0)
+			pm->perf_held = true;
+	} else {
+		pm->perf_hold_until_ns = 0;
+		if (pm->perf_held) {
+			pm->perf_held = false;
+			ops->put(avd, false);
+		}
+	}
+
+unlock:
+	mutex_unlock(&pm->perf_lock);
+}
+
+void avd_pm_perf_idle(struct avd_dev *avd)
+{
+	const struct avd_pm_perf_ops *ops;
+
+	if (!READ_ONCE(avd->pm.perf_ops))
+		return;
+
+	mutex_lock(&avd->pm.perf_lock);
+	ops = avd->pm.perf_ops;
+	if (ops && avd->pm.perf_held) {
+		avd->pm.perf_held = false;
+		ops->put(avd, false);
+	}
+	mutex_unlock(&avd->pm.perf_lock);
+}
+
+void avd_pm_perf_suspend(struct avd_dev *avd)
+{
+	const struct avd_pm_perf_ops *ops;
+
+	if (!READ_ONCE(avd->pm.perf_ops))
+		return;
+
+	mutex_lock(&avd->pm.perf_lock);
+	ops = avd->pm.perf_ops;
+	avd_pm_perf_reset_demand(&avd->pm);
+	if (ops) {
+		if (avd->pm.perf_held) {
+			avd->pm.perf_held = false;
+			ops->put(avd, true);
+		} else if (ops->suspend) {
+			ops->suspend(avd);
+		}
+	}
+	mutex_unlock(&avd->pm.perf_lock);
+}
+
 void avd_pm_init(struct avd_dev *avd, const struct avd_backend_ops *backend,
 		 const struct avd_queue_pm_ops *queue)
 {
 	mutex_init(&avd->pm.lock);
+	mutex_init(&avd->pm.perf_lock);
 	INIT_LIST_HEAD(&avd->pm.deferred_unmaps);
 	init_waitqueue_head(&avd->pm.idle_wait);
 	avd->pm.dart_active = false;
@@ -194,6 +421,11 @@ void avd_pm_init(struct avd_dev *avd, const struct avd_backend_ops *backend,
 	mutex_init(&avd->pm.hw_lock);
 	avd->pm.hw_on = false;
 	avd->pm.irq_gen = 0;
+	avd->pm.perf_dev = NULL;
+	avd->pm.perf_ops = NULL;
+	avd->pm.perf_held = false;
+	avd->pm.clock_ns = NULL;
+	avd_pm_perf_reset_demand(&avd->pm);
 	avd->backend = backend;
 	avd->pm.queue = queue;
 }
@@ -248,6 +480,7 @@ void avd_pm_disable(struct avd_dev *avd)
 	pm_runtime_disable(avd->dev);
 	/* Also close the host IRQ if the final hardware transition failed. */
 	avd_pm_disable_irq(avd);
+	avd_pm_perf_suspend(avd);
 	/* No queue_mutex is held here: let a woken handler thread finish. */
 	if (avd->pm.irq >= 0)
 		synchronize_irq(avd->pm.irq);
@@ -293,27 +526,34 @@ int avd_pm_backend_resume(struct avd_dev *avd)
 /* Caller holds a runtime PM reference and queue_mutex. */
 int avd_pm_park(struct avd_dev *avd)
 {
-	int ret;
+	int ret = 0;
 
-	if (!avd->pm.dart_active)
+	if (!avd->pm.dart_active) {
+		avd_pm_perf_suspend(avd);
 		return -EHOSTDOWN;
+	}
 	avd_pm_disable_irq(avd);
 	dev_warn(avd->dev, "recover: stop firmware\n");
 	avd->backend->shutdown(avd);
 	if (avd->domain && !avd->pm.dma_parked) {
-		if (!avd->empty_domain)
-			return -ENODEV;
+		if (!avd->empty_domain) {
+			ret = -ENODEV;
+			goto out_perf;
+		}
 		dev_warn(avd->dev, "recover: block DMA\n");
 		ret = iommu_attach_device(avd->empty_domain, avd->dev);
 		if (ret) {
 			dev_err(avd->dev, "recover: DART empty attach failed: %d\n", ret);
-			return ret;
+			goto out_perf;
 		}
 		avd->pm.dma_parked = true;
 		/* Outstanding transfers drain into faults before any reset/free. */
 		usleep_range(5000, 6000);
 	}
-	return 0;
+out_perf:
+	/* Drop the perf floor only after firmware shutdown and DMA parking. */
+	avd_pm_perf_suspend(avd);
+	return ret;
 }
 
 int avd_pm_recover(struct avd_dev *avd)
@@ -339,7 +579,8 @@ int avd_pm_recover(struct avd_dev *avd)
 	/*
 	 * On the J616C the machine hangs right after this reset, while the
 	 * decoder's DART domain is restored. The cause is not known yet, so
-	 * stay parked: players fall back to software.
+	 * stay parked: players fall back to software. Tracked in
+	 * https://github.com/aurora-silicon/linux/issues/2450.
 	 */
 	if (avd->variant && avd->variant->quirks & AVD_QUIRK_NO_RECOVERY_RESET) {
 		dev_err(avd->dev, "recover: staying parked, no reset on this SoC\n");
@@ -428,6 +669,7 @@ int avd_pm_power_off(struct avd_dev *avd)
 	avd_pm_drain_unmaps(avd);
 	avd->pm.dart_active = false;
 	mutex_unlock(&avd->pm.lock);
+	avd_pm_perf_suspend(avd);
 	return 0;
 }
 
@@ -450,6 +692,8 @@ static int avd_system_suspend(struct device *dev)
 	ret = avd->pm.queue->drain(avd);
 	if (!ret)
 		ret = pm_runtime_force_suspend(dev);
+	if (!ret)
+		avd_pm_perf_suspend(avd);
 	if (ret)
 		v4l2_m2m_resume(avd->m2m_dev);
 	return ret;
