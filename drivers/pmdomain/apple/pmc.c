@@ -797,7 +797,9 @@ static int apple_pmc_interface_set(struct apple_pmc_domain *dom, bool on)
  * A consumer-switched interface: off clears the boost, then the BWR enable,
  * as a pipe's power-down does, after saving both; on gives both back what
  * they had then. If the BWR enable does not take the change on the way off,
- * the boost enable gets its old value back. Nothing is retried.
+ * the boost enable gets its old value back; if that rollback fails too, keep
+ * consumer_off set with the saved bits so callers must verify restoration
+ * before resuming the pipe. Nothing is retried.
  */
 static int apple_pmc_interface_consumer_set(struct apple_pmc_domain *dom, bool on)
 {
@@ -825,9 +827,12 @@ static int apple_pmc_interface_consumer_set(struct apple_pmc_domain *dom, bool o
 		ret = apple_pmc_interface_update(pmc, hw->boost_enable, dom->boost_bit, false);
 		if (!ret) {
 			ret = apple_pmc_interface_update(pmc, hw->bwr_enable, dom->bwr_bit, false);
-			if (ret)
-				apple_pmc_interface_update(pmc, hw->boost_enable, dom->boost_bit,
-							   dom->consumer_boost);
+			if (ret) {
+				if (apple_pmc_interface_update(pmc, hw->boost_enable,
+							       dom->boost_bit,
+							       dom->consumer_boost))
+					dom->consumer_off = true;
+			}
 		}
 		if (!ret)
 			dom->consumer_off = true;
@@ -1022,11 +1027,83 @@ out:
 	return found;
 }
 
-/* Whether apple_pmc_interface_consumer_off() can run for @consumer now, changing nothing. */
-int apple_pmc_interface_consumer_check(struct device *consumer)
+/*
+ * Direct display-pipe PMC interface parent of a firmware-owned
+ * consumer-switched PMGR power-state device @pmgr_dev, without walking
+ * further up the PMGR chain. Used by apple-pmgr-pwrstate so the interface
+ * switches right between the PMGR domain that references it and that
+ * domain's parent (e.g. SYS <-> PMC <-> FE on T8132 external pipes).
+ */
+static struct apple_pmc_domain *
+apple_pmc_pmgr_direct_interface(struct device *pmgr_dev,
+				struct platform_device **out_pdev)
 {
-	struct platform_device *pdev = NULL;
-	struct apple_pmc_domain *dom = apple_pmc_consumer_interface(consumer, &pdev);
+	struct platform_device *found_pdev = NULL;
+	struct apple_pmc_domain *found = NULL;
+	struct of_phandle_iterator it;
+	const struct property *prop;
+	int len, rc, err = 0;
+
+	*out_pdev = NULL;
+	if (!pmgr_dev || !apple_pmc_is_consumer_pmgr(pmgr_dev->of_node))
+		return ERR_PTR(-ENODEV);
+
+	prop = of_find_property(pmgr_dev->of_node, "power-domains", &len);
+	if (prop && (!len || (len % sizeof(__be32))))
+		return ERR_PTR(-EINVAL);
+
+	of_for_each_phandle(&it, rc, pmgr_dev->of_node, "power-domains",
+			    "#power-domain-cells", -1) {
+		struct platform_device *pdev = NULL;
+		struct apple_pmc_domain *dom;
+
+		if (!it.node)
+			continue;
+		if (!of_property_present(it.node, "apple,bwr-bit") &&
+		    !of_property_present(it.node, "apple,boost-bit"))
+			continue;
+		if (!apple_pmc_is_interface_node(it.node, false)) {
+			of_node_put(it.node);
+			err = -EINVAL;
+			goto out;
+		}
+		dom = apple_pmc_domain_by_node(it.node, false, &pdev);
+		if (!dom) {
+			of_node_put(it.node);
+			err = -EPROBE_DEFER;
+			goto out;
+		}
+		if (found && found != dom) {
+			put_device(&pdev->dev);
+			of_node_put(it.node);
+			err = -EINVAL;
+			goto out;
+		}
+		if (!found) {
+			found = dom;
+			found_pdev = pdev;
+		} else {
+			put_device(&pdev->dev);
+		}
+	}
+	if (rc != -ENOENT)
+		err = rc;
+
+out:
+	if (err) {
+		if (found_pdev)
+			put_device(&found_pdev->dev);
+		return ERR_PTR(err);
+	}
+	if (!found)
+		return ERR_PTR(-ENODEV);
+	*out_pdev = found_pdev;
+	return found;
+}
+
+static int apple_pmc_interface_check_dom(struct apple_pmc_domain *dom,
+					 struct platform_device *pdev)
+{
 	unsigned long flags;
 	int ret;
 
@@ -1038,19 +1115,36 @@ int apple_pmc_interface_consumer_check(struct device *consumer)
 	put_device(&pdev->dev);
 	return ret;
 }
+
+static int apple_pmc_interface_switch_dom(struct apple_pmc_domain *dom,
+					  struct platform_device *pdev,
+					  bool on)
+{
+	int ret;
+
+	if (IS_ERR(dom))
+		return PTR_ERR(dom);
+	ret = apple_pmc_interface_consumer_set(dom, on);
+	put_device(&pdev->dev);
+	return ret;
+}
+
+/* Whether apple_pmc_interface_consumer_off() can run for @consumer now, changing nothing. */
+int apple_pmc_interface_consumer_check(struct device *consumer)
+{
+	struct platform_device *pdev = NULL;
+	struct apple_pmc_domain *dom = apple_pmc_consumer_interface(consumer, &pdev);
+
+	return apple_pmc_interface_check_dom(dom, pdev);
+}
 EXPORT_SYMBOL_GPL(apple_pmc_interface_consumer_check);
 
 int apple_pmc_interface_consumer_off(struct device *consumer)
 {
 	struct platform_device *pdev = NULL;
 	struct apple_pmc_domain *dom = apple_pmc_consumer_interface(consumer, &pdev);
-	int ret;
 
-	if (IS_ERR(dom))
-		return PTR_ERR(dom);
-	ret = apple_pmc_interface_consumer_set(dom, false);
-	put_device(&pdev->dev);
-	return ret;
+	return apple_pmc_interface_switch_dom(dom, pdev, false);
 }
 EXPORT_SYMBOL_GPL(apple_pmc_interface_consumer_off);
 
@@ -1058,15 +1152,37 @@ int apple_pmc_interface_consumer_on(struct device *consumer)
 {
 	struct platform_device *pdev = NULL;
 	struct apple_pmc_domain *dom = apple_pmc_consumer_interface(consumer, &pdev);
-	int ret;
 
-	if (IS_ERR(dom))
-		return PTR_ERR(dom);
-	ret = apple_pmc_interface_consumer_set(dom, true);
-	put_device(&pdev->dev);
-	return ret;
+	return apple_pmc_interface_switch_dom(dom, pdev, true);
 }
 EXPORT_SYMBOL_GPL(apple_pmc_interface_consumer_on);
+
+int apple_pmc_interface_pmgr_check(struct device *pmgr_dev)
+{
+	struct platform_device *pdev = NULL;
+	struct apple_pmc_domain *dom = apple_pmc_pmgr_direct_interface(pmgr_dev, &pdev);
+
+	return apple_pmc_interface_check_dom(dom, pdev);
+}
+EXPORT_SYMBOL_GPL(apple_pmc_interface_pmgr_check);
+
+int apple_pmc_interface_pmgr_off(struct device *pmgr_dev)
+{
+	struct platform_device *pdev = NULL;
+	struct apple_pmc_domain *dom = apple_pmc_pmgr_direct_interface(pmgr_dev, &pdev);
+
+	return apple_pmc_interface_switch_dom(dom, pdev, false);
+}
+EXPORT_SYMBOL_GPL(apple_pmc_interface_pmgr_off);
+
+int apple_pmc_interface_pmgr_on(struct device *pmgr_dev)
+{
+	struct platform_device *pdev = NULL;
+	struct apple_pmc_domain *dom = apple_pmc_pmgr_direct_interface(pmgr_dev, &pdev);
+
+	return apple_pmc_interface_switch_dom(dom, pdev, true);
+}
+EXPORT_SYMBOL_GPL(apple_pmc_interface_pmgr_on);
 
 static int apple_pmc_domain_power_on(struct generic_pm_domain *genpd)
 {

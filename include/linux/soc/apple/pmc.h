@@ -34,6 +34,9 @@ int apple_pmc_floor_update(struct device *pmc, unsigned int agent, u32 mask,
 int apple_pmc_interface_consumer_check(struct device *consumer);
 int apple_pmc_interface_consumer_off(struct device *consumer);
 int apple_pmc_interface_consumer_on(struct device *consumer);
+int apple_pmc_interface_pmgr_check(struct device *pmgr_dev);
+int apple_pmc_interface_pmgr_off(struct device *pmgr_dev);
+int apple_pmc_interface_pmgr_on(struct device *pmgr_dev);
 #else
 static inline int apple_pmc_interface_consumer_check(struct device *consumer)
 {
@@ -46,6 +49,21 @@ static inline int apple_pmc_interface_consumer_off(struct device *consumer)
 }
 
 static inline int apple_pmc_interface_consumer_on(struct device *consumer)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int apple_pmc_interface_pmgr_check(struct device *pmgr_dev)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int apple_pmc_interface_pmgr_off(struct device *pmgr_dev)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int apple_pmc_interface_pmgr_on(struct device *pmgr_dev)
 {
 	return -EOPNOTSUPP;
 }
