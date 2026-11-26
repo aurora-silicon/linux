@@ -23,15 +23,34 @@ static void tx_report(struct dcp_hdcp_tx *tx, enum dcp_hdcp_progress_code code,
 }
 
 /*
- * Waits for a session event. DCP watches the receiver's RxStatus and turns it
- * into these events; the transmitter never reads RxStatus itself (on
- * DisplayPort a read clears the bits DCP is waiting for).
+ * Waits for a session event. DCP turns the receiver's RxStatus into these
+ * events, so RxStatus is read only once the event is overdue (spec time plus
+ * slack): a DisplayPort read clears the bits DCP waits for. Some paths (an
+ * on-board DP to HDMI converter) never raise the event although the receiver
+ * has the message ready.
  */
 static int tx_wait(struct dcp_hdcp_tx *tx, enum dcp_hdcp_auth_op op,
 		   unsigned int spec_ms)
 {
+	u8 status;
+	int ret;
+
 	tx->step = "wait for DCP event";
-	return tx->ops->wait(tx->ctx, op, spec_ms + DCP_HDCP_EVENT_SLACK_MS);
+	ret = tx->ops->wait(tx->ctx, op, spec_ms + DCP_HDCP_EVENT_SLACK_MS);
+	if (ret != -ETIMEDOUT)
+		return ret;
+	if (TX_READ(tx, DP_HDCP_2_2_REG_RXSTATUS_OFFSET, &status, 1))
+		return -ETIMEDOUT;
+	switch (op) {
+	case DCP_HDCP_AUTH_H_PRIME:
+		return HDCP_2_2_DP_RXSTATUS_H_PRIME(status) ? 0 : -ETIMEDOUT;
+	case DCP_HDCP_AUTH_PAIRING:
+		return HDCP_2_2_DP_RXSTATUS_PAIRING(status) ? 0 : -ETIMEDOUT;
+	case DCP_HDCP_AUTH_LIST:
+		return HDCP_2_2_DP_RXSTATUS_READY(status) ? 0 : -ETIMEDOUT;
+	default:
+		return -ETIMEDOUT;
+	}
 }
 
 /* Any revoked ID, or an SRM that cannot be read, fails the attempt. */
