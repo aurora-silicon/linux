@@ -128,6 +128,8 @@ const RECOVERY_DRAIN_MS: i64 = 1000;
 /// Further recoveries answered while the stopped work drains (work behind it can time out in
 /// turn) before the runtime gives up.
 const FURTHER_RECOVERIES: u32 = 4;
+/// Event ring record kinds kept for the logs of a timeout or a recovery.
+const EVENT_HISTORY: usize = 8;
 /// Rounds start only within this budget; one round takes at most PHASE1_WAIT_MS +
 /// HANDSHAKE_MS + RECOVERY_DRAIN_MS, so the lock is released well within the 10 s scheduler
 /// job timeout.
@@ -567,6 +569,13 @@ enum Kept {
     Render(RenderFlight),
 }
 
+/// Who a recovery round blamed, for its log line: the client, and the stopped work's stamps
+/// (render: tiler and fragment; compute: the stopped command's and the queue's current one).
+struct Blamed {
+    owner: crate::m3::m3_submit::Owner,
+    stamps: [u32; 2],
+}
+
 struct State {
     peer: Peer,
     root: crate::fw::types::GpuObject<RootV27_2>,
@@ -609,6 +618,9 @@ struct State {
     recovery_count: u32,
     /// Reports read and rounds answered: tells a stale report from a new one.
     ledger: g14_v27_2_abi::RecoveryLedger,
+    /// Kind words of the last event ring records read, and how many were read in all.
+    events: [u32; EVENT_HISTORY],
+    events_read: u64,
     /// Packets with a command the firmware stopped (`blame`), with their VM job guard, kept
     /// for the rest of the boot: the firmware may still reach that memory. Allocated with
     /// `g14_v27_2_abi::QUARANTINE_LIMIT` places at start, so keeping one never allocates.
@@ -636,6 +648,17 @@ impl State {
             }
             packet.finish(Err(err));
         }
+    }
+
+    /// The kinds of the last event ring records read, oldest first, for a log line.
+    fn recent_events(&self) -> ([u32; EVENT_HISTORY], usize) {
+        let count = self.events_read.min(EVENT_HISTORY as u64) as usize;
+        let mut out = [0; EVENT_HISTORY];
+        for (i, kind) in out.iter_mut().take(count).enumerate() {
+            let at = (self.events_read - count as u64 + i as u64) % EVENT_HISTORY as u64;
+            *kind = self.events[at as usize];
+        }
+        (out, count)
     }
 
     fn running(&self) -> bool {
@@ -1121,8 +1144,8 @@ impl Runtime {
     /// Marks the work the firmware's snapshot named (`g14_v27_2_abi::Attribution`): the
     /// published render pair, or the compute command with that completion stamp and the rest of
     /// its packet. Err(EIO) if that work is no longer tracked: the caller then fails all work.
-    fn blame(&self, state: &mut State, error: Error, slot: i32, work: Stopped) -> Result {
-        match work {
+    fn blame(&self, state: &mut State, error: Error, work: Stopped) -> Result<Blamed> {
+        let blamed = match work {
             Stopped::Render => {
                 let Some(packet) = state.rendering.as_ref().map(|f| f.packet.clone())
                     else { return Err(EIO); };
@@ -1130,9 +1153,8 @@ impl Runtime {
                 let Some(flight) = state.rendering.as_mut() else { return Err(EIO); };
                 flight.doomed = Some(error);
                 latch_guilty(&flight.packet, error);
-                let owner = &flight.packet.owner;
-                dev_err!(self.dev, "GPU: stopped render of {}[{}] (slot {}, {:?})\n",
-                         owner.process(), owner.pid, slot, error);
+                Blamed { owner: flight.packet.owner,
+                         stamps: [flight.stamps[TILER].raw(), flight.stamps[FRAGMENT].raw()] }
             }
             Stopped::Compute(stamp) => {
                 let Some(packet) = state.inflight.iter().find(|f| f.stamp.raw() == stamp)
@@ -1143,11 +1165,10 @@ impl Runtime {
                     flight.doomed.get_or_insert(error);
                 }
                 latch_guilty(&packet, error);
-                dev_err!(self.dev, "GPU: stopped compute {:#x} of {}[{}] (slot {}, {:?})\n",
-                         stamp, packet.owner.process(), packet.owner.pid, slot, error);
+                Blamed { owner: packet.owner, stamps: [stamp, state.queue_stamp()] }
             }
-        }
-        Ok(())
+        };
+        Ok(blamed)
     }
 
     /// Whether every command marked by `blame` has left its queue.
@@ -1234,6 +1255,7 @@ impl Runtime {
                 .map(|f| [f.stamps[TILER].raw(), f.stamps[FRAGMENT].raw()]);
             let mut attribution = g14_v27_2_abi::Attribution::default();
             let mut entries = 0;
+            let mut first = [(0u32, 0u32); 4];
             let mut stopped_tiler = false;
             for i in 0..gpu::RECOVERY_SNAPSHOT_ENTRIES {
                 let (flags, target) = state.root.recovery_entry(i)?;
@@ -1245,20 +1267,26 @@ impl Runtime {
                 attribution.add(entry.flags, entry.target, render, |stamp| {
                     inflight.iter().any(|f| f.stamp.raw() == stamp && f.ordinal > retired)
                 });
-                if entries <= 8 {
-                    dev_err!(self.dev,
-                             "GPU: recovery {} entry {}: flags {:#x} (event {:#x}) target {:#x}\n",
-                             generation, i, entry.flags, entry.event, entry.target);
-                }
+                if let Some(at) = first.get_mut(i) { *at = (entry.flags, entry.target); }
             }
+            let shown = &first[..entries.min(first.len())];
+            let (events, seen) = state.recent_events();
             // Every round is attributed: work behind the first stopped command can time out in
             // turn. Unnamed or ambiguous stopped work keeps the fail-stop.
             let Some(work) = attribution.result() else {
-                dev_err!(self.dev, "GPU: recovery {} names no single tracked command ({} entries)\n",
-                         generation, entries);
+                dev_err!(self.dev, "GPU: recovery {} ({:?}, slot {}) names no single tracked command: snapshot ({} entries) {:x?}, events {:?}\n",
+                         generation, error, slot, entries, shown, &events[..seen]);
                 return Err(EIO);
             };
-            self.blame(state, error, slot, work)?;
+            let blamed = self.blame(state, error, work)?;
+            let (what, second) = match work {
+                Stopped::Render => ("render, tiler", "fragment"),
+                Stopped::Compute(_) => ("compute", "queue at"),
+            };
+            dev_warn!(self.dev, "GPU: recovery {} ({:?}, slot {}, events {:?}): snapshot ({} entries) {:x?}; stopped {} {:#x} ({} {:#x}) of {}[{}]\n",
+                      generation, error, slot, &events[..seen], entries, shown, what,
+                      blamed.stamps[0], second, blamed.stamps[1],
+                      blamed.owner.process(), blamed.owner.pid);
             if stopped_tiler {
                 if let Some(flight) = state.rendering.as_ref() {
                     let ta_left = state.root.render_retired(TILER, flight.targets[TILER])?;
@@ -1285,8 +1313,8 @@ impl Runtime {
             }
             state.root.answer_recovery(0)?;
             state.ledger.answered(generation);
-            dev_err!(self.dev, "GPU: recovery {} answered in {} ms ({} snapshot entries)\n",
-                     generation, start.elapsed().as_millis(), entries);
+            dev_info!(self.dev, "GPU: recovery {} answered in {} ms\n",
+                      generation, start.elapsed().as_millis());
             let start = Instant::<Monotonic>::now();
             loop {
                 let _ = state.root.drain();
@@ -1352,7 +1380,9 @@ impl Runtime {
         let mut reported = false;
         // Limit one pass to the ring capacity. Further arrivals notify the worker again.
         for _ in 0..256 {
-            let Some((cursor, event)) = state.root.peek_event()? else { break; };
+            let Some((cursor, kind, event)) = state.root.peek_event()? else { break; };
+            state.events[(state.events_read % EVENT_HISTORY as u64) as usize] = kind;
+            state.events_read += 1;
             match event {
                 FirmwareEvent::Grow(request) if request.halt_count == state.root.halt_count()? => {
                     let Some(reply) = state.root.reserve_control_reply()? else {
@@ -1921,6 +1951,8 @@ impl Backend {
             recovery_window: 0,
             recovery_count: 0,
             ledger: g14_v27_2_abi::RecoveryLedger::default(),
+            events: [0; EVENT_HISTORY],
+            events_read: 0,
             kept,
             kept_flights: KVec::new(),
             hardware_unreachable: false,

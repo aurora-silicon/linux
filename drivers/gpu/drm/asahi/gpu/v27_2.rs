@@ -738,6 +738,27 @@ impl RootV27_2 {
         for (name, queue) in ["tiler", "fragment"].into_iter().zip(&self.render_queues) {
             Self::log_queue(dev, name, &queue.positions, &queue.queue, &queue.event);
         }
+        let (generation, phase) = (self.halt_count(), self.recovery_phase());
+        let (snapshot, entries) = self.recovery_snapshot();
+        dev_err!(dev, "GPU: recovery generation={:?} phase={:?} snapshot ({} entries) {:x?}\n",
+                 generation, phase, entries, &snapshot[..entries.min(snapshot.len())]);
+    }
+
+    /// The first valid recovery snapshot entries, {flags, target} in hex, and how many valid
+    /// entries there are in all (the first invalid entry ends the snapshot). Logging only.
+    pub(crate) fn recovery_snapshot(&self) -> ([(u32, u32); 4], usize) {
+        let mut first = [(0, 0); 4];
+        let mut entries = 0;
+        for i in 0..RECOVERY_SNAPSHOT_ENTRIES {
+            match self.recovery_entry(i) {
+                Ok((flags, target)) if flags & 1 != 0 => {
+                    if let Some(slot) = first.get_mut(entries) { *slot = (flags, target); }
+                    entries += 1;
+                }
+                _ => break,
+            }
+        }
+        (first, entries)
     }
 
     pub(crate) fn render_kick(dm: usize) -> u64 {
@@ -850,7 +871,8 @@ impl RootV27_2 {
             && job.event.current_noncoherent().raw() == job.expected_stamp)
     }
 
-    pub(crate) fn peek_event(&self) -> Result<Option<(u32, FirmwareEvent)>> {
+    /// The record at the head of the event ring: its cursor, its raw kind word and its decoding.
+    pub(crate) fn peek_event(&self) -> Result<Option<(u32, u32, FirmwareEvent)>> {
         use crate::m3::m3_channel_format::RECEIVE_BYTES;
         let state = &self.channels[2 * EVENT_RING];
         let ring = &self.channels[2 * EVENT_RING + 1];
@@ -863,7 +885,8 @@ impl RootV27_2 {
         crate::pgtable::clean_invalidate_poc(ring.as_slice()[at..].as_ptr(), RECEIVE_BYTES);
         crate::pgtable::poc_barrier();
         let word = |offset| Self::word(ring, at + offset);
-        let event = match g14_v27_2_abi::event_kind(word(0)?) {
+        let kind = word(0)?;
+        let event = match g14_v27_2_abi::event_kind(kind) {
             EventKind::Grow => FirmwareEvent::Grow(GrowRequest::decode([
                 word(4)?, word(8)?, word(0x0c)?, word(0x10)?, word(0x14)?, word(0x18)?,
             ])),
@@ -874,7 +897,7 @@ impl RootV27_2 {
             EventKind::ChannelError => FirmwareEvent::ChannelError,
             EventKind::Notification => FirmwareEvent::Notification,
         };
-        Ok(Some((read, event)))
+        Ok(Some((read, kind, event)))
     }
 
     /// Validates a byte range of the control object before it is sliced or cache-maintained.
