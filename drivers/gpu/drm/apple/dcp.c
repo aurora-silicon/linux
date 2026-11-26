@@ -41,6 +41,7 @@
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/pmp-report.h>
 #include <linux/soc/apple/sleep.h>
+#include <linux/soc/apple/t8132.h>
 #include <linux/string.h>
 #include <linux/usb/typec_altmode.h>
 #include <linux/usb/typec_dp.h>
@@ -543,7 +544,21 @@ bool dcp_t6041_ext_enabled(void)
 
 static bool dcp_desktop_external(struct apple_dcp *dcp)
 {
-	return of_device_is_compatible(dcp->dev->of_node, "apple,t6041-dcpext");
+	return dcp->desktop_external;
+}
+
+/*
+ * The T6041 external processors, and the Mac mini's (J773g) T8132 ones on
+ * macOS 27.2: macOS drives the mini's HDMI port from dcpext0 alone, through
+ * the LPDPTX PHY (source select = dcp-index 1) and a PS190 DP-to-HDMI
+ * converter on the same SMC rails (gP0f, gP1a) as the M4 Max Mac Studio's
+ * (J575c), whose dcpext0 drives its HDMI port the same way. Its fixed PHY is
+ * powered at probe and its converter rails settle before the link, as there.
+ */
+static bool dcp_desktop_external_node(const struct device_node *np)
+{
+	return of_device_is_compatible(np, "apple,t6041-dcpext") ||
+	       apple_t8132_dcpext_v27_2(np);
 }
 
 /*
@@ -6494,9 +6509,42 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 		return version;
 
 	/*
+	 * T8132 external processors: the Mac mini's (J773g) on macOS 27.2
+	 * (26B123), handed over as the T6041's 27.2 ones are, run the
+	 * firmware-27 backend with the 27.2 method table, as on T6041; any
+	 * other is the M4 backend's (below). Both need
+	 * CONFIG_DRM_APPLE_DCP_T8132, which matches the T8132 nodes.
+	 *
+	 * ASSUMED, NOT TRACED: the T8132 26B123 image (B3BA603C) numbers its
+	 * IOMFB methods as the T6041 (964EDE5B) and T8142 26B123 images do
+	 * (dcp_methods_27_2), and calls the same D-callbacks. A trace of macOS
+	 * 27.2 driving the mini's dcpext0 has to confirm the A4xx/A5xx IDs
+	 * before this is relied on.
+	 */
+	if (apple_t8132_dcpext_v27_2(dev->of_node)) {
+		/* Checked by apple_t8132_dcpext_v27_2(). */
+		dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
+		return dcp_v27_method_table(dev, compat_str);
+	}
+
+	/*
+	 * The M4 backend (iomfb_m4.c) is written for the 26.6.2 firmware path
+	 * only (apple_t8132_firmware_path()). Off it, as on a Mac mini booted
+	 * from macOS 27.2, the boot loader leaves the main DCP running idle and
+	 * hands it to nobody: never adopt or touch it. iomfb_m4_init() would
+	 * refuse such firmware too, but only after the probe has claimed the
+	 * DCP's IOMMU domain.
+	 */
+	if (hw->firmware_compat == DCP_FIRMWARE_M4 && !apple_t8132_firmware_path()) {
+		dev_info(dev, "T8132 display processor left alone off the M4 26.6.2 firmware path\n");
+		return DCP_FIRMWARE_UNKNOWN;
+	}
+
+	/*
 	 * SoCs introduced with M4 or H17-generation firmware pin their
 	 * interface; keep explicit match-data pins ahead of the generic
-	 * firmware-27 rule below so T8132/T8140 stay on their pinned backend.
+	 * firmware-27 rule below so T8132 (but for the 27.2 dcpext above) and
+	 * T8140 stay on their pinned backend.
 	 */
 	if (hw->firmware_compat != DCP_FIRMWARE_UNKNOWN)
 		return hw->firmware_compat;
@@ -7424,8 +7472,9 @@ static void dcp_ext_give_up(struct apple_dcp *dcp, int err, const char *when);
 
 /*
  * The external processors whose failure must not take the DRM device down:
- * T8122's, T6041's, T6050's and T8142's dcpext. One that fails to probe or bind joins
- * as an unusable pipe (ext_dead), and the other displays go on without it.
+ * T8122's, T6041's, T6050's and T8142's dcpext, and the J773g's on 27.2. One
+ * that fails to probe or bind joins as an unusable pipe (ext_dead), and the
+ * other displays go on without it.
  * With every processor failed the DRM device has no pipe and does not bind.
  */
 static bool dcp_ext_is_failsafe(struct device_node *np)
@@ -7433,7 +7482,8 @@ static bool dcp_ext_is_failsafe(struct device_node *np)
 	return of_device_is_compatible(np, "apple,t8122-dcpext") ||
 	       of_device_is_compatible(np, "apple,t6041-dcpext") ||
 	       of_device_is_compatible(np, "apple,t6050-dcpext") ||
-	       of_device_is_compatible(np, "apple,t8142-dcpext");
+	       of_device_is_compatible(np, "apple,t8142-dcpext") ||
+	       apple_t8132_dcpext_v27_2(np);
 }
 
 /*
@@ -7744,8 +7794,9 @@ static void dcp_desktop_phy_off(void *data)
 }
 
 /*
- * The fixed HDMI output of a desktop 26.x external processor (T6041 dcpext0):
- * its DP PHY is powered here, as the boot loader's working sequence does. A
+ * The fixed HDMI output of a desktop external processor (T6041 dcpext0, and
+ * the J773g's T8132 dcpext0 on 27.2): its DP PHY is powered here, as the
+ * boot loader's working sequence does. A
  * Type-C output (dcpext1) has no fixed PHY; the display fabric powers the
  * PHY of the route a port claims (see dcp_typec_phy_on()).
  */
@@ -8153,6 +8204,32 @@ err:
 	return ret;
 }
 
+/*
+ * T8132 (Mac mini, J773g) external processor on firmware 27.2, admitted by
+ * dcp_check_firmware_version(): what the T6041 dcpext gets on that firmware
+ * (see dcp_platform_probe_pipe()), whatever hw data the compatible matched.
+ * - firmware_dma_bits 41: its firmware DART's window (ADT dart-dcpext0
+ *   vm-base 1 TiB, vm-size-23 64 GiB; apple,dma-range <0x100 0 0x10 0>)
+ *   ends at 1 TiB + 64 GiB, which takes 41 bits, as on T6041.
+ * - num_dptx_ports 2: the dcpdptx-port-epic units 0 and 1 every external
+ *   processor of this generation has (T6041's, and T8132's own on the M4
+ *   path); the fixed HDMI port is unit 0.
+ * - adopt_live_session: iBoot leaves it running with the 27.2 image
+ *   loaded (ADT pre-loaded = running = 1), as the boot loader hands it
+ *   over; Linux never starts its CPU.
+ * - sink_metadata_edid: the display it finds at boot is its first sink,
+ *   as on the T6041 dcpext.
+ * No sleep support: neither a firmware-27 sleep nor a link release has run
+ * on this processor.
+ */
+static const struct apple_dcp_hw_data apple_dcp_hw_t8132_dcpext_v27 = {
+	.firmware_dma_bits = 41,
+	.num_dptx_ports = 2,
+	.adopt_live_session = true,
+	.firmware_compat = DCP_FIRMWARE_V_27_0,
+	.sink_metadata_edid = true,
+};
+
 static int dcp_platform_probe_pipe(struct platform_device *pdev)
 {
 	const struct apple_dcp_hw_data *hw = of_device_get_match_data(&pdev->dev);
@@ -8286,7 +8363,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	dcp->ext_failsafe = dcp_ext_is_failsafe(dev->of_node);
 	dcp->dcpext = of_device_is_compatible(dev->of_node, "apple,dcpext");
 	dcp->external = of_device_is_compatible(dev->of_node, "apple,t6030-dcpext");
-	dcp->desktop_external = of_device_is_compatible(dev->of_node, "apple,t6041-dcpext");
+	dcp->desktop_external = dcp_desktop_external_node(dev->of_node);
 	dcp->external_native = dcp->external && dcp_t6030_ext_native(dev->of_node);
 	/*
 	 * J714s: the internal panel's processor suspends and resumes asynchronously, not in
@@ -8363,6 +8440,9 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 		/* Its ports where they have been opened so far, see dcp_v27_dptx_layout(). */
 		dcp->hw.dptx_endpoint = DPTX_ENDPOINT_V2;
 	}
+	if (fw_compat == DCP_FIRMWARE_V_27_0 &&
+	    of_device_is_compatible(dev->of_node, "apple,t8132-dcpext"))
+		dcp->hw = apple_dcp_hw_t8132_dcpext_v27;
 	/*
 	 * A SoC with derived power words is offered the stop only when asked for, and only on
 	 * firmware 27.0, whose calls are the ones that ran with them.
@@ -8970,7 +9050,7 @@ static int dcp_platform_probe(struct platform_device *pdev)
 		return -ENODEV;
 	}
 
-	if (of_device_is_compatible(dev->of_node, "apple,t8132-dcpext"))
+	if (dcp_t8132_ext_m4_node(dev->of_node))
 		return dcp_platform_probe_t8132_ext(pdev);
 	if (!dcp_ext_is_failsafe(dev->of_node))
 		return dcp_platform_probe_pipe(pdev);
@@ -9051,7 +9131,7 @@ static void dcp_platform_remove(struct platform_device *pdev)
 	if (dcp)
 		av_audiosrv_quiesce(dcp);
 	/* An adopted external DCP never joined the DRM device. */
-	if (of_device_is_compatible(pdev->dev.of_node, "apple,t8132-dcpext")) {
+	if (dcp_t8132_ext_m4_node(pdev->dev.of_node)) {
 		/* Enabled with its Type-C routes, see dcp_t8132_ext_routes(). */
 		if (dcp)
 			disable_delayed_work_sync(&dcp->typec_reconnect_wq);
@@ -9120,7 +9200,7 @@ VISIBLE_IF_KUNIT void dcp_platform_shutdown(struct platform_device *pdev)
 	}
 
 	/* An adopted external DCP never joined the DRM device. */
-	if (of_device_is_compatible(pdev->dev.of_node, "apple,t8132-dcpext"))
+	if (dcp_t8132_ext_m4_node(pdev->dev.of_node))
 		return;
 	component_del(&pdev->dev, &dcp_comp_ops);
 }
@@ -11464,7 +11544,10 @@ static const struct of_device_id of_match[] = {
 	{ .compatible = "apple,t8142-dcp", .data = &apple_dcp_hw_t8142,  },
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8132)
 	{ .compatible = "apple,t8132-dcp", .data = &apple_dcp_hw_t8132, },
-	/* Same firmware as the internal DCP; adopted from the boot loader. */
+	/*
+	 * Same firmware as the internal DCP; adopted from the boot loader. The
+	 * J773g's on 27.2 is a firmware-27 pipe (apple_dcp_hw_t8132_dcpext_v27).
+	 */
 	{ .compatible = "apple,t8132-dcpext", .data = &apple_dcp_hw_t8132_dcpext, },
 #endif
 	{ .compatible = "apple,t6030-dcp", .data = &apple_dcp_hw_t6030, },

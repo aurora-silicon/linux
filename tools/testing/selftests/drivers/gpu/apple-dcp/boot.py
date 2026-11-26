@@ -201,8 +201,9 @@ def _v27_prelude(root):
     display_h = (root / 'include/linux/soc/apple/display.h').read_text()
     uuid_defines = [line for line in display_h.splitlines()
                     if line.startswith(('#define APPLE_T6041_DCP_26B123_UUID ',
-                                        '#define APPLE_T8122_DCP_26B123_UUID '))]
-    assert len(uuid_defines) == 2
+                                        '#define APPLE_T8122_DCP_26B123_UUID ',
+                                        '#define APPLE_T8132_DCP_26B123_UUID '))]
+    assert len(uuid_defines) == 3
     helpers = ('static inline bool apple_dcp_image_v27_2(',
                'static inline bool apple_t6041_dcp_any_v27_2(',
                'static inline bool apple_t6041_dcp_v27_2(',
@@ -210,7 +211,14 @@ def _v27_prelude(root):
                'static inline bool apple_t8122_dcp_v27_2(',
                'static inline bool\napple_t8122_dcpext_v27_2_for_internal(',
                'static inline bool apple_t8122_dcpext_v27_2(')
-    helper = '\n'.join((*uuid_defines, *(block(display_h, marker) for marker in helpers)))
+    # The T8132 27.2 dcpext admission: by processor and image, never by board. No
+    # of_machine_is_compatible() exists in these units, so neither it nor the display.h
+    # helpers can depend on the machine.
+    t8132_h = (root / 'include/linux/soc/apple/t8132.h').read_text()
+    t8132_admission = block(t8132_h, 'static inline bool apple_t8132_dcpext_v27_2(')
+    assert 'of_machine_is_compatible' not in t8132_admission
+    helper = '\n'.join((*uuid_defines, *(block(display_h, marker) for marker in helpers),
+                        t8132_admission))
     iomfb_h = (root / 'drivers/gpu/drm/apple/iomfb.h').read_text()
     methods_decl = iomfb_h[iomfb_h.index('enum dcpep_method {'):
                            iomfb_h.index('#define IOMFB_MAX_CB')]
@@ -326,6 +334,13 @@ static int of_property_read_u32_array(const struct device_node *np, const char *
 #define dev_warn(...) ((void)0)
 #define IS_ERR(ptr) false
 static void dev_err(struct device *dev, const char *format, ...) {}
+#define dev_info(...) ((void)0)
+/* linux/soc/apple/t8132.h: the M4 backend's 26.6.2 firmware path (or an Air) */
+static bool t8132_firmware_path;
+static bool apple_t8132_firmware_path(void)
+{
+    return t8132_firmware_path;
+}
 static void *devm_kmemdup(struct device *dev, const void *src, size_t len, unsigned int gfp)
 {
     (void)dev; (void)src; (void)len; (void)gfp;
@@ -561,8 +576,59 @@ int main(void)
     node.fw[2] = 0; node.compat[2] = 0;
     assert(apple_t8122_dcp_v27_2(&node));
 
+    /*
+     * A T8132 processor of the M4 backend keeps it on the M4 firmware path
+     * only; off it (a Mac mini booted from 27.2) nobody adopts or touches it.
+     */
+    static struct apple_dcp_hw_data hw_m4 = { .firmware_compat = DCP_FIRMWARE_M4 };
+    dev.hw = &hw_m4;
+    for (unsigned ext = 0; ext < 2; ext++) {
+        reset_t6041_26b123(ext);
+        node.compatible = ext ? "apple,t8132-dcpext" : "apple,t8132-dcp";
+        node.uuid = "other";
+        t8132_firmware_path = true;
+        assert(dcp_check_firmware_version(&dev) == DCP_FIRMWARE_M4);
+        t8132_firmware_path = false;
+        assert(dcp_check_firmware_version(&dev) == DCP_FIRMWARE_UNKNOWN);
+    }
+
+    /*
+     * A T8132 dcpext handed over with the T8132 27.2 image (first the Mac
+     * mini's, J773g) runs the 27.2 table, whatever the firmware path and on
+     * any board: the selection is by processor and image.
+     */
+    reset_t6041_26b123(true);
+    node.compatible = "apple,t8132-dcpext";
+    node.uuid = APPLE_T8132_DCP_26B123_UUID;
+    assert(!apple_t6041_dcpext_v27_2(&node));
+    for (unsigned path = 0; path < 2; path++) {
+        t8132_firmware_path = path;
+        assert(apple_t8132_dcpext_v27_2(&node));
+        assert(dcp_check_firmware_version(&dev) == DCP_FIRMWARE_V_27_0);
+    }
+    t8132_firmware_path = false;
+    /* The internal DCP is never admitted: macOS parks it; aura hands it to nobody. */
+    node.compatible = "apple,t8132-dcp";
+    assert(!apple_t8132_dcpext_v27_2(&node));
+    assert(dcp_check_firmware_version(&dev) == DCP_FIRMWARE_UNKNOWN);
+    /* The T6041 image, a missing or second UUID, and other releases are refused. */
+    node.compatible = "apple,t8132-dcpext";
+    node.uuid = APPLE_T6041_DCP_26B123_UUID;
+    assert(!apple_t8132_dcpext_v27_2(&node));
+    assert(dcp_check_firmware_version(&dev) == DCP_FIRMWARE_UNKNOWN);
+    node.uuid = APPLE_T8132_DCP_26B123_UUID;
+    node.uuid_count = 0; assert(!apple_t8132_dcpext_v27_2(&node));
+    node.uuid_count = 2; assert(!apple_t8132_dcpext_v27_2(&node));
+    node.uuid_count = 1;
+    node.compat[1] = 0; assert(!apple_t8132_dcpext_v27_2(&node));
+    assert(dcp_check_firmware_version(&dev) == DCP_FIRMWARE_UNKNOWN);
+    node.compat[1] = 2; node.fw[2] = 1; assert(!apple_t8132_dcpext_v27_2(&node));
+    node.fw[2] = 0; assert(apple_t8132_dcpext_v27_2(&node));
+
+    dev.hw = &hw;
     puts("PASS T6041 26B123 v27.2 internal/external admission, refusal controls, and desktop 26.x preservation");
     puts("PASS T8122 internal DCP needs its 27.2 image for the 27.2 table");
+    puts("PASS T8132 M4 backend only on its firmware path; a T8132 dcpext on the 27.2 image runs the 27.2 table on any board");
     return 0;
 }
 '''
