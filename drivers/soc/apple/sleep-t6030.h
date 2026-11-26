@@ -1419,7 +1419,9 @@ static void t6030_deep_wfi_arm(void)
  * aura's C witness then notes 0x50 | n in PMU scratch +2 (0x830a), and its slot flag counts
  * the entry. With apple_sleep.reset_test_veneer=1 the core's RVBAR (unlocked) first takes the
  * boot core's locked one: the page a wake resets the boot core at, so the restart crosses the
- * same veneer. RVBAR is put back once the core is up. One line says what happened.
+ * same veneer. RVBAR is put back once the core is up. One line says what happened, and one
+ * gives the cpu-start words (stop, sys, E, P) once the core is offline, once it is off and once
+ * the start is written. With apple_sleep.reset_test_stop=0 the core skips its stop bit.
  *
  * Addresses are the J516s ADT's: cpu-impl-reg 0x210050000 + 0x1000000 * cluster + 0x100000 *
  * core, RVBAR at +0 (lock bit 0, address 47:12, aura's RVBAR_ADDR); the pmgr ps names ECPU0-5
@@ -1432,6 +1434,8 @@ static void t6030_deep_wfi_arm(void)
 static bool t6030_reset_test_veneer;
 module_param_named(reset_test_veneer, t6030_reset_test_veneer, bool, 0644);
 MODULE_PARM_DESC(reset_test_veneer, "T6030 DIAGNOSTIC: reset_test restarts the core through the boot core's RVBAR");
+module_param_named(reset_test_stop, sleep_reset_test_stop, bool, 0644);
+MODULE_PARM_DESC(reset_test_stop, "T6030 DIAGNOSTIC: reset_test's core writes its cpu-start stop bit before it powers off (default Y)");
 
 /*
  * XNU's power-down of one core outside a system sleep, on H15 (cpu_sleep() off the quiescing
@@ -1490,7 +1494,7 @@ static int t6030_reset_test(unsigned int cpu)
 	bool veneer = READ_ONCE(t6030_reset_test_veneer);
 	u64 mpidr, boot, rv0, rv1, brv, flag0, flag1, t0, t1;
 	void __iomem *rv = NULL, *boot_rv = NULL, *slot;
-	u32 vw[4] = {}, ps0, ps1 = 0, ps2;
+	u32 vw[4] = {}, ps0, ps1 = 0, ps2, w0[4], w1[4], w2[4];
 	unsigned int c, k, us, sleep_flags;
 	int ret, held, stopped, up;
 	void *vp;
@@ -1525,6 +1529,7 @@ static int t6030_reset_test(unsigned int cpu)
 	ret = remove_cpu(cpu);
 	if (ret)
 		goto unlock;
+	sleep_cpu_start_words(s, w0);
 	ps0 = readl(s->ps + T6030_PS_CPU(c, k));
 	WRITE_ONCE(sleep_reset_test_mpidr, mpidr);
 	held = spin_table_hold_parked();
@@ -1553,6 +1558,7 @@ static int t6030_reset_test(unsigned int cpu)
 	rv1 = readq(rv);
 	t6030_reset_test_resume_pa(s, __pa_symbol(t8142_el1_wfi_stub));
 	flag0 = t6030_reset_test_flag(slot);
+	sleep_cpu_start_words(s, w1);
 	spin_table_stop_finished();
 	WRITE_ONCE(sleep_reset_test_mpidr, ~0ULL);
 	t0 = ktime_get_ns();
@@ -1560,14 +1566,19 @@ static int t6030_reset_test(unsigned int cpu)
 	t1 = ktime_get_ns();
 	t6030_reset_test_resume_pa(s, 0);
 	flag1 = t6030_reset_test_flag(slot);
+	sleep_cpu_start_words(s, w2);
 	ps2 = readl(s->ps + T6030_PS_CPU(c, k));
 	if (veneer)
 		writeq(rv0 & T6030_RVBAR_ADDR, rv);
 
-	pr_info("apple-sleep: reset test: cpu%u %#llx (cluster %u core %u): ps %#x -> %#x after %u us (%s) -> %#x; held %d stopped %d; RVBAR %#llx -> %#llx (boot core's %#llx, veneer %08x %08x %08x%08x) -> %#llx; aura slot flag %llu -> %llu; online %d after %llu us\n",
-		cpu, mpidr, c, k, ps0, ps1, us, FIELD_GET(PS_ACTUAL, ps1) ? "STILL ON" : "off", ps2,
-		held, stopped, rv0, rv1, brv, vw[0], vw[1], vw[3], vw[2], readq(rv), flag0, flag1,
-		up, div_u64(t1 - t0, NSEC_PER_USEC));
+	pr_info("apple-sleep: reset test: cpu%u %#llx (cluster %u core %u, stop bit %s): ps %#x -> %#x after %u us (%s) -> %#x; held %d stopped %d; RVBAR %#llx -> %#llx (boot core's %#llx, veneer %08x %08x %08x%08x) -> %#llx; aura slot flag %llu -> %llu; online %d after %llu us\n",
+		cpu, mpidr, c, k, READ_ONCE(sleep_reset_test_stop) ? "written" : "skipped",
+		ps0, ps1, us, FIELD_GET(PS_ACTUAL, ps1) ? "STILL ON" : "off", ps2, held, stopped,
+		rv0, rv1, brv, vw[0], vw[1], vw[3], vw[2], readq(rv), flag0, flag1, up,
+		div_u64(t1 - t0, NSEC_PER_USEC));
+	pr_info("apple-sleep: reset test: cpu%u cpu-start stop/sys/e/p %x/%x/%x/%x offline, %x/%x/%x/%x off, %x/%x/%x/%x after the start\n",
+		cpu, w0[0], w0[1], w0[2], w0[3], w1[0], w1[1], w1[2], w1[3], w2[0], w2[1], w2[2],
+		w2[3]);
 	ret = up;
 unlock:
 	unlock_system_sleep(sleep_flags);
