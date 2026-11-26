@@ -4756,6 +4756,28 @@ out:
 	return res;
 }
 
+/*
+ * VFIO and iommufd require IOMMU_CAP_CACHE_COHERENCY because they always map
+ * with IOMMU_CACHE and claim exclusive paging/blocked ownership of the group.
+ * APPLE_DART (coherent fabric) and APPLE_DART2 (NO_CACHE PTE bit cleared when
+ * IOMMU_CACHE is set) honor IOMMU_CACHE for DMA-coherent devices, provided
+ * Linux can freely manage paging and blocking on every DART backing the device.
+ */
+static bool apple_dart_supports_cache_coherency(struct apple_dart *dart)
+{
+	return dart->pgsize <= PAGE_SIZE &&
+	       !dart->locked &&
+	       !dart->managed_sids &&
+	       !dart->retained &&
+	       !dart->retained_mtp &&
+	       !dart->live_mtp &&
+	       !dart->cold_ane &&
+	       !dart->isp_host &&
+	       !dart->preserve_display &&
+	       !dart->v27_provider &&
+	       !apple_dart_has_borrowed(dart);
+}
+
 static bool apple_dart_capable(struct device *dev, enum iommu_cap cap)
 {
 	struct apple_dart_master_cfg *cfg = dev_iommu_priv_get(dev);
@@ -4763,6 +4785,14 @@ static bool apple_dart_capable(struct device *dev, enum iommu_cap cap)
 	int i;
 
 	switch (cap) {
+	case IOMMU_CAP_CACHE_COHERENCY:
+		if (!dev_is_dma_coherent(dev) || !cfg ||
+		    !cfg->stream_maps[0].dart)
+			return false;
+		for_each_stream_map(i, cfg, stream_map)
+			if (!apple_dart_supports_cache_coherency(stream_map->dart))
+				return false;
+		return true;
 	case IOMMU_CAP_DEFERRED_FLUSH:
 		/*
 		 * A deferred flush invalidates whole streams. On a T8140 or
