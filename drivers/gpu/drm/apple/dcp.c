@@ -324,7 +324,7 @@ static int dcp_secure_port_init(struct apple_dcp *dcp)
  * once its secure port has gone idle. A device tree without those keeps the firmware
  * running: DPMS is the backlight alone and the display stays up across a sleep. A SoC
  * without a secure mailbox says so (hw.s2r_no_secure_port), and one behind
- * appledrm.s2r_untested stops its firmware for DPMS off and J813 system sleep.
+ * appledrm.s2r_untested (default on) stops its firmware for DPMS off and J813 system sleep.
  */
 static void dcp_s2r_check_dt(struct apple_dcp *dcp)
 {
@@ -514,14 +514,15 @@ static bool dcp_j714s_ext(struct device *dev)
 }
 
 /*
- * The firmware stop on a SoC whose display power words were derived from its macOS device
- * tree instead of measured (T8142). J813 supports DPMS off and system sleep with this
- * opt-in. Off by default: such a DCP keeps its firmware running.
+ * The firmware stop on a SoC whose display power words were derived from its device tree
+ * instead of measured (T8142), on firmware 27.0. It runs through DPMS off and full deep
+ * sleeps and wakes on J813 and J815 (MacBook Air 13" and 15" M5), so it is on by default;
+ * appledrm.s2r_untested=0 keeps such a DCP's firmware running.
  */
-static bool s2r_untested;
+static bool s2r_untested = true;
 module_param(s2r_untested, bool, 0444);
 MODULE_PARM_DESC(s2r_untested,
-		 "Stop the DCP firmware on DPMS off and J813 system sleep using derived T8142 power words (default 0)");
+		 "Stop the DCP firmware on DPMS off and system sleep using derived T8142 power words (default 1)");
 
 bool dcp_t6041_ext_enabled(void)
 {
@@ -11295,7 +11296,7 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8142 = {
 	.iomfb_method_profile = DCP_IOMFB_METHODS_H17G,
 	.adopt_live_session = true,
 	.firmware_compat = DCP_FIRMWARE_H17P,
-	/* Firmware 27.0's sleep calls (iomfb_v27.c): only with appledrm.s2r_untested */
+	/* Firmware 27.0's sleep calls (iomfb_v27.c), unless appledrm.s2r_untested=0 */
 	.s2r = true,
 	.s2r_untested = true,
 	.s2r_no_secure_port = true,

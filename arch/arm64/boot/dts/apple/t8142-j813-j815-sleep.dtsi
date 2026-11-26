@@ -13,8 +13,8 @@
 
 /*
  * Suspend-to-RAM (apple,t8142-sleep): derived from macOS 27.2.1 and T8132's measurements, and
- * dry-run gated in the driver (apple_sleep.deep, apple_sleep.untested_commit). The J813 and J815
- * ADTs (27.0) differ only in audio, product and CLPC power-limit properties: every block, wake
+ * run through full deep sleeps and wakes on J813 and J815, where it is the default sleep state.
+ * The J813 and J815 ADTs (27.0) differ only in audio, product and CLPC power-limit properties: every block, wake
  * source, GPIO and PCIe window below is the same on both.
  */
 &{/soc} {
@@ -25,9 +25,8 @@
 	 * and nine status words), [1] (ps-aon), /arm-io/wdt, nub-spmi0, nub-spmi-a0, the
 	 * PMC's voter floors (as &pmc), and the SoC and DCS perf-state words that
 	 * AppleT8142PMGR::setPerfState writes (reg[2] + 0x24000, + 0x25000).
-	 * Derived from macOS 27.2.1 and T8132's measurements, never run on an M5: the driver
-	 * stops each sleep at a dry run unless booted with apple_sleep.untested_commit=1,
-	 * and deep sleep is only used when asked for (mem_sleep).
+	 * Deep sleep is the default sleep state on both boards; the driver no longer stops it at
+	 * a dry run.
 	 */
 	sleep: sleep-controller@380700000 {
 		compatible = "apple,t8142-sleep";

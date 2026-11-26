@@ -1203,6 +1203,7 @@ static const struct apple_sleep_ops t8122_sleep_ops = {
 
 static const struct apple_sleep_soc t8122_sleep_soc = {
 	.ops = &t8122_sleep_ops,
+	.derived = true,
 	.untested = true,
 	.pen_deep = true,
 	.el1_wfi = true,

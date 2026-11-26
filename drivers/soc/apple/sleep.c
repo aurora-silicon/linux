@@ -814,10 +814,14 @@ struct apple_sleep_soc {
 	/* The sleep's SPMI bus has gen 4's queue layout (T8142). */
 	bool spmi_gen4;
 	/*
-	 * Derived from the binaries and another SoC's measurements, never through a full sleep and
-	 * wake: deep sleep is offered only with apple_sleep.deep=1 and is never the default, a
-	 * sleep stops before the commit unless apple_sleep.untested_commit=1, and each step is
-	 * noted in PMU scratch for after a reset.
+	 * The sleep data is derived from traces and another SoC's measurements: each step is
+	 * noted in PMU scratch for after a reset, and the probe reports the power-gate words.
+	 */
+	bool derived;
+	/*
+	 * Never through a full sleep and wake: deep sleep is offered only with apple_sleep.deep=1
+	 * and is never the default, and a sleep stops before the commit unless
+	 * apple_sleep.untested_commit=1.
 	 */
 	bool untested;
 	/*
@@ -5233,7 +5237,7 @@ static void sleep_spmi_sources_report(struct apple_sleep *s)
 
 static bool sleep_notes_on(struct apple_sleep *s)
 {
-	return s && s->spmi && s->soc->untested && !s->soc->no_pmu_notes &&
+	return s && s->spmi && s->soc->derived && !s->soc->no_pmu_notes &&
 	       READ_ONCE(sleep_pmu_notes);
 }
 
@@ -8419,10 +8423,10 @@ static int apple_sleep_probe(struct platform_device *pdev)
 	apple_sleep = s;
 	/* Deep becomes the default sleep state, unless mem_sleep_default= chose another. */
 	suspend_set_ops(s->soc->early_context ? &apple_sleep_early_ops : &apple_sleep_ops);
-	/* Not on a SoC whose data is derived: there it is asked for by name. */
-	if (s->soc->untested) {
-		if (mem_sleep_current == PM_SUSPEND_MEM)
-			mem_sleep_current = PM_SUSPEND_TO_IDLE;
+	/* Not on an untested SoC: there it is asked for by name. */
+	if (s->soc->untested && mem_sleep_current == PM_SUSPEND_MEM)
+		mem_sleep_current = PM_SUSPEND_TO_IDLE;
+	if (s->soc->derived) {
 		if (s->soc->ops->deep_wfi_arm == t8142_deep_wfi_arm && is_kernel_in_hyp_mode())
 			t8142_c1_6_report(dev);
 		if (s->soc->ops->deep_wfi_arm == t8142_deep_wfi_arm) {
@@ -8443,11 +8447,12 @@ static int apple_sleep_probe(struct platform_device *pdev)
 				 readl(s->pwrgate + s->soc->pwrgate_cpm[1]), readl(s->commit),
 				 readl(s->cluster + s->soc->cluster_cpu[0]),
 				 readl(s->cluster + s->soc->cluster_cpu[1]));
+	}
+	if (s->soc->untested)
 		dev_warn(dev, "sleep data derived for this SoC, untested: deep sleep is %s, and %s\n",
 			 READ_ONCE(sleep_deep) ? "offered (apple_sleep.deep=1)" : "off (apple_sleep.deep=1 offers it)",
 			 READ_ONCE(sleep_untested_commit) ? "the commit is allowed" :
 			 "a sleep stops before the commit (dry run)");
-	}
 
 	dev_info(dev, "deep sleep %s: boot object resumes %llu\n",
 		 mem_sleep_current == PM_SUSPEND_MEM ? "is the default" :
@@ -10042,7 +10047,11 @@ static const struct apple_sleep_extra_off t8142_extra_off[] = {
 
 static const struct apple_sleep_soc t8142_sleep_soc = {
 	.ops = &t8142_sleep_ops,
-	.untested = true,
+	/*
+	 * Derived, and run through full deep sleeps and wakes on J813 and J815 (MacBook Air 13" and
+	 * 15" M5): offered and the default, with the commit, as on the tested SoCs.
+	 */
+	.derived = true,
 	.regs_absent = t8142_regs_absent,
 	.spmi_gen4 = true,
 	.boot_wfi_delay_ms = 3,
