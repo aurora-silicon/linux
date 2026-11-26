@@ -112,7 +112,10 @@ pub(crate) fn alloc_work(
 
 pub(crate) struct ComputeGraph {
     pub(crate) sched_ctx: Arc<FwObject>,
-    /// Whole 0x1000 page; compute's record is +0x400, service stamps +0x640/+0x648.
+    /// Whole 0x1000 page, ASC-cached; compute's record is +0x400. The firmware reads and
+    /// updates the record around every completed item and cleans it itself, so it is mapped
+    /// like macOS 26B123 maps its compute notifier records (`0x443`); the host writes it only
+    /// before the firmware first sees it.
     pub(crate) notifier: Arc<FwObject>,
     pub(crate) threshold: Arc<FwObject>,
     pub(crate) job_list: Arc<FwObject>,
@@ -121,8 +124,8 @@ pub(crate) struct ComputeGraph {
     pub(crate) ring: Arc<FwObject>,
     #[allow(dead_code)]
     pub(crate) qscratch: Arc<FwObject>,
-    /// Separate uncached engine-stage cells; service stamps are in the notifier page.
-    #[allow(dead_code)]
+    /// Uncached service stamp cell the firmware stores each finished command's target into
+    /// (work +0x800); the host reads completions here, never from the cached notifier page.
     pub(crate) user_stamp: Arc<FwObject>,
     pub(crate) fw_stamp: Arc<FwObject>,
 }
@@ -196,8 +199,9 @@ fn init_queue(
 fn init_notifier(page: &FwObject, threshold: &FwObject) -> Result {
     for engine in 0..3 {
         let off = engine * 0x200;
-        // A separate uncached threshold is legal; the service cells retain the native page
-        // offsets so completion never depends on cacheable work memory.
+        // A separate uncached threshold is legal. The TA/FS service cells keep their native
+        // offsets in the uncached render page; compute's service stamp is its queue's own
+        // uncached `user_stamp` cell, because the compute page is ASC-cached.
         page.write(
             off,
             &graph::notifier_image(threshold.va + engine as u64 * 8, 1),
@@ -217,7 +221,7 @@ impl ComputeGraphSession {
     fn new(o: &mut Objects, sched_ctx: Arc<FwObject>) -> Result<Self> {
         Ok(Self {
             sched_ctx,
-            notifier: alloc(o, 0x1000, Class::Fw, None, 0, false)?,
+            notifier: alloc(o, 0x1000, Class::FwCached, None, 0, false)?,
             threshold: alloc(o, 24, Class::Fw, None, 0, false)?,
             job_list: alloc(o, job_list::SIZE, graph_fw(), None, 0, false)?,
             q: QueueSession::new(o)?,

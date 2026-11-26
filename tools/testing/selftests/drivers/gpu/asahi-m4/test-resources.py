@@ -2358,7 +2358,7 @@ pub mod g16 {
         assert_eq!(c.job_list.class, Class::FwCached);
         assert_eq!(c.sched_ctx.class, Class::Fw);
         assert_eq!(c.qstate.class, Class::Fw);
-        assert_eq!(c.notifier.class, Class::Fw);
+        assert_eq!(c.notifier.class, Class::FwCached);
         assert_eq!(c.threshold.class, Class::Fw);
         assert_eq!(c.ring.class, Class::FwCoherent);
         assert_eq!(c.user_stamp.class, Class::Shared);
