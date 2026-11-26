@@ -21,15 +21,25 @@ header and replayed on these layouts:
   stream takes the other pipeline, and its second takes the first one once
   the other port lets it go, in either stream order;
 - a pipeline whose route cannot clock the second stream: never offered to it;
-- a hybrid in front of one or two Type-C-only pipelines (M2 Pro/Max laptops).
+- a hybrid in front of one or two Type-C-only pipelines (M2 Pro/Max laptops),
+  its primary on the hybrid or, with the hybrid busy, on a Type-C-only one;
+- the dock goes, another display takes the lower pipeline, the dock's first
+  stream comes back on the upper one, the other display goes, and the second
+  stream is given the lower pipeline.
 
-Every assignment made is inside the connectors' masks as read at probe, which
-is what a compositor that reads possible_crtcs once pairs from.
+Every assignment made is inside the connectors' masks as read at probe.
+While a connector is routed, its possible_crtcs
+(dcp_fabric_routed_crtc_mask(), published by its route before the hotplug)
+is checked against the production atomic check
+(apple_connector_atomic_best_encoder()) on every CRTC, primary and secondary
+alike: each CRTC the mask offers is accepted, and no other.
 
 Each mutation must fail it; 'single-above-lowest' is the rule this replaces
-(the busy-then-free sequence left the second stream no pipeline), and
+(the busy-then-free sequence left the second stream no pipeline),
 'lowest-typec-only' the rule before it (the second stream never had one
-while the first had the lowest).
+while the first had the lowest), and 'routed-keeps-set' a routed mask that
+also offers a pipeline the stream is not routed to, which the atomic check
+refuses.
 """
 import argparse
 from pathlib import Path
@@ -41,12 +51,13 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
 CORE = (ROOT / 'drivers/gpu/drm/apple/dcp-fabric-core.c').read_text()
+DRV = (ROOT / 'drivers/gpu/drm/apple/apple_drv.c').read_text()
 HEADER = (ROOT / 'drivers/gpu/drm/apple/dcp-fabric-core.h').read_text()
 NAMES = ['dcp_fabric_available', 'dcp_fabric_score', 'dcp_fabric_fits',
          'dcp_fabric_port_route', 'dcp_fabric_port_tunneled', 'dcp_fabric_lowest',
          'dcp_fabric_second_yields', 'dcp_fabric_plan_pipeline',
          'dcp_fabric_plan', 'dcp_fabric_tunnel_keeps_direct', 'dcp_fabric_tunnel_candidate',
-         'dcp_fabric_port_crtc_mask']
+         'dcp_fabric_port_crtc_mask', 'dcp_fabric_routed_crtc_mask']
 MUTATIONS = {
     # The rule this replaces: one Type-C-only pipeline above the port's lowest.
     'single-above-lowest': ('return mask & carriers ? mask & carriers : mask;',
@@ -64,6 +75,8 @@ MUTATIONS = {
                            'false &&\n\t\t    score < UINT_MAX - 100)'),
     'plan-no-yield': ('if (stream && !port->plan->second_any &&', 'if (false &&'),
     'plan-yields-for-good': ('port->plan->second_any = true;\n\t\t\t\tagain = true;', ';'),
+    # A routed connector also offered the other Type-C pipeline, which it cannot move to.
+    'routed-keeps-set': ('return BIT(index);', 'return BIT(index) | BIT(index ^ 3);'),
 }
 
 
@@ -96,6 +109,36 @@ typedef uint8_t u8;
 typedef uint32_t u32;
 typedef uint64_t u64;
 #define BIT(n) (1U << (n))
+#define READ_ONCE(x) (x)
+#define container_of(ptr, type, member) ((type *)((char *)(ptr) - __builtin_offsetof(type, member)))
+
+/* What apple_connector_atomic_best_encoder() reads of the DRM state. */
+struct drm_crtc { unsigned int index; };
+struct drm_encoder { int unused; };
+struct drm_connector { int unused; };
+struct drm_connector_state { struct drm_crtc *crtc; };
+struct drm_atomic_commit { struct drm_connector_state *conn_state; };
+struct platform_device { int unused; };
+struct apple_dcp { int unused; };
+struct apple_connector {
+	struct drm_connector base;
+	struct drm_encoder *port_encoder;
+	struct platform_device *dcp;
+};
+struct apple_crtc { struct drm_crtc base; struct platform_device *dcp; };
+#define to_apple_connector(c) container_of(c, struct apple_connector, base)
+#define to_apple_crtc(c) container_of(c, struct apple_crtc, base)
+static struct drm_connector_state *
+drm_atomic_get_new_connector_state(struct drm_atomic_commit *state, struct drm_connector *c)
+{
+	(void)c;
+	return state->conn_state;
+}
+static struct apple_dcp a_dcp;
+static void *platform_get_drvdata(struct platform_device *p) { (void)p; return &a_dcp; }
+/* Tunnels and the ordered dual-stream routes never follow their CRTC. */
+static bool dcp_typec_follows_crtc(struct apple_dcp *d) { (void)d; return false; }
+#define drm_connector_for_each_possible_encoder(conn, enc) for ((enc) = NULL; (enc);)
 '''
 
 CASES = r'''
@@ -118,6 +161,10 @@ struct fabric {
 	struct dcp_fabric_policy policy;
 	unsigned int pipes;
 	u32 probed[NPORT][2];		/* possible_crtcs as read at probe */
+	/* The DRM side: CRTC 0 the panel's, CRTC i + 1 pipeline i's */
+	struct platform_device pdev[NPIPE + 1];
+	struct apple_crtc crtc[NPIPE + 1];
+	struct drm_encoder encoder[NPORT][2];
 };
 
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #c); \
@@ -144,6 +191,10 @@ static void setup(struct fabric *f, const struct layout *l)
 		pipe->services_ready = true;
 		pipe->presence = DCP_FABRIC_ABSENT;
 		pipe->next = i + 1 < l->pipes ? &f->pipe[i + 1] : NULL;
+	}
+	for (i = 0; i <= l->pipes; i++) {
+		f->crtc[i].base.index = i;
+		f->crtc[i].dcp = &f->pdev[i];
 	}
 	for (p = 0; p < NPORT; p++) {
 		struct dcp_fabric_port *port = &f->port[p];
@@ -178,6 +229,33 @@ static void setup(struct fabric *f, const struct layout *l)
 	}
 }
 
+/*
+ * A client reads the possible_crtcs of the connector of stream @dpin on @p,
+ * routed to @route (dcp_typec_route_activate()), and tries each CRTC with
+ * it in an atomic check: each one the mask offers is accepted, and no other.
+ */
+static void routed_agrees(struct fabric *f, unsigned int p, unsigned int dpin,
+			  const struct dcp_fabric_route *route)
+{
+	u32 mask = dcp_fabric_routed_crtc_mask(route->pipeline->crtc_index);
+	struct apple_connector connector = {
+		.port_encoder = &f->encoder[p][dpin & 1],
+		.dcp = &f->pdev[route->pipeline->crtc_index],
+	};
+	struct drm_connector_state state;
+	struct drm_atomic_commit commit = { &state };
+
+	CHECK(mask && !(mask & ~f->probed[p][dpin & 1]));
+	for (unsigned int c = 0; c <= f->pipes; c++) {
+		bool accepted;
+
+		state.crtc = &f->crtc[c].base;
+		accepted = apple_connector_atomic_best_encoder(&connector.base, &commit) ==
+			   connector.port_encoder;
+		CHECK(accepted == !!(mask & BIT(c)));
+	}
+}
+
 /* apple_dcp_tb_dp_tunnel(): plan (if ordered), pick, claim */
 static struct dcp_fabric_route *tunnel(struct fabric *f, unsigned int p, unsigned int dpin,
 				       bool ordered)
@@ -199,6 +277,8 @@ static struct dcp_fabric_route *tunnel(struct fabric *f, unsigned int p, unsigne
 	CHECK(!(best->tunnel_clock_blocked & BIT(dpin)));
 	/* A compositor that read the masks once can pair it. */
 	CHECK(f->probed[p][dpin & 1] & BIT(best->pipeline->crtc_index));
+	/* Routed, its mask is what the atomic check accepts. */
+	routed_agrees(f, p, dpin, best);
 	best->tunnel = true;
 	best->dpin = dpin;
 	best->pipeline->owned = true;
@@ -278,6 +358,38 @@ static void busy_then_free(const struct layout *l, unsigned int p, unsigned int 
 	       first, s_first->pipeline->crtc_index, second, busy);
 }
 
+/*
+ * Both streams on their usual pipelines, their masks read while routed. The
+ * dock goes, another port's display takes the lower pipeline, the dock's
+ * first stream comes back on the upper one, the other display goes, and the
+ * second stream comes: it is given the lower pipeline, and the mask its
+ * route publishes is what the atomic check accepts, at each attachment.
+ */
+static void routed_again(const struct layout *l, unsigned int p)
+{
+	unsigned int other = !p;
+	struct dcp_fabric_route *s0, *s1, *held;
+	struct fabric f;
+
+	setup(&f, l);
+	s0 = tunnel(&f, p, 0, false);
+	s1 = tunnel(&f, p, 1, false);
+	CHECK(s0 && s1 && s0->pipeline->crtc_index == 1 && s1->pipeline->crtc_index == 2);
+	release(&f, p, 1);
+	release(&f, p, 0);
+	held = &f.route[other][0];
+	held->pipeline->owned = true;
+	f.port[other].owner[0] = held;
+	s0 = tunnel(&f, p, 0, false);
+	CHECK(s0 && s0->pipeline->crtc_index == 2);
+	held->pipeline->owned = false;
+	f.port[other].owner[0] = NULL;
+	s1 = tunnel(&f, p, 1, false);
+	CHECK(s1 && s1->pipeline->crtc_index == 1);
+	printf("ok %s: port %u, routed again: dpin0 CRTC 2, dpin1 CRTC 1, each mask the atomic check's\n",
+	       l->name, p);
+}
+
 int main(void)
 {
 	/* The dcpexts of the M4 MacBook Air and 14-inch MacBook Pro on firmware 27.2. */
@@ -309,6 +421,7 @@ int main(void)
 		busy_then_free(&typec_only, p, 1, true);
 		busy_then_free(&typec_only, p, 2, false);
 		busy_then_free(&typec_only, p, 2, true);
+		routed_again(&typec_only, p);
 	}
 
 	/* A pipeline the second stream cannot clock is never offered to it. */
@@ -354,6 +467,14 @@ int main(void)
 	f.pipe[0].owned = false;
 	CHECK(!tunnel(&f, 0, 1, false));
 	puts("ok hybrid + Type-C-only: hybrid busy then free: dpin1 not handed the hybrid");
+	/*
+	 * The primary on the hybrid: its connector is offered both pipelines
+	 * at probe, and only the hybrid while routed there (checked in tunnel()).
+	 */
+	setup(&f, &hybrid);
+	CHECK(f.port[0].candidate_crtcs[0] == (BIT(1) | BIT(2)));
+	CHECK(tunnel(&f, 0, 0, false)->pipeline->crtc_index == 1);
+	puts("ok hybrid + Type-C-only: the primary routed to the hybrid is offered it alone");
 	setup(&f, &hybrid2);
 	CHECK(f.port[0].candidate_crtcs[0] == (BIT(1) | BIT(2) | BIT(3)));
 	CHECK(f.port[0].candidate_crtcs[1] == (BIT(2) | BIT(3)));
@@ -379,7 +500,8 @@ int main(void)
 
 def build(tmp, name, core):
     header = re.sub(r'^#include.*\n', '', HEADER, flags=re.M)
-    unit = PRE + header + ''.join(function(core, n) for n in NAMES) + CASES
+    unit = PRE + header + ''.join(function(core, n) for n in NAMES)
+    unit += function(DRV, 'apple_connector_atomic_best_encoder') + CASES
     c = Path(tmp) / (name + '.c')
     binary = Path(tmp) / name
     c.write_text(unit)

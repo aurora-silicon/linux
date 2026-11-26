@@ -1970,6 +1970,8 @@ static void fabric_t6030_dual_policy_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, dcp_fabric_port_crtc_mask(true, true, BIT(1), BIT(1), 0),
 			(u32)BIT(1));
 	KUNIT_EXPECT_EQ(test, dcp_fabric_port_crtc_mask(true, true, BIT(1), 0, ~0U), 0U);
+	/* Routed, a connector is offered the CRTC driving it alone. */
+	KUNIT_EXPECT_EQ(test, dcp_fabric_routed_crtc_mask(2), (u32)BIT(2));
 }
 
 static void fabric_t6030_clock_header_parity_test(struct kunit *test)

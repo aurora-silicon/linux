@@ -606,6 +606,22 @@ u32 dcp_fabric_connector_mask(bool dual_stream, bool bound, bool routed,
 EXPORT_SYMBOL_GPL(dcp_fabric_connector_mask);
 
 /*
+ * possible_crtcs of a routed port's connector, while the pipeline of CRTC
+ * @index drives it: that CRTC alone. A route is made before the modeset and
+ * does not follow another CRTC there, so the atomic check pairs the
+ * connector with that pipeline only (apple_connector_atomic_best_encoder()),
+ * and the mask offers exactly what it accepts. The next attachment may be
+ * given another pipeline (a dock stream's depends on what holds the others
+ * when it comes, dcp_fabric_tunnel_candidate()): its route publishes the
+ * new mask before the hotplug that reports the display.
+ */
+u32 dcp_fabric_routed_crtc_mask(unsigned int index)
+{
+	return BIT(index);
+}
+EXPORT_SYMBOL_GPL(dcp_fabric_routed_crtc_mask);
+
+/*
  * The CRTCs a port's connector is offered, from the CRTCs of every pipeline
  * that can drive the port (@candidates), of those among them that drive
  * Type-C only (@typec_only), and of those whose route can carry a DP

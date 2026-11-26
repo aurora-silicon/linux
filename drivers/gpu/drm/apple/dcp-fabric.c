@@ -749,7 +749,9 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 		 * holding a different monitor's mode list, and the modeset is
 		 * rejected with no way for it to recover.  The hotplug that
 		 * follows publishes the actual binding on dual-stream machines
-		 * too. Clients must re-read encoder topology after a hotplug.
+		 * too, whose streams may be given other pipelines at their next
+		 * attachment (dcp_fabric_routed_crtc_mask()). Clients must
+		 * re-read encoder topology after a hotplug.
 		 * Pipelines whose direct routes follow the CRTC they are
 		 * paired with keep the full set: the pairing is the
 		 * compositor's to make there.
@@ -757,10 +759,7 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 		if (connector->port_encoder && dcp->crtc &&
 		    dcp_typec_narrows(dcp))
 			connector->port_encoder->possible_crtcs =
-				dcp_fabric_connector_mask(false,
-							  true, true,
-							  drm_crtc_index(&dcp->crtc->base),
-							  connector->candidate_crtcs);
+				dcp_fabric_routed_crtc_mask(drm_crtc_index(&dcp->crtc->base));
 	}
 	dcp->active_typec_route = route;
 	scoped_guard(mutex, &dcp->tb_lock) {
@@ -4711,10 +4710,7 @@ static void dcp_typec_port_bind_connector(struct apple_dcp_typec_port *port,
 
 		if (dcp->crtc && connector->port_encoder && dcp_typec_narrows(dcp))
 			connector->port_encoder->possible_crtcs =
-				dcp_fabric_connector_mask(false,
-							  true, true,
-							  drm_crtc_index(&dcp->crtc->base),
-							  connector->candidate_crtcs);
+				dcp_fabric_routed_crtc_mask(drm_crtc_index(&dcp->crtc->base));
 
 		apple_connector_set_pipeline(connector, to_platform_device(dcp->dev));
 		dcp->typec_connector = connector;
