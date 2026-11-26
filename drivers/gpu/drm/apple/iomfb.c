@@ -41,6 +41,7 @@
 #include "cec.h"
 #include "dcp.h"
 #include "dcp-hdr-metadata.h"
+#include "dcp-hdcp-drv.h"
 #include "dcp-internal.h"
 #include "iomfb.h"
 #include "iomfb_internal.h"
@@ -1992,6 +1993,9 @@ void dcp_hotplug(struct work_struct *work)
 		 connector->connected, READ_ONCE(dcp->mode_state.valid), dcp->nr_modes);
 	if (READ_ONCE(dcp->mode_state.valid))
 		dcp->tunnel_power_cycles = 0;
+	/* An unplugged sink ends its HDCP session; a new link brings another. */
+	if (!READ_ONCE(connector->connected))
+		dcp_hdcp_link_changed(dcp);
 
 	scoped_guard(mutex, &connector->base.dev->mode_config.mutex) {
 		if (READ_ONCE(connector->dcp) == pdev)

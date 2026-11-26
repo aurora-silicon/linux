@@ -24,6 +24,7 @@
 #include <kunit/visibility.h>
 
 #include "afk.h"
+#include "dcp-hdcp-drv.h"
 #include "afkv2-codec.h"
 #include "afk_reply.h"
 #include "trace.h"
@@ -458,7 +459,7 @@ afk_match_service(struct apple_dcp_afkep *ep, const char *name)
 		return ops;
 	}
 
-	return NULL;
+	return dcp_hdcp_match_service(ep, name, false);
 }
 
 static struct apple_epic_service *afk_epic_find_service(struct apple_dcp_afkep *ep,
@@ -830,6 +831,7 @@ afk_compact_match_service(struct apple_dcp_afkep *ep, const char *name)
 	const struct apple_epic_service_ops *ops, *any = NULL;
 	const char *service_name;
 	size_t len;
+	bool cut;
 
 	if (!name[0] || !ep->ops)
 		return NULL;
@@ -856,13 +858,14 @@ afk_compact_match_service(struct apple_dcp_afkep *ep, const char *name)
 	}
 
 	/* An announcement that filled its field may have lost its end. */
-	if (strlen(name) < AFK_COMPACT_NAME_LEN - 1)
-		return any;
-	for (ops = ep->ops; ops->name[0]; ops++)
-		if (afk_compact_cut_of(ops, service_name))
-			return ops;
+	cut = strlen(name) >= AFK_COMPACT_NAME_LEN - 1;
+	if (cut)
+		for (ops = ep->ops; ops->name[0]; ops++)
+			if (afk_compact_cut_of(ops, service_name))
+				return ops;
 
-	return any;
+	/* The HDCP services, by name, wherever they are announced. */
+	return dcp_hdcp_match_service(ep, service_name, cut) ?: any;
 }
 
 /*
