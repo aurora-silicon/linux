@@ -1520,8 +1520,9 @@ MODULE_PARM_DESC(diag_feed, "DIAGNOSTIC (T6030): macOS's periodic PTD words +0x1
  *  - the request word stepped 0x80, 0x180, 0x380, 0x10380 at -216, each step read back;
  *  - PPM-TO-SMC (+0x10b40..+0x10b60) = 0x2111100000000, 0, 0, 0, 0 at -32;
  *  - the request word 0x103c0 at -25, then PPM-TO-SMC = 0x2111200000000, 0, 0, 0, 0.
- * Once the PMP is ready the request word gains bit 4 (0x103d0), as macOS's does 168 ms after its
- * start. Boot parameter, off by default.
+ * The AGX request (bit 4, which macOS sets 168 ms after its start) is left to the GPU driver's vote:
+ * set without a running GPU, the PMP samples the GPU's counters after a suspend powers it off and
+ * takes an SError. Boot parameter, off by default.
  */
 static bool pmp_diag_preboot;
 module_param_named(diag_preboot, pmp_diag_preboot, bool, 0444);
@@ -1689,17 +1690,6 @@ static void apple_pmp_start_finish(struct apple_pmp_start *st, int result)
 	if (!result && st->rep->offsets->start_at_probe) {
 		WRITE_ONCE(pmp_diag_rep, st->rep);
 		pmp_diag_kick();
-		if (READ_ONCE(pmp_diag_preboot)) {
-			struct apple_pmp_report *rep = st->rep;
-			unsigned long flags;
-
-			spin_lock_irqsave(&rep->lock, flags);
-			writeq(readq(rep->base + rep->offsets->tgt_read) | BIT_ULL(4),
-			       rep->base + rep->offsets->tgt_write);
-			spin_unlock_irqrestore(&rep->lock, flags);
-			dev_info(rep->dev, "DIAGNOSTIC: request %#llx after the PMP is ready\n",
-				 readq(rep->base + rep->offsets->tgt_read));
-		}
 	}
 	if (result && READ_ONCE(st->enabled))
 		dev_err(st->rep->dev,
