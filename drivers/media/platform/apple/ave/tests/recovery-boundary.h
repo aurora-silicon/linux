@@ -78,6 +78,7 @@ struct ave_dev {
 	enum ave_fw_state fw_state;
 	struct ave_ctx *sessions[AVE_MAX_SESSIONS];
 	struct ave_session *failed_sessions;
+	unsigned int failed_count;
 	struct ave_recovery_history recovery;
 	unsigned int recovery_count;
 	bool inject_wedge, data_dirty;
@@ -100,6 +101,27 @@ struct ave_dev {
 	bool witness_unusable;
 	u32 mctf_pool_changed;
 };
+
+/* ave_session_attach(): the firmware is running; Open is answered. */
+int ave_cmd_start(struct ave_ctx *ctx);
+static int ave_fw_ensure_running(struct ave_dev *ave)
+{
+	ave->fw_state = AVE_FW_RUNNING;
+	return 0;
+}
+static int ave_cmd_open(struct ave_ctx *ctx)
+{
+	ctx->sess->fw_open = true;
+	return 0;
+}
+static int ave_sess_mctf_borrow(struct ave_ctx *ctx)
+{
+	return 0;
+}
+static int ave_mctf_cmd_start(struct ave_ctx *ctx)
+{
+	return 0;
+}
 
 static void *test_ctrl_addr;
 static void ave_ipc_dump(struct ave_dev *ave, const char *why) {}

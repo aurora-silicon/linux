@@ -563,8 +563,97 @@ static void unconfirmed_close(void)
 	free(ctx[1].sess);
 }
 
+static unsigned int quarantined(void)
+{
+	unsigned int n = 0;
+
+	for (struct ave_session *s = ave.failed_sessions; s; s = s->failed_next)
+		n++;
+	return n;
+}
+
+/*
+ * One session stays open, so the coprocessor never powers off and every
+ * session stopped beside it stays quarantined. Starting and stopping
+ * another one in the free slot again and again must not keep all their
+ * memory: once AVE_MAX_SESSIONS stopped sessions wait for the power loss,
+ * attaching one more is refused before the firmware is given anything.
+ * Ending the last session and losing power gives all of it back.
+ */
+static void quarantine_churn(void)
+{
+	unsigned int started = 0, refused = 0;
+	int ret;
+
+	init();
+	owners();
+	/* Session 1 stops; session 0 keeps encoding. */
+	mutex_lock(&ave.hw_lock);
+	ave_session_close(&ctx[1], false);
+	mutex_unlock(&ave.hw_lock);
+	ctx[1].sess->hdr.cpu = NULL;
+	ave_sess_destroy(&ctx[1]);
+	assert(quarantined() == 1 && !halts);
+
+	for (unsigned int i = 0; i < 8; i++) {
+		ctx[1].sess = calloc(1, sizeof(*ctx[1].sess));
+		assert(ctx[1].sess);
+		ctx[1].sess->p.slots = 2;
+		ctx[1].sess->p.codec = AVE_CODEC_H264;
+		submit_ctx = &ctx[1];
+		mutex_lock(&ave.hw_lock);
+		ret = ave_session_attach(&ctx[1]);
+		if (!ret) {
+			started++;
+			assert(ctx[1].sess->handed && ave.sessions[1] == &ctx[1]);
+			ave_session_close(&ctx[1], false);
+		} else {
+			refused++;
+			assert(ret == -EBUSY && !ctx[1].sess->handed && !ave.sessions[1]);
+		}
+		mutex_unlock(&ave.hw_lock);
+		ave_sess_destroy(&ctx[1]);
+		/* What waits for the power loss stays bounded. */
+		assert(quarantined() <= AVE_MAX_SESSIONS);
+	}
+	assert(started == AVE_MAX_SESSIONS - 1 && refused == 8 - started);
+	assert(ave.failed_count == AVE_MAX_SESSIONS && !halts);
+
+	/* The last session ends; once the power is gone, everything goes back. */
+	mutex_lock(&ave.hw_lock);
+	ave_session_close(&ctx[0], false);
+	mutex_unlock(&ave.hw_lock);
+	assert(halts == 1);
+	ctx[0].sess->hdr.cpu = NULL;
+	ave_sess_destroy(&ctx[0]);
+	*(u32 *)((char *)coproc + regs.ctrl) = 0;
+	*(u32 *)((char *)coproc + regs.boot_arg) = 0;
+	stop_seen = power_seen = true;
+	mutex_lock(&ave.hw_lock);
+	assert(!ave_fw_prepare_restart(&ave));
+	mutex_unlock(&ave.hw_lock);
+	assert(!ave.failed_sessions && !ave.failed_count);
+
+	/* A new session is admitted again. */
+	ctx[1].sess = calloc(1, sizeof(*ctx[1].sess));
+	assert(ctx[1].sess);
+	ctx[1].sess->p.slots = 2;
+	ctx[1].sess->p.codec = AVE_CODEC_H264;
+	mutex_lock(&ave.hw_lock);
+	assert(!ave_session_attach(&ctx[1]));
+	ave_session_close(&ctx[1], false);
+	mutex_unlock(&ave.hw_lock);
+	ave_sess_destroy(&ctx[1]);
+	assert(ave.failed_count == 1);
+	mutex_lock(&ave.hw_lock);
+	assert(!ave_fw_prepare_restart(&ave));
+	mutex_unlock(&ave.hw_lock);
+	assert(!ave.failed_sessions && !ave.failed_count);
+}
+
 int main(void)
 {
+	quarantine_churn();
 	session_lifetime();
 	unconfirmed_close();
 	unusable_witness();
@@ -580,6 +669,7 @@ int main(void)
 	restore_data();
 	puts("ok: recovery ownership, queues, quarantine, reset proof, rate limit, "
 	     "PM rollback, DATA, IPC deadline and interrupt wait, MMAP/dma-buf release ordering, "
-	     "session and MCTF pool lifetime, canary, unconfirmed Close, unusable witness");
+	     "session and MCTF pool lifetime, canary, unconfirmed Close, unusable witness, "
+	     "bounded quarantine beside a running session");
 	return 0;
 }

@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
-"""Exercise production AVE recovery, PM and queue callbacks at a fake boundary."""
+"""Exercise production AVE recovery, PM and queue callbacks at a fake boundary.
+
+With --ref the driver sources of that revision are built instead (the
+negative control); the boundary and the test cases stay this tree's.
+"""
+import argparse
 import os
 from pathlib import Path
 import re
@@ -14,8 +19,29 @@ from run import declaration, function, source
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument('--ref', help='build the driver of this revision instead')
+    args = parser.parse_args()
     here = Path(__file__).resolve().parent
-    src = here.parent
+    tree = here.parent
+
+    class Driver:
+        """The driver directory, or the same files at --ref."""
+
+        def __truediv__(self, name):
+            return File(name)
+
+    class File:
+        def __init__(self, name):
+            self.name = name
+
+        def read_text(self):
+            if not args.ref:
+                return (tree / self.name).read_text()
+            return subprocess.check_output(['git', '-C', str(tree), 'show',
+                                            f'{args.ref}:./{self.name}'], text=True)
+
+    src = Driver()
     header = (src / 'ave.h').read_text()
     code = (here / 'shim.h').read_text()
     code += '\ntypedef uintptr_t phys_addr_t;\n'
@@ -46,7 +72,8 @@ def main():
                      'ave_fw_runtime_suspend', 'ave_fw_prepare_restart', 'ave_fw_restore_data'),
         'ave-sess.c': ('ave_mctf_pool_crc', 'ave_mctf_pool_check', 'ave_mctf_pool_return', 'ave_sess_domain_unsafe', 'ave_sess_free_bufs', 'ave_sess_destroy', 'ave_sess_reap'),
         'ave-v4l2.c': ('ave_return_bufs', 'ave_buf_queue', 'ave_session_index',
-                       'ave_session_count', 'ave_session_close', 'ave_session_free',
+                       'ave_session_count', 'ave_session_close', 'ave_session_attach',
+                       'ave_session_free',
                        'ave_session_end', 'ave_stop_streaming',
                        'ave_reset_drain', 'ave_job_ready', 'ave_job_fail', 'ave_poll_work'),
         'ave-ipc.c': ('ave_ipc_pump',),
@@ -67,7 +94,8 @@ def main():
                         '-Wno-unused-function', '-fsanitize=address,undefined',
                         '-fno-omit-frame-pointer', str(path / 'test.c'),
                         '-o', str(path / 'test')], check=True)
-        subprocess.run([str(path / 'test')], check=True)
+        # A failed check aborts the test: report it as this script's status.
+        sys.exit(subprocess.run([str(path / 'test')]).returncode)
 
 
 if __name__ == '__main__':

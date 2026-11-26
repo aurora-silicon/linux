@@ -835,6 +835,19 @@ static int ave_session_attach(struct ave_ctx *ctx)
 		dev_err(ave->dev, "already encoding %u streams\n", max_sessions);
 		return -EBUSY;
 	}
+	/*
+	 * A session stopped beside a running one keeps its memory until the
+	 * last session ends and the coprocessor loses power (ave_sess_reap()).
+	 * Starting and stopping sessions next to one that stays open would
+	 * keep all of it: once as many stopped sessions wait as the encoder
+	 * runs at once, refuse another before the firmware is given anything.
+	 */
+	if (ave_session_count(ave) && ave->failed_count >= AVE_MAX_SESSIONS) {
+		dev_err_ratelimited(ave->dev,
+				    "%u stopped sessions wait for the encoder to power off; not starting another\n",
+				    ave->failed_count);
+		return -EBUSY;
+	}
 	if (!ave_session_count(ave)) {
 		ret = ave_fw_ensure_running(ave);
 		if (ret)

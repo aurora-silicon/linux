@@ -302,6 +302,8 @@ struct ave_dev {
 	struct ave_recovery_history recovery;
 	unsigned int recovery_count;
 	struct ave_session *failed_sessions;
+	/* encoder sessions on failed_sessions (MCTF ones hold only the pool) */
+	unsigned int failed_count;
 	bool inject_wedge;
 
 	/* debugfs: the last Start and first Process built, per codec */
