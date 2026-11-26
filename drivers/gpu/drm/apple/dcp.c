@@ -9191,6 +9191,18 @@ static const struct dcp_s2r_layout dcp_s2r_t8142 = {
 	.pmc_dcp = false,
 };
 
+/*
+ * T8103's, from its device tree: DISP0's CPU (0x10018) and front end (0x360) power words,
+ * and no system word or retention words. The DCP's firmware DART has its stream 0, the
+ * display DART streams 0 and 4 (the display and its PIODMA).
+ */
+static const struct dcp_s2r_layout dcp_s2r_t8103 = {
+	.disp_cpu = 0x10018,
+	.disp_fe = 0x360,
+	.dcp_streams = BIT(0),
+	.disp_streams = BIT(0) | BIT(4),
+};
+
 /* TEST: J813 external processors, ADT DISPEXT0/1 power words. */
 static const struct dcp_s2r_layout dcp_s2r_t8142_ext[] = {
 	{ .disp_cpu = 0x428, .disp_fe = 0x418, .disp_sys = 0x308,
@@ -9273,8 +9285,9 @@ void dcp_s2r_dart_power(struct apple_dcp *dcp, u32 on)
 static bool dcp_s2r_capable(struct apple_dcp *dcp)
 {
 	/*
-	 * Firmware 27.2 and 27.3 run as V_27_0 with their own tables, which have no tag for the
-	 * AP link's release (27.2 moved it to A550): an empty tag panics the firmware.
+	 * Firmware 27.2 and 27.3 run as V_27_0 with their own tables. 27.2's has the AP link's
+	 * release (A550); a table without a tag for it can't stop: an empty tag panics the
+	 * firmware.
 	 */
 	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
 	    (!dcp->v27_methods || !dcp->v27_methods[dcpep_unnamed_500].tag[0]))
@@ -9447,8 +9460,16 @@ err:
 /* Its power state can only be lowered once this has finished. */
 static int dcp_s2r_stop_streams(struct apple_dcp *dcp)
 {
+	int ret;
+
 	if (!dcp->s2r_dcp_dart)
 		return -ENODEV;
+	if (dcp->hw.s2r_disp_dart_with_dcp && dcp->s2r_disp_dart) {
+		ret = apple_dart_display_streams(dcp->s2r_disp_dart,
+						 dcp_s2r_layout(dcp)->disp_streams, false, true);
+		if (ret)
+			return ret;
+	}
 
 	return apple_dart_display_streams(dcp->s2r_dcp_dart, dcp_s2r_layout(dcp)->dcp_streams,
 					  false, true);
@@ -9667,6 +9688,13 @@ static int dcp_s2r_suspend(struct apple_dcp *dcp)
 	bool was_off;
 	int ret;
 
+	/*
+	 * Not bound into the display subsystem (a component unbind released the RTKit
+	 * session): nothing of the firmware is this driver's to stop.
+	 */
+	if (IS_ERR_OR_NULL(dcp->rtk))
+		return 0;
+
 	/* Still stopped from a suspend that never reached the commit. */
 	if (READ_ONCE(dcp->s2r_fw_down)) {
 		dcp_s2r_stop_failed_start(dcp);
@@ -9726,7 +9754,7 @@ static void dcp_s2r_ps_lower(void __iomem *reg)
 	writel((val & ~GENMASK(3, 0)) | GENMASK(9, 8), reg);
 }
 
-/* Its display-power words, pmc-dcp only where the layout has one. */
+/* Its display-power words, pwrgate and pmc-dcp only where the layout has them. */
 static int dcp_s2r_map_power(struct apple_dcp *dcp, void __iomem **ps, void __iomem **pwrgate,
 			     void __iomem **pmc)
 {
@@ -9737,12 +9765,14 @@ static int dcp_s2r_map_power(struct apple_dcp *dcp, void __iomem **ps, void __io
 	if (!np)
 		return -ENODEV;
 	*ps = of_iomap(np, of_property_match_string(np, "reg-names", "ps"));
-	*pwrgate = of_iomap(np, of_property_match_string(np, "reg-names", "pwrgate"));
+	if (dcp_s2r_layout(dcp)->ret_ff)
+		*pwrgate = of_iomap(np, of_property_match_string(np, "reg-names", "pwrgate"));
 	if (dcp_s2r_layout(dcp)->pmc_dcp)
 		*pmc = of_iomap(np, of_property_match_string(np, "reg-names", "pmc-dcp"));
 	of_node_put(np);
 
-	return *ps && *pwrgate && (*pmc || !dcp_s2r_layout(dcp)->pmc_dcp) ? 0 : -ENODEV;
+	return *ps && (*pwrgate || !dcp_s2r_layout(dcp)->ret_ff) &&
+	       (*pmc || !dcp_s2r_layout(dcp)->pmc_dcp) ? 0 : -ENODEV;
 }
 
 /* macOS's power-off, measured 3 of 3 on T8140. The firmware is stopped and its DARTs are off. */
@@ -9778,14 +9808,17 @@ static int dcp_s2r_domains_off(struct apple_dcp *dcp)
 	}
 	dcp_s2r_ps_lower(ps + l->disp_cpu);
 	dcp_s2r_ps_lower(ps + l->disp_fe);
-	dcp_s2r_ps_lower(ps + l->disp_sys);
+	/* A layout without a system word has 0 there, a different domain's word. */
+	if (l->disp_sys)
+		dcp_s2r_ps_lower(ps + l->disp_sys);
 
 	ret = readl_poll_timeout(ps + l->disp_cpu, val, !FIELD_GET(GENMASK(7, 4), val), 100,
 				 50000);
 	if (ret)
 		dev_err(dcp->dev, "DISP_CPU did not power off: %#x\n", val);
 	dev_dbg(dcp->dev, "display domains off: CPU %#x FE %#x SYS %#x\n",
-		readl(ps + l->disp_cpu), readl(ps + l->disp_fe), readl(ps + l->disp_sys));
+		readl(ps + l->disp_cpu), readl(ps + l->disp_fe),
+		l->disp_sys ? readl(ps + l->disp_sys) : 0);
 out:
 	if (ps)
 		iounmap(ps);
@@ -9812,9 +9845,11 @@ static int dcp_s2r_domains_on(struct apple_dcp *dcp)
 	if (ret)
 		goto out;
 
-	val = readl(ps + l->disp_sys) & ~(GENMASK(9, 8) | GENMASK(3, 0) | BIT(28));
-	writel(val | 0xf, ps + l->disp_sys);
-	writel(val | 0xf | BIT(28), ps + l->disp_sys);
+	if (l->disp_sys) {
+		val = readl(ps + l->disp_sys) & ~(GENMASK(9, 8) | GENMASK(3, 0) | BIT(28));
+		writel(val | 0xf, ps + l->disp_sys);
+		writel(val | 0xf | BIT(28), ps + l->disp_sys);
+	}
 	val = readl(ps + l->disp_fe) & ~(GENMASK(9, 8) | GENMASK(3, 0));
 	writel(val | 0xf, ps + l->disp_fe);
 	val = readl(ps + l->disp_cpu) & ~(GENMASK(9, 8) | GENMASK(3, 0) | BIT(28));
@@ -10072,6 +10107,8 @@ static int dcp_s2r_warm_restart(struct apple_dcp *dcp)
 {
 	int ret;
 
+	if (IS_ERR_OR_NULL(dcp->rtk))
+		return -ENODEV;
 	dcp_s2r_forget_crash(dcp);
 	ret = dcp_s2r_domains_on(dcp);
 	if (ret)
@@ -10084,6 +10121,13 @@ static int dcp_s2r_warm_restart(struct apple_dcp *dcp)
 	if (dcp->s2r_dcp_dart)
 		apple_dart_display_streams(dcp->s2r_dcp_dart, dcp_s2r_layout(dcp)->dcp_streams,
 					   true, false);
+	/* Set up again before the firmware runs, which uses it right away. */
+	if (dcp->hw.s2r_disp_dart_with_dcp && dcp->s2r_disp_dart) {
+		ret = apple_dart_display_streams(dcp->s2r_disp_dart,
+						 dcp_s2r_layout(dcp)->disp_streams, true, false);
+		if (ret)
+			return ret;
+	}
 
 	if (dcp->secure_rtk) {
 		dcp_secure_poll_stop(dcp);
@@ -10237,6 +10281,9 @@ static int dcp_s2r_resume(struct apple_dcp *dcp)
 	bool real = pm_resume_via_firmware();
 
 	dcp->s2r_stopped = false;
+	/* No RTKit session since the suspend stopped it: nothing to start. */
+	if (IS_ERR_OR_NULL(dcp->rtk))
+		return 0;
 	/* A real sleep took the domains' power. */
 	if (real)
 		dcp->s2r_domains_up = false;
@@ -10470,7 +10517,8 @@ static void dcp_s2r_prewarm_work(struct work_struct *work)
 	guard(mutex)(&dcp->s2r_prewarm_lock);
 	light = dcp->s2r_wake_light;
 	dcp->s2r_wake_light = false;
-	if (!dcp->dpms_powered_off || !READ_ONCE(dcp->s2r_fw_down) || READ_ONCE(dcp->crashed))
+	if (!dcp->dpms_powered_off || !READ_ONCE(dcp->s2r_fw_down) || READ_ONCE(dcp->crashed) ||
+	    IS_ERR_OR_NULL(dcp->rtk))
 		return;
 	dcp_s2r_find_darts(dcp);
 	ret = dcp_s2r_warm_restart(dcp);
@@ -11014,6 +11062,16 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8142 = {
 	.s2r_layout = &dcp_s2r_t8142,
 };
 
+/* T8103's DCP: the firmware stop around DPMS off and system sleep, with its own power words */
+static const struct apple_dcp_hw_data apple_dcp_hw_t8103 = {
+	.num_dptx_ports = 0,
+	.s2r = true,
+	.s2r_no_secure_port = true,
+	.s2r_layout = &dcp_s2r_t8103,
+	.map_reg_dart = true,
+	.s2r_disp_dart_with_dcp = true,
+};
+
 static const struct apple_dcp_hw_data apple_dcp_hw_dcp = {
 	.num_dptx_ports = 0,
 };
@@ -11150,6 +11208,7 @@ static const struct of_device_id of_match[] = {
 	{ .compatible = "apple,t6050-dcpext", .data = &apple_dcp_hw_t6050_dcpext },
 	{ .compatible = "apple,t6020-dcp", .data = &apple_dcp_hw_t6020,  },
 	{ .compatible = "apple,t6020-dcpext", .data = &apple_dcp_hw_t6020_dcpext, },
+	{ .compatible = "apple,t8103-dcp", .data = &apple_dcp_hw_t8103,  },
 	{ .compatible = "apple,t8112-dcp", .data = &apple_dcp_hw_t8112,  },
 	{ .compatible = "apple,t8140-dcp", .data = &apple_dcp_hw_t8140,  },
 	{ .compatible = "apple,t8140-dcpext", .data = &apple_dcp_hw_t8140_external, },

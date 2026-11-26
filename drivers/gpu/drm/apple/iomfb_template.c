@@ -1514,8 +1514,7 @@ static u64 dcpep_cb_get_frequency(struct apple_dcp *dcp)
 	return clk_get_rate(dcp->clk);
 }
 
-#if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0) && !DCP_FW_H17(DCP_FW_VER) && \
-	!DCP_FW_DESKTOP_26(DCP_FW_VER)
+#if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0) && !DCP_FW_DESKTOP_26(DCP_FW_VER)
 /* The DVA that map_reg hands out for display register range @index. */
 static dma_addr_t dcpep_map_reg_dva(struct apple_dcp *dcp, u32 index,
 				    struct resource *rsrc)
@@ -1562,6 +1561,17 @@ static struct DCP_FW_NAME(dcp_map_reg_resp) dcpep_cb_map_reg(struct apple_dcp *d
 		 */
 		dma_addr_t dva = dcp->fw_compat == DCP_FIRMWARE_V_27_0 ?
 			dcp->disp_firmware_base[req->index] : rsrc->start;
+
+		/* Where firmware 27 goes through its DART: mapped there, once. */
+		if (dcp->fw_compat == DCP_FIRMWARE_V_27_0 && dcp->hw.map_reg_dart) {
+			if (!dcp->map_reg_dva[req->index]) {
+				dva = dcpep_map_reg_dva(dcp, req->index, rsrc);
+				if (WARN_ON(dva == DMA_MAPPING_ERROR))
+					return (struct DCP_FW_NAME(dcp_map_reg_resp)) { .ret = 1 };
+				dcp->map_reg_dva[req->index] = dva;
+			}
+			dva = dcp->map_reg_dva[req->index];
+		}
 #elif DCP_FW_DESKTOP_26(DCP_FW_VER)
 		/*
 		 * The desktop 26.x firmware takes the register windows'

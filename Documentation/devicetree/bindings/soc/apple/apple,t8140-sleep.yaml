@@ -19,17 +19,18 @@ description: |
 properties:
   compatible:
     enum:
+      - apple,t8103-sleep
       - apple,t8122-sleep
       - apple,t8132-sleep
       - apple,t8140-sleep
       - apple,t8142-sleep
 
   reg:
-    minItems: 21
+    minItems: 7
     maxItems: 41
 
   reg-names:
-    minItems: 21
+    minItems: 7
     maxItems: 41
 
   apple,wake-enable:
@@ -106,6 +107,28 @@ required:
   - apple,display-coprocessors
 
 allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8103-sleep
+    then:
+      required:
+        - apple,wake-enable
+        - apple,pinctrl
+      properties:
+        reg:
+          minItems: 7
+          maxItems: 7
+        reg-names:
+          items:
+            - const: ps
+            - const: ps-aon
+            - const: clk-mux
+            - const: wake
+            - const: cpu-start
+            - const: wdt
+            - const: spmi
   - if:
       properties:
         compatible:
