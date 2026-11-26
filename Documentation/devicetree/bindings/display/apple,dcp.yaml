@@ -387,6 +387,17 @@ properties:
     $ref: /schemas/types.yaml#/definitions/uint32
     description: Display coprocessor index on multi-DCP systems.
 
+  apple,hdcp-channels:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 1
+    maxItems: 2
+    items:
+      maximum: 14
+    description:
+      The Secure Enclave's HDCP interface channels assigned to this display
+      coprocessor. The first is the HDCP 2.2 transmitter channel of its
+      external output. Absent when the coprocessor has no HDCP transmitter.
+
   apple,sleep-host-stop:
     type: boolean
     description:
