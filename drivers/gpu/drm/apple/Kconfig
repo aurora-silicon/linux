@@ -8,6 +8,8 @@ config DRM_APPLE
 	depends on OF_ADDRESS
 	# The firmware-27 remote buffer path calls into the DART driver.
 	depends on APPLE_DART || !APPLE_DART
+	# The native audio links call into the SIO driver.
+	depends on APPLE_SIO || !APPLE_SIO
 	select APPLE_PMP_REPORT
 	select OF_DYNAMIC
 	select DRM_CLIENT_SELECTION
