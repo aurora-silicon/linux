@@ -1319,24 +1319,73 @@ static void macaudio_route_is_protected(struct kunit *test)
 static void macaudio_route_fixed_while_granted(struct kunit *test)
 {
 	struct macaudio_test_spk t = {};
+	struct snd_ctl_file other = {};
 
 	macaudio_test_spk_card(test, &t, &macaudio_j316_cfg, SN012776_0DB);
-	KUNIT_EXPECT_EQ(test, macaudio_route_check(t.ma), 0);
+	KUNIT_EXPECT_EQ(test, macaudio_route_check(t.ma, &other), 0);
 	macaudio_test_take(test, &t);
-	/* Owned but not granted: the owner checks the route before it grants. */
-	KUNIT_EXPECT_EQ(test, macaudio_route_check(t.ma), 0);
+	/* Owned but not granted: the owner may re-route before it grants. */
+	KUNIT_EXPECT_EQ(test, macaudio_route_check(t.ma, t.owner), 0);
+	/* The re-route before the owner took the card refuses one grant */
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 30), -EBUSY);
 	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 30), 0);
-	KUNIT_EXPECT_EQ(test, macaudio_route_check(t.ma), -EBUSY);
+	KUNIT_EXPECT_EQ(test, macaudio_route_check(t.ma, t.owner), -EBUSY);
+	KUNIT_EXPECT_EQ(test, macaudio_route_check(t.ma, &other), -EBUSY);
 	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 0), 0);
-	KUNIT_EXPECT_EQ(test, macaudio_route_check(t.ma), 0);
+	KUNIT_EXPECT_EQ(test, macaudio_route_check(t.ma, t.owner), 0);
 	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 30), 0);
 	macaudio_spk_unlock(t.spk);
-	KUNIT_EXPECT_EQ(test, macaudio_route_check(t.ma), 0);
+	KUNIT_EXPECT_EQ(test, macaudio_route_check(t.ma, &other), 0);
+}
+
+/*
+ * The owner checks the route, then grants: another file's re-route in
+ * between must not reach the speakers under that grant.
+ */
+static void macaudio_route_moved_before_the_grant(struct kunit *test)
+{
+	struct macaudio_test_spk t = {};
+	struct snd_ctl_file other = {};
+
+	macaudio_test_spk_card(test, &t, &macaudio_j316_cfg, SN012776_0DB);
+	macaudio_test_take(test, &t);
+	KUNIT_EXPECT_EQ(test, macaudio_route_check(t.ma, &other), 0);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 30), -EBUSY);
+	KUNIT_EXPECT_EQ(test, macaudio_test_read(test, &t), 0L);
+	macaudio_test_expect_vols(test, &t, 0);
+	/* Read again with nothing moved since: granted */
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 30), 0);
+	KUNIT_EXPECT_EQ(test, macaudio_test_read(test, &t), 1L);
+	macaudio_test_expect_vols(test, &t, SN012776_0DB);
+	/* A refused re-route under the grant moves nothing: renewals go on */
+	KUNIT_EXPECT_EQ(test, macaudio_route_check(t.ma, &other), -EBUSY);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 30), 0);
+
+	/* A write without a file counts as another file's */
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 0), 0);
+	KUNIT_EXPECT_EQ(test, macaudio_route_check(t.ma, NULL), 0);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 30), -EBUSY);
+	macaudio_test_expect_vols(test, &t, 0);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 30), 0);
+
+	/* The owner's own re-route is its decision */
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 0), 0);
+	KUNIT_EXPECT_EQ(test, macaudio_route_check(t.ma, t.owner), 0);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 30), 0);
+
+	/* A re-route while the card has no owner counts for the next one */
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 0), 0);
+	macaudio_spk_unlock(t.spk);
+	KUNIT_EXPECT_EQ(test, macaudio_route_check(t.ma, &other), 0);
+	macaudio_test_take(test, &t);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 30), -EBUSY);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 30), 0);
 }
 
 static struct kunit_case macaudio_protection_cases[] = {
 	KUNIT_CASE(macaudio_route_is_protected),
 	KUNIT_CASE(macaudio_route_fixed_while_granted),
+	KUNIT_CASE(macaudio_route_moved_before_the_grant),
 	KUNIT_CASE(macaudio_sense_owned_writes),
 	KUNIT_CASE(macaudio_sense_controls_are_protected),
 	KUNIT_CASE(macaudio_spk_floor_from_binding),
