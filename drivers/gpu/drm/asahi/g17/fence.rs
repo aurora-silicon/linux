@@ -426,8 +426,11 @@ impl ChunkWork {
         Arc::pin_init(
             pin_init!(Self {
                 work <- new_mutex!(Some(work), "G17 chunk work state"),
-                remaining: AtomicU32::new(0),
-                owners: AtomicU32::new(0),
+                // Initial enqueue guard matching Submission's lifecycle so an
+                // early-retiring or dropped member cannot release the work
+                // state before later commands in the same chunk attach.
+                remaining: AtomicU32::new(1),
+                owners: AtomicU32::new(1),
                 error: AtomicBool::new(false),
             }),
             GFP_KERNEL,
@@ -458,6 +461,10 @@ impl ChunkWork {
         if self.owners.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.release();
         }
+    }
+    pub(crate) fn finish_enqueue(&self, result: Result) {
+        self.member_done(result);
+        self.owner_done();
     }
 }
 
@@ -683,6 +690,7 @@ pub(crate) struct Outputs {
     syncs: KVec<SyncItem>,
     input_count: usize,
     submission: Option<Aggregate>,
+    chunks: KVec<Arc<ChunkWork>>,
     result: Result,
     cumulative: Option<super::sync_output::SignalBundle>,
 }
@@ -713,6 +721,7 @@ impl Outputs {
             syncs,
             input_count,
             submission: None,
+            chunks: KVec::new(),
             result: Err(ECANCELED),
             cumulative,
         })
@@ -739,8 +748,10 @@ impl Outputs {
     pub(crate) fn publish_with_status(
         &mut self,
         vm_status: Arc<super::status::VmStatus>,
+        chunks: KVec<Arc<ChunkWork>>,
         compute_only: bool,
     ) -> Result<Aggregate> {
+        self.chunks = chunks;
         let source = Submission::with_work_and_status(None, Some(vm_status), false)?;
         self.publish_source(source, compute_only)
     }
@@ -766,6 +777,9 @@ impl Outputs {
 }
 impl Drop for Outputs {
     fn drop(&mut self) {
+        for chunk in &self.chunks {
+            chunk.finish_enqueue(self.result);
+        }
         if let Some(submission) = self.submission.take() {
             if let Some(bundle) = &mut self.cumulative {
                 bundle.fail(&submission.fence());

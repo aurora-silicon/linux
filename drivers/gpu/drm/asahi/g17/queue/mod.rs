@@ -610,6 +610,8 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
             let mut work_states = KVec::new();
             let aggregate = if pending.len() > 1 {
                 work_states.reserve(pending.len(), GFP_KERNEL)?;
+                let mut chunks = KVec::new();
+                chunks.reserve(pending.len(), GFP_KERNEL)?;
                 let mut current: Option<Arc<ChunkWork>> = None;
                 let mut chunk_len = 0usize;
                 let mut prev_has_outputs = false;
@@ -621,12 +623,16 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
                             WorkStateLease::deferred(self.context.clone())?,
                             GFP_KERNEL,
                         )?;
-                        current = Some(ChunkWork::new(lease)?);
+                        let chunk = ChunkWork::new(lease)?;
+                        chunks.push(chunk.clone(), GFP_KERNEL)?;
+                        current = Some(chunk);
                         chunk_len = 0;
                     } else if work_state_split_before(chunk_len, prev_has_outputs, query_access) {
                         if let Some(lease) = WorkStateLease::deferred_split(self.context.clone()) {
                             let lease = Arc::new(lease, GFP_KERNEL)?;
-                            current = Some(ChunkWork::new(lease)?);
+                            let chunk = ChunkWork::new(lease)?;
+                            chunks.push(chunk.clone(), GFP_KERNEL)?;
+                            current = Some(chunk);
                             chunk_len = 0;
                         }
                     }
@@ -634,7 +640,11 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
                     chunk_len += 1;
                     prev_has_outputs = destinations.has_outputs();
                 }
-                outputs.publish_with_status(self.context.status().clone(), compute_only)?
+                outputs.publish_with_status(
+                    self.context.status().clone(),
+                    chunks,
+                    compute_only,
+                )?
             } else {
                 // Where a firmware wait reports completion before a weak stream tail's writes are
                 // visible, only a command that declares a visible completion is waited for there.
