@@ -1634,9 +1634,13 @@ static void t6030_gp_clk_off(struct apple_sleep *s)
  * words on instead of 48), and restore every word on wake. Run from .commit_regs, after the
  * coprocessors' stops.
  */
-static bool t6030_lower_macos_off = true;
+/*
+ * Off by default (MEAS J516S, 11-26): from the late group the PMP's commit stop timed out, and
+ * from .commit_regs the entry stopped there, before the commit word. One of the 25 words is to blame.
+ */
+static bool t6030_lower_macos_off;
 module_param_named(lower_macos_off, t6030_lower_macos_off, bool, 0644);
-MODULE_PARM_DESC(lower_macos_off, "T6030: lower macOS-off power domains (ATC0-3_COMMON, fabric, DPA1-4) before the -30 ms window (default: on)");
+MODULE_PARM_DESC(lower_macos_off, "T6030: lower the macOS-off power domains (ATC0-3_COMMON, fabric, DPA1-4) from .commit_regs (default: off)");
 
 static void t6030_sleep_unstage(struct apple_sleep *s, u32 offset, u32 before);
 
