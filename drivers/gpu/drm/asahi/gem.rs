@@ -81,21 +81,22 @@ pub(crate) struct AsahiObject {
 /// Type alias for the shmem GEM object type for this driver.
 pub(crate) type Object = shmem::Object<AsahiObject>;
 
-/// Marks whether the pages of `gem` are held.
+/// Marks `resident` pages of `gem` held, or none.
 ///
-/// It follows the object's shmem page array ([`AsahiObject::pages_changed`]). Every holder of
-/// that array keeps its pages referenced (a device SG table, a kernel vmap, a PFN CPU mapping or
-/// a dma-buf pin), so the pages cannot migrate. Unmarked, the compaction migrate scanner still
+/// It follows the pages that back the object ([`AsahiObject::pages_changed`]): all of them while
+/// its shmem page array exists, otherwise those that CPU faults populated in revocable mappings.
+/// Every holder keeps its pages referenced (a device SG table, a kernel vmap, a PFN CPU mapping
+/// or a dma-buf pin), so the pages cannot migrate. Unmarked, the compaction migrate scanner still
 /// isolates them from the unevictable LRU and every migration fails. The shmem mapping of a
 /// held object is therefore marked inaccessible, which compaction and migration check and which
 /// comes with unevictable, as `mapping_set_inaccessible()` sets it; nothing reads or writes a GEM
-/// shmem file through its mapping. Releasing the array (the last holder gone, idle backing
-/// released or the object purged) clears the mark, so the released pages can be swapped and
-/// migrated again.
+/// shmem file through its mapping. Releasing the last of them (the last holder gone, mappings
+/// revoked, idle backing released or the object purged) clears the mark, so the released pages
+/// can be swapped and migrated again.
 ///
-/// The same transitions charge and uncharge the held pages (see [`memacct`]): a held user object
-/// counts towards the resident set of the process that created it.
-fn set_mapping_held(gem: &Object, held: bool) {
+/// The same transitions charge and uncharge the held pages (see [`memacct`]): the held pages of a
+/// user object count towards the resident set of the process that created it.
+fn set_mapping_held(gem: &Object, resident: usize) {
     let raw = gem.as_raw();
     // SAFETY: `gem` keeps the GEM object alive. A shmem-backed object's `filp` and its
     // `f_mapping` are set at initialization and never change; imported objects have none.
@@ -115,12 +116,13 @@ fn set_mapping_held(gem: &Object, held: bool) {
         unsafe { AtomicUsize::from_ptr(core::ptr::addr_of_mut!((*mapping).flags).cast::<usize>()) };
     let inaccessible = 1usize << kernel::bindings::mapping_flags_AS_INACCESSIBLE;
     let unevictable = 1usize << kernel::bindings::mapping_flags_AS_UNEVICTABLE;
-    if held {
+    if resident != 0 {
         flags.fetch_or(inaccessible | unevictable, Ordering::Relaxed);
     } else {
         flags.fetch_and(!inaccessible, Ordering::Relaxed);
     }
-    gem.charge.set_held(held);
+    let bytes = resident.saturating_mul(kernel::page::PAGE_SIZE);
+    gem.charge.set_held_bytes(u64::try_from(bytes).unwrap_or(u64::MAX));
 }
 
 /// Takes the SG table of `gem`, which holds its pages for the device (and so the object, see
@@ -654,12 +656,13 @@ impl DriverObject for AsahiObject {
         }
     }
 
-    /// The page array of `obj` was populated or released: its backing is held from the first
-    /// holder of the array to the last (see [`set_mapping_held`]). That includes the holders the
-    /// generic shmem helpers create, CPU mappings, dma-buf pins and kernel vmaps, as well as the
-    /// SG tables of device mappings.
-    fn pages_changed(obj: &<Self::Driver as drm::Driver>::Object, present: bool) {
-        set_mapping_held(obj, present);
+    /// The pages that back `obj` changed to `resident` (see [`set_mapping_held`]). All of them
+    /// are held from the first holder of its page array to the last, which includes the holders
+    /// the generic shmem helpers create (CPU mappings, dma-buf pins and kernel vmaps) as well as
+    /// the SG tables of device mappings. Without the array, CPU faults in revocable mappings hold
+    /// one page each.
+    fn pages_changed(obj: &<Self::Driver as drm::Driver>::Object, resident: usize) {
+        set_mapping_held(obj, resident);
     }
 
     /// Optional handle for exporting a gem object.
