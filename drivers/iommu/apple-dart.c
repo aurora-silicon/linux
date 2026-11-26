@@ -1065,13 +1065,21 @@ static phys_addr_t apple_dart_pte_to_paddr(const struct apple_dart *dart,
 	return (pte & GENMASK_ULL(37, 10)) << 4;
 }
 
-/* Firmware table pages must remain outside Linux's page allocator. */
+/*
+ * Firmware table pages must remain outside Linux's page allocator. The boot
+ * loader says it reserved them with apple,firmware-root-handoff; the walker
+ * decodes them in the APPLE_DART2 PTE layout, and the handoff paths (retire,
+ * per-slot invalidate, locked map/unmap) need a DART whose probed version is
+ * at least 2.2. Only the T8110 family reports a version, so a T6000 DART,
+ * which shares the APPLE_DART2 layout, never takes the handoff.
+ */
 static bool apple_dart_fw_handoff_enabled(const struct apple_dart *dart)
 {
 	struct device_node *np = dart->dev->of_node;
 	u32 handoff;
 
-	return dart->locked && of_device_is_compatible(np, "apple,t8140-dart") &&
+	return dart->locked && dart->hw->fmt == APPLE_DART2 &&
+		dart->version >= 0x0202 &&
 		of_property_count_u32_elems(np, "apple,firmware-root-handoff") == 1 &&
 		!of_property_read_u32(np, "apple,firmware-root-handoff", &handoff) &&
 		handoff == 1;
@@ -5975,7 +5983,6 @@ static int apple_dart_probe(struct platform_device *pdev)
 		(res->start == 0x286300000ULL || res->start == 0x48a300000ULL);
 	/* The radio DART's fault interrupt is not described by the loader. */
 	j713_radio = res && !tunneled && apple_t8132_managed_radio() &&
-		of_machine_is_compatible("apple,t8132") &&
 		of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
 		res->start == 0x490000000ULL;
 	if (j713_display) {
@@ -6614,7 +6621,7 @@ params_done:
 	}
 	dart->fw_tree = dart->fw_mirror &&
 		of_device_is_compatible(dev->of_node, "apple,t6050-dart");
-	if (apple_t8132_live_mtp() && of_machine_is_compatible("apple,t8132") &&
+	if (apple_t8132_live_mtp() &&
 	    res->start == 0x394800000ULL && dart->hw->type == DART_T8110 &&
 	    !dart->locked && !tunneled && dart->supports_bypass &&
 	    apple_dart_streams_bypassed(dart)) {
