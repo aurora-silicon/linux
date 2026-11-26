@@ -342,6 +342,7 @@ impl SyncItem {
             }
             base += chunk as u32;
         }
+        let anchor = Self::coalesce_outputs(&mut vec, in_count as usize, anchor)?;
         if let Some(anchor) = anchor {
             let bundle = crate::g17::sync_output::SignalBundle::new(
                 &vec[in_count as usize..],
@@ -357,6 +358,130 @@ impl SyncItem {
         }
 
         Ok(vec)
+    }
+
+    /// Merges the timeline outputs of `syncs` (outputs from `first` on) that name the same
+    /// syncobj ([`coalesce_timeline_outputs`]), before any chain node is allocated for them.
+    /// Returns the index of the cumulative `anchor` after the merge. The anchor never merges,
+    /// so another output naming its syncobj is still refused.
+    fn coalesce_outputs(
+        syncs: &mut KVec<SyncItem>,
+        first: usize,
+        anchor: Option<usize>,
+    ) -> Result<Option<usize>> {
+        let mergeable = |&(index, sync): &(usize, &SyncItem)| {
+            index >= first && sync.timeline && Some(index) != anchor
+        };
+        let count = syncs.iter().enumerate().filter(mergeable).count();
+        if count < 2 {
+            return Ok(anchor);
+        }
+        let mut named = KVec::with_capacity(count, GFP_KERNEL)?;
+        for (index, sync) in syncs.iter().enumerate().filter(mergeable) {
+            named.push(
+                (sync.syncobj.as_raw() as usize, index, sync.timeline_value),
+                GFP_KERNEL,
+            )?;
+        }
+        let merged = coalesce_timeline_outputs(&mut named)?;
+        if merged.is_empty() {
+            return Ok(anchor);
+        }
+        for &(_, index, point) in named.iter() {
+            syncs[index].timeline_value = point;
+        }
+        let anchor = anchor
+            .map(|anchor| anchor - merged.iter().take_while(|&&index| index < anchor).count());
+        let mut index = 0;
+        let mut next = merged.iter().peekable();
+        syncs.retain(|_| {
+            let gone = next.next_if_eq(&&index).is_some();
+            index += 1;
+            !gone
+        });
+        Ok(anchor)
+    }
+}
+
+/// Timeline outputs of one submission that name the same syncobj all receive the
+/// submission's fence. Installing each walks the syncobj's unsignalled fence chain, which
+/// every installation lengthens, so N of them would walk it N times. They merge into the
+/// last of them, at the highest of their points: a wait for any of those points still
+/// resolves to the submission's fence.
+///
+/// `named` holds each mergeable output's syncobj, index and point. Leaves each kept output's
+/// entry with its merged point and returns the merged-away outputs' indices, in order.
+fn coalesce_timeline_outputs(named: &mut [(usize, usize, u64)]) -> Result<KVec<usize>> {
+    named.sort_unstable_by_key(|&(syncobj, index, _)| (syncobj, index));
+    let mut merged = KVec::new();
+    for group in named.chunk_by_mut(|a, b| a.0 == b.0) {
+        let Some(((_, _, point), earlier)) = group.split_last_mut() else {
+            continue;
+        };
+        for &(_, index, earlier_point) in earlier.iter() {
+            *point = (*point).max(earlier_point);
+            merged.push(index, GFP_KERNEL)?;
+        }
+    }
+    merged.sort_unstable();
+    Ok(merged)
+}
+
+#[kernel::macros::kunit_tests(asahi_submit_outputs)]
+mod output_tests {
+    use super::*;
+
+    fn merge(outputs: &[(usize, u64)]) -> (KVec<usize>, KVec<(usize, u64)>) {
+        let mut named = KVec::new();
+        for (index, &(syncobj, point)) in outputs.iter().enumerate() {
+            named.push((syncobj, index, point), GFP_KERNEL).unwrap();
+        }
+        let merged = coalesce_timeline_outputs(&mut named).unwrap();
+        let mut kept = KVec::new();
+        for &(_, index, point) in named.iter() {
+            if !merged.contains(&index) {
+                kept.push((index, point), GFP_KERNEL).unwrap();
+            }
+        }
+        kept.sort_unstable();
+        (merged, kept)
+    }
+
+    #[test]
+    fn distinct_syncobjs_stay_as_they_are() {
+        let (merged, kept) = merge(&[(1, 5), (2, 5), (3, 0)]);
+        assert!(merged.is_empty());
+        assert_eq!(&kept[..], &[(0, 5), (1, 5), (2, 0)]);
+    }
+
+    #[test]
+    fn rising_points_keep_the_last_and_highest() {
+        // Two batches that each signal one timeline, merged into one submission.
+        let (merged, kept) = merge(&[(1, 5), (2, 9), (1, 6)]);
+        assert_eq!(&merged[..], &[0]);
+        assert_eq!(&kept[..], &[(1, 9), (2, 6)]);
+    }
+
+    #[test]
+    fn falling_points_keep_the_highest_at_the_last() {
+        let (merged, kept) = merge(&[(4, 9), (4, 3), (4, 7)]);
+        assert_eq!(&merged[..], &[0, 1]);
+        assert_eq!(&kept[..], &[(2, 9)]);
+    }
+
+    #[test]
+    fn repeats_of_one_point_leave_one_output() {
+        let mut outputs = KVec::new();
+        for _ in 0..MAX_SYNCS_PER_SUBMISSION {
+            outputs.push((7, 3), GFP_KERNEL).unwrap();
+        }
+        let (merged, kept) = merge(&outputs);
+        assert_eq!(merged.len(), MAX_SYNCS_PER_SUBMISSION - 1);
+        assert!(merged
+            .iter()
+            .enumerate()
+            .all(|(order, &index)| order == index));
+        assert_eq!(&kept[..], &[(MAX_SYNCS_PER_SUBMISSION - 1, 3)]);
     }
 }
 
