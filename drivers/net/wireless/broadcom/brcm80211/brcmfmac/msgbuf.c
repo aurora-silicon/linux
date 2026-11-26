@@ -1526,6 +1526,28 @@ static void brcmf_msgbuf_rxbuf_event_post(struct brcmf_msgbuf *msgbuf)
 }
 
 
+/*
+ * A received frame is at least ETH_HLEN long: eth_type_trans() pulls that
+ * header, and a monitor frame holds a 10-byte 802.11 header and the 4 bytes
+ * brcmf_netif_mon_rx() trims. Drop and count a shorter one, and one the
+ * firmware says is longer than the buffer it came in, which the copy cut.
+ */
+static bool brcmf_msgbuf_rx_len_ok(struct brcmf_if *ifp, struct sk_buff *skb,
+				   u16 len)
+{
+	if (skb->len >= ETH_HLEN && skb->len == len)
+		return true;
+
+	ifp->ndev->stats.rx_errors++;
+	ifp->ndev->stats.rx_length_errors++;
+	if (net_ratelimit())
+		netdev_warn(ifp->ndev, "dropped a received frame of %u bytes\n",
+			    len);
+	brcmu_pkt_buf_free_skb(skb);
+	return false;
+}
+
+
 static void brcmf_msgbuf_process_event(struct brcmf_msgbuf *msgbuf, void *buf)
 {
 	struct brcmf_pub *drvr = msgbuf->drvr;
@@ -1555,6 +1577,8 @@ static void brcmf_msgbuf_process_event(struct brcmf_msgbuf *msgbuf, void *buf)
 			 event->msg.ifidx);
 		goto exit;
 	}
+	if (!brcmf_msgbuf_rx_len_ok(ifp, skb, buflen))
+		return;
 
 	skb->protocol = eth_type_trans(skb, ifp->ndev);
 
@@ -1600,6 +1624,8 @@ brcmf_msgbuf_process_rx_complete(struct brcmf_msgbuf *msgbuf, void *buf)
 			brcmu_pkt_buf_free_skb(skb);
 			return;
 		}
+		if (!brcmf_msgbuf_rx_len_ok(ifp, skb, buflen))
+			return;
 
 		brcmf_netif_mon_rx(ifp, skb);
 		return;
@@ -1612,6 +1638,8 @@ brcmf_msgbuf_process_rx_complete(struct brcmf_msgbuf *msgbuf, void *buf)
 		brcmu_pkt_buf_free_skb(skb);
 		return;
 	}
+	if (!brcmf_msgbuf_rx_len_ok(ifp, skb, buflen))
+		return;
 
 	skb->protocol = brcmf_rx_eth_type_trans(ifp, skb);
 	brcmf_netif_rx(ifp, skb);
