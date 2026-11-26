@@ -118,6 +118,14 @@ const PERIOD_MS_MIN: u32 = 10;
 const PERIOD_BYTES_MAX: usize = 0x10000;
 const BUFFER_BYTES_MAX: usize = 512 * 1024;
 const PERIODS_MIN: u32 = 2;
+/// T6041: the longest host ring the driver allocates, in seconds of the
+/// ring's own format.  The firmware describes four seconds; the limit leaves
+/// four times that, at any rate and channel count.
+const RING_SECONDS_MAX: u64 = 16;
+/// T6041: a ceiling on the ring whatever the format, above four seconds of
+/// the fastest format the PCM offers ([`PERIOD_BYTES_MAX`] per
+/// [`PERIOD_MS_MIN`]).
+const RING_BYTES_MAX: usize = 64 << 20;
 
 /// Warning classes, one message per class and driver instance.
 const WARN_MALFORMED: usize = 0;
@@ -319,11 +327,25 @@ impl StreamFormat {
             return None;
         }
         fmt.alsa_format()?;
+        // The PCM's period range must exist for the format.
+        fmt.period_bytes_min()?;
         Some(fmt)
     }
 
     pub(crate) fn frame_bytes(&self) -> usize {
         (self.channels * self.bytes_per_channel) as usize
+    }
+
+    /// The bytes of the shortest period, [`PERIOD_MS_MIN`] of whole frames;
+    /// `None` when that is no frame at all or more than the longest period
+    /// ([`PERIOD_BYTES_MAX`]), so that the PCM would have no valid period.
+    fn period_bytes_min(&self) -> Option<usize> {
+        let frames = u64::from(self.rate).checked_mul(u64::from(PERIOD_MS_MIN))? / 1000;
+        let frame = self.channels.checked_mul(self.bytes_per_channel)?;
+        let bytes = frames.checked_mul(u64::from(frame))?;
+        usize::try_from(bytes)
+            .ok()
+            .filter(|b| (1..=PERIOD_BYTES_MAX).contains(b))
     }
 
     /// Signed little-endian PCM of the container width.
@@ -404,6 +426,26 @@ pub(crate) enum RingStep {
     /// Take the position without copying (first report, backwards, overrun).
     Rebase,
     Copy(usize),
+}
+
+/// The bytes of a host ring of `frames` frames of `format` that reports its
+/// producer every `quantum` frames; `None` for a geometry the driver does not
+/// take: an empty ring, one longer than [`RING_SECONDS_MAX`] of the format or
+/// larger than [`RING_BYTES_MAX`], or a report interval that is zero or more
+/// than half the ring.
+pub(crate) fn ring_geometry(format: &StreamFormat, frames: u64, quantum: u64) -> Option<usize> {
+    let frames_max = u64::from(format.rate).checked_mul(RING_SECONDS_MAX)?;
+    let frame_bytes = u64::try_from(format.frame_bytes()).ok()?;
+    let bytes = usize::try_from(frames.checked_mul(frame_bytes)?).ok()?;
+    if bytes == 0
+        || frames > frames_max
+        || bytes > RING_BYTES_MAX
+        || quantum == 0
+        || quantum > frames / 2
+    {
+        return None;
+    }
+    Some(bytes)
 }
 
 pub(crate) fn ring_step(copied: Option<u64>, absolute: u64, ring_bytes: usize) -> RingStep {
@@ -587,7 +629,8 @@ impl LpaiCapture {
     /// a node without one yields `Ok(None)`.
     ///
     /// The geometry is read before the binding so the ring has exactly the
-    /// size the firmware describes (frames times frame bytes).
+    /// size the firmware describes (frames times frame bytes); a ring beyond
+    /// [`ring_geometry`]'s limits is refused before anything is allocated.
     pub(crate) fn new_ring(
         bus: &device::Device<device::Bound>,
         dev: &ARef<device::Device>,
@@ -624,14 +667,10 @@ impl LpaiCapture {
         };
         let frames = le_u64(&geo, GEOMETRY_RING_FRAMES).ok_or(EIO)?;
         let quantum = le_u64(&geo, GEOMETRY_REPORT_FRAMES).ok_or(EIO)?;
-        let ring_bytes = frames
-            .checked_mul(format.frame_bytes() as u64)
-            .filter(|b| *b > 0 && *b <= u64::from(u32::MAX))
-            .ok_or(EIO)? as usize;
-        if quantum == 0 || quantum > frames / 2 {
+        let Some(ring_bytes) = ring_geometry(&format, frames, quantum) else {
             dev_err!(dev, "invalid lpai ring geometry: {} frames, {} per report\n", frames, quantum);
             return Err(EIO);
-        }
+        };
         let ring = adata.bound_ring(bus, ring_bytes, &mut |iova, len| {
             let req = AudioSetDeviceProp::new(
                 AUDIO_DEV_IO_BUFFER,
@@ -784,8 +823,9 @@ impl LpaiCapture {
     }
 
     fn hw(&self) -> bindings::snd_pcm_hardware {
-        let frame = self.format.frame_bytes();
-        let period_min = (self.format.rate * PERIOD_MS_MIN / 1000) as usize * frame;
+        // `StreamFormat::new` only yields formats with a minimum period in
+        // 1..=PERIOD_BYTES_MAX.
+        let period_min = self.format.period_bytes_min().unwrap_or(PERIOD_BYTES_MAX);
         bindings::snd_pcm_hardware {
             info: bindings::SNDRV_PCM_INFO_MMAP
                 | bindings::SNDRV_PCM_INFO_MMAP_VALID
@@ -1147,6 +1187,83 @@ mod tests {
         p[12..16].copy_from_slice(&2u32.to_le_bytes());
         p[0..4].copy_from_slice(&0u32.to_le_bytes());
         assert!(StreamFormat::parse(&p).is_none());
+    }
+
+    fn format(rate: u32, channels: u32, bytes: u32) -> [u8; 16] {
+        let mut p = [0u8; 16];
+        p[0..4].copy_from_slice(&1u32.to_le_bytes());
+        p[4..8].copy_from_slice(&rate.to_le_bytes());
+        p[8..12].copy_from_slice(&channels.to_le_bytes());
+        p[12..16].copy_from_slice(&bytes.to_le_bytes());
+        p
+    }
+
+    #[test]
+    fn a_format_without_a_valid_period_range_is_refused() {
+        let f = StreamFormat::parse(&format(16000, 3, 2)).unwrap();
+        assert_eq!(f.period_bytes_min(), Some(160 * 6));
+        let f = StreamFormat::parse_ring(&format(16000, 3, 3)).unwrap();
+        assert_eq!(f.period_bytes_min(), Some(160 * 12));
+        let f = StreamFormat::parse(&format(48000, 8, 4)).unwrap();
+        assert_eq!(f.period_bytes_min(), Some(480 * 32));
+        // The shortest period holds no frame.
+        assert!(StreamFormat::parse(&format(50, 3, 2)).is_none());
+        assert!(StreamFormat::parse_ring(&format(50, 3, 3)).is_none());
+        assert!(StreamFormat::parse(&format(99, 1, 2)).is_none());
+        assert!(StreamFormat::parse(&format(100, 1, 2)).is_some());
+        // The shortest period is longer than the longest.
+        assert!(StreamFormat::parse(&format(u32::MAX, 3, 2)).is_none());
+        assert!(StreamFormat::parse_ring(&format(u32::MAX, 8, 3)).is_none());
+        assert!(StreamFormat::parse(&format(0x2000_0000, 3, 2)).is_none());
+        // Every period range the PCM offers is non-empty and in the buffer.
+        for rate in [100, 8000, 16000, 44100, 48000, 96000, 192000] {
+            for channels in 1..=8 {
+                for bytes in [2, 4] {
+                    if let Some(f) = StreamFormat::parse(&format(rate, channels, bytes)) {
+                        let min = f.period_bytes_min().unwrap();
+                        assert!(min >= f.frame_bytes() && min <= PERIOD_BYTES_MAX);
+                        assert!(BUFFER_BYTES_MAX / min >= PERIODS_MIN as usize);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_ring_geometry_is_bounded_by_its_format() {
+        // T6041: four seconds of 16 kHz, three 4-byte channels, 0.2 s reports.
+        let f = StreamFormat::parse_ring(&format(16000, 3, 4)).unwrap();
+        assert_eq!(ring_geometry(&f, 64000, 3200), Some(768000));
+        assert_eq!(ring_geometry(&f, 64000, 32000), Some(768000));
+        assert_eq!(ring_geometry(&f, 64000, 32001), None);
+        assert_eq!(ring_geometry(&f, 64000, 0), None);
+        assert_eq!(ring_geometry(&f, 0, 0), None);
+        // Longer rings of the same format, up to the time limit.
+        assert_eq!(ring_geometry(&f, 16000 * 16, 3200), Some(16000 * 16 * 12));
+        assert_eq!(ring_geometry(&f, 16000 * 16 + 1, 3200), None);
+        assert_eq!(ring_geometry(&f, 1 << 28, 3200), None);
+        assert_eq!(ring_geometry(&f, u64::from(u32::MAX) / 12, 3200), None);
+        assert_eq!(ring_geometry(&f, u64::MAX, 3200), None);
+        // Four seconds of other channel counts and rates are taken.
+        for rate in [8000, 16000, 24000, 32000, 44100, 48000, 96000, 192000] {
+            for channels in 1..=8 {
+                for bytes in [2, 3, 4] {
+                    if let Some(f) = StreamFormat::parse_ring(&format(rate, channels, bytes)) {
+                        let frames = u64::from(rate) * 4;
+                        assert_eq!(
+                            ring_geometry(&f, frames, frames / 20),
+                            Some(frames as usize * f.frame_bytes())
+                        );
+                    }
+                }
+            }
+        }
+        // The byte ceiling holds near the fastest format the PCM offers.
+        let f = StreamFormat::parse_ring(&format(204800, 8, 4)).unwrap();
+        assert!(ring_geometry(&f, 204800 * 10, 3200).is_some());
+        assert_eq!(ring_geometry(&f, 204800 * 12, 3200), None);
+        // 10 ms of 204900 Hz is 2049 frames, a period above PERIOD_BYTES_MAX.
+        assert!(StreamFormat::parse_ring(&format(204900, 8, 4)).is_none());
     }
 
     fn change(last_frame: u64, cursor: u64, property: u32) -> [u8; CHANGE_REPORT_MIN] {

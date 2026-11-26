@@ -17,28 +17,29 @@ unsafe impl crate::util::AnyBitPattern for uapi::drm_asahi_render_program {}
 unsafe impl crate::util::AnyBitPattern for uapi::drm_asahi_render_program_v2 {}
 
 pub(crate) struct Programs {
-    entries: KVec<uapi::drm_asahi_render_program_v2>,
+    /// As many as userspace sends in one command: charged to it, no contiguous pages.
+    entries: KVVec<uapi::drm_asahi_render_program_v2>,
 }
 impl Programs {
     pub(crate) fn parse(bytes: &[u8]) -> Result<Self> {
         let stride = size_of::<uapi::drm_asahi_render_program>();
         if bytes.is_empty() || bytes.len() % stride != 0 { return Err(EINVAL); }
-        let mut entries = KVec::with_capacity(bytes.len() / stride, GFP_KERNEL)?;
+        let mut entries = KVVec::with_capacity(bytes.len() / stride, GFP_KERNEL_ACCOUNT)?;
         let mut reader = Reader::new(bytes);
         for _ in 0..bytes.len() / stride {
             let entry: uapi::drm_asahi_render_program = reader.read()?;
             Self::validate(&entry)?;
-            entries.push(Self::wrap(entry), GFP_KERNEL)?;
+            entries.push(Self::wrap(entry), GFP_KERNEL_ACCOUNT)?;
         }
         Ok(Self { entries })
     }
 
     pub(crate) fn from_entries(values: &[uapi::drm_asahi_render_program]) -> Result<Self> {
         if values.is_empty() { return Err(EINVAL); }
-        let mut entries = KVec::with_capacity(values.len(), GFP_KERNEL)?;
+        let mut entries = KVVec::with_capacity(values.len(), GFP_KERNEL_ACCOUNT)?;
         for entry in values {
             Self::validate(entry)?;
-            entries.push(Self::wrap(*entry), GFP_KERNEL)?;
+            entries.push(Self::wrap(*entry), GFP_KERNEL_ACCOUNT)?;
         }
         Ok(Self { entries })
     }
@@ -54,7 +55,7 @@ impl Programs {
     pub(crate) fn parse_v2(bytes: &[u8]) -> Result<Self> {
         let stride = size_of::<uapi::drm_asahi_render_program_v2>();
         if bytes.is_empty() || bytes.len() % stride != 0 { return Err(EINVAL); }
-        let mut entries = KVec::with_capacity(bytes.len() / stride, GFP_KERNEL)?;
+        let mut entries = KVVec::with_capacity(bytes.len() / stride, GFP_KERNEL_ACCOUNT)?;
         let mut reader = Reader::new(bytes);
         for _ in 0..bytes.len() / stride {
             let entry: uapi::drm_asahi_render_program_v2 = reader.read()?;
@@ -76,7 +77,7 @@ impl Programs {
                 || (!scratch.enabled() && (entry.scs_layout != 0 || entry.auxiliary_allocation != 0)) {
                 return Err(EINVAL);
             }
-            entries.push(entry, GFP_KERNEL)?;
+            entries.push(entry, GFP_KERNEL_ACCOUNT)?;
         }
         let programs = Self { entries };
         // A render kick has one SCS layout and one intersection-table binding
@@ -304,19 +305,73 @@ impl M5Policy {
 unsafe impl crate::util::AnyBitPattern for uapi::drm_asahi_compute_program {}
 
 pub(crate) struct ComputePrograms {
-    entries: KVec<uapi::drm_asahi_compute_program>,
+    /// As many as userspace sends in one command: charged to it, no contiguous pages.
+    entries: KVVec<uapi::drm_asahi_compute_program>,
 }
 impl ComputePrograms {
     pub(crate) fn parse(bytes: &[u8]) -> Result<Self> {
         let stride = size_of::<uapi::drm_asahi_compute_program>();
         if bytes.is_empty() || bytes.len() % stride != 0 { return Err(EINVAL); }
-        let mut entries = KVec::with_capacity(bytes.len() / stride, GFP_KERNEL)?;
+        let mut entries = KVVec::with_capacity(bytes.len() / stride, GFP_KERNEL_ACCOUNT)?;
         let mut reader = Reader::new(bytes);
         for _ in 0..bytes.len() / stride {
             let entry: uapi::drm_asahi_compute_program = reader.read()?;
             if entry.flags != 0 || entry.threads == 0 { return Err(EINVAL); }
-            entries.push(entry, GFP_KERNEL)?;
+            entries.push(entry, GFP_KERNEL_ACCOUNT)?;
         }
         Ok(Self { entries })
+    }
+}
+
+#[kunit_tests(asahi_g17_render_resources)]
+mod tests {
+    use super::*;
+
+    /// The largest table a command can carry (its header's size is a u16), of zeroed records.
+    fn largest(stride: usize) -> KVVec<u8> {
+        let mut bytes = KVVec::new();
+        bytes
+            .extend_with(u16::MAX as usize / stride * stride, 0, GFP_KERNEL)
+            .unwrap();
+        bytes
+    }
+
+    #[test]
+    fn the_largest_legacy_render_table_is_widened_whole() {
+        let stride = size_of::<uapi::drm_asahi_render_program>();
+        let bytes = largest(stride);
+        let programs = Programs::parse(&bytes).unwrap();
+        assert_eq!(programs.entries.len(), bytes.len() / stride);
+        // Widened to the v2 records: larger than the command that carried them.
+        assert!(
+            programs.entries.len() * size_of::<uapi::drm_asahi_render_program_v2>()
+                > u16::MAX as usize
+        );
+        assert_eq!(Programs::parse(&bytes[..stride + 1]).err(), Some(EINVAL));
+        assert_eq!(Programs::parse(&[]).err(), Some(EINVAL));
+    }
+
+    #[test]
+    fn the_largest_v2_render_table_parses() {
+        let stride = size_of::<uapi::drm_asahi_render_program_v2>();
+        let bytes = largest(stride);
+        assert_eq!(Programs::parse_v2(&bytes).unwrap().entries.len(), bytes.len() / stride);
+        assert_eq!(Programs::parse_v2(&bytes[..stride - 1]).err(), Some(EINVAL));
+    }
+
+    #[test]
+    fn the_largest_compute_table_parses() {
+        let stride = size_of::<uapi::drm_asahi_compute_program>();
+        let mut bytes = largest(stride);
+        let threads = core::mem::offset_of!(uapi::drm_asahi_compute_program, threads);
+        for record in bytes.chunks_exact_mut(stride) {
+            record[threads..threads + 4].copy_from_slice(&1u32.to_le_bytes());
+        }
+        let programs = ComputePrograms::parse(&bytes).unwrap();
+        assert_eq!(programs.entries.len(), bytes.len() / stride);
+        // A program without threads is refused, wherever it is.
+        let last = bytes.len() - stride;
+        bytes[last + threads..last + threads + 4].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(ComputePrograms::parse(&bytes).err(), Some(EINVAL));
     }
 }
