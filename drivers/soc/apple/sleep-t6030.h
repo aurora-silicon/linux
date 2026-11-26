@@ -355,6 +355,20 @@ static void t6030_gp_map(struct apple_sleep *s)
 	}
 }
 
+/*
+ * Read-only: a core's power-down controls as they stand before its last WFI arms them (at probe,
+ * on whichever core probes, and at the dry run, on the boot core).
+ * macOS 27.2's boot core at its commit word (lane A's HV markers, p20-mac-stop-1/2): ACC_OVRD
+ * 0x180010900004020e, CYC_OVRD 0x2000000 (WFI mode 2), S3_5_C15_C6_2 0. XNU ORs the deep-sleep
+ * fields into what it finds, so any other bit that differs here differs at the sleep too.
+ */
+static void t6030_ovrd_report(struct apple_sleep *s, const char *when)
+{
+	dev_info(s->dev, "%s: cpu %#llx ACC_OVRD %#llx CYC_OVRD %#llx ACC_CFG %#llx\n", when,
+		 read_cpuid_mpidr() & MPIDR_HWID_BITMASK, read_sysreg_s(sys_reg(3, 5, 15, 6, 0)),
+		 read_sysreg_s(sys_reg(3, 5, 15, 5, 0)), read_sysreg_s(sys_reg(3, 5, 15, 4, 0)));
+}
+
 static int t6030_sleep_map_regs(struct apple_sleep *s)
 {
 	static const struct {
@@ -424,6 +438,7 @@ static int t6030_sleep_map_regs(struct apple_sleep *s)
 	t6030_gp_map(s);
 	/* Each core's external debug: its ADT coresight-reg, as on T8142 */
 	t8142_ed_map(s->dev);
+	t6030_ovrd_report(s, "probe");
 
 	return apple_sleep_read_wake_sources(s);
 }
@@ -510,6 +525,7 @@ static int t6030_sleep_final_check(struct apple_sleep *s)
 		t6030_dry_ps_on(s);
 		t6030_dry_clean(s);
 		t8142_ed_report(s->dev);
+		t6030_ovrd_report(s, "dry run");
 		return -EAGAIN;
 	}
 	return 0;
