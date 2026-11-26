@@ -78,6 +78,8 @@ bool dcp_has_typec_routes(struct platform_device *pdev);
 unsigned int dcp_typec_nr_ports(void);
 struct device_node *dcp_typec_port_of_node(unsigned int idx);
 bool dcp_typec_port_has_candidate(unsigned int idx, struct platform_device *pdev);
+bool dcp_typec_port_carries_stream(unsigned int idx, struct platform_device *pdev,
+				   unsigned int slot);
 /* Connectors by apple,connector-group; T6050's tunnel-only pairs after the others in each */
 #define DCP_TYPEC_CONNECTOR_GROUPS 4
 unsigned int dcp_typec_nr_passes(void);

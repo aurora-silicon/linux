@@ -4560,6 +4560,35 @@ bool dcp_typec_port_has_candidate(unsigned int idx, struct platform_device *pdev
 	return false;
 }
 
+/*
+ * Can the route of @pdev on Type-C port @idx carry a Thunderbolt DP tunnel's
+ * stream @slot (dcp_fabric_dpin_slot()): a pixel clock for one of its DP INs
+ * and a crossbar control feeding that DP IN to the pipeline?
+ */
+bool dcp_typec_port_carries_stream(unsigned int idx, struct platform_device *pdev,
+				   unsigned int slot)
+{
+	struct apple_dcp_typec_port *port;
+	struct apple_dcp_typec_route *route;
+	unsigned int dpin;
+
+	guard(mutex)(&dcp_typec_fabric_lock);
+
+	port = dcp_typec_port_by_index(idx);
+	if (!port)
+		return false;
+
+	list_for_each_entry(route, &port->routes, port_link) {
+		if (route->dcp->dev != &pdev->dev)
+			continue;
+		for (dpin = slot; dpin < DCP_FABRIC_DPIN_MAX; dpin += 2)
+			if (dcp_typec_tunnel_ctl(route, dpin))
+				return true;
+	}
+
+	return false;
+}
+
 static unsigned int dcp_typec_route_pass(const struct apple_dcp_typec_route *route)
 {
 	return 2 * route->connector_group + (route->core.tunnel_only ? 1 : 0);

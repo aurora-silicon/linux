@@ -228,6 +228,30 @@ static bool dcp_fabric_port_tunneled(const struct dcp_fabric_port *port)
 	return false;
 }
 
+/* The lowest set bit of @mask, 0 for none */
+static u32 dcp_fabric_lowest(u32 mask)
+{
+	return mask & -mask;
+}
+
+/*
+ * Does a dock's second stream on @port leave @pipeline to the first? While
+ * the first stream has no pipeline, the second keeps off the port's lowest
+ * candidate, the one the first takes when both are free, as a compositor
+ * pairs the primary connector first, as long as it is offered one above.
+ * Once the first has a pipeline, wherever that is, the second takes any it
+ * is offered.
+ */
+static bool dcp_fabric_second_yields(const struct dcp_fabric_port *port,
+				     const struct dcp_fabric_pipeline *pipeline)
+{
+	u32 first = dcp_fabric_lowest(port->candidate_crtcs[0]);
+
+	return !port->owner[0] && pipeline->bound &&
+	       BIT(pipeline->crtc_index) == first &&
+	       (port->candidate_crtcs[1] & ~((first << 1) - 1));
+}
+
 static void dcp_fabric_plan_pipeline(struct dcp_fabric_pipeline *pipeline,
 				     const struct dcp_fabric_port *ports,
 				     const struct dcp_fabric_port *arriving,
@@ -261,6 +285,11 @@ static void dcp_fabric_plan_pipeline(struct dcp_fabric_pipeline *pipeline,
 				       (route->tunnel_clock_blocked & BIT(stream))) ||
 			    (!tunnel && route->tunnel_only))
 				continue;
+			if (stream && !port->plan->second_any &&
+			    dcp_fabric_second_yields(port, pipeline)) {
+				port->plan->second_yielded = true;
+				continue;
+			}
 			port->plan->target[stream] = route;
 			return;
 		}
@@ -275,12 +304,15 @@ void dcp_fabric_plan(struct dcp_fabric_pipeline *pipelines,
 	struct dcp_fabric_pipeline *pipeline;
 	bool again;
 
-	for (port = ports; port; port = port->next)
+	for (port = ports; port; port = port->next) {
 		port->plan->dark = false;
+		port->plan->second_any = false;
+	}
 	do {
 		for (port = ports; port; port = port->next) {
 			port->plan->target[0] = NULL;
 			port->plan->target[1] = NULL;
+			port->plan->second_yielded = false;
 		}
 		/* The adapter supplies pipelines in CRTC index order. */
 		for (pipeline = pipelines; pipeline; pipeline = pipeline->next)
@@ -290,6 +322,15 @@ void dcp_fabric_plan(struct dcp_fabric_pipeline *pipelines,
 		again = false;
 		for (port = ports; port; port = port->next) {
 			struct dcp_fabric_route *target = port->plan->target[0];
+
+			/*
+			 * A second stream left the first's pipeline and found
+			 * none above it: it takes the first's after all.
+			 */
+			if (port->plan->second_yielded && !port->plan->target[1]) {
+				port->plan->second_any = true;
+				again = true;
+			}
 
 			if (port == arriving || !target ||
 			    (port->owner[0] && port->owner[0]->tunnel) ||
@@ -387,6 +428,11 @@ dcp_fabric_tunnel_candidate(const struct dcp_fabric_port *port,
 		score = dcp_fabric_score(pipeline, policy);
 		if (policy->dual_stream && !dcp_fabric_dpin_slot(dpin) &&
 		    !pipeline->has_fixed &&
+		    score < UINT_MAX - 100)
+			score += 100;
+		/* A second stream before its first: the first's pipeline last. */
+		if (policy->dual_stream && dcp_fabric_dpin_slot(dpin) &&
+		    dcp_fabric_second_yields(port, pipeline) &&
 		    score < UINT_MAX - 100)
 			score += 100;
 		/* below the hybrid and stream penalties, above the CRTC order (indices < 50) */
@@ -561,31 +607,28 @@ EXPORT_SYMBOL_GPL(dcp_fabric_connector_mask);
 
 /*
  * The CRTCs a port's connector is offered, from the CRTCs of every pipeline
- * that can drive the port (@candidates) and of those among them that drive
- * Type-C only (@typec_only). A primary connector, or any connector without
- * the ordered dual-stream policy, is offered them all. An ordered secondary
- * connector, a dock's second stream, is fixed to one Type-C-only pipeline:
- * compositors read possible_crtcs once and would otherwise pair it with a
- * pipeline its stream can never be routed to. The pairing order gives the
- * primary stream the port's lowest candidate, so the secondary takes the
- * lowest Type-C-only pipeline above it. Where a hybrid comes first, that is
- * the lowest Type-C-only one; where every candidate drives Type-C only (no
- * HDMI pipeline in front), it is the second, or the second stream could
- * never have a pipeline while the first has one. A port with a single
- * Type-C-only pipeline keeps it for the secondary.
+ * that can drive the port (@candidates), of those among them that drive
+ * Type-C only (@typec_only), and of those whose route can carry a DP
+ * tunnel's second stream (@carriers: a pixel clock and a crossbar control
+ * for its DP IN). A primary connector, or any connector without the ordered
+ * dual-stream policy, is offered them all. An ordered secondary connector,
+ * a dock's second stream, is offered every Type-C-only pipeline its stream
+ * can reach: compositors may read possible_crtcs once, so the set must hold
+ * every pipeline the stream can be given, whichever pipeline the first
+ * stream took (dcp_fabric_tunnel_candidate() keeps the streams in order).
+ * Where a hybrid comes first (M2 Pro/Max laptops), that is the one
+ * Type-C-only pipeline as before. A port whose second stream reaches none
+ * keeps the Type-C-only set, which its tunnel is then refused on.
  */
 u32 dcp_fabric_port_crtc_mask(bool secondary, bool ordered_dual, u32 candidates,
-			      u32 typec_only)
+			      u32 typec_only, u32 carriers)
 {
-	u32 spare;
+	u32 mask;
 
 	if (!secondary || !ordered_dual)
 		return candidates;
-	typec_only &= candidates;
-	spare = typec_only & ~(candidates & -candidates);
-	if (!spare)
-		spare = typec_only;
-	return spare & -spare;
+	mask = candidates & typec_only;
+	return mask & carriers ? mask & carriers : mask;
 }
 EXPORT_SYMBOL_GPL(dcp_fabric_port_crtc_mask);
 

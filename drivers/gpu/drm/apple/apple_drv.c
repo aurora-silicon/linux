@@ -1319,7 +1319,7 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 			if (!mask)
 				continue;
 		} else {
-			u32 typec_only = 0;
+			u32 typec_only = 0, carriers = 0;
 
 			if (dcp_typec_port_pass(port_idx, NULL) != pass)
 				continue;
@@ -1329,11 +1329,13 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 				mask |= crtc_mask[i];
 				if (dcp_is_typec_only(dcp[i]))
 					typec_only |= crtc_mask[i];
+				if (dcp_typec_port_carries_stream(port_idx, dcp[i], 1))
+					carriers |= crtc_mask[i];
 			}
-			/* Ordered dual-stream docks reserve a Type-C-only pipe. */
+			/* Ordered dual-stream docks keep the hybrid for the first stream. */
 			mask = dcp_fabric_port_crtc_mask(secondary,
 							 dcp_typec_ordered_dual_stream(),
-							 mask, typec_only);
+							 mask, typec_only, carriers);
 			if (!mask) {
 				drm_warn(drm, "Type-C port %u has no display pipeline\n",
 					 port_idx);
