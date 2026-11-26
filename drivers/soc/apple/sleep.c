@@ -3670,6 +3670,15 @@ out:
  * Where APCIE_SYS_GP is the general-purpose PCIe host's own, ANS and that host answer
  * separately, and neither waives the other. Both words are logged once, whatever the outcome.
  */
+/*
+ * DIAGNOSTIC (T6030 sleep bring-up): an ANS whose driver keeps its domains powered and only
+ * halts its CPU at the commit, warm-restarting it at the wake, as macOS 27.2 does on J516S.
+ * Its link isn't restored after a real sleep: it is never taken down. Off: refused as before.
+ */
+static bool sleep_ans_kept;
+module_param_named(ans_kept, sleep_ans_kept, bool, 0644);
+MODULE_PARM_DESC(ans_kept, "DIAGNOSTIC: let an idled ANS whose domains stay powered through the commit pass the sleep's ANS gate");
+
 static bool apple_sleep_refuse_ans_gp(struct apple_sleep *s, bool idled)
 {
 	const struct apple_sleep_domains *d = &s->soc->ps;
@@ -3677,8 +3686,11 @@ static bool apple_sleep_refuse_ans_gp(struct apple_sleep *s, bool idled)
 
 	dev_info(s->dev, "ANS %#x, APCIE_SYS_GP %#x\n", readl(sleep_power_reg(s, d->ans)),
 		 readl(sleep_power_reg(s, d->apcie_sys_gp)));
-	/* Its driver stopped it, but no restore of its link after a real sleep is verified. */
-	if (idled) {
+	if (idled && READ_ONCE(sleep_ans_kept) && sleep_ps_on(s, d->ans)) {
+		dev_info(s->dev,
+			 "ANS: idled by its driver, its domains kept on through the commit (ans_kept)\n");
+	} else if (idled) {
+		/* Its driver stopped it, but no restore of its link after a real sleep is verified. */
 		dev_err(s->dev, "refused: ANS's link has no verified restore after a real sleep\n");
 		refused = true;
 	} else if (sleep_ps_on(s, d->ans)) {

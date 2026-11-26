@@ -226,6 +226,12 @@ struct apple_nvme_hw {
 	bool cold_reset;
 	/* Firmware-driven suspend has been traced on this controller. */
 	bool sleep_traced;
+	/*
+	 * A pre-M4 controller that takes part in a firmware sleep as the post-M4 ones do
+	 * (macOS 27.2 on T6030): its domains stay powered and its CPU is only halted at the
+	 * commit, then warm-restarted, instead of an RTKit shutdown and a cold reset.
+	 */
+	bool sleep_legacy;
 	/* ... or derived and never run: only with nvme_apple.sleep_untested */
 	bool sleep_untested;
 	/* The last endpoint map reply from that trace */
@@ -1602,6 +1608,12 @@ static int apple_nvme_disable(struct apple_nvme *anv, bool shutdown)
  * All of a sleep's stop that can be taken back. Nothing is in flight or can start, and
  * the controller and its firmware keep running for a refused sleep to come back to.
  */
+/* The controller's ANS stays up through a firmware sleep: every post-M4 one, and sleep_legacy */
+static bool apple_nvme_fw_sleep(const struct apple_nvme *anv)
+{
+	return anv->hw->needs_ioq_registers || anv->hw->sleep_legacy;
+}
+
 static int apple_nvme_sleep_quiesce(struct apple_nvme *anv)
 {
 	guard(mutex)(&anv->disable_lock);
@@ -2034,6 +2046,12 @@ static void apple_nvme_reset_work_impl(struct work_struct *work)
 			if (ret)
 				goto out;
 			goto rtkit_ready;
+		}
+		/* A real sleep took the controller's state, and the warm restart kept RTKit's. */
+		if (anv->hw->sleep_legacy && READ_ONCE(anv->sleep_restarted)) {
+			WRITE_ONCE(anv->sleep_restarted, false);
+			if (!(readl(anv->mmio_nvme + NVME_REG_CC) & NVME_CC_ENABLE))
+				goto rtkit_ready;
 		}
 		/* reset the controller if it is enabled */
 		if (anv->ctrl.ctrl_config & NVME_CC_ENABLE)
@@ -3019,6 +3037,9 @@ static int apple_nvme_sleep_last_stop(void *data)
 		dev_dbg(anv->dev, "ANS idle, acknowledged in about %u us, CC %#x CSTS %#x\n",
 			us, cc, csts);
 	apple_rtkit_mailbox_recv_off(anv->rtk);
+	/* macOS reads the mailbox's first word once after closing its receive (T6030). */
+	if (anv->hw->sleep_legacy)
+		apple_rtkit_mailbox_status(anv->rtk);
 
 	return ret ? 1 : 0;
 }
@@ -3193,7 +3214,7 @@ static int apple_nvme_resume_early(struct device *dev)
 	    READ_ONCE(anv->m5.phase) != APPLE_M5_ANS_LIVE)
 		return apple_nvme_m5_resume_early(anv);
 
-	if (!anv->hw->needs_ioq_registers || !anv->suspended || !anv->sleep_idled)
+	if (!apple_nvme_fw_sleep(anv) || !anv->suspended || !anv->sleep_idled)
 		return 0;
 	anv->sleep_idled = false;
 	if (anv->sleep_stop)
@@ -3256,7 +3277,7 @@ static int apple_nvme_resume(struct device *dev)
 	    READ_ONCE(anv->m5.phase) != APPLE_M5_ANS_LIVE)
 		return apple_nvme_m5_resume(anv);
 
-	if (anv->hw->needs_ioq_registers) {
+	if (apple_nvme_fw_sleep(anv)) {
 		if (apple_nvme_m5_retained(anv))
 			return -EIO;
 		if (!anv->suspended)
@@ -3391,7 +3412,7 @@ static int apple_nvme_suspend(struct device *dev)
 	    pm_suspend_via_firmware())
 		return apple_nvme_m5_prepare(anv);
 
-	if (anv->hw->needs_ioq_registers) {
+	if (apple_nvme_fw_sleep(anv)) {
 		/* A sleep right after a wake, as from a dark wake: let that reset finish first. */
 		flush_work(&anv->ctrl.reset_work);
 		anv->sleep_stop = apple_nvme_sleep_wanted(anv);
@@ -3426,9 +3447,10 @@ static int apple_nvme_suspend(struct device *dev)
 	}
 	/*
 	 * Only the NVMe controller was disabled. Its owned RTKit session stays
-	 * live, so resume rebuilds queues without clearing CPU_CONTROL.RUN.
+	 * live, so resume rebuilds queues without clearing CPU_CONTROL.RUN. A
+	 * sleep_legacy controller does the same for a firmware sleep only.
 	 */
-	if (anv->hw->needs_ioq_registers) {
+	if (anv->hw->needs_ioq_registers || (anv->hw->sleep_legacy && anv->sleep_stop)) {
 		cancel_work_sync(&anv->recovery_work);
 		apple_nvme_keep_link_powered(anv);
 		if (anv->sleep_failed) {
@@ -3480,6 +3502,21 @@ static const struct apple_nvme_hw apple_nvme_t8103_hw = {
 	.has_lsq_nvmmu = true,
 	.has_queue_count = true,
 	.max_queue_depth = 64,
+};
+
+/*
+ * T6030 (M3 Pro/Max): the T8103 controller, in a firmware sleep as macOS 27.2 runs it on
+ * J516S: the shutdown notification (CC.SHN 0xc000), ANS and its storage PCIe domains left
+ * powered, the CPU halted at the commit after the idle pair, and a warm restart at the wake.
+ */
+static const struct apple_nvme_hw apple_nvme_t6030_hw = {
+	.has_lsq_nvmmu = true,
+	.has_queue_count = true,
+	.max_queue_depth = 64,
+	.sleep_traced = true,
+	.sleep_legacy = true,
+	.sleep_flush_max_nsid = 1,
+	.sleep_shn = NVME_CC_SHN_MASK,
 };
 
 /*
@@ -3589,6 +3626,7 @@ static const struct apple_nvme_hw apple_nvme_t8152_hw = {
 };
 
 static const struct of_device_id apple_nvme_of_match[] = {
+	{ .compatible = "apple,t6030-nvme-ans3", .data = &apple_nvme_t6030_hw },
 	{ .compatible = "apple,t6041-nvme-ans2", .data = &apple_nvme_t6040_hw },
 	{ .compatible = "apple,t6050-nvme-ans2", .data = &apple_nvme_t6050_hw },
 	{ .compatible = "apple,t8015-nvme-ans2", .data = &apple_nvme_t8015_hw },
