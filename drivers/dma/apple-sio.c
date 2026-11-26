@@ -2313,6 +2313,10 @@ static __maybe_unused int sio_suspend_late(struct device *dev)
 		return -EBUSY;
 	}
 
+	/* A dry run ends before the commit: the firmware would be stopped for nothing. */
+	if (apple_sleep_dry_run())
+		return 0;
+
 	ret = apple_rtkit_sleep_stop(sio->rtk, sio->base + REG_CPU_CONTROL);
 	if (ret) {
 		dev_err(dev, "firmware did not stop for sleep: %d\n", ret);
