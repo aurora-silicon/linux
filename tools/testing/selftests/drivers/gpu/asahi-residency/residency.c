@@ -20,8 +20,9 @@
  * kept_objects_stay_purgeable and requests_serialize_with_reclaim, which
  * write to the memory.reclaim file of the root memory cgroup.
  *
- * ASAHI_RESIDENCY_DROP_CACHES=1 runs kept_objects_go_under_urgent_pressure,
- * which writes 2 to /proc/sys/vm/drop_caches. That runs every shrinker of
+ * ASAHI_RESIDENCY_DROP_CACHES=1 runs reclaim_revokes_cpu_faulted_pages and
+ * kept_objects_go_under_urgent_pressure, which write 2 to
+ * /proc/sys/vm/drop_caches. That runs every shrinker of
  * the system at the last reclaim priority: it drops the dentry and inode
  * caches, with the page cache of the files they stood for, and the idle
  * memory of every GPU client.
@@ -196,6 +197,22 @@ static long long rss_shmem(void)
 		return -1;
 	while (fgets(line, sizeof(line), f))
 		if (sscanf(line, "RssShmem: %lld kB", &kb) == 1)
+			break;
+	fclose(f);
+	return kb < 0 ? -1 : kb << 10;
+}
+
+/* Unevictable in bytes: the memory on the system's unevictable LRU lists. */
+static long long unevictable(void)
+{
+	char line[256];
+	long long kb = -1;
+	FILE *f = fopen("/proc/meminfo", "r");
+
+	if (!f)
+		return -1;
+	while (fgets(line, sizeof(line), f))
+		if (sscanf(line, "Unevictable: %lld kB", &kb) == 1)
 			break;
 	fclose(f);
 	return kb < 0 ? -1 : kb << 10;
@@ -1324,6 +1341,39 @@ TEST_F(objects, foreign_imports_hold_the_backing)
 }
 
 /*
+ * The CPU mappings of a VM-private object can be revoked: without a device
+ * mapping that holds all of its pages, each CPU fault holds one page. The
+ * object's client and creating process are charged for those pages, until
+ * the last mapping goes.
+ */
+TEST_F(asahi, cpu_faults_charge_their_pages)
+{
+	const uint64_t size = 64 * PAGE;
+	struct drm_asahi_gem_create bo = {
+		.size = size, .flags = DRM_ASAHI_GEM_VM_PRIVATE, .vm_id = self->vm,
+	};
+	long long resident0 = client_resident(self->fd), rss0 = rss_shmem();
+	char *map;
+
+	ASSERT_GE(resident0, 0);
+	ASSERT_GE(rss0, 0);
+	ASSERT_EQ(0, ioc(self->fd, DRM_IOCTL_ASAHI_GEM_CREATE, &bo));
+	map = map_object(self->fd, bo.handle, size);
+	ASSERT_NE(MAP_FAILED, map);
+	EXPECT_EQ(resident0, client_resident(self->fd));
+	map[0] = 1;
+	map[8 * PAGE] = 2;
+	map[8 * PAGE + 1] = 3;
+	map[63 * PAGE] = 4;
+	EXPECT_EQ(resident0 + 3 * (long long)PAGE, client_resident(self->fd));
+	EXPECT_EQ(rss0 + 3 * (long long)PAGE, rss_shmem());
+	ASSERT_EQ(0, munmap(map, size));
+	EXPECT_EQ(resident0, client_resident(self->fd));
+	EXPECT_EQ(rss0, rss_shmem());
+	close_handle(self->fd, bo.handle);
+}
+
+/*
  * Of two idle objects, reclaim releases the one that is not kept first, at
  * any priority. Reclaim that does not come to the kept objects (see the top
  * of this file for how the case knows) leaves the kept one resident; once
@@ -1563,6 +1613,56 @@ TEST_F_TIMEOUT(asahi, requests_serialize_with_reclaim, 180)
 	EXPECT_EQ(kept0, gpu_memory_field("user_kept"));
 	close_handle(self->fd, kept);
 	close_handle(self->fd, control);
+}
+
+/*
+ * Reclaim releases the backing of an idle object, which leaves the
+ * unevictable LRU: the system counts it there, which moves by more than
+ * the per-CPU counter drift for an object this size. CPU faults in the
+ * object then hold their pages one at a time, until reclaim revokes them
+ * as well. The contents stay and fault back in.
+ */
+TEST_F_TIMEOUT(asahi, reclaim_revokes_cpu_faulted_pages, 60)
+{
+	const uint64_t size = 16384 * PAGE;
+	const char *run = getenv("ASAHI_RESIDENCY_DROP_CACHES");
+	long long resident0 = client_resident(self->fd), held;
+	uint32_t bo;
+	char *map;
+
+	if (!run || strcmp(run, "1"))
+		SKIP(return, "set ASAHI_RESIDENCY_DROP_CACHES=1 to drop the system's caches");
+	if (geteuid())
+		SKIP(return, "dropping caches needs root");
+	if (mem_available() < (long long)(4 * size))
+		SKIP(return, "not enough available memory for the test object");
+	ASSERT_GE(resident0, 0);
+	bo = bound_object(self->fd, self->vm, &self->va, self->va_end, size);
+	ASSERT_NE(0, bo);
+	EXPECT_EQ(resident0 + (long long)size, client_resident(self->fd));
+	map = map_object(self->fd, bo, size);
+	ASSERT_NE(MAP_FAILED, map);
+	map[0] = 0x5a;
+
+	sleep(IDLE_SECONDS);
+	held = unevictable();
+	ASSERT_GE(held, (long long)size / 2);
+	ASSERT_EQ(0, write_string("/proc/sys/vm/drop_caches", "2"));
+	ASSERT_EQ(resident0, client_resident(self->fd));
+	EXPECT_LE(unevictable(), held - (long long)size / 2);
+	EXPECT_EQ(0x5a, map[0]);
+	map[8 * PAGE] = 0x3c;
+	EXPECT_EQ(resident0 + 2 * (long long)PAGE, client_resident(self->fd));
+
+	sleep(IDLE_SECONDS);
+	ASSERT_EQ(0, write_string("/proc/sys/vm/drop_caches", "2"));
+	EXPECT_EQ(resident0, client_resident(self->fd));
+	EXPECT_EQ(0x5a, map[0]);
+	EXPECT_EQ(0x3c, map[8 * PAGE]);
+	EXPECT_EQ(resident0 + 2 * (long long)PAGE, client_resident(self->fd));
+	ASSERT_EQ(0, munmap(map, size));
+	EXPECT_EQ(resident0, client_resident(self->fd));
+	close_handle(self->fd, bo);
 }
 
 /*
