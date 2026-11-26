@@ -1704,13 +1704,27 @@ static void dcpaud_build_eld(struct dcp_audio *dcpaud, u8 *eld)
 		DIV_ROUND_UP(drm_eld_calc_baseline_block_size(eld), 4);
 }
 
+/*
+ * The card, while dcpaud_comp_unbind() has not taken it. The reference keeps it
+ * with its controls, jack and PCM should it be freed meanwhile; ALSA ignores
+ * what is reported to a disconnected card. Called with data_lock held.
+ */
+static struct snd_card *dcpaud_card_get(struct dcp_audio *dcpaud)
+{
+	lockdep_assert_held(&dcpaud->data_lock);
+	if (dcpaud->card)
+		get_device(&dcpaud->card->card_dev);
+	return dcpaud->card;
+}
+
 /* expects to be called with data_lock locked and unlocks it */
 static void dcpaud_report_hotplug(struct dcp_audio *dcpaud, bool connected,
 				  const u8 *eld)
 {
+	struct snd_card *card __free(snd_card_unref) = dcpaud_card_get(dcpaud);
 	struct snd_pcm_substream *substream = dcpaud->substream;
 
-	if (!dcpaud->card) {
+	if (!card) {
 		mutex_unlock(&dcpaud->data_lock);
 		return;
 	}
@@ -1726,8 +1740,7 @@ static void dcpaud_report_hotplug(struct dcp_audio *dcpaud, bool connected,
 			memcpy(dcpaud->eld, eld, DCPAUD_ELD_SIZE);
 		mutex_unlock(&dcpaud->data_lock);
 		if (changed)
-			snd_ctl_notify(dcpaud->card, SNDRV_CTL_EVENT_MASK_VALUE,
-				       &dcpaud->eld_ctl->id);
+			snd_ctl_notify(card, SNDRV_CTL_EVENT_MASK_VALUE, &dcpaud->eld_ctl->id);
 		return;
 	}
 
@@ -1743,7 +1756,7 @@ static void dcpaud_report_hotplug(struct dcp_audio *dcpaud, bool connected,
 	mutex_unlock(&dcpaud->data_lock);
 
 	/* The name first: the jack makes the output available. */
-	snd_ctl_notify(dcpaud->card, SNDRV_CTL_EVENT_MASK_VALUE, &dcpaud->eld_ctl->id);
+	snd_ctl_notify(card, SNDRV_CTL_EVENT_MASK_VALUE, &dcpaud->eld_ctl->id);
 	snd_jack_report(dcpaud->jack, connected ? SND_JACK_AVOUT : 0);
 
 	if (!connected) {
@@ -1960,11 +1973,14 @@ static bool dcpaud_refresh_eld_from_edid(struct dcp_audio *dcpaud)
 void dcpaud_refresh_eld(struct platform_device *pdev)
 {
 	struct dcp_audio *dcpaud = platform_get_drvdata(pdev);
+	struct snd_card *card __free(snd_card_unref) = NULL;
 
-	if (!dcpaud || !dcpaud->dcp_dev || !dcpaud->card)
+	if (!dcpaud || !dcpaud->dcp_dev)
 		return;
-	if (dcpaud_refresh_eld_from_edid(dcpaud))
-		snd_ctl_notify(dcpaud->card, SNDRV_CTL_EVENT_MASK_VALUE, &dcpaud->eld_ctl->id);
+	scoped_guard(mutex, &dcpaud->data_lock)
+		card = dcpaud_card_get(dcpaud);
+	if (card && dcpaud_refresh_eld_from_edid(dcpaud))
+		snd_ctl_notify(card, SNDRV_CTL_EVENT_MASK_VALUE, &dcpaud->eld_ctl->id);
 }
 
 void dcpaud_disconnect(struct platform_device *pdev)
@@ -1977,9 +1993,15 @@ void dcpaud_disconnect(struct platform_device *pdev)
 
 	dcpaud_report_hotplug(dcpaud, false, NULL);
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
-	/* The service may go without a release, and a held link with it. */
-	if (dcpaud->native_link)
-		schedule_work(&dcpaud->stale_work);
+	/*
+	 * The service may go without a release, and a held link with it. Not
+	 * once dcpaud_comp_unbind() took the card: it cancels this and ends the
+	 * link itself.
+	 */
+	scoped_guard(mutex, &dcpaud->data_lock) {
+		if (dcpaud->native_link && dcpaud->card)
+			schedule_work(&dcpaud->stale_work);
+	}
 #endif
 }
 
@@ -2074,9 +2096,21 @@ static void dcpaud_comp_unbind(struct device *dev, struct device *main,
 			       void *data)
 {
 	struct dcp_audio *dcpaud = dev_get_drvdata(dev);
+	struct snd_card *card;
 
+	/*
+	 * The DCP unbinds after its audio device: what it still reports must
+	 * not reach the card. The sink goes with it, so that a card made again
+	 * gets its jack and ELD from the next report.
+	 */
+	scoped_guard(mutex, &dcpaud->data_lock) {
+		card = dcpaud->card;
+		dcpaud->card = NULL;
+		dcpaud->connected = false;
+		memset(dcpaud->eld, 0, DCPAUD_ELD_SIZE);
+	}
 	/* snd_card_free_when_closed() checks for NULL */
-	snd_card_free_when_closed(dcpaud->card);
+	snd_card_free_when_closed(card);
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
 	if (dcpaud->native_link) {
@@ -2287,6 +2321,7 @@ void dcp_audio_unregister(void)
 }
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST)
+#include "audio-card-test.c"
 #include "audio-no-sio-test.c"
 #include "audio-legacy-test.c"
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
