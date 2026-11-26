@@ -62,11 +62,43 @@ static void dchid_pm2_power_off_test(struct kunit *test)
 	KUNIT_EXPECT_MEMEQ(test, cmd, expected, sizeof(expected));
 }
 
+static void dchid_pm1_fallback_test(struct kunit *test)
+{
+	KUNIT_EXPECT_TRUE(test,
+			  dchid_pm1_needs_pm2_fallback(-EIO,
+						       DCHID_ERR_BAD_ARGUMENT,
+						       false, false, true));
+	KUNIT_EXPECT_FALSE(test,
+			   dchid_pm1_needs_pm2_fallback(-EIO,
+							DCHID_ERR_BAD_ARGUMENT,
+							true, false, true));
+	KUNIT_EXPECT_FALSE(test,
+			   dchid_pm1_needs_pm2_fallback(-EIO,
+							DCHID_ERR_BAD_ARGUMENT,
+							false, true, true));
+	KUNIT_EXPECT_FALSE(test,
+			   dchid_pm1_needs_pm2_fallback(-EIO,
+							DCHID_ERR_BAD_ARGUMENT,
+							false, false, false));
+	KUNIT_EXPECT_FALSE(test,
+			   dchid_pm1_needs_pm2_fallback(-ETIMEDOUT,
+							DCHID_ERR_BAD_ARGUMENT,
+							false, false, true));
+	KUNIT_EXPECT_FALSE(test,
+			   dchid_pm1_needs_pm2_fallback(-EIO, 0xe00002bc,
+							false, false, true));
+	KUNIT_EXPECT_FALSE(test,
+			   dchid_pm1_needs_pm2_fallback(0,
+							DCHID_ERR_BAD_ARGUMENT,
+							false, false, true));
+}
+
 static struct kunit_case dchid_protocol_test_cases[] = {
 	KUNIT_CASE(dchid_pm1_command_test),
 	KUNIT_CASE(dchid_pm2_will_change_test),
 	KUNIT_CASE(dchid_pm2_has_changed_test),
 	KUNIT_CASE(dchid_pm2_power_off_test),
+	KUNIT_CASE(dchid_pm1_fallback_test),
 	{}
 };
 

@@ -551,9 +551,10 @@ static void __cpuinfo_store_cpu(struct cpuinfo_arm64 *info)
 	info->reg_id_aa64isar2 = read_cpuid(ID_AA64ISAR2_EL1);
 	/*
 	 * Timed waits bypass the register-saving idle path on Apple M4 and
-	 * later cores. Record WFxT as absent on every CPU, so the sanitised
-	 * register hides it from the kernel, KVM guests and userspace
-	 * (HWCAP2_WFXT) and a boot argument cannot bring it back.
+	 * later cores, and lose the same state there (see
+	 * midr_is_apple_m4_or_later()). Record WFxT as absent on every CPU,
+	 * so the sanitised register hides it from the kernel, KVM guests and
+	 * userspace (HWCAP2_WFXT) and a boot argument cannot bring it back.
 	 */
 	if (IS_ENABLED(CONFIG_ARCH_APPLE) &&
 	    midr_is_apple_m4_or_later(info->reg_midr))
