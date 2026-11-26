@@ -920,6 +920,70 @@ int apple_smc_write_noirq(struct apple_smc *smc, smc_key key, const void *buf, s
 }
 EXPORT_SYMBOL_GPL(apple_smc_write_noirq);
 
+int apple_smc_warm_reset_parse(struct device_node *np, struct apple_smc_warm_reset *wr)
+{
+	struct of_phandle_args fn;
+	int count, i;
+
+	memset(wr, 0, sizeof(*wr));
+	if (!np || of_parse_phandle_with_fixed_args(np, "apple,function-warm-reset", 2, 0, &fn))
+		return -ENODEV;
+	wr->smc = of_find_device_by_node(fn.np);
+	of_node_put(fn.np);
+	if (!wr->smc)
+		return -ENODEV;
+	count = of_property_count_u32_elems(np, "apple,warm-reset-writes");
+	if (count < 2 || count % 2 || count > ARRAY_SIZE(wr->writes) ||
+	    of_property_read_u32_array(np, "apple,warm-reset-writes", wr->writes, count))
+		goto bad;
+	for (i = 1; i < count; i += 2)
+		if (wr->writes[i] > 100 * USEC_PER_MSEC)
+			goto bad;
+	wr->key = fn.args[0];
+	wr->count = count / 2;
+	return 0;
+bad:
+	apple_smc_warm_reset_put(wr);
+	return -EINVAL;
+}
+EXPORT_SYMBOL_GPL(apple_smc_warm_reset_parse);
+
+void apple_smc_warm_reset_put(struct apple_smc_warm_reset *wr)
+{
+	if (wr->smc)
+		put_device(&wr->smc->dev);
+	memset(wr, 0, sizeof(*wr));
+}
+EXPORT_SYMBOL_GPL(apple_smc_warm_reset_put);
+
+int apple_smc_warm_reset(const struct apple_smc_warm_reset *wr, bool noirq)
+{
+	struct apple_smc *smc = wr->smc ? platform_get_drvdata(wr->smc) : NULL;
+	unsigned int i;
+	int ret = 0;
+
+	if (!smc || !wr->count)
+		return -ENODEV;
+	for (i = 0; i < wr->count && !ret; i++) {
+		__be32 value = cpu_to_be32(wr->writes[2 * i]);
+		u32 wait = wr->writes[2 * i + 1];
+
+		if (noirq) {
+			ret = apple_smc_write_noirq(smc, wr->key, &value, sizeof(value));
+			if (!ret) {
+				mdelay(wait / USEC_PER_MSEC);
+				udelay(wait % USEC_PER_MSEC);
+			}
+		} else {
+			ret = apple_smc_write(smc, wr->key, &value, sizeof(value));
+			if (!ret)
+				fsleep(wait);
+		}
+	}
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_smc_warm_reset);
+
 static void apple_smc_write_mbse(struct apple_smc *smc, smc_key value)
 {
 	int ret;
