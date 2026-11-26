@@ -104,8 +104,10 @@ pub(crate) struct ComputeSlot {
     pub(crate) aux: Arc<FwObject>,
     /// Freelist entries of the unit's UMA pool, seeded once ([`init_uma_pool`]).
     pub(crate) seeds: u32,
+    /// Hardware UMA slot ID (`COMPUTE_UMA_SLOT..RENDER_UMA_SLOT`) encoded in the descriptor.
+    pub(crate) uma_slot: u32,
     /// VM-free firmware lease keeping this unit's `descriptor` and `counter` mapped in context-0
-    /// UAT until a later compute retirement overwrites firmware `uma_mgr_table[1 + k]`.
+    /// UAT until a later compute retirement overwrites firmware `uma_mgr_table[uma_slot]`.
     uma_lease: Arc<FwLease>,
 }
 
@@ -122,21 +124,21 @@ pub(crate) enum Placement {
 }
 
 impl Placement {
-    fn pool(self, k: u64) -> u64 {
+    pub(crate) fn pool(self, k: u64) -> u64 {
         match self {
             Placement::Base => client::compute_pool(k),
             Placement::Scs { .. } => client::scs_compute_pool(k),
         }
     }
     /// The base of the unit's list, preempt, auxiliary and context records.
-    fn state(self, k: u64) -> u64 {
+    pub(crate) fn state(self, k: u64) -> u64 {
         match self {
             Placement::Base => client::compute_state(k),
             Placement::Scs { .. } => client::scs_compute_records(k),
         }
     }
     /// The unit's freelist: a base unit's at its state, an SCS unit's right after its pool.
-    fn freelist(self, k: u64) -> u64 {
+    pub(crate) fn freelist(self, k: u64) -> u64 {
         match self {
             Placement::Base => client::compute_state(k),
             Placement::Scs { .. } => self.pool(k) + self.pool_bytes() as u64,
@@ -298,6 +300,7 @@ impl ComputeSlot {
                 false,
             )?,
             seeds: placement.seeds(),
+            uma_slot: engine::COMPUTE_UMA_SLOT + hw_slot,
             uma_lease,
         };
         init_uma_pool(
@@ -310,7 +313,7 @@ impl ComputeSlot {
             0,
             &buffer::compute_uma_manager_image(
                 unit.work.va,
-                engine::COMPUTE_UMA_SLOT + hw_slot,
+                unit.uma_slot,
                 unit.pool_state.gva.ok_or(EINVAL)?,
                 unit.page_list.gva.ok_or(EINVAL)?,
                 unit.counter.va,
@@ -319,6 +322,71 @@ impl ComputeSlot {
             ),
         )?;
         Ok(unit)
+    }
+
+    /// Unit `k` sharing its VM's single compute UMA descriptor, counter, and 32 MiB pool.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Constructs one compute unit around a VM-shared UMA descriptor and pool."
+    )]
+    pub(crate) fn new_shared_in(
+        o: &mut Objects,
+        k: u64,
+        uma_slot: u32,
+        descriptor: Arc<FwObject>,
+        pool: Arc<FwObject>,
+        pool_state: Arc<FwObject>,
+        page_list: Arc<FwObject>,
+        counter: Arc<FwObject>,
+        uma_lease: Arc<FwLease>,
+        seeds: u32,
+        cmds: &UnitCmds,
+    ) -> Result<Self> {
+        let sh = Class::Shared;
+        let state = Placement::Base.state(k);
+        Ok(Self {
+            its: alloc(o, 16, sh, None, 0, false)?,
+            preempt: alloc(
+                o,
+                0x4000,
+                sh,
+                Client::nc(state + client::COMPUTE_PREEMPT_OFF),
+                0,
+                false,
+            )?,
+            work: cmds.work.clone(),
+            seq: cmds.seq.clone(),
+            barrier: cmds.barrier.clone(),
+            descriptor,
+            pool,
+            pool_state,
+            page_list,
+            counter,
+            context_store: alloc(
+                o,
+                0x40000,
+                sh,
+                Client::nc(state + client::COMPUTE_CONTEXT_OFF),
+                0,
+                false,
+            )?,
+            aux: alloc(
+                o,
+                0x4000,
+                sh,
+                Client::nc(state + client::COMPUTE_AUX_OFF),
+                0,
+                false,
+            )?,
+            seeds,
+            uma_slot,
+            uma_lease,
+        })
+    }
+
+    /// Zero-based hardware compute UMA slot index (`0..COMPUTE_UMA_SLOTS`).
+    pub(crate) fn uma_slot_idx(&self) -> usize {
+        self.uma_slot.saturating_sub(engine::COMPUTE_UMA_SLOT) as usize
     }
 
     /// VM-free firmware lease keeping this unit's `descriptor` and `counter` mapped in context-0
@@ -727,11 +795,14 @@ pub(crate) struct ComputeOwners {
     /// descriptor when a later owner displaces it, after its VM's client closed.
     arena: [Option<Arc<super::resources::ComputeArena>>; sizes::COMPUTE_UNITS],
     pending_arena: [Option<Arc<super::resources::ComputeArena>>; sizes::COMPUTE_UNITS],
-    /// VM-free firmware leases keeping each hardware slot's `work` + `counter` mapped in
-    /// context-0 UAT across closed-VM reclaim until a later compute retirement overwrites
-    /// firmware `uma_mgr_table[1 + k]`.
-    retained_uma: [Option<Arc<FwLease>>; sizes::COMPUTE_UNITS],
+    /// VM-free firmware leases keeping each hardware compute UMA slot's `descriptor` + `counter`
+    /// mapped in context-0 UAT across closed-VM reclaim until a later compute retirement
+    /// overwrites firmware `uma_mgr_table[COMPUTE_UMA_SLOT + slot]`.
+    retained_uma: [Option<Arc<FwLease>>; sizes::COMPUTE_UMA_SLOTS],
     pending_uma: [Option<Arc<FwLease>>; sizes::COMPUTE_UNITS],
+    pending_uma_slot: [usize; sizes::COMPUTE_UNITS],
+    /// Bitmask of permanently quarantined hardware compute UMA slots (`0..COMPUTE_UMA_SLOTS`).
+    uma_quarantined: u32,
     /// Force a full scrub on next claim (first use, cancel, error, or firmware recovery).
     scrub_full: [bool; sizes::COMPUTE_UNITS],
     /// Whether the most recent claim of each compute unit required a full scrub/work write.
@@ -1008,8 +1079,10 @@ impl Slots {
                     pending_owner: [const { None }; sizes::COMPUTE_UNITS],
                     arena: [const { None }; sizes::COMPUTE_UNITS],
                     pending_arena: [const { None }; sizes::COMPUTE_UNITS],
-                    retained_uma: [const { None }; sizes::COMPUTE_UNITS],
+                    retained_uma: [const { None }; sizes::COMPUTE_UMA_SLOTS],
                     pending_uma: [const { None }; sizes::COMPUTE_UNITS],
+                    pending_uma_slot: [0; sizes::COMPUTE_UNITS],
+                    uma_quarantined: 0,
                     scrub_full: [true; sizes::COMPUTE_UNITS],
                     last_full: [true; sizes::COMPUTE_UNITS],
                 }),
@@ -1054,6 +1127,15 @@ impl Slots {
         self.compute
             .lifetime
             .exhausted_within(super::params::compute_units())
+            || self.compute.uma_quarantined == u32::MAX
+    }
+    /// Bitmask of permanently quarantined hardware compute UMA slots (`0..COMPUTE_UMA_SLOTS`).
+    pub(crate) fn quarantined_compute_uma_mask(&self) -> u32 {
+        self.compute.uma_quarantined
+    }
+    /// Whether any hardware compute UMA slot in `uma_mask` has been permanently quarantined.
+    pub(crate) fn compute_uma_quarantined(&self, uma_mask: u32) -> bool {
+        (self.compute.uma_quarantined & uma_mask) != 0
     }
     /// Whether none of the first `n` compute units (a VM's own) can ever be claimed again.
     #[allow(dead_code)]
@@ -1873,7 +1955,13 @@ impl Slots {
             .and_then(|old| Self::vm_retarget(k, old, vm));
         self.compute.pending_owner[k] = Some(vm.clone());
         self.compute.pending_arena[k] = resources.compute_arena(k);
-        self.compute.pending_uma[k] = resources.compute_unit(k).ok().map(ComputeSlot::uma_lease);
+        if let Ok(unit) = resources.compute_unit(k) {
+            self.compute.pending_uma[k] = Some(unit.uma_lease());
+            self.compute.pending_uma_slot[k] = unit.uma_slot_idx();
+        } else {
+            self.compute.pending_uma[k] = None;
+            self.compute.pending_uma_slot[k] = k;
+        }
         Ok(())
     }
 
@@ -1996,10 +2084,13 @@ impl Slots {
                 *cell = resources.compute_arena(k as usize);
             }
             if let Some(cell) = self.compute.pending_uma.get_mut(k as usize) {
-                *cell = resources
-                    .compute_unit(k as usize)
-                    .ok()
-                    .map(ComputeSlot::uma_lease);
+                if let Ok(unit) = resources.compute_unit(k as usize) {
+                    *cell = Some(unit.uma_lease());
+                    self.compute.pending_uma_slot[k as usize] = unit.uma_slot_idx();
+                } else {
+                    *cell = None;
+                    self.compute.pending_uma_slot[k as usize] = k as usize;
+                }
             }
         }
         let mut mask = f.pass_mask & PASS_MASK;
@@ -2080,7 +2171,10 @@ impl Slots {
             self.compute.owner[k as usize] = self.compute.pending_owner[k as usize].take();
             self.compute.arena[k as usize] = self.compute.pending_arena[k as usize].take();
             if let Some(lease) = self.compute.pending_uma[k as usize].take() {
-                self.compute.retained_uma[k as usize] = Some(lease);
+                let slot = self.compute.pending_uma_slot[k as usize];
+                if slot < sizes::COMPUTE_UMA_SLOTS {
+                    self.compute.retained_uma[slot] = Some(lease);
+                }
             }
             if clean_scrub {
                 self.compute.scrub_full[k as usize] = false;
@@ -2107,6 +2201,10 @@ impl Slots {
     pub(crate) fn quarantine(&mut self, f: &mut Claims) {
         for &k in &f.slot[..f.slot_count as usize] {
             self.compute.lifetime.quarantine(k as usize);
+            let slot = self.compute.pending_uma_slot[k as usize];
+            if slot < sizes::COMPUTE_UMA_SLOTS {
+                self.compute.uma_quarantined |= 1u32 << slot;
+            }
             self.compute.pending_retarget[k as usize] = None;
             self.compute.scrub_full[k as usize] = true;
         }

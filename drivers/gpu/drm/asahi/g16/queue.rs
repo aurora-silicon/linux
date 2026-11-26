@@ -307,6 +307,11 @@ impl Queue {
         let hints = super::resources::PrepareHints {
             expand_compute_ext: self.shared.base_compute_quarantined.load(Ordering::Acquire),
             quarantined_compute_mask: self.shared.quarantined_compute_mask.load(Ordering::Acquire),
+            quarantined_compute_uma_mask: self
+                .shared
+                .quarantined_compute_uma_mask
+                .load(Ordering::Acquire),
+            next_compute_uma_slot: &self.shared.next_compute_uma_slot,
             expand_render_ext: self.shared.base_render_quarantined.load(Ordering::Acquire),
             quarantined_pb_mask: self.shared.quarantined_pb_mask.load(Ordering::Acquire),
             next_pb_slot: &self.shared.next_pb_slot,

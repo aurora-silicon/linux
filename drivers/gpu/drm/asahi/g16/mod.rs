@@ -299,6 +299,10 @@ pub(crate) struct Shared {
     pub(crate) base_compute_quarantined: AtomicBool,
     /// Bitmask of permanently quarantined device-wide compute units (`0..COMPUTE_UNITS`).
     pub(crate) quarantined_compute_mask: AtomicU32,
+    /// Bitmask of permanently quarantined device-wide compute UMA slots (`0..COMPUTE_UMA_SLOTS`).
+    pub(crate) quarantined_compute_uma_mask: AtomicU32,
+    /// Round-robin cursor assigning each non-SCS compute VM a slot in `0..COMPUTE_UMA_SLOTS`.
+    pub(crate) next_compute_uma_slot: AtomicU32,
     /// Whether any base render pass slot (`0..BASE_RENDER_SLOTS`) has been quarantined.
     pub(crate) base_render_quarantined: AtomicBool,
     /// Bitmask of permanently quarantined device-wide PB/UMA allocator slots (`0..PB_SLOTS`).
@@ -680,6 +684,8 @@ impl Gpu {
                 recovering: AtomicBool::new(false),
                 base_compute_quarantined: AtomicBool::new(false),
                 quarantined_compute_mask: AtomicU32::new(0),
+                quarantined_compute_uma_mask: AtomicU32::new(0),
+                next_compute_uma_slot: AtomicU32::new(0),
                 base_render_quarantined: AtomicBool::new(false),
                 quarantined_pb_mask: AtomicU32::new(0),
                 next_pb_slot: AtomicU32::new(0),

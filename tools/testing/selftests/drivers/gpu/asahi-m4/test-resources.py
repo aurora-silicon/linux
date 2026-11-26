@@ -329,6 +329,7 @@ pub mod g16 {
 
         pub(crate) mod reservations {
             use super::{ComputeArena as ComputeUnitSet, PoolExtArena, RenderArena};
+            pub(crate) struct SharedComputeUma;
             use crate::{
                 device::Device,
                 driver::AsahiDrmDevice,
@@ -441,6 +442,7 @@ pub mod g16 {
                     cache: Some(cache.clone()),
                     compute: None,
                     compute_ext: None,
+                    compute_uma: None,
                     compute_scs: false,
                     render: None,
                     render_scs: false,
@@ -3512,7 +3514,8 @@ assert object_source.count('let clean = req.class == Class::FwCoherent && req.lo
 assert 'pub(crate) struct ComputeUnitSet {' in resources_source, 'resources.rs must split compute units into per-unit ComputeArenas'
 assert 'pub(crate) struct ComputeCmds {' in resources_source, 'resources.rs must retain device-lifetime ComputeCmds'
 assert 'let cmds = factory.compute_cmds(hw_slot)?;' in resources_source, 'ComputeArena::new must fetch hardware-slot UnitCmds'
-assert 'ComputeArena::new(factory, bind, vm, live, k, k, placement)?' in resources_source, 'ComputeUnitSet::new must allocate one ComputeArena per unit'
+assert 'pub(crate) struct SharedComputeUma(' in resources_source, 'resources.rs must share one compute UMA descriptor/pool per VM'
+assert 'ComputeArena::new(factory, bind, vm, live, k, k, placement, shared_uma)?' in resources_source, 'ComputeUnitSet::new must allocate one ComputeArena per unit'
 assert 'for (local, &hw_slot) in hw_slots.iter().enumerate()' in resources_source, 'ComputeUnitSet::new_scs must bind UnitCmds by hw_slot'
 assert 'compute_ext: Option<Arc<ComputeUnitSet>>' in resources_source, 'compute_ext must use ComputeUnitSet so undisplaced slots pin only one unit'
 assert 'base.arena(k)' in resources_source and 'ext.arena(k - base.len())' in resources_source, 'Prepared::compute_arena must return the per-unit ComputeArena'

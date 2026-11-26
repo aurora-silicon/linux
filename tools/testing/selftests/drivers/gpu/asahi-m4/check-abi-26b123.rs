@@ -306,6 +306,21 @@ fn compute_work(out: &std::path::Path) {
     bad_idx[fw::graph::manager::INDEX..fw::graph::manager::INDEX + 4]
         .copy_from_slice(&(r_sep.uma_slot + 1).to_le_bytes());
     assert!(encode::validate_compute_descriptor(&r_sep, &bad_idx, r_sep.submitted - 1).is_err());
+    let mut shared_desc = fw::buffer::compute_uma_manager_image(
+        r_sep.descriptor_fw, r_sep.uma_slot, r_sep.pool_state_gva, r_sep.page_list_gva,
+        r_sep.counter_fw, 8192, fw::graph::manager::UNK_1C_VALUE,
+    );
+    shared_desc[fw::graph::manager::COMPLETED..fw::graph::manager::COMPLETED + 8]
+        .copy_from_slice(&(r_sep.submitted - 1).to_le_bytes());
+    assert_eq!(
+        encode::validate_shared_compute_descriptor(&r_sep, &shared_desc, r_sep.submitted - 1),
+        Ok(r_sep.submitted),
+    );
+    assert!(encode::validate_shared_compute_descriptor(&r_sep, &desc, r_sep.submitted - 1).is_err());
+    let mut bad_shared = shared_desc;
+    bad_shared[fw::graph::manager::INDEX..fw::graph::manager::INDEX + 4]
+        .copy_from_slice(&(r_sep.uma_slot + 1).to_le_bytes());
+    assert!(encode::validate_shared_compute_descriptor(&r_sep, &bad_shared, r_sep.submitted - 1).is_err());
     for (name, (w, q)) in ["25g83", "26b123"].iter().zip(&images) {
         let mut all = w.to_vec(); all.extend(q);
         std::fs::write(out.join(format!("compute-{name}.bin")), all).unwrap();

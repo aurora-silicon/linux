@@ -1319,25 +1319,52 @@ impl Firmware {
             let count = f.claims.slot_count as usize;
             full &= count != 0 && count == f.computes as usize;
             if full {
-                for m in 0..count {
-                    let k = f.claims.slot[m] as usize;
-                    let unit = f.job.resources.compute_unit(k)?;
-                    let submitted = f.csubmitted[m];
-                    if submitted == 0
-                        || unit.counter.r64(0)? != submitted
-                        || unit.descriptor.r64(manager::COMPLETED)? != submitted
-                        || unit.descriptor.r64(manager::COUNTER)? != unit.counter.va
+                if f.job.resources.has_shared_compute_uma() {
+                    let last_vm_flight = !self.engine.flights.iter().enumerate().any(|(idx, o)| {
+                        idx != index && o.computes != 0 && Arc::ptr_eq(&o.job.vm, &f.job.vm)
+                    });
+                    if !f
+                        .job
+                        .resources
+                        .compute_uma_retired(f.computes, last_vm_flight)?
                     {
                         full = false;
-                        break;
                     }
-                    let (start, end) = self.compute_ticks(unit)?;
-                    if start == 0 || end < start {
-                        full = false;
-                        break;
+                    if full {
+                        for m in 0..count {
+                            let k = f.claims.slot[m] as usize;
+                            let unit = f.job.resources.compute_unit(k)?;
+                            let (start, end) = self.compute_ticks(unit)?;
+                            if start == 0 || end < start {
+                                full = false;
+                                break;
+                            }
+                            if m == 0 && count == 1 {
+                                ticks = [start, end, 0, 0];
+                            }
+                        }
                     }
-                    if m == 0 && count == 1 {
-                        ticks = [start, end, 0, 0];
+                } else {
+                    for m in 0..count {
+                        let k = f.claims.slot[m] as usize;
+                        let unit = f.job.resources.compute_unit(k)?;
+                        let submitted = f.csubmitted[m];
+                        if submitted == 0
+                            || unit.counter.r64(0)? != submitted
+                            || unit.descriptor.r64(manager::COMPLETED)? != submitted
+                            || unit.descriptor.r64(manager::COUNTER)? != unit.counter.va
+                        {
+                            full = false;
+                            break;
+                        }
+                        let (start, end) = self.compute_ticks(unit)?;
+                        if start == 0 || end < start {
+                            full = false;
+                            break;
+                        }
+                        if m == 0 && count == 1 {
+                            ticks = [start, end, 0, 0];
+                        }
                     }
                 }
             }
@@ -1492,6 +1519,10 @@ impl Firmware {
             shared
                 .quarantined_compute_mask
                 .store(self.slots.quarantined_compute_mask(), Ordering::Release);
+            shared.quarantined_compute_uma_mask.store(
+                self.slots.quarantined_compute_uma_mask(),
+                Ordering::Release,
+            );
             shared
                 .base_render_quarantined
                 .store(self.slots.base_render_quarantined(), Ordering::Release);
@@ -1547,6 +1578,7 @@ impl Firmware {
                 return;
             }
             if f.computes != 0 {
+                f.job.resources.note_compute_uma_retired(f.computes);
                 let p = (f.compute_pipe as usize).min(super::hw::sizes::COMPUTE_PIPES - 1);
                 for &stamp in &f.cstamp[..(f.computes as usize).min(f.cstamp.len())] {
                     self.recovery.last_retired.push(p, stamp);

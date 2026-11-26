@@ -185,6 +185,7 @@ fn validate_compute_descriptor_inner(
     old: &[u8; compute::DESCRIPTOR_SIZE],
     submitted_before: u64,
     check_index: bool,
+    expected_work: u64,
 ) -> Result<u64, ComputeEncodeError> {
     fn read32(b: &[u8], off: usize) -> u32 {
         let mut v = [0; 4];
@@ -202,7 +203,7 @@ fn validate_compute_descriptor_inner(
         || r.uma_slot == 0
         || r.uma_slot > 32
         || (check_index && read32(old, manager::INDEX) != r.uma_slot)
-        || read64(old, manager::WORK) != r.work
+        || read64(old, manager::WORK) != expected_work
         || read64(old, manager::FREELIST) != r.pool_state_gva
         || read64(old, manager::POOL_TABLE) != r.page_list_gva
         || read64(old, manager::COUNTER) != r.counter_fw
@@ -221,7 +222,18 @@ pub(crate) fn validate_compute_descriptor(
     old: &[u8; compute::DESCRIPTOR_SIZE],
     submitted_before: u64,
 ) -> Result<u64, ComputeEncodeError> {
-    validate_compute_descriptor_inner(r, old, submitted_before, true)
+    validate_compute_descriptor_inner(r, old, submitted_before, true, r.work)
+}
+
+/// Validates a retained VM-shared compute UMA manager descriptor at an idle boundary before reuse.
+/// Unlike a per-unit descriptor whose `WORK` header holds the unit's work image VA, a VM-shared
+/// descriptor anchors `WORK` to its own `descriptor_fw` VA (matching render's shared UMA manager).
+pub(crate) fn validate_shared_compute_descriptor(
+    r: &ComputeRefs,
+    old: &[u8; compute::DESCRIPTOR_SIZE],
+    submitted_before: u64,
+) -> Result<u64, ComputeEncodeError> {
+    validate_compute_descriptor_inner(r, old, submitted_before, true, r.descriptor_fw)
 }
 
 /// Restores the complete allocator descriptor into a newly encoded, unpublished work after
@@ -236,7 +248,7 @@ pub(crate) fn preserve_compute_descriptor(
     submitted_before: u64,
     w: &mut [u8; compute::WORK_SIZE],
 ) -> Result<u64, ComputeEncodeError> {
-    let next = validate_compute_descriptor_inner(r, old, submitted_before, false)?;
+    let next = validate_compute_descriptor_inner(r, old, submitted_before, false, r.work)?;
     w[compute::DESCRIPTOR..compute::DESCRIPTOR + compute::DESCRIPTOR_SIZE].copy_from_slice(old);
     put64(w, compute::DESCRIPTOR + manager::WORK, r.work);
     put32(w, compute::DESCRIPTOR + manager::INDEX, r.uma_slot);
