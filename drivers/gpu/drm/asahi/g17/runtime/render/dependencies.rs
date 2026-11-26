@@ -67,4 +67,51 @@ impl Registry {
         }
         Ok(frontier)
     }
+    /// True when any render pair other than `slot` has live prefix-covered work for
+    /// `owner` (including pairs lent out for preparation or heap growth via
+    /// `borrowed_dependencies`). Used by `lend_render` so `Pair::own_dependencies`
+    /// matches `Registry::render_dependencies` for every direct render.
+    pub(in crate::g17::runtime) fn has_other_pair_dependencies(
+        &self,
+        slot: u8,
+        owner: u64,
+        packet: &Arc<Packet>,
+    ) -> Result<bool> {
+        let Some(prefix) = packet.order.wait_through[0] else {
+            return Ok(false);
+        };
+        let mut frontier = Frontier::new();
+        for (index, entry) in self.render.entries.iter().enumerate() {
+            if usize::from(slot) == index {
+                continue;
+            }
+            let Some(entry) = entry.as_ref() else {
+                continue;
+            };
+            if entry.reservation.owner != owner {
+                continue;
+            }
+            if let Some(pair) = entry.pair.as_ref() {
+                pair.collect_dependencies(
+                    owner,
+                    packet.completion.status(),
+                    Some(prefix),
+                    &mut frontier,
+                    false,
+                )?;
+            } else if let Some(dependencies) = entry.borrowed_dependencies.as_ref() {
+                dependencies.collect(
+                    owner,
+                    packet.completion.status(),
+                    Some(prefix),
+                    &mut frontier,
+                    false,
+                )?;
+            }
+            if !frontier.as_slice().is_empty() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
 }
