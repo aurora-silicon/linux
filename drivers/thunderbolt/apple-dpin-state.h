@@ -73,6 +73,7 @@ bool apple_dpin_token_admit(struct apple_dpin_tokens *tokens, u64 generation);
 bool apple_dpin_token_complete(struct apple_dpin_tokens *tokens, u64 generation);
 void apple_dpin_token_revoke(struct apple_dpin_tokens *tokens, u64 generation);
 bool apple_dpin_token_access(const struct apple_dpin_tokens *tokens, u64 generation);
+const char *apple_dpin_stale_binding(const struct apple_dpin_tokens *tokens, u64 generation);
 
 enum apple_dpin_event {
 	APPLE_DPIN_UP,

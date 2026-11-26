@@ -411,8 +411,8 @@ static void apple_dpin_m4_policy(struct kunit *test)
  * it waits for a display pipeline with no attempt to hand it to a display
  * admitted (apple_dpin_retirable()). A pipeline retry admitted for it keeps
  * it, and DCP's Activate meets its binding; retired between two attempts,
- * the next retry admits none. A replaced request has nothing left, and a
- * handed one is never retirable.
+ * the next retry admits none. A replaced request has nothing left, a handed
+ * one is never retirable, and a refused call says which case it met.
  */
 static void apple_dpin_m4_retire_waiting(struct kunit *test)
 {
@@ -450,6 +450,7 @@ static void apple_dpin_m4_retire_waiting(struct kunit *test)
 	apple_dpin_token_revoke(&t, 1);
 	apple_dpin_step(&s, p, APPLE_DPIN_RESULT, true, -EBUSY);
 	KUNIT_EXPECT_TRUE(test, apple_dpin_retirable(&s, &t, p, 1));
+	KUNIT_EXPECT_STREQ(test, apple_dpin_stale_binding(&t, 1), "not admitted");
 
 	/* Retired for the re-link: the next retry admits no attempt */
 	KUNIT_ASSERT_TRUE(test, apple_dpin_token_request(&t, 1, false));
@@ -458,6 +459,7 @@ static void apple_dpin_m4_retire_waiting(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, apple_dpin_token_admit(&t, 1));
 	KUNIT_EXPECT_FALSE(test, apple_dpin_token_access(&t, 1));
 	KUNIT_EXPECT_TRUE(test, apple_dpin_retirable(&s, &t, p, 1));
+	KUNIT_EXPECT_STREQ(test, apple_dpin_stale_binding(&t, 1), "retired");
 	apple_dpin_step(&s, p, APPLE_DPIN_WORK, true, 0);
 	apple_dpin_step(&s, p, APPLE_DPIN_DROPPED, false, 0);
 
@@ -465,6 +467,7 @@ static void apple_dpin_m4_retire_waiting(struct kunit *test)
 	KUNIT_ASSERT_TRUE(test, apple_dpin_token_request(&t, 2, true));
 	apple_dpin_step(&s, p, APPLE_DPIN_UP, false, 0);
 	KUNIT_EXPECT_TRUE(test, apple_dpin_retirable(&s, &t, p, 1));
+	KUNIT_EXPECT_STREQ(test, apple_dpin_stale_binding(&t, 1), "replaced");
 	KUNIT_EXPECT_EQ(test, apple_dpin_step(&s, p, APPLE_DPIN_WORK, false, 0),
 			APPLE_DPIN_ATTACH);
 	KUNIT_ASSERT_TRUE(test, apple_dpin_token_admit(&t, 2));

@@ -996,8 +996,20 @@ static int apple_dpin_dcp_set_active(void *data, bool active)
 	int ret;
 
 	guard(mutex)(&c->lock);
-	if (!apple_dpin_token_access(&c->tokens, binding->generation))
+	if (!apple_dpin_token_access(&c->tokens, binding->generation)) {
+		const char *why = apple_dpin_stale_binding(&c->tokens, binding->generation);
+
+		/* A Deactivate after the tunnel went is routine; an Activate is not. */
+		if (active)
+			dev_info(c->acio->dev, "dpin%u: display Activate refused: tunnel %llu %s (requested %llu, admitted %llu)\n",
+				 c->idx, binding->generation, why, c->tokens.requested,
+				 c->tokens.admitted);
+		else
+			dev_dbg(c->acio->dev, "dpin%u: display Deactivate for tunnel %llu %s (requested %llu, admitted %llu)\n",
+				c->idx, binding->generation, why, c->tokens.requested,
+				c->tokens.admitted);
 		return -ESTALE;
+	}
 	/* the tunnel is being torn down: the block may already be off */
 	if (!c->state.alive || !c->regs)
 		return -ENODEV;

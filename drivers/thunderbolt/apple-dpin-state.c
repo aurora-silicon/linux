@@ -142,6 +142,21 @@ bool apple_dpin_token_access(const struct apple_dpin_tokens *t, u64 generation)
 	return generation && t->requested == generation && t->admitted == generation;
 }
 
+/*
+ * Why a display call on the binding of request @generation is refused
+ * (!apple_dpin_token_access()): its tunnel went with no new one, a new
+ * tunnel's request replaced it, or no attempt for it is admitted (not yet,
+ * or it failed and was revoked).
+ */
+const char *apple_dpin_stale_binding(const struct apple_dpin_tokens *t, u64 generation)
+{
+	if (!t->requested)
+		return "retired";
+	if (t->requested != generation)
+		return "replaced";
+	return "not admitted";
+}
+
 bool apple_dpin_admission_blocked(const struct apple_dpin_state *s,
 				  const struct apple_dpin_policy *p, bool admitted)
 {
