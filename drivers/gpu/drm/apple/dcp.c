@@ -1867,8 +1867,6 @@ VISIBLE_IF_KUNIT void dcp_swap_watchdog(struct work_struct *work)
 void dcp_swap_watchdog_arm(struct apple_dcp *dcp)
 {
 	if (dcp_is_typec_output(dcp) || dcp_desktop_swap_watched(dcp)) {
-		/* A present taken now is the current display's. */
-		dcp->swap_watchdog_lost = false;
 		dcp->swap_watchdog_deadline = jiffies +
 			msecs_to_jiffies(DCP_SWAP_WATCHDOG_MS);
 		mod_delayed_work(system_dfl_wq, &dcp->swap_watchdog_wq,
@@ -1880,14 +1878,14 @@ void dcp_swap_watchdog_arm(struct apple_dcp *dcp)
  * The present in flight, accepted and not completed, was taken for a
  * display that went (see iomfb_present_lost()): the watchdog stays armed for
  * it, from now if something stopped it, and retires it without retraining
- * the pipeline, which may drive another display by then. Under the IOMFB
+ * the pipeline, which may drive another display by then (the present
+ * carries its attachment, iomfb_present_begun_h17p()). Under the IOMFB
  * queue's lock, as the firmware's acceptance and completion of the present
  * are.
  */
 void dcp_swap_watchdog_keep(struct apple_dcp *dcp)
 {
 	lockdep_assert_held(&dcp->iomfb.lock);
-	dcp->swap_watchdog_lost = true;
 	if (delayed_work_pending(&dcp->swap_watchdog_wq))
 		return;
 	dev_info(dcp->dev, "swap %u in flight as its display goes: retired if it does not complete\n",
@@ -1900,7 +1898,6 @@ void dcp_swap_watchdog_keep(struct apple_dcp *dcp)
 void dcp_swap_watchdog_complete(struct apple_dcp *dcp)
 {
 	cancel_delayed_work(&dcp->swap_watchdog_wq);
-	dcp->swap_watchdog_lost = false;
 	dcp->swap_watchdog_retrains = 0;
 	/* A completed swap on the adopted mode proves it. */
 	dcp_takeover_adopt_proven(dcp);
@@ -4252,7 +4249,8 @@ int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port)
 			WRITE_ONCE(dcp->typec_cable_connected, false);
 			dcp->typec_generation++;
 			dcp_firmware_metadata_connection(dcp, dcp->typec_generation, false);
-			dcp->typec_unplugs++;
+			/* Presents begun before this are the going display's. */
+			WRITE_ONCE(dcp->typec_unplugs, dcp->typec_unplugs + 1);
 			/* Nothing left to retry for the display that went. */
 			if (dcp->external_native)
 				cancel_delayed_work(&dcp->external_retry_wq);

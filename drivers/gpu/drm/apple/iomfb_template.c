@@ -2277,11 +2277,13 @@ static void dcp_present_failed(struct apple_dcp *dcp)
 static bool dcp_present_begin(struct apple_dcp *dcp, u32 swap_id)
 {
 #if DCP_FW_H17(DCP_FW_VER)
-	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
-	    !dcp_present_begin_h17p(&dcp->present_state_h17p, swap_id)) {
-		dev_err(dcp->dev, "overlapping present %u\n", swap_id);
-		dcp->crashed = true;
-		return false;
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
+		if (!dcp_present_begin_h17p(&dcp->present_state_h17p, swap_id)) {
+			dev_err(dcp->dev, "overlapping present %u\n", swap_id);
+			dcp->crashed = true;
+			return false;
+		}
+		iomfb_present_begun_h17p(dcp);
 	}
 #elif DCP_FW_DESKTOP_26(DCP_FW_VER)
 	WRITE_ONCE(dcp->desktop->present_id, swap_id);

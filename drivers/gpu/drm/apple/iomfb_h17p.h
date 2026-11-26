@@ -35,6 +35,11 @@ struct dcp_present_state_h17p {
 	 */
 	unsigned int nr_retired;
 	u32 retired[IOMFB_DROPPED_MAX];
+	/*
+	 * The Type-C attachment the present was begun for, as counted by the
+	 * detaches (typec_unplugs): see iomfb_present_begun_h17p().
+	 */
+	u64 attachment;
 };
 
 static inline bool

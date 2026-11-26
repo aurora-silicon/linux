@@ -5,8 +5,9 @@
 The swap watchdog of a pipeline on firmware with the IOMFB queue (H17P, 27) is
 compiled from the production bodies (dcp_swap_watchdog_arm(),
 dcp_swap_watchdog_keep(), dcp_swap_watchdog_complete(), dcp_swap_watchdog(),
-iomfb_present_lost(), iomfb_retire_dropped_present_h17p() and
-dcp_present_retire_h17p()) and from the CRTC's power-off (dcp_poweroff())
+iomfb_present_begun_h17p(), iomfb_present_lost(),
+iomfb_retire_dropped_present_h17p() and dcp_present_retire_h17p()) and from
+the CRTC's power-off (dcp_poweroff())
 against host mocks. The pipeline is a dcpext of the Air (J713) on firmware
 27.2, whose node declares a USB-C connector, so it is a Type-C output with or
 without a route:
@@ -16,6 +17,10 @@ without a route:
   holding the queue until its timeout declares the processor crashed;
 - the firmware's acceptance runs under the queue's lock, before or after the
   power-off looks: either way the present that will not complete is watched;
+- a present begun for the display that went is that display's whenever the
+  firmware accepts it, also after the detach and the power-off have looked
+  and a replacement is plugged in: retired without a retrain, the
+  replacement left alone;
 - retiring that present only completes its flip: it neither invalidates the
   mode nor queues a hotplug, so a display plugged in before the watchdog
   expires is not retrained for the old one's present;
@@ -43,7 +48,7 @@ FABRIC = (ROOT / 'drivers/gpu/drm/apple/dcp-fabric.c').read_text()
 SOURCES = {'dcp': DCP, 'iomfb': IOMFB, 'h17p': H17P, 'fabric': FABRIC}
 FUNCTIONS = [
     ('fabric', 'dcp_is_typec_output'), ('h17p', 'dcp_present_retire_h17p'),
-    ('iomfb', 'iomfb_uses_queue'),
+    ('iomfb', 'iomfb_uses_queue'), ('iomfb', 'iomfb_present_begun_h17p'),
     ('dcp', 'dcp_swap_watchdog_arm'), ('dcp', 'dcp_swap_watchdog_keep'),
     ('dcp', 'dcp_swap_watchdog_complete'),
     ('iomfb', 'iomfb_present_lost'), ('iomfb', 'iomfb_retire_dropped_present_h17p'),
@@ -65,8 +70,14 @@ MUTATIONS = {
     # The retired present of a display that went retrains what is plugged in now.
     'lost-retrains': ('dcp', '\tif (lost) {\n\t\tdev_info(dcp->dev, "swap of a display that went retired\\n");',
                       '\tif (false) {\n\t\tdev_info(dcp->dev, "swap of a display that went retired\\n");'),
-    # A later present of the current display is still taken as the lost one's.
-    'lost-sticks': ('dcp', '\t\t/* A present taken now is the current display\'s. */\n\t\tdcp->swap_watchdog_lost = false;\n', ''),
+    # A present is the current display's once accepted (the loss judged at acceptance).
+    'identity-at-acceptance': ('dcp', '\tif (dcp_is_typec_output(dcp) || dcp_desktop_swap_watched(dcp)) {\n',
+                               '\tif (dcp_is_typec_output(dcp) || dcp_desktop_swap_watched(dcp)) {\n'
+                               '\t\tdcp->present_state_h17p.attachment = READ_ONCE(dcp->typec_unplugs);\n'),
+    # Nothing is ever taken as lost: the replacement is retrained.
+    'never-lost': ('iomfb', '\t*lost = state->attachment != READ_ONCE(dcp->typec_unplugs);', '\t*lost = false;'),
+    # Everything taken as lost: a stuck present of a live display is not retrained.
+    'always-lost': ('iomfb', '\t*lost = state->attachment != READ_ONCE(dcp->typec_unplugs);', '\t*lost = true;'),
     # Nothing kept: the present holds the queue until its timeout.
     'no-keep': ('iomfb', '\tif (state->pending && state->accepted) {\n\t\tdcp_swap_watchdog_keep(dcp);\n\t\treturn true;\n\t}',
                 '\tif (false) {\n\t\tdcp_swap_watchdog_keep(dcp);\n\t\treturn true;\n\t}'),
@@ -172,6 +183,7 @@ struct dcp_present_state_h17p {
 	u32 swap_id;
 	unsigned int nr_retired;
 	u32 retired[IOMFB_DROPPED_MAX];
+	u64 attachment;
 };
 struct iomfb_scanout_h17p { int link; };
 struct apple_dcp {
@@ -191,7 +203,6 @@ struct apple_dcp {
 	struct { bool valid; } mode_state;
 	u64 typec_unplugs, crtc_unplugs;
 	bool typec_cable_connected, typec_crtc_off, vrr_enabled, external_native;
-	bool swap_watchdog_lost;
 	unsigned int swap_watchdog_retrains;
 	unsigned long swap_watchdog_deadline;
 	struct delayed_work swap_watchdog_wq, typec_reconnect_wq, placeholder_edid_wq;
@@ -272,15 +283,29 @@ static struct apple_dcp *pipe(int connector_type)
 	return &d;
 }
 
-/* The firmware accepts a present (dcp_swapped(), under the queue's lock). */
-static void accept(void)
+/* A present begins for the display attached now (dcp_present_begin()). */
+static void begin(void)
 {
 	struct apple_dcp *d = the_dcp;
 	static u32 id = 300;
 
 	mutex_lock(&d->iomfb.lock);
-	d->present_state_h17p.pending = d->present_state_h17p.accepted = true;
+	assert(!d->present_state_h17p.pending);
+	d->present_state_h17p.pending = true;
+	d->present_state_h17p.accepted = false;
 	d->present_state_h17p.swap_id = ++id;
+	iomfb_present_begun_h17p(d);
+	mutex_unlock(&d->iomfb.lock);
+}
+/* The firmware accepts it (dcp_swapped(), under the queue's lock); one begun now if none is. */
+static void accept(void)
+{
+	struct apple_dcp *d = the_dcp;
+
+	if (!d->present_state_h17p.pending)
+		begin();
+	mutex_lock(&d->iomfb.lock);
+	d->present_state_h17p.accepted = true;
 	if (d->fixed_connector_type == DRM_MODE_CONNECTOR_USB)
 		dcp_swap_watchdog_arm(d);
 	mutex_unlock(&d->iomfb.lock);
@@ -311,6 +336,11 @@ static void unplug(void)
 	the_dcp->typec_unplugs++;
 	iomfb_present_lost(the_dcp, false);
 }
+/* The dock's display is gone and its CRTC turned off: the power-off counts it gone. */
+static void gone(void)
+{
+	the_dcp->typec_unplugs++;
+}
 
 static void lost_display(void)
 {
@@ -321,7 +351,7 @@ static void lost_display(void)
 	accept();
 	d->swap_watchdog_wq.pending = false;	/* stopped by something since */
 	unplug();
-	assert(d->swap_watchdog_wq.pending && d->swap_watchdog_lost && infos == 1);
+	assert(d->swap_watchdog_wq.pending && infos == 1);
 	dcp_poweroff(&pdev);
 	assert(d->swap_watchdog_wq.pending && poweroffs == 1 && !hpd_lows);
 	/* A display plugged in before the watchdog expires: not retrained for the old present. */
@@ -329,10 +359,9 @@ static void lost_display(void)
 	expire();
 	assert(failed == 1 && advanced == 1 && vblanks == 1);
 	assert(!hotplugs && !invalidates && d->mode_state.valid);
-	assert(!d->present_state_h17p.pending && !d->swap_watchdog_lost);
+	assert(!d->present_state_h17p.pending);
 	/* The replacement's own presents are watched and retrained as before. */
 	accept();
-	assert(!d->swap_watchdog_lost);
 	expire();
 	assert(invalidates == 1 && hotplugs == 1 && hotplugged == &replacement);
 	puts("ok lost display: its present retired without a retrain, the replacement's as before");
@@ -340,10 +369,10 @@ static void lost_display(void)
 	/* The power-off alone, after the unplug, keeps the watchdog too. */
 	d = pipe(DRM_MODE_CONNECTOR_USB);
 	accept();
-	d->typec_unplugs++;
+	gone();
 	d->swap_watchdog_wq.pending = false;
 	dcp_poweroff(&pdev);
-	assert(d->swap_watchdog_wq.pending && d->swap_watchdog_lost);
+	assert(d->swap_watchdog_wq.pending);
 	expire();
 	assert(advanced == 1 && !hotplugs && !invalidates);
 	puts("ok lost display: kept by the power-off after the unplug");
@@ -354,7 +383,7 @@ static void lost_display(void)
 	unplug();
 	d->connector = &replacement;
 	completes();
-	assert(!d->swap_watchdog_wq.pending && !d->swap_watchdog_lost && !failed);
+	assert(!d->swap_watchdog_wq.pending && !failed);
 	puts("ok lost display: completed after a replug, the watchdog stops");
 
 	/* The firmware aborts it instead: the next display's present is its own. */
@@ -378,21 +407,48 @@ static void acceptance_during_poweroff(void)
 
 	/* Accepted just before the power-off takes the lock: kept. */
 	d = pipe(DRM_MODE_CONNECTOR_USB);
-	d->present_state_h17p.pending = true;
-	d->typec_unplugs++;
+	begin();
+	gone();
 	d->iomfb.lock.before = accept;
 	dcp_poweroff(&pdev);
-	assert(d->swap_watchdog_wq.pending && d->swap_watchdog_lost);
-	/* Accepted just after it: armed at the acceptance. */
+	assert(d->swap_watchdog_wq.pending);
+	d->connector = &replacement;
+	expire();
+	assert(failed == 1 && advanced == 1 && !hotplugs && !invalidates);
+	/*
+	 * Accepted just after it, with a display plugged in meanwhile: armed at
+	 * the acceptance, and still the present of the display that went.
+	 */
 	d = pipe(DRM_MODE_CONNECTOR_USB);
-	d->present_state_h17p.pending = true;
-	d->typec_unplugs++;
+	begin();
+	gone();
 	d->iomfb.lock.after = accept;
 	dcp_poweroff(&pdev);
+	d->connector = &replacement;
 	assert(d->swap_watchdog_wq.pending);
 	expire();
-	assert(failed == 1 && advanced == 1);
-	puts("ok acceptance during the power-off: watched in either order");
+	assert(failed == 1 && advanced == 1 && vblanks == 1);
+	assert(!hotplugs && !invalidates && d->mode_state.valid);
+	puts("ok acceptance during the power-off: watched in either order, the replacement left alone");
+
+	/*
+	 * Begun before the detach, accepted after the detach and the power-off
+	 * have looked: retired as the lost display's, not the replacement's.
+	 */
+	d = pipe(DRM_MODE_CONNECTOR_USB);
+	begin();
+	unplug();
+	assert(!d->swap_watchdog_wq.pending);
+	dcp_poweroff(&pdev);
+	d->connector = &replacement;
+	accept();
+	expire();
+	assert(failed == 1 && !hotplugs && !invalidates && d->mode_state.valid);
+	/* The replacement's own stuck present is retrained, as before. */
+	accept();
+	expire();
+	assert(invalidates == 1 && hotplugs == 1 && hotplugged == &replacement);
+	puts("ok accepted after the detach: the lost display's, the replacement's own retrained");
 }
 
 /* The power-off of a live output stops the watchdog, as before. */
@@ -408,7 +464,7 @@ static void live_outputs(void)
 		accept();
 		d->swap_watchdog_wq.pending = true;
 		dcp_poweroff(&pdev);
-		assert(!d->swap_watchdog_wq.pending && !d->swap_watchdog_lost && !infos);
+		assert(!d->swap_watchdog_wq.pending && !infos);
 	}
 	/* A live Type-C display's present that does not complete is retrained, as before. */
 	d = pipe(DRM_MODE_CONNECTOR_USB);
@@ -418,7 +474,7 @@ static void live_outputs(void)
 	/* The detach with nothing in flight keeps nothing. */
 	d = pipe(DRM_MODE_CONNECTOR_USB);
 	unplug();
-	assert(!d->swap_watchdog_wq.pending && !d->swap_watchdog_lost);
+	assert(!d->swap_watchdog_wq.pending);
 	/* Firmware without the IOMFB queue: the power-off stops it, nothing is kept. */
 	d = pipe(DRM_MODE_CONNECTOR_USB);
 	d->fw_compat = DCP_FIRMWARE_V_26_6;
@@ -426,7 +482,7 @@ static void live_outputs(void)
 	d->typec_unplugs++;
 	d->swap_watchdog_wq.pending = true;
 	dcp_poweroff(&pdev);
-	assert(!d->swap_watchdog_wq.pending && !d->swap_watchdog_lost);
+	assert(!d->swap_watchdog_wq.pending);
 	puts("ok live outputs: panel, fixed HDMI and attached Type-C DPMS stop the watchdog");
 }
 

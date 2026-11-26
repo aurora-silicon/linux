@@ -482,7 +482,6 @@ struct apple_dcp {
     struct delayed_work swap_watchdog_wq;
     unsigned long swap_watchdog_deadline;
     unsigned swap_watchdog_retrains;
-    bool swap_watchdog_lost;
     void *crtc,*connector,*dev;
 };
 static unsigned scheduled,cancelled,vblanks,hotplugs,unarmed,rejected;
