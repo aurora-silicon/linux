@@ -277,6 +277,8 @@ pub(crate) struct RenderGraph {
     pub(crate) sched_ctx: Arc<FwObject>,
     /// Whole page: TA record +0, FS +0x200, service stamps +0x620/+0x630.
     pub(crate) notifier: Arc<FwObject>,
+    /// LAB ONLY: the same records in an ASC-cached page ([`super::lab::RENDER_NCACHE`]).
+    pub(crate) notifier_cached: Arc<FwObject>,
     pub(crate) threshold: Arc<FwObject>,
     pub(crate) job_list: [Arc<FwObject>; 2],
     pub(crate) legacy_empty: Arc<FwObject>,
@@ -287,6 +289,7 @@ struct RenderGraphSession {
     fs: QueueSession,
     sched_ctx: Arc<FwObject>,
     notifier: Arc<FwObject>,
+    notifier_cached: Arc<FwObject>,
     threshold: Arc<FwObject>,
     job_list: [Arc<FwObject>; 2],
     legacy_empty: Arc<FwObject>,
@@ -299,6 +302,8 @@ impl RenderGraphSession {
             fs: QueueSession::new(o)?,
             sched_ctx: context,
             notifier: alloc(o, 0x1000, Class::Fw, None, 0, false)?,
+            // LAB ONLY: ASC-cached render notifier records, as macOS 26B123 maps them (0x443).
+            notifier_cached: alloc(o, 0x1000, Class::FwCached, None, 0, false)?,
             threshold: alloc(o, 24, Class::Fw, None, 0, false)?,
             job_list: [
                 alloc(o, job_list::SIZE, graph_fw(), None, 0, false)?,
@@ -326,6 +331,7 @@ impl RenderGraphSession {
             fw_stamp: [ta.fw_stamp, fs.fw_stamp],
             sched_ctx: self.sched_ctx,
             notifier: self.notifier,
+            notifier_cached: self.notifier_cached,
             threshold: self.threshold,
             job_list: self.job_list,
             legacy_empty: self.legacy_empty,
@@ -341,6 +347,7 @@ impl RenderGraph {
     }
     fn init(&self, abi: FwAbi) -> Result {
         init_notifier(&self.notifier, &self.threshold)?;
+        init_notifier(&self.notifier_cached, &self.threshold)?;
         for e in 0..2 {
             self.job_list[e].w64(job_list::SELF, self.job_list[e].va)?;
             init_queue(

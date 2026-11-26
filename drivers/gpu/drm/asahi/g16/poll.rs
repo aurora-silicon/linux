@@ -556,10 +556,15 @@ impl Shared {
             return repoll;
         }
         let ewma = self.ewma_flight_us.load(Ordering::Relaxed);
-        if ewma != 0 && ewma < resnap.saturating_mul(2) {
+        let us = if ewma != 0 && ewma < resnap.saturating_mul(2) {
             (ewma / 2).clamp(repoll, resnap)
         } else {
             resnap
+        };
+        match super::lab::knob(super::lab::BEHIND_REPOLL_US) {
+            0 => us,
+            cap if self.active_flights.load(Ordering::Acquire) >= 2 => us.min(cap.max(repoll)),
+            _ => us,
         }
     }
 
@@ -605,10 +610,24 @@ impl Shared {
             dir.read_callback_file(c_str!("stats"), self.clone(), &stats_show),
             GFP_KERNEL,
         )?;
+        let knobs = KBox::pin_init(
+            dir.read_write_callback_file(
+                c_str!("lab"),
+                (),
+                &super::lab::show_knobs,
+                &super::lab::write_knobs,
+            ),
+            GFP_KERNEL,
+        )?;
+        let trace = KBox::pin_init(
+            dir.read_callback_file(c_str!("trace"), (), &super::lab::show_trace),
+            GFP_KERNEL,
+        )?;
         let mut state = self.state.lock();
         let firmware = state.as_deref_mut().ok_or(ENODEV)?;
         firmware.engine.shared = Some(self.clone());
         firmware.engine.debugfs = Some(file);
+        firmware.engine.lab_files = [Some(knobs), Some(trace)];
         Ok(())
     }
 }
@@ -720,6 +739,44 @@ impl Firmware {
         let start = lap.on().then(now_ns);
         let retired_any = self.retire_once(done)?;
         lap.lap(&mut self.engine.prof.retire_ns);
+        if self.recovery.failed().is_none() && !self.engine.frozen {
+            self.lab_flush_deferred()?;
+        }
+        if super::lab::on() {
+            super::lab::rec([
+                7 | u64::from(evented) << 8 | u64::from(retired_any) << 9,
+                super::engine::counter_ticks(),
+                u64::from(self.events.stage_events.wrapping_sub(stage_before)),
+                self.engine.flights.len() as u64,
+                self.engine.pending.len() as u64,
+                self.lab_cursors(),
+            ]);
+        }
+        match super::lab::knob(super::lab::FS_KICK) {
+            1 if self.events.stage_events != stage_before
+                && self.engine.flights.iter().any(|f| f.renders != 0) =>
+            {
+                self.session.ring(super::channel::Channel::Fs)?;
+            }
+            2 if self.engine.flights.iter().any(|f| f.renders != 0) => {
+                let obs = [
+                    self.graph.render.fw_stamp[0].r32(0).unwrap_or(0),
+                    self.graph.render.fw_stamp[1].r32(0).unwrap_or(0),
+                    self.graph.compute[0].fw_stamp.r32(0).unwrap_or(0),
+                ];
+                let mut moved = false;
+                for (last, v) in super::lab::LAST_STAMP.iter().zip(obs) {
+                    if last.swap(v, Ordering::Relaxed) != v {
+                        moved = true;
+                    }
+                }
+                if moved {
+                    self.session.ring(super::channel::Channel::Fs)?;
+                    self.session.ring(super::channel::Channel::Ta)?;
+                }
+            }
+            _ => {}
+        }
         self.answer_growth()?;
         let recovery_pending = self.recovery.receipt_fault || self.recovery_pending()?;
         if recovery_pending {
@@ -1240,6 +1297,87 @@ impl Firmware {
         Ok(None)
     }
 
+    /// LAB ONLY: submit-pipe read/completion cursors and host producers, 8 bits each:
+    /// TA read, TA completion, FS read, FS completion, TA producer, FS producer, compute read,
+    /// compute completion.
+    fn lab_cursors(&self) -> u64 {
+        let c = |ch: Channel| -> [u64; 3] {
+            let p = self.channels.channel(ch);
+            [
+                u64::from(p.read().unwrap_or(0xff) & 0xff),
+                u64::from(p.completion().unwrap_or(0xff) & 0xff),
+                u64::from(self.channels.producer(ch) & 0xff),
+            ]
+        };
+        let (ta, fs, cp) = (c(Channel::Ta), c(Channel::Fs), c(Channel::Compute));
+        ta[0] | ta[1] << 8 | fs[0] << 16 | fs[1] << 24 | ta[2] << 32 | fs[2] << 40 | cp[0] << 48
+            | cp[1] << 56
+    }
+
+    /// LAB ONLY: every render receipt condition of flight `f`, without short-circuiting.
+    fn lab_render_bits(&self, f: &Flight, behind: bool) -> u64 {
+        let g = &self.graph.render;
+        let e = &self.engine;
+        let reach = |obs: u32, own: u32, tail: u32| {
+            if behind {
+                stamp_reached(obs, own, tail)
+            } else {
+                obs == own
+            }
+        };
+        let ok = |r: Result<bool>| u64::from(r.unwrap_or(false));
+        let fw_fs = g.fw_stamp[1].r32(0).unwrap_or(0);
+        let fw_ta = g.fw_stamp[0].r32(0).unwrap_or(0);
+        let (qta, qfs) = if behind {
+            (
+                ok(self.queue_ring_passed(Channel::Ta, &g.qstate[0], &g.qinfo[0], f)),
+                ok(self.queue_ring_passed(Channel::Fs, &g.qstate[1], &g.qinfo[1], f)),
+            )
+        } else {
+            (
+                ok(self.queue_ring_receipt(&g.qstate[0], &g.qinfo[0], f.ta_head)),
+                ok(self.queue_ring_receipt(&g.qstate[1], &g.qinfo[1], f.fs_head)),
+            )
+        };
+        let cta = ok(self.channel_receipt(Channel::Ta, f.rec[0], behind));
+        let cfs = ok(self.channel_receipt(Channel::Fs, f.rec[1], behind));
+        let (nfs, nta, ctx_ta, ctx_fs) = if f.lab_rncache {
+            (
+                g.user_stamp[1].r32(0).unwrap_or(0),
+                g.user_stamp[0].r32(0).unwrap_or(0),
+                true,
+                true,
+            )
+        } else {
+            (
+                g.notifier.r32(notifier_page::FS_STAMP).unwrap_or(0),
+                g.notifier.r32(notifier_page::TA_STAMP).unwrap_or(0),
+                g.notifier.r32(notifier::CONTEXT).unwrap_or(u32::MAX) == f.job.vm.slot,
+                g.notifier
+                    .r32(notifier_page::FS_RECORD + notifier::CONTEXT)
+                    .unwrap_or(u32::MAX)
+                    == f.job.vm.slot,
+            )
+        };
+        let pb = if behind {
+            ok(f.job.resources.pb_retired_at(f.pb_slot as usize, f.uma_submitted))
+        } else {
+            ok(f.job.resources.pb_retired(f.pb_slot as usize))
+        };
+        u64::from(reach(fw_fs, f.fs_target, e.fs_target))
+            | u64::from(reach(fw_ta, f.ta_target, e.ta_target)) << 1
+            | qta << 2
+            | cta << 3
+            | qfs << 4
+            | cfs << 5
+            | u64::from(reach(nfs, f.fs_target, e.fs_target)) << 6
+            | u64::from(reach(nta, f.ta_target, e.ta_target)) << 7
+            | u64::from(ctx_ta) << 8
+            | u64::from(ctx_fs) << 9
+            | pb << 10
+            | u64::from(behind) << 11
+    }
+
     fn retired_snapshot(&mut self) -> Result<Retirement> {
         self.retired_snapshot_at(0)
     }
@@ -1284,9 +1422,18 @@ impl Firmware {
                 }
                 rmb();
                 let stamp = g.notifier.r32(notifier_page::COMPUTE_STAMP)?;
-                full &= stamp_reached(stamp, f.target, tail)
+                let notified = stamp_reached(stamp, f.target, tail)
                     && (stamp != f.target
                         || g.notifier.r32(notifier_page::COMPUTE_CONTEXT)? == f.job.vm.slot);
+                super::lab::rec([
+                    8 | 1 << 8 | u64::from(notified) << 16,
+                    super::engine::counter_ticks(),
+                    u64::from(f.target),
+                    u64::from(stamp),
+                    0,
+                    0,
+                ]);
+                full &= notified || super::lab::knob(super::lab::BEHIND_NO_NOTIFIER) != 0;
             } else {
                 if g.fw_stamp.r32(0)? != f.target
                     || !self.queue_ring_receipt(&g.qstate, &g.qinfo, f.head)?
@@ -1333,6 +1480,17 @@ impl Firmware {
                 .filter(|o| o.renders != 0)
                 .nth(1)
                 .is_some();
+            if super::lab::on() {
+                let bits = self.lab_render_bits(f, render_behind);
+                super::lab::rec([
+                    9 | bits << 8,
+                    super::engine::counter_ticks(),
+                    u64::from(f.fs_target),
+                    u64::from(f.ta_target),
+                    self.lab_cursors(),
+                    u64::from(f.rec[0]) | u64::from(f.rec[1]) << 8,
+                ]);
+            }
             let g = &self.graph.render;
             let a = f.pb_slot as usize;
             if render_behind {
@@ -1346,19 +1504,36 @@ impl Firmware {
                     return Ok(Retirement::Pending);
                 }
                 rmb();
-                let fs_stamp = g.notifier.r32(notifier_page::FS_STAMP)?;
-                let ta_stamp = g.notifier.r32(notifier_page::TA_STAMP)?;
-                full &= stamp_reached(fs_stamp, f.fs_target, e.fs_target)
-                    && (fs_stamp != f.fs_target
+                // LAB ONLY: a RENDER_NCACHE flight's service stamps are in the separate
+                // uncached cells and its (cached) records' context words are not read.
+                let (fs_stamp, ta_stamp) = if f.lab_rncache {
+                    (g.user_stamp[1].r32(0)?, g.user_stamp[0].r32(0)?)
+                } else {
+                    (
+                        g.notifier.r32(notifier_page::FS_STAMP)?,
+                        g.notifier.r32(notifier_page::TA_STAMP)?,
+                    )
+                };
+                let notified = stamp_reached(fs_stamp, f.fs_target, e.fs_target)
+                    && (f.lab_rncache
+                        || fs_stamp != f.fs_target
                         || g.notifier
                             .r32(notifier_page::FS_RECORD + notifier::CONTEXT)?
                             == f.job.vm.slot)
                     && stamp_reached(ta_stamp, f.ta_target, e.ta_target)
-                    && (ta_stamp != f.ta_target
-                        || g.notifier.r32(notifier::CONTEXT)? == f.job.vm.slot)
-                    && f.job
-                        .resources
-                        .pb_retired_at(a, f.uma_submitted)?;
+                    && (f.lab_rncache
+                        || ta_stamp != f.ta_target
+                        || g.notifier.r32(notifier::CONTEXT)? == f.job.vm.slot);
+                let pb = f.job.resources.pb_retired_at(a, f.uma_submitted)?;
+                super::lab::rec([
+                    8 | 2 << 8 | u64::from(notified) << 16 | u64::from(pb) << 17,
+                    super::engine::counter_ticks(),
+                    u64::from(f.fs_target),
+                    u64::from(fs_stamp),
+                    u64::from(f.ta_target),
+                    u64::from(ta_stamp),
+                ]);
+                full &= (notified || super::lab::knob(super::lab::BEHIND_NO_NOTIFIER) != 0) && pb;
             } else {
                 // Check FS (terminal stage) before TA so running renders fail fast on 1 WC read.
                 if g.fw_stamp[1].r32(0)? != f.fs_target
@@ -1381,13 +1556,19 @@ impl Firmware {
                     return Ok(Retirement::Pending);
                 }
                 rmb();
-                full &= g.notifier.r32(notifier_page::FS_STAMP)? == f.fs_target
-                    && g.notifier.r32(notifier_page::TA_STAMP)? == f.ta_target
-                    && g.notifier.r32(notifier::CONTEXT)? == f.job.vm.slot
-                    && g.notifier
-                        .r32(notifier_page::FS_RECORD + notifier::CONTEXT)?
-                        == f.job.vm.slot
-                    && f.job.resources.pb_retired(a)?;
+                // LAB ONLY: see the RENDER_NCACHE note above.
+                let notified = if f.lab_rncache {
+                    g.user_stamp[1].r32(0)? == f.fs_target
+                        && g.user_stamp[0].r32(0)? == f.ta_target
+                } else {
+                    g.notifier.r32(notifier_page::FS_STAMP)? == f.fs_target
+                        && g.notifier.r32(notifier_page::TA_STAMP)? == f.ta_target
+                        && g.notifier.r32(notifier::CONTEXT)? == f.job.vm.slot
+                        && g.notifier
+                            .r32(notifier_page::FS_RECORD + notifier::CONTEXT)?
+                            == f.job.vm.slot
+                };
+                full &= notified && f.job.resources.pb_retired(a)?;
             }
             if full {
                 let count = (f.renders as usize).min(f.claims.pass.len());
@@ -2041,6 +2222,48 @@ impl Firmware {
         }
         if hi > lo {
             s.span_ticks = s.span_ticks.saturating_add(hi - lo);
+        }
+        if super::lab::on() {
+            super::lab::rec([
+                5 | u64::from(f.renders) << 8 | u64::from(f.computes) << 16,
+                super::engine::counter_ticks(),
+                u64::from(f.ta_target),
+                u64::from(f.fs_target),
+                u64::from(f.target),
+                f.job.vm.id as u64,
+            ]);
+            let cell = |o: &super::object::FwObject, off: usize| -> u64 {
+                match (o.r32(off), o.r32(off + 4)) {
+                    (Ok(lo), Ok(hi)) => u64::from(hi) << 32 | u64::from(lo),
+                    _ => 0,
+                }
+            };
+            for k in 0..f.renders as usize {
+                if let Ok(p) = f.job.resources.render_pass(f.claims.pass[k] as usize) {
+                    super::lab::rec([
+                        3 | (k as u64) << 8,
+                        u64::from(f.r_ta_stamp[k.min(f.r_ta_stamp.len() - 1)]),
+                        cell(&p.scene, 0x600),
+                        cell(&p.scene, 0x608),
+                        cell(&p.scene, 0x620),
+                        cell(&p.scene, 0x628),
+                    ]);
+                }
+            }
+            for k in 0..(f.computes as usize).min(f.claims.slot_count as usize) {
+                if let Ok(c) = f.job.resources.compute_unit(f.claims.slot[k] as usize) {
+                    if let Ok((start, end)) = Self::compute_ticks_with(work_ticks, c) {
+                        super::lab::rec([
+                            4 | u64::from(f.compute_pipe) << 8 | (k as u64) << 16,
+                            u64::from(f.target),
+                            start,
+                            end,
+                            0,
+                            0,
+                        ]);
+                    }
+                }
+            }
         }
         if f.renders != 0 {
             for b in 0..2 {

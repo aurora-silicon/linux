@@ -191,6 +191,20 @@ fn msaa_render_conflict(f: &Flight, vm: &Arc<super::vm::VmState>, msaa: bool) ->
         && (msaa || vm.renders_msaa() || f.job.vm.renders_msaa())
 }
 
+/// LAB ONLY: a submit record held back by [`super::lab::DEFER_RECORDS`].
+#[derive(Copy, Clone)]
+pub(crate) struct LabDeferred {
+    channel: Channel,
+    record: SubmitRecord,
+    /// The producer this record must return when posted.
+    expect: u32,
+    render: bool,
+    ta: u32,
+    fs: u32,
+    pipe: usize,
+    target: u32,
+}
+
 /// Resolved ring-barrier placement for one render pass (legacy, `FRAGMENT_BARRIERS`, or
 /// `DRM_ASAHI_RENDER_STAGE_PREFIXES`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -366,6 +380,9 @@ pub(crate) struct Flight {
     /// Whether this flight includes a multisampled render pass; its VM is marked
     /// (`VmStateInner::note_msaa_render`) once the flight becomes visible.
     pub(crate) msaa: bool,
+    /// LAB ONLY: this flight's renders use the ASC-cached notifier page
+    /// ([`super::lab::RENDER_NCACHE`]).
+    pub(crate) lab_rncache: bool,
 }
 
 impl Flight {
@@ -410,6 +427,7 @@ impl Flight {
             has_timestamps: false,
             rt_compute: false,
             msaa: false,
+            lab_rncache: false,
         }
     }
 }
@@ -696,6 +714,14 @@ pub(crate) struct Engine {
     pub(crate) prof: KBox<Prof>,
     /// The `aurora-g16/stats` file.
     pub(crate) debugfs: Option<Pin<KBox<kernel::debugfs::File<Arc<Shared>>>>>,
+    /// LAB ONLY: the `aurora-g16/lab` and `aurora-g16/trace` files.
+    pub(crate) lab_files: [Option<Pin<KBox<kernel::debugfs::File<()>>>>; 2],
+    /// LAB ONLY: held submit records, oldest first.
+    pub(crate) lab_deferred: KVec<LabDeferred>,
+    /// LAB ONLY: TA/FS targets of the newest render flight whose records are posted.
+    pub(crate) lab_posted_render: Option<[u32; 2]>,
+    /// LAB ONLY: target of the newest compute flight per pipe whose record is posted.
+    pub(crate) lab_posted_compute: [Option<u32>; sizes::COMPUTE_PIPES],
     scratch: Option<KBox<Scratch>>,
 }
 
@@ -742,6 +768,10 @@ impl Engine {
             stats: KBox::zeroed(GFP_KERNEL)?,
             prof: KBox::zeroed(GFP_KERNEL)?,
             debugfs: None,
+            lab_files: [None, None],
+            lab_deferred: KVec::new(),
+            lab_posted_render: None,
+            lab_posted_compute: [None; sizes::COMPUTE_PIPES],
             // Allocate host encoder buffers before any submitted fence can depend on
             // the device mutex. Publication must never enter direct reclaim here.
             scratch: Some(Scratch::new_boxed()?),
@@ -1083,6 +1113,9 @@ impl Firmware {
         self.engine.held_wait = false;
         self.engine.handoff_avoid_pipes = 0;
         self.engine.coalesce_deadline_ns = 0;
+        if self.recovery.failed().is_none() && !self.engine.frozen {
+            self.lab_flush_deferred()?;
+        }
         while self.recovery.failed().is_none()
             && !self.engine.frozen
             && !self.engine.pending.is_empty()
@@ -1352,6 +1385,7 @@ impl Firmware {
     /// FS-before-TA doorbell order for render batches.
     fn flush_doorbells(&mut self, pending_rings: &mut u8) -> Result {
         let mask = core::mem::take(pending_rings);
+        super::lab::rec([6 | u64::from(mask) << 8, counter_ticks(), 0, 0, 0, 0]);
         for channel in [Channel::Compute, Channel::Fs, Channel::Ta] {
             if mask & (1u8 << (channel as u8)) != 0 {
                 self.session.ring(channel)?;
@@ -1368,6 +1402,51 @@ impl Firmware {
             .flights
             .iter()
             .any(|f| msaa_render_conflict(f, vm, r.is_multisampled()))
+    }
+
+    /// LAB ONLY: once every posted record's work has finished, posts the held records in order
+    /// and rings each touched channel once. Returns whether it posted.
+    pub(crate) fn lab_flush_deferred(&mut self) -> Result<bool> {
+        if self.engine.lab_deferred.is_empty() {
+            return Ok(false);
+        }
+        if let Some([ta, fs]) = self.engine.lab_posted_render {
+            if self.graph.render.fw_stamp[1].r32(0)? != fs
+                || self.graph.render.fw_stamp[0].r32(0)? != ta
+            {
+                return Ok(false);
+            }
+        }
+        for p in 0..sizes::COMPUTE_PIPES {
+            if let Some(t) = self.engine.lab_posted_compute[p] {
+                if self.graph.compute[p].fw_stamp.r32(0)? != t {
+                    return Ok(false);
+                }
+            }
+        }
+        let held = core::mem::replace(&mut self.engine.lab_deferred, KVec::new());
+        let mut mask = 0u8;
+        for d in held.iter() {
+            if self.channels.post_ahead(d.channel, &d.record)? != d.expect {
+                return Err(EIO);
+            }
+            mask |= 1u8 << (d.channel as u8);
+            if d.render {
+                self.engine.lab_posted_render = Some([d.ta, d.fs]);
+            } else {
+                self.engine.lab_posted_compute[d.pipe] = Some(d.target);
+            }
+        }
+        super::lab::rec([
+            10 | u64::from(mask) << 8 | (held.len() as u64) << 16,
+            counter_ticks(),
+            0,
+            0,
+            0,
+            0,
+        ]);
+        self.flush_doorbells(&mut mask)?;
+        Ok(true)
     }
 
     /// Whether `job` requires `self.engine.flights` to drain to empty before it can
@@ -1445,6 +1524,14 @@ impl Firmware {
     /// marks it [`Engine::held_wait`] when only its own VM's flights hold it.
     fn note_hold(&mut self, job: &Arc<Job>, drain: bool) {
         let cause = self.hold_cause(job, drain);
+        super::lab::rec([
+            2 | (cause as u64) << 8,
+            counter_ticks(),
+            self.engine.pending.len() as u64,
+            self.engine.flights.len() as u64,
+            0,
+            0,
+        ]);
         let s = &mut self.engine.stats;
         s.hold[0] += 1;
         s.hold_causes[cause as usize] += 1;
@@ -3282,6 +3369,18 @@ impl Firmware {
         if f.msaa {
             job.vm.note_msaa_render();
         }
+        // LAB ONLY: hold this publication's records while records are held, or while work is in
+        // flight and the firmware has already taken every posted record of these channels.
+        let defer = super::lab::knob(super::lab::DEFER_RECORDS) != 0
+            && (!self.engine.lab_deferred.is_empty()
+                || (!self.engine.flights.is_empty() && {
+                    let mut taken = true;
+                    for &ch in channels {
+                        taken &= self.channels.read(ch)? == self.channels.producer(ch);
+                    }
+                    taken
+                }));
+        let mut lab_rec: [Option<u32>; 3] = [None; 3];
         let publication = (|| -> Result {
             if render {
                 let a = f.pb_slot as usize;
@@ -3350,7 +3449,7 @@ impl Firmware {
                         !self.engine.render_registered,
                     ),
                 };
-                let record = SubmitRecord {
+                let mut record = SubmitRecord {
                     unk_0: counter_ticks(),
                     qinfo,
                     kind: channel as u32,
@@ -3358,12 +3457,46 @@ impl Firmware {
                     event,
                     new_queue: u8::from(fresh),
                 };
+                if class_behind && super::lab::knob(super::lab::BEHIND_EVENT0) != 0 {
+                    record.event = 0;
+                }
+                if defer {
+                    let ahead = self
+                        .engine
+                        .lab_deferred
+                        .iter()
+                        .filter(|d| d.channel == channel)
+                        .count() as u32;
+                    let expect = (self.channels.producer(channel) + ahead + 1) % RING_SLOTS;
+                    lab_rec[channel as usize] = Some(expect);
+                    self.engine.lab_deferred.push(
+                        LabDeferred {
+                            channel,
+                            record,
+                            expect,
+                            render,
+                            ta: f.ta_target,
+                            fs: f.fs_target,
+                            pipe: compute_pipe,
+                            target: f.target,
+                        },
+                        GFP_NOWAIT,
+                    )?;
+                    continue;
+                }
                 if class_behind {
                     self.channels.post_ahead(channel, &record)?;
                 } else {
                     self.channels.post(channel, &record)?;
                 }
                 *pending_rings |= 1u8 << (channel as u8);
+            }
+            if !defer {
+                if render {
+                    self.engine.lab_posted_render = Some([f.ta_target, f.fs_target]);
+                } else {
+                    self.engine.lab_posted_compute[compute_pipe] = Some(f.target);
+                }
             }
             Ok(())
         })();
@@ -3373,9 +3506,9 @@ impl Firmware {
         // From the first counter/WRITE onward an error is uncertain. Keep the complete
         // retained flight even when a later channel store or doorbell fails.
         f.rec = [
-            self.channels.producer(Channel::Ta),
-            self.channels.producer(Channel::Fs),
-            self.channels.producer(Channel::Compute),
+            lab_rec[0].unwrap_or(self.channels.producer(Channel::Ta)),
+            lab_rec[1].unwrap_or(self.channels.producer(Channel::Fs)),
+            lab_rec[2].unwrap_or(self.channels.producer(Channel::Compute)),
         ];
         self.engine.ordinal = prefix.n;
         self.engine.draw = prefix.draw;
@@ -3400,6 +3533,23 @@ impl Firmware {
         self.engine.stage_seen = self.events.stage_events;
         f.behind = behind;
         self.stat_publish(f);
+        if super::lab::on() {
+            let ta_now = 0usize;
+            super::lab::rec([
+                1 | u64::from(f.renders) << 8
+                    | u64::from(f.computes) << 16
+                    | u64::from(behind) << 24
+                    | u64::from(defer) << 25
+                    | (compute_pipe as u64) << 28
+                    | (ta_now as u64) << 32
+                    | ((1 + f.group.len()) as u64) << 40,
+                counter_ticks(),
+                u64::from(if render { f.r_ta_stamp[0] } else { f.target }),
+                u64::from(if render { f.ta_target } else { f.target }),
+                u64::from(f.fs_target),
+                job.vm.id as u64,
+            ]);
+        }
         // First in-flight command on this render class or compute pipe starts about now;
         // commands queued behind the same class/pipe keep its oldest deadline.
         if render {
@@ -3752,7 +3902,7 @@ impl Firmware {
         } else {
             cmd.cmd.flags
         };
-        let plan = plan_render_barriers(
+        let mut plan = plan_render_barriers(
             plan_flags,
             has_prior_render,
             params::early_tiling(),
@@ -3765,11 +3915,18 @@ impl Firmware {
             ],
             cross_vm_prev,
         );
+        if super::lab::knob(super::lab::FS_SERIAL) != 0
+            && has_prior_render
+            && plan.ta_fs_wait != Some(prev_fs)
+        {
+            plan.fs_render_wait = Some(prev_fs);
+        }
         // Claim performs only a qualified per-use scrub, never allocator/list reset.
         self.slots
             .claim_pass_in(resources, k, Some(job.vm.id), geometry.tilemap_bytes)?;
         self.slots.hold_render_pass(k, &job.vm, resources)?;
-        let (refs, init_buffer) = if member == 0 {
+        let (mut refs, init_buffer) = if member == 0 {
+            f.lab_rncache = super::lab::knob(super::lab::RENDER_NCACHE) != 0;
             let (pb_mask, pb_home) = resources.pb_slot_mask()?;
             let heap_blocks = resources.pb_heap_blocks()?;
             let alloc_slot = self
@@ -3805,6 +3962,11 @@ impl Firmware {
             )?;
             (refs, false)
         };
+        if f.lab_rncache {
+            let r = &self.graph.render;
+            refs.notifier = r.notifier_cached.va;
+            refs.user_stamp = [r.user_stamp[0].va, r.user_stamp[1].va];
+        }
         f.has_timestamps |= !cmd.timestamp_outputs.is_empty();
         f.msaa |= cmd.is_multisampled();
         let p = resources.render_pass(k)?;
@@ -3918,13 +4080,19 @@ impl Firmware {
             || fs_wait_compute.iter().flatten().any(|w| w.initbm)
             || fs_wait_render.is_some_and(|w| w.initbm)
             || ta_wait_fs.is_some_and(|w| w.initbm);
-        let render_bar = cross_engine_barrier_type(producer_initbm, init_buffer);
+        let render_bar = if super::lab::knob(super::lab::CROSS_HOLD) != 0 {
+            BarrierType::Hold
+        } else {
+            cross_engine_barrier_type(producer_initbm, init_buffer)
+        };
         // Pipelined renders share TA/FS pipes across same-VM and cross-VM flights, so keep
         // the TA(N-1)->TA(N) `prev_barrier` (matching G15) whenever `plan.ta_fs_wait` does not
         // already serialize behind `prev_fs`. Emit `ta_fs_barrier` only when `plan.ta_fs_wait`
         // names an in-flight FS stamp, and `fs_dep` when `plan.fs_render_wait` names an
         // in-flight FS dependency (or cross-VM `prev_fs`) not already dominated by TA.
-        if plan.ta_prev_wait {
+        if plan.ta_prev_wait
+            && !(super::lab::knob(super::lab::NO_PREV_BARRIER) != 0 && !cross_vm_prev)
+        {
             let prev = encode::barrier(
                 r.fw_stamp[0].va,
                 prev_ta,
@@ -4008,7 +4176,11 @@ impl Firmware {
             0x70,
             target,
             refs.uuid,
-            BarrierType::Stamp,
+            if super::lab::knob(super::lab::OWN_HOLD) != 0 {
+                BarrierType::Hold
+            } else {
+                BarrierType::Stamp
+            },
         );
         p.own_barrier.write(0, &own)?;
         r.ring[0].w64(8 * pf.ta_head as usize, p.ta_work.va)?;
