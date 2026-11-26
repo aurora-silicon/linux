@@ -384,6 +384,22 @@ fn sense_ring_may_lap(elapsed_ns: i64) -> bool {
     elapsed_ns < 0 || elapsed_ns as u64 + SENSE_RING_PERIOD_NS >= SENSE_RING_NS
 }
 
+/// Frames the front-end has captured that its reader has not taken yet:
+/// `hw_ptr - appl_ptr` modulo `boundary`. `appl_ptr` is the reader's, so it
+/// can hold any value; `None` unless both pointers are positions below a
+/// non-zero `boundary`, and the caller stops the stream with an XRUN.
+fn sense_fe_unread(hw_ptr: usize, appl_ptr: usize, boundary: usize) -> Option<usize> {
+    if boundary == 0 || hw_ptr >= boundary || appl_ptr >= boundary {
+        return None;
+    }
+    if hw_ptr >= appl_ptr {
+        Some(hw_ptr - appl_ptr)
+    } else {
+        // Both below `boundary`: the difference fits, the sum is checked anyway.
+        hw_ptr.checked_add(boundary - appl_ptr)
+    }
+}
+
 /// Returns whether `incoming` frames fit strictly inside the capture front-end
 /// ring buffer of `buffer_frames` without overwriting unread frames
 /// (`unread_alsa`) or frames already copied since the last pointer sync
@@ -399,6 +415,21 @@ fn sense_ring_has_fe_space(
         .checked_add(pending)
         .and_then(|used| used.checked_add(incoming))
         .is_some_and(|total| total < buffer_frames)
+}
+
+/// Whether a running front-end of `buffer_frames` takes `incoming` more frames:
+/// its pointers are valid positions and the frames fit. Otherwise the caller
+/// stops it with an XRUN.
+fn sense_fe_takes(
+    buffer_frames: usize,
+    hw_ptr: usize,
+    appl_ptr: usize,
+    boundary: usize,
+    pending: usize,
+    incoming: usize,
+) -> bool {
+    sense_fe_unread(hw_ptr, appl_ptr, boundary)
+        .is_some_and(|unread| sense_ring_has_fe_space(buffer_frames, unread, pending, incoming))
 }
 
 /// The driver-owned speaker sense capture (base-ns ADMAC RX): a cyclic ring
@@ -642,13 +673,15 @@ impl SenseRing {
                 unsafe { bindings::snd_pcm_stop(sub, PCM_STATE_XRUN) };
             } else {
                 // SAFETY: as above; status and control are valid while running.
+                // The reader can map the control page and write `appl_ptr`
+                // at any time: read it once.
                 let (area, frames, period, hw_ptr, appl_ptr, boundary) = unsafe {
                     (
                         (*rt).dma_area,
                         (*rt).buffer_size as usize,
                         (*rt).period_size as usize,
                         (*(*rt).status).hw_ptr as usize,
-                        (*(*rt).control).appl_ptr as usize,
+                        ptr::addr_of!((*(*rt).control).appl_ptr).read_volatile() as usize,
                         (*rt).boundary as usize,
                     )
                 };
@@ -656,15 +689,8 @@ impl SenseRing {
                 let incoming = bytes / frame_bytes;
                 if !area.is_null() && !ring.is_null() && frames > 0 && incoming > 0 {
                     let mut pos = self.fe_pos.load(Ordering::Relaxed);
-                    let unread_alsa = if hw_ptr >= appl_ptr {
-                        hw_ptr - appl_ptr
-                    } else if boundary > 0 {
-                        hw_ptr + boundary - appl_ptr
-                    } else {
-                        frames
-                    };
                     let pending = (pos % frames + frames - hw_ptr % frames) % frames;
-                    if !sense_ring_has_fe_space(frames, unread_alsa, pending, incoming) {
+                    if !sense_fe_takes(frames, hw_ptr, appl_ptr, boundary, pending, incoming) {
                         // SAFETY: a running front-end, under its stream lock.
                         unsafe { bindings::snd_pcm_stop(sub, PCM_STATE_XRUN) };
                     } else {
@@ -1419,7 +1445,11 @@ unsafe fn sense_ring<'a>(
 /// incoming ring batches without XRUNning on the first callback.
 fn sense_pcm_hw(formats: u64, ring_period_bytes: usize) -> bindings::snd_pcm_hardware {
     let mut hw = pcm_hw();
-    hw.info |= bindings::SNDRV_PCM_INFO_BLOCK_TRANSFER | bindings::SNDRV_PCM_INFO_BATCH;
+    // SYNC_APPLPTR: the reader updates `appl_ptr` through ALSA, which checks
+    // it, rather than by writing a mapped control page.
+    hw.info |= bindings::SNDRV_PCM_INFO_BLOCK_TRANSFER
+        | bindings::SNDRV_PCM_INFO_BATCH
+        | bindings::SNDRV_PCM_INFO_SYNC_APPLPTR;
     hw.formats = formats;
     hw.period_bytes_min = hw.period_bytes_min.max(ring_period_bytes);
     hw.periods_max = (hw.buffer_bytes_max / hw.period_bytes_min) as u32;
@@ -2524,6 +2554,77 @@ mod tests {
         assert!(!sense_ring_has_fe_space(1024, 512, 240, 360));
         // Overflow in unread + pending + incoming fails closed
         assert!(!sense_ring_has_fe_space(1024, usize::MAX, 0, 1));
+    }
+
+    #[test]
+    fn sense_fe_unread_rejects_out_of_range_pointers() {
+        // A reader's pointer far past the boundary first: modular arithmetic
+        // on it underflows, which panics with Rust overflow checks.
+        assert_eq!(sense_fe_unread(100, usize::MAX, 4096), None);
+        assert_eq!(sense_fe_unread(100, 100 + 4096 + 1, 4096), None);
+        // ALSA's boundary is the buffer size times the largest power of two
+        // that keeps it below LONG_MAX / 2; any non-zero value must work.
+        for boundary in [1, 4096, 0x4000_0000, usize::MAX / 2, usize::MAX] {
+            // Valid positions, with and without the wrap.
+            assert_eq!(sense_fe_unread(0, 0, boundary), Some(0));
+            assert_eq!(
+                sense_fe_unread(boundary - 1, 0, boundary),
+                Some(boundary - 1)
+            );
+            assert_eq!(
+                sense_fe_unread(0, boundary - 1, boundary),
+                Some(1 % boundary)
+            );
+            // The reader's pointer at, past or far past the boundary.
+            for appl in [boundary, boundary.saturating_add(1), usize::MAX] {
+                assert_eq!(sense_fe_unread(0, appl, boundary), None);
+                assert_eq!(sense_fe_unread(boundary - 1, appl, boundary), None);
+            }
+            // A hardware pointer at or past the boundary.
+            assert_eq!(sense_fe_unread(boundary, 0, boundary), None);
+            assert_eq!(sense_fe_unread(usize::MAX, 0, boundary), None);
+        }
+        assert_eq!(sense_fe_unread(100, 40, 4096), Some(60));
+        assert_eq!(sense_fe_unread(10, 4076, 4096), Some(30));
+        // No boundary yet: nothing is a valid position.
+        assert_eq!(sense_fe_unread(0, 0, 0), None);
+        assert_eq!(sense_fe_unread(5, 3, 0), None);
+        assert_eq!(sense_fe_unread(3, 5, 0), None);
+        assert_eq!(sense_fe_unread(usize::MAX, usize::MAX, usize::MAX), None);
+    }
+
+    #[test]
+    fn sense_fe_takes_xruns_on_bad_pointers() {
+        let (frames, boundary) = (1024, 1024 << 20);
+        // Room for a batch, at both sides of the wrap.
+        assert!(sense_fe_takes(frames, 600, 512, boundary, 0, 120));
+        assert!(sense_fe_takes(frames, 40, boundary - 48, boundary, 0, 120));
+        // Valid but full: an XRUN, as before.
+        assert!(!sense_fe_takes(frames, 1000, 0, boundary, 0, 120));
+        // Invalid pointers: an XRUN, never arithmetic on them.
+        for (hw, appl, b) in [
+            (600, boundary, boundary),
+            (600, usize::MAX, boundary),
+            (600, 600 + boundary + 1, boundary),
+            (boundary, 0, boundary),
+            (usize::MAX, 0, boundary),
+            (600, 512, 0),
+            (0, 0, 0),
+            (usize::MAX, usize::MAX, usize::MAX),
+        ] {
+            assert!(!sense_fe_takes(frames, hw, appl, b, 0, 120));
+        }
+    }
+
+    #[test]
+    fn sense_pcm_syncs_the_reader_pointer() {
+        for cfg in [&HW_CFG_T8142, &HW_CFG_T8142_6AMP, &HW_CFG_T6050] {
+            let ring = SenseRing::new(cfg.sense_channels as usize * 2);
+            let hw = sense_pcm_hw(cfg.sense_formats, ring.period_bytes());
+            assert_ne!(hw.info & bindings::SNDRV_PCM_INFO_SYNC_APPLPTR, 0);
+        }
+        // The other front-ends keep their mapped control page.
+        assert_eq!(pcm_hw().info & bindings::SNDRV_PCM_INFO_SYNC_APPLPTR, 0);
     }
 
     #[test]
