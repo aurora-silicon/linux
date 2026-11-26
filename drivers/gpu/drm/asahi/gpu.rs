@@ -220,6 +220,15 @@ fn garbage_action(
 /// longest ago are released once more than this many wait. Each one costs roughly 60 KiB.
 const MAX_POWERED_CONTEXTS: usize = 1024;
 
+/// Releases the contexts invalidated longest ago while more than [`MAX_POWERED_CONTEXTS`] wait
+/// for a firmware PowerOff. `powered` is in invalidation order, oldest first.
+fn release_oldest_powered<T>(powered: &mut KVec<T>) {
+    let excess = powered.len().saturating_sub(MAX_POWERED_CONTEXTS);
+    if excess != 0 {
+        core::mem::drop(powered.drain(..excess));
+    }
+}
+
 /// Global allocators used for kernel-half structures.
 pub(crate) struct KernelAllocators {
     pub(crate) private: alloc::DefaultAllocator,
@@ -1891,10 +1900,7 @@ impl GpuManager for GpuManager::ver {
             }
 
             // Bound the memory held when no PowerOff boundary arrives, oldest first.
-            let excess = powered.len().saturating_sub(MAX_POWERED_CONTEXTS);
-            if excess != 0 {
-                core::mem::drop(powered.drain(..excess));
-            }
+            release_oldest_powered(&mut powered);
         }
 
         let mut guard = self.alloc.lock();
@@ -2225,6 +2231,35 @@ impl GpuManagerPriv for GpuManager::ver {
 #[kunit_tests(asahi_gpu_garbage)]
 mod tests {
     use super::*;
+
+    /// Invalidated contexts in invalidation order, numbered from 0.
+    fn invalidated(count: usize) -> KVec<usize> {
+        let mut powered = KVec::with_capacity(count, GFP_KERNEL).unwrap();
+        for context in 0..count {
+            powered.push(context, GFP_KERNEL).unwrap();
+            release_oldest_powered(&mut powered);
+        }
+        powered
+    }
+
+    #[test]
+    fn contexts_up_to_the_bound_all_wait_for_poweroff() {
+        let powered = invalidated(MAX_POWERED_CONTEXTS);
+        assert_eq!(powered.len(), MAX_POWERED_CONTEXTS);
+        assert_eq!(powered[0], 0);
+    }
+
+    #[test]
+    fn churn_without_poweroff_holds_only_the_newest_contexts() {
+        // Four times the bound without a PowerOff: without the bound all would be held.
+        let churned = 4 * MAX_POWERED_CONTEXTS;
+        let powered = invalidated(churned);
+        assert_eq!(powered.len(), MAX_POWERED_CONTEXTS);
+        // The ones invalidated longest ago went first, and the order is kept.
+        assert_eq!(powered[0], churned - MAX_POWERED_CONTEXTS);
+        assert!(powered.windows(2).all(|pair| pair[1] == pair[0] + 1));
+        assert_eq!(powered[MAX_POWERED_CONTEXTS - 1], churned - 1);
+    }
 
     const UNDER: (usize, usize) = (MAX_FW_ALLOC_GARBAGE_OBJECTS, MAX_FW_ALLOC_GARBAGE_BYTES);
     const OVER_COUNT: (usize, usize) = (MAX_FW_ALLOC_GARBAGE_OBJECTS + 1, 0);
