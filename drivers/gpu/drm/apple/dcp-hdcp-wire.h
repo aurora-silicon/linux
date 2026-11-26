@@ -45,6 +45,9 @@
 #define DCP_HDCP_DEV_GROUP		0
 #define DCP_HDCP_DEV_QUERY		4
 #define DCP_HDCP_DEV_QUERY_LEN		0x20
+/* Its counterpart when the session ends: DCP waits for it before power-down. */
+#define DCP_HDCP_DEV_END		5
+#define DCP_HDCP_DEV_END_LEN		0x10
 /* The device service's information call, once after it is opened. */
 #define DCP_HDCP_DEV_INFO		0xc
 #define DCP_HDCP_DEV_INFO_LEN		0x50

@@ -82,6 +82,8 @@ struct dcp_hdcp {
 	/* Sessions DCP announced for HDCP 1.x: declined, this is HDCP 2.2 only. */
 	struct apple_epic_service *hdcp1[DCP_HDCP_IFACES];
 	unsigned long ev_bits;
+	/* The device service was asked for a session (query) and not yet told it ended. */
+	bool dev_begun;
 	bool closed;
 	bool cancel;
 	struct dcp_hdcp_event queue[DCP_HDCP_QUEUE];
@@ -470,6 +472,21 @@ static void dcp_hdcp_kick_work(struct work_struct *work)
 }
 
 /* Encryption off, the SEP session closed, DCP told; the picture stays. */
+/* Tells the DP device service the session it was asked for has ended. */
+static void dcp_hdcp_dev_end(struct dcp_hdcp *h)
+{
+	struct apple_epic_service *relay;
+
+	if (!xchg(&h->dev_begun, false))
+		return;
+	relay = dcp_hdcp_pin(h, &h->relay);
+	if (!relay)
+		return;
+	dcp_hdcp_plain_call(relay, DCP_HDCP_DEV_GROUP, DCP_HDCP_DEV_END,
+			    DCP_HDCP_DEV_END_LEN, 0);
+	afk_service_put(relay);
+}
+
 static void dcp_hdcp_teardown_work(struct work_struct *work)
 {
 	struct dcp_hdcp *h = container_of(work, struct dcp_hdcp, teardown_work);
@@ -478,6 +495,7 @@ static void dcp_hdcp_teardown_work(struct work_struct *work)
 	dcp_hdcp_abort(&h->tx);
 	if (was_open)
 		dcp_hdcp_report(h, DCP_HDCP_PROGRESS_IDLE, false, false, false);
+	dcp_hdcp_dev_end(h);
 }
 
 /* One authentication, from DCP's start of the session to its result. */
@@ -503,9 +521,11 @@ static void dcp_hdcp_run(struct dcp_hdcp *h)
 	h->tx.channel = h->channel;
 
 	if (relay) {
-		/* The device service's query opens each session. */
-		dcp_hdcp_plain_call(relay, DCP_HDCP_DEV_GROUP, DCP_HDCP_DEV_QUERY,
-				    DCP_HDCP_DEV_QUERY_LEN, 0);
+		/* The device service's query opens each session; dcp_hdcp_dev_end() closes it. */
+		dcp_hdcp_dev_end(h);
+		if (!dcp_hdcp_plain_call(relay, DCP_HDCP_DEV_GROUP, DCP_HDCP_DEV_QUERY,
+					 DCP_HDCP_DEV_QUERY_LEN, 0))
+			WRITE_ONCE(h->dev_begun, true);
 		afk_service_put(relay);
 		ret = dcp_hdcp_authenticate(&h->tx);
 	} else {
@@ -540,6 +560,7 @@ static void dcp_hdcp_close(struct dcp_hdcp *h, struct apple_epic_service *servic
 	/* The session goes back to idle on DCP's side. */
 	if (service)
 		dcp_hdcp_report(h, DCP_HDCP_PROGRESS_IDLE, false, false, false);
+	dcp_hdcp_dev_end(h);
 	spin_lock_irqsave(&h->svc_lock, flags);
 	if (h->session == service)
 		h->session = NULL;
