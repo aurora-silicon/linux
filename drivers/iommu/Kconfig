@@ -355,6 +355,9 @@ config APPLE_DART_KUNIT_TEST
 	  roots retain their mappings and reject conflicting host entries.
 	  Verify that unmapping an IOVA maintains independent remap targets.
 	  That case requires kernel pages of at least 16 KiB.
+	  Inject each way an unmap's TLB retirement can fail and verify that
+	  the domain's streams are stopped, or the DART reported stuck, and
+	  that the domain then refuses mappings.
 
 config S390_IOMMU
 	def_bool y if S390 && PCI
