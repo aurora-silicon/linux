@@ -6377,10 +6377,7 @@ params_done:
 	 * roots of its own (dart-dcpextN SID 23, dart-dispextN SIDs 0 and 16).
 	 */
 	dart->fw_mirror = dart->locked && !dart->fw_handoff &&
-		(of_device_is_compatible(dev->of_node, "apple,t6041-dart") ||
-		 of_device_is_compatible(dev->of_node, "apple,t6050-dart") ||
-		 of_device_is_compatible(dev->of_node, "apple,t8140-dart") ||
-		 of_device_is_compatible(dev->of_node, "apple,t8142-dart"));
+		apple_dart_keeps_locked_roots(dev->of_node);
 	/*
 	 * A T6040/T6041 MTP (apple,t6041-mtp on both) may arrive live after the
 	 * boot keyboard used it; its firmware cannot be restarted. Do not reset
