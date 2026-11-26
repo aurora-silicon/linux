@@ -9,7 +9,7 @@
 //! Policy creation and the initial snapshot take the policy rwsem before the
 //! requests mutex. Removal callbacks and the worker take only requests;
 //! notifier unregistration joins callbacks without holding that mutex.
-//! M5 requests full CPU capacity only while refill pressure keeps the detector
+//! Requests full CPU capacity only while refill pressure keeps the detector
 //! active. Sustained demand can renew its deadline indefinitely; withdrawal
 //! occurs on a later worker poll, not at an exact twenty-millisecond boundary.
 
@@ -38,12 +38,29 @@ unsafe extern "C" {
 
 const MAX_REFILL_TICKS: u64 = CLOCK_HZ / 500;
 const _: () = assert!(CLOCK_HZ == crate::hw::t8140::resources::COMMAND_TIMESTAMP_HZ);
+const EWMA_WINDOW: u64 = 8;
+const REFILL_BOUND_DIV: u64 = 4;
 const STREAK_ON: u32 = 8;
 const STREAK_MAX: u32 = 64;
 const LINGER_NS: u64 = 20_000_000;
+/// Upper EWMA busy-sum (~8 x 4 ms passes) below which measurable inter-pass
+/// host refill gaps benefit from full CPU turnaround speed without boosting
+/// long multi-millisecond GPU-bound frames.
+const TURNAROUND_MAX_PASS_MS: u64 = 4;
+const TURNAROUND_BUSY_SUM_TICKS: u64 =
+    CLOCK_HZ * TURNAROUND_MAX_PASS_MS / 1000 * EWMA_WINDOW;
+/// Refill-gap share to engage (1/16 = 6.25%) and hold (3x hysteresis -> 1/48 = 2.08%,
+/// still above the 2.0% GPU-bound pass gap) CPU capacity on short turnaround-exposed
+/// passes once boosting shrinks each queue's refill gap.
+const TURNAROUND_ENTER_DIV: u64 = 16;
+const TURNAROUND_HOLD_DIV: u64 = TURNAROUND_ENTER_DIV * 3;
+/// Per-context completion timestamps so staggered concurrent depth-1 queues
+/// still report each queue's own host refill gap instead of masking it behind
+/// a sibling queue's overlapping pass.
+const CONTEXT_TRACKS: usize = 16;
 const POLL_MS: i64 = 2;
 #[cfg(CONFIG_CPU_FREQ)]
-const FLOOR_PERCENT: u64 = 50;
+const FLOOR_PERCENT: u64 = 100;
 const WAIT_UTIL_MIN: u32 = 512;
 const WAIT_HINT_MS: u32 = 20;
 #[cfg(CONFIG_CPU_FREQ)]
@@ -51,6 +68,7 @@ const MAX_POLICIES: usize = 8;
 
 struct Detector {
     last_end: AtomicU64,
+    context_end: [AtomicU64; CONTEXT_TRACKS],
     idle: AtomicU64,
     busy: AtomicU64,
     streak: AtomicU32,
@@ -66,6 +84,7 @@ impl Detector {
     const fn new() -> Self {
         Self {
             last_end: AtomicU64::new(0),
+            context_end: [const { AtomicU64::new(0) }; CONTEXT_TRACKS],
             idle: AtomicU64::new(0),
             busy: AtomicU64::new(0),
             streak: AtomicU32::new(0),
@@ -80,33 +99,46 @@ impl Detector {
     fn decay_add(sum: &AtomicU64, add: u64) -> u64 {
         let mut next = 0;
         let _ = sum.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
-            next = value - value / 8 + add;
+            next = value - value / EWMA_WINDOW + add;
             Some(next)
         });
         next
     }
 
-    fn note(&self, start: u64, end: u64, now: u64) {
+    fn note(&self, context: u32, start: u64, end: u64, now: u64) {
         if start == 0 || end <= start {
             return;
         }
-        let previous = self.last_end.fetch_max(end, Ordering::AcqRel);
-        let (idle, busy, paced) = if previous == 0 {
-            (0, end - start, true)
-        } else if start >= previous {
-            let gap = start - previous;
+        let global_prev = self.last_end.fetch_max(end, Ordering::AcqRel);
+        let ctx_prev = self.context_end[(context as usize) % CONTEXT_TRACKS]
+            .fetch_max(end, Ordering::AcqRel);
+        let paced = global_prev == 0
+            || (start >= global_prev && start - global_prev >= MAX_REFILL_TICKS);
+        let (idle, busy) = if ctx_prev == 0 {
+            (0, end - start)
+        } else if start >= ctx_prev {
+            let gap = start - ctx_prev;
             if gap < MAX_REFILL_TICKS {
-                (gap, end - start, false)
+                (gap, end - start)
             } else {
-                (0, end - start, true)
+                (0, end - start)
             }
-        } else if end > previous {
-            (0, end - previous, false)
+        } else if end > ctx_prev {
+            (0, end - ctx_prev)
         } else {
-            (0, 0, false)
+            (0, 0)
         };
-        let idle_sum = Self::decay_add(&self.idle, idle);
-        let busy_sum = Self::decay_add(&self.busy, busy);
+        let (idle_sum, busy_sum) = if idle == 0 && busy == 0 {
+            (
+                self.idle.load(Ordering::Acquire),
+                self.busy.load(Ordering::Acquire),
+            )
+        } else {
+            (
+                Self::decay_add(&self.idle, idle),
+                Self::decay_add(&self.busy, busy),
+            )
+        };
         let streak = if paced {
             self.streak.store(0, Ordering::Release);
             0
@@ -125,7 +157,15 @@ impl Detector {
         if streak < STREAK_ON {
             return;
         }
-        if idle_sum.saturating_mul(4) >= busy_sum {
+        let refill_bound = idle_sum.saturating_mul(REFILL_BOUND_DIV) >= busy_sum;
+        let turnaround_div = if self.active.load(Ordering::Acquire) {
+            TURNAROUND_HOLD_DIV
+        } else {
+            TURNAROUND_ENTER_DIV
+        };
+        let turnaround_exposed = busy_sum <= TURNAROUND_BUSY_SUM_TICKS
+            && idle_sum.saturating_mul(turnaround_div) >= busy_sum;
+        if refill_bound || turnaround_exposed {
             self.until.store(now + LINGER_NS, Ordering::Release);
             if !self.active.swap(true, Ordering::AcqRel) {
                 self.pending.store(true, Ordering::Release);
@@ -152,8 +192,6 @@ struct Requests {
     policies: [*mut bindings::cpufreq_policy; MAX_POLICIES],
     maxima: [u32; MAX_POLICIES],
     applied: [u32; MAX_POLICIES],
-    /// Full CPU capacity for M5 refill pressure; other profiles retain their floor.
-    floor_percent: u64,
 }
 
 // SAFETY: Each nonnull policy owns a kobject reference. The device requests
@@ -163,19 +201,18 @@ unsafe impl Send for Requests {}
 
 #[cfg(CONFIG_CPU_FREQ)]
 impl Requests {
-    fn new(m5: bool) -> Self {
+    fn new() -> Self {
         Self {
             requests: Opaque::zeroed(),
             policies: [ptr::null_mut(); MAX_POLICIES],
             maxima: [0; MAX_POLICIES],
             applied: [0; MAX_POLICIES],
-            floor_percent: if m5 { 100 } else { FLOOR_PERCENT },
         }
     }
 
-    fn target_floor(maximum: u32, floor_percent: u64, enabled: bool) -> u32 {
+    fn target_floor(maximum: u32, enabled: bool) -> u32 {
         if enabled {
-            (u64::from(maximum) * floor_percent / 100) as u32
+            (u64::from(maximum) * FLOOR_PERCENT / 100) as u32
         } else {
             bindings::FREQ_QOS_MIN_DEFAULT_VALUE as u32
         }
@@ -228,7 +265,7 @@ impl Requests {
             if this.policies[index].is_null() {
                 continue;
             }
-            let value = Self::target_floor(this.maxima[index], *this.floor_percent, enabled);
+            let value = Self::target_floor(this.maxima[index], enabled);
             if this.applied[index] != value {
                 // SAFETY: This slot is registered, pinned and exclusively locked;
                 // the policy reference keeps its constraints alive through REMOVE.
@@ -318,15 +355,13 @@ pub(crate) struct Feed {
 }
 
 impl Feed {
-    pub(crate) fn new(m5: bool) -> Result<Arc<Self>> {
-        #[cfg(not(CONFIG_CPU_FREQ))]
-        let _ = m5;
+    pub(crate) fn new() -> Result<Arc<Self>> {
         let feed = Arc::pin_init(
             pin_init!(Self {
                 detector: Detector::new(),
                 runs <- new_spinlock!(super::power::BusyRuns::new(), "G17 busy runs"),
                 #[cfg(CONFIG_CPU_FREQ)]
-                requests <- new_mutex!(Requests::new(m5), "G17 CPU feed"),
+                requests <- new_mutex!(Requests::new(), "G17 CPU feed"),
                 #[cfg(CONFIG_CPU_FREQ)]
                 notifier <- pin_init!(PolicyNotifier {
                     block: Opaque::new(bindings::notifier_block {
@@ -449,9 +484,9 @@ impl Feed {
 
     /// Firmware execution intervals in the device's 24 MHz timestamp domain.
     /// Missing, unexecuted and wrapped intervals must not affect the detector.
-    pub(crate) fn note_pass(&self, start: u64, end: u64) {
+    pub(crate) fn note_pass(&self, context: u32, start: u64, end: u64) {
         if cfg!(CONFIG_CPU_FREQ) {
-            self.detector.note(start, end, Self::now());
+            self.detector.note(context, start, end, Self::now());
         }
     }
 
@@ -589,7 +624,7 @@ mod detector_tests {
         let mut start = 1000;
         let mut now = 1_000_000;
         for _ in 0..passes {
-            detector.note(start, start + busy, now);
+            detector.note(0, start, start + busy, now);
             start += busy + gap;
             now += 1_000_000;
         }
@@ -619,7 +654,7 @@ mod detector_tests {
         let mut start = 1000;
         let mut now = 1_000_000;
         for _ in 0..16 {
-            detector.note(start, start + busy, now);
+            detector.note(0, start, start + busy, now);
             start += busy + gap;
             now += step_ns;
         }
@@ -654,5 +689,86 @@ mod detector_tests {
         let detector = Detector::new();
         let now = run(&detector, u64::from(STREAK_ON) - 1, CLOCK_HZ / 500, 0);
         assert!(!detector.bound(now) && !detector.wanted(now));
+    }
+
+    #[test]
+    fn medium_depth1_turnaround_requests_and_holds_floor() {
+        let detector = Detector::new();
+        // Unboosted 1.35 ms pass with 195 us host refill gap (~14.4% >= 1/16).
+        let busy = CLOCK_HZ * 1350 / 1_000_000;
+        let gap_unboosted = CLOCK_HZ * 195 / 1_000_000;
+        let gap_boosted = CLOCK_HZ * 78 / 1_000_000;
+        let mut start = 1000;
+        let mut now = 1_000_000;
+        for _ in 0..16 {
+            detector.note(1, start, start + busy, now);
+            start += busy + gap_unboosted;
+            now += 1_550_000;
+        }
+        assert!(detector.wanted(now));
+        assert!(!detector.bound(now));
+        // Once boosted, the refill gap shrinks to 78 us (~5.8%) and must hold.
+        for _ in 0..32 {
+            detector.note(1, start, start + busy, now);
+            start += busy + gap_boosted;
+            now += 1_430_000;
+        }
+        assert!(detector.wanted(now));
+        assert!(!detector.bound(now));
+    }
+
+    #[test]
+    fn staggered_two_queue_depth1_holds_floor_without_masking() {
+        let detector = Detector::new();
+        let busy = CLOCK_HZ * 2280 / 1_000_000;
+        let gap_unboosted = CLOCK_HZ * 165 / 1_000_000;
+        let gap_boosted = CLOCK_HZ * 72 / 1_000_000;
+        let stagger = CLOCK_HZ * 180 / 1_000_000;
+        let mut s0 = 1000;
+        let mut s1 = s0 + stagger;
+        let mut now = 1_000_000;
+        // Two depth-1 queues staggered by 180 us: GPU-wide gap is 0, but each
+        // queue has a 165 us unboosted -> 72 us boosted host refill gap.
+        for _ in 0..12 {
+            detector.note(3, s0, s0 + busy, now);
+            detector.note(4, s1, s1 + busy, now + 180_000);
+            s0 += busy + gap_unboosted;
+            s1 += busy + gap_unboosted;
+            now += 2_450_000;
+        }
+        assert!(detector.wanted(now));
+        for _ in 0..40 {
+            detector.note(3, s0, s0 + busy, now);
+            detector.note(4, s1, s1 + busy, now + 180_000);
+            s0 += busy + gap_boosted;
+            s1 += busy + gap_boosted;
+            now += 2_350_000;
+        }
+        assert!(detector.wanted(now));
+        assert!(!detector.bound(now));
+    }
+
+    #[test]
+    fn pipelined_stream_drops_turnaround_floor_cleanly() {
+        let detector = Detector::new();
+        let busy = CLOCK_HZ * 1150 / 1_000_000;
+        let gap_unboosted = CLOCK_HZ * 180 / 1_000_000;
+        let mut start = 1000;
+        let mut now = 1_000_000;
+        for _ in 0..16 {
+            detector.note(2, start, start + busy, now);
+            start += busy + gap_unboosted;
+            now += 1_330_000;
+        }
+        assert!(detector.wanted(now));
+        // Transition to zero-gap pipelined submissions: idle_sum decays below
+        // the hold threshold and the floor expires after LINGER_NS.
+        for _ in 0..48 {
+            detector.note(2, start, start + busy, now);
+            start += busy;
+            now += 1_150_000;
+        }
+        assert!(detector.bound(now));
+        assert!(!detector.wanted(now));
     }
 }

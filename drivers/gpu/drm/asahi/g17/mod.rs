@@ -2022,7 +2022,7 @@ impl Gpu {
         let renders = availability::Availability::new()?;
         let traversal = runtime::traversal::Gate::new()?;
         let reclaim = runtime::teardown::ReclaimBatch::new()?;
-        let feed = feed::Feed::new(m5)?;
+        let feed = feed::Feed::new()?;
         let alternate = cfg.core_layout.cores.is_some_and(|(clusters, cores)| {
             clusters == id.num_clusters
                 && cores != active_cores
