@@ -3081,8 +3081,8 @@ static int apple_dart_domain_flush_tlb_range(struct apple_dart_domain *domain,
 		if (gate == APPLE_DART_WRITER_CLOSED) {
 			ret = stream.dart->locked ?
 				apple_dart_hw_sync_locked(cfg, &stream, true) : 0;
-			apple_dart_sleep_writer_put(stream.dart, gate);
 			apple_dart_retire_fail(retire, &stream, ret, false);
+			apple_dart_sleep_writer_put(stream.dart, gate);
 			err = err ?: ret;
 			continue;
 		}
