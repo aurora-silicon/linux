@@ -269,13 +269,14 @@ struct brcmf_msgbuf_work_item {
 };
 
 /*
- * Receive buffers of one size, in pages that hold nothing else and stay
- * mapped while the rings exist. An IOMMU maps whole pages, so a device that
- * writes past the length it was given still reaches only other receive
- * buffers, never an skb or other host memory. A completed buffer is copied
- * into a new skb and goes back to the pool.
+ * DMA buffers of one size, in pages that hold nothing else and stay mapped
+ * while the rings exist. An IOMMU maps whole pages, so a device that reads or
+ * writes past the length it was given still reaches only other buffers of the
+ * pool, never an skb or other host memory. A frame is copied into a buffer to
+ * be sent, and out of one when it was received; the buffer then goes back to
+ * the pool.
  */
-struct brcmf_msgbuf_rxpool {
+struct brcmf_msgbuf_pool {
 	struct device *dev;
 	enum dma_data_direction direction;
 	u32 buf_size;
@@ -284,9 +285,10 @@ struct brcmf_msgbuf_rxpool {
 	u32 nr_chunks;
 	void **chunk_cpu;
 	dma_addr_t *chunk_dma;
-	spinlock_t lock;	/* protects free and nr_free */
+	spinlock_t lock;	/* protects free, nr_free and busy */
 	u32 *free;
 	u32 nr_free;
+	unsigned long *busy;	/* posted, until its completion */
 };
 
 struct brcmf_msgbuf {
@@ -327,8 +329,9 @@ struct brcmf_msgbuf {
 
 	struct brcmf_msgbuf_pktids *tx_pktids;
 	struct brcmf_msgbuf_pktids *rx_pktids;
-	struct brcmf_msgbuf_rxpool rx_data_pool;
-	struct brcmf_msgbuf_rxpool rx_ctl_pool;
+	struct brcmf_msgbuf_pool tx_pool;
+	struct brcmf_msgbuf_pool rx_data_pool;
+	struct brcmf_msgbuf_pool rx_ctl_pool;
 	struct brcmf_flowring *flow;
 
 	struct workqueue_struct *txflow_wq;
@@ -347,9 +350,9 @@ struct brcmf_msgbuf_pktid {
 	u16 data_offset;
 	struct sk_buff *skb;
 	dma_addr_t physaddr;
-	/* receive: the posted buffer, physaddr being its DMA address */
-	struct brcmf_msgbuf_rxpool *rxpool;
-	u32 rxbuf;
+	/* the posted buffer, physaddr being its DMA address */
+	struct brcmf_msgbuf_pool *pool;
+	u32 buf;
 };
 
 struct brcmf_msgbuf_pktids {
@@ -442,39 +445,7 @@ brcmf_msgbuf_claim_pktid(struct brcmf_msgbuf_pktids *pktids, u32 *idx)
 }
 
 
-static int
-brcmf_msgbuf_alloc_pktid(struct device *dev,
-			 struct brcmf_msgbuf_pktids *pktids,
-			 struct sk_buff *skb, u16 data_offset,
-			 dma_addr_t *physaddr, u32 *idx)
-{
-	struct brcmf_msgbuf_pktid *array;
-
-	array = pktids->array;
-
-	*physaddr = dma_map_single(dev, skb->data + data_offset,
-				   skb->len - data_offset, pktids->direction);
-
-	if (dma_mapping_error(dev, *physaddr)) {
-		brcmf_err("dma_map_single failed !!\n");
-		return -ENOMEM;
-	}
-
-	if (brcmf_msgbuf_claim_pktid(pktids, idx)) {
-		dma_unmap_single(dev, *physaddr, skb->len - data_offset,
-				 pktids->direction);
-		return -ENOMEM;
-	}
-
-	array[*idx].data_offset = data_offset;
-	array[*idx].physaddr = *physaddr;
-	array[*idx].skb = skb;
-
-	return 0;
-}
-
-
-static void brcmf_msgbuf_rxpool_free(struct brcmf_msgbuf_rxpool *pool)
+static void brcmf_msgbuf_pool_free(struct brcmf_msgbuf_pool *pool)
 {
 	u32 i;
 
@@ -487,17 +458,19 @@ static void brcmf_msgbuf_rxpool_free(struct brcmf_msgbuf_rxpool *pool)
 	kfree(pool->chunk_cpu);
 	kfree(pool->chunk_dma);
 	kfree(pool->free);
+	bitmap_free(pool->busy);
 	pool->chunk_cpu = NULL;
 	pool->chunk_dma = NULL;
 	pool->free = NULL;
+	pool->busy = NULL;
 	pool->nr_free = 0;
 }
 
 
-static int brcmf_msgbuf_rxpool_init(struct device *dev,
-				    struct brcmf_msgbuf_rxpool *pool,
-				    u32 nr_bufs, u32 buf_size,
-				    enum dma_data_direction direction)
+static int brcmf_msgbuf_pool_init(struct device *dev,
+				  struct brcmf_msgbuf_pool *pool,
+				  u32 nr_bufs, u32 buf_size,
+				  enum dma_data_direction direction)
 {
 	u32 i;
 
@@ -514,7 +487,8 @@ static int brcmf_msgbuf_rxpool_init(struct device *dev,
 	pool->chunk_dma = kcalloc(pool->nr_chunks, sizeof(*pool->chunk_dma),
 				  GFP_KERNEL);
 	pool->free = kcalloc(nr_bufs, sizeof(*pool->free), GFP_KERNEL);
-	if (!pool->chunk_cpu || !pool->chunk_dma || !pool->free)
+	pool->busy = bitmap_zalloc(nr_bufs, GFP_KERNEL);
+	if (!pool->chunk_cpu || !pool->chunk_dma || !pool->free || !pool->busy)
 		goto fail;
 
 	for (i = 0; i < pool->nr_chunks; i++) {
@@ -537,32 +511,54 @@ static int brcmf_msgbuf_rxpool_init(struct device *dev,
 	return 0;
 
 fail:
-	brcmf_msgbuf_rxpool_free(pool);
+	brcmf_msgbuf_pool_free(pool);
 	return -ENOMEM;
 }
 
 
-static dma_addr_t brcmf_msgbuf_rxbuf_dma(struct brcmf_msgbuf_rxpool *pool,
-					 u32 buf)
+static dma_addr_t brcmf_msgbuf_buf_dma(struct brcmf_msgbuf_pool *pool,
+				       u32 buf)
 {
 	return pool->chunk_dma[buf / pool->bufs_per_chunk] +
 	       (buf % pool->bufs_per_chunk) * pool->buf_size;
 }
 
 
-static void *brcmf_msgbuf_rxbuf_cpu(struct brcmf_msgbuf_rxpool *pool, u32 buf)
+static void *brcmf_msgbuf_buf_cpu(struct brcmf_msgbuf_pool *pool, u32 buf)
 {
 	return pool->chunk_cpu[buf / pool->bufs_per_chunk] +
 	       (buf % pool->bufs_per_chunk) * pool->buf_size;
 }
 
 
-static void brcmf_msgbuf_rxbuf_put(struct brcmf_msgbuf_rxpool *pool, u32 buf)
+static int brcmf_msgbuf_buf_get(struct brcmf_msgbuf_pool *pool, u32 *buf)
 {
 	unsigned long flags;
 
 	spin_lock_irqsave(&pool->lock, flags);
-	pool->free[pool->nr_free++] = buf;
+	if (!pool->nr_free) {
+		spin_unlock_irqrestore(&pool->lock, flags);
+		return -ENOMEM;
+	}
+	*buf = pool->free[--pool->nr_free];
+	__set_bit(*buf, pool->busy);
+	spin_unlock_irqrestore(&pool->lock, flags);
+
+	return 0;
+}
+
+
+/*
+ * A completion the firmware sends for a packet id being posted can name a
+ * buffer already back in the pool: it is not returned twice.
+ */
+static void brcmf_msgbuf_buf_put(struct brcmf_msgbuf_pool *pool, u32 buf)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&pool->lock, flags);
+	if (__test_and_clear_bit(buf, pool->busy))
+		pool->free[pool->nr_free++] = buf;
 	spin_unlock_irqrestore(&pool->lock, flags);
 }
 
@@ -570,27 +566,20 @@ static void brcmf_msgbuf_rxbuf_put(struct brcmf_msgbuf_rxpool *pool, u32 buf)
 /* Post a receive buffer whose data starts data_offset bytes into it. */
 static int
 brcmf_msgbuf_alloc_rx_pktid(struct brcmf_msgbuf_pktids *pktids,
-			    struct brcmf_msgbuf_rxpool *pool, u16 data_offset,
+			    struct brcmf_msgbuf_pool *pool, u16 data_offset,
 			    dma_addr_t *physaddr, u32 *idx)
 {
 	struct brcmf_msgbuf_pktid *pktid;
-	unsigned long flags;
 	u32 buf;
 
-	spin_lock_irqsave(&pool->lock, flags);
-	if (!pool->nr_free) {
-		spin_unlock_irqrestore(&pool->lock, flags);
+	if (brcmf_msgbuf_buf_get(pool, &buf))
 		return -ENOMEM;
-	}
-	buf = pool->free[--pool->nr_free];
-	spin_unlock_irqrestore(&pool->lock, flags);
-
 	if (brcmf_msgbuf_claim_pktid(pktids, idx)) {
-		brcmf_msgbuf_rxbuf_put(pool, buf);
+		brcmf_msgbuf_buf_put(pool, buf);
 		return -ENOMEM;
 	}
 
-	*physaddr = brcmf_msgbuf_rxbuf_dma(pool, buf);
+	*physaddr = brcmf_msgbuf_buf_dma(pool, buf);
 	dma_sync_single_for_device(pool->dev, *physaddr, pool->buf_size,
 				   pool->direction);
 
@@ -598,8 +587,46 @@ brcmf_msgbuf_alloc_rx_pktid(struct brcmf_msgbuf_pktids *pktids,
 	pktid->data_offset = data_offset;
 	pktid->physaddr = *physaddr;
 	pktid->skb = NULL;
-	pktid->rxpool = pool;
-	pktid->rxbuf = buf;
+	pktid->pool = pool;
+	pktid->buf = buf;
+
+	return 0;
+}
+
+
+/*
+ * Post a frame to be sent: copy it, from data_offset on, into a buffer of the
+ * pool. -EMSGSIZE if it does not fit one.
+ */
+static int
+brcmf_msgbuf_alloc_tx_pktid(struct brcmf_msgbuf_pktids *pktids,
+			    struct brcmf_msgbuf_pool *pool,
+			    struct sk_buff *skb, u16 data_offset,
+			    dma_addr_t *physaddr, u32 *idx)
+{
+	struct brcmf_msgbuf_pktid *pktid;
+	u32 len = skb->len - data_offset;
+	u32 buf;
+
+	if (len > pool->buf_size)
+		return -EMSGSIZE;
+	if (brcmf_msgbuf_buf_get(pool, &buf))
+		return -ENOMEM;
+	if (brcmf_msgbuf_claim_pktid(pktids, idx)) {
+		brcmf_msgbuf_buf_put(pool, buf);
+		return -ENOMEM;
+	}
+
+	*physaddr = brcmf_msgbuf_buf_dma(pool, buf);
+	memcpy(brcmf_msgbuf_buf_cpu(pool, buf), skb->data + data_offset, len);
+	dma_sync_single_for_device(pool->dev, *physaddr, len, pool->direction);
+
+	pktid = &pktids->array[*idx];
+	pktid->data_offset = data_offset;
+	pktid->physaddr = *physaddr;
+	pktid->skb = skb;
+	pktid->pool = pool;
+	pktid->buf = buf;
 
 	return 0;
 }
@@ -616,7 +643,7 @@ brcmf_msgbuf_get_rx_pktid(struct brcmf_msgbuf_pktids *pktids, u32 idx,
 			  u32 offset, u32 len)
 {
 	struct brcmf_msgbuf_pktid *pktid;
-	struct brcmf_msgbuf_rxpool *pool;
+	struct brcmf_msgbuf_pool *pool;
 	struct sk_buff *skb = NULL;
 	u32 size;
 
@@ -631,7 +658,7 @@ brcmf_msgbuf_get_rx_pktid(struct brcmf_msgbuf_pktids *pktids, u32 idx,
 		return NULL;
 	}
 
-	pool = pktid->rxpool;
+	pool = pktid->pool;
 	size = pool->buf_size - pktid->data_offset;
 	if (offset > size) {
 		brcmf_err("packet id %d: data offset %u past its %u bytes\n",
@@ -646,20 +673,19 @@ brcmf_msgbuf_get_rx_pktid(struct brcmf_msgbuf_pktids *pktids, u32 idx,
 	skb = brcmu_pkt_buf_get_skb(len);
 	if (skb)
 		memcpy(skb->data,
-		       brcmf_msgbuf_rxbuf_cpu(pool, pktid->rxbuf) + offset, len);
+		       brcmf_msgbuf_buf_cpu(pool, pktid->buf) + offset, len);
 	else
 		brcmf_err("Failed to alloc SKB\n");
 
 release:
-	brcmf_msgbuf_rxbuf_put(pool, pktid->rxbuf);
+	brcmf_msgbuf_buf_put(pool, pktid->buf);
 	atomic_set(&pktid->allocated, 0);
 	return skb;
 }
 
 
 static struct sk_buff *
-brcmf_msgbuf_get_pktid(struct device *dev, struct brcmf_msgbuf_pktids *pktids,
-		       u32 idx)
+brcmf_msgbuf_get_pktid(struct brcmf_msgbuf_pktids *pktids, u32 idx)
 {
 	struct brcmf_msgbuf_pktid *pktid;
 	struct sk_buff *skb;
@@ -671,9 +697,7 @@ brcmf_msgbuf_get_pktid(struct device *dev, struct brcmf_msgbuf_pktids *pktids,
 	}
 	if (pktids->array[idx].allocated.counter) {
 		pktid = &pktids->array[idx];
-		dma_unmap_single(dev, pktid->physaddr,
-				 pktid->skb->len - pktid->data_offset,
-				 pktids->direction);
+		brcmf_msgbuf_buf_put(pktid->pool, pktid->buf);
 		skb = pktid->skb;
 		pktid->allocated.counter = 0;
 		return skb;
@@ -686,24 +710,17 @@ brcmf_msgbuf_get_pktid(struct device *dev, struct brcmf_msgbuf_pktids *pktids,
 
 
 static void
-brcmf_msgbuf_release_array(struct device *dev,
-			   struct brcmf_msgbuf_pktids *pktids)
+brcmf_msgbuf_release_array(struct brcmf_msgbuf_pktids *pktids)
 {
 	struct brcmf_msgbuf_pktid *array;
-	struct brcmf_msgbuf_pktid *pktid;
 	u32 count;
 
 	array = pktids->array;
 	count = 0;
 	do {
-		/* A receive buffer has no skb: its pool goes as a whole. */
-		if (array[count].allocated.counter && array[count].skb) {
-			pktid = &array[count];
-			dma_unmap_single(dev, pktid->physaddr,
-					 pktid->skb->len - pktid->data_offset,
-					 pktids->direction);
-			brcmu_pkt_buf_free_skb(pktid->skb);
-		}
+		/* The buffers go with their pools; a frame not sent is freed. */
+		if (array[count].allocated.counter)
+			brcmu_pkt_buf_free_skb(array[count].skb);
 		count++;
 	} while (count < pktids->array_size);
 
@@ -715,15 +732,14 @@ brcmf_msgbuf_release_array(struct device *dev,
 static void brcmf_msgbuf_release_pktids(struct brcmf_msgbuf *msgbuf)
 {
 	if (msgbuf->rx_pktids)
-		brcmf_msgbuf_release_array(msgbuf->drvr->bus_if->dev,
-					   msgbuf->rx_pktids);
-	brcmf_msgbuf_rxpool_free(&msgbuf->rx_data_pool);
-	brcmf_msgbuf_rxpool_free(&msgbuf->rx_ctl_pool);
+		brcmf_msgbuf_release_array(msgbuf->rx_pktids);
+	brcmf_msgbuf_pool_free(&msgbuf->rx_data_pool);
+	brcmf_msgbuf_pool_free(&msgbuf->rx_ctl_pool);
 	brcmu_pkt_buf_free_skb(msgbuf->ioctl_resp);
 	msgbuf->ioctl_resp = NULL;
 	if (msgbuf->tx_pktids)
-		brcmf_msgbuf_release_array(msgbuf->drvr->bus_if->dev,
-					   msgbuf->tx_pktids);
+		brcmf_msgbuf_release_array(msgbuf->tx_pktids);
+	brcmf_msgbuf_pool_free(&msgbuf->tx_pool);
 }
 
 
@@ -1096,6 +1112,8 @@ static void brcmf_msgbuf_txflow(struct brcmf_msgbuf *msgbuf, u16 flowid)
 	u32 pktid;
 	struct msgbuf_tx_msghdr *tx_msghdr;
 	u64 address;
+	u8 ifidx;
+	int ret;
 
 	commonring = msgbuf->flowrings[flowid];
 	if (!brcmf_commonring_write_available(commonring))
@@ -1112,17 +1130,24 @@ static void brcmf_msgbuf_txflow(struct brcmf_msgbuf *msgbuf, u16 flowid)
 			break;
 		}
 		skb_orphan(skb);
-		if (brcmf_msgbuf_alloc_pktid(msgbuf->drvr->bus_if->dev,
-					     msgbuf->tx_pktids, skb, ETH_HLEN,
-					     &physaddr, &pktid)) {
+		ret = brcmf_msgbuf_alloc_tx_pktid(msgbuf->tx_pktids,
+						  &msgbuf->tx_pool, skb,
+						  ETH_HLEN, &physaddr, &pktid);
+		if (ret == -EMSGSIZE) {
+			bphy_err(drvr, "Frame of %u bytes too long to send\n",
+				 skb->len);
+			ifidx = brcmf_flowring_ifidx_get(flow, flowid);
+			brcmf_txfinalize(brcmf_get_ifp(drvr, ifidx), skb, false);
+			continue;
+		}
+		if (ret) {
 			brcmf_flowring_reinsert(flow, flowid, skb);
 			bphy_err(drvr, "No PKTID available !!\n");
 			break;
 		}
 		ret_ptr = brcmf_commonring_reserve_for_write(commonring);
 		if (!ret_ptr) {
-			brcmf_msgbuf_get_pktid(msgbuf->drvr->bus_if->dev,
-					       msgbuf->tx_pktids, pktid);
+			brcmf_msgbuf_get_pktid(msgbuf->tx_pktids, pktid);
 			brcmf_flowring_reinsert(flow, flowid, skb);
 			break;
 		}
@@ -1295,8 +1320,7 @@ brcmf_msgbuf_process_txstatus(struct brcmf_msgbuf *msgbuf, void *buf)
 	tx_status = (struct msgbuf_tx_status *)buf;
 	idx = le32_to_cpu(tx_status->msg.request_id) - 1;
 	flow_ring_id = le16_to_cpu(tx_status->compl_hdr.flow_ring_id);
-	skb = brcmf_msgbuf_get_pktid(msgbuf->drvr->bus_if->dev,
-				     msgbuf->tx_pktids, idx);
+	skb = brcmf_msgbuf_get_pktid(msgbuf->tx_pktids, idx);
 	if (!skb)
 		return;
 
@@ -2120,16 +2144,20 @@ int brcmf_proto_msgbuf_attach(struct brcmf_pub *drvr)
 			brcmf_msgbuf_rx_dma_direction(drvr->bus_if->dev));
 	if (!msgbuf->rx_pktids)
 		goto fail;
-	if (brcmf_msgbuf_rxpool_init(drvr->bus_if->dev, &msgbuf->rx_data_pool,
-				     min_t(u32, msgbuf->max_rxbufpost,
-					   NR_RX_PKTIDS),
-				     BRCMF_MSGBUF_MAX_PKT_SIZE,
-				     msgbuf->rx_pktids->direction) ||
-	    brcmf_msgbuf_rxpool_init(drvr->bus_if->dev, &msgbuf->rx_ctl_pool,
-				     msgbuf->max_ioctlrespbuf +
-				     msgbuf->max_eventbuf,
-				     BRCMF_MSGBUF_MAX_CTL_PKT_SIZE,
-				     msgbuf->rx_pktids->direction))
+	/* Every packet id can hold a frame being sent, as before. */
+	if (brcmf_msgbuf_pool_init(drvr->bus_if->dev, &msgbuf->tx_pool,
+				   NR_TX_PKTIDS, BRCMF_MSGBUF_MAX_PKT_SIZE,
+				   msgbuf->tx_pktids->direction) ||
+	    brcmf_msgbuf_pool_init(drvr->bus_if->dev, &msgbuf->rx_data_pool,
+				   min_t(u32, msgbuf->max_rxbufpost,
+					 NR_RX_PKTIDS),
+				   BRCMF_MSGBUF_MAX_PKT_SIZE,
+				   msgbuf->rx_pktids->direction) ||
+	    brcmf_msgbuf_pool_init(drvr->bus_if->dev, &msgbuf->rx_ctl_pool,
+				   msgbuf->max_ioctlrespbuf +
+				   msgbuf->max_eventbuf,
+				   BRCMF_MSGBUF_MAX_CTL_PKT_SIZE,
+				   msgbuf->rx_pktids->direction))
 		goto fail;
 
 	msgbuf->flow = brcmf_flowring_attach(drvr->bus_if->dev,
