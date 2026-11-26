@@ -1433,7 +1433,24 @@ impl Firmware {
                     0,
                     0,
                 ]);
-                full &= notified || super::lab::knob(super::lab::BEHIND_NO_NOTIFIER) != 0;
+                let next_done = || -> Result<bool> {
+                    let next = self
+                        .engine
+                        .flights
+                        .iter()
+                        .skip(index + 1)
+                        .find(|o| o.computes != 0 && o.compute_pipe == f.compute_pipe);
+                    Ok(match next {
+                        Some(o) => stamp_reached(g.fw_stamp.r32(0)?, o.target, tail),
+                        None => false,
+                    })
+                };
+                full &= notified
+                    || match super::lab::knob(super::lab::BEHIND_NO_NOTIFIER) {
+                        1 => true,
+                        3 => next_done()?,
+                        _ => false,
+                    };
             } else {
                 if g.fw_stamp.r32(0)? != f.target
                     || !self.queue_ring_receipt(&g.qstate, &g.qinfo, f.head)?
@@ -1533,7 +1550,7 @@ impl Firmware {
                     u64::from(f.ta_target),
                     u64::from(ta_stamp),
                 ]);
-                full &= (notified || super::lab::knob(super::lab::BEHIND_NO_NOTIFIER) != 0) && pb;
+                full &= (notified || matches!(super::lab::knob(super::lab::BEHIND_NO_NOTIFIER), 1..=3)) && pb;
             } else {
                 // Check FS (terminal stage) before TA so running renders fail fast on 1 WC read.
                 if g.fw_stamp[1].r32(0)? != f.fs_target

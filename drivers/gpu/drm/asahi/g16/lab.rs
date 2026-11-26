@@ -21,6 +21,8 @@ pub(crate) const FS_KICK: usize = 7;
 pub(crate) const FS_SERIAL: usize = 8;
 /// Retire a render or compute flight with later flights of its class behind it without the
 /// shared notifier stamps, which firmware writes only for the threshold (newest) draw.
+/// 1: render and compute; 2: render only; 3: render, and compute once the next compute flight
+/// on the same pipe has reached its stamp too.
 pub(crate) const BEHIND_NO_NOTIFIER: usize = 9;
 /// Repoll after at most this many us while more than one flight is in flight (0: default).
 pub(crate) const BEHIND_REPOLL_US: usize = 10;
