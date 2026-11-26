@@ -452,17 +452,26 @@ static void pf_prepare_complete_test(struct kunit *test)
 
 static void pf_match_data_test(struct kunit *test)
 {
-	const struct apple_pmgr_misc_hw *t600x = NULL, *t602x = NULL;
+	const struct apple_pmgr_misc_hw *t8103 = NULL, *t600x = NULL, *t602x = NULL;
 	const struct of_device_id *id;
 
 	for (id = apple_pmgr_misc_of_match; id->compatible[0]; id++) {
-		if (!strcmp(id->compatible, "apple,t6000-pmgr-misc"))
+		if (!strcmp(id->compatible, "apple,t8103-pmgr-misc"))
+			t8103 = id->data;
+		else if (!strcmp(id->compatible, "apple,t6000-pmgr-misc"))
 			t600x = id->data;
 		else if (!strcmp(id->compatible, "apple,t6020-pmgr-misc"))
 			t602x = id->data;
 	}
+	KUNIT_ASSERT_NOT_NULL(test, t8103);
 	KUNIT_ASSERT_NOT_NULL(test, t600x);
 	KUNIT_ASSERT_NOT_NULL(test, t602x);
+	KUNIT_EXPECT_EQ(test, t8103->dev_min_ps[DEV_FABRIC], 1U);
+	KUNIT_EXPECT_EQ(test, t8103->dev_min_ps[DEV_DCS], 3U);
+	KUNIT_EXPECT_EQ(test, t8103->dcs_valid_states, (u32)DCS_VALID_STATES_T8103);
+	KUNIT_EXPECT_TRUE(test, t8103->single_step);
+	KUNIT_EXPECT_EQ(test, t8103->default_idle_fabric, 1U);
+	KUNIT_EXPECT_EQ(test, t8103->default_idle_dcs, 3U);
 	KUNIT_EXPECT_EQ(test, t600x->dev_min_ps[DEV_FABRIC], 1U);
 	KUNIT_EXPECT_EQ(test, t600x->dev_min_ps[DEV_DCS], 7U);
 	KUNIT_EXPECT_EQ(test, t600x->dcs_valid_states, (u32)DCS_VALID_STATES_T600X);
@@ -470,6 +479,112 @@ static void pf_match_data_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, t602x->dev_min_ps[DEV_DCS], 1U);
 	/* No DCS state list: suspend uses the plain read-modify-write. */
 	KUNIT_EXPECT_EQ(test, t602x->dcs_valid_states, 0U);
+}
+
+static u32 pf_step_log[16];
+static unsigned int pf_step_cnt;
+static bool pf_step_inject_busy;
+
+static u32 pf_fake_perf_step(void __iomem *reg, u32 state)
+{
+	u32 val = readl_relaxed(reg);
+
+	if (pf_step_cnt < ARRAY_SIZE(pf_step_log))
+		pf_step_log[pf_step_cnt++] = state;
+	FIELD_MODIFY(APPLE_CLKGEN_PSTATE_DESIRED, &val, state);
+	if (pf_step_inject_busy) {
+		val |= APPLE_CLKGEN_PSTATE_BUSY;
+	} else {
+		val &= ~APPLE_CLKGEN_PSTATE_BUSY;
+		FIELD_MODIFY(APPLE_CLKGEN_PSTATE_ACTUAL, &val, state);
+	}
+	writel_relaxed(val, reg);
+	return val;
+}
+
+static void pf_t8103_gpu_tracking_and_dcs_valid_test(struct kunit *test)
+{
+	struct pf_test *f = test->priv;
+	struct apple_pmgr_misc *misc = &f->misc;
+	u32 last = 0;
+
+	pf_step_cnt = 0;
+	pf_step_inject_busy = false;
+	kunit_activate_static_stub(test, apple_pmgr_perf_step, pf_fake_perf_step);
+
+	misc->single_step = true;
+	misc->dcs_valid_states = DCS_VALID_STATES_T8103;
+	misc->devices[DEV_FABRIC].suspend_state = 1;
+	misc->devices[DEV_DCS].suspend_state = 3;
+	misc->devices[DEV_FABRIC].active_state = 4;
+	misc->devices[DEV_DCS].active_state = 6;
+	misc->fabric_now = 4;
+	misc->dcs_now = 6;
+	writel(0x00000444, f->fabric);
+	writel(0x00000666, f->dcs);
+	pf_publish(f);
+
+	/* T8103 DCS rejects unsafe states (1, 2) and accepts 3..6. */
+	KUNIT_EXPECT_EQ(test, idle_dcs_pstate_set("1", NULL), -EINVAL);
+	KUNIT_EXPECT_EQ(test, idle_dcs_pstate_set("2", NULL), -EINVAL);
+	KUNIT_EXPECT_EQ(test, idle_dcs_pstate_set("3", NULL), 0);
+	KUNIT_EXPECT_EQ(test, idle_dcs_pstate, 3U);
+	cancel_delayed_work_sync(&misc->idle_work);
+	cancel_delayed_work_sync(&misc->idle_work_prompt);
+
+	/*
+	 * With GPU tracking active, an always-on gfx PMGR voter does not
+	 * block idle while gpu_busy == 0, and single-stepping walks 4->3->2->1
+	 * on fabric and 6->5->4->3 on DCS.
+	 */
+	f->votes[0] = PF_VOTE_BUSY;
+	KUNIT_EXPECT_TRUE(test, apple_pmgr_voters_active(misc));
+
+	apple_pmgr_gpu_tracking_start();
+	KUNIT_EXPECT_FALSE(test, apple_pmgr_voters_active(misc));
+
+	WRITE_ONCE(idle_fabric_pstate, 1);
+	WRITE_ONCE(idle_dcs_pstate, 3);
+	pf_step_cnt = 0;
+	apple_pmgr_idle_eval(misc);
+	KUNIT_EXPECT_EQ(test, misc->fabric_now, 1U);
+	KUNIT_EXPECT_EQ(test, misc->dcs_now, 3U);
+	KUNIT_EXPECT_EQ(test, pf_step_cnt, 6U);
+	KUNIT_EXPECT_EQ(test, pf_step_log[0], 3U);
+	KUNIT_EXPECT_EQ(test, pf_step_log[2], 1U);
+	KUNIT_EXPECT_EQ(test, pf_step_log[3], 5U);
+	KUNIT_EXPECT_EQ(test, pf_step_log[5], 3U);
+	cancel_delayed_work_sync(&misc->idle_work_prompt);
+
+	/* Busy timeout on raise unwinds gpu_busy and returns error. */
+	pf_step_inject_busy = true;
+	KUNIT_EXPECT_EQ(test, apple_pmgr_gpu_busy_get(), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, atomic_read(&apple_pmgr_gpu_busy), 0);
+	/* Subsequent write while BUSY is still set fails -EBUSY without stepping. */
+	KUNIT_EXPECT_EQ(test, apple_pmgr_step_to(f->fabric, 4, 0, &last), -EBUSY);
+	/* Clear injected busy and restore clean registers. */
+	pf_step_inject_busy = false;
+	writel(0x00000111, f->fabric);
+	writel(0x00000333, f->dcs);
+	misc->fabric_now = 1;
+	misc->dcs_now = 3;
+
+	/* Normal raise succeeds and lifts both fabric and DCS synchronously. */
+	KUNIT_EXPECT_EQ(test, apple_pmgr_gpu_busy_get(), 0);
+	KUNIT_EXPECT_TRUE(test, apple_pmgr_voters_active(misc));
+	KUNIT_EXPECT_EQ(test, misc->fabric_now, 4U);
+	KUNIT_EXPECT_EQ(test, misc->dcs_now, 6U);
+
+	/* Missing voter regmap counts as busy (no NULL deref on tracking stop). */
+	misc->votes[2].regmap = NULL;
+	apple_pmgr_gpu_busy_put();
+	apple_pmgr_gpu_tracking_stop();
+	KUNIT_EXPECT_TRUE(test, apple_pmgr_voters_active(misc));
+
+	/* Path validation rejects stepping across an invalid intermediate DCS state. */
+	writel(0x00000666, f->dcs);
+	KUNIT_EXPECT_EQ(test, apple_pmgr_step_to(f->dcs, 3, BIT(3) | BIT(4) | BIT(6), &last), -EINVAL);
+	WRITE_ONCE(idle_dcs_pstate, 0);
 }
 
 /*
@@ -742,6 +857,7 @@ static struct kunit_case apple_pmgr_fabric_test_cases[] = {
 	KUNIT_CASE(pf_param_test),
 	KUNIT_CASE(pf_prepare_complete_test),
 	KUNIT_CASE(pf_match_data_test),
+	KUNIT_CASE(pf_t8103_gpu_tracking_and_dcs_valid_test),
 	KUNIT_CASE(pf_dt_voters_test),
 	KUNIT_CASE(pf_dt_voters_missing_test),
 	KUNIT_CASE(pf_dt_voters_duplicate_test),
