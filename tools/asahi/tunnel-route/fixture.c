@@ -62,9 +62,9 @@ struct apple_dcp_typec_port {
 	bool dp_wanted, dp_hpd, typec_yielded;
 };
 static bool t6030, t8132_ext;
-static bool of_machine_is_compatible(const char *compatible)
+/* Production: the T6030 processor's match data (dcp->hw.t6030_fabric). */
+static bool dcp_is_t6030_fabric(const struct apple_dcp *dcp)
 {
-	assert(!strcmp(compatible, "apple,t6030"));
 	return t6030;
 }
 /* Production: of_device_is_compatible(dcp->dev->of_node, "apple,t8132-dcpext"). */

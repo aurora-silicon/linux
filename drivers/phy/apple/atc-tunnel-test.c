@@ -4,91 +4,63 @@
 
 #include "atc-tunnel.h"
 
-static void atc_tunnel_soc_qualification(struct kunit *test)
+/* Only the per-DP IN clock PHY, and only on a connector wired to both DP INs. */
+static void atc_tunnel_dpin_clock_gate(struct kunit *test)
 {
 	const struct {
-		const char *soc;
-		bool qualified;
-	} cases[] = {
-		{ "apple,t6020", true },
-		{ "apple,t6021", true },
-		{ "apple,t6022", false },
-		{ "apple,t8103", false },
-		{ "apple,t6000", false },
-		{ "apple,t6001", false },
-		{ "apple,t6002", false },
-		{ "apple,t8112", false },
-		{ "apple,t6030", false },
-		{ "apple,t6031", false },
-	};
-	unsigned int i;
-
-	for (i = 0; i < ARRAY_SIZE(cases); i++) {
-		struct property compatible = {
-			.name = "compatible", .value = (void *)cases[i].soc,
-			.length = strlen(cases[i].soc) + 1,
-		};
-		struct device_node root = { .properties = &compatible };
-
-		KUNIT_EXPECT_EQ(test, apple_atc_t602x_qualified(&root), cases[i].qualified);
-	}
-	KUNIT_EXPECT_FALSE(test, apple_atc_t602x_qualified(NULL));
-}
-
-static void atc_tunnel_core_qualification(struct kunit *test)
-{
-	const struct {
-		const char *compatible;
-		u64 base;
-		u64 size;
-		bool valid;
-	} cases[] = {
-		{ "apple,t6020-atcphy", 0x703000000ULL, 0x7048, true },
-		{ "apple,t6020-atcphy", 0xb03000000ULL, 0x7048, true },
-		{ "apple,t6020-atcphy", 0xf03000000ULL, 0x7048, true },
-		{ "apple,t6020-atcphy", 0x703000000ULL, 0x7047, false },
-		{ "apple,t6020-atcphy", 0x1303000000ULL, 0x4c000, false },
-		{ "apple,t6020-atcphy", 0x2703000000ULL, 0x4c000, false },
-		{ "apple,t8103-atcphy", 0x703000000ULL, 0x4c000, false },
-	};
-	unsigned int i;
-
-	for (i = 0; i < ARRAY_SIZE(cases); i++) {
-		struct property compatible = {
-			.name = "compatible", .value = (void *)cases[i].compatible,
-			.length = strlen(cases[i].compatible) + 1,
-		};
-		struct device_node np = { .properties = &compatible };
-
-		KUNIT_EXPECT_EQ(test,
-				apple_atc_t602x_core_valid(&np, cases[i].base, cases[i].size),
-				cases[i].valid);
-	}
-	KUNIT_EXPECT_FALSE(test, apple_atc_t602x_core_valid(NULL, 0x703000000ULL, 0x7048));
-}
-
-static void atc_tunnel_wiring_gate(struct kunit *test)
-{
-	const struct {
-		bool own;
-		bool present;
-		bool valid;
+		bool dpin_clocks;
+		bool dual_stream;
 		int expected;
 	} cases[] = {
-		{ true, true, true, 0 },
-		{ false, true, true, -EOPNOTSUPP },
-		{ false, true, false, -EINVAL },
-		{ true, true, false, -EINVAL },
-		{ false, false, true, -EOPNOTSUPP },
-		{ false, false, false, -EOPNOTSUPP },
+		{ true, true, 0 },
+		{ true, false, -EOPNOTSUPP },
+		{ false, true, -EOPNOTSUPP },
+		{ false, false, -EOPNOTSUPP },
 	};
 	unsigned int i;
 
 	for (i = 0; i < ARRAY_SIZE(cases); i++)
 		KUNIT_EXPECT_EQ(test,
-				apple_atc_t602x_gate(cases[i].own, cases[i].present,
-						     cases[i].valid),
+				apple_atc_dpin_clock_gate(cases[i].dpin_clocks,
+							  cases[i].dual_stream),
 				cases[i].expected);
+}
+
+/* Which tunnel clock a PHY has follows its compatible's match data. */
+static void atc_tunnel_clock_by_compatible(struct kunit *test)
+{
+	const struct {
+		const char *compatible;
+		bool t8103_clock;
+		bool dpin_clocks;
+		bool t8122_clock;
+	} cases[] = {
+		{ "apple,t8103-atcphy", true, false, false },
+		{ "apple,t6000-atcphy", true, false, false },
+		{ "apple,t6020-atcphy", false, true, false },
+		{ "apple,t6030-atcphy", false, false, true },
+		{ "apple,t8122-atcphy", false, false, false },
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		const struct of_device_id *id;
+		const struct atcphy_hw *hw = NULL;
+
+		for (id = atcphy_match; id->compatible[0]; id++) {
+			if (!strcmp(id->compatible, cases[i].compatible)) {
+				hw = id->data;
+				break;
+			}
+		}
+		KUNIT_ASSERT_NOT_NULL_MSG(test, hw, "%s", cases[i].compatible);
+		KUNIT_EXPECT_EQ_MSG(test, hw->tunnel_t8103_clock, cases[i].t8103_clock,
+				    "%s", cases[i].compatible);
+		KUNIT_EXPECT_EQ_MSG(test, hw->tunnel_dpin_clocks, cases[i].dpin_clocks,
+				    "%s", cases[i].compatible);
+		KUNIT_EXPECT_EQ_MSG(test, hw->t8122_tunnel_clock, cases[i].t8122_clock,
+				    "%s", cases[i].compatible);
+	}
 }
 
 static void atc_tunnel_t6030_clock_sources(struct kunit *test)
@@ -156,9 +128,8 @@ static struct kunit_case atc_tunnel_cases[] = {
 	KUNIT_CASE(atc_tunnel_t8132_clock_sources),
 	KUNIT_CASE(atc_tunnel_t8132_one_rate),
 	KUNIT_CASE(atc_tunnel_pclk_gates),
-	KUNIT_CASE(atc_tunnel_soc_qualification),
-	KUNIT_CASE(atc_tunnel_core_qualification),
-	KUNIT_CASE(atc_tunnel_wiring_gate),
+	KUNIT_CASE(atc_tunnel_dpin_clock_gate),
+	KUNIT_CASE(atc_tunnel_clock_by_compatible),
 	{},
 };
 

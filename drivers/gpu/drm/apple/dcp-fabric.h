@@ -130,6 +130,7 @@ int dcp_tunnel_dpin_activate(struct apple_dcp *dcp, u32 unit, bool active);
 
 /* An adopted T8132 dcpext. */
 bool dcp_is_t8132_ext(const struct apple_dcp *dcp);
+bool dcp_is_t6030_fabric(const struct apple_dcp *dcp);
 
 /* DCP probe, resume and endpoint teardown hooks. */
 static inline bool dcp_typec_routes_available(const struct device_node *routes)
