@@ -2390,15 +2390,15 @@ void dcp_queue_typec_reconnect(struct apple_dcp *dcp, unsigned long delay)
 }
 
 /*
- * Before a T8132 dcpext connects, wait for the late answers of an earlier
- * teardown's timed-out calls (see dcp_dptx_release_locked()). The answers
- * wake the wait, and so does the session's revocation: a tunnel that goes
- * meanwhile ends it (dcp_dptx_disconnect_oob()), and so does the CRTC's
- * power-off for a connect that must not wake it (@recovery). After
- * DCP_T8132_ORPHAN_WAIT the M4 backend gives up on the answers of its
- * compact calls, as before; the firmware-27 transport keeps the slot of an
- * unanswered call until the firmware answers, so the port stays unavailable
- * and this connect fails.
+ * Before a T8132 dcpext on the M4 backend connects, wait for the late
+ * answers of an earlier teardown's timed-out compact calls (see
+ * dcp_dptx_release_locked()). The answers wake the wait, and so does the
+ * session's revocation: a tunnel that goes meanwhile ends it
+ * (dcp_dptx_disconnect_oob()), and so does the CRTC's power-off for a
+ * connect that must not wake it (@recovery, dcp_poweroff()). After
+ * DCP_T8132_ORPHAN_WAIT the answers still missing are given up, as before.
+ * Firmware 27 does not wait: its port is held until the firmware answers
+ * (dcp_t8132_port_held_locked()).
  */
 static int dcp_t8132_wait_teardown_answers(struct apple_dcp *dcp, u32 port,
 					   const struct dcp_fabric_session *session,
@@ -2411,7 +2411,7 @@ static int dcp_t8132_wait_teardown_answers(struct apple_dcp *dcp, u32 port,
 		generation = session->generation;
 	dev_dbg(dcp->dev, "DPTX port %u connect waits for late teardown answers\n", port);
 	wait_event_timeout(ep->compact_orphan_wq,
-			   !afk_late_replies_pending(ep) ||
+			   !afk_compact_orphans_pending(ep) ||
 			   READ_ONCE(dcp->typec_generation) != generation ||
 			   !READ_ONCE(dcp->typec_cable_connected) ||
 			   (recovery && READ_ONCE(dcp->typec_crtc_off)),
@@ -2421,16 +2421,52 @@ static int dcp_t8132_wait_teardown_answers(struct apple_dcp *dcp, u32 port,
 		dev_dbg(dcp->dev, "DPTX port %u connect abandoned: the tunnel went\n", port);
 		return -ESTALE;
 	}
-	if (!afk_late_replies_pending(ep))
-		return 0;
-	if (dcp_is_t8132_ext(dcp)) {
+	if (afk_compact_orphans_pending(ep))
 		afk_compact_orphans_drop(ep);
-		return 0;
-	}
-	dev_warn(dcp->dev, "DPTX port %u: an earlier release is still unanswered after %u ms: not connected\n",
-		 port, jiffies_to_msecs(DCP_T8132_ORPHAN_WAIT));
-	return -EBUSY;
+	return 0;
 }
+
+/*
+ * Firmware 27: the display hardware of a T8132 dcpext driven as a pipeline
+ * of the DRM device, not by the M4 backend.
+ */
+static bool dcp_t8132_fw27(const struct apple_dcp *dcp)
+{
+	return dcp_t8132_ext_hw(dcp) && !dcp_is_t8132_ext(dcp);
+}
+
+/*
+ * Firmware 27: the DPTX port of a T8132 dcpext is held while a teardown
+ * call of a display whose tunnel went is unanswered
+ * (dcp_dptx_release_locked()): the firmware may still be working on it,
+ * and its transport keeps the call's slot for the answer. No connect uses
+ * the port meanwhile. The answer frees it (dcp_t8132_port_work()).
+ */
+static bool dcp_t8132_port_held_locked(struct apple_dcp *dcp)
+{
+	lockdep_assert_held(&dcp->hpd_mutex);
+	return dcp_t8132_fw27(dcp) && dcp->t8132_release_late;
+}
+
+/*
+ * Hold the port for a teardown call that timed out, its transport's
+ * refusal count read before the call was sent (@refusals). A hold already
+ * taken keeps the count of its first call.
+ */
+static void dcp_t8132_hold_locked(struct apple_dcp *dcp, u64 refusals)
+{
+	lockdep_assert_held(&dcp->hpd_mutex);
+	if (!dcp->t8132_release_late)
+		dcp->t8132_release_refusals = refusals;
+	WRITE_ONCE(dcp->t8132_release_late, true);
+}
+
+static u64 dcp_t8132_refusals(struct apple_dcp *dcp)
+{
+	return dcp->dptxep ? afk_late_refusals(dcp->dptxep) : 0;
+}
+
+static int dcp_dptx_release_locked(struct apple_dcp *dcp, u32 port);
 
 /*
  * Has the Thunderbolt DP tunnel feeding DPTX port @port been taken down?
@@ -2499,19 +2535,31 @@ static bool dcp_connect_admitted(struct apple_dcp *dcp,
  * (desktop 26.x, the M4 backend) queues its calls under a lock it can hold
  * while waiting for ring space, and keeps the check before each call.
  */
-static void dcp_dptx_gate_open(struct apple_dcp *dcp,
-			       const struct dcp_fabric_session *session)
+static void dcp_dptx_gate_open(struct apple_dcp *dcp)
 {
 	mutex_lock(&dcp->dptx_gate_lock);
+}
+
+/* The calls that follow, of a tunnel's @session, are gated. */
+static void dcp_dptx_gate_arm(struct apple_dcp *dcp,
+			      const struct dcp_fabric_session *session)
+{
+	lockdep_assert_held(&dcp->dptx_gate_lock);
 	if (!session || !session->cookie)
 		return;
 	dcp->dptx_gate_cookie = session->cookie;
 	WRITE_ONCE(dcp->dptx_gate_task, current);
 }
 
-static void dcp_dptx_gate_close(struct apple_dcp *dcp)
+/* ... and those that follow now are not: a release must go out. */
+static void dcp_dptx_gate_disarm(struct apple_dcp *dcp)
 {
 	WRITE_ONCE(dcp->dptx_gate_task, NULL);
+}
+
+static void dcp_dptx_gate_close(struct apple_dcp *dcp)
+{
+	dcp_dptx_gate_disarm(dcp);
 	mutex_unlock(&dcp->dptx_gate_lock);
 }
 
@@ -2629,17 +2677,10 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 	 * the calls of an earlier teardown that timed out, so that none of its
 	 * late callbacks lands in this connection.
 	 */
-	if (dcp_t8132_ext_hw(dcp) && dcp->dptxep) {
-		/* Firmware 27: only a release taken as done waits. */
-		if (t8132 ? afk_compact_orphans_pending(dcp->dptxep) :
-			    READ_ONCE(dcp->t8132_release_late)) {
-			ret = dcp_t8132_wait_teardown_answers(dcp, port, session, cable,
-							      recovery);
-			if (ret)
-				return ret;
-		}
-		/* Nothing of an earlier teardown is outstanding any more. */
-		WRITE_ONCE(dcp->t8132_release_late, false);
+	if (t8132 && dcp->dptxep && afk_compact_orphans_pending(dcp->dptxep)) {
+		ret = dcp_t8132_wait_teardown_answers(dcp, port, session, cable, recovery);
+		if (ret)
+			return ret;
 	}
 	/* @port selects the upstream RemotePort service/core. dptx_dfp_port
 	 * is the downstream address: dpphy=0, dpin0=1, dpin1=2.
@@ -2652,12 +2693,24 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 		dcp->connector_type, dcp->dptxport[port].connected);
 
 	mutex_lock(&dcp->hpd_mutex);
-	/* Its calls go out under the provider's admission from here. */
-	dcp_dptx_gate_open(dcp, port ? NULL : session);
+	dcp_dptx_gate_open(dcp);
 	compact = dptx_service_available(&dcp->dptxport[port]) &&
 		  READ_ONCE(dcp->dptxport[port].service->ep->compact);
 	if (!dcp_connect_admitted_locked(dcp, session, cable, recovery)) {
 		ret = -ESTALE;
+		goto out_unlock;
+	}
+	/*
+	 * After the session's check: a detach that holds the port or leaves
+	 * orphans revokes the session first.
+	 */
+	if (t8132 && dcp->dptxep && !afk_compact_orphans_pending(dcp->dptxep)) {
+		/* M4 backend: nothing of an earlier teardown is outstanding any more. */
+		WRITE_ONCE(dcp->t8132_release_late, false);
+	} else if (dcp_t8132_port_held_locked(dcp)) {
+		dev_info(dcp->dev, "DPTX port %u held for an earlier release: connects once it is answered\n",
+			 port);
+		ret = -EBUSY;
 		goto out_unlock;
 	}
 	generation = dcp->typec_generation;
@@ -2678,8 +2731,18 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 
 	if (dcp->dptxport[port].connected)
 		goto out_unlock;
+	/* A release an earlier connect owes goes first, as a detach sends it. */
+	if (dcp->dptxport[port].release_owed) {
+		ret = dcp_dptx_release_locked(dcp, port);
+		if (!ret && dcp_t8132_port_held_locked(dcp))
+			ret = -EBUSY;
+		if (ret)
+			goto out_unlock;
+	}
 	if (dcp->external)
 		smp_store_release(&dcp->external_link_ready, false);
+	/* Its calls go out under the provider's admission from here. */
+	dcp_dptx_gate_arm(dcp, port ? NULL : session);
 
 	reinit_completion(&dcp->dptxport[port].linkcfg_completion);
 	WRITE_ONCE(dcp->dptxport[port].tile_hint, false);
@@ -2735,6 +2798,11 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 	ret = dptxport_request_display(dcp->dptxport[port].service);
 	if (ret == -ESTALE)
 		goto out_unlock;
+	/*
+	 * From here a display may be requested, also by a request that
+	 * failed: whatever fails releases it as a detach does.
+	 */
+	dcp->dptxport[port].connected = true;
 	if (ret) {
 		dev_err(dcp->dev,
 			"dcp_dptx_connect: failed to request display: %d\n",
@@ -2745,7 +2813,6 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 		ret = -ESTALE;
 		goto out_release;
 	}
-	dcp->dptxport[port].connected = true;
 	if (dcp_is_typec_output(dcp) && !late_hpd) {
 		if (dcp_uses_t6020_tunnel_flow(dcp))
 			ret = dptxport_set_hpd_timeout(dcp->dptxport[port].service,
@@ -2757,7 +2824,6 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 				dev_err(dcp->dev,
 					"dcp_dptx_connect: failed to assert Type-C HPD: %d\n",
 					ret);
-			dcp->dptxport[port].connected = false;
 			goto out_release;
 		}
 	}
@@ -2820,7 +2886,8 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 	usleep_range(5, 10);
 
 	if (dcp->connector_type == DRM_MODE_CONNECTOR_DisplayPort || late_hpd) {
-		dcp_dptx_gate_open(dcp, port ? NULL : session);
+		dcp_dptx_gate_open(dcp);
+		dcp_dptx_gate_arm(dcp, port ? NULL : session);
 		ret = dptxport_set_hpd(dcp->dptxport[port].service, true);
 		dcp_dptx_gate_close(dcp);
 		if (ret && late_hpd)
@@ -2873,7 +2940,7 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 out_withdraw:
 	mutex_lock(&dcp->hpd_mutex);
 	/* Withdrawing is not gated: the release must go out. */
-	dcp_dptx_gate_open(dcp, NULL);
+	dcp_dptx_gate_open(dcp);
 	/*
 	 * A T8132 dcpext's release lowers only the HPD of a connected port, so
 	 * a withdrawn one lowers its HPD here.
@@ -2885,10 +2952,8 @@ out_withdraw:
 			dev_warn(dcp->dev, "DPTX port %u withdrawn: set_hpd(0) failed: %d\n",
 				 port, err);
 	}
-	if (!dcp_is_retained_external(dcp)) {
-		dcp->dptxport[port].connected = false;
+	if (!dcp_is_retained_external(dcp))
 		goto out_release;
-	}
 	/*
 	 * No link configuration arrived, typically because the sink went away
 	 * while the firmware trained it.  Withdraw the request the way a
@@ -2917,9 +2982,20 @@ out_withdraw:
 	goto out_unlock;
 
 out_release:
-	/* Nor is the release of a display requested. */
-	WRITE_ONCE(dcp->dptx_gate_task, NULL);
-	dptxport_release_display(dcp->dptxport[port].service);
+	/*
+	 * Nor is the release of a display requested, which takes the path of
+	 * a detach's: a release of a gone tunnel the firmware has not answered
+	 * holds the port, and one not sent or refused is owed to the next
+	 * release, which a later connect sends first.
+	 */
+	dcp_dptx_gate_disarm(dcp);
+	err = dcp_dptx_release_locked(dcp, port);
+	if (err) {
+		dev_warn(dcp->dev, "dcp_dptx_connect: port %u not released (%d): its release is owed\n",
+			 port, err);
+		dcp->dptxport[port].connected = false;
+		dcp->dptxport[port].release_owed = true;
+	}
 
 out_unlock:
 	dcp_dptx_gate_close(dcp);
@@ -3085,8 +3161,6 @@ void dcp_external_ready(struct apple_dcp *dcp)
 }
 
 #define DCP_EXTERNAL_RETRIES	3
-
-static int dcp_dptx_release_locked(struct apple_dcp *dcp, u32 port);
 
 /*
  * Bounded recovery for a native external pipe: re-apply the display mode,
@@ -3856,7 +3930,9 @@ static void dcp_typec_reconnect_work(struct work_struct *work)
 	 * A T8132 dcpext connects once per tunnel, on either firmware: what
 	 * fails it (a binding replaced or revoked, a link that did not come,
 	 * an earlier release still unanswered) is not changed by trying again.
-	 * The tunnel's next request, or the CRTC's power-on, connects again.
+	 * The tunnel's next request, the CRTC's power-on, or on firmware 27
+	 * the event that ends what kept it (dcp_typec_resume_locked())
+	 * connects again.
 	 */
 	if (++dcp->typec_reconnect_tries <
 	    (dcp_uses_t6020_tunnel_flow(dcp) || dcp_t8132_ext_hw(dcp) ?
@@ -4159,7 +4235,10 @@ static int dcp_dptx_release_locked(struct apple_dcp *dcp, u32 port)
 		smp_store_release(&dcp->external_link_ready, false);
 		dcpext_scanout_invalidate(dcp);
 	}
-	if (dptx_service_available(&dcp->dptxport[port]) && dcp->dptxport[port].connected) {
+	if (dptx_service_available(&dcp->dptxport[port]) &&
+	    (dcp->dptxport[port].connected || dcp->dptxport[port].release_owed)) {
+		u64 refusals = dcp_t8132_refusals(dcp);
+
 		/*
 		 * A T8132 dcpext's DRM swaps stop with the route, before
 		 * the release, which can take the firmware a while to answer.
@@ -4193,18 +4272,17 @@ static int dcp_dptx_release_locked(struct apple_dcp *dcp, u32 port)
 			 * display whose tunnel is gone and has not answered it
 			 * in time. The host's side ends here, so that the route
 			 * goes back to the fabric and the next tunnel is not
-			 * refused on it, but the DPTX port is not reused until
-			 * the firmware answers: its transport keeps the call's
-			 * slot for that answer, the link callbacks the firmware
-			 * makes for the release meanwhile are not acted on
-			 * (dcp_t8132_late_release()), and the next connect
-			 * waits for it (dcp_t8132_wait_teardown_answers()).
-			 * Any other failure, a release not sent or refused, or
-			 * one on a live link, is returned as on every other
-			 * path.
+			 * refused on it, but the DPTX port is held until the
+			 * firmware answers (dcp_t8132_port_held_locked()): its
+			 * transport keeps the call's slot for that answer, the
+			 * link callbacks the firmware makes for the release
+			 * meanwhile are not acted on (dcp_t8132_late_release()),
+			 * and no connect uses the port. Any other failure, a
+			 * release not sent or refused, or one on a live link,
+			 * is returned as on every other path.
 			 */
 			dcp_t8132_dptx_teardown_log(dcp, port, "release_display", ret);
-			WRITE_ONCE(dcp->t8132_release_late, true);
+			dcp_t8132_hold_locked(dcp, refusals);
 			dev_info(dcp->dev, "DPTX port %u: its tunnel went, the release is answered late: port held until then\n",
 				 port);
 			ret = 0;
@@ -4212,6 +4290,7 @@ static int dcp_dptx_release_locked(struct apple_dcp *dcp, u32 port)
 		if (ret)
 			return ret;
 		dcp->dptxport[port].connected = false;
+		dcp->dptxport[port].release_owed = false;
 	}
 	/*
 	 * T6030: the firmware takes a direct crossbar output down when it
@@ -4288,6 +4367,109 @@ int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port)
 	}
 
 	return dcp_dptx_connect_attached(dcp, port);
+}
+
+/*
+ * DPMS turns a Type-C output's CRTC off (dcp_poweroff()). Under hpd_mutex:
+ * a connect of the reconnect work that must not wake the CRTC checks it
+ * there before each DPTX call, and one that raised HPD already is released
+ * by the power-off. A connect waiting for late teardown answers
+ * (dcp_t8132_wait_teardown_answers()) is woken to see it.
+ */
+static void dcp_typec_crtc_turned_off(struct apple_dcp *dcp)
+{
+	scoped_guard(mutex, &dcp->hpd_mutex) {
+		if (dcp->typec_cable_connected)
+			WRITE_ONCE(dcp->typec_crtc_off, true);
+	}
+	if (dcp->dptxep)
+		afk_late_replies_wake(dcp->dptxep);
+}
+
+/*
+ * Firmware 27: a T8132 dcpext's display attached while its connect could
+ * not run (its port held for an earlier release, its DPTX service not
+ * published yet) or failed: connect it from the reconnect work, for the
+ * session attached now. Called on the event that ended what kept it: the
+ * firmware's answer to the release, the service's publication, the
+ * tunnel's repeated request (dcp_t8132_port_work()). A CRTC turned off is
+ * not woken: dcp_poweron() connects it.
+ */
+static void dcp_typec_resume_locked(struct apple_dcp *dcp)
+{
+	lockdep_assert_held(&dcp->hpd_mutex);
+	if (!dcp_t8132_fw27(dcp) || !dcp->typec_work_enabled ||
+	    !dcp->typec_cable_connected || READ_ONCE(dcp->typec_crtc_off) ||
+	    dcp->dptxport[0].connected ||
+	    delayed_work_pending(&dcp->typec_reconnect_wq))
+		return;
+	dcp->typec_reconnect_tries = 0;
+	dcp->typec_reconnect_recovery = true;
+	dcp_queue_typec_reconnect_locked(dcp, 0);
+}
+
+/*
+ * Is the teardown call a held port waits for answered, and released? Its
+ * slot is free once the firmware answers (afk_late_replies_pending()); an
+ * answer that refused the call (afk_late_refusals() moved) leaves the
+ * display requested, and the release is sent again here. A release
+ * refused again keeps the port held: only a new endpoint frees it then
+ * (dptxep_init()). One that times out again is waited for as the first.
+ */
+static bool dcp_t8132_release_answered_locked(struct apple_dcp *dcp)
+{
+	struct apple_dcp_afkep *ep = dcp->dptxep;
+	int ret;
+
+	lockdep_assert_held(&dcp->hpd_mutex);
+	if (!ep || afk_late_replies_pending(ep))
+		return false;
+	if (afk_late_refusals(ep) == dcp->t8132_release_refusals)
+		return true;
+	dcp->t8132_release_refusals = afk_late_refusals(ep);
+	if (!dptx_service_available(&dcp->dptxport[0])) {
+		dev_warn(dcp->dev, "DPTX port 0: the firmware refused an earlier release, and the port is gone: held\n");
+		return false;
+	}
+	dev_info(dcp->dev, "DPTX port 0: the firmware refused an earlier release: releasing again\n");
+	ret = dptxport_release_display(dcp->dptxport[0].service);
+	if (!ret)
+		return true;
+	dcp_t8132_dptx_teardown_log(dcp, 0, "release_display", ret);
+	if (ret != -ETIMEDOUT)
+		dev_err(dcp->dev, "DPTX port 0: release refused again (%d): held until the display processor restarts\n",
+			ret);
+	return false;
+}
+
+/*
+ * Firmware 27: the firmware answered a timed-out DPTX call (queued by the
+ * transport, see afk_recv_handle_reply()), published the DPTX service
+ * (dptxport_init()), or the tunnel's provider repeated its request for the
+ * tunnel attached (dcp_typec_attach_repeated()). A held port whose release
+ * is answered is freed, and a display attached meanwhile is connected.
+ */
+static void dcp_t8132_port_work(struct work_struct *work)
+{
+	struct apple_dcp *dcp = container_of(work, struct apple_dcp, t8132_port_work);
+
+	guard(mutex)(&dcp->hpd_mutex);
+	if (!dcp->typec_work_enabled)
+		return;
+	if (dcp_t8132_port_held_locked(dcp)) {
+		if (!dcp_t8132_release_answered_locked(dcp))
+			return;
+		WRITE_ONCE(dcp->t8132_release_late, false);
+		dev_info(dcp->dev, "DPTX port 0: the earlier release is answered: the port is free\n");
+	}
+	dcp_typec_resume_locked(dcp);
+}
+
+/* A display processor's DPTX service was published, or a tunnel's request repeated. */
+void dcp_typec_attach_repeated(struct apple_dcp *dcp)
+{
+	if (dcp_t8132_fw27(dcp))
+		schedule_work(&dcp->t8132_port_work);
 }
 
 /**
@@ -4391,15 +4573,18 @@ int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port)
 	if (dcp_is_t8132_ext(dcp)) {
 		dcp_t8132_hpd_low(dcp, port);
 	} else if (dptx_service_available(&dcp->dptxport[port])) {
+		u64 refusals = dcp_t8132_refusals(dcp);
+
 		ret = dptxport_set_hpd(dcp->dptxport[port].service, false);
 		/*
 		 * Firmware 27: an HPD low unanswered for a display whose tunnel
-		 * is gone goes on to the release, which says what is still
-		 * outstanding (dcp_dptx_release_locked()).
+		 * is gone holds the port as an unanswered release does, and
+		 * goes on to the release (dcp_dptx_release_locked()).
 		 */
 		if (ret == -ETIMEDOUT && dcp_t8132_tunnel_gone(dcp, port)) {
 			dcp_t8132_dptx_teardown_log(dcp, port, "set_hpd(0)", ret);
-			WRITE_ONCE(dcp->t8132_release_late, true);
+			scoped_guard(mutex, &dcp->hpd_mutex)
+				dcp_t8132_hold_locked(dcp, refusals);
 		} else if (ret) {
 			return ret;
 		}
@@ -5753,15 +5938,8 @@ void dcp_poweroff(struct platform_device *pdev)
 	 */
 	if (dcp_is_typec_output(dcp)) {
 		reinit_completion(&dcp->typec_iomfb_hpd_ready);
-		/*
-		 * Under hpd_mutex: a connect of the reconnect work that must not
-		 * wake the CRTC checks it there before each DPTX call, and one
-		 * that raised HPD already is released below.
-		 */
-		scoped_guard(mutex, &dcp->hpd_mutex) {
-			if (dcp->typec_cable_connected)
-				WRITE_ONCE(dcp->typec_crtc_off, true);
-		}
+		/* A connect that raised HPD already is released below. */
+		dcp_typec_crtc_turned_off(dcp);
 		/* dcp_poweron() reconnects the link on DPMS wake. */
 		cancel_delayed_work(&dcp->typec_reconnect_wq);
 	}
@@ -6637,6 +6815,8 @@ VISIBLE_IF_KUNIT void dcp_disable_typec_work(struct apple_dcp *dcp, bool release
 	/* Block new enqueues as well as draining users of the AFK endpoints. */
 	disable_delayed_work_sync(&dcp->typec_reconnect_wq);
 	disable_delayed_work_sync(&dcp->placeholder_edid_wq);
+	/* It finds the work disabled (typec_work_enabled) if queued again. */
+	cancel_work_sync(&dcp->t8132_port_work);
 	scoped_guard(spinlock_irqsave, &dcp->relink_lock)
 		dcp_relink_enable(&dcp->relink, false);
 	disable_delayed_work_sync(&dcp->typec_relink_wq);
@@ -7959,6 +8139,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	INIT_DELAYED_WORK(&dcp->link_recovery_wq, dcp_link_recovery_work);
 	mutex_init(&dcp->tb_event_lock);
 	INIT_WORK(&dcp->tb_event_work, dcp_tb_event_work);
+	INIT_WORK(&dcp->t8132_port_work, dcp_t8132_port_work);
 	INIT_DELAYED_WORK(&dcp->placeholder_edid_wq,
 			  dcp_placeholder_edid_work);
 	INIT_DELAYED_WORK(&dcp->typec_relink_wq, dcp_typec_relink_work);

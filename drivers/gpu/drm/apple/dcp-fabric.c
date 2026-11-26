@@ -3543,6 +3543,12 @@ static int dcp_tb_dispatch_request(void *data, const struct dcp_fabric_port *fou
 			ret = dcp_fabric_binding_request((*slot)->tunnel_generation,
 							 ctx->generation, ctx->active, same);
 		}
+		/*
+		 * The same tunnel requested again: its display, if it is not
+		 * connected, may be now (dcp_typec_attach_repeated()).
+		 */
+		if (ret > 0 && ctx->active)
+			dcp_typec_attach_repeated(dcp);
 		if (ret)
 			return ret > 0 ? 0 : ret;
 	} else if (!ctx->active) {
@@ -5970,6 +5976,7 @@ void dcp_fabric_shutdown_dptx(struct apple_dcp *dcp)
 			for (int i = 0; i < ARRAY_SIZE(dcp->dptxport); i++) {
 				dcp->dptxport[i].enabled = false;
 				dcp->dptxport[i].connected = false;
+				dcp->dptxport[i].release_owed = false;
 				dcp->dptxport[i].service = NULL;
 			}
 		}

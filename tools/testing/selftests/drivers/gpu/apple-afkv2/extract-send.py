@@ -78,8 +78,10 @@ struct cmd_info {
 struct dcp { void *dev; bool quiescing,external,crashed,ext26; void *rtk; };
 static bool dcp_is_ext26(const struct dcp *dcp) { return dcp->ext26; }
 struct afk_ringbuffer { bool ready; };
+struct work_struct { int queued; };
+#define schedule_work(w) ((w)->queued++)
 struct apple_dcp_afkep { struct dcp *dcp; bool wire_v2,inline_v2,compact; int endpoint,lock;u8 *command_tags;
- int compact_orphan_wq;
+ int compact_orphan_wq; u64 late_refusals; struct work_struct *late_reply_work;
  struct afk_ringbuffer txbfr,rxbfr; size_t ext26_command_bytes; unsigned int ext26_command_count; };
 struct ops { const char *name; };
 struct apple_epic_service {
@@ -177,6 +179,7 @@ int main(void)
  u8 tags[AFKV2_INTERFACES]={0};
  struct dcp dcp={0};struct apple_dcp_afkep ep={.dcp=&dcp,.wire_v2=true,.inline_v2=true,.command_tags=tags};
  struct ops ops={.name="test"};struct apple_epic_service s={.ep=&ep,.ops=&ops,.channel=4,.enabled=true,.users=1};
+ struct work_struct late_work={0};ep.late_reply_work=&late_work;
  u8 request[112]={0x5a},*output=calloc(1,32888);size_t received;u32 status=99;
  active=&s;
  assert(!afk_send_command_timeout_len(&s,0xc0,request,112,output,32888,&status,1000,&received));
@@ -249,12 +252,17 @@ int main(void)
  assert(frees==before_late && s.cmd_map[0] && !s.cmds[0].done && s.users==1 && !late_wakes);
  afk_recv_handle_reply(&ep,4,retained_tag,&reply,sizeof(reply));
  assert(frees==before_late+2 && !s.cmd_map[0] && s.cmds[0].done && s.users==1);
- /* Only the late reply of the timed-out command wakes its waiters. */
- assert(late_wakes==1);
+ /* Only the late reply of the timed-out command wakes its waiters, and queues their work. */
+ assert(late_wakes==1 && late_work.queued==1 && !ep.late_refusals);
  afk_recv_handle_reply(&ep,4,retained_tag,&reply,sizeof(reply));
  assert(frees==before_late+2);
  s.enabled=true;s.torndown=false;
-timeout=0;
+ /* A late reply that refuses the call is counted (afk_late_refusals()). */
+ assert(afk_send_command_timeout_len(&s,0xc0,request,112,output,32888,&status,1000,&received)==-ETIMEDOUT);
+ reply.retcode=0xe00002bc;
+ afk_recv_handle_reply(&ep,4,s.cmds[0].tag,&reply,sizeof(reply));
+ assert(!s.cmd_map[0] && ep.late_refusals==1 && late_work.queued==2);
+ reply.retcode=0;timeout=0;
  /* Gated: refused, nothing queued, no slot kept; allowed, queued under the gate. */
  unsigned int gate_sends=sends,gate_frees=frees;
  gate_mode=1;

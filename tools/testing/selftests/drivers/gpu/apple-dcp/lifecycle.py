@@ -808,6 +808,17 @@ int main(void)
                      '#define dcp_dptx_gate_disarm(...) ((void)0)\n'
                      '#define dcp_dptx_gate_close(...) ((void)0)\n'
                      '#define dcp_connect_admitted(d, s, c, r) dcp_connect_session_valid(d, s, c, r)\n')
+    if 'dcp_dptx_release_locked(' in raw:
+        # A failed connect releases its display as a detach does: not a T8132 dcpext here.
+        swap(' struct { bool connected, closed, tile_hint;',
+             ' struct { bool connected, release_owed, closed, tile_hint;')
+        firmware += ('static bool dcp_t8132_port_held_locked(struct apple_dcp *d) { (void)d; return false; }\n'
+                     '/* dcp_dptx_release_locked() for this display: an H17P external, no tunnel. */\n'
+                     'static int dcp_dptx_release_locked(struct apple_dcp *d, u32 port)\n'
+                     '{ int r; if (!dptx_service_available(&d->dptxport[port]) ||\n'
+                     '  !(d->dptxport[port].connected || d->dptxport[port].release_owed)) return 0;\n'
+                     '  r = dptxport_release_display(d->dptxport[port].service); if (r) return r;\n'
+                     '  d->dptxport[port].connected = d->dptxport[port].release_owed = false; return 0; }\n')
     # unless the update work already needed the clock
     clock = 'static unsigned jiffies_to_msecs(unsigned long t) { return t; }\n'
     if clock in unit:
@@ -909,6 +920,9 @@ static void dcp_external_retry(struct apple_dcp *d, const char *why, int error, 
 { (void)d; (void)why; (void)error; (void)delay; retries++; }
 static bool gpiod_get_value_cansleep(void *gpio) { (void)gpio; return false; }
 static void disconnected_hpd_event(struct apple_connector *connector) { (void)connector; }
+/* The CRTC turned off, under hpd_mutex, for a display still attached. */
+static void dcp_typec_crtc_turned_off(struct apple_dcp *d)
+{ if (d->typec_cable_connected) d->typec_crtc_off = true; }
 ''' + panel_predicate + '\n' + poweroff + r'''
 static struct apple_dcp dcp;
 static struct apple_connector connector;

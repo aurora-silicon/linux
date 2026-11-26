@@ -254,6 +254,13 @@ static void dcp_external_crtc_released(struct apple_dcp *d) { (void)d; abort(); 
 static bool hdmi_present;
 static int gpiod_get_value_cansleep(void *g) { (void)g; return hdmi_present; }
 static void disconnected_hpd_event(struct apple_connector *c) { (void)c; }
+static void dcp_typec_crtc_turned_off(struct apple_dcp *d)
+{
+	scoped_guard(mutex, &d->hpd_mutex) {
+		if (d->typec_cable_connected)
+			d->typec_crtc_off = true;
+	}
+}
 '''
 
 CASES = r'''

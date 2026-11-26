@@ -1170,6 +1170,8 @@ static void dptxport_init(struct apple_epic_service *service, const char *name,
 
 	dptx_service_publish(service);
 	complete(&port->enable_completion);
+	/* Firmware 27 T8132: a display attached meanwhile connects now. */
+	dcp_typec_attach_repeated(service->ep->dcp);
 	/* A connect that found no port yet is retried from process context. */
 	if (service->ep->dcp->external_native)
 		schedule_work(&service->ep->dcp->external_ready_work);
@@ -1656,6 +1658,15 @@ int dptxep_init(struct apple_dcp *dcp)
 	if (IS_ERR(ep))
 		return PTR_ERR(ep);
 	ep->wire_v2 = wire_v2;
+	/*
+	 * Firmware 27 T8132: the answer to a timed-out call may free a held
+	 * port (dcp_t8132_port_work()). A new endpoint has no call outstanding.
+	 */
+	if (dcp_t8132_ext_hw(dcp) && !dcp_is_t8132_ext(dcp)) {
+		ep->late_reply_work = &dcp->t8132_port_work;
+		scoped_guard(mutex, &dcp->hpd_mutex)
+			WRITE_ONCE(dcp->t8132_release_late, false);
+	}
 	dcp->dptxep = ep;
 
 	ret = afk_start(dcp->dptxep);

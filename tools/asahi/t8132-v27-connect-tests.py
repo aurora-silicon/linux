@@ -20,12 +20,23 @@ firmware 27.2:
 - a T8132 dcpext connects once per tunnel: a failed connect is not tried
   again blindly;
 - a release the firmware does not answer for a display whose tunnel is gone
-  gives the route back, and the DPTX port is not reused until the firmware
-  answers: the next connect waits for that answer, a revocation ends the wait,
-  and a release never answered fails the connect instead of reusing the port.
-  The link reports the firmware makes for the old release meanwhile are not
-  acted on. A release not sent (-ENOSPC), refused, or timed out on a live
-  link, or on a link without a tunnel (a fixed HDMI output), fails as before.
+  gives the route back, and the DPTX port is held until the firmware answers:
+  a connect meanwhile does not use it, and does not wait for it either. The
+  answer frees the port and connects the display attached meanwhile, whenever
+  it comes (dcp_t8132_port_work()); an answer that refuses the release has it
+  sent again; a release never answered keeps the port held. The link reports
+  the firmware makes for the old release meanwhile are not acted on. A
+  release not sent (-ENOSPC), refused, or timed out on a live link, or on a
+  link without a tunnel (a fixed HDMI output), fails as before;
+- a connect that fails once its display is requested releases it as a detach
+  does (dcp_dptx_release_locked()): a revocation after the request with a
+  release that times out holds the port, and a release refused is owed to
+  the next release or connect. Only the firmware's answer frees a held port:
+  no connect clears it;
+- the DPTX service's publication, or the tunnel's repeated request, connects
+  a display attached while its connect could not run;
+- the M4 backend (26.6.2) still waits for its unanswered compact calls,
+  until a revocation or the CRTC's power-off, which wakes the wait.
 
 Each mutation puts one piece back as it was, or drops it; the replay must then
 fail.
@@ -51,14 +62,20 @@ FUNCTIONS = [
     ('dcp', 'dcp_connect_session_valid_locked'), ('dcp', 'dcp_connect_session_valid'),
     ('dcp', 'dcp_typec_sessionless'), ('dcp', 'dcp_queue_typec_reconnect_locked'),
     ('dcp', 'dcp_queue_typec_reconnect'), ('dcp', 'dcp_t8132_wait_teardown_answers'),
+    ('dcp', 'dcp_t8132_fw27'), ('dcp', 'dcp_t8132_port_held_locked'),
+    ('dcp', 'dcp_t8132_hold_locked'), ('dcp', 'dcp_t8132_refusals'),
     ('dcp', 'dcp_tb_tunnel_withdrawn'), ('dcp', 'dcp_connect_admitted_locked'),
     ('dcp', 'dcp_connect_admitted'), ('dcp', 'dcp_dptx_gate_open'),
+    ('dcp', 'dcp_dptx_gate_arm'), ('dcp', 'dcp_dptx_gate_disarm'),
     ('dcp', 'dcp_dptx_gate_close'), ('dcp', 'dcp_dptx_send_gated'),
     ('dcp', 'dcp_watches_tunnel_withdrawal'), ('dcp', 'dcp_dptx_wait_linkcfg'),
     ('dcp', 'dcp_dptx_connect_raw'), ('dcp', 'dcp_typec_reconnect_work'),
     ('dcp', 'dcp_typec_attach_locked'), ('dcp', 'dcp_typec_attach_deferred'),
     ('dcp', 'dcp_t8132_tunnel_gone'), ('dcp', 'dcp_dptx_release_locked'),
     ('dcp', 'dcp_dptx_disconnect'), ('dcp', 'dcp_dptx_disconnect_oob'),
+    ('dcp', 'dcp_typec_crtc_turned_off'), ('dcp', 'dcp_typec_resume_locked'),
+    ('dcp', 'dcp_t8132_release_answered_locked'), ('dcp', 'dcp_t8132_port_work'),
+    ('dcp', 'dcp_typec_attach_repeated'),
 ]
 
 # name -> (source, old, new)
@@ -76,8 +93,8 @@ MUTATIONS = {
     'detach-no-link-wake': ('dcp', '\t\tif (dcp->dptx_tunnel)\n\t\t\tcomplete(&dcp->dptxport[0].linkcfg_completion);\n',
                             ''),
     # The deferred connect may wake a CRTC turned off.
-    'deferred-wakes-off-crtc': ('dcp', '\tdcp->typec_reconnect_recovery = true;\n\tdcp_queue_typec_reconnect_locked(dcp, 0);',
-                                '\tdcp_queue_typec_reconnect_locked(dcp, 0);'),
+    'deferred-wakes-off-crtc': ('dcp', '\t */\n\tdcp->typec_reconnect_recovery = true;\n\tdcp_queue_typec_reconnect_locked(dcp, 0);',
+                                '\t */\n\tdcp_queue_typec_reconnect_locked(dcp, 0);'),
     # Blind retries of a failed firmware-27 connect.
     'blind-retries': ('dcp', '(dcp_uses_t6020_tunnel_flow(dcp) || dcp_t8132_ext_hw(dcp) ?',
                       '(dcp_uses_t6020_tunnel_flow(dcp) || dcp_is_t8132_ext(dcp) ?'),
@@ -89,15 +106,38 @@ MUTATIONS = {
                            '\t       dcp_tb_tunnel_withdrawn(dcp, port);',
                            '\treturn dcp_t8132_ext_hw(dcp) && !dcp_is_t8132_ext(dcp);'),
     # The next connect reuses the port before the firmware answered.
-    'no-fence': ('dcp', '\t\tif (t8132 ? afk_compact_orphans_pending(dcp->dptxep) :\n'
-                 '\t\t\t    READ_ONCE(dcp->t8132_release_late)) {',
-                 '\t\tif (t8132 && afk_compact_orphans_pending(dcp->dptxep)) {'),
-    # A revoked session does not end the wait for the answers.
+    'no-fence': ('dcp', '\t} else if (dcp_t8132_port_held_locked(dcp)) {', '\t} else if (false) {'),
+    # The M4 backend's wait is not ended by a revoked session.
     'fence-ignores-revocation': ('dcp', '\t\t\t   READ_ONCE(dcp->typec_generation) != generation ||\n', ''),
-    # The wait for the answers gives up and reuses the port.
-    'fence-gives-up': ('dcp', '\tdev_warn(dcp->dev, "DPTX port %u: an earlier release is still unanswered after %u ms: not connected\\n",\n'
-                       '\t\t port, jiffies_to_msecs(DCP_T8132_ORPHAN_WAIT));\n\treturn -EBUSY;',
-                       '\treturn 0;'),
+    # The hold is given up without the firmware's answer.
+    'fence-gives-up': ('dcp', '\t\tif (!dcp_t8132_release_answered_locked(dcp))\n\t\t\treturn;\n', ''),
+    # A connect clears the hold, as before (outside hpd_mutex, unanswered).
+    'connect-clears-hold': ('dcp', '\tif (t8132 && dcp->dptxep && afk_compact_orphans_pending(dcp->dptxep)) {\n'
+                            '\t\tret = dcp_t8132_wait_teardown_answers(',
+                            '\tWRITE_ONCE(dcp->t8132_release_late, false);\n'
+                            '\tif (t8132 && dcp->dptxep && afk_compact_orphans_pending(dcp->dptxep)) {\n'
+                            '\t\tret = dcp_t8132_wait_teardown_answers('),
+    # A failed connect releases its display ignoring the result, as before.
+    'connect-release-ignored': ('dcp', '\tdcp_dptx_gate_disarm(dcp);\n\terr = dcp_dptx_release_locked(dcp, port);\n',
+                                '\tdcp_dptx_gate_disarm(dcp);\n\tdptxport_release_display(dcp->dptxport[port].service);\n'
+                                '\tdcp->dptxport[port].connected = false;\n\terr = 0;\n'),
+    # A release not sent or refused is dropped instead of owed.
+    'owed-dropped': ('dcp', '\t    (dcp->dptxport[port].connected || dcp->dptxport[port].release_owed)) {',
+                     '\t    dcp->dptxport[port].connected) {'),
+    # An answer that refused the release taken as the release done.
+    'refusal-taken-as-release': ('dcp', '\tif (afk_late_refusals(ep) == dcp->t8132_release_refusals)\n\t\treturn true;',
+                                 '\treturn true;'),
+    # The answer frees the port, but nothing connects the display attached meanwhile.
+    'no-resume': ('dcp', '\t\tdev_info(dcp->dev, "DPTX port 0: the earlier release is answered: the port is free\\n");\n\t}\n\tdcp_typec_resume_locked(dcp);',
+                  '\t\tdev_info(dcp->dev, "DPTX port 0: the earlier release is answered: the port is free\\n");\n\t}'),
+    # The resume wakes a CRTC turned off.
+    'resume-wakes-off-crtc': ('dcp', '\t    !dcp->typec_cable_connected || READ_ONCE(dcp->typec_crtc_off) ||',
+                              '\t    !dcp->typec_cable_connected ||'),
+    # Neither the service's publication nor a repeated request resumes a display.
+    'repeat-no-resume': ('dcp', '\tif (dcp_t8132_fw27(dcp))\n\t\tschedule_work(&dcp->t8132_port_work);', '\t;'),
+    # DPMS does not wake the M4 backend's wait.
+    'dpms-no-wake': ('dcp', '\tif (dcp->dptxep)\n\t\tafk_late_replies_wake(dcp->dptxep);\n}\n\n/*\n * Firmware 27: a T8132 dcpext\'s display attached',
+                     '}\n\n/*\n * Firmware 27: a T8132 dcpext\'s display attached'),
     # The late link reports of the old release reach the new connect.
     'late-reports-acted-on': ('fabric', '\treturn dcp_t8132_ext_hw(dcp) && dcp_t8132_late_release(dcp, what);',
                               '\treturn false;'),
@@ -106,7 +146,7 @@ MUTATIONS = {
 
 def function(text, name):
     match = re.search(r'^(?:VISIBLE_IF_KUNIT\s+)?(?:static\s+)?(?:inline\s+)?'
-                      r'(?:bool|int|void|unsigned long|struct dcp_fabric_session)\s+' + re.escape(name) +
+                      r'(?:bool|int|void|unsigned long|u64|struct dcp_fabric_session)\s+' + re.escape(name) +
                       r'\([^;{]*?\)\n\{', text, re.M | re.S)
     assert match, name
     pos = text.index('{', match.start()) + 1
@@ -213,16 +253,24 @@ static unsigned long wait_for_completion_timeout(struct completion *c, unsigned 
 	return 0;
 }
 static unsigned long fence_wait_spent;
+/* Wakes of the late-answer waiters (afk_late_replies_wake(), an answer). */
+static unsigned int late_wakes;
+/* A wait sees a change only if it is woken for it, or at its end. */
 #define wait_event_timeout(wq, cond, timeout) ({ \
 	unsigned long __t = (timeout); \
+	unsigned int __w = late_wakes; \
 	(void)(wq); \
-	if (at_fence_wait) { void (*h)(void) = at_fence_wait; at_fence_wait = NULL; h(); } \
-	(cond) ? 1 : (jiffies += __t, fence_wait_spent += __t, (cond) ? 1 : 0); })
+	(cond) ? 1 : ({ \
+		if (at_fence_wait) { void (*h)(void) = at_fence_wait; at_fence_wait = NULL; h(); } \
+		(late_wakes != __w && (cond)) ? 1 : \
+		(jiffies += __t, fence_wait_spent += __t, (cond) ? 1 : 0); }); })
 
-struct work_struct { int unused; };
+struct work_struct { int queued; };
+static void schedule_work(struct work_struct *w) { w->queued++; }
 struct delayed_work { struct work_struct work; bool pending; unsigned int queued; };
 #define to_delayed_work(w) container_of(w, struct delayed_work, work)
 static void *system_freezable_wq;
+static bool delayed_work_pending(struct delayed_work *w) { return w->pending; }
 static bool mod_delayed_work(void *wq, struct delayed_work *w, unsigned long delay)
 {
 	(void)wq; (void)delay; w->pending = true; w->queued++; return false;
@@ -243,7 +291,7 @@ struct apple_epic_service { struct apple_dcp_afkep *ep; };
 struct dcp_fabric_session { u64 generation; u64 cookie; };
 struct dptx_port {
 	struct apple_epic_service *service;
-	bool connected, closed, tile_hint;
+	bool connected, release_owed, closed, tile_hint;
 	void *atcphy;
 	struct completion linkcfg_completion;
 };
@@ -269,6 +317,8 @@ struct apple_dcp {
 	bool typec_reconnect_recovery;
 	struct dcp_fabric_session typec_reconnect_session;
 	struct delayed_work typec_reconnect_wq, placeholder_edid_wq;
+	u64 t8132_release_refusals;
+	struct work_struct t8132_port_work;
 	struct completion typec_iomfb_hpd_ready;
 	void *tb_dpin_ctx;
 	struct { void *binding; bool active; } split;
@@ -289,11 +339,12 @@ static struct platform_device *to_platform_device(struct device *d)
 	return container_of(d, struct platform_device, dev);
 }
 static void *platform_get_drvdata(struct platform_device *p);
+static int dcp_dptx_release_locked(struct apple_dcp *dcp, u32 port);
 
 /* The DPTX calls, in order, and the firmware behind them. */
 static char rpcs[64][24];
 static unsigned int nrpcs;
-static int release_ret, set_hpd_low_ret;
+static int release_ret, set_hpd_low_ret, set_hpd_high_ret;
 static bool hpd_high;
 static void (*at_rpc)(const char *what);
 /* Whether the firmware configures the link once HPD is raised. */
@@ -343,6 +394,8 @@ static int dptxport_set_hpd(struct apple_epic_service *s, bool on)
 	ret = send(on ? "hpd1" : "hpd0");
 	if (ret)
 		return ret;
+	if (on && set_hpd_high_ret)
+		return set_hpd_high_ret;
 	if (!on && set_hpd_low_ret)
 		return set_hpd_low_ret;
 	hpd_high = on;
@@ -389,10 +442,12 @@ static int apple_dp_tunnel_binding_call(void *binding, int (*call)(void *arg), v
 #define symbol_get(sym) (&sym)
 #define symbol_put(sym) ((void)0)
 
-/* AFK: late answers of calls that timed out. */
+/* AFK: late answers of calls that timed out, and the refusals among them. */
 static bool late_pending, compact_orphans;
-static unsigned int orphans_dropped, late_wakes;
+static unsigned int orphans_dropped;
+static u64 late_refusals;
 static bool afk_late_replies_pending(struct apple_dcp_afkep *ep) { (void)ep; return late_pending || compact_orphans; }
+static u64 afk_late_refusals(struct apple_dcp_afkep *ep) { (void)ep; return late_refusals; }
 static bool afk_compact_orphans_pending(struct apple_dcp_afkep *ep) { (void)ep; return compact_orphans; }
 static unsigned int afk_compact_orphans_drop(struct apple_dcp_afkep *ep)
 { (void)ep; compact_orphans = false; return ++orphans_dropped; }
@@ -473,6 +528,7 @@ static void setup(struct device_node *node)
 	nrpcs = 0; warns = errs = infos = 0; link_waits = 0; link_wait_spent = fence_wait_spent = 0;
 	release_ret = set_hpd_low_ret = 0; hpd_high = false; link_comes = true; binding_live = true;
 	late_pending = compact_orphans = false; orphans_dropped = late_wakes = presents_lost = 0;
+	late_refusals = 0; set_hpd_high_ret = 0;
 	at_rpc = NULL; at_link_wait = at_fence_wait = NULL; waiter = NULL;
 	revoke_after_checks = gated_calls = 0;
 }
@@ -496,11 +552,8 @@ static bool hpd_raised_after_dpms(void)
 static void dpms_off(void)
 {
 	dpms_mark = nrpcs;
-	/* dcp_poweroff(): under hpd_mutex, then the CRTC's own release. */
-	scoped_guard(mutex, &dcp->hpd_mutex) {
-		if (dcp->typec_cable_connected)
-			WRITE_ONCE(dcp->typec_crtc_off, true);
-	}
+	/* dcp_poweroff(): the CRTC is off, then its own release. */
+	dcp_typec_crtc_turned_off(dcp);
 	cancel_delayed_work(&dcp->typec_reconnect_wq);
 	if (dcp->dptxport[0].connected) {
 		dptxport_set_hpd(dcp->dptxport[0].service, false);
@@ -648,6 +701,7 @@ static int release(bool live, bool tunnel, int ret, struct device_node *node)
 	int r;
 
 	setup(node);
+	dcp->typec_work_enabled = true;
 	dcp->dptxport[0].connected = true;
 	dcp->dptx_tunnel = tunnel;
 	binding_live = live;
@@ -661,7 +715,7 @@ static int release(bool live, bool tunnel, int ret, struct device_node *node)
 
 static void release_cases(void)
 {
-	/* The tunnel went and the release timed out: route back, port fenced. */
+	/* The tunnel went and the release timed out: route back, port held. */
 	assert(release(false, true, -ETIMEDOUT, &j713_27) == 0 && dcp->t8132_release_late);
 	/* Not sent, refused, or on a live or fixed link: the error, as before. */
 	assert(release(false, true, -ENOSPC, &j713_27) == -ENOSPC && !dcp->t8132_release_late);
@@ -674,7 +728,7 @@ static void release_cases(void)
 	assert(release(true, true, -ETIMEDOUT, &j713_26) == 0 && dcp->t8132_release_late);
 	puts("ok release: only a timed-out release of a gone tunnel is taken as done");
 
-	/* An unanswered HPD low of a gone tunnel goes on to the release. */
+	/* An unanswered HPD low of a gone tunnel holds the port and goes on to the release. */
 	setup(&j713_27);
 	dcp->dptxport[0].connected = true;
 	set_hpd_low_ret = -ETIMEDOUT; release_ret = -ETIMEDOUT;
@@ -688,7 +742,26 @@ static void release_cases(void)
 	puts("ok release: an unanswered HPD low only of a gone tunnel goes on");
 }
 
-static void answer(void) { late_pending = false; }
+/* The firmware answers the timed-out call: its slot is freed, its waiters woken, the work queued. */
+static void answer(void)
+{
+	late_pending = false;
+	late_wakes++;
+	dcp->t8132_port_work.queued++;
+}
+/* ... refusing it. */
+static void answer_refused(void)
+{
+	late_refusals++;
+	answer();
+}
+static void run_port_work(void)
+{
+	assert(dcp->t8132_port_work.queued);
+	dcp->t8132_port_work.queued = 0;
+	dcp_t8132_port_work(&dcp->t8132_port_work);
+	assert(!dcp->hpd_mutex.held);
+}
 
 /* The dock's tunnel comes back: a new binding, on the same pipeline. */
 static void replug(void)
@@ -705,47 +778,106 @@ static void replace(void)
 	replug();
 }
 
-static void fence_cases(void)
+/* A gone tunnel's release unanswered, the dock back: its connect does not use the port. */
+static void held_replug(void)
 {
-	/* The replug's connect waits for the answer, then connects. */
 	release(false, true, -ETIMEDOUT, &j713_27);
 	late_pending = true;
-	/* Meanwhile the old release's link reports are not acted on. */
-	assert(dcp_t8132_link_report_late(dcp, "SetActiveLaneCount"));
-	replug();
-	at_fence_wait = answer;
-	run_work();
-	assert(fence_wait_spent == 0 && hpd_high && dcp->dptxport[0].connected);
-	assert(!dcp->t8132_release_late && !dcp_t8132_link_report_late(dcp, "SetActiveLaneCount"));
-	puts("ok fence: the replug connects once the old release is answered");
-
-	/* The replug's tunnel goes while it waits: the wait ends at once. */
-	release(false, true, -ETIMEDOUT, &j713_27);
-	late_pending = true;
-	replug();
-	at_fence_wait = detach;
-	run_work();
-	assert(fence_wait_spent == 0 && nrpcs == 2 && !hpd_high);
-	puts("ok fence: a revocation ends the wait for the old release's answer");
-
-	/* The dock replaces the tunnel while the connect waits: that wait ends at once too. */
-	release(false, true, -ETIMEDOUT, &j713_27);
-	late_pending = true;
-	replug();
-	at_fence_wait = replace;
-	run_work();
-	assert(fence_wait_spent == 0 && !hpd_high && dcp->typec_reconnect_wq.pending);
-	puts("ok fence: a replaced tunnel ends the wait of its old session");
-
-	/* Never answered: the port is not reused, the connect fails. */
-	release(false, true, -ETIMEDOUT, &j713_27);
-	late_pending = true;
+	dcp->typec_cable_connected = false;
 	replug();
 	nrpcs = 0;
+	release_ret = 0;
 	run_work();
-	assert(fence_wait_spent && nrpcs == 0 && !hpd_high && dcp->t8132_release_late);
+	assert(nrpcs == 0 && !hpd_high && dcp->t8132_release_late && !dcp->typec_reconnect_wq.pending);
+	/* It did not wait for the answer either. */
+	assert(fence_wait_spent == 0);
+}
+
+/* The M4 backend's display goes and comes back (the detach wakes the waiters). */
+static void m4_reattach(void)
+{
+	scoped_guard(mutex, &dcp->hpd_mutex)
+		dcp->typec_generation++;
+	afk_late_replies_wake(dcp->dptxep);
+}
+
+static void fence_cases(void)
+{
+	/* The replug's connect is held; the answer, whenever it comes, connects it. */
+	held_replug();
+	/* Meanwhile the old release's link reports are not acted on. */
+	assert(dcp_t8132_link_report_late(dcp, "SetActiveLaneCount"));
+	answer();
+	run_port_work();
+	assert(!dcp->t8132_release_late && dcp->typec_reconnect_wq.pending);
+	run_work();
+	assert(hpd_high && dcp->dptxport[0].connected && nrpcs == 4);
+	assert(!dcp_t8132_link_report_late(dcp, "SetActiveLaneCount"));
+	puts("ok fence: the replug connects once the old release is answered, however late");
+
+	/* Answered with a refusal: released again, then connected. */
+	held_replug();
+	answer_refused();
+	run_port_work();
+	assert(nrpcs == 1 && !strcmp(rpcs[0], "release") && !dcp->t8132_release_late);
+	run_work();
+	assert(hpd_high && dcp->dptxport[0].connected);
+	/* ... refused again: still held, nothing connects. */
+	held_replug();
+	answer_refused();
+	release_ret = -EIO;
+	run_port_work();
+	assert(nrpcs == 1 && dcp->t8132_release_late && !dcp->typec_reconnect_wq.pending);
+	puts("ok fence: an answer that refuses the release has it sent again");
+
+	/* The replug's tunnel goes before the answer: nothing to connect then. */
+	held_replug();
+	detach();
+	answer();
+	run_port_work();
+	assert(!dcp->t8132_release_late && !dcp->typec_reconnect_wq.pending && !hpd_high);
+	puts("ok fence: a display gone before the answer is not connected");
+
+	/* The dock replaces the tunnel before the answer: the replacement connects. */
+	held_replug();
+	replace();
+	answer();
+	run_port_work();
+	assert(dcp->typec_reconnect_wq.pending);
+	assert(dcp->typec_reconnect_session.cookie == dcp->tb_generation);
+	run_work();
+	assert(hpd_high && dcp->dptxport[0].connected);
+	puts("ok fence: a replaced tunnel's replacement connects on the answer");
+
+	/* The CRTC turned off before the answer: not woken, its power-on connects. */
+	held_replug();
+	dcp->typec_cable_connected = true;
+	dpms_off();
+	answer();
+	run_port_work();
+	assert(!dcp->t8132_release_late && !dcp->typec_reconnect_wq.pending && !hpd_high);
+	puts("ok fence: a CRTC turned off is not woken by the answer");
+
+	/* Never answered: the port is not used, however often the dock asks. */
+	held_replug();
+	dcp_typec_attach_repeated(dcp);
+	run_port_work();
+	run_work();
+	assert(nrpcs == 0 && !hpd_high && dcp->t8132_release_late);
 	assert(dcp_t8132_link_report_late(dcp, "SetActiveLaneCount"));
 	puts("ok fence: a release never answered keeps the port unused");
+
+	/* A connect paused before its checks does not clear a hold a detach just set. */
+	release(false, true, -ETIMEDOUT, &j713_27);
+	late_pending = true;
+	binding_live = true;
+	dcp->typec_cable_connected = true;
+	scoped_guard(mutex, &dcp->hpd_mutex)
+		dcp->typec_reconnect_session = dcp_session_locked(dcp);
+	nrpcs = 0;
+	assert(dcp_dptx_connect_raw(dcp, 0, NULL, &dcp->typec_reconnect_session, true, false) == -EBUSY);
+	assert(dcp->t8132_release_late && nrpcs == 0);
+	puts("ok fence: only the answer frees a held port, never a connect");
 
 	/* The M4 backend gives up on its compact orphans, as before. */
 	setup(&j713_26);
@@ -755,7 +887,121 @@ static void fence_cases(void)
 		dcp->typec_reconnect_session = dcp_session_locked(dcp);
 	assert(dcp_dptx_connect_raw(dcp, 0, NULL, &dcp->typec_reconnect_session, true, false) == 0);
 	assert(orphans_dropped == 1 && hpd_high);
-	puts("ok fence: the M4 backend's unanswered compact calls are dropped as before");
+	/* A new attachment revokes the session and ends its wait at once. */
+	setup(&j713_26);
+	compact_orphans = true;
+	dcp->typec_cable_connected = true;
+	scoped_guard(mutex, &dcp->hpd_mutex)
+		dcp->typec_reconnect_session = dcp_session_locked(dcp);
+	at_fence_wait = m4_reattach;
+	assert(dcp_dptx_connect_raw(dcp, 0, NULL, &dcp->typec_reconnect_session, true, false) == -ESTALE);
+	assert(fence_wait_spent == 0 && !hpd_high);
+	/* So does the CRTC's power-off, for a connect that must not wake it. */
+	setup(&j713_26);
+	compact_orphans = true;
+	dcp->typec_cable_connected = true;
+	scoped_guard(mutex, &dcp->hpd_mutex)
+		dcp->typec_reconnect_session = dcp_session_locked(dcp);
+	at_fence_wait = dpms_off;
+	assert(dcp_dptx_connect_raw(dcp, 0, NULL, &dcp->typec_reconnect_session, true, true) == -ESTALE);
+	assert(fence_wait_spent == 0 && !hpd_high);
+	puts("ok fence: the M4 backend's wait, ended by its answers, a revocation or DPMS");
+}
+
+/* A connect that fails once its display is requested releases it as a detach does. */
+static void failed_connect_cases(void)
+{
+	/*
+	 * Revoked after Request, the release unanswered: the port is held, and
+	 * the replacement does not use it until the answer.
+	 */
+	setup(&j713_27);
+	dcp->typec_cable_connected = true;
+	dcp_typec_attach_deferred(dcp);
+	revoke_after = "request"; at_rpc = revoke_at;
+	release_ret = -ETIMEDOUT;
+	run_work();
+	assert(rpc_seen("release") && dcp->t8132_release_late);
+	assert(!dcp->dptxport[0].connected && !dcp->dptxport[0].release_owed);
+	at_rpc = NULL;
+	late_pending = true;
+	replace();
+	nrpcs = 0;
+	release_ret = 0;
+	run_work();
+	assert(nrpcs == 0 && !hpd_high);
+	answer();
+	run_port_work();
+	run_work();
+	assert(hpd_high && dcp->dptxport[0].connected);
+	puts("ok failed connect: revoked after Request, release unanswered: the port is held");
+
+	/* HPD refused on a live link, the release refused too: owed to the detach. */
+	setup(&j713_27);
+	dcp->typec_cable_connected = true;
+	dcp_typec_attach_deferred(dcp);
+	set_hpd_high_ret = -EIO; release_ret = -EIO;
+	run_work();
+	assert(!dcp->dptxport[0].connected && dcp->dptxport[0].release_owed);
+	nrpcs = 0; release_ret = 0;
+	assert(dcp_dptx_disconnect_oob(&pdev, 0) == 0);
+	assert(rpc_seen("release") && !dcp->dptxport[0].release_owed);
+	/* ... or to the next connect, which sends it first. */
+	setup(&j713_27);
+	dcp->typec_cable_connected = true;
+	dcp_typec_attach_deferred(dcp);
+	set_hpd_high_ret = -EIO; release_ret = -EIO;
+	run_work();
+	nrpcs = 0; release_ret = 0; set_hpd_high_ret = 0;
+	scoped_guard(mutex, &dcp->hpd_mutex)
+		dcp->typec_reconnect_session = dcp_session_locked(dcp);
+	assert(dcp_dptx_connect_raw(dcp, 0, NULL, &dcp->typec_reconnect_session, true, false) == 0);
+	assert(!strcmp(rpcs[0], "release") && !strcmp(rpcs[1], "validate") && hpd_high);
+	assert(!dcp->dptxport[0].release_owed);
+	/* A release owed and refused again: no connect. */
+	setup(&j713_27);
+	dcp->typec_cable_connected = true;
+	dcp_typec_attach_deferred(dcp);
+	set_hpd_high_ret = -EIO; release_ret = -EIO;
+	run_work();
+	nrpcs = 0; set_hpd_high_ret = 0;
+	scoped_guard(mutex, &dcp->hpd_mutex)
+		dcp->typec_reconnect_session = dcp_session_locked(dcp);
+	assert(dcp_dptx_connect_raw(dcp, 0, NULL, &dcp->typec_reconnect_session, true, false) == -EIO);
+	assert(nrpcs == 1 && dcp->dptxport[0].release_owed && !hpd_high);
+	puts("ok failed connect: a release refused is owed to the next release or connect");
+}
+
+/* The DPTX service's publication, or a repeated request, connects a display left waiting. */
+static void resume_cases(void)
+{
+	struct apple_epic_service *published = dcp->dptxport[0].service;
+
+	setup(&j713_27);
+	dcp->typec_cable_connected = true;
+	published = dcp->dptxport[0].service;
+	dcp->dptxport[0].service = NULL;
+	dcp_typec_attach_deferred(dcp);
+	run_work();
+	assert(nrpcs == 0 && !dcp->typec_reconnect_wq.pending);
+	/* dptxport_init(): the service is published. */
+	dcp->dptxport[0].service = published;
+	dcp_typec_attach_repeated(dcp);
+	run_port_work();
+	run_work();
+	assert(hpd_high && dcp->dptxport[0].connected);
+	/* A repeat for a display connected already does nothing more. */
+	nrpcs = 0;
+	dcp_typec_attach_repeated(dcp);
+	run_port_work();
+	assert(!dcp->typec_reconnect_wq.pending && nrpcs == 0);
+	puts("ok resume: the service's publication connects a display that came first");
+
+	/* The M4 backend has its own: nothing queued. */
+	setup(&j713_26);
+	dcp_typec_attach_repeated(dcp);
+	assert(!dcp->t8132_port_work.queued);
+	puts("ok resume: firmware 27 only");
 }
 
 int main(void)
@@ -763,6 +1009,8 @@ int main(void)
 	connect_cases();
 	release_cases();
 	fence_cases();
+	failed_connect_cases();
+	resume_cases();
 	puts("PASS firmware-27.2 T8132 dcpext deferred connect, revocation, DPMS, release and its fence");
 	return 0;
 }

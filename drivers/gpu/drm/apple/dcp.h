@@ -141,6 +141,7 @@ void dcp_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message);
 
 int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port);
 void dcp_typec_attach_deferred(struct apple_dcp *dcp);
+void dcp_typec_attach_repeated(struct apple_dcp *dcp);
 bool dcp_t6030_ext_native(const struct device_node *np);
 void dcp_external_ready(struct apple_dcp *dcp);
 void dcp_external_retry(struct apple_dcp *dcp, const char *why, int error,

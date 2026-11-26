@@ -1020,9 +1020,15 @@ struct apple_dcp {
 	bool typec_cable_connected;
 	/*
 	 * T8132 dcpext: a teardown call timed out; the firmware's late
-	 * Activate/Deactivate belong to it until its answer is in.
+	 * Activate/Deactivate belong to it until its answer is in. Firmware
+	 * 27: the DPTX port is held meanwhile (dcp_t8132_port_held_locked()),
+	 * set and cleared under hpd_mutex.
 	 */
 	bool t8132_release_late;
+	/* afk_late_refusals() before the held teardown call was sent */
+	u64 t8132_release_refusals;
+	/* Frees a held port on the firmware's answer, then resumes its display. */
+	struct work_struct t8132_port_work;
 	/*
 	 * A Thunderbolt tunnel's connect sends its DPTX calls under the
 	 * provider's admission of the session's binding (cookie): see

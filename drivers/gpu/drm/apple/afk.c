@@ -575,6 +575,18 @@ bool afk_late_replies_pending(struct apple_dcp_afkep *ep)
 	return pending;
 }
 
+/*
+ * How many late replies of @ep's timed-out V2 commands refused them (a
+ * nonzero return code). A count rather than a flag: whoever waits for a
+ * timed-out call reads it before sending the call, and the call was refused
+ * if the count moved once its slot is free (afk_late_replies_pending()). An
+ * empty slot map alone does not tell, as an error reply frees the slot too.
+ */
+u64 afk_late_refusals(struct apple_dcp_afkep *ep)
+{
+	return READ_ONCE(ep->late_refusals);
+}
+
 /* Wake the waiters for @ep's late replies, to check what else they wait for. */
 void afk_late_replies_wake(struct apple_dcp_afkep *ep)
 {
@@ -2031,6 +2043,9 @@ static void afk_recv_handle_reply(struct apple_dcp_afkep *ep, u32 channel,
 	}
 	if (service->cmds[idx].completion)
 		complete(service->cmds[idx].completion);
+	/* A late reply that refuses the call: see afk_late_refusals(). */
+	if (late && service->cmds[idx].retcode)
+		WRITE_ONCE(ep->late_refusals, ep->late_refusals + 1);
 
 	spin_unlock_irqrestore(&service->lock, flags);
 
@@ -2039,8 +2054,11 @@ static void afk_recv_handle_reply(struct apple_dcp_afkep *ep, u32 channel,
 	if (txbuf && txlen)
 		dma_free_coherent(ep->dcp->dev, txlen, txbuf, txbuf_dma);
 	/* The late reply of a timed-out command: see afk_late_replies_pending(). */
-	if (late)
+	if (late) {
 		wake_up_all(&ep->compact_orphan_wq);
+		if (ep->late_reply_work)
+			schedule_work(ep->late_reply_work);
+	}
 }
 
 /* A call from DCP: one word ahead of the call header AP sends. */
