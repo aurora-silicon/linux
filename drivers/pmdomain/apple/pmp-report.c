@@ -1577,12 +1577,15 @@ static void apple_pmp_diag_preboot(struct apple_pmp_report *rep)
 
 /*
  * DIAGNOSTIC (T6030): every change of the PTD read side (entries 0-447, value and stamp, at
- * +16e and +16e+8) from PM_SUSPEND_PREPARE to PM_POST_SUSPEND, sampled every diag_watch_ms ms,
+ * +16e and +16e+8, without the hardware packet entries 16-279) from PM_SUSPEND_PREPARE to
+ * PM_POST_SUSPEND, sampled every diag_watch_ms ms,
  * printed after resume, to see which entry is written between the DCP's M3 power-down and the
  * PMP's "PTD abort". Read only. 0 (the default) is off.
  */
 #define PMP_WATCH_ENTRIES	448
 #define PMP_WATCH_RECS		8192
+#define PMP_WATCH_PKT_FIRST	16
+#define PMP_WATCH_PKT_END	280
 
 struct pmp_watch_rec {
 	s64 us;
@@ -1609,6 +1612,9 @@ static void pmp_watch_scan(struct apple_pmp_report *rep, bool record)
 	u64 v, s;
 
 	for (e = 0; e < PMP_WATCH_ENTRIES; e++) {
+		/* PMS and SOC-DEV packets (16-279) are hardware-written every few ms */
+		if (e == PMP_WATCH_PKT_FIRST)
+			e = PMP_WATCH_PKT_END;
 		v = readq(rep->base + 16 * e);
 		s = readq(rep->base + 16 * e + 8);
 		if (record && (v != pmp_watch_last[2 * e] || s != pmp_watch_last[2 * e + 1])) {

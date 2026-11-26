@@ -445,13 +445,27 @@ const char *iomfb_v27_missing_method(const struct dcp_method_entry *methods,
 
 #include "iomfb_template.c"
 
+/*
+ * DIAGNOSTIC (T6030 sleep bring-up): the PTD entry D003 gives the firmware for its clock request,
+ * in the same window as the bandwidth scratch (entry N at window + 8 * N). 0 keeps the request
+ * address 0, which the J516S DCP writes as PTD entry 0 at its M3 power-down; the PMP traps that
+ * write ("PTD abort (0x0)").
+ */
+static unsigned int v27_clock_request_entry;
+module_param(v27_clock_request_entry, uint, 0444);
+MODULE_PARM_DESC(v27_clock_request_entry, "DIAGNOSTIC (T6030): PTD entry for the DCP's D003 clock request (0: address 0)");
+
 static bool trampoline_rt_bandwidth_h17p(struct apple_dcp *dcp, int tag,
 					 void *out, void *in)
 {
-	u64 scratch = dcp->disp_firmware_base[dcp->disp_bw_scratch_index] +
-		      dcp->disp_bw_scratch_offset;
+	u64 base = dcp->disp_firmware_base[dcp->disp_bw_scratch_index];
+	u64 scratch = base + dcp->disp_bw_scratch_offset;
 	u64 clock_request = 0;
 
+	if (v27_clock_request_entry)
+		clock_request = base + 8ULL * v27_clock_request_entry;
+	dev_info(dcp->dev, "D003: bandwidth scratch %#llx, clock request %#llx\n",
+		 scratch, clock_request);
 	trace_iomfb_callback(dcp, tag, __func__);
 	if (apple_dcp_h17p_rt_bw_encode_reply(in, out, scratch, clock_request))
 		dev_warn(dcp->dev, "D003 bandwidth request is malformed\n");
