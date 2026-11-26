@@ -6,11 +6,15 @@
  * Author: Mika Westerberg <mika.westerberg@linux.intel.com>
  */
 
+#include <linux/crc32.h>
 #include <linux/delay.h>
+#include <kunit/device.h>
 #include <kunit/static_stub.h>
 #include <kunit/test.h>
 #include <linux/idr.h>
+#include <linux/property.h>
 #include <linux/suspend.h>
+#include <linux/unaligned.h>
 
 #include "tb.h"
 #include "tunnel.h"
@@ -4647,6 +4651,275 @@ static void tb_test_noirq_xdomain_filter(struct kunit *test)
 	}
 }
 
+/*
+ * A DROM as the device tree hands it to the host router: @size bytes, of which
+ * the DROM is the first @drom_size. Returns what tb_drom_read() returns.
+ */
+static int tb_test_drom_read(struct kunit *test, struct tb_switch *sw,
+			     const u8 *drom, size_t drom_size, size_t size)
+{
+	struct property_entry props[2] = {};
+	struct tb_nhi *nhi;
+	struct device *dev;
+	struct tb *tb;
+	u8 *buf;
+	int ret;
+
+	buf = kunit_kzalloc(test, size, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, buf);
+	memcpy(buf, drom, drom_size);
+	/* The data length covers everything after the CRC32 */
+	buf[14] = drom_size - 13;
+	buf[15] = (drom_size - 13) >> 8;
+	put_unaligned_le32(~crc32c(~0, buf + 13, drom_size - 13), buf + 9);
+
+	dev = kunit_device_register(test, "tb-test-drom");
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, dev);
+	props[0] = PROPERTY_ENTRY_U8_ARRAY_LEN("apple,thunderbolt-drom", buf, size);
+	KUNIT_ASSERT_EQ(test, device_create_managed_software_node(dev, props, NULL), 0);
+
+	nhi = kunit_kzalloc(test, sizeof(*nhi), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, nhi);
+	tb = kunit_kzalloc(test, sizeof(*tb), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, tb);
+	nhi->dev = dev;
+	tb->nhi = nhi;
+	sw->tb = tb;
+
+	ret = tb_drom_read(sw);
+	kfree(sw->drom);
+	sw->drom = NULL;
+	kunit_device_unregister(test, dev);
+	return ret;
+}
+
+static void tb_test_drom_free_names(void *data)
+{
+	struct tb_switch *sw = data;
+
+	kfree(sw->vendor_name);
+	kfree(sw->device_name);
+}
+
+static struct tb_switch *tb_test_drom_switch(struct kunit *test)
+{
+	struct tb_switch *sw = alloc_host(test);
+
+	KUNIT_ASSERT_NOT_NULL(test, sw);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, tb_test_drom_free_names, sw), 0);
+	return sw;
+}
+
+/* USB4 DROM header: revision 3, the entries follow at byte 16 */
+#define TB_TEST_DROM_V3		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0
+/* Generic entry @index of @len bytes, header included */
+#define TB_TEST_DROM_GENERIC(len, index)	(len), (index)
+/* The vendor name "Aurora" */
+#define TB_TEST_DROM_VENDOR	TB_TEST_DROM_GENERIC(9, 1), 'A', 'u', 'r', 'o', 'r', 'a', 0
+
+/* An entry is at least its two-byte header, and fits in the DROM. */
+static void tb_test_drom_entry_lengths(struct kunit *test)
+{
+	static const u8 valid[] = { TB_TEST_DROM_V3, TB_TEST_DROM_VENDOR };
+	/* A name entry of one byte, the last two bytes of the DROM */
+	static const u8 one[] = { TB_TEST_DROM_V3, TB_TEST_DROM_VENDOR,
+				  TB_TEST_DROM_GENERIC(1, 2) };
+	static const u8 zero[] = { TB_TEST_DROM_V3, TB_TEST_DROM_GENERIC(0, 2),
+				   TB_TEST_DROM_VENDOR };
+	/* Only one byte left for the next entry's header */
+	static const u8 tail[] = { TB_TEST_DROM_V3, TB_TEST_DROM_VENDOR, 5 };
+	static const u8 header_only[] = { TB_TEST_DROM_V3, TB_TEST_DROM_GENERIC(2, 2),
+					  TB_TEST_DROM_VENDOR };
+	static const u8 overrun[] = { TB_TEST_DROM_V3, TB_TEST_DROM_VENDOR,
+				      TB_TEST_DROM_GENERIC(4, 2), 'x' };
+	struct tb_switch *sw;
+
+	sw = tb_test_drom_switch(test);
+	KUNIT_EXPECT_EQ(test, tb_test_drom_read(test, sw, valid, sizeof(valid), sizeof(valid)), 0);
+	KUNIT_EXPECT_STREQ(test, sw->vendor_name, "Aurora");
+	KUNIT_EXPECT_NULL(test, sw->device_name);
+
+	sw = tb_test_drom_switch(test);
+	KUNIT_EXPECT_EQ(test, tb_test_drom_read(test, sw, one, sizeof(one), sizeof(one)), -EIO);
+	KUNIT_EXPECT_NULL(test, sw->device_name);
+
+	sw = tb_test_drom_switch(test);
+	KUNIT_EXPECT_EQ(test, tb_test_drom_read(test, sw, zero, sizeof(zero), sizeof(zero)), -EIO);
+	KUNIT_EXPECT_NULL(test, sw->vendor_name);
+
+	sw = tb_test_drom_switch(test);
+	KUNIT_EXPECT_EQ(test, tb_test_drom_read(test, sw, tail, sizeof(tail), sizeof(tail)), -EIO);
+
+	sw = tb_test_drom_switch(test);
+	KUNIT_EXPECT_EQ(test, tb_test_drom_read(test, sw, header_only, sizeof(header_only),
+						sizeof(header_only)), 0);
+	KUNIT_EXPECT_STREQ(test, sw->device_name, "");
+	KUNIT_EXPECT_STREQ(test, sw->vendor_name, "Aurora");
+
+	sw = tb_test_drom_switch(test);
+	KUNIT_EXPECT_EQ(test, tb_test_drom_read(test, sw, overrun, sizeof(overrun),
+						sizeof(overrun)), -EIO);
+}
+
+/* The product descriptor is used only if it holds both IDs. */
+static void tb_test_drom_product_descriptor(struct kunit *test)
+{
+	static const u8 full[] = {
+		TB_TEST_DROM_V3, TB_TEST_DROM_VENDOR,
+		TB_TEST_DROM_GENERIC(15, 9), 0x00, 0x04, 0xac, 0x05, 0x34, 0x12,
+		0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+	};
+	/* Ends inside the product ID, at the end of the DROM */
+	static const u8 short_desc[] = {
+		TB_TEST_DROM_V3, TB_TEST_DROM_VENDOR,
+		TB_TEST_DROM_GENERIC(7, 9), 0x00, 0x04, 0xac, 0x05, 0x34,
+	};
+	struct tb_switch *sw;
+
+	sw = tb_test_drom_switch(test);
+	KUNIT_EXPECT_EQ(test, tb_test_drom_read(test, sw, full, sizeof(full), sizeof(full)), 0);
+	KUNIT_EXPECT_EQ(test, sw->vendor, 0x05ac);
+	KUNIT_EXPECT_EQ(test, sw->device, 0x1234);
+
+	sw = tb_test_drom_switch(test);
+	KUNIT_EXPECT_EQ(test, tb_test_drom_read(test, sw, short_desc, sizeof(short_desc),
+						sizeof(short_desc)), 0);
+	KUNIT_EXPECT_EQ(test, sw->vendor, 0);
+	KUNIT_EXPECT_EQ(test, sw->device, 0);
+	KUNIT_EXPECT_STREQ(test, sw->vendor_name, "Aurora");
+}
+
+static u8 tb_test_crc8(const u8 *data, int len)
+{
+	u8 val = 0xff;
+	int i, j;
+
+	for (i = 0; i < len; i++) {
+		val ^= data[i];
+		for (j = 0; j < 8; j++)
+			val = (val << 1) ^ ((val & 0x80) ? 7 : 0);
+	}
+	return val;
+}
+
+/* The header is read only from a DROM that holds it. */
+static void tb_test_drom_header_size(struct kunit *test)
+{
+	/* A revision 1 DROM as long as a USB4 header: 6 bytes short of its own */
+	u8 v1[16] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 1 };
+	/* No room for the revision and data length */
+	static const u8 tiny[13] = {};
+	struct tb_switch *sw;
+
+	v1[0] = tb_test_crc8(v1 + 1, 8);
+
+	/* The device tree property is always at least the full header */
+	sw = tb_test_drom_switch(test);
+	KUNIT_EXPECT_EQ(test, tb_test_drom_read(test, sw, v1, sizeof(v1), 22), -EIO);
+	KUNIT_EXPECT_EQ(test, sw->vendor, 0);
+
+	sw = tb_test_drom_switch(test);
+	KUNIT_EXPECT_EQ(test, tb_test_drom_read(test, sw, tiny, sizeof(tiny), 22), -EIO);
+}
+
+/*
+ * A DP bandwidth notification names an adapter of its router: one the router
+ * does not have, or that is no DP IN adapter, is refused without using it.
+ */
+static void tb_test_dp_bandwidth_request_port(struct kunit *test)
+{
+	struct tb_test_cm *cm = tb_test_cm_alloc(test);
+	struct tb_switch *host = cm->host;
+	static const u8 ports[] = { 14, 63, 0, 1, 7, 5 };
+	unsigned int refs;
+	int i;
+
+	cm->tb->root_switch = host;
+	refs = kref_read(&host->dev.kobj.kref);
+	for (i = 0; i < ARRAY_SIZE(ports); i++) {
+		tb_test_cm_dp_bandwidth_request(cm->tb, 0, ports[i]);
+		KUNIT_EXPECT_EQ_MSG(test, kref_read(&host->dev.kobj.kref), refs,
+				    "request for adapter %u", ports[i]);
+	}
+	/* Nothing was tunneled or changed for any of them */
+	KUNIT_EXPECT_TRUE(test, list_empty(tb_test_cm_tunnels(cm->tb)));
+	cm->tb->root_switch = NULL;
+}
+
+/* A remote host answering XDomain properties requests from a fixed block. */
+struct tb_test_xdp_props {
+	unsigned int requests;
+	u16 data_length;
+	unsigned int words;
+};
+
+static struct tb_cfg_result tb_test_xdp_props_sync(struct tb_ctl *ctl,
+						   struct tb_cfg_request *req,
+						   int timeout_msec)
+{
+	struct tb_test_xdp_props *peer = kunit_get_current_test()->priv;
+	const struct tb_xdp_properties *request = req->request;
+	struct tb_xdp_properties_response *res = req->response;
+	struct tb_cfg_result result = {};
+	unsigned int i;
+
+	/* Give up after a few, as a remote host that stops answering */
+	if (++peer->requests > 4) {
+		result.err = -ETIMEDOUT;
+		return result;
+	}
+
+	memset(res, 0, req->response_size);
+	res->hdr.xd_hdr.length_sn = (sizeof(*res) - sizeof(res->hdr.xd_hdr)) / 4 + peer->words;
+	res->hdr.type = PROPERTIES_RESPONSE;
+	res->offset = request->offset;
+	res->data_length = peer->data_length;
+	res->generation = 7;
+	for (i = 0; i < peer->words; i++)
+		res->data[i] = request->offset + i + 1;
+	return result;
+}
+
+static int tb_test_xdp_props_request(struct kunit *test, u32 **block, u32 *generation)
+{
+	kunit_activate_static_stub(test, tb_cfg_request_sync, tb_test_xdp_props_sync);
+	return tb_xdp_properties_request(NULL, 0x1, &tb_test_xdp_uuid, &tb_test_service_uuid,
+					 0, block, generation);
+}
+
+/* Each response moves the request on, and an empty block ends it. */
+static void tb_test_xdp_properties_progress(struct kunit *test)
+{
+	struct tb_test_xdp_props *peer;
+	u32 *block = NULL;
+	u32 generation = 0;
+	int ret, i;
+
+	peer = kunit_kzalloc(test, sizeof(*peer), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, peer);
+	test->priv = peer;
+
+	/* An empty block: refused at the first response, not asked for again */
+	peer->words = 3;
+	ret = tb_test_xdp_props_request(test, &block, &generation);
+	KUNIT_EXPECT_EQ(test, ret, -EINVAL);
+	KUNIT_EXPECT_EQ(test, peer->requests, 1U);
+	if (ret >= 0)
+		kfree(block);
+
+	/* Five dwords in two responses, the second one clamped to the block */
+	peer->requests = 0;
+	peer->data_length = 5;
+	block = NULL;
+	ret = tb_test_xdp_props_request(test, &block, &generation);
+	KUNIT_ASSERT_EQ(test, ret, 5);
+	KUNIT_EXPECT_EQ(test, peer->requests, 2U);
+	KUNIT_EXPECT_EQ(test, generation, 7U);
+	for (i = 0; i < 5; i++)
+		KUNIT_EXPECT_EQ(test, block[i], (u32)i + 1);
+	kfree(block);
+}
+
 static struct kunit_case tb_test_cases[] = {
 	KUNIT_CASE(tb_test_apple_right_dpin_wiring),
 	KUNIT_CASE(tb_test_dp_reduce_bandwidth_shared),
@@ -4721,6 +4994,11 @@ static struct kunit_case tb_test_cases[] = {
 	KUNIT_CASE(tb_test_property_parse_zero_length),
 	KUNIT_CASE(tb_test_property_parse_rootdir_overflow),
 	KUNIT_CASE(tb_test_property_merge),
+	KUNIT_CASE(tb_test_drom_entry_lengths),
+	KUNIT_CASE(tb_test_drom_product_descriptor),
+	KUNIT_CASE(tb_test_drom_header_size),
+	KUNIT_CASE(tb_test_dp_bandwidth_request_port),
+	KUNIT_CASE(tb_test_xdp_properties_progress),
 	{ }
 };
 

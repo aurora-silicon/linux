@@ -4587,4 +4587,23 @@ void tb_test_cm_stop(struct tb *tb)
 	if (cancel_work_sync(&tcm->dp_relink_run))
 		tb_domain_put(tb);
 }
+
+/* Handle a DP bandwidth notification from @port of the router at @route, with no retry. */
+void tb_test_cm_dp_bandwidth_request(struct tb *tb, u64 route, u8 port)
+{
+	struct tb_cm *tcm = tb_priv(tb);
+	struct tb_hotplug_event *ev;
+
+	ev = kmalloc_obj(*ev);
+	if (!ev)
+		return;
+
+	tcm->hotplug_active = true;
+	ev->tb = tb;
+	ev->route = route;
+	ev->port = port;
+	ev->retry = TB_BW_ALLOC_RETRIES;
+	INIT_DELAYED_WORK(&ev->work, tb_handle_dp_bandwidth_request);
+	tb_handle_dp_bandwidth_request(&ev->work.work);
+}
 #endif

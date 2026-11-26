@@ -329,7 +329,7 @@ static int tb_xdp_error_response(struct tb_ctl *ctl, u64 route, u8 sequence,
 				     TB_CFG_PKG_XDOMAIN_RESP);
 }
 
-static int tb_xdp_properties_request(struct tb_ctl *ctl, u64 route,
+VISIBLE_IF_KUNIT int tb_xdp_properties_request(struct tb_ctl *ctl, u64 route,
 	const uuid_t *src_uuid, const uuid_t *dst_uuid, int retry,
 	u32 **block, u32 *generation)
 {
