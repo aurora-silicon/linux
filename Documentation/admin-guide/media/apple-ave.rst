@@ -84,7 +84,10 @@ DART, which the device tree names as that DART's ``dapf`` window and which only
 the bootloader programs, from the ADT. Before every start the driver reads the
 filter and refuses to start the coprocessor, with the filter's entries in the
 log, unless it admits TEXT and the DATA alias. The ``dart_audit`` debugfs file
-shows the filter and that verdict without starting anything.
+shows the filter and that verdict without starting anything. A deep sleep clears
+the filter's enable bits and keeps its ranges; the DART driver keeps the
+entries the bootloader programmed and writes them back on resume, so encoding
+continues after a wake.
 
 T8122 (M3) with the macOS 27.2 firmware (TEXT 0x134000, DATA 0x128000, TEXT
 CRC ``918d70d3``) encodes H.264 and HEVC: the firmware boots on the boot

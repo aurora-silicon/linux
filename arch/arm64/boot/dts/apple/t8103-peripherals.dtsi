@@ -635,9 +635,15 @@
 		status = "okay";
 	};
 
+	/*
+	 * The coprocessor's CPU DART. Its address filter is the page at
+	 * 0x267044000 (ADT dart-ave reg[3]), which the bootloader programs.
+	 */
 	ave_dart0: iommu@267040000 {
 		compatible = "apple,t8103-dart";
-		reg = <0x2 0x67040000 0x0 0x4000>;
+		reg = <0x2 0x67040000 0x0 0x4000>,
+		      <0x2 0x67044000 0x0 0x4000>;
+		reg-names = "dart", "dapf";
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 557 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_venc_sys>;
