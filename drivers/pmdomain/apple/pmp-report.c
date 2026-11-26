@@ -35,7 +35,6 @@
 #include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/pmp-report.h>
-#include <linux/soc/apple/t8132.h>
 #include <linux/string.h>
 #include <linux/suspend.h>
 #include <linux/unaligned.h>
@@ -61,9 +60,10 @@
  * @tgt_write: power state request, write side
  * @actual: power state acknowledgment
  * @status: PMP status; bit 0 is set while the PMP is running
- * @fast_die: 32-bit word holding the fast die-temperature effort of each
+ * @fast_die: word holding the fast die-temperature effort of each
  *	CPU cluster, one byte per lane; 0 if the SoC has none
  * @fast_die_lanes: number of lanes at @fast_die, at most 4
+ * @fast_die_wide: read @fast_die with a 64-bit access instead of 32-bit
  * @running_any: the PMP runs while any bit of the 64-bit status word is set,
  *	not only bit 0
  * @defer_requests: keep power state requests in memory until the PMP runs,
@@ -89,6 +89,7 @@ struct apple_pmp_report_offsets {
 	/* Update aperture of every entry (8 bytes each) and SOC-DEV-DVFS range. */
 	u32 update;
 	u32 dvfs_first, dvfs_count;
+	bool fast_die_wide;
 	bool running_any;
 	bool defer_requests;
 	bool starts_pmp;
@@ -339,6 +340,13 @@ EXPORT_SYMBOL_GPL(apple_pmp_report_ane_perf);
 
 static struct dentry *apple_pmp_report_debugfs;
 
+static u32 apple_pmp_report_fast_die_word(const struct apple_pmp_report *rep)
+{
+	void __iomem *reg = rep->base + rep->offsets->fast_die;
+
+	return rep->offsets->fast_die_wide ? lower_32_bits(readq(reg)) : readl(reg);
+}
+
 /**
  * apple_pmp_report_fast_die_effort() - read the fast die-temperature effort
  *	of a CPU cluster
@@ -377,7 +385,7 @@ int apple_pmp_report_fast_die_effort(const struct device_node *np,
 		} else if (!apple_pmp_report_running(rep)) {
 			ret = -EAGAIN;
 		} else {
-			*effort = readl(rep->base + offs->fast_die) >>
+			*effort = apple_pmp_report_fast_die_word(rep) >>
 				  (lane * BITS_PER_BYTE);
 			ret = 0;
 		}
@@ -406,7 +414,7 @@ static int apple_pmp_report_status_show(struct seq_file *s, void *unused)
 	if (!running || !offs->fast_die)
 		return 0;
 
-	effort = readl(rep->base + offs->fast_die);
+	effort = apple_pmp_report_fast_die_word(rep);
 	for (lane = 0; lane < offs->fast_die_lanes; lane++)
 		seq_printf(s, "lane%u: %u\n", lane,
 			   (effort >> (lane * BITS_PER_BYTE)) & 0xff);
@@ -693,6 +701,43 @@ static int apple_pmp_report_wait_t6030_14(struct device *supplier, unsigned int 
 	return ret;
 }
 
+/*
+ * A T8122 PMP (apple,t8122-pmp-v2, chosen by the dispatch below) behind the GPU
+ * on its 14.8.3 firmware, for the M3 runtime (APPLE_T8122_GPU_PMP_LINK): the
+ * unique T8122 report linked to this PMP, and
+ * its display request (DISP, reg 7) READY and acknowledged before AGX, as on
+ * the 7.1.12 kernel that runtime was qualified with.
+ */
+static int apple_pmp_report_wait_t8122_14(struct device *supplier, unsigned int timeout_ms)
+{
+	struct device_node *np, *report = NULL, *pmp, *entry;
+	int ret;
+
+	if (!IS_ENABLED(CONFIG_APPLE_T8122_GPU_PMP_LINK))
+		return -ENODEV;
+	for_each_compatible_node(np, NULL, "apple,t8122-pmp-v2-report") {
+		if (report) {
+			of_node_put(np);
+			of_node_put(report);
+			return -ENODEV;
+		}
+		report = of_node_get(np);
+	}
+	if (!report || !of_device_is_available(report) ||
+	    of_property_count_u32_elems(report, "apple,pmp") != 1) {
+		of_node_put(report);
+		return -ENODEV;
+	}
+	pmp = of_parse_phandle(report, "apple,pmp", 0);
+	entry = apple_pmp_report_t6030_entry(report);
+	ret = pmp == supplier->of_node && entry ?
+		apple_pmp_report_wait_ready(entry, msecs_to_jiffies(timeout_ms)) : -ENODEV;
+	of_node_put(entry);
+	of_node_put(pmp);
+	of_node_put(report);
+	return ret;
+}
+
 /* The native 25G83 PMP starts through its supplier topology, after requests
  * are seeded. Its report is pinned against removal while readiness is read.
  */
@@ -702,13 +747,15 @@ int apple_pmp_report_wait_supplier_ready(struct device *supplier, unsigned int t
 	struct platform_device *pdev;
 	struct apple_pmp_report *rep;
 	u64 status;
-	bool t8132 = apple_t8132_firmware_path() &&
-		of_device_is_compatible(supplier->of_node, "apple,t8132-pmp-v2");
+	bool t8132 = of_device_is_compatible(supplier->of_node, "apple,t8132-pmp-v2");
 	int ret;
 
 	/* A declared report always takes the existing native25 path below. */
-	if (!np && !of_property_present(supplier->of_node, "apple,pmp-report"))
+	if (!np && !of_property_present(supplier->of_node, "apple,pmp-report")) {
+		if (of_device_is_compatible(supplier->of_node, "apple,t8122-pmp-v2"))
+			return apple_pmp_report_wait_t8122_14(supplier, timeout_ms);
 		return apple_pmp_report_wait_t6030_14(supplier, timeout_ms);
+	}
 	if (!np || !of_device_is_compatible(np, t8132 ?
 		"apple,t8132-pmp-v2-report" : "apple,j613-25g83-pmp-report")) {
 		of_node_put(np);
@@ -2638,6 +2685,27 @@ static const struct apple_pmp_report_offsets apple_pmp_offsets_t8132 = {
 	/* No qualified fast-die effort on this generation. */
 };
 
+/*
+ * T8142 (M5): PTD entries 1 (PMP-STATUS), 15 (FAST-DIE-CE: E, P),
+ * 39 (SOC-DEV-PS-REQ), 47 (SOC-DEV-PS-ACK) and 55..70 (SOC-DEV-DVFS).
+ * Reads are 16 bytes per entry from the base, writes 8 bytes per entry
+ * from base + 0x10000.
+ */
+static const struct apple_pmp_report_offsets apple_pmp_offsets_t8142 = {
+	.tgt_read = 0x270,
+	.tgt_write = 0x10138,
+	.update = 0x10000,
+	.dvfs_first = 0x37,
+	.dvfs_count = 16,
+	.actual = 0x2f0,
+	.status = 0x10,
+	.fast_die = 0xf0,
+	.fast_die_lanes = 2,
+	.fast_die_wide = true,
+	.running_any = true,
+	.defer_requests = true,
+};
+
 static const struct of_device_id apple_pmp_report_of_match[] = {
 	{ .compatible = "apple,j613-25g83-pmp-report", .data = &apple_pmp_offsets_j613_25g83 },
 	{ .compatible = "apple,t6000-pmp-v2-report", .data = &apple_pmp_offsets_t600x },
@@ -2651,6 +2719,7 @@ static const struct of_device_id apple_pmp_report_of_match[] = {
 	{ .compatible = "apple,t8122-pmp-v2-report", .data = &apple_pmp_offsets_t8122 },
 	{ .compatible = "apple,t8132-pmp-v2-report", .data = &apple_pmp_offsets_t8132 },
 	{ .compatible = "apple,t8140-pmp-v2-report", .data = &apple_pmp_offsets_t8140 },
+	{ .compatible = "apple,t8142-pmp-v2-report", .data = &apple_pmp_offsets_t8142 },
 	{}
 };
 

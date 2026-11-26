@@ -26,6 +26,8 @@ struct apple_sart;
  * apple_sart_add_allowed_region and apple_sart_remove_allowed_region.
  */
 struct apple_sart *devm_apple_sart_get(struct device *dev);
+void apple_sart_save_now(struct apple_sart *sart);
+void apple_sart_restore_early(struct apple_sart *sart);
 
 /*
  * Adds the region [paddr, paddr+size] to the DMA allow list.

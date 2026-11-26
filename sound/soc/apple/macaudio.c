@@ -185,11 +185,19 @@ struct macaudio_platform_cfg {
 	bool spk_secondary_only;
 	/*
 	 * No voltage or current sense reaches the AP, so no protection daemon
-	 * can govern the speakers: their SN012776 volumes stay under safe_vol,
-	 * locked, unlocked or granted alike, and there is no sense PCM. A
-	 * granted lease runs them at safe_vol, its operating gain.
+	 * can govern the speakers, and there is no sense PCM. "Speaker Volume
+	 * Unlock" does not apply: the SN012776 volumes stay at the floor until
+	 * the interface is on the "Speaker Protection" lease, and playback
+	 * starts only after a grant, which runs them at safe_vol, its
+	 * operating gain and their ceiling.
 	 */
 	bool spk_fixed_ceiling;
+	/*
+	 * With spk_fixed_ceiling: the amp level safe_vol was computed for. At
+	 * any other level the same volume drives the speaker differently, so
+	 * the speakers stay off.
+	 */
+	int spk_ceiling_level;
 };
 
 static const char *volume_control_names[] = {
@@ -408,6 +416,26 @@ static bool macaudio_spk_leased(const struct macaudio_snd_data *ma)
 	return READ_ONCE(ma->spk_iface) == MACAUDIO_SPK_IFACE_LEASE;
 }
 
+/* Only a "Speaker Protection" lease may lift these speakers (spk_fixed_ceiling) */
+static bool macaudio_spk_lease_only(const struct macaudio_platform_cfg *cfg)
+{
+	return cfg->spk_fixed_ceiling;
+}
+
+/*
+ * The SN012776 volumes' limit: the floor while locked; unlocked, 0 dB, or
+ * on a lease-only machine safe_vol, and there only under the lease.
+ */
+static int macaudio_sn012776_vlimit(const struct macaudio_platform_cfg *cfg,
+				    bool unlock, bool leased)
+{
+	if (macaudio_spk_lease_only(cfg))
+		return unlock && leased ? SN012776_DB(cfg->safe_vol) : 1;
+	if (unlock)
+		return SN012776_0DB;
+	return 1; //SN012776_DB(cfg->safe_vol);
+}
+
 
 SND_SOC_DAILINK_DEFS(primary,
 	DAILINK_COMP_ARRAY(COMP_CPU("mca-pcm-0")), // CPU
@@ -534,12 +562,7 @@ static void macaudio_vlimit_unlock(struct macaudio_snd_data *ma, bool unlock)
 			max = 1; //TAS5770_DB(ma->cfg->safe_vol);
 		break;
 	case AMP_SN012776:
-		if (ma->cfg->spk_fixed_ceiling)
-			max = SN012776_DB(ma->cfg->safe_vol);
-		else if (unlock)
-			max = SN012776_0DB;
-		else
-			max = 1; //SN012776_DB(ma->cfg->safe_vol);
+		max = macaudio_sn012776_vlimit(ma->cfg, unlock, macaudio_spk_leased(ma));
 		break;
 	case AMP_SSM3515:
 		if (unlock)
@@ -766,6 +789,10 @@ static void macaudio_vlimit_update(struct macaudio_snd_data *ma)
 	 * ceiling until the interface switches back (macaudio_spk_leave_lease()).
 	 */
 	if (macaudio_spk_leased(ma))
+		return;
+
+	/* No protection daemon can hold these speakers: nothing to unlock */
+	if (macaudio_spk_lease_only(ma->cfg))
 		return;
 
 	/* Check that someone is holding the main lock */
@@ -2406,10 +2433,21 @@ static int macaudio_sn012776_level(struct device_node *amp)
 }
 
 /*
+ * A fixed ceiling holds only at the amp level it was computed for.
+ */
+static bool macaudio_sn012776_level_allowed(const struct macaudio_platform_cfg *cfg,
+					    int level)
+{
+	return level >= 0 && (!cfg->spk_fixed_ceiling || level == cfg->spk_ceiling_level);
+}
+
+/*
  * Speakers on SN012776 amps run only when every amp has its level from the
- * Mac; a boot loader that does not pass it leaves them off.
+ * Mac, and under a fixed ceiling only at the level that ceiling was computed
+ * for; otherwise they stay off.
  */
 static bool macaudio_sn012776_levels_present(struct device *dev,
+					     const struct macaudio_platform_cfg *cfg,
 					     struct device_node *codec)
 {
 	struct of_phandle_args args;
@@ -2424,8 +2462,13 @@ static bool macaudio_sn012776_levels_present(struct device *dev,
 		if (level < 0)
 			dev_err(dev, "%pOF: %s amp level from the boot loader\n", args.np,
 				level == -ENOENT ? "no" : "out-of-range");
+		else if (!macaudio_sn012776_level_allowed(cfg, level))
+			dev_err(dev, "%pOF: amp level %d, the fixed ceiling holds only at %d\n",
+				args.np, level, cfg->spk_ceiling_level);
+		else if (cfg->spk_fixed_ceiling)
+			dev_info(dev, "%pOF: amp level %d from the boot loader\n", args.np, level);
 		of_node_put(args.np);
-		if (level < 0)
+		if (!macaudio_sn012776_level_allowed(cfg, level))
 			return false;
 	}
 	return n > 0;
@@ -2665,11 +2708,12 @@ static int macaudio_parse_of(struct macaudio_snd_data *ma)
 			if (ma->cfg->amp == AMP_SN012776) {
 				struct device_node *spk_codec = of_get_child_by_name(np, "codec");
 				bool levels = spk_codec &&
-					macaudio_sn012776_levels_present(card->dev, spk_codec);
+					macaudio_sn012776_levels_present(card->dev, ma->cfg,
+									 spk_codec);
 
 				of_node_put(spk_codec);
 				if (!levels) {
-					dev_err(card->dev, "the boot loader passed no amp levels, disabling speakers\n");
+					dev_err(card->dev, "no usable amp levels from the boot loader, disabling speakers\n");
 					continue;
 				}
 			}
@@ -4623,6 +4667,7 @@ MODULE_LICENSE("GPL");
 #include "macaudio-protection-test.h"
 #include "macaudio-hpf-test.h"
 #include "macaudio-pm-volumes-test.h"
+#include "macaudio-vlimit-test.h"
 #include "macaudio-iface-test.h"
 #if IS_ENABLED(CONFIG_OF_OVERLAY)
 #include "macaudio-amp-level-test.h"
