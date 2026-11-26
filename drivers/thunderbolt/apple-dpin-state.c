@@ -154,6 +154,22 @@ bool apple_dpin_awaits_display(const struct apple_dpin_state *s,
 	return s->alive && (s->waiting || (p->defer_new_bringup && s->deferred_first));
 }
 
+/*
+ * The request @generation waits for a display pipeline (as
+ * apple_dpin_awaits_display()) and no attempt to hand it to a display is
+ * admitted: none is in flight, none was handed. Admission takes the same
+ * lock, so a request retired while this holds never starts another attempt.
+ * A request that is not the current one has nothing left to hand.
+ */
+bool apple_dpin_retirable(const struct apple_dpin_state *s,
+			  const struct apple_dpin_tokens *t,
+			  const struct apple_dpin_policy *p, u64 generation)
+{
+	if (!generation || t->requested != generation)
+		return true;
+	return apple_dpin_awaits_display(s, p) && t->admitted != generation;
+}
+
 enum apple_dpin_event apple_dpin_request_event(const struct apple_dpin_state *s,
 					       const struct apple_dpin_tokens *t,
 					       u64 generation, bool active)
