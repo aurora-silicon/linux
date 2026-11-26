@@ -248,16 +248,6 @@ static const u32 t6030_macos_down[] = {
 	0x190, 0x218, 0x178,			/* AFT0, I2C5, PMGR_SOC_OCLA */
 };
 
-/*
- * The other way: off under Linux, on at macOS's commit (PLAN §4, linux-diff.tsv), the shared
- * core's ps_macos_on pattern: GPIO, I2C0/4/7/8, SPI0 and UART0-6. Raised by .commit_regs,
- * AUTO_ENABLE clear, each left as it was before the entry at the wake.
- */
-static const u32 t6030_macos_up[] = {
-	0x120, 0x1f0, 0x210, 0x228, 0x230, 0x260,
-	0x2a0, 0x2a8, 0x2b0, 0x2b8, 0x2c0, 0x2c8, 0x2d0,
-};
-
 /* And in "ps-aon": NUB_SPI0 and NUB_OCLA (0x200 at macOS's commit) */
 static const u32 t6030_macos_down_aon[] = { 0x88, 0x90 };
 
@@ -278,7 +268,6 @@ struct t6030_sleep {
 	u32 auto_saved[ARRAY_SIZE(t6030_auto_off)];
 	bool auto_staged;
 	u32 down_saved[ARRAY_SIZE(t6030_macos_down)];
-	u32 up_saved[ARRAY_SIZE(t6030_macos_up)];
 	u32 down_aon_saved[ARRAY_SIZE(t6030_macos_down_aon)];
 	bool down_staged;
 	u8 down_stuck;
@@ -985,6 +974,8 @@ static void t6030_mtp_dart_quiet(struct apple_sleep *s)
 #define T6030_PS_I2C6			0x220
 #define T6030_SPMI_A0_ENTRY_ACK3	BIT(1)
 
+static void t6030_sleep_down(struct apple_sleep *s);
+
 static void t6030_sleep_late_entry(struct apple_sleep *s)
 {
 	struct t6030_sleep *t = t6030_state(s);
@@ -994,6 +985,7 @@ static void t6030_sleep_late_entry(struct apple_sleep *s)
 	t->gate_dispext1_staged = true;
 	writel(T6030_PWRGATE_DISPEXT1_OFF, s->pwrgate + T6030_PWRGATE_DISPEXT1);
 	sleep_ps_lower(s, T6030_PS_SPI2);
+	t6030_sleep_down(s);
 }
 
 /*
@@ -1613,11 +1605,50 @@ static void t6030_gp_clk_off(struct apple_sleep *s)
 }
 
 /*
- * The words macOS leaves to their auto state (t6030_macos_down[], _up[], _aon[]) aren't written
- * at the entry any more: the stop-mode diff of ce1ff743 against macOS (PLAN 29.13) found those 37
- * writes only on Linux. down_staged stays false, so the wake's two helpers below do nothing.
+ * Lower the 23 "ps" and 2 "ps-aon" domains that macOS already has off long before its -30 ms
+ * sleep window (ATC0-3_COMMON, LW31/LW30/LS3/IOA3, MSG, DPA1-4, FPWM1/2, PMS_FPWM0-4, AFT0,
+ * I2C5, PMGR_SOC_OCLA, NUB_SPI0, NUB_OCLA). Run in t6030_sleep_late_entry() seconds before the
+ * -30 ms window so commit sees the same off state as macOS (25 words on instead of 48) without
+ * adding writes inside the late window, and restore every word on wake.
  */
+static bool t6030_lower_macos_off = true;
+module_param_named(lower_macos_off, t6030_lower_macos_off, bool, 0644);
+MODULE_PARM_DESC(lower_macos_off, "T6030: lower macOS-off power domains (ATC0-3_COMMON, fabric, DPA1-4) before the -30 ms window (default: on)");
+
 static void t6030_sleep_unstage(struct apple_sleep *s, u32 offset, u32 before);
+
+static void t6030_sleep_down(struct apple_sleep *s)
+{
+	struct t6030_sleep *t = t6030_state(s);
+	unsigned int i;
+	u32 v, now;
+
+	if (!READ_ONCE(t6030_lower_macos_off))
+		return;
+	t->down_stuck = 0;
+	for (i = 0; i < ARRAY_SIZE(t6030_macos_down); i++) {
+		t->down_saved[i] = readl(s->ps + t6030_macos_down[i]);
+		if (!FIELD_GET(PS_ACTUAL, t->down_saved[i]))
+			continue;
+		sleep_ps_lower(s, t6030_macos_down[i]);
+		if (sleep_ps_wait_off(s, t6030_macos_down[i]))
+			t->down_stuck++;
+	}
+	for (i = 0; i < ARRAY_SIZE(t6030_macos_down_aon); i++) {
+		void __iomem *reg = s->ps_aon + t6030_macos_down_aon[i];
+
+		v = readl(reg);
+		t->down_aon_saved[i] = v;
+		if (!FIELD_GET(PS_ACTUAL, v))
+			continue;
+		writel(v & ~(PS_AUTO_ENABLE | PS_FLAGS), reg);
+		writel((v & ~(PS_AUTO_ENABLE | PS_FLAGS | PS_TARGET)) | PS_FLAGS, reg);
+		if (readl_poll_timeout_atomic(reg, now, !FIELD_GET(PS_ACTUAL, now), 1,
+					      PS_OFF_TIMEOUT_US))
+			t->down_stuck++;
+	}
+	t->down_staged = true;
+}
 
 /* At the wake: the "ps" words back through the rewake (as before the entry), the aon ones here */
 static void t6030_sleep_down_unstage(struct apple_sleep *s)
@@ -1629,8 +1660,6 @@ static void t6030_sleep_down_unstage(struct apple_sleep *s)
 		return;
 	for (i = 0; i < ARRAY_SIZE(t6030_macos_down); i++)
 		t6030_sleep_unstage(s, t6030_macos_down[i], t->down_saved[i]);
-	for (i = 0; i < ARRAY_SIZE(t6030_macos_up); i++)
-		t6030_sleep_unstage(s, t6030_macos_up[i], t->up_saved[i]);
 }
 
 static void t6030_sleep_down_aon_back(struct apple_sleep *s)
