@@ -175,20 +175,19 @@ fn scs_compute_conflict(f: &Flight, vm: &Arc<super::vm::VmState>, scs: bool) -> 
     f.computes != 0 && (f.rt_compute != scs || (scs && !Arc::ptr_eq(&f.job.vm, vm)))
 }
 
-/// Whether a render of `vm`, multisampled when `msaa`, must wait for render flight `f` to
-/// retire before it is published.
+/// Whether a render of `vm` must wait for flight `f` to retire before it is published.
 ///
 /// Every VM's render passes share the one firmware TA/FS queue pair. While passes of two VMs
-/// are both published there and one of the VMs renders multisampled
-/// (`VmStateInner::renders_msaa`), that VM's passes can lose coverage (uncovered or zero
-/// pixels and samples, also in single-sampled passes that read its multisampled images) and
-/// its fragment shaders can read VA 0. Ordering the two passes' TA and FS with ring barriers
-/// does not prevent it; publishing one only after the other retired does. Passes of one VM,
-/// and passes of VMs that never render multisampled, still share the queues.
-fn msaa_render_conflict(f: &Flight, vm: &Arc<super::vm::VmState>, msaa: bool) -> bool {
-    f.renders != 0
-        && !Arc::ptr_eq(&f.job.vm, vm)
-        && (msaa || vm.renders_msaa() || f.job.vm.renders_msaa())
+/// are both published there, the GPU faults in the VM whose pass runs (linux#3201): its VDM
+/// reads the pass slot's kernel prefix and its control stream, and its shader cores read
+/// from a null base, at addresses that are not mapped in its context. Multisampled passes
+/// also lose coverage and their fragment shaders read VA 0. Ordering the two passes' TA and
+/// FS with ring barriers does not prevent it; publishing one only after the other retired
+/// does. A render of another VM also never runs beside compute, so a long compute dispatch
+/// cannot starve its fragment shading into a firmware DM1 timeout. Renders of one VM still
+/// share the queues.
+fn cross_vm_render_conflict(f: &Flight, vm: &Arc<super::vm::VmState>) -> bool {
+    !Arc::ptr_eq(&f.job.vm, vm)
 }
 
 /// Resolved ring-barrier placement for one render pass (legacy, `FRAGMENT_BARRIERS`, or
@@ -204,17 +203,14 @@ struct RenderBarrierPlan {
 }
 
 /// Computes TA/FS hardware ring barriers for a render command from its flags, prior render
-/// FS stamp, resolved render waits (`fs_wait_render`, `ta_wait_fs`), resolved `[ta, fs]`
-/// per-pipe compute wait stamps, and whether the immediately preceding in-flight render belongs
-/// to a different VM (`cross_vm_prev`).
+/// FS stamp, resolved render waits (`fs_wait_render`, `ta_wait_fs`), and resolved `[ta, fs]`
+/// per-pipe compute wait stamps.
 ///
-/// Same-VM pipelined renders share one parameter-buffer / UMA slot, and cross-VM pipelined
-/// renders use distinct UMA slots (`RENDER_UMA_SLOT + slot`) on the shared TA/FS pipes: TA(N)
-/// always waits on TA(N-1) (`ta_prev_wait`, matching G15's `prev_barrier`) whenever
-/// `ta_fs_wait` does not already wait on `prev_fs` (which dominates `prev_ta` via
-/// `own_barrier`). Same-VM independent FS passes omit `fs_dep`, while `cross_vm_prev` forces
-/// `fs_render_wait = Some(prev_fs)` (whenever `ta_fs_wait != Some(prev_fs)`) so cross-VM TA
-/// overlaps the previous VM's FS without ever overlapping two VMs' FS/PB teardowns.
+/// Pipelined renders all belong to one VM ([`cross_vm_render_conflict`]) and reuse that VM's
+/// warm parameter-buffer / UMA slots on the shared TA/FS pipes: TA(N) always waits on TA(N-1)
+/// (`ta_prev_wait`, matching G15's `prev_barrier`) whenever `ta_fs_wait` does not already wait
+/// on `prev_fs` (which dominates `prev_ta` via `own_barrier`). Independent FS passes omit
+/// `fs_dep`.
 #[expect(
     clippy::too_many_arguments,
     reason = "Pure barrier-plan helper mirrors the exact render barrier inputs."
@@ -227,7 +223,6 @@ fn plan_render_barriers(
     fs_wait_render: Option<u32>,
     ta_wait_fs: Option<u32>,
     compute_waits: [[Option<u32>; sizes::COMPUTE_PIPES]; 2],
-    cross_vm_prev: bool,
 ) -> RenderBarrierPlan {
     let staged =
         flags & kernel::uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_STAGE_PREFIXES != 0;
@@ -257,16 +252,8 @@ fn plan_render_barriers(
         None
     };
     let ta_prev_wait = class_behind && ta_fs_wait != Some(prev_fs);
-    let effective_fs_wait = if cross_vm_prev && class_behind {
-        Some(prev_fs)
-    } else {
+    let fs_render_wait = if class_behind && early && fs_wait_render != ta_fs_wait {
         fs_wait_render
-    };
-    let fs_render_wait = if class_behind
-        && (early || (cross_vm_prev && ta_fs_wait != Some(prev_fs)))
-        && effective_fs_wait != ta_fs_wait
-    {
-        effective_fs_wait
     } else {
         None
     };
@@ -363,9 +350,6 @@ pub(crate) struct Flight {
     pub(crate) has_timestamps: bool,
     /// Whether this flight runs ray-tracing or SCS-scratch compute (pinned to compute pipe 0).
     pub(crate) rt_compute: bool,
-    /// Whether this flight includes a multisampled render pass; its VM is marked
-    /// (`VmStateInner::note_msaa_render`) once the flight becomes visible.
-    pub(crate) msaa: bool,
 }
 
 impl Flight {
@@ -409,7 +393,6 @@ impl Flight {
             initbm: false,
             has_timestamps: false,
             rt_compute: false,
-            msaa: false,
         }
     }
 }
@@ -455,9 +438,8 @@ pub(crate) enum HoldCause {
     DrainFailed,
     /// A cold `InitBM` render is in flight.
     DrainInitbm,
-    /// Compute behind render of another VM, render behind compute of another VM, an SCS
-    /// compute conflict, or a render beside another VM's render while one of the two VMs
-    /// renders multisampled.
+    /// Compute behind render of another VM, render behind any flight of another VM, or an SCS
+    /// compute conflict.
     DrainCross,
     /// No warm PB/UMA allocator slot of the VM can take the render behind active flights.
     DrainPb,
@@ -1360,16 +1342,6 @@ impl Firmware {
         Ok(())
     }
 
-    /// Whether render `r` of `vm` may be published beside the flights in flight
-    /// ([`msaa_render_conflict`]). Every member of a prefix is checked, not only its first.
-    fn msaa_member_allowed(&self, vm: &Arc<super::vm::VmState>, r: &RenderCommand) -> bool {
-        !self
-            .engine
-            .flights
-            .iter()
-            .any(|f| msaa_render_conflict(f, vm, r.is_multisampled()))
-    }
-
     /// Whether `job` requires `self.engine.flights` to drain to empty before it can
     /// publish (so `alt`-class bypass must not keep refilling the engine ahead of it).
     fn needs_engine_drain(&self, job: &Arc<Job>) -> bool {
@@ -1379,16 +1351,14 @@ impl Firmware {
         let is_rt_compute = is_compute
             && (job.resources.compute_scs()
                 || matches!(cmd, Some(Command::Compute(c)) if c.is_rt()));
-        let is_msaa_render = matches!(cmd, Some(Command::Render(r)) if r.is_multisampled());
         job.vm.status.get() != 0
             || self.engine.flights.iter().any(|f| {
                 f.doomed
                     || f.recovery_suspect
                     || f.initbm
                     || (is_compute && scs_compute_conflict(f, &job.vm, is_rt_compute))
-                    || (is_render && msaa_render_conflict(f, &job.vm, is_msaa_render))
-                    || (((is_compute && f.renders != 0) || (is_render && f.computes != 0))
-                        && !Arc::ptr_eq(&f.job.vm, &job.vm))
+                    || (is_render && cross_vm_render_conflict(f, &job.vm))
+                    || (is_compute && f.renders != 0 && !Arc::ptr_eq(&f.job.vm, &job.vm))
             })
             || (is_render && !self.render_can_pipeline(job))
     }
@@ -1511,14 +1481,13 @@ impl Firmware {
     ///   is set and a same-queue predecessor in its compute or render barrier prefix has
     ///   CPU-published timestamp outputs that have not retired yet
     ///   (`DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS` clears `query_access`).
-    /// - Render queues behind healthy non-InitBM render flights of any VM or same-VM compute
-    ///   flights (up to [`params::render_flights`] active renders), rotating `PassSlot`
-    ///   (`0..RENDER_SLOTS`) while reusing that VM's warm PB/UMA allocator slot
-    ///   (`Pools::can_pipeline_within`, each owning its own hardware UMA slot
-    ///   `RENDER_UMA_SLOT + slot`). Hardware barriers on the CDM/TA/FS rings preserve exact
-    ///   same-engine, cross-engine, and cross-VM FS ordering while allowing cross-VM TA to
-    ///   overlap the preceding VM's FS.
-    /// - Cross-VM compute/render overlap is disallowed in both directions so a long compute
+    /// - Render queues behind healthy non-InitBM render and compute flights of its own VM (up
+    ///   to [`params::render_flights`] active renders), rotating `PassSlot` (`0..RENDER_SLOTS`)
+    ///   while reusing that VM's warm PB/UMA allocator slot (`Pools::can_pipeline_within`,
+    ///   each owning its own hardware UMA slot `RENDER_UMA_SLOT + slot`). Hardware barriers on
+    ///   the CDM/TA/FS rings preserve exact same-engine and cross-engine ordering. A render
+    ///   never queues behind a flight of another VM ([`cross_vm_render_conflict`]).
+    /// - Compute never queues behind a render of another VM either, so a long compute
     ///   dispatch from one client cannot starve another client's fragment shading into a
     ///   firmware DM1 timeout. Cold InitBM priming renders and every failure or recovery path
     ///   still drain the engine first.
@@ -1605,15 +1574,13 @@ impl Firmware {
                         .compute_slot_mask()
                         .is_ok_and(|mask| self.has_compute_pipe_for_vm(&job.vm, mask, scs))
             }
-            Some(Command::Render(r)) => {
-                let cross_vm_compute = e
+            Some(Command::Render(_)) => {
+                let cross_vm = e
                     .flights
                     .iter()
-                    .any(|f| f.computes != 0 && !Arc::ptr_eq(&f.job.vm, &job.vm));
-                let msaa_conflict = !self.msaa_member_allowed(&job.vm, r);
+                    .any(|f| cross_vm_render_conflict(f, &job.vm));
                 let render_count: usize = e.flights.iter().map(|f| f.renders as usize).sum();
-                !cross_vm_compute
-                    && !msaa_conflict
+                !cross_vm
                     && render_count < params::render_flights()
                     && !self.slots.render_exhausted()
                     && !self.pools.exhausted()
@@ -2999,9 +2966,6 @@ impl Firmware {
                         let Some(Command::Render(r2)) = command(job, end) else {
                             break;
                         };
-                        if !self.msaa_member_allowed(&job.vm, r2) {
-                            break;
-                        }
                         let Some(o2) = job.command_order(end) else {
                             break;
                         };
@@ -3143,10 +3107,6 @@ impl Firmware {
                                     precheck_ok = false;
                                     break;
                                 };
-                                if !self.msaa_member_allowed(&job.vm, r2) {
-                                    precheck_ok = false;
-                                    break;
-                                }
                                 let Some(o2) = j2.command_order(k) else {
                                     precheck_ok = false;
                                     break;
@@ -3279,9 +3239,6 @@ impl Firmware {
         // Even a failed first store may have become visible. From this boundary preserve
         // every owner and return explicit uncertainty rather than guessing from errno.
         *visible = true;
-        if f.msaa {
-            job.vm.note_msaa_render();
-        }
         let publication = (|| -> Result {
             if render {
                 let a = f.pb_slot as usize;
@@ -3731,15 +3688,6 @@ impl Firmware {
         } else {
             None
         };
-        let cross_vm_prev = member == 0
-            && class_behind
-            && self
-                .engine
-                .flights
-                .iter()
-                .rev()
-                .find(|fl| fl.renders != 0)
-                .is_some_and(|fl| !Arc::ptr_eq(&fl.job.vm, &job.vm));
         let plan_flags = if !staged
             && job.fw_waits.iter().any(|w| {
                 w.last_ordinal[super::command::RENDER].is_some_and(|last| {
@@ -3763,7 +3711,6 @@ impl Firmware {
                 ta_wait_compute.map(|w| w.map(|t| t.stamp)),
                 fs_wait_compute.map(|w| w.map(|t| t.stamp)),
             ],
-            cross_vm_prev,
         );
         // Claim performs only a qualified per-use scrub, never allocator/list reset.
         self.slots
@@ -3806,7 +3753,6 @@ impl Firmware {
             (refs, false)
         };
         f.has_timestamps |= !cmd.timestamp_outputs.is_empty();
-        f.msaa |= cmd.is_multisampled();
         let p = resources.render_pass(k)?;
         let pass = p.refs();
         let heap_bytes = if cmd.cmd.layers > 1 { 0x1000 } else { 0x200 };
@@ -3919,11 +3865,11 @@ impl Firmware {
             || fs_wait_render.is_some_and(|w| w.initbm)
             || ta_wait_fs.is_some_and(|w| w.initbm);
         let render_bar = cross_engine_barrier_type(producer_initbm, init_buffer);
-        // Pipelined renders share TA/FS pipes across same-VM and cross-VM flights, so keep
-        // the TA(N-1)->TA(N) `prev_barrier` (matching G15) whenever `plan.ta_fs_wait` does not
-        // already serialize behind `prev_fs`. Emit `ta_fs_barrier` only when `plan.ta_fs_wait`
-        // names an in-flight FS stamp, and `fs_dep` when `plan.fs_render_wait` names an
-        // in-flight FS dependency (or cross-VM `prev_fs`) not already dominated by TA.
+        // Pipelined renders of one VM share the TA/FS pipes, so keep the TA(N-1)->TA(N)
+        // `prev_barrier` (matching G15) whenever `plan.ta_fs_wait` does not already serialize
+        // behind `prev_fs`. Emit `ta_fs_barrier` only when `plan.ta_fs_wait` names an in-flight
+        // FS stamp, and `fs_dep` only when `plan.fs_render_wait` names an in-flight FS
+        // dependency not already dominated by TA.
         if plan.ta_prev_wait {
             let prev = encode::barrier(
                 r.fw_stamp[0].va,
