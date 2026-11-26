@@ -55,8 +55,6 @@ MODULE_PARM_DESC(hdcp, "HDCP 2.2 on external outputs: attach Content Protection 
 #define DCP_HDCP_KICK_MS	5000
 #define DCP_HDCP_KICKS		6
 /* The receiver's status on an encrypted link. */
-#define DCP_HDCP_CHECK_MS	1000
-#define DCP_HDCP_CHECK_ERRORS	3
 #define DCP_HDCP_IFACES		4
 #define DCP_HDCP_QUEUE		16
 
@@ -99,9 +97,7 @@ struct dcp_hdcp {
 	struct work_struct prop_work;
 	struct work_struct relay_work;
 	struct delayed_work kick_work;
-	struct delayed_work check_work;
 	unsigned int kicks;
-	unsigned int check_errors;
 
 	struct dcp_hdcp_tx tx;
 };
@@ -386,7 +382,6 @@ static void dcp_hdcp_apply(struct dcp_hdcp *h, enum dcp_hdcp_action action)
 		h->cancel = true;
 		spin_unlock_irqrestore(&h->svc_lock, flags);
 		wake_up_all(&h->ev_wq);
-		cancel_delayed_work(&h->check_work);
 		queue_work(h->wq, &h->teardown_work);
 	} else if (action == DCP_HDCP_KICK) {
 		h->kicks = 0;
@@ -477,36 +472,6 @@ static void dcp_hdcp_teardown_work(struct work_struct *work)
 		dcp_hdcp_report(h, DCP_HDCP_PROGRESS_IDLE, false, false, false);
 }
 
-static void dcp_hdcp_check_work(struct work_struct *work)
-{
-	struct dcp_hdcp *h = container_of(to_delayed_work(work), struct dcp_hdcp,
-					  check_work);
-	enum dcp_hdcp_action action = DCP_HDCP_NONE;
-	bool enabled;
-	int ret;
-
-	mutex_lock(&h->lock);
-	enabled = h->link.state == DCP_HDCP_ENABLED;
-	mutex_unlock(&h->lock);
-	if (!enabled)
-		return;
-	ret = dcp_hdcp_check_link(&h->tx);
-	if (ret == -EAGAIN || (ret && ++h->check_errors >= DCP_HDCP_CHECK_ERRORS)) {
-		dev_info(h->dcp->dev, "HDCP: link check failed (%d), re-authenticating\n",
-			 ret);
-		mutex_lock(&h->lock);
-		action = dcp_hdcp_closed(&h->link, h->session_gen, jiffies);
-		mutex_unlock(&h->lock);
-		dcp_hdcp_apply(h, action);
-		dcp_hdcp_apply(h, DCP_HDCP_KICK);
-		return;
-	}
-	if (!ret)
-		h->check_errors = 0;
-	queue_delayed_work(h->wq, &h->check_work,
-			   msecs_to_jiffies(DCP_HDCP_CHECK_MS));
-}
-
 /* One authentication, from DCP's start of the session to its result. */
 static void dcp_hdcp_run(struct dcp_hdcp *h)
 {
@@ -549,11 +514,6 @@ static void dcp_hdcp_run(struct dcp_hdcp *h)
 	mutex_lock(&h->lock);
 	action = dcp_hdcp_auth_done(&h->link, gen, ret, jiffies);
 	mutex_unlock(&h->lock);
-	if (!ret) {
-		h->check_errors = 0;
-		queue_delayed_work(h->wq, &h->check_work,
-				   msecs_to_jiffies(DCP_HDCP_CHECK_MS));
-	}
 	/* The SEP session is already closed after a failure. */
 	if (action != DCP_HDCP_TEARDOWN)
 		dcp_hdcp_apply(h, action);
@@ -565,7 +525,6 @@ static void dcp_hdcp_close(struct dcp_hdcp *h, struct apple_epic_service *servic
 {
 	unsigned long flags;
 
-	cancel_delayed_work(&h->check_work);
 	dcp_hdcp_abort(&h->tx);
 	mutex_lock(&h->lock);
 	dcp_hdcp_closed(&h->link, h->session_gen, jiffies);
@@ -713,11 +672,10 @@ static int dcp_hdcp_session_call(struct apple_epic_service *service, u16 group,
 	ret = dcp_hdcp_auth_reply(group, command, data, size, reply, room,
 				  accept);
 	if (ret == -EOPNOTSUPP && h && !group) {
-		/* Not a session step: answer it, and look at the receiver. */
+		/* Not a session step: answered and logged. */
 		memset(reply, 0, room);
 		memcpy(reply, data, min(size, room));
 		dev_dbg(h->dcp->dev, "HDCP: session call %#x\n", command);
-		mod_delayed_work(h->wq, &h->check_work, 0);
 		return 0;
 	}
 	if (ret || !h)
@@ -1028,7 +986,6 @@ struct dcp_hdcp *dcp_hdcp_init(struct apple_dcp *dcp)
 	INIT_WORK(&h->prop_work, dcp_hdcp_prop_work);
 	INIT_WORK(&h->relay_work, dcp_hdcp_relay_work);
 	INIT_DELAYED_WORK(&h->kick_work, dcp_hdcp_kick_work);
-	INIT_DELAYED_WORK(&h->check_work, dcp_hdcp_check_work);
 	h->wq = alloc_ordered_workqueue("apple-dcp-hdcp", WQ_FREEZABLE);
 	if (!h->wq)
 		return NULL;
@@ -1054,7 +1011,6 @@ void dcp_hdcp_fini(struct apple_dcp *dcp)
 	spin_unlock_irqrestore(&h->svc_lock, flags);
 	wake_up_all(&h->ev_wq);
 	cancel_delayed_work_sync(&h->kick_work);
-	cancel_delayed_work_sync(&h->check_work);
 	flush_workqueue(h->wq);
 	dcp_hdcp_abort(&h->tx);
 }
