@@ -799,6 +799,15 @@ int main(void)
     if 'dcp_connect_admitted_locked(' in raw:
         # The session checks before each DPTX call; no tunnel binding here.
         firmware += apple_function(root, 'dcp_connect_admitted_locked')
+    if 'dcp_dptx_gate_open(' in raw:
+        # No Thunderbolt tunnel here: the gate lets every call through.
+        swap(' struct { bool active; } split;',
+             ' struct { bool active; } split;\n void *dptx_gate_task;')
+        firmware += ('#define dcp_dptx_gate_open(...) ((void)0)\n'
+                     '#define dcp_dptx_gate_arm(...) ((void)0)\n'
+                     '#define dcp_dptx_gate_disarm(...) ((void)0)\n'
+                     '#define dcp_dptx_gate_close(...) ((void)0)\n'
+                     '#define dcp_connect_admitted(d, s, c, r) dcp_connect_session_valid(d, s, c, r)\n')
     # unless the update work already needed the clock
     clock = 'static unsigned jiffies_to_msecs(unsigned long t) { return t; }\n'
     if clock in unit:

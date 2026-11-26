@@ -628,6 +628,8 @@ bool afk_host_idle(struct apple_dcp_afkep *ep);
 unsigned int afk_compact_orphans_drop(struct apple_dcp_afkep *ep);
 bool afk_compact_orphans_pending(struct apple_dcp_afkep *ep);
 bool afk_late_replies_pending(struct apple_dcp_afkep *ep);
+/* dcp.c: queue a V2 command (@enqueue) as a tunnel connect's admission allows. */
+int dcp_dptx_send_gated(struct apple_dcp_afkep *ep, int (*enqueue)(void *arg), void *arg);
 void afk_late_replies_wake(struct apple_dcp_afkep *ep);
 void afk_shutdown(struct apple_dcp_afkep *ep);
 void afk_quiesce(struct apple_dcp_afkep *ep);

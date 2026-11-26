@@ -2462,7 +2462,9 @@ static bool dcp_tb_tunnel_withdrawn(struct apple_dcp *dcp, u32 port)
  * a Thunderbolt tunnel's provider revokes its binding before the fabric
  * retires the session (the detach that follows waits for this connect), and
  * no call is made for a revoked one. Only the binding the session holds is
- * checked: the session's cookie is the current binding's.
+ * checked: the session's cookie is the current binding's. The calls
+ * themselves go out under the provider's admission (dcp_dptx_send_gated()):
+ * this only spares the connect the calls that would be refused.
  */
 static bool dcp_connect_admitted_locked(struct apple_dcp *dcp,
 					const struct dcp_fabric_session *session,
@@ -2471,6 +2473,68 @@ static bool dcp_connect_admitted_locked(struct apple_dcp *dcp,
 	if (!dcp_connect_session_valid_locked(dcp, session, cable, recovery))
 		return false;
 	return !session || !session->cookie || !dcp_tb_tunnel_withdrawn(dcp, 0);
+}
+
+static bool dcp_connect_admitted(struct apple_dcp *dcp,
+				 const struct dcp_fabric_session *session,
+				 bool cable, bool recovery)
+{
+	if (!session)
+		return true;
+	guard(mutex)(&dcp->hpd_mutex);
+	return dcp_connect_admitted_locked(dcp, session, cable, recovery);
+}
+
+/*
+ * The DPTX calls of a Thunderbolt tunnel's connect go out only while the
+ * provider admits the session's binding. The provider revokes a binding
+ * under its own lock, before the detach that follows reaches us, so a check
+ * made before a call and released before it leaves a gap. Instead each
+ * call is queued under the provider's admission
+ * (apple_dp_tunnel_binding_call()): the revocation comes before it, and the
+ * call is refused (-ESTALE), or after it. Only the queueing: the reply is
+ * waited for after, as DCP's Activate for the binding takes the provider's
+ * lock. The connect opens the gate around its calls (dcp_dptx_gate_open());
+ * other senders and the connect's own release are not gated. Compact EPIC
+ * (desktop 26.x, the M4 backend) queues its calls under a lock it can hold
+ * while waiting for ring space, and keeps the check before each call.
+ */
+static void dcp_dptx_gate_open(struct apple_dcp *dcp,
+			       const struct dcp_fabric_session *session)
+{
+	mutex_lock(&dcp->dptx_gate_lock);
+	if (!session || !session->cookie)
+		return;
+	dcp->dptx_gate_cookie = session->cookie;
+	WRITE_ONCE(dcp->dptx_gate_task, current);
+}
+
+static void dcp_dptx_gate_close(struct apple_dcp *dcp)
+{
+	WRITE_ONCE(dcp->dptx_gate_task, NULL);
+	mutex_unlock(&dcp->dptx_gate_lock);
+}
+
+int dcp_dptx_send_gated(struct apple_dcp_afkep *ep, int (*enqueue)(void *arg), void *arg)
+{
+	struct apple_dcp *dcp = ep->dcp;
+	typeof(apple_dp_tunnel_binding_call) *call;
+	int ret;
+
+	/* Read without dereferencing: only the connect that set it matches. */
+	if (ep != dcp->dptxep || READ_ONCE(dcp->dptx_gate_task) != current)
+		return enqueue(arg);
+	lockdep_assert_held(&dcp->dptx_gate_lock);
+	guard(mutex)(&dcp->tb_lock);
+	/* The session's binding: a cookie replaced or gone is not admitted. */
+	if (!dcp->tb_dpin_ctx || dcp->tb_generation != dcp->dptx_gate_cookie)
+		return -ESTALE;
+	call = symbol_get(apple_dp_tunnel_binding_call);
+	if (!call)
+		return -ESTALE;
+	ret = call(dcp->tb_dpin_ctx, enqueue, arg);
+	symbol_put(apple_dp_tunnel_binding_call);
+	return ret;
 }
 
 /*
@@ -2588,6 +2652,8 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 		dcp->connector_type, dcp->dptxport[port].connected);
 
 	mutex_lock(&dcp->hpd_mutex);
+	/* Its calls go out under the provider's admission from here. */
+	dcp_dptx_gate_open(dcp, port ? NULL : session);
 	compact = dptx_service_available(&dcp->dptxport[port]) &&
 		  READ_ONCE(dcp->dptxport[port].service->ep->compact);
 	if (!dcp_connect_admitted_locked(dcp, session, cable, recovery)) {
@@ -2596,8 +2662,8 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 	}
 	generation = dcp->typec_generation;
 	if (dcp->external && dcpext_scanout_terminal(dcp)) {
-		mutex_unlock(&dcp->hpd_mutex);
-		return -ESHUTDOWN;
+		ret = -ESHUTDOWN;
+		goto out_unlock;
 	}
 	if (!dptx_service_available(&dcp->dptxport[port])) {
 		dev_warn(dcp->dev, "dcp_dptx_connect: dptx service for port %d not enabled\n", port);
@@ -2634,6 +2700,9 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 		ret = dptxport_validate_connection(dcp->dptxport[port].service,
 						   dfp_port,
 						   dcp->dptx_phy, dcp->dptx_die);
+		/* -ESTALE: the provider revoked the binding (dcp_dptx_send_gated()). */
+		if (ret == -ESTALE)
+			goto out_unlock;
 		if (ret) {
 			dev_err(dcp->dev,
 				"dcp_dptx_connect: failed to validate DPTX target %u:%u: %d\n",
@@ -2650,6 +2719,8 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 			       dfp_port,
 			       dcp->dptx_phy, dcp->dptx_die,
 			       dcp_is_typec_output(dcp) && !dcp_ext_dptx_607(dcp));
+	if (ret == -ESTALE)
+		goto out_unlock;
 	if (ret) {
 		dev_err(dcp->dev,
 			"dcp_dptx_connect: failed to connect DPTX target %u:%u: %d\n",
@@ -2662,6 +2733,8 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 		goto out_unlock;
 	}
 	ret = dptxport_request_display(dcp->dptxport[port].service);
+	if (ret == -ESTALE)
+		goto out_unlock;
 	if (ret) {
 		dev_err(dcp->dev,
 			"dcp_dptx_connect: failed to request display: %d\n",
@@ -2680,14 +2753,16 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 		else
 			ret = dptxport_set_hpd(dcp->dptxport[port].service, true);
 		if (ret) {
-			dev_err(dcp->dev,
-				"dcp_dptx_connect: failed to assert Type-C HPD: %d\n",
-				ret);
+			if (ret != -ESTALE)
+				dev_err(dcp->dev,
+					"dcp_dptx_connect: failed to assert Type-C HPD: %d\n",
+					ret);
 			dcp->dptxport[port].connected = false;
 			goto out_release;
 		}
 	}
 
+	dcp_dptx_gate_close(dcp);
 	mutex_unlock(&dcp->hpd_mutex);
 	/*
 	 * The display interface of a native external processor opens once a
@@ -2745,7 +2820,9 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 	usleep_range(5, 10);
 
 	if (dcp->connector_type == DRM_MODE_CONNECTOR_DisplayPort || late_hpd) {
+		dcp_dptx_gate_open(dcp, port ? NULL : session);
 		ret = dptxport_set_hpd(dcp->dptxport[port].service, true);
+		dcp_dptx_gate_close(dcp);
 		if (ret && late_hpd)
 			dev_err(dcp->dev,
 				"dcp_dptx_connect: failed to assert HPD after the link wait: %d\n",
@@ -2754,7 +2831,11 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 		if (ret && (dcp->external || late_hpd))
 			goto out_withdraw;
 	}
-	if (!dcp_connect_session_valid(dcp, session, cable, recovery))
+	/*
+	 * Still admitted: a binding revoked during the wait leaves the display
+	 * to its detach, which releases it.
+	 */
+	if (!dcp_connect_admitted(dcp, session, cable, recovery))
 		return -ESTALE;
 	if (dcp->external) {
 		/*
@@ -2791,6 +2872,8 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 
 out_withdraw:
 	mutex_lock(&dcp->hpd_mutex);
+	/* Withdrawing is not gated: the release must go out. */
+	dcp_dptx_gate_open(dcp, NULL);
 	/*
 	 * A T8132 dcpext's release lowers only the HPD of a connected port, so
 	 * a withdrawn one lowers its HPD here.
@@ -2834,9 +2917,12 @@ out_withdraw:
 	goto out_unlock;
 
 out_release:
+	/* Nor is the release of a display requested. */
+	WRITE_ONCE(dcp->dptx_gate_task, NULL);
 	dptxport_release_display(dcp->dptxport[port].service);
 
 out_unlock:
+	dcp_dptx_gate_close(dcp);
 	mutex_unlock(&dcp->hpd_mutex);
 	return ret;
 }
@@ -7739,6 +7825,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	INIT_WORK(&dcp->external_stop_work, dcp_external_stop_work);
 	INIT_DELAYED_WORK(&dcp->external_stop_retry_wq, dcp_external_stop_retry);
 	mutex_init(&dcp->tb_lock);
+	mutex_init(&dcp->dptx_gate_lock);
 	dcp_fabric_init(dcp);
 	spin_lock_init(&dcp->mode_state.lock);
 	spin_lock_init(&dcp->metadata.lock);

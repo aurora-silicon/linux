@@ -33,6 +33,14 @@ def check(root, output):
     # afk_send_command_common(); afk_send_command_timeout_len() wraps it.
     if 'static int afk_send_command_common(' in afk:
         sender=extract(afk,'static int afk_send_command_common(')+'\n'+sender
+    # The command's queueing, which a tunnel connect's gate may hold (dcp_dptx_send_gated()).
+    if 'static int afk_command_enqueue(' in afk:
+        start=afk.index('struct afk_command_send {')
+        queueing=afk[start:afk.index('};',start)+2].replace('struct completion *completion;','int *completion;')
+        sender=(queueing+'\n'+extract(afk,'static int afk_command_enqueue(')+'\n'
+                '/* No tunnel connect here: every command is queued at once. */\n'
+                'static int dcp_dptx_send_gated(struct apple_dcp_afkep *ep,int (*enqueue)(void *),void *arg)\n'
+                '{ (void)ep;return enqueue(arg); }\n'+sender)
     unit=unit[:unit.index('int main(void)')]
     unit=unit.replace('static unsigned int dma_frees,opens;',r'''
     static unsigned int dma_frees,opens;

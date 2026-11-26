@@ -10,9 +10,11 @@ the AFK transport. The replay drives a dock's tunnel on the Air (J713) on
 firmware 27.2:
 
 - the tunnel's provider revokes its binding before the work starts, between
-  two DPTX calls and during the link wait: no DPTX call goes out for a revoked
-  binding, HPD is never raised for it, and the detach does not wait out the
-  link wait;
+  two DPTX calls, right after the connect's own admission check, and during
+  the link wait: no DPTX call goes out for a revoked binding, as each is
+  queued under the provider's admission (dcp_dptx_send_gated()), HPD is
+  never raised for it, the connect does not report success for it, and the
+  detach does not wait out the link wait;
 - the CRTC is turned off (DPMS) before the work starts, between two calls and
   during the link wait: the connect never raises HPD on a CRTC turned off;
 - a T8132 dcpext connects once per tunnel: a failed connect is not tried
@@ -50,6 +52,8 @@ FUNCTIONS = [
     ('dcp', 'dcp_typec_sessionless'), ('dcp', 'dcp_queue_typec_reconnect_locked'),
     ('dcp', 'dcp_queue_typec_reconnect'), ('dcp', 'dcp_t8132_wait_teardown_answers'),
     ('dcp', 'dcp_tb_tunnel_withdrawn'), ('dcp', 'dcp_connect_admitted_locked'),
+    ('dcp', 'dcp_connect_admitted'), ('dcp', 'dcp_dptx_gate_open'),
+    ('dcp', 'dcp_dptx_gate_close'), ('dcp', 'dcp_dptx_send_gated'),
     ('dcp', 'dcp_watches_tunnel_withdrawal'), ('dcp', 'dcp_dptx_wait_linkcfg'),
     ('dcp', 'dcp_dptx_connect_raw'), ('dcp', 'dcp_typec_reconnect_work'),
     ('dcp', 'dcp_typec_attach_locked'), ('dcp', 'dcp_typec_attach_deferred'),
@@ -62,6 +66,12 @@ MUTATIONS = {
     # The connect checks the session alone, not the provider's admission.
     'no-admission': ('dcp', 'return !session || !session->cookie || !dcp_tb_tunnel_withdrawn(dcp, 0);',
                      'return true;'),
+    # The calls go out after a check, not under the provider's admission.
+    'no-gate': ('dcp', '\tif (ep != dcp->dptxep || READ_ONCE(dcp->dptx_gate_task) != current)\n\t\treturn enqueue(arg);',
+                '\treturn enqueue(arg);'),
+    # The connect reports success for a binding revoked during the link wait.
+    'no-recheck-after-wait': ('dcp', '\tif (!dcp_connect_admitted(dcp, session, cable, recovery))\n\t\treturn -ESTALE;\n\tif (dcp->external) {',
+                              '\tif (!dcp_connect_session_valid(dcp, session, cable, recovery))\n\t\treturn -ESTALE;\n\tif (dcp->external) {'),
     # The detach leaves the link wait to run out.
     'detach-no-link-wake': ('dcp', '\t\tif (dcp->dptx_tunnel)\n\t\t\tcomplete(&dcp->dptxport[0].linkcfg_completion);\n',
                             ''),
@@ -141,6 +151,9 @@ static unsigned long jiffies;
 static unsigned long msecs_to_jiffies(unsigned int ms) { return ms; }
 #define time_after_eq(a, b) ((long)((a) - (b)) >= 0)
 static void usleep_range(unsigned long a, unsigned long b) { (void)a; (void)b; }
+struct task_struct { int unused; };
+static struct task_struct the_task;
+#define current (&the_task)
 
 /* Locks: held counts, checked where production asserts them. */
 struct mutex { int held; };
@@ -224,7 +237,8 @@ enum { DRM_MODE_CONNECTOR_DisplayPort = 10, DRM_MODE_CONNECTOR_USB = 32 };
 struct device_node { const char *compatible; bool v27_2; };
 struct device { struct device_node *of_node; };
 struct platform_device { struct device dev; };
-struct apple_dcp_afkep { int compact_orphan_wq; bool compact; };
+struct apple_dcp;
+struct apple_dcp_afkep { int compact_orphan_wq; bool compact; struct apple_dcp *dcp; };
 struct apple_epic_service { struct apple_dcp_afkep *ep; };
 struct dcp_fabric_session { u64 generation; u64 cookie; };
 struct dptx_port {
@@ -237,7 +251,9 @@ struct apple_connector { int unused; };
 struct apple_dcp {
 	struct device *dev;
 	int fw_compat;
-	struct mutex hpd_mutex, tb_lock;
+	struct mutex hpd_mutex, tb_lock, dptx_gate_lock;
+	struct task_struct *dptx_gate_task;
+	u64 dptx_gate_cookie;
 	void *phy, *avep, *relink_lock, *relink;
 	struct { bool ext_pipe_off; } *desktop;
 	struct apple_connector *connector;
@@ -297,15 +313,36 @@ static bool rpc_seen(const char *what)
 			return true;
 	return false;
 }
+/*
+ * A DPTX call is queued through the V2 transport (afk_send_command_common()),
+ * which hands its queueing to the gate (dcp_dptx_send_gated()); the reply
+ * follows the queueing.
+ */
+int dcp_dptx_send_gated(struct apple_dcp_afkep *ep, int (*enqueue)(void *arg), void *arg);
+static struct apple_dcp_afkep dptxep;
+static int queue_rpc(void *what) { rpc(what); return 0; }
+static int send(const char *what)
+{
+	unsigned int before = nrpcs;
+	int ret = dcp_dptx_send_gated(&dptxep, queue_rpc, (void *)what);
+
+	/* Refused by the gate: nothing went out. */
+	assert(!ret || nrpcs == before);
+	return ret;
+}
 static int dptxport_validate_connection(struct apple_epic_service *s, u8 a, u8 b, u8 c)
-{ (void)s; (void)a; (void)b; (void)c; rpc("validate"); return 0; }
+{ (void)s; (void)a; (void)b; (void)c; return send("validate"); }
 static int dptxport_connect(struct apple_epic_service *s, u8 a, u8 b, u8 c, bool d)
-{ (void)s; (void)a; (void)b; (void)c; (void)d; rpc("connect"); return 0; }
-static int dptxport_request_display(struct apple_epic_service *s) { (void)s; rpc("request"); return 0; }
+{ (void)s; (void)a; (void)b; (void)c; (void)d; return send("connect"); }
+static int dptxport_request_display(struct apple_epic_service *s) { (void)s; return send("request"); }
 static int dptxport_set_hpd(struct apple_epic_service *s, bool on)
 {
+	int ret;
+
 	(void)s;
-	rpc(on ? "hpd1" : "hpd0");
+	ret = send(on ? "hpd1" : "hpd0");
+	if (ret)
+		return ret;
 	if (!on && set_hpd_low_ret)
 		return set_hpd_low_ret;
 	hpd_high = on;
@@ -316,12 +353,39 @@ static int dptxport_set_hpd(struct apple_epic_service *s, bool on)
 static int dptxport_set_hpd_timeout(struct apple_epic_service *s, bool on, unsigned int ms)
 { (void)ms; return dptxport_set_hpd(s, on); }
 static int dptxport_release_display(struct apple_epic_service *s)
-{ (void)s; rpc("release"); return release_ret; }
+{
+	int ret;
+
+	(void)s;
+	ret = send("release");
+	/* A release always goes out: it is never gated. */
+	assert(!ret);
+	return release_ret;
+}
 static bool dptx_service_available(struct dptx_port *p) { return p->service; }
 
 /* The provider's binding, and its admission. */
 static bool binding_live = true;
-static bool apple_dp_tunnel_binding_live(void *binding) { (void)binding; return binding_live; }
+/* The provider revokes the binding right after the n-th check of it, under its own lock. */
+static unsigned int revoke_after_checks;
+static bool apple_dp_tunnel_binding_live(void *binding)
+{
+	bool live = binding_live;
+
+	(void)binding;
+	if (revoke_after_checks && !--revoke_after_checks)
+		binding_live = false;
+	return live;
+}
+static unsigned int gated_calls;
+static int apple_dp_tunnel_binding_call(void *binding, int (*call)(void *arg), void *arg)
+{
+	(void)binding;
+	if (!binding_live)
+		return -ESTALE;
+	gated_calls++;
+	return call(arg);
+}
 #define symbol_get(sym) (&sym)
 #define symbol_put(sym) ((void)0)
 
@@ -383,7 +447,6 @@ static struct apple_dcp *dcp = &((struct { struct apple_dcp d; }){ 0 }).d;
 static void *platform_get_drvdata(struct platform_device *p) { (void)p; return the_dcp; }
 static struct device_node j713_27 = { "apple,t8132-dcpext", true };
 static struct device_node j713_26 = { "apple,t8132-dcpext", false };
-static struct apple_dcp_afkep dptxep;
 static struct apple_epic_service service = { &dptxep };
 static int binding;
 
@@ -403,6 +466,7 @@ static void setup(struct device_node *node)
 	d.tb_generation = 7;
 	d.tb_dpin_ctx = &binding;
 	d.dptxep = &dptxep;
+	dptxep.dcp = &d;
 	d.dptxport[0].service = &service;
 	d.typec_generation = 40;
 	the_dcp = dcp = &d;
@@ -410,6 +474,7 @@ static void setup(struct device_node *node)
 	release_ret = set_hpd_low_ret = 0; hpd_high = false; link_comes = true; binding_live = true;
 	late_pending = compact_orphans = false; orphans_dropped = late_wakes = presents_lost = 0;
 	at_rpc = NULL; at_link_wait = at_fence_wait = NULL; waiter = NULL;
+	revoke_after_checks = gated_calls = 0;
 }
 
 /* The provider's tunnel goes: it revokes, then the fabric detaches (dcp_tb_release_locked()). */
@@ -471,7 +536,35 @@ static void connect_cases(void)
 	run_work();
 	assert(nrpcs == 4 && rpc_seen("validate") && rpc_seen("request") && hpd_high);
 	assert(dcp->dptxport[0].connected && !warns);
+	/* Every call of the tunnel's connect went out under the provider's admission. */
+	assert(gated_calls == 4 && !dcp->dptx_gate_task && !dcp->dptx_gate_lock.held);
 	puts("ok connect: the deferred connect of a live tunnel lights it");
+
+	/*
+	 * Revoked right after a check of the connect said it was admitted,
+	 * before the call it checked for: that call is refused by the gate.
+	 */
+	for (unsigned int i = 1; i <= 4; i++) {
+		setup(&j713_27);
+		dcp_typec_attach_deferred(dcp);
+		revoke_after_checks = i;
+		run_work();
+		assert(nrpcs == (i == 4 ? 4 : i - 1) && !hpd_high && !rpc_seen("hpd1"));
+		assert(!dcp->dptx_gate_task && !dcp->dptx_gate_lock.held);
+		/* The display requested is released, which is never gated. */
+		if (i == 4)
+			assert(!strcmp(rpcs[3], "release"));
+	}
+	puts("ok connect: revoked right after its admission check: the call is refused");
+
+	/* Revoked during the link wait, its link come: no success reported. */
+	setup(&j713_27);
+	dcp_typec_attach_deferred(dcp);
+	at_link_wait = revoke;
+	scoped_guard(mutex, &dcp->hpd_mutex)
+		dcp->typec_reconnect_session = dcp_session_locked(dcp);
+	assert(dcp_dptx_connect_raw(dcp, 0, NULL, &dcp->typec_reconnect_session, true, true) == -ESTALE);
+	puts("ok connect: revoked during the link wait: not reported connected");
 
 	/* Revoked before the work starts: no DPTX call at all. */
 	setup(&j713_27);
@@ -684,10 +777,13 @@ def build(tmp, name, sources):
     unit += define(sources['dcp'], 'DPTX_RECONNECT_RETRIES')
     unit += define(sources['dcp'], 'DCP_LINKCFG_POLL_MS')
     unit += 'typedef bool apple_dp_tunnel_binding_live_t(void *);\n'
+    unit += 'typedef int apple_dp_tunnel_binding_call_t(void *, int (*)(void *), void *);\n'
     for src, fn in FUNCTIONS:
         body = function(sources[src], fn)
         body = body.replace('typeof(apple_dp_tunnel_binding_live) *live;',
                             'apple_dp_tunnel_binding_live_t *live;')
+        body = body.replace('typeof(apple_dp_tunnel_binding_call) *call;',
+                            'apple_dp_tunnel_binding_call_t *call;')
         unit += body
     unit += CASES
     c = Path(tmp) / (name + '.c')

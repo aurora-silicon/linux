@@ -3214,6 +3214,91 @@ int afk_send_command_timeout(struct apple_epic_service *service, u8 type,
  * @reply_len (legacy EPIC only): return just the bytes the firmware reported
  * in its reply instead of the whole allocated output.
  */
+/* A command of a V2 endpoint, ready to take a slot and go out. */
+struct afk_command_send {
+	struct apple_epic_service *service;
+	u8 type;
+	const void *payload;
+	size_t payload_len, output_len;
+	void *inline_command;
+	struct epic_cmd *cmd;
+	void *rxbuf, *txbuf;
+	dma_addr_t rxbuf_dma, txbuf_dma;
+	struct completion *completion;
+	/* the slot taken, and its tag */
+	int idx;
+	u16 tag;
+};
+
+/*
+ * Take a command slot of @data's service and send the command: under the
+ * service's lock, without waiting for anything, so that a gate
+ * (dcp_dptx_send_gated()) may hold its own lock across it. On failure no
+ * slot stays taken.
+ */
+static int afk_command_enqueue(void *data)
+{
+	struct afk_command_send *c = data;
+	struct apple_epic_service *service = c->service;
+	struct apple_dcp_afkep *ep = service->ep;
+	unsigned long flags;
+	int ret, idx;
+	u16 tag;
+
+	spin_lock_irqsave(&service->lock, flags);
+	if (service->torndown || !service->enabled) {
+		ret = -ENODEV;
+		goto out_unlock;
+	}
+	idx = bitmap_find_free_region(service->cmd_map, MAX_PENDING_CMDS, 0);
+	if (idx < 0) {
+		ret = -ENOSPC;
+		goto out_unlock;
+	}
+
+	tag = afk_command_tag(service, idx);
+
+	service->cmds[idx].tag = tag;
+	service->cmds[idx].type = c->type;
+	service->cmds[idx].reply_length = 0;
+	service->cmds[idx].reply_len = 0;
+	service->cmds[idx].reply_len_valid = false;
+	service->cmds[idx].rxbuf = c->rxbuf;
+	service->cmds[idx].txbuf = c->txbuf;
+	service->cmds[idx].rxbuf_dma = c->rxbuf_dma;
+	service->cmds[idx].txbuf_dma = c->txbuf_dma;
+	service->cmds[idx].rxlen = c->output_len;
+	service->cmds[idx].txlen = c->payload_len;
+	service->cmds[idx].free_on_ack = false;
+	service->cmds[idx].done = false;
+	service->cmds[idx].completion = c->completion;
+	init_completion(c->completion);
+
+	if (ep->inline_v2) {
+		ret = afkv2_encode_inline_command(c->inline_command,
+						  AFKV2_COMMAND_SIZE + c->payload_len,
+						  tag, c->payload, c->payload_len, c->output_len);
+		if (!ret)
+			ret = afk_send_epic(ep, service->channel, tag, EPIC_TYPE_COMMAND,
+					    EPIC_CAT_COMMAND, c->type, c->inline_command,
+					    AFKV2_COMMAND_SIZE + c->payload_len);
+	} else {
+		ret = afk_send_epic(ep, service->channel, tag,
+				    EPIC_TYPE_COMMAND, EPIC_CAT_COMMAND, c->type, c->cmd,
+				    sizeof(*c->cmd));
+	}
+	if (ret) {
+		service->cmds[idx].completion = NULL;
+		bitmap_release_region(service->cmd_map, idx, 0);
+	} else {
+		c->idx = idx;
+		c->tag = tag;
+	}
+out_unlock:
+	spin_unlock_irqrestore(&service->lock, flags);
+	return ret;
+}
+
 static int afk_send_command_common(struct apple_epic_service *service, u8 type,
 				   const void *payload, size_t payload_len,
 				   void *output, size_t output_len, u32 *retcode,
@@ -3221,13 +3306,13 @@ static int afk_send_command_common(struct apple_epic_service *service, u8 type,
 				   size_t *reply_len)
 {
 	struct epic_cmd cmd;
+	struct afk_command_send send;
 	void *inline_command = NULL;
 	size_t copy_len = output_len;
 	void *rxbuf, *txbuf;
 	dma_addr_t rxbuf_dma, txbuf_dma;
 	unsigned long flags;
 	int ret, idx;
-	u16 tag;
 	struct apple_dcp_afkep *ep;
 	DECLARE_COMPLETION_ONSTACK(completion);
 
@@ -3330,53 +3415,20 @@ static int afk_send_command_common(struct apple_epic_service *service, u8 type,
 	cmd.txbuf = cpu_to_le64(txbuf_dma);
 	cmd.txlen = cpu_to_le32(payload_len);
 
-	spin_lock_irqsave(&service->lock, flags);
-	if (service->torndown || !service->enabled) {
-		ret = -ENODEV;
-		goto err_unlock;
-	}
-	idx = bitmap_find_free_region(service->cmd_map, MAX_PENDING_CMDS, 0);
-	if (idx < 0) {
-		ret = -ENOSPC;
-		goto err_unlock;
-	}
-
-	tag = afk_command_tag(service, idx);
-
-	service->cmds[idx].tag = tag;
-	service->cmds[idx].type = type;
-	service->cmds[idx].reply_length = 0;
-	service->cmds[idx].reply_len = 0;
-	service->cmds[idx].reply_len_valid = false;
-	service->cmds[idx].rxbuf = rxbuf;
-	service->cmds[idx].txbuf = txbuf;
-	service->cmds[idx].rxbuf_dma = rxbuf_dma;
-	service->cmds[idx].txbuf_dma = txbuf_dma;
-	service->cmds[idx].rxlen = output_len;
-	service->cmds[idx].txlen = payload_len;
-	service->cmds[idx].free_on_ack = false;
-	service->cmds[idx].done = false;
-	service->cmds[idx].completion = &completion;
-	init_completion(&completion);
-
-	if (ep->inline_v2) {
-		ret = afkv2_encode_inline_command(inline_command,
-						  AFKV2_COMMAND_SIZE + payload_len,
-						  tag, payload, payload_len, output_len);
-		if (!ret)
-			ret = afk_send_epic(ep, service->channel, tag, EPIC_TYPE_COMMAND,
-					    EPIC_CAT_COMMAND, type, inline_command,
-					    AFKV2_COMMAND_SIZE + payload_len);
-	} else {
-		ret = afk_send_epic(service->ep, service->channel, tag,
-				    EPIC_TYPE_COMMAND, EPIC_CAT_COMMAND, type, &cmd,
-				    sizeof(cmd));
-	}
+	send = (struct afk_command_send) {
+		.service = service, .type = type, .payload = payload,
+		.payload_len = payload_len, .output_len = output_len,
+		.inline_command = inline_command, .cmd = &cmd,
+		.rxbuf = rxbuf, .txbuf = txbuf,
+		.rxbuf_dma = rxbuf_dma, .txbuf_dma = txbuf_dma,
+		.completion = &completion,
+	};
+	ret = dcp_dptx_send_gated(ep, afk_command_enqueue, &send);
 	kfree(inline_command);
 	inline_command = NULL;
-	spin_unlock_irqrestore(&service->lock, flags);
 	if (ret)
-		goto err_free_cmd;
+		goto err_free_txbuf;
+	idx = send.idx;
 
 	ret = wait_for_completion_timeout(&completion,
 					  msecs_to_jiffies(timeout_ms));
@@ -3397,7 +3449,7 @@ static int afk_send_command_common(struct apple_epic_service *service, u8 type,
 			dev_warn(ep->dcp->dev,
 				 "AFK[ep:%02x]: %s (chan:%u) command type 0x%x tag 0x%04x timed out after %u ms\n",
 				 ep->endpoint, service->ops->name, service->channel,
-				 type, tag, timeout_ms);
+				 type, send.tag, timeout_ms);
 			if (ep->dcp->external && ep->txbfr.ready && ep->rxbfr.ready) {
 				/* Diagnostic snapshot of shared RAM, not coprocessor MMIO.
 				 * Unequal TX pointers mean firmware has not drained the queue.
@@ -3405,7 +3457,7 @@ static int afk_send_command_common(struct apple_epic_service *service, u8 type,
 				dma_rmb();
 				dev_warn(ep->dcp->dev,
 					 "AFK timeout channel=%u tag=%#x TX r/w=%#x/%#x RX r/w=%#x/%#x running=%d crashed=%d\n",
-					 service->channel, tag,
+					 service->channel, send.tag,
 					 le32_to_cpu(READ_ONCE(*ep->txbfr.rptr)),
 					 le32_to_cpu(READ_ONCE(*ep->txbfr.wptr)),
 					 le32_to_cpu(READ_ONCE(*ep->rxbfr.rptr)),
@@ -3452,7 +3504,6 @@ err_free_cmd:
 	spin_lock_irqsave(&service->lock, flags);
 	service->cmds[idx].completion = NULL;
 	bitmap_release_region(service->cmd_map, idx, 0);
-err_unlock:
 	spin_unlock_irqrestore(&service->lock, flags);
 err_free_txbuf:
 	kfree(inline_command);

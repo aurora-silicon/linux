@@ -1024,6 +1024,14 @@ struct apple_dcp {
 	 */
 	bool t8132_release_late;
 	/*
+	 * A Thunderbolt tunnel's connect sends its DPTX calls under the
+	 * provider's admission of the session's binding (cookie): see
+	 * dcp_dptx_send_gated(). Held by the connect across them.
+	 */
+	struct mutex dptx_gate_lock;
+	struct task_struct *dptx_gate_task;	/* dptx_gate_lock to write */
+	u64 dptx_gate_cookie;			/* dptx_gate_lock */
+	/*
 	 * T8132 dcpext: its display was released and its route parked for a
 	 * deep sleep (dcp_t8132_sleep_release()), to be connected again after it.
 	 */

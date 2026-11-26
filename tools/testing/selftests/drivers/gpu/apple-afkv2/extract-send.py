@@ -54,6 +54,9 @@ prefix = r'''
 #define dma_rmb() do {} while(0)
 #define dev_warn(...) do {} while(0)
 #define dev_err(...) do {} while(0)
+#ifndef ESTALE
+#define ESTALE 116
+#endif
 #define complete(p) (*(p)=1)
 /* A late reply wakes the waiters for it (afk_late_replies_pending()). */
 static unsigned int late_wakes;
@@ -84,6 +87,21 @@ struct apple_epic_service {
  int lock; unsigned int users; bool enabled,torndown; u8 cmd_tag; struct cmd_info cmds[16];
 };
 static struct apple_epic_service *active;
+/*
+ * The gate a tunnel connect puts around queueing (dcp_dptx_send_gated()):
+ * 0 lets it through, 1 refuses it as the provider does for a revoked
+ * binding, 2 runs it under the provider's lock.
+ */
+static int gate_mode;
+static bool in_gate;
+static int dcp_dptx_send_gated(struct apple_dcp_afkep *ep,int (*enqueue)(void *),void *arg)
+{
+ int ret;
+ (void)ep;
+ if(gate_mode==1) return -ESTALE;
+ in_gate=gate_mode==2;ret=enqueue(arg);in_gate=false;
+ return ret;
+}
 static unsigned int frees, sends;
 static int wire_fail, timeout, reply_status;
 static size_t owned_reply_size=32888;
@@ -125,6 +143,8 @@ static int afk_send_epic(struct apple_dcp_afkep *ep,u32 channel,u16 tag,int type
  struct cmd_info *c=&active->cmds[0];struct afkv2_command parsed;
  assert(channel==4 && type==3 && category==0x30 && subtype==0xc0);
  sends++;
+ /* Gated, the command goes out under the gate, its reply waited for after. */
+ assert(in_gate==(gate_mode==2));
  /* The payload-envelope mock bounds the command separately from its response. */
  assert(length<=128);
  if(ep->inline_v2) {
@@ -233,7 +253,17 @@ int main(void)
  assert(late_wakes==1);
  afk_recv_handle_reply(&ep,4,retained_tag,&reply,sizeof(reply));
  assert(frees==before_late+2);
- s.enabled=true;s.torndown=false;timeout=0;
+ s.enabled=true;s.torndown=false;
+timeout=0;
+ /* Gated: refused, nothing queued, no slot kept; allowed, queued under the gate. */
+ unsigned int gate_sends=sends,gate_frees=frees;
+ gate_mode=1;
+ assert(afk_send_command_timeout_len(&s,0xc0,request,112,output,32888,&status,1000,&received)==-ESTALE);
+ assert(sends==gate_sends && frees==gate_frees+2 && !s.cmd_map[0] && s.users==1);
+ gate_mode=2;
+ assert(!afk_send_command_timeout_len(&s,0xc0,request,112,output,32888,&status,1000,&received));
+ assert(sends==gate_sends+1 && !s.cmd_map[0] && s.users==1 && !in_gate);
+ gate_mode=0;
  assert(!afk_send_command_timeout_len(&s,0xc0,request,112,output,32888,&status,1000,&received));
  assert(!s.cmd_map[0] && s.users==1);
  /* J613 ext26 keeps every command's DMA: a budget bounds it, a timeout latches crashed. */
@@ -265,8 +295,17 @@ int main(void)
  puts("PASS: extracted production sender, 128-byte command envelope / 32888-byte reply, short OOB, strict/legacy callers, legacy reply lengths, compact status, actual late-ACK ownership and the ext26 budget");
 }
 '''
+def struct(name):
+    match = re.search(r"^struct " + name + r" \{\n.*?^\};\n", source, re.M | re.S)
+    if not match:
+        raise RuntimeError("production struct " + name + " not found")
+    return match.group(0) + "\n"
+
+
 bodies = [function(r"static u32 afk_compact_next_status", "compact status allocator"),
           function(r"static u16 afk_command_tag", "interface tag allocator"),
+          struct("afk_command_send").replace("struct completion *completion;", "int *completion;"),
+          function(r"static int afk_command_enqueue", "command queueing"),
           function(r"static int afk_send_command_common", "command sender"),
           function(r"static int afk_send_command_timeout_len", "length-aware sender"),
           function(r"int afk_send_command_with_reply_len", "legacy reply-length sender"),
