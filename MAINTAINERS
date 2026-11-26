@@ -2786,6 +2786,7 @@ F:	Documentation/power/apple-s2idle.rst
 F:	arch/arm64/boot/dts/apple/
 F:	drivers/bluetooth/hci_bcm4377.c
 F:	drivers/bluetooth/hci_bcm4377_test.c
+F:	tools/asahi/bcm4377-completion-tests.py
 F:	tools/asahi/bcm4377-sleep-config-tests.*
 F:	drivers/clk/clk-apple-nco.c
 F:	drivers/cpufreq/apple-soc-cpufreq.c
