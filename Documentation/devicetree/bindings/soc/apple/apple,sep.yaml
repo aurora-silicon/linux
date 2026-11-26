@@ -71,6 +71,13 @@ properties:
       The signed local boot policy of the running boot, added by the
       bootloader, for the same purpose.
 
+  apple,no-biometric-sensor:
+    type: boolean
+    description:
+      The machine has no fingerprint sensor for the SEP, though the SoC has
+      the sensor's SPI bus (a desktop without built-in Touch ID). The SEP
+      runs without biometrics.
+
   status: true
 
 required:
