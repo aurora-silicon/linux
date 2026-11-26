@@ -1399,6 +1399,67 @@ module_param_cb(diag_toggle, &pmp_diag_ulong_ops, &pmp_diag_toggle, 0644);
 MODULE_PARM_DESC(diag_toggle, "DIAGNOSTIC (T6030): PTD request bits set 5.1 s, cleared 1.07 s, in turn");
 module_param_cb(diag_feed, &pmp_diag_bool_ops, &pmp_diag_feed, 0644);
 module_param_cb(diag_dvfs, &pmp_diag_ulong_ops, &pmp_diag_dvfs, 0644);
+
+/*
+ * DIAGNOSTIC: request bits set and cleared every 28 ms in turn (a 56 ms period), as macOS 27.2's
+ * AVD request (bit 11) moves while its display runs (mac-watch-stop-3: 646 toggles, median 56 ms),
+ * kept running through the DCP's power-down as on macOS. 0 clears them and stops.
+ */
+#define PMP_DIAG_FAST_MS	28
+static unsigned long pmp_diag_fast;
+static bool pmp_diag_fast_on;
+static void pmp_diag_fast_fn(struct work_struct *work);
+static DECLARE_DELAYED_WORK(pmp_diag_fast_work, pmp_diag_fast_fn);
+
+static void pmp_diag_fast_write(struct apple_pmp_report *rep, u64 bits, bool on)
+{
+	unsigned long flags;
+	u64 cur, want;
+
+	spin_lock_irqsave(&rep->lock, flags);
+	cur = readq(rep->base + rep->offsets->tgt_read);
+	want = on ? cur | bits : cur & ~bits;
+	if (want != cur)
+		writeq(want, rep->base + rep->offsets->tgt_write);
+	spin_unlock_irqrestore(&rep->lock, flags);
+}
+
+static void pmp_diag_fast_fn(struct work_struct *work)
+{
+	struct apple_pmp_report *rep = READ_ONCE(pmp_diag_rep);
+	unsigned long bits = READ_ONCE(pmp_diag_fast);
+
+	if (!rep || !bits)
+		return;
+	pmp_diag_fast_on = !pmp_diag_fast_on;
+	pmp_diag_fast_write(rep, bits, pmp_diag_fast_on);
+	schedule_delayed_work(&pmp_diag_fast_work, msecs_to_jiffies(PMP_DIAG_FAST_MS));
+}
+
+static int pmp_diag_fast_set(const char *val, const struct kernel_param *kp)
+{
+	struct apple_pmp_report *rep = READ_ONCE(pmp_diag_rep);
+	unsigned long old = pmp_diag_fast;
+	int ret = param_set_ulong(val, kp);
+
+	if (ret || !rep)
+		return ret;
+	if (!pmp_diag_fast) {
+		cancel_delayed_work_sync(&pmp_diag_fast_work);
+		pmp_diag_fast_write(rep, old, false);
+		pmp_diag_fast_on = false;
+	} else {
+		mod_delayed_work(system_wq, &pmp_diag_fast_work, 0);
+	}
+	return 0;
+}
+
+static const struct kernel_param_ops pmp_diag_fast_ops = {
+	.set = pmp_diag_fast_set,
+	.get = param_get_ulong,
+};
+module_param_cb(diag_fast, &pmp_diag_fast_ops, &pmp_diag_fast, 0644);
+MODULE_PARM_DESC(diag_fast, "DIAGNOSTIC (T6030): PTD request bits toggled every 28 ms (macOS's AVD bit 11 rhythm)");
 MODULE_PARM_DESC(diag_dvfs, "DIAGNOSTIC (T6030): CPU DVFS request levels for +0x10900/+0x10908/+0x10918 in bytes 0/1/2, every 100 ms");
 MODULE_PARM_DESC(diag_feed, "DIAGNOSTIC (T6030): macOS's periodic PTD words +0x10b68/+0x10b70 (100 ms) and +0x10c20 (1 s)");
 
@@ -1654,6 +1715,7 @@ static void apple_pmp_start_drain(void *data)
 	if (READ_ONCE(pmp_diag_rep) == st->rep) {
 		WRITE_ONCE(pmp_diag_rep, NULL);
 		cancel_delayed_work_sync(&pmp_diag_work);
+		cancel_delayed_work_sync(&pmp_diag_fast_work);
 	}
 	if (waiters)
 		wait_for_completion(&st->waiters_done);
