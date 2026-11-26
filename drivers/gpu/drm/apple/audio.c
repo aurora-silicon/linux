@@ -113,6 +113,8 @@ struct dcp_audio {
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
 	/* Ends a stream on a replaced instance, see dcpaud_replaced_work() */
 	struct work_struct replaced_work;
+	/* replaced_work is enabled: the card is bound, see dcpaud_comp_unbind() */
+	bool replaced_enabled;
 #endif
 	void *elements;
 	void *productattrs;
@@ -2097,6 +2099,11 @@ static int dcpaud_comp_bind(struct device *dev, struct device *main, void *data)
 	ret = dcpaud_init_snd_card(dcpaud);
 
 	if (!ret) {
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+		/* Connects may queue it from now on, with a card to act on. */
+		enable_work(&dcpaud->replaced_work);
+		dcpaud->replaced_enabled = true;
+#endif
 		dcpaud_expose_debugfs_blob(dcpaud, "selected_cookie", &dcpaud->selected_cookie,
 					sizeof(dcpaud->selected_cookie));
 		dcpaud_expose_debugfs_blob(dcpaud, "elements", dcpaud->elements,
@@ -2117,7 +2124,15 @@ static void dcpaud_comp_unbind(struct device *dev, struct device *main,
 	struct dcp_audio *dcpaud = dev_get_drvdata(dev);
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
-	cancel_work_sync(&dcpaud->replaced_work);
+	/*
+	 * The DCP unbinds after its audio and may still connect: a connect
+	 * from now on queues nothing, and a queued or running work ends
+	 * before the card goes.
+	 */
+	if (dcpaud->replaced_enabled) {
+		disable_work_sync(&dcpaud->replaced_work);
+		dcpaud->replaced_enabled = false;
+	}
 #endif
 	/* snd_card_free_when_closed() checks for NULL */
 	snd_card_free_when_closed(dcpaud->card);
@@ -2188,6 +2203,8 @@ static int dcpaud_probe(struct platform_device *pdev)
 	mutex_init(&dcpaud->link_lock);
 	INIT_WORK(&dcpaud->stale_work, dcpaud_stale_work);
 	INIT_WORK(&dcpaud->replaced_work, dcpaud_replaced_work);
+	/* Enabled once the card is bound, see dcpaud_comp_bind() */
+	disable_work(&dcpaud->replaced_work);
 #endif
 	INIT_DELAYED_WORK(&dcpaud->void_work, dcpaud_void_work);
 	platform_set_drvdata(pdev, dcpaud);
