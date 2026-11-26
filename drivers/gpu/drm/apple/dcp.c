@@ -5180,20 +5180,43 @@ static const struct dcp_fabric_resume_ops dcp_resume_ops = {
 	.sample = dcp_resume_sample,
 };
 
+/*
+ * Sample fixed-HDMI HPD and reconnect DPTX port 0 (or power off / report
+ * unplug when no sink is present). Shared by initial bring-up and deep sleep
+ * recovery.
+ */
+static void dcp_fixed_hdmi_reconnect(struct apple_dcp *dcp, bool poweroff_unplugged)
+{
+	bool connected;
+	int ret;
+
+	if (dcp_is_typec_output(dcp) || !dcp->hdmi_hpd ||
+	    READ_ONCE(dcp->active_typec_route))
+		return;
+
+	/* Check HPD before enabling the edge-triggered IRQ. */
+	connected = gpiod_get_value_cansleep(dcp->hdmi_hpd);
+	dev_info(dcp->dev, "%s: DP2HDMI HPD connected:%d\n", __func__, connected);
+
+	if (connected && !READ_ONCE(dcp->hdmi_yielded)) {
+		ret = dcp_dptx_connect(dcp, 0);
+		if (ret)
+			dev_warn(dcp->dev, "HDMI DPTX connect failed: %d\n", ret);
+	} else if (!connected) {
+		if (poweroff_unplugged)
+			_dcp_poweroff(dcp);
+		else if (dcp->connector)
+			disconnected_hpd_event(dcp->connector);
+	}
+}
+
 static int dcp_enable_dp2hdmi_hpd(struct apple_dcp *dcp)
 {
 	if (dcp_is_typec_output(dcp)) {
 		if (READ_ONCE(dcp->typec_cable_connected))
 			dcp_dptx_connect(dcp, 0);
-	} else if (dcp->hdmi_hpd) {
-		/* Check HPD before enabling the edge-triggered IRQ. */
-		bool connected = gpiod_get_value_cansleep(dcp->hdmi_hpd);
-		dev_info(dcp->dev, "%s: DP2HDMI HPD connected:%d\n", __func__, connected);
-
-		if (connected && !READ_ONCE(dcp->hdmi_yielded))
-			dcp_dptx_connect(dcp, 0);
-		else if (!connected)
-			_dcp_poweroff(dcp);
+	} else {
+		dcp_fixed_hdmi_reconnect(dcp, true);
 	}
 
 	if (dcp->hdmi_hpd_irq)
@@ -9593,11 +9616,28 @@ static int dcp_s2r_stop_crashed(struct apple_dcp *dcp)
 	return 0;
 }
 
+static void dcp_s2r_hdmi_irq_disable(struct apple_dcp *dcp)
+{
+	if (dcp->hdmi_hpd_irq && !dcp->s2r_hdmi_irq_disabled) {
+		disable_irq(dcp->hdmi_hpd_irq);
+		dcp->s2r_hdmi_irq_disabled = true;
+	}
+}
+
+static void dcp_s2r_hdmi_irq_enable(struct apple_dcp *dcp)
+{
+	if (dcp->hdmi_hpd_irq && dcp->s2r_hdmi_irq_disabled) {
+		dcp->s2r_hdmi_irq_disabled = false;
+		dcp_fabric_run_resume(&dcp_resume_ops, dcp);
+	}
+}
+
 static int dcp_s2r_ext_suspend(struct apple_dcp *dcp)
 {
 	int ret;
 
 	if (READ_ONCE(dcp->s2r_fw_down)) {
+		dcp_s2r_hdmi_irq_disable(dcp);
 		dcp_s2r_stop_failed_start(dcp);
 		dcp_s2r_find_darts(dcp);
 		dcp->s2r_stopped = true;
@@ -9612,9 +9652,15 @@ static int dcp_s2r_ext_suspend(struct apple_dcp *dcp)
 		return 0;
 	}
 
-	/* No A500 and no disconnect: the link and its crossbar output just go down. */
+	/*
+	 * No A500 and no disconnect: the link and its crossbar output just go down.
+	 * If dcp_s2r_stop_crashed() fails, it calls dcp_s2r_restart_failed_stop(),
+	 * which re-enables hdmi_hpd_irq on a clean restart or leaves it disabled
+	 * while the firmware stays crashed.
+	 */
 	if (dcp_s2r_stops_crashed(dcp)) {
 		dcp_disable_typec_work(dcp, false);
+		dcp_s2r_hdmi_irq_disable(dcp);
 		dcp_typec_route_park(dcp);
 		return dcp_s2r_stop_crashed(dcp);
 	}
@@ -9625,9 +9671,11 @@ static int dcp_s2r_ext_suspend(struct apple_dcp *dcp)
 		dev_dbg(dcp->dev, "a display is attached: released for the sleep, connected again after it\n");
 
 	dcp_disable_typec_work(dcp, false);
+	dcp_s2r_hdmi_irq_disable(dcp);
 	ret = dcp_external_disconnect(dcp, false);
 	if (ret) {
 		dcp_enable_typec_work(dcp);
+		dcp_s2r_hdmi_irq_enable(dcp);
 		return ret;
 	}
 
@@ -9637,6 +9685,7 @@ static int dcp_s2r_ext_suspend(struct apple_dcp *dcp)
 	if (iomfb_queue_settle(dcp, msecs_to_jiffies(500))) {
 		iomfb_pause_presentation(dcp, false);
 		dcp_enable_typec_work(dcp);
+		dcp_s2r_hdmi_irq_enable(dcp);
 		dev_err(dcp->dev, "display updates still pending, refusing sleep\n");
 		return -EBUSY;
 	}
@@ -9649,6 +9698,7 @@ static int dcp_s2r_ext_suspend(struct apple_dcp *dcp)
 		dev_err(dcp->dev, "no reply to A500: %d\n", ret);
 		WRITE_ONCE(dcp->crashed, true);
 		dcp_typec_route_unpark(dcp);
+		/* Keep typec work and hdmi_hpd_irq disabled while firmware is crashed. */
 		return ret == -ETIMEDOUT ? -EBUSY : ret;
 	}
 	usleep_range(4000, 5000);
@@ -9660,6 +9710,7 @@ static int dcp_s2r_ext_suspend(struct apple_dcp *dcp)
 			readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS));
 		WRITE_ONCE(dcp->crashed, true);
 		dcp_typec_route_unpark(dcp);
+		/* Keep typec work and hdmi_hpd_irq disabled while firmware is crashed. */
 		return ret == -ETIMEDOUT ? -EBUSY : ret;
 	}
 
@@ -10214,6 +10265,7 @@ static void dcp_s2r_restart_done(struct apple_dcp *dcp, int ret)
 		dcp_typec_route_unpark(dcp);
 	if (ret) {
 		WRITE_ONCE(dcp->crashed, true);
+		/* Firmware stays stopped/crashed, so hdmi_hpd_irq intentionally stays disabled. */
 		dev_warn(dcp->dev, "firmware stopped for sleep, display stays off until reboot\n");
 		return;
 	}
@@ -10223,6 +10275,20 @@ static void dcp_s2r_restart_done(struct apple_dcp *dcp, int ret)
 	iomfb_pause_presentation(dcp, false);
 	if (ext && !READ_ONCE(dcp->typec_work_enabled))
 		dcp_enable_typec_work(dcp);
+	if (ext && !dcp_is_typec_output(dcp) && dcp->hdmi_hpd &&
+	    !READ_ONCE(dcp->active_typec_route)) {
+		if (dcp->external_native) {
+			dcp_fabric_hdmi_reinit(dcp, "after deep sleep");
+		} else {
+			if (dcp->hdmi_pwren)
+				gpiod_set_value_cansleep(dcp->hdmi_pwren, 1);
+			if (dcp->dp2hdmi_pwren)
+				gpiod_set_value_cansleep(dcp->dp2hdmi_pwren, 1);
+		}
+		dcp_fixed_hdmi_reconnect(dcp, false);
+	}
+	if (ext)
+		dcp_s2r_hdmi_irq_enable(dcp);
 }
 
 /*
