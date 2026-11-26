@@ -37,6 +37,13 @@ pub(crate) enum Engine {
 }
 
 impl Engine {
+    pub(crate) fn of(command: &Validated) -> Self {
+        match command {
+            Validated::Render { .. } => Self::Render,
+            Validated::Compute { .. } => Self::Compute,
+        }
+    }
+
     pub(crate) fn index(self) -> usize {
         match self {
             Self::Render => 0,
@@ -177,10 +184,7 @@ impl Packet {
     }
 
     pub(crate) fn engine(&self) -> Engine {
-        match &self.command {
-            Validated::Render { .. } => Engine::Render,
-            Validated::Compute { .. } => Engine::Compute,
-        }
+        Engine::of(&self.command)
     }
 
     /// Replay holds the device mutex. Its original inputs were satisfied before
@@ -271,6 +275,7 @@ impl Packet {
     }
     pub(crate) fn request_cancel(&self) -> bool {
         self.cancelled.store(true, Ordering::Release);
+        self.completion.clear_source_published();
         self.publication
             .compare_exchange(0, 3, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
@@ -555,6 +560,13 @@ impl super::dependency::Retention for Fences {
 }
 
 impl Fences {
+    /// The command has an ordered host publication, or writes host timestamps and so is ready
+    /// only once it has completed and the host has written them (see `Scheduler::enqueue`).
+    /// Only such a command can be a same-engine predecessor or host wait of a later one.
+    pub(crate) fn publishes(&self) -> bool {
+        self.publication.is_some() || self.ready.raw() == self.completed.raw()
+    }
+
     /// Scheduler::enqueue always supplies our explicit completion fence here.
     /// It has no polling callback, so pending frontier checks need no lock.
     pub(crate) fn status(&self) -> i32 {

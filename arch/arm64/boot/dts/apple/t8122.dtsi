@@ -558,6 +558,7 @@
 			mboxes = <&sep_mbox>;
 			mbox-names = "mbox";
 			iommus = <&sep_dart 0>;
+			power-domains = <&ps_sep>, <&ps_gpio>;
 			status = "disabled";
 		};
 
@@ -893,6 +894,41 @@
 			/* child nodes are added in t8122-pmgr.dtsi */
 		};
 
+		sleep: sleep-controller@2d0700000 {
+			compatible = "apple,t8122-sleep";
+			reg = <0x2 0xd0700000 0x0 0x14000>,
+			      <0x2 0xd0724000 0x0 0x4000>,
+			      <0x2 0xd0734000 0x0 0x10>,
+			      <0x2 0xd0768000 0x0 0x40>,
+			      <0x2 0xd0780000 0x0 0x8>,
+			      <0x2 0xe42d4000 0x0 0x4>,
+			      <0x2 0xe42b0000 0x0 0x30>,
+			      <0x2 0xe4714000 0x0 0x100>,
+			      <0x2 0xe4908000 0x0 0x100>,
+			      <0x2 0xe4004000 0x0 0x48>,
+			      <0x2 0xe4280000 0x0 0x4000>,
+			      <0x2 0x20024000 0x0 0x1000>,
+			      <0x2 0x20064000 0x0 0x1000>,
+			      <0x2 0x20158000 0x0 0x1000>,
+			      <0x2 0x20400000 0x0 0x1000>,
+			      <0x5 0x9c000000 0x0 0x2000>,
+			      <0x5 0x91000000 0x0 0x1000>,
+			      <0x5 0x9e088000 0x0 0x3000>,
+			      <0x5 0x9e000000 0x0 0x10000>,
+			      <0x5 0x9e040000 0x0 0x10000>,
+			      <0x5 0x94008000 0x0 0x5000>;
+			reg-names = "ps", "pwrgate", "cpu-start", "cllt",
+				    "cluster", "commit", "wdt", "spmi",
+				    "spmi-hpm", "wake", "ps-aon",
+				    "mcc-a", "mcc-b", "mcc-c", "mcc-d",
+				    "apcie-axi", "apcie-rc", "apcie-clkgen",
+				    "apcie-phy", "apcie-phy-ip", "apcie-port0";
+			apple,wake-enable = <155>;
+			apple,display-coprocessors = <&dcp>;
+			apple,pinctrl = <&pinctrl_ap>;
+			status = "disabled";
+		};
+
 		pmp_mbox: mbox@2d0c08000 {
 			compatible = "apple,t8122-asc-mailbox", "apple,asc-mailbox-v4";
 			reg = <0x2 0xd0c08000 0x0 0x4000>;
@@ -1141,6 +1177,17 @@
 				apple,soc-die-keys = "Tg0D", "Tg0P", "Tg0X", "Tg0b",
 						     "Tg0j", "Tg0v", "Te05", "Te0P",
 						     "Tp05", "Tp0L", "Tp0b", "Tp0r";
+				/*
+				 * SoC die limits from the ADT's /arm-io/pmp/iop-pmp-nub,
+				 * the same in the J433, J434, J504, J613 and J615 device
+				 * trees: the PMP's fast die control holds the average die
+				 * temperature at fast-die-ctrl-ts-avg-temp (100 C) and the
+				 * hottest die sensor at the fast-die-ctrl-loop target
+				 * (110 C). Power consumers shed performance from the first
+				 * and hold their lowest state at the second.
+				 */
+				apple,soc-die-passive-millicelsius = <100000>;
+				apple,soc-die-hot-millicelsius = <110000>;
 				apple,thermal-pressure-key = "mTPL";
 
 				/* CPU die temperatures, first: thermal zones index them. */

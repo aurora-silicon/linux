@@ -166,12 +166,14 @@ impl super::Registry {
     /// ACK storage belongs to the already-retained transaction, so a full event
     /// batch cannot overflow a separate cache. No allocation or wait is needed.
     pub(super) fn acknowledge_compute_exit(&mut self, cookie: u64) {
+        let mut matched = false;
         for entry in self.compute.iter_mut().flatten() {
             if let Some(mut queue) = entry.queue.as_deref_mut() {
-                if queue.acknowledge_exit(cookie) {
-                    return;
-                }
+                matched |= queue.acknowledge_exit(cookie);
             }
+        }
+        if matched {
+            return;
         }
         if self.teardown.acknowledge_render_kill(cookie) {
             RENDER_KILLS[RENDER_KILL_ACKNOWLEDGED].fetch_add(1, Ordering::Relaxed);
@@ -269,6 +271,11 @@ impl Firmware {
     }
 
     fn publish_compute_exit(&mut self, context: &Arc<Context>, age: u64, now: u64, pressed: &mut bool) -> Result {
+        // A context is killed at most once: a multi-channel context records the single kill
+        // cookie across all of its exiting channels below.
+        if context.kill_published() {
+            return Ok(());
+        }
         let Some(index) = self.queues.compute.iter().position(|entry| {
             entry
                 .as_ref()
@@ -374,8 +381,25 @@ impl Firmware {
             PRESSED_KILL_NS.store(now.max(1), Ordering::Relaxed);
         }
         queue.record_exit(cookie, now);
+        drop(queue);
+        // A single ContextKill tears down every queue of this context: attach the same
+        // cookie to any other exiting compute channel of `context` so they settle together.
+        for (other_index, entry) in self.queues.compute.iter_mut().enumerate() {
+            if other_index == index {
+                continue;
+            }
+            if let Some(mut other) = entry.as_mut().and_then(|entry| entry.queue.as_deref_mut()) {
+                if other.exit_candidate(context, age) {
+                    other.record_exit(cookie, now);
+                }
+            }
+        }
         crate::g17::trace::teardown(3, cookie, u64::from(context.id()), hold | u64::from(beside));
         fence(Ordering::SeqCst);
+        let mut queue = self.queues.compute[index]
+            .as_mut()
+            .and_then(|entry| entry.queue.as_deref_mut())
+            .ok_or(EIO)?;
         if let Err(error) = queue.announce_exit(now, || self.primary.notify(MSG_CONTROL_NOTIFY)) {
             dev_warn!(
                 self.primary.state.shared.dev.as_ref(),

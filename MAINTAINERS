@@ -2709,6 +2709,7 @@ F:	Documentation/devicetree/bindings/dma/apple,sio.yaml
 F:	Documentation/devicetree/bindings/sound/apple,*
 F:	Documentation/devicetree/bindings/sound/cirrus,cs42l84.yaml
 F:	Documentation/devicetree/bindings/sound/trivial-codec.yaml
+F:	drivers/dma/apple-sio-msg-test.c
 F:	drivers/dma/apple-sio-probe-test.c
 F:	drivers/dma/apple-sio-probe-test.dtso
 F:	drivers/dma/apple-sio-t6030-test.dtso
@@ -2785,6 +2786,7 @@ F:	Documentation/power/apple-s2idle.rst
 F:	arch/arm64/boot/dts/apple/
 F:	drivers/bluetooth/hci_bcm4377.c
 F:	drivers/bluetooth/hci_bcm4377_test.c
+F:	tools/asahi/bcm4377-completion-tests.py
 F:	tools/asahi/bcm4377-sleep-config-tests.*
 F:	drivers/clk/clk-apple-nco.c
 F:	drivers/cpufreq/apple-soc-cpufreq.c

@@ -483,3 +483,7 @@ module_platform_driver(macsmc_rtc_driver);
 MODULE_LICENSE("Dual MIT/GPL");
 MODULE_DESCRIPTION("Apple SMC RTC driver");
 MODULE_AUTHOR("Hector Martin <marcan@marcan.st>");
+
+#if IS_ENABLED(CONFIG_RTC_DRV_MACSMC_KUNIT_TEST)
+#include "rtc-macsmc-test.c"
+#endif

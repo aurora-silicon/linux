@@ -1172,6 +1172,43 @@ struct afk_compact_reply {
 	u8 data[];
 };
 
+/*
+ * Replies wait on the transmit queue for ring space that only the firmware
+ * frees, while the receive worker keeps taking calls, so what is queued
+ * needs a limit of its own. One message is at most AFK_COMPACT_MESSAGE_MAX
+ * bytes and the receive side assembles one at a time; the queued replies
+ * together get the same room. A reply is never larger than its call, so
+ * any single call fits when nothing else is queued, and the calls the
+ * firmware makes are a small fraction of that even in a burst.
+ */
+static bool afk_compact_reply_reserve(struct apple_dcp_afkep *ep, size_t size)
+{
+	guard(spinlock_irqsave)(&ep->lock);
+	if (size > AFK_COMPACT_MESSAGE_MAX ||
+	    ep->compact_reply_bytes > AFK_COMPACT_MESSAGE_MAX - size)
+		return false;
+	ep->compact_reply_bytes += size;
+	return true;
+}
+
+static void afk_compact_reply_release(struct apple_dcp_afkep *ep, size_t size)
+{
+	guard(spinlock_irqsave)(&ep->lock);
+	ep->compact_reply_bytes -= size;
+}
+
+/*
+ * A call that gets no reply leaves the firmware waiting on it, so a
+ * coordinated sleep must not run against it afterwards.
+ */
+static void afk_compact_call_unanswered(struct apple_dcp_afkep *ep)
+{
+	if (!ep->dcp->v27_sleep_transport)
+		return;
+	guard(spinlock_irqsave)(&ep->lock);
+	ep->sleep_poisoned = true;
+}
+
 static void afk_compact_reply_worker(struct work_struct *work)
 {
 	struct afk_compact_reply *r = container_of(work, struct afk_compact_reply, work);
@@ -1183,10 +1220,9 @@ static void afk_compact_reply_worker(struct work_struct *work)
 		dev_err(r->ep->dcp->dev,
 			"AFK[ep:%02x]: failed to reply to compact service call: %d\n",
 			r->ep->endpoint, ret);
-	if (ret && r->ep->dcp->v27_sleep_transport) {
-		guard(spinlock_irqsave)(&r->ep->lock);
-		r->ep->sleep_poisoned = true;
-	}
+	if (ret)
+		afk_compact_call_unanswered(r->ep);
+	afk_compact_reply_release(r->ep, r->size);
 	atomic_dec_return_release(&r->ep->sleep_jobs);
 	kvfree(r);
 }
@@ -1223,9 +1259,19 @@ static void afk_recv_handle_compact_call(struct apple_dcp_afkep *ep,
 	group = le16_to_cpu(call->group);
 	command = le32_to_cpu(call->command);
 
-	r = kvzalloc(struct_size(r, data, payload_size), GFP_KERNEL);
-	if (!r)
+	if (!afk_compact_reply_reserve(ep, payload_size)) {
+		dev_warn_ratelimited(ep->dcp->dev,
+				     "AFK[ep:%02x]: too many replies queued, dropping compact service %u call %u:%u\n",
+				     ep->endpoint, channel, group, command);
+		afk_compact_call_unanswered(ep);
 		return;
+	}
+	r = kvzalloc(struct_size(r, data, payload_size), GFP_KERNEL);
+	if (!r) {
+		afk_compact_reply_release(ep, payload_size);
+		afk_compact_call_unanswered(ep);
+		return;
+	}
 	INIT_WORK(&r->work, afk_compact_reply_worker);
 	r->ep = ep;
 	r->channel = channel;
@@ -1947,6 +1993,21 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 			dev_err(ep->dcp->dev, "AFKV2 interface %u OPEN failed: %d\n",
 				channel, ret);
 			goto free;
+		}
+	}
+	/*
+	 * Only an admitted, opened successor retires the instance it
+	 * replaces: a replacement rejected above (no slot, admission or OPEN
+	 * failure) leaves the previous instance usable by its owner.
+	 */
+	for (ch_idx = 0; ch_idx < ep->num_channels; ch_idx++) {
+		struct apple_epic_service *old = &ep->services[ch_idx];
+
+		if (old != service && afk_service_supersede(old, ops, channel)) {
+			dev_info(ep->dcp->dev,
+				 "AFK[ep:%02x]: %s on channel %u supersedes channel %u\n",
+				 ep->endpoint, service_name, channel, old->channel);
+			afk_remove_service_debugfs(old);
 		}
 	}
 	if (ops->prepare)
@@ -3575,7 +3636,7 @@ int afk_service_call_timeout_len(struct apple_epic_service *service, u16 group,
 	if (!service)
 		return -ENODEV;
 
-	bfr = kzalloc(bfr_len, GFP_KERNEL);
+	bfr = kvzalloc(bfr_len, GFP_KERNEL);
 	if (!bfr)
 		return -ENOMEM;
 
@@ -3645,7 +3706,7 @@ int afk_service_call_timeout_len(struct apple_epic_service *service, u16 group,
 	}
 
 out:
-	kfree(bfr);
+	kvfree(bfr);
 	return ret;
 }
 
@@ -3683,7 +3744,7 @@ int afk_service_call_with_reply_len(struct apple_epic_service *service,
 			       &bfr_len) || bfr_len > U32_MAX)
 		return -EOVERFLOW;
 
-	bfr = kzalloc(bfr_len, GFP_KERNEL);
+	bfr = kvzalloc(bfr_len, GFP_KERNEL);
 	if (!bfr)
 		return -ENOMEM;
 
@@ -3728,7 +3789,7 @@ int afk_service_call_with_reply_len(struct apple_epic_service *service,
 	}
 
 out:
-	kfree(bfr);
+	kvfree(bfr);
 	return ret;
 }
 

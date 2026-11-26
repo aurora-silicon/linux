@@ -223,7 +223,7 @@ static void brcmf_fweh_unregister(struct brcmf_pub *p,int e) {(void)p;(void)e;}
 static void brcmf_abort_scanning(struct brcmf_cfg80211_info *c) {(void)c;can_command();}
 static unsigned wowl_offs;
 static void brcmf_bus_wowl_config(struct brcmf_bus *b,bool e) {(void)b;if(!e)wowl_offs++;}
-static void brcmf_link_down(struct brcmf_cfg80211_vif *v,int r,bool b) {(void)v;(void)r;(void)b;can_command();}
+static bool brcmf_link_down(struct brcmf_cfg80211_vif *v,int r,bool b) {(void)v;(void)r;(void)b;can_command();return true;}
 static void brcmf_delay(int t) {(void)t;}
 static void brcmf_set_mpc(struct brcmf_if *i,int v) {(void)i;(void)v;can_command();}
 static unsigned wowl_configs;
