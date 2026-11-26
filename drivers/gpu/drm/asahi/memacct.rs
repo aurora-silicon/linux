@@ -326,8 +326,9 @@ enum Kind {
 pub(crate) struct Charge {
     kind: Kind,
     bytes: u64,
-    /// Whether the bytes are currently counted as held by the GPU.
-    held: AtomicBool,
+    /// The bytes currently counted as held: all of them while the object's whole backing is
+    /// held, fewer while only some of its pages are (CPU faults in revocable mappings).
+    held: AtomicU64,
     /// Whether the bytes are currently counted as kept resident.
     kept: AtomicBool,
 }
@@ -344,7 +345,7 @@ impl Charge {
         Self {
             kind: Kind::None,
             bytes: 0,
-            held: AtomicBool::new(false),
+            held: AtomicU64::new(0),
             kept: AtomicBool::new(false),
         }
     }
@@ -354,7 +355,7 @@ impl Charge {
         Self {
             kind: Kind::Kernel(ledger),
             bytes,
-            held: AtomicBool::new(false),
+            held: AtomicU64::new(0),
             kept: AtomicBool::new(false),
         }
     }
@@ -370,7 +371,7 @@ impl Charge {
         Self {
             kind: Kind::User { commit, mm },
             bytes,
-            held: AtomicBool::new(false),
+            held: AtomicU64::new(0),
             kept: AtomicBool::new(false),
         }
     }
@@ -381,33 +382,30 @@ impl Charge {
         Self::user(commit, mm)
     }
 
-    fn pages(&self) -> isize {
-        isize::try_from(self.bytes / PAGE_SIZE as u64).unwrap_or(isize::MAX)
-    }
-
-    fn apply(&self, held: bool) {
+    /// Counts `bytes` more as held (`held`) or as no longer held.
+    fn apply(&self, bytes: u64, held: bool) {
         match &self.kind {
             Kind::None => {}
             Kind::Kernel(ledger) => {
                 if held {
-                    ledger.kernel_resident.fetch_add(self.bytes, Ordering::AcqRel);
+                    ledger.kernel_resident.fetch_add(bytes, Ordering::AcqRel);
                 } else {
-                    sub(&ledger.kernel_resident, self.bytes);
+                    sub(&ledger.kernel_resident, bytes);
                 }
             }
             Kind::User { commit, mm } => {
                 if held {
-                    commit.client.resident.fetch_add(self.bytes, Ordering::AcqRel);
+                    commit.client.resident.fetch_add(bytes, Ordering::AcqRel);
                     commit
                         .ledger
                         .user_resident
-                        .fetch_add(self.bytes, Ordering::AcqRel);
+                        .fetch_add(bytes, Ordering::AcqRel);
                 } else {
-                    sub(&commit.client.resident, self.bytes);
-                    sub(&commit.ledger.user_resident, self.bytes);
+                    sub(&commit.client.resident, bytes);
+                    sub(&commit.ledger.user_resident, bytes);
                 }
                 if let Some(mm) = mm {
-                    let pages = self.pages();
+                    let pages = isize::try_from(bytes / PAGE_SIZE as u64).unwrap_or(isize::MAX);
                     mm.add_rss_counter(RssCounter::Shmem, if held { pages } else { -pages });
                 }
             }
@@ -432,21 +430,32 @@ impl Charge {
             ledger.refused.fetch_add(1, Ordering::Relaxed);
             return Err(ENOMEM);
         }
-        if held {
-            to.resident.fetch_add(bytes, Ordering::AcqRel);
-            sub(&commit.client.resident, bytes);
+        if held != 0 {
+            to.resident.fetch_add(held, Ordering::AcqRel);
+            sub(&commit.client.resident, held);
         }
         sub(&commit.client.committed, bytes);
         commit.client = to.clone();
         Ok(())
     }
 
-    /// Records that the GPU now holds (or no longer holds) the object's backing.
+    /// Records that all of the object's backing is now held (or none of it is).
     ///
     /// Idempotent: only a change of state is counted.
     pub(crate) fn set_held(&self, held: bool) {
-        if self.held.swap(held, Ordering::AcqRel) != held {
-            self.apply(held);
+        self.set_held_bytes(if held { self.bytes } else { 0 });
+    }
+
+    /// Records that `bytes` of the object's backing are now held, at most its size.
+    ///
+    /// Idempotent: only the difference to the bytes counted before is counted.
+    pub(crate) fn set_held_bytes(&self, bytes: u64) {
+        let bytes = bytes.min(self.bytes);
+        let before = self.held.swap(bytes, Ordering::AcqRel);
+        if bytes > before {
+            self.apply(bytes - before, true);
+        } else if before > bytes {
+            self.apply(before - bytes, false);
         }
     }
 
@@ -582,7 +591,7 @@ mod tests {
         HELD.set_limits(Limits { device: 0, client: 0 });
         let a = Client::new()?;
         let charge = Charge::user(HELD.admit(&a, 8 * MIB)?, None);
-        assert!(!charge.held.load(Ordering::Relaxed));
+        assert_eq!(charge.held.load(Ordering::Relaxed), 0);
         charge.set_held(true);
         charge.set_held(true);
         assert_eq!(a.resident(), 8 * MIB);
@@ -659,11 +668,40 @@ mod tests {
         Ok(())
     }
 
+    static PART: Ledger = Ledger::new();
+
+    #[test]
+    fn some_pages_are_charged_as_they_are_held() -> Result {
+        const PAGE: u64 = PAGE_SIZE as u64;
+        PART.set_limits(Limits { device: 0, client: 0 });
+        let a = Client::new()?;
+        let charge = Charge::user(PART.admit(&a, 8 * PAGE)?, None);
+        // Pages held one by one, as CPU faults in a revocable mapping hold them.
+        charge.set_held_bytes(PAGE);
+        charge.set_held_bytes(2 * PAGE);
+        assert_eq!(a.resident(), 2 * PAGE);
+        assert_eq!(PART.user_resident.load(Ordering::Relaxed), 2 * PAGE);
+        // All of the backing, then some of it again; never more than the object's size.
+        charge.set_held(true);
+        assert_eq!(a.resident(), 8 * PAGE);
+        charge.set_held_bytes(16 * PAGE);
+        assert_eq!(a.resident(), 8 * PAGE);
+        charge.set_held_bytes(3 * PAGE);
+        assert_eq!(a.resident(), 3 * PAGE);
+        charge.set_held_bytes(3 * PAGE);
+        assert_eq!(PART.user_resident.load(Ordering::Relaxed), 3 * PAGE);
+        // Freeing the object uncharges what it held.
+        drop(charge);
+        assert_eq!(a.resident(), 0);
+        assert_eq!(PART.user_resident.load(Ordering::Relaxed), 0);
+        Ok(())
+    }
+
     #[test]
     fn imports_are_not_counted() {
         let charge = Charge::none();
         charge.set_held(true);
-        assert!(charge.held.load(Ordering::Relaxed));
+        assert_eq!(charge.held.load(Ordering::Relaxed), 0);
         drop(charge);
     }
 
