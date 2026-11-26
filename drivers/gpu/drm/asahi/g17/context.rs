@@ -279,20 +279,22 @@ impl Context {
         } else {
             mmu::PROT_GPU_FW_SHARED_RW
         };
+        // The scheduler page sits in the upper half, which every execution context includes,
+        // and only the firmware reads and writes it: it is firmware-only.
         let mut scheduler = if alloc.uat.is_m5() {
             SchedulerStorage::Retained(pool.allocate(
                 alloc,
                 Family::Scheduler,
                 UAT_PGSZ,
                 0,
-                kernel_prot,
+                mmu::PROT_FW_SHARED_RW,
                 CpuMap::WriteCombined,
             )?)
         } else {
             SchedulerStorage::Ordinary(alloc.kernel(
                 UAT_PGSZ,
                 UAT_PGSZ as u64,
-                mmu::PROT_GPU_FW_SHARED_RW,
+                mmu::PROT_FW_SHARED_RW,
                 CpuMap::WriteCombined,
             )?)
         };
