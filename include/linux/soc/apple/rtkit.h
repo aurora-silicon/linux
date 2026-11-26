@@ -423,6 +423,13 @@ int apple_rtkit_sleep_stop(struct apple_rtkit *rtk, void __iomem *cpu_control);
  * @cpu_control: the ASC's CPU control register.
  */
 int apple_rtkit_sleep_return(struct apple_rtkit *rtk, void __iomem *cpu_control);
+/*
+ * Real-sleep wake for auto-booting firmware whose RX IRQ was held across sleep
+ * (via apple_rtkit_hold_rx()): arms warm restart and I2A receive without writing
+ * CPU_CONTROL_RUN, releases RX so the queued HELLO runs under warm_restart, then
+ * completes boot.
+ */
+int apple_rtkit_sleep_return_held(struct apple_rtkit *rtk);
 
 /*
  * A start as after a real sleep, for a co-processor its driver power-cycled without one:

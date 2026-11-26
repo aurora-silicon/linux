@@ -3537,6 +3537,19 @@ int apple_rtkit_sleep_return(struct apple_rtkit *rtk, void __iomem *cpu_control)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_sleep_return);
 
+int apple_rtkit_sleep_return_held(struct apple_rtkit *rtk)
+{
+	int ret;
+
+	ret = apple_rtkit_warm_restart(rtk);
+	apple_rtkit_resume_rx(rtk);
+	if (ret)
+		return ret;
+
+	return apple_rtkit_boot(rtk);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_sleep_return_held);
+
 int apple_rtkit_power_cycled_return(struct apple_rtkit *rtk, void __iomem *cpu_control)
 {
 	int ret = apple_rtkit_warm_restart(rtk);

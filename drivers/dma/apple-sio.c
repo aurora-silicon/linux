@@ -199,6 +199,7 @@ struct sio_data {
 	bool tables_mismatch;
 	bool commit_registered;
 	bool commit_used;
+	bool rx_held;
 	u32 protocol;
 	/* The channel configuration's threshold and limit words */
 	u32 fifo_threshold;
@@ -2281,6 +2282,10 @@ static __maybe_unused int sio_suspend_late(struct device *dev)
 	}
 
 	if (sio->commit_registered && apple_sleep_commit_stops_coprocs()) {
+		if (sio->hw->commit_no_cpu_down) {
+			apple_rtkit_hold_rx(sio->rtk);
+			sio->rx_held = true;
+		}
 		apple_sleep_coproc_set_ready(dev, true);
 		/*
 		 * The commit stops it, through its ASC and mailbox, after the noirq
@@ -2332,6 +2337,10 @@ static __maybe_unused int sio_resume_early(struct device *dev)
 		sio->commit_used = false;
 		apple_sleep_coproc_set_ready(dev, false);
 		if (!pm_resume_via_firmware() && !stopped) {
+			if (sio->rx_held) {
+				sio->rx_held = false;
+				apple_rtkit_resume_rx(sio->rtk);
+			}
 			sio->asleep = false;
 			return 0;
 		}
@@ -2344,6 +2353,10 @@ static __maybe_unused int sio_resume_early(struct device *dev)
 	 * restarts it (S); if that fails it stays stopped until the next real sleep.
 	 */
 	if (!pm_resume_via_firmware()) {
+		if (sio->rx_held) {
+			sio->rx_held = false;
+			apple_rtkit_resume_rx(sio->rtk);
+		}
 		if (!apple_rtkit_sleep_return(sio->rtk, sio->base + REG_CPU_CONTROL)) {
 			sio->asleep = false;
 			return 0;
@@ -2362,7 +2375,12 @@ static __maybe_unused int sio_resume_early(struct device *dev)
 		return 0;
 	}
 	/* Endpoints and parameters stay with the firmware: nothing is sent again. */
-	ret = apple_rtkit_sleep_return(sio->rtk, sio->base + REG_CPU_CONTROL);
+	if (sio->rx_held) {
+		sio->rx_held = false;
+		ret = apple_rtkit_sleep_return_held(sio->rtk);
+	} else {
+		ret = apple_rtkit_sleep_return(sio->rtk, sio->base + REG_CPU_CONTROL);
+	}
 	t6050 = sio->hw == &sio_hw_t6050;
 	if (ret) {
 		/* Still down: the next sleep restarts it, or resets it if refused. */

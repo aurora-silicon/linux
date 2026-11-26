@@ -167,7 +167,7 @@ EXPORT_SYMBOL_GPL(apple_pmp_t6030_gpu_ready);
  * still running, and the GPU's request, withdrawn at the commit, reaches a running PMP.
  */
 static struct apple_pmp_commit_stop pmp_commit;
-static bool pmp_commit_registered, pmp_commit_used;
+static bool pmp_commit_registered, pmp_commit_used, pmp_rx_held;
 
 /* Interrupts off, one CPU: what apple_pmp_sleep() does, through pointers taken before. */
 static int apple_pmp_commit_stop_fn(void *unused)
@@ -255,6 +255,16 @@ static int apple_pmp_commit_prepare(struct device *dev)
 	ret = apple_pmp_sleep_prepare(pmp_data, &pmp_commit);
 	if (ret)
 		return ret;
+	/*
+	 * On T6030, the PMP auto-boots when its power domain rises during
+	 * platform wake, before resume_early runs. Hold RX across the sleep so
+	 * HELLO stays queued until apple_pmp_resume_early() arms warm_restart
+	 * and apple-dart has restored pmp_dart in resume_noirq.
+	 */
+	if (of_device_is_compatible(dev->of_node, "apple,t6030-pmp-v2") && pmp_commit.rtk) {
+		apple_rtkit_hold_rx(pmp_commit.rtk);
+		pmp_rx_held = true;
+	}
 	apple_sleep_coproc_set_ready(dev, true);
 	pmp_commit_used = true;
 	dev_dbg(dev, "idle and stop left for the sleep's commit\n");
@@ -304,6 +314,10 @@ static int apple_pmp_resume_early(struct device *dev)
 		pmp_commit_used = false;
 		apple_sleep_coproc_set_ready(dev, false);
 		if (!pm_resume_via_firmware() && !stopped) {
+			if (pmp_rx_held) {
+				pmp_rx_held = false;
+				apple_rtkit_resume_rx(pmp_commit.rtk);
+			}
 			pmp_asleep = false;
 			apple_pmp_report_wake(dev, true);
 			dev_info(dev, "sleep refused before the commit: firmware never stopped\n");
@@ -312,11 +326,20 @@ static int apple_pmp_resume_early(struct device *dev)
 	}
 	/* A stopped firmware doesn't restart with its power kept: the next real sleep does. */
 	if (!pm_resume_via_firmware()) {
+		if (pmp_rx_held) {
+			pmp_rx_held = false;
+			apple_rtkit_resume_rx(pmp_commit.rtk);
+		}
 		dev_warn(dev, "sleep refused: firmware stays stopped until a real sleep\n");
 		return 0;
 	}
 	pmp_asleep = false;
-	ret = apple_pmp_wake(pmp_data);
+	if (pmp_rx_held) {
+		pmp_rx_held = false;
+		ret = apple_rtkit_sleep_return_held(pmp_commit.rtk);
+	} else {
+		ret = apple_pmp_wake(pmp_data);
+	}
 	if (ret)
 		dev_err(dev, "firmware did not come back from sleep: %d\n", ret);
 	else

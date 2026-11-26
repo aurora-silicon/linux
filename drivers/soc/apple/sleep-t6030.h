@@ -2045,10 +2045,24 @@ struct t6030_wake_write {
 	u32 val;
 };
 
-static const struct t6030_wake_write t6030_wake_afr[] = {
-	{ 0x100, 0xf00000f },
-	{ 0x100, 0x1f00000f },
-};
+#define T6030_PS_GPU_AFR		0x100
+#define T6030_PS_GPU_AFR_ON		0xf00000f
+#define T6030_PS_GPU_AFR_AUTO		0x1f00000f
+
+static void t6030_wake_afr_on(struct apple_sleep *s)
+{
+	void __iomem *gpu = t6030_state(s)->blk[T6030_BLK_PS_GPU];
+	u32 val;
+
+	if (!gpu)
+		return;
+	writel(T6030_PS_GPU_AFR_ON, gpu + T6030_PS_GPU_AFR);
+	if (readl_poll_timeout_atomic(gpu + T6030_PS_GPU_AFR, val,
+				      FIELD_GET(PS_ACTUAL, val) == 0xf, 1, 2000))
+		dev_warn(s->dev, "T6030 wake: AFR power word not on: %#x\n", val);
+	writel(T6030_PS_GPU_AFR_AUTO, gpu + T6030_PS_GPU_AFR);
+	readl(gpu + T6030_PS_GPU_AFR);
+}
 
 static const struct t6030_wake_write t6030_wake_lowered[] = {
 	{ 0x5b8, 0xf000340 },
@@ -2293,8 +2307,11 @@ static void t6030_sleep_wake(struct apple_sleep *s)
 	unsigned int i;
 
 	sleep_note(s, 0x70);
-	for (i = 0; i < T6030_WAKE_WORDS; i++)
+	for (i = 0; i < T6030_WAKE_WORDS; i++) {
 		t->wake_status[i] = readl(s->wake + T6030_WAKE_STATUS + 4 * i);
+		if (i < ARRAY_SIZE(s->wake_status))
+			s->wake_status[i] = t->wake_status[i];
+	}
 	t6030_sleep_wake_seq(s, &t->wake_early, "apple,seq-wake-early");
 	sleep_note(s, 0x71);
 	/* SIO_CPU is in both lists: its value before the lowering is the one before the entry */
@@ -2310,7 +2327,7 @@ static void t6030_sleep_wake(struct apple_sleep *s)
 	sleep_ps_rewake_words(s, &t6030_wake_early_words, false);
 	/* None of the memory side's registers before every early word is on */
 	sleep_ps_rewake_settle(s);
-	t6030_wake_gpu_writes(s, t6030_wake_afr, ARRAY_SIZE(t6030_wake_afr));
+	t6030_wake_afr_on(s);
 	t6030_wake_lower(s);
 	t6030_wake_gpu_writes(s, t6030_wake_gpu, ARRAY_SIZE(t6030_wake_gpu));
 	if (READ_ONCE(t6030_diag_mask_steps) && t6030_ptd_update) {
