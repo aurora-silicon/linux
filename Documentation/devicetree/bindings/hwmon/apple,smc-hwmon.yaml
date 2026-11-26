@@ -121,7 +121,11 @@ properties:
     const: 1
     description:
       The cell is the zero-based index of a temperature channel, counting
-      the temperature-* child nodes in order.
+      the temperature-* child nodes in order. With
+      apple,discover-temperatures, whose channel indices are not stable, the
+      only sensor is 1000, the hottest of the apple,soc-die-keys readings.
+      A thermal zone on it comes in addition to the macsmc_soc_die zone,
+      which is still registered for the users that look it up by name.
 
   "#cooling-cells":
     const: 3
