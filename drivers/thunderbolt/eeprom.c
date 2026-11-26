@@ -348,6 +348,13 @@ static int tb_drom_parse_entry_generic(struct tb_switch *sw,
 		const struct tb_drom_entry_desc *desc =
 			(const struct tb_drom_entry_desc *)entry;
 
+		/* Only the IDs are read; sizeof() would count the padding */
+		if (header->len < offsetofend(struct tb_drom_entry_desc, idProduct)) {
+			tb_sw_warn(sw, "product descriptor entry too short (%u bytes), ignoring\n",
+				   header->len);
+			break;
+		}
+
 		if (!sw->vendor && !sw->device) {
 			sw->vendor = desc->idVendor;
 			sw->device = desc->idProduct;
@@ -668,6 +675,13 @@ static int tb_drom_parse(struct tb_switch *sw, u16 size)
 	const struct tb_drom_header *header = (const void *)sw->drom;
 	int ret;
 
+	/* The USB4 header is the shorter one, and holds the revision and length */
+	if (size < USB4_DROM_HEADER_SIZE) {
+		tb_sw_warn(sw, "DROM too small (%u bytes)\n", size);
+		ret = -EIO;
+		goto err;
+	}
+
 	if (header->data_len + TB_DROM_DATA_START != size) {
 		tb_sw_warn(sw, "DROM size mismatch\n");
 		ret = -EIO;
@@ -685,6 +699,11 @@ static int tb_drom_parse(struct tb_switch *sw, u16 size)
 			   header->device_rom_revision);
 		fallthrough;
 	case 1:
+		if (size < TB_DROM_HEADER_SIZE) {
+			tb_sw_warn(sw, "DROM too small for its header (%u bytes)\n", size);
+			ret = -EIO;
+			break;
+		}
 		ret = tb_drom_parse_v1(sw);
 		break;
 	}
