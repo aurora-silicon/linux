@@ -399,6 +399,151 @@ static void spihid_test_mngt_report_desc(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ctx->spihid->mngt.hid_desc_len, 0);
 }
 
+/*
+ * A transport that logs what the core asks of it. Its disable_irq() stands
+ * for the real one, which returns only after the threaded handler has run.
+ */
+struct spihid_test_ops {
+	struct spihid_apple_ops ops;
+	struct spihid_test *ctx;
+	struct spi_device *spi;
+	char log[64];
+	size_t log_len;
+	bool boot;		/* enable_irq() delivers the boot message */
+	int irq_enabled;
+	bool hid_at_irq_off;	/* a HID device still existed at disable_irq() */
+	int power_at_irq_off;
+};
+
+#define to_spihid_test_ops(o) container_of(o, struct spihid_test_ops, ops)
+
+static void spihid_test_log(struct spihid_test_ops *t, const char *what)
+{
+	t->log_len += scnprintf(t->log + t->log_len, sizeof(t->log) - t->log_len,
+				"%s ", what);
+}
+
+static int spihid_test_power_on(struct spihid_apple_ops *ops)
+{
+	spihid_test_log(to_spihid_test_ops(ops), "on");
+	return 0;
+}
+
+static int spihid_test_power_off(struct spihid_apple_ops *ops)
+{
+	spihid_test_log(to_spihid_test_ops(ops), "off");
+	return 0;
+}
+
+static int spihid_test_enable_irq(struct spihid_apple_ops *ops)
+{
+	struct spihid_test_ops *t = to_spihid_test_ops(ops);
+	struct spihid_apple *spihid = spi_get_drvdata(t->spi);
+
+	spihid_test_log(t, "irq-on");
+	t->irq_enabled++;
+	if (t->boot) {
+		/* The fake controller now answers this state's transfers. */
+		t->ctx->spihid = spihid;
+		spihid->status_booted = true;
+		wake_up_interruptible(&spihid->wait);
+	}
+	return 0;
+}
+
+static int spihid_test_disable_irq(struct spihid_apple_ops *ops)
+{
+	struct spihid_test_ops *t = to_spihid_test_ops(ops);
+	struct spihid_apple *spihid = spi_get_drvdata(t->spi);
+
+	spihid_test_log(t, "irq-off");
+	t->irq_enabled--;
+	t->hid_at_irq_off = spihid->kbd.hid || spihid->tp.hid || spihid->aux.hid;
+	t->power_at_irq_off = atomic_read(&spihid->power);
+	return 0;
+}
+
+static struct spihid_test_ops *spihid_test_ops_init(struct kunit *test,
+						    struct spi_device *spi)
+{
+	struct spihid_test_ops *t = kunit_kzalloc(test, sizeof(*t), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, t);
+	t->ctx = test->priv;
+	t->spi = spi;
+	t->ops.power_on = spihid_test_power_on;
+	t->ops.power_off = spihid_test_power_off;
+	t->ops.enable_irq = spihid_test_enable_irq;
+	t->ops.disable_irq = spihid_test_disable_irq;
+	return t;
+}
+
+/*
+ * The IRQ is requested before the core's device-managed state, so devres
+ * frees that state first when probe fails. A probe that fails after it
+ * enabled the IRQ must have stopped the handler and powered the controller
+ * off by the time it returns.
+ */
+static void spihid_test_probe_fails(struct kunit *test, bool boot)
+{
+	struct spihid_test *ctx = test->priv;
+	struct spihid_apple *orig = ctx->spihid;
+	struct spi_device *spi = orig->spidev;
+	struct spihid_test_ops *t = spihid_test_ops_init(test, spi);
+	void *group;
+	int ret;
+
+	t->boot = boot;
+	group = devres_open_group(&spi->dev, NULL, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, group);
+
+	ret = spihid_apple_core_probe(spi, &t->ops);
+
+	KUNIT_EXPECT_EQ(test, ret, -ENODEV);
+	KUNIT_EXPECT_STREQ(test, t->log, "on irq-on irq-off off ");
+	KUNIT_EXPECT_EQ(test, t->irq_enabled, 0);
+	KUNIT_EXPECT_EQ(test, t->power_at_irq_off, SPIHID_PWR_OFF);
+
+	ctx->spihid = orig;
+	spi_set_drvdata(spi, orig);
+	devres_release_group(&spi->dev, group);
+}
+
+/* No boot message: probe gives up waiting for the device to boot. */
+static void spihid_test_probe_boot_timeout(struct kunit *test)
+{
+	spihid_test_probe_fails(test, false);
+}
+
+/* Booted, but the device information never comes. */
+static void spihid_test_probe_info_timeout(struct kunit *test)
+{
+	spihid_test_probe_fails(test, true);
+}
+
+/* Remove stops the IRQ, and with it report delivery, before the HID devices go. */
+static void spihid_test_remove_irq_first(struct kunit *test)
+{
+	struct spihid_test *ctx = test->priv;
+	struct spihid_apple *spihid = ctx->spihid;
+	struct spihid_test_ops *t = spihid_test_ops_init(test, spihid->spidev);
+
+	spihid->ops = &t->ops;
+	spi_set_drvdata(spihid->spidev, spihid);
+	spihid->kbd.hid = hid_allocate_device();
+	KUNIT_ASSERT_FALSE(test, IS_ERR(spihid->kbd.hid));
+	spihid->tp.hid = hid_allocate_device();
+	KUNIT_ASSERT_FALSE(test, IS_ERR(spihid->tp.hid));
+
+	spihid_apple_core_remove(spihid->spidev);
+
+	KUNIT_EXPECT_STREQ(test, t->log, "irq-off off ");
+	KUNIT_EXPECT_TRUE(test, t->hid_at_irq_off);
+	KUNIT_EXPECT_EQ(test, t->power_at_irq_off, SPIHID_PWR_OFF);
+	KUNIT_EXPECT_NULL(test, spihid->kbd.hid);
+	KUNIT_EXPECT_NULL(test, spihid->tp.hid);
+}
+
 static struct kunit_case spihid_test_cases[] = {
 	KUNIT_CASE(spihid_test_bad_status),
 	KUNIT_CASE(spihid_test_later_get_bad_status),
@@ -412,6 +557,9 @@ static struct kunit_case spihid_test_cases[] = {
 	KUNIT_CASE(spihid_test_oversized_message),
 	KUNIT_CASE(spihid_test_max_message),
 	KUNIT_CASE(spihid_test_mngt_report_desc),
+	KUNIT_CASE(spihid_test_probe_boot_timeout),
+	KUNIT_CASE(spihid_test_probe_info_timeout),
+	KUNIT_CASE(spihid_test_remove_irq_first),
 	{}
 };
 

@@ -1153,6 +1153,31 @@ static void spihid_destroy_hid_device(struct spihid_interface *iface)
 	iface->ready = false;
 }
 
+/*
+ * Quiesce the device before its state goes: refuse new transfers, wait out
+ * the threaded IRQ handler, which reads into rx_buf and registers and feeds
+ * the HID devices, destroy those, then power the controller off. The IRQ is
+ * requested before this driver's device-managed state, so devres frees that
+ * state first; nothing may still run on it by then.
+ */
+static void spihid_apple_core_stop(struct spihid_apple *spihid)
+{
+	/*
+	 * hid_destroy_device() cancels led_work, which calls back into
+	 * spihid_apple_request(). Refuse that transfer. Power stays on
+	 * until power_off() below.
+	 */
+	spihid_set_power(spihid, SPIHID_PWR_OFF);
+
+	spihid->ops->disable_irq(spihid->ops);
+
+	spihid_destroy_hid_device(&spihid->aux);
+	spihid_destroy_hid_device(&spihid->tp);
+	spihid_destroy_hid_device(&spihid->kbd);
+
+	spihid->ops->power_off(spihid->ops);
+}
+
 int spihid_apple_core_probe(struct spi_device *spi, struct spihid_apple_ops *ops)
 {
 	struct device *dev = &spi->dev;
@@ -1222,7 +1247,7 @@ int spihid_apple_core_probe(struct spi_device *spi, struct spihid_apple_ops *ops
 		err = -ENODEV;
 	if (err < 0) {
 		dev_err(dev, "waiting for device boot failed: %d", err);
-		goto error;
+		goto err_stop;
 	}
 
 	spihid_set_power(spihid, SPIHID_PWR_ON);
@@ -1246,7 +1271,7 @@ int spihid_apple_core_probe(struct spi_device *spi, struct spihid_apple_ops *ops
 		err = -ENODEV;
 	if (err < 0) {
 		dev_err(dev, "waiting for device info failed: %d", err);
-		goto error;
+		goto err_stop;
 	}
 
 	/* request interface information */
@@ -1275,6 +1300,8 @@ int spihid_apple_core_probe(struct spi_device *spi, struct spihid_apple_ops *ops
 	}
 
 	return 0;
+err_stop:
+	spihid_apple_core_stop(spihid);
 error:
 	return err;
 }
@@ -1282,26 +1309,7 @@ EXPORT_SYMBOL_GPL(spihid_apple_core_probe);
 
 void spihid_apple_core_remove(struct spi_device *spi)
 {
-	struct spihid_apple *spihid = spi_get_drvdata(spi);
-
-	/*
-	 * hid_destroy_device() cancels led_work, which calls back into
-	 * spihid_apple_request(). Refuse that transfer. Power stays on
-	 * until power_off() below.
-	 */
-	spihid_set_power(spihid, SPIHID_PWR_OFF);
-
-	/* destroy input devices */
-
-	spihid_destroy_hid_device(&spihid->aux);
-	spihid_destroy_hid_device(&spihid->tp);
-	spihid_destroy_hid_device(&spihid->kbd);
-
-	/* disable irq */
-	spihid->ops->disable_irq(spihid->ops);
-
-	/* power SPI device down */
-	spihid->ops->power_off(spihid->ops);
+	spihid_apple_core_stop(spi_get_drvdata(spi));
 }
 EXPORT_SYMBOL_GPL(spihid_apple_core_remove);
 
