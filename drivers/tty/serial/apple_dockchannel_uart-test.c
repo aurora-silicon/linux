@@ -674,6 +674,254 @@ static void dcut_drain_timer_no_reader(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ctx->rx_ncounts, 0);
 }
 
+static void dcut_drain_timer_idle_backoff(struct kunit *test)
+{
+	struct dcut_ctx *ctx = test->priv;
+	struct dcuart_port *dc = &ctx->dcuart;
+	const unsigned int expected[] = { 20, 40, 80, SW_DRAIN_IDLE_MS, SW_DRAIN_IDLE_MS };
+	unsigned int got_ms;
+	bool pending;
+	int ret;
+	size_t i;
+
+	dc->sw_drain = true;
+	local_bh_disable();
+	ret = dcuart_startup(&dc->port);
+	got_ms = dc->drain_ms;
+	pending = timer_pending(&dc->drain_timer);
+	timer_delete(&dc->drain_timer);
+	local_bh_enable();
+	timer_delete_sync(&dc->drain_timer);
+
+	KUNIT_EXPECT_EQ(test, ret, 0);
+	KUNIT_EXPECT_TRUE(test, pending);
+	KUNIT_EXPECT_EQ(test, got_ms, SW_DRAIN_MS);
+
+	for (i = 0; i < ARRAY_SIZE(expected); i++) {
+		local_bh_disable();
+		dcuart_drain_timer(&dc->drain_timer);
+		got_ms = dc->drain_ms;
+		pending = timer_pending(&dc->drain_timer);
+		timer_delete(&dc->drain_timer);
+		local_bh_enable();
+		timer_delete_sync(&dc->drain_timer);
+
+		KUNIT_EXPECT_EQ(test, got_ms, expected[i]);
+		KUNIT_EXPECT_TRUE(test, pending);
+	}
+
+	/* Receiving a byte snaps polling back to SW_DRAIN_MS. */
+	dcut_queue_rx(ctx, 1, 1);
+	local_bh_disable();
+	dcuart_drain_timer(&dc->drain_timer);
+	got_ms = dc->drain_ms;
+	pending = timer_pending(&dc->drain_timer);
+	timer_delete(&dc->drain_timer);
+	local_bh_enable();
+	timer_delete_sync(&dc->drain_timer);
+
+	KUNIT_EXPECT_EQ(test, dc->port.icount.rx, 1);
+	KUNIT_EXPECT_EQ(test, got_ms, SW_DRAIN_MS);
+	KUNIT_EXPECT_TRUE(test, pending);
+
+	dcuart_shutdown(&dc->port);
+	KUNIT_EXPECT_FALSE(test, timer_pending(&dc->drain_timer));
+}
+
+static void dcut_drain_timer_closed_console(struct kunit *test)
+{
+	struct dcut_ctx *ctx = test->priv;
+	struct dcuart_port *dc = &ctx->dcuart;
+	unsigned long before, after, expires;
+	unsigned int got_ms;
+	bool pending;
+
+	dc->sw_drain = true;
+	ctx->state->port.console = true;
+	KUNIT_EXPECT_EQ(test, dcuart_startup(&dc->port), 0);
+	timer_delete_sync(&dc->drain_timer);
+
+	/* No tty open: skip RX MMIO and stop the drain timer completely. */
+	dcut_queue_rx(ctx, 2, 2);
+	dcuart_drain_timer(&dc->drain_timer);
+	KUNIT_EXPECT_EQ(test, ctx->rx_ncounts, 0);
+	KUNIT_EXPECT_EQ(test, dc->port.icount.rx, 0);
+	KUNIT_EXPECT_FALSE(test, timer_pending(&dc->drain_timer));
+
+	/* Reopen restarts polling immediately at SW_DRAIN_MS via start_rx(). */
+	ctx->state->port.count = 1;
+	local_bh_disable();
+	before = jiffies;
+	dcuart_start_rx(&dc->port);
+	after = jiffies;
+	pending = timer_pending(&dc->drain_timer);
+	got_ms = dc->drain_ms;
+	expires = dc->drain_timer.expires;
+	timer_delete(&dc->drain_timer);
+	local_bh_enable();
+	timer_delete_sync(&dc->drain_timer);
+
+	KUNIT_EXPECT_TRUE(test, pending);
+	KUNIT_EXPECT_EQ(test, got_ms, SW_DRAIN_MS);
+	KUNIT_EXPECT_TRUE(test, time_before_eq(expires,
+					       after + msecs_to_jiffies(SW_DRAIN_MS)));
+	KUNIT_EXPECT_TRUE(test, time_after_eq(expires, before));
+
+	/* Next callback drains the buffered bytes and stays at SW_DRAIN_MS. */
+	local_bh_disable();
+	dcuart_drain_timer(&dc->drain_timer);
+	got_ms = dc->drain_ms;
+	pending = timer_pending(&dc->drain_timer);
+	timer_delete(&dc->drain_timer);
+	local_bh_enable();
+	timer_delete_sync(&dc->drain_timer);
+
+	KUNIT_EXPECT_EQ(test, dc->port.icount.rx, 2);
+	KUNIT_EXPECT_EQ(test, got_ms, SW_DRAIN_MS);
+	KUNIT_EXPECT_TRUE(test, pending);
+
+	/* stop_rx() pauses polling and start_rx() resumes it. */
+	dcuart_stop_rx(&dc->port);
+	KUNIT_EXPECT_FALSE(test, timer_pending(&dc->drain_timer));
+	dcuart_drain_timer(&dc->drain_timer);
+	KUNIT_EXPECT_FALSE(test, timer_pending(&dc->drain_timer));
+	local_bh_disable();
+	dcuart_start_rx(&dc->port);
+	pending = timer_pending(&dc->drain_timer);
+	timer_delete(&dc->drain_timer);
+	local_bh_enable();
+	timer_delete_sync(&dc->drain_timer);
+	KUNIT_EXPECT_TRUE(test, pending);
+
+	dcuart_shutdown(&dc->port);
+	KUNIT_EXPECT_FALSE(test, timer_pending(&dc->drain_timer));
+}
+
+static void dcut_shutdown_blocks_rearm(struct kunit *test)
+{
+	struct dcut_ctx *ctx = test->priv;
+	struct dcuart_port *dc = &ctx->dcuart;
+
+	dc->sw_drain = true;
+	dc->never_wait = true;
+	KUNIT_EXPECT_EQ(test, dcuart_startup(&dc->port), 0);
+	dcuart_shutdown(&dc->port);
+	KUNIT_EXPECT_FALSE(test, timer_pending(&dc->drain_timer));
+
+	/* A racing timer callback, TX kick, or start_rx must not re-arm. */
+	dcut_queue_tx(ctx, "abc");
+	ctx->tx_room = 0;
+	dcuart_drain_timer(&dc->drain_timer);
+	KUNIT_EXPECT_FALSE(test, timer_pending(&dc->drain_timer));
+	dcuart_start_tx(&dc->port);
+	KUNIT_EXPECT_FALSE(test, timer_pending(&dc->drain_timer));
+	dcuart_start_rx(&dc->port);
+	KUNIT_EXPECT_FALSE(test, timer_pending(&dc->drain_timer));
+
+	/* Re-starting the port clears shutting_down and resumes polling. */
+	KUNIT_EXPECT_EQ(test, dcuart_startup(&dc->port), 0);
+	KUNIT_EXPECT_TRUE(test, timer_pending(&dc->drain_timer));
+	dcuart_shutdown(&dc->port);
+}
+
+static void dcut_start_tx_shortens_backoff(struct kunit *test)
+{
+	struct dcut_ctx *ctx = test->priv;
+	struct dcuart_port *dc = &ctx->dcuart;
+	unsigned long backed_off_expires, tx_expires;
+	unsigned int backed_off_ms, tx_ms, gen_before, gen_after;
+	bool backed_off_pending, tx_pending;
+	int i, ret;
+
+	dc->sw_drain = true;
+	dc->never_wait = true;
+	local_bh_disable();
+	ret = dcuart_startup(&dc->port);
+	timer_delete(&dc->drain_timer);
+	local_bh_enable();
+	timer_delete_sync(&dc->drain_timer);
+	KUNIT_EXPECT_EQ(test, ret, 0);
+
+	/* Drive real backoff up to SW_DRAIN_IDLE_MS so expires reflects 100 ms. */
+	local_bh_disable();
+	for (i = 0; i < 4; i++) {
+		dcuart_drain_timer(&dc->drain_timer);
+		if (i < 3)
+			timer_delete(&dc->drain_timer);
+	}
+	backed_off_ms = dc->drain_ms;
+	backed_off_pending = timer_pending(&dc->drain_timer);
+	backed_off_expires = dc->drain_timer.expires;
+	gen_before = dc->drain_kick_gen;
+
+	dcut_queue_tx(ctx, "hello");
+	ctx->tx_room = 2;
+	dcuart_start_tx(&dc->port);
+	tx_ms = dc->drain_ms;
+	gen_after = dc->drain_kick_gen;
+	tx_pending = timer_pending(&dc->drain_timer);
+	tx_expires = dc->drain_timer.expires;
+	timer_delete(&dc->drain_timer);
+	local_bh_enable();
+	timer_delete_sync(&dc->drain_timer);
+
+	KUNIT_EXPECT_EQ(test, backed_off_ms, SW_DRAIN_IDLE_MS);
+	KUNIT_EXPECT_TRUE(test, backed_off_pending);
+	KUNIT_EXPECT_EQ(test, tx_ms, SW_DRAIN_MS);
+	KUNIT_EXPECT_NE(test, gen_after, gen_before);
+	KUNIT_EXPECT_TRUE(test, tx_pending);
+	KUNIT_EXPECT_TRUE(test, time_before(tx_expires, backed_off_expires));
+
+	dcuart_shutdown(&dc->port);
+}
+
+static void dcut_preserves_earlier_deadline(struct kunit *test)
+{
+	struct dcut_ctx *ctx = test->priv;
+	struct dcuart_port *dc = &ctx->dcuart;
+	unsigned long early_expires, rx_expires, cb_expires;
+	unsigned int rx_ms, cb_ms;
+	bool rx_pending, cb_pending;
+
+	dc->sw_drain = true;
+	ctx->state->port.console = true;
+	ctx->state->port.count = 1;
+	KUNIT_EXPECT_EQ(test, dcuart_startup(&dc->port), 0);
+	timer_delete_sync(&dc->drain_timer);
+
+	/*
+	 * Repeated start_rx() on an already-open console must not push an
+	 * earlier pending deadline forward, and an empty RX poll must preserve
+	 * a kick armed before the callback snapshots drain_kick_gen.
+	 */
+	local_bh_disable();
+	early_expires = jiffies + 1;
+	dc->drain_ms = SW_DRAIN_MS;
+	mod_timer(&dc->drain_timer, early_expires);
+
+	dcuart_start_rx(&dc->port);
+	rx_pending = timer_pending(&dc->drain_timer);
+	rx_expires = dc->drain_timer.expires;
+	rx_ms = dc->drain_ms;
+
+	dcuart_drain_timer(&dc->drain_timer);
+	cb_pending = timer_pending(&dc->drain_timer);
+	cb_expires = dc->drain_timer.expires;
+	cb_ms = dc->drain_ms;
+	timer_delete(&dc->drain_timer);
+	local_bh_enable();
+	timer_delete_sync(&dc->drain_timer);
+
+	KUNIT_EXPECT_TRUE(test, rx_pending);
+	KUNIT_EXPECT_EQ(test, rx_expires, early_expires);
+	KUNIT_EXPECT_EQ(test, rx_ms, SW_DRAIN_MS);
+	KUNIT_EXPECT_TRUE(test, cb_pending);
+	KUNIT_EXPECT_EQ(test, cb_expires, early_expires);
+	KUNIT_EXPECT_EQ(test, cb_ms, SW_DRAIN_MS);
+
+	dcuart_shutdown(&dc->port);
+}
+
 /* termios and port ops */
 
 static void dcut_set_termios(struct kunit *test)
@@ -837,6 +1085,11 @@ static struct kunit_case dcuart_test_cases[] = {
 	KUNIT_CASE(dcut_start_tx_waiting),
 	KUNIT_CASE(dcut_drain_timer_sw_drain),
 	KUNIT_CASE(dcut_drain_timer_no_reader),
+	KUNIT_CASE(dcut_drain_timer_idle_backoff),
+	KUNIT_CASE(dcut_drain_timer_closed_console),
+	KUNIT_CASE(dcut_shutdown_blocks_rearm),
+	KUNIT_CASE(dcut_start_tx_shortens_backoff),
+	KUNIT_CASE(dcut_preserves_earlier_deadline),
 	KUNIT_CASE(dcut_set_termios),
 	KUNIT_CASE(dcut_port_ops),
 	KUNIT_CASE(dcut_console_putc_room),
