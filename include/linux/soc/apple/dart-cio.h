@@ -23,6 +23,7 @@ struct apple_dart_cio;
 int apple_dart_cio_bind(struct device *owner, struct device *provider,
 			struct apple_dart_cio **state);
 int apple_dart_cio_prepare(struct apple_dart_cio *state);
+int apple_dart_cio_prepare_runtime(struct apple_dart_cio *state);
 int apple_dart_cio_check(struct apple_dart_cio *state, bool quiesced);
 int apple_dart_cio_off(struct apple_dart_cio *state);
 int apple_dart_cio_on(struct apple_dart_cio *state);
@@ -35,6 +36,11 @@ static inline int apple_dart_cio_bind(struct device *owner, struct device *provi
 }
 
 static inline int apple_dart_cio_prepare(struct apple_dart_cio *s)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int apple_dart_cio_prepare_runtime(struct apple_dart_cio *s)
 {
 	return -EOPNOTSUPP;
 }
