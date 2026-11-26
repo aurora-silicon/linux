@@ -169,14 +169,24 @@ static inline bool boolify(u32 v)
 static inline void push(struct avd_ctx *ctx, u32 inst)
 {
 	struct avd_job *job = &ctx->job;
-	struct avd_segment *seg = &job->segments[job->num];
+	struct avd_segment *seg;
+
+	if (job->num >= job->max) {
+		job->overflow = true;
+		return;
+	}
+	seg = &job->segments[job->num];
+	if (seg->num >= AVD_MAX_INST) {
+		job->overflow = true;
+		return;
+	}
 	seg->instructions[seg->num++] = inst;
 }
 
 static inline void push_address(struct avd_ctx *ctx, dma_addr_t addr)
 {
 	if (ctx->dev->variant->quirks & AVD_QUIRK_LSR) {
-		push(ctx, (addr >> 8));
+		push(ctx, (u32)((addr >> 8) & 0xffffffff));
 	} else {
 		push(ctx, (u32)(addr & 0xffffffff));
 		push(ctx, (u32)(addr >> 32));

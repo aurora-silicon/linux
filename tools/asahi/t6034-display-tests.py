@@ -27,6 +27,8 @@ static bool of_machine_is_compatible(const char *c)
 { return (board && !strcmp(board,c)) || (soc && !strcmp(soc,c)); }
 static bool machine_is(const void *ctx,const char *c) { return of_machine_is_compatible(c); }
 static bool dcp_is(const void *ctx,const char *c) { return dcp && !strcmp(dcp,c); }
+/* No panel node: the T6034 records are selected by machine and SoC. */
+static bool panel_is(const void *ctx,const char *c) { return false; }
 '''
 types=header[header.index('struct dcp_v14_board {'):header.index('#endif')]
 defines='\n'.join(l for l in driver.splitlines() if l.startswith('#define DCP_V14_') and 'FIRMWARE_UUID' in l)
@@ -47,7 +49,7 @@ int main(void)
   assert(gate_t6034_wanted(-1)==expected);
   assert(!gate_t6034_wanted(0));
   assert(gate_t6034_wanted(1)==expected);
-  const struct dcp_v14_board *b=dcp_v14_board_select(dcp_is,machine_is,NULL,&known);
+  const struct dcp_v14_board *b=dcp_v14_board_select(dcp_is,machine_is,panel_is,NULL,&known);
   assert(known && (!!b)==expected);
   if(!b)continue;
   assert(!strcmp(b->handoff,"apple,t6034-handoff"));
@@ -58,7 +60,7 @@ int main(void)
   assert(!dcp_v14_board_admits(b,NULL));
  }
  board="apple,j514m";soc="apple,t6034";dcp="apple,t6031-dcp";bool known;
- assert(!dcp_v14_board_select(dcp_is,machine_is,NULL,&known));
+ assert(!dcp_v14_board_select(dcp_is,machine_is,panel_is,NULL,&known));
  /* J516M: the T6031 display layout on a T6034; default on, apple_t6034_display.enable=0 off */
  for(unsigned i=0;i<ARRAY_SIZE(boards);i++) for(unsigned j=0;j<ARRAY_SIZE(socs);j++) {
   board=boards[i];soc=socs[j];bool expected=i==1&&j==0;
@@ -67,7 +69,7 @@ int main(void)
   assert(!gate_j516m_wanted(0));
   assert(gate_j516m_wanted(1)==expected);
   dcp="apple,t6031-dcp";
-  const struct dcp_v14_board *b=dcp_v14_board_select(dcp_is,machine_is,NULL,&known);
+  const struct dcp_v14_board *b=dcp_v14_board_select(dcp_is,machine_is,panel_is,NULL,&known);
   if(i==1) {
    assert(known && (!!b)==expected);
    if(!b)continue;
@@ -78,7 +80,7 @@ int main(void)
   }
  }
  board="apple,j516m";soc="apple,t6034";dcp="apple,t6034-dcp";
- assert(!dcp_v14_board_select(dcp_is,machine_is,NULL,&known));
+ assert(!dcp_v14_board_select(dcp_is,machine_is,panel_is,NULL,&known));
  return 0;
 }
 '''

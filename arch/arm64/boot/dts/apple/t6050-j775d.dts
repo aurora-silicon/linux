@@ -10,6 +10,7 @@
 /dts-v1/;
 
 #include "t6050-ultra.dtsi"
+#include "t6050-studio-audio.dtsi"
 
 / {
 	compatible = "apple,j775d", "apple,t6050", "apple,arm-platform";
@@ -47,43 +48,35 @@
 		#size-cells = <2>;
 		ranges;
 	};
+};
 
-	/*
-	 * The jack (CS42L84) and the speaker (SN012776) through the AOP's audio services. The card waits
-	 * for its CPU component, the AOP audio node, which exists only after Aura's AOP handoff.
-	 */
-	sound {
-		compatible = "apple,j775d-macaudio", "apple,macaudio";
-		model = "Mac Studio J775D";
-		#address-cells = <1>;
-		#size-cells = <0>;
+&sound {
+	compatible = "apple,j775d-macaudio", "apple,macaudio";
+	model = "Mac Studio J775D";
+};
 
-		dai-link@0 {
-			reg = <0>;
-			link-name = "Headphone Jack";
+/*
+ * The AOP, with its RTKit mailbox, its DART and the audio DMA controller, booted over the RTKit
+ * mailbox alone. This board's AOP firmware does not service the setup port: started through both,
+ * it sends nothing there and leaves the AP's message unread. The setup mailbox stays described,
+ * disabled.
+ */
+&aop_mbox {
+	status = "okay";
+};
 
-			cpu {
-				sound-dai = <&aop_audio 0>;
-			};
+&aop_dart {
+	status = "okay";
+};
 
-			codec {
-				sound-dai = <&jack_codec>;
-			};
-		};
+&admac_base_ns {
+	status = "okay";
+};
 
-		dai-link@1 {
-			reg = <1>;
-			link-name = "Speaker";
-
-			cpu {
-				sound-dai = <&aop_audio 3>;
-			};
-
-			codec {
-				sound-dai = <&speaker_amp>;
-			};
-		};
-	};
+&aop {
+	mboxes = <&aop_mbox>;
+	mbox-names = "mbox";
+	status = "okay";
 };
 
 /*
@@ -237,34 +230,6 @@
 	 * names a new pin of pinctrl_ap opens it here too.
 	 */
 	gpio-reserved-ranges = <0 80>, <81 25>, <108 26>, <135 4>, <140 81>;
-};
-
-&i2c1 {
-	/*
-	 * ADT speaker-config: playback slot 0, amp gain 20, V sense in slot 0 and I sense
-	 * in slot 2. The firmware's speaker frame is 250 BCLKs of 12 MHz (ADT
-	 * iop-audio-controller/audio-speaker), which the amp's ratio detection rejects.
-	 */
-	speaker_amp: codec@38 {
-		compatible = "ti,sn012776", "ti,tas2764";
-		reg = <0x38>;
-		shutdown-gpios = <&pinctrl_ap 107 GPIO_ACTIVE_HIGH>;
-		interrupts-extended = <&pinctrl_ap 106 IRQ_TYPE_LEVEL_LOW>;
-		#sound-dai-cells = <0>;
-		ti,imon-slot-no = <2>;
-		ti,vmon-slot-no = <0>;
-	};
-};
-
-&i2c2 {
-	jack_codec: codec@4b {
-		compatible = "cirrus,cs42l84";
-		reg = <0x4b>;
-		reset-gpios = <&pinctrl_ap 139 GPIO_ACTIVE_HIGH>;
-		interrupts-extended = <&pinctrl_ap 134 IRQ_TYPE_LEVEL_LOW>;
-		#sound-dai-cells = <0>;
-		sound-name-prefix = "Jack";
-	};
 };
 
 /*
@@ -475,9 +440,13 @@
 					};
 				};
 
-				/* The USB4 router (usb4_3_acio), the PD driver's thunderbolt-switch */
-				port@2 {
-					reg = <2>;
+				/*
+				 * The USB4 router (usb4_3_acio), the PD driver's
+				 * thunderbolt-switch; port@2 is reserved for DisplayPort
+				 * (apple,dcp-typec-routes.yaml).
+				 */
+				port@3 {
+					reg = <3>;
 					hpm3_tbt: endpoint {
 						remote-endpoint = <&usb4_3_ep>;
 					};
@@ -696,3 +665,37 @@
 
 #define T6050_J775D
 #include "t6050-peripherals.dtsi"
+
+/*
+ * The other three die-0 external display engines (dcpext1..3). The shared
+ * properties live in t6050-peripherals.dtsi; each empty typec-routes container
+ * asks the boot loader to write the engine's USB-C display routes from the ADT.
+ */
+&dcpext1 {
+	apple,connector-type = "USB-C";
+
+	typec-routes {
+		#address-cells = <1>;
+		#size-cells = <0>;
+	};
+};
+
+&dcpext2 {
+	apple,connector-type = "USB-C";
+
+	typec-routes {
+		#address-cells = <1>;
+		#size-cells = <0>;
+	};
+};
+
+&dcpext3 {
+	apple,connector-type = "USB-C";
+
+	typec-routes {
+		#address-cells = <1>;
+		#size-cells = <0>;
+	};
+};
+
+#include "t6050-j775d-gpu.dtsi"

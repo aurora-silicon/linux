@@ -31,6 +31,12 @@ mod g18;
 #[cfg(CONFIG_DRM_ASAHI_M5)]
 mod m5;
 mod gpu;
+#[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+mod g14_v27_2;
+#[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+mod g14_v27_2_abi;
+#[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
+mod g14_v27_2_render;
 mod hw;
 mod initdata;
 mod m3;
@@ -109,6 +115,8 @@ impl kernel::InPlaceModule for DriverModule {
         unsafe { queue_share::init() };
         // SAFETY: Module init runs once, before either adapter is registered below.
         unsafe { g17::exec_share::init() };
+        // SAFETY: Module init runs once, before either adapter is registered below.
+        unsafe { g17::init() };
         try_pin_init!(Self {
             // Initialize the queue first, before registration can invoke probe.
             _cleanup: cleanup::QueueOwner::new()?,
@@ -266,7 +274,7 @@ module! {
             description: "G16: compute completion-stamp deadline, ms (0 permits unbounded compute; firmware recovery stays active)",
         },
         g16_repoll_us: u32 {
-            default: 15,
+            default: 8,
             description: "G16: repoll interval while publication waits for record consumption, us",
         },
         g16_resnap_us: u32 {

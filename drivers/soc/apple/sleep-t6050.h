@@ -71,6 +71,12 @@ struct t6050_ops {
 	unsigned int n;
 };
 
+/* An SPMI controller's peripheral sources: eight words of 32 */
+#define T6050_SPMI_SRC_WORDS	8
+/* apple,spmi-buses (spmi_bus[]), and with nub-spmi0 */
+#define T6050_SPMI_BUSES	7
+#define T6050_SPMI_CTRLS	(1 + T6050_SPMI_BUSES)
+
 struct apple_sleep_region_state {
 	void __iomem *base[T6050_REGIONS];
 	struct resource resource[T6050_REGIONS];
@@ -88,7 +94,7 @@ struct apple_sleep_region_state {
 	/* Connected to shared domain APIs; owners clear exclusions after a successful raise. */
 	unsigned long *driver_down;
 	bool snapshot_valid;
-	unsigned long manager_down[BITS_TO_LONGS(ARRAY_SIZE(t6050_ps_all))];
+	unsigned long *manager_down;
 	u8 alarm_compare[4];
 	bool alarm_valid;
 	unsigned int pmu_errors;
@@ -100,6 +106,9 @@ struct apple_sleep_region_state {
 	u32 late_saved[17], state4_saved[16], pmc154_lowered;
 	/* AUSS and the routers' CIO_AUSS words the entry lowered, and each as it read before */
 	u32 auss_lowered, auss_timeouts, auss_saved[5];
+	/* VENC0_SYS as it read before the entry lowered it, if it did */
+	u32 venc0_saved;
+	bool venc0_lowered;
 	/* The idle words the last refusal switched off and on again: their blocks' registers are at reset */
 	u32 refusal_cycled;
 	/* Type-C ports, by port index, whose always-on USB word the last entry left on. */
@@ -123,7 +132,7 @@ struct apple_sleep_region_state {
 	/* Each display child's word as it read before the stop lowered it */
 	u32 disp_child_saved[5][16];
 	u32 mcc_cycle[2][10];
-	void __iomem *spmi_bus[5];
+	void __iomem *spmi_bus[T6050_SPMI_BUSES];
 	/* nub-spmi0's controller: its driver's lock is held through a returning PMU exchange */
 	struct device *pmu_bus;
 	void __iomem *aon_clk[2];
@@ -146,7 +155,7 @@ struct apple_sleep_region_state {
 	/* Each stopped DART's GAPF slice, the value written there, and what it held before */
 	u32 dart_slice[5], dart_slice_off, dart_slice_saved[5], dart_slice_written;
 	/* The PMU's reads after the boot stage, the SPMI buses' masking order and gap */
-	u32 pmu_reads[8][2], npmu_reads, spmi_order[5], nspmi_order, spmi_gap_us;
+	u32 pmu_reads[8][2], npmu_reads, spmi_order[7], nspmi_order, spmi_gap_us;
 	/* nub-spmi0's interrupt mask at run time */
 	u32 spmi_runtime_mask;
 	/* nub-spmi0's status word holding the PMU's interrupt sources, and their bits (the DT's) */
@@ -168,10 +177,37 @@ struct apple_sleep_region_state {
 	/* The AP wake-enable words, on this die and the GFX die */
 	void __iomem *wake, *wake_gfx, *aic_gfx;
 	u32 wake_enabled[11], wake_saved[11];
+	/* The raw sticky wake status words as the wake found them */
+	u32 wake_status[11];
+	bool wake_status_valid;
 	bool wake_armed, wake_sources;
-	u32 spmi_mask[6];
+	u32 spmi_mask[T6050_SPMI_CTRLS];
 	bool spmi_masked;
 	bool spmi_post_timer;
+	/*
+	 * nub-spmi0's and each of apple,spmi-buses's peripheral sources as the last acknowledgement
+	 * found them (t6050_spmi_src_ack): latched, enabled, and those it acknowledged
+	 */
+	u32 spmi_src_latched[T6050_SPMI_CTRLS][T6050_SPMI_SRC_WORDS];
+	u32 spmi_src_enabled[T6050_SPMI_CTRLS][T6050_SPMI_SRC_WORDS];
+	u32 spmi_src_acked[T6050_SPMI_CTRLS][T6050_SPMI_SRC_WORDS];
+	bool spmi_src_valid;
+	/* This wake's status words are read and not yet in its events (t6050_wake_events_report) */
+	bool wake_status_fresh;
+	/* After a wake, the PMU's steps wait for the SMC's (t6050_sleep_pmu_wake) */
+	bool pmu_wake_pending;
+	u8 pmu_wake_rtc_ctl;
+	int pmu_wake_rtc_ret;
+	/* Each cluster's cores that reached their last WFI (t6050_cpu_down()) */
+	atomic_t cpus_down[3];
+	/*
+	 * The secondary clusters taken down first (t6050_clusters_down_first()): the result of the
+	 * cores' wait and of each cluster's sequencer poll, the sequencers' last reads and the
+	 * time each poll took, reported after the wake.
+	 */
+	bool early_done, early_dropped;
+	int early_ret[3];
+	u32 early_seq[2], early_us[2];
 };
 
 static const struct apple_sleep_region_desc t6050_regions[] = {
@@ -194,6 +230,18 @@ static const struct apple_sleep_region_profile t6050_region_profile = {
 	.region = t6050_regions,
 	.count = ARRAY_SIZE(t6050_regions),
 	.power = SLEEP_WORDS(t6050_ps_all),
+	.table = t6050_tables,
+	.ntables = ARRAY_SIZE(t6050_tables),
+};
+
+/*
+ * The Max inventory, for the J716c's full sleep. Its keepalive tables have the Pro's bases,
+ * counts and strides.
+ */
+static const struct apple_sleep_region_profile t6050_j716c_region_profile = {
+	.region = t6050_regions,
+	.count = ARRAY_SIZE(t6050_regions),
+	.power = SLEEP_WORDS(t6050_j716c_ps_all),
 	.table = t6050_tables,
 	.ntables = ARRAY_SIZE(t6050_tables),
 };
@@ -272,7 +320,9 @@ static int sleep_region_map(struct apple_sleep *s)
 	r->done = devm_kcalloc(s->dev, p->power.count, sizeof(bool), GFP_KERNEL);
 	r->late = devm_kcalloc(s->dev, p->power.count, sizeof(bool), GFP_KERNEL);
 	r->driver_down = devm_bitmap_zalloc(s->dev, p->power.count, GFP_KERNEL);
-	if (!r->saved || !r->woke || !r->done || !r->late || !r->driver_down)
+	r->manager_down = devm_bitmap_zalloc(s->dev, p->power.count, GFP_KERNEL);
+	if (!r->saved || !r->woke || !r->done || !r->late ||
+	    !r->driver_down || !r->manager_down)
 		return -ENOMEM;
 	s->region = r;
 	return 0;
@@ -340,6 +390,19 @@ static bool t6050_v27_retained_display_word(struct apple_sleep *s, u32 word)
 }
 
 
+/*
+ * The SEP's domain is under automatic power: the hardware raises it when the enclave is used,
+ * and a forced raise at the wake does not take. Whatever the snapshot caught it doing, its word
+ * goes back under automatic power without a wait (sleep_ps_restore()'s path for a word off
+ * under AUTO_ENABLE), rather than waiting for a state the hardware gives only on demand.
+ */
+static u32 t6050_replay_saved(struct apple_sleep *s, u32 word, u32 saved)
+{
+	if (s->soc->ps.sep && word == s->soc->ps.sep && (saved & PS_AUTO_ENABLE))
+		return saved & ~PS_ACTUAL;
+	return saved;
+}
+
 static void sleep_region_replay(struct apple_sleep *s)
 {
 	const struct apple_sleep_region_profile *p = s->soc->regions;
@@ -400,7 +463,8 @@ static void sleep_region_replay(struct apple_sleep *s)
 		if ((test_bit(n, r->driver_down) || test_bit(n, r->manager_down)) || !FIELD_GET(PS_TARGET, r->saved[n]))
 			continue;
 		s->ps_rewoken++;
-		r->late[n] = !!sleep_ps_restore(sleep_region_reg(s, p->power.offset[n]), r->saved[n]);
+		r->late[n] = !!sleep_ps_restore(sleep_region_reg(s, p->power.offset[n]),
+				t6050_replay_saved(s, p->power.offset[n], r->saved[n]));
 	}
 	for (pass = 0; pass < PS_REWAKE_PASSES; pass++)
 		for (i = 0; i < p->power.count; i++) {
@@ -417,7 +481,8 @@ static void sleep_region_replay(struct apple_sleep *s)
 			if (!r->done[i])
 				s->ps_rewoken++;
 			r->done[i] = true;
-			r->late[i] = !!sleep_ps_restore(sleep_region_reg(s, p->power.offset[i]), r->saved[i]);
+			r->late[i] = !!sleep_ps_restore(sleep_region_reg(s, p->power.offset[i]),
+				t6050_replay_saved(s, p->power.offset[i], r->saved[i]));
 		}
 	for (i = 0; i < p->power.count; i++)
 		s->ps_rewake_timeouts += r->late[i];
@@ -578,8 +643,9 @@ static int t6050_sleep_check_alarm(struct apple_sleep *s)
 	ret = t6050_sleep_pmu_xfer(s, T6050_SPMI_EXT_READL, T6050_RTC_CTL, NULL, &control, 1);
 	if (!ret)
 		ret = t6050_sleep_pmu_xfer(s, T6050_SPMI_EXT_READL, T6050_RTC_MASK, NULL, &mask, 1);
+	/* No armed alarm is no refusal: the SMC's wake sources (lid, keys) do not need it */
 	if (!ret && (!(control & T6050_RTC_CTL_ARMED) || (mask & BIT(0))))
-		ret = -EBUSY;
+		return 0;
 	if (!ret)
 		ret = t6050_sleep_pmu_xfer(s, T6050_SPMI_EXT_READL, T6050_RTC_COMPARE, NULL,
 					   r->alarm_compare, 4);
@@ -1357,6 +1423,7 @@ static int t6050_sleep_map_regs(struct apple_sleep *s)
 	unsigned int i;
 	int ret = sleep_region_map(s);
 
+	BUILD_BUG_ON(T6050_RBLK_SPMI + ARRAY_SIZE(s->region->spmi_bus) > T6050_RBLK_NODE);
 	if (ret)
 		return ret;
 	for (i = 0; i < ARRAY_SIZE(regs); i++) {
@@ -1493,6 +1560,12 @@ static int t6050_sleep_ptd_ownership(struct apple_sleep *s, bool own)
 	report = of_find_compatible_node(NULL, NULL, "apple,t6050-pmp-v2-report");
 	if (!report)
 		return -ENODEV;
+	/* Nothing else writes the entries: the gate refuses a PMP that runs unbound. */
+	if (s->soc->pmp_unstarted && !of_device_is_available(report)) {
+		of_node_put(report);
+		r->ptd_owned = true;
+		return 0;
+	}
 	for_each_child_of_node(report, entry) {
 		u32 id;
 
@@ -1617,10 +1690,17 @@ static int t6050_sleep_begin(struct apple_sleep *s)
 	s->ans_off_ret = 0;
 	r->staged = false;
 	r->committed = false;
+	r->early_done = false;
+	r->early_dropped = false;
+	r->venc0_lowered = false;
+	r->wake_status_valid = false;
+	r->wake_status_fresh = false;
+	r->spmi_src_valid = false;
+	r->pmu_wake_pending = false;
 	r->pmc_saved = false;
 	r->floor_changed = 0;
 	r->display_lowered = 0;
-	bitmap_zero(r->manager_down, ARRAY_SIZE(t6050_ps_all));
+	bitmap_zero(r->manager_down, s->soc->regions->power.count);
 	r->late_errors = 0;
 	r->auss_lowered = 0;
 	r->refusal_cycled = 0;
@@ -1812,7 +1892,7 @@ static const u8 t6050_disp_children[5][16] = {
 };
 static const u8 t6050_disp_nchildren[5] = { 16, 7, 7, 7, 7 };
 
-static void t6050_sleep_entry_lower(struct apple_sleep *s);
+static int t6050_sleep_entry_lower(struct apple_sleep *s);
 
 /*
  * Driver-provided readiness is required; never clear a running DCP's RUN bit. One set's words,
@@ -1850,7 +1930,8 @@ static int t6050_sleep_display_off_one(struct apple_sleep *s, unsigned int d)
 	/* Snapshot belongs to the returning pre-SEP phase. */
 	r->display_lowered |= BIT(d);
 	for (j = 0; j < 3; j++) {
-		int index = sleep_ps_find(t6050_ps_all, ARRAY_SIZE(t6050_ps_all), s->soc->ps.disp[d][j]);
+		int index = sleep_ps_find(s->soc->regions->power.offset,
+				  s->soc->regions->power.count, s->soc->ps.disp[d][j]);
 
 		if (index >= 0)
 			set_bit(index, r->manager_down);
@@ -1914,8 +1995,7 @@ static int t6050_sleep_display_prepare(struct apple_sleep *s)
 	r->gate_saved[1] = readl(s->disp_gate + 0x540);
 	memset(r->disp_children_lowered, 0, sizeof(r->disp_children_lowered));
 	sleep_region_snapshot(s);
-	t6050_sleep_entry_lower(s);
-	return 0;
+	return t6050_sleep_entry_lower(s);
 }
 
 /*
@@ -2159,14 +2239,7 @@ static void t6050_late_lower(struct apple_sleep *s, unsigned int i)
  * through the suspend. Here it goes down as on macOS: the children first, AUSS last, each only
  * if on, and polled off. After a sleep the snapshot's replay raises them again, parent first;
  * after a refusal t6050_auss_restore() does.
- *
- * t6050_auss_off=0 leaves them as they are, which was the behaviour before.
  */
-static bool t6050_auss_off = true;
-module_param(t6050_auss_off, bool, 0644);
-MODULE_PARM_DESC(t6050_auss_off,
-		 "T6050: lower AUSS and the routers' CIO_AUSS words at the sleep's entry, as macOS has them (0: leave them)");
-
 static const u32 t6050_auss_words[] = {
 	SLEEP_REGION_WORD(T6050_PS0, 0x348),	/* ATC0_CIO_AUSS */
 	SLEEP_REGION_WORD(T6050_PS0, 0x360),	/* ATC1_CIO_AUSS */
@@ -2188,7 +2261,7 @@ static void t6050_auss_lower(struct apple_sleep *s)
 		u32 word = t6050_auss_words[i];
 
 		r->auss_saved[i] = readl(sleep_region_reg(s, word));
-		if (!t6050_auss_off || !t6050_late_word_on(s, word))
+		if (!t6050_late_word_on(s, word))
 			continue;
 		sleep_ps_lower(s, word);
 		r->auss_lowered |= BIT(i);
@@ -2211,16 +2284,68 @@ static void t6050_auss_restore(struct apple_sleep *s)
 	r->auss_lowered = 0;
 }
 
-/* At the start of .enter, after the snapshot a refusal restores: the first lowerings and the state-4 caps. */
-static void t6050_sleep_entry_lower(struct apple_sleep *s)
+/*
+ * VENC0_SYS, the first video encoder's system word. On the J716c it reads 0x0f0003ff (on, no
+ * automatic state) at the commit, with no Linux user, while every other media word of the GPU
+ * die is off or under automatic power; and the entry's last phase waits for its power gate.
+ * It is lowered at the entry, after AUSS, and polled off: one that does not go off refuses the
+ * sleep. A refusal puts it back as it read before; after a sleep the snapshot's replay raises
+ * it again.
+ */
+#define T6050_VENC0_SYS	SLEEP_REGION_WORD(T6050_PS_MEDIA, 0x1c0)
+
+static int t6050_venc0_lower(struct apple_sleep *s)
+{
+	struct apple_sleep_region_state *r = s->region;
+	int ret;
+
+	r->venc0_lowered = false;
+	if (!s->soc->lower_venc0 || !t6050_late_word_on(s, T6050_VENC0_SYS))
+		return 0;
+	r->venc0_saved = readl(sleep_region_reg(s, T6050_VENC0_SYS));
+	sleep_ps_lower(s, T6050_VENC0_SYS);
+	r->venc0_lowered = true;
+	ret = sleep_ps_wait_off(s, T6050_VENC0_SYS);
+	if (ret) {
+		dev_warn(s->dev, "entry: VENC0_SYS %#x -> %#x, not off: refusing the sleep\n",
+			 r->venc0_saved, readl(sleep_region_reg(s, T6050_VENC0_SYS)));
+		return ret;
+	}
+	dev_info(s->dev, "entry: VENC0_SYS %#x -> %#x\n", r->venc0_saved,
+		 readl(sleep_region_reg(s, T6050_VENC0_SYS)));
+	return 0;
+}
+
+/* After a refusal: VENC0_SYS as it read before the entry lowered it */
+static void t6050_venc0_restore(struct apple_sleep *s)
+{
+	struct apple_sleep_region_state *r = s->region;
+
+	if (!r->venc0_lowered)
+		return;
+	if (sleep_ps_restore(sleep_region_reg(s, T6050_VENC0_SYS), r->venc0_saved))
+		dev_warn(s->dev, "refusal: VENC0_SYS not back: reads %#x, was %#x\n",
+			 readl(sleep_region_reg(s, T6050_VENC0_SYS)), r->venc0_saved);
+	r->venc0_lowered = false;
+}
+
+/*
+ * At the start of .enter, after the snapshot a refusal restores: the first lowerings and the
+ * state-4 caps. An error refuses the sleep; the refusal raises what was lowered.
+ */
+static int t6050_sleep_entry_lower(struct apple_sleep *s)
 {
 	struct apple_sleep_region_state *r = s->region;
 	unsigned int i;
+	int ret;
 
 	r->late_lowered = r->state4_set = r->late_timeouts = 0;
 	for (i = 0; i < T6050_LATE_ENTRY_END; i++)
 		t6050_late_lower(s, i);
 	t6050_auss_lower(s);
+	ret = t6050_venc0_lower(s);
+	if (ret)
+		return ret;
 	for (i = 0; i < ARRAY_SIZE(t6050_state4); i++) {
 		void __iomem *reg = sleep_region_reg(s, t6050_state4[i].word);
 		u32 val = readl(reg);
@@ -2235,33 +2360,64 @@ static void t6050_sleep_entry_lower(struct apple_sleep *s)
 		 r->late_lowered, r->late_timeouts, r->state4_set);
 	/* AUSS as the sleep's last steps find it: the engine wants it off. */
 	i = ARRAY_SIZE(t6050_auss_words) - 1;
-	dev_info(s->dev, "entry: AUSS %#x -> %#x, lowered %#x (%u timed out)%s\n",
+	dev_info(s->dev, "entry: AUSS %#x -> %#x, lowered %#x (%u timed out)\n",
 		 r->auss_saved[i], readl(sleep_region_reg(s, t6050_auss_words[i])),
-		 r->auss_lowered, r->auss_timeouts,
-		 t6050_auss_off ? "" : ", t6050_auss_off=0");
+		 r->auss_lowered, r->auss_timeouts);
+	return 0;
 }
 
 /*
- * nub-spmi0 latches each interrupt the PMU sends (its alarm's among them) in a peripheral status
- * word, and a latched source that is enabled holds the controller's interrupt output up: an AP
- * wake source, which the sleep keeps armed. No driver takes the PMU's interrupts on this
- * controller, so nothing acknowledged them: after the first alarm, each later sleep woke right
- * after its commit. The DT names the PMU's sources. They are acknowledged at each wake, before
- * the run-time mask is back, as macOS does; and before the sleep's masks, for one latched while
- * the system ran (an alarm that fired after an earlier wake). An event after that wakes the
- * sleep, as it should. Returns the word as found, before the acknowledgement.
+ * Each SPMI controller latches the interrupts its peripherals send, one bit a source, in eight
+ * peripheral status words at +0x600 (write 1 to clear); its enables at +0x400 pick the sources
+ * that raise its interrupt output. A latched source that is enabled holds the output up, and
+ * nub-spmi0's outputs are AP wake sources, which the sleep keeps armed: before nub-spmi0's PMU
+ * sources (the DT's) were acknowledged, each sleep after the first alarm woke right after its
+ * commit.
+ *
+ * macOS's handler takes a controller's latched and enabled sources as they come, so none is
+ * pending at the sleep's entry. At the wake it runs first, 57 ms in, before the SMC hears that
+ * the AP is on: it reads the eight words, acknowledges each enabled source that is set, masks it
+ * until its driver has seen it, and names it in the wake's events. In the macOS-HV traces
+ * mxt4, dk1 and dk2, those are nub-spmi0's 0x02 (the PMU's), nub-spmi-a1's 0x0b, and in dk1
+ * also nub-spmi-a0's 0x3f (dk1's pmset log: "NUB.SPMI0Sw3IRQ nub-spmi-a0.0x3F nub-spmi0.0x02
+ * nub-spmi-a1.0x0B rtc"). A latched source that isn't enabled stays set: nub-spmi-a0's +0x600
+ * reads 0x12051c00 through every macOS sleep.
+ *
+ * Linux takes no SPMI interrupt, and acknowledged only nub-spmi0's PMU sources. Do to the
+ * controllers what macOS's handler does: at the entry, before the sleep's masks, and at the
+ * wake, before the run-time masks are back, acknowledge each latched source that is enabled
+ * (and on nub-spmi0 the DT's PMU sources) on nub-spmi0 and each of apple,spmi-buses. The
+ * enables are left as they are. What the wake found is kept for its events. An event after the
+ * entry's acknowledgement wakes the sleep, as it should.
  */
-static u32 t6050_spmi_pmu_ack(struct apple_sleep *s)
+#define T6050_SPMI_SRC_EN	0x400
+
+static void t6050_spmi_src_ack(struct apple_sleep *s)
 {
 	struct apple_sleep_region_state *r = s->region;
-	u32 status;
+	unsigned int b, i, pmu_word = (r->spmi_pmu_status - M5_SPMI_SRC_STATUS) / 4;
+	void __iomem *bus;
+	u32 ack;
 
-	if (!r->spmi_pmu_bits)
-		return 0;
-	status = readl(s->spmi + r->spmi_pmu_status);
-	if (status & r->spmi_pmu_bits)
-		writel(status & r->spmi_pmu_bits, s->spmi + r->spmi_pmu_status);
-	return status;
+	BUILD_BUG_ON(ARRAY_SIZE(r->spmi_src_acked) != 1 + ARRAY_SIZE(r->spmi_bus));
+	for (b = 0; b < ARRAY_SIZE(r->spmi_src_acked); b++) {
+		bus = b ? r->spmi_bus[b - 1] : s->spmi;
+		for (i = 0; i < T6050_SPMI_SRC_WORDS; i++) {
+			r->spmi_src_latched[b][i] = 0;
+			r->spmi_src_enabled[b][i] = 0;
+			if (bus) {
+				r->spmi_src_latched[b][i] = readl(bus + M5_SPMI_SRC_STATUS + 4 * i);
+				r->spmi_src_enabled[b][i] = readl(bus + T6050_SPMI_SRC_EN + 4 * i);
+			}
+			ack = r->spmi_src_latched[b][i] & r->spmi_src_enabled[b][i];
+			if (!b && r->spmi_pmu_bits && i == pmu_word)
+				ack |= r->spmi_src_latched[b][i] & r->spmi_pmu_bits;
+			r->spmi_src_acked[b][i] = ack;
+			if (ack)
+				writel(ack, bus + M5_SPMI_SRC_STATUS + 4 * i);
+		}
+	}
+	r->spmi_src_valid = true;
 }
 
 /*
@@ -2301,8 +2457,10 @@ static void t6050_sleep_after_ans(struct apple_sleep *s)
 	for (i = T6050_LATE_I2C3; i <= T6050_LATE_I2C6; i++)
 		t6050_late_lower(s, i);
 	r->spmi_mask[0] = readl(s->spmi + M5_SPMI_IRQ_EN);
-	/* nub-spmi0 first: its interrupt outputs are AP wake sources. */
-	t6050_spmi_pmu_ack(s);
+	/* Every controller's pending sources, as macOS's handler leaves them for the sleep */
+	t6050_spmi_src_ack(s);
+	r->spmi_src_valid = false;
+	/* nub-spmi0's mask first: its interrupt outputs are AP wake sources. */
 	writel(readl(s->spmi + M5_SPMI_IRQ_STATUS), s->spmi + M5_SPMI_IRQ_STATUS);
 	writel(s->soc->spmi_notify_sleep, s->spmi + M5_SPMI_IRQ_EN);
 	for (i = 0; i < r->nspmi_order; i++) {
@@ -2584,6 +2742,27 @@ static void t6050_sleep_before_enclave(struct apple_sleep *s)
 	t6050_sleep_dart_stop(s, T6050_DART_SEP);
 }
 
+/*
+ * The early secondary-cluster step counts each present core entering its
+ * last WFI. A core left off by a failed restart cannot acknowledge it.
+ * Parked cores, including intentionally offline ones, still take part.
+ */
+static int t6050_check_early_cpus(struct apple_sleep *s)
+{
+	unsigned int cpu, cluster;
+
+	if (!s->soc->clusters_down_first)
+		return 0;
+	for_each_present_cpu(cpu) {
+		cluster = sleep_cpu_cluster(s, cpu_logical_map(cpu));
+		if ((cluster == 1 || cluster == 2) && spin_table_cpu_tracked_off(cpu)) {
+			dev_warn(s->dev, "refused: early cluster CPU%u still tracked off\n", cpu);
+			return -EBUSY;
+		}
+	}
+	return 0;
+}
+
 /* Final returning checks: no last_stop/enclave action has happened yet. */
 static int t6050_sleep_final_check(struct apple_sleep *s)
 {
@@ -2592,6 +2771,10 @@ static int t6050_sleep_final_check(struct apple_sleep *s)
 	u64 now, delay, counter;
 	u32 compare;
 	int ret;
+
+	ret = t6050_check_early_cpus(s);
+	if (ret)
+		return ret;
 
 	if (!r->ptd_owned || !s->smc.held || !s->smc.saved_ops ||
 	    !s->smc.saved_ops->check || !s->smc.saved_ops->commit_notice) {
@@ -2616,6 +2799,9 @@ static int t6050_sleep_final_check(struct apple_sleep *s)
 	ret = t6050_sleep_check_alarm(s);
 	if (ret)
 		return ret;
+	/* No alarm armed: nothing to hold against the sleep timer */
+	if (!r->alarm_valid)
+		return 0;
 	ret = t6050_sleep_pmu_xfer(s, T6050_SPMI_EXT_READL, T6050_RTC_COUNTER, NULL, ticks, 6);
 	if (ret)
 		return ret;
@@ -2721,6 +2907,10 @@ static int t6050_cpm_prop(struct apple_sleep *s, const char *name, u64 **ops, un
  */
 static void __noreturn t6050_cpu_down(struct apple_sleep *s, u64 mpidr)
 {
+	unsigned int c = sleep_cpu_cluster(s, mpidr);
+
+	if (c < ARRAY_SIZE(s->region->cpus_down))
+		atomic_inc(&s->region->cpus_down[c]);
 	write_sysreg(ARCH_TIMER_CTRL_IT_MASK, cntp_ctl_el0);
 	write_sysreg(ARCH_TIMER_CTRL_IT_MASK, cntv_ctl_el0);
 	isb();
@@ -2804,6 +2994,162 @@ static void t6050_mcc_stop(struct apple_sleep *s)
 		}
 }
 
+/* Timekeeping is stopped at the commit: waits there count the CPU's own counter. */
+static u64 t6050_cnt_ticks(u32 us)
+{
+	return div_u64((u64)arch_timer_get_cntfrq() * us, USEC_PER_SEC);
+}
+
+static u32 t6050_cnt_us(u64 ticks)
+{
+	return div_u64(ticks * USEC_PER_SEC, arch_timer_get_cntfrq());
+}
+
+/* Polls @reg until it reads @want, for up to @limit_us: 0, or -ETIMEDOUT */
+static int t6050_cnt_poll(void __iomem *reg, u32 want, u32 limit_us, u32 *last, u32 *us)
+{
+	u64 start = __arch_counter_get_cntpct(), end = start + t6050_cnt_ticks(limit_us), now;
+	u32 v;
+
+	do {
+		v = readl(reg);
+		now = __arch_counter_get_cntpct();
+		if (v == want)
+			break;
+		cpu_relax();
+	} while (now < end);
+	*last = v;
+	*us = t6050_cnt_us(now - start);
+	return v == want ? 0 : -ETIMEDOUT;
+}
+
+#define T6050_EARLY_CPUS_US	2000
+#define T6050_EARLY_SETTLE_US	50
+#define T6050_EARLY_SEQ_US	5000
+#define T6050_EARLY_SEQ1_DONE	0x1a
+#define T6050_EARLY_SEQ2_DONE	0x1c01a
+
+/*
+ * The clusters other than the boot cluster (MPIDR affinity 1 of 1 and 2) taken down at the
+ * start of the commit, before anything else in it.
+ *
+ * The clusters' power-down programs run one at a time, on one engine. Dropped together in the
+ * commit window, as the cluster words step below does, the P cluster's program queues behind
+ * the boot cluster's, and that one cannot finish while the boot core still runs the commit:
+ * the P cluster never goes down and the sleep does not complete. Taken down in this order, the
+ * secondary clusters first and the boot cluster last, all three programs complete.
+ *
+ * Their cores are released to their last WFI (spin_table_release_cpus()) and counted there,
+ * then each cluster's PTD bit and request drop (t6050_mcc_release()), then each cluster's
+ * sequencer is polled until its program is done. Nothing in the commit may touch those
+ * clusters' own blocks (0x211xxxxxx, 0x212xxxxxx) after this. The results are kept for the
+ * report after the wake: nothing is printed this late.
+ *
+ * This runs past the point of no return, so nothing here refuses the sleep. Every wait is
+ * bounded on the CPU's counter (2 ms for the cores, 5 ms for each sequencer), well inside the
+ * commit's runway. If the cores are not all counted, the cluster requests are left up and the
+ * commit drops them later, as it did before this step. Any failure here ends in the engine's
+ * watchdog reset 5 s after the commit, the same as without this step, so there is nothing to
+ * undo.
+ */
+static void t6050_clusters_down_first(struct apple_sleep *s)
+{
+	struct apple_sleep_region_state *r = s->region;
+	static struct cpumask cpus;
+	unsigned int cpu, c, want[3] = {};
+	u64 end;
+
+	memset(r->early_seq, 0, sizeof(r->early_seq));
+	memset(r->early_us, 0, sizeof(r->early_us));
+	r->early_done = true;
+	cpumask_clear(&cpus);
+	for_each_present_cpu(cpu) {
+		c = sleep_cpu_cluster(s, cpu_logical_map(cpu));
+		if (c == 1 || c == 2) {
+			cpumask_set_cpu(cpu, &cpus);
+			want[c]++;
+		}
+	}
+	atomic_set(&r->cpus_down[1], 0);
+	atomic_set(&r->cpus_down[2], 0);
+	spin_table_release_cpus(&cpus);
+	end = __arch_counter_get_cntpct() + t6050_cnt_ticks(T6050_EARLY_CPUS_US);
+	r->early_ret[0] = -ETIMEDOUT;
+	do {
+		if (atomic_read(&r->cpus_down[1]) == want[1] &&
+		    atomic_read(&r->cpus_down[2]) == want[2]) {
+			r->early_ret[0] = 0;
+			break;
+		}
+		cpu_relax();
+	} while (__arch_counter_get_cntpct() < end);
+	if (r->early_ret[0]) {
+		/* The requests stay up: the commit's own step drops them, as before */
+		r->early_ret[1] = -ECANCELED;
+		r->early_ret[2] = -ECANCELED;
+		return;
+	}
+	/* Counted on the way in: let the last ones reach the WFI itself */
+	end = __arch_counter_get_cntpct() + t6050_cnt_ticks(T6050_EARLY_SETTLE_US);
+	while (__arch_counter_get_cntpct() < end)
+		cpu_relax();
+	t6050_mcc_release(s, 0);
+	t6050_mcc_release(s, 1);
+	r->early_dropped = true;
+	r->early_ret[1] = t6050_cnt_poll(s->cluster + 0x18, T6050_EARLY_SEQ1_DONE,
+					 T6050_EARLY_SEQ_US, &r->early_seq[0], &r->early_us[0]);
+	r->early_ret[2] = t6050_cnt_poll(s->cluster + 0x1c, T6050_EARLY_SEQ2_DONE,
+					 T6050_EARLY_SEQ_US, &r->early_seq[1], &r->early_us[1]);
+}
+
+/* After the wake: how the early cluster step went, in one line */
+#define T6050_EARLY_REPORT "secondary clusters down first: cores %d+%d (%d), cluster 1 %#x in %u us (%d), cluster 2 %#x in %u us (%d)\n"
+
+static void t6050_clusters_down_first_report(struct apple_sleep *s)
+{
+	struct apple_sleep_region_state *r = s->region;
+	int c1 = atomic_read(&r->cpus_down[1]), c2 = atomic_read(&r->cpus_down[2]);
+
+	if (!r->early_done)
+		return;
+	r->early_done = false;
+	if (r->early_ret[0] || r->early_ret[1] || r->early_ret[2])
+		dev_warn(s->dev, T6050_EARLY_REPORT, c1, c2, r->early_ret[0],
+			 r->early_seq[0], r->early_us[0], r->early_ret[1],
+			 r->early_seq[1], r->early_us[1], r->early_ret[2]);
+	else
+		dev_info(s->dev, T6050_EARLY_REPORT, c1, c2, r->early_ret[0],
+			 r->early_seq[0], r->early_us[0], r->early_ret[1],
+			 r->early_seq[1], r->early_us[1], r->early_ret[2]);
+}
+
+static void t6050_sleep_commit_wdt(struct apple_sleep *s)
+{
+	struct apple_sleep_region_state *r = s->region;
+
+	if (r && r->seq[T6050_SEQ_WDT].n) {
+		s->aon_wdt_saved = readl(s->wdt_aux + AON_WDT_SLEEP);
+		s->aon_wdt_marked = true;
+	}
+	t6050_seq(s, T6050_SEQ_WDT);
+	writel(0, s->wdt + WDT_WD0_CTL);
+	apple_sleep_set_wd2(s, T6050_WDT_COMMIT_SECS);
+	writel(0, s->wdt_aux + AON_AP_DEADLINE);
+}
+
+static void t6050_sleep_wake_wdt(struct apple_sleep *s)
+{
+	writel(0, s->wdt + WDT_WD2_CTL);
+	writel(WDT_WD2_CTL_IRQ_STATUS, s->wdt + WDT_WD2_CTL);
+	(void)readl(s->wdt + WDT_WD2_CTL);
+	if (s->aon_wdt_marked) {
+		writel(s->aon_wdt_saved, s->wdt_aux + AON_WDT_SLEEP);
+		(void)readl(s->wdt_aux + AON_WDT_SLEEP);
+		s->aon_wdt_marked = false;
+	}
+	apple_sleep_set_wd2(s, WDT_SUSPEND_SECS);
+}
+
 /*
  * The commit window, each step at the DT schedule's time before the sleep timer: the MCC
  * requests released, the storage link's PHY parked and its words down, the watchdogs, the
@@ -2819,7 +3165,14 @@ static void t6050_sleep_commit_regs(struct apple_sleep *s)
 	u32 value;
 
 	r->committed = true;
-	/* Only +0x4 and +0x8 are released, each after pwrgate's three words: no raise or re-arm */
+	/* Past every refusal: the secondary clusters go first, where the SoC needs that */
+	r->early_dropped = false;
+	if (s->soc->clusters_down_first)
+		t6050_clusters_down_first(s);
+	/*
+	 * Only +0x4 and +0x8 are released, each after pwrgate's three words: no raise or re-arm.
+	 * Already released by t6050_clusters_down_first() when it dropped them.
+	 */
 	for (i = 0; i < 2; i++) {
 		t6050_step(s, T6050_STEP_MCC0 + i);
 		readl(s->pwrgate + 0x120);
@@ -2828,7 +3181,8 @@ static void t6050_sleep_commit_regs(struct apple_sleep *s)
 		writel(PWRGATE_ON, s->pwrgate + 0x128);
 		readl(s->pwrgate + 0x130);
 		writel(PWRGATE_ON, s->pwrgate + 0x130);
-		t6050_mcc_release(s, i);
+		if (!r->early_dropped)
+			t6050_mcc_release(s, i);
 	}
 	/* Only after ANS's registered driver stop. Never stop ANS here. */
 	t6050_step(s, T6050_STEP_PHY_PARK);
@@ -2848,10 +3202,7 @@ static void t6050_sleep_commit_regs(struct apple_sleep *s)
 		}
 	}
 	t6050_step(s, T6050_STEP_WDT);
-	t6050_seq(s, T6050_SEQ_WDT);
-	writel(0, s->wdt + WDT_WD0_CTL);
-	apple_sleep_set_wd2(s, T6050_WDT_COMMIT_SECS);
-	writel(0, s->wdt_aux + 8);
+	t6050_sleep_commit_wdt(s);
 	/* The memory floor's voter to 0, not read */
 	t6050_step(s, T6050_STEP_FLOOR);
 	s->region->floor_changed |= BIT(1);
@@ -2885,8 +3236,11 @@ static void t6050_sleep_commit_regs(struct apple_sleep *s)
 	}
 	for (i = 0; i < 3; i++) {
 		t6050_step(s, T6050_STEP_PWRGATE0 + i);
-		/* CPMn's counters read, then pwrgate's three R/W */
-		if (r->cpm[i]) {
+		/*
+		 * CPMn's counters read, then pwrgate's three R/W. Clusters 1 and 2's CPM blocks
+		 * are gone once t6050_clusters_down_first() took them down.
+		 */
+		if (r->cpm[i] && !(i && r->early_dropped)) {
 			readq(r->cpm[i] + 0x8000);
 			readq(r->cpm[i] + 0x8008);
 		}
@@ -2985,7 +3339,7 @@ static void t6050_sleep_restore_display(struct apple_sleep *s)
 		r->disp_children_lowered[d] = 0;
 	}
 	r->display_lowered = 0;
-	bitmap_zero(r->manager_down, ARRAY_SIZE(t6050_ps_all));
+	bitmap_zero(r->manager_down, s->soc->regions->power.count);
 }
 
 static void t6050_sleep_restore_pmc(struct apple_sleep *s)
@@ -3049,6 +3403,7 @@ static void t6050_sleep_refusal_raise(struct apple_sleep *s)
 		}
 	}
 	r->state4_set = 0;
+	t6050_venc0_restore(s);
 	/* AUSS and its children: between the caps and the idle words, as the entry had them */
 	t6050_auss_restore(s);
 	for (i = ARRAY_SIZE(t6050_late_off); i-- > 0;) {
@@ -3253,15 +3608,204 @@ static void t6050_wake_report(struct apple_sleep *s)
 			r->auss_lowered, timeouts);
 }
 
+/*
+ * The AP wake sources by number, as the ADT's /arm-io/pmgr ap-wake-sources names them (the
+ * J714s's and the J716c's are the same). Their status words are sticky: each source that
+ * raised a wake keeps its bit set, at +0x34 for the ten words on this die and at +0x10 for the
+ * GFX die's one.
+ */
+#define T6050_WAKE_STATUS	0x34
+#define T6050_WAKE_STATUS_GFX	0x10
+
+static const struct {
+	u16 id;
+	const char *name;
+} t6050_wake_names[] = {
+	{ 16, "AOP.GPIO.IRQ4" }, { 18, "AOP.GPIO.IRQ6" }, { 28, "AOP.Outbox0_NotEmpty" },
+	{ 30, "AOP.Outbox2_NotEmpty" }, { 38, "AOP2.Outbox2_NotEmpty" }, { 39, "AOP.CPUWakeupAP" },
+	{ 62, "NUB.WakeupAP" }, { 65, "NUB.GPIO.IRQ2" }, { 69, "NUB.GPIO.IRQ6" },
+	{ 71, "NUB.APWatchdog" }, { 72, "NUB.APWakeupTime" }, { 73, "NUB.SPMI0Sw0IRQ" },
+	{ 74, "NUB.SPMI0Sw1IRQ" }, { 76, "NUB.SPMI0Sw3IRQ" }, { 122, "SMC.CPUWakeupAP" },
+	{ 127, "SMC.OutboxNotEmpty" }, { 147, "ATC0.PMGRCIOWakeup" }, { 148, "ATC1.PMGRCIOWakeup" },
+	{ 149, "ATC2.PMGRCIOWakeup" }, { 150, "ATC3.PMGRCIOWakeup" }, { 151, "ATC0.PMGRUSBWakeup" },
+	{ 152, "ATC1.PMGRUSBWakeup" }, { 153, "ATC2.PMGRUSBWakeup" }, { 154, "ATC3.PMGRUSBWakeup" },
+	{ 171, "MTP.DOCK.CHANNELS.AP0.IRQ" }, { 183, "MTP.OutboxNotEmpty" },
+	{ 290, "AOP2.CPUWakeupAP" },
+};
+
+/* At the start of the wake, before anything is touched: the sticky wake status */
+static void t6050_wake_source_read(struct apple_sleep *s)
+{
+	struct apple_sleep_region_state *r = s->region;
+	unsigned int i;
+
+	r->wake_status_valid = false;
+	if (!r->wake || !r->wake_gfx)
+		return;
+	for (i = 0; i < T6050_WAKE_WORDS; i++)
+		r->wake_status[i] = readl(r->wake + T6050_WAKE_STATUS + 4 * i);
+	r->wake_status[T6050_WAKE_WORDS] = readl(r->wake_gfx + T6050_WAKE_STATUS_GFX);
+	r->wake_status_valid = true;
+	r->wake_status_fresh = true;
+}
+
+/* Raw latched status, not exclusive attribution or proof that a source was enabled. */
+static void t6050_wake_source_report(struct apple_sleep *s)
+{
+	struct apple_sleep_region_state *r = s->region;
+	unsigned int w, b, i, id;
+
+	BUILD_BUG_ON(ARRAY_SIZE(r->wake_status) != T6050_WAKE_WORDS + 1);
+	if (!r->wake_status_valid)
+		return;
+	r->wake_status_valid = false;
+	for (w = 0; w < T6050_WAKE_WORDS; w++)
+		for (b = 0; b < 32; b++) {
+			if (!(r->wake_status[w] & BIT(b)))
+				continue;
+			id = 32 * w + b;
+			for (i = 0; i < ARRAY_SIZE(t6050_wake_names); i++)
+				if (t6050_wake_names[i].id == id)
+					break;
+			if (i < ARRAY_SIZE(t6050_wake_names))
+				dev_info(s->dev, "wake status set: AP %u %s\n", id,
+					 t6050_wake_names[i].name);
+			else
+				dev_info(s->dev, "wake status set: AP %u\n", id);
+		}
+	for (b = 0; b < 32; b++)
+		if (r->wake_status[T6050_WAKE_WORDS] & BIT(b))
+			dev_info(s->dev, "wake status set: GFX %u\n", b);
+}
+
+/* Only the SMC's lines are latched: its own wake, whatever else was armed. */
+static bool t6050_smc_woke_alone(struct apple_sleep *s)
+{
+	struct apple_sleep_region_state *r = s->region;
+	u32 smc[T6050_WAKE_WORDS] = {};
+	unsigned int i;
+	bool any = false;
+
+	if (!r || !r->wake || !r->wake_gfx || r->wake_status[T6050_WAKE_WORDS])
+		return false;
+	for (i = 0; i < ARRAY_SIZE(t6050_wake_names); i++) {
+		u32 id = t6050_wake_names[i].id;
+
+		if (strstarts(t6050_wake_names[i].name, "SMC.") &&
+		    id / 32 < T6050_WAKE_WORDS)
+			smc[id / 32] |= BIT(id % 32);
+	}
+	for (i = 0; i < T6050_WAKE_WORDS; i++) {
+		if (r->wake_status[i] & ~smc[i])
+			return false;
+		any |= !!r->wake_status[i];
+	}
+
+	return any;
+}
+
+/* @n words appended to @buf at @len as " %08x"; the new length */
+static int t6050_wake_words(char *buf, int len, int size, const u32 *w, unsigned int n)
+{
+	unsigned int i;
+
+	for (i = 0; i < n; i++)
+		len += scnprintf(buf + len, size - len, " %08x", w[i]);
+	return len;
+}
+
+/*
+ * After each wake, one line in the form of macOS's console's ("system wake events: NUB.SPMI0Sw3IRQ
+ * nub-spmi0.0x02 nub-spmi-a1.0x0B rtc", wm2): the AP wake sources whose status is set, by their ADT
+ * names; the SPMI sources the wake acknowledged (latched and enabled), as <controller>.0x<source>
+ * with nub-spmi0 by its ADT name and the others by their nodes; and rtc if the PMU's alarm had
+ * fired. The SMC's reasons are its wake record's. Like macOS's, these are latched events, not
+ * proof that one of them alone raised the wake. The words as read go to the debug log.
+ */
+static void t6050_wake_events_report(struct apple_sleep *s)
+{
+	struct apple_sleep_region_state *r = s->region;
+	char ev[320], raw[320];
+	const int lim = sizeof(ev) - 4;	/* room for " ..." */
+	struct device_node *np;
+	unsigned int w, b, i, id;
+	int n = 0, m;
+
+	if (r->wake_status_fresh) {
+		for (w = 0; w < T6050_WAKE_WORDS; w++)
+			for (b = 0; b < 32; b++) {
+				if (!(r->wake_status[w] & BIT(b)))
+					continue;
+				id = 32 * w + b;
+				for (i = 0; i < ARRAY_SIZE(t6050_wake_names); i++)
+					if (t6050_wake_names[i].id == id)
+						break;
+				if (i < ARRAY_SIZE(t6050_wake_names))
+					n += scnprintf(ev + n, lim - n, " %s",
+						       t6050_wake_names[i].name);
+				else
+					n += scnprintf(ev + n, lim - n, " AP%u", id);
+			}
+		for (b = 0; b < 32; b++)
+			if (r->wake_status[T6050_WAKE_WORDS] & BIT(b))
+				n += scnprintf(ev + n, lim - n, " GFX%u", b);
+	}
+	for (b = 0; r->spmi_src_valid && b < ARRAY_SIZE(r->spmi_src_acked); b++) {
+		np = b ? of_parse_phandle(s->dev->of_node, "apple,spmi-buses", b - 1) : NULL;
+		for (i = 0; i < 32 * T6050_SPMI_SRC_WORDS; i++) {
+			if (!(r->spmi_src_acked[b][i / 32] & BIT(i % 32)))
+				continue;
+			if (np)
+				n += scnprintf(ev + n, lim - n, " %pOFP.0x%02X", np, i);
+			else
+				n += scnprintf(ev + n, lim - n, " %s.0x%02X",
+					       b ? "?" : "nub-spmi0", i);
+		}
+		of_node_put(np);
+	}
+	if (!r->pmu_wake_rtc_ret && (r->pmu_wake_rtc_ctl & T6050_RTC_CTL_FIRED))
+		n += scnprintf(ev + n, lim - n, " rtc");
+	if (n >= lim - 1)
+		n += scnprintf(ev + n, sizeof(ev) - n, " ...");
+	dev_info(s->dev, "wake events:%s\n", n ? ev : " none");
+
+	if (r->wake_status_fresh) {
+		m = scnprintf(raw, sizeof(raw), "AP status");
+		m = t6050_wake_words(raw, m, sizeof(raw), r->wake_status, T6050_WAKE_WORDS + 1);
+		dev_dbg(s->dev, "wake events: %s\n", raw);
+	}
+	for (b = 0; r->spmi_src_valid && b < ARRAY_SIZE(r->spmi_src_acked); b++) {
+		for (i = 0; i < T6050_SPMI_SRC_WORDS; i++)
+			if (r->spmi_src_latched[b][i] | r->spmi_src_enabled[b][i])
+				break;
+		if (i == T6050_SPMI_SRC_WORDS)
+			continue;
+		np = b ? of_parse_phandle(s->dev->of_node, "apple,spmi-buses", b - 1) : NULL;
+		if (np)
+			m = scnprintf(raw, sizeof(raw), "%pOFP latched", np);
+		else
+			m = scnprintf(raw, sizeof(raw), "%s latched", b ? "?" : "nub-spmi0");
+		of_node_put(np);
+		m = t6050_wake_words(raw, m, sizeof(raw), r->spmi_src_latched[b],
+				     T6050_SPMI_SRC_WORDS);
+		m += scnprintf(raw + m, sizeof(raw) - m, ", enabled");
+		m = t6050_wake_words(raw, m, sizeof(raw), r->spmi_src_enabled[b],
+				     T6050_SPMI_SRC_WORDS);
+		dev_dbg(s->dev, "wake events: %s\n", raw);
+	}
+}
+
 static void t6050_sleep_wake_regs(struct apple_sleep *s)
 {
 	struct apple_sleep_region_state *r = s->region;
 	unsigned int i;
 	u32 value;
 
+	t6050_wake_source_read(s);
+
 	if (r->spmi_masked) {
-		/* What the PMU sent while the SoC slept (its wake), before the run-time mask */
-		t6050_spmi_pmu_ack(s);
+		/* What the controllers latched while the SoC slept, before the run-time masks */
+		t6050_spmi_src_ack(s);
 		writel(r->spmi_mask[0], s->spmi + M5_SPMI_IRQ_EN);
 		for (i = 0; i < ARRAY_SIZE(r->spmi_bus); i++)
 			if (r->spmi_bus[i])
@@ -3276,8 +3820,7 @@ static void t6050_sleep_wake_regs(struct apple_sleep *s)
 		r->gfx_aic[2] = readl(r->aic_gfx + 0x14);
 	}
 	/* The complexes' requests back, in macOS's early wake order */
-	writel(0, s->wdt + WDT_WD2_CTL);
-	apple_sleep_set_wd2(s, WDT_SUSPEND_SECS);
+	t6050_sleep_wake_wdt(s);
 	for (i = 0; i < 3; i++)
 		writel(r->cluster_saved[i], s->cluster + 4 * i);
 	writel(PWRGATE_ON, s->pwrgate);
@@ -3325,6 +3868,8 @@ static void t6050_sleep_finish(struct apple_sleep *s)
 	if (!r->attempt_active)
 		return;
 	r->attempt_active = false;
+	t6050_wake_source_report(s);
+	t6050_clusters_down_first_report(s);
 	t6050_sleep_undo_regs(s);
 	/* Before any device resumes: the radio host's noirq resume asks for the result. */
 	if (r->committed && r->n1_host) {
@@ -3332,17 +3877,66 @@ static void t6050_sleep_finish(struct apple_sleep *s)
 		if (r->n1_up_ret)
 			dev_err(s->dev, "radio's PCIe PHY and root complex not back: %d\n", r->n1_up_ret);
 	}
-	/* Also reached after a reversible refusal. No PMU sleep/wake command: the DT's stage. */
-	value = r->pmu_wake_stage;
-	ret = r->boot_stage_written && r->pmu_wake_stage_valid ?
-		t6050_sleep_pmu_xfer(s, T6050_SPMI_EXT_WRITEL, T6050_PMU_BOOT_STAGE, &value, NULL, 1) :
-		0;
-	r->boot_stage_written = false;
+	/*
+	 * After a wake the PMU's steps wait for the SMC's first wake commands
+	 * (t6050_sleep_pmu_wake). After a reversible refusal the DT's stage goes back now. No PMU
+	 * sleep/wake command.
+	 */
+	ret = 0;
+	if (r->committed) {
+		r->pmu_wake_pending = true;
+	} else {
+		value = r->pmu_wake_stage;
+		if (r->boot_stage_written && r->pmu_wake_stage_valid)
+			ret = t6050_sleep_pmu_xfer(s, T6050_SPMI_EXT_WRITEL, T6050_PMU_BOOT_STAGE,
+						   &value, NULL, 1);
+		r->boot_stage_written = false;
+	}
 	t6050_sleep_ptd_ownership(s, false);
 	r->usb_aon_kept = 0;
 	dev_dbg(s->dev, "entry %s: replay %u, timeouts %u, late %u, PMU %u/%d, DART stops %#x\n",
 		r->committed ? "returned" : "refused", s->ps_rewoken, s->ps_rewake_timeouts,
 		r->late_errors, r->pmu_errors, ret, r->dart_done);
+}
+
+/*
+ * After a wake, once the SMC has had AP ON, its wake record read and waka (apple_sleep_report),
+ * the PMU's steps in macOS's order: its RTC control read, the DT's boot stage, the DT's PMU
+ * reads as at the entry. In the macOS-HV traces mxt4 and dk1 they start 95 ms into the wake,
+ * 27 ms after waka (no wait here: the SMC's steps are done when the PMU's begin). Linux wrote the
+ * boot stage first, and the SMC's MBSE then read 0x106fe where macOS's reads 0x10650. Then the
+ * wake's events.
+ */
+static void t6050_sleep_pmu_wake(struct apple_sleep *s)
+{
+	struct apple_sleep_region_state *r = s->region;
+	u8 value, rd[sizeof_field(struct apple_sleep_region_state, pmu_rd)];
+	unsigned int i, n;
+	int ret = 0;
+
+	if (!r->pmu_wake_pending)
+		return;
+	r->pmu_wake_pending = false;
+	r->pmu_wake_rtc_ctl = 0;
+	r->pmu_wake_rtc_ret = t6050_sleep_pmu_xfer(s, T6050_SPMI_EXT_READL, T6050_RTC_CTL, NULL,
+						   &r->pmu_wake_rtc_ctl, 1);
+	if (r->boot_stage_written && r->pmu_wake_stage_valid) {
+		value = r->pmu_wake_stage;
+		ret = t6050_sleep_pmu_xfer(s, T6050_SPMI_EXT_WRITEL, T6050_PMU_BOOT_STAGE, &value,
+					   NULL, 1);
+		for (i = 0, n = 0; i < r->npmu_reads; n += r->pmu_reads[i][1], i++) {
+			if (n + r->pmu_reads[i][1] > sizeof(rd))
+				break;
+			t6050_sleep_pmu_xfer(s, T6050_SPMI_EXT_READL, r->pmu_reads[i][0], NULL,
+					     rd + n, r->pmu_reads[i][1]);
+		}
+	}
+	r->boot_stage_written = false;
+	if (ret)
+		dev_warn(s->dev, "PMU boot stage not put back after the wake: %d\n", ret);
+	t6050_wake_events_report(s);
+	r->spmi_src_valid = false;
+	r->wake_status_fresh = false;
 }
 
 static const struct apple_sleep_ops t6050_sleep_ops = {
@@ -3371,6 +3965,7 @@ static const struct apple_sleep_ops t6050_sleep_ops = {
 	.cpu_down = t6050_cpu_down,
 	.wake = t6050_sleep_wake_regs,
 	.finish = t6050_sleep_finish,
+	.pmu_wake = t6050_sleep_pmu_wake,
 	.cpu_prepare = t6050_sleep_cpu_prepare,
 	.cpu_restore = t6050_sleep_cpu_restore,
 };
@@ -3416,3 +4011,141 @@ static const struct apple_sleep_soc t6050_sleep_soc = {
 		},
 	},
 };
+
+/*
+ * The J716c's banks, checked against the addresses its own hardware description gives before
+ * anything is mapped, and its display slots against the coprocessors they name.
+ */
+static int t6050_j716c_apertures(struct apple_sleep *s)
+{
+	static const resource_size_t base[T6050_REGIONS] = {
+		0x280600000ULL, 0x280900000ULL, 0x288300000ULL, 0x2300e80000ULL,
+		0x2380600000ULL, 0x2388300000ULL, 0x280760000ULL, 0x2807d4000ULL,
+		0x280930000ULL, 0x2300e90000ULL, 0x2380760000ULL, 0x280700000ULL,
+		0x2380700000ULL, 0x2807ec000ULL, 0x280950000ULL, 0x23807dc000ULL,
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(base); i++) {
+		struct resource res;
+		int index = of_property_match_string(s->dev->of_node, "reg-names",
+						     t6050_regions[i].name);
+
+		if (index < 0 || of_address_to_resource(s->dev->of_node, index, &res) ||
+		    res.start != base[i] || resource_size(&res) != t6050_regions[i].size)
+			return dev_err_probe(s->dev, -EINVAL, "wrong J716c aperture %s\n",
+					     t6050_regions[i].name);
+	}
+	/* Power words must describe the actual display instance in this slot. */
+	for (i = 0; i < s->soc->ndisp; i++) {
+		static const resource_size_t asc[] = {
+			0x48ae00000ULL, 0x2b2e00000ULL, 0x392e00000ULL,
+			0x302e00000ULL, 0x306e00000ULL,
+		};
+		struct device_node *np __free(device_node) =
+			of_parse_phandle(s->dev->of_node, "apple,display-coprocessors", i);
+		struct resource res;
+		int index;
+
+		if (!np || !of_device_is_compatible(np, i ? "apple,t6050-dcpext" :
+							  "apple,t6050-dcp"))
+			return -EINVAL;
+		index = of_property_match_string(np, "reg-names", "coproc");
+		if (index < 0 || of_address_to_resource(np, index, &res) ||
+		    res.start != asc[i] || resource_size(&res) != 0x4000)
+			return dev_err_probe(s->dev, -EINVAL, "wrong display %u aperture\n", i);
+	}
+	return 0;
+}
+
+/* The full sleep's map, from the same checked banks */
+static int t6050_j716c_sleep_map(struct apple_sleep *s)
+{
+	return t6050_j716c_apertures(s) ?: t6050_sleep_map_regs(s);
+}
+
+/* The J714s's operations, with the J716c's checked map. */
+static const struct apple_sleep_ops t6050_j716c_sleep_ops = {
+	.deep_wfi_arm = t8140_deep_wfi_arm,
+	.resume = cpu_resume,
+	.aic_mask_all = aic_sleep_mask_all,
+	.aic_ack = aic_sleep_ack,
+	.aic_restore = aic_sleep_restore,
+	.plan_complex_request = t6050_sleep_plan_complex_request,
+	.map_regs = t6050_j716c_sleep_map,
+	.begin = t6050_sleep_begin,
+	.check = t6050_sleep_check_alarm,
+	.display_off = t6050_sleep_display_prepare,
+	.display_stop = sleep_v27_final_stop,
+	.before_enclave = t6050_sleep_before_enclave,
+	.stage = t6050_sleep_stage,
+	.final_check = t6050_sleep_final_check,
+	.commit_notice = t6050_sleep_commit_notice,
+	.after_ans = t6050_sleep_after_ans,
+	.prepare_regs = t6050_sleep_prepare_regs,
+	.undo_regs = t6050_sleep_undo_regs,
+	.commit_begin = t6050_sleep_pre_commit,
+	.commit_regs = t6050_sleep_commit_regs,
+	.post_timer = t6050_sleep_post_timer,
+	.cpu_down = t6050_cpu_down,
+	.wake = t6050_sleep_wake_regs,
+	.finish = t6050_sleep_finish,
+	.pmu_wake = t6050_sleep_pmu_wake,
+	.cpu_prepare = t6050_sleep_cpu_prepare,
+	.cpu_restore = t6050_sleep_cpu_restore,
+};
+
+/*
+ * The J716c (M5 Max): the J714s's entry and wake over the Max inventory. The Max's own power
+ * words (the second encoder, AMCC16-31) are in no list the entry lowers: saved at the entry
+ * and put back at the wake if they dropped. No PMP runs on this board.
+ */
+static const struct apple_sleep_soc t6050_j716c_sleep_soc = {
+	.strict_gate_inventory = true,
+	.gate_coprocs = t6050_gate_coprocs,
+	.ngate_coprocs = ARRAY_SIZE(t6050_gate_coprocs),
+	.gate_off = t6050_gate_off,
+	.ngate_off = ARRAY_SIZE(t6050_gate_off),
+	.ops = &t6050_j716c_sleep_ops,
+	.smc_policy = &t6050_smc_policy,
+	.early_context = true,
+	.own_wake = true,
+	.pmp_unstarted = true,
+	.clusters_down_first = true,
+	.lower_venc0 = true,
+	.machine = "apple,j716c",
+	.spmi_notify_sleep = 0x2000001,
+	.boot_mpidr = 0x040000,
+	.cpu_count = 18,
+	.cpu_cluster_affinity = 1,
+	.cpu_clusters = 3,
+	.cpu_cores_per_cluster = 6,
+	.cpu_start_stride = 6,
+	.cpu_valid = t6050_sleep_cpu_valid,
+	.ndisp = 5,
+	.regions = &t6050_j716c_region_profile,
+	.ps = {
+		.ans = SLEEP_REGION_WORD(T6050_PS1, 0x140),
+		.apcie_sys_gp = SLEEP_REGION_WORD(T6050_PS1, 0x280),
+		.sep = SLEEP_REGION_WORD(T6050_PS1, 0x298),
+		.sio_cpu = SLEEP_REGION_WORD(T6050_PS1, 0x2a0),
+		.disp = {
+			{ SLEEP_REGION_WORD(T6050_PS1, 0x1a8), SLEEP_REGION_WORD(T6050_PS1, 0x198),
+			  SLEEP_REGION_WORD(T6050_PS1, 0x180) },
+			{ SLEEP_REGION_WORD(T6050_PS0, 0x278), SLEEP_REGION_WORD(T6050_PS0, 0x268),
+			  SLEEP_REGION_WORD(T6050_PS0, 0x200) },
+			{ SLEEP_REGION_WORD(T6050_PS0, 0x2e0), SLEEP_REGION_WORD(T6050_PS0, 0x2d0),
+			  SLEEP_REGION_WORD(T6050_PS0, 0x230) },
+			{ SLEEP_REGION_WORD(T6050_PS0, 0x2b0), SLEEP_REGION_WORD(T6050_PS0, 0x2a0),
+			  SLEEP_REGION_WORD(T6050_PS0, 0x220) },
+			{ SLEEP_REGION_WORD(T6050_PS0, 0x2c8), SLEEP_REGION_WORD(T6050_PS0, 0x2b8),
+			  SLEEP_REGION_WORD(T6050_PS0, 0x228) },
+		},
+	},
+};
+
+/* The full T6050 entries: the J714s's and the J716c's */
+static bool apple_sleep_t6050_full(const struct apple_sleep *s)
+{
+	return s && (s->soc == &t6050_sleep_soc || s->soc == &t6050_j716c_sleep_soc);
+}

@@ -820,6 +820,7 @@ int mt_register_regulatory_gate(struct mt7932 *m)
 {
 	static const int rates[] = {10,20,55,110,60,90,120,180,240,360,480,540};
 	static const u32 ciphers[] = { WLAN_CIPHER_SUITE_CCMP,
+				       WLAN_CIPHER_SUITE_TKIP,
 				       WLAN_CIPHER_SUITE_AES_CMAC };
 	static const u32 akms[] = {
 		WLAN_AKM_SUITE_PSK,
@@ -956,6 +957,7 @@ int mt_register_regulatory_gate(struct mt7932 *m)
 	}
 	m->wiphy_registered = true;
 	mt_policy_debugfs_init(m);
+	mt_restart_debugfs_init(m);
 	ret = mt_register_interface(m);
 	if (ret)
 		return ret;
