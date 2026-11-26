@@ -44,6 +44,11 @@ firmware 27.2:
 - the display processor's component unbinds with a release unanswered: its
   answer, the service's publication and a repeated request queue no work
   until the next bind, which takes the answer kept in the ticket;
+- on the M4 backend's compact transport, the production afk_send_compact()
+  commits a call with its first fragment under the provider's admission:
+  revoked right after the connect's own check, or while a call waits for
+  ring space (outside the admission), nothing goes out for the revoked
+  binding and no message is left half sent;
 - the M4 backend (26.6.2) still waits for its unanswered compact calls,
   until a revocation or the CRTC's power-off, which wakes the wait.
 
@@ -62,7 +67,8 @@ DCP = (ROOT / 'drivers/gpu/drm/apple/dcp.c').read_text()
 FABRIC = (ROOT / 'drivers/gpu/drm/apple/dcp-fabric.c').read_text()
 SESSION = (ROOT / 'drivers/gpu/drm/apple/dcp-fabric-session.h').read_text()
 TICKET = re.sub(r'^#include.*\n', '', (ROOT / 'drivers/gpu/drm/apple/afk-ticket.h').read_text(), flags=re.M)
-SOURCES = {'dcp': DCP, 'fabric': FABRIC, 'session': SESSION}
+AFK = (ROOT / 'drivers/gpu/drm/apple/afk.c').read_text()
+SOURCES = {'dcp': DCP, 'fabric': FABRIC, 'session': SESSION, 'afk': AFK}
 FUNCTIONS = [
     ('session', 'dcp_fabric_session_valid'),
     ('fabric', 'dcp_t8132_ext_m4_node'), ('fabric', 'dcp_is_t8132_ext'),
@@ -86,6 +92,7 @@ FUNCTIONS = [
     ('dcp', 'dcp_t8132_port_work'),
     ('dcp', 'dcp_typec_attach_repeated'), ('dcp', 'dcp_disable_typec_work'),
     ('dcp', 'dcp_enable_typec_work'),
+    ('afk', 'afk_compact_fragment_enqueue'), ('afk', 'afk_send_compact'),
 ]
 
 # name -> (source, old, new)
@@ -158,6 +165,12 @@ MUTATIONS = {
     'port-work-cancel-only': ('dcp', '\tdisable_work_sync(&dcp->t8132_port_work);', '\tcancel_work_sync(&dcp->t8132_port_work);'),
     # An answer that came while the work was off is never taken.
     'enable-drops-answer': ('dcp', '\t/* A release answered while the work was off frees its port now. */\n\tdcp_typec_attach_repeated(dcp);\n', ''),
+    # A compact call goes out without the provider's admission, as before.
+    'compact-ungated': ('afk', '\t\t\tret = dcp_dptx_send_gated(ep, afk_compact_fragment_enqueue, &first);',
+                        '\t\t\tret = afk_compact_fragment_enqueue(&first);'),
+    # The wait for ring space under the admission.
+    'compact-waits-gated': ('afk', '\t\t\tret = dcp_dptx_send_gated(ep, afk_compact_fragment_enqueue, &first);',
+                            '\t\t\tret = dcp_dptx_send_gated(ep, afk_compact_fragment_enqueue_waiting, &first);'),
     # DPMS does not wake the M4 backend's wait.
     'dpms-no-wake': ('dcp', '\tif (dcp->dptxep)\n\t\tafk_late_replies_wake(dcp->dptxep);\n}\n\n/*\n * Firmware 27: a T8132 dcpext\'s display attached',
                      '}\n\n/*\n * Firmware 27: a T8132 dcpext\'s display attached'),
@@ -198,6 +211,7 @@ PRE = r'''
 typedef uint64_t u64;
 typedef uint32_t u32;
 typedef uint8_t u8;
+typedef uint16_t u16;
 /* AFK_TICKET */
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x, v) ((x) = (v))
@@ -214,7 +228,22 @@ static unsigned int infos, warns, errs;
 static unsigned long jiffies;
 static unsigned long msecs_to_jiffies(unsigned int ms) { return ms; }
 #define time_after_eq(a, b) ((long)((a) - (b)) >= 0)
-static void usleep_range(unsigned long a, unsigned long b) { (void)a; (void)b; }
+/* What another thread does while this one sleeps. */
+static void (*at_sleep)(void);
+/* Inside the provider's admission of a binding (apple_dp_tunnel_binding_call()). */
+static bool in_admission;
+static void usleep_range(unsigned long a, unsigned long b)
+{
+	(void)a; (void)b;
+	/* A wait never holds the provider's lock. */
+	assert(!in_admission);
+	if (at_sleep) {
+		void (*hook)(void) = at_sleep;
+
+		at_sleep = NULL;
+		hook();
+	}
+}
 struct task_struct { int unused; };
 static struct task_struct the_task;
 #define current (&the_task)
@@ -322,7 +351,10 @@ struct device_node { const char *compatible; bool v27_2; };
 struct device { struct device_node *of_node; };
 struct platform_device { struct device dev; };
 struct apple_dcp;
-struct apple_dcp_afkep { int compact_orphan_wq; bool compact; struct apple_dcp *dcp; };
+struct apple_dcp_afkep {
+	int compact_orphan_wq; bool compact; struct apple_dcp *dcp;
+	struct mutex compact_tx_lock;
+};
 struct apple_epic_service { struct apple_dcp_afkep *ep; };
 struct dcp_fabric_session { u64 generation; u64 cookie; };
 struct dptx_port {
@@ -417,11 +449,62 @@ static bool rpc_seen(const char *what)
 int dcp_dptx_send_gated(struct apple_dcp_afkep *ep, int (*enqueue)(void *arg), void *arg);
 static struct apple_dcp_afkep dptxep;
 static int queue_rpc(void *what) { rpc(what); return 0; }
+/*
+ * Compact EPIC (the M4 backend): the production afk_send_compact() writes a
+ * call's fragments to the ring (afk_send_compact_fragment(), mocked); the
+ * first commits it. The ring is full for ring_full tries.
+ */
+#define AFK_COMPACT_FRAGMENT_SIZE 1028U
+#define AFK_COMPACT_MESSAGE_MAX (1024U * 1024U)
+#define FIELD_PREP(f, v) ((u64)(v) << 52)
+#define RBEP_TYPE 0
+#define RBEP_WAIT_FOR_SPACE 0x8
+#define kvzalloc(n, f) calloc(1, n)
+#define kvfree(p) free(p)
+#define GFP_KERNEL 0
+struct epic_compact_hdr { u8 seq, flags; u16 intf_id; u32 length; u64 timestamp; } __attribute__((packed));
+struct epic_compact_sub_hdr { u8 type, category, unk, flags; u32 reserved; } __attribute__((packed));
+static bool compact_mode;
+static unsigned int ring_full, fragments, space_waits, desyncs;
+static int afk_send_compact_fragment(struct apple_dcp_afkep *ep, u16 intf_id, const void *body,
+				     size_t size, u32 total)
+{
+	(void)ep; (void)intf_id; (void)total;
+	if (ring_full) {
+		ring_full--;
+		return -EAGAIN;
+	}
+	/* The first fragment carries the call: the timestamp, the sub-header, then the payload. */
+	if (!fragments++)
+		rpc((const char *)body + 8 + sizeof(struct epic_compact_sub_hdr));
+	(void)size;
+	return 0;
+}
+static void afk_send(struct apple_dcp_afkep *ep, u64 message) { (void)ep; (void)message; space_waits++; }
+static void afk_compact_tx_desync(struct apple_dcp_afkep *ep, int ret) { (void)ep; (void)ret; desyncs++; }
+static int afk_send_compact(struct apple_dcp_afkep *ep, u16 intf_id, u8 type, u8 category,
+			    const void *payload, size_t payload_size, size_t wire_size);
+/* The mutation that waits for ring space inside the admission. */
+static int afk_compact_fragment_enqueue(void *data);
+static int afk_compact_fragment_enqueue_waiting(void *data)
+{
+	int ret;
+
+	while ((ret = afk_compact_fragment_enqueue(data)) == -EAGAIN)
+		usleep_range(500, 1000);
+	return ret;
+}
 static int send(const char *what)
 {
 	unsigned int before = nrpcs;
-	int ret = dcp_dptx_send_gated(&dptxep, queue_rpc, (void *)what);
+	int ret;
 
+	if (compact_mode) {
+		fragments = 0;
+		ret = afk_send_compact(&dptxep, 1, 0xc0, 1, what, strlen(what) + 1, strlen(what) + 1);
+	} else {
+		ret = dcp_dptx_send_gated(&dptxep, queue_rpc, (void *)what);
+	}
 	/* Refused by the gate: nothing went out. */
 	assert(!ret || nrpcs == before);
 	return ret;
@@ -497,23 +580,32 @@ static bool dptx_service_available(struct dptx_port *p) { return p->service; }
 static bool binding_live = true;
 /* The provider revokes the binding right after the n-th check of it, under its own lock. */
 static unsigned int revoke_after_checks;
+/* The DPTX calls made when it did. */
+static int revoked_at = -1;
 static bool apple_dp_tunnel_binding_live(void *binding)
 {
 	bool live = binding_live;
 
 	(void)binding;
-	if (revoke_after_checks && !--revoke_after_checks)
+	if (revoke_after_checks && !--revoke_after_checks) {
 		binding_live = false;
+		revoked_at = nrpcs;
+	}
 	return live;
 }
 static unsigned int gated_calls;
 static int apple_dp_tunnel_binding_call(void *binding, int (*call)(void *arg), void *arg)
 {
+	int ret;
+
 	(void)binding;
 	if (!binding_live)
 		return -ESTALE;
 	gated_calls++;
-	return call(arg);
+	in_admission = true;
+	ret = call(arg);
+	in_admission = false;
+	return ret;
 }
 #define symbol_get(sym) (&sym)
 #define symbol_put(sym) ((void)0)
@@ -610,6 +702,9 @@ static void setup(struct device_node *node)
 	late_ticket = NULL; late_seq = 0; at_release_timeout = NULL; set_hpd_high_ret = 0;
 	at_rpc = NULL; at_link_wait = at_fence_wait = NULL; waiter = NULL;
 	revoke_after_checks = gated_calls = 0;
+	revoked_at = -1;
+	compact_mode = false; dptxep.compact = false; ring_full = fragments = space_waits = desyncs = 0;
+	at_sleep = NULL;
 }
 
 /* The provider's tunnel goes: it revokes, then the fabric detaches (dcp_tb_release_locked()). */
@@ -1207,6 +1302,61 @@ static void lifetime_cases(void)
 	puts("ok lifetime: nothing queues the port work after unbind; the next bind takes the answer");
 }
 
+/*
+ * The M4 backend's compact transport: revoked right after the connect's own
+ * admission check, before its call is queued, the call is refused at its
+ * first fragment, under the provider's admission; revoked while the call
+ * waits for ring space, which it does outside the admission, the next try
+ * is refused. Nothing goes out for the revoked binding, and no message is
+ * left half sent.
+ */
+static void compact_cases(void)
+{
+	unsigned int revoked = 0;
+
+	for (unsigned int i = 1; i <= 8; i++) {
+		setup(&j713_26);
+		compact_mode = dptxep.compact = true;
+		dcp->typec_cable_connected = true;
+		scoped_guard(mutex, &dcp->hpd_mutex)
+			dcp->typec_reconnect_session = dcp_session_locked(dcp);
+		revoke_after_checks = i;
+		dcp_dptx_connect_raw(dcp, 0, NULL, &dcp->typec_reconnect_session, true, false);
+		if (revoked_at < 0)
+			continue;
+		revoked++;
+		/* After the revocation only the release of a display requested goes out. */
+		for (unsigned int k = revoked_at; k < nrpcs; k++)
+			assert(!strcmp(rpcs[k], "release"));
+		assert(!desyncs && !dcp->dptx_gate_lock.held);
+	}
+	assert(revoked >= 4);
+	puts("ok compact: revoked right after its admission check: its call is refused at the ring");
+
+	setup(&j713_26);
+	compact_mode = dptxep.compact = true;
+	dcp->typec_cable_connected = true;
+	scoped_guard(mutex, &dcp->hpd_mutex)
+		dcp->typec_reconnect_session = dcp_session_locked(dcp);
+	ring_full = 1;
+	at_sleep = revoke;
+	assert(dcp_dptx_connect_raw(dcp, 0, NULL, &dcp->typec_reconnect_session, true, false) == -ESTALE);
+	assert(nrpcs == 0 && space_waits == 1 && !desyncs && !hpd_high);
+	puts("ok compact: revoked while its call waits for ring space: refused at the next try");
+
+	/* A live binding: every call goes out at its first fragment, under the admission. */
+	setup(&j713_26);
+	compact_mode = dptxep.compact = true;
+	dcp->typec_cable_connected = true;
+	scoped_guard(mutex, &dcp->hpd_mutex)
+		dcp->typec_reconnect_session = dcp_session_locked(dcp);
+	ring_full = 2;
+	assert(dcp_dptx_connect_raw(dcp, 0, NULL, &dcp->typec_reconnect_session, true, false) == 0);
+	assert(hpd_high && gated_calls == 5 && rpc_seen("connect") && rpc_seen("request"));
+	assert(space_waits == 1 && !desyncs && !dcp->tb_lock.held);
+	puts("ok compact: a live binding's calls go out, waiting for ring space outside the admission");
+}
+
 int main(void)
 {
 	connect_cases();
@@ -1215,6 +1365,7 @@ int main(void)
 	failed_connect_cases();
 	resume_cases();
 	lifetime_cases();
+	compact_cases();
 	puts("PASS firmware-27.2 T8132 dcpext deferred connect, revocation, DPMS, release and its fence");
 	return 0;
 }
@@ -1230,6 +1381,7 @@ def build(tmp, name, sources):
     unit += define(sources['dcp'], 'DCP_LINKCFG_POLL_MS')
     unit += 'typedef bool apple_dp_tunnel_binding_live_t(void *);\n'
     unit += 'typedef int apple_dp_tunnel_binding_call_t(void *, int (*)(void *), void *);\n'
+    unit += re.search(r'^struct afk_compact_fragment \{.*?^\};\n', sources['afk'], re.M | re.S).group(0)
     for src, fn in FUNCTIONS:
         body = function(sources[src], fn)
         body = body.replace('typeof(apple_dp_tunnel_binding_live) *live;',

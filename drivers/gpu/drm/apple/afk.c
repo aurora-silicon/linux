@@ -695,6 +695,22 @@ out_unlock:
 	return ret;
 }
 
+/* One fragment of a compact message (afk_compact_fragment_enqueue()). */
+struct afk_compact_fragment {
+	struct apple_dcp_afkep *ep;
+	u16 intf_id;
+	const void *body;
+	size_t size;
+	u32 total;
+};
+
+static int afk_compact_fragment_enqueue(void *data)
+{
+	struct afk_compact_fragment *f = data;
+
+	return afk_send_compact_fragment(f->ep, f->intf_id, f->body, f->size, f->total);
+}
+
 /*
  * Send one complete message.  Fragments carry no offset or tag beyond the
  * repeated interface/length and the per-fragment sequence number, so the
@@ -728,8 +744,24 @@ static int afk_send_compact(struct apple_dcp_afkep *ep, u16 intf_id, u8 type,
 	deadline = jiffies + msecs_to_jiffies(5000);
 	while (offset < total) {
 		chunk = min_t(size_t, total - offset, AFK_COMPACT_FRAGMENT_SIZE);
-		ret = afk_send_compact_fragment(ep, intf_id, body + offset,
-						chunk, total);
+		/*
+		 * The first fragment commits the message: a tunnel connect's
+		 * call goes out only as the provider admits it, as a V2
+		 * command does (dcp_dptx_send_gated()). Each try is one write
+		 * to the ring; a wait for its space below is outside the
+		 * admission, and the next try checks it again.
+		 */
+		if (!offset) {
+			struct afk_compact_fragment first = {
+				.ep = ep, .intf_id = intf_id, .body = body,
+				.size = chunk, .total = total,
+			};
+
+			ret = dcp_dptx_send_gated(ep, afk_compact_fragment_enqueue, &first);
+		} else {
+			ret = afk_send_compact_fragment(ep, intf_id, body + offset,
+							chunk, total);
+		}
 		if (ret == -EAGAIN) {
 			if (!waiting_for_space) {
 				afk_send(ep, FIELD_PREP(RBEP_TYPE, RBEP_WAIT_FOR_SPACE) |
@@ -3235,9 +3267,10 @@ struct afk_command_send {
 
 /*
  * Take a command slot of @data's service and send the command: under the
- * service's lock, without waiting for anything, so that a gate
- * (dcp_dptx_send_gated()) may hold its own lock across it. On failure no
- * slot stays taken.
+ * service's lock, without waiting for the firmware or for ring space, so
+ * that a gate (dcp_dptx_send_gated()) may hold its own lock across it;
+ * ringing the mailbox can wait for its FIFO, which the coprocessor drains
+ * without any host lock. On failure no slot stays taken.
  */
 static int afk_command_enqueue(void *data)
 {

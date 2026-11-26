@@ -2546,9 +2546,13 @@ static bool dcp_connect_admitted(struct apple_dcp *dcp,
  * call is refused (-ESTALE), or after it. Only the queueing: the reply is
  * waited for after, as DCP's Activate for the binding takes the provider's
  * lock. The connect opens the gate around its calls (dcp_dptx_gate_open());
- * other senders and the connect's own release are not gated. Compact EPIC
- * (desktop 26.x, the M4 backend) queues its calls under a lock it can hold
- * while waiting for ring space, and keeps the check before each call.
+ * other senders and the connect's own release are not gated. Both
+ * transports: a V2 command takes its slot and goes out under the
+ * admission; a compact one (the M4 backend) commits with its first
+ * fragment, written under it, and waits for ring space outside it
+ * (afk_send_compact()). Neither waits for the firmware under the
+ * admission; ringing the mailbox can wait for its FIFO, which the
+ * coprocessor drains without any host lock.
  */
 static void dcp_dptx_gate_open(struct apple_dcp *dcp)
 {
