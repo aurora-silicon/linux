@@ -1277,12 +1277,130 @@ static int apple_pmp_start_describe(struct apple_pmp_report *rep,
 	return 0;
 }
 
+/*
+ * DIAGNOSTIC (T6030 sleep bring-up): the PTD inputs macOS 27.2's AP gives a running J516S PMP
+ * and Linux doesn't (s2r-full-boot-2), to find which one the PMP needs to survive the DCP's M3
+ * power-down. All three are off by default and take effect once the PMP is ready:
+ *  - diag_hold: request bits held set (macOS holds AGX, bit 4, while its GPU driver runs);
+ *  - diag_toggle: request bits set 5.1 s and cleared 1.07 s in turn (macOS's ISP, bit 6);
+ *  - diag_feed: +0x10b68 and +0x10b70 every 100 ms and +0x10c20 every second, with macOS's last
+ *    values before its sleep, after its two one-time +0x10b40..+0x10b60 writes.
+ */
+#define PMP_DIAG_TICK_MS	100
+#define PMP_DIAG_TOGGLE_ON	51
+#define PMP_DIAG_TOGGLE_PERIOD	62
+#define PMP_DIAG_SECOND		10
+
+static unsigned long pmp_diag_hold, pmp_diag_toggle;
+static bool pmp_diag_feed;
+static struct apple_pmp_report *pmp_diag_rep;
+static unsigned int pmp_diag_tick;
+static bool pmp_diag_fed_once;
+
+static void pmp_diag_work_fn(struct work_struct *work);
+static DECLARE_DELAYED_WORK(pmp_diag_work, pmp_diag_work_fn);
+
+static void pmp_diag_once(void __iomem *base)
+{
+	static const u64 first[] = { 0x2111100000000ULL, 0x2111200000000ULL };
+	unsigned int i, off;
+
+	for (i = 0; i < ARRAY_SIZE(first); i++) {
+		writeq(first[i], base + 0x10b40);
+		for (off = 0x10b48; off <= 0x10b60; off += 8)
+			writeq(0, base + off);
+	}
+}
+
+static void pmp_diag_work_fn(struct work_struct *work)
+{
+	struct apple_pmp_report *rep = READ_ONCE(pmp_diag_rep);
+	unsigned long hold = READ_ONCE(pmp_diag_hold);
+	unsigned long toggle = READ_ONCE(pmp_diag_toggle);
+	bool feed = READ_ONCE(pmp_diag_feed);
+	unsigned long flags;
+	u64 cur, want;
+
+	if (!rep)
+		return;
+	if (feed) {
+		if (!pmp_diag_fed_once) {
+			pmp_diag_once(rep->base);
+			pmp_diag_fed_once = true;
+		}
+		writeq(0x3f38db023f38a373ULL, rep->base + 0x10b68);
+		writeq(0x382bf7fcULL, rep->base + 0x10b70);
+		if (!(pmp_diag_tick % PMP_DIAG_SECOND))
+			writeq(6, rep->base + 0x10c20);
+	}
+	if (hold || toggle) {
+		spin_lock_irqsave(&rep->lock, flags);
+		cur = readq(rep->base + rep->offsets->tgt_read);
+		want = cur | hold;
+		if (pmp_diag_tick % PMP_DIAG_TOGGLE_PERIOD < PMP_DIAG_TOGGLE_ON)
+			want |= toggle;
+		else
+			want &= ~(u64)toggle;
+		if (want != cur)
+			writeq(want, rep->base + rep->offsets->tgt_write);
+		spin_unlock_irqrestore(&rep->lock, flags);
+	}
+	pmp_diag_tick++;
+	if (feed || hold || toggle)
+		schedule_delayed_work(&pmp_diag_work, msecs_to_jiffies(PMP_DIAG_TICK_MS));
+}
+
+static void pmp_diag_kick(void)
+{
+	if (READ_ONCE(pmp_diag_rep))
+		mod_delayed_work(system_wq, &pmp_diag_work, 0);
+}
+
+static int pmp_diag_set_ulong(const char *val, const struct kernel_param *kp)
+{
+	int ret = param_set_ulong(val, kp);
+
+	if (!ret)
+		pmp_diag_kick();
+	return ret;
+}
+
+static int pmp_diag_set_bool(const char *val, const struct kernel_param *kp)
+{
+	int ret = param_set_bool(val, kp);
+
+	if (!ret)
+		pmp_diag_kick();
+	return ret;
+}
+
+static const struct kernel_param_ops pmp_diag_ulong_ops = {
+	.set = pmp_diag_set_ulong,
+	.get = param_get_ulong,
+};
+
+static const struct kernel_param_ops pmp_diag_bool_ops = {
+	.set = pmp_diag_set_bool,
+	.get = param_get_bool,
+};
+
+module_param_cb(diag_hold, &pmp_diag_ulong_ops, &pmp_diag_hold, 0644);
+MODULE_PARM_DESC(diag_hold, "DIAGNOSTIC (T6030): PTD request bits held set while the PMP runs");
+module_param_cb(diag_toggle, &pmp_diag_ulong_ops, &pmp_diag_toggle, 0644);
+MODULE_PARM_DESC(diag_toggle, "DIAGNOSTIC (T6030): PTD request bits set 5.1 s, cleared 1.07 s, in turn");
+module_param_cb(diag_feed, &pmp_diag_bool_ops, &pmp_diag_feed, 0644);
+MODULE_PARM_DESC(diag_feed, "DIAGNOSTIC (T6030): macOS's periodic PTD words +0x10b68/+0x10b70 (100 ms) and +0x10c20 (1 s)");
+
 static void apple_pmp_start_finish(struct apple_pmp_start *st, int result)
 {
 	scoped_guard(mutex, &apple_pmp_start_mutex) {
 		if (!st->stopping)
 			st->result = result;
 		complete_all(&st->started);
+	}
+	if (!result && st->rep->offsets->start_at_probe) {
+		WRITE_ONCE(pmp_diag_rep, st->rep);
+		pmp_diag_kick();
 	}
 	if (result && READ_ONCE(st->enabled))
 		dev_err(st->rep->dev,
@@ -1522,6 +1640,10 @@ static void apple_pmp_start_drain(void *data)
 	}
 	/* A start in progress gives up at its next poll. */
 	cancel_work_sync(&st->work);
+	if (READ_ONCE(pmp_diag_rep) == st->rep) {
+		WRITE_ONCE(pmp_diag_rep, NULL);
+		cancel_delayed_work_sync(&pmp_diag_work);
+	}
 	if (waiters)
 		wait_for_completion(&st->waiters_done);
 	/*
