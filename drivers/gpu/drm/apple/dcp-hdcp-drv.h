@@ -40,7 +40,7 @@ void dcp_hdcp_link_changed(struct apple_dcp *dcp);
 int dcp_hdcp_attach_connector(struct apple_connector *connector,
 			      struct platform_device **dcps, unsigned int n,
 			      int connector_type);
-void dcp_hdcp_atomic_check(struct drm_connector *conn,
+int dcp_hdcp_atomic_check(struct drm_connector *conn,
 			   struct drm_atomic_commit *state);
 void dcp_hdcp_commit(struct drm_atomic_commit *state);
 #else
@@ -68,8 +68,11 @@ static inline int dcp_hdcp_attach_connector(struct apple_connector *connector,
 	return 0;
 }
 
-static inline void dcp_hdcp_atomic_check(struct drm_connector *conn,
-					 struct drm_atomic_commit *state) { }
+static inline int dcp_hdcp_atomic_check(struct drm_connector *conn,
+					struct drm_atomic_commit *state)
+{
+	return 0;
+}
 static inline void dcp_hdcp_commit(struct drm_atomic_commit *state) { }
 #endif
 

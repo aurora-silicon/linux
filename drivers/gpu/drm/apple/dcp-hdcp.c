@@ -1078,29 +1078,47 @@ int dcp_hdcp_attach_connector(struct apple_connector *connector,
 	return 0;
 }
 
-void dcp_hdcp_atomic_check(struct drm_connector *conn,
-			   struct drm_atomic_commit *state)
+int dcp_hdcp_atomic_check(struct drm_connector *conn,
+			  struct drm_atomic_commit *state)
 {
 	struct drm_connector_state *old = drm_atomic_get_old_connector_state(state, conn);
 	struct drm_connector_state *new = drm_atomic_get_new_connector_state(state, conn);
 	struct drm_crtc_state *crtc_state;
+	bool asked;
 
 	if (!to_apple_connector(conn)->hdcp_attached || !old || !new)
-		return;
+		return 0;
 	/* A connector switched off keeps asking: DESIRED again when it is back. */
 	if (!new->crtc) {
 		if (old->content_protection == DRM_MODE_CONTENT_PROTECTION_ENABLED)
 			new->content_protection = DRM_MODE_CONTENT_PROTECTION_DESIRED;
-		return;
+		return 0;
+	}
+	/*
+	 * DCP offers an authentication session only when the link comes up. A
+	 * new request, or another content type, on a lit output therefore
+	 * retrains the link once when the commit may set a mode; otherwise it
+	 * waits for the next link-up (DPMS, hotplug, resume, mode set).
+	 */
+	asked = new->content_protection != DRM_MODE_CONTENT_PROTECTION_UNDESIRED &&
+		(old->content_protection == DRM_MODE_CONTENT_PROTECTION_UNDESIRED ||
+		 old->hdcp_content_type != new->hdcp_content_type);
+	if (asked && state->allow_modeset) {
+		crtc_state = drm_atomic_get_crtc_state(state, new->crtc);
+		if (IS_ERR(crtc_state))
+			return PTR_ERR(crtc_state);
+		if (crtc_state->active)
+			crtc_state->mode_changed = true;
 	}
 	crtc_state = drm_atomic_get_new_crtc_state(state, new->crtc);
 	if (old->content_protection != DRM_MODE_CONTENT_PROTECTION_ENABLED ||
 	    new->content_protection == DRM_MODE_CONTENT_PROTECTION_UNDESIRED)
-		return;
+		return 0;
 	/* A mode set or another type: protected again only after a new session. */
 	if ((crtc_state && drm_atomic_crtc_needs_modeset(crtc_state)) ||
 	    old->hdcp_content_type != new->hdcp_content_type)
 		new->content_protection = DRM_MODE_CONTENT_PROTECTION_DESIRED;
+	return 0;
 }
 
 void dcp_hdcp_commit(struct drm_atomic_commit *state)
