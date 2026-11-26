@@ -893,12 +893,33 @@ static int t6030_pmp_mgmt(void __iomem *mb, u64 type, u64 ack, u64 *got)
 	return -ETIMEDOUT;
 }
 
+/* The running PMP's driver, registered for the commit, or NULL */
+static struct apple_sleep_coproc *t6030_pmp_coproc(void)
+{
+	int i;
+
+	for (i = 0; i < SLEEP_COPROCS; i++) {
+		struct apple_sleep_coproc *c = &apple_sleep_coprocs[i];
+
+		if (c->dev && c->ready &&
+		    of_device_is_compatible(c->dev->of_node, "apple,t6030-pmp-v2"))
+			return c;
+	}
+	return NULL;
+}
+
 static void t6030_pmp_idle(struct apple_sleep *s)
 {
 	struct t6030_sleep *t = t6030_state(s);
+	struct apple_sleep_coproc *c = t6030_pmp_coproc();
 	void __iomem *mb = t->pmp_mbox;
 	int ret;
 
+	/* A running PMP was idled by its own driver's stop, with macOS's two messages. */
+	if (c) {
+		t->pmp_idle_ret = c->stopped ? c->stop_ret : -ESRCH;
+		return;
+	}
 	t->pmp_idle_ret = -ENODEV;
 	if (!mb || !sleep_ps_on(s, T6030_PS_PMP))
 		return;
