@@ -660,6 +660,10 @@ def v27_tag_translation(root):
     v27_c = (root / 'drivers/gpu/drm/apple/iomfb_v27.c').read_text()
     v27_tables = v27_c[v27_c.index('static const struct dcp_method_entry dcp_methods_27_0'):
                        v27_c.index('/* The template\'s calls resolve through')]
+    apple = root / 'drivers/gpu/drm/apple'
+    swap_h = (apple / 'iomfb_v27_3_swap.h').read_text()
+    swap_defines = '\n'.join(line for line in swap_h.splitlines()
+                             if line.startswith('#define DCP_V27'))
     dcp_c = (root / 'drivers/gpu/drm/apple/dcp.c').read_text()
     transport = block(dcp_c, 'static bool dcp_v27_sleep_transport_supported(')
     return r'''
@@ -670,6 +674,8 @@ def v27_tag_translation(root):
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+typedef uint16_t u16;
+''' + swap_defines + r'''
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #define CONFIG_APPLE_SOC_SLEEP 1
 #define IS_ENABLED(option) (option)

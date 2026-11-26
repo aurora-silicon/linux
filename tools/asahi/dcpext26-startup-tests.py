@@ -246,6 +246,7 @@ struct apple_dcp {
  bool native,crashed,quiescing,ext26_blocked,ext26_power_sent;
  u64 ext26_power_ns;struct {int iomfb_method_profile;}hw;struct {void *owner;} iomfb;
  struct dcp_channel ch_cb,ch_cmd,ch_oobcb,ch_oobcmd,ch_async,ch_oobasync;
+ atomic_t pending_acks;
 };
 static bool iomfb_uses_queue(struct apple_dcp *d){return true;}
 static bool dcp_is_ext26(struct apple_dcp *d){return d->native;}
