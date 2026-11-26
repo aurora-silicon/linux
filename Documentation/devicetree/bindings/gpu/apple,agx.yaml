@@ -276,8 +276,12 @@ allOf:
     then:
       description:
         The M5 Pro and M5 Ultra GPUs use one MMIO range and two firmware
-        mailbox roles. Their firmware graph supplies the performance tables,
-        so they have no operating-point table in the board DT.
+        mailbox roles. The driver has each board's performance states. A boot
+        loader may fill operating-point tables (operating-points-v2 with one
+        core and one SRAM cell per voltage table, apple,afr-opp and
+        apple,cs-opp, apple,csafr-min-sram-microvolt) with the part's own
+        voltages from the ADT; the driver takes those voltages when every
+        state's frequency is the board's.
       properties:
         reg:
           maxItems: 1
@@ -378,8 +382,19 @@ allOf:
         - apple,aon-ptd
     else:
       properties:
-        apple,csafr-min-sram-microvolt: false
         apple,aon-ptd: false
+  - if:
+      properties:
+        compatible:
+          not:
+            contains:
+              enum:
+                - apple,agx-g17s
+                - apple,agx-g17c
+                - apple,agx-g17d
+    then:
+      properties:
+        apple,csafr-min-sram-microvolt: false
   - if:
       properties:
         compatible:
