@@ -12,7 +12,7 @@
 //! family 0xb, variant 2, one die, one cluster of ten core slots; core mask 0x3bd (eight
 //! enabled, slots 1 and 6 fused off).
 //!
-//! J704 (m1n1 proxy reads of SGX, before this driver): the same ID registers, core mask 0x3ff
+//! J704 (boot loader proxy reads of SGX, before this driver): the same ID registers, core mask 0x3ff
 //! (all ten slots enabled).
 use kernel::{c_str, device, of, prelude::*, sync::SetOnce};
 use crate::g17::fw::m5::initdata::{Board, BoardPower, BoardPowerCells};
