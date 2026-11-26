@@ -12,13 +12,15 @@
 //! This module closes that gap:
 //!
 //! - Every user object remembers the mm of the process that created it (an `mmgrab`
-//!   reference, which keeps only the `mm_struct` itself). While the GPU holds the
-//!   object's backing, its pages are added to that mm's `MM_SHMEMPAGES` counter.
+//!   reference, which keeps only the `mm_struct` itself). While the object's backing
+//!   is held (by the GPU, a CPU mapping, a dma-buf pin or a kernel vmap), its pages
+//!   are added to that mm's `MM_SHMEMPAGES` counter.
 //!   They are shmem pages, so this is where `oom_badness()`, the OOM report's
 //!   `rss_shmem` column and `RssShmem`/`VmRSS` in `/proc/<pid>/status` look. Pages
-//!   are uncharged when idle reclaim or purge releases the backing and when the
-//!   object is freed; the mm reference is dropped after the last uncharge, so the
-//!   counter is back to its own value before `__mmdrop()` checks it.
+//!   are uncharged when the last holder releases the backing (idle reclaim and purge
+//!   among them) and when the object is freed; the mm reference is dropped after the
+//!   last uncharge, so the counter is back to its own value before `__mmdrop()`
+//!   checks it.
 //! - Each client (DRM file) and the device keep totals of created and held bytes,
 //!   reported in fdinfo (`drm-total-system`, `drm-resident-system`) and in the
 //!   `gpu_memory` sysfs file next to `agx_stats`. The device also totals the bytes of
