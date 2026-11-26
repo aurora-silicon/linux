@@ -427,6 +427,31 @@ impl<T: Operations> RtKit<T> {
         unsafe { bindings::apple_rtkit_set_oslog_echo(self.rtk, echo) };
     }
 
+    /// Parks a running coprocessor for a system sleep: AP and IOP state idle, the mailbox off,
+    /// the CPU's run bit cleared.
+    ///
+    /// # Safety
+    ///
+    /// `cpu_control` must be the mapped CPU control word of this coprocessor's ASC.
+    pub unsafe fn sleep_stop(self: Pin<&mut Self>, cpu_control: *mut core::ffi::c_void) -> Result {
+        // SAFETY: `rtk` is valid per the type invariant, `cpu_control` per the caller.
+        to_result(unsafe { bindings::apple_rtkit_sleep_stop(self.rtk, cpu_control) })
+    }
+
+    /// Restarts a parked coprocessor whose firmware lost its memory in the sleep: the whole
+    /// boot handshake, the application endpoints started again, then the AP's state on.
+    ///
+    /// # Safety
+    ///
+    /// `cpu_control` must be the mapped CPU control word of this coprocessor's ASC.
+    pub unsafe fn sleep_return_with_init(
+        self: Pin<&mut Self>,
+        cpu_control: *mut core::ffi::c_void,
+    ) -> Result {
+        // SAFETY: `rtk` is valid per the type invariant, `cpu_control` per the caller.
+        to_result(unsafe { bindings::apple_rtkit_sleep_return_with_init(self.rtk, cpu_control) })
+    }
+
     /// Checks if an endpoint is present
     pub fn has_endpoint(self: Pin<&mut Self>, endpoint: u8) -> bool {
         unsafe { bindings::apple_rtkit_has_endpoint(self.rtk, endpoint) }
