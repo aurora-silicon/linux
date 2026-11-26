@@ -1533,16 +1533,17 @@ static void ave_t8112_26b123_build(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, n->restore_data_first);
 	KUNIT_EXPECT_EQ(test, n->text_link_cell, 0U);
 	/* The Mac mini's loader sets the word at TEXT 0x4224 on every boot. */
-	KUNIT_EXPECT_EQ(test, n->text_boot_word, 0x4224U);
+	KUNIT_ASSERT_EQ(test, n->build_count, 1U);
+	KUNIT_EXPECT_EQ(test, n->builds[0].text_boot_word, 0x4224U);
 	/* The 27.2 builds' reference buffer sizing, as on the M3 and M4. */
 	KUNIT_EXPECT_EQ(test, n->lfs_ref_scale, 2U);
 	KUNIT_EXPECT_EQ(test, ave_t8112.lfs_ref_scale, 1U);
 	KUNIT_EXPECT_EQ(test, n->extra0_size, 0U);
 	KUNIT_EXPECT_EQ(test, n->vcbar_flags, (u64)AVE_COPROC_VCBAR_VALID);
 	KUNIT_EXPECT_EQ(test, ave_fw_vcbar(n, 0x800000000ULL), 0x800000001ULL);
-	KUNIT_EXPECT_EQ(test, n->text_crc, AVE_FW_TEXT_CRC_T8112_26B123);
+	KUNIT_EXPECT_EQ(test, n->builds[0].text_crc, AVE_FW_TEXT_CRC_T8112_26B123);
 	{
-		const u32 off = n->text_boot_word, size = off + 0x40;
+		const u32 off = n->builds[0].text_boot_word, size = off + 0x40;
 		u8 *text = kunit_kzalloc(test, size, GFP_KERNEL);
 		u32 zeroed, a, b;
 
@@ -1556,25 +1557,40 @@ static void ave_t8112_26b123_build(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, a, zeroed);
 		KUNIT_EXPECT_EQ(test, b, zeroed);
 	}
-	KUNIT_EXPECT_PTR_EQ(test, ave_layout_for_crc(n->text_crc), &ave_layout_26b123);
+	KUNIT_EXPECT_PTR_EQ(test, ave_layout_for_crc(n->builds[0].text_crc), &ave_layout_26b123);
 	KUNIT_EXPECT_PTR_EQ(test, ave_layout_for_crc(ave_t8112.text_crc),
 			    &ave_layout_6070_11_1);
 }
 
 static void ave_t6041_text_boot_word(struct kunit *test)
 {
-	const u32 off = ave_t6041.text_boot_word, size = off + 0x100;
+	const struct ave_fw_build *m4 = ave_t6041.builds;
+	const u32 off = m4[0].text_boot_word, size = off + 0x100;
 	u8 *text = kunit_kzalloc(test, size, GFP_KERNEL);
 	u32 image, a, b;
 
 	KUNIT_ASSERT_NOT_NULL(test, text);
 	KUNIT_EXPECT_EQ(test, off, 0x4224U);
-	KUNIT_EXPECT_EQ(test, ave_t6041.fw_data_size_alt, 0x130000U);
+	/* The M4 Pro and M4 Max builds: the same word, the Max with a larger DATA. */
+	KUNIT_ASSERT_EQ(test, ave_t6041.build_count, 2U);
+	KUNIT_EXPECT_EQ(test, m4[1].data_size, 0x130000U);
+	KUNIT_EXPECT_EQ(test, m4[1].text_boot_word, off);
 	KUNIT_EXPECT_EQ(test, ave_t6041.text_link_cell, 0U);
 	/* The M4 27.2 build: the same word, set per boot by some loaders. */
-	KUNIT_EXPECT_EQ(test, ave_t8132.text_boot_word, off);
-	KUNIT_EXPECT_EQ(test, ave_t8132.text_crc, AVE_FW_TEXT_CRC_T8132_26B123);
+	KUNIT_ASSERT_EQ(test, ave_t8132.build_count, 1U);
+	KUNIT_EXPECT_EQ(test, ave_t8132.builds[0].text_boot_word, off);
+	KUNIT_EXPECT_EQ(test, ave_t8132.builds[0].text_crc, AVE_FW_TEXT_CRC_T8132_26B123);
 	KUNIT_EXPECT_EQ(test, ave_t8132.text_link_cell, 0U);
+	/*
+	 * The M5 Pro/Max 26A428 build: the same word, which differs per boot on
+	 * the J775D. The 26C5035 build has none set: its CRC matches as it is.
+	 */
+	KUNIT_ASSERT_EQ(test, ave_t6050.build_count, 2U);
+	KUNIT_EXPECT_EQ(test, ave_t6050.builds[0].text_boot_word, off);
+	KUNIT_EXPECT_EQ(test, ave_t6050.builds[0].text_crc, AVE_FW_TEXT_CRC_T6050_26A428);
+	KUNIT_EXPECT_EQ(test, ave_t6050.builds[1].text_boot_word, 0U);
+	KUNIT_EXPECT_EQ(test, ave_t6050.builds[1].text_crc, AVE_FW_TEXT_CRC_T6050_26C5035);
+	KUNIT_EXPECT_EQ(test, ave_t6050.text_link_cell, 0U);
 	for (u32 i = 0; i < size; i++)
 		text[i] = i * 7 + 3;
 	memset(text + off, 0, 4);
