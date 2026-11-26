@@ -347,7 +347,7 @@ impl SepData {
             cpx_encryption_mode,
         } = self.profile.key_store
         else {
-            self.sks_initialized.store(true, Relaxed);
+            self.sks_initialized.store(true, Release);
             return true;
         };
 
@@ -399,7 +399,7 @@ impl SepData {
             );
             return false;
         }
-        self.sks_initialized.store(true, Relaxed);
+        self.sks_initialized.store(true, Release);
         true
     }
 
