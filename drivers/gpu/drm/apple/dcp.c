@@ -11327,6 +11327,32 @@ bool dcp_sleep_keeps_firmware(struct device *dev)
 }
 EXPORT_SYMBOL_GPL(dcp_sleep_keeps_firmware);
 
+/*
+ * hw.sleep_13_5: A500, as macOS sends it, then the firmware is parked and its CPU stopped.
+ * Not in a dry run. Returns whether the firmware was dealt with here.
+ */
+static bool dcp_sleep_13_5_stop(struct apple_dcp *dcp)
+{
+	int ret;
+
+	if (!dcp->hw.sleep_13_5 || !pm_suspend_via_firmware() || apple_sleep_dry_run() ||
+	    dcp->external || dcp->fw_compat != DCP_FIRMWARE_V_13_5 ||
+	    IS_ERR_OR_NULL(dcp->rtk) || !dcp->coproc_reg || READ_ONCE(dcp->crashed) ||
+	    !apple_rtkit_is_running(dcp->rtk))
+		return false;
+
+	ret = iomfb_s2r_500_v13_3(dcp);
+	if (ret)
+		dev_warn(dcp->dev, "A500 before the sleep: %d\n", ret);
+	ret = apple_rtkit_sleep_stop(dcp->rtk, dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
+	if (ret)
+		dev_warn(dcp->dev, "firmware did not stop for the sleep: %d\n", ret);
+	else
+		WRITE_ONCE(dcp->s2r_fw_down, true);
+	dcp->sleep_fw_runs = false;
+	return true;
+}
+
 static int dcp_platform_suspend(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
@@ -11524,6 +11550,8 @@ static int dcp_platform_suspend(struct device *dev)
 	dcp->sleep_fw_runs = true;
 	device_set_wakeup_path(dev);
 	dcp_sleep_hold_phys(dcp);
+	if (dcp_sleep_13_5_stop(dcp))
+		return 0;
 	/* Last: the steps above still talk to the coprocessor. */
 	dcp_hold_for_sleep(dcp);
 
@@ -11534,6 +11562,28 @@ void dcp_hdmi_disconnect(struct apple_dcp *dcp)
 {
 	disconnected_hpd_event(dcp->connector);
 	dcp_dptx_disconnect(dcp, 0);
+}
+
+/*
+ * hw.sleep_13_5: a real sleep took the firmware's memory, so it boots from scratch. A
+ * refused sleep left it parked with its power kept.
+ */
+static void dcp_sleep_13_5_start(struct apple_dcp *dcp)
+{
+	void __iomem *control = dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL;
+	int ret;
+
+	if (!dcp->hw.sleep_13_5 || dcp->external || dcp->fw_compat != DCP_FIRMWARE_V_13_5 ||
+	    !READ_ONCE(dcp->s2r_fw_down))
+		return;
+
+	WRITE_ONCE(dcp->s2r_fw_down, false);
+	if (pm_resume_via_firmware() && dcp_has_panel(dcp))
+		ret = apple_rtkit_sleep_return_with_init(dcp->rtk, control);
+	else
+		ret = apple_rtkit_sleep_return(dcp->rtk, control);
+	if (ret)
+		dev_err(dcp->dev, "firmware did not start after the sleep: %d\n", ret);
 }
 
 static int dcp_platform_resume(struct device *dev)
@@ -11555,6 +11605,8 @@ static int dcp_platform_resume(struct device *dev)
 
 	if (dcp->s2r_stopped)
 		return dcp_s2r_resume(dcp);
+
+	dcp_sleep_13_5_start(dcp);
 
 	if (iomfb_is_m4(dcp)) {
 		int ret = iomfb_m4_resume(dcp);
@@ -11709,6 +11761,12 @@ static const struct apple_dcp_hw_data apple_dcp_hw_dcp = {
 	.num_dptx_ports = 0,
 };
 
+/* T6000's DCP: as the generic one, with the firmware 13.5 stop around a suspend-to-RAM */
+static const struct apple_dcp_hw_data apple_dcp_hw_t6000 = {
+	.num_dptx_ports = 0,
+	.sleep_13_5 = true,
+};
+
 static const struct apple_dcp_hw_data apple_dcp_hw_t6030 = {
 	.iboot_handoff = "apple,t6030-handoff",
 	.num_dptx_ports = 1,
@@ -11840,6 +11898,7 @@ static const struct of_device_id of_match[] = {
 	{ .compatible = "apple,t6041-dcpext", .data = &apple_dcp_hw_t6041_dcpext, },
 	{ .compatible = "apple,t6050-dcp", .data = &apple_dcp_hw_t6050 },
 	{ .compatible = "apple,t6050-dcpext", .data = &apple_dcp_hw_t6050_dcpext },
+	{ .compatible = "apple,t6000-dcp", .data = &apple_dcp_hw_t6000,  },
 	{ .compatible = "apple,t6020-dcp", .data = &apple_dcp_hw_t6020,  },
 	{ .compatible = "apple,t6020-dcpext", .data = &apple_dcp_hw_t6020_dcpext, },
 	{ .compatible = "apple,t8103-dcp", .data = &apple_dcp_hw_t8103,  },

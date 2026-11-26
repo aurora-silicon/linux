@@ -380,6 +380,11 @@ struct apple_dcp_hw_data {
 	 */
 	bool s2r;
 	bool s2r_ext;
+	/*
+	 * Firmware 13.5: a firmware-driven sleep takes the internal processor's power. It is
+	 * stopped before the sleep and booted from scratch after it, see dcp_sleep_13_5_stop().
+	 */
+	bool sleep_13_5;
 	/* The firmware crashes on any mode but the 120 Hz boot timing, see dcp_mode_settable(). */
 	bool only_120hz_modes;
 	/* A firmware 27 sleep in progress, and how it ended */
