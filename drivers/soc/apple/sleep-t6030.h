@@ -1723,14 +1723,25 @@ static bool t6030_storage_on;
 module_param_named(storage_on, t6030_storage_on, bool, 0644);
 MODULE_PARM_DESC(storage_on, "T6030: ANS and the storage PCIe domains powered at the commit, as macOS (ANS's CPU halted)");
 
+/* PMU scratch +4 before each raise (0x11-0x13) and after (0x14); +3 the word's state if one fails */
 static void t6030_storage_on_at_commit(struct apple_sleep *s)
 {
+	static const u32 words[] = { T6030_PS_APCIE_SYS_ST, T6030_PS_APCIE_ST, T6030_PS_ANS };
+	unsigned int i;
+	int ret;
+
 	if (!READ_ONCE(t6030_storage_on))
 		return;
-	if (sleep_ps_raise(s, T6030_PS_APCIE_SYS_ST) ||
-	    sleep_ps_raise_start(s, T6030_PS_APCIE_ST) ||
-	    sleep_ps_raise(s, T6030_PS_ANS))
-		t6030_sleep_failed("storage power words on");
+	for (i = 0; i < ARRAY_SIZE(words); i++) {
+		sleep_note_at(s, 4, 0x11 + i);
+		ret = words[i] == T6030_PS_APCIE_ST ? sleep_ps_raise_start(s, words[i]) :
+						      sleep_ps_raise(s, words[i]);
+		if (ret) {
+			sleep_note_at(s, 3, readl(s->ps + words[i]) & 0xff);
+			t6030_sleep_failed("storage power words on");
+		}
+	}
+	sleep_note_at(s, 4, 0x14);
 }
 
 static void t6030_sleep_commit_regs(struct apple_sleep *s)
