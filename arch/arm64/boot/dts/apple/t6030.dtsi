@@ -1094,11 +1094,11 @@
 			/*
 			 * The SMC's pmVC, then the least spacings in us, as macOS's on
 			 * J516s: slpw to pmVC, pmVC to slpa, slpa to the AP idle, the idle
-			 * to the commit. macOS sends one pmVC, 4.38 s before slpa with its
-			 * whole suspend between them, so that span is no least spacing: 0.
-			 * The wake isn't traced: 0.
+			 * to the commit. pmVC to slpa is the shortest of macOS 27.2's three
+			 * full records (4119.5, 4435.3 and 4452.1 ms; the SMC hears nothing
+			 * else in between). The wake isn't traced: 0.
 			 */
-			apple,smc-sleep-policy = <0x100 286300 0 560 9510 0>;
+			apple,smc-sleep-policy = <0x100 286300 4119000 560 9510 0>;
 			/*
 			 * macOS 27.2's sequences on J516s, as traced, access for access, on the
 			 * reg entries above by index: the PTD's no-demand votes (64-bit), and
