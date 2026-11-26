@@ -1152,11 +1152,8 @@ static int apple_connector_atomic_check(struct drm_connector *conn,
 	struct drm_connector_state *new = drm_atomic_get_new_connector_state(state, conn);
 	const struct drm_property_blob *blob = new->hdr_output_metadata;
 	struct drm_crtc_state *crtc_state;
-	int ret;
 
-	ret = dcp_hdcp_atomic_check(conn, state);
-	if (ret)
-		return ret;
+	dcp_hdcp_atomic_check(conn, state);
 	if (blob && (blob->length != sizeof(struct hdr_output_metadata) ||
 		     !dcp_hdr_is_type1(blob->data)))
 		return -EINVAL;
