@@ -232,7 +232,8 @@ struct avd_av1_run {
 
 struct avd_av1_ctx {
 	struct avd_av1_stream *stream;
-	u8 submit_num;
+	/* PP kicks for the frame: one per tile, up to V4L2_AV1_MAX_TILE_COUNT */
+	u32 submit_num;
 	struct {
 		struct avd_buf inst;
 		struct avd_buf pipe_state;
@@ -2000,7 +2001,7 @@ static unsigned int avd_av1_pp_kicks(struct avd_ctx *ctx)
 {
 	struct avd_av1_ctx *priv = ctx->priv;
 
-	return max_t(int, priv->submit_num, 1);
+	return max_t(u32, priv->submit_num, 1);
 }
 
 static void avd_av1_submit(struct avd_ctx *ctx)
@@ -2014,7 +2015,7 @@ static void avd_av1_submit(struct avd_ctx *ctx)
 		       AVD_OP_EXEC_FIFO_IDX(ctx->fifo_idx) |
 		       AVD_OP_EXEC_FIFO_MASK(avd->variant->fifo_slots),
 	       avd->ctrl + avd->variant->submit_offset);
-	for (int i = 0; i < av1_ctx->submit_num - 1; i++) {
+	for (u32 i = 1; i < av1_ctx->submit_num; i++) {
 		writel(AVD_OP_EXEC | AVD_OP_EXEC_FIFO_IDX(ctx->fifo_idx) |
 			       AVD_OP_EXEC_FIFO_MASK(avd->variant->fifo_slots),
 		       avd->ctrl + avd->variant->submit_offset);
