@@ -53,6 +53,7 @@ extern "C" {
         rtk: *mut bindings::apple_rtkit,
     ) -> *mut core::ffi::c_void;
     fn asahi_g17_pmp_request(dev: *mut core::ffi::c_void, enable: bool) -> core::ffi::c_int;
+    fn asahi_g16_sleep_note(step: u8);
     fn asahi_g17_commit_finish(commit: *mut core::ffi::c_void, saved: *mut u32) -> bool;
     fn asahi_g17_power_auto_off(dev: *mut core::ffi::c_void, saved: *mut u32) -> core::ffi::c_int;
     fn asahi_g17_power_lower(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
@@ -76,17 +77,31 @@ impl Firmware {
         // Start the next render on each pass slot fresh after the firmware restarts.
         self.pools.invalidate();
         self.session.rtkit.warm_restart()?;
+        note(0x33);
         let control = self.session.regs.asc_control()?;
         self.session.regs.set_asc_control(control | ASC_RUN)?;
         regs::mb();
-        self.session.rtkit.boot()
+        note(0x34);
+        let result = self.session.rtkit.boot();
+        note(if result.is_ok() { 0x35 } else { 0x3f });
+        result
     }
+}
+
+/// A sleep step, in PMU scratch where the sleep driver keeps its notes: a reset keeps it.
+fn note(step: u8) {
+    // SAFETY: Writes one byte of the sleep driver's notes, or nothing without one.
+    unsafe { asahi_g16_sleep_note(step) }
 }
 
 impl Shared {
     /// The PMP's request for the GPU, where the device tree names one. The PMP may use a device
     /// whose request is set, so it's only ever set with the domain on.
     pub(crate) fn pmp_request(&self, enable: bool) {
+        // DIAGNOSTIC (T6030 sleep bring-up): leave the request alone.
+        if crate::module_parameters::g16_sleep_no_pmp_request.value() != 0 {
+            return;
+        }
         // SAFETY: `dev` is the live GPU device.
         let ret = unsafe { asahi_g17_pmp_request(self.dev.as_raw().cast(), enable) };
         if ret != 0 {
@@ -120,10 +135,12 @@ impl Shared {
         let saved = self.sleep_ps.load(Ordering::Relaxed);
         // SAFETY: `dev` is the live GPU device.
         kernel::error::to_result(unsafe { asahi_g16_tvm_enable(self.dev.as_raw().cast()) })?;
+        note(0x30);
         // SAFETY: `dev` is the live GPU device.
         kernel::error::to_result(unsafe {
             asahi_g17_power_raise(self.dev.as_raw().cast(), saved)
         })?;
+        note(0x31);
         // SAFETY: `dev` is the live GPU device.
         kernel::error::to_result(unsafe {
             asahi_g17_power_auto_on(self.dev.as_raw().cast(), saved)
@@ -242,6 +259,7 @@ impl Shared {
             return Ok(());
         }
         self.wait_quiet(now_ns().saturating_add(DRAIN_NS))?;
+        note(0x20);
         self.sleeping.store(true, Ordering::Release);
         self.join_workers();
         let left = {
@@ -297,6 +315,7 @@ impl Shared {
                         // As macOS: the request once the domain is on, before the firmware's
                         // mailbox and handshake.
                         self.pmp_request(true);
+                        note(0x32);
                         firmware.sleep_restart()
                     })
                 }

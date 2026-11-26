@@ -16,6 +16,7 @@ struct asahi_g17_commit *asahi_g17_commit_prepare(struct device *dev,
 						  struct apple_mbox *secondary_mbox, bool bridge);
 struct asahi_g17_commit *asahi_g16_commit_prepare(struct device *dev, struct apple_rtkit *rtk);
 struct asahi_g17_commit *asahi_g16_stop_now(struct device *dev, struct apple_rtkit *rtk);
+void asahi_g16_sleep_note(u8 step);
 bool asahi_g17_commit_finish(struct asahi_g17_commit *c, u32 *saved);
 bool asahi_g17_commit_required(void);
 bool asahi_g17_commit_stops_firmware(void);

@@ -11,6 +11,7 @@
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/mfd/syscon.h>
+#include <linux/nvmem-consumer.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/regmap.h>
@@ -723,6 +724,25 @@ static struct asahi_g17_commit *asahi_g16_commit_alloc(struct device *dev,
 	return c;
 }
 
+/*
+ * DIAGNOSTIC (T6030 sleep bring-up): a G16 sleep step in PMU scratch +4 (0x830c), which a reset
+ * keeps, through the SPMI nvmem and its locking: from .prepare and .complete, while the SPMI
+ * driver runs. Not the sleep driver's raw notes, which only its commit may write.
+ */
+void asahi_g16_sleep_note(u8 step)
+{
+	static struct nvmem_device *nv;
+
+	if (!nv) {
+		nv = nvmem_device_find((void *)"spmi_nvmem0", device_match_name);
+		if (IS_ERR(nv)) {
+			nv = NULL;
+			return;
+		}
+	}
+	nvmem_device_write(nv, 0x830c, 1, &step);
+}
+
 /* The same stop for G16, made by the sleep's commit. */
 struct asahi_g17_commit *asahi_g16_commit_prepare(struct device *dev, struct apple_rtkit *rtk)
 {
@@ -781,25 +801,33 @@ struct asahi_g17_commit *asahi_g16_stop_now(struct device *dev, struct apple_rtk
 	if (IS_ERR(c))
 		return c;
 
+	/* The step reached, in PMU scratch, which a reset keeps: 0x21 to 0x27 */
 	c->ran = true;
+	asahi_g16_sleep_note(0x21);
 	c->entry = readl(c->ps);
 	/* The CPU's status is read below; macOS doesn't poll it */
 	c->idle[0] = apple_rtkit_sleep_idle_polled(c->rtk[0], NULL, &c->idle_us[0]);
+	asahi_g16_sleep_note(0x22);
 	apple_rtkit_mailbox_recv_off(c->rtk[0]);
 	c->words[0] = apple_rtkit_mailbox_status(c->rtk[0]);
+	asahi_g16_sleep_note(0x23);
 	c->request_ret = c->request ? apple_pmp_report_entry_request(c->request, false) : 0;
+	asahi_g16_sleep_note(0x24);
 	c->status[0] = readl(c->cpu[0] + ASC_CPU_STATUS);
 	writel(readl(c->cpu[0]) & ~ASC_CPU_CONTROL_RUN, c->cpu[0]);
+	asahi_g16_sleep_note(0x25);
 
 	val = readl(c->ps);
 	c->saved = val;
 	writel(val & ~(PS_AUTO_ENABLE | PS_BUSY | PS_FLAGS), c->ps);
 	val = readl(c->ps);
 	writel((val & ~(PS_AUTO_ENABLE | PS_BUSY | PS_FLAGS | PS_TARGET)) | PS_FLAGS, c->ps);
+	asahi_g16_sleep_note(0x26);
 	c->lower_ret = readl_poll_timeout(c->ps, c->lowered,
 					  !FIELD_GET(PS_ACTUAL, c->lowered) &&
 					  !(c->lowered & PS_BUSY),
 					  10, PS_TIMEOUT_US);
+	asahi_g16_sleep_note(0x27);
 
 	dev_info(dev, "GPU stopped for the sleep: idle %d in %u us, mailbox %#x, CPU status %#x, PMP request %d, GFX %#x -> %#x (%d)\n",
 		 c->idle[0], c->idle_us[0], c->words[0], c->status[0], c->request_ret,
