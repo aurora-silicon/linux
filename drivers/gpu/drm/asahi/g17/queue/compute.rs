@@ -353,6 +353,22 @@ impl Graph {
         fence(Ordering::Acquire);
         Ok(self.support.word(STAMP)?.load(Ordering::Relaxed))
     }
+    /// Whether `prev_kick` (whose M5 timestamp pair lives at `prev_slot * 16`)
+    /// has neither stored its completion stamp nor written its end timestamp.
+    fn m5_kick_still_live(&self, prev_kick: u64, prev_slot: usize) -> bool {
+        let Ok(stamp) = self.stamp() else {
+            return false;
+        };
+        if retirement::stamp_covers(stamp, prev_kick) {
+            return false;
+        }
+        let Some(timestamps) = self.m5_timestamps.as_ref() else {
+            return false;
+        };
+        timestamps
+            .dword(prev_slot * 16 + 8)
+            .is_ok_and(|word| word.load(Ordering::Relaxed) == 0)
+    }
     /// EAGAIN while the queue is vacant: the owner must re-arm it first.
     fn descriptor_vas(&self, slot: u8) -> Result<(u64, u64)> {
         let ring = self.ring.as_ref().ok_or(EAGAIN)?;
@@ -1717,6 +1733,59 @@ fn item_capacity(cursors: Cursors, entry_signal: bool) -> Result {
     Ok(())
 }
 
+/// Validate M5's 2-item budget (configuration plus notification) on one cursor snapshot.
+fn check_m5_item_room(cursors: Cursors) -> Result<Cursors> {
+    if cursors.count != ITEM_RING_ENTRIES {
+        return Err(EIO);
+    }
+    if cursors.producer >= cursors.count || cursors.consumer >= cursors.count {
+        return Err(ERANGE);
+    }
+    let free = (cursors.consumer + cursors.count - cursors.producer - 1) % cursors.count;
+    if free < 2 {
+        return Err(ENOSPC);
+    }
+    Ok(cursors)
+}
+
+/// What a compute publication's warm host-port-only decision sees.
+#[derive(Clone, Copy, Debug)]
+struct M5Warmth {
+    warm_host_kicks: bool,
+    first: bool,
+    installed: bool,
+    m5_installed: bool,
+    pending_config: bool,
+    outer_started: bool,
+    replays_empty: bool,
+    quarantined: bool,
+    awaiting_witness: bool,
+    previous_published: bool,
+    prev_live: bool,
+    activation_first: bool,
+    activation_refresh: bool,
+    config_required: bool,
+}
+
+impl M5Warmth {
+    fn is_warm(&self) -> bool {
+        self.warm_host_kicks
+            && !self.first
+            && self.installed
+            && self.m5_installed
+            && !self.pending_config
+            && self.outer_started
+            && self.replays_empty
+            && !self.quarantined
+            && !self.awaiting_witness
+            && self.previous_published
+            && self.prev_live
+            && !self.activation_first
+            && !self.activation_refresh
+            && !self.config_required
+    }
+}
+
 /// Retained commands are capacity, not a failed VM. Nothing has been written
 /// when this check runs, so the outer publisher can wait for retirement under
 /// its original admission deadline, just as it does for a full firmware ring.
@@ -2796,6 +2865,13 @@ pub(crate) trait Host {
     fn notify(&mut self, message: u64) -> Result;
     fn note_submission(&mut self) -> Result;
     fn submit_m5(&mut self, submission: &crate::g17::fw::m5::queue::HardwareSubmission) -> Result;
+    fn announce_m5_warm(
+        &mut self,
+        priority: u8,
+        submission: &crate::g17::fw::m5::queue::HardwareSubmission,
+        fallback: &crate::g17::fw::channels::WorkSlot,
+        still_live: &mut dyn FnMut() -> bool,
+    ) -> Result;
 }
 
 impl Queue {
@@ -2891,38 +2967,90 @@ impl Queue {
             || dependencies
                 .iter()
                 .any(|dependency| dependency.qid() != qid);
-        // On M5 one read of the item-ring cursors serves the whole publication: the producer is
-        // the host's and only this publication moves it, and the consumer only advances, so the
-        // snapshot is conservative for the room, record-slot and reclaim checks.
+        let j813 = crate::g17::J813_FORMS.load(Ordering::Relaxed);
+        let record_slot = (self.graph.m5 || !first).then_some(self.ordinal as usize % RECORD_SLOTS);
+        let context_id: u16 = packet.context.id().try_into()?;
+        let identity = ConfigIdentity {
+            scheduler: packet.context.scheduler_va(),
+            qos: packet.context.qos_id(),
+            context: packet.context.id(),
+        };
+        let policy = packet.context.policy();
+        let activation = activation::Publication::new(
+            self.outer_started, policy.priority(), self.graph.m5);
+        let config = self.queue_config(&identity, first, activation.refresh,
+            context_id, policy, &packet)?;
+        let cached = self
+            .config_cache
+            .and_then(|(config, at)| (at == epoch).then_some(config));
+        let config_required = super::render::publication::required(cached, config);
+        // A warm M5 compute kick sends only the host-port advance without a doorbell, so it
+        // requires a board that admits host-port-only warm kicks and an active previous kick
+        // on this channel that is still live in hardware (neither observed, stamped, nor ended),
+        // re-checked after the host-port write with an outer-record + doorbell fallback.
+        let mut warmth = M5Warmth {
+            warm_host_kicks: self.graph.m5
+                && !j813
+                && self.graph.board.is_some_and(|board| board.warm_host_kicks),
+            first,
+            installed: self.installed,
+            m5_installed: self.m5_install.is_some(),
+            pending_config: self.configuration.is_some(),
+            outer_started: self.outer_started != 0,
+            replays_empty: self.replays.len == 0,
+            quarantined: self.quarantined,
+            awaiting_witness: self.awaiting_witness,
+            previous_published: self.previous.as_ref().is_none_or(|p| p.publication.is_some()),
+            prev_live: true,
+            activation_first: activation.first,
+            activation_refresh: activation.refresh,
+            config_required,
+        };
+        let warm_prev = warmth
+            .is_warm()
+            .then(|| {
+                let prev = self
+                    .active
+                    .back()
+                    .filter(|a| !a.stamps_owed && a.observed.is_none())?;
+                let ticket = prev.ticket?;
+                let prev_slot = ticket.ordinal.wrapping_sub(1) as usize % RECORD_SLOTS;
+                self.graph
+                    .m5_kick_still_live(ticket.kick, prev_slot)
+                    .then_some((ticket.item_producer, ticket.kick, prev_slot))
+            })
+            .flatten();
+        warmth.prev_live = warm_prev.is_some();
+        let warm_m5 = warmth.is_warm();
+        // On M5 one read of the item-ring cursors serves the whole cold publication: the
+        // producer is the host's and only this publication moves it, and the consumer only
+        // advances, so the snapshot is conservative for the room, record-slot and reclaim
+        // checks. A warm M5 kick writes no item-ring records and skips the uncached read.
         let mut snapshot = None;
         if self.graph.m5 {
-            // The configuration and its notification are the only items an M5 kick appends.
-            let cursors = self.graph.cursors()?;
-            if cursors.count != ITEM_RING_ENTRIES {
-                return Err(EIO);
+            if !warm_m5 {
+                snapshot = Some(check_m5_item_room(self.graph.cursors()?)?);
+                if let Some(slot) = record_slot {
+                    self.graph.ensure_record_slot(slot, snapshot)?;
+                }
             }
-            if cursors.producer >= cursors.count || cursors.consumer >= cursors.count {
-                return Err(ERANGE);
-            }
-            let free = (cursors.consumer + cursors.count - cursors.producer - 1) % cursors.count;
-            if free < 2 {
-                return Err(ENOSPC);
-            }
-            snapshot = Some(cursors);
         } else {
             item_capacity(self.graph.cursors()?, entry_signal)?;
-        }
-        if !native.is_empty() {
-            let cursors = self.graph.cursors()?;
-            let free = (cursors.consumer + cursors.count - cursors.producer - 1) % cursors.count;
-            if free < (if entry_signal { 4 } else { 3 }) + native.len() as u32 {
-                return Err(EAGAIN);
+            if !native.is_empty() {
+                let cursors = self.graph.cursors()?;
+                let free = (cursors.consumer + cursors.count - cursors.producer - 1) % cursors.count;
+                if free < (if entry_signal { 4 } else { 3 }) + native.len() as u32 {
+                    return Err(EAGAIN);
+                }
+            }
+            if let Some(slot) = record_slot {
+                self.graph.ensure_record_slot(slot, snapshot)?;
             }
         }
-        let record_slot = (self.graph.m5 || !first).then_some(self.ordinal as usize % RECORD_SLOTS);
-        if let Some(slot) = record_slot {
-            self.graph.ensure_record_slot(slot, snapshot)?;
-        }
+        self.free_list_generation = u64::from(packet.context.scheduler_generation());
+        // Cold M5 kicks checked `ensure_record_slot` above before clearing the timestamp slot.
+        // Warm kicks write no item-ring records and `IN_FLIGHT <= RECORD_SLOTS` guarantees no
+        // active entry shares `record_slot`.
         let timestamp_va = if self.graph.m5 {
             packet.completion.bind_m5_compute_timestamps(
                 self.graph.m5_timestamps.as_ref().ok_or(EINVAL)?,
@@ -2938,7 +3066,7 @@ impl Queue {
             sampler_heap_va: *sampler_heap_va,
             sampler_count: *sampler_count,
             descriptor_va: descriptor_low,
-            context_id: packet.context.id().try_into()?,
+            context_id,
             context_generation: packet.context.generation(),
             work_state: work_word,
             work_state_va: work_node,
@@ -2960,21 +3088,7 @@ impl Queue {
             ],
             timestamp_va,
         };
-        let identity = ConfigIdentity {
-            scheduler: packet.context.scheduler_va(),
-            qos: packet.context.qos_id(),
-            context: packet.context.id(),
-        };
-        self.free_list_generation = u64::from(packet.context.scheduler_generation());
-        let policy = packet.context.policy();
-        let activation = activation::Publication::new(
-            self.outer_started, policy.priority(), self.graph.m5);
-        let config = self.queue_config(&identity, first, activation.refresh,
-            args.context_id, policy, &packet)?;
-        let cached = self
-            .config_cache
-            .and_then(|(config, at)| (at == epoch).then_some(config));
-        let send_config = self.graph.m5 || first || super::render::publication::required(cached, config);
+        let send_config = (!warm_m5 && self.graph.m5) || first || config_required;
         let announce =
             KickAnnounce::new(qid, DataMaster::Compute, kick_timestamp, policy.priority())?;
         let predecessor = KickPredecessor::new(qid, kick_parent)?;
@@ -3062,7 +3176,11 @@ impl Queue {
             },
             mcache,
             event_mask: match m5_board {
-                Some(board) => crate::g17::fw::m5::compute::kick_event_mask(board, identity.context)?,
+                Some(board) => crate::g17::fw::m5::compute::kick_event_mask_for(
+                    board,
+                    identity.context,
+                    warm_m5,
+                )?,
                 None => COMPUTE_KICK_EVENT_MASK,
             },
             register_arrays: if self.graph.m5 {
@@ -3129,7 +3247,12 @@ impl Queue {
             } else {
                 None
             };
-            let cursors = match snapshot { Some(cursors) => cursors, None => self.graph.cursors()? };
+            let cursors = if warm_m5 {
+                let (p, _, _) = warm_prev.ok_or(EIO)?;
+                Cursors { producer: p, consumer: p, count: ITEM_RING_ENTRIES }
+            } else {
+                match snapshot { Some(cursors) => cursors, None => self.graph.cursors()? }
+            };
             let mut wait_vas = KVec::with_capacity(native.len(), GFP_KERNEL)?;
             for (index, wait) in native.iter().enumerate() {
                 let record = wait.bytes(
@@ -3155,20 +3278,25 @@ impl Queue {
                         Err(error)
                     })?;
                 self.active.back_mut().ok_or(EIO)?.qos_pending = true;
-                // `cursors` is this publication's snapshot: no second read of the ring.
-                producer = self.graph.append_to(cursors, cursors.producer, config_va.ok_or(EINVAL)?,
-                    || packet.mark_published())
-                    .or_else(|error| {
-                        self.pool.cancel_unpublished(target)?;
-                        host.qos_cancel(qos)?;
-                        self.active.back_mut().ok_or(EIO)?.qos_pending = false;
-                        Err(error)
-                    })?;
+                if warm_m5 {
+                    producer = cursors.producer;
+                    packet.mark_published();
+                } else {
+                    // `cursors` is this publication's snapshot: no second read of the ring.
+                    producer = self.graph.append_to(cursors, cursors.producer, config_va.ok_or(EINVAL)?,
+                        || packet.mark_published())
+                        .or_else(|error| {
+                            self.pool.cancel_unpublished(target)?;
+                            host.qos_cancel(qos)?;
+                            self.active.back_mut().ok_or(EIO)?.qos_pending = false;
+                            Err(error)
+                        })?;
+                }
                 visible = true;
                 self.unpublished_binding = false;
                 // The J813 (common 26A428) reads the descriptor from the item ring, after
                 // the configuration, as macOS 27.0's compute ring has it.
-                if crate::g17::J813_FORMS.load(Ordering::Relaxed) {
+                if j813 {
                     producer = self.graph.append(producer, descriptor_high, || {})?;
                 }
                 // This Active and its Packet pins now own all visible records.
@@ -3258,40 +3386,42 @@ impl Queue {
             }
             prepared_kick.commit();
             self.submitted = self.submitted.checked_add(1).ok_or(EOVERFLOW)?;
-            let announce_va = if self.graph.m5 && !crate::g17::J813_FORMS.load(Ordering::Relaxed) {
-                self.graph.record(record_slot, ANNOUNCE, 0x40,
-                    crate::g17::fw::m5::queue::notification(qid, kick_timestamp)?)?
-            } else { self.graph.record(record_slot, ANNOUNCE, 0x40, announce)? };
-            producer = match snapshot {
-                // The snapshot's consumer only lags the firmware's, and the free-room check
-                // above covered both M5 items; the producer is the one this publication set.
-                Some(snapshot) => self.graph.append_to(Cursors { producer, ..snapshot }, producer,
-                    announce_va, || {})?,
-                None => self.graph.append(producer, announce_va, || {})?,
-            };
-            fence(Ordering::SeqCst);
-            // Only the first kick installs a predecessor record. A later kick that names another
-            // queue's kick depends on it through the kick entry alone.
-            if first && !self.graph.m5 {
-                let predecessor_va =
-                    self.graph
-                        .record(record_slot, PREDECESSOR, 0x400, predecessor)?;
-                producer = self.graph.append(producer, predecessor_va, || {})?;
+            if !warm_m5 {
+                let announce_va = if self.graph.m5 && !j813 {
+                    self.graph.record(record_slot, ANNOUNCE, 0x40,
+                        crate::g17::fw::m5::queue::notification(qid, kick_timestamp)?)?
+                } else { self.graph.record(record_slot, ANNOUNCE, 0x40, announce)? };
+                producer = match snapshot {
+                    // The snapshot's consumer only lags the firmware's, and the free-room check
+                    // above covered both M5 items; the producer is the one this publication set.
+                    Some(snapshot) => self.graph.append_to(Cursors { producer, ..snapshot }, producer,
+                        announce_va, || {})?,
+                    None => self.graph.append(producer, announce_va, || {})?,
+                };
+                fence(Ordering::SeqCst);
+                // Only the first kick installs a predecessor record. A later kick that names another
+                // queue's kick depends on it through the kick entry alone.
+                if first && !self.graph.m5 {
+                    let predecessor_va =
+                        self.graph
+                            .record(record_slot, PREDECESSOR, 0x400, predecessor)?;
+                    producer = self.graph.append(producer, predecessor_va, || {})?;
+                }
+                if let Some(slot) = record_slot {
+                    self.graph.record_ends[slot] = Some(producer);
+                }
+                host.publish_qid(self.kick.id())?;
+                host.publish_outer(
+                    policy.priority(),
+                    &WorkSlot::new(
+                        DataMaster::Compute,
+                        self.graph.graph.gpu_va(),
+                        qid,
+                        producer.try_into()?,
+                        activation.first,
+                    )?,
+                )?;
             }
-            if let Some(slot) = record_slot {
-                self.graph.record_ends[slot] = Some(producer);
-            }
-            host.publish_qid(self.kick.id())?;
-            host.publish_outer(
-                policy.priority(),
-                &WorkSlot::new(
-                    DataMaster::Compute,
-                    self.graph.graph.gpu_va(),
-                    qid,
-                    producer.try_into()?,
-                    activation.first,
-                )?,
-            )?;
             let notify_activation = activation.first;
             self.outer_started = activation.next_started;
             self.installed = true;
@@ -3328,18 +3458,38 @@ impl Queue {
             // bits 3:2. The generic work doorbell left the firmware to find the
             // ring itself and delayed dispatch.
             fence(Ordering::SeqCst);
-            if self.graph.m5 {
-                // macOS's order on this firmware: the host-port transaction, with core gating
-                // held off across it (Host::submit_m5), then the work doorbell. Rung first, the
-                // doorbell can be served before the advance lands; the firmware then finds
-                // nothing new and goes idle, and the advance alone never wakes it, so the kick
-                // never runs. Held gating is what lets the advance land first: without the
-                // hold, gated cores did not take it.
-                host.submit_m5(&crate::g17::fw::m5::queue::HardwareSubmission::compute(
-                    qid, self.kick.low_va(), policy.priority(),
-                    first || notify_activation)?)?;
+            if warm_m5 {
+                let (_, prev_kick, prev_slot) = warm_prev.ok_or(EIO)?;
+                let submission = crate::g17::fw::m5::queue::HardwareSubmission::compute(
+                    qid,
+                    self.kick.low_va(),
+                    policy.priority(),
+                    false,
+                )?;
+                let fallback = WorkSlot::new(
+                    DataMaster::Compute,
+                    self.graph.graph.gpu_va(),
+                    qid,
+                    producer.try_into()?,
+                    false,
+                )?;
+                let graph = &self.graph;
+                let mut still_live = || graph.m5_kick_still_live(prev_kick, prev_slot);
+                host.announce_m5_warm(policy.priority(), &submission, &fallback, &mut still_live)?;
+            } else {
+                if self.graph.m5 {
+                    // Required order on this firmware: the host-port transaction, with core gating
+                    // held off across it (Host::submit_m5), then the work doorbell. Rung first, the
+                    // doorbell can be served before the advance lands; the firmware then finds
+                    // nothing new and goes idle, and the advance alone never wakes it, so the kick
+                    // never runs. Held gating is what lets the advance land first: without the
+                    // hold, gated cores did not take it.
+                    host.submit_m5(&crate::g17::fw::m5::queue::HardwareSubmission::compute(
+                        qid, self.kick.low_va(), policy.priority(),
+                        first || notify_activation)?)?;
+                }
+                host.notify((0x83 << 48) | 0x02 | u64::from(policy.priority()) << 2)?;
             }
-            host.notify((0x83 << 48) | 0x02 | u64::from(policy.priority()) << 2)?;
             if !packet.cancel_requested() {
                 if let Some(dependency) =
                     crate::g17::fw::kick::KickDependency::new(qid, kick_timestamp)
@@ -3917,3 +4067,60 @@ pub(crate) type SourceDependency = (
     crate::g17::sync_input::Hold,
     bool,
 );
+
+#[kernel::macros::kunit_tests(asahi_g17_compute_warm)]
+mod warm_tests {
+    use super::*;
+
+    const WARM: M5Warmth = M5Warmth {
+        warm_host_kicks: true,
+        first: false,
+        installed: true,
+        m5_installed: true,
+        pending_config: false,
+        outer_started: true,
+        replays_empty: true,
+        quarantined: false,
+        awaiting_witness: false,
+        previous_published: true,
+        prev_live: true,
+        activation_first: false,
+        activation_refresh: false,
+        config_required: false,
+    };
+
+    #[test]
+    fn warm_requires_every_condition() {
+        assert!(WARM.is_warm());
+        for cold in [
+            M5Warmth { warm_host_kicks: false, ..WARM },
+            M5Warmth { first: true, ..WARM },
+            M5Warmth { installed: false, ..WARM },
+            M5Warmth { m5_installed: false, ..WARM },
+            M5Warmth { pending_config: true, ..WARM },
+            M5Warmth { outer_started: false, ..WARM },
+            M5Warmth { replays_empty: false, ..WARM },
+            M5Warmth { quarantined: true, ..WARM },
+            M5Warmth { awaiting_witness: true, ..WARM },
+            M5Warmth { previous_published: false, ..WARM },
+            M5Warmth { prev_live: false, ..WARM },
+            M5Warmth { activation_first: true, ..WARM },
+            M5Warmth { activation_refresh: true, ..WARM },
+            M5Warmth { config_required: true, ..WARM },
+        ] {
+            assert!(!cold.is_warm());
+        }
+    }
+
+    #[test]
+    fn check_m5_item_room_rejects_short_or_corrupt_rings() {
+        let ok = Cursors { producer: 0, consumer: 0, count: ITEM_RING_ENTRIES };
+        assert_eq!(check_m5_item_room(ok).unwrap().producer, 0);
+        let full = Cursors { producer: 10, consumer: 12, count: ITEM_RING_ENTRIES };
+        assert_eq!(check_m5_item_room(full).err(), Some(ENOSPC));
+        let bad_count = Cursors { producer: 0, consumer: 0, count: 64 };
+        assert_eq!(check_m5_item_room(bad_count).err(), Some(EIO));
+        let bad_cursor = Cursors { producer: ITEM_RING_ENTRIES, consumer: 0, count: ITEM_RING_ENTRIES };
+        assert_eq!(check_m5_item_room(bad_cursor).err(), Some(ERANGE));
+    }
+}

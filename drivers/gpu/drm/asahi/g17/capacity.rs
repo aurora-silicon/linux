@@ -31,6 +31,8 @@ const SITE_COUNT: usize = Site::ExecutionContexts as usize + 1;
 static REFUSALS: [AtomicU64; SITE_COUNT] = [const { AtomicU64::new(0) }; SITE_COUNT];
 static M5_WARM_RENDER: AtomicU64 = AtomicU64::new(0);
 static M5_WARM_RENDER_FALLBACK: AtomicU64 = AtomicU64::new(0);
+static M5_WARM_COMPUTE: AtomicU64 = AtomicU64::new(0);
+static M5_WARM_COMPUTE_FALLBACK: AtomicU64 = AtomicU64::new(0);
 
 /// Record an M5 warm render kick (host-port only, or post-kick outer fallback).
 pub(crate) fn note_m5_warm_render(fallback: bool) {
@@ -38,6 +40,15 @@ pub(crate) fn note_m5_warm_render(fallback: bool) {
         M5_WARM_RENDER_FALLBACK.fetch_add(1, Ordering::Relaxed);
     } else {
         M5_WARM_RENDER.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Record an M5 warm compute kick (host-port only, or post-kick outer fallback).
+pub(crate) fn note_m5_warm_compute(fallback: bool) {
+    if fallback {
+        M5_WARM_COMPUTE_FALLBACK.fetch_add(1, Ordering::Relaxed);
+    } else {
+        M5_WARM_COMPUTE.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -89,9 +100,11 @@ impl kernel::debugfs::Writer for View {
         writeln!(f, "timestamp_window firmware={} host_fallbacks={}", kept, fallbacks)?;
         writeln!(
             f,
-            "m5_warm_kicks render={} render_fallback={}",
+            "m5_warm_kicks render={} render_fallback={} compute={} compute_fallback={}",
             M5_WARM_RENDER.load(Ordering::Relaxed),
             M5_WARM_RENDER_FALLBACK.load(Ordering::Relaxed),
+            M5_WARM_COMPUTE.load(Ordering::Relaxed),
+            M5_WARM_COMPUTE_FALLBACK.load(Ordering::Relaxed),
         )?;
         let upper = uat.kernel_dynamic_range();
         for (name, vm, range) in [

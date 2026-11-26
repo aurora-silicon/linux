@@ -2501,6 +2501,76 @@ impl compute::Host for ComputeHost<'_> {
         // Firmware::submit_m5_render_pair, which keeps its own order.
         self.regs.submit_m5_work_held(submission)
     }
+    fn announce_m5_warm(
+        &mut self,
+        priority: u8,
+        submission: &super::fw::m5::queue::HardwareSubmission,
+        fallback: &super::fw::channels::WorkSlot,
+        still_live: &mut dyn FnMut() -> bool,
+    ) -> Result {
+        if !self.init.is_m5() {
+            return Err(EINVAL);
+        }
+        let init = self.init;
+        let outer_cursors = &mut self.outer_cursors;
+        announce_m5_compute_warm(
+            self.port,
+            &mut self.m5_outer,
+            priority,
+            submission,
+            still_live,
+            |_| {
+                let cursors = outer_cursors
+                    .take()
+                    .filter(|&(checked, _)| checked == priority)
+                    .map(|(_, cursors)| cursors);
+                init.publish_work_at(priority, fallback, cursors).map(|_| ())
+            },
+        )
+    }
+}
+
+/// Compute doorbell message for `priority` on pipe 2.
+fn compute_doorbell_message(priority: u8) -> u64 {
+    (0x83 << super::MSG_TYPE_SHIFT) | 0x02 | u64::from(priority) << 2
+}
+
+/// Announce a warm M5 compute kick under `m5_outer`: note submission history,
+/// send the host-port advance (propagating any host-port error), then re-check
+/// whether the previous kick on this channel is still live. If it completed
+/// before or during the advance, publish the fallback outer record while still
+/// holding `m5_outer`, release the lock, and ring the compute doorbell so the
+/// firmware wakes without double-counting submission history.
+fn announce_m5_compute_warm<'a>(
+    port: &super::port::Port,
+    guard: &mut Option<kernel::sync::MutexGuard<'a, Option<(u32, u64, u64)>>>,
+    priority: u8,
+    submission: &super::fw::m5::queue::HardwareSubmission,
+    still_live: &mut dyn FnMut() -> bool,
+    publish_fallback: impl FnOnce(
+        &mut kernel::sync::MutexGuard<'a, Option<(u32, u64, u64)>>,
+    ) -> Result,
+) -> Result {
+    let lock = guard.as_mut().ok_or(EIO)?;
+    if let Err(error) = port.note_m5_submission_history_locked(lock, 1) {
+        pr_warn!("asahi: M5 submission history skipped: {:?}\n", error);
+    }
+    if let Err(error) = port.submit_m5_work_held_locked(lock, submission) {
+        *guard = None;
+        return Err(error);
+    }
+    // Full barrier: on arm64 Acquire compiles to dmb ishld, which does not order the
+    // preceding MMIO kick store before the subsequent completion-stamp and end-timestamp loads.
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    if still_live() {
+        *guard = None;
+        super::capacity::note_m5_warm_compute(false);
+        return Ok(());
+    }
+    publish_fallback(lock)?;
+    *guard = None;
+    super::capacity::note_m5_warm_compute(true);
+    port.notify(compute_doorbell_message(priority))
 }
 
 /// Publication into a bound, installed queue through the port alone. The caller checked the
@@ -2579,6 +2649,33 @@ impl compute::Host for DirectHost<'_> {
             .m5_outer_guard
             .get_or_insert_with(|| self.port.m5_outer_lock());
         self.port.submit_m5_work_held_locked(guard, submission)
+    }
+    fn announce_m5_warm(
+        &mut self,
+        priority: u8,
+        submission: &super::fw::m5::queue::HardwareSubmission,
+        fallback: &super::fw::channels::WorkSlot,
+        still_live: &mut dyn FnMut() -> bool,
+    ) -> Result {
+        if !self.m5 {
+            return Err(EINVAL);
+        }
+        self.m5_outer_guard
+            .get_or_insert_with(|| self.port.m5_outer_lock());
+        let port = self.port;
+        let m5_outer = &mut self.m5_outer;
+        announce_m5_compute_warm(
+            port,
+            &mut self.m5_outer_guard,
+            priority,
+            submission,
+            still_live,
+            |lock| {
+                let claim = m5_outer.as_deref_mut().ok_or(EIO)?;
+                port.publish_m5_compute_locked(lock, priority, claim, fallback)
+                    .map(|_| ())
+            },
+        )
     }
 }
 

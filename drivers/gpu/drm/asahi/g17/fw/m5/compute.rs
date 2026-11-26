@@ -113,6 +113,12 @@ pub(crate) const ENTRY_GATE_EVENT: u32 = 254;
 /// counted forms ([`counted_forms`]) it is the pool event alone. Otherwise it is the fixed
 /// `[0, 0, 8, 0]` (event 131, context 3's pool event, without the gate).
 pub(crate) fn kick_event_mask(board: &Board, context_id: u32) -> Result<[u64; 4]> {
+    kick_event_mask_for(board, context_id, false)
+}
+
+/// Like [`kick_event_mask`], omitting the entry-signal gate (event 254) on a warm
+/// kick that adds no item-ring notification for the firmware to process first.
+pub(crate) fn kick_event_mask_for(board: &Board, context_id: u32, warm: bool) -> Result<[u64; 4]> {
     if board.j813_forms() {
         if context_id >= POOL_EVENT_CONTEXTS {
             return Err(EINVAL);
@@ -127,8 +133,8 @@ pub(crate) fn kick_event_mask(board: &Board, context_id: u32) -> Result<[u64; 4]
     }
     let mut mask = [0u64; 4];
     let pool = POOL_EVENT_ENGINE * POOL_EVENT_CONTEXTS + context_id;
-    let events = [Some(pool), board.g17d_forms().then_some(ENTRY_GATE_EVENT)];
-    for event in events.into_iter().flatten() {
+    let gate = (!warm && board.g17d_forms()).then_some(ENTRY_GATE_EVENT);
+    for event in [Some(pool), gate].into_iter().flatten() {
         mask[(event / 64) as usize] |= 1 << (event % 64);
     }
     Ok(mask)
