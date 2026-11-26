@@ -7866,8 +7866,6 @@ static int apple_pcie_hib_port_up(struct apple_pcie *pcie, struct apple_pcie_por
 	}
 	apple_pcie_port_writel(port, BIT(PORT_INT_LINK_UP), PORT_INTSTAT);
 	apple_pcie_port_writel(port, port->saved_intmask, PORT_INTMSK);
-	/* 100 ms after the link before configuration requests (PCIe r5.0, 6.6.1). */
-	msleep(100);
 	return 0;
 }
 
@@ -7877,6 +7875,7 @@ static int apple_pcie_resume(struct device *dev)
 	struct apple_pcie *pcie = apple_pcie_lookup(dev);
 	struct apple_pcie_port *port;
 	struct apple_pcie_hib_fn *fn;
+	bool trained = false;
 	int ret;
 
 	if (!pcie->hib_saved)
@@ -7910,9 +7909,16 @@ static int apple_pcie_resume(struct device *dev)
 			continue;
 		}
 		apple_pcie_port_enable_irq(port);
+		trained = true;
 		dev_info(dev, "S2R: %pOF link back, PWREN and PERST# cycled as at probe\n",
 			 port->np);
 	}
+	/*
+	 * 100 ms after the last link before configuration requests (PCIe r5.0,
+	 * 6.6.1); every earlier link has waited longer.
+	 */
+	if (trained)
+		msleep(100);
 	list_for_each_entry(fn, &pcie->hib_fns, entry) {
 		port = apple_pcie_get_port(fn->pdev);
 		if (!port || !port->hib_cold)
