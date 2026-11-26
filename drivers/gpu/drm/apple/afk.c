@@ -1904,9 +1904,15 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 		}
 	}
 
-	if (ep->match_epic_name)
+	/*
+	 * The HDCP services go by their EPIC name: their provider classes are
+	 * shared with other services (the DP device class also names the AV
+	 * device, the interface class names the port controllers).
+	 */
+	ops = dcp_hdcp_match_service(ep, epic_name, false);
+	if (!ops && ep->match_epic_name)
 		ops = afk_match_service(ep, epic_name);
-	else
+	else if (!ops)
 		ops = afk_match_service(ep, service_name);
 	if (dcp_is_ext26(ep->dcp))
 		dev_dbg(ep->dcp->dev,
