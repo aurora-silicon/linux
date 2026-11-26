@@ -186,6 +186,10 @@ struct tb_path *tb_path_discover(struct tb_port *src, int src_hopid,
 	for (i = 0; i < num_hops; i++) {
 		int next_hop;
 
+		/* Ended early: a router reported an adapter without a link this time */
+		if (!p)
+			goto err;
+
 		ret = tb_port_read(p, &hop, TB_CFG_HOPS, 2 * h, 2);
 		if (ret) {
 			tb_port_warn(p, "failed to read path at %d\n", h);

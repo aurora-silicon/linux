@@ -4920,10 +4920,10 @@ static void tb_test_xdp_properties_progress(struct kunit *test)
 	kfree(block);
 }
 
-/* A router whose hop entries all go out of the adapters listed, one per read. */
+/* Routers whose hop entries go out of the adapters listed, one per read. */
 struct tb_test_hops {
-	unsigned int reads;
-	u8 out_port[2];
+	unsigned int reads, count;
+	u8 out_port[4];
 };
 
 static int tb_test_hops_cfg_read(struct tb_ctl *ctl, void *buffer, u64 route, u32 port,
@@ -4931,7 +4931,7 @@ static int tb_test_hops_cfg_read(struct tb_ctl *ctl, void *buffer, u64 route, u3
 {
 	struct tb_test_hops *hops = kunit_get_current_test()->priv;
 	struct tb_regs_hop hop = { .enable = true, .next_hop = 8 };
-	unsigned int n = min_t(unsigned int, hops->reads++, ARRAY_SIZE(hops->out_port) - 1);
+	unsigned int n = min_t(unsigned int, hops->reads++, hops->count - 1);
 
 	if (space != TB_CFG_HOPS || length * 4 > sizeof(hop))
 		return -EIO;
@@ -4965,6 +4965,7 @@ static struct tb_test_hops *tb_test_hops_alloc(struct kunit *test, struct tb_swi
 static void tb_test_hops_set(struct tb_test_hops *hops, u8 first, u8 again)
 {
 	hops->reads = 0;
+	hops->count = 2;
 	hops->out_port[0] = first;
 	hops->out_port[1] = again;
 }
@@ -5016,6 +5017,50 @@ static void tb_test_path_discover_out_port(struct kunit *test)
 	tb_port_release_in_hopid(in, 8);
 	KUNIT_EXPECT_EQ(test, tb_port_alloc_out_hopid(lane, 8, 8), 8);
 	tb_port_release_out_hopid(lane, 8);
+}
+
+/*
+ * Read again, a path can change shape: here it reaches a device router
+ * through lane adapter 1 and ends on the device's adapter 3, then goes out
+ * of the host's unlinked adapter 3 instead. Discovery fails instead of
+ * following a link that is not there.
+ */
+static void tb_test_path_discover_shorter(struct kunit *test)
+{
+	struct tb_switch *host, *dev;
+	struct tb_test_hops *hops = tb_test_hops_alloc(test, &host);
+	struct tb_port *in = &host->ports[5], *unlinked = &host->ports[3];
+	struct tb_path *path;
+
+	dev = alloc_dev_default(test, host, 0x1, true);
+	KUNIT_ASSERT_NOT_NULL(test, dev);
+	dev->tb = host->tb;
+
+	/* Both reads the same: two hops, the second on the device router */
+	hops->reads = 0;
+	hops->count = 4;
+	hops->out_port[0] = 1;
+	hops->out_port[1] = 3;
+	hops->out_port[2] = 1;
+	hops->out_port[3] = 3;
+	path = tb_path_discover(in, 8, NULL, -1, NULL, "Video", true);
+	KUNIT_ASSERT_NOT_NULL(test, path);
+	KUNIT_EXPECT_EQ(test, path->path_length, 2);
+	KUNIT_EXPECT_PTR_EQ(test, path->hops[1].in_port, &dev->ports[1]);
+	KUNIT_EXPECT_PTR_EQ(test, path->hops[1].out_port, &dev->ports[3]);
+	tb_path_free(path);
+
+	/* The host's entry names its unlinked adapter 3 on the second read */
+	hops->reads = 0;
+	hops->out_port[2] = 3;
+	KUNIT_EXPECT_NULL(test, tb_path_discover(in, 8, NULL, -1, NULL, "Video", true));
+	KUNIT_EXPECT_EQ(test, hops->reads, 3U);
+
+	/* The HopIDs taken for the first hop were given back */
+	KUNIT_EXPECT_EQ(test, tb_port_alloc_in_hopid(in, 8, 8), 8);
+	tb_port_release_in_hopid(in, 8);
+	KUNIT_EXPECT_EQ(test, tb_port_alloc_out_hopid(unlinked, 8, 8), 8);
+	tb_port_release_out_hopid(unlinked, 8);
 }
 
 static struct kunit_case tb_test_cases[] = {
@@ -5098,6 +5143,7 @@ static struct kunit_case tb_test_cases[] = {
 	KUNIT_CASE(tb_test_dp_bandwidth_request_port),
 	KUNIT_CASE(tb_test_xdp_properties_progress),
 	KUNIT_CASE(tb_test_path_discover_out_port),
+	KUNIT_CASE(tb_test_path_discover_shorter),
 	{ }
 };
 
