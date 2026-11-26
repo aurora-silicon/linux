@@ -125,6 +125,7 @@ static DEFINE_MUTEX(apple_g15_display_lock);
 static struct device *apple_t6030_display;
 static struct device *apple_t6031_display;
 static struct device *apple_t8132_display;
+static struct device *apple_t6034_display;
 #define APPLE_DRM_PUBLISHED_MAX 8
 static struct device *apple_drm_published[APPLE_DRM_PUBLISHED_MAX];
 
@@ -137,6 +138,8 @@ static struct device **apple_g15_display_slot(struct device *dev)
 		return &apple_t6031_display;
 	if (of_device_is_compatible(dev->of_node, "apple,t8132-display-subsystem"))
 		return &apple_t8132_display;
+	if (of_device_is_compatible(dev->of_node, "apple,t6034-display-subsystem"))
+		return &apple_t6034_display;
 	return NULL;
 }
 
@@ -270,6 +273,17 @@ int apple_drm_link_device(struct device *consumer,
 	return -EPROBE_DEFER;
 }
 EXPORT_SYMBOL_GPL(apple_drm_link_device);
+int apple_drm_t6034_link_device(struct device *consumer)
+{
+	if (of_machine_is_compatible("apple,j516m"))
+		return apple_g15_link_device(consumer, "apple,t6034", "apple,agx-t6034",
+					     &apple_t6031_display);
+	if (!of_machine_is_compatible("apple,j514m"))
+		return -ENODEV;
+	return apple_g15_link_device(consumer, "apple,t6034", "apple,agx-t6034",
+				     &apple_t6034_display);
+}
+EXPORT_SYMBOL_GPL(apple_drm_t6034_link_device);
 
 DEFINE_DRM_GEM_DMA_FOPS(apple_fops);
 
@@ -1819,6 +1833,7 @@ static const struct of_device_id apple_dcp_id_tbl[] = {
 	{ .compatible = "apple,t6030-dcp" },
 	{ .compatible = "apple,t8122-dcp" },
 	{ .compatible = "apple,t6031-dcp" },
+	{ .compatible = "apple,t6034-dcp" },
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8132)
 	{ .compatible = "apple,t8132-dcp" },
 #endif
@@ -2372,6 +2387,7 @@ static const struct of_device_id of_match[] = {
 	{ .compatible = "apple,t6030-display-subsystem" },
 	{ .compatible = "apple,t8122-display-subsystem" },
 	{ .compatible = "apple,t6031-display-subsystem" },
+	{ .compatible = "apple,t6034-display-subsystem" },
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8132)
 	{ .compatible = "apple,t8132-display-subsystem" },
 	/* Accept the qualified handoff emitted by the existing boot loader. */
