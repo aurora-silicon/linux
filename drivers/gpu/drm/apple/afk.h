@@ -262,9 +262,11 @@ static inline void afk_service_retire_channel(struct apple_epic_service *service
  * A singleton service has one live instance per endpoint. The firmware
  * announces it again on a fresh channel when the display is attached again,
  * without closing the previous channel (as for compact services, see
- * afk_compact_slot()). The announcement on @channel then supersedes
- * @service: retire it, so that its slot is reclaimed once its last user
- * lets go. The successor's init takes over the service's state.
+ * afk_compact_slot()). Once the instance announced on @channel has been
+ * admitted, it supersedes @service: retire it, so that its slot is
+ * reclaimed once its last user lets go. The successor's init takes over
+ * the service's state. Call this only after the successor holds its own
+ * slot; a rejected successor must leave @service usable.
  */
 static inline bool afk_service_supersede(struct apple_epic_service *service,
 					 const struct apple_epic_service_ops *ops,
