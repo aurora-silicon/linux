@@ -16,10 +16,7 @@ pub(crate) mod storage;
 
 use kernel::prelude::*;
 
-use super::kick::{
-    KickTimestamp, McacheClass, McacheRange, McacheTable, RegisterArray, RegisterArrayBinding,
-    RegisterWrite, WriteRange, MCACHE_INLINE_RANGES,
-};
+use super::kick::{KickTimestamp, RegisterArray, RegisterArrayBinding, RegisterWrite};
 use super::queue::CommandTag;
 use super::{
     clear, offset_va, sampler_max, stamp_value, timestamp_end_va, work_key, ObjectIds, UNK_0A599,
@@ -28,13 +25,8 @@ use super::{
 
 /// Size of a tiling descriptor.
 pub(crate) const TA_DESCRIPTOR_SIZE: usize = 0x9c0;
-/// Size of a [`FragmentSlot`]: the descriptor and its MCache spill table.
+/// Size of a [`FragmentSlot`], the stride of fragment descriptors.
 pub(crate) const FRAGMENT_SLOT_SIZE: usize = 0x2380;
-/// Write ranges of one fragment pass: its attachments and the auxiliary
-/// framebuffer.
-pub(crate) const MCACHE_RANGES_MAX: usize = 17;
-/// Size of the auxiliary framebuffer of a pass.
-pub(crate) const AUX_FB_SIZE: u64 = 0x8000;
 
 /// QoS class of tiling kicks.
 pub(crate) const TA_QOS_CLASS: u8 = 0x0c;
@@ -1576,24 +1568,23 @@ impl FragmentDescriptor {
     }
 }
 
-/// A fragment descriptor followed by room for an MCache table that does not
-/// fit its first register array.
+/// A fragment descriptor in its slot.
+///
+/// Fragment kicks name no MCache table, so nothing follows the descriptor;
+/// the slot keeps the room an MCache table of more than
+/// [`super::kick::MCACHE_INLINE_RANGES`] ranges once took, leaving the slot
+/// stride unchanged.
 #[repr(C)]
 #[derive(Debug)]
 pub(crate) struct FragmentSlot {
     /// The descriptor.
     pub(crate) descriptor: FragmentDescriptor,
-    /// MCache table of more than [`MCACHE_INLINE_RANGES`] ranges.
-    pub(crate) mcache: [McacheRange; MCACHE_RANGES_MAX],
-    pub(crate) pad_2350: [u8; 0x30],
+    pub(crate) pad: [u8; FRAGMENT_SLOT_SIZE - size_of::<FragmentDescriptor>()],
 }
 
 static_assert!(size_of::<FragmentSlot>() == FRAGMENT_SLOT_SIZE);
 
 impl FragmentSlot {
-    const INLINE_MCACHE_OFFSET: u64 =
-        FragmentDescriptor::array_offset(0) + core::mem::offset_of!(RegisterArray, mcache) as u64;
-    const SPILL_MCACHE_OFFSET: u64 = core::mem::offset_of!(Self, mcache) as u64;
     const UNK_2110: u32 = u32::MAX;
     const UNK_2124: [u32; 2] = [1, 1];
     const UNK_21CC: u8 = 0x53;
@@ -1604,11 +1595,8 @@ impl FragmentSlot {
     const UNK_1FAC_BASE: u64 = 0x300;
     const UNK_1FAC_TIB_SHIFT: u32 = 33;
 
-    /// Writes the complete descriptor except the completion link and the
-    /// MCache table.
-    ///
-    /// The spill table is left as it is: a kick entry names it only after
-    /// [`Self::set_mcache`] rewrote it, so stale bytes there are never read.
+    /// Writes the complete descriptor except the completion link. The padding
+    /// after it is never read.
     pub(crate) fn write(&mut self, args: &RenderArgs<'_>) -> Result {
         let pass = args.pass;
         let resources = args.resources;
@@ -1711,46 +1699,6 @@ impl FragmentSlot {
     pub(crate) fn set_completion_link(&mut self, fragment: KickTimestamp, pass_seq: u8) {
         self.descriptor.pass_seq = pass_seq;
         self.descriptor.completion = fragment.completion_value(pass_seq);
-    }
-
-    /// Writes the MCache table of the pass: the auxiliary framebuffer at
-    /// `aux_fb_va`, then `attachments`, translated in UAT context `context`.
-    /// `slot_va` is the GPU address of this slot as seen by the pass's VM.
-    ///
-    /// Returns the table for the fragment kick entry, or `None` when the pass
-    /// has no attachments.
-    pub(crate) fn set_mcache(
-        &mut self,
-        slot_va: u64,
-        aux_fb_va: u64,
-        attachments: &[WriteRange],
-        context: u8,
-    ) -> Result<Option<McacheTable>> {
-        if attachments.is_empty() {
-            return Ok(None);
-        }
-        let count = attachments.len() + 1;
-        if count > MCACHE_RANGES_MAX {
-            return Err(EINVAL);
-        }
-        let (offset, ranges) = if count <= MCACHE_INLINE_RANGES {
-            (
-                Self::INLINE_MCACHE_OFFSET,
-                &mut self.descriptor.arrays[0].mcache[..count],
-            )
-        } else {
-            (Self::SPILL_MCACHE_OFFSET, &mut self.mcache[..count])
-        };
-        let table = McacheTable::new(offset_va(slot_va, offset)?, count)?;
-        let aux_fb = WriteRange {
-            va: aux_fb_va,
-            size: AUX_FB_SIZE,
-        };
-        ranges[0] = McacheRange::new(&aux_fb, McacheClass::AuxFramebuffer, context)?;
-        for (range, attachment) in ranges[1..].iter_mut().zip(attachments) {
-            *range = McacheRange::new(attachment, McacheClass::Attachment, context)?;
-        }
-        Ok(Some(table))
     }
 }
 

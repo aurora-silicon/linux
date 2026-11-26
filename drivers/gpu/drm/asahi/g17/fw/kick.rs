@@ -184,15 +184,13 @@ pub(crate) struct WriteRange {
 
 /// Class of an [`McacheRange`].
 ///
-/// The auxiliary framebuffer range takes class 2 and attachment ranges take
-/// class 1.
+/// Attachment ranges take class 1; a fragment pass's auxiliary framebuffer
+/// range would take class 2, but fragment kicks name no MCache table.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub(crate) enum McacheClass {
-    /// A render-target attachment.
+    /// Memory the work writes: a compute write range.
     Attachment = 1,
-    /// The auxiliary framebuffer.
-    AuxFramebuffer = 2,
 }
 
 /// One MCache range: a GPU address range that work writes, in 128-byte cache
@@ -256,8 +254,8 @@ pub(crate) const MCACHE_INLINE_RANGES: usize = 16;
 pub(crate) struct RegisterArray {
     /// Register writes, in order.
     pub(crate) entries: [RegisterWrite; REGISTER_ARRAY_ENTRIES],
-    /// Space after the entries. The first fragment array keeps its MCache
-    /// table here when the table fits; it is zero everywhere else.
+    /// Space after the entries. A compute descriptor's main array keeps its
+    /// MCache table here; it is zero everywhere else.
     pub(crate) mcache: [McacheRange; MCACHE_INLINE_RANGES],
     /// GPU address of this array, as seen by the work's VM.
     pub(crate) self_va: u64,

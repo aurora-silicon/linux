@@ -819,12 +819,7 @@ impl Memory {
         Ok((encoded.rce, encoded.kick_flags))
     }
 
-    pub(super) fn write_descriptors(
-        &mut self,
-        args: &abi::RenderArgs<'_>,
-        attachments: &[fw::kick::WriteRange],
-        context: u8,
-    ) -> Result<Option<fw::kick::McacheTable>> {
+    pub(super) fn write_descriptors(&mut self, args: &abi::RenderArgs<'_>) -> Result {
         let tiling = self
             .graph
             .descriptors
@@ -858,13 +853,8 @@ impl Memory {
             for array in &fragment.descriptor.arrays {
                 array.entries.get(..(array.size & 0xffff) as usize).ok_or(EINVAL)?;
             }
-            fragment.set_mcache(
-                args.fragment.descriptor_va,
-                args.resources.aux_fb_va,
-                attachments,
-                context,
-            )
         }
+        Ok(())
     }
 }
 
