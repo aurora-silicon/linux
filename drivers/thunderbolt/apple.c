@@ -2730,6 +2730,7 @@ static int apple_nhi_probe(struct platform_device *pdev)
 
 	spin_lock_init(&anhi->nhi.lock);
 	anhi->nhi.iommu_dma_protection = true;
+	anhi->nhi.use_dma_credit_preferences = true;
 	/*
 	 * DP tunnel display support (and with it the host DP IN handling in
 	 * the connection manager) only where it is enabled and known to work.
