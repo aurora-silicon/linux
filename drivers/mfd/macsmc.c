@@ -1659,6 +1659,19 @@ static int apple_smc_sleep_saved_pmvc(void *data)
 	return 0;
 }
 
+static void apple_smc_sleep_until_before_slpa(void *data, u32 us)
+{
+	struct apple_smc *smc = data;
+	const struct apple_sleep_smc_policy *p = smc->sleep_policy;
+	u64 answered;
+
+	if (!p || !smc->sleep_warned)
+		return;
+	answered = smc->saved_pmvc_sent ? smc->saved_pmvc_at : smc->sleep_pmvc_at;
+	if (p->pmvc_to_slpa_us > us)
+		apple_smc_sleep_wait(answered, p->pmvc_to_slpa_us - us);
+}
+
 static const struct apple_sleep_smc_saved_ops apple_smc_saved_ops = {
 	.begin = apple_smc_sleep_saved_begin,
 	.check = apple_smc_sleep_saved_check,
@@ -1667,6 +1680,7 @@ static const struct apple_sleep_smc_saved_ops apple_smc_saved_ops = {
 	.end = apple_smc_sleep_saved_end,
 	.woken = apple_smc_sleep_saved_woken,
 	.pmvc = apple_smc_sleep_saved_pmvc,
+	.until_before_slpa = apple_smc_sleep_until_before_slpa,
 };
 
 /*

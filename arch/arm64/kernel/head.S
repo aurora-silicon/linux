@@ -420,26 +420,20 @@ pen:	ldr	x4, [x3]
 	 * Restarted after a system sleep's commit: the Apple deep-sleep bits, then WFI, as
 	 * macOS's parked cores do. A core spinning here would keep its cluster from powering down.
 	 * Bit 2: a core whose CYC_OVRD isn't locked (A7 to M3), which aura leaves in WFI mode 2
-	 * with retention: XNU's arm64_prepare_for_sleep(true) there, ACC_OVRD's deep-sleep
-	 * settings, then WFI mode 3 without retention, and nothing else. Without it (M4 on), the
+	 * with retention: WFI mode 3 without retention first, as macOS 27.2's cores on T6030 have
+	 * at their final WFI (ACC_OVRD stays at its boot value there). Then, on every core, the
 	 * deep-sleep bits of S3_5_C15_C6_2.
 	 */
-1:	tbnz	x5, #2, 4f
-	mrs_s	x4, sys_reg(3, 5, 15, 6, 2)
-	orr	x4, x4, #1
-	orr	x4, x4, #0x8000000000000000
-	msr_s	sys_reg(3, 5, 15, 6, 2), x4
-	b	3f
-4:	mrs_s	x4, sys_reg(3, 5, 15, 6, 0)
-	and	x4, x4, #~(3 << 15)
-	mov_q	x7, (3 << 13) | (2 << 15) | (3 << 17) | (3 << 25) | (1 << 32) | (1 << 34)
-	orr	x4, x4, x7
-	msr_s	sys_reg(3, 5, 15, 6, 0), x4
+1:	tbz	x5, #2, 4f
 	mrs_s	x4, sys_reg(3, 5, 15, 5, 0)
 	and	x4, x4, #~(3 << 24)
 	orr	x4, x4, #(3 << 24)
 	orr	x4, x4, #1
 	msr_s	sys_reg(3, 5, 15, 5, 0), x4
+4:	mrs_s	x4, sys_reg(3, 5, 15, 6, 2)
+	orr	x4, x4, #1
+	orr	x4, x4, #0x8000000000000000
+	msr_s	sys_reg(3, 5, 15, 6, 2), x4
 	isb
 	/*
 	 * 2 = the sleep driver asked for the last WFI at EL1 (apple_sleep.el1_wfi=2): from EL2,

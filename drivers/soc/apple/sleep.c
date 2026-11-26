@@ -6455,6 +6455,14 @@ static int apple_sleep_smc_pmvc(struct apple_sleep *s)
 	return s->smc.saved_ops->pmvc(s->smc.data);
 }
 
+/* Until @us before the SMC policy's earliest slpa, when the SMC driver offers that */
+static void apple_sleep_smc_until_before_slpa(struct apple_sleep *s, u32 us)
+{
+	if (s->smc.dev && s->smc.held && s->smc.saved_ops &&
+	    s->smc.saved_ops->until_before_slpa)
+		s->smc.saved_ops->until_before_slpa(s->smc.data, us);
+}
+
 static int apple_sleep_smc_commit_notice(struct apple_sleep *s)
 {
 	if (!s->smc.dev || !s->smc.held || !s->smc.saved_ops ||

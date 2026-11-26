@@ -82,6 +82,12 @@ struct apple_sleep_smc_saved_ops {
 	void (*woken)(void *data);
 	/* Optional, after the irreversible stops: pmVC alone, before late_notice (which then skips it). */
 	int (*pmvc)(void *data);
+	/*
+	 * Optional: busy-wait until @us before the earliest slpa the policy allows (its pmVC to
+	 * slpa spacing from the last pmVC's answer), so steps a SoC's macOS takes just before slpa
+	 * can be taken there too.
+	 */
+	void (*until_before_slpa)(void *data, u32 us);
 };
 
 /*

@@ -221,6 +221,19 @@ static const u32 t6030_lowered[] = {
 enum { T6030_LOWER_SIO_CPU, T6030_LOWER_PMP, T6030_LOWER_PMS_SRAM, T6030_LOWER_PHY };
 
 /*
+ * The two writes macOS 27.2 lowers each of them with, every run (entry -25.4, -24.7, -13.7 and
+ * -8.5 ms): AUTO_ENABLE off with the target kept, then target 0. The flags differ from what
+ * sleep_ps_lower() writes, and some stay: PMP keeps 0xf in bits 19:16 at the commit
+ * (0x0f0f0300), the storage PHY reads 0x0f000200.
+ */
+static const u32 t6030_lowered_macos[][2] = {
+	{ 0x400004f, 0x4000340 },	/* SIO_CPU */
+	{ 0xf0f00ff, 0xf0f03f0 },	/* PMP */
+	{ 0xf, 0x300 },			/* PMS_SRAM */
+	{ 0x400004f, 0x4000340 },	/* APCIE_PHY_SW */
+};
+
+/*
  * On under Linux at the commit, off at macOS's (PLAN §4, runs/t1c-stop/linux-diff.tsv): every
  * USB-C port's PHY common, then debug port's fabric (on under the HV only because aura holds
  * it), then the words macOS leaves to their auto state (0x200; the ADT calls them critical).
@@ -837,6 +850,8 @@ static void t6030_wake_masks_restore(struct apple_sleep *s)
 #define T6030_DART_ERROR		0x100
 #define T6030_DART_ERROR_MASK		0x104
 #define T6030_DART_704			0x704
+/* The value macOS writes to ERROR after reading it, in every run (an acknowledgment) */
+#define T6030_DART_ERROR_MACOS		0x10100000
 
 static void t6030_late_map(struct apple_sleep *s)
 {
@@ -904,7 +919,8 @@ static void t6030_mtp_dart_quiet(struct apple_sleep *s)
 		return;
 	writel(0xffffffff, d + T6030_DART_ERROR_MASK);
 	readl(d + T6030_DART_ERROR_MASK);
-	writel(readl(d + T6030_DART_ERROR), d + T6030_DART_ERROR);
+	readl(d + T6030_DART_ERROR);
+	writel(T6030_DART_ERROR_MACOS, d + T6030_DART_ERROR);
 	writel(0xffffffff, d + T6030_DART_704);
 	readl(d + T6030_DART_704);
 }
@@ -1343,16 +1359,32 @@ MODULE_PARM_DESC(mem_config, "T6030 DIAGNOSTIC: bring the AMCC, DCS and SoC perf
 
 static void t6030_sleep_prepare_regs(struct apple_sleep *s)
 {
-	struct t6030_sleep *t = t6030_state(s);
-
 	t6030_sleep_late_entry(s);
 	/*
-	 * The RAM walk first: what follows, up to the commit, is macOS's last 30 ms (t5), and the
-	 * commit's 1.8 ms tail still cleans what the steps below write.
+	 * The RAM walk here, seconds before the commit: the steps from .after_ans on are macOS's
+	 * last 30 ms, and the commit's 1.8 ms tail still cleans what they write.
 	 */
 	t6030_sleep_clean_ram();
+}
+
+/*
+ * macOS 27.2's late group on J516s, after ANS's stop and the 4.1 s from pmVC, 28.6 to 23.9 ms
+ * before its commit and 15.2 ms before slpa (run 3 and mac-stop-1000-1, PLAN 29.13-29.14): the
+ * PTD's no-demand votes (pmgr[40]); the PMU burst with the RTC read and 0xf801; WD0's and WD1's
+ * counts to 0; I2C6's word; the notify masks; then SIO's and the PMP's AP idle (the next
+ * coprocessor stops and .commit_notice). Linux took it right after pmVC, 3.8 s before its commit,
+ * so the coprocessors heard AP idle seconds early. Wait for macOS's slot first.
+ */
+#define T6030_LATE_TO_SLPA_US		15200
+
+static void t6030_sleep_after_ans(struct apple_sleep *s)
+{
+	struct t6030_sleep *t = t6030_state(s);
+
+	apple_sleep_smc_until_before_slpa(s, T6030_LATE_TO_SLPA_US);
+	if (sleep_seq_run_strict(t->blk, &t->prepare))
+		t6030_sleep_failed("apple,seq-prepare");
 	t6030_alarm_snapshot(s, readl(s->spmi + SPMI_NOTIFY_ENABLE));
-	/* t5: WD0's and WD1's counts to 0 at -28.3 ms, after the RTC read, before PMU 0xf801 */
 	writel(0, s->wdt + WDT_WD0_COUNT);
 	writel(0, s->wdt + WDT_WD1_COUNT);
 	sleep_pmu_write(s, s->soc->pmu_sleep_reg, s->soc->pmu_sleep_val);
@@ -1363,8 +1395,6 @@ static void t6030_sleep_prepare_regs(struct apple_sleep *s)
 	t6030_wake_masks_set(s);
 	writel(s->soc->spmi_notify_sleep, s->spmi_a0 + SPMI_NOTIFY_ENABLE);
 	writel(s->soc->spmi_notify_sleep, s->spmi + SPMI_NOTIFY_ENABLE);
-	if (sleep_seq_run_strict(t->blk, &t->prepare))
-		t6030_sleep_failed("apple,seq-prepare");
 }
 
 static void t6030_sleep_undo_regs(struct apple_sleep *s)
@@ -1389,7 +1419,8 @@ static int t6030_sleep_lower(struct apple_sleep *s, unsigned int from, unsigned 
 	for (i = from; i < to; i++) {
 		t->lowered_saved[i] = readl(s->ps + t6030_lowered[i]);
 		t->nlowered = i + 1;
-		sleep_ps_lower(s, t6030_lowered[i]);
+		writel(t6030_lowered_macos[i][0], s->ps + t6030_lowered[i]);
+		writel(t6030_lowered_macos[i][1], s->ps + t6030_lowered[i]);
 		if (sleep_ps_wait_off(s, t6030_lowered[i])) {
 			dev_err(s->dev, "power word %#x not off: %#x\n", t6030_lowered[i],
 				readl(s->ps + t6030_lowered[i]));
@@ -1510,49 +1541,11 @@ static void t6030_gp_clk_off(struct apple_sleep *s)
 }
 
 /*
- * t6030_macos_down[] and _aon[] off, each saved first; one that doesn't go off is counted
- * (t->down_stuck), not fatal: macOS has them off long before its commit, with no order of its
- * own in the window.
+ * The words macOS leaves to their auto state (t6030_macos_down[], _up[], _aon[]) aren't written
+ * at the entry any more: the stop-mode diff of ce1ff743 against macOS (PLAN 29.13) found those 37
+ * writes only on Linux. down_staged stays false, so the wake's two helpers below do nothing.
  */
 static void t6030_sleep_unstage(struct apple_sleep *s, u32 offset, u32 before);
-
-static void t6030_sleep_down(struct apple_sleep *s)
-{
-	struct t6030_sleep *t = t6030_state(s);
-	unsigned int i;
-	u32 v, now;
-
-	t->down_stuck = 0;
-	for (i = 0; i < ARRAY_SIZE(t6030_macos_down); i++) {
-		t->down_saved[i] = readl(s->ps + t6030_macos_down[i]);
-		if (!FIELD_GET(PS_ACTUAL, t->down_saved[i]))
-			continue;
-		sleep_ps_lower(s, t6030_macos_down[i]);
-		if (sleep_ps_wait_off(s, t6030_macos_down[i]))
-			t->down_stuck++;
-	}
-	for (i = 0; i < ARRAY_SIZE(t6030_macos_up); i++) {
-		t->up_saved[i] = readl(s->ps + t6030_macos_up[i]);
-		if (FIELD_GET(PS_ACTUAL, t->up_saved[i]) == 0xf)
-			continue;
-		if (sleep_ps_raise_start(s, t6030_macos_up[i]))
-			t->down_stuck++;
-	}
-	for (i = 0; i < ARRAY_SIZE(t6030_macos_down_aon); i++) {
-		void __iomem *reg = s->ps_aon + t6030_macos_down_aon[i];
-
-		v = readl(reg);
-		t->down_aon_saved[i] = v;
-		if (!FIELD_GET(PS_ACTUAL, v))
-			continue;
-		writel(v & ~(PS_AUTO_ENABLE | PS_FLAGS), reg);
-		writel((v & ~(PS_AUTO_ENABLE | PS_FLAGS | PS_TARGET)) | PS_FLAGS, reg);
-		if (readl_poll_timeout_atomic(reg, now, !FIELD_GET(PS_ACTUAL, now), 1,
-					      PS_OFF_TIMEOUT_US))
-			t->down_stuck++;
-	}
-	t->down_staged = true;
-}
 
 /* At the wake: the "ps" words back through the rewake (as before the entry), the aon ones here */
 static void t6030_sleep_down_unstage(struct apple_sleep *s)
@@ -1607,7 +1600,6 @@ static void t6030_sleep_commit_regs(struct apple_sleep *s)
 	for (i = 0; i < ARRAY_SIZE(t6030_auto_off); i++)
 		t->auto_saved[i] = readl(s->ps + t6030_auto_off[i]);
 	t->auto_staged = true;
-	t6030_sleep_down(s);
 	sleep_seq_save(t->blk, &t->wake_early);
 	sleep_seq_save(t->blk, &t->wake);
 	if (sleep_seq_run_strict(t->blk, &t->commit))
@@ -2220,18 +2212,14 @@ static void t6030_sleep_wake(struct apple_sleep *s)
 }
 
 /*
- * The cores' power-down controls, A7 to M3 (aura's cpu_regs.h; XNU's arm64_prepare_for_sleep
- * on its "global sleep" cores). CYC_OVRD is not locked before M4, and aura's init_cpu() leaves
- * each core's WFI in mode 2 with retention: a WFI that never powers the core down, so its
- * cluster never goes off and the sleep sequencer waits. The deep sleep wants mode 3 without
- * retention, and ACC_OVRD's deep-sleep settings.
+ * The cores' power-down controls, A7 to M3 (aura's cpu_regs.h). CYC_OVRD is not locked before
+ * M4, and aura's init_cpu() leaves each core's WFI in mode 2 with retention: a WFI that never
+ * powers the core down, so its cluster never goes off and the sleep sequencer waits.
  *
- * Every core's last steps are XNU's on H15 (pexpert/arm64/H15.h: __ARM_GLOBAL_SLEEP_BIT__,
- * HAS_CLUSTER, HAS_RETENTION_STATE, no NO_CPU_OVRD), and nothing else.
- * arm64_prepare_for_sleep(true) ORs ACC_OVRD's deep-sleep fields and CYC_OVRD's
- * ok2pwrdn_force_down (WFI mode 3) and disWfiRetn in, and loops on dsb, isb, wfi. That is at
- * the kernel's own EL, as aura's cpu_sleep(true) at EL2. S3_5_C15_C6_2 is T6041's and T6050's
- * deep-sleep register; H15 has no write to it.
+ * Every core's last steps are macOS 27.2's on J516s, measured at each core's final WFI under
+ * aura's HV (PLAN 29.14): CYC_OVRD in WFI mode 3, ACC_OVRD at its boot value (no deep-sleep
+ * fields; P cores 0x180010900004020e, E cores 0x180010100004020e), and S3_5_C15_C6_2 =
+ * 0x8000000000000001. The last is 0 at the commit words and set after them.
  *
  * No external-debug release. ml_arm_sleep() writes EDLAR and EDPRCR only through
  * coresight_base[CORESIGHT_ED], and configure_coresight_registers() maps that only on a
@@ -2241,13 +2229,6 @@ static void t6030_sleep_wake(struct apple_sleep *s)
 #define T6030_CYC_OVRD			sys_reg(3, 5, 15, 5, 0)
 #define T6030_CYC_OVRD_WFI_MODE		GENMASK_ULL(25, 24)
 #define T6030_CYC_OVRD_DISABLE_WFI_RET	BIT_ULL(0)
-#define T6030_ACC_OVRD			sys_reg(3, 5, 15, 6, 0)
-#define T6030_ACC_OVRD_PWR_DN_SRM	GENMASK_ULL(14, 13)
-#define T6030_ACC_OVRD_DIS_L2_FLUSH	GENMASK_ULL(16, 15)
-#define T6030_ACC_OVRD_TRAIN_DOWN_LINK	GENMASK_ULL(18, 17)
-#define T6030_ACC_OVRD_POWER_DOWN_CPM	GENMASK_ULL(26, 25)
-#define T6030_ACC_OVRD_NO_PIO_ON_WFI	BIT_ULL(32)
-#define T6030_ACC_OVRD_DEEP_SLEEP	BIT_ULL(34)
 
 static void t6030_deep_wfi_arm(void)
 {
@@ -2260,14 +2241,14 @@ static void t6030_deep_wfi_arm(void)
 	t6030_clean_all_levels();
 	t6030_dc_reblock(hid4);
 
-	/* As aura's cpu_sleep(true): only the L2 flush field is cleared first, the rest ORed in */
-	sysreg_clear_set_s(T6030_ACC_OVRD, T6030_ACC_OVRD_DIS_L2_FLUSH,
-			   T6030_ACC_OVRD_PWR_DN_SRM |
-			   FIELD_PREP(T6030_ACC_OVRD_DIS_L2_FLUSH, 2) |
-			   T6030_ACC_OVRD_TRAIN_DOWN_LINK | T6030_ACC_OVRD_POWER_DOWN_CPM |
-			   T6030_ACC_OVRD_NO_PIO_ON_WFI | T6030_ACC_OVRD_DEEP_SLEEP);
+	/*
+	 * macOS 27.2 at every core's final WFI on J516s, under aura's HV with option 0x1000
+	 * (PLAN 29.14): CYC_OVRD in WFI mode 3, ACC_OVRD left at its boot value, and
+	 * S3_5_C15_C6_2 = 0x8000000000000001, which is 0 at the commit words and set after them.
+	 */
 	sysreg_clear_set_s(T6030_CYC_OVRD, T6030_CYC_OVRD_WFI_MODE,
 			   FIELD_PREP(T6030_CYC_OVRD_WFI_MODE, 3) | T6030_CYC_OVRD_DISABLE_WFI_RET);
+	sysreg_clear_set_s(SYS_APL_DEEP_SLEEP, 0, DEEP_SLEEP_ENABLE);
 	isb();
 }
 
@@ -2345,6 +2326,7 @@ static const struct apple_sleep_ops t6030_sleep_ops = {
 	.final_check = t6030_sleep_final_check,
 	.prepare_regs = t6030_sleep_prepare_regs,
 	.undo_regs = t6030_sleep_undo_regs,
+	.after_ans = t6030_sleep_after_ans,
 	.after_early = t6030_sleep_after_early,
 	.commit_notice = t6030_sleep_commit_notice,
 	.commit_regs = t6030_sleep_commit_regs,
