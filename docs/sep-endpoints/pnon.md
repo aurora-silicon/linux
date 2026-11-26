@@ -21,26 +21,22 @@ preparation.
 
 1. **2-4 page SEP layout (`0x02020404`):** M1 Pro (13.5 firmware) and MacBook
    Neo (A18 Pro, 26.6.2 firmware) use the older `tag=1` mailbox carrier and
-   currently read `diag/pnon=absent`. Support is implemented in open PR #2810
-   (awaiting hardware rows on the 2-4 page Macs).
+   currently read `diag/pnon=absent`. Support is in draft PR #2810 (awaiting
+   hardware rows on the 2-4 page Macs).
 2. **Additional read-only BootPolicy queries:** proposed/blessed remote and
-   recovery digests (`0x0b`-`0x0d`, `0x0f`-`0x10`), current AP boot mode
-   (`0x3e`), and LocalPolicy pairing status/verification (`0x43`/`0x44`) are
-   not yet exposed in `main`.
+   recovery nonce digests, current AP boot mode, and LocalPolicy pairing
+   status/verification are not yet exposed in `main`.
 3. **Mutating LocalPolicy transactions & hibernation prepare:** nonce
-   begin/commit/reset transactions, LocalPolicy create/update (`0x4e`/`0x52`,
-   `0x4f`/`0x53`), and pre-hibernation policy preparation are not yet
+   begin/commit/reset transactions, LocalPolicy create/update/re-sign
+   transactions, and pre-hibernation policy preparation are not yet
    implemented. Ordinary Linux suspend does not require `pnon`.
 
 ## Messages and fields
 
-Only discovery descriptors and configuration records are evidenced. The pnon
-configuration data differs between the inspected T6040 and other profiles;
-its bytes have no verified meanings here. Do not interpret them as opcodes,
-versions, buffer sizes or permissions.
-
-Service selectors, request/reply headers, nonce length, nonce domain,
-persistence, rotation and consumption rules are all unknown.
+Beyond the implemented blessed-digest read (`op 0x0e`, `"hcPB"`/`"hrPB"`
+envelope on the `0x05050707` layout in `drivers/soc/apple/pnon.rs`), additional
+service selectors, nonce domains, persistence, rotation and consumption rules
+remain unmerged on `main`.
 
 **Proposed research vocabulary, not recovered commands:**
 

@@ -3152,9 +3152,9 @@ impl SepData {
                 now
             );
             diag::attach(false);
+            this.finalize_failed_bringup_endpoints();
             diag::bringup_ended();
             this.finish_bringup();
-            this.finalize_failed_bringup_endpoints();
             return;
         }
         dev_info_ratelimited!(
@@ -3175,9 +3175,9 @@ impl SepData {
                 "xarm: out-of-line buffer registration failed ({:?}); the persistent-state exchange cannot run\n",
                 e
             );
+            this.finalize_failed_bringup_endpoints();
             diag::bringup_ended();
             this.finish_bringup();
-            this.finalize_failed_bringup_endpoints();
             return;
         }
 
@@ -3223,16 +3223,17 @@ impl SepData {
             this.run_bringup();
             diag::bringup_ended();
         }
+        // Attach-only endpoints: checked and sent nothing (`sse` and `hibe`
+        // send nothing at boot on macOS; `skdl` has no Linux receipt or
+        // Apple Pay/FairPlay consumer). Finalize before publishing completion
+        // so readers observing `PHASE_READY` never see `"pending"`.
+        this.attach_idle_endpoints();
         diag::log_summary(&this.dev);
         this.finish_bringup();
         // As macOS does once the enclave is up.
         Self::queue_stac_online(this.clone());
         // The enclave's account of the LocalPolicy that admitted this boot.
         Self::queue_pnon_digest(this.clone());
-        // Attach-only endpoints: checked and sent nothing (`sse` and `hibe`
-        // send nothing at boot on macOS; `skdl` has no Linux receipt or
-        // Apple Pay/FairPlay consumer).
-        this.attach_idle_endpoints();
         Self::arm_settle(this);
     }
 

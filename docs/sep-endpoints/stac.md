@@ -19,21 +19,24 @@ Magic Keyboard with Touch ID. It shares the generic-transfer carrier
 **Known coverage gaps on `stac`:**
 
 1. **Accessory pairing, session and authorization operations:** none of the
-   accessory-management operations (host attestation `0x01`, pairing query
-   `0x02`, pairing begin/finish `0x03`/`0x15`, unpair `0x04`, manifest submit
-   `0x05`, session setup `0x06`/`0x07`, connection state `0x09`, paired count
-   `0x0b`, authorization `0x14`) are merged on `main` yet (tracked in PR #1810).
+   accessory-management operations (host attestation, pairing query/begin/
+   finish, unpair, manifest submission, session setup, connection state,
+   paired count, or authorization) are merged on `main` yet (earlier draft
+   PR #1810 was closed because it relied on module parameters; needs a
+   per-device interface and client lifecycle integration).
 2. **USB/Bluetooth HID transport & `sbio` sensor relay:** Linux `usbhid` does
-   not yet bind the keyboard's vendor bulk-IN Touch ID interface (`0xff00/0x4b`)
-   or relay keyboard sensor frames into `sbio` (`0x06`/`0x74`/`0x75`).
+   not yet bind the keyboard's vendor Touch ID interface or relay external
+   keyboard sensor frames into `sbio`.
 3. **Power-off / hibernation recovery:** ordinary suspend needs no pre-sleep
    `stac` message; cold-hibernation accessory session recovery will only be
    needed once both hibernation and the accessory client exist.
 
 ## Messages and fields
 
-No stac opcode, framing, credential schema or request/reply body is established.
-IORegistry user-client names identify consumers, not their SEP method mapping.
+Beyond the implemented `OP_POWER_STATE` (`0x0f`) online handshake in
+`drivers/soc/apple/stac.rs`, the remaining pairing, session and authorization
+wire schemas are not yet merged on `main`. IORegistry user-client names
+identify consumers, not their SEP method mapping.
 
 **Proposed operations, not recovered wire commands:**
 
