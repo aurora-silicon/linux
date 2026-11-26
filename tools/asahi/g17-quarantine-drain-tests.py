@@ -209,6 +209,7 @@ pub struct Ticket { ordinal: u64 }
 pub struct Active {
     packet: Arc<Packet>,
     ticket: Ticket,
+    context_update: bool,
     stamps_owed: bool,
     failed: bool,
     flist_completed: bool,
@@ -250,6 +251,7 @@ impl Pair {
     // This fixture models no killed guilty context (`Pair::guilty_killed`).
     fn guilty_killed(&self, _generation: u64, _state: u32) -> bool { false }
     fn resync(&mut self) {}
+    fn note_retirement(&mut self, _ordinal: u64, _context_update: bool) {}
     // The cross-pair task-stage order is not modelled here (KUnit asahi_g17_render_cross_pair_order).
     fn release_task_order_if_held(&self) {}
 ''' + pair + r'''
@@ -314,7 +316,7 @@ fn firmware(pool: &Arc<Pool>, commands: &[(&Command, u64)]) -> Firmware {
     let active = commands.iter().map(|(command, ordinal)| Active {
         packet: Arc::new(Packet { completion: command.completion.clone() }),
         ticket: Ticket { ordinal: *ordinal },
-        stamps_owed: false, failed: false, flist_completed: false, drained_result: None,
+        context_update: false, stamps_owed: false, failed: false, flist_completed: false, drained_result: None,
     }).collect();
     let pair = Pair { quarantined: false, active: Ring(active), terminal: None, memory: Memory { retired: Vec::new() },
                       drain_failures: 0, drain_retry_at: 0, guilty_released: false,

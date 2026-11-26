@@ -396,6 +396,13 @@ impl<T> Tracker<T> {
             self.entries[self.head].as_mut()
         }
     }
+    /// The entry `index` places behind the front.
+    pub(crate) fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+        if index >= self.len {
+            return None;
+        }
+        self.entries[(self.head + index) % DEPTH].as_mut()
+    }
     pub(crate) fn back(&self) -> Option<&T> {
         if self.len == 0 {
             None
