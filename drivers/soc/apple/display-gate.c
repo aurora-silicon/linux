@@ -165,6 +165,14 @@ static struct device_node *gate_pmp_values __initdata;
  */
 static const char gate_pmp_uuid[] __initconst = "2F4EB4C4-001B-3ACF-A9A0-68D8E42FC3A7";
 
+/*
+ * The T6030 PMP image of the 27.2 (26B123) system firmware, as the J516S ADT
+ * names it. Its soc-device records are those of the J516S overlay, and the PMP
+ * report driver checks the running image against the values the boot loader
+ * passes, so the same PMP support takes either image.
+ */
+static const char gate_t6030_pmp_uuid_27_2[] __initconst = "5D66805B-E4AD-335E-BDC3-26828C682AAC";
+
 /* The T8122 PMP image of the 14.x system firmware. */
 static const char gate_t8122_pmp_uuid[] __initconst = "3B18C886-4C70-349B-B1C4-70F35DE2C5CD";
 
@@ -308,6 +316,7 @@ static const struct gate_soc gate_t6030 __initconst = {
 	.dcp_full_name = "dcp@28ec00000",
 	.pmp_values = "/chosen/asahi,t6030-pmp",
 	.pmp_uuid = gate_pmp_uuid,
+	.pmp_uuid_alt = gate_t6030_pmp_uuid_27_2,
 	.report_compat = "apple,t6030-pmp-v2-report",
 	.disp_entry = "report@7",
 	.pmp_dtbo = __dtbo_t6030_pmp_begin,
@@ -1945,6 +1954,8 @@ static void __init gate_describe(void)
  * alone. apple_t8122_display.dcpext=0 keeps them disabled too.
  */
 static bool gate_t8122_dcpext_requested __initdata = true;
+/* The changeset that enabled the dcpext; only the KUnit test reverts it. */
+static struct of_changeset *gate_t8122_dcpext_cs __initdata;
 
 static int __init gate_t8122_dcpext_setup(char *arg)
 {
@@ -2000,16 +2011,80 @@ static bool __init gate_node_in(struct device_node *const *nodes, int n,
 	return false;
 }
 
+/*
+ * On the 27.2 image the T8122 external processor and its scanout use the
+ * panel's DMA window (the 1 TiB alias): the display subsystem takes the
+ * window all its display DARTs share, and the device tree's 14.7 windows for
+ * the external DARTs (from 0) share none with the panel's. Give @dart and
+ * @disp_dart the window of the internal processor's DART.
+ */
+static int __init gate_t8122_dcpext_alias(struct of_changeset *cs,
+					  struct device_node *dart,
+					  struct device_node *disp_dart)
+{
+	struct device_node *dcp, *panel_dart;
+	struct device_node *targets[] = { dart, disp_dart };
+	const struct property *window;
+	int i, ret = 0;
+
+	dcp = of_find_compatible_node(NULL, NULL, "apple,t8122-dcp");
+	panel_dart = dcp ? of_parse_phandle(dcp, "iommus", 0) : NULL;
+	of_node_put(dcp);
+	window = panel_dart ? of_find_property(panel_dart, "apple,dma-range", NULL) : NULL;
+	/* One window: its start and its size, as the DART driver reads it. */
+	if (!window || window->length != 2 * sizeof(u64)) {
+		of_node_put(panel_dart);
+		return -ENODEV;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(targets) && !ret; i++) {
+		/* Kept for good: the live tree refers to it once applied. */
+		struct property *prop = kzalloc_obj(*prop);
+		void *value = kmemdup(window->value, window->length, GFP_KERNEL);
+
+		if (!prop || !value) {
+			kfree(prop);
+			kfree(value);
+			ret = -ENOMEM;
+			break;
+		}
+		prop->name = "apple,dma-range";
+		prop->length = window->length;
+		prop->value = value;
+		ret = of_changeset_update_property(cs, targets[i], prop);
+		if (ret) {
+			kfree(prop);
+			kfree(value);
+		}
+	}
+	of_node_put(panel_dart);
+	return ret;
+}
+
+/*
+ * Does @np's display DART go into the display subsystem's domain? 1 or 0,
+ * or -ENODEV on a board that forbids it and has no @fbdma child to mirror
+ * framebuffers through: the dcpext then has no way to scan them out.
+ */
+static int __init gate_t8122_dcpext_shares_dart(struct device_node *np,
+						struct device_node *fbdma)
+{
+	if (!of_property_read_bool(np, "apple,no-shared-display-dart"))
+		return 1;
+	return fbdma ? 0 : -ENODEV;
+}
+
 static void __init gate_t8122_dcpext_one(struct device_node *np)
 {
 	struct device_node *dart = NULL, *mbox = NULL, *piodma = NULL;
 	struct device_node *disp_dart = NULL, *ps = NULL, *entry = NULL, *link;
+	struct device_node *fbdma = NULL;
 	struct device_node *xbar[GATE_T8122_XBARS] = {};
 	struct device_node *common[GATE_T8122_XBARS] = {};
 	struct of_phandle_args args;
 	struct of_changeset *cs;
 	const char *label;
-	int ret, i, nxbar = 0;
+	int share_dart, ret, i, nxbar = 0;
 	u32 ready;
 
 	if (!gate_disabled(np)) {
@@ -2017,16 +2092,23 @@ static void __init gate_t8122_dcpext_one(struct device_node *np)
 		return;
 	}
 	if (of_property_read_u32(np, "apple,t8122-dcpext-firmware-ready", &ready) ||
-	    ready != 1) {
+	    (ready != 1 && ready != 2)) {
 		gate_ext_refuse(np, "the boot loader did not reserve its firmware");
 		return;
 	}
-	if (!gate_ext_firmware_ok(np)) {
-		gate_ext_refuse(np, "its firmware-compat is not 14.7.0");
+	if (!gate_ext_firmware_ok(np) && !apple_t8122_dcpext_v27_2(np)) {
+		gate_ext_refuse(np, "its firmware is neither 14.7.0 nor the 27.2 image");
 		return;
 	}
 	if (!of_property_present(np, "memory-region")) {
 		gate_ext_refuse(np, "it has no firmware memory");
+		goto put;
+	}
+	fbdma = of_get_available_child_by_name(np, "fbdma");
+	share_dart = gate_t8122_dcpext_shares_dart(np, fbdma);
+	if (share_dart < 0) {
+		gate_ext_refuse(np,
+				"apple,no-shared-display-dart without an fbdma child to mirror framebuffers through");
 		goto put;
 	}
 	dart = gate_target(np, "iommus", "#iommu-cells", 1, 5, "apple,t8110-dart");
@@ -2104,6 +2186,8 @@ static void __init gate_t8122_dcpext_one(struct device_node *np)
 		ret = gate_add_bool(cs, entry, "apple,soc-device-record");
 	if (!ret)
 		ret = gate_add_bool(cs, entry, "apple,defer-startup-ack");
+	if (!ret && apple_t8122_dcpext_v27_2(np))
+		ret = gate_t8122_dcpext_alias(cs, dart, disp_dart);
 	if (!ret)
 		ret = of_changeset_update_prop_string(cs, dart, "status", "okay");
 	if (!ret)
@@ -2122,8 +2206,18 @@ static void __init gate_t8122_dcpext_one(struct device_node *np)
 		ret = of_changeset_update_prop_string(cs, np, "status", "okay");
 	if (!ret)
 		ret = gate_ext_routes(cs, np, "okay");
-	if (!ret)
+	if (!ret && share_dart) {
 		ret = gate_display_add_dart(cs, disp_dart);
+		/* The shared domain maps what fbdma would, at the same addresses. */
+		if (!ret && fbdma) {
+			ret = of_changeset_update_prop_string(cs, fbdma, "status", "disabled");
+			gate_warn("%pOF: display DART %pOF shared with the display subsystem; %pOF disabled\n",
+				  np, disp_dart, fbdma);
+		}
+	} else if (!ret) {
+		gate_info("%pOF: display DART %pOF kept out of the display subsystem; framebuffers are mirrored\n",
+			  np, disp_dart);
+	}
 	if (!ret)
 		ret = of_changeset_apply(cs);
 	if (ret) {
@@ -2132,13 +2226,15 @@ static void __init gate_t8122_dcpext_one(struct device_node *np)
 		gate_ext_refuse(np, "the gate could not enable it");
 		goto put;
 	}
-	gate_info("enabled %pOF with its Type-C routes, DARTs, mailbox, %d display crossbar(s) with ATC common power kept on, display DART %pOF in the display subsystem, CPU power floor and PMP DISPEXT request; started by the display driver\n",
-		  np, nxbar, disp_dart);
+	gate_t8122_dcpext_cs = cs;
+	gate_info("enabled %pOF with its Type-C routes, DARTs, mailbox, %d display crossbar(s) with ATC common power kept on, display DART %pOF %s the display subsystem, CPU power floor and PMP DISPEXT request; started by the display driver\n",
+		  np, nxbar, disp_dart, share_dart ? "in" : "kept out of");
 put:
 	for (i = 0; i < GATE_T8122_XBARS; i++) {
 		of_node_put(common[i]);
 		of_node_put(xbar[i]);
 	}
+	of_node_put(fbdma);
 	of_node_put(entry);
 	of_node_put(ps);
 	of_node_put(disp_dart);
@@ -3291,10 +3387,22 @@ static const char *const t6041_max_usbc2_nodes[] = {
 	"/dcp@606e00000",
 };
 
+/* The third USB-C processor of the J614c/J616c, dcpext3, as dcpext2's chain. */
+static const char *const t6041_max_usbc3_nodes[] = {
+	"/iommu@306340000",
+	"/iommu@306300000",
+	"/mailbox@306e08000",
+	"/dcp@306e00000/typec-routes/route@0",
+	"/dcp@306e00000/typec-routes/route@1",
+	"/dcp@306e00000/typec-routes/route@2",
+	"/dcp@306e00000",
+};
+
 static const struct gate_staged t6041_max_stages[] = {
 	{ "/iommu@3a2300000", t6041_max_hdmi_nodes, ARRAY_SIZE(t6041_max_hdmi_nodes) },
 	{ "/iommu@602300000", t6041_max_usbc_nodes, ARRAY_SIZE(t6041_max_usbc_nodes) },
 	{ "/iommu@606300000", t6041_max_usbc2_nodes, ARRAY_SIZE(t6041_max_usbc2_nodes) },
+	{ "/iommu@306300000", t6041_max_usbc3_nodes, ARRAY_SIZE(t6041_max_usbc3_nodes) },
 };
 
 /*
@@ -3374,7 +3482,39 @@ static const struct gate_staged *t6041_max_stage(unsigned int i)
 /* Applied, they stay: the live tree refers to them. Only the KUnit test reverts them. */
 static struct of_changeset t6041_max_cs[ARRAY_SIZE(t6041_max_stages)];
 
-/* Enable every node of stage @i and put its display DART into the display subsystem's iommus. */
+/*
+ * Whether @np needs a power domain that stays disabled: neither enabled nor one of the nodes
+ * stage @st enables.
+ */
+static bool __init t6041_max_needs_off_domain(const struct gate_staged *st, struct device_node *np)
+{
+	struct of_phandle_args args;
+	bool off = false;
+	unsigned int n;
+	int i;
+
+	for (i = 0; !off && !of_parse_phandle_with_args(np, "power-domains", "#power-domain-cells",
+							i, &args); i++) {
+		off = !of_device_is_available(args.np);
+		for (n = 0; off && n < st->nr; n++) {
+			struct device_node *dn = of_find_node_by_path(st->nodes[n]);
+
+			off = dn != args.np;
+			of_node_put(dn);
+		}
+		of_node_put(args.np);
+	}
+	return off;
+}
+
+/*
+ * Enable every node of stage @i and put its display DART into the display subsystem's iommus.
+ * The in-tree trees give the chains no DISPEXT power domain: they are on as iBoot left them. A
+ * tree that does describe them (the J616c's bring-up EL2 tree: dispextN_fe, and PMP report
+ * entries above them, all disabled) loses the property on the chain's nodes here, or each
+ * device would wait for a domain provider that never comes and give up at the deferred probe
+ * timeout, and the display subsystem with them.
+ */
 static int __init t6041_max_apply(unsigned int i, struct device_node *display)
 {
 	const struct gate_staged *st = t6041_max_stage(i);
@@ -3390,6 +3530,9 @@ static int __init t6041_max_apply(unsigned int i, struct device_node *display)
 	for (n = 0; !ret && n < st->nr; n++) {
 		np = of_find_node_by_path(st->nodes[n]);
 		ret = np ? of_changeset_update_prop_string(cs, np, "status", "okay") : -ENODEV;
+		if (!ret && t6041_max_needs_off_domain(st, np))
+			ret = of_changeset_remove_property(cs, np,
+							   of_find_property(np, "power-domains", NULL));
 		of_node_put(np);
 	}
 	if (!ret)

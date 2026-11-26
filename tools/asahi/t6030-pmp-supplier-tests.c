@@ -170,17 +170,6 @@ static bool of_machine_is_compatible(const char *name)
 {
 	return !strcmp(machine, name);
 }
-/* As in <linux/soc/apple/t8132.h>. */
-static inline bool apple_t8132_air(void)
-{
-	return of_machine_is_compatible("apple,j713") ||
-	       of_machine_is_compatible("apple,j715");
-}
-/* The qualified-firmware term: these harnesses model no /chosen. */
-static inline bool apple_t8132_firmware_path(void)
-{
-	return apple_t8132_air();
-}
 static struct device_node *of_find_compatible_node(struct device_node *from,
 						   const char *type,
 						   const char *compat)
@@ -571,6 +560,7 @@ int main(void)
 	RUN(machine = "apple,t6031", -ENODEV, 0, 0);
 	RUN(machine = "apple,t8140", -ENODEV, 0, 0);
 	RUN(supplier_node.compatible = "apple,t8122-pmp-v2", -ENODEV, 0, 0);
+	RUN(supplier_node.compatible = "apple,t6031-pmp-v2", -ENODEV, 0, 0);
 	RUN(report14.compatible = NULL, -ENODEV, 0, 0);
 	RUN(extra_report = report14, -ENODEV, 0, 0);
 	RUN(extra_report = report14;
@@ -613,8 +603,9 @@ int main(void)
 	RUN(t8122(); passive_words[apple_pmp_offsets_t6030.actual / 8] = 0, -EIO,
 	    0, 0);
 	RUN(t8122(); power_result = -EIO, -EIO, 0, 1);
-	RUN(t8122(); machine = "apple,t6030", -ENODEV, 0, 0);
-	RUN(t8122(); machine = "apple,t8112", -ENODEV, 0, 0);
+	/* The PMP's compatible picks the wait, not the machine's. */
+	RUN(t8122(); machine = "apple,t6030", 0, 0, 1);
+	RUN(t8122(); machine = "apple,t8112", 0, 0, 1);
 	RUN(t8122(); supplier_node.compatible = "apple,t6030-pmp-v2", -ENODEV, 0,
 	    0);
 	RUN(t8122(); report14.compatible = NULL, -ENODEV, 0, 0);

@@ -1,11 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* Copyright The Asahi Linux Contributors */
 
-/* Include all per-version headers before defining DCP_FW ourself. */
+/*
+ * Include all per-version headers before defining DCP_FW ourself.
+ * dcp-internal.h pulls in the remaining ones; included first from inside
+ * the template, they would rely on #pragma push_macro to keep our DCP_FW,
+ * which sparse does not implement.
+ */
 #include "iomfb_v12_3.h"
 #include "iomfb_v13_3.h"
 #include "iomfb_v14_7_tpl.h"
 #include "iomfb_h17p.h"
+#include "dcp-internal.h"
 #include "version_utils.h"
 
 static const struct dcp_method_entry dcp_methods[dcpep_num_methods] = {
@@ -105,7 +111,7 @@ void DCP_FW_NAME(iomfb_start)(struct apple_dcp *dcp)
 {
 	dcp->cb_handlers = cb_handlers;
 
-	dcp_start_signal(dcp, false, dcp_started, NULL);
+	iomfb_template_start(dcp);
 }
 
 #undef DCP_FW_VER

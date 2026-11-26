@@ -11,6 +11,7 @@ use core::mem::size_of;
 use core::ops::Range;
 use core::sync::atomic::{
     AtomicU64,
+    AtomicUsize,
     Ordering, //
 };
 
@@ -54,10 +55,18 @@ const UAT_LEVELS: usize = 3;
 /// Number of address bits below the index of a top-level page table entry.
 pub(crate) const UAT_TOP_LEVEL_SHIFT: usize = UAT_PGBIT + (UAT_LEVELS - 1) * UAT_LVBIT;
 
+/// Cached system-wide minimum CPU data cache line size (bytes), populated lazily from
+/// the arm64 sanitized `CTR_EL0` feature register.
+static DCACHE_LINE_SIZE: AtomicUsize = AtomicUsize::new(0);
+
 /// The system-wide minimum CPU line size, including heterogeneous CPUs. A local
 /// CTR_EL0 read can select too large a stride if the task migrates during the loop.
 #[inline(always)]
 fn dcache_line_size() -> usize {
+    let cached = DCACHE_LINE_SIZE.load(Ordering::Relaxed);
+    if cached != 0 {
+        return cached;
+    }
     use kernel::bindings;
     let ctr = (bindings::SYS_CTR_EL0_Op0 << 19)
         | (bindings::SYS_CTR_EL0_Op1 << 16)
@@ -65,9 +74,12 @@ fn dcache_line_size() -> usize {
         | (bindings::SYS_CTR_EL0_CRm << 8)
         | (bindings::SYS_CTR_EL0_Op2 << 5);
     // SAFETY: Read-only lookup of the arm64 sanitized feature register. DminLine
-    // uses the architecture's LOWER_SAFE merge policy across all admitted CPUs.
+    // uses the architecture's LOWER_SAFE merge policy across all admitted CPUs
+    // and remains constant once SMP boot has completed.
     let value = unsafe { bindings::read_sanitised_ftr_reg(ctr) };
-    4 << ((value >> bindings::CTR_EL0_DminLine_SHIFT) & 0xf)
+    let line = 4 << ((value >> bindings::CTR_EL0_DminLine_SHIFT) & 0xf);
+    DCACHE_LINE_SIZE.store(line, Ordering::Relaxed);
+    line
 }
 
 /// Cleans the CPU data cache lines covering `len` bytes at `ptr` to the point of coherency, for an
@@ -1057,6 +1069,53 @@ impl UatPageTable {
         })
     }
 
+    /// Maps a scatterlist of contiguous `(phys, len)` segments into `iova_range` in a single
+    /// page-table walk, emitting at most one point-of-coherency clean per leaf-table slice and
+    /// a single `dsb sy` barrier at the end instead of one walk and barrier per segment.
+    pub(crate) fn map_segments(
+        &mut self,
+        iova_range: Range<u64>,
+        segments: impl Iterator<Item = (PhysicalAddr, usize)>,
+        offset: usize,
+        prot: Prot,
+        one_page: bool,
+    ) -> Result {
+        if iova_range.is_empty() {
+            return Ok(());
+        }
+        if (iova_range.start | iova_range.end) & (UAT_PGMSK as u64) != 0 || offset & UAT_PGMSK != 0 {
+            pr_err!(
+                "UATPageTable::map_segments: range {:#x?} or offset {:#x} not page-aligned\n",
+                iova_range,
+                offset
+            );
+            return Err(EINVAL);
+        }
+
+        let prot_bits = self.stored(prot).as_pte() | self.pte_bits();
+        let mut cursor = SegmentCursor::new(segments, offset, one_page)?;
+
+        self.walk(iova_range, true, false, true, |iova, ptes| {
+            for (idx, pte) in ptes.iter().enumerate() {
+                let phys = cursor.next_page(iova + (idx * UAT_PGSZ) as u64)?;
+                let ptev = pte.load(Ordering::Relaxed);
+                if ptev != 0 {
+                    // Never replace a live leaf: it belongs to another mapping. The callers
+                    // check their whole range first (`ensure_unmapped`), so this is reached
+                    // only by a collision they missed.
+                    pr_err!(
+                        "UATPageTable::map_segments: Page at IOVA {:#x} is mapped (PTE: {:#x})\n",
+                        iova + (idx * UAT_PGSZ) as u64,
+                        ptev
+                    );
+                    return Err(EBUSY);
+                }
+                pte.store(phys | prot_bits, Ordering::Relaxed);
+            }
+            Ok(())
+        })
+    }
+
     /// Refuses with `EBUSY`, writing nothing, when any leaf of `iova_range` is live.
     ///
     /// Every PTE store writes either zero or a complete entry, so a nonzero leaf belongs to
@@ -1160,5 +1219,131 @@ impl Drop for UatPageTable {
                 Page::from_phys(self.ttb);
             }
         }
+    }
+}
+
+/// Streams page-aligned physical addresses out of a `(phys, len)` scatterlist iterator,
+/// optionally repeating the first page after `offset` (`one_page`).
+struct SegmentCursor<I> {
+    segments: I,
+    cur_phys: PhysicalAddr,
+    cur_len: usize,
+    one_page: bool,
+}
+
+impl<I: Iterator<Item = (PhysicalAddr, usize)>> SegmentCursor<I> {
+    fn new(mut segments: I, mut offset: usize, one_page: bool) -> Result<Self> {
+        if offset & UAT_PGMSK != 0 {
+            return Err(EINVAL);
+        }
+        let mut cur_phys: PhysicalAddr = 0;
+        let mut cur_len: usize = 0;
+        for (dma_addr, dma_len) in segments.by_ref() {
+            if (dma_addr & (UAT_PGMSK as PhysicalAddr)) != 0 || (dma_len & UAT_PGMSK) != 0 {
+                pr_err!(
+                    "UATPageTable::map_segments: segment {:#x}:{:#x} not page-aligned\n",
+                    dma_addr,
+                    dma_len
+                );
+                return Err(EINVAL);
+            }
+            let mut addr = dma_addr;
+            let mut len = dma_len;
+            if offset > 0 {
+                let skip = len.min(offset);
+                addr += skip as PhysicalAddr;
+                len -= skip;
+                offset -= skip;
+            }
+            if len > 0 {
+                cur_phys = addr;
+                cur_len = len;
+                break;
+            }
+        }
+        if cur_len == 0 {
+            return Err(EINVAL);
+        }
+        Ok(Self {
+            segments,
+            cur_phys,
+            cur_len,
+            one_page,
+        })
+    }
+
+    fn next_page(&mut self, iova: u64) -> Result<PhysicalAddr> {
+        if !self.one_page && self.cur_len == 0 {
+            loop {
+                let Some((dma_addr, dma_len)) = self.segments.next() else {
+                    pr_err!(
+                        "UATPageTable::map_segments: scatterlist ended before IOVA {:#x}\n",
+                        iova
+                    );
+                    return Err(EINVAL);
+                };
+                if (dma_addr & (UAT_PGMSK as PhysicalAddr)) != 0 || (dma_len & UAT_PGMSK) != 0 {
+                    pr_err!(
+                        "UATPageTable::map_segments: segment {:#x}:{:#x} not page-aligned\n",
+                        dma_addr,
+                        dma_len
+                    );
+                    return Err(EINVAL);
+                }
+                if dma_len > 0 {
+                    self.cur_phys = dma_addr;
+                    self.cur_len = dma_len;
+                    break;
+                }
+            }
+        }
+        let phys = self.cur_phys;
+        if !self.one_page {
+            self.cur_phys += UAT_PGSZ as PhysicalAddr;
+            self.cur_len -= UAT_PGSZ;
+        }
+        Ok(phys)
+    }
+}
+
+#[kernel::macros::kunit_tests(asahi_pgtable_segments)]
+mod tests {
+    use super::*;
+
+    const PG: usize = UAT_PGSZ;
+    const PGU: PhysicalAddr = UAT_PGSZ as PhysicalAddr;
+
+    #[test]
+    fn streams_multi_segment_with_offset_and_zero_len() {
+        let segs = [
+            (0x10_0000, 2 * PG),
+            (0x20_0000, 0),
+            (0x30_0000, PG),
+            (0x40_0000, 2 * PG),
+        ];
+        let mut cursor = SegmentCursor::new(segs.into_iter(), PG, false).unwrap();
+        assert_eq!(cursor.next_page(0), Ok(0x10_0000 + PGU));
+        assert_eq!(cursor.next_page(PGU), Ok(0x30_0000));
+        assert_eq!(cursor.next_page(2 * PGU), Ok(0x40_0000));
+        assert_eq!(cursor.next_page(3 * PGU), Ok(0x40_0000 + PGU));
+        assert_eq!(cursor.next_page(4 * PGU), Err(EINVAL));
+    }
+
+    #[test]
+    fn repeats_single_page_after_offset() {
+        let segs = [(0x10_0000, PG), (0x50_0000, 2 * PG)];
+        let mut cursor = SegmentCursor::new(segs.into_iter(), 2 * PG, true).unwrap();
+        for i in 0..4u64 {
+            assert_eq!(cursor.next_page(i * PGU), Ok(0x50_0000 + PGU));
+        }
+    }
+
+    #[test]
+    fn rejects_unaligned_and_short_inputs() {
+        let segs = [(0x10_0000, PG)];
+        assert!(SegmentCursor::new(segs.into_iter(), 0x100, false).is_err());
+        assert!(SegmentCursor::new([(0x10_0004, PG)].into_iter(), 0, false).is_err());
+        assert!(SegmentCursor::new([(0x10_0000, PG + 4)].into_iter(), 0, false).is_err());
+        assert!(SegmentCursor::new([(0x10_0000, PG)].into_iter(), PG, false).is_err());
     }
 }

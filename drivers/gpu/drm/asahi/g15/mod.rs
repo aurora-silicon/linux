@@ -214,6 +214,14 @@ impl platform::Driver for Driver<'_> {
                     return Err(ENODEV);
                 }
                 let cfg = *info.ok_or(ENODEV)?;
+                if pdev.as_ref().of_node().is_some_and(|node| {
+                    !matches!(
+                        node.get_opt_property::<u32>(c_str!("apple,g16-handoff-version")),
+                        Ok(None)
+                    )
+                }) {
+                    return Err(ENODEV);
+                }
                 let cfg = if cfg.chip_id == 0x6034 && boot::glue::machine(c_str!("apple,j516m")) {
                     &hw::j516m::CONFIG
                 } else {
@@ -693,11 +701,19 @@ impl gpu::Gpu for Gpu {
         )?)
     }
 
+    fn timestamp_window_size(&self) -> u64 {
+        hw::va::TIMESTAMPS_SIZE
+    }
+
     fn map_timestamp_buffer(
         &self,
         bo: gem::ObjectRef,
         range: Range<usize>,
+        window: crate::timestamp::WindowPermit,
     ) -> Result<crate::timestamp::Buffer> {
-        crate::timestamp::Buffer::firmware(timestamp::map(self, bo, range)?)
+        if !window.is_allowed() {
+            return Err(ENOSPC);
+        }
+        crate::timestamp::Buffer::firmware(timestamp::map(self, bo, range)?, window.into_share())
     }
 }
