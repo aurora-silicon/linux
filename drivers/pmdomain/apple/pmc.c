@@ -42,6 +42,7 @@
 
 #include <linux/bits.h>
 #include <linux/debugfs.h>
+#include <linux/err.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/module.h>
@@ -837,59 +838,233 @@ static int apple_pmc_interface_consumer_set(struct apple_pmc_domain *dom, bool o
 }
 
 static struct platform_driver apple_pmc_driver;
+static const struct of_device_id apple_pmc_of_match[];
 
-/* The consumer-switched interface named by @consumer's apple,pmc-interface. */
-static struct apple_pmc_domain *apple_pmc_consumer_interface(struct device *consumer)
+#define APPLE_PMC_MAX_PMGR_CHAIN	4
+
+static bool apple_pmc_is_consumer_pmgr(struct device_node *np)
 {
-	struct device_node *np = of_parse_phandle(consumer->of_node, "apple,pmc-interface", 0);
+	return np &&
+	       (of_device_is_compatible(np, "apple,pmgr-pwrstate") ||
+		of_device_is_compatible(np, "apple,t8103-pmgr-pwrstate")) &&
+	       of_property_read_bool(np, "apple,firmware-owned") &&
+	       of_property_read_bool(np, "apple,consumer-switched");
+}
+
+static bool apple_pmc_is_interface_node(struct device_node *np,
+					bool consumer_only)
+{
+	return np && np->parent &&
+	       of_match_node(apple_pmc_of_match, np->parent) &&
+	       of_property_present(np, "apple,bwr-bit") &&
+	       of_property_present(np, "apple,boost-bit") &&
+	       (!consumer_only ||
+		of_property_read_bool(np, "apple,consumer-switched"));
+}
+
+static struct apple_pmc_domain *
+apple_pmc_domain_by_node(struct device_node *np, bool consumer_only,
+			 struct platform_device **out_pdev)
+{
 	struct apple_pmc_domain *dom, *found = NULL;
 	struct platform_device *pdev;
 	struct apple_pmc *pmc = NULL;
 
-	if (!np)
-		return NULL;
 	pdev = of_find_device_by_node(np->parent);
 	if (pdev && pdev->dev.driver == &apple_pmc_driver.driver)
 		pmc = platform_get_drvdata(pdev);
 	if (pmc)
 		list_for_each_entry(dom, &pmc->domains, list)
-			if (dom->np == np && dom->consumer_switched)
+			if (dom->np == np && dom->interface &&
+			    (!consumer_only || dom->consumer_switched))
 				found = dom;
+	if (found) {
+		*out_pdev = pdev;
+		return found;
+	}
 	if (pdev)
 		put_device(&pdev->dev);
-	of_node_put(np);
+	return NULL;
+}
+
+/*
+ * The display-pipe interface domain controlled by @consumer: either named
+ * directly by apple,pmc-interface (consumer-switched), or attached as an
+ * unambiguous parent of its firmware-owned consumer-switched PMGR power
+ * domains (which genpd keeps always-on, so genpd never races consumer writes).
+ * Returns with a reference on *@out_pdev when non-error; -ENODEV when no
+ * interface is configured, -EPROBE_DEFER when a configured PMC provider is
+ * unavailable, or -EINVAL/-ELOOP on malformed, cyclic, over-deep, or
+ * ambiguous topology.
+ */
+static struct apple_pmc_domain *
+apple_pmc_consumer_interface(struct device *consumer,
+			     struct platform_device **out_pdev)
+{
+	struct device_node *seen[APPLE_PMC_MAX_PMGR_CHAIN + 1];
+	struct device_node *cur, *next = NULL;
+	struct platform_device *found_pdev = NULL;
+	struct apple_pmc_domain *found = NULL;
+	const struct property *prop;
+	int depth, len, seen_nr = 0, err = 0;
+
+	*out_pdev = NULL;
+	if (!consumer->of_node)
+		return ERR_PTR(-ENODEV);
+
+	prop = of_find_property(consumer->of_node, "apple,pmc-interface", &len);
+	if (prop) {
+		struct device_node *np;
+
+		if (len != sizeof(__be32))
+			return ERR_PTR(-EINVAL);
+		np = of_parse_phandle(consumer->of_node, "apple,pmc-interface", 0);
+		if (!np)
+			return ERR_PTR(-EINVAL);
+		if (!apple_pmc_is_interface_node(np, true)) {
+			of_node_put(np);
+			return ERR_PTR(-EINVAL);
+		}
+		found = apple_pmc_domain_by_node(np, true, out_pdev);
+		of_node_put(np);
+		return found ?: ERR_PTR(-EPROBE_DEFER);
+	}
+
+	cur = of_node_get(consumer->of_node);
+	for (depth = 0; cur; depth++) {
+		struct of_phandle_iterator it;
+		bool on_pmgr = depth > 0;
+		int j, rc;
+
+		if (depth > APPLE_PMC_MAX_PMGR_CHAIN) {
+			err = -ELOOP;
+			goto out;
+		}
+		for (j = 0; j < seen_nr; j++) {
+			if (seen[j] == cur) {
+				err = -ELOOP;
+				goto out;
+			}
+		}
+		seen[seen_nr++] = cur;
+		cur = NULL;
+		next = NULL;
+
+		prop = of_find_property(seen[depth], "power-domains", &len);
+		if (prop && (!len || (len % sizeof(__be32)))) {
+			err = -EINVAL;
+			goto out;
+		}
+		of_for_each_phandle(&it, rc, seen[depth], "power-domains",
+				    "#power-domain-cells", -1) {
+			if (!it.node)
+				continue;
+			if (on_pmgr &&
+			    (of_property_present(it.node, "apple,bwr-bit") ||
+			     of_property_present(it.node, "apple,boost-bit"))) {
+				struct platform_device *pdev = NULL;
+				struct apple_pmc_domain *dom;
+
+				if (!apple_pmc_is_interface_node(it.node, false)) {
+					of_node_put(it.node);
+					err = -EINVAL;
+					goto out;
+				}
+				dom = apple_pmc_domain_by_node(it.node, false, &pdev);
+				if (!dom) {
+					of_node_put(it.node);
+					err = -EPROBE_DEFER;
+					goto out;
+				}
+				if (found && found != dom) {
+					put_device(&pdev->dev);
+					of_node_put(it.node);
+					err = -EINVAL;
+					goto out;
+				}
+				if (!found) {
+					found = dom;
+					found_pdev = pdev;
+				} else {
+					put_device(&pdev->dev);
+				}
+			}
+			if (apple_pmc_is_consumer_pmgr(it.node)) {
+				if (next) {
+					of_node_put(it.node);
+					err = -EINVAL;
+					goto out;
+				}
+				next = of_node_get(it.node);
+			}
+		}
+		if (rc != -ENOENT) {
+			err = rc;
+			goto out;
+		}
+		cur = next;
+		next = NULL;
+	}
+
+out:
+	of_node_put(cur);
+	of_node_put(next);
+	while (seen_nr--)
+		of_node_put(seen[seen_nr]);
+	if (err) {
+		if (found_pdev)
+			put_device(&found_pdev->dev);
+		return ERR_PTR(err);
+	}
+	if (!found)
+		return ERR_PTR(-ENODEV);
+	*out_pdev = found_pdev;
 	return found;
 }
 
 /* Whether apple_pmc_interface_consumer_off() can run for @consumer now, changing nothing. */
 int apple_pmc_interface_consumer_check(struct device *consumer)
 {
-	struct apple_pmc_domain *dom = apple_pmc_consumer_interface(consumer);
+	struct platform_device *pdev = NULL;
+	struct apple_pmc_domain *dom = apple_pmc_consumer_interface(consumer, &pdev);
 	unsigned long flags;
 	int ret;
 
-	if (!dom)
-		return -ENODEV;
+	if (IS_ERR(dom))
+		return PTR_ERR(dom);
 	raw_spin_lock_irqsave(&dom->pmc->lock, flags);
 	ret = dom->consumer_off ? -EALREADY : 0;
 	raw_spin_unlock_irqrestore(&dom->pmc->lock, flags);
+	put_device(&pdev->dev);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_pmc_interface_consumer_check);
 
 int apple_pmc_interface_consumer_off(struct device *consumer)
 {
-	struct apple_pmc_domain *dom = apple_pmc_consumer_interface(consumer);
+	struct platform_device *pdev = NULL;
+	struct apple_pmc_domain *dom = apple_pmc_consumer_interface(consumer, &pdev);
+	int ret;
 
-	return dom ? apple_pmc_interface_consumer_set(dom, false) : -ENODEV;
+	if (IS_ERR(dom))
+		return PTR_ERR(dom);
+	ret = apple_pmc_interface_consumer_set(dom, false);
+	put_device(&pdev->dev);
+	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_pmc_interface_consumer_off);
 
 int apple_pmc_interface_consumer_on(struct device *consumer)
 {
-	struct apple_pmc_domain *dom = apple_pmc_consumer_interface(consumer);
+	struct platform_device *pdev = NULL;
+	struct apple_pmc_domain *dom = apple_pmc_consumer_interface(consumer, &pdev);
+	int ret;
 
-	return dom ? apple_pmc_interface_consumer_set(dom, true) : -ENODEV;
+	if (IS_ERR(dom))
+		return PTR_ERR(dom);
+	ret = apple_pmc_interface_consumer_set(dom, true);
+	put_device(&pdev->dev);
+	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_pmc_interface_consumer_on);
 
