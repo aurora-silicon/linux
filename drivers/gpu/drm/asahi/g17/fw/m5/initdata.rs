@@ -3030,6 +3030,11 @@ impl BoardPower {
             if core_uv == 0 || core_uv % 1000 != 0 || sram_uv == 0 || sram_uv % 1000 != 0 {
                 return Err("an operating point's voltage is 0 or not a whole number of mV");
             }
+            // The loader fills the core voltages from the machine's ADT, the SRAM ones are the
+            // node's: a part fused above them would run its SRAM below its core.
+            if sram_uv < core_uv {
+                return Err("an operating point's SRAM voltage is below its core voltage");
+            }
             let mhz = (hz / 1_000_000) as u32;
             // The off state at 0 MHz, then rising frequencies (a loader that did not fill the
             // operating points leaves them all 0).
@@ -3116,6 +3121,11 @@ impl Board {
     pub(crate) fn with_power(&self, power: &'static BoardPower) -> Result<Board, &'static str> {
         if !self.power_from_node {
             return Err("the board's power data is not the GPU node's");
+        }
+        // Without the M5 Pro's insert the HW data ends at the common 26A428 size.
+        let hw_size = if self.hw_data_insert { M5_HW_DATA_SIZE } else { COMMON26_HW_DATA_SIZE };
+        if power.hw_words[..power.hw_count].iter().any(|&(offset, _)| offset + 4 > hw_size) {
+            return Err("an apple,m5-hw-words offset is past this firmware's HW data");
         }
         // A later build moves the policy block: every word must have a place in its layout.
         if let Some(relayout) = self.graph.profile.common26_layouts()
