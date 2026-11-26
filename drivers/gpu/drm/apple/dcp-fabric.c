@@ -3023,8 +3023,15 @@ static int dcp_tb_candidate(void *data)
 						     connector_present,
 						     &ret);
 		best = dcp_fabric_real_route(chosen);
-		if (!best)
+		if (!best) {
+			/* The tunnel retries every few seconds: debug only. */
+			pr_debug("%pOF: DP tunnel dpin%u has no pipeline: %d (%s, planned %s, CRTCs %#x)\n",
+				 port->connector_np, dpin, ret,
+				 ordered ? "connector order" : "compositor order",
+				 planned ? dev_name(planned->dcp->dev) : "none",
+				 port->core.candidate_crtcs[stream]);
 			return ret;
+		}
 	}
 
 	ctl = dcp_typec_tunnel_ctl(best, dpin);
