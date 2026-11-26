@@ -526,10 +526,11 @@ impl Session {
     }
 }
 
-/// The endpoint: probed channel count, a session per slot, and whether it is
-/// quarantined.
+/// The endpoint: probed channel bitmask, a session per slot, and whether it is
+/// quarantined. Channel IDs returned by command `0x28` may be sparse (e.g. an
+/// absent channel ID with higher channel IDs above the interface count).
 pub(crate) struct State {
-    pub(crate) channel_count: Option<u8>,
+    pub(crate) channel_mask: Option<u32>,
     pub(crate) sessions: [Session; MAX_CHANNELS],
     pub(crate) quarantined: bool,
 }
@@ -537,15 +538,18 @@ pub(crate) struct State {
 impl State {
     pub(crate) const fn new() -> State {
         State {
-            channel_count: None,
+            channel_mask: None,
             sessions: [Session::new(); MAX_CHANNELS],
             quarantined: false,
         }
     }
 
-    /// Channels known to the enclave once enumerated.
-    pub(crate) fn channels(&self) -> usize {
-        self.channel_count.map_or(0, usize::from)
+    /// Whether `slot` is an enumerated HDCP channel on this enclave.
+    pub(crate) fn has_channel(&self, slot: u8) -> bool {
+        usize::from(slot) < MAX_CHANNELS
+            && self
+                .channel_mask
+                .is_some_and(|mask| (mask & (1u32 << slot)) != 0)
     }
 }
 
@@ -686,14 +690,15 @@ pub(crate) trait Transport {
     fn on_quarantine(&self, _slot: u8, _command: Command) {}
 }
 
-/// Queries the enclave's HDCP interface count (`0x27`) and per-channel
-/// descriptors (`0x28`), once per boot before any session opens.
-pub(crate) fn enumerate<T: Transport>(t: &T, state: &mut State) -> Result<u8> {
+/// Queries the enclave's HDCP interface count (`0x27`) and per-interface
+/// descriptors (`0x28`), once per boot before any session opens. Returns the
+/// bitmask of advertised channel IDs (`info[0]` per interface index).
+pub(crate) fn enumerate<T: Transport>(t: &T, state: &mut State) -> Result<u32> {
     if state.quarantined {
         return Err(EIO);
     }
-    if let Some(count) = state.channel_count {
-        return Ok(count);
+    if let Some(mask) = state.channel_mask {
+        return Ok(mask);
     }
     let outcome = match t.exchange(0, Command::QueryChannels, 0, &[], &mut []) {
         Ok(o) => o,
@@ -707,23 +712,29 @@ pub(crate) fn enumerate<T: Transport>(t: &T, state: &mut State) -> Result<u8> {
     let Outcome::ChannelCount(count) = outcome else {
         return Err(EIO);
     };
-    for slot in 0..count {
+    let mut mask = 0u32;
+    for index in 0..count {
         let mut info = [0u8; CHANNEL_INFO_LEN];
-        let o = match t.exchange(slot, Command::GetChannelInfo, 0, &[], &mut info) {
+        let o = match t.exchange(index, Command::GetChannelInfo, 0, &[], &mut info) {
             Ok(o) => o,
             Err(e) => return Err(e),
         };
         if o == Outcome::NoReply {
             state.quarantined = true;
-            t.on_quarantine(slot, Command::GetChannelInfo);
+            t.on_quarantine(index, Command::GetChannelInfo);
             return Err(EIO);
         }
-        if o != Outcome::Done(CHANNEL_INFO_LEN) || info[0] != slot {
+        let ch = info[0];
+        if o != Outcome::Done(CHANNEL_INFO_LEN) || usize::from(ch) >= MAX_CHANNELS {
             return Err(EIO);
         }
+        mask |= 1u32 << ch;
     }
-    state.channel_count = Some(count);
-    Ok(count)
+    if mask == 0 {
+        return Err(EIO);
+    }
+    state.channel_mask = Some(mask);
+    Ok(mask)
 }
 
 /// Sends one session command on `slot` if the session allows it, and records
@@ -740,10 +751,10 @@ fn run<T: Transport>(
     if state.quarantined {
         return Err(EIO);
     }
-    let i = usize::from(slot);
-    if i >= state.channels() {
+    if !state.has_channel(slot) {
         return Err(EINVAL);
     }
+    let i = usize::from(slot);
     if !state.sessions[i].allows(command, arg) {
         return Err(EPROTO);
     }
@@ -788,11 +799,11 @@ pub(crate) fn step<T: Transport>(
     if !step.sizes_ok(inp.len(), out.len()) {
         return Err(EINVAL);
     }
-    let count = enumerate(t, state)?;
-    let i = usize::from(slot);
-    if i >= usize::from(count) {
+    enumerate(t, state)?;
+    if !state.has_channel(slot) {
         return Err(EINVAL);
     }
+    let i = usize::from(slot);
     let was_open = state.sessions[i].is_open();
     let r = step_inner(t, state, slot, step, inp, out);
     if r.is_err() {
@@ -893,8 +904,11 @@ fn step_inner<T: Transport>(
 /// Ends the session on `slot` from any state: encryption off, then close.
 /// The local session is reset whatever the enclave answers.
 pub(crate) fn close<T: Transport>(t: &T, state: &mut State, slot: u8) {
+    if !state.has_channel(slot) {
+        return;
+    }
     let i = usize::from(slot);
-    if i >= state.channels() || !state.sessions[i].is_open() {
+    if !state.sessions[i].is_open() {
         return;
     }
     if !state.quarantined {
@@ -963,6 +977,31 @@ impl Transport for Mailbox<'_> {
             }
             other => other,
         };
+        // Log non-success replies using only the mailbox word (status/len),
+        // never any out-of-line payload bytes.
+        match final_outcome {
+            Outcome::Done(_) | Outcome::NotStored | Outcome::ChannelCount(_) => {}
+            Outcome::Refused(_) if spec_of(command).verifies => {
+                dev_dbg!(
+                    sep.dev,
+                    "hdcp: command {:#04x} channel {}: verification refused (reply {:#018x})\n",
+                    spec_of(command).id,
+                    slot,
+                    reply.msg0
+                );
+            }
+            other => {
+                dev_warn_ratelimited!(
+                    sep.dev,
+                    "hdcp: command {:#04x} channel {}: {:?} (reply {:#018x}, expected {} out)\n",
+                    spec_of(command).id,
+                    slot,
+                    other,
+                    reply.msg0,
+                    out.len()
+                );
+            }
+        }
         sep.hdcp_scrub_buffers(input.len(), out.len());
         Ok(final_outcome)
     }
@@ -1077,6 +1116,11 @@ impl SepData {
     fn hdcp_ready(&self) -> Result {
         self.hdcp_ready_state()?;
         self.register_ool(&self.ool_hdcp).map_err(|e| {
+            dev_warn_ratelimited!(
+                self.dev,
+                "hdcp: out-of-line buffer registration failed ({:?})\n",
+                e
+            );
             if e == EAGAIN || e == ENODEV {
                 e
             } else {
@@ -1380,6 +1424,7 @@ mod tests {
     /// was sent.
     struct Fake {
         replies: RefCell<KVec<u64>>,
+        channel_ids: RefCell<KVec<u8>>,
         sent: RefCell<KVec<(Command, u8, u32, usize)>>,
         next: Cell<usize>,
         quarantined: Cell<bool>,
@@ -1393,10 +1438,19 @@ mod tests {
             }
             Fake {
                 replies: RefCell::new(v),
+                channel_ids: RefCell::new(KVec::new()),
                 sent: RefCell::new(KVec::new()),
                 next: Cell::new(0),
                 quarantined: Cell::new(false),
             }
+        }
+
+        fn with_channel_ids(replies: &[u64], ids: &[u8]) -> Fake {
+            let f = Fake::new(replies);
+            for &id in ids {
+                f.channel_ids.borrow_mut().push(id, GFP_KERNEL).unwrap();
+            }
+            f
         }
 
         fn sent(&self) -> KVec<Command> {
@@ -1433,7 +1487,8 @@ mod tests {
                 }
                 if command == Command::GetChannelInfo {
                     out.fill(0);
-                    out[0] = slot;
+                    let ids = self.channel_ids.borrow();
+                    out[0] = ids.get(usize::from(slot)).copied().unwrap_or(slot);
                 } else {
                     out.fill(0x5c);
                 }
@@ -1454,7 +1509,7 @@ mod tests {
 
     fn state_with_channels(n: u8) -> State {
         let mut st = State::new();
-        st.channel_count = Some(n);
+        st.channel_mask = Some((1u32 << n) - 1);
         st
     }
 
@@ -1489,7 +1544,7 @@ mod tests {
         assert_eq!(ool_sizes(0x0202_0202), None);
         assert_eq!(ool_sizes(0), None);
 
-        // Enclave advertises 9 channels (as on T8112); slot 8 succeeds, slot 9 fails.
+        // Enclave advertises 9 contiguous channels (as on T8112); slot 8 ok, slot 9 EINVAL.
         let mut replies = KVec::new();
         replies.push(0x0000_0009_0000_000e, GFP_KERNEL)?;
         for _ in 0..9 {
@@ -1497,16 +1552,42 @@ mod tests {
         }
         let t = Fake::new(&replies);
         let mut st = State::new();
-        assert_eq!(enumerate(&t, &mut st)?, 9);
-        assert_eq!(st.channels(), 9);
+        assert_eq!(enumerate(&t, &mut st)?, 0x1ff);
+        assert!(st.has_channel(8));
+        assert!(!st.has_channel(9));
         // Second enumeration is cached (no further mailbox traffic).
-        assert_eq!(enumerate(&t, &mut st)?, 9);
+        assert_eq!(enumerate(&t, &mut st)?, 0x1ff);
         assert_eq!(t.sent().len(), 10);
         assert_eq!(
             step(&t, &mut st, 9, Step::Open, &[], &mut [0; RTX_LEN]),
             Err(EINVAL)
         );
         assert_eq!(t.sent().len(), 10);
+
+        // Sparse channel table (14 interfaces: 0..=5 and 7..=14, skipping 6,
+        // as on T6040): channel 6 is refused, channels 7 and 14 are accepted.
+        let sparse_ids: [u8; 14] = [0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14];
+        let mut sparse_replies = KVec::new();
+        sparse_replies.push(0x0000_000e_0000_000e, GFP_KERNEL)?;
+        for _ in 0..14 {
+            sparse_replies.push(ok_for(Command::GetChannelInfo), GFP_KERNEL)?;
+        }
+        for c in [Command::Open, Command::Prepare, Command::Start, Command::GetRtx] {
+            sparse_replies.push(ok_for(c), GFP_KERNEL)?;
+        }
+        let ts = Fake::with_channel_ids(&sparse_replies, &sparse_ids);
+        let mut sts = State::new();
+        let mask = enumerate(&ts, &mut sts)?;
+        assert!(!sts.has_channel(6));
+        assert!(sts.has_channel(7));
+        assert!(sts.has_channel(14));
+        assert!(!sts.has_channel(15));
+        assert_eq!(mask, 0x7fbf);
+        assert_eq!(
+            step(&ts, &mut sts, 6, Step::Open, &[], &mut [0; RTX_LEN]),
+            Err(EINVAL)
+        );
+        step(&ts, &mut sts, 14, Step::Open, &[], &mut [0; RTX_LEN])?;
         Ok(())
     }
 
