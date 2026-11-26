@@ -39,7 +39,7 @@ pub(crate) struct Window {
 
 impl Window {
     pub(crate) fn new(base: u32, count: u32, capacity: u32) -> Result<Self> {
-        if base >= capacity || count > MAX_GROUP_ITEMS || count >= capacity {
+        if base >= capacity || count == 0 || count > MAX_GROUP_ITEMS || count >= capacity {
             return Err(EINVAL);
         }
         Ok(Self {
@@ -47,6 +47,27 @@ impl Window {
             count,
             capacity,
         })
+    }
+
+    /// The window of a render that adds no firmware items: it starts and ends at `base`, and
+    /// claims no cursor movement of its own. Its progress is the ring's: it is accepted and
+    /// retired once the firmware has consumed every earlier item (`read` and `done` at `base`),
+    /// so a render with no items still retires after every earlier render's items, in order.
+    /// Its execution is witnessed by the pass record and the stamps, never by a cursor.
+    pub(crate) fn empty(base: u32, capacity: u32) -> Result<Self> {
+        if base >= capacity || capacity <= MAX_GROUP_ITEMS {
+            return Err(EINVAL);
+        }
+        Ok(Self {
+            base,
+            count: 0,
+            capacity,
+        })
+    }
+
+    /// The window holds none of the render's own items ([`Self::empty`]).
+    pub(crate) fn is_empty(self) -> bool {
+        self.count == 0
     }
 
     pub(crate) fn target(self) -> u32 {
@@ -454,6 +475,59 @@ mod executed_tests {
             job_list_empty: false,
             pass,
         }
+    }
+
+    /// A window of no items: `new` refuses a zero count; `empty` ends where it starts.
+    #[test]
+    fn an_empty_window_is_only_built_as_one() {
+        assert!(Window::new(1097, 0, 1280).is_err());
+        let window = Window::empty(1097, 1280).unwrap();
+        assert!(window.is_empty());
+        assert_eq!(window.target(), 1097);
+        assert!(Window::empty(1280, 1280).is_err());
+        assert!(!Window::new(1097, 1, 1280).unwrap().is_empty());
+    }
+
+    fn empty_ticket(done: u32) -> (Ticket, Snapshot) {
+        let window = Window::empty(1097, 1280).unwrap();
+        let previous = Cursors { done, read: done, write: 1097 };
+        let ticket = Ticket { ordinal: 406, windows: [window; 2], previous: [previous; 2] };
+        let cursors = Cursors { done, read: done, write: 1097 };
+        (ticket, Snapshot { cursors: [cursors; 2], job_list_empty: false, pass: [0, 0] })
+    }
+
+    /// A render with no items of its own is retired by the ring once every earlier item is
+    /// consumed, and not before: it waits for the items of the renders ahead of it.
+    #[test]
+    fn an_empty_window_retires_only_behind_every_earlier_item() {
+        let (ticket, snapshot) = empty_ticket(1097);
+        let seen = observe(&ticket, snapshot).unwrap();
+        assert!(seen.accepted && seen.retired);
+        let (ticket, snapshot) = empty_ticket(1095);
+        let seen = observe(&ticket, snapshot).unwrap();
+        assert!(!seen.accepted && !seen.retired);
+    }
+
+    /// Its cursors prove nothing about execution: with no pass record a render with no items
+    /// is neither complete nor executed and consumed, whatever the rings say. (Recovery's
+    /// drained-pair and reuse checks rest on these, and on the pair's in-flight list.)
+    #[test]
+    fn an_empty_window_without_a_pass_record_is_not_complete() {
+        let (ticket, snapshot) = empty_ticket(1097);
+        assert!(!observe(&ticket, snapshot).unwrap().complete);
+        assert!(!snapshot.executed_and_consumed());
+        assert!(snapshot.untouched());
+        let mut memory = Stalled { snapshot, stamps: [407 << 8; 2] };
+        let mut polled = ticket;
+        assert!(matches!(poll(&mut polled, &mut memory), Ok(Poll::Pending)));
+        assert!(matches!(poll_stampless(&mut polled, &mut memory), Ok(Poll::Pending)));
+        // Executed (tiler start, fragment end written) and stamped: complete.
+        let executed = Snapshot { pass: [10, 20], ..snapshot };
+        let mut memory = Stalled { snapshot: executed, stamps: [407 << 8; 2] };
+        assert!(matches!(poll(&mut polled, &mut memory), Ok(Poll::Complete(_))));
+        // Executed but the stamps hold the previous group: pending, as for any render.
+        let mut memory = Stalled { snapshot: executed, stamps: [406 << 8; 2] };
+        assert!(matches!(poll(&mut polled, &mut memory), Ok(Poll::Pending)));
     }
 
     #[test]

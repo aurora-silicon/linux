@@ -1048,19 +1048,28 @@ impl crate::g17::queue::render::Host for Host<'_> {
     }
     /// Pipe 0 (tiling) in bits 1:0, priority class in bits 3:2. M5 renders
     /// use the common compute work ring, pipe 2.
-    fn notify_render(&mut self, priority: u8) -> Result {
+    fn notify_render(
+        &mut self,
+        priority: u8,
+        notify: crate::g17::queue::render::announcement::Notify,
+    ) -> Result {
         self.release_registration();
         let m5 = self.firmware.init.is_m5();
         if m5 {
             // A paired publication is one tiling and one fragment submission, counted in
             // one slot.
-            if let Err(error) = self.firmware.init.note_m5_submission_history(2) {
-                pr_warn!("asahi: M5 submission history skipped: {:?}\n", error);
+            if notify.notes_history() {
+                if let Err(error) = self.firmware.init.note_m5_submission_history(2) {
+                    pr_warn!("asahi: M5 submission history skipped: {:?}\n", error);
+                }
             }
         } else {
             crate::g17::trace::doorbell(crate::g17::trace::RENDER, || {
                 self.firmware.bridge.regs.g17_core_power()
             });
+        }
+        if !notify.sends() {
+            return Ok(());
         }
         let result = self
             .firmware
@@ -1070,6 +1079,55 @@ impl crate::g17::queue::render::Host for Host<'_> {
             self.firmware.primary.state.shared.lose_device_quietly();
         }
         result
+    }
+    fn announce_kicks(
+        &mut self,
+        priority: u8,
+        fragment: &crate::g17::fw::channels::WorkSlot,
+        tiling: &crate::g17::fw::channels::WorkSlot,
+        commit: impl FnOnce() -> Result,
+        publish_inner: impl FnOnce(),
+        still_live: impl FnOnce(u32) -> bool,
+    ) -> Result<crate::g17::queue::render::announcement::Announced> {
+        // Only an M5 pair registered before this publication is warm: no registration
+        // transaction is pending. Warm render kicks run while the previous render is live
+        // in hardware (cores already active); if the post-kick stamp/pass-end check finds
+        // the prior render finished, outer records + doorbell wake firmware cleanly.
+        if !self.firmware.init.is_m5() || self.m5_registration.is_some() {
+            return Err(EIO);
+        }
+        let submission =
+            crate::g17::fw::m5::queue::HardwareSubmission::advance_pair(fragment.qid, tiling.qid)?;
+        let cursors = self.room_cursors(priority);
+        let firmware = &*self.firmware;
+        let announced = crate::g17::queue::render::announcement::announce(
+            || {
+                // A paired publication is one tiling and one fragment submission, counted in
+                // one slot.
+                if let Err(error) = firmware.init.note_m5_submission_history(2) {
+                    pr_warn!("asahi: M5 submission history skipped: {:?}\n", error);
+                }
+            },
+            commit,
+            publish_inner,
+            || firmware.bridge.regs.submit_m5_work(&submission),
+            || {
+                firmware
+                    .init
+                    .stamp(fragment.qid)
+                    .is_ok_and(|word| still_live(word.load(core::sync::atomic::Ordering::Relaxed)))
+            },
+            || {
+                let pair = firmware.init.m5_work_pair(priority, fragment, tiling, cursors)?;
+                pair.prepare();
+                pair.publish();
+                Ok(())
+            },
+        )?;
+        crate::g17::capacity::note_m5_warm_render(
+            announced == crate::g17::queue::render::announcement::Announced::Fallback,
+        );
+        Ok(announced)
     }
     fn note_submission(&mut self) -> Result {
         self.firmware.note_submission()

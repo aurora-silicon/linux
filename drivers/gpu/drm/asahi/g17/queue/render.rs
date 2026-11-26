@@ -3,6 +3,7 @@
 //! Physical paired tiling and fragment queues and their retained command storage.
 
 pub(in crate::g17) mod generation;
+pub(crate) mod announcement;
 mod configuration;
 pub(in crate::g17) mod m5_render_submission;
 mod observation;
@@ -138,7 +139,21 @@ pub(crate) trait Host {
         tiling: &WorkSlot,
         next: [u32; 2],
     ) -> Result;
-    fn notify_render(&mut self, priority: u8) -> Result;
+    /// Tells the firmware about a publication after its records or kicks, as `notify` says.
+    fn notify_render(&mut self, priority: u8, notify: announcement::Notify) -> Result;
+    /// Announces a warm M5 publication by its two host-port kicks alone (see
+    /// [`announcement::announce`]): `commit` and `publish_inner` run before the kick. If the
+    /// prior render finished before or during the kick, `fragment` and `tiling` are published
+    /// as outer records instead.
+    fn announce_kicks(
+        &mut self,
+        priority: u8,
+        fragment: &WorkSlot,
+        tiling: &WorkSlot,
+        commit: impl FnOnce() -> Result,
+        publish_inner: impl FnOnce(),
+        still_live: impl FnOnce(u32) -> bool,
+    ) -> Result<announcement::Announced>;
     fn note_submission(&mut self) -> Result;
     fn complete_render(
         &mut self,
@@ -240,6 +255,9 @@ pub(crate) struct Pair {
     registered: Option<u8>,
     /// Bit `p` set once a work slot of priority class `p` named the pair.
     outer_started: u8,
+    /// Recovery generation of the pair's last outer record: the channel cursor it named is
+    /// current only within it, so a warm render needs one in the current generation.
+    channel_epoch: Option<u64>,
     quarantined: bool,
     terminal: Option<(Arc<VmStatus>, Error)>,
     previous: Option<RetiredBinding>,
@@ -395,6 +413,7 @@ impl Pair {
             recovery_generation: 0,
             registered: None,
             outer_started: 0,
+            channel_epoch: None,
             quarantined: false,
             terminal: None,
             previous: None,
@@ -984,6 +1003,8 @@ impl Pair {
         let j813 = crate::g17::J813_FORMS.load(Ordering::Relaxed);
         let host_only_render_kicks =
             m5 && !j813 && self.board.is_some_and(|board| board.host_only_render_kicks);
+        let warm_host_kicks =
+            m5 && !j813 && self.board.is_some_and(|board| board.warm_host_kicks);
         if m5 && !j813 && self.registered.is_none() {
             if self.installed == [true; 2] {
                 // The cold-install configuration pair must be consumed first.
@@ -1026,17 +1047,16 @@ impl Pair {
             j813 || publication::required(cache[stage], config)
         });
         // An idle pair's next command starts from the rings' cursors; behind a command in
-        // flight it starts from that command's windows, and only the producers are checked.
+        // flight it starts from that command's windows; cold publications still verify the
+        // two producer cursors below once the warm/cold decision is made.
         let cursors = match self.active.front() {
             Some(_) => None,
             None => Some(self.memory.graph.cursors()?),
         };
-        let producers = match cursors {
-            Some(cursors) => cursors.map(|cursors| cursors.write),
-            None => self.memory.graph.write_cursors()?,
-        };
-        if producers != self.cursors {
-            return Err(EBUSY);
+        if let Some(cursors) = cursors {
+            if cursors.map(|cursors| cursors.write) != self.cursors {
+                return Err(EBUSY);
+            }
         }
         let queues = qids.map(|qid| self.memory.graph.queue_va(qid));
         let Validated::Render {
@@ -1093,6 +1113,59 @@ impl Pair {
             (None, None) if !m5 => None,
             _ => return Err(EIO),
         };
+        // One decision about the firmware work this publication needs, made before the kicks
+        // are encoded: the tiling kick's entry gate, both lanes' items and their cursor
+        // advance, the outer records and the notification all follow from it. Only a qualified
+        // warm-kick board can announce a render by host-port kicks alone, and only while the
+        // previous render's fragment stamp and pass-end timestamp are both still unwritten
+        // (re-checked after the host-port kick with outer-record + doorbell fallback).
+        let prev_live = self.active.back().filter(|prev| !prev.failed).and_then(|prev| {
+            let ord = prev.ticket.ordinal;
+            let done = ord.checked_add(1)?;
+            let end_offset = self
+                .memory
+                .owns(ord)
+                .then(|| self.memory.timestamp_offset(ord) + if m5 { 24 } else { 8 })?;
+            Some((done, end_offset))
+        });
+        let render_still_live = |timestamps: &crate::g17::KernelObject, fresh_fragment_stamp: u32| {
+            prev_live.is_some_and(|(done, end_offset)| {
+                !retirement::stamp_covers(fresh_fragment_stamp, done)
+                    && timestamps
+                        .dword(end_offset)
+                        .is_ok_and(|word| word.load(Ordering::Relaxed) == 0)
+            })
+        };
+        let pair_live = render_still_live(&self.memory.timestamps, stamps[1]);
+        let firmware = if warm_host_kicks {
+            publication::Firmware::decide(&publication::Warmth {
+                ring_started: self.outer_started & ring != 0,
+                registered: self.registered == Some(policy.priority()),
+                config: present.contains(&true) || leads.contains(&true),
+                update: self.context_update
+                    || identity_update
+                    || self.previous.as_ref().is_some_and(|p| p.publication.is_none()),
+                channel_current: self.channel_epoch == Some(epoch),
+                replay: packet.completion.replay_count() != 0,
+                unretained: !pair_live,
+            })
+        } else if host_only_render_kicks
+            && self.active.front().is_some()
+            && self.previous.is_none()
+            && self.registered == Some(policy.priority())
+            && !self.context_update
+            && !self.identity_update
+            && !present.contains(&true)
+            && !leads.contains(&true)
+        {
+            publication::Firmware::RecordsOnly
+        } else {
+            publication::Firmware::Needed(publication::Reason::Records)
+        };
+        let warm = firmware.warm();
+        if cursors.is_none() && !warm && self.memory.graph.write_cursors()? != self.cursors {
+            return Err(EBUSY);
+        }
         let args = |stage: usize, barriers, arrays, mcache| KickArgs {
             qid: qids[stage],
             timestamp: kicks[stage],
@@ -1111,9 +1184,10 @@ impl Pair {
                 },
             },
             mcache,
-            // Common 26A428 and the host-only form use an empty tiling event mask.
+            // An M5 tiling kick with firmware work first waits on its entry gate, except on the
+            // J813 and host-only-kick boards, which use an empty tiling event mask.
             event_mask: if m5 && stage == 0 && !j813 && !host_only_render_kicks {
-                [0, 0, 0, 1u64 << 62]
+                firmware.ta_event_mask()
             } else {
                 abi::RENDER_KICK_EVENT_MASK
             },
@@ -1169,16 +1243,6 @@ impl Pair {
         let tiling_kick = tiling_kick.prepare_entry(&ta_args)?;
         let fragment_kick = fragment_kick.prepare_entry(&fragment_args)?;
         let memory = &mut *self.memory;
-        // For a firmware that supports host-only kicks, an installed render
-        // pair with work in flight can use the host-port kick alone:
-        // another item-ring notification has no new configuration or lead
-        // command to publish. Keep the ordinary inner publication for the
-        // first command, a drained restart, a rebind, and a class change.
-        let sparse_inner = host_only_render_kicks
-            && self.active.front().is_some() && self.previous.is_none()
-            && self.registered == Some(policy.priority()) && !self.context_update
-            && !self.identity_update && !present.into_iter().any(|value| value)
-            && !leads.into_iter().any(|value| value);
         let lanes = [
             publication::Lane::new(
                 &memory.graph,
@@ -1189,7 +1253,7 @@ impl Pair {
                 present[0],
                 kicks[0],
                 leads[0],
-                sparse_inner,
+                firmware,
             )?,
             publication::Lane::new(
                 &memory.graph,
@@ -1200,7 +1264,7 @@ impl Pair {
                 present[1],
                 kicks[1],
                 leads[1],
-                sparse_inner,
+                firmware,
             )?,
         ];
         let windows = [lanes[0].window, lanes[1].window];
@@ -1304,28 +1368,50 @@ impl Pair {
                 host.install_pair(&registration)?;
                 self.registered = Some(policy.priority());
             }
+            let commit = || {
+                work.add_submitted_kicks(2)?;
+                flist_submission.commit();
+                pm_submission.commit();
+                Ok(())
+            };
+            let publish_inner = || match legacy_state {
+                Some((event_slot, next_event, inner, next_inner)) => {
+                    lanes[0].publish_tiling(event_slot, next_event, inner, next_inner)
+                }
+                None => {
+                    lanes[1].publish_kick();
+                    lanes[0].publish_kick();
+                }
+            };
+            if warm {
+                let [fragment, tiling] = announcement::frontier_records(
+                    queues,
+                    qids,
+                    windows.map(|window| window.target()),
+                )?;
+                let timestamps = &memory.timestamps;
+                let still_live = |fresh_fragment_stamp: u32| {
+                    render_still_live(timestamps, fresh_fragment_stamp)
+                };
+                return host.announce_kicks(
+                    policy.priority(),
+                    &fragment,
+                    &tiling,
+                    commit,
+                    publish_inner,
+                    still_live,
+                );
+            }
             host.publish_outer_pair(
                 policy.priority(),
                 &fragment_slot,
                 &tiling_slot,
-                || {
-                    work.add_submitted_kicks(2)?;
-                    flist_submission.commit();
-                    pm_submission.commit();
-                    Ok(())
-                },
-                || match legacy_state {
-                    Some((event_slot, next_event, inner, next_inner)) => {
-                        lanes[0].publish_tiling(event_slot, next_event, inner, next_inner)
-                    }
-                    None => {
-                        lanes[1].publish_kick();
-                        lanes[0].publish_kick();
-                    }
-                },
+                commit,
+                publish_inner,
             )
+            .map(announcement::Announced::Records)
         })();
-        let outer_next = match result {
+        let announced = match result {
             Ok(next) => {
                 if leads[0] {
                     self.memory.manager.mark_initialized();
@@ -1388,12 +1474,19 @@ impl Pair {
         packet.context.mark_published();
         self.announce_publication(
             host,
-            (&fragment_slot, &tiling_slot, outer_next),
+            (&fragment_slot, &tiling_slot, announced),
             lease.free_list_generation,
             policy.priority(),
             &packet,
             defer,
-        )
+        )?;
+        // Records name the frontier: the channel cursor is current in this generation. Kicks
+        // alone leave it where the last record put it, which is the frontier, since a warm
+        // render adds no items.
+        if announced.recorded() {
+            self.channel_epoch = Some(epoch);
+        }
+        Ok(())
     }
 
     /// M5 cold install: the queues consume their initial configuration
@@ -1424,7 +1517,7 @@ impl Pair {
                 true,
                 kicks[0],
                 false,
-                false,
+                publication::Firmware::Needed(publication::Reason::First),
             )?,
             publication::Lane::new(
                 &self.memory.graph,
@@ -1435,7 +1528,7 @@ impl Pair {
                 true,
                 kicks[1],
                 false,
-                false,
+                publication::Firmware::Needed(publication::Reason::First),
             )?,
         ];
         let ends = self.cursors.map(|base| (base + 1) % ITEM_RING_ENTRIES);
@@ -1478,7 +1571,7 @@ impl Pair {
         self.identity_update = false;
         self.outer_started |= ring;
         packet.context.mark_published();
-        host.notify_render(policy.priority())?;
+        host.notify_render(policy.priority(), announcement::Notify::Submission)?;
         Err(EBUSY)
     }
 
@@ -1548,7 +1641,7 @@ impl Pair {
     fn announce_publication(
         &mut self,
         host: &mut impl Host,
-        (fragment_slot, tiling_slot, outer_next): (&WorkSlot, &WorkSlot, [u32; 2]),
+        (fragment_slot, tiling_slot, announced): (&WorkSlot, &WorkSlot, announcement::Announced),
         free_list_generation: u64,
         priority: u8,
         packet: &Arc<Packet>,
@@ -1556,9 +1649,14 @@ impl Pair {
     ) -> Result {
         let publish = (|| {
             host.activate_render_pool(self.free_list.id(), free_list_generation)?;
-            host.publish_retained_pair(priority, fragment_slot, tiling_slot, outer_next)?;
+            // Records retained for their ordered producer update; a publication announced by
+            // its kicks, or by fallback records already published, has none left to publish.
+            if let announcement::Announced::Records(outer_next) = announced {
+                host.publish_retained_pair(priority, fragment_slot, tiling_slot, outer_next)?;
+            }
+            // The firmware can see the group: through its records or through its kicks.
             self.active.back_mut().ok_or(EIO)?.outer_published = true;
-            host.notify_render(priority)?;
+            host.notify_render(priority, announced.notify())?;
             crate::g17::trace::publish(
                 crate::g17::trace::RENDER,
                 self.qids()[1],

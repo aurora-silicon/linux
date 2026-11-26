@@ -168,21 +168,71 @@ impl crate::g17::queue::render::Host for DirectHost<'_> {
         }
     }
     /// Rings the shared render doorbell contract ([`super::render_doorbell_message`]).
-    fn notify_render(&mut self, priority: u8) -> Result {
+    fn notify_render(
+        &mut self,
+        priority: u8,
+        notify: crate::g17::queue::render::announcement::Notify,
+    ) -> Result {
         let m5 = matches!(self.target, DirectTarget::M5(_));
-        if m5 {
+        if m5 && notify.notes_history() {
             let geometry = self.m5_outer.as_mut().ok_or(EIO)?;
             if let Err(error) = self.port.note_m5_submission_history_locked(geometry, 2) {
                 pr_warn!("asahi: M5 submission history skipped: {:?}\n", error);
             }
-            // Drop `m5_outer` before ringing the mailbox doorbell so competing M5 submitters
-            // do not wait behind mailbox I/O.
-            self.m5_outer = None;
         }
-        // Outer ring producers, credits, and hazard order are committed; drop the render
-        // publication lock before mailbox I/O as well.
+        // Drop `m5_outer` and `render` locks before mailbox I/O so competing submitters
+        // do not wait behind mailbox I/O.
+        self.m5_outer = None;
         self.render = None;
+        if !notify.sends() {
+            return Ok(());
+        }
         self.port.notify(super::render_doorbell_message(m5, priority))
+    }
+    fn announce_kicks(
+        &mut self,
+        priority: u8,
+        fragment: &crate::g17::fw::channels::WorkSlot,
+        tiling: &crate::g17::fw::channels::WorkSlot,
+        commit: impl FnOnce() -> Result,
+        publish_inner: impl FnOnce(),
+        still_live: impl FnOnce(u32) -> bool,
+    ) -> Result<crate::g17::queue::render::announcement::Announced> {
+        let DirectTarget::M5(room) = &self.target else {
+            return Err(EINVAL);
+        };
+        if priority != room.priority() {
+            return Err(EINVAL);
+        }
+        let submission =
+            crate::g17::fw::m5::queue::HardwareSubmission::advance_pair(fragment.qid, tiling.qid)?;
+        let render = self.render.as_ref().ok_or(EIO)?;
+        let m5_outer = core::cell::RefCell::new(self.m5_outer.as_mut().ok_or(EIO)?);
+        let claim = self.m5_claim.as_deref_mut().ok_or(EIO)?;
+        let port = self.port;
+        let announced = crate::g17::queue::render::announcement::announce(
+            || {
+                let mut guard = m5_outer.borrow_mut();
+                if let Err(error) = port.note_m5_submission_history_locked(*guard, 2) {
+                    pr_warn!("asahi: M5 submission history skipped: {:?}\n", error);
+                }
+            },
+            commit,
+            publish_inner,
+            || {
+                let guard = m5_outer.borrow();
+                port.submit_m5_work_locked(*guard, &submission)
+            },
+            || port.stamp(fragment.qid).is_ok_and(still_live),
+            || {
+                let guard = m5_outer.borrow();
+                port.publish_m5_render_pair_fallback(render, *guard, room, claim, fragment, tiling)
+            },
+        )?;
+        crate::g17::capacity::note_m5_warm_render(
+            announced == crate::g17::queue::render::announcement::Announced::Fallback,
+        );
+        Ok(announced)
     }
     fn note_submission(&mut self) -> Result {
         // Counted, with full effort witnessed, before the pair was lent.

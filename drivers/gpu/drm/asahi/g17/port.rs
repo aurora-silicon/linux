@@ -558,27 +558,18 @@ impl Port {
         ))
     }
 
-    /// Copies an M5 render pair's fragment, then tiling record into the two reserved slots
-    /// of M5's shared outer ring without exposing them, commits accounting, issues the
-    /// host-port advance, and publishes inner producers (as `Firmware::submit_m5_render_pair`).
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Mirrors write_render_pair with the held M5 outer lock."
-    )]
-    pub(super) fn write_m5_render_pair(
+    /// Copies an M5 render pair's fragment and tiling records into the two reserved slots
+    /// of M5's shared outer ring while `m5_outer` is held, without exposing the producer.
+    fn copy_m5_render_records(
         &self,
-        _render: &MutexGuard<'_, ()>,
         _m5_outer: &MutexGuard<'_, Option<(u32, u64, u64)>>,
         room: &M5RenderRoom,
         fragment: &WorkSlot,
         tiling: &WorkSlot,
-        commit_accounting: impl FnOnce() -> Result,
-        publish_inner: impl FnOnce(),
-    ) -> Result<[u32; 2]> {
+    ) -> Result {
         if !matches!(fragment.data_master, 1 | 2) || !matches!(tiling.data_master, 0 | 2) {
             return Err(EINVAL);
         }
-        let regs = self.regs.as_ref().ok_or(ENODEV)?;
         let (_, ring) = self.ring(room.priority)?;
         let records = [
             WorkSlot::new(
@@ -596,10 +587,6 @@ impl Port {
                 tiling.first != 0,
             )?,
         ];
-        let submission = super::fw::m5::queue::HardwareSubmission::advance_pair(
-            fragment.qid,
-            tiling.qid,
-        )?;
         let destinations = [room.start, room.next[0]].map(|index| {
             // SAFETY: The ring view spans WORK_RING_SLOTS records; `reserve_m5_render_locked`
             // validated both indices are in range and host-owned while `m5_outer` stays held.
@@ -618,6 +605,32 @@ impl Port {
                 );
             }
         }
+        Ok(())
+    }
+
+    /// Copies an M5 render pair's fragment, then tiling record into the two reserved slots
+    /// of M5's shared outer ring without exposing them, commits accounting, issues the
+    /// host-port advance, and publishes inner producers (as `Firmware::submit_m5_render_pair`).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Mirrors write_render_pair with the held M5 outer lock."
+    )]
+    pub(super) fn write_m5_render_pair(
+        &self,
+        _render: &MutexGuard<'_, ()>,
+        m5_outer: &MutexGuard<'_, Option<(u32, u64, u64)>>,
+        room: &M5RenderRoom,
+        fragment: &WorkSlot,
+        tiling: &WorkSlot,
+        commit_accounting: impl FnOnce() -> Result,
+        publish_inner: impl FnOnce(),
+    ) -> Result<[u32; 2]> {
+        let regs = self.regs.as_ref().ok_or(ENODEV)?;
+        let submission = super::fw::m5::queue::HardwareSubmission::advance_pair(
+            fragment.qid,
+            tiling.qid,
+        )?;
+        self.copy_m5_render_records(m5_outer, room, fragment, tiling)?;
         commit_accounting()?;
         regs.submit_m5_work(&submission)?;
         publish_inner();
@@ -649,6 +662,30 @@ impl Port {
         unsafe { (*ring.producer).store(room.next[1], Ordering::Relaxed) };
         fence(Ordering::SeqCst);
         credits.consume_direct_count(claim, 2)
+    }
+
+    /// Submits an M5 host-port kick transaction while the caller holds `m5_outer`.
+    pub(super) fn submit_m5_work_locked(
+        &self,
+        _m5_outer: &MutexGuard<'_, Option<(u32, u64, u64)>>,
+        submission: &super::fw::m5::queue::HardwareSubmission,
+    ) -> Result {
+        self.regs.as_ref().ok_or(ENODEV)?.submit_m5_work(submission)
+    }
+
+    /// Writes and exposes outer work-ring fallback records for a warm M5 render whose
+    /// prior work completed before or during the host-port kick.
+    pub(super) fn publish_m5_render_pair_fallback(
+        &self,
+        render: &MutexGuard<'_, ()>,
+        m5_outer: &MutexGuard<'_, Option<(u32, u64, u64)>>,
+        room: &M5RenderRoom,
+        claim: &mut super::initdata::OuterClaim,
+        fragment: &WorkSlot,
+        tiling: &WorkSlot,
+    ) -> Result {
+        self.copy_m5_render_records(m5_outer, room, fragment, tiling)?;
+        self.expose_m5_render_pair(render, m5_outer, room, claim, room.next)
     }
 
     fn render_rings(&self, priority: u8) -> Result<(RingView, RingView)> {

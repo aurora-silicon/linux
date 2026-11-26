@@ -54,7 +54,7 @@ def check_guards():
     render = (ROOT / 'queue/render.rs').read_text()
     pair_publish = item(render, 'pub(crate) fn publish(')
     # The switch is recorded only after the outer publication succeeded.
-    ordered(pair_publish, 'let outer_next = match result', 'self.ordinal = next_ordinal;',
+    ordered(pair_publish, 'let announced = match result', 'self.ordinal = next_ordinal;',
             'self.switch = Some((self.executed, ordinal));', 'self.executed = scheduler;',
             'self.announce_publication(')
     parked = (ROOT / 'queue/render/parked.rs').read_text()

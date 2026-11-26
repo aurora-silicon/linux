@@ -29,6 +29,17 @@ pub(super) enum Site {
 
 const SITE_COUNT: usize = Site::ExecutionContexts as usize + 1;
 static REFUSALS: [AtomicU64; SITE_COUNT] = [const { AtomicU64::new(0) }; SITE_COUNT];
+static M5_WARM_RENDER: AtomicU64 = AtomicU64::new(0);
+static M5_WARM_RENDER_FALLBACK: AtomicU64 = AtomicU64::new(0);
+
+/// Record an M5 warm render kick (host-port only, or post-kick outer fallback).
+pub(crate) fn note_m5_warm_render(fallback: bool) {
+    if fallback {
+        M5_WARM_RENDER_FALLBACK.fetch_add(1, Ordering::Relaxed);
+    } else {
+        M5_WARM_RENDER.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 /// First and power-of-two refusals per site keep a pressure storm bounded in
 /// the log. This does not change whether the caller retries or rejects work.
@@ -76,6 +87,12 @@ impl kernel::debugfs::Writer for View {
         writeln!(f, "execution_contexts_fenced free_waiting={} overruns={}", fenced, overruns)?;
         let [kept, fallbacks] = super::completion::window_counters();
         writeln!(f, "timestamp_window firmware={} host_fallbacks={}", kept, fallbacks)?;
+        writeln!(
+            f,
+            "m5_warm_kicks render={} render_fallback={}",
+            M5_WARM_RENDER.load(Ordering::Relaxed),
+            M5_WARM_RENDER_FALLBACK.load(Ordering::Relaxed),
+        )?;
         let upper = uat.kernel_dynamic_range();
         for (name, vm, range) in [
             ("dynamic_lower_bytes", uat.kernel_lower_vm(), uat.kernel_lower_dynamic_range()),

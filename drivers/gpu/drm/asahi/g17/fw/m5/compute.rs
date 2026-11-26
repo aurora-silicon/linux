@@ -102,7 +102,7 @@ const POOL_EVENT_CONTEXTS: u32 = 64;
 const POOL_EVENT_ENGINE: u32 = 2;
 /// The entry-signal gate: event 254, which the firmware clears in the kick a current-kick
 /// notification names once it has handled that record.
-const ENTRY_GATE_EVENT: u32 = 254;
+pub(crate) const ENTRY_GATE_EVENT: u32 = 254;
 
 /// The event mask of a compute kick of context `context_id` on `board`, published with its
 /// current-kick notification. With the G17D forms ([`Board::g17d_forms`]) the kick waits on its

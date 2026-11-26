@@ -324,6 +324,7 @@ impl ParkedPair {
             recovery_generation: self.recovery_generation,
             registered: self.registered,
             outer_started: self.outer_started,
+            channel_epoch: None,
             quarantined: false,
             terminal: None,
             previous: self.previous.take(),

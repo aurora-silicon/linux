@@ -2723,12 +2723,16 @@ pub(crate) struct Board {
     /// Whether the host encodings are the G17D ones measured on the M5 Ultra
     /// ([`Board::g17d_forms`]).
     g17d_forms: bool,
-    /// Whether firmware accepts tiling kicks without an entry signal and retained
-    /// render pairs kicked through the host port alone.
+    /// Whether firmware accepts tiling kicks without an entry signal on outer-announced
+    /// render pairs.
     pub(crate) host_only_render_kicks: bool,
     /// Firmware compute queues of one context over which a single command queue's independent
     /// kicks may run ([`Board::compute_channels`]).
     compute_channels: u8,
+    /// Whether firmware accepts warm render and compute kicks announced through the host
+    /// port alone (without outer records or a doorbell) while prior work on the queue is
+    /// still live in hardware. Qualified per board.
+    pub(crate) warm_host_kicks: bool,
 }
 
 /// M5 Pro: two clusters of ten cores.
@@ -2761,6 +2765,7 @@ pub(crate) const J714: Board = Board {
     // macOS runs one M5 Pro command queue on up to three firmware compute queues of the same
     // context, created on demand and sharing one completion ordinal (its own kicks under aura).
     compute_channels: 3,
+    warm_host_kicks: false,
 };
 
 /// M5 Max: four clusters of ten cores.
@@ -2792,10 +2797,11 @@ pub(crate) const J716C: Board = Board {
     fan_curve_start_mc: 84_000,
     g17d_forms: false,
     // Qualified on G17C's 26A428 image. G17S uses completion-class inputs,
-    // G17D has distinct kick encodings, and common 26A428 publishes descriptors
-    // on the item ring. Qualify those interfaces separately.
+    // G17D uses gated cold kicks with warm host-port kicks, and common 26A428
+    // publishes descriptors on the item ring. Qualify those interfaces separately.
     host_only_render_kicks: true,
     compute_channels: 1,
+    warm_host_kicks: false,
 };
 
 /// J775D's performance controllers run from P3.
@@ -2838,6 +2844,9 @@ pub(crate) const J775D: Board = Board {
     g17d_forms: true,
     host_only_render_kicks: false,
     compute_channels: 1,
+    // Qualified on G17D (J775D): host-port warm kicks with post-kick stamp/pass-end
+    // re-check and outer-record + doorbell fallback; cold kicks stay gated on the entry signal.
+    warm_host_kicks: true,
 };
 
 /// M5 (T8142, MacBook Air J813): one cluster of ten core slots, eight enabled. Values from the
@@ -2878,6 +2887,7 @@ pub(crate) const J813: Board = Board {
     g17d_forms: false,
     host_only_render_kicks: false,
     compute_channels: 1,
+    warm_host_kicks: false,
 };
 
 /// The J813 on its macOS 27.2 (26B123) firmware: the same board on the common 26B123 graph.
