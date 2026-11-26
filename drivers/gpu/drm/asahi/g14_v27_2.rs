@@ -666,7 +666,16 @@ impl Runtime {
                 Ok(Some(slots)) => slots,
                 Ok(None) => return,
                 Err(err) => {
-                    dev_err!(self.dev, "GPU: command pool stalled: {:?}\n", err);
+                    dev_err!(self.dev, "GPU: command pool stalled: {:?} busy={:#x} unacked={:#x} inflight={} rendering={}\n",
+                             err, state.busy, state.unacked, state.inflight.len(), state.rendering.is_some());
+                    for slot in 0..POOL_SLOTS {
+                        if let Ok((count, cursor, linked)) = state.pool.describe(slot) {
+                            if linked != 0 || count != cursor {
+                                dev_err!(self.dev, "GPU: slot {}: records={} cursor={} linked={}\n",
+                                         slot, count, cursor, linked);
+                            }
+                        }
+                    }
                     self.fail_all(state, err);
                     return;
                 }

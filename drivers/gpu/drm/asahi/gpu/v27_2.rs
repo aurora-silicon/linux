@@ -570,6 +570,18 @@ impl CommandPool {
         Ok(true)
     }
 
+    /// Slot `i`'s record count (+0xc), its retirement cursor and whether the firmware still
+    /// holds it in the queue's tracking list (+0x94), for a stall report.
+    pub(crate) fn describe(&self, i: usize) -> Result<(u32, u32, u32)> {
+        if i >= POOL_SLOTS { return Err(EINVAL); }
+        crate::pgtable::clean_invalidate_poc(self.tracking.as_slice()[i * 0x100..].as_ptr(), 0x100);
+        crate::pgtable::clean_invalidate_poc(self.cursors.as_slice()[i * 0x40..].as_ptr(), 0x40);
+        crate::pgtable::poc_barrier();
+        Ok((self.tracking.shared_index(i * 0x100 + 0xc)?.load(Ordering::Acquire),
+            self.cursors.shared_index(i * 0x40)?.load(Ordering::Acquire),
+            self.tracking.shared_index(i * 0x100 + 0x94)?.load(Ordering::Acquire)))
+    }
+
     /// Whether the firmware still holds slot `i` in the queue's tracking list (+0x94).
     pub(crate) fn registered(&self, i: usize) -> Result<bool> {
         if i >= POOL_SLOTS { return Err(EINVAL); }
