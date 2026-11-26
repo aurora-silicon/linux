@@ -51,6 +51,7 @@ obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp_backlight_test.o
 obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp-indicator-test.o
 obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp-announce-test.o
 obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp-hdcp-test.o
+obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp-hdcp-wire-test.o
 
 obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += afk-service-test.o
 obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp_cec_test.o
