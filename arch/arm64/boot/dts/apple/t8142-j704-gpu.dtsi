@@ -18,7 +18,8 @@
  * requires exactly that many OPP nodes, each with a u64 opp-hz and one u32
  * opp-microvolt, and fills them from sgx perf-states; it fills the uat-* regions from
  * iBoot's raw-boot handoff and gfx-data/gfx1-data/fw-data from the firmware segments.
- * The OPP values below are the J704 ADT's (the loader overwrites them with the same).
+ * The OPPs are 0 here: their voltages are binned per part, so only the loader's copy
+ * of this machine's ADT is right, and the driver refuses a table it did not fill.
  */
 
 / {
@@ -79,23 +80,23 @@
 		compatible = "operating-points-v2";
 
 		/*
-		 * 14 entries in perf-state order (ADT sgx perf-states: MHz, core mV),
-		 * refilled by the bootloader.
+		 * 14 entries in perf-state order, filled by the bootloader from ADT sgx
+		 * perf-states (Hz, core uV).
 		 */
-		opp00 { opp-hz = /bits/ 64 <0>; opp-microvolt = <125000>; };
-		opp01 { opp-hz = /bits/ 64 <338000000>; opp-microvolt = <610000>; };
-		opp02 { opp-hz = /bits/ 64 <486000000>; opp-microvolt = <625000>; };
-		opp03 { opp-hz = /bits/ 64 <636000000>; opp-microvolt = <655000>; };
-		opp04 { opp-hz = /bits/ 64 <796000000>; opp-microvolt = <700000>; };
-		opp05 { opp-hz = /bits/ 64 <888000000>; opp-microvolt = <725000>; };
-		opp06 { opp-hz = /bits/ 64 <988000000>; opp-microvolt = <745000>; };
-		opp07 { opp-hz = /bits/ 64 <1084000000>; opp-microvolt = <775000>; };
-		opp08 { opp-hz = /bits/ 64 <1182000000>; opp-microvolt = <805000>; };
-		opp09 { opp-hz = /bits/ 64 <1278000000>; opp-microvolt = <840000>; };
-		opp10 { opp-hz = /bits/ 64 <1374000000>; opp-microvolt = <885000>; };
-		opp11 { opp-hz = /bits/ 64 <1470000000>; opp-microvolt = <940000>; };
-		opp12 { opp-hz = /bits/ 64 <1578000000>; opp-microvolt = <1010000>; };
-		opp13 { opp-hz = /bits/ 64 <1620000000>; opp-microvolt = <1030000>; };
+		opp00 { opp-hz = /bits/ 64 <0>; opp-microvolt = <0>; };
+		opp01 { opp-hz = /bits/ 64 <0>; opp-microvolt = <0>; };
+		opp02 { opp-hz = /bits/ 64 <0>; opp-microvolt = <0>; };
+		opp03 { opp-hz = /bits/ 64 <0>; opp-microvolt = <0>; };
+		opp04 { opp-hz = /bits/ 64 <0>; opp-microvolt = <0>; };
+		opp05 { opp-hz = /bits/ 64 <0>; opp-microvolt = <0>; };
+		opp06 { opp-hz = /bits/ 64 <0>; opp-microvolt = <0>; };
+		opp07 { opp-hz = /bits/ 64 <0>; opp-microvolt = <0>; };
+		opp08 { opp-hz = /bits/ 64 <0>; opp-microvolt = <0>; };
+		opp09 { opp-hz = /bits/ 64 <0>; opp-microvolt = <0>; };
+		opp10 { opp-hz = /bits/ 64 <0>; opp-microvolt = <0>; };
+		opp11 { opp-hz = /bits/ 64 <0>; opp-microvolt = <0>; };
+		opp12 { opp-hz = /bits/ 64 <0>; opp-microvolt = <0>; };
+		opp13 { opp-hz = /bits/ 64 <0>; opp-microvolt = <0>; };
 	};
 };
 
