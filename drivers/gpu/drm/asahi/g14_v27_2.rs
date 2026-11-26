@@ -482,7 +482,12 @@ pub(crate) fn start<'a>(
         step = "boot job";
         root.publish_boot_job(resources.operating_point())?;
         peer.as_mut().send_message(EP_DOORBELL, gpu::COMPUTE_KICK)?;
-        wait(&root, 3000, || root.boot_job_complete())
+        wait(&root, 3000, || root.boot_job_complete())?;
+        if root.has_pwr_controller() {
+            step = "idle power-off policy";
+            set_idle_policy(&root, &mut peer, true)?;
+        }
+        Ok(())
     })();
     if let Err(e) = result {
         dev_err!(dev, "GPU firmware 27.2 did not start: {}: {:?}\n", step, e);
@@ -555,6 +560,9 @@ struct State {
     accepting: bool,
     submitted: u64,
     retired: u64,
+    /// Set when the DT power-controller calibration is present and runtime idle power-off is
+    /// permitted (firmware powers the GPU off after `fender_idle_off_delay_ms` of inactivity).
+    idle_off_allowed: bool,
     /// Set when a sleep/wake failure may have left the GPU domain unpowered or stopped so
     /// teardown skips live-hardware MMIO and RTKit operations.
     hardware_unreachable: bool,
@@ -1199,9 +1207,15 @@ impl Runtime {
             if !self.healthy() || state.running() {
                 return Err(self.abort_deep_prepare(state, false, EBUSY));
             }
-            if let Err((published, err)) = try_set_idle_policy(&state.root, &mut state.peer, true) {
-                dev_err!(self.dev, "GPU: deep sleep refused, allow-off failed: {:?}\n", err);
-                return Err(self.abort_deep_prepare(state, published, err));
+            let mut policy_published = false;
+            if !state.idle_off_allowed {
+                match try_set_idle_policy(&state.root, &mut state.peer, true) {
+                    Ok(()) => policy_published = true,
+                    Err((published, err)) => {
+                        dev_err!(self.dev, "GPU: deep sleep refused, allow-off failed: {:?}\n", err);
+                        return Err(self.abort_deep_prepare(state, published, err));
+                    }
+                }
             }
             if let Err(err) = wait(&state.root, 500, || Ok(gpu_powered_off(state.asc.fender()))) {
                 dev_err!(
@@ -1210,7 +1224,7 @@ impl Runtime {
                     state.asc.fender(),
                     err
                 );
-                return Err(self.abort_deep_prepare(state, true, err));
+                return Err(self.abort_deep_prepare(state, policy_published, err));
             }
             // SAFETY: `ASC_CPU_CONTROL` lies within the mapped ASC page.
             let asc_ctl = unsafe { state.asc.0.add(ASC_CPU_CONTROL) };
@@ -1222,7 +1236,7 @@ impl Runtime {
                 idle_us: 0,
             }, GFP_KERNEL) {
                 Ok(c) => c,
-                Err(err) => return Err(self.abort_deep_prepare(state, true, err.into())),
+                Err(err) => return Err(self.abort_deep_prepare(state, policy_published, err.into())),
             };
             state.commit_stop = Some(commit);
             let data = state.commit_stop.as_deref_mut().map_or(core::ptr::null_mut(), |c| {
@@ -1239,7 +1253,7 @@ impl Runtime {
             };
             if ret != 0 {
                 state.commit_stop = None;
-                return Err(self.abort_deep_prepare(state, true, Error::from_errno(ret)));
+                return Err(self.abort_deep_prepare(state, policy_published, Error::from_errno(ret)));
             }
             // SAFETY: `dev` was just registered above.
             unsafe { apple_sleep_coproc_set_ready(self.dev.as_raw(), true) };
@@ -1271,10 +1285,14 @@ impl Runtime {
             // SAFETY: Reads a global flag word.
             let real = unsafe { kernel::bindings::pm_resume_via_firmware() };
             if !stopped && !real {
-                dev_info!(self.dev, "GPU: deep sleep refused before commit; restoring keep-powered\n");
-                if let Err(err) = set_idle_policy(&state.root, &mut state.peer, false) {
-                    dev_err!(self.dev, "GPU: failed to restore keep-powered policy: {:?}\n", err);
-                    self.fail_all(state, err);
+                if !state.idle_off_allowed {
+                    dev_info!(self.dev, "GPU: deep sleep refused before commit; restoring keep-powered\n");
+                    if let Err(err) = set_idle_policy(&state.root, &mut state.peer, false) {
+                        dev_err!(self.dev, "GPU: failed to restore keep-powered policy: {:?}\n", err);
+                        self.fail_all(state, err);
+                    }
+                } else {
+                    dev_info!(self.dev, "GPU: deep sleep refused before commit\n");
                 }
                 self.notify.set_deep_sleeping(self, false);
                 self.asleep.store(false, Ordering::Release);
@@ -1316,7 +1334,11 @@ impl Runtime {
                 state.asc.write(ASC_CPU_CONTROL, ctl_before | ASC_RUN);
                 state.peer.as_mut().boot()?;
                 set_idle_policy(&state.root, &mut state.peer, false)?;
-                wait(&state.root, 500, || Ok(gpu_powered(state.asc.fender())))
+                wait(&state.root, 500, || Ok(gpu_powered(state.asc.fender())))?;
+                if state.idle_off_allowed {
+                    set_idle_policy(&state.root, &mut state.peer, true)?;
+                }
+                Ok(())
             })();
             self.notify.set_deep_sleeping(self, false);
             self.asleep.store(false, Ordering::Release);
@@ -1393,7 +1415,11 @@ impl Runtime {
                 self.notify.messages.load(Ordering::Relaxed)
             );
         } else {
-            let allowed = set_idle_policy(&state.root, &mut state.peer, true);
+            let allowed = if state.idle_off_allowed {
+                Ok(())
+            } else {
+                set_idle_policy(&state.root, &mut state.peer, true)
+            };
             let root = &state.root;
             let _ = wait(root, 500, || Ok(root.firmware_running()? == 0));
             let running = root.firmware_running();
@@ -1489,6 +1515,7 @@ impl Backend {
                 return Err(e);
             }
         };
+        let idle_off_allowed = root.has_pwr_controller();
         *runtime.state.lock() = Some(State {
             peer, root, pool, asc, fault, queue, last,
             sequence: u64::from(head),
@@ -1510,6 +1537,7 @@ impl Backend {
             accepting: true,
             submitted: 0,
             retired: 0,
+            idle_off_allowed,
             hardware_unreachable: false,
             #[cfg(CONFIG_APPLE_SOC_SLEEP)]
             commit_stop: None,
