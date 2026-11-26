@@ -1440,10 +1440,22 @@ static void __init gt_max_fill(struct kunit *test, unsigned int i)
 static void __init gt_max_expect_chain(struct kunit *test, unsigned int i, bool enabled)
 {
 	const struct gate_staged *st = &t6041_max_stages[i];
-	unsigned int n;
+	struct device_node *routes, *route;
+	unsigned int n, nr_routes = 0;
 
 	for (n = 0; n < st->nr; n++)
 		KUNIT_EXPECT_EQ_MSG(test, gt_okay(test, st->nodes[n]), enabled, "%s", st->nodes[n]);
+	if (!st->dt_routes)
+		return;
+	/* A chain that takes its routes from the tree has every one of them. */
+	routes = staged_routes(st);
+	KUNIT_ASSERT_NOT_NULL(test, routes);
+	for_each_child_of_node(routes, route) {
+		KUNIT_EXPECT_EQ_MSG(test, of_device_is_available(route), enabled, "%pOF", route);
+		nr_routes++;
+	}
+	of_node_put(routes);
+	KUNIT_EXPECT_GT(test, nr_routes, 0);
 }
 
 /*
@@ -1523,6 +1535,67 @@ static void __init gate_t6041_max_all_externals(struct kunit *test)
 	for (i = 0; i < 4; i++)
 		gt_max_expect_chain(test, i, true);
 	gt_max_expect_display(test, BIT(0) | BIT(1) | BIT(2) | BIT(3));
+}
+
+/*
+ * dcpext3 takes its routes from the tree: with a route to a fourth Type-C port,
+ * as the J575c has, that route comes up with the chain too.
+ */
+static void __init gate_t6041_max_dt_routes(struct kunit *test)
+{
+	struct gate_test *t = test->priv;
+	struct device_node *route;
+
+	route = of_changeset_create_node(&t->cs, gt_node(test, "/dcp@306e00000/typec-routes"),
+					 "route@3");
+	KUNIT_ASSERT_NOT_NULL(test, route);
+	KUNIT_ASSERT_EQ(test, of_changeset_add_prop_u32(&t->cs, route, "reg", 3), 0);
+	KUNIT_ASSERT_EQ(test, of_changeset_add_prop_string(&t->cs, route, "status", "disabled"), 0);
+	gt_max_fill(test, 3);
+	gt_max_run(test);
+	gt_max_expect_chain(test, 3, true);
+	KUNIT_EXPECT_TRUE(test, gt_okay(test, "/dcp@306e00000/typec-routes/route@3"));
+	gt_max_expect_display(test, BIT(3));
+}
+
+static void __init gt_max_expect_dt_routes_refused(struct kunit *test)
+{
+	const struct gate_staged *st = &t6041_max_stages[3];
+	struct device_node *display = gt_node(test, "/display-subsystem");
+	unsigned int n;
+
+	gt_max_fill(test, 3);
+	gt_max_run(test);
+	for (n = 0; n < st->nr; n++)
+		KUNIT_EXPECT_FALSE_MSG(test, gt_okay(test, st->nodes[n]), "%s", st->nodes[n]);
+	gt_max_expect_display(test, 0);
+
+	/* Direct application refuses it too and leaves the changeset untouched. */
+	if (gt_okay(test, st->nodes[st->nr - 1]))
+		return;
+	KUNIT_EXPECT_EQ(test, t6041_max_apply(3, display), -ENODEV);
+	for (n = 0; n < st->nr; n++)
+		KUNIT_EXPECT_FALSE_MSG(test, gt_okay(test, st->nodes[n]), "%s", st->nodes[n]);
+	gt_max_expect_display(test, 0);
+}
+
+/* A dt_routes stage whose typec-routes container is missing stays off whole. */
+static void __init gate_t6041_max_dt_routes_missing(struct kunit *test)
+{
+	gt_detach(test, "/dcp@306e00000/typec-routes/route@0");
+	gt_detach(test, "/dcp@306e00000/typec-routes/route@1");
+	gt_detach(test, "/dcp@306e00000/typec-routes/route@2");
+	gt_detach(test, "/dcp@306e00000/typec-routes");
+	gt_max_expect_dt_routes_refused(test);
+}
+
+/* A dt_routes stage whose typec-routes container has no routes stays off whole. */
+static void __init gate_t6041_max_dt_routes_empty(struct kunit *test)
+{
+	gt_detach(test, "/dcp@306e00000/typec-routes/route@0");
+	gt_detach(test, "/dcp@306e00000/typec-routes/route@1");
+	gt_detach(test, "/dcp@306e00000/typec-routes/route@2");
+	gt_max_expect_dt_routes_refused(test);
 }
 
 /* The other processor's chain does not wait for one that was refused. */
@@ -1646,6 +1719,9 @@ static struct kunit_case gate_t6041_max_cases[] __refdata = {
 	KUNIT_CASE(gate_t6041_max_no_memory),
 	KUNIT_CASE(gate_t6041_max_second_usbc),
 	KUNIT_CASE(gate_t6041_max_all_externals),
+	KUNIT_CASE(gate_t6041_max_dt_routes),
+	KUNIT_CASE(gate_t6041_max_dt_routes_missing),
+	KUNIT_CASE(gate_t6041_max_dt_routes_empty),
 	KUNIT_CASE(gate_t6041_max_one_processor),
 	KUNIT_CASE(gate_t6041_max_partial_memory),
 	KUNIT_CASE(gate_t6041_max_enabled_by_loader),
