@@ -54,6 +54,8 @@ struct ave_mctf_layout;
 #define AVE_IPC_BYTES (20 * SZ_1M)
 #define AVE_IPC_CHANNEL_OFF 0x4000
 #define AVE_IPC_HANDSHAKE_OFF 0x24000
+/* Most channel descriptors any firmware publishes (the 6070 one: 7). */
+#define AVE_IPC_MAX_CHANNELS 8
 #define AVE_IPC_SHARED_OFF 0x28000
 #define AVE_IPC_SHARED_BYTES SZ_64K
 #define AVE_IPC_CMD_OFF 0x40000
@@ -183,6 +185,11 @@ enum ave_opcode {
 /* The M3 (T8122) build preloaded by the macOS 27.2 (26B123) stub. */
 #define AVE_FW_TEXT_CRC_T8122_26B123 0x918d70d3
 /*
+ * The M2 (T8112) build preloaded by the macOS 27.2 (26B123) stub, with the
+ * per-boot word at TEXT 0x4224 zeroed.
+ */
+#define AVE_FW_TEXT_CRC_T8112_26B123 0x077a3444
+/*
  * The M5 build of macOS 27.2 (26B123; 27.2.1 26B131 ships it unchanged),
  * AppleAVE2FW 9013.55.1: TEXT 0x154000, DATA 0x12c000, as 26A428's.
  */
@@ -248,6 +255,16 @@ struct ave_variant {
 	u32 mbox_idle;
 	/* Restore DATA from the boot snapshot before every start, the first included. */
 	bool restore_data_first;
+	/*
+	 * The same encoder running another firmware build that a newer
+	 * bootloader preloads, with a start and command protocol of its own.
+	 * The firmware segment sizes the bootloader reserved select it.
+	 * NULL when there is none. Use builds[] when the builds differ only
+	 * in TEXT CRC (and command layout) but start the same way; use
+	 * next_build when a build needs other start fields (boot device,
+	 * handshake type, boot word, DATA handling) and has sizes of its own.
+	 */
+	const struct ave_variant *next_build;
 
 	size_t extra0_size;
 	/* Register sequence and boot/hello configuration have been qualified. */
@@ -566,6 +583,9 @@ extern const struct ave_variant ave_t6000, ave_t6041, ave_t8112, ave_t8132,
 /* ave-fw.c */
 u64 ave_fw_vcbar(const struct ave_variant *variant, u64 text_iova);
 int ave_fw_probe(struct ave_dev *ave);
+bool ave_fw_sizes_match(const struct ave_variant *v, size_t text, size_t data);
+const struct ave_variant *ave_fw_select_build(const struct ave_variant *v,
+					      size_t text, size_t data);
 int ave_fw_text_id_crc(const void *text, size_t size, u32 cell_off,
 		       u64 data_iova, u32 *crc);
 int ave_fw_text_boot_crc(const void *text, size_t size, u32 word_off,
