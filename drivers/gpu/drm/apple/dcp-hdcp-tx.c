@@ -23,31 +23,15 @@ static void tx_report(struct dcp_hdcp_tx *tx, enum dcp_hdcp_progress_code code,
 }
 
 /*
- * Waits for a session event. A missed event is not fatal when the receiver
- * already says, in RxStatus, that what the event announces is there.
+ * Waits for a session event. DCP watches the receiver's RxStatus and turns it
+ * into these events; the transmitter never reads RxStatus itself (on
+ * DisplayPort a read clears the bits DCP is waiting for).
  */
 static int tx_wait(struct dcp_hdcp_tx *tx, enum dcp_hdcp_auth_op op,
 		   unsigned int spec_ms)
 {
-	u8 status;
-	int ret;
-
 	tx->step = "wait for DCP event";
-	ret = tx->ops->wait(tx->ctx, op, spec_ms + DCP_HDCP_EVENT_SLACK_MS);
-	if (ret != -ETIMEDOUT)
-		return ret;
-	if (TX_READ(tx, DP_HDCP_2_2_REG_RXSTATUS_OFFSET, &status, 1))
-		return -ETIMEDOUT;
-	switch (op) {
-	case DCP_HDCP_AUTH_H_PRIME:
-		return HDCP_2_2_DP_RXSTATUS_H_PRIME(status) ? 0 : -ETIMEDOUT;
-	case DCP_HDCP_AUTH_PAIRING:
-		return HDCP_2_2_DP_RXSTATUS_PAIRING(status) ? 0 : -ETIMEDOUT;
-	case DCP_HDCP_AUTH_LIST:
-		return HDCP_2_2_DP_RXSTATUS_READY(status) ? 0 : -ETIMEDOUT;
-	default:
-		return -ETIMEDOUT;
-	}
+	return tx->ops->wait(tx->ctx, op, spec_ms + DCP_HDCP_EVENT_SLACK_MS);
 }
 
 /* Any revoked ID, or an SRM that cannot be read, fails the attempt. */
@@ -364,19 +348,6 @@ void dcp_hdcp_abort(struct dcp_hdcp_tx *tx)
 	if (tx->sep_open)
 		TX_SEP(tx, sep_close)(tx->ctx, tx->channel);
 	tx->sep_open = false;
-}
-
-int dcp_hdcp_check_link(struct dcp_hdcp_tx *tx)
-{
-	u8 status;
-	int ret = TX_READ(tx, DP_HDCP_2_2_REG_RXSTATUS_OFFSET, &status, 1);
-
-	if (ret)
-		return ret;
-	if (HDCP_2_2_DP_RXSTATUS_REAUTH_REQ(status) ||
-	    HDCP_2_2_DP_RXSTATUS_LINK_FAILED(status))
-		return -EAGAIN;
-	return 0;
 }
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_KUNIT_TEST)
