@@ -469,6 +469,12 @@ static void apple_pwm_test_enable_holds_power(struct kunit *test)
 
 	KUNIT_ASSERT_EQ(test, apple_pwm_test_apply(ctx, 1000000, 250000, true), 0);
 	KUNIT_EXPECT_EQ(test, apple_pwm_test_usage(ctx), usage + 1);
+	KUNIT_ASSERT_EQ(test, apple_pwm_test_apply(ctx, 1000000, 0, true), 0);
+	KUNIT_EXPECT_EQ(test, apple_pwm_test_usage(ctx), usage);
+	KUNIT_EXPECT_FALSE(test, ctx->fpwm->enabled);
+
+	KUNIT_ASSERT_EQ(test, apple_pwm_test_apply(ctx, 1000000, 250000, true), 0);
+	KUNIT_EXPECT_EQ(test, apple_pwm_test_usage(ctx), usage + 1);
 	KUNIT_ASSERT_EQ(test, apple_pwm_test_apply(ctx, 1000000, 250000, false), 0);
 	KUNIT_EXPECT_EQ(test, apple_pwm_test_usage(ctx), usage);
 }
@@ -504,6 +510,44 @@ static void apple_pwm_test_runtime_pm_keeps_registers(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, apple_pwm_test_reg(ctx, APPLE_PWM_OFF_CYCLES), 0x9abcdef0);
 }
 
+/*
+ * An enabled zero-duty state (or a duty that rounds down to zero cycles)
+ * releases the output power hold while preserving readback across register loss.
+ */
+static void apple_pwm_test_zero_duty_runtime_pm_readback(struct kunit *test)
+{
+	struct apple_pwm_test *ctx = test->priv;
+	struct pwm_state hw;
+	int usage = apple_pwm_test_usage(ctx);
+
+	if (!IS_ENABLED(CONFIG_PM))
+		kunit_skip(test, "needs CONFIG_PM");
+
+	/* Explicit zero duty */
+	KUNIT_ASSERT_EQ(test, apple_pwm_test_apply(ctx, 1000000, 0, true), 0);
+	KUNIT_EXPECT_EQ(test, apple_pwm_test_usage(ctx), usage);
+	KUNIT_EXPECT_FALSE(test, ctx->fpwm->enabled);
+	KUNIT_ASSERT_EQ(test, apple_pwm_runtime_suspend(ctx->dev), 0);
+	apple_pwm_test_set_regs(ctx, 0, 0, 0);
+	KUNIT_ASSERT_EQ(test, apple_pwm_runtime_resume(ctx->dev), 0);
+	KUNIT_ASSERT_EQ(test, pwm_get_state_hw(ctx->pwm, &hw), 0);
+	KUNIT_EXPECT_TRUE(test, hw.enabled);
+	KUNIT_EXPECT_EQ(test, hw.duty_cycle, 0);
+	KUNIT_EXPECT_EQ(test, hw.period, 1000000);
+
+	/* Non-zero duty that rounds down to 0 cycles at 24 MHz (1 cycle = 41.67 ns) */
+	KUNIT_ASSERT_EQ(test, apple_pwm_test_apply(ctx, 1000000, 10, true), 0);
+	KUNIT_EXPECT_EQ(test, apple_pwm_test_usage(ctx), usage);
+	KUNIT_EXPECT_FALSE(test, ctx->fpwm->enabled);
+	KUNIT_ASSERT_EQ(test, apple_pwm_runtime_suspend(ctx->dev), 0);
+	apple_pwm_test_set_regs(ctx, 0, 0, 0);
+	KUNIT_ASSERT_EQ(test, apple_pwm_runtime_resume(ctx->dev), 0);
+	KUNIT_ASSERT_EQ(test, pwm_get_state_hw(ctx->pwm, &hw), 0);
+	KUNIT_EXPECT_TRUE(test, hw.enabled);
+	KUNIT_EXPECT_EQ(test, hw.duty_cycle, 0);
+	KUNIT_EXPECT_EQ(test, hw.period, 1000000);
+}
+
 static struct kunit_case apple_pwm_test_cases[] = {
 	KUNIT_CASE_PARAM(apple_pwm_test_apply_cycles, apple_pwm_test_conv_gen_params),
 	KUNIT_CASE_PARAM(apple_pwm_test_readback, apple_pwm_test_conv_gen_params),
@@ -518,6 +562,7 @@ static struct kunit_case apple_pwm_test_cases[] = {
 	KUNIT_CASE(apple_pwm_test_enable_holds_power),
 	KUNIT_CASE(apple_pwm_test_get_state_power_balanced),
 	KUNIT_CASE(apple_pwm_test_runtime_pm_keeps_registers),
+	KUNIT_CASE(apple_pwm_test_zero_duty_runtime_pm_readback),
 	{}
 };
 
