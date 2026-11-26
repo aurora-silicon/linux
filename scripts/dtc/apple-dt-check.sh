@@ -15,6 +15,8 @@
 set -u
 BASE=$1 HEAD=$2 W=$3
 export ARCH=arm64 LLVM=1
+# sort and comm must agree on the order: some UTF-8 locales collate these lines differently.
+export LC_ALL=C
 mkdir -p "$W"
 filter_documented_chosen() { # chosen_bindings_dir
 	python3 -c '
@@ -139,6 +141,29 @@ extract_warnings() { # src_dir out_dir log_file out_warn tag
 		filter_failed=1
 		return 1
 	fi
+	# One line per undocumented property, so documenting one of a node's properties does not
+	# turn that node's remaining ones into a "new" warning.
+	python3 -c '
+import re, sys
+pat = re.compile(r"^(.*?: )(\x27[^\x27]+\x27(?:, \x27[^\x27]+\x27)*) do(?:es)? not match any of the regexes:(.*)$")
+for line in open(sys.argv[1]):
+	line = line.rstrip("\n")
+	m = pat.match(line)
+	if not m:
+		print(line)
+		continue
+	prefix, props, tail = m.groups()
+	for prop in re.findall(r"\x27[^\x27]+\x27", props):
+		print(prefix + prop + " does not match any of the regexes:" + tail)
+' "$out" | sort -u > "$out.split"
+	local sp=("${PIPESTATUS[@]}")
+	if [ "${sp[0]}" -ne 0 ] || [ "${sp[1]}" -ne 0 ]; then
+		rm -f "$out" "$out.split"
+		echo "apple-dt-check.sh: $tag: splitting property warnings failed" >&2
+		filter_failed=1
+		return 1
+	fi
+	mv "$out.split" "$out"
 }
 warnings() { # rev tag
 	local t=$W/src-$2 o=$W/out-$2
