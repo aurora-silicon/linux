@@ -2094,13 +2094,26 @@ static int dcp_v27_early_stage(struct apple_dcp *dcp)
  * sleep's A489, A484 with the sleep's flags (the hard power state), A115 and A500's sleep
  * form.
  */
+/*
+ * DIAGNOSTIC (T6030 with its PMP running): with it off, the early stop leaves out the display
+ * stage and the plain power-off and goes straight to the sleep's own calls, as macOS's system
+ * sleep sends them to a DCP whose display is already off. The PMP crashed with "PTD abort"
+ * during the plain power-off (p20-hv-stop-493f-1).
+ */
+static bool v27_early_soft_off = true;
+module_param(v27_early_soft_off, bool, 0644);
+MODULE_PARM_DESC(v27_early_soft_off, "DIAGNOSTIC: V27 early stop: the display stage and plain A484 off before the sleep's calls (default Y)");
+
 static int dcp_v27_early_calls_off(struct apple_dcp *dcp, struct dcp_v27_early *e)
 {
-	int ret;
+	int ret = 0;
 
-	ret = dcp_v27_early_step(e, "stage", dcp_v27_early_stage(dcp));
-	if (!ret)
-		ret = dcp_v27_early_step(e, "plain-off", iomfb_v27_sleep_plain(dcp, false));
+	if (READ_ONCE(v27_early_soft_off)) {
+		ret = dcp_v27_early_step(e, "stage", dcp_v27_early_stage(dcp));
+		if (!ret)
+			ret = dcp_v27_early_step(e, "plain-off",
+						 iomfb_v27_sleep_plain(dcp, false));
+	}
 	if (!ret)
 		ret = dcp_v27_early_step(e, "A500-wake", iomfb_v27_sleep_rpc(dcp, true, true));
 	if (!ret)
