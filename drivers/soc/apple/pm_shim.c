@@ -311,7 +311,7 @@ static int sep_pm_commit_stop(void *data)
 	if (ret)
 		goto out;
 	c->sent = true;
-	while (!c->answered && !((c->state = readl(c->ps)) & SEP_PS_DEV_DISABLE) &&
+	while (!c->answered && !sep_ps_down(c->state = readl(c->ps)) &&
 	       c->answer_us < SEP_PM_TIMEOUT_US) {
 		ret = apple_mbox_poll_one(c->mbox);
 		if (ret < 0)
@@ -330,8 +330,17 @@ out:
 		return ret;
 	}
 	/* Preserve the failure reason without another hardware query. */
-	if (ret >= 0 && !c->answered)
-		ret = c->state & SEP_PS_DEV_DISABLE ? -EHOSTDOWN : -ETIMEDOUT;
+	if (ret >= 0 && !c->answered) {
+		if (c->state & SEP_PS_DEV_DISABLE)
+			ret = -EHOSTDOWN;
+		else if (FIELD_GET(SEP_PS_ACTUAL, c->state))
+			ret = -ETIMEDOUT;
+		/*
+		 * Otherwise the domain reads off without DEV_DISABLE: it took
+		 * the request and gated before the answer was polled for. Never
+		 * in place of an answer that reports an error.
+		 */
+	}
 	if (c->answered && c->reply_result)
 		ret = -EREMOTEIO;
 	/* Native cmsgSLEEP errors/abort/timeout are fatal, never cancellation. */
