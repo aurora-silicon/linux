@@ -537,7 +537,8 @@ static void dcp_hdcp_run(struct dcp_hdcp *h)
 		ret = -ENODEV;
 	}
 	if (ret) {
-		dev_info(h->dcp->dev, "HDCP: authentication failed: %d\n", ret);
+		dev_info(h->dcp->dev, "HDCP: authentication failed at %s: %d\n",
+			 h->tx.step ?: "start", ret);
 		dcp_hdcp_abort(&h->tx);
 	} else {
 		dev_info(h->dcp->dev, "HDCP: encrypted, type %u%s\n", h->tx.type,
@@ -877,7 +878,11 @@ static const struct apple_epic_service_ops dcp_hdcp_service_ops[] = {
 	{
 		.name = "dcpdptx-hdcp-auth-session",
 		.compact_full = "dcpdptx-hdcp-auth-session",
-		.singleton = true,
+		/*
+		 * Not a singleton: DCP announces one session per protocol
+		 * version and closes each before it powers down, so every
+		 * one needs its handler to answer.
+		 */
 		.init = dcp_hdcp_session_init,
 		.call_v2 = dcp_hdcp_session_call,
 		.teardown = dcp_hdcp_session_teardown,

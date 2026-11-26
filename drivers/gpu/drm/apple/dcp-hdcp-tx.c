@@ -8,8 +8,12 @@
 
 #include "dcp-hdcp-tx.h"
 
-#define TX_READ(tx, reg, buf, len) ((tx)->ops->read((tx)->ctx, reg, buf, len))
-#define TX_WRITE(tx, reg, buf, len) ((tx)->ops->write((tx)->ctx, reg, buf, len))
+/* Each step names itself, so a failed attempt says where it stopped. */
+#define TX_READ(tx, reg, buf, len) \
+	((tx)->step = "read " #reg, (tx)->ops->read((tx)->ctx, reg, buf, len))
+#define TX_WRITE(tx, reg, buf, len) \
+	((tx)->step = "write " #reg, (tx)->ops->write((tx)->ctx, reg, buf, len))
+#define TX_SEP(tx, fn) ((tx)->step = #fn, (tx)->ops->fn)
 
 static void tx_report(struct dcp_hdcp_tx *tx, enum dcp_hdcp_progress_code code,
 		      bool encrypted)
@@ -27,6 +31,7 @@ static int tx_wait(struct dcp_hdcp_tx *tx, enum dcp_hdcp_auth_op op,
 	u8 status;
 	int ret;
 
+	tx->step = "wait for DCP event";
 	ret = tx->ops->wait(tx->ctx, op, spec_ms + DCP_HDCP_EVENT_SLACK_MS);
 	if (ret != -ETIMEDOUT)
 		return ret;
@@ -73,7 +78,7 @@ static int tx_ake(struct dcp_hdcp_tx *tx, bool *stored)
 	u8 ekh_km[HDCP_2_2_E_KH_KM_LEN];
 	int ret;
 
-	ret = tx->ops->sep_open(tx->ctx, tx->channel, rtx);
+	ret = TX_SEP(tx, sep_open)(tx->ctx, tx->channel, rtx);
 	if (ret)
 		return ret;
 	tx->sep_open = true;
@@ -106,7 +111,7 @@ static int tx_ake(struct dcp_hdcp_tx *tx, bool *stored)
 	ret = tx_revocation(tx, tx->cert.receiver_id, 1);
 	if (ret)
 		return ret;
-	ret = tx->ops->sep_ake_cert(tx->ctx, tx->channel, (const u8 *)&tx->cert,
+	ret = TX_SEP(tx, sep_ake_cert)(tx->ctx, tx->channel, (const u8 *)&tx->cert,
 				    tx->rrx, stored, ekh_km_m, ekpub_km);
 	if (ret)
 		return ret;
@@ -130,7 +135,7 @@ static int tx_ake(struct dcp_hdcp_tx *tx, bool *stored)
 		ret = TX_READ(tx, DP_HDCP_2_2_REG_HPRIME_OFFSET, h_prime,
 			      sizeof(h_prime));
 	if (!ret)
-		ret = tx->ops->sep_h_prime(tx->ctx, tx->channel, tx->rxcaps,
+		ret = TX_SEP(tx, sep_h_prime)(tx->ctx, tx->channel, tx->rxcaps,
 					   (const u8 *)&tx->txcaps, h_prime);
 	if (ret)
 		return ret;
@@ -144,7 +149,7 @@ static int tx_ake(struct dcp_hdcp_tx *tx, bool *stored)
 		ret = TX_READ(tx, DP_HDCP_2_2_REG_EKH_KM_RD_OFFSET, ekh_km,
 			      sizeof(ekh_km));
 	if (!ret)
-		ret = tx->ops->sep_pairing(tx->ctx, tx->channel, ekh_km);
+		ret = TX_SEP(tx, sep_pairing)(tx->ctx, tx->channel, ekh_km);
 	return ret;
 }
 
@@ -161,7 +166,7 @@ static int tx_lc_ske(struct dcp_hdcp_tx *tx)
 	 * wrong L' is retried with a fresh r_n, a bounded number of times.
 	 */
 	for (attempt = 0; attempt < DCP_HDCP_LC_TRIES; attempt++) {
-		ret = tx->ops->sep_lc_init(tx->ctx, tx->channel, rn);
+		ret = TX_SEP(tx, sep_lc_init)(tx->ctx, tx->channel, rn);
 		if (!ret)
 			ret = TX_WRITE(tx, DP_HDCP_2_2_REG_RN_OFFSET, rn, sizeof(rn));
 		if (ret)
@@ -170,7 +175,7 @@ static int tx_lc_ske(struct dcp_hdcp_tx *tx)
 		ret = TX_READ(tx, DP_HDCP_2_2_REG_LPRIME_OFFSET, l_prime,
 			      sizeof(l_prime));
 		if (!ret)
-			ret = tx->ops->sep_l_prime(tx->ctx, tx->channel, l_prime);
+			ret = TX_SEP(tx, sep_l_prime)(tx->ctx, tx->channel, l_prime);
 		if (ret != -EACCES)
 			break;
 	}
@@ -178,7 +183,7 @@ static int tx_lc_ske(struct dcp_hdcp_tx *tx)
 		return ret;
 
 	/* SKE_Send_Eks */
-	ret = tx->ops->sep_ske(tx->ctx, tx->channel, edkey_ks, riv);
+	ret = TX_SEP(tx, sep_ske)(tx->ctx, tx->channel, edkey_ks, riv);
 	if (!ret)
 		ret = TX_WRITE(tx, DP_HDCP_2_2_REG_EDKEY_KS_OFFSET, edkey_ks,
 			       sizeof(edkey_ks));
@@ -234,7 +239,7 @@ static int tx_receiver_list(struct dcp_hdcp_tx *tx)
 	ret = tx_revocation(tx, tx->ids, count);
 	if (ret)
 		return ret;
-	ret = tx->ops->sep_repeater_list(tx->ctx, tx->channel, tx->ids, count,
+	ret = TX_SEP(tx, sep_repeater_list)(tx->ctx, tx->channel, tx->ids, count,
 					 rxinfo, seq_num_v, v_prime, v);
 	if (ret)
 		return ret;
@@ -277,7 +282,7 @@ static int tx_stream_manage(struct dcp_hdcp_tx *tx)
 			      sizeof(m_prime));
 		if (ret)
 			return ret;
-		ret = tx->ops->sep_repeater_stream(tx->ctx, tx->channel, 0,
+		ret = TX_SEP(tx, sep_repeater_stream)(tx->ctx, tx->channel, 0,
 						   tx->type, msg, m_prime);
 		tx->seq_num_m++;
 	}
@@ -291,6 +296,7 @@ int dcp_hdcp_authenticate(struct dcp_hdcp_tx *tx)
 	bool stored = false;
 	int ret;
 
+	tx->step = NULL;
 	if (tx->type > 1)
 		return -EINVAL;
 	tx->repeater = false;
@@ -320,12 +326,12 @@ int dcp_hdcp_authenticate(struct dcp_hdcp_tx *tx)
 		return ret;
 
 	/* Encryption no sooner than 200 ms after SKE_Send_Eks. */
-	ret = tx->ops->sep_finish(tx->ctx, tx->channel);
+	ret = TX_SEP(tx, sep_finish)(tx->ctx, tx->channel);
 	if (ret)
 		return ret;
 	tx->ops->sleep(tx->ctx, HDCP_2_2_DELAY_BEFORE_ENCRYPTION_EN);
 	tx->encrypting = true;
-	ret = tx->ops->sep_set_encryption(tx->ctx, tx->channel, true);
+	ret = TX_SEP(tx, sep_set_encryption)(tx->ctx, tx->channel, true);
 	if (ret)
 		return ret;
 	tx_report(tx, DCP_HDCP_PROGRESS_ENCRYPTED, true);
@@ -335,10 +341,10 @@ int dcp_hdcp_authenticate(struct dcp_hdcp_tx *tx)
 void dcp_hdcp_abort(struct dcp_hdcp_tx *tx)
 {
 	if (tx->encrypting)
-		tx->ops->sep_set_encryption(tx->ctx, tx->channel, false);
+		TX_SEP(tx, sep_set_encryption)(tx->ctx, tx->channel, false);
 	tx->encrypting = false;
 	if (tx->sep_open)
-		tx->ops->sep_close(tx->ctx, tx->channel);
+		TX_SEP(tx, sep_close)(tx->ctx, tx->channel);
 	tx->sep_open = false;
 }
 
