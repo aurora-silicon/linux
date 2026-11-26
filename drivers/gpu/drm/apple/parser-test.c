@@ -1428,8 +1428,9 @@ static void parser_panel_identity(struct kunit *test)
 	struct dcp_parse_ctx ctx;
 	const struct drm_edid *edid;
 	const struct edid *raw;
-	struct dcp_display_mode modes[2] = {};
+	struct dcp_display_mode *modes = kunit_kcalloc(test, 2, sizeof(*modes), GFP_KERNEL);
 
+	KUNIT_ASSERT_NOT_NULL(test, modes);
 	modes[0].mode = (struct drm_display_mode) {
 		.clock = 540005, .hdisplay = 3456, .hsync_start = 3500,
 		.hsync_end = 3550, .htotal = 4000, .vdisplay = 2160,
@@ -1457,7 +1458,7 @@ static void parser_panel_identity(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, parse(blob->data, blob->size, &ctx), 0);
 	KUNIT_ASSERT_EQ(test, parse_panel_metadata(&ctx, &metadata), 0);
 	KUNIT_EXPECT_STREQ(test, metadata.name, "Synthetic Int");
-	edid = dcp_panel_edid(&metadata, NULL, modes, ARRAY_SIZE(modes), 345, 223);
+	edid = dcp_panel_edid(&metadata, NULL, modes, 2, 345, 223);
 	KUNIT_ASSERT_FALSE(test, IS_ERR(edid));
 	KUNIT_EXPECT_TRUE(test, drm_edid_valid(edid));
 	raw = drm_edid_raw(edid);
@@ -1790,6 +1791,7 @@ static void parser_panel_of_dimensions(struct kunit *test)
 static void parser_panel_publication(struct kunit *test,
 				     enum dcp_firmware_version fw_compat, bool desktop_state)
 {
+	const size_t adt_capacity = 512;
 	const char *gamut = fw_compat == DCP_FIRMWARE_H17P ? "sRGB" : "P3";
 	struct apple_dcp *dcp = kunit_kzalloc(test, sizeof(*dcp), GFP_KERNEL);
 	struct dcp_desktop_state *desktop = kunit_kzalloc(test, sizeof(*desktop), GFP_KERNEL);
@@ -1802,7 +1804,7 @@ static void parser_panel_publication(struct kunit *test,
 	};
 	struct dcp_panel_adt before = panel;
 	__le32 matrix[10];
-	u8 adt[512];
+	u8 *adt = kunit_kmalloc(test, adt_capacity, GFP_KERNEL);
 	size_t adt_size;
 	struct device *dev = drm_kunit_helper_alloc_device(test);
 	struct drm_device *drm;
@@ -1820,11 +1822,12 @@ static void parser_panel_publication(struct kunit *test,
 	KUNIT_ASSERT_NOT_NULL(test, id);
 	KUNIT_ASSERT_NOT_NULL(test, pipeline);
 	KUNIT_ASSERT_NOT_NULL(test, connector);
+	KUNIT_ASSERT_NOT_NULL(test, adt);
 	ret = drmm_connector_init(drm, &connector->base, &parser_route_connector_funcs,
 				  DRM_MODE_CONNECTOR_eDP, NULL);
 	KUNIT_ASSERT_EQ(test, ret, 0);
 	parser_adt_synthetic_matrix(matrix, 1 << 20);
-	adt_size = parser_adt_color_fixture(adt, sizeof(adt), gamut, strlen(gamut) + 1,
+	adt_size = parser_adt_color_fixture(adt, adt_capacity, gamut, strlen(gamut) + 1,
 					    matrix, sizeof(matrix));
 	KUNIT_ASSERT_GT(test, adt_size, (size_t)0);
 	ret = dcp_panel_adt_parse(adt, adt_size, &panel);
@@ -2028,12 +2031,13 @@ static void parser_desktop_metadata_timing(struct kunit *test)
  */
 static void parser_internal_v27_only_120hz(struct kunit *test)
 {
-	struct dcp_display_mode catalog[2] = {};
+	struct dcp_display_mode *catalog = kunit_kcalloc(test, 2, sizeof(*catalog), GFP_KERNEL);
 	struct apple_dcp *dcp = kunit_kzalloc(test, sizeof(*dcp), GFP_KERNEL);
 	struct platform_device *pipeline = kunit_kzalloc(test, sizeof(*pipeline), GFP_KERNEL);
 	struct apple_connector *connector = kunit_kzalloc(test, sizeof(*connector), GFP_KERNEL);
 	unsigned int i;
 
+	KUNIT_ASSERT_NOT_NULL(test, catalog);
 	KUNIT_ASSERT_NOT_NULL(test, dcp);
 	KUNIT_ASSERT_NOT_NULL(test, pipeline);
 	KUNIT_ASSERT_NOT_NULL(test, connector);

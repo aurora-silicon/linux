@@ -56,6 +56,30 @@
 };
 
 /*
+ * The AOP, with its RTKit mailbox, its DART and the audio DMA controller, booted over the RTKit
+ * mailbox alone. This board's AOP firmware does not service the setup port: started through both,
+ * it sends nothing there and leaves the AP's message unread. The setup mailbox stays described,
+ * disabled.
+ */
+&aop_mbox {
+	status = "okay";
+};
+
+&aop_dart {
+	status = "okay";
+};
+
+&admac_base_ns {
+	status = "okay";
+};
+
+&aop {
+	mboxes = <&aop_mbox>;
+	mbox-names = "mbox";
+	status = "okay";
+};
+
+/*
  * PCIe ports 2 (the onboard 10 Gb Ethernet) and 3 (the rear USB-A xHCI). The boot loader
  * powers and trains both links; it disables a port, and its DART, whose link did not come up.
  *
