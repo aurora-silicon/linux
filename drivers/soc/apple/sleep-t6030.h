@@ -282,6 +282,10 @@ struct t6030_sleep {
 	/* The DISPEXT1 power gate as the entry found it */
 	u32 gate_dispext1_saved;
 	bool gate_dispext1_staged;
+	/* The memory side brought to macOS's configured state (apple_sleep.mem_config) */
+	bool mem_configured;
+	void __iomem *mem_va[24];
+	u64 mem_page[24];
 };
 
 static struct apple_sleep_smc_policy t6030_smc_policy;
@@ -929,6 +933,414 @@ static void t6030_sleep_late_entry(struct apple_sleep *s)
 	sleep_ps_lower(s, T6030_PS_SPI2);
 }
 
+/*
+ * DIAGNOSTIC: the memory side in macOS's configured state. Under Linux on J516s the AMCC's SLC way
+ * words, way masks and plane stage words, the DCS's +0x580..0x63c words, the AMCC planes' +0x27000
+ * words read 0, and the DCS channels' +0x18 reads 0x70a0100: iBoot leaves them so. macOS 27.2 runs
+ * with them configured: its entry clears them (apple,seq-commit copies that) and its wake sets
+ * them again. These are its wake's writes, in its order, every run alike, 9.36 to 10.90 ms after
+ * the reset (ref/t6030-macos-s2r-fixed-sequence.tsv): each AMCC0 plane's way words then that
+ * way's mask bit; each AMCC plane's stage words, 0 to 1 to 3; the DCS's words, +0x580 = 0x71 and
+ * +0x584's bits up to 0x1ff, then +0x588 = 0x100, 0x1, 0x1001, 0x11; the planes' +0x27000 words;
+ * and each DCS channel's +0x18 = 0x70a1100, the value macOS reads back and writes at its wake
+ * (wake-full-1: all twelve). The SoC perf word gets bits 15:12 = 4, as macOS's reads hold it
+ * (0x4222 against Linux's 0x1222), read-modify-write as macOS's -2.68 ms step.
+ *
+ * apple_sleep.mem_config=1 does all of it once, at run time, and reports what reads back. Its
+ * tail, from the +0x27000 words, is done again at the wake.
+ */
+struct t6030_mem_write {
+	u64 pa;
+	u8 width;
+	u64 val;
+};
+
+static const struct t6030_mem_write t6030_mem_config[] = {
+	{ 0x220024010ULL, 64, 0x110000100501000ULL },
+	{ 0x220024018ULL, 64, 0xff000000000ULL },
+	{ 0x220024000ULL, 64, 0x1ULL },
+	{ 0x220024020ULL, 64, 0x210000100501000ULL },
+	{ 0x220024028ULL, 64, 0xff000000000ULL },
+	{ 0x220024000ULL, 64, 0x3ULL },
+	{ 0x220024030ULL, 64, 0x110000000500000ULL },
+	{ 0x220024038ULL, 64, 0xff000000000ULL },
+	{ 0x220024000ULL, 64, 0x7ULL },
+	{ 0x220024040ULL, 64, 0x210000000500000ULL },
+	{ 0x220024048ULL, 64, 0xff000000000ULL },
+	{ 0x220024000ULL, 64, 0xfULL },
+	{ 0x220024050ULL, 64, 0x11000311492a100ULL },
+	{ 0x220024058ULL, 64, 0xff000000000ULL },
+	{ 0x220024000ULL, 64, 0x1fULL },
+	{ 0x220024060ULL, 64, 0x21000311492a100ULL },
+	{ 0x220024068ULL, 64, 0xff000000000ULL },
+	{ 0x220024000ULL, 64, 0x3fULL },
+	{ 0x220024070ULL, 64, 0x11000121c4121c0ULL },
+	{ 0x220024078ULL, 64, 0xff000000000ULL },
+	{ 0x220024000ULL, 64, 0x7fULL },
+	{ 0x220024080ULL, 64, 0x21000121c4121c0ULL },
+	{ 0x220024088ULL, 64, 0xff000000000ULL },
+	{ 0x220024000ULL, 64, 0xffULL },
+	{ 0x220024090ULL, 64, 0x110001129b11280ULL },
+	{ 0x220024098ULL, 64, 0xff000000000ULL },
+	{ 0x220024000ULL, 64, 0x1ffULL },
+	{ 0x2200240a0ULL, 64, 0x210001129b11280ULL },
+	{ 0x2200240a8ULL, 64, 0xff000000000ULL },
+	{ 0x220024000ULL, 64, 0x3ffULL },
+	{ 0x2200240b0ULL, 64, 0x110001048310480ULL },
+	{ 0x2200240b8ULL, 64, 0xff000000000ULL },
+	{ 0x220024000ULL, 64, 0x7ffULL },
+	{ 0x2200240c0ULL, 64, 0x210001048310480ULL },
+	{ 0x2200240c8ULL, 64, 0xff000000000ULL },
+	{ 0x220024000ULL, 64, 0xfffULL },
+	{ 0x2200240d0ULL, 64, 0x110001263c12600ULL },
+	{ 0x2200240d8ULL, 64, 0xff000000000ULL },
+	{ 0x220024000ULL, 64, 0x1fffULL },
+	{ 0x2200240e0ULL, 64, 0x210001263c12600ULL },
+	{ 0x2200240e8ULL, 64, 0xff000000000ULL },
+	{ 0x220024000ULL, 64, 0x3fffULL },
+	{ 0x2200240f0ULL, 64, 0x11000104c5104c0ULL },
+	{ 0x2200240f8ULL, 64, 0xff000000000ULL },
+	{ 0x220024000ULL, 64, 0x7fffULL },
+	{ 0x220024100ULL, 64, 0x21000104c5104c0ULL },
+	{ 0x220024108ULL, 64, 0xff000000000ULL },
+	{ 0x220024000ULL, 64, 0xffffULL },
+	{ 0x220064010ULL, 64, 0x11000106c9106c0ULL },
+	{ 0x220064018ULL, 64, 0xff000000000ULL },
+	{ 0x220064000ULL, 64, 0x1ULL },
+	{ 0x220064020ULL, 64, 0x21000106c9106c0ULL },
+	{ 0x220064028ULL, 64, 0xff000000000ULL },
+	{ 0x220064000ULL, 64, 0x3ULL },
+	{ 0x220064030ULL, 64, 0x110001018410180ULL },
+	{ 0x220064038ULL, 64, 0xff000000000ULL },
+	{ 0x220064000ULL, 64, 0x7ULL },
+	{ 0x220064040ULL, 64, 0x210001018410180ULL },
+	{ 0x220064048ULL, 64, 0xff000000000ULL },
+	{ 0x220064000ULL, 64, 0xfULL },
+	{ 0x220064050ULL, 64, 0x110001131411300ULL },
+	{ 0x220064058ULL, 64, 0xff000000000ULL },
+	{ 0x220064000ULL, 64, 0x1fULL },
+	{ 0x220064060ULL, 64, 0x210001131411300ULL },
+	{ 0x220064068ULL, 64, 0xff000000000ULL },
+	{ 0x220064000ULL, 64, 0x3fULL },
+	{ 0x220064070ULL, 64, 0x110001135411340ULL },
+	{ 0x220064078ULL, 64, 0xff000000000ULL },
+	{ 0x220064000ULL, 64, 0x7fULL },
+	{ 0x220064080ULL, 64, 0x210001135411340ULL },
+	{ 0x220064088ULL, 64, 0xff000000000ULL },
+	{ 0x220064000ULL, 64, 0xffULL },
+	{ 0x220064090ULL, 64, 0x110001371e13700ULL },
+	{ 0x220064098ULL, 64, 0xff000000000ULL },
+	{ 0x220064000ULL, 64, 0x1ffULL },
+	{ 0x2200640a0ULL, 64, 0x210001371e13700ULL },
+	{ 0x2200640a8ULL, 64, 0xff000000000ULL },
+	{ 0x220064000ULL, 64, 0x3ffULL },
+	{ 0x2200640b0ULL, 64, 0x110001375e13740ULL },
+	{ 0x2200640b8ULL, 64, 0xff000000000ULL },
+	{ 0x220064000ULL, 64, 0x7ffULL },
+	{ 0x2200640c0ULL, 64, 0x210001375e13740ULL },
+	{ 0x2200640c8ULL, 64, 0xff000000000ULL },
+	{ 0x220064000ULL, 64, 0xfffULL },
+	{ 0x2200640d0ULL, 64, 0x110001379e13780ULL },
+	{ 0x2200640d8ULL, 64, 0xff000000000ULL },
+	{ 0x220064000ULL, 64, 0x1fffULL },
+	{ 0x2200640e0ULL, 64, 0x210001379e13780ULL },
+	{ 0x2200640e8ULL, 64, 0xff000000000ULL },
+	{ 0x220064000ULL, 64, 0x3fffULL },
+	{ 0x2200640f0ULL, 64, 0x11000137de137c0ULL },
+	{ 0x2200640f8ULL, 64, 0xff000000000ULL },
+	{ 0x220064000ULL, 64, 0x7fffULL },
+	{ 0x220064100ULL, 64, 0x21000137de137c0ULL },
+	{ 0x220064108ULL, 64, 0xff000000000ULL },
+	{ 0x220064000ULL, 64, 0xffffULL },
+	{ 0x2200a4010ULL, 64, 0x110001359713580ULL },
+	{ 0x2200a4018ULL, 64, 0xff000000000ULL },
+	{ 0x2200a4000ULL, 64, 0x1ULL },
+	{ 0x2200a4020ULL, 64, 0x210001359713580ULL },
+	{ 0x2200a4028ULL, 64, 0xff000000000ULL },
+	{ 0x2200a4000ULL, 64, 0x3ULL },
+	{ 0x2200a4030ULL, 64, 0x110001364713640ULL },
+	{ 0x2200a4038ULL, 64, 0xff000000000ULL },
+	{ 0x2200a4000ULL, 64, 0x7ULL },
+	{ 0x2200a4040ULL, 64, 0x210001364713640ULL },
+	{ 0x2200a4048ULL, 64, 0xff000000000ULL },
+	{ 0x2200a4000ULL, 64, 0xfULL },
+	{ 0x2200a4050ULL, 64, 0x11000102e9102c0ULL },
+	{ 0x2200a4058ULL, 64, 0xff000000000ULL },
+	{ 0x2200a4000ULL, 64, 0x1fULL },
+	{ 0x2200a4060ULL, 64, 0x21000102e9102c0ULL },
+	{ 0x2200a4068ULL, 64, 0xff000000000ULL },
+	{ 0x2200a4000ULL, 64, 0x3fULL },
+	{ 0x2200a4070ULL, 64, 0x110001340413400ULL },
+	{ 0x2200a4078ULL, 64, 0xff000000000ULL },
+	{ 0x2200a4000ULL, 64, 0x7fULL },
+	{ 0x2200a4080ULL, 64, 0x210001340413400ULL },
+	{ 0x2200a4088ULL, 64, 0xff000000000ULL },
+	{ 0x2200a4000ULL, 64, 0xffULL },
+	{ 0x2200a4090ULL, 64, 0x110001251012500ULL },
+	{ 0x2200a4098ULL, 64, 0xff000000000ULL },
+	{ 0x2200a4000ULL, 64, 0x1ffULL },
+	{ 0x2200a40a0ULL, 64, 0x210001251012500ULL },
+	{ 0x2200a40a8ULL, 64, 0xff000000000ULL },
+	{ 0x2200a4000ULL, 64, 0x3ffULL },
+	{ 0x2200a40b0ULL, 64, 0x110001120811200ULL },
+	{ 0x2200a40b8ULL, 64, 0xff000000000ULL },
+	{ 0x2200a4000ULL, 64, 0x7ffULL },
+	{ 0x2200a40c0ULL, 64, 0x210001120811200ULL },
+	{ 0x2200a40c8ULL, 64, 0xff000000000ULL },
+	{ 0x2200a4000ULL, 64, 0xfffULL },
+	{ 0x2200a40d0ULL, 64, 0x11000126bf12680ULL },
+	{ 0x2200a40d8ULL, 64, 0xff000000000ULL },
+	{ 0x2200a4000ULL, 64, 0x1fffULL },
+	{ 0x2200a40e0ULL, 64, 0x21000126bf12680ULL },
+	{ 0x2200a40e8ULL, 64, 0xff000000000ULL },
+	{ 0x2200a4000ULL, 64, 0x3fffULL },
+	{ 0x220024858ULL, 64, 0x100000000500000ULL },
+	{ 0x220024810ULL, 64, 0x103fff00000000ULL },
+	{ 0x220024860ULL, 64, 0xff000000000ULL },
+	{ 0x220024800ULL, 64, 0x1ULL },
+	{ 0x220024868ULL, 64, 0x200000000500000ULL },
+	{ 0x220024870ULL, 64, 0xff000000000ULL },
+	{ 0x220024800ULL, 64, 0x3ULL },
+	{ 0x220064858ULL, 64, 0x10000311492a100ULL },
+	{ 0x220064810ULL, 64, 0x103fff00000000ULL },
+	{ 0x220064860ULL, 64, 0xff000000000ULL },
+	{ 0x220064800ULL, 64, 0x1ULL },
+	{ 0x220064868ULL, 64, 0x20000311492a100ULL },
+	{ 0x220064870ULL, 64, 0xff000000000ULL },
+	{ 0x220064800ULL, 64, 0x3ULL },
+	{ 0x2200a4858ULL, 64, 0x100003ffff00000ULL },
+	{ 0x2200a4810ULL, 64, 0x103fff00000000ULL },
+	{ 0x2200a4860ULL, 64, 0xff000000000ULL },
+	{ 0x2200a4800ULL, 64, 0x1ULL },
+	{ 0x2200a4868ULL, 64, 0x200003ffff00000ULL },
+	{ 0x2200a4870ULL, 64, 0xff000000000ULL },
+	{ 0x2200a4800ULL, 64, 0x3ULL },
+	{ 0x222024858ULL, 64, 0x100001129b11280ULL },
+	{ 0x222024810ULL, 64, 0x103fff00000000ULL },
+	{ 0x222024860ULL, 64, 0xff000000000ULL },
+	{ 0x222024800ULL, 64, 0x1ULL },
+	{ 0x222024868ULL, 64, 0x200001129b11280ULL },
+	{ 0x222024870ULL, 64, 0xff000000000ULL },
+	{ 0x222024800ULL, 64, 0x3ULL },
+	{ 0x222064858ULL, 64, 0x100001251012500ULL },
+	{ 0x222064810ULL, 64, 0x103fff00000000ULL },
+	{ 0x222064860ULL, 64, 0xff000000000ULL },
+	{ 0x222064800ULL, 64, 0x1ULL },
+	{ 0x222064868ULL, 64, 0x200001251012500ULL },
+	{ 0x222064870ULL, 64, 0xff000000000ULL },
+	{ 0x222064800ULL, 64, 0x3ULL },
+	{ 0x2220a4858ULL, 64, 0x100001120811200ULL },
+	{ 0x2220a4810ULL, 64, 0x103fff00000000ULL },
+	{ 0x2220a4860ULL, 64, 0xff000000000ULL },
+	{ 0x2220a4800ULL, 64, 0x1ULL },
+	{ 0x2220a4868ULL, 64, 0x200001120811200ULL },
+	{ 0x2220a4870ULL, 64, 0xff000000000ULL },
+	{ 0x2220a4800ULL, 64, 0x3ULL },
+	{ 0x22040058cULL, 32, 0x3ff001aULL },
+	{ 0x220400590ULL, 32, 0x0ULL },
+	{ 0x220400594ULL, 32, 0x33ULL },
+	{ 0x220400598ULL, 32, 0x0ULL },
+	{ 0x22040059cULL, 32, 0x0ULL },
+	{ 0x220400580ULL, 32, 0x71ULL },
+	{ 0x220400584ULL, 32, 0x1ULL },
+	{ 0x2204005a0ULL, 32, 0x3ff0039ULL },
+	{ 0x2204005a4ULL, 32, 0x0ULL },
+	{ 0x2204005a8ULL, 32, 0x33ULL },
+	{ 0x2204005acULL, 32, 0x0ULL },
+	{ 0x2204005b0ULL, 32, 0x0ULL },
+	{ 0x220400580ULL, 32, 0x71ULL },
+	{ 0x220400584ULL, 32, 0x3ULL },
+	{ 0x2204005b4ULL, 32, 0x3ff003aULL },
+	{ 0x2204005b8ULL, 32, 0x0ULL },
+	{ 0x2204005bcULL, 32, 0x33ULL },
+	{ 0x2204005c0ULL, 32, 0x0ULL },
+	{ 0x2204005c4ULL, 32, 0x0ULL },
+	{ 0x220400580ULL, 32, 0x71ULL },
+	{ 0x220400584ULL, 32, 0x7ULL },
+	{ 0x2204005c8ULL, 32, 0x3ff0013ULL },
+	{ 0x2204005ccULL, 32, 0x0ULL },
+	{ 0x2204005d0ULL, 32, 0x0ULL },
+	{ 0x2204005d4ULL, 32, 0x0ULL },
+	{ 0x2204005d8ULL, 32, 0x0ULL },
+	{ 0x220400580ULL, 32, 0x71ULL },
+	{ 0x220400584ULL, 32, 0xfULL },
+	{ 0x2204005dcULL, 32, 0x3ff0016ULL },
+	{ 0x2204005e0ULL, 32, 0x0ULL },
+	{ 0x2204005e4ULL, 32, 0x0ULL },
+	{ 0x2204005e8ULL, 32, 0x0ULL },
+	{ 0x2204005ecULL, 32, 0x0ULL },
+	{ 0x220400580ULL, 32, 0x71ULL },
+	{ 0x220400584ULL, 32, 0x1fULL },
+	{ 0x2204005f0ULL, 32, 0x3ff001aULL },
+	{ 0x2204005f4ULL, 32, 0x0ULL },
+	{ 0x2204005f8ULL, 32, 0x31ULL },
+	{ 0x2204005fcULL, 32, 0x0ULL },
+	{ 0x220400600ULL, 32, 0x0ULL },
+	{ 0x220400580ULL, 32, 0x71ULL },
+	{ 0x220400584ULL, 32, 0x3fULL },
+	{ 0x220400604ULL, 32, 0x3ff001aULL },
+	{ 0x220400608ULL, 32, 0x0ULL },
+	{ 0x22040060cULL, 32, 0x32ULL },
+	{ 0x220400610ULL, 32, 0x0ULL },
+	{ 0x220400614ULL, 32, 0x0ULL },
+	{ 0x220400580ULL, 32, 0x71ULL },
+	{ 0x220400584ULL, 32, 0x7fULL },
+	{ 0x220400618ULL, 32, 0x3ff0012ULL },
+	{ 0x22040061cULL, 32, 0x0ULL },
+	{ 0x220400620ULL, 32, 0x33ULL },
+	{ 0x220400624ULL, 32, 0x0ULL },
+	{ 0x220400628ULL, 32, 0x0ULL },
+	{ 0x220400580ULL, 32, 0x71ULL },
+	{ 0x220400584ULL, 32, 0xffULL },
+	{ 0x22040062cULL, 32, 0x3ff0014ULL },
+	{ 0x220400630ULL, 32, 0x0ULL },
+	{ 0x220400634ULL, 32, 0x33ULL },
+	{ 0x220400638ULL, 32, 0x0ULL },
+	{ 0x22040063cULL, 32, 0x0ULL },
+	{ 0x220400580ULL, 32, 0x71ULL },
+	{ 0x220400584ULL, 32, 0x1ffULL },
+	{ 0x220400588ULL, 32, 0x100ULL },
+	{ 0x220400588ULL, 32, 0x1ULL },
+	{ 0x220400588ULL, 32, 0x1001ULL },
+	{ 0x220400588ULL, 32, 0x11ULL },
+	{ 0x220027018ULL, 64, 0x10000000ULL },
+	{ 0x220027008ULL, 64, 0x700ULL },
+	{ 0x220027000ULL, 64, 0x11ULL },
+	{ 0x220067008ULL, 64, 0x708ULL },
+	{ 0x220067000ULL, 64, 0x1ULL },
+	{ 0x2200a7008ULL, 64, 0x710ULL },
+	{ 0x2200a7000ULL, 64, 0x1ULL },
+	{ 0x222027008ULL, 64, 0x718ULL },
+	{ 0x222027000ULL, 64, 0x1ULL },
+	{ 0x220400018ULL, 32, 0x70a1100ULL },
+	{ 0x220600018ULL, 32, 0x70a1100ULL },
+	{ 0x220800018ULL, 32, 0x70a1100ULL },
+	{ 0x220a00018ULL, 32, 0x70a1100ULL },
+	{ 0x220c00018ULL, 32, 0x70a1100ULL },
+	{ 0x220e00018ULL, 32, 0x70a1100ULL },
+	{ 0x222400018ULL, 32, 0x70a1100ULL },
+	{ 0x222600018ULL, 32, 0x70a1100ULL },
+	{ 0x222800018ULL, 32, 0x70a1100ULL },
+	{ 0x222a00018ULL, 32, 0x70a1100ULL },
+	{ 0x222c00018ULL, 32, 0x70a1100ULL },
+	{ 0x222e00018ULL, 32, 0x70a1100ULL },
+};
+
+/* The +0x27000 words and the DCS channels' +0x18, which the wake's apple,seq-wake lacks */
+#define T6030_MEM_CONFIG_TAIL		247
+#define T6030_MEM_PAGE			SZ_16K
+#define T6030_MEM_PAGES			24
+#define T6030_PERF_SOC_HI		GENMASK(15, 12)
+#define T6030_PERF_SOC_HI_MACOS		4
+
+/* A register of the table: its page mapped once, in process context (@map), kept for the wake */
+static void __iomem *t6030_mem_reg(struct t6030_sleep *t, u64 pa, bool map)
+{
+	u64 p = pa & ~(u64)(T6030_MEM_PAGE - 1);
+	int i;
+
+	for (i = 0; i < T6030_MEM_PAGES && t->mem_va[i]; i++)
+		if (t->mem_page[i] == p)
+			return t->mem_va[i] + (pa - p);
+	if (!map || i == T6030_MEM_PAGES)
+		return NULL;
+	t->mem_va[i] = ioremap_np(p, T6030_MEM_PAGE);
+	t->mem_page[i] = p;
+	return t->mem_va[i] ? t->mem_va[i] + (pa - p) : NULL;
+}
+
+/* Every page the table writes, mapped up front: 0, or -ENOMEM with nothing written */
+static int t6030_mem_config_map(struct t6030_sleep *t)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(t6030_mem_config); i++)
+		if (!t6030_mem_reg(t, t6030_mem_config[i].pa, true))
+			return -ENOMEM;
+	return 0;
+}
+
+static void t6030_mem_config_run(struct t6030_sleep *t, unsigned int from, unsigned int to)
+{
+	unsigned int i;
+	void __iomem *r;
+
+	for (i = from; i < to; i++) {
+		const struct t6030_mem_write *w = &t6030_mem_config[i];
+
+		r = t6030_mem_reg(t, w->pa, false);
+		if (!r)
+			continue;
+		if (w->width == 64)
+			writeq(w->val, r);
+		else
+			writel(w->val, r);
+	}
+}
+
+static void t6030_mem_perf(struct apple_sleep *s)
+{
+	u32 v = readl(s->clk_perf + CLK_PERF_SOC);
+
+	writel((v & ~T6030_PERF_SOC_HI) | FIELD_PREP(T6030_PERF_SOC_HI, T6030_PERF_SOC_HI_MACOS),
+	       s->clk_perf + CLK_PERF_SOC);
+	readl(s->clk_perf + CLK_PERF_SOC);
+}
+
+static u64 t6030_mem_read(u64 pa, u8 width)
+{
+	void __iomem *r = ioremap_np(pa & ~(u64)(T6030_MEM_PAGE - 1), T6030_MEM_PAGE);
+	u64 v;
+
+	if (!r)
+		return ~0ULL;
+	v = width == 64 ? readq(r + (pa & (T6030_MEM_PAGE - 1))) :
+			  readl(r + (pa & (T6030_MEM_PAGE - 1)));
+	iounmap(r);
+	return v;
+}
+
+static void t6030_deep_wfi_arm(void);
+
+static int t6030_mem_config_set(const char *val, const struct kernel_param *kp)
+{
+	struct apple_sleep *s = apple_sleep;
+	struct t6030_sleep *t;
+	u32 perf0;
+	bool on;
+	int ret = kstrtobool(val, &on);
+
+	if (ret || !on)
+		return ret;
+	if (!s || s->soc->ops->deep_wfi_arm != t6030_deep_wfi_arm)
+		return -ENODEV;
+	t = t6030_state(s);
+	perf0 = readl(s->clk_perf + CLK_PERF_SOC);
+	ret = t6030_mem_config_map(t);
+	if (!ret) {
+		t6030_mem_config_run(t, 0, ARRAY_SIZE(t6030_mem_config));
+		t6030_mem_perf(s);
+		t->mem_configured = true;
+	}
+	dev_info(s->dev, "mem config: %d; ways %#llx %#llx %#llx; stages %#llx %#llx %#llx / %#llx %#llx %#llx; DCS +0x584 %#llx +0x588 %#llx; +0x27000 %#llx %#llx %#llx %#llx; ch +0x18 %#llx %#llx; perf %#x -> %#x\n",
+		 ret, t6030_mem_read(0x220024000, 64), t6030_mem_read(0x220064000, 64),
+		 t6030_mem_read(0x2200a4000, 64), t6030_mem_read(0x220024800, 64),
+		 t6030_mem_read(0x220064800, 64), t6030_mem_read(0x2200a4800, 64),
+		 t6030_mem_read(0x222024800, 64), t6030_mem_read(0x222064800, 64),
+		 t6030_mem_read(0x2220a4800, 64), t6030_mem_read(0x220400584, 32),
+		 t6030_mem_read(0x220400588, 32), t6030_mem_read(0x220027000, 64),
+		 t6030_mem_read(0x220067000, 64), t6030_mem_read(0x2200a7000, 64),
+		 t6030_mem_read(0x222027000, 64), t6030_mem_read(0x220400018, 32),
+		 t6030_mem_read(0x222e00018, 32), perf0, readl(s->clk_perf + CLK_PERF_SOC));
+	return ret;
+}
+
+static const struct kernel_param_ops t6030_mem_config_ops = {
+	.set = t6030_mem_config_set,
+};
+module_param_cb(mem_config, &t6030_mem_config_ops, NULL, 0200);
+MODULE_PARM_DESC(mem_config, "T6030 DIAGNOSTIC: bring the AMCC, DCS and SoC perf word to macOS's configured state (traced wake writes)");
+
 static void t6030_sleep_prepare_regs(struct apple_sleep *s)
 {
 	struct t6030_sleep *t = t6030_state(s);
@@ -1526,6 +1938,10 @@ static void t6030_sleep_wake(struct apple_sleep *s)
 	t6030_sleep_wake_check_ps(s, "before the memory side");
 	sleep_note(s, 0x72);
 	t6030_sleep_wake_seq(s, &t->wake, "apple,seq-wake");
+	if (t->mem_configured) {
+		t6030_mem_config_run(t, T6030_MEM_CONFIG_TAIL, ARRAY_SIZE(t6030_mem_config));
+		t6030_mem_perf(s);
+	}
 	sleep_note(s, 0x73);
 	sleep_ps_rewake_words(s, &t6030_wake_mid_words, false);
 	t6030_spmi_wake_irqs(s);
