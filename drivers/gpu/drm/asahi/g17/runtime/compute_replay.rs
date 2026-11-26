@@ -141,7 +141,7 @@ impl Firmware {
                         .state
                         .shared
                         .m5_board
-                        .is_some_and(|board| board.completion_inputs());
+                        .is_some_and(|board| board.firmware_cross_waits());
                     self.queues.append_compute_prefix(
                         owner,
                         Some(qid),
