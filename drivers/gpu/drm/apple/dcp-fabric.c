@@ -544,6 +544,7 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route);
 static int dcp_dpxbar_preselect(struct mux_control *mux, int state);
 static bool dcp_xbar_t8142(struct mux_control *mux);
+static bool dcp_xbar_t8132(struct mux_control *mux);
 
 static int dcp_dpxbar_tunnel_select_source(struct mux_control *mux, int state)
 {
@@ -824,11 +825,18 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 			} else {
 				ret = dcp_dpxbar_preselect(route->active_xbar, MUX_IDLE_DISCONNECT);
 				/*
-				 * The T8142-layout crossbar writes an output only when it
-				 * is selected: one never selected is idle already.
+				 * The T8142-layout and runtime-PM T8132
+				 * crossbars write an output only when it is
+				 * selected: one never selected is idle already.
+				 * A T8132 tunnel whose Activate never came (or
+				 * was refused) is such an output: a failed
+				 * release here would keep its pipeline owned
+				 * for good, every later tunnel refused with
+				 * this error.
 				 */
 				if (ret == -EOPNOTSUPP &&
 				    (dcp_xbar_t8142(route->active_xbar) ||
+				     dcp_xbar_t8132(route->active_xbar) ||
 				     dcp_typec_route_no_dp_alt(route)))
 					ret = 0;
 			}
@@ -2250,6 +2258,13 @@ static bool dcp_xbar_t8142(struct mux_control *mux)
 {
 	return mux && of_device_is_compatible(mux->chip->dev.parent->of_node,
 					      "apple,t8142-display-crossbar");
+}
+
+/* The T8132 crossbar (one per ATC): T602X map, runtime PM, selected outputs only */
+static bool dcp_xbar_t8132(struct mux_control *mux)
+{
+	return mux && of_device_is_compatible(mux->chip->dev.parent->of_node,
+					      "apple,t8132-display-crossbar");
 }
 
 /*

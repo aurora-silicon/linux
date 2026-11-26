@@ -106,6 +106,8 @@ static int mux_control_deselect(struct mux_control *m) { (void)m;event('C');xbar
     static bool dcp_typec_sink_relink(struct apple_dcp *d) { (void)d;return false; }
     /* An M1/M2 crossbar is not the T8142 layout, and an M1/M2 port has no fixed-CRTC connectors. */
     static bool dcp_xbar_t8142(struct mux_control *m) { (void)m;return false; }
+    /* Nor the T8132 crossbar. */
+    static bool dcp_xbar_t8132(struct mux_control *m) { (void)m;return false; }
     static bool dcp_typec_fixed_crtcs(void) { return false; }
     /* Deactivation retires queued DP IN events and drains their work. */
     static int tb_event_cancels;
