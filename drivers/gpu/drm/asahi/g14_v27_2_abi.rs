@@ -154,29 +154,39 @@ pub(crate) fn pool_command(slot: usize, second: bool) -> usize {
     2 * slot + usize::from(second)
 }
 
+/// Whether slot `slot`'s next command goes to its second buffer: the one it did not last
+/// publish, given one bit per slot set when the last published command used the second.
+/// Encoding does not change the bits, so a command that is encoded but never published is
+/// replaced in the same spare buffer.
+pub(crate) fn spare_buffer(published: u64, slot: usize) -> bool {
+    published & (1 << slot) == 0
+}
+
 #[cfg_attr(not(test), kunit_tests(asahi_g14_fw_queues))]
 #[cfg_attr(test, allow(dead_code))]
 mod tests {
     use super::*;
 
     #[test]
-    fn a_slot_never_rewrites_the_command_it_used_last() {
+    fn a_slot_never_rewrites_the_command_it_published_last() {
         const SLOTS: usize = 48;
         let mut owner = [usize::MAX; 2 * SLOTS];
-        let mut alternate = 0u64;
+        let mut published = 0u64;
         let mut last = [usize::MAX; SLOTS];
-        for round in 0..5 {
+        for round in 0..6 {
             for slot in 0..SLOTS {
-                alternate ^= 1 << slot;
-                let c = pool_command(slot, alternate & (1 << slot) != 0);
+                let c = pool_command(slot, spare_buffer(published, slot));
                 assert!(c < 2 * SLOTS);
                 // Two buffers per slot, never shared with another slot.
                 assert!(owner[c] == usize::MAX || owner[c] == slot);
                 owner[c] = slot;
-                // Consecutive uses of a slot take different buffers.
-                if round > 0 {
-                    assert_ne!(c, last[slot]);
+                // Never the buffer the slot last published.
+                assert_ne!(c, last[slot]);
+                // Every third slot's publication fails once: the retry takes the same spare.
+                if (slot + round) % 3 == 0 {
+                    assert_eq!(pool_command(slot, spare_buffer(published, slot)), c);
                 }
+                published ^= 1 << slot;
                 last[slot] = c;
             }
         }

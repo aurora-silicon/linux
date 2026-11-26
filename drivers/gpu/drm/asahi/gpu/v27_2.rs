@@ -479,8 +479,8 @@ const STREAM_STRIDE: usize = 0x400;
 pub(crate) struct CommandPool {
     /// Two command buffers per slot, used in turn (`g14_v27_2_abi::pool_command`).
     commands: fw::types::GpuArray<u8>,
-    /// Which of its two command buffers each slot used last, one bit per slot.
-    alternate: u64,
+    /// Which of its two command buffers each slot last published, one bit per slot.
+    published: u64,
     streams: fw::types::GpuArray<u8>,
     tracking: fw::types::GpuArray<u8>,
     cursors: fw::types::GpuArray<u8>,
@@ -501,7 +501,7 @@ impl CommandPool {
             put64(chunk, 0, base + 0x40 * i as u64);
         }
         crate::pgtable::clean_poc(tracking.as_slice().as_ptr(), tracking.as_slice().len());
-        Ok(Self { commands, alternate: 0, streams, tracking, cursors, stamps,
+        Ok(Self { commands, published: 0, streams, tracking, cursors, stamps,
                   preempt1: cfg.compute_preempt1_size as u64 })
     }
 
@@ -521,11 +521,12 @@ impl CommandPool {
     ) -> Result<u64> {
         if i >= POOL_SLOTS { return Err(EINVAL); }
         // The firmware may read a retired command's JobMeta after it has unlinked the slot
-        // (for the stamp stores it still has queued), so the next command of the slot goes
-        // to the slot's other buffer. A buffer is rewritten only after the slot has been
-        // retired and unlinked once more, which the firmware does in a later pass.
-        self.alternate ^= 1 << i;
-        let c = g14_v27_2_abi::pool_command(i, self.alternate & (1 << i) != 0);
+        // (for the stamp stores it still has queued), so the slot's next command goes to its
+        // other buffer. A buffer is rewritten only after the slot has been retired and
+        // unlinked once more, which the firmware does in a later pass. Encoding always
+        // takes the spare; `published` moves it only once the firmware can see the command,
+        // so a publication that fails leaves the last published buffer alone.
+        let c = g14_v27_2_abi::pool_command(i, g14_v27_2_abi::spare_buffer(self.published, i));
         let cmd_va = self.commands.gpu_va().get() + (c * COMMAND_STRIDE) as u64;
         let stream_va = self.streams.gpu_va().get() + (i * STREAM_STRIDE) as u64;
         let tracking_va = self.tracking.gpu_va().get() + (i * 0x100) as u64;
@@ -548,6 +549,12 @@ impl CommandPool {
         crate::pgtable::clean_poc(cmd.as_ptr(), cmd.len());
         crate::pgtable::poc_barrier();
         Ok(cmd_va)
+    }
+
+    /// Slot `i`'s command, encoded in its spare buffer, is now visible to the firmware: the
+    /// next encode of the slot takes the other buffer.
+    pub(crate) fn mark_published(&mut self, i: usize) {
+        if i < POOL_SLOTS { self.published ^= 1 << i; }
     }
 
     /// Retirement: advance slot `i`'s cursor to the value the firmware recorded at

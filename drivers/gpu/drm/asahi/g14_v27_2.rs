@@ -724,6 +724,7 @@ impl Runtime {
             publication_error: None, started: Instant::now(), _bind: bind }, GFP_KERNEL)?;
         packet.mark_published();
         submission.publish();
+        state.pool.mark_published(slot);
         state.last = stamp;
         state.sequence += 1;
         state.unacked &= !(1 << slot);
@@ -784,6 +785,9 @@ impl Runtime {
         // Queue the fragment dependency before kicking the tiler that satisfies it.
         fs_post.publish();
         ta_post.publish();
+        for slot in slots {
+            state.pool.mark_published(slot);
+        }
         for slot in slots {
             state.busy |= 1 << slot;
             state.unacked &= !(1 << slot);
