@@ -160,6 +160,8 @@ static int dcp_dptx_connect_raw(struct apple_dcp *d, u32 port, bool *waiting)
  if (!raw_error) d->dptxport[0].connected = true;
  return raw_error; }
 static bool dcp_is_typec_output(struct apple_dcp *d) { (void)d; return true; }
+static int __attribute__((unused)) dcp_ext_idle_wake(struct apple_dcp *d) { (void)d; return 0; }
+static void __attribute__((unused)) dcp_ext_idle_kick(struct apple_dcp *d) { (void)d; }
 static int __attribute__((unused)) dcp_dptx_connect(struct apple_dcp *d, u32 port) { (void)d; (void)port; return 0; }
 #define DPTX_RECONNECT_DELAY 500
 static int settle_error, power_error, hpd_error, release_error;
@@ -596,7 +598,7 @@ def bounce(root):
          ' void *phy, *dev, *active_typec_route;\n'
          ' int dptx_die, dptx_phy, dptx_dfp_port, connector_type;\n'
          ' bool external, external_link_ready, crashed, rtkit_adopted;\n'
-         ' bool typec_work_enabled;' + ('' if '\n int fw_compat;' in unit else ' int fw_compat;') +
+         ' bool typec_work_enabled, ext_idle_paused;' + ('' if '\n int fw_compat;' in unit else ' int fw_compat;') +
          ' struct { bool fw_14_7_endpoints; } hw;\n'
          ' struct { bool active; } split;\n'
          ' bool hdmi_hpd;')

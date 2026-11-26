@@ -639,10 +639,6 @@ DCP_THUNK_INOUT(dcp_pipe_cfg_414, dcpep_pipe_cfg_414, u64, u64);
 DCP_THUNK_OUT(dcp_pipe_query_478, dcpep_pipe_query_478, u32);
 DCP_THUNK_OUT(dcp_pipe_query_474, dcpep_pipe_query_474, u32);
 DCP_THUNK_IN(dcp_pipe_set_476, dcpep_pipe_set_476, u32);
-/* Built for 27.0 too, which still dispatches it as A500; the sleep checks the build has it. */
-#if DCP_FW_VER <= DCP_FW_VERSION(27, 0, 0)
-DCP_THUNK_IN(dcp_unnamed_500, dcpep_unnamed_500, u32);
-#endif
 #endif
 DCP_THUNK_INOUT(dcp_set_brightness_correction, iomfbep_set_brightness_correction, u32, u32);
 
@@ -2766,6 +2762,7 @@ int DCP_FW_NAME(iomfb_s2r_500)(struct apple_dcp *dcp)
 	struct dcp_wait_cookie *cookie;
 	unsigned long left;
 	u32 val = 0xaaaa0000;
+	int ret;
 
 	cookie = kzalloc_obj(*cookie);
 	if (!cookie)
@@ -2775,7 +2772,13 @@ int DCP_FW_NAME(iomfb_s2r_500)(struct apple_dcp *dcp)
 	/* increase refcount to ensure the receiver has a reference */
 	kref_get(&cookie->refcount);
 
-	dcp_unnamed_500(dcp, false, &val, dcp_s2r_500_done, cookie);
+	ret = dcp_push_try(dcp, false, &dcp_methods[dcpep_unnamed_500],
+			   sizeof(val), 0, &val, dcp_s2r_500_done, cookie);
+	if (ret) {
+		kref_put(&cookie->refcount, release_wait_cookie);
+		kref_put(&cookie->refcount, release_wait_cookie);
+		return ret;
+	}
 
 	left = wait_for_completion_timeout(&cookie->done, msecs_to_jiffies(1000));
 	kref_put(&cookie->refcount, release_wait_cookie);

@@ -1352,20 +1352,26 @@ static void dcp_push_context(struct apple_dcp *dcp, enum dcp_context_id context,
 	}
 }
 
+int dcp_push_try(struct apple_dcp *dcp, bool oob,
+		 const struct dcp_method_entry *call, u32 in_len, u32 out_len,
+		 void *data, dcp_callback_t cb, void *cookie)
+{
+	/* Reply chains stay on the serialized receiver; callers enqueue copies. */
+	if (iomfb_uses_queue(dcp) && READ_ONCE(dcp->iomfb.owner) != current)
+		return iomfb_queue_command(dcp, oob, call, in_len, out_len,
+					   data, cb, cookie);
+
+	dcp_push_context(dcp, dcp_call_context(dcp, oob), call,
+			 in_len, out_len, data, cb, cookie);
+	return 0;
+}
+
 void dcp_push(struct apple_dcp *dcp, bool oob,
 	      const struct dcp_method_entry *call, u32 in_len, u32 out_len,
 	      void *data, dcp_callback_t cb, void *cookie)
 {
-	/* Reply chains stay on the serialized receiver; callers enqueue copies. */
-	if (iomfb_uses_queue(dcp) && READ_ONCE(dcp->iomfb.owner) != current) {
-		if (iomfb_queue_command(dcp, oob, call, in_len, out_len,
-					data, cb, cookie))
-			WRITE_ONCE(dcp->crashed, true);
-		return;
-	}
-
-	dcp_push_context(dcp, dcp_call_context(dcp, oob), call,
-			 in_len, out_len, data, cb, cookie);
+	if (dcp_push_try(dcp, oob, call, in_len, out_len, data, cb, cookie))
+		WRITE_ONCE(dcp->crashed, true);
 }
 
 /*
