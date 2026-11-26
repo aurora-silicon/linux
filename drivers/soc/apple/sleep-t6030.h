@@ -436,8 +436,6 @@ static int t6030_sleep_map_regs(struct apple_sleep *s)
 		return ret;
 
 	t6030_gp_map(s);
-	/* Each core's external debug: its ADT coresight-reg, as on T8142 */
-	t8142_ed_map(s->dev);
 	t6030_ovrd_report(s, "probe");
 
 	return apple_sleep_read_wake_sources(s);
@@ -524,7 +522,6 @@ static int t6030_sleep_final_check(struct apple_sleep *s)
 		sleep_note(s, T6030_NOTE_DRY_RUN);
 		t6030_dry_ps_on(s);
 		t6030_dry_clean(s);
-		t8142_ed_report(s->dev);
 		t6030_ovrd_report(s, "dry run");
 		return -EAGAIN;
 	}
@@ -1364,12 +1361,16 @@ static void t6030_sleep_wake(struct apple_sleep *s)
  * retention, and ACC_OVRD's deep-sleep settings.
  *
  * Every core's last steps are XNU's on H15 (pexpert/arm64/H15.h: __ARM_GLOBAL_SLEEP_BIT__,
- * HAS_CLUSTER, HAS_RETENTION_STATE, no NO_CPU_OVRD), and nothing else. ml_arm_sleep() lifts
- * the core's external-debug power-down request (EDLAR unlocked, EDPRCR := 0; the J516s ADT's
- * coresight-reg windows, which are t8142_ed_map()'s). arm64_prepare_for_sleep(true) then ORs
- * ACC_OVRD's deep-sleep fields and CYC_OVRD's ok2pwrdn_force_down (WFI mode 3) and disWfiRetn
- * in, and loops on dsb, isb, wfi. That is at the kernel's own EL, as aura's cpu_sleep(true)
- * at EL2. S3_5_C15_C6_2 is T6041's and T6050's deep-sleep register; H15 has no write to it.
+ * HAS_CLUSTER, HAS_RETENTION_STATE, no NO_CPU_OVRD), and nothing else.
+ * arm64_prepare_for_sleep(true) ORs ACC_OVRD's deep-sleep fields and CYC_OVRD's
+ * ok2pwrdn_force_down (WFI mode 3) and disWfiRetn in, and loops on dsb, isb, wfi. That is at
+ * the kernel's own EL, as aura's cpu_sleep(true) at EL2. S3_5_C15_C6_2 is T6041's and T6050's
+ * deep-sleep register; H15 has no write to it.
+ *
+ * No external-debug release. ml_arm_sleep() writes EDLAR and EDPRCR only through
+ * coresight_base[CORESIGHT_ED], and configure_coresight_registers() maps that only on a
+ * debug-fused chip; J516s's /chosen effective-production-status-ap is 1. On J516s a plain read
+ * of a core's coresight-reg window (0x210010310, EDPRCR) hangs the SoC.
  */
 #define T6030_CYC_OVRD			sys_reg(3, 5, 15, 5, 0)
 #define T6030_CYC_OVRD_WFI_MODE		GENMASK_ULL(25, 24)
@@ -1395,7 +1396,6 @@ static void t6030_deep_wfi_arm(void)
 	t6030_clean_all_levels();
 	t6030_dc_reblock(hid4);
 
-	t8142_ed_release();
 	/* As aura's cpu_sleep(true): only the L2 flush field is cleared first, the rest ORed in */
 	sysreg_clear_set_s(T6030_ACC_OVRD, T6030_ACC_OVRD_DIS_L2_FLUSH,
 			   T6030_ACC_OVRD_PWR_DN_SRM |
