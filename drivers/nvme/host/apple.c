@@ -16,8 +16,10 @@
 #include <linux/part_stat.h>
 #include <linux/blk-mq.h>
 #include <linux/crash_dump.h>
+#include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/device.h>
+#include <linux/fault-inject.h>
 #include <linux/dma-mapping.h>
 #include <linux/dmapool.h>
 #include <linux/interrupt.h>
@@ -703,13 +705,56 @@ static const struct apple_rtkit_ops apple_nvme_rtkit_ops = {
 	.shmem_destroy = apple_nvme_sart_dma_destroy,
 };
 
+#ifdef CONFIG_FAULT_INJECTION_DEBUG_FS
+/*
+ * debugfs fail_nvme_apple_nvmmu_inval: report invalidations as failed, to
+ * exercise the handling of a TCB the NVMMU did not invalidate.
+ */
+static DECLARE_FAULT_ATTR(apple_nvme_fail_inval);
+static struct dentry *apple_nvme_fail_inval_dir;
+
+static bool apple_nvme_should_fail_inval(void)
+{
+	return should_fail(&apple_nvme_fail_inval, 1);
+}
+
+static void apple_nvme_fault_init(void)
+{
+	struct dentry *dir;
+
+	dir = fault_create_debugfs_attr("fail_nvme_apple_nvmmu_inval", NULL,
+					&apple_nvme_fail_inval);
+	if (!IS_ERR(dir))
+		apple_nvme_fail_inval_dir = dir;
+}
+
+static void apple_nvme_fault_exit(void)
+{
+	debugfs_remove_recursive(apple_nvme_fail_inval_dir);
+}
+#else
+static bool apple_nvme_should_fail_inval(void)
+{
+	return false;
+}
+
+static void apple_nvme_fault_init(void)
+{
+}
+
+static void apple_nvme_fault_exit(void)
+{
+}
+#endif
+
 /* Returns -EIO if the NVMMU reports that the TCB was not invalidated. */
 static int apple_nvmmu_inval(struct apple_nvme_queue *q, unsigned int tag)
 {
 	struct apple_nvme *anv = queue_to_apple_nvme(q);
 
 	writel(tag, anv->mmio_nvmmu + APPLE_NVMMU_TCB_INVAL);
-	if (readl(anv->mmio_nvmmu + APPLE_NVMMU_TCB_STAT))
+	if (readl(anv->mmio_nvmmu + APPLE_NVMMU_TCB_STAT) ||
+	    apple_nvme_should_fail_inval())
 		return -EIO;
 	return 0;
 }
@@ -3757,7 +3802,25 @@ static struct platform_driver apple_nvme_driver = {
 	.remove = apple_nvme_remove,
 	.shutdown = apple_nvme_shutdown,
 };
-module_platform_driver(apple_nvme_driver);
+
+static int __init apple_nvme_init(void)
+{
+	int ret;
+
+	apple_nvme_fault_init();
+	ret = platform_driver_register(&apple_nvme_driver);
+	if (ret)
+		apple_nvme_fault_exit();
+	return ret;
+}
+module_init(apple_nvme_init);
+
+static void __exit apple_nvme_exit(void)
+{
+	platform_driver_unregister(&apple_nvme_driver);
+	apple_nvme_fault_exit();
+}
+module_exit(apple_nvme_exit);
 
 MODULE_AUTHOR("Sven Peter <sven@svenpeter.dev>");
 MODULE_DESCRIPTION("Apple ANS NVM Express device driver");
