@@ -70,6 +70,8 @@ typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t
 #define check_add_overflow(a,b,c) __builtin_add_overflow((a),(b),(c))
 #define DIV_ROUND_UP(n,d) (((n)+(d)-1)/(d))
 #define DIV_ROUND_UP_ULL(n,d) (((u64)(n)+(d)-1)/(d))
+#define DIV_ROUND_CLOSEST_ULL(n,d) (((u64)(n)+((u64)(d)/2))/(u64)(d))
+#define max_t(type, x, y) ({ type _x = (x); type _y = (y); _x > _y ? _x : _y; })
 #define ALIGN(n,a) (((n)+(a)-1)&~((a)-1))
 #define roundup_pow_of_two(n) ((n) == 1 ? 1UL : 1UL << (64-__builtin_clzl((unsigned long)(n)-1)))
 #define fourcc_code(a,b,c,d) ((u32)(a)|((u32)(b)<<8)|((u32)(c)<<16)|((u32)(d)<<24))
@@ -130,6 +132,7 @@ static struct apple_crtc *to_apple_crtc(void *crtc) { return &host_crtc; }
 static struct apple_dcp *platform_get_drvdata(struct platform_device *pdev) { return NULL; }
 static bool dcp_is_ext26(struct apple_dcp *dcp) { return false; }
 static bool iomfb_ext26_backing_fresh(struct apple_dcp *dcp,struct drm_framebuffer *fb) { return true; }
+static bool __attribute__((unused)) dcp_mode_panel_view(struct apple_dcp *dcp, const void *mode, void *view) { (void)dcp; (void)mode; (void)view; return false; }
 #define to_apple_plane_state(p) container_of(p,struct apple_plane_state,base)
 static struct drm_crtc_state crtc_state = { .mode = { 3840,2160 } };
 static struct drm_plane_state *drm_atomic_get_new_plane_state(struct drm_atomic_commit *c,struct drm_plane *p) { return p->state; }
