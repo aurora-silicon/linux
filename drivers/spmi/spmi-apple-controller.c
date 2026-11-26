@@ -835,6 +835,26 @@ void apple_spmi_fifo_unlock(struct device *dev)
 }
 EXPORT_SYMBOL_GPL(apple_spmi_fifo_unlock);
 
+/* Only called during the platform's noirq resume with secondary CPUs offline. */
+bool apple_spmi_irq_wake_armed(struct device *dev, unsigned int hwirq)
+{
+	struct apple_spmi *spmi;
+	struct irq_data *data;
+	unsigned int irq;
+
+	if (!dev || dev->driver != &apple_spmi_driver.driver)
+		return false;
+	spmi = dev_get_drvdata(dev);
+	if (!spmi->irqd || hwirq >= spmi->hw->num_irqs ||
+	    !test_bit(hwirq, spmi->irq_mask_cache))
+		return false;
+
+	irq = irq_find_mapping(spmi->irqd, hwirq);
+	data = irq ? irq_get_irq_data(irq) : NULL;
+	return data && irqd_is_wakeup_armed(data) && !irqd_irq_disabled(data);
+}
+EXPORT_SYMBOL_GPL(apple_spmi_irq_wake_armed);
+
 module_platform_driver(apple_spmi_driver);
 
 MODULE_AUTHOR("Jean-Francois Bortolotti <jeff@borto.fr>");

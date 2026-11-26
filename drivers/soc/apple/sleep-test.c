@@ -496,6 +496,17 @@ static void apple_sleep_test_wdt_handoff(struct kunit *test)
 	apple_sleep_wdt_unregister(&st->dev2);
 }
 
+static void apple_sleep_test_t6050_rtc_ack(struct kunit *test)
+{
+	u32 pending = BIT(2) | BIT(11);
+
+	KUNIT_EXPECT_EQ(test, t6050_spmi_ack_mask(pending, 0, 0, true), (u32)BIT(11));
+	KUNIT_EXPECT_EQ(test, t6050_spmi_ack_mask(pending, 0, 0, false), pending);
+	KUNIT_EXPECT_EQ(test, t6050_spmi_ack_mask(pending, 1, 0, true), pending);
+	KUNIT_EXPECT_EQ(test, t6050_spmi_ack_mask(pending, 0, 1, true), pending);
+	KUNIT_EXPECT_EQ(test, t6050_spmi_ack_mask(BIT(2), 0, 0, true), 0u);
+}
+
 static struct kunit_case apple_sleep_test_cases[] = {
 	KUNIT_CASE(apple_sleep_test_layout),
 	KUNIT_CASE(apple_sleep_test_t6050),
@@ -510,6 +521,7 @@ static struct kunit_case apple_sleep_test_cases[] = {
 	KUNIT_CASE(apple_sleep_test_books),
 	KUNIT_CASE(apple_sleep_test_wake_names),
 	KUNIT_CASE(apple_sleep_test_wdt_handoff),
+	KUNIT_CASE(apple_sleep_test_t6050_rtc_ack),
 	{}
 };
 
