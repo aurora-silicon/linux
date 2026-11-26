@@ -198,7 +198,7 @@ impl SharedComputeUma {
         pool_va_idx: usize,
     ) -> Result<Arc<Self>> {
         if uma_slot_idx >= super::hw::sizes::COMPUTE_UMA_SLOTS
-            || pool_va_idx >= super::hw::sizes::COMPUTE_UNITS
+            || pool_va_idx >= super::hw::sizes::COMPUTE_UMA_WINDOWS
         {
             return Err(EIO);
         }
@@ -492,7 +492,7 @@ pub(crate) struct PrepareHints<'a> {
     /// A base compute unit (`0..BASE_COMPUTE_UNITS`) is quarantined: allocate extension units.
     pub(crate) expand_compute_ext: bool,
     /// Bitmask of permanently quarantined device-wide compute units (`0..COMPUTE_UNITS`).
-    pub(crate) quarantined_compute_mask: u32,
+    pub(crate) quarantined_compute_mask: u64,
     /// Bitmask of permanently quarantined device-wide compute UMA slots (`0..COMPUTE_UMA_SLOTS`).
     pub(crate) quarantined_compute_uma_mask: u32,
     /// Round-robin cursor assigning a VM's shared compute UMA slot in `0..COMPUTE_UMA_SLOTS`.
@@ -569,16 +569,17 @@ fn pick_compute_uma_slot(
 /// pipe-0-exclusive units (`0..PIPE1_COMPUTE_START`) are preferred before falling back to
 /// `PIPE1_COMPUTE_START..max_units`.
 fn pick_scs_compute_slots(
-    quarantined_mask: u32,
+    quarantined_mask: u64,
     max_units: usize,
 ) -> [usize; super::hw::sizes::SCS_COMPUTE_UNITS] {
     let limit = max_units
         .min(super::hw::sizes::COMPUTE_UNITS)
+        .min(super::hw::sizes::COMPUTE_UMA_SLOTS)
         .max(super::hw::sizes::SCS_COMPUTE_UNITS);
     let mut out = [0usize; super::hw::sizes::SCS_COMPUTE_UNITS];
     let mut found = 0usize;
     for k in 0..limit {
-        if (quarantined_mask & (1u32 << k)) == 0 {
+        if (quarantined_mask & (1u64 << k)) == 0 {
             out[found] = k;
             found += 1;
             if found == out.len() {
@@ -1363,7 +1364,7 @@ impl Cache {
                 });
                 if needs_uma {
                     let pool_va_idx = ready.compute_uma_va_idx;
-                    if pool_va_idx >= super::hw::sizes::COMPUTE_UNITS {
+                    if pool_va_idx >= super::hw::sizes::COMPUTE_UMA_WINDOWS {
                         return Err(EIO);
                     }
                     let start =
@@ -1795,20 +1796,20 @@ impl Prepared {
         Ok(self.compute()?.len() + self.compute_ext.as_deref().map_or(0, ComputeUnitSet::len))
     }
     /// Hardware compute ledger bitmask (bit `k` -> unit `k`) this job can use.
-    pub(crate) fn compute_slot_mask(&self) -> Result<u32> {
+    pub(crate) fn compute_slot_mask(&self) -> Result<u64> {
         let base = self.compute()?;
         if let Some(slots) = base.hw_slots {
-            let mut mask = 0u32;
+            let mut mask = 0u64;
             for slot in slots {
-                mask |= 1u32 << slot;
+                mask |= 1u64 << slot;
             }
             return Ok(mask);
         }
         let total = self.compute_units()?.min(super::hw::sizes::COMPUTE_UNITS);
-        Ok(if total >= 32 {
-            u32::MAX
+        Ok(if total >= 64 {
+            u64::MAX
         } else {
-            (1u32 << total) - 1
+            (1u64 << total) - 1
         })
     }
     /// The per-unit arena holding compute unit `k`.
@@ -1854,7 +1855,7 @@ impl Prepared {
         if let Some(uma) = &self.compute_uma {
             1u32 << uma.uma_slot_idx
         } else {
-            self.compute_slot_mask().unwrap_or(0)
+            self.compute_slot_mask().unwrap_or(0) as u32
         }
     }
     /// Whether the VM's shared compute UMA descriptor has completed at least `count` additional

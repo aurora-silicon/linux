@@ -45,9 +45,13 @@ pub(crate) fn compute_units() -> usize {
     hw::sizes::COMPUTE_UNITS
 }
 
-/// Compute commands in flight at most.
+/// Compute commands in flight at most: bounded by retained compute units
+/// (`COMPUTE_UNITS - 1`, leaving one unit for displacement) and `FLIGHTS`.
 pub(crate) fn compute_flights() -> usize {
-    32usize.clamp(1, hw::sizes::FLIGHTS)
+    hw::sizes::COMPUTE_UNITS
+        .saturating_sub(1)
+        .min(hw::sizes::FLIGHTS)
+        .max(1)
 }
 
 /// Render commands in flight at most: bounded by both retained pass slots

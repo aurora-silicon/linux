@@ -119,7 +119,7 @@ impl<const N: usize> Lifetime<N> {
                 .any(|u| matches!(u.state, State::Preparing | State::Published))
     }
     /// [`Self::exhausted`] restricted to owners selected by `mask` (bit `k` -> owner `k`).
-    pub(crate) fn exhausted_in_mask(&self, mask: u32) -> bool {
+    pub(crate) fn exhausted_in_mask(&self, mask: u64) -> bool {
         let mut rem = mask;
         while rem != 0 {
             let k = rem.trailing_zeros() as usize;
@@ -133,12 +133,12 @@ impl<const N: usize> Lifetime<N> {
             .iter()
             .any(|u| matches!(u.state, State::Preparing | State::Published))
     }
-    /// Bitmask of permanently quarantined owners in `0..N.min(32)`.
-    pub(crate) fn quarantined_mask(&self) -> u32 {
-        let mut mask = 0u32;
-        for k in 0..N.min(32) {
+    /// Bitmask of permanently quarantined owners in `0..N.min(64)`.
+    pub(crate) fn quarantined_mask(&self) -> u64 {
+        let mut mask = 0u64;
+        for k in 0..N.min(64) {
             if self.units[k].state == State::Quarantined {
-                mask |= 1u32 << k;
+                mask |= 1u64 << k;
             }
         }
         mask

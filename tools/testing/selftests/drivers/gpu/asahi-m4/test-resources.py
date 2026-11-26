@@ -304,14 +304,14 @@ pub mod g16 {
         }
         impl ComputeArena{
             pub fn compute_units(&self)->Result<usize>{Ok(self.compute.len())}
-            pub fn compute_slot_mask(&self)->Result<u32>{
+            pub fn compute_slot_mask(&self)->Result<u64>{
                 if let Some(slots)=self.hw_slots {
-                    let mut mask=0u32;
-                    for slot in slots { mask |= 1u32 << slot; }
+                    let mut mask=0u64;
+                    for slot in slots { mask |= 1u64 << slot; }
                     return Ok(mask);
                 }
                 let n=self.compute.len().min(super::hw::sizes::COMPUTE_UNITS);
-                Ok(if n>=32 { u32::MAX } else { (1u32 << n) - 1 })
+                Ok(if n>=64 { u64::MAX } else { (1u64 << n) - 1 })
             }
             pub fn compute_unit(&self,k:usize)->Result<&super::slots::ComputeSlot>{
                 if let Some(slots)=self.hw_slots {
@@ -1134,9 +1134,11 @@ pub mod g16 {
         assert_eq!(p0.heap.fills.lock().unwrap().last(),Some(&(0,0x4000)));
     }
 
-    #[test]fn forty_eight_render_passes_and_twenty_four_compute_units_are_disjoint_in_mesa_hole(){
+    #[test]fn forty_eight_render_passes_and_sixty_four_compute_units_are_disjoint_in_mesa_hole(){
         assert_eq!(g16::hw::sizes::RENDER_SLOTS, 48);
-        assert_eq!(g16::hw::sizes::COMPUTE_UNITS, 24);
+        assert_eq!(g16::hw::sizes::COMPUTE_UNITS, 64);
+        assert_eq!(g16::hw::sizes::COMPUTE_PIPES, 16);
+        assert_eq!(g16::hw::sizes::FLIGHTS, 64);
         let mut o=Objects::new();
         let pools=PoolSet::new(&mut o,&g16::object::Factory).unwrap();
         for idx in 0..g16::hw::sizes::EXT_PB_SLOTS {
@@ -1146,7 +1148,13 @@ pub mod g16 {
             assert_eq!(ext.refs().unwrap().parameter_id,hw_slot);
         }
         for k in 0..g16::hw::sizes::COMPUTE_UNITS as u64 {
-            g16::slots::ComputeSlot::new(&mut o,&g16::object::Factory,k,&crate::g16::object::test_unit_cmds(k)).unwrap();
+            g16::slots::ComputeSlot::new_shared_in(&mut o,k,&crate::g16::object::test_unit_cmds(k)).unwrap();
+        }
+        let pl=g16::slots::Placement::Base;
+        for w in 0..g16::hw::sizes::COMPUTE_UMA_WINDOWS as u64 {
+            o.alloc(g16::object::Request{size:pl.pool_bytes(),class:g16::object::Class::Shared,placement:g16::object::Placement::Anywhere,offset:0,client:Some((pl.pool(w),g16::hw::pte::LEAF_NC)),lower:None,cpu:false}).unwrap();
+            g16::graph::alloc(&mut o,pl.freelist_bytes(),g16::object::Class::Shared,g16::graph::Client::nc(pl.freelist(w)),0,false).unwrap();
+            g16::graph::alloc(&mut o,0x4000,g16::object::Class::Shared,g16::graph::Client::nc(pl.state(w)+g16::hw::client::COMPUTE_LIST_OFF),0,false).unwrap();
         }
         let mut scene_lists=Vec::new();
         let count_client=|objs:&Objects|objs.objects.iter().filter(|a|a.gva.is_some()).count();
@@ -2111,7 +2119,7 @@ pub mod g16 {
         let mut c=Claims::new();
         assert_eq!(s.claim_compute_for_pipe(&prep_full,&mut c,Some(bad.id),0).unwrap(),Some(0));
         s.hold_vm(&c,&bad).unwrap();s.publish(&mut c).unwrap();s.quarantine(&mut c);
-        assert_eq!(s.quarantined_compute_mask(), 1u32 << 0);
+        assert_eq!(s.quarantined_compute_mask(), 1u64 << 0);
         // Pipe 1 runs concurrent non-SCS compute on PIPE1_COMPUTE_START..COMPUTE_UNITS.
         let mut c_p1=Claims::new();
         assert_eq!(s.claim_compute_for_pipe(&prep_full,&mut c_p1,Some(other.id),1).unwrap(),Some(p1_start));
@@ -2125,7 +2133,7 @@ pub mod g16 {
         }
         let prep_scs=g16::resources::ComputeArena{compute:scs_units,render:None,hw_slots:Some(scs_slots),shared_uma:None};
         let scs_mask = prep_scs.compute_slot_mask().unwrap();
-        assert_eq!(scs_mask, (1u32 << 1) | (1u32 << 2));
+        assert_eq!(scs_mask, (1u64 << 1) | (1u64 << 2));
         // Execute two back-to-back SCS compute commands (e.g. rt.scene p_rt + p_comp) repeatedly:
         // must never hit compute_exhausted_in_mask and must ping-pong cleanly across [1, 2].
         for expected in [1usize, 2, 1, 2] {
@@ -3679,10 +3687,17 @@ pub mod g16 {
         s.publish(&mut cb1).unwrap();
         s.retire(&mut cb1).unwrap();
         let lease_b1 = uma_b1.uma_lease.clone();
-        // Exhausting pool_va_idx >= COMPUTE_UNITS returns EIO.
+        // Exhausting pool_va_idx >= COMPUTE_UMA_WINDOWS returns EIO.
         assert!(
-            SharedComputeUma::new(&factory, &bind_b, &vm_b.vm, &live_b, s2, COMPUTE_UNITS)
-                .is_err()
+            SharedComputeUma::new(
+                &factory,
+                &bind_b,
+                &vm_b.vm,
+                &live_b,
+                s2,
+                g16::hw::sizes::COMPUTE_UMA_WINDOWS,
+            )
+            .is_err()
         );
         drop(bind_b);
         drop(prep_b);

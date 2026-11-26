@@ -31,7 +31,7 @@ const EINVAL:Error=Error(-22);const EAGAIN:Error=Error(-11);type Result<T=()> = 
 #[path="__LOGIC__"]mod logic;
 use logic::{Retirement, ABORT_GRACE_NS};
 mod encode { __STAMP_SEED__ __STAMP__ }
-mod hw { pub mod sizes { pub const COMPUTE_PIPES: usize = 8; } }
+mod hw { pub mod sizes { pub const COMPUTE_PIPES: usize = 16; } }
 struct Object{cells:BTreeMap<usize,u64>,va:u64,unstable:bool,reads:Cell<u32>}
 impl Default for Object{fn default()->Self{Self{cells:BTreeMap::new(),va:0x1234,unstable:false,reads:Cell::new(0)}}}
 impl Object {

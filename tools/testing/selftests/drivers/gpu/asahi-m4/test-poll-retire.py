@@ -68,7 +68,7 @@ mod hw {
         pub const TA_WAVE_PASSES: usize = 4;
         pub const TA_WAVE_PASSES_LIGHT: usize = 8;
         pub const TA_WAVE_REFILL_HEADROOM: usize = 2;
-        pub const COMPUTE_PIPES: usize = 8;
+        pub const COMPUTE_PIPES: usize = 16;
         pub const COALESCE_WINDOW_US: u32 = 18;
     }
 }
@@ -1278,7 +1278,7 @@ mod event_drain_test {
     const STATE_WRITE: usize = 0x40;
     const RING_SLOTS: u32 = 128;
     const RECORD_WORDS: usize = 18;
-    const COMPUTE_PIPES: usize = 8;
+    const COMPUTE_PIPES: usize = 16;
     const STAGE_COUNT: usize = 2 + COMPUTE_PIPES;
     mod compute {
         pub const EVENT: u32 = 15;

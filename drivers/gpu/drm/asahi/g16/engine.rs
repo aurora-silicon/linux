@@ -481,7 +481,7 @@ impl HoldCause {
 }
 
 /// Engine statistics, printed by `aurora-g16/stats`.
-#[derive(Default, Zeroable)]
+#[derive(Zeroable)]
 pub(crate) struct Stats {
     pub(crate) pub_ns: u64,
     pub(crate) idle_from_ns: u64,
@@ -541,7 +541,7 @@ pub(crate) struct Stats {
 /// Host-side phase timers of publication and polling, on with `debug_flags` bit 49
 /// (`Debug1`); printed as the `prof:` line of `aurora-g16/stats`. A measurement aid: nothing is
 /// timed while the flag is off.
-#[derive(Default, Zeroable)]
+#[derive(Zeroable)]
 pub(crate) struct Prof {
     /// Published prefixes timed.
     pub(crate) prefixes: u64,
@@ -2321,7 +2321,7 @@ impl Firmware {
             let allowed = if p == 0 {
                 slot_mask
             } else {
-                slot_mask & !((1u32 << sizes::PIPE1_COMPUTE_START) - 1)
+                slot_mask & !((1u64 << sizes::PIPE1_COMPUTE_START) - 1)
             };
             if allowed == 0 || self.slots.compute_exhausted_in_mask(allowed) {
                 continue;
@@ -2339,7 +2339,7 @@ impl Firmware {
     fn has_compute_pipe_for_vm(
         &self,
         vm: &Arc<super::vm::VmState>,
-        slot_mask: u32,
+        slot_mask: u64,
         rt_compute: bool,
     ) -> bool {
         let avoid = self.engine.handoff_avoid_pipes;
@@ -2383,7 +2383,7 @@ impl Firmware {
         &self,
         vm: &Arc<super::vm::VmState>,
         pipe: usize,
-        slot_mask: u32,
+        slot_mask: u64,
     ) -> Option<usize> {
         let mut active_same = [0usize; sizes::COMPUTE_PIPES];
         let mut active_other = [false; sizes::COMPUTE_PIPES];
@@ -2436,7 +2436,7 @@ impl Firmware {
         queue: &Arc<super::queue::QueueState>,
         vm: &Arc<super::vm::VmState>,
         waits: [Option<WaitTarget>; sizes::COMPUTE_PIPES],
-        slot_mask: u32,
+        slot_mask: u64,
         rt_compute: bool,
         heavy_compute: bool,
     ) -> Option<usize> {
@@ -2563,7 +2563,7 @@ impl Firmware {
             }
             None
         };
-        let has_secondary = (slot_mask & !((1u32 << sizes::PIPE1_COMPUTE_START) - 1)) != 0;
+        let has_secondary = (slot_mask & !((1u64 << sizes::PIPE1_COMPUTE_START) - 1)) != 0;
         let prefer_secondary = has_secondary && active_other.iter().any(|&a| a);
         if vm_active_pipes < sizes::MAX_VM_COMPUTE_PIPES {
             if let Some(p) = pick_idle(prefer_secondary) {

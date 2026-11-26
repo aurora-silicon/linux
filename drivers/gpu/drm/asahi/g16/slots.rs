@@ -349,14 +349,13 @@ impl ComputeSlot {
     /// rebuilding per-unit arenas.
     pub(crate) fn new_shared_in(o: &mut Objects, k: u64, cmds: &UnitCmds) -> Result<Self> {
         let sh = Class::Shared;
-        let state = Placement::Base.state(k);
         Ok(Self {
             its: alloc(o, 16, sh, None, 0, false)?,
             preempt: alloc(
                 o,
                 0x4000,
                 sh,
-                Client::nc(state + client::COMPUTE_PREEMPT_OFF),
+                Client::nc(client::compute_preempt(k)),
                 0,
                 false,
             )?,
@@ -367,18 +366,11 @@ impl ComputeSlot {
                 o,
                 0x40000,
                 sh,
-                Client::nc(state + client::COMPUTE_CONTEXT_OFF),
+                Client::nc(client::compute_context(k)),
                 0,
                 false,
             )?,
-            aux: alloc(
-                o,
-                0x4000,
-                sh,
-                Client::nc(state + client::COMPUTE_AUX_OFF),
-                0,
-                false,
-            )?,
+            aux: alloc(o, 0x4000, sh, Client::nc(client::compute_aux(k)), 0, false)?,
             private_uma: None,
         })
     }
@@ -1152,11 +1144,11 @@ impl Slots {
         self.compute.lifetime.exhausted_within(n)
     }
     /// Whether none of the compute units in `mask` (bit `k` -> unit `k`) can ever be claimed.
-    pub(crate) fn compute_exhausted_in_mask(&self, mask: u32) -> bool {
+    pub(crate) fn compute_exhausted_in_mask(&self, mask: u64) -> bool {
         self.compute.lifetime.exhausted_in_mask(mask)
     }
     /// Bitmask of permanently quarantined compute units (`0..COMPUTE_UNITS`).
-    pub(crate) fn quarantined_compute_mask(&self) -> u32 {
+    pub(crate) fn quarantined_compute_mask(&self) -> u64 {
         self.compute.lifetime.quarantined_mask()
     }
     pub(crate) fn render_exhausted(&self) -> bool {
@@ -1187,7 +1179,7 @@ impl Slots {
         (0..n.min(sizes::COMPUTE_UNITS)).any(|k| self.compute.lifetime.available(k))
     }
     /// Whether any compute unit in `mask` can be claimed now.
-    pub(crate) fn compute_available_in_mask(&self, mask: u32) -> bool {
+    pub(crate) fn compute_available_in_mask(&self, mask: u64) -> bool {
         let mut rem = mask;
         while rem != 0 {
             let k = rem.trailing_zeros() as usize;
@@ -1202,11 +1194,11 @@ impl Slots {
     /// Pipe 0 may claim any bit in `mask`; secondary pipes stay in
     /// `PIPE1_COMPUTE_START..COMPUTE_UNITS` so `0..PIPE1_COMPUTE_START` only ever hold pipe-0
     /// leases.
-    pub(crate) fn compute_available_in_mask_for_pipe(&self, mask: u32, pipe: usize) -> bool {
+    pub(crate) fn compute_available_in_mask_for_pipe(&self, mask: u64, pipe: usize) -> bool {
         let allowed = if pipe == 0 {
             mask
         } else {
-            mask & !((1u32 << sizes::PIPE1_COMPUTE_START) - 1)
+            mask & !((1u64 << sizes::PIPE1_COMPUTE_START) - 1)
         };
         self.compute_available_in_mask(allowed)
     }
@@ -1214,10 +1206,10 @@ impl Slots {
     #[allow(dead_code)]
     pub(crate) fn compute_available_for_pipe(&self, n: usize, pipe: usize) -> bool {
         let limit = n.min(sizes::COMPUTE_UNITS);
-        let mask = if limit >= 32 {
-            u32::MAX
+        let mask = if limit >= 64 {
+            u64::MAX
         } else {
-            (1u32 << limit) - 1
+            (1u64 << limit) - 1
         };
         self.compute_available_in_mask_for_pipe(mask, pipe)
     }
@@ -1428,11 +1420,11 @@ impl Slots {
         self.free_compute_in_for_pipe(n, 0)
     }
     /// Available compute units in `mask` eligible for `pipe`.
-    pub(crate) fn free_compute_in_mask_for_pipe(&self, mask: u32, pipe: usize) -> u32 {
+    pub(crate) fn free_compute_in_mask_for_pipe(&self, mask: u64, pipe: usize) -> u32 {
         let mut rem = if pipe == 0 {
             mask
         } else {
-            mask & !((1u32 << sizes::PIPE1_COMPUTE_START) - 1)
+            mask & !((1u64 << sizes::PIPE1_COMPUTE_START) - 1)
         };
         let mut count = 0u32;
         while rem != 0 {
@@ -1448,10 +1440,10 @@ impl Slots {
     #[allow(dead_code)]
     pub(crate) fn free_compute_in_for_pipe(&self, n: usize, pipe: usize) -> u32 {
         let limit = n.min(sizes::COMPUTE_UNITS);
-        let mask = if limit >= 32 {
-            u32::MAX
+        let mask = if limit >= 64 {
+            u64::MAX
         } else {
-            (1u32 << limit) - 1
+            (1u64 << limit) - 1
         };
         self.free_compute_in_mask_for_pipe(mask, pipe)
     }
@@ -1527,18 +1519,18 @@ impl Slots {
         let allowed = if pipe == 0 {
             mask
         } else {
-            mask & !((1u32 << sizes::PIPE1_COMPUTE_START) - 1)
+            mask & !((1u64 << sizes::PIPE1_COMPUTE_START) - 1)
         };
         if allowed == 0 {
             return Ok(None);
         }
         let n = sizes::COMPUTE_UNITS;
         let base_cursor = (self.cursor as usize) % n;
-        let p0_mask = (1u32 << sizes::PIPE1_COMPUTE_START) - 1;
+        let p0_mask = (1u64 << sizes::PIPE1_COMPUTE_START) - 1;
         // On pipe 0, prefer pipe-0-exclusive units (`0..PIPE1_COMPUTE_START`) before spilling
         // into secondary-pipe units (`PIPE1_COMPUTE_START..COMPUTE_UNITS`) so concurrent
         // secondary pipes keep maximum unit headroom.
-        let tiers: [u32; 2] = if pipe == 0 {
+        let tiers: [u64; 2] = if pipe == 0 {
             [allowed & p0_mask, allowed & !p0_mask]
         } else {
             [allowed, 0]
@@ -1552,7 +1544,7 @@ impl Slots {
                 }
                 for i in 0..n {
                     let k = (base_cursor + i) % n;
-                    if (tier & (1u32 << k)) != 0
+                    if (tier & (1u64 << k)) != 0
                         && !self.compute.scrub_full[k]
                         && self.compute.owner[k]
                             .as_ref()
@@ -1572,7 +1564,7 @@ impl Slots {
                     }
                     for i in 0..n {
                         let k = (base_cursor + i) % n;
-                        if (tier & (1u32 << k)) != 0
+                        if (tier & (1u64 << k)) != 0
                             && self.compute.owner[k].is_none()
                             && self.compute.lifetime.claim(k)
                         {
@@ -1591,7 +1583,7 @@ impl Slots {
                 }
                 for i in 0..n {
                     let k = (base_cursor + i) % n;
-                    if (tier & (1u32 << k)) != 0 && self.compute.lifetime.claim(k) {
+                    if (tier & (1u64 << k)) != 0 && self.compute.lifetime.claim(k) {
                         chosen = Some(k);
                         break 'any;
                     }
