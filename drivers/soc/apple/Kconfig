@@ -318,6 +318,12 @@ config APPLE_AOP
 config APPLE_SEP_FV_INTERFACE
 	bool
 
+config APPLE_SEP_HDCP_INTERFACE
+	bool
+	help
+	  The kernel interface through which the display driver runs HDCP 2.2
+	  authentication on the SEP. Selected by the SEP driver.
+
 config APPLE_SEP
 	tristate "Apple SEP (Secure Enclave Processor)"
 	default m if ARCH_APPLE
@@ -338,6 +344,7 @@ config APPLE_SEP
 	select CRYPTO_GCM
 	select CRYPTO_ECDH
 	select APPLE_SEP_FV_INTERFACE
+	select APPLE_SEP_HDCP_INTERFACE
 	select RUST_FW_LOADER_ABSTRACTIONS
 	help
 	  Driver for the Apple SEP (Secure Enclave Processor) on Apple silicon.
