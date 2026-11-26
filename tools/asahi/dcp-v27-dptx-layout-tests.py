@@ -7,7 +7,7 @@ choice, and runs them over firmware, processor role, advertised endpoints and
 hardware data. A firmware-27 dcpext, or a firmware-27 DCP that the device tree
 connects to Type-C display routes (the M2 Mac mini's primary), whose firmware
 advertises both DPTX_CONTROLLER_ENDPOINT (0x24) and DPTX_ENDPOINT (0x2a) gets
-the controller and its ports there (J413 and J615 on 27.2); hardware data that names an
+the controller and its ports there (J413, J615, and the T8132 J773g and J713 on 27.2); hardware data that names an
 endpoint keeps it (T8142, T6050 and firmware-27 T6041 dcpexts); every other
 processor is unchanged. The selector must not test a compatible.
 
@@ -78,6 +78,21 @@ t6041 = function(dcp_c, 'static int dcp_platform_probe_pipe(')
 t6041 = t6041[t6041.index('"apple,t6041-dcpext")) {'):]
 t6041 = t6041[:t6041.index('\n\t}\n')]
 assert 'dcp->hw.dptx_endpoint = DPTX_ENDPOINT_V2;' in t6041
+# A firmware-27 T8132 dcpext (J773g, J713 on 27.2) has no apple,dcpext
+# fallback: the probe must still make it a dcpext, and its hardware data must
+# name no endpoint, so the advertisement decides.
+t8132 = function(dcp_c, 'static int dcp_platform_probe_pipe(')
+t8132 = t8132[t8132.index('if (fw_compat == DCP_FIRMWARE_V_27_0 &&\n'
+                          '\t    of_device_is_compatible(dev->of_node, "apple,t8132-dcpext")) {'):]
+t8132 = t8132[:t8132.index('\n\t}\n')]
+assert 'dcp->hw = apple_dcp_hw_t8132_dcpext_v27;' in t8132
+assert 'dcp->dcpext = true;' in t8132, 'a firmware-27 T8132 dcpext must be a dcpext'
+# ... after the compatible-based assignment, which would otherwise clear it.
+probe = function(dcp_c, 'static int dcp_platform_probe_pipe(')
+generic = probe.index('dcp->dcpext = of_device_is_compatible(dev->of_node, "apple,dcpext")')
+assert generic < probe.index('dcp->hw = apple_dcp_hw_t8132_dcpext_v27;'), \
+    'the T8132 firmware-27 dcpext block must come after the generic dcpext assignment'
+assert '.dptx_endpoint' not in table('apple_dcp_hw_t8132_dcpext_v27')
 
 if args.mutation:
     old, new = MUTATIONS[args.mutation]

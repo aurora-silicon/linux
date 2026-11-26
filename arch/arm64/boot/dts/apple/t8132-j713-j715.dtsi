@@ -184,11 +184,13 @@
 
 /*
  * dcpext0's Type-C routes, UFP mux selector 2 on both ATC crossbars
- * (cells 0/1/2: DP PHY, DP IN0, DP IN1). The ATC PHYs have no DP alt mode:
- * the routes are for DisplayPort tunnels, and DP alt mode is refused. The
- * routes are disabled here; the display gate enables them only for a dcpext
- * the boot loader handed over, since a USB-C port controller waits for every
- * available route.
+ * (cells 0/1/2: DP PHY, DP IN0, DP IN1). The routes carry DisplayPort tunnels,
+ * and DP alt mode only on a port whose ATC PHY the board marks
+ * apple,dp-alt-mode (both J713 ports, t8132-j713.dts); elsewhere DP alt mode
+ * is refused. The routes are disabled here; the display gate enables them
+ * only for a dcpext the boot loader handed over (26.6.2: firmware-ready set;
+ * 27.2: its firmware memory filled), since a USB-C port controller waits for
+ * every available route.
  */
 &dcpext0 {
 	apple,connector-type = "USB-C";
@@ -237,11 +239,13 @@
 
 /*
  * dcpext1's Type-C routes, UFP mux selector 4 on both ATC crossbars
- * (cells 0/1/2: DP PHY, DP IN0, DP IN1). The ATC PHYs have no DP alt mode:
- * the routes are for DisplayPort tunnels, and DP alt mode is refused. The
- * routes are disabled here; the display gate enables them only for a dcpext
- * the boot loader handed over, since a USB-C port controller waits for every
- * available route.
+ * (cells 0/1/2: DP PHY, DP IN0, DP IN1). The routes carry DisplayPort tunnels,
+ * and DP alt mode only on a port whose ATC PHY the board marks
+ * apple,dp-alt-mode (both J713 ports, t8132-j713.dts); elsewhere DP alt mode
+ * is refused. The routes are disabled here; the display gate enables them
+ * only for a dcpext the boot loader handed over (26.6.2: firmware-ready set;
+ * 27.2: its firmware memory filled), since a USB-C port controller waits for
+ * every available route.
  */
 &dcpext1 {
 	apple,connector-type = "USB-C";

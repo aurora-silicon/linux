@@ -597,9 +597,9 @@ int main(void)
     }
 
     /*
-     * A T8132 dcpext handed over with the T8132 27.2 image (first the Mac
-     * mini's, J773g) runs the 27.2 table, whatever the firmware path and on
-     * any board: the selection is by processor and image.
+     * A T8132 dcpext handed over with the T8132 27.2 image runs the 27.2
+     * table on any board (the J773g's HDMI dcpext0, the J713's USB-C
+     * dcpexts) and on either firmware path.
      */
     reset_t6041_26b123(true);
     node.compatible = "apple,t8132-dcpext";

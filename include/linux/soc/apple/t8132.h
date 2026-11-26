@@ -56,17 +56,29 @@ static inline bool apple_t8132_firmware_path(void)
 }
 
 /*
- * A T8132 external display processor handed over with the 27.2 image
- * (first on the Mac mini, J773g): it runs the firmware-27 backend
- * (iomfb_v27.c), not the M4 26.6.2 one (iomfb_m4.c). The firmware
- * interface belongs to the processor and the image it runs, so both are
- * checked and the board is not; what differs between boards (the HDMI
- * port, its PHY, rails and hot-plug line) comes from the device tree.
+ * A T8132 external display processor handed over with the 27.2 image: it
+ * runs the firmware-27 backend (iomfb_v27.c), not the M4 26.6.2 one
+ * (iomfb_m4.c). What decides it is what the loader handed over: the
+ * processor and the pinned 26B123 image with its 27.2 firmware compat. The
+ * Mac mini's (J773g) dcpext0 drives the HDMI port that way and the MacBook
+ * Air's (J713) dcpext0 and dcpext1 the USB-C ports; a board whose external
+ * display is not ready keeps these nodes disabled in its tree. Kept here,
+ * not in display.h, whose T6041 helpers key on the processor alone.
  */
 static inline bool apple_t8132_dcpext_v27_2(const struct device_node *np)
 {
 	return apple_dcp_image_v27_2(np, "apple,t8132-dcpext",
 				     APPLE_T8132_DCP_26B123_UUID);
+}
+
+/*
+ * Such a processor whose node describes a DP-to-HDMI converter on a fixed
+ * PHY (its HDMI hot-plug line), as the J773g's dcpext0: a desktop external
+ * processor, driven as the J575c's dcpext0 is.
+ */
+static inline bool apple_t8132_dcpext_hdmi_v27_2(const struct device_node *np)
+{
+	return apple_t8132_dcpext_v27_2(np) && of_property_present(np, "hdmi-hpd-gpios");
 }
 
 /*

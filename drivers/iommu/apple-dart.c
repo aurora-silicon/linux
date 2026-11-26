@@ -5884,21 +5884,25 @@ static bool apple_dart_np_is_iommu_of(const struct device_node *consumer,
 }
 
 /*
- * Whether @dart_np serves an available T8132 internal display processor that
- * the boot loader handed over with its firmware clocks (apple,clock-ids, from
- * the ADT's /arm-io/disp0): its firmware DART (the processor's iommus) or its
- * display DART (its PIODMA's). Those clocks are what the firmware-27 backend
- * needs and what tells its handoff from the M4 26.6.2 one, whose DARTs are
- * borrowed. The DART is keyed on what uses it, not on its address, the board
- * or the firmware build: a PMP or external display DART is never named here,
- * and an idle main DCP (a Mac mini's) is not handed over.
+ * Whether @dart_np serves an available T8132 display processor compatible
+ * with @compat (the internal apple,t8132-dcp or an external
+ * apple,t8132-dcpext) that the boot loader handed over with its firmware
+ * clocks (apple,clock-ids: the ADT's /arm-io/disp0 ones on dcp, its pipe's on
+ * a dcpext): its firmware DART (the processor's iommus) or its display DART
+ * (its PIODMA's). Those clocks are what the firmware-27 backend needs and what
+ * tells its handoff from the M4 26.6.2 one, whose DARTs are borrowed. The
+ * DART is keyed on what uses it, not on its address, the board or the
+ * firmware build: a PMP DART is never named here, an idle main DCP (a Mac
+ * mini's) is not handed over, and a dcpext left to the 26.6.2 firmware-ready
+ * path gets no clocks.
  */
-static bool apple_dart_serves_t8132_dcp(const struct device_node *dart_np)
+static bool apple_dart_serves_t8132_dcp(const struct device_node *dart_np,
+					const char *compat)
 {
 	struct device_node *np, *child;
 	bool serves = false;
 
-	for_each_compatible_node(np, NULL, "apple,t8132-dcp") {
+	for_each_compatible_node(np, NULL, compat) {
 		if (serves || !of_device_is_available(np) ||
 		    !of_property_present(np, "apple,clock-ids"))
 			continue;
@@ -5916,8 +5920,9 @@ static bool apple_dart_serves_t8132_dcp(const struct device_node *dart_np)
  * tables (fw_handoff), and no display driver borrows its live roots
  * (preserve_display). That is the DART's own state; which DARTs take it is the
  * SoC's (T6041, T6050, T8140, T8142: every one) or, on T8132, the DARTs of its
- * handed-over internal display processor (@t8132_dcp). Other locked T8132
- * DARTs, the PMP's among them, keep the retained-root path they always had.
+ * handed-over internal or external display processors (@t8132_dcp). Other
+ * locked T8132 DARTs, the PMP's among them, keep the retained-root path they
+ * always had.
  */
 static bool apple_dart_selects_fw_mirror(const struct apple_dart *dart,
 					 const struct device_node *np, bool t8132_dcp)
@@ -5941,6 +5946,7 @@ static int apple_dart_probe(struct platform_device *pdev)
 					     "usb4-pcie-tunnel-");
 	bool j713_display, j713_dcpext, j713_dispext, j713_radio, t8132_dcp = false;
 	bool cold_avd = of_device_is_compatible(dev->of_node, "apple,t8152-avd-dart");
+	bool t8132_dcpext = false;
 
 	/*
 	 * The M4 internal display DARTs are live: DCP firmware (SID23)
@@ -5962,15 +5968,27 @@ static int apple_dart_probe(struct platform_device *pdev)
 	 */
 	t8132_dcp = res && !tunneled &&
 		of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
-		apple_dart_serves_t8132_dcp(dev->of_node);
+		apple_dart_serves_t8132_dcp(dev->of_node, "apple,t8132-dcp");
 	if (t8132_dcp)
 		j713_display = false;
-	/* The external DCP firmware DARTs (SID23) of dcpext0 and dcpext1. */
-	j713_dcpext = res && !tunneled && apple_t8132_firmware_path() &&
+	/*
+	 * An external display processor handed over the same way (the J773g's
+	 * HDMI dcpext0, an Air's USB-C dcpext0 and dcpext1) runs the same
+	 * backend on its own firmware and display DARTs, through ordinary
+	 * domains: they keep their firmware's locked roots the same way
+	 * (fw_mirror below) and must be locked. Decided first, by the handoff
+	 * of the processor that names the DART, on any board and either
+	 * firmware path: such a DART is never a borrowed 26.6.2 one.
+	 */
+	t8132_dcpext = res && !tunneled &&
+		of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
+		apple_dart_serves_t8132_dcp(dev->of_node, "apple,t8132-dcpext");
+	/* The borrowed 26.6.2 external DCP firmware DARTs (SID23) of dcpext0 and dcpext1. */
+	j713_dcpext = res && !tunneled && !t8132_dcpext && apple_t8132_firmware_path() &&
 		of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
 		(res->start == 0x286340000ULL || res->start == 0x48a340000ULL);
-	/* The external display DARTs (SID0/SID16) of dispext0 and dispext1. */
-	j713_dispext = res && !tunneled && apple_t8132_firmware_path() &&
+	/* The borrowed 26.6.2 external display DARTs (SID0/SID16) of dispext0 and dispext1. */
+	j713_dispext = res && !tunneled && !t8132_dcpext && apple_t8132_firmware_path() &&
 		of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
 		(res->start == 0x286300000ULL || res->start == 0x48a300000ULL);
 	/* The radio DART's fault interrupt is not described by the loader. */
@@ -6561,19 +6579,25 @@ params_done:
 	 * T6050's boot loader leaves every display DART locked on four-level
 	 * roots of its own (dart-dcpextN SID 23, dart-dispextN SIDs 0 and 16).
 	 */
-	dart->fw_mirror = apple_dart_selects_fw_mirror(dart, dev->of_node, t8132_dcp);
+	dart->fw_mirror = apple_dart_selects_fw_mirror(dart, dev->of_node,
+						       t8132_dcp || t8132_dcpext);
 	/*
 	 * The firmware-27 backend runs on the locked roots alone: a DART that
 	 * is not locked, or whose boot loader also handed over reserved tables,
 	 * is not the handoff it was written for. Refuse either, saying which.
 	 */
-	if (t8132_dcp && dart->fw_mirror)
-		dev_info(dev, "T8132 internal display DART: locked roots kept (mirror)\n");
-	else if (t8132_dcp && !dart->locked)
-		dev_err(dev, "T8132 internal display DART: NOT locked: refusing\n");
-	else if (t8132_dcp)
-		dev_err(dev, "T8132 internal display DART: locked with a reserved-table handoff: refusing\n");
-	if (t8132_dcp && !dart->fw_mirror) {
+	if (t8132_dcp || t8132_dcpext) {
+		const char *what = t8132_dcp ? "internal" : "external";
+
+		if (dart->fw_mirror)
+			dev_info(dev, "T8132 %s display DART: locked roots kept (mirror)\n", what);
+		else if (!dart->locked)
+			dev_err(dev, "T8132 %s display DART: NOT locked: refusing\n", what);
+		else
+			dev_err(dev, "T8132 %s display DART: locked with a reserved-table handoff: refusing\n",
+				what);
+	}
+	if ((t8132_dcp || t8132_dcpext) && !dart->fw_mirror) {
 		ret = -EINVAL;
 		goto err_clk_disable;
 	}
