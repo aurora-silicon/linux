@@ -39,6 +39,8 @@ static const struct dcp_method_entry dcp_methods[dcpep_num_methods] = {
 	IOMFB_METHOD("A466", dcpep_flush_supports_power),
 	IOMFB_METHOD("A467", iomfbep_abort_swaps_dcp),
 	IOMFB_METHOD("A472", dcpep_set_power_state),
+	/* Unnamed here as on the later firmwares, see iomfb_s2r_500_v13_3(). */
+	IOMFB_METHOD("A500", dcpep_unnamed_500),
 };
 
 #define DCP_FW v13_3

@@ -2843,6 +2843,44 @@ int DCP_FW_NAME(iomfb_s2r_500)(struct apple_dcp *dcp)
 }
 #endif
 
+#if DCP_FW_VER == DCP_FW_VERSION(13, 3, 0)
+DCP_THUNK_IN(dcp_unnamed_500, dcpep_unnamed_500, u32);
+
+static void dcp_s2r_500_done(struct apple_dcp *dcp, void *out, void *cookie)
+{
+	struct dcp_wait_cookie *wait = cookie;
+
+	complete(&wait->done);
+	kref_put(&wait->refcount, release_wait_cookie);
+}
+
+/*
+ * A500 on firmware 13.5, sent before the firmware is stopped for a suspend-to-RAM. The
+ * argument is zero, as T6000's sleep was brought up; H17P and 26.6 send 0xaaaa0000.
+ */
+int DCP_FW_NAME(iomfb_s2r_500)(struct apple_dcp *dcp)
+{
+	struct dcp_wait_cookie *cookie;
+	unsigned long left;
+	u32 val = 0;
+
+	cookie = kzalloc_obj(*cookie);
+	if (!cookie)
+		return -ENOMEM;
+	init_completion(&cookie->done);
+	kref_init(&cookie->refcount);
+	/* increase refcount to ensure the receiver has a reference */
+	kref_get(&cookie->refcount);
+
+	dcp_unnamed_500(dcp, false, &val, dcp_s2r_500_done, cookie);
+
+	left = wait_for_completion_timeout(&cookie->done, msecs_to_jiffies(2000));
+	kref_put(&cookie->refcount, release_wait_cookie);
+
+	return left ? 0 : -ETIMEDOUT;
+}
+#endif
+
 static bool dcp_power_stop_confirmed(struct dcp_wait_cookie *cookie)
 {
 	/* H17P does not confirm that scanout has stopped. */
