@@ -271,6 +271,7 @@ static int dcp_v27_warm_restart(struct apple_dcp *dcp, bool strict)
 		if (ret)
 			dev_warn(dcp->dev, "V27 wake: secure port restart: %d\n", ret);
 	}
+	iomfb_v27_idle_cache_reset(dcp);
 	return strict ? apple_rtkit_warm_restart_strict(dcp->rtk) :
 			apple_rtkit_warm_restart_stopped(dcp->rtk);
 }

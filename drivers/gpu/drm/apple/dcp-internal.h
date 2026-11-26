@@ -930,6 +930,38 @@ struct apple_dcp {
 	bool active;
 	/* A successful initial enable keeps the H17P pipe running across DPMS. */
 	bool pipe_enabled_h17p;
+
+	/* Firmware 27 internal-panel static-frame idle cache ("replay") */
+	spinlock_t v27_idle_lock;
+	struct delayed_work v27_idle_cache_work;
+	struct drm_gem_dma_object *v27_idle_obj;
+	size_t v27_idle_obj_size;
+	struct dcp_surface v27_idle_pending_surf;
+	struct dcp_rect v27_idle_pending_src;
+	struct dcp_rect v27_idle_pending_dst;
+	bool v27_idle_pending_valid;
+	struct dcp_surface v27_idle_template_surf;
+	struct dcp_rect v27_idle_src_rect;
+	struct dcp_rect v27_idle_dst_rect;
+	bool v27_idle_template_valid;
+	bool v27_idle_closed;
+	unsigned long v27_idle_deadline;
+	u64 v27_idle_gen;
+	u32 v27_idle_state;
+	u32 v27_idle_mem_total;
+	u32 v27_idle_swap_id;
+	u8 v27_idle_uses_host;
+	unsigned int v27_idle_fences;
+	bool v27_idle_method_set;
+	bool v27_idle_registered;
+	bool v27_idle_submitting;
+	bool v27_idle_dma_pinned;
+	bool v27_idle_swap_pending;
+	u64 v27_idle_release_seq;
+	bool v27_idle_unavailable;
+	bool v27_idle_in_flight;
+	u64 v27_idle_entries;
+	u64 v27_idle_replays;
 	/* Messages from the coprocessor are held in the mailbox for sleep. */
 	bool rx_held;
 
@@ -1326,6 +1358,11 @@ struct apple_rtkit_shmem;
 int dcp_rtk_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr);
 void dcp_rtk_shmem_destroy(void *cookie, struct apple_rtkit_shmem *bfr);
 /* Keep a session that cannot be stopped, its DMA and this driver until reboot. */
+struct dcp_session_ref;
+struct dcp_session_ref *dcp_retain_live_session_prepare(struct apple_dcp *dcp);
+void dcp_retain_live_session_abort(struct dcp_session_ref *session);
+bool dcp_retain_live_session_commit(struct apple_dcp *dcp,
+				    struct dcp_session_ref *session);
 int dcp_retain_live_session(struct apple_dcp *dcp);
 
 /* T8132 firmware uses its own wire codec, with the common DRM/KMS owner. */
