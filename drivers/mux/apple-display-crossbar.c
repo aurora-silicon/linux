@@ -635,12 +635,9 @@ static int apple_dpxbar_set(struct mux_control *mux, int state)
 			bool need_mmio;
 
 			spin_lock_irqsave(&dpxbar->lock, flags);
-			need_mmio = test_bit(index, &dpxbar->rpm_held);
-			if (!need_mmio && test_and_clear_bit(index, &dpxbar->rpm_preselect))
-				rpm_puts++;
+			need_mmio = test_bit(index, &dpxbar->rpm_held) ||
+				    test_bit(index, &dpxbar->rpm_preselect);
 			spin_unlock_irqrestore(&dpxbar->lock, flags);
-			while (rpm_puts--)
-				pm_runtime_put(dpxbar->dev);
 			if (!need_mmio) {
 				dev_dbg(dpxbar->dev, "%s already disconnected while suspended\n",
 					apple_dpxbar_names[index]);
@@ -1644,7 +1641,7 @@ static struct platform_driver apple_dpxbar_driver = {
 	.driver = {
 		.name = "apple-display-crossbar",
 		.of_match_table	= apple_dpxbar_ids,
-		.pm = pm_sleep_ptr(&apple_dpxbar_pm_ops),
+		.pm = pm_ptr(&apple_dpxbar_pm_ops),
 	},
 	.probe = apple_dpxbar_probe,
 };
