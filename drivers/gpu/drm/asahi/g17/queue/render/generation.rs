@@ -98,6 +98,13 @@ pub(in crate::g17) struct Generation {
     state: KernelObject,
     pub(super) ordinal: Option<u64>,
 }
+/// M5 status holds two 64-bit status words (tiling at +0, fragment at +8);
+/// clear the first 64-byte cache line rather than the entire uncached 16 KiB status page.
+const TA_STATUS_OFFSET: usize = 0;
+const FRAGMENT_STATUS_OFFSET: usize = core::mem::size_of::<u64>();
+const STATUS_CLEAR_BYTES: usize = 64;
+const _: () = assert!(STATUS_CLEAR_BYTES >= FRAGMENT_STATUS_OFFSET + core::mem::size_of::<u64>());
+
 impl Generation {
     pub(in crate::g17) fn allocate_state(alloc: &Allocator<'_>, vm: &mmu::Vm,
         board: Option<&'static Board>) -> Result<KernelObject> {
@@ -144,7 +151,7 @@ impl Generation {
             }
             Views::M5 { board, .. } => {
                 let layout = Layout::m5(board);
-                self.state.bytes_mut()[layout.status..layout.status + mmu::UAT_PGSZ].fill(0);
+                self.state.bytes_mut()[layout.status..layout.status + STATUS_CLEAR_BYTES].fill(0);
                 layout
             }
         };
@@ -162,8 +169,10 @@ impl Generation {
             Views::M5 { status_fw, board } => {
                 let base = self.state.gpu_va();
                 let layout = Layout::m5(board);
-                [base + layout.deflake as u64, base + layout.status as u64,
-                    base + layout.status as u64 + 8, status_fw.iova() + 8,
+                [base + layout.deflake as u64,
+                    base + layout.status as u64 + TA_STATUS_OFFSET as u64,
+                    base + layout.status as u64 + FRAGMENT_STATUS_OFFSET as u64,
+                    status_fw.iova() + FRAGMENT_STATUS_OFFSET as u64,
                     base + layout.auxiliary as u64]
             }
         }
