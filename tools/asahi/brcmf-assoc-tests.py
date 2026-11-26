@@ -45,6 +45,7 @@ typedef int32_t s32; typedef uint32_t __le32;
 #define le32_to_cpu(x) (x)
 #define max_t(t,a,b) ((t)(a)>(t)(b)?(t)(a):(t)(b))
 #define min_t(t,a,b) ((t)(a)<(t)(b)?(t)(a):(t)(b))
+#define xchg(p,v) __atomic_exchange_n((p),(v),__ATOMIC_SEQ_CST)
 #define BRCMF_DCMD_MAXLEN 8192
 #define BRCMF_BUS_UP 1
 #define BRCMF_C_GET_VAR 262
@@ -79,7 +80,7 @@ struct brcmf_cfg80211_connect_info {u8 *req_ie,*resp_ie;int req_ie_len,resp_ie_l
 struct brcmf_cfg80211_info {struct brcmf_pub *pub;u8 extra_buf[2048];u8 ac_priority[8];struct brcmf_cfg80211_connect_info conn;};
 static struct brcmf_cfg80211_connect_info *cfg_to_conn(struct brcmf_cfg80211_info *c){return &c->conn;}
 struct sk_buff {u8 data[8192];u32 len;};
-struct brcmf_msgbuf {struct brcmf_pub *drvr;void *rx_pktids;u32 ioctl_resp_pktid,ioctl_resp_ret_len;int ioctl_resp_status;bool ctl_completed;u32 ctl_stalls;};
+struct brcmf_msgbuf {struct brcmf_pub *drvr;void *rx_pktids;struct sk_buff *ioctl_resp;u32 ioctl_resp_ret_len;int ioctl_resp_status;bool ctl_completed;u32 ctl_stalls;};
 #define BUS_HEADER_LEN 80
 @BCDC_STRUCTS@
 static struct sk_buff packet;
@@ -112,12 +113,13 @@ static void check_request(const char *name,u32 len){
 static int brcmf_msgbuf_tx_ioctl(struct brcmf_pub *d,int idx,uint c,void *b,uint l){
  (void)idx;(void)c;if(l>512)check_request(b,l);struct brcmf_msgbuf *m=d->proto->pd;
  bool wme=!strcmp(b,"wme_ac_sta"), fail=error_name&&!strcmp(b,error_name);m->ioctl_resp_ret_len=make_reply(b,packet.data);
- packet.len=malformed_skb?0:8192;m->ioctl_resp_status=fw_error;
- return fail?-EIO:(wme?wme_error:query_error);
+ packet.len=malformed_skb?0:min_t(u32,m->ioctl_resp_ret_len,sizeof(packet.data));m->ioctl_resp_status=fw_error;
+ int ret=fail?-EIO:(wme?wme_error:query_error);
+ if(!ret&&!timeout_reply&&!no_skb)m->ioctl_resp=&packet;
+ return ret;
 }
 static int brcmf_msgbuf_ioctl_resp_wait(struct brcmf_msgbuf *m){(void)m;return !timeout_reply;}
 static void brcmf_bus_ctl_stall(struct brcmf_bus *b,u32 n){(void)b;(void)n;}
-static struct sk_buff *brcmf_msgbuf_get_pktid(void *d,void *p,u32 n){(void)d;(void)p;(void)n;return no_skb?NULL:&packet;}
 static void brcmu_pkt_buf_free_skb(struct sk_buff *s){if(s)free_packets++;}
 static int brcmf_proto_bcdc_msg(struct brcmf_pub *d,int idx,uint c,void *b,uint l,bool set){
  (void)idx;(void)c;(void)set;if(l>512)check_request(b,l);struct brcmf_bcdc *m=d->proto->pd;
@@ -148,7 +150,7 @@ static void reset(int transport){
  memset(cfg.extra_buf,0xa5,sizeof(cfg.extra_buf));memset(pub.proto_buf,0xdd,sizeof(pub.proto_buf));
  declared_req=declared_resp=actual_req=actual_resp=0;info_len=8;
  error_name=NULL;query_error=wme_error=fw_error=no_skb=malformed_skb=timeout_reply=0;
- allocations=fail_alloc=query_calls=free_packets=rx_calls=0;
+ allocations=fail_alloc=query_calls=free_packets=rx_calls=0;msgbuf.ioctl_resp=NULL;
  if(transport){proto.pd=&bcdc;proto.query_dcmd=brcmf_proto_bcdc_query_dcmd;proto.query_dcmd_len=brcmf_proto_bcdc_query_dcmd_len;}
  else{proto.pd=&msgbuf;proto.query_dcmd=brcmf_msgbuf_query_dcmd;proto.query_dcmd_len=brcmf_msgbuf_query_dcmd_len;}
 }
