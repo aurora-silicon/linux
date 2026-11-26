@@ -491,15 +491,19 @@
 	/delete-node/ temperature-TW0P;
 
 	/*
-	 * The T6050 SMC spells the fan mode keys F0md/F1md, as on the J775D. No
-	 * apple,fan-manual-control: the SMC drives the fans.
+	 * The T6050 SMC spells the fan mode keys F0md/F1md, as on the J775D. The
+	 * SMC drives the fans; as on the J714s, it also accepts a manual speed for
+	 * either from userspace, within the fan's own minimum and maximum, and
+	 * takes the fan back when the target is set to 0.
 	 */
 	fan-F0Ac {
 		apple,fan-mode = "F0md";
+		apple,fan-manual-control;
 	};
 
 	fan-F1Ac {
 		apple,fan-mode = "F1md";
+		apple,fan-manual-control;
 	};
 };
 
