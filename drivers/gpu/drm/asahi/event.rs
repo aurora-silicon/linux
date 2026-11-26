@@ -54,6 +54,11 @@ pub(crate) type Event = slotalloc::Guard<EventInner>;
 pub(crate) struct EventValue(u32);
 
 impl EventValue {
+    #[cfg(CONFIG_KUNIT)]
+    pub(crate) const fn from_raw(raw: u32) -> Self {
+        EventValue(raw)
+    }
+
     #[cfg(CONFIG_DRM_ASAHI_G14_V27_2)]
     pub(crate) fn raw(self) -> u32 {
         self.0
@@ -67,22 +72,6 @@ impl EventValue {
     /// Increments this `EventValue` in place.
     pub(crate) fn increment(&mut self) {
         self.0 = self.0.wrapping_add(0x100);
-    }
-
-    /* Not used
-    /// Increments this `EventValue` in place by a certain count.
-    pub(crate) fn add(&mut self, val: u32) {
-        self.0 = self
-            .0
-            .wrapping_add(val.checked_mul(0x100).expect("Adding too many events"));
-    }
-    */
-
-    /// Increments this `EventValue` in place by a certain count.
-    pub(crate) fn sub(&mut self, val: u32) {
-        self.0 = self
-            .0
-            .wrapping_sub(val.checked_mul(0x100).expect("Subtracting too many events"));
     }
 
     /// Computes the delta between this event and another event.

@@ -79,6 +79,155 @@ fn can_submit_inline(
         && free_space > command_count
 }
 
+/// Monotonic sequence and event-stamp ordering state for a single work queue.
+///
+/// Once a job commits, `tail_value`, `commit_seq`, and `event_seq` never move
+/// backwards on pre-publication failure: later jobs may already be building or
+/// committed against them. Instead, aborting a committed job before publication
+/// advances `submit_seq` past its commands while leaving `last_submitted` and
+/// `published_event_seq` at the last work that actually reached the firmware.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+struct WorkQueueOrder {
+    pending_jobs: usize,
+    tail_value: Option<EventValue>,
+    last_submitted: Option<EventValue>,
+    last_completed: Option<EventValue>,
+    commit_seq: u64,
+    submit_seq: u64,
+    event_seq: u64,
+    published_event_seq: u64,
+}
+
+impl WorkQueueOrder {
+    fn attach_event(&mut self, cur: EventValue) {
+        self.tail_value = Some(cur);
+        self.last_submitted = Some(cur);
+        self.last_completed = Some(cur);
+    }
+
+    fn clear_event(&mut self) {
+        self.tail_value = None;
+        self.last_submitted = None;
+        self.last_completed = None;
+    }
+
+    fn new_job(&mut self) -> (EventValue, u64, u64) {
+        self.pending_jobs += 1;
+        (
+            self.tail_value.expect("WorkQueue: missing event tail"),
+            self.commit_seq,
+            self.event_seq,
+        )
+    }
+
+    fn commit(
+        &mut self,
+        start_value: EventValue,
+        end_value: EventValue,
+        command_count: u64,
+        event_count: u64,
+    ) -> core::result::Result<(), Option<EventValue>> {
+        if self.tail_value != Some(start_value) {
+            return Err(self.tail_value);
+        }
+
+        self.tail_value = Some(end_value);
+        self.commit_seq += command_count;
+        self.event_seq += event_count;
+        Ok(())
+    }
+
+    fn uncommit(
+        &mut self,
+        start_value: EventValue,
+        end_value: EventValue,
+        cmd_seq: u64,
+        command_count: u64,
+        start_event_seq: u64,
+        event_count: u64,
+    ) -> bool {
+        if self.tail_value == Some(end_value)
+            && self.commit_seq == cmd_seq + command_count
+            && self.event_seq == start_event_seq + event_count
+            && self.submit_seq <= cmd_seq
+        {
+            self.tail_value = Some(start_value);
+            self.commit_seq = cmd_seq;
+            self.event_seq = start_event_seq;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn publish(&mut self, command_count: u64, end_value: EventValue, end_event_seq: u64) {
+        self.last_submitted = Some(end_value);
+        self.submit_seq += command_count;
+        self.published_event_seq = end_event_seq;
+    }
+
+    fn abort_committed(&mut self, cmd_seq: u64, command_count: u64) -> bool {
+        if self.submit_seq == cmd_seq {
+            self.submit_seq += command_count;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn release_job(&mut self, pending_empty: bool) -> bool {
+        self.pending_jobs -= 1;
+        if pending_empty && self.pending_jobs == 0 {
+            self.clear_event();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Return the latest live `(stamp_value, event_seq)` a newly built explicit
+    /// barrier should wait for, skipping work that has already aborted before
+    /// publishing.
+    fn wait_target(&self, pending_empty: bool) -> Option<(EventValue, u64)> {
+        let tail = self.tail_value?;
+        if self.submit_seq < self.commit_seq {
+            Some((tail, self.event_seq))
+        } else if !pending_empty {
+            Some((self.last_submitted?, self.published_event_seq))
+        } else {
+            None
+        }
+    }
+
+    /// Check whether `event_seq` from an earlier submission reached firmware.
+    ///
+    /// A single high-water `published_event_seq` is exact here because every
+    /// `Queue` runs its `QueueJob`s strictly FIFO on one `drm_sched::Entity`
+    /// (and `can_submit_inline()` requires the prior job's fence to be
+    /// signaled and `submit_seq == cmd_seq`), while cross-submission explicit
+    /// barriers (`index == 0`) always capture `wait_target()` = the latest
+    /// committed `event_seq` under the queue lock. A dependent consumer waiting
+    /// on `event_seq = k` therefore always runs after producer `k` and before
+    /// any later producer `m > k` can publish, so `published_event_seq >= k`
+    /// holds if and only if producer `k` itself published.
+    fn has_published(&self, event_seq: u64) -> bool {
+        self.published_event_seq >= event_seq
+    }
+
+    fn free_slots(&self) -> usize {
+        let busy_slots = if let Some(ls) = self.last_submitted {
+            let lc = self
+                .last_completed
+                .expect("last_submitted but not completed?");
+            ls.delta(&lc)
+        } else {
+            0
+        };
+
+        ((MAX_JOB_SLOTS as i32) - busy_slots).max(0) as usize
+    }
+}
+
 /// An enum of possible errors that might cause a piece of work to fail execution.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum WorkError {
@@ -309,14 +458,9 @@ struct WorkQueueInner {
     /// order, so observing a later command's stamp proves this one's firmware tail is done.
     last_completed_work: Option<Pin<KBox<SubmittedWorkContainer>>>,
     last_token: Option<event::Token>,
-    pending_jobs: usize,
-    last_submitted: Option<event::EventValue>,
-    last_completed: Option<event::EventValue>,
-    event: Option<(event::Event, event::EventValue)>,
+    event: Option<event::Event>,
+    order: WorkQueueOrder,
     priority: u32,
-    commit_seq: u64,
-    submit_seq: u64,
-    event_seq: u64,
 }
 
 /// An instance of a work queue.
@@ -379,8 +523,10 @@ pub(crate) struct Job {
 pub(crate) struct JobSubmission<'a> {
     inner: Option<Guard<'a, WorkQueueInner::ver, MutexBackend>>,
     wptr: u32,
-    event_count: usize,
+    cmd_seq: u64,
     command_count: usize,
+    end_value: EventValue,
+    end_event_seq: u64,
 }
 
 #[versions(AGX)]
@@ -455,24 +601,46 @@ impl Job::ver {
 
         let mut inner = self.wq.inner.lock();
 
-        let ev = inner.event.as_mut().expect("WorkQueue: Job lost its event");
+        let slot = inner.event.as_ref().expect("WorkQueue: Job lost its event").slot();
 
-        if ev.1 != self.start_value {
+        if let Err(cur) = inner.order.commit(
+            self.start_value,
+            self.event_info.value,
+            self.pending.len() as u64,
+            self.event_count as u64,
+        ) {
             pr_err!(
-                "WorkQueue: Job::commit() out of order (event slot {} {:?} != {:?}\n",
-                ev.0.slot(),
-                ev.1,
+                "WorkQueue: Job::commit() out of order (event slot {} {:?} != {:?})\n",
+                slot,
+                cur,
                 self.start_value
             );
             return Err(EINVAL);
         }
 
-        ev.1 = self.event_info.value;
-        inner.commit_seq += self.pending.len() as u64;
-        inner.event_seq += self.event_count as u64;
         self.committed = true;
 
         Ok(())
+    }
+
+    /// Roll back a just-committed tail job when a sibling subqueue fails
+    /// `commit()` under the submission queue lock.
+    pub(crate) fn uncommit(&mut self) {
+        if !self.committed || self.submitted {
+            return;
+        }
+
+        let mut inner = self.wq.inner.lock();
+        if inner.order.uncommit(
+            self.start_value,
+            self.event_info.value,
+            self.event_info.cmd_seq,
+            self.pending.len() as u64,
+            self.event_info.event_seq,
+            self.event_count as u64,
+        ) {
+            self.committed = false;
+        }
     }
 
     pub(crate) fn can_submit(&self) -> Option<dma_fence::Fence> {
@@ -489,11 +657,11 @@ impl Job::ver {
                 inner.free_space(),
                 self.pending.len(),
                 inner.pending.len(),
-                inner.last_submitted,
-                inner.last_completed,
-                inner.event.as_ref().map(|a| a.1),
-                inner.event.as_ref().map(|a| a.0.current()),
-                inner.event.as_ref().map(|a| a.0.slot()),
+                inner.order.last_submitted,
+                inner.order.last_completed,
+                inner.order.tail_value,
+                inner.event.as_ref().map(|a| a.current()),
+                inner.event.as_ref().map(|a| a.slot()),
             );
             None
         }
@@ -506,7 +674,7 @@ impl Job::ver {
         let inner = self.wq.inner.lock();
 
         can_submit_inline(
-            inner.submit_seq,
+            inner.order.submit_seq,
             self.event_info.cmd_seq,
             inner.pending.len(),
             inner.free_slots(),
@@ -534,19 +702,19 @@ impl Job::ver {
 
         let mut inner = self.wq.inner.lock();
 
-        if inner.submit_seq != self.event_info.cmd_seq {
+        if inner.order.submit_seq != self.event_info.cmd_seq {
             pr_err!(
                 "WorkQueue: Job::submit() out of order (submit_seq {} != {})\n",
-                inner.submit_seq,
+                inner.order.submit_seq,
                 self.event_info.cmd_seq
             );
             return Err(EINVAL);
         }
 
-        if inner.commit_seq < (self.event_info.cmd_seq + self.pending.len() as u64) {
+        if inner.order.commit_seq < (self.event_info.cmd_seq + self.pending.len() as u64) {
             pr_err!(
                 "WorkQueue: Job::submit() out of order (commit_seq {} != {})\n",
-                inner.commit_seq,
+                inner.order.commit_seq,
                 (self.event_info.cmd_seq + self.pending.len() as u64)
             );
             return Err(EINVAL);
@@ -579,14 +747,14 @@ impl Job::ver {
 
         inner.pending.reserve(command_count, GFP_KERNEL)?;
 
-        inner.last_submitted = Some(self.event_info.value);
         mod_dev_dbg!(
             inner.dev,
-            "WorkQueue: submitting {} cmds at {:#x?}, lc {:#x?}, cur {:#x?}, pending {}, events {}\n",
+            "WorkQueue: submitting {} cmds at {:#x?}, ls {:#x?}, lc {:#x?}, cur {:#x?}, pending {}, events {}\n",
             self.pending.len(),
-            inner.last_submitted,
-            inner.last_completed,
-            inner.event.as_ref().map(|a| a.0.current()),
+            self.event_info.value,
+            inner.order.last_submitted,
+            inner.order.last_completed,
+            inner.event.as_ref().map(|a| a.current()),
             inner.pending.len(),
             self.event_count,
         );
@@ -610,8 +778,10 @@ impl Job::ver {
         Ok(JobSubmission::ver {
             inner: Some(inner),
             wptr,
+            cmd_seq: self.event_info.cmd_seq,
             command_count,
-            event_count: self.event_count,
+            end_value: self.event_info.value,
+            end_event_seq: self.event_info.event_seq + self.event_count as u64,
         })
     }
 }
@@ -622,6 +792,8 @@ impl<'a> JobSubmission::ver<'a> {
         let command_count = self.command_count;
         let mut inner = self.inner.take().expect("No inner?");
         let wptr = self.wptr;
+        let end_value = self.end_value;
+        let end_event_seq = self.end_event_seq;
         core::mem::forget(self);
 
         inner
@@ -631,9 +803,11 @@ impl<'a> JobSubmission::ver<'a> {
 
         inner.wptr = wptr;
 
-        let event = inner.event.as_mut().expect("JobSubmission lost its event");
-
-        let event_slot = event.0.slot();
+        let event_slot = inner
+            .event
+            .as_ref()
+            .expect("JobSubmission lost its event")
+            .slot();
 
         let msg = fw::channels::RunWorkQueueMsg::ver {
             pipe_type: inner.pipe_type,
@@ -646,7 +820,9 @@ impl<'a> JobSubmission::ver<'a> {
         channel.send(&msg);
         inner.new = false;
 
-        inner.submit_seq += command_count as u64;
+        inner
+            .order
+            .publish(command_count as u64, end_value, end_event_seq);
     }
 
     pub(crate) fn pipe_type(&self) -> PipeType {
@@ -673,31 +849,29 @@ impl Drop for Job::ver {
 
         if self.committed && !self.submitted {
             let pipe_type = inner.pipe_type;
-            let event = inner.event.as_mut().expect("Job lost its event");
+            let slot = inner.event.as_ref().expect("Job lost its event").slot();
             pr_info!(
-                "WorkQueue({:?}): Roll back {} events (slot {} val {:#x?}) and {} commands\n",
+                "WorkQueue({:?}): Abort {} events and {} commands at seq {} (slot {} tail {:#x?})\n",
                 pipe_type,
                 self.event_count,
-                event.0.slot(),
-                event.1,
-                self.pending.len()
+                self.pending.len(),
+                self.event_info.cmd_seq,
+                slot,
+                inner.order.tail_value,
             );
-            event.1.sub(self.event_count as u32);
-            inner.commit_seq -= self.pending.len() as u64;
-            inner.event_seq -= self.event_count as u64;
+            inner
+                .order
+                .abort_committed(self.event_info.cmd_seq, self.pending.len() as u64);
         }
 
-        inner.pending_jobs -= 1;
-
-        if inner.pending.is_empty() && inner.pending_jobs == 0 {
+        let pending_empty = inner.pending.is_empty();
+        if inner.order.release_job(pending_empty) {
             mod_pr_debug!("WorkQueue({:?}): Dropping event\n", inner.pipe_type);
             // Queue is idle with all work completed; release any held completed command.
             if let Some(last_cmd) = inner.last_completed_work.take() {
                 workqueue::system_dfl().enqueue(last_cmd);
             }
             inner.event = None;
-            inner.last_submitted = None;
-            inner.last_completed = None;
         }
         mod_pr_debug!("WorkQueue({:?}): Dropped Job\n", inner.pipe_type);
     }
@@ -713,20 +887,22 @@ impl<'a> Drop for JobSubmission::ver<'a> {
         inner.pending.truncate(new_len);
 
         let pipe_type = inner.pipe_type;
-        let event = inner.event.as_mut().expect("JobSubmission lost its event");
+        let slot = inner
+            .event
+            .as_ref()
+            .expect("JobSubmission lost its event")
+            .slot();
         pr_info!(
-            "WorkQueue({:?}): JobSubmission: Roll back {} events (slot {} val {:#x?}) and {} commands\n",
+            "WorkQueue({:?}): JobSubmission: Abort {} commands at seq {} (slot {} tail {:#x?})\n",
             pipe_type,
-            self.event_count,
-            event.0.slot(),
-            event.1,
-            self.command_count
+            self.command_count,
+            self.cmd_seq,
+            slot,
+            inner.order.tail_value,
         );
-        event.1.sub(self.event_count as u32);
-        let val = event.1;
-        inner.commit_seq -= self.command_count as u64;
-        inner.event_seq -= self.event_count as u64;
-        inner.last_submitted = Some(val);
+        inner
+            .order
+            .abort_committed(self.cmd_seq, self.command_count as u64);
         mod_pr_debug!("WorkQueue({:?}): Dropped JobSubmission\n", inner.pipe_type);
     }
 }
@@ -761,16 +937,7 @@ impl WorkQueueInner::ver {
     }
 
     pub(crate) fn free_slots(&self) -> usize {
-        let busy_slots = if let Some(ls) = self.last_submitted {
-            let lc = self
-                .last_completed
-                .expect("last_submitted but not completed?");
-            ls.delta(&lc)
-        } else {
-            0
-        };
-
-        ((MAX_JOB_SLOTS as i32) - busy_slots).max(0) as usize
+        self.order.free_slots()
     }
 }
 
@@ -883,13 +1050,8 @@ impl WorkQueue::ver {
             last_completed_work: None,
             last_token: None,
             event: None,
+            order: WorkQueueOrder::default(),
             priority,
-            pending_jobs: 0,
-            commit_seq: 0,
-            submit_seq: 0,
-            event_seq: 0,
-            last_completed: None,
-            last_submitted: None,
         };
 
         let info_pointer = inner.info().weak_pointer();
@@ -909,16 +1071,22 @@ impl WorkQueue::ver {
 
     pub(crate) fn event_info(&self) -> Option<QueueEventInfo::ver> {
         let inner = self.inner.lock();
+        let ev = inner.event.as_ref()?;
+        let (value, event_seq) = inner.order.wait_target(inner.pending.is_empty())?;
 
-        inner.event.as_ref().map(|ev| QueueEventInfo::ver {
-            stamp_pointer: ev.0.stamp_pointer(),
-            fw_stamp_pointer: ev.0.fw_stamp_pointer(),
-            slot: ev.0.slot(),
-            value: ev.1,
-            cmd_seq: inner.commit_seq,
-            event_seq: inner.event_seq,
+        Some(QueueEventInfo::ver {
+            stamp_pointer: ev.stamp_pointer(),
+            fw_stamp_pointer: ev.fw_stamp_pointer(),
+            slot: ev.slot(),
+            value,
+            cmd_seq: inner.order.commit_seq,
+            event_seq,
             info_ptr: self.info_pointer,
         })
+    }
+
+    pub(crate) fn has_published(&self, event_seq: u64) -> bool {
+        self.inner.lock().order.has_published(event_seq)
     }
 
     pub(crate) fn new_job(self: &Arc<Self>, fence: dma_fence::Fence) -> Result<Job::ver> {
@@ -935,33 +1103,32 @@ impl WorkQueue::ver {
                 event.slot(),
                 cur
             );
-            inner.event = Some((event, cur));
-            inner.last_submitted = Some(cur);
-            inner.last_completed = Some(cur);
+            inner.event = Some(event);
+            inner.order.attach_event(cur);
         }
 
-        inner.pending_jobs += 1;
+        let (start_value, cmd_seq, event_seq) = inner.order.new_job();
 
-        let ev = &inner.event.as_ref().unwrap();
+        let ev = inner.event.as_ref().unwrap();
 
         mod_pr_debug!(
             "WorkQueue({:?}): New job at value {:#x?} slot {}\n",
             inner.pipe_type,
-            ev.1,
-            ev.0.slot()
+            start_value,
+            ev.slot()
         );
         Ok(Job::ver {
             wq: self.clone(),
             event_info: QueueEventInfo::ver {
-                stamp_pointer: ev.0.stamp_pointer(),
-                fw_stamp_pointer: ev.0.fw_stamp_pointer(),
-                slot: ev.0.slot(),
-                value: ev.1,
-                cmd_seq: inner.commit_seq,
-                event_seq: inner.event_seq,
+                stamp_pointer: ev.stamp_pointer(),
+                fw_stamp_pointer: ev.fw_stamp_pointer(),
+                slot: ev.slot(),
+                value: start_value,
+                cmd_seq,
+                event_seq,
                 info_ptr: self.info_pointer,
             },
-            start_value: ev.1,
+            start_value,
             pending: KVec::new(),
             event_count: 0,
             committed: false,
@@ -1024,27 +1191,27 @@ impl WorkQueue for WorkQueue::ver {
             None => {
                 mod_pr_debug!("WorkQueue: signal() called but no event?\n");
 
-                if inner.pending_jobs > 0 || !inner.pending.is_empty() {
+                if inner.order.pending_jobs > 0 || !inner.pending.is_empty() {
                     pr_crit!("WorkQueue: signal() called with no event and pending jobs.\n");
                 }
                 return true;
             }
-            Some(event) => event.0.current(),
+            Some(event) => event.current(),
         };
 
-        if let Some(lc) = inner.last_completed {
+        if let Some(lc) = inner.order.last_completed {
             if value < lc {
                 pr_err!(
                     "WorkQueue: event rolled back? cur {:#x?}, lc {:#x?}, ls {:#x?}",
                     value,
-                    inner.last_completed,
-                    inner.last_submitted
+                    inner.order.last_completed,
+                    inner.order.last_submitted
                 );
             }
         } else {
             pr_crit!("WorkQueue: signal() called with no last_completed.\n");
         }
-        inner.last_completed = Some(value);
+        inner.order.last_completed = Some(value);
 
         mod_pr_debug!(
             "WorkQueue({:?}): Signaling event {:?} value {:#x?}\n",
@@ -1102,8 +1269,8 @@ impl WorkQueue for WorkQueue::ver {
             inner.pipe_type,
             completed_commands,
             inner.pending.len(),
-            inner.last_submitted,
-            inner.last_completed,
+            inner.order.last_submitted,
+            inner.order.last_completed,
         );
 
         inner
@@ -1112,7 +1279,7 @@ impl WorkQueue for WorkQueue::ver {
             .with(|raw, _inner| raw.cpu_freeptr.store(last_wptr, Ordering::Release));
 
         let empty = inner.pending.is_empty();
-        if empty && inner.pending_jobs == 0 {
+        if empty && inner.order.pending_jobs == 0 {
             // The queue is idle. This completion was signalled by the last command's RetireStamp,
             // the final op of its microsequence, so the firmware is done with every retired
             // descriptor including the held one. Release it now rather than pinning its slot until
@@ -1121,8 +1288,7 @@ impl WorkQueue for WorkQueue::ver {
                 workqueue::system_dfl().enqueue(last_cmd);
             }
             inner.event = None;
-            inner.last_submitted = None;
-            inner.last_completed = None;
+            inner.order.clear_event();
         }
 
         empty
@@ -1139,7 +1305,7 @@ impl WorkQueue for WorkQueue::ver {
         if inner.event.is_none() {
             mod_pr_debug!("WorkQueue: signal_fault() called but no event?\n");
 
-            if inner.pending_jobs > 0 || !inner.pending.is_empty() {
+            if inner.order.pending_jobs > 0 || !inner.pending.is_empty() {
                 pr_crit!("WorkQueue: signal_fault() called with no event and pending jobs.\n");
             }
             return;
@@ -1172,7 +1338,7 @@ impl WorkQueue for WorkQueue::ver {
         if inner.event.is_none() {
             mod_pr_debug!("WorkQueue: fail_all() called but no event?\n");
 
-            if inner.pending_jobs > 0 || !inner.pending.is_empty() {
+            if inner.order.pending_jobs > 0 || !inner.pending.is_empty() {
                 pr_crit!("WorkQueue: fail_all() called with no event and pending jobs.\n");
             }
             return;
@@ -1192,8 +1358,9 @@ impl WorkQueue for WorkQueue::ver {
         // completed command along with the rest.
         let held = inner.last_completed_work.take();
 
-        if inner.pending_jobs == 0 {
+        if inner.order.pending_jobs == 0 {
             inner.event = None;
+            inner.order.clear_event();
         }
 
         core::mem::drop(inner);
@@ -1221,7 +1388,10 @@ fn ring_reaches_done(wptr: u32, count: usize, size: u32, doneptr: u32) -> bool {
 
 #[kunit_tests(asahi_legacy_inline_workqueue)]
 mod tests {
-    use super::{can_submit_inline, ring_reaches_done};
+    use super::{can_submit_inline, ring_reaches_done, WorkQueueOrder, MAX_JOB_SLOTS};
+    use crate::event::EventValue;
+
+    const BASE: EventValue = EventValue::from_raw(20 << 24);
 
     #[test]
     fn done_pointer_inside_the_new_entries_is_refused() {
@@ -1260,5 +1430,136 @@ mod tests {
         assert!(!can_submit_inline(4, 4, 0, 1, 1, 2, 1));
         assert!(!can_submit_inline(4, 4, 0, 2, 1, 1, 1));
         assert!(can_submit_inline(4, 4, 0, 2, 1, 2, 1));
+    }
+
+    #[test]
+    fn prepub_abort_preserves_concurrent_commit_and_submit_order() {
+        let mut q = WorkQueueOrder::default();
+        q.attach_event(BASE);
+
+        // J1 commits 2 commands / 1 event.
+        let (j1_start, j1_cmd, j1_ev) = q.new_job();
+        let j1_end = j1_start.next();
+        assert_eq!(q.commit(j1_start, j1_end, 2, 1), Ok(()));
+        assert_eq!(q.wait_target(true), Some((j1_end, j1_ev + 1)));
+
+        // J2 starts building while J1 has not yet run.
+        let (j2_start, j2_cmd, j2_ev) = q.new_job();
+        let j2_end = j2_start.next();
+
+        // J1 fails before publishing and releases its job while J2 is still building.
+        assert!(q.abort_committed(j1_cmd, 2));
+        assert!(!q.release_job(true));
+        assert_eq!(q.submit_seq, j2_cmd);
+        assert!(!q.has_published(j1_ev + 1));
+
+        // J2 must still commit cleanly and line up with submit_seq.
+        assert_eq!(q.commit(j2_start, j2_end, 2, 1), Ok(()));
+        assert_eq!(q.submit_seq, j2_cmd);
+        assert_eq!(q.free_slots(), MAX_JOB_SLOTS as usize);
+
+        // J2 publishes and completes cleanly; releasing J2 leaves the queue idle.
+        q.publish(2, j2_end, j2_ev + 1);
+        assert!(q.has_published(j2_ev + 1));
+        assert_eq!(q.last_submitted, Some(j2_end));
+        assert!(!q.release_job(false));
+        q.last_completed = Some(j2_end);
+        assert_eq!(q.free_slots(), MAX_JOB_SLOTS as usize);
+        q.clear_event();
+        assert_eq!(q.tail_value, None);
+    }
+
+    #[test]
+    fn prepub_abort_never_corrupts_last_submitted_or_wait_target() {
+        let mut q = WorkQueueOrder::default();
+        q.attach_event(BASE);
+
+        // J0 publishes and remains in flight on the GPU.
+        let (j0_start, _j0_cmd, j0_ev) = q.new_job();
+        let j0_end = j0_start.next();
+        assert_eq!(q.commit(j0_start, j0_end, 2, 1), Ok(()));
+        q.publish(2, j0_end, j0_ev + 1);
+        assert!(!q.release_job(false));
+
+        // J1 commits, then aborts before publishing (e.g. sibling submit() ENOMEM).
+        let (j1_start, j1_cmd, j1_ev) = q.new_job();
+        let j1_end = j1_start.next();
+        assert_eq!(q.commit(j1_start, j1_end, 2, 1), Ok(()));
+        assert!(q.abort_committed(j1_cmd, 2));
+        assert!(!q.release_job(false));
+
+        // last_submitted stays at J0, free_slots counts only J0, and a new barrier
+        // target points at live J0 instead of dead J1.
+        assert_eq!(q.last_submitted, Some(j0_end));
+        assert_eq!(q.free_slots(), (MAX_JOB_SLOTS - 1) as usize);
+        assert!(!q.has_published(j1_ev + 1));
+        assert_eq!(q.wait_target(false), Some((j0_end, j0_ev + 1)));
+        assert_eq!(q.wait_target(true), None);
+    }
+
+    #[test]
+    fn uncommitted_drop_and_partial_commit_uncommit_reset_cleanly() {
+        let mut q = WorkQueueOrder::default();
+        q.attach_event(BASE);
+
+        // Uncommitted job fails before commit() and drops: event resets cleanly.
+        let (start, cmd, ev) = q.new_job();
+        assert_eq!((start, cmd, ev), (BASE, 0, 0));
+        assert!(q.release_job(true));
+        assert_eq!(q.tail_value, None);
+
+        // Partial commit: tail uncommit restores state cleanly; non-tail refuses.
+        q.attach_event(BASE);
+        let (j1_s, j1_c, j1_e) = q.new_job();
+        let j1_end = j1_s.next();
+        assert_eq!(q.commit(j1_s, j1_end, 2, 1), Ok(()));
+        assert!(q.uncommit(j1_s, j1_end, j1_c, 2, j1_e, 1));
+        assert_eq!(q.tail_value, Some(BASE));
+        assert_eq!(q.commit_seq, 0);
+        assert_eq!(q.event_seq, 0);
+        assert!(q.release_job(true));
+
+        // Non-tail uncommit is refused once a later job has committed.
+        q.attach_event(BASE);
+        let (a_s, a_c, a_e) = q.new_job();
+        let a_end = a_s.next();
+        assert_eq!(q.commit(a_s, a_end, 2, 1), Ok(()));
+        let (b_s, _b_c, _b_e) = q.new_job();
+        let b_end = b_s.next();
+        assert_eq!(q.commit(b_s, b_end, 2, 1), Ok(()));
+        assert!(!q.uncommit(a_s, a_end, a_c, 2, a_e, 1));
+        assert_eq!(q.tail_value, Some(b_end));
+    }
+
+    #[test]
+    fn fifo_abort_cancels_dependent_consumer_before_later_independent_publish() {
+        let mut q = WorkQueueOrder::default();
+        q.attach_event(BASE);
+
+        // Producer J1 commits (event_seq = 1), followed by dependent consumer J2
+        // capturing J1's tail wait target, followed by independent producer J3
+        // (event_seq = 2) committed on the same FIFO queue.
+        let (j1_s, j1_c, j1_e) = q.new_job();
+        let j1_end = j1_s.next();
+        assert_eq!(q.commit(j1_s, j1_end, 2, 1), Ok(()));
+        let (j2_wait_stamp, j2_wait_seq) = q.wait_target(true).unwrap();
+        assert_eq!((j2_wait_stamp, j2_wait_seq), (j1_end, j1_e + 1));
+
+        let (j3_s, j3_c, j3_e) = q.new_job();
+        let j3_end = j3_s.next();
+        assert_eq!(q.commit(j3_s, j3_end, 2, 1), Ok(()));
+
+        // FIFO execution: J1 aborts before publishing; J2 runs BEFORE J3 and sees
+        // !has_published(j2_wait_seq), so J2 cancels instead of waiting on dead J1.
+        assert!(q.abort_committed(j1_c, 2));
+        assert!(!q.release_job(true));
+        assert!(!q.has_published(j2_wait_seq));
+
+        // Next in FIFO order, independent J3 publishes cleanly and a subsequent
+        // consumer J4 captures J3's live tail rather than J1's aborted sequence.
+        assert_eq!(q.submit_seq, j3_c);
+        q.publish(2, j3_end, j3_e + 1);
+        assert!(q.has_published(j3_e + 1));
+        assert_eq!(q.wait_target(false), Some((j3_end, j3_e + 1)));
     }
 }
