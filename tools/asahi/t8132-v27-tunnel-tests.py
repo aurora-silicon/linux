@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Replay the T8132 dcpext Thunderbolt DP tunnel flow on both firmware backends.
 
 A T8132 dcpext is driven by the M4 26.6.2 backend (dcp_is_t8132_ext()) or, on

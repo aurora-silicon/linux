@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Replay both streams of a dual-stream Thunderbolt dock through the pairing pass.
 
 On an ordered dual-stream machine each Type-C port has a primary and a

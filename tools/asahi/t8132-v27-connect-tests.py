@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Replay a firmware-27.2 T8132 dcpext's deferred tunnel connect and its release.
 
 The production bodies of the Type-C reconnect work, the DPTX connect, its

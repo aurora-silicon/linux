@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Replay a dock's display going and coming back with a present in flight.
 
 The swap watchdog of a pipeline on firmware with the IOMFB queue (H17P, 27) is
