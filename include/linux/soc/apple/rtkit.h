@@ -434,6 +434,12 @@ int apple_rtkit_sleep_stop(struct apple_rtkit *rtk, void __iomem *cpu_control);
 int apple_rtkit_sleep_return(struct apple_rtkit *rtk, void __iomem *cpu_control);
 
 /*
+ * As apple_rtkit_sleep_return(), for a firmware that boots from scratch: the whole handshake,
+ * then the endpoints that were started. The caller checks pm_resume_via_firmware().
+ */
+int apple_rtkit_sleep_return_with_init(struct apple_rtkit *rtk, void __iomem *cpu_control);
+
+/*
  * A start as after a real sleep, for a co-processor its driver power-cycled without one:
  * the warm restart, the run bit set, then RTKit's handshake.
  */

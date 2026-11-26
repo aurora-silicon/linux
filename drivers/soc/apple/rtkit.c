@@ -2210,6 +2210,21 @@ int apple_rtkit_start_ep(struct apple_rtkit *rtk, u8 endpoint)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_start_ep);
 
+/* Every application endpoint that was started before, started again in endpoint order. */
+static int apple_rtkit_restart_app_endpoints(struct apple_rtkit *rtk)
+{
+	unsigned long endpoint = APPLE_RTKIT_APP_ENDPOINT_START;
+	int ret;
+
+	for_each_set_bit_from(endpoint, rtk->started, APPLE_RTKIT_MAX_ENDPOINTS) {
+		ret = apple_rtkit_start_announced_ep(rtk, endpoint);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
 static void apple_rtkit_mark_running(struct apple_rtkit *rtk)
 {
 	static const u8 system_endpoints[] = {
@@ -2639,8 +2654,11 @@ EXPORT_SYMBOL_GPL(apple_rtkit_set_handshake_timeout);
  * given and its rings, so unlike apple_rtkit_reinit() nothing is freed, and
  * endpoints aren't started again. The caller then sets the run bit and calls
  * apple_rtkit_boot().
+ *
+ * With @full_handshake the firmware sends its endpoint map again: the map is cleared, and
+ * the caller starts the endpoints.
  */
-int apple_rtkit_warm_restart(struct apple_rtkit *rtk)
+static int apple_rtkit_prepare_restart(struct apple_rtkit *rtk, bool full_handshake)
 {
 	unsigned long flags;
 	int ret;
@@ -2652,8 +2670,13 @@ int apple_rtkit_warm_restart(struct apple_rtkit *rtk)
 	reinit_completion(&rtk->iop_pwr_ack_completion);
 	reinit_completion(&rtk->ap_pwr_ack_completion);
 
+	if (full_handshake) {
+		bitmap_zero(rtk->endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
+		set_bit(APPLE_RTKIT_EP_MGMT, rtk->endpoints);
+		rtk->boot_result = -EINPROGRESS;
+	}
 	rtk->crashed = false;
-	rtk->warm_restart = true;
+	rtk->warm_restart = !full_handshake;
 	rtk->iop_power_state = APPLE_RTKIT_PWR_STATE_OFF;
 	rtk->ap_power_state = APPLE_RTKIT_PWR_STATE_OFF;
 	kfifo_reset(&rtk->sync_ack_fifo);
@@ -2671,6 +2694,11 @@ int apple_rtkit_warm_restart(struct apple_rtkit *rtk)
 		apple_mbox_set_recv_enabled(rtk->mbox, true);
 	}
 	return ret;
+}
+
+int apple_rtkit_warm_restart(struct apple_rtkit *rtk)
+{
+	return apple_rtkit_prepare_restart(rtk, false);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_warm_restart);
 
@@ -3548,6 +3576,42 @@ int apple_rtkit_sleep_return(struct apple_rtkit *rtk, void __iomem *cpu_control)
 	return apple_rtkit_boot(rtk);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_sleep_return);
+
+int apple_rtkit_sleep_return_with_init(struct apple_rtkit *rtk, void __iomem *cpu_control)
+{
+	int ret, ap_ret;
+	u64 msg;
+
+	ret = apple_rtkit_prepare_restart(rtk, true);
+	if (ret)
+		return ret;
+	ret = apple_rtkit_mbox_restore(rtk);
+	if (ret)
+		return ret;
+
+	writel(readl(cpu_control) | APPLE_ASC_CPU_CONTROL_RUN, cpu_control);
+	msg = FIELD_PREP(APPLE_RTKIT_MGMT_PWR_STATE, APPLE_RTKIT_PWR_STATE_INIT);
+	ret = apple_rtkit_management_send(rtk, APPLE_RTKIT_MGMT_SET_IOP_PWR_STATE, msg);
+	if (ret)
+		return ret;
+
+	ret = apple_rtkit_wait(rtk, &rtk->epmap_completion);
+	if (ret)
+		return ret;
+	if (rtk->boot_result)
+		return rtk->boot_result;
+	ret = apple_rtkit_wait(rtk, &rtk->iop_pwr_ack_completion);
+	if (ret)
+		return ret;
+	if ((rtk->iop_power_state & 0xff) != APPLE_RTKIT_PWR_STATE_ON)
+		return -EPROTO;
+
+	/* The AP's state goes on even if an endpoint didn't start: the first error is returned. */
+	ret = apple_rtkit_restart_app_endpoints(rtk);
+	ap_ret = apple_rtkit_set_ap_power_state(rtk, APPLE_RTKIT_PWR_STATE_ON);
+	return ret ?: ap_ret;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_sleep_return_with_init);
 
 int apple_rtkit_power_cycled_return(struct apple_rtkit *rtk, void __iomem *cpu_control)
 {
