@@ -36,9 +36,9 @@
 #define APPLE_CLKGEN_PSTATE_BUSY BIT(31)
 
 #define DCS_DEV_PSTATE_MIN_T600X 7
-#define DCS_DEV_PSTATE_MIN_T8103 3
+#define DCS_DEV_PSTATE_MIN_T8103 4
 #define DCS_VALID_STATES_T600X (BIT(5) | BIT(6) | BIT(7) | BIT(9))
-#define DCS_VALID_STATES_T8103 (BIT(3) | BIT(4) | BIT(5) | BIT(6))
+#define DCS_VALID_STATES_T8103 (BIT(4) | BIT(5) | BIT(6))
 #define SYS_DEV_PSTATE_SUSPEND 1
 
 #define APPLE_PMGR_IDLE_POLL_MS 250
@@ -123,6 +123,8 @@ static struct apple_pmgr_misc *apple_pmgr_misc_inst;
 static DECLARE_RWSEM(apple_pmgr_inst_sem);
 static unsigned int idle_fabric_pstate;
 static unsigned int idle_dcs_pstate;
+static bool idle_fabric_pstate_explicit;
+static bool idle_dcs_pstate_explicit;
 static atomic_t apple_pmgr_gpu_tracked = ATOMIC_INIT(0);
 static atomic_t apple_pmgr_gpu_busy = ATOMIC_INIT(0);
 
@@ -898,6 +900,7 @@ static int idle_fabric_pstate_set(const char *val, const struct kernel_param *kp
 	if (ps && misc && !misc->voters_ok)
 		dev_warn(misc->dev, "idle fabric: not every bandwidth voter was found, staying high\n");
 	WRITE_ONCE(idle_fabric_pstate, ps);
+	WRITE_ONCE(idle_fabric_pstate_explicit, true);
 	if (!misc)
 		return 0;
 	if (!ps && !READ_ONCE(idle_dcs_pstate))
@@ -939,6 +942,7 @@ static int idle_dcs_pstate_set(const char *val, const struct kernel_param *kp)
 	if (ps && misc && (misc->pmp_owned || misc->dcs_data))
 		return -EBUSY;
 	WRITE_ONCE(idle_dcs_pstate, ps);
+	WRITE_ONCE(idle_dcs_pstate_explicit, true);
 	if (!misc)
 		return 0;
 	if (!ps && !READ_ONCE(idle_fabric_pstate))
@@ -1311,9 +1315,11 @@ static int apple_pmgr_misc_probe(struct platform_device *pdev)
 		if (ret)
 			return ret;
 		if (!misc->pmp_owned) {
-			if (!READ_ONCE(idle_fabric_pstate) && hw->default_idle_fabric)
+			if (!READ_ONCE(idle_fabric_pstate_explicit) &&
+			    !READ_ONCE(idle_fabric_pstate) && hw->default_idle_fabric)
 				WRITE_ONCE(idle_fabric_pstate, hw->default_idle_fabric);
-			if (!READ_ONCE(idle_dcs_pstate) && hw->default_idle_dcs &&
+			if (!READ_ONCE(idle_dcs_pstate_explicit) &&
+			    !READ_ONCE(idle_dcs_pstate) && hw->default_idle_dcs &&
 			    apple_pmgr_dcs_state_valid(misc, misc->devices[DEV_DCS].active_state) &&
 			    apple_pmgr_dcs_state_valid(misc, hw->default_idle_dcs))
 				WRITE_ONCE(idle_dcs_pstate, hw->default_idle_dcs);

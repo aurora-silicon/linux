@@ -467,11 +467,11 @@ static void pf_match_data_test(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, t600x);
 	KUNIT_ASSERT_NOT_NULL(test, t602x);
 	KUNIT_EXPECT_EQ(test, t8103->dev_min_ps[DEV_FABRIC], 1U);
-	KUNIT_EXPECT_EQ(test, t8103->dev_min_ps[DEV_DCS], 3U);
+	KUNIT_EXPECT_EQ(test, t8103->dev_min_ps[DEV_DCS], 4U);
 	KUNIT_EXPECT_EQ(test, t8103->dcs_valid_states, (u32)DCS_VALID_STATES_T8103);
 	KUNIT_EXPECT_TRUE(test, t8103->single_step);
 	KUNIT_EXPECT_EQ(test, t8103->default_idle_fabric, 1U);
-	KUNIT_EXPECT_EQ(test, t8103->default_idle_dcs, 3U);
+	KUNIT_EXPECT_EQ(test, t8103->default_idle_dcs, 4U);
 	KUNIT_EXPECT_EQ(test, t600x->dev_min_ps[DEV_FABRIC], 1U);
 	KUNIT_EXPECT_EQ(test, t600x->dev_min_ps[DEV_DCS], 7U);
 	KUNIT_EXPECT_EQ(test, t600x->dcs_valid_states, (u32)DCS_VALID_STATES_T600X);
@@ -515,7 +515,7 @@ static void pf_t8103_gpu_tracking_and_dcs_valid_test(struct kunit *test)
 	misc->single_step = true;
 	misc->dcs_valid_states = DCS_VALID_STATES_T8103;
 	misc->devices[DEV_FABRIC].suspend_state = 1;
-	misc->devices[DEV_DCS].suspend_state = 3;
+	misc->devices[DEV_DCS].suspend_state = 4;
 	misc->devices[DEV_FABRIC].active_state = 4;
 	misc->devices[DEV_DCS].active_state = 6;
 	misc->fabric_now = 4;
@@ -524,18 +524,19 @@ static void pf_t8103_gpu_tracking_and_dcs_valid_test(struct kunit *test)
 	writel(0x00000666, f->dcs);
 	pf_publish(f);
 
-	/* T8103 DCS rejects unsafe states (1, 2) and accepts 3..6. */
+	/* T8103 DCS rejects unsafe states (1, 2, 3) and accepts 4..6. */
 	KUNIT_EXPECT_EQ(test, idle_dcs_pstate_set("1", NULL), -EINVAL);
 	KUNIT_EXPECT_EQ(test, idle_dcs_pstate_set("2", NULL), -EINVAL);
-	KUNIT_EXPECT_EQ(test, idle_dcs_pstate_set("3", NULL), 0);
-	KUNIT_EXPECT_EQ(test, idle_dcs_pstate, 3U);
+	KUNIT_EXPECT_EQ(test, idle_dcs_pstate_set("3", NULL), -EINVAL);
+	KUNIT_EXPECT_EQ(test, idle_dcs_pstate_set("4", NULL), 0);
+	KUNIT_EXPECT_EQ(test, idle_dcs_pstate, 4U);
 	cancel_delayed_work_sync(&misc->idle_work);
 	cancel_delayed_work_sync(&misc->idle_work_prompt);
 
 	/*
 	 * With GPU tracking active, an always-on gfx PMGR voter does not
 	 * block idle while gpu_busy == 0, and single-stepping walks 4->3->2->1
-	 * on fabric and 6->5->4->3 on DCS.
+	 * on fabric and 6->5->4 on DCS.
 	 */
 	f->votes[0] = PF_VOTE_BUSY;
 	KUNIT_EXPECT_TRUE(test, apple_pmgr_voters_active(misc));
@@ -544,16 +545,16 @@ static void pf_t8103_gpu_tracking_and_dcs_valid_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, apple_pmgr_voters_active(misc));
 
 	WRITE_ONCE(idle_fabric_pstate, 1);
-	WRITE_ONCE(idle_dcs_pstate, 3);
+	WRITE_ONCE(idle_dcs_pstate, 4);
 	pf_step_cnt = 0;
 	apple_pmgr_idle_eval(misc);
 	KUNIT_EXPECT_EQ(test, misc->fabric_now, 1U);
-	KUNIT_EXPECT_EQ(test, misc->dcs_now, 3U);
-	KUNIT_EXPECT_EQ(test, pf_step_cnt, 6U);
+	KUNIT_EXPECT_EQ(test, misc->dcs_now, 4U);
+	KUNIT_EXPECT_EQ(test, pf_step_cnt, 5U);
 	KUNIT_EXPECT_EQ(test, pf_step_log[0], 3U);
 	KUNIT_EXPECT_EQ(test, pf_step_log[2], 1U);
 	KUNIT_EXPECT_EQ(test, pf_step_log[3], 5U);
-	KUNIT_EXPECT_EQ(test, pf_step_log[5], 3U);
+	KUNIT_EXPECT_EQ(test, pf_step_log[4], 4U);
 	cancel_delayed_work_sync(&misc->idle_work_prompt);
 
 	/* Busy timeout on raise unwinds gpu_busy and returns error. */
@@ -565,9 +566,9 @@ static void pf_t8103_gpu_tracking_and_dcs_valid_test(struct kunit *test)
 	/* Clear injected busy and restore clean registers. */
 	pf_step_inject_busy = false;
 	writel(0x00000111, f->fabric);
-	writel(0x00000333, f->dcs);
+	writel(0x00000444, f->dcs);
 	misc->fabric_now = 1;
-	misc->dcs_now = 3;
+	misc->dcs_now = 4;
 
 	/* Normal raise succeeds and lifts both fabric and DCS synchronously. */
 	KUNIT_EXPECT_EQ(test, apple_pmgr_gpu_busy_get(), 0);
@@ -583,8 +584,10 @@ static void pf_t8103_gpu_tracking_and_dcs_valid_test(struct kunit *test)
 
 	/* Path validation rejects stepping across an invalid intermediate DCS state. */
 	writel(0x00000666, f->dcs);
-	KUNIT_EXPECT_EQ(test, apple_pmgr_step_to(f->dcs, 3, BIT(3) | BIT(4) | BIT(6), &last), -EINVAL);
+	KUNIT_EXPECT_EQ(test, apple_pmgr_step_to(f->dcs, 4, BIT(4) | BIT(6), &last), -EINVAL);
 	WRITE_ONCE(idle_dcs_pstate, 0);
+	WRITE_ONCE(idle_dcs_pstate_explicit, false);
+	WRITE_ONCE(idle_fabric_pstate_explicit, false);
 }
 
 /*
