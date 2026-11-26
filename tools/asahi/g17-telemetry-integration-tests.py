@@ -101,9 +101,11 @@ mod g17 {
             pub cursors:[[AtomicU32;2];2],
             pub slots:RefCell<[[[u32;18];8];2]>,
             pub m5:bool,
+            pub power_mw:Option<u32>,
         }
         impl InitData {
-            pub fn new()->Self { Self { cursors:std::array::from_fn(|_|std::array::from_fn(|_|AtomicU32::new(0))), slots:RefCell::new([[[0;18];8];2]), m5:false } }
+            pub fn new()->Self { Self { cursors:std::array::from_fn(|_|std::array::from_fn(|_|AtomicU32::new(0))), slots:RefCell::new([[[0;18];8];2]), m5:false, power_mw:None } }
+            pub fn m5_gpu_power_mw(&self)->Result<u32> { self.power_mw.ok_or(-22) }
             INITDATA_FAMILY
             pub fn push(&self,role:Role,words:[u32;18]) {
                 use std::sync::atomic::Ordering::Relaxed;
@@ -146,7 +148,15 @@ mod g17 {
     impl State {
         fn lock(&self)->std::sync::MutexGuard<'_,Option<Box<Firmware>>> { self.0.lock().unwrap() }
     }
-    struct Variant { graph:fw::variant::InitGraph, telemetry_protocol:telemetry::Protocol }
+    mod thermal {
+        use std::sync::atomic::{AtomicI32, Ordering};
+        pub static HOTSPOT: AtomicI32 = AtomicI32::new(i32::MIN);
+        pub fn hotspot_temperature_mc() -> Option<i32> {
+            let v = HOTSPOT.load(Ordering::Relaxed);
+            (v != i32::MIN).then_some(v)
+        }
+    }
+    struct Variant { graph:fw::variant::InitGraph, telemetry_protocol:telemetry::Protocol, m5_commands:bool }
     struct Shared { state:State, dev:crate::device::Device, variant:Variant, crashed:std::sync::atomic::AtomicBool }
     mod reports;
 '''
@@ -160,11 +170,11 @@ RUST_TESTS = r'''
 
     fn reader_with(graph:fw::variant::InitGraph,protocol:telemetry::Protocol,frequencies:Option<stats::StateFrequencies>)->stats::Reader {
         let max_pstate=frequencies.as_ref().map_or(0,stats::StateFrequencies::max_pstate);
-        stats::Reader(std::sync::Arc::new(Shared {
+        stats::Reader::new(std::sync::Arc::new(Shared {
             state:State(std::sync::Mutex::new(Some(Box::new(Firmware {
                 rings:channel::Rings::new(graph,protocol,max_pstate).unwrap(),
                 init:initdata::InitData::new(),powered:true,epoch:0,recovery:Recovery(false),
-            })))),dev:crate::device::Device,variant:Variant { graph, telemetry_protocol:protocol },crashed:false.into(),
+            })))),dev:crate::device::Device,variant:Variant { graph, telemetry_protocol:protocol, m5_commands:false },crashed:false.into(),
         }),frequencies)
     }
 
@@ -510,7 +520,7 @@ RUST_TESTS = r'''
         init.push(Secondary,HIST_ACTIVE);
         let shared=std::sync::Arc::new(Shared { state:State(std::sync::Mutex::new(Some(Box::new(Firmware {
             rings,init:initdata::InitData::new(),powered:true,epoch:0,recovery:Recovery(false),
-        })))),dev,variant:Variant { graph, telemetry_protocol:telemetry::Protocol::PSTATE_16MS },crashed:false.into() });
+        })))),dev,variant:Variant { graph, telemetry_protocol:telemetry::Protocol::PSTATE_16MS, m5_commands:false },crashed:false.into() });
         let view=reports::View(shared.clone());
         struct View<'a>(&'a reports::View);
         impl std::fmt::Display for View<'_> {
@@ -632,6 +642,31 @@ RUST_TESTS = r'''
         rings.drain_statistics(&dev,&init,Primary);
         assert_eq!(rings.read_statistics(1).pstate_status,telemetry::UNAVAILABLE);
     }
+
+    #[test]
+    fn m5_reader_exposes_power_and_hotspot_while_non_m5_marks_unsupported() {
+        use {fw::variant::InitGraph,std::sync::atomic::Ordering::Relaxed};
+        let non_m5=reader(InitGraph::G17P);
+        let non_m5_view=non_m5.read();
+        assert_eq!(non_m5_view.power_status,telemetry::UNSUPPORTED);
+        assert_eq!(non_m5_view.temp_status,telemetry::UNSUPPORTED);
+
+        let m5=stats::Reader::new(std::sync::Arc::new(Shared {
+            state:State(std::sync::Mutex::new(Some(Box::new(Firmware {
+                rings:channel::Rings::new(InitGraph::G17P,telemetry::Protocol::PSTATE_8MS,13).unwrap(),
+                init:initdata::InitData::new(),powered:true,epoch:0,recovery:Recovery(false),
+            })))),dev:crate::device::Device,variant:Variant { graph:InitGraph::G17P, telemetry_protocol:telemetry::Protocol::PSTATE_8MS, m5_commands:true },crashed:false.into(),
+        }),None);
+        m5.0.state.lock().as_mut().unwrap().init.power_mw=Some(42150);
+        thermal::HOTSPOT.store(54321,Relaxed);
+        NOW.with(|now| now.set(1_000_000_000));
+        let view=m5.read();
+        assert_eq!(view.power_status,telemetry::VALID);
+        assert_eq!(view.power_mw,42150);
+        assert_eq!(view.temp_status,telemetry::VALID);
+        assert_eq!(view.temp_mc,54321);
+        thermal::HOTSPOT.store(i32::MIN,Relaxed);
+    }
 }
 '''
 
@@ -644,8 +679,10 @@ C_HEADER = r'''
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+typedef int32_t s32;
 typedef uint32_t u32;
 typedef uint64_t u64;
+#define IS_REACHABLE(x) 0
 #define PAGE_SIZE 4096
 #define READ_ONCE(x) (x)
 #define container_of(ptr,type,member) ((type*)((char*)(ptr)-offsetof(type,member)))
@@ -777,6 +814,16 @@ int main(void) {
     current=(struct asahi_qualified_stats){.util_status=1,.pstate_status=1,.pstate=6,.busy_status=2,.busy_ns=77};
     agx_stats_show(NULL,&stats.attr,now);
     assert(strstr(now,"busy_ns stale\n") && !strstr(now,"busy_ns 77"));
+    /* M5: valid power and hotspot temperature appear in agx_stats. */
+    current=(struct asahi_qualified_stats){.util_status=1,.pstate_status=1,.pstate=13,.achieved_frequency_hz=1620000000,
+                                          .power_status=1,.power_mw=42150,.temp_status=1,.temp_mc=54321};
+    agx_stats_show(NULL,&stats.attr,now);
+    assert(strstr(now,"power_mw 42150\n"));
+    assert(strstr(now,"hotspot_temperature_mc 54321\n"));
+    current.power_status=3;current.temp_status=3;
+    agx_stats_show(NULL,&stats.attr,now);
+    assert(strstr(now,"power_mw unsupported\n"));
+    assert(strstr(now,"hotspot_temperature_mc unsupported\n"));
     /* G16S: pstate unsupported by firmware, utilisation still valid. */
     current=(struct asahi_qualified_stats){.util_status=1,.pstate_status=3,.tiler=30,.renderer=80,.device=57,.pstate=0,
                                           .util_samples=19,.util_host_ns=123};
@@ -900,12 +947,13 @@ fn write_power(_: &super::Firmware, f:&mut kernel::fmt::Formatter<'_>)->kernel::
     header = (RUST_HEADER.replace('M5_STATISTICS_TYPES', m5_types).replace('M5_ASSERTS_GPU_POWER', m5_power)
               .replace('INITDATA_FAMILY', family))
 
-    reader_rs = ('#[derive(Clone, Copy, Debug, PartialEq, Eq)]\n' + item(stats_rs, 'pub(crate) struct StateFrequencies')
+    reader_consts = '\n'.join(line for line in stats_rs.splitlines() if line.startswith('const HOTSPOT_'))
+    reader_rs = (reader_consts + '\n#[derive(Clone, Copy, Debug, PartialEq, Eq)]\n' + item(stats_rs, 'pub(crate) struct StateFrequencies')
                  + '\n' + item(stats_rs, 'impl StateFrequencies') + '\n'
-                 + 'pub(crate) struct Reader(pub(super) Arc<Shared>, pub(super) Option<StateFrequencies>);\n'
+                 + 'pub(crate) struct Reader(pub(super) Arc<Shared>, pub(super) Option<StateFrequencies>, AtomicI32, AtomicU64);\n'
                  + item(stats_rs, 'impl Reader'))
     (work / 'rings.rs').write_text(header + 'mod stats { use super::{fw::variant::InitGraph, telemetry::Readout, Shared};\n'
-                                  + 'use std::sync::{Arc,atomic::Ordering};\n' + reader_rs + '\n'
+                                  + 'use std::sync::{Arc,atomic::{AtomicI32,AtomicU64,Ordering}};\n' + reader_rs + '\n'
                                   + policy + '\n}\nmod telemetry;\nmod channel;\n' + RUST_TESTS)
     # Rust resolves child modules relative to the inline parent's directory.
     (work / 'g17').mkdir(exist_ok=True)
