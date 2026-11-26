@@ -279,6 +279,9 @@ struct t6030_sleep {
 	void __iomem *pmp_mbox, *mtp_dart;
 	int pmp_idle_ret;
 	u64 pmp_ack[2];
+	/* The DISPEXT1 power gate as the entry found it */
+	u32 gate_dispext1_saved;
+	bool gate_dispext1_staged;
 };
 
 static struct apple_sleep_smc_policy t6030_smc_policy;
@@ -574,6 +577,9 @@ static void t6030_sleep_check_stops(void)
  */
 #define T6030_SPMI_RX_EMPTY		BIT(24)
 #define T6030_SPMI_DONE			BIT(0)
+/* The nub SPMI controllers' gen-1 interrupt words: masks from +0x20, acks from +0x60 */
+#define T6030_SPMI_MASK(n)		(0x20 + 4 * (n))
+#define T6030_SPMI_ACK(n)		(0x60 + 4 * (n))
 #define T6030_SPMI_POLL_US		1000
 
 static int t6030_pmu_xfer(struct apple_sleep *s, u32 mask, u8 opcode, u16 address,
@@ -899,10 +905,35 @@ static void t6030_mtp_dart_quiet(struct apple_sleep *s)
 	readl(d + T6030_DART_704);
 }
 
+/*
+ * macOS 27.2's entry on J516s, every run (ref/t6030-macos-s2r-fixed-sequence.tsv), before its last
+ * 30 ms: at -4.44 s nub-spmi-a0's fourth ack word gets bit 1; at -4.43 s, with DISPEXT1's words
+ * going off, the power gate at +0x16ec goes from 0 to 3 (back to 0 at 59.6 ms into the wake); at
+ * -3.44 s SPI2's word is lowered. In its last 30 ms, after the PMU's 0xf801, I2C6's word is
+ * lowered (-27.4 ms). Under Linux DISPEXT1, SPI2 and I2C6 are already off; the gate isn't set.
+ */
+#define T6030_PWRGATE_DISPEXT1		0x16ec
+#define T6030_PWRGATE_DISPEXT1_OFF	3
+#define T6030_PS_SPI2			0x270
+#define T6030_PS_I2C6			0x220
+#define T6030_SPMI_A0_ENTRY_ACK3	BIT(1)
+
+static void t6030_sleep_late_entry(struct apple_sleep *s)
+{
+	struct t6030_sleep *t = t6030_state(s);
+
+	writel(T6030_SPMI_A0_ENTRY_ACK3, s->spmi_a0 + T6030_SPMI_ACK(3));
+	t->gate_dispext1_saved = readl(s->pwrgate + T6030_PWRGATE_DISPEXT1);
+	t->gate_dispext1_staged = true;
+	writel(T6030_PWRGATE_DISPEXT1_OFF, s->pwrgate + T6030_PWRGATE_DISPEXT1);
+	sleep_ps_lower(s, T6030_PS_SPI2);
+}
+
 static void t6030_sleep_prepare_regs(struct apple_sleep *s)
 {
 	struct t6030_sleep *t = t6030_state(s);
 
+	t6030_sleep_late_entry(s);
 	/*
 	 * The RAM walk first: what follows, up to the commit, is macOS's last 30 ms (t5), and the
 	 * commit's 1.8 ms tail still cleans what the steps below write.
@@ -913,6 +944,7 @@ static void t6030_sleep_prepare_regs(struct apple_sleep *s)
 	writel(0, s->wdt + WDT_WD0_COUNT);
 	writel(0, s->wdt + WDT_WD1_COUNT);
 	sleep_pmu_write(s, s->soc->pmu_sleep_reg, s->soc->pmu_sleep_val);
+	sleep_ps_lower(s, T6030_PS_I2C6);
 	t->notify_saved[0] = readl(s->spmi_a0 + SPMI_NOTIFY_ENABLE);
 	t->notify_saved[1] = readl(s->spmi + SPMI_NOTIFY_ENABLE);
 	t->notify_staged = true;
@@ -1451,12 +1483,10 @@ static void t6030_sleep_wake_check_ps(struct apple_sleep *s, const char *step)
  */
 /*
  * macOS 27.2's wake on J516s, 12.97-13.13 ms (ref/t6030-macos-wake-full.tsv), after the memory
- * side and before the cores' starts: on nub-spmi0 (gen-1 layout: mask words from +0x20, acks
- * from +0x60) the latched RTC alarm, source 2, acked and the first mask word set to 0x1000; on
- * nub-spmi-a0 bit 25 of its third ack word acked and its third mask word set to 0x80000000.
+ * side and before the cores' starts: on nub-spmi0 the latched RTC alarm, source 2, acked and the
+ * first mask word set to 0x1000; on nub-spmi-a0 bit 25 of its third ack word acked and its third
+ * mask word set to 0x80000000.
  */
-#define T6030_SPMI_MASK(n)		(0x20 + 4 * (n))
-#define T6030_SPMI_ACK(n)		(0x60 + 4 * (n))
 #define T6030_SPMI_WAKE_ACK0		BIT(2)
 #define T6030_SPMI_WAKE_MASK0		BIT(12)
 #define T6030_SPMI_A0_WAKE_ACK2		BIT(25)
@@ -1504,6 +1534,10 @@ static void t6030_sleep_wake(struct apple_sleep *s)
 	sleep_ps_rewake_words(s, &t6030_wake_late_words, false);
 	sleep_ps_rewake_rest(s);
 	t6030_sleep_down_aon_back(s);
+	if (t->gate_dispext1_staged) {
+		writel(t->gate_dispext1_saved, s->pwrgate + T6030_PWRGATE_DISPEXT1);
+		t->gate_dispext1_staged = false;
+	}
 	t6030_sleep_wake_check_ps(s, "at the end");
 	sleep_note(s, 0x75);
 }
