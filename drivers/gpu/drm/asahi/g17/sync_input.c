@@ -137,20 +137,66 @@ void asahi_g17_put_fence(struct dma_fence *fence)
 }
 
 /*
- * One fence that signals once every one of @fences has: unwrapped, already
- * signalled members dropped and same-context members deduplicated. The
- * fences stay borrowed; returns a new reference, or NULL without memory.
+ * One fence that signals once every one of @fences has: already-signalled
+ * non-error members are skipped, small inputs deduplicate identical pointers
+ * and same-context members (keeping the latest seqno), already-signalled
+ * error status is preserved, and 2+ remaining fences join an inline-drained
+ * asahi_g17_barrier rather than a sorted dma_fence_array. The fences stay
+ * borrowed; returns a new reference, or NULL without memory.
  */
 struct dma_fence *asahi_g17_merge_fences(struct dma_fence *const *fences, size_t count)
 {
-	struct dma_fence_unwrap *cursors;
+	enum { INLINE_CAP = 64, DEDUP_LIMIT = 16 };
+	struct dma_fence *stack_buf[INLINE_CAP];
+	struct dma_fence **unsignaled = stack_buf;
+	struct dma_fence *first_err = NULL;
 	struct dma_fence *merged;
+	size_t i, j, n = 0;
 
-	cursors = kmalloc_array(count, sizeof(*cursors), GFP_KERNEL);
-	if (!cursors)
-		return NULL;
-	merged = __dma_fence_unwrap_merge(count, (struct dma_fence **)fences, cursors);
-	kfree(cursors);
+	if (count > INLINE_CAP) {
+		unsignaled = kmalloc_array(count, sizeof(*unsignaled), GFP_KERNEL);
+		if (!unsignaled)
+			return NULL;
+	}
+	for (i = 0; i < count; ++i) {
+		struct dma_fence *f = fences[i];
+		int status;
+		bool dup = false;
+
+		if (!f)
+			continue;
+		status = dma_fence_get_status(f);
+		if (status > 0)
+			continue;
+		if (status < 0) {
+			if (!first_err)
+				first_err = f;
+			continue;
+		}
+		if (n <= DEDUP_LIMIT) {
+			for (j = 0; j < n; ++j) {
+				if (unsignaled[j] == f) {
+					dup = true;
+					break;
+				}
+				if (f->context != 0 && unsignaled[j]->context == f->context) {
+					if (dma_fence_is_later(f, unsignaled[j]))
+						unsignaled[j] = f;
+					dup = true;
+					break;
+				}
+			}
+		} else if (unsignaled[n - 1] == f) {
+			dup = true;
+		}
+		if (!dup)
+			unsignaled[n++] = f;
+	}
+	if (first_err)
+		unsignaled[n++] = first_err;
+	merged = asahi_g17_barrier_create(unsignaled, n);
+	if (unsignaled != stack_buf)
+		kfree(unsignaled);
 	return merged;
 }
 

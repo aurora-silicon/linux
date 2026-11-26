@@ -33,13 +33,23 @@ impl super::dependency::FenceOrder for Fence {
 
 /// One fence that signals once all of `fences` have (see `job::MERGED_DEPENDENCIES`).
 pub(super) fn merge(fences: &[Fence]) -> Result<Fence> {
-    let mut raw = KVec::with_capacity(fences.len(), GFP_KERNEL)?;
-    for fence in fences {
-        raw.push(fence.raw(), GFP_KERNEL)?;
-    }
-    // SAFETY: Every pointer is a live fence borrowed from `fences` for this call;
-    // the helper only reads them and returns a new reference of its own.
-    let merged = unsafe { asahi_g17_merge_fences(raw.as_ptr(), raw.len()) };
+    let mut stack = [core::ptr::null_mut(); 64];
+    let merged = if fences.len() <= stack.len() {
+        for (slot, fence) in stack.iter_mut().zip(fences.iter()) {
+            *slot = fence.raw();
+        }
+        // SAFETY: Every pointer is a live fence borrowed from `fences` for this call;
+        // the helper only reads them and returns a new reference of its own.
+        unsafe { asahi_g17_merge_fences(stack.as_ptr(), fences.len()) }
+    } else {
+        let mut raw = KVec::with_capacity(fences.len(), GFP_KERNEL)?;
+        for fence in fences {
+            raw.push(fence.raw(), GFP_KERNEL)?;
+        }
+        // SAFETY: Every pointer is a live fence borrowed from `fences` for this call;
+        // the helper only reads them and returns a new reference of its own.
+        unsafe { asahi_g17_merge_fences(raw.as_ptr(), raw.len()) }
+    };
     if merged.is_null() {
         return Err(ENOMEM);
     }
