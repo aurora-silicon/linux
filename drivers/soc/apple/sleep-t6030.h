@@ -1713,6 +1713,26 @@ static void t6030_sleep_down_aon_back(struct apple_sleep *s)
  * The other cores stopped: the storage PHY's word, then what the wake sequences write back,
  * read before the DT's sequence to the commit word changes any of it
  */
+/*
+ * macOS 27.2 halts ANS's CPU but keeps ANS and the storage PCIe domains powered through the commit
+ * on J516S (both final-WFI snapshots: ANS 0x1f0023ff, APCIE_SYS_ST 0x1f0003ff, APCIE_ST 0x2ff);
+ * Linux's stop lowers all three. Raised again here, after every coprocessor's stop, parents
+ * first; ANS's CPU comes up halted with its domain. Off: Linux's state at the commit as before.
+ */
+static bool t6030_storage_on;
+module_param_named(storage_on, t6030_storage_on, bool, 0644);
+MODULE_PARM_DESC(storage_on, "T6030: ANS and the storage PCIe domains powered at the commit, as macOS (ANS's CPU halted)");
+
+static void t6030_storage_on_at_commit(struct apple_sleep *s)
+{
+	if (!READ_ONCE(t6030_storage_on))
+		return;
+	if (sleep_ps_raise(s, T6030_PS_APCIE_SYS_ST) ||
+	    sleep_ps_raise_start(s, T6030_PS_APCIE_ST) ||
+	    sleep_ps_raise(s, T6030_PS_ANS))
+		t6030_sleep_failed("storage power words on");
+}
+
 static void t6030_sleep_commit_regs(struct apple_sleep *s)
 {
 	struct t6030_sleep *t = t6030_state(s);
@@ -1726,6 +1746,7 @@ static void t6030_sleep_commit_regs(struct apple_sleep *s)
 	 * these words made the PMP's commit stop time out (-ETIMEDOUT, J516S).
 	 */
 	t6030_sleep_down(s);
+	t6030_storage_on_at_commit(s);
 	t6030_gp_phy_park(s);
 	if (t6030_sleep_lower(s, T6030_LOWER_PHY, ARRAY_SIZE(t6030_lowered)))
 		t6030_sleep_failed("storage PHY power word");
