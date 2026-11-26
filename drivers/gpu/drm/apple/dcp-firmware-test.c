@@ -193,7 +193,7 @@ static void dcp_firmware_27_pin_precedence(struct kunit *test)
 
 	fx->props[0].value = compat_27_3;
 	KUNIT_EXPECT_EQ(test, dcp_check_firmware_version(&fx->dev),
-			DCP_FIRMWARE_UNKNOWN);
+			DCP_FIRMWARE_V_27_0);
 	fx->props[0].value = compat_27_2;
 
 	/* T6041 internal and external UUID pins remain enforced on 27.2. */
@@ -276,7 +276,7 @@ static void dcp_firmware_27_pin_precedence(struct kunit *test)
 			DCP_FIRMWARE_UNKNOWN);
 	fx->props[0].value = compat_27_3;
 	KUNIT_EXPECT_EQ(test, dcp_check_firmware_version(&fx->dev),
-			DCP_FIRMWARE_UNKNOWN);
+			DCP_FIRMWARE_V_27_0);
 	fx->props[0].value = compat_26_6;
 	KUNIT_EXPECT_EQ(test, dcp_check_firmware_version(&fx->dev),
 			DCP_FIRMWARE_H17P);
