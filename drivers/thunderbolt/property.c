@@ -246,6 +246,8 @@ struct tb_property_dir *tb_property_parse_dir(const u32 *block,
 	const struct tb_property_rootdir_entry *rootdir =
 		(const struct tb_property_rootdir_entry *)block;
 
+	if (block_len < sizeof(*rootdir) / 4)
+		return NULL;
 	if (rootdir->magic != TB_PROPERTY_ROOTDIR_MAGIC)
 		return NULL;
 	if (rootdir->length > block_len)

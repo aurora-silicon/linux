@@ -3039,6 +3039,23 @@ static void tb_test_property_parse_zero_length(struct kunit *test)
 	tb_property_free_dir(dir);
 }
 
+/* A block shorter than the root directory header is not read past. */
+static void tb_test_property_parse_short_block(struct kunit *test)
+{
+	size_t len;
+
+	for (len = 0; len < 2; len++) {
+		/* Exactly the block, so a read past it is caught */
+		u32 *block = kunit_kzalloc(test, max_t(size_t, len, 1) * sizeof(u32),
+					   GFP_KERNEL);
+
+		KUNIT_ASSERT_NOT_NULL(test, block);
+		block[0] = 0x55584401;	/* rootdir magic */
+		KUNIT_EXPECT_NULL_MSG(test, tb_property_parse_dir(block, len),
+				      "%zu dwords", len);
+	}
+}
+
 static void tb_test_property_parse_rootdir_overflow(struct kunit *test)
 {
 	u32 *block = kunit_kzalloc(test, 4 * sizeof(u32), GFP_KERNEL);
@@ -5136,6 +5153,7 @@ static struct kunit_case tb_test_cases[] = {
 	KUNIT_CASE(tb_test_property_copy),
 	KUNIT_CASE(tb_test_property_parse_zero_length),
 	KUNIT_CASE(tb_test_property_parse_rootdir_overflow),
+	KUNIT_CASE(tb_test_property_parse_short_block),
 	KUNIT_CASE(tb_test_property_merge),
 	KUNIT_CASE(tb_test_drom_entry_lengths),
 	KUNIT_CASE(tb_test_drom_product_descriptor),
