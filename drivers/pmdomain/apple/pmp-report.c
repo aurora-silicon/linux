@@ -1401,6 +1401,56 @@ module_param_cb(diag_feed, &pmp_diag_bool_ops, &pmp_diag_feed, 0644);
 module_param_cb(diag_dvfs, &pmp_diag_ulong_ops, &pmp_diag_dvfs, 0644);
 
 /*
+ * DIAGNOSTIC (T6030): macOS 27.2's memory-controller doorbell to the J516S PMP (lane A,
+ * t6030-macos-mc-drv-ctrl-doorbells): a quota on MC-DRV-TO-CTRL[4] (+0x109e0) in three steps,
+ * raise 0x180000, 0x1800180000, 0x180018000c, or drop 0x18000c, 0x180000, 0; then [9] (+0x10a08)
+ * = 0 and the sequence number on [8] (+0x10a00), which the PMP echoes on MC-CTRL-TO-DRV[8]
+ * (+0x1500) about 0.4 ms later, with its status in [0..7] (+0x1480..). macOS's first one, a raise
+ * with sequence 2, comes 6.7 s after the PMP starts; at a display-off it drops the quota and rings
+ * once more, 7.6 ms before the DCP's M3 power-down. Write 1 to raise, 2 to drop, 3 to ring alone.
+ */
+static u32 pmp_diag_mc_seq = 2;
+
+static int pmp_diag_mc_set(const char *val, const struct kernel_param *kp)
+{
+	static const u64 raise[] = { 0x180000, 0x1800180000ULL, 0x180018000cULL };
+	static const u64 drop[] = { 0x18000c, 0x180000, 0 };
+	struct apple_pmp_report *rep = READ_ONCE(pmp_diag_rep);
+	const u64 *steps = NULL;
+	u64 echo = 0, st[8];
+	unsigned int op, i;
+	int ret = kstrtouint(val, 0, &op);
+
+	if (ret)
+		return ret;
+	if (!rep)
+		return -ENODEV;
+	if (op == 1)
+		steps = raise;
+	else if (op == 2)
+		steps = drop;
+	else if (op != 3)
+		return -EINVAL;
+	for (i = 0; steps && i < 3; i++)
+		writeq(steps[i], rep->base + 0x109e0);
+	writeq(0, rep->base + 0x10a08);
+	writeq(pmp_diag_mc_seq, rep->base + 0x10a00);
+	ret = readq_poll_timeout(rep->base + 0x1500, echo, echo == pmp_diag_mc_seq, 50, 20000);
+	for (i = 0; i < 8; i++)
+		st[i] = readq(rep->base + 0x1480 + 16 * i);
+	dev_info(rep->dev, "DIAGNOSTIC: MC doorbell op %u seq %u: echo %#llx (%d); status %#llx %#llx %#llx %#llx %#llx %#llx %#llx %#llx\n",
+		 op, pmp_diag_mc_seq, echo, ret, st[0], st[1], st[2], st[3], st[4], st[5], st[6], st[7]);
+	pmp_diag_mc_seq++;
+	return 0;
+}
+
+static const struct kernel_param_ops pmp_diag_mc_ops = {
+	.set = pmp_diag_mc_set,
+};
+module_param_cb(diag_mc, &pmp_diag_mc_ops, NULL, 0200);
+MODULE_PARM_DESC(diag_mc, "DIAGNOSTIC (T6030): macOS's MC doorbell to the PMP: 1 raise, 2 drop, 3 ring");
+
+/*
  * DIAGNOSTIC: request bits set and cleared every 28 ms in turn (a 56 ms period), as macOS 27.2's
  * AVD request (bit 11) moves while its display runs (mac-watch-stop-3: 646 toggles, median 56 ms),
  * kept running through the DCP's power-down as on macOS. 0 clears them and stops.
