@@ -8,6 +8,7 @@
  * read here. On T8140 at EL2 the sleep driver sends the request at the
  * irreversible commit boundary. Only errors before send may refuse.
  */
+#include <linux/bitfield.h>
 #include <linux/compiler.h>
 #include <linux/delay.h>
 #include <linux/device.h>
@@ -35,6 +36,15 @@
 /* The state word of a PMGR power domain, as pmgr-pwrstate has it. */
 #define SEP_PS_DEV_DISABLE	BIT(10)
 #define SEP_PS_ACTUAL		GENMASK(7, 4)
+
+/*
+ * After its sleep request, the enclave has gone down: DEV_DISABLE where its firmware sets
+ * it, or its actual state at 0. The M1's enclave never sets DEV_DISABLE (measured on J313).
+ */
+static bool sep_ps_down(u32 state)
+{
+	return (state & SEP_PS_DEV_DISABLE) || !FIELD_GET(SEP_PS_ACTUAL, state);
+}
 
 /* One-shot precommit test: no SLEEP request or commit coprocessor stop. */
 static bool sleep_refuse_before_send;
@@ -334,7 +344,7 @@ out:
 	 * the native contract, not proved atomic by the preceding PMGR sample.
 	 */
 	apple_mbox_set_recv_enabled(c->mbox, false);
-	c->gate_ret = readl_poll_timeout_atomic(c->ps, c->state, c->state & SEP_PS_DEV_DISABLE,
+	c->gate_ret = readl_poll_timeout_atomic(c->ps, c->state, sep_ps_down(c->state),
 						SEP_PM_POLL_US, SEP_PM_TIMEOUT_US);
 	c->gate_valid = true;
 	if (c->gate_ret)

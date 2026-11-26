@@ -241,6 +241,7 @@ impl ParkedPair {
             &first.command,
             self.clusters,
             self.variant.programs,
+            self.board,
         )?;
         let aliases = [
             kicks[0].prepare_client_alias(context.vm())?,

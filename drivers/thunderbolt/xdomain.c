@@ -762,7 +762,10 @@ static void stop_handshake(struct tb_xdomain *xd)
 
 /*
  * The XDomain discovery requests answered while the control channel is kept
- * through s2idle (tb->noirq_ctl_retained): they only read state.
+ * through s2idle (tb->noirq_ctl_retained). They change no state: UUID and
+ * properties are answered from memory, and LINK_STATE_STATUS_REQUEST reads
+ * the downstream port's registers, under tb->lock, from a host router that
+ * stays powered (QUIRK_NO_SYSTEM_SLEEP).
  */
 VISIBLE_IF_KUNIT bool tb_xdp_noirq_request(enum tb_xdp_type type)
 {

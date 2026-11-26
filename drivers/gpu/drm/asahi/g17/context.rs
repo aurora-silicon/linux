@@ -223,9 +223,12 @@ pub(crate) struct Context {
     /// The kernel closed this context's queue on its client's behalf
     /// (`Firmware::close_failed_owners`) and the client has not closed it yet.
     closed_for_open_client: AtomicBool,
-    /// Advisory only: publication still checks the physical binding under the
-    /// device mutex. False skips an inline attempt known to need admission.
-    compute_binding_hint: AtomicBool,
+    /// Advisory count of bound compute channels: publication still checks the physical binding
+    /// under the device mutex. Zero skips an inline attempt known to need admission.
+    compute_bindings: AtomicU32,
+    /// Shared monotonic compute completion ordinal / submit sequence across an M5 multi-channel
+    /// context's physical compute queues.
+    compute_ordinal: AtomicU32,
     /// Mixed-engine contexts keep the original inline publication path.
     render_seen: AtomicBool,
     qos: Arc<QosLease>,
@@ -361,7 +364,8 @@ impl Context {
             kill_seen: AtomicU64::new(u64::MAX),
             closed_generation: AtomicU64::new(u64::MAX),
             closed_for_open_client: AtomicBool::new(false),
-            compute_binding_hint: AtomicBool::new(false),
+            compute_bindings: AtomicU32::new(0),
+            compute_ordinal: AtomicU32::new(0),
             render_seen: AtomicBool::new(false),
             qos,
             owner_pid,
@@ -388,7 +392,11 @@ impl Context {
     }
     pub(crate) fn compute_binding_hint(&self) -> bool {
         self.render_seen.load(Ordering::Acquire)
-            || self.compute_binding_hint.load(Ordering::Relaxed)
+            || self.compute_bindings.load(Ordering::Relaxed) != 0
+    }
+    /// Advisory count of physical compute channels currently bound to this context.
+    pub(crate) fn compute_binding_count(&self) -> u32 {
+        self.compute_bindings.load(Ordering::Acquire)
     }
     /// This logical queue has submitted render work, so its compute may have a render prefix.
     pub(crate) fn render_seen(&self) -> bool {
@@ -400,7 +408,27 @@ impl Context {
         }
     }
     pub(crate) fn note_compute_binding(&self, owned: bool) {
-        self.compute_binding_hint.store(owned, Ordering::Relaxed);
+        if owned {
+            self.compute_bindings.fetch_add(1, Ordering::AcqRel);
+        } else {
+            let _ = self
+                .compute_bindings
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                    Some(n.saturating_sub(1))
+                });
+        }
+    }
+    /// Atomically allocates the next 1-based shared compute ordinal and packed
+    /// `(predecessor_id << 32) | current_id` descriptor object_ids pair for a multi-channel
+    /// M5 context, so concurrent direct submissions across sibling QIDs never collide on
+    /// `submit_sequence`, `completion_ordinal`, or `object_ids`.
+    pub(crate) fn next_compute_identity(&self) -> (u32, u64) {
+        let prev = self.compute_ordinal.fetch_add(1, Ordering::AcqRel);
+        let next = prev.wrapping_add(1);
+        let predecessor_id = if prev == 0 { 1 } else { prev };
+        let current_id = if next == 0 { 1 } else { next };
+        let object_ids = (u64::from(predecessor_id) << 32) | u64::from(current_id);
+        (next, object_ids)
     }
     pub(crate) fn compute_timestamps(&self) -> &Arc<super::completion::ComputeTimestampCache> {
         &self.compute_timestamps

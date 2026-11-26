@@ -12,7 +12,6 @@
 #include <linux/aperture.h>
 #include <linux/component.h>
 #include <linux/completion.h>
-#include <linux/delay.h>
 #include <linux/dma-fence.h>
 #include <linux/dma-mapping.h>
 #include <linux/jiffies.h>
@@ -286,6 +285,42 @@ static int apple_drm_gem_dumb_create(struct drm_file *file_priv,
 	return drm_gem_dma_dumb_create_internal(file_priv, drm, args);
 }
 
+/*
+ * A T8122 dcpext mirrors framebuffers into its own display DART domain.
+ * Remove a buffer's mirror before its pages and its DVA are released.
+ */
+static void apple_drm_gem_free(struct drm_gem_object *gem)
+{
+	struct drm_crtc *crtc;
+
+	drm_for_each_crtc(crtc, gem->dev) {
+		if (t8132_ext_crtc(crtc))
+			continue;
+		dcp_fb_unmirror(to_apple_crtc(crtc)->dcp, to_drm_gem_dma_obj(gem));
+	}
+	drm_gem_dma_object_free(gem);
+}
+
+static const struct drm_gem_object_funcs apple_drm_gem_funcs = {
+	.free		= apple_drm_gem_free,
+	.print_info	= drm_gem_dma_object_print_info,
+	.get_sg_table	= drm_gem_dma_object_get_sg_table,
+	.vmap		= drm_gem_dma_object_vmap,
+	.mmap		= drm_gem_dma_object_mmap,
+	.vm_ops		= &drm_gem_dma_vm_ops,
+};
+
+static struct drm_gem_object *apple_drm_gem_create_object(struct drm_device *drm,
+							  size_t size)
+{
+	struct drm_gem_dma_object *obj = kzalloc_obj(*obj);
+
+	if (!obj)
+		return ERR_PTR(-ENOMEM);
+	obj->base.funcs = &apple_drm_gem_funcs;
+	return &obj->base;
+}
+
 #ifdef CONFIG_DRM_FBDEV_EMULATION
 static int apple_drm_fbdev_probe(struct drm_fb_helper *helper,
 				 struct drm_fb_helper_surface_size *sizes)
@@ -414,6 +449,7 @@ static const struct drm_driver apple_drm_driver = {
 	DRM_FBDEV_DMA_DRIVER_OPS,
 #endif
 	.postclose		= apple_drm_postclose,
+	.gem_create_object	= apple_drm_gem_create_object,
 	.name			= DRIVER_NAME,
 	.desc			= DRIVER_DESC,
 	.major			= 1,
@@ -1830,6 +1866,22 @@ static void apple_drm_quiesce_connectors(struct drm_device *drm)
 	drm_connector_list_iter_end(&iter);
 }
 
+/* Process the hotplug reports queued while the display processors started. */
+static void apple_drm_flush_start_reports(struct drm_device *drm)
+{
+	struct drm_connector_list_iter iter;
+	struct drm_connector *connector;
+
+	drm_connector_list_iter_begin(drm, &iter);
+	drm_for_each_connector_iter(connector, &iter) {
+		/* A T8132 external output has no DCP hotplug work. */
+		if (t8132_ext_connector(connector))
+			continue;
+		flush_work(&to_apple_connector(connector)->hotplug_wq);
+	}
+	drm_connector_list_iter_end(&iter);
+}
+
 /*
  * Each display processor runs its own RTKit firmware, and starting one waits
  * for its firmware: a T6041 external processor takes 0.6 to 1.6 s to bring up
@@ -1987,8 +2039,12 @@ static int apple_drm_init_dcp(struct device *dev)
 		return -ENODEV;
 	}
 
-	/* HACK: Wait for dcp* to settle before a modeset */
-	msleep(100);
+	/*
+	 * What the firmware reported while its processor started (connection,
+	 * modes) is processed before the device registers, so the first
+	 * modeset sees it. Later reports arrive as hotplug events.
+	 */
+	apple_drm_flush_start_reports(&apple->drm);
 
 	return 0;
 }

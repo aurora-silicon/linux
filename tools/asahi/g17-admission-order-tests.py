@@ -161,12 +161,13 @@ def held_fixture():
     backlog = pairs[at:pairs.index('\n}\n', pairs.index('fn sibling_backlog', at)) + 3]
     state = '\n'.join(item(source, name) for name in [
         'const fn new(', 'fn owns_live(', 'fn has_live_owner(', 'fn exhausted(', 'fn owner_quarantine(', 'fn owner_released(', 'fn refusal(', 'fn advance(',
-        'fn take_idle(', 'fn acquire(', 'fn acquire_for(', 'fn live_owners(', 'fn live_siblings(',
+        'fn set_owner(', 'fn take_idle(', 'fn acquire(', 'fn acquire_for(', 'fn live_owners(', 'fn live_siblings(',
         'fn reclaimable_siblings_in(', 'fn reclaimable_siblings(', 'fn promotes_reclaimable_sibling(',
         'fn can_lease_slot(', 'fn unavailable_released(', 'fn total_pair_demand(', 'fn pair_demand(',
         'fn claim_sibling(', 'fn can_reassign_unused_spare(', 'fn reassign_unused_spare(',
-        'fn cancel_empty_slot(', 'fn can_pick(',
-        'fn can_pick_for(', 'fn pick(', 'fn pick_for(', 'fn usable(', 'fn join(', 'fn join_for(',
+        'fn cancel_empty_slot(', 'fn can_pick(', 'fn can_pick_for(',
+        'fn wide(', 'fn mark_wide(', 'fn can_pick_render(', 'fn can_pick_render_for(',
+        'fn pick(', 'fn pick_for(', 'fn usable(', 'fn join(', 'fn join_for(',
         'fn release(', 'fn set_held(', 'fn retained(', 'fn used('])
     pool = '\n'.join(item(source, name) for name in [
         'pub(crate) fn set_held(', 'pub(crate) fn release_retained_owners_after_processor_stop(',
@@ -377,7 +378,7 @@ def release_fixture():
     backlog = pairs[at:pairs.index('\n}\n', pairs.index('fn sibling_backlog', at)) + 3]
     state = '\n'.join(item(source, name) for name in [
         'const fn new(', 'fn owns_live(', 'fn has_live_owner(', 'fn exhausted(', 'fn owner_quarantine(', 'fn refusal(', 'fn advance(',
-        'fn take_idle(', 'fn acquire(', 'fn acquire_for(', 'fn live_owners(', 'fn live_siblings(',
+        'fn set_owner(', 'fn take_idle(', 'fn acquire(', 'fn acquire_for(', 'fn live_owners(', 'fn live_siblings(',
         'fn reclaimable_siblings_in(', 'fn reclaimable_siblings(', 'fn promotes_reclaimable_sibling(',
         'fn can_lease_slot(', 'fn unavailable_released(', 'fn total_pair_demand(', 'fn pair_demand(',
         'fn claim_sibling(', 'fn usable(', 'fn can_reassign_unused_spare(', 'fn reassign_unused_spare(',
@@ -385,7 +386,7 @@ def release_fixture():
     pool = '\n'.join(item(source, name) for name in [
         'pub(crate) fn can_reassign_unused_spare(', 'pub(crate) fn reassign_unused_spare(',
         'pub(crate) fn release_unused_sibling(', 'pub(crate) fn owns_live_slot(',
-        'pub(crate) fn hold_render_slots_for_exit_kill(',
+        'pub(crate) fn is_wide(', 'pub(crate) fn hold_render_slots_for_exit_kill(',
         'pub(crate) fn set_held(', 'pub(crate) fn sync_held(', 'pub(crate) fn release_owner('])
     pending = '\n'.join(item(teardown, name) for name in [
         'pub(crate) fn new(', 'pub(crate) fn releasing(', 'fn find(', 'fn insert(',
