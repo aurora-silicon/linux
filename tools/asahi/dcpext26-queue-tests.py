@@ -76,7 +76,7 @@ struct iomfb_transaction {struct list_head link;void (*start)(struct apple_dcp *
 struct iomfb_scanout_h17p {int request;struct drm_framebuffer *fb[4];struct list_head link;};
 struct apple_dcp {
  void *dev;bool s2r_scanout_stale,s2r_scanout_hold,sleep_v27_closed;
- struct {int lock,timeout,backlight_retry,callback_count;void *owner;unsigned long deadline;unsigned queued;bool presentation_paused,backlight_queued,stopped;struct work_struct work;struct list_head pending,dropped;struct iomfb_transaction *active;struct iomfb_scanout_h17p *scanout,*next_scanout;} iomfb;
+ struct {int lock,timeout,backlight_retry,callback_count;void *owner;unsigned long deadline;unsigned queued;bool presentation_paused,peer_paused,backlight_queued,stopped;struct work_struct work;struct list_head pending,dropped;struct iomfb_transaction *active;struct iomfb_scanout_h17p *scanout,*next_scanout;} iomfb;
  struct {bool pending;} present_state_h17p;struct {bool valid;} mode_state;struct {bool connected;} *connector;
  struct {void *data;} chunks;bool native,crashed,ext26_control_pending,ext26_blanked,ext26_normal,ext26_early_complete;
  unsigned ext26_epochs;u64 ext26_retained_bytes;struct list_head ext26_retained;
