@@ -27,6 +27,12 @@ enum ane_fw_irq_role {
 	ANE_FW_IRQ_CHANNELS,
 };
 
+struct ane_fw_bridge_op {
+	u32 offset;
+	u32 clear;
+	u32 set;
+};
+
 /* Later firmware generations must never enter the H14 staging path. */
 struct ane_fw_platform {
 	const struct ane_h16_profile *h16_profiles;
@@ -34,6 +40,9 @@ struct ane_fw_platform {
 	/* DART/DAPF register tables, one per supported DART revision. */
 	const struct ane_h16_mmio *h16_mmio;
 	unsigned int h16_mmio_count;
+	/* Engine AXI2AF bridge register updates applied after CE bring-up at every power-up. */
+	const struct ane_fw_bridge_op *bridge_ops;
+	unsigned int bridge_op_count;
 	/* DART PARAMS3, the one DART register read before a table is chosen. */
 	u32 dart_params;
 	/* The DAPF bank: iommus entry that owns it, offset from its reg, size. */
@@ -125,6 +134,12 @@ struct ane_fw_platform {
 	const char *build_name;
 };
 
+static inline u32 ane_fw_bridge_op_apply(u32 current_val,
+					 const struct ane_fw_bridge_op *op)
+{
+	return (current_val & ~op->clear) | op->set;
+}
+
 /* Pure range check: the boot loader supplies the physical addresses. */
 static inline bool
 ane_fw_preload_ranges_valid(const struct ane_fw_platform *soc, const u64 phys[2],
@@ -171,6 +186,7 @@ ane_fw_sleep_path(const struct ane_fw_platform *platform)
 
 extern const struct ane_fw_platform ane_h16_platform, ane_h17_platform, ane_t6050_platform,
 				    ane_t8142_platform;
+extern const struct ane_fw_platform ane_t8122_platform;
 extern const struct ane_fw_platform ane_t8132_platform;
 int ane_fw_platform_preflight(struct platform_device *pdev,
 			      const struct ane_fw_platform *soc);
@@ -180,6 +196,8 @@ int ane_fw_platform_probe(struct platform_device *pdev,
 void ane_fw_platform_remove(struct platform_device *pdev);
 int ane_fw_platform_suspend(struct device *dev);
 int ane_fw_platform_resume(struct device *dev);
+int ane_fw_platform_runtime_suspend(struct device *dev);
+int ane_fw_platform_runtime_resume(struct device *dev);
 int ane_fw_preload_range(struct device_node *np, unsigned int index, u64 *phys, u64 *size);
 const struct ane_fw_platform *ane_fw_platform_build(struct device_node *np,
 						    const struct ane_fw_platform *soc);
@@ -187,5 +205,7 @@ int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_plat
 void ane_h16_backend_remove(struct platform_device *pdev);
 int ane_h16_backend_suspend(struct device *dev);
 int ane_h16_backend_resume(struct device *dev);
+int ane_h16_backend_runtime_suspend(struct device *dev);
+int ane_h16_backend_runtime_resume(struct device *dev);
 
 #endif /* __ANE_FW_PLATFORM_H__ */

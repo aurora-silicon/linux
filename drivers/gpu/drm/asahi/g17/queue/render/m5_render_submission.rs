@@ -3,7 +3,7 @@
 
 use kernel::prelude::*;
 use crate::g17::fw::m5::{render as cmd, render_registers as regs};
-use crate::g17::{buffer::target, command::Validated, fw::render::{RenderArgs, RenderPass, RegisterPrograms}};
+use crate::g17::{buffer::{compact, target}, command::Validated, fw::render::{RenderArgs, RenderPass, RegisterPrograms}};
 
 /// Compressed single-layer MSAA ZLS admission: D32 depth with optional plain
 /// stencil, and the compressed Z/S form.
@@ -120,25 +120,83 @@ pub(crate) fn parameter_geometry(blocks: usize) -> Result<crate::g17::buffer::Bl
     // SAFETY: The object was initialized before si_meminfo filled it.
     let info = unsafe { info.assume_init() };
     let ram = (info.totalram as u64).checked_mul(u64::from(info.mem_unit)).ok_or(EOVERFLOW)?;
-    let initial = blocks.checked_mul(0x80000).ok_or(EOVERFLOW)?;
+    let initial = blocks.checked_mul(crate::g17::buffer::BlockGeometry::M5_BLOCK_BYTES)
+        .ok_or(EOVERFLOW)?;
     crate::g17::buffer::BlockGeometry::m5(ram, initial as u64)
 }
 
-/// The target layout of a render: G17P's for a command without an M5 plan.
-pub(crate) fn layout(command: &Validated, clusters: u32, programs: RegisterPrograms)
-    -> Result<target::Layout> {
+/// The target layout of a render: G17P's for a command without an M5 plan. `board` is the M5
+/// board, which an M5 plan needs.
+pub(crate) fn layout(command: &Validated, clusters: u32, programs: RegisterPrograms,
+    board: Option<&'static crate::g17::fw::m5::initdata::Board>) -> Result<target::Layout> {
+    Ok(layout_and_window(command, clusters, programs, board)?.0)
+}
+
+/// The target layout of a render and, for an M5 render, the bytes of the client's compact
+/// window that each render pair built for it reserves.
+pub(crate) fn layout_and_window(command: &Validated, clusters: u32, programs: RegisterPrograms,
+    board: Option<&'static crate::g17::fw::m5::initdata::Board>)
+    -> Result<(target::Layout, Option<usize>)> {
     let Validated::Render { pass, plan, .. } = command else { return Err(EINVAL); };
     let layout = target::Layout::new(pass, clusters, programs)?;
-    if plan.is_none() { return Ok(layout); }
+    if plan.is_none() { return Ok((layout, None)); }
     validate(pass)?;
+    let geometry = parameter_geometry(layout.tvb_blocks)?;
+    let mesh_storage = compact::mesh_storage()?.map(|(_, bytes)| bytes);
+    // The context state a pair allocates for each command slot (`Generation::allocate_state`).
+    let state = super::generation::Layout::m5(board.ok_or(EINVAL)?).bytes;
+    let (layout, reserved) = m5_layout(layout, pass, clusters, geometry, mesh_storage, state)?;
+    Ok((layout, Some(reserved)))
+}
+
+/// The M5 layout of `pass` from its G17P layout, and the compact-window bytes a pair built for
+/// it reserves ([`pair_window_bytes`]) with `mesh_storage` bytes of task-stage mesh storage.
+fn m5_layout(layout: target::Layout, pass: &RenderPass, clusters: u32,
+    geometry: crate::g17::buffer::BlockGeometry, mesh_storage: Option<usize>, state: usize)
+    -> Result<(target::Layout, usize)> {
     // One target group per cluster unless the pass asks for few primitives.
     // Both target storage and the segment controls use the physical cluster count.
-    let geometry = parameter_geometry(layout.tvb_blocks)?;
     // The auxiliary tables cover the complete parameter inventory, including
     // future growth, rather than just the initially resident physical blocks.
     let bytes = geometry.capacity.checked_mul(geometry.block_bytes).ok_or(EOVERFLOW)?;
     let groups = if pass.few_primitives { 1 } else { clusters };
-    layout.with_m5_slices(pass, clusters, groups, 64, bytes)
+    let layout = layout.with_m5_slices(pass, clusters, groups, 64, bytes)?;
+    // A pair maps its objects in the client's compact window, whose 32-bit offsets make it
+    // 4 GiB. A layout whose pair does not fit there on its own can never be mapped: refuse it
+    // as memory that cannot be had, before any of it is allocated. SUBMIT derives the layout,
+    // so the refusal is the ioctl's.
+    let reserved = pair_window_bytes(&layout, geometry, state, mesh_storage)?;
+    if reserved as u64 > compact::WINDOW_BYTES {
+        return Err(ENOMEM);
+    }
+    Ok((layout, reserved))
+}
+
+/// The objects a render pair built for `layout` maps in the client's M5 compact window
+/// ([`compact::PairObject`]): its target records (a page-rounded record for each command slot),
+/// its TPC object and its initial parameter blocks, which the layout sizes, the context state
+/// of each command slot (`state` bytes each), the parameter buffer's scratch, discard and page
+/// list, its metrics entry, and, while the binding is enabled, the task-stage mesh storage. A
+/// pair maps that storage on its first task-stage kick and keeps it for the passes that follow,
+/// so every pair counts it, whether or not this pass has a task stage.
+fn pair_sizes(layout: &target::Layout, geometry: crate::g17::buffer::BlockGeometry,
+    state: usize, mesh_storage: Option<usize>) -> Result<compact::PairSizes> {
+    let depth = crate::hw::t8140::queues::RENDER_DEPTH as usize;
+    Ok(compact::PairSizes {
+        records: layout.record_stride()?.checked_mul(depth).ok_or(EOVERFLOW)?,
+        tpc: layout.tpc_capacity()?,
+        blocks: layout.tvb_blocks,
+        geometry,
+        state,
+        mesh_storage,
+    })
+}
+
+/// Bytes of the client's M5 compact window that a render pair built for `layout` reserves
+/// ([`pair_sizes`]).
+fn pair_window_bytes(layout: &target::Layout, geometry: crate::g17::buffer::BlockGeometry,
+    state: usize, mesh_storage: Option<usize>) -> Result<usize> {
+    pair_sizes(layout, geometry, state, mesh_storage)?.window_bytes()
 }
 
 pub(crate) fn controls(
@@ -215,4 +273,123 @@ pub(crate) fn inputs(args: &RenderArgs<'_>, usage: [u64; 2]) -> Result<cmd::M5Re
     fields.ta.tail_flag = 1;
     fields.fragment.tail_flag = 1;
     Ok(fields)
+}
+
+
+#[kernel::macros::kunit_tests(asahi_g17_m5_pair_window)]
+mod tests {
+    use super::*;
+    use crate::g17::buffer::{compact::PairObject, BlockGeometry};
+
+    /// The J775D (M5 Ultra, eight clusters) of the measured boot, 98970480 KiB of memory.
+    const RAM: u64 = 98970480 << 10;
+    const WINDOW: usize = 1 << 32;
+    const MIB: usize = 1 << 20;
+    /// The task-stage mesh storage of the default module parameter: 0x200 64 KiB chunks.
+    const MESH: Option<usize> = Some(0x200 * compact::MESH_STORAGE_CHUNK);
+    /// The J775D's context state per command slot.
+    const STATE: usize =
+        super::super::generation::Layout::m5(&crate::g17::fw::m5::initdata::J775D).bytes;
+
+    /// A single-sample pass as Borealis sends it: `utile` tiles, and few-primitives for a pass
+    /// of at most four primitives.
+    fn pass(size: u32, layers: u16, utile: u8, few: bool) -> RenderPass {
+        // SAFETY: RenderPass and its nested surfaces/programs contain only
+        // integers and bools, for which the all-zero representation is valid.
+        let mut pass: RenderPass = unsafe { core::mem::zeroed() };
+        pass.width = size;
+        pass.height = size;
+        pass.layers = layers;
+        pass.utile_width = utile;
+        pass.utile_height = utile;
+        pass.few_primitives = few;
+        pass
+    }
+
+    /// The window bytes of a pair for that pass with `mesh` bytes of mesh storage.
+    fn reserved_with(size: u32, layers: u16, utile: u8, few: bool, mesh: Option<usize>)
+        -> Result<usize> {
+        let pass = pass(size, layers, utile, few);
+        let layout = target::Layout::new(&pass, 8, RegisterPrograms::G17P)?;
+        let geometry = BlockGeometry::m5(RAM,
+            (layout.tvb_blocks * BlockGeometry::M5_BLOCK_BYTES) as u64)?;
+        m5_layout(layout, &pass, 8, geometry, mesh, STATE).map(|(_, bytes)| bytes)
+    }
+
+    /// The same with the default mesh storage.
+    fn reserved(size: u32, layers: u16, utile: u8, few: bool) -> Result<usize> {
+        reserved_with(size, layers, utile, few, MESH)
+    }
+
+    /// The pairs a two-pair queue uses for that pass.
+    fn pairs(size: u32, layers: u16, utile: u8, few: bool, mesh: Option<usize>) -> u8 {
+        let bytes = reserved_with(size, layers, utile, few, mesh).unwrap() as u64;
+        crate::g17::pairs::for_window(2, Some(bytes), compact::WINDOW_BYTES)
+    }
+
+    #[test]
+    fn borealis_32x32_passes_of_more_than_four_primitives() {
+        assert!(reserved(16384, 21, 32, false).unwrap() <= WINDOW);
+        assert_eq!(reserved(16384, 22, 32, false), Err(ENOMEM));
+        assert!(reserved(512, 2048, 32, false).unwrap() <= WINDOW);
+        assert!(reserved(1024, 2048, 32, false).unwrap() <= WINDOW);
+        assert_eq!(reserved(1152, 2048, 32, false), Err(ENOMEM));
+    }
+
+    #[test]
+    fn borealis_32x32_passes_of_few_primitives() {
+        assert!(reserved(16384, 53, 32, true).unwrap() <= WINDOW);
+        assert_eq!(reserved(16384, 54, 32, true), Err(ENOMEM));
+        assert!(reserved(2048, 2047, 32, true).unwrap() <= WINDOW);
+        assert!(reserved(2048, 2048, 32, true).unwrap() <= WINDOW);
+        assert_eq!(reserved(2112, 2048, 32, true), Err(ENOMEM));
+        assert!(reserved(1152, 2048, 32, true).unwrap() <= WINDOW);
+    }
+
+    #[test]
+    fn passes_with_16x16_tiles() {
+        assert!(reserved(16384, 5, 16, false).unwrap() <= WINDOW);
+        assert_eq!(reserved(16384, 6, 16, false), Err(ENOMEM));
+        assert!(reserved(512, 2048, 16, false).unwrap() <= WINDOW);
+        assert_eq!(reserved(1024, 2048, 16, false), Err(ENOMEM));
+    }
+
+    #[test]
+    fn mesh_storage_counts_at_the_4_gib_edge() {
+        // A pass that fits only without the mesh storage a pair keeps once it has run a
+        // task-stage pass is refused while the binding is enabled.
+        assert!(reserved_with(16384, 22, 32, false, None).unwrap() <= WINDOW);
+        assert_eq!(reserved_with(16384, 22, 32, false, MESH), Err(ENOMEM));
+        let with = reserved_with(16384, 21, 32, false, MESH).unwrap();
+        let without = reserved_with(16384, 21, 32, false, None).unwrap();
+        assert_eq!(with - without, PairObject::MeshStorage.window_bytes(MESH.unwrap()).unwrap());
+        assert!(with - without >= 32 * MIB);
+    }
+
+    #[test]
+    fn mesh_storage_counts_at_the_2_gib_edge() {
+        // A pass whose pair the window holds twice only without mesh storage runs on one pair.
+        assert_eq!(pairs(16384, 17, 32, true, None), 2);
+        assert_eq!(pairs(16384, 17, 32, true, MESH), 1);
+        assert_eq!(pairs(16384, 16, 32, true, MESH), 2);
+    }
+
+    #[test]
+    fn a_pair_counts_the_objects_its_layout_does_not_size() {
+        // A trace of a pair on the J775D found 3824 KiB of these objects, guards included and
+        // alignment holes not.
+        let geometry = BlockGeometry::m5(RAM, 32 * BlockGeometry::M5_BLOCK_BYTES as u64).unwrap();
+        let sizes = compact::PairSizes {
+            records: 0, tpc: 0, blocks: 0, geometry,
+            state: STATE, mesh_storage: None,
+        };
+        let sized = [PairObject::Records, PairObject::Tpc, PairObject::ParameterBlock]
+            .into_iter().map(|object| sizes.object_bytes(object).unwrap()).sum::<usize>();
+        let fixed = sizes.window_bytes().unwrap() - sized;
+        assert!(fixed >= 3824 * 1024);
+        assert!(fixed <= 5 * MIB);
+        // Each block takes its stride, guard included.
+        assert_eq!(PairObject::ParameterBlock.window_bytes(geometry.block_bytes).unwrap(),
+            geometry.stride);
+    }
 }
