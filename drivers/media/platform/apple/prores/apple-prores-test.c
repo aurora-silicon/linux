@@ -442,6 +442,47 @@ static void apr_test_apri_t6050(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, apr_parse_init(&apri_t6050, data, pos, init), -EINVAL);
 }
 
+/* A T8132 container: T6041's blocks with a 48-row wrapper table. */
+static void apr_test_apri_t8132(struct kunit *test)
+{
+	static const u32 counts[APRI_T6041_BLOCKS] = {
+		APRI_SYSTEM_COUNT, APRI_CORE_COUNT, APRI_T8132_WRAPPER_COUNT,
+	};
+	struct apr_init_data *init = kunit_kzalloc(test, sizeof(*init), GFP_KERNEL);
+	u8 *data = kunit_kzalloc(test, APRI_T8132_FIRMWARE_SIZE, GFP_KERNEL);
+	size_t pos = 16;
+	u32 block, entry;
+
+	KUNIT_ASSERT_NOT_NULL(test, init);
+	KUNIT_ASSERT_NOT_NULL(test, data);
+	memcpy(data, "APRI", 4);
+	put_unaligned_le32(1, data + 4);
+	put_unaligned_le32(0x8132, data + 8);
+	put_unaligned_le32(APRI_T6041_BLOCKS, data + 12);
+	for (block = 0; block < APRI_T6041_BLOCKS; block++) {
+		put_unaligned_le32(block + 1, data + pos);
+		put_unaligned_le32(counts[block], data + pos + 4);
+		pos += 8;
+		for (entry = 0; entry < counts[block]; entry++, pos += 12) {
+			put_unaligned_le32(entry * 4, data + pos);
+			put_unaligned_le32(0xffffffff, data + pos + 4);
+			put_unaligned_le32(entry, data + pos + 8);
+		}
+	}
+	KUNIT_ASSERT_EQ(test, pos, (size_t)APRI_T8132_FIRMWARE_SIZE);
+	KUNIT_EXPECT_EQ(test, apr_parse_init(&apri_t8132, data, pos, init), 0);
+	KUNIT_EXPECT_EQ(test, init->blocks[APRI_WRAPPER_BLOCK].count,
+			(u32)APRI_T8132_WRAPPER_COUNT);
+	/* T6041 does not take it, nor T8132 a T6041 SoC field. */
+	KUNIT_EXPECT_EQ(test, apr_parse_init(&apri_t6041, data, pos, init), -EINVAL);
+	put_unaligned_le32(0x6041, data + 8);
+	KUNIT_EXPECT_EQ(test, apr_parse_init(&apri_t8132, data, pos, init), -EINVAL);
+	put_unaligned_le32(0x8132, data + 8);
+	/* A wrapper row past its window. */
+	put_unaligned_le32(0x1000000, data + pos - 12);
+	KUNIT_EXPECT_EQ(test, apr_parse_init(&apri_t8132, data, pos, init), -EINVAL);
+}
+
 /* A T8142 container: T6050's blocks with a 38-row wrapper. */
 static void apr_test_apri_t8142(struct kunit *test)
 {
@@ -564,6 +605,608 @@ static void apr_test_apri_row_rejects(struct kunit *test)
 	apr_test_apri_rows_reject(test, APRI_SYSTEM_BLOCK, 0, 8, 0x100);
 }
 
+static void apr_test_decode_desc(struct kunit *test)
+{
+	struct apr_decode_frame f = {
+		.width = 320, .height = 240, .output = APR_INPUT_422_16,
+		.luma_stride = 640, .chroma_stride = 640,
+		.input = 0x10000100000ULL, .luma = 0x10000200000ULL,
+		.chroma = 0x10000300000ULL, .job_id = 0x1234,
+	};
+	u8 *d = kunit_kmalloc(test, APR_DECODE_DESC_BYTES + 1, GFP_KERNEL);
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, d);
+	memset(d, 0xa5, APR_DECODE_DESC_BYTES + 1);
+	KUNIT_ASSERT_EQ(test, apr_build_decode_desc(&f, d), 0);
+	KUNIT_EXPECT_EQ(test, d[APR_DECODE_DESC_BYTES], 0xa5);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(d), 0x1234120b);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(d + 4), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(d + 8), f.input);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(d + 0x14), 320);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(d + 0x16), 240);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(d + 0x1c), 320);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(d + 0x1e), 240);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(d + 0x20), 10);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(d + 0x22), 10);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(d + 0x28), f.luma);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(d + 0x30), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(d + 0x38), f.chroma);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(d + 0x40), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(d + 0x48), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(d + 0x90), 3);
+	for (i = 0x94; i < APR_DECODE_DESC_BYTES; i++)
+		KUNIT_EXPECT_EQ_MSG(test, d[i], 0, "reserved byte %#x", i);
+
+	f.output = APR_INPUT_444_16;
+	f.chroma_stride = 1280;
+	f.bottom_field_first = true;
+	KUNIT_ASSERT_EQ(test, apr_build_decode_desc(&f, d), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(d), 0x1234520f);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(d + 0x22), 20);
+	f.luma_stride = 600;
+	KUNIT_EXPECT_EQ(test, apr_build_decode_desc(&f, d), -EINVAL);
+}
+
+static u8 *apr_test_bitstream_size(struct kunit *test, u32 width, u32 height,
+				   bool interlaced, size_t *bytes)
+{
+	u32 slices = apr_slice_count(width, interlaced ?
+				     DIV_ROUND_UP(height, 2) : height, 3);
+	u32 picture_size = 8 + 2 * slices + 6 * slices;
+	u32 pictures = interlaced ? 2 : 1;
+	u32 frame_size = 28 + pictures * picture_size;
+	u8 *frame = kunit_kzalloc(test, frame_size, GFP_KERNEL);
+	u32 offset = 28;
+	unsigned int i, p;
+
+	if (!frame)
+		return NULL;
+	put_unaligned_be32(frame_size, frame);
+	memcpy(frame + 4, "icpf", 4);
+	put_unaligned_be16(20, frame + 8);
+	put_unaligned_be16(0, frame + 10);
+	memcpy(frame + 12, "kunt", 4);
+	put_unaligned_be16(width, frame + 16);
+	put_unaligned_be16(height, frame + 18);
+	frame[20] = 2 << 6 | (interlaced ? 1 << 2 : 0);
+	frame[22] = 1;
+	frame[23] = 1;
+	frame[24] = 1;
+	for (p = 0; p < pictures; p++) {
+		u8 *picture = frame + offset;
+
+		picture[0] = 8 << 3;
+		put_unaligned_be32(picture_size, picture + 1);
+		put_unaligned_be16(slices, picture + 5);
+		picture[7] = 3 << 4;
+		for (i = 0; i < slices; i++) {
+			put_unaligned_be16(6, picture + 8 + 2 * i);
+			/* A 6-byte slice header with empty Y and Cb data. */
+			picture[8 + 2 * slices + 6 * i] = 6 << 3;
+		}
+		offset += picture_size;
+	}
+	*bytes = frame_size;
+	return frame;
+}
+
+static u8 *apr_test_bitstream(struct kunit *test, bool interlaced, size_t *bytes)
+{
+	return apr_test_bitstream_size(test, 320, 240, interlaced, bytes);
+}
+
+static void apr_test_parse_frame(struct kunit *test)
+{
+	struct apr_prores_info info;
+	size_t bytes;
+	u8 *frame = apr_test_bitstream(test, false, &bytes);
+
+	KUNIT_ASSERT_NOT_NULL(test, frame);
+	KUNIT_ASSERT_EQ(test, apr_parse_frame(frame, bytes, &info), 0);
+	KUNIT_EXPECT_EQ(test, info.frame_size, (u32)bytes);
+	KUNIT_EXPECT_EQ(test, info.width, 320U);
+	KUNIT_EXPECT_EQ(test, info.height, 240U);
+	KUNIT_EXPECT_EQ(test, info.chroma, (u8)2);
+	KUNIT_EXPECT_EQ(test, info.pictures, (u8)1);
+	KUNIT_EXPECT_EQ(test, info.slices[0], 45U);
+	KUNIT_EXPECT_EQ(test, info.picture_offset[0], 28U);
+
+	put_unaligned_be32(bytes - 1, frame);
+	KUNIT_EXPECT_EQ(test, apr_parse_frame(frame, bytes, &info), -EINVAL);
+	put_unaligned_be32(bytes, frame);
+	frame[4] = 'x';
+	KUNIT_EXPECT_EQ(test, apr_parse_frame(frame, bytes, &info), -EINVAL);
+}
+
+static void apr_test_parse_interlaced(struct kunit *test)
+{
+	struct apr_prores_info info;
+	size_t bytes;
+	u8 *frame = apr_test_bitstream(test, true, &bytes);
+
+	KUNIT_ASSERT_NOT_NULL(test, frame);
+	KUNIT_ASSERT_EQ(test, apr_parse_frame(frame, bytes, &info), 0);
+	KUNIT_EXPECT_EQ(test, info.frame_type, (u8)1);
+	KUNIT_EXPECT_EQ(test, info.pictures, (u8)2);
+	KUNIT_EXPECT_EQ(test, info.slices[0], 24U);
+	KUNIT_EXPECT_EQ(test, info.slices[1], 24U);
+	KUNIT_EXPECT_EQ(test, info.picture_offset[1],
+			info.picture_offset[0] + info.picture_size[0]);
+}
+
+/* 1080p has 1020 slices: the table is read in several blocks. */
+static void apr_test_parse_many_slices(struct kunit *test)
+{
+	struct apr_prores_info info;
+	size_t bytes;
+	u8 *frame = apr_test_bitstream_size(test, 1920, 1080, false, &bytes);
+	u8 *table;
+
+	KUNIT_ASSERT_NOT_NULL(test, frame);
+	KUNIT_ASSERT_EQ(test, apr_parse_frame(frame, bytes, &info), 0);
+	KUNIT_EXPECT_EQ(test, info.slices[0], 1020U);
+	table = frame + 28 + 8;
+	/* A bad size in the last, partial block is still found. */
+	put_unaligned_be16(5, table + 2 * 1019);
+	KUNIT_EXPECT_EQ(test, apr_parse_frame(frame, bytes, &info), -EINVAL);
+	put_unaligned_be16(6, table + 2 * 1019);
+	/* So is one just past the first block. */
+	put_unaligned_be16(0, table + 2 * 128);
+	KUNIT_EXPECT_EQ(test, apr_parse_frame(frame, bytes, &info), -EINVAL);
+	put_unaligned_be16(6, table + 2 * 128);
+	/* And slices that together overrun the picture. */
+	put_unaligned_be16(7, table + 2 * 500);
+	KUNIT_EXPECT_EQ(test, apr_parse_frame(frame, bytes, &info), -EINVAL);
+	put_unaligned_be16(6, table + 2 * 500);
+	KUNIT_EXPECT_EQ(test, apr_parse_frame(frame, bytes, &info), 0);
+}
+
+/*
+ * The decode descriptor has no input length, so the engine reads as far as the
+ * frame's own sizes say. Each of these frames points past its payload and
+ * must be rejected before a descriptor is built. Every frame is parsed from an
+ * allocation exactly as long as the payload, so an over-read is a KASAN error.
+ *
+ * Progressive fixture: frame header at 8, picture at 28 (8-byte header,
+ * 45-entry slice table, 45 slices of 6 bytes), 396 bytes in all.
+ */
+#define APR_TP_PIC	28U
+#define APR_TP_SLICES	45U
+#define APR_TP_TABLE	(APR_TP_PIC + 8)
+#define APR_TP_DATA	(APR_TP_TABLE + 2 * APR_TP_SLICES)
+#define APR_TP_SIZE	(8 + 8 * APR_TP_SLICES)
+#define APR_TP_BYTES	(APR_TP_PIC + APR_TP_SIZE)
+
+/* Parse the first @bytes of @frame from a buffer exactly that long. */
+static int apr_test_parse_at(struct kunit *test, const u8 *frame, size_t bytes)
+{
+	struct apr_prores_info info;
+	u8 *copy = kunit_kmalloc(test, bytes, GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, copy);
+	memcpy(copy, frame, bytes);
+	return apr_parse_frame(copy, bytes, &info);
+}
+
+/* A progressive fixture with @extra zero bytes of room after it. */
+static u8 *apr_test_room(struct kunit *test, size_t extra, size_t *bytes)
+{
+	u8 *frame = apr_test_bitstream(test, false, bytes);
+	u8 *room;
+
+	KUNIT_ASSERT_NOT_NULL(test, frame);
+	KUNIT_ASSERT_EQ(test, *bytes, (size_t)APR_TP_BYTES);
+	room = kunit_kzalloc(test, *bytes + extra, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, room);
+	memcpy(room, frame, *bytes);
+	return room;
+}
+
+static void apr_test_oob_exact_fit(struct kunit *test)
+{
+	size_t bytes;
+	u8 *frame = apr_test_room(test, 1, &bytes);
+	struct apr_prores_info info;
+	u8 *last = frame + APR_TP_TABLE + 2 * (APR_TP_SLICES - 1);
+
+	/* Header, table and slices fill the picture and the frame exactly. */
+	KUNIT_ASSERT_EQ(test, apr_parse_frame(frame, bytes, &info), 0);
+	KUNIT_EXPECT_EQ(test, info.picture_offset[0] + info.picture_size[0],
+			info.frame_size);
+	KUNIT_EXPECT_EQ(test, info.picture_size[0], APR_TP_SIZE);
+
+	/* One more byte in the last slice, the picture and the frame fits too. */
+	put_unaligned_be16(7, last);
+	put_unaligned_be32(APR_TP_SIZE + 1, frame + APR_TP_PIC + 1);
+	put_unaligned_be32(APR_TP_BYTES + 1, frame);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes + 1), 0);
+
+	/* An encoder may leave the deprecated slice count at 0. */
+	put_unaligned_be16(0, frame + APR_TP_PIC + 5);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes + 1), 0);
+}
+
+static void apr_test_oob_frame_size(struct kunit *test)
+{
+	size_t bytes;
+	u8 *frame = apr_test_room(test, 4096, &bytes);
+
+	/* The frame claims more bytes than were queued. */
+	put_unaligned_be32(bytes + 1, frame);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+	put_unaligned_be32(bytes + 4096, frame);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+	put_unaligned_be32(U32_MAX, frame);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+
+	/* bytesused one short of an otherwise valid frame. */
+	put_unaligned_be32(bytes, frame);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes - 1), -EINVAL);
+
+	/* Truncated by one byte with the frame size rewritten to match. */
+	put_unaligned_be32(bytes - 1, frame);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes - 1), -EINVAL);
+
+	/* Shorter than any frame header. */
+	put_unaligned_be32(27, frame);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, 27), -EINVAL);
+}
+
+static void apr_test_oob_frame_header(struct kunit *test)
+{
+	size_t bytes;
+	u8 *frame = apr_test_room(test, 0, &bytes);
+
+	/* Frame header one byte past the frame, then filling it entirely. */
+	put_unaligned_be16(bytes - 8 + 1, frame + 8);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+	put_unaligned_be16(bytes - 8, frame + 8);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+	put_unaligned_be16(U16_MAX, frame + 8);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+
+	/* Quantisation matrices flagged but not inside the frame header. */
+	put_unaligned_be16(20, frame + 8);
+	frame[8 + 19] = 3;
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+	frame[8 + 19] = 0;
+
+	/* Picture header shorter than its fixed fields. */
+	frame[APR_TP_PIC] = 7 << 3;
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+}
+
+static void apr_test_oob_picture_size(struct kunit *test)
+{
+	size_t bytes;
+	u8 *frame = apr_test_room(test, 0, &bytes);
+	u8 *size = frame + APR_TP_PIC + 1;
+
+	/* The picture runs one byte, 64 KiB and 4 GiB past the payload. */
+	put_unaligned_be32(APR_TP_SIZE + 1, size);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+	put_unaligned_be32(APR_TP_SIZE + SZ_64K, size);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+	put_unaligned_be32(U32_MAX, size);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+
+	/* Its slices must fit a picture one byte shorter. */
+	put_unaligned_be32(APR_TP_SIZE - 1, size);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+
+	/* Pictures must account for every byte of the frame. */
+	frame = apr_test_room(test, 1, &bytes);
+	put_unaligned_be32(bytes + 1, frame);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes + 1), -EINVAL);
+}
+
+static void apr_test_oob_slice_table(struct kunit *test)
+{
+	size_t bytes;
+	u8 *frame = apr_test_room(test, 0, &bytes);
+	u32 table_end = 8 + 2 * APR_TP_SLICES;
+
+	/* The slice table ends one byte past the picture (and the frame). */
+	put_unaligned_be32(table_end - 1, frame + APR_TP_PIC + 1);
+	put_unaligned_be32(APR_TP_PIC + table_end - 1, frame);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, APR_TP_PIC + table_end - 1),
+			-EINVAL);
+
+	/* The in-band slice count asks for one more table entry. */
+	frame = apr_test_room(test, 0, &bytes);
+	put_unaligned_be16(APR_TP_SLICES + 1, frame + APR_TP_PIC + 5);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+	put_unaligned_be16(U16_MAX, frame + APR_TP_PIC + 5);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+
+	/*
+	 * Smaller slices mean more of them (75 at 320x240): the table the
+	 * engine walks grows with log2_slice even with no in-band count.
+	 */
+	put_unaligned_be16(0, frame + APR_TP_PIC + 5);
+	frame[APR_TP_PIC + 7] = 2 << 4;
+	KUNIT_EXPECT_EQ(test, apr_slice_count(320, 240, 2), 75U);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+}
+
+static void apr_test_oob_slice_sizes(struct kunit *test)
+{
+	size_t bytes;
+	u8 *frame = apr_test_room(test, 0, &bytes);
+	u8 *table = frame + APR_TP_TABLE;
+
+	/* The last slice ends one byte past the picture and the payload. */
+	put_unaligned_be16(7, table + 2 * (APR_TP_SLICES - 1));
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+	put_unaligned_be16(U16_MAX, table + 2 * (APR_TP_SLICES - 1));
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+
+	/* A large early slice pushes every later one past the end. */
+	put_unaligned_be16(6, table + 2 * (APR_TP_SLICES - 1));
+	put_unaligned_be16(U16_MAX, table);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+
+	/* A slice too short for its own header. */
+	put_unaligned_be16(5, table);
+	put_unaligned_be16(7, table + 2);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+}
+
+static void apr_test_oob_slice_headers(struct kunit *test)
+{
+	size_t bytes;
+	u8 *frame = apr_test_room(test, 0, &bytes);
+	u8 *last = frame + APR_TP_DATA + 6 * (APR_TP_SLICES - 1);
+
+	/* Coded Y and Cb data run one byte past the last slice. */
+	put_unaligned_be16(1, last + 2);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+	put_unaligned_be16(0, last + 2);
+	put_unaligned_be16(U16_MAX, last + 4);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+	put_unaligned_be16(0, last + 4);
+
+	/* A slice header longer than the slice. */
+	last[0] = 7 << 3;
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+	last[0] = 6 << 3;
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), 0);
+
+	/* With alpha the Cr size is in the header too: 6 bytes is too short. */
+	frame[8 + 12] = 3 << 6;
+	frame[8 + 17] = 1;
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+}
+
+static void apr_test_oob_second_field(struct kunit *test)
+{
+	size_t bytes;
+	u8 *frame = apr_test_bitstream(test, true, &bytes);
+	struct apr_prores_info info;
+	u32 second;
+
+	KUNIT_ASSERT_NOT_NULL(test, frame);
+	KUNIT_ASSERT_EQ(test, apr_parse_frame(frame, bytes, &info), 0);
+	second = info.picture_offset[1];
+
+	/* The bottom field runs one byte past the payload. */
+	put_unaligned_be32(info.picture_size[1] + 1, frame + second + 1);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+	put_unaligned_be32(U32_MAX, frame + second + 1);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+	put_unaligned_be32(info.picture_size[1], frame + second + 1);
+
+	/* Its last slice ends one byte past the payload. */
+	put_unaligned_be16(7, frame + second + 8 + 2 * (info.slices[1] - 1));
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+	put_unaligned_be16(6, frame + second + 8 + 2 * (info.slices[1] - 1));
+
+	/* The frame stops one byte into, and right at, the bottom field. */
+	put_unaligned_be32(second + 1, frame);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, second + 1), -EINVAL);
+	put_unaligned_be32(second, frame);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, second), -EINVAL);
+	put_unaligned_be32(bytes, frame);
+
+	/* The top field grows by a byte, so the bottom one is misplaced. */
+	put_unaligned_be32(info.picture_size[0] + 1, frame + info.picture_offset[0] + 1);
+	KUNIT_EXPECT_EQ(test, apr_test_parse_at(test, frame, bytes), -EINVAL);
+}
+
+static void apr_test_ring_accounting(struct kunit *test)
+{
+	u8 *ring = kunit_kzalloc(test, APR_RING_BYTES, GFP_KERNEL);
+	u8 *desc = kunit_kmalloc(test, APR_ENCODE_DESC_BYTES, GFP_KERNEL);
+	u32 ptr = APR_RING_BYTES - 0x100;
+	u32 next;
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, ring);
+	KUNIT_ASSERT_NOT_NULL(test, desc);
+	next = apr_ring_advance(0, APR_DECODE_DESC_BYTES, APR_RING_BYTES);
+	KUNIT_EXPECT_EQ(test, next, 0x100U);
+	next = apr_ring_advance(0x100, APR_ENCODE_DESC_BYTES, APR_RING_BYTES);
+	KUNIT_EXPECT_EQ(test, next, 0x280U);
+	next = apr_ring_advance(ptr, APR_ENCODE_DESC_BYTES, APR_RING_BYTES);
+	KUNIT_EXPECT_EQ(test, next, APR_RING_GENERATION | 0x80U);
+	next = apr_ring_advance(APR_RING_GENERATION | APR_RING_BYTES - 0x80,
+				APR_DECODE_DESC_BYTES, APR_RING_BYTES);
+	KUNIT_EXPECT_EQ(test, next, 0x80U);
+	for (i = 0; i < APR_ENCODE_DESC_BYTES; i++)
+		desc[i] = i;
+	apr_ring_write(ring, APR_RING_BYTES, ptr, desc, APR_ENCODE_DESC_BYTES);
+	KUNIT_EXPECT_MEMEQ(test, ring + ptr, desc, 0x100);
+	KUNIT_EXPECT_MEMEQ(test, ring, desc + 0x100, 0x80);
+}
+
+static void apr_test_ring_space(struct kunit *test)
+{
+	const u32 r = APR_RING_BYTES, g = APR_RING_GENERATION;
+
+	KUNIT_EXPECT_EQ(test, apr_ring_distance(0, 0x100, r), 0x100U);
+	KUNIT_EXPECT_EQ(test, apr_ring_distance(0x100, 0x100, r), 0U);
+	/* Across the end of the ring, in either generation. */
+	KUNIT_EXPECT_EQ(test, apr_ring_distance(r - 0x80, g | 0x80, r), 0x100U);
+	KUNIT_EXPECT_EQ(test, apr_ring_distance(g | (r - 0x80), 0x80, r), 0x100U);
+	/* Same offset, other generation: a whole ring apart. */
+	KUNIT_EXPECT_EQ(test, apr_ring_distance(0x100, g | 0x100, r), r);
+
+	KUNIT_EXPECT_EQ(test, apr_ring_free(0, 0, r), r);
+	KUNIT_EXPECT_EQ(test, apr_ring_free(0, 0x800, r), r - 0x800);
+	KUNIT_EXPECT_EQ(test, apr_ring_free(r - 0x80, g | 0x80, r), r - 0x100);
+	KUNIT_EXPECT_EQ(test, apr_ring_free(g | 0x100, 0x100, r), 0U);
+	/* The deepest ring the driver builds still has room. */
+	KUNIT_EXPECT_GT(test, apr_ring_free(0, APR_MAX_INFLIGHT *
+					    APR_ENCODE_DESC_BYTES, r),
+			(u32)APR_ENCODE_DESC_BYTES);
+}
+
+static void apr_test_ring_tail(struct kunit *test)
+{
+	const u32 r = APR_RING_BYTES, g = APR_RING_GENERATION;
+
+	KUNIT_EXPECT_TRUE(test, apr_ring_passed(0, 0x100, 0x100, r));
+	KUNIT_EXPECT_TRUE(test, apr_ring_passed(0, 0x100, 0x300, r));
+	KUNIT_EXPECT_FALSE(test, apr_ring_passed(0, 0x100, 0x80, r));
+	KUNIT_EXPECT_FALSE(test, apr_ring_passed(0, 0x100, 0, r));
+	KUNIT_EXPECT_TRUE(test, apr_ring_passed(r - 0x80, g | 0x80, g | 0x80, r));
+	KUNIT_EXPECT_FALSE(test, apr_ring_passed(r - 0x80, g | 0x80, r - 0x40, r));
+	KUNIT_EXPECT_FALSE(test, apr_ring_passed(g | (r - 0x80), 0x80, 0x40, r));
+	KUNIT_EXPECT_TRUE(test, apr_ring_passed(g | (r - 0x80), 0x80, 0x80, r));
+
+	KUNIT_EXPECT_TRUE(test, apr_ring_tail_valid(0x100, 0x100, 0x400, r));
+	KUNIT_EXPECT_TRUE(test, apr_ring_tail_valid(0x100, 0x400, 0x400, r));
+	KUNIT_EXPECT_TRUE(test, apr_ring_tail_valid(0x100, 0x280, 0x400, r));
+	KUNIT_EXPECT_FALSE(test, apr_ring_tail_valid(0x100, 0x500, 0x400, r));
+	KUNIT_EXPECT_FALSE(test, apr_ring_tail_valid(0x100, 0x80, 0x400, r));
+	KUNIT_EXPECT_FALSE(test, apr_ring_tail_valid(0x100, g | 0x200, 0x400, r));
+	KUNIT_EXPECT_FALSE(test, apr_ring_tail_valid(0, r, 0x400, r));
+	KUNIT_EXPECT_FALSE(test, apr_ring_tail_valid(0, BIT(25), 0x400, r));
+	KUNIT_EXPECT_TRUE(test, apr_ring_tail_valid(r - 0x80, g | 0x40, g | 0x80, r));
+	KUNIT_EXPECT_FALSE(test, apr_ring_tail_valid(r - 0x80, 0x40, g | 0x80, r));
+}
+
+static void apr_test_inflight(struct kunit *test)
+{
+	const u32 r = APR_RING_BYTES;
+	u32 ends[APR_MAX_INFLIGHT], done, head, tail;
+	unsigned int i, retired;
+
+	KUNIT_EXPECT_FALSE(test, apr_jobs_full(0, 0));
+	KUNIT_EXPECT_FALSE(test, apr_jobs_full(APR_MAX_INFLIGHT - 1, 0));
+	KUNIT_EXPECT_TRUE(test, apr_jobs_full(APR_MAX_INFLIGHT, 0));
+	/* Encode stays alone at the end of the ring. */
+	KUNIT_EXPECT_TRUE(test, apr_jobs_full(1, 1));
+	KUNIT_EXPECT_TRUE(test, apr_jobs_full(3, 1));
+
+	/*
+	 * Ring space and tail arithmetic for a full ring straddling the wrap.
+	 * Only the lone encode retires on the tail; decode jobs retire on
+	 * their ids (apr_test_job_id).
+	 */
+	done = r - 3 * APR_DECODE_DESC_BYTES - 0x80;
+	head = done;
+	for (i = 0; i < APR_MAX_INFLIGHT; i++) {
+		KUNIT_ASSERT_GT(test, apr_ring_free(done, head, r),
+				(u32)APR_DECODE_DESC_BYTES);
+		head = apr_ring_advance(head, APR_DECODE_DESC_BYTES, r);
+		ends[i] = head;
+	}
+	KUNIT_EXPECT_EQ(test, apr_ring_distance(done, head, r),
+			(u32)(APR_MAX_INFLIGHT * APR_DECODE_DESC_BYTES));
+	/* The tail stops inside the fifth descriptor: four jobs are done. */
+	tail = apr_ring_advance(ends[3], 0x40, r);
+	KUNIT_ASSERT_TRUE(test, apr_ring_tail_valid(done, tail, head, r));
+	for (retired = 0; retired < APR_MAX_INFLIGHT; retired++) {
+		if (!apr_ring_passed(done, ends[retired], tail, r))
+			break;
+		done = ends[retired];
+	}
+	KUNIT_EXPECT_EQ(test, retired, 4U);
+	KUNIT_EXPECT_EQ(test, done, ends[3]);
+	/* Then the engine drains the ring. */
+	tail = head;
+	KUNIT_ASSERT_TRUE(test, apr_ring_tail_valid(done, tail, head, r));
+	for (; retired < APR_MAX_INFLIGHT; retired++) {
+		if (!apr_ring_passed(done, ends[retired], tail, r))
+			break;
+		done = ends[retired];
+	}
+	KUNIT_EXPECT_EQ(test, retired, (unsigned int)APR_MAX_INFLIGHT);
+	KUNIT_EXPECT_EQ(test, done, head);
+	KUNIT_EXPECT_EQ(test, apr_ring_free(done, head, r), r);
+}
+
+static void apr_test_job_id(struct kunit *test)
+{
+	/* Ids are never 0, which ST1 reads after a reset. */
+	KUNIT_EXPECT_EQ(test, apr_next_job_id(1), 2);
+	KUNIT_EXPECT_EQ(test, apr_next_job_id(U16_MAX), 1);
+	KUNIT_EXPECT_FALSE(test, apr_job_id_done(0, 1));
+	KUNIT_EXPECT_TRUE(test, apr_job_id_done(1, 1));
+	KUNIT_EXPECT_TRUE(test, apr_job_id_done(5, 3));
+	KUNIT_EXPECT_FALSE(test, apr_job_id_done(3, 5));
+	/* Across the wrap: 65535 finishes before 1 and 2. */
+	KUNIT_EXPECT_TRUE(test, apr_job_id_done(1, U16_MAX));
+	KUNIT_EXPECT_FALSE(test, apr_job_id_done(U16_MAX, 1));
+	KUNIT_EXPECT_FALSE(test, apr_job_id_done(U16_MAX - 1, 2));
+
+	/* ST1 = 0 is no progress, never "everything in 0x8001..0xffff done". */
+	KUNIT_EXPECT_EQ(test, apr_job_id_check(0, 9), APR_DONE_ID_NONE);
+	KUNIT_EXPECT_EQ(test, apr_job_id_check(0, 0x8005), APR_DONE_ID_NONE);
+	KUNIT_EXPECT_TRUE(test, apr_job_id_done(0, 0x8001));
+	/* Ids 1..8 outstanding: ids already issued, finished or not. */
+	KUNIT_EXPECT_EQ(test, apr_job_id_check(1, 9), APR_DONE_ID_ISSUED);
+	KUNIT_EXPECT_EQ(test, apr_job_id_check(8, 9), APR_DONE_ID_ISSUED);
+	/* The other half of the id space reads as old ids: nothing retires. */
+	for (u32 d = 0x8009; d <= U16_MAX; d += 0x7ff) {
+		KUNIT_EXPECT_EQ(test, apr_job_id_check(d, 9), APR_DONE_ID_ISSUED);
+		for (u16 id = 1; id < 9; id++)
+			KUNIT_EXPECT_FALSE(test, apr_job_id_done(d, id));
+	}
+	KUNIT_EXPECT_EQ(test, apr_job_id_check(U16_MAX, 9), APR_DONE_ID_ISSUED);
+	KUNIT_EXPECT_FALSE(test, apr_job_id_done(U16_MAX, 1));
+	/* An id not issued yet: the ring is hung, nothing retires. */
+	KUNIT_EXPECT_EQ(test, apr_job_id_check(9, 9), APR_DONE_ID_FUTURE);
+	KUNIT_EXPECT_EQ(test, apr_job_id_check(10, 9), APR_DONE_ID_FUTURE);
+	KUNIT_EXPECT_EQ(test, apr_job_id_check(0x8008, 9), APR_DONE_ID_FUTURE);
+	/* First job after a reset: id 1 not issued until next_id moves on. */
+	KUNIT_EXPECT_EQ(test, apr_job_id_check(1, 1), APR_DONE_ID_FUTURE);
+
+	/* Eight jobs across the wrap: 0xfffc..0xffff, then 1..4 (0 skipped). */
+	{
+		u16 ids[APR_MAX_INFLIGHT], next = 0xfffc;
+		unsigned int i, retired = 0;
+
+		for (i = 0; i < APR_MAX_INFLIGHT; i++) {
+			ids[i] = next;
+			next = apr_next_job_id(next);
+		}
+		KUNIT_EXPECT_EQ(test, ids[4], 1);
+		KUNIT_EXPECT_EQ(test, next, 5);
+		/* ST1 skips ahead to 2: six jobs finished, in ring order. */
+		KUNIT_EXPECT_EQ(test, apr_job_id_check(2, next), APR_DONE_ID_ISSUED);
+		while (retired < APR_MAX_INFLIGHT &&
+		       apr_job_id_done(2, ids[retired]))
+			retired++;
+		KUNIT_EXPECT_EQ(test, retired, 6U);
+		/* The same id again retires nothing more. */
+		while (retired < APR_MAX_INFLIGHT &&
+		       apr_job_id_done(2, ids[retired]))
+			retired++;
+		KUNIT_EXPECT_EQ(test, retired, 6U);
+		/* A stale id from before the wrap retires nothing more either. */
+		KUNIT_EXPECT_FALSE(test, apr_job_id_done(0xfffe, ids[6]));
+		KUNIT_EXPECT_EQ(test, apr_job_id_check(4, next), APR_DONE_ID_ISSUED);
+		KUNIT_EXPECT_TRUE(test, apr_job_id_done(4, ids[7]));
+		/* 5 = next_id: not issued, hung. */
+		KUNIT_EXPECT_EQ(test, apr_job_id_check(5, next), APR_DONE_ID_FUTURE);
+		KUNIT_EXPECT_EQ(test, apr_job_id_check(0x8004, next), APR_DONE_ID_FUTURE);
+		KUNIT_EXPECT_EQ(test, apr_job_id_check(0x8005, next), APR_DONE_ID_ISSUED);
+	}
+}
+
 static struct kunit_case apr_test_cases[] = {
 	KUNIT_CASE(apr_test_qmat_regs),
 	KUNIT_CASE(apr_test_dc_scale),
@@ -578,10 +1221,28 @@ static struct kunit_case apr_test_cases[] = {
 	KUNIT_CASE(apr_test_output),
 	KUNIT_CASE(apr_test_apri_valid),
 	KUNIT_CASE(apr_test_apri_t6050),
+	KUNIT_CASE(apr_test_apri_t8132),
 	KUNIT_CASE(apr_test_apri_t8142),
 	KUNIT_CASE(apr_test_apri_header_rejects),
 	KUNIT_CASE(apr_test_apri_shape_rejects),
 	KUNIT_CASE(apr_test_apri_row_rejects),
+	KUNIT_CASE(apr_test_decode_desc),
+	KUNIT_CASE(apr_test_parse_frame),
+	KUNIT_CASE(apr_test_parse_interlaced),
+	KUNIT_CASE(apr_test_parse_many_slices),
+	KUNIT_CASE(apr_test_oob_exact_fit),
+	KUNIT_CASE(apr_test_oob_frame_size),
+	KUNIT_CASE(apr_test_oob_frame_header),
+	KUNIT_CASE(apr_test_oob_picture_size),
+	KUNIT_CASE(apr_test_oob_slice_table),
+	KUNIT_CASE(apr_test_oob_slice_sizes),
+	KUNIT_CASE(apr_test_oob_slice_headers),
+	KUNIT_CASE(apr_test_oob_second_field),
+	KUNIT_CASE(apr_test_ring_accounting),
+	KUNIT_CASE(apr_test_ring_space),
+	KUNIT_CASE(apr_test_ring_tail),
+	KUNIT_CASE(apr_test_inflight),
+	KUNIT_CASE(apr_test_job_id),
 	{}
 };
 
@@ -591,6 +1252,6 @@ static struct kunit_suite apr_test_suite = {
 };
 kunit_test_suite(apr_test_suite);
 
-MODULE_DESCRIPTION("KUnit tests for the Apple ProRes encoder");
+MODULE_DESCRIPTION("KUnit tests for the Apple ProRes codec");
 MODULE_LICENSE("GPL");
 MODULE_IMPORT_NS("EXPORTED_FOR_KUNIT_TESTING");

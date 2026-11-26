@@ -97,7 +97,7 @@ static inline void chan_write_msg_index(struct apple_isp *isp,
 					struct isp_message *msg, u32 index)
 {
 	u64 *p0 = chan_msg_virt(chan, index);
-	memcpy(p0 + 1, &msg->arg1, sizeof(*msg) - 8);
+	memcpy(p0 + 1, &msg->payload, sizeof(msg->payload));
 
 	/* Make sure we write arg0 last, since that indicates message validity. */
 

@@ -45,8 +45,7 @@
 
 use kernel::{
     error::code::*,
-    prelude::*,
-    sync::Arc, //
+    prelude::*, //
 };
 
 use core::fmt;
@@ -108,7 +107,7 @@ impl<'a, T> GpuPointer<'a, T> {
     /// Create a GPU pointer from a KernelMapping and an offset.
     /// TODO: Change all GPU pointers to point to the raw types so size_of here is GPU-sound.
     pub(crate) fn from_mapping(
-        mapping: &'a Arc<mmu::KernelMapping>,
+        mapping: &'a mmu::KernelMapping,
         offset: usize,
     ) -> Result<GpuPointer<'a, T>> {
         let addr = mapping.iova().checked_add(offset as u64).ok_or(EINVAL)?;

@@ -35,7 +35,8 @@ def fixture():
                      ('super::recovery::Memory', 'Memory'),
                      ('super::fw::compute_pool::required_blocks', 'required_blocks'),
                      ('super::freelist::ComputeCapacity', 'ComputeCapacity'),
-                     ('super::preparation::QUEUE_WAIT_NS', 'QUEUE_WAIT_NS')]:
+                     ('super::preparation::QUEUE_WAIT_NS', 'QUEUE_WAIT_NS'),
+                     ('super::pairs::SIBLING_HEADROOM_BACKOFF_NS', 'SIBLING_HEADROOM_BACKOFF_NS')]:
         packet = packet.replace(old, new)
         ensure = ensure.replace(old, new)
     admission = (item(preparation, "pub(super) struct Admission<'a>") + '\n' +
@@ -85,7 +86,8 @@ mod g17{pub mod job{#[derive(Clone,Copy,Debug,PartialEq)]pub enum Engine{Render,
 // A work-state node is taken per engine: compute admission must ask for a compute one.
 struct Work;impl Work{fn acquire(&self,engine:g17::job::Engine)->Result<u32>{assert_eq!(engine,g17::job::Engine::Compute,"compute admission takes a compute work state");if MODE.load(Ordering::SeqCst)==4{Err(EBUSY)}else{Ok(1)}}}
 struct Completion;impl Completion{fn status(&self)->Status{Status}fn work_state(&self)->Result<Work>{Ok(Work)}}
-struct Packet{command:Validated,completion:Completion}
+struct Order{wait_through:[Option<u64>;2]}
+struct Packet{command:Validated,completion:Completion,order:Order}
 impl Packet{fn check_dependencies(&self)->Result{Ok(())}fn cancel_requested(&self)->bool{now_ns()>=CANCEL.load(Ordering::SeqCst)}fn is_published(&self)->bool{false}}
 struct DeferredBatch;impl DeferredBatch{fn publication()->Result<Self>{Ok(Self)}fn finish(&mut self){}}
 struct Recovery;impl Recovery{fn pending(&self)->bool{MODE.load(Ordering::SeqCst)==1}}
@@ -98,7 +100,13 @@ impl Queues{
  fn compute(&self,_:u64)->Option<()>{if MODE.load(Ordering::SeqCst)==0{None}else{Some(())}}
  fn render_prefix(&self,_:u64,_:&Arc<Packet>)->Result<Vec<()>>{Ok(vec![])}
  fn release_compute_witness(&self,_:&Init,_:&(),_:u64,_:&mut DeferredBatch)->Result<bool>{Ok(MODE.load(Ordering::SeqCst)==2)}
+ fn wants_compute_sibling(&self,_:u64,_:&Context,_:u8,_:usize)->bool{false}
+ fn has_compute_sibling_headroom(&self,_:u64,_:&Context,_:usize)->bool{true}
+ fn bind_reusable_sibling(&mut self,_:u64,_:&Context,_:u8,_:usize)->Result<Option<bool>>{Ok(None)}
+ fn compute_primary(&self,_:u64)->Option<Primary>{None}
 }
+struct Primary;impl Primary{fn sustained(&self)->bool{false}}
+const SIBLING_HEADROOM_BACKOFF_NS:u64=10_000_000;
 struct Firmware{recovery:Recovery,init:Init,queues:Queues,port:()}
 // Mode 6: the publication itself refuses with EBUSY (no recovery): an immediate error, not a spent budget.
 impl Firmware{fn replay_compute(&mut self,_:&mut DeferredBatch)->Result{Ok(())}fn publish_compute(&mut self,_:u64,_:Arc<Packet>,_:&[()],_:&mut DeferredBatch)->Result{if MODE.load(Ordering::SeqCst)==6{advance(5_000_000);Err(EBUSY)}else{Err(EAGAIN)}}}
@@ -106,7 +114,7 @@ struct State(Mutex<Option<Box<Firmware>>>);impl State{fn lock(&self)->MutexGuard
 struct Available;impl Available{fn observe(&self)->u64{now_ns()}}
 struct Shared{preparations:Arc<Gate>,state:State,crashed:AtomicBool,compute_blocks:usize,active_cores:u32,progress:Available}impl Shared{fn queue_events(&self){}}
 struct ComputeDemand;impl ComputeDemand{fn new(_:&Shared)->Self{Self}}
-struct Backend{shared:Shared,owner:u64,context:Context}
+struct Backend{shared:Shared,owner:u64,context:Context,compute_channels:u8,sibling_backoff_until:AtomicU64}
 fn required_blocks(_:usize,_:u32,_:u16)->Result<usize>{Ok(1)}
 type ComputeCapacity=usize;
 impl Backend{
@@ -118,6 +126,8 @@ impl Backend{
  fn compute_direct(&self,_:&Arc<Packet>,_:usize,_:&mut DeferredBatch)->Option<Result>{None}
  fn sources_published(&self,_:&Arc<Packet>)->Result<bool>{Ok(true)}
  fn remember_direct(&self,_:&Queues){}
+ fn try_add_compute_sibling(&self,_:usize,_:&Admission<'_>)->Result<bool>{Ok(false)}
+ fn fans_out(&self,_:&Packet,primary_sustained:impl FnOnce()->bool)->bool{self.compute_channels>1&&primary_sustained()}
  fn wait_release(&self,_:&Available,_:u64,admission:&Admission<'_>)->Result{
   let _=admission.slice_ms()?;
   advance(1_000_000);
@@ -140,8 +150,8 @@ impl Backend{
 ''' + ensure + '\n' + packet + r'''
 }
 fn main(){
- let b=Backend{owner:1,context:Context,shared:Shared{compute_blocks:21,active_cores:1,progress:Available,preparations:Arc::new(Gate{wait:Wait,changed:Changed}),state:State(Mutex::new(Some(Box::new(Firmware{recovery:Recovery,init:Init,queues:Queues,port:()})))),crashed:AtomicBool::new(false)}};
- let p=Arc::new(Packet{command:Validated::Compute{scratch:Scratch},completion:Completion});
+ let b=Backend{owner:1,context:Context,compute_channels:1,sibling_backoff_until:AtomicU64::new(0),shared:Shared{compute_blocks:21,active_cores:1,progress:Available,preparations:Arc::new(Gate{wait:Wait,changed:Changed}),state:State(Mutex::new(Some(Box::new(Firmware{recovery:Recovery,init:Init,queues:Queues,port:()})))),crashed:AtomicBool::new(false)}};
+ let p=Arc::new(Packet{command:Validated::Compute{scratch:Scratch},completion:Completion,order:Order{wait_through:[None,None]}});
  for mode in 0..4 {
   MODE.store(mode,Ordering::SeqCst);NOW.store(0,Ordering::SeqCst);CALLS.store(0,Ordering::SeqCst);REPORTED.store(usize::MAX,Ordering::SeqCst);
   let r=b.compute_packet(&p,&mut DeferredBatch);

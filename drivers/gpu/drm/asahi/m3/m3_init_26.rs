@@ -19,6 +19,18 @@ pub(crate) const LOG_THREADS: usize = 9;
 pub(crate) const RX_BYTES: usize = 0x48;
 pub(crate) const LOG_PAYLOAD_BYTES: usize = 0xd8;
 
+/// Control-region byte size and offset shift for recovery/flush fields on this extended layout.
+pub(crate) const CONTROL_REGION_BYTES: usize = 0xeaf0;
+pub(crate) const CONTROL_SHIFT: usize = 0;
+
+pub(crate) const fn control_shift() -> usize {
+    CONTROL_SHIFT
+}
+
+pub(crate) const fn control_region_bytes() -> usize {
+    CONTROL_REGION_BYTES
+}
+
 /// The shared cache-flush ring has separate index and entry addresses on the wire.
 pub(crate) fn write_flush_ring(
     bytes: &mut [u8], offset: usize, state: u64, entries: u64,
@@ -56,7 +68,7 @@ pub(crate) fn allocation(index: usize) -> Result<Allocation, Error> {
         44 => 0xe10,
         45 => 0xe48,
         46 => 0x670,
-        47 => 0xeaf0,
+        47 => CONTROL_REGION_BYTES,
         48 => 0x20,
         DYNAMIC_STATE | RETENTION_STATE | GLOBAL_POOL | GLOBAL_PARAMETERS => 0x4000,
         PERFORMANCE_CONTROL => 0x6578,

@@ -189,6 +189,8 @@ struct sio_data {
 	/* The firmware is stopped for a system sleep. */
 	bool asleep;
 	bool firmware_only;
+	/* Protocol 10 firmware given the earlier boot tables: no DMA, which would crash it */
+	bool tables_mismatch;
 	bool commit_registered;
 	bool commit_used;
 	u32 protocol;
@@ -370,16 +372,16 @@ static int sio_t6030_windows(struct device_node *np, struct sio_t6030_window *wi
 	return err == -ENOENT ? n : err;
 }
 
-/* 0 when the node's boot tables are protocol-10 tables inside its mapped windows */
-static int sio_t6030_check_node(struct device_node *np)
+/* 0 when the node's boot tables in propname are protocol-10 tables inside its mapped windows */
+static int sio_t6030_check_node(struct device_node *np, const char *propname)
 {
 	struct sio_t6030_window windows[SIO_T6030_WINDOWS_MAX];
 	u32 params[2 * SIO_T6030_PARAMS_MAX];
 	int nparams, nwindows;
 
-	nparams = of_property_count_u32_elems(np, "apple,sio-firmware-params");
+	nparams = of_property_count_u32_elems(np, propname);
 	if (nparams <= 0 || nparams > ARRAY_SIZE(params) ||
-	    of_property_read_u32_array(np, "apple,sio-firmware-params", params, nparams))
+	    of_property_read_u32_array(np, propname, params, nparams))
 		return -EINVAL;
 	nwindows = sio_t6030_windows(np, windows, ARRAY_SIZE(windows));
 	if (nwindows < 0)
@@ -389,7 +391,7 @@ static int sio_t6030_check_node(struct device_node *np)
 
 static int sio_t6030_check_boot_tables(struct device *dev)
 {
-	if (sio_t6030_check_node(dev->of_node)) {
+	if (sio_t6030_check_node(dev->of_node, "apple,sio-firmware-params")) {
 		dev_err(dev, "boot tables are not for SIO protocol 10; leaving the SIO stopped\n");
 		return -ENODEV;
 	}
@@ -654,6 +656,7 @@ static const struct sio_hw_data sio_hw_t6030 = {
  * the 5 of the host's mailbox call timeout is not part of the record.
  */
 static const struct sio_hw_data sio_hw_t6041 = {
+	.stop_at_commit = true,
 	.protocol = 10,
 	.fifo_threshold = 0x600,
 	.cfg_word4 = 0x800,
@@ -697,18 +700,24 @@ static const struct sio_hw_data sio_hw_t6050 = {
 };
 
 /*
- * The T6050 description is in force on the board it has run on. On another T6050 board the
- * node is taken as before: by its generic compatible.
+ * The T6050 description, with its stop at the sleep's commit, is in force on the boards
+ * that describe the sleep. On another T6050 board the node is taken as before: by its
+ * generic compatible.
  */
 static bool sio_t6050_board(void)
 {
-	return of_machine_is_compatible("apple,j714s");
+	return apple_t6050_sleep_described();
 }
 
 static const struct of_device_id sio_of_match[] = {
 	{ .compatible = "apple,t6050-sio", .data = &sio_hw_t6050 },
 	{ .compatible = "apple,t6041-sio", .data = &sio_hw_t6041 },
 	{ .compatible = "apple,t8140-sio", .data = &sio_hw_t8140 },
+	/*
+	 * T8132 (M4): the J773g ADT describes the SIO tables as T8140's and
+	 * its DisplayPort audio channels alike ([2, 0, 0x800, 0x800, 0x800, 0]).
+	 */
+	{ .compatible = "apple,t8132-sio", .data = &sio_hw_t8140 },
 	{ .compatible = "apple,t6030-sio", .data = &sio_hw_t6030 },
 	{ .compatible = "apple,sio", .data = &sio_hw_generic },
 	{ }
@@ -869,7 +878,8 @@ static struct dma_async_tx_descriptor *sio_prep_dma_cyclic(
 	struct sio_chan *siochan = to_sio_chan(chan);
 	struct sio_tx *siotx;
 
-	if (direction != sio_chan_direction(siochan->no))
+	if (siochan->host->tables_mismatch ||
+	    direction != sio_chan_direction(siochan->no))
 		return NULL;
 
 	siotx = sio_alloc_tx(siochan, buf_addr, buf_len, period_len, GFP_NOWAIT);
@@ -1534,6 +1544,16 @@ static void sio_process_report(struct sio_chan *siochan)
 	spin_unlock_irqrestore(&siochan->vc.lock, flags);
 }
 
+/*
+ * A tag the firmware names in an ACK or NACK must be one the host handed out
+ * and has not freed: tag 0 is never allocated, and the field is wider than
+ * the table.
+ */
+static bool sio_tag_outstanding(struct sio_data *sio, u8 tag)
+{
+	return tag && tag < SIO_NTAGS && test_bit(tag, sio->tags.allocated);
+}
+
 static void sio_recv_msg(void *cookie, u8 ep, u64 msg)
 {
 	struct sio_data *sio = cookie;
@@ -1558,13 +1578,21 @@ static void sio_recv_msg(void *cookie, u8 ep, u64 msg)
 		fallthrough;
 	case MSG_ACK:
 	case MSG_NACK:
-		if (WARN_ON(tag >= SIO_NTAGS))
+		if (!sio_tag_outstanding(sio, tag)) {
+			dev_warn_ratelimited(sio->dev,
+					     "ack for tag %u, which is not outstanding\n",
+					     tag);
 			break;
+		}
 
 		if (tags->atomic[tag]) {
 			sio_ack_callback callback = tags->ack_callback[tag];
 
-			if (callback && !WARN_ON(sioep >= sio->nchannels))
+			if (callback && sioep >= sio->nchannels)
+				dev_warn_ratelimited(sio->dev,
+						     "ack for channel %u of %d\n",
+						     sioep, sio->nchannels);
+			else if (callback)
 				callback(&sio->channels[sioep],
 					 tags->cookie[tag], type == MSG_ACK);
 			if (type == MSG_NACK)
@@ -1577,8 +1605,12 @@ static void sio_recv_msg(void *cookie, u8 ep, u64 msg)
 		break;
 
 	case MSG_REPORT:
-		if (WARN_ON(sioep >= sio->nchannels))
+		if (sioep >= sio->nchannels) {
+			dev_warn_ratelimited(sio->dev,
+					     "report for channel %u of %d\n",
+					     sioep, sio->nchannels);
 			break;
+		}
 
 		sio_process_report(&sio->channels[sioep]);
 		break;
@@ -1677,6 +1709,9 @@ static int sio_device_config(struct dma_chan *chan,
 	struct sio_shmem_chan_config *cfg_shmem = sio->shmem;
 	struct sio_shmem_chan_config cfg;
 	int ret;
+
+	if (sio->tables_mismatch)
+		return -ENODEV;
 
 	if (config->peripheral_config) {
 		if (config->peripheral_size != sizeof(struct apple_sio_idle))
@@ -1926,14 +1961,42 @@ free_shmem:
 	return err;
 }
 
+/*
+ * A low-window SIO (M1, M2) takes the earlier boot tables when its firmware reports protocol 9
+ * and T6030's when it reports protocol 10 (the M2's 27.2 firmware, with an ADT the same as its
+ * 13.5 one's), so the boot loader passes T6030's tables as a second list, used for protocol 10.
+ * A protocol-10 firmware given only the earlier tables (an older boot loader) crashes at its
+ * first channel configuration; keep the firmware running for sleep, but offer it no DMA.
+ */
+static const char *sio_dt_params_name(struct sio_data *sio)
+{
+	struct device_node *np = sio->dev->of_node;
+
+	if (sio->protocol != 10)
+		return "apple,sio-firmware-params";
+	if (!sio_t6030_check_node(np, "apple,sio-firmware-params-v10"))
+		return "apple,sio-firmware-params-v10";
+	if (!sio_t6030_check_node(np, "apple,sio-firmware-params"))
+		return "apple,sio-firmware-params";
+
+	sio->tables_mismatch = true;
+	return NULL;
+}
+
 static int sio_send_dt_params(struct sio_data *sio)
 {
 	struct device_node *np = sio->dev->of_node;
-	const char *propname = "apple,sio-firmware-params";
+	const char *propname;
 	int nparams, err, i;
 
 	if (sio->hw->send_dt_params)
 		return sio->hw->send_dt_params(sio);
+
+	propname = sio_dt_params_name(sio);
+	if (!propname) {
+		dev_err(sio->dev, "boot tables are not for SIO protocol 10; no DMA\n");
+		return 0;
+	}
 
 	nparams = of_property_count_u32_elems(np, propname);
 	if (nparams < 0) {
@@ -2051,7 +2114,7 @@ static int sio_probe(struct platform_device *pdev)
 		dev_err(&pdev->dev, "couldn't initialize rtkit\n");
 		goto rpm_put;
 	}
-	for (i = 1; i < SIO_NTAGS; i++)
+	for (i = 0; i < SIO_NTAGS; i++)
 		init_completion(&sio->tags.completions[i]);
 
 	dma = &sio->dma;
@@ -2116,6 +2179,10 @@ static int sio_probe(struct platform_device *pdev)
 	err = sio_send_dt_params(sio);
 	if (err < 0)
 		return dev_err_probe(&pdev->dev, err, "failed to send boot-up parameters\n");
+	if (sio->tables_mismatch) {
+		sio->firmware_only = true;
+		goto rpm_put;
+	}
 
 	err = sio_alloc_shmem(sio);
 	if (err < 0)
@@ -2354,4 +2421,5 @@ MODULE_LICENSE("Dual MIT/GPL");
 #if IS_ENABLED(CONFIG_APPLE_SIO_KUNIT_TEST)
 #include "apple-sio-probe-test.c"
 #include "apple-sio-boot-test.c"
+#include "apple-sio-msg-test.c"
 #endif
