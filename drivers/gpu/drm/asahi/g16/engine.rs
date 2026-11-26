@@ -2977,9 +2977,16 @@ impl Firmware {
                         .iter()
                         .map(|fl| fl.renders as usize)
                         .sum();
-                    let mut more_renders = params::render_flights()
-                        .saturating_sub(active_renders + 1)
-                        .min(sizes::RENDER_SLOTS.saturating_sub(1));
+                    // On an idle GPU the firmware starts a record later the more passes it
+                    // holds, so a job published onto an idle engine starts with its first pass
+                    // alone; the rest of the job follows right behind it in the next record.
+                    let mut more_renders = if behind {
+                        params::render_flights()
+                            .saturating_sub(active_renders + 1)
+                            .min(sizes::RENDER_SLOTS.saturating_sub(1))
+                    } else {
+                        0
+                    };
                     while more_renders > 0 && end < job.progress.count() {
                         let Some(next_seq) = last_seq.and_then(|s| s.checked_add(1)) else {
                             break;
