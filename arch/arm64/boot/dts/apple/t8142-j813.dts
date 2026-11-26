@@ -182,6 +182,10 @@
 &mtp_hid {
 	multi-touch {
 		firmware-name = "apple/tpmtfw-j813.bin";
+		/* Palm classes flicker onto fingers for single reports. */
+		apple,palm-debounce;
+		/* The same touch states and path IDs as the J815's pad. */
+		apple,touch-states;
 	};
 };
 

@@ -4,6 +4,7 @@
 //! Larger targets replace only the objects that need more capacity. Every old
 //! backing keeps the exact commands that still reference it until retirement.
 
+use super::compact::PairObject;
 use super::compact_alias;
 use crate::g17::{
     fw::render::{RegisterPrograms, RenderPass},
@@ -237,14 +238,22 @@ struct Object {
     backing: KernelObject,
 }
 impl Object {
-    fn new(dev: &AsahiDrmDevice, vm: &mmu::Vm, size: usize, m5: bool) -> Result<Self> {
-        let backing = KernelObject::backing(dev, size, CpuMap::WriteCombined)?;
-        let prot = mmu::PROT_GPU_FW_SHARED_RW;
-        let mapping = if m5 {
-            backing.map_range(vm, 0..size, super::BlockGeometry::M5_COMPACT,
-                cfg::TVB_PAGE, prot, mmu::UAT_PGSZ)?
+    /// An object of `size` bytes, on M5 mapped in the client's compact window as `m5`.
+    fn new(dev: &AsahiDrmDevice, vm: &mmu::Vm, size: usize, m5: Option<PairObject>)
+        -> Result<Self> {
+        if let Some(object) = m5 {
+            object.check_room(vm, size, 1)?;
+        }
+        // An M5 target is sized by the client's pass: charge it to the client.
+        let backing = if m5.is_some() {
+            KernelObject::client_backing(dev, size, vm.memory_client())?
         } else {
-            compact_alias(&backing, vm, 0..size, cfg::TVB_PAGE, prot, mmu::UAT_PGSZ)?
+            KernelObject::backing(dev, size, CpuMap::WriteCombined)?
+        };
+        let prot = mmu::PROT_GPU_FW_SHARED_RW;
+        let mapping = match m5 {
+            Some(object) => object.map(&backing, vm, 0..size, prot)?,
+            None => compact_alias(&backing, vm, 0..size, cfg::TVB_PAGE, prot, mmu::UAT_PGSZ)?,
         };
         Ok(Self {
             address: mapping.iova(),
@@ -281,8 +290,8 @@ impl Target {
         let stride = layout.record_stride()?;
         layout.check_capacity(stride)?;
         let m5 = layout.m5.is_some();
-        let records = Object::new(dev, vm, stride * DEPTH, m5)?;
-        let tpc = Object::new(dev, vm, tpc, m5)?;
+        let records = Object::new(dev, vm, stride * DEPTH, m5.then_some(PairObject::Records))?;
+        let tpc = Object::new(dev, vm, tpc, m5.then_some(PairObject::Tpc))?;
         KBox::new(
             Self {
                 records,
@@ -387,7 +396,8 @@ impl Target {
         layout.check_capacity(stride)?;
         let mut grew = false;
         if tpc > self.tpc.backing.size() {
-            Self::replace(&mut self.retired, &mut self.tpc, dev, vm, tpc, owners, self.m5)?;
+            Self::replace(&mut self.retired, &mut self.tpc, dev, vm, tpc, owners,
+                self.m5.then_some(PairObject::Tpc))?;
             grew = true;
         }
         if stride > self.stride {
@@ -398,7 +408,7 @@ impl Target {
                 vm,
                 stride * DEPTH,
                 owners,
-                self.m5,
+                self.m5.then_some(PairObject::Records),
             )?;
             self.stride = stride;
             self.slots = [None; DEPTH];
@@ -413,7 +423,7 @@ impl Target {
         vm: &mmu::Vm,
         size: usize,
         owners: &[Option<u64>; DEPTH],
-        m5: bool,
+        m5: Option<PairObject>,
     ) -> Result {
         let retain = owners.iter().any(Option::is_some);
         if retain {

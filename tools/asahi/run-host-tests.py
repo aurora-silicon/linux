@@ -72,6 +72,8 @@ ASAHI_TESTS = {
                               (['--resume-after-detach'], KILL)],
     'dcp-peer-shown-tests.py': [([], PASS), (['--always-shown'], KILL), (['--owner-only'], KILL)],
     'dcpext26-queue-tests.py': [([], PASS), (['--drop-v27-close'], KILL)],
+    'rtkit-v27-late-tests.py': [(out(), PASS), (out() + ['--consume-committed'], KILL),
+                                (out() + ['--fail-foreign'], KILL)],
     'dcpext26-retrain-tests.py': [([], PASS), (['--negative-control'], KILL)],
     'dcpext26-lifecycle-tests.py': [([], PASS)],
     'dcpext26-modeset-tests.py': [([], PASS)],
@@ -160,6 +162,7 @@ ASAHI_TESTS = {
         + mutations('--mutation', ('round-up', 'cpu-unaligned', 'seg-cpu-unaligned',
                                    'seg-any-size', 'ref-index-upper', 'frame-width-unchecked'), out()),
     'avd-codec-tail-tests.py': [(out('--output'), PASS), (out('--output') + ['--mutations'], PASS)],
+    'bcm4377-completion-tests.py': [([], PASS)],
     # The old revision is the one before the J493 hardware-table ID match.
     'bcm4377-id-tests.py': [(out() + ['--old-ref', '87ddae1397f6f70817cb57df76477a86bdf96424'], PASS)],
     # These mutations are caught inside the test, which then exits 0.

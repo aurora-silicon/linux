@@ -1,5 +1,6 @@
 /dev/sep-bio	-c	gen_context(system_u:object_r:aurora_sep_device_t,s0)
 /var/lib/apple-sep-catacomb-(master|owner|user)\.bin	--	gen_context(system_u:object_r:aurora_sep_state_t,s0)
+/var/lib/\.apple-sep-catacomb-(master|owner|user)\.bin\.new	--	gen_context(system_u:object_r:aurora_sep_state_t,s0)
 /var/lib/aurora-sep-keybag\.bin	--	gen_context(system_u:object_r:aurora_sep_state_t,s0)
 /var/lib/aurora-sep-refkey(-v2)?\.bin	--	gen_context(system_u:object_r:aurora_sep_state_t,s0)
 /var/lib/aurora-sep-host-state\.bin	--	gen_context(system_u:object_r:aurora_sep_state_t,s0)
