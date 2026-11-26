@@ -73,6 +73,8 @@ static void wire_write(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(body), 0);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(body + 16), 0x69000);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(body + 32), 8);
+	/* A write carries the AUX timeout too, at +48. */
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(body + 48), DCP_HDCP_REG_TIMEOUT_MS);
 	KUNIT_EXPECT_MEMEQ(test, body + DCP_HDCP_REG_ARGS_LEN, rtx, sizeof(rtx));
 	KUNIT_EXPECT_EQ(test, dcp_hdcp_reg_write_check(body, sizeof(body),
 						       0x69000, 8), 0);

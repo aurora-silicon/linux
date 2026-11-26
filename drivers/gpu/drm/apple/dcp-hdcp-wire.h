@@ -38,7 +38,7 @@
 #define DCP_HDCP_REG_ARGS_LEN		64
 /* The longest register block: the receiver certificate. */
 #define DCP_HDCP_REG_MAX		1024
-/* The read timeout DCP applies on the AUX side. */
+/* The timeout DCP applies to a register read or write on the AUX side. */
 #define DCP_HDCP_REG_TIMEOUT_MS		500
 
 /* The device service's query, the first call of a session. */
@@ -99,7 +99,9 @@ struct dcp_hdcp_reg_write {
 	__le32 addr;
 	__le32 rsvd1[3];
 	__le32 len;
-	__le32 rsvd2[7];
+	__le32 rsvd2[3];
+	__le32 timeout_ms;
+	__le32 rsvd3[3];
 } __packed;
 static_assert(sizeof(struct dcp_hdcp_reg_write) == DCP_HDCP_REG_ARGS_LEN);
 
@@ -171,6 +173,7 @@ static inline int dcp_hdcp_reg_write_encode(void *body, size_t room, u32 addr,
 	memset(body, 0, DCP_HDCP_REG_ARGS_LEN);
 	a->addr = cpu_to_le32(addr);
 	a->len = cpu_to_le32(len);
+	a->timeout_ms = cpu_to_le32(DCP_HDCP_REG_TIMEOUT_MS);
 	memcpy(body + DCP_HDCP_REG_ARGS_LEN, data, len);
 	return DCP_HDCP_REG_ARGS_LEN + len;
 }
