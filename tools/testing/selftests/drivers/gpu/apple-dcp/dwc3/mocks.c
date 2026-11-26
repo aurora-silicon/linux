@@ -2,8 +2,8 @@
 /* This fixture selects the original controller layout, not T8132. */
 #define of_device_is_compatible(...) false
 struct apple_atcphy {
-    /* T8132-only paths are covered by drivers/apple/atc-t8132-usb3.py. */
-    bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt;
+	/* T8132-only paths are covered by drivers/apple/atc-t8132-usb3.py. */
+	bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt, t8132_device;
 	/* A CIO sleep is T8132's too, covered by tools/asahi/atc-cio-sleep-tests.py. */
 	struct {
 		bool prepared;
@@ -25,7 +25,7 @@ struct apple_atcphy {
 		bool aux, pll;
 		unsigned int pairs, rate;
 	} dp_t8122;
-	bool fixed_usb2, host_active, mode_dirty, ss_tunables, dp_tunables,
+	bool fixed_usb2, fixed_usb3, cio_only, host_active, mode_dirty, ss_tunables, dp_tunables,
 		aux_power_requested;
 	unsigned int dp_owned_pmas, dp_idle_pmas;
 	unsigned int dp_usb_context_valid, dp_usb_context_dirty;
@@ -252,11 +252,15 @@ static void atcphy_restore_after_pd_off(struct apple_atcphy *p);
 static int atcphy_power_off(struct apple_atcphy *p);
 static int atcphy_configure(struct apple_atcphy *p, enum atcphy_mode mode);
 
-/* These units exercise older PHY generations. Never accept a T8132 dispatch. */
+/* These units exercise older PHY generations. Never accept a T8132 or T8152 dispatch. */
 static int __attribute__((unused)) atcphy_configure_t8132(struct apple_atcphy *p, enum atcphy_mode mode)
 { (void)p; (void)mode; assert(false); return -EOPNOTSUPP; }
 static int __attribute__((unused)) atcphy_configure_pipehandler_usb3_host_t8132(struct apple_atcphy *p)
 { (void)p; assert(false); return -EOPNOTSUPP; }
+static int __attribute__((unused)) atcphy_configure_pipehandler_usb3_host_t8152(struct apple_atcphy *p)
+{ (void)p; assert(false); return -EOPNOTSUPP; }
+static void __attribute__((unused)) atcphy_lanes_down_t8152(struct apple_atcphy *p)
+{ (void)p; assert(false); }
 
 
 /* Model the USB2 power-on boundary's running state. */
@@ -400,6 +404,12 @@ static int dwc3_host_init(struct dwc3 *d)
 		pipe_regs[PIPEHANDLER_LOCK_ACK / 4] = PIPEHANDLER_LOCK_EN;
 	}
 	return host_init_error;
+}
+
+/* The xHCI start and its USB3 routing; atc-t8132-usb3 models them. */
+static int dwc3_apple_host_start(struct dwc3_apple *a)
+{
+	return dwc3_host_init(&a->dwc);
 }
 static int dwc3_gadget_init(struct dwc3 *d)
 {

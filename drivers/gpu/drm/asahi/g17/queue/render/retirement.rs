@@ -39,7 +39,7 @@ pub(crate) struct Window {
 
 impl Window {
     pub(crate) fn new(base: u32, count: u32, capacity: u32) -> Result<Self> {
-        if base >= capacity || !(1..=MAX_GROUP_ITEMS).contains(&count) || count >= capacity {
+        if base >= capacity || count > MAX_GROUP_ITEMS || count >= capacity {
             return Err(EINVAL);
         }
         Ok(Self {

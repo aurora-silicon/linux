@@ -290,7 +290,7 @@ cancel:
 static void ext_plane_disable(struct drm_plane *plane, struct drm_atomic_commit *state)
 {
 	struct dcpext_drm *ext = container_of(plane->dev, struct dcpext_drm, drm);
-	u32 *dst = ext->pixels;
+	__le32 *dst = ext->pixels;
 	struct dcpext_frame frame;
 	int idx, i, ret;
 

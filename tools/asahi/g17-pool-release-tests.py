@@ -31,7 +31,8 @@ def fixture():
     predicate = '.any(|queue| queue.retirement_polling() || queue.pool_release_pending())'
     assert events.count(predicate) == 1
     methods = '\n'.join(item(runtime, name) for name in [
-        'fn compute_admission_error(', 'pub(super) fn reserve_compute(']).replace('pub(super) ', '').replace('queue: ComputeSlot::new()?', 'queue: None')
+        'fn compute_admission_error(', 'pub(super) fn reserve_compute(',
+        'pub(super) fn reserve_compute_channel(']).replace('pub(super) ', '').replace('queue: ComputeSlot::new()?', 'queue: None')
     pending = item(compute, 'pub(crate) fn pool_release_pending(') + '\n' + \
         item(compute, 'pub(crate) fn release_settling(')
     return r'''
@@ -74,7 +75,10 @@ struct Id { qid: u8 }
 struct ComputeReservation { slot: usize, id: Id, owner: u64 }
 type ComputeSlot = Option<Box<compute::Queue>>;
 struct ComputeEntry { reservation: ComputeReservation, queue: ComputeSlot }
-struct Admission; impl Admission {fn queues(&self)->u32{4}}
+struct Admission; impl Admission {fn queues(&self)->u32{4}
+    fn reserve_compute_with_budget<T>(&self, _: u64, _: u64, reserve: impl FnOnce(usize) -> Result<(T, bool, usize)>) -> Result<T> {
+        reserve(self.queues() as usize).map(|(value, _, _)| value)
+    }}
 struct QueueIds { free: bool, fail: Option<Error> }
 impl QueueIds {
     fn reserve_for(&mut self, _: u64, _: DataMaster, preferred: Option<u8>, _: usize) -> Result<Id> {
@@ -83,6 +87,8 @@ impl QueueIds {
         self.free = false;
         Ok(Id { qid: preferred.unwrap() })
     }
+    fn render_pair_fits(&self) -> bool { true }
+    fn render_pair_capacity(&self) -> usize { 0 }
 }
 struct Identities { next: u64 }
 impl Identities {
@@ -100,6 +106,7 @@ struct Registry {
 impl Registry {
     // Physical-QID capacity notification does not change this pool-release fixture.
     fn note_build_room(&self) {}
+    fn reclaimable_render_slots(&self) -> Result<(u64, u64)> { Ok((0, 0)) }
 METHODS
     fn poll(&self) -> bool {
         self.compute.iter().flatten().filter_map(|entry| entry.queue.as_deref())PREDICATE

@@ -5,7 +5,7 @@
 #include <kunit/test.h>
 
 static void apple_g17_test_rx(struct apple_mbox *mbox,
-                              struct apple_mbox_msg msg, void *cookie)
+			      struct apple_mbox_msg msg, void *cookie)
 {
 	unsigned int *count = cookie;
 
@@ -93,8 +93,52 @@ static void apple_g17_rx_util_min_test(struct kunit *test)
 #endif
 }
 
+static void apple_g17_rx_hardirq_dispatch_test(struct kunit *test)
+{
+	const struct apple_mbox_hw hw = {
+		.i2a_control = 0, .i2a_recv0 = 8, .i2a_recv1 = 16,
+		.control_empty = BIT(17),
+	};
+	struct apple_mbox mbox = { .hw = &hw, .rx = apple_g17_test_rx };
+	unsigned int count = 0;
+	void *regs = kunit_kzalloc(test, 32, GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, regs);
+	mbox.regs = (void __iomem *)regs;
+	const struct apple_mbox_hw hw_v8 = {
+		.i2a_control = 0, .i2a_recv0 = 8, .i2a_recv1 = 16,
+		.control_empty = BIT(17),
+		.is_ascwrap_v8 = true,
+	};
+	struct apple_mbox mbox_v8 = { .hw = &hw_v8 };
+
+	mbox.ascwrap_v6.role = APPLE_MBOX_ASCWRAP_V6_ROLE_GFX;
+	mbox.cookie = &count;
+	spin_lock_init(&mbox.rx_lock);
+
+	/* ASCWrap v6 GFX/GFX1 use the hard-IRQ split; ASCWrap v8 stays excluded
+	 * so apple_mbox_recv_irq() keeps running apple_mbox_v8_rx_irq_guard().
+	 */
+	KUNIT_EXPECT_TRUE(test, apple_mbox_is_g17(&mbox));
+	mbox_v8.ascwrap_v6.role = APPLE_MBOX_ASCWRAP_V6_ROLE_GFX;
+	KUNIT_EXPECT_FALSE(test, apple_mbox_is_g17(&mbox_v8));
+	mbox_v8.ascwrap_v6.role = APPLE_MBOX_ASCWRAP_V6_ROLE_GFX1;
+	KUNIT_EXPECT_FALSE(test, apple_mbox_is_g17(&mbox_v8));
+
+	/* Empty FIFO finishes directly in hard IRQ without waking the thread. */
+	writel(BIT(17), mbox.regs);
+	KUNIT_EXPECT_EQ(test, apple_mbox_g17_recv_irq(0, &mbox), IRQ_HANDLED);
+	KUNIT_EXPECT_EQ(test, count, 0U);
+
+	/* Saturated budget wakes the oneshot throttle thread. */
+	writel(0, mbox.regs);
+	KUNIT_EXPECT_EQ(test, apple_mbox_g17_recv_irq(0, &mbox), IRQ_WAKE_THREAD);
+	KUNIT_EXPECT_EQ(test, count, (unsigned int)APPLE_G17_MBOX_RX_BUDGET);
+}
+
 static struct kunit_case apple_g17_stall_cases[] = {
 	KUNIT_CASE(apple_g17_rx_flood_bounded_test),
+	KUNIT_CASE(apple_g17_rx_hardirq_dispatch_test),
 	KUNIT_CASE(apple_g17_tx_stall_bounded_test),
 	KUNIT_CASE(apple_g17_rx_util_min_test),
 	{ }
