@@ -30,8 +30,18 @@ static void tx_report(struct dcp_hdcp_tx *tx, enum dcp_hdcp_progress_code code,
 static int tx_wait(struct dcp_hdcp_tx *tx, enum dcp_hdcp_auth_op op,
 		   unsigned int spec_ms)
 {
+	int ret;
+
 	tx->step = "wait for DCP event";
-	return tx->ops->wait(tx->ctx, op, spec_ms + DCP_HDCP_EVENT_SLACK_MS);
+	ret = tx->ops->wait(tx->ctx, op, spec_ms + DCP_HDCP_EVENT_SLACK_MS);
+	/* LAB DIAGNOSTIC (drop before PR): after a failed wait only, what the receiver says. */
+	if (ret == -ETIMEDOUT) {
+		u8 status = 0xff;
+		int r = tx->ops->read(tx->ctx, DP_HDCP_2_2_REG_RXSTATUS_OFFSET, &status, 1);
+
+		pr_info("hdcp lab: event %#x timed out; RxStatus read %d = %#x\n", op, r, status);
+	}
+	return ret;
 }
 
 /* Any revoked ID, or an SRM that cannot be read, fails the attempt. */
