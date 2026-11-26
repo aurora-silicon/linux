@@ -94,6 +94,11 @@
 				reg = <0x3 0x50300000 0x0 0x4000>;
 				#iommu-cells = <1>;
 				interrupts = <0 734 4>;
+				/*
+				 * The ADT dart-pmp window (vm-base, vm-size). macOS
+				 * 27.2 answers the PMP's allocations from it.
+				 */
+				apple,dma-range = /bits/ 64 <0x10000000000 0x1000000000>;
 				status = "disabled";
 			};
 

@@ -197,6 +197,8 @@ struct PmpData {
     self_ack_start: bool,
     /// See [`PmpHwConfig::confirm_ioreg_len`].
     confirm_ioreg_len: bool,
+    /// See [`PmpHwConfig::register_ack_index`].
+    register_ack_index: bool,
 }
 
 impl PmpData {
@@ -234,6 +236,7 @@ impl PmpData {
                     sram_backup_data,
                     self_ack_start: cfg.self_ack_start,
                     confirm_ioreg_len: cfg.confirm_ioreg_len,
+                    register_ack_index: cfg.register_ack_index,
                 }
             ),
             GFP_KERNEL,
@@ -462,7 +465,11 @@ impl PmpData {
         }
         state.ioreg_entries.push(size, GFP_KERNEL)?;
         state.ioreg_ids.push(id, GFP_KERNEL)?;
-        let index = state.ioreg_entries.len() as u64;
+        let index = if self.register_ack_index {
+            state.ioreg_entries.len() as u64
+        } else {
+            0
+        };
         let msg = (OPC_REGISTER_IOREG | OPC_ACK_MASK) << OPC_SHIFT | (index << 32) | size as u64;
         Ok(msg)
     }
@@ -945,6 +952,9 @@ struct PmpHwConfig {
     self_ack_start: bool,
     /// Answer UPDATE_IOREG with the registered entry's length instead of 0.
     confirm_ioreg_len: bool,
+    /// Put the entry's count in bits 47:32 of the REGISTER_IOREG acknowledgment. macOS 27.2
+    /// leaves them 0 on T6030.
+    register_ack_index: bool,
 }
 
 /// Whether a PMP firmware needs endpoint 7 to finish its RTKit boot.
@@ -966,6 +976,7 @@ const HW_CFG_DEFAULT: PmpHwConfig = PmpHwConfig {
     sram_backup_data: false,
     self_ack_start: false,
     confirm_ioreg_len: false,
+    register_ack_index: true,
 };
 
 /// T8140: the DART translates 42 bits and its DMA window starts at 1 TiB.
@@ -977,6 +988,7 @@ const HW_CFG_T8140: PmpHwConfig = PmpHwConfig {
     sram_backup_data: false,
     self_ack_start: false,
     confirm_ioreg_len: false,
+    register_ack_index: true,
 };
 
 /// T6041: the DART window starts at 1 TiB; the boot argument header is
@@ -992,6 +1004,7 @@ const HW_CFG_T6041: PmpHwConfig = PmpHwConfig {
     sram_backup_data: false,
     self_ack_start: false,
     confirm_ioreg_len: false,
+    register_ack_index: true,
 };
 
 /// T8142: the DART window starts at 1 TiB as on T8140. Its registry-v2
@@ -1005,6 +1018,7 @@ const HW_CFG_T8142: PmpHwConfig = PmpHwConfig {
     sram_backup_data: false,
     self_ack_start: false,
     confirm_ioreg_len: false,
+    register_ack_index: true,
 };
 
 /// T6050: the DART window starts at 1 TiB (ADT dart-pmp0 vm-base) and spans
@@ -1018,6 +1032,7 @@ const HW_CFG_T6050: PmpHwConfig = PmpHwConfig {
     sram_backup_data: false,
     self_ack_start: false,
     confirm_ioreg_len: false,
+    register_ack_index: true,
 };
 
 /// T8132: over a sleep only the ADT's second segment (0x68000 bytes, starting at 0x3c000 on
@@ -1032,6 +1047,24 @@ const HW_CFG_T8132: PmpHwConfig = PmpHwConfig {
     sram_backup_data: true,
     self_ack_start: true,
     confirm_ioreg_len: true,
+    register_ack_index: true,
+};
+
+/// T6030 (J516S, macOS 27.2 image 5D66805B): the DART window starts at 1 TiB (ADT dart-pmp
+/// vm-base, 64 GiB), and macOS answers the firmware's allocations from it. As macOS does, the host
+/// sends no SET_IOP_PWR_STATE at the start: the firmware acknowledges IOP power on by itself. It
+/// answers UPDATE_IOREG with 8, the registered entry's length, and REGISTER_IOREG with the length
+/// alone. The image has endpoints 1 to 4 and 0x20, no endpoint 7. macOS's sleep never touches the
+/// PMP SRAM, so none is kept.
+const HW_CFG_T6030: PmpHwConfig = PmpHwConfig {
+    dma_mask: Some(DmaMask::new::<42>()),
+    check_bootargs_uuid: false,
+    coreanalytics: Ep7::No,
+    sram_backup: None,
+    sram_backup_data: false,
+    self_ack_start: true,
+    confirm_ioreg_len: true,
+    register_ack_index: false,
 };
 
 impl Drop for PmpDriver {
@@ -1050,6 +1083,7 @@ kernel::of_device_table!(
         (of::DeviceId::new(c"apple,t8142-pmp-v2"), &HW_CFG_T8142),
         (of::DeviceId::new(c"apple,t6041-pmp-v2"), &HW_CFG_T6041),
         (of::DeviceId::new(c"apple,t6050-pmp-v2"), &HW_CFG_T6050),
+        (of::DeviceId::new(c"apple,t6030-pmp-v2"), &HW_CFG_T6030),
         (of::DeviceId::new(c"apple,t6000-pmp-v2"), &HW_CFG_DEFAULT),
     ]
 );
