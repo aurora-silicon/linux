@@ -121,7 +121,7 @@ impl<T> KVec<T> {
 impl<T> core::ops::Deref for KVec<T> { type Target = [T]; fn deref(&self) -> &[T] { &self.0 } }
 impl<T> core::ops::DerefMut for KVec<T> { fn deref_mut(&mut self) -> &mut [T] { &mut self.0 } }
 mod uapi { include!("FULL_UAPI"); }
-mod file { pub const MAX_COMMANDS_PER_SUBMISSION: u32 = 64; }
+mod file { pub const MAX_COMMANDS_PER_SUBMISSION: u32 = 64; pub const MAX_SYNCS_PER_SUBMISSION: usize = 4096; }
 mod hw {
     pub const USER_RANGE: core::ops::Range<u64> = 0x4000..((1u64 << 42) - 0x8000);
     pub mod sizes { pub const MAX_ATTACHMENTS: usize = 16; pub const TA_LIGHT_TILEMAP_BYTES: u64 = 64 * 1024; }
