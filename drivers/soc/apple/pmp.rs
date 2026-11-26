@@ -716,7 +716,21 @@ impl PmpData {
                 } else {
                     0
                 };
+                if !self.register_ack_index {
+                    dev_info!(
+                        self.dev,
+                        "PMP: UPDATE_IOREG {:#x}, confirmed with {}\n",
+                        msg & SET_IOREG_INDEX_MASK,
+                        value
+                    );
+                }
                 OPC_CONFIRM_IOREG << OPC_SHIFT | value
+            }
+            // The firmware's answer to the host's query (opcode 0x46), as macOS 27.2 gets it on
+            // T6030: taken, nothing sent back.
+            OPC_CONFIRM_IOREG => {
+                dev_info!(self.dev, "PMP: CONFIRM_IOREG {:#x}\n", msg & MSG_IOVA_MASK);
+                return Ok(());
             }
             _ => {
                 dev_err!(self.dev, "Got unknown message {}", msg);
@@ -860,6 +874,24 @@ pub unsafe extern "C" fn apple_pmp_send_power_command(
         enabled
     );
     0
+}
+
+/// DIAGNOSTIC: sends one message as is on the PMP endpoint.
+///
+/// # Safety
+/// `data` must point to the live PmpData registered by PmpDriver.
+#[export]
+pub unsafe extern "C" fn apple_pmp_send_raw(data: *const core::ffi::c_void, msg: u64) -> i32 {
+    // SAFETY: The C bridge serializes calls against unregister in Drop.
+    let data = unsafe { &*data.cast::<PmpData>() };
+    let mut guard = data.rtkit.lock();
+    let Some(rtk) = guard.as_mut().as_pin_mut() else {
+        return ENODEV.to_errno();
+    };
+    match rtk.send_message(PMP_ENDPOINT, msg) {
+        Ok(()) => 0,
+        Err(error) => error.to_errno(),
+    }
 }
 
 /// Stops the firmware for a system sleep.

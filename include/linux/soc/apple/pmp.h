@@ -34,6 +34,8 @@ int apple_pmp_send_power_command(const void *data, u8 command,
 extern const struct dev_pm_ops apple_pmp_pm_ops;
 int apple_pmp_sleep(const void *data);
 int apple_pmp_wake(const void *data);
+/* DIAGNOSTIC: one message as is, on the PMP's endpoint 0x20 */
+int apple_pmp_send_raw(const void *data, u64 msg);
 
 /*
  * What the sleep's last step needs to idle and stop the PMP with interrupts off: its RTKit and

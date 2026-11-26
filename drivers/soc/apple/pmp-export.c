@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
+#include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/export.h>
 #include <linux/io.h>
+#include <linux/kstrtox.h>
+#include <linux/moduleparam.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
@@ -19,6 +22,40 @@ static const void *pmp_data;
 static struct device *pmp_device;
 /* The firmware is stopped for a system sleep. */
 static bool pmp_asleep;
+
+/*
+ * DIAGNOSTIC (T6030 sleep bring-up): macOS 27.2's three host queries to the J516S PMP, about 5 s
+ * after its start (s2r-full-boot-2, -194,362 ms): opcode 0x46 for entries 0x15f, 0x17c and 0x183,
+ * each answered with CONFIRM_IOREG 8. Writing 1 sends them.
+ */
+static const u64 apple_pmp_diag_queries[] = {
+	0x004600000000015fULL, 0x004600000000017cULL, 0x0046000000000183ULL,
+};
+
+static int apple_pmp_diag_query_set(const char *val, const struct kernel_param *kp)
+{
+	bool on;
+	int ret = kstrtobool(val, &on);
+	size_t i;
+
+	if (ret || !on)
+		return ret;
+	guard(mutex)(&pmp_lock);
+	if (!pmp_data || pmp_asleep)
+		return -ENODEV;
+	for (i = 0; i < ARRAY_SIZE(apple_pmp_diag_queries) && !ret; i++) {
+		ret = apple_pmp_send_raw(pmp_data, apple_pmp_diag_queries[i]);
+		msleep(1);
+	}
+	dev_info(pmp_device, "DIAGNOSTIC: sent macOS's 0x46 queries: %d\n", ret);
+	return ret;
+}
+
+static const struct kernel_param_ops apple_pmp_diag_query_ops = {
+	.set = apple_pmp_diag_query_set,
+};
+module_param_cb(diag_query, &apple_pmp_diag_query_ops, NULL, 0200);
+MODULE_PARM_DESC(diag_query, "DIAGNOSTIC (T6030): send macOS's three 0x46 queries to the PMP");
 
 int apple_pmp_register(struct device *dev, const void *data)
 {
