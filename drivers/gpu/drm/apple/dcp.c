@@ -5346,6 +5346,36 @@ int dcp_typec_prepare_route(struct apple_dcp *dcp)
 	return ready ? 0 : -ETIMEDOUT;
 }
 
+/*
+ * Set once the boot loader's panel has been power-cycled.  The framebuffer
+ * node outlives the handover, so a later bind must not take it again; a bind
+ * that fails before the cycle leaves it for the retry.
+ */
+static bool dcp_panel_handover_taken;
+
+/*
+ * J313 on DCP 13.5 finds its panel already on from the boot loader
+ * (set_device_enabled 1 -> 1), so the first power-on only sets a mode:
+ * the firmware never powers up its video interface or LTM block and
+ * logs that it could not find the Backlight service.  It then takes
+ * the levels Linux swaps in and reports them back, but the panel stays
+ * at the boot level until a DPMS cycle.  Give it that cycle once, as
+ * dcp_poweroff() runs it for an internal panel.
+ */
+static void dcp_cycle_handed_over_panel(struct apple_dcp *dcp)
+{
+	if (!dcp->panel_cold_poweron)
+		return;
+
+	dcp->panel_cold_poweron = false;
+	dcp_panel_handover_taken = true;
+	dev_info(dcp->dev, "power-cycling the panel handed over by the boot loader\n");
+	cancel_delayed_work(&dcp->swap_watchdog_wq);
+	if (dcp->avep)
+		av_service_disconnect(dcp);
+	_dcp_poweroff(dcp);
+}
+
 void dcp_poweron(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
@@ -5487,6 +5517,8 @@ void dcp_poweron(struct platform_device *pdev)
 		if (connected && !READ_ONCE(dcp->hdmi_yielded))
 			dcp_dptx_connect(dcp, 0);
 	}
+
+	dcp_cycle_handed_over_panel(dcp);
 
 	switch (dcp->fw_compat) {
 	case DCP_FIRMWARE_V_12_3:
@@ -7075,6 +7107,49 @@ static int dcp_ext26_start_resident(struct apple_dcp *dcp)
 	return ret;
 }
 
+/*
+ * J313 BrightnessLCD::nitsToDBV rejects 395 nits and above.  iDAC 1956 is
+ * accepted and 1957 is not, so 394 is the brightest level that applies.
+ * apple,max-brightness on this panel is 420; 100% must land on 394.
+ */
+#define DCP_J313_MAX_NITS 394U
+
+static bool dcp_panel_is_j313(const struct dcp_panel_id *id,
+			      const char *compatible)
+{
+	if (compatible && !strcmp(compatible, "apple,panel-j313"))
+		return true;
+	return id && !strcmp(id->name, "J313");
+}
+
+/*
+ * The boot loader hands a panel over lit as an available simple-framebuffer
+ * whose "panel" points at it, until the first power-on has cycled it (see
+ * dcp_panel_handover_taken).
+ */
+static bool dcp_panel_handed_over(struct device_node *panel_np)
+{
+	struct device_node *fb, *panel;
+	bool lit = false;
+
+	if (dcp_panel_handover_taken)
+		return false;
+
+	for_each_compatible_node(fb, NULL, "simple-framebuffer") {
+		if (!of_device_is_available(fb))
+			continue;
+		panel = of_parse_phandle(fb, "panel", 0);
+		lit = panel == panel_np;
+		of_node_put(panel);
+		if (lit) {
+			of_node_put(fb);
+			break;
+		}
+	}
+
+	return lit;
+}
+
 static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *data)
 {
 	struct device_node *panel_np;
@@ -7189,6 +7264,8 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 		panel_np = of_get_compatible_child(dev->of_node, "apple,panel");
 
 	if (panel_np) {
+		const char *compatible = NULL;
+
 		if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) {
 			/*
 			 * Desktop 26.x swaps carry nits, and the panel node
@@ -7207,6 +7284,31 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 		}
 
 		dcp_panel_read_dimensions(dcp, panel_np);
+		if (of_property_read_string_index(panel_np, "compatible", 0,
+						  &compatible))
+			compatible = NULL;
+		/* The most specific compatible names the panel for its EDID. */
+		if (iomfb_v14_7_base_edid(dcp) && compatible &&
+		    dcp_panel_id_from_compatible(&dcp->panel.id, compatible))
+			dev_dbg(dev, "no EDID make and product in '%s'\n", compatible);
+		if (dcp_panel_is_j313(&dcp->panel.id, compatible)) {
+			dcp->panel_cold_poweron =
+				dcp->fw_compat == DCP_FIRMWARE_V_13_5 &&
+				dcp_panel_handed_over(panel_np);
+			/*
+			 * Only this panel.  The backlight device's maximum is
+			 * this value, so 100% asks the firmware for
+			 * DCP_J313_MAX_NITS.
+			 */
+			if (dcp->brightness.maximum > DCP_J313_MAX_NITS) {
+				dcp->brightness.maximum = DCP_J313_MAX_NITS;
+				if (dcp->brightness.nits > (int)DCP_J313_MAX_NITS)
+					dcp->brightness.nits = DCP_J313_MAX_NITS;
+				dev_info(dev, "capping panel backlight at %u nits\n",
+					 DCP_J313_MAX_NITS);
+			}
+		}
+
 		of_node_put(panel_np);
 		/* Read target metadata for H17P and desktop firmware alike. */
 		dcp_panel_read_adt(dcp);
@@ -11471,6 +11573,7 @@ static const struct of_device_id of_match[] = {
 	{ .compatible = "apple,t6030-dcpext", .data = &apple_dcp_hw_t6030_dcpext, },
 	{ .compatible = "apple,t8122-dcp", .data = &apple_dcp_hw_t8122, },
 	{ .compatible = "apple,t6031-dcp", .data = &apple_dcp_hw_t6031, },
+	{ .compatible = "apple,t6034-dcp", .data = &apple_dcp_hw_t6031, },
 	{ .compatible = "apple,t8122-dcpext", .data = &apple_dcp_hw_t8122_dcpext, },
 	{ .compatible = "apple,dcp",       .data = &apple_dcp_hw_dcp,    },
 	{ .compatible = "apple,dcpext",    .data = &apple_dcp_hw_dcpext, },
