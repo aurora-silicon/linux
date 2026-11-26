@@ -2442,11 +2442,12 @@ static bool dcp_t8132_fw27(const struct apple_dcp *dcp)
 
 /*
  * Firmware 27: the DPTX port of a T8132 dcpext is held while the release
- * of a display whose tunnel went is unanswered (dcp_dptx_release_locked()):
- * the firmware may still be working on it, and its transport keeps the
- * call's slot for the answer. No connect uses the port meanwhile, and the
- * firmware's link calls are not acted on (dcp_t8132_late_release()). Only
- * the answer to that call ends it (dcp_t8132_settle_locked()).
+ * of a display whose tunnel went, or a release owed, is unanswered
+ * (dcp_dptx_release_locked()): the firmware may still be working on it, and
+ * its transport keeps the call's slot for the answer. No connect uses the
+ * port meanwhile, nor sends a release again, and the firmware's link calls
+ * are not acted on (dcp_t8132_late_release()). Only the answer to that call
+ * ends it (dcp_t8132_settle_locked()).
  */
 static bool dcp_t8132_port_held_locked(struct apple_dcp *dcp)
 {
@@ -3003,17 +3004,19 @@ out_withdraw:
 out_release:
 	/*
 	 * Nor is the release of a display requested, which takes the path of
-	 * a detach's: a release of a gone tunnel the firmware has not answered
-	 * holds the port, and one not sent or refused is owed to the next
-	 * release, which a later connect sends first.
+	 * a detach's, owed from here: on firmware 27 one the firmware has not
+	 * answered holds the port, live link or not, and one not sent or
+	 * refused stays owed to the next release, which a later connect sends
+	 * first.
 	 */
 	dcp_dptx_gate_disarm(dcp);
+	/* Its display is no longer wanted: owed until a release goes through. */
+	dcp->dptxport[port].release_owed = true;
 	err = dcp_dptx_release_locked(dcp, port);
 	if (err) {
 		dev_warn(dcp->dev, "dcp_dptx_connect: port %u not released (%d): its release is owed\n",
 			 port, err);
 		dcp->dptxport[port].connected = false;
-		dcp->dptxport[port].release_owed = true;
 	}
 
 out_unlock:
@@ -4259,6 +4262,12 @@ static int dcp_dptx_release_locked(struct apple_dcp *dcp, u32 port)
 		/* Firmware 27: followed past a timeout (dcp_t8132_settle_locked()). */
 		struct afk_ticket *ticket = dcp_t8132_fw27(dcp) && !port ?
 					    &dcp->t8132_release : NULL;
+		/*
+		 * A release owed is of a display no longer wanted: one a
+		 * failed connect requested, or one whose release the firmware
+		 * refused. It is that display's, whichever tunnel is bound now.
+		 */
+		bool owed = dcp->dptxport[port].release_owed;
 
 		/*
 		 * A T8132 dcpext's DRM swaps stop with the route, before
@@ -4287,24 +4296,30 @@ static int dcp_dptx_release_locked(struct apple_dcp *dcp, u32 port)
 			ret = 0;
 			/* Its next sink starts from scratch. */
 			iomfb_m4_external_link_gone(dcp);
-		} else if (ret == -ETIMEDOUT && dcp_t8132_tunnel_gone(dcp, port)) {
+		} else if (ret == -ETIMEDOUT &&
+			   ((ticket && owed) || dcp_t8132_tunnel_gone(dcp, port))) {
 			/*
 			 * Firmware 27: the firmware has the release of a
-			 * display whose tunnel is gone and has not answered it
-			 * in time. The host's side ends here, so that the route
-			 * goes back to the fabric and the next tunnel is not
-			 * refused on it, but the DPTX port is held until the
-			 * firmware answers (dcp_t8132_port_held_locked()): its
-			 * transport keeps the call's slot for that answer, the
-			 * link callbacks the firmware makes for the release
-			 * meanwhile are not acted on (dcp_t8132_late_release()),
-			 * and no connect uses the port. Any other failure, a
-			 * release not sent or refused, or one on a live link,
-			 * is returned as on every other path.
+			 * display whose tunnel is gone, or a release owed, and
+			 * has not answered it in time. The host's side ends
+			 * here, so that the route goes back to the fabric and
+			 * the next tunnel is not refused on it, but the DPTX
+			 * port is held until the firmware answers
+			 * (dcp_t8132_port_held_locked()): its transport keeps
+			 * the call's slot for that answer, the link callbacks
+			 * the firmware makes for the release meanwhile are not
+			 * acted on (dcp_t8132_late_release()), and no connect
+			 * uses the port nor sends the release again. An owed
+			 * release holds also once a replacement tunnel is bound,
+			 * whose connect sends it (dcp_dptx_connect_raw()), and
+			 * after a failed connect on a live link. Any other
+			 * failure, a release not sent or refused, or the release
+			 * of a display connected on a live link, is returned as
+			 * on every other path.
 			 */
 			dcp_t8132_dptx_teardown_log(dcp, port, "release_display", ret);
 			WRITE_ONCE(dcp->t8132_release_late, true);
-			dev_info(dcp->dev, "DPTX port %u: its tunnel went, the release is answered late: port held until then\n",
+			dev_info(dcp->dev, "DPTX port %u: the release of a display no longer wanted is answered late: port held until then\n",
 				 port);
 			ret = 0;
 		}

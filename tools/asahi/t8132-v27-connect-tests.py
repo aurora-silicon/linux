@@ -35,10 +35,17 @@ firmware 27.2:
   refused, or timed out on a live link, or on a link without a tunnel (a
   fixed HDMI output), fails as before;
 - a connect that fails once its display is requested releases it as a detach
-  does (dcp_dptx_release_locked()): a revocation after the request with a
-  release that times out holds the port, and a release refused is owed to
-  the next release or connect. Only the firmware's answer frees a held port:
-  no connect clears it;
+  does (dcp_dptx_release_locked()): a release that times out holds the port,
+  on a revoked or a live link, and a release refused is owed to the next
+  release or connect. Only the firmware's answer frees a held port: no
+  connect clears it;
+- a release owed and sent again that times out holds the port as the first
+  did, also with the replacement tunnel bound: whichever comes first, the
+  dock's repeated request or the answer, only one release is ever
+  outstanding, nothing is connected until it is answered, and an answer that
+  carries it out connects the display with no release sent again; one that
+  refuses it has it sent once more. A release refused at once by the detach,
+  sent again by the fabric and unanswered, holds as well;
 - the DPTX service's publication, or the tunnel's repeated request, connects
   a display attached while its connect could not run;
 - the display processor's component unbinds with a release unanswered: its
@@ -116,8 +123,19 @@ MUTATIONS = {
     'blind-retries': ('dcp', '(dcp_uses_t6020_tunnel_flow(dcp) || dcp_t8132_ext_hw(dcp) ?',
                       '(dcp_uses_t6020_tunnel_flow(dcp) || dcp_is_t8132_ext(dcp) ?'),
     # Any release error on firmware 27 taken as done, as before.
-    'any-error-released': ('dcp', '} else if (ret == -ETIMEDOUT && dcp_t8132_tunnel_gone(dcp, port)) {',
+    'any-error-released': ('dcp', '} else if (ret == -ETIMEDOUT &&\n\t\t\t   ((ticket && owed) || dcp_t8132_tunnel_gone(dcp, port))) {',
                            '} else if (ret && dcp_t8132_ext_hw(dcp)) {'),
+    # A release owed and sent again holds only while no tunnel is bound, as before.
+    'owed-retry-unfenced': ('dcp', '\t\t\t   ((ticket && owed) || dcp_t8132_tunnel_gone(dcp, port))) {',
+                            '\t\t\t   dcp_t8132_tunnel_gone(dcp, port)) {'),
+    # A failed connect's release is owed only once it failed, as before.
+    'failed-connect-not-owed': ('dcp', '\tdcp->dptxport[port].release_owed = true;\n\terr = dcp_dptx_release_locked(dcp, port);\n'
+                                '\tif (err) {\n\t\tdev_warn(dcp->dev, "dcp_dptx_connect: port %u not released (%d): its release is owed\\n",\n'
+                                '\t\t\t port, err);\n\t\tdcp->dptxport[port].connected = false;\n',
+                                '\terr = dcp_dptx_release_locked(dcp, port);\n'
+                                '\tif (err) {\n\t\tdev_warn(dcp->dev, "dcp_dptx_connect: port %u not released (%d): its release is owed\\n",\n'
+                                '\t\t\t port, err);\n\t\tdcp->dptxport[port].connected = false;\n'
+                                '\t\tdcp->dptxport[port].release_owed = true;\n'),
     # A live link's timed-out release taken as done.
     'live-link-released': ('dcp', '\treturn dcp_t8132_ext_hw(dcp) && !dcp_is_t8132_ext(dcp) && dcp->dptx_tunnel &&\n'
                            '\t       dcp_tb_tunnel_withdrawn(dcp, port);',
@@ -144,8 +162,8 @@ MUTATIONS = {
                             '\tif (t8132 && dcp->dptxep && afk_compact_orphans_pending(dcp->dptxep)) {\n'
                             '\t\tret = dcp_t8132_wait_teardown_answers('),
     # A failed connect releases its display ignoring the result, as before.
-    'connect-release-ignored': ('dcp', '\tdcp_dptx_gate_disarm(dcp);\n\terr = dcp_dptx_release_locked(dcp, port);\n',
-                                '\tdcp_dptx_gate_disarm(dcp);\n\tdptxport_release_display(dcp->dptxport[port].service);\n'
+    'connect-release-ignored': ('dcp', '\tdcp->dptxport[port].release_owed = true;\n\terr = dcp_dptx_release_locked(dcp, port);\n',
+                                '\tdptxport_release_display(dcp->dptxport[port].service);\n'
                                 '\tdcp->dptxport[port].connected = false;\n\terr = 0;\n'),
     # A release not sent or refused is dropped instead of owed.
     'owed-dropped': ('dcp', '\t    (dcp->dptxport[port].connected || dcp->dptxport[port].release_owed)) {',
@@ -434,6 +452,14 @@ static void rpc(const char *what)
 	if (at_rpc)
 		at_rpc(what);
 }
+static unsigned int rpc_count(const char *what)
+{
+	unsigned int n = 0;
+
+	for (unsigned int i = 0; i < nrpcs; i++)
+		n += !strcmp(rpcs[i], what);
+	return n;
+}
 static bool rpc_seen(const char *what)
 {
 	for (unsigned int i = 0; i < nrpcs; i++)
@@ -548,6 +574,8 @@ static int dptxport_release_display_ticket(struct apple_epic_service *s, struct 
 	int ret;
 
 	(void)s;
+	/* Firmware 27: never a release while an earlier one is unanswered. */
+	assert(!late_pending || the_dcp->fw_compat != DCP_FIRMWARE_V_27_0);
 	ret = send("release");
 	/* A release always goes out: it is never gated. */
 	assert(!ret);
@@ -1187,6 +1215,116 @@ static void fence_cases(void)
 	puts("ok fence: the M4 backend's wait, ended by its answers, a revocation or DPMS");
 }
 
+/*
+ * The first release timed out on a gone tunnel, its late answer refused it,
+ * and the replacement's connect sends it again, which times out too, with the
+ * replacement bound: the port is held for that release's own answer.
+ */
+static void owed_retry_late(void)
+{
+	held_replug();
+	answer_refused();
+	release_ret = -ETIMEDOUT;
+	run_port_work();
+	assert(dcp->typec_reconnect_wq.pending && binding_live);
+	run_work();
+	assert(nrpcs == 1 && !strcmp(rpcs[0], "release") && late_pending);
+	assert(dcp->t8132_release_late && !dcp->dptxport[0].release_owed);
+	assert(!hpd_high && !dcp->dptxport[0].connected && !dcp->typec_reconnect_wq.pending);
+	assert(dcp_t8132_link_report_late(dcp, "SetActiveLaneCount"));
+}
+
+static void owed_retry_cases(void)
+{
+	/*
+	 * The dock repeats its request before the answer: nothing goes out,
+	 * neither a release nor a connect call. The answer carries the
+	 * release out: the replacement connects, with no release sent again.
+	 */
+	owed_retry_late();
+	release_ret = 0;
+	for (unsigned int i = 0; i < 2; i++) {
+		dcp_typec_attach_repeated(dcp);
+		run_port_work();
+		if (dcp->typec_reconnect_wq.pending)
+			run_work();
+	}
+	assert(nrpcs == 1 && !hpd_high && dcp->t8132_release_late);
+	assert(dcp_t8132_link_report_late(dcp, "SetActiveLaneCount"));
+	answer();
+	run_port_work();
+	run_work();
+	assert(hpd_high && dcp->dptxport[0].connected && !dcp->dptxport[0].release_owed);
+	assert(nrpcs == 5 && rpc_count("release") == 1 && !strcmp(rpcs[1], "validate"));
+	assert(!dcp->t8132_release_late && !dcp_t8132_link_report_late(dcp, "SetActiveLaneCount"));
+	puts("ok owed retry: timed out with the replacement bound: held, repeated requests send nothing");
+
+	/*
+	 * The answer first: it carries the release out, and the work connects
+	 * the replacement without a release a firmware would refuse.
+	 */
+	owed_retry_late();
+	release_ret = -EIO;
+	answer();
+	run_port_work();
+	run_work();
+	assert(hpd_high && dcp->dptxport[0].connected && !dcp->dptxport[0].release_owed);
+	assert(rpc_count("release") == 1);
+	puts("ok owed retry: its own answer frees the port, and no release goes out again");
+
+	/* Refused again: sent once more, after that answer, then the connect. */
+	owed_retry_late();
+	release_ret = 0;
+	answer_refused();
+	run_port_work();
+	assert(dcp->dptxport[0].release_owed && !dcp->t8132_release_late);
+	run_work();
+	assert(rpc_count("release") == 2 && !strcmp(rpcs[1], "release") && !strcmp(rpcs[2], "validate"));
+	assert(hpd_high && dcp->dptxport[0].connected && !dcp->dptxport[0].release_owed);
+	puts("ok owed retry: refused again: sent once more once answered, then connected");
+
+	/* Unanswered, the replacement goes too: nothing connects, still held. */
+	owed_retry_late();
+	detach();
+	assert(rpc_count("release") == 1 && dcp->t8132_release_late);
+	answer();
+	run_port_work();
+	assert(!dcp->t8132_release_late && !dcp->typec_reconnect_wq.pending && !hpd_high);
+	puts("ok owed retry: the replacement gone before the answer is not connected");
+
+	/*
+	 * The detach's release refused at once: the fabric keeps the route and
+	 * sends the release again before the replacement takes the pipeline.
+	 * Unanswered, it holds the port for the replacement as well.
+	 */
+	setup(&j713_27);
+	dcp->dptxport[0].connected = true;
+	binding_live = false;
+	release_ret = -EIO;
+	assert(dcp_dptx_disconnect_oob(&pdev, 0) == -EIO);
+	assert(dcp->dptxport[0].connected && !dcp->t8132_release_late);
+	release_ret = -ETIMEDOUT;
+	assert(dcp_dptx_disconnect(dcp, 0) == 0);
+	assert(dcp->t8132_release_late && !dcp->dptxport[0].connected);
+	release_ret = 0;
+	replug();
+	nrpcs = 0;
+	run_work();
+	assert(nrpcs == 0 && !hpd_high);
+	answer();
+	run_port_work();
+	run_work();
+	assert(hpd_high && dcp->dptxport[0].connected && !rpc_seen("release"));
+	puts("ok owed retry: a detach's release refused at once, sent again unanswered: held");
+
+	/* A display still connected on a live or fixed link: its release's timeout, as before. */
+	assert(release(true, true, -ETIMEDOUT, &j713_27) == -ETIMEDOUT && !dcp->t8132_release_late);
+	assert(dcp->dptxport[0].connected);
+	late_pending = false;
+	assert(release(true, false, -ETIMEDOUT, &j713_27) == -ETIMEDOUT && !dcp->t8132_release_late);
+	puts("ok owed retry: a connected display's release on a live or fixed link fails as before");
+}
+
 /* A connect that fails once its display is requested releases it as a detach does. */
 static void failed_connect_cases(void)
 {
@@ -1249,6 +1387,30 @@ static void failed_connect_cases(void)
 	assert(dcp_dptx_connect_raw(dcp, 0, NULL, &dcp->typec_reconnect_session, true, false) == -EIO);
 	assert(nrpcs == 1 && dcp->dptxport[0].release_owed && !hpd_high);
 	puts("ok failed connect: a release refused is owed to the next release or connect");
+
+	/*
+	 * HPD refused on a live link, the release unanswered: the port is
+	 * held, a repeated request sends nothing, and the answer connects
+	 * the display with no release sent again.
+	 */
+	setup(&j713_27);
+	dcp->typec_cable_connected = true;
+	dcp_typec_attach_deferred(dcp);
+	set_hpd_high_ret = -EIO; release_ret = -ETIMEDOUT;
+	run_work();
+	assert(dcp->t8132_release_late && late_pending);
+	assert(!dcp->dptxport[0].connected && !dcp->dptxport[0].release_owed);
+	nrpcs = 0; set_hpd_high_ret = 0; release_ret = 0;
+	dcp_typec_attach_repeated(dcp);
+	run_port_work();
+	if (dcp->typec_reconnect_wq.pending)
+		run_work();
+	assert(nrpcs == 0 && !hpd_high);
+	answer();
+	run_port_work();
+	run_work();
+	assert(hpd_high && dcp->dptxport[0].connected && !rpc_seen("release"));
+	puts("ok failed connect: its release unanswered on a live link holds the port");
 }
 
 /* The DPTX service's publication, or a repeated request, connects a display left waiting. */
@@ -1362,6 +1524,7 @@ int main(void)
 	connect_cases();
 	release_cases();
 	fence_cases();
+	owed_retry_cases();
 	failed_connect_cases();
 	resume_cases();
 	lifetime_cases();
