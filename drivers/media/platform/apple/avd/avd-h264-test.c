@@ -8,6 +8,7 @@
 #include <media/v4l2-common.h>
 
 #include "avd.h"
+#include "avd-h264-params.h"
 
 struct avd_slice_data_case {
 	const char *desc;
@@ -270,6 +271,92 @@ static void avd_scaling_flat_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, avd_h264_scaling_is_flat(&pps, m));
 }
 
+struct avd_slice_start_case {
+	const char *desc;
+	u32 width_mbs;
+	u32 height_map_units;
+	u32 sps_flags;
+	u32 decode_flags;
+	u32 first_mb;
+	bool in_picture;
+};
+
+#define AVD_TEST_FRAME	V4L2_H264_SPS_FLAG_FRAME_MBS_ONLY
+#define AVD_TEST_MBAFF	V4L2_H264_SPS_FLAG_MB_ADAPTIVE_FRAME_FIELD
+#define AVD_TEST_FIELD	V4L2_H264_DECODE_PARAM_FLAG_FIELD_PIC
+
+static const struct avd_slice_start_case avd_slice_start_cases[] = {
+	{ "64x64, first macroblock", 4, 4, AVD_TEST_FRAME, 0, 0, true },
+	{ "64x64, last macroblock", 4, 4, AVD_TEST_FRAME, 0, 15, true },
+	{ "64x64, PicSizeInMbs", 4, 4, AVD_TEST_FRAME, 0, 16 },
+	{ "64x64, macroblock 16383", 4, 4, AVD_TEST_FRAME, 0, 16383 },
+	{ "64x64, U32_MAX", 4, 4, AVD_TEST_FRAME, 0, U32_MAX },
+	{ "1920x1088, last macroblock", 120, 68, AVD_TEST_FRAME, 0, 8159, true },
+	{ "1920x1088, PicSizeInMbs", 120, 68, AVD_TEST_FRAME, 0, 8160 },
+	{ "4096x4096, last macroblock", 256, 256, AVD_TEST_FRAME, 0, 65535, true },
+	{ "4096x4096, PicSizeInMbs", 256, 256, AVD_TEST_FRAME, 0, 65536 },
+	/* PicSizeInMbs is 2^32 here: no 32-bit wrap to zero */
+	{ "largest SPS size, U32_MAX", U16_MAX + 1, U16_MAX + 1, AVD_TEST_FRAME,
+	  0, U32_MAX, true },
+	{ "interlaced frame, last macroblock", 4, 4, 0, 0, 31, true },
+	{ "interlaced frame, PicSizeInMbs", 4, 4, 0, 0, 32 },
+	{ "field, last macroblock", 4, 4, 0, AVD_TEST_FIELD, 15, true },
+	{ "field, PicSizeInMbs", 4, 4, 0, AVD_TEST_FIELD, 16 },
+	{ "MBAFF frame, last pair", 4, 4, AVD_TEST_MBAFF, 0, 15, true },
+	{ "MBAFF frame, half PicSizeInMbs", 4, 4, AVD_TEST_MBAFF, 0, 16 },
+	{ "MBAFF SPS, field", 4, 4, AVD_TEST_MBAFF, AVD_TEST_FIELD, 15, true },
+};
+
+KUNIT_ARRAY_PARAM_DESC(avd_slice_start, avd_slice_start_cases, desc);
+
+/* H.264 7.4.3: a slice starts inside its picture. */
+static void avd_slice_start_test(struct kunit *test)
+{
+	const struct avd_slice_start_case *c = test->param_value;
+	struct v4l2_ctrl_h264_sps sps = {
+		.pic_width_in_mbs_minus1 = c->width_mbs - 1,
+		.pic_height_in_map_units_minus1 = c->height_map_units - 1,
+		.flags = c->sps_flags,
+	};
+	struct v4l2_ctrl_h264_decode_params decode = { .flags = c->decode_flags };
+	struct avd_h264_pic_size pic = avd_h264_pic_size(&sps, &decode);
+
+	KUNIT_EXPECT_EQ(test, avd_h264_slice_in_picture(&pic, &sps, &decode,
+							 c->first_mb),
+			c->in_picture);
+}
+
+/* A held picture's later slices keep the size its first slice set. */
+static void avd_slice_pic_size_test(struct kunit *test)
+{
+	struct v4l2_ctrl_h264_sps sps = {
+		.pic_width_in_mbs_minus1 = 3,
+		.pic_height_in_map_units_minus1 = 3,
+		.flags = V4L2_H264_SPS_FLAG_FRAME_MBS_ONLY,
+	};
+	struct v4l2_ctrl_h264_decode_params decode = {};
+	struct avd_h264_pic_size first = avd_h264_pic_size(&sps, &decode);
+	struct avd_h264_pic_size pic;
+
+	KUNIT_EXPECT_EQ(test, first.width_mbs, 4U);
+	KUNIT_EXPECT_EQ(test, first.mbs, 16ULL);
+	pic = avd_h264_pic_size(&sps, &decode);
+	KUNIT_EXPECT_TRUE(test, avd_h264_same_pic_size(&first, &pic));
+
+	/* As many macroblocks in another shape */
+	sps.pic_width_in_mbs_minus1 = 1;
+	sps.pic_height_in_map_units_minus1 = 7;
+	pic = avd_h264_pic_size(&sps, &decode);
+	KUNIT_EXPECT_EQ(test, pic.mbs, 16ULL);
+	KUNIT_EXPECT_FALSE(test, avd_h264_same_pic_size(&first, &pic));
+
+	/* A taller picture of the same width */
+	sps.pic_width_in_mbs_minus1 = 3;
+	sps.pic_height_in_map_units_minus1 = 255;
+	pic = avd_h264_pic_size(&sps, &decode);
+	KUNIT_EXPECT_FALSE(test, avd_h264_same_pic_size(&first, &pic));
+}
+
 static struct kunit_case avd_h264_test_cases[] = {
 	KUNIT_CASE(avd_scaling_flat_test),
 	KUNIT_CASE_PARAM(avd_slice_data_test, avd_slice_data_gen_params),
@@ -277,6 +364,8 @@ static struct kunit_case avd_h264_test_cases[] = {
 	KUNIT_CASE_PARAM(avd_sps_size_test, avd_sps_size_gen_params),
 	KUNIT_CASE(avd_sps_fmt_init_test),
 	KUNIT_CASE(avd_start_slices_test),
+	KUNIT_CASE_PARAM(avd_slice_start_test, avd_slice_start_gen_params),
+	KUNIT_CASE(avd_slice_pic_size_test),
 	{}
 };
 
