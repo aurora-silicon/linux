@@ -1659,12 +1659,142 @@ const fn relative_frequency(states: &[M5PerfState; 14], floor: usize) -> [u32; 1
     values
 }
 
-fn encode_m5_aux_perf_states(board: &Board, out: &mut [u8]) {
+/// The performance rows the HW data carries: the board's tables, or the same states with the
+/// voltages the boot loader read from this part's ADT ([`M5PerfRows::with_loader_voltages`]).
+#[derive(Clone, Copy)]
+pub(crate) struct M5PerfRows {
+    states: [M5PerfState; 14],
+    aux: Option<[M5AuxPerfState; 14]>,
+}
+
+/// One operating point of a loader-filled DT table: Hz, and µV per voltage cell.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct LoaderOpp {
+    pub(crate) hz: u64,
+    pub(crate) core_uv: [u32; M5_PERF_LANES],
+    pub(crate) sram_uv: [u32; M5_PERF_LANES],
+    /// Cells of `opp-microvolt`.
+    pub(crate) cells: usize,
+    /// Cells of `opp-microvolt-sram`, 0 where the table has none.
+    pub(crate) sram_cells: usize,
+}
+
+/// Why loader-filled operating points were not taken.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum LoaderOppError {
+    /// The DT tables are still the zero placeholders: no loader filled them.
+    NotFilled,
+    /// A table has the wrong number of states or voltage cells.
+    Shape,
+    /// The state's frequency is not the board's.
+    State(usize),
+    /// The state's voltage is not whole mV or is far from the board's.
+    Voltage(usize),
+}
+
+/// How far a loader voltage may lie from the board's table. Parts of one board differ by a few
+/// steps of 5 mV (the K116s is 15 mV from the J714 table at most); more than this is a table
+/// from another part or a misread ADT, not calibration.
+const LOADER_VOLTAGE_SLACK_MV: u32 = 50;
+
+fn loader_mv(uv: u32, board_mv: u32) -> Option<u32> {
+    let mv = uv / 1000;
+    (uv % 1000 == 0 && mv != 0 && mv.abs_diff(board_mv) <= LOADER_VOLTAGE_SLACK_MV).then_some(mv)
+}
+
+fn loader_opps_unfilled(opps: &[LoaderOpp]) -> bool {
+    opps.iter().all(|opp| opp.hz == 0 && opp.core_uv.iter().chain(&opp.sram_uv).all(|&uv| uv == 0))
+}
+
+impl M5PerfRows {
+    /// The board's own tables.
+    pub(crate) fn of_board(board: &Board) -> Self {
+        Self { states: *board.perf_states, aux: board.aux_perf_states.copied() }
+    }
+
+    /// The board's states with the loader's voltages. `main` is the GPU's operating points (one
+    /// core and one SRAM cell per voltage table); `aux` the CS/AFR domain's (one core cell per
+    /// lane) and its SRAM floor in µV, which a board with CS/AFR domains must have. Every
+    /// frequency must be the board's: only the voltages are per part.
+    pub(crate) fn with_loader_voltages(
+        board: &Board,
+        main: &[LoaderOpp],
+        aux: Option<(&[LoaderOpp], u32)>,
+    ) -> Result<Self, LoaderOppError> {
+        if loader_opps_unfilled(main) {
+            return Err(LoaderOppError::NotFilled);
+        }
+        let mut rows = Self::of_board(board);
+        let used = board.perf_state_count as usize + 1;
+        if main.len() != used {
+            return Err(LoaderOppError::Shape);
+        }
+        for (state, opp) in main.iter().enumerate() {
+            let row = &mut rows.states[state];
+            if opp.cells != board.perf_tables || opp.sram_cells != board.perf_tables {
+                return Err(LoaderOppError::Shape);
+            }
+            if opp.hz != u64::from(row.0) * 1_000_000 {
+                return Err(LoaderOppError::State(state));
+            }
+            for table in 0..board.perf_tables {
+                row.1[table] = loader_mv(opp.core_uv[table], row.1[table])
+                    .ok_or(LoaderOppError::Voltage(state))?;
+                row.2[table] = loader_mv(opp.sram_uv[table], row.2[table])
+                    .ok_or(LoaderOppError::Voltage(state))?;
+            }
+        }
+
+        let Some(board_aux) = rows.aux.as_mut() else {
+            return Ok(rows);
+        };
+        let (opps, floor_uv) = aux.ok_or(LoaderOppError::Shape)?;
+        if opps.len() != board_aux.len() || floor_uv % 1000 != 0 {
+            return Err(LoaderOppError::Shape);
+        }
+        let floor = floor_uv / 1000;
+        let lanes = if board_aux.iter().any(|state| state.1[1] != 0) { 2 } else { 1 };
+        for (state, opp) in opps.iter().enumerate() {
+            let row = &mut board_aux[state];
+            if opp.cells != lanes {
+                return Err(LoaderOppError::Shape);
+            }
+            if opp.hz != u64::from(row.0) * 1_000_000 {
+                return Err(LoaderOppError::State(state));
+            }
+            for lane in 0..lanes {
+                let core = loader_mv(opp.core_uv[lane], row.1[lane])
+                    .ok_or(LoaderOppError::Voltage(state))?;
+                // The SRAM rule the board tables follow: the floor, or the core voltage above it.
+                // A floor far from the board's (zero, or misread) shows in the result.
+                let sram = core.max(floor);
+                if sram.abs_diff(row.2[lane]) > LOADER_VOLTAGE_SLACK_MV {
+                    return Err(LoaderOppError::Voltage(state));
+                }
+                row.1[lane] = core;
+                row.2[lane] = sram;
+            }
+        }
+        Ok(rows)
+    }
+
+    /// States whose voltages differ from the board's tables.
+    pub(crate) fn changed_states(&self, board: &Board) -> usize {
+        let main = self.states.iter().zip(board.perf_states.iter()).filter(|(a, b)| a != b);
+        let aux = match (&self.aux, board.aux_perf_states) {
+            (Some(a), Some(b)) => a.iter().zip(b.iter()).filter(|(a, b)| a != b).count(),
+            _ => 0,
+        };
+        main.count() + aux
+    }
+}
+
+fn encode_m5_aux_perf_states(perf: &M5PerfRows, out: &mut [u8]) {
     let table = &mut out[M5_HW_AUX_PERF_STATE..
         M5_HW_AUX_PERF_STATE + M5_HW_AUX_PERF_STATE_SIZE];
     table.fill(0);
     // Without CS/AFR domains (M5) the table stays zero, as in the J813's 25G76 HW data.
-    let Some(aux_perf_states) = board.aux_perf_states else {
+    let Some(aux_perf_states) = perf.aux.as_ref() else {
         return;
     };
     put_u32(table, 0, 13);
@@ -3597,6 +3727,7 @@ pub(crate) fn encode_m5_register_map(
 
 pub(crate) fn encode_m5_hw_data(
     board: &Board,
+    perf: &M5PerfRows,
     aliases: [G17PKsmCompletionAliases; M5_25G76_COMPLETION_QUEUE_COUNT],
     qos_high: u64,
     windows: &[M5RegisterWindow],
@@ -3637,7 +3768,7 @@ pub(crate) fn encode_m5_hw_data(
     put_u32(g18, 0x10dc, board.gpu_cores);
     put_u32(g18, 0x283a, 1);
     put_u32(g18, 0x283e, 1);
-    let states = board.perf_states;
+    let states = &perf.states;
     // Off and the board's `perf_state_count` states: the rows above them stay zero, as in macOS
     // 27.0's J813 bundle, whose twelve states leave state 13 empty where the padded table repeats
     // its top state. (Every other board has 13 states, so all fourteen rows.)
@@ -3662,11 +3793,11 @@ pub(crate) fn encode_m5_hw_data(
         put_u32(g18, COMMON26_HW_PERF_INDEX_MAP + index * 4, index as u32);
         let relative = if index < used { board.relative_frequency[index] } else { 0 };
         put_u32(g18, COMMON26_HW_PERF_RELATIVE_B + index * 4, relative);
-        if board.aux_perf_states.is_some() {
+        if perf.aux.is_some() {
             put_u32(g18, M5_HW_AUX_RELATIVE_FREQUENCY + index * 4, relative);
         }
     }
-    encode_m5_aux_perf_states(board, g18);
+    encode_m5_aux_perf_states(perf, g18);
     let table = COMMON26_KSM_COMPLETION_TABLE_OFFSET;
     g18[table..table + completion.len()].copy_from_slice(&completion);
     put_u64(g18, COMMON26_QOS_POINTER_OFFSET, qos_high);

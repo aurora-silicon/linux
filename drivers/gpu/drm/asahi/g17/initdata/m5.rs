@@ -38,6 +38,79 @@ const FW_LOG_SIZE: usize = 0x8000;
 const BOOT_LINK: u64 = 0x10_0008_0000;
 
 impl InitData {
+    /// The HW data's performance rows: the board's tables, with this part's voltages where the
+    /// boot loader filled the GPU node's operating points from the ADT.
+    fn m5_perf_rows(dev: &AsahiDrmDevice, board: &m::Board) -> m::M5PerfRows {
+        match Self::m5_loader_perf_rows(dev, board) {
+            Ok(rows) => {
+                dev_info!(dev.as_ref(), "GPU voltages from the boot loader's ADT tables: {} states differ from the board's\n",
+                    rows.changed_states(board));
+                rows
+            }
+            Err(None) => m::M5PerfRows::of_board(board),
+            Err(Some(why)) => {
+                dev_warn!(dev.as_ref(), "GPU operating points not used ({:?}), the board's tables instead\n",
+                    why);
+                m::M5PerfRows::of_board(board)
+            }
+        }
+    }
+
+    /// `Err(None)` where there is nothing to take: no table, or the DT's zero placeholders.
+    fn m5_loader_perf_rows(
+        dev: &AsahiDrmDevice,
+        board: &m::Board,
+    ) -> core::result::Result<m::M5PerfRows, Option<m::LoaderOppError>> {
+        let shape = Some(m::LoaderOppError::Shape);
+        let node = dev.as_ref().as_ref().of_node().ok_or(None)?;
+        let main = node.parse_phandle(c_str!("operating-points-v2"), 0).ok_or(None)?;
+        let main = Self::m5_loader_opps(&main).map_err(|_| shape)?;
+        let aux = match node.parse_phandle(c_str!("apple,afr-opp"), 0) {
+            None => None,
+            Some(afr) => {
+                let afr = Self::m5_loader_opps(&afr).map_err(|_| shape)?;
+                // The CS domain runs the AFR domain's states; the HW data has one table for both.
+                if let Some(cs) = node.parse_phandle(c_str!("apple,cs-opp"), 0) {
+                    let cs = Self::m5_loader_opps(&cs).map_err(|_| shape)?;
+                    let same = cs.len() == afr.len() && cs.iter().zip(afr.iter())
+                        .all(|(c, a)| c.hz == a.hz && c.cells == a.cells && c.core_uv == a.core_uv);
+                    if !same {
+                        return Err(shape);
+                    }
+                }
+                let floor: u32 = node.get_opt_property(c_str!("apple,csafr-min-sram-microvolt"))
+                    .map_err(|_| shape)?.ok_or(shape)?;
+                Some((afr, floor))
+            }
+        };
+        m::M5PerfRows::with_loader_voltages(board, &main,
+            aux.as_ref().map(|(opps, floor)| (&opps[..], *floor)))
+            .map_err(|why| (why != m::LoaderOppError::NotFilled).then_some(why))
+    }
+
+    /// The entries of a loader-filled operating-point table.
+    fn m5_loader_opps(table: &kernel::of::Node) -> Result<KVec<m::LoaderOpp>> {
+        let mut opps = KVec::new();
+        for node in table.children() {
+            let core: KVec<u32> = node.get_property(c_str!("opp-microvolt"))?;
+            let sram: Option<KVec<u32>> = node.get_opt_property(c_str!("opp-microvolt-sram"))?;
+            let sram = sram.unwrap_or_default();
+            if core.is_empty() || core.len() > m::M5_PERF_LANES || sram.len() > m::M5_PERF_LANES {
+                return Err(EINVAL);
+            }
+            let mut opp = m::LoaderOpp {
+                hz: node.get_property(c_str!("opp-hz"))?,
+                cells: core.len(),
+                sram_cells: sram.len(),
+                ..Default::default()
+            };
+            opp.core_uv[..core.len()].copy_from_slice(&core);
+            opp.sram_uv[..sram.len()].copy_from_slice(&sram);
+            opps.push(opp, GFP_KERNEL)?;
+        }
+        Ok(opps)
+    }
+
     /// The kernel lower-root ranges a bare-metal M5 firmware reaches, whose top-level links must
     /// exist before it starts: entry 1, the descriptor tables and completion rings (entry 7) and
     /// the first page of the canonical arena (`canonical`, entry 8), where queues go later.
@@ -280,7 +353,8 @@ impl InitData {
         let views = m::PrimaryRegionViews {
             sentinel_high: BASE + 0xc07e_0000, alias_high: [PB, UMA],
         };
-        m::encode_m5_hw_data(board, completions, QOS, windows,
+        let perf = Self::m5_perf_rows(dev, board);
+        m::encode_m5_hw_data(board, &perf, completions, QOS, windows,
             &mut self.object_mut(self.bundle)?.bytes_mut()[..m::M5_HW_DATA_SIZE]).map_err(|_| EINVAL)?;
         m::set_m5_kick_shared(board,
             &mut self.object_mut(self.bundle)?.bytes_mut()[..m::M5_HW_DATA_SIZE], KICK_SHARED)

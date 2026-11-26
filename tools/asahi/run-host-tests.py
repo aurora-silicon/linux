@@ -355,6 +355,9 @@ ASAHI_TESTS = {
         + mutations('--mutation', ('m5-ignores-bound',), []),
     'g17-highpri-sched-wq-tests.py': [([], PASS)]
         + mutations('--mutation', ('drop-highpri', 'drop-reclaim', 'drop-highpri-flag'), []),
+    'g17-m5-loader-opps-tests.py': [([], PASS)]
+        + mutations('--mutation', ('no-state-check', 'no-slack', 'no-whole-mv', 'no-floor',
+                                   'no-floor-check', 'aux-optional', 'placeholder-taken'), []),
     'g17-firmware-selection-tests.py': [([], PASS)],
     'g17-freelist-lease-direct-tests.py': [([], PASS)]
         + mutations('--mutation', ('reject-preparing-complete', 'snapshot-rollback',
