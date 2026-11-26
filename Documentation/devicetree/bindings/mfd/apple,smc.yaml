@@ -102,6 +102,15 @@ properties:
     maxItems: 64
     description: The names of the bits in apple,wake-reasons, in the same order.
 
+  apple,dark-wake-reasons:
+    $ref: /schemas/types.yaml#/definitions/string-array
+    minItems: 1
+    maxItems: 64
+    description: |
+      Names from apple,wake-reason-names whose wake, when it is the only bit in
+      the wake record, needs nothing from user space: the system goes back to
+      sleep with user space frozen and the outputs off.
+
 additionalProperties: false
 
 required:
