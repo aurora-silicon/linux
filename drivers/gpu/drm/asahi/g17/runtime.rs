@@ -2955,6 +2955,7 @@ impl super::Firmware {
                     .resync_compute_completions(seen, |record| observations.fold_any(record))?;
             }
         }
+        self.init.diag_compute_pool();
         let port = &self.port;
         let retired = deferred.pending();
         let mut freed = false;

@@ -572,6 +572,35 @@ impl InitData {
         Ok(())
     }
 
+    /// Experiment diagnostic (not for merging): logs the device-wide compute pool's control
+    /// and state words whenever they differ from the last logged ones.
+    pub(super) fn diag_compute_pool(&self) {
+        static LAST: AtomicU64 = AtomicU64::new(0);
+        if self.compute_shared.is_none() {
+            return;
+        }
+        let (Some(control), Some(state)) = (self.boot_control, self.boot_state) else {
+            return;
+        };
+        let (Ok(control), Ok(state)) = (self.object(control), self.object(state)) else {
+            return;
+        };
+        let mut words = [0u32; 10];
+        for (index, offset) in [0x20, 0x24, 0x28, 0x2c, 0x44, 0x48, 0x54, 0x58].iter().enumerate() {
+            words[index] = control.word(*offset).map_or(u32::MAX, |w| w.load(Ordering::Relaxed));
+        }
+        for index in 0..2 {
+            words[8 + index] = state.word(index * 4).map_or(u32::MAX, |w| w.load(Ordering::Relaxed));
+        }
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for word in words {
+            hash = (hash ^ u64::from(word)).wrapping_mul(0x100_0000_01b3);
+        }
+        if LAST.swap(hash, Ordering::Relaxed) != hash {
+            pr_info!("G17 diag: compute pool control {:x?}\n", words);
+        }
+    }
+
     /// Whether `vm` has the shared compute aperture mapped. M5 has no shared
     /// aperture: its compute queues need only their own pools, so every VM is ready.
     pub(super) fn compute_vm_cached(&self, vm: &mmu::Vm) -> bool {

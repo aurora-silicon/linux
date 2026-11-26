@@ -1400,6 +1400,22 @@ impl Queue {
                     // Only an exact execution record measures the kick: a recordless retirement
                     // carries a synthesized envelope.
                     let execution = front.observed.map(|record| record.timestamps);
+                    {
+                        // Experiment diagnostic (not for merging).
+                        use core::sync::atomic::{AtomicU64, Ordering as O};
+                        static RECORDED: AtomicU64 = AtomicU64::new(0);
+                        static RECORDLESS: AtomicU64 = AtomicU64::new(0);
+                        let (n, r, l) = if execution.is_some() {
+                            let n = RECORDED.fetch_add(1, O::Relaxed) + 1;
+                            (n, n, RECORDLESS.load(O::Relaxed))
+                        } else {
+                            let n = RECORDLESS.fetch_add(1, O::Relaxed) + 1;
+                            (n, RECORDED.load(O::Relaxed), n)
+                        };
+                        if n.is_power_of_two() {
+                            pr_info!("G17 diag: compute retired with record {} recordless {}\n", r, l);
+                        }
+                    }
                     if let Some(ticket) = front.ticket {
                         crate::g17::recovery::note_retired();
                         crate::g17::trace::complete(
