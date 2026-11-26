@@ -351,7 +351,8 @@ impl Pair {
         if word == u32::MAX {
             return Err(EINVAL);
         }
-        let layout = m5_render_submission::layout(&first.command, clusters, variant.programs)?;
+        let layout =
+            m5_render_submission::layout(&first.command, clusters, variant.programs, board)?;
         let storage = KBox::<Self>::new_uninit(GFP_KERNEL)?;
         let (tiling, ta_alias) = kick::Queue::render(alloc, ids[0], context.vm(), rings)?;
         let (fragment, fragment_alias) = kick::Queue::render(alloc, ids[1], context.vm(), rings)?;
@@ -543,7 +544,8 @@ impl Pair {
         let node = work.node_va()?;
         let word = work.word();
         let layout =
-            m5_render_submission::layout(&packet.command, self.clusters, self.variant.programs)?;
+            m5_render_submission::layout(&packet.command, self.clusters, self.variant.programs,
+                self.board)?;
         let deflake_layout = self.deflake;
         let owners = self.memory.owners();
         self.memory
@@ -1839,7 +1841,8 @@ impl Pair {
     /// keeps its current capacity and lets firmware request growth as needed.
     pub(crate) fn host_growth_target(&mut self, packet: &Packet) -> Result<Option<HostGrowth>> {
         let mut required =
-            m5_render_submission::layout(&packet.command, self.clusters, self.variant.programs)?
+            m5_render_submission::layout(&packet.command, self.clusters, self.variant.programs,
+                self.board)?
                 .tvb_blocks;
         // A mesh workgroup whose output is in flight when the tiler heap runs out loses part of
         // it, whether the firmware then grows the heap or partial-renders, and the tile-count
@@ -3302,7 +3305,8 @@ impl Pair {
             let buffer_id = buffer_id.ok_or(EINVAL)?;
             let pm_generation = pm_generation.ok_or(EINVAL)?;
             let layout =
-                m5_render_submission::layout(&first.command, self.clusters, self.variant.programs)?;
+                m5_render_submission::layout(&first.command, self.clusters, self.variant.programs,
+                    self.board)?;
             // A context of another VM gets the rings cleared before its VM is given its view,
             // so it cannot read the entries earlier owners' commands left, as for a parked pair.
             // The pair is bindable, hence idle: the firmware consumed every entry.
