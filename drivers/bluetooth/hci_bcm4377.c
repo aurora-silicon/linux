@@ -5,6 +5,7 @@
  * Copyright (C) The Asahi Linux Contributors
  */
 
+#include <linux/suspend.h>
 #include <linux/async.h>
 #include <linux/atomic.h>
 #include <linux/bitfield.h>
@@ -1959,11 +1960,39 @@ static int bcm4377_hci_set_bdaddr(struct hci_dev *hdev, const bdaddr_t *bdaddr)
 	return 0;
 }
 
+/*
+ * The ACL transfer ring takes at most MAX_ACL_PAYLOAD_SIZE bytes per entry
+ * (HCI_MAX_ACL_SIZE of data), and bcm4377_enqueue() refuses anything larger.
+ * The core fragments ACL data to the MTUs the controller reports, so a
+ * controller that reports more than the ring takes would have every larger
+ * fragment dropped. Fragment to what the ring takes instead.
+ */
+static void bcm4377_clamp_acl_mtu(struct hci_dev *hdev)
+{
+	struct bcm4377_data *bcm4377 = hci_get_drvdata(hdev);
+
+	if (hdev->acl_mtu > HCI_MAX_ACL_SIZE) {
+		dev_info(&bcm4377->pdev->dev,
+			 "controller ACL MTU %u exceeds the ACL ring's %u, using %u\n",
+			 hdev->acl_mtu, HCI_MAX_ACL_SIZE, HCI_MAX_ACL_SIZE);
+		hdev->acl_mtu = HCI_MAX_ACL_SIZE;
+	}
+
+	if (hdev->le_mtu > HCI_MAX_ACL_SIZE) {
+		dev_info(&bcm4377->pdev->dev,
+			 "controller LE MTU %u exceeds the ACL ring's %u, using %u\n",
+			 hdev->le_mtu, HCI_MAX_ACL_SIZE, HCI_MAX_ACL_SIZE);
+		hdev->le_mtu = HCI_MAX_ACL_SIZE;
+	}
+}
+
 static int bcm4377_hci_post_init(struct hci_dev *hdev)
 {
 	struct bcm4377_data *bcm4377 = hci_get_drvdata(hdev);
 	const bdaddr_t *bda = NULL;
 	int ret;
+
+	bcm4377_clamp_acl_mtu(hdev);
 
 	if (!bcm4377->cal_needed)
 		return 0;
@@ -3216,6 +3245,19 @@ static int bcm4377_resume(struct device *dev)
 	if (bcm4377->wake_armed) {
 		disable_irq_wake(pdev->irq);
 		bcm4377->wake_armed = false;
+	}
+
+	/*
+	 * A real sleep took the function's power: the firmware is gone, and every resume command
+	 * would only time out (two times 2 s inside the system resume, then the rebind anyway).
+	 * Skip them and rebind from the work queue; probe boots the firmware from scratch.
+	 */
+	if (pm_resume_via_firmware() && !bcm4377->dma_window_base) {
+		bcm4377->quiesced = false;
+		bcm4377->resume_powered = false;
+		WRITE_ONCE(bcm4377->setup_retry_blocked, false);
+		bcm4377_queue_rebind(bcm4377, "power lost in the sleep");
+		return 0;
 	}
 
 	if (bcm4377->quiesced) {

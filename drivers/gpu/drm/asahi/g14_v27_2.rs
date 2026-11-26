@@ -1216,8 +1216,16 @@ impl gpu::Gpu for Backend {
         Ok(KBox::new(crate::m3::m3_submit::Queue::new_g14_v27_2(self.runtime.clone(), self.scheduler.clone(),
             vm, priority, usc_exec_base, ualloc_priv, self.preempt_bytes, render)?, GFP_KERNEL)?)
     }
-    fn map_timestamp_buffer(&self, bo: gem::ObjectRef, range: Range<usize>) -> Result<crate::timestamp::Buffer> {
+    fn timestamp_window_size(&self) -> u64 {
+        <GpuManagerG14V13_5 as gpu::Gpu>::timestamp_window_size(&self.graph)
+    }
+    fn map_timestamp_buffer(
+        &self,
+        bo: gem::ObjectRef,
+        range: Range<usize>,
+        window: crate::timestamp::WindowPermit,
+    ) -> Result<crate::timestamp::Buffer> {
         // The aperture's tables were linked before the firmware window was mirrored (start()).
-        <GpuManagerG14V13_5 as gpu::Gpu>::map_timestamp_buffer(&self.graph, bo, range)
+        <GpuManagerG14V13_5 as gpu::Gpu>::map_timestamp_buffer(&self.graph, bo, range, window)
     }
 }

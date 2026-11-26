@@ -681,15 +681,17 @@ impl InitData {
     }
 
     /// M5 TA, fragment and compute share the compute outer ring per priority.
-    /// The physical queue claim prevents reassignment while this credit lives.
+    /// The caller must hold `Port::m5_outer`; the physical queue claim prevents
+    /// reassignment while this credit lives.
     pub(crate) fn reserve_outer(&self, priority: u8, count: u32) -> Result<OuterClaim> {
         if !self.m5 { return Err(EINVAL); }
         let cursors = self.work_cursors(priority, super::fw::queue::DataMaster::Compute)?;
         self.outer_credits.as_ref().ok_or(EIO)?.reserve(priority, count, cursors)
     }
 
-    /// Hold the device mutex for this scope, including its Drop. The result
-    /// borrows only the claim, allowing the caller to publish through Firmware.
+    /// Hold the device mutex for this scope, including its Drop, and serialize entry
+    /// and Drop under `Port::m5_outer` via `Port::outer_scope`. The result borrows
+    /// only the claim, allowing the caller to publish through Firmware.
     pub(crate) fn outer_scope<'a>(&self, claim: &'a mut OuterClaim) -> Result<OuterScope<'a>> {
         self.outer_credits.as_ref().ok_or(EINVAL)?.scope(claim)
     }
@@ -1074,6 +1076,8 @@ impl InitData {
             // The word recovery_state() reads: the status block moves with the firmware build.
             recovery: self.object(self.cluster)?.word(self.recovery_state_offset())?,
             mailbox,
+            m5_credits: self.outer_credits.clone(),
+            m5_history: self.m5_history_view()?,
         })
     }
 
@@ -1685,18 +1689,33 @@ impl InitData {
     /// pipelined compute and render loops that keep the GPU continuously busy without blocking on
     /// an unsignalled fence would otherwise fall to the base performance state.
     ///
-    /// The other G17 SoCs publish the full effort while `bound`, and stream other work with the
-    /// lowest effort that keeps it above the base performance state ([`active_effort`]), leaving
-    /// the rest to the firmware: work that the firmware let fall to the base state stalled the GPU
-    /// under concurrent load (a firmware recovery with no fault), and a full effort on every
-    /// submission held the top state whatever the load. A waiter doesn't tell paced work from a
-    /// submit-and-wait loop, because paced work has one too (the compositor, or the next frame's
-    /// fence).
-    pub(super) fn submission_effort(&self, effort: u32, waited: bool, bound: bool) -> u32 {
+    /// The other G17 SoCs publish the full effort while `bound` or while a host thread is waiting
+    /// on a pure-compute submission (`compute_waited`): a submit-and-wait loop queues nothing
+    /// behind its command, so the firmware alone keeps it at the bottom state however busy the GPU
+    /// is, and a compute burst resuming after a CPU gap longer than the 2 ms firmware idle-off
+    /// delay would otherwise run at [`active_effort`] for 16 ms before `BusyRuns::bound` fires.
+    /// Other work streams with the lowest effort that keeps it above the base performance state
+    /// ([`active_effort`]), leaving the rest to the firmware: work that the firmware let fall to
+    /// the base state stalled the GPU under concurrent load (a firmware recovery with no fault),
+    /// and a full effort on every submission held the top state whatever the load. A generic
+    /// render waiter doesn't tell paced work from a submit-and-wait loop, because paced work has
+    /// one too (the compositor, or the next frame's fence); pure-compute waiters exclude paced
+    /// render compositors.
+    pub(super) fn submission_effort(
+        &self,
+        effort: u32,
+        waited: bool,
+        bound: bool,
+        compute_waited: bool,
+    ) -> u32 {
         if self.m5 {
             return if waited || bound { effort } else { 0 };
         }
-        if bound { effort } else { effort.min(self.active_effort) }
+        if bound || compute_waited {
+            effort
+        } else {
+            effort.min(self.active_effort)
+        }
     }
 
     /// Writes the effort input in firmware order, then cleans its cache line to coherency.

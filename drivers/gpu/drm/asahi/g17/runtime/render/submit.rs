@@ -656,13 +656,26 @@ impl Registry {
                 dependencies.tiling_count += 1;
             }
         }
-        if let Some(queue) = self.compute(owner) {
-            dependencies.compute = queue.dependency(
+        for queue in self
+            .compute
+            .iter()
+            .flatten()
+            .filter_map(|entry| entry.queue.as_deref())
+            .filter(|queue| queue.owner() == Some(owner))
+        {
+            let tiling = queue.dependency(
                 owner,
                 packet.completion.status(),
                 packet.order.tiling_wait_through[1],
                 state,
             )?;
+            if let Some(dep) = tiling {
+                *dependencies
+                    .compute
+                    .get_mut(dependencies.compute_count)
+                    .ok_or(EOVERFLOW)? = dep;
+                dependencies.compute_count += 1;
+            }
             if packet.order.tiling_wait_through[1] != packet.order.wait_through[1] {
                 let whole = queue.dependency(
                     owner,
@@ -670,8 +683,12 @@ impl Registry {
                     packet.order.wait_through[1],
                     state,
                 )?;
-                if whole != dependencies.compute {
-                    dependencies.fragment_compute = whole;
+                if let Some(dep) = whole.filter(|dep| Some(*dep) != tiling) {
+                    *dependencies
+                        .fragment_compute
+                        .get_mut(dependencies.fragment_compute_count)
+                        .ok_or(EOVERFLOW)? = dep;
+                    dependencies.fragment_compute_count += 1;
                 }
             }
         }
@@ -761,6 +778,7 @@ impl crate::g17::Firmware {
         // time and attachment overlaps are ordered by publication order.
         let port = self.port.clone();
         let _render = port.render_lock();
+        let _m5_outer = self.init.is_m5().then(|| port.m5_outer_lock());
         // Both outer destinations must have room before pool accounting or
         // either inner queue becomes visible. On M5 both are the shared compute ring: one
         // check covers the pair, and the pair is written against its cursors (this hold
@@ -840,7 +858,7 @@ impl crate::g17::Firmware {
         if packet.is_published() {
             self.queues.render.entry_mut(slot)?.published = true;
         } else if result.is_err() {
-            self.queues.render.pools.rollback(preparation);
+            let rollback = self.rollback_render_pool(preparation);
             self.queues.buffers.release(buffer_id)?;
             self.queues
                 .render
@@ -849,6 +867,7 @@ impl crate::g17::Firmware {
                 .as_mut()
                 .ok_or(EIO)?
                 .discard_prepared(packet)?;
+            rollback?;
         }
         result
     }

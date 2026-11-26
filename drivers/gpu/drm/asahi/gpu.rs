@@ -525,12 +525,19 @@ pub(crate) trait Gpu: Send + Sync {
         usc_exec_base: u64,
         usage: Arc<crate::usage::Client>,
     ) -> Result<KBox<dyn queue::Queue>>;
-    /// Bind a BO range as a firmware- or CPU-written timestamp buffer.
+    /// Bind a BO range as a firmware- or CPU-written timestamp buffer. With `WindowPermit::Denied`
+    /// the buffer must not be mapped in the firmware timestamp window (the file's share of it is
+    /// used up): a backend that can only alias it there fails with ENOSPC, as for a full window.
     fn map_timestamp_buffer(
         &self,
         bo: gem::ObjectRef,
         range: Range<usize>,
+        window: crate::timestamp::WindowPermit,
     ) -> Result<crate::timestamp::Buffer>;
+    /// Size of the fixed firmware range timestamp buffers are aliased in (0: none).
+    fn timestamp_window_size(&self) -> u64 {
+        0
+    }
 }
 
 /// Trait used to abstract the firmware/GPU-dependent variants of the GpuManager.
@@ -1643,10 +1650,12 @@ extern "C" {
 
 #[versions(AGX)]
 impl Gpu for GpuManager::ver {
-    /// Render commands may order their dependencies on earlier renders after
-    /// their vertex half only (DRM_ASAHI_RENDER_FRAGMENT_BARRIERS).
+    /// Render commands may make only their fragment half wait for earlier
+    /// renders (DRM_ASAHI_RENDER_FRAGMENT_BARRIERS), and the fragment half
+    /// does wait for them (DRM_ASAHI_FEATURE_ORDERED_FRAGMENT_BARRIERS).
     fn backend_feature_flags(&self) -> u64 {
         u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS)
+            | uapi::DRM_ASAHI_FEATURE_ORDERED_FRAGMENT_BARRIERS as u64
     }
 
     /// A light submission completes in tens of microseconds, so its submitter
@@ -1785,19 +1794,30 @@ impl Gpu for GpuManager::ver {
         )?)
     }
 
+    fn timestamp_window_size(&self) -> u64 {
+        self.timestamp_range.end - self.timestamp_range.start
+    }
+
     fn map_timestamp_buffer(
         &self,
         mut bo: gem::ObjectRef,
         range: Range<usize>,
+        window: crate::timestamp::WindowPermit,
     ) -> Result<crate::timestamp::Buffer> {
-        crate::timestamp::Buffer::firmware(bo.map_range_into_range(
-            self.uat.kernel_vm(),
-            range,
-            self.timestamp_range.clone(),
-            mmu::UAT_PGSZ as u64,
-            mmu::PROT_FW_SHARED_RW,
-            false,
-        )?)
+        if !window.is_allowed() {
+            return Err(ENOSPC);
+        }
+        crate::timestamp::Buffer::firmware(
+            bo.map_range_into_range(
+                self.uat.kernel_vm(),
+                range,
+                self.timestamp_range.clone(),
+                mmu::UAT_PGSZ as u64,
+                mmu::PROT_FW_SHARED_RW,
+                false,
+            )?,
+            window.into_share(),
+        )
     }
 }
 

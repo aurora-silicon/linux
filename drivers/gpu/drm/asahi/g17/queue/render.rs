@@ -53,8 +53,10 @@ pub(crate) struct RenderDependencies {
     pub(crate) render_tiling_count: usize,
     pub(crate) tiling: [KickDependency; 2],
     pub(crate) tiling_count: usize,
-    pub(crate) compute: Option<KickDependency>,
-    pub(crate) fragment_compute: Option<KickDependency>,
+    pub(crate) compute: [KickDependency; crate::g17::pairs::COMPUTE_CHANNELS_MAX],
+    pub(crate) compute_count: usize,
+    pub(crate) fragment_compute: [KickDependency; crate::g17::pairs::COMPUTE_CHANNELS_MAX],
+    pub(crate) fragment_compute_count: usize,
     /// Fragment kicks of other pairs' overlapping same-VM renders.
     pub(crate) hazards: [KickDependency; crate::g17::hazard::PUBLICATION_BARRIERS],
     pub(crate) hazard_count: usize,
@@ -68,8 +70,10 @@ impl RenderDependencies {
         render_tiling_count: 0,
         tiling: [KickDependency::ZERO; 2],
         tiling_count: 0,
-        compute: None,
-        fragment_compute: None,
+        compute: [KickDependency::ZERO; crate::g17::pairs::COMPUTE_CHANNELS_MAX],
+        compute_count: 0,
+        fragment_compute: [KickDependency::ZERO; crate::g17::pairs::COMPUTE_CHANNELS_MAX],
+        fragment_compute_count: 0,
         hazards: [KickDependency::ZERO; crate::g17::hazard::PUBLICATION_BARRIERS],
         hazard_count: 0,
     };
@@ -671,12 +675,14 @@ impl Pair {
 /// 1 the tiling encoder, 2 a full channel or compute completion, 3 the
 /// fragment encoder; the last class is the implicit parent's.
 struct RenderBarriers {
-    tiling: [KickDependency; 5],
+    tiling: [KickDependency; 4 + crate::g17::pairs::COMPUTE_CHANNELS_MAX],
     tiling_count: usize,
-    fragment: [KickDependency; 4 + crate::g17::hazard::PUBLICATION_BARRIERS],
+    fragment: [KickDependency;
+        3 + crate::g17::pairs::COMPUTE_CHANNELS_MAX + crate::g17::hazard::PUBLICATION_BARRIERS],
     fragment_count: usize,
-    tiling_types: [u8; 6],
-    fragment_types: [u8; 5 + crate::g17::hazard::PUBLICATION_BARRIERS],
+    tiling_types: [u8; 5 + crate::g17::pairs::COMPUTE_CHANNELS_MAX],
+    fragment_types: [u8;
+        4 + crate::g17::pairs::COMPUTE_CHANNELS_MAX + crate::g17::hazard::PUBLICATION_BARRIERS],
 }
 
 /// The last fragment kick published on any pair, and the last one of a render with an API task
@@ -743,12 +749,14 @@ fn render_barriers(
     compute_class: u8,
 ) -> RenderBarriers {
     let fragment_stage = fragment_stage || stage_prefixes;
-    let mut tiling_barriers = [KickDependency::ZERO; 5];
+    let mut tiling_barriers = [KickDependency::ZERO; 4 + crate::g17::pairs::COMPUTE_CHANNELS_MAX];
     let mut tiling_count = 0;
-    let mut fragment_barriers = [own_tiling; 4 + crate::g17::hazard::PUBLICATION_BARRIERS];
+    let mut fragment_barriers = [own_tiling;
+        3 + crate::g17::pairs::COMPUTE_CHANNELS_MAX + crate::g17::hazard::PUBLICATION_BARRIERS];
     let mut fragment_count = 1;
-    let mut tiling_types = [1; 6];
-    let mut fragment_types = [3; 5 + crate::g17::hazard::PUBLICATION_BARRIERS];
+    let mut tiling_types = [1; 5 + crate::g17::pairs::COMPUTE_CHANNELS_MAX];
+    let mut fragment_types =
+        [3; 4 + crate::g17::pairs::COMPUTE_CHANNELS_MAX + crate::g17::hazard::PUBLICATION_BARRIERS];
     fragment_types[0] = 1;
     for dependency in &dependencies.render_tiling[..dependencies.render_tiling_count] {
         tiling_barriers[tiling_count] = *dependency;
@@ -778,13 +786,13 @@ fn render_barriers(
             }
         }
     }
-    if let Some(compute) = dependencies.compute {
-        tiling_barriers[tiling_count] = compute;
+    for compute in &dependencies.compute[..dependencies.compute_count] {
+        tiling_barriers[tiling_count] = *compute;
         tiling_types[tiling_count] = compute_class;
         tiling_count += 1;
     }
-    if let Some(compute) = dependencies.fragment_compute {
-        fragment_barriers[fragment_count] = compute;
+    for compute in &dependencies.fragment_compute[..dependencies.fragment_compute_count] {
+        fragment_barriers[fragment_count] = *compute;
         fragment_types[fragment_count] = compute_class;
         fragment_count += 1;
     }
@@ -2005,6 +2013,12 @@ impl Pair {
     pub(crate) fn visit_owners(&self, visit: &mut dyn FnMut(&Arc<VmStatus>)) {
         for active in self.active.iter() {
             visit(active.packet.completion.status());
+        }
+    }
+    /// The context ID (UAT slot) of every in-flight packet.
+    pub(crate) fn visit_contexts(&self, visit: &mut dyn FnMut(u32)) {
+        for active in self.active.iter() {
+            visit(active.packet.context.id());
         }
     }
     pub(crate) fn classify(&self, classify: &dyn Fn(&Arc<VmStatus>) -> recovery::Class) {

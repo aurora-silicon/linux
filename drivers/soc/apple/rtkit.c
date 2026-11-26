@@ -193,6 +193,21 @@ static bool apple_rtkit_firmware_owns_crashlog(struct apple_rtkit *rtk)
 	return rtk->ops->flags & APPLE_RTKIT_FIRMWARE_OWNED_CRASHLOG;
 }
 
+/*
+ * Whether RTKit maps a crash log the firmware placed at its own address: one rule for
+ * the buffer request on an endpoint the firmware announced and for the crash report on
+ * one it left out of its map. Not when the client says the firmware owns that buffer
+ * (taken unmapped) or sets placed buffers up itself (shmem_setup); otherwise it is
+ * mapped if apple_dart_fw_range() accepts it (apple_rtkit_crashlog_map()).
+ */
+static bool apple_rtkit_maps_placed_crashlog(struct apple_rtkit *rtk)
+{
+	return !apple_rtkit_firmware_owns_crashlog(rtk) &&
+	       !rtk->ops->shmem_setup && !rtk->ops->shmem_setup_ep;
+}
+
+static int apple_rtkit_crashlog_map(struct apple_rtkit *rtk, u64 msg);
+
 /* The crashlog endpoint is started while the endpoint map is handled. */
 static bool apple_rtkit_early_crashlog(struct apple_rtkit *rtk)
 {
@@ -567,11 +582,9 @@ static void apple_rtkit_management_rx(struct apple_rtkit *rtk, u64 msg)
 	}
 }
 
-static int apple_rtkit_alloc_shmem(struct apple_rtkit *rtk, u8 ep,
-				   struct apple_rtkit_shmem *buffer)
+static int apple_rtkit_alloc_first_shmem(struct apple_rtkit *rtk, u8 ep,
+					 struct apple_rtkit_shmem *buffer)
 {
-	if (READ_ONCE(rtk->ans_hold))
-		return apple_rtkit_ans_fail(rtk, -EBUSY);
 	/* The crash log's buffer is asked for only at a crash: serve it after a strict restart too. */
 	if (READ_ONCE(rtk->strict_retained_buffers) && ep != APPLE_RTKIT_EP_CRASHLOG)
 		return -EPROTO;
@@ -584,6 +597,14 @@ static int apple_rtkit_alloc_shmem(struct apple_rtkit *rtk, u8 ep,
 	buffer->buffer = dma_alloc_coherent(rtk->dev, buffer->size,
 					    &buffer->iova, GFP_KERNEL);
 	return buffer->buffer ? 0 : -ENOMEM;
+}
+
+static int apple_rtkit_alloc_shmem(struct apple_rtkit *rtk, u8 ep,
+				   struct apple_rtkit_shmem *buffer)
+{
+	if (READ_ONCE(rtk->ans_hold))
+		return apple_rtkit_ans_fail(rtk, -EBUSY);
+	return apple_rtkit_alloc_first_shmem(rtk, ep, buffer);
 }
 
 static int apple_rtkit_common_rx_get_buffer(struct apple_rtkit *rtk,
@@ -645,6 +666,14 @@ static int apple_rtkit_common_rx_get_buffer(struct apple_rtkit *rtk,
 		return apple_rtkit_send_message(rtk, ep, msg, NULL, false);
 	}
 
+	if (ep == APPLE_RTKIT_EP_CRASHLOG && request.iova &&
+	    apple_rtkit_maps_placed_crashlog(rtk)) {
+		err = apple_rtkit_crashlog_map(rtk, msg);
+		if (err)
+			goto error;
+		return 0;
+	}
+
 	if ((rtk->ops->flags & APPLE_RTKIT_FIRMWARE_OWNED_LOGS) && request.iova &&
 	    (ep == APPLE_RTKIT_EP_SYSLOG || ep == APPLE_RTKIT_EP_OSLOG)) {
 		*buffer = request;
@@ -659,7 +688,8 @@ static int apple_rtkit_common_rx_get_buffer(struct apple_rtkit *rtk,
 		goto error;
 	}
 
-	err = apple_rtkit_alloc_shmem(rtk, ep, &request);
+	/* The endpoint has no buffer yet: a first one replaces nothing the ANS hold protects */
+	err = apple_rtkit_alloc_first_shmem(rtk, ep, &request);
 	if (err)
 		goto error;
 	*buffer = request;
@@ -946,51 +976,31 @@ static void apple_rtkit_memcpy(struct apple_rtkit *rtk, void *dst,
 }
 
 /*
- * Where a DVA of the crash buffer lands: in a mapping Linux made, or else in one the
- * firmware kept from the bootloader in a root its DART inherited (the T8140 AOP's own
- * slot). 0 when neither translates it.
- */
-static phys_addr_t apple_rtkit_crashlog_phys(struct apple_rtkit *rtk,
-					     struct iommu_domain *domain, dma_addr_t iova)
-{
-	phys_addr_t phys = iommu_iova_to_phys(domain, iova);
-
-	if (!phys && IS_REACHABLE(CONFIG_APPLE_DART) &&
-	    apple_dart_fw_remote(rtk->dev, iova, false, &phys))
-		phys = 0;
-
-	return phys;
-}
-
-/*
  * The buffer a crashing firmware placed at its own address, mapped if its IOMMU
- * translates every page of it to one contiguous range, and acknowledged as a placed
+ * translates every page of it, through Linux's mappings or those the firmware kept
+ * from the boot loader (the T8140 AOP's own slot), to one contiguous range of DRAM
+ * that nothing else claims (apple_dart_fw_range()), and acknowledged as a placed
  * buffer is. The firmware doesn't run again until a reboot.
+ *
+ * Write-combined, not cacheable: the co-processor isn't coherent with the CPU's
+ * caches, and apple_rtkit_crashlog_late() polls the buffer for a log written after
+ * the request, with no cache maintenance for a placed buffer, so a cacheable
+ * mapping could keep returning the header it read first.
  */
 static int apple_rtkit_crashlog_map(struct apple_rtkit *rtk, u64 msg)
 {
 	struct apple_rtkit_shmem *bfr = &rtk->crashlog_buffer;
-	struct iommu_domain *domain = iommu_get_domain_for_dev(rtk->dev);
 	dma_addr_t iova = FIELD_GET(APPLE_RTKIT_BUFFER_REQUEST_IOVA, msg);
 	size_t size = FIELD_GET(APPLE_RTKIT_BUFFER_REQUEST_SIZE, msg) << 12;
-	phys_addr_t phys, page;
-	size_t off;
+	phys_addr_t phys;
 	void *va;
+	int ret;
 
-	if (!domain || !iova || !size)
-		return -ENODEV;
-	phys = apple_rtkit_crashlog_phys(rtk, domain, iova);
-	for (off = 0; phys && off < size; off += PAGE_SIZE) {
-		page = apple_rtkit_crashlog_phys(rtk, domain, iova + off);
-		if (page != phys + off) {
-			dev_err(rtk->dev, "RTKit: crash log at %pad isn't contiguous at +%#zx\n",
-				&iova, off);
-			return -EINVAL;
-		}
-	}
-	if (!phys)
-		return -ENOENT;
-	va = memremap(phys, size, MEMREMAP_WB);
+	ret = apple_dart_fw_range(rtk->dev, iova, size,
+				  APPLE_DART_FW_LINUX | APPLE_DART_FW_RETAINED, &phys);
+	if (ret)
+		return ret;
+	va = memremap(phys, size, MEMREMAP_WC);
 	if (!va)
 		return -ENOMEM;
 	bfr->buffer = va;
@@ -1089,10 +1099,11 @@ static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
 	 * A firmware that never announced this endpoint asks for its buffer only when
 	 * it crashes, so there's no handshake to take the request for. Report the
 	 * crash now, as the log may never come. A client that sets such a buffer up
-	 * itself takes the path below, which also reads a log written later.
+	 * itself, or whose firmware owns it, takes the path below, which also reads a
+	 * log written later (apple_rtkit_maps_placed_crashlog()).
 	 */
 	if (!rtk->crashlog_buffer.size && !test_bit(APPLE_RTKIT_EP_CRASHLOG, rtk->endpoints) &&
-	    !rtk->ops->shmem_setup && !rtk->ops->shmem_setup_ep) {
+	    apple_rtkit_maps_placed_crashlog(rtk)) {
 		int ret = apple_rtkit_crashlog_map(rtk, msg);
 
 		dev_err(rtk->dev, "RTKit: co-processor has crashed: crash log buffer at %#llx %s (%d)\n",
@@ -2370,6 +2381,7 @@ static int apple_rtkit_inherit_endpoints(
 }
 
 static struct apple_rtkit *__apple_rtkit_init(struct device *dev, void *cookie,
+					      const char *mbox_prop,
 					      const char *mbox_name, int mbox_idx,
 					      const struct apple_rtkit_ops *ops,
 					      bool adopted,
@@ -2421,8 +2433,7 @@ static struct apple_rtkit *__apple_rtkit_init(struct device *dev, void *cookie,
 		goto free_rtk;
 	rtk->pmp_registry_v2 =
 		of_device_is_compatible(dev->of_node, "apple,t6050-pmp-v2");
-	rtk->pmp_ca_event_ack = rtk->pmp_registry_v2 &&
-				of_machine_is_compatible("apple,j714s");
+	rtk->pmp_ca_event_ack = rtk->pmp_registry_v2;
 
 	init_completion(&rtk->epmap_completion);
 	init_completion(&rtk->coreanalytics_completion);
@@ -2435,7 +2446,9 @@ static struct apple_rtkit *__apple_rtkit_init(struct device *dev, void *cookie,
 	set_bit(APPLE_RTKIT_EP_MGMT, rtk->endpoints);
 	set_bit(APPLE_RTKIT_EP_MGMT, rtk->started);
 
-	if (mbox_name)
+	if (mbox_prop)
+		rtk->mbox = apple_mbox_get_prop(dev, mbox_prop, 0);
+	else if (mbox_name)
 		rtk->mbox = apple_mbox_get_byname(dev, mbox_name);
 	else
 		rtk->mbox = apple_mbox_get(dev, mbox_idx);
@@ -2489,16 +2502,25 @@ struct apple_rtkit *apple_rtkit_init(struct device *dev, void *cookie,
 					    const char *mbox_name, int mbox_idx,
 					    const struct apple_rtkit_ops *ops)
 {
-	return __apple_rtkit_init(dev, cookie, mbox_name, mbox_idx, ops, false,
+	return __apple_rtkit_init(dev, cookie, NULL, mbox_name, mbox_idx, ops, false,
 				  NULL, 0, false, NULL);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_init);
+
+struct apple_rtkit *apple_rtkit_init_mbox_prop(struct device *dev, void *cookie,
+					       const char *mbox_prop,
+					       const struct apple_rtkit_ops *ops)
+{
+	return __apple_rtkit_init(dev, cookie, mbox_prop, NULL, 0, ops, false,
+				  NULL, 0, false, NULL);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_init_mbox_prop);
 
 struct apple_rtkit *apple_rtkit_init_adopted(struct device *dev, void *cookie,
 					     const char *mbox_name, int mbox_idx,
 					     const struct apple_rtkit_ops *ops)
 {
-	return __apple_rtkit_init(dev, cookie, mbox_name, mbox_idx, ops, true,
+	return __apple_rtkit_init(dev, cookie, NULL, mbox_name, mbox_idx, ops, true,
 				  NULL, 0, false, NULL);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_init_adopted);
@@ -2557,7 +2579,7 @@ struct apple_rtkit *apple_rtkit_init_adopted_with_buffers(
 	const struct apple_rtkit_ops *ops,
 	const struct apple_rtkit_inherited_buffer *buffers, unsigned int count)
 {
-	return __apple_rtkit_init(dev, cookie, mbox_name, mbox_idx, ops, true,
+	return __apple_rtkit_init(dev, cookie, NULL, mbox_name, mbox_idx, ops, true,
 				  buffers, count, false, NULL);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_init_adopted_with_buffers);
@@ -2570,7 +2592,7 @@ struct apple_rtkit *apple_rtkit_init_adopted_with_session(
 	if (!session)
 		return ERR_PTR(-EINVAL);
 
-	return __apple_rtkit_init(dev, cookie, mbox_name, mbox_idx, ops, true,
+	return __apple_rtkit_init(dev, cookie, NULL, mbox_name, mbox_idx, ops, true,
 				  session->buffers, session->num_buffers, false,
 				  session);
 }
@@ -2945,6 +2967,16 @@ static int apple_rtkit_strict_idle_state(struct apple_rtkit *rtk, bool ap)
 
 int apple_rtkit_idle_strict(struct apple_rtkit *rtk)
 {
+	return apple_rtkit_idle_strict_with(rtk, NULL, NULL);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_idle_strict);
+
+/*
+ * As apple_rtkit_idle_strict(), with a step between the AP state's and the IOP state's.
+ * A failed step fails the idle: the IOP state is not sent.
+ */
+int apple_rtkit_idle_strict_with(struct apple_rtkit *rtk, int (*after_ap)(void *data), void *data)
+{
 	int ret;
 
 	if (rtk->strict_idle_poisoned || rtk->crashed ||
@@ -2954,6 +2986,8 @@ int apple_rtkit_idle_strict(struct apple_rtkit *rtk)
 	reinit_completion(&rtk->strict_idle_done);
 	WRITE_ONCE(rtk->strict_idle_waiting, true);
 	ret = apple_rtkit_strict_idle_state(rtk, true);
+	if (!ret && after_ap)
+		ret = after_ap(data);
 	if (!ret)
 		ret = apple_rtkit_strict_idle_state(rtk, false);
 	if (!ret && !wait_for_completion_timeout(&rtk->strict_idle_done,
@@ -2966,7 +3000,7 @@ int apple_rtkit_idle_strict(struct apple_rtkit *rtk)
 		rtk->strict_idle_poisoned = true;
 	return ret;
 }
-EXPORT_SYMBOL_GPL(apple_rtkit_idle_strict);
+EXPORT_SYMBOL_GPL(apple_rtkit_idle_strict_with);
 
 int apple_rtkit_warm_restart_strict(struct apple_rtkit *rtk)
 {
@@ -3696,7 +3730,7 @@ struct apple_rtkit *devm_apple_rtkit_init_m5_saved(struct device *dev, void *coo
 	struct apple_rtkit *rtk;
 	int ret;
 
-	rtk = __apple_rtkit_init(dev, cookie, mbox_name, mbox_idx, ops, false,
+	rtk = __apple_rtkit_init(dev, cookie, NULL, mbox_name, mbox_idx, ops, false,
 				NULL, 0, true, NULL);
 	if (IS_ERR(rtk))
 		return rtk;

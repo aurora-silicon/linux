@@ -85,7 +85,7 @@ static bool __attribute__((unused)) cancel_work_sync(struct work_struct *w) { bo
 struct apple_dcp;struct apple_dcp_afkep;struct apple_epic_service;
 void afk_service_retry(struct apple_dcp_afkep *ep);
 /* open_later: a firmware 27 panel service that sends its own OPEN; none is here. */
-struct apple_epic_service_ops { char name[32];bool reusable,optional,open_later;void (*init)(struct apple_epic_service *,const char *,const char *,s64);int (*prepare)(struct apple_epic_service *,const char *,const char *,s64);int (*revalidate)(struct apple_epic_service *,const char *,const char *,s64);void (*init_props)(struct apple_epic_service *,s64,const void *,size_t);void (*teardown)(struct apple_epic_service *); };
+struct apple_epic_service_ops { char name[32];bool reusable,optional,open_later,singleton;void (*init)(struct apple_epic_service *,const char *,const char *,s64);int (*prepare)(struct apple_epic_service *,const char *,const char *,s64);int (*revalidate)(struct apple_epic_service *,const char *,const char *,s64);void (*init_props)(struct apple_epic_service *,s64,const void *,size_t);void (*teardown)(struct apple_epic_service *); };
 struct epic_cmd_info { u16 tag;u8 type;size_t reply_length,reply_len;bool reply_len_valid;void *rxbuf,*txbuf;dma_addr_t rxbuf_dma,txbuf_dma;size_t rxlen,txlen;u32 retcode;bool done,free_on_ack;int *completion; };
 struct apple_epic_service {
     struct apple_dcp_afkep *ep;const struct apple_epic_service_ops *ops;
@@ -183,7 +183,7 @@ static int skip(struct dcp_parse_ctx *h) { assert(!h->key);h->index++;h->key=tru
            function('epic/dpavservep.c','static void dcpavserv_teardown('),function('epic/dpavservep.c','void dpavservep_detach('),
            function('afk.c','static const struct apple_epic_service_ops *\nafk_match_service('),
            function('afk.c','static struct apple_epic_service *afk_epic_find_service('),
-           function('afk.h','static inline bool afk_service_retired('),function('afk.c','static bool afk_epic_channel_retired('),
+           function('afk.h','static inline bool afk_service_retired('),function('afk.h','static inline bool afk_service_supersede('),function('afk.c','static bool afk_epic_channel_retired('),
            function('afk.c','static void afk_discard_pending_open('),function('afk.c','static void afk_retry_service_init('),function('afk.c','static void afk_service_worker('),function('afk.c','static void afk_recv_handle_init('),
            function('epic/dpavservep.c','static int dcpdpserv_prepare('),
            function('epic/dpavservep.c','static void dcpdpserv_teardown('),function('afk.c','static void afk_recv_handle_teardown('),

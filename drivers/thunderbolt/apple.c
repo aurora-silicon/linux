@@ -192,6 +192,20 @@ static const struct apple_cio_hw apple_cio_t8103_hw = {
 	.dp = &apple_dpin_m1,
 };
 
+/*
+ * T8122 shares the T8103 ACIO register layout and DP IN policy, while deep
+ * sleep removes the CIO power domains and shares the ATC PHY with DWC3. Tear
+ * down a connected router before tasks freeze (ahead of DWC3's PM notifier)
+ * and request fresh cable state immediately on wake; s2idle and freeze leave
+ * the port up.
+ */
+static const struct apple_cio_hw apple_cio_t8122_hw = {
+	.sleep_removes_domains = true,
+	.restart_on_wake = true,
+	.phy_shared_with_dwc3 = true,
+	.dp = &apple_dpin_m1,
+};
+
 static const struct apple_cio_hw apple_cio_t6020_hw = {
 	.dp = &apple_dpin_m2,
 };
@@ -537,7 +551,7 @@ struct apple_cio {
 	unsigned int start_gen; /* protected by lock: bumped by every start */
 	unsigned int link_lost_gen; /* start_gen when the peer went away */
 	unsigned int link_lost_cycles; /* protected by lock */
-	u64 link_lost_cycle_activity; /* remote activity at the last cycle */
+	u64 link_lost_cycle_activity; /* remote activity of this domain at the last cycle */
 	bool link_lost_restart; /* protected by lock: cycle requested */
 	struct notifier_block pm_notifier;
 	struct notifier_block reboot_notifier;
@@ -2716,6 +2730,7 @@ static int apple_nhi_probe(struct platform_device *pdev)
 
 	spin_lock_init(&anhi->nhi.lock);
 	anhi->nhi.iommu_dma_protection = true;
+	anhi->nhi.use_dma_credit_preferences = true;
 	/*
 	 * DP tunnel display support (and with it the host DP IN handling in
 	 * the connection manager) only where it is enabled and known to work.
@@ -2799,6 +2814,13 @@ static int apple_nhi_probe(struct platform_device *pdev)
 		acio->pcie_pm_prepared = false;
 		acio->pcie_resume_expected = false;
 	}
+	/*
+	 * A port restart rebuilds the domain, whose remote activity count starts
+	 * again at zero. Compare the next link loss against that, not against
+	 * the count of the domain that went away: any discovery on this domain
+	 * then marks the restart as having worked.
+	 */
+	WRITE_ONCE(acio->link_lost_cycle_activity, 0);
 	ret = tb_domain_add(anhi->tb, false);
 	if (ret) {
 		dev_err_probe(anhi->dev, ret, "failed to add TB domain\n");
@@ -4888,6 +4910,10 @@ static const struct of_device_id apple_acio_match[] = {
 	{
 		.compatible = "apple,t6030-usb4-acio",
 		.data = &apple_cio_t6030_hw,
+	},
+	{
+		.compatible = "apple,t8122-usb4-acio",
+		.data = &apple_cio_t8122_hw,
 	},
 	{
 		.compatible = "apple,t6020-usb4-acio",

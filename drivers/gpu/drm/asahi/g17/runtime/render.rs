@@ -8,7 +8,7 @@ mod exit;
 mod dependencies;
 mod direct;
 mod grow;
-mod observe;
+pub(super) mod observe;
 mod pools;
 mod prepare;
 mod recovery;
@@ -876,6 +876,23 @@ impl Host<'_> {
         }
     }
 }
+/// Encodes the G17 render mailbox doorbell (0x83, priority in bits 3:2, pipe in bits 1:0).
+///
+/// Firmware queue contract across both locked and direct render publishers:
+/// - Non-M5 G17 submits render pairs to the dedicated tiling/fragment rings and rings pipe 0.
+/// - M5 Pro/Max/Ultra (!J813_FORMS) submits render pairs into the shared compute work ring paired
+///   with host-port gating writes and submission-history accounting, and rings pipe 2.
+/// - J813 (J813_FORMS, common 26A428 firmware) uses the mailbox-only G17P queue forms (no
+///   host-port or KSM register writes) and rings pipe 0.
+fn render_doorbell_message(m5: bool, priority: u8) -> u64 {
+    let pipe = if m5 && !crate::g17::J813_FORMS.load(core::sync::atomic::Ordering::Relaxed) {
+        2
+    } else {
+        0
+    };
+    (0x83 << crate::g17::MSG_TYPE_SHIFT) | u64::from(priority) << 2 | pipe
+}
+
 impl crate::g17::queue::render::Host for Host<'_> {
     fn generation(&self) -> u64 {
         self.firmware.recovery.generation()
@@ -1039,11 +1056,10 @@ impl crate::g17::queue::render::Host for Host<'_> {
                 self.firmware.bridge.regs.g17_core_power()
             });
         }
-        let result = self.firmware.primary.notify(
-            (0x83 << crate::g17::MSG_TYPE_SHIFT)
-                | u64::from(priority) << 2
-                | if m5 && !crate::g17::J813_FORMS.load(core::sync::atomic::Ordering::Relaxed) { 2 } else { 0 },
-        );
+        let result = self
+            .firmware
+            .primary
+            .notify(render_doorbell_message(m5, priority));
         if result.is_err() {
             self.firmware.primary.state.shared.lose_device_quietly();
         }
@@ -1166,6 +1182,29 @@ impl crate::g17::Firmware {
         self.queues.render.pools.publish_releases(&self.init, || {
             primary.notify(crate::g17::MSG_CONTROL_NOTIFY)
         })
+    }
+
+    /// Undoes an unpublished pool preparation and flushes any final release
+    /// exposed when sibling renders completed while the preparation was lent.
+    fn rollback_render_pool(&mut self, preparation: pools::Preparation) -> Result {
+        let pending = match self.queues.render.pools.rollback(preparation) {
+            Ok(pending) => pending,
+            Err(error) => {
+                self.primary.state.shared.lose_device_quietly();
+                return Err(error);
+            }
+        };
+        if pending {
+            match self.release_render_lists() {
+                Ok(()) => {}
+                Err(error) if error == EAGAIN => self.primary.state.shared.queue_events(),
+                Err(error) => {
+                    self.primary.state.shared.lose_device_quietly();
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Events have already been consumed by the caller. Each healthy completion
@@ -1506,13 +1545,15 @@ impl Registry {
             )
         })
     }
-    pub(in crate::g17) fn retain_render_completions(&mut self, masks: [u64; 2]) {
+    pub(in crate::g17) fn retain_render_completions(&mut self, masks: [u64; 2]) -> [u64; 2] {
+        let mut matched = [0u64; 2];
         for entry in self.render.entries.iter_mut().flatten() {
             let mut hit = false;
             for id in entry.reservation.ids {
                 let qid = usize::from(id.qid());
                 let bit = masks[qid / 64] & (1u64 << (qid % 64));
                 entry.event_masks[qid / 64] |= bit;
+                matched[qid / 64] |= bit;
                 hit |= bit != 0;
             }
             // Event passes skip a pair while preparation, growth or an
@@ -1523,14 +1564,20 @@ impl Registry {
                 entry.missed_event = true;
             }
         }
+        matched
     }
     pub(in crate::g17) fn render_needs_rescan(&self) -> bool {
         self.render.entries.iter().flatten().any(|entry| {
+            // A completion that arrived while the pair was borrowed (`missed_event`) is owed to
+            // its borrower, whose return observes the pair or requests an event pass: no
+            // rescan waits for it.
             let active = entry
                 .pair
                 .as_ref()
                 .map_or(
-                    (entry.preparing.is_some() || entry.growing) && entry.borrowed_active,
+                    (entry.preparing.is_some() || entry.growing)
+                        && entry.borrowed_active
+                        && !entry.missed_event,
                     |pair| pair.published_in_flight(),
                 );
             active

@@ -133,6 +133,23 @@ harness = r'''
         assert_eq!(before.quarantined, 0);
         assert!(logic::admit(logic::WINDOW_NS + 2, &mut window, &mut count));
     }
+
+    #[test]
+    fn cross_vm_render_abort_isolates_innocent_flight_and_quarantines_only_aborted_slot() {
+        let mut owners = Lifetime::<6>::new(true);
+        // Client A claims slot 0; Client B concurrently claims slot 1.
+        assert!(owners.claim(0));
+        assert!(owners.publish(0));
+        assert!(owners.claim(1));
+        assert!(owners.publish(1));
+        // Client A aborts (affected=true) -> slot 0 quarantined, Client A fails.
+        assert!(finish(&mut owners, 0, Retirement::Aborted, true));
+        // Client B retires Full (affected=false) -> slot 1 cleanly retired, Client B succeeds.
+        assert!(!finish(&mut owners, 1, Retirement::Full, false));
+        assert!(!owners.exhausted());
+        assert_eq!(owners.counts().quarantined, 1);
+        assert_eq!(owners.counts().retired, 1);
+    }
 }
 '''.replace('__ROOT__', str(production))
 

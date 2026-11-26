@@ -56,6 +56,7 @@
 #include <linux/jump_label.h>
 #include <linux/limits.h>
 #include <linux/of_address.h>
+#include <linux/soc/apple/sleep.h>
 #include <linux/slab.h>
 #include <linux/suspend.h>
 #include <linux/syscore_ops.h>
@@ -278,8 +279,8 @@ struct aic_info {
 	bool vm_timer_fiq_readonly;
 	/* A firmware-driven suspend powers the controller down: aic_syscore_ops keep it. */
 	bool fw_suspend;
-	/* If set, fw_suspend holds on these boards only */
-	const char *const *fw_suspend_boards;
+	/* If set, fw_suspend holds only where this says the sleep is described */
+	bool (*fw_suspend_described)(void);
 };
 
 static const struct aic_info aic1_info __initconst = {
@@ -328,12 +329,9 @@ static const struct aic_info aic3_info __initconst = {
 
 /*
  * The M5 Pro's sleep: the last steps mask every interrupt and acknowledge events by hand. The
- * save and restore are set up on the boards with a T6050 sleep, the J714s and the J716c;
+ * save and restore are set up on the boards whose device tree describes a T6050 sleep;
  * another T6050 board is as one without them.
  */
-static const char *const aic3_t6050_sleep_boards[] __initconst = {
-	"apple,j714s", "apple,j716c", NULL
-};
 
 static const struct aic_info aic3_t6050_info __initconst = {
 	.version = 3,
@@ -341,10 +339,22 @@ static const struct aic_info aic3_t6050_info __initconst = {
 	.fast_ipi = true,
 	.local_fast_ipi = true,
 	.fw_suspend = true,
-	.fw_suspend_boards = aic3_t6050_sleep_boards,
+	.fw_suspend_described = apple_t6050_sleep_described,
 };
 
 static const struct aic_info aic3_t8140_info __initconst = {
+	.version = 3,
+	.irq_cfg = AIC3_IRQ_CFG,
+	.fast_ipi = true,
+	.local_fast_ipi = true,
+	.fw_suspend = true,
+};
+
+/*
+ * T6041 (M4 Max): the AICv3 of T8122, with the state its sleep driver's firmware
+ * suspend loses saved and restored around it.
+ */
+static const struct aic_info aic3_t6041_info __initconst = {
 	.version = 3,
 	.irq_cfg = AIC3_IRQ_CFG,
 	.fast_ipi = true,
@@ -357,6 +367,7 @@ static const struct aic_info aic3_t8132_info __initconst = {
 	.irq_cfg = AIC3_IRQ_CFG,
 	.fast_ipi = true,
 	.local_fast_ipi = true,
+	.vm_timer_fiq_readonly = true,
 	.fw_suspend = true,
 };
 
@@ -383,6 +394,10 @@ static const struct of_device_id aic_info_match[] = {
 	{
 		.compatible = "apple,t8142-aic3",
 		.data = &aic3_t8142_info,
+	},
+	{
+		.compatible = "apple,t6041-aic3",
+		.data = &aic3_t6041_info,
 	},
 	{
 		.compatible = "apple,t8103-aic",
@@ -656,8 +671,9 @@ static unsigned long aic_fiq_get_idx(struct irq_data *d)
 }
 
 /*
- * T8142 traps writes to VM_TMR_FIQ_ENA_EL2. Mask the guest timers through
- * their architectural EL02 controls instead, leaving the older SoCs alone.
+ * T8132 and T8142 trap writes to VM_TMR_FIQ_ENA_EL2 outside a CTXR execute
+ * window. Mask the guest timers through their architectural EL02 controls
+ * instead, leaving the older SoCs alone.
  */
 static void aic_vm_timer_mask(u64 timers, bool mask)
 {
@@ -1301,8 +1317,7 @@ static struct syscore aic_syscore = {
 static void __init aic_sleep_init(struct aic_irq_chip *irqc)
 {
 	if (!irqc->info.fw_suspend ||
-	    (irqc->info.fw_suspend_boards &&
-	     !of_machine_compatible_match(irqc->info.fw_suspend_boards)))
+	    (irqc->info.fw_suspend_described && !irqc->info.fw_suspend_described()))
 		return;
 
 	aic_sleep.irq_cfg = kcalloc(irqc->nr_die * irqc->nr_irq, sizeof(u32), GFP_KERNEL);
@@ -1345,12 +1360,13 @@ static int __init aic_of_ic_init(struct device_node *node, struct device_node *p
 	irqc->info = *(struct aic_info *)match->data;
 
 	/*
-	 * The VM_TMR_FIQ_ENA_EL2 write that traps on T8142 was seen under
-	 * SPTM. A loader that runs the OS at EL2 in a CTXR execute window
-	 * starts no SPTM and says so with this property, and there the
-	 * register takes writes. Masking through the EL02 controls instead
-	 * sets IMASK in the guest's own timer, which KVM then keeps as
-	 * guest state: the guest gets no timer interrupt again.
+	 * The VM_TMR_FIQ_ENA_EL2 write traps on T8142 under SPTM, and on T8132
+	 * booted by a stage 1 that arms no CTXR execute window. A loader that
+	 * runs the OS at EL2 in a CTXR execute window starts no SPTM and says
+	 * so with this property, and there the register takes writes.
+	 * Masking through the EL02 controls instead sets IMASK in the guest's
+	 * own timer, which KVM then keeps as guest state: the guest gets no
+	 * timer interrupt again.
 	 */
 	if (irqc->info.vm_timer_fiq_readonly && is_kernel_in_hyp_mode() &&
 	    of_property_present(of_chosen, "aurora,ctxr-exec-window"))

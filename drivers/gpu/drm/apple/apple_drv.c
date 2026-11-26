@@ -12,7 +12,6 @@
 #include <linux/aperture.h>
 #include <linux/component.h>
 #include <linux/completion.h>
-#include <linux/delay.h>
 #include <linux/dma-fence.h>
 #include <linux/dma-mapping.h>
 #include <linux/jiffies.h>
@@ -126,6 +125,8 @@ static DEFINE_MUTEX(apple_g15_display_lock);
 static struct device *apple_t6030_display;
 static struct device *apple_t6031_display;
 static struct device *apple_t8132_display;
+#define APPLE_DRM_PUBLISHED_MAX 8
+static struct device *apple_drm_published[APPLE_DRM_PUBLISHED_MAX];
 
 /* The publication slot of a G15/G16 SoC's internal display subsystem, or NULL. */
 static struct device **apple_g15_display_slot(struct device *dev)
@@ -208,6 +209,67 @@ int apple_drm_t8132_link_device(struct device *consumer)
 				     &apple_t8132_display);
 }
 EXPORT_SYMBOL_GPL(apple_drm_t8132_link_device);
+
+static int apple_drm_display_publish(struct device *dev)
+{
+	int free_slot = -1;
+	int i;
+
+	if (!dev->of_node)
+		return 0;
+	guard(mutex)(&apple_g15_display_lock);
+	for (i = 0; i < ARRAY_SIZE(apple_drm_published); i++) {
+		if (apple_drm_published[i] == dev)
+			return 0;
+		if (apple_drm_published[i] &&
+		    apple_drm_published[i]->of_node == dev->of_node)
+			return -EBUSY;
+		if (!apple_drm_published[i] && free_slot < 0)
+			free_slot = i;
+	}
+	if (free_slot < 0)
+		return -ENOSPC;
+	apple_drm_published[free_slot] = get_device(dev);
+	return 0;
+}
+
+static void apple_drm_display_withdraw(struct device *dev)
+{
+	struct device *old = NULL;
+	int i;
+
+	scoped_guard(mutex, &apple_g15_display_lock) {
+		for (i = 0; i < ARRAY_SIZE(apple_drm_published); i++) {
+			if (apple_drm_published[i] == dev) {
+				old = apple_drm_published[i];
+				apple_drm_published[i] = NULL;
+				break;
+			}
+		}
+	}
+	put_device(old);
+}
+
+int apple_drm_link_device(struct device *consumer,
+			  const struct device_node *display_node)
+{
+	struct device_link *link;
+	int i;
+
+	if (!consumer || !consumer->of_node || !display_node)
+		return -EINVAL;
+	guard(mutex)(&apple_g15_display_lock);
+	for (i = 0; i < ARRAY_SIZE(apple_drm_published); i++) {
+		if (apple_drm_published[i] &&
+		    apple_drm_published[i]->of_node == display_node) {
+			link = device_link_add(consumer, apple_drm_published[i],
+					       DL_FLAG_AUTOREMOVE_CONSUMER);
+			return link ? 0 : -EINVAL;
+		}
+	}
+	return -EPROBE_DEFER;
+}
+EXPORT_SYMBOL_GPL(apple_drm_link_device);
 
 DEFINE_DRM_GEM_DMA_FOPS(apple_fops);
 
@@ -1767,6 +1829,22 @@ static void apple_drm_quiesce_connectors(struct drm_device *drm)
 	drm_connector_list_iter_end(&iter);
 }
 
+/* Process the hotplug reports queued while the display processors started. */
+static void apple_drm_flush_start_reports(struct drm_device *drm)
+{
+	struct drm_connector_list_iter iter;
+	struct drm_connector *connector;
+
+	drm_connector_list_iter_begin(drm, &iter);
+	drm_for_each_connector_iter(connector, &iter) {
+		/* A T8132 external output has no DCP hotplug work. */
+		if (t8132_ext_connector(connector))
+			continue;
+		flush_work(&to_apple_connector(connector)->hotplug_wq);
+	}
+	drm_connector_list_iter_end(&iter);
+}
+
 /*
  * Each display processor runs its own RTKit firmware, and starting one waits
  * for its firmware: a T6041 external processor takes 0.6 to 1.6 s to bring up
@@ -1924,8 +2002,12 @@ static int apple_drm_init_dcp(struct device *dev)
 		return -ENODEV;
 	}
 
-	/* HACK: Wait for dcp* to settle before a modeset */
-	msleep(100);
+	/*
+	 * What the firmware reported while its processor started (connection,
+	 * modes) is processed before the device registers, so the first
+	 * modeset sees it. Later reports arrive as hotplug events.
+	 */
+	apple_drm_flush_start_reports(&apple->drm);
 
 	return 0;
 }
@@ -2102,6 +2184,13 @@ static int apple_drm_init(struct device *dev)
 		drm_dev_unregister(&apple->drm);
 		goto err_unbind;
 	}
+	ret = apple_drm_display_publish(dev);
+	if (ret) {
+		apple_g15_display_withdraw(dev);
+		t8132_ext_drm_fini(&apple->drm);
+		drm_dev_unregister(&apple->drm);
+		goto err_unbind;
+	}
 
 	mutex_lock(&apple_drm_pm_lock);
 	list_add_tail(&apple->pm_node, &apple_drm_pm_list);
@@ -2124,6 +2213,7 @@ static void apple_drm_uninit(struct device *dev)
 {
 	struct apple_drm_private *apple = dev_get_drvdata(dev);
 
+	apple_drm_display_withdraw(dev);
 	apple_g15_display_withdraw(dev);
 
 	/* An aborted takeover leaves its DCPs running until the reboot. */
@@ -2282,10 +2372,23 @@ static int apple_platform_suspend(struct device *dev)
 	if (apple && apple->dark_held)
 		return 0;
 
+	if (pm_suspend_via_firmware()) {
+		int ret = dcp_t6041_s2r_all(false);
+
+		if (ret)
+			return ret;
+	}
+
 	if (apple && !apple->aborted) {
 		apple->s2r_skipped = apple_drm_firmware_stopped(apple);
-		if (!apple->s2r_skipped)
-			return drm_mode_config_helper_suspend(&apple->drm);
+		if (!apple->s2r_skipped) {
+			int ret = drm_mode_config_helper_suspend(&apple->drm);
+
+			if (ret) {
+				dcp_t6041_s2r_all(true);
+				return ret;
+			}
+		}
 	}
 
 	return 0;
@@ -2332,6 +2435,10 @@ static void apple_drm_resume_outputs(struct apple_drm_private *apple)
 static int apple_platform_resume(struct device *dev)
 {
 	struct apple_drm_private *apple = dev_get_drvdata(dev);
+
+	/* Nothing if this suspend never took the display down. */
+	if (dcp_t6041_s2r_all(true))
+		dev_err(dev, "T6041 S2R display resume failed\n");
 
 	if (!apple || apple->aborted || apple->s2r_skipped)
 		return 0;
