@@ -327,6 +327,10 @@ impl Shared {
 impl Gpu {
     /// Where this GPU's deep sleep stops its firmware.
     fn sleep_stop(&self) -> SleepStop {
+        // DIAGNOSTIC (T6030 sleep bring-up): the commit's stop instead, for comparison.
+        if crate::module_parameters::g16_sleep_at_commit.value() != 0 {
+            return SleepStop::Commit;
+        }
         self.cfg.sleep_stop
     }
 
