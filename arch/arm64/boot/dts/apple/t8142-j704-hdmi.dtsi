@@ -35,11 +35,6 @@
 	};
 };
 
-/* aura prunes a provider it leaves disabled from this list again. */
-&display {
-	iommus = <&disp0_dart 0>, <&dispext1_dart 0>;
-};
-
 &pmgr {
 	ps_atc2_common: power-controller@2d8 {
 		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
@@ -52,12 +47,12 @@
 	/*
 	 * These islands stay owned by the firmware session inherited from iBoot:
 	 * as apple,firmware-owned domains they are always on for Linux, which
-	 * never reads or changes them. They are left enabled because &display
-	 * lists dispext1_dart, which the loader enables together with dcpext1
-	 * when it hands the session over (aura#409, dt_set_t8142_dcpext()); a
-	 * disabled state would leave that DART waiting for its domain. When the
-	 * loader does not hand dcpext1 over, it keeps dcpext1 and its DARTs
-	 * disabled and prunes dispext1_dart from &display, so nothing uses them.
+	 * never reads or changes them, so leaving them enabled changes nothing
+	 * on the bus. They are ready for dispext1_dart when the loader hands
+	 * dcpext1 over: it then enables dcpext1 and its DARTs and adds
+	 * dispext1_dart to &display's iommus itself (aura, dt_set_t8142_dcpext()).
+	 * Without a handoff dcpext1 and its DARTs stay disabled and &display
+	 * lists only disp0_dart.
 	 */
 	ps_dispext1_sys: power-controller@2b8 {
 		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
