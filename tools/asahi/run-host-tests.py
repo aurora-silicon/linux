@@ -232,6 +232,13 @@ ASAHI_TESTS = {
     'dpavserv-admission-tests.py': [([], PASS)]
         + mutations('--mutation', ('old-cable-wait', 'ignore-generation', 'ignore-cable',
                                      'ignore-quiescing'), []),
+    # Compact AFK services start before publication and discard on start failure.
+    'afk-compact-start-tests.py': [([], PASS)]
+        + mutations('--mutation', ('no-discard-on-start-fail', 'publish-before-start',
+                                   'skip-start', 'ignore-ops-defer',
+                                   'dpavctrl-no-defer-prepare', 'no-enabled-check-in-start',
+                                   'reuse-pinned-slot', 'discard-clears-pinned-ops',
+                                   'discard-keeps-defer-flag', 'dptxport-no-defer-unit0'), []),
     'dcp-bw-scratch-window-tests.py': [([], PASS)] + mutations('--mutation', ('old-check', 'start-only'), []),
     'clpc-gpu-demand-tests.py': [([], PASS)],
     'clpc-high-power-cleanup-tests.py': [(out(), PASS),

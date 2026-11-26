@@ -123,6 +123,8 @@ struct apple_epic_service_ops {
 	bool singleton;
 	/* AFKV2: the provider sends this service's OPEN itself, afk_service_open(). */
 	bool open_later;
+	/* Compact EPIC: do not send compact start (0x12) on announcement. */
+	bool defer_start;
 
 	/*
 	 * Optional admission, before OPEN/publication. Must not retain service
@@ -356,13 +358,17 @@ static inline void afk_service_discard(struct apple_epic_service *service)
 {
 	unsigned long flags;
 
-	if (service->ops->teardown)
+	if (service->ops && service->ops->teardown)
 		service->ops->teardown(service);
 	spin_lock_irqsave(&service->lock, flags);
 	service->enabled = false;
 	service->torndown = true;
-	service->cookie = NULL;
-	service->ops = NULL;
+	service->defer_start = false;
+	service->started = false;
+	if (!WARN_ON(service->users)) {
+		service->cookie = NULL;
+		service->ops = NULL;
+	}
 	spin_unlock_irqrestore(&service->lock, flags);
 }
 

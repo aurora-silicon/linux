@@ -818,12 +818,10 @@ static int afk_send_compact(struct apple_dcp_afkep *ep, u16 intf_id, u8 type,
 	return ret;
 }
 
-int afk_start_service(struct apple_epic_service *service)
+static int afk_start_compact_service(struct apple_epic_service *service)
 {
 	int ret;
 
-	if (!service || !service->enabled)
-		return -EINVAL;
 	if (!READ_ONCE(service->ep->compact) || service->started)
 		return 0;
 
@@ -832,6 +830,13 @@ int afk_start_service(struct apple_epic_service *service)
 	if (!ret)
 		service->started = true;
 	return ret;
+}
+
+int afk_start_service(struct apple_epic_service *service)
+{
+	if (!service || !service->enabled)
+		return -EINVAL;
+	return afk_start_compact_service(service);
 }
 
 /* "prefix:name[:suffix]": match on name, cut or not; "*" takes every other service. */
@@ -932,8 +937,21 @@ afk_compact_slot(struct apple_dcp_afkep *ep,
 		afk_service_retire(service);
 		if (service->ops->teardown)
 			service->ops->teardown(service);
-		service->power_gen = gen;
-		return service;
+		/*
+		 * Only reuse the retired slot in place once no caller still
+		 * pins it or waits on a pending command; otherwise keep its
+		 * ops intact until those callers release it and take a free
+		 * slot below.
+		 */
+		spin_lock_irqsave(&service->lock, flags);
+		free = !service->users &&
+		       bitmap_empty(service->cmd_map, MAX_PENDING_CMDS);
+		spin_unlock_irqrestore(&service->lock, flags);
+		if (free) {
+			service->power_gen = gen;
+			return service;
+		}
+		break;
 	}
 
 	for (i = 0; i < ep->num_channels; i++) {
@@ -1016,11 +1034,11 @@ static void afk_recv_handle_compact_init(struct apple_dcp_afkep *ep,
 	service->cmd_tag = 0;
 	strscpy(service->name, service_name, sizeof(service->name));
 	service->unit = unit;
-	service->defer_start = false;
+	service->defer_start = ops->defer_start;
 	service->started = false;
 	service->torndown = false;
-	/* A service with an admission step is published once admitted. */
-	service->enabled = !ops->prepare;
+	/* Publish only once admission and compact start succeed. */
+	service->enabled = false;
 	spin_unlock_irqrestore(&service->lock, flags);
 
 	if (ops->prepare) {
@@ -1032,9 +1050,20 @@ static void afk_recv_handle_compact_init(struct apple_dcp_afkep *ep,
 			afk_service_discard(service);
 			return;
 		}
-		afk_service_publish(service);
 	}
 
+	if (!service->defer_start) {
+		ret = afk_start_compact_service(service);
+		if (ret) {
+			dev_err(ep->dcp->dev,
+				"AFK[ep:%02x]: failed to start compact service %u: %d\n",
+				ep->endpoint, channel, ret);
+			afk_service_discard(service);
+			return;
+		}
+	}
+
+	afk_service_publish(service);
 	if (ops->init)
 		ops->init(service, service_name, service_name, unit);
 	wake_up_all(&ep->service_wq);
@@ -1044,14 +1073,6 @@ static void afk_recv_handle_compact_init(struct apple_dcp_afkep *ep,
 		 ep->endpoint, wire_name, channel,
 		 service->defer_start ? " (deferred)" : "");
 	afk_populate_service_debugfs(service);
-
-	if (!service->defer_start) {
-		ret = afk_start_service(service);
-		if (ret)
-			dev_err(ep->dcp->dev,
-				"AFK[ep:%02x]: failed to start compact service %u: %d\n",
-				ep->endpoint, channel, ret);
-	}
 }
 
 /* IOReturn values of a refused call (IOKit's sys_iokit error space) */

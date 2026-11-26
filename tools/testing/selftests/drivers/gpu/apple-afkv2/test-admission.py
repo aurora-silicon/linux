@@ -49,7 +49,7 @@ struct apple_epic_service_ops {
  void (*teardown)(struct apple_epic_service *);
 };
 struct apple_epic_service {
- int lock; unsigned int users; u32 channel; bool enabled, torndown;
+ int lock; unsigned int users; u32 channel; bool enabled, torndown, defer_start, started;
  void *cookie; const struct apple_epic_service_ops *ops;
  struct apple_dcp_afkep *ep; unsigned long cmd_map[1];
 };

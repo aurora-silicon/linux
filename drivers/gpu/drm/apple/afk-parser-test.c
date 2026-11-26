@@ -436,6 +436,189 @@ static void afk_compact_cut_before_wildcard_test(struct kunit *test)
 			    &wildcard_first_ops[0]);
 }
 
+struct compact_start_capture {
+	unsigned int prepares;
+	unsigned int inits;
+	unsigned int teardowns;
+	bool defer_in_prepare;
+	bool init_saw_enabled;
+	bool init_saw_started;
+};
+
+static struct compact_start_capture *compact_start_cap;
+
+static int compact_start_prepare(struct apple_epic_service *service,
+				 const char *name, const char *class, s64 unit)
+{
+	compact_start_cap->prepares++;
+	service->cookie = compact_start_cap;
+	if (compact_start_cap->defer_in_prepare)
+		service->defer_start = true;
+	return 0;
+}
+
+static void compact_start_init(struct apple_epic_service *service,
+			       const char *name, const char *class, s64 unit)
+{
+	compact_start_cap->inits++;
+	compact_start_cap->init_saw_enabled = service->enabled;
+	compact_start_cap->init_saw_started = service->started;
+}
+
+static void compact_start_teardown(struct apple_epic_service *service)
+{
+	compact_start_cap->teardowns++;
+}
+
+static void afk_compact_start_failure_test(struct kunit *test)
+{
+	static const struct apple_epic_service_ops ops[] = {
+		{
+			.name = "start-fail",
+			.prepare = compact_start_prepare,
+			.init = compact_start_init,
+			.teardown = compact_start_teardown,
+		},
+		{
+			.name = "start-defer",
+			.defer_start = true,
+			.prepare = compact_start_prepare,
+			.init = compact_start_init,
+			.teardown = compact_start_teardown,
+		},
+		{},
+	};
+	struct apple_dcp_afkep *ep = test->priv;
+	struct compact_start_capture cap = {};
+	char fail_name[AFK_COMPACT_NAME_LEN] = "dispext0:start-fail:0";
+	char defer_name[AFK_COMPACT_NAME_LEN] = "dispext0:start-defer:0";
+
+	compact_slot_reset(ep, 0x2b);
+	ep->compact = true;
+	ep->ops = ops;
+	compact_start_cap = &cap;
+
+	/* Without a ready TX ring, compact start fails and discards the slot. */
+	afk_recv_handle_compact_init(ep, 5, fail_name, sizeof(fail_name));
+	KUNIT_EXPECT_EQ(test, cap.prepares, 1U);
+	KUNIT_EXPECT_EQ(test, cap.inits, 0U);
+	KUNIT_EXPECT_EQ(test, cap.teardowns, 1U);
+	KUNIT_EXPECT_PTR_EQ(test, afk_epic_find_service(ep, 5), NULL);
+	KUNIT_EXPECT_TRUE(test, afk_epic_channel_retired(ep, 5));
+	KUNIT_EXPECT_FALSE(test, ep->services[0].enabled);
+	KUNIT_EXPECT_TRUE(test, ep->services[0].torndown);
+	KUNIT_EXPECT_FALSE(test, ep->services[0].defer_start);
+	KUNIT_EXPECT_FALSE(test, ep->services[0].started);
+	KUNIT_EXPECT_PTR_EQ(test, ep->services[0].ops, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, ep->services[0].cookie, NULL);
+	KUNIT_EXPECT_EQ(test, ep->services[0].users, 0U);
+	KUNIT_EXPECT_PTR_EQ(test, afk_service_get(&ep->services[0]), NULL);
+
+	/* A deferred-start service reuses the discarded slot and publishes. */
+	afk_recv_handle_compact_init(ep, 6, defer_name, sizeof(defer_name));
+	KUNIT_EXPECT_EQ(test, ep->num_channels, 1U);
+	KUNIT_EXPECT_EQ(test, cap.prepares, 2U);
+	KUNIT_EXPECT_EQ(test, cap.inits, 1U);
+	KUNIT_EXPECT_EQ(test, cap.teardowns, 1U);
+	KUNIT_EXPECT_TRUE(test, cap.init_saw_enabled);
+	KUNIT_EXPECT_FALSE(test, cap.init_saw_started);
+	KUNIT_EXPECT_PTR_EQ(test, afk_epic_find_service(ep, 6), &ep->services[0]);
+	KUNIT_EXPECT_TRUE(test, ep->services[0].defer_start);
+	KUNIT_EXPECT_FALSE(test, ep->services[0].started);
+
+	/* Deferring from ops->prepare skips start before publication too. */
+	cap.defer_in_prepare = true;
+	afk_recv_handle_compact_init(ep, 7, fail_name, sizeof(fail_name));
+	KUNIT_EXPECT_EQ(test, ep->num_channels, 2U);
+	KUNIT_EXPECT_EQ(test, cap.prepares, 3U);
+	KUNIT_EXPECT_EQ(test, cap.inits, 2U);
+	KUNIT_EXPECT_EQ(test, cap.teardowns, 1U);
+	KUNIT_EXPECT_PTR_EQ(test, afk_epic_find_service(ep, 7), &ep->services[1]);
+	KUNIT_EXPECT_TRUE(test, ep->services[1].defer_start);
+	KUNIT_EXPECT_FALSE(test, ep->services[1].started);
+
+	compact_start_cap = NULL;
+}
+
+static void afk_compact_pinned_replace_start_fail_test(struct kunit *test)
+{
+	static const struct apple_epic_service_ops ops[] = {
+		{
+			.name = "pinned-singleton",
+			.singleton = true,
+			.prepare = compact_start_prepare,
+			.init = compact_start_init,
+			.teardown = compact_start_teardown,
+		},
+		{},
+	};
+	struct apple_dcp_afkep *ep = test->priv;
+	struct compact_start_capture cap = {};
+	struct apple_epic_service *pinned, *busy;
+	char svc_name[AFK_COMPACT_NAME_LEN] = "dispext0:pinned-singleton:0";
+
+	compact_slot_reset(ep, 0x2b);
+	ep->compact = true;
+	ep->ops = ops;
+	compact_start_cap = &cap;
+
+	/* Publish the initial singleton via deferred start, then pin it. */
+	cap.defer_in_prepare = true;
+	afk_recv_handle_compact_init(ep, 10, svc_name, sizeof(svc_name));
+	KUNIT_ASSERT_EQ(test, ep->num_channels, 1U);
+	pinned = afk_service_get(&ep->services[0]);
+	KUNIT_ASSERT_PTR_EQ(test, pinned, &ep->services[0]);
+	KUNIT_EXPECT_EQ(test, pinned->users, 1U);
+
+	/*
+	 * A replacement whose start fails must not reuse or wipe the pinned
+	 * predecessor: its ops->name and cookie stay valid until released.
+	 */
+	cap.defer_in_prepare = false;
+	afk_recv_handle_compact_init(ep, 12, svc_name, sizeof(svc_name));
+	KUNIT_EXPECT_EQ(test, ep->num_channels, 2U);
+	KUNIT_EXPECT_EQ(test, cap.teardowns, 2U);
+	KUNIT_EXPECT_FALSE(test, pinned->enabled);
+	KUNIT_EXPECT_TRUE(test, pinned->torndown);
+	KUNIT_EXPECT_EQ(test, pinned->channel, 10U);
+	KUNIT_EXPECT_EQ(test, pinned->users, 1U);
+	KUNIT_ASSERT_PTR_EQ(test, pinned->ops, &ops[0]);
+	KUNIT_EXPECT_STREQ(test, pinned->ops->name, "pinned-singleton");
+	KUNIT_EXPECT_PTR_EQ(test, pinned->cookie, &cap);
+	KUNIT_EXPECT_FALSE(test, ep->services[1].enabled);
+	KUNIT_EXPECT_TRUE(test, ep->services[1].torndown);
+	KUNIT_EXPECT_FALSE(test, ep->services[1].defer_start);
+	KUNIT_EXPECT_FALSE(test, ep->services[1].started);
+	KUNIT_EXPECT_PTR_EQ(test, ep->services[1].ops, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, ep->services[1].cookie, NULL);
+	KUNIT_EXPECT_EQ(test, ep->services[1].users, 0U);
+	KUNIT_EXPECT_PTR_EQ(test, afk_epic_find_service(ep, 12), NULL);
+	KUNIT_EXPECT_TRUE(test, afk_epic_channel_retired(ep, 12));
+
+	/* Dropping the caller pin allows slot 0 to be reclaimed cleanly. */
+	afk_service_put(pinned);
+	KUNIT_EXPECT_EQ(test, pinned->users, 0U);
+	cap.defer_in_prepare = true;
+	afk_recv_handle_compact_init(ep, 14, svc_name, sizeof(svc_name));
+	KUNIT_EXPECT_EQ(test, ep->num_channels, 2U);
+	busy = afk_epic_find_service(ep, 14);
+	KUNIT_ASSERT_PTR_EQ(test, busy, &ep->services[0]);
+
+	/* A pending command also prevents in-place slot reuse on failure. */
+	set_bit(0, busy->cmd_map);
+	cap.defer_in_prepare = false;
+	afk_recv_handle_compact_init(ep, 16, svc_name, sizeof(svc_name));
+	KUNIT_EXPECT_EQ(test, ep->num_channels, 2U);
+	KUNIT_EXPECT_FALSE(test, busy->enabled);
+	KUNIT_EXPECT_TRUE(test, busy->torndown);
+	KUNIT_EXPECT_EQ(test, busy->channel, 14U);
+	KUNIT_ASSERT_PTR_EQ(test, busy->ops, &ops[0]);
+	KUNIT_EXPECT_PTR_EQ(test, ep->services[1].ops, NULL);
+	clear_bit(0, busy->cmd_map);
+
+	compact_start_cap = NULL;
+}
+
 static struct kunit_case afk_parser_cases[] = {
 	KUNIT_CASE(afk_serialized_report_test),
 	KUNIT_CASE(afk_compact_service_call_report_test),
@@ -448,6 +631,8 @@ static struct kunit_case afk_parser_cases[] = {
 	KUNIT_CASE(afk_compact_singleton_no_leak_test),
 	KUNIT_CASE(afk_compact_siblings_kept_test),
 	KUNIT_CASE(afk_compact_cut_before_wildcard_test),
+	KUNIT_CASE(afk_compact_start_failure_test),
+	KUNIT_CASE(afk_compact_pinned_replace_start_fail_test),
 	{}
 };
 
