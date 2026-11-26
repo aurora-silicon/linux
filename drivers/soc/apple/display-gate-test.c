@@ -790,6 +790,17 @@ static void __init gate_t6030_other_pmp_image(struct kunit *test)
 	gt_expect_untouched(test);
 }
 
+/* The 27.2 (26B123) T6030 PMP image is taken as well. */
+static void __init gate_t6030_pmp_image_27_2(struct kunit *test)
+{
+	struct gate_test *t = test->priv;
+
+	t->pmp_uuid = "5D66805B-E4AD-335E-BDC3-26828C682AAC";
+	gt_set_string(test, gt_t6030.values, "apple,tunable-uuid", t->pmp_uuid);
+	gt_run(test);
+	gt_expect_enabled(test);
+}
+
 static void __init gate_t6030_enabled_again(struct kunit *test)
 {
 	gt_run(test);
@@ -1185,6 +1196,7 @@ static struct kunit_case gate_t6030_cases[] __refdata = {
 	KUNIT_CASE(gate_t6030_no_marker),
 	KUNIT_CASE(gate_t6030_t6031_power_layout),
 	KUNIT_CASE(gate_t6030_other_pmp_image),
+	KUNIT_CASE(gate_t6030_pmp_image_27_2),
 	KUNIT_CASE(gate_t6030_enabled_again),
 	{}
 };
@@ -1407,6 +1419,7 @@ static void __init gate_t6041_max_no_memory(struct kunit *test)
 	gt_max_expect_chain(test, 0, false);
 	gt_max_expect_chain(test, 1, false);
 	gt_max_expect_chain(test, 2, false);
+	gt_max_expect_chain(test, 3, false);
 	gt_max_expect_display(test, 0);
 }
 
@@ -1420,7 +1433,21 @@ static void __init gate_t6041_max_second_usbc(struct kunit *test)
 	gt_max_expect_chain(test, 0, true);
 	gt_max_expect_chain(test, 1, true);
 	gt_max_expect_chain(test, 2, true);
+	gt_max_expect_chain(test, 3, false);
 	gt_max_expect_display(test, BIT(0) | BIT(1) | BIT(2));
+}
+
+/* With all four filled, every external chain comes up, dcpext3's last. */
+static void __init gate_t6041_max_all_externals(struct kunit *test)
+{
+	unsigned int i;
+
+	for (i = 0; i < 4; i++)
+		gt_max_fill(test, i);
+	gt_max_run(test);
+	for (i = 0; i < 4; i++)
+		gt_max_expect_chain(test, i, true);
+	gt_max_expect_display(test, BIT(0) | BIT(1) | BIT(2) | BIT(3));
 }
 
 /* The other processor's chain does not wait for one that was refused. */
@@ -1543,6 +1570,7 @@ static struct kunit_case gate_t6041_max_cases[] __refdata = {
 	KUNIT_CASE(gate_t6041_max_enabled),
 	KUNIT_CASE(gate_t6041_max_no_memory),
 	KUNIT_CASE(gate_t6041_max_second_usbc),
+	KUNIT_CASE(gate_t6041_max_all_externals),
 	KUNIT_CASE(gate_t6041_max_one_processor),
 	KUNIT_CASE(gate_t6041_max_partial_memory),
 	KUNIT_CASE(gate_t6041_max_enabled_by_loader),

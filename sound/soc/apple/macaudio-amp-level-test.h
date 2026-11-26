@@ -114,6 +114,7 @@ static void macaudio_level_no_table(struct kunit *test)
 		&macaudio_j614_cfg, &macaudio_j616_cfg, &macaudio_j713_cfg,
 		&macaudio_j714_cfg, &macaudio_j715_cfg, &macaudio_j716_cfg,
 		&macaudio_j813_cfg, &macaudio_j775_cfg, &macaudio_j873_cfg,
+		&macaudio_k114_cfg,
 	};
 	unsigned int i;
 

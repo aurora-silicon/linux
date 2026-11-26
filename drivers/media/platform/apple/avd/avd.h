@@ -258,7 +258,7 @@ struct avd_dev {
 
 	struct iommu_domain *domain;
 	struct iommu_domain *empty_domain;
-	/* Core and perf-floor domains when the node lists more than one. */
+	/* Power domains linked to runtime PM when the node lists more than one. */
 	struct dev_pm_domain_list *pd_list;
 
 	struct mutex vdev_lock;
@@ -421,8 +421,15 @@ struct v4l2_ctrl_av1_tile_group_entry *
 avd_av1_copy_tile_group(struct v4l2_ctrl *ctrl, unsigned int *entries);
 int avd_av1_check_frame_size(const struct v4l2_ctrl_av1_frame *frame,
 			     u32 width, u32 height);
+int avd_h264_validate_sps_fmt(struct avd_ctx *ctx,
+			      const struct v4l2_ctrl_h264_sps *sps);
 int avd_h264_validate_sps(struct avd_ctx *ctx,
 			  const struct v4l2_ctrl_h264_sps *sps);
+int avd_h264_validate_sps_ctrl(struct avd_ctx *ctx,
+			       const struct v4l2_ctrl_h264_sps *sps,
+			       bool streaming);
+int avd_hevc_validate_sps_fmt(struct avd_ctx *ctx,
+			      const struct v4l2_ctrl_hevc_sps *sps);
 size_t avd_h264_start_slices(const struct v4l2_ctrl_h264_sps *sps);
 int avd_try_capture_fmt(struct file *file, void *priv, struct v4l2_format *f);
 int avd_s_capture_fmt(struct file *file, void *priv, struct v4l2_format *f);

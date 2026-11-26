@@ -6,6 +6,11 @@
 #include "t8122-j615.dts"
 #include "t8122-j613-dcp-25g83.dtsi"
 
+/* The memory floor has not run with the native J613 report on a J615. */
+&pmp_report {
+	/delete-property/ apple,cpu-memory-floor;
+};
+
 /* As on the J613 25G83. */
 &mtp {
 	compatible = "apple,t8122-mtp", "apple,t8122-rtk-helper-asc4", "apple,mtp";

@@ -15,6 +15,7 @@
 
 #define T6050_J716C
 #include "t6050-max.dtsi"
+#include "hwmon-fan-dual.dtsi"
 
 / {
 	compatible = "apple,j716c", "apple,t6050", "apple,arm-platform";
@@ -47,6 +48,8 @@
 			compatible = "apple,simple-framebuffer", "simple-framebuffer";
 			reg = <0 0 0 0>; /* To be filled by the loader */
 			/* Format properties will be added by the loader */
+			/* Scanned out by the internal DCP, handed off or not. */
+			display = <&dcp>;
 			status = "disabled";
 		};
 	};
@@ -178,9 +181,24 @@
 	gpio-reserved-ranges = <0 80>, <81 25>, <108 26>, <135 1>, <140 81>;
 };
 
-/* This board's SMC fan and power keys are not yet checked */
+/*
+ * Inherit apple,discover-temperatures and apple,soc-die-keys ("TCMb") from
+ * t6050-die0.dtsi so all readable T* float sensors are discovered and TCMb
+ * supplies the macsmc_soc_die thermal zone for the GPU thermal governor.
+ * T6050 spells the fan mode keys F0md/F1md and accepts manual fan targets.
+ */
 &smc_hwmon {
-	status = "disabled";
+	status = "okay";
+
+	fan-F0Ac {
+		apple,fan-mode = "F0md";
+		apple,fan-manual-control;
+	};
+
+	fan-F1Ac {
+		apple,fan-mode = "F1md";
+		apple,fan-manual-control;
+	};
 };
 
 /*

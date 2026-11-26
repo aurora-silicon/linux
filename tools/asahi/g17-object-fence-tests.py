@@ -148,7 +148,10 @@ pub mod mmu {
     pub struct KernelMapping { pub iova: u64 }
     impl KernelMapping {
         pub fn iova(&self) -> u64 { self.iova }
-        pub unsafe fn set_fw_cached_prefix(&self, _prefix: usize) -> (crate::Result<[u64; 2]>, bool) { (Ok([0; 2]), true) }
+        pub unsafe fn set_fw_cached_prefix(&self, prefix: usize) -> (crate::Result<[u64; 2]>, bool) {
+            assert!(prefix > 0, "set_fw_cached_prefix must not be called for prefix == 0");
+            (Ok([0; 2]), true)
+        }
     }
 }
 
@@ -355,6 +358,54 @@ pub mod now {
     fn returns(pool: &Pool) -> [u64; 3] {
         let s = snapshot(pool);
         ["unseen=", "released=", "strict="].map(|key| crate::count(&s, "workstate_returns", key))
+    }
+
+    /// Uncached pooled objects (`prefix == 0`) skip `set_fw_cached_prefix` while keeping
+    /// their pool lease, fence, return mark, reuse zeroing and retention until stop.
+    pub fn uncached_pooled() {
+        for after_release in [true, false] {
+            let next = Cell::new(1);
+            let alloc = Allocator { next: &next };
+            let pool = Pool::new(after_release).unwrap();
+            crate::forget_unmapped();
+            crate::channel::set(5, 3);
+
+            let mut ws = pool.allocate(&alloc, Family::WorkState, WORK, 0, 0, CpuMap::WriteCombined).unwrap();
+            assert!(ws.lease.is_some(), "prefix == 0 keeps a pool lease");
+            assert_eq!(ws.return_mark().is_some(), after_release);
+            ws.bytes_mut()[0] = 0x42;
+            let ws_id = ws.id;
+            if let Some(mark) = ws.return_mark() {
+                mark.expose();
+            }
+            drop(ws);
+            assert!(!unmapped(ws_id), "prefix == 0 stays mapped on drop");
+            assert_eq!(fence(&pool, Family::WorkState, ws_id), Some(6));
+
+            // Still behind fence: a fresh object is allocated instead of reusing ws_id.
+            let fresh = pool.allocate(&alloc, Family::WorkState, WORK, 0, 0, CpuMap::WriteCombined).unwrap();
+            assert_ne!(fresh.id, ws_id);
+            drop(fresh);
+
+            // Once the fence is met, ws_id is reused and zeroed.
+            crate::channel::set(6, 6);
+            let reused = pool.allocate(&alloc, Family::WorkState, WORK, 0, 0, CpuMap::WriteCombined).unwrap();
+            assert_eq!(reused.id, ws_id, "prefix == 0 is reused once its fence is met");
+            assert_eq!(reused.bytes[0], 0, "reused prefix == 0 object is zeroed");
+            drop(reused);
+
+            // retain_until_stop keeps an uncached pooled object mapped until firmware stop.
+            let mut kept = pool.allocate(&alloc, Family::QueueState, mmu::UAT_PGSZ, 0, 0, CpuMap::WriteCombined).unwrap();
+            assert!(kept.lease.is_some());
+            let kept_id = kept.id;
+            kept.retain_until_stop(&pool);
+            drop(kept);
+            assert!(!unmapped(kept_id));
+            pool.stop_after_firmware();
+            assert!(unmapped(kept_id));
+            assert!(unmapped(ws_id));
+        }
+        println!("uncached pooled: prefix == 0 skips firmware caching while keeping fencing, reuse and retention");
     }
 
     /// Each return class decides the fence; reuse never waits on a met fence.
@@ -708,6 +759,7 @@ pub mod now {
 }
 
 fn main() {
+    now::uncached_pooled();
     now::return_classes();
     now::full_family();
     let (mut allocations, mut uncached, mut overruns) = (0, 0, 0);
