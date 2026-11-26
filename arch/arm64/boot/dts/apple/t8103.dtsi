@@ -2254,6 +2254,7 @@
 				device_type = "pci";
 				reg = <0x0 0x0 0x0 0x0 0x0>;
 				reset-gpios = <&pinctrl_ap 152 GPIO_ACTIVE_LOW>;
+				supports-clkreq;
 
 				#address-cells = <3>;
 				#size-cells = <2>;
