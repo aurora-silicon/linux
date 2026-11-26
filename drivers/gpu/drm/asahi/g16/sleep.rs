@@ -54,6 +54,7 @@ extern "C" {
     ) -> *mut core::ffi::c_void;
     fn asahi_g17_pmp_request(dev: *mut core::ffi::c_void, enable: bool) -> core::ffi::c_int;
     fn asahi_g16_sleep_note(step: u8);
+    fn apple_rtkit_resume_rx(rtk: *mut bindings::apple_rtkit);
     fn asahi_g17_commit_finish(commit: *mut core::ffi::c_void, saved: *mut u32) -> bool;
     fn asahi_g17_power_auto_off(dev: *mut core::ffi::c_void, saved: *mut u32) -> core::ffi::c_int;
     fn asahi_g17_power_lower(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
@@ -72,11 +73,16 @@ impl Firmware {
             && self.recovery_idle()?)
     }
 
-    /// The run bit and the RTKit handshake, with the firmware's state as it was left.
-    fn sleep_restart(&mut self) -> Result {
+    /// The run bit and the RTKit handshake, with the firmware's state as it was left. `held`:
+    /// the stop masked the mailbox's receive interrupt, which comes back with the receive path.
+    fn sleep_restart(&mut self, held: bool) -> Result {
         // Start the next render on each pass slot fresh after the firmware restarts.
         self.pools.invalidate();
         self.session.rtkit.warm_restart()?;
+        if held {
+            // SAFETY: The RTKit handle lasts until reboot; the stop masked the interrupt once.
+            unsafe { apple_rtkit_resume_rx(self.session.rtkit.as_raw()) };
+        }
         note(0x33);
         let control = self.session.regs.asc_control()?;
         self.session.regs.set_asc_control(control | ASC_RUN)?;
@@ -304,8 +310,9 @@ impl Shared {
         true
     }
 
-    /// Raises the domain and restarts the firmware. A failure loses the device.
-    fn sleep_up(self: &Arc<Self>) -> Result {
+    /// Raises the domain and restarts the firmware. A failure loses the device. `held`: the
+    /// stop was made in `.prepare`, with the mailbox's receive interrupt masked.
+    fn sleep_up(self: &Arc<Self>, held: bool) -> Result {
         let started = now_ns();
         let result = {
             let mut state = self.state.lock();
@@ -316,7 +323,7 @@ impl Shared {
                         // mailbox and handshake.
                         self.pmp_request(true);
                         note(0x32);
-                        firmware.sleep_restart()
+                        firmware.sleep_restart(held)
                     })
                 }
                 _ => self.raise_domain(),
@@ -384,7 +391,7 @@ impl Gpu {
         let stopped = self.shared.sleep_commit_finish();
         if stopped == Some(true) && self.sleep_stop() == SleepStop::Prepare {
             // Stopped in `.prepare`: back up warm, whether or not the sleep reached the hardware.
-            let _ = self.shared.sleep_up();
+            let _ = self.shared.sleep_up(true);
             return;
         }
         if stopped == Some(false) && !real {
@@ -400,7 +407,7 @@ impl Gpu {
         if !real && self.shared.sleep_hold() {
             return;
         }
-        let _ = self.shared.sleep_up();
+        let _ = self.shared.sleep_up(false);
     }
 }
 

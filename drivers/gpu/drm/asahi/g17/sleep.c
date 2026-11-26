@@ -810,6 +810,12 @@ struct asahi_g17_commit *asahi_g16_stop_now(struct device *dev, struct apple_rtk
 	asahi_g16_sleep_note(0x22);
 	apple_rtkit_mailbox_recv_off(c->rtk[0]);
 	c->words[0] = apple_rtkit_mailbox_status(c->rtk[0]);
+	/*
+	 * Its receive interrupt masked as well, before its domain goes: unlike in the commit, the
+	 * kernel runs on with GFX off, and a read of the unpowered mailbox from its handler aborts.
+	 * The restart unmasks it once GFX is back.
+	 */
+	apple_rtkit_hold_rx(c->rtk[0]);
 	asahi_g16_sleep_note(0x23);
 	c->request_ret = c->request ? apple_pmp_report_entry_request(c->request, false) : 0;
 	asahi_g16_sleep_note(0x24);
