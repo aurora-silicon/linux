@@ -394,26 +394,21 @@ fn alias_in(
 pub(crate) struct TvbGrowth {
     mappings: KVec<mmu::KernelMapping>,
     addresses: KVec<u64>,
-    extensions: KVec<Extension>,
+    extensions: KVec<KernelObject>,
     /// Why the growth stopped short of its target: ENOMEM or ENOSPC.
     stopped: Option<Error>,
 }
 
-/// Blocks of one growth extension at most. A shrink gives back whole trailing extensions, so
-/// this is its step: 8 MiB, 16 periods of shrink credit, and 53 extensions in a full block table.
+/// Blocks of one growth extension at most. A shrink gives back whole trailing extensions of a
+/// NEO heap, so this is its step: 8 MiB, 16 periods of shrink credit, and 53 extensions in a
+/// full block table.
 const EXTENSION_BLOCKS: usize = 64;
 
 /// Aliases and backing of growth extensions a shrink removed from an idle
 /// heap. Field order unmaps the aliases before freeing their backing.
 pub(crate) struct TvbRelease {
     _mappings: KVec<mmu::KernelMapping>,
-    _extensions: KVec<Extension>,
-}
-
-/// One growth extension's packed blocks, and their charge to the pair's client if it has one.
-struct Extension {
-    backing: KernelObject,
-    _charge: Option<crate::memacct::Charge>,
+    _extensions: KVec<KernelObject>,
 }
 
 /// Packed 128-KiB data blocks mapped at guarded 160-KiB virtual strides.
@@ -426,7 +421,7 @@ pub(crate) struct Tvb {
     addresses: KVec<u64>,
     // Retain sparse-block backing until the pool and its aliases retire.
     _primary: KernelObject,
-    extensions: KVec<Extension>,
+    extensions: KVec<KernelObject>,
 }
 impl Tvb {
     /// Blocks are packed in the backing; only their VA placement keeps the
@@ -440,17 +435,21 @@ impl Tvb {
         }
         geometry.backing_bytes(blocks)
     }
-    /// Backing for `blocks` blocks to be mapped into `vm`. M5 blocks are mapped one by one in
-    /// the compact window, which is checked for room for all of them first, and the client's
-    /// passes and geometry size them, so they are charged to the client.
-    fn allocate(dev: &AsahiDrmDevice, vm: &mmu::Vm, geometry: BlockGeometry, blocks: usize)
-        -> Result<KernelObject> {
+    /// Backing for `blocks` blocks to be mapped into `vm`, charged to `client` if there is one
+    /// ([`KernelObject::client_backing`]). M5 blocks are mapped one by one in the compact
+    /// window, which is checked for room for all of them first.
+    fn allocate(
+        dev: &AsahiDrmDevice,
+        vm: &mmu::Vm,
+        geometry: BlockGeometry,
+        blocks: usize,
+        client: Option<&Arc<crate::memacct::Client>>,
+    ) -> Result<KernelObject> {
         let bytes = Self::backing_bytes(geometry, blocks)?;
-        if geometry == BlockGeometry::NEO {
-            return KernelObject::backing(dev, bytes, CpuMap::WriteCombined);
+        if geometry != BlockGeometry::NEO {
+            compact::PairObject::ParameterBlock.check_room(vm, geometry.block_bytes, blocks)?;
         }
-        compact::PairObject::ParameterBlock.check_room(vm, geometry.block_bytes, blocks)?;
-        KernelObject::client_backing(dev, bytes, vm.memory_client())
+        KernelObject::client_backing(dev, bytes, client)
     }
     /// Maps a NEO block in the first of `ranges` with room; other geometries have their own.
     fn map_block(
@@ -498,7 +497,10 @@ impl Tvb {
         if blocks == 0 || blocks > geometry.max_blocks() {
             return Err(ERANGE);
         }
-        let backing = Self::allocate(dev, vm, geometry, blocks)?;
+        // The client's passes and geometry size M5 blocks, so they are charged to it; a NEO
+        // heap's primary blocks are kernel memory.
+        let client = if geometry == BlockGeometry::NEO { None } else { vm.memory_client() };
+        let backing = Self::allocate(dev, vm, geometry, blocks, client)?;
         let mut mappings = KVec::with_capacity(blocks, GFP_KERNEL)?;
         let mut addresses = KVec::with_capacity(blocks, GFP_KERNEL)?;
         for index in 0..blocks {
@@ -523,23 +525,8 @@ impl Tvb {
         &self.addresses
     }
     /// Blocks of each growth extension; extensions are packed like the primary.
-    fn extension_blocks(extension: &Extension) -> usize {
-        extension.backing.size() / cfg::TVB_BLOCK_SIZE
-    }
-    /// Backing for `bytes` of growth. A client's growth is admitted against its own and the
-    /// device's memory limits (ENOMEM over one) and counted as its held memory, as its buffers
-    /// are: the client sizes it through its renders.
-    fn extension(dev: &AsahiDrmDevice, client: Option<&Arc<crate::memacct::Client>>,
-        bytes: usize) -> Result<Extension> {
-        let Some(client) = client else {
-            let backing = KernelObject::backing(dev, bytes, CpuMap::WriteCombined)?;
-            return Ok(Extension { backing, _charge: None });
-        };
-        let commit = crate::memacct::LEDGER.admit(client, bytes as u64)?;
-        let backing = KernelObject::backing_user_charged(dev, bytes)?;
-        let charge = crate::memacct::Charge::user(commit, None);
-        charge.set_held(true);
-        Ok(Extension { backing, _charge: Some(charge) })
+    fn extension_blocks(extension: &KernelObject) -> usize {
+        extension.size() / cfg::TVB_BLOCK_SIZE
     }
     /// Blocks of the primary backing, which a heap never gives back.
     fn primary_blocks(&self) -> usize {
@@ -576,15 +563,11 @@ impl Tvb {
             let (start, made) = (addresses.len(), extensions.len());
             let blocks = (added - start).min(EXTENSION_BLOCKS);
             let result = (|| {
-                // M5 blocks are mapped in the compact window: check it has room for this
-                // extension before allocating it.
-                if self.geometry != BlockGeometry::NEO {
-                    compact::PairObject::ParameterBlock.check_room(vm, self.geometry.block_bytes,
-                        blocks)?;
-                }
-                extensions.push(Self::extension(dev, vm.memory_client(),
-                    Self::backing_bytes(self.geometry, blocks)?)?, GFP_KERNEL)?;
-                let backing = &extensions.last().ok_or(EIO)?.backing;
+                // The client's renders size the growth, so it is charged to the client. Each
+                // extension is admitted, and on M5 checked for room, before it is allocated.
+                extensions.push(Self::allocate(dev, vm, self.geometry, blocks,
+                    vm.memory_client())?, GFP_KERNEL)?;
+                let backing = extensions.last().ok_or(EIO)?;
                 for relative in 0..blocks {
                     let mapping = Self::map_block(backing, vm, relative, self.geometry, &ranges)?;
                     addresses.push(mapping.iova(), GFP_KERNEL)?;

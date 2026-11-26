@@ -110,12 +110,6 @@ impl KernelObject {
         }, size)
     }
 
-    /// [`Self::backing`] write-combined that is not counted as kernel memory: the caller
-    /// charges it to a client ([`crate::memacct::Charge::user`]).
-    pub(crate) fn backing_user_charged(dev: &AsahiDrmDevice, size: usize) -> Result<Self> {
-        Self::with_object(gem::new_kernel_object_wc_user_charged(dev, size)?, size)
-    }
-
     /// Write-combined [`Self::backing`] that a client's commands size, charged to that client
     /// (`client`) as a user buffer of the same size would be: admitted against its and the
     /// device's memory limits before it is allocated, failing with ENOMEM over either, and then
