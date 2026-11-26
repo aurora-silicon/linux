@@ -980,21 +980,27 @@ struct apple_sleep {
 	/* Per-attempt M5 ANS receipt; survives platform .wake reporting. */
 	int ans_m5_wake_error;
 	int pcie_ans_on_ret;
-	int apcie_port_clk_ret[2];
 	void __iomem *apcie_axi;
 	void __iomem *apcie_cio3pll;
 	void __iomem *apcie_clkgen;
 	void __iomem *apcie_phy;
 	void __iomem *apcie_rc;
+#define APCIE_SLEEP_PORTS_MAX 4
+
 	bool apcie_port_stopped;
-	/* A real sleep left the radio's port down, until its host sets it up again */
-	bool apcie_port_down;
-	void __iomem *apcie_port;
-	void __iomem *apcie_port_phy;
 	/* Ports no host sets up again after a real sleep: no managed radio contract */
 	bool apcie_ports_unowned;
-	void __iomem *apcie_port2;
-	void __iomem *apcie_port2_phy;
+	struct {
+		void __iomem *port;
+		void __iomem *phy;
+		int idx;
+		int perst;
+		bool perst_low;
+		/* A real sleep left this port down until its host sets it up again */
+		bool down;
+		int clk_ret;
+	} apcie_ports[APCIE_SLEEP_PORTS_MAX];
+	unsigned int napcie_ports;
 	void __iomem *apcie_engine;
 	void __iomem *apcie_fabric;
 	struct apple_tunable *apcie_axi_tunable;
@@ -1344,11 +1350,40 @@ bool apple_sleep_debug_link_cut_peek(struct device *dev)
 }
 EXPORT_SYMBOL_GPL(apple_sleep_debug_link_cut_peek);
 
+/* Kept out of struct apple_sleep so pcie-apple and apple-sleep may probe in either order. */
+static bool apcie_ports_host_owned;
+
+void apple_sleep_apcie_ports_owned(bool owned)
+{
+	WRITE_ONCE(apcie_ports_host_owned, owned);
+}
+EXPORT_SYMBOL_GPL(apple_sleep_apcie_ports_owned);
+
+/* One APCIe port's host set it up again after a real sleep: the next commit may stop it. */
+void apple_sleep_apcie_port_up(unsigned int idx)
+{
+	struct apple_sleep *s = apple_sleep;
+	unsigned int i;
+
+	if (!s)
+		return;
+	for (i = 0; i < s->napcie_ports; i++) {
+		if (s->apcie_ports[i].idx == (int)idx)
+			WRITE_ONCE(s->apcie_ports[i].down, false);
+	}
+}
+EXPORT_SYMBOL_GPL(apple_sleep_apcie_port_up);
+
 /* The radio's host set its port up again after a real sleep: the next commit may stop it. */
 void apple_sleep_radio_port_up(void)
 {
-	if (apple_sleep)
-		WRITE_ONCE(apple_sleep->apcie_port_down, false);
+	struct apple_sleep *s = apple_sleep;
+	unsigned int i;
+
+	if (!s)
+		return;
+	for (i = 0; i < s->napcie_ports; i++)
+		WRITE_ONCE(s->apcie_ports[i].down, false);
 }
 EXPORT_SYMBOL_GPL(apple_sleep_radio_port_up);
 
@@ -3518,10 +3553,23 @@ static int apple_sleep_refuse(struct apple_sleep *s)
 		refused = true;
 	}
 
-	/* Only a driver takes the display to where its domain can be lowered. */
-	if (!s->display[0].bound) {
-		dev_err(s->dev, "refused: no driver bound to the display coprocessor\n");
-		refused = true;
+	/* Only a driver takes each available display to where its domain can be lowered. */
+	if (!s->display[0].np || of_device_is_available(s->display[0].np)) {
+		if (!s->display[0].bound) {
+			dev_err(s->dev, "refused: no driver bound to the display coprocessor\n");
+			refused = true;
+		}
+	} else {
+		for (i = 1; i < s->soc->ndisp; i++) {
+			if (!s->display[i].np || !of_device_is_available(s->display[i].np))
+				continue;
+			if (!s->display[i].bound) {
+				dev_err(s->dev,
+					"refused: no driver bound to external display coprocessor %d\n",
+					i - 1);
+				refused = true;
+			}
+		}
 	}
 
 	/*
@@ -4094,10 +4142,12 @@ EXPORT_SYMBOL_GPL(apple_sleep_debug_link_cut_wake);
  * the link untouched. A link that's down or a radio that's gone only makes the poll time
  * out, and the power goes next either way.
  */
-static void sleep_apcie_port_stop(struct apple_sleep *s)
+static void sleep_apcie_port_stop(struct apple_sleep *s, unsigned int i)
 {
-	void __iomem *port = s->apcie_port;
-	void __iomem *phy = s->apcie_port_phy;
+	void __iomem *port = s->apcie_ports[i].port;
+	void __iomem *phy = s->apcie_ports[i].phy;
+	int perst = s->apcie_ports[i].perst;
+	bool perst_low = s->apcie_ports[i].perst_low;
 	u32 val;
 
 	writel(readl(port + APCIE_PORT_INTMSK) | APCIE_PORT_INT_LINK, port + APCIE_PORT_INTMSK);
@@ -4110,16 +4160,16 @@ static void sleep_apcie_port_stop(struct apple_sleep *s)
 		readl_poll_timeout_atomic(port + APCIE_PORT_L2, val, !(val & APCIE_PORT_L2_BUSY),
 					  10, APCIE_PORT_STOP_US);
 	}
-	/* The radio keeps its power and firmware, in reset until its host releases it. */
-	if (s->radio_perst >= 0 && sleep_ps_on(s, s->soc->ps.gpio)) {
-		void __iomem *reg = s->pins + PIN_REG(s->radio_perst);
+	/* The endpoint keeps its power, held in reset until its host releases it. */
+	if (perst >= 0 && sleep_ps_on(s, s->soc->ps.gpio)) {
+		void __iomem *reg = s->pins + PIN_REG(perst);
 
 		val = readl(reg);
-		writel(s->radio_perst_low ? val & ~PIN_DATA : val | PIN_DATA, reg);
+		writel(perst_low ? val & ~PIN_DATA : val | PIN_DATA, reg);
 	}
 	writel(readl(phy) & ~APCIE_PORT_PHY_LINK, phy);
 
-	if (s->apcie_engine && s->apcie_fabric) {
+	if (!s->apcie_ports[i].idx && s->apcie_engine && s->apcie_fabric) {
 		writel(0, s->apcie_engine + APCIE_ENGINE_IRQ_MASK);
 		writel(3, s->apcie_fabric + APCIE_FABRIC_STOP);
 		writel(readl(s->apcie_engine + APCIE_ENGINE_CTRL) | APCIE_ENGINE_STOP,
@@ -4143,14 +4193,27 @@ static void sleep_apcie_port_stop(struct apple_sleep *s)
 	writel(readl(port + APCIE_PORT_INTSTAT), port + APCIE_PORT_INTSTAT);
 }
 
+static void sleep_apcie_ports_mark_down(struct apple_sleep *s)
+{
+	unsigned int i;
+
+	for (i = 0; i < s->napcie_ports; i++)
+		WRITE_ONCE(s->apcie_ports[i].down, true);
+}
+
 static void sleep_apcie_port_stop_once(struct apple_sleep *s)
 {
-	/* Only with the port set up, by the loader or by its host after a wake, or it aborts. */
-	if (s->apcie_port_stopped || s->apcie_port_down || !s->apcie_port || !s->apcie_port_phy ||
+	unsigned int i;
+
+	/* Only with ports set up, by the loader or by their host after a wake, or it aborts. */
+	if (s->apcie_port_stopped || !s->napcie_ports ||
 	    !sleep_ps_on(s, s->soc->ps.apcie_gp) || !sleep_ps_on(s, s->soc->ps.apcie_phy_sw))
 		return;
 	s->apcie_port_stopped = true;
-	sleep_apcie_port_stop(s);
+	for (i = 0; i < s->napcie_ports; i++) {
+		if (!READ_ONCE(s->apcie_ports[i].down))
+			sleep_apcie_port_stop(s, i);
+	}
 }
 
 /*
@@ -6098,7 +6161,7 @@ static void t8140_wake(struct apple_sleep *s)
 	 */
 	if (s->pcie_ans_stopped)
 		s->pcie_ans_on_ret = apple_sleep_raise_apcie(s);
-	s->apcie_port_down = true;
+	sleep_apcie_ports_mark_down(s);
 	s->pins_lost = s->pins_saved_valid;
 }
 
@@ -6134,7 +6197,7 @@ static void t8132_wake(struct apple_sleep *s)
 {
 	const struct apple_sleep_soc *soc = s->soc;
 	u32 val;
-	int i;
+	unsigned int i;
 
 	writel(CLUSTER_ON, s->cluster + soc->cluster_cpu[0]);
 	s->cluster_e_ret = readl_poll_timeout_atomic(s->cluster + soc->cluster_cpu[0], val,
@@ -6168,15 +6231,15 @@ static void t8132_wake(struct apple_sleep *s)
 
 	if (s->pcie_ans_stopped)
 		s->pcie_ans_on_ret = apple_sleep_raise_apcie(s);
-	s->apcie_port_clk_ret[0] = 0;
-	s->apcie_port_clk_ret[1] = 0;
-	if (s->pcie_ans_stopped && !s->pcie_ans_on_ret && s->apcie_ports_unowned) {
-		s->apcie_port_clk_ret[0] = sleep_apcie_port_clock(s->apcie_port,
-								  s->apcie_port_phy);
-		s->apcie_port_clk_ret[1] = sleep_apcie_port_clock(s->apcie_port2,
-								  s->apcie_port2_phy);
+	for (i = 0; i < s->napcie_ports; i++) {
+		s->apcie_ports[i].clk_ret = 0;
+		if (s->pcie_ans_stopped && !s->pcie_ans_on_ret &&
+		    s->apcie_ports_unowned && !READ_ONCE(apcie_ports_host_owned))
+			s->apcie_ports[i].clk_ret =
+				sleep_apcie_port_clock(s->apcie_ports[i].port,
+						       s->apcie_ports[i].phy);
 	}
-	s->apcie_port_down = true;
+	sleep_apcie_ports_mark_down(s);
 	s->pins_lost = s->pins_saved_valid;
 }
 
@@ -7261,12 +7324,12 @@ static void apple_sleep_report(void)
 	if (s->pcie_ans_stopped && s->pcie_ans_on_ret)
 		dev_err(s->dev, "ANS's PCIe block did not come up after the wake: %d\n",
 			s->pcie_ans_on_ret);
-	if (s->apcie_port_clk_ret[0])
-		dev_err(s->dev, "PCIe port 0's PHY clocks did not ack after the wake: %d\n",
-			s->apcie_port_clk_ret[0]);
-	if (s->apcie_port_clk_ret[1])
-		dev_err(s->dev, "PCIe port 2's PHY clocks did not ack after the wake: %d\n",
-			s->apcie_port_clk_ret[1]);
+	for (i = 0; i < s->napcie_ports; i++) {
+		if (s->apcie_ports[i].clk_ret)
+			dev_err(s->dev,
+				"PCIe port %d's PHY clocks did not ack after the wake: %d\n",
+				s->apcie_ports[i].idx, s->apcie_ports[i].clk_ret);
+	}
 }
 
 static int apple_sleep_valid(suspend_state_t state)
@@ -7628,11 +7691,68 @@ static void apple_sleep_map_apcie(struct apple_sleep *s)
 		s->apcie_axi = NULL;
 	}
 
-	s->apcie_port = apple_sleep_apcie_block(s, np, "port0", NULL, NULL);
-	s->apcie_port_phy = apple_sleep_apcie_block(s, np, "phy0", NULL, NULL);
-	s->apcie_port2 = apple_sleep_apcie_block(s, np, "port2", NULL, NULL);
-	s->apcie_port2_phy = apple_sleep_apcie_block(s, np, "phy2", NULL, NULL);
 	s->apcie_ports_unowned = !of_property_present(np, "apple,managed-sids");
+	if (of_device_is_available(np)) {
+		struct device_node *child;
+
+		for_each_available_child_of_node(np, child) {
+			char pname[16], phyname[16];
+			void __iomem *port, *phy;
+			u32 reg;
+
+			if (s->napcie_ports >= APCIE_SLEEP_PORTS_MAX) {
+				of_node_put(child);
+				break;
+			}
+			if (of_property_read_u32_index(child, "reg", 0, &reg))
+				continue;
+			snprintf(pname, sizeof(pname), "port%u", reg >> 11);
+			snprintf(phyname, sizeof(phyname), "phy%u", reg >> 11);
+			port = apple_sleep_apcie_block(s, np, pname, NULL, NULL);
+			phy = apple_sleep_apcie_block(s, np, phyname, NULL, NULL);
+			if (!port || !phy) {
+				if (port)
+					iounmap(port);
+				if (phy)
+					iounmap(phy);
+				continue;
+			}
+			s->apcie_ports[s->napcie_ports].port = port;
+			s->apcie_ports[s->napcie_ports].phy = phy;
+			s->apcie_ports[s->napcie_ports].idx = reg >> 11;
+			s->apcie_ports[s->napcie_ports].perst = -1;
+			s->napcie_ports++;
+		}
+	}
+	if (!s->napcie_ports) {
+		static const unsigned int fallback_ports[] = { 0, 2 };
+		unsigned int j;
+
+		for (j = 0; j < ARRAY_SIZE(fallback_ports); j++) {
+			unsigned int idx = fallback_ports[j];
+			char pname[16], phyname[16];
+			void __iomem *port, *phy;
+
+			if (idx && !s->apcie_ports_unowned)
+				continue;
+			snprintf(pname, sizeof(pname), "port%u", idx);
+			snprintf(phyname, sizeof(phyname), "phy%u", idx);
+			port = apple_sleep_apcie_block(s, np, pname, NULL, NULL);
+			phy = apple_sleep_apcie_block(s, np, phyname, NULL, NULL);
+			if (!port || !phy) {
+				if (port)
+					iounmap(port);
+				if (phy)
+					iounmap(phy);
+				continue;
+			}
+			s->apcie_ports[s->napcie_ports].port = port;
+			s->apcie_ports[s->napcie_ports].phy = phy;
+			s->apcie_ports[s->napcie_ports].idx = idx;
+			s->apcie_ports[s->napcie_ports].perst = -1;
+			s->napcie_ports++;
+		}
+	}
 	engine = of_parse_phandle(np, "apple,piodma", 0);
 	if (engine) {
 		s->apcie_engine = apple_sleep_apcie_block(s, engine, "engine", NULL, NULL);
@@ -7642,7 +7762,54 @@ static void apple_sleep_map_apcie(struct apple_sleep *s)
 	of_node_put(np);
 }
 
-/* The radio port's PERST# on the AP pins @np, from the ports of the SoC's enabled PCIe host. */
+/* Return whether a PCIe root port carries the wireless radio. */
+static bool apple_sleep_port_is_radio(struct device_node *port)
+{
+	struct device_node *wifi, *child;
+
+	wifi = of_find_node_by_path("wifi0");
+	if (wifi) {
+		struct device_node *parent = of_get_parent(wifi);
+		bool match = (parent == port);
+
+		of_node_put(parent);
+		of_node_put(wifi);
+		if (match)
+			return true;
+	}
+
+	for_each_child_of_node(port, child) {
+		if (of_node_name_eq(child, "wifi") ||
+		    of_node_name_eq(child, "bluetooth")) {
+			of_node_put(child);
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static void apple_sleep_set_apcie_perst(struct apple_sleep *s, struct device_node *port,
+					u32 pin, bool active_low)
+{
+	u32 reg;
+	unsigned int i;
+
+	if (s->radio_perst < 0 && apple_sleep_port_is_radio(port)) {
+		s->radio_perst = pin;
+		s->radio_perst_low = active_low;
+	}
+	if (of_property_read_u32_index(port, "reg", 0, &reg))
+		return;
+	for (i = 0; i < s->napcie_ports; i++) {
+		if (s->apcie_ports[i].idx == (int)(reg >> 11)) {
+			s->apcie_ports[i].perst = pin;
+			s->apcie_ports[i].perst_low = active_low;
+		}
+	}
+}
+
+/* The ports' PERST# on the AP pins @np, from the ports of the SoC's enabled PCIe host. */
 static void apple_sleep_find_radio_perst(struct apple_sleep *s, struct device_node *np)
 {
 	struct device_node *host, *port;
@@ -7657,10 +7824,9 @@ static void apple_sleep_find_radio_perst(struct apple_sleep *s, struct device_no
 						       &args))
 				continue;
 			if (args.np == np && args.args_count >= 2 && args.args[0] < s->npins &&
-			    !test_bit(args.args[0], s->pins_skip)) {
-				s->radio_perst = args.args[0];
-				s->radio_perst_low = args.args[1] & GPIO_ACTIVE_LOW;
-			}
+			    !test_bit(args.args[0], s->pins_skip))
+				apple_sleep_set_apcie_perst(s, port, args.args[0],
+							    args.args[1] & GPIO_ACTIVE_LOW);
 			of_node_put(args.np);
 		}
 	}
@@ -9638,7 +9804,7 @@ static void t8142_wake(struct apple_sleep *s)
 	if (s->radio_trainable)
 		s->radio_train_ret = s->pcie_ans_stopped && !s->pcie_ans_on_ret ?
 				     apple_sleep_radio_train(s) : -ENOLINK;
-	s->apcie_port_down = true;
+	sleep_apcie_ports_mark_down(s);
 	s->pins_lost = s->pins_saved_valid;
 }
 
