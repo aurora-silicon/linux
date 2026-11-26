@@ -152,7 +152,7 @@ impl Graph {
             alloc,
             Family::QueueState,
             GRAPH_SIZE,
-            0,
+            if m5 { 0 } else { 0x8000 }, // HACK qsc: pre-#3170 cached record prefix on G17P
             prot,
             CpuMap::WriteCombined,
         )?;
