@@ -98,7 +98,11 @@ impl WorkStates {
 
 /// How far past the oldest waiting ioctl a new ioctl may be ordered: the ordinals past the
 /// turn remembered for ioctls that left early.
-pub(super) const ORDER_WINDOW: u64 = 1024;
+pub(super) const ORDER_WINDOW: u64 = 2048;
+
+/// Cap for extra work-state splits inside multi-command ioctls, keeping the upper half of
+/// [`ORDER_WINDOW`] permanently reserved for new ioctls.
+pub(super) const ORDER_SPLIT_LIMIT: u64 = ORDER_WINDOW / 2;
 
 /// The order in which a context's ioctls take work-state nodes.
 ///
@@ -146,6 +150,14 @@ impl Order {
         let ordinal = self.next;
         self.next += 1;
         Some(ordinal)
+    }
+    /// The ordinal of an extra work-state split within a multi-command ioctl. None once
+    /// [`ORDER_SPLIT_LIMIT`] ordinals are ahead of the turn so new ioctls keep full headroom.
+    pub(super) fn assign_split(&mut self) -> Option<u64> {
+        if self.next - self.turn >= ORDER_SPLIT_LIMIT {
+            return None;
+        }
+        self.assign()
     }
     /// Whether the ioctl `ordinal` may take its node now: only at its turn. A refusal is
     /// remembered until the turn next moves, so that move wakes the refused publisher.
@@ -388,6 +400,19 @@ mod tests {
         assert!(order.admits(first));
         assert!(!order.admit(first));
         assert!(order.assign().is_some());
+    }
+
+    #[test]
+    fn split_ordinals_reserve_half_the_window_for_new_ioctls() {
+        let mut order = Order::new();
+        for _ in 0..ORDER_SPLIT_LIMIT {
+            assert!(order.assign_split().is_some());
+        }
+        assert!(order.assign_split().is_none());
+        for _ in ORDER_SPLIT_LIMIT..ORDER_WINDOW {
+            assert!(order.assign().is_some());
+        }
+        assert!(order.assign().is_none());
     }
 
     #[test]
