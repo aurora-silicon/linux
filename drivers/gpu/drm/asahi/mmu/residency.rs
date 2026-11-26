@@ -133,6 +133,61 @@ impl Gate {
         }
     }
 
+    /// Acquires `count` residency leases under a single lock acquisition when not evicted.
+    pub(crate) fn enter_many(
+        gate: &Arc<Self>,
+        count: usize,
+        mut restore: impl FnMut() -> Result,
+    ) -> Result<KVec<Lease>> {
+        let mut leases = KVec::with_capacity(count, GFP_KERNEL)?;
+        if count == 0 {
+            return Ok(leases);
+        }
+        loop {
+            let mut state = gate.state.lock();
+            if state.closed {
+                return Err(ENOENT);
+            }
+            while state.busy {
+                if gate.ready.wait_interruptible(&mut state) {
+                    return Err(ERESTARTSYS);
+                }
+            }
+            if state.closed {
+                return Err(ENOENT);
+            }
+            if !state.evicted {
+                state.users = state.users.checked_add(count).ok_or(EOVERFLOW)?;
+                drop(state);
+                for _ in 0..count {
+                    let _ = leases.push_within_capacity(Lease { gate: gate.clone() });
+                }
+                return Ok(leases);
+            }
+            if state.users != 0 {
+                if gate.ready.wait_interruptible(&mut state) {
+                    return Err(ERESTARTSYS);
+                }
+                continue;
+            }
+            state.busy = true;
+            drop(state);
+            let started = now_ns();
+            let result = restore();
+            let mut state = gate.state.lock();
+            state.busy = false;
+            if result.is_ok() {
+                state.evicted = false;
+                let now = now_ns();
+                state.restored_at = now;
+                state.restore_cost = now.saturating_sub(started);
+            }
+            drop(state);
+            gate.ready.notify_all();
+            result?;
+        }
+    }
+
     pub(crate) fn enter_metadata(gate: &Arc<Self>) -> Result<Lease> {
         let mut state = gate.state.lock();
         while state.busy {
@@ -437,6 +492,13 @@ impl Vm {
         self.residency
             .as_ref()
             .map(|gate| Gate::enter(gate, || self.restore_idle_pages()))
+            .transpose()
+    }
+
+    pub(super) fn enter_residency_many(&self, count: usize) -> Result<Option<KVec<Lease>>> {
+        self.residency
+            .as_ref()
+            .map(|gate| Gate::enter_many(gate, count, || self.restore_idle_pages()))
             .transpose()
     }
 
