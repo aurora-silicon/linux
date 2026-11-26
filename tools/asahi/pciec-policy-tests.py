@@ -682,6 +682,9 @@ struct apple_cio_hw {
     bool sleep_removes_domains;
     bool restart_on_wake;
     bool phy_shared_with_dwc3;
+    bool psd_power_cycle;
+    bool stop_at_reboot;
+    bool sleep_router_on_stop;
     const struct apple_dpin_policy *dp;
 };
 struct notifier_block { int (*notifier_call)(void); int priority; };
@@ -761,6 +764,7 @@ int main(void)
     assert(t8122->sleep_removes_domains && t8103->sleep_removes_domains);
     assert(t8122->restart_on_wake && t8103->restart_on_wake);
     assert(t8122->phy_shared_with_dwc3 && t8103->phy_shared_with_dwc3);
+    assert(t8103->psd_power_cycle && t8103->stop_at_reboot && t8103->sleep_router_on_stop);
     assert(t8122->dp == &apple_dpin_m1 && t8103->dp == &apple_dpin_m1);
 
     struct apple_cio acio_t8122 = { .hw = t8122 };

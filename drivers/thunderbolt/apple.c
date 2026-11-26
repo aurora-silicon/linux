@@ -176,6 +176,11 @@ struct apple_cio_hw {
 	bool psd_power_cycle;
 	/* Stop a started router before a reboot shuts its PCIe and DARTs down. */
 	bool stop_at_reboot;
+	/*
+	 * Put the host router into ACIO sleep before powering off its domains,
+	 * and detach the RTKit mailbox before freeing it.
+	 */
+	bool sleep_router_on_stop;
 	/* Deep sleep removes the CIO domains, including an attached router. */
 	bool sleep_removes_domains;
 	/* Start the router again at once after a wake. */
@@ -192,12 +197,16 @@ struct apple_cio_hw {
  * T8103 deep sleep removes the CIO power domains and shares the ATC PHY with
  * DWC3. Tear down a connected router before tasks freeze (ahead of DWC3's PM
  * notifier) and request fresh cable state immediately on wake; s2idle and
- * freeze leave the port up.
+ * freeze leave the port up. Put the host router into ACIO sleep before
+ * powering off the CIO power domain, and stop a started router before reboot.
  */
 static const struct apple_cio_hw apple_cio_t8103_hw = {
 	.sleep_removes_domains = true,
 	.restart_on_wake = true,
 	.phy_shared_with_dwc3 = true,
+	.psd_power_cycle = true,
+	.stop_at_reboot = true,
+	.sleep_router_on_stop = true,
 	.dp = &apple_dpin_m1,
 };
 
@@ -1544,6 +1553,7 @@ struct apple_nhi {
 };
 
 static int apple_nhi_cio_bind(struct apple_nhi *anhi);
+static int apple_nhi_cio_router_sleep(struct tb_nhi *nhi);
 static int apple_nhi_cio_prepare(struct apple_nhi *anhi);
 static int apple_nhi_cio_suspend(struct apple_nhi *anhi);
 static int apple_nhi_cio_resume(struct apple_nhi *anhi);
@@ -3213,6 +3223,30 @@ static struct platform_device *apple_cio_find_pcie_tunnel(struct apple_cio *acio
 	return pdev;
 }
 
+static void apple_cio_sleep_router_for_stop(struct apple_cio *acio)
+{
+	struct platform_device *nhi_pdev;
+	struct apple_nhi *anhi;
+	int ret;
+
+	lockdep_assert_held(&acio->lock);
+	nhi_pdev = READ_ONCE(acio->nhi_pdev);
+	if (!nhi_pdev)
+		return;
+	device_lock(&nhi_pdev->dev);
+	if (READ_ONCE(acio->nhi_pdev) == nhi_pdev) {
+		anhi = platform_get_drvdata(nhi_pdev);
+		if (anhi && anhi->tb && anhi->tb->root_switch) {
+			scoped_guard(mutex, &anhi->tb->lock)
+				ret = apple_nhi_cio_router_sleep(&anhi->nhi);
+			if (ret)
+				dev_warn(acio->dev,
+					 "CIO router sleep before stop failed: %d\n", ret);
+		}
+	}
+	device_unlock(&nhi_pdev->dev);
+}
+
 static void apple_cio_remove_children(struct apple_cio *acio)
 {
 	struct platform_device *nhi_pdev;
@@ -3225,6 +3259,14 @@ static void apple_cio_remove_children(struct apple_cio *acio)
 	 * when they acquire pcie_tunnel_lock.
 	 */
 	apple_cio_stop_pcie_tunnel(acio);
+
+	/*
+	 * Put the host router firmware into ACIO sleep before tearing down the
+	 * NHI and powering off the CIO power domain. On T8103, dropping the
+	 * CIO domain while the firmware is still active triggers a SoC reset.
+	 */
+	if (acio->hw->sleep_router_on_stop)
+		apple_cio_sleep_router_for_stop(acio);
 
 	/*
 	 * The NHI is the tunnel control plane. Stop it while the tunneled PCIe
@@ -3427,6 +3469,8 @@ static void apple_cio_stop(struct apple_cio *acio)
 	if (ret)
 		dev_warn(acio->dev,
 			 "Failed to shutdown M3 RTKit, continuing ACIO shutdown anyway\n");
+	if (acio->hw->sleep_router_on_stop)
+		apple_rtkit_mailbox_off(acio->rtk);
 	apple_rtkit_free(acio->rtk);
 	acio->rtk = NULL;
 	apple_cio_cpu_halt(acio);
