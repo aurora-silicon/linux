@@ -3,9 +3,10 @@
 //! Module parameters and the GET_PARAMS identity.
 //!
 //! With the shared `file.rs` additions (VM_STATUS and VM_STATUS_MIRROR from `supports_vm_status`,
-//! INDEPENDENT_QUEUES from `queue_limits`, SOFT_FAULTS suppressed by `soft_faults`), the feature
-//! word is exactly 0x3e (0xbe with `g15_early_tiling`). Never advertise SOFT_FAULTS,
-//! FEW_PRIMITIVES or RENDER_RAY_QUERY on G15S.
+//! INDEPENDENT_QUEUES from `queue_limits`, SOFT_FAULTS suppressed by `soft_faults`, and
+//! VDM_USC_INVALIDATE, bit 40 in both numberings), the feature word is exactly 0x3e (0xbe with
+//! `g15_early_tiling`) plus bit 40. Never advertise SOFT_FAULTS, FEW_PRIMITIVES or
+//! RENDER_RAY_QUERY on G15S.
 
 use kernel::prelude::*;
 

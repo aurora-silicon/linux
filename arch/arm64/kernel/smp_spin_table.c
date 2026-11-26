@@ -222,6 +222,9 @@ int spin_table_hold_parked(void)
 	int us, ret;
 	unsigned int cpu;
 
+	/* No CPU restarted from here to the wake may pass the pen without its own bring-up. */
+	write_pen_release(INVALID_HWID);
+
 	for_each_present_cpu(cpu)
 		WRITE_ONCE(spin_table_hold_error[cpu], 0);
 	WRITE_ONCE(spin_table_hold_generation, READ_ONCE(spin_table_hold_generation) + 1);
@@ -331,6 +334,8 @@ void spin_table_stop_finished(void)
 	/* Before any CPU is started again: the pen must let them boot. */
 	if (secondary_pen_deep)
 		spin_table_pen_deep_set(0);
+	/* ...but only the one its bring-up releases (cores started early wait in the pen). */
+	write_pen_release(INVALID_HWID);
 	WRITE_ONCE(spin_table_hold_requested, false);
 	WRITE_ONCE(spin_table_stop_requested, false);
 	WRITE_ONCE(spin_table_stop_released, false);
@@ -473,6 +478,14 @@ static int smp_rvbar_spin_table_cpu_kill(unsigned int cpu)
 
 static void smp_rvbar_spin_table_postboot(void)
 {
+	/*
+	 * Close the pen behind this CPU. Left at its MPIDR, the next restart at the reset vector
+	 * (after a sleep's commit, or a platform that starts every core at once at the wake)
+	 * lets it straight through the pen into secondary_startup ahead of its own bring-up,
+	 * with the secondary_data of its last boot: it then runs as that CPU with no STARTING
+	 * callbacks run, e.g. without a tick device.
+	 */
+	write_pen_release(INVALID_HWID);
 	cpumask_clear_cpu(smp_processor_id(), &spin_table_cpus_off);
 	if (READ_ONCE(spin_table_power) && spin_table_power->cpu_restore)
 		spin_table_power->cpu_restore(read_cpuid_mpidr() & MPIDR_HWID_BITMASK);

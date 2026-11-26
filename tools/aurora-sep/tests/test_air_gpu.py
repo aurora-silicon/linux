@@ -174,6 +174,7 @@ ESP='{self.esp}'
 STATE_DIR='{self.state}'
 CMDLINE='{self.cmdline}'
 LOCKS='{self.tmp}/run/boot-partition.lock {self.tmp}/run/limine-global.lock'
+COMPAT_LOCKS=''
 LIMINE_DEFAULTS='{self.tmp}/etc/limine'
 KREL='{KREL}'
 is_root() {{ {'true' if root else 'false'}; }}
