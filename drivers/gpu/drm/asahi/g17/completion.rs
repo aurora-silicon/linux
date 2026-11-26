@@ -222,12 +222,18 @@ struct Output {
 }
 
 impl Output {
-    fn publish(&self, result: Result<[u64; 4]>) {
+    /// `status` is the command's VM status.
+    fn publish(&self, result: Result<[u64; 4]>, status: &VmStatus) {
         match result {
-            Ok(ticks) => self.destinations.write(ticks),
-            Err(error) => self.fence.set_error(error),
+            Ok(ticks) => {
+                self.destinations.write(ticks);
+                self.fence.signal();
+            }
+            Err(error) => status.signal_failure(|| {
+                self.fence.set_error(error);
+                self.fence.signal();
+            }),
         }
-        self.fence.signal();
         self.member.complete(result.map(|_| ()));
     }
 }
@@ -276,9 +282,9 @@ impl HostOutput {
         }
     }
 
-    pub(super) fn finish(&self, result: Result<[u64; 4]>) {
+    pub(super) fn finish(&self, result: Result<[u64; 4]>, status: &VmStatus) {
         match &self.0 {
-            HostOutputKind::Immediate(output) => output.publish(result),
+            HostOutputKind::Immediate(output) => output.publish(result, status),
             HostOutputKind::Ordered(publication) => publication.finish(result),
         }
     }
@@ -950,7 +956,7 @@ impl Completion {
         }
         self.release_healthy();
         self.signal_terminal(result);
-        self.output.finish(result);
+        self.output.finish(result, &self.status);
         // Feed detector and busy-run tracking are internal host heuristics: update them
         // after signalling the fence so their spinlocks stay off the wakeup critical path.
         if let (Some(feed), Ok(ticks)) = (&self.feed, &result) {
@@ -985,7 +991,7 @@ impl Completion {
         }
         self.release_healthy();
         self.signal_terminal(Err(error));
-        self.output.finish(Err(error));
+        self.output.finish(Err(error), &self.status);
     }
 
     /// The physical queue must already be quarantined. Keep mappings pinned while
@@ -1006,7 +1012,7 @@ impl Completion {
             self.report(error);
         }
         self.signal_terminal(Err(error));
-        self.output.finish(Err(error));
+        self.output.finish(Err(error), &self.status);
     }
 }
 
