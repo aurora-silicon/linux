@@ -1510,6 +1510,12 @@ static const struct apple_sleep_soc t6030_sleep_soc = {
 	.cpu_clusters = 2,
 	.cpu_cores_per_cluster = 6,
 	.cpu_start_stride = 6,
+	/*
+	 * MEAS t5 (wake.tsv +20.87..21.04 ms): macOS starts each core with three writes, its
+	 * stop-bit-numbered bit at +0x4, then +0x8 and +0xc, its own bit in its cluster's, 0 in
+	 * the other's
+	 */
+	.cpu_start_every_cluster = true,
 	.cluster_cpu = { T6030_CLUSTER_E, T6030_CLUSTER_P },
 	.ncluster_cpu = 2,
 	/* DCP, then the external DCPs; macOS lowers the internal one first, then 1, then 0 */

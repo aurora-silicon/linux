@@ -716,6 +716,8 @@ struct apple_sleep_soc {
 	unsigned int ncluster_cpu;
 	/* "cpu-start": a core's bit is BIT(cpu_start_stride * cluster + core). */
 	unsigned int cpu_start_stride;
+	/* A core's start also writes every other cluster's start word, with 0 */
+	bool cpu_start_every_cluster;
 	/* In "clk-mux": parked in this order before the commit, with this value */
 	u32 clk_mux_parked[SLEEP_CLK_MUX_MAX];
 	unsigned int nclk_mux_parked;
@@ -2917,7 +2919,14 @@ static int sleep_cpu_on(u64 mpidr)
 	}
 
 	writel(sleep_cpu_start_bit(s, mpidr), s->cpu_start + CPU_START_SYS);
-	writel(BIT(core), s->cpu_start + CPU_START_CLUSTER(cluster));
+	if (s->soc->cpu_start_every_cluster) {
+		unsigned int c;
+
+		for (c = 0; c < s->soc->cpu_clusters; c++)
+			writel(c == cluster ? BIT(core) : 0, s->cpu_start + CPU_START_CLUSTER(c));
+	} else {
+		writel(BIT(core), s->cpu_start + CPU_START_CLUSTER(cluster));
+	}
 
 	if (!trace)
 		return 0;
