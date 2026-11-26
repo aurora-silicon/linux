@@ -9,6 +9,7 @@
  * Copyright The Asahi Linux Contributors
  */
 
+#define T6050_K116S
 #include "t6050-k114-k116.dtsi"
 
 / {
@@ -19,9 +20,6 @@
 &mtp_multitouch {
 	firmware-name = "apple/tpmtfw-k116s.bin";
 };
-
-#define T6050_K116S
-#include "t6050-peripherals.dtsi"
 
 / {
 	aliases {
