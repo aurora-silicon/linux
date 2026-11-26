@@ -1266,6 +1266,7 @@ struct apple_dcp {
 		unsigned int queued;
 		bool stopped;
 		bool presentation_paused;
+		bool peer_paused;
 		bool backlight_queued;
 		atomic_t opaque_x_state;
 		struct iomfb_scanout_h17p *scanout;
@@ -1376,6 +1377,7 @@ bool iomfb_present_brightness_only_h17p(struct apple_dcp *dcp);
 bool iomfb_present_complete_h17p(struct apple_dcp *dcp);
 void iomfb_present_failed_h17p(struct apple_dcp *dcp);
 bool iomfb_retire_dropped_present_h17p(struct apple_dcp *dcp);
+bool iomfb_retire_stalled_present_h17p(struct apple_dcp *dcp);
 bool iomfb_present_has_surface_h17p(const struct dcp_swap_submit_req_h17p *request);
 bool iomfb_apply_backlight_h17p(struct apple_dcp *dcp,
 				const struct dcp_swap_submit_req_h17p *request,
@@ -1394,6 +1396,7 @@ void iomfb_reset_transport(struct apple_dcp *dcp);
 bool iomfb_queue_drain(struct apple_dcp *dcp, unsigned long timeout);
 int iomfb_queue_settle(struct apple_dcp *dcp, unsigned long timeout);
 void iomfb_pause_presentation(struct apple_dcp *dcp, bool pause);
+void iomfb_pause_peer(struct apple_dcp *dcp, bool pause);
 int iomfb_external_power_h17p(struct apple_dcp *dcp, bool on);
 int iomfb_queue(struct apple_dcp *dcp, struct iomfb_transaction *transaction);
 void iomfb_queue_crc_h17p(struct apple_dcp *dcp, u32 swap_id);

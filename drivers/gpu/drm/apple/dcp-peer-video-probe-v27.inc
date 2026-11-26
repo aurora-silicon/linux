@@ -130,7 +130,7 @@ static int dcp_peer_install_video_v27(struct apple_dcp *dcp, struct apple_dcp *p
 		if (install == 4 && (dcp->peer_tiling.vftg || peer->peer_tiling.vftg)) {
 			u8 power[16] = {1}, response[8];
 
-			ret = dcp_peer_probe_quiesce(dcp, peer);
+			ret = dcp_peer_probe_quiesce(dcp, peer, false);
 			if (ret)
 				return ret;
 			/* A mode-only DRM commit does not call CRTC poweron again. */
@@ -141,7 +141,7 @@ static int dcp_peer_install_video_v27(struct apple_dcp *dcp, struct apple_dcp *p
 		}
 		return -EOPNOTSUPP;
 	}
-	ret = dcp_peer_probe_quiesce(dcp, peer);
+	ret = dcp_peer_probe_quiesce(dcp, peer, false);
 	if (ret)
 		return ret;
 	insert.video = resp.video;

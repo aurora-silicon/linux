@@ -80,9 +80,11 @@ int dcp_peer_check_v27(struct apple_dcp *dcp, struct drm_atomic_commit *commit,
 		       struct drm_crtc_state *crtc_state);
 int dcp_peer_color_v27(struct apple_dcp *dcp, struct iomfb_set_matrix_req *matrix);
 int dcp_peer_stop_v27(struct apple_dcp *dcp);
+int dcp_peer_stop_wait_v27(struct apple_dcp *dcp, unsigned int timeout_ms);
 struct apple_dcp *dcp_peer_scanout_v27(struct apple_dcp *dcp);
 void dcp_peer_swap_armed_v27(struct apple_dcp *dcp, u32 id);
 void dcp_peer_swap_failed_v27(struct apple_dcp *dcp);
+void dcp_peer_record_retired_v27(struct apple_dcp *dcp, u32 swap_id);
 bool dcp_peer_swap_complete_v27(struct apple_dcp *dcp, u32 id, ktime_t now, bool shown,
 				void (*report)(struct apple_dcp *, u32, ktime_t, bool));
 int dcp_set_crc(struct drm_crtc *crtc, bool enabled);

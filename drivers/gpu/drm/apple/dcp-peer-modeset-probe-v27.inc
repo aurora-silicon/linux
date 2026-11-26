@@ -40,7 +40,36 @@ static int dcp_peer_probe_power(struct apple_dcp *dcp, struct apple_dcp *peer,
 	return ret;
 }
 
-static int dcp_peer_probe_quiesce(struct apple_dcp *dcp, struct apple_dcp *peer)
+static void dcp_peer_sync_retired_v27(struct apple_dcp *dcp,
+				      struct apple_dcp *peer)
+{
+	u32 retired[IOMFB_DROPPED_MAX];
+	unsigned int i, count;
+	bool has_aborted;
+	u32 aborted_id;
+
+	scoped_guard(mutex, &dcp->iomfb.lock) {
+		count = dcp->present_state_h17p.nr_retired;
+		for (i = 0; i < count && i < IOMFB_DROPPED_MAX; i++)
+			retired[i] = dcp->present_state_h17p.retired[i];
+		has_aborted = dcp->present_state_h17p.has_last_aborted;
+		aborted_id = dcp->present_state_h17p.last_aborted;
+	}
+	if (!count && !has_aborted)
+		return;
+	scoped_guard(mutex, &peer->iomfb.lock) {
+		for (i = 0; i < count && i < IOMFB_DROPPED_MAX; i++)
+			dcp_present_record_retired_h17p(&peer->present_state_h17p,
+							retired[i]);
+		if (has_aborted) {
+			peer->present_state_h17p.has_last_aborted = true;
+			peer->present_state_h17p.last_aborted = aborted_id;
+		}
+	}
+}
+
+static int dcp_peer_probe_quiesce(struct apple_dcp *dcp, struct apple_dcp *peer,
+				  bool invalidate_mode)
 {
 	__le32 manage = 0;
 	int ret;
@@ -48,9 +77,19 @@ static int dcp_peer_probe_quiesce(struct apple_dcp *dcp, struct apple_dcp *peer)
 	/* Setting the digital-out mode: pair API power0, 100ms,
 	 * then manage_elements(false), A362, on each engine before A365.
 	 * Only discard AP state after both engines have acknowledged power0.
+	 *
+	 * On a paired stop (invalidate_mode == true), invalidate mode_state
+	 * before clearing modeset_complete or peer_frames.active:
+	 *  - if a power-off RPC fails mid-quiesce, unpausing presentation
+	 *    will not let a later flip hit dcp_peer_scanout_v27() -> -EIO;
+	 *  - once peer_frames.active clears, a concurrent iomfb_poweroff()
+	 *    cannot observe !peer_frames.active with a still-valid mode and
+	 *    issue a single-pipe clear swap on the stopped pipe.
 	 */
 	{
 		guard(mutex)(&dcp_peer_lock);
+		if (invalidate_mode)
+			dcp_mode_invalidate(&dcp->mode_state);
 		dcp->peer_tiling.modeset_complete = peer->peer_tiling.modeset_complete = false;
 	}
 	ret = dcp_peer_probe_power(dcp, peer, false);
@@ -63,8 +102,16 @@ static int dcp_peer_probe_quiesce(struct apple_dcp *dcp, struct apple_dcp *peer)
 	ret = dcp_peer_video_call(peer, "A362", &manage, sizeof(manage), NULL, 0);
 	if (ret)
 		return ret;
+	/*
+	 * Propagate any retired swap IDs to the peer before clearing
+	 * peer_frames.active so a late peer completion cannot fall through to
+	 * the single-pipe handler and mark the peer crashed.
+	 */
+	dcp_peer_sync_retired_v27(dcp, peer);
 	{
 		guard(mutex)(&dcp_peer_lock);
+		/* Pair with smp_load_acquire() in dcp_peer_stop_v27() so mode_state.valid == false is visible first. */
+		smp_wmb();
 		dcp->peer_frames = (struct dcp_peer_frames_v27){};
 		dcp->peer_tiling.member = peer->peer_tiling.member = false;
 		dcp->peer_tiling.vftg = peer->peer_tiling.vftg = false;

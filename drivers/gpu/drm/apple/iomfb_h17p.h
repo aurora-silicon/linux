@@ -107,6 +107,26 @@ dcp_present_retire_h17p(struct dcp_present_state_h17p *state, u32 swap_id)
 	return true;
 }
 
+/* Record a retired paired present ID on a peer engine so a late completion
+ * arriving after the pair stops is ignored instead of crashing the peer.
+ */
+static inline void
+dcp_present_record_retired_h17p(struct dcp_present_state_h17p *state,
+				u32 swap_id)
+{
+	unsigned int i;
+
+	for (i = 0; i < state->nr_retired; i++)
+		if (state->retired[i] == swap_id)
+			return;
+	if (state->nr_retired >= IOMFB_DROPPED_MAX) {
+		for (i = 1; i < IOMFB_DROPPED_MAX; i++)
+			state->retired[i - 1] = state->retired[i];
+		state->nr_retired = IOMFB_DROPPED_MAX - 1;
+	}
+	state->retired[state->nr_retired++] = swap_id;
+}
+
 /* Whether @swap_id was retired; a completion for it is late, not unexpected. */
 static inline bool
 dcp_present_was_retired_h17p(const struct dcp_present_state_h17p *state,

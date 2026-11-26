@@ -98,7 +98,7 @@ static int dcp_peer_limited_stop_v27(struct apple_dcp *dcp, struct apple_dcp *pe
 	u8 power[16] = {1}, response[8];
 	int ret;
 
-	ret = dcp_peer_probe_quiesce(dcp, peer);
+	ret = dcp_peer_probe_quiesce(dcp, peer, false);
 	if (ret)
 		return ret;
 	ret = dcp_peer_video_call(dcp, "A484", power, sizeof(power),
@@ -133,22 +133,30 @@ int dcp_peer_modeset_v27(struct apple_dcp *dcp, u32 timing, u32 color, u32 min_v
 	}
 	if (!device_trylock(dcp->dev))
 		return -EBUSY;
+	iomfb_pause_peer(dcp, true);
+	ret = iomfb_queue_settle(dcp, msecs_to_jiffies(500));
+	if (ret) {
+		if (ret == -ETIMEDOUT)
+			ret = -EBUSY;
+		goto unpause;
+	}
+	ret = -EOPNOTSUPP;
 	{
 		guard(mutex)(&dcp_peer_lock);
 		peer = dcp->peer_reserved;
 		if (!peer)
-			goto unlock;
+			goto unpause;
 		/* The limit may have come or gone since the check above. */
 		limited = dcp_peer_limited_pair_locked(dcp, &prepared);
 		if (limited && !prepared)
-			goto unlock;
+			goto unpause;
 		if (peer->peer_owner != dcp || !dcp_peer_transport_idle(dcp) ||
 		    !dcp_peer_transport_idle(peer) || peer->fixed_phy ||
 		    peer->nr_typec_routes || !peer->crtc ||
 		    !peer->crtc->base.state || peer->crtc->base.state->active ||
 		    !device_trylock(peer->dev)) {
 			ret = -EBUSY;
-			goto unlock;
+			goto unpause;
 		}
 		vrr_only = dcp->peer_tiling.modeset_complete &&
 			   peer->peer_tiling.modeset_complete &&
@@ -157,6 +165,8 @@ int dcp_peer_modeset_v27(struct apple_dcp *dcp, u32 timing, u32 color, u32 min_v
 	}
 	if (limited) {
 		ret = dcp_peer_limited_stop_v27(dcp, peer);
+		if (ret && ret != -EOPNOTSUPP)
+			dcp_mode_invalidate(&dcp->mode_state);
 		goto peer_unlock;
 	}
 	/*
@@ -193,6 +203,8 @@ int dcp_peer_modeset_v27(struct apple_dcp *dcp, u32 timing, u32 color, u32 min_v
 		if (limited) {
 			ret = prepared ? dcp_peer_limited_stop_v27(dcp, peer)
 				       : -EOPNOTSUPP;
+			if (ret && ret != -EOPNOTSUPP)
+				dcp_mode_invalidate(&dcp->mode_state);
 			goto peer_unlock;
 		}
 	}
@@ -200,6 +212,8 @@ int dcp_peer_modeset_v27(struct apple_dcp *dcp, u32 timing, u32 color, u32 min_v
 	if (ret)
 		goto peer_unlock;
 	ret = dcp_peer_install_video_v27(dcp, peer, timing, color, 4);
+	if (ret && ret != -EOPNOTSUPP)
+		dcp_mode_invalidate(&dcp->mode_state);
 	if (!ret)
 		dcp_peer_finish_v27(dcp, peer);
 	if (!ret) {
@@ -216,7 +230,8 @@ int dcp_peer_modeset_v27(struct apple_dcp *dcp, u32 timing, u32 color, u32 min_v
 	}
 peer_unlock:
 	device_unlock(peer->dev);
-unlock:
+unpause:
+	iomfb_pause_peer(dcp, false);
 	device_unlock(dcp->dev);
 	return ret;
 }
@@ -295,32 +310,76 @@ int dcp_peer_check_v27(struct apple_dcp *dcp, struct drm_atomic_commit *commit,
 	return 0;
 }
 
-/* Return1 after a paired stop,0 for a normal CRTC, or an error. */
+/* Return 1 after a paired stop, 0 for a normal CRTC, or an error. */
 int dcp_peer_stop_v27(struct apple_dcp *dcp)
 {
 	struct apple_dcp *peer;
 	int ret = 0;
 
-	if (!peer_scanout || !READ_ONCE(dcp->peer_frames.active))
+	if (!peer_scanout || !smp_load_acquire(&dcp->peer_frames.active))
 		return 0;
 	if (!device_trylock(dcp->dev))
 		return -EBUSY;
+	/* Re-check under device_lock: a racing unplug/power-off may have finished. */
+	if (!READ_ONCE(dcp->peer_frames.active))
+		goto unlock;
+	/*
+	 * Pause new presentations and wait for any in-flight paired swap to
+	 * settle before dcp_peer_probe_quiesce() clears modeset_complete and
+	 * powers both engines down. Otherwise iomfb_queue_work() can launch a
+	 * queued swap mid-quiesce and mark the primary DCP crashed.
+	 */
+	iomfb_pause_peer(dcp, true);
+	ret = iomfb_queue_settle(dcp, msecs_to_jiffies(500));
+	if (ret == -ETIMEDOUT && iomfb_retire_stalled_present_h17p(dcp))
+		ret = iomfb_queue_settle(dcp, msecs_to_jiffies(100));
+	if (ret) {
+		if (ret == -ETIMEDOUT)
+			ret = -EBUSY;
+		goto unpause;
+	}
 	{
 		guard(mutex)(&dcp_peer_lock);
+		if (!dcp->peer_frames.active) {
+			ret = 0;
+			goto unpause;
+		}
 		peer = dcp->peer_reserved;
 		if (!peer || peer->peer_owner != dcp || !dcp_peer_transport_idle(dcp) ||
 		    !dcp_peer_transport_idle(peer) || !device_trylock(peer->dev)) {
 			ret = -EBUSY;
-			goto unlock;
+			goto unpause;
 		}
 	}
-	ret = dcp_peer_probe_quiesce(dcp, peer);
+	ret = dcp_peer_probe_quiesce(dcp, peer, true);
 	device_unlock(peer->dev);
 	if (!ret)
 		ret = 1;
+unpause:
+	iomfb_pause_peer(dcp, false);
 unlock:
 	device_unlock(dcp->dev);
 	return ret;
+}
+
+/*
+ * Retry transient -EBUSY from dcp_peer_stop_v27() until timeout_ms elapses
+ * (the deadline bounds starting new retries; an attempt already in settle or
+ * firmware RPCs runs to completion).
+ */
+int dcp_peer_stop_wait_v27(struct apple_dcp *dcp, unsigned int timeout_ms)
+{
+	unsigned long deadline = jiffies + msecs_to_jiffies(timeout_ms);
+	int ret;
+
+	if (dcp->fw_compat != DCP_FIRMWARE_V_27_0)
+		return 0;
+	for (;;) {
+		ret = dcp_peer_stop_v27(dcp);
+		if (ret != -EBUSY || time_after_eq(jiffies, deadline))
+			return ret;
+		usleep_range(5000, 6000);
+	}
 }
 
 /*
@@ -332,19 +391,13 @@ unlock:
  * sleep is refused. Stop the pair first, as macOS tears its dual pipe down
  * (power 0 on both engines, A362(0) on the main, then the peer) before the
  * DPTX release it sends to the main DCP only. A swap in flight, or a power-off
- * of the CRTC holding the device lock, is let go in a few ms.
+ * of the CRTC holding the device lock (~220 ms for A484(0) + 100 ms + A362(0)),
+ * is waited out before giving up.
  * Returns 1 after a stop, 0 if no pair runs, or an error.
  */
 static int dcp_peer_unplug_v27(struct apple_dcp *dcp)
 {
-	unsigned int tries = 20;
-	int ret;
-
-	if (dcp->fw_compat != DCP_FIRMWARE_V_27_0)
-		return 0;
-	while ((ret = dcp_peer_stop_v27(dcp)) == -EBUSY && --tries)
-		usleep_range(5000, 6000);
-	return ret;
+	return dcp_peer_stop_wait_v27(dcp, 1000);
 }
 
 struct apple_dcp *dcp_peer_scanout_v27(struct apple_dcp *dcp)
@@ -375,6 +428,23 @@ void dcp_peer_swap_failed_v27(struct apple_dcp *dcp)
 	guard(mutex)(&dcp_peer_lock);
 	dcp->peer_frames.failed = true;
 	dcp_mode_invalidate(&dcp->mode_state);
+}
+
+void dcp_peer_record_retired_v27(struct apple_dcp *dcp, u32 swap_id)
+{
+	struct apple_dcp *peer;
+
+	if (!peer_scanout)
+		return;
+	scoped_guard(mutex, &dcp_peer_lock) {
+		peer = dcp->peer_reserved;
+		if (!peer || peer->peer_owner != dcp)
+			return;
+		get_device(peer->dev);
+	}
+	scoped_guard(mutex, &peer->iomfb.lock)
+		dcp_present_record_retired_h17p(&peer->present_state_h17p, swap_id);
+	put_device(peer->dev);
 }
 
 bool dcp_peer_swap_complete_v27(struct apple_dcp *dcp, u32 id, ktime_t now, bool shown,
