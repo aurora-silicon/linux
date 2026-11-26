@@ -2586,6 +2586,8 @@ impl Gpu {
         if cfg.profile.is_m5() {
             return Self::boot_m5(pdev, dev, cfg, regs, geometry, id, shared);
         }
+        dev_info!(dev.as_ref(), "G17 diag: fault_control {:#x}\n",
+            crate::module_parameters::fault_control.value());
         let uat = Arc::new(
             mmu::Uat::new(
                 dev.into(),

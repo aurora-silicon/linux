@@ -720,6 +720,7 @@ impl Queue {
                 Err(error) => return Err(error),
             }
         };
+        pr_info!("G17 diag va: render kick ring {:#x}+{:#x}\n", high.gpu_va(), KICK_RING_SIZE);
         let storage = RenderStorage { low, high, vm, status };
         // Count the storage only once it exists. Without room to return it,
         // nothing has aliased it but `client`, which drops first.

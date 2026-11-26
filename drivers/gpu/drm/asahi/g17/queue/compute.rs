@@ -238,6 +238,9 @@ impl Graph {
         let m5_timestamps = if m5 {
             Some(Arc::new(alloc.kernel(RECORD_SLOTS * 16, page, prot, cpu)?, GFP_KERNEL)?)
         } else { None };
+        pr_info!("G17 diag va: compute ring {:#x} graph {:#x} records {:#x} support {:#x} preempt {:#x} usage {:#x}\n",
+            ring.object.gpu_va(), graph.gpu_va(), records.gpu_va(), support.gpu_va(), preempt.gpu_va(),
+            usage.gpu_va());
         let cached_records = objects.allocate(
             alloc,
             Family::QueueConfig,

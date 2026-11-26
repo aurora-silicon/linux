@@ -311,6 +311,8 @@ impl Context {
             CpuMap::WriteCombined,
         )?;
         let work_base = object.gpu_va();
+        pr_info!("G17 diag va: work state {:#x}+{:#x} scheduler {:#x}+{:#x}\n", work_base, 2 * UAT_PGSZ,
+            scheduler.gpu_va(), UAT_PGSZ);
         let work_mark = object.return_mark();
         object.write(
             UAT_PGSZ + 0x400,

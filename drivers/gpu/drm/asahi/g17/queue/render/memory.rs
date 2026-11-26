@@ -172,6 +172,9 @@ impl Graph {
             CpuMap::WriteCombined,
         )?;
         let address = queues.gpu_va();
+        pr_info!("G17 diag va: render descriptors {:#x}+{:#x} queues {:#x}+{:#x} config {:#x}+{:#x} support {:#x}+{:#x}\n",
+            descriptors.gpu_va(), bytes, address, GRAPH_SIZE, config.gpu_va(), 0x8000,
+            support.gpu_va(), if m5 { mmu::UAT_PGSZ } else { storage::SUPPORT_SIZE });
         for stage in 0..2 {
             let args = queue::QueueRecordArgs {
                 pointers_va: address + POINTERS[stage] as u64,
@@ -590,6 +593,7 @@ impl Memory {
             mmu::PROT_GPU_FW_SHARED_RW,
             CpuMap::WriteCombined,
         )?;
+        pr_info!("G17 diag va: render timestamps {:#x}+{:#x}\n", timestamps.gpu_va(), mmu::UAT_PGSZ);
         let manager = buffer::Manager::new(
             alloc,
             vm,
