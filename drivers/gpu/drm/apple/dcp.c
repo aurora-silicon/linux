@@ -7583,7 +7583,7 @@ static void dcp_t8132_ext_routes(struct apple_dcp *dcp)
 		of_get_child_by_name(dcp->dev->of_node, "typec-routes");
 	int ret;
 
-	if (!routes || !of_get_available_child_count(routes)) {
+	if (!dcp_typec_routes_available(routes)) {
 		dev_info(dcp->dev, "no Type-C display routes enabled\n");
 		return;
 	}

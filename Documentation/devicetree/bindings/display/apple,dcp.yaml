@@ -791,6 +791,26 @@ allOf:
     then:
       properties:
         resets: false
+  - if:
+      required:
+        - typec-routes
+      properties:
+        typec-routes:
+          not:
+            anyOf:
+              - required: [route@0]
+              - required: [route@1]
+              - required: [route@2]
+              - required: [route@3]
+    then:
+      properties:
+        phys: false
+        phy-names: false
+        mux-controls: false
+        mux-control-names: false
+        apple,typec-mux-indices: false
+        apple,typec-dptx-phys: false
+        apple,dptx-die: false
 
 unevaluatedProperties: false
 
