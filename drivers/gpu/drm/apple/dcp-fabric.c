@@ -2879,7 +2879,14 @@ int dcp_tunnel_dpin_activate(struct apple_dcp *dcp, u32 unit, bool active)
 			return ret;
 	}
 	ret = dcp_tunnel_dpin_locked(dcp, active);
-	if (t8132 && ret)
+	/*
+	 * A Deactivate after the tunnel went finds its DP IN idled by the
+	 * tunnel's teardown already (-ESTALE): routine on every unplug.
+	 */
+	if (t8132 && ret && !active && ret == -ESTALE)
+		dev_dbg(dcp->dev, "DPTX Deactivate: DP IN dpin%u already idled by its tunnel's teardown\n",
+			route->tunnel_dpin);
+	else if (t8132 && ret)
 		dev_warn(dcp->dev, "DPTX %s: DP IN dpin%u handshake failed: %d\n",
 			 active ? "Activate" : "Deactivate", route->tunnel_dpin, ret);
 	return ret;
