@@ -3015,7 +3015,12 @@ static int afk_send_epic_token(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 	if (ep->wire_v2) {
 		if (!channel || channel > U16_MAX || tag > U8_MAX || payload_len > SZ_1M)
 			return -EINVAL;
-		if (ecat == EPIC_CAT_REPORT) {
+		if (ecat == EPIC_CAT_REPORT && stype == EPIC_SUBTYPE_STD_SERVICE) {
+			/* A service report with its data (an HDCP session's progress). */
+			if (!payload_len)
+				return -EINVAL;
+			v2_category = AFKV2_REPORT;
+		} else if (ecat == EPIC_CAT_REPORT) {
 			if ((stype != AFKV2_OPEN && stype != AFKV2_CLOSE) || payload_len)
 				return -EOPNOTSUPP;
 			v2_flags = 1;
