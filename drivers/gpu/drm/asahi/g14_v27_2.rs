@@ -561,14 +561,6 @@ struct RenderFlight {
     doomed: Option<Error>,
 }
 
-/// A command the firmware stopped, kept with everything it owns (VM binding, scene) after it
-/// left its queue: see `Runtime::fail_doomed` and `Runtime::keep`. Held, never read.
-#[allow(dead_code)]
-enum Kept {
-    Compute(Inflight),
-    Render(RenderFlight),
-}
-
 /// Who a recovery round blamed, for its log line: the client, and the stopped work's stamps
 /// (render: tiler and fragment; compute: the stopped command's and the queue's current one).
 struct Blamed {
@@ -625,8 +617,10 @@ struct State {
     /// for the rest of the boot: the firmware may still reach that memory. Allocated with
     /// `g14_v27_2_abi::QUARANTINE_LIMIT` places at start, so keeping one never allocates.
     kept: KVec<Arc<Packet>>,
-    /// The stopped commands of those packets, once they left their queue.
-    kept_flights: KVec<Kept>,
+    /// The stopped commands of those packets, with their VM binding and scene, once they left
+    /// their queue (`Runtime::keep`). Held, never read.
+    kept_compute: KVec<Inflight>,
+    kept_renders: KVec<RenderFlight>,
     /// Set when a sleep/wake failure may have left the GPU domain unpowered or stopped so
     /// teardown skips live-hardware MMIO and RTKit operations.
     hardware_unreachable: bool,
@@ -1074,7 +1068,7 @@ impl Runtime {
             }
             if let Some(err) = flight.doomed {
                 self.fail_doomed(state, &flight.packet, err);
-                self.keep(state, Kept::Render(flight));
+                self.keep(&mut state.kept_renders, flight);
             } else if flight.last {
                 flight.packet.retired();
             } else if !state.pending(&flight.packet) {
@@ -1121,11 +1115,17 @@ impl Runtime {
     }
 
     /// Keeps a stopped command that left its queue, with its VM binding and scene, for the rest
-    /// of the boot. Its packet is already in `State::kept`, so ownership does not depend on
-    /// this allocation; if it fails, the flight is leaked instead, which keeps it as well.
-    fn keep(&self, state: &mut State, flight: Kept) {
-        if let Err(err) = state.kept_flights.push(flight, GFP_KERNEL) {
-            dev_warn!(self.dev, "GPU: no memory to track a stopped command ({:?}); leaking it\n", err);
+    /// of the boot (`State::kept_compute`, `kept_renders`). Its packet is already in
+    /// `State::kept`, so ownership does not depend on this allocation. If it fails, the flight
+    /// is leaked, which keeps it as well; it is never dropped.
+    fn keep<T>(&self, list: &mut KVec<T>, flight: T) {
+        if list.reserve(1, GFP_KERNEL).is_err() {
+            dev_warn!(self.dev, "GPU: no memory to track a stopped command; leaking it\n");
+            core::mem::forget(flight);
+            return;
+        }
+        if let Err(kernel::alloc::kvec::PushError(flight)) = list.push_within_capacity(flight) {
+            core::mem::forget(flight);
         }
     }
 
@@ -1505,7 +1505,7 @@ impl Runtime {
                     self.retire_slot(state, done.slot);
                     if let Some(err) = done.doomed {
                         self.fail_doomed(state, &done.packet, err);
-                        self.keep(state, Kept::Compute(done));
+                        self.keep(&mut state.kept_compute, done);
                     } else if let Some(err) = done.publication_error {
                         done.packet.release_guard();
                         done.packet.finish(Err(err));
@@ -1984,7 +1984,8 @@ impl Backend {
             events: [0; EVENT_HISTORY],
             events_read: 0,
             kept,
-            kept_flights: KVec::new(),
+            kept_compute: KVec::new(),
+            kept_renders: KVec::new(),
             hardware_unreachable: false,
             #[cfg(CONFIG_APPLE_SOC_SLEEP)]
             commit_stop: None,
