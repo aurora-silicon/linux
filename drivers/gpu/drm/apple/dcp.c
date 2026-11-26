@@ -6787,8 +6787,13 @@ VISIBLE_IF_KUNIT void dcp_disable_typec_work(struct apple_dcp *dcp, bool release
 	/* Block new enqueues as well as draining users of the AFK endpoints. */
 	disable_delayed_work_sync(&dcp->typec_reconnect_wq);
 	disable_delayed_work_sync(&dcp->placeholder_edid_wq);
-	/* It finds the work disabled (typec_work_enabled) if queued again. */
-	cancel_work_sync(&dcp->t8132_port_work);
+	/*
+	 * The transport's late answers, the DPTX service's publication and
+	 * the provider's repeated request queue it: none runs it from now
+	 * until a bind enables it again, the DCP gone or not. An answer that
+	 * comes meanwhile is kept in its ticket (dcp_enable_typec_work()).
+	 */
+	disable_work_sync(&dcp->t8132_port_work);
 	scoped_guard(spinlock_irqsave, &dcp->relink_lock)
 		dcp_relink_enable(&dcp->relink, false);
 	disable_delayed_work_sync(&dcp->typec_relink_wq);
@@ -6820,10 +6825,13 @@ VISIBLE_IF_KUNIT void dcp_enable_typec_work(struct apple_dcp *dcp)
 	enable_delayed_work(&dcp->hdmi_recheck_wq);
 	enable_delayed_work(&dcp->link_recovery_wq);
 	enable_work(&dcp->tb_event_work);
+	enable_work(&dcp->t8132_port_work);
 	enable_delayed_work(&dcp->hybrid_wq);
 	dcp_hdmi_enable(dcp);
 	scoped_guard(mutex, &dcp->hpd_mutex)
 		dcp->typec_work_enabled = true;
+	/* A release answered while the work was off frees its port now. */
+	dcp_typec_attach_repeated(dcp);
 	/* A cable can be routed before the DRM component binds. */
 	if (READ_ONCE(dcp->typec_cable_connected))
 		dcp_queue_typec_reconnect(dcp, 0);
@@ -8134,6 +8142,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	disable_delayed_work(&dcp->announce_wq);
 	disable_delayed_work(&dcp->link_recovery_wq);
 	disable_work(&dcp->tb_event_work);
+	disable_work(&dcp->t8132_port_work);
 	dcp->announce.stopped = true;
 	/*
 	 * A native external pipe's bind enables these; firmware callbacks may

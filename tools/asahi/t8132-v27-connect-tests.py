@@ -41,6 +41,9 @@ firmware 27.2:
   no connect clears it;
 - the DPTX service's publication, or the tunnel's repeated request, connects
   a display attached while its connect could not run;
+- the display processor's component unbinds with a release unanswered: its
+  answer, the service's publication and a repeated request queue no work
+  until the next bind, which takes the answer kept in the ticket;
 - the M4 backend (26.6.2) still waits for its unanswered compact calls,
   until a revocation or the CRTC's power-off, which wakes the wait.
 
@@ -81,7 +84,8 @@ FUNCTIONS = [
     ('dcp', 'dcp_dptx_disconnect'), ('dcp', 'dcp_dptx_disconnect_oob'),
     ('dcp', 'dcp_typec_crtc_turned_off'), ('dcp', 'dcp_typec_resume_locked'),
     ('dcp', 'dcp_t8132_port_work'),
-    ('dcp', 'dcp_typec_attach_repeated'),
+    ('dcp', 'dcp_typec_attach_repeated'), ('dcp', 'dcp_disable_typec_work'),
+    ('dcp', 'dcp_enable_typec_work'),
 ]
 
 # name -> (source, old, new)
@@ -150,6 +154,10 @@ MUTATIONS = {
                               '\t    !dcp->typec_cable_connected ||'),
     # Neither the service's publication nor a repeated request resumes a display.
     'repeat-no-resume': ('dcp', '\tif (dcp_t8132_fw27(dcp))\n\t\tschedule_work(&dcp->t8132_port_work);', '\t;'),
+    # The work only cancelled at unbind: a late answer queues it again.
+    'port-work-cancel-only': ('dcp', '\tdisable_work_sync(&dcp->t8132_port_work);', '\tcancel_work_sync(&dcp->t8132_port_work);'),
+    # An answer that came while the work was off is never taken.
+    'enable-drops-answer': ('dcp', '\t/* A release answered while the work was off frees its port now. */\n\tdcp_typec_attach_repeated(dcp);\n', ''),
     # DPMS does not wake the M4 backend's wait.
     'dpms-no-wake': ('dcp', '\tif (dcp->dptxep)\n\t\tafk_late_replies_wake(dcp->dptxep);\n}\n\n/*\n * Firmware 27: a T8132 dcpext\'s display attached',
                      '}\n\n/*\n * Firmware 27: a T8132 dcpext\'s display attached'),
@@ -1180,6 +1188,25 @@ static void resume_cases(void)
 	puts("ok resume: firmware 27 only");
 }
 
+/*
+ * The display processor's component unbinds with a release unanswered: its
+ * late answer, the service's publication and a repeated request queue no
+ * work from then (the DCP may be freed before a work would run), and the
+ * next bind takes the answer, kept in its ticket.
+ */
+static void lifetime_cases(void)
+{
+	held_replug();
+	dcp_disable_typec_work(dcp, true);
+	answer();
+	dcp_typec_attach_repeated(dcp);
+	assert(!dcp->t8132_port_work.queued && dcp->t8132_release_late);
+	dcp_enable_typec_work(dcp);
+	run_port_work();
+	assert(!dcp->t8132_release_late && !dcp->dptxport[0].release_owed);
+	puts("ok lifetime: nothing queues the port work after unbind; the next bind takes the answer");
+}
+
 int main(void)
 {
 	connect_cases();
@@ -1187,6 +1214,7 @@ int main(void)
 	fence_cases();
 	failed_connect_cases();
 	resume_cases();
+	lifetime_cases();
 	puts("PASS firmware-27.2 T8132 dcpext deferred connect, revocation, DPMS, release and its fence");
 	return 0;
 }
