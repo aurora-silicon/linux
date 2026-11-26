@@ -44,7 +44,7 @@ static void dcpep_cb_swap_complete(struct apple_dcp *d,struct dc_swap_complete_r
 static u64 ktime_get(void) { return 30; }
 static u64 dcp_swap_time(void) { return 40; }
 static void dcp_swap_watchdog_arm(struct apple_dcp *d) { (void)d;watchdogs++; }
-static bool dcp_present_begin(struct apple_dcp *d,u32 id) { (void)d;assert(id);return begin_allowed; }
+static bool dcp_present_begin(struct apple_dcp *d,u32 id,u64 attachment) { (void)d;(void)attachment;assert(id);return begin_allowed; }
 static void dcp_arm_retained_framebuffers(struct apple_dcp *d,u32 id) { (void)d;(void)id;armed++; }
 static void dcp_h17p_prepare_swap(struct apple_dcp *d) { assert(!d->native); }
 static void dcp_swap_submit(struct apple_dcp *d,bool oob,void *r,void (*cb)(struct apple_dcp *,void *,void *),void *c) { (void)d;(void)r;(void)cb;(void)c;assert(!oob);sent++; }

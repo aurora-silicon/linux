@@ -460,6 +460,7 @@ def watchdog(root):
 #include <stdint.h>
 #include <stddef.h>
 typedef uint32_t u32;
+typedef uint64_t u64;
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x,v) ((x)=(v))
 #define xchg(p,v) __atomic_exchange_n((p),(v),__ATOMIC_SEQ_CST)
@@ -483,10 +484,13 @@ struct apple_dcp {
     unsigned long swap_watchdog_deadline;
     unsigned swap_watchdog_retrains;
     void *crtc,*connector,*dev;
+    int hpd_mutex;u64 typec_unplugs;
 };
 static unsigned scheduled,cancelled,vblanks,hotplugs,unarmed,rejected;
 static bool allow_retire=true;
-static bool iomfb_retire_dropped_present_h17p(struct apple_dcp *d,bool *lost) {*lost=false;return allow_retire;}
+static bool iomfb_retire_dropped_present_h17p(struct apple_dcp *d,u64 *attachment) {*attachment=d->typec_unplugs;return allow_retire;}
+/* The watchdog's retrain runs under hpd_mutex; one thread here. */
+#define guard(kind) (void)
 static void dcp_unarm_retained_framebuffers(struct apple_dcp *d,u32 id)
 {assert(id==d->desktop->present_id);unarmed++;}
 static void dcp_backlight_desktop_finish(struct apple_dcp *d,u32 id,bool reply,bool accepted)

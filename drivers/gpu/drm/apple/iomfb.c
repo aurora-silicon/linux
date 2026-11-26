@@ -4048,12 +4048,12 @@ bool iomfb_present_complete_h17p(struct apple_dcp *dcp)
  * the present was begun for a display that went since
  * (iomfb_present_begun_h17p()).
  */
-bool iomfb_retire_dropped_present_h17p(struct apple_dcp *dcp, bool *lost)
+bool iomfb_retire_dropped_present_h17p(struct apple_dcp *dcp, u64 *attachment)
 {
 	struct dcp_present_state_h17p *state = &dcp->present_state_h17p;
 	u32 swap_id;
 
-	*lost = false;
+	*attachment = READ_ONCE(dcp->typec_unplugs);
 	if (!iomfb_uses_queue(dcp))
 		return true;
 
@@ -4062,8 +4062,8 @@ bool iomfb_retire_dropped_present_h17p(struct apple_dcp *dcp, bool *lost)
 	if (time_before(jiffies, dcp->swap_watchdog_deadline) ||
 	    !state->pending || !state->accepted)
 		return false;
-	/* Begun for a display that went since (iomfb_present_begun_h17p()). */
-	*lost = state->attachment != READ_ONCE(dcp->typec_unplugs);
+	/* The display it was started for (iomfb_present_begun_h17p()). */
+	*attachment = state->attachment;
 	if (!dcp_present_retire_h17p(state, swap_id))
 		return true;
 
@@ -4081,17 +4081,18 @@ bool iomfb_retire_dropped_present_h17p(struct apple_dcp *dcp, bool *lost)
 }
 
 /*
- * A present begins (the firmware's swap start): it is for the display
- * attached now, whose Type-C attachment is counted by the detaches before
- * it (typec_unplugs). Its retirement compares that with the count then
- * (iomfb_retire_dropped_present_h17p()): a present begun before a detach,
- * whenever the firmware accepts it, belongs to the display that went, not
- * to one attached since. Outputs without Type-C detaches keep their first
- * count. In the IOMFB receive thread, as the present's state.
+ * A present begins (the firmware's answer to its swap start): it is for the
+ * display attached when the host started it (@attachment, the detaches
+ * before it as typec_unplugs counted them, carried by its SwapStart). Its
+ * watchdog compares that with the count when it retires the present
+ * (dcp_swap_watchdog()): a present started before a detach, whenever the
+ * firmware answers its start or accepts it, belongs to the display that
+ * went, not to one attached since. Outputs without Type-C detaches keep
+ * their first count. In the IOMFB receive thread, as the present's state.
  */
-void iomfb_present_begun_h17p(struct apple_dcp *dcp)
+void iomfb_present_begun_h17p(struct apple_dcp *dcp, u64 attachment)
 {
-	dcp->present_state_h17p.attachment = READ_ONCE(dcp->typec_unplugs);
+	dcp->present_state_h17p.attachment = attachment;
 }
 
 /*

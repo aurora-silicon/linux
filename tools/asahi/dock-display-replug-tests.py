@@ -21,6 +21,13 @@ without a route:
   firmware accepts it, also after the detach and the power-off have looked
   and a replacement is plugged in: retired without a retrain, the
   replacement left alone;
+- so is a present the host started for it, whenever the firmware answers
+  its SwapStart: its attachment is read as the host starts it and carried
+  to the reply (iomfb_present_begun_h17p()), also when the answer comes after
+  the detach and a replug;
+- a detach between the present's retirement and its retrain is seen before
+  anything is retrained: the watchdog decides under hpd_mutex, where the
+  detach counts itself;
 - retiring that present only completes its flip: it neither invalidates the
   mode nor queues a hotplug, so a display plugged in before the watchdog
   expires is not retrained for the old one's present;
@@ -68,16 +75,22 @@ MUTATIONS = {
     'unlocked-check': ('iomfb', '\tguard(mutex)(&dcp->iomfb.lock);\n\tif (state->pending && state->accepted) {',
                        '\tif (state->pending && state->accepted) {'),
     # The retired present of a display that went retrains what is plugged in now.
-    'lost-retrains': ('dcp', '\tif (lost) {\n\t\tdev_info(dcp->dev, "swap of a display that went retired\\n");',
-                      '\tif (false) {\n\t\tdev_info(dcp->dev, "swap of a display that went retired\\n");'),
+    'lost-retrains': ('dcp', '\t\tdev_info(dcp->dev, "swap of a display that went retired\\n");\n\t\tdcp_drm_crtc_vblank(dcp->crtc);\n\t\treturn;\n',
+                      '\t\tdev_info(dcp->dev, "swap of a display that went retired\\n");\n'),
     # A present is the current display's once accepted (the loss judged at acceptance).
     'identity-at-acceptance': ('dcp', '\tif (dcp_is_typec_output(dcp) || dcp_desktop_swap_watched(dcp)) {\n',
                                '\tif (dcp_is_typec_output(dcp) || dcp_desktop_swap_watched(dcp)) {\n'
                                '\t\tdcp->present_state_h17p.attachment = READ_ONCE(dcp->typec_unplugs);\n'),
     # Nothing is ever taken as lost: the replacement is retrained.
-    'never-lost': ('iomfb', '\t*lost = state->attachment != READ_ONCE(dcp->typec_unplugs);', '\t*lost = false;'),
+    'never-lost': ('dcp', '\tif (attachment != dcp->typec_unplugs) {', '\tif (false) {'),
     # Everything taken as lost: a stuck present of a live display is not retrained.
-    'always-lost': ('iomfb', '\t*lost = state->attachment != READ_ONCE(dcp->typec_unplugs);', '\t*lost = true;'),
+    'always-lost': ('dcp', '\tif (attachment != dcp->typec_unplugs) {', '\tif (true) {'),
+    # The attachment read at the SwapStart's answer, not when the host started it.
+    'attachment-at-reply': ('iomfb', '\tdcp->present_state_h17p.attachment = attachment;',
+                            '\tdcp->present_state_h17p.attachment = READ_ONCE(dcp->typec_unplugs);'),
+    # The loss decided without hpd_mutex, where a detach counts itself.
+    'retrain-unlocked': ('dcp', '\tguard(mutex)(&dcp->hpd_mutex);\n\tif (attachment != dcp->typec_unplugs) {',
+                         '\tif (attachment != dcp->typec_unplugs) {'),
     # Nothing kept: the present holds the queue until its timeout.
     'no-keep': ('iomfb', '\tif (state->pending && state->accepted) {\n\t\tdcp_swap_watchdog_keep(dcp);\n\t\treturn true;\n\t}',
                 '\tif (false) {\n\t\tdcp_swap_watchdog_keep(dcp);\n\t\treturn true;\n\t}'),
@@ -290,8 +303,14 @@ static struct apple_dcp *pipe(int connector_type)
 	return &d;
 }
 
-/* A present begins for the display attached now (dcp_present_begin()). */
-static void begin(void)
+/* The host starts a present: its SwapStart carries the attachment (do_swap()). */
+static u64 started;
+static void start(void)
+{
+	started = READ_ONCE(the_dcp->typec_unplugs);
+}
+/* The firmware answers the SwapStart: the present begins (dcp_present_begin()). */
+static void answered(void)
 {
 	struct apple_dcp *d = the_dcp;
 	static u32 id = 300;
@@ -301,8 +320,14 @@ static void begin(void)
 	d->present_state_h17p.pending = true;
 	d->present_state_h17p.accepted = false;
 	d->present_state_h17p.swap_id = ++id;
-	iomfb_present_begun_h17p(d);
+	iomfb_present_begun_h17p(d, started);
 	mutex_unlock(&d->iomfb.lock);
+}
+/* ... at once, for the display attached now. */
+static void begin(void)
+{
+	start();
+	answered();
 }
 /* The firmware accepts it (dcp_swapped(), under the queue's lock); one begun now if none is. */
 static void accept(void)
@@ -340,13 +365,23 @@ static void expire(void)
 /* The dock goes (dcp_dptx_disconnect_oob()): the unplug is counted, a present is kept. */
 static void unplug(void)
 {
+	mutex_lock(&the_dcp->hpd_mutex);
 	the_dcp->typec_unplugs++;
+	mutex_unlock(&the_dcp->hpd_mutex);
 	iomfb_present_lost(the_dcp, false);
 }
 /* The dock's display is gone and its CRTC turned off: the power-off counts it gone. */
 static void gone(void)
 {
+	mutex_lock(&the_dcp->hpd_mutex);
 	the_dcp->typec_unplugs++;
+	mutex_unlock(&the_dcp->hpd_mutex);
+}
+/* ... and a replacement is plugged in on the same pipeline. */
+static void unplug_replug(void)
+{
+	unplug();
+	the_dcp->connector = &replacement;
 }
 
 static void lost_display(void)
@@ -493,9 +528,50 @@ static void live_outputs(void)
 	puts("ok live outputs: panel, fixed HDMI and attached Type-C DPMS stop the watchdog");
 }
 
+/*
+ * The host starts a present for the dock's display; the dock goes and a
+ * replacement comes before the firmware answers the SwapStart. The present
+ * is the display's that went: accepted and stuck, it is retired without a
+ * retrain. A detach between its retirement and the retrain is seen too.
+ */
+static void started_before_detach(void)
+{
+	struct apple_dcp *d;
+
+	d = pipe(DRM_MODE_CONNECTOR_USB);
+	start();
+	unplug_replug();
+	answered();
+	accept();
+	expire();
+	assert(failed == 1 && advanced == 1 && vblanks == 1);
+	assert(!hotplugs && !invalidates && d->mode_state.valid);
+	/* The replacement's own presents are retrained as before. */
+	accept();
+	expire();
+	assert(invalidates == 1 && hotplugs == 1 && hotplugged == &replacement);
+	puts("ok started before the detach, answered after the replug: retired, the replacement left alone");
+
+	/* The dock goes while the watchdog retires its stuck present. */
+	d = pipe(DRM_MODE_CONNECTOR_USB);
+	accept();
+	d->iomfb.lock.after = unplug_replug;
+	expire();
+	assert(failed == 1 && !hotplugs && !invalidates && d->mode_state.valid);
+	/* ... or while the watchdog waits for hpd_mutex to retrain it. */
+	d = pipe(DRM_MODE_CONNECTOR_USB);
+	accept();
+	d->hpd_mutex.before = unplug_replug;
+	expire();
+	assert(d->typec_unplugs == 1);
+	assert(failed == 1 && !hotplugs && !invalidates && d->mode_state.valid);
+	puts("ok a detach between the retirement and the retrain: the replacement left alone");
+}
+
 int main(void)
 {
 	lost_display();
+	started_before_detach();
 	acceptance_during_poweroff();
 	live_outputs();
 	puts("PASS a dock display's present in flight across its unplug, power-off and replug");

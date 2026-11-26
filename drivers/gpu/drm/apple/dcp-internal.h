@@ -1262,9 +1262,9 @@ void iomfb_present_matrix_h17p(struct apple_dcp *dcp);
 bool iomfb_present_brightness_only_h17p(struct apple_dcp *dcp);
 bool iomfb_present_complete_h17p(struct apple_dcp *dcp);
 void iomfb_present_failed_h17p(struct apple_dcp *dcp);
-bool iomfb_retire_dropped_present_h17p(struct apple_dcp *dcp, bool *lost);
+bool iomfb_retire_dropped_present_h17p(struct apple_dcp *dcp, u64 *attachment);
 bool iomfb_present_lost(struct apple_dcp *dcp, bool poweroff);
-void iomfb_present_begun_h17p(struct apple_dcp *dcp);
+void iomfb_present_begun_h17p(struct apple_dcp *dcp, u64 attachment);
 bool iomfb_present_has_surface_h17p(const struct dcp_swap_submit_req_h17p *request);
 bool iomfb_apply_backlight_h17p(struct apple_dcp *dcp,
 				const struct dcp_swap_submit_req_h17p *request,

@@ -1812,7 +1812,7 @@ VISIBLE_IF_KUNIT void dcp_swap_watchdog(struct work_struct *work)
 	struct apple_dcp *dcp =
 		container_of(to_delayed_work(work), struct apple_dcp,
 			     swap_watchdog_wq);
-	bool lost;
+	u64 attachment;
 
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) {
 		if (time_before(jiffies, dcp->swap_watchdog_deadline) ||
@@ -1837,14 +1837,19 @@ VISIBLE_IF_KUNIT void dcp_swap_watchdog(struct work_struct *work)
 		}
 	}
 
-	if (!iomfb_retire_dropped_present_h17p(dcp, &lost))
+	if (!iomfb_retire_dropped_present_h17p(dcp, &attachment))
 		return;
 	/*
-	 * The display it was taken for went: nothing to retrain, and the
-	 * pipeline's connector may hold another display by now. Only the flip
-	 * is completed, so that the commit waiting for it goes on.
+	 * The display it was started for went (its attachment, carried from
+	 * its SwapStart): nothing to retrain, and the pipeline's connector may
+	 * hold another display by now. Only the flip is completed, so that the
+	 * commit waiting for it goes on. Decided under hpd_mutex, where a
+	 * detach counts itself, and retrained under it: a detach after the
+	 * retirement is seen here, and one after this finds the retrain done
+	 * for the display it takes away.
 	 */
-	if (lost) {
+	guard(mutex)(&dcp->hpd_mutex);
+	if (attachment != dcp->typec_unplugs) {
 		dev_info(dcp->dev, "swap of a display that went retired\n");
 		dcp_drm_crtc_vblank(dcp->crtc);
 		return;
