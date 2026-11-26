@@ -235,6 +235,9 @@ pub(crate) struct HwClusteringConfig {
 pub(crate) struct HwConfig {
     /// Chip ID in hex format (e.g. 0x8103 for t8103).
     pub(crate) chip_id: u32,
+    /// A firmware-driven system sleep takes the GPU's power, and its firmware can be parked
+    /// before the sleep and restarted from scratch after it, see `Gpu::sleep_suspend()`.
+    pub(crate) sleep_restart: bool,
     /// GPU generation.
     pub(crate) gpu_gen: GpuGen,
     /// GPU variant type.

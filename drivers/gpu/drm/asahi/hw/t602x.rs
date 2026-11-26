@@ -47,6 +47,7 @@ const fn iomaps(chip_id: u32, mcc_count: usize) -> [Option<IOMapping>; 24] {
 
 // TODO: Tentative
 pub(crate) const HWCONFIG_T6022: super::HwConfig = HwConfig {
+    sleep_restart: false,
     chip_id: 0x6022,
     gpu_gen: GpuGen::G14,
     gpu_variant: GpuVariant::D,
