@@ -287,6 +287,15 @@ impl Gpu {
     /// Called before any device suspends. Only a sleep that powers the SoC down gets here.
     fn sleep_prepare(&self) -> Result {
         if !self.cfg.deep_sleep {
+            // DIAGNOSTIC (T6030 sleep bring-up): pass with the firmware left running. Nothing
+            // stops it, so `sleeping` stays clear and the completion has nothing to undo.
+            if crate::module_parameters::g16_sleep_quiesce.value() != 0 {
+                dev_info!(
+                    self.shared.dev.as_ref(),
+                    "DIAGNOSTIC: no deep sleep support; GPU firmware left running for this sleep\n"
+                );
+                return Ok(());
+            }
             return Err(EBUSY);
         }
         let result = self.shared.sleep_down();

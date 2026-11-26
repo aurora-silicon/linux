@@ -289,5 +289,9 @@ module! {
             default: 1,
             description: "G16: validate CDM/VDM stream records",
         },
+        g16_sleep_quiesce: u32 {
+            default: 0,
+            description: "DIAGNOSTIC: G16 without deep sleep support: let a sleep's prepare pass with the GPU firmware left running (userspace is frozen), for T6030 PMP tests",
+        },
     },
 }
