@@ -571,6 +571,26 @@ struct Blamed {
     stopped: Option<u64>,
 }
 
+/// Outcome of a failed command publication before the firmware sees the work.
+enum PublishError {
+    /// All UAT context slots are currently held; retry without blocking under `Runtime::state`.
+    BindBusy,
+    /// Any other publication failure.
+    Error(Error),
+}
+
+impl From<Error> for PublishError {
+    fn from(err: Error) -> Self {
+        Self::Error(err)
+    }
+}
+
+impl From<kernel::alloc::AllocError> for PublishError {
+    fn from(err: kernel::alloc::AllocError) -> Self {
+        Self::Error(err.into())
+    }
+}
+
 struct State {
     peer: Peer,
     root: crate::fw::types::GpuObject<RootV27_2>,
@@ -583,6 +603,7 @@ struct State {
     next_slot: usize,
     waiting_unlink: Option<FirmwareWait>,
     waiting_control: Option<FirmwareWait>,
+    waiting_bind: Option<Instant<Monotonic>>,
     /// Publications and retirements counted on the queue's position block.
     published: u64,
     /// Completion stamps seen before the retired position they precede.
@@ -656,6 +677,24 @@ impl State {
             *kind = self.events[at as usize];
         }
         (out, count)
+    }
+
+    /// Track a bounded wait when all UAT context slots are held externally while idle.
+    fn bind_wait_expired(&mut self) -> bool {
+        let now = Instant::<Monotonic>::now();
+        let since = *self.waiting_bind.get_or_insert(now);
+        now - since >= Delta::from_millis(COMMAND_TIMEOUT_MS)
+    }
+
+    /// Fail an unpublished front packet after idle UAT context-slot retries expire without
+    /// poisoning its VM status or the runtime.
+    fn fail_bind_wait(&mut self, packet: &Arc<Packet>) {
+        let _ = self.pending.remove(0);
+        self.waiting_bind = None;
+        if g14_v27_2_abi::guard_releasable(false, self.kept(packet)) {
+            packet.release_guard();
+        }
+        packet.fail_packet(ENOSPC);
     }
 
     fn running(&self) -> bool {
@@ -779,14 +818,25 @@ impl Runtime {
     pub(crate) fn withdraw(&self, packet: &Arc<Packet>) {
         let mut guard = self.state.lock();
         if let Some(state) = Option::as_mut(&mut *guard) {
+            let mut front_removed = false;
             if let Some(i) = state.pending.iter().position(|(p, _)| Arc::ptr_eq(p, packet)) {
                 let _ = state.pending.remove(i);
+                front_removed = i == 0;
             }
             if !state.owns(packet) {
                 packet.release_guard();
             }
+            if front_removed {
+                state.waiting_bind = None;
+            }
             if state.pending.is_empty() {
                 state.waiting_unlink = None;
+                state.waiting_bind = None;
+                if !state.running() {
+                    self.idle.notify_all();
+                }
+            } else if front_removed && self.healthy() {
+                self.notify.wake();
             }
         }
     }
@@ -794,6 +844,7 @@ impl Runtime {
     fn fail_all(&self, state: &mut State, error: Error) {
         self.healthy.store(false, Ordering::Release);
         self.idle.notify_all();
+        state.waiting_bind = None;
         while let Some((packet, _)) = state.pending.pop() {
             if !state.owns(&packet) {
                 packet.release_guard();
@@ -863,6 +914,34 @@ impl Runtime {
         Ok(None)
     }
 
+    fn try_bind_vm(&self, vm: &mmu::Vm) -> core::result::Result<mmu::VmBind, PublishError> {
+        match self.graph.kernel_uat().try_bind(vm) {
+            Ok(bind) => Ok(bind),
+            Err(err) if err == ENOSPC => Err(PublishError::BindBusy),
+            Err(err) => Err(PublishError::Error(err)),
+        }
+    }
+
+    /// Handle `ENOSPC` from non-blocking UAT context binding without blocking under `state`.
+    /// Returns `true` when the front packet was retired with failure and `pump()` can continue.
+    fn handle_bind_busy(&self, state: &mut State, packet: &Arc<Packet>) -> bool {
+        if state.running() {
+            state.waiting_bind = None;
+            return false;
+        }
+        if state.bind_wait_expired() {
+            dev_err!(
+                self.dev,
+                "GPU: UAT context slot unavailable for {} ms\n",
+                COMMAND_TIMEOUT_MS
+            );
+            state.fail_bind_wait(packet);
+            return true;
+        }
+        self.notify.retry();
+        false
+    }
+
     /// Compute commands may pipeline. A render pair is a scheduling boundary so its buffer,
     /// timestamps and dependencies remain owned until both data masters retire.
     fn pump(&self, state: &mut State) {
@@ -874,6 +953,7 @@ impl Runtime {
             let (packet, index) = (state.pending[0].0.clone(), state.pending[0].1);
             if vm_failed(&packet) {
                 // Queued before its VM failed: none of it is published from now on.
+                state.waiting_bind = None;
                 state.fail_publication(&packet, EIO);
                 continue;
             }
@@ -883,7 +963,10 @@ impl Runtime {
             let count = if paired { 2 } else { 1 };
             let slots = match self.free_slots(state, count) {
                 Ok(Some(slots)) => slots,
-                Ok(None) => return,
+                Ok(None) => {
+                    state.waiting_bind = None;
+                    return;
+                }
                 Err(err) => {
                     dev_err!(self.dev, "GPU: command pool stalled: {:?} busy={:#x} unacked={:#x} inflight={} rendering={}\n",
                              err, state.busy, state.unacked, state.inflight.len(), state.rendering.is_some());
@@ -907,10 +990,21 @@ impl Runtime {
                     self.publish_render(state, &packet, index, &command, usc, last, slots),
             };
             match result {
-                Ok(()) if paired || !self.healthy() => return,
-                Ok(()) => {}
-                Err(EBUSY) if state.running() => return,
-                Err(err) => {
+                Ok(()) => {
+                    state.waiting_bind = None;
+                    if paired || !self.healthy() { return; }
+                }
+                Err(PublishError::BindBusy) => {
+                    if !self.handle_bind_busy(state, &packet) {
+                        return;
+                    }
+                }
+                Err(PublishError::Error(EBUSY)) if state.running() => {
+                    state.waiting_bind = None;
+                    return;
+                }
+                Err(PublishError::Error(err)) => {
+                    state.waiting_bind = None;
                     dev_err!(self.dev, "GPU: command publication failed {:?}\n", err);
                     state.fail_publication(&packet, err);
                 }
@@ -921,9 +1015,9 @@ impl Runtime {
     fn publish_compute(
         &self, state: &mut State, packet: &Arc<Packet>, index: usize,
         control: crate::m3::agx_compute::Control, last: bool, slot: usize,
-    ) -> Result {
-        let bind = self.graph.kernel_uat().bind(&packet.vm)?;
+    ) -> core::result::Result<(), PublishError> {
         let preempt = packet.preempt.as_ref().ok_or(EINVAL)?.gpu_va().get();
+        let bind = self.try_bind_vm(&packet.vm)?;
         let stamp = state.last.next();
         let job = ComputeJob {
             context: bind.slot(),
@@ -965,10 +1059,10 @@ impl Runtime {
     fn publish_render(
         &self, state: &mut State, packet: &Arc<Packet>, index: usize,
         command: &crate::m3::agx_uapi::UapiRenderCommand, usc: u64, last: bool, slots: [usize; 2],
-    ) -> Result {
+    ) -> core::result::Result<(), PublishError> {
         let queue = packet.render_queue.as_ref().ok_or(EINVAL)?;
+        let bind = self.try_bind_vm(&packet.vm)?;
         let scene = queue.prepare(command, usc)?;
-        let bind = self.graph.kernel_uat().bind(&packet.vm)?;
         let context = bind.slot();
         let (tiler, tiler_stamp) = state.root.render_queue(TILER);
         let (fragment, fragment_stamp) = state.root.render_queue(FRAGMENT);
@@ -1111,6 +1205,9 @@ impl Runtime {
         if state.live(packet) { return; }
         if let Some(i) = state.pending.iter().position(|(p, _)| Arc::ptr_eq(p, packet)) {
             let _ = state.pending.remove(i);
+            if i == 0 {
+                state.waiting_bind = None;
+            }
         }
         // Record it even if a racing scheduler timeout already claimed the fence (as fail_all).
         if let Some(status) = packet.vm.status() { status.record(err); }
@@ -1346,6 +1443,7 @@ impl Runtime {
                     state.recoveries += 1;
                     // Work behind the stopped command waited out the recovery: restart its clocks.
                     let now = Instant::now();
+                    state.waiting_bind = None;
                     for flight in state.inflight.iter_mut() { flight.started = now; }
                     if let Some(flight) = state.rendering.as_mut() { flight.started = now; }
                     dev_err!(self.dev,
@@ -1595,6 +1693,9 @@ impl Runtime {
         // Hold publications first, then let what is published retire. User space is frozen by
         // now; only the scheduler's queued jobs can still arrive, and they wait in `pending`.
         self.asleep.store(true, Ordering::Release);
+        if let Some(state) = Option::as_mut(&mut *guard) {
+            state.waiting_bind = None;
+        }
         let mut remaining = msecs_to_jiffies(STOP_DRAIN_MS);
         loop {
             let Some(state) = Option::as_mut(&mut *guard) else { return Ok(()); };
@@ -1751,6 +1852,7 @@ impl Runtime {
                 self.notify.set_deep_sleeping(self, false);
                 self.asleep.store(false, Ordering::Release);
                 state.waiting_unlink = None;
+                state.waiting_bind = None;
                 if self.healthy() {
                     self.pump(state);
                     self.notify.wake();
@@ -1794,6 +1896,7 @@ impl Runtime {
             self.asleep.store(false, Ordering::Release);
             state.waiting_unlink = None;
             state.waiting_control = None;
+            state.waiting_bind = None;
             match restart {
                 Ok(()) => {
                     // No round crosses a sleep (sleep_prepare refuses one), and the restarted
@@ -1819,6 +1922,7 @@ impl Runtime {
         dev_info!(self.dev, "GPU released after sleep: running={:?} pending={}\n",
                   state.root.firmware_running(), state.pending.len());
         state.waiting_unlink = None;
+        state.waiting_bind = None;
         if self.healthy() { self.pump(state); }
     }
 
@@ -1971,6 +2075,7 @@ impl Backend {
             next_slot: 0,
             waiting_unlink: None,
             waiting_control: None,
+            waiting_bind: None,
             published: 0,
             late: 0,
             busy: 0,
