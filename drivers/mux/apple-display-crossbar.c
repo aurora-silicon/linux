@@ -23,6 +23,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/soc/apple/dp-tunnel.h>
+#include <linux/suspend.h>
 
 /*
  * T602x register interface is cleary different so most of the names below are
@@ -110,12 +111,15 @@ struct apple_dpxbar_hw {
 	bool t604x_dpin_atc;
 	/* power domain held only while an output is selected */
 	bool runtime_pm;
+	/* a firmware sleep resets the block: the tunable and each selection are written again */
+	bool restore_after_fw_sleep;
 	/* T8142 layout: a connection status still busy after its poll is only logged */
 	bool status_log_only;
 };
 
 struct apple_dpxbar {
 	struct device *dev;
+	struct mux_chip *chip;
 	const struct apple_dpxbar_hw *hw;
 	void __iomem *regs;
 	int selected_dispext[T8142_MUX_MAX];
@@ -1338,6 +1342,7 @@ static int apple_dpxbar_probe(struct platform_device *pdev)
 	spin_lock_init(&dpxbar->lock);
 
 	dpxbar->dev = dev;
+	dpxbar->chip = mux_chip;
 	dpxbar->t6030_dpin = hw->t6030_flow || of_machine_is_compatible("apple,t6030");
 	dpxbar->regs = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(dpxbar->regs))
@@ -1387,7 +1392,23 @@ static int apple_dpxbar_resume(struct device *dev)
 	unsigned long restored = 0, flags;
 	unsigned int i;
 
-	if (!xbar || !xbar->t6030_dpin)
+	if (!xbar)
+		return 0;
+
+	/* As at probe, then each output's route and clocks as its last selection set them. */
+	if (xbar->hw->restore_after_fw_sleep && pm_resume_via_firmware()) {
+		writel(xbar->hw->tunable, xbar->regs + UNK_TUNABLE);
+
+		for (i = 0; i < MUX_MAX; i++) {
+			int state = xbar->selected_dispext[i];
+
+			if (state < 0)
+				continue;
+			apple_dpxbar_set(&xbar->chip->mux[i], state);
+		}
+	}
+
+	if (!xbar->t6030_dpin)
 		return 0;
 
 	spin_lock_irqsave(&xbar->lock, flags);
@@ -1443,6 +1464,7 @@ static const struct apple_dpxbar_hw apple_dpxbar_hw_t6000 = {
 	.tunable = 5,
 	.ops = &apple_dpxbar_ops,
 	.dpin_no_cycle_slip = true,
+	.restore_after_fw_sleep = true,
 };
 
 static const struct apple_dpxbar_hw apple_dpxbar_hw_t6020 = {
