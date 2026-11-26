@@ -122,6 +122,7 @@ static int mux_control_deselect(struct mux_control *m) { (void)m;event('C');xbar
     /* T6030 external processors (dcp->external_native) are not in these scenarios. */
     static void __attribute__((unused)) dcp_external_sink_irq(struct apple_dcp *d) { (void)d;assert(!"T6030 external sink IRQ"); }
     static bool __attribute__((unused)) iomfb_v14_7_external_failed(struct apple_dcp *d) { (void)d;assert(!"T6030 external state");return false; }
+    static void __attribute__((unused)) iomfb_m4_ext_idle_release(struct apple_dcp *d) { (void)d; }
     /* fw_compat is UNKNOWN here: never H17P, 14.7 or 26.6. */
     #ifndef DCP_FIRMWARE_H17P
     #define DCP_FIRMWARE_H17P 5

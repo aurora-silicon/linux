@@ -38,11 +38,21 @@ static inline int dptx_service_bind(struct apple_epic_service *service,
 	return 0;
 }
 
+static inline int dptx_service_rebind(struct apple_epic_service *service,
+				      struct dptx_port *port, s64 unit)
+{
+	port->unit = unit;
+	/* No owner is published until OPEN and AFK publication succeed. */
+	service->cookie = port;
+	return 0;
+}
+
 static inline void dptx_service_publish(struct apple_epic_service *service)
 {
 	struct dptx_port *port = service->cookie;
 
-	port->service = service;
+	WRITE_ONCE(port->closed, false);
+	WRITE_ONCE(port->service, service);
 	port->connected = false;
 	/* Pair with dcp.c readers before they dereference the service cookie. */
 	smp_store_release(&port->enabled, true);
@@ -51,14 +61,19 @@ static inline void dptx_service_publish(struct apple_epic_service *service)
 static inline void dptx_service_unbind(struct apple_epic_service *service)
 {
 	struct dptx_port *port = service->cookie;
+	unsigned long flags;
 
+	spin_lock_irqsave(&service->lock, flags);
 	if (port && port->service == service) {
-		WRITE_ONCE(port->closed, true);
+		/* Retain route eligibility across an authorized reset rebind. */
+		if (!READ_ONCE(port->rebind_allowed))
+			WRITE_ONCE(port->closed, true);
 		/* Make terminal state visible to readers of availability. */
 		smp_store_release(&port->enabled, false);
 		WRITE_ONCE(port->connected, false);
 		reinit_completion(&port->enable_completion);
 	}
+	spin_unlock_irqrestore(&service->lock, flags);
 	/*
 	 * Keep the published owner and cookie valid for retained callers. Once
 	 * this session closes, bind fails closed until reboot:

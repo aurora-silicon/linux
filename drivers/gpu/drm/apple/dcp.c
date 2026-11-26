@@ -2196,14 +2196,14 @@ static const struct apple_rtkit_ops external_h17p_rtkit_ops = {
 	.shmem_destroy = dcp_rtk_shmem_destroy,
 };
 
-void dcp_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message)
+int dcp_send_message_ret(struct apple_dcp *dcp, u8 endpoint, u64 message)
 {
 	bool native_14_7 = dcp->fw_compat == DCP_FIRMWARE_V_14_7;
 	int ret;
 
 	if (READ_ONCE(dcp->quiescing) ||
 	    (dcp_is_ext26(dcp) && READ_ONCE(dcp->ext26_blocked)))
-		return;
+		return -ESHUTDOWN;
 	trace_dcp_send_msg(dcp, endpoint, message);
 	/*
 	 * The adopted T6030 14.7 session shares this mailbox with the panel
@@ -2219,6 +2219,12 @@ void dcp_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message)
 	if (ret && native_14_7)
 		dev_warn_ratelimited(dcp->dev, "DCP send ep %02x failed: %d\n",
 				     endpoint, ret);
+	return ret;
+}
+
+void dcp_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message)
+{
+	dcp_send_message_ret(dcp, endpoint, message);
 }
 
 int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_commit *commit)
@@ -8396,6 +8402,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	spin_lock_init(&dcp->mode_state.lock);
 	spin_lock_init(&dcp->metadata.lock);
 	spin_lock_init(&dcp->hdr.lock);
+	spin_lock_init(&dcp->afk_tx_lock);
 	dcp->active_color.score = -1;
 	mutex_init(&dcp->dcpavserv.lock);
 	INIT_WORK(&dcp->dcpavserv.close_wq, dcpavserv_close_work);
@@ -8579,8 +8586,10 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 			ret = dcp_pin_live_session(dcp);
 			if (!ret)
 				ret = iomfb_m4_adopt_external(dcp);
-			if (!ret)
+			if (!ret) {
 				dcp_t8132_ext_routes(dcp);
+				iomfb_m4_ext_idle_kick(dcp);
+			}
 			return ret;
 		}
 		return component_add(dev, &dcp_comp_ops);
@@ -9133,8 +9142,10 @@ static void dcp_platform_remove(struct platform_device *pdev)
 	/* An adopted external DCP never joined the DRM device. */
 	if (dcp_t8132_ext_m4_node(pdev->dev.of_node)) {
 		/* Enabled with its Type-C routes, see dcp_t8132_ext_routes(). */
-		if (dcp)
+		if (dcp) {
 			disable_delayed_work_sync(&dcp->typec_reconnect_wq);
+			iomfb_m4_ext_idle_close(dcp, true);
+		}
 		return;
 	}
 	component_del(&pdev->dev, &dcp_comp_ops);

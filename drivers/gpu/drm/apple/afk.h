@@ -123,6 +123,8 @@ struct apple_epic_service_ops {
 	bool singleton;
 	/* AFKV2: the provider sends this service's OPEN itself, afk_service_open(). */
 	bool open_later;
+	/* Compact EPIC: send protocol OPEN before ops->init publishes the service. */
+	bool start_before_init;
 
 	/*
 	 * Optional admission, before OPEN/publication. Must not retain service
@@ -549,6 +551,8 @@ struct afk_ringbuffer {
 };
 
 
+#define AFK_RX_RING_SIZE	128
+
 struct apple_dcp_afkep {
 	struct apple_dcp *dcp;
 
@@ -561,6 +565,7 @@ struct apple_dcp_afkep {
 	u8 *command_tags;
 	struct workqueue_struct *wq;
 	struct work_struct service_work;
+	struct work_struct rx_work;
 
 	struct completion started;
 	struct completion stopped;
@@ -586,6 +591,18 @@ struct apple_dcp_afkep {
 	spinlock_t lock;
 	u16 qe_seq;
 	bool stopping; /* lock: no new receive work after shutdown. */
+	bool tx_paused; /* lock: no new host commands while stopping/stopped. */
+	bool rx_paused; /* lock: defer incoming RX words while stopping/stopped. */
+	bool late_rx; /* lock: RX message arrived while rx_paused. */
+	unsigned int tx_active; /* lock: host commands in flight. */
+	u64 rx_ring[AFK_RX_RING_SIZE]; /* lock: allocation-free early RX ring. */
+	u32 rx_head; /* lock */
+	u32 rx_count; /* lock */
+	u32 rx_admitted; /* lock: prefix of rx_ring admitted before rx_paused. */
+	bool rx_work_queued; /* lock */
+	bool rx_failed; /* lock: early RX ring overflowed; never reopen TX. */
+	int compact_start_err; /* lock: first compact protocol start failure. */
+	u32 compact_rebind_gen; /* power_gen authorized to retire same-channel services. */
 
 	/* Compact EPIC, detected from the first compact message (desktop 26.x). */
 	bool compact;
@@ -670,7 +687,17 @@ unsigned int afk_compact_orphans_drop(struct apple_dcp_afkep *ep);
 bool afk_compact_orphans_pending(struct apple_dcp_afkep *ep);
 void afk_shutdown(struct apple_dcp_afkep *ep);
 void afk_quiesce(struct apple_dcp_afkep *ep);
+int afk_pause_tx(struct apple_dcp_afkep *ep);
+int afk_pause_recheck(struct apple_dcp_afkep *ep);
+void afk_pause_rx(struct apple_dcp_afkep *ep);
+int afk_pause_rx_check(struct apple_dcp_afkep *ep);
+void afk_compact_rx_reset(struct apple_dcp_afkep *ep);
+void afk_resume_rx(struct apple_dcp_afkep *ep, bool replay);
+int afk_resume_tx(struct apple_dcp_afkep *ep);
+void afk_block_tx(struct apple_dcp_afkep *ep);
+void afk_flush_rx(struct apple_dcp_afkep *ep);
 int afk_receive_message(struct apple_dcp_afkep *ep, u64 message);
+int afk_receive_message_early(struct apple_dcp_afkep *ep, u64 message);
 int afk_send_epic(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 		  enum epic_type etype, enum epic_category ecat, u8 stype,
 		  const void *payload, size_t payload_len);

@@ -677,6 +677,10 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 	if (xbar == route->xbar && dcp_typec_route_no_dp_alt(route))
 		return -EOPNOTSUPP;
 
+	ret = iomfb_m4_ext_idle_wake(dcp);
+	if (ret)
+		return ret;
+
 	dcp_firmware_metadata_connection(dcp, READ_ONCE(dcp->typec_generation), false);
 
 	/*
@@ -685,14 +689,18 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 	 * (a no-op otherwise), or connecting the borrowed route returns early.
 	 */
 	ret = dcp_dptx_disconnect(dcp, 0);
-	if (ret)
+	if (ret) {
+		iomfb_m4_ext_idle_release(dcp);
 		return ret;
+	}
 
 	if (dcp->fixed_route_selected) {
 		ret = mux_control_deselect(dcp->fixed_xbar);
 		dcp->fixed_route_selected = false;
-		if (ret)
+		if (ret) {
+			iomfb_m4_ext_idle_release(dcp);
 			return ret;
+		}
 	}
 
 	/*
@@ -749,6 +757,7 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 					"failed to restore fixed display route: %d\n",
 					restore_ret);
 		}
+		iomfb_m4_ext_idle_release(dcp);
 		return ret;
 	}
 
@@ -791,7 +800,7 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 							  drm_crtc_index(&dcp->crtc->base),
 							  connector->candidate_crtcs);
 	}
-	dcp->active_typec_route = route;
+	WRITE_ONCE(dcp->active_typec_route, route);
 	scoped_guard(mutex, &dcp->tb_lock) {
 		route->deactivate_xbar_done = false;
 		route->deactivate_error = 0;
@@ -904,7 +913,7 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 	route->selected = false;
 	ended_attachment = dcp_modes_end_typec(dcp, route);
 	if (dcp->active_typec_route == route)
-		dcp->active_typec_route = NULL;
+		WRITE_ONCE(dcp->active_typec_route, NULL);
 
 	if (connector && connector->dcp == to_platform_device(dcp->dev)) {
 		/*
@@ -987,6 +996,7 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 		dcp->connector_type = DRM_MODE_CONNECTOR_USB;
 	}
 
+	iomfb_m4_ext_idle_release(dcp);
 	return 0;
 }
 
@@ -2935,8 +2945,9 @@ static bool dcp_tb_services_ready(struct apple_dcp *dcp)
 	 */
 	if (dcp_is_t8132_ext(dcp))
 		return iomfb_m4_external_ready(dcp) &&
-		       /* Pairs with the DPTX RemotePort publication. */
-		       smp_load_acquire(&dcp->dptxport[0].enabled);
+		       (dcp->v26_6 ? iomfb_m4_ext_route_ready(dcp) :
+			/* Pairs with the DPTX RemotePort publication. */
+			smp_load_acquire(&dcp->dptxport[0].enabled));
 	if (!dcp->external || dcp->fw_compat != DCP_FIRMWARE_V_14_7)
 		return true;
 	/* A native processor starts for the tunnel; the tunnel retries meanwhile. */

@@ -39,6 +39,7 @@ typedef uint32_t u32;
 #define WARN_ON(x) (x)
 #define smp_store_release(p,v) (*(p)=(v))
 #define smp_load_acquire(p) (*(p))
+#define READ_ONCE(p) (p)
 #define WRITE_ONCE(p,v) ((p)=(v))
 #define bitmap_empty(p, n) (!*(p))
 struct apple_epic_service;
@@ -54,7 +55,7 @@ struct apple_epic_service {
  struct apple_dcp_afkep *ep; unsigned long cmd_map[1];
 };
 struct dptx_port {
- bool enabled, connected, closed; int enable_completion; u32 unit;
+ bool enabled, connected, closed, rebind_allowed; int enable_completion; u32 unit;
  struct apple_epic_service *service;
 };
 static void reinit_completion(int *p) { *p = 0; }

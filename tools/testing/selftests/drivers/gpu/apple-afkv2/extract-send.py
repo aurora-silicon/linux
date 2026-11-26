@@ -49,6 +49,12 @@ prefix = r'''
 #define kfree(p) free(p)
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x,v) ((x)=(v))
+#define ESHUTDOWN 108
+#ifndef EBUSY
+#define EBUSY 16
+#endif
+#define spin_lock(l) ((void)(l))
+#define spin_unlock(l) ((void)(l))
 #define spin_lock_irqsave(l,f) ((void)(l),(f)=0)
 #define spin_unlock_irqrestore(l,f) ((void)(l),(void)(f))
 #define dma_rmb() do {} while(0)
@@ -69,10 +75,10 @@ struct cmd_info {
  size_t reply_len; bool reply_len_valid;
  bool done,free_on_ack; int *completion;
 };
-struct dcp { void *dev; bool quiescing,external,crashed,ext26; void *rtk; };
+struct dcp { void *dev; bool quiescing,external,crashed,ext26,afk_tx_closed,afk_rx_failed; int afk_tx_lock; void *rtk; };
 static bool dcp_is_ext26(const struct dcp *dcp) { return dcp->ext26; }
 struct afk_ringbuffer { bool ready; };
-struct apple_dcp_afkep { struct dcp *dcp; bool wire_v2,inline_v2,compact; int endpoint,lock;u8 *command_tags;
+struct apple_dcp_afkep { struct dcp *dcp; bool wire_v2,inline_v2,compact,stopping,tx_paused,rx_paused,rx_failed; int endpoint,lock; unsigned int tx_active; u8 *command_tags;
  struct afk_ringbuffer txbfr,rxbfr; size_t ext26_command_bytes; unsigned int ext26_command_count; };
 struct ops { const char *name; };
 struct apple_epic_service {
@@ -259,7 +265,9 @@ int main(void)
  puts("PASS: extracted production sender, 128-byte command envelope / 32888-byte reply, short OOB, strict/legacy callers, legacy reply lengths, compact status, actual late-ACK ownership and the ext26 budget");
 }
 '''
-bodies = [function(r"static u32 afk_compact_next_status", "compact status allocator"),
+bodies = [function(r"static int afk_tx_failed_under_tx_lock", "TX failure check"),
+          function(r"static int afk_tx_admit_locked", "TX admission check"),
+          function(r"static u32 afk_compact_next_status", "compact status allocator"),
           function(r"static u16 afk_command_tag", "interface tag allocator"),
           function(r"static int afk_send_command_common", "command sender"),
           function(r"static int afk_send_command_timeout_len", "length-aware sender"),
