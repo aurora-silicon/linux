@@ -70,6 +70,7 @@
 		iommus = <&dcp_dart 23>;
 		power-domains = <&ps_disp_cpu>;
 		dma-noncoherent;
+		apple,bw-scratch = <&pmgr_dcp 0 4 0>;
 		status = "disabled";
 
 		disp0_piodma: piodma {
@@ -77,6 +78,18 @@
 			dma-noncoherent;
 			status = "disabled";
 		};
+	};
+
+	/*
+	 * The internal pipe's realtime bandwidth request slot in the PMC, 0x20000
+	 * into the window the DCP has as disp-4: bandwidth agent 0, the one the
+	 * ADT's disp0 bw_req interrupt names (agents are 0x4000 apart from
+	 * 0x20000; the dcpexts' agents 3 and 4 are pmgr_dcpext's slots).
+	 */
+	pmgr_dcp: power-management@382820000 {
+		reg = <0x3 0x82820000 0x0 0x8>;
+		reg-names = "dcp-bw-scratch";
+		#apple,bw-scratch-cells = <3>;
 	};
 
 	/* The scanout frontend; it has no registers of its own. */
