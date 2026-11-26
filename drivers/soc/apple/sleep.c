@@ -2751,18 +2751,10 @@ static void __noreturn sleep_deep_wfi(void)
 	}
 }
 
-/* T6030's reset-witness control (t6030_reset_test()): the one core it powers off, or ~0 */
-static u64 sleep_reset_test_mpidr = ~0ULL;
-/* ... and whether that core writes its stop bit first (apple_sleep.reset_test_stop) */
-static bool sleep_reset_test_stop = true;
-
 static void sleep_cpu_stop(u64 mpidr)
 {
 	struct apple_sleep *s = apple_sleep;
 
-	if ((mpidr & MPIDR_HWID_BITMASK) == READ_ONCE(sleep_reset_test_mpidr) &&
-	    !READ_ONCE(sleep_reset_test_stop))
-		return;
 	writel(sleep_cpu_start_bit(s, mpidr), s->cpu_start + CPU_START_STOP);
 	dsb(sy);
 }
@@ -2848,8 +2840,6 @@ static void sleep_cpu_observe(u64 mpidr)
 		t8142_observe(s, ms);
 }
 
-static void __noreturn t6030_reset_test_off(void);
-
 static void sleep_cpu_off(u64 mpidr)
 {
 	sleep_cpu_observe(mpidr);
@@ -2859,8 +2849,6 @@ static void sleep_cpu_off(u64 mpidr)
 /* A stopped core with last steps of its own before the WFI */
 static void sleep_cpu_down_off(u64 mpidr)
 {
-	if ((mpidr & MPIDR_HWID_BITMASK) == READ_ONCE(sleep_reset_test_mpidr))
-		t6030_reset_test_off();
 	if (apple_sleep && apple_sleep->soc->ops->cpu_down)
 		apple_sleep->soc->ops->cpu_down(apple_sleep, mpidr);
 	sleep_cpu_observe(mpidr);
