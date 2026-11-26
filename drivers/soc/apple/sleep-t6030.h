@@ -581,9 +581,12 @@ static void t6030_sleep_check_stops(void)
 {
 	struct apple_sleep_coproc *c = apple_sleep_coprocs_stop_failed();
 
-	if (c)
-		panic("T6030 sleep: %s's stop failed (%d), not committing", dev_name(c->dev),
-		      c->stop_ret);
+	if (!c)
+		return;
+	/* With notes on, +2 already names the slot: +4 gets why, as -errno. */
+	sleep_note_at(apple_sleep, 4, min(-c->stop_ret, 0xff));
+	panic("T6030 sleep: %s's stop failed (%d), not committing", dev_name(c->dev),
+	      c->stop_ret);
 }
 
 /*
