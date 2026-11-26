@@ -3485,6 +3485,12 @@ void apple_rtkit_mailbox_recv_off(struct apple_rtkit *rtk)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_mailbox_recv_off);
 
+u32 apple_rtkit_mailbox_status(struct apple_rtkit *rtk)
+{
+	return apple_mbox_read_status(rtk->mbox);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_mailbox_status);
+
 int apple_rtkit_sleep_stop(struct apple_rtkit *rtk, void __iomem *cpu_control)
 {
 	int ret;

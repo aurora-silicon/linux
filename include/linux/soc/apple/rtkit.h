@@ -345,6 +345,7 @@ int apple_rtkit_sleep_idle_polled(struct apple_rtkit *rtk, void __iomem *cpu_con
  * goes. Safe with interrupts off, and apple_rtkit_warm_restart() sets it again.
  */
 void apple_rtkit_mailbox_recv_off(struct apple_rtkit *rtk);
+u32 apple_rtkit_mailbox_status(struct apple_rtkit *rtk);
 
 /*
  * Prepare for a firmware being restarted with its buffers kept.

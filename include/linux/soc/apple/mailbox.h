@@ -106,6 +106,8 @@ void apple_mbox_stop(struct apple_mbox *mbox);
 bool apple_mbox_send_ready(struct apple_mbox *mbox);
 /* T6050 ANS only: raw native idle-status scalar, not a DMA-lifetime fence. */
 int apple_mbox_ans_idle_status(struct apple_mbox *mbox, u32 *status);
+/* Single 32-bit read of mailbox +0x0, as macOS does after recv-off on T6030. */
+u32 apple_mbox_read_status(struct apple_mbox *mbox);
 int apple_mbox_restore(struct apple_mbox *mbox);
 int apple_mbox_poll(struct apple_mbox *mbox);
 /* Narrow no-post-callback-MMIO receive; see provider's supported transport guard. */

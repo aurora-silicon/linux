@@ -1255,6 +1255,12 @@ int apple_mbox_ans_idle_status(struct apple_mbox *mbox, u32 *status)
 }
 EXPORT_SYMBOL_GPL(apple_mbox_ans_idle_status);
 
+u32 apple_mbox_read_status(struct apple_mbox *mbox)
+{
+	return readl(mbox->regs);
+}
+EXPORT_SYMBOL_GPL(apple_mbox_read_status);
+
 /*
  * The mailbox's power domain was off while it stayed started (its consumer
  * powered its co-processor down and up again around it): set the

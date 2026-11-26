@@ -179,6 +179,8 @@ static int apple_pmp_commit_stop_fn(void *unused)
 
 	ret = apple_rtkit_sleep_idle_polled(c->rtk, c->control, &us);
 	apple_rtkit_mailbox_recv_off(c->rtk);
+	if (!c->control)
+		apple_rtkit_mailbox_status(c->rtk);
 	for (i = 0; c->sram && i < c->count; i++)
 		c->words[i] = readl_relaxed(c->sram + 4 * i);
 	/* Told to idle, it can't carry on whatever it answered: the sleep goes on. The value is
@@ -220,17 +222,25 @@ bool apple_pmp_keep_bound(void)
 /* Whether the sleep's last step takes the PMP: registered with the sleep driver, once. */
 static bool apple_pmp_commit_available(struct device *dev)
 {
-	void __iomem *asc;
+	void __iomem *asc = NULL;
 	int idx;
 
 	if (pmp_commit_registered)
 		return true;
-	idx = of_property_match_string(dev->of_node, "reg-names", "asc");
-	asc = idx >= 0 ? of_iomap(dev->of_node, idx) : NULL;
-	if (!asc)
-		return false;
+	/*
+	 * On T6030 macOS never reads ASC CPU_STATUS or clears CPU_CONTROL_RUN
+	 * at the PMP's commit stop; it sends the idle pair, disables mailbox
+	 * receive, reads mailbox +0x0 once, and lowers the PMP power word.
+	 */
+	if (!of_device_is_compatible(dev->of_node, "apple,t6030-pmp-v2")) {
+		idx = of_property_match_string(dev->of_node, "reg-names", "asc");
+		asc = idx >= 0 ? of_iomap(dev->of_node, idx) : NULL;
+		if (!asc)
+			return false;
+	}
 	if (apple_sleep_coproc_register(dev, asc, false, apple_pmp_commit_stop_fn, NULL)) {
-		iounmap(asc);
+		if (asc)
+			iounmap(asc);
 		return false;
 	}
 	pmp_commit_registered = true;

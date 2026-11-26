@@ -957,6 +957,7 @@ static void t6030_pmp_idle(struct apple_sleep *s)
 				     &t->pmp_ack[1]);
 	writel(readl(mb + T6030_MBOX_I2A_CONTROL) & ~T6030_MBOX_I2A_IRQ,
 	       mb + T6030_MBOX_I2A_CONTROL);
+	readl(mb);
 	t->pmp_idle_ret = ret;
 }
 

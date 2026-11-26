@@ -173,6 +173,12 @@ struct sio_hw_data {
 	bool stop_at_commit;
 	/* Stopped by the sleep's commit, not in suspend_late */
 	bool commit_stop;
+	/*
+	 * macOS does not poll ASC CPU_STATUS or clear CPU_CONTROL_RUN at commit stop;
+	 * it sends the idle pair, disables mailbox receive, reads mailbox +0x0 once,
+	 * and lowers the power domain directly.
+	 */
+	bool commit_no_cpu_down;
 	/* DMA arrays owned by the driver, if not protocol 9's */
 	const struct sio_dma_arrays *arrays;
 	int (*check_boot_tables)(struct device *dev);
@@ -649,6 +655,7 @@ static const struct sio_hw_data sio_hw_generic = {
  */
 static const struct sio_hw_data sio_hw_t6030 = {
 	.stop_at_commit = true,
+	.commit_no_cpu_down = true,
 	.fifo_threshold = 0x600,
 	.cfg_word4 = 0x800,
 	.clear_period_desc = true,
@@ -2014,11 +2021,14 @@ badprop:
 static int sio_commit_stop(void *data)
 {
 	struct sio_data *sio = data;
+	void __iomem *control = sio->hw->commit_no_cpu_down ? NULL : sio->base + REG_CPU_CONTROL;
 	unsigned int us;
 	int ret;
 
-	ret = apple_rtkit_sleep_idle_polled(sio->rtk, sio->base + REG_CPU_CONTROL, &us);
+	ret = apple_rtkit_sleep_idle_polled(sio->rtk, control, &us);
 	apple_rtkit_mailbox_recv_off(sio->rtk);
+	if (sio->hw->commit_no_cpu_down)
+		apple_rtkit_mailbox_status(sio->rtk);
 
 	return ret;
 }
@@ -2185,8 +2195,9 @@ static int sio_probe(struct platform_device *pdev)
 
 rpm_put:
 	if (!err && hw->stop_at_commit)
-		sio->commit_registered = !apple_sleep_coproc_register(&pdev->dev, sio->base, false,
-								      sio_commit_stop, sio);
+		sio->commit_registered = !apple_sleep_coproc_register(&pdev->dev,
+								      hw->commit_no_cpu_down ? NULL : sio->base,
+								      false, sio_commit_stop, sio);
 	/* Where the sleep orders its stops (T6050, T6030), SIO's comes before the PMP's */
 	if (sio->commit_registered)
 		apple_sleep_coproc_set_early(&pdev->dev);
