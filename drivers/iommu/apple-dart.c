@@ -294,6 +294,8 @@ struct apple_dart_hw {
 
 	u32 lock;
 	u32 lock_bit;
+	/* A firmware sleep resets the DART and its lock: a locked DART is saved and restored. */
+	bool sleep_clears_lock;
 
 	u32 error;
 
@@ -585,6 +587,10 @@ struct apple_dart {
 
 	u32 save_tcr[DART_MAX_STREAMS];
 	u32 save_ttbr[DART_MAX_STREAMS][DART_MAX_TTBR];
+	/* A locked DART's lock word and stream enables, see apple_dart_hw.sleep_clears_lock */
+	u32 save_lock;
+	u32 save_enable[DART_MAX_STREAMS / 32];
+	bool locked_saved;
 
 	u64 *locked_ttbr[DART_MAX_STREAMS][DART_MAX_TTBR];
 	/* Values published by this driver into initially vacant root slots. */
@@ -7107,6 +7113,7 @@ static const struct apple_dart_hw apple_dart_hw_t6000 = {
 	.enable_streams = DART_T8020_STREAMS_ENABLE,
 	.lock = DART_T8020_CONFIG,
 	.lock_bit = DART_T8020_CONFIG_LOCK,
+	.sleep_clears_lock = true,
 
 	.error = DART_T8020_ERROR,
 
@@ -7442,8 +7449,21 @@ static __maybe_unused int apple_dart_suspend(struct device *dev)
 		return 0;
 
 	/* Locked DARTs can't be restored so skip saving their registers. */
-	if (dart->locked)
-		return 0;
+	if (dart->locked) {
+		unsigned int idx;
+
+		/*
+		 * Unless a sleep takes the lock with the registers. Saved at every suspend:
+		 * a DART that is runtime suspended when the system sleeps isn't asked again.
+		 */
+		if (!dart->hw->sleep_clears_lock)
+			return 0;
+		dart->save_lock = apple_dart_readl(dart, dart->hw->lock);
+		for (idx = 0; idx < BITS_TO_U32(dart->num_streams); idx++)
+			dart->save_enable[idx] =
+				apple_dart_readl(dart, dart->hw->enable_streams + 4 * idx);
+		dart->locked_saved = true;
+	}
 
 	apple_dart_save_state(dart);
 	return 0;
@@ -7750,8 +7770,30 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 		return 0;
 
 	/* Locked DARTs can't be restored, and they should not need it */
-	if (dart->locked)
+	if (dart->locked) {
+		/*
+		 * Except one the sleep reset, lock included: the translations and stream
+		 * enables go back as they were, then the lock word, which closes them again.
+		 */
+		if (!dart->locked_saved || !pm_resume_via_firmware() ||
+		    apple_dart_state_retained(dart))
+			return 0;
+		for (sid = 0; sid < dart->num_streams; sid++) {
+			for (idx = 0; idx < dart->hw->ttbr_count; idx++)
+				apple_dart_writel(dart, dart->save_ttbr[sid][idx],
+						  DART_TTBR(dart, sid, idx));
+			apple_dart_writel(dart, dart->save_tcr[sid], DART_TCR(dart, sid));
+		}
+		for (idx = 0; idx < BITS_TO_U32(dart->num_streams); idx++)
+			apple_dart_writel(dart, dart->save_enable[idx],
+					  dart->hw->enable_streams + 4 * idx);
+		apple_dart_writel(dart, dart->save_lock, dart->hw->lock);
+		ret = apple_dart_invalidate_each_stream(dart);
+		if (ret)
+			dev_warn(dev, "locked DART restored after the sleep, TLB flush failed: %d\n",
+				 ret);
 		return 0;
+	}
 
 	/*
 	 * Not for a DART restored at every power-up, as macOS's SPTM does (its
