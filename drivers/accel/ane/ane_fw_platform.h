@@ -205,5 +205,7 @@ int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_plat
 void ane_h16_backend_remove(struct platform_device *pdev);
 int ane_h16_backend_suspend(struct device *dev);
 int ane_h16_backend_resume(struct device *dev);
+int ane_h16_backend_runtime_suspend(struct device *dev);
+int ane_h16_backend_runtime_resume(struct device *dev);
 
 #endif /* __ANE_FW_PLATFORM_H__ */

@@ -85,7 +85,7 @@ static bool __attribute__((unused)) cancel_work_sync(struct work_struct *w) { bo
 struct apple_dcp;struct apple_dcp_afkep;struct apple_epic_service;
 void afk_service_retry(struct apple_dcp_afkep *ep);
 /* open_later: a firmware 27 panel service that sends its own OPEN; none is here. */
-struct apple_epic_service_ops { char name[32];bool reusable,optional,open_later;void (*init)(struct apple_epic_service *,const char *,const char *,s64);int (*prepare)(struct apple_epic_service *,const char *,const char *,s64);int (*revalidate)(struct apple_epic_service *,const char *,const char *,s64);void (*init_props)(struct apple_epic_service *,s64,const void *,size_t);void (*teardown)(struct apple_epic_service *); };
+struct apple_epic_service_ops { char name[32];bool reusable,optional,open_later,singleton;void (*init)(struct apple_epic_service *,const char *,const char *,s64);int (*prepare)(struct apple_epic_service *,const char *,const char *,s64);int (*revalidate)(struct apple_epic_service *,const char *,const char *,s64);void (*init_props)(struct apple_epic_service *,s64,const void *,size_t);void (*teardown)(struct apple_epic_service *); };
 struct epic_cmd_info { u16 tag;u8 type;size_t reply_length,reply_len;bool reply_len_valid;void *rxbuf,*txbuf;dma_addr_t rxbuf_dma,txbuf_dma;size_t rxlen,txlen;u32 retcode;bool done,free_on_ack;int *completion; };
 struct apple_epic_service {
     struct apple_dcp_afkep *ep;const struct apple_epic_service_ops *ops;
@@ -183,7 +183,7 @@ static int skip(struct dcp_parse_ctx *h) { assert(!h->key);h->index++;h->key=tru
            function('epic/dpavservep.c','static void dcpavserv_teardown('),function('epic/dpavservep.c','void dpavservep_detach('),
            function('afk.c','static const struct apple_epic_service_ops *\nafk_match_service('),
            function('afk.c','static struct apple_epic_service *afk_epic_find_service('),
-           function('afk.h','static inline bool afk_service_retired('),function('afk.c','static bool afk_epic_channel_retired('),
+           function('afk.h','static inline bool afk_service_retired('),function('afk.h','static inline bool afk_service_supersede('),function('afk.c','static bool afk_epic_channel_retired('),
            function('afk.c','static void afk_discard_pending_open('),function('afk.c','static void afk_retry_service_init('),function('afk.c','static void afk_service_worker('),function('afk.c','static void afk_recv_handle_init('),
            function('epic/dpavservep.c','static int dcpdpserv_prepare('),
            function('epic/dpavservep.c','static void dcpdpserv_teardown('),function('afk.c','static void afk_recv_handle_teardown('),
@@ -479,6 +479,45 @@ static void optional_admission_controls(void)
     memset(ep.services,0,sizeof(ep.services));ep.num_channels=AFK_MAX_CHANNEL;ep.ops=announcement_ops;
     puts("PASS optional absence remains closed; required unsupported and genuine optional failures remain errors");
 }
+static struct apple_epic_service *singleton_owner;
+/* As av_audiosrv_init(): the owner pins the new instance and lets go of the old one. */
+static void singleton_init(struct apple_epic_service *s,const char *n,const char *c,s64 u)
+{
+    struct apple_epic_service *old=singleton_owner;
+    singleton_owner=afk_service_get(s);assert(singleton_owner==s);
+    if(old) afk_service_put(old);
+}
+static int singleton_prepare(struct apple_epic_service *s,const char *n,const char *c,s64 u) { return 0; }
+static void singleton_rejected_replacement(void)
+{
+    /* A classic AV singleton (no prepare): its replacement must not retire the
+     * instance it would replace before the replacement has a slot. */
+    const struct apple_epic_service_ops single[]={{.name="dcpav-service-epic",.reusable=true,.singleton=true,.prepare=singleton_prepare,.init=singleton_init},{.name=""}};
+    memset(ep.services,0,sizeof(ep.services));singleton_owner=NULL;
+    ep.ops=single;ep.match_epic_name=true;ep.num_channels=0;d.fw_compat=DCP_FIRMWARE_H17P;
+    announce(1,name,class,1);run_retries();
+    struct apple_epic_service *a=singleton_owner;
+    assert(a && a->channel==1 && a->enabled && !a->torndown && a->users==1);
+    /* Every other slot is retired with a reply still owed: none is reclaimable. */
+    for(unsigned i=0;i<AFK_MAX_CHANNEL;i++) {
+        struct apple_epic_service *o=&ep.services[i];
+        if(o==a) continue;
+        o->ops=&single[0];o->torndown=true;o->enabled=false;o->channel=100+i;o->cmd_map[0]|=1;
+    }
+    ep.num_channels=AFK_MAX_CHANNEL;diagnostic_errors=0;
+    announce(5,name,class,5);run_retries();
+    assert(diagnostic_errors>=1);
+    assert(singleton_owner==a && a->enabled && !a->torndown && a->users==1);
+    assert(afk_service_get(a)==a);afk_service_put(a);
+    /* A slot comes back: the replacement is admitted, and only then retires the previous instance. */
+    ep.services[a==&ep.services[0]?1:0].cmd_map[0]&=~1UL;
+    announce(5,name,class,5);run_retries();
+    assert(singleton_owner && singleton_owner!=a && singleton_owner->channel==5 && singleton_owner->enabled);
+    assert(a->torndown && !a->enabled && !a->users);
+    afk_service_put(singleton_owner);singleton_owner=NULL;
+    memset(ep.services,0,sizeof(ep.services));ep.num_channels=AFK_MAX_CHANNEL;ep.ops=announcement_ops;
+    puts("PASS a singleton replacement rejected for lack of a slot leaves the previous instance usable; an admitted one retires it");
+}
 int main(void)
 {
     d.hw.iomfb_method_profile=2;d.typec_cable_connected=true;d.typec_generation=1;d.nr_modes=1;d.connector=&con;d.dev=&d;
@@ -555,6 +594,7 @@ int main(void)
     assert(d.dcpavserv.service==pending && pending->users==1);dpavservep_detach(&d);
     assert(!pending->users && !d.hpd_mutex && !d.dcpavserv.lock);
     memset(&ep.services,0,sizeof(ep.services));ep.wire_v2=true;ep.endpoint=0x2a;d.hw.iomfb_method_profile=2;
+    singleton_rejected_replacement();
     repeated_announcements();
     deferred_announcements();
     free(ep.command_tags);ep.command_tags=NULL;

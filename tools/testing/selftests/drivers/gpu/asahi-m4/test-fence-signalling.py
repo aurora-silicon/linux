@@ -350,14 +350,20 @@ mod cumulative_syncs_test {
             #[derive(Default)]
             pub(crate) struct BundleLog {
                 pub(crate) published: Vec<Fence>,
+                pub(crate) compute_only: Vec<bool>,
                 pub(crate) failed: Vec<Fence>,
                 pub(crate) fail_publish: bool,
             }
 
             pub(crate) struct SignalBundle(pub(crate) Rc<RefCell<BundleLog>>);
             impl SignalBundle {
-                pub(crate) fn publish(&mut self, fence: &Fence) -> Result {
+                pub(crate) fn publish(&mut self, fence: &Fence, compute_only: bool) -> Result {
+                    assert!(
+                        !compute_only,
+                        "G16 must not trigger G17 compute-waiter effort accounting"
+                    );
                     let mut log = self.0.borrow_mut();
+                    log.compute_only.push(compute_only);
                     if log.fail_publish {
                         return Err(ENOMEM);
                     }

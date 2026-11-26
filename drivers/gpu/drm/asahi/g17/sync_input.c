@@ -23,8 +23,14 @@ static int collect_leaf(struct dma_fence *leaf,
 				out[i].status = status;
 			return 0;
 		}
-		if (coalesce_contexts && status == 0 && out[i].status == 0 &&
-		    out[i].fence->context == leaf->context) {
+		/*
+		 * Coalesce healthy unsignaled leaves sharing a fence context (such
+		 * as multiple points of one timeline chain), keeping only the
+		 * latest seqno. Failed leaves are never coalesced, so errors are
+		 * preserved, and neither is context 0, which names no timeline.
+		 */
+		if (coalesce_contexts && status == 0 && leaf->context != 0 &&
+		    out[i].status == 0 && out[i].fence->context == leaf->context) {
 			if (dma_fence_is_later(leaf, out[i].fence)) {
 				dma_fence_put(out[i].fence);
 				out[i].fence = dma_fence_get(leaf);
@@ -146,4 +152,16 @@ struct dma_fence *asahi_g17_merge_fences(struct dma_fence *const *fences, size_t
 	merged = __dma_fence_unwrap_merge(count, (struct dma_fence **)fences, cursors);
 	kfree(cursors);
 	return merged;
+}
+
+/*
+ * How @a orders against @b: 1 when it signals after it on their shared
+ * context, 0 when not, -1 when they are on different contexts, which
+ * dma_fence_is_later() would warn about.
+ */
+int asahi_g17_fence_order(struct dma_fence *a, struct dma_fence *b)
+{
+	if (a->context != b->context)
+		return -1;
+	return dma_fence_is_later(a, b);
 }
