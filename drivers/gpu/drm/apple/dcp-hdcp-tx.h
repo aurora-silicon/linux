@@ -111,6 +111,5 @@ void dcp_hdcp_abort(struct dcp_hdcp_tx *tx);
  * The receiver's status on an encrypted link: 0 while it holds, -EAGAIN when
  * it asks for re-authentication or reports a link integrity failure.
  */
-int dcp_hdcp_check_link(struct dcp_hdcp_tx *tx);
 
 #endif /* __APPLE_DCP_HDCP_TX_H__ */

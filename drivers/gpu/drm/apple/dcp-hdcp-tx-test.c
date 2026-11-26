@@ -39,6 +39,7 @@ struct fake {
 	bool sep_busy;			/* the SEP is not available */
 	bool encryption;
 	bool closed;
+	bool read_rxstatus;		/* the TX read RxStatus */
 };
 
 static int fake_read(void *ctx, u32 addr, void *buf, size_t len)
@@ -47,6 +48,8 @@ static int fake_read(void *ctx, u32 addr, void *buf, size_t len)
 
 	if (addr < FAKE_REG_BASE || addr + len > FAKE_REG_BASE + FAKE_REG_SIZE)
 		return -EIO;
+	if (addr == DP_HDCP_2_2_REG_RXSTATUS_OFFSET)
+		f->read_rxstatus = true;
 	memcpy(buf, f->regs + addr - FAKE_REG_BASE, len);
 	return 0;
 }
@@ -450,7 +453,7 @@ static void tx_revoked(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, f->encryption);
 }
 
-static void tx_timeout_and_rxstatus(struct kunit *test)
+static void tx_timeout_no_rxstatus(struct kunit *test)
 {
 	struct dcp_hdcp_tx tx;
 	struct fake *f = fake_new(test, &tx, false, 0);
@@ -460,12 +463,13 @@ static void tx_timeout_and_rxstatus(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, dcp_hdcp_authenticate(&tx), -ETIMEDOUT);
 	KUNIT_EXPECT_FALSE(test, f->encryption);
 
-	/* A lost event, but RxStatus says H' is there. */
+	/* RxStatus is DCP's: never read, even when an event is late. */
 	f = fake_new(test, &tx, false, 0);
 	f->stored = true;
 	f->events = 0;
 	*reg(f, DP_HDCP_2_2_REG_RXSTATUS_OFFSET) = BIT(1);
-	KUNIT_EXPECT_EQ(test, dcp_hdcp_authenticate(&tx), 0);
+	KUNIT_EXPECT_EQ(test, dcp_hdcp_authenticate(&tx), -ETIMEDOUT);
+	KUNIT_EXPECT_FALSE(test, f->read_rxstatus);
 }
 
 static void tx_close_mid_auth(struct kunit *test)
@@ -503,7 +507,7 @@ static void tx_m_prime_retry(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, f->encryption);
 }
 
-static void tx_not_capable_and_link_check(struct kunit *test)
+static void tx_not_capable(struct kunit *test)
 {
 	struct dcp_hdcp_tx tx;
 	struct fake *f = fake_new(test, &tx, false, 0);
@@ -516,11 +520,6 @@ static void tx_not_capable_and_link_check(struct kunit *test)
 					.ops = &fake_ops, .ctx = f, .type = 2 }),
 			-EINVAL);
 
-	KUNIT_EXPECT_EQ(test, dcp_hdcp_check_link(&tx), 0);
-	*reg(f, DP_HDCP_2_2_REG_RXSTATUS_OFFSET) = BIT(3);
-	KUNIT_EXPECT_EQ(test, dcp_hdcp_check_link(&tx), -EAGAIN);
-	*reg(f, DP_HDCP_2_2_REG_RXSTATUS_OFFSET) = BIT(4);
-	KUNIT_EXPECT_EQ(test, dcp_hdcp_check_link(&tx), -EAGAIN);
 }
 
 static void tx_l_prime_retry(struct kunit *test)
@@ -561,12 +560,12 @@ static struct kunit_case dcp_hdcp_tx_cases[] = {
 	KUNIT_CASE(tx_topology_exceeded),
 	KUNIT_CASE(tx_revoked),
 	KUNIT_CASE(tx_bad_receiver_id),
-	KUNIT_CASE(tx_timeout_and_rxstatus),
+	KUNIT_CASE(tx_timeout_no_rxstatus),
 	KUNIT_CASE(tx_close_mid_auth),
 	KUNIT_CASE(tx_m_prime_retry),
 	KUNIT_CASE(tx_l_prime_retry),
 	KUNIT_CASE(tx_sep_busy),
-	KUNIT_CASE(tx_not_capable_and_link_check),
+	KUNIT_CASE(tx_not_capable),
 	{ }
 };
 
