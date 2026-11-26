@@ -1796,6 +1796,9 @@ impl Runtime {
             state.waiting_control = None;
             match restart {
                 Ok(()) => {
+                    // No round crosses a sleep (sleep_prepare refuses one), and the restarted
+                    // firmware may count generations again from its start: forget old rounds.
+                    state.ledger = g14_v27_2_abi::RecoveryLedger::default();
                     dev_info!(self.dev, "GPU firmware 27.2 back in {} us (commit idle={} {} us, pending={})\n",
                               started.elapsed().as_micros_ceil(), commit.idle_ret, commit.idle_us,
                               state.pending.len());
