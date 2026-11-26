@@ -15,25 +15,7 @@ static struct dcp_hdcp_link bound(void)
 	return l;
 }
 
-/* Runs steps OPEN..TYPE on @gen; returns the action after the last one. */
-static enum dcp_hdcp_action run_to_wait(struct kunit *test,
-					struct dcp_hdcp_link *l, u32 gen,
-					unsigned long now)
-{
-	enum dcp_hdcp_action a = DCP_HDCP_NONE;
-	int s;
-
-	for (s = DCP_HDCP_STEP_OPEN; s < DCP_HDCP_STEP_ENCRYPT; s++) {
-		KUNIT_EXPECT_EQ(test, l->step, s);
-		a = dcp_hdcp_step_done(l, gen, s, true, now);
-		KUNIT_EXPECT_EQ(test, l->state, DCP_HDCP_AUTH);
-		KUNIT_EXPECT_EQ(test, dcp_hdcp_property(l),
-				DRM_MODE_CONTENT_PROTECTION_DESIRED);
-	}
-	return a;
-}
-
-static void hdcp_no_property_without_both_sides(struct kunit *test)
+static void hdcp_property_needs_all(struct kunit *test)
 {
 	KUNIT_EXPECT_TRUE(test, dcp_hdcp_attach_property(true, true, true));
 	KUNIT_EXPECT_FALSE(test, dcp_hdcp_attach_property(false, true, true));
@@ -41,46 +23,72 @@ static void hdcp_no_property_without_both_sides(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, dcp_hdcp_attach_property(true, true, false));
 }
 
-static void hdcp_unbound_never_starts(struct kunit *test)
+static void hdcp_unbound_declines(struct kunit *test)
 {
 	struct dcp_hdcp_link l = { };
 
-	dcp_hdcp_request(&l, true, T0);
-	KUNIT_EXPECT_EQ(test, dcp_hdcp_start(&l, 1, T0), DCP_HDCP_NONE);
+	KUNIT_EXPECT_EQ(test, dcp_hdcp_request(&l, true, 0, T0), DCP_HDCP_NONE);
+	KUNIT_EXPECT_FALSE(test, dcp_hdcp_open(&l, 1, T0));
 	KUNIT_EXPECT_EQ(test, dcp_hdcp_property(&l),
 			DRM_MODE_CONTENT_PROTECTION_DESIRED);
 	l.relay = true;
-	KUNIT_EXPECT_EQ(test, dcp_hdcp_start(&l, 1, T0), DCP_HDCP_NONE);
+	KUNIT_EXPECT_FALSE(test, dcp_hdcp_open(&l, 1, T0));
+	/* Both sides bound: ask DCP for a session. */
+	KUNIT_EXPECT_EQ(test, dcp_hdcp_bind(&l, true, true, T0), DCP_HDCP_KICK);
+	KUNIT_EXPECT_TRUE(test, dcp_hdcp_open(&l, 1, T0));
 }
 
-static void hdcp_full_session_enables(struct kunit *test)
+static void hdcp_undesired_declines(struct kunit *test)
 {
 	struct dcp_hdcp_link l = bound();
-	unsigned long wait = msecs_to_jiffies(HDCP_2_2_DELAY_BEFORE_ENCRYPTION_EN);
 
 	KUNIT_EXPECT_EQ(test, dcp_hdcp_property(&l),
 			DRM_MODE_CONTENT_PROTECTION_UNDESIRED);
-	KUNIT_EXPECT_EQ(test, dcp_hdcp_start(&l, 1, T0), DCP_HDCP_NONE);
-	dcp_hdcp_request(&l, true, T0);
-	KUNIT_EXPECT_EQ(test, dcp_hdcp_start(&l, 1, T0), DCP_HDCP_RUN);
-	KUNIT_EXPECT_EQ(test, run_to_wait(test, &l, 1, T0), DCP_HDCP_WAIT);
-	KUNIT_EXPECT_EQ(test, l.encrypt_at, T0 + wait);
+	KUNIT_EXPECT_FALSE(test, dcp_hdcp_open(&l, 1, T0));
+	KUNIT_EXPECT_EQ(test, dcp_hdcp_request(&l, true, 0, T0), DCP_HDCP_KICK);
+	KUNIT_EXPECT_TRUE(test, dcp_hdcp_open(&l, 1, T0));
+	/* One session at a time. */
+	KUNIT_EXPECT_FALSE(test, dcp_hdcp_open(&l, 1, T0));
+}
 
-	/* Not before the 200 ms. */
-	KUNIT_EXPECT_FALSE(test, dcp_hdcp_may_encrypt(&l, 1, T0 + wait - 1));
-	KUNIT_EXPECT_FALSE(test, dcp_hdcp_may_encrypt(&l, 2, T0 + wait));
-	KUNIT_EXPECT_TRUE(test, dcp_hdcp_may_encrypt(&l, 1, T0 + wait));
-	KUNIT_EXPECT_EQ(test, dcp_hdcp_step_done(&l, 1, DCP_HDCP_STEP_ENCRYPT,
-						 true, T0 + wait),
-			DCP_HDCP_NONE);
+static void hdcp_session_enables(struct kunit *test)
+{
+	struct dcp_hdcp_link l = bound();
+
+	dcp_hdcp_request(&l, true, 1, T0);
+	KUNIT_ASSERT_TRUE(test, dcp_hdcp_open(&l, 1, T0));
+	KUNIT_EXPECT_EQ(test, dcp_hdcp_property(&l),
+			DRM_MODE_CONTENT_PROTECTION_DESIRED);
+	KUNIT_EXPECT_EQ(test, dcp_hdcp_auth_done(&l, 1, 0, T0), DCP_HDCP_NONE);
 	KUNIT_EXPECT_EQ(test, dcp_hdcp_property(&l),
 			DRM_MODE_CONTENT_PROTECTION_ENABLED);
+	KUNIT_EXPECT_EQ(test, l.type, 1);
 
 	/* Userspace turns it off: teardown, UNDESIRED. */
-	KUNIT_EXPECT_EQ(test, dcp_hdcp_request(&l, false, T0 + wait),
+	KUNIT_EXPECT_EQ(test, dcp_hdcp_request(&l, false, 1, T0),
 			DCP_HDCP_TEARDOWN);
 	KUNIT_EXPECT_EQ(test, dcp_hdcp_property(&l),
 			DRM_MODE_CONTENT_PROTECTION_UNDESIRED);
+	KUNIT_EXPECT_EQ(test, dcp_hdcp_request(&l, false, 1, T0), DCP_HDCP_NONE);
+}
+
+static void hdcp_type_change_reauths(struct kunit *test)
+{
+	struct dcp_hdcp_link l = bound();
+
+	dcp_hdcp_request(&l, true, 0, T0);
+	dcp_hdcp_open(&l, 1, T0);
+	dcp_hdcp_auth_done(&l, 1, 0, T0);
+	/* Same type again: nothing. */
+	KUNIT_EXPECT_EQ(test, dcp_hdcp_request(&l, true, 0, T0), DCP_HDCP_NONE);
+	KUNIT_EXPECT_EQ(test, l.state, DCP_HDCP_ENABLED);
+	/* Type 1 now: the running session goes, no backoff. */
+	KUNIT_EXPECT_EQ(test, dcp_hdcp_request(&l, true, 1, T0),
+			DCP_HDCP_TEARDOWN);
+	KUNIT_EXPECT_EQ(test, l.state, DCP_HDCP_DESIRED);
+	KUNIT_EXPECT_EQ(test, l.failures, 0);
+	KUNIT_EXPECT_TRUE(test, dcp_hdcp_open(&l, 1, T0));
+	KUNIT_EXPECT_EQ(test, l.type, 1);
 }
 
 static void hdcp_failure_backs_off(struct kunit *test)
@@ -89,102 +97,133 @@ static void hdcp_failure_backs_off(struct kunit *test)
 	unsigned long t = T0;
 	unsigned int i;
 
-	dcp_hdcp_request(&l, true, t);
-	KUNIT_EXPECT_EQ(test, dcp_hdcp_start(&l, 1, t), DCP_HDCP_RUN);
-	dcp_hdcp_step_done(&l, 1, DCP_HDCP_STEP_OPEN, true, t);
-	dcp_hdcp_step_done(&l, 1, DCP_HDCP_STEP_AKE_INIT, true, t);
-	/* The certificate does not check out. */
-	KUNIT_EXPECT_EQ(test, dcp_hdcp_step_done(&l, 1, DCP_HDCP_STEP_CERT,
-						 false, t),
+	dcp_hdcp_request(&l, true, 0, t);
+	dcp_hdcp_open(&l, 1, t);
+	KUNIT_EXPECT_EQ(test, dcp_hdcp_auth_done(&l, 1, -EACCES, t),
 			DCP_HDCP_TEARDOWN);
 	KUNIT_EXPECT_EQ(test, l.state, DCP_HDCP_DESIRED);
-	KUNIT_EXPECT_EQ(test, dcp_hdcp_start(&l, 1, t + 1), DCP_HDCP_NONE);
+	/* DCP's next open is declined until the backoff is over. */
+	KUNIT_EXPECT_FALSE(test, dcp_hdcp_open(&l, 1, t + 1));
 	t += msecs_to_jiffies(DCP_HDCP_RETRY_MS);
-	KUNIT_EXPECT_EQ(test, dcp_hdcp_start(&l, 1, t), DCP_HDCP_RUN);
+	KUNIT_EXPECT_TRUE(test, dcp_hdcp_open(&l, 1, t));
 
 	/* Doubling, capped. */
 	for (i = 2; i < 12; i++) {
-		dcp_hdcp_step_done(&l, 1, DCP_HDCP_STEP_OPEN, false, t);
+		dcp_hdcp_auth_done(&l, 1, -EACCES, t);
 		KUNIT_EXPECT_EQ(test, l.failures, i);
 		t = l.retry_at;
-		KUNIT_EXPECT_EQ(test, dcp_hdcp_start(&l, 1, t), DCP_HDCP_RUN);
+		KUNIT_EXPECT_TRUE(test, dcp_hdcp_open(&l, 1, t));
 	}
 	KUNIT_EXPECT_EQ(test, dcp_hdcp_backoff(20),
 			msecs_to_jiffies(DCP_HDCP_RETRY_MAX_MS));
 	KUNIT_EXPECT_EQ(test, dcp_hdcp_backoff(2),
 			msecs_to_jiffies(2 * DCP_HDCP_RETRY_MS));
+	/* A success resets it. */
+	dcp_hdcp_auth_done(&l, 1, 0, t);
+	KUNIT_EXPECT_EQ(test, l.failures, 0);
+}
+
+static void hdcp_close_mid_auth(struct kunit *test)
+{
+	struct dcp_hdcp_link l = bound();
+
+	/* DCP gives up on an attempt (a receiver timeout): a failure. */
+	dcp_hdcp_request(&l, true, 0, T0);
+	dcp_hdcp_open(&l, 1, T0);
+	KUNIT_EXPECT_EQ(test, dcp_hdcp_closed(&l, 1, T0), DCP_HDCP_TEARDOWN);
+	KUNIT_EXPECT_EQ(test, l.failures, 1);
+	KUNIT_EXPECT_EQ(test, dcp_hdcp_property(&l),
+			DRM_MODE_CONTENT_PROTECTION_DESIRED);
+	/* The attempt's late result changes nothing. */
+	KUNIT_EXPECT_EQ(test, dcp_hdcp_auth_done(&l, 1, 0, T0), DCP_HDCP_NONE);
+	KUNIT_EXPECT_EQ(test, l.state, DCP_HDCP_DESIRED);
+
+	/* Closing an enabled session (re-authentication) is no failure. */
+	l = bound();
+	dcp_hdcp_request(&l, true, 0, T0);
+	dcp_hdcp_open(&l, 1, T0);
+	dcp_hdcp_auth_done(&l, 1, 0, T0);
+	KUNIT_EXPECT_EQ(test, dcp_hdcp_closed(&l, 1, T0), DCP_HDCP_TEARDOWN);
+	KUNIT_EXPECT_EQ(test, l.failures, 0);
+	KUNIT_EXPECT_TRUE(test, dcp_hdcp_open(&l, 1, T0));
+	/* A close for another generation is ignored. */
+	KUNIT_EXPECT_EQ(test, dcp_hdcp_closed(&l, 7, T0), DCP_HDCP_NONE);
+	KUNIT_EXPECT_EQ(test, l.state, DCP_HDCP_AUTH);
 }
 
 static void hdcp_link_change_drops_enabled(struct kunit *test)
 {
 	struct dcp_hdcp_link l = bound();
-	unsigned long wait = msecs_to_jiffies(HDCP_2_2_DELAY_BEFORE_ENCRYPTION_EN);
 
-	dcp_hdcp_request(&l, true, T0);
-	dcp_hdcp_start(&l, 1, T0);
-	run_to_wait(test, &l, 1, T0);
-	dcp_hdcp_step_done(&l, 1, DCP_HDCP_STEP_ENCRYPT, true, T0 + wait);
+	dcp_hdcp_request(&l, true, 0, T0);
+	dcp_hdcp_open(&l, 1, T0);
+	dcp_hdcp_auth_done(&l, 1, 0, T0);
 	KUNIT_EXPECT_EQ(test, l.state, DCP_HDCP_ENABLED);
 
 	/* Same generation: nothing. */
 	KUNIT_EXPECT_EQ(test, dcp_hdcp_link_event(&l, 1, T0), DCP_HDCP_NONE);
-	/* A new one: back to DESIRED, no backoff. */
+	/* Hotplug, DPMS, resume: back to DESIRED, no backoff. */
 	KUNIT_EXPECT_EQ(test, dcp_hdcp_link_event(&l, 2, T0), DCP_HDCP_TEARDOWN);
 	KUNIT_EXPECT_EQ(test, dcp_hdcp_property(&l),
 			DRM_MODE_CONTENT_PROTECTION_DESIRED);
-	KUNIT_EXPECT_EQ(test, dcp_hdcp_start(&l, 2, T0), DCP_HDCP_RUN);
-}
-
-static void hdcp_late_reports_are_ignored(struct kunit *test)
-{
-	struct dcp_hdcp_link l = bound();
-
-	dcp_hdcp_request(&l, true, T0);
-	dcp_hdcp_start(&l, 1, T0);
-	dcp_hdcp_step_done(&l, 1, DCP_HDCP_STEP_OPEN, true, T0);
-	dcp_hdcp_link_event(&l, 2, T0);
-	dcp_hdcp_start(&l, 2, T0);
-
-	/* Generation 1's AKE_Init result, success or failure, changes nothing. */
-	KUNIT_EXPECT_EQ(test, dcp_hdcp_step_done(&l, 1, DCP_HDCP_STEP_AKE_INIT,
-						 true, T0), DCP_HDCP_NONE);
-	KUNIT_EXPECT_EQ(test, dcp_hdcp_step_done(&l, 1, DCP_HDCP_STEP_OPEN,
-						 false, T0), DCP_HDCP_NONE);
-	KUNIT_EXPECT_EQ(test, l.step, DCP_HDCP_STEP_OPEN);
+	KUNIT_EXPECT_TRUE(test, dcp_hdcp_open(&l, 2, T0));
+	/* A result from generation 1 is late. */
+	KUNIT_EXPECT_EQ(test, dcp_hdcp_auth_done(&l, 1, 0, T0), DCP_HDCP_NONE);
+	KUNIT_EXPECT_EQ(test, l.state, DCP_HDCP_AUTH);
+	/* A link change clears an earlier backoff. */
+	dcp_hdcp_auth_done(&l, 2, -EACCES, T0);
+	KUNIT_EXPECT_EQ(test, l.failures, 1);
+	dcp_hdcp_link_event(&l, 3, T0);
 	KUNIT_EXPECT_EQ(test, l.failures, 0);
-	/* Nor does a report for a step other than the running one. */
-	KUNIT_EXPECT_EQ(test, dcp_hdcp_step_done(&l, 2, DCP_HDCP_STEP_SKE,
-						 true, T0), DCP_HDCP_NONE);
-	KUNIT_EXPECT_EQ(test, l.step, DCP_HDCP_STEP_OPEN);
-	/* Skipping the wait is impossible: ENCRYPT is not the running step. */
-	KUNIT_EXPECT_FALSE(test, dcp_hdcp_may_encrypt(&l, 2, T0 + HZ));
+	KUNIT_EXPECT_TRUE(test, dcp_hdcp_open(&l, 3, T0));
 }
 
 static void hdcp_unbind_drops(struct kunit *test)
 {
 	struct dcp_hdcp_link l = bound();
-	unsigned long wait = msecs_to_jiffies(HDCP_2_2_DELAY_BEFORE_ENCRYPTION_EN);
 
-	dcp_hdcp_request(&l, true, T0);
-	dcp_hdcp_start(&l, 1, T0);
-	run_to_wait(test, &l, 1, T0);
-	dcp_hdcp_step_done(&l, 1, DCP_HDCP_STEP_ENCRYPT, true, T0 + wait);
+	dcp_hdcp_request(&l, true, 0, T0);
+	dcp_hdcp_open(&l, 1, T0);
+	dcp_hdcp_auth_done(&l, 1, 0, T0);
 	KUNIT_EXPECT_EQ(test, dcp_hdcp_bind(&l, true, false, T0),
 			DCP_HDCP_TEARDOWN);
 	KUNIT_EXPECT_EQ(test, l.state, DCP_HDCP_DESIRED);
-	KUNIT_EXPECT_EQ(test, dcp_hdcp_start(&l, 1, T0), DCP_HDCP_NONE);
-	KUNIT_EXPECT_EQ(test, dcp_hdcp_bind(&l, true, true, T0), DCP_HDCP_NONE);
-	KUNIT_EXPECT_EQ(test, dcp_hdcp_start(&l, 1, T0), DCP_HDCP_RUN);
+	KUNIT_EXPECT_FALSE(test, dcp_hdcp_open(&l, 1, T0));
+	KUNIT_EXPECT_EQ(test, dcp_hdcp_bind(&l, true, true, T0), DCP_HDCP_KICK);
+	KUNIT_EXPECT_TRUE(test, dcp_hdcp_open(&l, 1, T0));
+}
+
+static void hdcp_sep_busy_holds(struct kunit *test)
+{
+	struct dcp_hdcp_link l = bound();
+	unsigned long hold = msecs_to_jiffies(DCP_HDCP_RETRY_MS);
+
+	dcp_hdcp_request(&l, true, 0, T0);
+	dcp_hdcp_open(&l, 1, T0);
+	/* The SEP is busy: DESIRED, no failure counted, a short hold. */
+	KUNIT_EXPECT_EQ(test, dcp_hdcp_auth_done(&l, 1, -EAGAIN, T0),
+			DCP_HDCP_TEARDOWN);
+	KUNIT_EXPECT_EQ(test, l.failures, 0);
+	KUNIT_EXPECT_EQ(test, dcp_hdcp_property(&l),
+			DRM_MODE_CONTENT_PROTECTION_DESIRED);
+	KUNIT_EXPECT_FALSE(test, dcp_hdcp_open(&l, 1, T0 + hold - 1));
+	KUNIT_EXPECT_TRUE(test, dcp_hdcp_open(&l, 1, T0 + hold));
+	dcp_hdcp_auth_done(&l, 1, 0, T0 + hold);
+	KUNIT_EXPECT_FALSE(test, l.hold);
+	KUNIT_EXPECT_EQ(test, l.state, DCP_HDCP_ENABLED);
 }
 
 static struct kunit_case dcp_hdcp_cases[] = {
-	KUNIT_CASE(hdcp_no_property_without_both_sides),
-	KUNIT_CASE(hdcp_unbound_never_starts),
-	KUNIT_CASE(hdcp_full_session_enables),
+	KUNIT_CASE(hdcp_property_needs_all),
+	KUNIT_CASE(hdcp_unbound_declines),
+	KUNIT_CASE(hdcp_undesired_declines),
+	KUNIT_CASE(hdcp_session_enables),
+	KUNIT_CASE(hdcp_type_change_reauths),
 	KUNIT_CASE(hdcp_failure_backs_off),
+	KUNIT_CASE(hdcp_close_mid_auth),
 	KUNIT_CASE(hdcp_link_change_drops_enabled),
-	KUNIT_CASE(hdcp_late_reports_are_ignored),
 	KUNIT_CASE(hdcp_unbind_drops),
+	KUNIT_CASE(hdcp_sep_busy_holds),
 	{ }
 };
 
