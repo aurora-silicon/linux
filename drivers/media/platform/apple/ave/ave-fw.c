@@ -51,12 +51,19 @@ static const u32 ave_known_text_crc[] = {
 	0x25bfd039, /* encoder firmware 6070.11.1 / T8112 */
 };
 
-static int ave_fw_chosen_crc(struct ave_dev *ave, const char *name, u32 *crc)
+static int ave_fw_dt_crc(struct ave_dev *ave, const char *name, u32 *crc)
 {
-	struct device_node *chosen = of_find_node_by_path("/chosen");
+	struct device_node *chosen;
 	const char *str;
 	int ret;
 
+	ret = of_property_read_string(ave->dev->of_node, name, &str);
+	if (!ret)
+		return kstrtou32(str, 16, crc);
+	if (ret != -EINVAL)
+		return ret;
+
+	chosen = of_find_node_by_path("/chosen");
 	if (!chosen)
 		return -ENOENT;
 	ret = of_property_read_string(chosen, name, &str);
@@ -331,7 +338,7 @@ int ave_fw_probe(struct ave_dev *ave)
 	ret = ave_fw_crc(&ave->text, &text_crc, NULL);
 	if (ret)
 		return ret;
-	ret = ave_fw_chosen_crc(ave, "aurora,ave-text-crc32", &want);
+	ret = ave_fw_dt_crc(ave, "aurora,ave-text-crc32", &want);
 	if (ret || text_crc != want)
 		return dev_err_probe(dev, -ENODEV,
 				     "firmware text differs from loader CRC\n");
@@ -371,7 +378,7 @@ int ave_fw_probe(struct ave_dev *ave)
 	 * The loader records the DATA checksum before anything runs. If it
 	 * differs, the firmware already ran and there is no clean copy left.
 	 */
-	ret = ave_fw_chosen_crc(ave, "aurora,ave-data-crc32", &want);
+	ret = ave_fw_dt_crc(ave, "aurora,ave-data-crc32", &want);
 	if (ret || data_crc != want) {
 		ret = dev_err_probe(dev, -ENODEV,
 				    "firmware data is not in its boot state\n");
