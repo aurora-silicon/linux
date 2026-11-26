@@ -166,9 +166,9 @@ impl WorkStorage {
     }
 }
 
-/// A context's scheduler page. The M5 firmware caches its mapping, so on M5 it
-/// comes from the retention pool and stays mapped until firmware stop; elsewhere
-/// it is an ordinary allocation.
+/// A context's scheduler page. On M5 it comes from the retention pool so its
+/// VA stays mapped and fenced across releases (uncached, because both firmware
+/// and host write it on reuse); elsewhere it is an ordinary allocation.
 pub(crate) enum SchedulerStorage {
     Ordinary(KernelObject),
     Retained(PooledObject),
@@ -214,9 +214,12 @@ pub(crate) struct Context {
     /// A kill of this context was published, through a compute queue or on its render pairs'
     /// behalf. A context is killed at most once.
     kill_published: AtomicBool,
-    /// Advisory only: publication still checks the physical binding under the
-    /// device mutex. False skips an inline attempt known to need admission.
-    compute_binding_hint: AtomicBool,
+    /// Advisory count of bound compute channels: publication still checks the physical binding
+    /// under the device mutex. Zero skips an inline attempt known to need admission.
+    compute_bindings: AtomicU32,
+    /// Shared monotonic compute completion ordinal / submit sequence across an M5 multi-channel
+    /// context's physical compute queues.
+    compute_ordinal: AtomicU32,
     /// Mixed-engine contexts keep the original inline publication path.
     render_seen: AtomicBool,
     qos: Arc<QosLease>,
@@ -281,7 +284,7 @@ impl Context {
                 alloc,
                 Family::Scheduler,
                 UAT_PGSZ,
-                UAT_PGSZ,
+                0,
                 kernel_prot,
                 CpuMap::WriteCombined,
             )?)
@@ -300,11 +303,14 @@ impl Context {
         fence(Ordering::SeqCst);
         let scheduler_generation = super::ids::OBJECTS.object()?;
         let scheduler = Arc::new(scheduler, GFP_KERNEL)?;
+        // Both firmware and host write work nodes (reused every 63 submissions
+        // and zeroed on pool reuse). Keep the whole work-state object uncached
+        // while retaining its VA and return mark in the pool.
         let mut object = pool.allocate(
             alloc,
             Family::WorkState,
             2 * UAT_PGSZ,
-            UAT_PGSZ,
+            0,
             kernel_prot,
             CpuMap::WriteCombined,
         )?;
@@ -346,7 +352,8 @@ impl Context {
             scheduler_generation,
             published: AtomicBool::new(false),
             kill_published: AtomicBool::new(false),
-            compute_binding_hint: AtomicBool::new(false),
+            compute_bindings: AtomicU32::new(0),
+            compute_ordinal: AtomicU32::new(0),
             render_seen: AtomicBool::new(false),
             qos,
             owner_pid,
@@ -373,7 +380,11 @@ impl Context {
     }
     pub(crate) fn compute_binding_hint(&self) -> bool {
         self.render_seen.load(Ordering::Acquire)
-            || self.compute_binding_hint.load(Ordering::Relaxed)
+            || self.compute_bindings.load(Ordering::Relaxed) != 0
+    }
+    /// Advisory count of physical compute channels currently bound to this context.
+    pub(crate) fn compute_binding_count(&self) -> u32 {
+        self.compute_bindings.load(Ordering::Acquire)
     }
     /// This logical queue has submitted render work, so its compute may have a render prefix.
     pub(crate) fn render_seen(&self) -> bool {
@@ -385,7 +396,27 @@ impl Context {
         }
     }
     pub(crate) fn note_compute_binding(&self, owned: bool) {
-        self.compute_binding_hint.store(owned, Ordering::Relaxed);
+        if owned {
+            self.compute_bindings.fetch_add(1, Ordering::AcqRel);
+        } else {
+            let _ = self
+                .compute_bindings
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                    Some(n.saturating_sub(1))
+                });
+        }
+    }
+    /// Atomically allocates the next 1-based shared compute ordinal and packed
+    /// `(predecessor_id << 32) | current_id` descriptor object_ids pair for a multi-channel
+    /// M5 context, so concurrent direct submissions across sibling QIDs never collide on
+    /// `submit_sequence`, `completion_ordinal`, or `object_ids`.
+    pub(crate) fn next_compute_identity(&self) -> (u32, u64) {
+        let prev = self.compute_ordinal.fetch_add(1, Ordering::AcqRel);
+        let next = prev.wrapping_add(1);
+        let predecessor_id = if prev == 0 { 1 } else { prev };
+        let current_id = if next == 0 { 1 } else { next };
+        let object_ids = (u64::from(predecessor_id) << 32) | u64::from(current_id);
+        (next, object_ids)
     }
     pub(crate) fn compute_timestamps(&self) -> &Arc<super::completion::ComputeTimestampCache> {
         &self.compute_timestamps

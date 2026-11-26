@@ -24,10 +24,10 @@ pub(super) struct Pools {
     leases: KVec<Option<Lease>>,
 }
 
-/// Undo state cannot leave the device-locked publication transaction. Rollback
-/// is permitted only before the packet exposes its first firmware reference.
+/// Undo handle for one unpublished `prepare()` call. Rollback undoes only
+/// this preparation's references, preserving any sibling completions or
+/// control-ring release observations that occurred while lent.
 pub(super) struct Preparation {
-    previous: Option<Lease>,
     slot: usize,
     pub(super) generation: u64,
 }
@@ -96,11 +96,7 @@ impl Pools {
         }
         let generation = next.generation();
         self.leases[slot] = Some(next);
-        Ok(Preparation {
-            previous,
-            slot,
-            generation,
-        })
+        Ok(Preparation { slot, generation })
     }
 
     /// Warming validates the incoming owner and stages its descriptor without
@@ -170,8 +166,15 @@ impl Pools {
         lease.retire_prepare()
     }
 
-    pub(super) fn rollback(&mut self, preparation: Preparation) {
-        self.leases[preparation.slot] = preparation.previous;
+    /// Rolls back one unpublished preparation without disturbing sibling
+    /// completions or release observations that occurred while it was lent.
+    /// Returns whether a final release is now pending on this pool.
+    pub(super) fn rollback(&mut self, preparation: Preparation) -> Result<bool> {
+        let lease = self.leases[preparation.slot].as_mut().ok_or(EIO)?;
+        if lease.generation() != preparation.generation {
+            return Err(EIO);
+        }
+        Ok(lease.cancel_prepare()?.is_some())
     }
 
     /// Preflight a paired retirement before QoS or PB reference accounting.
