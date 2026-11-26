@@ -1513,6 +1513,166 @@ MODULE_PARM_DESC(diag_fast, "DIAGNOSTIC (T6030): PTD request bits toggled every 
 MODULE_PARM_DESC(diag_dvfs, "DIAGNOSTIC (T6030): CPU DVFS request levels for +0x10900/+0x10908/+0x10918 in bytes 0/1/2, every 100 ms");
 MODULE_PARM_DESC(diag_feed, "DIAGNOSTIC (T6030): macOS's periodic PTD words +0x10b68/+0x10b70 (100 ms) and +0x10c20 (1 s)");
 
+/*
+ * DIAGNOSTIC (T6030): macOS 27.2's AP-side PTD writes before its J516S PMP starts
+ * (s2r-full-boot-2, ms before the PMP's HELLO), in its order, before the PMP's nodes are enabled:
+ *  - MC-CTRL-TO-SMC (+0x10c20) = 6 at -356, then every 1.0 s for as long as the PMP runs;
+ *  - the request word stepped 0x80, 0x180, 0x380, 0x10380 at -216, each step read back;
+ *  - PPM-TO-SMC (+0x10b40..+0x10b60) = 0x2111100000000, 0, 0, 0, 0 at -32;
+ *  - the request word 0x103c0 at -25, then PPM-TO-SMC = 0x2111200000000, 0, 0, 0, 0.
+ * Once the PMP is ready the request word gains bit 4 (0x103d0), as macOS's does 168 ms after its
+ * start. Boot parameter, off by default.
+ */
+static bool pmp_diag_preboot;
+module_param_named(diag_preboot, pmp_diag_preboot, bool, 0444);
+MODULE_PARM_DESC(diag_preboot, "DIAGNOSTIC (T6030): macOS's PTD writes before its PMP starts, in its order and spacing");
+
+static struct apple_pmp_report *pmp_diag_hb_rep;
+static void pmp_diag_hb_fn(struct work_struct *work);
+static DECLARE_DELAYED_WORK(pmp_diag_hb_work, pmp_diag_hb_fn);
+
+static void pmp_diag_hb_fn(struct work_struct *work)
+{
+	struct apple_pmp_report *rep = READ_ONCE(pmp_diag_hb_rep);
+
+	if (!rep)
+		return;
+	writeq(6, rep->base + 0x10c20);
+	schedule_delayed_work(&pmp_diag_hb_work, msecs_to_jiffies(1000));
+}
+
+static void pmp_diag_ppm(void __iomem *base, u64 first)
+{
+	unsigned int off;
+
+	writeq(first, base + 0x10b40);
+	for (off = 0x10b48; off <= 0x10b60; off += 8)
+		writeq(0, base + off);
+}
+
+static void apple_pmp_diag_preboot(struct apple_pmp_report *rep)
+{
+	static const u64 steps[] = { 0x80, 0x180, 0x380, 0x10380 };
+	u64 back[ARRAY_SIZE(steps)];
+	unsigned int i;
+
+	WRITE_ONCE(pmp_diag_hb_rep, rep);
+	writeq(6, rep->base + 0x10c20);
+	schedule_delayed_work(&pmp_diag_hb_work, msecs_to_jiffies(1000));
+	msleep(140);
+	for (i = 0; i < ARRAY_SIZE(steps); i++) {
+		writeq(steps[i], rep->base + rep->offsets->tgt_write);
+		back[i] = readq(rep->base + rep->offsets->tgt_read);
+	}
+	msleep(184);
+	pmp_diag_ppm(rep->base, 0x2111100000000ULL);
+	usleep_range(7000, 7500);
+	writeq(0x103c0, rep->base + rep->offsets->tgt_write);
+	pmp_diag_ppm(rep->base, 0x2111200000000ULL);
+	dev_info(rep->dev, "DIAGNOSTIC: macOS's pre-start PTD writes done: request steps read back %#llx %#llx %#llx %#llx, now %#llx, status %#llx\n",
+		 back[0], back[1], back[2], back[3], readq(rep->base + rep->offsets->tgt_read),
+		 readq(rep->base + rep->offsets->status));
+	msleep(25);
+}
+
+/*
+ * DIAGNOSTIC (T6030): every change of the PTD read side (entries 0-447, value and stamp, at
+ * +16e and +16e+8) from PM_SUSPEND_PREPARE to PM_POST_SUSPEND, sampled every diag_watch_ms ms,
+ * printed after resume, to see which entry is written between the DCP's M3 power-down and the
+ * PMP's "PTD abort". Read only. 0 (the default) is off.
+ */
+#define PMP_WATCH_ENTRIES	448
+#define PMP_WATCH_RECS		8192
+
+struct pmp_watch_rec {
+	s64 us;
+	u64 val, stamp;
+	u16 entry;
+};
+
+static unsigned int pmp_diag_watch_ms;
+module_param_named(diag_watch_ms, pmp_diag_watch_ms, uint, 0644);
+MODULE_PARM_DESC(diag_watch_ms, "DIAGNOSTIC (T6030): PTD read-side changes across a suspend, sampled every N ms (0: off)");
+
+static struct pmp_watch_rec *pmp_watch_recs;
+static u64 pmp_watch_last[2 * PMP_WATCH_ENTRIES];
+static unsigned int pmp_watch_n, pmp_watch_dropped, pmp_watch_scans;
+static ktime_t pmp_watch_t0;
+static bool pmp_watch_on;
+static void pmp_watch_fn(struct work_struct *work);
+static DECLARE_DELAYED_WORK(pmp_watch_work, pmp_watch_fn);
+
+static void pmp_watch_scan(struct apple_pmp_report *rep, bool record)
+{
+	s64 us = ktime_us_delta(ktime_get(), pmp_watch_t0);
+	unsigned int e;
+	u64 v, s;
+
+	for (e = 0; e < PMP_WATCH_ENTRIES; e++) {
+		v = readq(rep->base + 16 * e);
+		s = readq(rep->base + 16 * e + 8);
+		if (record && (v != pmp_watch_last[2 * e] || s != pmp_watch_last[2 * e + 1])) {
+			if (pmp_watch_n < PMP_WATCH_RECS)
+				pmp_watch_recs[pmp_watch_n++] = (struct pmp_watch_rec){
+					.us = us, .val = v, .stamp = s, .entry = e };
+			else
+				pmp_watch_dropped++;
+		}
+		pmp_watch_last[2 * e] = v;
+		pmp_watch_last[2 * e + 1] = s;
+	}
+	pmp_watch_scans++;
+}
+
+static void pmp_watch_fn(struct work_struct *work)
+{
+	struct apple_pmp_report *rep = READ_ONCE(pmp_diag_rep);
+
+	if (!rep || !READ_ONCE(pmp_watch_on))
+		return;
+	pmp_watch_scan(rep, true);
+	queue_delayed_work(system_unbound_wq, &pmp_watch_work,
+			   msecs_to_jiffies(max(1U, READ_ONCE(pmp_diag_watch_ms))));
+}
+
+static void pmp_watch_begin(void)
+{
+	struct apple_pmp_report *rep = READ_ONCE(pmp_diag_rep);
+
+	if (!rep || !READ_ONCE(pmp_diag_watch_ms))
+		return;
+	if (!pmp_watch_recs)
+		pmp_watch_recs = kvmalloc_array(PMP_WATCH_RECS, sizeof(*pmp_watch_recs),
+						GFP_KERNEL);
+	if (!pmp_watch_recs)
+		return;
+	pmp_watch_n = 0;
+	pmp_watch_dropped = 0;
+	pmp_watch_scans = 0;
+	pmp_watch_t0 = ktime_get();
+	pmp_watch_scan(rep, false);
+	dev_info(rep->dev, "DIAGNOSTIC: PTD watch started (every %u ms), t0 = %lld ns\n",
+		 pmp_diag_watch_ms, ktime_to_ns(pmp_watch_t0));
+	WRITE_ONCE(pmp_watch_on, true);
+	queue_delayed_work(system_unbound_wq, &pmp_watch_work, 0);
+}
+
+static void pmp_watch_end(void)
+{
+	struct apple_pmp_report *rep = READ_ONCE(pmp_diag_rep);
+	unsigned int i;
+
+	if (!rep || !READ_ONCE(pmp_watch_on))
+		return;
+	WRITE_ONCE(pmp_watch_on, false);
+	cancel_delayed_work_sync(&pmp_watch_work);
+	dev_info(rep->dev, "DIAGNOSTIC: PTD watch: %u scans, %u changes, %u dropped\n",
+		 pmp_watch_scans, pmp_watch_n, pmp_watch_dropped);
+	for (i = 0; i < pmp_watch_n; i++)
+		dev_info(rep->dev, "PTD watch +%lld us e%u %#llx %#llx\n", pmp_watch_recs[i].us,
+			 pmp_watch_recs[i].entry, pmp_watch_recs[i].val, pmp_watch_recs[i].stamp);
+}
+
 static void apple_pmp_start_finish(struct apple_pmp_start *st, int result)
 {
 	scoped_guard(mutex, &apple_pmp_start_mutex) {
@@ -1523,6 +1683,17 @@ static void apple_pmp_start_finish(struct apple_pmp_start *st, int result)
 	if (!result && st->rep->offsets->start_at_probe) {
 		WRITE_ONCE(pmp_diag_rep, st->rep);
 		pmp_diag_kick();
+		if (READ_ONCE(pmp_diag_preboot)) {
+			struct apple_pmp_report *rep = st->rep;
+			unsigned long flags;
+
+			spin_lock_irqsave(&rep->lock, flags);
+			writeq(readq(rep->base + rep->offsets->tgt_read) | BIT_ULL(4),
+			       rep->base + rep->offsets->tgt_write);
+			spin_unlock_irqrestore(&rep->lock, flags);
+			dev_info(rep->dev, "DIAGNOSTIC: request %#llx after the PMP is ready\n",
+				 readq(rep->base + rep->offsets->tgt_read));
+		}
 	}
 	if (result && READ_ONCE(st->enabled))
 		dev_err(st->rep->dev,
@@ -1661,6 +1832,9 @@ static void apple_pmp_start_work(struct work_struct *work)
 	if (st->record_seed)
 		dev_info(rep->dev, "request bits %#llx are soc-device records\n",
 			 st->record_seed);
+
+	if (READ_ONCE(pmp_diag_preboot) && rep->offsets->start_at_probe)
+		apple_pmp_diag_preboot(rep);
 
 	/* From here the PMP may run, and only a reboot stops it. */
 	dev_info(rep->dev, "starting the PMP with request %#llx\n", st->seed);
@@ -3308,11 +3482,13 @@ static int apple_pmp_agx_pm_notify(struct notifier_block *nb, unsigned long acti
 	switch (action) {
 	case PM_SUSPEND_PREPARE:
 	case PM_HIBERNATION_PREPARE:
+		pmp_watch_begin();
 		apple_pmp_agx_activity_release();
 		break;
 	case PM_POST_SUSPEND:
 	case PM_POST_HIBERNATION:
 		apple_pmp_agx_activity_resume();
+		pmp_watch_end();
 		break;
 	}
 	return NOTIFY_DONE;
