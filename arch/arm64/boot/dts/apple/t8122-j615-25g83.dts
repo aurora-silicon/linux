@@ -5,7 +5,11 @@
  */
 #include "t8122-j615.dts"
 #include "t8122-j613-dcp-25g83.dtsi"
-#include "t8122-j613-qspi.dtsi"
+
+/* The memory floor has not run with the native J613 report on a J615. */
+&pmp_report {
+	/delete-property/ apple,cpu-memory-floor;
+};
 
 /* As on the J613 25G83. */
 &mtp {
@@ -15,9 +19,4 @@
 /* GPIO-mediated AFE power sequencing, as on the J613 (J615 ADT gP08). */
 &mtp_mt {
 	apple,power-method = <2>;
-};
-
-/* Keep the J615 NVRAM partition read-only. */
-&nvram_qspi {
-	read-only;
 };

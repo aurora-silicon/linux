@@ -24,6 +24,7 @@ PRELUDE = r'''
 #define AVD_RECOVER_GAP_MS 20
 #define AVD_STORM_MAX 2
 #define AVD_STORM_WINDOW 60000
+#define AVD_QUIRK_NO_RECOVERY_RESET (1U << 5)
 #define msecs_to_jiffies(x) (x)
 #define jiffies_to_msecs(x) ((unsigned int)(x))
 #define time_before(a,b) ((long)((a)-(b))<0)
@@ -41,6 +42,7 @@ typedef int irqreturn_t;
 struct avd_dev;
 struct avd_ctx { bool session_started; };
 struct frame { int state,status; };
+struct avd_variant { unsigned int quirks; };
 struct avd_backend_ops {
  void (*shutdown)(struct avd_dev *);
  int (*resume)(struct avd_dev *);
@@ -53,6 +55,7 @@ struct queue {
 struct avd_dev {
  void *dev,*domain,*empty_domain,*rstc,*compat_active;
  const struct avd_backend_ops *backend;
+ const struct avd_variant *variant;
  struct {
   bool dart_active,dma_parked,irq_enabled,hw_on;
   int irq,hw_lock,lock;unsigned int irq_gen;
@@ -65,7 +68,7 @@ static struct avd_dev d;
 static unsigned long jiffies=100;
 static void *attached;
 static int reset_error,boot_error,attach_error;
-static unsigned int resets,boots,attaches,detaches,shutdowns,resubmits,drains,irq_opens,irq_closes,step,block_step,reset_step;
+static unsigned int resets,boots,attaches,detaches,shutdowns,resubmits,drains,irq_opens,irq_closes,perf_suspends,step,block_step,reset_step;
 static bool pm_runtime_suspended(void *dev) { (void)dev;return false; }
 static void disable_irq_nosync(int irq) { assert(irq==1);irq_closes++; }
 static void enable_irq(int irq) { assert(irq==1);assert(!d.pm.dma_parked);irq_opens++; }
@@ -94,42 +97,53 @@ static bool idle(struct avd_dev *avd) {
 }
 static void resubmit(struct avd_dev *avd) { (void)avd;resubmits++; }
 static void avd_pm_drain_unmaps(struct avd_dev *avd) { assert(avd->pm.dart_active);drains++; }
+static void avd_pm_perf_suspend(struct avd_dev *avd) {
+ assert(avd==&d);
+ if(avd->pm.dart_active) assert(!d.pm.hw_on&&!d.pm.irq_enabled);
+ perf_suspends++;
+}
 '''
 
 MAIN = r'''
 static const struct avd_backend_ops backend={.shutdown=shutdown_backend};
+static const struct avd_variant no_recovery_reset = { .quirks = AVD_QUIRK_NO_RECOVERY_RESET };
 static const struct queue queue={.idle=idle,.resubmit=resubmit};
 static int domain_token,empty_token;
 static void init(void) {
  d=(struct avd_dev){.dev=&d,.domain=&domain_token,.empty_domain=&empty_token,.backend=&backend,
  .pm={.dart_active=true,.irq_enabled=true,.hw_on=true,.irq=1,.queue=&queue}};
  attached=d.domain;reset_error=boot_error=attach_error=0;
- resets=boots=attaches=detaches=shutdowns=resubmits=drains=irq_opens=irq_closes=step=0;
+ resets=boots=attaches=detaches=shutdowns=resubmits=drains=irq_opens=irq_closes=perf_suspends=step=0;
 }
 int main(void) {
- init();assert(!avd_pm_recover(&d));assert(resets==1&&boots==1&&attaches==1&&detaches==1);
+ init();assert(!avd_pm_recover(&d));assert(resets==1&&boots==1&&attaches==1&&detaches==1&&perf_suspends==1);
  assert(!d.pm.dma_parked&&!d.pm.irq_enabled&&attached==d.domain);
  avd_pm_enable_irq(&d);assert(irq_opens==1);
+ init();
+ d.variant = &no_recovery_reset;
+ assert(avd_pm_recover(&d) == -EIO);
+ assert(attaches == 1 && !resets && !boots && !detaches && perf_suspends == 1);
+ assert(d.pm.dma_parked && !d.pm.irq_enabled && attached == d.empty_domain);
  init();reset_error=-EIO;d.frames[0].state=AVD_FRAME_SUBMITTED;avd_reset_queue(&d,-ETIMEDOUT);
- assert(d.faulted&&resets==1&&!boots&&!detaches&&d.pm.dma_parked&&attached==d.empty_domain);
+ assert(d.faulted&&resets==1&&!boots&&!detaches&&d.pm.dma_parked&&attached==d.empty_domain&&perf_suspends==1);
  assert(d.frames[0].state==AVD_FRAME_DONE&&!d.pm.irq_enabled);
  d.frames[0].state=AVD_FRAME_FREE;
  assert(!avd_pm_power_off(&d)&&!avd_pm_power_on(&d));
- assert(!boots&&!resubmits&&!d.pm.irq_enabled&&attached==d.empty_domain);
+ assert(!boots&&!resubmits&&!d.pm.irq_enabled&&attached==d.empty_domain&&perf_suspends==2);
  init();boot_error=-ETIMEDOUT;avd_reset_queue(&d,-ETIMEDOUT);
- assert(d.faulted&&resets==1&&boots==1&&attaches==2&&detaches==1&&d.pm.dma_parked);
+ assert(d.faulted&&resets==1&&boots==1&&attaches==2&&detaches==1&&d.pm.dma_parked&&perf_suspends==2);
  assert(attached==d.empty_domain&&!d.pm.irq_enabled);
  init();avd_reset_queue(&d,-EIO);avd_reset_queue(&d,-EIO);avd_reset_queue(&d,-EIO);
- assert(resets==2&&boots==2&&attaches==3&&detaches==2&&!d.faulted&&d.rest_until);
+ assert(resets==2&&boots==2&&attaches==3&&detaches==2&&!d.faulted&&d.rest_until&&perf_suspends==3);
  assert(d.pm.dma_parked&&attached==d.empty_domain&&!d.pm.irq_enabled);
  unsigned int old_boots=boots,old_resets=resets;
  assert(!avd_pm_power_off(&d)&&!avd_pm_power_on(&d));
- assert(boots==old_boots&&resets==old_resets&&!resubmits&&!d.pm.irq_enabled);
+ assert(boots==old_boots&&resets==old_resets&&!resubmits&&!d.pm.irq_enabled&&perf_suspends==4);
  /* The expiry path (dispatch-test) calls recover under a PM reference. */
- jiffies=d.rest_until;assert(!avd_pm_recover(&d));assert(resets==3&&!d.pm.dma_parked);
- init();attach_error=-EIO;assert(avd_pm_recover(&d)==-EIO);assert(!resets&&!boots&&!detaches);
- init();d.pm.dart_active=false;assert(avd_pm_park(&d)==-EHOSTDOWN);assert(!shutdowns&&!resets&&!attaches);
- puts("PASS: production recovery/PM: park before reset, failed reset/boot stays blocked, budget rests, parked resume never boots, expiry recovery");
+ jiffies=d.rest_until;assert(!avd_pm_recover(&d));assert(resets==3&&!d.pm.dma_parked&&perf_suspends==5);
+ init();attach_error=-EIO;assert(avd_pm_recover(&d)==-EIO);assert(!resets&&!boots&&!detaches&&perf_suspends==1);
+ init();d.pm.dart_active=false;assert(avd_pm_park(&d)==-EHOSTDOWN);assert(!shutdowns&&!resets&&!attaches&&perf_suspends==1);
+ puts("PASS: production recovery/PM: park before reset, no-reset variant stays parked, failed reset/boot stays blocked, budget rests, parked resume never boots, expiry recovery");
 }
 '''
 

@@ -18,7 +18,7 @@ static bool sleep_v27_held;
 
 static bool sleep_v27_selected_for(struct apple_sleep *s)
 {
-	return s && s->soc == &t6050_sleep_soc;
+	return apple_sleep_t6050_full(s);
 }
 
 bool apple_sleep_v27_late(void)
@@ -141,7 +141,7 @@ static int sleep_v27_final_check(unsigned int i)
 	if (!sleep_v27_held || i >= ARRAY_SIZE(sleep_v27) ||
 	    !sleep_v27[i].armed || !READ_ONCE(sleep_v27[i].prepared))
 		return -EBUSY;
-	return sleep_v27[i].ops->check(sleep_v27[i].data);
+	return sleep_v27[i].ops->check(sleep_v27[i].data, apple_sleep->entry_committed);
 }
 
 static bool sleep_v27_gate_prepared(const struct device_node *np)

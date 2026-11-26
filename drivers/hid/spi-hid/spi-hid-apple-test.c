@@ -319,6 +319,86 @@ static void spihid_test_no_set_retry(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ctx->writes, 1);
 }
 
+static void spihid_test_fragment(struct spihid_apple *spihid, u16 offset,
+				 u16 remain)
+{
+	struct spihid_transfer_packet *pkt = (void *)spihid->rx_buf;
+
+	memset(pkt, 0, sizeof(*pkt));
+	pkt->flags = SPIHID_READ_PACKET;
+	pkt->device = SPIHID_DEVICE_ID_TP;
+	pkt->offset = cpu_to_le16(offset);
+	pkt->remain = cpu_to_le16(remain);
+	pkt->length = cpu_to_le16(sizeof(pkt->data));
+	memset(pkt->data, 0x5a, sizeof(pkt->data));
+	pkt->crc16 = cpu_to_le16(crc16(0, (u8 *)pkt,
+				       offsetof(struct spihid_transfer_packet, crc16)));
+	spihid_process_read(spihid);
+}
+
+/* A fragmented message longer than the reassembly buffer is dropped. */
+static void spihid_test_oversized_message(struct kunit *test)
+{
+	struct spihid_test *ctx = test->priv;
+	struct spihid_apple *spihid = ctx->spihid;
+	const size_t frag = sizeof(((struct spihid_transfer_packet *)0)->data);
+	const size_t total = SPIHID_MAX_INPUT_REPORT_SIZE + 2 * frag;
+	const size_t guard = 2 * frag;
+	size_t offset, i;
+	u8 *buf;
+
+	/* Room past the real buffer size, so an overrun is visible. */
+	buf = kunit_kzalloc(test, SPIHID_MAX_INPUT_REPORT_SIZE + guard,
+			    GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, buf);
+	memset(buf + SPIHID_MAX_INPUT_REPORT_SIZE, 0xc3, guard);
+	spihid->report.buf = buf;
+
+	/* Every fragment but the last, so the message never completes. */
+	for (offset = 0; offset + frag < total; offset += frag) {
+		spihid_test_fragment(spihid, offset, total - offset - frag);
+		KUNIT_EXPECT_LE(test, spihid->report.length,
+				SPIHID_MAX_INPUT_REPORT_SIZE);
+		KUNIT_EXPECT_LE(test, spihid->report.offset,
+				SPIHID_MAX_INPUT_REPORT_SIZE);
+	}
+
+	for (i = 0; i < guard; i++)
+		if (buf[SPIHID_MAX_INPUT_REPORT_SIZE + i] != 0xc3)
+			break;
+	KUNIT_EXPECT_EQ(test, i, guard);
+}
+
+/* A message that fills the buffer exactly is still reassembled. */
+static void spihid_test_max_message(struct kunit *test)
+{
+	struct spihid_test *ctx = test->priv;
+	struct spihid_apple *spihid = ctx->spihid;
+	const size_t frag = sizeof(((struct spihid_transfer_packet *)0)->data);
+	const size_t total = SPIHID_MAX_INPUT_REPORT_SIZE;
+	size_t offset;
+
+	for (offset = 0; offset + frag < total; offset += frag) {
+		spihid_test_fragment(spihid, offset, total - offset - frag);
+		KUNIT_EXPECT_EQ(test, spihid->report.offset, offset + frag);
+		KUNIT_EXPECT_EQ(test, spihid->report.length, total);
+	}
+}
+
+/* The management interface has no descriptor buffer. */
+static void spihid_test_mngt_report_desc(struct kunit *test)
+{
+	struct spihid_test *ctx = test->priv;
+	u8 desc[16] = { 0x05, 0x01 };
+
+	KUNIT_EXPECT_NULL(test, ctx->spihid->mngt.hid_desc);
+	KUNIT_EXPECT_FALSE(test,
+			   spihid_process_iface_hid_report_desc(ctx->spihid,
+								SPIHID_DEVICE_ID_MNGT,
+								desc, sizeof(desc)));
+	KUNIT_EXPECT_EQ(test, ctx->spihid->mngt.hid_desc_len, 0);
+}
+
 static struct kunit_case spihid_test_cases[] = {
 	KUNIT_CASE(spihid_test_bad_status),
 	KUNIT_CASE(spihid_test_later_get_bad_status),
@@ -329,6 +409,9 @@ static struct kunit_case spihid_test_cases[] = {
 	KUNIT_CASE(spihid_test_mixed_retry_limit),
 	KUNIT_CASE(spihid_test_spi_error_no_retry),
 	KUNIT_CASE(spihid_test_no_set_retry),
+	KUNIT_CASE(spihid_test_oversized_message),
+	KUNIT_CASE(spihid_test_max_message),
+	KUNIT_CASE(spihid_test_mngt_report_desc),
 	{}
 };
 

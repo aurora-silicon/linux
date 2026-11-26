@@ -455,6 +455,18 @@ impl G18FirmwareMemory {
         Ok((prepared, job.binding, generation, knobs))
     }
 
+    /// Whether the compute owner is as the last retirement left it, with no
+    /// process, command or context published: a failed preparation that
+    /// leaves this true changed nothing the firmware uses. Before the owner
+    /// exists, its scheduler record must not be armed yet.
+    pub(crate) fn application_compute_unpublished(&self) -> bool {
+        self.compute.unpublished_idle() && match self.application_compute.as_ref() {
+            Some(job) => job.retired && job.guard.is_none() && job.aliases.is_empty()
+                && job.previous_pool.is_none() && job.previous_binding.is_none(),
+            None => self.scheduler.binding(0).is_err(),
+        }
+    }
+
     /// The binding the firmware must still own before the next tag15.
     pub(crate) fn application_compute_previous_binding(&self) -> Result<(G18UmaPoolBinding, u32)> {
         let job = self.application_compute.as_ref().ok_or(EIO)?;

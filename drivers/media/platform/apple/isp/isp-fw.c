@@ -5,6 +5,7 @@
 #include "isp-ipc-layout.h"
 
 #include <asm/io.h>
+#include <linux/cacheflush.h>
 #include <linux/delay.h>
 #include <linux/highmem.h>
 #include <linux/io.h>
@@ -356,9 +357,15 @@ static int isp_check_coproc_t6040(struct apple_isp *isp)
 	u32 control = isp_coproc_read32(isp, isp_coproc_control(isp));
 	u64 rvbar = readq(isp->coproc + ISP_COPROC_RVBAR);
 
-	if (control) {
+	/*
+	 * Our own power-down leaves the start word where the domain kept
+	 * it; the boot writes 0 then the start word as for a fresh start.
+	 */
+	if (control &&
+	    !(isp->coproc_left && control == ISP_COPROC_CONTROL_START)) {
 		isp_err(isp, "coprocessor already started (control 0x%x)\n",
 			control);
+		isp->coproc_left = false;
 		return -EBUSY;
 	}
 
@@ -419,10 +426,19 @@ static int isp_reset_coproc(struct apple_isp *isp)
 	return 0;
 }
 
+/* Write CPU stores out to memory, for a coprocessor that might not snoop them. */
+static void isp_clean_to_poc(void *addr, size_t size)
+{
+#ifdef CONFIG_ARM64
+	dcache_clean_poc((unsigned long)addr, (unsigned long)addr + size);
+#endif
+}
+
 /*
  * With hw->fw_restore, put the firmware memory back as the boot loader left
  * it: the data segment, and a heap the boot loader provides, from their
- * copies, and the host-backed main memory above the data cleared.
+ * copies, and the host-backed main memory above the data cleared. All of it
+ * is cleaned to the point of coherency before the coprocessor starts.
  */
 static void isp_restore_fw_memory(struct apple_isp *isp)
 {
@@ -432,11 +448,16 @@ static void isp_restore_fw_memory(struct apple_isp *isp)
 		return;
 
 	memcpy(isp->fw_data, isp->fw_data_copy, isp->fw_data_size);
-	if (isp->fw_heap)
+	isp_clean_to_poc(isp->fw_data, isp->fw_data_size);
+	if (isp->fw_heap) {
 		memcpy(isp->fw_heap, isp->fw_heap_copy, isp->fw_heap_size);
+		isp_clean_to_poc(isp->fw_heap, isp->fw_heap_size);
+	}
 	if (tail)
-		for (u32 i = 0; i < tail->num_pages; i++)
+		for (u32 i = 0; i < tail->num_pages; i++) {
 			clear_highpage(tail->pages[i]);
+			isp_clean_to_poc(page_address(tail->pages[i]), PAGE_SIZE);
+		}
 }
 
 /*
@@ -487,12 +508,12 @@ static void isp_firmware_shutdown_stage1(struct apple_isp *isp)
 			 val);
 
 	/*
-	 * macOS powers T8140's ISP off from WFI with the run bit still set. The sleep
-	 * engine's own restore of the ISP in a wake that kept DRAM up depends on it:
-	 * with the bit cleared that wake stalls until the SoC's watchdog resets it.
+	 * Leave the coprocessor control word as it is, on every generation.
+	 * macOS powers the T8132 ISP down without writing it, and T8140's ISP
+	 * off from WFI with the run bit still set. On T8140 the sleep engine's
+	 * own restore of the ISP in a wake that kept DRAM up depends on it: with
+	 * the bit cleared that wake stalls until the SoC's watchdog resets it.
 	 */
-	if (isp->hw->gen != ISP_GEN_T8140)
-		isp_coproc_write32(isp, isp_coproc_control(isp), 0x0);
 
 	if (started) {
 		/* The request bit alone asks for it, and reads back once done */
@@ -558,8 +579,11 @@ static int isp_firmware_boot_stage1(struct apple_isp *isp)
 	isp_mbox_write32(isp, isp->hw->mbox_irq_enable, 0x0);
 
 	isp_coproc_write32(isp, isp_coproc_control(isp), 0x0);
-	isp_coproc_write32(isp, isp_coproc_control(isp), 0x10);
+	isp_coproc_write32(isp, isp_coproc_control(isp),
+			   ISP_COPROC_CONTROL_START);
 	isp->fw.started = true;
+	/* Power-down leaves the start word, for the next boot's check */
+	isp->coproc_left = true;
 
 	/* Wait for ISP_GPIO_7 to 0x0 -> 0x8042006 */
 	if (isp_gpio_wait(isp, ISP_GPIO_7, 0x8042006)) {

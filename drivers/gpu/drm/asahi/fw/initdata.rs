@@ -637,7 +637,7 @@ pub(crate) mod raw {
         pub(crate) afr_unkpad: u32,
     }
 
-    #[versions(AGX)]
+    #[versions(AGX_V27_2)]
     #[derive(Debug)]
     #[repr(C)]
     pub(crate) struct HwDataB {
@@ -663,10 +663,15 @@ pub(crate) mod raw {
         pub(crate) yuv_matrices: Array<0x3f, Array<3, Array<4, i16>>>,
 
         pub(crate) pad_1c8: Pad<0x8>,
+        #[ver(V < V27_2)]
         pub(crate) io_mappings: Array<IO_MAPPING_COUNT::ver, IOMapping>,
+        #[ver(V >= V27_2)]
+        pub(crate) io_mappings: Array<60, crate::g17::fw::initdata::RegisterMapEntry>,
 
         #[ver(V >= V13_0B4)]
         pub(crate) sgx_sram_ptr: U64,
+        #[ver(V >= V27_2)]
+        pub(crate) coredump_copy_buffer_size: U64,
 
         pub(crate) chip_id: u32,
         pub(crate) unk_454: u32,
@@ -835,7 +840,7 @@ pub(crate) mod raw {
         #[ver(V >= V13_0B4)]
         pub(crate) unk_c3c: u32,
     }
-    #[versions(AGX)]
+    #[versions(AGX_V27_2)]
     default_zeroed!(HwDataB::ver);
 
     #[derive(Debug)]
@@ -1243,7 +1248,7 @@ pub(crate) mod raw {
         pub(crate) index_mask: U64,
     }
 
-    #[versions(AGX)]
+    #[versions(AGX_V27_2)]
     #[derive(Debug)]
     #[repr(C)]
     pub(crate) struct InitData<'a> {
@@ -1253,20 +1258,65 @@ pub(crate) mod raw {
         pub(crate) unk_buf: GpuPointer<'a, &'a [u8]>,
         pub(crate) unk_8: u32,
         pub(crate) unk_c: u32,
+        #[ver(V < V27_2)]
         pub(crate) runtime_pointers: GpuPointer<'a, super::RuntimePointers::ver>,
+        #[ver(V < V27_2)]
         pub(crate) globals: GpuPointer<'a, super::Globals::ver>,
+        #[ver(V < V27_2)]
         pub(crate) fw_status: GpuPointer<'a, super::FwStatus>,
+        // From 27.2 the root names opaque records; their layouts live with the 27.2 builder.
+        #[ver(V >= V27_2)]
+        pub(crate) runtime_pointers: GpuPointer<'a, &'a [u8]>,
+        #[ver(V >= V27_2)]
+        pub(crate) globals: GpuPointer<'a, &'a [u8]>,
+        #[ver(V >= V27_2)]
+        pub(crate) role: u32,
+        #[ver(V >= V27_2)]
+        pub(crate) host_mapped_fw_allocations: u32,
         pub(crate) uat_page_size: u16,
         pub(crate) uat_page_bits: u8,
         pub(crate) uat_num_levels: u8,
         pub(crate) uat_level_info: Array<0x3, UatLevelInfo>,
         pub(crate) __pad0: Pad<0x14>,
+        #[ver(V < V27_2)]
         pub(crate) host_mapped_fw_allocations: u32,
+        #[ver(V < V27_2)]
         pub(crate) unk_ac: u32,
+        #[ver(V < V27_2)]
         pub(crate) unk_b0: u32,
+        #[ver(V < V27_2)]
         pub(crate) unk_b4: u32,
+        #[ver(V < V27_2)]
         pub(crate) unk_b8: u32,
+        #[ver(V >= V27_2)]
+        pub(crate) status_record: GpuPointer<'a, &'a [u8]>,
+        #[ver(V >= V27_2)]
+        pub(crate) control: GpuPointer<'a, &'a [u8]>,
+        #[ver(V >= V27_2)]
+        pub(crate) power: GpuPointer<'a, &'a [u8]>,
+        #[ver(V >= V27_2)]
+        pub(crate) extra: GpuPointer<'a, &'a [u8]>,
     }
+
+    // Layout checks for the firmware 27.2 root and hardware data against the 13.5 layout.
+    const _: () = {
+        // T8112's older layout locates its optional SRAM pointer after 25 IO records.
+        assert!(core::mem::offset_of!(HwDataBG14V13_5, io_mappings) == 0x640);
+        assert!(core::mem::size_of::<IOMapping>() == 0x20);
+        assert!(core::mem::offset_of!(HwDataBG14V13_5, sgx_sram_ptr) == 0x960);
+        assert!(core::mem::offset_of!(HwDataBG14V27_2, io_mappings) == 0x640);
+        assert!(core::mem::offset_of!(HwDataBG14V27_2, sgx_sram_ptr) == 0xfa0);
+        assert!(core::mem::offset_of!(HwDataBG14V27_2, coredump_copy_buffer_size) == 0xfa8);
+        assert!(core::mem::offset_of!(HwDataBG14V27_2, chip_id) == 0xfb0);
+        type Root = InitDataG14V27_2<'static>;
+        assert!(core::mem::offset_of!(Root, ver_info) == 0);
+        assert!(core::mem::offset_of!(Root, role) == 0x28);
+        assert!(core::mem::offset_of!(Root, host_mapped_fw_allocations) == 0x2c);
+        assert!(core::mem::offset_of!(Root, uat_level_info) == 0x34);
+        assert!(core::mem::offset_of!(Root, status_record) == 0xa8);
+        assert!(core::mem::offset_of!(Root, extra) == 0xc0);
+        assert!(core::mem::size_of::<Root>() == 0xc8);
+    };
 }
 
 #[derive(Debug)]

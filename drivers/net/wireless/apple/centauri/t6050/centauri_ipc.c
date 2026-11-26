@@ -191,7 +191,7 @@ static int message(struct cen_context *ctx, void __iomem *doorbell,
 {
 	u16 head = ctx->message_head;
 	u8 *descriptor;
-	u16 tail;
+	__le16 tail;
 	int ret;
 
 	if (head >= 15 || !length || length > 512)
@@ -232,7 +232,7 @@ static int cchi_init(struct centauri_t6050 *c)
 {
 	struct centauri_t6050_ipc *ipc = c->ipc;
 	u8 config[4] = {9, 0, 0xff, 0xff}, *entry;
-	u16 tail;
+	__le16 tail;
 	int i, ret;
 
 	ipc->cchi_rx = buffer_alloc(c, 0, SZ_32K);
@@ -378,7 +378,8 @@ unlock:
 	return 0;
 }
 
-static int centauri_t6050_start_ipc_locked(struct centauri_t6050 *c)
+static int centauri_t6050_start_ipc_locked(struct centauri_t6050 *c,
+					   struct pci_dev **beta)
 {
 	struct centauri_t6050_ipc *ipc;
 	u32 stage;
@@ -450,9 +451,7 @@ static int centauri_t6050_start_ipc_locked(struct centauri_t6050 *c)
 
 	/* Publish usable shared firmware before the Beta consumer probes. */
 	smp_store_release(&c->ready, true);
-	ret = device_attach(&ipc->function[2]->dev);
-	if (ret < 0)
-		dev_warn(&c->pdev->dev, "Beta driver attachment failed: %d\n", ret);
+	*beta = pci_dev_get(ipc->function[2]);
 	return 0;
 failed:
 	dev_err(&c->pdev->dev, "IPC bootstrap failed: %d (Control stage=%#x)\n",
@@ -468,15 +467,31 @@ failed:
 	return ret;
 }
 
-int centauri_t6050_start_ipc(struct centauri_t6050 *c)
+/* On success *beta may hold a reference to the Beta function, for centauri_t6050_attach_beta(). */
+int centauri_t6050_start_ipc(struct centauri_t6050 *c, struct pci_dev **beta)
 {
 	int ret;
 
 	if (!pci_trylock_rescan_remove())
 		return -EAGAIN;
-	ret = READ_ONCE(c->removing) ? -ECANCELED : centauri_t6050_start_ipc_locked(c);
+	ret = READ_ONCE(c->removing) ? -ECANCELED :
+	      centauri_t6050_start_ipc_locked(c, beta);
 	pci_unlock_rescan_remove();
-	return ret;
+	return *beta ? 0 : ret;
+}
+
+/*
+ * Under neither the rescan lock nor boot_lock: the Beta driver's probe
+ * registers a PM notifier, a suspend's notifiers wait for a rescan, and a
+ * rescan's holder (the rewake) takes boot_lock.
+ */
+void centauri_t6050_attach_beta(struct centauri_t6050 *c, struct pci_dev *beta)
+{
+	int ret = device_attach(&beta->dev);
+
+	if (ret < 0)
+		dev_warn(&c->pdev->dev, "Beta driver attachment failed: %d\n", ret);
+	pci_dev_put(beta);
 }
 
 void centauri_t6050_free_ipc(struct centauri_t6050 *c)
@@ -577,4 +592,38 @@ int centauri_t6050_alpha_resources(struct centauri_t6050 *c, struct cen_alpha_re
 	resources->mtr = ipc->alpha.mtr;
 	resources->mcr = ipc->alpha.mcr;
 	return 0;
+}
+
+struct pci_dev *centauri_t6050_ipc_alpha_dev(struct centauri_t6050 *c)
+{
+	return c->ipc ? c->ipc->function[1] : NULL;
+}
+
+static u32 control_sleep_status(struct centauri_t6050 *c)
+{
+	return le32_to_cpu(READ_ONCE(*(__le32 *)(c->ipc->control.buffer->cpu + 0x70)));
+}
+
+int centauri_t6050_ipc_control_sleep(struct centauri_t6050 *c, bool asleep)
+{
+	u32 status;
+	int ret;
+
+	if (!c->ipc || !c->ipc->control.buffer ||
+	    readl(c->bar + 0x8000) != 2 || readl(c->bar + 0x8050) != 2)
+		return -EIO;
+	dma_wmb();
+	writel(asleep ? 3 : 0, c->bar + 0x9078);
+	ret = read_poll_timeout(control_sleep_status, status,
+				(asleep ? status == 3 : status <= 1) ||
+				readl(c->bar + 0x8000) != 2,
+				100, 2000000, false, c);
+	dma_rmb();
+	if (readl(c->bar + 0x8000) != 2)
+		ret = -EIO;
+	dev_dbg(&c->pdev->dev,
+		"Control ACIPC host %s: ret=%d status=%u exec=%u ipc=%u\n",
+		asleep ? "sleep" : "wake", ret, status,
+		readl(c->bar + 0x8000), readl(c->bar + 0x8050));
+	return ret;
 }

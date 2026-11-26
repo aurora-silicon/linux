@@ -2121,6 +2121,19 @@ config RTC_DRV_MACSMC
 	  To compile this driver as a module, choose M here: the
 	  module will be called rtc-macsmc.
 
+config RTC_DRV_MACSMC_KUNIT_TEST
+	bool "KUnit tests for the Apple SMC RTC" if !KUNIT_ALL_TESTS
+	depends on RTC_DRV_MACSMC=y && KUNIT=y
+	depends on MFD_MACSMC_KUNIT_TEST && NVMEM
+	default KUNIT_ALL_TESTS
+	help
+	  Build tests for the Apple SMC RTC's time and alarm arithmetic: the
+	  48-bit tick offset with its sign extension and wrap, the 64-bit
+	  seconds offset and its rounding, and the PMU alarm's value, mask
+	  and control byte writes. A static stub replaces the SMC counter
+	  read and a RAM-backed NVMEM device holds the offset and alarm
+	  cells, so the tests need no Apple hardware.
+
 config RTC_DRV_MSC313
 	tristate "MStar MSC313 RTC"
 	depends on ARCH_MSTARV7 || COMPILE_TEST

@@ -674,7 +674,13 @@ impl RawAllocation for HeapAllocation {
 struct HeapAllocatorInner {
     dev: AsahiDevRef,
     allocated: usize,
-    backing_objects: KVec<(crate::gem::ObjectRef, mmu::KernelMapping, u64)>,
+    /// Each block, its mapping, its GPU address and, for a client VM, its charge.
+    backing_objects: KVec<(
+        crate::gem::ObjectRef,
+        mmu::KernelMapping,
+        u64,
+        Option<crate::memacct::Charge>,
+    )>,
     garbage: Option<KVec<mm::Node<HeapAllocatorInner, HeapAllocationInner>>>,
     total_garbage: usize,
     name: CString,
@@ -789,7 +795,19 @@ impl HeapAllocator {
             );
         }
 
-        let mut obj = crate::gem::new_kernel_object(&self.dev, size_aligned)?;
+        // A client VM's heap grows with what the client submits (scene buffers are sized
+        // from its render targets), so its blocks count against that client's limit, like
+        // the client's own objects, and not as kernel memory.
+        let (mut obj, charge) = match self.vm.memory_client() {
+            Some(client) => {
+                let commit = crate::memacct::LEDGER.admit(client, size_aligned as u64)?;
+                let obj = crate::gem::new_kernel_object_user_charged(&self.dev, size_aligned)?;
+                let charge = crate::memacct::Charge::user(commit, None);
+                charge.set_held(true);
+                (obj, Some(charge))
+            }
+            None => (crate::gem::new_kernel_object(&self.dev, size_aligned)?, None),
+        };
         if self.cpu_maps && debug_enabled(DebugFlags::FillAllocations) {
             let obj_size = obj.size();
             if let Ok(vmap) = obj.vmap() {
@@ -868,7 +886,7 @@ impl HeapAllocator {
         self.mm.with_inner(|inner| {
             inner
                 .backing_objects
-                .push((obj, mapping, gpu_ptr), GFP_KERNEL)
+                .push((obj, mapping, gpu_ptr, charge), GFP_KERNEL)
         })?;
 
         self.top = new_top;

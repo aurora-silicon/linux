@@ -242,7 +242,6 @@ static const struct fabric_scenario scenarios[] = {
 	{ "S32_dual_hdmi_reclaim_core", 32 },
 	{ "S33_dual_scores", 33 },
 	{ "S34_dual_park_reselect", 34 },
-	{ "S35_dual_retry_off", 35 },
 	{ "S40_desktop_promotion", 40 },
 	{ "S41_dedicated_hdmi", 41 },
 	{ "S50a_panel_has_no_routes_core", 50 },
@@ -269,7 +268,7 @@ static void fabric_scenario_test(struct kunit *test)
 	enum dcp_fabric_fixed_step steps[2];
 	unsigned int count, order;
 
-	fabric_init(&f, scenario->id >= 30 && scenario->id <= 35);
+	fabric_init(&f, scenario->id >= 30 && scenario->id <= 34);
 	switch (scenario->id) {
 	case 1:
 		f.port[0].preferred = &f.route[0][0];
@@ -438,9 +437,6 @@ static void fabric_scenario_test(struct kunit *test)
 		f.pipeline[0].presence = DCP_FABRIC_SETTLING;
 		KUNIT_EXPECT_EQ(test, fabric_tunnel(&f, 1, 0), 0);
 		break;
-	case 35:
-		kunit_skip(test, "TB match-data retry policy is tested by W3");
-		break;
 	case 50:
 		f.port[0].routes = NULL;
 		KUNIT_EXPECT_PTR_EQ(test,
@@ -480,6 +476,9 @@ static void fabric_scenario_test(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, dcp_fabric_tunnel_request(f.port, 0, 0, &found), -EINVAL);
 		KUNIT_EXPECT_EQ(test, dcp_fabric_tunnel_request(f.port, 1, DCP_FABRIC_DPIN_MAX,
 								&found), -EINVAL);
+		break;
+	default:
+		KUNIT_FAIL(test, "scenario %u has no checks", scenario->id);
 		break;
 	}
 }
@@ -1561,10 +1560,18 @@ static void fabric_effect_s50a_test(struct kunit *test)
 	struct fabric_fake f;
 
 	fabric_fake_init(&f, test, false);
+	KUNIT_EXPECT_FALSE(test, dcp_fabric_has_available_routes(false, 0));
+	KUNIT_EXPECT_FALSE(test, dcp_fabric_has_available_routes(true, 0));
+	KUNIT_EXPECT_TRUE(test, dcp_fabric_has_available_routes(true, 1));
 	KUNIT_EXPECT_EQ(test, dcp_fabric_run_probe(false, fabric_fake_register, &f), 0);
+	KUNIT_EXPECT_EQ(test,
+			dcp_fabric_run_probe(dcp_fabric_has_available_routes(true, 0),
+					     fabric_fake_register, &f), 0);
 	KUNIT_EXPECT_EQ(test, f.count, 0U);
 	KUNIT_EXPECT_FALSE(test, f.f.pipeline[0].owned);
-	KUNIT_EXPECT_EQ(test, dcp_fabric_run_probe(true, fabric_fake_register, &f), 0);
+	KUNIT_EXPECT_EQ(test,
+			dcp_fabric_run_probe(dcp_fabric_has_available_routes(true, 1),
+					     fabric_fake_register, &f), 0);
 	KUNIT_ASSERT_EQ(test, f.count, 1U);
 	KUNIT_EXPECT_EQ(test, f.trace[0], FX_REGISTER);
 }
@@ -2447,6 +2454,32 @@ static void relink_unplug_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, dcp_relink_unplug(&s, 7, relink_ms(t, 62000)));
 }
 
+/*
+ * A sink attached while the outputs were off gets its link trained at the
+ * CRTC's first enable, minutes later: the window starts there, and the
+ * attachment keeps its retries.
+ */
+static void relink_first_enable_test(struct kunit *test)
+{
+	unsigned long t = 100000;
+	struct dcp_relink_state s;
+	unsigned int i;
+
+	relink_fresh(&s, 5, t);
+	KUNIT_EXPECT_FALSE(test, dcp_relink_unplug(&s, 5, relink_ms(t, 137000)));
+	dcp_relink_link_up(&s, 5, relink_ms(t, 135000));
+	KUNIT_EXPECT_TRUE(test, dcp_relink_unplug(&s, 5, relink_ms(t, 137000)));
+	dcp_relink_end(&s);
+
+	/* no fresh budget: unlike a DPMS wake, the enable does not reset it */
+	for (i = s.tries; i < DCP_RELINK_RETRIES; i++) {
+		KUNIT_EXPECT_TRUE(test, dcp_relink_unplug(&s, 5, relink_ms(t, 137000)));
+		dcp_relink_end(&s);
+	}
+	dcp_relink_link_up(&s, 5, relink_ms(t, 200000));
+	KUNIT_EXPECT_FALSE(test, dcp_relink_unplug(&s, 5, relink_ms(t, 201000)));
+}
+
 /* One relink at a time; the replay keeps the retries of its attachment. */
 static void relink_running_test(struct kunit *test)
 {
@@ -2623,6 +2656,7 @@ static struct kunit_case fabric_tests[] = {
 	KUNIT_CASE(fabric_t8132_clock_refused_test),
 	KUNIT_CASE(fabric_t6050_merged_limit_test),
 	KUNIT_CASE(relink_unplug_test),
+	KUNIT_CASE(relink_first_enable_test),
 	KUNIT_CASE(relink_running_test),
 	KUNIT_CASE(relink_budget_test),
 	KUNIT_CASE(relink_disabled_test),

@@ -19,6 +19,8 @@ struct dcp_v14_board {
 	const char *dcp_compatible;
 	/* The machine compatible; NULL for any machine with this DCP. */
 	const char *machine;
+	/* The compatible of the DCP's "panel" child; NULL for any panel. */
+	const char *panel;
 	/* The firmware image whose layouts were tested on this board. */
 	const char *firmware_uuid;
 	/* Set to <1> by the boot loader on the DCP, display and PIODMA nodes. */
@@ -50,16 +52,21 @@ struct dcp_v14_board {
 	bool panel_nits;
 };
 
-/* Whether the DCP node or the machine (as @ctx gives them) has @compat. */
+/*
+ * Whether the DCP node, the machine or the DCP's panel node (as @ctx gives
+ * them) has @compat.
+ */
 typedef bool (*dcp_v14_compat_fn)(const void *ctx, const char *compat);
 
 /*
  * The board record of a DCP. NULL if there is none: *@dcp_known then says
  * whether a record names the DCP's compatible (but no record is for this
- * machine) or none does (not an internal 14.x DCP).
+ * machine and panel) or none does (not an internal 14.x DCP). A record with
+ * a machine is for that machine, one with a panel for a DCP with that panel.
  */
 const struct dcp_v14_board *dcp_v14_board_select(dcp_v14_compat_fn dcp_is,
 						 dcp_v14_compat_fn machine_is,
+						 dcp_v14_compat_fn panel_is,
 						 const void *ctx, bool *dcp_known);
 
 /*

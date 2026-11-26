@@ -554,6 +554,24 @@ static int dcp_v26_callback(void *cookie, u32 tag,
 	}
 	if (tag == D(576) && SHAPE(4, 0))
 		return 0;
+	/*
+	 * Callbacks the firmware sends when the display is powered down (A473, observed in
+	 * macOS's panel-off and in Linux's sleep calls), answered as the H17P and M4 drivers
+	 * answer them: a no-op (D2), swap_complete_intent_gated (D592, a no-op),
+	 * powerUpDART (D572, success) and get_calendar_time_ms (D209).
+	 */
+	if ((tag == D(2) && SHAPE(0, 0)) || (tag == D(592) && SHAPE(20, 0)))
+		return 0;
+	if (tag == D(572) && SHAPE(4, 4)) {
+		if (v26->dcp)
+			dcp_s2r_dart_power(v26->dcp, get_unaligned_le32(in));
+		memset(out, 0, 4);
+		return 0;
+	}
+	if (tag == D(209) && SHAPE(0, 8)) {
+		put_unaligned_le64(ktime_get_real_ns() / NSEC_PER_MSEC, out);
+		return 0;
+	}
 	if (tag == D(300) && SHAPE(16, 0)) {
 		dcp_v26_publish(v26, in);
 		return 0;
@@ -1740,9 +1758,11 @@ int iomfb_v26_6_atomic_check(struct apple_dcp *dcp, struct drm_crtc *crtc,
 
 int iomfb_v26_6_modeset(struct apple_dcp *dcp, struct drm_crtc_state *crtc_state)
 {
-	struct dcp_display_mode mode;
+	struct dcp_display_mode *mode __free(kfree) = kzalloc_obj(*mode);
 
-	if (!lookup_mode(dcp, &crtc_state->mode, &mode))
+	if (!mode)
+		return -ENOMEM;
+	if (!lookup_mode(dcp, &crtc_state->mode, mode))
 		return -EINVAL;
 	/*
 	 * The firmware keeps the timing it booted with, which every mode
@@ -1751,8 +1771,8 @@ int iomfb_v26_6_modeset(struct apple_dcp *dcp, struct drm_crtc_state *crtc_state
 	 * (locked 60 Hz).
 	 */
 	if (dcp->v26) {
-		WRITE_ONCE(dcp->v26->timed, mode.vrr);
-		WRITE_ONCE(dcp->v26->refresh, drm_mode_vrefresh(&mode.mode));
+		WRITE_ONCE(dcp->v26->timed, mode->vrr);
+		WRITE_ONCE(dcp->v26->refresh, drm_mode_vrefresh(&mode->mode));
 	}
 	dcp_mode_set_valid(&dcp->mode_state, true);
 	return 0;
@@ -1772,7 +1792,8 @@ void iomfb_v26_6_flush(struct apple_dcp *dcp, struct drm_crtc *crtc,
 		p = crtc->primary->state;
 	fb = p && p->visible ? p->fb : NULL;
 	dcp->swap_start = ktime_get();
-	if (!dcp->v26 || !dcp_v26_present(dcp->v26, fb, dcp->notch_height, &presented, cs)) {
+	if (READ_ONCE(dcp->sleep_cold_stopped) || !dcp->v26 ||
+	    !dcp_v26_present(dcp->v26, fb, dcp->notch_height, &presented, cs)) {
 		dcp_v26_cancel_event(dcp);
 		return;
 	}
@@ -1925,4 +1946,82 @@ void iomfb_v26_6_poweroff(struct apple_dcp *dcp)
 		dcp_v26_brightness_power(dcp->v26, false);
 		dcp_v26_present(dcp->v26, NULL, 0, NULL, NULL);
 	}
+}
+
+/*
+ * Calls the 26.6 firmware receives from macOS before a system sleep, in the order and
+ * with the inputs observed on its mailbox and RPC memory.
+ * The panel-off group: A414 (8 zero bytes; reply 1), A478 (reply 1) twice, A476(1),
+ * A478, A412 (reply 1), A473 (16 zero bytes; reply 8 zero bytes), A500 (0, 0).
+ * The sleep-entry group: A478, A476(1), A473 (bytes 8, 11 and 12 set to 1), A115
+ * (reply 0), A500 (0, 1). @groups: 1 sends the sleep-entry group only, 2 sends the
+ * panel-off group first, then the sleep-entry group. Every reply is compared with
+ * the expected firmware reply; a mismatch returns -EPROTO.
+ */
+static int dcp_v26_sleep_call(struct apple_dcp_v26 *v26, u32 tag, const void *in, u32 in_size,
+			      const void *want, u32 want_size, bool *same)
+{
+	u8 out[8] = {};
+	int ret;
+
+	ret = dcp_v26_call(v26, tag, in, in_size, want_size ? out : NULL, want_size, 0);
+	if (!ret && want_size && memcmp(out, want, want_size)) {
+		dev_warn(v26->dev, "sleep call %#x reply %*ph, expected %*ph\n", tag, want_size,
+			 out, want_size, want);
+		*same = false;
+	}
+	return ret;
+}
+
+int dcp_v26_sleep_calls(struct apple_dcp *dcp, int groups)
+{
+	static const u8 zero16[16], one[4] = { 1 }, one8[8] = { 1 };
+	static const u8 a473_entry[16] = { [8] = 1, [11] = 1, [12] = 1 };
+	static const u8 a500_off[4] = { 0, 0 }, a500_entry[4] = { 0, 1 };
+	struct apple_dcp_v26 *v26 = dcp->v26;
+	bool same = true;
+	int ret = 0;
+
+	if (!v26 || !v26->started)
+		return -ENODEV;
+	mutex_lock(&v26->lock);
+	if (groups >= 2) {
+		ret = dcp_v26_sleep_call(v26, A(414), zero16, 8, one8, 8, &same);
+		if (!ret)
+			ret = dcp_v26_sleep_call(v26, A(478), NULL, 0, one, 4, &same);
+		if (!ret)
+			ret = dcp_v26_sleep_call(v26, A(478), NULL, 0, one, 4, &same);
+		if (!ret)
+			ret = dcp_v26_sleep_call(v26, A(476), one, 4, NULL, 0, &same);
+		if (!ret)
+			ret = dcp_v26_sleep_call(v26, A(478), NULL, 0, one, 4, &same);
+		if (!ret)
+			ret = dcp_v26_sleep_call(v26, A(412), NULL, 0, one, 4, &same);
+		if (!ret)
+			ret = dcp_v26_sleep_call(v26, A(473), zero16, 16, zero16, 8, &same);
+		if (!ret)
+			ret = dcp_v26_sleep_call(v26, A(500), a500_off, 4, NULL, 0, &same);
+		dev_dbg(v26->dev, "panel-off calls before sleep: %d\n", ret);
+	}
+	if (!ret)
+		ret = dcp_v26_sleep_call(v26, A(478), NULL, 0, one, 4, &same);
+	if (!ret)
+		ret = dcp_v26_sleep_call(v26, A(476), one, 4, NULL, 0, &same);
+	if (!ret)
+		ret = dcp_v26_sleep_call(v26, A(473), a473_entry, 16, zero16, 8, &same);
+	if (!ret)
+		ret = dcp_v26_sleep_call(v26, A(115), NULL, 0, zero16, 4, &same);
+	if (!ret)
+		ret = dcp_v26_sleep_call(v26, A(500), a500_entry, 4, NULL, 0, &same);
+	mutex_unlock(&v26->lock);
+	if (!ret && !same)
+		ret = -EPROTO;
+	dev_dbg(v26->dev, "sleep calls (groups %d): %d, replies %s expected\n", groups, ret,
+		same ? "matched" : "differed from");
+	return ret;
+}
+
+struct apple_rtkit *dcp_v26_rtkit(struct apple_dcp *dcp)
+{
+	return dcp->v26 ? dcp->v26->rtk : NULL;
 }

@@ -10,7 +10,7 @@ maintainers:
   - Diljit Singh <hey@djdev.me>
 
 description: |
-  The registers a kernel running directly at EL2 on the M5 Pro writes to enter and
+  The registers a kernel running directly at EL2 on the M5 Pro or Max writes to enter and
   return from suspend-to-RAM: the PMGR's power, clock, perf and table banks on both
   dies, the CPU clusters, power gates and start block, the sleep commit word, the
   watchdogs, nub-spmi0, the PMC, PTD, the DART GAPF bank, the clusters' CPM blocks,
@@ -21,7 +21,11 @@ description: |
 
 properties:
   compatible:
-    const: apple,t6050-sleep
+    oneOf:
+      - const: apple,t6050-sleep
+      - items:
+          - const: apple,t6050-j716c-sleep
+          - const: apple,t6050-sleep
 
   reg:
     minItems: 46
@@ -87,10 +91,12 @@ properties:
   apple,spmi-buses:
     $ref: /schemas/types.yaml#/definitions/phandle-array
     minItems: 1
-    maxItems: 5
+    maxItems: 7
     items:
       maxItems: 1
-    description: The SPMI buses whose interrupt masks the sleep sets, aop-spmi0 last.
+    description: |
+      The SPMI buses whose interrupt masks the sleep sets: aop-spmi0 fifth, then
+      the buses a board has beyond the J714s's (the M5 Max's nub-spmi1, nub-spmi4).
 
   apple,sleep-darts:
     $ref: /schemas/types.yaml#/definitions/phandle-array
@@ -111,10 +117,12 @@ properties:
     description: The AP pin controller, whose pins a deep sleep resets.
 
   apple,pinctrl-skip-pins:
-    $ref: /schemas/types.yaml#/definitions/uint32-array
+    oneOf:
+      - $ref: /schemas/types.yaml#/definitions/uint32-array
+      - type: boolean
     description: |
       Pins neither saved nor restored. From the ADT, set by the bootloader;
-      without it no pin is saved.
+      without it no pin is saved. Empty where every pin is saved.
 
   apple,sleep-low-pins:
     $ref: /schemas/types.yaml#/definitions/uint32-array
@@ -137,6 +145,14 @@ properties:
     description: |
       The GFX die's wake sources left enabled for a sleep. From the ADT, set by
       the bootloader.
+
+  apple,display-method-sleep:
+    type: boolean
+    description: |
+      The display coprocessors take the sleep through their firmware 27 method
+      table: its sleep call and its swap, the panel's AV and DP services and the
+      external processors' handling around a sleep. Without it they keep the
+      method table they had and take the sleep's endpoint transport alone.
 
   apple,clk-gating-boot:
     $ref: /schemas/types.yaml#/definitions/uint32-matrix
@@ -322,7 +338,7 @@ properties:
   apple,spmi-sleep-order:
     $ref: /schemas/types.yaml#/definitions/uint32-array
     minItems: 1
-    maxItems: 5
+    maxItems: 7
     description: |
       The order in which the apple,spmi-buses get their sleep mask, by index;
       without it, their DT order.
@@ -390,7 +406,7 @@ $defs:
       wait whose timeout is not an error. The blocks are 0 to 7 the radio
       host's config, port0 (0x24000 bytes from its start), phy0, rc, phy0's
       four port words (0x10000 bytes from its start), the PHY's common page
-      below them, this node's storage-phy and storage-phy-ip; 8 to 12 the
+      below them, this node's storage-phy and storage-phy-ip; 8 to 14 the
       apple,spmi-buses; from 16, this node's reg entries by index.
     items:
       items:

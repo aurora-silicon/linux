@@ -92,6 +92,7 @@ struct avd_ctx {
  const struct format *coded_fmt_desc; struct work_struct submit_work;
  bool draining,broken; unsigned int hw_errors,max_frames; enum avd_frame_dep next_dep;
  bool session_started; u64 session_generation;
+ u32 width,height;
  int ctrl_hdl;
 };
 struct avd_variant { size_t fp_size; };
@@ -106,6 +107,7 @@ struct avd_dev {
  struct avd_ctx *deferred_ctx; struct avd_frame *building;
  unsigned int inflight; u64 frame_seq; bool compat_held,stopping,faulted;
  unsigned long rest_until,last_recover; unsigned int storm_count;
+ struct { const void *perf_ops; } pm;
  int queue_lock,queue_mutex,queue_work; void *dev,*m2m_dev;
 };
 static struct avd_ctx *running;
@@ -147,6 +149,20 @@ static int pm_runtime_resume_and_get(void *d) { (void)d; if(pm_error)return pm_e
 static void pm_runtime_mark_last_busy(void *d) { (void)d; }
 static void pm_runtime_put_autosuspend(void *d) { (void)d; assert(pm_refs);pm_refs--; }
 static void avd_pm_queue_changed(struct avd_dev *d) { (void)d; }
+static unsigned int perf_starts,perf_idles;
+static const void *last_perf_stream;
+static u32 last_perf_width,last_perf_height;
+static unsigned int last_perf_inflight,last_perf_streams;
+static u32 fmt_width(struct avd_ctx *c) { return c->width ? c->width : 1920; }
+static u32 fmt_height(struct avd_ctx *c) { return c->height ? c->height : 1080; }
+static void avd_pm_perf_frame_start(struct avd_dev *d,const void *stream_id,
+ u32 width,u32 height,unsigned int inflight,unsigned int concurrent_streams)
+{
+ assert(d && d->pm.perf_ops); perf_starts++;
+ last_perf_stream=stream_id; last_perf_width=width; last_perf_height=height;
+ last_perf_inflight=inflight; last_perf_streams=concurrent_streams;
+}
+static void avd_pm_perf_idle(struct avd_dev *d) { assert(d && !d->inflight); perf_idles++; }
 static void mod_delayed_work(void *w,void *v,int t) { (void)w;(void)v;(void)t; }
 static int avd_buf_alloc(struct avd_dev *d,struct avd_buf *b,size_t n) { (void)d;(void)b;(void)n;return -ENOMEM; }
 static void *devm_kzalloc(void *d,size_t n,int f) { (void)d;(void)f;return calloc(1,n); }
@@ -285,6 +301,28 @@ int main(void) {
  m[0].src=&src[18];m[0].dst=&dst[18];submit(&c[0]);
  assert(!running&&wakes==old_wakes+1&&irq_enables==1&&!d.rest_until&&!d.storm_count);
  complete(&d,&c[0],0);assert(!pm_refs);
+ /* Perf floor hooks stay silent without perf_ops and track streams when enabled. */
+ assert(!perf_starts&&perf_idles);
+ {
+  static const int fake_perf_ops;
+  struct vb2_v4l2_buffer perf_src[3]={},perf_dst[3]={};
+  unsigned int old_idles=perf_idles;
+  d.pm.perf_ops=&fake_perf_ops;
+  c[0].width=3840;c[0].height=2160;c[1].width=1920;c[1].height=1080;
+  m[0].src=&perf_src[0];m[0].dst=&perf_dst[0];submit(&c[0]);
+  assert(perf_starts==1&&last_perf_stream==&c[0]&&last_perf_width==3840&&last_perf_height==2160);
+  assert(last_perf_inflight==1&&last_perf_streams==1&&perf_idles==old_idles);
+  m[1].src=&perf_src[1];m[1].dst=&perf_dst[1];submit(&c[1]);
+  assert(perf_starts==2&&last_perf_stream==&c[1]&&last_perf_width==1920&&last_perf_height==1080);
+  assert(last_perf_inflight==2&&last_perf_streams==2&&perf_idles==old_idles);
+  complete(&d,&c[0],0);assert(perf_idles==old_idles);
+  complete(&d,&c[1],0);assert(perf_idles==old_idles+1&&!d.inflight&&!pm_refs);
+  perf_src[2].flags=V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF;
+  m[0].src=&perf_src[2];m[0].dst=&perf_dst[2];submit(&c[0]);
+  assert(perf_starts==2&&perf_idles==old_idles+2&&!d.inflight&&!pm_refs);
+  m[0].dst=NULL;
+  d.pm.perf_ops=NULL;
+ }
  /* A failed wake retires the decoder and never opens IRQs or posts a frame. */
  d.rest_until=jiffies;wake_error=-EIO;m[0].src=&src[19];m[0].dst=&dst[19];
  unsigned int old_sent=send_count;submit(&c[0]);assert(d.faulted&&irq_enables==1&&send_count==old_sent);
@@ -413,7 +451,9 @@ def main():
                     function(CORE.read_text(), 'v4l2_m2m_buf_done_and_job_finish') +
                     function(legacy, 'avd_job_finish_no_pm') + function(legacy, 'avd_job_finish') +
                     function(source, 'avd_send_frame') +
-                    function(source, 'avd_retire') + function(source, 'avd_queue_submit_work') +
+                    function(source, 'avd_retire') +
+                    function(source, 'avd_active_stream_stats') +
+                    function(source, 'avd_queue_submit_work') +
                     function(source, 'avd_frame_vp_complete') + function(source, 'avd_retire_vp') +
                     function(source, 'avd_queue_ready') + VP_MAIN + MAIN.replace(' puts("PASS: production dispatch', ' check_vp_events();\n puts("PASS: production dispatch'))
     exe = out / 'dispatch-test'

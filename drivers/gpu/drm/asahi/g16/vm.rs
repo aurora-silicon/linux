@@ -138,6 +138,15 @@ pub(crate) struct VmStateInner {
     pub(crate) live: Arc<LiveToken>,
 }
 
+impl VmStateInner {
+    /// Whether renders this VM's SUBMITs accepted are not yet published.
+    pub(crate) fn renders_unpublished(&self) -> bool {
+        self.resources
+            .as_ref()
+            .is_some_and(|cache| cache.renders_unpublished())
+    }
+}
+
 impl Drop for VmStateInner {
     fn drop(&mut self) {
         mod_pr_debug!("G16: VM {} releases context {}\n", self.id, self.slot);
@@ -254,6 +263,11 @@ impl Registry {
             let index = vms.iter().position(|state| state.id == id);
             index.and_then(|index| vms.remove(index).ok())
         };
+        // Arenas still reachable by firmware stay with the slot leases and jobs that hold
+        // them; the rest (and the spare epochs, which hold the VM) go now.
+        if let Some(cache) = state.as_ref().and_then(|state| state.resources.as_ref()) {
+            cache.close();
+        }
         drop(state);
     }
 
@@ -268,8 +282,12 @@ impl Registry {
             let Some(closed) = closed else {
                 break;
             };
-            // No allocation while holding the registry lock, which fail_all() also needs.
-            // Final VM destruction is deferred independently of this caller's locks.
+            // Break the spare-epoch cycle before releasing the registry reference, matching
+            // close(). No allocation while holding the registry lock, which fail_all() also
+            // needs. Final VM destruction is deferred independently of this caller's locks.
+            if let Some(cache) = closed.resources.as_ref() {
+                cache.close();
+            }
             drop(closed);
         }
     }
@@ -330,6 +348,15 @@ impl Registry {
             .find(|state| state.id == id)
             .cloned()
             .ok_or(ENOENT)
+    }
+
+    /// The VM id of a live VM currently bound to TTBAT `slot`, if any.
+    pub(crate) fn find_by_slot(&self, slot: u32) -> Option<u64> {
+        self.vms
+            .lock()
+            .iter()
+            .find(|state| state.slot == slot)
+            .map(|state| state.id)
     }
 
     /// Latches `error` on every VM whose client handle is open. The fail-stop path calls it under
@@ -397,6 +424,7 @@ pub(crate) fn new_vm(gpu: &Gpu, kernel_range: Range<u64>, file_id: u64) -> Resul
         factory,
         live.bind.as_ref().ok_or(EIO)?.clone(),
         live.clone(),
+        gpu.shared.clone(),
     )?;
     let inner = VmStateInner {
         id,

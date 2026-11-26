@@ -184,7 +184,7 @@ static const struct apple_key_translation magic_keyboard_2021_and_2024_fn_keys[]
 	{ KEY_F3,	KEY_SCALE,          APPLE_FLAG_FKEY },
 	{ KEY_F4,	KEY_SEARCH,         APPLE_FLAG_FKEY },
 	{ KEY_F5,	KEY_MICMUTE,        APPLE_FLAG_FKEY },
-	{ KEY_F6,	KEY_SLEEP,          APPLE_FLAG_FKEY },
+	{ KEY_F6,	KEY_DO_NOT_DISTURB, APPLE_FLAG_FKEY },
 	{ KEY_F7,	KEY_PREVIOUSSONG,   APPLE_FLAG_FKEY },
 	{ KEY_F8,	KEY_PLAYPAUSE,      APPLE_FLAG_FKEY },
 	{ KEY_F9,	KEY_NEXTSONG,       APPLE_FLAG_FKEY },
@@ -1295,9 +1295,28 @@ static const struct hid_device_id apple_devices[] = {
 };
 MODULE_DEVICE_TABLE(hid, apple_devices);
 
+/*
+ * Every interface of an internal SPI or DockChannel controller carries the
+ * controller's IDs. Only the keyboard is ours; leave the others to their own
+ * driver or to hid-generic.
+ */
+static bool apple_match(struct hid_device *hdev, bool ignore_special_driver)
+{
+	if (ignore_special_driver ||
+	    (hdev->quirks & HID_QUIRK_IGNORE_SPECIAL_DRIVER))
+		return false;
+
+	if ((hdev->bus == BUS_SPI || hdev->bus == BUS_HOST) &&
+	    hdev->vendor == SPI_VENDOR_ID_APPLE)
+		return hdev->type == HID_TYPE_SPI_KEYBOARD;
+
+	return true;
+}
+
 static struct hid_driver apple_driver = {
 	.name = "apple",
 	.id_table = apple_devices,
+	.match = apple_match,
 	.report_fixup = apple_report_fixup,
 	.probe = apple_probe,
 	.remove = apple_remove,
