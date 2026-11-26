@@ -134,15 +134,20 @@ static inline u64 dcp_m4_nits_binary64(u32 nits)
 	return ((u64)(1023 + bit) << 52) | ((u64)(nits - (1U << bit)) << (52 - bit));
 }
 
+/* Largest external linear XRGB/ARGB scanout (5120x2880x4 = 56.25 MiB <= 64 MiB). */
+#define DCP_M4_EXT_MAX_WIDTH	5120U
+#define DCP_M4_EXT_MAX_HEIGHT	2880U
+
 /*
- * External outputs: any qualified size up to 3840x2160, same surface layout.
+ * External outputs: any qualified size up to 5120x2880, same surface layout.
  * The frame must already be described at its wire DVA in an owned mapping.
  */
 static inline int dcp_m4_frame_check_ext(const struct dcp_m4_frame *frame)
 {
 	u64 size = (u64)frame->stride * frame->height;
 
-	if (!frame->width || !frame->height || frame->width > 3840 || frame->height > 2160 ||
+	if (!frame->width || !frame->height ||
+	    frame->width > DCP_M4_EXT_MAX_WIDTH || frame->height > DCP_M4_EXT_MAX_HEIGHT ||
 	    frame->stride < frame->width * 4 || frame->stride % 64 ||
 	    !size || size > 0xffffffffULL || frame->backing_size < size ||
 	    !frame->dva || frame->dva % 0x4000 || frame->dva >= (1ULL << 42) ||
