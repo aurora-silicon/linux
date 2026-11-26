@@ -1236,6 +1236,8 @@ struct apple_dcp {
 	struct gpio_desc *hdmi_hpd;
 	struct gpio_desc *hdmi_pwren;
 	struct gpio_desc *dp2hdmi_pwren;
+	/* The converter was powered down for a firmware sleep: resume powers it up again. */
+	bool dp2hdmi_sleep_off;
 
 	struct mutex hpd_mutex;
 

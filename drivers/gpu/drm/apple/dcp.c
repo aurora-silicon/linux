@@ -11542,6 +11542,11 @@ static int dcp_platform_suspend(struct device *dev)
 			dcp_dptx_disconnect(dcp, 0);
 		}
 	}
+	/* The converter draws power through a suspend-to-RAM; macOS has it off. */
+	if (dcp->dp2hdmi_pwren && pm_suspend_via_firmware()) {
+		gpiod_set_value_cansleep(dcp->dp2hdmi_pwren, 0);
+		dcp->dp2hdmi_sleep_off = true;
+	}
 	/*
 	 * Set the device as a wakeup device, which forces its power
 	 * domains to stay on. We need this as we do not support full
@@ -11605,6 +11610,12 @@ static int dcp_platform_resume(struct device *dev)
 
 	if (dcp->s2r_stopped)
 		return dcp_s2r_resume(dcp);
+
+	/* The converter first, so that it is up by the time HPD is sampled below. */
+	if (dcp->dp2hdmi_sleep_off) {
+		dcp->dp2hdmi_sleep_off = false;
+		gpiod_set_value_cansleep(dcp->dp2hdmi_pwren, 1);
+	}
 
 	dcp_sleep_13_5_start(dcp);
 
