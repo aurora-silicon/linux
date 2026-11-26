@@ -1095,6 +1095,25 @@ static int mca_sync_stop(struct snd_soc_component *component,
 }
 
 /*
+ * A stream suspended while running keeps its transfer, paused, for RESUME.
+ * Dropped or prepared from the suspended state instead, it gets no STOP: the
+ * paused transfer would stay the channel's current one, still pointing into
+ * the old buffer, and the next START would queue behind it and never run.
+ * ALSA prepares before every START: end such a transfer here. After a stop
+ * the channel has no transfer left, and there is nothing to end.
+ */
+static int mca_pcm_prepare(struct snd_soc_component *component,
+			   struct snd_pcm_substream *substream)
+{
+	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
+
+	if (rtd->dai_link->no_pcm)
+		return 0;
+
+	return dmaengine_terminate_sync(snd_dmaengine_pcm_get_chan(substream));
+}
+
+/*
  * The capture buffers are cacheable (SNDRV_DMA_TYPE_NONCOHERENT): reading
  * them through an uncached mapping costs the reader several times the
  * copy itself. The CPU's view of what the DMA wrote is made current here,
@@ -1320,6 +1339,7 @@ static const struct snd_soc_component_driver mca_component = {
 	.open = mca_pcm_open,
 	.close = mca_close,
 	.hw_params = mca_hw_params,
+	.prepare = mca_pcm_prepare,
 	.trigger = mca_trigger,
 	.sync_stop = mca_sync_stop,
 	.pointer = mca_pointer,
