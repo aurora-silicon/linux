@@ -218,7 +218,7 @@ static const u32 t6030_lowered[] = {
 	T6030_PS_SIO_CPU, T6030_PS_PMP, T6030_PS_PMS_SRAM, T6030_PS_APCIE_PHY_SW,
 };
 
-enum { T6030_LOWER_SIO_CPU, T6030_LOWER_PMP, T6030_LOWER_PHY = 3 };
+enum { T6030_LOWER_SIO_CPU, T6030_LOWER_PMP, T6030_LOWER_PMS_SRAM, T6030_LOWER_PHY };
 
 /*
  * On under Linux at the commit, off at macOS's (PLAN §4, runs/t1c-stop/linux-diff.tsv): every
@@ -275,6 +275,10 @@ struct t6030_sleep {
 	/* The PMU's RTC alarm as the entry found it, for the rearm after the commit word */
 	u8 alarm_compare[4];
 	bool alarm_valid;
+	/* The PMP's mailbox and the MTP's DART, for macOS's last steps on them */
+	void __iomem *pmp_mbox, *mtp_dart;
+	int pmp_idle_ret;
+	u64 pmp_ack[2];
 };
 
 static struct apple_sleep_smc_policy t6030_smc_policy;
@@ -369,6 +373,8 @@ static void t6030_ovrd_report(struct apple_sleep *s, const char *when)
 		 read_sysreg_s(sys_reg(3, 5, 15, 5, 0)), read_sysreg_s(sys_reg(3, 5, 15, 4, 0)));
 }
 
+static void t6030_late_map(struct apple_sleep *s);
+
 static int t6030_sleep_map_regs(struct apple_sleep *s)
 {
 	static const struct {
@@ -436,6 +442,7 @@ static int t6030_sleep_map_regs(struct apple_sleep *s)
 		return ret;
 
 	t6030_gp_map(s);
+	t6030_late_map(s);
 	t6030_ovrd_report(s, "probe");
 
 	return apple_sleep_read_wake_sources(s);
@@ -779,11 +786,126 @@ static void t6030_wake_masks_restore(struct apple_sleep *s)
  * After the enclave, before the coprocessors stop: the PMU's stage, the notify masks, then the
  * votes. macOS's nub-spmi-a0 word comes before the first vote in every run.
  */
+/*
+ * macOS 27.2's last 30 ms on J516s that Linux didn't have (t5 sleep.tsv against Linux under the
+ * HV, runs/p20-hv-stop-1j/sleep-diff.txt). The PMP is told the AP and then the IOP go idle over
+ * RTKit's management endpoint, each answered within 0.2 ms; then its mailbox's I2A control bit
+ * 0 goes off, and its power word comes down (-23.9 to -23.5 ms). 10.7 ms of nothing later, its
+ * SRAM's word comes down (-12.8 ms). After the SMC's AP idle, the MTP's DART has its errors
+ * masked and acknowledged (-11.0 ms).
+ *
+ * The mailbox is our DTS's pmp_mbox (0x350c08000, apple,asc-mailbox-v4, the registers of
+ * drivers/mailbox/apple-mailbox.c); it's mapped from that address because the PMP's nodes are
+ * added at run time, and only under APPLE_USE_PMP. The management messages are RTKit's
+ * (drivers/soc/apple/rtkit.c). The DART's registers are apple-dart.c's T8110 ERROR and
+ * ERROR_MASK, plus +0x704, written as traced.
+ */
+#define T6030_PMP_MBOX_PA		0x350c08000ULL
+#define T6030_MBOX_A2I_CONTROL		0x110
+#define T6030_MBOX_I2A_CONTROL		0x114
+#define T6030_MBOX_CONTROL_FULL		BIT(16)
+#define T6030_MBOX_CONTROL_EMPTY	BIT(17)
+#define T6030_MBOX_I2A_IRQ		BIT(0)
+#define T6030_MBOX_A2I_SEND0		0x800
+#define T6030_MBOX_A2I_SEND1		0x808
+#define T6030_MBOX_I2A_RECV0		0x830
+#define T6030_MBOX_I2A_RECV1		0x838
+#define T6030_RTKIT_MGMT_TYPE		GENMASK_ULL(59, 52)
+#define T6030_RTKIT_SET_IOP_PWR		0x6
+#define T6030_RTKIT_SET_IOP_PWR_ACK	0x7
+#define T6030_RTKIT_SET_AP_PWR		0xb
+#define T6030_RTKIT_PWR_IDLE		0x201
+#define T6030_PMP_ACK_US		10000
+#define T6030_PMP_DRAIN			32
+#define T6030_PMP_TO_SRAM_US		10680
+#define T6030_DART_ERROR		0x100
+#define T6030_DART_ERROR_MASK		0x104
+#define T6030_DART_704			0x704
+
+static void t6030_late_map(struct apple_sleep *s)
+{
+	struct t6030_sleep *t = t6030_state(s);
+	struct device_node *np = of_find_node_by_path("/soc/iommu@37a808000");
+
+	t->pmp_mbox = ioremap_np(T6030_PMP_MBOX_PA, 0x1000);
+	if (np && of_device_is_compatible(np, "apple,t6030-dart"))
+		t->mtp_dart = of_iomap(np, 0);
+	of_node_put(np);
+	t->pmp_idle_ret = -ENODEV;
+}
+
+/* One management message to the PMP, then its answer: 0, or why none came */
+static int t6030_pmp_mgmt(void __iomem *mb, u64 type, u64 ack, u64 *got)
+{
+	unsigned int us, n = 0;
+	u64 m0, m1;
+
+	if (readl(mb + T6030_MBOX_A2I_CONTROL) & T6030_MBOX_CONTROL_FULL)
+		return -EBUSY;
+	writeq(FIELD_PREP(T6030_RTKIT_MGMT_TYPE, type) | T6030_RTKIT_PWR_IDLE,
+	       mb + T6030_MBOX_A2I_SEND0);
+	writeq(0, mb + T6030_MBOX_A2I_SEND1);
+	readl(mb + T6030_MBOX_A2I_CONTROL);
+	for (us = 0; us < T6030_PMP_ACK_US; us++) {
+		if (readl(mb + T6030_MBOX_I2A_CONTROL) & T6030_MBOX_CONTROL_EMPTY) {
+			udelay(1);
+			continue;
+		}
+		m0 = readq(mb + T6030_MBOX_I2A_RECV0);
+		m1 = readq(mb + T6030_MBOX_I2A_RECV1);
+		*got = m0;
+		if (!(m1 & 0xff) && FIELD_GET(T6030_RTKIT_MGMT_TYPE, m0) == ack)
+			return 0;
+		if (++n >= T6030_PMP_DRAIN)
+			return -EPROTO;
+	}
+	return -ETIMEDOUT;
+}
+
+static void t6030_pmp_idle(struct apple_sleep *s)
+{
+	struct t6030_sleep *t = t6030_state(s);
+	void __iomem *mb = t->pmp_mbox;
+	int ret;
+
+	t->pmp_idle_ret = -ENODEV;
+	if (!mb || !sleep_ps_on(s, T6030_PS_PMP))
+		return;
+	ret = t6030_pmp_mgmt(mb, T6030_RTKIT_SET_AP_PWR, T6030_RTKIT_SET_AP_PWR, &t->pmp_ack[0]);
+	if (!ret)
+		ret = t6030_pmp_mgmt(mb, T6030_RTKIT_SET_IOP_PWR, T6030_RTKIT_SET_IOP_PWR_ACK,
+				     &t->pmp_ack[1]);
+	writel(readl(mb + T6030_MBOX_I2A_CONTROL) & ~T6030_MBOX_I2A_IRQ,
+	       mb + T6030_MBOX_I2A_CONTROL);
+	t->pmp_idle_ret = ret;
+}
+
+static void t6030_mtp_dart_quiet(struct apple_sleep *s)
+{
+	void __iomem *d = t6030_state(s)->mtp_dart;
+
+	if (!d)
+		return;
+	writel(0xffffffff, d + T6030_DART_ERROR_MASK);
+	readl(d + T6030_DART_ERROR_MASK);
+	writel(readl(d + T6030_DART_ERROR), d + T6030_DART_ERROR);
+	writel(0xffffffff, d + T6030_DART_704);
+	readl(d + T6030_DART_704);
+}
+
 static void t6030_sleep_prepare_regs(struct apple_sleep *s)
 {
 	struct t6030_sleep *t = t6030_state(s);
 
+	/*
+	 * The RAM walk first: what follows, up to the commit, is macOS's last 30 ms (t5), and the
+	 * commit's 1.8 ms tail still cleans what the steps below write.
+	 */
+	t6030_sleep_clean_ram();
 	t6030_alarm_snapshot(s, readl(s->spmi + SPMI_NOTIFY_ENABLE));
+	/* t5: WD0's and WD1's counts to 0 at -28.3 ms, after the RTC read, before PMU 0xf801 */
+	writel(0, s->wdt + WDT_WD0_COUNT);
+	writel(0, s->wdt + WDT_WD1_COUNT);
 	sleep_pmu_write(s, s->soc->pmu_sleep_reg, s->soc->pmu_sleep_val);
 	t->notify_saved[0] = readl(s->spmi_a0 + SPMI_NOTIFY_ENABLE);
 	t->notify_saved[1] = readl(s->spmi + SPMI_NOTIFY_ENABLE);
@@ -848,15 +970,20 @@ static int t6030_sleep_commit_notice(struct apple_sleep *s)
 	int ret;
 
 	t6030_sleep_check_stops();
-	ret = t6030_sleep_lower(s, T6030_LOWER_PMP, T6030_LOWER_PHY);
+	t6030_pmp_idle(s);
+	ret = t6030_sleep_lower(s, T6030_LOWER_PMP, T6030_LOWER_PMS_SRAM);
 	if (ret)
 		return ret;
-	t6030_sleep_clean_ram();
+	udelay(T6030_PMP_TO_SRAM_US);
+	ret = t6030_sleep_lower(s, T6030_LOWER_PMS_SRAM, T6030_LOWER_PHY);
+	if (ret)
+		return ret;
 	ret = apple_sleep_smc_commit_notice(s);
 	if (ret)
 		return ret;
 	if (!s->smc_idle_sent || s->smc_idle_ack < s->smc_idle_sent)
 		return -EPROTO;
+	t6030_mtp_dart_quiet(s);
 	return 0;
 }
 
