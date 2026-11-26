@@ -759,25 +759,25 @@ main() {
   mv "$d" "$dir/$base"
   summary=$dir/$base/summary.txt
   tar -C "$dir" -czf "$dir/out.tgz" "$base"
-  # The user (runu) can't read the root-only mktemp dir, so hand the tgz over through its own
-  # world-readable temp file (the tgz is meant for a public issue); the collection dir stays 0700.
-  local pub
-  pub=$(mktemp --tmpdir "air-gpu-collect.XXXXXX.tgz")
-  cp -f "$dir/out.tgz" "$pub"
-  chmod 0644 "$pub"
-  # Durable before this returns (fsync the tgz and its directory): a hard reset right after must
-  # not lose it.
-  # shellcheck disable=SC2016 # $1..$3 are expanded by that sh
-  if runu sh -c 'cp -f -- "$1" "$2" && sync -- "$2" && sync -- "$3"' _ "$pub" "$out.tgz" "$home" 2>/dev/null; then
+  # The user (runu) can't read the root-only mktemp dir, so the tgz goes to them through a pipe:
+  # their own process creates the file, theirs and 0600 (with --include-dumps it holds GPU
+  # memory), and no copy is left anywhere else. Durable before this returns (fsync the tgz and
+  # its directory): a hard reset right after must not lose it.
+  # shellcheck disable=SC2016 # $1..$2 are expanded by that sh
+  if runu sh -c 'umask 077 && rm -f -- "$1" && cat >"$1" && sync -- "$1" && sync -- "$2"' \
+      _ "$out.tgz" "$home" <"$dir/out.tgz" 2>/dev/null; then
     say "wrote $out.tgz"
   else
-    # The user's home was not writable (a symlink, say): keep the temp copy, under a name
-    # mktemp chose, where root can reach it.
-    sync "$pub" 2>/dev/null || true
-    say "wrote $pub (could not write $user's home)"
-    pub=""
+    # The user's home was not writable (a symlink, say): keep it where only root can read it.
+    local keep
+    keep=$STATE_DIR/collect/$base.tgz
+    if (umask 077 && mkdir -p -- "$STATE_DIR/collect" && cp -- "$dir/out.tgz" "$keep" &&
+        sync -- "$keep"); then
+      say "wrote $keep, readable by root only (could not write $user's home)"
+    else
+      say "could not write $user's home or $STATE_DIR/collect; nothing was kept"
+    fi
   fi
-  [[ -z $pub ]] || rm -f "$pub"
   sed -n '2,6p' "$summary"
   head -1 "$summary"
 }
