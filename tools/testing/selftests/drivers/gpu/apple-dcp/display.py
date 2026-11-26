@@ -446,7 +446,6 @@ def watchdog(root):
     production='\n'.join(block(source, marker) for marker in (
         'bool dcp_desktop_present_complete(',
         'VISIBLE_IF_KUNIT void dcp_swap_watchdog(',
-        'bool dcp_swap_watched(',
         'void dcp_swap_watchdog_arm(',
         'void dcp_swap_watchdog_complete('))
     internal=(root/'drivers/gpu/drm/apple/dcp-internal.h').read_text()
@@ -467,6 +466,7 @@ typedef uint32_t u32;
 #define VISIBLE_IF_KUNIT
 #define DCP_FIRMWARE_V_26_6_DESKTOP 5
 #define dev_warn(...) ((void)0)
+#define dev_info(...) ((void)0)
 #define container_of(p,t,m) ((t *)((char *)(p)-offsetof(t,m)))
 #define to_delayed_work(p) container_of(p,struct delayed_work,work)
 #define msecs_to_jiffies(n) (n)
@@ -477,17 +477,17 @@ struct work_struct {unsigned unused;};
 struct delayed_work {struct work_struct work;};
 struct apple_dcp {
     int fw_compat;bool vrr_enabled,typec;
-    u32 nr_typec_routes;void *fixed_connector;
     struct {u32 present_id;bool present_pending,vrr_failed,takeover_adopted,mode_live;} *desktop;
     struct {bool valid;} mode_state;
     struct delayed_work swap_watchdog_wq;
     unsigned long swap_watchdog_deadline;
     unsigned swap_watchdog_retrains;
+    bool swap_watchdog_lost;
     void *crtc,*connector,*dev;
 };
 static unsigned scheduled,cancelled,vblanks,hotplugs,unarmed,rejected;
 static bool allow_retire=true;
-static bool iomfb_retire_dropped_present_h17p(struct apple_dcp *d) {return allow_retire;}
+static bool iomfb_retire_dropped_present_h17p(struct apple_dcp *d,bool *lost) {*lost=false;return allow_retire;}
 static void dcp_unarm_retained_framebuffers(struct apple_dcp *d,u32 id)
 {assert(id==d->desktop->present_id);unarmed++;}
 static void dcp_backlight_desktop_finish(struct apple_dcp *d,u32 id,bool reply,bool accepted)
@@ -526,12 +526,6 @@ int main(void) {
     d.fw_compat=1;d.typec=true;dcp_swap_watchdog_arm(&d);assert(scheduled==before+1);
     allow_retire=false;d.mode_state.valid=true;
     dcp_swap_watchdog(&d.swap_watchdog_wq.work);assert(d.mode_state.valid && hotplugs==1);
-    /* A pipeline with Type-C displays only stays watched once its route is released;
-     * one with a fixed output, or without Type-C routes, does not. */
-    d.typec=false;d.nr_typec_routes=2;before=scheduled;
-    dcp_swap_watchdog_arm(&d);assert(scheduled==before+1);
-    d.fixed_connector=(void *)1;dcp_swap_watchdog_arm(&d);assert(scheduled==before+1);
-    d.fixed_connector=NULL;d.nr_typec_routes=0;dcp_swap_watchdog_arm(&d);assert(scheduled==before+1);
     /* A takeover that adopted the loader's mode is watched until a swap
      * completes; with none, the mode is set through the hotplug worker. */
     allow_retire=true;d.fw_compat=5;d.typec=false;d.vrr_enabled=false;

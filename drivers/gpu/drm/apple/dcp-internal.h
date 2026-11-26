@@ -80,7 +80,6 @@ struct apple_dcp_typec_port;
 void dcp_swap_watchdog_arm(struct apple_dcp *dcp);
 void dcp_swap_watchdog_keep(struct apple_dcp *dcp);
 void dcp_swap_watchdog_complete(struct apple_dcp *dcp);
-bool dcp_swap_watched(struct apple_dcp *dcp);
 bool dcp_swap_lost(struct apple_dcp *dcp, u32 swap_id);
 void dcp_retry_placeholder_edid(struct apple_dcp *dcp,
 				const struct drm_edid *drm_edid);
@@ -946,6 +945,12 @@ struct apple_dcp {
 	unsigned int swap_watchdog_retrains;
 	/* When the latest arm expires, in jiffies. */
 	unsigned long swap_watchdog_deadline;
+	/*
+	 * The present it waits for was taken for a display that went
+	 * (iomfb_present_lost()): retired without a retrain. IOMFB queue's
+	 * lock on firmware with the queue.
+	 */
+	bool swap_watchdog_lost;
 
 	/* List of referenced framebuffers pending a completed replacement swap.
 	 * The commit and RTKit work queues share it under this lock.
@@ -1246,8 +1251,8 @@ void iomfb_present_matrix_h17p(struct apple_dcp *dcp);
 bool iomfb_present_brightness_only_h17p(struct apple_dcp *dcp);
 bool iomfb_present_complete_h17p(struct apple_dcp *dcp);
 void iomfb_present_failed_h17p(struct apple_dcp *dcp);
-bool iomfb_retire_dropped_present_h17p(struct apple_dcp *dcp);
-bool iomfb_present_in_flight(struct apple_dcp *dcp);
+bool iomfb_retire_dropped_present_h17p(struct apple_dcp *dcp, bool *lost);
+bool iomfb_present_lost(struct apple_dcp *dcp, bool poweroff);
 bool iomfb_present_has_surface_h17p(const struct dcp_swap_submit_req_h17p *request);
 bool iomfb_apply_backlight_h17p(struct apple_dcp *dcp,
 				const struct dcp_swap_submit_req_h17p *request,

@@ -4044,13 +4044,15 @@ bool iomfb_present_complete_h17p(struct apple_dcp *dcp)
  * it displaced stay referenced.  Without a completed present for
  * IOMFB_DROPPED_MAX retired ones, the queue is left to its timeout.  Returns
  * false if the present ended or a newer one re-armed the watchdog in the
- * meantime.  Other firmware has no present state.
+ * meantime.  Other firmware has no present state.  *@lost tells whether
+ * the present was taken for a display that went (iomfb_present_lost()).
  */
-bool iomfb_retire_dropped_present_h17p(struct apple_dcp *dcp)
+bool iomfb_retire_dropped_present_h17p(struct apple_dcp *dcp, bool *lost)
 {
 	struct dcp_present_state_h17p *state = &dcp->present_state_h17p;
 	u32 swap_id;
 
+	*lost = false;
 	if (!iomfb_uses_queue(dcp))
 		return true;
 
@@ -4059,6 +4061,9 @@ bool iomfb_retire_dropped_present_h17p(struct apple_dcp *dcp)
 	if (time_before(jiffies, dcp->swap_watchdog_deadline) ||
 	    !state->pending || !state->accepted)
 		return false;
+	/* Taken for a display that went (iomfb_present_lost()). */
+	*lost = dcp->swap_watchdog_lost;
+	dcp->swap_watchdog_lost = false;
 	if (!dcp_present_retire_h17p(state, swap_id))
 		return true;
 
@@ -4076,15 +4081,34 @@ bool iomfb_retire_dropped_present_h17p(struct apple_dcp *dcp)
 }
 
 /*
- * A present the firmware accepted and has not completed yet, on firmware
- * with the IOMFB queue: only its completion or the swap watchdog
- * (iomfb_retire_dropped_present_h17p()) lets the queue go on. A snapshot,
- * read without the queue's lock.
+ * The display a present was taken for went: its Type-C attachment ended
+ * (dcp_dptx_disconnect_oob()), or its CRTC is turned off after that
+ * (@poweroff, dcp_poweroff()). On firmware with the IOMFB queue a present
+ * the firmware accepted and has not completed may never complete now, and
+ * the queue waits behind it: its swap watchdog is kept to retire it
+ * (dcp_swap_watchdog_keep()). Under the queue's lock, as the firmware's
+ * acceptance (which arms the watchdog) and completion are, so a present
+ * accepted meanwhile is either seen here or armed after. A power-off with
+ * no such present stops the watchdog, as before. Returns whether one was
+ * in flight.
  */
-bool iomfb_present_in_flight(struct apple_dcp *dcp)
+bool iomfb_present_lost(struct apple_dcp *dcp, bool poweroff)
 {
-	return iomfb_uses_queue(dcp) && READ_ONCE(dcp->present_state_h17p.pending) &&
-	       READ_ONCE(dcp->present_state_h17p.accepted);
+	struct dcp_present_state_h17p *state = &dcp->present_state_h17p;
+
+	if (!iomfb_uses_queue(dcp)) {
+		if (poweroff)
+			cancel_delayed_work(&dcp->swap_watchdog_wq);
+		return false;
+	}
+	guard(mutex)(&dcp->iomfb.lock);
+	if (state->pending && state->accepted) {
+		dcp_swap_watchdog_keep(dcp);
+		return true;
+	}
+	if (poweroff)
+		cancel_delayed_work(&dcp->swap_watchdog_wq);
+	return false;
 }
 
 /* Release a present's scanout unless it is displayed or was dropped. */

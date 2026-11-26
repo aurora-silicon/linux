@@ -867,11 +867,24 @@ static int dcp_backlight_dpms(struct apple_dcp *d, bool on)
 static void av_service_disconnect(struct apple_dcp *d)
 { (void)d; av_disconnects++; }
 static bool dcp_is_typec_output(struct apple_dcp *d) { return d->typec_output; }
-/* A present the firmware took and has not completed: its watchdog is kept. */
+/*
+ * A present the firmware took and has not completed: its watchdog is kept
+ * for a display that went (iomfb_present_lost()); the power-off of a live
+ * output stops it.
+ */
 static bool present_in_flight;
 static int watchdog_keeps;
-static bool iomfb_present_in_flight(struct apple_dcp *d) { (void)d; return present_in_flight; }
-static void dcp_swap_watchdog_keep(struct apple_dcp *d) { d->swap_watchdog_wq.pending = true; watchdog_keeps++; }
+static bool iomfb_present_lost(struct apple_dcp *d, bool poweroff)
+{
+	assert(poweroff);
+	if (!present_in_flight) {
+		d->swap_watchdog_wq.pending = false;
+		return false;
+	}
+	d->swap_watchdog_wq.pending = true;
+	watchdog_keeps++;
+	return true;
+}
 static void _dcp_poweroff(struct apple_dcp *d) { (void)d; poweroffs++; }
 static void reinit_completion(struct completion *c) { c->done = 0; }
 static bool dptx_service_available(struct dptx_port *p) { return p->available; }
@@ -924,6 +937,10 @@ int main(void)
  init(4, 3); dcp.swap_watchdog_wq.pending = true; present_in_flight = true;
  dcp_poweroff(&pdev);
  assert(poweroffs == 1 && watchdog_keeps == 1 && dcp.swap_watchdog_wq.pending);
+ /* DPMS of the display still attached stops it, a present in flight or not. */
+ init(4, 4); dcp.swap_watchdog_wq.pending = true; present_in_flight = true;
+ dcp_poweroff(&pdev);
+ assert(!watchdog_keeps && !dcp.swap_watchdog_wq.pending);
  puts("stale CRTC power-off ownership passed");
  return 0;
 }

@@ -1,23 +1,31 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only OR MIT
-"""Replay a dock's displays going and coming back on a firmware-27.2 T8132 dcpext.
+"""Replay a dock's display going and coming back with a present in flight.
 
-The display side of a two-display dock's unplug and replug is compiled from
-the production bodies against host mocks:
+The swap watchdog of a pipeline on firmware with the IOMFB queue (H17P, 27) is
+compiled from the production bodies (dcp_swap_watchdog_arm(),
+dcp_swap_watchdog_keep(), dcp_swap_watchdog_complete(), dcp_swap_watchdog(),
+iomfb_present_lost(), iomfb_retire_dropped_present_h17p() and
+dcp_present_retire_h17p()) and from the CRTC's power-off (dcp_poweroff())
+against host mocks. The pipeline is a dcpext of the Air (J713) on firmware
+27.2, whose node declares a USB-C connector, so it is a Type-C output with or
+without a route:
 
-* the swap watchdog of a pipeline with Type-C displays only
-  (dcp_swap_watched(), dcp_swap_watchdog_arm(), dcp_swap_watchdog_keep(),
-  iomfb_present_in_flight()): a present accepted for a display that went,
-  before or after its route is released and across the CRTC's power-off, is
-  retired instead of holding the IOMFB queue until its timeout declares the
-  processor crashed;
-* the display release of a T8132 dcpext (dcp_dptx_release_locked()): a
-  release the firmware-27.2 dcpext does not answer is taken as done, as on
-  the M4 backend, so the replug's tunnel is not refused on the old route.
+- a present the firmware accepted for a display that went, at the detach or
+  at the CRTC's power-off after it, is retired by the watchdog instead of
+  holding the queue until its timeout declares the processor crashed;
+- the firmware's acceptance runs under the queue's lock, before or after the
+  power-off looks: either way the present that will not complete is watched;
+- retiring that present only completes its flip: it neither invalidates the
+  mode nor queues a hotplug, so a display plugged in before the watchdog
+  expires is not retrained for the old one's present;
+- a present that completes after a replug stops the watchdog;
+- the power-off of a live output (the internal panel, a fixed HDMI output,
+  a Type-C display still attached) stops the watchdog as before, and a
+  present of a live display that does not complete is retrained as before.
 
-Pipelines with a fixed output, the internal panel, firmware without the IOMFB
-queue and other processors' releases keep what they had. Each negative
-control puts one piece back as it was before; the replay must then fail.
+Each negative control puts one piece back as it was, or drops it; the replay
+must then fail.
 """
 from pathlib import Path
 import os
@@ -29,30 +37,45 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[2]
 DCP = (ROOT / 'drivers/gpu/drm/apple/dcp.c').read_text()
 IOMFB = (ROOT / 'drivers/gpu/drm/apple/iomfb.c').read_text()
+H17P = (ROOT / 'drivers/gpu/drm/apple/iomfb_h17p.h').read_text()
 FABRIC = (ROOT / 'drivers/gpu/drm/apple/dcp-fabric.c').read_text()
 
-SOURCES = {'dcp': DCP, 'iomfb': IOMFB, 'fabric': FABRIC}
+SOURCES = {'dcp': DCP, 'iomfb': IOMFB, 'h17p': H17P, 'fabric': FABRIC}
 FUNCTIONS = [
-    ('fabric', 'dcp_is_typec_output'), ('fabric', 'dcp_t8132_ext_m4_node'),
-    ('fabric', 'dcp_is_t8132_ext'), ('fabric', 'dcp_t8132_ext_hw'),
-    ('iomfb', 'iomfb_uses_queue'), ('iomfb', 'iomfb_present_in_flight'),
-    ('dcp', 'dcp_swap_watched'), ('dcp', 'dcp_swap_watchdog_arm'),
-    ('dcp', 'dcp_swap_watchdog_keep'), ('dcp', 'dcp_dptx_release_locked'),
+    ('fabric', 'dcp_is_typec_output'), ('h17p', 'dcp_present_retire_h17p'),
+    ('iomfb', 'iomfb_uses_queue'),
+    ('dcp', 'dcp_swap_watchdog_arm'), ('dcp', 'dcp_swap_watchdog_keep'),
+    ('dcp', 'dcp_swap_watchdog_complete'),
+    ('iomfb', 'iomfb_present_lost'), ('iomfb', 'iomfb_retire_dropped_present_h17p'),
+    ('dcp', 'dcp_swap_watchdog'), ('dcp', 'dcp_poweroff'),
 ]
 
-# name -> (source, old, new): each puts one piece back as it was.
+# name -> (source, old, new)
 MUTATIONS = {
-    'unwatched-routeless-pipe': ('dcp', '\t       (dcp->nr_typec_routes && !dcp->fixed_connector) ||\n', ''),
-    'no-keep': ('dcp', 'if (!iomfb_present_in_flight(dcp) || delayed_work_pending(&dcp->swap_watchdog_wq))\n\t\treturn;',
-                'return;'),
-    'm4-only-release': ('dcp', 'bool t8132 = dcp_t8132_ext_hw(dcp);\n\tint ret;\n\n\tlockdep_assert_held(&dcp->hpd_mutex);\n\tif (dcp->external) {',
-                        'bool t8132 = dcp_is_t8132_ext(dcp);\n\tint ret;\n\n\tlockdep_assert_held(&dcp->hpd_mutex);\n\tif (dcp->external) {'),
+    # The power-off cancels the watchdog of a present that will not complete.
+    'poweroff-cancels': ('dcp', '\tif (display_gone)\n\t\tiomfb_present_lost(dcp, true);\n\telse\n'
+                         '\t\tcancel_delayed_work(&dcp->swap_watchdog_wq);',
+                         '\tcancel_delayed_work(&dcp->swap_watchdog_wq);'),
+    # Every power-off with a present in flight keeps the watchdog (the earlier rule).
+    'poweroff-keeps-live': ('dcp', '\tif (display_gone)\n\t\tiomfb_present_lost(dcp, true);',
+                            '\tif (true)\n\t\tiomfb_present_lost(dcp, true);'),
+    # The check outside the queue's lock: acceptance can slip between it and the cancel.
+    'unlocked-check': ('iomfb', '\tguard(mutex)(&dcp->iomfb.lock);\n\tif (state->pending && state->accepted) {',
+                       '\tif (state->pending && state->accepted) {'),
+    # The retired present of a display that went retrains what is plugged in now.
+    'lost-retrains': ('dcp', '\tif (lost) {\n\t\tdev_info(dcp->dev, "swap of a display that went retired\\n");',
+                      '\tif (false) {\n\t\tdev_info(dcp->dev, "swap of a display that went retired\\n");'),
+    # A later present of the current display is still taken as the lost one's.
+    'lost-sticks': ('dcp', '\t\t/* A present taken now is the current display\'s. */\n\t\tdcp->swap_watchdog_lost = false;\n', ''),
+    # Nothing kept: the present holds the queue until its timeout.
+    'no-keep': ('iomfb', '\tif (state->pending && state->accepted) {\n\t\tdcp_swap_watchdog_keep(dcp);\n\t\treturn true;\n\t}',
+                '\tif (false) {\n\t\tdcp_swap_watchdog_keep(dcp);\n\t\treturn true;\n\t}'),
 }
 
 
 def function(text, name):
     match = re.search(r'^(?:VISIBLE_IF_KUNIT\s+)?(?:static\s+)?(?:inline\s+)?'
-                      r'(?:bool|int|void|enum tb_dp_relink)\s+' + re.escape(name) +
+                      r'(?:bool|int|void)\s*\n?' + re.escape(name) +
                       r'\([^;{]*?\)\n\{', text, re.M | re.S)
     assert match, name
     pos = text.index('{', match.start()) + 1
@@ -63,207 +86,364 @@ def function(text, name):
     return re.sub(r'^VISIBLE_IF_KUNIT\s+', '', text[match.start():pos]) + '\n'
 
 
+def define(text, name):
+    match = re.search(r'^#define ' + re.escape(name) + r'\b.*\n', text, re.M)
+    assert match, name
+    return match.group(0)
+
+
 PRE = r'''
 #include <assert.h>
 #include <errno.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 typedef uint64_t u64;
 typedef uint32_t u32;
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x, v) ((x) = (v))
-#define lockdep_assert_held(l) ((void)(l))
+#define container_of(ptr, type, member) ((type *)((char *)(ptr) - offsetof(type, member)))
+static unsigned int infos, warns;
 #define dev_info(dev, ...) ((void)(dev), infos++)
 #define dev_warn(dev, ...) ((void)(dev), warns++)
-static unsigned int infos, warns;
-/* jiffies in ms */
+#define dev_err(dev, ...) ((void)(dev), warns++)
+#define dev_dbg(dev, ...) ((void)(dev))
 static unsigned long jiffies;
 static unsigned long msecs_to_jiffies(unsigned int ms) { return ms; }
+#define time_before(a, b) ((long)((a) - (b)) < 0)
+#define xchg(p, v) ({ __typeof__(*(p)) __o = *(p); *(p) = (v); __o; })
+#define IOMFB_DROPPED_MAX 4
 
-/* Display */
+/* Locks, with what another thread holding or waiting for one does. */
+struct mutex { int held; void (*before)(void); void (*after)(void); };
+static void mutex_lock(struct mutex *m)
+{
+	if (m->before) { void (*f)(void) = m->before; m->before = NULL; f(); }
+	assert(!m->held);
+	m->held = 1;
+}
+static void mutex_unlock(struct mutex *m)
+{
+	assert(m->held);
+	m->held = 0;
+	if (m->after) { void (*f)(void) = m->after; m->after = NULL; f(); }
+}
+typedef struct mutex *mutex_ref;
+static void mutex_ref_release(mutex_ref *m) { mutex_unlock(*m); }
+static mutex_ref mutex_ref_take(struct mutex *m) { mutex_lock(m); return m; }
+#define CAT2(a, b) a##b
+#define CAT(a, b) CAT2(a, b)
+#define guard(kind) mutex_ref __attribute__((cleanup(mutex_ref_release))) CAT(guard_, __COUNTER__) = mutex_ref_take
+#define scoped_guard(kind, lock) \
+	for (bool CAT(once_, __LINE__) = true; CAT(once_, __LINE__);) \
+		for (mutex_ref CAT(sg_, __LINE__) __attribute__((cleanup(mutex_ref_release))) = \
+		     mutex_ref_take(lock); CAT(once_, __LINE__); CAT(once_, __LINE__) = false)
+#define lockdep_assert_held(l) assert((l)->held)
+
+struct work_struct { int unused; };
+struct delayed_work { struct work_struct work; bool pending; unsigned long due; unsigned int arms; };
+#define to_delayed_work(w) container_of(w, struct delayed_work, work)
+static void *system_dfl_wq, *system_unbound_wq;
+static bool mod_delayed_work(void *wq, struct delayed_work *w, unsigned long delay)
+{
+	bool was = w->pending;
+
+	(void)wq; w->pending = true; w->due = jiffies + delay; w->arms++; return was;
+}
+static bool delayed_work_pending(struct delayed_work *w) { return w->pending; }
+static bool cancel_delayed_work(struct delayed_work *w) { bool was = w->pending; w->pending = false; return was; }
+static bool cancel_delayed_work_sync(struct delayed_work *w) { return cancel_delayed_work(w); }
+static bool queue_work(void *wq, struct work_struct *w) { (void)wq; (void)w; abort(); }
+
 enum { DCP_FIRMWARE_V_26_6 = 26, DCP_FIRMWARE_V_26_6_DESKTOP = 260, DCP_FIRMWARE_H17P = 17,
        DCP_FIRMWARE_V_27_0 = 27 };
 enum { DCP_IOMFB_METHODS_DEFAULT, DCP_IOMFB_METHODS_H17G };
-enum { DRM_MODE_CONNECTOR_USB = 32, DRM_MODE_CONNECTOR_HDMIA = 11 };
-struct device_node { const char *compatible; bool v27_2; };
-struct device { struct device_node *of_node; };
-struct delayed_work { bool pending; unsigned long due; unsigned int arms; };
+enum { DRM_MODE_CONNECTOR_USB = 32, DRM_MODE_CONNECTOR_HDMIA = 11, DRM_MODE_CONNECTOR_eDP = 14 };
+struct platform_device { int unused; };
 struct apple_epic_service { int unused; };
-struct dptx_port { bool enabled, connected; struct apple_epic_service *service; };
-struct apple_dcp {
-    struct device *dev;
-    int fw_compat, hpd_mutex;
-    struct { int iomfb_method_profile; } hw;
-    void *active_typec_route, *fixed_connector;
-    int fixed_connector_type;
-    u32 nr_typec_routes;
-    bool external, external_native, t8132_release_late, external_link_ready;
-    struct { bool pending, accepted; u32 swap_id; } present_state_h17p;
-    unsigned long swap_watchdog_deadline;
-    struct delayed_work swap_watchdog_wq;
-    struct dptx_port dptxport[2];
+struct dptx_port { bool connected, enabled; struct apple_epic_service *service; };
+struct apple_connector { const char *sink; bool connected; };
+struct apple_crtc { int unused; };
+struct dcp_present_state_h17p {
+	bool pending, accepted;
+	u32 swap_id;
+	unsigned int nr_retired;
+	u32 retired[IOMFB_DROPPED_MAX];
 };
-static bool of_device_is_compatible(const struct device_node *n, const char *c)
-{
-    return n && !strcmp(n->compatible, c);
-}
-static bool apple_t8132_dcpext_v27_2(const struct device_node *n)
-{
-    return of_device_is_compatible(n, "apple,t8132-dcpext") && n->v27_2;
-}
-/* Desktop 26.x watches its own; not these pipelines. */
-static bool dcp_desktop_swap_watched(struct apple_dcp *dcp) { (void)dcp; return false; }
-static void *system_dfl_wq;
-static bool mod_delayed_work(void *wq, struct delayed_work *w, unsigned long delay)
-{
-    bool was = w->pending;
-    (void)wq; w->pending = true; w->due = jiffies + delay; w->arms++; return was;
-}
-static bool delayed_work_pending(struct delayed_work *w) { return w->pending; }
-static void cancel_delayed_work(struct delayed_work *w) { w->pending = false; }
+struct iomfb_scanout_h17p { int link; };
+struct apple_dcp {
+	void *dev;
+	int fw_compat, fixed_connector_type;
+	struct { int iomfb_method_profile; } hw;
+	void *active_typec_route, *avep, *hdmi_hpd;
+	struct mutex external_lock;
+	bool ext26_pm_preparing, external_stopped, external_stop_deferred;
+	struct work_struct ext26_blank_work;
+	u64 external_crtc_generation;
+	struct mutex hpd_mutex;
+	struct { struct mutex lock; struct iomfb_scanout_h17p *next_scanout; int dropped; } iomfb;
+	struct dcp_present_state_h17p present_state_h17p;
+	struct apple_connector *connector;
+	struct apple_crtc *crtc;
+	struct { bool valid; } mode_state;
+	u64 typec_unplugs, crtc_unplugs;
+	bool typec_cable_connected, typec_crtc_off, vrr_enabled, external_native;
+	bool swap_watchdog_lost;
+	unsigned int swap_watchdog_retrains;
+	unsigned long swap_watchdog_deadline;
+	struct delayed_work swap_watchdog_wq, typec_reconnect_wq, placeholder_edid_wq;
+	struct { int done; } typec_iomfb_hpd_ready;
+	struct { bool present_pending, vrr_failed, takeover_adopted, mode_live; u32 present_id; } *desktop;
+	struct { bool active; } split;
+	struct dptx_port dptxport[2];
+};
+static struct apple_dcp *the_dcp;
+static void *platform_get_drvdata(struct platform_device *p) { (void)p; return the_dcp; }
+static bool dcp_desktop_swap_watched(struct apple_dcp *d) { (void)d; return false; }
 
-static int release_ret, releases, link_gones, invalidates, crossbar_downs;
-static bool dptx_service_available(struct dptx_port *p) { return p->enabled; }
-static int dptxport_release_display(struct apple_epic_service *s) { (void)s; releases++; return release_ret; }
-static void smp_store_release_bool(bool *p, bool v) { *p = v; }
-#define smp_store_release(p, v) smp_store_release_bool(p, v)
-static void dcpext_scanout_invalidate(struct apple_dcp *d) { (void)d; invalidates++; }
-static void iomfb_m4_external_link_gone(struct apple_dcp *d) { (void)d; link_gones++; }
-static void dcp_t8132_dptx_teardown_log(struct apple_dcp *d, u32 port, const char *what, int ret)
-{
-    (void)d; (void)port; (void)what; if (ret) warns++;
-}
-static int dcp_direct_crossbar_link(struct apple_dcp *d, bool up) { (void)d; (void)up; crossbar_downs++; return 0; }
-#define DCP_SWAP_WATCHDOG_MS 1000
+/* What the watchdog's recovery does, and what the queue sees. */
+static unsigned int vblanks, hotplugs, invalidates, failed, advanced, unarmed, poweroffs, hpd_lows;
+static struct apple_connector *hotplugged;
+static void dcp_drm_crtc_vblank(struct apple_crtc *c) { (void)c; vblanks++; }
+static void dcp_queue_hotplug(struct apple_connector *c) { hotplugs++; hotplugged = c; }
+static void dcp_mode_invalidate(void *m) { (void)m; invalidates++; }
+static void dcp_takeover_adopt_proven(struct apple_dcp *d) { (void)d; }
+static void dcp_unarm_retained_framebuffers(struct apple_dcp *d, u32 id) { (void)d; (void)id; unarmed++; }
+static void dcp_backlight_desktop_finish(struct apple_dcp *d, u32 id, bool a, bool b)
+{ (void)d; (void)id; (void)a; (void)b; }
+static void iomfb_present_failed_h17p(struct apple_dcp *d) { (void)d; failed++; }
+static bool iomfb_present_brightness_only_h17p(struct apple_dcp *d) { (void)d; return false; }
+static void iomfb_queue_advance(struct apple_dcp *d) { (void)d; advanced++; }
+#define list_add_tail(a, b) ((void)(a), (void)(b))
+
+/* The CRTC's power-off, outside the watchdog. */
+static bool panel;
+static bool iomfb_is_m4(struct apple_dcp *d) { (void)d; return false; }
+static bool dcp_is_ext26(struct apple_dcp *d) { (void)d; return false; }
+static bool dcp_is_retained_external(struct apple_dcp *d) { (void)d; return false; }
+static bool dcp_uses_soft_dpms(struct apple_dcp *d) { (void)d; return panel; }
+static int dcp_backlight_dpms(struct apple_dcp *d, bool on) { (void)d; (void)on; return 0; }
+static void dcp_dpms_power_off(struct apple_dcp *d) { (void)d; poweroffs++; }
+static bool dcp_h17g_panel(struct apple_dcp *d) { (void)d; return false; }
+static void iomfb_blank_h17p(struct apple_dcp *d) { (void)d; abort(); }
+static int iomfb_m4_blank(struct apple_dcp *d) { (void)d; abort(); }
+static void _dcp_poweroff(struct apple_dcp *d) { (void)d; poweroffs++; }
+static void av_service_disconnect(struct apple_dcp *d) { (void)d; }
+static void reinit_completion(void *c) { (void)c; }
+static bool dptx_service_available(struct dptx_port *p) { return p->service; }
+static int dptxport_set_hpd(struct apple_epic_service *s, bool on) { (void)s; if (!on) hpd_lows++; return 0; }
+static int dcp_dptx_disconnect(struct apple_dcp *d, u32 port) { (void)d; (void)port; return 0; }
+static void dcp_external_retry(struct apple_dcp *d, const char *why, int e, unsigned int ms)
+{ (void)d; (void)why; (void)e; (void)ms; abort(); }
+static int dcp_external_stop_locked(struct apple_dcp *d, u64 g) { (void)d; (void)g; abort(); }
+static void dcp_external_crtc_released(struct apple_dcp *d) { (void)d; abort(); }
+static bool hdmi_present;
+static int gpiod_get_value_cansleep(void *g) { (void)g; return hdmi_present; }
+static void disconnected_hpd_event(struct apple_connector *c) { (void)c; }
 '''
 
 CASES = r'''
-/* ---- Display: the swap watchdog and the release of a firmware-27.2 T8132 dcpext ---- */
-static int route;
-static struct device_node j713_27 = { "apple,t8132-dcpext", true };
-static struct device_node j713_26 = { "apple,t8132-dcpext", false };
-static struct device_node t6041 = { "apple,t6041-dcpext", false };
+static struct platform_device pdev;
+static struct apple_connector dock = { "dock monitor", true }, replacement = { "replacement", true };
+static struct apple_crtc crtc;
+static struct apple_epic_service service;
 
-static struct apple_dcp pipe(struct device *dev, int fw)
+/* A pipeline on firmware 27: a J713 dcpext (USB-C connector), the panel, or a fixed HDMI output */
+static struct apple_dcp *pipe(int connector_type)
 {
-    struct apple_dcp dcp = { .dev = dev, .fw_compat = fw, .nr_typec_routes = 2,
-                             .fixed_connector_type = 0 };
-    static struct apple_epic_service service;
+	static struct apple_dcp d;
 
-    dcp.dptxport[0].service = &service;
-    return dcp;
+	memset(&d, 0, sizeof(d));
+	d.fw_compat = DCP_FIRMWARE_V_27_0;
+	d.fixed_connector_type = connector_type;
+	d.connector = &dock;
+	d.crtc = &crtc;
+	d.mode_state.valid = true;
+	d.dptxport[0].service = &service;
+	the_dcp = &d;
+	jiffies = 1000;
+	vblanks = hotplugs = invalidates = failed = advanced = unarmed = poweroffs = hpd_lows = 0;
+	infos = warns = 0;
+	hotplugged = NULL;
+	panel = connector_type == DRM_MODE_CONNECTOR_eDP;
+	return &d;
 }
 
-/* The firmware accepts a present (dcp_swapped()). */
-static void accepted(struct apple_dcp *dcp, u32 swap_id)
+/* The firmware accepts a present (dcp_swapped(), under the queue's lock). */
+static void accept(void)
 {
-    dcp->present_state_h17p.pending = dcp->present_state_h17p.accepted = true;
-    dcp->present_state_h17p.swap_id = swap_id;
-    dcp_swap_watchdog_arm(dcp);
+	struct apple_dcp *d = the_dcp;
+	static u32 id = 300;
+
+	mutex_lock(&d->iomfb.lock);
+	d->present_state_h17p.pending = d->present_state_h17p.accepted = true;
+	d->present_state_h17p.swap_id = ++id;
+	if (d->fixed_connector_type == DRM_MODE_CONNECTOR_USB)
+		dcp_swap_watchdog_arm(d);
+	mutex_unlock(&d->iomfb.lock);
+}
+/* ... and completes it (dcpep_cb_swap_complete()). */
+static void completes(void)
+{
+	struct apple_dcp *d = the_dcp;
+
+	mutex_lock(&d->iomfb.lock);
+	d->present_state_h17p.pending = d->present_state_h17p.accepted = false;
+	dcp_swap_watchdog_complete(d);
+	mutex_unlock(&d->iomfb.lock);
+}
+/* The watchdog runs when due. */
+static void expire(void)
+{
+	struct apple_dcp *d = the_dcp;
+
+	assert(d->swap_watchdog_wq.pending);
+	jiffies = d->swap_watchdog_wq.due;
+	d->swap_watchdog_wq.pending = false;
+	dcp_swap_watchdog(&d->swap_watchdog_wq.work);
+}
+/* The dock goes (dcp_dptx_disconnect_oob()): the unplug is counted, a present is kept. */
+static void unplug(void)
+{
+	the_dcp->typec_unplugs++;
+	iomfb_present_lost(the_dcp, false);
 }
 
-static void watchdog(void)
+static void lost_display(void)
 {
-    struct device dev = { &j713_27 };
-    struct apple_dcp dcp = pipe(&dev, DCP_FIRMWARE_V_27_0);
-    int fixed;
+	struct apple_dcp *d;
 
-    /* Routed to the dock: watched, as before */
-    dcp.active_typec_route = &route;
-    accepted(&dcp, 317);
-    assert(dcp.swap_watchdog_wq.pending);
-    dcp.present_state_h17p.pending = false;
-    cancel_delayed_work(&dcp.swap_watchdog_wq);
+	/* Accepted, then the dock goes and the CRTC is turned off: retired, no retrain. */
+	d = pipe(DRM_MODE_CONNECTOR_USB);
+	accept();
+	d->swap_watchdog_wq.pending = false;	/* stopped by something since */
+	unplug();
+	assert(d->swap_watchdog_wq.pending && d->swap_watchdog_lost && infos == 1);
+	dcp_poweroff(&pdev);
+	assert(d->swap_watchdog_wq.pending && poweroffs == 1 && !hpd_lows);
+	/* A display plugged in before the watchdog expires: not retrained for the old present. */
+	d->connector = &replacement;
+	expire();
+	assert(failed == 1 && advanced == 1 && vblanks == 1);
+	assert(!hotplugs && !invalidates && d->mode_state.valid);
+	assert(!d->present_state_h17p.pending && !d->swap_watchdog_lost);
+	/* The replacement's own presents are watched and retrained as before. */
+	accept();
+	assert(!d->swap_watchdog_lost);
+	expire();
+	assert(invalidates == 1 && hotplugs == 1 && hotplugged == &replacement);
+	puts("ok lost display: its present retired without a retrain, the replacement's as before");
 
-    /* The dock goes with present 318 in flight: the disconnect keeps its watchdog */
-    accepted(&dcp, 318);
-    dcp_swap_watchdog_keep(&dcp);
-    assert(dcp.swap_watchdog_wq.pending && dcp.swap_watchdog_wq.arms == 2);
-    /* The route is released; the desktop turns the CRTC off: in flight, kept */
-    dcp.active_typec_route = NULL;
-    cancel_delayed_work(&dcp.swap_watchdog_wq);
-    if (iomfb_present_in_flight(&dcp))
-        dcp_swap_watchdog_keep(&dcp);
-    else
-        cancel_delayed_work(&dcp.swap_watchdog_wq);
-    assert(dcp.swap_watchdog_wq.pending && infos == 1);
-    dcp.present_state_h17p.pending = false;
-    cancel_delayed_work(&dcp.swap_watchdog_wq);
+	/* The power-off alone, after the unplug, keeps the watchdog too. */
+	d = pipe(DRM_MODE_CONNECTOR_USB);
+	accept();
+	d->typec_unplugs++;
+	d->swap_watchdog_wq.pending = false;
+	dcp_poweroff(&pdev);
+	assert(d->swap_watchdog_wq.pending && d->swap_watchdog_lost);
+	expire();
+	assert(advanced == 1 && !hotplugs && !invalidates);
+	puts("ok lost display: kept by the power-off after the unplug");
 
-    /* The desktop's next present, to the pipe without its route: watched */
-    accepted(&dcp, 319);
-    assert(dcp.swap_watchdog_wq.pending);
-    dcp.present_state_h17p.pending = false;
-    cancel_delayed_work(&dcp.swap_watchdog_wq);
+	/* The firmware completes it after a replug: the watchdog stops. */
+	d = pipe(DRM_MODE_CONNECTOR_USB);
+	accept();
+	unplug();
+	d->connector = &replacement;
+	completes();
+	assert(!d->swap_watchdog_wq.pending && !d->swap_watchdog_lost && !failed);
+	puts("ok lost display: completed after a replug, the watchdog stops");
 
-    /* Nothing in flight: the CRTC's power-off stops the watchdog, as before */
-    assert(!iomfb_present_in_flight(&dcp));
-    dcp_swap_watchdog_keep(&dcp);
-    assert(!dcp.swap_watchdog_wq.pending);
-
-    /* A pipeline with a fixed output, unrouted, keeps what it had: not watched */
-    dcp.fixed_connector = &fixed;
-    dcp.fixed_connector_type = DRM_MODE_CONNECTOR_HDMIA;
-    accepted(&dcp, 320);
-    assert(!dcp.swap_watchdog_wq.pending);
-    /* Nor the panel: no Type-C routes */
-    dcp.fixed_connector = NULL;
-    dcp.nr_typec_routes = 0;
-    accepted(&dcp, 321);
-    assert(!dcp.swap_watchdog_wq.pending);
-    /* Firmware without the IOMFB queue: no present state, nothing kept */
-    dcp.nr_typec_routes = 2;
-    dcp.fw_compat = DCP_FIRMWARE_V_26_6;
-    dcp.present_state_h17p.pending = true;
-    cancel_delayed_work(&dcp.swap_watchdog_wq);
-    dcp_swap_watchdog_keep(&dcp);
-    assert(!dcp.swap_watchdog_wq.pending);
-    puts("ok display: a present taken for a display that went is watched until retired");
+	/* The firmware aborts it instead: the next display's present is its own. */
+	d = pipe(DRM_MODE_CONNECTOR_USB);
+	accept();
+	unplug();
+	mutex_lock(&d->iomfb.lock);
+	d->present_state_h17p.pending = d->present_state_h17p.accepted = false;
+	mutex_unlock(&d->iomfb.lock);
+	d->connector = &replacement;
+	accept();
+	expire();
+	assert(invalidates == 1 && hotplugs == 1 && hotplugged == &replacement);
+	puts("ok lost display: aborted, the replacement's next present is watched as its own");
 }
 
-static int release(struct device_node *node, int fw, int ret)
+/* The firmware's acceptance runs under the queue's lock, as the power-off looks. */
+static void acceptance_during_poweroff(void)
 {
-    struct device dev = { node };
-    struct apple_dcp dcp = pipe(&dev, fw);
-    int r;
+	struct apple_dcp *d;
 
-    dcp.dptxport[0].enabled = dcp.dptxport[0].connected = true;
-    release_ret = ret; releases = link_gones = 0;
-    r = dcp_dptx_release_locked(&dcp, 0);
-    assert(releases == 1);
-    assert(r || !dcp.dptxport[0].connected);
-    if (r)
-        assert(dcp.dptxport[0].connected);
-    return r;
+	/* Accepted just before the power-off takes the lock: kept. */
+	d = pipe(DRM_MODE_CONNECTOR_USB);
+	d->present_state_h17p.pending = true;
+	d->typec_unplugs++;
+	d->iomfb.lock.before = accept;
+	dcp_poweroff(&pdev);
+	assert(d->swap_watchdog_wq.pending && d->swap_watchdog_lost);
+	/* Accepted just after it: armed at the acceptance. */
+	d = pipe(DRM_MODE_CONNECTOR_USB);
+	d->present_state_h17p.pending = true;
+	d->typec_unplugs++;
+	d->iomfb.lock.after = accept;
+	dcp_poweroff(&pdev);
+	assert(d->swap_watchdog_wq.pending);
+	expire();
+	assert(failed == 1 && advanced == 1);
+	puts("ok acceptance during the power-off: watched in either order");
 }
 
-static void teardown(void)
+/* The power-off of a live output stops the watchdog, as before. */
+static void live_outputs(void)
 {
-    /* Firmware 27.2: the timed-out release is taken as done, the M4 backend left alone */
-    assert(release(&j713_27, DCP_FIRMWARE_V_27_0, -ETIMEDOUT) == 0 && link_gones == 0);
-    assert(release(&j713_27, DCP_FIRMWARE_V_27_0, -EIO) == 0);
-    assert(release(&j713_27, DCP_FIRMWARE_V_27_0, 0) == 0);
-    /* The M4 backend, as before */
-    assert(release(&j713_26, DCP_FIRMWARE_V_26_6, -ETIMEDOUT) == 0 && link_gones == 2);
-    /* Other processors keep a refused release */
-    assert(release(&t6041, DCP_FIRMWARE_V_27_0, -ETIMEDOUT) == -ETIMEDOUT);
-    puts("ok display: a firmware-27.2 T8132 dcpext's unanswered release frees its route");
+	static const int types[] = { DRM_MODE_CONNECTOR_eDP, DRM_MODE_CONNECTOR_HDMIA,
+				     DRM_MODE_CONNECTOR_USB };
+	struct apple_dcp *d;
+
+	for (unsigned int i = 0; i < 3; i++) {
+		d = pipe(types[i]);
+		hdmi_present = true;
+		accept();
+		d->swap_watchdog_wq.pending = true;
+		dcp_poweroff(&pdev);
+		assert(!d->swap_watchdog_wq.pending && !d->swap_watchdog_lost && !infos);
+	}
+	/* A live Type-C display's present that does not complete is retrained, as before. */
+	d = pipe(DRM_MODE_CONNECTOR_USB);
+	accept();
+	expire();
+	assert(failed == 1 && invalidates == 1 && hotplugs == 1 && hotplugged == &dock);
+	/* The detach with nothing in flight keeps nothing. */
+	d = pipe(DRM_MODE_CONNECTOR_USB);
+	unplug();
+	assert(!d->swap_watchdog_wq.pending && !d->swap_watchdog_lost);
+	/* Firmware without the IOMFB queue: the power-off stops it, nothing is kept. */
+	d = pipe(DRM_MODE_CONNECTOR_USB);
+	d->fw_compat = DCP_FIRMWARE_V_26_6;
+	d->present_state_h17p.pending = d->present_state_h17p.accepted = true;
+	d->typec_unplugs++;
+	d->swap_watchdog_wq.pending = true;
+	dcp_poweroff(&pdev);
+	assert(!d->swap_watchdog_wq.pending && !d->swap_watchdog_lost);
+	puts("ok live outputs: panel, fixed HDMI and attached Type-C DPMS stop the watchdog");
 }
 
 int main(void)
 {
-    watchdog();
-    teardown();
-    puts("PASS dock unplug with a present in flight, and replug");
-    return 0;
+	lost_display();
+	acceptance_during_poweroff();
+	live_outputs();
+	puts("PASS a dock display's present in flight across its unplug, power-off and replug");
+	return 0;
 }
 '''
 
 
 def build(tmp, name, sources):
-    unit = PRE
+    unit = PRE + define(sources['dcp'], 'DCP_SWAP_WATCHDOG_MS')
+    unit += define(sources['dcp'], 'DCP_SWAP_WATCHDOG_RETRAINS')
     for src, fn in FUNCTIONS:
         unit += function(sources[src], fn)
     unit += CASES
@@ -271,14 +451,14 @@ def build(tmp, name, sources):
     binary = Path(tmp) / name
     c.write_text(unit)
     subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-O1', '-g', '-Wall', '-Wextra', '-Werror',
-                    '-Wno-unused-parameter', '-Wno-unused-function',
+                    '-Wno-unused-parameter', '-Wno-unused-function', '-Wno-unused-variable',
                     '-fsanitize=address,undefined', '-fno-sanitize-recover=all',
                     str(c), '-o', str(binary)], check=True)
     return subprocess.run([str(binary)], capture_output=True, text=True)
 
 
 def main():
-    with tempfile.TemporaryDirectory(prefix='dock-hotplug-relink-') as tmp:
+    with tempfile.TemporaryDirectory(prefix='dock-display-replug-') as tmp:
         for name, (src, old, new) in MUTATIONS.items():
             assert SOURCES[src].count(old) == 1, 'stale mutation: ' + name
             sources = dict(SOURCES)
