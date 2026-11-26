@@ -149,6 +149,9 @@ pub(crate) const DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS: u32 =
 const DEBUG_CLASS: DebugFlags = DebugFlags::File;
 
 pub(crate) const MAX_COMMANDS_PER_SUBMISSION: u32 = 64;
+/// Most input plus output syncs of one SUBMIT, on the GPUs that bound them
+/// ([`gpu::Gpu::max_syncs`]).
+pub(crate) const MAX_SYNCS_PER_SUBMISSION: usize = 4096;
 
 /// A client instance of an `mmu::Vm` address space.
 struct Vm {
@@ -1897,6 +1900,12 @@ impl File {
         let gpu = &reg_data.gpu;
         if data.cmdbuf_size as usize > gpu.max_cmdbuf_size() {
             return Err(E2BIG);
+        }
+        // Before anything is allocated for the syncs: each one costs a parsed record, and
+        // a timeline output a chain node its syncobj keeps.
+        if data.in_sync_count as usize + data.out_sync_count as usize > gpu.max_syncs() {
+            cls_pr_debug!(Errors, "submit: Too many syncs\n");
+            return Err(EINVAL);
         }
         if let Some(manager) = gpu.manager() {
             manager.update_globals();
