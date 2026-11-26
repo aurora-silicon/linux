@@ -1966,6 +1966,8 @@ static int dcp_v27_early_services_start(struct apple_dcp *dcp)
 				 PTR_ERR(ep));
 			continue;
 		}
+		/* The announcement path matches names exactly: take every one here. */
+		ep->unmatched_ops = dcp_v27_early_any_service;
 		/* Routed before the first message can come (dcp_afkep()). */
 		WRITE_ONCE(dcp->v27_early_svc_ep[id - 0x20], ep);
 		ret = afk_start(ep);
