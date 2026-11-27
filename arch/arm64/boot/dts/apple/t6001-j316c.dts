@@ -9,6 +9,12 @@
 
 /dts-v1/;
 
+/*
+ * Enable PMP on the 16-inch M1 Max (J316c) so the GPU AGX vote (PS-REQ bit 9)
+ * and CPU memory floor lift memory DVFS out of its idle floor.
+ */
+#define APPLE_USE_PMP
+
 #include "t6001.dtsi"
 #include "t600x-j314-j316.dtsi"
 

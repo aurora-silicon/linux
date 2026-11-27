@@ -150,6 +150,79 @@
 };
 
 #ifndef APPLE_T6000_SUBSET
+/*
+ * DRAM interface class for M1 Max (512-bit LPDDR5-6400, 400 GB/s class).
+ * State IDs below describe firmware DCS states, not PMGR codes.
+ */
+/ {
+	dram_opp: opp-table-dram {
+		compatible = "operating-points-v2-apple-dram";
+		opp-shared;
+
+		opp-0 {
+			opp-level = <0>;
+		};
+
+		opp-1 {
+			opp-level = <1>;
+		};
+
+		opp-2 {
+			opp-level = <2>;
+		};
+
+		opp-3 {
+			opp-level = <3>;
+			opp-hz = /bits/ 64 <3200000000>;
+			apple,data-rate = /bits/ 64 <6400000000>;
+		};
+	};
+};
+
+&pmp_report {
+	operating-points-v2 = <&dram_opp>;
+	apple,dram-type = "lpddr5";
+	apple,data-bus-width = <512>;
+	apple,dcs-state-count = <4>;
+	apple,peak-bandwidth-bytes-per-second = /bits/ 64 <409600000000>;
+	apple,bandwidth-class-bytes-per-second = /bits/ 64 <400000000000>;
+};
+
+#ifdef APPLE_USE_PMP
+/*
+ * With the PMP managing DCS and fabric, request the CPU memory floor (DRAM
+ * class 0x21 level 3, fabric class 0x25 level 2) and attach media blocks to
+ * their PMP report entries, matching t6000.dtsi.
+ */
+&pmp_report {
+	apple,pmp-tables = <&pmp>;
+	apple,cpu-memory-floor = <0x21 3 0x25 2>;
+};
+
+&pmp_report_venc_sys {
+	apple,adt-dvfs;
+	status = "okay";
+};
+
+&pmp_report_avd_sys {
+	apple,adt-dvfs;
+};
+
+&pmp_report_jpg {
+	apple,adt-dvfs;
+};
+
+&pmp_report_msr0 {
+	apple,adt-dvfs;
+	status = "okay";
+};
+
+&pmp_report_scodec {
+	apple,adt-dvfs;
+	status = "okay";
+};
+#endif
+
 #include "t6001-peripherals.dtsi"
 #include "t6001-aux-spmi.dtsi"
 #include "t6001-display-extra.dtsi"
@@ -169,5 +242,21 @@
 
 &ave {
 	status = "okay";
+#ifdef APPLE_USE_PMP
+	power-domains = <&ps_venc_dma>, <&ps_venc_pipe4>,
+			<&ps_venc_pipe5>, <&ps_venc_me0>, <&ps_venc_me1>,
+			<&pmp_report_venc_sys>;
+	power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1", "perf";
+#endif
 };
+
+#ifdef APPLE_USE_PMP
+&scaler0 {
+	power-domains = <&pmp_report_msr0>, <&ps_msr0_ase_core>;
+};
+
+&apr0 {
+	power-domains = <&pmp_report_scodec>;
+};
+#endif
 #endif
