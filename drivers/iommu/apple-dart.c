@@ -6858,6 +6858,21 @@ int apple_dart_resume_commands(struct device *dev)
 }
 EXPORT_SYMBOL_GPL(apple_dart_resume_commands);
 
+static bool apple_dart_tunables_lock(const struct apple_dart *dart)
+{
+	size_t i;
+
+	if (!dart->tunables)
+		return false;
+
+	for (i = 0; i < dart->tunables->sz; ++i) {
+		if (dart->tunables->values[i].offset == dart->hw->lock &&
+		    (dart->tunables->values[i].value & dart->hw->lock_bit))
+			return true;
+	}
+	return false;
+}
+
 /*
  * System sleep has quiesced every downstream device. PCIe-C calls this
  * before stopping APPCLK because its domain reset also loses DART state,
@@ -6869,7 +6884,7 @@ int apple_dart_save_tunnel_state(struct device *dev)
 	unsigned int sid, idx;
 
 	if (!dart || !dart->tunneled || dart->locked ||
-	    dart->hw->type != DART_T8020 || dart->tunables)
+	    dart->hw->type != DART_T8020 || apple_dart_tunables_lock(dart))
 		return -EOPNOTSUPP;
 
 	guard(spinlock_irqsave)(&dart->lock);
@@ -6897,7 +6912,7 @@ int apple_dart_restore_tunnel_state(struct device *dev)
 	int ret;
 
 	if (!dart || !dart->tunneled || dart->locked ||
-	    dart->hw->type != DART_T8020 || dart->tunables)
+	    dart->hw->type != DART_T8020 || apple_dart_tunables_lock(dart))
 		return -EOPNOTSUPP;
 	if (!dart->tunnel_state_saved || READ_ONCE(dart->commands_gated))
 		return -EINVAL;
@@ -6905,6 +6920,8 @@ int apple_dart_restore_tunnel_state(struct device *dev)
 	ret = apple_dart_hw_reset(dart);
 	if (ret)
 		return ret;
+	if (dart->tunables)
+		apple_dart_apply_own_tunables(dart);
 
 	for (sid = 0; sid < dart->num_streams; sid++) {
 		for (idx = 0; idx < dart->hw->ttbr_count; idx++)
