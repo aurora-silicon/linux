@@ -158,6 +158,10 @@
 /* The GPU, handed over by the boot loader */
 #include "t6050-k114-k116-gpu.dtsi"
 
+/* Touch ID: the SEP and the Mesa sensor, with this Mac's own calibration and root key */
+#define T6050_TOUCHID_FIRMWARE	"apple/mesacal-k114c.bin", "apple/msrk-k114c.bin"
+#include "t6050-touchid.dtsi"
+
 /*
  * The K114c keeps J714's card with its speakers, at the J714's safe level. The
  * chassis' K114 entry (t6050-k114.dtsi) has the jack only.
@@ -307,10 +311,10 @@
  * Pin 112's register takes an SError when read, so only the pins a node here
  * names are exposed: 80 and 81 (PCIe ports 0 and 1's PERST#); 106 and 107, the speaker
  * amps' interrupt and shutdown line; 134 and 139, the jack codec's interrupt and
- * reset; 136 and 137, the speaker ID.
+ * reset; 136 and 137, the speaker ID; 138, the Touch ID sensor's data-ready line.
  */
 &pinctrl_ap {
-	gpio-reserved-ranges = <0 80>, <82 24>, <108 26>, <135 1>, <138 1>, <140 81>;
+	gpio-reserved-ranges = <0 80>, <82 24>, <108 26>, <135 1>, <140 81>;
 };
 
 /* It answers only once port 1's root complex is up: pcie-apple then enables it */
