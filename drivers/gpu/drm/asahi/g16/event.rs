@@ -10,13 +10,18 @@ use kernel::{bindings, device, prelude::*};
 
 use super::channel::Ring;
 use super::fw::channels::{RING_SLOTS, STATE_READ, STATE_WRITE};
-use super::fw::work::compute;
+use super::fw::work::{compute, render_pair};
 use super::hw::{rings, sizes};
 use super::regs::{mb, rmb, wmb};
 
 pub(crate) const RECORD_WORDS: usize = 18;
-pub(crate) const STAGE_COUNT: usize = 2 + sizes::COMPUTE_PIPES;
+pub(crate) const STAGE_COUNT: usize = sizes::STAGES;
 const COMPUTE_EVENT_MASK: u32 = ((1u32 << sizes::COMPUTE_PIPES) - 1) << compute::EVENT;
+/// TA/FS events of every render pair, in type-1 word 4.
+const RENDER_EVENT_MASK: u32 =
+    ((1u32 << (2 * sizes::RENDER_PAIRS)) - 1) << (render_pair::TA_EVENT % 32);
+const _: () = assert!(render_pair::TA_EVENT / 32 == 3);
+const _: () = assert!(sizes::RENDER_PAIRS <= render_pair::MAX_PAIRS);
 const _: () = assert!(compute::EVENTS.len() == sizes::COMPUTE_PIPES);
 const _: () = assert!(compute::EVENT as usize + sizes::COMPUTE_PIPES <= 32);
 /// Retained only for the allocator's pending-growth container. M4 does not
@@ -129,7 +134,8 @@ impl Events {
             match kind {
                 1 => {
                     // Type 1 carries 128 completion bits across words 1..=4; compute pipe events
-                    // (15..15+COMPUTE_PIPES) live in word 1 and TA/FS (0x70/0x71) live in word 4.
+                    // (15..15+COMPUTE_PIPES) live in word 1 and the TA/FS events of every render
+                    // pair (0x70 + 2p, 0x71 + 2p) live in word 4.
                     let (w1, w4) = match ring.ring.r32(base + 4).and_then(|w1| {
                         Ok((w1, ring.ring.r32(base + 16)?))
                     }) {
@@ -141,14 +147,17 @@ impl Events {
                             return Err(err);
                         }
                     };
-                    if w4 & (1u32 << (0x70 % 32)) != 0 {
-                        self.event_ns[0] = now;
+                    let mut rbits = w4 & RENDER_EVENT_MASK;
+                    while rbits != 0 {
+                        let bit = rbits.trailing_zeros();
+                        rbits &= rbits - 1;
+                        let i = (bit - render_pair::TA_EVENT % 32) as usize;
+                        let (pair, stage) = (i / 2, i % 2);
+                        self.event_ns[sizes::render_stage(pair, stage)] = now;
                         self.stage_events = self.stage_events.wrapping_add(1);
-                    }
-                    if w4 & (1u32 << (0x71 % 32)) != 0 {
-                        self.event_ns[1] = now;
-                        self.stage_events = self.stage_events.wrapping_add(1);
-                        self.fs_events = self.fs_events.wrapping_add(1);
+                        if stage == 1 {
+                            self.fs_events = self.fs_events.wrapping_add(1);
+                        }
                     }
                     let mut cbits = w1 & COMPUTE_EVENT_MASK;
                     while cbits != 0 {

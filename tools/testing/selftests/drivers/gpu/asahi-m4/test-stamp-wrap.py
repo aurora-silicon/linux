@@ -28,7 +28,7 @@ const EINVAL:Error=Error(-22);const EAGAIN:Error=Error(-11);type Result<T=()> = 
 #[path="__LOGIC__"]mod logic;
 use logic::{Retirement, ABORT_GRACE_NS};
 mod encode { __STAMP_SEED__ __STAMP__ }
-mod hw { pub mod sizes { pub const COMPUTE_PIPES: usize = 8; } }
+mod hw { pub mod sizes { pub const COMPUTE_PIPES: usize = 8; pub const RENDER_PAIRS: usize = 2; } }
 struct Object{cells:BTreeMap<usize,u64>,va:u64,unstable:bool,reads:Cell<u32>}
 impl Default for Object{fn default()->Self{Self{cells:BTreeMap::new(),va:0x1234,unstable:false,reads:Cell::new(0)}}}
 impl Object {
@@ -43,13 +43,13 @@ mod notifier {pub const CONTEXT:usize=16;}
 mod manager {pub const COUNTER:usize=0x4c;pub const COMPLETED:usize=0x54;}
 #[derive(Default)]struct CGraph{fw_stamp:Object,qstate:Object,qinfo:Object,notifier:Object}
 struct RGraph{fw_stamp:[Object;2],qstate:[Object;2],qinfo:[Object;2],notifier:Object}
-struct Graph{compute:[CGraph;hw::sizes::COMPUTE_PIPES],render:RGraph}
+struct Graph{compute:[CGraph;hw::sizes::COMPUTE_PIPES],render:[RGraph;hw::sizes::RENDER_PAIRS]}
 struct Vm{slot:u32}struct Job{vm:Vm,resources:Resources}
 struct Resources{compute:Vec<CUnit>,passes:Vec<RUnit>,pools:Pools}
 impl Resources{fn compute(&self)->Result<&Self>{Ok(self)}fn render(&self)->Result<&Self>{Ok(self)}fn compute_unit(&self,k:usize)->Result<&CUnit>{self.compute.get(k).ok_or(EINVAL)}fn render_pass(&self,k:usize)->Result<&RUnit>{self.passes.get(k).ok_or(EINVAL)}fn pb_retired(&self,k:usize)->Result<bool>{self.pools.retired(k)}fn pb_retired_at(&self,k:usize,target:u64)->Result<bool>{self.pools.retired_at(k,target)}}
 struct Claims{slot:[u32;16],slot_count:u32,pass:[u32;4]}
-struct Flight{computes:u32,renders:u32,compute_pipe:u8,target:u32,ta_target:u32,fs_target:u32,job:Job,claims:Claims,head:u32,ta_head:u32,fs_head:u32,rec:[u32;3],chan_settled:bool,pb_slot:u32,uma_submitted:u64,csubmitted:[u64;16],recovery_suspect:bool,recovery_started_ns:u64,gate_passed_ns:Option<u64>,unsettled_polls:u32,doomed:bool}
-struct Engine{flights:Vec<Flight>,target:[u32;hw::sizes::COMPUTE_PIPES],ta_target:u32,fs_target:u32,retired_ticks:[u64;4]}
+struct Flight{computes:u32,renders:u32,compute_pipe:u8,render_pair:u8,target:u32,ta_target:u32,fs_target:u32,job:Job,claims:Claims,head:u32,ta_head:u32,fs_head:u32,rec:[u32;3],chan_settled:bool,pb_slot:u32,uma_submitted:u64,csubmitted:[u64;16],recovery_suspect:bool,recovery_started_ns:u64,gate_passed_ns:Option<u64>,unsettled_polls:u32,doomed:bool}
+struct Engine{flights:Vec<Flight>,target:[u32;hw::sizes::COMPUTE_PIPES],ta_target:[u32;hw::sizes::RENDER_PAIRS],fs_target:[u32;hw::sizes::RENDER_PAIRS],retired_ticks:[u64;4]}
 fn stamp_reached(observed:u32,own:u32,tail:u32)->bool{logic::stamp_reached(observed,own,tail)}
 impl Engine{fn oldest(&self)->Option<&Flight>{self.flights.first()}}
 struct CUnit{counter:Object,descriptor:Object,its:Object,work:Object}
@@ -83,8 +83,8 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     let mut target_arr=[0u32;hw::sizes::COMPUTE_PIPES];target_arr[0]=target;
     let mut f=Firmware{
         graph:Graph{compute:core::array::from_fn(|_|CGraph::default()),
-            render:RGraph{fw_stamp:Default::default(),qstate:Default::default(),qinfo:Default::default(),notifier:Object::default()}},
-        engine:Engine{flights:vec![Flight{computes:u32::from(!render),renders:u32::from(render),compute_pipe:0,target,ta_target:target,fs_target:target,job:Job{vm:Vm{slot:2},resources:Resources{compute:vec![CUnit{counter:Object::default(),descriptor:Object::default(),its:Object::default(),work:Object::default()}],passes:vec![RUnit{scene:Object::default()}],pools:Pools{full:true,completed:2}}},claims:Claims{slot:[0;16],slot_count:u32::from(!render),pass:[0;4]},head:1,ta_head:1,fs_head:1,rec:[1;3],chan_settled:false,pb_slot:0,uma_submitted:2,csubmitted:{let mut a=[0u64;16];if !render{a[0]=ordinal;}a},recovery_suspect:false,recovery_started_ns:0,gate_passed_ns:None,unsettled_polls:0,doomed:false}],target:target_arr,ta_target:target,fs_target:target,retired_ticks:[0;4]},
+            render:core::array::from_fn(|_|RGraph{fw_stamp:Default::default(),qstate:Default::default(),qinfo:Default::default(),notifier:Object::default()})},
+        engine:Engine{flights:vec![Flight{computes:u32::from(!render),renders:u32::from(render),compute_pipe:0,render_pair:0,target,ta_target:target,fs_target:target,job:Job{vm:Vm{slot:2},resources:Resources{compute:vec![CUnit{counter:Object::default(),descriptor:Object::default(),its:Object::default(),work:Object::default()}],passes:vec![RUnit{scene:Object::default()}],pools:Pools{full:true,completed:2}}},claims:Claims{slot:[0;16],slot_count:u32::from(!render),pass:[0;4]},head:1,ta_head:1,fs_head:1,rec:[1;3],chan_settled:false,pb_slot:0,uma_submitted:2,csubmitted:{let mut a=[0u64;16];if !render{a[0]=ordinal;}a},recovery_suspect:false,recovery_started_ns:0,gate_passed_ns:None,unsettled_polls:0,doomed:false}],target:target_arr,ta_target:[target;hw::sizes::RENDER_PAIRS],fs_target:[target;hw::sizes::RENDER_PAIRS],retired_ticks:[0;4]},
         slots:Slots{scrub:Scrub{compute:vec![CUnit{counter:Object::default(),descriptor:Object::default(),its:Object::default(),work:Object::default()}],passes:vec![RUnit{scene:Object::default()}]}},
         pools:Pools{full:true,completed:2},channels:TopChannels{compute_producer:1},queue_passed:true,last_chan_passed:Cell::new(None),
     };
@@ -95,11 +95,11 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     f.engine.flights[0].job.resources.compute[0].its.set(0,100);f.engine.flights[0].job.resources.compute[0].its.set(8,101);
     f.engine.flights[0].job.resources.compute[0].descriptor.set(manager::COMPLETED,ordinal);
     f.engine.flights[0].job.resources.compute[0].descriptor.set(manager::COUNTER,0x1234);
-    for stage in 0..2{f.graph.render.fw_stamp[stage].set(0,u64::from(target));}
-    f.graph.render.notifier.set(notifier_page::TA_STAMP,u64::from(target));
-    f.graph.render.notifier.set(notifier_page::FS_STAMP,u64::from(target));
-    f.graph.render.notifier.set(notifier::CONTEXT,2);
-    f.graph.render.notifier.set(notifier_page::FS_RECORD+notifier::CONTEXT,2);
+    for stage in 0..2{f.graph.render[0].fw_stamp[stage].set(0,u64::from(target));}
+    f.graph.render[0].notifier.set(notifier_page::TA_STAMP,u64::from(target));
+    f.graph.render[0].notifier.set(notifier_page::FS_STAMP,u64::from(target));
+    f.graph.render[0].notifier.set(notifier::CONTEXT,2);
+    f.graph.render[0].notifier.set(notifier_page::FS_RECORD+notifier::CONTEXT,2);
     for (off,time) in [(0x600,100),(0x608,101),(0x620,102),(0x628,103)]{f.engine.flights[0].job.resources.passes[0].scene.set(off,time);}
     f
 }
@@ -118,12 +118,12 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
         f.queue_passed=false;assert_eq!(f.retired(),Ok(Retirement::Pending));
         f.queue_passed=true;
         if render {
-            f.graph.render.fw_stamp[0].set(0,u64::from(encode::stamp(n-1)));
+            f.graph.render[0].fw_stamp[0].set(0,u64::from(encode::stamp(n-1)));
             assert_eq!(f.retired(),Ok(Retirement::Pending));
-            f.graph.render.fw_stamp[0].set(0,u64::from(encode::stamp(n)));
-            f.graph.render.fw_stamp[1].set(0,u64::from(encode::stamp(n-1)));
+            f.graph.render[0].fw_stamp[0].set(0,u64::from(encode::stamp(n)));
+            f.graph.render[0].fw_stamp[1].set(0,u64::from(encode::stamp(n-1)));
             assert_eq!(f.retired(),Ok(Retirement::Pending));
-            f.graph.render.fw_stamp[1].set(0,u64::from(encode::stamp(n)));
+            f.graph.render[0].fw_stamp[1].set(0,u64::from(encode::stamp(n)));
             f.engine.flights[0].job.resources.pools.full=false;assert_eq!(f.retired(),Ok(Retirement::Pending));
         }else{
             f.engine.flights[0].job.resources.compute[0].its.set(8,0);
@@ -156,20 +156,20 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
         let mut later=firmware(true,n+1).engine.flights.remove(0);
         later.uma_submitted=4;
         f.engine.flights.push(later);
-        f.engine.ta_target=encode::stamp(n+1);
-        f.engine.fs_target=encode::stamp(n+1);
+        f.engine.ta_target[0]=encode::stamp(n+1);
+        f.engine.fs_target[0]=encode::stamp(n+1);
         // The render behind it finished too: shared TA/FS stamps and notifier moved on.
-        for stage in 0..2 { f.graph.render.fw_stamp[stage].set(0,u64::from(encode::stamp(n+1))); }
-        f.graph.render.notifier.set(notifier_page::TA_STAMP,u64::from(encode::stamp(n+1)));
-        f.graph.render.notifier.set(notifier_page::FS_STAMP,u64::from(encode::stamp(n+1)));
-        f.graph.render.notifier.set(notifier::CONTEXT,9);
-        f.graph.render.notifier.set(notifier_page::FS_RECORD+notifier::CONTEXT,9);
+        for stage in 0..2 { f.graph.render[0].fw_stamp[stage].set(0,u64::from(encode::stamp(n+1))); }
+        f.graph.render[0].notifier.set(notifier_page::TA_STAMP,u64::from(encode::stamp(n+1)));
+        f.graph.render[0].notifier.set(notifier_page::FS_STAMP,u64::from(encode::stamp(n+1)));
+        f.graph.render[0].notifier.set(notifier::CONTEXT,9);
+        f.graph.render[0].notifier.set(notifier_page::FS_RECORD+notifier::CONTEXT,9);
         f.engine.flights[0].job.resources.pools.completed=4;
         assert_eq!(f.retired(),Ok(Retirement::Full));
         // Unreached FS stamp keeps it pending.
-        f.graph.render.fw_stamp[1].set(0,u64::from(encode::stamp(n-1)));
+        f.graph.render[0].fw_stamp[1].set(0,u64::from(encode::stamp(n-1)));
         assert_eq!(f.retired(),Ok(Retirement::Pending));
-        f.graph.render.fw_stamp[1].set(0,u64::from(encode::stamp(n)));
+        f.graph.render[0].fw_stamp[1].set(0,u64::from(encode::stamp(n)));
         assert_eq!(f.retired(),Ok(Retirement::Full));
         // Unreached UMA completion keeps it pending.
         f.engine.flights[0].job.resources.pools.completed=1;
@@ -202,22 +202,22 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     f.graph.compute[0].notifier.set(notifier_page::COMPUTE_STAMP,u64::from(encode::stamp(20)));
     f.graph.compute[0].notifier.set(notifier_page::COMPUTE_CONTEXT,2);
     // Keep render FS stamp unreached so render at index 0 stays pending.
-    f.graph.render.fw_stamp[1].set(0,u64::from(encode::stamp(9)));
+    f.graph.render[0].fw_stamp[1].set(0,u64::from(encode::stamp(9)));
     assert_eq!(f.retired_flight(),Ok(Some((1,Retirement::Full))));
     f.engine.flights.remove(1);
     assert_eq!(f.retired_flight(),Ok(None));
     // Now finish render: render retires cleanly with exact single-class receipt.
-    f.graph.render.fw_stamp[1].set(0,u64::from(encode::stamp(10)));
+    f.graph.render[0].fw_stamp[1].set(0,u64::from(encode::stamp(10)));
     assert_eq!(f.retired_flight(),Ok(Some((0,Retirement::Full))));
     // Reverse order: Compute at index 0 (pending) + Render at index 1 (complete).
     let mut f2=firmware(false,30);
     let r=firmware(true,40).engine.flights.remove(0);
     f2.engine.flights.push(r);
-    f2.engine.ta_target=encode::stamp(40);
-    f2.engine.fs_target=encode::stamp(40);
-    for stage in 0..2 { f2.graph.render.fw_stamp[stage].set(0,u64::from(encode::stamp(40))); }
-    f2.graph.render.notifier.set(notifier_page::TA_STAMP,u64::from(encode::stamp(40)));
-    f2.graph.render.notifier.set(notifier_page::FS_STAMP,u64::from(encode::stamp(40)));
+    f2.engine.ta_target[0]=encode::stamp(40);
+    f2.engine.fs_target[0]=encode::stamp(40);
+    for stage in 0..2 { f2.graph.render[0].fw_stamp[stage].set(0,u64::from(encode::stamp(40))); }
+    f2.graph.render[0].notifier.set(notifier_page::TA_STAMP,u64::from(encode::stamp(40)));
+    f2.graph.render[0].notifier.set(notifier_page::FS_STAMP,u64::from(encode::stamp(40)));
     f2.graph.compute[0].fw_stamp.set(0,u64::from(encode::stamp(29)));
     assert_eq!(f2.retired_flight(),Ok(Some((1,Retirement::Full))));
 }
@@ -252,9 +252,9 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     // Compute-only retirement performs zero render WC reads.
     let mut fc=firmware(false,5);
     assert_eq!(fc.retired_flight(),Ok(Some((0,Retirement::Full))));
-    assert_eq!(fc.graph.render.fw_stamp[0].reads.get(),0);
-    assert_eq!(fc.graph.render.fw_stamp[1].reads.get(),0);
-    assert_eq!(fc.graph.render.notifier.reads.get(),0);
+    assert_eq!(fc.graph.render[0].fw_stamp[0].reads.get(),0);
+    assert_eq!(fc.graph.render[0].fw_stamp[1].reads.get(),0);
+    assert_eq!(fc.graph.render[0].notifier.reads.get(),0);
     // Render-only retirement performs zero compute WC reads.
     let mut fr=firmware(true,5);
     assert_eq!(fr.retired_flight(),Ok(Some((0,Retirement::Full))));
@@ -264,14 +264,14 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     assert_eq!(fr.graph.compute[1].notifier.reads.get(),0);
     // In-progress render (TA done, FS still running) fails fast on FS stamp without reading TA or scene.
     let mut fp=firmware(true,7);
-    fp.graph.render.fw_stamp[1].set(0,u64::from(encode::stamp(6)));
+    fp.graph.render[0].fw_stamp[1].set(0,u64::from(encode::stamp(6)));
     assert_eq!(fp.retired_flight(),Ok(None));
-    assert_eq!(fp.graph.render.fw_stamp[1].reads.get(),1);
-    assert_eq!(fp.graph.render.fw_stamp[0].reads.get(),0);
+    assert_eq!(fp.graph.render[0].fw_stamp[1].reads.get(),1);
+    assert_eq!(fp.graph.render[0].fw_stamp[0].reads.get(),0);
     assert_eq!(fp.engine.flights[0].job.resources.passes[0].scene.reads.get(),0);
     // Unsettled notifier skips scene WC timestamp reads.
-    fp.graph.render.fw_stamp[1].set(0,u64::from(encode::stamp(7)));
-    fp.graph.render.notifier.set(notifier_page::FS_STAMP,u64::from(encode::stamp(6)));
+    fp.graph.render[0].fw_stamp[1].set(0,u64::from(encode::stamp(7)));
+    fp.graph.render[0].notifier.set(notifier_page::FS_STAMP,u64::from(encode::stamp(6)));
     assert_eq!(fp.retired_flight(),Ok(None));
     assert_eq!(fp.engine.flights[0].job.resources.passes[0].scene.reads.get(),0);
     // Mixed flight pending is polled once, not twice.
@@ -280,27 +280,84 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     fm.graph.compute[0].fw_stamp.set(0,u64::from(encode::stamp(8)));
     assert_eq!(fm.retired_flight(),Ok(None));
     assert_eq!(fm.graph.compute[0].fw_stamp.reads.get(),1);
-    assert_eq!(fm.graph.render.fw_stamp[1].reads.get(),0);
+    assert_eq!(fm.graph.render[0].fw_stamp[1].reads.get(),0);
     // Pending compute class is not re-polled while retiring a burst of render flights.
     let mut fmix=firmware(false,30);
     let r1=firmware(true,40).engine.flights.remove(0);
     let r2=firmware(true,41).engine.flights.remove(0);
     fmix.engine.flights.push(r1);
     fmix.engine.flights.push(r2);
-    fmix.engine.ta_target=encode::stamp(41);
-    fmix.engine.fs_target=encode::stamp(41);
-    for stage in 0..2 { fmix.graph.render.fw_stamp[stage].set(0,u64::from(encode::stamp(41))); }
-    fmix.graph.render.notifier.set(notifier_page::TA_STAMP,u64::from(encode::stamp(41)));
-    fmix.graph.render.notifier.set(notifier_page::FS_STAMP,u64::from(encode::stamp(41)));
+    fmix.engine.ta_target[0]=encode::stamp(41);
+    fmix.engine.fs_target[0]=encode::stamp(41);
+    for stage in 0..2 { fmix.graph.render[0].fw_stamp[stage].set(0,u64::from(encode::stamp(41))); }
+    fmix.graph.render[0].notifier.set(notifier_page::TA_STAMP,u64::from(encode::stamp(41)));
+    fmix.graph.render[0].notifier.set(notifier_page::FS_STAMP,u64::from(encode::stamp(41)));
     fmix.graph.compute[0].fw_stamp.set(0,u64::from(encode::stamp(29)));
-    let (mut check_c,mut check_r)=([true;hw::sizes::COMPUTE_PIPES],true);
+    let (mut check_c,mut check_r)=([true;hw::sizes::COMPUTE_PIPES],[true;hw::sizes::RENDER_PAIRS]);
     assert_eq!(fmix.retired_flight_classes(&mut check_c,&mut check_r),Ok(Some((1,Retirement::Full))));
-    assert!(!check_c[0] && !check_c[1] && check_r);
+    assert!(!check_c[0] && !check_c[1] && check_r[0] && !check_r[1]);
     fmix.engine.flights.remove(1);
     assert_eq!(fmix.retired_flight_classes(&mut check_c,&mut check_r),Ok(Some((1,Retirement::Full))));
     fmix.engine.flights.remove(1);
     assert_eq!(fmix.retired_flight_classes(&mut check_c,&mut check_r),Ok(None));
     assert_eq!(fmix.graph.compute[0].fw_stamp.reads.get(),1);
+}
+/// A render flight of ordinal `n` on render pair 1 whose pair-1 cells show it done.
+fn pair1_render(f:&mut Firmware,n:u64){
+    let mut fl=firmware(true,n).engine.flights.remove(0);
+    fl.render_pair=1;
+    f.engine.flights.push(fl);
+    let t=encode::stamp(n);
+    f.engine.ta_target[1]=t;f.engine.fs_target[1]=t;
+    for stage in 0..2 { f.graph.render[1].fw_stamp[stage].set(0,u64::from(t)); }
+    f.graph.render[1].notifier.set(notifier_page::TA_STAMP,u64::from(t));
+    f.graph.render[1].notifier.set(notifier_page::FS_STAMP,u64::from(t));
+    f.graph.render[1].notifier.set(notifier::CONTEXT,2);
+    f.graph.render[1].notifier.set(notifier_page::FS_RECORD+notifier::CONTEXT,2);
+}
+#[test]fn render_pairs_retire_out_of_order_on_their_own_cells(){
+    // Pair 0 render (older, FS still running) + pair 1 render (newer, finished): pair 1 retires
+    // first, from pair 1's stamps and notifier alone. Dense per-pair stamps may be equal.
+    for n in [1u64,0x7fffff,0xffffff,0x1000000] {
+        let mut f=firmware(true,n);
+        f.graph.render[0].fw_stamp[1].set(0,u64::from(encode::stamp(n-1)));
+        pair1_render(&mut f,n);
+        assert_eq!(f.retired_flight(),Ok(Some((1,Retirement::Full))));
+        // Another render flight is in flight on the shared TA/FS channels: passed channel proof.
+        assert_eq!(f.last_chan_passed.get(),Some(true));
+        f.engine.flights.remove(1);
+        assert_eq!(f.retired_flight(),Ok(None));
+        // Pair 1's cells never stand in for pair 0's.
+        assert_eq!(f.graph.render[1].fw_stamp[1].reads.get(),1);
+        f.graph.render[0].fw_stamp[1].set(0,u64::from(encode::stamp(n)));
+        f.last_chan_passed.set(None);
+        assert_eq!(f.retired_flight(),Ok(Some((0,Retirement::Full))));
+        // Alone again with the newest channel record: exact channel proof.
+        assert_eq!(f.last_chan_passed.get(),Some(false));
+    }
+}
+#[test]fn render_pair_progress_does_not_retire_the_other_pair(){
+    // Pair 1 finished, pair 0 pending with its own FS stamp unreached: only pair 1 retires,
+    // and a later pair-0 flight keeps pair 0 in order with "passed" receipts.
+    let mut f=firmware(true,5);
+    f.graph.render[0].fw_stamp[1].set(0,u64::from(encode::stamp(4)));
+    pair1_render(&mut f,5);
+    f.graph.render[1].fw_stamp[1].set(0,u64::from(encode::stamp(4)));
+    assert_eq!(f.retired_flight(),Ok(None));
+    let mut later=firmware(true,6).engine.flights.remove(0);
+    later.uma_submitted=4;
+    f.engine.flights.push(later);
+    f.engine.ta_target[0]=encode::stamp(6);f.engine.fs_target[0]=encode::stamp(6);
+    f.engine.flights[0].job.resources.pools.completed=4;
+    for stage in 0..2 { f.graph.render[0].fw_stamp[stage].set(0,u64::from(encode::stamp(6))); }
+    f.graph.render[0].notifier.set(notifier_page::TA_STAMP,u64::from(encode::stamp(6)));
+    f.graph.render[0].notifier.set(notifier_page::FS_STAMP,u64::from(encode::stamp(6)));
+    // Pair 0's oldest retires in order (index 0); pair 1 stays pending.
+    assert_eq!(f.retired_flight(),Ok(Some((0,Retirement::Full))));
+    f.engine.flights.remove(0);
+    assert_eq!(f.retired_flight(),Ok(Some((1,Retirement::Full))));
+    f.engine.flights.remove(1);
+    assert_eq!(f.retired_flight(),Ok(None));
 }
 #[test]fn innocent_suspect_flight_does_not_false_abort_after_recovery_grace(){
     let mut f=firmware(true,15);
@@ -396,13 +453,13 @@ fn firmware(render:bool,ordinal:u64)->Firmware{
     f.engine.flights.push(innocent);
 
     let t31=encode::stamp(31);
-    f.engine.ta_target=t31;
-    f.engine.fs_target=t31;
-    for stage in 0..2 { f.graph.render.fw_stamp[stage].set(0,u64::from(t31)); }
-    f.graph.render.notifier.set(notifier_page::TA_STAMP,u64::from(t31));
-    f.graph.render.notifier.set(notifier_page::FS_STAMP,u64::from(t31));
-    f.graph.render.notifier.set(notifier::CONTEXT,2);
-    f.graph.render.notifier.set(notifier_page::FS_RECORD+notifier::CONTEXT,2);
+    f.engine.ta_target[0]=t31;
+    f.engine.fs_target[0]=t31;
+    for stage in 0..2 { f.graph.render[0].fw_stamp[stage].set(0,u64::from(t31)); }
+    f.graph.render[0].notifier.set(notifier_page::TA_STAMP,u64::from(t31));
+    f.graph.render[0].notifier.set(notifier_page::FS_STAMP,u64::from(t31));
+    f.graph.render[0].notifier.set(notifier::CONTEXT,2);
+    f.graph.render[0].notifier.set(notifier_page::FS_RECORD+notifier::CONTEXT,2);
 
     // First unsettled poll records gate_passed_ns on hanging VM A; after ABORT_GRACE_NS, VM A aborts.
     assert_eq!(f.retired_flight(),Ok(None));
@@ -537,8 +594,8 @@ mod queue_proof {
         }
         fn producer(&self, ch: Channel) -> u32 { self.channel(ch).write }
     }
-    struct Engine { head: [u32; hw::sizes::COMPUTE_PIPES], ta_head: u32, fs_head: u32, flights: Vec<Flight> }
-    struct Flight { computes: u32, compute_pipe: u8, c_start: u32, head: u32, ta_start: u32, ta_head: u32, fs_start: u32, fs_head: u32, rec: [u32; 3], chan_settled: bool }
+    struct Engine { head: [u32; hw::sizes::COMPUTE_PIPES], ta_head: [u32; hw::sizes::RENDER_PAIRS], fs_head: [u32; hw::sizes::RENDER_PAIRS], flights: Vec<Flight> }
+    struct Flight { computes: u32, compute_pipe: u8, render_pair: u8, c_start: u32, head: u32, ta_start: u32, ta_head: u32, fs_start: u32, fs_head: u32, rec: [u32; 3], chan_settled: bool }
     struct Firmware { init: Init, channels: Channels, engine: Engine }
     mod inner {
         use super::*;
@@ -561,7 +618,7 @@ mod queue_proof {
                     ta: Pipe { read: 7, completion: 7, write: 7 },
                     fs: Pipe { read: 9, completion: 9, write: 9 },
                 },
-                engine: Engine { head: { let mut h = [0u32; hw::sizes::COMPUTE_PIPES]; h[0] = 10; h[1] = 12; h }, ta_head: 20, fs_head: 30, flights: vec![] },
+                engine: Engine { head: { let mut h = [0u32; hw::sizes::COMPUTE_PIPES]; h[0] = 10; h[1] = 12; h }, ta_head: [20; hw::sizes::RENDER_PAIRS], fs_head: [30; hw::sizes::RENDER_PAIRS], flights: vec![] },
             };
             let mut state = Object::default();
             let mut info = Object::default();
@@ -596,16 +653,16 @@ mod queue_proof {
             assert_eq!(fw.queue_ring_receipt(&state, &info, 12), Ok(true));
             assert_eq!(fw.channel_receipt(Channel::Compute, 5, false), Ok(false));
             assert_eq!(fw.channel_receipt(Channel::Compute, 5, true), Ok(true));
-            let f_p1 = Flight { computes: 1, compute_pipe: 1, c_start: 10, head: 11, ta_start: 0, ta_head: 1, fs_start: 0, fs_head: 1, rec: [1, 1, 5], chan_settled: false };
+            let f_p1 = Flight { render_pair: 0, computes: 1, compute_pipe: 1, c_start: 10, head: 11, ta_start: 0, ta_head: 1, fs_start: 0, fs_head: 1, rec: [1, 1, 5], chan_settled: false };
             assert_eq!(fw.queue_ring_passed(Channel::Compute, &state, &info, &f_p1), Ok(true));
             state.set(qstate::READ, 10);
             assert_eq!(fw.queue_ring_passed(Channel::Compute, &state, &info, &f_p1), Ok(false));
             assert_eq!(info.reads.get(), 0);
 
             // queue_passed with queued work behind flight (including wrap-around) never reads qinfo.
-            fw.engine.ta_head = 2;
+            fw.engine.ta_head[0] = 2;
             fw.channels.ta = Pipe { read: 2, completion: 2, write: 3 };
-            let f = Flight { computes: 0, compute_pipe: 0, c_start: 0, head: 10, ta_start: 254, ta_head: 0, fs_start: 0, fs_head: 1, rec: [1, 1, 5], chan_settled: false };
+            let f = Flight { render_pair: 0, computes: 0, compute_pipe: 0, c_start: 0, head: 10, ta_start: 254, ta_head: 0, fs_start: 0, fs_head: 1, rec: [1, 1, 5], chan_settled: false };
             state.set(qstate::READ, 1);
             assert_eq!(fw.queue_passed(Channel::Ta, &state, &info, &f), Ok(true));
             assert_eq!(info.reads.get(), 0);
@@ -633,9 +690,10 @@ mod queue_proof {
                 },
                 engine: Engine {
                     head: [0u32; hw::sizes::COMPUTE_PIPES],
-                    ta_head: 0,
-                    fs_head: 0,
+                    ta_head: [0; hw::sizes::RENDER_PAIRS],
+                    fs_head: [0; hw::sizes::RENDER_PAIRS],
                     flights: vec![Flight {
+                        render_pair: 0,
                         computes: 1,
                         compute_pipe: 0,
                         c_start: 0,

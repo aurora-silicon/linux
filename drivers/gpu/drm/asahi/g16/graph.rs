@@ -293,26 +293,41 @@ struct RenderGraphSession {
     registration_barrier: Arc<FwObject>,
 }
 impl RenderGraphSession {
-    fn new(o: &mut Objects, context: Arc<FwObject>) -> Result<Self> {
+    /// Pairs after the first share `first`'s `legacy_empty` and `registration_barrier`: the
+    /// shared scheduling context registers once, through pair 0.
+    fn new(
+        o: &mut Objects,
+        context: Arc<FwObject>,
+        first: Option<&RenderGraphSession>,
+    ) -> Result<Self> {
+        // Pair 0 keeps the allocation order of the single render graph.
+        let ta = QueueSession::new(o)?;
+        let fs = QueueSession::new(o)?;
+        let notifier = alloc(o, 0x1000, Class::Fw, None, 0, false)?;
+        let threshold = alloc(o, 24, Class::Fw, None, 0, false)?;
+        let job_list = [
+            alloc(o, job_list::SIZE, graph_fw(), None, 0, false)?,
+            alloc(o, job_list::SIZE, graph_fw(), None, 0, false)?,
+        ];
+        let (legacy_empty, registration_barrier) = match first {
+            Some(first) => (
+                first.legacy_empty.clone(),
+                first.registration_barrier.clone(),
+            ),
+            None => (
+                alloc(o, 0x40, Class::Shared, None, 0, false)?,
+                alloc(o, super::fw::work::barrier::SIZE, cmd_fw(), None, 0, false)?,
+            ),
+        };
         Ok(Self {
-            ta: QueueSession::new(o)?,
-            fs: QueueSession::new(o)?,
+            ta,
+            fs,
             sched_ctx: context,
-            notifier: alloc(o, 0x1000, Class::Fw, None, 0, false)?,
-            threshold: alloc(o, 24, Class::Fw, None, 0, false)?,
-            job_list: [
-                alloc(o, job_list::SIZE, graph_fw(), None, 0, false)?,
-                alloc(o, job_list::SIZE, graph_fw(), None, 0, false)?,
-            ],
-            legacy_empty: alloc(o, 0x40, Class::Shared, None, 0, false)?,
-            registration_barrier: alloc(
-                o,
-                super::fw::work::barrier::SIZE,
-                cmd_fw(),
-                None,
-                0,
-                false,
-            )?,
+            notifier,
+            threshold,
+            job_list,
+            legacy_empty,
+            registration_barrier,
         })
     }
     fn finish(self, rings: &mut Objects) -> Result<RenderGraph> {
@@ -337,7 +352,7 @@ impl RenderGraphSession {
 impl RenderGraph {
     #[allow(dead_code)]
     fn new(o: &mut Objects, rings: &mut Objects, context: Arc<FwObject>) -> Result<Self> {
-        RenderGraphSession::new(o, context)?.finish(rings)
+        RenderGraphSession::new(o, context, None)?.finish(rings)
     }
     fn init(&self, abi: FwAbi) -> Result {
         init_notifier(&self.notifier, &self.threshold)?;
@@ -362,13 +377,14 @@ impl RenderGraph {
 /// [`Factory::persistent_objects_probe`] pool.
 pub(crate) struct GraphSession {
     compute: KVec<ComputeGraphSession>,
-    render: RenderGraphSession,
+    render: KVec<RenderGraphSession>,
 }
 
 pub(crate) struct Graphs {
     pub(crate) dev: ARef<device::Device>,
     pub(crate) compute: KVec<ComputeGraph>,
-    pub(crate) render: RenderGraph,
+    /// TA/FS render queue pairs `0..RENDER_PAIRS`.
+    pub(crate) render: KVec<RenderGraph>,
     /// Owns the firmware-cached work rings for the device lifetime (never dropped).
     _ring_objects: core::mem::ManuallyDrop<Objects>,
 }
@@ -382,7 +398,12 @@ impl Graphs {
         for _ in 0..sizes::COMPUTE_PIPES {
             compute.push(ComputeGraphSession::new(o, sched_ctx.clone())?, GFP_KERNEL)?;
         }
-        let render = RenderGraphSession::new(o, sched_ctx)?;
+        let mut render: KVec<RenderGraphSession> =
+            KVec::with_capacity(sizes::RENDER_PAIRS, GFP_KERNEL)?;
+        for _ in 0..sizes::RENDER_PAIRS {
+            let pair = RenderGraphSession::new(o, sched_ctx.clone(), render.first())?;
+            render.push(pair, GFP_KERNEL)?;
+        }
         Ok(GraphSession { compute, render })
     }
 
@@ -398,7 +419,10 @@ impl Graphs {
         for c in session.compute {
             compute.push(c.finish(&mut ring_objects)?, GFP_KERNEL)?;
         }
-        let render = session.render.finish(&mut ring_objects)?;
+        let mut render = KVec::with_capacity(sizes::RENDER_PAIRS, GFP_KERNEL)?;
+        for r in session.render {
+            render.push(r.finish(&mut ring_objects)?, GFP_KERNEL)?;
+        }
         ring_objects.finish_private()?;
         Ok(Self {
             dev: dev.as_ref().as_ref().into(),
@@ -419,7 +443,9 @@ impl Firmware {
         for (pipe, compute) in self.graph.compute.iter().enumerate() {
             compute.init(self.init.abi, pipe == 0)?;
         }
-        self.graph.render.init(self.init.abi)?;
+        for render in self.graph.render.iter() {
+            render.init(self.init.abi)?;
+        }
         self.slots.init()?;
         self.init_render_pools(false)?;
         super::engine::wmb();
