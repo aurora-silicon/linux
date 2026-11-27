@@ -1,0 +1,80 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * The T6050 Neural Engine (ane0 in t6050-peripherals.dtsi), for any board
+ * that includes this after t6050-peripherals.dtsi. iBoot preloads the
+ * personalized firmware (ADT ane0 segment-ranges, TEXT 0xc0000 and DATA
+ * 0x2ac000 bytes). The boot loader fills the two reservations from that
+ * boot's ADT, renames them to their physical addresses and enables them; a
+ * boot without that hand-off leaves ane0 disabled, and the ANE driver leaves
+ * the engine off unless the preloaded firmware is one it knows.
+ *
+ * This describes die 0's engine only. The second die of an M5 Ultra has its
+ * own engine, DARTs and power state, which are not described yet.
+ */
+
+#ifndef __T6050_ANE_DTSI__
+#define __T6050_ANE_DTSI__
+
+/ {
+	reserved-memory {
+		ane_fw_text: ane-firmware-text@0 {
+			compatible = "apple,asc-mem";
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+
+		ane_fw_data: ane-firmware-data@0 {
+			compatible = "apple,asc-mem";
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+	};
+};
+
+&ane0 {
+	memory-region = <&ane_fw_text>, <&ane_fw_data>;
+	memory-region-names = "firmware-text", "firmware-data";
+	status = "okay";
+};
+
+&ane0_dart {
+	status = "okay";
+};
+
+&ane0_dart1 {
+	status = "okay";
+};
+
+&ane0_dart2 {
+	status = "okay";
+};
+
+&ps_ane_sys {
+	status = "okay";
+};
+
+/*
+ * ANE_SYS's parents in the ADT power tree are FAB8_SOC and FAB9_SOC, and
+ * FAB8_SOC's is FAB0_PIOGW. The firmware keeps these fabrics up (the Secure
+ * Enclave and the camera sit behind them too), so Linux only holds a vote on
+ * them and never switches them. A board that already enables them for its
+ * Secure Enclave or camera ends up with the same nodes.
+ */
+&ps_fab0_piogw {
+	apple,firmware-owned;
+	status = "okay";
+};
+
+&ps_fab8_soc {
+	apple,firmware-owned;
+	status = "okay";
+};
+
+&ps_fab9_soc {
+	apple,firmware-owned;
+	status = "okay";
+};
+
+#endif /* __T6050_ANE_DTSI__ */

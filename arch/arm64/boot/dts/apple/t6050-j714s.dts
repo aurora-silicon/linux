@@ -761,7 +761,7 @@
 #include "t6050-j714s-dpaudio.dtsi"
 
 /* The Neural Engine, started only after the boot loader's preload hand-off */
-#include "t6050-j714s-ane.dtsi"
+#include "t6050-ane.dtsi"
 /*
  * The port controllers: the sleep's command rules, a reset and more probe tries after a failed
  * probe, and for the USB-C ports LOCK's key, the board number reversed ("417J"; their debug mode
