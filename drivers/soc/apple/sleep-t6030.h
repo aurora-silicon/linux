@@ -3675,6 +3675,99 @@ static void t6030_eng_probe(struct apple_sleep *s)
 }
 
 /*
+ * DIAGNOSTIC: the ADT wdt's reconfig watchdog (reconfig-wdog-support): 0x3642b8008/+0xc/+0x20 and
+ * 0x3642bc220. XNU writes 0x3642b8008 = 0 at boot, 7 us after WD1's control = 0; Linux never
+ * touches them. The boot record reads all four; apple_sleep.wdt_reconfig_zero=1 also writes
+ * XNU's 0 to 0x3642b8008 if it isn't 0 (logged before and after).
+ */
+#define T6030_WDT_RECONFIG		0x8
+#define T6030_WDT_RECONFIG_PA2		0x3642bc000ULL
+#define T6030_WDT_RECONFIG2		0x220
+static bool t6030_wdt_reconfig_zero;
+module_param_named(wdt_reconfig_zero, t6030_wdt_reconfig_zero, bool, 0444);
+MODULE_PARM_DESC(wdt_reconfig_zero, "T6030 DIAGNOSTIC: at probe, XNU's 0x3642b8008 = 0 (the reconfig watchdog), if it isn't 0");
+
+static void t6030_wdt_reconfig_probe(struct apple_sleep *s)
+{
+	void __iomem *p2 = t6030_eng_map(s, T6030_WDT_RECONFIG_PA2);
+	u32 v;
+
+	if (!t6030_eng_step)
+		return;
+	v = readl(t6030_eng_step + T6030_WDT_RECONFIG);
+	dev_info(s->dev, "boot engine: reconfig wdog 0x3642b8008 %#x +0xc %#x +0x20 %#x, 0x3642bc220 %#x\n",
+		 v, readl(t6030_eng_step + 0xc), readl(t6030_eng_step + 0x20),
+		 p2 ? readl(p2 + T6030_WDT_RECONFIG2) : ~0U);
+	if (READ_ONCE(t6030_wdt_reconfig_zero) && v) {
+		writel(0, t6030_eng_step + T6030_WDT_RECONFIG);
+		dev_info(s->dev, "wdt_reconfig_zero: 0x3642b8008 %#x -> %#x\n", v,
+			 readl(t6030_eng_step + T6030_WDT_RECONFIG));
+	}
+}
+
+/*
+ * DIAGNOSTIC: T6030's other PMICs (it has four): nub-spmi0 SID 9 (spitfireE1, has-fw,
+ * function-suspend_helper = pmgr:S2RT()) and nub-spmi1 SID 8 (spitfireE2): 0x200-0x201, the fault
+ * log 0x1000 (4 B), 0x2808, 0x2860; and chapelF1 (nub-spmi1 SID 0xb) 0x201. Read commands only;
+ * pmic_dump=1 logs them now. (SID 0xf, the group address the engine's command uses, isn't read:
+ * a group read could have several PMICs answer.)
+ */
+#define T6030_PMIC_SPITFIRE_E1		9
+#define T6030_PMIC_SPITFIRE_E2		8
+
+static int t6030_pmic_rd(void __iomem *spmi, u8 usid, u16 reg, u8 *buf, unsigned int len)
+{
+	u32 runtime;
+	int ret;
+
+	if (!spmi)
+		return -ENODEV;
+	runtime = readl(spmi + SPMI_NOTIFY_ENABLE);
+	ret = t6030_spmi_xfer(spmi, usid, runtime & ~T6030_SPMI_DONE, T6050_SPMI_EXT_READL, reg,
+			      NULL, buf, len);
+	writel(runtime, spmi + SPMI_NOTIFY_ENABLE);
+	return ret;
+}
+
+static void t6030_pmic_report(struct apple_sleep *s, void __iomem *spmi, const char *bus, u8 usid)
+{
+	u8 st[2] = {}, fault[4] = {}, a = 0, b = 0;
+	int r0, r1, r2, r3;
+
+	r0 = t6030_pmic_rd(spmi, usid, 0x200, st, 2);
+	r1 = t6030_pmic_rd(spmi, usid, 0x1000, fault, 4);
+	r2 = t6030_pmic_rd(spmi, usid, 0x2808, &a, 1);
+	r3 = t6030_pmic_rd(spmi, usid, 0x2860, &b, 1);
+	dev_info(s->dev, "pmic %s SID %u: 0x200/0x201 %02x %02x (%d), 0x1000 %4ph (%d), 0x2808 %02x (%d), 0x2860 %02x (%d)\n",
+		 bus, usid, st[0], st[1], r0, fault, r1, a, r2, b, r3);
+}
+
+static int t6030_pmic_dump_set(const char *val, const struct kernel_param *kp)
+{
+	struct apple_sleep *s = apple_sleep;
+	u8 f1 = 0;
+	int r;
+
+	if (!s || !s->spmi)
+		return -ENODEV;
+	t6030_pmic_report(s, s->spmi, "nub-spmi0", T6030_PMIC_SPITFIRE_E1);
+	if (!t6030_spmi1_base) {
+		dev_info(s->dev, "pmic nub-spmi1: not mapped (apple_sleep.spmi1=1)\n");
+		return 0;
+	}
+	t6030_pmic_report(s, t6030_spmi1_base, "nub-spmi1", T6030_PMIC_SPITFIRE_E2);
+	r = t6030_pmu2_read(0x201, &f1, 1);
+	dev_info(s->dev, "pmic nub-spmi1 SID %u (chapelF1): 0x201 %02x (%d)\n", T6030_PMU2_USID, f1, r);
+	return 0;
+}
+
+static const struct kernel_param_ops t6030_pmic_dump_ops = {
+	.set = t6030_pmic_dump_set,
+};
+module_param_cb(pmic_dump, &t6030_pmic_dump_ops, NULL, 0200);
+MODULE_PARM_DESC(pmic_dump, "T6030 DIAGNOSTIC: log the other PMICs' state words now (reads only)");
+
+/*
  * The sleep program's markers as this boot found them, before anything writes them: if they
  * survive the reset that ended a failed sleep, they say which sequence and step it stopped in.
  * Reads only.
@@ -3717,6 +3810,7 @@ static void t6030_eng_boot_record(struct apple_sleep *s)
 			 dcs[0], dcs[1], dcs[2], dcs[3], dcs[4], dcs[5], dcs[6], dcs[7], dcs[8],
 			 dcs[9], dcs[10], dcs[11]);
 	}
+	t6030_wdt_reconfig_probe(s);
 	if (t6030_eng_flag) {
 		char buf[T6030_PST_WORDS * 9 + 1];
 		unsigned int n = 0;

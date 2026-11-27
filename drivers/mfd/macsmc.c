@@ -615,6 +615,7 @@ MODULE_PARM_DESC(smc_cold_init, "T6030 DIAGNOSTIC: boot the SMC's RTKit from IOP
 #define SMC_LITE_CRASHLOG_ECHO	0x001040036de6c000ULL
 #define SMC_LITE_EP3_MSG	0x0008000000000000ULL
 static bool smc_lite;
+static struct apple_smc *apple_smc_lite_smc;
 module_param(smc_lite, bool, 0444);
 MODULE_PARM_DESC(smc_lite, "T6030 DIAGNOSTIC: after the usual SMC wake, start its system endpoints 1-4 if listed and write macOS's one-time keys (no INIT)");
 
@@ -665,6 +666,29 @@ static void apple_smc_cold_keys(struct apple_smc *smc)
 	ret = apple_smc_write(smc, SMC_KEY(CHLS), chls, sizeof(chls));
 	dev_info(smc->dev, "smc_cold_init: CHLS = 0000: %d\n", ret);
 }
+
+/*
+ * DIAGNOSTIC (T6030): gp19_off=1 writes gP19 (smc_gpio 25, the SD card reader's power on J516s)
+ * = 00000000 now, macOS's write 90 s before its commit (it had written 01000000 at boot).
+ */
+static int apple_smc_gp19_off_set(const char *val, const struct kernel_param *kp)
+{
+	struct apple_smc *smc = apple_smc_lite_smc;
+	u8 zero[4] = {};
+	int ret;
+
+	if (!smc)
+		return -ENODEV;
+	ret = apple_smc_write(smc, SMC_KEY(gP19), zero, sizeof(zero));
+	dev_info(smc->dev, "gp19_off: gP19 = 00000000: %d\n", ret);
+	return ret;
+}
+
+static const struct kernel_param_ops apple_smc_gp19_off_ops = {
+	.set = apple_smc_gp19_off_set,
+};
+module_param_cb(gp19_off, &apple_smc_gp19_off_ops, NULL, 0200);
+MODULE_PARM_DESC(gp19_off, "T6030 DIAGNOSTIC: write macOS's gP19 = 00000000 (SD reader power) now");
 
 static void apple_smc_rtkit_shutdown(void *data)
 {
@@ -891,6 +915,7 @@ static int apple_smc_probe(struct platform_device *pdev)
 
 	if (smc_cold_init || smc_lite)
 		apple_smc_cold_keys(smc);
+	apple_smc_lite_smc = smc;
 
 	if (smc->sleep_pmvc_set)
 		apple_smc_sleep_pmvc_report(smc);
