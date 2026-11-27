@@ -1124,6 +1124,26 @@ unlock:
 static void hub_init_func2(struct work_struct *ws);
 static void hub_init_func3(struct work_struct *ws);
 
+/*
+ * Whether every port the hub powers still reports its power on. Setting PORT_POWER on such a
+ * port starts no power-on sequence, so there is no PwrOn2PwrGood time to wait for; a port
+ * that reports its power off, or whose status can't be read, still gets the full wait.
+ */
+static bool hub_ports_kept_power(struct usb_hub *hub)
+{
+	u16 portstatus, portchange;
+	int port1;
+
+	for (port1 = 1; port1 <= hub->hdev->maxchild; port1++) {
+		if (!test_bit(port1, hub->power_bits))
+			continue;
+		if (usb_hub_port_status(hub, port1, &portstatus, &portchange) ||
+		    !usb_port_is_power_on(hub, portstatus))
+			return false;
+	}
+	return true;
+}
+
 static void hub_activate(struct usb_hub *hub, enum hub_activation_type type)
 {
 	struct usb_device *hdev = hub->hdev;
@@ -1210,7 +1230,7 @@ static void hub_activate(struct usb_hub *hub, enum hub_activation_type type)
 						"LS/FS devices and hubs may not work under this hub\n");
 				}
 			}
-			hub_power_on(hub, true);
+			hub_power_on(hub, !hub_ports_kept_power(hub));
 		} else {
 			hub_power_on(hub, true);
 		}
