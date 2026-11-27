@@ -20,4 +20,8 @@ int asahi_g17_signals_publish(struct asahi_g17_signal_bundle *bundle,
 			      struct dma_fence *submitted, bool compute_only);
 void asahi_g17_signals_fail(struct asahi_g17_signal_bundle *bundle,
 			    struct dma_fence *failure);
+#ifdef CONFIG_KUNIT
+void asahi_g17_kunit_raise_sigterm(void);
+void asahi_g17_kunit_clear_sigterm(void);
+#endif
 #endif

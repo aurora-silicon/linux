@@ -23,6 +23,19 @@ impl SyncObj {
         self.ptr
     }
 
+    /// Creates an empty sync object for KUnit tests.
+    #[cfg(CONFIG_KUNIT = "y")]
+    pub fn new_kunit() -> Result<SyncObj> {
+        let mut ptr = core::ptr::null_mut();
+        // SAFETY: `ptr` is valid for writing the created sync object pointer.
+        let ret = unsafe { bindings::drm_syncobj_create(&mut ptr, 0, core::ptr::null_mut()) };
+        if ret != 0 {
+            Err(Error::from_errno(ret))
+        } else {
+            Ok(SyncObj { ptr })
+        }
+    }
+
     /// Looks up a sync object by its handle for a given `File`.
     pub fn lookup_handle<T: drm::file::DriverFile>(
         file: &drm::File<T>,
