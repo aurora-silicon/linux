@@ -389,6 +389,8 @@ static void t6030_last_pmu_boot(struct apple_sleep *s);
 static void t6030_spmi1_probe(struct apple_sleep *s);
 static void t6030_pmu_boot_record(struct apple_sleep *s);
 static void t6030_pwrgate_boot(struct apple_sleep *s);
+static void t6030_cpm_probe(struct apple_sleep *s);
+static void t6030_cpm_entry(void);
 static void t6030_eng_probe(struct apple_sleep *s);
 static void t6030_eng_boot_record(struct apple_sleep *s);
 static void t6030_dbgprcr_report(struct apple_sleep *s);
@@ -471,6 +473,7 @@ static int t6030_sleep_map_regs(struct apple_sleep *s)
 	t6030_dbgprcr_report(s);
 	t6030_pmu_boot_record(s);
 	t6030_pwrgate_boot(s);
+	t6030_cpm_probe(s);
 	if (t6030_mem_config_boot_on())
 		t6030_mem_config_apply(s);
 	if (t6030_last_writes_on())
@@ -675,6 +678,152 @@ static int t6030_pmu_xfer(struct apple_sleep *s, u32 mask, u8 opcode, u16 addres
 #define T6030_PMU_OFF2WAKE		0x281c
 /* The register the sleep program's PMU commands write: D2C 1, C2S 2; at the wake S2C 1, C2D 0 */
 #define T6030_PMU_PSTATE		0x200
+
+/*
+ * DIAGNOSTIC (T6030 sleep bring-up): the two clusters' CPMs (cpm-impl, E 0x210e40000, P
+ * 0x211e40000, 0xc000 each), which macOS 27.2 configures and Linux never touched (lane A,
+ * mac-cpm-1: every AP access to both across a boot, a sleep and a wake). About 0.3 s into XNU,
+ * and again after the wake: +0x8000/+0x8008 = 0, +0x8080 written back, +0x40f8 = 1, bit 63 set
+ * on +0x8400/+0x8408/+0x0270/+0x0250, an 11-entry table at +0x4018..+0x40b8, and
+ * +0x4180..+0x41b8 (+0x4190 = 0xffffffff, +0x41b0 = 0x6665, +0x4180 = 3 last); iBoot leaves
+ * those 0. 3.5 ms before the commit: +0x8080 = 0, then bit 63 off again on the four. 64-bit
+ * registers. The probe logs every one of them; apple_sleep.cpm_macos=1 makes macOS's writes, in
+ * its order, at probe and before apple,seq-commit (whose pwrgate +0xc0/+0xc8 writes macOS
+ * interleaves them with). Only these offsets are touched; never the coresight or impl windows.
+ */
+#define T6030_CPM_E_PA			0x210e40000ULL
+#define T6030_CPM_P_PA			0x211e40000ULL
+#define T6030_CPM_SIZE			0xc000
+#define T6030_CPM_CNT0			0x8000
+#define T6030_CPM_CNT1			0x8008
+#define T6030_CPM_CTL			0x8080
+#define T6030_CPM_ENA			0x40f8
+#define T6030_CPM_B63_0			0x8400
+#define T6030_CPM_B63_1			0x8408
+#define T6030_CPM_B63_2			0x0270
+#define T6030_CPM_B63_3			0x0250
+#define T6030_CPM_TABLE			0x4018
+#define T6030_CPM_TABLE_STRIDE		0x10
+#define T6030_CPM_CFG			0x4180
+#define T6030_CPM_B63			BIT_ULL(63)
+
+static bool t6030_cpm_macos;
+module_param_named(cpm_macos, t6030_cpm_macos, bool, 0444);
+MODULE_PARM_DESC(cpm_macos, "T6030 DIAGNOSTIC: macOS's CPM writes at boot and before the commit");
+
+static void __iomem *t6030_cpm[2];
+
+static const u16 t6030_cpm_table[] = {
+	0x8a0f, 0x800f, 0x8c0f, 0x9c0f, 0x9e0f, 0x810f, 0xb90f, 0xbe0f, 0xbf0f, 0xd40f, 0x980f,
+};
+/* +0x4180..+0x41b8 in macOS's order, then +0x4180 = 3 */
+static const u32 t6030_cpm_cfg[] = { 0, 0, 0xffffffff, 0, 0, 0, 0x6665, 0 };
+#define T6030_CPM_CFG_ON		3
+
+static void t6030_cpm_log(struct apple_sleep *s, const char *when)
+{
+	static const u16 regs[] = {
+		T6030_CPM_B63_3, T6030_CPM_B63_2, T6030_CPM_ENA, T6030_CPM_CNT0, T6030_CPM_CNT1,
+		T6030_CPM_CTL, T6030_CPM_B63_0, T6030_CPM_B63_1,
+	};
+	u64 v[ARRAY_SIZE(regs)], tbl[ARRAY_SIZE(t6030_cpm_table)], cfg[ARRAY_SIZE(t6030_cpm_cfg)];
+	unsigned int c, i;
+
+	for (c = 0; c < 2; c++) {
+		if (!t6030_cpm[c])
+			continue;
+		for (i = 0; i < ARRAY_SIZE(regs); i++)
+			v[i] = readq(t6030_cpm[c] + regs[i]);
+		for (i = 0; i < ARRAY_SIZE(tbl); i++)
+			tbl[i] = readq(t6030_cpm[c] + T6030_CPM_TABLE + T6030_CPM_TABLE_STRIDE * i);
+		for (i = 0; i < ARRAY_SIZE(cfg); i++)
+			cfg[i] = readq(t6030_cpm[c] + T6030_CPM_CFG + 8 * i);
+		dev_info(s->dev, "CPM %c at %s: 0250 %#llx 0270 %#llx 40f8 %#llx 8000 %#llx 8008 %#llx 8080 %#llx 8400 %#llx 8408 %#llx\n",
+			 c ? 'P' : 'E', when, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+		dev_info(s->dev, "CPM %c at %s: 4018.. %llx %llx %llx %llx %llx %llx %llx %llx %llx %llx %llx | 4180.. %llx %llx %llx %llx %llx %llx %llx %llx\n",
+			 c ? 'P' : 'E', when, tbl[0], tbl[1], tbl[2], tbl[3], tbl[4], tbl[5], tbl[6],
+			 tbl[7], tbl[8], tbl[9], tbl[10], cfg[0], cfg[1], cfg[2], cfg[3], cfg[4],
+			 cfg[5], cfg[6], cfg[7]);
+	}
+}
+
+static void t6030_cpm_b63(unsigned int c, u16 off, bool on)
+{
+	u64 v = readq(t6030_cpm[c] + off);
+
+	writeq(on ? v | T6030_CPM_B63 : v & ~T6030_CPM_B63, t6030_cpm[c] + off);
+}
+
+/* macOS's boot writes, both clusters, in its order */
+static void t6030_cpm_boot_writes(void)
+{
+	unsigned int c, i;
+
+	for (c = 0; c < 2; c++) {
+		writeq(0, t6030_cpm[c] + T6030_CPM_CNT0);
+		writeq(0, t6030_cpm[c] + T6030_CPM_CNT1);
+		writeq(readq(t6030_cpm[c] + T6030_CPM_CTL), t6030_cpm[c] + T6030_CPM_CTL);
+		writeq(1, t6030_cpm[c] + T6030_CPM_ENA);
+	}
+	for (c = 0; c < 2; c++) {
+		t6030_cpm_b63(c, T6030_CPM_B63_0, true);
+		t6030_cpm_b63(c, T6030_CPM_B63_1, true);
+	}
+	for (c = 0; c < 2; c++)
+		t6030_cpm_b63(c, T6030_CPM_B63_2, true);
+	for (c = 0; c < 2; c++)
+		t6030_cpm_b63(c, T6030_CPM_B63_3, true);
+	for (c = 0; c < 2; c++) {
+		writeq(1, t6030_cpm[c] + T6030_CPM_ENA);
+		for (i = 0; i < ARRAY_SIZE(t6030_cpm_table); i++)
+			writeq(t6030_cpm_table[i],
+			       t6030_cpm[c] + T6030_CPM_TABLE + T6030_CPM_TABLE_STRIDE * i);
+	}
+	for (c = 0; c < 2; c++) {
+		for (i = 0; i < ARRAY_SIZE(t6030_cpm_cfg); i++)
+			writeq(t6030_cpm_cfg[i], t6030_cpm[c] + T6030_CPM_CFG + 8 * i);
+		writeq(T6030_CPM_CFG_ON, t6030_cpm[c] + T6030_CPM_CFG);
+	}
+}
+
+static void t6030_cpm_probe(struct apple_sleep *s)
+{
+	struct resource res;
+	static const u64 pa[2] = { T6030_CPM_E_PA, T6030_CPM_P_PA };
+	unsigned int c;
+
+	for (c = 0; c < 2; c++) {
+		res = (struct resource)DEFINE_RES_MEM(pa[c], T6030_CPM_SIZE);
+		res.flags |= IORESOURCE_MEM_NONPOSTED;
+		t6030_cpm[c] = apple_sleep_ioremap(s->dev, &res);
+		if (!t6030_cpm[c])
+			return;
+	}
+	t6030_cpm_log(s, "probe");
+	if (!READ_ONCE(t6030_cpm_macos))
+		return;
+	t6030_cpm_boot_writes();
+	t6030_cpm_log(s, "probe, after macOS's writes");
+}
+
+/* macOS's entry writes, 3.5 ms before its commit: +0x8080 = 0, then bit 63 off on the four */
+static void t6030_cpm_entry(void)
+{
+	unsigned int c;
+
+	if (!READ_ONCE(t6030_cpm_macos) || !t6030_cpm[0] || !t6030_cpm[1])
+		return;
+	for (c = 0; c < 2; c++)
+		writeq(0, t6030_cpm[c] + T6030_CPM_CTL);
+	for (c = 0; c < 2; c++)
+		t6030_cpm_b63(c, T6030_CPM_B63_3, false);
+	for (c = 0; c < 2; c++)
+		t6030_cpm_b63(c, T6030_CPM_B63_2, false);
+	for (c = 0; c < 2; c++) {
+		t6030_cpm_b63(c, T6030_CPM_B63_0, false);
+		t6030_cpm_b63(c, T6030_CPM_B63_1, false);
+	}
+}
 
 /*
  * DIAGNOSTIC (T6030 sleep bring-up): the cluster power-gate enables in pmgr[28] ("pwrgate").
@@ -2171,6 +2320,7 @@ static void t6030_sleep_commit_regs(struct apple_sleep *s)
 	t->auto_staged = true;
 	sleep_seq_save(t->blk, &t->wake_early);
 	sleep_seq_save(t->blk, &t->wake);
+	t6030_cpm_entry();
 	if (sleep_seq_run_strict(t->blk, &t->commit))
 		t6030_sleep_failed("apple,seq-commit");
 	/* Every listed word as the commit leaves it, for the wake's report */
