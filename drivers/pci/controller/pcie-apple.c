@@ -709,6 +709,9 @@ struct apple_pcie_port {
 	/* Conventional port: link up when the sleep began, and found down after it */
 	bool			hib_link_up;
 	bool			hib_cold;
+	/* Set up again after the sleep: its link keeps L1.2 off from then on */
+	bool			hib_retrained;
+	bool			l1_2_off;
 	bool			started;
 	bool			needs_stop;
 	bool			link_failed;
@@ -7937,12 +7940,58 @@ static void apple_pcie_hib_ports_up_noirq(struct apple_pcie *pcie)
 				port->np, ret);
 		else
 			dev_info(pcie->dev, "S2R: %pOF link back before its functions resume\n", port->np);
+		port->hib_retrained = !ret;
 		port->hib_cold = false;
 	}
 	apple_pcie_hib_free_fns(pcie);
 }
 
 /* The normal phase, after the SMC (the PWREN GPIOs are its) and before the functions. */
+/*
+ * At boot the bootloader sets the root ports up, and the host has no copy of all of
+ * that to put back after a sleep took the complex's power: a port set up again reads
+ * its link capabilities as the hardware's defaults. The L1.2 exit on such a link isn't
+ * reliable: the J616s' SD reader, idling into L1.2 after it, hangs the next suspend
+ * when its driver touches it. Keep L1.2 off on the links set up again. L1, L1.1 and
+ * Clock PM stay as they were.
+ */
+static int apple_pcie_hib_no_l1_2(struct pci_dev *pdev, void *data)
+{
+	struct apple_pcie_port *port;
+	int ret;
+
+	if (pci_is_root_bus(pdev->bus) || !pci_is_pcie(pdev) || !pdev->bus->self ||
+	    !pci_is_root_bus(pdev->bus->self->bus))
+		return 0;
+	port = apple_pcie_get_port(pdev);
+	if (!port || !port->hib_retrained || port->l1_2_off)
+		return 0;
+	ret = pci_disable_link_state_locked(pdev, PCIE_LINK_STATE_L1_2 |
+					    PCIE_LINK_STATE_L1_2_PCIPM);
+	if (!ret)
+		pci_info(pdev, "S2R: L1.2 off on the link set up again\n");
+	else if (ret != -EINVAL)
+		pci_warn(pdev, "S2R: cannot turn L1.2 off: %d\n", ret);
+	return 0;
+}
+
+static void apple_pcie_hib_links_no_l1_2(struct apple_pcie *pcie)
+{
+	struct pci_host_bridge *bridge = pci_host_bridge_from_priv(pcie);
+	struct apple_pcie_port *port;
+	bool any = false;
+
+	list_for_each_entry(port, &pcie->ports, entry)
+		any |= port->hib_retrained && !port->l1_2_off;
+	if (any && bridge->bus)
+		pci_walk_bus(bridge->bus, apple_pcie_hib_no_l1_2, pcie);
+	list_for_each_entry(port, &pcie->ports, entry) {
+		if (port->hib_retrained)
+			port->l1_2_off = true;
+		port->hib_retrained = false;
+	}
+}
+
 static int apple_pcie_resume(struct device *dev)
 {
 	struct apple_pcie *pcie = apple_pcie_lookup(dev);
@@ -7981,6 +8030,7 @@ static int apple_pcie_resume(struct device *dev)
 			continue;
 		}
 		apple_pcie_port_enable_irq(port);
+		port->hib_retrained = true;
 		dev_info(dev, "S2R: %pOF link back, PWREN and PERST# cycled as at probe\n",
 			 port->np);
 	}
@@ -8002,6 +8052,7 @@ static int apple_pcie_resume(struct device *dev)
 	apple_pcie_hib_free_fns(pcie);
 	list_for_each_entry(port, &pcie->ports, entry)
 		port->hib_cold = false;
+	apple_pcie_hib_links_no_l1_2(pcie);
 	return 0;
 }
 
