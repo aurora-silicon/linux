@@ -60,7 +60,7 @@
 	led-controller {
 		compatible = "pwm-leds";
 
-		led-0 {
+		kbd_led: led-0 {
 			pwms = <&fpwm1 0 40000>;
 			label = "kbd_backlight";
 			function = LED_FUNCTION_KBD_BACKLIGHT;
@@ -140,6 +140,15 @@
 	};
 
 	stm {
+	};
+
+	/*
+	 * Force Touch: the trackpad's haptic engine, ADT
+	 * /arm-io/dockchannel-mtp/mtp-transport/actuator on every M4 laptop.
+	 * Without it the click stays firmware-driven and there is no Force
+	 * Touch stage.
+	 */
+	actuator {
 	};
 };
 

@@ -34,7 +34,7 @@ use kernel::{prelude::*, sync::Arc, xarray};
 use super::wire as uapi;
 
 use super::{gate, hw};
-use crate::{file, mmu, util::AnyBitPattern, util::Reader};
+use crate::{file, mmu, timestamp, util::AnyBitPattern, util::Reader};
 
 /// Largest command buffer.
 pub(crate) const MAX_CMDBUF: usize = 4 << 20;
@@ -135,7 +135,7 @@ pub(crate) struct Submission {
     /// Render and compute commands, for the queue's EXACT_PRIOR ordinals.
     pub(crate) counts: [u64; 2],
     /// The timestamp buffers the commands name, retained with the job.
-    pub(crate) timestamps: KVec<Arc<mmu::KernelMapping>>,
+    pub(crate) timestamps: KVec<Arc<timestamp::Bound>>,
 }
 
 /// What the per-command checks need.
@@ -146,8 +146,8 @@ pub(crate) struct Context<'a> {
     pub(crate) usc_base: u64,
 }
 
-struct CheckedContext<'a> {
-    vm: &'a mut mmu::VmReadGuard,
+struct CheckedContext<'a, 'b> {
+    vm: &'a mut mmu::VmReadGuard<'b>,
     usc_base: u64,
 }
 
@@ -158,7 +158,7 @@ pub(crate) struct Prepared<'a> {
     /// Arena VAs of each command's timestamp slots.
     resolved: KVec<[u64; 4]>,
     counts: [u64; 2],
-    timestamps: KVec<Arc<mmu::KernelMapping>>,
+    timestamps: KVec<Arc<timestamp::Bound>>,
 }
 
 /// One command of the stream.
@@ -349,7 +349,7 @@ pub(crate) fn check_stream(bytes: &[u8], early_tiling: bool) -> Result {
 /// The timestamp buffers named by a submission, resolved to firmware arena VAs.
 struct Timestamps<'a> {
     objects: Pin<&'a xarray::XArray<KBox<file::Object>>>,
-    held: KVec<Arc<mmu::KernelMapping>>,
+    held: KVec<Arc<timestamp::Bound>>,
 }
 
 impl Timestamps<'_> {
@@ -365,15 +365,15 @@ impl Timestamps<'_> {
             .get(timestamp.handle.try_into()?)
             .ok_or(ENOENT)?
             .clone();
-        let file::Object::TimestampBuffer(mapping) = object;
-        let mapping = mapping.firmware_mapping()?;
+        let file::Object::TimestampBuffer(buffer) = object;
+        let mapping = buffer.firmware_mapping()?;
         let offset = timestamp.offset as usize;
         if offset % 8 != 0 || offset >= mapping.size() || mapping.size() - offset < 8 {
             return Err(EINVAL);
         }
         let va = mapping.iova() + offset as u64;
-        if !self.held.iter().any(|held| Arc::ptr_eq(held, &mapping)) {
-            self.held.push(mapping, GFP_KERNEL)?;
+        if !self.held.iter().any(|held| Arc::ptr_eq(held, &buffer)) {
+            self.held.push(buffer, GFP_KERNEL)?;
         }
         Ok(va)
     }
@@ -383,7 +383,7 @@ impl Timestamps<'_> {
 /// GPU access: a driver range ENOENT, outside the user range EINVAL, an unmapped page ENOENT, a
 /// page without the access EACCES.
 pub(crate) fn cover(
-    vm: &mut mmu::VmReadGuard,
+    vm: &mut mmu::VmReadGuard<'_>,
     start: u64,
     end: u64,
     read: bool,
@@ -419,7 +419,7 @@ pub(crate) fn cover(
 
 /// Attachment spans, 128-byte granular, actually mapped with `write` or read access.
 fn check_attachments(
-    vm: &mut mmu::VmReadGuard,
+    vm: &mut mmu::VmReadGuard<'_>,
     list: &[uapi::drm_asahi_attachment],
     write: bool,
 ) -> Result {
@@ -482,7 +482,7 @@ fn geometry_bytes(cmd: &uapi::drm_asahi_cmd_render) -> (u64, u64) {
 }
 
 /// Per-command render admission.
-fn check_render(context: &mut CheckedContext<'_>, cmd: &uapi::drm_asahi_cmd_render) -> Result {
+fn check_render(context: &mut CheckedContext<'_, '_>, cmd: &uapi::drm_asahi_cmd_render) -> Result {
     let vm = &mut *context.vm;
     let allowed = PROCESS_EMPTY_TILES
         | NO_VERTEX_CLUSTERING
@@ -567,7 +567,7 @@ fn check_render(context: &mut CheckedContext<'_>, cmd: &uapi::drm_asahi_cmd_rend
 
 /// Per-command compute admission.
 fn check_compute(
-    context: &mut CheckedContext<'_>,
+    context: &mut CheckedContext<'_, '_>,
     cmd: &uapi::drm_asahi_cmd_compute,
     attachments: &[uapi::drm_asahi_attachment],
 ) -> Result {

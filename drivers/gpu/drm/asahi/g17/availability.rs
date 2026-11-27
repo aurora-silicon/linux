@@ -7,6 +7,7 @@
 //! lock round trip.
 
 use super::fence::{self, CompletionFence};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use kernel::{
     c_str,
     dma_fence::{Fence, FenceContexts, RawDmaFence, UserFence},
@@ -21,12 +22,13 @@ struct Entry {
 }
 
 struct State {
-    generation: u64,
     waiters: Option<KBox<Entry>>,
 }
 
 #[pin_data]
 pub(crate) struct Availability {
+    generation: AtomicU64,
+    has_waiters: AtomicBool,
     #[pin]
     state: Mutex<State>,
     fences: FenceContexts,
@@ -36,8 +38,10 @@ impl Availability {
     pub(crate) fn new() -> Result<Arc<Self>> {
         Arc::pin_init(
             try_pin_init!(Self {
+                generation: AtomicU64::new(0),
+                has_waiters: AtomicBool::new(false),
                 state <- new_mutex!(
-                    State { generation: 0, waiters: None },
+                    State { waiters: None },
                     "g17::Availability"
                 ),
                 fences: FenceContexts::new(1, c_str!("aurora_resource"), kernel::static_lock_class!())?,
@@ -48,11 +52,11 @@ impl Availability {
 
     /// Sample before checking capacity under the resource's own synchronization.
     pub(crate) fn observe(&self) -> u64 {
-        self.state.lock().generation
+        self.generation.load(Ordering::Acquire)
     }
 
     pub(crate) fn has_waiters(&self) -> bool {
-        self.state.lock().waiters.is_some()
+        self.has_waiters.load(Ordering::Acquire)
     }
 
     /// A fence the next notification signals. None means capacity changed after the sample:
@@ -69,7 +73,14 @@ impl Availability {
             GFP_KERNEL,
         )?;
         let mut state = self.state.lock();
-        if state.generation != observed {
+        // Publish `has_waiters` with SeqCst before re-checking `generation` (SeqCst),
+        // pairing with `advance()`'s SeqCst fetch_add on `generation` followed by SeqCst
+        // load of `has_waiters` so no waiter can be lost on the lock-free fast path.
+        self.has_waiters.store(true, Ordering::SeqCst);
+        if self.generation.load(Ordering::SeqCst) != observed {
+            if state.waiters.is_none() {
+                self.has_waiters.store(false, Ordering::Release);
+            }
             return Ok(None);
         }
         entry.next = state.waiters.take();
@@ -115,11 +126,14 @@ impl Availability {
 
     /// Notifies, returning the generation before this notification.
     fn advance(&self) -> u64 {
-        let (previous, mut waiters) = {
+        let previous = self.generation.fetch_add(1, Ordering::SeqCst);
+        if !self.has_waiters.load(Ordering::SeqCst) {
+            return previous;
+        }
+        let mut waiters = {
             let mut state = self.state.lock();
-            let previous = state.generation;
-            state.generation = previous.wrapping_add(1);
-            (previous, state.waiters.take())
+            self.has_waiters.store(false, Ordering::Release);
+            state.waiters.take()
         };
         while let Some(mut entry) = waiters {
             waiters = entry.next.take();

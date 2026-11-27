@@ -117,10 +117,12 @@ properties:
     description: The AP pin controller, whose pins a deep sleep resets.
 
   apple,pinctrl-skip-pins:
-    $ref: /schemas/types.yaml#/definitions/uint32-array
+    oneOf:
+      - $ref: /schemas/types.yaml#/definitions/uint32-array
+      - type: boolean
     description: |
       Pins neither saved nor restored. From the ADT, set by the bootloader;
-      without it no pin is saved.
+      without it no pin is saved. Empty where every pin is saved.
 
   apple,sleep-low-pins:
     $ref: /schemas/types.yaml#/definitions/uint32-array
@@ -143,6 +145,14 @@ properties:
     description: |
       The GFX die's wake sources left enabled for a sleep. From the ADT, set by
       the bootloader.
+
+  apple,display-method-sleep:
+    type: boolean
+    description: |
+      The display coprocessors take the sleep through their firmware 27 method
+      table: its sleep call and its swap, the panel's AV and DP services and the
+      external processors' handling around a sleep. Without it they keep the
+      method table they had and take the sleep's endpoint transport alone.
 
   apple,clk-gating-boot:
     $ref: /schemas/types.yaml#/definitions/uint32-matrix

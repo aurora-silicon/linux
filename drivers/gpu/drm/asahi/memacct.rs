@@ -101,6 +101,26 @@ fn pct_of(total: u64, pct: u32) -> u64 {
     }
 }
 
+fn total_ram_bytes() -> u64 {
+    // SAFETY: `struct sysinfo` is plain integers, for which all zeroes is a valid value.
+    let mut info: kernel::bindings::sysinfo = unsafe { core::mem::zeroed() };
+    // SAFETY: `si_meminfo()` only fills in the structure it is given.
+    unsafe { kernel::bindings::si_meminfo(&mut info) };
+    (info.totalram as u64).saturating_mul(u64::from(info.mem_unit))
+}
+
+/// Sets both limits from the percentage written through sysfs.
+#[no_mangle]
+pub extern "C" fn asahi_set_mem_limit_pct(pct: u32) {
+    let limits = limits_for(total_ram_bytes(), pct, pct);
+    LEDGER.set_limits(limits);
+    pr_info!(
+        "GPU memory limits set: device {} MiB, per client {} MiB (0 = none)\n",
+        limits.device >> 20,
+        limits.client >> 20
+    );
+}
+
 /// Computes the limits for `total_ram` bytes of RAM.
 ///
 /// A percentage of 0 or 100 and above disables that limit. A per-client limit
@@ -156,13 +176,8 @@ impl Ledger {
 
     /// Sets the limits from the module parameters and the amount of RAM.
     pub(crate) fn configure(&self) {
-        // SAFETY: `struct sysinfo` is plain integers, for which all zeroes is a valid value.
-        let mut info: kernel::bindings::sysinfo = unsafe { core::mem::zeroed() };
-        // SAFETY: `si_meminfo()` only fills in the structure it is given.
-        unsafe { kernel::bindings::si_meminfo(&mut info) };
-        let total = (info.totalram as u64).saturating_mul(u64::from(info.mem_unit));
         let limits = limits_for(
-            total,
+            total_ram_bytes(),
             module_parameters::mem_limit_pct.value(),
             module_parameters::client_mem_limit_pct.value(),
         );
@@ -223,6 +238,8 @@ pub(crate) struct Client {
     committed: AtomicU64,
     /// Size of those whose backing the GPU currently holds.
     resident: AtomicU64,
+    /// Bytes of the device's firmware timestamp window this client's bound buffers hold.
+    timestamp_window: AtomicU64,
 }
 
 impl Client {
@@ -231,6 +248,7 @@ impl Client {
             Self {
                 committed: AtomicU64::new(0),
                 resident: AtomicU64::new(0),
+                timestamp_window: AtomicU64::new(0),
             },
             GFP_KERNEL,
         )?)
@@ -242,6 +260,37 @@ impl Client {
 
     pub(crate) fn resident(&self) -> u64 {
         self.resident.load(Ordering::Relaxed)
+    }
+
+    /// Bytes of the firmware timestamp window this client holds.
+    #[cfg(CONFIG_KUNIT = "y")]
+    pub(crate) fn timestamp_window(&self) -> u64 {
+        self.timestamp_window.load(Ordering::Relaxed)
+    }
+
+    /// Takes `bytes` of the firmware timestamp window for `client` if its share stays within
+    /// `limit` (which must not be 0); the returned [`WindowShare`] gives them back when dropped.
+    /// Concurrent callers cannot overshoot.
+    pub(crate) fn take_window(client: &Arc<Self>, bytes: u64, limit: u64) -> Option<WindowShare> {
+        if limit == 0 || !try_add_within(&client.timestamp_window, bytes, limit, 0) {
+            return None;
+        }
+        Some(WindowShare {
+            client: client.clone(),
+            bytes,
+        })
+    }
+}
+
+/// Bytes of the firmware timestamp window held by one bound buffer of a client.
+pub(crate) struct WindowShare {
+    client: Arc<Client>,
+    bytes: u64,
+}
+
+impl Drop for WindowShare {
+    fn drop(&mut self) {
+        sub(&self.client.timestamp_window, self.bytes);
     }
 }
 

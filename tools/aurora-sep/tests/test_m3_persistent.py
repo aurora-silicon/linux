@@ -160,7 +160,8 @@ class Persistent(test_m3_handoff.M3PathTest):
     def test_real_option_parser_auto_and_conflicting_profiles(self):
         source=test_m3_handoff.INSTALLER.read_text()
         tail=source[source.index('\nargs=()\n'):]
-        for args,good in [(['--m3-gpu'],True),(['--m3-gpu','--read-only'],True),
+        for args,good in [(['--m3-gpu'],True),(['--m3-gpu','--desktop-fixes'],True),
+                          (['--m3-gpu','--read-only'],False),
                           (['--m3-gpu','--m3-gpu-persistent'],False),
                           (['--m3-profile=j613-25g83','--m3-gpu'],False)]:
             with self.subTest(args=args):
@@ -254,6 +255,8 @@ class Persistent(test_m3_handoff.M3PathTest):
         return self.selection()+f'''
 chain=limine
 work="{work}"
+# What install_all checked (m3_install_packages installs these by name).
+INSTALL_ARCHIVES=("$work/matched.pkg.tar.zst")
 M3_LIMINE_DEFAULTS="{defaults}"
 M3_GRUB_DEFAULTS="{self.etc}/default/grub"
 M3_PROFILE_HOOK="{self.etc}/hooks/profile.hook"

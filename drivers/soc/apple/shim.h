@@ -33,6 +33,8 @@ int sep_pm_keep_domains(void *dev);
 int sep_pm_wait_gated(void *dev, unsigned int timeout_ms);
 int sep_pm_clear_dev_disable(void *dev);
 void sep_pm_dart_restore(void *dev);
+int sep_pm_dart_prepare(void *dev);
+bool sep_pm_platform_commit(void);
 int sep_pm_commit_prepare(void *dev, void *mbox, u64 msg0, u32 msg1, u64 reply, u64 mask);
 int sep_pm_commit_finish(void *dev);
 extern const struct dev_pm_ops sep_pm_ops;
@@ -55,6 +57,7 @@ void *sep_store_open_trunc(const char *path);
 void *sep_store_open_writable_existing(const char *path);
 void *sep_store_open_ro(const char *path);
 void *sep_store_open_block(const char *path, int writable);
+void *sep_store_open_internal_block(const char *path, int writable);
 void sep_store_close(void *handle);
 long long sep_store_size(void *handle);
 long sep_store_read(void *handle, long long off, void *buf, size_t len);
@@ -218,9 +221,8 @@ struct device;
 
 int sep_diag_register(struct device *dev, const char *profile,
 		      size_t profile_len, bool cold, bool sepos13, bool xart);
-void sep_diag_set_policy(bool provision_keybag, bool trusted_keys,
-			 bool filevault_api, bool xarm_trace, bool refkey_v2,
-			 bool identity_override);
+void sep_diag_set_policy(bool trusted_keys, bool filevault_api,
+			 bool xarm_trace, bool refkey_v2, bool identity_override);
 void sep_diag_set_identity_source(unsigned int source);
 void sep_diag_set_attach(bool attached);
 void sep_diag_set_endpoints(unsigned int count);
@@ -309,7 +311,7 @@ void sep_tk_set_blob_len(struct trusted_key_payload *p, unsigned int n);
 bool sep_keystore_only(void);
 bool sep_keystore_user_bags(void);
 int sep_complete_attach_register(struct device *dev, void *ctx,
-                                int (*complete)(void *ctx));
+				int (*complete)(void *ctx));
 void sep_complete_attach_unregister(struct device *dev);
 void sep_diag_keystore_ended(void);
 void sep_diag_set_xart(bool writable);
