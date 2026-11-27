@@ -105,6 +105,13 @@ struct sio_shmem_chan_config {
 struct sio_data;
 struct sio_tx;
 
+#define SIO_MAX_ERROR_COOKIES	16
+
+struct sio_error_cookie {
+	dma_cookie_t cookie;
+	u32 residue;
+};
+
 struct sio_chan {
 	unsigned int no;
 	struct sio_data *host;
@@ -116,8 +123,10 @@ struct sio_chan {
 	struct sio_shmem_chan_config cfg;
 
 	struct sio_tx *current_tx;
-	/* Holds a runtime PM reference while current_tx is active. */
+	/* Holds a runtime PM reference across active or pending channel work. */
 	bool tx_rpm_held;
+	struct sio_error_cookie error_cookies[SIO_MAX_ERROR_COOKIES];
+	unsigned int error_head;
 
 	/*
 	 * Until a client sets an idle transfer, the channel keeps the old
@@ -193,6 +202,9 @@ struct sio_data {
 	bool asleep;
 	/* The firmware is stopped while runtime-suspended. */
 	bool rpm_stopped;
+	bool removing;
+	bool rtk_stopped;
+	bool rtk_shutdown_failed;
 	bool firmware_only;
 	/* Protocol 10 firmware given the earlier boot tables: no DMA, which would crash it */
 	bool tables_mismatch;
@@ -883,7 +895,8 @@ static struct dma_async_tx_descriptor *sio_prep_dma_cyclic(
 	struct sio_chan *siochan = to_sio_chan(chan);
 	struct sio_tx *siotx;
 
-	if (siochan->host->tables_mismatch ||
+	if (READ_ONCE(siochan->host->removing) ||
+	    siochan->host->tables_mismatch ||
 	    direction != sio_chan_direction(siochan->no))
 		return NULL;
 
@@ -892,6 +905,62 @@ static struct dma_async_tx_descriptor *sio_prep_dma_cyclic(
 		return NULL;
 
 	return vchan_tx_prep(&siochan->vc, &siotx->vd, flags);
+}
+
+static void sio_record_error_locked(struct sio_chan *siochan,
+				    dma_cookie_t cookie, u32 residue)
+{
+	unsigned int i;
+
+	if (cookie < DMA_MIN_COOKIE)
+		return;
+
+	for (i = 0; i < ARRAY_SIZE(siochan->error_cookies); i++) {
+		if (siochan->error_cookies[i].cookie == cookie) {
+			siochan->error_cookies[i].residue = residue;
+			return;
+		}
+	}
+
+	/* Bounded FIFO ring: evict the oldest recorded failure when full. */
+	siochan->error_cookies[siochan->error_head].cookie = cookie;
+	siochan->error_cookies[siochan->error_head].residue = residue;
+	siochan->error_head = (siochan->error_head + 1) %
+			      ARRAY_SIZE(siochan->error_cookies);
+}
+
+static void sio_clear_error_locked(struct sio_chan *siochan,
+				   dma_cookie_t cookie)
+{
+	unsigned int i;
+
+	if (cookie < DMA_MIN_COOKIE)
+		return;
+
+	for (i = 0; i < ARRAY_SIZE(siochan->error_cookies); i++) {
+		if (siochan->error_cookies[i].cookie == cookie) {
+			siochan->error_cookies[i].cookie = 0;
+			siochan->error_cookies[i].residue = 0;
+			return;
+		}
+	}
+}
+
+static bool sio_lookup_error_locked(const struct sio_chan *siochan,
+				    dma_cookie_t cookie, u32 *residue)
+{
+	unsigned int i;
+
+	if (cookie < DMA_MIN_COOKIE)
+		return false;
+
+	for (i = 0; i < ARRAY_SIZE(siochan->error_cookies); i++) {
+		if (siochan->error_cookies[i].cookie == cookie) {
+			*residue = siochan->error_cookies[i].residue;
+			return true;
+		}
+	}
+	return false;
 }
 
 static enum dma_status sio_tx_status(struct dma_chan *chan, dma_cookie_t cookie,
@@ -906,7 +975,19 @@ static enum dma_status sio_tx_status(struct dma_chan *chan, dma_cookie_t cookie,
 	size_t residue;
 
 	ret = dma_cookie_status(chan, cookie, txstate);
-	if (ret == DMA_COMPLETE || !txstate)
+	if (ret == DMA_COMPLETE) {
+		u32 err_residue;
+
+		spin_lock_irqsave(&siochan->vc.lock, flags);
+		if (sio_lookup_error_locked(siochan, cookie, &err_residue)) {
+			ret = DMA_ERROR;
+			if (txstate)
+				dma_set_residue(txstate, err_residue);
+		}
+		spin_unlock_irqrestore(&siochan->vc.lock, flags);
+		return ret;
+	}
+	if (!txstate)
 		return ret;
 
 	spin_lock_irqsave(&siochan->vc.lock, flags);
@@ -1087,16 +1168,72 @@ static void sio_ring_issue_ack_locked(struct sio_chan *siochan, bool ok)
 	sio_fill_in_locked(siochan);
 }
 
+static bool sio_firmware_active(const struct sio_data *sio)
+{
+	return !READ_ONCE(sio->rpm_stopped) && !READ_ONCE(sio->asleep);
+}
+
+static bool sio_chan_tx_busy_locked(const struct sio_chan *siochan)
+{
+	return siochan->current_tx || !list_empty(&siochan->retired) ||
+	       (siochan->ring && !siochan->idle) || siochan->pending;
+}
+
+static int sio_try_get_tx_pm_locked(struct sio_chan *siochan)
+{
+	struct sio_data *sio = siochan->host;
+	int ret;
+
+	if (siochan->tx_rpm_held)
+		return sio_firmware_active(sio) ? 1 : 0;
+
+	ret = pm_runtime_get_if_active(sio->dev);
+	if (ret > 0) {
+		if (!sio_firmware_active(sio)) {
+			pm_runtime_put_noidle(sio->dev);
+			return 0;
+		}
+		siochan->tx_rpm_held = true;
+		return 1;
+	}
+	if (ret < 0)
+		return (!IS_ENABLED(CONFIG_PM) && sio_firmware_active(sio)) ? 1 : ret;
+
+	return 0;
+}
+
+static bool sio_take_tx_pm_put_locked(struct sio_chan *siochan)
+{
+	if (!siochan->tx_rpm_held || sio_chan_tx_busy_locked(siochan))
+		return false;
+	siochan->tx_rpm_held = false;
+	return true;
+}
+
+static void sio_put_tx_pm(struct sio_chan *siochan, bool put)
+{
+	if (put) {
+		pm_runtime_mark_last_busy(siochan->host->dev);
+		pm_runtime_put_autosuspend(siochan->host->dev);
+	}
+}
+
 static void sio_handle_issue_ack(struct sio_chan *siochan, void *cookie, bool ok)
 {
 	unsigned long flags;
+	bool put_pm;
 
 	spin_lock_irqsave(&siochan->vc.lock, flags);
-	if (siochan->ring)
+	if (siochan->ring) {
 		sio_ring_issue_ack_locked(siochan, ok);
-	else
+		sio_ring_leave_locked(siochan);
+	} else {
 		sio_old_issue_ack_locked(siochan, (unsigned long)cookie, ok);
+	}
+	put_pm = sio_take_tx_pm_put_locked(siochan);
 	spin_unlock_irqrestore(&siochan->vc.lock, flags);
+
+	sio_put_tx_pm(siochan, put_pm);
 }
 
 /* The old accounting: the current transfer's next descriptor */
@@ -1107,8 +1244,8 @@ static bool sio_fill_in_old_locked(struct sio_chan *siochan)
 	struct sio_coproc_desc *d = tx->siodesc[tx->next];
 	int ret;
 
-	if (READ_ONCE(sio->rpm_stopped) ||
-	    tx->ninflight >= SIO_MAX_NINFLIGHT || tx->terminated)
+	if (!sio_firmware_active(sio) || tx->ninflight >= SIO_MAX_NINFLIGHT ||
+	    tx->terminated)
 		return false;
 
 	static_assert(sizeof(dma_cookie_t) <= sizeof(void *));
@@ -1132,7 +1269,7 @@ static bool sio_fill_in_ring_locked(struct sio_chan *siochan)
 	struct sio_coproc_desc *d;
 	int ret;
 
-	if (READ_ONCE(sio->rpm_stopped) || !tx || siochan->issuing ||
+	if (!sio_firmware_active(sio) || !tx || siochan->issuing ||
 	    siochan->stopping || siochan->nissued >= SIO_MAX_NINFLIGHT)
 		return false;
 
@@ -1163,10 +1300,29 @@ static void sio_update_current_tx_locked(struct sio_chan *siochan)
 {
 	struct virt_dma_desc *vd = vchan_next_desc(&siochan->vc);
 
-	if (vd && !siochan->current_tx) {
+	if (vd && !siochan->current_tx && !READ_ONCE(siochan->host->removing) &&
+	    sio_firmware_active(siochan->host)) {
 		list_del(&vd->node);
+		/* Retire any stale wrapped-around entry for this reused cookie. */
+		sio_clear_error_locked(siochan, vd->tx.cookie);
 		siochan->current_tx = to_sio_tx(&vd->tx);
 		sio_fill_in_locked(siochan);
+	}
+}
+
+static void sio_abort_issued_locked(struct sio_chan *siochan)
+{
+	struct virt_dma_desc *vd, *tmp;
+
+	list_for_each_entry_safe(vd, tmp, &siochan->vc.desc_issued, node) {
+		struct sio_tx *tx = to_sio_tx(&vd->tx);
+		u32 residue = tx->period_len * tx->nperiods;
+
+		list_del(&vd->node);
+		vd->tx_result.result = DMA_TRANS_ABORTED;
+		vd->tx_result.residue = residue;
+		sio_record_error_locked(siochan, vd->tx.cookie, residue);
+		vchan_cookie_complete(vd);
 	}
 }
 
@@ -1175,75 +1331,80 @@ static void sio_issue_work(struct work_struct *wq)
 	struct sio_chan *siochan = container_of(wq, struct sio_chan, issue_wq);
 	struct sio_data *sio = siochan->host;
 	unsigned long flags;
-	bool need_start;
-	bool put_rpm = true;
+	bool put_extra = false;
+	bool put_pm = false;
 	int ret;
 
-	spin_lock_irqsave(&siochan->vc.lock, flags);
-	need_start = !siochan->current_tx && vchan_next_desc(&siochan->vc);
-	spin_unlock_irqrestore(&siochan->vc.lock, flags);
-	if (!need_start)
+	if (READ_ONCE(sio->removing)) {
+		spin_lock_irqsave(&siochan->vc.lock, flags);
+		if (!siochan->current_tx)
+			sio_abort_issued_locked(siochan);
+		put_pm = sio_take_tx_pm_put_locked(siochan);
+		spin_unlock_irqrestore(&siochan->vc.lock, flags);
+		sio_put_tx_pm(siochan, put_pm);
 		return;
+	}
 
 	ret = pm_runtime_resume_and_get(sio->dev);
 	if (ret < 0) {
 		dev_err(sio->dev, "runtime resume before issue on chan %d failed: %d\n",
 			siochan->no, ret);
+		spin_lock_irqsave(&siochan->vc.lock, flags);
+		if (!siochan->current_tx)
+			sio_abort_issued_locked(siochan);
+		put_pm = sio_take_tx_pm_put_locked(siochan);
+		spin_unlock_irqrestore(&siochan->vc.lock, flags);
+		sio_put_tx_pm(siochan, put_pm);
 		return;
 	}
 
 	spin_lock_irqsave(&siochan->vc.lock, flags);
-	if (!siochan->current_tx && vchan_next_desc(&siochan->vc) &&
-	    !READ_ONCE(sio->rpm_stopped)) {
-		if (!siochan->tx_rpm_held) {
+	if (!READ_ONCE(sio->removing) && !siochan->current_tx &&
+	    vchan_next_desc(&siochan->vc) && sio_firmware_active(sio)) {
+		if (!siochan->tx_rpm_held)
 			siochan->tx_rpm_held = true;
-			put_rpm = false;
-		}
+		else
+			put_extra = true;
 		sio_update_current_tx_locked(siochan);
+	} else {
+		if (!siochan->current_tx &&
+		    (READ_ONCE(sio->removing) || READ_ONCE(sio->asleep)))
+			sio_abort_issued_locked(siochan);
+		put_extra = true;
 	}
+	put_pm = sio_take_tx_pm_put_locked(siochan);
 	spin_unlock_irqrestore(&siochan->vc.lock, flags);
 
-	if (put_rpm) {
-		pm_runtime_mark_last_busy(sio->dev);
-		pm_runtime_put_autosuspend(sio->dev);
-	}
+	sio_put_tx_pm(siochan, put_extra);
+	sio_put_tx_pm(siochan, put_pm);
 }
 
 static void sio_issue_pending(struct dma_chan *chan)
 {
 	struct sio_chan *siochan = to_sio_chan(chan);
-	struct sio_data *sio = siochan->host;
 	unsigned long flags;
-	bool defer = false;
+	bool put_pm;
 
 	spin_lock_irqsave(&siochan->vc.lock, flags);
+	if (READ_ONCE(siochan->host->removing)) {
+		spin_unlock_irqrestore(&siochan->vc.lock, flags);
+		return;
+	}
 	vchan_issue_pending(&siochan->vc);
 	if (!siochan->current_tx && vchan_next_desc(&siochan->vc)) {
-		if (siochan->tx_rpm_held) {
-			if (READ_ONCE(sio->rpm_stopped))
-				defer = true;
-			else
-				sio_update_current_tx_locked(siochan);
-		} else if (!IS_ENABLED(CONFIG_PM)) {
-			if (!READ_ONCE(sio->rpm_stopped))
-				sio_update_current_tx_locked(siochan);
-		} else {
-			int ret = pm_runtime_get_if_active(sio->dev);
+		int ret = sio_try_get_tx_pm_locked(siochan);
 
-			if (ret > 0 && !READ_ONCE(sio->rpm_stopped)) {
-				siochan->tx_rpm_held = true;
-				sio_update_current_tx_locked(siochan);
-			} else {
-				if (ret > 0)
-					pm_runtime_put_noidle(sio->dev);
-				defer = true;
-			}
-		}
+		if (ret > 0)
+			sio_update_current_tx_locked(siochan);
+		else if (ret == 0)
+			schedule_work(&siochan->issue_wq);
+		else
+			sio_abort_issued_locked(siochan);
 	}
+	put_pm = sio_take_tx_pm_put_locked(siochan);
 	spin_unlock_irqrestore(&siochan->vc.lock, flags);
 
-	if (defer)
-		schedule_work(&siochan->issue_wq);
+	sio_put_tx_pm(siochan, put_pm);
 }
 
 static int sio_terminate_all(struct dma_chan *chan)
@@ -1251,7 +1412,7 @@ static int sio_terminate_all(struct dma_chan *chan)
 	struct sio_chan *siochan = to_sio_chan(chan);
 	struct sio_tx *tx;
 	unsigned long flags;
-	bool put_rpm = false;
+	bool put_pm;
 	LIST_HEAD(to_free);
 
 	spin_lock_irqsave(&siochan->vc.lock, flags);
@@ -1268,10 +1429,6 @@ static int sio_terminate_all(struct dma_chan *chan)
 			if (siochan->vc.cyclic == &tx->vd)
 				siochan->vc.cyclic = NULL;
 			siochan->current_tx = NULL;
-			if (siochan->tx_rpm_held) {
-				siochan->tx_rpm_held = false;
-				put_rpm = true;
-			}
 			/* Its callback may be running: sio_free_dead() frees it. */
 			if (sio_tx_quiet_locked(siochan, tx)) {
 				list_add_tail(&tx->vd.node, &siochan->dead);
@@ -1287,13 +1444,10 @@ static int sio_terminate_all(struct dma_chan *chan)
 		}
 	}
 	vchan_get_all_descriptors(&siochan->vc, &to_free);
+	put_pm = sio_take_tx_pm_put_locked(siochan);
 	spin_unlock_irqrestore(&siochan->vc.lock, flags);
 
-	if (put_rpm) {
-		pm_runtime_mark_last_busy(siochan->host->dev);
-		pm_runtime_put_autosuspend(siochan->host->dev);
-	}
-
+	sio_put_tx_pm(siochan, put_pm);
 	vchan_dma_desc_free_list(&siochan->vc, &to_free);
 
 	return 0;
@@ -1305,7 +1459,7 @@ static void sio_terminate_work(struct work_struct *wq)
 	struct sio_data *sio = siochan->host;
 	struct sio_tx *tx;
 	unsigned long flags;
-	bool put_tx_rpm = false;
+	bool put_tx_pm;
 	bool resumed;
 	int ret;
 
@@ -1339,25 +1493,21 @@ static void sio_terminate_work(struct work_struct *wq)
 	WARN_ON(siochan->current_tx != tx);
 	siochan->current_tx = NULL;
 	sio_scrub_locked(siochan, tx);
-	if (resumed && !READ_ONCE(sio->rpm_stopped) &&
-	    vchan_next_desc(&siochan->vc)) {
-		if (!siochan->tx_rpm_held && IS_ENABLED(CONFIG_PM)) {
+	if (!READ_ONCE(sio->removing) && resumed && sio_firmware_active(sio)) {
+		sio_update_current_tx_locked(siochan);
+		if (siochan->current_tx && !siochan->tx_rpm_held &&
+		    IS_ENABLED(CONFIG_PM)) {
 			siochan->tx_rpm_held = true;
 			resumed = false;
 		}
-		sio_update_current_tx_locked(siochan);
-	} else if (siochan->tx_rpm_held) {
-		siochan->tx_rpm_held = false;
-		put_tx_rpm = true;
+	} else {
+		sio_abort_issued_locked(siochan);
 	}
 	sio_ring_leave_locked(siochan);
+	put_tx_pm = sio_take_tx_pm_put_locked(siochan);
 	spin_unlock_irqrestore(&siochan->vc.lock, flags);
 
-	if (put_tx_rpm) {
-		pm_runtime_mark_last_busy(sio->dev);
-		pm_runtime_put_autosuspend(sio->dev);
-	}
-
+	sio_put_tx_pm(siochan, put_tx_pm);
 	if (resumed) {
 		pm_runtime_mark_last_busy(sio->dev);
 		pm_runtime_put_autosuspend(sio->dev);
@@ -1406,6 +1556,7 @@ static int sio_stop_quiet(struct sio_chan *siochan)
 	unsigned long flags;
 	struct sio_tx *tx;
 	unsigned int i;
+	bool put_tx_pm;
 	int ret;
 
 	ret = pm_runtime_resume_and_get(dev);
@@ -1453,8 +1604,11 @@ static int sio_stop_quiet(struct sio_chan *siochan)
 	}
 	siochan->stopping = false;
 	sio_fill_in_locked(siochan);
+	sio_ring_leave_locked(siochan);
+	put_tx_pm = sio_take_tx_pm_put_locked(siochan);
 	spin_unlock_irqrestore(&siochan->vc.lock, flags);
 
+	sio_put_tx_pm(siochan, put_tx_pm);
 	pm_runtime_mark_last_busy(dev);
 	pm_runtime_put_autosuspend(dev);
 
@@ -1497,8 +1651,8 @@ static void sio_synchronize(struct dma_chan *chan)
 				      "chan %d: synchronized without being stopped\n",
 				      siochan->no);
 		/* No callback of an ended transfer runs after this. */
-		tasklet_kill(&siochan->vc.task);
 	}
+	tasklet_kill(&siochan->vc.task);
 	sio_free_dead(siochan);
 }
 
@@ -1510,7 +1664,7 @@ static int sio_clear_idle(struct sio_chan *siochan)
 {
 	struct sio_tx *idle;
 	unsigned long flags;
-	bool quiet, stop;
+	bool quiet, stop, put_tx_pm;
 	int ret;
 
 	spin_lock_irqsave(&siochan->vc.lock, flags);
@@ -1542,11 +1696,13 @@ static int sio_clear_idle(struct sio_chan *siochan)
 	siochan->idle = NULL;
 	sio_scrub_locked(siochan, idle);
 	sio_ring_leave_locked(siochan);
+	put_tx_pm = sio_take_tx_pm_put_locked(siochan);
 	spin_unlock_irqrestore(&siochan->vc.lock, flags);
 
 	sio_tx_free(&idle->vd);
 	sio_free_dead(siochan);
 
+	sio_put_tx_pm(siochan, put_tx_pm);
 	pm_runtime_mark_last_busy(siochan->host->dev);
 	pm_runtime_put_autosuspend(siochan->host->dev);
 	return 0;
@@ -1595,10 +1751,19 @@ static int sio_set_idle(struct sio_chan *siochan, const struct apple_sio_idle *c
 
 static void sio_free_chan_resources(struct dma_chan *chan)
 {
+	struct sio_chan *siochan = to_sio_chan(chan);
+	unsigned long flags;
+
 	sio_terminate_all(chan);
 	sio_synchronize(chan);
-	sio_clear_idle(to_sio_chan(chan));
-	vchan_free_chan_resources(&to_sio_chan(chan)->vc);
+	sio_clear_idle(siochan);
+
+	spin_lock_irqsave(&siochan->vc.lock, flags);
+	memset(siochan->error_cookies, 0, sizeof(siochan->error_cookies));
+	siochan->error_head = 0;
+	spin_unlock_irqrestore(&siochan->vc.lock, flags);
+
+	vchan_free_chan_resources(&siochan->vc);
 }
 
 static struct dma_chan *sio_dma_of_xlate(struct of_phandle_args *dma_spec,
@@ -1669,13 +1834,17 @@ static void sio_ring_report_locked(struct sio_chan *siochan)
 static void sio_process_report(struct sio_chan *siochan)
 {
 	unsigned long flags;
+	bool put_pm;
 
 	spin_lock_irqsave(&siochan->vc.lock, flags);
 	if (siochan->ring)
 		sio_ring_report_locked(siochan);
 	else
 		sio_old_report_locked(siochan);
+	put_pm = sio_take_tx_pm_put_locked(siochan);
 	spin_unlock_irqrestore(&siochan->vc.lock, flags);
+
+	sio_put_tx_pm(siochan, put_pm);
 }
 
 /*
@@ -2012,7 +2181,9 @@ static void sio_free_v9_shmem(void *data)
 	struct sio_data *sio = data;
 	int err;
 
-	if (!sio->rpm_stopped && !sio->asleep) {
+	if (sio->rtk_shutdown_failed)
+		return;
+	if (!sio->rpm_stopped && !sio->asleep && !sio->rtk_stopped) {
 		/* An acknowledged shutdown must precede releasing firmware DMA targets. */
 		err = apple_rtkit_shutdown(sio->rtk);
 		if (err) {
@@ -2397,18 +2568,69 @@ err_rpm_put:
 static void sio_remove(struct platform_device *pdev)
 {
 	struct sio_data *sio = platform_get_drvdata(pdev);
+	int i;
 
+	WRITE_ONCE(sio->removing, true);
+	for (i = 0; i < sio->nchannels; i++) {
+		struct sio_chan *siochan = &sio->channels[i];
+		unsigned long flags;
+		bool put_pm;
+
+		spin_lock_irqsave(&siochan->vc.lock, flags);
+		spin_unlock_irqrestore(&siochan->vc.lock, flags);
+		cancel_work_sync(&siochan->issue_wq);
+		flush_work(&siochan->terminate_wq);
+		spin_lock_irqsave(&siochan->vc.lock, flags);
+		if (!siochan->current_tx)
+			sio_abort_issued_locked(siochan);
+		put_pm = sio_take_tx_pm_put_locked(siochan);
+		spin_unlock_irqrestore(&siochan->vc.lock, flags);
+		sio_put_tx_pm(siochan, put_pm);
+		tasklet_kill(&siochan->vc.task);
+	}
 	if (sio->commit_registered || sio->hw->commit_stop)
 		apple_sleep_coproc_unregister(&pdev->dev);
 	if (!sio->firmware_only) {
 		of_dma_controller_free(pdev->dev.of_node);
 		dma_async_device_unregister(&sio->dma);
 	}
+	/* Quiesce terminate producers before runtime PM and RTKit teardown. */
+	for (i = 0; i < sio->nchannels; i++)
+		flush_work(&sio->channels[i].terminate_wq);
 	if (sio_can_runtime_suspend(sio)) {
 		pm_runtime_dont_use_autosuspend(&pdev->dev);
 		pm_runtime_barrier(&pdev->dev);
 	} else {
 		pm_runtime_put_noidle(&pdev->dev);
+	}
+	/* Quiesce RTKit report producers before the final drain and tasklet kill. */
+	if (!READ_ONCE(sio->rpm_stopped) && !READ_ONCE(sio->asleep)) {
+		if (sio->arrays) {
+			int err = apple_rtkit_shutdown(sio->rtk);
+
+			if (err) {
+				dev_err(sio->dev,
+					"SIO shutdown failed: %d; retaining DMA buffers\n",
+					err);
+				sio->rtk_shutdown_failed = true;
+			} else {
+				sio->rtk_stopped = true;
+			}
+		}
+		apple_rtkit_mailbox_off(sio->rtk);
+	}
+	for (i = 0; i < sio->nchannels; i++) {
+		struct sio_chan *siochan = &sio->channels[i];
+		unsigned long flags;
+		bool put_pm;
+
+		spin_lock_irqsave(&siochan->vc.lock, flags);
+		if (!siochan->current_tx)
+			sio_abort_issued_locked(siochan);
+		put_pm = sio_take_tx_pm_put_locked(siochan);
+		spin_unlock_irqrestore(&siochan->vc.lock, flags);
+		sio_put_tx_pm(siochan, put_pm);
+		tasklet_kill(&siochan->vc.task);
 	}
 }
 
@@ -2443,6 +2665,8 @@ static __maybe_unused int sio_suspend(struct device *dev)
 
 	if (!sio_can_runtime_suspend(sio) || sio->asleep || sio->rpm_stopped)
 		return 0;
+	if (READ_ONCE(sio->removing))
+		return -EBUSY;
 
 	for (i = 0; i < sio->nchannels; i++) {
 		if (sio_chan_busy(&sio->channels[i]))
@@ -2534,12 +2758,12 @@ static __maybe_unused int sio_suspend_late(struct device *dev)
 		 */
 		device_set_wakeup_path(dev);
 		sio->commit_used = true;
-		sio->asleep = true;
+		WRITE_ONCE(sio->asleep, true);
 		return 0;
 	}
 	if (sio->hw->commit_stop) {
 		apple_sleep_coproc_set_ready(dev, true);
-		sio->asleep = true;
+		WRITE_ONCE(sio->asleep, true);
 		return 0;
 	}
 
@@ -2556,7 +2780,7 @@ static __maybe_unused int sio_suspend_late(struct device *dev)
 			dev_err(dev, "firmware did not come back\n");
 		return ret;
 	}
-	sio->asleep = true;
+	WRITE_ONCE(sio->asleep, true);
 
 	return 0;
 }
@@ -2576,7 +2800,7 @@ static __maybe_unused int sio_resume_early(struct device *dev)
 		sio->commit_used = false;
 		apple_sleep_coproc_set_ready(dev, false);
 		if (!pm_resume_via_firmware() && !stopped) {
-			sio->asleep = false;
+			WRITE_ONCE(sio->asleep, false);
 			return 0;
 		}
 	}
@@ -2589,7 +2813,7 @@ static __maybe_unused int sio_resume_early(struct device *dev)
 	 */
 	if (!pm_resume_via_firmware()) {
 		if (!apple_rtkit_sleep_return(sio->rtk, sio->base + REG_CPU_CONTROL)) {
-			sio->asleep = false;
+			WRITE_ONCE(sio->asleep, false);
 			return 0;
 		}
 		ret = apple_sleep_engine_reset(dev);
@@ -2601,7 +2825,7 @@ static __maybe_unused int sio_resume_early(struct device *dev)
 				 ret);
 			return 0;
 		}
-		sio->asleep = false;
+		WRITE_ONCE(sio->asleep, false);
 		dev_info(dev, "sleep refused: firmware back after a reset\n");
 		return 0;
 	}
@@ -2614,7 +2838,7 @@ static __maybe_unused int sio_resume_early(struct device *dev)
 			t6050 ? "SIO: not restarted after the sleep: " : "", ret);
 		return 0;
 	}
-	sio->asleep = false;
+	WRITE_ONCE(sio->asleep, false);
 	/* T6050: one line per wake: the start reply's line is the probe's alone. */
 	if (t6050)
 		dev_info(dev, "SIO: restarted after the sleep, firmware up, protocol v%u, CPU control 0x%x\n",
