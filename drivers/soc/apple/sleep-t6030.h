@@ -2703,6 +2703,153 @@ static const struct apple_sleep_gate_coproc t6030_gate_coprocs[] = {
 };
 
 /*
+ * DIAGNOSTIC (T6030 sleep bring-up): where the RTC alarm's event stops after a real commit.
+ * With observer_ms, the observer core (the boot core's P neighbour, kept out of the sleep)
+ * samples every 100 ms for observer_ms, from the boot core's last WFI:
+ *  - the PMU's alarm control, 0x2000 (one SPMI read a sample, after the MMIO reads);
+ *  - nub-ap-ctrl's seven wake status words, +0x24..+0x3c (macOS's wake status: +0x34 bit 31);
+ *  - nub-spmi0's first ack and mask words, +0x60 (macOS reads 4 at its wake: source 2) and
+ *    +0x20; nub-spmi-a0's third, +0x68 (macOS 0x4f000000) and +0x28;
+ *  - the boot core's PCPU word, both cluster words, the commit word and the CLLT sleep word.
+ * Only the PMU scratch's 5 bytes survive the VDM, so obs_timeline picks what goes there, each
+ * byte written when it changes:
+ *  1: the sample at which each first changed (0xff: not yet; 0xfe at the window's end: never):
+ *     +0 the alarm event (0x2000 bit 1), +1 any wake status word nonzero, +2 nub-spmi0 +0x60
+ *     nonzero, +3 nub-spmi-a0 +0x68 nonzero, +4 the boot core's side moved: its WFI came
+ *     back, its PCPU word on again after it went off, or a cluster, commit or CLLT word changed
+ *     after the first 200 ms;
+ *  2: the latest values: +0 the alarm control, +1 the wake status words nonzero (bits 0-6) and
+ *     +0x34 bit 31 (bit 7), +2 nub-spmi0 +0x60 bits 7:0, +3 nub-spmi0 +0x20 bits 3:0 and 15:12
+ *     (bits 3:0 and 7:4), +4 nub-spmi-a0 +0x68 bits 31:24.
+ * Reads only, beyond the notes. 0 (default): the plain observer.
+ */
+#define T6030_OBS_PERIOD_MS		100
+#define T6030_OBS_SETTLE		2
+#define T6030_OBS_NOT_YET		0xff
+#define T6030_OBS_NEVER			0xfe
+#define T6030_OBS_LAST			0xfd
+#define T6030_OBS_STATUS_WORDS		7
+#define T6030_OBS_MACOS_WAKE_WORD	4
+#define T6030_OBS_CTL_UNREAD		0xff
+#define T6030_PS_PCPU0			0x30
+#define T6030_PS_ACTUAL			GENMASK(7, 4)
+
+static unsigned int t6030_obs_timeline;
+module_param_named(obs_timeline, t6030_obs_timeline, uint, 0644);
+MODULE_PARM_DESC(obs_timeline, "T6030 DIAGNOSTIC: with observer_ms, the observer's 100 ms samples in PMU scratch: 1 when each first changed, 2 the latest values (0 = off)");
+
+static bool t6030_obs_timeline_on(void)
+{
+	unsigned int mode = READ_ONCE(t6030_obs_timeline);
+
+	return mode == 1 || mode == 2;
+}
+
+struct t6030_obs {
+	u32 status[T6030_OBS_STATUS_WORDS];
+	u32 ack0, mask0, a0_ack2, a0_mask2;
+	u32 pcpu, cluster[2], commit, cllt;
+	u8 ctl;
+	bool ctl_read;
+};
+
+static void t6030_obs_read(struct apple_sleep *s, struct t6030_obs *o)
+{
+	u32 runtime;
+	int i;
+
+	for (i = 0; i < T6030_OBS_STATUS_WORDS; i++)
+		o->status[i] = readl(s->wake + T6030_WAKE_STATUS + 4 * i);
+	o->ack0 = readl(s->spmi + T6030_SPMI_ACK(0));
+	o->mask0 = readl(s->spmi + T6030_SPMI_MASK(0));
+	o->a0_ack2 = readl(s->spmi_a0 + T6030_SPMI_ACK(2));
+	o->a0_mask2 = readl(s->spmi_a0 + T6030_SPMI_MASK(2));
+	o->pcpu = readl(s->ps + T6030_PS_PCPU0);
+	o->cluster[0] = readl(s->cluster + T6030_CLUSTER_E);
+	o->cluster[1] = readl(s->cluster + T6030_CLUSTER_P);
+	o->commit = readl(s->commit);
+	o->cllt = readl(s->cllt + T6030_CLLT_SLEEP);
+	/* The notify mask as the commit left it, without the done bit during the read */
+	runtime = readl(s->spmi + SPMI_NOTIFY_ENABLE);
+	o->ctl = T6030_OBS_CTL_UNREAD;
+	o->ctl_read = !t6030_pmu_xfer(s, runtime & ~T6030_SPMI_DONE, T6050_SPMI_EXT_READL,
+				      T6050_RTC_CTL, NULL, &o->ctl, 1);
+	writel(runtime, s->spmi + SPMI_NOTIFY_ENABLE);
+}
+
+static void t6030_obs_mark(struct apple_sleep *s, u8 *at, unsigned int off, bool hit,
+			   unsigned int k)
+{
+	if (!hit || at[off] != T6030_OBS_NOT_YET)
+		return;
+	at[off] = min(k, (unsigned int)T6030_OBS_LAST);
+	sleep_note_at(s, off, at[off]);
+}
+
+static void t6030_obs_values(const struct t6030_obs *o, u8 *v)
+{
+	int i;
+
+	v[0] = o->ctl_read ? o->ctl : T6030_OBS_CTL_UNREAD;
+	v[1] = 0;
+	for (i = 0; i < T6030_OBS_STATUS_WORDS; i++)
+		if (o->status[i])
+			v[1] |= BIT(i);
+	if (o->status[T6030_OBS_MACOS_WAKE_WORD] & BIT(31))
+		v[1] |= BIT(7);
+	v[2] = o->ack0 & 0xff;
+	v[3] = (o->mask0 & 0xf) | ((o->mask0 >> 8) & 0xf0);
+	v[4] = o->a0_ack2 >> 24;
+}
+
+static void t6030_observe_timeline(struct apple_sleep *s, unsigned int ms, u64 t0)
+{
+	u64 period = arch_timer_get_cntfrq() * T6030_OBS_PERIOD_MS / 1000;
+	unsigned int n = max(ms / T6030_OBS_PERIOD_MS, 1U), k, i;
+	bool values = READ_ONCE(t6030_obs_timeline) == 2, off_seen = false, hit, moved;
+	struct t6030_obs o, ref = {};
+	u8 at[5], v[5], last[5] = {};
+
+	memset(at, T6030_OBS_NOT_YET, sizeof(at));
+	for (i = 0; !values && i < ARRAY_SIZE(at); i++)
+		sleep_note_at(s, i, T6030_OBS_NOT_YET);
+	for (k = 0; k < n; k++) {
+		while (read_sysreg(cntpct_el0) - t0 < k * period)
+			cpu_relax();
+		t6030_obs_read(s, &o);
+		if (k == T6030_OBS_SETTLE)
+			ref = o;
+		if (values) {
+			t6030_obs_values(&o, v);
+			for (i = 0; i < ARRAY_SIZE(v); i++) {
+				if (k && v[i] == last[i])
+					continue;
+				sleep_note_at(s, i, v[i]);
+				last[i] = v[i];
+			}
+			continue;
+		}
+		t6030_obs_mark(s, at, 0, o.ctl_read && (o.ctl & T6050_RTC_CTL_FIRED), k);
+		for (hit = false, i = 0; i < T6030_OBS_STATUS_WORDS; i++)
+			hit |= !!o.status[i];
+		t6030_obs_mark(s, at, 1, hit, k);
+		t6030_obs_mark(s, at, 2, !!o.ack0, k);
+		t6030_obs_mark(s, at, 3, !!o.a0_ack2, k);
+		if (!FIELD_GET(T6030_PS_ACTUAL, o.pcpu))
+			off_seen = true;
+		moved = READ_ONCE(t8142_obs_wfi_back) ||
+			(off_seen && FIELD_GET(T6030_PS_ACTUAL, o.pcpu)) ||
+			(k > T6030_OBS_SETTLE &&
+			 (o.cluster[0] != ref.cluster[0] || o.cluster[1] != ref.cluster[1] ||
+			  o.commit != ref.commit || o.cllt != ref.cllt));
+		t6030_obs_mark(s, at, 4, moved, k);
+	}
+	for (i = 0; !values && i < ARRAY_SIZE(at); i++)
+		if (at[i] == T6030_OBS_NOT_YET)
+			sleep_note_at(s, i, T6030_OBS_NEVER);
+}
+
+/*
  * The ps words macOS 27.2 has OFF (actual state 0) at its commit on J516s, as the last value
  * each had in the t1, t1b, t1c, t3 and t4 traces (ps-at-commit.tsv). The others weren't read in
  * any window, so their state there is unknown: the dry run's list marks only these.

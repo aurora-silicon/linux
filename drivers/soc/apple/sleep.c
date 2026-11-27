@@ -2791,6 +2791,10 @@ static u8 t8142_obs_sample(struct apple_sleep *s)
 	return f;
 }
 
+/* T6030's observer timeline, apple_sleep.obs_timeline (sleep-t6030.h) */
+static bool t6030_obs_timeline_on(void);
+static void t6030_observe_timeline(struct apple_sleep *s, unsigned int ms, u64 t0);
+
 /* E core 0 with apple_sleep.observer_ms: see sleep_observer_ms. */
 static void t8142_observe(struct apple_sleep *s, unsigned int ms)
 {
@@ -2803,6 +2807,10 @@ static void t8142_observe(struct apple_sleep *s, unsigned int ms)
 	while (!READ_ONCE(t8142_obs_boot_wfi) && read_sysreg(cntpct_el0) - t0 < 30 * freq)
 		cpu_relax();
 	t0 = read_sysreg(cntpct_el0);
+	if (s->soc->observer && t6030_obs_timeline_on()) {
+		t6030_observe_timeline(s, ms, t0);
+		return;
+	}
 	for (i = 0; i < 3; i++) {
 		u64 wait = (i < 2 ? at_ms[i] : max(ms, 301U)) * freq / 1000;
 
