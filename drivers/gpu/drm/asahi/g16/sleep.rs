@@ -47,6 +47,7 @@ extern "C" {
     fn asahi_g16_commit_prepare(
         dev: *mut core::ffi::c_void,
         rtk: *mut bindings::apple_rtkit,
+        quiet: bool,
     ) -> *mut core::ffi::c_void;
     fn asahi_g16_stop_now(
         dev: *mut core::ffi::c_void,
@@ -128,6 +129,15 @@ fn note(step: u8) {
 }
 
 impl Shared {
+    /// The mailbox's receive interrupt back on after `.prepare` masked it for the commit.
+    fn resume_rx(&self) {
+        let state = self.state.lock();
+        if let Some(firmware) = state.as_deref() {
+            // SAFETY: The RTKit handle lasts until reboot; the prepare masked it once.
+            unsafe { apple_rtkit_resume_rx(firmware.session.rtkit.as_raw()) };
+        }
+    }
+
     /// The PMP's request for the GPU, where the device tree names one. The PMP may use a device
     /// whose request is set, so it's only ever set with the domain on.
     pub(crate) fn pmp_request(&self, enable: bool) {
@@ -235,14 +245,14 @@ impl Shared {
 
     /// Leaves the stop to the sleep's commit, or with [`SleepStop::Prepare`] stops the firmware
     /// now. False, with the reason logged, if neither can be.
-    fn leave_for_commit(&self, firmware: &mut Firmware, stop: SleepStop) -> bool {
+    fn leave_for_commit(&self, firmware: &mut Firmware, stop: SleepStop, quiet: bool) -> bool {
         let dev = self.dev.as_raw().cast();
         let rtk = firmware.session.rtkit.as_raw();
         // SAFETY: `dev` is the live GPU device. The RTKit handle lasts until reboot, and
         // `.complete` frees the result.
         let commit = unsafe {
             match stop {
-                SleepStop::Commit => asahi_g16_commit_prepare(dev, rtk),
+                SleepStop::Commit => asahi_g16_commit_prepare(dev, rtk, quiet),
                 SleepStop::Prepare => asahi_g16_stop_now(dev, rtk),
             }
         };
@@ -278,7 +288,7 @@ impl Shared {
     /// Waits for quiet, closes publication and leaves the stop to the commit. Refuses if the
     /// commit can't take it: a stop here loses the GPU after a refused sleep. A refusal
     /// changes nothing.
-    fn sleep_down(self: &Arc<Self>, stop: SleepStop) -> Result {
+    fn sleep_down(self: &Arc<Self>, stop: SleepStop, quiet: bool) -> Result {
         if self.sleeping.load(Ordering::Acquire) {
             // After a sleep refused past the stop, only the domain is left to lower.
             self.lower_domain();
@@ -302,7 +312,7 @@ impl Shared {
                     .sleep_quiet()
                     .and_then(|quiet| if quiet { Ok(()) } else { Err(EBUSY) })
                     .and_then(|_| {
-                        if self.leave_for_commit(firmware, stop) {
+                        if self.leave_for_commit(firmware, stop, quiet) {
                             firmware.power.release_clpc_now();
                             self.active_flights.store(0, Ordering::Release);
                             Ok(())
@@ -387,9 +397,9 @@ impl Shared {
 impl Gpu {
     /// Where this GPU's deep sleep stops its firmware.
     fn sleep_stop(&self) -> SleepStop {
-        // DIAGNOSTIC (T6030 sleep bring-up): the commit's stop instead, for comparison.
-        if crate::module_parameters::g16_sleep_at_commit.value() != 0 {
-            return SleepStop::Commit;
+        // DIAGNOSTIC (T6030 sleep bring-up): the stop in `.prepare` instead, for comparison.
+        if crate::module_parameters::g16_sleep_at_prepare.value() != 0 {
+            return SleepStop::Prepare;
         }
         self.cfg.sleep_stop
     }
@@ -408,7 +418,7 @@ impl Gpu {
             }
             return Err(EBUSY);
         }
-        let result = self.shared.sleep_down(self.sleep_stop());
+        let result = self.shared.sleep_down(self.sleep_stop(), self.cfg.sleep_quiet_stop);
         if let Err(error) = result {
             dev_warn!(self.shared.dev.as_ref(), "GPU refused sleep: {:?}\n", error);
         }
@@ -433,6 +443,9 @@ impl Gpu {
                 self.shared.dev.as_ref(),
                 "sleep refused before the commit: GPU firmware never stopped\n"
             );
+            if self.cfg.sleep_quiet_stop {
+                self.shared.resume_rx();
+            }
             self.shared.feed.resume();
             self.shared.sleeping.store(false, Ordering::Release);
             self.shared.poll_now();
@@ -441,7 +454,7 @@ impl Gpu {
         if !real && self.shared.sleep_hold() {
             return;
         }
-        let _ = self.shared.sleep_up(false);
+        let _ = self.shared.sleep_up(self.cfg.sleep_quiet_stop);
     }
 }
 

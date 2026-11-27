@@ -743,8 +743,41 @@ void asahi_g16_sleep_note(u8 step)
 	nvmem_device_write(nv, 0x830c, 1, &step);
 }
 
-/* The same stop for G16, made by the sleep's commit. */
-struct asahi_g17_commit *asahi_g16_commit_prepare(struct device *dev, struct apple_rtkit *rtk)
+/*
+ * G15S's stop at the commit, as far as Linux can make it (J516s, pm_test=devices): AP IDLE and
+ * IOP IDLE, the mailbox's receive off, the PMP request withdrawn. After the idle the ASC's own
+ * page doesn't answer, and every AP write taking GFX out of automatic power reset the SoC, so
+ * neither is touched; the sleep controller takes AFR, GFX's parent, down. An idled G15S
+ * firmware answers neither IOP INIT nor IOP ON without a reset, so only the commit, which
+ * only a real wake follows, may idle it.
+ */
+static int asahi_g16_commit_stop_quiet(void *data)
+{
+	struct asahi_g17_commit *c = data;
+
+	c->ran = true;
+	apple_sleep_note_sub(1);
+	c->entry = readl(c->ps);
+	c->saved = c->entry;
+	c->idle[0] = apple_rtkit_sleep_idle_polled(c->rtk[0], NULL, &c->idle_us[0]);
+	apple_sleep_note_sub(3);
+	apple_rtkit_mailbox_recv_off(c->rtk[0]);
+	c->words[0] = apple_rtkit_mailbox_status(c->rtk[0]);
+	apple_sleep_note_sub(4);
+	c->request_ret = c->request ? apple_pmp_report_entry_withdraw_polled(c->request) : 0;
+	apple_sleep_note_sub(5);
+	c->lowered = readl(c->ps);
+
+	return (c->idle[0] || c->request_ret) ? 1 : 0;
+}
+
+/*
+ * The same stop for G16, made by the sleep's commit. @quiet: G15S's, which touches neither the
+ * ASC's page nor GFX, and whose mailbox interrupt stays masked from here until the restart or
+ * the refusal.
+ */
+struct asahi_g17_commit *asahi_g16_commit_prepare(struct device *dev, struct apple_rtkit *rtk,
+						  bool quiet)
 {
 	struct asahi_g17_commit *c;
 	int ret;
@@ -759,9 +792,12 @@ struct asahi_g17_commit *asahi_g16_commit_prepare(struct device *dev, struct app
 		c->request_owned = true;
 	}
 
-	ret = apple_sleep_coproc_register_first(dev, asahi_g17_commit_stop, c);
+	ret = apple_sleep_coproc_register_first(dev, quiet ? asahi_g16_commit_stop_quiet :
+							     asahi_g17_commit_stop, c);
 	if (ret)
 		goto err;
+	if (quiet)
+		apple_rtkit_hold_rx(rtk);
 	apple_sleep_coproc_set_ready(dev, true);
 
 	return c;
