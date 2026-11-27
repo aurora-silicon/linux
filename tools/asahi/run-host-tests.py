@@ -357,6 +357,10 @@ ASAHI_TESTS = {
                                    'skip-tiling-prefix', 'skip-compute-resolve',
                                    'skip-eagain-fallback', 'skip-other-pair-guard',
                                    'skip-borrowed-sibling', 'skip-tiling-sibling'), []),
+    'g17-inline-cross-engine-tests.py': [([], PASS)]
+        + mutations('--mutation', ('always-wait-scheduled', 'skip-unpublished-scheduled',
+                                   'block-firmware-early', 'skip-compute-producer-check',
+                                   'skip-render-producer-check', 'copy-try-early-bool'), []),
     'g17-firmware-selection-tests.py': [([], PASS)],
     'g17-freelist-lease-direct-tests.py': [([], PASS)]
         + mutations('--mutation', ('reject-preparing-complete', 'snapshot-rollback',

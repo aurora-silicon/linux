@@ -289,7 +289,13 @@ impl<B: Backend> Queue<B> {
         // since the prune above without a publication is not among them, so prune again: any
         // failure now visible makes it a full scan, and the failure record below has it.
         self.prune_frontier(index);
-        let (completion, publication, ordering_host_waits, ordering_firmware_waits) = {
+        let (
+            completion,
+            publication,
+            ordering_host_waits,
+            ordering_firmware_waits,
+            ordering_firmware_published,
+        ) = {
             let ordering = EnqueueOrdering::build(
                 &self.publishers[index],
                 &self.frontiers[other],
@@ -320,6 +326,7 @@ impl<B: Backend> Queue<B> {
                 publication,
                 ordering.host_waits,
                 ordering.firmware_waits,
+                ordering.firmware_published,
             )
         };
         let mut failures: [Option<Fence>; 2] = [None, None];
@@ -352,12 +359,17 @@ impl<B: Backend> Queue<B> {
             checked_inputs.push(fence, GFP_KERNEL)?;
         }
         // Firmware orders execution after each producer; the scheduler needs only the latest
-        // scheduled fence of them (dependency::ProducerWaits).
+        // scheduled fence of producers that have not already been published into firmware.
         let mut producer_waits = super::dependency::ProducerWaits::new();
-        for (scheduled, completed) in &ordering_firmware_waits {
-            producer_waits.producer(scheduled, |fence| {
-                Ok(dependencies.push(fence.clone(), GFP_KERNEL)?)
-            })?;
+        for ((scheduled, completed), published) in ordering_firmware_waits
+            .iter()
+            .zip(ordering_firmware_published.iter())
+        {
+            if !*published && job::fence_status(scheduled) <= 0 {
+                producer_waits.producer(scheduled, |fence| {
+                    Ok(dependencies.push(fence.clone(), GFP_KERNEL)?)
+                })?;
+            }
             firmware.push(completed.clone(), GFP_KERNEL)?;
         }
         producer_waits.finish(|fence| Ok(dependencies.push(fence.clone(), GFP_KERNEL)?))?;
@@ -705,6 +717,9 @@ trait FrontierEntry: outstanding::Status {
     }
     fn completed(&self) -> &Fence;
     fn scheduled(&self) -> &Fence;
+    fn inline_published(&self) -> bool {
+        false
+    }
 }
 
 impl FrontierEntry for Fences {
@@ -723,12 +738,17 @@ impl FrontierEntry for Fences {
     fn scheduled(&self) -> &Fence {
         &self.scheduled
     }
+
+    fn inline_published(&self) -> bool {
+        self.inline_published
+    }
 }
 
 struct EnqueueOrdering<'a> {
     predecessors: KVec<&'a Arc<Publication>>,
     host_waits: KVec<Fence>,
     firmware_waits: KVec<(Fence, Fence)>,
+    firmware_published: KVec<bool>,
 }
 
 impl<'a> EnqueueOrdering<'a> {
@@ -759,6 +779,7 @@ impl<'a> EnqueueOrdering<'a> {
         let mut predecessors = KVec::new();
         let mut host = KVec::new();
         let mut firmware = KVec::new();
+        let mut firmware_published = KVec::new();
         if same_chain {
             for (_, entry) in same_covered.clone() {
                 let status = entry.status();
@@ -814,6 +835,7 @@ impl<'a> EnqueueOrdering<'a> {
                     (entry.scheduled().clone(), entry.completed().clone()),
                     GFP_KERNEL,
                 )?;
+                firmware_published.push(entry.inline_published(), GFP_KERNEL)?;
             }
         }
 
@@ -821,6 +843,7 @@ impl<'a> EnqueueOrdering<'a> {
             predecessors,
             host_waits: host,
             firmware_waits: firmware,
+            firmware_published,
         })
     }
 }

@@ -3687,12 +3687,22 @@ impl Backend {
     /// its queue is already bound and nothing has to wait, as renders do. Any
     /// wait leaves the command, unpublished, to its scheduler.
     pub(super) fn try_compute_early(&self, packet: &Arc<super::job::Packet>) -> bool {
-        if self.compute_backlog.load(Ordering::Acquire) != 0 || packet.has_dependencies() {
+        if self.compute_backlog.load(Ordering::Acquire) != 0 || packet.has_host_dependencies() {
             return false;
         }
         // A command the ray-traversal rule could hold now is left to its scheduler.
         if !self.traversal_inline(packet) {
             return false;
+        }
+        if let Err(error) = packet.check_firmware_producers() {
+            if !packet.begin_publication() {
+                packet.completion.fail_unpublished(ECANCELED);
+                packet.set_early_result(Err(ECANCELED));
+                return true;
+            }
+            packet.completion.fail_unpublished(error);
+            packet.set_early_result(Err(error));
+            return true;
         }
         if !packet.begin_publication() {
             packet.completion.fail_unpublished(ECANCELED);
