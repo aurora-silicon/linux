@@ -2684,16 +2684,9 @@ int apple_rtkit_port_restart(struct apple_rtkit *rtk)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_port_restart);
 
-/* Everything of a firmware session but the mailbox hardware. */
-static void apple_rtkit_reset_session(struct apple_rtkit *rtk)
+/* What a firmware that restarts from its reset vector has forgotten. */
+static void apple_rtkit_free_session_buffers(struct apple_rtkit *rtk)
 {
-	unsigned long flags;
-
-	/* make sure we don't handle any messages while reinitializing */
-	apple_rtkit_detach_rx(rtk);
-	flush_workqueue(rtk->wq);
-	cancel_delayed_work_sync(&rtk->crashlog_late_work);
-
 	apple_rtkit_free_buffer(rtk, &rtk->coreanalytics_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->ioreport_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->crashlog_buffer);
@@ -2711,6 +2704,23 @@ static void apple_rtkit_reset_session(struct apple_rtkit *rtk)
 	rtk->syslog_inherited = false;
 	rtk->crashlog_inherited = false;
 	rtk->oslog_inherited = false;
+}
+
+/*
+ * Everything of a firmware session but the mailbox hardware and, with
+ * @keep_buffers, the shared buffers and the syslog geometry.
+ */
+static void apple_rtkit_reset_session(struct apple_rtkit *rtk, bool keep_buffers)
+{
+	unsigned long flags;
+
+	/* make sure we don't handle any messages while reinitializing */
+	apple_rtkit_detach_rx(rtk);
+	flush_workqueue(rtk->wq);
+	cancel_delayed_work_sync(&rtk->crashlog_late_work);
+
+	if (!keep_buffers)
+		apple_rtkit_free_session_buffers(rtk);
 
 	bitmap_zero(rtk->endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
 	set_bit(APPLE_RTKIT_EP_MGMT, rtk->endpoints);
@@ -2735,11 +2745,11 @@ static void apple_rtkit_reset_session(struct apple_rtkit *rtk)
 	spin_unlock_irqrestore(&rtk->mbox->rx_lock, flags);
 }
 
-int apple_rtkit_reinit(struct apple_rtkit *rtk)
+static int apple_rtkit_reinit_session(struct apple_rtkit *rtk, bool keep_buffers)
 {
 	int ret;
 
-	apple_rtkit_reset_session(rtk);
+	apple_rtkit_reset_session(rtk, keep_buffers);
 	ret = apple_mbox_start(rtk->mbox);
 	if (ret) {
 		apple_rtkit_detach_rx(rtk);
@@ -2747,7 +2757,18 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk)
 	}
 	return ret;
 }
+
+int apple_rtkit_reinit(struct apple_rtkit *rtk)
+{
+	return apple_rtkit_reinit_session(rtk, false);
+}
 EXPORT_SYMBOL_GPL(apple_rtkit_reinit);
+
+int apple_rtkit_reinit_retaining_buffers(struct apple_rtkit *rtk)
+{
+	return apple_rtkit_reinit_session(rtk, true);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_reinit_retaining_buffers);
 
 static int apple_rtkit_set_ap_power_state(struct apple_rtkit *rtk,
 					  unsigned int state)
@@ -3075,7 +3096,7 @@ int apple_rtkit_cold_restart(struct apple_rtkit *rtk, int (*start)(void *), void
 	int ret;
 
 	/* A fresh boot: no warm or port-only restart may answer its endpoint map. */
-	apple_rtkit_reset_session(rtk);
+	apple_rtkit_reset_session(rtk, false);
 	rtk->warm_restart = false;
 	rtk->port_only = false;
 	rtk->warm_last_mask = U32_MAX;

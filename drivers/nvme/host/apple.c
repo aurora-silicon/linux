@@ -277,7 +277,7 @@ struct apple_nvme {
 	u32 sleep_csts;
 	/* ANS came back across a sleep, or failed to. reset_work picks these up. */
 	bool sleep_restarted;
-	/* A firmware sleep took ANS's power: its next start is from that power-on */
+	/* Start from reset after a firmware sleep or an IDLE that was unwound. */
 	bool fw_sleep_restart;
 	/* This suspend idled ANS for a firmware sleep, whether or not the sleep happened */
 	bool fw_sleep_idled;
@@ -1899,6 +1899,47 @@ static void apple_nvme_stop_crashed_session(struct apple_nvme *anv)
 	anv->ctrl.ctrl_config = 0;
 }
 
+static void apple_nvme_save_sart(struct apple_nvme *anv)
+{
+	anv->sart_power = readl(anv->mmio_nvme + APPLE_ANS_SART_POWER);
+	if (anv->sart)
+		apple_sart_save_now(anv->sart);
+}
+
+/* IDLE can gate the SART independently of the ANS power domain. */
+static void apple_nvme_restore_sart_power(struct apple_nvme *anv)
+{
+	void __iomem *power = anv->mmio_nvme + APPLE_ANS_SART_POWER;
+
+	if (readl(power) != anv->sart_power)
+		writel(anv->sart_power, power);
+}
+
+static int apple_nvme_restart_warm_idle(struct apple_nvme *anv)
+{
+	int ret;
+
+	/* The SART shares this reset. Keep RUN clear through the restore. */
+	ret = reset_control_reset(anv->reset);
+	if (ret)
+		return ret;
+
+	apple_nvme_restore_sart_power(anv);
+	if (readl(anv->mmio_nvme + APPLE_ANS_SART_POWER) != anv->sart_power)
+		return -EIO;
+	if (anv->sart)
+		apple_sart_restore_early(anv->sart);
+
+	/* ANS may resume logging to the buffers in the restored entries. */
+	ret = apple_rtkit_reinit_retaining_buffers(anv->rtk);
+	if (ret)
+		return ret;
+	apple_rtkit_set_recv_enabled(anv->rtk, true);
+	writel(APPLE_ANS_COPROC_CPU_CONTROL_RUN,
+	       anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
+	return apple_rtkit_boot(anv->rtk);
+}
+
 static bool apple_nvme_sleep_wait_on(struct apple_nvme *anv);
 
 static void apple_nvme_reset_work_impl(struct work_struct *work)
@@ -2061,6 +2102,18 @@ static void apple_nvme_reset_work_impl(struct work_struct *work)
 		fw_sleep = READ_ONCE(anv->fw_sleep_restart);
 		WRITE_ONCE(anv->fw_sleep_restart, false);
 
+		if (fw_sleep && anv->hw->warm_sleep) {
+			ret = apple_nvme_restart_warm_idle(anv);
+			if (ret) {
+				WRITE_ONCE(anv->sleep_failed, true);
+				dev_crit(anv->dev, "ANS recovery after refused sleep failed: %d\n",
+					 ret);
+				return;
+			}
+			dev_info(anv->dev, "ANS: recovered after refused sleep\n");
+			goto rtkit_ready;
+		}
+
 		ret = reset_control_assert(anv->reset);
 		if (ret)
 			goto out;
@@ -2080,8 +2133,7 @@ static void apple_nvme_reset_work_impl(struct work_struct *work)
 		 * entries before starting ANS (no-op on cold boot when replay_valid is false).
 		 */
 		if (fw_sleep) {
-			if (readl(anv->mmio_nvme + APPLE_ANS_SART_POWER) != anv->sart_power)
-				writel(anv->sart_power, anv->mmio_nvme + APPLE_ANS_SART_POWER);
+			apple_nvme_restore_sart_power(anv);
 			/* Only after a sleep that didn't happen: the wake wrote them already. */
 			if (anv->sart)
 				apple_sart_restore_early(anv->sart);
@@ -3197,8 +3249,10 @@ static void apple_nvme_t8122_warm_resume(struct apple_nvme *anv)
 	 * restart without a power cycle can hang; fall back to the cold PMGR
 	 * reset path in apple_nvme_reset_work_impl().
 	 */
-	if (!pm_resume_via_firmware())
+	if (!pm_resume_via_firmware()) {
+		WRITE_ONCE(anv->fw_sleep_restart, true);
 		return;
+	}
 
 	apple_sleep_restore_pins();
 	if (anv->sart)
@@ -3430,6 +3484,13 @@ static int apple_nvme_suspend(struct device *dev)
 	    pm_suspend_via_firmware())
 		return apple_nvme_m5_prepare(anv);
 
+	if (anv->hw->warm_sleep) {
+		/* The previous resume may still be using its SART snapshot. */
+		flush_work(&anv->ctrl.reset_work);
+		if (READ_ONCE(anv->sleep_failed))
+			return -EIO;
+	}
+
 	if (anv->hw->needs_ioq_registers) {
 		/* A sleep right after a wake, as from a dark wake: let that reset finish first. */
 		flush_work(&anv->ctrl.reset_work);
@@ -3495,11 +3556,15 @@ static int apple_nvme_suspend(struct device *dev)
 		    !apple_sleep_dry_run()) {
 			anv->sleep_failed = false;
 			anv->sleep_restarted = false;
+			apple_nvme_save_sart(anv);
 			ret = apple_rtkit_idle(anv->rtk);
 			if (ret) {
+				if (anv->sart)
+					apple_sart_discard_saved(anv->sart);
 				dev_err(dev, "ANS warm idle failed: %d\n", ret);
 				return ret;
 			}
+			apple_rtkit_mailbox_off(anv->rtk);
 			writel(0, anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
 			WRITE_ONCE(anv->t8122_warm_sleep, true);
 			return 0;
@@ -3514,9 +3579,7 @@ static int apple_nvme_suspend(struct device *dev)
 			 * In IDLE it gates its SART, so the SART's entries and the word
 			 * that gates it are read before that.
 			 */
-			anv->sart_power = readl(anv->mmio_nvme + APPLE_ANS_SART_POWER);
-			if (anv->sart)
-				apple_sart_save_now(anv->sart);
+			apple_nvme_save_sart(anv);
 			anv->fw_sleep_idled = true;
 			ret = apple_rtkit_idle(anv->rtk);
 			if (!ret)

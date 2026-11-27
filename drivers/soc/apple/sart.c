@@ -450,6 +450,16 @@ void apple_sart_save_now(struct apple_sart *sart)
 }
 EXPORT_SYMBOL_GPL(apple_sart_save_now);
 
+/* An aborted sleep must not supply entries to a later suspend or reset. */
+void apple_sart_discard_saved(struct apple_sart *sart)
+{
+	sart->saved_early = false;
+	sart->early_pending = false;
+	sart->saved_valid = false;
+	sart->replay_valid = false;
+}
+EXPORT_SYMBOL_GPL(apple_sart_discard_saved);
+
 static unsigned int apple_sart_write_saved(struct apple_sart *sart)
 {
 	unsigned int restored = 0;
@@ -476,9 +486,9 @@ void apple_sart_restore_early(struct apple_sart *sart)
 	sart->saved_early = false;
 	if (!sart->early_pending)
 		return;
-	sart->early_pending = false;
 	dev_info(sart->dev, "%u entries written back after a sleep that didn't happen\n",
 		 apple_sart_write_saved(sart));
+	apple_sart_discard_saved(sart);
 }
 EXPORT_SYMBOL_GPL(apple_sart_restore_early);
 
