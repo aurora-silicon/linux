@@ -1653,6 +1653,7 @@
 
 		dcpext: dcp@271c00000 {
 			compatible = "apple,t8103-dcpext", "apple,dcpext";
+			apple,display-power = <&dcp_power>;
 			mboxes = <&dcpext_mbox>;
 			mbox-names = "mbox";
 			iommus = <&dcpext_dart 0 0x0 0x0 0x0 0xfc000000>;
