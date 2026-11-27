@@ -117,6 +117,110 @@ int avd_h264_next_nalu(const u8 *buf, u32 len, u32 *cursor,
 	return 0;
 }
 
+bool avd_h264_mode_supported(s32 decode_mode, s32 start_code)
+{
+	switch (decode_mode) {
+	case V4L2_STATELESS_H264_DECODE_MODE_SLICE_BASED:
+		return start_code == V4L2_STATELESS_H264_START_CODE_NONE;
+	case V4L2_STATELESS_H264_DECODE_MODE_FRAME_BASED:
+		return start_code == V4L2_STATELESS_H264_START_CODE_ANNEX_B ||
+		       start_code == V4L2_STATELESS_H264_START_CODE_NONE;
+	default:
+		return false;
+	}
+}
+
+static bool avd_h264_has_annexb_start_code(const u8 *buf, u32 len)
+{
+	u32 pos = 0;
+
+	while (pos < len && buf[pos] == 0x00)
+		pos++;
+
+	return pos >= 2 && pos < len && buf[pos] == 0x01;
+}
+
+/*
+ * Parse a single unprefixed ITU-T H.264 7.3.1 VCL slice NALU for
+ * FRAME_BASED + START_CODE_NONE. No Annex-B start code prefix is present
+ * and none may appear inside the EBSP payload.
+ */
+static int avd_h264_parse_raw_nalu(const u8 *buf, u32 len,
+				   struct avd_h264_nalu *nalu)
+{
+	u32 end = len, i;
+	u8 hdr, nal_type;
+
+	if (!buf || !nalu || !len)
+		return -EINVAL;
+
+	while (end > 0 && buf[end - 1] == 0x00)
+		end--;
+	if (end < 2)
+		return -EINVAL;
+
+	/* An EBSP must not contain an unescaped 0x00 0x00 0x01 start code. */
+	for (i = 0; end >= 3 && i <= end - 3; i++) {
+		if (buf[i] == 0x00 && buf[i + 1] == 0x00 && buf[i + 2] == 0x01)
+			return -EINVAL;
+	}
+
+	hdr = buf[0];
+	if (hdr & 0x80)
+		return -EINVAL;
+
+	nal_type = hdr & 0x1f;
+	if (nal_type != AVD_H264_NAL_SLICE &&
+	    nal_type != AVD_H264_NAL_IDR_SLICE)
+		return -EINVAL;
+
+	nalu->off = 0;
+	nalu->len = end;
+	nalu->nal_ref_idc = (hdr >> 5) & 0x03;
+	nalu->nal_unit_type = nal_type;
+	return 1;
+}
+
+/*
+ * Iterate VCL slice NALUs in a FRAME_BASED OUTPUT buffer according to
+ * V4L2_CID_STATELESS_H264_START_CODE:
+ * - START_CODE_ANNEX_B requires Annex-B start codes (0x000001 / 0x00000001).
+ * - START_CODE_NONE accepts a single unprefixed ITU-T H.264 7.3.1 VCL slice
+ *   NALU. For compatibility with clients (such as Chromium's
+ *   V4L2VideoDecoderDelegateH264) that set DECODE_MODE=FRAME_BASED without
+ *   writing START_CODE, leaving it at this driver's START_CODE_NONE default
+ *   while still emitting Annex-B start codes, a buffer starting with an
+ *   Annex-B start code is dispatched to the Annex-B scanner. That cannot
+ *   collide with valid START_CODE_NONE data because no valid 7.3.1 NALU
+ *   begins with 0x00 (nal_unit_type 0 is invalid).
+ */
+int avd_h264_next_frame_nalu(const u8 *buf, u32 len, s32 start_code,
+			     u32 *cursor, struct avd_h264_nalu *nalu)
+{
+	int ret;
+
+	if (!cursor || !nalu)
+		return -EINVAL;
+
+	if (start_code == V4L2_STATELESS_H264_START_CODE_ANNEX_B)
+		return avd_h264_next_nalu(buf, len, cursor, nalu);
+
+	if (start_code != V4L2_STATELESS_H264_START_CODE_NONE)
+		return -EINVAL;
+
+	if (!buf)
+		return len ? -EINVAL : 0;
+	if (avd_h264_has_annexb_start_code(buf, len))
+		return avd_h264_next_nalu(buf, len, cursor, nalu);
+	if (*cursor >= len)
+		return 0;
+
+	ret = avd_h264_parse_raw_nalu(buf, len, nalu);
+	if (ret > 0)
+		*cursor = len;
+	return ret;
+}
+
 VISIBLE_IF_KUNIT void avd_h264_br_init(struct avd_h264_br *br, const u8 *data,
 				       u32 len, u32 pos)
 {
