@@ -192,6 +192,11 @@ impl RenderCommand {
     pub(crate) fn is_heavy_ta(&self) -> bool {
         self.heavy_ta
     }
+
+    /// Whether this render pass is multisampled.
+    pub(crate) fn is_multisampled(&self) -> bool {
+        self.cmd.samples > 1
+    }
 }
 
 /// A validated compute command.
