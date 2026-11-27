@@ -567,6 +567,9 @@ static void __iomem *asahi_g17_map(struct device_node *np, const char *name, int
 	    offset + size > resource_size(&res))
 		return NULL;
 
+	/* A posted write to a nonposted-mmio bus is not acknowledged as the bus requires. */
+	if (res.flags & IORESOURCE_MEM_NONPOSTED)
+		return ioremap_np(res.start + offset, size);
 	return ioremap(res.start + offset, size);
 }
 
