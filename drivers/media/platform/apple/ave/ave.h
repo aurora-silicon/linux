@@ -621,6 +621,10 @@ int ave_fw_text_boot_crc(const void *text, size_t size, u32 word_off,
 			 u32 *crc);
 bool ave_dapf_admits(const struct ave_dapf_entry *e, unsigned int n, u64 first,
 		     u64 last);
+const char *ave_fw_filter_gap(struct ave_dev *ave,
+			      const struct ave_dapf_entry *e, u64 *first,
+			      u64 *last);
+int ave_fw_check_filter(struct ave_dev *ave);
 void ave_fw_remove(struct ave_dev *ave);
 int ave_fw_ensure_running(struct ave_dev *ave);
 int ave_dart_audit(struct ave_dev *ave, const char *when);

@@ -203,6 +203,11 @@ static int ave_fw_text_boot_id(struct ave_dev *ave, u32 word_off, u32 *crc)
 	return ret;
 }
 
+static bool ave_fw_range_valid(u64 start, size_t size)
+{
+	return start && size && start <= U64_MAX - (size - 1);
+}
+
 static int ave_fw_text_id(struct ave_dev *ave, const struct ave_fw_build *build,
 			  u32 *crc)
 {
@@ -343,6 +348,10 @@ int ave_fw_probe(struct ave_dev *ave)
 	if (ret)
 		return dev_err_probe(dev, ret,
 				     "firmware text link cell is not the DATA address\n");
+	if ((ave->dapf || ave->variant->vcbar_text_phys) &&
+	    !ave_fw_range_valid(ave->data_alias, ave->data.size))
+		return dev_err_probe(dev, -ENODEV,
+				     "firmware DATA alias is missing or invalid\n");
 	known |= ave_fw_known_crc(text_crc);
 	if (build) {
 		const struct ave_fw_build *same_size =
@@ -580,23 +589,28 @@ static void ave_fw_read_dapf(struct ave_dev *ave, struct ave_dapf_entry *e)
 	}
 }
 
-/* The firmware range the filter leaves out, with its bounds, or NULL. */
-static const char *ave_fw_filter_gap(struct ave_dev *ave,
-				     const struct ave_dapf_entry *e, u64 *first,
-				     u64 *last)
+static bool ave_fw_filter_admits(const struct ave_dapf_entry *e, u64 start,
+				 size_t size, u64 *first, u64 *last)
 {
-	if (ave->variant->vcbar_text_phys) {
-		*first = ave->text.phys;
-		*last = ave->text.phys + ave->text.size - 1;
-		if (!ave_dapf_admits(e, AVE_DAPF_ENTRIES, *first, *last))
-			return "TEXT";
+	*first = start;
+	if (!ave_fw_range_valid(start, size)) {
+		*last = start;
+		return false;
 	}
-	if (ave->data_alias) {
-		*first = ave->data_alias;
-		*last = ave->data_alias + ave->data.size - 1;
-		if (!ave_dapf_admits(e, AVE_DAPF_ENTRIES, *first, *last))
-			return "DATA";
-	}
+	*last = start + size - 1;
+	return ave_dapf_admits(e, AVE_DAPF_ENTRIES, *first, *last);
+}
+
+/* The firmware range the filter leaves out, with its bounds, or NULL. */
+const char *ave_fw_filter_gap(struct ave_dev *ave,
+			      const struct ave_dapf_entry *e, u64 *first,
+			      u64 *last)
+{
+	if (ave->variant->vcbar_text_phys &&
+	    !ave_fw_filter_admits(e, ave->text.phys, ave->text.size, first, last))
+		return "TEXT";
+	if (!ave_fw_filter_admits(e, ave->data_alias, ave->data.size, first, last))
+		return "DATA";
 	return NULL;
 }
 
@@ -609,14 +623,20 @@ static const char *ave_fw_filter_gap(struct ave_dev *ave,
  * first instruction. Check the filter, read-only, before anything is
  * written to start the coprocessor.
  */
-static int ave_fw_check_filter(struct ave_dev *ave)
+int ave_fw_check_filter(struct ave_dev *ave)
 {
 	struct ave_dapf_entry e[AVE_DAPF_ENTRIES];
 	const char *missing;
 	u64 first = 0, last = 0;
 
-	if (!ave->dapf)
+	if (!ave->dapf) {
+		if (ave->variant->vcbar_text_phys) {
+			dev_err(ave->dev,
+				"CPU DART filter is unavailable; not starting the coprocessor\n");
+			return -ENODEV;
+		}
 		return 0;
+	}
 	ave_fw_read_dapf(ave, e);
 	missing = ave_fw_filter_gap(ave, e, &first, &last);
 	if (!missing)

@@ -1710,12 +1710,26 @@ static void ave_t8103_26b123_build(struct kunit *test)
 	}
 }
 
+static void ave_t8103_write_dapf(void __iomem *dapf,
+				 const struct ave_dapf_entry *e,
+				 unsigned int n)
+{
+	memset_io(dapf, 0, AVE_DAPF_ENTRIES * AVE_DAPF_STRIDE);
+	for (unsigned int i = 0; i < n; i++) {
+		void __iomem *r = dapf + i * AVE_DAPF_STRIDE;
+
+		writel(e[i].ctrl, r + AVE_DAPF_CTRL);
+		writeq(e[i].start, r + AVE_DAPF_START);
+		writeq(e[i].end, r + AVE_DAPF_END);
+	}
+}
+
 /*
  * The J313's encoder CPU DART filter as its ADT describes it: TEXT at its
  * physical address, and the window the firmware reaches DART space through.
  * The driver starts the coprocessor only when the filter admits TEXT and
- * the firmware's DATA alias (the link cell); an unprogrammed filter reads
- * zero and admits nothing.
+ * the firmware's nonzero DATA alias (the link cell); an unprogrammed filter
+ * reads zero and admits nothing.
  */
 static void ave_t8103_cpu_dart_filter(struct kunit *test)
 {
@@ -1726,6 +1740,28 @@ static void ave_t8103_cpu_dart_filter(struct kunit *test)
 		{ .ctrl = 0x33, .start = 0xf00000000ULL, .end = 0xfffffffffULL },
 	};
 	struct ave_dapf_entry none[AVE_DAPF_ENTRIES] = {};
+	struct ave_dapf_entry text_only[AVE_DAPF_ENTRIES] = {
+		{ .ctrl = 0x11, .start = text, .end = text_last },
+	};
+	struct ave_dev *ave = kunit_kzalloc(test, sizeof(*ave), GFP_KERNEL);
+	void __iomem *dapf;
+	u64 first = 0, last = 0;
+	const char *gap;
+
+	KUNIT_ASSERT_NOT_NULL(test, ave);
+	dapf = (void __iomem __force *)kunit_kzalloc(test,
+						    AVE_DAPF_ENTRIES * AVE_DAPF_STRIDE,
+						    GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, dapf);
+	ave->dev = kunit_device_register(test, "apple-ave-dapf-test");
+	KUNIT_ASSERT_FALSE(test, IS_ERR(ave->dev));
+	ave->variant = &ave_t8103;
+	ave->text.phys = text;
+	ave->text.size = 0x114000;
+	ave->data.size = 0x128000;
+	ave->data_alias = alias;
+	ave->dapf = dapf;
+	ave->dapf_phys = 0x267044000ULL;
 
 	KUNIT_EXPECT_TRUE(test, ave_dapf_admits(e, AVE_DAPF_ENTRIES, text, text_last));
 	KUNIT_EXPECT_TRUE(test, ave_dapf_admits(e, AVE_DAPF_ENTRIES, alias, alias_last));
@@ -1741,16 +1777,82 @@ static void ave_t8103_cpu_dart_filter(struct kunit *test)
 	/* An end whose low two bits do not read back still covers its range. */
 	e[0].end = text_last & ~3ULL;
 	KUNIT_EXPECT_TRUE(test, ave_dapf_admits(e, AVE_DAPF_ENTRIES, text, text_last));
+
+	/* Valid filter with a nonzero DATA alias passes the pre-start guard. */
+	ave_t8103_write_dapf(dapf, e, 2);
+	KUNIT_EXPECT_NULL(test, ave_fw_filter_gap(ave, e, &first, &last));
+	KUNIT_EXPECT_EQ(test, ave_fw_check_filter(ave), 0);
+
+	/* A required filter that is unavailable or unmapped is refused separately. */
+	ave->dapf = NULL;
+	KUNIT_EXPECT_EQ(test, ave_fw_check_filter(ave), -ENODEV);
+	ave->variant = &ave_t8112;
+	KUNIT_EXPECT_EQ(test, ave_fw_check_filter(ave), 0);
+	ave->variant = &ave_t8103;
+	ave->dapf = dapf;
+
+	/* A mapped, unprogrammed filter (all-zero entries) is refused. */
+	ave_t8103_write_dapf(dapf, none, 0);
+	gap = ave_fw_filter_gap(ave, none, &first, &last);
+	KUNIT_ASSERT_NOT_NULL(test, gap);
+	KUNIT_EXPECT_STREQ(test, gap, "TEXT");
+	KUNIT_EXPECT_EQ(test, ave_fw_check_filter(ave), -ENODEV);
+
+	/* An unlinked handoff (zero DATA alias) is refused even on a TEXT-only filter. */
+	ave->data_alias = 0;
+	gap = ave_fw_filter_gap(ave, e, &first, &last);
+	KUNIT_ASSERT_NOT_NULL(test, gap);
+	KUNIT_EXPECT_STREQ(test, gap, "DATA");
+	KUNIT_EXPECT_EQ(test, ave_fw_check_filter(ave), -ENODEV);
+	ave_t8103_write_dapf(dapf, text_only, 1);
+	gap = ave_fw_filter_gap(ave, text_only, &first, &last);
+	KUNIT_ASSERT_NOT_NULL(test, gap);
+	KUNIT_EXPECT_STREQ(test, gap, "DATA");
+	KUNIT_EXPECT_EQ(test, ave_fw_check_filter(ave), -ENODEV);
+
+	/* An excluded or wrapping DATA alias is refused. */
+	ave->data_alias = 0x114000ULL;
+	ave_t8103_write_dapf(dapf, e, 2);
+	gap = ave_fw_filter_gap(ave, e, &first, &last);
+	KUNIT_ASSERT_NOT_NULL(test, gap);
+	KUNIT_EXPECT_STREQ(test, gap, "DATA");
+	KUNIT_EXPECT_EQ(test, ave_fw_check_filter(ave), -ENODEV);
+
+	ave->data_alias = U64_MAX - 0x1000ULL;
+	gap = ave_fw_filter_gap(ave, e, &first, &last);
+	KUNIT_ASSERT_NOT_NULL(test, gap);
+	KUNIT_EXPECT_STREQ(test, gap, "DATA");
+	KUNIT_EXPECT_EQ(test, ave_fw_check_filter(ave), -ENODEV);
+
+	ave->data_alias = alias;
+	gap = ave_fw_filter_gap(ave, text_only, &first, &last);
+	KUNIT_ASSERT_NOT_NULL(test, gap);
+	KUNIT_EXPECT_STREQ(test, gap, "DATA");
+	ave_t8103_write_dapf(dapf, text_only, 1);
+	KUNIT_EXPECT_EQ(test, ave_fw_check_filter(ave), -ENODEV);
+
 	/* After a deep sleep the range stays but the enable bits are clear. */
 	e[0].ctrl = 0x10;
 	e[1].ctrl = 0x30;
 	KUNIT_EXPECT_FALSE(test, ave_dapf_admits(e, AVE_DAPF_ENTRIES, text, text_last));
 	KUNIT_EXPECT_FALSE(test, ave_dapf_admits(e, AVE_DAPF_ENTRIES, alias, alias_last));
+	e[0].ctrl = 0x11;
+	ave_t8103_write_dapf(dapf, e, 2);
+	gap = ave_fw_filter_gap(ave, e, &first, &last);
+	KUNIT_ASSERT_NOT_NULL(test, gap);
+	KUNIT_EXPECT_STREQ(test, gap, "DATA");
+	KUNIT_EXPECT_EQ(test, ave_fw_check_filter(ave), -ENODEV);
+
 	e[1].ctrl = 0x33;
 	/* A range with no control word is not programmed. */
 	e[0].ctrl = 0;
 	KUNIT_EXPECT_FALSE(test, ave_dapf_admits(e, AVE_DAPF_ENTRIES, text, text_last));
 	KUNIT_EXPECT_FALSE(test, ave_dapf_admits(e, AVE_DAPF_ENTRIES, text_last, text));
+	ave_t8103_write_dapf(dapf, e, 2);
+	gap = ave_fw_filter_gap(ave, e, &first, &last);
+	KUNIT_ASSERT_NOT_NULL(test, gap);
+	KUNIT_EXPECT_STREQ(test, gap, "TEXT");
+	KUNIT_EXPECT_EQ(test, ave_fw_check_filter(ave), -ENODEV);
 	/* Only the entries counted are looked at. */
 	KUNIT_EXPECT_FALSE(test, ave_dapf_admits(e, 1, alias, alias_last));
 }
