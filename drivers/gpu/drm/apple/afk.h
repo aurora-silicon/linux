@@ -47,6 +47,8 @@ struct epic_cmd_info {
 	bool done;
 	bool free_on_ack;
 	struct completion *completion;
+	/* When the command was queued, in jiffies: for the report of a late reply. */
+	unsigned long queued;
 };
 
 struct apple_epic_service {
@@ -57,6 +59,14 @@ struct apple_epic_service {
 	DECLARE_BITMAP(cmd_map, MAX_PENDING_CMDS);
 	/* Legacy EPIC sequence; AFKV2 history belongs to the interface. */
 	u8 cmd_tag;
+	/*
+	 * A command that timed out unanswered was reported with the state of
+	 * its endpoint, and so was a call refused for want of a free slot.
+	 * The next reply on the service ends both; only a reply frees the slot
+	 * of a timed-out command (lock).
+	 */
+	bool stall_reported;
+	bool full_reported;
 	spinlock_t lock;
 	/* Pins held by owners and synchronous callers; protected by lock. */
 	unsigned int users;
@@ -587,6 +597,13 @@ struct apple_dcp_afkep {
 	/* Serializes TX ring writes and mailbox doorbells outside ep->lock. */
 	struct mutex tx_lock;
 	u16 qe_seq;
+	/*
+	 * For the report of a command that goes unanswered: the doorbells not
+	 * delivered since the last one that was, and the error of the last
+	 * (tx_lock).
+	 */
+	unsigned int doorbells_lost;
+	int doorbell_error;
 	bool stopping; /* lock: no new receive work after shutdown. */
 
 	/* Compact EPIC, detected from the first compact message (desktop 26.x). */
