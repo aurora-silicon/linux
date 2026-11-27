@@ -589,6 +589,10 @@ impl Firmware {
 }
 
 impl gpu::Gpu for Gpu {
+    fn max_cmdbuf_size(&self) -> usize {
+        command::MAX_CMDBUF
+    }
+
     fn stats_snapshot(&self) -> Option<Arc<crate::stats::StatsSnapshot>> {
         None
     }
