@@ -276,6 +276,8 @@ struct apple_nvme {
 	u32 sleep_csts;
 	/* ANS came back across a sleep, or failed to. reset_work picks these up. */
 	bool sleep_restarted;
+	/* sleep_legacy: the suspend kept RTKit live; the reset only re-enables the controller. */
+	bool sleep_kept;
 	bool sleep_failed;
 	/* Run bit set after a sleep, and not yet reported on. */
 	bool sleep_restarting;
@@ -2047,11 +2049,24 @@ static void apple_nvme_reset_work_impl(struct work_struct *work)
 				goto out;
 			goto rtkit_ready;
 		}
-		/* A real sleep took the controller's state, and the warm restart kept RTKit's. */
-		if (anv->hw->sleep_legacy && READ_ONCE(anv->sleep_restarted)) {
+		/*
+		 * RTKit stayed live across the suspend (the shutdown notification was sent, the
+		 * queues stopped), or a warm restart brought it back after a real sleep: only the
+		 * controller is disabled and set up again, as on post-M4. An RTKit shutdown and a
+		 * cold reset of that firmware leave the controller dead.
+		 */
+		if (anv->hw->sleep_legacy &&
+		    (READ_ONCE(anv->sleep_restarted) || READ_ONCE(anv->sleep_kept))) {
+			dev_info(anv->dev, "ANS: kept live across the suspend%s, controller set up again\n",
+				 READ_ONCE(anv->sleep_restarted) ? " and warm-restarted" : "");
 			WRITE_ONCE(anv->sleep_restarted, false);
-			if (!(readl(anv->mmio_nvme + NVME_REG_CC) & NVME_CC_ENABLE))
-				goto rtkit_ready;
+			WRITE_ONCE(anv->sleep_kept, false);
+			if (readl(anv->mmio_nvme + NVME_REG_CC) & NVME_CC_ENABLE) {
+				ret = apple_nvme_disable_legacy(anv, false);
+				if (ret)
+					goto out;
+			}
+			goto rtkit_ready;
 		}
 		/* reset the controller if it is enabled */
 		if (anv->ctrl.ctrl_config & NVME_CC_ENABLE)
@@ -3471,6 +3486,10 @@ static int apple_nvme_suspend(struct device *dev)
 		}
 		if (anv->sleep_stop) {
 			apple_sleep_coproc_set_ready(dev, true);
+			if (anv->hw->sleep_legacy) {
+				WRITE_ONCE(anv->sleep_kept, true);
+				dev_info(dev, "NVMe suspended for a sleep: SHN done, ANS kept live, domains kept on\n");
+			}
 			dev_dbg(dev, "NVMe suspended for a sleep\n");
 		}
 		return 0;
