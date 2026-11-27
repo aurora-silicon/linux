@@ -537,6 +537,12 @@ static struct macaudio_link_props macaudio_fe_link_props[] = {
  * speakers play. While it does, the volumes may go up to the amps' 0 dB;
  * otherwise they are held at the lock's ceiling. The daemon governs them
  * from its thermal model.
+ *
+ * As for "Speaker Protection", taking the lock and renewing the lease need
+ * CAP_SYS_ADMIN: access to the card's control device alone does not lift
+ * the ceiling. The daemon need not hold the speaker volume controls with
+ * the capability: they are unlocked only while every one of them belongs
+ * to the owner of the lock.
  */
 
 static void macaudio_vlimit_unlock(struct macaudio_snd_data *ma, bool unlock)
@@ -3879,6 +3885,9 @@ static int macaudio_slk_put(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_v
 
 	if (val != SPEAKER_MAGIC_VALUE)
 		return -EINVAL;
+	/* The protection daemon, not whoever has the seat's control device */
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
 
 	mutex_lock(&ma->volume_lock_mutex);
 
@@ -3937,6 +3946,10 @@ static int macaudio_slk_lock(struct snd_kcontrol *kcontrol, struct snd_ctl_file 
 {
 	struct snd_soc_card *card = snd_kcontrol_chip(kcontrol);
 	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
+
+	/* The protection daemon, not whoever has the seat's control device */
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
 
 	mutex_lock(&ma->volume_lock_mutex);
 

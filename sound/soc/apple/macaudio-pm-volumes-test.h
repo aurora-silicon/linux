@@ -254,10 +254,84 @@ static void macaudio_pm_volumes_new_owner(struct kunit *test)
 	macaudio_pmt_expect_vols(test, &t, true);
 }
 
+static int macaudio_pmt_write(struct kunit *test, struct macaudio_pmt_pm *t, long val)
+{
+	struct snd_ctl_elem_value *uval = kunit_kzalloc(test, sizeof(*uval), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, uval);
+	uval->value.integer.value[0] = val;
+	return macaudio_slk_put(t->slk, uval);
+}
+
+static const struct cred *macaudio_pmt_drop_cap(struct kunit *test, struct cred **cred)
+{
+	*cred = prepare_creds();
+	KUNIT_ASSERT_NOT_NULL(test, *cred);
+	cap_lower((*cred)->cap_effective, CAP_SYS_ADMIN);
+	return override_creds(*cred);
+}
+
+static void macaudio_pmt_restore_cap(const struct cred *old, struct cred *cred)
+{
+	revert_creds(old);
+	put_cred(cred);
+}
+
+/*
+ * Only a CAP_SYS_ADMIN process takes the volume lock and renews its lease,
+ * as for "Speaker Protection". A saved mixer state (0 or 1) is restored
+ * without it.
+ */
+static void macaudio_pm_volumes_lock_needs_cap_sys_admin(struct kunit *test)
+{
+	struct snd_ctl_file *seat = kunit_kzalloc(test, sizeof(*seat), GFP_KERNEL);
+	struct macaudio_pmt_pm t;
+	const struct cred *old;
+	struct cred *cred;
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, seat);
+	macaudio_pmt_pm_card(test, &t);
+	/* The floor of every bind */
+	macaudio_vlimit_unlock(t.ma, false);
+	macaudio_pmt_expect_vols(test, &t, true);
+
+	/* Without the capability: the volumes and the lock refused */
+	old = macaudio_pmt_drop_cap(test, &cred);
+	for (i = 0; i < MACAUDIO_PMT_NR_VOLS - 1; i++)
+		t.vols[i]->vd[0].owner = seat;
+	KUNIT_EXPECT_EQ(test, macaudio_slk_lock(t.slk, seat), -EPERM);
+	KUNIT_EXPECT_EQ(test, macaudio_pmt_ping(test, &t), -EPERM);
+	KUNIT_EXPECT_EQ(test, macaudio_pmt_write(test, &t, 0), 0);
+	KUNIT_EXPECT_EQ(test, macaudio_pmt_write(test, &t, 1), 0);
+	macaudio_pmt_restore_cap(old, cred);
+	KUNIT_EXPECT_NULL(test, t.ma->speaker_lock_owner);
+	KUNIT_EXPECT_FALSE(test, t.ma->speaker_volume_unlocked);
+	macaudio_pmt_expect_vols(test, &t, true);
+	for (i = 0; i < MACAUDIO_PMT_NR_VOLS - 1; i++)
+		t.vols[i]->vd[0].owner = NULL;
+
+	/* The daemon's lock, its file then pinged without the capability */
+	macaudio_pmt_take(test, &t);
+	old = macaudio_pmt_drop_cap(test, &cred);
+	KUNIT_EXPECT_EQ(test, macaudio_pmt_ping(test, &t), -EPERM);
+	KUNIT_EXPECT_EQ(test, macaudio_pmt_write(test, &t, 1), 0);
+	macaudio_pmt_restore_cap(old, cred);
+	KUNIT_EXPECT_FALSE(test, t.ma->speaker_volume_unlocked);
+	macaudio_pmt_expect_vols(test, &t, true);
+
+	/* With it, the lease unlocks them as before */
+	KUNIT_EXPECT_EQ(test, macaudio_pmt_ping(test, &t), 0);
+	KUNIT_EXPECT_TRUE(test, t.ma->speaker_volume_unlocked);
+	KUNIT_EXPECT_EQ(test, macaudio_pmt_write(test, &t, 0), 0);
+	KUNIT_EXPECT_TRUE(test, t.ma->speaker_volume_unlocked);
+}
+
 static struct kunit_case macaudio_pm_volumes_cases[] = {
 	KUNIT_CASE(macaudio_pm_volumes_restored_after_sleep),
 	KUNIT_CASE(macaudio_pm_volumes_second_sleep_before_ping),
 	KUNIT_CASE(macaudio_pm_volumes_new_owner),
+	KUNIT_CASE(macaudio_pm_volumes_lock_needs_cap_sys_admin),
 	{}
 };
 
