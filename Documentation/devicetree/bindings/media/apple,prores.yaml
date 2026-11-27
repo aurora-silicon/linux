@@ -92,7 +92,11 @@ allOf:
           maxItems: 2
 
         power-domains:
-          maxItems: 1
+          minItems: 1
+          items:
+            - description: Power state of the engine.
+            - description: PMC rail floor held while the engine runs.
+            - description: PMC rail floor held while the engine runs.
 
         resets:
           maxItems: 1
