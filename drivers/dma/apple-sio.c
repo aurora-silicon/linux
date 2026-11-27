@@ -109,12 +109,15 @@ struct sio_chan {
 	unsigned int no;
 	struct sio_data *host;
 	struct virt_dma_chan vc;
+	struct work_struct issue_wq;
 	struct work_struct terminate_wq;
 
 	bool configured;
 	struct sio_shmem_chan_config cfg;
 
 	struct sio_tx *current_tx;
+	/* Holds a runtime PM reference while current_tx is active. */
+	bool tx_rpm_held;
 
 	/*
 	 * Until a client sets an idle transfer, the channel keeps the old
@@ -1104,7 +1107,8 @@ static bool sio_fill_in_old_locked(struct sio_chan *siochan)
 	struct sio_coproc_desc *d = tx->siodesc[tx->next];
 	int ret;
 
-	if (tx->ninflight >= SIO_MAX_NINFLIGHT || tx->terminated)
+	if (READ_ONCE(sio->rpm_stopped) ||
+	    tx->ninflight >= SIO_MAX_NINFLIGHT || tx->terminated)
 		return false;
 
 	static_assert(sizeof(dma_cookie_t) <= sizeof(void *));
@@ -1128,8 +1132,8 @@ static bool sio_fill_in_ring_locked(struct sio_chan *siochan)
 	struct sio_coproc_desc *d;
 	int ret;
 
-	if (!tx || siochan->issuing || siochan->stopping ||
-	    siochan->nissued >= SIO_MAX_NINFLIGHT)
+	if (READ_ONCE(sio->rpm_stopped) || !tx || siochan->issuing ||
+	    siochan->stopping || siochan->nissued >= SIO_MAX_NINFLIGHT)
 		return false;
 
 	d = tx->siodesc[tx->next];
@@ -1166,15 +1170,80 @@ static void sio_update_current_tx_locked(struct sio_chan *siochan)
 	}
 }
 
+static void sio_issue_work(struct work_struct *wq)
+{
+	struct sio_chan *siochan = container_of(wq, struct sio_chan, issue_wq);
+	struct sio_data *sio = siochan->host;
+	unsigned long flags;
+	bool need_start;
+	bool put_rpm = true;
+	int ret;
+
+	spin_lock_irqsave(&siochan->vc.lock, flags);
+	need_start = !siochan->current_tx && vchan_next_desc(&siochan->vc);
+	spin_unlock_irqrestore(&siochan->vc.lock, flags);
+	if (!need_start)
+		return;
+
+	ret = pm_runtime_resume_and_get(sio->dev);
+	if (ret < 0) {
+		dev_err(sio->dev, "runtime resume before issue on chan %d failed: %d\n",
+			siochan->no, ret);
+		return;
+	}
+
+	spin_lock_irqsave(&siochan->vc.lock, flags);
+	if (!siochan->current_tx && vchan_next_desc(&siochan->vc) &&
+	    !READ_ONCE(sio->rpm_stopped)) {
+		if (!siochan->tx_rpm_held) {
+			siochan->tx_rpm_held = true;
+			put_rpm = false;
+		}
+		sio_update_current_tx_locked(siochan);
+	}
+	spin_unlock_irqrestore(&siochan->vc.lock, flags);
+
+	if (put_rpm) {
+		pm_runtime_mark_last_busy(sio->dev);
+		pm_runtime_put_autosuspend(sio->dev);
+	}
+}
+
 static void sio_issue_pending(struct dma_chan *chan)
 {
 	struct sio_chan *siochan = to_sio_chan(chan);
+	struct sio_data *sio = siochan->host;
 	unsigned long flags;
+	bool defer = false;
 
 	spin_lock_irqsave(&siochan->vc.lock, flags);
 	vchan_issue_pending(&siochan->vc);
-	sio_update_current_tx_locked(siochan);
+	if (!siochan->current_tx && vchan_next_desc(&siochan->vc)) {
+		if (siochan->tx_rpm_held) {
+			if (READ_ONCE(sio->rpm_stopped))
+				defer = true;
+			else
+				sio_update_current_tx_locked(siochan);
+		} else if (!IS_ENABLED(CONFIG_PM)) {
+			if (!READ_ONCE(sio->rpm_stopped))
+				sio_update_current_tx_locked(siochan);
+		} else {
+			int ret = pm_runtime_get_if_active(sio->dev);
+
+			if (ret > 0 && !READ_ONCE(sio->rpm_stopped)) {
+				siochan->tx_rpm_held = true;
+				sio_update_current_tx_locked(siochan);
+			} else {
+				if (ret > 0)
+					pm_runtime_put_noidle(sio->dev);
+				defer = true;
+			}
+		}
+	}
 	spin_unlock_irqrestore(&siochan->vc.lock, flags);
+
+	if (defer)
+		schedule_work(&siochan->issue_wq);
 }
 
 static int sio_terminate_all(struct dma_chan *chan)
@@ -1182,6 +1251,7 @@ static int sio_terminate_all(struct dma_chan *chan)
 	struct sio_chan *siochan = to_sio_chan(chan);
 	struct sio_tx *tx;
 	unsigned long flags;
+	bool put_rpm = false;
 	LIST_HEAD(to_free);
 
 	spin_lock_irqsave(&siochan->vc.lock, flags);
@@ -1198,6 +1268,10 @@ static int sio_terminate_all(struct dma_chan *chan)
 			if (siochan->vc.cyclic == &tx->vd)
 				siochan->vc.cyclic = NULL;
 			siochan->current_tx = NULL;
+			if (siochan->tx_rpm_held) {
+				siochan->tx_rpm_held = false;
+				put_rpm = true;
+			}
 			/* Its callback may be running: sio_free_dead() frees it. */
 			if (sio_tx_quiet_locked(siochan, tx)) {
 				list_add_tail(&tx->vd.node, &siochan->dead);
@@ -1215,6 +1289,11 @@ static int sio_terminate_all(struct dma_chan *chan)
 	vchan_get_all_descriptors(&siochan->vc, &to_free);
 	spin_unlock_irqrestore(&siochan->vc.lock, flags);
 
+	if (put_rpm) {
+		pm_runtime_mark_last_busy(siochan->host->dev);
+		pm_runtime_put_autosuspend(siochan->host->dev);
+	}
+
 	vchan_dma_desc_free_list(&siochan->vc, &to_free);
 
 	return 0;
@@ -1226,6 +1305,7 @@ static void sio_terminate_work(struct work_struct *wq)
 	struct sio_data *sio = siochan->host;
 	struct sio_tx *tx;
 	unsigned long flags;
+	bool put_tx_rpm = false;
 	bool resumed;
 	int ret;
 
@@ -1259,9 +1339,24 @@ static void sio_terminate_work(struct work_struct *wq)
 	WARN_ON(siochan->current_tx != tx);
 	siochan->current_tx = NULL;
 	sio_scrub_locked(siochan, tx);
-	sio_update_current_tx_locked(siochan);
+	if (resumed && !READ_ONCE(sio->rpm_stopped) &&
+	    vchan_next_desc(&siochan->vc)) {
+		if (!siochan->tx_rpm_held && IS_ENABLED(CONFIG_PM)) {
+			siochan->tx_rpm_held = true;
+			resumed = false;
+		}
+		sio_update_current_tx_locked(siochan);
+	} else if (siochan->tx_rpm_held) {
+		siochan->tx_rpm_held = false;
+		put_tx_rpm = true;
+	}
 	sio_ring_leave_locked(siochan);
 	spin_unlock_irqrestore(&siochan->vc.lock, flags);
+
+	if (put_tx_rpm) {
+		pm_runtime_mark_last_busy(sio->dev);
+		pm_runtime_put_autosuspend(sio->dev);
+	}
 
 	if (resumed) {
 		pm_runtime_mark_last_busy(sio->dev);
@@ -1391,6 +1486,7 @@ static void sio_synchronize(struct dma_chan *chan)
 {
 	struct sio_chan *siochan = to_sio_chan(chan);
 
+	flush_work(&siochan->issue_wq);
 	flush_work(&siochan->terminate_wq);
 	if (READ_ONCE(siochan->ring)) {
 		/* The caller frees the buffer on return; nothing can stop that. */
@@ -2196,6 +2292,7 @@ static int sio_probe(struct platform_device *pdev)
 		siochan->host = sio;
 		siochan->no = i;
 		siochan->vc.desc_free = sio_tx_free;
+		INIT_WORK(&siochan->issue_wq, sio_issue_work);
 		INIT_WORK(&siochan->terminate_wq, sio_terminate_work);
 		INIT_LIST_HEAD(&siochan->retired);
 		INIT_LIST_HEAD(&siochan->dead);
@@ -2323,7 +2420,8 @@ static bool sio_chan_busy(struct sio_chan *siochan)
 
 	spin_lock_irqsave(&siochan->vc.lock, flags);
 	busy = siochan->current_tx || siochan->idle || siochan->ring ||
-	       siochan->pending;
+	       siochan->pending || siochan->tx_rpm_held ||
+	       !list_empty(&siochan->vc.desc_issued);
 	spin_unlock_irqrestore(&siochan->vc.lock, flags);
 
 	return busy;
@@ -2360,7 +2458,7 @@ static __maybe_unused int sio_suspend(struct device *dev)
 			dev_err(dev, "firmware did not come back\n");
 		return ret;
 	}
-	sio->rpm_stopped = true;
+	WRITE_ONCE(sio->rpm_stopped, true);
 
 	return 0;
 }
@@ -2370,7 +2468,7 @@ static __maybe_unused int sio_resume(struct device *dev)
 	struct sio_data *sio = dev_get_drvdata(dev);
 	int ret;
 
-	if (!sio->rpm_stopped)
+	if (!READ_ONCE(sio->rpm_stopped))
 		return 0;
 
 	/*
@@ -2391,7 +2489,7 @@ static __maybe_unused int sio_resume(struct device *dev)
 		dev_err(dev, "firmware did not come back from runtime suspend: %d\n", ret);
 		return ret;
 	}
-	sio->rpm_stopped = false;
+	WRITE_ONCE(sio->rpm_stopped, false);
 
 	return 0;
 }
