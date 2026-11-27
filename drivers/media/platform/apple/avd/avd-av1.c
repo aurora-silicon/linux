@@ -1453,6 +1453,68 @@ avd_av1_check_tiles(struct device *dev, unsigned int tile_rows,
 EXPORT_SYMBOL_IF_KUNIT(avd_av1_check_tiles);
 
 /*
+ * The tiles of one dimension must cover the frame's superblocks the way
+ * tile_info() lays them out (AV1 5.9.15): at least one tile, tile i starting
+ * at the superblocks of the tiles before it, << sbShift, in MI units, and
+ * the tile sizes adding up to the frame's superblocks. set_tiles() programs
+ * each tile's start and end from these, and the work buffers are sized from
+ * the tile sizes.
+ */
+static int avd_av1_check_tile_dim(const u32 *mi_starts, const u32 *sbs_minus_1,
+				  unsigned int tiles, unsigned int max_tiles,
+				  u32 mi_size, unsigned int sb_shift)
+{
+	u32 sbs = (mi_size + (1 << sb_shift) - 1) >> sb_shift;
+	u32 start = 0;
+	unsigned int i;
+
+	if (!tiles || tiles > max_tiles)
+		return -EINVAL;
+	for (i = 0; i < tiles; i++) {
+		if (start >= sbs || mi_starts[i] != start << sb_shift ||
+		    sbs_minus_1[i] >= sbs - start)
+			return -EINVAL;
+		start += sbs_minus_1[i] + 1;
+	}
+	return start == sbs ? 0 : -EINVAL;
+}
+
+/*
+ * The frame is MiCols x MiRows 4x4 blocks (AV1 5.9.9, compute_image_size()),
+ * in superblocks of 16 or 32 of them (sbShift 4 or 5, AV1 5.9.15). The tile
+ * whose CDFs are kept is one of the frame's tiles (AV1 6.8.14).
+ */
+VISIBLE_IF_KUNIT int
+avd_av1_check_tile_info(struct device *dev,
+			const struct v4l2_ctrl_av1_sequence *seq,
+			const struct v4l2_ctrl_av1_frame *frame)
+{
+	const struct v4l2_av1_tile_info *t = &frame->tile_info;
+	unsigned int sb_shift =
+		seq->flags & V4L2_AV1_SEQUENCE_FLAG_USE_128X128_SUPERBLOCK ? 5 : 4;
+	u32 mi_cols = 2 * (((u32)frame->frame_width_minus_1 + 1 + 7) >> 3);
+	u32 mi_rows = 2 * (((u32)frame->frame_height_minus_1 + 1 + 7) >> 3);
+
+	if (avd_av1_check_tile_dim(t->mi_col_starts, t->width_in_sbs_minus_1,
+				   t->tile_cols, V4L2_AV1_MAX_TILE_COLS,
+				   mi_cols, sb_shift) ||
+	    avd_av1_check_tile_dim(t->mi_row_starts, t->height_in_sbs_minus_1,
+				   t->tile_rows, V4L2_AV1_MAX_TILE_ROWS,
+				   mi_rows, sb_shift)) {
+		dev_err_ratelimited(dev, "AV1: %ux%u tiles do not cover the %ux%u frame\n",
+				    t->tile_cols, t->tile_rows,
+				    frame->frame_width_minus_1 + 1,
+				    frame->frame_height_minus_1 + 1);
+		return -EINVAL;
+	}
+	if (t->context_update_tile_id >= t->tile_cols * t->tile_rows)
+		return -EINVAL;
+
+	return 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(avd_av1_check_tile_info);
+
+/*
  * Setting a larger tile-group array reallocates the control's storage and
  * frees the old one under the control lock, which the run does not otherwise
  * hold. Copy the entries under that lock; the run checks and uses the copy.
@@ -1598,6 +1660,10 @@ static int avd_av1_run_preamble(struct avd_ctx *ctx, struct avd_av1_run *run)
 		if (idx < 0 || idx >= V4L2_AV1_TOTAL_REFS_PER_FRAME)
 			return -EINVAL;
 	}
+
+	ret = avd_av1_check_tile_info(ctx->dev->dev, run->seq, run->frame);
+	if (ret)
+		return ret;
 
 	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
 			      V4L2_CID_STATELESS_AV1_TILE_GROUP_ENTRY);

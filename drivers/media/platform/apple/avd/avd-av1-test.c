@@ -274,6 +274,99 @@ static void avd_av1_try_frame_size_test(struct kunit *test)
 	v4l2_ctrl_handler_free(&ctx->ctrl_hdl);
 }
 
+struct avd_av1_tile_case {
+	const char *desc;
+	u16 width, height;
+	bool sb128;
+	u8 cols, rows;
+	/* mi_*_starts and *_in_sbs_minus_1 of the first tiles */
+	u32 col_start[3], col_sbs[3];
+	u32 row_start[3], row_sbs[3];
+	u8 context_tile;
+	int ret;
+};
+
+/*
+ * 1920x1080 is 480x270 MI units: 30x17 superblocks of 64, 15x9 of 128.
+ * Two uniform tiles per dimension are 15+15 columns and 9+8 rows.
+ */
+static const struct avd_av1_tile_case avd_av1_tile_cases[] = {
+	{ "64x64, one tile", 64, 64, false, 1, 1, {0}, {0}, {0}, {0}, 0, 0 },
+	{ "64x64, 4096x4096 superblock tile", 64, 64, false, 1, 1,
+	  {0}, {4095}, {0}, {4095}, 0, -EINVAL },
+	{ "64x64, tile one superblock too wide", 64, 64, false, 1, 1,
+	  {0}, {1}, {0}, {0}, 0, -EINVAL },
+	{ "64x64, tile one superblock too high", 64, 64, false, 1, 1,
+	  {0}, {0}, {0}, {1}, 0, -EINVAL },
+	{ "66x66, two partial superblocks", 66, 66, false, 2, 2,
+	  {0, 16}, {0, 0}, {0, 16}, {0, 0}, 0, 0 },
+	{ "1080p, one tile", 1920, 1080, false, 1, 1, {0}, {29}, {0}, {16}, 0, 0 },
+	{ "1080p, 2x2 tiles", 1920, 1080, false, 2, 2,
+	  {0, 240}, {14, 14}, {0, 144}, {8, 7}, 0, 0 },
+	{ "1080p, 128x128 superblocks", 1920, 1080, true, 1, 1,
+	  {0}, {14}, {0}, {8}, 0, 0 },
+	{ "1080p, 64x64 layout with 128x128 superblocks", 1920, 1080, true, 1, 1,
+	  {0}, {29}, {0}, {16}, 0, -EINVAL },
+	{ "1080p, second column one MI early", 1920, 1080, false, 2, 1,
+	  {0, 239}, {14, 14}, {0}, {16}, 0, -EINVAL },
+	{ "1080p, second row one superblock late", 1920, 1080, false, 1, 2,
+	  {0}, {29}, {0, 160}, {8, 7}, 0, -EINVAL },
+	{ "1080p, first column not at 0", 1920, 1080, false, 1, 1,
+	  {16}, {29}, {0}, {16}, 0, -EINVAL },
+	{ "1080p, columns short of the frame", 1920, 1080, false, 2, 1,
+	  {0, 240}, {14, 13}, {0}, {16}, 0, -EINVAL },
+	{ "1080p, columns past the frame", 1920, 1080, false, 2, 1,
+	  {0, 240}, {14, 15}, {0}, {16}, 0, -EINVAL },
+	{ "1080p, third column past the frame", 1920, 1080, false, 3, 1,
+	  {0, 240, 480}, {14, 14, 0}, {0}, {16}, 0, -EINVAL },
+	{ "1080p, largest width", 1920, 1080, false, 1, 1,
+	  {0}, {U32_MAX}, {0}, {16}, 0, -EINVAL },
+	{ "1080p, width wrapping to the next column", 1920, 1080, false, 2, 1,
+	  {0, 0}, {U32_MAX, 29}, {0}, {16}, 0, -EINVAL },
+	{ "1080p, largest height", 1920, 1080, false, 1, 1,
+	  {0}, {29}, {0}, {U32_MAX}, 0, -EINVAL },
+	{ "1080p, no tiles", 1920, 1080, false, 0, 0, {}, {}, {}, {}, 0, -EINVAL },
+	{ "1080p, no columns", 1920, 1080, false, 0, 1, {}, {}, {0}, {16}, 0, -EINVAL },
+	{ "1080p, more columns than tile_info has", 1920, 1080, false,
+	  V4L2_AV1_MAX_TILE_COLS + 1, 1, {0}, {0}, {0}, {16}, 0, -EINVAL },
+	{ "1080p, CDFs from the last tile", 1920, 1080, false, 2, 2,
+	  {0, 240}, {14, 14}, {0, 144}, {8, 7}, 3, 0 },
+	{ "1080p, CDFs from past the tiles", 1920, 1080, false, 2, 2,
+	  {0, 240}, {14, 14}, {0, 144}, {8, 7}, 4, -EINVAL },
+};
+
+KUNIT_ARRAY_PARAM_DESC(avd_av1_tile, avd_av1_tile_cases, desc);
+
+/* The tiles cover the frame's superblock grid, no more and no less. */
+static void avd_av1_tile_info_test(struct kunit *test)
+{
+	const struct avd_av1_tile_case *c = test->param_value;
+	struct v4l2_ctrl_av1_sequence seq = {
+		.flags = c->sb128 ? V4L2_AV1_SEQUENCE_FLAG_USE_128X128_SUPERBLOCK : 0,
+	};
+	struct v4l2_ctrl_av1_frame *frame;
+	struct v4l2_av1_tile_info *t;
+	unsigned int i;
+
+	frame = kunit_kzalloc(test, sizeof(*frame), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, frame);
+	frame->frame_width_minus_1 = c->width - 1;
+	frame->frame_height_minus_1 = c->height - 1;
+	frame->upscaled_width = c->width;
+	t = &frame->tile_info;
+	t->tile_cols = c->cols;
+	t->tile_rows = c->rows;
+	t->context_update_tile_id = c->context_tile;
+	for (i = 0; i < ARRAY_SIZE(c->col_start); i++) {
+		t->mi_col_starts[i] = c->col_start[i];
+		t->width_in_sbs_minus_1[i] = c->col_sbs[i];
+		t->mi_row_starts[i] = c->row_start[i];
+		t->height_in_sbs_minus_1[i] = c->row_sbs[i];
+	}
+
+	KUNIT_EXPECT_EQ(test, avd_av1_check_tile_info(NULL, &seq, frame), c->ret);
+}
+
 static struct kunit_case avd_av1_test_cases[] = {
 	KUNIT_CASE(avd_av1_tiles_valid_test),
 	KUNIT_CASE(avd_av1_tiles_count_test),
@@ -282,6 +375,7 @@ static struct kunit_case avd_av1_test_cases[] = {
 	KUNIT_CASE(avd_av1_copy_tile_group_test),
 	KUNIT_CASE_PARAM(avd_av1_frame_size_test, avd_av1_size_gen_params),
 	KUNIT_CASE(avd_av1_try_frame_size_test),
+	KUNIT_CASE_PARAM(avd_av1_tile_info_test, avd_av1_tile_gen_params),
 	{}
 };
 

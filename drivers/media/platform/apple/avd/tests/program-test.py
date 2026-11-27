@@ -507,6 +507,22 @@ int main(void) {
   assert(hc.bank[0].busy&&hc.bank[0].submitted&&dst[0].bank==1);
   pps.num_slice_groups_minus1=0;sps.bit_depth_chroma_minus8=0;valid_data=true;sl.slice_type=V4L2_H264_SLICE_TYPE_I;
  }
+ /* A slice past PicSizeInMbs (8160) or of another picture size aborts only the builder. */
+ for(unsigned int failure=0;failure<4;failure++) {
+  sl.first_mb_in_slice=0;dma_count=0;assert(!avd_h264_run(&ctx));
+  sl.first_mb_in_slice=failure==0?8160:failure==1?16383:failure==2?UINT32_MAX:33;
+  if(failure==3)sps.pic_width_in_mbs_minus1=59;
+  assert(avd_h264_run(&ctx)==-EINVAL);
+  assert(!hc.bank[1].busy&&!hc.bank[1].slice_num&&!ctx.job.segments&&!dst[1].bank);
+  assert(hc.bank[0].busy&&hc.bank[0].submitted&&dst[0].bank==1);
+  sps.pic_width_in_mbs_minus1=119;
+ }
+ /* The last macroblock still starts a slice; one past it drops the held picture. */
+ sl.first_mb_in_slice=0;dma_count=0;assert(!avd_h264_run(&ctx));
+ sl.first_mb_in_slice=8159;dma_count=0;assert(!avd_h264_run(&ctx));
+ assert(hc.bank[1].busy&&!hc.bank[1].submitted&&hc.bank[1].slice_num==2);
+ sl.first_mb_in_slice=8160;assert(avd_h264_run(&ctx)==-EINVAL);
+ assert(!hc.bank[1].busy&&!hc.bank[1].slice_num&&!ctx.job.segments&&!dst[1].bank);
  /* Final slice submits once; retirement selects CAPTURE's bank, not hc.b. */
  sl.first_mb_in_slice=0;dma_count=0;assert(!avd_h264_run(&ctx));
  sl.first_mb_in_slice=33;src.flags=0;dma_count=0;assert(!avd_h264_run(&ctx));
@@ -515,7 +531,7 @@ int main(void) {
  avd_h264_done(&ctx,&src,&dst[0].base.vb,VB2_BUF_STATE_DONE);
  assert(!hc.bank[0].busy&&hc.bank[1].busy&&hc.b==&hc.bank[1]);
  avd_h264_done(&ctx,&src,&dst[1].base.vb,VB2_BUF_STATE_DONE);assert(!hc.bank[1].busy);
- assert(postambles==27&&held_finishes==16&&submissions==2);
+ assert(postambles==38&&held_finishes==22&&submissions==2);
  /* The legacy transport collects the same held slices in its single bank. */
  dev.queued=false;hc.nbanks=1;dev.building=&frames[0];fixture_run.base.bufs.dst=&dst[0].base.vb;
  src.flags=V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF;sl.first_mb_in_slice=0;dma_count=0;

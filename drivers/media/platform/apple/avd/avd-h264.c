@@ -77,6 +77,8 @@ struct avd_bank {
 	/* allocated size of the held slices */
 	size_t slice_bytes;
 	u32 last_mb;
+	/* the size of the held picture, set by its first slice */
+	struct avd_h264_pic_size pic;
 
 	struct avd_h264_bufs {
 		/* VP to PP instruction FIFO for pictures of this bank */
@@ -1109,6 +1111,7 @@ static int avd_h264_run(struct avd_ctx *ctx)
 	struct avd_h264_ctx *h264_ctx = ctx->priv;
 	struct v4l2_h264_reflist_builder reflist_builder;
 	struct avd_h264_run run;
+	struct avd_h264_pic_size pic;
 	size_t held = h264_ctx->b->busy && !h264_ctx->b->submitted ?
 		      h264_ctx->b->slice_num : 0;
 	int ret;
@@ -1138,10 +1141,23 @@ static int avd_h264_run(struct avd_ctx *ctx)
 		goto err_free_jobs;
 	}
 
+	/* The slice starts in its picture; later slices keep the held picture's size. */
+	pic = avd_h264_pic_size(run.sps, run.decode_params);
+	if (!avd_h264_slice_in_picture(&pic, run.sps, run.decode_params,
+				       run.slice_params->first_mb_in_slice) ||
+	    (held && !avd_h264_same_pic_size(&pic, &h264_ctx->b->pic))) {
+		dev_err_ratelimited(ctx->dev->dev,
+				    "H.264 slice at macroblock %u is outside its %llu macroblock picture\n",
+				    run.slice_params->first_mb_in_slice, pic.mbs);
+		ret = -EINVAL;
+		goto err_free_jobs;
+	}
+
 	if (is_new_frame(run.slice_params)) {
 		ret = avd_h264_pick_bank(ctx, run.base.bufs.dst);
 		if (ret)
 			goto err_free_jobs;
+		h264_ctx->b->pic = pic;
 	}
 
 	if (!h264_ctx->b->busy || h264_ctx->b->submitted ||
