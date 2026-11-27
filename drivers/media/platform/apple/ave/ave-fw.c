@@ -41,6 +41,7 @@ static const u32 ave_known_text_crc[] = {
 	AVE_FW_TEXT_CRC_T6040_25G83, /* encoder firmware 9003.78.0 / T6040 */
 	AVE_FW_TEXT_CRC_T6041_25G83, /* encoder firmware 9003.78.0 / M4 Max */
 	AVE_FW_TEXT_CRC_T6050_26A428, /* encoder firmware macOS 27.0 26A428 / T6050 */
+	AVE_FW_TEXT_CRC_T6050_26B123, /* encoder firmware 27.2 26B123 / T6050 */
 	AVE_FW_TEXT_CRC_T6050_26C5035, /* encoder firmware macOS 27.3 26C5035r / T6050 */
 	AVE_FW_TEXT_CRC_T8142_26A428, /* encoder firmware 9013.45.1, macOS 27.0 26A428 / T8142 */
 	AVE_FW_TEXT_CRC_T8122_26B123, /* encoder firmware macOS 27.2 26B123 / T8122 */
@@ -159,7 +160,7 @@ int ave_fw_text_id_crc(const void *text, size_t size, u32 cell_off,
 	return 0;
 }
 
-static bool ave_fw_known_crc(u32 crc)
+bool ave_fw_known_crc(u32 crc)
 {
 	for (unsigned int i = 0; i < ARRAY_SIZE(ave_known_text_crc); i++)
 		if (crc == ave_known_text_crc[i])
