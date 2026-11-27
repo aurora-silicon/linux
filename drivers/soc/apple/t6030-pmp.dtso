@@ -78,6 +78,21 @@
 					status = "disabled";
 				};
 
+				/*
+				 * The GPU's request: AGX, soc-device record 4 in the ADT
+				 * iop-pmp-nub. macOS 27.2 holds it while its GPU driver runs,
+				 * withdraws it before GFX goes off for a sleep and makes it
+				 * again once GFX is back. The gate links the GPU to it
+				 * (apple,pmp-report-entry); the GPU driver makes it.
+				 */
+				pmp_report_agx: report@4 {
+					compatible = "apple,t6000-pmp-v2-report-entry";
+					reg = <0x4>;
+					label = "pmp-agx";
+					#power-domain-cells = <0>;
+					phandle = <0x103>;
+				};
+
 				pmp_report_ans: report@10 {
 					compatible = "apple,t6000-pmp-v2-report-entry";
 					reg = <0x10>;

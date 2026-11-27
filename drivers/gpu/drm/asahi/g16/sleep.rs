@@ -14,6 +14,13 @@
 //!
 //! Only a real wake restarts the firmware. A sleep refused after a stop leaves it stopped and
 //! publication closed until the next real sleep, with the domain on.
+//!
+//! Where the [`super::Config`]'s `sleep_stop` is [`SleepStop::Prepare`] (G15S), the stop is
+//! macOS's instead: `.prepare` drains, closes publication and stops the firmware there, before
+//! any other device suspends, and `.complete` always restarts it, whether the sleep reached the
+//! hardware or not. Where the device tree names the PMP's request for the GPU
+//! (`apple,pmp-report-entry`), the request is made while the firmware runs, withdrawn before
+//! the domain goes off and made again once it's back on, before the firmware restarts.
 
 use core::sync::atomic::Ordering;
 
@@ -25,6 +32,7 @@ use kernel::{
     workqueue::{DelayedWork, Work},
 };
 
+use super::hw::SleepStop;
 use super::recovery::now_ns;
 use super::regs::{self, ASC_RUN};
 use super::{Firmware, Gpu, Shared};
@@ -39,7 +47,17 @@ extern "C" {
     fn asahi_g16_commit_prepare(
         dev: *mut core::ffi::c_void,
         rtk: *mut bindings::apple_rtkit,
+        quiet: bool,
     ) -> *mut core::ffi::c_void;
+    fn asahi_g16_stop_now(
+        dev: *mut core::ffi::c_void,
+        rtk: *mut bindings::apple_rtkit,
+    ) -> *mut core::ffi::c_void;
+    fn asahi_g17_pmp_request(dev: *mut core::ffi::c_void, enable: bool) -> core::ffi::c_int;
+    fn asahi_g16_sleep_note(step: u8);
+    fn apple_rtkit_resume_rx(rtk: *mut bindings::apple_rtkit);
+    fn apple_rtkit_set_recv_enabled(rtk: *mut bindings::apple_rtkit, enabled: bool);
+    fn apple_rtkit_wake_iop_on(rtk: *mut bindings::apple_rtkit) -> core::ffi::c_int;
     fn asahi_g17_commit_finish(commit: *mut core::ffi::c_void, saved: *mut u32) -> bool;
     fn asahi_g17_power_auto_off(dev: *mut core::ffi::c_void, saved: *mut u32) -> core::ffi::c_int;
     fn asahi_g17_power_lower(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
@@ -58,20 +76,90 @@ impl Firmware {
             && self.recovery_idle()?)
     }
 
-    /// The run bit and the RTKit handshake, with the firmware's state as it was left.
-    fn sleep_restart(&mut self) -> Result {
+    /// Wakes firmware the stop idled and nothing reset (a sleep that didn't reach the
+    /// hardware): the mailbox's receive and its interrupt back on, then IOP ON and AP on, with
+    /// the RTKit session as it was (J516s: it didn't acknowledge IOP INIT). No GFX write and nothing on the ASC's page.
+    fn sleep_wake_idle(&mut self) -> Result {
+        self.pools.invalidate();
+        let rtk = self.session.rtkit.as_raw();
+        // SAFETY: The RTKit handle lasts until reboot; the stop masked the interrupt once.
+        unsafe {
+            apple_rtkit_set_recv_enabled(rtk, true);
+            apple_rtkit_resume_rx(rtk);
+        }
+        note(0x3a);
+        // SAFETY: The RTKit handle lasts until reboot.
+        let result = kernel::error::to_result(unsafe { apple_rtkit_wake_iop_on(rtk) });
+        note(if result.is_ok() { 0x3b } else { 0x3e });
+        result
+    }
+
+    /// The run bit and the RTKit handshake, with the firmware's state as it was left. `held`:
+    /// the stop masked the mailbox's receive interrupt, which comes back with the receive path.
+    fn sleep_restart(&mut self, held: bool) -> Result {
         // Start the next render on each pass slot fresh after the firmware restarts.
         self.pools.invalidate();
         self.session.rtkit.warm_restart()?;
+        if held {
+            // SAFETY: The RTKit handle lasts until reboot; the stop masked the interrupt once.
+            unsafe { apple_rtkit_resume_rx(self.session.rtkit.as_raw()) };
+        }
+        note(0x33);
         let control = self.session.regs.asc_control()?;
+        if held {
+            dev_info!(
+                self.session.dev.as_ref(),
+                "GPU firmware restart: ASC control {:#x} with GFX back on\n",
+                control
+            );
+        }
         self.session.regs.set_asc_control(control | ASC_RUN)?;
         regs::mb();
-        self.session.rtkit.boot()
+        note(0x34);
+        let result = self.session.rtkit.boot();
+        note(if result.is_ok() { 0x35 } else { 0x3f });
+        result
     }
 }
 
+/// A sleep step, in PMU scratch where the sleep driver keeps its notes: a reset keeps it.
+fn note(step: u8) {
+    // SAFETY: Writes one byte of the sleep driver's notes, or nothing without one.
+    unsafe { asahi_g16_sleep_note(step) }
+}
+
 impl Shared {
+    /// The mailbox's receive interrupt back on after `.prepare` masked it for the commit.
+    fn resume_rx(&self) {
+        let state = self.state.lock();
+        if let Some(firmware) = state.as_deref() {
+            // SAFETY: The RTKit handle lasts until reboot; the prepare masked it once.
+            unsafe { apple_rtkit_resume_rx(firmware.session.rtkit.as_raw()) };
+        }
+    }
+
+    /// The PMP's request for the GPU, where the device tree names one. The PMP may use a device
+    /// whose request is set, so it's only ever set with the domain on.
+    pub(crate) fn pmp_request(&self, enable: bool) {
+        // DIAGNOSTIC (T6030 sleep bring-up): leave the request alone.
+        if crate::module_parameters::g16_sleep_no_pmp_request.value() != 0 {
+            return;
+        }
+        // SAFETY: `dev` is the live GPU device.
+        let ret = unsafe { asahi_g17_pmp_request(self.dev.as_raw().cast(), enable) };
+        if ret != 0 {
+            dev_warn!(
+                self.dev.as_ref(),
+                "PMP request for the GPU, {}: {}\n",
+                if enable { "on" } else { "off" },
+                ret
+            );
+        }
+    }
+
     fn lower_domain(&self) {
+        // Before the domain goes: the PMP reads the GPU's counters while its request is set.
+        self.pmp_request(false);
         let mut saved = 0;
         // SAFETY: `dev` is the live GPU device and `saved` is writable.
         let ret = unsafe { asahi_g17_power_auto_off(self.dev.as_raw().cast(), &mut saved) };
@@ -90,10 +178,12 @@ impl Shared {
         let saved = self.sleep_ps.load(Ordering::Relaxed);
         // SAFETY: `dev` is the live GPU device.
         kernel::error::to_result(unsafe { asahi_g16_tvm_enable(self.dev.as_raw().cast()) })?;
+        note(0x30);
         // SAFETY: `dev` is the live GPU device.
         kernel::error::to_result(unsafe {
             asahi_g17_power_raise(self.dev.as_raw().cast(), saved)
         })?;
+        note(0x31);
         // SAFETY: `dev` is the live GPU device.
         kernel::error::to_result(unsafe {
             asahi_g17_power_auto_on(self.dev.as_raw().cast(), saved)
@@ -153,12 +243,18 @@ impl Shared {
         }
     }
 
-    /// Leaves the stop to the sleep's commit. False, with the reason logged, if it can't be.
-    fn leave_for_commit(&self, firmware: &mut Firmware) -> bool {
+    /// Leaves the stop to the sleep's commit, or with [`SleepStop::Prepare`] stops the firmware
+    /// now. False, with the reason logged, if neither can be.
+    fn leave_for_commit(&self, firmware: &mut Firmware, stop: SleepStop, quiet: bool) -> bool {
+        let dev = self.dev.as_raw().cast();
+        let rtk = firmware.session.rtkit.as_raw();
         // SAFETY: `dev` is the live GPU device. The RTKit handle lasts until reboot, and
         // `.complete` frees the result.
         let commit = unsafe {
-            asahi_g16_commit_prepare(self.dev.as_raw().cast(), firmware.session.rtkit.as_raw())
+            match stop {
+                SleepStop::Commit => asahi_g16_commit_prepare(dev, rtk, quiet),
+                SleepStop::Prepare => asahi_g16_stop_now(dev, rtk),
+            }
         };
         match kernel::error::from_err_ptr(commit) {
             Ok(commit) => {
@@ -168,7 +264,7 @@ impl Shared {
             Err(error) => {
                 dev_warn!(
                     self.dev.as_ref(),
-                    "no GPU stop at the commit ({:?}): refusing the sleep\n",
+                    "no GPU stop for the sleep ({:?}): refusing the sleep\n",
                     error
                 );
                 false
@@ -192,7 +288,7 @@ impl Shared {
     /// Waits for quiet, closes publication and leaves the stop to the commit. Refuses if the
     /// commit can't take it: a stop here loses the GPU after a refused sleep. A refusal
     /// changes nothing.
-    fn sleep_down(self: &Arc<Self>) -> Result {
+    fn sleep_down(self: &Arc<Self>, stop: SleepStop, quiet: bool) -> Result {
         if self.sleeping.load(Ordering::Acquire) {
             // After a sleep refused past the stop, only the domain is left to lower.
             self.lower_domain();
@@ -206,6 +302,7 @@ impl Shared {
             return Ok(());
         }
         self.wait_quiet(now_ns().saturating_add(DRAIN_NS))?;
+        note(0x20);
         self.sleeping.store(true, Ordering::Release);
         self.join_workers();
         let left = {
@@ -215,7 +312,7 @@ impl Shared {
                     .sleep_quiet()
                     .and_then(|quiet| if quiet { Ok(()) } else { Err(EBUSY) })
                     .and_then(|_| {
-                        if self.leave_for_commit(firmware) {
+                        if self.leave_for_commit(firmware, stop, quiet) {
                             firmware.power.release_clpc_now();
                             self.active_flights.store(0, Ordering::Release);
                             Ok(())
@@ -250,14 +347,28 @@ impl Shared {
         true
     }
 
-    /// Raises the domain and restarts the firmware. A failure loses the device.
-    fn sleep_up(self: &Arc<Self>) -> Result {
+    /// Raises the domain and restarts the firmware. A failure loses the device. `held`: the
+    /// stop was made in `.prepare`, with the mailbox's receive interrupt masked.
+    fn sleep_up(self: &Arc<Self>, held: bool) -> Result {
         let started = now_ns();
+        // SAFETY: Reads a global flag word.
+        let real = unsafe { bindings::pm_resume_via_firmware() };
         let result = {
             let mut state = self.state.lock();
             match state.as_deref_mut() {
+                Some(firmware) if held && !real && !self.crashed.load(Ordering::Acquire) => {
+                    // Stopped in `.prepare` and nothing reset: GFX stayed under automatic
+                    // power, so only the firmware wakes, then the PMP's request comes back.
+                    firmware.sleep_wake_idle().map(|_| self.pmp_request(true))
+                }
                 Some(firmware) if !self.crashed.load(Ordering::Acquire) => {
-                    self.raise_domain().and_then(|_| firmware.sleep_restart())
+                    self.raise_domain().and_then(|_| {
+                        // As macOS: the request once the domain is on, before the firmware's
+                        // mailbox and handshake.
+                        self.pmp_request(true);
+                        note(0x32);
+                        firmware.sleep_restart(held)
+                    })
                 }
                 _ => self.raise_domain(),
             }
@@ -284,6 +395,15 @@ impl Shared {
 }
 
 impl Gpu {
+    /// Where this GPU's deep sleep stops its firmware.
+    fn sleep_stop(&self) -> SleepStop {
+        // DIAGNOSTIC (T6030 sleep bring-up): the stop in `.prepare` instead, for comparison.
+        if crate::module_parameters::g16_sleep_at_prepare.value() != 0 {
+            return SleepStop::Prepare;
+        }
+        self.cfg.sleep_stop
+    }
+
     /// Called before any device suspends. Only a sleep that powers the SoC down gets here.
     fn sleep_prepare(&self) -> Result {
         if !self.cfg.deep_sleep {
@@ -298,7 +418,7 @@ impl Gpu {
             }
             return Err(EBUSY);
         }
-        let result = self.shared.sleep_down();
+        let result = self.shared.sleep_down(self.sleep_stop(), self.cfg.sleep_quiet_stop);
         if let Err(error) = result {
             dev_warn!(self.shared.dev.as_ref(), "GPU refused sleep: {:?}\n", error);
         }
@@ -312,11 +432,20 @@ impl Gpu {
         }
         // SAFETY: Reads a global flag word.
         let real = unsafe { bindings::pm_resume_via_firmware() };
-        if self.shared.sleep_commit_finish() == Some(false) && !real {
+        let stopped = self.shared.sleep_commit_finish();
+        if stopped == Some(true) && self.sleep_stop() == SleepStop::Prepare {
+            // Stopped in `.prepare`: back up warm, whether or not the sleep reached the hardware.
+            let _ = self.shared.sleep_up(true);
+            return;
+        }
+        if stopped == Some(false) && !real {
             dev_info!(
                 self.shared.dev.as_ref(),
                 "sleep refused before the commit: GPU firmware never stopped\n"
             );
+            if self.cfg.sleep_quiet_stop {
+                self.shared.resume_rx();
+            }
             self.shared.feed.resume();
             self.shared.sleeping.store(false, Ordering::Release);
             self.shared.poll_now();
@@ -325,7 +454,7 @@ impl Gpu {
         if !real && self.shared.sleep_hold() {
             return;
         }
-        let _ = self.shared.sleep_up();
+        let _ = self.shared.sleep_up(self.cfg.sleep_quiet_stop);
     }
 }
 

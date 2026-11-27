@@ -11,6 +11,7 @@
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/mfd/syscon.h>
+#include <linux/nvmem-consumer.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/regmap.h>
@@ -690,15 +691,16 @@ bool asahi_g17_commit_required(void)
 }
 
 /*
- * The same stop for G16: one firmware instance, whose control registers are the ASC's own, no
- * bridge and no PMP request to withdraw, as its vote stays through the sleep.
+ * What a G16 stop touches: one firmware instance, whose control registers are the ASC's own,
+ * no bridge, the GFX word, and the PMP's request for the GPU where the device tree names one
+ * (apple,pmp-report-entry). Without one the vote stays through the sleep, as on T8132.
  */
-struct asahi_g17_commit *asahi_g16_commit_prepare(struct device *dev, struct apple_rtkit *rtk)
+static struct asahi_g17_commit *asahi_g16_commit_alloc(struct device *dev,
+						       struct apple_rtkit *rtk)
 {
 	struct asahi_g17_commit *c;
 	struct device_node *np;
 	u32 offset;
-	int ret;
 
 	c = kzalloc_obj(*c);
 	if (!c)
@@ -708,20 +710,94 @@ struct asahi_g17_commit *asahi_g16_commit_prepare(struct device *dev, struct app
 	c->count = 1;
 	c->raise = asahi_g17_commit_raises(dev);
 
-	ret = -ENODEV;
 	c->cpu[0] = asahi_g17_map(dev->of_node, "asc", 0, ASC_CPU_CONTROL, 8);
 	np = of_parse_phandle(dev->of_node, "power-domains", 0);
-	if (!np)
-		goto err;
-	if (!of_property_read_u32(np, "reg", &offset) && np->parent)
+	if (np && !of_property_read_u32(np, "reg", &offset) && np->parent)
 		c->ps = asahi_g17_map(np->parent, NULL, 0, offset, 4);
 	of_node_put(np);
-	if (!c->cpu[0] || !c->ps)
-		goto err;
+	if (!c->cpu[0] || !c->ps) {
+		asahi_g17_commit_free(c);
+		return ERR_PTR(-ENODEV);
+	}
+	c->request = of_parse_phandle(dev->of_node, "apple,pmp-report-entry", 0);
 
-	ret = apple_sleep_coproc_register_first(dev, asahi_g17_commit_stop, c);
+	return c;
+}
+
+/*
+ * DIAGNOSTIC (T6030 sleep bring-up): a G16 sleep step in PMU scratch +4 (0x830c), which a reset
+ * keeps, through the SPMI nvmem and its locking: from .prepare and .complete, while the SPMI
+ * driver runs. Not the sleep driver's raw notes, which only its commit may write.
+ */
+void asahi_g16_sleep_note(u8 step)
+{
+	static struct nvmem_device *nv;
+
+	if (!nv) {
+		nv = nvmem_device_find((void *)"spmi_nvmem0", device_match_name);
+		if (IS_ERR(nv)) {
+			nv = NULL;
+			return;
+		}
+	}
+	nvmem_device_write(nv, 0x830c, 1, &step);
+}
+
+/*
+ * G15S's stop at the commit, as far as Linux can make it (J516s, pm_test=devices): AP IDLE and
+ * IOP IDLE, the mailbox's receive off, the PMP request withdrawn. After the idle the ASC's own
+ * page doesn't answer, and every AP write taking GFX out of automatic power reset the SoC, so
+ * neither is touched; the sleep controller takes AFR, GFX's parent, down. An idled G15S
+ * firmware answers neither IOP INIT nor IOP ON without a reset, so only the commit, which
+ * only a real wake follows, may idle it.
+ */
+static int asahi_g16_commit_stop_quiet(void *data)
+{
+	struct asahi_g17_commit *c = data;
+
+	c->ran = true;
+	apple_sleep_note_sub(1);
+	c->entry = readl(c->ps);
+	c->saved = c->entry;
+	c->idle[0] = apple_rtkit_sleep_idle_polled(c->rtk[0], NULL, &c->idle_us[0]);
+	apple_sleep_note_sub(3);
+	apple_rtkit_mailbox_recv_off(c->rtk[0]);
+	c->words[0] = apple_rtkit_mailbox_status(c->rtk[0]);
+	apple_sleep_note_sub(4);
+	c->request_ret = c->request ? apple_pmp_report_entry_withdraw_polled(c->request) : 0;
+	apple_sleep_note_sub(5);
+	c->lowered = readl(c->ps);
+
+	return (c->idle[0] || c->request_ret) ? 1 : 0;
+}
+
+/*
+ * The same stop for G16, made by the sleep's commit. @quiet: G15S's, which touches neither the
+ * ASC's page nor GFX, and whose mailbox interrupt stays masked from here until the restart or
+ * the refusal.
+ */
+struct asahi_g17_commit *asahi_g16_commit_prepare(struct device *dev, struct apple_rtkit *rtk,
+						  bool quiet)
+{
+	struct asahi_g17_commit *c;
+	int ret;
+
+	c = asahi_g16_commit_alloc(dev, rtk);
+	if (IS_ERR(c))
+		return c;
+	if (c->request) {
+		ret = apple_pmp_report_entry_commit_owned(c->request, true);
+		if (ret)
+			goto err;
+		c->request_owned = true;
+	}
+
+	ret = apple_sleep_coproc_register_first(dev, quiet ? asahi_g16_commit_stop_quiet :
+							     asahi_g17_commit_stop, c);
 	if (ret)
 		goto err;
+	if (quiet)
+		apple_rtkit_hold_rx(rtk);
 	apple_sleep_coproc_set_ready(dev, true);
 
 	return c;
@@ -729,6 +805,68 @@ struct asahi_g17_commit *asahi_g16_commit_prepare(struct device *dev, struct app
 err:
 	asahi_g17_commit_free(c);
 	return ERR_PTR(ret);
+}
+
+/*
+ * The G15S stop as macOS 27.2 makes it on J516s: in its device sleep, before any display request
+ * goes, 4.1 to 4.5 s before the commit. The same in all three full records
+ * (s2r-trace ref/t6030-macos-s2r-entry-full-{1,2,3}.tsv; run 1's times from the AP IDLE):
+ *  1. AP IDLE (0x201) on endpoint 0: echoed after 94 us;
+ *  2. IOP IDLE (0x201): acknowledged after 0.12 ms;
+ *  3. the mailbox's receive interrupt off (I2A control 0x21101 -> 0x21100) 38 us later, and
+ *     the mailbox's first word read (0x2e);
+ *  4. the PMP's AGX request (PTD request bit 4) withdrawn 20 us later;
+ *  5. 0.24 ms later the GFX word out of automatic power with its target on (0x0f0000ff), then
+ *     its target off (0x0f0003f0) 6 us after that. Not copied yet: see below.
+ * AFR, the GPU PMGR's +0x10000 and +0x14000 blocks stay for the sleep controller, which lowers
+ * them 2.7 to 6.6 ms before the commit.
+ *
+ * Those records don't cover the ASC's own page. Linux doesn't touch it here either: with the
+ * firmware idle, GFX may be gated, and the page doesn't answer then.
+ *
+ * Interrupts on, in .prepare, before anything else suspends. Told to idle, the firmware can't
+ * carry on, so the stop goes on whatever it answers, and only a restart brings it back.
+ */
+struct asahi_g17_commit *asahi_g16_stop_now(struct device *dev, struct apple_rtkit *rtk)
+{
+	struct asahi_g17_commit *c;
+
+	c = asahi_g16_commit_alloc(dev, rtk);
+	if (IS_ERR(c))
+		return c;
+
+	/* The step reached, in PMU scratch, which a reset keeps: 0x21 to 0x27 */
+	c->ran = true;
+	asahi_g16_sleep_note(0x21);
+	/*
+	 * No GFX write, and nothing on the ASC's own page. On J516s every AP write taking GFX out
+	 * of automatic power reset the SoC, before or after the idle and macOS's 0x0f0000ff too
+	 * (PMU notes 0x21 and 0x24), and the CPU's status didn't answer after the idle; what macOS
+	 * does before its GFX write isn't in its records yet. GFX stays under automatic power,
+	 * which the idle firmware gates, and the sleep controller takes AFR, its parent, down
+	 * before the commit. The PMGR word is only read, for the log and the wake.
+	 */
+	c->entry = readl(c->ps);
+	c->saved = c->entry;
+	c->idle[0] = apple_rtkit_sleep_idle_polled(c->rtk[0], NULL, &c->idle_us[0]);
+	asahi_g16_sleep_note(0x22);
+	apple_rtkit_mailbox_recv_off(c->rtk[0]);
+	c->words[0] = apple_rtkit_mailbox_status(c->rtk[0]);
+	/*
+	 * Its receive interrupt masked as well: the kernel runs on with the domain gated, and a
+	 * read of the unpowered mailbox from its handler aborts. The wake unmasks it.
+	 */
+	apple_rtkit_hold_rx(c->rtk[0]);
+	asahi_g16_sleep_note(0x23);
+	c->request_ret = c->request ? apple_pmp_report_entry_request(c->request, false) : 0;
+	asahi_g16_sleep_note(0x24);
+	c->lowered = readl(c->ps);
+	asahi_g16_sleep_note(0x27);
+
+	dev_info(dev, "GPU stopped for the sleep: idle %d in %u us, mailbox %#x, PMP request %d, GFX %#x, then %#x\n",
+		 c->idle[0], c->idle_us[0], c->words[0], c->request_ret, c->entry, c->lowered);
+
+	return c;
 }
 
 /*

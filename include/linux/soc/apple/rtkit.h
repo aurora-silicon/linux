@@ -274,6 +274,7 @@ int apple_rtkit_quiesce(struct apple_rtkit *rtk);
  * Wake the co-processor up from hibernation mode.
  */
 int apple_rtkit_wake(struct apple_rtkit *rtk);
+int apple_rtkit_wake_iop_on(struct apple_rtkit *rtk);
 
 /*
  * Start a co-processor whose firmware may acknowledge IOP power on by itself
