@@ -293,6 +293,14 @@ module! {
             default: 0,
             description: "DIAGNOSTIC: G16: stop the GPU firmware in the sleep's commit instead of .prepare (T6030 sleep bring-up)",
         },
+        g16_sleep_snap: u32 {
+            default: 0,
+            description: "DIAGNOSTIC: G16: snapshot these GPU register windows (bit i = window i) before a .prepare stop, at its restart and after it, and log what changed (T6030 sleep bring-up)",
+        },
+        g16_sleep_snap_restore: u32 {
+            default: 0,
+            description: "DIAGNOSTIC: G16: write the words of these snapshot windows that changed back to their values before the stop, before the run bit (T6030 sleep bring-up)",
+        },
         g16_sleep_no_pmp_request: u32 {
             default: 0,
             description: "DIAGNOSTIC: G16: never make or withdraw the PMP's request for the GPU (T6030 sleep bring-up)",

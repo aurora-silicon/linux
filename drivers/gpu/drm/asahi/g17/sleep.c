@@ -15,6 +15,7 @@
 #include <linux/nvmem-consumer.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
+#include <linux/of_reserved_mem.h>
 #include <linux/regmap.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/dcp-v27-sleep.h>
@@ -861,6 +862,219 @@ int asahi_g16_sram_restore(void)
 		writeq(asahi_g16_sram[i], asahi_g16_sram_io + 8 * i);
 	asahi_g16_sram_restore_len = 0;
 	return 0;
+}
+
+/*
+ * DIAGNOSTIC (T6030 sleep bring-up): what a G15S GFX power cycle loses that iBoot set at boot.
+ * Read-only snapshots, nonposted, 32 bits at a time, of the windows macOS's stop and wake capture
+ * (s2r-trace ref/t6030-macos-gpu-stop-asc-sgx.tsv) didn't hook and the firmware maps (PLAN U4), plus
+ * hooked ones as controls: #0 before the stop (firmware running, GFX on), #1 at the restart (GFX
+ * back on, PMP request made, SRAM written back, before the run bit), #2 after the handshake. #1 is
+ * diffed against #0 and #2 against #1, and #0 is searched for the boot loader's handoff addresses
+ * (the reserved regions the GPU node names) in the forms an address register may hold them.
+ * aurora.g16_sleep_snap: the windows to take (bit i = window i); aurora.g16_sleep_snap_restore:
+ * the windows whose changed words #0's values are written back to, in order, before the run bit.
+ * PAs: J516s ADT (gfx-asc reg[0] 0x292400000, reg[1] 0x292050000; sgx reg[0] 0x290000000+0x32a4000,
+ * reg[1] 0x290d00000) and the firmware's register map in the live dump (hv-dump-live).
+ */
+struct asahi_g16_snap_win {
+	const char *name;
+	u64 pa;
+	u32 size;
+	bool no_restore;
+};
+
+static const struct asahi_g16_snap_win asahi_g16_snap_wins[] = {
+	{ "gfx-asc reg[1]", 0x292050000, 0x6c000 },
+	{ "asc cpu", 0x292400000, 0x8000 },
+	{ "asc above mbox", 0x29240c000, 0x14000 },
+	{ "sgx +0", 0x290000000, 0x20000 },
+	{ "sgx +0xd04000", 0x290d04000, 0x8000 },
+	{ "sgx +0xd10000", 0x290d10000, 0x4000 },
+	{ "sgx +0xd40000", 0x290d40000, 0x8000 },
+	{ "sgx +0xd4c000", 0x290d4c000, 0xc000 },
+	{ "sgx +0xe00000", 0x290e00000, 0x4000 },
+	{ "sgx +0xe08000", 0x290e08000, 0x8000 },
+	{ "sgx +0xe40000", 0x290e40000, 0x4000 },
+	{ "sgx +0xe5c000", 0x290e5c000, 0x8000 },
+	{ "sgx +0x1000000", 0x291000000, 0x4000 },
+	{ "gpu pmgr ps", 0x290e80000, 0x4000, true },
+	{ "gpu pmgr +0x10000", 0x290e90000, 0x6000, true },
+	{ "sgx +0x3000000", 0x293000000, 0x400000 },
+};
+
+#define G16_SNAPS	3
+#define G16_SNAP_WINS	ARRAY_SIZE(asahi_g16_snap_wins)
+
+static u32 *asahi_g16_snap_buf[G16_SNAPS][G16_SNAP_WINS];
+static bool asahi_g16_snap_have[G16_SNAPS];
+
+/* Never read: CPU_STATUS (macOS never does). Never written back: CPU_CONTROL, the GPU counters. */
+static bool asahi_g16_snap_skip(const struct asahi_g16_snap_win *w, u32 off, bool write)
+{
+	if (w->pa == 0x292400000 && off == 0x48)
+		return true;
+	if (!write)
+		return false;
+	if (w->pa == 0x292400000 && off == 0x44)
+		return true;
+	return w->pa == 0x290d10000 && off >= 0x1000 && off < 0x1020;
+}
+
+static void asahi_g16_snap_needles(struct device *dev, unsigned int n)
+{
+	static const char *const names[] = { "ttbs", "pagetables", "handoff", "shared-l2",
+					     "fw-text", "fw-data" };
+	unsigned int r, k, found = 0;
+	struct resource res;
+	u64 base[ARRAY_SIZE(names)] = { 0 };
+
+	for (r = 0; r < ARRAY_SIZE(names); r++)
+		if (!of_reserved_mem_region_to_resource_byname(dev->of_node, names[r], &res))
+			base[r] = res.start;
+
+	for (k = 0; k < G16_SNAP_WINS; k++) {
+		const struct asahi_g16_snap_win *w = &asahi_g16_snap_wins[k];
+		u32 *b = asahi_g16_snap_buf[n][k];
+		u32 i;
+
+		if (!b)
+			continue;
+		for (i = 0; i < w->size / 4; i++) {
+			u32 v = b[i];
+
+			if (!v)
+				continue;
+			for (r = 0; r < ARRAY_SIZE(names); r++) {
+				const char *form = NULL;
+
+				if (!base[r])
+					continue;
+				if (v == lower_32_bits(base[r]))
+					form = "lo";
+				else if (v == lower_32_bits(base[r] >> 12))
+					form = ">>12";
+				else if (v == lower_32_bits(base[r] >> 14))
+					form = ">>14";
+				else if (v == lower_32_bits(base[r] >> 2))
+					form = ">>2";
+				if (form && found++ < 64)
+					dev_info(dev, "G16 snap %u: %s +%#x = %#x is %s %#llx %s\n", n,
+						 w->name, 4 * i, v, names[r], base[r], form);
+			}
+		}
+	}
+	dev_info(dev, "G16 snap %u: %u words hold a handoff address\n", n, found);
+}
+
+static void asahi_g16_snap_take(struct device *dev, unsigned int n, u32 mask)
+{
+	unsigned int k;
+
+	for (k = 0; k < G16_SNAP_WINS; k++) {
+		const struct asahi_g16_snap_win *w = &asahi_g16_snap_wins[k];
+		void __iomem *io;
+		u32 *b, i;
+
+		if (!(mask & BIT(k)))
+			continue;
+		b = asahi_g16_snap_buf[n][k];
+		if (!b) {
+			b = kvzalloc(w->size, GFP_KERNEL);
+			if (!b)
+				continue;
+			asahi_g16_snap_buf[n][k] = b;
+		}
+		io = ioremap_np(w->pa, w->size);
+		if (!io)
+			continue;
+		/* Where a read took the SoC down, in PMU scratch */
+		asahi_g16_sleep_note(0x40 + 0x10 * n + k);
+		for (i = 0; i < w->size / 4; i++)
+			b[i] = asahi_g16_snap_skip(w, 4 * i, false) ? 0 : readl(io + 4 * i);
+		iounmap(io);
+	}
+	asahi_g16_snap_have[n] = true;
+}
+
+static void asahi_g16_snap_diff(struct device *dev, unsigned int a, unsigned int n, u32 mask)
+{
+	unsigned int k;
+
+	for (k = 0; k < G16_SNAP_WINS; k++) {
+		const struct asahi_g16_snap_win *w = &asahi_g16_snap_wins[k];
+		u32 *x = asahi_g16_snap_buf[a][k], *y = asahi_g16_snap_buf[n][k];
+		u32 i, changed = 0, nonzero = 0;
+
+		if (!(mask & BIT(k)) || !x || !y)
+			continue;
+		for (i = 0; i < w->size / 4; i++) {
+			nonzero += !!y[i];
+			if (x[i] == y[i])
+				continue;
+			if (changed++ < 256)
+				dev_info(dev, "G16 snap %u-%u: %s +%#x (%#llx): %#x -> %#x\n", a, n,
+					 w->name, 4 * i, w->pa + 4 * i, x[i], y[i]);
+		}
+		dev_info(dev, "G16 snap %u-%u: %s: %u words changed, %u of %u non-zero\n", a, n,
+			 w->name, changed, nonzero, w->size / 4);
+	}
+}
+
+static void asahi_g16_snap_write_back(struct device *dev, u32 mask)
+{
+	unsigned int k;
+
+	for (k = 0; k < G16_SNAP_WINS; k++) {
+		const struct asahi_g16_snap_win *w = &asahi_g16_snap_wins[k];
+		u32 *x = asahi_g16_snap_buf[0][k], *y = asahi_g16_snap_buf[1][k];
+		void __iomem *io;
+		u32 i, written = 0;
+
+		if (!(mask & BIT(k)) || w->no_restore || !x || !y)
+			continue;
+		io = ioremap_np(w->pa, w->size);
+		if (!io)
+			continue;
+		asahi_g16_sleep_note(0x70 + k);
+		for (i = 0; i < w->size / 4; i++) {
+			if (x[i] == y[i] || asahi_g16_snap_skip(w, 4 * i, true))
+				continue;
+			writel(x[i], io + 4 * i);
+			written++;
+		}
+		/* What the write-back left, for the log */
+		for (i = 0; i < w->size / 4; i++)
+			if (x[i] != y[i] && !asahi_g16_snap_skip(w, 4 * i, true))
+				y[i] = readl(io + 4 * i);
+		iounmap(io);
+		dev_info(dev, "G16 snap: %s: %u words written back\n", w->name, written);
+	}
+}
+
+/*
+ * @when 0: before the stop; 1: at the restart, before the run bit (diffs against 0, then writes
+ * back @restore's windows); 2: after the handshake (diffs against 1).
+ */
+void asahi_g16_snap(struct device *dev, unsigned int when, u32 mask, u32 restore)
+{
+	if (!mask || when >= G16_SNAPS)
+		return;
+	if (when && !asahi_g16_snap_have[when - 1])
+		return;
+	asahi_g16_snap_take(dev, when, mask);
+	if (!when) {
+		asahi_g16_snap_needles(dev, 0);
+		return;
+	}
+	asahi_g16_snap_diff(dev, when - 1, when, mask);
+	if (when == 1 && restore) {
+		asahi_g16_snap_write_back(dev, restore & mask);
+		asahi_g16_snap_diff(dev, 0, 1, restore & mask);
+	}
+	asahi_g16_snap_have[when - 1] = false;
+	if (when == 2)
+		asahi_g16_snap_have[2] = false;
 }
 
 /* The mailbox +0x0 bit macOS waits for after the receive goes off (0x2c -> 0x2e) */
