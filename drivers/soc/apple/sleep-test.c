@@ -10,6 +10,7 @@ static const char *const apple_sleep_test_profiles[] = {
 	"apple,t8140-sleep",
 	"apple,t8132-sleep",
 	"apple,t8142-sleep",
+	"apple,t6040-sleep",
 	"apple,t6050-sleep",
 	"apple,t6050-j716c-sleep",
 	"apple,t8103-sleep",
@@ -187,7 +188,8 @@ static void apple_sleep_test_wake_names(struct kunit *test)
 		const struct apple_sleep_soc *soc = id->data;
 		int i, j;
 
-		if (soc->regions)
+		/* A profile without a "wake" block (T6040 arms its own) has no last word */
+		if (soc->regions || !soc->wake_words)
 			continue;
 		KUNIT_EXPECT_NE(test, soc->wake_last_word, 0);
 		for (i = 0; i < soc->nwake_names; i++) {
