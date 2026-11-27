@@ -604,6 +604,16 @@ static bool smc_cold_init;
 module_param(smc_cold_init, bool, 0444);
 MODULE_PARM_DESC(smc_cold_init, "T6030 DIAGNOSTIC: boot the SMC's RTKit from IOP power INIT and write macOS's one-time keys, as macOS's boot does");
 
+/*
+ * DIAGNOSTIC: macsmc.smc_lite=1 is smc_cold_init without the INIT (which hangs the handed-over SMC
+ * on J516s): the usual wake and endpoint 0x20, then START_EP for whichever of the system endpoints
+ * 1-4 the endpoint map lists (the SMC's own crashlog buffer acknowledged by echo, as macOS does),
+ * then macOS's one-time keys. Every step is logged; none waits longer than an SMC command.
+ */
+static bool smc_lite;
+module_param(smc_lite, bool, 0444);
+MODULE_PARM_DESC(smc_lite, "T6030 DIAGNOSTIC: after the usual SMC wake, start its system endpoints 1-4 if listed and write macOS's one-time keys (no INIT)");
+
 static const struct apple_rtkit_ops apple_smc_rtkit_ops_cold = {
 	.crashed = apple_smc_rtkit_crashed,
 	.recv_message = apple_smc_rtkit_recv,
@@ -798,7 +808,7 @@ static int apple_smc_probe(struct platform_device *pdev)
 	if (IS_ERR(smc->sram_base))
 		return dev_err_probe(dev, PTR_ERR(smc->sram_base), "Failed to map SRAM region");
 
-	if (smc_cold_init)
+	if (smc_cold_init || smc_lite)
 		smc->rtk = devm_apple_rtkit_init(dev, smc, NULL, 0, &apple_smc_rtkit_ops_cold);
 	else if (smc->saved_enabled)
 		smc->rtk = devm_apple_rtkit_init_m5_saved(dev, smc, NULL, 0, &apple_smc_rtkit_ops);
@@ -836,6 +846,19 @@ static int apple_smc_probe(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(dev, ret, "Failed to start SMC endpoint");
 
+	if (smc_lite) {
+		u8 ep;
+
+		for (ep = 1; ep <= 4; ep++) {
+			if (!apple_rtkit_has_endpoint(smc->rtk, ep)) {
+				dev_info(dev, "smc_lite: endpoint %u not in the map: skipped\n", ep);
+				continue;
+			}
+			dev_info(dev, "smc_lite: START_EP %u: %d\n", ep,
+				 apple_rtkit_start_ep(smc->rtk, ep));
+		}
+	}
+
 	init_completion(&smc->init_done);
 	init_completion(&smc->cmd_done);
 
@@ -866,7 +889,7 @@ static int apple_smc_probe(struct platform_device *pdev)
 		return dev_err_probe(smc->dev, ret, "Failed to get key count");
 	smc->key_count = be32_to_cpu(count);
 
-	if (smc_cold_init)
+	if (smc_cold_init || smc_lite)
 		apple_smc_cold_keys(smc);
 
 	if (smc->sleep_pmvc_set)
