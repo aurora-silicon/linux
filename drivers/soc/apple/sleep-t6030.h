@@ -387,6 +387,7 @@ static bool t6030_last_writes_on(void);
 static void t6030_last_writes_filter(struct apple_sleep *s, struct sleep_seq *seq);
 static void t6030_last_pmu_boot(struct apple_sleep *s);
 static void t6030_spmi1_probe(struct apple_sleep *s);
+static void t6030_pmu_boot_record(struct apple_sleep *s);
 
 static int t6030_mem_config_apply(struct apple_sleep *s);
 static bool t6030_mem_config_boot_on(void);
@@ -461,6 +462,7 @@ static int t6030_sleep_map_regs(struct apple_sleep *s)
 	t6030_gp_map(s);
 	t6030_late_map(s);
 	t6030_ovrd_report(s, "probe");
+	t6030_pmu_boot_record(s);
 	if (t6030_mem_config_boot_on())
 		t6030_mem_config_apply(s);
 	if (t6030_last_writes_on())
@@ -657,6 +659,37 @@ static int t6030_pmu_xfer(struct apple_sleep *s, u32 mask, u8 opcode, u16 addres
 }
 
 /*
+ * DIAGNOSTIC (T6030 sleep bring-up): the main PMU's alarm and stage words as this boot found
+ * them, read at probe before Linux writes any (rtc-macsmc probes later; last_writes' probe
+ * clears 0xf803): 0x2000 bit 1 set means the alarm fired before the reset that started this
+ * boot, and the scratch notes are what the last sleep left. Reads only.
+ */
+#define T6030_PMU_OFF2WAKE		0x281c
+
+static void t6030_pmu_boot_record(struct apple_sleep *s)
+{
+	u32 runtime = readl(s->spmi + SPMI_NOTIFY_ENABLE), mask = runtime & ~T6030_SPMI_DONE;
+	u8 ctl = 0, rmask = 0, compare[4] = {}, ticks[6] = {}, stage[4] = {}, wake = 0, notes[5] = {};
+	u32 cmp, now;
+	int ret;
+
+	ret = t6030_pmu_xfer(s, mask, T6050_SPMI_EXT_READL, T6050_RTC_CTL, NULL, &ctl, 1) ?:
+	      t6030_pmu_xfer(s, mask, T6050_SPMI_EXT_READL, T6050_RTC_MASK, NULL, &rmask, 1) ?:
+	      t6030_pmu_xfer(s, mask, T6050_SPMI_EXT_READL, T6050_RTC_COMPARE, NULL, compare, 4) ?:
+	      t6030_pmu_xfer(s, mask, T6050_SPMI_EXT_READL, T6050_RTC_COUNTER, NULL, ticks, 6) ?:
+	      t6030_pmu_xfer(s, mask, T6050_SPMI_EXT_READL, 0xf800, NULL, stage, 4) ?:
+	      t6030_pmu_xfer(s, mask, T6050_SPMI_EXT_READL, T6030_PMU_OFF2WAKE, NULL, &wake, 1) ?:
+	      t6030_pmu_xfer(s, mask, T6050_SPMI_EXT_READL, PMU_NOTE_BASE, NULL, notes, 5);
+	writel(runtime, s->spmi + SPMI_NOTIFY_ENABLE);
+	cmp = get_unaligned_le32(compare);
+	now = get_unaligned_le32(ticks + 2);
+	dev_info(s->dev, "boot PMU%s: 0x2000 %#04x (armed %d event %d) 0x200e %#x compare-counter %+d s, f801 %#04x f802 %#04x f803 %#04x, 0x281c %#04x, notes %5ph\n",
+		 ret ? " (a read failed)" : "", ctl, !!(ctl & T6050_RTC_CTL_ARMED),
+		 !!(ctl & T6050_RTC_CTL_FIRED), rmask, (s32)(cmp - now), stage[1], stage[2], stage[3],
+		 wake, notes);
+}
+
+/*
  * DIAGNOSTIC (T6030 sleep bring-up): the second Chapel PMU (ADT spmi-chapelF1, SID 0xb on
  * nub-spmi1, with its own RTC block and off2wake latch), which the DT leaves disabled and no
  * driver touches. apple_sleep.spmi1=1 maps nub-spmi1 at probe, once its always-on power word
@@ -668,7 +701,6 @@ static int t6030_pmu_xfer(struct apple_sleep *s, u32 mask, u8 opcode, u16 addres
 #define T6030_SPMI1_SIZE		0x100
 #define T6030_AON_NUB_SPMI1		0x60
 #define T6030_PMU2_USID			0xb
-#define T6030_PMU_OFF2WAKE		0x281c
 #define T6030_PS_ACTIVE			0xf
 
 static bool t6030_spmi1;
