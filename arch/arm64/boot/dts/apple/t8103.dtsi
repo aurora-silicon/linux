@@ -1946,6 +1946,7 @@
 
 			orientation-switch;
 			mode-switch;
+			apple,idle-power-off;
 			power-domains = <&ps_atc0_usb>;
 		};
 
@@ -2174,6 +2175,7 @@
 
 			orientation-switch;
 			mode-switch;
+			apple,idle-power-off;
 			power-domains = <&ps_atc1_usb>;
 		};
 
