@@ -195,9 +195,9 @@ static ssize_t nvm_authenticate_show(struct device *dev,
 	return ret;
 }
 
-static void tb_retimer_nvm_authenticate_status(struct tb_port *port, u32 *status)
+static int tb_retimer_nvm_authenticate_status(struct tb_port *port, u32 *status)
 {
-	int i;
+	int i, ret;
 
 	tb_port_dbg(port, "reading NVM authentication status of retimers\n");
 
@@ -207,9 +207,15 @@ static void tb_retimer_nvm_authenticate_status(struct tb_port *port, u32 *status
 	 * device instance.
 	 */
 	for (i = 1; i <= TB_MAX_RETIMER_INDEX; i++) {
-		if (usb4_port_retimer_nvm_authenticate_status(port, i, &status[i]))
+		ret = usb4_port_retimer_nvm_authenticate_status(port, i, &status[i]);
+		if (ret) {
+			if (ret == -ETIMEDOUT || ret == -EBUSY)
+				return ret;
 			break;
+		}
 	}
+
+	return 0;
 }
 
 static void tb_retimer_set_inbound_sbtx(struct tb_port *port)
@@ -545,7 +551,9 @@ int tb_retimer_scan(struct tb_port *port, bool add)
 	 * Immediately after sending enumerate retimers read the
 	 * authentication status of each retimer.
 	 */
-	tb_retimer_nvm_authenticate_status(port, status);
+	ret = tb_retimer_nvm_authenticate_status(port, status);
+	if (ret)
+		return ret;
 
 	/*
 	 * Enable sideband channel for each retimer. We can do this
