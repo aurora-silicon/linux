@@ -1723,6 +1723,74 @@ static bool t6030_storage_on;
 module_param_named(storage_on, t6030_storage_on, bool, 0644);
 MODULE_PARM_DESC(storage_on, "T6030: ANS and the storage PCIe domains powered at the commit, as macOS (ANS's CPU halted)");
 
+/*
+ * DIAGNOSTIC (T6030 sleep bring-up): the "ps" words lane A's final-WFI comparison of macOS 27.2
+ * with Linux 313ee6fb (t6030-ps-at-final-wfi-macos-vs-313ee6fb) found in another state, set as
+ * macOS has them, from .commit_regs after the coprocessors' stops:
+ *  - off on macOS, on in Linux: MSG, DPA1-4, ATC1-3_COMMON (and NUB_SPI0, NUB_OCLA in ps-aon);
+ *  - off on macOS, at target 4 in Linux: PMS_FPWM0-4, PMGR_SOC_OCLA, AFT0, FPWM1-2, I2C5, MCA3;
+ *  - powered at macOS's final WFI (no AUTO_ENABLE), off or at 4 in Linux: DWI, GPIO, I2C0/4/7/8,
+ *    SPI0, UART1-6.
+ * LW31/LW30/LS3/IOA3, which Neon's list lowered too, are on at macOS's final WFI and left alone.
+ * Each wait is bounded; a word that doesn't get there is counted in PMU scratch +2 (0x80 | n).
+ */
+static bool t6030_wfi_match;
+module_param_named(wfi_match, t6030_wfi_match, bool, 0644);
+MODULE_PARM_DESC(wfi_match, "T6030 DIAGNOSTIC: set the power words lane A's final-WFI diff found apart to macOS's state at the commit");
+
+static const u32 t6030_wfi_off[] = {
+	0x108,					/* MSG */
+	0x2e8, 0x2f0, 0x2f8, 0x300,		/* DPA1-4 */
+	0x4e8, 0x4f0, 0x4f8,			/* ATC1-3_COMMON */
+	0x138, 0x140, 0x148, 0x150, 0x158,	/* PMS_FPWM0-4 */
+	0x178, 0x190,				/* PMGR_SOC_OCLA, AFT0 */
+	0x1e0, 0x1e8, 0x218, 0x398,		/* FPWM1-2, I2C5, MCA3 */
+};
+
+static const u32 t6030_wfi_off_aon[] = { 0x88, 0x90 };	/* NUB_SPI0, NUB_OCLA */
+
+static const u32 t6030_wfi_on[] = {
+	0x118, 0x120,				/* DWI, GPIO */
+	0x1f0, 0x210, 0x228, 0x230,		/* I2C0, I2C4, I2C7, I2C8 */
+	0x260,					/* SPI0 */
+	0x2a8, 0x2b0, 0x2b8, 0x2c0, 0x2c8, 0x2d0, /* UART1-6 */
+};
+
+static void t6030_wfi_match_at_commit(struct apple_sleep *s)
+{
+	unsigned int i, stuck = 0;
+	u32 v, now;
+
+	if (!READ_ONCE(t6030_wfi_match))
+		return;
+	for (i = 0; i < ARRAY_SIZE(t6030_wfi_off); i++) {
+		if (!(readl(s->ps + t6030_wfi_off[i]) & (PS_ACTUAL | PS_TARGET)))
+			continue;
+		sleep_ps_lower(s, t6030_wfi_off[i]);
+		if (sleep_ps_wait_off(s, t6030_wfi_off[i]))
+			stuck++;
+	}
+	for (i = 0; i < ARRAY_SIZE(t6030_wfi_off_aon); i++) {
+		void __iomem *reg = s->ps_aon + t6030_wfi_off_aon[i];
+
+		v = readl(reg);
+		if (!FIELD_GET(PS_ACTUAL, v))
+			continue;
+		writel(v & ~(PS_AUTO_ENABLE | PS_FLAGS), reg);
+		writel((v & ~(PS_AUTO_ENABLE | PS_FLAGS | PS_TARGET)) | PS_FLAGS, reg);
+		if (readl_poll_timeout_atomic(reg, now, !FIELD_GET(PS_ACTUAL, now), 1,
+					      PS_OFF_TIMEOUT_US))
+			stuck++;
+	}
+	for (i = 0; i < ARRAY_SIZE(t6030_wfi_on); i++) {
+		if (FIELD_GET(PS_ACTUAL, readl(s->ps + t6030_wfi_on[i])) == 0xf)
+			continue;
+		if (sleep_ps_raise_start(s, t6030_wfi_on[i]))
+			stuck++;
+	}
+	sleep_note_at(s, 2, 0x80 | min(stuck, 0x7fU));
+}
+
 /* PMU scratch +4 before each raise (0x11-0x13) and after (0x14); +3 the word's state if one fails */
 static void t6030_storage_on_at_commit(struct apple_sleep *s)
 {
@@ -1758,6 +1826,7 @@ static void t6030_sleep_commit_regs(struct apple_sleep *s)
 	 */
 	t6030_sleep_down(s);
 	t6030_storage_on_at_commit(s);
+	t6030_wfi_match_at_commit(s);
 	t6030_gp_phy_park(s);
 	if (t6030_sleep_lower(s, T6030_LOWER_PHY, ARRAY_SIZE(t6030_lowered)))
 		t6030_sleep_failed("storage PHY power word");
