@@ -2824,6 +2824,10 @@ static void t6030_sleep_wake(struct apple_sleep *s)
  * EL1 pair (macOS's per-core init leaves cntp_ctl = 2) and stops the core PMU (PMCR0 = 0), as
  * XNU's core-offline path does before its deep WFI. Boot parameter, off by default (A/B).
  */
+static bool t6030_no_wfi_clean;
+module_param_named(no_wfi_clean, t6030_no_wfi_clean, bool, 0444);
+MODULE_PARM_DESC(no_wfi_clean, "T6030 DIAGNOSTIC: no set/way clean or HID4 toggles before each core's final WFI");
+
 static bool t6030_quiet;
 module_param_named(quiet, t6030_quiet, bool, 0444);
 MODULE_PARM_DESC(quiet, "T6030 DIAGNOSTIC: mask the EL1 timers and stop the core PMU before each core's final WFI");
@@ -2840,14 +2844,17 @@ static void t6030_deep_wfi_arm(void)
 		write_sysreg_s(0, T8142_PMCR0);
 		isb();
 	}
-	hid4 = t6030_dc_unblock();
-
 	/*
 	 * This core's last stores are in by now: its L1 and its cluster's L2 back to memory, as
 	 * XNU's CleanPoC_Dcache before its sleep. A cluster's last core in cleans the L2 last.
+	 * DIAGNOSTIC: apple_sleep.no_wfi_clean=1 leaves out the clean and the HID4/EHID4 toggles,
+	 * which no working SoC's last WFI does (A/B).
 	 */
-	t6030_clean_all_levels();
-	t6030_dc_reblock(hid4);
+	if (!READ_ONCE(t6030_no_wfi_clean)) {
+		hid4 = t6030_dc_unblock();
+		t6030_clean_all_levels();
+		t6030_dc_reblock(hid4);
+	}
 
 	/*
 	 * macOS 27.2 at every core's final WFI on J516s, under aura's HV with option 0x1000
