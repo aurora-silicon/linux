@@ -1191,7 +1191,7 @@ pub(crate) mod sizes {
     /// queue/recovery capacities: `47` in-flight passes consume at most `47 * 4 = 188` entries of
     /// each 256-entry TA/FS work ring (`QUEUE_CAP = 256`, 255 usable, ring cap `63`), use
     /// per-allocator hardware UMA slots `RENDER_UMA_SLOT + slot` (`33..38`, strictly inside the
-    /// firmware render slot range `33..64`), post at most `FLIGHTS = 32` `SubmitRecord`s (vs
+    /// firmware render slot range `33..64`), post at most `FLIGHTS = 64` `SubmitRecord`s (vs
     /// `AHEAD_RECORDS = 128` / `RING_SLOTS = 256`), and stay far below the firmware recovery
     /// `snapshot_entries = 448` limit.
     pub(crate) const RENDER_SLOTS: usize = 48;
@@ -1241,16 +1241,14 @@ pub(crate) mod sizes {
     const _: () = assert!(COMPUTE_UMA_SLOTS == 32);
     const _: () = assert!(COMPUTE_UNITS >= 2 && COMPUTE_UNITS <= 64);
     const _: () = assert!((COMPUTE_UNITS - 1) * MAX_COMPUTE_RING_ENTRIES < QUEUE_CAP as usize);
-    const _: () = assert!(
-        super::client::compute_list(2) + 0x4000 <= super::client::compute_base(3)
-    );
+    const _: () =
+        assert!(super::client::compute_list(2) + 0x4000 <= super::client::compute_base(3));
     const _: () = assert!(
         super::client::compute_base(COMPUTE_UMA_WINDOWS as u64)
             <= super::client::EXT_COMPUTE_REC_BASE
     );
-    const _: () = assert!(
-        super::client::compute_context(2) + 0x40000 <= super::client::compute_preempt(3)
-    );
+    const _: () =
+        assert!(super::client::compute_context(2) + 0x40000 <= super::client::compute_preempt(3));
     const _: () = assert!(
         super::client::compute_context(COMPUTE_UNITS as u64 - 1) + 0x40000
             <= super::client::scs_compute_records(0)
