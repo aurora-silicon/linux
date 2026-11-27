@@ -87,7 +87,7 @@ struct centauri_t6050_wifi {
 	bool reply_valid, registered, configured;
 	u8 *reply_buffer;
 	size_t reply_capacity, reply_size;
-	bool stopping, command_failed;
+	bool stopping, command_failed, stage_fault_logged;
 	bool tx_paused, transport_paused, host_sleep_sent, transport_sleep_sent;
 	bool regulatory_deferred;
 	u8 country_deferred[3];
@@ -898,8 +898,12 @@ static int command_reply(struct centauri_t6050_wifi *wifi, u32 id,
 		return -EIO;
 	if (size > BUFFER_SIZE - 24)
 		return -EMSGSIZE;
-	if ((slot + 1) % ring_size[1] == index_read(wifi, 1, 1))
+	if ((slot + 1) % ring_size[1] == index_read(wifi, 1, 1)) {
+		if (!wifi->pm_prepared)
+			centauri_t6050_fault_report(wifi->control,
+						    "command ring full");
 		return -ENOSPC;
+	}
 	packet = wifi->a.window + TX_BUFFER + slot * BUFFER_SIZE;
 	memset(packet, 0, 24 + size);
 	put_unaligned_le16(24 + size, packet + 0x10);
@@ -939,6 +943,9 @@ static int command_reply(struct centauri_t6050_wifi *wifi, u32 id,
 				"Wi-Fi command %#x lost transport: stage=%#x sequence=%u rx=%u\n",
 				id, stage, sequence, wifi->rx_seen[2]);
 			command_fault(wifi);
+			if (!wifi->pm_prepared)
+				centauri_t6050_fault_report(wifi->control,
+							    "command: Alpha stage");
 			ret = -EIO;
 			goto out;
 		}
@@ -961,6 +968,8 @@ static int command_reply(struct centauri_t6050_wifi *wifi, u32 id,
 	dev_err(&wifi->control->pdev->dev,
 		"Wi-Fi command %#x timed out (rx=%u)\n", id, wifi->rx_seen[2]);
 	command_fault(wifi);
+	if (!wifi->pm_prepared)
+		centauri_t6050_fault_report(wifi->control, "command timeout");
 	ret = -ETIMEDOUT;
 out:
 	wifi->reply_buffer = NULL;
@@ -1259,8 +1268,25 @@ static int radio_start(struct centauri_t6050_wifi *wifi)
 
 static bool scan_transport_stopped(struct centauri_t6050_wifi *wifi)
 {
-	return READ_ONCE(wifi->stopping) || wifi->command_failed ||
-	       wifi->host_sleep_sent || readl(wifi->a.bar + 8) != 2;
+	u32 stage;
+
+	if (READ_ONCE(wifi->stopping) || wifi->command_failed ||
+	    wifi->host_sleep_sent)
+		return true;
+	stage = readl(wifi->a.bar + 8);
+	if (stage != 2) {
+		if (!wifi->stage_fault_logged) {
+			wifi->stage_fault_logged = true;
+			dev_err(&wifi->control->pdev->dev,
+				"Wi-Fi Alpha firmware stopped during scan: stage=%#x\n",
+				stage);
+		}
+		if (!wifi->pm_prepared)
+			centauri_t6050_fault_report(wifi->control,
+						    "scan: Alpha stage");
+		return true;
+	}
+	return false;
 }
 
 static int scan_stop_chunk(struct centauri_t6050_wifi *wifi, u32 done)
@@ -2030,12 +2056,28 @@ static void connect_worker(struct work_struct *work)
 	while (!ret && !wifi->connect_event &&
 	       !READ_ONCE(wifi->connect_abort) && !READ_ONCE(wifi->stopping) &&
 	       time_before(jiffies, deadline)) {
+		u32 stage;
+
 		drain(wifi);
 
 		if (wifi->disconnect_event)
 			ret = -ENOTCONN;
-		if (readl(wifi->a.bar + 8) != 2)
+		stage = readl(wifi->a.bar + 8);
+		if (stage != 2) {
+			if (!READ_ONCE(wifi->stopping) &&
+			    !wifi->host_sleep_sent && !wifi->command_failed) {
+				if (!wifi->stage_fault_logged) {
+					wifi->stage_fault_logged = true;
+					dev_err(&wifi->control->pdev->dev,
+						"Wi-Fi Alpha firmware stopped during connect: stage=%#x\n",
+						stage);
+				}
+				if (!wifi->pm_prepared)
+					centauri_t6050_fault_report(wifi->control,
+								    "connect: Alpha stage");
+			}
 			ret = -EIO;
+		}
 		usleep_range(1000, 2000);
 	}
 	if (READ_ONCE(wifi->connect_abort) || READ_ONCE(wifi->stopping))
@@ -2128,6 +2170,7 @@ static void link_worker(struct work_struct *work)
 	struct centauri_t6050_wifi *wifi =
 		container_of(work, struct centauri_t6050_wifi, link_work);
 	bool disconnected, was_connected;
+	u32 stage;
 
 	mutex_lock(&wifi->lock);
 	if (READ_ONCE(wifi->transport_paused)) {
@@ -2136,8 +2179,22 @@ static void link_worker(struct work_struct *work)
 	}
 	was_connected = wifi->connected;
 	drain(wifi);
+	stage = readl(wifi->a.bar + 8);
+	if (stage == 2) {
+		wifi->stage_fault_logged = false;
+	} else if (!READ_ONCE(wifi->stopping) && !wifi->host_sleep_sent &&
+		   !wifi->command_failed) {
+		if (!wifi->stage_fault_logged) {
+			wifi->stage_fault_logged = true;
+			dev_err(&wifi->control->pdev->dev,
+				"Wi-Fi Alpha firmware stopped: stage=%#x\n", stage);
+		}
+		if (!wifi->pm_prepared)
+			centauri_t6050_fault_report(wifi->control,
+						    "link: Alpha stage");
+	}
 	disconnected = wifi->command_failed || wifi->disconnect_event ||
-		       READ_ONCE(wifi->stopping) || readl(wifi->a.bar + 8) != 2;
+		       READ_ONCE(wifi->stopping) || stage != 2;
 	if (disconnected)
 		wifi->connected = false;
 	if (disconnected && was_connected) {
@@ -2155,9 +2212,26 @@ static int wait_disconnect(struct centauri_t6050_wifi *wifi)
 	unsigned long deadline = jiffies + msecs_to_jiffies(5000);
 
 	while (wifi->disconnect_pending) {
+		u32 stage;
+
 		drain(wifi);
-		if (READ_ONCE(wifi->stopping) || readl(wifi->a.bar + 8) != 2)
+		if (READ_ONCE(wifi->stopping))
 			return -EIO;
+		stage = readl(wifi->a.bar + 8);
+		if (stage != 2) {
+			if (!wifi->host_sleep_sent && !wifi->command_failed) {
+				if (!wifi->stage_fault_logged) {
+					wifi->stage_fault_logged = true;
+					dev_err(&wifi->control->pdev->dev,
+						"Wi-Fi Alpha firmware stopped during disconnect: stage=%#x\n",
+						stage);
+				}
+				if (!wifi->pm_prepared)
+					centauri_t6050_fault_report(wifi->control,
+								    "disconnect: Alpha stage");
+			}
+			return -EIO;
+		}
 		if (!wifi->disconnect_pending)
 			break;
 		if (time_after_eq(jiffies, deadline))
@@ -2304,6 +2378,24 @@ bool centauri_t6050_wifi_wowlan_armed(struct centauri_t6050 *c)
 		armed = wifi->pm_wowlan_armed;
 	mutex_unlock(&wifi->lock);
 	return armed;
+}
+
+bool centauri_t6050_wifi_stalled(struct centauri_t6050 *c)
+{
+	struct centauri_t6050_wifi *wifi = c->wifi;
+	bool stalled = false;
+
+	if (!wifi)
+		return false;
+	mutex_lock(&wifi->lock);
+	if (!READ_ONCE(wifi->stopping) && !READ_ONCE(wifi->transport_paused) &&
+	    !wifi->host_sleep_sent && !wifi->pm_prepared)
+		stalled = wifi->command_failed ||
+			  readl(wifi->a.bar + 8) != 2 ||
+			  (wifi->command_head + 1) % ring_size[1] ==
+				  index_read(wifi, 1, 1);
+	mutex_unlock(&wifi->lock);
+	return stalled;
 }
 
 void centauri_t6050_wifi_mark_failed(struct centauri_t6050 *c)
@@ -2632,7 +2724,9 @@ static void wifi_regulatory(struct wiphy *wiphy,
 			memcpy(wifi->country_deferred, country, sizeof(country));
 		wifi->regulatory_deferred = true;
 	} else {
-		if (wifi->configured && named)
+		if (wifi->configured && !READ_ONCE(wifi->stopping) &&
+		    !wifi->command_failed && named &&
+		    readl(wifi->a.bar + 8) == 2)
 			country_set(wifi, country);
 		/* cfg80211 has just recomputed the channel flags. */
 		channels_apply(wifi);
@@ -3083,6 +3177,8 @@ int centauri_t6050_wifi_register(struct centauri_t6050 *c)
 	/* The bands come from the firmware's reports: start the radio first. */
 	ret = radio_start(wifi);
 	if (ret) {
+		if (ret == -EIO || ret == -ETIMEDOUT)
+			c->boot_hw_failed = true;
 		dev_err(&c->pdev->dev,
 			"Wi-Fi ring/interface setup failed: %d\n", ret);
 		goto failed;

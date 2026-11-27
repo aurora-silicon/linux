@@ -121,7 +121,7 @@ struct apple_sleep_region_state {
 	struct platform_device *radio_host, *radio_dart;
 	u32 n1_perst, n1_held, n1_gapf;
 	int n1_state, n1_up_ret;
-	bool n1_host;
+	bool n1_host, n1_gapf_gated;
 	/* The GFX die's interrupt controller word over the sleep, and GFX at the wake */
 	u32 gfx_aic[3];
 	u32 gfx_wake[2];
@@ -1668,6 +1668,7 @@ static int t6050_sleep_begin(struct apple_sleep *s)
 
 	t6050_sleep_pins_low(s);
 	r->n1_up_ret = 0;
+	r->n1_gapf_gated = false;
 	r->n1_host = t6050_n1_host_bound(s);
 	if (r->n1_host) {
 		/* Its functions are in use until their own suspend: the host's noirq suspend runs it. */
@@ -2613,6 +2614,17 @@ static bool t6050_n1_host_bound(struct apple_sleep *s)
 	return pdev && device_is_bound(&pdev->dev);
 }
 
+bool apple_sleep_radio_port_ready(void)
+{
+	struct apple_sleep *s = apple_sleep;
+	struct apple_sleep_region_state *r = s ? s->region : NULL;
+
+	return r && t6050_n1_host_bound(s) && r->ap_gpio && r->n1_perst &&
+	       r->n1_ecam && r->n1_port && r->n1_phy &&
+	       r->dart[T6050_DART_APCIE0] && r->gapf && r->link_down.n;
+}
+EXPORT_SYMBOL_GPL(apple_sleep_radio_port_ready);
+
 /*
  * From the radio host driver's noirq suspend, once its functions are quiet and its DART is saved
  * and gated: the same link shutdown, before every step of the commit. An error means nothing
@@ -2623,33 +2635,40 @@ int apple_sleep_radio_port_down(void)
 	struct apple_sleep *s = apple_sleep;
 	struct apple_sleep_region_state *r = s ? s->region : NULL;
 
-	if (!r || !r->n1_host || !r->ap_gpio)
+	if (!r || !t6050_n1_host_bound(s) || !r->ap_gpio)
 		return -ENODEV;
 	t6050_sleep_n1_down(s, false);
 	if (r->n1_state && r->n1_state != 4)
 		return -EIO;
+	r->n1_gapf_gated = !!(r->gapf && r->dart_slice[T6050_DART_APCIE0]);
+	r->n1_up_ret = 0;
 	/* The wake puts PERST# back as the shutdown left it, low, as macOS restores it */
-	if (s->pins_saved_valid && s->npins > r->n1_perst && !test_bit(r->n1_perst, s->pins_skip))
+	if (r->attempt_active && s->pins_saved_valid && s->npins > r->n1_perst &&
+	    !test_bit(r->n1_perst, s->pins_skip))
 		s->pins_saved[r->n1_perst] = readl(r->ap_gpio + 4 * r->n1_perst);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(apple_sleep_radio_port_down);
 
 /*
- * For the radio host's noirq resume: 0 once the root complex runs again (or never stopped),
- * else nothing behind it may be read. A sleep abandoned after the shutdown lost no power: the
- * DART's slice goes back, and the host resets the DART itself.
+ * For the radio host's noirq resume or runtime port recycle: 0 once the root complex runs
+ * again (or never stopped), else nothing behind it may be read. A sleep abandoned after the
+ * shutdown, or a runtime port recycle, lost no power: the DART's slice goes back, and the
+ * host resets the DART itself.
  */
 int apple_sleep_radio_rc_ready(void)
 {
 	struct apple_sleep *s = apple_sleep;
 	struct apple_sleep_region_state *r = s ? s->region : NULL;
 
-	if (!r || !r->n1_host)
+	if (!r || !t6050_n1_host_bound(s))
 		return 0;
-	if (!r->committed && r->gapf && r->dart_slice[T6050_DART_APCIE0] &&
-	    (!r->n1_state || r->n1_state == 4))
+	if ((r->n1_gapf_gated || (!r->committed && (!r->n1_state || r->n1_state == 4))) &&
+	    r->gapf && r->dart_slice[T6050_DART_APCIE0]) {
 		writel(r->n1_gapf, r->gapf + r->dart_slice[T6050_DART_APCIE0]);
+		r->dart_slice_written &= ~BIT(T6050_DART_APCIE0);
+		r->n1_gapf_gated = false;
+	}
 	return r->n1_up_ret;
 }
 EXPORT_SYMBOL_GPL(apple_sleep_radio_rc_ready);
@@ -2708,7 +2727,7 @@ void apple_sleep_radio_port_wake(unsigned int step)
 	struct apple_sleep *s = apple_sleep;
 	struct apple_sleep_region_state *r = s ? s->region : NULL;
 
-	if (r && r->n1_host)
+	if (r && t6050_n1_host_bound(s))
 		t6050_ops_run(s, step ? &r->dart_wake : &r->port_wake);
 }
 EXPORT_SYMBOL_GPL(apple_sleep_radio_port_wake);
@@ -3873,6 +3892,7 @@ static void t6050_sleep_finish(struct apple_sleep *s)
 	t6050_sleep_undo_regs(s);
 	/* Before any device resumes: the radio host's noirq resume asks for the result. */
 	if (r->committed && r->n1_host) {
+		r->n1_gapf_gated = false;
 		r->n1_up_ret = t6050_n1_unpark(s);
 		if (r->n1_up_ret)
 			dev_err(s->dev, "radio's PCIe PHY and root complex not back: %d\n", r->n1_up_ret);

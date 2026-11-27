@@ -72,7 +72,7 @@ struct centauri_t6050_wifi {
     struct centauri_t6050 *control;
     struct { u8 *window, *bar; uint64_t window_dma; } a;
     int lock, connect_work, link_work, data_tx_queue;
-    bool command_failed, stopping, connect_abort, disconnect_pending, connecting, connected;
+    bool command_failed, stage_fault_logged, stopping, connect_abort, disconnect_pending, connecting, connected;
     bool reply_valid, pm_prepared, pm_wowlan_armed;
     bool data_tx_busy[DATA_TX_SLOTS];
     bool host_events_fallback_logged;
@@ -89,7 +89,7 @@ struct centauri_t6050_wifi {
 };
 static const u16 ring_size[5] = {0, 64};
 static unsigned int doorbells, drains, notifications, consumer, tx_drain_rounds, info_logs;
-static unsigned int reads, index_reads, reports, applies;
+static unsigned int reads, index_reads, reports, applies, fault_reports;
 static bool rtnl_held, fail_firmware_report;
 #define ASSERT_RTNL() assert(rtnl_held)
 static void dev_info(const void *dev, const char *fmt, ...)
@@ -138,6 +138,8 @@ static int command(struct centauri_t6050_wifi *wifi, u32 id, const void *payload
     return command_reply(wifi, id, payload, size, NULL, NULL, NULL);
 }
 static void command_fault(struct centauri_t6050_wifi *wifi) { wifi->command_failed = true; }
+static void centauri_t6050_fault_report(struct centauri_t6050 *c, const char *why)
+{ (void)c; (void)why; fault_reports++; }
 static void drain(struct centauri_t6050_wifi *wifi)
 {
     assert(wifi->lock);
@@ -216,7 +218,7 @@ static void reset(void)
     wifi.connected = true;
     wiphy.wifi = &wifi;
     doorbells = drains = notifications = consumer = tx_drain_rounds = info_logs = 0;
-    reads = index_reads = reports = applies = 0;
+    reads = index_reads = reports = applies = fault_reports = 0;
     rtnl_held = fail_firmware_report = false;
     firmware_status = last_cmd6_tlv280_len = mock_fw_transient_status = 0;
     mock_reply_command = 131073;
@@ -327,6 +329,59 @@ static void test_deferred_regulatory(void)
     assert(alpha_resume_locked(&wifi) == -EIO);
     mutex_unlock(&wifi.lock);
     assert(wifi.command_failed && wifi.transport_paused && wifi.tx_paused);
+    /* Stopping, command_failed, or Alpha stage != 2 skips country_set cleanly. */
+    reset();
+    wifi.configured = true;
+    wifi.stopping = true;
+    rtnl_held = true;
+    wifi_regulatory(&wiphy, &us);
+    assert(!doorbells && !reports && applies == 1);
+    reset();
+    wifi.configured = true;
+    transport_mode = LOST;
+    rtnl_held = true;
+    wifi_regulatory(&wiphy, &us);
+    assert(!doorbells && !reports && !wifi.command_failed && applies == 1);
+
+    /* Production centauri_t6050_wifi_stalled() distinguishes transient stage loss from persistent stall. */
+    reset();
+    transport_mode = LOST;
+    assert(centauri_t6050_wifi_stalled(&control));
+    transport_mode = REPLY;
+    assert(!centauri_t6050_wifi_stalled(&control));
+    wifi.command_failed = true;
+    assert(centauri_t6050_wifi_stalled(&control));
+    wifi.pm_prepared = true;
+    assert(!centauri_t6050_wifi_stalled(&control));
+    reset();
+    consumer = 1;
+    assert(centauri_t6050_wifi_stalled(&control));
+
+    /* Runtime (non-PM) transport faults report recovery; PM faults do not. */
+    reset();
+    consumer = 1;
+    mutex_lock(&wifi.lock);
+    assert(command_reply(&wifi, 9, NULL, 0, NULL, NULL, NULL) == -ENOSPC);
+    mutex_unlock(&wifi.lock);
+    assert(fault_reports == 1);
+    reset();
+    transport_mode = LOST;
+    mutex_lock(&wifi.lock);
+    assert(command_reply(&wifi, 9, NULL, 0, NULL, NULL, NULL) == -EIO);
+    mutex_unlock(&wifi.lock);
+    assert(fault_reports == 1 && wifi.command_failed);
+    reset();
+    transport_mode = TIMEOUT;
+    mutex_lock(&wifi.lock);
+    assert(command_reply(&wifi, 9, NULL, 0, NULL, NULL, NULL) == -ETIMEDOUT);
+    mutex_unlock(&wifi.lock);
+    assert(fault_reports == 1 && wifi.command_failed);
+    prepare();
+    transport_mode = LOST;
+    mutex_lock(&wifi.lock);
+    assert(command_reply(&wifi, 9, NULL, 0, NULL, NULL, NULL) == -EIO);
+    mutex_unlock(&wifi.lock);
+    assert(fault_reports == 0);
 }
 
 int main(void)
@@ -544,6 +599,7 @@ def main():
              "drain_tx_in_flight", "wifi_disconnect",
              "centauri_t6050_wifi_pm_prepare", "centauri_t6050_wifi_pm_error",
              "centauri_t6050_wifi_pm_disconnected", "centauri_t6050_wifi_wowlan_armed",
+             "centauri_t6050_wifi_stalled",
              "centauri_t6050_wifi_mark_failed", "centauri_t6050_wifi_pm_complete",
              "alpha_host_power_send", "alpha_host_power", "country_set",
              "alpha_resume_locked", "wifi_regulatory", "wifi_suspend"]

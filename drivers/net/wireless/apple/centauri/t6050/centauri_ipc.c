@@ -410,11 +410,14 @@ static int centauri_t6050_start_ipc_locked(struct centauri_t6050 *c,
 	ret = readl_poll_timeout(c->bar + 0x8000, stage, stage == 2 || stage == 3, 100, 3000000);
 	if (ret || stage != 2) {
 		ret = ret ?: -EIO;
+		c->boot_hw_failed = true;
 		goto failed;
 	}
 	ret = handshake(c->bar, &ipc->control, 0x8050, 0x8054, 0x907c);
-	if (ret)
+	if (ret) {
+		c->boot_hw_failed = true;
 		goto failed;
+	}
 	ret = memswap_handoff(c, 0, "mswc");
 	if (!ret)
 		ret = memswap_handoff(c, 2, "mswb");
@@ -423,11 +426,15 @@ static int centauri_t6050_start_ipc_locked(struct centauri_t6050 *c,
 	if (ret)
 		goto failed;
 	ret = cchi_init(c);
-	if (ret)
+	if (ret) {
+		if (ret != -ENOMEM)
+			c->boot_hw_failed = true;
 		goto failed;
+	}
 	ret = readl_poll_timeout(ipc->bar[1] + 8, stage, stage == 2 || stage == 3, 100, 2000000);
 	if (ret || stage != 2) {
 		ret = ret ?: -EIO;
+		c->boot_hw_failed = true;
 		goto failed;
 	}
 	ipc->window = buffer_alloc(c, 1, CEN_ALPHA_WINDOW_SIZE);
@@ -443,8 +450,10 @@ static int centauri_t6050_start_ipc_locked(struct centauri_t6050 *c,
 	writel(upper_32_bits(ipc->window->dma), ipc->bar[1] + 0x1c);
 	writel(CEN_ALPHA_WINDOW_SIZE, ipc->bar[1] + 0x20);
 	ret = handshake(ipc->bar[1], &ipc->alpha, 0xc, 0x10, 0x1028);
-	if (ret)
+	if (ret) {
+		c->boot_hw_failed = true;
 		goto failed;
+	}
 	ret = centauri_t6050_wifi_register(c);
 	if (ret)
 		return ret;
