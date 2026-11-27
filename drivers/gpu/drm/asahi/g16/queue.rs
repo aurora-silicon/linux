@@ -337,7 +337,7 @@ impl Queue {
         let resolved = match resolved {
             Some(waits) if !waits.is_empty() => {
                 let host = match super::lab::knob(super::lab::FW_WAITS) {
-                    0 => false,
+                    0 | 3 => false,
                     1 => true,
                     _ => waits
                         .iter()

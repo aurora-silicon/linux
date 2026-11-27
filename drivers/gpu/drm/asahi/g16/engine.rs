@@ -3917,9 +3917,22 @@ impl Firmware {
         }
         for p_idx in 0..sizes::COMPUTE_PIPES {
             let off = p_idx * work::barrier::SIZE;
+            // LAB ONLY (linux#3349): knob 0 = 3 waits on the compute pipe's service stamp (notifier
+            // page, written after the firmware's end-of-record walk) instead of its FINALIZE fw_stamp.
+            let service = super::lab::knob(super::lab::FW_WAITS) == 3;
+            let compute_wait_va = if service {
+                self.graph.compute[p_idx].notifier.va + notifier_page::COMPUTE_STAMP as u64
+            } else {
+                self.graph.compute[p_idx].fw_stamp.va
+            };
+            if service
+                && (plan.ta_compute_wait[p_idx].is_some() || plan.fs_compute_wait[p_idx].is_some())
+            {
+                super::lab::SERVICE_WAITS.fetch_add(1, Ordering::Relaxed);
+            }
             if let Some(wait_c) = plan.ta_compute_wait[p_idx] {
                 let cbar = encode::barrier(
-                    self.graph.compute[p_idx].fw_stamp.va,
+                    compute_wait_va,
                     wait_c,
                     work::compute::EVENTS[p_idx],
                     target,
@@ -3935,7 +3948,7 @@ impl Firmware {
             }
             if let Some(wait_c) = plan.fs_compute_wait[p_idx] {
                 let fcbar = encode::barrier(
-                    self.graph.compute[p_idx].fw_stamp.va,
+                    compute_wait_va,
                     wait_c,
                     work::compute::EVENTS[p_idx],
                     target,
