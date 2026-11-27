@@ -843,6 +843,22 @@ static int ane_h16_sleep_prepare(struct ane_h16_device *h)
 		h->genpd[i].off_ns = 0;
 	}
 	WRITE_ONCE(h->sleep_quarantined, false);
+	/*
+	 * A bring-up that failed after RUN, every restart used: the firmware
+	 * cannot be asked for anything and holds no program. Power the engine
+	 * off under it, as for a hung session, and let the sleep go on. It stays
+	 * off and quarantined until reboot, every mapping held.
+	 */
+	if (!h->program_ready && h->boot.ran && h->boot.quarantined && ane_t6021_hung_stop) {
+		if (h->engine_on) {
+			unsigned int held = ane_h16_hold_darts(h);
+
+			ane_h16_power_down(h);
+			ane_h16_release_darts(h, held);
+			dev_info(h->dev, "H16 ANE: engine that failed its bring-up powered off for system sleep\n");
+		}
+		return 0;
+	}
 	if (!h->program_ready || (h->boot.quarantined && !ane_t6021_hung_stop))
 		return -EBUSY;
 	ane_h16_session_sleep(&h->session, true);
