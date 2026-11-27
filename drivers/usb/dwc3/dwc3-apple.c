@@ -21,6 +21,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/pm_wakeup.h>
 #include <linux/reset.h>
+#include <linux/sched.h>
 #include <linux/soc/apple/sleep.h>
 #include <linux/soc/apple/t8132.h>
 #include <linux/soc/apple/tunable.h>
@@ -193,6 +194,14 @@ struct dwc3_apple {
 	bool pre_core_rpm;
 	bool dt_dis_u3_susphy;
 	bool sleep_ddr;
+	/*
+	 * A host's USB3 PHY is routed from xHCI's probe, see dwc3_apple_usb3_host_route(): the
+	 * task that runs that probe under the glue lock, whether the routing is still owed, and
+	 * its result (-EINPROGRESS until the SuperSpeed root hub was set up).
+	 */
+	struct task_struct *host_start_task;
+	bool usb3_host_owed;
+	int usb3_host_ret;
 	struct notifier_block pm_nb;
 	/* Kept through a deep sleep, with the PHY's hibernation, and the GUID it had. */
 	bool sleep_in_place;
@@ -651,8 +660,11 @@ static int dwc3_apple_pre_host_resume(struct dwc3 *dwc)
 	return ret;
 }
 
+static int dwc3_apple_usb3_host_route(struct dwc3 *dwc);
+
 static const struct dwc3_glue_ops dwc3_apple_glue_ops = {
 	.pre_host_resume = dwc3_apple_pre_host_resume,
+	.usb3_host_route = dwc3_apple_usb3_host_route,
 };
 
 static bool dwc3_apple_host_before_core_init(struct dwc3_apple *appledwc,
@@ -945,25 +957,18 @@ static void dwc3_apple_usb3_pipe_reset(struct dwc3_apple *appledwc)
 	msleep(100);
 }
 
-/* Select the role in the core and route the USB3 PHY, before xhci or the gadget is started */
-static int dwc3_apple_set_role(struct dwc3_apple *appledwc, enum dwc3_apple_state state)
+/*
+ * Route the USB3 PHY for the role. This platform requires SUSPHY to be enabled already in order
+ * to properly configure the PHY and switch dwc3's PIPE interface to the USB3 PHY.
+ */
+static int dwc3_apple_route_usb3(struct dwc3_apple *appledwc, enum phy_mode mode)
 {
-	bool host = state == DWC3_APPLE_HOST;
+	bool host = mode == PHY_MODE_USB_HOST;
 	int ret;
 
 	lockdep_assert_held(&appledwc->lock);
 
-	appledwc->dwc.dr_mode = host ? USB_DR_MODE_HOST : USB_DR_MODE_PERIPHERAL;
-	dwc3_apple_set_ptrcap(appledwc, host ? DWC3_GCTL_PRTCAP_HOST : DWC3_GCTL_PRTCAP_DEVICE);
-	/*
-	 * This platform requires SUSPHY to be enabled here already in order to properly
-	 * configure the PHY and switch dwc3's PIPE interface to USB3 PHY. The USB2 PHY's
-	 * device mode and the T8132 host role were selected in dwc3_apple_core_start();
-	 * other host roles are selected by the xHCI root hub as it starts.
-	 */
-	appledwc->dwc.dis_u3_susphy_quirk = appledwc->dt_dis_u3_susphy;
-	dwc3_enable_susphy(&appledwc->dwc, true);
-	ret = phy_set_mode(appledwc->usb3_phy, host ? PHY_MODE_USB_HOST : PHY_MODE_USB_DEVICE);
+	ret = phy_set_mode(appledwc->usb3_phy, mode);
 	if (ret) {
 		/*
 		 * A failed T8132 BIST or PIPE handoff must not start xHCI. Neither must a failed
@@ -985,11 +990,111 @@ static int dwc3_apple_set_role(struct dwc3_apple *appledwc, enum dwc3_apple_stat
 		 */
 		appledwc->dwc.dis_u3_susphy_quirk = true;
 		dwc3_enable_susphy(&appledwc->dwc, true);
-	} else if (appledwc->usb3_phy &&
+	} else if (host && appledwc->usb3_phy &&
 		   of_device_is_compatible(appledwc->dev->of_node, "apple,t6040-dwc3")) {
 		dwc3_apple_usb3_pipe_reset(appledwc);
 	}
 	return 0;
+}
+
+/*
+ * Select the role in the core, and route the USB3 PHY before the gadget or xHCI starts unless
+ * dwc3_apple_usb3_mode_before_start() leaves a host's routing to dwc3_apple_usb3_host_route().
+ */
+static int dwc3_apple_set_role(struct dwc3_apple *appledwc, enum dwc3_apple_state state)
+{
+	bool host = state == DWC3_APPLE_HOST;
+	bool pipe_reset = host && appledwc->usb3_phy &&
+			  of_device_is_compatible(appledwc->dev->of_node, "apple,t6040-dwc3");
+	enum phy_mode mode;
+	int ret;
+
+	lockdep_assert_held(&appledwc->lock);
+
+	ret = dwc3_apple_usb3_mode_before_start(state, pipe_reset, &mode);
+	if (ret)
+		return ret;
+
+	appledwc->dwc.dr_mode = host ? USB_DR_MODE_HOST : USB_DR_MODE_PERIPHERAL;
+	dwc3_apple_set_ptrcap(appledwc, host ? DWC3_GCTL_PRTCAP_HOST : DWC3_GCTL_PRTCAP_DEVICE);
+	appledwc->dwc.dis_u3_susphy_quirk = appledwc->dt_dis_u3_susphy;
+	/*
+	 * A routing left to xHCI keeps SUSPHY clear through xhci_reset() on the dummy PIPE:
+	 * dwc3_xhci_plat_start() enables it once that reset has completed.
+	 */
+	appledwc->usb3_host_owed = host && mode == PHY_MODE_INVALID;
+	dwc3_enable_susphy(&appledwc->dwc, !appledwc->usb3_host_owed);
+	if (appledwc->usb3_host_owed)
+		return 0;
+
+	return dwc3_apple_route_usb3(appledwc, mode);
+}
+
+/*
+ * Runs from xHCI's probe as its SuperSpeed root hub is set up: after xhci_reset() (USBCMD.HCRST)
+ * has completed on the dummy PIPE, with SUSPHY enabled, and before xhci_run() starts the
+ * controller. The root hub leaves the USB3 PHY alone (see dwc3_host_init()), so routing the
+ * live PIPE here cannot expose a SuperSpeed link handshake to that reset, and an error both
+ * stops xHCI before it starts and reaches dwc3_apple_host_start(). Only the probe that
+ * dwc3_apple_host_start() runs under the glue lock routes; any other one, such as a probe
+ * the driver core ran asynchronously, is refused, and dwc3_apple_host_start() probes again.
+ */
+static int dwc3_apple_usb3_host_route(struct dwc3 *dwc)
+{
+	struct dwc3_apple *appledwc = to_dwc3_apple(dwc);
+
+	if (READ_ONCE(appledwc->host_start_task) != current)
+		return -EBUSY;
+
+	lockdep_assert_held(&appledwc->lock);
+	appledwc->usb3_host_ret = 0;
+	if (appledwc->usb3_host_owed)
+		appledwc->usb3_host_ret = dwc3_apple_route_usb3(appledwc, PHY_MODE_USB_HOST);
+	appledwc->usb3_host_owed = false;
+
+	return appledwc->usb3_host_ret;
+}
+
+/*
+ * Start xHCI, with its USB3 PHY routed. dwc3_host_init() does not report a failed xHCI probe
+ * (platform_device_add() ignores it), and the driver core may have left that probe to run
+ * asynchronously, or to a driver not registered yet: bind it here, so that the routing's
+ * result is known and nothing routes the PIPE later without the glue lock. A probe that has
+ * routed it is not repeated, as its xhci_reset() would then run on the live PIPE.
+ */
+static int dwc3_apple_host_start(struct dwc3_apple *appledwc)
+{
+	struct dwc3 *dwc = &appledwc->dwc;
+	bool bound = false;
+	int ret;
+
+	lockdep_assert_held(&appledwc->lock);
+
+	appledwc->usb3_host_ret = -EINPROGRESS;
+	WRITE_ONCE(appledwc->host_start_task, current);
+	ret = dwc3_host_init(dwc);
+	if (!ret) {
+		scoped_guard(device, &dwc->xhci->dev)
+			bound = device_is_bound(&dwc->xhci->dev);
+		if (!bound && appledwc->usb3_host_ret == -EINPROGRESS)
+			bound = device_attach(&dwc->xhci->dev) > 0;
+	}
+	WRITE_ONCE(appledwc->host_start_task, NULL);
+	if (ret)
+		return ret;
+
+	ret = appledwc->usb3_host_ret;
+	/* No SuperSpeed root hub was set up: xHCI has none, or no driver has bound it yet. */
+	if (ret == -EINPROGRESS)
+		ret = bound ? 0 : -EPROBE_DEFER;
+	else if (!ret && !bound)
+		ret = -ENODEV;
+	if (ret) {
+		/* dwc3_host_exit() lets the USB3 PHY into P3 for the PIPE handback */
+		dwc->dis_u3_susphy_quirk = appledwc->dt_dis_u3_susphy;
+		dwc3_host_exit(dwc);
+	}
+	return ret;
 }
 
 /*
@@ -1032,7 +1137,7 @@ static int dwc3_apple_init(struct dwc3_apple *appledwc, enum dwc3_apple_state st
 
 	switch (state) {
 	case DWC3_APPLE_HOST:
-		ret = dwc3_host_init(&appledwc->dwc);
+		ret = dwc3_apple_host_start(appledwc);
 		if (ret) {
 			dev_err(appledwc->dev, "Failed to initialize host, ret=%d\n", ret);
 			goto core_exit;
@@ -2264,3 +2369,4 @@ module_platform_driver(dwc3_apple_driver);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Sven Peter <sven@kernel.org>");
 MODULE_DESCRIPTION("DesignWare DWC3 Apple Silicon Glue Driver");
+MODULE_SOFTDEP("pre: xhci_plat_hcd");

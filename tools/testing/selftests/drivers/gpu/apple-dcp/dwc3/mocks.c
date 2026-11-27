@@ -2,8 +2,8 @@
 /* This fixture selects the original controller layout, not T8132. */
 #define of_device_is_compatible(...) false
 struct apple_atcphy {
-    /* T8132-only paths are covered by drivers/apple/atc-t8132-usb3.py. */
-    bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt;
+	/* T8132-only paths are covered by drivers/apple/atc-t8132-usb3.py. */
+	bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt, t8132_device;
 	/* A CIO sleep is T8132's too, covered by tools/asahi/atc-cio-sleep-tests.py. */
 	struct {
 		bool prepared;
@@ -404,6 +404,12 @@ static int dwc3_host_init(struct dwc3 *d)
 		pipe_regs[PIPEHANDLER_LOCK_ACK / 4] = PIPEHANDLER_LOCK_EN;
 	}
 	return host_init_error;
+}
+
+/* The xHCI start and its USB3 routing; atc-t8132-usb3 models them. */
+static int dwc3_apple_host_start(struct dwc3_apple *a)
+{
+	return dwc3_host_init(&a->dwc);
 }
 static int dwc3_gadget_init(struct dwc3 *d)
 {

@@ -48,16 +48,25 @@ pub(crate) fn explicit_dependency(board: &Board) -> u8 {
 /// Dependency class of a compute kick's implicit parent (the previous kick of its queue) on
 /// `board`. With the counted forms ([`counted_forms`]) it is class 1, which holds the kick until
 /// its parent has completed. On boards whose explicit waits take the completion class
-/// ([`Board::completion_inputs`]) a parent the host has already retired (`parent_retired`) takes
-/// the pipelined class instead, as macOS's late-published M5 Pro kicks do: there is nothing left
-/// to hold for. Otherwise it is the pipelined class, with which a kick may start while its parent
-/// still runs.
+/// ([`Board::completion_inputs`]), a parent the host has already retired (`parent_retired`) takes
+/// the pipelined class instead: there is nothing left on that physical QID to hold for.
+/// Otherwise it is the pipelined class, with which a kick may start while its parent still runs.
 pub(crate) fn parent_dependency(board: &Board, parent_retired: bool) -> u8 {
     if !counted_forms(board) || (parent_retired && board.completion_inputs()) {
         COMPUTE_PIPELINED_DEPENDENCY
     } else {
         COMPLETION_DEPENDENCY
     }
+}
+
+/// Whether `board` spreads a logical compute queue across multiple physical compute channels
+/// ([`Board::compute_channels`]) sharing one context, QoS slot, scheduler page, and work-state
+/// table, each with its own dedicated compute pool. Each physical QID still holds a
+/// completion-class implicit parent while its own prior kick is active, preventing two kicks
+/// from overlapping on one QID's single preemption/operand/usage state; concurrency comes
+/// strictly from independent kicks running across distinct sibling QIDs.
+pub(crate) fn multi_channel(board: &Board) -> bool {
+    board.compute_channels() > 1
 }
 
 /// Whether compute kicks on `board` count their completion ordinal and hold for their parent:
@@ -465,6 +474,8 @@ pub(crate) struct DescriptorArgs {
     pub(crate) stamp_va: [u64; 2],
     pub(crate) stamp_value: u32,
     pub(crate) qid: u32,
+    /// Per-context compute channel index (0, 1, 2 for a multi-channel owner; 0 otherwise).
+    pub(crate) channel_index: u32,
     pub(crate) kick_timestamp: u64,
     pub(crate) completion_ordinal: u32,
     pub(crate) status_va: [u64; 2],
@@ -503,7 +514,8 @@ pub(crate) struct Descriptor {
     stamp_va: [u64; 2],
     stamp_value: u32,
     qid: u32,
-    reserved_f58: u64,
+    channel_index: u32,
+    reserved_f5c: u32,
     kick_timestamp: u64,
     current_id: u64,
     completion_ordinal: u32,
@@ -574,6 +586,7 @@ impl Descriptor {
         self.stamp_va = args.stamp_va;
         self.stamp_value = args.stamp_value;
         self.qid = args.qid;
+        self.channel_index = args.channel_index;
         self.kick_timestamp = args.kick_timestamp;
         self.current_id = args.registers.object_ids as u32 as u64;
         self.completion_ordinal = args.completion_ordinal;

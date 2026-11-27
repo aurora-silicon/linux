@@ -168,6 +168,7 @@ mod backend {
         pub vals: [u64; 4],
         pub r64_calls: std::cell::Cell<u32>,
         pub r32_calls: std::cell::Cell<u32>,
+        pub sync_calls: std::cell::Cell<u32>,
     }
     impl Cells {
         pub fn new(vals: [u64; 4]) -> Self {
@@ -175,7 +176,12 @@ mod backend {
                 vals,
                 r64_calls: std::cell::Cell::new(0),
                 r32_calls: std::cell::Cell::new(0),
+                sync_calls: std::cell::Cell::new(0),
             }
+        }
+        pub fn sync_for_cpu(&self, _offset: usize, _len: usize) -> Result {
+            self.sync_calls.set(self.sync_calls.get() + 1);
+            Ok(())
         }
         pub fn r64(&self, offset: usize) -> Result<u64> {
             self.r64_calls.set(self.r64_calls.get() + 1);
@@ -322,7 +328,9 @@ fn resources()->Resources{Resources{
     fw.publish_timestamps(&flight,&claims).unwrap();
     assert_eq!((c0.words[0].load(Ordering::Relaxed),c0.words[1].load(Ordering::Relaxed)),(expected(0x1_0000_0070),expected(0x1_0000_0090)));
     assert_eq!((c1.words[0].load(Ordering::Relaxed),c1.words[1].load(Ordering::Relaxed)),(expected(0x2_0000_0010),expected(0x2_0000_0040)));
-    // 26B123 work_ticks-first path must skip redundant ITS WC reads when work ticks are valid.
+    // 26B123 work_ticks-first path invalidates cacheable FwCoherent work lines and skips ITS WC reads.
+    assert_eq!(flight.job.resources.compute[0].work.sync_calls.get(), 1);
+    assert_eq!(flight.job.resources.compute[1].work.sync_calls.get(), 1);
     assert_eq!(flight.job.resources.compute[0].its.r64_calls.get(), 0);
     assert_eq!(flight.job.resources.compute[1].its.r64_calls.get(), 0);
     // When work_ticks holds no interval (0/0), fall back to ITS cleanly.
@@ -331,8 +339,9 @@ fn resources()->Resources{Resources{
         work: Cells::new([0, 0, 0, 0]),
     };
     assert_eq!(fw.compute_ticks(&fallback_unit), Ok((0x300, 0x400)));
+    assert_eq!(fallback_unit.work.sync_calls.get(), 1);
     assert_eq!(fallback_unit.its.r64_calls.get(), 2);
-    // 25G83 (work_ticks = None) reads ITS directly with zero work reads.
+    // 25G83 (work_ticks = None) reads ITS directly with zero work reads or syncs.
     let fw25 = firmware();
     let unit25 = Compute {
         its: Cells::new([0x500, 0x600, 0, 0]),
@@ -341,6 +350,7 @@ fn resources()->Resources{Resources{
     assert_eq!(fw25.compute_ticks(&unit25), Ok((0x500, 0x600)));
     assert_eq!(unit25.its.r64_calls.get(), 2);
     assert_eq!(unit25.work.r32_calls.get(), 0);
+    assert_eq!(unit25.work.sync_calls.get(), 0);
 }
 mod r64_scope {
     use super::{Result, EINVAL};

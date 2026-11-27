@@ -69,6 +69,8 @@ struct apple_sleep_smc_saved_ops {
 const struct apple_sleep_smc_policy *apple_sleep_smc_policy(void);
 /* J813 experiment: send the final SMC notice after the peer idle handshakes. */
 bool apple_sleep_smc_defer_notice(void);
+/* Gen 1 (T8103): the SMC gets WKTP between slpw and slpa */
+bool apple_sleep_smc_gen1_keys(void);
 int apple_sleep_smc_register(struct device *dev,
 	int (*late_notice)(void *data, u64 *sent, u64 *ack), void *data);
 int apple_sleep_smc_register_saved(struct device *dev,
@@ -144,11 +146,17 @@ void apple_sleep_coproc_set_early(struct device *dev);
 /* Whether the last step stopped it: after a refused sleep, false means it still runs. */
 bool apple_sleep_coproc_stopped(struct device *dev);
 
+/* Platform wake error for a stopped coprocessor (0 if its power domain and fabric restored). */
+int apple_sleep_coproc_wake_error(struct device *dev);
+
 /*
  * Whether this sleep's commit stops the registered coprocessors. Then one that can't be
  * registered refuses the sleep: stopped any earlier, a later refusal would strand it.
  */
 bool apple_sleep_commit_stops_coprocs(void);
+
+/* This firmware sleep stops before its commit: a driver must stop nothing it can't restart. */
+bool apple_sleep_dry_run(void);
 
 /*
  * Untested SoCs: a coprocessor's last stop notes its own step in PMU scratch (kept across a
@@ -306,6 +314,7 @@ bool apple_sleep_wdt_active(struct device *dev);
 #else
 static inline const struct apple_sleep_smc_policy *apple_sleep_smc_policy(void) { return NULL; }
 static inline bool apple_sleep_smc_defer_notice(void) { return false; }
+static inline bool apple_sleep_smc_gen1_keys(void) { return false; }
 static inline int apple_sleep_smc_register(struct device *dev,
 	int (*late_notice)(void *data, u64 *sent, u64 *ack), void *data) { return -EOPNOTSUPP; }
 static inline int apple_sleep_smc_register_saved(struct device *dev,
@@ -371,6 +380,11 @@ static inline bool apple_sleep_coproc_stopped(struct device *dev)
 	return false;
 }
 
+static inline int apple_sleep_coproc_wake_error(struct device *dev)
+{
+	return -ENODEV;
+}
+
 static inline void apple_sleep_note_sub(u8 step) {}
 
 static inline void apple_sleep_set_commit_stops_coprocs(bool enable)
@@ -398,6 +412,11 @@ static inline bool apple_sleep_coprocs_ans_stopped(void)
 }
 
 static inline bool apple_sleep_commit_stops_coprocs(void)
+{
+	return false;
+}
+
+static inline bool apple_sleep_dry_run(void)
 {
 	return false;
 }

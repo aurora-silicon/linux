@@ -667,6 +667,57 @@ static void avd_release_open_firmware(void *data)
 	release_firmware(avd->fw);
 }
 
+static int avd_attach_power_domains(struct avd_dev *avd)
+{
+	static const char *const core_pd_names[] = { "core" };
+	static const struct dev_pm_domain_attach_data core_pd_data = {
+		.pd_names = core_pd_names,
+		.num_pd_names = ARRAY_SIZE(core_pd_names),
+		.pd_flags = PD_FLAG_DEV_LINK_ON,
+	};
+	static const struct dev_pm_domain_attach_data all_pd_data = {
+		.pd_flags = PD_FLAG_DEV_LINK_ON,
+	};
+	struct device_node *np = avd->dev->of_node;
+	int num_pds, perf_idx, ret;
+
+	/*
+	 * A node may list a second power domain, "perf": a PMC or PMP
+	 * performance floor that raises the SoC rail while the decoder works.
+	 * With more than one domain the core attaches none. Link only "core"
+	 * to avd->dev's runtime PM so light streams do not hold the floor on
+	 * every frame, and manage "perf" separately on demand in avd-pm.c.
+	 */
+	num_pds = of_count_phandle_with_args(np, "power-domains",
+					     "#power-domain-cells");
+	if (num_pds <= 1)
+		return 0;
+
+	perf_idx = of_property_match_string(np, "power-domain-names", "perf");
+	if (perf_idx >= 0 &&
+	    of_property_match_string(np, "power-domain-names", "core") >= 0) {
+		ret = devm_pm_domain_attach_list(avd->dev, &core_pd_data,
+						 &avd->pd_list);
+		if (ret < 0)
+			return dev_err_probe(avd->dev, ret,
+					     "failed to attach core power domain\n");
+
+		ret = avd_pm_attach_perf(avd, perf_idx);
+		if (ret)
+			return dev_err_probe(avd->dev, ret,
+					     "failed to attach perf power domain\n");
+
+		return 0;
+	}
+
+	ret = devm_pm_domain_attach_list(avd->dev, &all_pd_data, &avd->pd_list);
+	if (ret < 0)
+		return dev_err_probe(avd->dev, ret,
+				     "failed to attach power domains\n");
+
+	return 0;
+}
+
 static int avd_probe(struct platform_device *pdev)
 {
 	struct avd_dev *avd;
@@ -695,25 +746,9 @@ static int avd_probe(struct platform_device *pdev)
 	if (IS_ERR(avd->rstc))
 		return PTR_ERR(avd->rstc);
 
-	/*
-	 * A node may list a second power domain, "perf": the PMC floor that
-	 * holds the SoC rail at its performance level while the decoder works
-	 * (decode runs at about half speed on the M4 Pro without it). With more
-	 * than one domain the core attaches none, so attach them all with
-	 * runtime PM device links: the floor is then held exactly while the
-	 * decoder is runtime-active (frames in flight plus the autosuspend
-	 * delay) and released when it idles, rests or is retired.
-	 */
-	if (of_count_phandle_with_args(pdev->dev.of_node, "power-domains",
-				       "#power-domain-cells") > 1) {
-		static const struct dev_pm_domain_attach_data pd_data = {
-			.pd_flags = PD_FLAG_DEV_LINK_ON,
-		};
-
-		ret = devm_pm_domain_attach_list(avd->dev, &pd_data, &avd->pd_list);
-		if (ret < 0)
-			return dev_err_probe(avd->dev, ret, "failed to attach power domains\n");
-	}
+	ret = avd_attach_power_domains(avd);
+	if (ret)
+		return ret;
 
 	avd->code = devm_platform_ioremap_resource_byname(pdev, "code");
 	if (IS_ERR(avd->code))
@@ -769,8 +804,8 @@ static int avd_probe(struct platform_device *pdev)
 
 	/*
 	 * The domain links were added active, but the decoder starts
-	 * suspended: settle that before enabling runtime PM, so the floor is
-	 * not held until the first decode has come and gone.
+	 * suspended: settle that before enabling runtime PM, so the attached
+	 * domains are not held until the first decode has come and gone.
 	 */
 	if (avd->pd_list) {
 		ret = pm_runtime_set_suspended(avd->dev);

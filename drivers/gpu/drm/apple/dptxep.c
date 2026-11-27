@@ -482,11 +482,12 @@ static int dptxport_call_set_active_lane_count(struct apple_epic_service *servic
 		ret = dptx_j700_validate_lanes(dptx, lane_count);
 		if (ret)
 			return ret;
-	} else if (dptx->lane_count < lane_count && !dcp_is_usb4_output(dcp)) {
+	} else if (dptx->lane_count < lane_count && !dcp_is_usb4_output(dcp) &&
+		   dcp->dptx_phy <= 3) {
 		/*
-		 * A DP tunnel has no PHY lanes to check, on any SoC: its lane
-		 * count is the tunnel's, and lane_count holds the previous
-		 * active one.
+		 * A DP tunnel or a fixed non-ATC-PHY output (dptx_phy > 3) has
+		 * no ATC PHY lanes to check: its lane count is accepted below,
+		 * and lane_count holds the previous active one.
 		 */
 		dev_err(dcp->dev, "set_active_lane_count: unexpected lane "
 			"count:%llu phy: %d\n", lane_count, dptx->lane_count);

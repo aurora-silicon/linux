@@ -164,6 +164,11 @@ pub(super) enum JobFailure {
     Released,
     /// [`Self::Stranded`] as reported back to the submitting thread.
     Retained,
+    /// Refused while being prepared from the client's own state (its VM
+    /// closed, an address it names unmapped, an allocation it sized): nothing
+    /// of the job reached the firmware and its owner is back where the last
+    /// retirement left it. The session and the path keep serving.
+    Refused(Error),
 }
 
 /// How far a failed task reaches.
