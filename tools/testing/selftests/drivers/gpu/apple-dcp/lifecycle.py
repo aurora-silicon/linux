@@ -859,6 +859,7 @@ struct apple_dcp {
  struct dptx_port dptxport[2];
  struct apple_connector *connector;
  struct { bool active; } split;
+ struct { bool valid; } mode_state;
  bool external_h17p, external_stop_deferred, soft_dpms, typec_output;
  bool typec_cable_connected, typec_crtc_off, external_native, hdmi_crtc_off;
  u64 external_crtc_generation, typec_unplugs, crtc_unplugs;
@@ -905,6 +906,7 @@ static void init(u64 released, u64 claimed)
   .typec_output = true, .typec_cable_connected = true,
   .typec_unplugs = released, .crtc_unplugs = claimed,
   .connector = &connector,
+  .mode_state = { .valid = true },
  };
  dcp.dptxport[0].available = dcp.dptxport[0].connected = true;
  dcp.typec_reconnect_wq.pending = true;
@@ -949,6 +951,12 @@ int main(void)
  /* The desktop turns the CRTC off after the firmware's unplug at sleep: keep the link. */
  init(0, 0); dcp.typec_output = false; dcp.hdmi_hpd = &dcp; hdmi_gpio = true;
  dcp.fw_compat = DCP_FIRMWARE_V_27_0; connector.connected = false;
+ dcp_poweroff(&pdev);
+ assert(poweroffs == 1 && disconnects == 0 && dcp.dptxport[0].connected);
+ assert(!dcp.hdmi_crtc_off);
+ /* Firmware republishing after hotplug (mode_state invalid): keep the link. */
+ init(0, 0); dcp.typec_output = false; dcp.hdmi_hpd = &dcp; hdmi_gpio = true;
+ dcp.fw_compat = DCP_FIRMWARE_V_27_0; dcp.mode_state.valid = false;
  dcp_poweroff(&pdev);
  assert(poweroffs == 1 && disconnects == 0 && dcp.dptxport[0].connected);
  assert(!dcp.hdmi_crtc_off);

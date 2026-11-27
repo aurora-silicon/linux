@@ -5835,14 +5835,19 @@ void dcp_poweroff(struct platform_device *pdev)
 		 * The firmware then reports an unplug although the cable is still
 		 * attached; dcpep_cb_hotplug() ignores it while hdmi_crtc_off is
 		 * set. A real removal still arrives through the HPD GPIO.
-		 * Only a DPMS off of a display still described as connected: a
-		 * CRTC disabled for a system sleep, or by the desktop after the
-		 * firmware's unplug at sleep, keeps the link as before, so the
-		 * firmware reports the display again once it is retrained.
+		 *
+		 * Only a DPMS off of a display whose mode is still valid and
+		 * described as connected: a CRTC disabled for a system sleep,
+		 * by the desktop after the firmware's unplug at sleep, or while
+		 * firmware is republishing the display after hotplug (when
+		 * iomfb_poweroff() skipped stopping an external H17P pipe)
+		 * keeps the link as before, so the firmware reports the display
+		 * again once it is retrained.
 		 */
 		bool release = dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
 			       pm_suspend_target_state == PM_SUSPEND_ON &&
-			       dcp->connector && READ_ONCE(dcp->connector->connected);
+			       dcp->connector && READ_ONCE(dcp->connector->connected) &&
+			       READ_ONCE(dcp->mode_state.valid);
 
 		if (!connected) {
 			WRITE_ONCE(dcp->hdmi_crtc_off, false);
