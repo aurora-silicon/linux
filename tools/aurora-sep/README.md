@@ -338,10 +338,15 @@ suspend instead, so pressing while authenticating loses nothing and the next
 press wakes the machine, and holding the button for 5 s powers off cleanly.
 GNOME sessions and the GDM login screen handle a short press themselves
 (`power-button-action`, `suspend` by default); the setting covers consoles
-and other desktops. It takes effect at the next boot. By hand:
+and other desktops. It takes effect at the next boot. The packages install it
+as `05-aurora-sep.conf`: logind sorts the drop-ins of `/etc` and `/usr/lib` by
+file name and the last one wins, so it only replaces logind's own default,
+and a distribution or administrator drop-in (`HandlePowerKey=ignore` where a
+compositor shows its own power menu, for example) still takes precedence. By
+hand:
 
 ```sh
-install -Dm644 logind-aurora-sep.conf /etc/systemd/logind.conf.d/aurora-sep.conf
+install -Dm644 logind-aurora-sep.conf /etc/systemd/logind.conf.d/05-aurora-sep.conf
 ```
 
 GNOME Shell 51 offers fingerprint only on the lock screen, never on the

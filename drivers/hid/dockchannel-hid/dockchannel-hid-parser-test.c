@@ -21,6 +21,7 @@ static int dchid_parser_test_init(struct kunit *test)
 	iface->out_flags = 0x80;
 	iface->tx_seq = 7;
 	init_completion(&iface->out_complete);
+	spin_lock_init(&iface->resp_lock);
 	dchid->ifaces[1] = iface;
 	test->priv = iface;
 	return 0;
@@ -170,6 +171,41 @@ static void dchid_init_descriptor_test(struct kunit *test)
 	KUNIT_EXPECT_MEMEQ(test, iface->hid_desc, msg.descriptor, sizeof(msg.descriptor));
 }
 
+/* Repeated descriptors keep one copy, and none replaces a queued one. */
+static void dchid_init_descriptor_repeat_test(struct kunit *test)
+{
+	struct dchid_iface *iface = test->priv;
+	struct device *dev = iface->dchid->dev;
+	struct {
+		struct dchid_init_hdr hdr;
+		struct dchid_init_block_hdr block;
+		u8 descriptor[4];
+	} __packed msg = {
+		.hdr = { .iface = 1, .more_packets = 1 },
+		.block = { .type = INIT_HID_DESCRIPTOR, .length = 4 },
+		.descriptor = { 0x05, 0x01, 0x09, 0x06 },
+	};
+	size_t resources = list_count_nodes(&dev->devres_head);
+	void *desc;
+	int i;
+
+	for (i = 0; i < 3; i++) {
+		msg.descriptor[3] = i;
+		dchid_handle_init(iface->dchid, &msg, sizeof(msg));
+	}
+	KUNIT_EXPECT_EQ(test, list_count_nodes(&dev->devres_head), resources + 1);
+	KUNIT_ASSERT_NOT_NULL(test, iface->hid_desc);
+	KUNIT_EXPECT_EQ(test, ((u8 *)iface->hid_desc)[3], 2);
+
+	iface->creating = true;
+	desc = iface->hid_desc;
+	msg.descriptor[3] = 3;
+	dchid_handle_init(iface->dchid, &msg, sizeof(msg));
+	KUNIT_EXPECT_PTR_EQ(test, iface->hid_desc, desc);
+	KUNIT_EXPECT_EQ(test, ((u8 *)iface->hid_desc)[3], 2);
+	KUNIT_EXPECT_EQ(test, list_count_nodes(&dev->devres_head), resources + 1);
+}
+
 static void dchid_packet_checksum_test(struct kunit *test)
 {
 	struct dchid_hdr hdr = { .hdr_len = sizeof(hdr), .length = 8 };
@@ -265,6 +301,7 @@ static struct kunit_case dchid_parser_cases[] = {
 	KUNIT_CASE(dchid_init_bounds_test),
 	KUNIT_CASE(dchid_short_input_test),
 	KUNIT_CASE(dchid_init_descriptor_test),
+	KUNIT_CASE(dchid_init_descriptor_repeat_test),
 	KUNIT_CASE(dchid_packet_checksum_test),
 	KUNIT_CASE(dchid_ring_wrap_test),
 	KUNIT_CASE(dchid_ring_bad_header_test),
