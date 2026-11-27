@@ -418,6 +418,8 @@ static u32 apple_soc_cpufreq_timeout(const struct apple_soc_cpufreq_info *info)
 	return info->transition_timeout_us ?: APPLE_DVFS_TRANSITION_TIMEOUT;
 }
 
+static int apple_soc_cpufreq_drop_pending(struct apple_cpu_priv *priv);
+
 static unsigned int apple_soc_cpufreq_get_rate(unsigned int cpu)
 {
 	struct cpufreq_policy *policy;
@@ -436,7 +438,7 @@ static unsigned int apple_soc_cpufreq_get_rate(unsigned int cpu)
 
 		raw_spin_lock_irqsave(&priv->lock, flags);
 		priv->waited = true;
-		priv->pending_pstate = -1;
+		apple_soc_cpufreq_drop_pending(priv);
 		raw_spin_unlock_irqrestore(&priv->lock, flags);
 	}
 
@@ -576,16 +578,10 @@ static int apple_soc_cpufreq_request(struct cpufreq_policy *policy,
  *
  * Called with priv->lock held.
  */
-static void apple_soc_cpufreq_publish_cur(struct apple_cpu_priv *priv,
-					  unsigned int pstate,
-					  bool record_stats);
-
 static void apple_soc_cpufreq_fail(struct apple_cpu_priv *priv, u64 reg)
 {
-	if (priv->pending_pstate >= 0)
-		apple_soc_cpufreq_publish_cur(priv, priv->expected_pstate, false);
+	apple_soc_cpufreq_drop_pending(priv);
 	priv->transition_failed = true;
-	priv->pending_pstate = -1;
 	/* The scheduler may hold a runqueue lock: the timer reports it. */
 	priv->failure_unreported = true;
 	priv->failure_command = reg;
@@ -678,6 +674,21 @@ static void apple_soc_cpufreq_publish_cur(struct apple_cpu_priv *priv,
 		cur = priv->cap_freq;
 	if (cur)
 		apple_soc_cpufreq_record_cur(policy, cur, record_stats);
+}
+
+/*
+ * Discards an unaccepted pending request and restores policy->cur to the
+ * accepted hardware state. Called with priv->lock held.
+ */
+static int apple_soc_cpufreq_drop_pending(struct apple_cpu_priv *priv)
+{
+	int pstate = priv->pending_pstate;
+
+	if (pstate >= 0) {
+		priv->pending_pstate = -1;
+		apple_soc_cpufreq_publish_cur(priv, priv->expected_pstate, false);
+	}
+	return pstate;
 }
 
 /*
@@ -779,7 +790,7 @@ static enum hrtimer_restart apple_soc_cpufreq_verify(struct hrtimer *timer)
 		ktime_t now = ktime_get();
 
 		if (priv->policy && !READ_ONCE(priv->policy->fast_switch_enabled))
-			priv->pending_pstate = -1;
+			apple_soc_cpufreq_drop_pending(priv);
 
 		if (ktime_after(now, priv->verify_deadline))
 			apple_soc_cpufreq_fail(priv, reg);
@@ -791,7 +802,7 @@ static enum hrtimer_restart apple_soc_cpufreq_verify(struct hrtimer *timer)
 				      HRTIMER_MODE_ABS_HARD);
 	} else if (priv->pending_pstate >= 0) {
 		if (priv->policy && !READ_ONCE(priv->policy->fast_switch_enabled)) {
-			priv->pending_pstate = -1;
+			apple_soc_cpufreq_drop_pending(priv);
 			if (FIELD_GET(APPLE_DVFS_CMD_PS1, reg) != priv->expected_pstate)
 				apple_soc_cpufreq_fail(priv, reg);
 		} else {
@@ -857,7 +868,6 @@ static int apple_soc_cpufreq_lazy_set(struct apple_cpu_priv *priv,
 	}
 
 	/* An idle cluster has accepted, or refused, the previous request. */
-	priv->pending_pstate = -1;
 	if (apple_soc_cpufreq_lazy_write(priv, reg, pstate)) {
 		if (!hrtimer_is_queued(&priv->verify_timer))
 			apple_soc_cpufreq_verify_later(priv);
@@ -866,6 +876,7 @@ static int apple_soc_cpufreq_lazy_set(struct apple_cpu_priv *priv,
 		hrtimer_start(&priv->verify_timer, 0, HRTIMER_MODE_REL_HARD);
 		return -EIO;
 	}
+	priv->pending_pstate = -1;
 	*accepted = true;
 	return 0;
 }
@@ -988,12 +999,9 @@ static int apple_soc_cpufreq_drain(struct apple_cpu_priv *priv)
 	hrtimer_cancel(&priv->verify_timer);
 
 	raw_spin_lock_irqsave(&priv->lock, flags);
-	pstate = priv->pending_pstate;
-	priv->pending_pstate = -1;
-	if (pstate >= 0) {
-		apple_soc_cpufreq_publish_cur(priv, priv->expected_pstate, false);
+	pstate = apple_soc_cpufreq_drop_pending(priv);
+	if (pstate >= 0)
 		pstate = apple_soc_cpufreq_clamp_pstate(priv, pstate);
-	}
 	report = priv->failure_unreported;
 	priv->failure_unreported = false;
 	reg = priv->failure_command;

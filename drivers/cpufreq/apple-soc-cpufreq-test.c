@@ -1339,7 +1339,8 @@ static void cft_test_lazy_policy_limits_and_handoff(struct kunit *test)
 	/*
 	 * Switching away from a fast-switch governor clears
 	 * fast_switch_enabled: the timer must drop the pending state and
-	 * thermal samples must leave hardware and policy->cur untouched.
+	 * restore policy->cur to expected_pstate, and thermal samples must
+	 * leave hardware and policy->cur untouched.
 	 */
 	cft_set_cmd(ctx->regs, 7 | APPLE_DVFS_CMD_BUSY);
 	ctx->priv->expected_pstate = 7;
@@ -1354,10 +1355,26 @@ static void cft_test_lazy_policy_limits_and_handoff(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ctx->priv->pending_pstate, -1);
 	KUNIT_EXPECT_EQ(test, FIELD_GET(APPLE_DVFS_CMD_PS1, cft_cmd(ctx->regs)), 7ULL);
 	KUNIT_EXPECT_FALSE(test, ctx->priv->transition_failed);
+	KUNIT_EXPECT_EQ(test, ctx->policy->cur, 1800000U);
 
 	KUNIT_EXPECT_FALSE(test, cft_lazy_cap(ctx, 1, 600000, &moved));
 	KUNIT_EXPECT_EQ(test, moved, -1);
+	KUNIT_EXPECT_EQ(test, ctx->policy->cur, 1800000U);
+
+	/* Dropping a pending request while BUSY under !fast_switch_enabled also restores cur. */
+	ctx->priv->cap_pstate = soc_t6050_info.max_pstate;
+	ctx->policy->fast_switch_enabled = true;
+	cft_set_cmd(ctx->regs, 7 | APPLE_DVFS_CMD_BUSY);
+	KUNIT_EXPECT_TRUE(test, cft_lazy_request(ctx, 4, &freq));
+	KUNIT_EXPECT_EQ(test, ctx->priv->pending_pstate, 15);
 	KUNIT_EXPECT_EQ(test, ctx->policy->cur, 3000000U);
+
+	ctx->policy->fast_switch_enabled = false;
+	ctx->priv->verify_deadline = ktime_add_ms(ktime_get(), 60 * MSEC_PER_SEC);
+	KUNIT_EXPECT_TRUE(test, cft_verify(ctx));
+	KUNIT_EXPECT_EQ(test, ctx->priv->pending_pstate, -1);
+	KUNIT_EXPECT_FALSE(test, ctx->priv->transition_failed);
+	KUNIT_EXPECT_EQ(test, ctx->policy->cur, 1800000U);
 }
 
 static struct kunit_case apple_soc_cpufreq_test_cases[] = {
@@ -2482,6 +2499,8 @@ static void cft_test_stats_busy_then_discard(struct kunit *test)
 	local_irq_restore(flags);
 	KUNIT_EXPECT_TRUE(test, priv->transition_failed);
 	KUNIT_EXPECT_EQ(test, priv->pending_pstate, -1);
+	KUNIT_EXPECT_EQ(test, policy->cur, 1200000U);
+	cft_expect_freq_scale(test, policy, 1200000);
 
 	msleep(25);
 	KUNIT_EXPECT_EQ(test, cft_stats_total_trans(test, policy), total);
@@ -2531,6 +2550,8 @@ static void cft_test_stats_busy_then_discard(struct kunit *test)
 	local_irq_restore(flags);
 	KUNIT_EXPECT_TRUE(test, priv->transition_failed);
 	KUNIT_EXPECT_EQ(test, priv->pending_pstate, -1);
+	KUNIT_EXPECT_EQ(test, policy->cur, 1200000U);
+	cft_expect_freq_scale(test, policy, 1200000);
 
 	msleep(25);
 	KUNIT_EXPECT_EQ(test, cft_stats_total_trans(test, policy), total);
@@ -2689,6 +2710,134 @@ static void cft_test_stats_busy_suspend_fail(struct kunit *test)
 			c_3000_600);
 }
 
+static void cft_live_queue_3g_at_1200(struct kunit *test,
+				      struct cpufreq_policy *policy)
+{
+	struct apple_cpu_priv *priv = cft_live_priv;
+	unsigned int freq;
+
+	cft_live_reset_t6050(policy);
+	freq = cpufreq_driver_fast_switch(policy, 1200000);
+	hrtimer_cancel(&priv->verify_timer);
+	KUNIT_EXPECT_EQ(test, freq, 1200000U);
+	KUNIT_EXPECT_EQ(test, policy->cur, 1200000U);
+	cft_expect_freq_scale(test, policy, 1200000);
+
+	cft_set_cmd(cft_live_regs, 4 | APPLE_DVFS_CMD_BUSY);
+	freq = cpufreq_driver_fast_switch(policy, 3000000);
+	hrtimer_cancel(&priv->verify_timer);
+	KUNIT_EXPECT_EQ(test, freq, 3000000U);
+	KUNIT_EXPECT_EQ(test, policy->cur, 3000000U);
+	KUNIT_EXPECT_EQ(test, priv->pending_pstate, 15);
+	KUNIT_EXPECT_EQ(test, priv->expected_pstate, 4U);
+}
+
+/*
+ * Queueing a fast-switch request behind BUSY and then hitting an idle register
+ * with an unexpected P-state on fast_switch(), lazy_cap(), policy->update, or
+ * timer replay must restore policy->cur to expected_pstate and keep
+ * cpufreq_stats and scheduler freq_scale strictly on that accepted state.
+ */
+static void cft_test_stats_idle_mismatch_discard(struct kunit *test)
+{
+	struct cpufreq_policy *policy;
+	struct apple_cpu_priv *priv = cft_live_priv;
+	struct freq_qos_request *user_req, *min_req;
+	unsigned int total, c_1200_3000, c_1200_1800;
+	u64 t1200_before, t1800_before, t3000_before;
+	unsigned long flags;
+	unsigned int freq;
+	int moved;
+
+	if (!IS_ENABLED(CONFIG_CPU_FREQ_STAT))
+		kunit_skip(test, "CONFIG_CPU_FREQ_STAT is disabled");
+
+	policy = cft_live_policy_setup(test);
+	cft_live_add_qos(test, policy, &user_req, FREQ_QOS_MAX, 3000000);
+	cft_live_add_qos(test, policy, &min_req, FREQ_QOS_MIN, 600000);
+	flush_work(&policy->update);
+
+	/* 1. Idle mismatch on follow-up fast_switch() after queueing 3 GHz. */
+	cft_live_queue_3g_at_1200(test, policy);
+	total = cft_stats_total_trans(test, policy);
+	c_1200_3000 = cft_stats_trans_count(test, policy, 1200000, 3000000);
+	c_1200_1800 = cft_stats_trans_count(test, policy, 1200000, 1800000);
+	t1200_before = cft_stats_time_in_state(test, policy, 1200000);
+	t1800_before = cft_stats_time_in_state(test, policy, 1800000);
+	t3000_before = cft_stats_time_in_state(test, policy, 3000000);
+
+	cft_set_cmd(cft_live_regs, 9);
+	freq = cpufreq_driver_fast_switch(policy, 1800000);
+	hrtimer_cancel(&priv->verify_timer);
+	KUNIT_EXPECT_EQ(test, freq, 0U);
+	KUNIT_EXPECT_TRUE(test, priv->transition_failed);
+	KUNIT_EXPECT_EQ(test, priv->pending_pstate, -1);
+	KUNIT_EXPECT_EQ(test, priv->expected_pstate, 4U);
+	KUNIT_EXPECT_EQ(test, policy->cur, 1200000U);
+	cft_expect_freq_scale(test, policy, 1200000);
+
+	msleep(25);
+	KUNIT_EXPECT_EQ(test, cft_stats_total_trans(test, policy), total);
+	KUNIT_EXPECT_EQ(test, cft_stats_trans_count(test, policy, 1200000, 3000000),
+			c_1200_3000);
+	KUNIT_EXPECT_EQ(test, cft_stats_trans_count(test, policy, 1200000, 1800000),
+			c_1200_1800);
+	KUNIT_EXPECT_GT(test, cft_stats_time_in_state(test, policy, 1200000),
+			t1200_before);
+	KUNIT_EXPECT_EQ(test, cft_stats_time_in_state(test, policy, 1800000),
+			t1800_before);
+	KUNIT_EXPECT_EQ(test, cft_stats_time_in_state(test, policy, 3000000),
+			t3000_before);
+
+	/* 2. Idle mismatch on lazy_cap() after queueing 3 GHz. */
+	cft_live_queue_3g_at_1200(test, policy);
+	total = cft_stats_total_trans(test, policy);
+	cft_set_cmd(cft_live_regs, 9);
+	local_irq_save(flags);
+	moved = apple_soc_cpufreq_lazy_cap(priv, 7, 1800000);
+	hrtimer_cancel(&priv->verify_timer);
+	local_irq_restore(flags);
+	KUNIT_EXPECT_EQ(test, moved, -1);
+	KUNIT_EXPECT_TRUE(test, priv->transition_failed);
+	KUNIT_EXPECT_EQ(test, priv->pending_pstate, -1);
+	KUNIT_EXPECT_EQ(test, priv->expected_pstate, 4U);
+	KUNIT_EXPECT_EQ(test, policy->cur, 1200000U);
+	cft_expect_freq_scale(test, policy, 1200000);
+	KUNIT_EXPECT_EQ(test, cft_stats_total_trans(test, policy), total);
+
+	/* 3. Idle mismatch on policy->update ceiling drop after queueing 3 GHz. */
+	cft_live_queue_3g_at_1200(test, policy);
+	total = cft_stats_total_trans(test, policy);
+	cft_set_cmd(cft_live_regs, 9);
+	KUNIT_ASSERT_GE(test, freq_qos_update_request(user_req, 1800000), 0);
+	flush_work(&policy->update);
+	hrtimer_cancel(&priv->verify_timer);
+	KUNIT_EXPECT_TRUE(test, priv->transition_failed);
+	KUNIT_EXPECT_EQ(test, priv->pending_pstate, -1);
+	KUNIT_EXPECT_EQ(test, priv->expected_pstate, 4U);
+	KUNIT_EXPECT_EQ(test, policy->cur, 1200000U);
+	cft_expect_freq_scale(test, policy, 1200000);
+	KUNIT_EXPECT_EQ(test, cft_stats_total_trans(test, policy), total);
+
+	/* 4. Idle mismatch on verify timer replay after queueing 3 GHz. */
+	KUNIT_ASSERT_GE(test, freq_qos_update_request(user_req, 3000000), 0);
+	flush_work(&policy->update);
+	cft_live_queue_3g_at_1200(test, policy);
+	total = cft_stats_total_trans(test, policy);
+	cft_set_cmd(cft_live_regs, 9);
+	local_irq_save(flags);
+	KUNIT_EXPECT_EQ(test, apple_soc_cpufreq_verify(&priv->verify_timer),
+			HRTIMER_NORESTART);
+	hrtimer_cancel(&priv->verify_timer);
+	local_irq_restore(flags);
+	KUNIT_EXPECT_TRUE(test, priv->transition_failed);
+	KUNIT_EXPECT_EQ(test, priv->pending_pstate, -1);
+	KUNIT_EXPECT_EQ(test, priv->expected_pstate, 4U);
+	KUNIT_EXPECT_EQ(test, policy->cur, 1200000U);
+	cft_expect_freq_scale(test, policy, 1200000);
+	KUNIT_EXPECT_EQ(test, cft_stats_total_trans(test, policy), total);
+}
+
 static struct kunit_case apple_soc_cpufreq_policy_test_cases[] = {
 	KUNIT_CASE_PARAM(cft_test_get, cft_get_gen_params),
 	KUNIT_CASE(cft_test_thermal_owner),
@@ -2698,6 +2847,7 @@ static struct kunit_case apple_soc_cpufreq_policy_test_cases[] = {
 	KUNIT_CASE(cft_test_stats_clamp_and_race),
 	KUNIT_CASE(cft_test_stats_busy_then_discard),
 	KUNIT_CASE(cft_test_stats_busy_suspend_fail),
+	KUNIT_CASE(cft_test_stats_idle_mismatch_discard),
 	{}
 };
 
