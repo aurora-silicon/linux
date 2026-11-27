@@ -602,6 +602,14 @@
  */
 #include "t6050-j714s-left-usb4.dtsi"
 
+/*
+ * The apple,pcie binding names interrupts only on apple,t6040-pciec; the PCIe-C driver takes
+ * the port interrupt by index. Leave the shared description's "port0" name out on this board.
+ */
+&apciec1 {
+	/delete-property/ interrupt-names;
+};
+
 &atc1_phy {
 	apple,tunable-lane0-rx-top-cio = <0x35c 0xe00 0x0>;
 	apple,tunable-lane1-rx-top-cio = <0x35c 0xe00 0x0>;
