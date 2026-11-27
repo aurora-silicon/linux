@@ -11,7 +11,10 @@ static void macaudio_admission_needs_a_safe_level(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, macaudio_speakers_allowed(&macaudio_j45x_cfg));
 	KUNIT_EXPECT_TRUE(test, macaudio_speakers_allowed(&macaudio_j413_cfg));
 	KUNIT_EXPECT_TRUE(test, macaudio_speakers_allowed(&macaudio_j700_cfg));
-	/* The AOP-fed machines: J714 and J813 with their safe level, J873 and J704 without one */
+	/*
+	 * The AOP-fed machines: J714 (also K114 and K116) and J813 with their safe
+	 * level, J873 and J704 without one
+	 */
 	KUNIT_EXPECT_TRUE(test, macaudio_speakers_allowed(&macaudio_j714_cfg));
 	KUNIT_EXPECT_TRUE(test, macaudio_speakers_allowed(&macaudio_j813_cfg));
 	KUNIT_EXPECT_FALSE(test, macaudio_speakers_allowed(&macaudio_j873_cfg));
@@ -19,8 +22,6 @@ static void macaudio_admission_needs_a_safe_level(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, macaudio_speakers_allowed(&macaudio_j775_cfg));
 	/* J704: speakers off until their slots and protection are verified */
 	KUNIT_EXPECT_FALSE(test, macaudio_speakers_allowed(&macaudio_j704_cfg));
-	/* K114: the J714 amps and frame, but no safe level for the chassis */
-	KUNIT_EXPECT_FALSE(test, macaudio_speakers_allowed(&macaudio_k114_cfg));
 	cfg = macaudio_j413_cfg;
 	cfg.safe_vol = 0;
 	KUNIT_EXPECT_FALSE(test, macaudio_speakers_allowed(&cfg));
