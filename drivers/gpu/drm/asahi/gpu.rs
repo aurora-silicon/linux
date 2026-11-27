@@ -406,8 +406,12 @@ impl WorkItem for GpuManager::ver {
 /// Operations the DRM driver performs on a GPU, independent of its firmware interface.
 pub(crate) trait Gpu: Send + Sync {
     /// Admission bound checked before copying the userspace command stream.
+    ///
+    /// The copy is a kmalloc() buffer, which warns past `KMALLOC_MAX_SIZE`, so that is the
+    /// default. A GPU whose parser accepts less returns its own limit (G15 and G16: 4 MiB;
+    /// G17: see `g17::command::MAX_STREAM`).
     fn max_cmdbuf_size(&self) -> usize {
-        usize::MAX
+        kernel::bindings::KMALLOC_MAX_SIZE as usize
     }
 
     /// The firmware statistics snapshot of this GPU, if its firmware reports any.

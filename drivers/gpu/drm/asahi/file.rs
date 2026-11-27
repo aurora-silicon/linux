@@ -301,7 +301,12 @@ impl SyncItem {
         const STRIDE: usize = core::mem::size_of::<uapi::drm_asahi_sync>();
         const CHUNK: usize = 8;
         let size = STRIDE.checked_mul(count as usize).ok_or(EOVERFLOW)?;
-        let mut vec = KVec::with_capacity(count as usize, GFP_KERNEL)?;
+        // Userspace picks the count, and the array is one kmalloc() buffer, which warns past
+        // KMALLOC_MAX_SIZE. Refuse a larger one first. Charge it to the caller's memcg.
+        if count as usize > bindings::KMALLOC_MAX_SIZE as usize / core::mem::size_of::<SyncItem>() {
+            return Err(E2BIG);
+        }
+        let mut vec = KVec::with_capacity(count as usize, GFP_KERNEL_ACCOUNT)?;
         let mut anchor = None;
 
         // Read each record once in small stack chunks so validation and use see the
@@ -425,11 +430,13 @@ impl TableQueue {
     }
 }
 
+/// Copies the command stream. `max_cmdbuf_size()` has bounded `size`. The buffer is charged
+/// to the caller's memcg, as userspace picks its size.
 fn copy_cmdbuf_from_user(buf: &mut KVec<u8>, addr: u64, size: usize) -> Result {
     buf.clear();
     UserSlice::new(UserPtr::from_addr(addr as usize), size)
         .reader()
-        .read_all(buf, GFP_KERNEL)
+        .read_all(buf, GFP_KERNEL_ACCOUNT)
 }
 
 impl Deref for TableQueue {
@@ -1220,7 +1227,8 @@ impl File {
             .checked_mul(usize::try_from(data.num_binds)?)
             .ok_or(EOVERFLOW)?;
         let reader = UserSlice::new(UserPtr::from_addr(data.userptr as usize), size).reader();
-        reader.read_all(&mut vec, GFP_KERNEL)?;
+        // Without a GPU batch limit, userspace picks the size: fail, do not warn.
+        reader.read_all(&mut vec, GFP_KERNEL | __GFP_NOWARN)?;
         let mut reader = Reader::new(&vec);
 
         for _i in 0..data.num_binds {
@@ -1239,7 +1247,7 @@ impl File {
         let mut bytes = KVec::new();
         UserSlice::new(UserPtr::from_addr(data.userptr as usize), size)
             .reader()
-            .read_all(&mut bytes, GFP_KERNEL)?;
+            .read_all(&mut bytes, GFP_KERNEL | __GFP_NOWARN)?;
         let (vm, user_range, kernel_range) = {
             let vms = file.inner().vms();
             let guard = vms.lock();
