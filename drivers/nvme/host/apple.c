@@ -2065,7 +2065,14 @@ static void apple_nvme_reset_work_impl(struct work_struct *work)
 		if (ret)
 			goto out;
 
-		ret = apple_rtkit_reinit(anv->rtk);
+		/*
+		 * ANS was idled for the sleep, not shut down, and comes back with the
+		 * buffers it had: it logs to its syslog buffer without asking again.
+		 */
+		if (fw_sleep)
+			ret = apple_rtkit_reinit_retaining_buffers(anv->rtk);
+		else
+			ret = apple_rtkit_reinit(anv->rtk);
 		if (ret)
 			goto out;
 
@@ -3513,6 +3520,11 @@ static int apple_nvme_suspend(struct device *dev)
 			 * after its power-on it then brings its flash links back itself.
 			 * In IDLE it gates its SART, so the SART's entries and the word
 			 * that gates it are read before that.
+			 *
+			 * An idled ANS keeps its state, and after the wake it goes on
+			 * writing to the buffers it was given without asking for them
+			 * again. They stay allocated and in the SART: only the session's
+			 * handshake state is reset.
 			 */
 			anv->sart_power = readl(anv->mmio_nvme + APPLE_ANS_SART_POWER);
 			if (anv->sart)
@@ -3520,7 +3532,7 @@ static int apple_nvme_suspend(struct device *dev)
 			anv->fw_sleep_idled = true;
 			ret = apple_rtkit_idle(anv->rtk);
 			if (!ret)
-				ret = apple_rtkit_reinit(anv->rtk);
+				ret = apple_rtkit_reinit_retaining_buffers(anv->rtk);
 		} else {
 			ret = apple_rtkit_shutdown(anv->rtk);
 		}
