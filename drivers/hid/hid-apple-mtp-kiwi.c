@@ -85,6 +85,9 @@ struct kiwi_contact {
 	int miss;
 	int x, y;	/* 1/KIWI_FP cell, centre of cell 0 is KIWI_FP / 2 */
 	int size;
+	int major, minor;	/* ellipse axes, 1/KIWI_FP cell */
+	int orient;		/* major axis, degrees clockwise from the panel's vertical */
+	int pressure;		/* summed signal of the blob, counts */
 	u32 born;	/* accepted-frame stamp of the first sight of this blob */
 	int bx, by;	/* birth position: net drift past a cell over a sane hold = phantom */
 	s16 b_sig;	/* signal at the birth cell when born: flatness marks a stuck cell */
@@ -100,7 +103,8 @@ struct kiwi {
 	int rowmean[KIWI_ROWS];	/* per-row mean of the last frame, pre-removal */
 	u8 cand_hot[(KIWI_CELLS + 7) / 8];	/* hot-cell map of the first baseline candidate */
 	bool have_hot;
-	u64 drop_ring, drop_hold, drop_still;	/* per-rule drop counters, debugfs */
+	u64 drop_hold, drop_still;	/* per-rule drop counters, debugfs */
+	u64 skip_frames, base_retakes;	/* frame gate counters, debugfs */
 	struct dentry *dbg;
 	int bad;
 	int agree;		/* agreeing pairs chained toward a baseline */
@@ -246,9 +250,37 @@ static void kiwi_take_base(struct kiwi *k, const u8 *data)
  * peak search: a baseline taken from the -126 frame, or a -126 frame passed
  * through, turns the top edge cells into a held touch.
  */
+/*
+ * The common-mode shift of n cells (stride apart), in the 1/256 counts of fp[]:
+ * a mean that leaves out the cells a touch moved. A plain mean is pulled by a
+ * finger's own signal (several cells hundreds of counts deep), which made a
+ * held touch look like a whole-image reference shift: its frames were skipped
+ * and the baseline retaken with the finger in it. Cells more than a touch
+ * threshold from the first-pass mean are left out of the second pass, so a
+ * true reference shift (every cell moves) still shows in full.
+ */
+static s32 kiwi_common(const s32 *fp, int n, int stride)
+{
+	s64 sum = 0, sum2 = 0;
+	s32 m0;
+	int i, kept = 0;
+
+	for (i = 0; i < n; i++)
+		sum += fp[i * stride];
+	m0 = div_s64(sum, n);
+	for (i = 0; i < n; i++) {
+		s32 v = fp[i * stride];
+
+		if (abs(v - m0) < (KIWI_THRESHOLD << 8)) {
+			sum2 += v;
+			kept++;
+		}
+	}
+	return kept > n / 2 ? div_s64(sum2, kept) : m0;
+}
+
 static bool kiwi_load(struct kiwi *k, const u8 *data)
 {
-	s64 sum = 0;
 	s32 common;
 	int rowmax;
 	int i, r, c;
@@ -257,25 +289,22 @@ static bool kiwi_load(struct kiwi *k, const u8 *data)
 		kiwi_take_base(k, data);
 		return false;
 	}
-	for (i = 0; i < KIWI_CELLS; i++) {
+	for (i = 0; i < KIWI_CELLS; i++)
 		k->fp[i] = k->base[i] - (get_unaligned_le16(data + KIWI_HDR_LEN + 2 * i) << 8);
-		sum += k->fp[i];
-	}
-	common = div_s64(sum, KIWI_CELLS);
+	common = kiwi_common(k->fp, KIWI_CELLS, 1);
 	if (abs(common >> 8) > KIWI_GLITCH) {
-		if (++k->bad >= KIWI_GLITCH_MAX)
+		k->skip_frames++;
+		if (++k->bad >= KIWI_GLITCH_MAX) {
 			k->have_base = false;
+			k->base_retakes++;
+		}
 		return false;
 	}
 	k->bad = 0;
 	/* the shift differs a little from row to row, so remove it per row */
 	rowmax = 0;
 	for (r = 0; r < KIWI_ROWS; r++) {
-		s64 row = 0;
-
-		for (c = 0; c < KIWI_COLS; c++)
-			row += k->fp[r * KIWI_COLS + c];
-		common = div_s64(row, KIWI_COLS);
+		common = kiwi_common(&k->fp[r * KIWI_COLS], KIWI_COLS, 1);
 		k->rowmean[r] = (int)common;
 		if (abs(common >> 8) > rowmax)
 			rowmax = abs(common >> 8);
@@ -315,8 +344,11 @@ static bool kiwi_load(struct kiwi *k, const u8 *data)
 			for (c = 0; c < KIWI_COLS; c++)
 				k->base[r * KIWI_COLS + c] -= step;
 		}
-		if (++k->bad >= KIWI_GLITCH_MAX)
+		k->skip_frames++;
+		if (++k->bad >= KIWI_GLITCH_MAX) {
 			k->have_base = false;
+			k->base_retakes++;
+		}
 		return false;
 	}
 	return true;
@@ -371,11 +403,41 @@ static bool kiwi_is_peak(struct kiwi *k, int r, int c)
 	return true;
 }
 
+/* atan2 in degrees (-180..180), integer only: octant reduction and a 17-entry atan(i/16) table */
+static int kiwi_atan2_deg(s64 y, s64 x)
+{
+	static const u16 atan16[17] = {	/* atan(i / 16) in 1/256 degree */
+		0, 915, 1824, 2722, 3602, 4461, 5293, 6097, 6869,
+		7607, 8312, 8982, 9617, 10219, 10788, 11325, 11520,
+	};
+	s64 ax = abs(x), ay = abs(y), num, den;
+	int deg, idx, frac;
+
+	if (!ax && !ay)
+		return 0;
+	num = min(ax, ay);
+	den = max(ax, ay);
+	idx = (int)div64_s64(num * 16 * 256, den);	/* tan * 16, 1/256 steps */
+	frac = idx & 255;
+	idx >>= 8;
+	deg = idx >= 16 ? atan16[16] :
+	      atan16[idx] + (((int)atan16[idx + 1] - (int)atan16[idx]) * frac >> 8);
+	if (ay > ax)
+		deg = 90 * 256 - deg;
+	if (x < 0)
+		deg = 180 * 256 - deg;
+	if (y < 0)
+		deg = -deg;
+	return deg / 256;
+}
+
 static void kiwi_centroid(struct kiwi *k, int r, int c, struct kiwi_contact *out)
 {
-	s64 w = 0, wx = 0, wy = 0;
+	s64 w = 0, wx = 0, wy = 0, m = 0, mx = 0, my = 0, mxx = 0, myy = 0, mxy = 0;
+	s64 sxx, syy, sxy, half, disc, l1, l2, mdx, mdy;
 	int dr, dc, cells = 0;
 
+	/* position: 3x3 centroid on the peak */
 	for (dr = -1; dr <= 1; dr++) {
 		for (dc = -1; dc <= 1; dc++) {
 			int rr = r + dr, cc = c + dc, s;
@@ -396,6 +458,52 @@ static void kiwi_centroid(struct kiwi *k, int r, int c, struct kiwi_contact *out
 	out->size = cells;
 	out->on = true;
 	out->miss = 0;
+
+	/* shape and pressure: weighted second moments over 5x5, cells up to the peak's level */
+	for (dr = -2; dr <= 2; dr++) {
+		for (dc = -2; dc <= 2; dc++) {
+			int rr = r + dr, cc = c + dc, s;
+
+			if (rr < 0 || rr >= KIWI_ROWS || cc < 0 || cc >= KIWI_COLS)
+				continue;
+			s = k->sig[rr * KIWI_COLS + cc];
+			if (s <= KIWI_THRESHOLD / 4 || s > k->sig[r * KIWI_COLS + c])
+				continue;
+			m += s;
+			mx += (s64)s * dc;
+			my += (s64)s * dr;
+			mxx += (s64)s * dc * dc;
+			myy += (s64)s * dr * dr;
+			mxy += (s64)s * dc * dr;
+		}
+	}
+	out->pressure = (int)min_t(s64, m, 65535);
+	/* covariance in 1/KIWI_FP^2 cell^2, plus the 1/12 cell^2 of a cell's own extent */
+	mdx = div64_s64(mx * KIWI_FP, m);
+	mdy = div64_s64(my * KIWI_FP, m);
+	sxx = div64_s64(mxx * KIWI_FP * KIWI_FP, m) - mdx * mdx + KIWI_FP * KIWI_FP / 12;
+	syy = div64_s64(myy * KIWI_FP * KIWI_FP, m) - mdy * mdy + KIWI_FP * KIWI_FP / 12;
+	sxy = div64_s64(mxy * KIWI_FP * KIWI_FP, m) - mdx * mdy;
+	half = (sxx + syy) / 2;
+	disc = int_sqrt64((u64)(((sxx - syy) / 2) * ((sxx - syy) / 2) + sxy * sxy));
+	l1 = max_t(s64, half + disc, 0);
+	l2 = max_t(s64, half - disc, 0);
+	/* axis = 4 sigma (the full width of the blob) */
+	out->major = 4 * (int)int_sqrt64(l1);
+	out->minor = 4 * (int)int_sqrt64(l2);
+	/*
+	 * Major axis angle from the sensor's +x (columns), then turned into
+	 * degrees clockwise from the panel's vertical: sensor row 0 is the
+	 * bottom edge, so screen y runs against the rows.
+	 */
+	{
+		int a = kiwi_atan2_deg(2 * sxy, sxx - syy) / 2;	/* -90..90 from +x, ccw on screen */
+
+		a = 90 - a;	/* clockwise from the screen's vertical, 0..180 */
+		if (a > 90)
+			a -= 180;
+		out->orient = a;
+	}
 }
 
 static int kiwi_find(struct kiwi *k, const struct kiwi_contact *c, u32 *claimed)
@@ -553,7 +661,12 @@ static void kiwi_report(struct kiwi *k)
 		y = clamp(k->size_y - 1 - y, 0, k->size_y - 1);
 		input_report_abs(input, ABS_MT_POSITION_X, x);
 		input_report_abs(input, ABS_MT_POSITION_Y, y);
-		input_report_abs(input, ABS_MT_TOUCH_MAJOR, c->size * 16);
+		input_report_abs(input, ABS_MT_TOUCH_MAJOR,
+				 div_s64((s64)c->major * k->size_x, KIWI_COLS * KIWI_FP));
+		input_report_abs(input, ABS_MT_TOUCH_MINOR,
+				 div_s64((s64)c->minor * k->size_x, KIWI_COLS * KIWI_FP));
+		input_report_abs(input, ABS_MT_ORIENTATION, c->orient);
+		input_report_abs(input, ABS_MT_PRESSURE, c->pressure);
 	}
 	input_mt_sync_frame(input);
 	input_sync(input);
@@ -729,15 +842,15 @@ static void kiwi_frame(struct kiwi *k, const u8 *data)
 
 	for (r = 0; r < KIWI_ROWS && n < KIWI_MAX_SLOTS; r++) {
 		for (c = 0; c < KIWI_COLS && n < KIWI_MAX_SLOTS; c++) {
-			/* the 2-cell edge ring is where stuck-cell phantoms live; a real
-			 * finger is never centred that close to the bezel
+			/*
+			 * Every peak is a contact, to the very edge of the panel (the top
+			 * band under the camera housing included). Static outliers are
+			 * baked into the baseline; telling an accidental contact from a
+			 * finger is left to userspace, from the size, orientation and
+			 * pressure reported with each contact.
 			 */
-			if (k->sig[r * KIWI_COLS + c] >= KIWI_THRESHOLD && kiwi_is_peak(k, r, c)) {
-				if (r > 1 && r < KIWI_ROWS - 2 && c > 1 && c < KIWI_COLS - 2)
-					kiwi_centroid(k, r, c, &found[n++]);
-				else
-					k->drop_ring++;	/* the 2-cell edge ring rejected a peak */
-			}
+			if (k->sig[r * KIWI_COLS + c] >= KIWI_THRESHOLD && kiwi_is_peak(k, r, c))
+				kiwi_centroid(k, r, c, &found[n++]);
 		}
 	}
 	kiwi_adapt(k);
@@ -848,7 +961,11 @@ static struct input_dev *kiwi_alloc_input(struct hid_device *hdev, struct kiwi *
 	input_set_abs_params(input, ABS_MT_POSITION_Y, 0, k->size_y - 1, 0, 0);
 	input_abs_set_res(input, ABS_MT_POSITION_X, k->res_x);
 	input_abs_set_res(input, ABS_MT_POSITION_Y, k->res_y);
-	input_set_abs_params(input, ABS_MT_TOUCH_MAJOR, 0, 255, 0, 0);
+	/* in position units: the sensor cells are square, so one scale for both axes */
+	input_set_abs_params(input, ABS_MT_TOUCH_MAJOR, 0, max(k->size_x, k->size_y), 0, 0);
+	input_set_abs_params(input, ABS_MT_TOUCH_MINOR, 0, max(k->size_x, k->size_y), 0, 0);
+	input_set_abs_params(input, ABS_MT_ORIENTATION, -90, 90, 0, 0);
+	input_set_abs_params(input, ABS_MT_PRESSURE, 0, 65535, 0, 0);
 	if (input_mt_init_slots(input, KIWI_MAX_SLOTS, INPUT_MT_DIRECT))
 		return NULL;
 	return input;
@@ -890,8 +1007,9 @@ static int kiwi_probe(struct hid_device *hdev, const struct hid_device_id *id)
 		return ret;
 
 	kiwi->dbg = debugfs_create_dir("hid-apple-mtp-kiwi", NULL);
-	debugfs_create_u64("drop_edge_ring", 0444, kiwi->dbg, &kiwi->drop_ring);
 	debugfs_create_u64("drop_hold", 0444, kiwi->dbg, &kiwi->drop_hold);
+	debugfs_create_u64("skip_frames", 0444, kiwi->dbg, &kiwi->skip_frames);
+	debugfs_create_u64("base_retakes", 0444, kiwi->dbg, &kiwi->base_retakes);
 	debugfs_create_u64("drop_still", 0444, kiwi->dbg, &kiwi->drop_still);
 
 	return hid_hw_start(hdev, HID_CONNECT_HIDRAW);
