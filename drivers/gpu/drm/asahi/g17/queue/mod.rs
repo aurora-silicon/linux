@@ -289,7 +289,13 @@ impl<B: Backend> Queue<B> {
         // since the prune above without a publication is not among them, so prune again: any
         // failure now visible makes it a full scan, and the failure record below has it.
         self.prune_frontier(index);
-        let (completion, publication, ordering_host_waits, ordering_firmware_waits) = {
+        let (
+            completion,
+            publication,
+            ordering_host_waits,
+            ordering_firmware_waits,
+            inherited_publications,
+        ) = {
             let ordering = EnqueueOrdering::build(
                 &self.publishers[index],
                 &self.frontiers[other],
@@ -313,13 +319,20 @@ impl<B: Backend> Queue<B> {
             )?;
             let publication = completion
                 .publication()
-                .map(|target| PreparedPublication::new(target, ordering.predecessors.iter().copied()))
+                .map(|target| PreparedPublication::new(target, ordering.predecessors.iter()))
                 .transpose()?;
+            let inherited_publications =
+                if has_outputs || ordering.predecessors.is_empty() {
+                    None
+                } else {
+                    Some(Arc::new(ordering.predecessors, GFP_KERNEL)?)
+                };
             (
                 completion,
                 publication,
                 ordering.host_waits,
                 ordering.firmware_waits,
+                inherited_publications,
             )
         };
         let mut failures: [Option<Fence>; 2] = [None, None];
@@ -405,11 +418,12 @@ impl<B: Backend> Queue<B> {
             Engine::Render => &mut self.render,
             Engine::Compute => &mut self.compute,
         };
-        let fences =
+        let mut fences =
             scheduler
                 .as_mut()
                 .ok_or(ENODEV)?
                 .enqueue(packet, dependencies, early, publication)?;
+        fences.timestamp_publications = inherited_publications;
         self.sequence[index] = order.sequence;
         if fences.publishes() {
             self.publishers[index].push_within_capacity(order.sequence, fences.clone())?;
@@ -698,6 +712,9 @@ trait FrontierEntry: outstanding::Status {
     fn pending_publication(&self) -> Option<&Arc<Publication>> {
         self.publication().filter(|publication| publication.is_pending())
     }
+    fn timestamp_publications(&self) -> &[Arc<Publication>] {
+        &[]
+    }
     fn completed(&self) -> &Fence;
     fn scheduled(&self) -> &Fence;
 }
@@ -711,6 +728,12 @@ impl FrontierEntry for Fences {
         self.publication.as_ref()
     }
 
+    fn timestamp_publications(&self) -> &[Arc<Publication>] {
+        self.timestamp_publications
+            .as_deref()
+            .map_or(&[], |v| v.as_slice())
+    }
+
     fn completed(&self) -> &Fence {
         &self.completed
     }
@@ -720,18 +743,56 @@ impl FrontierEntry for Fences {
     }
 }
 
-struct EnqueueOrdering<'a> {
-    predecessors: KVec<&'a Arc<Publication>>,
+fn push_unique_publication(
+    out: &mut KVec<Arc<Publication>>,
+    publication: &Arc<Publication>,
+) -> Result {
+    if !out.iter().any(|existing| Arc::ptr_eq(existing, publication)) {
+        out.push(publication.clone(), GFP_KERNEL)?;
+    }
+    Ok(())
+}
+
+/// Collect the actual pending host-timestamp writer publications represented by
+/// `entry` (deduplicated) rather than linking to every intermediate
+/// timestamp-free pass-through node, avoiding an O(N^2) clique of links across
+/// deeply pipelined frames.
+fn collect_publication_predecessors<E: FrontierEntry>(
+    entry: &E,
+    out: &mut KVec<Arc<Publication>>,
+) -> Result {
+    let Some(pub_ref) = entry.pending_publication() else {
+        return Ok(());
+    };
+    if pub_ref.has_outputs() || entry.status() < 0 {
+        push_unique_publication(out, pub_ref)?;
+        return Ok(());
+    }
+    let inherited = entry.timestamp_publications();
+    if inherited.is_empty() {
+        push_unique_publication(out, pub_ref)?;
+    } else {
+        for ancestor in inherited {
+            if ancestor.is_pending() {
+                push_unique_publication(out, ancestor)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+struct EnqueueOrdering {
+    predecessors: KVec<Arc<Publication>>,
     host_waits: KVec<Fence>,
     firmware_waits: KVec<(Fence, Fence)>,
 }
 
-impl<'a> EnqueueOrdering<'a> {
+impl EnqueueOrdering {
     /// `same_publishers`: the publishers of this command's engine. Only those can be same-engine
     /// predecessors or host waits, and the rest of that engine's frontier can be deep.
     fn build<E: FrontierEntry>(
-        same_publishers: &'a Outstanding<E>,
-        other_frontier: &'a Outstanding<E>,
+        same_publishers: &Outstanding<E>,
+        other_frontier: &Outstanding<E>,
         order: Order,
         engine: Engine,
         host_waits: bool,
@@ -758,8 +819,8 @@ impl<'a> EnqueueOrdering<'a> {
             for (_, entry) in same_covered.clone() {
                 let status = entry.status();
                 if status <= 0 {
-                    if let Some(publication) = entry.pending_publication() {
-                        predecessors.push(publication, GFP_KERNEL)?;
+                    if entry.pending_publication().is_some() {
+                        collect_publication_predecessors(entry, &mut predecessors)?;
                     } else if status < 0 {
                         // Failed after `prune_frontier()` without an active
                         // publication: keep its already-signalled error fence.
@@ -770,10 +831,8 @@ impl<'a> EnqueueOrdering<'a> {
         }
         if cross_chain {
             for (_, entry) in other_covered.clone() {
-                if entry.status() <= 0 {
-                    if let Some(publication) = entry.pending_publication() {
-                        predecessors.push(publication, GFP_KERNEL)?;
-                    }
+                if entry.status() <= 0 && entry.pending_publication().is_some() {
+                    collect_publication_predecessors(entry, &mut predecessors)?;
                 }
             }
         }
@@ -833,6 +892,7 @@ mod tests {
         scheduled: Fence,
         completed: Fence,
         publication: Option<Arc<Publication>>,
+        timestamp_publications: KVec<Arc<Publication>>,
     }
 
     impl outstanding::Status for TestEntry {
@@ -848,6 +908,10 @@ mod tests {
 
         fn publication(&self) -> Option<&Arc<Publication>> {
             self.publication.as_ref()
+        }
+
+        fn timestamp_publications(&self) -> &[Arc<Publication>] {
+            self.timestamp_publications.as_slice()
         }
 
         fn completed(&self) -> &Fence {
@@ -884,6 +948,7 @@ mod tests {
                     scheduled,
                     completed,
                     publication: Some(publication.clone()),
+                    timestamp_publications: KVec::new(),
                 },
                 Some(publication),
             )
@@ -895,6 +960,7 @@ mod tests {
                     scheduled,
                     completed,
                     publication: None,
+                    timestamp_publications: KVec::new(),
                 },
                 None,
             )
@@ -937,7 +1003,7 @@ mod tests {
 
         let (rend_b, pub_b) = test_entry(&contexts, &status, Some(false));
         let pub_b = pub_b.unwrap();
-        PreparedPublication::new(pub_b.clone(), plan_b.predecessors.iter().copied())
+        PreparedPublication::new(pub_b.clone(), plan_b.predecessors.iter())
             .unwrap()
             .activate();
         let render_frontier = frontier([(1, rend_b)]);
@@ -965,7 +1031,7 @@ mod tests {
         assert_eq!(plan_c.predecessors.len(), 1);
 
         let (pub_c, fence_c) = Publication::test_pair(&contexts, &status, true).unwrap();
-        PreparedPublication::new(pub_c.clone(), plan_c.predecessors.iter().copied())
+        PreparedPublication::new(pub_c.clone(), plan_c.predecessors.iter())
             .unwrap()
             .activate();
 
@@ -1023,7 +1089,7 @@ mod tests {
         assert_eq!(plan_c.predecessors.len(), 1);
 
         let (pub_c, fence_c) = Publication::test_pair(&contexts, &status, false).unwrap();
-        PreparedPublication::new(pub_c.clone(), plan_c.predecessors.iter().copied())
+        PreparedPublication::new(pub_c.clone(), plan_c.predecessors.iter())
             .unwrap()
             .activate();
         pub_c.finish(Ok([3, 4, 0, 0]));
@@ -1277,7 +1343,7 @@ mod tests {
         let publication = host_output
             .publication()
             .expect("compute with outputs uses ordered publication");
-        PreparedPublication::new(publication, plan.predecessors.iter().copied())
+        PreparedPublication::new(publication, plan.predecessors.iter())
             .unwrap()
             .activate();
 
@@ -1336,7 +1402,7 @@ mod tests {
         let pub_b = host_output_b
             .publication()
             .expect("compute consumer behind publication uses ordered publication");
-        PreparedPublication::new(pub_b, plan_b.predecessors.iter().copied())
+        PreparedPublication::new(pub_b, plan_b.predecessors.iter())
             .unwrap()
             .activate();
 
@@ -1346,5 +1412,47 @@ mod tests {
 
         pub_a.finish(Ok([1, 2, 0, 0]));
         assert!(fence_status(&comp_b_completed) > 0);
+    }
+
+    #[test]
+    fn deep_timestamp_free_chain_links_directly_to_writer_not_clique() {
+        let none = frontier([]);
+        let contexts = FenceContexts::new(1, c_str!("asahi_q_noclq"), TEST_KEY).unwrap();
+        let status = Arc::pin_init(VmStatus::new(), GFP_KERNEL).unwrap();
+
+        let (comp_a, pub_a) = test_entry(&contexts, &status, Some(true));
+        let pub_a = pub_a.unwrap();
+        PreparedPublication::new(pub_a.clone(), core::iter::empty())
+            .unwrap()
+            .activate();
+        let compute_frontier = frontier([(1, comp_a)]);
+
+        let mut render_publishers: Outstanding<TestEntry> = Outstanding::new(0);
+        render_publishers.reserve(32).unwrap();
+        for seq in 1..=32u64 {
+            let plan = EnqueueOrdering::build(
+                &render_publishers,
+                &compute_frontier,
+                Order {
+                    sequence: seq,
+                    wait_through: [(seq > 1).then_some(seq - 1), Some(1)],
+                    tiling_wait_through: [None, None],
+                },
+                Engine::Render,
+                false,
+                true,
+            )
+            .unwrap();
+            assert_eq!(plan.predecessors.len(), 1);
+            assert!(Arc::ptr_eq(&plan.predecessors[0], &pub_a));
+            let (mut entry, pub_r) = test_entry(&contexts, &status, Some(false));
+            let pub_r = pub_r.unwrap();
+            PreparedPublication::new(pub_r, plan.predecessors.iter())
+                .unwrap()
+                .activate();
+            entry.timestamp_publications = plan.predecessors;
+            render_publishers.push_within_capacity(seq, entry).unwrap();
+        }
+        pub_a.finish(Ok([1, 2, 0, 0]));
     }
 }

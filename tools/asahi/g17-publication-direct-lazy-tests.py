@@ -1,0 +1,556 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only OR MIT
+"""Host test for direct timestamp-writer linking and lazy Publication attachment.
+
+Verifies:
+1. `collect_publication_predecessors()` in `queue/mod.rs` links directly to
+   pending timestamp writers (`has_outputs()`) and failed entries (`status() < 0`)
+   via `timestamp_publications`, preventing an O(N^2) clique of intermediate
+   timestamp-free pass-through links.
+2. `Publication` in `completion/publication.rs` defers predecessor attachment
+   until `finish()` with `target: None` in `deferred_links` (no Arc self-cycle
+   when dropped unfinished), skips locking cleanly settled predecessors on the
+   in-order path, and preserves exact out-of-order / failed predecessor
+   propagation and settlement semantics.
+"""
+import argparse
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+G17 = ROOT / 'drivers/gpu/drm/asahi/g17'
+
+
+def item(source, signature):
+    assert source.count(signature) == 1, signature
+    start = source.index(signature)
+    begin = source.index('{', start)
+    depth, end = 1, begin + 1
+    while depth:
+        depth += (source[end] == '{') - (source[end] == '}')
+        end += 1
+    return source[start:end]
+
+
+def build_harness(mutation=None):
+    pub_src = (G17 / 'completion/publication.rs').read_text()
+    q_src = (G17 / 'queue/mod.rs').read_text()
+    job_src = (G17 / 'job.rs').read_text()
+
+    collect_fn = item(q_src, 'fn collect_publication_predecessors<')
+    build_fn = item(q_src, 'fn build<E: FrontierEntry>(')
+    activate_fn = item(pub_src, 'pub(crate) fn activate(self)')
+    new_prep_fn = item(pub_src, 'pub(crate) fn new<\'a>(')
+    finish_fn = item(pub_src, 'pub(crate) fn finish(self: &Arc<Self>,')
+    attach_fn = item(pub_src, 'fn attach_deferred(self: &Arc<Self>,')
+    publish_fn = item(pub_src, 'fn publish(&self, result: Result<[u64; 4]>) -> Links')
+    is_pending_fn = item(pub_src, 'pub(crate) fn is_pending(&self) -> bool')
+
+    if mutation == 'clique-chain':
+        collect_fn = collect_fn.replace(
+            'if pub_ref.has_outputs() || entry.status() < 0 {',
+            'if true {',
+            1,
+        )
+    elif mutation == 'skip-failed-status-direct':
+        collect_fn = collect_fn.replace(
+            'if pub_ref.has_outputs() || entry.status() < 0 {',
+            'if pub_ref.has_outputs() {',
+            1,
+        )
+    elif mutation == 'eager-activate':
+        activate_fn = activate_fn.replace(
+            'state.deferred_links = self.links;',
+            'for (p, l) in self.links { p.add_successor(l); }',
+            1,
+        )
+    elif mutation == 'cycle-target-some':
+        new_prep_fn = new_prep_fn.replace(
+            'target: None,',
+            'target: Some(target.clone()),',
+            1,
+        )
+    elif mutation == 'skip-error-clear-settled':
+        publish_fn = publish_fn.replace(
+            'self.settled_clean.store(false, Ordering::Release);',
+            '',
+            1,
+        )
+    elif mutation == 'skip-fast-check':
+        attach_fn = attach_fn.replace(
+            'if predecessor.settled_clean.load(Ordering::Acquire) {',
+            'if false {',
+            1,
+        )
+
+    src_checks = {
+        'fences_field': 'pub(crate) timestamp_publications: Option<Arc<KVec<Arc<super::completion::Publication>>>>,' in job_src,
+        'build_uses_collect': 'collect_publication_predecessors(entry, &mut predecessors)?;' in build_fn,
+        'collect_direct_writer': 'if pub_ref.has_outputs() || entry.status() < 0 {' in collect_fn
+            and 'entry.timestamp_publications()' in collect_fn,
+        'lazy_activate': 'state.deferred_links = self.links;' in activate_fn
+            and 'predecessor.add_successor' not in activate_fn,
+        'no_cycle_prep': 'target: None,' in new_prep_fn,
+        'fast_settled_check': 'if predecessor.settled_clean.load(Ordering::Acquire) {' in attach_fn,
+        'clear_settled_on_err': 'self.settled_clean.store(false, Ordering::Release);' in publish_fn,
+        'finish_takes_deferred': 'core::mem::take(&mut state.deferred_links)' in finish_fn,
+        'is_pending_settles': 'state.upstream_released = true;' in is_pending_fn,
+    }
+
+    # Behavioral Rust model mirroring the exact lazy Publication + direct-writer rules.
+    use_clique = mutation == 'clique-chain'
+    skip_failed_direct = mutation == 'skip-failed-status-direct'
+    eager_activate = mutation == 'eager-activate'
+    cycle_target_some = mutation == 'cycle-target-some'
+    skip_err_clear = mutation == 'skip-error-clear-settled'
+    skip_fast = mutation == 'skip-fast-check'
+
+    return f'''
+use std::sync::{{Arc, Mutex, Weak, atomic::{{AtomicBool, AtomicI32, AtomicUsize, Ordering}}}};
+
+const PRODUCER_FAILED: i32 = -5;
+const EIO: i32 = -5;
+
+type Links = Option<Box<Link>>;
+
+struct Link {{
+    target: Option<Arc<Publication>>,
+    result: Result<(), i32>,
+    next: Links,
+    resume: Links,
+}}
+
+struct State {{
+    deferred_links: Vec<(Arc<Publication>, Box<Link>)>,
+    remaining: usize,
+    result: Option<Result<(), i32>>,
+    predecessor_error: Option<i32>,
+    claimed: bool,
+    published: Option<Result<(), i32>>,
+    upstream_released: bool,
+    successors: Links,
+}}
+
+impl State {{
+    fn claim(&mut self) -> Option<Result<(), i32>> {{
+        if self.remaining != 0 || self.claimed {{
+            return None;
+        }}
+        let result = self.result.take()?;
+        self.claimed = true;
+        Some(match (result, self.predecessor_error) {{
+            (Ok(()), Some(err)) => Err(err),
+            (res, _) => res,
+        }})
+    }}
+}}
+
+struct Publication {{
+    has_outputs: bool,
+    pending: AtomicBool,
+    settled_clean: AtomicBool,
+    fence_status: AtomicI32,
+    add_succ_calls: AtomicUsize,
+    state: Mutex<State>,
+}}
+
+impl Publication {{
+    fn new(has_outputs: bool) -> Arc<Self> {{
+        Arc::new(Self {{
+            has_outputs,
+            pending: AtomicBool::new(true),
+            settled_clean: AtomicBool::new(false),
+            fence_status: AtomicI32::new(0),
+            add_succ_calls: AtomicUsize::new(0),
+            state: Mutex::new(State {{
+                deferred_links: Vec::new(),
+                remaining: 1,
+                result: None,
+                predecessor_error: None,
+                claimed: false,
+                published: None,
+                upstream_released: false,
+                successors: None,
+            }}),
+        }})
+    }}
+
+    fn has_outputs(&self) -> bool {{ self.has_outputs }}
+
+    fn is_pending(&self) -> bool {{
+        if !self.pending.load(Ordering::Acquire) {{
+            return false;
+        }}
+        if self.has_outputs {{
+            return true;
+        }}
+        loop {{
+            let (probe, dropped) = {{
+                let mut state = self.state.lock().unwrap();
+                if !self.pending.load(Ordering::Acquire) {{
+                    return false;
+                }}
+                if state.published.is_some() || state.claimed || state.deferred_links.is_empty() {{
+                    return self.pending.load(Ordering::Acquire);
+                }}
+                let unsettled = state
+                    .deferred_links
+                    .iter()
+                    .find(|(p, _)| !p.settled_clean.load(Ordering::Acquire))
+                    .map(|(p, _)| p.clone());
+                match unsettled {{
+                    None => {{
+                        let old = std::mem::take(&mut state.deferred_links);
+                        state.upstream_released = true;
+                        self.settled_clean.store(true, Ordering::Release);
+                        self.pending.store(false, Ordering::Release);
+                        (None, old)
+                    }}
+                    Some(p) if !p.has_outputs => (Some(p), Vec::new()),
+                    Some(_) => return true,
+                }}
+            }};
+            drop(dropped);
+            match probe {{
+                Some(p) => {{
+                    if p.is_pending() {{
+                        return true;
+                    }}
+                }}
+                None => return false,
+            }}
+        }}
+    }}
+
+    fn finish(self: &Arc<Self>, result: Result<(), i32>) {{
+        let (ready, to_attach) = {{
+            let mut state = self.state.lock().unwrap();
+            if state.claimed || state.result.is_some() {{
+                return;
+            }}
+            state.result = Some(result);
+            let deferred = std::mem::take(&mut state.deferred_links);
+            if deferred.is_empty() {{
+                (state.claim(), deferred)
+            }} else {{
+                state.remaining += 1 + deferred.len();
+                (None, deferred)
+            }}
+        }};
+        if let Some(res) = ready {{
+            Self::drain(self.publish(res));
+            return;
+        }}
+        if !to_attach.is_empty() {{
+            self.attach_deferred(to_attach);
+        }}
+    }}
+
+    fn attach_deferred(self: &Arc<Self>, deferred: Vec<(Arc<Publication>, Box<Link>)>) {{
+        let mut fast_ok = 0usize;
+        for (pred, mut link) in deferred {{
+            if !{str(skip_fast).lower()} && pred.settled_clean.load(Ordering::Acquire) {{
+                fast_ok += 1;
+                drop(link);
+            }} else {{
+                link.target = Some(self.clone());
+                pred.add_successor(link);
+            }}
+        }}
+        Self::drain(self.predecessors_done_ok(1 + fast_ok));
+    }}
+
+    fn publish(&self, result: Result<(), i32>) -> Links {{
+        self.fence_status.store(match result {{ Ok(()) => 1, Err(e) => e }}, Ordering::Release);
+        let mut links = {{
+            let mut state = self.state.lock().unwrap();
+            state.published = Some(result);
+            if result.is_ok() {{
+                self.settled_clean.store(true, Ordering::Release);
+                self.pending.store(false, Ordering::Release);
+            }} else if !{str(skip_err_clear).lower()} {{
+                self.settled_clean.store(false, Ordering::Release);
+            }}
+            state.successors.take()
+        }};
+        let mut next = links.as_mut();
+        while let Some(link) = next {{
+            link.result = result;
+            next = link.next.as_mut();
+        }}
+        links
+    }}
+
+    fn predecessors_done_ok(&self, count: usize) -> Links {{
+        let (ready, settled) = {{
+            let mut state = self.state.lock().unwrap();
+            state.remaining -= count;
+            if let Some(ready) = state.claim() {{
+                (Some(ready), None)
+            }} else if state.remaining == 0
+                && !self.has_outputs
+                && state.predecessor_error.is_none()
+                && !state.upstream_released
+            {{
+                state.upstream_released = true;
+                self.settled_clean.store(true, Ordering::Release);
+                self.pending.store(false, Ordering::Release);
+                (None, state.successors.take())
+            }} else {{
+                (None, None)
+            }}
+        }};
+        if let Some(res) = ready {{
+            return self.publish(res);
+        }}
+        let mut links = settled;
+        let mut next = links.as_mut();
+        while let Some(link) = next {{
+            link.result = Ok(());
+            next = link.next.as_mut();
+        }}
+        links
+    }}
+
+    fn predecessor_done(&self, result: Result<(), i32>) -> Links {{
+        if result.is_ok() {{
+            return self.predecessors_done_ok(1);
+        }}
+        let ready = {{
+            let mut state = self.state.lock().unwrap();
+            if state.predecessor_error.is_none() {{
+                state.predecessor_error = Some(PRODUCER_FAILED);
+            }}
+            state.remaining -= 1;
+            state.claim()
+        }};
+        if let Some(res) = ready {{
+            return self.publish(res);
+        }}
+        None
+    }}
+
+    fn add_successor(&self, mut link: Box<Link>) {{
+        self.add_succ_calls.fetch_add(1, Ordering::Relaxed);
+        let immediate = {{
+            let mut state = self.state.lock().unwrap();
+            if let Some(res) = state.published {{
+                res
+            }} else if state.upstream_released {{
+                Ok(())
+            }} else {{
+                link.next = state.successors.take();
+                state.successors = Some(link);
+                return;
+            }}
+        }};
+        if let Some(target) = link.target.take() {{
+            Self::drain(target.predecessor_done(immediate));
+        }}
+    }}
+
+    fn drain(mut pending: Links) {{
+        let mut frames: Links = None;
+        loop {{
+            if let Some(mut link) = pending.take() {{
+                pending = link.next.take();
+                let children = link
+                    .target
+                    .take()
+                    .and_then(|t| t.predecessor_done(link.result));
+                if children.is_some() {{
+                    link.resume = pending.take();
+                    link.next = frames.take();
+                    frames = Some(link);
+                    pending = children;
+                }}
+            }} else if let Some(mut frame) = frames.take() {{
+                frames = frame.next.take();
+                pending = frame.resume.take();
+            }} else {{
+                break;
+            }}
+        }}
+    }}
+}}
+
+fn activate(target: &Arc<Publication>, preds: &[Arc<Publication>]) {{
+    let mut links = Vec::with_capacity(preds.len());
+    for p in preds {{
+        links.push((p.clone(), Box::new(Link {{
+            target: if {str(cycle_target_some).lower()} {{ Some(target.clone()) }} else {{ None }},
+            result: Ok(()),
+            next: None,
+            resume: None,
+        }})));
+    }}
+    if {str(eager_activate).lower()} {{
+        target.state.lock().unwrap().remaining += links.len();
+        for (p, mut l) in links {{
+            l.target = Some(target.clone());
+            p.add_successor(l);
+        }}
+        Publication::drain(target.predecessors_done_ok(1));
+        return;
+    }}
+    let mut state = target.state.lock().unwrap();
+    state.remaining -= 1;
+    if links.is_empty() && !target.has_outputs {{
+        state.upstream_released = true;
+        target.settled_clean.store(true, Ordering::Release);
+        target.pending.store(false, Ordering::Release);
+    }} else {{
+        state.deferred_links = links;
+    }}
+}}
+
+struct Entry {{
+    pub_node: Arc<Publication>,
+    inherited: Vec<Arc<Publication>>,
+}}
+
+fn collect(entry: &Entry, out: &mut Vec<Arc<Publication>>) {{
+    if !entry.pub_node.is_pending() {{
+        return;
+    }}
+    let status = entry.pub_node.fence_status.load(Ordering::Acquire);
+    let direct = if {str(use_clique).lower()} {{
+        true
+    }} else if {str(skip_failed_direct).lower()} {{
+        entry.pub_node.has_outputs()
+    }} else {{
+        entry.pub_node.has_outputs() || status < 0
+    }};
+    if direct || entry.inherited.is_empty() {{
+        if !out.iter().any(|e| Arc::ptr_eq(e, &entry.pub_node)) {{
+            out.push(entry.pub_node.clone());
+        }}
+    }} else {{
+        for anc in &entry.inherited {{
+            if anc.is_pending() && !out.iter().any(|e| Arc::ptr_eq(e, anc)) {{
+                out.push(anc.clone());
+            }}
+        }}
+    }}
+}}
+
+fn main() {{
+    // Static contract checks on actual kernel sources.
+    assert!({str(src_checks['fences_field']).lower()}, "Fences must store timestamp_publications");
+    assert!({str(src_checks['build_uses_collect']).lower()}, "EnqueueOrdering::build must use collect_publication_predecessors");
+    assert!({str(src_checks['collect_direct_writer']).lower()}, "collect_publication_predecessors must link directly to writers/failed entries");
+    assert!({str(src_checks['lazy_activate']).lower()}, "Prepared::activate must defer links instead of eager add_successor");
+    assert!({str(src_checks['no_cycle_prep']).lower()}, "Prepared::new must set link.target = None");
+    assert!({str(src_checks['fast_settled_check']).lower()}, "attach_deferred must fast-path settled_clean predecessors");
+    assert!({str(src_checks['clear_settled_on_err']).lower()}, "publish(Err) must clear settled_clean");
+    assert!({str(src_checks['finish_takes_deferred']).lower()}, "finish() must take deferred_links before attaching");
+    assert!({str(src_checks['is_pending_settles']).lower()}, "is_pending() must settle clean deferred chains");
+
+    // 1. 64-deep timestamp-free chain behind 1 writer must stay O(1) links per node (NOT O(N^2) clique).
+    let writer = Publication::new(true);
+    activate(&writer, &[]);
+    let mut entries = vec![Entry {{ pub_node: writer.clone(), inherited: vec![] }}];
+    let mut total_links = 0usize;
+    for _ in 0..64 {{
+        let mut preds = Vec::new();
+        for e in &entries {{
+            collect(e, &mut preds);
+        }}
+        assert_eq!(preds.len(), 1, "must link only to direct timestamp writer, got {{}}", preds.len());
+        assert!(Arc::ptr_eq(&preds[0], &writer));
+        total_links += preds.len();
+        let node = Publication::new(false);
+        activate(&node, &preds);
+        entries.push(Entry {{ pub_node: node, inherited: preds }});
+    }}
+    assert_eq!(total_links, 64);
+    assert_eq!(writer.add_succ_calls.load(Ordering::Relaxed), 0, "lazy activate must not lock predecessor");
+
+    // 2. In-order writer finish drains 0 links and successors skip add_successor completely.
+    writer.finish(Ok(()));
+    assert_eq!(writer.fence_status.load(Ordering::Acquire), 1);
+    for e in &entries[1..] {{
+        e.pub_node.finish(Ok(()));
+        assert_eq!(e.pub_node.fence_status.load(Ordering::Acquire), 1);
+    }}
+    assert_eq!(writer.add_succ_calls.load(Ordering::Relaxed), 0, "in-order finish must skip predecessor lock");
+
+    // 3. Out-of-order consumer finishing before producer fails when producer fails.
+    let p2 = Publication::new(true);
+    activate(&p2, &[]);
+    let c2 = Publication::new(false);
+    activate(&c2, &[p2.clone()]);
+    c2.finish(Ok(()));
+    assert_eq!(c2.fence_status.load(Ordering::Acquire), 0);
+    p2.finish(Err(EIO));
+    assert_eq!(c2.fence_status.load(Ordering::Acquire), PRODUCER_FAILED);
+
+    // 4. Failed timestamp-free entry (status < 0) is linked directly even if inherited writer settled.
+    let w3 = Publication::new(true);
+    activate(&w3, &[]);
+    let mid = Publication::new(false);
+    activate(&mid, &[w3.clone()]);
+    let mid_entry = Entry {{ pub_node: mid.clone(), inherited: vec![w3.clone()] }};
+    w3.finish(Ok(()));
+    mid.finish(Err(EIO));
+    let mut preds3 = Vec::new();
+    collect(&mid_entry, &mut preds3);
+    assert_eq!(preds3.len(), 1, "failed entry must be linked directly");
+    assert!(Arc::ptr_eq(&preds3[0], &mid));
+
+    // 5. Settled consumer failing later still delivers error to late successor.
+    let w4 = Publication::new(true);
+    activate(&w4, &[]);
+    let cons4 = Publication::new(false);
+    activate(&cons4, &[w4.clone()]);
+    w4.finish(Ok(()));
+    assert!(!cons4.is_pending());
+    cons4.finish(Err(EIO));
+    let late4 = Publication::new(false);
+    activate(&late4, &[cons4.clone()]);
+    late4.finish(Ok(()));
+    assert_eq!(late4.fence_status.load(Ordering::Acquire), PRODUCER_FAILED);
+
+    // 6. Activated-then-dropped publication without finish() has ZERO Arc cycle!
+    let w5 = Publication::new(true);
+    activate(&w5, &[]);
+    let weak_c5: Weak<Publication>;
+    {{
+        let c5 = Publication::new(false);
+        activate(&c5, &[w5.clone()]);
+        weak_c5 = Arc::downgrade(&c5);
+    }}
+    assert!(weak_c5.upgrade().is_none(), "unfinished deferred publication leaked via Arc self-cycle!");
+
+    println!("PASS g17-publication-direct-lazy-tests");
+}}
+'''
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--mutation', choices=[
+        'clique-chain',
+        'skip-failed-status-direct',
+        'eager-activate',
+        'cycle-target-some',
+        'skip-error-clear-settled',
+        'skip-fast-check',
+    ])
+    args = parser.parse_args()
+    src = build_harness(args.mutation)
+    rustc = os.environ.get('HOSTRUSTC', 'rustc')
+    with tempfile.TemporaryDirectory(prefix='g17-pub-lazy-') as td:
+        rs = Path(td) / 'test.rs'
+        exe = Path(td) / 'test'
+        rs.write_text(src)
+        subprocess.run([rustc, '-O', '-o', str(exe), str(rs)], check=True)
+        res = subprocess.run([str(exe)])
+        sys.exit(res.returncode)
+
+
+if __name__ == '__main__':
+    main()
