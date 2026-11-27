@@ -711,6 +711,24 @@ impl<U: Allocation<u8>> GpuArray<u8, U> {
         // this word only in aligned 32-bit transactions while the ring is live.
         Ok(unsafe { core::sync::atomic::AtomicU32::from_ptr(ptr) })
     }
+
+    /// Zeroes the first `bytes` through the raw CPU mapping, without creating a Rust reference
+    /// to the payload, and cleans them to the point of coherency for the GPU.
+    ///
+    /// # Safety
+    ///
+    /// No CPU reference into the range may be live, and no device may access it during the call.
+    pub(crate) unsafe fn zero_prefix(&self, bytes: usize) -> Result {
+        if bytes > self.len {
+            return Err(ERANGE);
+        }
+        // SAFETY: `raw` is valid for `len` bytes (type invariant) and `bytes <= len`; the caller
+        // guarantees that nothing else accesses the range meanwhile.
+        unsafe { core::ptr::write_bytes(self.raw, 0, bytes) };
+        crate::pgtable::clean_poc(self.raw.cast_const(), bytes);
+        crate::pgtable::poc_barrier();
+        Ok(())
+    }
 }
 
 impl<T, U: Allocation<T>> Deref for GpuArray<T, U> {
