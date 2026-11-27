@@ -10,7 +10,7 @@ mod identity;
 use super::{
     freelist::{RenderId, RenderIds, RenderPool},
     fw::{context as fw, queue::Policy},
-    object::{Allocator, CpuMap, Family, KernelObject, Pool, PooledObject, ReturnMark},
+    object::{Allocator, CpuMap, Exposure, Family, KernelObject, Pool, PooledObject, ReturnMark},
     status::VmStatus,
 };
 use crate::mmu::{self, ExecutionContext, Vm, UAT_PGSZ};
@@ -246,6 +246,10 @@ pub(crate) struct Context {
     /// How far the work storage's address reached the firmware, kept up to date by every
     /// accessor that hands it out (A18 Pro, cached storage only; see [`ReturnMark`]).
     work_mark: Option<Arc<ReturnMark>>,
+    /// Whether the work storage's or the scheduler page's address reached the firmware, set by
+    /// the same accessors, by [`Self::scheduler_va`] and at publication. Until then a pooled
+    /// one that had no cache slot is unmapped as soon as it is dropped ([`Exposure`]).
+    exposure: Arc<Exposure>,
     render: Arc<Mutex<Option<Arc<RenderPool>>>>,
     /// The render pool identity taken with the context
     /// ([`super::fw::Variant::render_id_at_create`]), until its render pool takes it over or
@@ -288,15 +292,18 @@ impl Context {
         } else {
             mmu::PROT_GPU_FW_SHARED_RW
         };
+        let exposure = Arc::new(Exposure::new(), GFP_KERNEL)?;
         let mut scheduler = if alloc.uat.is_m5() {
-            SchedulerStorage::Retained(pool.allocate(
+            let mut object = pool.allocate(
                 alloc,
                 Family::Scheduler,
                 UAT_PGSZ,
                 0,
                 kernel_prot,
                 CpuMap::WriteCombined,
-            )?)
+            )?;
+            object.defer_once_exposed(&exposure);
+            SchedulerStorage::Retained(object)
         } else {
             SchedulerStorage::Ordinary(alloc.kernel(
                 UAT_PGSZ,
@@ -328,6 +335,7 @@ impl Context {
             kernel_prot,
             CpuMap::WriteCombined,
         )?;
+        object.defer_once_exposed(&exposure);
         let work_base = object.gpu_va();
         let work_mark = object.return_mark();
         object.write(
@@ -384,6 +392,7 @@ impl Context {
             work,
             work_base,
             work_mark,
+            exposure,
             render,
             render_id,
             render_blocks: AtomicUsize::new(super::fw::freelist::RENDER_BLOCKS),
@@ -478,7 +487,10 @@ impl Context {
     pub(crate) fn qos_id(&self) -> u8 {
         self.qos.id
     }
+    /// The scheduler page's address. Every caller may hand it to the firmware, so it counts as
+    /// exposed from here on ([`Exposure`]).
     pub(crate) fn scheduler_va(&self) -> u64 {
+        self.exposure.expose();
         self.scheduler.gpu_va()
     }
     /// Installed physical channels retain this page after the logical execution
@@ -558,6 +570,7 @@ impl Context {
     }
     /// The work storage's address is being handed to the firmware.
     fn expose_work(&self) {
+        self.exposure.expose();
         if let Some(mark) = &self.work_mark {
             mark.expose();
         }
@@ -623,6 +636,7 @@ impl Context {
         self.published.load(Ordering::Acquire)
     }
     pub(crate) fn mark_published(&self) {
+        self.exposure.expose();
         self.hold.mark_seen();
         self.qos.seen.store(true, Ordering::Release);
         self.published.store(true, Ordering::Release);

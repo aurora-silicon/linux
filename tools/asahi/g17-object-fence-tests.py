@@ -16,6 +16,10 @@ this is not GPU execution. Checks:
   instead, and counts it. An uncached object stays mapped after its owner drops
   it until the firmware has met `control_fence()`, and is unmapped after that
   or at firmware stop, never earlier.
+- A context's uncached work state (and M5 scheduler page) whose address never
+  reached the firmware is unmapped at its drop: creating and closing queues
+  without submitting does not grow the deferred list, while one exposed by a
+  queue record, a command or publication still waits for its fence.
 - Without `after_release` (M4, M5) every decision, and the snapshot counts,
   match the pool before linux#1978 (BASE) on the same random operations, with
   BASE's reuse limited to met fences.
@@ -47,7 +51,14 @@ MUTATIONS = {
     'overrun-full-family': ('object', 'Some((index, _, true)) => inner.returned[index].take(),',
                             'Some((index, _, _)) => inner.returned[index].take(),'),
     # An uncached object is unmapped as soon as its owner drops it.
-    'unmap-uncached': ('object', '(None, Some(pool)) => pool.defer_object(object),', '(None, Some(_)) => drop(object),'),
+    'unmap-uncached': ('object', '(None, Some(pool)) => pool.defer_object(object, self.exposure.take()),',
+                       '(None, Some(_)) => drop(object),'),
+    # An uncached object nobody exposed is deferred anyway (linux#2959 review: unbounded list).
+    'defer-unexposed': ('object', 'let unexposed = exposure.as_deref().is_some_and(|exposure| !exposure.exposed());',
+                        'let unexposed = false;'),
+    # Handing out the work-list head does not count as exposure.
+    'unexposed-head': ('context', '        self.exposure.expose();\n        if let Some(mark) = &self.work_mark {',
+                       '        if let Some(mark) = &self.work_mark {'),
     # A deferred object is unmapped one control record early.
     'reap-early': ('object', '.position(|(_, fence)| *fence <= witnessed)', '.position(|(_, fence)| *fence <= witnessed + 1)'),
     # Firmware stop leaves deferred objects mapped.
@@ -367,7 +378,7 @@ pub mod base {
 
 pub mod now {
     use super::*;
-    use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 @NOW@
     driver!(|after_release| Pool::new(after_release).unwrap(), |object: &PooledObject, op: &crate::Op| {
         // Without after_release there is no mark: the context's updates change nothing.
@@ -768,6 +779,7 @@ pub mod now {
             work: Arc<Mutex<WorkStorage>>,
             work_base: u64,
             work_mark: Option<Arc<ReturnMark>>,
+            exposure: Arc<Exposure>,
             scheduler: Arc<SchedulerStorage>,
             hold: Arc<mmu::ContextHold>,
             qos: Arc<QosLease>,
@@ -785,10 +797,12 @@ pub mod now {
         }
 
         fn new_context(pool: &kernel::sync::Arc<Pool>, alloc: &Allocator<'_>) -> (Arc<Context>, u64) {
-            let object = super::work_state(pool, alloc);
+            let mut object = super::work_state(pool, alloc);
+            let exposure = Arc::new(Exposure::new());
+            object.defer_once_exposed(&exposure);
             let (id, work_base, work_mark) = (object.id, object.gpu_va(), object.return_mark());
             let context = Arc::new(Context {
-                work: Arc::new(Mutex::new(WorkStorage { object })), work_base, work_mark,
+                work: Arc::new(Mutex::new(WorkStorage { object })), work_base, work_mark, exposure,
                 scheduler: Arc::new(SchedulerStorage), hold: Arc::new(mmu::ContextHold), qos: Arc::new(QosLease),
                 head: Cell::new([0, work_base + (UAT_PGSZ + 0x400) as u64]),
             });
@@ -855,6 +869,64 @@ pub mod now {
             }
             println!("context: records, commands and retained records mark the work state; a consumed release with an empty list releases it");
         }
+
+        /// Queues created and closed without work publish no control record, so the control
+        /// fence never moves. Once the work-state family is full of objects waiting for it,
+        /// each further context gets an uncached work state: one never exposed is unmapped at
+        /// once and the deferred list does not grow; one a record or a command exposed still
+        /// waits for the fence.
+        pub fn create_close_loop() {
+            for after_release in [true, false] {
+                let what = format!("after_release {after_release}");
+                let next = Cell::new(1);
+                let alloc = Allocator { next: &next };
+                let pool = Pool::new(after_release).unwrap();
+                crate::forget_unmapped();
+                crate::channel::set(10, 7);
+                // Fill the family with work states a queue record exposed and nothing released.
+                let exposed: Vec<_> = (0..POOL_SLOTS).map(|_| new_context(&pool, &alloc)).collect();
+                for (context, _) in &exposed {
+                    let _ = context.work_head_va();
+                }
+                drop(exposed);
+                let s = snapshot(&pool);
+                assert_eq!(crate::count(&s, "cached_objects_1 ", "waiting="), POOL_SLOTS as u64, "{what}\n{s}");
+
+                // The loop: create, compare the head (no exposure), close.
+                for round in 0..4096u64 {
+                    let (context, id) = new_context(&pool, &alloc);
+                    assert!(context.work.lock().object.lease.is_none(), "{what}: full family, uncached");
+                    assert_eq!(context.work_head_address(), context.work_base + 0x4400);
+                    drop(context);
+                    assert!(unmapped(id), "{what}: round {round}: an unexposed work state waits for a fence");
+                }
+                let s = snapshot(&pool);
+                assert_eq!(crate::count(&s, "uncached_objects_fenced", "waiting="), 0, "{what}\n{s}");
+                assert_eq!(crate::count(&s, "uncached_objects_fenced", "bytes="), 0, "{what}\n{s}");
+                assert_eq!(crate::count(&s, "uncached_objects_fenced", "unexposed_freed="), 4096, "{what}\n{s}");
+                assert_eq!(pool.inner.lock().deferred_reserved, 0, "{what}: no reservation is left behind");
+
+                // A queue record names the head: it waits for the fence like any uncached object.
+                let (context, id) = new_context(&pool, &alloc);
+                let _ = context.work_head_va();
+                drop(context);
+                assert!(!unmapped(id), "{what}: an exposed uncached work state was unmapped before its fence");
+                // A command names a node of another: the same.
+                let (context, node_id) = new_context(&pool, &alloc);
+                let lease = WorkStateLease { context: context.clone(), word: 5.into() };
+                let _ = lease.node_va().unwrap();
+                drop((lease, context));
+                assert!(!unmapped(node_id), "{what}: a command's uncached work state was unmapped early");
+                let s = snapshot(&pool);
+                assert_eq!(crate::count(&s, "uncached_objects_fenced", "waiting="), 2, "{what}\n{s}");
+                // The fence is met: the next allocation unmaps both.
+                crate::channel::set(11, 11);
+                drop(new_context(&pool, &alloc));
+                assert!(unmapped(id) && unmapped(node_id), "{what}: unmapped once the fence is met");
+                assert_eq!(crate::count(&snapshot(&pool), "uncached_objects_fenced", "waiting="), 0);
+            }
+            println!("context: 4096 queue create/close cycles without work leave no deferred object; exposed ones wait for the fence");
+        }
     }
 }
 
@@ -880,6 +952,7 @@ fn main() {
         now::model(seed.wrapping_mul(0x2545_f491_4f6c_dd1d), 6000);
     }
     now::context::accessors();
+    now::context::create_close_loop();
 }
 '''
 
@@ -916,6 +989,16 @@ def source_rules(context, observation, tree):
         assert ('== [0, ' in line or '!= [0, ' in line or line.startswith('must_retain(')
                 or line == 'self.work_head_address()'), (name, line)
     assert len(users) == 4, users
+    # Whatever may hand an address of the context's pages to the firmware exposes them: the
+    # work storage's accessors (above), the scheduler page's only address reader, publication.
+    assert context.count('scheduler.gpu_va()') == 1, context.count('scheduler.gpu_va()')
+    assert 'self.exposure.expose();' in block(context, '    pub(crate) fn scheduler_va(')
+    assert 'self.exposure.expose();' in block(context, '    fn expose_work(')
+    assert 'self.exposure.expose();' in block(context, '    pub(crate) fn mark_published(')
+    assert context.count('object.defer_once_exposed(&exposure);') == 2
+    for path in sorted(tree.rglob('*.rs')):
+        text = path.read_text()
+        assert not re.search(r'scheduler_owner\(\)[^;]*gpu_va', text), path
     assert 'job_list_empty: head == [0, memory.context.work_head_address()],' in observation
     print('source: records and commands mark the work state; only a consumed empty-list release releases it')
 
