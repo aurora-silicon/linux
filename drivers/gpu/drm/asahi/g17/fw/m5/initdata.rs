@@ -3030,8 +3030,8 @@ impl BoardPower {
             if core_uv == 0 || core_uv % 1000 != 0 || sram_uv == 0 || sram_uv % 1000 != 0 {
                 return Err("an operating point's voltage is 0 or not a whole number of mV");
             }
-            // The loader fills the core voltages from the machine's ADT, the SRAM ones are the
-            // node's: a part fused above them would run its SRAM below its core.
+            // The loader fills both from the machine's ADT, one pair per operating point: a
+            // pair whose SRAM is below its core is refused, whatever its source.
             if sram_uv < core_uv {
                 return Err("an operating point's SRAM voltage is below its core voltage");
             }

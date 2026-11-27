@@ -264,8 +264,10 @@ properties:
     maxItems: 14
     description:
       SRAM voltage of each operating point of operating-points-v2, in the
-      table's order, in microvolts (the ADT's sgx perf-states-sram). The
-      operating points carry the core voltage.
+      table's order, in microvolts. The operating points carry the core
+      voltage. Both are binned per part, so the bootloader fills them from
+      the machine's ADT (sgx perf-states-sram and perf-states); a source
+      tree leaves them 0, which the driver refuses.
 
   apple,m5-relative-power:
     $ref: /schemas/types.yaml#/definitions/uint32-array

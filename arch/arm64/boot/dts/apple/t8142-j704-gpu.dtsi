@@ -144,24 +144,22 @@
 		apple,clpc = <&clpc>;
 
 		/*
-		 * The J704's GPU power data, which the driver requires: the J704 ADT's (sgx)
-		 * or macOS 27.0's own InitData on a J704 (26A428, every startup capture alike).
-		 * SRAM voltage per OPP: the ADT's sgx perf-states-sram, which macOS also has at
-		 * hardware data +0x1524.
+		 * The J704's GPU power data, which the driver requires. SRAM voltage per OPP:
+		 * 0 here, filled by the bootloader from this machine's ADT sgx perf-states-sram
+		 * with the OPPs, as it is binned per part like the core voltage; the driver
+		 * refuses a table it did not fill and an OPP whose SRAM is below its core.
 		 */
-		apple,sram-microvolt = <770000 770000 770000 770000 770000 770000 770000
-					775000 805000 840000 885000 940000 1010000 1030000>;
+		apple,sram-microvolt = <0 0 0 0 0 0 0 0 0 0 0 0 0 0>;
 		/*
-		 * Relative performance per OPP (IEEE single, percent), hardware data +0x19e4:
-		 * 0, 11.52, 15.13, 20.03, 27.18, 31.89, 36.86, 43.31, 50.58, 59.33, 71.35,
-		 * 87.47, 98.06, 100.
+		 * Relative performance per OPP (IEEE single, percent): 0, 11.52, 15.13,
+		 * 20.03, 27.18, 31.89, 36.86, 43.31, 50.58, 59.33, 71.35, 87.47, 98.06, 100.
 		 */
 		apple,m5-relative-power = <0 0x413859bf 0x41721ec4 0x41a0407d 0x41d969aa
 					   0x41ff2298 0x42137266 0x422d41a1 0x424a5481
 					   0x426d5023 0x428eb134 0x42aeee33 0x42c41dd3
 					   0x42c80000>;
 		/*
-		 * The AON rows as macOS 27.0 hands them over: RT0g first (index 0x28, the row
+		 * The AON rows the firmware expects: RT0g first (index 0x28, the row
 		 * the power policy names), then LFCR, LFXG and PLXG.
 		 */
 		apple,m5-aon-records = <0x67305452 0x00280001 0x00001401>,
