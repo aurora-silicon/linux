@@ -56,7 +56,12 @@ def build_harness(mutation=None):
 
     direct_fn = item(runtime_src, 'fn compute_direct(')
     drop_impl = item(render_src, 'impl Drop for Active')
+    parked_struct = item(render_src, 'struct ParkedReplay')
+    parked_impl = item(render_src, 'impl ParkedReplay')
+    parked_drop = item(render_src, 'impl Drop for ParkedReplay')
+    replay_fn = item(render_src, 'fn replay_abandoned(')
     push_snippet_ok = 'packet.context.inc_render_active();\n        self.active\n            .push(Active {' in render_src
+    replay_field_ok = 'replay: Tracker<ParkedReplay>,' in render_src
     context_ok = (
         'render_active: AtomicU32,' in context_src
         and 'pub(crate) fn render_active(&self) -> u32' in context_src
@@ -84,8 +89,18 @@ def build_harness(mutation=None):
         )
     elif mutation == 'drop-active-dec':
         drop_impl = drop_impl.replace('self.packet.context.dec_render_active();', '', 1)
+    elif mutation == 'drop-count-on-park':
+        parked_impl = parked_impl.replace('packet.context.inc_render_active();', '', 1)
+        parked_drop = parked_drop.replace('self.packet.context.dec_render_active();', '', 1)
+        replay_fn = replay_fn.replace('let parked = ParkedReplay::new(packet.clone());', '', 1)
 
     no_render_seen_bail = '|| self.context.render_seen()' not in direct_fn
+    park_handoff_ok = ordered_ok(
+        replay_fn,
+        'let parked = ParkedReplay::new(packet.clone());',
+        'self.active.pop().ok_or(EIO)?;',
+        'self.replay.push(parked).map_err(|_| EIO)?;',
+    )
     prefix_contract_ok = ordered_ok(
         direct_fn,
         'packet.check_firmware_producers()',
@@ -128,21 +143,25 @@ struct Packet {{ context: Arc<Context> }}
 struct Active {{ packet: Arc<Packet> }}
 {drop_impl}
 
-struct Tracker {{
+{parked_struct}
+{parked_impl}
+{parked_drop}
+
+struct Tracker<T> {{
     cap: usize,
-    items: Vec<Active>,
+    items: Vec<T>,
 }}
 
-impl Tracker {{
+impl<T> Tracker<T> {{
     fn new(cap: usize) -> Self {{ Self {{ cap, items: Vec::new() }} }}
-    fn push(&mut self, a: Active) -> Result<(), ()> {{
+    fn push(&mut self, a: T) -> Result<(), ()> {{
         if self.items.len() >= self.cap {{
             return Err(());
         }}
         self.items.push(a);
         Ok(())
     }}
-    fn pop(&mut self) -> Option<Active> {{
+    fn pop(&mut self) -> Option<T> {{
         if self.items.is_empty() {{ None }} else {{ Some(self.items.remove(0)) }}
     }}
 }}
@@ -150,6 +169,8 @@ impl Tracker {{
 fn main() {{
     assert!({str(context_ok).lower()}, "Context must expose atomic render_active counter");
     assert!({str(push_snippet_ok).lower()}, "Pair::publish must increment render_active before pushing Active");
+    assert!({str(replay_field_ok).lower()}, "Pair::replay must hold ParkedReplay RAII wrappers");
+    assert!({str(park_handoff_ok).lower()}, "replay_abandoned must construct ParkedReplay before popping Active");
     assert!({str(no_render_seen_bail).lower()}, "compute_direct must not bail unconditionally on render_seen()");
     assert!({str(prefix_contract_ok).lower()}, "compute_direct must resolve active render prefix and check recovery/replay");
     assert!({str(lock_scope_ok).lower()}, "compute_direct must drop device mutex before locking compute cell");
@@ -157,24 +178,48 @@ fn main() {{
 
     let ctx = Context::new();
     let pkt = Arc::new(Packet {{ context: ctx.clone() }});
-    let mut tracker = Tracker::new(2);
+    let mut active = Tracker::<Active>::new(2);
+    let mut replay = Tracker::<ParkedReplay>::new(2);
 
     // Push two active renders.
     for _ in 0..2 {{
         pkt.context.inc_render_active();
-        tracker.push(Active {{ packet: pkt.clone() }}).unwrap();
+        active.push(Active {{ packet: pkt.clone() }}).unwrap();
     }}
     assert_eq!(ctx.render_active(), 2);
 
     // Failed push drops Active immediately, leaving render_active balanced.
     pkt.context.inc_render_active();
-    assert!(tracker.push(Active {{ packet: pkt.clone() }}).is_err());
+    assert!(active.push(Active {{ packet: pkt.clone() }}).is_err());
     assert_eq!(ctx.render_active(), 2);
 
-    // Retiring one drops it to 1; dropping the tracker drops it to 0.
-    drop(tracker.pop());
+    // Park both active renders into replay: render_active stays > 0 across every step
+    // (including when active becomes completely empty!).
+    for _ in 0..2 {{
+        let parked = ParkedReplay::new(pkt.clone());
+        drop(active.pop());
+        assert!(ctx.render_active() >= 1, "render_active must never dip to 0 while parking");
+        replay.push(parked).unwrap();
+    }}
+    assert_eq!(ctx.render_active(), 2);
+
+    // Failed replay push drops ParkedReplay immediately, keeping balance.
+    let overflow = ParkedReplay::new(pkt.clone());
+    assert!(replay.push(overflow).is_err());
+    assert_eq!(ctx.render_active(), 2);
+
+    // Republish one from replay -> active (publish before finish_replay): count stays >= 2 -> 2.
+    pkt.context.inc_render_active();
+    active.push(Active {{ packet: pkt.clone() }}).unwrap();
+    drop(replay.pop());
+    assert_eq!(ctx.render_active(), 2);
+
+    // Retire the active one; parked replay still holds render_active == 1.
+    drop(active.pop());
     assert_eq!(ctx.render_active(), 1);
-    drop(tracker);
+
+    // Failing / dropping replay returns render_active to 0.
+    drop(replay);
     assert_eq!(ctx.render_active(), 0);
 
     println!("PASS g17-direct-compute-render-prefix-tests");
@@ -189,6 +234,7 @@ def main():
         'skip-render-prefix',
         'ignore-replay-parked',
         'drop-active-dec',
+        'drop-count-on-park',
     ])
     args = parser.parse_args()
     src = build_harness(args.mutation)
