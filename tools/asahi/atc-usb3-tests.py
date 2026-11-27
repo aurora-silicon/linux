@@ -693,7 +693,7 @@ static void lock_timeout_left_to_caller(void) {
 }
 int main(void) {
  TEST(both_role_and_typec_orders_complete_usb3);
- TEST(t8132_device_role_runs_usb2);
+ TEST(usb2_device_role_runs_usb2);
  TEST(nonusb3_commit_discharges_deferred_role);
  TEST(deferred_role_survives_configuration_failures);
  TEST(admission_requires_machine_and_generation);
