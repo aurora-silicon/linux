@@ -13,6 +13,7 @@ compile_error!("apple_sep requires CONFIG_OF_DYNAMIC: the SEP and DART nodes shi
 mod ratelimit;
 mod attach;
 mod bio;
+mod capture;
 mod catacomb;
 mod control;
 mod der;
@@ -24,6 +25,13 @@ mod hibe;
 mod hwrng;
 mod image;
 mod key;
+mod key_command;
+mod key_context;
+mod key_context_state;
+mod key_device;
+mod key_request;
+mod key_result;
+mod key_wait;
 mod keybag;
 mod keybag_identity;
 mod os_identity;
@@ -297,6 +305,35 @@ enum LockState {
     Unlocked,
 }
 
+/// A Unix user's own biometric user: the designation of its key bag
+/// (`userbag::bag_designation`) and the uid whose catacomb file it uses.
+/// A Touch ID match for one of that bag's keys runs in this user's domain,
+/// as macOS matches against the logged-in user's catacomb: a match against
+/// another user's templates does not satisfy the key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BioSubject {
+    pub(crate) user: i32,
+    pub(crate) uid: u32,
+}
+
+/// Routes Touch ID to a bag user while a touch-gated call or an enrolment
+/// runs, under `catacomb_writer`; the configured user again when it ends, on
+/// every path.
+pub(crate) struct SubjectScope<'a>(&'a SepData);
+
+impl<'a> SubjectScope<'a> {
+    pub(crate) fn new(sep: &'a SepData, subject: BioSubject) -> Self {
+        *sep.bio_subject.lock() = Some(subject);
+        SubjectScope(sep)
+    }
+}
+
+impl Drop for SubjectScope<'_> {
+    fn drop(&mut self) {
+        *self.0.bio_subject.lock() = None;
+    }
+}
+
 impl LockState {
     const fn wire(self) -> i32 {
         match self {
@@ -428,6 +465,9 @@ enum RestoreOutcome {
     Failed,
     // 0x8002 cold-transition; tolerated only for the lockout record, never a catacomb
     EmptyTolerated,
+    // A bag user's catacomb answered 0x8002 and the enclave then listed none
+    // of its identities: its saved templates did not come back.
+    LoadedEmpty,
 }
 
 const PRIVATE_TYPE_CATACOMB_MASTER: u8 = 0xF2;
@@ -715,6 +755,10 @@ struct SepData {
     templates_restored: Atomic<bool>,
     // Provisional cold restore; COMPLETE_INIT must still prove the device view.
     cold_restore_candidate: Atomic<bool>,
+    /// Every attach step of the cold restore succeeded, whatever the
+    /// configured user's identity count: enough for a match in a bag user's
+    /// own domain, whose catacomb is loaded and checked on its own.
+    components_restored: Atomic<bool>,
 
     sensor_calibrated: Atomic<bool>,
     sensor_key_loaded: Atomic<bool>,
@@ -745,6 +789,22 @@ struct SepData {
     // all before it sets up the new one, as a restart does.
     #[pin]
     cold_match_contexts: Mutex<KVec<[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]>>,
+
+    // Per-user bags the 13.5 key store keeps loaded between import and
+    // logout (see `userbag::LoadedBags`).
+    #[pin]
+    user_bags: Mutex<userbag::LoadedBags>,
+
+    // Touch ID's failed attempts, lockout and after-boot wait of each account
+    // that matches in its own domain; `bio_lockout` and `bio_after_boot` are
+    // the configured user's.
+    #[pin]
+    account_gates: Mutex<userbag::AccountGates>,
+
+    // The biometric user a match addresses while a touch-gated call on a
+    // user-bag key waits (see `BioSubject`); none means the configured user.
+    #[pin]
+    bio_subject: Mutex<Option<BioSubject>>,
 
     // The sensor stayed powered and registered after the last verify, so the
     // next verify captures without a new bring-up, as macOS does. Cleared by
@@ -886,7 +946,18 @@ struct SepData {
 
     // /dev/sep-key: P-256 keys created inside the SEP (see `key`).
     #[pin]
-    key_dev: Mutex<Option<shim::BioChardev>>,
+    key_dev: Mutex<Option<key_device::Registration>>,
+    key_calls: Atomic<u32>,
+    key_context_generation: Atomic<u64>,
+    #[pin]
+    key_contexts: Mutex<KVec<Arc<key_context::Context>>>,
+    key_context_queue: workqueue::OwnedQueue,
+    key_auth_queue: workqueue::OwnedQueue,
+    #[pin]
+    key_commands: Mutex<key_command::State>,
+    #[pin]
+    capture: Mutex<capture::State>,
+    key_sensor_waiting: Atomic<bool>,
 
     // /dev/sep-key: one identity-bag load, operation and unload at a time.
     // The device's ioctls run concurrently (a touch wait must not block
@@ -917,6 +988,10 @@ struct SepData {
     // (SEP_BIO_REQUIRE_PASSWORD): every verify is refused without a capture
     // until a password authentication re-arms it. Never recorded.
     bio_after_boot: Atomic<bool>,
+
+    // SEP_BIO_REQUIRE_PASSWORD was called this boot: each account with its
+    // own fingerprints then also waits for its own password (`account_gates`).
+    bio_after_boot_asked: Atomic<bool>,
 
     // The refusal of a verify during a lockout has been logged.
     bio_lockout_logged: Atomic<bool>,
@@ -1240,10 +1315,14 @@ impl SepData {
                 sensor_key_loaded: Atomic::new(false),
                 templates_restored: Atomic::new(false),
                 cold_restore_candidate: Atomic::new(false),
+                components_restored: Atomic::new(false),
                 enrol_material <- new_mutex!(None),
                 match_context <- new_mutex!(None),
                 match_context_generation: Atomic::new(0),
                 cold_match_contexts <- new_mutex!(KVec::new()),
+                user_bags <- new_mutex!(userbag::LoadedBags::new()),
+                account_gates <- new_mutex!(userbag::AccountGates::new()),
+                bio_subject <- new_mutex!(None),
                 sensor_kept: Atomic::new(false),
                 sensor_reset_in_capture: Atomic::new(false),
                 bg_ops_ready: Atomic::new(false),
@@ -1302,6 +1381,14 @@ impl SepData {
                 bio_dev <- new_mutex!(None),
                 rearm_dev <- new_mutex!(None),
                 key_dev <- new_mutex!(None),
+                key_calls: Atomic::new(0),
+                key_context_generation: Atomic::new(0),
+                key_contexts <- new_mutex!(KVec::new()),
+                key_context_queue: workqueue::OwnedQueue::new_ordered(c"sep_context")?,
+                key_auth_queue: workqueue::OwnedQueue::new_ordered(c"sep_auth")?,
+                key_commands <- new_mutex!(key_command::State::new()),
+                capture <- new_mutex!(capture::State::new()),
+                key_sensor_waiting: Atomic::new(false),
                 key_bag_lock <- new_mutex!(()),
                 key_touch <- new_mutex!(None),
                 key_touch_active: Atomic::new(false),
@@ -1310,6 +1397,7 @@ impl SepData {
                 last_key_status: Atomic::new(0),
                 bio_lockout: Atomic::new(false),
                 bio_after_boot: Atomic::new(false),
+                bio_after_boot_asked: Atomic::new(false),
                 bio_lockout_logged: Atomic::new(false),
                 bio_nomatch_streak: Atomic::new(0),
                 enclave_failures_owed: Atomic::new(false),
@@ -3492,6 +3580,11 @@ impl SepData {
         self.scrd_wq.notify_all();
         self.hdcp_wq.notify_all();
         pm::unregister();
+        self.cancel_key(ENODEV);
+        self.cancel_context_commands(ENODEV);
+        self.revoke_key_contexts(ENODEV);
+        self.key_auth_queue.drain();
+        self.remove_key_contexts();
         // Release any capture start still held for a resume that will not be
         // reported now.
         self.sleep_finished();
@@ -3505,6 +3598,9 @@ impl SepData {
         drop(dev);
         let dev = self.key_dev.lock().take();
         drop(dev);
+        // Files outlive the registration; their calls end before the
+        // hardware goes.
+        key_device::wait_for_calls(self);
 
         self.rng_shutdown.store(true, Relaxed);
         self.control_wq.notify_all();

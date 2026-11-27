@@ -55,6 +55,9 @@ struct sep_bio_info {
 
 /* reserved[0] flags; reserved[1] is a live SEP identity count only when valid. */
 #define SEP_BIO_INFO_LIVE_COUNT_VALID 1u
+/* SEP_BIO_VERIFY_START takes SEP_BIO_VERIFY_ACCOUNT (only where per-user
+ * key bags are supported). */
+#define SEP_BIO_INFO_VERIFY_ACCOUNT   2u
 
 struct sep_bio_list {
 	__u32 count;
@@ -111,9 +114,26 @@ struct sep_bio_enrol_poll {
 	__u32 progress_percent;
 };
 
+/*
+ * flags SEP_BIO_VERIFY_ACCOUNT: 'account_uid' is the resolved Unix account the
+ * match is for. While that account's own key bag is loaded and unlocked by
+ * its password, the match runs against that user's own templates; while it
+ * is loaded but locked, the verify fails and the password is needed. With
+ * no loaded bag, or without the flag, the built-in Linux user matches.
+ *
+ * In an account's own domain Touch ID's gates are that account's: its
+ * failed attempts (a finger that matches only another account is a miss for
+ * it), the lockout after five of them, and, once SEP_BIO_REQUIRE_PASSWORD was
+ * called this boot, the wait for its own first password. A refusal is
+ * SEP_BIO_STATUS_LOCKOUT, as for the configured user. The account's bag
+ * password (its unlock) clears its state and no other; SEP_BIO_LOCKOUT_STATE
+ * and SEP_BIO_REARM report and clear only the configured user's.
+ */
+#define SEP_BIO_VERIFY_ACCOUNT 1u
+
 struct sep_bio_verify_start {
 	__u32 flags;
-	__u32 reserved;
+	__u32 account_uid; /* with SEP_BIO_VERIFY_ACCOUNT, else 0 */
 	__u8  nonce[SEP_BIO_NONCE_LEN];
 };
 
@@ -316,6 +336,7 @@ struct sep_bio_rearm {
 #define SEP_KEY_FEATURE_SEAL   0x2
 #define SEP_KEY_FEATURE_PASSWORD 0x4
 #define SEP_KEY_FEATURE_PERSISTENT_ATTEMPTS 0x8
+#define SEP_KEY_FEATURE_CONTEXTS 0x20 /* authorization contexts, below */
 #define SEP_KEY_PASSWORD_MAX 256
 #define SEP_KEY_SECRET_MAX 64
 #define SEP_KEY_SEALED_MAX 256
@@ -409,6 +430,138 @@ struct sep_key_unseal_password {
 #define SEP_KEY_CREATE_USER     _IOWR(SEP_BIO_IOC_MAGIC, 0x28, struct sep_key_create_user)
 #define SEP_KEY_SIGN_PASSWORD   _IOWR(SEP_BIO_IOC_MAGIC, 0x29, struct sep_key_sign_password)
 #define SEP_KEY_UNSEAL_PASSWORD _IOWR(SEP_BIO_IOC_MAGIC, 0x2a, struct sep_key_unseal_password)
+
+/*
+ * Authorization contexts (SEP_KEY_FEATURE_CONTEXTS, offered on every key
+ * store with per-user bags). DESIGN DRAFT, not a stable ABI.
+ *
+ * One authentication (a Touch ID match in the bag user's own domain, or the
+ * bag's password checked by the enclave) authorizes a bounded run of
+ * operations on that bag's keys, or with BIND on one of them, as macOS lets
+ * an authentication be reused for a short time: a password manager reveals
+ * many items after one unlock. The bounds:
+ *
+ * - a context belongs to one Unix account's key bag (NEW: root or that
+ *   user) and is a file descriptor: closing it ends it;
+ * - it belongs to the effective uid that made it: every request on the
+ *   context, or naming it, from another effective uid fails with EPERM.
+ *   Within that uid the descriptor is a capability: a process it is
+ *   passed to, or a child that inherits it, can use it;
+ * - BIND, before AUTH, may name the one key and the operations
+ *   (SEP_KEY_CTX_SCOPE_*) it authorizes; nothing else is then accepted;
+ * - it lasts lifetime_s from the authentication (1 s to 12 hours; 0 is
+ *   refused with EINVAL), and ends at once when the bag locks, on suspend,
+ *   on REVOKE and when the driver stops;
+ * - each SIGN or DECRYPT still runs one enclave operation under the
+ *   enclave's own access-control check of that key.
+ *
+ * Every request carries a caller-chosen nonzero id; SEP_KEY_CANCEL_ID on
+ * the file it was made on (the /dev/sep-key file, or the context for its
+ * AUTH) ends that request, such as an AUTH waiting for a finger.
+ * Outcome: 0 authenticated, 1 not matched or wrong password, 5 failed.
+ * Errors: EOPNOTSUPP without the feature, EKEYEXPIRED once the
+ * context's lifetime has passed, EKEYREVOKED once it was ended early (REVOKE,
+ * the bag locking, a suspend, a failed AUTH), EPERM outside its scope, EBUSY
+ * while another request runs or when a Touch ID verify or enrolment on
+ * /dev/sep-bio wants the sensor during an AUTH, ECANCELED when cancelled,
+ * ETIMEDOUT at timeout_ms, ENODEV once the driver has stopped (every file
+ * open then refuses context requests; open /dev/sep-key again). At most 16
+ * contexts are live at once; a closed one frees its slot once the enclave
+ * has deleted its credential, so NEW right after a close may briefly get
+ * ENOSPC.
+ */
+#define SEP_KEY_CTX_NEW_BAG       0x1
+#define SEP_KEY_CTX_LIFETIME_MAX  (12 * 3600)
+#define SEP_KEY_CTX_SCOPE_SIGN    0x1
+#define SEP_KEY_CTX_SCOPE_DECRYPT 0x2
+#define SEP_KEY_CTX_METHOD_TOUCH  1
+#define SEP_KEY_CTX_OUTCOME_OK          0
+#define SEP_KEY_CTX_OUTCOME_NOT_MATCHED 1
+#define SEP_KEY_CTX_OUTCOME_FAILED      5
+
+struct sep_key_buffer {
+	__u32 len;
+	__u32 reserved;
+	__u64 ptr;
+};
+
+struct sep_key_ctx_new {
+	__u32 flags;            /* SEP_KEY_CTX_NEW_BAG */
+	__s32 fd;               /* out: the context */
+	__u32 uid;              /* the bag's Unix account */
+	__u32 lifetime_s;       /* 1..SEP_KEY_CTX_LIFETIME_MAX */
+	__u32 reserved[2];      /* in: 0 */
+};
+
+struct sep_key_ctx_auth {
+	__u64 id;
+	__u32 timeout_ms;
+	__u32 method;           /* SEP_KEY_CTX_METHOD_TOUCH */
+	__u32 outcome;          /* out: SEP_KEY_CTX_OUTCOME_* */
+	__u32 reserved;
+};
+
+struct sep_key_ctx_auth_password {
+	__u64 id;
+	__u32 timeout_ms;
+	__u32 outcome;          /* out */
+	struct sep_key_password password;
+};
+
+struct sep_key_ctx_bind {
+	__u32 ops;              /* SEP_KEY_CTX_SCOPE_* */
+	__u32 reserved;
+	struct sep_key_buffer handle;
+};
+
+struct sep_key_ctx_query {
+	__u32 phase;
+	__u32 cleanup;
+	__s32 reason;
+	__u32 activity_flags;
+	__u32 reserved[2];      /* out: 0 */
+};
+
+struct sep_key_ctx_revoke {
+	__u32 timeout_ms;
+	__u32 reserved;
+};
+
+struct sep_key_ctx_sign {
+	__u64 id;
+	__u32 timeout_ms;
+	__s32 context_fd;
+	__u32 blob_len;
+	__u32 reserved;
+	__u64 blob_ptr;
+	__u8  digest[SEP_KEY_DIGEST_LEN];
+	__u32 sig_len;          /* out */
+	__u32 reserved2;
+	__u8  signature[SEP_KEY_SIG_MAX];
+};
+
+struct sep_key_ctx_decrypt {
+	__u64 id;
+	__u32 timeout_ms;
+	__s32 context_fd;
+	struct sep_key_buffer blob;
+	struct sep_key_buffer sealed;
+	struct sep_key_buffer plain;    /* in: capacity, out: length */
+};
+
+struct sep_key_cancel_id {
+	__u64 request_id;
+};
+
+#define SEP_KEY_CTX_NEW           _IOWR(SEP_BIO_IOC_MAGIC, 0x40, struct sep_key_ctx_new)
+#define SEP_KEY_CTX_AUTH          _IOWR(SEP_BIO_IOC_MAGIC, 0x41, struct sep_key_ctx_auth)
+#define SEP_KEY_CTX_QUERY         _IOR(SEP_BIO_IOC_MAGIC, 0x42, struct sep_key_ctx_query)
+#define SEP_KEY_CTX_REVOKE        _IOW(SEP_BIO_IOC_MAGIC, 0x43, struct sep_key_ctx_revoke)
+#define SEP_KEY_CTX_SIGN          _IOWR(SEP_BIO_IOC_MAGIC, 0x44, struct sep_key_ctx_sign)
+#define SEP_KEY_CTX_DECRYPT       _IOWR(SEP_BIO_IOC_MAGIC, 0x45, struct sep_key_ctx_decrypt)
+#define SEP_KEY_CTX_AUTH_PASSWORD _IOWR(SEP_BIO_IOC_MAGIC, 0x46, struct sep_key_ctx_auth_password)
+#define SEP_KEY_CTX_BIND          _IOW(SEP_BIO_IOC_MAGIC, 0x47, struct sep_key_ctx_bind)
+#define SEP_KEY_CANCEL_ID         _IOW(SEP_BIO_IOC_MAGIC, 0x48, struct sep_key_cancel_id)
 
 /*
  * Test only, refused unless apple_sep.key_selftest=1, root: sign with a
@@ -525,7 +678,9 @@ struct sep_keybag_change {
  * A user's wrapped bag, for userspace to keep across reboots (as macOS
  * saves it). It holds no secret: it opens only with the user's password,
  * on this Mac. EXPORT copies the designated bag; IMPORT loads a saved one
- * and designates it again, locked until SEP_BIO_KEYBAG_UNLOCK.
+ * and designates it again, locked until SEP_BIO_KEYBAG_UNLOCK. IMPORT of a
+ * bag the driver still holds (locked, or open for another session) is
+ * EBUSY: unlock it instead.
  */
 #define SEP_KEYBAG_BLOB_MAX 4096
 

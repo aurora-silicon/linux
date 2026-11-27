@@ -14,7 +14,7 @@ class ContextCleanupTests(unittest.TestCase):
         source = (ROOT / "drivers/soc/apple/key.rs").read_text()
         trait = source[source.index("pub(crate) trait ContextDelete"):
                        source.index("impl ContextDelete for SepData")]
-        guard = source[source.index("/// A credential context"):
+        guard = source[source.index("pub(crate) struct OwnedContext"):
                        source.index("/// Self-test copies")]
         tests = source[source.index("    struct Deleter {"):
                        source.index("    // Production kernels do not build")]
