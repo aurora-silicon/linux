@@ -129,15 +129,6 @@ fn note(step: u8) {
 }
 
 impl Shared {
-    /// The mailbox's receive interrupt back on after `.prepare` masked it for the commit.
-    fn resume_rx(&self) {
-        let state = self.state.lock();
-        if let Some(firmware) = state.as_deref() {
-            // SAFETY: The RTKit handle lasts until reboot; the prepare masked it once.
-            unsafe { apple_rtkit_resume_rx(firmware.session.rtkit.as_raw()) };
-        }
-    }
-
     /// The PMP's request for the GPU, where the device tree names one. The PMP may use a device
     /// whose request is set, so it's only ever set with the domain on.
     pub(crate) fn pmp_request(&self, enable: bool) {
@@ -443,9 +434,6 @@ impl Gpu {
                 self.shared.dev.as_ref(),
                 "sleep refused before the commit: GPU firmware never stopped\n"
             );
-            if self.cfg.sleep_quiet_stop {
-                self.shared.resume_rx();
-            }
             self.shared.feed.resume();
             self.shared.sleeping.store(false, Ordering::Release);
             self.shared.poll_now();
@@ -454,7 +442,7 @@ impl Gpu {
         if !real && self.shared.sleep_hold() {
             return;
         }
-        let _ = self.shared.sleep_up(self.cfg.sleep_quiet_stop);
+        let _ = self.shared.sleep_up(false);
     }
 }
 

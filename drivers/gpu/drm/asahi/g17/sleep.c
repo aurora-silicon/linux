@@ -768,13 +768,15 @@ static int asahi_g16_commit_stop_quiet(void *data)
 	apple_sleep_note_sub(5);
 	c->lowered = readl(c->ps);
 
-	return (c->idle[0] || c->request_ret) ? 1 : 0;
+	/* Which step failed, as the sleep driver notes it (+4 = -result): 0xff the idle, 0xfe the request */
+	return (c->idle[0] ? 1 : 0) | (c->request_ret ? 2 : 0);
 }
 
 /*
  * The same stop for G16, made by the sleep's commit. @quiet: G15S's, which touches neither the
- * ASC's page nor GFX, and whose mailbox interrupt stays masked from here until the restart or
- * the refusal.
+ * ASC's page nor GFX. The mailbox's interrupt stays live until the commit, which turns its
+ * receive off (J516s: masked from .prepare instead, the firmware's messages went unanswered
+ * through the suspend and its stop failed at the commit, PMU +4 0xff).
  */
 struct asahi_g17_commit *asahi_g16_commit_prepare(struct device *dev, struct apple_rtkit *rtk,
 						  bool quiet)
@@ -796,8 +798,6 @@ struct asahi_g17_commit *asahi_g16_commit_prepare(struct device *dev, struct app
 							     asahi_g17_commit_stop, c);
 	if (ret)
 		goto err;
-	if (quiet)
-		apple_rtkit_hold_rx(rtk);
 	apple_sleep_coproc_set_ready(dev, true);
 
 	return c;
