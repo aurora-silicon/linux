@@ -17,10 +17,10 @@ this is not GPU execution. Checks:
   match the pool before linux#1978 (BASE) on the same random operations.
 - Source rules: every accessor that hands the address to the firmware marks it,
   and only the release path of `retain_linked_work` marks it released.
-- Cache policy (linux#3170 and its G17P follow-up): records the host rewrites
+- Cache policy (linux#3170 and follow-ups): records the host rewrites
   in place (render queue records, the compute graph, M5 scheduler pages) stay
-  uncached on every G17; work nodes and compute descriptors are uncached on M5
-  and keep their firmware-cached prefix on G17P.
+  uncached on every G17; work nodes and compute descriptors keep their
+  firmware-cached prefix on every G17 (G17P and M5).
 
 `--mutation` applies one known-bad change to the compiled copy; the run must
 then fail.
@@ -51,14 +51,17 @@ MUTATIONS = {
     'node-unmarked': ('context', '        self.context.expose_work();\n', ''),
     # A consumed release with an empty list does not mark the work state.
     'no-release': ('context', 'mark.released(super::channel::control_witnessed());', 'let _ = mark;'),
-    # M5 work nodes are firmware-cached again.
-    'm5-cached-nodes': ('policy-context', 'if alloc.uat.is_m5() { 0 } else { UAT_PGSZ }', 'UAT_PGSZ'),
-    # M5 compute descriptors are firmware-cached again.
-    'm5-cached-descriptors': ('policy-compute', 'if alloc.uat.is_m5() { 0 } else { size }', 'size'),
+    # Work nodes lose their firmware-cached prefix (the linux#3170 light-submission cost).
+    'uncached-nodes': ('policy-context', 'Family::WorkState,\n            2 * UAT_PGSZ,\n            UAT_PGSZ,',
+                       'Family::WorkState,\n            2 * UAT_PGSZ,\n            0,'),
+    # Compute descriptors lose their firmware-cached prefix.
+    'uncached-descriptors': ('policy-compute', 'Family::Descriptor,\n            size,\n            size,',
+                             'Family::Descriptor,\n            size,\n            0,'),
     # Render queue records, which the host retargets in place, are firmware-cached again.
     'cached-queue-records': ('policy-memory', 'GRAPH_SIZE,\n            0,\n', 'GRAPH_SIZE,\n            0x8000,\n'),
-    # G17P work nodes lose their cached prefix (the linux#3170 light-submission cost).
-    'uncached-g17p-nodes': ('policy-context', 'if alloc.uat.is_m5() { 0 } else { UAT_PGSZ }', '0'),
+    # M5 scheduler pages, which are zeroed and reinitialised on reuse, are firmware-cached again.
+    'cached-scheduler': ('policy-context', 'Family::Scheduler,\n                UAT_PGSZ,\n                0,',
+                         'Family::Scheduler,\n                UAT_PGSZ,\n                UAT_PGSZ,'),
 }
 
 
@@ -839,14 +842,13 @@ def cache_policy(context, compute, memory):
         if not re.search(pattern, text):
             failures.append(what)
 
-    # Work nodes: uncached on M5, the node page cached on G17P; the counter page stays uncached.
-    need(context, r'pool\.allocate\(\s*alloc,\s*Family::WorkState,\s*2 \* UAT_PGSZ,\s*'
-         r'if alloc\.uat\.is_m5\(\) \{ 0 \} else \{ UAT_PGSZ \},', 'work nodes: M5 uncached, G17P node page cached')
+    # Work nodes: the node page is cached on every G17; the counter page stays uncached.
+    need(context, r'pool\.allocate\(\s*alloc,\s*Family::WorkState,\s*2 \* UAT_PGSZ,\s*UAT_PGSZ,',
+         'work nodes: node page cached')
     # M5 scheduler pages, which are zeroed and reinitialised on reuse, stay uncached.
     need(context, r'Family::Scheduler,\s*UAT_PGSZ,\s*0,', 'M5 scheduler pages uncached')
-    # Compute descriptors: uncached on M5, cached on G17P.
-    need(compute, r'Family::Descriptor,\s*size,\s*if alloc\.uat\.is_m5\(\) \{ 0 \} else \{ size \},',
-         'compute descriptors: M5 uncached, G17P cached')
+    # Compute descriptors: cached on every G17.
+    need(compute, r'Family::Descriptor,\s*size,\s*size,', 'compute descriptors cached')
     # The compute graph, whose queue record is rebound in place, is an ordinary uncached allocation.
     need(compute, r'let mut graph = alloc\.kernel\(GRAPH_SIZE \+ mmu::UAT_PGSZ, page, prot, cpu\)\?;',
          'compute graph uncached')
@@ -881,7 +883,7 @@ def main():
     if failures:
         return 1
     print('cache policy: in-place rewritten records uncached everywhere; work nodes and compute descriptors '
-          'uncached on M5 and cached on G17P')
+          'cached on every G17')
     if args.mutation and MUTATIONS[args.mutation][0].startswith('policy-'):
         return 0
 

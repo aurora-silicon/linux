@@ -313,18 +313,18 @@ impl Context {
         let scheduler_generation = super::ids::OBJECTS.object()?;
         let scheduler = Arc::new(scheduler, GFP_KERNEL)?;
         // Both firmware and host write work nodes (reused every 63 submissions
-        // and zeroed on pool reuse). M5 keeps the whole work-state object
-        // uncached. G17P maps the node page firmware-cached: the host rewrites
-        // a node only after `WorkStorage::drained` has read the firmware's
-        // final `completed` count from memory, and zeroes a returned object
-        // only once its pool fence is met, so it never rewrites a node the
-        // firmware is still updating. The counter page, which the host writes
-        // on every kick, stays uncached.
+        // and zeroed on pool reuse). Map the node page firmware-cached on all
+        // G17 (G17P and M5): the host rewrites a node only after
+        // `WorkStorage::drained` has read the firmware's final `completed`
+        // count from memory, and zeroes a returned object only once its pool
+        // fence is met, so it never rewrites a node the firmware is still
+        // updating. The counter page, which the host writes on every kick,
+        // stays uncached.
         let mut object = pool.allocate(
             alloc,
             Family::WorkState,
             2 * UAT_PGSZ,
-            if alloc.uat.is_m5() { 0 } else { UAT_PGSZ },
+            UAT_PGSZ,
             kernel_prot,
             CpuMap::WriteCombined,
         )?;
