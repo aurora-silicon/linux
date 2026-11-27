@@ -153,7 +153,8 @@ struct WaitTarget {
 /// Zero-fault M4 J773g runs (13,873 `fs2c` and 20,506 `c2ta` type-0 handoffs) confirm no GPU
 /// wedge or hang. Which stamp a wait uses is chosen at its site: a producer's `fw_stamp`,
 /// stored at `FINALIZE`, does not yet make its writes visible to work on another firmware
-/// queue, so waits on compute use `ComputeGraph::service_stamp_va` (linux#3349).
+/// queue, so waits on compute use `ComputeGraph::service_stamp_va` (linux#3349) and waits on
+/// a render's FS use `RenderGraph::fs_service_stamp_va`.
 ///
 /// Keep `BarrierType::Hold` (type 1) whenever either producer or consumer carries `InitBM`
 /// (checked against both the waited target and any live `InitBM` flight). Cross-VM switches,
@@ -3536,14 +3537,14 @@ impl Firmware {
             // Check producer InitBM explicitly in addition to the scheduler drain guard so
             // FS -> CDM handoff: downgrade to `BarrierType::Stamp` (type 0) only when neither
             // the waited render nor any live flight carries `InitBM` and the GPU does not need
-            // G15's cross-engine hold; G16 FS `FINALIZE` flushes caches before advancing
-            // `fw_stamp[1]` (see `cross_engine_barrier_type`).
+            // G15's cross-engine hold (see `cross_engine_barrier_type`). Compute may read what
+            // the render wrote: wait for the FS service stamp, not its FINALIZE `fw_stamp[1]`.
             let producer_initbm = self.cfg.cross_engine_hold
                 || wait_fs.initbm
                 || self.engine.flights.iter().any(|fl| fl.initbm);
             let bar_type = cross_engine_barrier_type(producer_initbm, false);
             let bar = encode::barrier(
-                self.graph.render.fw_stamp[1].va,
+                self.graph.render.fs_service_stamp_va(),
                 wait_fs.stamp,
                 0x71,
                 target,

@@ -364,6 +364,14 @@ impl RenderGraph {
         }
         Ok(())
     }
+
+    /// The FS queue's terminal service-stamp cell, stored after the firmware has serviced a
+    /// pass's FS record, later than `fw_stamp[1]` (`FINALIZE`). Work on another firmware queue
+    /// that reads what a render wrote waits on this cell, as it does for compute
+    /// ([`ComputeGraph::service_stamp_va`]). Retirement waits for the same cell.
+    pub(crate) fn fs_service_stamp_va(&self) -> u64 {
+        self.notifier.va + notifier_page::FS_STAMP as u64
+    }
 }
 
 /// Session-side queue graph allocations before sealing the session allocator and attaching

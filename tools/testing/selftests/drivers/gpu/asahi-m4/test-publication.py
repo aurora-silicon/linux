@@ -88,6 +88,15 @@ assert 'render_bar,' in c2ta_slice and 'BarrierType::Hold' not in c2ta_slice
 assert 'render_bar,' in c2fs_slice and 'BarrierType::Hold' not in c2fs_slice
 assert 'BarrierType::Stamp,' in prefix_render_fn[prefix_render_fn.index('let own = encode::barrier'):prefix_render_fn.index('p.own_barrier.write')]
 assert 'cross_engine_barrier_type(producer_initbm, false)' in fs2c_slice
+# Render->compute (fs2c) waits on the render FS service stamp, not FINALIZE fw_stamp[1].
+fs2c_bar = prefix_compute_fn[
+    prefix_compute_fn.index('let fs2c_bar ='):prefix_compute_fn.index('s.barrier.write(0, &bar)?;')
+]
+assert 'self.graph.render.fs_service_stamp_va(),' in fs2c_bar, fs2c_bar
+assert 'fw_stamp[1].va' not in fs2c_bar, fs2c_bar
+render_service_fn = graph_src[graph_src.index('pub(crate) fn fs_service_stamp_va(&self) -> u64 {'):]
+render_service_fn = render_service_fn[:render_service_fn.index('\n    }\n') + 6]
+assert 'self.notifier.va + notifier_page::FS_STAMP as u64' in render_service_fn, render_service_fn
 assert 'bar_type,' in fs2c_slice and 'BarrierType::Hold' not in fs2c_slice
 assert 'let waits_for_timestamps = c.query_access' in can_queue_behind_fn
 assert 'DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2' in params_src
