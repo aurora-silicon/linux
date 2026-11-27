@@ -882,6 +882,7 @@
 			reg = <0x04 0x12000000 0x00 0x20000>;
 			interrupts = <0x00 0x00 0x604 0x04>;
 			#iommu-cells = <0x01>;
+			power-domains = <&ps_apcie_sys_gp>;
 			status = "okay";
 		};
 
@@ -890,6 +891,7 @@
 			reg = <0x04 0x10000000 0x00 0x20000>;
 			interrupts = <0x00 0x00 0x5f4 0x04>;
 			#iommu-cells = <0x01>;
+			power-domains = <&ps_apcie_sys_gp>;
 			status = "disabled";
 		};
 
@@ -898,6 +900,7 @@
 			reg = <0x04 0x13000000 0x00 0x20000>;
 			interrupts = <0x00 0x00 0x60c 0x04>;
 			#iommu-cells = <0x01>;
+			power-domains = <&ps_apcie_sys_gp>;
 			status = "okay";
 		};
 
@@ -2517,14 +2520,15 @@
 				status = "disabled";
 			};
 
-			power-controller@118 {
+			ps_apcie_gp: power-controller@118 {
 				compatible = "apple,t6050-pmgr-pwrstate" ,
 					"apple,t8103-pmgr-pwrstate" ;
 				reg = <0x118 0x04>;
 				#power-domain-cells = <0x00>;
 				#reset-cells = <0x00>;
 				label = "apcie-gp";
-				status = "disabled";
+				apple,firmware-owned;
+				status = "okay";
 			};
 
 			power-controller@120 {
@@ -2557,7 +2561,7 @@
 				status = "disabled";
 			};
 
-			power-controller@138 {
+			ps_fab6_soc: power-controller@138 {
 				compatible = "apple,t6050-pmgr-pwrstate" ,
 					"apple,t8103-pmgr-pwrstate" ;
 				reg = <0x138 0x04>;
@@ -2565,7 +2569,8 @@
 				#reset-cells = <0x00>;
 				label = "fab6-soc";
 				power-domains = <&{/soc/power-management@280600000/power-controller@1d8}>;
-				status = "disabled";
+				apple,firmware-owned;
+				status = "okay";
 			};
 
 			power-controller@140 {
@@ -2579,16 +2584,16 @@
 				status = "disabled";
 			};
 
-			power-controller@148 {
+			ps_apcie_sys_gp: power-controller@148 {
 				compatible = "apple,t6050-pmgr-pwrstate" ,
 					"apple,t8103-pmgr-pwrstate" ;
 				reg = <0x148 0x04>;
 				#power-domain-cells = <0x00>;
 				#reset-cells = <0x00>;
 				label = "apcie-sys-gp";
-				power-domains = <&{/soc/power-management@280900000/power-controller@118}
-					&{/soc/power-management@280900000/power-controller@138}>;
-				status = "disabled";
+				power-domains = <&ps_apcie_gp>, <&ps_fab6_soc>;
+				apple,firmware-owned;
+				status = "okay";
 			};
 
 			power-controller@150 {
@@ -3421,6 +3426,7 @@
 			reg = <0x04 0x11000000 0x00 0x20000>;
 			interrupts = <0x00 0x00 0x5fc 0x04>;
 			#iommu-cells = <0x01>;
+			power-domains = <&ps_apcie_sys_gp>;
 			status = "disabled";
 		};
 
