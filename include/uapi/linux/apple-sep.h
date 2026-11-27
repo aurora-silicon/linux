@@ -55,6 +55,9 @@ struct sep_bio_info {
 
 /* reserved[0] flags; reserved[1] is a live SEP identity count only when valid. */
 #define SEP_BIO_INFO_LIVE_COUNT_VALID 1u
+/* SEP_BIO_VERIFY_START takes SEP_BIO_VERIFY_ACCOUNT (only where per-user
+ * key bags are supported). */
+#define SEP_BIO_INFO_VERIFY_ACCOUNT   2u
 
 struct sep_bio_list {
 	__u32 count;
@@ -111,9 +114,26 @@ struct sep_bio_enrol_poll {
 	__u32 progress_percent;
 };
 
+/*
+ * flags SEP_BIO_VERIFY_ACCOUNT: 'account_uid' is the resolved Unix account the
+ * match is for. While that account's own key bag is loaded and unlocked by
+ * its password, the match runs against that user's own templates; while it
+ * is loaded but locked, the verify fails and the password is needed. With
+ * no loaded bag, or without the flag, the built-in Linux user matches.
+ *
+ * In an account's own domain Touch ID's gates are that account's: its
+ * failed attempts (a finger that matches only another account is a miss for
+ * it), the lockout after five of them, and, once SEP_BIO_REQUIRE_PASSWORD was
+ * called this boot, the wait for its own first password. A refusal is
+ * SEP_BIO_STATUS_LOCKOUT, as for the configured user. The account's bag
+ * password (its unlock) clears its state and no other; SEP_BIO_LOCKOUT_STATE
+ * and SEP_BIO_REARM report and clear only the configured user's.
+ */
+#define SEP_BIO_VERIFY_ACCOUNT 1u
+
 struct sep_bio_verify_start {
 	__u32 flags;
-	__u32 reserved;
+	__u32 account_uid; /* with SEP_BIO_VERIFY_ACCOUNT, else 0 */
 	__u8  nonce[SEP_BIO_NONCE_LEN];
 };
 
@@ -525,7 +545,9 @@ struct sep_keybag_change {
  * A user's wrapped bag, for userspace to keep across reboots (as macOS
  * saves it). It holds no secret: it opens only with the user's password,
  * on this Mac. EXPORT copies the designated bag; IMPORT loads a saved one
- * and designates it again, locked until SEP_BIO_KEYBAG_UNLOCK.
+ * and designates it again, locked until SEP_BIO_KEYBAG_UNLOCK. IMPORT of a
+ * bag the driver still holds (locked, or open for another session) is
+ * EBUSY: unlock it instead.
  */
 #define SEP_KEYBAG_BLOB_MAX 4096
 

@@ -1664,6 +1664,15 @@ impl SepData {
         // with each other, and with every other touch-gated call: one job,
         // one grant, one context at a time.
         let _writer = self.catacomb_writer.lock();
+        // A key under a user's bag is matched in that user's domain, and
+        // only after its password unlocked the bag.
+        let _subject = match job.grant.as_ref().and_then(|g| g.bag()) {
+            Some(uid) => match self.userbag_touch_subject(uid)? {
+                Some(subject) => Some(crate::SubjectScope::new(self, subject)),
+                None => None,
+            },
+            None => None,
+        };
         *self.key_touch.lock() = Some(job);
         self.key_touch_cancel.store(false, Relaxed);
         self.key_touch_active.store(true, Relaxed);
@@ -1767,7 +1776,7 @@ impl SepData {
     /// A fresh tracked context for `uid`; with `secret`, a passcode
     /// credential from `bag`'s verify-secret is added. Returns the context
     /// and the verify status (0 when none was asked).
-    fn key_context_for(
+    pub(crate) fn key_context_for(
         &self,
         uid: i32,
         cred: Option<(crate::sks::SpecialHandle, &[u8])>,
@@ -2334,7 +2343,8 @@ impl SepData {
         }
         let user = UserPtr::from_addr(arg);
         match read_request(cmd, arg)? {
-            KeyRequest::Info => write_user(user, &info_for(self.profile.key_store == crate::profile::KeyStore::Variant5)),
+            // Password keys live in per-user bags (see `userbag`).
+            KeyRequest::Info => write_user(user, &info_for(self.profile.per_user_keybags())),
             KeyRequest::Create(mut req, policy) => {
                 may_create_machine_key(crate::shim::capable_admin(), crate::shim::current_euid())?;
                 let (acl, flags) = match policy {
