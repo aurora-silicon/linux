@@ -56,6 +56,7 @@ extern "C" {
     fn asahi_g16_sleep_note(step: u8);
     fn apple_rtkit_resume_rx(rtk: *mut bindings::apple_rtkit);
     fn apple_rtkit_set_recv_enabled(rtk: *mut bindings::apple_rtkit, enabled: bool);
+    fn apple_rtkit_wake_iop_on(rtk: *mut bindings::apple_rtkit) -> core::ffi::c_int;
     fn asahi_g17_commit_finish(commit: *mut core::ffi::c_void, saved: *mut u32) -> bool;
     fn asahi_g17_power_auto_off(dev: *mut core::ffi::c_void, saved: *mut u32) -> core::ffi::c_int;
     fn asahi_g17_power_lower(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
@@ -75,8 +76,8 @@ impl Firmware {
     }
 
     /// Wakes firmware the stop idled and nothing reset (a sleep that didn't reach the
-    /// hardware): the mailbox's receive and its interrupt back on, then IOP and AP on, with the
-    /// RTKit session as it was. No GFX write and nothing on the ASC's page.
+    /// hardware): the mailbox's receive and its interrupt back on, then IOP ON and AP on, with
+    /// the RTKit session as it was (J516s: it didn't acknowledge IOP INIT). No GFX write and nothing on the ASC's page.
     fn sleep_wake_idle(&mut self) -> Result {
         self.pools.invalidate();
         let rtk = self.session.rtkit.as_raw();
@@ -86,7 +87,8 @@ impl Firmware {
             apple_rtkit_resume_rx(rtk);
         }
         note(0x3a);
-        let result = self.session.rtkit.wake();
+        // SAFETY: The RTKit handle lasts until reboot.
+        let result = kernel::error::to_result(unsafe { apple_rtkit_wake_iop_on(rtk) });
         note(if result.is_ok() { 0x3b } else { 0x3e });
         result
     }
