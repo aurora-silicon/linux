@@ -306,3 +306,15 @@
 &smc_pcio {
 	apple,output-commands = /bits/ 64 <0x001a000000000000 0x000f000000800000 0x011c000000010000>;
 };
+
+/*
+ * Port 0's power: the ADT's apcie0 power-gates are APCIE_GP (137), APCIE_SYS_GP (143) and the
+ * fabric; APCIE_SYS_GP sits on APCIE_GP and FAB6_SOC. Its DART (dart-apcie0, which the N1 uses
+ * through the host's iommu-map) takes APCIE_SYS_GP, as the T600x/T602x PCIe DARTs do. The loader
+ * trains port 0 and keeps it powered for the hand-off, so these stay firmware-owned
+ * (enabled in t6050-k114-k116-usb.dtsi, which boards include after t6050-peripherals.dtsi).
+ */
+&dart_apcie0 {
+	power-domains = <&ps_apcie_sys_gp>;
+};
+

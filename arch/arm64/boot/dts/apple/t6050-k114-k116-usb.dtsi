@@ -180,3 +180,19 @@
 		};
 	};
 };
+
+/* PCIe port 0's power states, used by pcie0 and dart_apcie0 (see t6050-k114-k116.dtsi) */
+&ps_fab6_soc {
+	apple,firmware-owned;
+	status = "okay";
+};
+
+&ps_apcie_gp {
+	apple,firmware-owned;
+	status = "okay";
+};
+
+&ps_apcie_sys_gp {
+	apple,firmware-owned;
+	status = "okay";
+};
