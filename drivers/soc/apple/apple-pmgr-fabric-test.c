@@ -360,10 +360,10 @@ static void pf_idle_lowers_test(struct kunit *test)
 	apple_pmgr_idle_eval(misc);
 	KUNIT_EXPECT_EQ(test, readl(f->fabric), 0xa5000071U);
 	KUNIT_EXPECT_EQ(test, misc->fabric_now, 1U);
-	/* At the lowest idle state, deferrable work gives 0 Hz idle wakeups. */
-	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&misc->idle_work));
-	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&misc->idle_work_prompt));
-	cancel_delayed_work_sync(&misc->idle_work);
+	/* Lowered: prompt non-deferrable work guarantees a bounded raise. */
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&misc->idle_work));
+	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&misc->idle_work_prompt));
+	cancel_delayed_work_sync(&misc->idle_work_prompt);
 
 	/* Already low: no second write. */
 	writel(0xa5000011, f->fabric);
@@ -383,8 +383,6 @@ static void pf_idle_blockers_test(struct kunit *test)
 	unsigned int b;
 
 	for (b = 0; b < PF_BLOCKERS; b++) {
-		bool static_blocker = b == PF_PMP || b == PF_NO_VOTERS || b == PF_IDLE_HIGH;
-
 		WRITE_ONCE(idle_fabric_pstate, 1);
 		misc->holds = b == PF_HOLD;
 		misc->dcs_bw_active = b == PF_DCS_BW;
@@ -404,19 +402,11 @@ static void pf_idle_blockers_test(struct kunit *test)
 			KUNIT_EXPECT_EQ_MSG(test, readl(f->fabric), PF_DEFAULT, "blocker %u", b);
 			KUNIT_EXPECT_EQ_MSG(test, misc->fabric_now, 7U, "blocker %u", b);
 		}
-		if (static_blocker) {
-			KUNIT_EXPECT_TRUE_MSG(test, delayed_work_pending(&misc->idle_work),
-					      "blocker %u", b);
-			KUNIT_EXPECT_FALSE_MSG(test, delayed_work_pending(&misc->idle_work_prompt),
-					       "blocker %u", b);
-			cancel_delayed_work_sync(&misc->idle_work);
-		} else {
-			KUNIT_EXPECT_TRUE_MSG(test, delayed_work_pending(&misc->idle_work_prompt),
-					      "blocker %u", b);
-			KUNIT_EXPECT_FALSE_MSG(test, delayed_work_pending(&misc->idle_work),
-					       "blocker %u", b);
-			cancel_delayed_work_sync(&misc->idle_work_prompt);
-		}
+		KUNIT_EXPECT_TRUE_MSG(test, delayed_work_pending(&misc->idle_work),
+				      "blocker %u", b);
+		KUNIT_EXPECT_FALSE_MSG(test, delayed_work_pending(&misc->idle_work_prompt),
+				       "blocker %u", b);
+		cancel_delayed_work_sync(&misc->idle_work);
 	}
 }
 
@@ -633,13 +623,13 @@ static void pf_t8103_gpu_tracking_and_dcs_valid_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, pf_step_log[2], 3U);
 	KUNIT_EXPECT_EQ(test, pf_step_log[3], 2U);
 	KUNIT_EXPECT_EQ(test, pf_step_log[4], 1U);
-	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&misc->idle_work));
-	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&misc->idle_work_prompt));
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&misc->idle_work));
+	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&misc->idle_work_prompt));
 
 	/*
 	 * GPU busy 0 -> 1 edge never takes misc->lock or slams (4, 6)
-	 * synchronously; it cancels deferrable idle_work and kicks
-	 * idle_work_prompt while recording duty cycle.
+	 * synchronously; it pulls idle_work_prompt in immediately while
+	 * recording duty cycle.
 	 */
 	scoped_guard(mutex, &misc->lock) {
 		KUNIT_EXPECT_EQ(test, apple_pmgr_gpu_busy_get(), 0);
@@ -836,7 +826,7 @@ static void pf_tiered_eval_order_and_timers_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&misc->idle_work_prompt));
 	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&misc->idle_work));
 
-	/* Quiet another 500 ms -> demote LIGHT (2,4) -> IDLE (1,4); deferrable timer armed. */
+	/* Quiet another 500 ms -> demote LIGHT (2,4) -> IDLE (1,4); bounded prompt poll armed. */
 	pf_step_cnt = 0;
 	apple_pmgr_tiered_eval(misc, PF_MS(1000));
 	KUNIT_EXPECT_EQ(test, misc->gov.tier, APPLE_PMGR_TIER_IDLE);
@@ -844,8 +834,8 @@ static void pf_tiered_eval_order_and_timers_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, misc->dcs_now, 4U);
 	KUNIT_EXPECT_EQ(test, pf_step_cnt, 1U);
 	KUNIT_EXPECT_EQ(test, pf_step_log[0], 1U);
-	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&misc->idle_work));
-	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&misc->idle_work_prompt));
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&misc->idle_work));
+	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&misc->idle_work_prompt));
 
 	/* Light E-core activity promotes IDLE (1,4) -> LIGHT (2,4) without touching DCS. */
 	f->sample = (struct apple_pmgr_gov_sample){ .e_max = 20, .e_sum = 35 };

@@ -193,8 +193,8 @@ struct apple_pmgr_misc {
 
 	/* Fabric/DCS governor; lock serializes writes and governor state. */
 	struct mutex lock;
-	struct delayed_work idle_work;		/* deferrable: at IDLE tier */
-	struct delayed_work idle_work_prompt;	/* prompt: at active tiers */
+	struct delayed_work idle_work;		/* deferrable: fabric high / held */
+	struct delayed_work idle_work_prompt;	/* bounded raise: fabric/DCS lowered */
 	u32 fabric_now;				/* protected by lock */
 	u32 dcs_now;				/* protected by lock */
 	unsigned int holds;			/* protected by lock */
@@ -1129,11 +1129,12 @@ int apple_pmgr_gpu_busy_get(void)
 
 			/*
 			 * Not cancel_delayed_work_sync: callers may hold
-			 * locks or run in atomic context.
+			 * locks or run in atomic context. Pull in both a
+			 * deferrable wait and a longer IDLE-tier poll.
 			 */
-			if (cancel_delayed_work(&misc->idle_work))
-				queue_delayed_work(system_freezable_power_efficient_wq,
-						   &misc->idle_work_prompt, 0);
+			cancel_delayed_work(&misc->idle_work);
+			mod_delayed_work(system_freezable_power_efficient_wq,
+					 &misc->idle_work_prompt, 0);
 		}
 	}
 	spin_unlock_irqrestore(&apple_pmgr_gpu.lock, flags);
@@ -1363,6 +1364,8 @@ static void apple_pmgr_queue_work(struct apple_pmgr_misc *misc,
 				  bool deferrable, unsigned int delay_ms)
 {
 	unsigned long delay = msecs_to_jiffies(delay_ms);
+	unsigned long flags;
+	bool gpu_busy;
 
 	lockdep_assert_held(&misc->lock);
 	/*
@@ -1371,29 +1374,32 @@ static void apple_pmgr_queue_work(struct apple_pmgr_misc *misc,
 	 * cross-requeue between idle_work and idle_work_prompt.
 	 */
 	if (deferrable) {
-		unsigned long flags;
-		bool gpu_busy;
-
 		cancel_delayed_work(&misc->idle_work_prompt);
 		/*
 		 * Serialize with apple_pmgr_gpu_busy_get() so a 0 -> 1 GPU
-		 * edge racing with this idle re-arm cannot leave deferrable
-		 * work pending while GPU work is in flight.
+		 * edge racing with this re-arm cannot leave deferrable work
+		 * pending while GPU work is in flight.
 		 */
 		spin_lock_irqsave(&apple_pmgr_gpu.lock, flags);
 		gpu_busy = atomic_read(&apple_pmgr_gpu_tracked) > 0 &&
 			   apple_pmgr_gpu.busy_count > 0;
 		if (gpu_busy)
-			queue_delayed_work(system_freezable_power_efficient_wq,
-					   &misc->idle_work_prompt, 0);
+			mod_delayed_work(system_freezable_power_efficient_wq,
+					 &misc->idle_work_prompt, 0);
 		else
 			queue_delayed_work(system_freezable_power_efficient_wq,
 					   &misc->idle_work, delay);
 		spin_unlock_irqrestore(&apple_pmgr_gpu.lock, flags);
 	} else {
 		cancel_delayed_work(&misc->idle_work);
-		queue_delayed_work(system_freezable_power_efficient_wq,
-				   &misc->idle_work_prompt, delay);
+		spin_lock_irqsave(&apple_pmgr_gpu.lock, flags);
+		gpu_busy = atomic_read(&apple_pmgr_gpu_tracked) > 0 &&
+			   apple_pmgr_gpu.busy_count > 0;
+		if (gpu_busy && delay_ms > APPLE_PMGR_TIER_SAMPLE_MS)
+			delay = 0;
+		mod_delayed_work(system_freezable_power_efficient_wq,
+				 &misc->idle_work_prompt, delay);
+		spin_unlock_irqrestore(&apple_pmgr_gpu.lock, flags);
 	}
 }
 
@@ -1448,8 +1454,18 @@ static void apple_pmgr_tiered_eval(struct apple_pmgr_misc *misc, u64 now)
 	tier = apple_pmgr_gov_step(&misc->gov, &misc->gov_cfg, now, &sample);
 	apple_pmgr_tier_targets(misc, tier, idle_fab, idle_dcs, &target_fab, &target_dcs);
 	ret = apple_pmgr_apply_targets(misc, target_fab, target_dcs);
-	apple_pmgr_queue_work(misc, tier == APPLE_PMGR_TIER_IDLE && !ret,
-			      APPLE_PMGR_TIER_SAMPLE_MS);
+	/*
+	 * Keep a non-deferrable poll whenever fabric or DCS is lowered so hard
+	 * voters (avd_sys, isp_sys, venc_sys) and cross-core CPU load are
+	 * raised within a bounded window; FULL under a hard override stays
+	 * deferrable since fabric/DCS are already at max and cannot demote.
+	 */
+	if (tier == APPLE_PMGR_TIER_IDLE && !ret)
+		apple_pmgr_queue_work(misc, false, APPLE_PMGR_IDLE_POLL_MS);
+	else if (tier == APPLE_PMGR_TIER_FULL && hard_override && !ret)
+		apple_pmgr_queue_work(misc, true, APPLE_PMGR_IDLE_POLL_MS);
+	else
+		apple_pmgr_queue_work(misc, false, APPLE_PMGR_TIER_SAMPLE_MS);
 }
 
 static void apple_pmgr_idle_eval(struct apple_pmgr_misc *misc)
@@ -1462,8 +1478,8 @@ static void apple_pmgr_idle_eval(struct apple_pmgr_misc *misc)
 	bool idle_ok = false;
 	bool low_fab = false;
 	bool low_dcs = false;
+	bool lowered;
 	u32 target_fab, target_dcs;
-	int ret;
 
 	if (misc->tiered_scaling) {
 		apple_pmgr_tiered_eval(misc, ktime_get_ns());
@@ -1486,19 +1502,20 @@ static void apple_pmgr_idle_eval(struct apple_pmgr_misc *misc)
 		low_dcs = can_scale_dcs && idle_ok;
 		target_fab = low_fab ? idle_fab : active_fab;
 		target_dcs = low_dcs ? idle_dcs : active_dcs;
-		ret = apple_pmgr_apply_targets(misc, target_fab, target_dcs);
+		apple_pmgr_apply_targets(misc, target_fab, target_dcs);
 		if (!idle_fab && !idle_dcs)
 			return;
 		/*
-		 * Deferrable at the lowest state (or when lowering is disabled)
-		 * for 0 Hz idle wakeups; prompt while active so demotion is
-		 * timely once load subsides.
+		 * Keep a non-deferrable poll while fabric or DCS is lowered so
+		 * hard voters and cross-core CPU load are raised within a
+		 * bounded window; stay deferrable when at active p-states.
 		 */
-		apple_pmgr_queue_work(misc,
-				      ((low_fab || low_dcs) && !ret) ||
-				      misc->pmp_owned || !misc->voters_ok ||
-				      (!can_scale_fab && !can_scale_dcs),
-				      APPLE_PMGR_IDLE_POLL_MS);
+		lowered = !misc->pmp_owned &&
+			  ((misc->fabric_now != U32_MAX &&
+			    misc->fabric_now < active_fab) ||
+			   (misc->dcs_now != U32_MAX &&
+			    misc->dcs_now < active_dcs));
+		apple_pmgr_queue_work(misc, !lowered, APPLE_PMGR_IDLE_POLL_MS);
 	}
 }
 
