@@ -1634,6 +1634,74 @@ static void ave_t8112_26b123_build(struct kunit *test)
 }
 
 /*
+ * The probe's firmware gate: the segment sizes pick the build, and the TEXT
+ * identity CRC must be a known one that is that build's own.
+ */
+static void ave_fw_admit_gate(struct kunit *test)
+{
+	/* Two builds of the same sizes, told apart by their CRCs. */
+	static const struct ave_fw_build shared_builds[] = {
+		{ "a", 0x10000, 0x20000, 0x460c7a7c },
+		{ "b", 0x10000, 0x20000, 0x25bfd039 },
+	};
+	static const struct ave_variant shared = {
+		.builds = shared_builds,
+		.build_count = ARRAY_SIZE(shared_builds),
+		.boot_qualified = true,
+	};
+	const struct ave_variant *m2_272 = ave_t8112.next_build;
+	const struct ave_fw_build *b;
+
+	/* A variant without builds[] takes its own sizes and CRC only. */
+	b = shared_builds;
+	KUNIT_EXPECT_EQ(test, ave_fw_admit(&ave_t8112, 0xd0000, 0x128000,
+					   0x25bfd039, &b), 0);
+	KUNIT_EXPECT_NULL(test, b);
+	KUNIT_EXPECT_EQ(test, ave_fw_admit(&ave_t8112, 0xd0000, 0x128000,
+					   0x460c7a7c, &b), -ENODEV);
+	KUNIT_EXPECT_EQ(test, ave_fw_admit(&ave_t8112, 0xd0000, 0x128000,
+					   0x25bfd038, &b), -ENODEV);
+	KUNIT_EXPECT_EQ(test, ave_fw_admit(&ave_t8112, 0xd0000, 0x12c000,
+					   0x25bfd039, &b), -EINVAL);
+
+	/* Builds of the same sizes: the CRC picks one and must be one of them. */
+	KUNIT_EXPECT_EQ(test, ave_fw_admit(&shared, 0x10000, 0x20000,
+					   0x25bfd039, &b), 0);
+	KUNIT_EXPECT_PTR_EQ(test, b, &shared_builds[1]);
+	KUNIT_EXPECT_EQ(test, ave_fw_admit(&shared, 0x10000, 0x20000,
+					   0x460c7a7c, &b), 0);
+	KUNIT_EXPECT_PTR_EQ(test, b, &shared_builds[0]);
+	KUNIT_EXPECT_EQ(test, ave_fw_admit(&shared, 0x10000, 0x20000,
+					   AVE_FW_TEXT_CRC_9003_78_0, &b), -ENODEV);
+
+	/* Each build's CRC only with its own sizes. */
+	KUNIT_EXPECT_EQ(test, ave_fw_admit(&ave_t6050, 0x158000, 0x134000,
+					   AVE_FW_TEXT_CRC_T6050_26C5035, &b), 0);
+	KUNIT_EXPECT_PTR_EQ(test, b, &ave_t6050.builds[1]);
+	KUNIT_EXPECT_EQ(test, ave_fw_admit(&ave_t6050, 0x154000, 0x134000,
+					   AVE_FW_TEXT_CRC_T6050_26C5035, &b), -ENODEV);
+	KUNIT_EXPECT_EQ(test, ave_fw_admit(&ave_t6050, 0x158000, 0x130000,
+					   AVE_FW_TEXT_CRC_T6050_26C5035, &b), -EINVAL);
+	KUNIT_EXPECT_EQ(test, ave_fw_admit(m2_272, 0x11c000, 0x128000,
+					   AVE_FW_TEXT_CRC_T8112_26B123, &b), 0);
+	KUNIT_EXPECT_PTR_EQ(test, b, &m2_272->builds[0]);
+	KUNIT_EXPECT_EQ(test, ave_fw_admit(m2_272, 0x11c000, 0x128000,
+					   0x25bfd039, &b), -ENODEV);
+
+	/* A build that names no CRC takes any known one, never another. */
+	KUNIT_EXPECT_EQ(test, ave_fw_admit(&ave_t6041, 0x14c000, 0x130000,
+					   AVE_FW_TEXT_CRC_T6041_25G83, &b), 0);
+	KUNIT_EXPECT_PTR_EQ(test, b, &ave_t6041.builds[1]);
+	KUNIT_EXPECT_EQ(test, ave_fw_admit(&ave_t6041, 0x14c000, 0x130000,
+					   0x9a080cac, &b), -ENODEV);
+
+	/* The probe-only M3 generation takes any sizes and CRC. */
+	KUNIT_EXPECT_EQ(test, ave_fw_admit(&ave_m3, 0x134000, 0x128000,
+					   0x12345678, &b), 0);
+	KUNIT_EXPECT_NULL(test, b);
+}
+
+/*
  * HEVC B flag with a PPS whose num_extra_slice_header_bits is 2. The PPS
  * comes with the IDR access unit; the B slice after it has two extra bits
  * before slice_type, and reads as an I slice if they are not skipped.
@@ -1747,6 +1815,7 @@ static struct kunit_case ave_abi_cases[] = {
 	KUNIT_CASE(ave_m3_probe_only),
 	KUNIT_CASE(ave_26b123_layout),
 	KUNIT_CASE(ave_t8112_26b123_build),
+	KUNIT_CASE(ave_fw_admit_gate),
 	KUNIT_CASE(ave_hevc_bframe_extra_bits),
 	{}
 };

@@ -587,6 +587,8 @@ int ave_fw_probe(struct ave_dev *ave);
 bool ave_fw_sizes_match(const struct ave_variant *v, size_t text, size_t data);
 const struct ave_variant *ave_fw_select_build(const struct ave_variant *v,
 					      size_t text, size_t data);
+int ave_fw_admit(const struct ave_variant *v, size_t text, size_t data,
+		 u32 crc, const struct ave_fw_build **build);
 int ave_fw_text_id_crc(const void *text, size_t size, u32 cell_off,
 		       u64 data_iova, u32 *crc);
 int ave_fw_text_boot_crc(const void *text, size_t size, u32 word_off,
