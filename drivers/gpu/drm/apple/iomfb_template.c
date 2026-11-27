@@ -300,6 +300,7 @@ struct dcp_wait_cookie {
 	struct completion done;
 	u32 status;
 	bool replied;
+	bool vrr_refused;
 };
 
 static void release_wait_cookie(struct kref *ref)
@@ -4244,13 +4245,20 @@ static void dcp_on_set_adaptive_sync(struct apple_dcp *dcp, void *out,
 				     void *cookie)
 {
 #if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
-	if (!out || get_unaligned_le32(out)) {
-		struct dcp_wait_cookie *wait = cookie;
+	struct dcp_wait_cookie *wait = cookie;
+	u32 st = out ? get_unaligned_le32(out) : ~0U;
 
-		wait->status = -EOPNOTSUPP;
-		complete(&wait->done);
-		kref_put(&wait->refcount, release_wait_cookie);
-		return;
+	if (st) {
+		WRITE_ONCE(wait->vrr_refused, true);
+		if (!dcp_has_panel(dcp)) {
+			wait->status = -EOPNOTSUPP;
+			complete(&wait->done);
+			kref_put(&wait->refcount, release_wait_cookie);
+			return;
+		}
+		dev_warn_once(dcp->dev,
+			      "adaptive sync parameter refused (%#x); keeping fixed refresh\n",
+			      st);
 	}
 #endif
 	dcp_set_digital_out_mode(dcp, false, &dcp->mode,
@@ -4383,7 +4391,8 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	 */
 	keep_mode = dcp->v27_j714s && xchg(&dcp->v27_keep_mode, false) &&
 		    dcp->mode.color_mode_id == mode->color_mode_id &&
-		    dcp->mode.timing_mode_id == mode->timing_mode_id;
+		    dcp->mode.timing_mode_id == mode->timing_mode_id &&
+		    !(mode->vrr && crtc_state->vrr_enabled);
 	/*
 	 * Firmware 27.2: sent once the panel's video interface is open again and the firmware
 	 * has reported the panel, which it does after the open.
@@ -4441,6 +4450,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 
 	if (keep_mode) {
 		dev_info(dcp->dev, "keeping the panel's mode after the sleep\n");
+		WRITE_ONCE(cookie->vrr_refused, true);
 		complete_set_digital_out_mode(dcp, NULL, cookie);
 	} else if ((DCP_INHERIT_BOOT_MODE || DCP_FW_NAME(dcp_fw27_keep_panel_mode)(dcp)) &&
 	    !dcp_is_ext26(dcp) &&
@@ -4448,6 +4458,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL) {
 		dev_info(dcp->dev, "inheriting the bootloader's display mode (%u fixed timing(s))\n",
 			 READ_ONCE(dcp->nr_modes));
+		WRITE_ONCE(cookie->vrr_refused, true);
 		complete_set_digital_out_mode(dcp, NULL, cookie);
 	} else
 #if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
@@ -4536,8 +4547,16 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 		return ret;
 	}
 #endif
+#if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
+	if (!dcp_has_panel(dcp) && !paired && READ_ONCE(cookie->vrr_refused)) {
+		ret = (int)READ_ONCE(cookie->status);
+		kref_put(&cookie->refcount, release_wait_cookie);
+		return ret ?: -EOPNOTSUPP;
+	}
+#endif
+	dcp->vrr_enabled = mode->vrr && crtc_state->vrr_enabled &&
+			   !READ_ONCE(cookie->vrr_refused);
 	kref_put(&cookie->refcount, release_wait_cookie);
-	dcp->vrr_enabled = mode->vrr && crtc_state->vrr_enabled;
 	/* A firmware 27 pair took them on both engines (dcp_peer_finish_v27()). */
 	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL ||
 	    (dcp->fw_compat == DCP_FIRMWARE_V_27_0 && !dcp_has_panel(dcp) && !paired))

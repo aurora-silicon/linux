@@ -586,25 +586,56 @@ static void parser_vrr_empty_range(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, modes[0].min_vrr, 0U);
 	KUNIT_EXPECT_EQ(test, modes[0].max_vrr, 0U);
 	kfree(modes);
-	/* The catalog owner enables this convention only for desktop firmware. */
-	for (desktop = 0; desktop < 2; desktop++) {
-		struct apple_dcp *dcp = kunit_kzalloc(test, sizeof(*dcp), GFP_KERNEL);
-		u64 generation;
+	/*
+	 * The catalog owner enables this convention for desktop 26.6 and
+	 * firmware 27 internal panels only; older firmware and external
+	 * connectors keep fixed timing.
+	 */
+	{
+		static const struct {
+			enum dcp_firmware_version fw;
+			int connector;
+			u32 rate;
+			bool expect_vrr;
+			u32 min_vrr;
+			u32 max_vrr;
+		} cases[] = {
+			{ DCP_FIRMWARE_V_13_5, DRM_MODE_CONNECTOR_eDP,
+			  120U << 16, false, 0, 0 },
+			{ DCP_FIRMWARE_V_26_6_DESKTOP, DRM_MODE_CONNECTOR_eDP,
+			  120U << 16, true, 24U << 16, 120U << 16 },
+			{ DCP_FIRMWARE_V_27_0, DRM_MODE_CONNECTOR_eDP,
+			  120U << 16, true, 24U << 16, 120U << 16 },
+			{ DCP_FIRMWARE_V_27_0, DRM_MODE_CONNECTOR_eDP,
+			  60U << 16, false, 0, 0 },
+			{ DCP_FIRMWARE_V_27_0, DRM_MODE_CONNECTOR_DisplayPort,
+			  120U << 16, false, 0, 0 },
+		};
 
-		KUNIT_ASSERT_NOT_NULL(test, dcp);
-		parser_modes_init(dcp);
-		dcp->fw_compat = desktop ? DCP_FIRMWARE_V_26_6_DESKTOP :
-			DCP_FIRMWARE_V_13_5;
-		dcp->fixed_connector_type = DRM_MODE_CONNECTOR_eDP;
-		KUNIT_ASSERT_EQ(test, parse(blob->data, blob->size, &ctx), 0);
-		ctx.dcp = &parser_dcp;
-		generation = dcp_modes_transfer_begin(dcp);
-		KUNIT_ASSERT_EQ(test, dcp_modes_replace(dcp, &ctx, generation), 0);
-		KUNIT_ASSERT_EQ(test, dcp->nr_modes, 1U);
-		KUNIT_EXPECT_EQ(test, dcp->modes[0].vrr, !!desktop);
-		KUNIT_EXPECT_EQ(test, dcp->modes[0].min_vrr, desktop ? 24U << 16 : 0U);
-		KUNIT_EXPECT_EQ(test, dcp->modes[0].max_vrr, desktop ? 120U << 16 : 0U);
-		kfree(dcp->modes);
+		for (desktop = 0; desktop < ARRAY_SIZE(cases); desktop++) {
+			struct apple_dcp *dcp = kunit_kzalloc(test, sizeof(*dcp), GFP_KERNEL);
+			struct parser_blob *case_blob;
+			u64 generation;
+
+			KUNIT_ASSERT_NOT_NULL(test, dcp);
+			record.rate = cases[desktop].rate;
+			case_blob = make_blob(test, &record, 1);
+			KUNIT_ASSERT_NOT_NULL(test, case_blob);
+			parser_modes_init(dcp);
+			dcp->fw_compat = cases[desktop].fw;
+			dcp->fixed_connector_type = cases[desktop].connector;
+			KUNIT_ASSERT_EQ(test, parse(case_blob->data, case_blob->size, &ctx), 0);
+			ctx.dcp = &parser_dcp;
+			generation = dcp_modes_transfer_begin(dcp);
+			KUNIT_ASSERT_EQ(test, dcp_modes_replace(dcp, &ctx, generation), 0);
+			KUNIT_ASSERT_EQ(test, dcp->nr_modes, 1U);
+			KUNIT_EXPECT_EQ(test, dcp->modes[0].vrr, cases[desktop].expect_vrr);
+			KUNIT_EXPECT_EQ(test, dcp->modes[0].min_vrr, cases[desktop].min_vrr);
+			KUNIT_EXPECT_EQ(test, dcp->modes[0].max_vrr, cases[desktop].max_vrr);
+			KUNIT_EXPECT_EQ(test, READ_ONCE(dcp->vrr_capable),
+					cases[desktop].expect_vrr);
+			kfree(dcp->modes);
+		}
 	}
 }
 

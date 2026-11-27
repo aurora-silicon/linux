@@ -2376,6 +2376,18 @@ static struct dcp_display_mode *dcp_modes_snapshot(struct apple_dcp *dcp,
 	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
 	return modes;
 }
+
+static bool dcp_modes_have_vrr(const struct dcp_display_mode *modes,
+			       unsigned int count)
+{
+	unsigned int i;
+
+	for (i = 0; i < count; i++)
+		if (modes[i].vrr)
+			return true;
+	return false;
+}
+
 void dcp_modes_begin_attachment(struct apple_dcp *dcp)
 {
 	/* H17P external catalogs are fenced by their connection receipt. */
@@ -2385,6 +2397,7 @@ void dcp_modes_begin_attachment(struct apple_dcp *dcp)
 	dcp->modes_generation++;
 	dcp->modes_admitted = false;
 	dcp->modes_provisional = false;
+	WRITE_ONCE(dcp->vrr_capable, false);
 }
 
 bool dcp_modes_end_typec(struct apple_dcp *dcp, struct apple_dcp_typec_route *route)
@@ -2397,6 +2410,7 @@ bool dcp_modes_end_typec(struct apple_dcp *dcp, struct apple_dcp_typec_route *ro
 		dcp->modes_generation++;
 		dcp->modes_admitted = false;
 		dcp->modes_provisional = false;
+		WRITE_ONCE(dcp->vrr_capable, false);
 	}
 	return true;
 }
@@ -2449,6 +2463,7 @@ void dcp_modes_adopt(struct apple_dcp *dcp, struct apple_connector *connector,
 	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
 	dcp->modes_admitted = true;
 	dcp->modes_provisional = true;
+	WRITE_ONCE(dcp->vrr_capable, dcp_modes_have_vrr(modes, count));
 }
 
 u64 dcp_modes_transfer_begin(struct apple_dcp *dcp)
@@ -2512,7 +2527,8 @@ int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *ctx,
 		ctx->pq_dsc = READ_ONCE(dcp->iomfb_template_pq) &&
 			      !dcp_has_panel(dcp);
 	}
-	ctx->zero_vrr_range_fallback = dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP;
+	ctx->zero_vrr_range_fallback = dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
+				       dcp->fw_compat == DCP_FIRMWARE_V_27_0;
 	ctx->internal_present_deadline = dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP;
 	if (dcp->fixed_connector_type != DRM_MODE_CONNECTOR_eDP &&
 	    smp_load_acquire(&dcp->dptxport[0].tile_hint)) {
@@ -2566,6 +2582,7 @@ int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *ctx,
 	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
 	dcp->modes_admitted = !ret;
 	dcp->modes_provisional = false;
+	WRITE_ONCE(dcp->vrr_capable, !ret && dcp_modes_have_vrr(modes, nr_modes));
 	/* A fresh catalog replaced one adopted across a route move. */
 	if (!ret && provisional && dcp->connector && dcp->dev &&
 	    dcp_modes_for_connector(dcp, dcp->connector) &&
@@ -2688,6 +2705,7 @@ void dcp_modes_release(void *data)
 	guard(mutex)(&dcp->modes_lock);
 	dcp->modes_generation++;
 	dcp->modes_admitted = false;
+	WRITE_ONCE(dcp->vrr_capable, false);
 	kfree(dcp->modes);
 	dcp->modes = NULL;
 	dcp->nr_modes = 0;
