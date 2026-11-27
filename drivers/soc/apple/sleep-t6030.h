@@ -391,6 +391,7 @@ static void t6030_pmu_boot_record(struct apple_sleep *s);
 static void t6030_pwrgate_boot(struct apple_sleep *s);
 static void t6030_cpm_probe(struct apple_sleep *s);
 static void t6030_nub_fabric_probe(struct apple_sleep *s);
+static void t6030_pmgr_aon_probe(struct apple_sleep *s);
 static void t6030_cpm_entry(void);
 static void t6030_eng_probe(struct apple_sleep *s);
 static void t6030_eng_boot_record(struct apple_sleep *s);
@@ -476,6 +477,7 @@ static int t6030_sleep_map_regs(struct apple_sleep *s)
 	t6030_pwrgate_boot(s);
 	t6030_cpm_probe(s);
 	t6030_nub_fabric_probe(s);
+	t6030_pmgr_aon_probe(s);
 	if (t6030_mem_config_boot_on())
 		t6030_mem_config_apply(s);
 	if (t6030_last_writes_on())
@@ -1537,6 +1539,39 @@ static void t6030_mtp_dart_quiet(struct apple_sleep *s)
 
 static void t6030_sleep_down(struct apple_sleep *s);
 
+/*
+ * DIAGNOSTIC: in every macOS 27.2 entry record (full-1/2/3/5, stop-1000-1) the display CPUs'
+ * power-gate words +0x6c (DISP_CPU +0xe6c, DISPEXT0_CPU +0x136c, DISPEXT1_CPU +0x16ec) are each
+ * written 0 and then 3 again 5-8 ms later, at -4.4 s; 3 at the commit, as iBoot leaves them. Linux
+ * only wrote DISPEXT1's 3. apple_sleep.gate_pulse=1 makes the same 0-then-3 on all three there.
+ */
+#define T6030_PWRGATE_DISP_CPU		0xe6c
+#define T6030_PWRGATE_DISPEXT0		0x136c
+#define T6030_GATE_PULSE_MS		6
+static bool t6030_gate_pulse;
+module_param_named(gate_pulse, t6030_gate_pulse, bool, 0444);
+MODULE_PARM_DESC(gate_pulse, "T6030 DIAGNOSTIC: at the late entry, macOS's 0-then-3 on the display CPUs' power-gate +0x6c words");
+
+static void t6030_gate_pulse_entry(struct apple_sleep *s)
+{
+	static const u32 gate[] = {
+		T6030_PWRGATE_DISP_CPU, T6030_PWRGATE_DISPEXT0, T6030_PWRGATE_DISPEXT1,
+	};
+	u32 before[ARRAY_SIZE(gate)];
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(gate); i++) {
+		before[i] = readl(s->pwrgate + gate[i]);
+		writel(0, s->pwrgate + gate[i]);
+	}
+	mdelay(T6030_GATE_PULSE_MS);
+	for (i = 0; i < ARRAY_SIZE(gate); i++)
+		writel(T6030_PWRGATE_DISPEXT1_OFF, s->pwrgate + gate[i]);
+	dev_info(s->dev, "gate_pulse: +0xe6c/+0x136c/+0x16ec %#x %#x %#x -> 0 -> %#x %#x %#x\n",
+		 before[0], before[1], before[2], readl(s->pwrgate + gate[0]),
+		 readl(s->pwrgate + gate[1]), readl(s->pwrgate + gate[2]));
+}
+
 static void t6030_sleep_late_entry(struct apple_sleep *s)
 {
 	struct t6030_sleep *t = t6030_state(s);
@@ -1544,7 +1579,10 @@ static void t6030_sleep_late_entry(struct apple_sleep *s)
 	writel(T6030_SPMI_A0_ENTRY_ACK3, s->spmi_a0 + T6030_SPMI_ACK(3));
 	t->gate_dispext1_saved = readl(s->pwrgate + T6030_PWRGATE_DISPEXT1);
 	t->gate_dispext1_staged = true;
-	writel(T6030_PWRGATE_DISPEXT1_OFF, s->pwrgate + T6030_PWRGATE_DISPEXT1);
+	if (READ_ONCE(t6030_gate_pulse))
+		t6030_gate_pulse_entry(s);
+	else
+		writel(T6030_PWRGATE_DISPEXT1_OFF, s->pwrgate + T6030_PWRGATE_DISPEXT1);
 	sleep_ps_lower(s, T6030_PS_SPI2);
 }
 
@@ -3486,6 +3524,55 @@ static void __iomem *t6030_eng_map(struct apple_sleep *s, u64 pa)
 
 	res.flags |= IORESOURCE_MEM_NONPOSTED;
 	return apple_sleep_ioremap(s->dev, &res);
+}
+
+/*
+ * DIAGNOSTIC: the pmgr-aon page 0x3642b4000 (ADT pmgr reg 1 + 0x34000). iBoot leaves it 0 and
+ * Linux never writes it. XNU writes it once at boot next to the cluster power-gate enables
+ * (s2r-full-boot-2, -199366.96..-199366.41 ms): 57 words at stride 0x1c from +0x2c, each read (0)
+ * and written 4 (5 on five of them), in this order, then +0x000 = 0x30001; it reads the entries'
+ * other words later, never writes them again. apple_sleep.pmgr_aon_boot=1 copies it at probe.
+ */
+#define T6030_PMGR_AON_PA		0x3642b4000ULL
+#define T6030_PMGR_AON_CTL_MACOS	0x30001
+static const struct { u16 off; u8 val; } t6030_pmgr_aon_boot_writes[] = {
+	{ 0x02c, 4 }, { 0x048, 4 }, { 0x064, 4 }, { 0x080, 4 }, { 0x09c, 4 }, { 0x0b8, 4 },
+	{ 0x0d4, 4 }, { 0x10c, 4 }, { 0x128, 4 }, { 0x144, 4 }, { 0x240, 4 }, { 0x160, 4 },
+	{ 0x25c, 4 }, { 0x224, 4 }, { 0x198, 4 }, { 0x1b4, 4 }, { 0x1d0, 4 }, { 0x1ec, 4 },
+	{ 0x208, 4 }, { 0x17c, 4 }, { 0x294, 4 }, { 0x0f0, 4 }, { 0x278, 4 }, { 0x2b0, 4 },
+	{ 0x2cc, 4 }, { 0x33c, 4 }, { 0x2e8, 4 }, { 0x304, 4 }, { 0x320, 4 }, { 0x358, 4 },
+	{ 0x374, 4 }, { 0x390, 4 }, { 0x3ac, 4 }, { 0x3c8, 4 }, { 0x3e4, 4 }, { 0x400, 4 },
+	{ 0x41c, 4 }, { 0x438, 4 }, { 0x454, 4 }, { 0x470, 4 }, { 0x48c, 4 }, { 0x4a8, 4 },
+	{ 0x4c4, 4 }, { 0x4e0, 4 }, { 0x4fc, 4 }, { 0x518, 4 }, { 0x534, 4 }, { 0x550, 4 },
+	{ 0x56c, 5 }, { 0x588, 4 }, { 0x5a4, 5 }, { 0x5c0, 4 }, { 0x5dc, 5 }, { 0x5f8, 4 },
+	{ 0x614, 5 }, { 0x630, 4 }, { 0x64c, 5 },
+};
+static bool t6030_pmgr_aon_boot;
+module_param_named(pmgr_aon_boot, t6030_pmgr_aon_boot, bool, 0444);
+MODULE_PARM_DESC(pmgr_aon_boot, "T6030 DIAGNOSTIC: at probe, XNU's boot writes to the pmgr-aon page 0x3642b4000");
+
+static void t6030_pmgr_aon_probe(struct apple_sleep *s)
+{
+	unsigned int i, nz = 0, bad = 0;
+	void __iomem *p;
+	u32 v;
+
+	if (!READ_ONCE(t6030_pmgr_aon_boot))
+		return;
+	p = t6030_eng_map(s, T6030_PMGR_AON_PA);
+	if (!p)
+		return;
+	for (i = 0; i < ARRAY_SIZE(t6030_pmgr_aon_boot_writes); i++) {
+		v = readl(p + t6030_pmgr_aon_boot_writes[i].off);
+		nz += !!v;
+		writel(t6030_pmgr_aon_boot_writes[i].val, p + t6030_pmgr_aon_boot_writes[i].off);
+	}
+	v = readl(p);
+	writel(T6030_PMGR_AON_CTL_MACOS, p);
+	for (i = 0; i < ARRAY_SIZE(t6030_pmgr_aon_boot_writes); i++)
+		bad += readl(p + t6030_pmgr_aon_boot_writes[i].off) != t6030_pmgr_aon_boot_writes[i].val;
+	dev_info(s->dev, "pmgr_aon_boot: %zu words (%u nonzero before), +0x000 %#x -> %#x; %u read back other than written\n",
+		 ARRAY_SIZE(t6030_pmgr_aon_boot_writes), nz, v, readl(p), bad);
 }
 
 /* obs_timeline=8: the PST page (t6030_eng_flag's page), and PMGR2:10's poll word */
