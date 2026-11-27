@@ -236,3 +236,13 @@
 		apple,dma-range = /bits/ 64 <0x10000000000 0x1000000000>;
 	};
 };
+
+/* ADT /arm-io/spi4/dp855; chip select = /arm-io/spi4 function-spi_cs0. */
+&spi4 {
+	cs-gpios = <&pinctrl_ap 136 GPIO_ACTIVE_LOW>;
+	status = "okay";
+};
+
+&tcon {
+	status = "okay";
+};

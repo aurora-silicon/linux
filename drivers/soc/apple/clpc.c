@@ -202,6 +202,14 @@ struct apple_clpc {
 	struct device *dev;
 	struct device *pmc;
 	const struct apple_clpc_hw *hw;
+	/*
+	 * The board's states for a CPU cluster busy in the top quarter of its
+	 * range (apple,cpu-busy-floor) outside the low-power profile, in place
+	 * of the top of @hw->map; GPU and ANE demand still use @hw. Unset:
+	 * @hw->map applies.
+	 */
+	u8 cpu_top[APPLE_CLPC_RAILS];
+	bool cpu_top_set;
 	unsigned int agent;
 	/* Samples while a vote is held; idle_work defers to busy CPUs. */
 	struct delayed_work work;
@@ -603,6 +611,20 @@ static void apple_clpc_find_clusters(struct apple_clpc *clpc)
 	}
 }
 
+/*
+ * The state a busy CPU cluster in frequency quarter @q asks @rail for.
+ * The board's override applies outside the low-power platform profile,
+ * where macOS drops the single-thread busy floor.
+ */
+static unsigned int apple_clpc_cpu_state(const struct apple_clpc *clpc,
+					 unsigned int rail, unsigned int q)
+{
+	if (clpc->cpu_top_set && q == APPLE_CLPC_LEVELS - 1 &&
+	    !READ_ONCE(clpc->low_power))
+		return clpc->cpu_top[rail];
+	return clpc->hw->map[rail][q];
+}
+
 static void apple_clpc_sample_cluster(struct apple_clpc *clpc,
 				      struct apple_clpc_cluster *cl)
 {
@@ -652,7 +674,7 @@ static void apple_clpc_sample_cluster(struct apple_clpc *clpc,
 	for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
 		cl->request[rail] = busy >= APPLE_CLPC_BUSY_PCT &&
 				    cl->streak >= clpc->hw->sustain ?
-				   clpc->hw->map[rail][q] : 0;
+				   apple_clpc_cpu_state(clpc, rail, q) : 0;
 }
 
 static unsigned int apple_clpc_vote(struct apple_clpc_vote *vote,
@@ -1159,6 +1181,37 @@ static void apple_clpc_idle_work(struct work_struct *work)
 	apple_clpc_run(container_of(to_delayed_work(work), struct apple_clpc, idle_work));
 }
 
+/*
+ * apple,cpu-busy-floor: the DCS and fabric states, in that order, for a CPU
+ * cluster busy in the top quarter of its frequency range outside the low-power
+ * profile, where the board's measurement differs from the SoC's table. A bad
+ * value costs the override, not the driver.
+ */
+static void apple_clpc_cpu_top_init(struct apple_clpc *clpc)
+{
+	u32 top[APPLE_CLPC_RAILS];
+	unsigned int rail;
+	int ret;
+
+	if (!of_property_present(clpc->dev->of_node, "apple,cpu-busy-floor"))
+		return;
+	ret = of_property_read_u32_array(clpc->dev->of_node, "apple,cpu-busy-floor",
+					 top, APPLE_CLPC_RAILS);
+	for (rail = 0; !ret && rail < APPLE_CLPC_RAILS; rail++)
+		if (top[rail] > 0xf)
+			ret = -ERANGE;
+	if (ret || of_property_count_u32_elems(clpc->dev->of_node,
+					       "apple,cpu-busy-floor") != APPLE_CLPC_RAILS) {
+		dev_warn(clpc->dev, "invalid apple,cpu-busy-floor; using the SoC's states\n");
+		return;
+	}
+	for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
+		clpc->cpu_top[rail] = top[rail];
+	clpc->cpu_top_set = true;
+	dev_info(clpc->dev, "busy CPU floor: DCS %u, fabric %u\n",
+		 clpc->cpu_top[APPLE_CLPC_DCS], clpc->cpu_top[APPLE_CLPC_SOC]);
+}
+
 static int apple_clpc_status_show(struct seq_file *s, void *unused)
 {
 	struct apple_clpc *clpc = s->private;
@@ -1174,8 +1227,10 @@ static int apple_clpc_status_show(struct seq_file *s, void *unused)
 				   clpc->hw->rail[rail], clpc->vote[rail].state,
 				   apple_pmc_voter_enabled(clpc->pmc, clpc->agent,
 							   clpc->hw->rail[rail]),
-				   clpc->hw->map[rail][0], clpc->hw->map[rail][1],
-				   clpc->hw->map[rail][2], clpc->hw->map[rail][3]);
+				   apple_clpc_cpu_state(clpc, rail, 0),
+				   apple_clpc_cpu_state(clpc, rail, 1),
+				   apple_clpc_cpu_state(clpc, rail, 2),
+				   apple_clpc_cpu_state(clpc, rail, 3));
 		seq_printf(s, "last_vote: %#x reason_bits %#x sampled_ns %llu (cpu=1 host_gpu=2 streaming_gpu=4 dense_gpu=8 hold=16 ane=32)\n",
 			   READ_ONCE(clpc->last_floor), READ_ONCE(clpc->last_reason),
 			   READ_ONCE(clpc->last_vote_ns));
@@ -1742,6 +1797,7 @@ static int apple_clpc_probe(struct platform_device *pdev)
 				     "parent is not a PMC and no platform profile is available\n");
 
 	if (clpc->has_pmc) {
+		apple_clpc_cpu_top_init(clpc);
 		/* T6040 firmware keeps GFX powered for its whole lifetime. A separate
 		 * host publication/idle input, not that supplier state, drives demand;
 		 * the T8132 and M5 (T8142) GPU drivers report through the same input.
@@ -2478,6 +2534,32 @@ static void apple_clpc_ane_wake_removal_test(struct kunit *test)
 	apple_clpc_ane_put(ane);
 }
 
+static void apple_clpc_cpu_busy_floor_test(struct kunit *test)
+{
+	struct apple_clpc *clpc = kunit_kzalloc(test, sizeof(*clpc), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, clpc);
+	clpc->hw = &apple_clpc_hw_t6050;
+
+	/* Without the board override, the top quarter uses the SoC map. */
+	KUNIT_EXPECT_EQ(test, apple_clpc_cpu_state(clpc, APPLE_CLPC_DCS, 3), 5u);
+	KUNIT_EXPECT_EQ(test, apple_clpc_cpu_state(clpc, APPLE_CLPC_SOC, 3), 2u);
+
+	/* With the override active outside low-power, only the top quarter changes. */
+	clpc->cpu_top[APPLE_CLPC_DCS] = 6;
+	clpc->cpu_top[APPLE_CLPC_SOC] = 3;
+	clpc->cpu_top_set = true;
+	KUNIT_EXPECT_EQ(test, apple_clpc_cpu_state(clpc, APPLE_CLPC_DCS, 2), 5u);
+	KUNIT_EXPECT_EQ(test, apple_clpc_cpu_state(clpc, APPLE_CLPC_SOC, 2), 2u);
+	KUNIT_EXPECT_EQ(test, apple_clpc_cpu_state(clpc, APPLE_CLPC_DCS, 3), 6u);
+	KUNIT_EXPECT_EQ(test, apple_clpc_cpu_state(clpc, APPLE_CLPC_SOC, 3), 3u);
+
+	/* Under the low-power platform profile, fall back to the SoC map. */
+	WRITE_ONCE(clpc->low_power, true);
+	KUNIT_EXPECT_EQ(test, apple_clpc_cpu_state(clpc, APPLE_CLPC_DCS, 3), 5u);
+	KUNIT_EXPECT_EQ(test, apple_clpc_cpu_state(clpc, APPLE_CLPC_SOC, 3), 2u);
+}
+
 static void apple_clpc_low_power_roundup_test(struct kunit *test)
 {
 	/* M4 Pro P-cluster OPPs around the 2808 MHz ADT ceiling (J616s). */
@@ -2616,6 +2698,7 @@ static void apple_clpc_profile_ops_test(struct kunit *test)
 }
 
 static struct kunit_case apple_clpc_cases[] = {
+	KUNIT_CASE(apple_clpc_cpu_busy_floor_test),
 	KUNIT_CASE(apple_clpc_ane_demand_hold_test),
 	KUNIT_CASE(apple_clpc_ane_states_test),
 	KUNIT_CASE(apple_clpc_ane_cluster_test),

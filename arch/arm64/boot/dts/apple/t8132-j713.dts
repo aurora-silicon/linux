@@ -193,8 +193,40 @@
 	apple,clock-protection = <&ps_prot 8>;
 };
 
+/*
+ * The words the firmware-27 stop of the internal DCP writes (by default, see
+ * dcp_s2r_layout_from_dt()), the same ones the deep sleep lowers: pmc-dcp, the PMGR
+ * power states and its power gate block.
+ */
+&soc {
+	dcp_power: display-power@3828a9c14 {
+		compatible = "apple,t8132-display-power";
+		reg = <0x3 0x828a9c14 0x0 0x4>,
+		      <0x3 0x80700000 0x0 0x14000>,
+		      <0x3 0x80724000 0x0 0x2000>;
+		reg-names = "pmc-dcp", "ps", "pwrgate";
+	};
+};
+
+/* Clock-protection slice 42 (ADT dart-dcp): it guards DISP_CPU's power state. */
+&dcp_dart {
+	reg = <0x3 0x0a340000 0x0 0x20000>,
+	      <0x3 0x8079cb80 0x0 0x4>;
+	reg-names = "dart", "gapf";
+};
+
 &dcp {
 	apple,pmc-interface = <&pmc_disp0>;
+	apple,display-power = <&dcp_power>;
+
+	panel: panel {
+		compatible = "apple,panel-j713", "apple,panel";
+		/* 2560x1664 at 224 ppi; 64 notch rows above the desktop. */
+		width-mm = <290>;
+		height-mm = <189>;
+		adj-height-mm = <181>;
+		apple,max-brightness = <500>;
+	};
 };
 
 /*

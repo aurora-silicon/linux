@@ -106,6 +106,7 @@ def fixture():
     # teardown_idle() is idle_for() without the release-time kill exception.
     idle = '\n'.join(item(render_teardown, name) for name in [
         'pub(in crate::g17::runtime) fn teardown_idle(', 'fn idle_for(']).replace('pub(in crate::g17::runtime) ', '')
+    counts_idle = item(render_teardown, 'fn counts_idle(')
     compute_switch = item((ROOT / 'queue/compute.rs').read_text(),
                           'pub(crate) fn switching_from(').replace('pub(crate) ', '')
     compute_idle = item((ROOT / 'runtime/teardown.rs').read_text(), 'fn compute_idle(')
@@ -118,8 +119,8 @@ struct Context { scheduler: u64, published: bool }
 impl Context {
     fn scheduler_va(&self) -> u64 { self.scheduler }
     fn is_published(&self) -> bool { self.published }
-    // Reached only for a release-time check, which this fixture does not make.
-    fn kill_published(&self) -> bool { unreachable!() }
+    // This ordering fixture publishes no kill.
+    fn kill_published(&self) -> bool { false }
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase { Deferred, Draining, Released(u32) }
@@ -138,6 +139,9 @@ struct Pair { executed: u64, switch: Option<(u64, u64)>, replay: Vec<()>, active
 impl Pair {
     // This ordering fixture models no faulted/executed unstamped pair.
     fn executed_for_kill(&self, _: &Arc<Context>) -> bool { false }
+    // Nor a guilty pair of a killed context.
+    fn guilty_for_kill(&self, _: &Arc<Context>, _: u64) -> bool { false }
+    fn guilty_released(&self) -> bool { false }
 SWITCH
     /// Host stand-in for a successful publication of `ordinal` (stand-in, not production).
     fn publish(&mut self, packet: &Packet, ordinal: u64) {
@@ -157,6 +161,7 @@ struct RenderState { entries: Vec<Option<RenderEntry>> }
 impl RenderState {
 IDLE
 }
+COUNTS_FN
 struct Previous { context: Arc<Context>, publication: Option<(u64, u64)> }
 struct Queue { previous: Option<Previous>, bound: Option<Arc<Context>> }
 impl Queue {
@@ -206,23 +211,23 @@ fn main() {
     let mut render = RenderState { entries: vec![Some(RenderEntry {
         context: Some(c.clone()), preparing: None, growing: false, pair: Some(Box::new(pair)), borrowed_switch: None,
     })] };
-    assert!(!render.teardown_idle(&d).unwrap(), "release waits for the new owner's first command");
-    assert!(render.teardown_idle(&b).unwrap(), "unrelated releases are not held");
+    assert!(!render.teardown_idle(&d, 0).unwrap(), "release waits for the new owner's first command");
+    assert!(render.teardown_idle(&b, 0).unwrap(), "unrelated releases are not held");
     // A borrowed pair is judged by its snapshot; a stale snapshot outside a borrow is ignored.
     let borrowed = render.entries[0].as_mut().unwrap();
     let pair = borrowed.pair.take().unwrap();
     borrowed.borrowed_switch = pair.switch_in_flight();
     borrowed.preparing = Some(());
-    assert!(!render.teardown_idle(&d).unwrap(), "a borrowed switching pair still holds the release");
+    assert!(!render.teardown_idle(&d, 0).unwrap(), "a borrowed switching pair still holds the release");
     let entry = render.entries[0].as_mut().unwrap();
     entry.preparing = None;
     entry.pair = Some(pair);
     entry.pair.as_mut().unwrap().active.clear();
-    assert!(render.teardown_idle(&d).unwrap(), "retirement of the first command releases the hold");
+    assert!(render.teardown_idle(&d, 0).unwrap(), "retirement of the first command releases the hold");
     let entry = render.entries[0].as_mut().unwrap();
     entry.pair.as_mut().unwrap().active.push(Active { ticket: Ticket { ordinal: 1 } });
     entry.pair = None;
-    assert!(render.teardown_idle(&d).unwrap(), "a stale snapshot without a borrow holds nothing");
+    assert!(render.teardown_idle(&d, 0).unwrap(), "a stale snapshot without a borrow holds nothing");
 
     // Compute: only a published first command after the change holds the release.
     let mut service = Service { compute: vec![Some(ComputeEntry { queue: Some(Box::new(Queue {
@@ -237,7 +242,7 @@ fn main() {
     println!("PASS release table gate, pair switch hold, borrowed snapshot and compute switch hold");
 }
 '''.replace('PENDING', pending).replace('SWITCH', switch_methods, 1).replace('RECORD', record) \
-   .replace('IDLE', idle, 1).replace('COMPUTE_SWITCH', compute_switch).replace('COMPUTE_IDLE', compute_idle)
+   .replace('IDLE', idle, 1).replace('COMPUTE_SWITCH', compute_switch).replace('COMPUTE_IDLE', compute_idle).replace('COUNTS_FN', counts_idle)
 
 
 def main():

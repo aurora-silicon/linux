@@ -214,7 +214,7 @@ impl recovery::Queues for Service<'_> {
     fn render_pass_started(&self, qid: u8, stamp: u64) -> Option<bool> {
         self.firmware.queues.render_pass_started(qid, stamp)
     }
-    fn render_culprit(&self, blamed: u8) -> Option<u128> {
+    fn render_culprit(&self, blamed: u8) -> Option<crate::g17::recovery::Attribution> {
         self.firmware.queues.render_culprit(blamed)
     }
     fn fault_culprit(&self, slots: u64) -> Option<u128> {
@@ -251,6 +251,19 @@ impl recovery::Queues for Service<'_> {
                 .find(|queue| queue.qid() == qid)
                 .and_then(|queue| queue.oldest_spared())
         })
+    }
+    // Not on M5: it takes published work back through its recovery target, and its spared
+    // work keeps the old collateral rule.
+    fn collateral_before(&self, qid: u8, generation: u64) -> bool {
+        !self.firmware.init.is_m5() && self.firmware.queues.render_collateral_before(qid, generation)
+    }
+    fn note_collateral(&mut self, qid: u8, generation: u64) {
+        if !self.firmware.init.is_m5() {
+            self.firmware.queues.note_render_collateral(qid, generation);
+        }
+    }
+    fn marks_collateral(&self, qid: u8) -> bool {
+        !self.firmware.init.is_m5() && self.firmware.queues.render_oldest_spared(qid).is_some()
     }
     fn visit_owners(&self, qid: u8, visit: &mut dyn FnMut(&Arc<VmStatus>)) {
         self.firmware.queues.visit_render_owners(qid, visit);
@@ -295,6 +308,9 @@ impl recovery::Queues for Service<'_> {
             .map_or(recovery::Interrupted::None, |queue| {
                 queue.note_interrupted(stamp)
             })
+    }
+    fn note_kill_sightings(&self, generation: u64) {
+        self.firmware.queues.note_render_kill_sightings(generation);
     }
     fn report_blamed_render(&self, qid: u8) {
         self.firmware
