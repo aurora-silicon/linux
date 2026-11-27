@@ -113,9 +113,6 @@ pub(crate) struct Soc {
     pub(crate) board: &'static str,
     /// GPU node compatible.
     pub(crate) gpu: &'static str,
-    /// Boards the runtime starts on by default and registers a render node on. On a T8122 it
-    /// starts on no other board, whatever `asahi.m3_backend` says (`m3_params::t8122_backend`).
-    pub(crate) validated_boards: &'static [&'static [u8]],
     /// GPU clusters, and core slots per cluster.
     pub(crate) clusters: u32,
     pub(crate) cores_per_cluster: u32,
@@ -268,13 +265,13 @@ pub(crate) fn by_chip(chip_id: u32) -> Option<&'static Soc> {
 
 /// T8122 (M3, G15G): one die, one cluster of ten core slots (eight or ten of them active).
 ///
-/// The compatibles, the mailbox and its interrupts are the T8122 device tree's. The identity is
-/// the one the T8122 identity gate admits (`t8122_admission`: family 7, variant 2, revision 0x20,
-/// core slots in the first core-mask word only), with the die count of the AGX3 identification
-/// table (`hw::agx3::T8122`). The hardware configuration is `hw::t8122`; power configuration
-/// comes from the boot loader. Startup uses the guarded `t8122_start` path, which selects this
-/// table's values by default on admitted Air boards and adds a performance-state cap. Explicit
-/// `asahi.t8122_start=0` disables startup; firmware, board and resource admission still apply.
+/// The compatibles, the mailbox and its interrupts are the T8122 device tree's. The identity is the
+/// one the T8122 identity gate admits (`t8122_admission`: family 7, variant 2, revision 0x20, core
+/// slots in the first core-mask word only), with one die. The hardware configuration is
+/// `hw::t8122`; power configuration comes from the boot loader. Startup uses the guarded
+/// `t8122_start` path, which selects this table's values by default on admitted Air boards and adds
+/// a performance-state cap. Explicit `asahi.t8122_start=0` disables startup; firmware, board and
+/// resource admission still apply.
 pub(crate) static T8122: Soc = Soc {
     name: "T8122",
     gpu_name: "G15G",
@@ -284,9 +281,8 @@ pub(crate) static T8122: Soc = Soc {
     gpu_revision_id: hw::GpuRevisionID::C0,
     board: "apple,t8122",
     gpu: "apple,agx-t8122",
-    // The M3 MacBook Airs (13" J613, 15" J615). Allowed, not validated: the runtime has not run
-    // on either, and starts only behind a boot loader that hands the GPU over.
-    validated_boards: &[b"apple,j613", b"apple,j615"],
+    // The runtime starts only behind a boot loader that hands the GPU over
+    // (`m3_board::handed_over`).
     clusters: 1,
     cores_per_cluster: 10,
     mailbox_compatibles: &[

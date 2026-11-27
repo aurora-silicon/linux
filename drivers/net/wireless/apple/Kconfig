@@ -10,6 +10,7 @@ config APPLE_CENTAURI
 	tristate "Apple N1 Centauri experimental J813 Wi-Fi"
 	depends on ARCH_APPLE || COMPILE_TEST
 	depends on PCI && CFG80211 && DEBUG_FS
+	depends on MFD_MACSMC
 	select FW_LOADER
 	help
 	  Experimental Apple N1 PCIe and ACIPC Wi-Fi support for the J813
@@ -22,6 +23,17 @@ config APPLE_CENTAURI
 	  This driver does not include Bluetooth HCI support.
 
 	  To build as a module, choose M; the module is apple_centauri.
+
+config APPLE_CENTAURI_KUNIT_TEST
+	bool "KUnit tests for the N1 Centauri Wi-Fi reply parsing" if !KUNIT_ALL_TESTS
+	depends on APPLE_CENTAURI && KUNIT=y
+	default KUNIT_ALL_TESTS
+	help
+	  Build tests that pass statistics replies to the Centauri Wi-Fi
+	  reply handler and check the recorded counter lengths. They need no
+	  N1 hardware.
+
+	  If unsure, say N.
 
 config APPLE_CENTAURI_T6050
 	tristate "Apple N1 Centauri T6050 firmware and IPC transport"

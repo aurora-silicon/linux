@@ -2552,11 +2552,11 @@ impl SepData {
     }
 
     /// Whether the verify this work item runs is still wanted: not cancelled,
-    /// not ended by a suspend and not closed.
+    /// not ended by a suspend and not closed, and, for a touch-gated
+    /// `/dev/sep-key` call, not given up for `/dev/sep-bio` (see
+    /// [`Self::capture_live`]).
     fn verify_wanted(&self) -> bool {
-        !self.shutting_down.load(Relaxed)
-            && ((self.key_touch_active.load(Relaxed) && !self.key_touch_cancel.load(Relaxed))
-                || bio::verify_is_live(&self.bio_session.lock(), self.capture_epoch.load(Relaxed)))
+        !self.shutting_down.load(Relaxed) && self.capture_live()
     }
 
     // Every verify registers the sensor again. On a profile with a nonce
@@ -3071,10 +3071,9 @@ impl SepData {
                 return bio::VerifyOutcome::Failed(ENROL_STATUS_SENSOR);
             }
             CaptureWait::Abandon => {
-                // A cancelled verify also abandons; only a live one is a fault.
-                if self.key_touch_active.load(Relaxed)
-                    || bio::verify_is_live(&self.bio_session.lock(), self.capture_epoch.load(Relaxed))
-                {
+                // A cancelled or given-up capture also abandons; only one
+                // still wanted is a fault.
+                if self.capture_live() {
                     dev_err_ratelimited!(
                         self.dev,
                         "verify: the sensor status became unreadable during the capture\n"

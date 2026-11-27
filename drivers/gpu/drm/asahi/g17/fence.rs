@@ -63,8 +63,11 @@ pub(crate) fn allocation_failure(contexts: &FenceContexts) -> Result<Fence> {
 pub(crate) struct ExportFence {
     source: Option<Arc<Submission>>,
     scoped: bool,
+    compute_only: bool,
     /// A waiter enabled signalling on this ioctl output fence before it signalled ([`waiters`]).
     waited: AtomicBool,
+    /// A host waiter enabled signalling on this unscoped pure-compute output fence.
+    compute_waited: AtomicBool,
 }
 static EXPORT_OPS: AtomicUsize = AtomicUsize::new(0);
 
@@ -72,11 +75,40 @@ static EXPORT_OPS: AtomicUsize = AtomicUsize::new(0);
 static WAITERS: AtomicU32 = AtomicU32::new(0);
 /// Waits begun on output fences, ever.
 static WAITS: AtomicU64 = AtomicU64::new(0);
+/// Pure-compute output fences a host waiter is blocked on now.
+static COMPUTE_WAITERS: AtomicU32 = AtomicU32::new(0);
+/// Host waits begun on pure-compute output fences, ever.
+static COMPUTE_WAITS: AtomicU64 = AtomicU64::new(0);
 
 /// The output fences a waiter is blocked on now, and the waits begun so far: the work a host
 /// thread waits for, which the M5 performance effort follows ([`super::power::Effort`]).
 pub(crate) fn waiters() -> (u32, u64) {
     (WAITERS.load(Ordering::Acquire), WAITS.load(Ordering::Acquire))
+}
+
+/// Pure-compute output fences a host thread is blocked on now, and total waits begun.
+/// Scoped cumulative outputs count waits on their exported scope (excluding internal scope
+/// chaining); unscoped outputs count waits directly on `ExportFence`.
+pub(crate) fn compute_waiters() -> (u32, u64) {
+    (
+        COMPUTE_WAITERS.load(Ordering::Acquire),
+        COMPUTE_WAITS.load(Ordering::Acquire),
+    )
+}
+
+/// Called from fence `enable_signaling` (atomic, under `dma_fence->lock` with IRQs off) when a
+/// host thread begins waiting on a pure-compute output fence.
+#[no_mangle]
+pub(super) extern "C" fn asahi_g17_note_compute_waiter() {
+    COMPUTE_WAITERS.fetch_add(1, Ordering::AcqRel);
+    COMPUTE_WAITS.fetch_add(1, Ordering::AcqRel);
+    super::wake_for_compute_waiter();
+}
+
+/// Called once a previously waited pure-compute output fence signals or is released.
+#[no_mangle]
+pub(super) extern "C" fn asahi_g17_unnote_compute_waiter() {
+    COMPUTE_WAITERS.fetch_sub(1, Ordering::AcqRel);
 }
 
 /// The first waiter on an unsignalled output fence (the fence core calls this once, under the
@@ -95,9 +127,22 @@ fn unwaited(flag: &AtomicBool) {
     }
 }
 
+fn compute_waited(flag: &AtomicBool) {
+    if !flag.swap(true, Ordering::AcqRel) {
+        asahi_g17_note_compute_waiter();
+    }
+}
+
+fn compute_unwaited(flag: &AtomicBool) {
+    if flag.swap(false, Ordering::AcqRel) {
+        asahi_g17_unnote_compute_waiter();
+    }
+}
+
 impl Drop for ExportFence {
     fn drop(&mut self) {
         unwaited(&self.waited);
+        compute_unwaited(&self.compute_waited);
     }
 }
 
@@ -111,6 +156,9 @@ impl FenceOps for ExportFence {
     }
     fn enable_signaling(self: &FenceObject<Self>) -> bool {
         waited(&self.waited);
+        if self.compute_only && !self.scoped {
+            compute_waited(&self.compute_waited);
+        }
         true
     }
 }
@@ -122,7 +170,9 @@ fn export_fallback(contexts: &FenceContexts) -> Result<UniqueFence<ExportFence>>
         ExportFence {
             source: None,
             scoped: false,
+            compute_only: false,
             waited: AtomicBool::new(false),
+            compute_waited: AtomicBool::new(false),
         },
     )?;
     // SAFETY: Unique, initialized and still private. Only this constructor
@@ -172,9 +222,20 @@ pub(super) unsafe fn exported_source_raw(raw: *mut bindings::dma_fence) -> Optio
         .cloned()
 }
 
+/// Immutable cross-QID kick metadata published once a compute source is committed in firmware.
+/// Consumers on the same VM read this without acquiring the global device mutex.
+#[derive(Clone)]
+pub(crate) struct PublishedSource {
+    pub(crate) epoch: u64,
+    pub(crate) published: u64,
+    pub(crate) dependency: super::fw::kick::KickDependency,
+    pub(crate) readers: Arc<core::sync::atomic::AtomicU32>,
+}
+
 struct State {
     work: Option<Arc<WorkStateLease>>,
     ready: Option<Fence>,
+    published: Option<PublishedSource>,
 }
 
 // One Member per parsed command, plus the enqueue guard. Exported references
@@ -186,6 +247,8 @@ kernel::static_assert!(crate::file::MAX_COMMANDS_PER_SUBMISSION < u8::MAX as u32
 pub(crate) struct Submission {
     #[pin]
     state: Mutex<State>,
+    /// Immutable VM status of this submission, stored outside `state` so `same_vm()` is lock-free.
+    vm_status: Option<Arc<super::status::VmStatus>>,
     remaining: AtomicU8,
     error: AtomicI32,
     /// Live Member objects, plus the enqueue guard, independently of signalling.
@@ -195,22 +258,38 @@ pub(crate) struct Submission {
     /// is queued, before its fence is signalled off-lock: a consumer published
     /// in between needs no wait on it.
     retired: AtomicBool,
+    /// Non-zero encoded recovery epoch (`epoch.wrapping_add(1)`) while `state.published` holds a
+    /// live `PublishedSource` snapshot, or `0` when unpublished.
+    published_epoch: AtomicU64,
+    /// Set atomically when a firmware kick depends on this source so replay/retirement
+    /// observes consumers without scanning producer queues under the device mutex.
+    firmware_consumer: AtomicBool,
 }
 
 impl Submission {
+    fn encode_epoch(epoch: u64) -> u64 {
+        epoch.wrapping_add(1)
+    }
     fn new(context: Arc<Context>, firmware_source: bool) -> Result<Arc<Self>> {
         let work = Arc::new(WorkStateLease::deferred(context)?, GFP_KERNEL)?;
         Self::with_work(Some(work), firmware_source)
     }
     fn with_work(work: Option<Arc<WorkStateLease>>, firmware_source: bool) -> Result<Arc<Self>> {
+        let vm_status = work.as_ref().map(|work| work.status().clone());
         Arc::pin_init(
             pin_init!(Self {
-                state <- new_mutex!(State { work, ready: None }, "G17 submission work state"),
+                state <- new_mutex!(
+                    State { work, ready: None, published: None },
+                    "G17 submission work state"
+                ),
+                vm_status,
                 remaining: AtomicU8::new(1),
                 error: AtomicI32::new(0),
                 owners: AtomicU8::new(1),
                 firmware_source,
                 retired: AtomicBool::new(false),
+                published_epoch: AtomicU64::new(0),
+                firmware_consumer: AtomicBool::new(false),
             }),
             GFP_KERNEL,
         )
@@ -225,14 +304,54 @@ impl Submission {
         Ok(complete)
     }
     pub(super) fn same_vm(&self, status: &Arc<super::status::VmStatus>) -> bool {
-        self.state
-            .lock()
-            .work
+        self.vm_status
             .as_ref()
-            .is_some_and(|work| Arc::ptr_eq(work.status(), status))
+            .is_some_and(|vm| Arc::ptr_eq(vm, status))
     }
     pub(super) fn ready(&self) -> Option<Fence> {
         self.state.lock().ready.clone()
+    }
+    pub(super) fn set_published(&self, source: PublishedSource) {
+        if !self.firmware_source {
+            return;
+        }
+        let tag = Self::encode_epoch(source.epoch);
+        let mut state = self.state.lock();
+        if state.work.is_some()
+            && self.error.load(Ordering::Acquire) == 0
+            && !self.retired.load(Ordering::Acquire)
+        {
+            state.published = Some(source);
+            self.published_epoch.store(tag, Ordering::Release);
+        }
+    }
+    pub(super) fn clear_published(&self) {
+        if self.published_epoch.swap(0, Ordering::AcqRel) == 0 {
+            return;
+        }
+        let old = self.state.lock().published.take();
+        drop(old);
+    }
+    pub(super) fn published_source(&self, epoch: u64) -> Option<PublishedSource> {
+        if !self.has_published_epoch(epoch) {
+            return None;
+        }
+        let state = self.state.lock();
+        state
+            .published
+            .as_ref()
+            .filter(|source| source.epoch == epoch)
+            .cloned()
+    }
+    pub(super) fn has_published_epoch(&self, epoch: u64) -> bool {
+        let tag = Self::encode_epoch(epoch);
+        self.firmware_source && tag != 0 && self.published_epoch.load(Ordering::Acquire) == tag
+    }
+    pub(super) fn note_firmware_consumer(&self) {
+        self.firmware_consumer.store(true, Ordering::Release);
+    }
+    pub(super) fn has_firmware_consumer(&self) -> bool {
+        self.firmware_consumer.load(Ordering::Acquire)
     }
     fn set_ready(&self, ready: Fence) {
         if !self.firmware_source {
@@ -244,14 +363,16 @@ impl Submission {
         }
     }
     fn note_error(&self, error: Error) -> bool {
+        self.clear_published();
         self.error
             .compare_exchange(0, error.to_errno(), Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     }
     fn release_state(&self) {
+        self.published_epoch.store(0, Ordering::Release);
         let old = {
             let mut state = self.state.lock();
-            (state.work.take(), state.ready.take())
+            (state.work.take(), state.ready.take(), state.published.take())
         };
         drop(old);
     }
@@ -280,6 +401,7 @@ impl Submission {
                 fence.signal();
             }
             unwaited(&fence.waited);
+            compute_unwaited(&fence.compute_waited);
         }
     }
 }
@@ -314,6 +436,15 @@ impl Aggregate {
         self.source().member_done(&self.0, result);
         self.source().owner_done();
     }
+    #[cfg(CONFIG_KUNIT = "y")]
+    pub(super) fn test_member(contexts: &FenceContexts) -> Result<Member> {
+        let mut fence = export_fallback(contexts)?;
+        fence.source = Some(Submission::with_work(None, false)?);
+        let aggregate = Self(fence.into());
+        let member = aggregate.member();
+        aggregate.finish_enqueue(Ok(()));
+        Ok(member)
+    }
 }
 
 pub(crate) struct Member {
@@ -346,7 +477,17 @@ impl Member {
         let source = self.aggregate.source();
         if source.firmware_source {
             source.retired.store(true, Ordering::Release);
+            source.clear_published();
         }
+    }
+    pub(super) fn note_published(&self, published: PublishedSource) {
+        self.aggregate.source().set_published(published);
+    }
+    pub(super) fn clear_published(&self) {
+        self.aggregate.source().clear_published();
+    }
+    pub(super) fn has_firmware_consumer(&self) -> bool {
+        self.aggregate.source().has_firmware_consumer()
     }
     pub(crate) fn complete(&self, result: Result) {
         if !self.complete.swap(true, Ordering::AcqRel) {
@@ -466,7 +607,7 @@ fn install(outputs: impl Iterator<Item = SyncItem>, fence: &Fence) {
 
 pub(crate) struct Outputs {
     fallback: Option<UniqueFence<ExportFence>>,
-    syncs: KVec<SyncItem>,
+    syncs: KVVec<SyncItem>,
     input_count: usize,
     submission: Option<Aggregate>,
     result: Result,
@@ -475,7 +616,7 @@ pub(crate) struct Outputs {
 impl Outputs {
     pub(crate) fn new(
         contexts: &FenceContexts,
-        mut syncs: KVec<SyncItem>,
+        mut syncs: KVVec<SyncItem>,
         input_count: usize,
         allocation_failure: &Fence,
     ) -> Result<Self> {
@@ -517,15 +658,17 @@ impl Outputs {
         &mut self,
         context: Arc<Context>,
         firmware_source: bool,
+        compute_only: bool,
     ) -> Result<Aggregate> {
         let source = Submission::new(context, firmware_source)?;
         let mut fence = self.fallback.take().ok_or(EINVAL)?;
         fence.source = Some(source);
         fence.scoped = self.cumulative.is_some();
+        fence.compute_only = compute_only;
         let submission = Aggregate(fence.into());
         self.submission = Some(submission.clone());
         if let Some(bundle) = &mut self.cumulative {
-            bundle.publish(&submission.fence())?;
+            bundle.publish(&submission.fence(), compute_only)?;
             self.syncs.truncate(self.input_count);
         } else {
             install(self.syncs.drain(self.input_count..), &submission.fence());
@@ -564,6 +707,7 @@ impl Drop for Outputs {
             );
             fallback.signal();
             unwaited(&fallback.waited);
+            compute_unwaited(&fallback.compute_waited);
         }
     }
 }
