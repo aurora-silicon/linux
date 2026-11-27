@@ -1886,7 +1886,7 @@ enum dcp_firmware_version { DCP_FIRMWARE_UNKNOWN, DCP_FIRMWARE_V_12_3, DCP_FIRMW
     DCP_FIRMWARE_V_14_7, DCP_FIRMWARE_V_14_7_TEMPLATE, DCP_FIRMWARE_V_26_6,
     DCP_FIRMWARE_V_26_6_DESKTOP, DCP_FIRMWARE_V_27_0 };
 struct apple_dcp {
-    bool crashed, external, external_native, quiescing, main_display, panel, iomfb_template_pq, vrr_enabled;
+    bool crashed, external, external_native, quiescing, main_display, panel, iomfb_template_pq, vrr_capable, vrr_enabled;
     int peer_check; /* what the firmware 27 paired-timing check answers */
     unsigned int nr_typec_routes;
     enum dcp_firmware_version fw_compat;
@@ -1928,7 +1928,7 @@ static int dcp_crtc_check_hdr(struct apple_dcp *d, struct drm_crtc *c,
 static bool dcp_vrr_live(struct apple_dcp *d)
 { return d->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && d->main_display; }
 static bool iomfb_is_m4(struct apple_dcp *d) { (void)d; return false; }
-static bool dcp_has_panel(struct apple_dcp *d) { return d->panel; }
+static bool __attribute__((unused)) dcp_has_panel(struct apple_dcp *d) { return d->panel; }
 /* The firmware 27 paired-timing check (dcp-peer-runtime-v27.inc) runs on firmware 27 only. */
 static unsigned int peer_checks;
 static int dcp_peer_check_v27(struct apple_dcp *d, struct drm_atomic_commit *s,
@@ -1998,6 +1998,7 @@ FW27_VRR    dcp.crashed = true;
     # processors ignore a live minimum rate and still apply it with a mode set.
     desktop = r"""    dcp.fw_compat = DCP_FIRMWARE_V_26_6_DESKTOP;
     dcp.iomfb_template_pq = true;
+    dcp.vrr_capable = true;
     dcp.vrr_enabled = true;
     dcp.hw.iomfb_method_profile = 0;
     dcp.mode_state.valid = true;
@@ -2043,13 +2044,14 @@ FW27_VRR    dcp.crashed = true;
         cases += 2;
     }
     dcp.main_display = false;
+    dcp.vrr_capable = false;
     dcp.vrr_enabled = false;
     dcp.iomfb_template_pq = false;
     dcp.fw_compat = DCP_FIRMWARE_UNKNOWN;
 """
-    # Firmware 27: its externals change adaptive sync with a full mode set, as
-    # macOS switches between a timing's fixed and variable modes; the panel
-    # does not. A paired timing the pair cannot take fails the check.
+    # Firmware 27: VRR-capable displays (internal ProMotion panels and
+    # externals) and pipes with VRR currently armed change adaptive sync with a
+    # mode set; fixed panels (!vrr_capable && !vrr_enabled) stay fixed.
     fw27 = r"""    dcp.fw_compat = DCP_FIRMWARE_V_27_0;
     dcp.iomfb_template_pq = true;
     dcp.hw.iomfb_method_profile = 0;
@@ -2058,12 +2060,16 @@ FW27_VRR    dcp.crashed = true;
     connector.connected = true;
     state.crtc.modeset = false;
     for (unsigned int panel = 0; panel < 2; panel++)
+    for (unsigned int capable = 0; capable < 2; capable++)
+    for (unsigned int armed = 0; armed < 2; armed++)
     for (unsigned int enable = 0; enable < 2; enable++)
     for (unsigned int old_vrr = 0; old_vrr < 3; old_vrr++)
     for (unsigned int vrr = 0; vrr < 2; vrr++)
     for (unsigned int refuse = 0; refuse < 2; refuse++) {
         dcp.main_display = panel;
         dcp.panel = panel;
+        dcp.vrr_capable = capable;
+        dcp.vrr_enabled = armed;
         dcp.peer_check = refuse ? -EINVAL : 0;
         state.crtc.enable = enable;
         state.crtc.vrr_enabled = vrr;
@@ -2072,17 +2078,19 @@ FW27_VRR    dcp.crashed = true;
         state.old_crtc.vrr_enabled = old_vrr == 1;
         unsigned int checks = peer_checks;
         int actual = dcp_crtc_atomic_check(&crtc, &state);
-        bool expected = !panel && enable && old_vrr != 2 && (old_vrr == 1) != vrr;
+        bool expected = (capable || armed) && enable && old_vrr != 2 && (old_vrr == 1) != vrr;
         if (actual != (refuse ? -EINVAL : 0) || peer_checks != checks + 1 ||
             state.crtc.mode_changed != expected) {
-            fprintf(stderr, "fw27 panel=%u enable=%u old_vrr=%u vrr=%u refuse=%u: got %d mode_changed=%d expected %d\n",
-                    panel, enable, old_vrr, vrr, refuse, actual, state.crtc.mode_changed, expected);
+            fprintf(stderr, "fw27 panel=%u cap=%u armed=%u enable=%u old_vrr=%u vrr=%u refuse=%u: got %d mode_changed=%d expected %d\n",
+                    panel, capable, armed, enable, old_vrr, vrr, refuse, actual, state.crtc.mode_changed, expected);
             return 1;
         }
         cases++;
     }
     dcp.main_display = false;
     dcp.panel = false;
+    dcp.vrr_capable = false;
+    dcp.vrr_enabled = false;
     dcp.peer_check = 0;
     dcp.fw_compat = DCP_FIRMWARE_UNKNOWN;
     /* Template-driven 12.3/13.5/14.7_tpl DCPs program VRR inside iomfb_modeset(). */
@@ -2090,6 +2098,7 @@ FW27_VRR    dcp.crashed = true;
         DCP_FIRMWARE_V_12_3, DCP_FIRMWARE_V_13_5, DCP_FIRMWARE_V_14_7_TEMPLATE
     };
     dcp.iomfb_template_pq = true;
+    dcp.vrr_capable = true;
     for (unsigned int i = 0; i < 3; i++) {
         dcp.fw_compat = tpl_fws[i];
         state.crtc.enable = true;
@@ -2103,10 +2112,166 @@ FW27_VRR    dcp.crashed = true;
         assert(dcp_crtc_atomic_check(&crtc, &state) == 0 && !state.crtc.mode_changed);
         cases += 2;
     }
+    dcp.vrr_capable = false;
     dcp.iomfb_template_pq = false;
     dcp.fw_compat = DCP_FIRMWARE_UNKNOWN;
 """
     return prefix + check + suffix.replace('DESKTOP_VRR', desktop, 1).replace('FW27_VRR', fw27, 1)
+
+
+def vrr_refusal(root):
+    source = (root / 'drivers/gpu/drm/apple/iomfb_template.c').read_text()
+    cookie_def = block(source, 'struct dcp_wait_cookie {') + ';\n'
+    on_set = block(source, 'static void dcp_on_set_adaptive_sync(')
+    set_as = block(source, 'static void dcp_set_adaptive_sync(')
+    modeset_start = source.index('int DCP_FW_NAME(iomfb_modeset)(')
+    disp_start = source.index('\tif ((mode->vrr || dcp->vrr_enabled) &&', modeset_start)
+    disp_end = source.index('\t/*\n\t * The DCP firmware has an internal timeout', disp_start)
+    dispatch = source[disp_start:disp_end]
+    fin_start = source.index('#if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))\n\tif (!paired && READ_ONCE(cookie->vrr_refused)', disp_end)
+    fin_end = source.index('\tkref_put(&cookie->refcount, release_wait_cookie);\n\t/* A firmware 27 pair', fin_start)
+    finish = source[fin_start:fin_end]
+    return r"""
+#undef NDEBUG
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+typedef uint32_t u32;
+#define DCP_FW_VER 0x270200
+#define DCP_FW_H17(v) 1
+#define DCP_FW_VERSION(a,b,c) (((a) << 16) | ((b) << 8) | (c))
+#define DCP_IOMFB_METHODS_H17P_EXTERNAL 2
+#define READ_ONCE(x) (x)
+#define WRITE_ONCE(x,v) ((x)=(v))
+#define dev_warn(...) ((void)0)
+#define dev_warn_once(...) ((void)0)
+static inline u32 get_unaligned_le32(const void *p) { u32 v; memcpy(&v, p, sizeof(v)); return v; }
+struct kref { int refcount; };
+struct completion { bool done; };
+struct apple_dcp {
+    bool panel, vrr_enabled;
+    int mode;
+    struct { int iomfb_method_profile; } hw;
+    void *dev;
+};
+struct dcp_display_mode { bool vrr; u32 min_vrr; };
+struct drm_crtc_state { bool vrr_enabled; };
+struct dcp_set_parameter_dcp { u32 param; u32 value[3]; u32 count; };
+typedef void (*dcp_callback_t)(struct apple_dcp *, void *, void *);
+""" + cookie_def + r"""
+static bool dcp_has_panel(const struct apple_dcp *dcp) { return dcp->panel; }
+static void complete(struct completion *c) { c->done = true; }
+static void release_wait_cookie(struct kref *r) { (void)r; }
+static void kref_put(struct kref *r, void (*rel)(struct kref *)) { if (--r->refcount == 0) rel(r); }
+static unsigned int digital_out_calls, param_calls;
+static u32 next_param_status, last_min_rr;
+static bool next_param_null;
+static void complete_set_digital_out_mode(struct apple_dcp *dcp, void *data, void *cookie)
+{
+    struct dcp_wait_cookie *wait = cookie;
+    (void)dcp;
+    if (data) {
+        wait->status = *(u32 *)data;
+        wait->replied = true;
+    }
+    complete(&wait->done);
+    kref_put(&wait->refcount, release_wait_cookie);
+}
+static void dcp_set_digital_out_mode(struct apple_dcp *dcp, bool sync, int *mode,
+                                     dcp_callback_t cb, void *cookie)
+{
+    u32 ok = 0;
+    (void)sync; (void)mode;
+    digital_out_calls++;
+    cb(dcp, &ok, cookie);
+}
+static void dcp_on_set_adaptive_sync(struct apple_dcp *dcp, void *out, void *cookie);
+static void dcp_set_parameter_dcp(struct apple_dcp *dcp, bool sync,
+                                  struct dcp_set_parameter_dcp *p,
+                                  dcp_callback_t cb, void *cookie)
+{
+    (void)sync;
+    assert(p->param == 15 && p->count == 3);
+    param_calls++;
+    last_min_rr = p->value[0];
+    cb(dcp, next_param_null ? NULL : &next_param_status, cookie);
+}
+""" + on_set + "\n" + set_as + r"""
+static int run_modeset(struct apple_dcp *dcp, bool mode_vrr, bool crtc_vrr,
+                       u32 param_status, bool param_null)
+{
+    struct dcp_display_mode mode_val = { .vrr = mode_vrr, .min_vrr = 24U << 16 };
+    struct dcp_display_mode *mode = &mode_val;
+    struct drm_crtc_state cs_val = { .vrr_enabled = crtc_vrr };
+    struct drm_crtc_state *crtc_state = &cs_val;
+    struct dcp_wait_cookie c_val = { .refcount = { 2 }, .status = ~0U };
+    struct dcp_wait_cookie *cookie = &c_val;
+    bool paired = false, vrr_sent = false;
+    int ret;
+
+    next_param_status = param_status;
+    next_param_null = param_null;
+    digital_out_calls = 0;
+    param_calls = 0;
+""" + dispatch + "\n" + finish + r"""
+    kref_put(&cookie->refcount, release_wait_cookie);
+    assert(cookie->done.done);
+    assert(cookie->refcount.refcount == 0);
+    return 0;
+}
+
+int main(void)
+{
+    struct apple_dcp dcp = { .panel = true };
+
+    /* 1. Internal panel, VRR initially off, param 15 refused -> keeps fixed refresh. */
+    assert(run_modeset(&dcp, true, true, 0x8000000bU, false) == 0);
+    assert(param_calls == 1 && last_min_rr == (24U << 16) && digital_out_calls == 1);
+    assert(!dcp.vrr_enabled);
+
+    /* 2. Internal panel, VRR initially off, param 15 accepted -> enables VRR. */
+    assert(run_modeset(&dcp, true, true, 0, false) == 0);
+    assert(param_calls == 1 && last_min_rr == (24U << 16) && digital_out_calls == 1);
+    assert(dcp.vrr_enabled);
+
+    /* 3. Transition starting with VRR enabled: disable refused -> fails and keeps VRR active. */
+    assert(run_modeset(&dcp, true, false, 0x8000000bU, false) == -EOPNOTSUPP);
+    assert(param_calls == 1 && last_min_rr == 0 && digital_out_calls == 0);
+    assert(dcp.vrr_enabled);
+
+    /* 4. Following modeset while VRR still armed: disable accepted -> clears VRR. */
+    assert(run_modeset(&dcp, true, false, 0, false) == 0);
+    assert(param_calls == 1 && last_min_rr == 0 && digital_out_calls == 1);
+    assert(!dcp.vrr_enabled);
+
+    /* 5. Re-arm refusal while VRR already active -> fails and keeps VRR active. */
+    dcp.vrr_enabled = true;
+    assert(run_modeset(&dcp, true, true, 0x8000000bU, false) == -EOPNOTSUPP);
+    assert(param_calls == 1 && last_min_rr == (24U << 16) && digital_out_calls == 0);
+    assert(dcp.vrr_enabled);
+
+    /* 6. Switching to fixed timing while VRR armed: refused keeps active, accepted clears. */
+    assert(run_modeset(&dcp, false, false, 0, true) == -EOPNOTSUPP);
+    assert(param_calls == 1 && last_min_rr == 0 && digital_out_calls == 0);
+    assert(dcp.vrr_enabled);
+    assert(run_modeset(&dcp, false, false, 0, false) == 0);
+    assert(param_calls == 1 && last_min_rr == 0 && digital_out_calls == 1);
+    assert(!dcp.vrr_enabled);
+
+    /* 7. External display: param 15 refusal always fails without calling digital_out_mode. */
+    dcp.panel = false;
+    assert(run_modeset(&dcp, true, true, 0x8000000bU, false) == -EOPNOTSUPP);
+    assert(param_calls == 1 && digital_out_calls == 0 && !dcp.vrr_enabled);
+    dcp.vrr_enabled = true;
+    assert(run_modeset(&dcp, true, false, 0x8000000bU, false) == -EOPNOTSUPP);
+    assert(param_calls == 1 && digital_out_calls == 0 && dcp.vrr_enabled);
+
+    return 0;
+}
+"""
 
 
 def power_reply(root):

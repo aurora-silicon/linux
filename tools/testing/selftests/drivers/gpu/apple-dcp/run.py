@@ -135,6 +135,7 @@ def main():
         ('lifecycle', 'firmware-provider', lifecycle.firmware, ((),), ()),
         ('lifecycle', 'readiness', lifecycle.readiness, ((),), ()),
         ('lifecycle', 'vrr-rejection', lifecycle.vrr, ((),), ()),
+        ('lifecycle', 'vrr-refusal', lifecycle.vrr_refusal, ((),), ()),
         ('lifecycle', 'power-reply', lifecycle.power_reply, ((),), ()),
         ('lifecycle', 'dispatcher-scope', lifecycle.dispatcher, ((),), ()),
     ]
