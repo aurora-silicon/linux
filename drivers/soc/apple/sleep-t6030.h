@@ -389,6 +389,8 @@ static void t6030_last_pmu_boot(struct apple_sleep *s);
 static void t6030_spmi1_probe(struct apple_sleep *s);
 static void t6030_pmu_boot_record(struct apple_sleep *s);
 static void t6030_pwrgate_boot(struct apple_sleep *s);
+static void t6030_eng_probe(struct apple_sleep *s);
+static void t6030_eng_boot_record(struct apple_sleep *s);
 
 static int t6030_mem_config_apply(struct apple_sleep *s);
 static bool t6030_mem_config_boot_on(void);
@@ -463,6 +465,8 @@ static int t6030_sleep_map_regs(struct apple_sleep *s)
 	t6030_gp_map(s);
 	t6030_late_map(s);
 	t6030_ovrd_report(s, "probe");
+	t6030_eng_probe(s);
+	t6030_eng_boot_record(s);
 	t6030_pmu_boot_record(s);
 	t6030_pwrgate_boot(s);
 	if (t6030_mem_config_boot_on())
@@ -2936,6 +2940,12 @@ static const struct apple_sleep_gate_coproc t6030_gate_coprocs[] = {
  *     DCS0-5, AMCC1, DCS6-11, PMP: bits 0-16) then t6030_obs_aon_words (the nub words
  *     ps-aon +0x58..+0xa8: bits 17-27), in +0..+3 (+3 bits 3:0); +3 bit 4 the PTD request not
  *     equal to its ack, bit 5 the PTD unread; +4 ECPM's actual state (7:4) and PCPM's (3:0).
+ *  7: the sleep program's own progress (lane A's decode of the NUB SRAM program), the latest:
+ *     +0 the step code 0x3642b8040, +1 E_ST 0x350782000 and +2 P_ST 0x350782004 (bits 7:0),
+ *     +3 bit 0 the sequence flag 0x3642d010c, 1/2 E_ST bits 9/10, 3/4 P_ST bits 9/10,
+ *     5 0x3642b801c = 1 (a sequence ended), 6 = 0xa03 (one started), 7 any AMCC +0x40c bit 0;
+ *     +4 the engine's SPMI queue: 0x36471c000 bits 18:16 (2:0), 0x36471c060 bits 2:0 (5:3),
+ *     WD2 armed (6).
  * The sample bytes count 100 ms each up to a 25.3 s window, steps of 200 ms beyond.
  * Reads only, beyond the notes. 0 (default): the plain observer.
  */
@@ -2963,7 +2973,7 @@ static bool t6030_obs_timeline_on(void)
 {
 	unsigned int mode = READ_ONCE(t6030_obs_timeline);
 
-	return mode >= 1 && mode <= 6;
+	return mode >= 1 && mode <= 7;
 }
 
 struct t6030_obs {
@@ -3030,6 +3040,121 @@ static const u8 t6030_obs_aon_words[] = {
 #define T6030_OBS_BLK_PTD		17
 #define T6030_OBS_PTD_REQ		0x1180
 #define T6030_OBS_PTD_ACK		0x11c0
+
+/*
+ * obs_timeline=7: the sleep program's progress and poll targets, mapped nonposted at probe (no
+ * access there). Lane A's decode of the J516s program: every sequence writes the flag 0 at its
+ * start and 1 at its end, the step code around each PMU handshake, E_DOWN and P_DOWN poll E_ST
+ * and P_ST (& 0x20 == 0 with no timeout), the PMU handshake polls the engine's own SPMI queue
+ * (+0x60 with no timeout), and the DRAM step polls each AMCC +0x40c bit 0.
+ */
+#define T6030_ENG_FLAG_PA		0x3642d0000ULL
+#define T6030_ENG_FLAG			0x10c
+#define T6030_ENG_STEP_PA		0x3642b8000ULL
+#define T6030_ENG_STEP			0x40
+#define T6030_ENG_SEQ			0x1c
+#define T6030_ENG_SEQ_START		0xa03
+#define T6030_ENG_CST_PA		0x350782000ULL
+#define T6030_ENG_E_ST			0x0
+#define T6030_ENG_P_ST			0x4
+#define T6030_ENG_SPMI_PA		0x36471c000ULL
+#define T6030_ENG_SPMI_ACK		0x60
+#define T6030_ENG_AMCC_CH		0x40c
+#define T6030_WDT_WD2_CTL		0x2c
+#define T6030_WDT_WD2_ARMED		BIT(2)
+#define T6030_OBS_BLK_AMCC0		14
+#define T6030_OBS_BLK_AMCC1		15
+
+static void __iomem *t6030_eng_flag, *t6030_eng_step, *t6030_eng_cst, *t6030_eng_spmi;
+static void __iomem *t6030_eng_smc;
+
+/* The SMC word each sequence writes at its start and end */
+#define T6030_ENG_SMC_PA		0x36c400000ULL
+#define T6030_ENG_SMC_NOTIFY		0x910
+
+static void __iomem *t6030_eng_map(struct apple_sleep *s, u64 pa)
+{
+	struct resource res = DEFINE_RES_MEM(pa, 0x1000);
+
+	res.flags |= IORESOURCE_MEM_NONPOSTED;
+	return apple_sleep_ioremap(s->dev, &res);
+}
+
+static void t6030_eng_probe(struct apple_sleep *s)
+{
+	t6030_eng_flag = t6030_eng_map(s, T6030_ENG_FLAG_PA);
+	t6030_eng_step = t6030_eng_map(s, T6030_ENG_STEP_PA);
+	t6030_eng_cst = t6030_eng_map(s, T6030_ENG_CST_PA);
+	t6030_eng_spmi = t6030_eng_map(s, T6030_ENG_SPMI_PA);
+	t6030_eng_smc = t6030_eng_map(s, T6030_ENG_SMC_PA);
+	t6030_block(s, T6030_OBS_BLK_AMCC0);
+	t6030_block(s, T6030_OBS_BLK_AMCC1);
+}
+
+/*
+ * The sleep program's markers as this boot found them, before anything writes them: if they
+ * survive the reset that ended a failed sleep, they say which sequence and step it stopped in.
+ * Reads only.
+ */
+static void t6030_eng_boot_record(struct apple_sleep *s)
+{
+	u32 wd[12];
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(wd); i++)
+		wd[i] = readl(s->wdt + 4 * i);
+	dev_info(s->dev, "boot engine: flag 0x3642d010c %#x, step 0x3642b8040 %#x, seq 0x3642b801c %#x, SPMI queue 0x36471c000 %#x +0x4 %#x +0x8 %#x +0x60 %#x, SMC 0x36c400910 %#x, E_ST %#x P_ST %#x\n",
+		 t6030_eng_flag ? readl(t6030_eng_flag + T6030_ENG_FLAG) : ~0U,
+		 t6030_eng_step ? readl(t6030_eng_step + T6030_ENG_STEP) : ~0U,
+		 t6030_eng_step ? readl(t6030_eng_step + T6030_ENG_SEQ) : ~0U,
+		 t6030_eng_spmi ? readl(t6030_eng_spmi) : ~0U,
+		 t6030_eng_spmi ? readl(t6030_eng_spmi + 0x4) : ~0U,
+		 t6030_eng_spmi ? readl(t6030_eng_spmi + 0x8) : ~0U,
+		 t6030_eng_spmi ? readl(t6030_eng_spmi + T6030_ENG_SPMI_ACK) : ~0U,
+		 t6030_eng_smc ? readl(t6030_eng_smc + T6030_ENG_SMC_NOTIFY) : ~0U,
+		 t6030_eng_cst ? readl(t6030_eng_cst + T6030_ENG_E_ST) : ~0U,
+		 t6030_eng_cst ? readl(t6030_eng_cst + T6030_ENG_P_ST) : ~0U);
+	dev_info(s->dev, "boot engine: WD 0x3642b0000: %*ph\n", (int)sizeof(wd), wd);
+}
+
+static void t6030_obs_engine(struct apple_sleep *s, u8 *v)
+{
+	struct t6030_sleep *t = t6030_state(s);
+	u32 e = 0, p = 0, seq = 0, q = 0, ack = 0, ch;
+	unsigned int b, c;
+
+	if (t6030_eng_cst) {
+		e = readl(t6030_eng_cst + T6030_ENG_E_ST);
+		p = readl(t6030_eng_cst + T6030_ENG_P_ST);
+	}
+	v[0] = t6030_eng_step ? readl(t6030_eng_step + T6030_ENG_STEP) : 0xff;
+	v[1] = e;
+	v[2] = p;
+	v[3] = 0;
+	if (t6030_eng_flag && (readl(t6030_eng_flag + T6030_ENG_FLAG) & 1))
+		v[3] |= BIT(0);
+	v[3] |= !!(e & BIT(9)) << 1 | !!(e & BIT(10)) << 2 | !!(p & BIT(9)) << 3 |
+		!!(p & BIT(10)) << 4;
+	if (t6030_eng_step)
+		seq = readl(t6030_eng_step + T6030_ENG_SEQ);
+	if (seq == 1)
+		v[3] |= BIT(5);
+	else if (seq == T6030_ENG_SEQ_START)
+		v[3] |= BIT(6);
+	for (b = T6030_OBS_BLK_AMCC0; b <= T6030_OBS_BLK_AMCC1; b++)
+		for (c = 0; t->blk[b] && c < 3; c++) {
+			ch = readl(t->blk[b] + 0x40000 * c + T6030_ENG_AMCC_CH);
+			if (ch & BIT(0))
+				v[3] |= BIT(7);
+		}
+	if (t6030_eng_spmi) {
+		q = readl(t6030_eng_spmi);
+		ack = readl(t6030_eng_spmi + T6030_ENG_SPMI_ACK);
+	}
+	v[4] = ((q >> 16) & 7) | (ack & 7) << 3;
+	if (readl(s->wdt + T6030_WDT_WD2_CTL) & T6030_WDT_WD2_ARMED)
+		v[4] |= BIT(6);
+}
 
 static void t6030_obs_waits(struct apple_sleep *s, u8 *v)
 {
@@ -3113,7 +3238,9 @@ static void t6030_observe_timeline(struct apple_sleep *s, unsigned int ms, u64 t
 		if (k == T6030_OBS_SETTLE)
 			ref = o;
 		if (cores) {
-			if (mode == 6) {
+			if (mode == 7) {
+				t6030_obs_engine(s, v);
+			} else if (mode == 6) {
 				t6030_obs_waits(s, v);
 			} else {
 				for (i = 0; i < 12; i++)
