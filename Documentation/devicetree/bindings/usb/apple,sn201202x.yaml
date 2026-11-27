@@ -17,10 +17,11 @@ description: |
 
   The controller can be polled when interrupt resources are not supplied.
 
-  T8132 omits the register-selection interrupt, so selection is polled while
-  event, standby and wakeup notifications use interrupts. The T8152
-  controllers work as the T8132 ones do: no register-selection interrupt, and
-  the payload length of a selected register in register 0x1f.
+  Controllers that omit the register-selection interrupt poll register
+  selection and read the payload length of a selected register from register
+  0x1f, while event, standby and wakeup notifications use interrupts. Legacy
+  device trees also carry `apple,t8132-sn201202x` or `apple,t8152-sn201202x`
+  compatibles for those controllers.
 
 properties:
   compatible:
@@ -129,23 +130,13 @@ required:
 
 allOf:
   - if:
+      required:
+        - interrupt-names
       properties:
-        compatible:
-          contains:
-            const: apple,t8132-sn201202x
-    then:
-      properties:
-        interrupts:
-          items:
-            - description: Primary irq used for tps6598x events
-            - description: Standby command completed
-            - description: Wakeup command completed
         interrupt-names:
-          items:
-            - const: irq
-            - const: sleep
-            - const: wake
-    else:
+          contains:
+            const: select
+    then:
       properties:
         interrupts:
           items:
@@ -157,6 +148,18 @@ allOf:
           items:
             - const: irq
             - const: select
+            - const: sleep
+            - const: wake
+    else:
+      properties:
+        interrupts:
+          items:
+            - description: Primary irq used for tps6598x events
+            - description: Standby command completed
+            - description: Wakeup command completed
+        interrupt-names:
+          items:
+            - const: irq
             - const: sleep
             - const: wake
 
