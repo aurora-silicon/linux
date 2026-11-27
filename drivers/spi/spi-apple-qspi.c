@@ -716,7 +716,8 @@ static int apple_qspi_qualify(struct spi_mem *mem, struct apple_qspi *qspi,
 	ret = apple_qspi_read_sfdp(mem, table, dword, sizeof(dword));
 	if (ret)
 		return ret;
-	if (apple_qspi_sfdp_size(get_unaligned_le32(&dword[4])) != part->size) {
+	if (apple_qspi_sfdp_size(get_unaligned_le32(&dword[4])) !=
+	    apple_qspi_part_sfdp_size(part)) {
 		*denial = "part-size";
 		ret = -ENODEV;
 		goto latch;

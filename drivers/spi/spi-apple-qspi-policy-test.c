@@ -154,6 +154,9 @@ static void qspi_policy_status(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, apple_qspi_status_allows_write(0x04, 0x02, 0, 0x1c));
 	/* The J813 W25Q64: QE and the SR3 drive strength, no block protection. */
 	KUNIT_EXPECT_TRUE(test, apple_qspi_status_allows_write(0x00, 0x02, 0x60, 0));
+	/* The J873g W25Q80: QE and SR3 0x20, no block protection. */
+	KUNIT_EXPECT_TRUE(test, apple_qspi_status_allows_write(0x00, 0x02, 0x20, 0));
+	KUNIT_EXPECT_FALSE(test, apple_qspi_status_allows_write(0x04, 0x02, 0x20, 0));
 	/* CMP, SUS and WPS are refused everywhere. */
 	KUNIT_EXPECT_FALSE(test, apple_qspi_status_allows_write(0, 0x40, 0, 0x1c));
 	KUNIT_EXPECT_FALSE(test, apple_qspi_status_allows_write(0, 0x80, 0, 0x1c));
@@ -277,15 +280,17 @@ static void qspi_policy_parts(struct kunit *test)
 	static const unsigned char known[][3] = {
 		{ 0xef, 0x65, 0x17 }, { 0xc2, 0x2b, 0x27 },
 		{ 0xef, 0x65, 0x15 }, { 0xc8, 0x83, 0x15 },
-		{ 0xc8, 0x83, 0x17 },
+		{ 0xc8, 0x83, 0x17 }, { 0xef, 0x65, 0x14 },
 	};
 	static const unsigned int sizes[] = { 0x800000, 0x800000, 0x200000, 0x200000,
-					      0x800000 };
-	static const unsigned char bp_ok[] = { 0, 0, 0x1c, 0x1c, 0 };
+					      0x800000, 0x100000 };
+	static const unsigned int sfdp_sizes[] = { 0x800000, 0x800000, 0x200000, 0x200000,
+						   0x800000, 0x200000 };
+	static const unsigned char bp_ok[] = { 0, 0, 0x1c, 0x1c, 0, 0 };
 	static const unsigned char unknown[][3] = {
-		{ 0xef, 0x65, 0x16 }, { 0xef, 0x40, 0x17 }, { 0xc2, 0x2b, 0x28 },
-		{ 0xc8, 0x60, 0x15 }, { 0xc8, 0x83, 0x16 }, { 0xc8, 0x83, 0x18 },
-		{ 0, 0, 0 }, { 0xff, 0xff, 0xff },
+		{ 0xef, 0x65, 0x13 }, { 0xef, 0x65, 0x16 }, { 0xef, 0x40, 0x17 },
+		{ 0xc2, 0x2b, 0x28 }, { 0xc8, 0x60, 0x15 }, { 0xc8, 0x83, 0x16 },
+		{ 0xc8, 0x83, 0x18 }, { 0, 0, 0 }, { 0xff, 0xff, 0xff },
 	};
 	const struct apple_qspi_part *part;
 	unsigned int i;
@@ -294,6 +299,7 @@ static void qspi_policy_parts(struct kunit *test)
 		part = apple_qspi_find_part(known[i]);
 		KUNIT_ASSERT_NOT_NULL(test, part);
 		KUNIT_EXPECT_EQ(test, part->size, sizes[i]);
+		KUNIT_EXPECT_EQ(test, apple_qspi_part_sfdp_size(part), sfdp_sizes[i]);
 		KUNIT_EXPECT_EQ(test, part->bp_ok, bp_ok[i]);
 	}
 	for (i = 0; i < ARRAY_SIZE(unknown); i++)
@@ -302,6 +308,10 @@ static void qspi_policy_parts(struct kunit *test)
 	part = apple_qspi_find_part(known[2]);
 	KUNIT_EXPECT_LE(test, 0x1f4000ULL, (unsigned long long)part->size);
 	KUNIT_EXPECT_GT(test, 0x800000ULL, (unsigned long long)part->size);
+	/* The J873g 13-bank window fits 1 MiB; an oversized 2 MiB J700 window does not. */
+	part = apple_qspi_find_part(known[5]);
+	KUNIT_EXPECT_LE(test, 0xf4000ULL, (unsigned long long)part->size);
+	KUNIT_EXPECT_GT(test, 0x1f4000ULL, (unsigned long long)part->size);
 }
 
 static void qspi_policy_protected(struct kunit *test)

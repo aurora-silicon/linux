@@ -156,19 +156,22 @@ static inline int apple_qspi_nvram_bank_state(const unsigned char h[24])
 
 /*
  * The boot NOR parts whose nvram partition may be written: the JEDEC ID, the
- * size, which bounds the window (a three-byte address past it wraps around)
- * and must match the part's SFDP density, and the SR1 block-protect bits the
- * part's firmware leaves set. Those stay set; apple_qspi_protected_range()
- * says what they protect.
+ * physical size, which bounds the window (a three-byte address past it wraps
+ * around), the SR1 block-protect bits the part's firmware leaves set, and
+ * optionally sfdp_size when a part's factory SFDP density differs from its
+ * physical size (0 means SFDP density must equal size). Protected bits stay
+ * set; apple_qspi_protected_range() says what they protect.
  */
 struct apple_qspi_part {
 	unsigned char jedec[3];
 	unsigned int size;
 	unsigned char bp_ok;
+	unsigned int sfdp_size;
 };
 
 #define APPLE_QSPI_JEDEC_W25Q64		{ 0xef, 0x65, 0x17 }
 #define APPLE_QSPI_JEDEC_W25Q16		{ 0xef, 0x65, 0x15 }
+#define APPLE_QSPI_JEDEC_W25Q80		{ 0xef, 0x65, 0x14 }
 #define APPLE_QSPI_JEDEC_MX_2B27	{ 0xc2, 0x2b, 0x27 }
 #define APPLE_QSPI_JEDEC_GD25UF16E	{ 0xc8, 0x83, 0x15 }
 #define APPLE_QSPI_JEDEC_GD25UF64E	{ 0xc8, 0x83, 0x17 }
@@ -184,7 +187,19 @@ static const struct apple_qspi_part apple_qspi_parts[] = {
 	{ APPLE_QSPI_JEDEC_GD25UF16E, 0x200000, 0x1c },
 	/* J775D (M5 Ultra): no block protection left set, SR1 0x00 */
 	{ APPLE_QSPI_JEDEC_GD25UF64E, 0x800000, 0 },
+	/*
+	 * J873g (Mac mini, M6): 1 MiB die (wraps at 0x100000, ADT spinor
+	 * ranges 0x100000), no BP bits (SR1 0x00, SR2 0x02, SR3 0x20),
+	 * factory SFDP BFPT reports 16 Mbit (0x00ffffff = 0x200000).
+	 */
+	{ APPLE_QSPI_JEDEC_W25Q80, 0x100000, 0, 0x200000 },
 };
+
+static inline unsigned int
+apple_qspi_part_sfdp_size(const struct apple_qspi_part *part)
+{
+	return part->sfdp_size ? part->sfdp_size : part->size;
+}
 
 static inline const struct apple_qspi_part *
 apple_qspi_find_part(const unsigned char id[3])
