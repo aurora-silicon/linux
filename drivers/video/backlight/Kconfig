@@ -336,6 +336,16 @@ config BACKLIGHT_APPLE_DWI
 	  To compile this driver as a module, choose M here: the module will
 	  be called apple_dwi_bl.
 
+config BACKLIGHT_APPLE_DWI_KUNIT_TEST
+	bool "KUnit tests for the Apple DWI backlight driver" if !KUNIT_ALL_TESTS
+	depends on BACKLIGHT_APPLE_DWI=y && KUNIT=y
+	default KUNIT_ALL_TESTS
+	help
+	  Build tests for the Apple DWI backlight driver: the brightness
+	  command word and send bits, reading the level back, the maximum,
+	  and blanking through bl_power and suspend/resume. The registers
+	  are kernel memory, so the tests need no Apple hardware.
+
 config BACKLIGHT_QCOM_WLED
 	tristate "Qualcomm PMIC WLED Driver"
 	select REGMAP

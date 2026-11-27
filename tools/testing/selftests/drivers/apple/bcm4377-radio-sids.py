@@ -115,7 +115,9 @@ struct apple_dart {
     bool four_level, per_stream, tunneled, fw_mirror, fw_handoff;
     bool pending, preserve_display;
     bool isp_host, cold_ane, live_mtp, display_dark, display_tlb_stale;
-    bool cold_gen3;
+    unsigned int display_writers, display_dark_writers;
+    bool cold_gen3, cold_gen3_pcie;
+    u32 cold_gen3_sids;
     void *tunables;
     unsigned long static_bypass[4];
     void *dcp, *frontend[2];

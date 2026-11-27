@@ -1,0 +1,51 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Touch ID on the T6050 laptops: the SEP (t6050-sep.dtsi) and the Mesa sensor (ADT spi2/mesa).
+ * The live ADTs of the J714s, J716c, K114s and K116s and the 27.2 DeviceTrees of the other
+ * boards describe it alike: spi2 at 8 MHz, chip select 0, powered by NUB GPIO 21
+ * (function-mesa_pwr), data ready on AP GPIO 138. spi2 runs from the 24 MHz reference (ADT
+ * clock-ids 451).
+ *
+ * The board defines T6050_TOUCHID_FIRMWARE before including this file: the sensor's
+ * calibration and signed root key, per-device factory data that aurora-touchid-setup builds
+ * from this Mac's own iBoot System Container. The board also leaves AP pin 138 out of its
+ * gpio-reserved-ranges.
+ *
+ * Included after t6050-peripherals.dtsi.
+ */
+
+#ifndef T6050_TOUCHID_FIRMWARE
+#error "define T6050_TOUCHID_FIRMWARE (calibration, root key) before including t6050-touchid.dtsi"
+#endif
+
+#include "t6050-sep.dtsi"
+
+&ps_nub_gpio {
+	status = "okay";
+};
+
+&nub_gpio0 {
+	status = "okay";
+};
+
+&ps_spi2 {
+	status = "okay";
+};
+
+&spi2 {
+	clocks = <&clkref>;
+	status = "okay";
+
+	mesa: fingerprint@0 {
+		compatible = "apple,mesa-fingerprint";
+		reg = <0>;
+		spi-max-frequency = <8000000>;
+		spi-cpol;
+		spi-cs-setup-delay-ns = <20>;
+		spi-cs-hold-delay-ns = <20>;
+		enable-gpios = <&nub_gpio0 21 GPIO_ACTIVE_HIGH>;
+		interrupt-parent = <&pinctrl_ap>;
+		interrupts = <138 IRQ_TYPE_EDGE_RISING>;
+		firmware-name = T6050_TOUCHID_FIRMWARE;
+	};
+};

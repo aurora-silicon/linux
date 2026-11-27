@@ -18,6 +18,10 @@
 
 #include "apple_dockchannel.h"
 
+#if IS_ENABLED(CONFIG_SERIAL_APPLE_DOCKCHANNEL_KUNIT_TEST)
+#include <kunit/static_stub.h>
+#endif
+
 #define FIFO_SIZE         0x800
 
 #define IRQ_MASK          0x0
@@ -79,6 +83,34 @@ static struct dcuart_port *dcuart_ports[MAX_PORTS];
 static inline struct dcuart_port *port_to_dc(struct uart_port *port)
 {
 	return container_of(port, struct dcuart_port, port);
+}
+
+/*
+ * Data FIFO accesses of the RX drain and the TX paths. They are functions so
+ * that the KUnit test can model the FIFO behind them.
+ */
+static u32 dcuart_rx_readl(struct dcuart_port *dcuart, u32 reg)
+{
+#if IS_ENABLED(CONFIG_SERIAL_APPLE_DOCKCHANNEL_KUNIT_TEST)
+	KUNIT_STATIC_STUB_REDIRECT(dcuart_rx_readl, dcuart, reg);
+#endif
+	return readl_relaxed(dcuart->port.membase + reg);
+}
+
+static u32 dcuart_tx_free(struct dcuart_port *dcuart)
+{
+#if IS_ENABLED(CONFIG_SERIAL_APPLE_DOCKCHANNEL_KUNIT_TEST)
+	KUNIT_STATIC_STUB_REDIRECT(dcuart_tx_free, dcuart);
+#endif
+	return readl(dcuart->port.membase + DATA_TX_FREE);
+}
+
+static void dcuart_tx_put(struct dcuart_port *dcuart, u8 ch)
+{
+#if IS_ENABLED(CONFIG_SERIAL_APPLE_DOCKCHANNEL_KUNIT_TEST)
+	KUNIT_STATIC_STUB_REDIRECT(dcuart_tx_put, dcuart, ch);
+#endif
+	writel(ch, dcuart->port.membase + DATA_TX8);
 }
 
 static void dcuart_irq_update(struct dcuart_port *dcuart,
@@ -186,7 +218,7 @@ static bool dcuart_drain_rx(struct dcuart_port *dcuart)
 	bool got = false;
 	int left;
 
-	while ((left = readl_relaxed(dcuart->port.membase + DATA_RX_COUNT))) {
+	while ((left = dcuart_rx_readl(dcuart, DATA_RX_COUNT))) {
 		left = min_t(size_t, left, FIFO_SIZE);
 		while (left) {
 			/*
@@ -195,7 +227,7 @@ static bool dcuart_drain_rx(struct dcuart_port *dcuart)
 			 */
 			char c;
 
-			c = readl_relaxed(dcuart->port.membase + DATA_RX8) >> 8;
+			c = dcuart_rx_readl(dcuart, DATA_RX8) >> 8;
 			uart_insert_char(&dcuart->port, 0, 0, c, TTY_NORMAL);
 			dcuart->port.icount.rx++;
 			left--;
@@ -246,8 +278,8 @@ static unsigned int dcuart_tx_chars(struct dcuart_port *dcuart, bool tick)
 	if (!queued && !port->x_char)
 		return 0;
 
-	pending = uart_port_tx_limited(port, ch, readl(port->membase + DATA_TX_FREE),
-				       true, writel(ch, port->membase + DATA_TX8), ({}));
+	pending = uart_port_tx_limited(port, ch, dcuart_tx_free(dcuart),
+				       true, dcuart_tx_put(dcuart, ch), ({}));
 	if (!pending || pending < queued) {
 		dcuart->tx_stuck_ticks = 0;
 		return pending;
@@ -309,7 +341,7 @@ static void dcuart_drain_timer(struct timer_list *t)
 static unsigned int dcuart_tx_empty(struct uart_port *port)
 {
 	if (!port_to_dc(port)->never_wait)
-		return (readl(port->membase + DATA_TX_FREE) != 0) ? TIOCSER_TEMT : 0;
+		return (dcuart_tx_free(port_to_dc(port)) != 0) ? TIOCSER_TEMT : 0;
 	return TIOCSER_TEMT;
 }
 
@@ -567,3 +599,7 @@ device_initcall(dcuart_init);
 MODULE_AUTHOR("Yureka Lilian <yureka@cyberchaos.dev>");
 MODULE_DESCRIPTION("Apple DockChannel UART driver");
 MODULE_LICENSE("Dual MIT/GPL");
+
+#if IS_ENABLED(CONFIG_SERIAL_APPLE_DOCKCHANNEL_KUNIT_TEST)
+#include "apple_dockchannel_uart-test.c"
+#endif

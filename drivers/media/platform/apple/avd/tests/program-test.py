@@ -545,12 +545,14 @@ def prepare_regressions(out):
     pre = pre.replace('unsigned int bank; };', 'unsigned int bank; size_t grey_chroma_offset; bool grey_chroma_10bit; };')
     pre += 'enum vb2_buffer_state { VB2_BUF_STATE_DONE, VB2_BUF_STATE_ERROR };\n'
     code = pre + helpers + inst + h264
-    for name in ('avd_h264_alloc_bufs', 'avd_h264_validate_sps', 'avd_h264_validate_pps',
+    for name in ('avd_h264_alloc_bufs', 'avd_h264_validate_sps_fmt', 'avd_h264_validate_sps',
+                 'avd_h264_validate_pps',
                  'avd_h264_validate_slice', 'avd_h264_drop_bank_slices', 'avd_h264_pick_bank',
                  'avd_h264_abort_picture', 'avd_h264_refs_valid', 'avd_h264_done'):
         code += function(source, name)
     code += function((ROOT / 'avd-backend-open.c').read_text(), 'avd_open_build_program')
     code += function((ROOT / 'avd-hevc.c').read_text(), 'avd_hevc_check_sps_geometry')
+    code += function((ROOT / 'avd-hevc.c').read_text(), 'avd_hevc_validate_sps_fmt')
     code += function((ROOT / 'avd-hevc.c').read_text(), 'avd_hevc_validate_sps')
     code += RUN_FIXTURE + function(source, 'avd_h264_sps_image_fmt') + function(source, 'avd_h264_run') + RUN_MAIN
     dest = out / 'prepare.c'
