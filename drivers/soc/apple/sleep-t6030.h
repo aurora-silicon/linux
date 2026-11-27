@@ -452,6 +452,7 @@ static int t6030_sleep_map_regs(struct apple_sleep *s)
 	      t6030_sleep_seq_get(s, "apple,seq-wake", &t->wake, true);
 	if (ret)
 		return ret;
+	t6030_last_writes_filter(s, &t->commit);
 
 	t6030_gp_map(s);
 	t6030_late_map(s);
@@ -643,6 +644,49 @@ static int t6030_pmu_xfer(struct apple_sleep *s, u32 mask, u8 opcode, u16 addres
 }
 
 /*
+ * DIAGNOSTIC (T6030 sleep bring-up): the last-second differences lane A's 0x1000 stops of macOS
+ * 27.2 and Linux 313ee6fb show on J516S (t6030-linux-313ee6fb-stop-1-diff-summary):
+ *  - the PMU's RTC alarm: after the commit word macOS finds it disarmed (control 0x01) and arms
+ *    it again (0x41), an edge; Linux's is still armed from rtcwake. Disarm it (0x01) first;
+ *  - SOC-DEV-DVFS[0] (PTD +0x900): macOS writes bit 61 | 1 there 4.2 ms before the late group's
+ *    votes, which then drop it to bit 61 alone;
+ *  - AFR (ps-gpu +0x100): apple,seq-commit writes it 0, macOS doesn't touch it in its window.
+ * Boot parameter, off by default.
+ */
+static bool t6030_last_writes;
+module_param_named(last_writes, t6030_last_writes, bool, 0444);
+MODULE_PARM_DESC(last_writes, "T6030 DIAGNOSTIC: macOS's last-second RTC alarm edge, DVFS[0] vote and no AFR write");
+
+#define T6030_LAST_DVFS0		0x900
+#define T6030_LAST_DVFS0_VOTE		(BIT_ULL(61) | 1)
+#define T6030_LAST_DVFS0_TO_SLPA_US	(15200 + 4200)
+#define T6030_BLK_PS_GPU_AFR		0x100
+
+/* apple,seq-commit without its AFR write (block 13, +0x100), for last_writes */
+static void t6030_last_writes_filter(struct apple_sleep *s, struct sleep_seq *seq)
+{
+	unsigned int i, n = 0;
+	u32 *op;
+
+	if (!READ_ONCE(t6030_last_writes) || seq->saved)
+		return;
+	op = devm_kcalloc(s->dev, seq->n, 4 * sizeof(u32), GFP_KERNEL);
+	if (!op)
+		return;
+	for (i = 0; i < seq->n; i++) {
+		const u32 *e = seq->op + 4 * i;
+
+		if (e[0] == 0 && e[1] == 13 && e[2] == T6030_BLK_PS_GPU_AFR)
+			continue;
+		memcpy(op + 4 * n++, e, 4 * sizeof(u32));
+	}
+	dev_info(s->dev, "last_writes: apple,seq-commit without its AFR write (%u of %u entries)\n",
+		 n, seq->n);
+	seq->op = op;
+	seq->n = n;
+}
+
+/*
  * The RTC alarm the OS armed (rtcwake), read before anything of the entry touches the PMU:
  * the control, the mask, the 4-byte compare and the seconds counter. Only an armed, unmasked
  * alarm still ahead of the counter is rearmed after the commit word.
@@ -731,6 +775,11 @@ static void t6030_sleep_post_timer(struct apple_sleep *s)
 	if (!ret && (ctl & T6050_RTC_CTL_FIRED)) {
 		step = 1;
 		v = 0x43;
+		ret = t6030_pmu_xfer(s, mask, T6050_SPMI_EXT_WRITEL, T6050_RTC_CTL, &v, NULL, 1);
+	} else if (!ret && READ_ONCE(t6030_last_writes) && (ctl & T6050_RTC_CTL_ARMED)) {
+		/* As macOS finds it here: disarmed, so that the 0x41 below arms it with an edge */
+		step = 5;
+		v = ctl & ~T6050_RTC_CTL_ARMED;
 		ret = t6030_pmu_xfer(s, mask, T6050_SPMI_EXT_WRITEL, T6050_RTC_CTL, &v, NULL, 1);
 	}
 	if (!ret) {
@@ -1467,6 +1516,10 @@ static void t6030_sleep_after_ans(struct apple_sleep *s)
 				 T6030_MASK_AT_PMVC, ack);
 		apple_sleep_smc_until_before_slpa(s, T6030_MASK_LATE_TO_SLPA_US);
 		writeq(T6030_MASK_LATE, t6030_ptd_update + T6030_PTD_REQUEST);
+	}
+	if (READ_ONCE(t6030_last_writes) && t6030_ptd_update) {
+		apple_sleep_smc_until_before_slpa(s, T6030_LAST_DVFS0_TO_SLPA_US);
+		writeq(T6030_LAST_DVFS0_VOTE, t6030_ptd_update + T6030_LAST_DVFS0);
 	}
 	apple_sleep_smc_until_before_slpa(s, T6030_LATE_TO_SLPA_US);
 	if (sleep_seq_run_strict(t->blk, &t->prepare))
