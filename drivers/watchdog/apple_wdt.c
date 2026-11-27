@@ -179,26 +179,26 @@ static unsigned int apple_wdt_get_timeleft(struct watchdog_device *wdd)
 
 	/*
 	 * Without the reset armed the counter runs freely and wraps every
-	 * 2^32 ticks (about 179 s at 24 MHz), so its distance to the bite
-	 * time means nothing: no reset is coming.
+	 * 2^32 ticks (about 179 s at 24 MHz), so its distance to the reset
+	 * time means nothing: no reset is coming. WD1 resets through
+	 * RESET_EN; with reconfig, the WD2 bark IRQ_EN is what resets.
 	 */
-	ctrl = readl_relaxed(wdt->regs + APPLE_WDT_WD1_CTRL);
-	if (!(ctrl & APPLE_WDT_CTRL_RESET_EN))
-		return 0;
-
 	if (wdt->reconfig) {
+		ctrl = readl_relaxed(wdt->regs + APPLE_WDT_WD2_CTRL);
+		if (!(ctrl & APPLE_WDT_CTRL_IRQ_EN))
+			return 0;
 		cur_time = readl_relaxed(wdt->regs + APPLE_WDT_WD2_CUR_TIME);
 		reset_time = readl_relaxed(wdt->regs + APPLE_WDT_WD2_BARK_TIME);
 	} else {
+		ctrl = readl_relaxed(wdt->regs + APPLE_WDT_WD1_CTRL);
+		if (!(ctrl & APPLE_WDT_CTRL_RESET_EN))
+			return 0;
 		cur_time = readl_relaxed(wdt->regs + APPLE_WDT_WD1_CUR_TIME);
 		reset_time = readl_relaxed(wdt->regs + APPLE_WDT_WD1_BITE_TIME);
 	}
 
-	if (cur_time >= reset_time)
-		return 0;
-
 	/*
-	 * Armed, the counter can read past the bite time while the reset
+	 * Armed, the counter can read past the reset time while the reset
 	 * is on its way; the unsigned difference would wrap.
 	 */
 	if (cur_time >= reset_time)
