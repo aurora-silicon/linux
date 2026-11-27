@@ -572,6 +572,47 @@ static void apple_pmc_test_dcs_floor_pending(struct kunit *test)
 }
 
 /*
+ * T8132: the CLPC votes through the AP agent and writes the whole word on
+ * every sample. Floors held on the SoC and DCS rails survive its updates,
+ * the DCS limit still caps the DCS floor, a higher CLPC vote wins, and
+ * releasing the floors leaves the CLPC's vote.
+ */
+static void apple_pmc_test_t8132_floor_and_clpc(struct kunit *test)
+{
+	struct apple_pmc *pmc = apple_pmc_test_alloc(test);
+	struct device dev = { .driver = &apple_pmc_driver.driver };
+	struct apple_pmc_domain *soc, *dcs;
+	unsigned int agent;
+
+	INIT_LIST_HEAD(&pmc->domains);
+	pmc->hw = &apple_pmc_hw_t8132;
+	agent = pmc->hw->ap_agent;
+	dev_set_drvdata(&dev, pmc);
+	soc = apple_pmc_test_floor(test, pmc, 1, 3);
+	dcs = apple_pmc_test_floor(test, pmc, pmc->hw->dcs_rail, 5);
+
+	KUNIT_ASSERT_EQ(test, apple_pmc_floor_update(&dev, agent, 0xff, 0x01), 0);
+	KUNIT_EXPECT_EQ(test, apple_pmc_test_ap_floor(pmc) & 0xff, 0x01U);
+	KUNIT_ASSERT_EQ(test, apple_pmc_floor_set(soc, true), 0);
+	KUNIT_ASSERT_EQ(test, apple_pmc_floor_set(dcs, true), 0);
+	KUNIT_EXPECT_EQ(test, apple_pmc_test_ap_floor(pmc) & 0xff, 0x35U);
+	/* An idle sample asks for nothing; the floors stay. */
+	KUNIT_ASSERT_EQ(test, apple_pmc_floor_update(&dev, agent, 0xff, 0x00), 0);
+	KUNIT_EXPECT_EQ(test, apple_pmc_test_ap_floor(pmc) & 0xff, 0x35U);
+	pmc->dcs_state = 2;
+	KUNIT_ASSERT_EQ(test, apple_pmc_floor_update(&dev, agent, 0xff, 0x00), 0);
+	KUNIT_EXPECT_EQ(test, apple_pmc_test_ap_floor(pmc) & 0xff, 0x33U);
+	pmc->dcs_state = 0;
+	KUNIT_ASSERT_EQ(test, apple_pmc_floor_update(&dev, agent, 0xff, 0x45), 0);
+	KUNIT_EXPECT_EQ(test, apple_pmc_test_ap_floor(pmc) & 0xff, 0x45U);
+	KUNIT_ASSERT_EQ(test, apple_pmc_floor_set(soc, false), 0);
+	KUNIT_ASSERT_EQ(test, apple_pmc_floor_set(dcs, false), 0);
+	KUNIT_EXPECT_EQ(test, apple_pmc_test_ap_floor(pmc) & 0xff, 0x45U);
+	KUNIT_ASSERT_EQ(test, apple_pmc_floor_update(&dev, agent, 0xff, 0x01), 0);
+	KUNIT_EXPECT_EQ(test, apple_pmc_test_ap_floor(pmc) & 0xff, 0x01U);
+}
+
+/*
  * Leaving a DCS limit when the AP's vote is still pending rolls back the
  * rail enable so dcs_state and hardware stay in sync until a retry clears it.
  */
@@ -626,6 +667,7 @@ static struct kunit_case apple_pmc_test_cases[] = {
 	KUNIT_CASE(apple_pmc_test_floor_pending_timeout),
 	KUNIT_CASE(apple_pmc_test_dcs_floor_pending),
 	KUNIT_CASE(apple_pmc_test_dcs_limit_release_pending),
+	KUNIT_CASE(apple_pmc_test_t8132_floor_and_clpc),
 	KUNIT_CASE(apple_pmc_test_interface),
 	KUNIT_CASE(apple_pmc_test_interface_stuck),
 	KUNIT_CASE(apple_pmc_test_interface_consumer),

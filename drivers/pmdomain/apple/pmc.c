@@ -138,6 +138,16 @@ struct apple_pmc {
 	unsigned int ap_dcs_vote;
 	/* Highest DCS floor held by a floor domain; protected by @lock. */
 	unsigned int dcs_floor;
+	/*
+	 * The AP agent's floor word as last asked for through
+	 * apple_pmc_floor_update(), and the highest floor held on each rail
+	 * other than DCS; protected by @lock. On T8132 the AP agent is also the
+	 * CLPC's, which rewrites the whole word on every sample: the word
+	 * carries the higher of the two on each rail, so neither undoes the
+	 * other.
+	 */
+	u32 ap_request;
+	unsigned int floor_level[APPLE_PMC_MAX_RAILS];
 	/* Power cost of each DCS state in mW, if a model is described. */
 	u32 dcs_power[APPLE_PMC_MAX_STATES];
 	struct delayed_work dcs_work;
@@ -365,6 +375,51 @@ static int __apple_pmc_floor_update(struct apple_pmc *pmc, unsigned int agent,
 	return ret;
 }
 
+/*
+ * Caller holds pmc->lock. The DCS state the DCS floors held keep the AP's
+ * agent at, capped by the DCS limit.
+ */
+static unsigned int apple_pmc_dcs_floor(struct apple_pmc *pmc)
+{
+	if (!pmc->dcs_state)
+		return pmc->dcs_floor;
+
+	return min_t(unsigned int, pmc->dcs_floor,
+		     pmc->hw->dcs_max - pmc->dcs_state);
+}
+
+/*
+ * Caller holds pmc->lock. Raise the rails of an AP agent floor value to the
+ * floors held on them. The DCS rail too: the AP agent's other user writes
+ * the whole word, DCS state included, so without this its next update
+ * would drop a DCS floor.
+ */
+static u32 apple_pmc_ap_raise(struct apple_pmc *pmc, u32 mask, u32 value)
+{
+	unsigned int rail;
+
+	for (rail = 0; rail < pmc->hw->rails; rail++) {
+		u32 m = APPLE_PMC_RAIL_MASK(rail);
+		unsigned int level = rail == pmc->hw->dcs_rail ?
+				     apple_pmc_dcs_floor(pmc) : pmc->floor_level[rail];
+
+		if (!(mask & m) ||
+		    ((value & m) >> APPLE_PMC_RAIL_SHIFT(rail)) >= level)
+			continue;
+		value = (value & ~m) | (level << APPLE_PMC_RAIL_SHIFT(rail));
+	}
+
+	return value;
+}
+
+/* Caller holds pmc->lock. What apple_pmc_floor_update() asked of @rail. */
+static unsigned int apple_pmc_ap_request(struct apple_pmc *pmc,
+					 unsigned int rail)
+{
+	return (pmc->ap_request & APPLE_PMC_RAIL_MASK(rail)) >>
+	       APPLE_PMC_RAIL_SHIFT(rail);
+}
+
 /**
  * apple_pmc_floor_update() - update the perf-state floor of an agent
  * @dev: the PMC device
@@ -373,7 +428,8 @@ static int __apple_pmc_floor_update(struct apple_pmc *pmc, unsigned int agent,
  * @value: new value of the bits in @mask
  *
  * The floor only takes effect on rails where the agent's interface is
- * enabled.
+ * enabled. For the AP agent, a rail floor domain held on a rail keeps that
+ * rail at least at its level.
  *
  * Context: Any context.
  * Return: 0 on success, -EINVAL if @agent is out of range, or -EIO if the
@@ -390,6 +446,10 @@ int apple_pmc_floor_update(struct device *dev, unsigned int agent, u32 mask,
 		return -EINVAL;
 
 	raw_spin_lock_irqsave(&pmc->lock, flags);
+	if (agent == pmc->hw->ap_agent) {
+		pmc->ap_request = (pmc->ap_request & ~mask) | (value & mask);
+		value = apple_pmc_ap_raise(pmc, mask, value);
+	}
 	ret = __apple_pmc_floor_update(pmc, agent, mask, value);
 	raw_spin_unlock_irqrestore(&pmc->lock, flags);
 
@@ -430,13 +490,15 @@ static unsigned int apple_pmc_ap_dcs_read(struct apple_pmc *pmc)
 /*
  * Caller holds pmc->lock. Vote through the AP's agent for what the other
  * agents ask for and the DCS floors held, capped by the limit; without a
- * limit, the vote the AP's agent had before probe or the floors, if higher.
+ * limit, the highest of the vote the AP's agent had before probe, the
+ * floors and what the agent's other user asked for.
  * Like any other floor write, wait out a vote the PMC has not taken yet.
  */
 static int apple_pmc_dcs_vote(struct apple_pmc *pmc)
 {
 	const struct apple_pmc_hw *hw = pmc->hw;
-	unsigned int state = max(pmc->ap_dcs_vote, pmc->dcs_floor);
+	unsigned int state = max3(pmc->ap_dcs_vote, pmc->dcs_floor,
+				  apple_pmc_ap_request(pmc, hw->dcs_rail));
 
 	if (pmc->dcs_state)
 		state = min_t(unsigned int,
@@ -680,6 +742,9 @@ static int apple_pmc_floor_apply(struct apple_pmc *pmc, unsigned int rail)
 		return apple_pmc_dcs_vote(pmc);
 	}
 
+	/* What the AP agent's other user asked for on this rail stays if higher. */
+	pmc->floor_level[rail] = level;
+	level = max(level, apple_pmc_ap_request(pmc, rail));
 	return __apple_pmc_floor_update(pmc, pmc->hw->ap_agent,
 					APPLE_PMC_RAIL_MASK(rail),
 					level << APPLE_PMC_RAIL_SHIFT(rail));
