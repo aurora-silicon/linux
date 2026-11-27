@@ -118,6 +118,7 @@ struct apple_dpxbar {
 	struct device *dev;
 	const struct apple_dpxbar_hw *hw;
 	void __iomem *regs;
+	struct device *common_pd;
 	int selected_dispext[T8142_MUX_MAX];
 	/* T6030 programs all its outputs itself, see apple_dpxbar_t6030_link() */
 	bool t6030_dpin;
@@ -1030,12 +1031,20 @@ static int apple_dpxbar_set_t8142(struct mux_control *mux, int state)
 	struct apple_dpxbar *xbar = mux_chip_priv(mux->chip);
 	unsigned int index = mux_control_get_index(mux);
 	unsigned long flags;
+	bool put_rpm;
 	u32 mask, value;
 	int ret = 0;
 
 	if (state != MUX_IDLE_DISCONNECT &&
 	    (state < 0 || state >= 8 || (index == MUX_DPPHY && (state & 1))))
 		return -EINVAL;
+
+	if (xbar->common_pd && state >= 0 && !test_bit(index, &xbar->rpm_held)) {
+		ret = pm_runtime_resume_and_get(xbar->common_pd);
+		if (ret < 0)
+			return ret;
+		set_bit(index, &xbar->rpm_held);
+	}
 
 	spin_lock_irqsave(&xbar->lock, flags);
 	if (xbar->faulted) {
@@ -1045,8 +1054,8 @@ static int apple_dpxbar_set_t8142(struct mux_control *mux, int state)
 	if (state >= 0) {
 		for (unsigned int i = 0; i < T8142_MUX_MAX; i++) {
 			if (i != index && xbar->selected_dispext[i] == state) {
-				spin_unlock_irqrestore(&xbar->lock, flags);
-				return -EBUSY;
+				ret = -EBUSY;
+				goto out;
 			}
 		}
 	}
@@ -1070,7 +1079,10 @@ static int apple_dpxbar_set_t8142(struct mux_control *mux, int state)
 		dpxbar_mask32(xbar, index == 4 ? 0x40 : 0x44, mask, value);
 	}
 out:
+	put_rpm = xbar->selected_dispext[index] < 0;
 	spin_unlock_irqrestore(&xbar->lock, flags);
+	if (xbar->common_pd && put_rpm && test_and_clear_bit(index, &xbar->rpm_held))
+		pm_runtime_put_sync_suspend(xbar->common_pd);
 	return ret;
 }
 
@@ -1285,29 +1297,49 @@ static void apple_dpxbar_domain_release(void *data)
 	dev_pm_domain_detach(pd, true);
 }
 
-static int apple_dpxbar_domains(struct device *dev)
+static void apple_dpxbar_common_domain_release(void *data)
 {
-	static const char * const names[] = { "usb-aon", "common" };
+	struct apple_dpxbar *xbar = data;
+	unsigned int i;
+
+	for (i = 0; i < T8142_MUX_MAX; i++) {
+		if (test_and_clear_bit(i, &xbar->rpm_held))
+			pm_runtime_put_sync_suspend(xbar->common_pd);
+	}
+	dev_pm_domain_detach(xbar->common_pd, true);
+	xbar->common_pd = NULL;
+}
+
+static int apple_dpxbar_domains(struct device *dev, struct apple_dpxbar *xbar)
+{
+	struct device *pd;
 	int ret;
 
 	/* Older handoff-only trees have no Linux-managed domains. */
 	if (!of_property_present(dev->of_node, "power-domain-names"))
 		return 0;
-	for (unsigned int i = 0; i < ARRAY_SIZE(names); i++) {
-		struct device *pd = dev_pm_domain_attach_by_name(dev, names[i]);
 
-		if (IS_ERR_OR_NULL(pd))
-			return pd ? PTR_ERR(pd) : -ENODEV;
-		ret = pm_runtime_resume_and_get(pd);
-		if (ret < 0) {
-			dev_pm_domain_detach(pd, true);
-			return ret;
-		}
-		ret = devm_add_action_or_reset(dev, apple_dpxbar_domain_release, pd);
-		if (ret)
-			return ret;
+	pd = dev_pm_domain_attach_by_name(dev, "usb-aon");
+	if (IS_ERR_OR_NULL(pd))
+		return pd ? PTR_ERR(pd) : -ENODEV;
+	ret = pm_runtime_resume_and_get(pd);
+	if (ret < 0) {
+		dev_pm_domain_detach(pd, true);
+		return ret;
 	}
-	return 0;
+	ret = devm_add_action_or_reset(dev, apple_dpxbar_domain_release, pd);
+	if (ret)
+		return ret;
+
+	/*
+	 * Hold the ATC common power domain only while an output is selected,
+	 * so idle USB-C/Thunderbolt ports can power-gate their ATC common rail.
+	 */
+	pd = dev_pm_domain_attach_by_name(dev, "common");
+	if (IS_ERR_OR_NULL(pd))
+		return pd ? PTR_ERR(pd) : -ENODEV;
+	xbar->common_pd = pd;
+	return devm_add_action_or_reset(dev, apple_dpxbar_common_domain_release, xbar);
 }
 
 static int apple_dpxbar_probe(struct platform_device *pdev)
@@ -1324,9 +1356,6 @@ static int apple_dpxbar_probe(struct platform_device *pdev)
 
 		if (!res || resource_size(res) < 0x830)
 			return -EINVAL;
-		ret = apple_dpxbar_domains(dev);
-		if (ret)
-			return dev_err_probe(dev, ret, "cannot power crossbar controls\n");
 	}
 	mux_chip = devm_mux_chip_alloc(dev, hw->n_mux, sizeof(*dpxbar));
 	if (IS_ERR(mux_chip))
@@ -1338,6 +1367,11 @@ static int apple_dpxbar_probe(struct platform_device *pdev)
 	spin_lock_init(&dpxbar->lock);
 
 	dpxbar->dev = dev;
+	if (hw->ops == &apple_dpxbar_t8142_ops) {
+		ret = apple_dpxbar_domains(dev, dpxbar);
+		if (ret)
+			return dev_err_probe(dev, ret, "cannot power crossbar controls\n");
+	}
 	dpxbar->t6030_dpin = hw->t6030_flow || of_machine_is_compatible("apple,t6030");
 	dpxbar->regs = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(dpxbar->regs))
