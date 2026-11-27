@@ -1324,7 +1324,8 @@
 #else
 &{/soc} {
 #endif
-#if defined(T6050_J714C) || defined(T6050_J716C) || defined(T6050_J775C) || defined(T6050_J775D) || defined(T6050_K114C) || defined(T6050_K116C)
+/* nub-spmi1: an M5 Max bus (t6050-soc-max.dtsi) */
+#ifdef T6050_MAX_PMIC_BUSES
 	nub_spmi1: spmi@28a054000 {
 		compatible = "apple,t6050-spmi", "apple,t8142-spmi";
 		reg = <0x2 0x8a054000 0x0 0x4000>,
@@ -1337,7 +1338,8 @@
 	};
 #endif
 
-#if defined(T6050_J714C) || defined(T6050_J716C) || defined(T6050_J775C) || defined(T6050_J775D) || defined(T6050_K114C) || defined(T6050_K116C)
+/* nub-spmi4: the other bus of t6050-soc-max.dtsi */
+#ifdef T6050_MAX_PMIC_BUSES
 	nub_spmi4: spmi@28a114000 {
 		compatible = "apple,t6050-spmi", "apple,t8142-spmi";
 		reg = <0x2 0x8a114000 0x0 0x4000>,
@@ -1617,7 +1619,8 @@
 		status = "disabled";
 	};
 
-#if !defined(T6050_J714C) && !defined(T6050_J714S) && !defined(T6050_J716C) && !defined(T6050_K114C)
+/* With ATC2's USB4 router, t6050-max.dtsi describes this DART with the router instead. */
+#ifndef T6050_ATC2_USB4_ROUTER
 	apciec2_dart: iommu@384000000 {
 		compatible = "apple,t6050-dart", "apple,t8110-dart";
 		reg = <0x3 0x84000000 0x0 0x20000>;
