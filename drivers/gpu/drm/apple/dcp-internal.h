@@ -1250,6 +1250,8 @@ struct apple_dcp {
 	/* Lets a test answer IOMFB method calls in place of the firmware. */
 	void (*test_push)(struct apple_dcp *dcp, const struct dcp_method_entry *call,
 			  dcp_callback_t cb, void *cookie);
+	/* Lets a test intercept or fail mailbox sends in dcp_send_message_checked(). */
+	int (*test_send)(struct apple_dcp *dcp, u8 endpoint, u64 message);
 #endif
 
 	struct gpio_desc *hdmi_hpd;
@@ -1474,6 +1476,15 @@ void dcp_disable_typec_work(struct apple_dcp *dcp, bool release_cable);
 void dcp_enable_typec_work(struct apple_dcp *dcp);
 void dcp_swap_watchdog(struct work_struct *work);
 void iomfb_scanout_put_h17p(struct apple_dcp *dcp, struct iomfb_scanout_h17p *scanout);
+#endif
+
+#if IS_ENABLED(CONFIG_DRM_APPLE_KUNIT_TEST)
+bool dcp_test_session_retained(struct device *dev);
+void dcp_test_release_retained_session(struct device *dev);
+int iomfb_test_push_context(struct apple_dcp *dcp, enum dcp_context_id context,
+			    const struct dcp_method_entry *call, u32 in_len,
+			    u32 out_len, void *data, dcp_callback_t cb,
+			    void *cookie, bool unwind_on_err);
 #endif
 
 int dcp_backlight_init(struct apple_dcp *dcp, struct device *dev);

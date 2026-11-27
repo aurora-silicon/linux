@@ -2082,6 +2082,17 @@ static int dcp_push_context(struct apple_dcp *dcp, enum dcp_context_id context,
 	return ret;
 }
 
+#if IS_ENABLED(CONFIG_DRM_APPLE_KUNIT_TEST)
+int iomfb_test_push_context(struct apple_dcp *dcp, enum dcp_context_id context,
+			    const struct dcp_method_entry *call, u32 in_len,
+			    u32 out_len, void *data, dcp_callback_t cb,
+			    void *cookie, bool unwind_on_err)
+{
+	return dcp_push_context(dcp, context, call, in_len, out_len, data, cb,
+				cookie, unwind_on_err);
+}
+#endif
+
 void dcp_push(struct apple_dcp *dcp, bool oob,
 	      const struct dcp_method_entry *call, u32 in_len, u32 out_len,
 	      void *data, dcp_callback_t cb, void *cookie)

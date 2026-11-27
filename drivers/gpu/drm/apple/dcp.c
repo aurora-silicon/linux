@@ -176,6 +176,44 @@ bool dcp_retain_live_session_commit(struct apple_dcp *dcp,
 	return committed;
 }
 
+#if IS_ENABLED(CONFIG_DRM_APPLE_KUNIT_TEST)
+bool dcp_test_session_retained(struct device *dev)
+{
+	struct dcp_session_ref *session;
+	unsigned long flags;
+	bool retained = false;
+
+	spin_lock_irqsave(&dcp_retained_sessions_lock, flags);
+	list_for_each_entry(session, &dcp_retained_sessions, link) {
+		if (session->dev == dev) {
+			retained = true;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&dcp_retained_sessions_lock, flags);
+	return retained;
+}
+
+void dcp_test_release_retained_session(struct device *dev)
+{
+	struct dcp_session_ref *session, *next;
+	LIST_HEAD(released);
+	unsigned long flags;
+
+	spin_lock_irqsave(&dcp_retained_sessions_lock, flags);
+	list_for_each_entry_safe(session, next, &dcp_retained_sessions, link) {
+		if (session->dev == dev)
+			list_move_tail(&session->link, &released);
+	}
+	spin_unlock_irqrestore(&dcp_retained_sessions_lock, flags);
+
+	list_for_each_entry_safe(session, next, &released, link) {
+		list_del(&session->link);
+		dcp_retain_live_session_abort(session);
+	}
+}
+#endif
+
 int dcp_retain_live_session(struct apple_dcp *dcp)
 {
 	struct dcp_session_ref *session;
@@ -2378,6 +2416,10 @@ int dcp_send_message_checked(struct apple_dcp *dcp, u8 endpoint, u64 message)
 	if (READ_ONCE(dcp->quiescing) ||
 	    (dcp_is_ext26(dcp) && READ_ONCE(dcp->ext26_blocked)))
 		return -ESHUTDOWN;
+#if IS_ENABLED(CONFIG_DRM_APPLE_KUNIT_TEST)
+	if (dcp->test_send)
+		return dcp->test_send(dcp, endpoint, message);
+#endif
 	trace_dcp_send_msg(dcp, endpoint, message);
 	/*
 	 * The adopted T6030 14.7 and native26 (ext26) sessions share this
