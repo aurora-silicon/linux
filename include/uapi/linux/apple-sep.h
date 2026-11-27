@@ -525,7 +525,9 @@ struct sep_keybag_change {
  * A user's wrapped bag, for userspace to keep across reboots (as macOS
  * saves it). It holds no secret: it opens only with the user's password,
  * on this Mac. EXPORT copies the designated bag; IMPORT loads a saved one
- * and designates it again, locked until SEP_BIO_KEYBAG_UNLOCK.
+ * and designates it again, locked until SEP_BIO_KEYBAG_UNLOCK. IMPORT of a
+ * bag the driver still holds (locked, or open for another session) is
+ * EBUSY: unlock it instead.
  */
 #define SEP_KEYBAG_BLOB_MAX 4096
 
