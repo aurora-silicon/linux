@@ -525,8 +525,6 @@ static void *fwnode_typec_mux_get(struct fwnode_handle *f) { (void)f;muxes++;ret
 static struct fwnode_handle *fwnode_find_reference(struct fwnode_handle *f,const char *s,int n) {
  (void)f;(void)s;(void)n;connector.refs++;return &connector;
 }
-static bool fwnode_property_present(struct fwnode_handle *f,const char *s) { (void)f;(void)s;return true; }
-static struct fwnode_handle *fwnode_handle_get(struct fwnode_handle *f) { assert(!"connector is a displayport reference");return f; }
 static void __attribute__((unused)) fwnode_handle_put(struct fwnode_handle *f) {
  if(f){assert(f->refs>0);f->refs--;}
 }

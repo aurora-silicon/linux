@@ -3004,7 +3004,6 @@ static bool cd321x_display_gate_pending(struct tps6598x *tps)
 static int
 cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 {
-	struct fwnode_handle *connector_fwnode;
 	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
 	bool tbt_late;
 	int ret;
@@ -3025,12 +3024,9 @@ cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 		goto err_unregister_altmodes;
 	}
 
-	if (fwnode_property_present(fwnode, "displayport"))
-		connector_fwnode = fwnode_find_reference(fwnode, "displayport", 0);
-	else
-		connector_fwnode = fwnode_handle_get(fwnode);
-	if (!IS_ERR_OR_NULL(connector_fwnode))
-		cd321x->connector_fwnode = connector_fwnode;
+	cd321x->connector_fwnode = fwnode_find_reference(fwnode, "displayport", 0);
+	if (IS_ERR(cd321x->connector_fwnode))
+		cd321x->connector_fwnode = NULL;
 
 	cd321x->tbt_switch = cd321x_tbt_switch_get(tps->dev, fwnode, &tbt_late);
 	if (IS_ERR(cd321x->tbt_switch)) {
@@ -4047,6 +4043,8 @@ int tipd_init(struct tps6598x *tps)
 		return -EPROBE_DEFER;
 
 	dev_dbg(tps->dev, "Type-C probe start\n");
+	tps->h17_display = of_machine_is_compatible("apple,t8140") ||
+			   of_machine_is_compatible("apple,t8142");
 	tps->reset = devm_gpiod_get_optional(tps->dev, "reset", GPIOD_OUT_LOW);
 	if (IS_ERR(tps->reset))
 		return dev_err_probe(tps->dev, PTR_ERR(tps->reset),
@@ -4382,9 +4380,6 @@ EXPORT_SYMBOL_GPL(tipd_suspend);
 int tipd_resume(struct tps6598x *tps)
 {
 	int ret;
-
-	tps->h17_display = of_machine_is_compatible("apple,t8140") ||
-			   of_machine_is_compatible("apple,t8142");
 
 	ret = tps6598x_check_mode(tps);
 	if (ret < 0)
