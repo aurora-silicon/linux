@@ -361,6 +361,8 @@ ASAHI_TESTS = {
         + mutations('--mutation', ('always-wait-scheduled', 'skip-unpublished-scheduled',
                                    'block-firmware-early', 'skip-compute-producer-check',
                                    'skip-render-producer-check', 'copy-try-early-bool'), []),
+    'g17-highpri-sched-wq-tests.py': [([], PASS)]
+        + mutations('--mutation', ('drop-highpri', 'drop-reclaim', 'drop-highpri-flag'), []),
     'g17-firmware-selection-tests.py': [([], PASS)],
     'g17-freelist-lease-direct-tests.py': [([], PASS)]
         + mutations('--mutation', ('reject-preparing-complete', 'snapshot-rollback',
