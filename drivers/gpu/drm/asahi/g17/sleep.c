@@ -803,8 +803,20 @@ struct asahi_g17_commit *asahi_g16_stop_now(struct device *dev, struct apple_rtk
 	/* The step reached, in PMU scratch, which a reset keeps: 0x21 to 0x27 */
 	c->ran = true;
 	asahi_g16_sleep_note(0x21);
+	/*
+	 * macOS stops a GFX that is up: it reads actual 0xf three times before its power-down,
+	 * in every record. Gated under automatic power, as G15S idles, it is brought up first,
+	 * while the firmware still runs (J516s: raised after the idle instead, the SoC went down).
+	 */
 	c->entry = readl(c->ps);
-	/* The CPU's status is read below; macOS doesn't poll it */
+	c->saved = c->entry;
+	if (FIELD_GET(PS_ACTUAL, c->entry) != PS_ACTIVE) {
+		writel((c->entry & ~(PS_AUTO_ENABLE | PS_BUSY | PS_FLAGS | PS_TARGET)) |
+		       FIELD_PREP(PS_TARGET, PS_ACTIVE), c->ps);
+		c->raise_ret = readl_poll_timeout(c->ps, val, FIELD_GET(PS_ACTUAL, val) == PS_ACTIVE,
+						  10, PS_TIMEOUT_US);
+	}
+	asahi_g16_sleep_note(0x28);
 	c->idle[0] = apple_rtkit_sleep_idle_polled(c->rtk[0], NULL, &c->idle_us[0]);
 	asahi_g16_sleep_note(0x22);
 	apple_rtkit_mailbox_recv_off(c->rtk[0]);
@@ -822,14 +834,12 @@ struct asahi_g17_commit *asahi_g16_stop_now(struct device *dev, struct apple_rtk
 	/*
 	 * Nothing on the ASC's own page from here: the idle firmware gates GFX under automatic
 	 * power, and a read of the CPU's status or control then takes the SoC down (J516s: PMU
-	 * scratch 0x24, then a reset). As macOS: out of automatic power with the target on, which
-	 * brings a gated domain back (it reads actual 0xf), then the target off.
+	 * scratch 0x24, then a reset). As macOS: out of automatic power with the target on (it
+	 * reads actual 0xf), then the target off.
 	 */
 	val = readl(c->ps);
-	c->saved = val;
 	writel(val & ~(PS_AUTO_ENABLE | PS_BUSY | PS_FLAGS), c->ps);
-	c->raise_ret = readl_poll_timeout(c->ps, val, FIELD_GET(PS_ACTUAL, val) == PS_ACTIVE,
-					  10, PS_TIMEOUT_US);
+	readl_poll_timeout(c->ps, val, FIELD_GET(PS_ACTUAL, val) == PS_ACTIVE, 10, PS_TIMEOUT_US);
 	c->words[1] = val;
 	asahi_g16_sleep_note(0x25);
 	writel((val & ~(PS_AUTO_ENABLE | PS_BUSY | PS_FLAGS | PS_TARGET)) | PS_FLAGS, c->ps);
