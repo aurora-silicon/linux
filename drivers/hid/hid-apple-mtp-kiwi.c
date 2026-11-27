@@ -100,7 +100,7 @@ struct kiwi {
 	int rowmean[KIWI_ROWS];	/* per-row mean of the last frame, pre-removal */
 	u8 cand_hot[(KIWI_CELLS + 7) / 8];	/* hot-cell map of the first baseline candidate */
 	bool have_hot;
-	u64 drop_ring, drop_hold, drop_still;	/* per-rule drop counters, debugfs */
+	u64 drop_hold, drop_still;	/* per-rule drop counters, debugfs */
 	struct dentry *dbg;
 	int bad;
 	int agree;		/* agreeing pairs chained toward a baseline */
@@ -729,15 +729,14 @@ static void kiwi_frame(struct kiwi *k, const u8 *data)
 
 	for (r = 0; r < KIWI_ROWS && n < KIWI_MAX_SLOTS; r++) {
 		for (c = 0; c < KIWI_COLS && n < KIWI_MAX_SLOTS; c++) {
-			/* the 2-cell edge ring is where stuck-cell phantoms live; a real
-			 * finger is never centred that close to the bezel
+			/*
+			 * Every peak is a contact, to the very edge of the panel (the top
+			 * band under the camera housing included). Static outliers are
+			 * baked into the baseline; telling an accidental contact from a
+			 * finger is left to userspace.
 			 */
-			if (k->sig[r * KIWI_COLS + c] >= KIWI_THRESHOLD && kiwi_is_peak(k, r, c)) {
-				if (r > 1 && r < KIWI_ROWS - 2 && c > 1 && c < KIWI_COLS - 2)
-					kiwi_centroid(k, r, c, &found[n++]);
-				else
-					k->drop_ring++;	/* the 2-cell edge ring rejected a peak */
-			}
+			if (k->sig[r * KIWI_COLS + c] >= KIWI_THRESHOLD && kiwi_is_peak(k, r, c))
+				kiwi_centroid(k, r, c, &found[n++]);
 		}
 	}
 	kiwi_adapt(k);
@@ -890,7 +889,6 @@ static int kiwi_probe(struct hid_device *hdev, const struct hid_device_id *id)
 		return ret;
 
 	kiwi->dbg = debugfs_create_dir("hid-apple-mtp-kiwi", NULL);
-	debugfs_create_u64("drop_edge_ring", 0444, kiwi->dbg, &kiwi->drop_ring);
 	debugfs_create_u64("drop_hold", 0444, kiwi->dbg, &kiwi->drop_hold);
 	debugfs_create_u64("drop_still", 0444, kiwi->dbg, &kiwi->drop_still);
 
