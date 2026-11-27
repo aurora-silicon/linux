@@ -352,6 +352,8 @@ ASAHI_TESTS = {
                                    'max-channels', 'multi-channel-max'), []),
     'g17-m5-effort-tests.py': [([], PASS)]
         + mutations('--mutation', ('m5-ignores-bound',), []),
+    'g17-highpri-sched-wq-tests.py': [([], PASS)]
+        + mutations('--mutation', ('drop-highpri', 'drop-reclaim', 'drop-highpri-flag'), []),
     'g17-firmware-selection-tests.py': [([], PASS)],
     'g17-freelist-lease-direct-tests.py': [([], PASS)]
         + mutations('--mutation', ('reject-preparing-complete', 'snapshot-rollback',
@@ -375,6 +377,10 @@ ASAHI_TESTS = {
                                    'observe-in-recovery', 'collector-blocks', 'finish-under-mutex',
                                    'no-pass-requested', 'rescan-no-poll', 'worker-rescan-slow-path',
                                    'owed-slow-path'), []),
+    'g17-rescan-poll-tests.py': [([], PASS)]
+        + mutations('--mutation', ('starve-fast-pending', 'starve-slow-pending', 'jiffy-poll',
+                                   'skip-backpressure-poll', 'skip-sleep-cancel',
+                                   'skip-shutdown-disable'), []),
     'g17-render-direct-recovery-tests.py': [([], PASS)]
         + mutations('--mutation', ('recovery-state-eio', 'drop-generation-check',
                                    'wrong-j813-pipe'), []),

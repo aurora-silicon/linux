@@ -24,6 +24,7 @@
 #endif
 
 #define APPLE_T602X_NON_ULTRA
+#define APPLE_USE_PMP
 
 #include "t602x-common.dtsi"
 

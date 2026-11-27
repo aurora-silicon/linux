@@ -79,13 +79,7 @@ impl Vm {
         gem::validate_vm_binding(gem, self)?;
         let residency = self.enter_residency_metadata()?;
         let context = self.prepare_context_binding(addr, size, offset)?;
-        let resources = VmOpResources {
-            preallocated_gpuvas: [
-                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL)?),
-                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL)?),
-                Some(GpuVaAlloc::<VmInner>::new(GFP_KERNEL)?),
-            ],
-        };
+        let resources = VmOpResources::with_gpuvas(self.memory_client())?;
         // SAFETY: As in `Vm::bind_object()`, the device is bound while its file can issue binds.
         let dev = unsafe { self.dev.as_bound() };
         // Populate the scatter-gather table before any GPUVM lock is taken.
