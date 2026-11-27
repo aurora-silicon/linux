@@ -1942,8 +1942,61 @@ static int dcp_v27_early_any_report(struct apple_epic_service *service, enum epi
 	return 0;
 }
 
+/*
+ * The internal DCP's AV endpoint (0x29) is one of these, not avep's (it has no audio device): its
+ * video interface's publications are counted here for a restart's CRTC to wait on
+ * (dcp_v27_early_av_wait()); with v27_early_av_open, opened first (as epic/panelavep.c does).
+ */
+struct dcp_v27_early_open_work {
+	struct work_struct work;
+	struct apple_epic_service *service;
+};
+
+static void dcp_v27_early_av_counted(struct apple_dcp *dcp)
+{
+	atomic_inc(&dcp->av_video_gen);
+	wake_up_all(&dcp->av_video_wq);
+}
+
+static void dcp_v27_early_open_worker(struct work_struct *work)
+{
+	struct dcp_v27_early_open_work *w = container_of(work, struct dcp_v27_early_open_work, work);
+	struct apple_epic_service *service = w->service;
+	struct apple_dcp *dcp = service->ep->dcp;
+
+	dev_info(dcp->dev, "AV video interface %u: OPEN after the restart: %d\n", service->channel,
+		 afk_service_open(service));
+	dcp_v27_early_av_counted(dcp);
+	afk_service_put(service);
+	kfree(w);
+}
+
+static void dcp_v27_early_any_init(struct apple_epic_service *service, const char *name,
+				   const char *class, s64 unit)
+{
+	struct apple_dcp *dcp = service->ep->dcp;
+	struct dcp_v27_early_open_work *w;
+
+	if (service->ep->endpoint != AV_ENDPOINT || !name || !strstr(name, "VideoInterface"))
+		return;
+	if (READ_ONCE(dcp->av_video_reopen)) {
+		w = kzalloc(sizeof(*w), GFP_KERNEL);
+		if (w) {
+			w->service = afk_service_get(service);
+			if (w->service) {
+				INIT_WORK(&w->work, dcp_v27_early_open_worker);
+				/* Not on the endpoint's own queue: the reply arrives there. */
+				queue_work(system_dfl_wq, &w->work);
+				return;
+			}
+			kfree(w);
+		}
+	}
+	dcp_v27_early_av_counted(dcp);
+}
+
 static const struct apple_epic_service_ops dcp_v27_early_any_service[] = {
-	{ .name = "*", .report = dcp_v27_early_any_report },
+	{ .name = "*", .init = dcp_v27_early_any_init, .report = dcp_v27_early_any_report },
 	{},
 };
 
