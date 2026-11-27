@@ -184,6 +184,20 @@
 
 	smc_hwmon: hwmon {
 		compatible = "apple,smc-hwmon";
+		/*
+		 * The CPU die sensors of the M4. The SMC reports each in a key
+		 * triplet; the middle key is listed, as on M3: under load it
+		 * tracks the PMP's die hotspot within about 2 C, while the
+		 * first key reads 8-11 C lower. E cluster: Te05 Te09 Te0H Te0S;
+		 * P cluster: Tp01 ... Tp1R. The GPU (Tg) keys are left out:
+		 * they hold a fixed placeholder while Linux drives the GPU.
+		 * Keys the running SMC lacks are skipped at probe.
+		 */
+		apple,soc-die-keys = "Te05", "Te09", "Te0H", "Te0S",
+				     "Tp01", "Tp05", "Tp09", "Tp0D", "Tp0V",
+				     "Tp0Y", "Tp0b", "Tp0e", "Tp1B", "Tp1F",
+				     "Tp1R";
+		apple,thermal-pressure-key = "mTPL";
 	};
 
 	smc_rtc: rtc {
