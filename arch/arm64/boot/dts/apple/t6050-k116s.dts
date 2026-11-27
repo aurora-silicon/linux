@@ -82,9 +82,9 @@
 		     <AIC_IRQ 0 1531 IRQ_TYPE_LEVEL_HIGH>;
 	interrupt-names = "port0", "port1";
 	iommu-map = <0x100 &dart_apcie0 1 3>,
-		    <0x200 &apcie1_dart 1 1>;
-	/* apcie1_dart probes only once port 1 is up: the host must not wait for it */
-	post-init-providers = <&apcie1_dart>;
+		    <0x200 &dart_apcie1 1 1>;
+	/* dart_apcie1 probes only once port 1 is up: the host must not wait for it */
+	post-init-providers = <&dart_apcie1>;
 
 	port01: pci@1,0 {
 		device_type = "pci";
@@ -141,7 +141,7 @@
 };
 
 /* ADT dart-apcie1 manual-availability: pcie-apple enables it once port 1 is up */
-&apcie1_dart {
+&dart_apcie1 {
 	apple,manual-availability;
 	status = "okay";
 };
