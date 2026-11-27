@@ -516,6 +516,7 @@ static int ane_fw_exclave_mode_stop(struct ane_fw_backend *b)
 static int ane_fw_suspend_firmware(struct ane_fw_backend *b)
 {
 	u8 command[8] = {};
+	size_t mark;
 	u8 *slot;
 	u32 status;
 	int ret;
@@ -529,6 +530,12 @@ static int ane_fw_suspend_firmware(struct ane_fw_backend *b)
 	ret = ane_fw_transport_settle(&b->transport, 2 * NSEC_PER_MSEC, 20 * NSEC_PER_MSEC);
 	if (ret < 0)
 		return ret;
+	/*
+	 * The transport survives a warm sleep, so the arena the 0x31 and
+	 * SUSPEND commands take must be given back once SUSPEND is answered,
+	 * or every sleep would keep it until the next firmware boot.
+	 */
+	mark = ane_fw_transport_mark(&b->transport);
 	ret = ane_fw_exclave_mode_stop(b);
 	if (ret) {
 		ane_h16_session_dump_fwlog(&b->session);
@@ -558,6 +565,9 @@ static int ane_fw_suspend_firmware(struct ane_fw_backend *b)
 	dev_info(&b->pdev->dev, "H17 ANE: SUSPEND reply %*ph\n", (int)sizeof(command), command);
 	if (get_unaligned_le16(command + 6))
 		return -EREMOTEIO;
+	/* Both commands are answered and their replies read. */
+	if (ane_fw_transport_release(&b->transport, mark))
+		dev_warn(&b->pdev->dev, "H17 ANE: SUSPEND arena not released\n");
 	dev_info(&b->pdev->dev, "H17 ANE: SUSPEND acknowledged, wrapper status %#x\n",
 		 ane_rd32(b, b->engine + b->soc->wrapper + 0x48));
 	/*
@@ -1544,8 +1554,13 @@ int ane_fw_staged_runtime_suspend(struct device *dev)
 			return -EBUSY;
 		}
 	}
+	/* Do not cut power at runtime idle if clean firmware stop is disabled. */
+	if (!ane_fw_clean_stop(b) || !b->pmu_base_set) {
+		ane_h16_session_sleep(&b->session, false);
+		return -EBUSY;
+	}
 	b->in_rpm = true;
-	ret = ane_fw_clean_stop(b) ? ane_fw_firmware_stop(b) : 0;
+	ret = ane_fw_firmware_stop(b);
 	if (!ret)
 		ret = ane_fw_power_down(b);
 	b->in_rpm = false;

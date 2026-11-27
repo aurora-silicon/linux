@@ -2369,3 +2369,4 @@ module_platform_driver(dwc3_apple_driver);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Sven Peter <sven@kernel.org>");
 MODULE_DESCRIPTION("DesignWare DWC3 Apple Silicon Glue Driver");
+MODULE_SOFTDEP("pre: xhci_plat_hcd");

@@ -277,8 +277,9 @@ impl crate::g17::Firmware {
         let pair = match self.queues.render.take_pair(slot, owner, packet) {
             Ok(pair) => pair,
             Err(error) => {
-                self.queues.render.pools.rollback(preparation);
+                let rollback = self.rollback_render_pool(preparation);
                 self.queues.buffers.release(buffer)?;
+                rollback?;
                 return if error == EBUSY { Ok(None) } else { Err(error) };
             }
         };
@@ -338,8 +339,9 @@ impl crate::g17::Firmware {
         if packet.is_published() {
             self.queues.render.entry_mut(slot)?.published = true;
         } else {
-            self.queues.render.pools.rollback(preparation);
+            let rollback = self.rollback_render_pool(preparation);
             self.queues.buffers.release(loan.buffer)?;
+            rollback?;
         }
         Ok(missed)
     }

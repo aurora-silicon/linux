@@ -1190,6 +1190,28 @@ const RETIRED_FEATURES: u64 = (uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_COMPUTE
     | uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES) as u64;
 const _: () = assert!(M5_FEATURES & RETIRED_FEATURES == 0);
 
+/// The compute channel features of a GPU whose logical compute queues each hold up to `channels`
+/// physical compute channels ([`pairs::compute_channels_per_owner`]): with more than one, the
+/// kernel fans independent compute commands out itself.
+fn compute_channel_features(channels: u8) -> u64 {
+    if channels > 1 {
+        crate::file::DRM_ASAHI_FEATURE_COMPUTE_MULTI_CHANNEL
+    } else {
+        0
+    }
+}
+
+/// Whether the firmware keeps partial renders (tiler-heap overflow fragment passes) strictly
+/// ordered behind earlier fragment work: advertised where `fragment_busy` drains an outstanding
+/// fragment pass on the pair and each logical render queue uses a single physical render pair.
+fn ordered_partial_renders_feature(fragment_busy: bool, render_pairs: u8) -> u64 {
+    if fragment_busy && render_pairs == 1 {
+        uapi::DRM_ASAHI_FEATURE_ORDERED_PARTIAL_RENDERS as u64
+    } else {
+        0
+    }
+}
+
 /// Event work item ID.
 const EVENT_WORK: u64 = 0;
 /// Short control/retirement polls do not wait behind the longer idle deadline.
@@ -2881,8 +2903,11 @@ impl gpu::Gpu for Gpu {
                 | uapi::DRM_ASAHI_FEATURE_ORDERED_FRAGMENT_BARRIERS as u64
                 | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS)
                 | sync_output::FEATURE_CUMULATIVE_SIGNALS
-                | crate::file::DRM_ASAHI_FEATURE_COMPUTE_TIMEOUT;
+                | crate::file::DRM_ASAHI_FEATURE_COMPUTE_TIMEOUT
+                | compute_channel_features(pairs::compute_channels_per_owner());
         let variant = self.shared.variant;
+        params.features |=
+            ordered_partial_renders_feature(variant.fragment_busy, pairs::per_owner());
         // The M5 command set has no AS-build flag: its validation refuses one.
         if !variant.m5_commands {
             params.features |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_BOUNDED_AS_BUILD);

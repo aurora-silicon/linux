@@ -77,8 +77,10 @@
 #define AOP_EP_COUNT		(AOP_EP_LAST - AOP_EP_FIRST + 1)
 
 struct t6050_aop_ring {
+	/* Set once, by the firmware's first GETBUF; published after its size and IOVA */
 	void *buf;
 	size_t size;
+	dma_addr_t iova;
 	u32 tx_off, tx_size;
 	u32 rx_off, rx_size;
 	bool tx_ready, rx_ready;
@@ -139,21 +141,61 @@ static void t6050_aop_send(struct t6050_aop *aop, u8 ep, u64 msg)
 		dev_err(aop->dev, "endpoint %#x: send %#llx: %d\n", ep, msg, ret);
 }
 
+/*
+ * What a GETBUF gets: 0 a new buffer, 1 the endpoint's own again, as it fits in it, or -EINVAL for
+ * no size or more than the endpoint's buffer holds. An endpoint has one buffer for as long as the
+ * firmware runs: its rings are read from it at a sleep and a wake, by other threads.
+ *
+ * A GETBUF that is answered starts the endpoint's rings over: they are announced again after it,
+ * so the endpoint has none, and sends nothing, until then.
+ */
+static int t6050_aop_getbuf_claim(struct t6050_aop_ring *r, size_t size)
+{
+	int ret;
+
+	if (!size)
+		return -EINVAL;
+	ret = !r->buf ? 0 : size <= r->size ? 1 : -EINVAL;
+	if (ret < 0)
+		return ret;
+
+	WRITE_ONCE(r->tx_ready, false);
+	WRITE_ONCE(r->rx_ready, false);
+	r->seq = 0;
+	r->tx_rptr = 0;
+	r->tx_wptr = 0;
+	return ret;
+}
+
 static void t6050_aop_getbuf(struct t6050_aop *aop, u8 ep, u64 msg)
 {
+	struct t6050_aop_ring *r = &aop->ring[ep - AOP_EP_FIRST];
 	size_t size = (size_t)FIELD_GET(AFK_GETBUF_SIZE, msg) << AFK_BLOCK_SHIFT;
-	dma_addr_t iova;
 	void *buf;
+	int ret;
 
-	buf = dmam_alloc_coherent(aop->dev, size, &iova, GFP_KERNEL);
-	if (!buf) {
-		dev_err(aop->dev, "endpoint %#x: no %#zx byte buffer\n", ep, size);
+	/* Only this endpoint's messages, in order, change its buffer. */
+	ret = t6050_aop_getbuf_claim(r, size);
+	if (ret < 0) {
+		dev_err_ratelimited(aop->dev, "endpoint %#x: no buffer for a %#zx byte GETBUF (has %#zx)\n",
+				    ep, size, r->buf ? r->size : 0);
 		return;
 	}
-	aop->ring[ep - AOP_EP_FIRST].buf = buf;
-	aop->ring[ep - AOP_EP_FIRST].size = size;
+	/* Open again once its rings start (AFK_START_ACK). */
+	clear_bit(ep - AOP_EP_FIRST, &aop->opened);
+	if (!ret) {
+		buf = dmam_alloc_coherent(aop->dev, size, &r->iova, GFP_KERNEL);
+		if (!buf) {
+			dev_err_ratelimited(aop->dev, "endpoint %#x: no %#zx byte buffer\n",
+					    ep, size);
+			return;
+		}
+		r->size = size;
+		/* A reader that finds the buffer finds its size. */
+		smp_store_release(&r->buf, buf);
+	}
 	t6050_aop_send(aop, ep, FIELD_PREP(AFK_TYPE, AFK_GETBUF_ACK) |
-				FIELD_PREP(AFK_GETBUF_IOVA, iova));
+				FIELD_PREP(AFK_GETBUF_IOVA, r->iova));
 }
 
 static int t6050_aop2_take(struct t6050_aop *aop, u8 ep, u32 old, u32 new);
@@ -178,15 +220,17 @@ static void t6050_aop_recv(void *cookie, u8 ep, u64 msg)
 	case AFK_INIT_TX:
 		r->tx_off = FIELD_GET(AFK_RING_OFFSET, msg) << AFK_BLOCK_SHIFT;
 		r->tx_size = FIELD_GET(AFK_RING_SIZE, msg) << AFK_BLOCK_SHIFT;
-		r->tx_ready = true;
+		WRITE_ONCE(r->tx_ready, true);
 		break;
 	case AFK_INIT_RX:
 		r->rx_off = FIELD_GET(AFK_RING_OFFSET, msg) << AFK_BLOCK_SHIFT;
 		r->rx_size = FIELD_GET(AFK_RING_SIZE, msg) << AFK_BLOCK_SHIFT;
-		r->rx_ready = true;
+		WRITE_ONCE(r->rx_ready, true);
 		t6050_aop_send(aop, ep, FIELD_PREP(AFK_TYPE, AFK_START));
 		break;
 	case AFK_START_ACK:
+		/* Started again from a GETBUF: no sleep element of the last setup is pending. */
+		r->closed = false;
 		set_bit(ep - AOP_EP_FIRST, &aop->opened);
 		break;
 	case AFK_RING:
@@ -221,9 +265,12 @@ static const struct apple_rtkit_ops t6050_aop2_rtkit_ops = {
 static int t6050_aop2_view(struct t6050_aop_ring *r, u32 off, u32 size, bool ready,
 			   struct t6050_aop_view *v)
 {
-	if (!ready || !r->buf || size < sizeof(__le32) || off > r->size || size > r->size - off)
+	/* Pairs with t6050_aop_getbuf(): a buffer found here comes with its size. */
+	u8 *buf = smp_load_acquire(&r->buf);
+
+	if (!ready || !buf || size < sizeof(__le32) || off > r->size || size > r->size - off)
 		return -EINVAL;
-	v->hdr = (u8 *)r->buf + off;
+	v->hdr = buf + off;
 	v->bufsz = le32_to_cpu(READ_ONCE(*(__le32 *)v->hdr));
 	if (v->bufsz >= size || (size - v->bufsz) % 3 || v->bufsz < 2 * AFK_QE_SLOT ||
 	    v->bufsz > AFK_RING_MAX)
@@ -259,7 +306,7 @@ static int t6050_aop2_put(struct t6050_aop *aop, u8 ep, const u32 *msg, unsigned
 	__le32 *qe;
 	int ret;
 
-	ret = t6050_aop2_view(r, r->tx_off, r->tx_size, r->tx_ready, &v);
+	ret = t6050_aop2_view(r, r->tx_off, r->tx_size, READ_ONCE(r->tx_ready), &v);
 	if (ret)
 		return ret;
 	dma_rmb();
@@ -316,7 +363,7 @@ static int t6050_aop2_rx_wptr(struct t6050_aop *aop, u8 ep)
 	struct t6050_aop_view v;
 	u32 wptr;
 
-	if (t6050_aop2_view(r, r->rx_off, r->rx_size, r->rx_ready, &v))
+	if (t6050_aop2_view(r, r->rx_off, r->rx_size, READ_ONCE(r->rx_ready), &v))
 		return -EINVAL;
 	dma_rmb();
 	wptr = t6050_aop2_ptr(&v, AFK_PTR_WRITE);
@@ -351,8 +398,8 @@ static int t6050_aop2_take(struct t6050_aop *aop, u8 ep, u32 old, u32 new)
 	struct t6050_aop_view v;
 	int code;
 
-	if (t6050_aop2_view(r, r->rx_off, r->rx_size, r->rx_ready, &v) || old >= v.bufsz ||
-	    new >= v.bufsz)
+	if (t6050_aop2_view(r, r->rx_off, r->rx_size, READ_ONCE(r->rx_ready), &v) ||
+	    old >= v.bufsz || new >= v.bufsz)
 		return -EINVAL;
 	if (old == new)
 		return -ENOMSG;
@@ -746,3 +793,7 @@ static struct platform_driver t6050_aop_driver = {
 	.probe = t6050_aop_probe,
 };
 builtin_platform_driver(t6050_aop_driver);
+
+#if IS_ENABLED(CONFIG_APPLE_T6050_AOP_KUNIT_TEST)
+#include "t6050-aop-test.c"
+#endif

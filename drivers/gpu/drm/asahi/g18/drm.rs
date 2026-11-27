@@ -108,14 +108,14 @@ pub(crate) trait G18DrmRuntime: G18RenderJobSink {
 /// Adapter options fixed at registration.
 #[derive(Debug, Copy, Clone, Default)]
 pub(crate) struct G18DrmConfig {
-    /// Admit compute commands (module parameter `g18_admit_compute`, default 0).
+    /// Admit compute commands (module parameter `g18_admit_compute`, default 1).
     pub(crate) admit_compute: bool,
     /// Admit exactly the native 4x MSAA render set (module parameter
-    /// `g18_admit_msaa4`, default 0; msaa163). Off refuses every
+    /// `g18_admit_msaa4`, default 1; msaa163). Off refuses every
     /// multisampled render as before.
     pub(crate) admit_msaa4: bool,
     /// Admit renders carrying `DRM_ASAHI_RENDER_G18_RESOURCES` (module
-    /// parameter `g18_admit_graphics_scratch`, default 0). Off leaves the
+    /// parameter `g18_admit_graphics_scratch`, default 1). Off leaves the
     /// feature unadvertised and refuses the flag, so Mesa keeps refusing
     /// draws whose programs need a thread-private frame.
     pub(crate) admit_graphics_scratch: bool,
@@ -197,7 +197,7 @@ impl gpu::Gpu for G18DrmGpu {
         params.max_frequency_khz = 0;
         params.usc_generation = G18_USC_GENERATION;
         params.gpu_hal_generation = G18_UAPI_HAL_GENERATION;
-        params.max_commands_per_submission = 1;
+        params.max_commands_per_submission = file::MAX_COMMANDS_PER_SUBMISSION;
         if self.config.admit_graphics_scratch {
             params.features |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_G18_GRAPHICS_SCRATCH as u64;
         }

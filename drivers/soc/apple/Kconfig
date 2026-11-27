@@ -159,7 +159,7 @@ config APPLE_SOC_SLEEP
 	  /chosen/aurora,s2r-mailbox.
 
 	  Only SoCs whose sleep has been measured and tested are supported,
-	  each by its match data: today T8140, T8132 and T6050. On every other
+	  each by its match data: today T8140, T8132, T6050 and T8103. On every other
 	  SoC the driver doesn't bind, and s2idle stays the only system sleep.
 
 	  T6041 (M4 Max) has a driver of its own, t6041-sleep, which binds
@@ -178,6 +178,17 @@ config APPLE_SOC_SLEEP_KUNIT_TEST
 
 	  If unsure, say N.
 
+config APPLE_T6050_AOP_KUNIT_TEST
+	bool "KUnit tests for the T6050 AOP2 driver" if !KUNIT_ALL_TESTS
+	depends on APPLE_SOC_SLEEP && KUNIT=y
+	default KUNIT_ALL_TESTS
+	help
+	  Checks that each AOP2 endpoint gets one ring buffer for as long as
+	  its firmware runs, and that a ring is read only inside it. The tests
+	  touch no hardware.
+
+	  If unsure, say N.
+
 config APPLE_RTKIT
 	tristate "Apple RTKit co-processor IPC protocol"
 	depends on APPLE_MAILBOX
@@ -189,6 +200,21 @@ config APPLE_RTKIT
 	  by various client drivers.
 
 	  Say 'y' here if you have an Apple SoC.
+
+config APPLE_RTKIT_KUNIT_TEST
+	bool "KUnit tests for the Apple RTKit IPC library" if !KUNIT_ALL_TESTS
+	depends on APPLE_RTKIT=y && KUNIT=y
+	default KUNIT_ALL_TESTS
+	help
+	  Feed the RTKit receive handlers the messages a co-processor sends
+	  (HELLO version negotiation, the endpoint map, power state ACKs,
+	  buffer requests, syslog, ioreport, kdebug, CoreAnalytics and crash
+	  reports) and check the replies, with the mailbox send replaced by a
+	  static stub. Check that the crashlog parser follows containers to
+	  the right log and never reads past a truncated or malformed
+	  crashlog. The tests touch no hardware.
+
+	  If unsure, say N.
 
 config APPLE_RTKIT_HELPER
 	tristate "Apple Generic RTKit helper co-processor"
@@ -292,6 +318,12 @@ config APPLE_AOP
 config APPLE_SEP_FV_INTERFACE
 	bool
 
+config APPLE_SEP_HDCP_INTERFACE
+	bool
+	help
+	  The kernel interface through which the display driver runs HDCP 2.2
+	  authentication on the SEP. Selected by the SEP driver.
+
 config APPLE_SEP
 	tristate "Apple SEP (Secure Enclave Processor)"
 	default m if ARCH_APPLE
@@ -312,6 +344,7 @@ config APPLE_SEP
 	select CRYPTO_GCM
 	select CRYPTO_ECDH
 	select APPLE_SEP_FV_INTERFACE
+	select APPLE_SEP_HDCP_INTERFACE
 	select RUST_FW_LOADER_ABSTRACTIONS
 	help
 	  Driver for the Apple SEP (Secure Enclave Processor) on Apple silicon.
