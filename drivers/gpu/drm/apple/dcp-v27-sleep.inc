@@ -18,6 +18,9 @@ module_param(v27_two_stage, bool, 0644);
 static bool v27_early_av_open;
 module_param(v27_early_av_open, bool, 0644);
 MODULE_PARM_DESC(v27_early_av_open, "DIAGNOSTIC: V27 restart: open the AV video interface the restarted firmware publishes, before the CRTC comes on");
+static uint v27_early_av_open_us = 5000;
+module_param(v27_early_av_open_us, uint, 0644);
+MODULE_PARM_DESC(v27_early_av_open_us, "DIAGNOSTIC: the wait after the publication before that open, past the firmware's plug, which closes it (us, at most 100000)");
 MODULE_PARM_DESC(v27_two_stage, "V27 sleep: the panel's soft power state off before the hard one, on after it (macOS's display stage)");
 static bool v27_soft_first = true;
 module_param(v27_soft_first, bool, 0644);
@@ -1964,6 +1967,10 @@ static void dcp_v27_early_open_worker(struct work_struct *work)
 	struct apple_epic_service *service = w->service;
 	struct apple_dcp *dcp = service->ep->dcp;
 
+	unsigned int us = min(READ_ONCE(v27_early_av_open_us), 100000U);
+
+	if (us)
+		usleep_range(us, us + 300);
 	dev_info(dcp->dev, "AV video interface %u: OPEN after the restart: %d\n", service->channel,
 		 afk_service_open(service));
 	dcp_v27_early_av_counted(dcp);
@@ -2662,6 +2669,10 @@ static int dcp_v27_early_restart(struct apple_dcp *dcp, struct dcp_v27_early *e)
 	dcp_s2r_put_darts(dcp);
 	/* The mode set waits for the video interface the power-on brings back (iomfb_template.c) */
 	WRITE_ONCE(dcp->av_video_reopen, v27_early_av_open && av_gen);
+	if (v27_early_av_open && av_gen) {
+		reinit_completion(&dcp->v27_wake_hotplug);
+		WRITE_ONCE(dcp->v27_early_hpd, true);
+	}
 	WRITE_ONCE(dcp->v27_early_av_gen, av_gen);
 	dev_info(dcp->dev, "V27 wake: firmware %s; the panel comes on with its CRTC\n",
 		 pm_resume_via_firmware() ? "back after the sleep" : "restarted, the sleep given up");

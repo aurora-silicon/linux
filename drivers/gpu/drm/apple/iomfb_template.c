@@ -4367,6 +4367,15 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 			dev_info(dcp->dev, "V27 wake: video interface back %lld ms into the mode set\n",
 				 ktime_ms_delta(ktime_get(), start));
 		WRITE_ONCE(dcp->av_video_reopen, false);
+		/* DIAGNOSTIC: then the firmware's report of the panel, as the J714s path waits */
+		if (gen && xchg(&dcp->v27_early_hpd, false)) {
+			if (!wait_for_completion_timeout(&dcp->v27_wake_hotplug,
+							 msecs_to_jiffies(V27_WAKE_VIDEO_MS)))
+				dev_warn(dcp->dev, "V27 wake: no hotplug report after the open\n");
+			else
+				dev_info(dcp->dev, "V27 wake: hotplug report %lld ms into the mode set\n",
+					 ktime_ms_delta(ktime_get(), start));
+		}
 	}
 	if (keep_mode && iomfb_v27_methods_renumbered(dcp->v27_methods)) {
 		if (!wait_for_completion_timeout(&dcp->v27_wake_video,

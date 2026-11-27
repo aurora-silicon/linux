@@ -996,6 +996,8 @@ struct apple_dcp {
 	wait_queue_head_t av_video_wq;
 	/* After a T6030 V27 restart: the count the next mode set waits to see change (0: none) */
 	int v27_early_av_gen;
+	/* DIAGNOSTIC: the mode set after it also waits for the firmware's hotplug report */
+	bool v27_early_hpd;
 	/* DIAGNOSTIC: the restart opens the next publication before counting it (v27_early_av_open) */
 	bool av_video_reopen;
 	bool sleep_host_stop;

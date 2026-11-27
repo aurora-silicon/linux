@@ -543,7 +543,7 @@ static bool trampoline_hotplug_h17p(struct apple_dcp *dcp, int tag,
 		memcpy(out, request->tiled_display,
 		       sizeof(request->tiled_display));
 	/* The V27 wake's mode set waits for the firmware's report of the panel */
-	if (request->connected && dcp->v27_j714s)
+	if (request->connected && (dcp->v27_j714s || READ_ONCE(dcp->v27_early_hpd)))
 		complete(&dcp->v27_wake_hotplug);
 	return trampoline_hotplug(dcp, tag, out, in);
 }
