@@ -153,8 +153,8 @@ struct WaitTarget {
 /// Zero-fault M4 J773g runs (13,873 `fs2c` and 20,506 `c2ta` type-0 handoffs) confirm no GPU
 /// wedge or hang. Which stamp a wait uses is chosen at its site: a producer's `fw_stamp`,
 /// stored at `FINALIZE`, does not yet make its writes visible to work on another firmware
-/// queue, so waits on compute use `ComputeGraph::service_stamp_va` (linux#3349) and waits on
-/// a render's FS use `RenderGraph::fs_service_stamp_va`.
+/// queue, so waits on compute use `ComputeGraph::service_stamp` (linux#3349) and waits on a
+/// render's FS use `RenderGraph::fs_service_stamp`.
 ///
 /// Keep `BarrierType::Hold` (type 1) whenever either producer or consumer carries `InitBM`
 /// (checked against both the waited target and any live `InitBM` flight). Cross-VM switches,
@@ -2458,10 +2458,7 @@ impl Firmware {
                 notifier: r.notifier.va,
                 legacy_empty: r.legacy_empty.va,
                 qinfo: [r.qinfo[0].va, r.qinfo[1].va],
-                user_stamp: [
-                    r.notifier.va + notifier_page::TA_STAMP as u64,
-                    r.notifier.va + notifier_page::FS_STAMP as u64,
-                ],
+                user_stamp: [r.ta_service_stamp().va(), r.fs_service_stamp().va()],
                 fw_stamp: [r.fw_stamp[0].va, r.fw_stamp[1].va],
                 uma_mgr: a.uma_mgr,
                 uma_aux: a.uma_aux,
@@ -2502,10 +2499,7 @@ impl Firmware {
             notifier: r.notifier.va,
             legacy_empty: r.legacy_empty.va,
             qinfo: [r.qinfo[0].va, r.qinfo[1].va],
-            user_stamp: [
-                r.notifier.va + notifier_page::TA_STAMP as u64,
-                r.notifier.va + notifier_page::FS_STAMP as u64,
-            ],
+            user_stamp: [r.ta_service_stamp().va(), r.fs_service_stamp().va()],
             fw_stamp: [r.fw_stamp[0].va, r.fw_stamp[1].va],
             uma_mgr: a.uma_mgr,
             uma_aux: a.uma_aux,
@@ -3450,7 +3444,7 @@ impl Firmware {
         let refs = ComputeRefs {
             notifier: g.notifier.va + notifier_page::COMPUTE_RECORD as u64,
             qinfo: g.qinfo.va,
-            user_stamp: g.notifier.va + notifier_page::COMPUTE_STAMP as u64,
+            user_stamp: g.service_stamp().va(),
             fw_stamp: g.fw_stamp.va,
             work: s.work.va,
             work_gva: s.work.lower_gva.ok_or(EINVAL)?,
@@ -3544,7 +3538,7 @@ impl Firmware {
                 || self.engine.flights.iter().any(|fl| fl.initbm);
             let bar_type = cross_engine_barrier_type(producer_initbm, false);
             let bar = encode::barrier(
-                self.graph.render.fs_service_stamp_va(),
+                self.graph.render.fs_service_stamp().va(),
                 wait_fs.stamp,
                 0x71,
                 target,
@@ -3568,7 +3562,7 @@ impl Firmware {
                 // Compute on another pipe may read what the producer wrote: wait for the
                 // producer pipe's service stamp, not its FINALIZE fw_stamp.
                 let bar = encode::barrier(
-                    self.graph.compute[p_idx].service_stamp_va(),
+                    self.graph.compute[p_idx].service_stamp().va(),
                     wait_c.stamp,
                     work::compute::EVENTS[p_idx],
                     target,
@@ -3917,10 +3911,10 @@ impl Firmware {
         for p_idx in 0..sizes::COMPUTE_PIPES {
             let off = p_idx * work::barrier::SIZE;
             // A render reads what compute wrote: wait for the producer pipe's service stamp, not
-            // its FINALIZE fw_stamp (see `ComputeGraph::service_stamp_va`).
+            // its FINALIZE fw_stamp (see `ComputeGraph::service_stamp`).
             if let Some(wait_c) = plan.ta_compute_wait[p_idx] {
                 let cbar = encode::barrier(
-                    self.graph.compute[p_idx].service_stamp_va(),
+                    self.graph.compute[p_idx].service_stamp().va(),
                     wait_c,
                     work::compute::EVENTS[p_idx],
                     target,
@@ -3936,7 +3930,7 @@ impl Firmware {
             }
             if let Some(wait_c) = plan.fs_compute_wait[p_idx] {
                 let fcbar = encode::barrier(
-                    self.graph.compute[p_idx].service_stamp_va(),
+                    self.graph.compute[p_idx].service_stamp().va(),
                     wait_c,
                     work::compute::EVENTS[p_idx],
                     target,

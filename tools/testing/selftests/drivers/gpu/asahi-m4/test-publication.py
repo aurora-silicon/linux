@@ -70,19 +70,34 @@ assert 'work::compute::EVENTS[pipe]' in prefix_compute_fn
 assert 'work::compute::EVENTS[p_idx]' in c2ta_slice
 assert 'work::compute::EVENTS[p_idx]' in c2fs_slice
 # linux#3349: a render's barriers on a compute pipe wait on that pipe's service stamp, not FINALIZE.
-assert 'self.graph.compute[p_idx].service_stamp_va(),' in c2ta_slice, c2ta_slice
-assert 'self.graph.compute[p_idx].service_stamp_va(),' in c2fs_slice, c2fs_slice
+assert 'self.graph.compute[p_idx].service_stamp().va(),' in c2ta_slice, c2ta_slice
+assert 'self.graph.compute[p_idx].service_stamp().va(),' in c2fs_slice, c2fs_slice
 assert 'fw_stamp' not in c2ta_slice and 'fw_stamp' not in c2fs_slice
 graph_src = (production.parent / 'graph.rs').read_text()
-service_fn = graph_src[graph_src.index('pub(crate) fn service_stamp_va(&self) -> u64 {'):]
-service_fn = service_fn[:service_fn.index('\n    }\n') + 6]
-assert 'self.notifier.va + notifier_page::COMPUTE_STAMP as u64' in service_fn, service_fn
+# One accessor per service-stamp cell: the work item names it (where the firmware stores), retirement
+# reads it, and cross-engine barriers wait on it. Nothing else may name the cell, so the three can
+# never diverge (a barrier on a cell no longer written would hang the queue).
+poll_src = (production.parent / 'poll.rs').read_text()
+for cell, accessor in (('COMPUTE_STAMP', 'fn service_stamp(&self) -> StampCell'),
+                       ('TA_STAMP', 'fn ta_service_stamp(&self) -> StampCell'),
+                       ('FS_STAMP', 'fn fs_service_stamp(&self) -> StampCell')):
+    assert graph_src.count('notifier_page::' + cell) == 1, cell
+    body = graph_src[graph_src.index(accessor):]
+    body = body[:body.index('\n    }\n')]
+    assert 'notifier_page::' + cell in body, (cell, body)
+    assert 'notifier_page::' + cell not in source, cell
+    assert 'notifier_page::' + cell not in poll_src, cell
+assert source.count('user_stamp: g.service_stamp().va(),') == 1
+assert source.count('user_stamp: [r.ta_service_stamp().va(), r.fs_service_stamp().va()],') == 2
+assert poll_src.count('g.service_stamp().read()?') == 2
+assert poll_src.count('g.fs_service_stamp().read()?') == 2
+assert poll_src.count('g.ta_service_stamp().read()?') == 2
 # Cross-pipe compute->compute barriers wait on the producer pipe's service stamp as well.
 c2c_slice = prefix_compute_fn[
     prefix_compute_fn.index('for (p_idx, wait_opt) in c_waits.iter().enumerate()'):
     prefix_compute_fn.index('s.barrier.write(off, &bar)?;')
 ]
-assert 'self.graph.compute[p_idx].service_stamp_va(),' in c2c_slice, c2c_slice
+assert 'self.graph.compute[p_idx].service_stamp().va(),' in c2c_slice, c2c_slice
 assert 'fw_stamp.va' not in c2c_slice, c2c_slice
 assert 'render_bar,' in c2ta_slice and 'BarrierType::Hold' not in c2ta_slice
 assert 'render_bar,' in c2fs_slice and 'BarrierType::Hold' not in c2fs_slice
@@ -92,11 +107,9 @@ assert 'cross_engine_barrier_type(producer_initbm, false)' in fs2c_slice
 fs2c_bar = prefix_compute_fn[
     prefix_compute_fn.index('let fs2c_bar ='):prefix_compute_fn.index('s.barrier.write(0, &bar)?;')
 ]
-assert 'self.graph.render.fs_service_stamp_va(),' in fs2c_bar, fs2c_bar
+assert 'self.graph.render.fs_service_stamp().va(),' in fs2c_bar, fs2c_bar
 assert 'fw_stamp[1].va' not in fs2c_bar, fs2c_bar
-render_service_fn = graph_src[graph_src.index('pub(crate) fn fs_service_stamp_va(&self) -> u64 {'):]
-render_service_fn = render_service_fn[:render_service_fn.index('\n    }\n') + 6]
-assert 'self.notifier.va + notifier_page::FS_STAMP as u64' in render_service_fn, render_service_fn
+
 assert 'bar_type,' in fs2c_slice and 'BarrierType::Hold' not in fs2c_slice
 assert 'let waits_for_timestamps = c.query_access' in can_queue_behind_fn
 assert 'DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2' in params_src
