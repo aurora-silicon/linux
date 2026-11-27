@@ -21,6 +21,7 @@ struct asahi_g17_commit *asahi_g16_stop_now(struct device *dev, struct apple_rtk
 int asahi_g16_sram_restore(void);
 void asahi_g16_sleep_note(u8 step);
 void asahi_g16_snap(struct device *dev, unsigned int when, u32 mask, u32 restore);
+void asahi_g16_snap_config(u64 pa0, u32 len0, u64 pa1, u32 len1, u32 dump);
 bool asahi_g17_commit_finish(struct asahi_g17_commit *c, u32 *saved);
 bool asahi_g17_commit_required(void);
 bool asahi_g17_commit_stops_firmware(void);

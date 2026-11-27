@@ -901,6 +901,12 @@ static const struct asahi_g16_snap_win asahi_g16_snap_wins[] = {
 	{ "gpu pmgr ps", 0x290e80000, 0x4000, true },
 	{ "gpu pmgr +0x10000", 0x290e90000, 0x6000, true },
 	{ "sgx +0x3000000", 0x293000000, 0x400000 },
+	/* Window 1 split for the bisect (reading it whole at a cold start keeps the ASC from booting) */
+	{ "asc page 0", 0x292400000, 0x4000 },
+	{ "asc page 1", 0x292404000, 0x4000 },
+	/* The mailbox words the driver itself reads: +0x0 (status), the A2I and I2A controls */
+	{ "mbox +0x0", 0x292408000, 0x4, true },
+	{ "mbox controls", 0x292408110, 0x8, true },
 };
 
 #define G16_SNAPS	3
@@ -915,16 +921,39 @@ static bool asahi_g16_snap_have[G16_SNAPS];
 #define G16_SNAP_LATE	BIT(31)
 static u32 asahi_g16_snap_late;
 
+/*
+ * Skipped for reads and write-backs: up to two PA ranges (aurora.g16_sleep_snap_skip{0,1}_{pa,len}),
+ * for bisecting a read-sensitive word. Windows whose every snapshot is logged word by word
+ * (non-zero words): aurora.g16_sleep_snap_dump.
+ */
+static u64 asahi_g16_snap_skip_pa[2];
+static u32 asahi_g16_snap_skip_len[2];
+static u32 asahi_g16_snap_dump;
+
+void asahi_g16_snap_config(u64 pa0, u32 len0, u64 pa1, u32 len1, u32 dump)
+{
+	asahi_g16_snap_skip_pa[0] = pa0;
+	asahi_g16_snap_skip_len[0] = len0;
+	asahi_g16_snap_skip_pa[1] = pa1;
+	asahi_g16_snap_skip_len[1] = len1;
+	asahi_g16_snap_dump = dump;
+}
+
 /* Never read: CPU_STATUS (macOS never does). Never written back: CPU_CONTROL, the GPU counters. */
 static bool asahi_g16_snap_skip(const struct asahi_g16_snap_win *w, u32 off, bool write)
 {
-	if (w->pa == 0x292400000 && off == 0x48)
+	u64 pa = w->pa + off;
+	unsigned int r;
+
+	if (pa == 0x292400048)
 		return true;
+	for (r = 0; r < 2; r++)
+		if (asahi_g16_snap_skip_len[r] && pa >= asahi_g16_snap_skip_pa[r] &&
+		    pa < asahi_g16_snap_skip_pa[r] + asahi_g16_snap_skip_len[r])
+			return true;
 	if (!write)
 		return false;
-	if (w->pa == 0x292400000 && off == 0x44)
-		return true;
-	return w->pa == 0x290d10000 && off >= 0x1000 && off < 0x1020;
+	return pa == 0x292400044 || (pa >= 0x290d11000 && pa < 0x290d11020);
 }
 
 static void asahi_g16_snap_needles(struct device *dev, unsigned int n)
@@ -999,6 +1028,15 @@ static void asahi_g16_snap_take(struct device *dev, unsigned int n, u32 mask)
 		for (i = 0; i < w->size / 4; i++)
 			b[i] = asahi_g16_snap_skip(w, 4 * i, false) ? 0 : readl(io + 4 * i);
 		iounmap(io);
+		if (asahi_g16_snap_dump & BIT(k)) {
+			u32 shown = 0;
+
+			for (i = 0; i < w->size / 4; i++)
+				if (b[i] && shown++ < 2048)
+					dev_info(dev, "G16 snap %u dump: %s +%#x (%#llx) = %#x\n", n,
+						 w->name, 4 * i, w->pa + 4 * i, b[i]);
+			dev_info(dev, "G16 snap %u dump: %s: %u non-zero words\n", n, w->name, shown);
+		}
 	}
 	asahi_g16_snap_have[n] = true;
 }

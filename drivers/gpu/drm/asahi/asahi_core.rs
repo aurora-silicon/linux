@@ -297,6 +297,26 @@ module! {
             default: 0,
             description: "DIAGNOSTIC: G16: snapshot these GPU register windows (bit i = window i) before a .prepare stop, at its restart and after it, and log what changed (T6030 sleep bring-up)",
         },
+        g16_sleep_snap_dump: u32 {
+            default: 0,
+            description: "DIAGNOSTIC: G16: log every non-zero word of these snapshot windows (T6030 sleep bring-up)",
+        },
+        g16_sleep_snap_skip0_pa: u64 {
+            default: 0,
+            description: "DIAGNOSTIC: G16: a PA range the snapshots never read or write: start (T6030 sleep bring-up)",
+        },
+        g16_sleep_snap_skip0_len: u32 {
+            default: 0,
+            description: "DIAGNOSTIC: G16: that range's length in bytes",
+        },
+        g16_sleep_snap_skip1_pa: u64 {
+            default: 0,
+            description: "DIAGNOSTIC: G16: a second such range: start",
+        },
+        g16_sleep_snap_skip1_len: u32 {
+            default: 0,
+            description: "DIAGNOSTIC: G16: the second range's length in bytes",
+        },
         g16_sleep_snap_restore: u32 {
             default: 0,
             description: "DIAGNOSTIC: G16: write the words of these snapshot windows that changed back to their values before the stop, before the run bit (T6030 sleep bring-up)",

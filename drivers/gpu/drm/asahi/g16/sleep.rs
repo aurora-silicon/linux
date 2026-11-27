@@ -58,6 +58,7 @@ extern "C" {
     ) -> *mut core::ffi::c_void;
     fn asahi_g16_sram_restore() -> core::ffi::c_int;
     fn asahi_g16_snap(dev: *mut core::ffi::c_void, when: u32, mask: u32, restore: u32);
+    fn asahi_g16_snap_config(pa0: u64, len0: u32, pa1: u64, len1: u32, dump: u32);
     fn asahi_g17_pmp_request(dev: *mut core::ffi::c_void, enable: bool) -> core::ffi::c_int;
     fn asahi_g16_sleep_note(step: u8);
     fn apple_rtkit_resume_rx(rtk: *mut bindings::apple_rtkit);
@@ -108,8 +109,25 @@ impl Firmware {
 }
 
 /// DIAGNOSTIC (T6030 sleep bring-up): the register windows to snapshot around a `.prepare` stop.
-fn snap_mask() -> u32 {
+pub(crate) fn snap_mask() -> u32 {
     crate::module_parameters::g16_sleep_snap.value()
+}
+
+/// DIAGNOSTIC (T6030 sleep bring-up): snapshot `when` of the windows in `mask` (`asahi_g16_snap()`).
+pub(crate) fn snap(dev: *mut core::ffi::c_void, when: u32, mask: u32, restore: u32) {
+    use crate::module_parameters as p;
+    // SAFETY: `dev` is the live GPU device; the C side only reads (and, for `restore`, writes back)
+    // the GPU's own registers.
+    unsafe {
+        asahi_g16_snap_config(
+            p::g16_sleep_snap_skip0_pa.value(),
+            p::g16_sleep_snap_skip0_len.value(),
+            p::g16_sleep_snap_skip1_pa.value(),
+            p::g16_sleep_snap_skip1_len.value(),
+            p::g16_sleep_snap_dump.value(),
+        );
+        asahi_g16_snap(dev, when, mask, restore)
+    }
 }
 
 /// A sleep step, in PMU scratch where the sleep driver keeps its notes: a reset keeps it.
@@ -245,7 +263,7 @@ impl Shared {
                         sram.map_or((0, 0, 0), |r| (r.start as u64, r.save, r.restore));
                     // DIAGNOSTIC (T6030 sleep bring-up): the GPU's registers with it running.
                     if snap_mask() & (1 << 30) == 0 {
-                        asahi_g16_snap(dev, 0, snap_mask(), 0);
+                        snap(dev, 0, snap_mask(), 0);
                     }
                     asahi_g16_stop_now(dev, rtk, start, save, restore)
                 }
@@ -382,20 +400,16 @@ impl Shared {
                             }
                             // DIAGNOSTIC (T6030 sleep bring-up): what the GFX cycle changed,
                             // and the chosen windows written back.
-                            // SAFETY: `dev` is the live GPU device; GFX is on.
-                            unsafe {
-                                asahi_g16_snap(
-                                    self.dev.as_raw().cast(),
-                                    1,
-                                    snap_mask(),
-                                    crate::module_parameters::g16_sleep_snap_restore.value(),
-                                )
-                            };
+                            snap(
+                                self.dev.as_raw().cast(),
+                                1,
+                                snap_mask(),
+                                crate::module_parameters::g16_sleep_snap_restore.value(),
+                            );
                         }
                         let ret = firmware.sleep_restart(held);
                         if held {
-                            // SAFETY: As above.
-                            unsafe { asahi_g16_snap(self.dev.as_raw().cast(), 2, snap_mask(), 0) };
+                            snap(self.dev.as_raw().cast(), 2, snap_mask(), 0);
                         }
                         ret
                     })
