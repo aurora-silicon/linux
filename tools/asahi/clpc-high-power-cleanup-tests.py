@@ -35,6 +35,16 @@ PREFIX = r'''
 #include <stdio.h>
 #include <string.h>
 typedef uint8_t u8;
+typedef int atomic_t;
+static void __attribute__((unused)) atomic_set(atomic_t *v, int i) { *v = i; }
+struct hlist_node { int unused; };
+struct apple_clpc_idle_timer { int timer; };
+static int __attribute__((unused)) apple_clpc_cpuhp_state;
+static void __attribute__((unused)) cpuhp_state_remove_instance_nocalls(int s, struct hlist_node *n) { (void)s; (void)n; }
+static void __attribute__((unused)) timer_delete_sync(int *t) { (void)t; }
+#define scoped_guard(kind, lock) for (int _once = (mutex_lock(lock), 1); _once; _once = (mutex_unlock(lock), 0))
+#define for_each_possible_cpu(cpu) for ((cpu) = 0; (cpu) < 1; (cpu)++)
+#define per_cpu_ptr(ptr, cpu) (&(ptr)[cpu])
 #define APPLE_CLPC_RAILS 2
 #define FREQ_QOS_MIN_DEFAULT_VALUE 0
 #define CPUFREQ_POLICY_NOTIFIER 1
@@ -63,9 +73,12 @@ struct apple_clpc {
     struct device_node *smc_np;
     struct apple_clpc_gpu *gpu;
     struct apple_clpc_ane *ane;
-    struct mutex sample_lock;
+    struct mutex sample_lock, idle_lock;
     struct delayed_work work, idle_work;
-    bool has_pmc, stopped, high_power, high_power_sent, policy_nb_added, low_power;
+    struct apple_clpc_idle_timer *idle_timers;
+    struct hlist_node cpuhp_node;
+    atomic_t idle_armed;
+    bool has_pmc, stopped, high_power, high_power_sent, policy_nb_added, low_power, cpuhp_added;
     u8 high_power_seq;
     enum platform_profile_option profile;
     unsigned long power_next, ane_until;
@@ -109,7 +122,7 @@ static void cancel_delayed_work_sync(struct delayed_work *w) {
 }
 static void apple_pmc_floor_update(void *p, unsigned a, unsigned mask, unsigned saved) {
     (void)p; (void)a; (void)mask; (void)saved;
-    assert(cancels == 4 && !active->work.pending && !active->idle_work.pending);
+    assert(cancels >= 4 && !active->work.pending && !active->idle_work.pending);
     floor_restored = true;
 }
 static int freq_qos_update_request(struct freq_qos_request *q, int value) {
@@ -138,7 +151,7 @@ static int apple_smc_write(struct apple_smc *s, unsigned key, const u8 *p, unsig
     assert(s && key == SMC_KEY(zETM) && size == sizeof(last_record));
     assert(active->sample_lock.held && !node_put && !freed);
     if (cleanup) {
-        assert(detached && debug_removed && floor_restored && cancels == 4);
+        assert(detached && debug_removed && floor_restored && cancels >= 4);
         assert(!active->dev->data && !active->gpu->wake && !active->ane->wake);
         assert(active->stopped && !notifier_removed && !qos_removed);
         assert(active->vote[0].state == 0 && active->vote[1].state == 0);
@@ -182,7 +195,7 @@ static void stop(void) {
     cleanup = true; apple_clpc_stop(&c);
     assert(freed && notifier_removed && qos_removed == 3);
     assert(!c.sample_lock.held && !apple_clpc_clients_lock.held);
-    assert(c.stopped && cancels == 4 && floor_restored && !dev.data);
+    assert(c.stopped && cancels >= 4 && floor_restored && !dev.data);
 }
 int main(void) {
     /* A real successful performance callback sets the qualified sent state. */
