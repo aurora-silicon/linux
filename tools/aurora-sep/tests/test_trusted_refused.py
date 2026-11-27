@@ -42,7 +42,11 @@ class ShowTests(unittest.TestCase):
         state = re.search(r'static struct \{.*?\} sep_diag;', text, re.S).group(0)
         defines = '\n'.join(re.findall(r'^#define SEP_DIAG_(?:TRUSTED_\w+|MAX_EP)\s+\S+$',
                                        HEADER.read_text() + text, re.M))
-        body = function(text, 'trusted_show') + function(text, 'sep_diag_set_trusted')
+        body = (function(text, 'trusted_show')
+                + function(text, 'sep_diag_set_trusted_atomic')
+                + function(text, 'sep_diag_set_trusted')
+                + function(text, 'sep_diag_clear_trusted_refusal_atomic')
+                + function(text, 'sep_diag_clear_trusted_refusal'))
         prefix = '''#include <stdio.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -58,6 +62,11 @@ struct device { int unused; };
 struct device_attribute { int unused; };
 #define atomic_read(p) (*(p))
 #define atomic_set(p, v) (*(p) = (v))
+static inline bool atomic_try_cmpxchg(atomic_t *p, int *old, int val) {
+ if (*p == *old) { *p = val; return true; }
+ *old = *p;
+ return false;
+}
 static int sysfs_emit(char *out, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 static int sysfs_emit(char *out, const char *fmt, ...) {
  va_list args; va_start(args, fmt); int n = vsnprintf(out, 4096, fmt, args); va_end(args); return n;
@@ -66,10 +75,14 @@ static int sysfs_emit(char *out, const char *fmt, ...) {
         main = '''int main(void) {
  char out[4096];
  trusted_show(NULL, NULL, out); fputs(out, stdout);
+ sep_diag_clear_trusted_refusal(); trusted_show(NULL, NULL, out); fputs(out, stdout);
  sep_diag_set_trusted(SEP_DIAG_TRUSTED_REFUSED, -8); trusted_show(NULL, NULL, out); fputs(out, stdout);
+ sep_diag_clear_trusted_refusal(); trusted_show(NULL, NULL, out); fputs(out, stdout);
  sep_diag_set_trusted(SEP_DIAG_TRUSTED_READY, 0); trusted_show(NULL, NULL, out); fputs(out, stdout);
+ sep_diag_clear_trusted_refusal(); trusted_show(NULL, NULL, out); fputs(out, stdout);
  sep_diag_set_trusted(SEP_DIAG_TRUSTED_REFUSED, -128); trusted_show(NULL, NULL, out); fputs(out, stdout);
  sep_diag_set_trusted(SEP_DIAG_TRUSTED_REFUSED, 127); trusted_show(NULL, NULL, out); fputs(out, stdout);
+ sep_diag_clear_trusted_refusal(); trusted_show(NULL, NULL, out); fputs(out, stdout);
  return 0;
 }
 '''
@@ -79,7 +92,10 @@ static int sysfs_emit(char *out, const char *fmt, ...) {
             subprocess.run([compiler, '-std=gnu11', '-Wall', '-Wextra', '-Werror',
                             '-Wno-unused-parameter', str(source), '-o', str(program)], check=True)
             lines = subprocess.check_output([str(program)], text=True).splitlines()
-        self.assertEqual(lines, ['unknown', 'refused -8', 'ready', 'refused -128', 'refused 127'])
+        self.assertEqual(lines, [
+            'unknown', 'unknown', 'refused -8', 'unknown',
+            'ready', 'ready', 'refused -128', 'refused 127', 'unknown',
+        ])
 
 
 # keyctl as the loader uses it. A refused seal writes what the driver would
@@ -94,6 +110,9 @@ case "$1" in
             exit 1
         fi
         if [ -n "${FAKE_WORK:-}" ]; then
+            if [ "${3:-}" = "aurora-sep-load-check" ] && [ -d "$DIAG" ] && [ -n "${FAKE_TRUSTED:-}" ]; then
+                printf 'ready\n' >"$DIAG/trusted"
+            fi
             echo 1234
             exit 0
         fi
@@ -141,51 +160,69 @@ class LoaderTests(unittest.TestCase):
                    PATH=str(bin_dir) + os.pathsep + os.environ['PATH'])
         env.pop('FAKE_REFUSE', None)
         env.pop('FAKE_WORK', None)
+        if trusted is not None:
+            env['FAKE_TRUSTED'] = '1'
         if refuse:
             env['FAKE_REFUSE'] = '1'
-            if trusted is not None:
-                env['FAKE_TRUSTED'] = '1'
         if work:
             env['FAKE_WORK'] = '1'
         began = time.monotonic()
         done = subprocess.run(['sh', str(script)], env=env, capture_output=True, text=True,
                               timeout=30)
         seals = len(calls.read_text().splitlines()) if calls.exists() else 0
-        return done, seals, time.monotonic() - began
+        after_trusted = (diag / 'trusted').read_text().strip() if (diag / 'trusted').exists() else None
+        return done, seals, time.monotonic() - began, after_trusted
 
     def test_first_refusal_stops_the_probe(self):
-        done, seals, took = self.run_loader(trusted='unknown')
+        done, seals, took, after = self.run_loader(trusted='unknown')
         self.assertEqual(done.returncode, 1, done.stderr)
         self.assertEqual(seals, 1)
         self.assertLess(took, 10)
         self.assertIn('diag/trusted: refused -8', done.stderr)
+        self.assertEqual(after, 'refused -8')
 
     def test_rerun_sends_no_seal(self):
-        done, seals, _ = self.run_loader(trusted='refused -8')
+        done, seals, _, after = self.run_loader(trusted='refused -8')
         self.assertEqual(done.returncode, 1, done.stderr)
         self.assertEqual(seals, 0)
         self.assertIn('diag/trusted: refused -8', done.stderr)
+        self.assertEqual(after, 'refused -8')
 
     def test_guard_refusal_is_named_first(self):
         for trusted in ('unknown', 'refused -8'):
             with self.subTest(trusted=trusted):
-                done, seals, _ = self.run_loader(trusted=trusted, guard='1')
+                done, seals, _, _ = self.run_loader(trusted=trusted, guard='1')
                 self.assertEqual(done.returncode, 1, done.stderr)
                 self.assertLessEqual(seals, 1)
                 self.assertIn('xART guard refused', done.stderr)
                 self.assertNotIn('diag/trusted', done.stderr)
 
     def test_without_the_attribute_the_deadline_still_applies(self):
-        done, seals, _ = self.run_loader(trusted=None, timeout='1')
+        done, seals, _, _ = self.run_loader(trusted=None, timeout='1')
         self.assertEqual(done.returncode, 1, done.stderr)
         self.assertGreater(seals, 1)
         self.assertIn('within 1 s', done.stderr)
 
     def test_ready_kernel_still_verifies(self):
-        done, seals, _ = self.run_loader(trusted='ready', refuse=False, work=True)
+        done, seals, _, after = self.run_loader(trusted='ready', refuse=False, work=True)
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(seals, 2)
         self.assertIn('trusted keys work', done.stderr)
+        self.assertEqual(after, 'ready')
+
+    def test_cleared_refusal_lets_rerun_probe_and_reach_ready(self):
+        done, seals, _, after = self.run_loader(trusted='unknown', refuse=False, work=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(seals, 2)
+        self.assertIn('trusted keys work', done.stderr)
+        self.assertEqual(after, 'ready')
+
+    def test_cleared_refusal_re_refuses_if_unlock_fails_again(self):
+        done, seals, _, after = self.run_loader(trusted='unknown', refuse=True, work=False)
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertEqual(seals, 1)
+        self.assertIn('diag/trusted: refused -8', done.stderr)
+        self.assertEqual(after, 'refused -8')
 
 
 if __name__ == '__main__':

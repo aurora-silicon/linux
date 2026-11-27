@@ -247,6 +247,9 @@ void sep_diag_set_xart_guard(unsigned int level, bool list_loaded,
 			     int matching);
 void sep_diag_xart_guard_refused(int matching);
 void sep_diag_set_trusted(int state, int status);
+void sep_diag_set_trusted_atomic(atomic_t *word, int state, int status);
+void sep_diag_clear_trusted_refusal(void);
+void sep_diag_clear_trusted_refusal_atomic(atomic_t *word);
 void sep_diag_bringup_ended(void);
 void sep_diag_set_endpoint(u8 id, u32 name);
 void sep_diag_set_os_identity(int source);

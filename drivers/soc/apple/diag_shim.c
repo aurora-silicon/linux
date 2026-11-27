@@ -1039,13 +1039,38 @@ void sep_diag_set_xart_guard(unsigned int level, bool list_loaded,
 	atomic_set(&sep_diag.matching, matching);
 }
 
+void sep_diag_set_trusted_atomic(atomic_t *word, int state, int status)
+{
+	atomic_set(word, (state & 0xff) | ((u8)status << 8));
+}
+
 /*
  * The latest answer wins: a success after a refusal (or the reverse) is what
  * the next seal or unseal can expect.
  */
 void sep_diag_set_trusted(int state, int status)
 {
-	atomic_set(&sep_diag.trusted, (state & 0xff) | ((u8)status << 8));
+	sep_diag_set_trusted_atomic(&sep_diag.trusted, state, status);
+}
+
+/*
+ * A validated identity unlock (for example through /dev/sep-key) clears any
+ * stale refusal so a loader re-run probes again, while leaving "ready" tied
+ * to a working trusted-key unseal.
+ */
+void sep_diag_clear_trusted_refusal_atomic(atomic_t *word)
+{
+	int old = atomic_read(word);
+
+	while ((old & 0xff) == SEP_DIAG_TRUSTED_REFUSED) {
+		if (atomic_try_cmpxchg(word, &old, SEP_DIAG_TRUSTED_UNKNOWN))
+			break;
+	}
+}
+
+void sep_diag_clear_trusted_refusal(void)
+{
+	sep_diag_clear_trusted_refusal_atomic(&sep_diag.trusted);
 }
 
 /* With matching as the refusal leaves it. */

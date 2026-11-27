@@ -619,6 +619,7 @@ Description:
 		A refusal is the enclave's answer for this key bag, not a
 		lost reply, and a test or loader stops on it rather than
 		asking again. An xART guard refusal (xart_guard_refusals)
-		can cause one: check that first. A later unseal that works
-		changes the value back to "ready". The value resets to
-		"unknown" when the driver binds.
+		can cause one: check that first. A later identity unlock that
+		works clears a stale refusal back to "unknown", and a later
+		unseal that works changes the value to "ready". The value
+		resets to "unknown" when the driver binds.
