@@ -1860,10 +1860,10 @@
 	};
 
 	/*
-	 * Disabled until the H16 firmware path is proven on hardware. The
-	 * loader fills the preload reservations and the firmware IOVAs from
-	 * the ADT, so enabling it then only takes status = "okay" here and on
-	 * the three DARTs.
+	 * H16 is proven on the J616s; the node stays off until the loader
+	 * fills the preload reservations and the firmware IOVAs from the ADT.
+	 * Enabling it then only takes status = "okay" on this node and the
+	 * three DARTs.
 	 */
 	ane: ane@484000000 {
 		compatible = "apple,t6041-ane";
