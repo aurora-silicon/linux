@@ -21,6 +21,7 @@ on:
       - 'drivers/iommu/**'
       - 'drivers/media/platform/apple/**'
       - 'drivers/mfd/**'
+      - 'drivers/net/wireless/apple/**'
       - 'drivers/nvme/host/**'
       - 'drivers/nvmem/**'
       - 'drivers/pci/controller/**'
@@ -49,6 +50,7 @@ on:
       - 'drivers/iommu/**'
       - 'drivers/media/platform/apple/**'
       - 'drivers/mfd/**'
+      - 'drivers/net/wireless/apple/**'
       - 'drivers/nvme/host/**'
       - 'drivers/nvmem/**'
       - 'drivers/pci/controller/**'
@@ -111,7 +113,7 @@ jobs:
           for opt in RUST=y DRM_ASAHI=m DRM_APPLE=m DRM_ACCEL_ANE=m VIDEO_APPLE_AVD=m \
                      NVME_APPLE=m APPLE_DART=y PCIE_APPLE=y USB4=m USB4_APPLE_SOC=m \
                      SPI_HID_APPLE_OF=m MFD_MACSMC=y MACSMC_POWER=m POWER_RESET_MACSMC=m \
-                     APPLE_SEP=m KSM=y MM_SUBPAGE=y; do
+                     APPLE_SEP=m KSM=y MM_SUBPAGE=y APPLE_CENTAURI_T6050_WIFI=y; do
             grep -qx "CONFIG_$opt" .config || { echo "::error::CONFIG_$opt is not set"; exit 1; }
           done
       - name: Compile the Apple drivers
@@ -125,6 +127,7 @@ jobs:
             drivers/iommu/ \
             drivers/media/platform/apple/ \
             drivers/mfd/ \
+            drivers/net/wireless/apple/ \
             drivers/nvme/host/ \
             drivers/nvmem/ \
             drivers/pci/controller/ \
