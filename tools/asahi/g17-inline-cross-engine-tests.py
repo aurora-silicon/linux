@@ -35,6 +35,7 @@ MUTATIONS = [
     'block-firmware-early',
     'skip-compute-producer-check',
     'skip-render-producer-check',
+    'copy-try-early-bool',
 ]
 
 
@@ -67,6 +68,13 @@ def build_harness(mutation=None):
     loop_end = queue_src.index('producer_waits.finish(', loop_start)
     loop_block = queue_src[loop_start:loop_end]
 
+    # Extract the exact inline_published expression from Scheduler::enqueue().
+    inline_pub_sig = '            inline_published: '
+    assert job_src.count(inline_pub_sig) == 1, inline_pub_sig
+    ip_start = job_src.index(inline_pub_sig) + len(inline_pub_sig)
+    ip_end = job_src.index(',', ip_start)
+    inline_pub_expr = job_src[ip_start:ip_end].strip()
+
     if mutation == 'always-wait-scheduled':
         old = 'if !*published && job::fence_status(scheduled) <= 0 {'
         assert old in loop_block
@@ -88,11 +96,13 @@ def build_harness(mutation=None):
         old = 'if let Err(error) = packet.check_firmware_producers() {'
         assert old in rend_early_fn
         rend_early_fn = rend_early_fn.replace(old, 'if let Err::<(), i32>(error) = Ok(()) {', 1)
+    elif mutation == 'copy-try-early-bool':
+        assert inline_pub_expr == 'inline && packet.is_published()', inline_pub_expr
+        inline_pub_expr = 'inline'
 
     # Verify structural pieces that feed into inline_published.
     fences_has_inline = (
         'pub(crate) inline_published: bool,' in job_src
-        and 'inline_published: inline,' in job_src
         and 'firmware_published.push(entry.inline_published(), GFP_KERNEL)?;' in queue_src
     )
 
@@ -168,6 +178,7 @@ struct Packet {{
     firmware: Vec<Fence>,
     producer_err: Option<i32>,
     began: Cell<bool>,
+    published: Cell<bool>,
     early_result: Cell<Option<Result>>,
     completion: Completion,
 }}
@@ -186,9 +197,16 @@ impl Packet {{
         self.began.set(true);
         ok
     }}
+    fn is_published(&self) -> bool {{
+        self.published.get()
+    }}
     fn set_early_result(&self, res: Result) {{
         self.early_result.set(Some(res));
     }}
+}}
+
+fn compute_inline_published(inline: bool, packet: &Packet) -> bool {{
+    {inline_pub_expr}
 }}
 
 struct Backend {{
@@ -232,6 +250,7 @@ fn pkt(inputs: Vec<Fence>, firmware: Vec<Fence>, producer_err: Option<i32>) -> P
         firmware,
         producer_err,
         began: Cell::new(false),
+        published: Cell::new(false),
         early_result: Cell::new(None),
         completion: Completion {{ failed_unpublished: Cell::new(None) }},
     }}
@@ -289,6 +308,23 @@ fn main() {{
     assert!(b.run_render_early_guard(&p_err_r));
     assert_eq!(p_err_r.completion.failed_unpublished.get(), Some(EIO), "render must catch failed producer");
     assert_eq!(p_err_r.early_result.get(), Some(Err(EIO)));
+
+    // 6. Early failed producer (try_early returned true without hardware publication)
+    //    followed by a cross-engine consumer: inline_published MUST be false so the
+    //    consumer keeps its scheduled-fence wait and never omits it.
+    assert!(!p_err_c.is_published(), "early failed producer was never published to firmware");
+    let prod_inline_pub = compute_inline_published(true, &p_err_c);
+    assert!(!prod_inline_pub, "inline_published must be false when try_early failed unpublished");
+    let (deps, fw) = filter_producers(&[(sched_pending, comp_pending)], &[prod_inline_pub]);
+    assert_eq!(deps.len(), 1, "consumer after early-failed producer must keep scheduled wait");
+    assert_eq!(deps[0].id, 10);
+    assert_eq!(fw.len(), 1);
+
+    // Confirm a genuinely firmware-published inline producer sets inline_published = true.
+    let p_ok = pkt(vec![], vec![], None);
+    p_ok.published.set(true);
+    assert!(compute_inline_published(true, &p_ok));
+    assert!(!compute_inline_published(false, &p_ok));
 
     println!("PASS g17 inline cross-engine publication");
 }}

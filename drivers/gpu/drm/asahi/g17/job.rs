@@ -696,7 +696,7 @@ impl<B: Backend> Scheduler<B> {
             completed,
             publication: host_publication,
             owner: packet.completion.clone(),
-            inline_published: inline,
+            inline_published: inline && packet.is_published(),
         })
     }
 }
