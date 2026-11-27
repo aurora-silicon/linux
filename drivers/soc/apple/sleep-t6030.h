@@ -391,6 +391,7 @@ static void t6030_pmu_boot_record(struct apple_sleep *s);
 static void t6030_pwrgate_boot(struct apple_sleep *s);
 static void t6030_eng_probe(struct apple_sleep *s);
 static void t6030_eng_boot_record(struct apple_sleep *s);
+static void t6030_dbgprcr_report(struct apple_sleep *s);
 
 static int t6030_mem_config_apply(struct apple_sleep *s);
 static bool t6030_mem_config_boot_on(void);
@@ -467,6 +468,7 @@ static int t6030_sleep_map_regs(struct apple_sleep *s)
 	t6030_ovrd_report(s, "probe");
 	t6030_eng_probe(s);
 	t6030_eng_boot_record(s);
+	t6030_dbgprcr_report(s);
 	t6030_pmu_boot_record(s);
 	t6030_pwrgate_boot(s);
 	if (t6030_mem_config_boot_on())
@@ -2824,6 +2826,42 @@ static void t6030_sleep_wake(struct apple_sleep *s)
  * EL1 pair (macOS's per-core init leaves cntp_ctl = 2) and stops the core PMU (PMCR0 = 0), as
  * XNU's core-offline path does before its deep WFI. Boot parameter, off by default (A/B).
  */
+/*
+ * DIAGNOSTIC (T6030 sleep bring-up): the core's debug power-down request. Before its final WFI,
+ * macOS 27.2 clears each core's EDPRCR through the external-debug window (EDLAR unlocked, then
+ * EDPRCR = 0, twice), which clears CORENPDRQ: a request that keeps the core from powering down.
+ * That window hangs this SoC, but the same bit reads through DBGPRCR_EL1. The probe logs every
+ * core's; apple_sleep.dbg_pdrq=1 writes it 0 on every core before its final WFI.
+ */
+#define T6030_DBGPRCR_EL1		sys_reg(2, 0, 1, 4, 4)
+#define T6030_DBGPRCR_CORENPDRQ		BIT(0)
+
+static bool t6030_dbg_pdrq;
+module_param_named(dbg_pdrq, t6030_dbg_pdrq, bool, 0444);
+MODULE_PARM_DESC(dbg_pdrq, "T6030 DIAGNOSTIC: DBGPRCR_EL1 = 0 (CORENPDRQ clear) before each core's final WFI");
+
+static u64 t6030_dbgprcr[NR_CPUS];
+
+static void t6030_dbgprcr_read(void *unused)
+{
+	unsigned int cpu = smp_processor_id();
+
+	if (cpu < NR_CPUS)
+		t6030_dbgprcr[cpu] = read_sysreg_s(T6030_DBGPRCR_EL1);
+}
+
+static void t6030_dbgprcr_report(struct apple_sleep *s)
+{
+	unsigned int cpu, req = 0;
+
+	on_each_cpu(t6030_dbgprcr_read, NULL, 1);
+	for_each_online_cpu(cpu)
+		if (cpu < 32 && (t6030_dbgprcr[cpu] & T6030_DBGPRCR_CORENPDRQ))
+			req |= BIT(cpu);
+	dev_info(s->dev, "DBGPRCR_EL1 at probe: CORENPDRQ set on cpus %#x (cpu0 %#llx, cpu6 %#llx, %u online)\n",
+		 req, t6030_dbgprcr[0], t6030_dbgprcr[min(6U, NR_CPUS - 1)], num_online_cpus());
+}
+
 static bool t6030_no_wfi_clean;
 module_param_named(no_wfi_clean, t6030_no_wfi_clean, bool, 0444);
 MODULE_PARM_DESC(no_wfi_clean, "T6030 DIAGNOSTIC: no set/way clean or HID4 toggles before each core's final WFI");
@@ -2836,6 +2874,10 @@ static void t6030_deep_wfi_arm(void)
 {
 	u64 hid4;
 
+	if (READ_ONCE(t6030_dbg_pdrq)) {
+		write_sysreg_s(0, T6030_DBGPRCR_EL1);
+		isb();
+	}
 	if (READ_ONCE(t6030_quiet)) {
 		if (is_kernel_in_hyp_mode()) {
 			write_sysreg_s(ARCH_TIMER_CTRL_IT_MASK, SYS_CNTP_CTL_EL02);
