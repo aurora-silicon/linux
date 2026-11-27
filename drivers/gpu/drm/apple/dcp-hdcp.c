@@ -392,8 +392,37 @@ static void dcp_hdcp_apply(struct dcp_hdcp *h, enum dcp_hdcp_action action)
 	queue_work(h->wq, &h->prop_work);
 }
 
+/*
+ * DCP offers a session at link-up and keeps it open until it closes it; a
+ * local disable only idles it. Asked for protection again while that session
+ * is still open, run on it instead of waiting for the next link-up.
+ */
+static void dcp_hdcp_queue(struct dcp_hdcp *h, struct apple_epic_service *service,
+			   u8 op);
+
+static void dcp_hdcp_reuse_locked(struct dcp_hdcp *h, unsigned long now)
+{
+	struct apple_epic_service *service;
+	unsigned long flags;
+
+	lockdep_assert_held(&h->lock);
+	spin_lock_irqsave(&h->svc_lock, flags);
+	service = h->closed ? NULL : h->session;
+	spin_unlock_irqrestore(&h->svc_lock, flags);
+	/* Only a session from this link: after a link change it is gone with the link. */
+	if (!service || h->session_gen != h->gen || !dcp_hdcp_open(&h->link, h->gen, now))
+		return;
+	h->session_gen = h->gen;
+	spin_lock_irqsave(&h->svc_lock, flags);
+	h->ev_bits = 0;
+	h->cancel = false;
+	h->open_seq++;
+	spin_unlock_irqrestore(&h->svc_lock, flags);
+	dcp_hdcp_queue(h, service, DCP_HDCP_AUTH_CONFIG);
+}
+
 /* The bound state of both sides, then what the connector asks for. */
-static void dcp_hdcp_sync_locked(struct dcp_hdcp *h)
+static void dcp_hdcp_sync_locked(struct dcp_hdcp *h, bool reuse)
 {
 	unsigned long now = jiffies;
 	enum dcp_hdcp_action a, b;
@@ -405,12 +434,14 @@ static void dcp_hdcp_sync_locked(struct dcp_hdcp *h)
 	dcp_hdcp_want(h, &want, &type);
 	b = dcp_hdcp_request(&h->link, want, type, now);
 	dcp_hdcp_apply(h, a == DCP_HDCP_TEARDOWN ? a : b);
+	if (reuse && a != DCP_HDCP_TEARDOWN && b == DCP_HDCP_KICK)
+		dcp_hdcp_reuse_locked(h, now);
 }
 
 static void dcp_hdcp_sync(struct dcp_hdcp *h)
 {
 	mutex_lock(&h->lock);
-	dcp_hdcp_sync_locked(h);
+	dcp_hdcp_sync_locked(h, true);
 	mutex_unlock(&h->lock);
 }
 
@@ -688,9 +719,14 @@ static int dcp_hdcp_session_call(struct apple_epic_service *service, u16 group,
 
 	if (h && !group && command == DCP_HDCP_AUTH_OPEN) {
 		mutex_lock(&h->lock);
-		dcp_hdcp_sync_locked(h);
+		/* Not the earlier session: this one is DCP's offer. */
+		dcp_hdcp_sync_locked(h, false);
 		accept = !dcp_hdcp_is_hdcp1(h, service) &&
 			 dcp_hdcp_open(&h->link, h->gen, jiffies);
+		dev_dbg(h->dcp->dev,
+			"HDCP: session %u open %s (state %d relay %d sep %d failures %u hold %d)\n",
+			service->channel, accept ? "taken" : "declined", h->link.state,
+			h->link.relay, h->link.sep, h->link.failures, h->link.hold);
 		if (accept)
 			h->session_gen = h->gen;
 		mutex_unlock(&h->lock);
