@@ -8680,16 +8680,17 @@ static int apple_dart_t8020_display_streams(struct apple_dart *dart, u32 streams
  */
 int apple_dart_display_keep(struct device *dev, u32 streams, bool save)
 {
-	static struct { struct apple_dart *dart; u32 tcr[32]; u32 ttbr[32][4]; } keep[2];
+	/* Two DARTs (DCP and display) for each of the T6041's five display processors. */
+	static struct { struct apple_dart *dart; u32 tcr[32]; u32 ttbr[32][4]; } keep[10];
 	struct apple_dart *dart = dev_get_drvdata(dev);
 	unsigned long bits = streams;
 	unsigned int sid, idx, k, n = 0;
 
 	if (!dart)
 		return -ENODEV;
-	for (k = 0; k < 2 && keep[k].dart && keep[k].dart != dart; k++)
+	for (k = 0; k < ARRAY_SIZE(keep) && keep[k].dart && keep[k].dart != dart; k++)
 		;
-	if (k == 2)
+	if (k == ARRAY_SIZE(keep))
 		return -ENOSPC;
 	if (!save && keep[k].dart != dart)
 		return -ENOENT;
