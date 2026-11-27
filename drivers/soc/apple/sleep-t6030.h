@@ -388,6 +388,7 @@ static void t6030_last_writes_filter(struct apple_sleep *s, struct sleep_seq *se
 static void t6030_last_pmu_boot(struct apple_sleep *s);
 static void t6030_spmi1_probe(struct apple_sleep *s);
 static void t6030_pmu_boot_record(struct apple_sleep *s);
+static void t6030_pwrgate_boot(struct apple_sleep *s);
 
 static int t6030_mem_config_apply(struct apple_sleep *s);
 static bool t6030_mem_config_boot_on(void);
@@ -463,6 +464,7 @@ static int t6030_sleep_map_regs(struct apple_sleep *s)
 	t6030_late_map(s);
 	t6030_ovrd_report(s, "probe");
 	t6030_pmu_boot_record(s);
+	t6030_pwrgate_boot(s);
 	if (t6030_mem_config_boot_on())
 		t6030_mem_config_apply(s);
 	if (t6030_last_writes_on())
@@ -665,6 +667,41 @@ static int t6030_pmu_xfer(struct apple_sleep *s, u32 mask, u8 opcode, u16 addres
  * boot, and the scratch notes are what the last sleep left. Reads only.
  */
 #define T6030_PMU_OFF2WAKE		0x281c
+
+/*
+ * DIAGNOSTIC (T6030 sleep bring-up): the cluster power-gate enables in pmgr[28] ("pwrgate"). At
+ * each wake (+3.6 ms) macOS's ApplePMGR reads +0x0 (the E cluster's, set by iBoot) and writes it
+ * back, then reads +0x60 (the P cluster's, 0) and writes 0x80000000. Linux never touched them.
+ * On the Neo the P cluster's enable left P0 clock-gated, and the sleep engine waited at P_DOWN
+ * forever. The probe logs +0x0..+0xfc; apple_sleep.pcluster_pg=1 also makes macOS's writes.
+ */
+#define T6030_PWRGATE_E_CLUSTER		0x0
+#define T6030_PWRGATE_P_CLUSTER		0x60
+#define T6030_PWRGATE_ENABLE		BIT(31)
+#define T6030_PWRGATE_WORDS		64
+
+static bool t6030_pcluster_pg;
+module_param_named(pcluster_pg, t6030_pcluster_pg, bool, 0444);
+MODULE_PARM_DESC(pcluster_pg, "T6030 DIAGNOSTIC: macOS's cluster power-gate enables (pwrgate +0x0 back, +0x60 = 0x80000000) at probe");
+
+static void t6030_pwrgate_boot(struct apple_sleep *s)
+{
+	u32 w[T6030_PWRGATE_WORDS], p;
+	int i;
+
+	for (i = 0; i < T6030_PWRGATE_WORDS; i++)
+		w[i] = readl(s->pwrgate + 4 * i);
+	print_hex_dump(KERN_INFO, "apple-sleep pwrgate: ", DUMP_PREFIX_OFFSET, 32, 4, w, sizeof(w),
+		       false);
+	if (!READ_ONCE(t6030_pcluster_pg))
+		return;
+	writel(readl(s->pwrgate + T6030_PWRGATE_E_CLUSTER), s->pwrgate + T6030_PWRGATE_E_CLUSTER);
+	p = readl(s->pwrgate + T6030_PWRGATE_P_CLUSTER);
+	writel(T6030_PWRGATE_ENABLE, s->pwrgate + T6030_PWRGATE_P_CLUSTER);
+	dev_info(s->dev, "pcluster_pg: P cluster power gate %#x -> %#x (E %#x)\n", p,
+		 readl(s->pwrgate + T6030_PWRGATE_P_CLUSTER),
+		 readl(s->pwrgate + T6030_PWRGATE_E_CLUSTER));
+}
 
 static void t6030_pmu_boot_record(struct apple_sleep *s)
 {
@@ -2989,8 +3026,8 @@ static const u8 t6030_obs_aon_words[] = {
 	0x58, 0x60, 0x68, 0x70, 0x78, 0x80, 0x88, 0x90, 0x98, 0xa0, 0xa8,
 };
 #define T6030_OBS_BLK_PTD		17
-#define T6030_PTD_REQUEST		0x1180
-#define T6030_PTD_ACK			0x11c0
+#define T6030_OBS_PTD_REQ		0x1180
+#define T6030_OBS_PTD_ACK		0x11c0
 
 static void t6030_obs_waits(struct apple_sleep *s, u8 *v)
 {
@@ -3010,7 +3047,7 @@ static void t6030_obs_waits(struct apple_sleep *s, u8 *v)
 	v[3] = (on >> 24) & 0xf;
 	if (!ptd)
 		v[3] |= BIT(5);
-	else if (readl(ptd + T6030_PTD_REQUEST) != readl(ptd + T6030_PTD_ACK))
+	else if (readl(ptd + T6030_OBS_PTD_REQ) != readl(ptd + T6030_OBS_PTD_ACK))
 		v[3] |= BIT(4);
 	v[4] = FIELD_GET(PS_ACTUAL, readl(s->ps + t6030_obs_ps_words[0])) << 4 |
 	       FIELD_GET(PS_ACTUAL, readl(s->ps + t6030_obs_ps_words[1]));
