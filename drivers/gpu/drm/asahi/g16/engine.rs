@@ -3564,8 +3564,10 @@ impl Firmware {
                 let producer_initbm =
                     wait_c.initbm || self.engine.flights.iter().any(|fl| fl.initbm);
                 let bar_type = cross_engine_barrier_type(producer_initbm, false);
+                // Compute on another pipe may read what the producer wrote: wait for the
+                // producer pipe's service stamp, not its FINALIZE fw_stamp.
                 let bar = encode::barrier(
-                    self.graph.compute[p_idx].fw_stamp.va,
+                    self.graph.compute[p_idx].service_stamp_va(),
                     wait_c.stamp,
                     work::compute::EVENTS[p_idx],
                     target,

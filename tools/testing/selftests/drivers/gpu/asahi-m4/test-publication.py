@@ -77,6 +77,13 @@ graph_src = (production.parent / 'graph.rs').read_text()
 service_fn = graph_src[graph_src.index('pub(crate) fn service_stamp_va(&self) -> u64 {'):]
 service_fn = service_fn[:service_fn.index('\n    }\n') + 6]
 assert 'self.notifier.va + notifier_page::COMPUTE_STAMP as u64' in service_fn, service_fn
+# Cross-pipe compute->compute barriers wait on the producer pipe's service stamp as well.
+c2c_slice = prefix_compute_fn[
+    prefix_compute_fn.index('for (p_idx, wait_opt) in c_waits.iter().enumerate()'):
+    prefix_compute_fn.index('s.barrier.write(off, &bar)?;')
+]
+assert 'self.graph.compute[p_idx].service_stamp_va(),' in c2c_slice, c2c_slice
+assert 'fw_stamp.va' not in c2c_slice, c2c_slice
 assert 'render_bar,' in c2ta_slice and 'BarrierType::Hold' not in c2ta_slice
 assert 'render_bar,' in c2fs_slice and 'BarrierType::Hold' not in c2fs_slice
 assert 'BarrierType::Stamp,' in prefix_render_fn[prefix_render_fn.index('let own = encode::barrier'):prefix_render_fn.index('p.own_barrier.write')]
