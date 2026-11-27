@@ -47,7 +47,7 @@ fn main() {
             uma_mgr:[f+0x300000,f+0x300000],uma_aux:[f+0x300100,f+0x300200],uma_gpu:g+0x6000000,pb_mgr:f+0x3000000,
             scene_list:g+0x500000,parameter_id:[0,3,31,15][v],generation:[1,2,254,127][v],
             activity:[f+0x900004,f+0xa00008],counter:[2+v as u64*2,1+v as u64*2],
-            uma_submitted:2+v as u64*2,uuid:0x123400+v as u32,usc_base:1<<40,
+            uma_submitted:2+v as u64*2,uuid:0x123400+v as u32,usc_base:1<<40, event: [0x70, 0x71],
             ..Default::default()
         };
         let p=encode::PassRefs {
