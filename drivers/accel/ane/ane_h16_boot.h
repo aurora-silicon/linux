@@ -439,10 +439,13 @@ static inline int ane_h16_prepare(struct ane_h16_boot *b)
 {
 	const struct ane_h16_build *f = b->build;
 	unsigned int i, j;
-	int ret = ane_h16_ce(b);
+	int ret;
 
-	if (ret)
-		return ret;
+	if (f->ce) {
+		ret = ane_h16_ce(b);
+		if (ret)
+			return ret;
+	}
 	for (i = 0; i < f->tunable_count; i++) {
 		const struct ane_h16_tunables *group = &f->tunables[i];
 

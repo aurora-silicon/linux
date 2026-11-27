@@ -32,7 +32,7 @@ pre = pre.replace('struct vb2_buffer { struct { size_t length; } planes[1]; dma_
                   'struct vb2_buffer { struct { size_t length; } planes[1]; dma_addr_t dma; void *cpu; size_t payload; u64 timestamp; };')
 pre = pre.replace('struct avd_comp comp; unsigned int bank;', 'struct avd_comp comp; unsigned int bank; struct { unsigned int width,height,bit_depth; } vp9;')
 pre = pre.replace('struct vb2_v4l2_buffer *dst; } bufs;', 'struct vb2_v4l2_buffer *src,*dst; } bufs;')
-pre = pre.replace('unsigned int fifo_idx, pp_total;', 'unsigned int fifo_idx, pp_total, max_frames; int ctrl_hdl;')
+pre = pre.replace('unsigned int fifo_idx, pp_total;', 'unsigned int fifo_idx, pp_total, max_frames; int ctrl_hdl; bool scratch_sized; enum avd_image_fmt scratch_fmt;')
 pre = pre.replace('static int avd_buf_alloc(struct avd_dev *d, struct avd_buf *b, size_t n)',
                   '#ifdef AVD_TEST_VP_READY\nstatic struct avd_ctx *allocating_ctx;\nstatic int fail_alloc_after;\nstatic bool avd_vp9_ready(struct avd_ctx *);\n#endif\nstatic int avd_buf_alloc(struct avd_dev *d, struct avd_buf *b, size_t n)')
 pre = pre.replace('{ (void)d; free(b->cpu); b->cpu = calloc(1,n);',
@@ -59,9 +59,10 @@ pre += r'''
 enum vb2_buffer_state { STATE_DUMMY };
 #define dev_err(d,...) ((void)(d))
 #define kzalloc(n,f) calloc(1,n)
-#define kfree free
+#define kfree(p) free((void *)(p))
 static bool vp_feature = true;
 static bool avd_qfw_has_vp_done(const struct avd_dev *d) { return d->queued && vp_feature; }
+static bool avd_backend_is_open(const struct avd_dev *d) { return !d->queued; }
 static void *vb2_plane_vaddr(struct vb2_buffer *b,int p) { (void)p;return b->cpu; }
 static size_t vb2_get_plane_payload(struct vb2_buffer *b,int p) { (void)p;return b->payload; }
 static struct vb2_v4l2_buffer *current_src,*current_dst;
@@ -71,6 +72,32 @@ struct v4l2_ctrl { union { void *p; } p_cur; };
 static struct v4l2_ctrl_vp9_frame params;
 static struct v4l2_ctrl_vp9_compressed_hdr updates;
 static struct v4l2_ctrl frame_ctrl,update_ctrl;
+static struct v4l2_ctrl *locked_ctrl;
+
+static void v4l2_ctrl_lock(struct v4l2_ctrl *ctrl)
+{
+ assert(!locked_ctrl);
+ locked_ctrl = ctrl;
+}
+
+static void v4l2_ctrl_unlock(struct v4l2_ctrl *ctrl)
+{
+ assert(locked_ctrl == ctrl);
+ locked_ctrl = NULL;
+}
+
+static void *kmemdup(const void *source, size_t size, int flags)
+{
+ void *copy;
+
+ (void)flags;
+ assert(locked_ctrl);
+ copy = malloc(size);
+ if (copy)
+  memcpy(copy, source, size);
+ return copy;
+}
+
 static struct v4l2_ctrl *v4l2_ctrl_find(void *h,u32 id) {
  (void)h;frame_ctrl.p_cur.p=&params;update_ctrl.p_cur.p=&updates;
  return id==V4L2_CID_STATELESS_VP9_FRAME?&frame_ctrl:&update_ctrl;
@@ -80,10 +107,15 @@ static void avd_run_preamble(struct avd_ctx *ctx,struct avd_run *run) {
  run->coded_in=current_src->vb2_buf.dma;run->comp_out=current_dst->vb2_buf.dma;
  run->y_out=run->comp_out+0x100000;run->uv_out=run->comp_out+0x300000;
 }
+/* avd-fmt-test.c independently exercises the run image format check. */
+static int avd_check_run_image_fmt(struct avd_ctx *ctx, int fmt)
+{
+ (void)ctx;(void)fmt;return 0;
+}
 static void avd_run_postamble(struct avd_ctx *ctx,struct avd_run *run) { (void)ctx;(void)run; }
 static int avd_init_job(struct avd_ctx *ctx,int codec,size_t segments) {
  free(ctx->job.segments);ctx->job.codec=codec;ctx->job.num=0;
- ctx->job.segments=calloc(segments,sizeof(*ctx->job.segments));return ctx->job.segments?0:-ENOMEM;
+ ctx->job.segments=calloc(segments,sizeof(*ctx->job.segments));ctx->job.overflow=false;ctx->job.max=ctx->job.segments?segments:0;return ctx->job.segments?0:-ENOMEM;
 }
 static int avd_submit_job(struct avd_ctx *ctx);
 '''
@@ -183,8 +215,7 @@ int main(int argc,char **argv) {
  assert(!memcmp(&adapted,&p->bank[1].probability_tables,sizeof(adapted)));
  write_program(argv[1],"vp9-adaptive-1",&frame);
  assert(!avd_vp9_ready(&ctx));
- struct avd_vp9_run attempt;
- current_dst=&dst[2].base.vb;assert(avd_vp9_run_preamble(&ctx,&attempt)==-EBUSY);assert(!dst[2].bank);
+ current_dst=&dst[2].base.vb;assert(avd_vp9_run(&ctx)==-EBUSY);assert(!dst[2].bank);
  /* PP(0) retires while b points to bank 1: only bank 0 may be released. */
  avd_vp9_done(&ctx,&src,&dst[0].base.vb,VB2_BUF_STATE_DONE);
  assert(!p->bank[0].busy&&p->bank[1].busy&&!dst[0].bank);
@@ -208,12 +239,96 @@ int main(int argc,char **argv) {
   assert(p->bank[0].busy&&p->bank[1].busy);
   avd_vp9_done(&ctx,&src,&dst[0].base.vb,VB2_BUF_STATE_DONE);avd_vp9_done(&ctx,&src,&dst[1].base.vb,VB2_BUF_STATE_DONE);
  }
+ /* After a frame size change the temporal-MV input is not the prior bank. */
+ params=(struct v4l2_ctrl_vp9_frame){.flags=V4L2_VP9_FRAME_FLAG_SHOW_FRAME,
+  .frame_width_minus_1=1919,.frame_height_minus_1=1087,.bit_depth=8};
+ current_dst=&dst[0].base.vb;frame.idx=0;assert(!avd_vp9_run(&ctx));
+ struct avd_vp9_bank *shown=p->b;
+ params.frame_width_minus_1=1899;params.frame_height_minus_1=1079;
+ current_dst=&dst[1].base.vb;frame.idx=1;assert(!avd_vp9_run(&ctx));
+ assert(p->b!=shown&&p->last.width==1900&&p->last.height==1080);
+ {bool prior_color=false;u32 *words=program.cpu;
+  for(size_t j=0;j<frame.prog_words;j++)if(words[j]==(shown->bufs.color.addr>>8))prior_color=true;
+  assert(!prior_color);}
+ avd_vp9_done(&ctx,&src,&dst[0].base.vb,VB2_BUF_STATE_DONE);avd_vp9_done(&ctx,&src,&dst[1].base.vb,VB2_BUF_STATE_DONE);
+ /* A 1440x1088 reference of a 1920x1088 frame: vertical scale high, horizontal low. */
+ params.frame_width_minus_1=1919;params.frame_height_minus_1=1087;reference.vp9.width=1440;
+ current_dst=&dst[0].base.vb;frame.idx=0;assert(!avd_vp9_run(&ctx));
+ {bool scale=false;u32 *words=program.cpu;
+  for(size_t j=0;j<frame.prog_words;j++){assert(words[j]!=0x30004000);if(words[j]==0x40003000)scale=true;}
+  assert(scale);}
+ reference.vp9.width=1920;avd_vp9_done(&ctx,&src,&dst[0].base.vb,VB2_BUF_STATE_DONE);
+ /* Only a frame size change clears the segmentation state in the seg buffers: each bank's
+  * when it is next taken (a busy one belongs to the hardware), and VP9_SEG_RESET goes to the
+  * first frame that uses segmentation after the change. */
+ for(unsigned int i=0;i<p->nbanks;i++)memset(p->bank[i].bufs.seg.cpu,0xa5,p->bank[i].bufs.seg.size);
+ /* Frame A writes a map, so no reset is owed from the earlier size changes. */
+ params.seg.flags=V4L2_VP9_SEGMENTATION_FLAG_ENABLED|V4L2_VP9_SEGMENTATION_FLAG_UPDATE_MAP;
+ current_dst=&dst[0].base.vb;frame.idx=0;assert(!avd_vp9_run(&ctx));
+ assert(p->b==&p->bank[0]&&((u8 *)p->bank[0].bufs.seg.cpu)[0]==0xa5&&!p->seg_reset);
+ /* Bank 0 stays busy; the next frame is smaller and has no segmentation. */
+ params.seg.flags=0;params.frame_width_minus_1=1899;params.frame_height_minus_1=1079;
+ current_dst=&dst[1].base.vb;frame.idx=1;assert(!avd_vp9_run(&ctx));
+ assert(p->b==&p->bank[1]&&p->seg_reset&&p->bank[0].seg_clear&&!p->bank[1].seg_clear);
+ {u8 *seg=p->bank[1].bufs.seg.cpu;for(size_t j=0;j<p->bank[1].bufs.seg.size;j++)assert(!seg[j]);}
+ assert(((u8 *)p->bank[0].bufs.seg.cpu)[0]==0xa5);
+ avd_vp9_done(&ctx,&src,&dst[0].base.vb,VB2_BUF_STATE_DONE);
+ avd_vp9_done(&ctx,&src,&dst[1].base.vb,VB2_BUF_STATE_DONE);
+ /* Same size again, segmentation on without a map update: the reset is still owed, and it stays
+  * owed after that frame, as the decoder would read the old map again. */
+ params.seg.flags=V4L2_VP9_SEGMENTATION_FLAG_ENABLED;current_dst=&dst[0].base.vb;
+ {struct avd_vp9_run r={.decode_params=&params};r.base.bufs.dst=current_dst;
+  assert(make_flags1(&ctx,&r)&VP9_SEG_RESET(1));}
+ frame.idx=0;assert(!avd_vp9_run(&ctx));
+ assert(p->b==&p->bank[0]&&!p->bank[0].seg_clear&&p->seg_reset);
+ {u8 *seg=p->bank[0].bufs.seg.cpu;for(size_t j=0;j<p->bank[0].bufs.seg.size;j++)assert(!seg[j]);}
+ avd_vp9_done(&ctx,&src,&dst[0].base.vb,VB2_BUF_STATE_DONE);
+ /* The next frame updates the map: it still gets the reset, and after it the reset is gone. */
+ params.seg.flags=V4L2_VP9_SEGMENTATION_FLAG_ENABLED|V4L2_VP9_SEGMENTATION_FLAG_UPDATE_MAP;
+ current_dst=&dst[1].base.vb;
+ {struct avd_vp9_run r={.decode_params=&params};r.base.bufs.dst=current_dst;
+  assert(make_flags1(&ctx,&r)&VP9_SEG_RESET(1));}
+ frame.idx=1;assert(!avd_vp9_run(&ctx));assert(!p->seg_reset);
+ {struct avd_vp9_run r={.decode_params=&params};r.base.bufs.dst=current_dst;
+  assert(!(make_flags1(&ctx,&r)&VP9_SEG_RESET(1)));}
+ avd_vp9_done(&ctx,&src,&dst[1].base.vb,VB2_BUF_STATE_DONE);params.seg.flags=0;
+ /* The firmware transport still needs the format's size: smaller and larger frames are refused. */
+ params.frame_width_minus_1=959;params.frame_height_minus_1=539;
+ current_dst=&dst[0].base.vb;frame.idx=0;assert(avd_vp9_run(&ctx)==-EINVAL);
+ params.frame_width_minus_1=1983;params.frame_height_minus_1=1087;
+ current_dst=&dst[1].base.vb;frame.idx=1;assert(avd_vp9_run(&ctx)==-EINVAL);
+ /* The firmware transport keeps the 64-pixel floor. */
+ ctx.decoded_fmt.fmt.pix_mp.width=64;ctx.decoded_fmt.fmt.pix_mp.height=64;
+ ctx.decoded_fmt.fmt.pix_mp.plane_fmt[0].bytesperline=64;
+ params=(struct v4l2_ctrl_vp9_frame){.flags=V4L2_VP9_FRAME_FLAG_KEY_FRAME|V4L2_VP9_FRAME_FLAG_SHOW_FRAME,
+  .frame_width_minus_1=31,.frame_height_minus_1=15,.bit_depth=8};
+ current_dst=&dst[0].base.vb;frame.idx=0;assert(avd_vp9_run(&ctx)==-EINVAL);
  avd_vp9_stop(&ctx);assert(!avd_vp9_ready(&ctx));
  /* Old firmware and the legacy transport allocate only one bank. */
  for(unsigned int mode=0;mode<2;mode++) {
   dev.queued=mode;vp_feature=false;assert(!avd_vp9_start(&ctx));p=ctx.priv;
   assert(p->nbanks==1&&ctx.max_frames==1);avd_vp9_stop(&ctx);
  }
+ /* On the legacy transport a frame below 64x64 decodes into a 64x64 CAPTURE buffer. */
+ dev.queued=false;vp_feature=false;assert(!avd_vp9_start(&ctx));p=ctx.priv;
+ current_dst=&dst[0].base.vb;frame.idx=0;assert(!avd_vp9_run(&ctx));
+ avd_vp9_done(&ctx,&src,&dst[0].base.vb,VB2_BUF_STATE_DONE);
+ /* A frame larger than the CAPTURE format is still refused. */
+ params.frame_width_minus_1=1919;params.frame_height_minus_1=1087;
+ assert(avd_vp9_run(&ctx)==-EINVAL);
+ avd_vp9_stop(&ctx);
+ /* On the legacy transport a frame smaller than the capture format runs in it, a larger one is refused. */
+ ctx.decoded_fmt.fmt.pix_mp.width=1920;ctx.decoded_fmt.fmt.pix_mp.height=1088;
+ ctx.decoded_fmt.fmt.pix_mp.plane_fmt[0].bytesperline=1920;
+ dev.queued=false;vp_feature=false;assert(!avd_vp9_start(&ctx));p=ctx.priv;
+ params=(struct v4l2_ctrl_vp9_frame){.flags=V4L2_VP9_FRAME_FLAG_KEY_FRAME|V4L2_VP9_FRAME_FLAG_SHOW_FRAME,
+  .frame_width_minus_1=959,.frame_height_minus_1=539,.bit_depth=8};
+ current_dst=&dst[0].base.vb;frame.idx=0;assert(!avd_vp9_run(&ctx));
+ assert(dst[0].vp9.width==960&&dst[0].vp9.height==540);
+ avd_vp9_done(&ctx,&src,&dst[0].base.vb,VB2_BUF_STATE_DONE);
+ params.frame_width_minus_1=1983;params.frame_height_minus_1=1087;
+ current_dst=&dst[0].base.vb;frame.idx=0;assert(avd_vp9_run(&ctx)==-EINVAL);
+ avd_vp9_stop(&ctx);
  dev.queued=true;vp_feature=true;fail_alloc_after=13;allocating_ctx=&ctx;
  assert(avd_vp9_start(&ctx)==-ENOMEM);allocating_ctx=NULL;
  assert(!ctx.priv&&!avd_vp9_ready(&ctx)&&ctx.max_frames==1);
