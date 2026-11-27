@@ -178,19 +178,23 @@ fn scs_compute_conflict(f: &Flight, vm: &Arc<super::vm::VmState>, scs: bool) -> 
     f.computes != 0 && (f.rt_compute != scs || (scs && !Arc::ptr_eq(&f.job.vm, vm)))
 }
 
-/// Whether a render of `vm` must wait for flight `f` to retire before it is published.
+/// Whether a render of `vm` on render queue pair `pair` must wait for flight `f` of another VM
+/// to retire before it is published.
 ///
-/// Every VM's render passes share the one firmware TA/FS queue pair. While passes of two VMs
-/// are both published there, the GPU faults in the VM whose pass runs (linux#3201): its VDM
-/// reads the pass slot's kernel prefix and its control stream, and its shader cores read
-/// from a null base, at addresses that are not mapped in its context. Multisampled passes
-/// also lose coverage and their fragment shaders read VA 0. Ordering the two passes' TA and
-/// FS with ring barriers does not prevent it; publishing one only after the other retired
-/// does. A render of another VM also never runs beside compute, so a long compute dispatch
-/// cannot starve its fragment shading into a firmware DM1 timeout. Renders of one VM still
-/// share the queues.
-fn cross_vm_render_conflict(f: &Flight, vm: &Arc<super::vm::VmState>) -> bool {
+/// While render passes of two VMs are both published on one firmware TA/FS queue pair, the GPU
+/// faults in the VM whose pass runs (linux#3201): its VDM reads the pass slot's kernel prefix
+/// and its control stream, and its shader cores read from a null base, at addresses that are
+/// not mapped in its context. Multisampled passes also lose coverage and their fragment
+/// shaders read VA 0. Ordering the two passes' TA and FS with ring barriers does not prevent
+/// it; publishing one only after the other retired does. Renders of different VMs on different
+/// pairs run cleanly side by side. macOS 26B123 likewise gives every Metal process its own TA
+/// and FS queue, each with its own job-list entry, all rung through one doorbell.
+///
+/// A render of another VM also never runs beside compute, so a long compute dispatch cannot
+/// starve its fragment shading into a firmware DM1 timeout.
+fn cross_vm_render_conflict(f: &Flight, vm: &Arc<super::vm::VmState>, pair: usize) -> bool {
     !Arc::ptr_eq(&f.job.vm, vm)
+        && (f.computes != 0 || (f.renders != 0 && f.render_pair as usize == pair))
 }
 
 /// Resolved ring-barrier placement for one render pass (legacy, `FRAGMENT_BARRIERS`, or
@@ -318,6 +322,9 @@ pub(crate) struct Flight {
     /// Whether `Channel::Compute` read and completion cursors already passed `rec[2]` before
     /// the shared submit ring could wrap past this flight.
     pub(crate) chan_settled: bool,
+    /// Whether `Channel::Ta` / `Channel::Fs` read and completion cursors already passed
+    /// `rec[0]` / `rec[1]` before another render pair's records could lap them.
+    pub(crate) render_chan_settled: [bool; 2],
     /// Compute member j's FW stamp target, the FS target it waits on directly (0: none), and
     /// its private UMA counter value after publication.
     pub(crate) cstamp: [u32; sizes::COMPUTE_SLOTS],
@@ -381,6 +388,7 @@ impl Flight {
             fs_start: 0,
             rec: [0; 3],
             chan_settled: false,
+            render_chan_settled: [false; 2],
             cstamp: [0; sizes::COMPUTE_SLOTS],
             cwait: [0; sizes::COMPUTE_SLOTS],
             csubmitted: [0; sizes::COMPUTE_SLOTS],
@@ -451,7 +459,7 @@ pub(crate) enum HoldCause {
     DrainFailed,
     /// A cold `InitBM` render is in flight.
     DrainInitbm,
-    /// Compute behind render of another VM, render behind any flight of another VM, or an SCS
+    /// Compute behind render of another VM, render behind compute of another VM, or an SCS
     /// compute conflict.
     DrainCross,
     /// No warm PB/UMA allocator slot of the VM can take the render behind active flights.
@@ -534,6 +542,10 @@ pub(crate) struct Stats {
     pub(crate) behind: u64,
     /// Most flights in flight at once.
     pub(crate) max_flights: u64,
+    /// Render prefixes published per render pair, and those published while another VM's
+    /// renders were in flight on another pair (`render_pairs:` in `aurora-g16/stats`).
+    pub(crate) render_pair_publications: [u64; sizes::RENDER_PAIRS],
+    pub(crate) cross_pair_renders: u64,
 }
 
 /// Host-side phase timers of publication and polling, on with `debug_flags` bit 49
@@ -664,6 +676,12 @@ pub(crate) struct Engine {
     /// Transient bitmask of compute pipes being drained for handoff to a waiting job that has
     /// no eligible pipe (e.g. a base-only VM limited to pipe 0).
     pub(crate) handoff_avoid_pipes: u32,
+    /// Transient bitmask of render pairs being drained for handoff to a waiting render whose VM
+    /// finds every pair holding another VM's renders ([`Firmware::render_handoff_pair`]).
+    pub(crate) handoff_avoid_pairs: u8,
+    /// Per TTBAT slot, the render pair of its VM's newest render (`u8::MAX`: none), which the
+    /// VM takes again when it is free.
+    pub(crate) vm_pair: [u8; sizes::MAX_VMS as usize + 1],
     /// The FS / TA queues of each render pair were registered by a first record.
     pub(crate) render_registered: [bool; sizes::RENDER_PAIRS],
     pub(crate) ta_registered: [bool; sizes::RENDER_PAIRS],
@@ -729,6 +747,8 @@ impl Engine {
             pipe_last_used: [0; sizes::COMPUTE_PIPES],
             pipe_use_seq: 0,
             handoff_avoid_pipes: 0,
+            handoff_avoid_pairs: 0,
+            vm_pair: [u8::MAX; sizes::MAX_VMS as usize + 1],
             render_registered: [false; sizes::RENDER_PAIRS],
             ta_registered: [false; sizes::RENDER_PAIRS],
             chan_wait: false,
@@ -751,6 +771,21 @@ impl Engine {
     /// The oldest published prefix.
     pub(crate) fn oldest(&self) -> Option<&Flight> {
         self.flights.first()
+    }
+
+    /// The render pair of `vm`'s newest render, if any.
+    pub(crate) fn render_pair_hint(&self, vm: &super::vm::VmState) -> Option<usize> {
+        self.vm_pair
+            .get(vm.slot as usize)
+            .map(|&pair| pair as usize)
+            .filter(|&pair| pair < sizes::RENDER_PAIRS)
+    }
+
+    /// `vm` published a render on `pair`.
+    fn note_render_pair(&mut self, vm: &super::vm::VmState, pair: usize) {
+        if let Some(entry) = self.vm_pair.get_mut(vm.slot as usize) {
+            *entry = pair as u8;
+        }
     }
 
     /// Jobs of the queue in published prefixes.
@@ -1102,12 +1137,14 @@ impl Firmware {
         self.engine.slot_wait = false;
         self.engine.held_wait = false;
         self.engine.handoff_avoid_pipes = 0;
+        self.engine.handoff_avoid_pairs = 0;
         self.engine.coalesce_deadline_ns = 0;
         while self.recovery.failed().is_none()
             && !self.engine.frozen
             && !self.engine.pending.is_empty()
         {
             self.engine.handoff_avoid_pipes = 0;
+            self.engine.handoff_avoid_pairs = 0;
             let Some(index) = self.engine.pick() else {
                 break;
             };
@@ -1132,6 +1169,10 @@ impl Firmware {
                 self.engine.handoff_avoid_pipes = self
                     .compute_handoff_pipe(&job)
                     .map_or(0, |pipe| 1u32 << pipe);
+                // Likewise, when every render pair holds another VM's renders, let the least
+                // loaded pair drain for this render's VM while the other pairs keep going.
+                self.engine.handoff_avoid_pairs =
+                    self.render_handoff_pair(&job).map_or(0, |pair| 1u8 << pair);
                 let mut alt: Option<usize> = None;
                 for (i, cand) in self.engine.pending.iter().enumerate() {
                     // `Engine::pick` chose the earliest pending job of `job.queue`, so later
@@ -1168,6 +1209,7 @@ impl Firmware {
                     Some(i) => job = self.engine.pending[i].clone(),
                     None => {
                         self.engine.handoff_avoid_pipes = 0;
+                        self.engine.handoff_avoid_pairs = 0;
                         self.engine.slot_wait = self
                             .engine
                             .pending
@@ -1257,6 +1299,7 @@ impl Firmware {
                 Ok(()) => {}
                 Err(e) if e == EAGAIN => {
                     self.engine.handoff_avoid_pipes = 0;
+                    self.engine.handoff_avoid_pairs = 0;
                     break;
                 }
                 Err(e) => {
@@ -1268,6 +1311,7 @@ impl Firmware {
             }
             let pub_res = self.publish_prefix(&job, done, &mut pending_rings);
             self.engine.handoff_avoid_pipes = 0;
+            self.engine.handoff_avoid_pairs = 0;
             match pub_res {
                 Ok(()) => {
                     self.engine.turn += 1;
@@ -1380,6 +1424,52 @@ impl Firmware {
         Ok(())
     }
 
+    /// The render queue pair of `vm`'s next render: the pair of its renders in flight;
+    /// otherwise its last pair if free, else the lowest free pair; `None` while every pair holds
+    /// another VM's renders or drains for a handoff. One VM's renders never use two pairs at
+    /// once, so its render waits stay within one in-order pair.
+    pub(crate) fn render_pair_for(&self, vm: &Arc<super::vm::VmState>) -> Option<usize> {
+        let flights = &self.engine.flights;
+        if let Some(f) = flights
+            .iter()
+            .find(|f| f.renders != 0 && Arc::ptr_eq(&f.job.vm, vm))
+        {
+            return Some(f.render_pair as usize);
+        }
+        let avoid = self.engine.handoff_avoid_pairs;
+        let free = |pair: usize| {
+            avoid & (1u8 << pair) == 0
+                && !flights
+                    .iter()
+                    .any(|f| f.renders != 0 && f.render_pair as usize == pair)
+        };
+        self.engine
+            .render_pair_hint(vm)
+            .filter(|&pair| free(pair))
+            .or_else(|| (0..sizes::RENDER_PAIRS).find(|&pair| free(pair)))
+    }
+
+    /// When the ready render `job` finds every render pair holding another VM's renders, the
+    /// pair to drain for it, as [`Self::compute_handoff_pipe`] drains a compute pipe: the one
+    /// with the fewest render passes in flight. Its VM publishes nothing more there meanwhile.
+    fn render_handoff_pair(&self, job: &Arc<Job>) -> Option<usize> {
+        let sent = job.progress.sent();
+        if !matches!(command(job, sent), Some(Command::Render(_)))
+            || job.vm.status.get() != 0
+            || job.check_command_dependencies(sent).is_err()
+            || self.render_pair_for(&job.vm).is_some()
+        {
+            return None;
+        }
+        let mut load = [0usize; sizes::RENDER_PAIRS];
+        for f in &self.engine.flights {
+            if f.renders != 0 {
+                load[(f.render_pair as usize).min(sizes::RENDER_PAIRS - 1)] += f.renders as usize;
+            }
+        }
+        (0..sizes::RENDER_PAIRS).min_by_key(|&pair| load[pair])
+    }
+
     /// Whether `job` requires `self.engine.flights` to drain to empty before it can
     /// publish (so `alt`-class bypass must not keep refilling the engine ahead of it).
     fn needs_engine_drain(&self, job: &Arc<Job>) -> bool {
@@ -1395,7 +1485,7 @@ impl Firmware {
                     || f.recovery_suspect
                     || f.initbm
                     || (is_compute && scs_compute_conflict(f, &job.vm, is_rt_compute))
-                    || (is_render && cross_vm_render_conflict(f, &job.vm))
+                    || (is_render && f.computes != 0 && !Arc::ptr_eq(&f.job.vm, &job.vm))
                     || (is_compute && f.renders != 0 && !Arc::ptr_eq(&f.job.vm, &job.vm))
             })
             || (is_render && !self.render_can_pipeline(job))
@@ -1524,7 +1614,8 @@ impl Firmware {
     ///   while reusing that VM's warm PB/UMA allocator slot (`Pools::can_pipeline_within`,
     ///   each owning its own hardware UMA slot `RENDER_UMA_SLOT + slot`). Hardware barriers on
     ///   the CDM/TA/FS rings preserve exact same-engine and cross-engine ordering. A render
-    ///   never queues behind a flight of another VM ([`cross_vm_render_conflict`]).
+    ///   queues behind renders of another VM only on another render pair
+    ///   ([`cross_vm_render_conflict`], [`Self::render_pair_for`]).
     /// - Compute never queues behind a render of another VM either, so a long compute
     ///   dispatch from one client cannot starve another client's fragment shading into a
     ///   firmware DM1 timeout. Cold InitBM priming renders and every failure or recovery path
@@ -1613,10 +1704,13 @@ impl Firmware {
                         .is_ok_and(|mask| self.has_compute_pipe_for_vm(&job.vm, mask, scs))
             }
             Some(Command::Render(_)) => {
-                let cross_vm = e
-                    .flights
-                    .iter()
-                    .any(|f| cross_vm_render_conflict(f, &job.vm));
+                let Some(pair) = self.render_pair_for(&job.vm) else {
+                    return false;
+                };
+                let cross_vm = e.handoff_avoid_pairs & (1u8 << pair) != 0
+                    || e.flights
+                        .iter()
+                        .any(|f| cross_vm_render_conflict(f, &job.vm, pair));
                 let render_count: usize = e.flights.iter().map(|f| f.renders as usize).sum();
                 !cross_vm
                     && render_count < params::render_flights()
@@ -2632,10 +2726,24 @@ impl Firmware {
         let index = job.progress.sent();
         let cmd = command(job, index).ok_or(EINVAL)?;
         let render = matches!(cmd, Command::Render(_));
-        // The render queue pair of this publication: pair 0 until pairs are leased per VM.
-        // `class_behind` (any render flight) governs the shared TA/FS submit channels,
-        // `pair_behind` the pair's own queues, stamps and barriers.
-        let pair = 0;
+        // The render queue pair of this publication. `class_behind` (any render flight) governs
+        // the shared TA/FS submit channels, `pair_behind` the pair's own queues, stamps and
+        // barriers. Two VMs' renders never share a pair (linux#3201).
+        let pair = if render {
+            let pair = self.render_pair_for(&job.vm).ok_or(EAGAIN)?;
+            if self.engine.handoff_avoid_pairs & (1u8 << pair) != 0
+                || self
+                    .engine
+                    .flights
+                    .iter()
+                    .any(|fl| cross_vm_render_conflict(fl, &job.vm, pair))
+            {
+                return Err(EAGAIN);
+            }
+            pair
+        } else {
+            0
+        };
         let class_behind = self
             .engine
             .flights
@@ -2696,21 +2804,35 @@ impl Firmware {
         if !render && class_behind {
             self.latch_compute_channel_receipts()?;
         }
+        // Only another pair's records can lap a render flight on the shared TA/FS channels.
+        let other_pair = render
+            && self
+                .engine
+                .flights
+                .iter()
+                .any(|fl| fl.renders != 0 && fl.render_pair as usize != pair);
+        if other_pair {
+            self.latch_render_channel_receipts()?;
+        }
         for &channel in channels {
             let pipe = self.channels.channel(channel);
             let producer = self.channels.producer(channel);
             let busy = if class_behind {
                 // Behind in-flight commands on this class: post after their unconsumed records
-                // and never lap an unsettled compute flight's shared submit-channel record.
-                let wrap_bound = channel == Channel::Compute
-                    && self.engine.flights.iter().any(|fl| {
-                        fl.computes != 0
-                            && !fl.chan_settled
-                            && producer
-                                .wrapping_sub((fl.rec[2] + RING_SLOTS - 1) % RING_SLOTS)
-                                % RING_SLOTS
-                                >= RING_SLOTS - 2
-                    });
+                // and never lap an unsettled flight's shared submit-channel record (of another
+                // compute pipe, or of another render pair on TA/FS).
+                let wrap_bound = self.engine.flights.iter().any(|fl| {
+                    let (active, settled, record) = match channel {
+                        Channel::Compute => (fl.computes != 0, fl.chan_settled, fl.rec[2]),
+                        Channel::Ta => (fl.renders != 0, fl.render_chan_settled[0], fl.rec[0]),
+                        Channel::Fs => (fl.renders != 0, fl.render_chan_settled[1], fl.rec[1]),
+                    };
+                    active
+                        && !settled
+                        && producer.wrapping_sub((record + RING_SLOTS - 1) % RING_SLOTS)
+                            % RING_SLOTS
+                            >= RING_SLOTS - 2
+                });
                 pipe.write()? != producer
                     || producer.wrapping_sub(pipe.read()?) % RING_SLOTS >= sizes::AHEAD_RECORDS
                     || wrap_bound
@@ -3403,6 +3525,11 @@ impl Firmware {
         self.engine.ordinal = prefix.n;
         self.engine.draw = prefix.draw;
         if render {
+            self.engine.note_render_pair(&job.vm, pair);
+            self.engine.stats.render_pair_publications[pair] += 1;
+            if other_pair {
+                self.engine.stats.cross_pair_renders += 1;
+            }
             self.engine.pair_draw[pair] = prefix.pair_draw;
             self.engine.ta_target[pair] = f.ta_target;
             self.engine.fs_target[pair] = f.fs_target;
@@ -3940,7 +4067,33 @@ impl Firmware {
         // consumer carries `InitBM`: G16 `FINALIZE` flushes producer caches before advancing
         // `fw_stamp` (unlike G15's `CROSS_ENGINE_HOLD`; see `cross_engine_barrier_type`).
         // Cold `InitBM` transitions and recovery paths drain completely before publishing.
+        // Renders reach the TA and FS engines in publication order across render pairs, as on
+        // one pair's in-order queues: the PB and pass slot displacement proofs rely on it
+        // (`Pools::retire_flight`). A prefix's first pass whose newest predecessor in flight is
+        // on another pair waits for that render's TA and FS. Its completion implies every
+        // earlier render's, so those waits stand in for this pair's own `prev_barrier` and
+        // `fs_dep`, and a pass still takes at most `MAX_RENDER_RING_ENTRIES` entries per ring.
+        // The TA of one VM's render still overlaps the FS of the other VM's.
+        let prior = if member == 0 {
+            self.engine
+                .flights
+                .iter()
+                .rev()
+                .find(|fl| fl.renders != 0)
+                .filter(|fl| fl.render_pair as usize != pair)
+                .map(|fl| {
+                    (
+                        fl.render_pair as usize,
+                        fl.ta_target,
+                        fl.fs_target,
+                        fl.initbm,
+                    )
+                })
+        } else {
+            None
+        };
         let producer_initbm = pf.initbm
+            || prior.is_some_and(|(_, _, _, initbm)| initbm)
             || self.engine.flights.iter().any(|fl| fl.initbm)
             || ta_wait_compute.iter().flatten().any(|w| w.initbm)
             || fs_wait_compute.iter().flatten().any(|w| w.initbm)
@@ -3952,11 +4105,27 @@ impl Firmware {
         // behind `prev_fs`. Emit `ta_fs_barrier` only when `plan.ta_fs_wait` names an in-flight
         // FS stamp, and `fs_dep` only when `plan.fs_render_wait` names an in-flight FS
         // dependency not already dominated by TA.
-        if plan.ta_prev_wait {
+        let (ta_prev, fs_prev) = match prior {
+            Some((q, ta, fs, _)) => {
+                let other = self.graph.render.get(q).ok_or(EINVAL)?;
+                let [ta_event, fs_event] = work::render_pair::events(q);
+                (
+                    Some((other.fw_stamp[0].va, ta, ta_event)),
+                    Some((other.fw_stamp[1].va, fs, fs_event)),
+                )
+            }
+            None => (
+                plan.ta_prev_wait
+                    .then_some((r.fw_stamp[0].va, prev_ta, events[0])),
+                plan.fs_render_wait
+                    .map(|wait_fs| (r.fw_stamp[1].va, wait_fs, events[1])),
+            ),
+        };
+        if let Some((stamp, wait_ta, event)) = ta_prev {
             let prev = encode::barrier(
-                r.fw_stamp[0].va,
-                prev_ta,
-                events[0],
+                stamp,
+                wait_ta,
+                event,
                 target,
                 work::barrier::RENDER_WAIT_UUID,
                 render_bar,
@@ -3978,11 +4147,11 @@ impl Firmware {
             r.ring[0].w64(8 * pf.ta_head as usize, p.ta_fs_barrier.va)?;
             pf.ta_head = (pf.ta_head + 1) % cap;
         }
-        if let Some(wait_fs) = plan.fs_render_wait {
+        if let Some((stamp, wait_fs, event)) = fs_prev {
             let dep = encode::barrier(
-                r.fw_stamp[1].va,
+                stamp,
                 wait_fs,
-                events[1],
+                event,
                 target,
                 work::barrier::RENDER_WAIT_UUID,
                 render_bar,

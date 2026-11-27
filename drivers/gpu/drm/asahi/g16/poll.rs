@@ -1144,6 +1144,46 @@ impl Firmware {
         Ok(())
     }
 
+    /// Latches `Channel::Ta` / `Channel::Fs` read and completion proofs onto active render
+    /// flights before the shared submit rings can lap them, so a long flight on one render pair
+    /// stays retirable while another pair keeps posting records.
+    pub(crate) fn latch_render_channel_receipts(&mut self) -> Result {
+        if !self
+            .engine
+            .flights
+            .iter()
+            .any(|f| f.renders != 0 && f.render_chan_settled.contains(&false))
+        {
+            return Ok(());
+        }
+        let slots = super::fw::channels::RING_SLOTS;
+        for (i, channel) in [Channel::Ta, Channel::Fs].into_iter().enumerate() {
+            let pipe = self.channels.channel(channel);
+            let read = pipe.read()?;
+            let comp = pipe.completion()?;
+            if read >= slots || comp >= slots {
+                continue;
+            }
+            let producer = self.channels.producer(channel);
+            for f in self.engine.flights.iter_mut() {
+                if f.renders == 0 || f.render_chan_settled[i] {
+                    continue;
+                }
+                let record = f.rec[i];
+                if record >= slots {
+                    return Err(EINVAL);
+                }
+                let first = (record + slots - 1) % slots;
+                if ring_passed(read, first, record, producer, slots)
+                    && ring_passed(comp, first, record, producer, slots)
+                {
+                    f.render_chan_settled[i] = true;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Exact M4 queue and submit-pipe proof for one serialized publication. Event
     /// notifications are wakeups; neither an event nor elapsed time releases an owner.
     pub(crate) fn queue_receipt(
@@ -1357,7 +1397,7 @@ impl Firmware {
             // Renders retire in order per render pair. A later flight on the same pair makes the
             // queue and stamp proof a "passed" one; the TA/FS submit channels are shared by every
             // pair, so any other render flight or later record makes the channel proof a
-            // "passed" one.
+            // "passed" one, unless latched before another pair's records could lap it.
             let pair = (f.render_pair as usize).min(super::hw::sizes::RENDER_PAIRS - 1);
             let render_behind = self
                 .engine
@@ -1384,8 +1424,10 @@ impl Firmware {
                     || !stamp_reached(g.fw_stamp[0].r32(0)?, f.ta_target, e.ta_target[pair])
                     || !self.queue_ring_passed(Channel::Ta, &g.qstate[0], &g.qinfo[0], f)?
                     || !self.queue_ring_passed(Channel::Fs, &g.qstate[1], &g.qinfo[1], f)?
-                    || !self.channel_receipt(Channel::Ta, f.rec[0], true)?
-                    || !self.channel_receipt(Channel::Fs, f.rec[1], true)?
+                    || !(f.render_chan_settled[0]
+                        || self.channel_receipt(Channel::Ta, f.rec[0], true)?)
+                    || !(f.render_chan_settled[1]
+                        || self.channel_receipt(Channel::Fs, f.rec[1], true)?)
                 {
                     return Ok(Retirement::Pending);
                 }
@@ -1409,8 +1451,10 @@ impl Firmware {
                     || g.fw_stamp[0].r32(0)? != f.ta_target
                     || !self.queue_ring_receipt(&g.qstate[0], &g.qinfo[0], f.ta_head)?
                     || !self.queue_ring_receipt(&g.qstate[1], &g.qinfo[1], f.fs_head)?
-                    || !self.channel_receipt(Channel::Ta, f.rec[0], chan_behind)?
-                    || !self.channel_receipt(Channel::Fs, f.rec[1], chan_behind)?
+                    || !(f.render_chan_settled[0]
+                        || self.channel_receipt(Channel::Ta, f.rec[0], chan_behind)?)
+                    || !(f.render_chan_settled[1]
+                        || self.channel_receipt(Channel::Fs, f.rec[1], chan_behind)?)
                 {
                     return Ok(Retirement::Pending);
                 }
@@ -1880,7 +1924,8 @@ impl Firmware {
                 && e.progress_flight[p] == published[p]
                 && next_progress[p] != e.progress[p];
         }
-        // One render deadline covers every render pair.
+        // One render deadline covers every render pair: a render can wait on another pair's
+        // (`prefix_render` orders them), so a stall on any pair holds the others.
         let render_moved = (0..RP).any(|q| {
             let (ta, fs) = (CP + 2 * q, CP + 2 * q + 1);
             fr[q].is_some()
@@ -2366,6 +2411,11 @@ impl Firmware {
                 write!(f, " {} {}", name, n)?;
             }
             writeln!(f)?;
+            write!(f, "render_pairs: publications")?;
+            for n in s.render_pair_publications {
+                write!(f, " {}", n)?;
+            }
+            writeln!(f, " cross_pair {}", s.cross_pair_renders)?;
         }
         let p = &self.engine.prof;
         writeln!(

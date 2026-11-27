@@ -1116,11 +1116,20 @@ pub(crate) mod sizes {
     /// Maximum concurrent compute pipes one VM may occupy at once, preserving the render
     /// ring-entry bound (`MAX_RENDER_RING_ENTRIES = 5`) since cross-VM render/compute drains.
     pub(crate) const MAX_VM_COMPUTE_PIPES: usize = 2;
-    /// Firmware TA/FS render queue pairs. Each pair owns a disjoint `RenderGraph` (TA and FS
-    /// `qinfo`, work rings, `qstate`, stamps, notifier page, threshold) and its own completion
-    /// events (`work::render_pair::events`, at most eight); all pairs share `sched_ctx` and the
-    /// `Channel::Ta`/`Channel::Fs` submit rings.
-    pub(crate) const RENDER_PAIRS: usize = 1;
+    /// Firmware TA/FS render queue pairs, each leased to one rendering VM at a time
+    /// (`Firmware::render_pair_for`): two VMs' renders on one pair fault (linux#3201), on two
+    /// pairs they run side by side, as macOS 26B123 gives every Metal process its own TA and FS
+    /// queue. Each pair owns a disjoint `RenderGraph` (TA and FS `qinfo`, work rings, `qstate`,
+    /// stamps, job lists, notifier page, threshold: fourteen objects of one 16 KiB page each,
+    /// 224 KiB, allocated at probe) and its own completion events (`work::render_pair::events`);
+    /// all pairs share `sched_ctx`, the `Channel::Ta`/`Channel::Fs` submit rings and their
+    /// doorbells, as the macOS processes share one doorbell.
+    ///
+    /// Eight: as many as the completion-event block names (`work::render_pair::MAX_PAIRS`), so
+    /// a compositor and seven clients render without a pair handoff. A pair registers with the
+    /// firmware on its first record, and a VM takes the lowest free pair, so pairs beyond the
+    /// clients rendering at once stay unregistered.
+    pub(crate) const RENDER_PAIRS: usize = 8;
     const _: () = assert!(RENDER_PAIRS >= 1 && RENDER_PAIRS <= 8);
     /// Per-stage event and recovery-snapshot cells: pair 0 TA/FS at `0`/`1`, compute pipes at
     /// `2..2 + COMPUTE_PIPES`, then TA/FS of pairs `1..RENDER_PAIRS` ([`render_stage`]).
