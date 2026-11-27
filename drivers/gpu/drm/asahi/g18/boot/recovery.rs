@@ -164,6 +164,11 @@ pub(super) enum JobFailure {
     Released,
     /// [`Self::Stranded`] as reported back to the submitting thread.
     Retained,
+    /// Refused while being prepared from the client's own state (its VM
+    /// closed, an address it names unmapped, an allocation it sized): nothing
+    /// of the job reached the firmware and its owner is back where the last
+    /// retirement left it. The session and the path keep serving.
+    Refused(Error),
 }
 
 /// How far a failed task reaches.
@@ -395,6 +400,9 @@ impl G18Session {
         let mut since = Instant::<Monotonic>::now();
         let mut reported = 0u32;
         self.growth_refused = false;
+        // The job is running: the CLPC holds the memory and fabric floor
+        // until it ends, on every path out of here, and 16 ms past the last.
+        let _job = self.demand.job();
         loop {
             if let Some(serviced) = self.poll_faults(label)? {
                 if recovery.is_none() {

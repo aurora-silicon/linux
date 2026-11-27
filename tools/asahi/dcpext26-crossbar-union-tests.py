@@ -44,7 +44,7 @@ pre = r'''
 #include <string.h>
 #include <errno.h>
 enum { DCP_FIRMWARE_V_27_0 = 27, DCP_IOMFB_METHODS_J613_EXT26 = 26 };
-struct device_node { const char *compatible; };
+struct device_node { const char *compatible; bool v27_2; };
 struct device { struct device_node *of_node; };
 struct mux_control { int id; };
 struct apple_dcp_typec_route {
@@ -68,6 +68,10 @@ static bool of_machine_is_compatible(const char *name) { return !strcmp(machine,
 static bool of_device_is_compatible(const struct device_node *n, const char *name) {
     return !strcmp(n->compatible, name);
 }
+/* The J773g's 27.2 (26B123) dcpext admission, include/linux/soc/apple/display.h. */
+static bool apple_t8132_dcpext_v27_2(const struct device_node *n) {
+    return of_device_is_compatible(n, "apple,t8132-dcpext") && n->v27_2;
+}
 static void mock_guard(int *lock) { (void)lock; locks++; }
 #define guard(kind) mock_guard
 #define dev_warn(...) ((void)0)
@@ -81,7 +85,7 @@ static int dcp_direct_crossbar_link_t6050(struct apple_dcp *dcp, bool up) {
 cases = r'''
 static void reset(void) { links = v27 = locks = 0; last = NULL; last_up = false; fault = 0; }
 int main(void) {
-    struct device_node node = { "apple,other-dcp" };
+    struct device_node node = { .compatible = "apple,other-dcp" };
     struct device dev = { &node };
     struct mux_control a = {1}, b = {2};
     struct apple_dcp_typec_route route = { .xbar = &a, .selected = true };
@@ -128,16 +132,25 @@ int main(void) {
         reset(); assert(dcp_direct_crossbar_link(&d, true) == 0);
         assert(v27 == 0 && links == 1 && locks == 1);
     }
+    /* A J773g dcpext on firmware 27.2 is no M4 dcpext: it links as a T6041 firmware-27 one. */
+    machine = "apple,other"; node.compatible = "apple,t8132-dcpext"; node.v27_2 = true;
+    struct apple_dcp j773g = { .dev = &dev, .active_typec_route = &route,
+                               .fw_compat = DCP_FIRMWARE_V_27_0, .desktop_external = true };
+    assert(!dcp_is_t8132_ext(&j773g));
+    reset(); assert(dcp_direct_crossbar_link(&j773g, true) == 0);
+    assert(v27 == 0 && links == 1 && locks == 1 && j773g.direct_xbar_up == &a);
+    node.v27_2 = false;
     machine = "apple,other"; node.compatible = "apple,other-dcp";
     struct apple_dcp unrelated = { .dev = &dev, .active_typec_route = &route };
     reset(); assert(dcp_direct_crossbar_link(&unrelated, true) == 0);
     assert(links == 0 && locks == 0);
-    puts("PASS production crossbar union, route/cache/error behavior, V27 precedence and unrelated exclusion");
+    puts("PASS production crossbar union, route/cache/error behavior, V27 precedence, J773g 27.2 and unrelated exclusion");
     return 0;
 }
 '''
 unit = pre + function(header, 'dcp_is_ext26') + '\n'
 unit += function(source, 'dcp_t6041_ext_v27') + '\n'
+unit += function(source, 'dcp_t8132_ext_m4_node') + '\n'
 unit += function(source, 'dcp_is_t8132_ext') + '\n' + link + '\n' + cases
 with tempfile.TemporaryDirectory() as tmp:
     c = Path(tmp) / 'crossbar.c'

@@ -231,6 +231,12 @@ dcp_fabric_run_rebalance(const struct dcp_fabric_rebalance_ops *ops, void *ctx)
 	}
 }
 
+static inline bool dcp_fabric_has_available_routes(bool has_container,
+						   unsigned int available_children)
+{
+	return has_container && available_children > 0;
+}
+
 static inline int dcp_fabric_run_probe(bool has_routes,
 				       int (*register_routes)(void *ctx), void *ctx)
 {

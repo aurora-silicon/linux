@@ -60,11 +60,23 @@ static const struct dpavid_case dpavid_cases[] = {
 	{ "v2 ep 0x2a: DCPDPService class", DPAVID_V2, DPAVSERV_ENDPOINT_V2, DPAVID_NAME,
 	  "DCPDPService", 3, 3, false },
 
-	/* AFKV2 on the classic DPAV endpoint: EPICUnit 0, dynamic channel. */
+	/*
+	 * AFKV2 on the classic DPAV endpoint: the MCDP29xx converters and the
+	 * M3/M4 Airs' generic DCPDP13Service, with EPICUnit 0 and a bounded
+	 * dynamic interface-id. AppleDCPDP2HDMI and the other classes stay refused.
+	 */
 	{ "v2 ep 0x28: DP13 unit 0", DPAVID_V2, DPAVSERV_ENDPOINT, DPAVID_NAME,
 	  "DCPDP13Service", 0, 7, true },
 	{ "v2 ep 0x28: DP2HDMI unit 0", DPAVID_V2, DPAVSERV_ENDPOINT, DPAVID_NAME,
-	  "AppleDCPDP2HDMI", 0, 1, true },
+	  "AppleDCPDP2HDMI", 0, 1, false },
+	{ "v2 ep 0x28: MCDP29XX unit 0", DPAVID_V2, DPAVSERV_ENDPOINT, DPAVID_NAME,
+	  "AppleDCPMCDP29XX", 0, 5, true },
+	{ "v2 ep 0x28: MCDP2900 unit 0", DPAVID_V2, DPAVSERV_ENDPOINT, DPAVID_NAME,
+	  "AppleDCPMCDP2900", 0, 1, true },
+	{ "v2 ep 0x28: MCDP2900 unit 1", DPAVID_V2, DPAVSERV_ENDPOINT, DPAVID_NAME,
+	  "AppleDCPMCDP2900", 1, 1, false },
+	{ "v2 ep 0x28: other MCDP part", DPAVID_V2, DPAVSERV_ENDPOINT, DPAVID_NAME,
+	  "AppleDCPMCDP2800", 0, 1, false },
 	{ "v2 ep 0x28: unit 0, channel at u16 max", DPAVID_V2, DPAVSERV_ENDPOINT, DPAVID_NAME,
 	  "DCPDP13Service", 0, 0xffff, true },
 	{ "v2 ep 0x28: unit == channel", DPAVID_V2, DPAVSERV_ENDPOINT, DPAVID_NAME,
