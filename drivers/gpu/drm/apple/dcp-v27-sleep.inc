@@ -57,13 +57,10 @@ module_param(v27_cycle_disp_rewrite, bool, 0644);
 MODULE_PARM_DESC(v27_cycle_disp_rewrite, "V27 wake: after each DCP cycle's power on, the display pipe DART's Linux-owned streams written back (the scanout stream does not survive the power cycle)");
 
 /* The display PMC words in disp-4 that macOS writes around each DCP power cycle. */
-#define V27_PMC_BASE	0x106000
-#define V27_PMC_REQ	(0x106154 - V27_PMC_BASE)
-#define V27_PMC_ACK	(0x106158 - V27_PMC_BASE)
-#define V27_PMC_EN0	(0x108020 - V27_PMC_BASE)
-#define V27_PMC_EN1	(0x108028 - V27_PMC_BASE)
-#define V27_PMC_SIZE	0x2030
-static void __iomem *v27_pmc;
+/*
+ * The display PMC handshake is serialized with external display PMC updates
+ * inside drivers/soc/apple/sleep.c (apple_sleep_m5_display_pmc()).
+ */
 
 static void dcp_v27_sessions(struct apple_dcp *dcp, bool open);
 static bool dcp_v27_external(struct apple_dcp *dcp);
@@ -151,24 +148,31 @@ static bool dcp_v27_two_stage(struct dcp_v27_sleep *s)
 {
 	return s->restore_on && v27_two_stage && iomfb_v27_display_described(s->dcp);
 }
-/* Every V27 endpoint's session open (code 4) or closed (code 2), in macOS's order; a refusal is logged only. */
-static void dcp_v27_sessions(struct apple_dcp *dcp, bool open)
+/* Every V27 endpoint's session open (code 4) or closed (code 2), in firmware order. */
+static int dcp_v27_sessions_checked(struct apple_dcp *dcp, bool open)
 {
 	struct dcp_v27_sleep *s = dcp->sleep_v27;
 	unsigned int i, n = ARRAY_SIZE(v27_sleep_endpoints);
-	int ret;
+	int ret, first_err = 0;
 
 	if (!s)
-		return;
+		return -ENODEV;
 	for (i = 0; i < n; i++) {
 		unsigned int j = open ? i : n - 1 - i;
+		struct apple_dcp_afkep *ep = dcp->sleep_v27_ep[v27_sleep_endpoints[j] - 0x20];
+		int check;
 
 		if (!!(s->closed & BIT(j)) != open)
 			continue;
-		ret = afk_v27_sleep_control(dcp->sleep_v27_ep[v27_sleep_endpoints[j] - 0x20], open);
+		if (ep)
+			read_poll_timeout(afk_v27_sleep_check, check, check != -EBUSY, 1000,
+					  100 * USEC_PER_MSEC, false, ep);
+		ret = afk_v27_sleep_control(ep, open);
 		if (ret) {
 			dev_warn_ratelimited(dcp->dev, "V27 wake: session %02x %s: %d\n",
 					     v27_sleep_endpoints[j], open ? "open" : "close", ret);
+			if (!first_err)
+				first_err = ret;
 			continue;
 		}
 		if (open)
@@ -176,6 +180,12 @@ static void dcp_v27_sessions(struct apple_dcp *dcp, bool open)
 		else
 			s->closed |= BIT(j);
 	}
+	return first_err;
+}
+
+static void dcp_v27_sessions(struct apple_dcp *dcp, bool open)
+{
+	dcp_v27_sessions_checked(dcp, open);
 }
 
 /*
@@ -186,34 +196,11 @@ static void dcp_v27_sessions(struct apple_dcp *dcp, bool open)
  */
 static int dcp_v27_cycle_pmc(struct apple_dcp *dcp, bool on)
 {
-	u32 v;
-	int ret;
+	int ret = apple_sleep_m5_display_pmc(dcp->dev, on);
 
-	if (!v27_pmc) {
-		struct resource *res = platform_get_resource_byname(to_platform_device(dcp->dev),
-								    IORESOURCE_MEM, "disp-4");
-
-		if (!res || res->start != 0x286700000ULL ||
-		    resource_size(res) < V27_PMC_BASE + V27_PMC_SIZE)
-			return -ENODEV;
-		v27_pmc = ioremap(res->start + V27_PMC_BASE, V27_PMC_SIZE);
-		if (!v27_pmc)
-			return -ENOMEM;
-	}
-	if (on) {
-		writel(readl(v27_pmc + V27_PMC_EN1) | BIT(0), v27_pmc + V27_PMC_EN1);
-		writel(readl(v27_pmc + V27_PMC_EN0) | BIT(0), v27_pmc + V27_PMC_EN0);
-		v = readl(v27_pmc + V27_PMC_REQ);
-		writel(v | BIT(2), v27_pmc + V27_PMC_REQ);
-	} else {
-		writel(readl(v27_pmc + V27_PMC_EN1) & ~BIT(0), v27_pmc + V27_PMC_EN1);
-		writel(readl(v27_pmc + V27_PMC_EN0) & ~BIT(0), v27_pmc + V27_PMC_EN0);
-		v = readl(v27_pmc + V27_PMC_REQ);
-		writel((v & ~BIT(2)) | BIT(10), v27_pmc + V27_PMC_REQ);
-	}
-	ret = readl_poll_timeout(v27_pmc + V27_PMC_ACK, v, (v & 0xf) == 0xf, 1, 2000);
 	if (ret)
-		dev_warn(dcp->dev, "V27 wake: RTKit cycle: PMC %s: status %#x\n", on ? "on" : "off", v);
+		dev_warn(dcp->dev, "V27 wake: RTKit cycle: PMC %s: %d\n",
+			 on ? "on" : "off", ret);
 	return ret;
 }
 
@@ -225,22 +212,33 @@ static int dcp_v27_cycle_pmc(struct apple_dcp *dcp, bool on)
  * pipe DART's own streams are remembered before the words go off and written back after they
  * come on, as around the internal processor's cycle.
  */
-static void dcp_v27_ext_power(struct apple_dcp *dcp, bool on)
+static int dcp_v27_ext_power(struct apple_dcp *dcp, bool on)
 {
 	int ret;
 
-	if (!on && v27_cycle_disp_rewrite && dcp->s2r_disp_dart)
-		apple_dart_m5_display_snapshot(dcp->s2r_disp_dart);
+	if (!on && v27_cycle_disp_rewrite && dcp->s2r_disp_dart) {
+		ret = apple_dart_m5_display_snapshot(dcp->s2r_disp_dart);
+		if (ret < 0) {
+			dev_warn(dcp->dev, "V27 wake: RTKit cycle: external display DART snapshot %d\n",
+				 ret);
+			return ret;
+		}
+	}
 	ret = apple_sleep_m5_dispext_power(dcp->dev, on);
-	if (ret)
+	if (ret) {
 		dev_warn(dcp->dev, "V27 wake: RTKit cycle: external power %s %d\n",
 			 on ? "on" : "off", ret);
+		return ret;
+	}
 	if (on && v27_cycle_disp_rewrite && dcp->s2r_disp_dart) {
 		ret = apple_dart_m5_display_rewrite(dcp->s2r_disp_dart);
-		if (ret)
+		if (ret) {
 			dev_warn(dcp->dev, "V27 wake: RTKit cycle: external display DART rewrite %d\n",
 				 ret);
+			return ret;
+		}
 	}
+	return 0;
 }
 
 /*
@@ -301,7 +299,7 @@ static int dcp_v27_boot(struct apple_dcp *dcp)
 static int dcp_v27_rtkit_cycle(struct apple_dcp *dcp, unsigned int pause_ms)
 {
 	struct dcp_v27_sleep *s = dcp->sleep_v27;
-	bool powered_off = false, ext = dcp_v27_external(dcp);
+	bool powered_off = false, dart_stopped = false, ext = dcp_v27_external(dcp);
 	u32 status, run_status = 0;
 	int ret;
 
@@ -340,6 +338,8 @@ static int dcp_v27_rtkit_cycle(struct apple_dcp *dcp, unsigned int pause_ms)
 		/* The DART's stop writes, while dart-dcp is still powered */
 		ret = dcp->s2r_dcp_dart ?
 			apple_dart_m5_display_cycle(dcp->s2r_dcp_dart, false) : -ENODEV;
+		if (!ret || ret == -ETIMEDOUT)
+			dart_stopped = true;
 		if (ret) {
 			/* Never power the domain off under a live DART */
 			dev_warn(dcp->dev, "V27 wake: RTKit cycle: DART stop %d; no power cycle\n", ret);
@@ -348,8 +348,14 @@ static int dcp_v27_rtkit_cycle(struct apple_dcp *dcp, unsigned int pause_ms)
 			 * Every external processor's stop, as macOS's: its DART as the internal one's,
 			 * then its two PMC bits and its CPU, FE and SYS words off.
 			 */
-			dcp_v27_ext_power(dcp, false);
-			powered_off = true;
+			ret = dcp_v27_ext_power(dcp, false);
+			if (!ret) {
+				powered_off = true;
+			} else if (ret != -ENODEV && ret != -ENOMEM) {
+				if (s)
+					s->cycle_failed = true;
+				return ret;
+			}
 		} else {
 			/* The PMC handshake between the DART stop and the power words */
 			if (v27_cycle_pmc)
@@ -366,10 +372,15 @@ static int dcp_v27_rtkit_cycle(struct apple_dcp *dcp, unsigned int pause_ms)
 	if (pause_ms)
 		msleep(min(pause_ms, 10000U));
 	/* The words on, then the streams on again just before RUN on */
-	if (v27_cycle_power && powered_off) {
+	if (powered_off) {
 		if (ext) {
 			/* SYS, FE and CPU on, the two PMC bits, then the DART and RUN */
-			dcp_v27_ext_power(dcp, true);
+			ret = dcp_v27_ext_power(dcp, true);
+			if (ret) {
+				if (s)
+					s->cycle_failed = true;
+				return ret;
+			}
 		} else {
 			ret = apple_sleep_m5_display_power(true);
 			if (ret)
@@ -378,10 +389,20 @@ static int dcp_v27_rtkit_cycle(struct apple_dcp *dcp, unsigned int pause_ms)
 			if (v27_cycle_pmc)
 				dcp_v27_cycle_pmc(dcp, true);
 		}
+	}
+	if (dart_stopped) {
 		ret = dcp->s2r_dcp_dart ?
 			apple_dart_m5_display_cycle(dcp->s2r_dcp_dart, true) : -ENODEV;
-		if (ret)
+		if (ret) {
 			dev_warn(dcp->dev, "V27 wake: RTKit cycle: DART start %d\n", ret);
+			if (ext) {
+				if (s)
+					s->cycle_failed = true;
+				return ret;
+			}
+		}
+	}
+	if (powered_off) {
 		/*
 		 * The display pipe DART keeps its firmware-locked streams through the power
 		 * cycle but loses the Linux-owned scanout stream (SID 0: CTE invalid at the first scanout).
@@ -407,16 +428,41 @@ static int dcp_v27_rtkit_cycle(struct apple_dcp *dcp, unsigned int pause_ms)
 	 * RUN bit once more, with a longer time off, before it is given up.
 	 */
 	if (ret && ext && powered_off) {
+		bool retry_dart_stopped = false;
+		int stop_ret;
+
 		dev_warn(dcp->dev, "V27 wake: RTKit cycle: restart %d (CPU status %#x at RUN); once more with %u ms off\n",
 			 ret, run_status, V27_EXT_RETRY_MS);
 		apple_rtkit_set_recv_enabled(dcp->rtk, false);
 		dcp_s2r_cpu_stop(dcp);
-		ret = apple_dart_m5_display_cycle(dcp->s2r_dcp_dart, false);
-		if (!ret) {
-			dcp_v27_ext_power(dcp, false);
-			msleep(V27_EXT_RETRY_MS);
-			dcp_v27_ext_power(dcp, true);
-			ret = apple_dart_m5_display_cycle(dcp->s2r_dcp_dart, true);
+		stop_ret = dcp->s2r_dcp_dart ?
+			   apple_dart_m5_display_cycle(dcp->s2r_dcp_dart, false) : -ENODEV;
+		if (!stop_ret || stop_ret == -ETIMEDOUT)
+			retry_dart_stopped = true;
+		if (stop_ret) {
+			dev_warn(dcp->dev, "V27 wake: RTKit cycle retry: DART stop %d; no power cycle\n",
+				 stop_ret);
+			ret = stop_ret;
+		} else {
+			ret = dcp_v27_ext_power(dcp, false);
+			if (!ret) {
+				msleep(V27_EXT_RETRY_MS);
+				ret = dcp_v27_ext_power(dcp, true);
+			} else if (ret == -ENODEV || ret == -ENOMEM) {
+				ret = 0;
+			}
+		}
+		if (retry_dart_stopped && (!ret || stop_ret)) {
+			int dart_ret = dcp->s2r_dcp_dart ?
+				       apple_dart_m5_display_cycle(dcp->s2r_dcp_dart, true) :
+				       -ENODEV;
+
+			if (dart_ret) {
+				dev_warn(dcp->dev, "V27 wake: RTKit cycle retry: DART start %d\n",
+					 dart_ret);
+				if (!ret)
+					ret = dart_ret;
+			}
 		}
 		if (!ret)
 			ret = dcp_v27_warm_restart(dcp, false);
@@ -448,6 +494,11 @@ static bool dcp_v27_sleep_selected(struct apple_dcp *dcp)
 		 of_device_is_compatible(dcp->dev->of_node, "apple,t6050-dcpext")) &&
 		dcp->hw.adopt_live_session && dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
 		dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_DEFAULT;
+}
+
+static bool dcp_v27_sleep_active(struct apple_dcp *dcp)
+{
+	return dcp->sleep_v27 && dcp->sleep_v27->phase != V27_LIVE;
 }
 static bool dcp_v27_external(struct apple_dcp *dcp)
 {
@@ -632,21 +683,27 @@ busy:
  * macOS ends a wake stage with A500's wake form and closes every session behind it; the next
  * stage opens them again. Returns the sessions left closed (none, if all went well).
  */
-static unsigned long dcp_v27_ext_round(struct apple_dcp *dcp)
+static unsigned long dcp_v27_ext_round(struct apple_dcp *dcp, bool allow_cycle, int *err_out)
 {
+	int err = 0;
+
 	/*
 	 * macOS also stops the processor between the stages: sessions closed, AP and IOP idle,
 	 * RUN off and its DART's streams 23 and 24 off; then the streams and RUN on again and the
 	 * sessions opened. Here with its DART, PMC bits and power words as there
 	 * (dcp_v27_rtkit_cycle()), and without the pause.
 	 */
-	if ((pm_resume_via_firmware() || dcp->sleep_v27->phase == V27_PREPARED) && v27_ext_cycles) {
+	if (allow_cycle &&
+	    (pm_resume_via_firmware() || dcp->sleep_v27->phase == V27_PREPARED) &&
+	    v27_ext_cycles) {
 		int ret = dcp_v27_ext_cycle_ready(dcp);
 
 		if (!ret) {
 			ret = dcp_v27_rtkit_cycle(dcp, 0);
 			dev_info(dcp->dev, "ext %u: stopped and restarted between the wake's stages: %d\n",
 				 dcp_v27_ext_nr(dcp), ret);
+			if (err_out)
+				*err_out = ret;
 			return dcp->sleep_v27->closed;
 		}
 		/* Not stopped at all: the sessions' round below, as with the switch off. */
@@ -655,17 +712,20 @@ static unsigned long dcp_v27_ext_round(struct apple_dcp *dcp)
 	}
 	if (!v27_ext_rounds)
 		return 0;
-	dcp_v27_sessions(dcp, false);
-	dcp_v27_sessions(dcp, true);
+	err = dcp_v27_sessions_checked(dcp, false);
+	err = dcp_v27_sessions_checked(dcp, true) ?: err;
+	if (err_out)
+		*err_out = err;
 	return dcp->sleep_v27->closed;
 }
 
-static int dcp_v27_ext_wake_calls(struct dcp_v27_sleep *s)
+static int dcp_v27_ext_wake_calls(struct dcp_v27_sleep *s, bool allow_cycle)
 {
 	struct apple_dcp *dcp = s->dcp;
 	/* A442 only on a processor that had a display, as macOS: not on an idle one. */
 	bool a442 = v27_a115 && v27_ext_a442 && s->ext_torn;
 	int ret, a500, a489 = 0, a115 = 0, again = 0;
+	int round_err[2] = {};
 	unsigned long round[2] = {};
 
 	/*
@@ -675,7 +735,9 @@ static int dcp_v27_ext_wake_calls(struct dcp_v27_sleep *s)
 	 * macOS's dark wake: a full wake restarts the processor once, after the first A500.
 	 */
 	a500 = iomfb_v27_sleep_rpc(dcp, true, true);
-	round[0] = dcp_v27_ext_round(dcp);
+	round[0] = dcp_v27_ext_round(dcp, allow_cycle, &round_err[0]);
+	if (s->cycle_failed)
+		return round_err[0] ?: -EIO;
 	/* A489 before and A115 after the flagged power call, as on every external processor. */
 	if (a442)
 		a489 = iomfb_v27_sleep_call_a442(dcp, "A489", 4, V27_EXT_A442_KEY);
@@ -686,17 +748,31 @@ static int dcp_v27_ext_wake_calls(struct dcp_v27_sleep *s)
 		a115 = iomfb_v27_sleep_a115(dcp, true);
 	if (!ret && v27_ext_a500_again) {
 		again = iomfb_v27_sleep_rpc(dcp, true, true);
-		round[1] = dcp_v27_ext_round(dcp);
+		round[1] = dcp_v27_ext_round(dcp, allow_cycle, &round_err[1]);
+		if (s->cycle_failed)
+			return round_err[1] ?: -EIO;
 	}
 	WRITE_ONCE(dcp->pipe_enabled_h17p, s->ext_pipe);
 	dev_dbg(dcp->dev, "ext %u: wake calls: A500 %d, sessions left closed %#lx, A489 %d, A442 %s, A484 %d, A115 %d, A500 %d, sessions left closed %#lx\n",
 		dcp_v27_ext_nr(dcp), a500, round[0], a489, a442 ? "sent" : "none", ret, a115,
 		again, round[1]);
 	/* Answered with an error: nothing is outstanding, the processor is as before the call. */
-	if (ret == -EREMOTEIO) {
+	if (allow_cycle && ret == -EREMOTEIO) {
 		dev_warn(dcp->dev, "ext %u: the wake's power call was refused\n",
 			 dcp_v27_ext_nr(dcp));
 		ret = 0;
+	}
+	if (!allow_cycle) {
+		if (!ret && a500)
+			ret = a500;
+		if (!ret && again)
+			ret = again;
+		if (!ret && (round_err[0] || round_err[1]))
+			ret = round_err[0] ?: round_err[1];
+		if (!ret && (round[0] || round[1]))
+			ret = -EIO;
+		if (!ret && !apple_rtkit_v27_live(dcp->rtk))
+			ret = -EUCLEAN;
 	}
 	return ret;
 }
@@ -1265,7 +1341,7 @@ static int dcp_v27_reopen_live(struct apple_dcp *dcp)
 			}
 			WRITE_ONCE(dcp->v27_keep_mode, true);
 		} else if (s->ext_wake) {
-			ret = dcp_v27_ext_wake_calls(s);
+			ret = dcp_v27_ext_wake_calls(s, true);
 			if (ret)
 				return ret;
 		}
@@ -1511,6 +1587,10 @@ static int dcp_v27_sleep_prepare(struct apple_dcp *dcp)
 	unsigned int i;
 	bool soft_first;
 	int ret;
+
+	ret = dcp_ext_idle_suspend(dcp);
+	if (ret)
+		return ret;
 
 	dcp_v27_sleep_invalidate(dcp);
 	/* Refused before anything changes: the sleep RPCs' arguments come from the DT. */
@@ -1813,6 +1893,8 @@ static int dcp_v27_sleep_resume(struct apple_dcp *dcp)
 
 	/* Also when the restart failed: the port can go to another pipeline. */
 	dcp_v27_ext_replug(dcp, !ret);
+	if (!ret && dcp_ext_idle_capable(dcp))
+		dcp_ext_idle_kick(dcp);
 	return ret;
 }
 
@@ -1830,10 +1912,440 @@ static void dcp_v27_dark_replug_owed(struct apple_dcp *dcp)
 		 dcp_v27_ext_nr(dcp));
 	dcp_v27_ext_replug(dcp, true);
 }
+
+static bool dcp_v27_ext_idle_capable(struct apple_dcp *dcp)
+{
+	return dcp_v27_external(dcp) &&
+	       dcp_v27_sleep_selected(dcp) &&
+	       iomfb_v27_sleep_described(dcp) &&
+	       v27_cycle_power &&
+	       v27_cycle_disp_rewrite &&
+	       apple_sleep_m5_dispext_power_ready(dcp->dev) &&
+	       !dcp->fixed_phy && !dcp->hdmi_hpd &&
+	       dcp->fixed_connector_type != DRM_MODE_CONNECTOR_HDMIA;
+}
+
+static int dcp_v27_ext_idle_prepare(struct apple_dcp *dcp)
+{
+	struct dcp_v27_sleep *s = dcp->sleep_v27;
+
+	if (!s) {
+		s = devm_kzalloc(dcp->dev, sizeof(*s), GFP_KERNEL);
+		if (!s)
+			return -ENOMEM;
+		s->dcp = dcp;
+		dcp->sleep_v27 = s;
+	}
+	return dcp_v27_sleep_endpoints_open(dcp);
+}
+
+static void dcp_v27_ext_idle_set_closed(struct apple_dcp *dcp, bool closed)
+{
+	unsigned int i;
+
+	mutex_lock(&dcp->iomfb.lock);
+	WRITE_ONCE(dcp->sleep_v27_closed, closed);
+	mutex_unlock(&dcp->iomfb.lock);
+	if (!closed)
+		return;
+	/*
+	 * Synchronize with compact AFK admission and ring publication under
+	 * each tracked endpoint lock so no in-flight compact command can slip
+	 * onto compact_cmds or advance txbfr.wptr after the final settle.
+	 */
+	for (i = 0; i < ARRAY_SIZE(v27_sleep_endpoints); i++) {
+		struct apple_dcp_afkep *ep = dcp->sleep_v27_ep[v27_sleep_endpoints[i] - 0x20];
+		unsigned long flags;
+
+		if (!ep)
+			continue;
+		spin_lock_irqsave(&ep->lock, flags);
+		spin_unlock_irqrestore(&ep->lock, flags);
+	}
+}
+
+static int dcp_v27_ext_idle_reopen_sessions(struct apple_dcp *dcp)
+{
+	struct dcp_v27_sleep *s = dcp->sleep_v27;
+	unsigned int i;
+	int ret;
+
+	for (i = 0; i < ARRAY_SIZE(v27_sleep_endpoints); i++) {
+		struct apple_dcp_afkep *ep = dcp->sleep_v27_ep[v27_sleep_endpoints[i] - 0x20];
+		int check;
+
+		if (!(s->closed & BIT(i)))
+			continue;
+		if (ep)
+			read_poll_timeout(afk_v27_sleep_check, check, check != -EBUSY, 1000,
+					  100 * USEC_PER_MSEC, false, ep);
+		ret = afk_v27_sleep_control(ep, true);
+		if (ret) {
+			dev_warn(dcp->dev, "dcpext idle: V27 session %02x open: %d\n",
+				 v27_sleep_endpoints[i], ret);
+			return ret;
+		}
+		s->closed &= ~BIT(i);
+	}
+	return 0;
+}
+
+/*
+ * Checked rollback to a live coprocessor when a clean refusal occurs before
+ * RTKit idle is issued. Returns > 0 (1) if the pipe was cleanly restored so
+ * the caller can defer, or a negative error if rollback itself failed.
+ */
+static int dcp_v27_ext_idle_rollback(struct apple_dcp *dcp, bool wake_calls, int orig_err)
+{
+	struct dcp_v27_sleep *s = dcp->sleep_v27;
+	int ret;
+
+	ret = dcp_v27_ext_idle_reopen_sessions(dcp);
+	if (!ret && wake_calls) {
+		s->ext_torn = false;
+		s->ext_pipe = READ_ONCE(dcp->pipe_enabled_h17p);
+		ret = dcp_v27_ext_wake_calls(s, false);
+	}
+	if (!ret)
+		ret = iomfb_queue_settle(dcp, msecs_to_jiffies(1000));
+	if (!ret && !apple_rtkit_v27_live(dcp->rtk))
+		ret = -EUCLEAN;
+	if (ret) {
+		dev_err(dcp->dev, "dcpext idle: V27 rollback after %d failed: %d\n",
+			orig_err, ret);
+		return ret;
+	}
+	dcp_v27_ext_idle_set_closed(dcp, false);
+	return 1;
+}
+
+static void dcp_v27_ext_idle_mailbox_stop(struct apple_dcp *dcp)
+{
+	if (dcp->secure_rtk && dcp->secure_answered) {
+		dcp_secure_poll_stop(dcp);
+		apple_rtkit_mailbox_off(dcp->secure_rtk);
+	}
+	apple_rtkit_mailbox_off(dcp->rtk);
+}
+
+static void dcp_v27_ext_idle_drain_endpoints(struct apple_dcp *dcp)
+{
+	unsigned int i;
+
+	iomfb_queue_settle(dcp, msecs_to_jiffies(1000));
+	for (i = 0; i < ARRAY_SIZE(v27_sleep_endpoints); i++) {
+		struct apple_dcp_afkep *ep = dcp->sleep_v27_ep[v27_sleep_endpoints[i] - 0x20];
+
+		if (!ep)
+			continue;
+		if (ep->wq)
+			flush_workqueue(ep->wq);
+		flush_work(&ep->service_work);
+		if (ep->tx_wq)
+			flush_workqueue(ep->tx_wq);
+	}
+}
+
+static int dcp_v27_ext_idle_power_off_domains(struct apple_dcp *dcp)
+{
+	int ret;
+
+	dcp->ext_idle_disp_saved = false;
+	if (!dcp->s2r_disp_dart) {
+		dev_warn(dcp->dev, "dcpext idle: missing display DART; keeping domains on\n");
+		return -ENODEV;
+	}
+	ret = apple_dart_m5_display_snapshot(dcp->s2r_disp_dart);
+	if (ret < 0) {
+		dev_warn(dcp->dev, "dcpext idle: V27 display DART snapshot failed: %d\n",
+			 ret);
+		return ret;
+	}
+	dcp->ext_idle_disp_saved = true;
+	ret = apple_sleep_m5_dispext_power(dcp->dev, false);
+	if (ret) {
+		dev_warn(dcp->dev, "dcpext idle: V27 external power off failed: %d\n", ret);
+		if (ret != -ENODEV && ret != -ENOMEM) {
+			dcp->ext_idle_power = DCP_EXT_POWER_UNCERTAIN;
+			dcp->ext_idle_domains_off = true;
+		}
+		return ret;
+	}
+	dcp->ext_idle_power = DCP_EXT_POWER_OFF;
+	dcp->ext_idle_domains_off = true;
+	return 0;
+}
+
+/*
+ * Runtime idle power-off for an unattached T6050 external DCP: close IOMFB
+ * admission, settle callbacks, send A484 + A500, close V27 sessions, stop
+ * RTKit + detach/drain mailbox RX + stop ASC CPU, cycle dart-dcp off, and
+ * lower the DISPEXTN CPU/FE/SYS power domains and PMC bits. Caller holds
+ * ext_idle_lock and has already darkened s2r_disp_dart and s2r_dcp_dart.
+ *
+ * Returns 0 on power-off, 1 if cleanly rolled back / deferred before stop,
+ * or negative errno on hard failure.
+ */
+static int dcp_v27_ext_idle_off(struct apple_dcp *dcp)
+{
+	struct dcp_v27_sleep *s = dcp->sleep_v27;
+	unsigned int i;
+	u32 status, tx_errors;
+	bool idle;
+	int ret;
+
+	if (!s || !dcp->s2r_dcp_dart || !dcp->s2r_disp_dart)
+		return -ENODEV;
+
+	dcp_v27_ext_idle_set_closed(dcp, true);
+	ret = dcp_v27_sleep_settle(dcp);
+	if (ret) {
+		dcp_v27_ext_idle_set_closed(dcp, false);
+		if (ret == -EBUSY || ret == -EAGAIN ||
+		    (ret == -ETIMEDOUT && apple_rtkit_v27_live(dcp->rtk)))
+			return 1;
+		if (ret == -EOPNOTSUPP || ret == -ENODEV ||
+		    ((ret == -EUCLEAN || ret == -EPROTO) && apple_rtkit_v27_live(dcp->rtk))) {
+			dev_info(dcp->dev, "dcpext idle: unsupported V27 endpoint inventory (%d); leaving pipe on\n",
+				 ret);
+			WRITE_ONCE(dcp->ext_idle_unsupported, true);
+			return 1;
+		}
+		return ret;
+	}
+
+	ret = iomfb_v27_sleep_rpc(dcp, false, false);
+	if (ret) {
+		dev_warn(dcp->dev, "dcpext idle: V27 A484 failed: %d\n", ret);
+		if (ret == -ENOMEM || ret == -EREMOTEIO || ret == -EBUSY || ret == -EAGAIN)
+			return dcp_v27_ext_idle_rollback(dcp, false, ret);
+		return ret;
+	}
+	ret = iomfb_v27_sleep_rpc(dcp, true, false);
+	if (ret) {
+		dev_warn(dcp->dev, "dcpext idle: V27 A500 failed: %d\n", ret);
+		if (ret == -ENOMEM || ret == -EREMOTEIO || ret == -EBUSY || ret == -EAGAIN)
+			return dcp_v27_ext_idle_rollback(dcp, true, ret);
+		return ret;
+	}
+	ret = read_poll_timeout(iomfb_channels_idle, idle, idle, 1000, 100000, false, dcp);
+	if (ret) {
+		dev_warn(dcp->dev, "dcpext idle: V27 calls still in flight: %d\n", ret);
+		return ret;
+	}
+
+	for (i = ARRAY_SIZE(v27_sleep_endpoints); i-- > 0;) {
+		struct apple_dcp_afkep *ep = dcp->sleep_v27_ep[v27_sleep_endpoints[i] - 0x20];
+		int check;
+
+		if (s->closed & BIT(i))
+			continue;
+		if (ep)
+			read_poll_timeout(afk_v27_sleep_check, check, check != -EBUSY, 1000,
+					  300 * USEC_PER_MSEC, false, ep);
+		ret = afk_v27_sleep_control(ep, false);
+		if (ret) {
+			dev_warn(dcp->dev, "dcpext idle: V27 session %02x close: %d\n",
+				 v27_sleep_endpoints[i], ret);
+			if (ret == -EBUSY || ret == -EAGAIN)
+				return dcp_v27_ext_idle_rollback(dcp, true, ret);
+			return ret;
+		}
+		s->closed |= BIT(i);
+	}
+
+	/*
+	 * Drain queued RX work and settle while RTKit TX is still live so any
+	 * IOMFB callback ACK or AFK reply completes before strict idle closes
+	 * application TX.
+	 */
+	apple_rtkit_flush_rx(dcp->rtk);
+	ret = dcp_v27_sleep_settle(dcp);
+	if (ret) {
+		dev_warn(dcp->dev, "dcpext idle: V27 pre-idle settle failed: %d\n", ret);
+		if (ret == -EBUSY || ret == -EAGAIN ||
+		    (ret == -ETIMEDOUT && apple_rtkit_v27_live(dcp->rtk)))
+			return dcp_v27_ext_idle_rollback(dcp, true, ret);
+		return ret;
+	}
+
+	tx_errors = atomic_read(&dcp->tx_errors);
+	if (dcp->secure_rtk && dcp->secure_answered) {
+		dcp_secure_poll_stop(dcp);
+		ret = apple_rtkit_idle_strict_with(dcp->rtk, dcp_secure_port_idle_strict, dcp);
+	} else {
+		ret = apple_rtkit_idle_strict(dcp->rtk);
+	}
+	if (ret) {
+		dev_warn(dcp->dev, "dcpext idle: V27 RTKit idle failed: %d\n", ret);
+		return ret;
+	}
+	ret = readl_poll_timeout(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS, status,
+		(status & (APPLE_DCP_COPROC_CPU_STATUS_IDLE | APPLE_DCP_COPROC_CPU_STATUS_STOPPED)) ==
+		(APPLE_DCP_COPROC_CPU_STATUS_IDLE | APPLE_DCP_COPROC_CPU_STATUS_STOPPED), 10, 5000);
+	if (ret) {
+		dev_warn(dcp->dev, "dcpext idle: V27 CPU did not stop (%#x)\n", status);
+		return ret;
+	}
+
+	/*
+	 * Pause and drain mailbox RX without setting RTKit's shutting_down
+	 * flag so any late message dispatches and any failed ACK or nonempty
+	 * ring is observed before powering the pipe off.
+	 */
+	apple_rtkit_set_recv_enabled(dcp->rtk, false);
+	apple_rtkit_hold_rx(dcp->rtk);
+	apple_rtkit_flush_rx(dcp->rtk);
+	ret = dcp_v27_sleep_settle(dcp);
+	if (!ret && atomic_read(&dcp->tx_errors) != tx_errors)
+		ret = -EIO;
+	if (ret) {
+		dcp_v27_ext_idle_mailbox_stop(dcp);
+		apple_rtkit_resume_rx(dcp->rtk);
+		dcp_v27_ext_idle_drain_endpoints(dcp);
+		dev_warn(dcp->dev, "dcpext idle: V27 post-idle settle failed: %d\n", ret);
+		return ret;
+	}
+	dcp_v27_ext_idle_mailbox_stop(dcp);
+	apple_rtkit_resume_rx(dcp->rtk);
+	dcp_v27_ext_idle_drain_endpoints(dcp);
+	dcp_s2r_cpu_stop(dcp);
+	WRITE_ONCE(dcp->s2r_fw_down, true);
+
+	ret = apple_dart_m5_display_cycle(dcp->s2r_dcp_dart, false);
+	if (ret) {
+		dev_warn(dcp->dev, "dcpext idle: V27 DART stop failed: %d\n", ret);
+		return ret;
+	}
+
+	return dcp_v27_ext_idle_power_off_domains(dcp);
+}
+
+static int dcp_v27_ext_idle_power_on_darts(struct apple_dcp *dcp)
+{
+	int ret;
+
+	if (!dcp->s2r_dcp_dart || !dcp->s2r_disp_dart)
+		return -ENODEV;
+	ret = apple_sleep_m5_dispext_power(dcp->dev, true);
+	if (ret) {
+		dev_warn(dcp->dev, "dcpext idle: V27 external power on failed: %d\n", ret);
+		dcp->ext_idle_power = DCP_EXT_POWER_UNCERTAIN;
+		dcp->ext_idle_domains_off = true;
+		return ret;
+	}
+	dcp->ext_idle_power = DCP_EXT_POWER_ON;
+	dcp->ext_idle_domains_off = false;
+	if (dcp->ext_idle_disp_saved) {
+		ret = apple_dart_m5_display_rewrite(dcp->s2r_disp_dart);
+		if (ret) {
+			dev_warn(dcp->dev, "dcpext idle: V27 display DART rewrite failed: %d\n",
+				 ret);
+			return ret;
+		}
+		dcp->ext_idle_disp_saved = false;
+	}
+	ret = apple_dart_m5_display_cycle(dcp->s2r_dcp_dart, true);
+	if (ret)
+		return ret;
+	ret = apple_dart_power_dark(dcp->s2r_dcp_dart, false);
+	if (ret)
+		return ret;
+	return apple_dart_power_dark(dcp->s2r_disp_dart, false);
+}
+
+static int dcp_v27_ext_idle_wake(struct apple_dcp *dcp)
+{
+	struct dcp_v27_sleep *s = dcp->sleep_v27;
+	u32 run_status = 0;
+	int ret;
+
+	if (!s || !dcp->s2r_dcp_dart || !dcp->s2r_disp_dart)
+		return -ENODEV;
+
+	ret = dcp_v27_ext_idle_power_on_darts(dcp);
+	if (ret)
+		return ret;
+
+	ret = dcp_v27_warm_restart(dcp, true);
+	if (ret == -EUCLEAN && READ_ONCE(dcp->s2r_fw_down) &&
+	    !(readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL) &
+	      APPLE_DCP_COPROC_CPU_CONTROL_RUN))
+		ret = dcp_v27_warm_restart(dcp, false);
+	if (!ret) {
+		writel(readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL) |
+		       APPLE_DCP_COPROC_CPU_CONTROL_RUN,
+		       dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
+		run_status = readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS);
+		ret = dcp_v27_boot(dcp);
+	}
+	if (ret) {
+		dev_warn(dcp->dev, "dcpext idle: V27 wake restart %d (CPU %#x); retrying\n",
+			 ret, run_status);
+		dcp_v27_ext_idle_mailbox_stop(dcp);
+		dcp_v27_ext_idle_drain_endpoints(dcp);
+		dcp_s2r_cpu_stop(dcp);
+		WRITE_ONCE(dcp->s2r_fw_down, true);
+
+		if (dcp->s2r_disp_dart) {
+			ret = apple_dart_power_dark(dcp->s2r_disp_dart, true);
+			if (ret)
+				return ret;
+		}
+		ret = apple_dart_power_dark(dcp->s2r_dcp_dart, true);
+		if (ret) {
+			if (dcp->s2r_disp_dart)
+				apple_dart_power_dark(dcp->s2r_disp_dart, false);
+			return ret;
+		}
+		ret = apple_dart_m5_display_cycle(dcp->s2r_dcp_dart, false);
+		if (!ret)
+			ret = dcp_v27_ext_idle_power_off_domains(dcp);
+		if (!ret) {
+			msleep(V27_EXT_RETRY_MS);
+			ret = dcp_v27_ext_idle_power_on_darts(dcp);
+		}
+		if (!ret)
+			ret = dcp_v27_warm_restart(dcp, false);
+		if (!ret) {
+			writel(readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL) |
+			       APPLE_DCP_COPROC_CPU_CONTROL_RUN,
+			       dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
+			ret = dcp_v27_boot(dcp);
+		}
+	}
+	if (ret) {
+		if (dcp->ext_idle_power == DCP_EXT_POWER_ON) {
+			dcp_v27_ext_idle_mailbox_stop(dcp);
+			dcp_v27_ext_idle_drain_endpoints(dcp);
+			dcp_s2r_cpu_stop(dcp);
+		}
+		WRITE_ONCE(dcp->s2r_fw_down, true);
+		return ret;
+	}
+
+	ret = dcp_v27_ext_idle_reopen_sessions(dcp);
+	if (ret)
+		return ret;
+	s->ext_torn = false;
+	s->ext_pipe = READ_ONCE(dcp->pipe_enabled_h17p);
+	ret = dcp_v27_ext_wake_calls(s, false);
+	if (!ret)
+		ret = iomfb_queue_settle(dcp, msecs_to_jiffies(1000));
+	if (ret)
+		return ret;
+	dcp_v27_ext_idle_set_closed(dcp, false);
+	return 0;
+}
 #else
 static void dcp_v27_dark_replug_owed(struct apple_dcp *dcp) { }
 static bool dcp_v27_sleep_selected(struct apple_dcp *dcp) { return false; }
+static bool dcp_v27_sleep_active(struct apple_dcp *dcp) { return false; }
 static void dcp_v27_sleep_invalidate(struct apple_dcp *dcp) { }
 static int dcp_v27_sleep_suspend(struct apple_dcp *dcp) { return -EOPNOTSUPP; }
 static int dcp_v27_sleep_resume(struct apple_dcp *dcp) { return -EOPNOTSUPP; }
+static bool dcp_v27_ext_idle_capable(struct apple_dcp *dcp) { return false; }
+static int dcp_v27_ext_idle_prepare(struct apple_dcp *dcp) { return -EOPNOTSUPP; }
+static int dcp_v27_ext_idle_off(struct apple_dcp *dcp) { return -EOPNOTSUPP; }
+static int dcp_v27_ext_idle_wake(struct apple_dcp *dcp) { return -EOPNOTSUPP; }
 #endif

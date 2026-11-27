@@ -146,8 +146,10 @@ void dcp_peer_display_ids_v27(struct apple_dcp *dcp, u32 own, u32 related)
 	peer->peer_tiling.display_id_valid = true;
 }
 
-static void dcp_peer_release_locked(struct apple_dcp *dcp)
+static struct apple_dcp *dcp_peer_release_locked(struct apple_dcp *dcp)
 {
+	struct apple_dcp *released = NULL;
+
 	if (dcp->peer_reserved) {
 		/* A link-allocation release is not a DMA-stop acknowledgement.
 		 * Keep a prepared pair owned until the AP has powered both down.
@@ -158,22 +160,24 @@ static void dcp_peer_release_locked(struct apple_dcp *dcp)
 		    dcp->peer_reserved->peer_tiling.member) {
 			dcp->peer_tiling.modeset_complete = false;
 			dcp->peer_reserved->peer_tiling.modeset_complete = false;
-			return;
+			return NULL;
 		}
+		released = dcp->peer_reserved;
 		memset(&dcp->peer_tiling, 0, sizeof(dcp->peer_tiling));
-		memset(&dcp->peer_reserved->peer_tiling, 0,
-		       sizeof(dcp->peer_reserved->peer_tiling));
-		dcp->peer_reserved->peer_owner = NULL;
+		memset(&released->peer_tiling, 0, sizeof(released->peer_tiling));
+		released->peer_owner = NULL;
 		dcp->peer_reserved = NULL;
 	}
+	return released;
 }
 
 int dcp_peer_hints_v27(struct apple_dcp *dcp, struct dptx_port *port,
 		      const void *data, size_t size, void *reply, size_t reply_size)
 {
 	struct dcp_display_hints_v27 *r = reply;
-	struct apple_dcp *peer = NULL;
+	struct apple_dcp *peer = NULL, *released = NULL;
 	struct drm_crtc *crtc;
+	bool need_wake = false;
 	u32 extra;
 
 	if (size != sizeof(*r) || reply_size != sizeof(*r))
@@ -191,19 +195,26 @@ int dcp_peer_hints_v27(struct apple_dcp *dcp, struct dptx_port *port,
 
 	extra = dcp_peer_extra_pipes(r->hints, &port->caps);
 	memset(&r->allocation, 0, sizeof(r->allocation));
-	guard(mutex)(&dcp_peer_lock);
-	if (dcp->peer_unbinding || dcp->crashed)
+	mutex_lock(&dcp_peer_lock);
+	if (dcp->peer_unbinding || dcp->crashed) {
+		mutex_unlock(&dcp_peer_lock);
 		return -ENODEV;
+	}
 	if (!extra || !(r->hints[0] & 1)) {
-		dcp_peer_release_locked(dcp);
+		released = dcp_peer_release_locked(dcp);
+		mutex_unlock(&dcp_peer_lock);
+		if (released)
+			dcp_ext_idle_kick(released);
 		memset(&r->allocation, 0, sizeof(r->allocation));
 		return 0;
 	}
 	/* This candidate implements a non-tiled, two-pipe reservation. Tiled
 	 * panels and more than one peer require the full display allocator.
 	 */
-	if (extra != 1 || (r->hints[0] & 2) || dcp->peer_owner)
+	if (extra != 1 || (r->hints[0] & 2) || dcp->peer_owner) {
+		mutex_unlock(&dcp_peer_lock);
 		return 0;
+	}
 	peer = dcp->peer_reserved;
 	if (!peer) {
 		drm_for_each_crtc(crtc, dcp->crtc->base.dev) {
@@ -214,6 +225,8 @@ int dcp_peer_hints_v27(struct apple_dcp *dcp, struct dptx_port *port,
 			 */
 			if (!p || !p->active || p->crashed || p->peer_unbinding ||
 			    p->peer_owner || p->peer_reserved || p->fixed_phy ||
+			    READ_ONCE(p->ext_idle_state) == DCP_EXT_IDLE_FAILED ||
+			    READ_ONCE(p->ext_idle_state) == DCP_EXT_IDLE_CLOSED ||
 			    p->nr_typec_routes || p->active_typec_route ||
 			    (p->connector && p->connector->connected) ||
 			    !dcp_peer_index_allowed(dcp->index, p->index) ||
@@ -231,6 +244,7 @@ int dcp_peer_hints_v27(struct apple_dcp *dcp, struct dptx_port *port,
 				peer = p;
 		}
 		if (!peer) {
+			mutex_unlock(&dcp_peer_lock);
 			dev_info(dcp->dev, "no eligible idle peer for %u extra pipe\n", extra);
 			return 0;
 		}
@@ -241,6 +255,31 @@ int dcp_peer_hints_v27(struct apple_dcp *dcp, struct dptx_port *port,
 			 get_unaligned_le32(r->hints + 0x3c),
 			 get_unaligned_le32(r->hints + 0x40),
 			 get_unaligned_le32(r->hints + 0x44));
+	}
+	need_wake = READ_ONCE(peer->ext_idle_state) != DCP_EXT_IDLE_ON;
+	if (need_wake) {
+		peer->peer_waking = true;
+		mutex_unlock(&dcp_peer_lock);
+		if (dcp_ext_idle_wake(peer)) {
+			mutex_lock(&dcp_peer_lock);
+			peer->peer_waking = false;
+			if (dcp->peer_reserved == peer && peer->peer_owner == dcp)
+				dcp_peer_release_locked(dcp);
+			mutex_unlock(&dcp_peer_lock);
+			return 0;
+		}
+		mutex_lock(&dcp_peer_lock);
+		peer->peer_waking = false;
+		if (dcp->peer_unbinding || dcp->crashed ||
+		    dcp->peer_reserved != peer || peer->peer_owner != dcp ||
+		    peer->peer_unbinding || peer->crashed ||
+		    READ_ONCE(peer->sleep_v27_closed) ||
+		    READ_ONCE(peer->ext_idle_state) != DCP_EXT_IDLE_ON) {
+			if (dcp->peer_reserved == peer && peer->peer_owner == dcp)
+				dcp_peer_release_locked(dcp);
+			mutex_unlock(&dcp_peer_lock);
+			return -ENODEV;
+		}
 	}
 	/*
 	 * The platform limit keeps the reservation: the peer is an engine no
@@ -266,5 +305,6 @@ int dcp_peer_hints_v27(struct apple_dcp *dcp, struct dptx_port *port,
 	r->peer_id = cpu_to_le32(peer->index);
 	r->extra_pipes = extra;
 	r->flags &= ~3;
+	mutex_unlock(&dcp_peer_lock);
 	return 0;
 }
