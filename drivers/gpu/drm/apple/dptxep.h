@@ -60,6 +60,10 @@ struct dptx_port {
 	bool enabled, connected;
 	/* A published session closed; unlike initial discovery, this is terminal. */
 	bool closed;
+	/* T8132 dcpext restarted from CPU reset: allow rebinding on fresh announcement. */
+	bool rebind_allowed;
+	/* Compact initial discovery: hold port->enabled until startup completes. */
+	bool staged;
 	struct completion enable_completion;
 	struct completion linkcfg_completion;
 	u32 unit;

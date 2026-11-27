@@ -653,6 +653,10 @@ struct apple_dcp {
 	struct dcp_iboot *iboot;
 	/* Bumped by every iomfb poweron; see afk_compact_slot(). */
 	u32 afk_power_gen;
+	/* Serializes session-wide AFK TX fence, early-RX overflow, and TX commit. */
+	spinlock_t afk_tx_lock;
+	bool afk_tx_closed;
+	bool afk_rx_failed;
 	/*
 	 * AFK endpoints the bootloader left running, bit N for endpoint
 	 * 0x20 + N, from its hand-off: afk_start() stops each before its

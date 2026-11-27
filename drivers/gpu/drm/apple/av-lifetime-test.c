@@ -153,6 +153,7 @@ static struct av_life_test *av_life_setup(struct kunit *test, work_func_t owner_
 	KUNIT_ASSERT_NOT_NULL(test, t->asrv);
 	KUNIT_ASSERT_NOT_NULL(test, t->ep);
 	t->dcp->dev = t->dev;
+	spin_lock_init(&t->dcp->afk_tx_lock);
 	dev_set_drvdata(t->dev, t->dcp);
 	afk_ep_init_state(t->ep);
 	init_rwsem(&t->asrv->srv_rwsem);

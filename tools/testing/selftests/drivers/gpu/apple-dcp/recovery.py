@@ -33,9 +33,19 @@ def check(root, output):
     # afk_send_command_common(); afk_send_command_timeout_len() wraps it.
     if 'static int afk_send_command_common(' in afk:
         sender=extract(afk,'static int afk_send_command_common(')+'\n'+sender
+    if 'static int afk_tx_admit_locked(' in afk:
+        sender=(extract(afk,'static int afk_tx_failed_under_tx_lock(')+'\n'+
+                extract(afk,'static int afk_tx_admit_locked(')+'\n'+sender)
     unit=unit[:unit.index('int main(void)')]
+    unit=unit.replace('bool lock,stopping;',
+                      'bool lock,stopping,tx_paused,rx_paused,rx_failed;unsigned int tx_active;')
+    unit=unit.replace('bool dcpext;',
+                      'bool dcpext,afk_tx_lock,afk_tx_closed,afk_rx_failed,crashed;')
     unit=unit.replace('static unsigned int dma_frees,opens;',r'''
     static unsigned int dma_frees,opens;
+    #define ESHUTDOWN 108
+    #define spin_lock(lock) do { assert(!*(lock)); *(lock)=true; } while(0)
+    #define spin_unlock(lock) do { assert(*(lock)); *(lock)=false; } while(0)
     #define SZ_1M (1U<<20)
     #define GFP_KERNEL 0
     #define DECLARE_COMPLETION_ONSTACK(c) int c=0
@@ -100,6 +110,10 @@ def check(root, output):
             current_channel=channel;current_tag=tag;return 0;
         }
     '''+marker)
+    unit=unit.replace('static void afk_v2_callback(',
+                      'static int afk_send_epic_published(struct apple_dcp_afkep *e,u32 channel,u16 tag,int type,int category,u8 subtype,const void *p,size_t n,bool *published)\n'
+                      '{ int r=afk_send_epic(e,channel,tag,type,category,subtype,p,n); if(published) *published=!r; return r; }\n'
+                      'static void afk_v2_callback(')
 
     tests=r'''
     static void setup(void) {
@@ -333,9 +347,9 @@ def check(root, output):
     # The actual RX loop uses the real ring buffers instead of the diagnostic mock.
     queued=queued.replace('struct apple_dcp_afkep { struct { bool ready;u32 *rptr,*wptr; } txbfr,rxbfr;u8 *command_tags;',
                           'struct apple_dcp_afkep { u8 *command_tags;',1)
-    queued=queued.replace('struct apple_dcp_afkep { u8 *command_tags;bool lock,stopping;',
+    queued=queued.replace('struct apple_dcp_afkep { u8 *command_tags;bool lock,stopping,tx_paused,rx_paused,rx_failed;unsigned int tx_active;',
                           'typedef u32 __le32;\n'+extract(afh,'struct afk_ringbuffer {')+';\n'
-                          'struct apple_dcp_afkep { u8 *command_tags;int started,stopped;struct afk_ringbuffer txbfr,rxbfr;void *debugfs_entry;bool lock,stopping;')
+                          'struct apple_dcp_afkep { u8 *command_tags;int started,stopped;struct afk_ringbuffer txbfr,rxbfr;void *debugfs_entry;bool lock,stopping,tx_paused,rx_paused,rx_failed;unsigned int tx_active;u32 rx_head,rx_count,rx_admitted;')
     queued=queued.replace('bool external_physically_absent,hpd_mutex,quiescing,typec_cable_connected;',
                           'bool retain_dma,external_physically_absent,hpd_mutex,quiescing,typec_cable_connected;')
     queued=queued.replace('static void run_retries(void) { assert(!ep.lock);if(ep.service_work.pending) { ep.service_work.pending=false;afk_service_worker(&ep.service_work); } }',
@@ -361,7 +375,7 @@ def check(root, output):
     '''
     af=(root/'drivers/gpu/drm/apple/afk.c').read_text()
     if 'mutex_lock(&afkep->tx_lock);' in af:
-        queued=queued.replace('bool lock,stopping;','bool lock,tx_lock,stopping;',1)
+        queued=queued.replace('bool lock,stopping','bool lock,tx_lock,stopping',1)
     if 'atomic_inc(&ep->sleep_jobs);' in af:
         # The receive jobs a firmware sleep waits for; nothing here waits.
         anchor='struct apple_dcp_afkep { u8 *command_tags;int started,stopped;'
@@ -391,6 +405,7 @@ def check(root, output):
     for signature in ['static inline unsigned int afk_ring_drain_budget(', 'static inline unsigned int afk_ring_drain(']:
         queued+=extract(afh,signature)+'\n'
     for signature in ['static bool afk_recv_entry(', 'static void afk_recv_drain(',
+                      'static void afk_handle_rx_word(',
                       'static void afk_receive_message_worker(', 'int afk_receive_message(', 'void afk_quiesce(', 'static void afk_release_context(']:
         queued+=extract(af,signature)+'\n'
     queued+=r'''

@@ -11,6 +11,7 @@ typedef uint32_t u32;
 typedef int64_t s64;
 #define MAX_PENDING_CMDS 8
 #define READ_ONCE(x) (x)
+#define WRITE_ONCE(x, v) ((x) = (v))
 #define dev_info(...) do { } while (0)
 #define spin_lock_irqsave(lock, flags) do { (void)(lock); (flags) = 0; } while (0)
 #define spin_unlock_irqrestore(lock, flags) do { (void)(lock); (void)(flags); } while (0)

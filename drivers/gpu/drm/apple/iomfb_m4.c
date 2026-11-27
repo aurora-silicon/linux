@@ -50,6 +50,7 @@
 #include "afk.h"
 #include "dcp.h"
 #include "dcp-sdr-edid.h"
+#include "dptx-service.h"
 #include "dptxep.h"
 #include "epic/dpavservep.h"
 #include "iomfb_m4.h"
@@ -207,9 +208,19 @@ struct iomfb_m4 {
 	 */
 	bool gate_capable;
 	bool gated;
-	/* External: its firmware (0) and display (1) DARTs, and stopped for a deep sleep. */
+	/* External: its firmware (0) and display (1) DARTs, and stopped for sleep or idle. */
 	struct apple_dart_cio *ext_darts[2];
 	bool ext_stopped;
+	struct delayed_work ext_idle_work;
+	bool ext_idle_capable;
+	bool ext_idle_armed;
+	bool ext_idle_held;
+	bool ext_idle_stopping;
+	bool ext_idle_stopped;
+	bool ext_dptx_live;
+	bool ext_route_ready;
+	bool ext_idle_closed;
+	unsigned int ext_idle_delay_ms;
 	struct delayed_work gate_work;
 	u64 gate_cycles;
 	s64 gate_off_us, gate_on_us;
@@ -302,6 +313,10 @@ struct iomfb_m4 {
 	int ext_logged_pick;
 };
 
+/* Power down an unused external DCP after this long with no active route. */
+#define DCP_M4_EXT_IDLE_DELAY_MS	5000
+#define DCP_M4_EXT_IDLE_MAX_DELAY_MS	60000
+
 static void dcp_m4_runtime_wake(struct iomfb_m4 *dcp);
 struct dcp_m4_runtime;
 static void dcp_m4_ext_async_work(struct work_struct *work);
@@ -309,6 +324,8 @@ static int dcp_m4_set_power_state(struct iomfb_m4 *dcp, bool on);
 static int iomfb_m4_power_gate(struct iomfb_m4 *dcp);
 static int iomfb_m4_power_ungate(struct iomfb_m4 *dcp);
 static void iomfb_m4_gate_work(struct work_struct *work);
+static void iomfb_m4_ext_idle_work(struct work_struct *work);
+static void iomfb_m4_ext_idle_arm_locked(struct iomfb_m4 *dcp, unsigned int delay_ms);
 static void dcp_m4_runtime_receive(struct iomfb_m4 *dcp, u64 word);
 
 static int dcp_m4_dart_check(struct device *dev)
@@ -366,8 +383,12 @@ static bool dcp_m4_reserved(struct iomfb_m4 *dcp, u64 pa, size_t size, bool oslo
 	return found;
 }
 
+static void iomfb_m4_ext_afk_block_tx(struct iomfb_m4 *dcp, unsigned int count);
+
 static void dcp_m4_failed(struct iomfb_m4 *dcp, int error)
 {
+	/* Pairs with smp_store_release() in dptxep_init_desktop(). */
+	struct apple_dcp_afkep *dptxep = smp_load_acquire(&dcp->owner->dptxep);
 	unsigned long flags;
 	bool first;
 
@@ -376,12 +397,20 @@ static void dcp_m4_failed(struct iomfb_m4 *dcp, int error)
 	if (first)
 		dcp->error = error;
 	dcp->ready = false;
+	spin_lock(&dcp->owner->afk_tx_lock);
 	WRITE_ONCE(dcp->owner->crashed, true);
+	dcp->owner->afk_tx_closed = true;
+	spin_unlock(&dcp->owner->afk_tx_lock);
 	spin_unlock_irqrestore(&dcp->state_lock, flags);
+	if (dcp->external)
+		iomfb_m4_ext_afk_block_tx(dcp,
+					  ARRAY_SIZE(dcp->probe_ep) + 1);
 	if (first)
 		dev_err(dcp->dev, "Retained DCP session quarantined: %d\n", error);
 	complete_all(&dcp->reply);
 	dcp_m4_runtime_wake(dcp);
+	if (dptxep)
+		wake_up_all(&dptxep->service_wq);
 }
 
 static int dcp_m4_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
@@ -466,7 +495,12 @@ static void dcp_m4_crashed(void *cookie, const void *log, size_t size)
 	dcp_m4_failed(dcp, -EIO);
 }
 
-static void dcp_m4_receive(void *cookie, u8 endpoint, u64 message)
+/*
+ * Handle all application endpoints synchronously in RTKit's early receive path
+ * into pre-allocated rings so RTKit never allocates per-message receive work
+ * (which could silently drop an AFK or IOMFB word under GFP_ATOMIC pressure).
+ */
+static bool dcp_m4_receive_early(void *cookie, u8 endpoint, u64 message)
 {
 	struct iomfb_m4 *dcp = cookie;
 	unsigned long flags;
@@ -476,20 +510,25 @@ static void dcp_m4_receive(void *cookie, u8 endpoint, u64 message)
 	if (endpoint != DCP_M4_ENDPOINT) {
 		struct apple_dcp_afkep *ep = NULL;
 
-		if (dcp->external && endpoint == DPTX_ENDPOINT)
-			ep = READ_ONCE(dcp->owner->dptxep);
-		else if (dcp->external && endpoint >= 0x20 && endpoint < 0x40)
-			ep = READ_ONCE(dcp->probe_ep[endpoint - 0x20]);
+		if (dcp->external && endpoint == DPTX_ENDPOINT) {
+			/* Pairs with smp_store_release() in dptxep_init_desktop(). */
+			ep = smp_load_acquire(&dcp->owner->dptxep);
+		} else if (dcp->external && endpoint >= 0x20 && endpoint < 0x40) {
+			/* Pairs with smp_store_release() in dcp_m4_probe_endpoints(). */
+			ep = smp_load_acquire(&dcp->probe_ep[endpoint - 0x20]);
+		}
 		if (ep) {
-			afk_receive_message(ep, message);
-			return;
+			ret = afk_receive_message_early(ep, message);
+			if (ret && ret != -ESHUTDOWN)
+				dcp_m4_failed(dcp, ret);
+			return true;
 		}
 		dcp_m4_failed(dcp, -EPROTO);
-		return;
+		return true;
 	}
 	if (READ_ONCE(dcp->runtime)) {
 		dcp_m4_runtime_receive(dcp, message);
-		return;
+		return true;
 	}
 	spin_lock_irqsave(&dcp->state_lock, flags);
 	ret = dcp_m4_ready_notification(message, dcp->init_sent, dcp->ready_word);
@@ -500,10 +539,17 @@ static void dcp_m4_receive(void *cookie, u8 endpoint, u64 message)
 		dcp_m4_failed(dcp, ret);
 	else if (ret == 1)
 		complete_all(&dcp->reply);
+	return true;
+}
+
+static void dcp_m4_receive(void *cookie, u8 endpoint, u64 message)
+{
+	dcp_m4_receive_early(cookie, endpoint, message);
 }
 
 static const struct apple_rtkit_ops dcp_m4_rtkit_ops = {
 	.recv_message = dcp_m4_receive,
+	.recv_message_early = dcp_m4_receive_early,
 	.crashed = dcp_m4_crashed,
 	.shmem_setup = dcp_m4_shmem_setup,
 	.shmem_destroy = dcp_m4_shmem_destroy,
@@ -1729,8 +1775,14 @@ static int dcp_m4_external_callback(struct dcp_m4_runtime *r, u32 tag, bool remo
 			WRITE_ONCE(r->ext_restore_dart, on);
 		WRITE_ONCE(r->dcp->ext_dart_down, !on);
 		/* A sleep's preparation may wait for it (iomfb_m4_ext_sleep_prepare()). */
-		if (!on)
+		if (!on) {
 			wake_up_all(&r->dcp->ext_settle_wq);
+			if (!r->ext_sleeping && !r->dcp->ext_idle_armed &&
+			    !r->dcp->ext_idle_stopping) {
+				r->dcp->ext_idle_delay_ms = DCP_M4_EXT_IDLE_DELAY_MS;
+				iomfb_m4_ext_idle_arm_locked(r->dcp, DCP_M4_EXT_IDLE_DELAY_MS);
+			}
+		}
 		if (on)
 			r->dcp->ext_dart_since_sleep = false;
 		dev_dbg(r->dcp->dev, "D572 powerUpDART(%u)\n", on);
@@ -2742,6 +2794,7 @@ int iomfb_m4_init(struct apple_dcp *owner)
 	init_waitqueue_head(&dcp->ext_settle_wq);
 	INIT_DELAYED_WORK(&dcp->idle_cache, iomfb_m4_idle_cache_work);
 	INIT_DELAYED_WORK(&dcp->gate_work, iomfb_m4_gate_work);
+	INIT_DELAYED_WORK(&dcp->ext_idle_work, iomfb_m4_ext_idle_work);
 	INIT_DELAYED_WORK(&dcp->ext_edid_retry, iomfb_m4_ext_edid_retry_work);
 	if (!request_mem_region(res->start, resource_size(res), dev_name(dev))) {
 		ret = -EBUSY;
@@ -2779,6 +2832,8 @@ int iomfb_m4_init(struct apple_dcp *owner)
 		if (ret)
 			dev_info(dev, "deep sleep with an external display not supported here: %d\n",
 				 ret);
+		dcp->ext_idle_capable = dcp->ext_darts[0] && dcp->ext_darts[1] &&
+					!apple_pmgr_ps_consumer_check(dev);
 	}
 	/* The internal display's power-down: its PMC interface names the rest. */
 	dcp->gate_capable = !external && apple_pmp_j713_board() &&
@@ -2881,7 +2936,8 @@ static void dcp_m4_probe_endpoints(struct iomfb_m4 *dcp)
 				 PTR_ERR(ep));
 			continue;
 		}
-		WRITE_ONCE(dcp->probe_ep[eps[i] - 0x20], ep);
+		/* Pairs with smp_load_acquire() in early RX dispatch. */
+		smp_store_release(&dcp->probe_ep[eps[i] - 0x20], ep);
 		ret = afk_start(ep);
 		if (ret)
 			dev_warn(dcp->dev, "endpoint %02x start failed: %d\n", eps[i], ret);
@@ -2889,8 +2945,13 @@ static void dcp_m4_probe_endpoints(struct iomfb_m4 *dcp)
 
 	/* The DPTX port services live on EP 0x2a on this firmware. */
 	ret = dptxep_init_desktop(dcp->owner, DPTX_ENDPOINT);
-	if (ret)
+	if (ret) {
 		dev_err(dcp->dev, "DPTX ports on EP %#x: %d\n", DPTX_ENDPOINT, ret);
+	} else {
+		dcp->ext_dptx_live = true;
+		/* Pairs with smp_load_acquire() in iomfb_m4_ext_route_ready(). */
+		smp_store_release(&dcp->ext_route_ready, true);
+	}
 	dev_dbg(dcp->dev, "DPTX port0 %s, port1 %s\n",
 		dcp->owner->dptxport[0].service ? "bound" : "absent",
 		dcp->owner->dptxport[1].service ? "bound" : "absent");
@@ -5371,6 +5432,10 @@ void iomfb_m4_ext_sleep_wake(struct apple_dcp *owner)
 		if (kept)
 			dev_dbg(dcp->dev, "sleep: no suspend since it began: the display DART stays confirmed\n");
 	}
+	if (!dcp->ext_idle_armed) {
+		dcp->ext_idle_delay_ms = DCP_M4_EXT_IDLE_DELAY_MS;
+		iomfb_m4_ext_idle_arm_locked(dcp, DCP_M4_EXT_IDLE_DELAY_MS);
+	}
 	mutex_unlock(&dcp->lock);
 }
 
@@ -5651,10 +5716,246 @@ static int iomfb_m4_ext_dart_off(struct apple_dart_cio *dart)
  * refusal before RTKit idles changes nothing, and a failure after the CPU
  * stopped is undone in reverse. Either way the sleep is refused.
  */
-static int iomfb_m4_ext_stop(struct iomfb_m4 *dcp)
+#define DCP_M4_EXT_AFK_SLOTS	(ARRAY_SIZE(((struct iomfb_m4 *)0)->probe_ep) + 1)
+
+static struct apple_dcp_afkep *iomfb_m4_ext_afk_ep(struct iomfb_m4 *dcp, unsigned int idx)
+{
+	if (idx < ARRAY_SIZE(dcp->probe_ep))
+		return READ_ONCE(dcp->probe_ep[idx]);
+	if (idx == ARRAY_SIZE(dcp->probe_ep)) {
+		if (!dcp->ext_dptx_live)
+			return NULL;
+		/* Pairs with smp_store_release() in dptxep_init_desktop(). */
+		return smp_load_acquire(&dcp->owner->dptxep);
+	}
+	return NULL;
+}
+
+static void iomfb_m4_ext_afk_block_tx(struct iomfb_m4 *dcp, unsigned int count)
+{
+	for (unsigned int i = 0; i < count; i++)
+		afk_block_tx(iomfb_m4_ext_afk_ep(dcp, i));
+}
+
+static int iomfb_m4_ext_afk_resume_tx(struct iomfb_m4 *dcp, unsigned int count)
+{
+	for (unsigned int i = 0; i < count; i++) {
+		int ret = afk_resume_tx(iomfb_m4_ext_afk_ep(dcp, i));
+
+		if (ret) {
+			iomfb_m4_ext_afk_block_tx(dcp, i);
+			return ret;
+		}
+	}
+	return 0;
+}
+
+static int iomfb_m4_ext_afk_open_tx(struct iomfb_m4 *dcp, unsigned int afk_count,
+				    bool clear_gated)
+{
+	unsigned long flags;
+	int ret;
+
+	/*
+	 * Keep the session-wide afk_tx_closed fence closed while reopening each
+	 * endpoint, then atomically check the failure latches and reopen under
+	 * state_lock -> afk_tx_lock so neither early RX overflow nor TX commit
+	 * can race across endpoints.
+	 */
+	ret = iomfb_m4_ext_afk_resume_tx(dcp, afk_count);
+	if (ret)
+		return READ_ONCE(dcp->error) ?: ret;
+
+	spin_lock_irqsave(&dcp->state_lock, flags);
+	spin_lock(&dcp->owner->afk_tx_lock);
+	ret = dcp->error ?: (dcp->owner->afk_rx_failed ? -ENOSPC :
+			     READ_ONCE(dcp->owner->crashed) ? -EIO : 0);
+	if (!ret) {
+		if (clear_gated)
+			WRITE_ONCE(dcp->gated, false);
+		dcp->owner->afk_tx_closed = false;
+	}
+	spin_unlock(&dcp->owner->afk_tx_lock);
+	spin_unlock_irqrestore(&dcp->state_lock, flags);
+	if (ret) {
+		iomfb_m4_ext_afk_block_tx(dcp, afk_count);
+		return ret;
+	}
+	return 0;
+}
+
+static int iomfb_m4_ext_afk_pause_tx(struct iomfb_m4 *dcp, unsigned int *paused)
+{
+	unsigned long flags;
+	int ret;
+
+	*paused = 0;
+	spin_lock_irqsave(&dcp->state_lock, flags);
+	spin_lock(&dcp->owner->afk_tx_lock);
+	ret = dcp->error ?: (dcp->owner->afk_rx_failed ? -ENOSPC :
+			     READ_ONCE(dcp->owner->crashed) ? -EIO : 0);
+	if (!ret)
+		dcp->owner->afk_tx_closed = true;
+	spin_unlock(&dcp->owner->afk_tx_lock);
+	spin_unlock_irqrestore(&dcp->state_lock, flags);
+	if (ret)
+		return ret;
+
+	for (unsigned int i = 0; i < DCP_M4_EXT_AFK_SLOTS; i++) {
+		ret = afk_pause_tx(iomfb_m4_ext_afk_ep(dcp, i));
+		if (ret) {
+			iomfb_m4_ext_afk_open_tx(dcp, *paused, false);
+			*paused = 0;
+			return ret;
+		}
+		*paused = i + 1;
+	}
+	return 0;
+}
+
+static int iomfb_m4_ext_afk_recheck(struct iomfb_m4 *dcp)
+{
+	for (unsigned int i = 0; i < DCP_M4_EXT_AFK_SLOTS; i++) {
+		int ret = afk_pause_recheck(iomfb_m4_ext_afk_ep(dcp, i));
+
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
+static void iomfb_m4_ext_afk_pause_rx(struct iomfb_m4 *dcp)
+{
+	for (unsigned int i = 0; i < DCP_M4_EXT_AFK_SLOTS; i++)
+		afk_pause_rx(iomfb_m4_ext_afk_ep(dcp, i));
+}
+
+static int iomfb_m4_ext_afk_rx_check(struct iomfb_m4 *dcp)
+{
+	for (unsigned int i = 0; i < DCP_M4_EXT_AFK_SLOTS; i++) {
+		int ret = afk_pause_rx_check(iomfb_m4_ext_afk_ep(dcp, i));
+
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
+static void iomfb_m4_ext_afk_resume_rx(struct iomfb_m4 *dcp, bool replay)
+{
+	for (unsigned int i = 0; i < DCP_M4_EXT_AFK_SLOTS; i++)
+		afk_resume_rx(iomfb_m4_ext_afk_ep(dcp, i), replay);
+}
+
+static bool iomfb_m4_ext_dptx0_started(struct iomfb_m4 *dcp, u32 gen)
+{
+	struct dptx_port *port = &dcp->owner->dptxport[0];
+	struct apple_epic_service *service;
+
+	if (!dptx_service_available(port))
+		return false;
+	service = READ_ONCE(port->service);
+	return service && READ_ONCE(service->power_gen) == gen &&
+	       READ_ONCE(service->started);
+}
+
+static bool iomfb_m4_ext_dptx0_ready(struct iomfb_m4 *dcp,
+				     struct apple_dcp_afkep *dptxep, u32 gen)
+{
+	return READ_ONCE(dcp->error) ||
+	       READ_ONCE(dptxep->compact_start_err) ||
+	       iomfb_m4_ext_dptx0_started(dcp, gen);
+}
+
+static void dcp_m4_ext_reset_swap_state(struct dcp_m4_runtime *r)
+{
+	if (!r)
+		return;
+	for (unsigned int i = 0; i < ARRAY_SIZE(r->ext_lost_swap); i++)
+		r->ext_lost_swap[i] = (struct dcp_m4_ext_lost){ .win = -1 };
+	memset(r->ext_early, 0, sizeof(r->ext_early));
+	r->ext_hold_id = 0;
+	r->ext_hold_probe = false;
+	r->ext_orphan_start = 0;
+	r->ext_buf_lost[0] = 0;
+	r->ext_buf_lost[1] = 0;
+	r->ext_front = -1;
+	r->ext_buf_stale[0] = true;
+	r->ext_buf_stale[1] = true;
+	r->ext_done = (struct dcp_m4_ext_done){};
+	r->ext_swap_shown = false;
+	for (int i = 0; i < DCP_M4_EXT_WINDOWS; i++)
+		r->ext_win[i].on_screen = false;
+}
+
+static int iomfb_m4_ext_reset_finish(struct iomfb_m4 *dcp)
+{
+	struct apple_dcp_afkep *dptxep =
+		iomfb_m4_ext_afk_ep(dcp, ARRAY_SIZE(dcp->probe_ep));
+	bool wait_dptx = dptxep && READ_ONCE(dptxep->compact);
+	unsigned long flags;
+	u32 gen;
+
+	spin_lock_irqsave(&dcp->state_lock, flags);
+	dcp->ext_avserv = NULL;
+	spin_unlock_irqrestore(&dcp->state_lock, flags);
+	dcp_m4_ext_reset_swap_state(dcp->runtime);
+	if (dptxep) {
+		afk_compact_orphans_drop(dptxep);
+		spin_lock_irqsave(&dptxep->lock, flags);
+		WRITE_ONCE(dptxep->compact_start_err, 0);
+		spin_unlock_irqrestore(&dptxep->lock, flags);
+	}
+	WRITE_ONCE(dcp->owner->t8132_release_late, false);
+	gen = READ_ONCE(dcp->owner->afk_power_gen) + 1;
+	WRITE_ONCE(dcp->owner->afk_power_gen, gen);
+	for (unsigned int i = 0; i < DCP_M4_EXT_AFK_SLOTS; i++) {
+		struct apple_dcp_afkep *ep = iomfb_m4_ext_afk_ep(dcp, i);
+
+		if (ep) {
+			afk_compact_rx_reset(ep);
+			WRITE_ONCE(ep->compact_rebind_gen, gen);
+		}
+	}
+	for (unsigned int i = 0; i < ARRAY_SIZE(dcp->owner->dptxport); i++) {
+		struct dptx_port *port = &dcp->owner->dptxport[i];
+
+		if (wait_dptx) {
+			/* Pairs with smp_load_acquire() in dptx_service_available(). */
+			smp_store_release(&port->enabled, false);
+			WRITE_ONCE(port->connected, false);
+			reinit_completion(&port->enable_completion);
+		}
+		WRITE_ONCE(port->rebind_allowed, true);
+	}
+	/* Replay new-session AFK words deferred during retained wake once RTKit is ON. */
+	iomfb_m4_ext_afk_resume_rx(dcp, true);
+	if (wait_dptx) {
+		long left = wait_event_timeout(dptxep->service_wq,
+					       iomfb_m4_ext_dptx0_ready(dcp, dptxep, gen),
+					       msecs_to_jiffies(1000));
+		int err;
+
+		afk_flush_rx(dptxep);
+		err = READ_ONCE(dcp->error);
+		if (!err)
+			err = READ_ONCE(dptxep->compact_start_err);
+		if (err)
+			return err;
+		if (!iomfb_m4_ext_dptx0_started(dcp, gen))
+			return left ? -EIO : -ETIMEDOUT;
+	} else {
+		afk_flush_rx(dptxep);
+	}
+	return READ_ONCE(dcp->error);
+}
+
+static int iomfb_m4_ext_stop(struct iomfb_m4 *dcp, bool runtime)
 {
 	struct dcp_m4_runtime *r = dcp->runtime;
+	ktime_t start = ktime_get();
 	bool prepared[2] = {}, rx_held = false, cpu_off = false, cpu_reset;
+	unsigned int afk_paused = 0;
 	unsigned long flags;
 	__le32 zero = 0;
 	const char *step = "DART owner";
@@ -5674,9 +5975,14 @@ static int iomfb_m4_ext_stop(struct iomfb_m4 *dcp)
 		step = "PMGR";
 		ret = apple_pmgr_ps_consumer_check(dcp->dev);
 	}
+	if (!ret) {
+		step = "AFK pause";
+		ret = iomfb_m4_ext_afk_pause_tx(dcp, &afk_paused);
+	}
 	for (unsigned int i = 0; !ret && i < 2; i++) {
 		step = "DART owner";
-		ret = apple_dart_cio_prepare(dcp->ext_darts[i]);
+		ret = runtime ? apple_dart_cio_prepare_runtime(dcp->ext_darts[i]) :
+				apple_dart_cio_prepare(dcp->ext_darts[i]);
 		prepared[i] = !ret;
 	}
 	if (ret)
@@ -5690,7 +5996,36 @@ static int iomfb_m4_ext_stop(struct iomfb_m4 *dcp)
 		if (ret > 0 || (!ret && r->count))
 			ret = -EBUSY;
 	}
-	/* Nothing has changed yet: the session stays, the sleep is refused. */
+	/*
+	 * Callbacks drained above (such as D572(1) or an error) can invalidate
+	 * stop preconditions before RTKit idles: recheck while still recoverable.
+	 */
+	if (!ret) {
+		step = "precondition";
+		if (r->ext_qn || dcp->transaction.calls ||
+		    !READ_ONCE(dcp->ext_dart_down))
+			ret = -EBUSY;
+		else
+			ret = dcp_m4_runtime_live(r);
+	}
+	if (!ret) {
+		step = "AFK drain";
+		ret = iomfb_m4_ext_afk_recheck(dcp);
+	}
+	if (!ret) {
+		/*
+		 * Defer incoming AFK RX and let admitted endpoint workers finish
+		 * before RTKit idles so no queued reply or GETBUF runs after the
+		 * DCP stops accepting doorbells. If anything arrived in the
+		 * window, replay it and back out cleanly.
+		 */
+		step = "AFK RX pause";
+		iomfb_m4_ext_afk_pause_rx(dcp);
+		ret = iomfb_m4_ext_afk_rx_check(dcp);
+		if (ret)
+			iomfb_m4_ext_afk_resume_rx(dcp, true);
+	}
+	/* Nothing has changed yet: the session stays, the stop is refused. */
 	if (ret)
 		goto unprepare;
 	step = "RTKit idle";
@@ -5707,12 +6042,21 @@ static int iomfb_m4_ext_stop(struct iomfb_m4 *dcp)
 	ret = apple_rtkit_poll(dcp->rtkit);
 	if (ret >= 0) {
 		apple_rtkit_flush_rx(dcp->rtkit);
+		ret = READ_ONCE(dcp->error);
+		if (ret)
+			goto fail;
 		spin_lock_irqsave(&dcp->state_lock, flags);
 		ret = r->count ? -EBUSY : 0;
 		spin_unlock_irqrestore(&dcp->state_lock, flags);
+	} else {
+		goto fail;
+	}
+	if (!ret) {
+		step = "late AFK";
+		ret = iomfb_m4_ext_afk_rx_check(dcp);
 	}
 	if (ret)
-		goto fail;
+		goto unwind;
 	/* From here on nothing may use the DCP's or its DARTs' registers. */
 	WRITE_ONCE(dcp->gated, true);
 	dcp->ext_stopped = true;
@@ -5730,21 +6074,51 @@ static int iomfb_m4_ext_stop(struct iomfb_m4 *dcp)
 	}
 	if (ret)
 		goto unwind;
-	/* The restarted firmware announces the sink's AV service anew. */
+	/*
+	 * Publish ext_idle_stopped before clearing port->enabled so route
+	 * selection never observes a gap while the DCP transitions to idle.
+	 */
+	smp_store_release(&dcp->ext_idle_stopped, runtime);
+	/* The restarted firmware announces the sink's AV and DPTX services anew. */
 	spin_lock_irqsave(&dcp->state_lock, flags);
 	dcp->ext_avserv = NULL;
 	spin_unlock_irqrestore(&dcp->state_lock, flags);
-	dev_info(dcp->dev, "external DCP stopped for sleep\n");
+	if (dcp->owner->dptxep && READ_ONCE(dcp->owner->dptxep->compact)) {
+		for (unsigned int i = 0; i < ARRAY_SIZE(dcp->owner->dptxport); i++) {
+			struct dptx_port *port = &dcp->owner->dptxport[i];
+
+			/* Pairs with smp_load_acquire() in dptx_service_available(). */
+			smp_store_release(&port->enabled, false);
+			WRITE_ONCE(port->connected, false);
+		}
+	}
+	dcp->gate_cycles++;
+	dcp->gate_off_us = ktime_us_delta(ktime_get(), start);
+	if (runtime) {
+		if (dcp->owner->dptxep)
+			afk_compact_orphans_drop(dcp->owner->dptxep);
+		WRITE_ONCE(dcp->owner->t8132_release_late, false);
+		dev_dbg(dcp->dev, "external DCP powered down while idle (%lld us)\n",
+			dcp->gate_off_us);
+	} else {
+		dev_info(dcp->dev, "external DCP stopped for sleep\n");
+	}
 	return 0;
 unwind:
-	dev_err(dcp->dev, "external DCP stop failed at %s: %d; restarting it\n", step, ret);
+	if (runtime && ret == -EBUSY && !cpu_off)
+		dev_dbg(dcp->dev, "external DCP idle stop interrupted at %s: %d; resuming it\n",
+			step, ret);
+	else
+		dev_err(dcp->dev, "external DCP stop failed at %s: %d; restarting it\n",
+			step, ret);
 	/* Only a CPU whose own domain went off starts from reset. */
 	cpu_reset = cpu_off && apple_pmgr_ps_consumer_is_off(dcp->dev);
 	recover = cpu_off ? apple_pmgr_ps_consumer_on(dcp->dev) : 0;
 	recover = recover ?: apple_dart_cio_on(dcp->ext_darts[0]) ?:
 		  apple_dart_cio_on(dcp->ext_darts[1]);
 	if (!recover && cpu_reset) {
-		/* Start it as after the sleep. */
+		/* Start it as after the sleep; keep AFK RX deferred until RTKit is ON. */
+		iomfb_m4_ext_afk_pause_rx(dcp);
 		recover = apple_rtkit_wake_retained(dcp->rtkit, iomfb_m4_cpu_start, dcp);
 	} else if (!recover) {
 		/* A CPU only stopped resumes where it idled. */
@@ -5754,15 +6128,28 @@ unwind:
 	}
 	for (unsigned int i = 0; i < 2; i++)
 		recover = apple_dart_cio_finish(dcp->ext_darts[i]) ?: recover;
+	if (!recover) {
+		apple_rtkit_flush_rx(dcp->rtkit);
+		recover = READ_ONCE(dcp->error);
+	}
 	dcp->ext_stopped = false;
+	if (!recover) {
+		if (cpu_reset)
+			recover = iomfb_m4_ext_reset_finish(dcp);
+		else
+			iomfb_m4_ext_afk_resume_rx(dcp, true);
+	}
+	if (!recover)
+		recover = iomfb_m4_ext_afk_open_tx(dcp, afk_paused, true);
 	if (recover) {
+		iomfb_m4_ext_afk_pause_rx(dcp);
 		dev_err(dcp->dev, "external DCP restart failed: %d\n", recover);
 		dcp_m4_failed(dcp, recover);
 		return ret;
 	}
-	WRITE_ONCE(dcp->gated, false);
 	return ret;
 fail:
+	iomfb_m4_ext_afk_pause_rx(dcp);
 	dev_err(dcp->dev, "external DCP stop failed at %s: %d\n", step, ret);
 	dcp_m4_failed(dcp, ret);
 	/* Its CPU still runs, or was never left: the DARTs were not touched. */
@@ -5772,22 +6159,29 @@ fail:
 		apple_dart_cio_finish(dcp->ext_darts[i]);
 	return ret;
 unprepare:
-	dev_warn(dcp->dev, "external DCP stop refused at %s: %d\n", step, ret);
+	iomfb_m4_ext_afk_open_tx(dcp, afk_paused, false);
+	if (runtime && (ret == -EBUSY || ret == -EAGAIN))
+		dev_dbg(dcp->dev, "external DCP idle stop refused at %s: %d\n", step, ret);
+	else
+		dev_warn(dcp->dev, "external DCP stop refused at %s: %d\n", step, ret);
 	for (unsigned int i = 0; i < 2; i++)
 		if (prepared[i])
 			apple_dart_cio_finish(dcp->ext_darts[i]);
-	return -EBUSY;
+	if (!runtime)
+		return -EBUSY;
+	return ret == -EAGAIN ? -EBUSY : ret;
 }
 
 /*
- * After the sleep: the firmware DART and the display DART as they were, then
- * the CPU from its reset vector on the firmware image it kept, through
- * RTKit's retained wake. The display comes back with its next enable. The
- * DART transactions end whatever happens; a DART that did not come back
- * stays closed, and the session is failed.
+ * After the sleep or on route activation: the firmware DART and the display
+ * DART as they were, then the CPU from its reset vector on the firmware image
+ * it kept, through RTKit's retained wake. The display comes back with its next
+ * enable. The DART transactions end whatever happens; a DART that did not come
+ * back stays closed, and the session is failed.
  */
-static int iomfb_m4_ext_start(struct iomfb_m4 *dcp)
+static int iomfb_m4_ext_start(struct iomfb_m4 *dcp, bool runtime)
 {
+	ktime_t start = ktime_get();
 	const char *step = "CPU domain";
 	int ret, finish;
 
@@ -5807,6 +6201,8 @@ static int iomfb_m4_ext_start(struct iomfb_m4 *dcp)
 	}
 	if (!ret) {
 		step = "RTKit wake";
+		/* Keep AFK RX deferred through the management handshake until RTKit is ON. */
+		iomfb_m4_ext_afk_pause_rx(dcp);
 		ret = apple_rtkit_wake_retained(dcp->rtkit, iomfb_m4_cpu_start, dcp);
 	}
 	for (unsigned int i = 0; i < 2; i++) {
@@ -5816,15 +6212,204 @@ static int iomfb_m4_ext_start(struct iomfb_m4 *dcp)
 			ret = finish;
 		}
 	}
+	if (!ret) {
+		apple_rtkit_flush_rx(dcp->rtkit);
+		ret = READ_ONCE(dcp->error);
+		if (ret)
+			step = "RX";
+	}
 	dcp->ext_stopped = false;
+	if (!ret) {
+		step = "DPTX ready";
+		ret = iomfb_m4_ext_reset_finish(dcp);
+	}
+	if (!ret) {
+		step = "TX commit";
+		ret = iomfb_m4_ext_afk_open_tx(dcp, DCP_M4_EXT_AFK_SLOTS, true);
+	}
 	if (ret) {
+		iomfb_m4_ext_afk_pause_rx(dcp);
 		dev_err(dcp->dev, "external DCP restart failed at %s: %d\n", step, ret);
 		dcp_m4_failed(dcp, ret);
+		WRITE_ONCE(dcp->ext_idle_stopped, false);
 		return ret;
 	}
-	WRITE_ONCE(dcp->gated, false);
-	dev_info(dcp->dev, "external DCP restarted after sleep\n");
+	WRITE_ONCE(dcp->ext_idle_stopped, false);
+	dcp->gate_on_us = ktime_us_delta(ktime_get(), start);
+	if (runtime)
+		dev_dbg(dcp->dev, "external DCP powered up on demand (%lld us)\n",
+			dcp->gate_on_us);
+	else
+		dev_info(dcp->dev, "external DCP restarted after sleep\n");
 	return 0;
+}
+
+static void iomfb_m4_ext_idle_arm_locked(struct iomfb_m4 *dcp, unsigned int delay_ms)
+{
+	lockdep_assert_held(&dcp->lock);
+	if (!dcp->external || !dcp->ext_idle_capable || dcp->ext_idle_closed ||
+	    dcp->ext_idle_held || dcp->ext_idle_stopping || dcp->ext_stopped ||
+	    READ_ONCE(dcp->error) || READ_ONCE(dcp->owner->quiescing) || !dcp->runtime)
+		return;
+	if (!dcp->ext_dptx_live || !dptx_service_available(&dcp->owner->dptxport[0]))
+		return;
+	/* Pairs with the release store of r->done in startup. */
+	if (!smp_load_acquire(&dcp->runtime->done))
+		return;
+	dcp->ext_idle_armed = true;
+	mod_delayed_work(system_freezable_wq, &dcp->ext_idle_work,
+			 msecs_to_jiffies(delay_ms ?: DCP_M4_EXT_IDLE_DELAY_MS));
+}
+
+static void iomfb_m4_ext_idle_retry_locked(struct iomfb_m4 *dcp)
+{
+	unsigned int delay_ms;
+
+	lockdep_assert_held(&dcp->lock);
+	delay_ms = clamp(dcp->ext_idle_delay_ms, (unsigned int)DCP_M4_EXT_IDLE_DELAY_MS,
+			 (unsigned int)DCP_M4_EXT_IDLE_MAX_DELAY_MS);
+	dcp->ext_idle_delay_ms = min(delay_ms * 2, (unsigned int)DCP_M4_EXT_IDLE_MAX_DELAY_MS);
+	iomfb_m4_ext_idle_arm_locked(dcp, delay_ms);
+}
+
+static void iomfb_m4_ext_idle_work(struct work_struct *work)
+{
+	struct iomfb_m4 *dcp = container_of(to_delayed_work(work), struct iomfb_m4,
+					    ext_idle_work);
+	struct apple_dcp *owner = dcp->owner;
+	struct dcp_m4_runtime *r;
+	int ret;
+
+	mutex_lock(&dcp->lock);
+	if (!dcp->ext_idle_armed || dcp->ext_idle_closed || dcp->ext_idle_held ||
+	    dcp->ext_stopped || READ_ONCE(dcp->error) || READ_ONCE(owner->quiescing)) {
+		dcp->ext_idle_armed = false;
+		goto out;
+	}
+	r = dcp->runtime;
+	/* Pairs with the release store of r->done in startup. */
+	if (!r || !smp_load_acquire(&r->done) || r->ext_sleeping ||
+	    READ_ONCE(owner->active_typec_route) ||
+	    READ_ONCE(owner->typec_cable_connected) ||
+	    READ_ONCE(owner->dptxport[0].connected)) {
+		dcp->ext_idle_armed = false;
+		goto out;
+	}
+	if (work_busy(&owner->typec_reconnect_wq.work) ||
+	    work_busy(&owner->tb_event_work) ||
+	    r->ext_qn || dcp->transaction.calls) {
+		iomfb_m4_ext_idle_retry_locked(dcp);
+		goto out;
+	}
+	if (!READ_ONCE(dcp->ext_dart_down)) {
+		/* Wait for the firmware's D572(0) callback to re-arm. */
+		dcp->ext_idle_armed = false;
+		dcp->ext_idle_delay_ms = DCP_M4_EXT_IDLE_DELAY_MS;
+		goto out;
+	}
+	dcp->ext_idle_armed = false;
+	dcp->ext_idle_stopping = true;
+	ret = iomfb_m4_ext_stop(dcp, true);
+	dcp->ext_idle_stopping = false;
+	if (!ret) {
+		dcp->ext_idle_delay_ms = DCP_M4_EXT_IDLE_DELAY_MS;
+	} else if (ret == -EBUSY && !READ_ONCE(dcp->error)) {
+		if (READ_ONCE(dcp->ext_dart_down))
+			iomfb_m4_ext_idle_retry_locked(dcp);
+		else
+			dcp->ext_idle_delay_ms = DCP_M4_EXT_IDLE_DELAY_MS;
+	}
+out:
+	mutex_unlock(&dcp->lock);
+}
+
+void iomfb_m4_ext_idle_kick(struct apple_dcp *owner)
+{
+	struct iomfb_m4 *dcp = owner->v26_6;
+
+	if (!dcp || !dcp->external)
+		return;
+	mutex_lock(&dcp->lock);
+	dcp->ext_idle_delay_ms = DCP_M4_EXT_IDLE_DELAY_MS;
+	iomfb_m4_ext_idle_arm_locked(dcp, DCP_M4_EXT_IDLE_DELAY_MS);
+	mutex_unlock(&dcp->lock);
+}
+
+bool iomfb_m4_ext_route_ready(struct apple_dcp *owner)
+{
+	struct iomfb_m4 *dcp = owner->v26_6;
+
+	if (!dcp || !dcp->external || READ_ONCE(dcp->error) ||
+	    READ_ONCE(dcp->ext_idle_closed) ||
+	    READ_ONCE(owner->dptxport[0].closed))
+		return false;
+	/* Pairs with smp_store_release() after initial DPTX startup succeeds. */
+	return smp_load_acquire(&dcp->ext_route_ready);
+}
+
+int iomfb_m4_ext_idle_wake(struct apple_dcp *owner)
+{
+	struct iomfb_m4 *dcp = owner->v26_6;
+	int ret = 0;
+
+	if (!dcp || !dcp->external)
+		return 0;
+	mutex_lock(&dcp->lock);
+	if (dcp->ext_idle_closed) {
+		mutex_unlock(&dcp->lock);
+		return -ENODEV;
+	}
+	ret = READ_ONCE(dcp->error);
+	if (ret) {
+		mutex_unlock(&dcp->lock);
+		return ret;
+	}
+	dcp->ext_idle_armed = false;
+	cancel_delayed_work(&dcp->ext_idle_work);
+	dcp->ext_idle_held = true;
+	if (dcp->ext_stopped) {
+		ret = iomfb_m4_ext_start(dcp, true);
+		if (ret)
+			dcp->ext_idle_held = false;
+	}
+	if (!ret && !dptx_service_available(&owner->dptxport[0])) {
+		dcp->ext_idle_held = false;
+		ret = -ENODEV;
+	}
+	mutex_unlock(&dcp->lock);
+	return ret;
+}
+
+void iomfb_m4_ext_idle_release(struct apple_dcp *owner)
+{
+	struct iomfb_m4 *dcp = owner->v26_6;
+
+	if (!dcp || !dcp->external)
+		return;
+	mutex_lock(&dcp->lock);
+	dcp->ext_idle_held = false;
+	dcp->ext_idle_delay_ms = DCP_M4_EXT_IDLE_DELAY_MS;
+	iomfb_m4_ext_idle_arm_locked(dcp, DCP_M4_EXT_IDLE_DELAY_MS);
+	mutex_unlock(&dcp->lock);
+}
+
+void iomfb_m4_ext_idle_close(struct apple_dcp *owner, bool wake)
+{
+	struct iomfb_m4 *dcp = owner->v26_6;
+
+	if (!dcp || !dcp->external)
+		return;
+	mutex_lock(&dcp->lock);
+	WRITE_ONCE(dcp->ext_idle_closed, true);
+	dcp->ext_idle_armed = false;
+	mutex_unlock(&dcp->lock);
+	cancel_delayed_work_sync(&dcp->ext_idle_work);
+	if (!wake)
+		return;
+	mutex_lock(&dcp->lock);
+	if (dcp->ext_stopped)
+		iomfb_m4_ext_start(dcp, true);
+	mutex_unlock(&dcp->lock);
 }
 
 /* An external DCP stopped for a deep sleep, its CPU to start from reset after it. */
@@ -5869,27 +6454,36 @@ int iomfb_m4_suspend(struct apple_dcp *owner)
 	 * off (the firmware's last D572 was 0) and nothing in flight; else the
 	 * sleep is refused, and the outputs are restored after it.
 	 */
-	if (dcp && dcp->external && dcp->runtime && smp_load_acquire(&dcp->runtime->done)) {
-		const char *why = NULL;
-
-		mutex_lock(&dcp->lock);
-		if (!READ_ONCE(dcp->ext_dart_down))
-			why = "the display DART is on (last D572 was 1)";
-		else if (dcp->runtime->ext_qn)
-			why = "a swap is under way";
-		mutex_unlock(&dcp->lock);
-		if (why) {
-			dev_warn(dcp->dev, "refusing system sleep: %s\n", why);
-			return -EBUSY;
-		}
-	}
 	if (dcp && dcp->external) {
+		bool stopped;
+
+		cancel_delayed_work_sync(&dcp->ext_idle_work);
+		mutex_lock(&dcp->lock);
+		dcp->ext_idle_armed = false;
+		stopped = dcp->ext_stopped;
+		/* Pairs with the release store of r->done in startup. */
+		if (!stopped && dcp->runtime && smp_load_acquire(&dcp->runtime->done)) {
+			const char *why = NULL;
+
+			if (!READ_ONCE(dcp->ext_dart_down))
+				why = "the display DART is on (last D572 was 1)";
+			else if (dcp->runtime->ext_qn)
+				why = "a swap is under way";
+			if (why) {
+				dcp->ext_idle_delay_ms = DCP_M4_EXT_IDLE_DELAY_MS;
+				iomfb_m4_ext_idle_arm_locked(dcp, DCP_M4_EXT_IDLE_DELAY_MS);
+				mutex_unlock(&dcp->lock);
+				dev_warn(dcp->dev, "refusing system sleep: %s\n", why);
+				return -EBUSY;
+			}
+		}
+		mutex_unlock(&dcp->lock);
 		/*
 		 * Every message RTKit received so far is dispatched, and stamped
 		 * with the old epoch, before the epoch moves on: its receive work
 		 * takes no lock held here (only state_lock, then queue_work).
 		 */
-		if (dcp->rtkit)
+		if (!stopped && dcp->rtkit)
 			apple_rtkit_flush_rx(dcp->rtkit);
 		mutex_lock(&dcp->lock);
 		atomic_inc(&dcp->ext_pm_epoch);
@@ -5897,12 +6491,17 @@ int iomfb_m4_suspend(struct apple_dcp *owner)
 		dcp->ext_dart_since_sleep = true;
 		ret = 0;
 		/* A deep sleep powers it off: stop it first, if it has a session. */
-		if (pm_suspend_target_state == PM_SUSPEND_MEM && dcp->runtime) {
+		if (!dcp->ext_stopped && pm_suspend_target_state == PM_SUSPEND_MEM &&
+		    dcp->runtime) {
 			/* Pairs with the release store of r->done in startup. */
 			bool session = smp_load_acquire(&dcp->runtime->done);
 
 			if (session)
-				ret = iomfb_m4_ext_stop(dcp);
+				ret = iomfb_m4_ext_stop(dcp, false);
+		}
+		if (ret) {
+			dcp->ext_idle_delay_ms = DCP_M4_EXT_IDLE_DELAY_MS;
+			iomfb_m4_ext_idle_arm_locked(dcp, DCP_M4_EXT_IDLE_DELAY_MS);
 		}
 		mutex_unlock(&dcp->lock);
 		/*
@@ -5911,7 +6510,7 @@ int iomfb_m4_suspend(struct apple_dcp *owner)
 		 * counts as fresh and the output stays dark.
 		 */
 		if (ret) {
-			if (dcp->rtkit)
+			if (!stopped && dcp->rtkit)
 				apple_rtkit_flush_rx(dcp->rtkit);
 			atomic_inc(&dcp->ext_pm_epoch);
 		}
@@ -5958,10 +6557,22 @@ int iomfb_m4_resume(struct apple_dcp *owner)
 	 * every one RTKit received before is dispatched with the old one first.
 	 */
 	if (dcp && dcp->external) {
+		bool stopped;
+
 		mutex_lock(&dcp->lock);
-		ret = iomfb_m4_ext_start(dcp);
+		if (dcp->ext_stopped && dcp->ext_idle_stopped) {
+			/* Powered down while idle already: stays down until a route needs it. */
+			ret = 0;
+		} else {
+			ret = iomfb_m4_ext_start(dcp, false);
+			if (!ret) {
+				dcp->ext_idle_delay_ms = DCP_M4_EXT_IDLE_DELAY_MS;
+				iomfb_m4_ext_idle_arm_locked(dcp, DCP_M4_EXT_IDLE_DELAY_MS);
+			}
+		}
+		stopped = dcp->ext_stopped;
 		mutex_unlock(&dcp->lock);
-		if (dcp->rtkit)
+		if (!stopped && dcp->rtkit)
 			apple_rtkit_flush_rx(dcp->rtkit);
 		atomic_inc(&dcp->ext_pm_epoch);
 		return ret;
@@ -6041,6 +6652,7 @@ void iomfb_m4_quiesce(struct apple_dcp *owner)
 	/* After the flush, as drained callbacks can queue it. */
 	cancel_delayed_work_sync(&dcp->idle_cache);
 	cancel_delayed_work_sync(&dcp->gate_work);
+	iomfb_m4_ext_idle_close(owner, false);
 	cancel_delayed_work_sync(&dcp->ext_edid_retry);
 }
 
@@ -6063,8 +6675,8 @@ static int iomfb_m4_status_show(struct seq_file *s, void *unused)
 		   !dcp->gated && !!(readl(dcp->coproc + DCP_M4_CPU_CONTROL) & DCP_M4_CPU_RUN),
 		   health);
 	seq_printf(s, "gate_capable=%u gated=%u gate_cycles=%llu gate_off_us=%lld gate_on_us=%lld\n",
-		   dcp->gate_capable, dcp->gated, dcp->gate_cycles, dcp->gate_off_us,
-		   dcp->gate_on_us);
+		   dcp->gate_capable || dcp->ext_idle_capable, dcp->gated, dcp->gate_cycles,
+		   dcp->gate_off_us, dcp->gate_on_us);
 	seq_printf(s, "startup=%u background=%u power=%u scanout=%u callbacks=%u\n",
 		   r && r->done, r && r->background_done, r && r->power_done,
 		   r && r->scanout_done, r ? r->callbacks : 0);

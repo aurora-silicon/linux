@@ -1117,12 +1117,19 @@ static int dptxport_prepare(struct apple_epic_service *service, const char *name
 	 * without a class.  Unit 0 is opened last, see dptxep_init_desktop().
 	 */
 	if (READ_ONCE(service->ep->compact)) {
+		bool rebind;
+
 		/* Bind by name: another service on this endpoint is not a port. */
 		if ((unit != 0 && unit != 1) || !name || strcmp(name, "dcpdptx-port-epic"))
 			return -EINVAL;
-		if (!unit)
+		rebind = READ_ONCE(dcp->dptxport[unit].rebind_allowed);
+		if (!unit && !rebind)
 			service->defer_start = true;
 		trace_dptxport_init(dcp, unit);
+		if (rebind) {
+			WRITE_ONCE(dcp->dptxport[unit].rebind_allowed, false);
+			return dptx_service_rebind(service, &dcp->dptxport[unit], unit);
+		}
 		return dptx_service_bind(service, &dcp->dptxport[unit], unit);
 	}
 
@@ -1161,6 +1168,11 @@ static void dptxport_init(struct apple_epic_service *service, const char *name,
 {
 	struct dptx_port *port = service->cookie;
 
+	if (service->defer_start || READ_ONCE(port->staged)) {
+		WRITE_ONCE(port->service, service);
+		complete(&port->enable_completion);
+		return;
+	}
 	dptx_service_publish(service);
 	complete(&port->enable_completion);
 	/* A connect that found no port yet is retried from process context. */
@@ -1477,6 +1489,7 @@ static int dptxport_compact_call(struct apple_epic_service *service, u16 group,
 static const struct apple_epic_service_ops dptxep_compact_ops[] = {
 	{
 		.name = "dcpdptx-port-epic",
+		.start_before_init = true,
 		.prepare = dptxport_prepare,
 		.teardown = dptxport_teardown,
 		.init = dptxport_init,
@@ -1500,36 +1513,107 @@ int dptxep_init_desktop(struct apple_dcp *dcp, u32 endpoint)
 	init_completion(&dcp->dptxport[1].enable_completion);
 	init_completion(&dcp->dptxport[0].linkcfg_completion);
 	init_completion(&dcp->dptxport[1].linkcfg_completion);
+	for (port = 0; port < ARRAY_SIZE(dcp->dptxport); port++)
+		WRITE_ONCE(dcp->dptxport[port].staged, true);
 
 	ep = afk_init(dcp, endpoint, dptxep_compact_ops);
-	if (IS_ERR(ep))
+	if (IS_ERR(ep)) {
+		for (port = 0; port < ARRAY_SIZE(dcp->dptxport); port++)
+			WRITE_ONCE(dcp->dptxport[port].staged, false);
 		return PTR_ERR(ep);
+	}
 	/*
 	 * A T8132 dcpext's firmware can answer a teardown call after it
 	 * timed out; keep such a call until its answer, see
 	 * dcp_dptx_release_locked().
 	 */
 	ep->compact_keep_orphans = dcp_is_t8132_ext(dcp);
-	/* Routed by its endpoint number: set before the start replies arrive. */
-	dcp->dptxep = ep;
+	/* Pairs with smp_load_acquire() in early RX before start replies arrive. */
+	smp_store_release(&dcp->dptxep, ep);
 
 	ret = afk_start(ep);
 	if (ret)
-		return ret;
+		goto fail;
 
 	for (port = 0; port < dcp->hw.num_dptx_ports; port++) {
 		ret = wait_for_completion_timeout(&dcp->dptxport[port].enable_completion,
 						  timeout);
 		if (!ret) {
 			dev_warn(dcp->dev, "DPTX port %u service not announced\n", port);
-			return -ETIMEDOUT;
+			ret = -ETIMEDOUT;
+			goto fail;
 		}
 		timeout = ret;
 	}
 
-	if (READ_ONCE(ep->compact) && dcp->dptxport[0].service)
-		return afk_start_service(dcp->dptxport[0].service);
+	if (READ_ONCE(ep->compact) && dcp->dptxport[0].service) {
+		ret = afk_start_service(dcp->dptxport[0].service);
+		if (ret)
+			goto fail;
+	}
+
+	/*
+	 * Serialize final validation and publication of all required ports
+	 * against concurrent RX teardown by holding their service locks
+	 * together in fixed index order.
+	 */
+	{
+		u32 count = min_t(u32, dcp->hw.num_dptx_ports,
+				  ARRAY_SIZE(dcp->dptxport));
+		struct apple_epic_service *svcs[ARRAY_SIZE(dcp->dptxport)] = {};
+		unsigned long flags = 0;
+		bool ok = count > 0;
+
+		for (port = 0; port < count; port++) {
+			svcs[port] = READ_ONCE(dcp->dptxport[port].service);
+			if (!svcs[port])
+				ok = false;
+		}
+		if (!ok) {
+			ret = -ENODEV;
+			goto fail;
+		}
+		spin_lock_irqsave(&svcs[0]->lock, flags);
+		for (port = 1; port < count; port++) {
+			if (svcs[port] != svcs[0])
+				spin_lock_nested(&svcs[port]->lock, port);
+		}
+		for (port = 0; port < count; port++) {
+			if (!svcs[port]->enabled || svcs[port]->torndown ||
+			    READ_ONCE(dcp->dptxport[port].closed) ||
+			    (READ_ONCE(ep->compact) &&
+			     !READ_ONCE(svcs[port]->started))) {
+				ok = false;
+				break;
+			}
+		}
+		if (ok) {
+			for (port = 0; port < ARRAY_SIZE(dcp->dptxport); port++)
+				WRITE_ONCE(dcp->dptxport[port].staged, false);
+			for (port = count; port-- > 0;)
+				dptx_service_publish(svcs[port]);
+		}
+		for (port = count; port-- > 1;) {
+			if (svcs[port] != svcs[0])
+				spin_unlock(&svcs[port]->lock);
+		}
+		spin_unlock_irqrestore(&svcs[0]->lock, flags);
+		if (!ok) {
+			ret = -ENODEV;
+			goto fail;
+		}
+	}
 	return 0;
+
+fail:
+	/* Fence any late RX announcements before withdrawing staged ports. */
+	afk_quiesce(ep);
+	for (port = 0; port < ARRAY_SIZE(dcp->dptxport); port++) {
+		WRITE_ONCE(dcp->dptxport[port].staged, false);
+		if (dcp->dptxport[port].service)
+			dptx_service_unbind(dcp->dptxport[port].service);
+	}
+	return ret;
 }
 
 static void dptx_controller_service_init(struct apple_epic_service *service,
