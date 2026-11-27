@@ -244,7 +244,9 @@ impl Shared {
                     let (start, save, restore) =
                         sram.map_or((0, 0, 0), |r| (r.start as u64, r.save, r.restore));
                     // DIAGNOSTIC (T6030 sleep bring-up): the GPU's registers with it running.
-                    asahi_g16_snap(dev, 0, snap_mask(), 0);
+                    if snap_mask() & (1 << 30) == 0 {
+                        asahi_g16_snap(dev, 0, snap_mask(), 0);
+                    }
                     asahi_g16_stop_now(dev, rtk, start, save, restore)
                 }
             }

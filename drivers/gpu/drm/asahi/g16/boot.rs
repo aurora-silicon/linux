@@ -990,6 +990,16 @@ pub(crate) fn start(
     if regs.asc_control()? & regs::ASC_RUN != 0 {
         return Err(EBUSY);
     }
+    // DIAGNOSTIC (T6030 sleep bring-up): with bit 30 of aurora.g16_sleep_snap, snapshot #0 is
+    // iBoot's state of the windows, before the first RUN, for the restart's #1 to diff against.
+    let snap = crate::module_parameters::g16_sleep_snap.value();
+    if snap & (1 << 30) != 0 {
+        extern "C" {
+            fn asahi_g16_snap(dev: *mut c_void, when: u32, mask: u32, restore: u32);
+        }
+        // SAFETY: `d` is the bound GPU device; the firmware hasn't started.
+        unsafe { asahi_g16_snap(d.as_raw().cast(), 0, snap & !(3 << 30), 0) };
+    }
     let kind = adt.layout.start;
     if kind == hw::Start::MacOs27_2 {
         // 26B123 sends no PMP AGX vote: the firmware acknowledges its own IOP power-on once
