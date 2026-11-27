@@ -88,6 +88,8 @@ static int j700_dp_configure(struct apple_atcphy *a, struct phy_configure_opts_d
 static int atcphy_dpphy_configure_t8122(struct apple_atcphy *a, struct phy_configure_opts_dp *o) { calls_other++; return 0; }
 static void atcphy_restore_after_pd_off(struct apple_atcphy *a) { }
 static int atcphy_dp_set_rate_t8122(struct apple_atcphy *a, u32 r) { calls_other++; return 0; }
+static int atcphy_rpm_get(struct apple_atcphy *a) { return 0; }
+static void atcphy_rpm_put(struct apple_atcphy *a) { }
 static int atcphy_dp_configure(struct apple_atcphy *a, enum atcphy_dp_link_rate lr) { calls_rate++; last_rate = lr; return 0; }
 #define guard(x) (void)
 #define dev_dbg(...) do { } while (0)

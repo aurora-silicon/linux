@@ -123,6 +123,9 @@ struct apple_dpxbar {
 	bool t6030_dpin;
 	/* outputs holding a runtime PM reference (runtime_pm crossbars) */
 	unsigned long rpm_held;
+	/* outputs holding a runtime PM reference from preselect */
+	unsigned long rpm_preselect;
+	bool probed;
 	bool tunnel_link_up[MUX_MAX];
 	u8 pclk[T8142_MUX_MAX];
 	bool uhbr[T8142_MUX_MAX];
@@ -624,6 +627,29 @@ static int apple_dpxbar_set(struct mux_control *mux, int state)
 		return -EINVAL;
 	}
 
+	bool rpm_temp = false;
+	unsigned int rpm_puts = 0;
+
+	if (dpxbar->hw->runtime_pm) {
+		if (!enable && dpxbar->probed) {
+			bool need_mmio;
+
+			spin_lock_irqsave(&dpxbar->lock, flags);
+			need_mmio = test_bit(index, &dpxbar->rpm_held) ||
+				    test_bit(index, &dpxbar->rpm_preselect);
+			spin_unlock_irqrestore(&dpxbar->lock, flags);
+			if (!need_mmio) {
+				dev_dbg(dpxbar->dev, "%s already disconnected while suspended\n",
+					apple_dpxbar_names[index]);
+				return 0;
+			}
+		}
+		ret = pm_runtime_resume_and_get(dpxbar->dev);
+		if (ret)
+			return ret;
+		rpm_temp = true;
+	}
+
 	spin_lock_irqsave(&dpxbar->lock, flags);
 
 	/* ensure the selected dispext isn't already used in this crossbar */
@@ -633,6 +659,8 @@ static int apple_dpxbar_set(struct mux_control *mux, int state)
 				continue;
 			if (dpxbar->selected_dispext[i] == state) {
 				spin_unlock_irqrestore(&dpxbar->lock, flags);
+				if (rpm_temp)
+					pm_runtime_put(dpxbar->dev);
 				return -EBUSY;
 			}
 		}
@@ -690,9 +718,21 @@ static int apple_dpxbar_set(struct mux_control *mux, int state)
 		}
 
 		dpxbar->selected_dispext[index] = state;
+		if (dpxbar->hw->runtime_pm && !test_and_set_bit(index, &dpxbar->rpm_held))
+			pm_runtime_get_noresume(dpxbar->dev);
+	} else if (dpxbar->hw->runtime_pm) {
+		if (test_and_clear_bit(index, &dpxbar->rpm_held))
+			rpm_puts++;
+		if (test_and_clear_bit(index, &dpxbar->rpm_preselect))
+			rpm_puts++;
 	}
 
 	spin_unlock_irqrestore(&dpxbar->lock, flags);
+
+	if (rpm_temp)
+		rpm_puts++;
+	while (rpm_puts--)
+		pm_runtime_put(dpxbar->dev);
 
 	if (enable)
 		dev_info(dpxbar->dev, "Switched %s to dispext%u,%u\n",
@@ -845,18 +885,53 @@ int apple_dpxbar_preselect(struct mux_control *mux, int state)
 		return -EOPNOTSUPP;
 	}
 
+	u32 reg_val = 0;
+	unsigned int rpm_puts = 0;
+	bool rpm_temp = false;
+
+	if (dpxbar->hw->runtime_pm) {
+		if (state == MUX_IDLE_DISCONNECT) {
+			bool active;
+
+			spin_lock_irqsave(&dpxbar->lock, flags);
+			active = test_bit(index, &dpxbar->rpm_preselect) ||
+				 test_bit(index, &dpxbar->rpm_held);
+			spin_unlock_irqrestore(&dpxbar->lock, flags);
+			if (!active)
+				return 0;
+		}
+		ret = pm_runtime_resume_and_get(dpxbar->dev);
+		if (ret)
+			return ret;
+		rpm_temp = true;
+	}
+
 	spin_lock_irqsave(&dpxbar->lock, flags);
 	/* a selected output already points at its source */
-	if (dpxbar->selected_dispext[index] >= 0)
+	if (dpxbar->selected_dispext[index] >= 0) {
 		ret = -EBUSY;
-	else
+	} else {
 		dpxbar_mask32(dpxbar, CROSSBAR_MUX_CTRL, mask, set);
+		reg_val = readl(dpxbar->regs + CROSSBAR_MUX_CTRL);
+		if (dpxbar->hw->runtime_pm) {
+			if (state == MUX_IDLE_DISCONNECT) {
+				if (test_and_clear_bit(index, &dpxbar->rpm_preselect))
+					rpm_puts++;
+			} else if (!test_and_set_bit(index, &dpxbar->rpm_preselect)) {
+				pm_runtime_get_noresume(dpxbar->dev);
+			}
+		}
+	}
 	spin_unlock_irqrestore(&dpxbar->lock, flags);
+	if (rpm_temp)
+		rpm_puts++;
+	while (rpm_puts--)
+		pm_runtime_put(dpxbar->dev);
 	if (ret)
 		return ret;
 
 	dev_dbg(dpxbar->dev, "%s: source preselected, MUX_CTRL=%08x\n",
-		apple_dpxbar_names[index], readl(dpxbar->regs + CROSSBAR_MUX_CTRL));
+		apple_dpxbar_names[index], reg_val);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(apple_dpxbar_preselect);
@@ -1342,8 +1417,8 @@ static int apple_dpxbar_probe(struct platform_device *pdev)
 	dpxbar->regs = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(dpxbar->regs))
 		return PTR_ERR(dpxbar->regs);
+	platform_set_drvdata(pdev, dpxbar);
 	if (hw->runtime_pm) {
-		/* Left suspended: the ATC domain may go off until a selection. */
 		ret = devm_pm_runtime_enable(dev);
 		if (ret)
 			return ret;
@@ -1351,9 +1426,15 @@ static int apple_dpxbar_probe(struct platform_device *pdev)
 
 	if (hw->ops == &apple_dpxbar_ops && !hw->no_tunable &&
 	    !of_device_is_compatible(dev->of_node, "apple,t6020-display-crossbar")) {
-		readl(dpxbar->regs + UNK_TUNABLE);
-		writel(hw->tunable, dpxbar->regs + UNK_TUNABLE);
-		readl(dpxbar->regs + UNK_TUNABLE);
+		if (hw->runtime_pm) {
+			ret = pm_runtime_resume_and_get(dev);
+			if (ret)
+				return ret;
+		} else {
+			readl(dpxbar->regs + UNK_TUNABLE);
+			writel(hw->tunable, dpxbar->regs + UNK_TUNABLE);
+			readl(dpxbar->regs + UNK_TUNABLE);
+		}
 	}
 
 	for (unsigned int i = 0; i < hw->n_mux; ++i) {
@@ -1363,10 +1444,13 @@ static int apple_dpxbar_probe(struct platform_device *pdev)
 	}
 
 	ret = devm_mux_chip_register(dev, mux_chip);
+	dpxbar->probed = true;
+	if (hw->runtime_pm && hw->ops == &apple_dpxbar_ops && !hw->no_tunable &&
+	    !of_device_is_compatible(dev->of_node, "apple,t6020-display-crossbar"))
+		pm_runtime_put(dev);
 	if (ret < 0)
 		return ret;
 
-	platform_set_drvdata(pdev, dpxbar);
 	return 0;
 }
 
@@ -1421,13 +1505,34 @@ static int apple_dpxbar_resume(struct device *dev)
 	return 0;
 }
 
-static DEFINE_SIMPLE_DEV_PM_OPS(apple_dpxbar_pm_ops, NULL, apple_dpxbar_resume);
+static int apple_dpxbar_runtime_resume(struct device *dev)
+{
+	struct apple_dpxbar *dpxbar = dev_get_drvdata(dev);
+	unsigned long flags;
+
+	if (!dpxbar || !dpxbar->hw->runtime_pm || dpxbar->hw->ops != &apple_dpxbar_ops ||
+	    dpxbar->hw->no_tunable)
+		return 0;
+
+	spin_lock_irqsave(&dpxbar->lock, flags);
+	readl(dpxbar->regs + UNK_TUNABLE);
+	writel(dpxbar->hw->tunable, dpxbar->regs + UNK_TUNABLE);
+	readl(dpxbar->regs + UNK_TUNABLE);
+	spin_unlock_irqrestore(&dpxbar->lock, flags);
+	return 0;
+}
+
+static const struct dev_pm_ops apple_dpxbar_pm_ops = {
+	SYSTEM_SLEEP_PM_OPS(NULL, apple_dpxbar_resume)
+	RUNTIME_PM_OPS(NULL, apple_dpxbar_runtime_resume, NULL)
+};
 
 static const struct apple_dpxbar_hw apple_dpxbar_hw_t8103 = {
 	.n_mux = MUX_MAX,
 	.n_ufp = 2,
 	.tunable = 0,
 	.ops = &apple_dpxbar_ops,
+	.runtime_pm = true,
 };
 
 static const struct apple_dpxbar_hw apple_dpxbar_hw_t8112 = {
@@ -1536,7 +1641,7 @@ static struct platform_driver apple_dpxbar_driver = {
 	.driver = {
 		.name = "apple-display-crossbar",
 		.of_match_table	= apple_dpxbar_ids,
-		.pm = pm_sleep_ptr(&apple_dpxbar_pm_ops),
+		.pm = pm_ptr(&apple_dpxbar_pm_ops),
 	},
 	.probe = apple_dpxbar_probe,
 };
