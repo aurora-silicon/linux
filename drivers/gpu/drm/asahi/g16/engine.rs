@@ -347,8 +347,10 @@ pub(crate) struct Flight {
     pub(crate) pb: Option<Arc<super::pools::PbEpoch>>,
     /// Its allocator slot (`0` or `1`, decoupled from `claims.pass[0]`).
     pub(crate) pb_slot: u32,
-    /// Its allocator slot binding (`Pools::bind`).
+    /// Its allocator slot binding (`Pools::bind`) and publication sequence
+    /// (`Pools::publish_flight`).
     pub(crate) pb_binding: u64,
+    pub(crate) pb_seq: u64,
     /// Whether this render carries InitBM (priming renders always drain before pipelining).
     pub(crate) initbm: bool,
     /// Whether this flight publishes CPU-written command timestamps on retirement.
@@ -396,6 +398,7 @@ impl Flight {
             pb: None,
             pb_slot: 0,
             pb_binding: 0,
+            pb_seq: 0,
             initbm: false,
             has_timestamps: false,
             rt_compute: false,
@@ -2793,6 +2796,7 @@ impl Firmware {
         f.first = index as usize;
         f.compute_pipe = compute_pipe as u8;
         f.render_pair = pair as u8;
+        f.claims.render_pair = pair as u8;
         f.c_start = prefix.c_head;
         f.ta_start = prefix.ta_head;
         f.fs_start = prefix.fs_head;
@@ -3310,7 +3314,7 @@ impl Firmware {
                 }
                 job.resources
                     .publish_pb_batch(a, f.uma_submitted, f.renders)?;
-                self.pools.publish_flight(a);
+                f.pb_seq = self.pools.publish_flight(a);
                 // Notifier service dereferences u32 counters; the host ordering ledger
                 // remains u64. Eight-byte spacing is retained allocation padding. Always
                 // advance both TA and FS thresholds to the pair's newest published draw

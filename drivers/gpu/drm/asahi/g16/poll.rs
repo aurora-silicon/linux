@@ -1583,6 +1583,7 @@ impl Firmware {
                 let committed = f.pb.as_ref().ok_or(EINVAL).and_then(|epoch| {
                     self.pools.retire_flight(
                         f.pb_slot as usize,
+                        f.pb_seq,
                         epoch,
                         f.pb_binding,
                         result.is_ok(),
