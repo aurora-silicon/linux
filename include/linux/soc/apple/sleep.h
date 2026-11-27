@@ -71,8 +71,6 @@ const struct apple_sleep_smc_policy *apple_sleep_smc_policy(void);
 bool apple_sleep_smc_defer_notice(void);
 /* Gen 1 (T8103): the SMC gets WKTP between slpw and slpa */
 bool apple_sleep_smc_gen1_keys(void);
-int apple_sleep_smc_register(struct device *dev,
-	int (*late_notice)(void *data, u64 *sent, u64 *ack), void *data);
 int apple_sleep_smc_register_saved(struct device *dev,
 	const struct apple_sleep_smc_saved_ops *ops, void *data);
 void apple_sleep_smc_unregister(struct device *dev);
@@ -315,8 +313,6 @@ bool apple_sleep_wdt_active(struct device *dev);
 static inline const struct apple_sleep_smc_policy *apple_sleep_smc_policy(void) { return NULL; }
 static inline bool apple_sleep_smc_defer_notice(void) { return false; }
 static inline bool apple_sleep_smc_gen1_keys(void) { return false; }
-static inline int apple_sleep_smc_register(struct device *dev,
-	int (*late_notice)(void *data, u64 *sent, u64 *ack), void *data) { return -EOPNOTSUPP; }
 static inline int apple_sleep_smc_register_saved(struct device *dev,
 	const struct apple_sleep_smc_saved_ops *ops, void *data) { return -EOPNOTSUPP; }
 static inline void apple_sleep_smc_unregister(struct device *dev) {}
