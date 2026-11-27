@@ -12,6 +12,8 @@
 
 /* Defined before the includes: t6050-max.dtsi guards the ATC2 router on it. */
 #define T6050_K114C
+/* The M5 Max die-0 blocks (nub-spmi1, nub-spmi4) */
+#include "t6050-soc-max.dtsi"
 /* ADT /arm-io/acio2: the right port's USB4/Thunderbolt router */
 #define T6050_ATC2_USB4_ROUTER
 /* The N1's firmware and this board's ADT board-id, for t6050-k114-k116.dtsi */
