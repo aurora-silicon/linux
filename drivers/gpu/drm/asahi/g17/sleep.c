@@ -908,6 +908,12 @@ static const struct asahi_g16_snap_win asahi_g16_snap_wins[] = {
 
 static u32 *asahi_g16_snap_buf[G16_SNAPS][G16_SNAP_WINS];
 static bool asahi_g16_snap_have[G16_SNAPS];
+/*
+ * Bit 31 of the mask: #0 once the stop has halted the ASC, before GFX goes off, not with the
+ * firmware running (J516s: reading the first windows with it running crashed it, FAR in its TEXT).
+ */
+#define G16_SNAP_LATE	BIT(31)
+static u32 asahi_g16_snap_late;
 
 /* Never read: CPU_STATUS (macOS never does). Never written back: CPU_CONTROL, the GPU counters. */
 static bool asahi_g16_snap_skip(const struct asahi_g16_snap_win *w, u32 off, bool write)
@@ -1060,6 +1066,10 @@ void asahi_g16_snap(struct device *dev, unsigned int when, u32 mask, u32 restore
 {
 	if (!mask || when >= G16_SNAPS)
 		return;
+	if (!when && (mask & G16_SNAP_LATE)) {
+		asahi_g16_snap_late = mask & ~G16_SNAP_LATE;
+		return;
+	}
 	if (when && !asahi_g16_snap_have[when - 1])
 		return;
 	asahi_g16_snap_take(dev, when, mask);
@@ -1134,6 +1144,11 @@ struct asahi_g17_commit *asahi_g16_stop_now(struct device *dev, struct apple_rtk
 	readl(c->cpu[0]);
 	writel(0, c->cpu[0]);
 	asahi_g16_sleep_note(0x29);
+	if (asahi_g16_snap_late) {
+		asahi_g16_snap_take(dev, 0, asahi_g16_snap_late);
+		asahi_g16_snap_needles(dev, 0);
+		asahi_g16_snap_late = 0;
+	}
 	c->request_ret = c->request ? apple_pmp_report_entry_request(c->request, false) : 0;
 	asahi_g16_sleep_note(0x24);
 
