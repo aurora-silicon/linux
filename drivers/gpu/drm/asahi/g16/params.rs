@@ -102,6 +102,11 @@ pub(crate) fn fill(gpu: &Gpu, params: &mut uapi::drm_asahi_params_global) -> Res
         } else {
             0
         }
+        | if gpu.cfg.max_tile_buffer >= hw::sizes::TILE_BUFFER_48K {
+            crate::file::DRM_ASAHI_FEATURE_TILE_BUFFER_48K
+        } else {
+            0
+        }
         | crate::g17::sync_output::FEATURE_CUMULATIVE_SIGNALS
         | crate::file::DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2;
     params.gpu_generation = gpu.cfg.gpu_generation;

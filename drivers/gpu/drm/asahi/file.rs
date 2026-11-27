@@ -94,6 +94,9 @@ pub(crate) const DRM_ASAHI_RENDER_SHADER_WRITES: u32 =
 /// (DRM_ASAHI_RENDER_STAGE_PREFIXES), as the complete struct drm_asahi_cmd_render_m5.
 pub(crate) const DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2: u64 =
     uapi::DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2 as u64;
+/// Render commands accept tile buffers of up to 48 KiB.
+pub(crate) const DRM_ASAHI_FEATURE_TILE_BUFFER_48K: u64 =
+    uapi::DRM_ASAHI_FEATURE_TILE_BUFFER_48K as u64;
 /// Compute commands may declare a stream that ends with a memory-scoped flush
 /// (DRM_ASAHI_COMPUTE_VISIBLE_COMPLETION).
 pub(crate) const DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION: u64 =
